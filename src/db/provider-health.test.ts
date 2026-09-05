@@ -71,21 +71,21 @@ describe('provider health cooldown', () => {
     expect(Date.parse(until) - NOW).toBeLessThanOrEqual(7 * 24 * 60 * 60_000);
   });
 
-  it('a success clears the cooldown and the streak', () => {
+  it('a success clears the cooldown and the streak', async () => {
     markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW });
-    markProviderAvailable(GID, 'codex', { nowMs: NOW });
+    await markProviderAvailable(GID, 'codex', { nowMs: NOW });
     expect(isProviderUnavailable(GID, 'codex', { nowMs: NOW })).toBe(false);
     expect(getProviderHealth(GID, 'codex')?.consecutive_failures).toBe(0);
   });
 
-  it('a fresh episode starts at the first backoff, not where the last one ended', () => {
+  it('a fresh episode starts at the first backoff, not where the last one ended', async () => {
     // The streak must reset once an outage is over, or a provider healthy for
     // weeks would reopen at the 6h cap. markProviderAvailable is what the
     // spawn path calls when it gives the primary another go.
     markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW });
     markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW });
     expect(getProviderHealth(GID, 'codex')?.consecutive_failures).toBe(2);
-    markProviderAvailable(GID, 'codex', { nowMs: NOW });
+    await markProviderAvailable(GID, 'codex', { nowMs: NOW });
     const reopened = markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW });
     expect(Date.parse(reopened) - NOW).toBe(15 * 60_000);
   });

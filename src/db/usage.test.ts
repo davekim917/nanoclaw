@@ -86,7 +86,7 @@ describe('rollupSessionUsage', () => {
   });
   afterEach(() => closeDb());
 
-  it('aggregates turn_usage rows into usage_daily, additive by (date, group, provider, model)', () => {
+  it('aggregates turn_usage rows into usage_daily, additive by (date, group, provider, model)', async () => {
     const outDb = makeOutboundDb();
     insertTurn(outDb, { ts: '2026-08-10T01:00:00.000Z' });
     insertTurn(outDb, { ts: '2026-08-10T23:00:00.000Z' });
@@ -95,7 +95,7 @@ describe('rollupSessionUsage', () => {
     const rolled = rollupSessionUsage(sessionOf(outDb), GID, SESSION_DIR);
     expect(rolled).toBe(3);
 
-    const rows = listUsageDaily({ agentGroupId: GID });
+    const rows = await listUsageDaily({ agentGroupId: GID });
     expect(rows).toHaveLength(2);
 
     const day1 = rows.find((r) => r.date === '2026-08-10' && r.provider === 'claude')!;
@@ -117,7 +117,7 @@ describe('rollupSessionUsage', () => {
     expect(day2.cost_applicable).toBe(false);
   });
 
-  it('watermark prevents double-counting on a second sweep of the same session', () => {
+  it('watermark prevents double-counting on a second sweep of the same session', async () => {
     const outDb = makeOutboundDb();
     insertTurn(outDb, { ts: '2026-08-10T01:00:00.000Z' });
     insertTurn(outDb, { ts: '2026-08-10T02:00:00.000Z' });
@@ -127,17 +127,17 @@ describe('rollupSessionUsage', () => {
     // everything, so nothing is re-added.
     expect(rollupSessionUsage(sessionOf(outDb), GID, SESSION_DIR)).toBe(0);
 
-    const rows = listUsageDaily({ agentGroupId: GID });
+    const rows = await listUsageDaily({ agentGroupId: GID });
     expect(rows).toHaveLength(1);
     expect(rows[0].turns).toBe(2);
 
     // A third turn lands; only the NEW row is picked up.
     insertTurn(outDb, { ts: '2026-08-10T03:00:00.000Z' });
     expect(rollupSessionUsage(sessionOf(outDb), GID, SESSION_DIR)).toBe(1);
-    expect(listUsageDaily({ agentGroupId: GID })[0].turns).toBe(3);
+    expect((await listUsageDaily({ agentGroupId: GID }))[0].turns).toBe(3);
   });
 
-  it('NULL token/cost/model columns roll up as 0 / empty string, not NULL or a crash', () => {
+  it('NULL token/cost/model columns roll up as 0 / empty string, not NULL or a crash', async () => {
     const outDb = makeOutboundDb();
     insertTurn(outDb, {
       model: null,
@@ -149,7 +149,7 @@ describe('rollupSessionUsage', () => {
     });
 
     expect(rollupSessionUsage(sessionOf(outDb), GID, SESSION_DIR)).toBe(1);
-    const [row] = listUsageDaily({ agentGroupId: GID });
+    const [row] = await listUsageDaily({ agentGroupId: GID });
     expect(row.model).toBe('');
     expect(row.input_tokens).toBe(0);
     expect(row.output_tokens).toBe(0);
@@ -162,11 +162,11 @@ describe('rollupSessionUsage', () => {
     expect(row.cost_applicable).toBe(true);
   });
 
-  it('a session outbound.db with no turn_usage table is skipped without error', () => {
+  it('a session outbound.db with no turn_usage table is skipped without error', async () => {
     const outDb = new Database(':memory:'); // no turn_usage table at all
     expect(() => rollupSessionUsage(sessionOf(outDb), GID, SESSION_DIR)).not.toThrow();
     expect(rollupSessionUsage(sessionOf(outDb), GID, SESSION_DIR)).toBe(0);
-    expect(listUsageDaily({ agentGroupId: GID })).toHaveLength(0);
+    await expect(listUsageDaily({ agentGroupId: GID })).resolves.toHaveLength(0);
   });
 });
 
@@ -211,7 +211,7 @@ describe('rollupSessionUsage — central turn_usage mirror', () => {
   });
   afterEach(() => closeDb());
 
-  it('writes a faithful 1:1 central row per turn_usage row, including steps/duration_ms/trigger/rate_limit_*', () => {
+  it('writes a faithful 1:1 central row per turn_usage row, including steps/duration_ms/trigger/rate_limit_*', async () => {
     const outDb = makeOutboundDbWithTurnMeta();
     outDb
       .prepare(
@@ -223,7 +223,7 @@ describe('rollupSessionUsage — central turn_usage mirror', () => {
     expect(rollupSessionUsage(sessionOf(outDb), GID, SESSION_DIR)).toBe(1);
 
     // usage_daily is untouched by the mirror — same shape as the existing contract.
-    const daily = listUsageDaily({ agentGroupId: GID });
+    const daily = await listUsageDaily({ agentGroupId: GID });
     expect(daily).toHaveLength(1);
     expect(daily[0].turns).toBe(1);
 
@@ -335,14 +335,14 @@ describe('listUsageDaily filters', () => {
   });
   afterEach(() => closeDb());
 
-  it('--group filters to one agent group', () => {
-    const rows = listUsageDaily({ agentGroupId: GID });
+  it('--group filters to one agent group', async () => {
+    const rows = await listUsageDaily({ agentGroupId: GID });
     expect(rows.every((r) => r.agent_group_id === GID)).toBe(true);
     expect(rows.length).toBeGreaterThan(0);
   });
 
-  it('--since filters to dates on/after the given UTC date', () => {
-    const rows = listUsageDaily({ agentGroupId: GID, sinceDate: '2026-08-05' });
+  it('--since filters to dates on/after the given UTC date', async () => {
+    const rows = await listUsageDaily({ agentGroupId: GID, sinceDate: '2026-08-05' });
     expect(rows.map((r) => r.date)).toEqual(['2026-08-09']);
   });
 });
@@ -355,7 +355,7 @@ describe('pruneOldTurnUsage', () => {
   });
   afterEach(() => closeDb());
 
-  it('deletes central turn_usage rows older than 30 days, keeps recent ones', () => {
+  it('deletes central turn_usage rows older than 30 days, keeps recent ones', async () => {
     const db = getRawDb();
     const old = new Date(Date.now() - 31 * 86_400_000).toISOString();
     const recent = new Date(Date.now() - 1 * 86_400_000).toISOString();
@@ -366,7 +366,7 @@ describe('pruneOldTurnUsage', () => {
       `INSERT INTO turn_usage (ts, session_id, agent_group_id, provider) VALUES (?, 's1', 'ag', 'claude')`,
     ).run(recent);
 
-    const deleted = pruneOldTurnUsage();
+    const deleted = await pruneOldTurnUsage();
     expect(deleted).toBe(1);
 
     const remaining = db.prepare('SELECT ts FROM turn_usage').all() as Array<{ ts: string }>;
@@ -375,9 +375,8 @@ describe('pruneOldTurnUsage', () => {
   });
 
   it('never throws — returns 0 rather than crashing the sweep', async () => {
-    await closeDb(); // no DB initialized — getRawDb() would throw inside
-    expect(() => pruneOldTurnUsage()).not.toThrow();
-    expect(pruneOldTurnUsage()).toBe(0);
+    await closeDb(); // no DB initialized — getDb() throws inside the try
+    await expect(pruneOldTurnUsage()).resolves.toBe(0);
   });
 });
 
@@ -423,22 +422,22 @@ describe('summarizeTurnUsage', () => {
       });
   }
 
-  it('counts distinct turns, not rows — a multi-model turn is one turn', () => {
+  it('counts distinct turns, not rows — a multi-model turn is one turn', async () => {
     central({ turnId: 't-1', model: 'claude-opus-5' });
     central({ turnId: 't-1', model: 'claude-sonnet-5' });
     central({ turnId: 't-1', model: 'claude-haiku-4-5' });
     central({ turnId: 't-2', model: 'claude-opus-5' });
 
-    const total = summarizeTurnUsage().at(-1)!;
+    const total = (await summarizeTurnUsage()).at(-1)!;
     expect(total.group).toBe('TOTAL');
     expect(total.turns).toBe(2); // a row count would say 4 — that is the 1.40x bug
   });
 
-  it('TOTAL is queried un-grouped, so per-model buckets deliberately exceed it', () => {
+  it('TOTAL is queried un-grouped, so per-model buckets deliberately exceed it', async () => {
     central({ turnId: 't-1', model: 'claude-opus-5' });
     central({ turnId: 't-1', model: 'claude-sonnet-5' });
 
-    const rows = summarizeTurnUsage({ dimensions: ['model'] });
+    const rows = await summarizeTurnUsage({ dimensions: ['model'] });
     const buckets = rows.slice(0, -1);
     const total = rows.at(-1)!;
     expect(buckets).toHaveLength(2);
@@ -450,11 +449,11 @@ describe('summarizeTurnUsage', () => {
     expect(total.turns).toBe(1);
   });
 
-  it('splits token composition and reports per-turn averages', () => {
+  it('splits token composition and reports per-turn averages', async () => {
     central({ turnId: 't-1', input: 100, output: 20, cacheRead: 900, cacheWrite: 50, cost: 1.5 });
     central({ turnId: 't-2', input: 300, output: 40, cacheRead: 1100, cacheWrite: 50, cost: 2.5 });
 
-    const total = summarizeTurnUsage().at(-1)!;
+    const total = (await summarizeTurnUsage()).at(-1)!;
     expect(total.input_tokens).toBe(400);
     expect(total.output_tokens).toBe(60);
     expect(total.cache_read_tokens).toBe(2000);
@@ -465,21 +464,21 @@ describe('summarizeTurnUsage', () => {
     expect(total.output_per_turn).toBe(30);
   });
 
-  it('counts each pre-migration-061 row (turn_id NULL) as its own turn instead of dropping it', () => {
+  it('counts each pre-migration-061 row (turn_id NULL) as its own turn instead of dropping it', async () => {
     central({ turnId: null });
     central({ turnId: null });
     central({ turnId: 't-9' });
 
     // Bare COUNT(DISTINCT turn_id) would report 1 and silently lose the two
     // old-container turns.
-    expect(summarizeTurnUsage().at(-1)!.turns).toBe(3);
+    expect((await summarizeTurnUsage()).at(-1)!.turns).toBe(3);
   });
 
-  it('buckets by several dimensions at once and orders heaviest cache_read first', () => {
+  it('buckets by several dimensions at once and orders heaviest cache_read first', async () => {
     central({ group: 'ag-a', provider: 'claude', turnId: 't-1', cacheRead: 100 });
     central({ group: 'ag-b', provider: 'codex', turnId: 't-2', cacheRead: 900 });
 
-    const rows = summarizeTurnUsage({ dimensions: ['group', 'provider'] });
+    const rows = await summarizeTurnUsage({ dimensions: ['group', 'provider'] });
     expect(rows.slice(0, -1).map((r) => [r.group, r.provider])).toEqual([
       ['ag-b', 'codex'],
       ['ag-a', 'claude'],
@@ -488,19 +487,19 @@ describe('summarizeTurnUsage', () => {
     expect(rows.at(-1)).toMatchObject({ group: 'TOTAL', provider: '' });
   });
 
-  it('filters by group, --since and --days', () => {
+  it('filters by group, --since and --days', async () => {
     const recent = new Date(Date.now() - 86_400_000).toISOString();
     central({ group: 'ag-a', turnId: 't-a', ts: '2026-01-01T00:00:00.000Z' });
     central({ group: 'ag-b', turnId: 't-b', ts: recent });
 
-    expect(summarizeTurnUsage({ agentGroupId: 'ag-a' }).at(-1)!.turns).toBe(1);
-    expect(summarizeTurnUsage({ sinceDate: '2026-06-01' }).at(-1)!.turns).toBe(1);
-    expect(summarizeTurnUsage({ days: 7 }).at(-1)!.turns).toBe(1);
-    expect(summarizeTurnUsage({ days: 7 }).at(-1)!.group).toBe('TOTAL');
+    expect((await summarizeTurnUsage({ agentGroupId: 'ag-a' })).at(-1)!.turns).toBe(1);
+    expect((await summarizeTurnUsage({ sinceDate: '2026-06-01' })).at(-1)!.turns).toBe(1);
+    expect((await summarizeTurnUsage({ days: 7 })).at(-1)!.turns).toBe(1);
+    expect((await summarizeTurnUsage({ days: 7 })).at(-1)!.group).toBe('TOTAL');
   });
 
-  it('an empty window still returns a zeroed TOTAL row, not an empty list', () => {
-    const rows = summarizeTurnUsage({ days: 7 });
+  it('an empty window still returns a zeroed TOTAL row, not an empty list', async () => {
+    const rows = await summarizeTurnUsage({ days: 7 });
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ group: 'TOTAL', turns: 0, cache_read_tokens: 0, cache_read_per_turn: 0 });
   });

@@ -152,7 +152,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/db/container-configs.ts',
   'src/db/db-v2.test.ts',
   'src/db/denied-models.ts',
-  'src/db/dropped-messages.ts',
   'src/db/index.ts',
   'src/db/messaging-groups-instance.test.ts',
   'src/db/messaging-groups.ts',

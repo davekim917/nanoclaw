@@ -499,3 +499,7 @@ Several early migrations were later renamed/retired and replaced by "module" fil
 Numbers 5 and 6 are intentionally absent — migrations were renumbered during early development.
 
 Session DB schemas (`INBOUND_SCHEMA`, `OUTBOUND_SCHEMA`) are **not** versioned here. They're `CREATE TABLE IF NOT EXISTS` so new columns land via the session-DB lazy migration helpers (`migrateDeliveredTable()` etc.) when a session file from an older build is reopened. See [db-session.md](db-session.md).
+
+## 3. Conversion state (seam 3)
+
+Four leaves are on the async driver as of PR 3: `src/db/usage.ts` (`listUsageDaily`, `summarizeTurnUsage`, `pruneOldTurnUsage`), `src/db/provider-health.ts` (`markProviderAvailable`), `src/db/dropped-messages.ts` (both exports, now byte-identical to upstream), and `src/db/scheduled-tasks.ts` (nothing — its only central-DB access is a pinned raw transaction). What stays synchronous is not an oversight and has no async twin: an export reachable from a raw `db.transaction(() => …)()` closure cannot be awaited from inside it, so `rollupSessionUsage`, `markProviderUnavailable`, `getProviderHealth` (called inside `markProviderUnavailable`'s closure) and `resolveAndValidateDestination` stay on `getRawDb()` until PR 6 converts each closure with its callees. `isProviderUnavailable` issues no statement of its own and follows `getProviderHealth`. Everything else in those files converted, and every caller awaits it — the type checker forces that, since a `Promise` has no row columns.

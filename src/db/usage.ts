@@ -41,7 +41,7 @@
  * (usage_daily is an additive upsert over a watermark, so it never sees a
  * turn's rows together) and would silently redefine an existing column.
  */
-import { getRawDb } from './connection.js';
+import { getDb, getRawDb } from './connection.js';
 import { log } from '../log.js';
 import type { NanoclawMailboxSession } from '../modules/mailbox/index.js';
 
@@ -92,6 +92,12 @@ export function isCostApplicable(provider: string): boolean {
   return !PROVIDERS_WITHOUT_COST.has(provider);
 }
 
+/**
+ * Seam 3: stays SYNCHRONOUS on the raw handle. It is called from
+ * `rollupSessionUsage`, which is itself a raw `db.transaction(() => …)()`
+ * closure and cannot await — the plan's §4.2 exception. It converts in PR 6
+ * with its caller.
+ */
 function getWatermark(sessionDirKey: string): number {
   const row = getRawDb()
     .prepare('SELECT last_turn_usage_id FROM usage_rollup_state WHERE session_dir = ?')
@@ -114,6 +120,13 @@ function getWatermark(sessionDirKey: string): number {
  * (the container writes it, the host reads it). Missing table, empty result,
  * or an already-caught-up watermark are all the normal "nothing to do" case,
  * not an error. Returns the row count rolled up.
+ *
+ * Seam 3: stays SYNCHRONOUS on the raw handle. The usage_daily upsert, the
+ * central turn_usage mirror and the watermark advance are one raw
+ * `db.transaction(() => …)()`; a synchronous closure cannot be interleaved,
+ * which is what keeps raw and driver statements safe on one connection while
+ * the fork converts leaf-by-leaf. It converts with the other ten central
+ * transaction sites in PR 6 (plan §4.2, §4.4).
  */
 export function rollupSessionUsage(
   mailbox: Pick<NanoclawMailboxSession, 'listTurnUsageSince'>,
@@ -205,9 +218,9 @@ export function rollupSessionUsage(
 }
 
 /** Read-side query backing `ncl usage list`. Filters are optional and AND'd. */
-export function listUsageDaily(
+export async function listUsageDaily(
   filters: { agentGroupId?: string; sinceDate?: string; days?: number } = {},
-): UsageDailyRow[] {
+): Promise<UsageDailyRow[]> {
   const where: string[] = [];
   const params: unknown[] = [];
   if (filters.agentGroupId) {
@@ -223,9 +236,10 @@ export function listUsageDaily(
     params.push(new Date(Date.now() - filters.days * 86_400_000).toISOString().slice(0, 10));
   }
   const clause = where.length > 0 ? ` WHERE ${where.join(' AND ')}` : '';
-  const rows = getRawDb()
-    .prepare(`SELECT * FROM usage_daily${clause} ORDER BY date DESC, agent_group_id, provider, model LIMIT 1000`)
-    .all(...params) as Omit<UsageDailyRow, 'cost_applicable'>[];
+  const rows = await getDb().all<Omit<UsageDailyRow, 'cost_applicable'>>(
+    `SELECT * FROM usage_daily${clause} ORDER BY date DESC, agent_group_id, provider, model LIMIT 1000`,
+    ...params,
+  );
   return rows.map((row) => ({ ...row, cost_applicable: isCostApplicable(row.provider) }));
 }
 
@@ -272,9 +286,9 @@ export type TurnUsageSummaryRow = Record<string, string | number>;
  * rather than as one number because measured fleet volume is ~96% cache_read
  * — a collapsed "tokens" column hides the entire cost story.
  */
-export function summarizeTurnUsage(
+export async function summarizeTurnUsage(
   filters: { dimensions?: UsageDimension[]; agentGroupId?: string; sinceDate?: string; days?: number } = {},
-): TurnUsageSummaryRow[] {
+): Promise<TurnUsageSummaryRow[]> {
   const dims: UsageDimension[] = filters.dimensions?.length ? filters.dimensions : ['group'];
 
   const where: string[] = [];
@@ -306,20 +320,20 @@ export function summarizeTurnUsage(
     COALESCE(SUM(output_tokens), 0) AS output_tokens,
     COALESCE(SUM(cost_usd), 0) AS cost_usd`;
 
-  const db = getRawDb();
+  const db = getDb();
   const selectDims = dims.map((d) => `${USAGE_DIMENSIONS[d]} AS "${d}"`).join(', ');
   const order = dims.includes('day') ? '"day" DESC' : 'cache_read_tokens DESC';
-  const buckets = db
-    .prepare(
-      `SELECT ${selectDims}, ${metrics} FROM turn_usage${clause}
+  const buckets = await db.all<Record<string, string | number>>(
+    `SELECT ${selectDims}, ${metrics} FROM turn_usage${clause}
        GROUP BY ${dims.map((d) => USAGE_DIMENSIONS[d]).join(', ')}
        ORDER BY ${order} LIMIT 1000`,
-    )
-    .all(...params) as Record<string, string | number>[];
-  const total = db.prepare(`SELECT ${metrics} FROM turn_usage${clause}`).get(...params) as Record<
-    string,
-    string | number
-  > | null;
+    ...params,
+  );
+  // `get` resolves to `undefined` where `.get()` returned `undefined` too; the
+  // un-grouped TOTAL query always produces a row, so this is defensive only and
+  // `decorate` already renders a null/absent row as all zeros.
+  const total =
+    (await db.get<Record<string, string | number>>(`SELECT ${metrics} FROM turn_usage${clause}`, ...params)) ?? null;
 
   const decorate = (
     row: Record<string, string | number> | null,
@@ -355,11 +369,12 @@ const TURN_USAGE_RETENTION_DAYS = 30;
  * this is a trivial per-tick cost and doesn't need its own timer. Self-
  * contained try/catch so a prune failure never blocks the rest of the sweep.
  */
-export function pruneOldTurnUsage(): number {
+export async function pruneOldTurnUsage(): Promise<number> {
   try {
-    return getRawDb()
-      .prepare(`DELETE FROM turn_usage WHERE datetime(ts) < datetime('now', '-${TURN_USAGE_RETENTION_DAYS} days')`)
-      .run().changes;
+    const result = await getDb().run(
+      `DELETE FROM turn_usage WHERE datetime(ts) < datetime('now', '-${TURN_USAGE_RETENTION_DAYS} days')`,
+    );
+    return result.changes;
   } catch (err) {
     log.warn('pruneOldTurnUsage: failed', { err });
     return 0;

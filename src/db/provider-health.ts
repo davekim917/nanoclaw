@@ -19,7 +19,7 @@
  * outlive an operator fixing the account, and a one-second reset should not
  * produce a hot loop.
  */
-import { getRawDb } from './connection.js';
+import { getDb, getRawDb } from './connection.js';
 
 /** Never trust an unbounded reset promise from a provider. */
 const MAX_COOLDOWN_MS = 7 * 24 * 60 * 60_000;
@@ -62,6 +62,12 @@ function cooldownMs(consecutiveFailures: number, resetAtMs: number | null, nowMs
   return clampCooldown(backoff);
 }
 
+/**
+ * Seam 3: stays SYNCHRONOUS on the raw handle. `markProviderUnavailable` calls
+ * it from inside a raw `db.transaction(() => …)()` closure, which cannot await
+ * — the plan's §4.2 exception, so there is no async form of this read. It
+ * converts with that closure in PR 6.
+ */
 export function getProviderHealth(agentGroupId: string, provider: string): ProviderHealthRow | undefined {
   return getRawDb()
     .prepare(`SELECT * FROM provider_health WHERE agent_group_id = ? AND provider = ?`)
@@ -72,6 +78,10 @@ export function getProviderHealth(agentGroupId: string, provider: string): Provi
  * True while the group's provider is inside a recorded cooldown window.
  * Absence of a row — the normal case — is always "available": this must fail
  * OPEN, or a bookkeeping gap would strand every group on its fallback.
+ *
+ * Seam 3: stays SYNCHRONOUS. It issues no statement of its own — its only DB
+ * access is `getProviderHealth`, which the §4.2 exception keeps on the raw
+ * handle — so there is nothing here to convert and its callers are unchanged.
  */
 export function isProviderUnavailable(
   agentGroupId: string,
@@ -88,6 +98,11 @@ export function isProviderUnavailable(
 /**
  * Record a provider as unavailable and return the window end.
  * `resetAt` is the provider's own stated recovery time when it gave one.
+ *
+ * Seam 3: stays SYNCHRONOUS on the raw handle — the read-then-upsert is one
+ * raw `db.transaction(() => …)()` closure, which is what keeps the failure
+ * streak from racing itself. It converts with the other ten central
+ * transaction sites in PR 6 (plan §4.2, §4.4).
  */
 export function markProviderUnavailable(
   agentGroupId: string,
@@ -131,20 +146,34 @@ export function markProviderUnavailable(
   })();
 }
 
-/** Clear a cooldown — a turn completed on this provider, so it works. */
-export function markProviderAvailable(agentGroupId: string, provider: string, options: { nowMs?: number } = {}): void {
+/**
+ * Clear a cooldown — a turn completed on this provider, so it works.
+ *
+ * The read stays on the synchronous `getProviderHealth` above (§4.2) and only
+ * the UPDATE moves onto the driver. That is not a check-then-act race this
+ * function has to care about: a concurrent `markProviderUnavailable` either
+ * commits before the read (whose row this then clears) or after the write
+ * (whose window then stands), and both orderings are the same two outcomes the
+ * all-synchronous version produced.
+ */
+export async function markProviderAvailable(
+  agentGroupId: string,
+  provider: string,
+  options: { nowMs?: number } = {},
+): Promise<void> {
   if (!agentGroupId || !provider) return;
   const row = getProviderHealth(agentGroupId, provider);
   // Only write when there is something to clear: a healthy provider must not
   // generate a DB write on every successful turn.
   if (!row || (row.unavailable_until === null && row.consecutive_failures === 0)) return;
-  getRawDb()
-    .prepare(
-      `UPDATE provider_health
+  await getDb().run(
+    `UPDATE provider_health
           SET unavailable_until = NULL, consecutive_failures = 0, updated_at = ?
         WHERE agent_group_id = ? AND provider = ?`,
-    )
-    .run(new Date(options.nowMs ?? Date.now()).toISOString(), agentGroupId, provider);
+    new Date(options.nowMs ?? Date.now()).toISOString(),
+    agentGroupId,
+    provider,
+  );
 }
 
 /**

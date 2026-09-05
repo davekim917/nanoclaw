@@ -44,7 +44,7 @@ vi.mock('./db/agent-groups.js', async (importOriginal) => ({
 
 vi.mock('./db/dropped-messages.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./db/dropped-messages.js')>()),
-  recordDroppedMessage: vi.fn(),
+  recordDroppedMessage: vi.fn(async () => undefined),
 }));
 
 vi.mock('./db/sessions.js', async (importOriginal) => ({

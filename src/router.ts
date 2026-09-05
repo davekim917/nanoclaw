@@ -699,7 +699,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
     }
 
     const parsed = safeParseContent(event.message.content);
-    recordDroppedMessage({
+    await recordDroppedMessage({
       channel_type: event.channelType,
       platform_id: event.platformId,
       user_id: null,
@@ -971,7 +971,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
   }
 
   if (engagedCount + accumulatedCount === 0) {
-    recordDroppedMessage({
+    await recordDroppedMessage({
       channel_type: event.channelType,
       platform_id: event.platformId,
       user_id: userId,

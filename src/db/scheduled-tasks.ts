@@ -179,6 +179,14 @@ export async function resolveActiveSession(agentGroupId: string, messagingGroupI
  *
  * `destination` is required by `TaskDef`'s type — TypeScript prevents
  * callers from omitting it; no runtime guard needed.
+ *
+ * Seam 3: this is the ONLY central-DB access in this file, and it stays
+ * SYNCHRONOUS on the raw handle — it is one of the ten pinned raw
+ * `db.transaction(...)` closures, and it is re-run inside `stamp` below, which
+ * is itself a synchronous mailbox action that must not await. It converts with
+ * the other central transaction sites in PR 6 (plan §4.2, §4.4). Every other
+ * DB call this file makes goes through the sessions leaf (PR 4) or the
+ * mailbox, so nothing else here changes in PR 3.
  */
 function resolveAndValidateDestination(def: TaskDef): { messagingGroupId: string } {
   const { platformId, channelType } = def.destination;
