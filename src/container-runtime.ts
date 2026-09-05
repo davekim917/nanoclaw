@@ -5,7 +5,12 @@
 import { execSync } from 'child_process';
 import os from 'os';
 
-import { CONTAINER_INSTALL_LABEL } from './config.js';
+import {
+  CONTAINER_GROUP_LABEL_KEY,
+  CONTAINER_INSTALL_LABEL,
+  CONTAINER_SESSION_LABEL_KEY,
+  CONTAINER_WORKGROUP_LABEL_KEY,
+} from './config.js';
 import { log } from './log.js';
 
 /** The container runtime binary name. */
@@ -102,6 +107,65 @@ function listInstallContainersStrict(): string[] {
   } catch (err) {
     throw new Error('Cannot prove install-scoped container absence: runtime listing failed', { cause: err });
   }
+}
+
+/** One install-labeled container as the boot inventory sees it. */
+export interface InstallContainerScope {
+  name: string;
+  /** `nanoclaw-workgroup` label, or null when the container carries none. */
+  workgroupId: string | null;
+  /** `nanoclaw-session` label, or null when the container carries none. */
+  sessionId: string | null;
+  /** `nanoclaw-group` label, or null when the container carries none. */
+  groupId: string | null;
+}
+
+/** Docker emits an empty string for a label a container does not carry. */
+function labelOrNull(value: string | undefined): string | null {
+  const trimmed = (value ?? '').trim();
+  return trimmed === '' || trimmed === '<no value>' ? null : trimmed;
+}
+
+/**
+ * Every install-labeled container with the scope labels the boot quiescence
+ * door needs (docs/specs/upstream-restart-survival-seam/plan.md §7.D).
+ *
+ * One `docker ps`, same install filter and same fail-closed contract as
+ * `listInstallContainersStrict`: a listing failure is never read as "none
+ * running". A container spawned before the scope labels shipped carries none
+ * of them, so every field but `name` reads as null and the caller must treat
+ * it as unknown scope (plan §3.5, divergence 7).
+ */
+export function listInstallContainersWithScope(): InstallContainerScope[] {
+  const format = [
+    '{{.Names}}',
+    `{{.Label "${CONTAINER_WORKGROUP_LABEL_KEY}"}}`,
+    `{{.Label "${CONTAINER_SESSION_LABEL_KEY}"}}`,
+    `{{.Label "${CONTAINER_GROUP_LABEL_KEY}"}}`,
+  ].join('\\t');
+  let output: string;
+  try {
+    output = execSync(`${CONTAINER_RUNTIME_BIN} ps --filter label=${CONTAINER_INSTALL_LABEL} --format '${format}'`, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      encoding: 'utf-8',
+    });
+  } catch (err) {
+    throw new Error('Cannot prove install-scoped container absence: runtime listing failed', { cause: err });
+  }
+  return output
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => {
+      const [name, workgroupId, sessionId, groupId] = line.split('\t');
+      return {
+        name: (name ?? '').trim(),
+        workgroupId: labelOrNull(workgroupId),
+        sessionId: labelOrNull(sessionId),
+        groupId: labelOrNull(groupId),
+      };
+    })
+    .filter((entry) => entry.name !== '');
 }
 
 /**

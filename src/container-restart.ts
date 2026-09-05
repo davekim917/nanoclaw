@@ -14,6 +14,7 @@ import {
   wakeContainer,
 } from './container-runner.js';
 import { randomUUID } from 'crypto';
+import { listInstallContainersWithScope, stopContainer, type InstallContainerScope } from './container-runtime.js';
 import { getSessionsByAgentGroup } from './db/sessions.js';
 import { log } from './log.js';
 import { SessionDbMissingError, sessionMailboxPath, type NanoclawMailboxSession } from './modules/mailbox/index.js';
@@ -475,6 +476,97 @@ export async function quiesceSessionsForRepositoryMounts(
       );
     }
   }
+}
+
+/** Counts from one boot quiescence pass — the §6 `Boot quiescence scope` line. */
+export interface BootQuiescenceScope {
+  /** Install-labeled containers the runtime reported. */
+  containers: number;
+  /** Containers this pass actually stopped. */
+  stopped: number;
+  /**
+   * Containers that carry a workgroup label outside the changed set — the ones
+   * milestone 1 will leave running once D2 flips the stop set. D1 stops them
+   * anyway; this count is the counterfactual the flip is measured against.
+   */
+  survivable: number;
+  /** Containers carrying no workgroup label: unknown scope, always stopped. */
+  unlabeled: number;
+}
+
+/** Injection seam for the boot door's runtime access — real docker by default. */
+export interface BootQuiescenceRuntime {
+  list?: () => InstallContainerScope[];
+  stop?: (name: string) => void;
+}
+
+/**
+ * The BOOT quiescence door (docs/specs/upstream-restart-survival-seam/plan.md
+ * §4.2, §7.D). Stops the containers whose mounts a startup reconcile is about
+ * to invalidate, and proves they are gone before the caller mutates anything.
+ *
+ * The stop set comes from the container runtime by label, not from
+ * `activeContainers`: the in-process registry is empty at boot, so the runtime
+ * door (`quiesceSessionsForRepositoryMounts`, above) cannot see a container
+ * left by the previous host (plan §3.5, divergence 2). Two doors, two
+ * authorities; both are pinned by src/workgroup-reconcile-doors.test.ts.
+ *
+ * A container with no workgroup label is unknown scope and is always stopped
+ * (divergence 7) — on the first restart after the scope labels ship, that is
+ * every container.
+ *
+ * D1 STOPS EVERYTHING. The partition is computed, proved and logged, but the
+ * stop set is still the whole install, exactly what `cleanupOrphansStrict` did.
+ * D2 is the one-branch flip to stopping only `mustStop`, and it is gated on
+ * adoption (plan §4.1).
+ *
+ * Fail-closed like the call it replaces: a listing failure, or a stop that does
+ * not take, throws — startup stops before any reconcile runs.
+ */
+export async function quiesceWorkgroupsForBootMountChange(
+  changedWorkgroupIds: string[],
+  runtime: BootQuiescenceRuntime = {},
+): Promise<BootQuiescenceScope> {
+  const list = runtime.list ?? listInstallContainersWithScope;
+  const stop = runtime.stop ?? stopContainer;
+  const changed = new Set(changedWorkgroupIds);
+
+  const containers = list();
+  const unlabeled = containers.filter((entry) => entry.workgroupId === null);
+  const mustStop = containers.filter((entry) => entry.workgroupId === null || changed.has(entry.workgroupId));
+  const survivable = containers.filter((entry) => entry.workgroupId !== null && !changed.has(entry.workgroupId));
+
+  // D1: the stop set is the whole install. D2 replaces this with `mustStop`.
+  const stopSet = containers;
+  for (const entry of stopSet) {
+    try {
+      stop(entry.name);
+    } catch (err) {
+      throw new Error(`Cannot prove install-scoped container absence: failed to stop ${entry.name}`, { cause: err });
+    }
+  }
+
+  const stopNames = new Set(stopSet.map((entry) => entry.name));
+  const remaining = list().filter((entry) => stopNames.has(entry.name));
+  if (remaining.length > 0) {
+    throw new Error(
+      `Install-scoped containers still running after boot quiescence: ${remaining.map((e) => e.name).join(', ')}`,
+    );
+  }
+
+  const scope: BootQuiescenceScope = {
+    containers: containers.length,
+    stopped: stopSet.length,
+    survivable: survivable.length,
+    unlabeled: unlabeled.length,
+  };
+  log.info('Boot quiescence scope', {
+    ...scope,
+    changed: changedWorkgroupIds.length,
+    // `mustStop` is what D2 will stop; under D1 it is a subset of `stopped`.
+    mustStop: mustStop.length,
+  });
+  return scope;
 }
 
 export function wakeRepositoryMountSessions(sessions: Session[]): void {

@@ -2,9 +2,14 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 import { pathToFileURL } from 'url';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
-import { isDirectExecution, resolveChannelMetadataUpdates, runWorkgroupMemoryStartupGate } from './main.js';
+import {
+  isDirectExecution,
+  resolveChannelMetadataUpdates,
+  runBootMountQuiescence,
+  runWorkgroupMemoryStartupGate,
+} from './main.js';
 
 // PR #251, rounds 5-7 all landed on this seam. The settled rule is a single
 // invariant, and it is about PROVENANCE, not about what any name looks like:
@@ -168,56 +173,101 @@ it('uses exact main-module identity instead of NODE_ENV to decide startup', () =
   expect(isDirectExecution(moduleUrl, undefined)).toBe(false);
 });
 
-it('test_startup_runs_strict_quiescence_before_any_memory_cutover', () => {
+it('test_startup_runs_strict_quiescence_before_any_memory_cutover', async () => {
+  // The strict proof moved out of the memory gate and into the boot door
+  // (docs/specs/upstream-restart-survival-seam/plan.md §7.D): one quiescence,
+  // ahead of BOTH reconciles, still fail-closed. The assertion is unchanged —
+  // a proof that cannot be completed stops startup before any cutover.
   const db = new Database(':memory:');
   const calls: string[] = [];
-  const ensureRuntime = vi.fn(() => calls.push('runtime'));
-  const cleanupStrict = vi.fn(() => {
-    calls.push('quiescence');
-    throw new Error('listing unavailable');
-  });
-  const reconcile = vi.fn(() => {
-    calls.push('reconcile');
-    return [];
-  });
 
-  expect(() =>
-    runWorkgroupMemoryStartupGate(db, {
-      ensureRuntime,
-      cleanupStrict,
-      reconcile,
+  await expect(
+    runBootMountQuiescence(db, {
+      workgroupIds: () => ['wg-1'],
+      memoryWouldChange: () => true,
+      sharedWouldChange: () => false,
+      sharedFsEnabled: true,
+      quiesce: () => {
+        calls.push('quiescence');
+        return Promise.reject(new Error('listing unavailable'));
+      },
+      warnStartup: async () => {
+        calls.push('warn');
+      },
+      reconcileShared: () => {
+        calls.push('reconcile-shared');
+      },
+      memoryGate: () => {
+        calls.push('reconcile-memory');
+        return [];
+      },
+      prune: () => {
+        calls.push('prune');
+      },
     }),
-  ).toThrow('listing unavailable');
-  expect(calls).toEqual(['runtime', 'quiescence']);
-  expect(reconcile).not.toHaveBeenCalled();
+  ).rejects.toThrow('listing unavailable');
+
+  expect(calls).toEqual(['quiescence']);
   db.close();
 });
 
-it('runs reconciliation only after runtime and strict absence proof succeed', () => {
+it('runs reconciliation only after runtime and strict absence proof succeed', async () => {
   const db = new Database(':memory:');
   const calls: string[] = [];
 
-  runWorkgroupMemoryStartupGate(db, {
+  await runBootMountQuiescence(db, {
+    workgroupIds: () => ['wg-1'],
+    memoryWouldChange: () => true,
+    sharedWouldChange: () => false,
+    sharedFsEnabled: true,
+    quiesce: () => {
+      calls.push('quiescence');
+      return Promise.resolve({ containers: 0, stopped: 0, survivable: 0, unlabeled: 0 });
+    },
+    warnStartup: async () => {
+      calls.push('warn');
+    },
+    reconcileShared: () => {
+      calls.push('reconcile-shared');
+    },
+    memoryGate: (_db, opts) => {
+      calls.push('reconcile-memory');
+      expect(opts.workgroupIds).toEqual(['wg-1']);
+      return [];
+    },
+    prune: () => {
+      calls.push('prune');
+    },
+  });
+
+  expect(calls).toEqual(['quiescence', 'warn', 'reconcile-shared', 'reconcile-memory', 'prune']);
+  db.close();
+});
+
+it('keeps the memory gate a runtime check plus the cutover, with nothing stopped inside it', () => {
+  const db = new Database(':memory:');
+  const calls: string[] = [];
+
+  const reports = runWorkgroupMemoryStartupGate(db, {
+    workgroupIds: ['wg-1'],
     ensureRuntime: () => {
       calls.push('runtime');
     },
-    cleanupStrict: () => {
-      calls.push('quiescence');
-      return [];
-    },
-    reconcile: () => {
+    reconcile: (_db, dirs) => {
       calls.push('reconcile');
+      expect(dirs.workgroupIds).toEqual(['wg-1']);
       return [];
     },
   });
 
-  expect(calls).toEqual(['runtime', 'quiescence', 'reconcile']);
+  expect(calls).toEqual(['runtime', 'reconcile']);
+  expect(reports).toEqual([]);
   db.close();
 });
 
 it('admits pending upgrade contexts after memory cutover and before any runtime can wake', () => {
   const source = fs.readFileSync(path.resolve('src/main.ts'), 'utf8');
-  const memoryCutover = source.indexOf('const memoryReports = runWorkgroupMemoryStartupGate(db);');
+  const memoryCutover = source.indexOf('const { memoryReports } = await runBootMountQuiescence(db);');
   const pendingUpgrade = source.indexOf('const pendingUpgrade = await reconcilePendingUpgradeContexts(');
   const dashboard = source.indexOf('startDashboard();');
   const channels = source.indexOf('await initChannelAdapters(');
