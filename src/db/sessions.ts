@@ -400,14 +400,19 @@ export async function getWarmQuietSessionMarks(nowIso: string): Promise<WarmQuie
  * A session with no row has no container and no delivery loop, so nothing is
  * left that could replay or re-execute the request the claim guarded.
  *
+ * `delivery_attempts` (migration 071) is the same shape of problem: the retry
+ * count is keyed to the session, has no cascading foreign key, and is only
+ * ever cleared by a delivery loop this session no longer has.
+ *
  * Seam 3: stays SYNCHRONOUS — it IS one of the eleven pinned central raw
- * `db.transaction(...)` sites (plan §4.4), and the two DELETEs are atomic by
+ * `db.transaction(...)` sites (plan §4.4), and the three DELETEs are atomic by
  * construction. Converts in PR 6.
  */
 export function deleteSession(id: string): void {
   const db = getRawDb();
   db.transaction(() => {
     db.prepare('DELETE FROM cli_request_executions WHERE session_id = ?').run(id);
+    db.prepare('DELETE FROM delivery_attempts WHERE session_id = ?').run(id);
     db.prepare('DELETE FROM sessions WHERE id = ?').run(id);
   })();
 }

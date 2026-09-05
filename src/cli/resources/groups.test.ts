@@ -37,6 +37,7 @@ const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-cli-group
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from '../../db/index.js';
 import { createSession } from '../../db/sessions.js';
+import { recordDeliveryAttempt } from '../../db/coordination.js';
 import { dispatch } from '../dispatch.js';
 import { readContainerConfig } from '../../container-config.js';
 import { ensureContainerConfig, getContainerConfig } from '../../db/container-configs.js';
@@ -293,6 +294,44 @@ describe('groups CLI delete cascades dependent rows (#2525)', () => {
     expect(data.removed.workgroups).toBe(1);
     expect(count('SELECT COUNT(*) AS c FROM agent_groups WHERE id = ?', SOLO)).toBe(0);
     expect(count('SELECT COUNT(*) AS c FROM workgroups WHERE id = ?', WG)).toBe(0);
+  });
+
+  it("deleting a group removes its sessions' delivery_attempts rows", async () => {
+    // Delivery retry counts (migration 071) are keyed to the session and have
+    // no cascading foreign key. Only a delivery loop clears one, and a deleted
+    // session has none — so the cascade is the last thing that can.
+    const GID = 'ag-attempts';
+    const SID = 'sess-attempts-1';
+
+    await createAgentGroup({ id: GID, name: 'attempts', folder: 'attempts', agent_provider: null, created_at: now() });
+    await createSession({
+      id: SID,
+      agent_group_id: GID,
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      created_at: now(),
+    });
+    await recordDeliveryAttempt({
+      messageId: 'out-doomed',
+      sessionId: SID,
+      now: now(),
+      nextAttemptAt: null,
+      error: 'boom',
+    });
+
+    const resp = await dispatch(
+      { id: 'req-del-attempts', command: 'groups-delete', args: { id: GID } },
+      { caller: 'host' },
+    );
+
+    expect(resp.ok).toBe(true);
+    const data = (resp as { ok: true; data: { removed: Record<string, number> } }).data;
+    expect(data.removed.delivery_attempts).toBe(1);
+    expect(count('SELECT COUNT(*) AS c FROM delivery_attempts WHERE session_id = ?', SID)).toBe(0);
   });
 });
 

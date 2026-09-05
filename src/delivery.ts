@@ -18,6 +18,12 @@ import {
 import { getAgentGroup } from './db/agent-groups.js';
 import { getRawDb, hasTableRaw } from './db/connection.js';
 import {
+  clearDeliveryAttempt,
+  getDeliveryAttempt,
+  recordDeliveryAttempt,
+  type DeliveryAttemptRow,
+} from './db/coordination.js';
+import {
   getTaskThreadAnchor,
   setTaskThreadAnchor,
   deleteTaskThreadAnchor,
@@ -67,8 +73,72 @@ const ACTIVE_POLL_MS = 1000;
 const SWEEP_POLL_MS = 60_000;
 const MAX_DELIVERY_ATTEMPTS = 3;
 
-/** Track delivery attempt counts. Resets on process restart (gives failed messages a fresh chance). */
-const deliveryAttempts = new Map<string, number>();
+/**
+ * Attempt counts live in the `delivery_attempts` table, so they survive a
+ * host restart: a poison message gets MAX_DELIVERY_ATTEMPTS total, not
+ * MAX_DELIVERY_ATTEMPTS per process lifetime (the old in-memory counter
+ * reset on every restart, so a crash-looping host retried it forever).
+ * Bookkeeping failures must never break delivery: a failed read delivers
+ * without a stored count, a failed record skips the give-up decision for this
+ * tick (the message just retries next poll), and a failed clear leaves a stale
+ * row the next lifecycle of the same id clears.
+ *
+ * The count is consulted BEFORE the adapter is called, not only after a
+ * failure, because recording attempt N and marking the message permanently
+ * failed are two separate writes. A host that dies between them leaves a row
+ * at the cap with no terminal `delivered` row, and a successor that only ever
+ * read the count after its own failure would call the adapter again — attempt
+ * N+1, unbounded across repeated crashes in that window, and a duplicate
+ * user-visible message whenever the failure happened after the send left the
+ * host. Reading first makes the stored row terminal on its own.
+ */
+async function recordAttemptRow(messageId: string, sessionId: string, err: unknown): Promise<number | null> {
+  /* eslint-disable no-catch-all/no-catch-all -- attempt bookkeeping must never break delivery */
+  try {
+    return await recordDeliveryAttempt({
+      messageId,
+      sessionId,
+      now: new Date().toISOString(),
+      nextAttemptAt: null,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  } catch (recordErr) {
+    log.error('Failed to record delivery attempt — retrying next poll without a count', {
+      messageId,
+      sessionId,
+      err: recordErr,
+    });
+    return null;
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+}
+
+/**
+ * The stored row, or `undefined` when there is none and when the read failed.
+ * The whole row rather than just the count: `last_error` is the only surviving
+ * description of why the message failed under the previous host, and the
+ * terminal give-up has to carry it forward.
+ */
+async function readAttemptRow(messageId: string): Promise<DeliveryAttemptRow | undefined> {
+  /* eslint-disable no-catch-all/no-catch-all -- attempt bookkeeping must never block delivery */
+  try {
+    return await getDeliveryAttempt(messageId);
+  } catch (err) {
+    log.warn('Failed to read delivery attempt row — delivering without a stored count', { messageId, err });
+    return undefined;
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+}
+
+async function clearAttemptRow(messageId: string): Promise<void> {
+  /* eslint-disable no-catch-all/no-catch-all -- attempt bookkeeping must never break delivery */
+  try {
+    await clearDeliveryAttempt(messageId);
+  } catch (err) {
+    log.warn('Failed to clear delivery attempt row', { messageId, err });
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+}
 
 // ── Sweep change-gate (docs/specs/bounded-periodic-work/plan.md) ──
 //
@@ -83,8 +153,12 @@ const deliveryAttempts = new Map<string, number>();
 //
 //   1. Arm only after a drain proves the session has NOTHING outstanding —
 //      not even a future `deliver_after` row, and not after a delivery error.
-//      Retry state lives only in `deliveryAttempts` (in memory), so a failed
-//      delivery never moves the file and would otherwise be skipped forever.
+//      Retry state now lives in the central DB's `delivery_attempts` rows
+//      rather than in process memory, but THE RULE IS UNCHANGED and must not
+//      be relaxed on that basis: the retry itself is still driven by polling
+//      the session's own outbound.db, and a failed delivery writes nothing
+//      there, so its mtime does not move. Arming on a drain that ended in an
+//      error would skip that session until the backoff in rule 2 expires.
 //   2. Expire the skip on time as well as on the change signal, so a bug in
 //      the signal costs bounded delay instead of permanent silence.
 export const QUIET_DELIVERY_BACKOFF_MS = 10 * 60_000;
@@ -592,7 +666,80 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
 
   let sawError = false;
   const deliveredNow = new Set<string>();
+
+  /**
+   * Terminal drop for one message, reached either from this tick's own
+   * failure or from a stored count that is already at the cap. `decidedFrom`
+   * says which, so the operator reading the first `giving up` line after a
+   * restart can tell a fresh exhaustion from an inherited one.
+   */
+  const giveUpOnMessage = async (
+    msg: (typeof undelivered)[number],
+    attempts: number,
+    errMsg: string,
+    decidedFrom: 'this attempt' | 'a count stored before this host started',
+    err?: unknown,
+  ): Promise<void> => {
+    log.error('Message delivery failed permanently, giving up', {
+      messageId: msg.id,
+      sessionId: session.id,
+      attempts,
+      decidedFrom,
+      err: err ?? errMsg,
+    });
+    await ackDelivery(agentGroup.id, session.id, (mailbox) => mailbox.markDeliveryFailed(msg.id, errMsg));
+    await clearAttemptRow(msg.id);
+    // Incident 2026-09-01: the row dropped here was a repository
+    // publication that had already fenced ~1400 session inbound DBs in
+    // its workgroup. Its strict release fails fast on the first bad
+    // session, so every session behind that one stayed fenced — deaf,
+    // unspawnable, and with no code path left to free it. Giving up on
+    // the message is the last moment the host knows the transition has
+    // ended, so release any fence no live publication still owns.
+    // Lazy import: session-manager already imports delivery, so a static
+    // edge here would close a module-init cycle (CLAUDE.md).
+    try {
+      const { releaseOrphanedRepoIngressFencesForDroppedMessage } = await import('./repo-fence-recovery.js');
+      await releaseOrphanedRepoIngressFencesForDroppedMessage(msg, session);
+    } catch (recoveryErr) {
+      log.error('Orphaned repository fence recovery after a dropped delivery failed', {
+        messageId: msg.id,
+        sessionId: session.id,
+        err: recoveryErr,
+      });
+    }
+  };
+
   for (const msg of undelivered) {
+    // A stored count already at the cap is terminal on its own — the crash
+    // window described on the helpers above leaves exactly that row behind.
+    // Deciding from it BEFORE the adapter runs is what stops a successor host
+    // spending attempt N+1, and stops a re-send of a message whose failure
+    // happened after it had already left the previous host.
+    const stored = await readAttemptRow(msg.id);
+    if (stored !== undefined && stored.attempts >= MAX_DELIVERY_ATTEMPTS) {
+      // Terminal, like the give-up below, so the drain must not arm the quiet
+      // cache this tick. The `delivered` row it writes takes the message out
+      // of `outstanding` on the next drain.
+      sawError = true;
+      // The persisted adapter error, verbatim, because it is what the failure
+      // actually was: the runner surfaces `delivered.error` to synchronous
+      // callers (`send_file` and friends, container/agent-runner/src/db/
+      // delivery-acks.ts), and a missing scope or an oversized file is only
+      // actionable if that text survives the restart. The generic line is a
+      // fallback for a row with no error stored, never a replacement.
+      await giveUpOnMessage(
+        msg,
+        stored.attempts,
+        stored.last_error && stored.last_error.length > 0
+          ? stored.last_error
+          : `delivery abandoned: ${stored.attempts} attempts recorded before this host started`,
+        'a count stored before this host started',
+      );
+      // Nothing was sent, so nothing can overtake this row: unlike the retry
+      // branch below, a terminal decision does not have to break the drain.
+      continue;
+    }
     try {
       const result = await deliverMessage(msg, session);
       // System actions like request_bash_gate return deferAck:true — the
@@ -631,7 +778,7 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
           });
         }
       }
-      deliveryAttempts.delete(msg.id);
+      await clearAttemptRow(msg.id);
 
       // Pause the typing indicator after a real user-facing message
       // lands on the user's screen, so the client has time to visually
@@ -644,41 +791,14 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
       }
     } catch (err) {
       sawError = true;
-      const attempts = (deliveryAttempts.get(msg.id) ?? 0) + 1;
-      deliveryAttempts.set(msg.id, attempts);
-      if (attempts >= MAX_DELIVERY_ATTEMPTS) {
-        log.error('Message delivery failed permanently, giving up', {
-          messageId: msg.id,
-          sessionId: session.id,
-          attempts,
-          err,
-        });
-        const errMsg = err instanceof Error ? err.message : String(err);
-        await ackDelivery(agentGroup.id, session.id, (mailbox) => mailbox.markDeliveryFailed(msg.id, errMsg));
-        deliveryAttempts.delete(msg.id);
-        // Incident 2026-09-01: the row dropped here was a repository
-        // publication that had already fenced ~1400 session inbound DBs in
-        // its workgroup. Its strict release fails fast on the first bad
-        // session, so every session behind that one stayed fenced — deaf,
-        // unspawnable, and with no code path left to free it. Giving up on
-        // the message is the last moment the host knows the transition has
-        // ended, so release any fence no live publication still owns.
-        // Lazy import: session-manager already imports delivery, so a static
-        // edge here would close a module-init cycle (CLAUDE.md).
-        try {
-          const { releaseOrphanedRepoIngressFencesForDroppedMessage } = await import('./repo-fence-recovery.js');
-          await releaseOrphanedRepoIngressFencesForDroppedMessage(msg, session);
-        } catch (recoveryErr) {
-          log.error('Orphaned repository fence recovery after a dropped delivery failed', {
-            messageId: msg.id,
-            sessionId: session.id,
-            err: recoveryErr,
-          });
-        }
+      const attempts = await recordAttemptRow(msg.id, session.id, err);
+      if (attempts !== null && attempts >= MAX_DELIVERY_ATTEMPTS) {
+        await giveUpOnMessage(msg, attempts, err instanceof Error ? err.message : String(err), 'this attempt', err);
       } else {
         log.warn('Message delivery failed, will retry', {
           messageId: msg.id,
           sessionId: session.id,
+          // null: the bookkeeping write itself failed; count unknown this tick.
           attempt: attempts,
           maxAttempts: MAX_DELIVERY_ATTEMPTS,
           err,
