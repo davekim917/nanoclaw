@@ -26,11 +26,12 @@ import {
   updateMessagingGroup,
 } from './db/messaging-groups.js';
 import type { ChannelNameSource, MessagingGroupUpdates } from './db/messaging-groups.js';
-import { ensureContainerRuntimeRunning, cleanupOrphansStrict } from './container-runtime.js';
+import { ensureContainerRuntimeRunning } from './container-runtime.js';
 import { warnActiveContainersOfShutdown, warnMarkedRunningSessionsOfStartup } from './host-restart-warn.js';
-import { resetPhantomContainerStatus } from './db/sessions.js';
+import { getActiveSessions, resetPhantomContainerStatus } from './db/sessions.js';
 import { resetProcessingChannelIngress } from './db/channel-ingress-receipts.js';
 import { getActiveContainerSessionIds, stopAllContainers } from './container-runner.js';
+import { quiesceWorkgroupsForBootMountChange, type BootQuiescenceScope } from './container-restart.js';
 import { writeUpstreamPolicySnapshot } from './container-updates.js';
 import { setDeliveryAdapter, startActiveDeliveryPoll, startSweepDeliveryPoll, stopDeliveryPolls } from './delivery.js';
 import { getHostInstanceId, startHostInstanceLease, stopHostInstanceLease } from './host-instance.js';
@@ -135,6 +136,8 @@ import { reconcileWorkgroupFsState } from './modules/workgroup/fs-reconcile.js';
 import {
   reconcileWorkgroupMemory,
   reconcileWorkgroupSharedDirs,
+  sharedDirsReconcileWouldChange,
+  workgroupMemoryReconcileWouldChange,
   type WorkgroupMemoryReport,
 } from './modules/workgroup/shared-dirs.js';
 import { WORKGROUP_SHARED_FS } from './config.js';
@@ -152,17 +155,227 @@ import {
 } from './channels/channel-registry.js';
 import type Database from 'better-sqlite3';
 
+/**
+ * Canonical-memory reconciliation for the workgroups the boot door proved
+ * quiescent.
+ *
+ * It no longer stops anything: `cleanupOrphansStrict()` moved out to
+ * `quiesceWorkgroupsForBootMountChange`, which runs once, ahead of every
+ * reconcile, and proves its own scope (plan §7.D). This gate is now the
+ * runtime check plus the cutover, and it must never be called from outside a
+ * quiescence door — src/workgroup-reconcile-doors.test.ts pins that.
+ */
 export function runWorkgroupMemoryStartupGate(
   db: Database.Database,
   deps: {
+    /**
+     * Confines the cutover's WRITES to the workgroups the boot door proved
+     * quiescent. Every workgroup is still reported: `main()` derives the
+     * pending-pre-turn-context targets and the migration-required operator
+     * warnings from these reports, and an ordinary boot changes nothing, so
+     * scoping the report set would silently skip both on almost every start.
+     */
+    mutateWorkgroupIds?: string[];
     ensureRuntime?: () => void;
-    cleanupStrict?: () => string[];
-    reconcile?: (db: Database.Database) => WorkgroupMemoryReport[];
+    reconcile?: (db: Database.Database, dirs: { mutateWorkgroupIds?: string[] }) => WorkgroupMemoryReport[];
   } = {},
 ): WorkgroupMemoryReport[] {
   (deps.ensureRuntime ?? ensureContainerRuntimeRunning)();
-  (deps.cleanupStrict ?? cleanupOrphansStrict)();
-  return (deps.reconcile ?? reconcileWorkgroupMemory)(db);
+  return (deps.reconcile ?? reconcileWorkgroupMemory)(db, { mutateWorkgroupIds: deps.mutateWorkgroupIds });
+}
+
+/** Seams the boot mount-change block injects in tests; real work by default. */
+export interface BootMountQuiescenceDeps {
+  workgroupIds?: (db: Database.Database) => string[];
+  memoryWouldChange?: (db: Database.Database, workgroupId: string) => boolean;
+  sharedWouldChange?: (db: Database.Database, workgroupId: string) => boolean;
+  sharedFsEnabled?: boolean;
+  activeSessionIds?: () => Promise<string[]>;
+  ensureRuntime?: () => void;
+  quiesce?: (
+    changedWorkgroupIds: string[],
+    options: {
+      knownWorkgroupIds: string[];
+      knownSessionIds: string[];
+      reevaluateChanged: () => string[];
+    },
+  ) => Promise<BootQuiescenceScope>;
+  warnStartup?: (reason: string, skipSessionIds: ReadonlySet<string>) => Promise<void>;
+  reconcileShared?: (db: Database.Database, dirs: { workgroupIds?: string[] }) => void;
+  memoryGate?: (db: Database.Database, opts: { mutateWorkgroupIds?: string[] }) => WorkgroupMemoryReport[];
+  prune?: () => void;
+  fatal?: (message: string, err: unknown) => never;
+}
+
+/**
+ * Sessions the startup warn skips. EMPTY under D1, and that is the correct
+ * value, not a placeholder.
+ *
+ * Series G narrowed the warn to the sessions a restart actually interrupts and
+ * takes the skip set from the caller (`src/host-restart-warn.ts`). Two reasons
+ * it stays empty here:
+ *
+ *   - D1 stops EVERY install-labeled container, the survivable partition
+ *     included. Skipping the sessions the door reports survivable would leave
+ *     unwarned exactly the sessions D1 goes on to stop — the inversion of what
+ *     the note is for.
+ *   - The partition does not exist yet at this point. It is computed AFTER
+ *     quiescence, deliberately (see `quiesceWorkgroupsForBootMountChange`), and
+ *     the warn has to run before the stops because that pass can outlast the
+ *     heartbeat freshness window.
+ *
+ * D2 is where this becomes `new Set(preStopScope.survivableSessionIds)`, and it
+ * has to be the PRE-stop partition for exactly the ordering reason above. The
+ * door's own D2 note already records that D2 partitions twice — once pre-stop
+ * to choose the stop set, once post-stop for the adoption contract — and this
+ * skip set is the first of those two.
+ */
+const BOOT_WARN_SKIP_SESSION_IDS: ReadonlySet<string> = new Set<string>();
+
+function bootFatal(message: string, err: unknown): never {
+  log.error(message, { err });
+  process.exit(1);
+}
+
+/**
+ * The boot mount-change block: decide the scope, prove it, then reconcile.
+ *
+ * Order is the safety argument (plan §4.1, §7.D), and every step of it is
+ * asserted in src/boot-quiescence-order.test.ts:
+ *
+ *   1. warn sessions still marked 'running' by an unclean previous host —
+ *      BEFORE anything is stopped, which is where `main()` has always had it,
+ *      and it is DB-only so it stays ahead of every docker call;
+ *   2. probe the container runtime, bounded, before the door's unbounded
+ *      inventory — the order main has;
+ *   3. evaluate the predicates once, as the door's input;
+ *   4. quiesce — the ONLY thing that stops containers at boot, and it throws
+ *      before anything below runs if it cannot prove its scope is down;
+ *   5. the door re-evaluates the predicates on the now-quiescent tree and
+ *      partitions against THAT answer; the same set drives the reconciles.
+ *      Group directories are container-writable, so the pre-stop snapshot can
+ *      be stale by the time the stops finish, and a scope built from it would
+ *      call a flipped workgroup's sessions survivable;
+ *   6. shared-FS consolidation, scoped to the post-stop set. It used to run
+ *      BEFORE the quiescence proof (plan §3.5, divergence 4), masked only by
+ *      the flag defaulting off;
+ *   7. canonical-memory cutover, scoped to the same set;
+ *   8. snapshot pruning, after both cutovers.
+ *
+ * Steps 2 and 3 are swapped relative to §7.D's listed order, deliberately: the
+ * plan's order writes the accountability note after the stops, so a door that
+ * fails part way through them would leave the sessions it already killed with
+ * no note at all. Warning first is what `main()` did before this PR.
+ *
+ * D1 measures: `quiesceWorkgroupsForBootMountChange` still stops the whole
+ * install regardless of the scope it computes, so this boot behaves exactly
+ * as the one before it. The scope decision runs in production, and its
+ * `survivable` count is the milestone-1 counterfactual, before D2 is allowed
+ * to act on it.
+ */
+export async function runBootMountQuiescence(
+  db: Database.Database,
+  deps: BootMountQuiescenceDeps = {},
+): Promise<{ changedWorkgroupIds: string[]; scope: BootQuiescenceScope; memoryReports: WorkgroupMemoryReport[] }> {
+  const sharedFsEnabled = deps.sharedFsEnabled ?? WORKGROUP_SHARED_FS;
+  const listWorkgroupIds =
+    deps.workgroupIds ??
+    ((database: Database.Database): string[] =>
+      (database.prepare(`SELECT id FROM workgroups ORDER BY id`).all() as Array<{ id: string }>).map((row) => row.id));
+  const memoryWouldChange = deps.memoryWouldChange ?? workgroupMemoryReconcileWouldChange;
+  const sharedWouldChange = deps.sharedWouldChange ?? sharedDirsReconcileWouldChange;
+  const fatal = deps.fatal ?? bootFatal;
+
+  const allWorkgroupIds = listWorkgroupIds(db);
+  const evaluateChanged = (): string[] =>
+    allWorkgroupIds.filter((id) => memoryWouldChange(db, id) || (sharedFsEnabled && sharedWouldChange(db, id)));
+
+  // Warn FIRST, before anything is stopped. `main()` has always captured this
+  // evidence ahead of the fleet-wide stop (the warn sat above the memory gate
+  // that held `cleanupOrphansStrict`), and it has to stay there: the note is
+  // written from the session rows an unclean previous host left marked
+  // 'running', and a door that dies half way through its stops would otherwise
+  // leave the sessions it did kill with no accountability at all. §7.D's
+  // listed order puts the warn after the door; that regresses this, so the
+  // order here is main's, not the plan's — recorded as a deviation.
+  try {
+    await (deps.warnStartup ?? warnMarkedRunningSessionsOfStartup)(
+      'host startup after an unclean stop',
+      BOOT_WARN_SKIP_SESSION_IDS,
+    );
+  } catch (err) {
+    log.error('host-restart startup warn failed', { err });
+  }
+
+  // Bounded probe BEFORE the unbounded inventory, which is the order main has.
+  // There `ensureContainerRuntimeRunning()` (a 10 s-timeout `docker info`) ran
+  // immediately ahead of `cleanupOrphansStrict()`; here the door's
+  // `listInstallContainersWithScope` is an unbounded `docker ps`, so without
+  // this a stalled daemon hangs the boot instead of failing it. The memory
+  // gate keeps its own call: idempotent, and fast when the daemon is healthy.
+  (deps.ensureRuntime ?? ensureContainerRuntimeRunning)();
+
+  // The pre-stop evaluation is the door's INPUT, and nothing more. The group
+  // directories these predicates read are bind-mounted writable into live
+  // containers, so a still-running agent can flip a workgroup from settled to
+  // needs-reconcile between this snapshot and the stops completing.
+  const changedBeforeQuiescence = evaluateChanged();
+
+  // One read, for the door's known-session test. A container whose session row
+  // is gone or archived has nothing for adoption to resolve, so it can never
+  // be classified survivable.
+  const knownSessionIds = await (
+    deps.activeSessionIds ?? (async () => (await getActiveSessions()).map((session) => session.id))
+  )();
+
+  const scope = await (deps.quiesce ?? quiesceWorkgroupsForBootMountChange)(changedBeforeQuiescence, {
+    knownWorkgroupIds: allWorkgroupIds,
+    knownSessionIds,
+    // Re-run on the quiescent tree. The door partitions against THIS answer,
+    // so the scope it returns and the cutover below can never disagree about
+    // which workgroups changed.
+    reevaluateChanged: evaluateChanged,
+  });
+
+  // The authoritative set: one evaluation, inside the door, after the proof.
+  // A workgroup that flipped while the stops were in flight is in it, so it is
+  // reconciled here and is must-stop in the partition — never left out of both.
+  const changedWorkgroupIds = scope.changedWorkgroupIds;
+  const flipped = changedWorkgroupIds.filter((id) => !changedBeforeQuiescence.includes(id));
+  log.info('Boot quiescence rescope', {
+    changedBefore: changedBeforeQuiescence.length,
+    changedAfter: changedWorkgroupIds.length,
+    // Non-empty means a live agent wrote to a group directory while the door
+    // was stopping it. Harmless under D1; under D2 it is the case the door's
+    // own re-validation has to cover (see quiesceWorkgroupsForBootMountChange).
+    ...(flipped.length > 0 ? { flipped } : {}),
+  });
+
+  // Workgroup shared-FS consolidation — flag-gated (NANOCLAW_WORKGROUP_SHARED_FS,
+  // default off). Moves each workgroup's shared dirs into data/workgroups/<id>/
+  // (bind-mounted at /workspace/workgroup). Idempotent + fail-closed.
+  if (sharedFsEnabled) {
+    try {
+      (deps.reconcileShared ?? reconcileWorkgroupSharedDirs)(db, { workgroupIds: changedWorkgroupIds });
+    } catch (sharedErr) {
+      fatal('Workgroup shared-FS consolidation failed at startup', sharedErr);
+    }
+  }
+
+  const memoryReports = (deps.memoryGate ?? runWorkgroupMemoryStartupGate)(db, {
+    mutateWorkgroupIds: changedWorkgroupIds,
+  });
+
+  // Prune old agent-runner-source snapshots now that the boot door above has
+  // stopped every container left running by an unclean previous host — pruning
+  // any earlier is unsafe (a bind mount pins the directory, not its entries).
+  // `defaultReferencedPaths` reads docker rather than the in-process registry
+  // (src/agent-runner-source.ts), so this stays correct under D2, when an
+  // adopted container is a live reference this call must not delete out from
+  // under.
+  (deps.prune ?? pruneAgentRunnerSnapshots)();
+
+  return { changedWorkgroupIds, scope, memoryReports };
 }
 
 /**
@@ -297,53 +510,11 @@ export async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Workgroup shared-FS consolidation — flag-gated (NANOCLAW_WORKGROUP_SHARED_FS,
-  // default off). Moves each workgroup's shared dirs into data/workgroups/<id>/
-  // (bind-mounted at /workspace/workgroup). Idempotent + fail-closed; runs
-  // before any container spawn so the filesystem is quiesced during the move.
-  if (WORKGROUP_SHARED_FS) {
-    try {
-      reconcileWorkgroupSharedDirs(db);
-    } catch (sharedErr) {
-      log.error('Workgroup shared-FS consolidation failed at startup', { err: sharedErr });
-      process.exit(1);
-    }
-  }
-
-  // Canonical memory reconciliation can create links only after install-scoped
-  // container absence has been proved. A failed runtime listing is not
-  // equivalent to "none running": cleanupOrphansStrict throws and startup
-  // stops before any filesystem cutover. FIRST warn sessions still marked
-  // 'running' (unclean previous host) whose containers this boot will stop —
-  // the on_wake note makes the next spawn account publicly instead of the
-  // session going dark until a human pings.
-  //
-  // BEFORE the stop pass, deliberately. That pass is sequential and can run
-  // longer than the heartbeat freshness window end to end, so warning after it
-  // would find the earliest-stopped sessions' heartbeat evidence already aged
-  // out and leave exactly the interrupted sessions unwarned. The skip set is
-  // therefore a prediction of which containers survive, not an observation.
-  //
-  // D1 integration: `new Set(scope.survivableSessionIds)`, where `scope` is the
-  // partition `runBootMountQuiescence` passes through — `survivableSessionIds`
-  // plus its complement `mustStopSessionIds` (seam4/d1, #440). Until that lands
-  // the boot stops every container, so the set is empty and every session
-  // marked running is treated as interrupted, exactly as before.
-  try {
-    await warnMarkedRunningSessionsOfStartup('host startup after an unclean stop', new Set<string>());
-  } catch (err) {
-    log.error('host-restart startup warn failed', { err });
-  }
-  const memoryReports = runWorkgroupMemoryStartupGate(db);
-
-  // Prune old agent-runner-source snapshots now that cleanupOrphansStrict()
-  // (inside runWorkgroupMemoryStartupGate, above) has stopped every
-  // container left running by an unclean previous host — pruning any
-  // earlier is unsafe (a bind mount pins the directory, not its entries).
-  // When container adoption across restarts lands (mailbox seam 2), this
-  // ordering assumption needs revisiting: an adopted container is a live
-  // reference this call must not delete out from under.
-  pruneAgentRunnerSnapshots();
+  // Boot mount-change block: scope → quiescence proof → both reconciles →
+  // snapshot prune. Nothing here mutates a mount before the proof returns; a
+  // listing failure or a stop that does not take throws out of startup, which
+  // is what "prove install-scoped container absence" has always meant.
+  const { memoryReports } = await runBootMountQuiescence(db);
   for (const report of memoryReports) {
     if (report.state.status === 'migration-required') {
       log.warn('Workgroup memory requires operator migration; automatic startup left it untouched', {

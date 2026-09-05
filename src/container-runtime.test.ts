@@ -30,8 +30,14 @@ import {
   ensureContainerRuntimeRunning,
   cleanupOrphans,
   cleanupOrphansStrict,
+  listInstallContainersWithScope,
 } from './container-runtime.js';
-import { CONTAINER_INSTALL_LABEL } from './config.js';
+import {
+  CONTAINER_GROUP_LABEL_KEY,
+  CONTAINER_INSTALL_LABEL,
+  CONTAINER_SESSION_LABEL_KEY,
+  CONTAINER_WORKGROUP_LABEL_KEY,
+} from './config.js';
 import { log } from './log.js';
 
 beforeEach(() => {
@@ -190,5 +196,44 @@ describe('cleanupOrphansStrict', () => {
     mockExecSync.mockReturnValueOnce('nanoclaw-a-1\n').mockReturnValueOnce('').mockReturnValueOnce('nanoclaw-a-1\n');
 
     expect(() => cleanupOrphansStrict()).toThrow(/still running/);
+  });
+});
+
+describe('listInstallContainersWithScope', () => {
+  it('reads the three scope labels beside the name', () => {
+    mockExecSync.mockReturnValueOnce('nanoclaw-v2-a-1\twg-a\tsess-a\tgrp-a\n');
+
+    expect(listInstallContainersWithScope()).toEqual([
+      { name: 'nanoclaw-v2-a-1', workgroupId: 'wg-a', sessionId: 'sess-a', groupId: 'grp-a' },
+    ]);
+    const command = mockExecSync.mock.calls[0][0] as string;
+    expect(command).toContain(`--filter label=${CONTAINER_INSTALL_LABEL}`);
+    for (const key of [CONTAINER_WORKGROUP_LABEL_KEY, CONTAINER_SESSION_LABEL_KEY, CONTAINER_GROUP_LABEL_KEY]) {
+      expect(command).toContain(`{{.Label "${key}"}}`);
+    }
+    expect(mockExecSync).toHaveBeenCalledTimes(1);
+  });
+
+  it('reads a missing label as null — unknown scope, never an empty string', () => {
+    // Divergence 7: every container spawned before the labels shipped looks
+    // like this, and the boot door must treat it as unknown scope.
+    mockExecSync.mockReturnValueOnce('nanoclaw-v2-legacy-1\t\t\t\n');
+
+    expect(listInstallContainersWithScope()).toEqual([
+      { name: 'nanoclaw-v2-legacy-1', workgroupId: null, sessionId: null, groupId: null },
+    ]);
+  });
+
+  it('returns an empty inventory for an empty listing', () => {
+    mockExecSync.mockReturnValueOnce('\n');
+    expect(listInstallContainersWithScope()).toEqual([]);
+  });
+
+  it('fails closed when the runtime listing fails', () => {
+    mockExecSync.mockImplementationOnce(() => {
+      throw new Error('runtime listing failed');
+    });
+
+    expect(() => listInstallContainersWithScope()).toThrow(/prove install-scoped container absence/);
   });
 });
