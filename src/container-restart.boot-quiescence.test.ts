@@ -1,0 +1,200 @@
+/**
+ * Acceptance cases for the boot quiescence door (convergence seam 4, PR D1 —
+ * docs/specs/upstream-restart-survival-seam/plan.md §7.D).
+ *
+ * The runtime listing is a fake: no `docker ps`, no `docker stop`. The
+ * `child_process` tripwire below records and throws on any real spawn, and
+ * every case asserts it stayed empty — the whole point of this door is that it
+ * is the ONE place at boot that stops containers, so a stray spawn from
+ * anywhere in the import graph is a finding, not noise.
+ *
+ * D1 is the measurement PR: the door partitions `mustStop` from `survivable`,
+ * logs the counts, and then stops EVERYTHING, exactly as `cleanupOrphansStrict`
+ * did. The "counted survivable — and still stopped" case is the one D2 flips.
+ */
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+const spawns = vi.hoisted(() => [] as string[]);
+
+/** A tripwire, not a functional mock: it records the call and then throws. */
+function childProcessTripwire(record: string[]): Record<string, (...args: unknown[]) => never> {
+  const spawnAttempted =
+    (name: string) =>
+    (...args: unknown[]): never => {
+      record.push(name);
+      throw new Error(`boot-quiescence.test: real process spawn attempted (${name}(${JSON.stringify(args[0])}))`);
+    };
+  return {
+    exec: spawnAttempted('exec'),
+    execFile: spawnAttempted('execFile'),
+    spawn: spawnAttempted('spawn'),
+    execSync: spawnAttempted('execSync'),
+    execFileSync: spawnAttempted('execFileSync'),
+    spawnSync: spawnAttempted('spawnSync'),
+    fork: spawnAttempted('fork'),
+  };
+}
+
+vi.mock('child_process', () => childProcessTripwire(spawns));
+vi.mock('node:child_process', () => childProcessTripwire(spawns));
+
+// NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
+// handlers (including process.exit(1)) at module scope.
+vi.mock('./log.js', () => ({
+  setLogScrubber: vi.fn(),
+  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn() },
+  isSurvivableIoError: vi.fn(() => false),
+}));
+
+// The runtime door's dependencies are irrelevant here and expensive to load.
+vi.mock('./container-runner.js', () => ({
+  containerOwnsOutbound: vi.fn(() => false),
+  getContainerSpawnedAt: vi.fn(() => 0),
+  isContainerRunning: vi.fn(() => false),
+  isContainerSpawning: vi.fn(() => false),
+  killContainer: vi.fn(),
+  sessionStillActive: vi.fn(() => true),
+  wakeContainer: vi.fn(async () => undefined),
+}));
+
+// Stubbed so the module graph never reaches a real `docker ps`; every case
+// injects its own listing through the primitive's runtime seam anyway.
+vi.mock('./container-runtime.js', () => ({
+  listInstallContainersWithScope: vi.fn(() => {
+    throw new Error('container-runtime must not be reached in this suite');
+  }),
+  stopContainer: vi.fn(() => {
+    throw new Error('container-runtime must not be reached in this suite');
+  }),
+}));
+
+import { quiesceWorkgroupsForBootMountChange } from './container-restart.js';
+import type { InstallContainerScope } from './container-runtime.js';
+import { log } from './log.js';
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  spawns.length = 0;
+});
+
+function container(name: string, workgroupId: string | null): InstallContainerScope {
+  return { name, workgroupId, sessionId: `${name}-session`, groupId: `${name}-group` };
+}
+
+/**
+ * A fake runtime: `list()` returns whatever is still "running", `stop()`
+ * removes it. `stubborn` models a container that does not go away.
+ */
+function fakeRuntime(initial: InstallContainerScope[], stubborn: string[] = []) {
+  let running = [...initial];
+  const stops: string[] = [];
+  const listings: number[] = [];
+  return {
+    stops,
+    listings,
+    list: (): InstallContainerScope[] => {
+      listings.push(running.length);
+      return [...running];
+    },
+    stop: (name: string): void => {
+      stops.push(name);
+      if (!stubborn.includes(name)) running = running.filter((entry) => entry.name !== name);
+    },
+  };
+}
+
+describe('quiesceWorkgroupsForBootMountChange', () => {
+  it('a container in a changed workgroup is stopped', async () => {
+    const runtime = fakeRuntime([container('nanoclaw-v2-a-1', 'wg-a')]);
+
+    const scope = await quiesceWorkgroupsForBootMountChange(['wg-a'], runtime);
+
+    expect(runtime.stops).toEqual(['nanoclaw-v2-a-1']);
+    expect(scope).toEqual({ containers: 1, stopped: 1, survivable: 0, unlabeled: 0 });
+    expect(spawns).toEqual([]);
+  });
+
+  it('a container in an unchanged workgroup is counted survivable', async () => {
+    const runtime = fakeRuntime([container('nanoclaw-v2-b-1', 'wg-b')]);
+
+    const scope = await quiesceWorkgroupsForBootMountChange(['wg-a'], runtime);
+
+    expect(scope.survivable).toBe(1);
+    // D1 STILL STOPS IT. This assertion is the D2 acceptance criterion: the
+    // flip changes it to `expect(runtime.stops).toEqual([])` and
+    // `stopped: 0`. Until then `survivable` is only a counterfactual.
+    expect(runtime.stops).toEqual(['nanoclaw-v2-b-1']);
+    expect(scope.stopped).toBe(scope.containers);
+    expect(spawns).toEqual([]);
+  });
+
+  it('a container with no workgroup label is always stopped', async () => {
+    // Divergence 7: on the first restart after the scope labels ship, every
+    // live container looks like this. Unknown scope is stopped, fail-closed,
+    // and it is never counted survivable.
+    const runtime = fakeRuntime([container('nanoclaw-v2-legacy-1', null), container('nanoclaw-v2-b-1', 'wg-b')]);
+
+    const scope = await quiesceWorkgroupsForBootMountChange([], runtime);
+
+    expect(runtime.stops).toContain('nanoclaw-v2-legacy-1');
+    expect(scope).toEqual({ containers: 2, stopped: 2, survivable: 1, unlabeled: 1 });
+    expect(spawns).toEqual([]);
+  });
+
+  it('a runtime listing failure fails closed', async () => {
+    const stops: string[] = [];
+
+    await expect(
+      quiesceWorkgroupsForBootMountChange(['wg-a'], {
+        list: () => {
+          throw new Error('Cannot prove install-scoped container absence: runtime listing failed');
+        },
+        stop: (name: string) => {
+          stops.push(name);
+        },
+      }),
+    ).rejects.toThrow(/prove install-scoped container absence/);
+
+    // Nothing was stopped, nothing was logged as proved, and the caller never
+    // reaches a reconcile: the rejection propagates out of startup.
+    expect(stops).toEqual([]);
+    expect(log.info).not.toHaveBeenCalledWith('Boot quiescence scope', expect.anything());
+    expect(spawns).toEqual([]);
+  });
+
+  it('a stop that does not take fails closed', async () => {
+    const runtime = fakeRuntime([container('nanoclaw-v2-a-1', 'wg-a')], ['nanoclaw-v2-a-1']);
+
+    await expect(quiesceWorkgroupsForBootMountChange(['wg-a'], runtime)).rejects.toThrow(
+      /still running after boot quiescence/,
+    );
+
+    expect(runtime.stops).toEqual(['nanoclaw-v2-a-1']);
+    expect(log.info).not.toHaveBeenCalledWith('Boot quiescence scope', expect.anything());
+    expect(spawns).toEqual([]);
+  });
+
+  it('the scope log carries every count', async () => {
+    const runtime = fakeRuntime([
+      container('nanoclaw-v2-a-1', 'wg-a'),
+      container('nanoclaw-v2-b-1', 'wg-b'),
+      container('nanoclaw-v2-legacy-1', null),
+    ]);
+
+    await quiesceWorkgroupsForBootMountChange(['wg-a', 'wg-c'], runtime);
+
+    const scopeLines = (log.info as unknown as { mock: { calls: unknown[][] } }).mock.calls.filter(
+      (call) => call[0] === 'Boot quiescence scope',
+    );
+    expect(scopeLines).toHaveLength(1);
+    expect(scopeLines[0][1]).toEqual({
+      containers: 3,
+      stopped: 3,
+      survivable: 1,
+      unlabeled: 1,
+      changed: 2,
+      mustStop: 2,
+    });
+    expect(spawns).toEqual([]);
+  });
+});
