@@ -146,7 +146,7 @@ function push(
   } = {},
 ) {
   if (options.withoutIonice) {
-    for (const command of ['dirname', 'mktemp', 'rm', 'rmdir', 'ln', 'grep', 'cat', 'node', 'sed', 'uname']) {
+    for (const command of ['dirname', 'mktemp', 'rm', 'rmdir', 'ln', 'grep', 'cat', 'node', 'sed', 'awk', 'uname']) {
       linkSystemCommand(f.bin, command);
     }
     writeExecutable(
@@ -433,6 +433,55 @@ describe('.husky/pre-push', () => {
     const result = push(f, `refs/tags/release ${tag} refs/tags/release ${zeroSha}\n`, {
       remoteRefs: `${base}\trefs/heads/main\n`,
     });
+    expect(result.status, result.stderr).toBe(0);
+    expect(records(f.log)).toHaveLength(1);
+  });
+
+  it.each([
+    ['no later blank line', 'Private Customer annotation\n'],
+    [
+      'a later blank line after private pre-separator content',
+      'Private Customer annotation\n\nclean second paragraph\n',
+    ],
+  ])('rejects an annotated tag with %s', (_shape, contentAfterHeaders) => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const tagFile = path.join(f.root, 'malformed-tag');
+    fs.writeFileSync(
+      tagFile,
+      [
+        `object ${base}`,
+        'type commit',
+        'tag missing-separator',
+        'tagger Synthetic Tag <tagger@example.invalid> 0 +0000',
+        contentAfterHeaders,
+      ].join('\n'),
+    );
+    const tag = runGit(f.root, ['hash-object', '-t', 'tag', '-w', tagFile]);
+
+    const result = push(f, `refs/tags/release ${tag} refs/tags/release ${zeroSha}\n`, {
+      remoteRefs: `${base}\trefs/heads/main\n`,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('malformed annotated tag object: expected header separator');
+    expect(fs.existsSync(f.log)).toBe(false);
+  });
+
+  it('accepts a raw annotated tag with an empty annotation after its separator', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const tagFile = path.join(f.root, 'empty-annotation-tag');
+    fs.writeFileSync(
+      tagFile,
+      `object ${base}\ntype commit\ntag empty-annotation\ntagger Synthetic Tag <tagger@example.invalid> 0 +0000\n\n`,
+    );
+    const tag = runGit(f.root, ['hash-object', '-t', 'tag', '-w', tagFile]);
+
+    const result = push(f, `refs/tags/release ${tag} refs/tags/release ${zeroSha}\n`, {
+      remoteRefs: `${base}\trefs/heads/main\n`,
+    });
+
     expect(result.status, result.stderr).toBe(0);
     expect(records(f.log)).toHaveLength(1);
   });
