@@ -331,11 +331,29 @@ function seedAppliedWorkgroup(
   );
 }
 
+function verifierChildEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  for (const name of [
+    'ALL_PROXY',
+    'HTTPS_PROXY',
+    'HTTP_PROXY',
+    'NO_PROXY',
+    'NODE_USE_ENV_PROXY',
+    'all_proxy',
+    'https_proxy',
+    'http_proxy',
+    'no_proxy',
+  ]) {
+    delete env[name];
+  }
+  return env;
+}
+
 function run(root: string, args: string[]): CliResult {
   const result = spawnSync(TSX, [SCRIPT, ...args], {
     cwd: root,
     encoding: 'utf8',
-    env: { ...process.env },
+    env: verifierChildEnv(),
   });
   let json: CliResult['json'];
   try {
