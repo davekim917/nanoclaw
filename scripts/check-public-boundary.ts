@@ -47,6 +47,7 @@ export interface ScanOptions {
   root: string;
   index: boolean;
   portable: boolean;
+  allowStructural: boolean;
   dbPath?: string;
   // Undefined means "not explicitly requested" — run() resolves the default
   // local path, falling back to the main checkout when the worktree has none.
@@ -399,12 +400,14 @@ export function resolveOptions(argv: string[], cwd = process.cwd()): ScanOptions
     root: cwd,
     index: false,
     portable: false,
+    allowStructural: false,
     allowlistPath: '.public-boundary-allowlist.json',
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--') continue;
     if (arg === '--portable') options.portable = true;
+    else if (arg === '--allow-structural') options.allowStructural = true;
     else if (arg === '--staged' || arg === '--index') options.index = true;
     else if (arg === '--root') options.root = argv[++i] ?? '';
     else if (arg === '--db') options.dbPath = argv[++i];
@@ -452,21 +455,26 @@ function resolveIdentifierSet(
   mainCheckoutRoot: string | null,
   defaultRelative: string,
   loader: (resolvedPath: string) => Set<string>,
-): { identifiers: Set<string>; origin: IdentifierOrigin } {
-  if (explicitPath !== undefined) return { identifiers: loader(explicitPath), origin: 'explicit' };
+): { identifiers: Set<string>; origin: IdentifierOrigin; attemptedPaths: string[] } {
+  if (explicitPath !== undefined) {
+    return { identifiers: loader(explicitPath), origin: 'explicit', attemptedPaths: [explicitPath] };
+  }
+  const attemptedPaths = [path.join(root, defaultRelative)];
   try {
-    return { identifiers: loader(path.join(root, defaultRelative)), origin: 'local' };
+    return { identifiers: loader(attemptedPaths[0]), origin: 'local', attemptedPaths };
   } catch {
     // fall through to the main-checkout fallback below
   }
   if (mainCheckoutRoot) {
+    const mainCheckoutPath = path.join(mainCheckoutRoot, defaultRelative);
+    attemptedPaths.push(mainCheckoutPath);
     try {
-      return { identifiers: loader(path.join(mainCheckoutRoot, defaultRelative)), origin: 'main-checkout' };
+      return { identifiers: loader(mainCheckoutPath), origin: 'main-checkout', attemptedPaths };
     } catch {
       // fall through to "none"
     }
   }
-  return { identifiers: new Set(), origin: 'none' };
+  return { identifiers: new Set(), origin: 'none', attemptedPaths };
 }
 
 export interface RunReport {
@@ -474,6 +482,8 @@ export interface RunReport {
   mode: 'portable' | 'install-aware' | 'structural-fallback';
   registryOrigin: IdentifierOrigin | 'skipped';
   identifiersOrigin: IdentifierOrigin | 'skipped';
+  registryPathsTried: string[];
+  identifiersPathsTried: string[];
 }
 
 /**
@@ -563,6 +573,8 @@ export function runReport(options: ScanOptions): RunReport {
   const privateIdentifiers = new Set<string>();
   let registryOrigin: IdentifierOrigin | 'skipped' = 'skipped';
   let identifiersOrigin: IdentifierOrigin | 'skipped' = 'skipped';
+  let registryPathsTried: string[] = [];
+  let identifiersPathsTried: string[] = [];
 
   if (!options.portable) {
     const mainCheckoutRoot = findMainCheckoutRoot(options.root);
@@ -574,6 +586,7 @@ export function runReport(options: ScanOptions): RunReport {
       loadRegistryIdentifiers,
     );
     registryOrigin = registry.origin;
+    registryPathsTried = registry.attemptedPaths;
     for (const value of registry.identifiers) privateIdentifiers.add(value);
 
     const identifiers = resolveIdentifierSet(
@@ -584,6 +597,7 @@ export function runReport(options: ScanOptions): RunReport {
       loadLocalIdentifiers,
     );
     identifiersOrigin = identifiers.origin;
+    identifiersPathsTried = identifiers.attemptedPaths;
     for (const value of identifiers.identifiers) privateIdentifiers.add(value);
   }
 
@@ -598,7 +612,7 @@ export function runReport(options: ScanOptions): RunReport {
     privateIdentifiers,
     loadAllowlist(options.allowlistPath),
   );
-  return { findings, mode, registryOrigin, identifiersOrigin };
+  return { findings, mode, registryOrigin, identifiersOrigin, registryPathsTried, identifiersPathsTried };
 }
 
 export function run(options: ScanOptions): Finding[] {
@@ -612,15 +626,39 @@ function describeMode(report: RunReport): string {
   return usedFallback ? 'identifiers from main checkout' : 'identifiers from local install';
 }
 
+function describeMissingIdentifierSources(report: RunReport): string {
+  const sources: string[] = [];
+  if (report.registryOrigin === 'none') {
+    sources.push(`missing install registry; registry paths tried: ${report.registryPathsTried.join(', ') || '(none)'}`);
+  }
+  if (report.identifiersOrigin === 'none') {
+    sources.push(
+      `missing identifier inventory; identifier inventory paths tried: ${report.identifiersPathsTried.join(', ') || '(none)'}`,
+    );
+  }
+  return sources.join('; ');
+}
+
 export function main(argv = process.argv.slice(2)): number {
   try {
     const options = resolveOptions(argv);
     const report = runReport(options);
     const { findings } = report;
-    if (report.mode === 'structural-fallback') {
-      process.stderr.write(
-        'WARNING: no identifier registry found (locally or in the main checkout) — running structural-pattern checks only; real names and tenant identifiers will NOT be caught\n',
-      );
+    const missingIdentifierSources =
+      !options.portable && (report.registryOrigin === 'none' || report.identifiersOrigin === 'none');
+    if (missingIdentifierSources) {
+      const missing = describeMissingIdentifierSources(report);
+      const coverage =
+        report.mode === 'structural-fallback'
+          ? `no identifier registry found; ${missing} — running structural-pattern checks only; real names and tenant identifiers will NOT be caught`
+          : `install-aware checks are incomplete; ${missing}`;
+      process.stderr.write(`WARNING: ${coverage}\n`);
+      if (options.index && !options.allowStructural) {
+        process.stderr.write(
+          'public boundary check failed: indexed scans require both an install registry and identifier inventory; use --allow-structural only for read-only structural reporting\n',
+        );
+        return 1;
+      }
     }
     const scanned = options.messagePath ? 'commit message' : options.index ? 'index' : 'worktree';
     const surface = `${scanned}, ${describeMode(report)}`;
