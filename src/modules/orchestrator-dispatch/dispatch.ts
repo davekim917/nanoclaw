@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 
 import { getChannelAdapter } from '../../channels/channel-registry.js';
-import { getRawDb } from '../../db/connection.js';
+import { getDb, getRawDb } from '../../db/connection.js';
 // Lazy import to avoid module-init cycle (events.ts imports nothing from dispatch.ts).
 // The import() call is memoized by Node's module cache after the first resolution.
 //
@@ -74,7 +74,7 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
   }
 
   // Auth: caller's agent_group must have orchestrator capability
-  if (!hasOrchestratorCapability(callerSession.agent_group_id)) {
+  if (!(await hasOrchestratorCapability(callerSession.agent_group_id))) {
     await _notifyCaller(callerSession, 'spawn rejected: not an orchestrator');
     return;
   }
@@ -84,9 +84,16 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
   // session/thread is isolated. There is no cross-group dispatch primitive.
   const childAgentGroupId = callerSession.agent_group_id;
 
-  const capConfig = getCapabilityConfig(callerSession.agent_group_id, 'orchestrator') ?? DEFAULT_CAPABILITY_CONFIG;
+  const capConfig =
+    (await getCapabilityConfig(callerSession.agent_group_id, 'orchestrator')) ?? DEFAULT_CAPABILITY_CONFIG;
 
-  // All admission steps inside a single better-sqlite3 transaction.
+  // All admission steps inside a single better-sqlite3 transaction. Seam 3
+  // keeps this ONE raw transaction (and only it) on `getRawDb()`: it is one of
+  // the eleven central sites `src/db/transaction-closures.test.ts` pins, and it
+  // converts to `centralTransaction` in PR 6 together with the leaf exports its
+  // closure calls. Every non-transactional statement in this file is on the
+  // async driver.
+  //
   // Use IMMEDIATE (write lock from BEGIN) instead of DEFERRED (default) so the
   // cap-count read holds the write lock through the INSERT — prevents two parallel
   // delivery drains from the same orchestrator both reading the same count, both
@@ -260,9 +267,9 @@ async function _runCompletionSideEffects(taskId: string, childAgentGroupId: stri
     return;
   }
 
-  const releaseLeaseAndFinish = () => {
+  const releaseLeaseAndFinish = async (): Promise<void> => {
     try {
-      getRawDb().prepare(`UPDATE tasks SET completion_lease_at = NULL WHERE task_id = ?`).run(taskId);
+      await getDb().run(`UPDATE tasks SET completion_lease_at = NULL WHERE task_id = ?`, taskId);
     } catch (err) {
       log.warn('completeSpawnSideEffects: failed to release lease', { taskId, err });
     }
@@ -290,7 +297,7 @@ async function _runCompletionSideEffects(taskId: string, childAgentGroupId: stri
       log.warn('completeSpawnSideEffects: task marked completion_exhausted', { taskId, attempts });
     }
   } finally {
-    releaseLeaseAndFinish();
+    await releaseLeaseAndFinish();
   }
 }
 
@@ -380,12 +387,14 @@ async function _runThreadedPath(task: Task, childAgentGroupId: string): Promise<
 
       // a. UPDATE tasks first (cycle-3 M21)
       const now = new Date().toISOString();
-      const updated = getRawDb()
-        .prepare(
-          `UPDATE tasks SET child_session_id = ?, started_at = ?, last_progress_at = ?, status = 'running'
+      const updated = await getDb().run(
+        `UPDATE tasks SET child_session_id = ?, started_at = ?, last_progress_at = ?, status = 'running'
              WHERE task_id = ? AND status = 'pending' AND child_session_id IS NULL`,
-        )
-        .run(childSession.id, now, now, taskId);
+        childSession.id,
+        now,
+        now,
+        taskId,
+      );
       if (updated.changes === 0) return;
 
       // b. Write spawn_task_id to child's inbound.db session_routing
@@ -447,12 +456,14 @@ async function _runHeadlessPath(task: Task, childAgentGroupId: string): Promise<
 
     // a. UPDATE tasks first (cycle-3 M21)
     const now = new Date().toISOString();
-    const updated = getRawDb()
-      .prepare(
-        `UPDATE tasks SET child_session_id = ?, started_at = ?, last_progress_at = ?, status = 'running'
+    const updated = await getDb().run(
+      `UPDATE tasks SET child_session_id = ?, started_at = ?, last_progress_at = ?, status = 'running'
            WHERE task_id = ? AND status = 'pending' AND child_session_id IS NULL`,
-      )
-      .run(childSession.id, now, now, taskId);
+      childSession.id,
+      now,
+      now,
+      taskId,
+    );
     if (updated.changes === 0) return;
 
     // b. Write spawn_task_id to child's inbound.db session_routing

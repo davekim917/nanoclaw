@@ -1,4 +1,4 @@
-import { getRawDb } from '../../../db/connection.js';
+import { getDb } from '../../../db/connection.js';
 
 export interface CapabilityConfig {
   concurrencyCap: number;
@@ -8,57 +8,63 @@ export interface CapabilityConfig {
   targetDenylist?: string[];
 }
 
-export function hasOrchestratorCapability(agentGroupId: string): boolean {
-  const row = getRawDb()
-    .prepare(`SELECT 1 FROM agent_group_capabilities WHERE agent_group_id = ? AND role = 'orchestrator' LIMIT 1`)
-    .get(agentGroupId);
+export async function hasOrchestratorCapability(agentGroupId: string): Promise<boolean> {
+  const row = await getDb().get(
+    `SELECT 1 FROM agent_group_capabilities WHERE agent_group_id = ? AND role = 'orchestrator' LIMIT 1`,
+    agentGroupId,
+  );
   return row !== undefined;
 }
 
-export function grantCapability(
+export async function grantCapability(
   agentGroupId: string,
   role: 'orchestrator',
   config: CapabilityConfig,
   grantedBy: string,
-): void {
+): Promise<void> {
   const configJson = JSON.stringify(config);
   const grantedAt = new Date().toISOString();
-  getRawDb()
-    .prepare(
-      `INSERT INTO agent_group_capabilities (agent_group_id, role, config_json, granted_by, granted_at)
+  await getDb().run(
+    `INSERT INTO agent_group_capabilities (agent_group_id, role, config_json, granted_by, granted_at)
        VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(agent_group_id, role) DO UPDATE SET
          config_json = excluded.config_json,
          granted_by  = excluded.granted_by,
          granted_at  = excluded.granted_at`,
-    )
-    .run(agentGroupId, role, configJson, grantedBy, grantedAt);
+    agentGroupId,
+    role,
+    configJson,
+    grantedBy,
+    grantedAt,
+  );
 }
 
-export function revokeCapability(agentGroupId: string, role: 'orchestrator'): { success: boolean; reason?: string } {
-  const inFlight = getRawDb()
-    .prepare(
-      `SELECT 1 FROM tasks
+export async function revokeCapability(
+  agentGroupId: string,
+  role: 'orchestrator',
+): Promise<{ success: boolean; reason?: string }> {
+  const inFlight = await getDb().get(
+    `SELECT 1 FROM tasks
         WHERE parent_agent_group_id = ? AND status IN ('pending', 'running')
         LIMIT 1`,
-    )
-    .get(agentGroupId);
+    agentGroupId,
+  );
 
   if (inFlight !== undefined) {
     return { success: false, reason: 'tasks_in_flight' };
   }
 
-  getRawDb()
-    .prepare(`DELETE FROM agent_group_capabilities WHERE agent_group_id = ? AND role = ?`)
-    .run(agentGroupId, role);
+  await getDb().run(`DELETE FROM agent_group_capabilities WHERE agent_group_id = ? AND role = ?`, agentGroupId, role);
 
   return { success: true };
 }
 
-export function getCapabilityConfig(agentGroupId: string, role: string): CapabilityConfig | null {
-  const row = getRawDb()
-    .prepare(`SELECT config_json FROM agent_group_capabilities WHERE agent_group_id = ? AND role = ?`)
-    .get(agentGroupId, role) as { config_json: string | null } | undefined;
+export async function getCapabilityConfig(agentGroupId: string, role: string): Promise<CapabilityConfig | null> {
+  const row = await getDb().get<{ config_json: string | null }>(
+    `SELECT config_json FROM agent_group_capabilities WHERE agent_group_id = ? AND role = ?`,
+    agentGroupId,
+    role,
+  );
 
   if (!row) return null;
   if (!row.config_json) return null;

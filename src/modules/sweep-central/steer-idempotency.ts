@@ -1,4 +1,4 @@
-import { getRawDb } from '../../db/connection.js';
+import { getDb } from '../../db/connection.js';
 import { log } from '../../log.js';
 
 /**
@@ -8,17 +8,17 @@ import { log } from '../../log.js';
  * Moved unchanged from src/host-sweep.ts (seam 2, S2-PR4 — central
  * housekeeping). Same statements, same log strings, same thresholds.
  */
-export function pruneSteerIdempotency(): void {
+export async function pruneSteerIdempotency(): Promise<void> {
   try {
-    const db = getRawDb();
+    const db = getDb();
     // Delete applied rows older than 60 seconds
-    db.prepare(
+    await db.run(
       `DELETE FROM steer_idempotency WHERE status = 'applied' AND datetime(applied_at) < datetime('now', '-60 seconds')`,
-    ).run();
+    );
     // Delete pending rows older than 5 minutes (crash-recovery window expires)
-    db.prepare(
+    await db.run(
       `DELETE FROM steer_idempotency WHERE status = 'pending' AND datetime(reserved_at) < datetime('now', '-300 seconds')`,
-    ).run();
+    );
   } catch (err) {
     log.warn('pruneSteerIdempotency: failed', { err });
   }

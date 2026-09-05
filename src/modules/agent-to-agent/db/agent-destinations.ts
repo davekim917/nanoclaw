@@ -44,12 +44,21 @@ import { deletePoliciesTouching, removeMessagePolicy } from './agent-message-pol
  * session of that agent group so the change propagates to the running
  * container's inbound.db. See the top-of-file invariant.
  */
-export async function createDestination(row: AgentDestination): Promise<void> {
-  await getDb().run(
-    `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
+/*
+ * Seam 3: `createDestination`, `getDestinationByName` and
+ * `getDestinationByTarget` stay SYNCHRONOUS with no async form —
+ * `db/messaging-groups.ts`'s `ensureAgentDestinationForWiring` calls all
+ * three from inside `cli/resources/wirings.ts`'s pinned raw transaction
+ * closure, and `getDestinations` is read inside write-destinations' mailbox
+ * action. Plan §4.2/§4.5; they convert in PR 6 with their closure.
+ */
+export function createDestination(row: AgentDestination): void {
+  getRawDb()
+    .prepare(
+      `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
        VALUES (@agent_group_id, @local_name, @target_type, @target_id, @created_at)`,
-    row,
-  );
+    )
+    .run(row);
 }
 
 export const AGENT_DESTINATIONS_BY_GROUP_SQL = 'SELECT * FROM agent_destinations WHERE agent_group_id = ?';
@@ -66,29 +75,21 @@ export function getDestinations(agentGroupId: string): AgentDestination[] {
   return getRawDb().prepare(AGENT_DESTINATIONS_BY_GROUP_SQL).all(agentGroupId) as AgentDestination[];
 }
 
-export async function getDestinationByName(
-  agentGroupId: string,
-  localName: string,
-): Promise<AgentDestination | undefined> {
-  return getDb().get<AgentDestination>(
-    'SELECT * FROM agent_destinations WHERE agent_group_id = ? AND local_name = ?',
-    agentGroupId,
-    localName,
-  );
+export function getDestinationByName(agentGroupId: string, localName: string): AgentDestination | undefined {
+  return getRawDb()
+    .prepare('SELECT * FROM agent_destinations WHERE agent_group_id = ? AND local_name = ?')
+    .get(agentGroupId, localName) as AgentDestination | undefined;
 }
 
 /** Reverse lookup: what does this agent call the given target? */
-export async function getDestinationByTarget(
+export function getDestinationByTarget(
   agentGroupId: string,
   targetType: 'channel' | 'agent',
   targetId: string,
-): Promise<AgentDestination | undefined> {
-  return getDb().get<AgentDestination>(
-    'SELECT * FROM agent_destinations WHERE agent_group_id = ? AND target_type = ? AND target_id = ?',
-    agentGroupId,
-    targetType,
-    targetId,
-  );
+): AgentDestination | undefined {
+  return getRawDb()
+    .prepare('SELECT * FROM agent_destinations WHERE agent_group_id = ? AND target_type = ? AND target_id = ?')
+    .get(agentGroupId, targetType, targetId) as AgentDestination | undefined;
 }
 
 export const AGENT_DESTINATION_EXISTS_SQL =
