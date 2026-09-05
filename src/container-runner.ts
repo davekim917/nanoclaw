@@ -850,7 +850,10 @@ export function isContainerSpawning(sessionId: string): boolean {
  * definitions of "owns", which is the drift the seam work exists to remove.
  */
 export function containerOwnsOutbound(sessionId: string): boolean {
-  return isContainerRunning(sessionId) || isContainerSpawning(sessionId);
+  // A pending adoption is a survivor this host could not claim: alive,
+  // untracked, and still writing. It owns the file until a runtime listing
+  // proves it gone (`retryPendingAdoption` clears the entry on that proof).
+  return isContainerRunning(sessionId) || isContainerSpawning(sessionId) || pendingAdoptions.has(sessionId);
 }
 
 /** Snapshot passed to isolated maintenance workers; never expose the mutable map. */
@@ -2238,19 +2241,27 @@ function scheduleWaiterRearm(sessionId: string, channel: AdoptedChannel, contain
 /**
  * Register a container this host did not spawn, after its claim is held.
  *
- * Mirrors the spawn path's registration with three deliberate differences:
- * the channel is a `docker wait` observer, `storageActivity` is null (no lease
- * is held for a container this host did not start), and `spawnedAt` is the
- * adoption instant — the honest ceiling anchor for a container whose real
- * start this host never saw. The heartbeat file is NOT cleared: it is the
+ * Mirrors the spawn path's registration with two deliberate differences: the
+ * channel is a `docker wait` observer, and `spawnedAt` is the adoption instant
+ * — the honest ceiling anchor for a container whose real start this host
+ * never saw. The storage-activity lease is the same one a spawn holds, taken
+ * by the caller after `main()`'s startup reset of the previous host's markers. The heartbeat file is NOT cleared: it is the
  * survivor's own, and the sweep reads it as evidence the container is alive.
  * The `running` status write is awaited only after the waiter is armed, for
  * the same reason the spawn path attaches its exit handlers first.
  */
+/** The workgroup an adopted container's storage roots belong to: its label, else its group's declaration. */
+async function adoptedWorkgroupId(session: Session, labelled: string | null): Promise<string> {
+  if (labelled) return labelled;
+  const agentGroup = await getAgentGroup(session.agent_group_id);
+  return agentGroup?.workgroup_id ?? session.agent_group_id;
+}
+
 async function registerAdoptedContainer(
   session: Session,
   containerName: string,
   claimIncarnation: number,
+  storageActivity: StorageActivityLease,
 ): Promise<void> {
   const channel: AdoptedChannel = {
     kind: 'adopted',
@@ -2263,7 +2274,7 @@ async function registerAdoptedContainer(
     containerName,
     spawnedAt: Date.now(),
     adopted: true,
-    storageActivity: null,
+    storageActivity,
     claimIncarnation,
   });
   everSeenRunningSessions.add(session.id);
@@ -2325,21 +2336,15 @@ async function reserveAdoptedMemory(
  * claim leaves the container running and untracked, recorded in
  * `pendingAdoptions` so the wake path retries rather than spawning into it.
  */
-async function adoptRunningSession(session: Session, containerName: string): Promise<AdoptionOutcome> {
-  // Memory first, claim second: a survivor that does not fit is stopped
-  // without ever having been claimed, and a claim that then fails hands the
-  // reservation back (`finalizeSession` releases it for an adopted entry
-  // exactly as for a spawned one).
-  const memory = await reserveAdoptedMemory(session);
-  if (!memory.ok) {
-    log.warn('Adoption refused — the container does not fit the memory admission budget; stopping it', {
-      sessionId: session.id,
-      containerName,
-      reason: memory.reason,
-    });
-    stopUnadoptable(containerName, memory.reason, session.id);
-    return { outcome: 'stopped', reason: memory.reason };
-  }
+async function adoptRunningSession(
+  session: Session,
+  containerName: string,
+  workgroupId: string | null,
+): Promise<AdoptionOutcome> {
+  // Claim FIRST. Only a container this host has claimed may be stopped for
+  // local admission pressure: a survivor a live peer holds is the peer's turn,
+  // and stopping it for our budget would be the interruption the lost-claim
+  // path exists to avoid. Unclaimed and over-budget both leave it running.
   let claimIncarnation: number | null;
   try {
     claimIncarnation = await claimSessionRun(session.id, containerName, { adopting: true });
@@ -2349,7 +2354,6 @@ async function adoptRunningSession(session: Session, containerName: string): Pro
       containerName,
       err,
     });
-    releaseMemoryReservation(session.id);
     pendingAdoptions.add(session.id);
     return { outcome: 'pending' };
   }
@@ -2358,15 +2362,36 @@ async function adoptRunningSession(session: Session, containerName: string): Pro
       sessionId: session.id,
       containerName,
     });
-    releaseMemoryReservation(session.id);
     pendingAdoptions.add(session.id);
     return { outcome: 'pending' };
   }
+  // Memory second, under our own claim. A survivor that does not fit is ours
+  // to stop; the claim goes back with it so the next wake re-enters admission
+  // like any spawn.
+  const memory = await reserveAdoptedMemory(session);
+  if (!memory.ok) {
+    log.warn('Adoption refused — the container does not fit the memory admission budget; stopping it', {
+      sessionId: session.id,
+      containerName,
+      reason: memory.reason,
+    });
+    stopUnadoptable(containerName, memory.reason, session.id);
+    await releaseClaimQuietly(session.id, claimIncarnation);
+    return { outcome: 'stopped', reason: memory.reason };
+  }
+  // Storage-activity leases, the same session-dir and worktree roots a spawn
+  // holds, under the container's own workgroup (its label; the group's
+  // declared workgroup when it carries none). `main()` resets the previous
+  // host's markers BEFORE adoption, so this fresh marker is the only one and
+  // the storage manager cannot clean a root a survivor is still using.
+  let storageActivity: StorageActivityLease | null = null;
   try {
-    await registerAdoptedContainer(session, containerName, claimIncarnation);
+    storageActivity = await acquireContainerStorageActivity(session, await adoptedWorkgroupId(session, workgroupId));
+    await registerAdoptedContainer(session, containerName, claimIncarnation, storageActivity);
   } catch (err) {
-    // The waiter could not be created: the claim is held with nothing to
-    // supervise it. Hand it back and let the wake path retry the whole step.
+    // The lease or the waiter could not be created: the claim is held with
+    // nothing to supervise it. Hand everything back and let the wake path
+    // retry the whole step.
     log.error('Could not register an adopted container — releasing its claim for retry', {
       sessionId: session.id,
       containerName,
@@ -2374,6 +2399,7 @@ async function adoptRunningSession(session: Session, containerName: string): Pro
     });
     activeContainers.delete(session.id);
     releaseMemoryReservation(session.id);
+    if (storageActivity) await storageActivity.release();
     await releaseClaimQuietly(session.id, claimIncarnation);
     pendingAdoptions.add(session.id);
     return { outcome: 'pending' };
@@ -2486,7 +2512,7 @@ export async function adoptRunningSessions(
       counts.stopped += 1;
       continue;
     }
-    const result = await adoptRunningSession(session!, container.name);
+    const result = await adoptRunningSession(session!, container.name, container.workgroupId);
     if (result.outcome === 'pending') {
       counts.pendingClaim += 1;
       continue;
@@ -2530,7 +2556,7 @@ async function retryPendingAdoption(session: Session): Promise<boolean> {
     pendingAdoptions.delete(session.id);
     return false;
   }
-  const result = await adoptRunningSession(fresh, survivor.name);
+  const result = await adoptRunningSession(fresh, survivor.name, survivor.workgroupId);
   if (result.outcome === 'pending') {
     throw new Error(`session ${session.id} has a running container this host could not claim — not spawning`);
   }

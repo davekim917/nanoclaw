@@ -475,17 +475,20 @@ describe('supervision channel', () => {
     await until(() => !isContainerRunning('sess-interleave'), 'the replacement never finalized');
   });
 
-  it('an adopted entry releases no storage-activity lease', async () => {
-    await adopt('sess-no-lease');
+  it('an adopted entry holds the storage-activity leases until it finishes', async () => {
+    await adopt('sess-lease');
 
-    fakes.exit('nanoclaw-v2-sess-no-lease', 0);
-    await until(() => !isContainerRunning('sess-no-lease'), 'the adopted entry never finalized');
+    // The same two roots a spawn of this session holds: its session directory
+    // and its topic-worktrees directory. Held, not released, while it runs.
+    expect(leases.acquired).toHaveLength(2);
+    expect(leases.acquired.some((root) => root.endsWith('/sess-lease'))).toBe(true);
+    expect(leases.released).toEqual([]);
+
+    fakes.exit('nanoclaw-v2-sess-lease', 0);
+    await until(() => !isContainerRunning('sess-lease'), 'the adopted entry never finalized');
     await new Promise((resolve) => setTimeout(resolve, 20));
 
-    // This host holds no lease for a container it did not spawn: nothing was
-    // acquired at adoption, so nothing is released at exit.
-    expect(leases.acquired).toEqual([]);
-    expect(leases.released).toEqual([]);
+    expect([...leases.released].sort()).toEqual([...leases.acquired].sort());
   });
   // LAST case in the file, deliberately: `beginContainerShutdown()` latches
   // `containerShutdownInProgress` for the life of the module, and nothing

@@ -117,6 +117,21 @@ describe('adoption order (P3)', () => {
     expect(indexOfCall(calls, FENCE_RECOVERY)).toBeGreaterThan(adopt);
   });
 
+  it('the startup storage-activity reset runs before adoption, so it cannot strip an adopted lease', () => {
+    // `resetStorageActivityState` deletes every marker the previous host left;
+    // adoption plants a fresh one per survivor. Reset after adoption would
+    // strip exactly that marker and let the storage manager clean a root a
+    // survivor is still using.
+    expect(indexOfCall(calls, 'resetStorageActivityState')).toBeLessThan(indexOfCall(calls, ADOPT));
+  });
+
+  it("adopted sessions remain 'running' after boot completes — the phantom reset precedes adoption", () => {
+    // `resetPhantomContainerStatus` flips every 'running' row to 'stopped';
+    // adoption writes `running` for the sessions it took over, so the reset
+    // must land first or the adopted rows are flipped back under a live container.
+    expect(indexOfCall(calls, 'await resetPhantomContainerStatus')).toBeLessThan(indexOfCall(calls, ADOPT));
+  });
+
   it("the shutdown warn receives the door's stopping set, not every active session", () => {
     const calls = callsWithin(mainSource(), 'shutdown');
     const warn = calls.filter((call) => call.callee === 'warnActiveContainersOfShutdown');

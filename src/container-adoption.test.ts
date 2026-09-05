@@ -224,6 +224,7 @@ import { EventEmitter } from 'node:events';
 
 import {
   adoptRunningSessions,
+  containerOwnsOutbound,
   getAdoptedSessionIds,
   getContainerSpawnedAt,
   hasContainerEverRun,
@@ -559,12 +560,65 @@ describe('adoptRunningSessions', () => {
     expect(reconciled).toEqual({ adopted: 1, stopped: 1, pendingClaim: 0, fencedInbound: 0 });
     expect(fakes.stopped).toEqual(['nanoclaw-v2-sess-too-big']);
     expect(isContainerRunning('sess-too-big')).toBe(false);
-    // Never claimed, nothing reserved for it, and the budget is exactly spent.
-    expect(await getSessionClaim('sess-too-big')).toBeUndefined();
+    // Stopped under this host's own claim, which went back with it; nothing
+    // reserved for it, and the budget is exactly spent.
+    const stoppedClaim = await getSessionClaim('sess-too-big');
+    expect([stoppedClaim?.claimed_by, stoppedClaim?.container_ref]).toEqual([null, null]);
     expect(memoryStub.reservedMb()).toBe(requestMb);
     expect(
       warnings('Adoption refused — the container does not fit the memory admission budget; stopping it'),
     ).toHaveLength(1);
+  });
+
+  it('a survivor held by a live peer is never stopped for memory', async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-peer-memory');
+    await seedHostInstance('peer-live', 'live');
+    await seedForeignClaim('sess-peer-memory', 'peer-live', 5);
+    fakes.listing = [survivor('sess-peer-memory')];
+    // No room at all — a spawn would be refused outright.
+    memoryStub.budgetMb = 1;
+
+    const reconciled = await adoptRunningSessions({ list: fakes.list });
+
+    // The claim decides first: an unclaimed survivor is the peer's turn, and
+    // local admission pressure is never a reason to stop it.
+    expect(reconciled).toEqual({ adopted: 0, stopped: 0, pendingClaim: 1, fencedInbound: 0 });
+    expect(fakes.stopped).toEqual([]);
+    expect(hasPendingAdoption('sess-peer-memory')).toBe(true);
+    expect(warnings('Adoption refused — the container does not fit the memory admission budget; stopping it')).toEqual(
+      [],
+    );
+    expect(memoryStub.reservedMb()).toBe(0);
+  });
+
+  it("a pending adoption keeps the session's outbound owned", async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-owned');
+    fakes.listing = [survivor('sess-owned')];
+    hooks.claimWriteFails = true;
+
+    await adoptRunningSessions({ list: fakes.list });
+
+    // Alive, untracked, still writing: the host must not touch its outbound.db.
+    expect(hasPendingAdoption('sess-owned')).toBe(true);
+    expect(isContainerRunning('sess-owned')).toBe(false);
+    expect(containerOwnsOutbound('sess-owned')).toBe(true);
+  });
+
+  it('a vanished pending container releases ownership', async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-released');
+    fakes.listing = [survivor('sess-released')];
+    hooks.claimWriteFails = true;
+    await adoptRunningSessions({ list: fakes.list });
+    expect(containerOwnsOutbound('sess-released')).toBe(true);
+
+    // The re-list proves it gone: the pending entry clears and the ordinary
+    // path spawns (an ENOENT child here, which finalizes itself).
+    fakes.listing = [];
+    hooks.claimWriteFails = false;
+    await expect(wakeContainer(callerSnapshot('sess-released'))).resolves.toBe(true);
+    expect(hasPendingAdoption('sess-released')).toBe(false);
+    await until(() => !isContainerRunning('sess-released'), 'the spawned container never finalized');
+    expect(containerOwnsOutbound('sess-released')).toBe(false);
   });
 
   it("an adopted session's ceiling uses the adoption instant", async () => {

@@ -536,6 +536,23 @@ export async function main(): Promise<void> {
   // is what "prove install-scoped container absence" has always meant.
   const { scope, memoryReports } = await runBootMountQuiescence(db);
 
+  // Two resets of the previous host's residue, BEFORE adoption — both are
+  // "everything the last host marked is stale", which is true only until
+  // adoption re-marks what survived (src/adoption-order.test.ts pins the
+  // order). The storage-activity markers and cleanup claims: adoption takes a
+  // fresh lease for every survivor, and a reset after it would strip exactly
+  // that marker and let the storage manager clean a root a survivor is using.
+  resetStorageActivityState();
+  // The phantom `container_status` rows: before adoption every 'running' row
+  // is a previous host's, and the sweep would otherwise waste ticks enforcing
+  // SLA against containers that no longer exist; adoption then writes
+  // `running` for the sessions it took over, and a reset after it would flip
+  // them back to 'stopped' while their containers run.
+  const resetCount = await resetPhantomContainerStatus();
+  if (resetCount > 0) {
+    log.info('Reset phantom container_status rows on startup', { count: resetCount });
+  }
+
   // Adopt the containers the boot door left running (seam 4 series E, plan
   // §7.E). Immediately after the door's return, and before every wake source
   // (the dashboard, the channel adapters, the sweep, delivery) and before the
@@ -644,9 +661,7 @@ export async function main(): Promise<void> {
   // 1d. One-time filesystem cutover — idempotent, no-op after first run.
   migrateGroupsToClaudeLocal();
 
-  // 2. Container runtime was already proved available/quiescent before the
-  // canonical memory reconciliation above.
-  resetStorageActivityState();
+  // 2. (The storage-activity reset moved ahead of adoption, above.)
 
   // 2-bis. Resolve any session archival a previous stop interrupted, before
   // the sweep can hand out work to a row still parked in 'archiving'.
@@ -675,15 +690,7 @@ export async function main(): Promise<void> {
     }
   })();
 
-  // 2a. Reset phantom container_status='running' rows in central DB. Session
-  // containers use --rm and don't survive the host restart, so any 'running'
-  // row in sessions is stale by definition at this point. Without this, the
-  // sweep wastes ticks enforcing SLA against containers that no longer exist
-  // (see kill-ceiling / kill-claim warnings against 3-week-old sessions).
-  const resetCount = await resetPhantomContainerStatus();
-  if (resetCount > 0) {
-    log.info('Reset phantom container_status rows on startup', { count: resetCount });
-  }
+  // 2a. (The phantom container_status reset moved ahead of adoption, above.)
 
   // 2b. Re-issue any restart a previous host ordered but did not live to
   // finish. `respawn_after_stop` is the durable half of a kill whose respawn
