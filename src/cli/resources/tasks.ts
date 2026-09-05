@@ -33,6 +33,7 @@ import {
   validateRecurrence,
 } from '../../modules/scheduling/create.js';
 import { resolveTaskFlagIntent } from '../../modules/scheduling/task-flags.js';
+import { parseTaskContent } from '../../modules/scheduling/task-content.js';
 import { writeAudit } from '../../dashboard/api/scheduled-shared.js';
 import { resolveTaskSession, withExistingMailboxSession } from '../../session-manager.js';
 import { registerResource } from '../crud.js';
@@ -179,31 +180,8 @@ function withInbound<T>(session: ScopedSession, fn: (mailbox: NanoclawMailboxSes
  * Reads (`list`, `show`) never invalidate.
  */
 
-function parseContent(raw: string): {
-  prompt: string;
-  script: string | null;
-  scriptHost: boolean;
-  threadAnchor: boolean;
-  originSessionId: string | null;
-} {
-  try {
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    return {
-      prompt: typeof parsed.prompt === 'string' ? parsed.prompt : '',
-      script: typeof parsed.script === 'string' ? parsed.script : null,
-      scriptHost: parsed.scriptHost === true,
-      threadAnchor: parsed.threadAnchor !== false,
-      originSessionId: typeof parsed.originSessionId === 'string' ? parsed.originSessionId : null,
-    };
-  } catch {
-    // LEGACY-COMPAT(v1-tasks): plain-string content from rows that predate the
-    // JSON envelope. Removable once no pre-v2 session DBs remain in the wild.
-    return { prompt: raw, script: null, scriptHost: false, threadAnchor: true, originSessionId: null };
-  }
-}
-
 function toOutput(session: ScopedSession, row: TaskRow) {
-  const content = parseContent(row.content);
+  const content = parseTaskContent(row.content);
   return {
     agent_group_id: session.agent_group_id,
     session_id: session.id,
@@ -473,7 +451,7 @@ async function getTask(args: Record<string, unknown>, ctx: CallerContext) {
       if (!row) return undefined;
       const seriesKey = row.series_id ?? row.row_id;
       const stats = seriesStats(mailbox, seriesKey);
-      const content = parseContent(row.content);
+      const content = parseTaskContent(row.content);
       return {
         ...toOutput(session, row),
         prompt: content.prompt,
@@ -596,7 +574,8 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
       validateRecurrence(recurrence, await tz);
       // Effective script AFTER this update: the new value when provided
       // (including an explicit clear), else whatever THIS task already has.
-      const scriptAfter: string | null = script !== undefined ? script : row ? parseContent(row.content).script : null;
+      const scriptAfter: string | null =
+        script !== undefined ? script : row ? parseTaskContent(row.content).script : null;
       enforceRecurrenceLimit(
         recurrence,
         bool(args.dangerously_override_recurrence_limit),
@@ -675,7 +654,7 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
         sessionUpdate.script !== undefined &&
         sessionUpdate.scriptHost !== false &&
         before &&
-        parseContent(before.content).scriptHost
+        parseTaskContent(before.content).scriptHost
       ) {
         throw new Error('this series runs its script on the host — an operator must make script changes');
       }
@@ -693,7 +672,7 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
       // read.
       if (recurrence !== undefined) {
         const scriptNow: string | null =
-          script !== undefined ? script : before ? parseContent(before.content).script : null;
+          script !== undefined ? script : before ? parseTaskContent(before.content).script : null;
         enforceRecurrenceLimit(recurrence, bool(args.dangerously_override_recurrence_limit), scriptNow != null, tz);
       }
       const n = withQuietInvalidationSync(session.id, () => mailbox.updateTask(id, sessionUpdate));
@@ -708,7 +687,7 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
         agentGroupId: session.agent_group_id,
         sessionId: session.id,
         seriesId: id,
-        before: before ? parseContent(before.content).prompt : undefined,
+        before: before ? parseTaskContent(before.content).prompt : undefined,
         ...(sessionUpdate.prompt !== undefined ? { after: sessionUpdate.prompt } : {}),
         ...(sessionUpdate.script !== undefined && sessionUpdate.script !== null
           ? { scriptAfter: sessionUpdate.script }

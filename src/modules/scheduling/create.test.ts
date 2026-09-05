@@ -27,9 +27,42 @@ import { runMigrations } from '../../db/migrations/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
-import { createScheduledTask, prepareScheduledTask } from './create.js';
+import { createScheduledTask, makeTaskId, prepareScheduledTask, taskNameSlug } from './create.js';
 
 const AG = 'ag-create-test';
+
+describe('taskNameSlug', () => {
+  it('is deterministic', () => {
+    expect(taskNameSlug('Daily Digest!')).toBe(taskNameSlug('Daily Digest!'));
+  });
+
+  it('lowercases, collapses non-alphanumerics to a single hyphen, and trims edges', () => {
+    expect(taskNameSlug('Daily  Digest!!')).toBe('daily-digest');
+  });
+
+  it('truncates to 24 characters with no trailing hyphen', () => {
+    expect(taskNameSlug('a'.repeat(30))).toBe('a'.repeat(24));
+    expect(taskNameSlug('a-very-long-task-name-that-runs-on')).not.toMatch(/-$/);
+  });
+
+  it('returns empty for a non-string name', () => {
+    expect(taskNameSlug(undefined)).toBe('');
+    expect(taskNameSlug(42)).toBe('');
+  });
+});
+
+describe('makeTaskId', () => {
+  it('prefixes the id with exactly taskNameSlug(name)', () => {
+    const name = 'Daily Digest';
+    const id = makeTaskId(name);
+    expect(id.startsWith(`${taskNameSlug(name)}-`)).toBe(true);
+    expect(id).toMatch(/^daily-digest-[0-9a-f]{4}$/);
+  });
+
+  it('falls back to a t-<6hex> id when the slug is empty', () => {
+    expect(makeTaskId(undefined)).toMatch(/^t-[0-9a-f]{6}$/);
+  });
+});
 
 async function taskSession(): Promise<{ id: string }> {
   const sessions = (await getSessionsByAgentGroup(AG)).filter((s) => s.thread_id?.startsWith('system:tasks'));
@@ -59,7 +92,7 @@ beforeEach(async () => {
   await initTestDb();
   const db = getRawDb();
   runMigrations(db);
-  (await createAgentGroup({ id: AG, name: AG, folder: AG, agent_provider: null, created_at: new Date().toISOString() }));
+  await createAgentGroup({ id: AG, name: AG, folder: AG, agent_provider: null, created_at: new Date().toISOString() });
 });
 
 afterEach(async () => {
