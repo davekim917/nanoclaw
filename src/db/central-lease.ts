@@ -106,8 +106,19 @@ export class CentralLeaseReentrancyError extends Error {
   }
 }
 
+/**
+ * Thenable in the sense `await` uses, which includes a CALLABLE thenable.
+ *
+ * `typeof` a function object carrying a `then` method is `'function'`, not
+ * `'object'` — but `await` still adopts it, and the compile-time
+ * `PromiseLike` check classifies it as async. An object-only test therefore
+ * disagreed with both: `evaluateGuardSync` handed the function back as a
+ * truthy synchronous decision, and `withCentralSync` released the lease around
+ * a result that was still going to resolve later.
+ */
 function isThenable(value: unknown): boolean {
-  return typeof value === 'object' && value !== null && typeof (value as { then?: unknown }).then === 'function';
+  if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return false;
+  return typeof (value as { then?: unknown }).then === 'function';
 }
 
 const DEFAULT_LEASE_WARN_MS = 1_000;
@@ -330,51 +341,70 @@ function assertBlockStillRunning(epoch: number): void {
   if (!insideSyncBlock || epoch !== blockEpoch) throw new RawAccessOutsideSyncBlockError();
 }
 
+/**
+ * ECMAScript `#private` and not TypeScript `private`, on both facades below.
+ *
+ * TypeScript's `private` is a compile-time annotation over an ordinary
+ * enumerable own property, so `Object.values(facade)[0]`, `{ ...facade }`,
+ * `Object.getOwnPropertyNames(facade)` and `JSON.stringify(facade)` all hand
+ * back the live `Database`/`Statement` — reflection walks straight past every
+ * epoch check the methods perform. `#` fields are a runtime brand: they are not
+ * own properties, so none of those paths can see them, and the ONLY way to the
+ * connection is through a method that checks the epoch first. `#live()` is
+ * private the same way, so the check cannot be skipped by calling the helper
+ * off the prototype either.
+ */
 class BlockScopedRawStatement implements RawStatement {
-  constructor(
-    private readonly statement: Database.Statement<unknown[]>,
-    private readonly epoch: number,
-  ) {}
+  readonly #statement: Database.Statement<unknown[]>;
+  readonly #epoch: number;
 
-  private live(): Database.Statement<unknown[]> {
-    assertBlockStillRunning(this.epoch);
-    return this.statement;
+  constructor(statement: Database.Statement<unknown[]>, epoch: number) {
+    this.#statement = statement;
+    this.#epoch = epoch;
+  }
+
+  #live(): Database.Statement<unknown[]> {
+    assertBlockStillRunning(this.#epoch);
+    return this.#statement;
   }
 
   run(...params: unknown[]): Database.RunResult {
-    return this.live().run(...params);
+    return this.#live().run(...params);
   }
 
   get(...params: unknown[]): unknown {
-    return this.live().get(...params);
+    return this.#live().get(...params);
   }
 
   all(...params: unknown[]): unknown[] {
-    return this.live().all(...params);
+    return this.#live().all(...params);
   }
 }
 
 class BlockScopedRawDb implements RawDb {
-  constructor(
-    private readonly raw: Database.Database,
-    private readonly epoch: number,
-  ) {}
+  readonly #raw: Database.Database;
+  readonly #epoch: number;
 
-  private live(): Database.Database {
-    assertBlockStillRunning(this.epoch);
-    return this.raw;
+  constructor(raw: Database.Database, epoch: number) {
+    this.#raw = raw;
+    this.#epoch = epoch;
+  }
+
+  #live(): Database.Database {
+    assertBlockStillRunning(this.#epoch);
+    return this.#raw;
   }
 
   prepare(source: string): RawStatement {
-    return new BlockScopedRawStatement(this.live().prepare(source), this.epoch);
+    return new BlockScopedRawStatement(this.#live().prepare(source), this.#epoch);
   }
 
   exec(source: string): void {
-    this.live().exec(source);
+    this.#live().exec(source);
   }
 
   get inTransaction(): boolean {
-    return this.live().inTransaction;
+    return this.#live().inTransaction;
   }
 }
 

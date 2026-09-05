@@ -318,6 +318,37 @@ describe('withRawDb is confined to a synchronous block', () => {
     );
     expect(() => smuggled.statement.get()).toThrow(RawAccessOutsideSyncBlockError);
   });
+
+  it('neither facade exposes the live sqlite object to reflection', async () => {
+    /** Anything with a `prepare` or `run` method is a live better-sqlite3 object. */
+    const reachesSqlite = (value: unknown): boolean =>
+      typeof value === 'object' &&
+      value !== null &&
+      (typeof (value as { prepare?: unknown }).prepare === 'function' ||
+        typeof (value as { run?: unknown }).run === 'function');
+
+    await withCentralSync(() => {
+      withRawDb((r) => {
+        const statement = r.prepare(`SELECT 1 AS ok`);
+        const facades: readonly [string, RawDb | RawStatement][] = [
+          ['RawDb', r],
+          ['RawStatement', statement],
+        ];
+
+        for (const [name, facade] of facades) {
+          const asRecord = facade as unknown as Record<string, unknown>;
+          // `#private` fields are not own properties; TypeScript `private`
+          // would put the live handle right here.
+          expect(Object.getOwnPropertyNames(facade), `${name} has own properties`).toEqual([]);
+          expect(Object.keys(facade), `${name} has enumerable keys`).toEqual([]);
+          expect(JSON.stringify(facade), `${name} serializes state`).toBe('{}');
+
+          const reachable: unknown[] = [...Object.values(asRecord), ...Object.values({ ...asRecord })];
+          expect(reachable.filter(reachesSqlite), `${name} leaks a live sqlite object`).toEqual([]);
+        }
+      });
+    }, 'reflection');
+  });
 });
 
 describe('a raw block may not leave a transaction open', () => {
@@ -393,6 +424,25 @@ describe('a synchronous contract that a cast cannot escape', () => {
     // @ts-expect-error — SyncBlockOnly<Promise<number>> demands an argument no caller can produce
     const rejected = withCentralSync(async () => 1);
     await expect(rejected).rejects.toBeInstanceOf(GuardNotSynchronousError);
+  });
+
+  /**
+   * `await` adopts a function object carrying a `then`, and the compile-time
+   * `PromiseLike` check calls it async — so an object-only runtime test
+   * (`typeof value === 'object'`) disagrees with both: it hands the value back
+   * as a truthy SYNCHRONOUS decision and releases the lease around a result
+   * still due to resolve. Two cases, so each entry point fails on its own.
+   */
+  const callableThenable = (): unknown => Object.assign(() => true, { then: () => undefined });
+
+  it('rejects a CALLABLE thenable guard, which `typeof value === "object"` alone misses', () => {
+    expect(() => evaluateGuardSync(callableThenable)).toThrow(GuardNotSynchronousError);
+  });
+
+  it('rejects a withCentralSync block returning a CALLABLE thenable', async () => {
+    await expect(
+      withTimeout(withCentralSync(callableThenable as unknown as () => string, 'callable-thenable-block')),
+    ).rejects.toBeInstanceOf(GuardNotSynchronousError);
   });
 
   it('rejects a cast async guard in evaluateGuardSync', () => {
