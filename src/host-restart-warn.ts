@@ -4,8 +4,10 @@
  * and self-accounted instead of silent.
  *
  * Every host start stops all install-labeled containers — graceful shutdown
- * via `stopAllContainers`, startup via `cleanupOrphansStrict` (quiescence is
- * a hard precondition for workgroup FS reconciliation). Without this, a
+ * via `stopAllContainers`, startup via `quiesceWorkgroupsForBootMountChange`
+ * (quiescence is a hard precondition for workgroup FS reconciliation; the boot
+ * door stops everything until seam 4 series D2 lets it honour its scope).
+ * Without this, a
  * mid-work session loses its turn and its background workers with no
  * explanation, and only comes back when a human pings — the exact
  * "said it was working, then silence" failure family.

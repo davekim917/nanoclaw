@@ -26,7 +26,7 @@ import {
   updateMessagingGroup,
 } from './db/messaging-groups.js';
 import type { ChannelNameSource, MessagingGroupUpdates } from './db/messaging-groups.js';
-import { ensureContainerRuntimeRunning, cleanupOrphansStrict } from './container-runtime.js';
+import { ensureContainerRuntimeRunning } from './container-runtime.js';
 import { warnActiveContainersOfShutdown, warnMarkedRunningSessionsOfStartup } from './host-restart-warn.js';
 import { resetPhantomContainerStatus } from './db/sessions.js';
 import { resetProcessingChannelIngress } from './db/channel-ingress-receipts.js';
@@ -132,9 +132,14 @@ import { runReconcilerOnStartup as runDispatchReconcilerOnStartup } from './modu
 
 // Workgroup FS reconciler — drains the migration-036 report after migrations.
 import { reconcileWorkgroupFsState } from './modules/workgroup/fs-reconcile.js';
+import { quiesceWorkgroupsForBootMountChange } from './container-restart.js';
 import {
+  listWorkgroupIds,
   reconcileWorkgroupMemory,
   reconcileWorkgroupSharedDirs,
+  sharedDirsReconcileWouldChange,
+  workgroupMemoryReconcileWouldChange,
+  type WorkgroupMemoryDirs,
   type WorkgroupMemoryReport,
 } from './modules/workgroup/shared-dirs.js';
 import { WORKGROUP_SHARED_FS } from './config.js';
@@ -152,17 +157,25 @@ import {
 } from './channels/channel-registry.js';
 import type Database from 'better-sqlite3';
 
+/**
+ * Canonical memory reconciliation, gated on a live container runtime.
+ *
+ * The install-scoped stop this used to run (`cleanupOrphansStrict`) has moved
+ * out to `quiesceWorkgroupsForBootMountChange`, the one boot door
+ * (docs/specs/upstream-restart-survival-seam/plan.md §4.2): quiescence is now
+ * proved once, with its scope computed and logged, before ANY reconciler runs.
+ * `dirs.workgroupIds` is that proved scope.
+ */
 export function runWorkgroupMemoryStartupGate(
   db: Database.Database,
+  dirs: WorkgroupMemoryDirs = {},
   deps: {
     ensureRuntime?: () => void;
-    cleanupStrict?: () => string[];
-    reconcile?: (db: Database.Database) => WorkgroupMemoryReport[];
+    reconcile?: (db: Database.Database, dirs: WorkgroupMemoryDirs) => WorkgroupMemoryReport[];
   } = {},
 ): WorkgroupMemoryReport[] {
   (deps.ensureRuntime ?? ensureContainerRuntimeRunning)();
-  (deps.cleanupStrict ?? cleanupOrphansStrict)();
-  return (deps.reconcile ?? reconcileWorkgroupMemory)(db);
+  return (deps.reconcile ?? reconcileWorkgroupMemory)(db, dirs);
 }
 
 /**
@@ -297,39 +310,61 @@ export async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // BOOT QUIESCENCE DOOR (plan §7.D). Both workgroup reconcilers repoint a
+  // group's local `memory` at a container-absolute symlink target that
+  // resolves only inside a container spawned with the workgroup bind mount, so
+  // a container that outlives the cutover ends up with a dangling
+  // /workspace/agent/memory. Compute which workgroups either reconcile would
+  // actually change, then stop the containers that must not survive it and
+  // PROVE they are gone before anything mutates.
+  //
+  // Fail-closed by construction, and unwrapped on purpose: a predicate that
+  // throws, a runtime listing that cannot be taken, or a stop that does not
+  // take all end startup here — the same answer the fleet-wide
+  // `cleanupOrphansStrict()` gave from inside the memory gate, one step
+  // earlier and with its scope logged.
+  //
+  // D1 still stops every install container; the scoped set is measured, not
+  // honoured (`survivable` on the `Boot quiescence scope` line is the
+  // milestone-1 counterfactual). D2 flips that once adoption lands.
+  const changedWorkgroupIds = listWorkgroupIds(db).filter(
+    (workgroupId) =>
+      workgroupMemoryReconcileWouldChange(db, workgroupId) ||
+      (WORKGROUP_SHARED_FS && sharedDirsReconcileWouldChange(db, workgroupId)),
+  );
+  await quiesceWorkgroupsForBootMountChange(changedWorkgroupIds);
+
+  // Warn sessions still marked 'running' (unclean previous host) that their
+  // containers have been stopped — the on_wake note makes the next spawn
+  // account publicly instead of the session going dark until a human pings.
+  try {
+    await warnMarkedRunningSessionsOfStartup('host startup after an unclean stop');
+  } catch (err) {
+    log.error('host-restart startup warn failed', { err });
+  }
+
   // Workgroup shared-FS consolidation — flag-gated (NANOCLAW_WORKGROUP_SHARED_FS,
   // default off). Moves each workgroup's shared dirs into data/workgroups/<id>/
-  // (bind-mounted at /workspace/workgroup). Idempotent + fail-closed; runs
-  // before any container spawn so the filesystem is quiesced during the move.
+  // (bind-mounted at /workspace/workgroup). Idempotent + fail-closed. It used
+  // to run BEFORE the quiescence proof, which made its own "runs at startup
+  // before any container spawns" comment true only for spawns THIS process
+  // makes; containers left by the previous host were still live (divergence 4).
   if (WORKGROUP_SHARED_FS) {
     try {
-      reconcileWorkgroupSharedDirs(db);
+      reconcileWorkgroupSharedDirs(db, { workgroupIds: changedWorkgroupIds });
     } catch (sharedErr) {
       log.error('Workgroup shared-FS consolidation failed at startup', { err: sharedErr });
       process.exit(1);
     }
   }
 
-  // Canonical memory reconciliation can create links only after install-scoped
-  // container absence has been proved. A failed runtime listing is not
-  // equivalent to "none running": cleanupOrphansStrict throws and startup
-  // stops before any filesystem cutover. FIRST warn sessions still marked
-  // 'running' (unclean previous host) that their containers are about to be
-  // stopped — the on_wake note makes the next spawn account publicly instead
-  // of the session going dark until a human pings.
-  try {
-    await warnMarkedRunningSessionsOfStartup('host startup after an unclean stop');
-  } catch (err) {
-    log.error('host-restart startup warn failed', { err });
-  }
-  const memoryReports = runWorkgroupMemoryStartupGate(db);
+  const memoryReports = runWorkgroupMemoryStartupGate(db, { workgroupIds: changedWorkgroupIds });
 
-  // Prune old agent-runner-source snapshots now that cleanupOrphansStrict()
-  // (inside runWorkgroupMemoryStartupGate, above) has stopped every
-  // container left running by an unclean previous host — pruning any
-  // earlier is unsafe (a bind mount pins the directory, not its entries).
-  // When container adoption across restarts lands (mailbox seam 2), this
-  // ordering assumption needs revisiting: an adopted container is a live
+  // Prune old agent-runner-source snapshots now that the boot quiescence door
+  // above has stopped every container left running by an unclean previous host
+  // — pruning any earlier is unsafe (a bind mount pins the directory, not its
+  // entries). When container adoption across restarts lands (seam 4 series E),
+  // this ordering assumption needs revisiting: an adopted container is a live
   // reference this call must not delete out from under.
   pruneAgentRunnerSnapshots();
   for (const report of memoryReports) {

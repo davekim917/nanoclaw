@@ -141,10 +141,12 @@ function defaultReferencedPaths(): Set<string> | null {
  * one and any still mounted by a running container. Best-effort: a failure
  * removing one entry is logged and skipped, never thrown — pruning is
  * housekeeping, not a boot-blocking step. Call only after orphan containers
- * from a previous host process have been stopped (`main.ts` calls this
- * right after `cleanupOrphansStrict()`); once container adoption across
- * restarts (mailbox seam 2) lands, `referencedPaths` must keep covering
- * adopted containers too, or a live one can lose its mount out from under it.
+ * from a previous host process have been stopped (`main.ts` calls this after
+ * the boot quiescence door, `quiesceWorkgroupsForBootMountChange`); once
+ * container adoption across restarts (seam 4 series E) lands, `referencedPaths`
+ * must keep covering adopted containers too, or a live one can lose its mount
+ * out from under it. `defaultReferencedPaths` below reads docker rather than
+ * the host's in-process registry, which is what makes that survivable.
  */
 export function pruneAgentRunnerSnapshots(opts?: {
   dataDir?: string;

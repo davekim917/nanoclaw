@@ -14,6 +14,7 @@ import {
   wakeContainer,
 } from './container-runner.js';
 import { randomUUID } from 'crypto';
+import { listInstallContainersWithScope, stopContainer, type InstallContainerScope } from './container-runtime.js';
 import { getSessionsByAgentGroup } from './db/sessions.js';
 import { log } from './log.js';
 import { SessionDbMissingError, sessionMailboxPath, type NanoclawMailboxSession } from './modules/mailbox/index.js';
@@ -475,6 +476,105 @@ export async function quiesceSessionsForRepositoryMounts(
       );
     }
   }
+}
+
+/** Counts from one boot quiescence pass. `survivable` is the milestone-1 counterfactual. */
+export interface BootQuiescenceScope {
+  /** Live install containers the runtime reported before any stop. */
+  containers: number;
+  /** Containers this pass actually stopped and proved gone. */
+  stopped: number;
+  /** Labeled containers in no changed workgroup — what D2 will leave running. */
+  survivable: number;
+  /** Containers carrying no workgroup label: unknown scope, always stopped. */
+  unlabeled: number;
+}
+
+/**
+ * D1 stops every install container, exactly as `cleanupOrphansStrict` did, and
+ * only MEASURES the scoped set. D2 flips this to true once adoption (series E)
+ * can track a survivor and shutdown can stop one — until then a container the
+ * host does not adopt is neither fenced against a duplicate spawn nor stopped
+ * at shutdown, so leaving it running would leak it (plan §4.1, divergences 3
+ * and 8). The flip is this constant plus the acceptance assertions that pin it.
+ */
+const BOOT_QUIESCENCE_HONOURS_SCOPE: boolean = false;
+
+/**
+ * The BOOT door for mount changes (plan §4.2).
+ *
+ * Stops the containers that must not survive a workgroup mount cutover, proves
+ * they are gone, and returns the counts. Called once per boot, before either
+ * workgroup reconciler runs — the reconcilers repoint a group's local `memory`
+ * at a container-absolute symlink target, which only resolves inside a
+ * container spawned with the workgroup bind mount, so a container that
+ * outlives the cutover ends up with a dangling `/workspace/agent/memory`.
+ *
+ * The stop set comes from the container runtime by label rather than from the
+ * in-process registry, which is empty at boot. A container with no workgroup
+ * label has unknown scope and is stopped: fail-closed, and the state every
+ * container is in on the first restart after the labels shipped.
+ *
+ * Unlike the runtime door (`quiesceSessionsForRepositoryMounts`) this one does
+ * not fence session ingress and does not wait for a barrier ack. Deliberate:
+ * the path it replaces had neither, the sessions being stopped are the ones
+ * whose mounts are changing, and a 120 s per-session barrier on the startup
+ * critical path would be new behavior at the worst possible moment.
+ *
+ * Fails closed in both directions — a listing that cannot be taken and a stop
+ * that does not take both throw, and startup stops before any reconcile runs.
+ */
+export async function quiesceWorkgroupsForBootMountChange(
+  changedWorkgroupIds: string[],
+  deps: {
+    listWithScope?: () => InstallContainerScope[];
+    stop?: (name: string) => void;
+  } = {},
+): Promise<BootQuiescenceScope> {
+  const listWithScope = deps.listWithScope ?? listInstallContainersWithScope;
+  const stop = deps.stop ?? stopContainer;
+  const changed = new Set(changedWorkgroupIds);
+
+  const containers = listWithScope();
+  const unlabeled = containers.filter((container) => container.workgroupId === null);
+  const mustStop = containers.filter(
+    (container) => container.workgroupId === null || changed.has(container.workgroupId),
+  );
+  const survivable = containers.filter(
+    (container) => container.workgroupId !== null && !changed.has(container.workgroupId),
+  );
+  const stopSet = BOOT_QUIESCENCE_HONOURS_SCOPE ? mustStop : containers;
+
+  for (const container of stopSet) {
+    try {
+      stop(container.name);
+    } catch (err) {
+      throw new Error(`Cannot prove boot mount quiescence: failed to stop ${container.name}`, { cause: err });
+    }
+  }
+
+  // The proof, in the shape `cleanupOrphansStrict` uses: re-list, and refuse to
+  // continue if anything this pass was supposed to stop is still running.
+  const stillRunning = new Set(listWithScope().map((container) => container.name));
+  const survived = stopSet.filter((container) => stillRunning.has(container.name));
+  if (survived.length > 0) {
+    throw new Error(
+      `Boot mount quiescence incomplete: containers still running after stop: ${survived
+        .map((container) => container.name)
+        .join(', ')}`,
+    );
+  }
+
+  const scope: BootQuiescenceScope = {
+    containers: containers.length,
+    stopped: stopSet.length,
+    survivable: survivable.length,
+    unlabeled: unlabeled.length,
+  };
+  // Plan §6, series D1: one line per boot. `survivable` is the measurement this
+  // series exists to take — how many containers milestone 1 would have kept.
+  log.info('Boot quiescence scope', { ...scope, changed: changed.size });
+  return scope;
 }
 
 export function wakeRepositoryMountSessions(sessions: Session[]): void {

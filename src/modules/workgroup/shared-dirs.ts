@@ -130,6 +130,15 @@ export function memoryTreeSha256(root: string): string {
   return hash.digest('hex');
 }
 
+/**
+ * Every workgroup id, ordered. The boot quiescence door (plan §7.D) needs the
+ * same list both reconcilers iterate, so it asks the one place that owns the
+ * query rather than re-deriving the SQL at the call site.
+ */
+export function listWorkgroupIds(db: Database.Database): string[] {
+  return (db.prepare(`SELECT id FROM workgroups ORDER BY id`).all() as Array<{ id: string }>).map((row) => row.id);
+}
+
 function memoryMembers(db: Database.Database, workgroupId: string): Array<{ id: string; folder: string }> {
   return db
     .prepare(`SELECT id, folder FROM agent_groups WHERE workgroup_id = ? ORDER BY folder, id`)
@@ -343,6 +352,58 @@ export function inspectWorkgroupMemoryState(
   };
 }
 
+/**
+ * Would `reconcileWorkgroupMemory` mutate anything for this workgroup?
+ *
+ * PURE. It re-reads the same `lstat` facts the reconcile acts on and answers
+ * true when any of its four mutations would fire: the canonical directory is
+ * missing, a member's local `memory` path is not already the exact
+ * container-absolute compatibility link, `preferences/` is missing under an
+ * existing canon, or the workgroup is `exact-empty` with zero members (the
+ * branch that materializes a bare canon).
+ *
+ * `migration-required` reports FALSE, because the reconcile skips those
+ * workgroups untouched — nothing has to be stopped for them.
+ *
+ * Deliberately a SUPERSET of the dangerous case. Only the member-link branch
+ * actually invalidates a live container's mount targets; over-stopping is safe
+ * and under-stopping is not, so the boot door takes the whole `changed` set.
+ *
+ * The per-member checks read the state as it is BEFORE the reconcile runs,
+ * which is what a boot decision needs: `prepareWorkgroupMemoryMember` creates
+ * the canon and `preferences/` on the first member it visits, so evaluating
+ * them once against the initial tree gives the same boolean the reconcile's
+ * accumulated `changed` flag ends up with.
+ */
+export function workgroupMemoryReconcileWouldChange(
+  db: Database.Database,
+  workgroupId: string,
+  dirs: WorkgroupMemoryDirs = {},
+): boolean {
+  const groupsDir = dirs.groupsDir ?? GROUPS_DIR;
+  const dataDir = dirs.dataDir ?? DATA_DIR;
+  const state = inspectWorkgroupMemoryState(db, workgroupId, { groupsDir, dataDir });
+  if (state.status === 'migration-required') return false;
+
+  const members = memoryMembers(db, workgroupId);
+  // `exact-empty` with zero members is the one branch that runs outside the
+  // per-member loop: the reconcile mkdirs a bare canonical directory.
+  if (state.status === 'exact-empty' && members.length === 0) return true;
+
+  const canonicalPath = workgroupMemoryDir(workgroupId, dataDir);
+  const canonicalExists = lstatOrNull(canonicalPath) !== null;
+  const preferencesExists = canonicalExists && lstatOrNull(path.join(canonicalPath, 'preferences')) !== null;
+  for (const member of members) {
+    if (!canonicalExists) return true;
+    const local = path.join(groupsDir, member.folder, 'memory');
+    const localStat = lstatOrNull(local);
+    const exactLink = localStat?.isSymbolicLink() === true && safeReadlink(local) === WORKGROUP_MEMORY_CONTAINER_PATH;
+    if (!exactLink) return true;
+    if (!preferencesExists) return true;
+  }
+  return false;
+}
+
 function linkMembersToCanonical(
   db: Database.Database,
   workgroupId: string,
@@ -374,10 +435,9 @@ export function reconcileWorkgroupMemory(
   const groupsDir = dirs.groupsDir ?? GROUPS_DIR;
   const dataDir = dirs.dataDir ?? DATA_DIR;
   const selected = dirs.workgroupIds ? new Set(dirs.workgroupIds) : null;
-  const workgroups = db.prepare(`SELECT id FROM workgroups ORDER BY id`).all() as Array<{ id: string }>;
   const reports: WorkgroupMemoryReport[] = [];
 
-  for (const { id } of workgroups) {
+  for (const id of listWorkgroupIds(db)) {
     if (selected && !selected.has(id)) continue;
     const before = inspectWorkgroupMemoryState(db, id, { groupsDir, dataDir });
     if (before.status === 'migration-required') {
@@ -418,38 +478,47 @@ interface MigrationReport {
  * (src/index.ts) can `process.exit(1)` rather than spawn containers against a
  * half-migrated tree. Runs at startup BEFORE any container spawns.
  */
-export function reconcileWorkgroupSharedDirs(
-  db: Database.Database,
-  dirs: { groupsDir?: string; dataDir?: string } = {},
-): void {
+export function reconcileWorkgroupSharedDirs(db: Database.Database, dirs: WorkgroupMemoryDirs = {}): void {
   const groupsDir = dirs.groupsDir ?? GROUPS_DIR;
   const dataDir = dirs.dataDir ?? DATA_DIR;
-  const workgroups = db.prepare(`SELECT id FROM workgroups`).all() as Array<{ id: string }>;
-  for (const wg of workgroups) {
-    migrateWorkgroup(db, wg.id, groupsDir, dataDir);
+  // `workgroupIds` confines the pass to the workgroups the boot door proved
+  // quiescent (plan §7.D). Absent, every workgroup is reconciled — the
+  // pre-seam-4 behavior every other caller still gets.
+  const selected = dirs.workgroupIds ? new Set(dirs.workgroupIds) : null;
+  for (const id of listWorkgroupIds(db)) {
+    if (selected && !selected.has(id)) continue;
+    migrateWorkgroup(db, id, groupsDir, dataDir);
   }
 }
 
-function migrateWorkgroup(db: Database.Database, workgroupId: string, groupsDir: string, dataDir: string): void {
+interface SharedDirsPlan {
+  seedDir: string;
+  wgDir: string;
+  /** Member folders in this workgroup other than the seed. */
+  siblingFolders: string[];
+  /** Names the migration would consolidate into `wgDir`. */
+  shared: Set<string>;
+  /** Real top-level seed dirs left in the bedroom — review for manual sharing. */
+  candidates: string[];
+}
+
+/**
+ * Discover a workgroup's shared set. READ-ONLY — no mkdir, no move, no link.
+ *
+ * Both the migration and `sharedDirsReconcileWouldChange` run off this one
+ * discovery so the predicate cannot drift from the mutation it predicts.
+ * Returns null when the workgroup has no seed folder to consolidate.
+ */
+function planWorkgroupSharedDirs(
+  db: Database.Database,
+  workgroupId: string,
+  groupsDir: string,
+  dataDir: string,
+): SharedDirsPlan | null {
   const seedDir = path.join(groupsDir, workgroupId); // seed folder == workgroup_id
-  if (!fs.existsSync(seedDir)) return; // no seed data to consolidate
+  if (!fs.existsSync(seedDir)) return null; // no seed data to consolidate
 
   const wgDir = path.join(dataDir, 'workgroups', workgroupId);
-  const markerPath = path.join(wgDir, '.migrated');
-  // RE-RUNS EVERY STARTUP, deliberately. This used to `return` here on the
-  // marker, which made the shared tree a one-shot snapshot of whenever it first
-  // ran. On one install a workgroup's marker predated a later seed dir by two
-  // months — the release desk's board, ledger and runbook — so the
-  // union rule below (share any seed dir a sibling already symlinks) never got
-  // to see it. It ended up reachable only by the three siblings someone
-  // remembered to hand-symlink it into and invisible to the two QA agents,
-  // which is exactly the scattered-symlink drift docs/workgroups.md says
-  // workgroups exist to end.
-  //
-  // Every step below already skips when it is already correct, so a re-run on
-  // settled state touches nothing and rewrites nothing. The marker is now a
-  // record (it keeps its original `migratedAt`), not a latch.
-  const priorReport = readMigrationReport(markerPath);
 
   // Sibling folders in this workgroup (excluding the seed itself).
   const members = db.prepare(`SELECT folder FROM agent_groups WHERE workgroup_id = ?`).all(workgroupId) as Array<{
@@ -517,6 +586,83 @@ function migrateWorkgroup(db: Database.Database, workgroupId: string, groupsDir:
   // Defense in depth: a reserved name can never reach the mutating loop even
   // if another discovery source is added without applying the filters above.
   for (const name of RESERVED_SHARED_DIR_NAMES) shared.delete(name);
+
+  return { seedDir, wgDir, siblingFolders, shared, candidates };
+}
+
+/**
+ * Would `reconcileWorkgroupSharedDirs` mutate anything for this workgroup?
+ *
+ * PURE. It replays `migrateWorkgroup`'s decisions over the same plan and the
+ * same `lstat` facts and returns the `changed` flag the migration would end
+ * with, without moving a directory or writing a link.
+ *
+ * One mutation is deliberately not modelled: `mkdir -p` of the shared root.
+ * The migration creates it only when the shared set is non-empty, and a
+ * non-empty shared set with an absent root always contains at least one real
+ * seed directory to move — so `changed` is true on exactly the boots where
+ * that mkdir happens.
+ */
+export function sharedDirsReconcileWouldChange(
+  db: Database.Database,
+  workgroupId: string,
+  dirs: { groupsDir?: string; dataDir?: string } = {},
+): boolean {
+  const groupsDir = dirs.groupsDir ?? GROUPS_DIR;
+  const dataDir = dirs.dataDir ?? DATA_DIR;
+  const plan = planWorkgroupSharedDirs(db, workgroupId, groupsDir, dataDir);
+  if (!plan || plan.shared.size === 0) return false;
+  const { seedDir, wgDir, siblingFolders, shared } = plan;
+
+  let changed = false;
+  const moved: string[] = [];
+  for (const name of [...shared].sort()) {
+    const src = path.join(seedDir, name);
+    const dst = path.join(wgDir, name);
+    if (!fs.existsSync(dst)) {
+      if (!isRealDir(src)) continue; // nothing real to move — and never reaches `moved`
+      changed = true;
+    } else if (isRealDir(src)) {
+      changed = true; // a crash landed between the atomic move and the source cleanup
+    }
+    if (compatSymlinkNeedsWrite(seedDir, name)) changed = true;
+    moved.push(name);
+  }
+
+  for (const sf of siblingFolders) {
+    const sdir = path.join(groupsDir, sf);
+    if (!fs.existsSync(sdir)) continue;
+    for (const name of moved) {
+      const linkPath = path.join(sdir, name);
+      const lst = lstatOrNull(linkPath);
+      if (lst?.isSymbolicLink() && safeReadlink(linkPath) === `${WORKGROUP_CONTAINER_PATH}/${name}`) continue;
+      if (lst && !lst.isSymbolicLink()) continue; // sibling owns a real entry — never clobbered
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function migrateWorkgroup(db: Database.Database, workgroupId: string, groupsDir: string, dataDir: string): void {
+  const plan = planWorkgroupSharedDirs(db, workgroupId, groupsDir, dataDir);
+  if (!plan) return; // no seed data to consolidate
+  const { seedDir, wgDir, siblingFolders, shared, candidates } = plan;
+
+  const markerPath = path.join(wgDir, '.migrated');
+  // RE-RUNS EVERY STARTUP, deliberately. This used to `return` here on the
+  // marker, which made the shared tree a one-shot snapshot of whenever it first
+  // ran. On one install a workgroup's marker predated a later seed dir by two
+  // months — the release desk's board, ledger and runbook — so the
+  // union rule below (share any seed dir a sibling already symlinks) never got
+  // to see it. It ended up reachable only by the three siblings someone
+  // remembered to hand-symlink it into and invisible to the two QA agents,
+  // which is exactly the scattered-symlink drift docs/workgroups.md says
+  // workgroups exist to end.
+  //
+  // Every step below already skips when it is already correct, so a re-run on
+  // settled state touches nothing and rewrites nothing. The marker is now a
+  // record (it keeps its original `migratedAt`), not a latch.
+  const priorReport = readMigrationReport(markerPath);
 
   if (shared.size === 0) {
     log.info('reconcileWorkgroupSharedDirs: nothing to consolidate', { workgroupId });
@@ -643,25 +789,37 @@ function lstatOrNull(p: string): fs.Stats | null {
   }
 }
 
+/**
+ * Would `ensureCompatSymlink` write at `<dir>/<name>`? Read-only, and the sole
+ * authority for that decision — the writer below and the boot predicate both
+ * ask it, so neither can drift from the other.
+ */
+function compatSymlinkNeedsWrite(dir: string, name: string): boolean {
+  const linkPath = path.join(dir, name);
+  const st = lstatOrNull(linkPath);
+  if (!st) return true;
+  // A real entry at the seed path is never clobbered.
+  if (!st.isSymbolicLink()) return false;
+  return safeReadlink(linkPath) !== `${WORKGROUP_CONTAINER_PATH}/${name}`;
+}
+
 /** Create (or replace) a container-absolute compat symlink at `<dir>/<name>`. */
 /** @returns true if it actually wrote a link (i.e. state changed). */
 function ensureCompatSymlink(dir: string, name: string): boolean {
   const linkPath = path.join(dir, name);
   const target = `${WORKGROUP_CONTAINER_PATH}/${name}`;
   const st = lstatOrNull(linkPath);
-  if (st) {
-    if (st.isSymbolicLink() && safeReadlink(linkPath) === target) return false; // already correct
-    if (st.isSymbolicLink()) {
-      fs.unlinkSync(linkPath);
-    } else {
+  if (!compatSymlinkNeedsWrite(dir, name)) {
+    if (st && !st.isSymbolicLink()) {
       // A real entry reappeared at the seed path — do not clobber.
       log.warn('reconcileWorkgroupSharedDirs: refusing to overwrite real seed entry with compat symlink', {
         dir,
         name,
       });
-      return false;
     }
+    return false;
   }
+  if (st) fs.unlinkSync(linkPath); // a symlink pointing somewhere else
   fs.symlinkSync(target, linkPath);
   return true;
 }
