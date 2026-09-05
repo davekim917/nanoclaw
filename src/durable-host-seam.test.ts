@@ -53,9 +53,9 @@ describe('main.ts wires the lease as shadow state', () => {
   // dependency. Pinned structurally: the only call to the starter goes
   // through upstream's `shadowWrite`, which swallows and warns.
   it('starts the lease only through shadowWrite so a failed registration cannot abort boot', () => {
-    const calls = main.match(/startHostInstanceLease\(\)/g) ?? [];
+    const calls = main.match(/startHostInstanceLease\(/g) ?? [];
     expect(calls).toHaveLength(1);
-    expect(main).toMatch(/shadowWrite\([^)]*\(\) => startHostInstanceLease\(\)\)/);
+    expect(main).toMatch(/shadowWrite\('host instance lease start', \(\) => startHostInstanceLease\(\{/);
   });
 
   it('logs the §6 evidence line exactly once, with the instance id and the ttl it passed in', () => {
