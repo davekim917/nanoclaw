@@ -369,13 +369,20 @@ function genericUpdate(def: ResourceDef) {
         const checkParams: Record<string, unknown> = {};
         for (const [k, v] of Object.entries(current)) checkParams[`__orig_${k}`] = v;
 
-        const result = await getDb().run(
-          `UPDATE ${def.table} SET ${setClause} WHERE ${def.idColumn} = @_id AND ${checkClause}`,
+        // `RETURNING` makes the write and the reload ONE statement — github
+        // Codex review, PR #437, src/cli/crud.ts:377: a separate `getDb().get`
+        // reload after the UPDATE is itself an awaited step, so a concurrent
+        // delete of this same row in that gap made the reload find nothing
+        // and the handler return `undefined` — an `{ ok: true }` response
+        // with no row, not the documented not-found/conflict error. Folding
+        // the reload into the UPDATE's own RETURNING clause closes that gap:
+        // there is no longer a second await between "the write landed" and
+        // "here is the row it produced".
+        const updated = await getDb().get<Record<string, unknown>>(
+          `UPDATE ${def.table} SET ${setClause} WHERE ${def.idColumn} = @_id AND ${checkClause} RETURNING ${cols}`,
           { ...updates, ...checkParams, _id: id },
         );
-        if (result.changes > 0) {
-          return getDb().get(`SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`, id);
-        }
+        if (updated) return updated;
 
         current = await getDb().get<Record<string, unknown>>(
           `SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`,
@@ -392,13 +399,16 @@ function genericUpdate(def: ResourceDef) {
     const setClause = Object.keys(updates)
       .map((k) => `${k} = @${k}`)
       .join(', ');
-    const result = await getDb().run(`UPDATE ${def.table} SET ${setClause} WHERE ${def.idColumn} = @_id`, {
-      ...updates,
-      _id: id,
-    });
-    if (result.changes === 0) throw new Error(`${def.name} not found: ${id}`);
+    // Same RETURNING fold as the preUpdate branch above — a separate reload
+    // after the UPDATE would have the identical gap (github Codex review, PR
+    // #437, src/cli/crud.ts:377), just without a `preUpdate` validating it.
+    const updated = await getDb().get<Record<string, unknown>>(
+      `UPDATE ${def.table} SET ${setClause} WHERE ${def.idColumn} = @_id RETURNING ${cols}`,
+      { ...updates, _id: id },
+    );
+    if (!updated) throw new Error(`${def.name} not found: ${id}`);
 
-    return getDb().get(`SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`, id);
+    return updated;
   };
 }
 

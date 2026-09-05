@@ -89,6 +89,10 @@ async function update(args: Record<string, unknown>) {
   return (await lookup('wirings-update')!.handler(args, hostCtx)) as Record<string, unknown>;
 }
 
+async function del(args: Record<string, unknown>) {
+  return lookup('wirings-delete')!.handler(args, hostCtx);
+}
+
 beforeEach(async () => {
   await initTestDb();
   runMigrations(getRawDb());
@@ -315,6 +319,38 @@ describe('wirings-update — same validation as create', () => {
         mg,
       ),
     ).not.toThrow();
+  });
+
+  // github Codex review, PR #437, src/cli/crud.ts:377 (fourth and final round
+  // on this race class): genericUpdate used to reload the row with a SEPARATE
+  // `getDb().get` SELECT after the UPDATE landed. That reload is itself an
+  // awaited step, so a concurrent delete of the same row in the gap between
+  // "the UPDATE committed" and "the reload ran" made the reload find nothing
+  // — the handler returned `undefined`, which the dispatcher reports as
+  // `{ ok: true }` with no row, not the documented not-found error.
+  it('an update overlapping a delete of the same wiring reports not-found, never ok with no row', async () => {
+    const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1' });
+
+    const [updateResult, deleteResult] = await Promise.allSettled([
+      update({ id: row.id, threads: 'true' }),
+      del({ id: row.id }),
+    ]);
+
+    // Whichever ran second sees the other's effect: either the update ran
+    // first and its own row is what gets deleted (delete fulfills, update
+    // fulfills with real data), or the delete lands first/mid-flight and the
+    // update must refuse with the documented not-found error — it must NEVER
+    // resolve to `undefined`/a row-less success.
+    if (updateResult.status === 'fulfilled') {
+      expect(updateResult.value).toBeDefined();
+      expect((updateResult.value as { id: string }).id).toBe(row.id);
+    } else {
+      expect(updateResult.reason).toMatchObject({ message: expect.stringMatching(/not found/i) });
+    }
+    expect(deleteResult.status).toBe('fulfilled');
+
+    // The row is gone either way — the update never resurrects or half-applies.
+    expect(await getMessagingGroupAgent(row.id as string)).toBeUndefined();
   });
 });
 
