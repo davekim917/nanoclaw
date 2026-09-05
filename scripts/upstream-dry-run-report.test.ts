@@ -23,15 +23,15 @@ function createOwnerDb(dbPath: string, includeDm = true): void {
   db.exec(`
     CREATE TABLE user_roles (user_id TEXT NOT NULL, role TEXT NOT NULL);
     CREATE TABLE user_dms (user_id TEXT NOT NULL, messaging_group_id TEXT NOT NULL, channel_type TEXT NOT NULL, resolved_at TEXT NOT NULL);
-    CREATE TABLE messaging_groups (id TEXT PRIMARY KEY, platform_id TEXT NOT NULL);
+    CREATE TABLE messaging_groups (id TEXT PRIMARY KEY, platform_id TEXT NOT NULL, instance TEXT NOT NULL DEFAULT 'test-channel');
   `);
-  db.exec(`INSERT INTO user_roles VALUES ('owner-user', 'owner');`);
+  db.exec(`INSERT INTO user_roles VALUES ('test-channel:owner-user', 'owner');`);
   if (includeDm) {
     db.exec(`
-      INSERT INTO messaging_groups VALUES ('older-dm', 'destination-older');
-      INSERT INTO messaging_groups VALUES ('newer-dm', 'destination-newer');
-      INSERT INTO user_dms VALUES ('owner-user', 'older-dm', 'test-channel', '2026-01-01T00:00:00.000Z');
-      INSERT INTO user_dms VALUES ('owner-user', 'newer-dm', 'test-channel', '2026-02-01T00:00:00.000Z');
+      INSERT INTO messaging_groups (id, platform_id) VALUES ('older-dm', 'destination-older');
+      INSERT INTO messaging_groups (id, platform_id) VALUES ('newer-dm', 'destination-newer');
+      INSERT INTO user_dms VALUES ('test-channel:owner-user', 'older-dm', 'test-channel', '2026-01-01T00:00:00.000Z');
+      INSERT INTO user_dms VALUES ('test-channel:owner-user', 'newer-dm', 'test-channel', '2026-02-01T00:00:00.000Z');
     `);
   }
   db.close();
@@ -62,7 +62,12 @@ describe('upstream dry-run owner notification', () => {
     const dbPath = path.join(fixtureRoot(), 'v2.db');
     createOwnerDb(dbPath);
 
-    expect(resolveLatestOwnerDm(dbPath)).toEqual({ channelType: 'test-channel', platformId: 'destination-newer' });
+    expect(resolveLatestOwnerDm(dbPath)).toEqual({
+      ownerUserId: 'test-channel:owner-user',
+      instance: 'test-channel',
+      channelType: 'test-channel',
+      platformId: 'destination-newer',
+    });
   });
 
   it('returns no target when no owner has a DM cache row', () => {
@@ -91,13 +96,18 @@ describe('upstream dry-run owner notification', () => {
     try {
       await submitOwnerReport({
         socketPath,
-        dm: { channelType: 'test-channel', platformId: 'destination-current' },
+        dm: {
+          ownerUserId: 'test-channel:owner-user',
+          instance: 'test-channel',
+          channelType: 'test-channel',
+          platformId: 'destination-current',
+        },
         report: 'Weekly report body',
       });
 
       const payload = JSON.parse((await receivedPayload).trim()) as Record<string, unknown>;
       expect(payload).toMatchObject({
-        senderId: 'system:upstream-dry-run',
+        senderId: 'test-channel:owner-user',
         sender: 'Upstream Dry Run',
         isMention: true,
         to: { channelType: 'test-channel', platformId: 'destination-current', threadId: 'destination-current' },
@@ -109,13 +119,54 @@ describe('upstream dry-run owner notification', () => {
     }
   });
 
+  it('retains a named instance and refuses to silently route it through the default adapter', async () => {
+    const dbPath = path.join(fixtureRoot(), 'v2.db');
+    createOwnerDb(dbPath);
+    const db = new Database(dbPath);
+    db.prepare('UPDATE messaging_groups SET instance = ? WHERE id = ?').run('test-channel-secondary', 'newer-dm');
+    db.close();
+    const dm = resolveLatestOwnerDm(dbPath)!;
+    expect(dm.instance).toBe('test-channel-secondary');
+    const connectSocket = vi.fn();
+
+    await expect(submitOwnerReport({ socketPath: 'unused.sock', dm, report: 'report' }, connectSocket)).rejects.toThrow(
+      /named adapter instance/,
+    );
+    expect(connectSocket).not.toHaveBeenCalled();
+  });
+
+  it('rejects an owner identity that would be renamespaced by the receiver', async () => {
+    const connectSocket = vi.fn();
+    await expect(
+      submitOwnerReport(
+        {
+          socketPath: 'unused.sock',
+          dm: {
+            ownerUserId: 'owner-without-namespace',
+            instance: 'test-channel',
+            channelType: 'test-channel',
+            platformId: 'destination-current',
+          },
+          report: 'report',
+        },
+        connectSocket,
+      ),
+    ).rejects.toThrow(/not namespaced/);
+    expect(connectSocket).not.toHaveBeenCalled();
+  });
+
   it('surfaces socket connection errors', async () => {
     const socketPath = path.join(fixtureRoot(), 'missing.sock');
 
     await expect(
       submitOwnerReport({
         socketPath,
-        dm: { channelType: 'test-channel', platformId: 'destination-current' },
+        dm: {
+          ownerUserId: 'test-channel:owner-user',
+          instance: 'test-channel',
+          channelType: 'test-channel',
+          platformId: 'destination-current',
+        },
         report: 'report',
       }),
     ).rejects.toThrow(/submission failed/);
@@ -130,7 +181,12 @@ describe('upstream dry-run owner notification', () => {
       submitOwnerReport(
         {
           socketPath: 'pending.sock',
-          dm: { channelType: 'test-channel', platformId: 'destination-current' },
+          dm: {
+            ownerUserId: 'test-channel:owner-user',
+            instance: 'test-channel',
+            channelType: 'test-channel',
+            platformId: 'destination-current',
+          },
           report: 'report',
           timeoutMs: 1,
         },
@@ -151,7 +207,12 @@ describe('upstream dry-run owner notification', () => {
     const submission = submitOwnerReport(
       {
         socketPath: 'failed.sock',
-        dm: { channelType: 'test-channel', platformId: 'destination-current' },
+        dm: {
+          ownerUserId: 'test-channel:owner-user',
+          instance: 'test-channel',
+          channelType: 'test-channel',
+          platformId: 'destination-current',
+        },
         report: 'report',
       },
       () => socket as unknown as net.Socket,
@@ -190,7 +251,12 @@ describe('upstream dry-run owner notification', () => {
     expect(submitReport).toHaveBeenCalledOnce();
     expect(submitReport).toHaveBeenCalledWith({
       socketPath: path.join(root, 'data', 'cli.sock'),
-      dm: { channelType: 'test-channel', platformId: 'destination-newer' },
+      dm: {
+        ownerUserId: 'test-channel:owner-user',
+        instance: 'test-channel',
+        channelType: 'test-channel',
+        platformId: 'destination-newer',
+      },
       report: 'Generated report',
     });
     expect(log).toHaveBeenNthCalledWith(1, 'Generated report');

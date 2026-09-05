@@ -21,6 +21,8 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 const CLI_SOCKET_TIMEOUT_MS = 5_000;
 
 export interface OwnerDm {
+  ownerUserId: string;
+  instance: string;
   channelType: string;
   platformId: string;
 }
@@ -34,7 +36,7 @@ export function resolveLatestOwnerDm(dbPath: string): OwnerDm | undefined {
     return (
       (db
         .prepare(
-          `SELECT mg.platform_id AS platformId, ud.channel_type AS channelType
+          `SELECT ur.user_id AS ownerUserId, mg.instance AS instance, mg.platform_id AS platformId, ud.channel_type AS channelType
              FROM user_roles ur
              JOIN user_dms ud ON ud.user_id = ur.user_id
              JOIN messaging_groups mg ON mg.id = ud.messaging_group_id
@@ -62,10 +64,20 @@ export async function submitOwnerReport(
   }: { socketPath: string; dm: OwnerDm; report: string; timeoutMs?: number },
   connectSocket: SocketConnector = (target) => net.createConnection(target),
 ): Promise<void> {
+  if (!dm.ownerUserId.includes(':')) {
+    throw new Error('Cannot notify the owner: the stored owner identity is not namespaced.');
+  }
+  if (dm.instance !== dm.channelType) {
+    throw new Error(
+      'Cannot notify the owner: this DM uses a named adapter instance that the current CLI transport cannot preserve. See issue #390.',
+    );
+  }
+
   const payload =
     JSON.stringify({
       text: `System notification (weekly upstream dry-run): Please relay the following weekly upstream dry-run report to the operator:\n\n${report}`,
-      senderId: 'system:upstream-dry-run',
+      // This owner-only local transport acts on behalf of the selected owner.
+      senderId: dm.ownerUserId,
       sender: 'Upstream Dry Run',
       isMention: true,
       to: {
