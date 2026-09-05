@@ -166,9 +166,9 @@ async function _writeAndEchoSteer(
   const requestHash = createHash('sha256').update(trimmedText).digest('hex');
   const messageId = randomUUID();
 
-  let reserved: ReturnType<typeof reserveIdempotency>;
+  let reserved: Awaited<ReturnType<typeof reserveIdempotency>>;
   try {
-    reserved = reserveIdempotency(userId, idempotencyKey, exec.target, messageId, trimmedText, requestHash);
+    reserved = await reserveIdempotency(userId, idempotencyKey, exec.target, messageId, trimmedText, requestHash);
   } catch (err) {
     if (err instanceof IdempotencyConflict) {
       refundRateLimit(rateLimitKey);
@@ -187,7 +187,7 @@ async function _writeAndEchoSteer(
     // never sees the message. claim+fire here closes that window —
     // single CAS guarantees we don't double-echo if the original
     // setImmediate already ran.
-    if (!reserved.echoAttempted && claimEchoAttempted(reserved.id)) {
+    if (!reserved.echoAttempted && (await claimEchoAttempted(reserved.id))) {
       setImmediate(() => {
         void (async () => {
           try {
@@ -281,9 +281,9 @@ async function _writeAndEchoSteer(
     message_id: resolvedMessageId,
     echo_status: 'pending',
   };
-  applyIdempotency(userId, idempotencyKey, steerResponse);
+  await applyIdempotency(userId, idempotencyKey, steerResponse);
 
-  if (claimEchoAttempted(reserved.id)) {
+  if (await claimEchoAttempted(reserved.id)) {
     setImmediate(() => {
       void (async () => {
         try {
