@@ -108,6 +108,24 @@ vi.mock('./container-runtime.js', async (importOriginal) => ({
   waitForContainerExit: (name: string) => fakes.arm(name),
 }));
 
+/** Parks the NEXT `getSessionClaim` read once — the finish's fence read, in the interleaving case. */
+const claimReads = vi.hoisted(() => ({ parkNext: null as Promise<void> | null, count: 0 }));
+vi.mock('./db/coordination.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./db/coordination.js')>();
+  return {
+    ...real,
+    getSessionClaim: async (sessionId: string) => {
+      claimReads.count += 1;
+      const gate = claimReads.parkNext;
+      if (gate) {
+        claimReads.parkNext = null;
+        await gate;
+      }
+      return real.getSessionClaim(sessionId);
+    },
+  };
+});
+
 const leases = vi.hoisted(() => ({ acquired: [] as string[], released: [] as string[] }));
 vi.mock('./storage-activity.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('./storage-activity.js')>();
@@ -195,6 +213,7 @@ import {
   getAdoptedSessionIds,
   beginContainerShutdown,
   finalizeSession,
+  planContainerShutdown,
   isAdoptedContainer,
   isContainerRunning,
   killContainer,
@@ -276,6 +295,8 @@ async function drainAdopted(): Promise<void> {
 describe('supervision channel', () => {
   beforeEach(async () => {
     fakes.reset();
+    claimReads.parkNext = null;
+    claimReads.count = 0;
     leases.acquired.length = 0;
     leases.released.length = 0;
     // A short re-arm backoff: the daemon-restart cases wait for the second waiter.
@@ -419,6 +440,41 @@ describe('supervision channel', () => {
     expect((await getSessionClaim('sess-stale-channel'))?.claimed_by).not.toBeNull();
   });
 
+  it('the stale-finish fence and the stopped stamp are one step — a replacement wake waits behind them', async () => {
+    await adopt('sess-interleave');
+    const first = await getSessionClaim('sess-interleave');
+    expect(first?.incarnation).toBe(1);
+    // Park the finish INSIDE its fence transaction, between its claim read and
+    // its status write — the window where a replacement used to claim N+1.
+    let letTheFinishContinue!: () => void;
+    claimReads.parkNext = new Promise<void>((resolve) => {
+      letTheFinishContinue = resolve;
+    });
+
+    fakes.exit('nanoclaw-v2-sess-interleave', 0);
+    expect(isContainerRunning('sess-interleave')).toBe(false);
+    // The replacement wake: its claim CAS is its own central transaction, so
+    // it queues behind the parked finish instead of landing inside its window.
+    const replacement = wakeContainer(callerSnapshot('sess-interleave'));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(isContainerRunning('sess-interleave'), 'the replacement claimed inside the finish window').toBe(false);
+    letTheFinishContinue();
+
+    await expect(replacement).resolves.toBe(true);
+    // The finish stamped `stopped` at incarnation 1 BEFORE the replacement
+    // claimed 2 and marked itself running, so the live container's status is
+    // not overwritten by the old finalizer.
+    expect(isContainerRunning('sess-interleave')).toBe(true);
+    expect(await containerStatusOf('sess-interleave')).toBe('running');
+    const claim = await getSessionClaim('sess-interleave');
+    expect([claim?.incarnation, claim?.claimed_by]).toEqual([2, first?.claimed_by]);
+
+    // The replacement is a real `sleep` client: kill it so it does not outlive the case.
+    fakes.stopThrows = true;
+    killContainer('sess-interleave', 'test');
+    await until(() => !isContainerRunning('sess-interleave'), 'the replacement never finalized');
+  });
+
   it('an adopted entry releases no storage-activity lease', async () => {
     await adopt('sess-no-lease');
 
@@ -436,10 +492,12 @@ describe('supervision channel', () => {
   // resets it — every later wake would be refused before it reached a claim.
   it('beginContainerShutdown leaves a running container alone and closes the spawn path', async () => {
     await adopt('sess-door-1');
+    // The warn's input, asked before the door: nothing running is stopped.
+    expect([...planContainerShutdown()]).toEqual([]);
 
     const left = await beginContainerShutdown(0);
 
-    expect(left).toEqual({ running: 1, adopted: 1, spawning: 0 });
+    expect(left).toEqual({ running: 1, adopted: 1, spawning: 0, stopping: 0 });
     expect(isContainerRunning('sess-door-1')).toBe(true);
     expect(fakes.calls).toEqual([]);
     expect(await containerStatusOf('sess-door-1')).toBe('running');

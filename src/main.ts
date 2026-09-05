@@ -33,8 +33,8 @@ import { resetProcessingChannelIngress } from './db/channel-ingress-receipts.js'
 import {
   adoptRunningSessions,
   beginContainerShutdown,
-  getActiveContainerSessionIds,
   honorPendingStopIntents,
+  planContainerShutdown,
 } from './container-runner.js';
 import { quiesceWorkgroupsForBootMountChange, type BootQuiescenceScope } from './container-restart.js';
 import { writeUpstreamPolicySnapshot } from './container-updates.js';
@@ -925,10 +925,12 @@ async function shutdown(signal: string): Promise<void> {
     // on_wake note (due immediately) makes the post-restart spawn account
     // for the interruption publicly instead of the session going dark.
     try {
-      // E integration: the narrowed stopping set from beginContainerShutdown()
-      // (seam4/e-adoption). Today it is every tracked container, because that
-      // is exactly what stopAllContainers() below stops.
-      await warnActiveContainersOfShutdown('graceful host shutdown', new Set(getActiveContainerSessionIds()));
+      // The stopping set is the door's own plan, asked before the door runs
+      // (series E, door 1): under it no running container is stopped, so this
+      // is the empty set and adopted-to-be sessions get no interruption note.
+      // Sessions the unit's `ExecStop` still stops until the unit-file doors
+      // land get none either — accepted, the doors ship on one restart.
+      await warnActiveContainersOfShutdown('graceful host shutdown', planContainerShutdown());
     } catch (err) {
       log.error('host-restart shutdown warn failed', { err });
     }

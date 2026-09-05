@@ -157,14 +157,33 @@ vi.mock('./storage-maintenance-worker.js', async (importOriginal) => ({
       ReturnType<typeof import('./storage-maintenance-worker.js').assertStorageAdmissionInBackground>
     >,
 }));
+/**
+ * A memory-admission controller that keeps real reservations (the real one
+ * sizes its budget from a `docker info` probe at first use, which a unit test
+ * must not make). `budgetMb` is what a case lowers to make a survivor not fit;
+ * the request/queue/reject verdicts mirror the real controller's.
+ */
+const memoryStub = vi.hoisted(() => ({
+  budgetMb: 1_000_000,
+  reservations: new Map<string, number>(),
+  reservedMb(): number {
+    let total = 0;
+    for (const amount of this.reservations.values()) total += amount;
+    return total;
+  },
+  reset(): void {
+    this.budgetMb = 1_000_000;
+    this.reservations.clear();
+  },
+}));
 vi.mock('./memory-admission.js', () => {
-  class AlwaysAdmits<T> {
+  class TrackingAdmission<T> {
     readonly budgetMb: number;
     constructor(budgetMb: number) {
       this.budgetMb = budgetMb;
     }
     get reservedMb(): number {
-      return 0;
+      return memoryStub.reservedMb();
     }
     get queuedCount(): number {
       return 0;
@@ -172,23 +191,32 @@ vi.mock('./memory-admission.js', () => {
     isQueued(): boolean {
       return false;
     }
-    hasReservation(): boolean {
-      return false;
+    hasReservation(id: string): boolean {
+      return memoryStub.reservations.has(id);
     }
-    request(_id: string, requestMb: number, _payload: T): MemoryAdmissionResult {
-      return { status: 'admitted', budgetMb: this.budgetMb, requestMb };
+    request(id: string, requestMb: number, _payload: T): MemoryAdmissionResult {
+      const budgetMb = memoryStub.budgetMb;
+      if (requestMb > budgetMb) return { status: 'rejected', reason: 'request_exceeds_budget', budgetMb, requestMb };
+      if (memoryStub.reservations.has(id)) return { status: 'admitted', budgetMb, requestMb };
+      if (memoryStub.reservedMb() + requestMb > budgetMb) return { status: 'queued', budgetMb, requestMb, position: 1 };
+      memoryStub.reservations.set(id, requestMb);
+      return { status: 'admitted', budgetMb, requestMb };
     }
-    release(): T[] {
+    release(id: string): T[] {
+      memoryStub.reservations.delete(id);
       return [];
     }
-    cancel(): T[] {
+    cancel(id: string): T[] {
+      memoryStub.reservations.delete(id);
       return [];
     }
-    shutdown(): void {}
+    shutdown(): void {
+      memoryStub.reservations.clear();
+    }
   }
   return {
     MemoryAdmissionController:
-      AlwaysAdmits as unknown as typeof import('./memory-admission.js').MemoryAdmissionController,
+      TrackingAdmission as unknown as typeof import('./memory-admission.js').MemoryAdmissionController,
   };
 });
 
@@ -206,6 +234,7 @@ import {
   _resetAdoptionStateForTesting,
   _resetEverSeenRunningForTest,
 } from './container-runner.js';
+import { resolveContainerResources } from './container-resources.js';
 import { closeDb } from './db/connection.js';
 import { getSessionClaim } from './db/coordination.js';
 import { getHostInstanceId, stopHostInstanceLease } from './host-instance.js';
@@ -286,6 +315,7 @@ async function drainAdopted(): Promise<void> {
 describe('adoptRunningSessions', () => {
   beforeEach(async () => {
     fakes.reset();
+    memoryStub.reset();
     hooks.claimWriteFails = false;
     _resetAdoptionStateForTesting();
     _resetEverSeenRunningForTest();
@@ -497,6 +527,44 @@ describe('adoptRunningSessions', () => {
     expect(warnings('Session adoption skipped — runtime listing failed')).toHaveLength(1);
     expect(isContainerRunning('sess-unlisted')).toBe(false);
     expect(fakes.stopped).toEqual([]);
+  });
+
+  it('an adopted container holds a memory reservation until it finishes', async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-reserved');
+    fakes.listing = [survivor('sess-reserved')];
+    // Sized exactly as a spawn of this group would be: the group has no
+    // container.json, so the install defaults apply on both paths.
+    const requestMb = resolveContainerResources(undefined).memory.requestMb;
+
+    await adoptRunningSessions({ list: fakes.list });
+
+    expect(memoryStub.reservedMb()).toBe(requestMb);
+    expect(memoryStub.reservations.get('sess-reserved')).toBe(requestMb);
+
+    fakes.exit('nanoclaw-v2-sess-reserved', 0);
+    await until(() => !isContainerRunning('sess-reserved'), 'the adopted entry never finalized');
+    expect(memoryStub.reservedMb()).toBe(0);
+  });
+
+  it('adoption never exceeds the budget it would refuse a spawn for', async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-fits');
+    await seedSession(TEST_DATA_DIR, 'sess-too-big');
+    fakes.listing = [survivor('sess-fits'), survivor('sess-too-big')];
+    const requestMb = resolveContainerResources(undefined).memory.requestMb;
+    // Room for exactly one survivor: the second would be queued as a spawn.
+    memoryStub.budgetMb = requestMb;
+
+    const reconciled = await adoptRunningSessions({ list: fakes.list });
+
+    expect(reconciled).toEqual({ adopted: 1, stopped: 1, pendingClaim: 0, fencedInbound: 0 });
+    expect(fakes.stopped).toEqual(['nanoclaw-v2-sess-too-big']);
+    expect(isContainerRunning('sess-too-big')).toBe(false);
+    // Never claimed, nothing reserved for it, and the budget is exactly spent.
+    expect(await getSessionClaim('sess-too-big')).toBeUndefined();
+    expect(memoryStub.reservedMb()).toBe(requestMb);
+    expect(
+      warnings('Adoption refused — the container does not fit the memory admission budget; stopping it'),
+    ).toHaveLength(1);
   });
 
   it("an adopted session's ceiling uses the adoption instant", async () => {

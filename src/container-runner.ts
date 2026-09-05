@@ -99,11 +99,10 @@ import {
   setStopIntent,
   shadowWrite,
   tryClaimSession,
-  type SessionClaimRow,
 } from './db/coordination.js';
 import { getHostInstanceId, startHostInstanceLease } from './host-instance.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
-import { getSession, SESSION_BY_ID_SQL } from './db/sessions.js';
+import { getSession, SESSION_BY_ID_SQL, updateSession } from './db/sessions.js';
 import { buildCentralProjection } from './db/per-agent-projections.js';
 import { ensureArchiveProjection } from './db/archive-projection-worker.js';
 import { initGroupFilesystem } from './group-init.js';
@@ -145,6 +144,7 @@ import {
   heartbeatPath,
   markContainerRunning,
   markContainerStopped,
+  _emitContainerStateEvent,
   sessionContextPath,
   sessionDir,
   withExistingMailboxSession,
@@ -1905,48 +1905,58 @@ export function finalizeSession(
  * The durable half of a container's finish: the `stopped` status write (and
  * the dashboard event it emits) and the claim release.
  *
- * Both are fenced on the claim row first. The release always was — it matches
+ * Both are fenced on the claim row. The release always was — it matches
  * `claimed_by` AND `incarnation`, so a stale release is a no-op — but the
  * status write was not: after a peer host took the session at N+1, this host's
  * still-live child could report the peer's live container stopped (#439, item
- * 2). One read decides both: a row that has moved past our incarnation, or is
- * held by someone else, means the finish is not ours to record. A read that
- * fails proceeds unfenced, exactly as before the fence existed — a central DB
- * that cannot answer a read will refuse the status write on its own terms.
+ * 2). The fence read and the conditional status write are ONE atomic step
+ * (`centralTransaction`, `BEGIN IMMEDIATE` under the central lease): a
+ * replacement wake's claim CAS runs in its own transaction and so waits behind
+ * this one, which closes the interleaving where the replacement claimed N+1
+ * between this finish's read and its write and was then stamped `stopped`
+ * after it had marked itself running. The dashboard event is emitted after
+ * the commit — the closure is DB calls only (plan §4.4).
  *
- * Entries with no incarnation (the claim was refused, or never taken under a
- * durable id) have nothing to fence on and write as they always did.
+ * A row that has moved past our incarnation, or is held by someone else,
+ * means the finish is not ours to record. A transaction that fails proceeds
+ * unfenced, exactly as before the fence existed — a central DB that cannot
+ * answer a read will refuse the status write on its own terms. Entries with no
+ * incarnation (the claim was refused, or never taken under a durable id) have
+ * nothing to fence on and write as they always did.
  */
 async function finishSessionBookkeeping(sessionId: string, claimIncarnation: number | undefined): Promise<void> {
+  let fenced: 'ours' | 'stale' | 'unfenced' = 'unfenced';
   if (claimIncarnation !== undefined) {
-    let claim: SessionClaimRow | undefined;
-    let readable = true;
+    const self = getHostInstanceId();
     try {
-      claim = await getSessionClaim(sessionId);
+      fenced = await centralTransaction(async () => {
+        const claim = await getSessionClaim(sessionId);
+        if (claim) {
+          const movedOn = claim.incarnation !== claimIncarnation;
+          const heldByAnother = claim.claimed_by !== null && claim.claimed_by !== self;
+          if (movedOn || heldByAnother) {
+            log.warn('Ignoring stale session finish', {
+              sessionId,
+              fence: 'claim',
+              ourIncarnation: claimIncarnation,
+              incarnation: claim.incarnation,
+              holder: claim.claimed_by,
+            });
+            return 'stale';
+          }
+        }
+        await updateSession(sessionId, { container_status: 'stopped' });
+        return 'ours';
+      }, 'session-finish');
     } catch (err) {
-      readable = false;
-      log.warn('Could not read the session claim before finish bookkeeping — proceeding unfenced', {
-        sessionId,
-        err,
-      });
-    }
-    if (readable && claim) {
-      const self = getHostInstanceId();
-      const movedOn = claim.incarnation !== claimIncarnation;
-      const heldByAnother = claim.claimed_by !== null && claim.claimed_by !== self;
-      if (movedOn || heldByAnother) {
-        log.warn("Skipping finish bookkeeping — the session claim is no longer this runtime's", {
-          sessionId,
-          ourIncarnation: claimIncarnation,
-          incarnation: claim.incarnation,
-          holder: claim.claimed_by,
-        });
-        return;
-      }
+      log.warn('Could not fence the finish on the session claim — proceeding unfenced', { sessionId, err });
+      fenced = 'unfenced';
     }
   }
+  if (fenced === 'stale') return;
   try {
-    await markContainerStopped(sessionId);
+    if (fenced === 'ours') await _emitContainerStateEvent(sessionId, 'stopped');
+    else await markContainerStopped(sessionId);
   } catch (err) {
     log.warn('markContainerStopped failed after container exit', { sessionId, err });
   }
@@ -2267,7 +2277,47 @@ async function registerAdoptedContainer(
   }
 }
 
-type AdoptionOutcome = { outcome: 'adopted'; fencedInbound: boolean } | { outcome: 'pending' };
+type AdoptionOutcome =
+  | { outcome: 'adopted'; fencedInbound: boolean }
+  | { outcome: 'pending' }
+  | { outcome: 'stopped'; reason: string };
+
+/**
+ * Reserve an adopted container's memory in the admission controller, sized
+ * exactly as a spawn of the same agent group would be (`resolveContainerResources`
+ * over the group's `container.json`). Without this the controller starts a
+ * boot with survivors at 0 MiB reserved and can admit a full budget of fresh
+ * spawns on top of containers that are already using theirs.
+ *
+ * A survivor the controller would refuse a spawn for — the request exceeds
+ * the budget, or the budget is already spent by earlier survivors — is refused
+ * here too: adoption never over-commits what a spawn could not. The caller
+ * stops that container; its next wake re-enters admission like any spawn.
+ */
+async function reserveAdoptedMemory(
+  session: Session,
+): Promise<{ ok: true; requestMb: number } | { ok: false; reason: string }> {
+  const agentGroup = await getAgentGroup(session.agent_group_id);
+  if (!agentGroup) return { ok: false, reason: 'agent group not found' };
+  let requestMb: number;
+  try {
+    requestMb = resolveContainerResources(readContainerConfig(agentGroup.folder).resources).memory.requestMb;
+  } catch (err) {
+    return { ok: false, reason: `invalid resource configuration: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  const decision = getMemoryAdmission().request(session.id, requestMb, { session }, 'interactive');
+  if (decision.status === 'admitted') return { ok: true, requestMb };
+  // A queued request would otherwise be drained into a spawn later, for a
+  // container this host is about to stop.
+  cancelMemoryAdmission(session.id);
+  return {
+    ok: false,
+    reason:
+      decision.status === 'rejected'
+        ? `memory request ${requestMb} MiB exceeds the host budget ${decision.budgetMb} MiB`
+        : `memory budget exhausted: ${requestMb} MiB requested, ${decision.budgetMb} MiB budget`,
+  };
+}
 
 /**
  * Take the claim for a survivor and register it. Property 1 (§7.E): claim
@@ -2276,6 +2326,20 @@ type AdoptionOutcome = { outcome: 'adopted'; fencedInbound: boolean } | { outcom
  * `pendingAdoptions` so the wake path retries rather than spawning into it.
  */
 async function adoptRunningSession(session: Session, containerName: string): Promise<AdoptionOutcome> {
+  // Memory first, claim second: a survivor that does not fit is stopped
+  // without ever having been claimed, and a claim that then fails hands the
+  // reservation back (`finalizeSession` releases it for an adopted entry
+  // exactly as for a spawned one).
+  const memory = await reserveAdoptedMemory(session);
+  if (!memory.ok) {
+    log.warn('Adoption refused — the container does not fit the memory admission budget; stopping it', {
+      sessionId: session.id,
+      containerName,
+      reason: memory.reason,
+    });
+    stopUnadoptable(containerName, memory.reason, session.id);
+    return { outcome: 'stopped', reason: memory.reason };
+  }
   let claimIncarnation: number | null;
   try {
     claimIncarnation = await claimSessionRun(session.id, containerName, { adopting: true });
@@ -2285,6 +2349,7 @@ async function adoptRunningSession(session: Session, containerName: string): Pro
       containerName,
       err,
     });
+    releaseMemoryReservation(session.id);
     pendingAdoptions.add(session.id);
     return { outcome: 'pending' };
   }
@@ -2293,6 +2358,7 @@ async function adoptRunningSession(session: Session, containerName: string): Pro
       sessionId: session.id,
       containerName,
     });
+    releaseMemoryReservation(session.id);
     pendingAdoptions.add(session.id);
     return { outcome: 'pending' };
   }
@@ -2307,6 +2373,7 @@ async function adoptRunningSession(session: Session, containerName: string): Pro
       err,
     });
     activeContainers.delete(session.id);
+    releaseMemoryReservation(session.id);
     await releaseClaimQuietly(session.id, claimIncarnation);
     pendingAdoptions.add(session.id);
     return { outcome: 'pending' };
@@ -2424,6 +2491,10 @@ export async function adoptRunningSessions(
       counts.pendingClaim += 1;
       continue;
     }
+    if (result.outcome === 'stopped') {
+      counts.stopped += 1;
+      continue;
+    }
     counts.adopted += 1;
     if (result.fencedInbound) counts.fencedInbound += 1;
   }
@@ -2462,6 +2533,12 @@ async function retryPendingAdoption(session: Session): Promise<boolean> {
   const result = await adoptRunningSession(fresh, survivor.name);
   if (result.outcome === 'pending') {
     throw new Error(`session ${session.id} has a running container this host could not claim — not spawning`);
+  }
+  if (result.outcome === 'stopped') {
+    // Stopped for not fitting the memory budget: the container is gone now,
+    // and the ordinary path's own admission decides whether a spawn fits.
+    pendingAdoptions.delete(session.id);
+    return false;
   }
   log.info('Adopted a pending survivor on wake', { sessionId: session.id, containerName: survivor.name });
   return true;
@@ -2721,17 +2798,35 @@ function settlePendingKill(sessionId: string): void {
  * Returns what was left running, for the operator log and for the restart
  * warning's stopping set (series G): under this door that set is empty.
  */
+/**
+ * The sessions `beginContainerShutdown()` will stop, computed without stopping
+ * anything — the restart warning's input (series G), asked BEFORE the door
+ * runs so the note is in place before a container dies.
+ *
+ * Under door 1 this is the empty set: every running container is left for the
+ * next host to adopt. Until the unit-file doors land, systemd's `ExecStop`
+ * sweep still stops those containers after this process exits and they get no
+ * note — accepted, because the three doors ship on the same restart (plan §7)
+ * and a warn sized to `ExecStop` would be a warn for every session on every
+ * restart thereafter.
+ */
+export function planContainerShutdown(): ReadonlySet<string> {
+  return new Set<string>();
+}
+
 export async function beginContainerShutdown(
   gracePeriodMs: number = 10_000,
-): Promise<{ running: number; adopted: number; spawning: number }> {
+): Promise<{ running: number; adopted: number; spawning: number; stopping: number }> {
   containerShutdownInProgress = true;
   memoryAdmission?.shutdown();
   const inFlight = [...wakePromises.values()];
   const running = activeContainers.size;
   const adopted = getAdoptedSessionIds().length;
+  const stopping = planContainerShutdown().size;
   log.info('Container shutdown begun — leaving running containers for the next host to adopt', {
     running,
     adopted,
+    stopping,
     spawning: inFlight.length,
     gracePeriodMs,
   });
@@ -2743,7 +2838,7 @@ export async function beginContainerShutdown(
     await Promise.race([Promise.allSettled(inFlight).then(() => undefined), timeout]);
     if (timeoutHandle) clearTimeout(timeoutHandle);
   }
-  return { running, adopted, spawning: inFlight.length };
+  return { running, adopted, spawning: inFlight.length, stopping };
 }
 
 /**

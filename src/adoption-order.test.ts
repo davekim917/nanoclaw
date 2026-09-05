@@ -47,6 +47,25 @@ function mainSource(): string {
   return fs.readFileSync(path.join(import.meta.dirname, 'main.ts'), 'utf8');
 }
 
+/** Every call expression inside the top-level function `name`, with its argument texts. */
+function callsWithin(source: string, name: string): Array<{ callee: string; args: string[] }> {
+  const sourceFile = ts.createSourceFile('main.ts', source, ts.ScriptTarget.Latest, true);
+  const fn = sourceFile.statements.find(
+    (statement): statement is ts.FunctionDeclaration =>
+      ts.isFunctionDeclaration(statement) && statement.name?.text === name,
+  );
+  expect(fn?.body, `${name}() is no longer a top-level function declaration`).toBeDefined();
+  const calls: Array<{ callee: string; args: string[] }> = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
+      calls.push({ callee: node.expression.text, args: node.arguments.map((arg) => arg.getText(sourceFile)) });
+    }
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(fn!.body!, visit);
+  return calls;
+}
+
 const ADOPT = 'await adoptRunningSessions';
 /** D1's scoped boot door; until it lands, the fleet-wide stop inside the memory gate is the door. */
 const QUIESCE = 'await quiesceWorkgroupsForBootMountChange';
@@ -95,6 +114,20 @@ describe('adoption order (P3)', () => {
     // adoption (which registers containers but takes no claims) goes first,
     // and the recovery is the one that releases what adoption only counted.
     expect(indexOfCall(calls, FENCE_RECOVERY)).toBeGreaterThan(adopt);
+  });
+
+  it("the shutdown warn receives the door's stopping set, not every active session", () => {
+    const calls = callsWithin(mainSource(), 'shutdown');
+    const warn = calls.filter((call) => call.callee === 'warnActiveContainersOfShutdown');
+    expect(warn).toHaveLength(1);
+    // The set the door will stop, computed by the door itself before it runs
+    // (empty under door 1) — never the live registry, which is what the door
+    // deliberately leaves alone.
+    expect(warn[0]!.args[1]).toBe('planContainerShutdown()');
+    expect(calls.some((call) => call.callee === 'getActiveContainerSessionIds')).toBe(false);
+    // And the warn precedes the door.
+    const order = calls.map((call) => call.callee);
+    expect(order.indexOf('warnActiveContainersOfShutdown')).toBeLessThan(order.indexOf('beginContainerShutdown'));
   });
 
   it('nothing in main() calls wakeContainer before adoption resolves', () => {
