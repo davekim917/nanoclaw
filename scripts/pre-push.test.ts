@@ -378,7 +378,15 @@ describe('.husky/pre-push', () => {
     (nested) => {
       const f = fixture();
       const base = commit(f.root, 'remote-base');
-      runGit(f.root, ['tag', '-a', 'synthetic-inner', '-m', 'Private Customer annotation', base]);
+      runGit(f.root, [
+        'tag',
+        '-a',
+        'synthetic-inner',
+        '--cleanup=verbatim',
+        '-m',
+        'clean first paragraph\n\n# Private Customer annotation',
+        base,
+      ]);
       if (nested)
         runGit(f.root, [
           '-c',
@@ -401,6 +409,33 @@ describe('.husky/pre-push', () => {
       expect(fs.readdirSync(f.root).some((name) => name.startsWith('nanoclaw-pre-push.'))).toBe(false);
     },
   );
+
+  it('accepts an annotation with a tagger outside the synthetic email exemptions', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    // Deliberately outside the boundary check's synthetic-identity exemptions.
+    // The reserved .invalid domain keeps this fixture independent of any person.
+    const email = ['release', 'publisher.invalid'].join('@');
+    runGit(f.root, [
+      '-c',
+      'user.name=Release Publisher',
+      '-c',
+      `user.email=${email}`,
+      'tag',
+      '-a',
+      'ordinary-tagger',
+      '-m',
+      'clean annotation',
+      base,
+    ]);
+    const tag = runGit(f.root, ['rev-parse', 'ordinary-tagger']);
+    expect(runGit(f.root, ['cat-file', 'tag', tag])).toContain(`<${email}>`);
+    const result = push(f, `refs/tags/release ${tag} refs/tags/release ${zeroSha}\n`, {
+      remoteRefs: `${base}\trefs/heads/main\n`,
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(records(f.log)).toHaveLength(1);
+  });
 
   it('accepts clean annotated and lightweight tags and scans shared tag objects once', () => {
     const f = fixture();

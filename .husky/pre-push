@@ -110,7 +110,9 @@ scan_message() {
 scan_tag() {
   snapshot_parent=$(mktemp -d "${TMPDIR:-/tmp}/nanoclaw-pre-push.XXXXXX")
   commit_message="$snapshot_parent/TAG_EDITMSG"
-  git -C "$worktree_root" cat-file tag "$1" > "$commit_message"
+  tag_contents=$(git -C "$worktree_root" cat-file tag "$1")
+  # Tagger identity is object metadata; only the annotation is published prose.
+  printf '%s\n' "$tag_contents" | sed '1,/^$/d' > "$commit_message"
   scan_message "$worktree_root" "$commit_message"
   remove_file "$commit_message"
   commit_message=''
