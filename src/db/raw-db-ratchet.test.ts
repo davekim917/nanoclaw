@@ -64,7 +64,7 @@ const NOT_CALLERS: readonly string[] = [DEFINER, SELF];
  * through one shared fake means the identifier is named once instead of once
  * per test file. Migrating an existing test entry onto it removes that entry.
  *
- * PR 5b removed EIGHT entries (226 → 218): `users`, `user_dms`,
+ * PR 5b removed EIGHT entries (205 → 197): `users`, `user_dms`,
  * `pending_sender_approvals`, the orchestrator capability leaf, `progress.ts`,
  * agent-to-agent `create-agent.ts` and `steer-idempotency.ts` are wholly on
  * the driver now, and `modules/interactive/index.ts` traded `hasTableRaw` for
