@@ -116,6 +116,21 @@ export class CentralLeaseReentrancyError extends Error {
  * truthy synchronous decision, and `withCentralSync` released the lease around
  * a result that was still going to resolve later.
  */
+/**
+ * A thenable that reached a synchronous seam is a contract violation, and the
+ * violation is what gets thrown — but the thenable itself is still a live
+ * promise that may reject later. Abandoning it would surface that rejection as
+ * an `unhandledRejection` (which log.ts turns into a process exit) even though
+ * the caller caught the intended error, so its rejection is consumed here and
+ * logged as the evidence it is.
+ */
+function disownThenable(value: unknown, site: string): void {
+  void Promise.resolve(value).then(
+    () => undefined,
+    (err: unknown) => log.warn(`${site} returned a thenable that later rejected`, { err }),
+  );
+}
+
 function isThenable(value: unknown): boolean {
   if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return false;
   return typeof (value as { then?: unknown }).then === 'function';
@@ -252,7 +267,10 @@ export async function withCentralSync<T>(
   let result!: T;
   try {
     result = fn();
-    if (isThenable(result)) throw new GuardNotSynchronousError('The withCentralSync block');
+    if (isThenable(result)) {
+      disownThenable(result, 'The withCentralSync block');
+      throw new GuardNotSynchronousError('The withCentralSync block');
+    }
     blockThrew = false;
   } finally {
     // The postcondition is settled BEFORE the lease is handed on, so the next
@@ -511,7 +529,10 @@ export function withRawDb<T>(
  */
 export function evaluateGuardSync<R>(guard: () => R): R {
   const decision = guard();
-  if (isThenable(decision)) throw new GuardNotSynchronousError('The guard');
+  if (isThenable(decision)) {
+    disownThenable(decision, 'The guard');
+    throw new GuardNotSynchronousError('The guard');
+  }
   return decision;
 }
 

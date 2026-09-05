@@ -451,6 +451,33 @@ describe('a synchronous contract that a cast cannot escape', () => {
     expect(() => evaluateGuardSync(castAsyncGuard)).toThrow(GuardNotSynchronousError);
     expect(evaluateGuardSync<'allow' | 'refuse'>(() => 'allow')).toBe('allow');
   });
+
+  // A thenable that reaches a synchronous seam is thrown away as a contract
+  // violation, but it is still a live promise: if it later rejects and nobody
+  // consumed it, Node raises `unhandledRejection` (which log.ts turns into an
+  // exit). vitest fails the run on an unhandled rejection, so these two cases
+  // are their own proof.
+  it('consumes a cast async guard that later rejects, so its rejection is never unhandled', async () => {
+    type WriteGuard = () => 'allow' | 'refuse';
+    const rejectingGuard = (async () => {
+      await Promise.resolve();
+      throw new Error('guard rejected later');
+    }) as unknown as WriteGuard;
+    expect(() => evaluateGuardSync(rejectingGuard)).toThrow(GuardNotSynchronousError);
+    // Let the abandoned promise settle before the test ends.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  });
+
+  it('consumes a cast async withCentralSync block that later rejects', async () => {
+    const rejectingBlock = (async () => {
+      await Promise.resolve();
+      throw new Error('block rejected later');
+    }) as unknown as () => string;
+    await expect(withTimeout(withCentralSync(rejectingBlock, 'rejecting-block'))).rejects.toBeInstanceOf(
+      GuardNotSynchronousError,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  });
 });
 
 describe('the lease is not re-entrant', () => {
