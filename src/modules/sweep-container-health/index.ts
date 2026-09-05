@@ -26,6 +26,7 @@ import { OomKillObserver } from '../../resource-oom-observer.js';
 import { heartbeatPath } from '../../session-manager.js';
 import {
   getContainerSpawnedAt,
+  isAdoptedContainer,
   isContainerRunning,
   isContainerSpawning,
   killContainer,
@@ -447,8 +448,13 @@ export function decideStuckAction(args: {
   // kill-claim path so a fresh container has SPAWN_GRACE_MS to clean its
   // own pre-existing claims before being killed for them.
   spawnedAtMs?: number;
+  // True when this host ADOPTED the container from a previous host rather
+  // than spawning it. `spawnedAtMs` is then the adoption instant, not a
+  // spawn, so the "heartbeat predates the spawn" test below stops meaning
+  // what it means for a fresh container.
+  adopted?: boolean;
 }): StuckDecision {
-  const { now, heartbeatMtimeMs, containerState, claims } = args;
+  const { now, heartbeatMtimeMs, containerState, claims, adopted } = args;
   const spawnedAtMs = args.spawnedAtMs ?? 0;
   const declaredOperationMs = activeOperationTimeoutMs(containerState);
 
@@ -474,8 +480,14 @@ export function decideStuckAction(args: {
       // had already aged past the ceiling) SIGKILLs the fresh container
       // before the agent-runner can mark itself alive, creating an
       // infinite spawn → kill → respawn loop.
+      // An ADOPTED container is excluded, because for it the predicate is
+      // false by construction and would be generous for the wrong reason: its
+      // `spawnedAt` is the adoption instant, so a heartbeat older than it is
+      // this container's OWN and genuinely stale. Without the `!adopted`
+      // guard a wedged survivor would buy a fresh grace window on every host
+      // restart and never be killed (plan §3.5 divergence 11).
       const inSpawnGrace = spawnedAtMs > 0 && now - spawnedAtMs < SPAWN_GRACE_MS;
-      const heartbeatFromPriorContainer = spawnedAtMs > 0 && heartbeatMtimeMs < spawnedAtMs;
+      const heartbeatFromPriorContainer = !adopted && spawnedAtMs > 0 && heartbeatMtimeMs < spawnedAtMs;
       if (!(inSpawnGrace && heartbeatFromPriorContainer)) {
         return { action: 'kill-ceiling', heartbeatAgeMs: heartbeatAge, ceilingMs: ceiling };
       }
@@ -607,6 +619,7 @@ async function enforceRunningContainerSla(ctx: SweepSessionContext): Promise<voi
       containerState,
       claims: mailbox.getProcessingClaimRows(),
       spawnedAtMs: getContainerSpawnedAt(session.id),
+      adopted: isAdoptedContainer(session.id),
     });
     // Snapshot BEFORE the kill so the follow-ups have the pre-kill state —
     // resetStuckProcessingRows clears the claims, so a read afterward would

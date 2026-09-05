@@ -630,6 +630,45 @@ describe('decideStuckAction keeps all 19 existing decisions', () => {
   });
 });
 
+// ── Seam 4 F3: the adoption-aware ceiling (plan §3.5 divergence 11) ──────────
+describe('decideStuckAction — adopted containers', () => {
+  /**
+   * For an ADOPTED container `spawnedAtMs` is the ADOPTION instant, not a
+   * spawn, so a heartbeat older than it is this container's own and genuinely
+   * stale. Without the `adopted` flag the prior-container test is true by
+   * construction and a wedged survivor buys a fresh grace window on every host
+   * restart — forever.
+   */
+  it('an adopted container past the ceiling is killed, not granted spawn grace', () => {
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: BASE - 2 * ABSOLUTE_CEILING_MS,
+      containerState: null,
+      claims: [],
+      // Adopted seconds ago, so the grace window is wide open. The heartbeat
+      // is nonetheless an hour stale and belongs to this very container.
+      spawnedAtMs: BASE - 10_000,
+      adopted: true,
+    });
+    expect(res.action).toBe('kill-ceiling');
+  });
+
+  it('a freshly spawned container still gets spawn grace', () => {
+    const res = decideStuckAction({
+      now: BASE,
+      // Identical inputs, minus the adoption. The heartbeat is inherited from
+      // the PRIOR container through the host-side mount, and the fresh one has
+      // not had a poll iteration to touch it yet.
+      heartbeatMtimeMs: BASE - 2 * ABSOLUTE_CEILING_MS,
+      containerState: null,
+      claims: [],
+      spawnedAtMs: BASE - 10_000,
+      adopted: false,
+    });
+    expect(res.action).toBe('ok');
+  });
+});
+
 // ── F-10.4 / F-10.5 ──────────────────────────────────────────────────────────
 describe('decideStuckAction — CodexItem widening (F-10.4, F-10.5)', () => {
   it('a CodexItem tool declaring a timeout beyond the ceiling widens the ceiling', () => {
