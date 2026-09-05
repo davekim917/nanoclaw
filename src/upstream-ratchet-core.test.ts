@@ -529,13 +529,37 @@ describe('--check exit decision (decideCheckOutcome)', () => {
       rejects({ upstream: 'a'.repeat(40), paths: 'abc1234', files: {} }, /"paths" is not a 64-character/);
     });
 
-    it('accepts a well-shaped manifest (empty findings) — a real one, and the first-run empty fallback', () => {
+    it('accepts a well-shaped manifest (empty findings)', () => {
       expect(validateManifestShape(manifestOf({}))).toEqual([]);
-      // The not-yet-pinned baseline `main()` synthesizes on a first run: an
-      // empty "upstream"/"paths" is exempt from the sha-shape checks above —
-      // this is the ONE place either field is allowed to be a non-matching
-      // string, and only because it is exactly empty.
-      expect(validateManifestShape({ upstream: '', paths: '', files: {} })).toEqual([]);
+    });
+
+    // Fork issue: "upstream-ratchet --check: reject an empty upstream pin in
+    // a parsed manifest before resolveCommit". `"upstream": ""` is the
+    // synthetic in-memory baseline `main()` builds ONLY while creating a
+    // manifest with `--upstream` on a first run — never a value that belongs
+    // in a real, on-disk or checked-ref manifest. Strict by default (no
+    // `opts`) is what closes that hole: an on-disk manifest hand-edited (or
+    // corrupted) to carry an empty pin must be rejected exactly like
+    // `"not-a-sha"` is, not silently waved through to `resolveCommit('')`.
+    it('rejects an empty "upstream" or "paths" by default — the empty-pin bootstrap value is not a valid on-disk/checked shape', () => {
+      rejects({ upstream: '', paths: '', files: {} }, /"upstream" is not a 40-character commit sha/);
+      rejects({ upstream: 'a'.repeat(40), paths: '', files: {} }, /"paths" is not a 64-character/);
+    });
+
+    it('opts.unpinnedOk exempts ONLY an exactly-empty "upstream"/"paths" — never any other invalid string', () => {
+      // The escape hatch that lets main() validate its own synthesized
+      // first-run baseline through the same single validator, rather than
+      // skipping validation for it entirely.
+      expect(validateManifestShape({ upstream: '', paths: '', files: {} }, { unpinnedOk: true })).toEqual([]);
+      // unpinnedOk narrows the exemption to exactly the empty string — it is
+      // not a general "skip the regex" switch, so a short sha or any other
+      // malformed pin still fails even with it set.
+      rejects({ upstream: 'abc1234', paths: '', files: {} }, /"upstream" is not a 40-character commit sha/);
+      const findingsWithOpt = validateManifestShape(
+        { upstream: 'abc1234', paths: '', files: {} },
+        { unpinnedOk: true },
+      );
+      expect(findingsWithOpt.some((f) => /"upstream" is not a 40-character commit sha/.test(f.detail))).toBe(true);
     });
 
     it('checkTree calls validateManifestShape FIRST, so it never reaches its own field checks on an unusable value', () => {
@@ -551,14 +575,20 @@ describe('--check exit decision (decideCheckOutcome)', () => {
       expect(findings).toEqual(validateManifestShape(null));
     });
 
-    it('an invalid pin ("not-a-sha", a 7-character short sha) is rejected through checkTree too, before any per-entry work', () => {
-      for (const upstream of ['not-a-sha', 'abc1234']) {
+    it('an invalid pin ("not-a-sha", a 7-character short sha, or an EMPTY pin) is rejected through checkTree too, before any per-entry work', () => {
+      // '' is the fork-issue case: a committed (or checked-ref) manifest is
+      // real content, never the in-memory bootstrap baseline, so checkTree —
+      // which never passes unpinnedOk — must reject an empty pin exactly like
+      // any other malformed one, and MUST NOT let it through to a bare
+      // `resolveCommit('')` in the script above this.
+      for (const upstream of ['not-a-sha', 'abc1234', '']) {
         const manifest = sealManifest({ upstream, paths: '', files: {} });
-        const findings = checkTree(manifest, uniqueTmpRoot(`validate-shape-checktree-pin-${upstream}`));
+        const findings = checkTree(manifest, uniqueTmpRoot(`validate-shape-checktree-pin-${upstream || 'empty'}`));
         expect(findings).toEqual(validateManifestShape(manifest));
         expect(findings).toEqual([
           expect.objectContaining({ kind: 'malformed', detail: expect.stringContaining('40-character commit sha') }),
         ]);
+        expect(decideCheckOutcome([], findings).failing).toBe(true);
       }
     });
   });
