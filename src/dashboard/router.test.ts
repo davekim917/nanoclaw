@@ -19,7 +19,7 @@ vi.mock('./auth/compute-scopes.js', async (importOriginal) => ({
 // stub it same as computeScopes so these tests don't need a live DB.
 vi.mock('../modules/permissions/db/users.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../modules/permissions/db/users.js')>()),
-  getUser: vi.fn(() => undefined),
+  getUser: vi.fn(async () => undefined),
 }));
 
 import { pathMatch, register, requireAuth, dispatch, registerCookieVerifier, clearCookieVerifier } from './router.js';
@@ -56,7 +56,7 @@ beforeEach(() => {
     no_filter: true,
   });
   vi.mocked(usersMod.getUser).mockReset();
-  vi.mocked(usersMod.getUser).mockReturnValue(undefined);
+  vi.mocked(usersMod.getUser).mockResolvedValue(undefined);
 });
 
 describe('pathMatch', () => {
@@ -159,7 +159,7 @@ describe('requireAuth and dispatch', () => {
 
   it('test_requireAuth_populates_display_name_from_users_table', async () => {
     registerCookieVerifier(() => ({ user_id: 'test-channel:UFIXTUREUSER1', expires_at: '2099-01-01T00:00:00Z' }));
-    vi.mocked(usersMod.getUser).mockReturnValue({
+    vi.mocked(usersMod.getUser).mockResolvedValue({
       id: 'test-channel:UFIXTUREUSER1',
       kind: 'test-channel',
       display_name: 'Fixture Person',

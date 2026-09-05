@@ -34,6 +34,25 @@ vi.mock('../../config.js', async () => {
 const TEST_DIR = '/tmp/nanoclaw-test-permissions-grant';
 
 const notifyCalls: Array<{ sessionId: string; text: string }> = [];
+// Lets a case run arbitrary work INSIDE `removeMember`'s yield, which is what
+// the mid-revoke escalation case needs: the target must gain an admin role
+// between the member removal and the role check that follows it.
+const duringRemoveMember = vi.hoisted(() => ({ run: null as null | (() => Promise<void>) }));
+vi.mock('./db/agent-group-members.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./db/agent-group-members.js')>();
+  return {
+    ...real,
+    removeMember: async (userId: string, agentGroupId: string) => {
+      await real.removeMember(userId, agentGroupId);
+      if (duringRemoveMember.run) {
+        const run = duringRemoveMember.run;
+        duringRemoveMember.run = null;
+        await run();
+      }
+    },
+  };
+});
+
 vi.mock('../approvals/index.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../approvals/index.js')>()),
   notifyAgent: (session: { id: string }, text: string) => {
@@ -52,7 +71,7 @@ import {
 import { initSessionFolder } from '../../session-manager.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import type { AgentGroup, MessagingGroup, Session } from '../../types.js';
-import { addMember, isMember } from './db/agent-group-members.js';
+import { addMember, hasMembershipRow, isMember } from './db/agent-group-members.js';
 import { createUser } from './db/users.js';
 import { grantRole, isAdminOfAgentGroup, isOwner } from './db/user-roles.js';
 import {
@@ -141,20 +160,25 @@ beforeEach(async () => {
   await createAgentGroup(makeAg('ag-helper', 'example-labs-v2', 'helper'));
   await createAgentGroup(makeAg('ag-other', 'other', 'other'));
 
-  createUser({ id: 'slack-example-labs:OWNER', kind: 'slack-example-labs', display_name: 'Owner', created_at: now() });
-  createUser({
+  await createUser({
+    id: 'slack-example-labs:OWNER',
+    kind: 'slack-example-labs',
+    display_name: 'Owner',
+    created_at: now(),
+  });
+  await createUser({
     id: 'slack-example-labs:GADMIN',
     kind: 'slack-example-labs',
     display_name: 'GlobalAdmin',
     created_at: now(),
   });
-  createUser({
+  await createUser({
     id: 'slack-example-labs:SADMIN',
     kind: 'slack-example-labs',
     display_name: 'ScopedAdmin',
     created_at: now(),
   });
-  createUser({
+  await createUser({
     id: 'slack-example-labs:STRANGER',
     kind: 'slack-example-labs',
     display_name: 'Stranger',
@@ -162,24 +186,34 @@ beforeEach(async () => {
   });
   // Target users that test-local addMember/grantRole calls reference before
   // the handler's own ensureUserExists has a chance to create them.
-  createUser({ id: 'slack-example-labs:BOB', kind: 'slack-example-labs', display_name: 'Bob', created_at: now() });
-  createUser({ id: 'slack-example-labs:CAROL', kind: 'slack-example-labs', display_name: 'Carol', created_at: now() });
+  await createUser({
+    id: 'slack-example-labs:BOB',
+    kind: 'slack-example-labs',
+    display_name: 'Bob',
+    created_at: now(),
+  });
+  await createUser({
+    id: 'slack-example-labs:CAROL',
+    kind: 'slack-example-labs',
+    display_name: 'Carol',
+    created_at: now(),
+  });
 
-  grantRole({
+  await grantRole({
     user_id: 'slack-example-labs:OWNER',
     role: 'owner',
     agent_group_id: null,
     granted_by: null,
     granted_at: now(),
   });
-  grantRole({
+  await grantRole({
     user_id: 'slack-example-labs:GADMIN',
     role: 'admin',
     agent_group_id: null,
     granted_by: null,
     granted_at: now(),
   });
-  grantRole({
+  await grantRole({
     user_id: 'slack-example-labs:SADMIN',
     role: 'admin',
     agent_group_id: 'ag-helper',
@@ -319,14 +353,19 @@ describe('handleGrantAccess', () => {
 
 describe('handleRevokeAccess', () => {
   it('owner can revoke a member', async () => {
-    addMember({ user_id: 'slack-example-labs:BOB', agent_group_id: 'ag-helper', added_by: null, added_at: now() });
+    await addMember({
+      user_id: 'slack-example-labs:BOB',
+      agent_group_id: 'ag-helper',
+      added_by: null,
+      added_at: now(),
+    });
     insertChatInbound({ senderId: 'OWNER' });
     await handleRevokeAccess({ user: '<@BOB>' }, makeSession());
     expect(isMember('slack-example-labs:BOB', 'ag-helper')).toBe(false);
   });
 
   it('scoped admin cannot revoke another admin', async () => {
-    grantRole({
+    await grantRole({
       user_id: 'slack-example-labs:CAROL',
       role: 'admin',
       agent_group_id: 'ag-helper',
@@ -339,6 +378,44 @@ describe('handleRevokeAccess', () => {
     expect(notifyCalls.at(-1)?.text).toMatch(/only a global admin can revoke another admin/);
   });
 
+  // Issue #443, Codex round 2 — the escalation the yield reopens.
+  //
+  // "Only a global admin can revoke another admin" is decided BEFORE
+  // `removeMember`, which yields. If an owner grants the target an admin role
+  // in that window, the role check AFTER the yield flips to true and the same
+  // scoped caller — already waved through by the earlier check — would revoke
+  // an admin. The role-removal branch is now gated on the caller being global,
+  // so the escalation cannot happen no matter when the grant lands.
+  it('a grant landing mid-revoke does not let a scoped admin revoke an admin', async () => {
+    await addMember({
+      user_id: 'slack-example-labs:CAROL',
+      agent_group_id: 'ag-helper',
+      added_by: null,
+      added_at: now(),
+    });
+    // The grant lands inside removeMember's yield, exactly as an owner acting
+    // concurrently would.
+    duringRemoveMember.run = async () => {
+      await grantRole({
+        user_id: 'slack-example-labs:CAROL',
+        role: 'admin',
+        agent_group_id: 'ag-helper',
+        granted_by: null,
+        granted_at: now(),
+      });
+    };
+
+    insertChatInbound({ senderId: 'SADMIN' });
+    await handleRevokeAccess({ user: '<@CAROL>' }, makeSession());
+
+    // Membership went, which is all a scoped admin may take. Asserted on the
+    // ROW, not `isMember`: an admin counts as an implicit member, so `isMember`
+    // is true again the moment the grant lands and would hide the removal.
+    expect(hasMembershipRow('slack-example-labs:CAROL', 'ag-helper')).toBe(false);
+    // …and the admin role the owner just granted survives.
+    expect(isAdminOfAgentGroup('slack-example-labs:CAROL', 'ag-helper')).toBe(true);
+  });
+
   it('never revokes an owner', async () => {
     insertChatInbound({ senderId: 'GADMIN' });
     await handleRevokeAccess({ user: '<@OWNER>' }, makeSession());
@@ -349,7 +426,12 @@ describe('handleRevokeAccess', () => {
 
 describe('handleListAccess', () => {
   it('lists owners, global admins, scoped admins, members', async () => {
-    addMember({ user_id: 'slack-example-labs:BOB', agent_group_id: 'ag-helper', added_by: null, added_at: now() });
+    await addMember({
+      user_id: 'slack-example-labs:BOB',
+      agent_group_id: 'ag-helper',
+      added_by: null,
+      added_at: now(),
+    });
     await handleListAccess({}, makeSession());
     const text = notifyCalls.at(-1)?.text ?? '';
     expect(text).toMatch(/Access for `ag-helper`/);

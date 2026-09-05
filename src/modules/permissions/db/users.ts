@@ -1,38 +1,44 @@
 import type { User } from '../../../types.js';
-import { getRawDb } from '../../../db/connection.js';
+import { getDb } from '../../../db/connection.js';
 
-export function createUser(user: User): void {
-  getRawDb()
-    .prepare(
-      `INSERT INTO users (id, kind, display_name, created_at)
+export async function createUser(user: User): Promise<void> {
+  await getDb().run(
+    `INSERT INTO users (id, kind, display_name, created_at)
        VALUES (@id, @kind, @display_name, @created_at)`,
-    )
-    .run(user);
+    user,
+  );
 }
 
-export function upsertUser(user: User): void {
-  getRawDb()
-    .prepare(
-      `INSERT INTO users (id, kind, display_name, created_at)
+export async function upsertUser(user: User): Promise<void> {
+  await getDb().run(
+    `INSERT INTO users (id, kind, display_name, created_at)
        VALUES (@id, @kind, @display_name, @created_at)
        ON CONFLICT(id) DO UPDATE SET
          display_name = COALESCE(excluded.display_name, users.display_name)`,
-    )
-    .run(user);
+    user,
+  );
 }
 
-export function getUser(id: string): User | undefined {
-  return getRawDb().prepare('SELECT * FROM users WHERE id = ?').get(id) as User | undefined;
+/**
+ * The one-row lookup `modules/memory/pre-turn-context.ts` executes on the raw
+ * handle: `buildPreTurnContext` runs inside `writeSessionMessage`'s
+ * synchronous recall block, which must not gain a suspension point (seam-3
+ * plan §4.5, I-1). One constant, two executors — not a `*Sync` twin.
+ */
+export const USER_BY_ID_SQL = 'SELECT * FROM users WHERE id = ?';
+
+export async function getUser(id: string): Promise<User | undefined> {
+  return getDb().get<User>(USER_BY_ID_SQL, id);
 }
 
-export function getAllUsers(): User[] {
-  return getRawDb().prepare('SELECT * FROM users ORDER BY created_at').all() as User[];
+export async function getAllUsers(): Promise<User[]> {
+  return getDb().all<User>('SELECT * FROM users ORDER BY created_at');
 }
 
-export function updateDisplayName(id: string, displayName: string): void {
-  getRawDb().prepare('UPDATE users SET display_name = ? WHERE id = ?').run(displayName, id);
+export async function updateDisplayName(id: string, displayName: string): Promise<void> {
+  await getDb().run('UPDATE users SET display_name = ? WHERE id = ?', displayName, id);
 }
 
-export function deleteUser(id: string): void {
-  getRawDb().prepare('DELETE FROM users WHERE id = ?').run(id);
+export async function deleteUser(id: string): Promise<void> {
+  await getDb().run('DELETE FROM users WHERE id = ?', id);
 }

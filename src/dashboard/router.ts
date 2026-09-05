@@ -180,7 +180,7 @@ export function requireAuth(handler: AuthHandler): Handler {
     const user: User = {
       id: payload.user_id,
       kind: 'dashboard',
-      display_name: getUser(payload.user_id)?.display_name ?? null,
+      display_name: (await getUser(payload.user_id))?.display_name ?? null,
       created_at: new Date().toISOString(),
     };
 

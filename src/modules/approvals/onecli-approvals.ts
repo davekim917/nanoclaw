@@ -102,7 +102,7 @@ function shortApprovalId(): string {
  * delivery is best-effort and a card can land with an admin who is not the
  * right decider.
  */
-function approversFor(row: PendingApproval): string[] {
+async function approversFor(row: PendingApproval): Promise<string[]> {
   if (row.approver_user_id) return [row.approver_user_id];
   return pickApprover(row.agent_group_id);
 }
@@ -132,7 +132,7 @@ export async function resolveOneCLIApproval(
   // credentialed call. Empty userId (legacy adapters that don't carry it)
   // falls through with a warning rather than blocking, since legacy
   // installs predate userId propagation.
-  const approvers = approversFor(row);
+  const approvers = await approversFor(row);
   // Fail closed on an empty set. `handleRequest` denies outright when there is
   // no eligible approver, so before this port the set could never be empty by
   // the time a card existed. Deriving it at click time makes empty reachable —
@@ -342,7 +342,7 @@ async function handleRequest(request: ApprovalRequest): Promise<Decision> {
   // the scope for approver selection: admin @ group → global admin → owner.
   const originGroup = request.agent.externalId ? await getAgentGroup(request.agent.externalId) : undefined;
   const agentGroupId = originGroup?.id ?? null;
-  const approvers = pickApprover(agentGroupId);
+  const approvers = await pickApprover(agentGroupId);
   if (approvers.length === 0) {
     log.warn('OneCLI approval auto-denied: no eligible approver', {
       id: request.id,

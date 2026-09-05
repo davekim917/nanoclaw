@@ -74,7 +74,7 @@ export async function sweepTaskWatchdog(): Promise<void> {
           : null;
 
       // Pull per-orchestrator timeout config; fall back to defaults when absent.
-      const cap = getCapabilityConfig(task.parent_agent_group_id, 'orchestrator');
+      const cap = await getCapabilityConfig(task.parent_agent_group_id, 'orchestrator');
       const noProgressTimeoutSec = cap?.noProgressTimeoutSec ?? DEFAULT_NO_PROGRESS_TIMEOUT_SEC;
       const spawnDeadlineSec = cap?.spawnDeadlineSec ?? DEFAULT_SPAWN_DEADLINE_SEC;
       const drainGraceSec = cap?.drainGraceSec ?? DEFAULT_DRAIN_GRACE_SEC;

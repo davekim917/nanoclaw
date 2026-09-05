@@ -15,7 +15,7 @@ import {
   searchArchiveEvidence,
   type ArchiveEvidenceRow,
 } from '../../message-archive.js';
-import { getUser } from '../permissions/db/users.js';
+import { USER_BY_ID_SQL } from '../permissions/db/users.js';
 import { workgroupMemoryDir } from '../workgroup/shared-dirs.js';
 
 export const PRE_TURN_BOUNDS = Object.freeze({
@@ -1979,7 +1979,13 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
       messagingGroupId: currentMessagingGroupId,
       threadId: currentThreadId,
     })) {
-      const canonicalName = sender.senderId ? getUser(sender.senderId)?.display_name : undefined;
+      // Raw, not the async `getUser`: this whole builder runs inside
+      // `writeSessionMessage`'s synchronous recall block (seam-3 plan §4.5,
+      // I-1), so it executes the users leaf's exported SQL on the raw handle.
+      const canonicalName = sender.senderId
+        ? (db.prepare(USER_BY_ID_SQL).get(sender.senderId) as { display_name?: string | null } | undefined)
+            ?.display_name
+        : undefined;
       const aliases =
         canonicalName && canonicalName !== sender.senderName ? [sender.senderName, canonicalName] : [sender.senderName];
       involvedSenders.push({ senderId: sender.senderId, aliases });

@@ -59,7 +59,11 @@ import {
   updatePendingChannelApprovalCard,
   type PendingChannelApproval,
 } from './db/pending-channel-approvals.js';
-import { deletePendingSenderApproval, getPendingSenderApproval } from './db/pending-sender-approvals.js';
+import {
+  createPendingSenderApproval,
+  deletePendingSenderApproval,
+  getPendingSenderApproval,
+} from './db/pending-sender-approvals.js';
 import { hasAdminPrivilege } from './db/user-roles.js';
 import { getUser, upsertUser } from './db/users.js';
 import './grant.js';
@@ -77,7 +81,7 @@ interface PendingNameInput {
 }
 const awaitingNameInput = new Map<string, PendingNameInput>();
 
-function extractAndUpsertUser(event: InboundEvent): string | null {
+async function extractAndUpsertUser(event: InboundEvent): Promise<string | null> {
   let content: Record<string, unknown>;
   try {
     content = JSON.parse(event.message.content) as Record<string, unknown>;
@@ -104,8 +108,8 @@ function extractAndUpsertUser(event: InboundEvent): string | null {
   if (!rawHandle) return null;
 
   const userId = rawHandle.includes(':') ? rawHandle : `${event.channelType}:${rawHandle}`;
-  if (!getUser(userId)) {
-    upsertUser({
+  if (!(await getUser(userId))) {
+    await upsertUser({
       id: userId,
       kind: event.channelType,
       display_name: senderName ?? null,
@@ -268,7 +272,7 @@ setAccessGate(async (event, userId, mg, agentGroupId, effectiveThreadId): Promis
     };
   }
 
-  const decision = canAccessAgentGroup(userId, agentGroupId);
+  const decision = await canAccessAgentGroup(userId, agentGroupId);
   if (decision.allowed) {
     return { allowed: true };
   }
@@ -305,10 +309,15 @@ setAccessGate(async (event, userId, mg, agentGroupId, effectiveThreadId): Promis
  * canAccessAgentGroup accepts (owner, admin, or group member).
  */
 setSenderScopeGate(
-  (_event: InboundEvent, userId: string | null, _mg: MessagingGroup, agent: MessagingGroupAgent): AccessGateResult => {
+  async (
+    _event: InboundEvent,
+    userId: string | null,
+    _mg: MessagingGroup,
+    agent: MessagingGroupAgent,
+  ): Promise<AccessGateResult> => {
     if (agent.sender_scope === 'all') return { allowed: true };
     if (!userId) return { allowed: false, reason: 'unknown_user_scope' };
-    const decision = canAccessAgentGroup(userId, agent.agent_group_id);
+    const decision = await canAccessAgentGroup(userId, agent.agent_group_id);
     if (decision.allowed) return { allowed: true };
     return { allowed: false, reason: `sender_scope_${decision.reason}` };
   },
@@ -329,7 +338,7 @@ setSenderScopeGate(
  * fresh card per ACTION-ITEMS item 5 "no denial persistence").
  */
 async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<boolean> {
-  const row = getPendingSenderApproval(payload.questionId);
+  const row = await getPendingSenderApproval(payload.questionId);
   if (!row) return false;
 
   // payload.userId is the raw platform userId (e.g. "6037840640"); namespace it
@@ -365,17 +374,47 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
   // card there is a legitimate explicit grant, and that behavior predates
   // this policy.
   const currentMg = getMessagingGroup(row.messaging_group_id);
-  if (currentMg?.unknown_sender_policy === 'decline_notify') {
+  const voidedByPolicyFlip = currentMg?.unknown_sender_policy === 'decline_notify';
+
+  // ── Claim the card before acting on it (issue #443, Codex round 1) ──
+  //
+  // `getPendingSenderApproval` above is awaited, so it yields. Two callbacks
+  // for the SAME card — an adapter retry, a double-click — can therefore both
+  // find the row live, and every branch below ends in an effect that must not
+  // happen twice: the approve branch replays the retained message
+  // (`replayDeferredInbound`), which is a real second delivery to the agent,
+  // and the deny and policy-flip branches each close out the deferred inbound.
+  //
+  // The DELETE is the arbiter rather than a lock: SQLite applies it once, so
+  // exactly one caller sees `changes === 1`. The loser returns `true` — the
+  // response IS claimed, by the winner, so reporting it unclaimed would be
+  // wrong — and does nothing else.
+  //
+  // It also has to happen HERE, before the approve branch's `addMember`, and
+  // that is the same ordering the pre-seam code already needed for a different
+  // reason: the row must be gone before `replayDeferredInbound` runs, or the
+  // second routing attempt sees an in-flight row and short-circuits.
+  const claimed = await deletePendingSenderApproval(row.id);
+  if (!claimed) {
+    log.debug('Unknown-sender approval click ignored — another callback already resolved this card', {
+      approvalId: row.id,
+      clickerId,
+    });
+    return true;
+  }
+
+  // The card is only actionable while the group still runs the flow that
+  // issued it — see the comment above the policy read.
+  if (voidedByPolicyFlip) {
     log.warn('Unknown-sender approval click rejected — group switched to decline_notify', {
       approvalId: row.id,
       senderIdentity: row.sender_identity,
       messagingGroupId: row.messaging_group_id,
       clickerId,
     });
-    // Void the card the same way a deny does: drop the row (and with it the
-    // retained message body) and close out the deferred inbound so it does
-    // not sit unresolved.
-    deletePendingSenderApproval(row.id);
+    // Void the card the same way a deny does: the row (and with it the
+    // retained message body) is already dropped by the claim above; close out
+    // the deferred inbound so it does not sit unresolved.
     completeStoredDeferredInbound(row.original_message);
     return true;
   }
@@ -384,22 +423,41 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
   const approved = payload.value === 'approve';
 
   if (approved) {
-    addMember({
-      user_id: row.sender_identity,
-      agent_group_id: row.agent_group_id,
-      added_by: approverId,
-      added_at: new Date().toISOString(),
-    });
+    // The claim above already removed the row, and that row held the ONLY copy
+    // of the retained inbound (`original_message`). If the member write fails
+    // here, a plain rethrow would leave the sender approved-but-not-admitted
+    // with nothing left to replay and no card to click again (issue #443,
+    // Codex round 2).
+    //
+    // So the claim is made recoverable by putting the row back, rather than by
+    // adding a `claimed_at` column — a column means a migration, and the row
+    // object is already in hand, complete with its body and render metadata.
+    // `createPendingSenderApproval` is INSERT OR IGNORE, so a concurrent flow
+    // that re-created the card in the meantime wins and this is a no-op.
+    try {
+      await addMember({
+        user_id: row.sender_identity,
+        agent_group_id: row.agent_group_id,
+        added_by: approverId,
+        added_at: new Date().toISOString(),
+      });
+    } catch (err) {
+      const restored = await createPendingSenderApproval(row);
+      log.error('Unknown sender approval failed to add the member — card restored for retry', {
+        approvalId: row.id,
+        senderIdentity: row.sender_identity,
+        agentGroupId: row.agent_group_id,
+        restored,
+        err,
+      });
+      return true;
+    }
     log.info('Unknown sender approved — member added', {
       approvalId: row.id,
       senderIdentity: row.sender_identity,
       agentGroupId: row.agent_group_id,
       approverId,
     });
-
-    // Clear the pending row BEFORE re-routing so the gate check on the
-    // second attempt doesn't see the in-flight row and short-circuit.
-    deletePendingSenderApproval(row.id);
 
     try {
       const event = JSON.parse(row.original_message) as InboundEvent;
@@ -416,7 +474,6 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
     agentGroupId: row.agent_group_id,
     approverId,
   });
-  deletePendingSenderApproval(row.id);
   completeStoredDeferredInbound(row.original_message);
   return true;
 }
@@ -453,7 +510,22 @@ async function wireApprovedChannel(
       messagingGroupId: row.messaging_group_id,
       err,
     });
-    deletePendingChannelApproval(row.messaging_group_id);
+    await deletePendingChannelApproval(row.messaging_group_id);
+    return false;
+  }
+
+  // Claim the card before any write. This is the terminal branch — it creates
+  // the wiring, admits the sender and replays the retained message — and the
+  // caller reached it across several awaits, so a duplicate callback can be
+  // here too. Every individual effect below is already idempotent or
+  // self-claiming (`insertOrAdopt` on the wiring, INSERT OR IGNORE on the
+  // member, `replayDeferredInbound`'s own receipt claim), so the claim is the
+  // belt rather than the only guard — but it means the log lines and the
+  // approver's confirmation reflect one act, not two.
+  if (!(await deletePendingChannelApproval(row.messaging_group_id))) {
+    log.debug('Channel registration: another callback already wired this channel', {
+      messagingGroupId: row.messaging_group_id,
+    });
     return false;
   }
 
@@ -476,7 +548,6 @@ async function wireApprovedChannel(
       messagingGroupId: row.messaging_group_id,
       err,
     });
-    deletePendingChannelApproval(row.messaging_group_id);
     completeDeferredInbound(event);
     return false;
   }
@@ -520,17 +591,15 @@ async function wireApprovedChannel(
     approverId,
   });
 
-  const senderUserId = extractAndUpsertUser(event);
+  const senderUserId = await extractAndUpsertUser(event);
   if (senderUserId) {
-    addMember({
+    await addMember({
       user_id: senderUserId,
       agent_group_id: agentGroupId,
       added_by: approverId,
       added_at: new Date().toISOString(),
     });
   }
-
-  deletePendingChannelApproval(row.messaging_group_id);
 
   try {
     await replayDeferredInbound(event);
@@ -585,8 +654,12 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
 
   // ── Reject / Cancel ──
   if (payload.value === REJECT_VALUE) {
+    // Claim before acting, same rule as the sender card: this branch is
+    // terminal, so a duplicate callback must not run it twice. The
+    // intermediate branches below (choose_existing, new_agent) deliberately do
+    // NOT claim — they leave the card live for a second click by design.
+    if (!(await deletePendingChannelApproval(row.messaging_group_id))) return true;
     await setMessagingGroupDeniedAt(row.messaging_group_id, new Date().toISOString());
-    deletePendingChannelApproval(row.messaging_group_id);
     completeStoredDeferredInbound(row.original_message);
     log.info('Channel registration denied', {
       messagingGroupId: row.messaging_group_id,
@@ -613,7 +686,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
     const options = buildAgentSelectionOptions(agentGroups, approverId);
     const title = '📋 Choose an agent';
     const question = `Which agent should handle this channel? ${AGENT_ACCESS_SCOPE_WARNING}`;
-    updatePendingChannelApprovalCard(row.messaging_group_id, title, question, JSON.stringify(options));
+    await updatePendingChannelApprovalCard(row.messaging_group_id, title, question, JSON.stringify(options));
 
     try {
       await adapter.deliver(
@@ -692,7 +765,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
         messagingGroupId: row.messaging_group_id,
         targetAgentGroupId,
       });
-      deletePendingChannelApproval(row.messaging_group_id);
+      await deletePendingChannelApproval(row.messaging_group_id);
       completeStoredDeferredInbound(row.original_message);
       return true;
     }
@@ -724,7 +797,7 @@ registerResponseHandler(handleChannelApprovalResponse);
 // creates the agent immediately, wires the channel, and replays.
 
 registerMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
-  const userId = extractAndUpsertUser(event);
+  const userId = await extractAndUpsertUser(event);
   if (!userId) return false;
 
   const pending = awaitingNameInput.get(userId);

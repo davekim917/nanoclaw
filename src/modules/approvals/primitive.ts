@@ -141,7 +141,7 @@ export async function notifyApprovalResolved(event: ApprovalResolvedEvent): Prom
  * Ordered list of user IDs eligible to approve an action for the given agent
  * group. Preference: admins @ that group → global admins → owners.
  */
-export function pickApprover(agentGroupId: string | null): string[] {
+export async function pickApprover(agentGroupId: string | null): Promise<string[]> {
   const approvers: string[] = [];
   const seen = new Set<string>();
   const add = (id: string): void => {
@@ -152,10 +152,10 @@ export function pickApprover(agentGroupId: string | null): string[] {
   };
 
   if (agentGroupId) {
-    for (const r of getAdminsOfAgentGroup(agentGroupId)) add(r.user_id);
+    for (const r of await getAdminsOfAgentGroup(agentGroupId)) add(r.user_id);
   }
-  for (const r of getGlobalAdmins()) add(r.user_id);
-  for (const r of getOwners()) add(r.user_id);
+  for (const r of await getGlobalAdmins()) add(r.user_id);
+  for (const r of await getOwners()) add(r.user_id);
 
   return approvers;
 }
@@ -200,7 +200,7 @@ export async function pickApprovalDelivery(
       // approver is reachable at all. The permissions layer already resolves
       // this (parseUserId falls back to user.kind); asking it is what keeps
       // the two sides from disagreeing.
-      if (resolveUserChannelType(userId) !== originChannelType) continue;
+      if ((await resolveUserChannelType(userId)) !== originChannelType) continue;
       const mg = await ensureUserDm(userId, options.instance);
       if (mg) return { userId, messagingGroup: mg };
     }
@@ -323,7 +323,9 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<boo
   } else {
     // A named approver (e.g. an a2a policy's designated user) narrows the set
     // to exactly that user; otherwise fall back to the group's approver chain.
-    const approvers = approverUserId ? [approverUserId] : (approverOverride ?? pickApprover(session.agent_group_id));
+    const approvers = approverUserId
+      ? [approverUserId]
+      : (approverOverride ?? (await pickApprover(session.agent_group_id)));
     if (approvers.length === 0) {
       await notifyAgent(session, `${action} failed: no owner or admin configured to approve.`);
       return false;

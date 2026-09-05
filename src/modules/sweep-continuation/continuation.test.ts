@@ -179,7 +179,7 @@ vi.mock('../orchestrator-dispatch/db/tasks.js', async (importOriginal) => {
 
 vi.mock('../orchestrator-dispatch/db/agent-group-capabilities.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../orchestrator-dispatch/db/agent-group-capabilities.js')>()),
-  getCapabilityConfig: () => undefined,
+  getCapabilityConfig: async () => undefined,
 }));
 
 vi.mock('../orchestrator-dispatch/reconciler.js', async (importOriginal) => ({

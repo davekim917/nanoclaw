@@ -47,6 +47,24 @@ vi.mock('../../delivery.js', async (importOriginal) => ({
 // (these tests pre-seed user_dms and must not hit a platform openDM).
 // `resolveUserChannelType` stays real so the approver-reachability check
 // under test is the shipped one.
+// Counts calls to the members leaf without changing its behavior, so the
+// duplicate-callback case below can assert that only ONE callback acted.
+const addMemberCalls = vi.hoisted(() => ({ n: 0, failNext: false }));
+vi.mock('./db/agent-group-members.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./db/agent-group-members.js')>();
+  return {
+    ...real,
+    addMember: async (row: Parameters<typeof real.addMember>[0]) => {
+      addMemberCalls.n++;
+      if (addMemberCalls.failNext) {
+        addMemberCalls.failNext = false;
+        throw new Error('simulated member-write failure');
+      }
+      return real.addMember(row);
+    },
+  };
+});
+
 vi.mock('./user-dm.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./user-dm.js')>()),
   ensureUserDm: vi.fn(async (userId: string) => {
@@ -116,8 +134,8 @@ beforeEach(async () => {
   });
 
   // Owner user + their DM messaging group (pickApprover + ensureUserDm target).
-  upsertUser({ id: 'telegram:owner', kind: 'telegram', display_name: 'Owner', created_at: now() });
-  grantRole({
+  await upsertUser({ id: 'telegram:owner', kind: 'telegram', display_name: 'Owner', created_at: now() });
+  await grantRole({
     user_id: 'telegram:owner',
     role: 'owner',
     agent_group_id: null,
@@ -258,6 +276,146 @@ describe('unknown-sender request_approval flow', () => {
     expect(wakeContainer).toHaveBeenCalled();
   });
 
+  // Issue #443, Codex round 1 — the async read-then-write class.
+  //
+  // `getPendingSenderApproval` is awaited, so it yields. Two callbacks for the
+  // SAME card (an adapter retry, a double-click) both found the row live and
+  // both ran the whole branch, and the approve branch ends in
+  // `replayDeferredInbound` — a real second delivery of the retained message
+  // to the agent. The fix makes the DELETE the claim: exactly one caller sees
+  // `changes === 1` and only that caller adds the member and replays.
+  //
+  // Both clicks are started before either is awaited, which is what makes them
+  // overlap: the first suspends at its first `await` and the second then reads
+  // the same still-present row.
+  it('two overlapping approve clicks replay once and add one member', async () => {
+    const { routeInbound } = await import('../../router.js');
+    const { getResponseHandlers } = await import('../../response-registry.js');
+    const { wakeContainer } = await import('../../container-runner.js');
+
+    await routeInbound(stranger('please let me in'));
+    await new Promise((r) => setTimeout(r, 10));
+
+    const { getRawDb } = await import('../../db/connection.js');
+    const pending = getRawDb().prepare('SELECT id FROM pending_sender_approvals').get() as { id: string };
+    expect(pending).toBeDefined();
+
+    (wakeContainer as unknown as ReturnType<typeof vi.fn>).mockClear();
+    addMemberCalls.n = 0;
+
+    const click = async (): Promise<void> => {
+      for (const handler of getResponseHandlers()) {
+        if (
+          await handler({
+            questionId: pending.id,
+            value: 'approve',
+            userId: 'owner',
+            channelType: 'telegram',
+            platformId: 'dm-owner',
+            threadId: null,
+          })
+        ) {
+          break;
+        }
+      }
+    };
+    await Promise.all([click(), click()]);
+    await new Promise((r) => setTimeout(r, 10));
+
+    // The assertion the bug breaks: only the winner ran the approve branch.
+    // `addMember` is INSERT OR IGNORE and `replayDeferredInbound` has its own
+    // atomic receipt claim, so the ROW state below is identical either way —
+    // the call count is the only thing that distinguishes one caller acting
+    // from two, which is exactly what the claim guarantees.
+    expect(addMemberCalls.n).toBe(1);
+    expect(wakeContainer).toHaveBeenCalledTimes(1);
+
+    // One member row, and the card is gone.
+    const members = getRawDb()
+      .prepare('SELECT COUNT(*) AS c FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?')
+      .get('tg:stranger', 'ag-1') as { c: number };
+    expect(members.c).toBe(1);
+    const stillPending = getRawDb().prepare('SELECT COUNT(*) AS c FROM pending_sender_approvals').get() as {
+      c: number;
+    };
+    expect(stillPending.c).toBe(0);
+  });
+
+  // Issue #443, Codex round 2 — a claim that cannot be recovered is a lost card.
+  //
+  // The claim removes the approval row, and that row holds the ONLY copy of the
+  // retained inbound. If the member write then fails, the sender is left
+  // approved-but-not-admitted with nothing to replay and no card to click
+  // again. The handler now restores the row on failure, so the card stays
+  // actionable and a retry completes normally.
+  it('a failed member write restores the card, and a retry admits the sender once', async () => {
+    const { routeInbound } = await import('../../router.js');
+    const { getResponseHandlers } = await import('../../response-registry.js');
+    const { wakeContainer } = await import('../../container-runner.js');
+    const { getRawDb } = await import('../../db/connection.js');
+
+    await routeInbound(stranger('please let me in'));
+    await new Promise((r) => setTimeout(r, 10));
+
+    const before = getRawDb().prepare('SELECT id, original_message FROM pending_sender_approvals').get() as {
+      id: string;
+      original_message: string;
+    };
+    expect(before).toBeDefined();
+
+    const click = async (): Promise<void> => {
+      for (const handler of getResponseHandlers()) {
+        if (
+          await handler({
+            questionId: before.id,
+            value: 'approve',
+            userId: 'owner',
+            channelType: 'telegram',
+            platformId: 'dm-owner',
+            threadId: null,
+          })
+        ) {
+          break;
+        }
+      }
+    };
+
+    // First click: the member write fails.
+    (wakeContainer as unknown as ReturnType<typeof vi.fn>).mockClear();
+    addMemberCalls.failNext = true;
+    await click();
+
+    // The card survived, with its retained body intact — this is the assertion
+    // the bug breaks: without the restore the row is gone forever.
+    const after = getRawDb().prepare('SELECT id, original_message FROM pending_sender_approvals').get() as
+      | { id: string; original_message: string }
+      | undefined;
+    expect(after).toBeDefined();
+    expect(after!.id).toBe(before.id);
+    expect(after!.original_message).toBe(before.original_message);
+    // Nothing was replayed on the failed attempt.
+    expect(wakeContainer).not.toHaveBeenCalled();
+    // And no member was admitted.
+    const midMembers = getRawDb()
+      .prepare('SELECT COUNT(*) AS c FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?')
+      .get('tg:stranger', 'ag-1') as { c: number };
+    expect(midMembers.c).toBe(0);
+
+    // Second click: the retry succeeds, exactly once.
+    await click();
+    await new Promise((r) => setTimeout(r, 10));
+
+    const members = getRawDb()
+      .prepare('SELECT COUNT(*) AS c FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?')
+      .get('tg:stranger', 'ag-1') as { c: number };
+    expect(members.c).toBe(1);
+    const stillPending = getRawDb().prepare('SELECT COUNT(*) AS c FROM pending_sender_approvals').get() as {
+      c: number;
+    };
+    expect(stillPending.c).toBe(0);
+    expect(wakeContainer).toHaveBeenCalledTimes(1);
+  });
+
   it('deny → deletes the pending row without adding a member', async () => {
     const { routeInbound } = await import('../../router.js');
     const { getResponseHandlers } = await import('../../response-registry.js');
@@ -331,8 +489,8 @@ describe('unknown-sender request_approval flow', () => {
 
   it('accepts a click from a global admin even if they are not the designated approver', async () => {
     // Pre-seed a separate admin user so we can click as them.
-    upsertUser({ id: 'telegram:admin-bob', kind: 'telegram', display_name: 'Bob', created_at: now() });
-    grantRole({
+    await upsertUser({ id: 'telegram:admin-bob', kind: 'telegram', display_name: 'Bob', created_at: now() });
+    await grantRole({
       user_id: 'telegram:admin-bob',
       role: 'admin',
       agent_group_id: null,

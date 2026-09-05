@@ -14,7 +14,7 @@ import path from 'path';
 
 import { GROUPS_DIR } from '../../config.js';
 import { createAgentGroup, getAgentGroup, getAgentGroupByFolder, getAllAgentGroups } from '../../db/agent-groups.js';
-import { getRawDb } from '../../db/connection.js';
+import { getDb } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
 import { wakeContainer } from '../../container-runner.js';
 import { initGroupFilesystem } from '../../group-init.js';
@@ -176,11 +176,13 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
     // request — bounding total children per parent prevents resource
     // exhaustion + persistent-foothold accumulation.
     const CHILDREN_PER_PARENT_CAP = 10;
-    const childCount = (
-      getRawDb()
-        .prepare("SELECT COUNT(*) AS c FROM agent_destinations WHERE agent_group_id = ? AND target_type = 'agent'")
-        .get(sourceGroup.id) as { c: number }
-    ).c;
+    const childCount =
+      (
+        await getDb().get<{ c: number }>(
+          "SELECT COUNT(*) AS c FROM agent_destinations WHERE agent_group_id = ? AND target_type = 'agent'",
+          sourceGroup.id,
+        )
+      )?.c ?? 0;
     if (childCount >= CHILDREN_PER_PARENT_CAP) {
       await notifyAgent(
         session,

@@ -93,8 +93,8 @@ function registerCentralSweepDuties(): void {
     order: 30,
     // Prune steer_idempotency rows: applied rows older than 60s, pending rows
     // older than 5min.
-    run: () => {
-      pruneSteerIdempotency();
+    run: async () => {
+      await pruneSteerIdempotency();
     },
   });
 

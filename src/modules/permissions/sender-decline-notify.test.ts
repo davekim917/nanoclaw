@@ -138,8 +138,8 @@ beforeEach(async () => {
   });
 
   // Owner (display name feeds the decline copy) + their DM.
-  upsertUser({ id: 'telegram:owner', kind: 'telegram', display_name: 'Owner', created_at: now() });
-  grantRole({
+  await upsertUser({ id: 'telegram:owner', kind: 'telegram', display_name: 'Owner', created_at: now() });
+  await grantRole({
     user_id: 'telegram:owner',
     role: 'owner',
     agent_group_id: null,
@@ -333,6 +333,58 @@ describe('unknown-sender decline_notify flow', () => {
     expect(drop.message_count).toBeGreaterThan(1);
   });
 
+  // Issue #443, Codex round 1 — the async read-then-write class.
+  //
+  // `declineAndNotify` used to read the stamp, decide the 24h window had
+  // expired, and only then write it. Under the async driver that read yields,
+  // so two overlapping declines for the same (group, sender) both concluded
+  // "no fresh stamp" and both sent — the stranger refused twice, the owner
+  // FYI'd twice. The fix folds the freshness test into the upsert's conflict
+  // clause (`claimDeclineStamp`), so exactly one caller wins.
+  //
+  // Both calls are started before either is awaited, which is what makes them
+  // overlap: the first suspends at its first `await` and the second then runs
+  // the same lookup against the same unchanged table. Driven through the real
+  // routing path first so the messaging group, the wiring and the stamp are
+  // the ones production would have.
+  it('two overlapping declines send one decline and one FYI, not two of each', async () => {
+    const { routeInbound } = await import('../../router.js');
+    const { declineAndNotify } = await import('./sender-approval.js');
+
+    await routeInbound(strangerDm('hello'));
+    await waitForDeliveries(2);
+
+    const conn = await db();
+    const mg = conn.prepare('SELECT id FROM messaging_groups WHERE platform_id = ?').get('dm-stranger') as {
+      id: string;
+    };
+    // Age the stamp past the window so both callers below legitimately see an
+    // expired one — the state the race needs.
+    const old = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+    conn.prepare(`UPDATE pending_sender_approvals SET created_at = ? WHERE id LIKE 'decline:%'`).run(old);
+
+    deliverMock.mockClear();
+    const input = {
+      messagingGroupId: mg.id,
+      agentGroupId: 'ag-1',
+      senderIdentity: 'tg:stranger',
+      senderName: 'Stranger',
+      event: strangerDm('hello again'),
+      threadId: null,
+    };
+    await Promise.all([declineAndNotify(input), declineAndNotify(input)]);
+    await settle();
+
+    // One decline + one FYI, not two pairs.
+    expect(deliverMock).toHaveBeenCalledTimes(2);
+
+    // And still exactly one stamp row for the pair.
+    const stamps = conn
+      .prepare(`SELECT COUNT(*) AS c FROM pending_sender_approvals WHERE id LIKE 'decline:%'`)
+      .get() as { c: number };
+    expect(stamps.c).toBe(1);
+  });
+
   it('declines again once the 24h stamp expires', async () => {
     const { routeInbound } = await import('../../router.js');
     await routeInbound(strangerDm('hello'));
@@ -506,8 +558,8 @@ describe('unknown-sender decline_notify flow', () => {
     // this channel — the beforeEach owner ('Owner') keeps their user_dms row,
     // so make them unreachable by pointing it at a different channel_type.
     (await db()).prepare('DELETE FROM user_dms WHERE user_id = ?').run('telegram:owner');
-    upsertUser({ id: 'telegram:second', kind: 'telegram', display_name: 'Second', created_at: now() });
-    grantRole({
+    await upsertUser({ id: 'telegram:second', kind: 'telegram', display_name: 'Second', created_at: now() });
+    await grantRole({
       user_id: 'telegram:second',
       role: 'owner',
       agent_group_id: null,
@@ -593,8 +645,8 @@ describe('unknown-sender decline_notify flow', () => {
     // owner has no display_name, falling back to another owner's name would
     // reintroduce the mismatch — say "my owner" instead.
     (await db()).prepare('DELETE FROM user_dms WHERE user_id = ?').run('telegram:owner');
-    upsertUser({ id: 'telegram:nameless', kind: 'telegram', display_name: null, created_at: now() });
-    grantRole({
+    await upsertUser({ id: 'telegram:nameless', kind: 'telegram', display_name: null, created_at: now() });
+    await grantRole({
       user_id: 'telegram:nameless',
       role: 'owner',
       agent_group_id: null,
@@ -634,8 +686,8 @@ describe('unknown-sender decline_notify flow', () => {
     // A scoped admin of ag-1 with a reachable DM. pickApprover puts this
     // user FIRST (scoped admins → global admins → owners), so a card would
     // land here; the personal FYI must not.
-    upsertUser({ id: 'telegram:admin', kind: 'telegram', display_name: 'Admin', created_at: now() });
-    grantRole({
+    await upsertUser({ id: 'telegram:admin', kind: 'telegram', display_name: 'Admin', created_at: now() });
+    await grantRole({
       user_id: 'telegram:admin',
       role: 'admin',
       agent_group_id: 'ag-1',
@@ -661,7 +713,7 @@ describe('unknown-sender decline_notify flow', () => {
 
     // Sanity: the card audience really does put the admin first.
     const { pickApprover } = await import('../approvals/primitive.js');
-    expect(pickApprover('ag-1')[0]).toBe('telegram:admin');
+    expect((await pickApprover('ag-1'))[0]).toBe('telegram:admin');
 
     const { routeInbound } = await import('../../router.js');
     await routeInbound(strangerDm('hello'));

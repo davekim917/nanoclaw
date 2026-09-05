@@ -1,4 +1,4 @@
-import { getRawDb } from '../../db/connection.js';
+import { getDb } from '../../db/connection.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 import { authChildTaskAction } from './db/tasks.js';
@@ -16,11 +16,12 @@ export async function applySpawnProgress(content: Record<string, unknown>, calle
     // Status guard — only update on active tasks. A late progress message on an
     // already-terminal task should not pollute timestamps post-dating cancelled_at /
     // completed_at / failed_at, which would break the lifecycle invariant.
-    const result = getRawDb()
-      .prepare(
-        `UPDATE tasks SET last_progress_at = ?, last_progress_message = ? WHERE task_id = ? AND status IN ('pending', 'running')`,
-      )
-      .run(now, truncated, taskId);
+    const result = await getDb().run(
+      `UPDATE tasks SET last_progress_at = ?, last_progress_message = ? WHERE task_id = ? AND status IN ('pending', 'running')`,
+      now,
+      truncated,
+      taskId,
+    );
 
     if (result.changes > 0) {
       void import('../../dashboard/api/events.js')

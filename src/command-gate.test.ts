@@ -41,8 +41,8 @@ async function seedAgentGroup(id: string): Promise<void> {
   await createAgentGroup({ id, name: id.toUpperCase(), folder: id, agent_provider: null, created_at: now() });
 }
 
-function seedUser(id: string): void {
-  createUser({ id, kind: 'telegram', display_name: null, created_at: now() });
+async function seedUser(id: string): Promise<void> {
+  await createUser({ id, kind: 'telegram', display_name: null, created_at: now() });
 }
 
 beforeEach(async () => {
@@ -59,10 +59,10 @@ afterEach(async () => {
 });
 
 describe('preFanoutGate', () => {
-  it('test_preFanoutGate_intercept_dashboard_token_admin', () => {
+  it('test_preFanoutGate_intercept_dashboard_token_admin', async () => {
     insertUser('u1');
     insertRole('u1', 'owner', null);
-    const result = preFanoutGate(JSON.stringify({ text: '/dashboard-token' }), 'u1');
+    const result = await preFanoutGate(JSON.stringify({ text: '/dashboard-token' }), 'u1');
     expect(result).toEqual({
       action: 'intercept',
       handlerName: 'dashboard_token_issue',
@@ -72,16 +72,16 @@ describe('preFanoutGate', () => {
     });
   });
 
-  it('test_preFanoutGate_intercept_non_admin_denies', () => {
+  it('test_preFanoutGate_intercept_non_admin_denies', async () => {
     insertUser('u2');
-    const result = preFanoutGate(JSON.stringify({ text: '/dashboard-token' }), 'u2');
+    const result = await preFanoutGate(JSON.stringify({ text: '/dashboard-token' }), 'u2');
     expect(result).toEqual({ action: 'deny', command: '/dashboard-token', leadingMention: false });
   });
 
-  it('test_preFanoutGate_intercept_dashboard_token_member_allowed', () => {
+  it('test_preFanoutGate_intercept_dashboard_token_member_allowed', async () => {
     insertUser('u3');
-    addMember({ user_id: 'u3', agent_group_id: 'ag-1', added_by: null, added_at: now() });
-    const result = preFanoutGate(JSON.stringify({ text: '/dashboard-token' }), 'u3');
+    await addMember({ user_id: 'u3', agent_group_id: 'ag-1', added_by: null, added_at: now() });
+    const result = await preFanoutGate(JSON.stringify({ text: '/dashboard-token' }), 'u3');
     expect(result).toEqual({
       action: 'intercept',
       handlerName: 'dashboard_token_issue',
@@ -91,29 +91,29 @@ describe('preFanoutGate', () => {
     });
   });
 
-  it('test_preFanoutGate_intercept_dashboard_token_no_role_no_membership_denies', () => {
+  it('test_preFanoutGate_intercept_dashboard_token_no_role_no_membership_denies', async () => {
     insertUser('u4');
-    const result = preFanoutGate(JSON.stringify({ text: '/dashboard-token' }), 'u4');
+    const result = await preFanoutGate(JSON.stringify({ text: '/dashboard-token' }), 'u4');
     expect(result).toEqual({ action: 'deny', command: '/dashboard-token', leadingMention: false });
   });
 
-  it('test_preFanoutGate_filtered_drops', () => {
-    const result = preFanoutGate(JSON.stringify({ text: '/help' }), 'any');
+  it('test_preFanoutGate_filtered_drops', async () => {
+    const result = await preFanoutGate(JSON.stringify({ text: '/help' }), 'any');
     expect(result).toEqual({ action: 'filter' });
   });
 
-  it('test_preFanoutGate_admin_command_passes', () => {
-    const result = preFanoutGate(JSON.stringify({ text: '/clear' }), 'any');
+  it('test_preFanoutGate_admin_command_passes', async () => {
+    const result = await preFanoutGate(JSON.stringify({ text: '/clear' }), 'any');
     expect(result).toEqual({ action: 'pass' });
   });
 
-  it('test_preFanoutGate_unknown_slash_passes', () => {
-    const result = preFanoutGate(JSON.stringify({ text: '/unknown' }), 'any');
+  it('test_preFanoutGate_unknown_slash_passes', async () => {
+    const result = await preFanoutGate(JSON.stringify({ text: '/unknown' }), 'any');
     expect(result).toEqual({ action: 'pass' });
   });
 
-  it('test_preFanoutGate_non_slash_passes', () => {
-    const result = preFanoutGate(JSON.stringify({ text: 'hello world' }), 'any');
+  it('test_preFanoutGate_non_slash_passes', async () => {
+    const result = await preFanoutGate(JSON.stringify({ text: 'hello world' }), 'any');
     expect(result).toEqual({ action: 'pass' });
   });
 });
@@ -143,12 +143,12 @@ describe('gateCommand (unchanged regression tests)', () => {
 });
 
 describe('stripLeadingMentions integration via preFanoutGate', () => {
-  it('test_preFanoutGate_intercept_with_discord_mention_prefix', () => {
+  it('test_preFanoutGate_intercept_with_discord_mention_prefix', async () => {
     // Discord formal mention prefix on /dashboard-token must still intercept.
     const owner = 'discord:owner-1';
     insertUser(owner);
     insertRole(owner, 'owner', null);
-    const result = preFanoutGate(JSON.stringify({ text: '<@123456789000000014> /dashboard-token' }), owner);
+    const result = await preFanoutGate(JSON.stringify({ text: '<@123456789000000014> /dashboard-token' }), owner);
     expect(result).toEqual({
       action: 'intercept',
       handlerName: 'dashboard_token_issue',
@@ -158,12 +158,12 @@ describe('stripLeadingMentions integration via preFanoutGate', () => {
     });
   });
 
-  it('test_preFanoutGate_intercept_with_slack_mention_prefix_with_alias', () => {
+  it('test_preFanoutGate_intercept_with_slack_mention_prefix_with_alias', async () => {
     // Slack mention with display-name alias `<@U_ID|name>` must still intercept.
     const owner = 'slack-example-labs:owner-2';
     insertUser(owner);
     insertRole(owner, 'owner', null);
-    const result = preFanoutGate(JSON.stringify({ text: '<@UTEST00013|helper> /dashboard-token' }), owner);
+    const result = await preFanoutGate(JSON.stringify({ text: '<@UTEST00013|helper> /dashboard-token' }), owner);
     expect(result).toEqual({
       action: 'intercept',
       handlerName: 'dashboard_token_issue',
@@ -173,12 +173,12 @@ describe('stripLeadingMentions integration via preFanoutGate', () => {
     });
   });
 
-  it('test_preFanoutGate_intercept_with_bare_at_mention', () => {
+  it('test_preFanoutGate_intercept_with_bare_at_mention', async () => {
     // Bare @bot prefix (some clients send plain text rather than formal tags).
     const owner = 'discord:owner-3';
     insertUser(owner);
     insertRole(owner, 'owner', null);
-    const result = preFanoutGate(JSON.stringify({ text: '@example-agent /dashboard-token' }), owner);
+    const result = await preFanoutGate(JSON.stringify({ text: '@example-agent /dashboard-token' }), owner);
     expect(result).toEqual({
       action: 'intercept',
       handlerName: 'dashboard_token_issue',
@@ -190,14 +190,14 @@ describe('stripLeadingMentions integration via preFanoutGate', () => {
 });
 
 describe('threaded inbound — extractUserMessage', () => {
-  it('test_preFanoutGate_intercept_when_wrapped_in_thread_context', () => {
+  it('test_preFanoutGate_intercept_when_wrapped_in_thread_context', async () => {
     // chat-sdk wraps Slack DM thread replies with "[Thread context]\n...\n[Latest message]\n<user>".
     // preFanoutGate must classify the user's last message, not the prior assistant context.
     const owner = 'slack-example-labs:UTEST00013';
     insertUser(owner);
     insertRole(owner, 'owner', null);
     const wrapped = `[Thread context]\nassistant: prior message about something\n[Latest message]\n@UTEST00021 /dashboard-token`;
-    const result = preFanoutGate(JSON.stringify({ text: wrapped }), owner);
+    const result = await preFanoutGate(JSON.stringify({ text: wrapped }), owner);
     expect(result).toEqual({
       action: 'intercept',
       handlerName: 'dashboard_token_issue',
@@ -207,19 +207,19 @@ describe('threaded inbound — extractUserMessage', () => {
     });
   });
 
-  it('test_preFanoutGate_intercept_thread_context_no_mention', () => {
+  it('test_preFanoutGate_intercept_thread_context_no_mention', async () => {
     // Same as above but the user typed `/dashboard-token` directly without @ prefix.
     const owner = 'discord:plain-thread';
     insertUser(owner);
     insertRole(owner, 'owner', null);
     const wrapped = `[Thread context]\nassistant: hello\n[Latest message]\n/dashboard-token`;
-    const result = preFanoutGate(JSON.stringify({ text: wrapped }), owner);
+    const result = await preFanoutGate(JSON.stringify({ text: wrapped }), owner);
     expect(result.action).toBe('intercept');
   });
 
-  it('test_preFanoutGate_pass_when_user_text_in_thread_is_not_command', () => {
+  it('test_preFanoutGate_pass_when_user_text_in_thread_is_not_command', async () => {
     // The wrapped portion is not a command — should still pass.
-    const result = preFanoutGate(
+    const result = await preFanoutGate(
       JSON.stringify({
         text: `[Thread context]\nassistant: /dashboard-token (false hit in context)\n[Latest message]\nthanks`,
       }),
@@ -248,15 +248,21 @@ describe('admin gating goes through roles', () => {
     expect(gateCommand('/clear', null, 'ag-1')).toEqual({ action: 'deny', command: '/clear' });
   });
 
-  it('allows an admin command from an owner', () => {
-    seedUser('telegram:owner');
-    grantRole({ user_id: 'telegram:owner', role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });
+  it('allows an admin command from an owner', async () => {
+    await seedUser('telegram:owner');
+    await grantRole({
+      user_id: 'telegram:owner',
+      role: 'owner',
+      agent_group_id: null,
+      granted_by: null,
+      granted_at: now(),
+    });
     expect(gateCommand('/clear', 'telegram:owner', 'ag-1')).toEqual({ action: 'pass' });
   });
 
-  it('allows an admin command from a scoped admin of the group', () => {
-    seedUser('telegram:admin');
-    grantRole({
+  it('allows an admin command from a scoped admin of the group', async () => {
+    await seedUser('telegram:admin');
+    await grantRole({
       user_id: 'telegram:admin',
       role: 'admin',
       agent_group_id: 'ag-1',

@@ -7,17 +7,17 @@
  * row, write the response into the session's inbound.db, wake the container.
  *
  * The `createPendingQuestion` call in `deliverMessage` (delivery.ts) stays
- * inline in core — it's 15 lines guarded by `hasTableRaw('pending_questions')`,
- * modularizing it adds more registry surface than it saves.
+ * inline in core — it's 15 lines guarded by a `hasTable('pending_questions')`
+ * check, and modularizing it adds more registry surface than it saves.
  */
-import { getRawDb, hasTableRaw } from '../../db/connection.js';
+import { getDb, hasTable } from '../../db/connection.js';
 import { deletePendingQuestion, getPendingQuestion, getSession } from '../../db/sessions.js';
 import { registerResponseHandler, type ResponsePayload } from '../../response-registry.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 
 async function handleInteractiveResponse(payload: ResponsePayload): Promise<boolean> {
-  if (!hasTableRaw(getRawDb(), 'pending_questions')) return false;
+  if (!(await hasTable(getDb(), 'pending_questions'))) return false;
 
   const pq = await getPendingQuestion(payload.questionId);
   if (!pq) return false;

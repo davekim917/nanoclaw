@@ -17,9 +17,14 @@ export type AccessDecision =
   | { allowed: true; reason: 'owner' | 'global_admin' | 'admin_of_group' | 'member' }
   | { allowed: false; reason: 'unknown_user' | 'not_member' };
 
-/** Can this user interact with this agent group? */
-export function canAccessAgentGroup(userId: string, agentGroupId: string): AccessDecision {
-  if (!getUser(userId)) return { allowed: false, reason: 'unknown_user' };
+/**
+ * Can this user interact with this agent group?
+ *
+ * The three role predicates stay synchronous (seam-3 plan §4.5, I-1); the two
+ * awaited reads keep their original position in the check order.
+ */
+export async function canAccessAgentGroup(userId: string, agentGroupId: string): Promise<AccessDecision> {
+  if (!(await getUser(userId))) return { allowed: false, reason: 'unknown_user' };
   if (isOwner(userId)) return { allowed: true, reason: 'owner' };
   if (isGlobalAdmin(userId)) return { allowed: true, reason: 'global_admin' };
   if (isAdminOfAgentGroup(userId, agentGroupId)) return { allowed: true, reason: 'admin_of_group' };

@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 // Mock canAccessAgentGroup — needed by requireAuth in router.js
 vi.mock('../../modules/permissions/access.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../modules/permissions/access.js')>()),
-  canAccessAgentGroup: vi.fn(() => ({ allowed: true, reason: 'owner' })),
+  canAccessAgentGroup: vi.fn(async () => ({ allowed: true, reason: 'owner' })),
 }));
 
 // Mock router.js register to avoid polluting the route table
@@ -69,7 +69,7 @@ beforeEach(async () => {
   await initTestDb();
   const db = getRawDb();
   runMigrations(db);
-  vi.mocked(accessMod.canAccessAgentGroup).mockReturnValue({ allowed: true, reason: 'owner' });
+  vi.mocked(accessMod.canAccessAgentGroup).mockResolvedValue({ allowed: true, reason: 'owner' });
 });
 
 afterEach(async () => {
@@ -95,7 +95,7 @@ describe('authMeHandler', () => {
     insertUser('u1');
     insertRole('u1', 'owner', null);
     registerCookieVerifier(() => ({ user_id: 'u1', expires_at: '2099-01-01T00:00:00Z' }));
-    vi.mocked(accessMod.canAccessAgentGroup).mockReturnValue({ allowed: true, reason: 'owner' });
+    vi.mocked(accessMod.canAccessAgentGroup).mockResolvedValue({ allowed: true, reason: 'owner' });
 
     const req = makeReq('spawn_board=token');
     const res = await authedHandler(req, {}, makeNodeCtx());
@@ -117,7 +117,7 @@ describe('authMeHandler', () => {
     insertRole('u1', 'admin', 'ag-1');
     insertRole('u1', 'admin', 'ag-2');
     registerCookieVerifier(() => ({ user_id: 'u1', expires_at: '2099-01-01T00:00:00Z' }));
-    vi.mocked(accessMod.canAccessAgentGroup).mockReturnValue({ allowed: true, reason: 'admin_of_group' });
+    vi.mocked(accessMod.canAccessAgentGroup).mockResolvedValue({ allowed: true, reason: 'admin_of_group' });
 
     const req = makeReq('spawn_board=token');
     const res = await authedHandler(req, {}, makeNodeCtx());
@@ -137,7 +137,7 @@ describe('authMeHandler', () => {
       )
       .run('u1', 'member', 'ag-1', now());
     registerCookieVerifier(() => ({ user_id: 'u1', expires_at: '2099-01-01T00:00:00Z' }));
-    vi.mocked(accessMod.canAccessAgentGroup).mockReturnValue({ allowed: false, reason: 'not_member' });
+    vi.mocked(accessMod.canAccessAgentGroup).mockResolvedValue({ allowed: false, reason: 'not_member' });
 
     const req = makeReq('spawn_board=token');
     const res = await authedHandler(req, {}, makeNodeCtx());

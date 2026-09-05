@@ -9,7 +9,7 @@
  * `hasInFlightChannelApproval` in the request flow and drops silently
  * instead of spamming the owner.
  */
-import { getRawDb } from '../../../db/connection.js';
+import { getDb, getRawDb } from '../../../db/connection.js';
 
 export interface PendingChannelApproval {
   messaging_group_id: string;
@@ -24,10 +24,9 @@ export interface PendingChannelApproval {
   options_json: string;
 }
 
-export function createPendingChannelApproval(row: PendingChannelApproval): boolean {
-  const result = getRawDb()
-    .prepare(
-      `INSERT OR IGNORE INTO pending_channel_approvals (
+export async function createPendingChannelApproval(row: PendingChannelApproval): Promise<boolean> {
+  const result = await getDb().run(
+    `INSERT OR IGNORE INTO pending_channel_approvals (
          messaging_group_id, agent_group_id, original_message,
          approver_user_id, created_at, title, question, options_json
        )
@@ -35,37 +34,64 @@ export function createPendingChannelApproval(row: PendingChannelApproval): boole
          @messaging_group_id, @agent_group_id, @original_message,
          @approver_user_id, @created_at, @title, @question, @options_json
        )`,
-    )
-    .run(row);
+    row,
+  );
   return result.changes > 0;
 }
 
+/** The row the `channels.register` guard reads. */
+export const PENDING_CHANNEL_APPROVAL_BY_GROUP_SQL =
+  'SELECT * FROM pending_channel_approvals WHERE messaging_group_id = ?';
+
+/**
+ * Synchronous by design (seam-3 plan §4.5, I-1): the `channels.register` guard
+ * in `../guard.ts` reads this row inside its `decide` body, which never awaits.
+ * Same rule as §4.2's transaction-reachable leaf exports — not a `*Sync` twin
+ * (there is one form, not two), simply not yet converted. PR 6 moves it inside
+ * `withCentralSync`/`withRawDb`.
+ */
 export function getPendingChannelApproval(messagingGroupId: string): PendingChannelApproval | undefined {
-  return getRawDb()
-    .prepare('SELECT * FROM pending_channel_approvals WHERE messaging_group_id = ?')
-    .get(messagingGroupId) as PendingChannelApproval | undefined;
+  return getRawDb().prepare(PENDING_CHANNEL_APPROVAL_BY_GROUP_SQL).get(messagingGroupId) as
+    | PendingChannelApproval
+    | undefined;
 }
 
-export function hasInFlightChannelApproval(messagingGroupId: string): boolean {
-  const row = getRawDb()
-    .prepare('SELECT 1 AS x FROM pending_channel_approvals WHERE messaging_group_id = ?')
-    .get(messagingGroupId) as { x: number } | undefined;
+export async function hasInFlightChannelApproval(messagingGroupId: string): Promise<boolean> {
+  const row = await getDb().get<{ x: number }>(
+    'SELECT 1 AS x FROM pending_channel_approvals WHERE messaging_group_id = ?',
+    messagingGroupId,
+  );
   return row !== undefined;
 }
 
-export function updatePendingChannelApprovalCard(
+export async function updatePendingChannelApprovalCard(
   messagingGroupId: string,
   title: string,
   question: string,
   optionsJson: string,
-): void {
-  getRawDb()
-    .prepare(
-      'UPDATE pending_channel_approvals SET title = ?, question = ?, options_json = ? WHERE messaging_group_id = ?',
-    )
-    .run(title, question, optionsJson, messagingGroupId);
+): Promise<void> {
+  await getDb().run(
+    'UPDATE pending_channel_approvals SET title = ?, question = ?, options_json = ? WHERE messaging_group_id = ?',
+    title,
+    question,
+    optionsJson,
+    messagingGroupId,
+  );
 }
 
-export function deletePendingChannelApproval(messagingGroupId: string): void {
-  getRawDb().prepare('DELETE FROM pending_channel_approvals WHERE messaging_group_id = ?').run(messagingGroupId);
+/**
+ * Delete the row, and say whether THIS caller is the one that deleted it.
+ *
+ * The twin of `deletePendingSenderApproval`'s claim, for the same reason: the
+ * click handler resolves the card across several awaits, so two callbacks for
+ * one card can both reach the branch that wires the channel and admits the
+ * sender. SQLite applies the DELETE once, so exactly one caller sees
+ * `changes === 1`. See `handleChannelApprovalResponse` in ../index.ts.
+ */
+export async function deletePendingChannelApproval(messagingGroupId: string): Promise<boolean> {
+  const info = await getDb().run(
+    'DELETE FROM pending_channel_approvals WHERE messaging_group_id = ?',
+    messagingGroupId,
+  );
+  return info.changes > 0;
 }

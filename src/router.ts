@@ -237,7 +237,7 @@ function generateId(): string {
  * carry enough info to identify a sender. Without the hook, every message
  * arrives at the gate with userId=null.
  */
-export type SenderResolverFn = (event: InboundEvent) => string | null;
+export type SenderResolverFn = (event: InboundEvent) => Promise<string | null>;
 
 let senderResolver: SenderResolverFn | null = null;
 
@@ -355,7 +355,7 @@ export type SenderScopeGateFn = (
   userId: string | null,
   mg: MessagingGroup,
   agent: MessagingGroupAgent,
-) => AccessGateResult;
+) => Promise<AccessGateResult>;
 
 let senderScopeGate: SenderScopeGateFn | null = null;
 
@@ -768,7 +768,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
   // 2. Sender resolution (permissions module upserts the users row as a
   //    side effect so later role/access lookups find a real record).
   //    Without the module, userId is null — downstream tolerates it.
-  const userId: string | null = senderResolver ? senderResolver(event) : null;
+  const userId: string | null = senderResolver ? await senderResolver(event) : null;
 
   // 2a. Eagerly populate the user_dms cache for inbound 1:1 DMs. The cache
   //     was historically only written lazily by ensureUserDm() on the
@@ -788,7 +788,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
   if (userId !== null && event.isDM === true) {
     try {
       const { upsertUserDm } = await import('./modules/permissions/db/user-dms.js');
-      upsertUserDm({
+      await upsertUserDm({
         user_id: userId,
         channel_type: mg.channel_type,
         messaging_group_id: mg.id,
@@ -805,7 +805,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
   //     are resolved. Handles /dashboard-token and other INTERCEPT_COMMANDS.
   //     FILTERED commands are dropped. Unknown/ADMIN commands fall through.
   if (userId !== null && (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')) {
-    const preGate = preFanoutGate(event.message.content, userId);
+    const preGate = await preFanoutGate(event.message.content, userId);
     if (preGate.action === 'intercept' || preGate.action === 'deny') {
       // Sibling bots (separate channel_type/instance per bot user — see
       // docs/workgroups.md) each get their OWN inbound event for the same
@@ -937,7 +937,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
       engages && accessGate ? await accessGate(event, userId, mg, agent.agent_group_id, effectiveThreadId) : null;
     if (accessDecision && !accessDecision.allowed && accessDecision.replayPending) markReplayPending();
     const accessOk = engages && (!accessDecision || accessDecision.allowed);
-    const scopeOk = engages && (!senderScopeGate || senderScopeGate(event, userId, mg, agent).allowed);
+    const scopeOk = engages && (!senderScopeGate || (await senderScopeGate(event, userId, mg, agent)).allowed);
 
     if (engages && accessOk && scopeOk) {
       await deliverToAgent(

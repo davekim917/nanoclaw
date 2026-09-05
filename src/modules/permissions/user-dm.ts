@@ -65,7 +65,7 @@ import { getUserDm, upsertUserDm } from './db/user-dms.js';
  * cache key is a schema change and out of scope for this fix.
  */
 export async function ensureUserDm(userId: string, instance?: string): Promise<MessagingGroup | null> {
-  const user = getUser(userId);
+  const user = await getUser(userId);
   if (!user) {
     log.warn('ensureUserDm: user not found', { userId });
     return null;
@@ -78,7 +78,7 @@ export async function ensureUserDm(userId: string, instance?: string): Promise<M
   }
 
   // Cache hit: existing user_dms row → load and return the messaging_group.
-  const cached = getUserDm(userId, channelType);
+  const cached = await getUserDm(userId, channelType);
   if (cached) {
     const mg = getMessagingGroup(cached.messaging_group_id);
     if (mg) return mg;
@@ -154,7 +154,7 @@ export async function ensureUserDm(userId: string, instance?: string): Promise<M
     }
   }
 
-  upsertUserDm({
+  await upsertUserDm({
     user_id: userId,
     channel_type: channelType,
     messaging_group_id: mg.id,
@@ -220,8 +220,8 @@ function parseUserId(user: User): { channelType: string; handle: string } | { ch
  * Returns null when the user is unknown or the id is not resolvable to a
  * channel at all — callers should read that as "not reachable on any origin".
  */
-export function resolveUserChannelType(userId: string): string | null {
-  const user = getUser(userId);
+export async function resolveUserChannelType(userId: string): Promise<string | null> {
+  const user = await getUser(userId);
   if (!user) return null;
   return parseUserId(user).channelType;
 }

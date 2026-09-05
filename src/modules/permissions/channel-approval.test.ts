@@ -117,8 +117,8 @@ beforeEach(async () => {
   // Base fixtures: one agent group + owner with a DM on 'telegram'.
   await createAgentGroup({ id: 'ag-1', name: 'Andy', folder: 'andy', agent_provider: null, created_at: now() });
 
-  upsertUser({ id: 'telegram:owner', kind: 'telegram', display_name: 'Owner', created_at: now() });
-  grantRole({
+  await upsertUser({ id: 'telegram:owner', kind: 'telegram', display_name: 'Owner', created_at: now() });
+  await grantRole({
     user_id: 'telegram:owner',
     role: 'owner',
     agent_group_id: null,
@@ -147,8 +147,8 @@ beforeEach(async () => {
   // matched by user-id channel prefix against the ORIGIN channel_type. Seed a
   // wamock-identity owner (+ DM) so the undeclared-channel ('wamock')
   // registration tests can deliver a card.
-  upsertUser({ id: 'wamock:owner', kind: 'wamock', display_name: 'Owner', created_at: now() });
-  grantRole({
+  await upsertUser({ id: 'wamock:owner', kind: 'wamock', display_name: 'Owner', created_at: now() });
+  await grantRole({
     user_id: 'wamock:owner',
     role: 'owner',
     agent_group_id: null,
@@ -583,8 +583,13 @@ describe('unknown-channel registration flow', () => {
     const { getRawDb } = await import('../../db/connection.js');
 
     await createAgentGroup({ id: 'ag-2', name: 'Betty', folder: 'betty', agent_provider: null, created_at: now() });
-    upsertUser({ id: 'telegram:scoped-admin', kind: 'telegram', display_name: 'Scoped Admin', created_at: now() });
-    grantRole({
+    await upsertUser({
+      id: 'telegram:scoped-admin',
+      kind: 'telegram',
+      display_name: 'Scoped Admin',
+      created_at: now(),
+    });
+    await grantRole({
       user_id: 'telegram:scoped-admin',
       role: 'admin',
       agent_group_id: 'ag-1',

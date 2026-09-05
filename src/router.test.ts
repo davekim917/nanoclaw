@@ -170,7 +170,7 @@ vi.mock('./topic-title.js', async (importOriginal) => ({
 
 vi.mock('./modules/permissions/db/user-roles.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./modules/permissions/db/user-roles.js')>()),
-  isAnyAdmin: vi.fn(() => false),
+  isAnyAdmin: vi.fn(async () => false),
   // command-gate's isAdmin() gate for ADMIN_COMMANDS. Default deny, so a test
   // that wants the denial branch only has to send the command.
   hasAdminPrivilege: vi.fn(() => false),
@@ -178,7 +178,7 @@ vi.mock('./modules/permissions/db/user-roles.js', async (importOriginal) => ({
 
 vi.mock('./modules/permissions/db/agent-group-members.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./modules/permissions/db/agent-group-members.js')>()),
-  hasAnyMembership: vi.fn(() => false),
+  hasAnyMembership: vi.fn(async () => false),
 }));
 
 vi.mock('./delivery.js', async (importOriginal) => ({
@@ -287,12 +287,12 @@ beforeEach(() => {
   sessionFiles.inbound = true;
   sessionFiles.outbound = true;
   // Reset singleton hook state
-  setSenderResolver(() => 'u1');
+  setSenderResolver(() => Promise.resolve('u1'));
   setAccessGate(() => ({ allowed: true }));
   setUnwiredChannelResolver(() => []);
   setChannelRequestGate(() => Promise.resolve(false));
   registerMessageInterceptor(() => Promise.resolve(false));
-  vi.mocked(isAnyAdmin).mockReturnValue(true);
+  vi.mocked(isAnyAdmin).mockResolvedValue(true);
   vi.mocked(claimChannelIngress).mockReturnValue(true);
 });
 
@@ -873,7 +873,7 @@ describe('34: pre-fanout intercept fan-out dedup + denial reply', () => {
   });
 
   it('replies with a safe, non-leaky denial exactly once when the addressed agent denies', async () => {
-    vi.mocked(isAnyAdmin).mockReturnValue(false);
+    vi.mocked(isAnyAdmin).mockResolvedValue(false);
     const mg = makeMg({ id: 'mg-1', channel_type: 'slack-test', platform_id: 'platform-1', is_group: 0 });
     vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({ mg, agentCount: 1 });
     vi.mocked(getMessagingGroupAgents).mockResolvedValue([makeAgent()]);
@@ -899,7 +899,7 @@ describe('34: pre-fanout intercept fan-out dedup + denial reply', () => {
   });
 
   it('does not send a duplicate denial from a non-responding sibling', async () => {
-    vi.mocked(isAnyAdmin).mockReturnValue(false);
+    vi.mocked(isAnyAdmin).mockResolvedValue(false);
     const mg = makeMg({ id: 'mg-1', is_group: 1 });
     vi.mocked(getMessagingGroupWithAgentCount).mockResolvedValue({ mg, agentCount: 1 });
     vi.mocked(getMessagingGroupAgents).mockResolvedValue([makeAgent()]);
@@ -1049,7 +1049,7 @@ describe('router notices survive a session whose inbound.db is gone', () => {
   }
 
   it('writes the permission-denied notice when only outbound.db is present', async () => {
-    vi.mocked(isAnyAdmin).mockReturnValue(false);
+    vi.mocked(isAnyAdmin).mockResolvedValue(false);
     sessionFiles.inbound = false;
     sessionFiles.outbound = true;
 
@@ -1085,7 +1085,7 @@ describe('router notices survive a session whose inbound.db is gone', () => {
   // The other half of the funnel's contract: absent outbound.db is the
   // never-woken shape and answers `undefined` rather than provisioning one.
   it('writes nothing when outbound.db is absent too', async () => {
-    vi.mocked(isAnyAdmin).mockReturnValue(false);
+    vi.mocked(isAnyAdmin).mockResolvedValue(false);
     sessionFiles.inbound = false;
     sessionFiles.outbound = false;
 

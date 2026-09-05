@@ -35,7 +35,7 @@
  *     — iterates over `getSessionsByAgentGroup(agentGroupId)`)
  */
 import type { AgentDestination } from '../../../types.js';
-import { getRawDb } from '../../../db/connection.js';
+import { getDb, getRawDb } from '../../../db/connection.js';
 import { deletePoliciesTouching, removeMessagePolicy } from './agent-message-policies.js';
 
 /**
@@ -43,6 +43,14 @@ import { deletePoliciesTouching, removeMessagePolicy } from './agent-message-pol
  * `writeDestinations(row.agent_group_id, <sessionId>)` for each active
  * session of that agent group so the change propagates to the running
  * container's inbound.db. See the top-of-file invariant.
+ */
+/*
+ * Seam 3: `createDestination`, `getDestinationByName` and
+ * `getDestinationByTarget` stay SYNCHRONOUS with no async form —
+ * `db/messaging-groups.ts`'s `ensureAgentDestinationForWiring` calls all
+ * three from inside `cli/resources/wirings.ts`'s pinned raw transaction
+ * closure, and `getDestinations` is read inside write-destinations' mailbox
+ * action. Plan §4.2/§4.5; they convert in PR 6 with their closure.
  */
 export function createDestination(row: AgentDestination): void {
   getRawDb()
@@ -53,10 +61,18 @@ export function createDestination(row: AgentDestination): void {
     .run(row);
 }
 
+export const AGENT_DESTINATIONS_BY_GROUP_SQL = 'SELECT * FROM agent_destinations WHERE agent_group_id = ?';
+
+/**
+ * Synchronous by design (seam-3 plan §4.5, I-1): `write-destinations.ts`
+ * resolves this map INSIDE the mailbox action, immediately before a
+ * REPLACE-shaped `replaceDestinationRows`, so a yield between the read and the
+ * write could reinstate a destination an admin revoked. Same rule as §4.2's
+ * transaction-reachable leaf exports — one form, not a `*Sync` twin. PR 6 wraps
+ * the block in `withCentralSync`/`withRawDb`.
+ */
 export function getDestinations(agentGroupId: string): AgentDestination[] {
-  return getRawDb()
-    .prepare('SELECT * FROM agent_destinations WHERE agent_group_id = ?')
-    .all(agentGroupId) as AgentDestination[];
+  return getRawDb().prepare(AGENT_DESTINATIONS_BY_GROUP_SQL).all(agentGroupId) as AgentDestination[];
 }
 
 export function getDestinationByName(agentGroupId: string, localName: string): AgentDestination | undefined {
@@ -76,12 +92,17 @@ export function getDestinationByTarget(
     .get(agentGroupId, targetType, targetId) as AgentDestination | undefined;
 }
 
-/** Permission check: can this agent send to this target? */
+export const AGENT_DESTINATION_EXISTS_SQL =
+  'SELECT 1 FROM agent_destinations WHERE agent_group_id = ? AND target_type = ? AND target_id = ? LIMIT 1';
+
+/**
+ * Permission check: can this agent send to this target?
+ *
+ * Synchronous by design (seam-3 plan §4.5, I-1): the `a2a.send` guard in
+ * `../guard.ts` calls it from inside its `decide` body, which never awaits.
+ */
 export function hasDestination(agentGroupId: string, targetType: 'channel' | 'agent', targetId: string): boolean {
-  const row = getRawDb()
-    .prepare('SELECT 1 FROM agent_destinations WHERE agent_group_id = ? AND target_type = ? AND target_id = ? LIMIT 1')
-    .get(agentGroupId, targetType, targetId);
-  return !!row;
+  return getRawDb().prepare(AGENT_DESTINATION_EXISTS_SQL).get(agentGroupId, targetType, targetId) !== undefined;
 }
 
 /**
@@ -89,16 +110,20 @@ export function hasDestination(agentGroupId: string, targetType: 'channel' | 'ag
  * `writeDestinations(agentGroupId, <sessionId>)` for each active session
  * so the deletion propagates to the running container's inbound.db.
  */
-export function deleteDestination(agentGroupId: string, localName: string): void {
+export async function deleteDestination(agentGroupId: string, localName: string): Promise<void> {
   // Resolve the target first so we can drop a matching policy for this edge (no ghost gate on re-wire).
-  const row = getRawDb()
-    .prepare('SELECT target_type, target_id FROM agent_destinations WHERE agent_group_id = ? AND local_name = ?')
-    .get(agentGroupId, localName) as { target_type: string; target_id: string } | undefined;
-  getRawDb()
-    .prepare('DELETE FROM agent_destinations WHERE agent_group_id = ? AND local_name = ?')
-    .run(agentGroupId, localName);
+  const row = await getDb().get<{ target_type: string; target_id: string }>(
+    'SELECT target_type, target_id FROM agent_destinations WHERE agent_group_id = ? AND local_name = ?',
+    agentGroupId,
+    localName,
+  );
+  await getDb().run(
+    'DELETE FROM agent_destinations WHERE agent_group_id = ? AND local_name = ?',
+    agentGroupId,
+    localName,
+  );
   if (row?.target_type === 'agent') {
-    removeMessagePolicy(agentGroupId, row.target_id);
+    await removeMessagePolicy(agentGroupId, row.target_id);
   }
 }
 
@@ -112,11 +137,14 @@ export function deleteDestination(agentGroupId: string, localName: string): void
  * `agentGroupId` as a destination target. Use `getDestinationReferencers`
  * below to find them BEFORE calling this (the rows are gone afterwards).
  */
-export function deleteAllDestinationsTouching(agentGroupId: string): void {
-  getRawDb()
-    .prepare('DELETE FROM agent_destinations WHERE agent_group_id = ? OR (target_type = ? AND target_id = ?)')
-    .run(agentGroupId, 'agent', agentGroupId);
-  deletePoliciesTouching(agentGroupId);
+export async function deleteAllDestinationsTouching(agentGroupId: string): Promise<void> {
+  await getDb().run(
+    'DELETE FROM agent_destinations WHERE agent_group_id = ? OR (target_type = ? AND target_id = ?)',
+    agentGroupId,
+    'agent',
+    agentGroupId,
+  );
+  await deletePoliciesTouching(agentGroupId);
 }
 
 /**
@@ -126,12 +154,12 @@ export function deleteAllDestinationsTouching(agentGroupId: string): void {
  * projections to refresh after the delete — the rows are gone once the
  * delete runs.
  */
-export function getDestinationReferencers(targetAgentGroupId: string): string[] {
-  const rows = getRawDb()
-    .prepare(
-      "SELECT DISTINCT agent_group_id FROM agent_destinations WHERE target_type = 'agent' AND target_id = ? AND agent_group_id != ?",
-    )
-    .all(targetAgentGroupId, targetAgentGroupId) as Array<{ agent_group_id: string }>;
+export async function getDestinationReferencers(targetAgentGroupId: string): Promise<string[]> {
+  const rows = await getDb().all<{ agent_group_id: string }>(
+    "SELECT DISTINCT agent_group_id FROM agent_destinations WHERE target_type = 'agent' AND target_id = ? AND agent_group_id != ?",
+    targetAgentGroupId,
+    targetAgentGroupId,
+  );
   return rows.map((r) => r.agent_group_id);
 }
 

@@ -222,7 +222,7 @@ function isSameInboundEvent(raw: string, event: InboundEvent): boolean {
 export async function requestChannelApproval(input: RequestChannelApprovalInput): Promise<boolean> {
   const { messagingGroupId, event } = input;
 
-  if (hasInFlightChannelApproval(messagingGroupId)) {
+  if (await hasInFlightChannelApproval(messagingGroupId)) {
     log.debug('Channel registration already in flight — dropping retry', { messagingGroupId });
     const existing = getPendingChannelApproval(messagingGroupId);
     return existing ? isSameInboundEvent(existing.original_message, event) : false;
@@ -239,7 +239,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
   // are returned regardless of which group we pass.
   const referenceGroup = agentGroups[0];
 
-  const approvers = pickApprover(referenceGroup.id);
+  const approvers = await pickApprover(referenceGroup.id);
   if (approvers.length === 0) {
     log.warn('Channel registration skipped — no owner or admin configured', {
       messagingGroupId,
@@ -353,7 +353,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
   const question = buildQuestionText(isGroup, senderName, channelName, originChannelType, ruleNote, conversation);
   const options = normalizeOptions(buildApprovalOptions(agentGroups, delivery.userId));
 
-  const created = createPendingChannelApproval({
+  const created = await createPendingChannelApproval({
     messaging_group_id: messagingGroupId,
     agent_group_id: referenceGroup.id,
     original_message: JSON.stringify(event),
