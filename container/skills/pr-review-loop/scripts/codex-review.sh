@@ -207,9 +207,11 @@ status_observation() {
   local sha="$1" since="$2" thread_pages review_pages reaction_pages
   local observed_heads head_count head_changed head_oid open_count review_matches review_count last_review_at reaction_matches reaction_count last_thumbs_up_at rounds codex
 
-  thread_pages=$(paginate_connection reviewThreads review_threads_page) || return 1
+  # Read verdict evidence before threads: a review submitted between these
+  # requests must have its findings included before we can declare it clean.
   review_pages=$(paginate_connection reviews reviews_page) || return 1
   reaction_pages=$(paginate_connection reactions reactions_page) || return 1
+  thread_pages=$(paginate_connection reviewThreads review_threads_page) || return 1
 
   observed_heads=$(printf '%s\n%s\n%s\n' "$thread_pages" "$review_pages" "$reaction_pages" | jq -ers '
     [ .[] | .data.repository.pullRequest.headRefOid ] | unique') || return 1

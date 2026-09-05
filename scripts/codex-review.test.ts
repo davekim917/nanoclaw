@@ -84,7 +84,11 @@ esac
 page=1
 [ "$after" = "null" ] || page=2
 printf '%s %s\\n' "$connection" "$after" >> "$MOCK_CALLS"
-cat "$MOCK_DIR/$connection-$page.json"
+if [ "$connection" = "reviewThreads" ] && [ -f "$MOCK_DIR/threads-after-review.json" ] && grep -q '^reviews ' "$MOCK_CALLS"; then
+  cat "$MOCK_DIR/threads-after-review.json"
+else
+  cat "$MOCK_DIR/$connection-$page.json"
+fi
 `,
     { mode: 0o755 },
   );
@@ -158,6 +162,22 @@ describe('codex-review status and foreground wait', () => {
     expect(result.calls).toContain('reviewThreads threads-2');
     expect(result.calls).toContain('reviews reviews-2');
     expect(result.calls).toContain('reactions reactions-2');
+  });
+
+  it('includes findings published with a review between the separate GraphQL requests', () => {
+    const root = tempRoot();
+    writePage(root, 'reviewThreads', 1, connectionPage('reviewThreads', []));
+    writePage(root, 'reviews', 1, connectionPage('reviews', [review('2026-09-05T00:01:00Z')]));
+    writePage(root, 'reactions', 1, connectionPage('reactions', []));
+    fs.writeFileSync(
+      path.join(root, 'threads-after-review.json'),
+      JSON.stringify(connectionPage('reviewThreads', [thread(false)])),
+    );
+
+    const result = run(root, 'wait', '1');
+    expect(result.status).toBe(10);
+    expect(result.stdout).toContain(`codex=findings head=${HEAD} open=1 review=1`);
+    expect(result.stdout).not.toContain('codex=clean');
   });
 
   it('reports unresolved Codex threads as findings even when they are from an older round', () => {
