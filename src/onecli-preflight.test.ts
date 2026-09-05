@@ -7,6 +7,7 @@
  */
 import fs from 'fs';
 import path from 'path';
+import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -40,6 +41,23 @@ function deps(overrides: Partial<PreflightDeps> = {}): PreflightDeps & { exitCod
   };
 }
 
+function directMainCallNames(source: string): string[] {
+  const sourceFile = ts.createSourceFile('main.ts', source, ts.ScriptTarget.Latest, true);
+  const main = sourceFile.statements.find(
+    (statement): statement is ts.FunctionDeclaration =>
+      ts.isFunctionDeclaration(statement) && statement.name?.text === 'main',
+  );
+  if (!main?.body) return [];
+
+  return main.body.statements.flatMap((statement) => {
+    if (!ts.isExpressionStatement(statement)) return [];
+    const awaited = ts.isAwaitExpression(statement.expression);
+    const expression = awaited ? statement.expression.expression : statement.expression;
+    if (!ts.isCallExpression(expression) || !ts.isIdentifier(expression.expression)) return [];
+    return [`${awaited ? 'await ' : ''}${expression.expression.text}`];
+  });
+}
+
 describe('boot wiring', () => {
   /**
    * The gate has to close before anything can accept work. Past the dashboard
@@ -48,17 +66,36 @@ describe('boot wiring', () => {
    * the exit would kill a host that has already taken work on.
    */
   it('runs the preflight before the dashboard and the channel adapters', () => {
-    const main = fs.readFileSync(path.join(import.meta.dirname, 'main.ts'), 'utf-8');
-
-    const preflight = main.indexOf('await runOnecliBootPreflight(');
-    const dashboard = main.indexOf('startDashboard()');
-    const adapters = main.indexOf('await initChannelAdapters(');
+    const source = fs.readFileSync(path.join(import.meta.dirname, 'main.ts'), 'utf-8');
+    const calls = directMainCallNames(source);
+    const preflight = calls.indexOf('await runOnecliBootPreflight');
+    const dashboard = calls.indexOf('startDashboard');
+    const adapters = calls.indexOf('await initChannelAdapters');
 
     expect(preflight).toBeGreaterThan(-1);
     expect(dashboard).toBeGreaterThan(-1);
     expect(adapters).toBeGreaterThan(-1);
     expect(preflight).toBeLessThan(dashboard);
     expect(preflight).toBeLessThan(adapters);
+  });
+
+  it('does not count a disabled preflight call in a block comment', () => {
+    const source = fs.readFileSync(path.join(import.meta.dirname, 'main.ts'), 'utf-8');
+    const disabled = source.replace(
+      '  await runOnecliBootPreflight();',
+      '  /*\n  await runOnecliBootPreflight();\n  */',
+    );
+
+    expect(directMainCallNames(disabled)).not.toContain('await runOnecliBootPreflight');
+  });
+
+  it('does not count an unawaited preflight call as startup-safe', () => {
+    const source = fs.readFileSync(path.join(import.meta.dirname, 'main.ts'), 'utf-8');
+    const unawaited = source.replace('  await runOnecliBootPreflight();', '  runOnecliBootPreflight();');
+    const calls = directMainCallNames(unawaited);
+
+    expect(calls).toContain('runOnecliBootPreflight');
+    expect(calls).not.toContain('await runOnecliBootPreflight');
   });
 });
 
