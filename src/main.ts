@@ -15,6 +15,7 @@ import { formatBuildInfoLog, readBuildInfo } from './build-info.js';
 import { DATA_DIR, REPO_ROOT } from './config.js';
 import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
+import { shadowWrite } from './db/coordination.js';
 import { getDb, getRawDb, initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
 import { registerSecretsFromEnv } from './secret-scrubber.js';
@@ -32,6 +33,7 @@ import { resetProcessingChannelIngress } from './db/channel-ingress-receipts.js'
 import { stopAllContainers } from './container-runner.js';
 import { writeUpstreamPolicySnapshot } from './container-updates.js';
 import { setDeliveryAdapter, startActiveDeliveryPoll, startSweepDeliveryPoll, stopDeliveryPolls } from './delivery.js';
+import { getHostInstanceId, startHostInstanceLease, stopHostInstanceLease } from './host-instance.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { ensureArchiveSchema } from './message-archive.js';
 import { startHostModules, stopHostModules } from './host-lifecycle.js';
@@ -150,6 +152,13 @@ import {
 } from './channels/channel-registry.js';
 import type Database from 'better-sqlite3';
 
+/**
+ * Lease TTL handed to `startHostInstanceLease` and logged with the §6 evidence
+ * line, so the value operators read is the value in force. 3× the 30 s renewal
+ * interval, matching upstream's default (src/host-instance.ts).
+ */
+const HOST_LEASE_TTL_MS = 90_000;
+
 export function runWorkgroupMemoryStartupGate(
   db: Database.Database,
   deps: {
@@ -242,6 +251,21 @@ export async function main(): Promise<void> {
   await initDb(dbPath);
   const db = getRawDb();
   runMigrations(db);
+
+  // 1-a. Register this host process in `host_instances` and start renewing
+  // its lease. Ahead of everything that can spawn, so the row exists before
+  // any container work; write-only shadow state — nothing reads it yet
+  // (docs/specs/upstream-restart-survival-seam/plan.md §7.A). Through
+  // `shadowWrite` for the same reason: a failed INSERT (contention, a locked
+  // file) must log and let boot continue, never turn shadow state into a
+  // startup dependency. The double-start throw is unreachable here (one call).
+  await shadowWrite('host instance lease start', () => startHostInstanceLease({ leaseTtlMs: HOST_LEASE_TTL_MS }));
+  const hostInstanceId = getHostInstanceId();
+  if (hostInstanceId) {
+    // Plan §6 series-A evidence: exactly one per boot, instance id + ttl. Its
+    // absence after a boot means the registration failed (WARN above).
+    log.info('Host instance lease started', { instanceId: hostInstanceId, ttlMs: HOST_LEASE_TTL_MS });
+  }
 
   // 1-0. Materialize the archive schema before ANY service that can spawn.
   //
@@ -658,6 +682,11 @@ async function shutdown(signal: string): Promise<void> {
       log.error('stopAllContainers threw', { err });
     }
   } finally {
+    // Stamp `stopped_at` FIRST so a graceful exit is durably distinguishable
+    // from a crash even if the teardown above threw — in the `try` a throw
+    // from teardownChannelAdapters() would skip it and leave the row looking
+    // crash-ended for the 90 s lease TTL. Never throws.
+    await stopHostInstanceLease();
     // Always reset on graceful shutdown — even if teardown threw, we got here
     // via SIGTERM/SIGINT, not a crash, so the next start shouldn't be counted
     // as one.

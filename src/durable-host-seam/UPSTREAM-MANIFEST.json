@@ -1,0 +1,7 @@
+{
+  "upstream": "b76fcb3d",
+  "files": {
+    "src/db/coordination.ts": "fb7263a5a35c9a5b793c945565c9f07379bb9442058a6c63cdbc02d700b0c752",
+    "src/host-instance.ts": "bcb5a1646ae357aaa0aeedd0312b4e7fc65a1f04a725fb16c2ca19966fa9873c"
+  }
+}
