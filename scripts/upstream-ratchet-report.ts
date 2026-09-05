@@ -769,11 +769,17 @@ function runCheck(options: Options): never {
   // `validateManifestShape` is what stands between here and a crash: a
   // top-level `null`/array/primitive, or a non-string `upstream`, would throw
   // on the very next line (`committed.upstream`) otherwise. It also validates
-  // `upstream`/`paths`' own regex shape, so an invalid pin is caught here too,
-  // before `resolveCommit`'s `git rev-parse` object lookup. `--check` reads
-  // `committed` from an ARBITRARY ref's content, so this cannot be skipped the
-  // way a trusted local file arguably could be — and `main()`'s working-tree
-  // path runs the identical check for the identical reason.
+  // `upstream`/`paths`' own regex shape — including an EMPTY pin, which is
+  // never legitimate on a checked ref's own committed manifest — so any
+  // invalid pin is caught here, before `resolveCommit`'s `git rev-parse`
+  // object lookup, with a structured MALFORMED finding rather than that
+  // call's exit-2 stderr. No `unpinnedOk`: that exemption exists only for the
+  // synthetic baseline `main()` builds in memory on a first run, never for a
+  // ref's real committed content, which is what `--check` reads. `--check`
+  // reads `committed` from an ARBITRARY ref's content, so this cannot be
+  // skipped the way a trusted local file arguably could be — and `main()`'s
+  // working-tree path runs the identical strict check on an EXISTING on-disk
+  // manifest for the identical reason.
   const shapeFindings = validateManifestShape(committed);
   if (shapeFindings.length > 0) reportUnusableCheckedManifest(ref, resolvedRef, shapeFindings, options.json);
 
@@ -917,6 +923,13 @@ function main(): void {
   }
 
   let committed: UpstreamRatchetManifest;
+  // Set only for the synthetic first-run baseline constructed below — the ONE
+  // value this tool builds itself rather than reads off disk, and therefore
+  // the ONE call below allowed to pass `unpinnedOk` to `validateManifestShape`.
+  // An on-disk manifest — including a hand-edited or corrupted one — gets no
+  // such exemption: see that function's docstring for why an empty pin must
+  // never reach `resolveCommit` uncaught.
+  let isBootstrap = false;
   try {
     committed = readManifest(root);
     // eslint-disable-next-line no-catch-all/no-catch-all
@@ -946,6 +959,7 @@ function main(): void {
       fail(`could not read ${committedPath}: ${error instanceof Error ? error.message : String(error)}`);
     }
     committed = { upstream: '', paths: '', files: {} };
+    isBootstrap = true;
   }
 
   // Same guard as `runCheck`'s, for the same reason: `resolveCommit` on the
@@ -954,8 +968,11 @@ function main(): void {
   // validates `upstream`/`paths`' own regex shape now, catching an invalid pin
   // here too. The local file is not exempt just because this tool is the only
   // thing that usually writes it — a hand-edited or corrupted one hits the
-  // same crash.
-  const shapeFindings = validateManifestShape(committed);
+  // same crash, and gets the same STRICT check `runCheck` gives a `--check
+  // <ref>`'s committed manifest: `unpinnedOk` is passed ONLY for the
+  // synthetic bootstrap baseline this function built two lines above, never
+  // for anything `readManifest` actually returned.
+  const shapeFindings = validateManifestShape(committed, { unpinnedOk: isBootstrap });
   if (shapeFindings.length > 0) reportUnusableLocalManifest(committedPath, shapeFindings, options.json);
 
   const sha = resolveCommit(root, options.upstream ?? committed.upstream);

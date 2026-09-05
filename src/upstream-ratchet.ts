@@ -507,28 +507,45 @@ export function fsTreeReader(repoRoot: string): TreeReader {
  * `main()`, so both paths get the same guard rather than treating the local
  * file as trusted by convention.
  *
- * ALSO validates the SHAPE of `upstream` (a 40-character commit sha, or the
- * empty string — the not-yet-pinned baseline `main()` synthesizes on a first
- * run) and `paths` (a 64-character sha256 hex digest, or empty, for the same
- * reason) rather than just their type. This used to be `checkTree`'s own
- * `COMMIT_RE` check, run AFTER this function, on the next line — which meant
- * an invalid-but-string pin like `"not-a-sha"` or a 7-character short sha
- * passed here and reached `resolveCommit`'s `git rev-parse` UNCAUGHT: that
- * call is itself an object lookup, so it either misreports the failure as
- * "not in this clone, run: git fetch" (exit 2, wrong diagnosis) or — for a
- * short sha that happens to resolve locally — silently accepts a pin this
- * tool never writes in that form. Moved here so both call sites (`runCheck`
- * and `main()`) catch it before any object lookup, with one JSON-safe
- * MALFORMED finding, exit 1. The seal-equality check (`paths` against the
- * ACTUAL computed seal of `files`' keys) still lives in `checkTree`, since it
- * needs the file list this function deliberately does not require.
+ * ALSO validates the SHAPE of `upstream` (a 40-character commit sha) and
+ * `paths` (a 64-character sha256 hex digest) rather than just their type.
+ * This used to be `checkTree`'s own `COMMIT_RE` check, run AFTER this
+ * function, on the next line — which meant an invalid-but-string pin like
+ * `"not-a-sha"` or a 7-character short sha passed here and reached
+ * `resolveCommit`'s `git rev-parse` UNCAUGHT: that call is itself an object
+ * lookup, so it either misreports the failure as "not in this clone, run:
+ * git fetch" (exit 2, wrong diagnosis) or — for a short sha that happens to
+ * resolve locally — silently accepts a pin this tool never writes in that
+ * form. Moved here so both call sites (`runCheck` and `main()`) catch it
+ * before any object lookup, with one JSON-safe MALFORMED finding, exit 1.
+ * The seal-equality check (`paths` against the ACTUAL computed seal of
+ * `files`' keys) still lives in `checkTree`, since it needs the file list
+ * this function deliberately does not require.
+ *
+ * `opts.unpinnedOk` (default `false`) is the ONLY escape hatch from the
+ * 40-hex/64-hex shape rule above, and it exists for exactly one caller:
+ * `main()` synthesizing the not-yet-pinned in-memory baseline
+ * (`{ upstream: '', paths: '', files: {} }`) when `--upstream <rev>` creates
+ * a manifest for the first time — a value this tool builds itself, never one
+ * read off disk or off a ref. Every OTHER caller — `checkTree`, `runCheck`'s
+ * own call on a `--check <ref>`'s committed manifest, and `main()`'s call on
+ * whatever `readManifest` returned for an EXISTING on-disk manifest — passes
+ * no `opts` and gets the strict, no-exceptions check. An on-disk or
+ * checked-ref manifest can never legitimately carry an empty pin: the
+ * committed baseline case is over the instant `--write` first runs, since
+ * `writeManifest` never serializes an empty `upstream`. A carried-over empty
+ * pin reaching `resolveCommit('')` used to exit 2 with a plain "not in this
+ * clone" stderr line instead of this function's structured MALFORMED finding
+ * (exit 1, JSON-safe) — see the fork issue tracker, "upstream-ratchet
+ * --check: reject an empty upstream pin before resolveCommit".
  *
  * Per-entry validation (`diff`/`mode`/`sha256`/`deleted`/`ignored`/`binary`
  * shapes) stays in `checkEntry`, which already never crashes anything
  * downstream because every field read there is either optional-chained or
  * already defended.
  */
-export function validateManifestShape(value: unknown): Finding[] {
+export function validateManifestShape(value: unknown, opts: { unpinnedOk?: boolean } = {}): Finding[] {
+  const unpinnedOk = opts.unpinnedOk ?? false;
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     return [
       {
@@ -548,7 +565,7 @@ export function validateManifestShape(value: unknown): Finding[] {
       detail: `"upstream" is not a string: ${JSON.stringify(manifest.upstream)}`,
       hint: `regenerate: ${REGENERATE_HINT}`,
     });
-  } else if (manifest.upstream !== '' && !COMMIT_RE.test(manifest.upstream)) {
+  } else if (!(unpinnedOk && manifest.upstream === '') && !COMMIT_RE.test(manifest.upstream)) {
     findings.push({
       kind: 'malformed',
       path: MANIFEST_REL,
@@ -563,7 +580,7 @@ export function validateManifestShape(value: unknown): Finding[] {
       detail: `"paths" is not a string: ${JSON.stringify(manifest.paths)}`,
       hint: `regenerate: ${REGENERATE_HINT}`,
     });
-  } else if (manifest.paths !== '' && !SHA256_RE.test(manifest.paths)) {
+  } else if (!(unpinnedOk && manifest.paths === '') && !SHA256_RE.test(manifest.paths)) {
     findings.push({
       kind: 'malformed',
       path: MANIFEST_REL,
