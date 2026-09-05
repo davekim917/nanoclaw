@@ -20,7 +20,7 @@ function listTestFiles(root: string): string[] {
 }
 
 function hasRealLogImportOriginal(source: string): boolean {
-  return /\bvi\.mock\(\s*(['"])(?:\.{1,2}\/)(?:[^'"]*\/)?log\.js\1\s*,\s*(?:async\s*)?\(\s*importOriginal\b/.test(
+  return /\bvi\.(?:mock|doMock)\s*\(\s*(['"])(?:\.{1,2}\/)(?:[^'"]*\/)?log\.js\1\s*,\s*(?:async\s*)?\(\s*importOriginal\b/.test(
     source,
   );
 }
@@ -31,6 +31,13 @@ describe('log mock tripwire', () => {
     expect(
       hasRealLogImportOriginal(`vi.mock('${logSpecifier}', async (importOriginal) => ({ ...importOriginal() }))`),
     ).toBe(true);
+  });
+
+  it('flags a deferred logger mock that imports the production module', () => {
+    const logSpecifier = `./${'log.js'}`;
+    expect(hasRealLogImportOriginal(`vi.doMock('${logSpecifier}', async (importOriginal) => importOriginal())`)).toBe(
+      true,
+    );
   });
 
   it('flags a synchronous script-side mock of the host log module', () => {
