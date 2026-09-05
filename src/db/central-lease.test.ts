@@ -13,6 +13,7 @@ import type Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { log } from '../log.js';
+import type { RawDb } from './central-lease.js';
 import {
   CentralLeaseReentrancyError,
   GuardNotSynchronousError,
@@ -26,6 +27,14 @@ import {
 } from './central-lease.js';
 import { closeDb, initTestDb } from './connection.js';
 import type { DbDriver } from './driver.js';
+/**
+ * Upstream's own escape hatch, and the only way a TEST can hold the live
+ * connection now that `withRawDb` confines it. Two fixtures need it: the commit
+ * spy below, and the open-transaction state the belt refuses. Not `getRawDb()`,
+ * which the seam-3 ratchet pins — this is the driver's own accessor, used here
+ * to CONSTRUCT the conditions the primitive is supposed to reject.
+ */
+import { sqliteRaw } from './drivers/sqlite.js';
 
 type ExecFn = (sql: string) => Database.Database;
 
@@ -67,7 +76,7 @@ describe('the central lease serializes driver transactions against synchronous b
     // of inferring it from promise-resolution order. Row visibility could not
     // stand in for this: raw and driver share ONE connection, so an uncommitted
     // row would be visible too.
-    const raw = await withCentralSync(() => withRawDb((r) => r));
+    const raw = sqliteRaw(db);
     const originalExec = raw.exec.bind(raw) as ExecFn;
     (raw as unknown as { exec: ExecFn }).exec = (sql: string) => {
       if (/^\s*COMMIT/i.test(sql)) calls.push('commit');
@@ -219,17 +228,49 @@ describe('withRawDb is confined to a synchronous block', () => {
   });
 
   it('throws RawAccessDuringTransactionError when the raw handle is in a transaction', async () => {
-    await withCentralSync(() => {
-      // Constructed directly: under the lease this state is unreachable, which
-      // is exactly why the belt needs its own fixture rather than a scenario.
-      const raw = withRawDb((r) => r);
-      raw.exec('BEGIN');
-      try {
+    // Constructed directly on the live handle: under the lease this state is
+    // unreachable, which is exactly why the belt needs its own fixture rather
+    // than a scenario.
+    const raw = sqliteRaw(db);
+    raw.exec('BEGIN');
+    try {
+      await withCentralSync(() => {
         expect(() => withRawDb((r) => r.prepare(`SELECT 1`).get())).toThrow(RawAccessDuringTransactionError);
-      } finally {
-        raw.exec('ROLLBACK');
-      }
-    }, 'belt-fixture');
+      }, 'belt-fixture');
+    } finally {
+      raw.exec('ROLLBACK');
+    }
+  });
+
+  it('refuses to hand back anything that still reaches the connection', async () => {
+    await withCentralSync(() => {
+      // @ts-expect-error — NoLiveSqlite refuses the facade itself
+      withRawDb((r) => r);
+      // @ts-expect-error — NoLiveSqlite refuses a prepared statement
+      withRawDb((r) => r.prepare(`SELECT 1`));
+      // @ts-expect-error — and the connection reached through a statement
+      withRawDb((r) => r.prepare(`SELECT 1`).database);
+      // Reading a ROW out of the block is the whole point, and still compiles.
+      expect(withRawDb((r) => r.prepare(`SELECT 1 AS ok`).get())).toEqual({ ok: 1 });
+    }, 'confinement');
+  });
+
+  it('a facade captured inside a block is inert once the block returns', async () => {
+    let escaped: RawDb | undefined;
+    await withCentralSync(() => {
+      withRawDb((r) => {
+        escaped = r;
+      });
+    }, 'capture');
+
+    expect(() => escaped?.prepare(`SELECT 1`)).toThrow(RawAccessOutsideSyncBlockError);
+    expect(() => escaped?.exec(`SELECT 1`)).toThrow(RawAccessOutsideSyncBlockError);
+    expect(() => escaped?.inTransaction).toThrow(RawAccessOutsideSyncBlockError);
+
+    // And it does not come back to life on a LATER block's lease.
+    await withCentralSync(() => {
+      expect(() => escaped?.prepare(`SELECT 1`)).toThrow(RawAccessOutsideSyncBlockError);
+    }, 'a-different-block');
   });
 });
 

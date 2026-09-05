@@ -19,7 +19,7 @@
  *
  *   centralTransaction(fn)  acquire → getDb().transaction(fn) → release
  *   withCentralSync(fn)     acquire → run the synchronous block → release
- *   withRawDb(fn)           the raw handle, usable only inside such a block
+ *   withRawDb(fn)           the connection, confined to such a block
  *   evaluateGuardSync(g)    call a guard, reject a thenable result
  *
  * Non-transactional driver `get`/`all`/`run` do NOT take the lease. They never
@@ -215,6 +215,7 @@ export async function withCentralSync<T>(
   const release = await lease.acquire(label);
   const previouslyInside = insideSyncBlock;
   insideSyncBlock = true;
+  blockEpoch += 1;
   try {
     const result = fn();
     if (isThenable(result)) throw new GuardNotSynchronousError('The withCentralSync block');
@@ -222,6 +223,74 @@ export async function withCentralSync<T>(
   } finally {
     insideSyncBlock = previouslyInside;
     release();
+  }
+}
+
+/**
+ * The connection as a synchronous block may hold it: statements, and nothing
+ * that outlives the block.
+ *
+ * `withRawDb` hands over one of these rather than the better-sqlite3 handle
+ * itself, so that a callback cannot stash the live connection somewhere and run
+ * statements on it after the lease is released — which is the exact race the
+ * lease exists to prevent. Every method re-checks that its own block is still
+ * running, so a captured facade is inert the moment the block returns.
+ *
+ * `prepare` hands back a REAL better-sqlite3 `Statement`, because a facade over
+ * statements would be a second wrapper around the same problem. A statement
+ * captured and executed after the block is therefore still an escape the
+ * runtime cannot see; `NoLiveSqlite` is what stops the direct form of it, and
+ * the block-scoped statement is a deliberate boundary, not an oversight.
+ */
+export interface RawDb {
+  prepare(source: string): Database.Statement;
+  exec(source: string): void;
+  readonly inTransaction: boolean;
+}
+
+/**
+ * A `withCentralSync` block may not hand back anything that still reaches the
+ * connection: the handle, a statement, an open `iterate()` cursor, a
+ * better-sqlite3 transaction function, or the facade itself. Compile-time half
+ * of the confinement; `BlockScopedRawDb` is the runtime half.
+ */
+export type NoLiveSqlite<T> = T extends
+  | Database.Database
+  | Database.Statement
+  | Database.Transaction
+  | IterableIterator<unknown>
+  | RawDb
+  ? [resultMustNotOutliveTheBlock: never]
+  : [];
+
+/**
+ * Bumped when a synchronous block starts, so a facade can tell "my block is
+ * still running" from "a LATER block is running" — `insideSyncBlock` alone
+ * would let a stale facade ride a subsequent block's lease.
+ */
+let blockEpoch = 0;
+
+class BlockScopedRawDb implements RawDb {
+  constructor(
+    private readonly raw: Database.Database,
+    private readonly epoch: number,
+  ) {}
+
+  private live(): Database.Database {
+    if (!insideSyncBlock || this.epoch !== blockEpoch) throw new RawAccessOutsideSyncBlockError();
+    return this.raw;
+  }
+
+  prepare(source: string): Database.Statement {
+    return this.live().prepare(source);
+  }
+
+  exec(source: string): void {
+    this.live().exec(source);
+  }
+
+  get inTransaction(): boolean {
+    return this.live().inTransaction;
   }
 }
 
@@ -235,15 +304,25 @@ export async function withCentralSync<T>(
  * construction (the lease is exclusive), so the `inTransaction` check is a belt:
  * a non-zero count in the post-restart gate means a bypass, not a race.
  *
+ * The callback gets a `RawDb` facade, not the connection, and may not RETURN
+ * anything that still reaches the connection (`NoLiveSqlite`). Both halves
+ * close the same hole: a block that hands the live handle to its caller runs
+ * statements after the lease is released, which is the race this primitive
+ * exists to prevent.
+ *
  * `src/db/migrations/index.ts` and the storage-maintenance worker thread are
  * allowlisted raw users that do NOT come through here: they run with no
  * concurrent central-DB activity at all.
  */
-export function withRawDb<T>(fn: (db: Database.Database) => T): T {
+export function withRawDb<T>(
+  fn: (db: RawDb) => T,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- type-level only
+  ..._confined: NoLiveSqlite<T>
+): T {
   if (!insideSyncBlock) throw new RawAccessOutsideSyncBlockError();
   const raw = getRawDb();
   if (raw.inTransaction) throw new RawAccessDuringTransactionError();
-  return fn(raw);
+  return fn(new BlockScopedRawDb(raw, blockEpoch));
 }
 
 /**
