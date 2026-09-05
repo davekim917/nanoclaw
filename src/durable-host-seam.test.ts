@@ -50,8 +50,16 @@ describe('main.ts wires the lease as shadow state', () => {
 
   // A failed `host_instances` INSERT at boot must log and let the host come
   // up — the lease is write-only shadow state (plan §7.A), never a startup
-  // dependency. Pinned structurally: the only call to the starter goes
+  // dependency. Pinned structurally: main.ts's only call to the starter goes
   // through upstream's `shadowWrite`, which swallows and warns.
+  //
+  // Scoped to main.ts on purpose. Series A′ added a SECOND caller, the spawn
+  // path's late start (`resolveClaimantId`, src/container-runner.ts), which
+  // exists precisely because this one is fail-open: a host that came up
+  // without an instance id retries once before it claims, and refuses the
+  // spawn if that retry fails too. It is `shadowWrite`-wrapped for its own
+  // reason (a failed retry must refuse one spawn, not throw out of the wake
+  // path) and is covered by src/session-claim-spawn.test.ts.
   it('starts the lease only through shadowWrite so a failed registration cannot abort boot', () => {
     const calls = main.match(/startHostInstanceLease\(/g) ?? [];
     expect(calls).toHaveLength(1);

@@ -716,6 +716,11 @@ export const SWEEP_DUTY_INVENTORY: Readonly<Record<string, string>> = {
   // so the registration drift guard in host-sweep-registry.test.ts stays an
   // exact accounting of every registered duty.
   FORK1: 'github-token-file-refresh',
+  // Fork addition (seam 4 series A', issue #430): the coordination tables of
+  // migration 071 gained writers, and a write that lands after session teardown
+  // leaves a row behind that no foreign key removes. Body in
+  // `src/modules/sweep-central/coordination-orphans.ts`.
+  FORK2: 'coordination-orphans',
   S2: 'processing-ack-sync',
   S3: 'stale-pending-expiry',
   S4: 'pre-wake-orphan-claim-reset',

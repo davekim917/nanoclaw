@@ -1146,9 +1146,12 @@ describe('sweep duty registry (S2-PR2)', () => {
    * housekeeping phase, right after the App-token re-mint it depends on.
    * `cli-request-execution-prune` (tick:housekeeping, 42) is likewise later
    * work (issue #273's at-most-once ncl ledger). Both are tracked in
-   * SWEEP_DUTY_INVENTORY (as FORK1 and T23) alongside the 38 seam-2-ported
-   * duties, so the set below stays an exact accounting of every registered
-   * duty — ported or not.
+   * `coordination-orphans` (tick:housekeeping, 130) is the third, from seam 4
+   * series A' (issue #430): the coordination tables gained writers and a write
+   * that lands after session teardown leaves an orphan row behind. All three
+   * are tracked in SWEEP_DUTY_INVENTORY (as FORK1, T23 and FORK2) alongside
+   * the 38 seam-2-ported duties, so the set below stays an exact accounting of
+   * every registered duty — ported or not.
    */
   const EXPECTED_REGISTRATIONS: Array<[string, string, string, number]> = [
     ['duty', 'egress-network-reheal', 'tick:pre-session', 10],
@@ -1188,6 +1191,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     ['duty', 'claims-reconcile', 'tick:housekeeping', 100],
     ['duty', 'claims-self-heal', 'tick:housekeeping', 110],
     ['duty', 'dashboard-token-prune', 'tick:housekeeping', 120],
+    ['duty', 'coordination-orphans', 'tick:housekeeping', 130],
     ['sla-observation-hook', 'container-oom-notice', 'sla-observation-hook', 10],
     ['kill-follow-up', 'kill-ceiling-notice', 'kill-follow-up', 10],
     ['kill-follow-up', 'orphan-claim-reset', 'kill-follow-up', 20],
@@ -1215,14 +1219,15 @@ describe('sweep duty registry (S2-PR2)', () => {
     // Surface, name, phase AND order, in run order — a swap anywhere fails.
     expect(actual).toEqual(EXPECTED_REGISTRATIONS);
 
-    // 41 registrations: the 39 from the seam-2 port (38 unique names, one
-    // registered twice — see below) plus two fork additions,
-    // github-token-file-refresh and cli-request-execution-prune.
-    expect(actual).toHaveLength(41);
+    // 42 registrations: the 39 from the seam-2 port (38 unique names, one
+    // registered twice — see below) plus three fork additions,
+    // github-token-file-refresh, cli-request-execution-prune and
+    // coordination-orphans (seam 4 series A', issue #430).
+    expect(actual).toHaveLength(42);
     const names = new Set(actual.map((r) => r[1]));
-    expect(names.size).toBe(40);
+    expect(names.size).toBe(41);
     expect(names).toEqual(new Set(Object.values(SWEEP_DUTY_INVENTORY)));
-    expect(Object.keys(SWEEP_DUTY_INVENTORY)).toHaveLength(40);
+    expect(Object.keys(SWEEP_DUTY_INVENTORY)).toHaveLength(41);
     // The one duty registered twice is the orphan-claim reset: once in the tail
     // window, once as the post-kill follow-up (rev-3 grounding §2, S17).
     expect(actual.filter((r) => r[1] === SWEEP_DUTY_INVENTORY.S17)).toHaveLength(2);
@@ -1492,20 +1497,21 @@ describe('sweep duty registry (S2-PR2)', () => {
     ];
 
     expect(actual).toEqual(EXPECTED_REGISTRATIONS);
-    // 41 registrations over 40 names. The seam-2 port is 38 duties in 39
+    // 42 registrations over 41 names. The seam-2 port is 38 duties in 39
     // registrations — S17 is the only one registered twice, once as a
-    // session:health duty and once as the post-kill follow-up — plus the two
+    // session:health duty and once as the post-kill follow-up — plus the three
     // fork duties the upstream seam does not have: T23
-    // `cli-request-execution-prune` (#285) and FORK1
-    // `github-token-file-refresh` (#247), both from `sweep-central`. The
-    // numbers here said 39/38/38 from before those two landed; the tuple
-    // comparison above was already right, which is why it never failed.
-    expect(actual).toHaveLength(41);
+    // `cli-request-execution-prune` (#285), FORK1
+    // `github-token-file-refresh` (#247) and FORK2 `coordination-orphans`
+    // (#430), all three from `sweep-central`. The numbers here said 39/38/38
+    // from before those landed; the tuple comparison above was already right,
+    // which is why it never failed.
+    expect(actual).toHaveLength(42);
     const names = new Set(actual.map((r) => r[1]));
-    expect(names.size).toBe(40);
+    expect(names.size).toBe(41);
     // The inventory comes from the same fresh instance, not this file's binding.
     expect(names).toEqual(new Set(Object.values(hs.SWEEP_DUTY_INVENTORY)));
-    expect(Object.keys(hs.SWEEP_DUTY_INVENTORY)).toHaveLength(40);
+    expect(Object.keys(hs.SWEEP_DUTY_INVENTORY)).toHaveLength(41);
     expect(actual.filter((r) => r[1] === hs.SWEEP_DUTY_INVENTORY.S17)).toHaveLength(2);
     expect(h.spawns).toEqual([]);
   });

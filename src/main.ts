@@ -12,7 +12,7 @@ import { activateAgentRunnerSource, pruneAgentRunnerSnapshots } from './agent-ru
 import { backfillContainerConfigs } from './backfill-container-configs.js';
 import { markDeployBootHealthy } from './deploy-crash-guard.js';
 import { formatBuildInfoLog, readBuildInfo } from './build-info.js';
-import { DATA_DIR, REPO_ROOT } from './config.js';
+import { DATA_DIR, HOST_LEASE_TTL_MS, REPO_ROOT } from './config.js';
 import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { shadowWrite } from './db/coordination.js';
@@ -151,13 +151,6 @@ import {
   createChannelDeliveryAdapter,
 } from './channels/channel-registry.js';
 import type Database from 'better-sqlite3';
-
-/**
- * Lease TTL handed to `startHostInstanceLease` and logged with the §6 evidence
- * line, so the value operators read is the value in force. 3× the 30 s renewal
- * interval, matching upstream's default (src/host-instance.ts).
- */
-const HOST_LEASE_TTL_MS = 90_000;
 
 export function runWorkgroupMemoryStartupGate(
   db: Database.Database,
