@@ -633,7 +633,7 @@ describe('git hooks scan the committing tree, not the main checkout', () => {
   it('.husky/pre-push passes --root for each pushed snapshot', () => {
     const script = fs.readFileSync(new URL('../.husky/pre-push', import.meta.url), 'utf8');
     expect(script).toMatch(/while read -r local_ref local_sha remote_ref remote_sha/);
-    expect(script).toMatch(/worktree add --detach --quiet "\$snapshot_root" "\$local_sha"/);
+    expect(script).toMatch(/worktree add --detach --quiet "\$snapshot_root" "\$1"/);
     expect(script).toMatch(/check:public-boundary\s+--\s+--root\s+"\$snapshot_root" --index/);
   });
 });

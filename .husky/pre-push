@@ -3,9 +3,25 @@
 set -e
 repo_root=$(dirname "$(cd "$(git rev-parse --git-common-dir)" && pwd)")
 worktree_root=$(git rev-parse --show-toplevel)
+git_local_env=$(git rev-parse --local-env-vars)
+unset $git_local_env
+remote_name=$1
+remote_url=$2
+zero_sha=0000000000000000000000000000000000000000
+refs_file=''
+seen_commits=''
+advertised_refs=''
+known_remote_tips=''
+commit_list=''
 snapshot_parent=''
 snapshot_root=''
 snapshot_node_modules_link=''
+
+remove_file() {
+  if [ -n "$1" ] && [ -e "$1" ] && ! rm -f "$1"; then
+    echo "pre-push: failed to remove temporary file" >&2
+  fi
+}
 
 cleanup() {
   status=$?
@@ -21,6 +37,11 @@ cleanup() {
   if [ -n "$snapshot_parent" ] && [ -d "$snapshot_parent" ] && ! rmdir "$snapshot_parent"; then
     echo "pre-push: failed to remove temporary snapshot directory" >&2
   fi
+  remove_file "$commit_list"
+  remove_file "$advertised_refs"
+  remove_file "$known_remote_tips"
+  remove_file "$seen_commits"
+  remove_file "$refs_file"
   exit "$status"
 }
 trap cleanup EXIT
@@ -28,13 +49,39 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-zero_sha=0000000000000000000000000000000000000000
+refs_file=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-refs.XXXXXX")
+seen_commits=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-seen.XXXXXX")
+cat > "$refs_file"
+
+needs_remote_tips=''
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ "$local_sha" = "$zero_sha" ] && continue
+  if [ "$remote_sha" = "$zero_sha" ] || ! git -C "$worktree_root" cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+    needs_remote_tips=1
+    break
+  fi
+done < "$refs_file"
 
+if [ -n "$needs_remote_tips" ]; then
+  advertised_refs=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-remote.XXXXXX")
+  known_remote_tips=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-known.XXXXXX")
+  if [ -z "$remote_url" ] || ! git -C "$worktree_root" ls-remote "$remote_url" > "$advertised_refs"; then
+    echo "pre-push: failed to list advertised refs for $remote_name" >&2
+    exit 1
+  fi
+  while read -r remote_tip remote_ref; do
+    if git -C "$worktree_root" cat-file -e "$remote_tip^{commit}" 2>/dev/null; then
+      printf '%s\n' "$remote_tip" >> "$known_remote_tips"
+    fi
+  done < "$advertised_refs"
+  remove_file "$advertised_refs"
+  advertised_refs=''
+fi
+
+snapshot_commit() {
   snapshot_parent=$(mktemp -d "${TMPDIR:-/tmp}/nanoclaw-pre-push.XXXXXX")
   snapshot_root="$snapshot_parent/tree"
-  git -C "$worktree_root" -c core.hooksPath=/dev/null worktree add --detach --quiet "$snapshot_root" "$local_sha" </dev/null
+  git -C "$worktree_root" -c core.hooksPath=/dev/null worktree add --detach --quiet "$snapshot_root" "$1" </dev/null
   if [ -e "$snapshot_root/node_modules" ] || [ -L "$snapshot_root/node_modules" ]; then
     echo "pre-push: snapshot unexpectedly contains node_modules" >&2
     exit 1
@@ -43,7 +90,11 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   snapshot_node_modules_link=1
 
   (cd "$repo_root" && pnpm run check:public-boundary -- --root "$snapshot_root" --index) </dev/null
-  (cd "$snapshot_root" && ionice -c3 nice -n 10 node_modules/.bin/eslint --quiet src/ scripts/) </dev/null
+  if command -v ionice >/dev/null 2>&1; then
+    (cd "$snapshot_root" && ionice -c3 nice -n 10 node_modules/.bin/eslint --quiet src/ scripts/) </dev/null
+  else
+    (cd "$snapshot_root" && nice -n 10 node_modules/.bin/eslint --quiet src/ scripts/) </dev/null
+  fi
 
   rm "$snapshot_root/node_modules"
   snapshot_node_modules_link=''
@@ -51,4 +102,39 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   rmdir "$snapshot_parent"
   snapshot_parent=''
   snapshot_root=''
-done
+}
+
+commits_for_ref() {
+  local_sha=$1
+  remote_sha=$2
+  commit_list=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-commits.XXXXXX")
+  if [ "$remote_sha" != "$zero_sha" ] && git -C "$worktree_root" cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+    git -C "$worktree_root" rev-list "$remote_sha..$local_sha" > "$commit_list"
+  else
+    set --
+    if [ -n "$known_remote_tips" ]; then
+      while read -r remote_tip; do
+        set -- "$@" "$remote_tip"
+      done < "$known_remote_tips"
+    fi
+    if [ "$#" -eq 0 ]; then
+      git -C "$worktree_root" rev-list "$local_sha" > "$commit_list"
+    else
+      git -C "$worktree_root" rev-list "$local_sha" --not "$@" > "$commit_list"
+    fi
+  fi
+  while read -r commit_sha; do
+    if grep -Fqx "$commit_sha" "$seen_commits"; then
+      continue
+    fi
+    printf '%s\n' "$commit_sha" >> "$seen_commits"
+    snapshot_commit "$commit_sha"
+  done < "$commit_list"
+  remove_file "$commit_list"
+  commit_list=''
+}
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "$zero_sha" ] && continue
+  commits_for_ref "$local_sha" "$remote_sha"
+done < "$refs_file"
