@@ -59,8 +59,11 @@ export async function dispatch(
       const fallback = lookup(shortened);
       if (fallback) {
         const tail = req.command.slice(shortened.length + 1); // full remainder = id, dashes intact
+        if (req.args.id !== undefined) {
+          return err(req.id, 'invalid-args', 'target is supplied both positionally and with --id');
+        }
         cmd = fallback;
-        req = { ...req, command: shortened, args: { ...req.args, id: req.args.id ?? tail } };
+        req = { ...req, command: shortened, args: { ...req.args, id: tail } };
         break;
       }
     }

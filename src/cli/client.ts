@@ -5,7 +5,7 @@
  * formats the response, exits non-zero on error.
  *
  * Usage:
- *   ncl <resource> <verb> [target] [--key value ...] [--json]
+ *   ncl <resource> <verb> [target] [--key value ...] [--stdin-json] [--json]
  *
  * Examples:
  *   ncl groups list
@@ -16,23 +16,57 @@
  *   ncl groups help
  */
 import { randomUUID } from 'crypto';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 import { formatResponse } from './format.js';
 import type { RequestFrame } from './frame.js';
+import { parseArgv } from './parse-argv.js';
 import { SocketTransport } from './socket-client.js';
+import { readStdinJsonArgs, StdinJsonInputError, type StdinJsonStream } from './stdin-json.js';
 import type { Transport } from './transport.js';
 import { formatTransportError } from './transport-errors.js';
 
-async function main(): Promise<void> {
-  const argv = process.argv.slice(2);
+async function readRequestArgs(
+  stdin: StdinJsonStream & { isTTY?: boolean },
+  args: Record<string, unknown>,
+  stdinJson: boolean,
+): Promise<Record<string, unknown>> {
+  if (!stdinJson) return args;
+  if (stdin.isTTY) {
+    throw new StdinJsonInputError('--stdin-json requires piped stdin (e.g. `echo {...} | ncl ...`)');
+  }
+  return readStdinJsonArgs(stdin, args);
+}
+
+export async function main(
+  argv = process.argv.slice(2),
+  stdin: StdinJsonStream & { isTTY?: boolean } = process.stdin,
+): Promise<void> {
 
   if (argv.length === 0 || argv[0] === '--help' || argv[0] === '-h') {
     printUsage();
     process.exit(0);
   }
 
-  const { command, args, json } = parseArgv(argv);
-  const req: RequestFrame = { id: randomUUID(), command, args };
+  const { command, args, json, stdinJson } = parseArgv(argv);
+  if (command.length === 0) {
+    process.stderr.write('ncl: missing command\n');
+    printUsage();
+    process.exit(2);
+  }
+
+  let requestArgs: Record<string, unknown>;
+  try {
+    requestArgs = await readRequestArgs(stdin, args, stdinJson);
+  } catch (err) {
+    if (!(err instanceof StdinJsonInputError)) throw err;
+    process.stderr.write(`ncl: ${err.message}\n`);
+    process.exit(2);
+  }
+  // Stdin is only a client-side encoding for args. The daemon receives the
+  // same stable request frame it would receive if every value came from argv.
+  const req: RequestFrame = { id: randomUUID(), command, args: requestArgs };
   const transport: Transport = pickTransport();
 
   let res;
@@ -57,54 +91,12 @@ function pickTransport(): Transport {
   return new SocketTransport();
 }
 
-function parseArgv(argv: string[]): {
-  command: string;
-  args: Record<string, unknown>;
-  json: boolean;
-} {
-  const positional: string[] = [];
-  const args: Record<string, unknown> = {};
-  let json = false;
-
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a === '--json') {
-      json = true;
-      continue;
-    }
-    if (a.startsWith('--')) {
-      const key = a.slice(2);
-      const next = argv[i + 1];
-      if (next === undefined || next.startsWith('--')) {
-        args[key] = true;
-      } else {
-        args[key] = next;
-        i++;
-      }
-      continue;
-    }
-    positional.push(a);
-  }
-
-  if (positional.length === 0) {
-    process.stderr.write('ncl: missing command\n');
-    printUsage();
-    process.exit(2);
-  }
-
-  // Join all positionals with dashes to form the command name.
-  // If the full name isn't a command, the dispatcher will try trimming
-  // the last segment and using it as the target ID (e.g. `groups get abc`
-  // → command "groups-get", id "abc").
-  const command = positional.join('-');
-
-  return { command, args, json };
-}
-
 function printUsage(): void {
   process.stdout.write(
     [
-      'Usage: ncl <resource> <verb> [target] [--key value ...] [--json]',
+      'Usage: ncl <resource> <verb> [target] [--key value ...] [--stdin-json] [--json]',
+      '',
+      '  --stdin-json  Read one bounded JSON object from stdin and merge it with argv flags.',
       '',
       'Run `ncl help` to list available resources and commands.',
       '',
@@ -112,7 +104,18 @@ function printUsage(): void {
   );
 }
 
-main().catch((err) => {
-  process.stderr.write(`ncl: unexpected error: ${err instanceof Error ? err.message : String(err)}\n`);
-  process.exit(2);
-});
+function isCliEntryPoint(): boolean {
+  if (!process.argv[1]) return false;
+  try {
+    return fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+  } catch {
+    return false;
+  }
+}
+
+if (isCliEntryPoint()) {
+  main().catch((err) => {
+    process.stderr.write(`ncl: unexpected error: ${err instanceof Error ? err.message : String(err)}\n`);
+    process.exit(2);
+  });
+}

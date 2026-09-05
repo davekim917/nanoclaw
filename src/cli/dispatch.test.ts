@@ -798,10 +798,19 @@ describe('positional dashed-id resolution', () => {
     if (resp.ok) expect(resp.data).toEqual({ echo: {} });
   });
 
-  it('does not override an explicit --id', async () => {
-    const resp = await dispatch({ id: '4', command: 'groups-test-tail', args: { id: 'explicit' } }, host);
+  it('accepts an explicit id with an exact nested command', async () => {
+    const resp = await dispatch({ id: '5', command: 'groups-cfg-get', args: { id: 'target-a' } }, host);
     expect(resp.ok).toBe(true);
-    if (resp.ok) expect(resp.data).toEqual({ echo: { id: 'explicit' } });
+    if (resp.ok) expect(resp.data).toEqual({ echo: { id: 'target-a' } });
+  });
+
+  it.each(['explicit', 'tail', null])('rejects an explicit id %j alongside a positional target', async (id) => {
+    const resp = await dispatch({ id: '4', command: 'groups-test-tail', args: { id } }, host);
+    expect(resp).toEqual({
+      id: '4',
+      ok: false,
+      error: { code: 'invalid-args', message: 'target is supplied both positionally and with --id' },
+    });
   });
 });
 
