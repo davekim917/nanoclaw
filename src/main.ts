@@ -30,7 +30,7 @@ import { ensureContainerRuntimeRunning } from './container-runtime.js';
 import { warnActiveContainersOfShutdown, warnMarkedRunningSessionsOfStartup } from './host-restart-warn.js';
 import { getActiveSessions, resetPhantomContainerStatus } from './db/sessions.js';
 import { resetProcessingChannelIngress } from './db/channel-ingress-receipts.js';
-import { getActiveContainerSessionIds, stopAllContainers } from './container-runner.js';
+import { getActiveContainerSessionIds, honorPendingStopIntents, stopAllContainers } from './container-runner.js';
 import { quiesceWorkgroupsForBootMountChange, type BootQuiescenceScope } from './container-restart.js';
 import { writeUpstreamPolicySnapshot } from './container-updates.js';
 import { setDeliveryAdapter, startActiveDeliveryPoll, startSweepDeliveryPoll, stopDeliveryPolls } from './delivery.js';
@@ -543,6 +543,18 @@ export async function main(): Promise<void> {
     log.error('Pending pre-turn context reconciliation failed at startup', { err: pendingErr });
     process.exit(1);
   }
+
+  // Re-issue any restart that a previous host ordered but did not live to
+  // finish. `respawn_after_stop` is the durable half of a kill whose respawn
+  // was only ever a process-memory callback, so this is where "rebuild applied"
+  // with nothing coming back gets recovered.
+  //
+  // E integration (seam4/e-adoption): `adoptRunningSessions()` lands
+  // IMMEDIATELY ABOVE this call. The order is required, not incidental — a
+  // survivor has to be registered and claim-fenced before an intent against it
+  // is acted on, and a session still awaiting its fence is skipped here rather
+  // than killed at the wrong incarnation.
+  await honorPendingStopIntents();
 
   // Incident 2026-09-01: a failed repository publication left 1401 session
   // inbound DBs fenced with no publication left to release them, and the

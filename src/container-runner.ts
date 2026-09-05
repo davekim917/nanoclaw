@@ -81,10 +81,13 @@ import { getRawDb, hasTableRaw } from './db/connection.js';
 import {
   getLiveHostInstance,
   getSessionClaim,
+  listSessionsWithStopIntent,
   releaseSessionClaim,
   renewHostInstanceLease,
+  setStopIntent,
   shadowWrite,
   tryClaimSession,
+  type SessionClaimRow,
 } from './db/coordination.js';
 import { getHostInstanceId, startHostInstanceLease } from './host-instance.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
@@ -206,8 +209,43 @@ const activeContainers = new Map<
     storageActivity: StorageActivityLease;
     /** Incarnation this process claimed in `session_claims` for this runtime. */
     claimIncarnation?: number;
+    /**
+     * True for a container this host ADOPTED rather than spawned.
+     *
+     * E integration (seam4/e-adoption): series E introduces the supervision
+     * union and sets this at adoption; its declaration subsumes this one at
+     * the merge. Series F only reads it, through `isAdoptedContainer`.
+     */
+    adopted?: boolean;
   }
 >();
+
+/**
+ * Sessions whose surviving container could not be claim-fenced at adoption.
+ *
+ * E integration (seam4/e-adoption): `adoptRunningSessions` populates and drains
+ * this set, and `wakeContainer` routes a hit to `retryPendingAdoption` instead
+ * of spawning a duplicate. Series F only READS it, in `honorPendingStopIntents`
+ * — a container that is alive but not yet fenced must not have a stop intent
+ * acted on, because the kill could land on the wrong incarnation.
+ */
+const pendingAdoptions = new Set<string>();
+
+export function _resetAdoptionRetryStateForTesting(): void {
+  pendingAdoptions.clear();
+}
+
+/**
+ * Test-only: stand in for an adoption that failed its claim write.
+ *
+ * Series F ships the READER of `pendingAdoptions` before series E ships the
+ * writer, so its deferral case has no other way to reach that state. Delete
+ * this alongside E's merge if `adoptRunningSessions` gives the suite a real
+ * route into it.
+ */
+export function _markPendingAdoptionForTesting(sessionId: string): void {
+  pendingAdoptions.add(sessionId);
+}
 
 /**
  * The claimant id for `session_claims`, or null when this process has none.
@@ -399,6 +437,22 @@ export function _resetEverSeenRunningForTest(): void {
  */
 export function getContainerSpawnedAt(sessionId: string): number {
   return activeContainers.get(sessionId)?.spawnedAt ?? 0;
+}
+
+/**
+ * Was this session's container ADOPTED from a previous host, rather than
+ * spawned by this one?
+ *
+ * The sweep's ceiling check asks, because `spawnedAt` means something different
+ * for the two. For a spawned container it is the moment the process started, so
+ * a heartbeat older than it belongs to a PRIOR container and the fresh one
+ * deserves its spawn grace. For an adopted container it is merely the adoption
+ * instant, and the heartbeat older than it is the container's OWN — so the same
+ * predicate would hand a wedged survivor a free grace window on every host
+ * restart (plan §3.5 divergence 11).
+ */
+export function isAdoptedContainer(sessionId: string): boolean {
+  return activeContainers.get(sessionId)?.adopted === true;
 }
 
 /**
@@ -1697,13 +1751,42 @@ function stopRunningContainer(sessionId: string, reason: string, onExit: Contain
 export function killContainer(sessionId: string, reason: string, onExit?: ContainerExitCallback): void {
   if (!activeContainers.has(sessionId)) {
     if (!isContainerSpawning(sessionId)) return;
+    recordStopIntent(sessionId, onExit);
     const pending = pendingKills.get(sessionId) ?? { reason, onExit: [] };
     if (onExit) pending.onExit.push(onExit);
     pendingKills.set(sessionId, pending);
     log.info('Container kill deferred — a wake is in flight for this session', { sessionId, reason });
     return;
   }
+  recordStopIntent(sessionId, onExit);
   stopRunningContainer(sessionId, reason, onExit ? [onExit] : []);
+}
+
+/**
+ * Record the DURABLE half of a stop request, so a host that dies mid-restart
+ * does not forget it.
+ *
+ * A kill-with-respawn lives in an `onExit` callback, which is process memory: a
+ * host that went down between the kill and the callback firing forgot the
+ * restart entirely, and the operator saw "rebuild applied" with nothing coming
+ * back. `honorPendingStopIntents()` consumes the row at the next startup.
+ *
+ * `onExit` is the whole signal. A caller that supplied one wants the session
+ * back — that is what `respawn_after_stop` means — and a caller that did not
+ * wants it down. Putting the write HERE rather than at each caller is the
+ * point: `killContainer` is the single door every stop goes through, so no
+ * caller can forget to arm the recovery.
+ *
+ * Not awaited, because `killContainer` is synchronous and every one of its
+ * callers depends on that. `shadowWrite` already swallows its own failures, so
+ * the only thing an await would buy is ordering against the stop — and a stop
+ * intent that lost its race with a host crash is exactly as recoverable as one
+ * that was never written.
+ */
+function recordStopIntent(sessionId: string, onExit?: ContainerExitCallback): void {
+  void shadowWrite('stop-intent', () =>
+    setStopIntent(sessionId, onExit ? 'respawn_after_stop' : 'stop', new Date().toISOString()),
+  );
 }
 
 /**
@@ -1738,6 +1821,70 @@ export async function reconcileSurvivorWakeRows(session: Session): Promise<{ con
     return { converted: 0, withdrawn: 0 };
   }
   /* eslint-enable no-catch-all/no-catch-all */
+}
+
+/**
+ * Honor stop intents that outlived their process.
+ *
+ * A kill-with-respawn used to live only in a volatile `onExit` callback: a host
+ * dying between the kill and the respawn forgot the restart entirely. The
+ * durable `respawn_after_stop` row is consumed here at startup — a session
+ * whose container is still up gets its kill re-issued with the respawn
+ * re-armed; one without a container gets the respawn directly. The intent
+ * clears only once the respawn wake actually succeeds, so a failed wake is
+ * retried at the next startup while the sweep retries it sooner.
+ *
+ * A plain `'stop'` intent is left where it is. The container is already down
+ * and nothing is owed; the row is one upsert per session of inert shadow state,
+ * and clearing it here would cost a write per boot to no end.
+ *
+ * `wake` and `hasContainer` are injected with their production defaults. The
+ * second exists because the branch it selects is the one an interrupted restart
+ * takes, and a unit test cannot put a container into the registry without a
+ * container runtime; both are `activeContainers` reads in production.
+ */
+export async function honorPendingStopIntents(
+  wake: (session: Session) => Promise<boolean> = wakeContainer,
+  hasContainer: (sessionId: string) => boolean = isContainerRunning,
+): Promise<void> {
+  let intents: SessionClaimRow[];
+  /* eslint-disable no-catch-all/no-catch-all -- an unreadable coordination table must not block startup */
+  try {
+    intents = await listSessionsWithStopIntent();
+  } catch (err) {
+    log.warn('Failed to read pending stop intents', { err });
+    return;
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+  for (const intent of intents) {
+    if (intent.stop_intent !== 'respawn_after_stop') continue;
+    if (pendingAdoptions.has(intent.session_id)) {
+      // The session's container is alive but not yet re-fenced; acting on the
+      // intent now could kill or respawn the wrong incarnation. The row stays
+      // for the next recovery pass.
+      log.warn('Deferring stop intent — session awaits claim-fenced adoption', { sessionId: intent.session_id });
+      continue;
+    }
+    const session = await getSession(intent.session_id);
+    if (!session || session.status !== 'active') {
+      await shadowWrite('stop-intent-clear', () => setStopIntent(intent.session_id, null, new Date().toISOString()));
+      continue;
+    }
+    const respawn = async (): Promise<void> => {
+      const woke = await wake(session);
+      if (woke) {
+        await shadowWrite('stop-intent-clear', () => setStopIntent(session.id, null, new Date().toISOString()));
+      }
+    };
+    if (hasContainer(session.id)) {
+      // The kill never completed — the container outlived the host that
+      // ordered it. Re-issue the kill with the respawn re-armed.
+      log.info('Re-issuing interrupted restart', { sessionId: session.id });
+      killContainer(session.id, 'restart-intent-recovery', () => void respawn());
+    } else {
+      await respawn();
+    }
+  }
 }
 
 /**

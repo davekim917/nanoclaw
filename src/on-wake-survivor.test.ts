@@ -182,7 +182,7 @@ describe('reconcileSurvivorWakeRows — the op', () => {
       platformId: AGENT_GROUP_ID,
       channelType: 'agent',
       threadId: null,
-      content: JSON.stringify({ text: 'hello', sender: 'dave', senderId: 'u1' }),
+      content: JSON.stringify({ text: 'a later message', sender: 'system', senderId: 'system' }),
       processAfter: null,
       recurrence: null,
     });
