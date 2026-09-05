@@ -664,7 +664,7 @@
 "src/cli/resources/index.ts":{"diff":3,"mode":"100644","sha256":"47688f4781501cea96643c31fa84adf1f10edb5aef8501e7a07aea5f76dccb9e"},
 "src/cli/resources/members.ts":{"diff":5,"mode":"100644","sha256":"c84a6f306bcdaa3ed13a4be9e186c5707e9549a0f9a5dcf6502663fab7e3c0e4"},
 "src/cli/resources/messaging-groups.test.ts":{"diff":342,"mode":"100644","sha256":"a7252bf26a3b2a60060ab1f1d50022f256cdf2a485dcc6e92610686f17162564"},
-"src/cli/resources/messaging-groups.ts":{"diff":86,"mode":"100644","sha256":"30828d3dde89085e8255c552e69249decbf0a4a5fccf56c04a154608a20b8a9a"},
+"src/cli/resources/messaging-groups.ts":{"diff":86,"mode":"100644","sha256":"54f994d04ee130238acbcc88bd388925b99a46dc48eb3476fe270df8f6421238"},
 "src/cli/resources/policies.ts":{"diff":4,"mode":"100644","sha256":"d3eeec9ff1941fb2b0492c3a605283fd05e6c3fe420715079703fc519e769ff4"},
 "src/cli/resources/programmatic-wiring.test.ts":{"diff":113,"mode":"100644","sha256":"6b74c87eda10d260339cb207ce235c4a0c95c613d6f9ee5e7f5ca14cb9db0785"},
 "src/cli/resources/roles.ts":{"diff":7,"mode":"100644","sha256":"6b98d0aeb0ed0405ae2c109806ac06a42852e7d3890bf70d34927636a7bf7a5f"},
