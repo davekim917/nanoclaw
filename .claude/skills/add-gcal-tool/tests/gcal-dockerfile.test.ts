@@ -9,12 +9,23 @@
  */
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
 import { describe, it, expect } from 'vitest';
 
+const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
+
 function dockerfile(): string {
-  const p = path.resolve(process.cwd(), 'container/Dockerfile');
-  return fs.readFileSync(p, 'utf8');
+  const skill = path.join(TEST_DIR, '..', 'SKILL.md');
+  if (fs.existsSync(skill)) {
+    const instructions = fs.readFileSync(skill, 'utf8');
+    const snippets = [...instructions.matchAll(/```dockerfile\n([\s\S]*?)```/g)]
+      .map((match) => match[1])
+      .filter((snippet) => snippet.includes('CALENDAR_MCP_VERSION'));
+    if (snippets.length === 0) throw new Error('Calendar Dockerfile instructions not found in SKILL.md');
+    return snippets.join('\n');
+  }
+  return fs.readFileSync(path.resolve(process.cwd(), 'container/Dockerfile'), 'utf8');
 }
 
 describe('container/Dockerfile installs @cocal/google-calendar-mcp', () => {

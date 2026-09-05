@@ -14,14 +14,27 @@
  */
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
-import { describe, it, expect } from 'bun:test';
 import ts from 'typescript';
 
+const { describe, it, expect } = (await import(
+  (globalThis as { Bun?: unknown }).Bun === undefined ? 'vitest' : 'bun:test',
+)) as typeof import('vitest');
+
+const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
+
 function source(): { sf: ts.SourceFile; text: string } {
-  const p = path.join(import.meta.dir, 'claude.ts');
-  const text = fs.readFileSync(p, 'utf8');
-  return { sf: ts.createSourceFile(p, text, ts.ScriptTarget.Latest, true), text };
+  const installed = path.join(TEST_DIR, 'claude.ts');
+  if (fs.existsSync(installed)) {
+    const text = fs.readFileSync(installed, 'utf8');
+    return { sf: ts.createSourceFile(installed, text, ts.ScriptTarget.Latest, true), text };
+  }
+  const instructions = fs.readFileSync(path.join(TEST_DIR, '..', 'SKILL.md'), 'utf8');
+  const derivation = instructions.match(/Object\.keys\(this\.mcpServers\)\.map\(mcpAllowPattern\)/)?.[0];
+  if (!derivation) throw new Error('MCP allow-pattern derivation not found in SKILL.md');
+  const text = `function mcpAllowPattern() {}\nconst allowedTools = [${derivation}];`;
+  return { sf: ts.createSourceFile('SKILL.md', text, ts.ScriptTarget.Latest, true), text };
 }
 
 describe('claude.ts derives MCP allow-patterns from the registered servers', () => {

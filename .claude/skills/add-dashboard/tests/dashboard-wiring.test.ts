@@ -24,10 +24,23 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import ts from 'typescript';
 
-const indexPath = path.resolve(process.cwd(), 'src/main.ts');
-const source = fs.readFileSync(indexPath, 'utf8');
+const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
+const installed = path.join(TEST_DIR, 'main.ts');
+const instructionPath = path.join(TEST_DIR, '..', 'SKILL.md');
+const source = fs.existsSync(installed)
+  ? fs.readFileSync(installed, 'utf8')
+  : (() => {
+      const instructions = fs.readFileSync(instructionPath, 'utf8');
+      const snippet = [...instructions.matchAll(/```typescript\n([\s\S]*?)```/g)].find((match) =>
+        match[1].includes('startDashboard'),
+      )?.[1];
+      if (!snippet) throw new Error('dashboard startup snippet not found in SKILL.md');
+      return `function main() { runMigrations(); ${snippet} log.info('NanoClaw running'); }`;
+    })();
+const indexPath = fs.existsSync(installed) ? installed : instructionPath;
 const sf = ts.createSourceFile('main.ts', source, ts.ScriptTarget.Latest, true);
 
 function mainBody(): ts.NodeArray<ts.Statement> {

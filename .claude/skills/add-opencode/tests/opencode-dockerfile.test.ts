@@ -18,19 +18,31 @@
  */
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
 import { describe, it, expect } from 'vitest';
 
+const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
+
 function dockerfile(): string {
-  // Walk up from this test file to the repo root (the dir holding container/Dockerfile),
-  // so the test works wherever it is copied (src/ on the host, or the skill folder).
-  let dir = __dirname;
+  const skill = path.join(TEST_DIR, '..', 'SKILL.md');
+  if (fs.existsSync(skill)) {
+    const instructions = fs.readFileSync(skill, 'utf8');
+    const snippets = [...instructions.matchAll(/```dockerfile\n([\s\S]*?)```/g)]
+      .map((match) => match[1])
+      .filter((snippet) => snippet.includes('OPENCODE_VERSION'));
+    if (snippets.length === 0) throw new Error('OpenCode Dockerfile instructions not found in SKILL.md');
+    return snippets.join('\n');
+  }
+
+  // The provider's installed test runs from the composed project.
+  let dir = TEST_DIR;
   for (let i = 0; i < 8; i++) {
     const candidate = path.join(dir, 'container', 'Dockerfile');
     if (fs.existsSync(candidate)) return fs.readFileSync(candidate, 'utf8');
     dir = path.dirname(dir);
   }
-  throw new Error('container/Dockerfile not found walking up from ' + __dirname);
+  throw new Error('container/Dockerfile not found walking up from ' + TEST_DIR);
 }
 
 describe('container/Dockerfile installs the OpenCode CLI', () => {
@@ -43,6 +55,6 @@ describe('container/Dockerfile installs the OpenCode CLI', () => {
   });
 
   it('globally installs the pinned opencode-ai package via pnpm', () => {
-    expect(text).toMatch(/pnpm install -g\s+"?opencode-ai@\$\{OPENCODE_VERSION\}"?/);
+    expect(text).toMatch(/pnpm\s+install\s+-g[\s\S]*?"?opencode-ai@\$\{OPENCODE_VERSION\}"?/);
   });
 });

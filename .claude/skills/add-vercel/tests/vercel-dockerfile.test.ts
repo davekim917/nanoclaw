@@ -12,19 +12,30 @@
  */
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
 import { describe, it, expect } from 'vitest';
 
+const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
+
 function dockerfile(): string {
-  // Walk up from this test file to the repo root (the dir holding container/Dockerfile),
-  // so the test works wherever it is copied (src/ on the host, or the skill folder).
-  let dir = __dirname;
+  const skill = path.join(TEST_DIR, '..', 'SKILL.md');
+  if (fs.existsSync(skill)) {
+    const instructions = fs.readFileSync(skill, 'utf8');
+    const arg = instructions.match(/ARG VERCEL_VERSION=\d+\.\d+\.\d+/)?.[0];
+    const install = instructions.match(/pnpm install -g "?vercel@\$\{VERCEL_VERSION\}"?/)?.[0];
+    if (!arg || !install) throw new Error('Vercel Dockerfile instructions not found in SKILL.md');
+    return `${arg}\nRUN ${install}`;
+  }
+
+  // Installed under src/: walk to the composed project's Dockerfile.
+  let dir = TEST_DIR;
   for (let i = 0; i < 8; i++) {
     const candidate = path.join(dir, 'container', 'Dockerfile');
     if (fs.existsSync(candidate)) return fs.readFileSync(candidate, 'utf8');
     dir = path.dirname(dir);
   }
-  throw new Error('container/Dockerfile not found walking up from ' + __dirname);
+  throw new Error('container/Dockerfile not found walking up from ' + TEST_DIR);
 }
 
 describe('container/Dockerfile installs the Vercel CLI', () => {

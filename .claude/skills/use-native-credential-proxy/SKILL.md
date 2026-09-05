@@ -42,8 +42,8 @@ This should print the `TZ` env line inside `buildContainerArgs`. If it does not,
 ```bash
 S=.claude/skills/use-native-credential-proxy
 cp $S/native-credential-proxy.ts              src/native-credential-proxy.ts
-cp $S/native-credential-proxy.test.ts         src/native-credential-proxy.test.ts
-cp $S/native-credential-proxy-wiring.test.ts  src/native-credential-proxy-wiring.test.ts
+cp $S/tests/native-credential-proxy.test.ts         src/native-credential-proxy.test.ts
+cp $S/tests/native-credential-proxy-wiring.test.ts  src/native-credential-proxy-wiring.test.ts
 ```
 
 `native-credential-proxy.test.ts` is the behavior test (it drives `nativeCredentialEnvArgs()` against a real `.env` read through core's `readEnvFile`). `native-credential-proxy-wiring.test.ts` asserts the one-line reach-in is present in `buildContainerArgs`.

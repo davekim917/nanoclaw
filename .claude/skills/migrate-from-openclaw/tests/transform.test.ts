@@ -27,12 +27,14 @@ import {
   resolveSecretInput,
   vaultCreateCommand,
   type OpenClawSchedule,
-} from './transform.js';
+} from '../scripts/transform.js';
 
 // The same cron-parser call the host recurrence sweep makes, used as the
 // injected `computeNextCron` so the mapping test mirrors production behavior.
 function computeNextCron(expr: string, tz?: string): string {
-  return CronExpressionParser.parse(expr, { tz: tz ?? 'UTC' }).next().toISOString();
+  return CronExpressionParser.parse(expr, { tz: tz ?? 'UTC' })
+    .next()
+    .toISOString();
 }
 
 describe('resolveSecretInput', () => {

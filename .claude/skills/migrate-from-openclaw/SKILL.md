@@ -24,9 +24,8 @@ This skill drives existing NanoClaw entry points (`setup/index.ts --step
 register`, `scripts/init-first-agent.ts`, the `onecli` CLI), preserves imported
 user data, and copies selected OpenClaw skills. It makes no code-level reach-in
 into core. Its integration assumptions about v2 are guarded by
-`scripts/transform.test.ts`, which is copied into the project's `scripts/` test
-tree on apply (Phase 8) so vitest runs it against the composed install. The
-transform module and test are the only shared code files this skill installs;
+`tests/transform.test.ts`, which runs in place against the canonical transform
+module (Phase 8). The transform module is the only shared code file this skill installs;
 `REMOVE.md` reverses those files, never migrated user data or permanent
 snapshots.
 
@@ -585,17 +584,14 @@ Tell the user which agents are live now and which await channel installation
 
 ### Run the shipped test
 
-Copy the transform module and its test into the project so vitest runs them
-against the composed install, then build and test:
+Copy the transform module into the project, then build and run the canonical
+test in place:
 
 ```bash
 cp ${CLAUDE_SKILL_DIR}/scripts/transform.ts        scripts/openclaw-transform.ts
-cp ${CLAUDE_SKILL_DIR}/scripts/transform.test.ts   scripts/openclaw-transform.test.ts
-# Point the copied test at the copied module name:
-sed -i.bak "s#from './transform.js'#from './openclaw-transform.js'#" scripts/openclaw-transform.test.ts && rm -f scripts/openclaw-transform.test.ts.bak
 
 pnpm run build
-pnpm exec vitest run scripts/openclaw-transform.test.ts
+pnpm exec vitest run --config vitest.skills.config.ts .claude/skills/migrate-from-openclaw/tests/transform.test.ts
 ```
 
 The test guards the skill's two v2 integration assumptions: credential routing

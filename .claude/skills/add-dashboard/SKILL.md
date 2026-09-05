@@ -34,8 +34,8 @@ Copy all three resource files into `src/`. The tests ship with the skill and run
 
 ```
 .claude/skills/add-dashboard/resources/dashboard-pusher.ts       → src/dashboard-pusher.ts
-.claude/skills/add-dashboard/resources/dashboard-pusher.test.ts  → src/dashboard-pusher.test.ts
-.claude/skills/add-dashboard/resources/dashboard-wiring.test.ts  → src/dashboard-wiring.test.ts
+.claude/skills/add-dashboard/tests/dashboard-pusher.test.ts      → src/dashboard-pusher.test.ts
+.claude/skills/add-dashboard/tests/dashboard-wiring.test.ts      → src/dashboard-wiring.test.ts
 ```
 
 - `dashboard-pusher.test.ts` — behavior: starts the pusher, posts a real snapshot to a fake dashboard.

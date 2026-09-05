@@ -14,22 +14,30 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { fileURLToPath, pathToFileURL } from 'url';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import {
+const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
+const installedSource = path.join(TEST_DIR, 'native-credential-proxy.ts');
+const sourcePath = fs.existsSync(installedSource)
+  ? installedSource
+  : path.join(TEST_DIR, '..', 'native-credential-proxy.ts');
+const {
   NATIVE_CREDENTIALS_FLAG,
   NATIVE_CREDENTIAL_VARS,
   nativeCredentialEnvArgs,
   nativeCredentialsEnabled,
-} from './native-credential-proxy.js';
+} = await import(pathToFileURL(sourcePath).href);
 
 const SAVED_CWD = process.cwd();
 const SAVED_ENV: Record<string, string | undefined> = {};
+const TEMP_DIRS: string[] = [];
 
 function writeEnv(contents: string): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'native-cred-'));
   fs.writeFileSync(path.join(dir, '.env'), contents, 'utf8');
+  TEMP_DIRS.push(dir);
   return dir;
 }
 
@@ -46,6 +54,7 @@ afterEach(() => {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
+  for (const dir of TEMP_DIRS.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
 describe('native-credential-proxy', () => {

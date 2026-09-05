@@ -60,10 +60,10 @@ files go into both, alongside the integration points they cover.
 S=.claude/skills/add-ollama-tool
 # Container (Bun) tree — the MCP server and the registration wiring test
 cp $S/ollama-mcp-stdio.ts       container/agent-runner/src/ollama-mcp-stdio.ts
-cp $S/ollama-registration.test.ts container/agent-runner/src/ollama-registration.test.ts
+cp $S/tests/ollama-registration.test.ts container/agent-runner/src/ollama-registration.test.ts
 # Host (Node) tree — the env-forwarding helper and the wiring test
 cp $S/ollama-env.ts             src/ollama-env.ts
-cp $S/ollama-wiring.test.ts     src/ollama-wiring.test.ts
+cp $S/tests/ollama-wiring.test.ts     src/ollama-wiring.test.ts
 ```
 
 ### Register the MCP server in the agent-runner

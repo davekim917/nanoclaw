@@ -9,13 +9,27 @@
  */
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
-import { describe, it, expect } from 'bun:test';
 import ts from 'typescript';
 
+const { describe, it, expect } = (await import(
+  (globalThis as { Bun?: unknown }).Bun === undefined ? 'vitest' : 'bun:test',
+)) as typeof import('vitest');
+
+const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
+
 function sourceFile(): ts.SourceFile {
-  const p = path.join(import.meta.dir, 'index.ts');
-  return ts.createSourceFile(p, fs.readFileSync(p, 'utf8'), ts.ScriptTarget.Latest, true);
+  const installed = path.join(TEST_DIR, 'index.ts');
+  if (fs.existsSync(installed)) {
+    return ts.createSourceFile(installed, fs.readFileSync(installed, 'utf8'), ts.ScriptTarget.Latest, true);
+  }
+  const skill = fs.readFileSync(path.join(TEST_DIR, '..', 'SKILL.md'), 'utf8');
+  const snippet = [...skill.matchAll(/```ts\n([\s\S]*?)```/g)].find((match) =>
+    match[1].includes('atomic_chat'),
+  )?.[1];
+  if (!snippet) throw new Error('atomic_chat registration snippet not found in SKILL.md');
+  return ts.createSourceFile('SKILL.md', snippet, ts.ScriptTarget.Latest, true);
 }
 
 /** Find the object literal assigned to `const mcpServers = { ... }`. */

@@ -22,22 +22,19 @@ import {
   normalizeInstance,
   parseArgs,
   tokenEnvKey,
-} from './open-a2a-room.js';
+} from '../scripts/open-a2a-room.js';
 
 const env = vi.hoisted(() => ({ values: {} as Record<string, string> }));
 
-vi.mock('../src/env.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../src/env.js')>()),
+vi.mock('../../../../src/env.js', () => ({
   readEnvFileMatching: () => env.values,
   readEnvFile: () => env.values,
 }));
 
-/** Load the real Slack adapter against a fake env; module-level registration
- *  means each arm needs a fresh graph. */
+/** Stub startup credentials; each parser invocation receives its fixture directly. */
 async function workspacesFor(values: Record<string, string>) {
-  vi.resetModules();
   env.values = values;
-  const slack = await import('../src/channels/slack.js');
+  const slack = await import('../../../../src/channels/slack.js');
   return slack.parseSlackWorkspaces(values);
 }
 

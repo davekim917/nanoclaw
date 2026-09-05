@@ -1,4 +1,5 @@
 import { defineConfig } from 'vitest/config';
+import skillsConfig from './vitest.skills.config.js';
 
 export default defineConfig({
   test: {
@@ -13,6 +14,7 @@ export default defineConfig({
       'scripts/**/*.test.ts',
       'tests/**/*.test.ts',
       'container/*.test.ts',
+      ...skillsConfig.test!.include!,
     ],
     // Run one test FILE at a time.
     //

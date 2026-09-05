@@ -122,7 +122,7 @@ If `PRESENT`, the CLI is already in the image — skip the rebuild.
 The Vercel CLI is a globally-installed binary — not importable or typed — so a structural test guards the Dockerfile install. Copy it into the host test tree and run it:
 
 ```bash
-cp .claude/skills/add-vercel/vercel-dockerfile.test.ts src/vercel-dockerfile.test.ts
+cp .claude/skills/add-vercel/tests/vercel-dockerfile.test.ts src/vercel-dockerfile.test.ts
 pnpm exec vitest run src/vercel-dockerfile.test.ts
 ```
 

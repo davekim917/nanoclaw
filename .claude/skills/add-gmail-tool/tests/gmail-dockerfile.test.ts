@@ -9,13 +9,26 @@
  */
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
-import { describe, it, expect } from 'bun:test';
+const { describe, it, expect } = (await import(
+  (globalThis as { Bun?: unknown }).Bun === undefined ? 'vitest' : 'bun:test',
+)) as typeof import('vitest');
+
+const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 function dockerfile(): string {
-  // container/agent-runner/src/providers/ -> ../../../Dockerfile == container/Dockerfile
-  const p = path.join(import.meta.dir, '..', '..', '..', 'Dockerfile');
-  return fs.readFileSync(p, 'utf8');
+  const skill = path.join(TEST_DIR, '..', 'SKILL.md');
+  if (fs.existsSync(skill)) {
+    const instructions = fs.readFileSync(skill, 'utf8');
+    const snippets = [...instructions.matchAll(/```dockerfile\n([\s\S]*?)```/g)]
+      .map((match) => match[1])
+      .filter((snippet) => snippet.includes('GMAIL_MCP_VERSION'));
+    if (snippets.length === 0) throw new Error('Gmail Dockerfile instructions not found in SKILL.md');
+    return snippets.join('\n');
+  }
+  // Installed under container/agent-runner/src/providers/: ../../../Dockerfile.
+  return fs.readFileSync(path.join(TEST_DIR, '..', '..', '..', 'Dockerfile'), 'utf8');
 }
 
 describe('container/Dockerfile installs the Gmail MCP server', () => {
