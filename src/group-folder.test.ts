@@ -66,6 +66,20 @@ describe('groupFolderExistsOnDisk', () => {
     expect(groupFolderExistsOnDisk('never-created')).toBe(false);
   });
 
+  it('a permission error from the probe is rethrown, not reported absent', () => {
+    fs.writeFileSync(path.join(GROUPS_TEST_DIR, 'residue-file'), '');
+    const spy = vi.spyOn(fs, 'lstatSync').mockImplementation(() => {
+      const err = new Error('EACCES: permission denied') as NodeJS.ErrnoException;
+      err.code = 'EACCES';
+      throw err;
+    });
+    try {
+      expect(() => groupFolderExistsOnDisk('residue-file')).toThrow(/EACCES/);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('throws when the name escapes the groups dir', () => {
     expect(() => groupFolderExistsOnDisk('../../etc')).toThrow(/escapes/);
   });

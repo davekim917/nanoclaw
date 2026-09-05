@@ -56,7 +56,15 @@ export function groupFolderExistsOnDisk(folder: string): boolean {
   try {
     fs.lstatSync(groupPath);
     return true;
-  } catch {
-    return false;
+  } catch (err) {
+    // ENOENT is a real "not there" answer. Anything else — EACCES, EIO, a
+    // broken GROUPS_DIR — means the probe itself failed, not that the name
+    // is free; reporting that as absent would let a caller allocate or
+    // adopt a name it never actually verified. ENOTDIR is deliberately NOT
+    // folded in here: it means a path component (potentially GROUPS_DIR
+    // itself) isn't a directory, which is an environment fault, not
+    // "folder absent" — fail closed on it too. Rethrow everything but ENOENT.
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw err;
   }
 }
