@@ -163,6 +163,7 @@ import { mergeWorkgroupAndGroupSecrets } from './onecli-secrets.js';
 import { getProviderContainerConfig } from './providers/provider-container-registry.js';
 import { log } from './log.js';
 import { closeDb, getRawDb, initTestDb } from './db/connection.js';
+import { withCentralSync } from './db/central-lease.js';
 import { runMigrations } from './db/index.js';
 import { allowSubprocess } from './test-hermeticity.js';
 import type { MemoryAdmissionResult } from './memory-admission.js';
@@ -1948,7 +1949,7 @@ describe('killContainer against a session that is still spawning', () => {
    * a thread the operator had been told was finished — and the archive-only
    * close is the ordinary case, not an edge one.
    */
-  it('refuses a session that is archived even though its status is still active', () => {
+  it('refuses a session that is archived even though its status is still active', async () => {
     seedSession('sess-archived');
     getRawDb()
       .prepare('UPDATE sessions SET archived_at = ? WHERE id = ?')
@@ -1961,12 +1962,15 @@ describe('killContainer against a session that is still spawning', () => {
         .status,
     ).toBe('active');
 
-    expect(sessionStillActive('sess-archived')()).toEqual({ ok: false, reason: 'session is archived' });
+    expect(await withCentralSync(() => sessionStillActive('sess-archived')(), 'test-guard')).toEqual({
+      ok: false,
+      reason: 'session is archived',
+    });
   });
 
-  it('admits a live session that has never been archived', () => {
+  it('admits a live session that has never been archived', async () => {
     seedSession('sess-live');
-    expect(sessionStillActive('sess-live')()).toBe(true);
+    expect(await withCentralSync(() => sessionStillActive('sess-live')(), 'test-guard')).toBe(true);
   });
 
   /**

@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { closeDb, getRawDb, initTestDb } from '../connection.js';
+import { withCentralSync } from '../central-lease.js';
 import { runMigrations } from './index.js';
 import { migration068 } from './068-sessions-sweep-quiet-until.js';
 import {
@@ -200,10 +201,14 @@ describe('the persisted quiet mark (S2-PR15)', () => {
     await persistQuietSessionMarks([{ sessionId: 's-1', quietUntil: FUTURE, lastActive: ACTIVE }]);
     let ran = false;
 
-    const out = withQuietInvalidationSync('s-1', () => {
-      ran = true;
-      return 'written';
-    });
+    // The invalidation is a raw central write (§4.5 I-1), so it runs inside
+    // the lease — the same wrapper every production caller takes.
+    const out = await withCentralSync(() =>
+      withQuietInvalidationSync('s-1', () => {
+        ran = true;
+        return 'written';
+      }),
+    );
 
     expect(out).toBe('written');
     expect(ran).toBe(true);
@@ -219,7 +224,7 @@ describe('the persisted quiet mark (S2-PR15)', () => {
     await createSession(session('s-1', null));
     const seen: string[] = [];
     for (let i = 0; i < 50; i++) {
-      withQuietInvalidationSync('s-1', () => undefined);
+      await withCentralSync(() => withQuietInvalidationSync('s-1', () => undefined));
       seen.push(lastActiveOf('s-1')!);
     }
     expect(new Set(seen).size, 'two invalidations published the same last_active').toBe(50);
@@ -236,7 +241,7 @@ describe('the persisted quiet mark (S2-PR15)', () => {
     // The sweep read `last_active` at the start of the tick: ACTIVE.
     const basis = lastActiveOf('s-1');
 
-    withQuietInvalidationSync('s-1', () => undefined);
+    await withCentralSync(() => withQuietInvalidationSync('s-1', () => undefined));
     // The flush lands afterwards, still carrying the basis it computed on.
     await persistQuietSessionMarks([{ sessionId: 's-1', quietUntil: FUTURE, lastActive: basis }]);
 
@@ -248,11 +253,13 @@ describe('the persisted quiet mark (S2-PR15)', () => {
     getRawDb().exec('DROP TABLE sessions');
     let ran = false;
 
-    expect(() =>
-      withQuietInvalidationSync('s-1', () => {
-        ran = true;
-      }),
-    ).toThrow(QuietInvalidationError);
+    await expect(
+      withCentralSync(() =>
+        withQuietInvalidationSync('s-1', () => {
+          ran = true;
+        }),
+      ),
+    ).rejects.toThrow(QuietInvalidationError);
     expect(ran, 'the write ran behind a mark that could not be cleared').toBe(false);
   });
 
@@ -267,9 +274,15 @@ describe('the persisted quiet mark (S2-PR15)', () => {
     getRawDb().prepare('DELETE FROM sessions WHERE id = ?').run('s-gone');
     const ran: string[] = [];
 
-    expect(() => withQuietInvalidationSync('s-gone', () => ran.push('gone'))).toThrow(QuietInvalidationError);
-    expect(() => withQuietInvalidationSync('s-closed', () => ran.push('closed'))).toThrow(QuietInvalidationError);
-    expect(() => withQuietInvalidationSync('s-never-existed', () => ran.push('never'))).toThrow(QuietInvalidationError);
+    await expect(withCentralSync(() => withQuietInvalidationSync('s-gone', () => ran.push('gone')))).rejects.toThrow(
+      QuietInvalidationError,
+    );
+    await expect(
+      withCentralSync(() => withQuietInvalidationSync('s-closed', () => ran.push('closed'))),
+    ).rejects.toThrow(QuietInvalidationError);
+    await expect(
+      withCentralSync(() => withQuietInvalidationSync('s-never-existed', () => ran.push('never'))),
+    ).rejects.toThrow(QuietInvalidationError);
     expect(ran, 'a due row was written into a session the sweep will never enumerate').toEqual([]);
   });
 
@@ -284,12 +297,14 @@ describe('the persisted quiet mark (S2-PR15)', () => {
     // published. Reading it after the throw and comparing it to itself would
     // pass no matter what ran in between.
     let atWriteTime: string | null = null;
-    expect(() =>
-      withQuietInvalidationSync('s-1', () => {
-        atWriteTime = lastActiveOf('s-1');
-        throw new Error('mailbox write failed');
-      }),
-    ).toThrow(/mailbox write failed/);
+    await expect(
+      withCentralSync<void>(() =>
+        withQuietInvalidationSync('s-1', () => {
+          atWriteTime = lastActiveOf('s-1');
+          throw new Error('mailbox write failed');
+        }),
+      ),
+    ).rejects.toThrow(/mailbox write failed/);
 
     expect(atWriteTime).not.toBe(ACTIVE);
     expect(markOf('s-1')).toBeNull();
@@ -313,7 +328,7 @@ describe('the persisted quiet mark (S2-PR15)', () => {
     expect(basis).toBe(B);
 
     // The due-ness write invalidates: B → B+1 ms (strictly greater).
-    withQuietInvalidationSync('s-1', () => undefined);
+    await withCentralSync(() => withQuietInvalidationSync('s-1', () => undefined));
     const invalidated = lastActiveOf('s-1')!;
     expect(invalidated, 'the invalidation did not take the +1 ms arm').toBe(new Date(Date.parse(B) + 1).toISOString());
 

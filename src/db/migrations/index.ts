@@ -1,8 +1,6 @@
 import type Database from 'better-sqlite3';
 
 import { log } from '../../log.js';
-import { getDb } from '../connection.js';
-import { sqliteRaw } from '../drivers/sqlite.js';
 import { migration001 } from './001-initial.js';
 import { migration002 } from './002-chat-sdk-state.js';
 import { moduleApprovalsPendingApprovals } from './module-approvals-pending-approvals.js';
@@ -247,20 +245,6 @@ interface FkViolation {
 
 const fkIdentity = (v: FkViolation): string =>
   JSON.stringify({ table: v.table, rowid: v.rowid, parent: v.parent, fkid: v.fkid });
-
-/**
- * Run the ledger against the central database the host has opened.
- *
- * The runner stays synchronous on the raw handle (plan §4.3 amendment): it
- * runs at boot with no concurrent central-DB activity, and its own
- * `db.transaction` is the one raw transaction the receiver-aware tripwire
- * (src/db/transaction-closures.test.ts) still pins after PR 6. `sqliteRaw` is
- * upstream's own escape hatch for exactly this, which is why this file is on
- * the terminal raw allowlist and `main.ts` is not.
- */
-export function runCentralMigrations(list: Migration[] = migrations): void {
-  runMigrations(sqliteRaw(getDb()), list);
-}
 
 export function runMigrations(db: Database.Database, list: Migration[] = migrations): void {
   db.exec(`

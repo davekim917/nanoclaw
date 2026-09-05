@@ -17,7 +17,7 @@ import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { shadowWrite } from './db/coordination.js';
 import { getDb, getRawDb, initDb } from './db/connection.js';
-import { runCentralMigrations } from './db/migrations/index.js';
+import { runMigrations } from './db/migrations/index.js';
 import { registerSecretsFromEnv } from './secret-scrubber.js';
 import {
   channelNameProvenance,
@@ -466,11 +466,11 @@ export async function main(): Promise<void> {
   // 1. Init central DB
   const dbPath = path.join(DATA_DIR, 'v2.db');
   await initDb(dbPath);
-  runCentralMigrations();
-  // The boot-time workgroup reconcilers below still take the raw handle (they
-  // run before any concurrent central-DB activity exists); they convert with
-  // their owning modules, not with the migration entry above.
+  // The migration runner stays synchronous on the raw handle (plan §4.3
+  // amendment): it runs at boot with no concurrent central-DB activity, and
+  // the boot-time workgroup reconcilers below take the same handle.
   const db = getRawDb();
+  runMigrations(db);
 
   // 1-a. Register this host process in `host_instances` and start renewing
   // its lease. Ahead of everything that can spawn, so the row exists before

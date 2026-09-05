@@ -203,7 +203,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/delivery.test.ts',
   'src/delivery.ts',
   'src/group-init.settings.test.ts',
-  'src/guard/guard.test.ts',
   'src/host-core.test.ts',
   'src/host-lifecycle-timers.test.ts',
   'src/host-sweep.test.ts',

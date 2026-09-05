@@ -41,7 +41,7 @@ describe('central-DB boot order in src/main.ts', () => {
   });
 
   it('runs migrations only after the driver exists', () => {
-    expect(at('await initDb(')).toBeLessThan(at('runCentralMigrations('));
+    expect(at('await initDb(')).toBeLessThan(at('runMigrations('));
     expect(at('await initDb(')).toBeLessThan(at('getRawDb()'));
   });
 

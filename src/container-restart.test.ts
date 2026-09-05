@@ -1,3 +1,4 @@
+import { withCentralSync } from './db/central-lease.js';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // --- Mocks ---
@@ -911,7 +912,7 @@ describe('restartAgentGroupContainers', () => {
       guard: expect.any(Function),
     });
     const { guard } = mockWakeContainer.mock.calls[0][2] as { guard: () => unknown };
-    expect(guard()).toBe(true);
+    expect(await withCentralSync(() => guard(), 'test-guard')).toBe(true);
   });
 
   /**
@@ -933,7 +934,10 @@ describe('restartAgentGroupContainers', () => {
     onExit();
 
     const { guard } = mockWakeContainer.mock.calls[0][2] as { guard: () => unknown };
-    expect(guard()).toEqual({ ok: false, reason: 'session no longer exists' });
+    expect(await withCentralSync(() => guard(), 'test-guard')).toEqual({
+      ok: false,
+      reason: 'session no longer exists',
+    });
   });
 
   it('handles multiple running sessions with wake message', async () => {
@@ -967,6 +971,6 @@ describe('restartAgentGroupContainers', () => {
     onExit();
     expect(mockWakeContainer).toHaveBeenCalled();
     const { guard } = mockWakeContainer.mock.calls[0][2] as { guard: () => unknown };
-    expect(guard()).toBe(true);
+    expect(await withCentralSync(() => guard(), 'test-guard')).toBe(true);
   });
 });
