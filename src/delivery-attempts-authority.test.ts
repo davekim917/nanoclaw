@@ -98,8 +98,16 @@ async function bootHost(): Promise<Host> {
   // does this once per test, before the body reaches its first restart.
   await import('./mailbox/compose.js');
   const db = await import('./db/index.js');
+  // Migrations run on their own connection rather than through `getRawDb()`:
+  // the raw central-DB handle is a shrink-only allowlist and this file is not
+  // on it (src/db/raw-db-ratchet.test.ts). Idempotent, so the restart is free.
+  const migrator = new Database(DB_PATH);
+  try {
+    db.runMigrations(migrator);
+  } finally {
+    migrator.close();
+  }
   await db.initDb(DB_PATH);
-  db.runMigrations(db.getRawDb());
   const delivery = await import('./delivery.js');
   delivery.setDeliveryAdapter(adapter);
   host = { delivery, db, sessions: await import('./session-manager.js') };
