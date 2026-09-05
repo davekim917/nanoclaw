@@ -81,6 +81,19 @@ export class RawAccessDuringTransactionError extends Error {
   }
 }
 
+/** A raw block returned with a transaction still open on the shared connection. */
+export class RawBlockLeftTransactionOpenError extends Error {
+  constructor(site: string) {
+    super(
+      `${site} returned with a transaction still open on the central connection. The lease is released at the ` +
+        'end of the block, so the transaction would outlive it: the next centralTransaction() would die on ' +
+        'BEGIN IMMEDIATE and unrelated raw statements would silently join it. It has been rolled back — issue ' +
+        'BEGIN/COMMIT as a matched pair inside one block, or use centralTransaction().',
+    );
+    this.name = 'RawBlockLeftTransactionOpenError';
+  }
+}
+
 /** The lease was requested by code that already holds it. */
 export class CentralLeaseReentrancyError extends Error {
   constructor(entry: string, holder: string) {
@@ -204,6 +217,11 @@ export async function centralTransaction<T>(fn: () => Promise<T>, label = 'centr
  * The rest parameter rejects an async block at compile time; the runtime check
  * catches the callers the types cannot reach — plain JavaScript, an `as never`,
  * a callback whose return type widened through a generic.
+ *
+ * The same stray-transaction postcondition `withRawDb` applies runs again here.
+ * A facade or statement prepared earlier in the SAME block is still live after
+ * its `withRawDb` call returns (the epoch matches), so a `BEGIN` issued through
+ * it would otherwise escape the per-callback check and outlive the lease.
  */
 export async function withCentralSync<T>(
   fn: () => T,
@@ -214,16 +232,55 @@ export async function withCentralSync<T>(
   assertLeaseNotHeld('withCentralSync');
   const release = await lease.acquire(label);
   const previouslyInside = insideSyncBlock;
+  const previousRawHandle = blockRawHandle;
   insideSyncBlock = true;
+  blockRawHandle = undefined;
   blockEpoch += 1;
+  let blockThrew = true;
+  let stray: RawBlockLeftTransactionOpenError | undefined;
+  let result!: T;
   try {
-    const result = fn();
+    result = fn();
     if (isThenable(result)) throw new GuardNotSynchronousError('The withCentralSync block');
-    return result;
+    blockThrew = false;
   } finally {
+    // The postcondition is settled BEFORE the lease is handed on, so the next
+    // holder never sees the abandoned transaction — but it is THROWN after the
+    // try/finally, so a stray BEGIN cannot swallow the block's own error and
+    // cannot leak the lease.
+    stray = blockRawHandle
+      ? settleStrayTransaction(blockRawHandle, 'The withCentralSync() block', blockThrew)
+      : undefined;
     insideSyncBlock = previouslyInside;
+    blockRawHandle = previousRawHandle;
     release();
   }
+  if (stray) throw stray;
+  return result;
+}
+
+/**
+ * A prepared statement as a synchronous block may hold it.
+ *
+ * `RawDb.prepare` hands back one of these rather than the better-sqlite3
+ * `Statement`, because a statement holds its own reference to the connection:
+ * `{ statement: r.prepare(...) }`, or an assignment to a variable declared
+ * outside the block, puts a live executable on the shared handle into the
+ * caller's hands, and a `run`/`get`/`all` on it after the lease is released
+ * lands in whatever transaction the next holder has open — the exact race this
+ * primitive exists to prevent. `NoLiveSqlite` only constrains the block's
+ * top-level return type, so it cannot see either shape.
+ *
+ * Every method therefore re-checks the same epoch predicate as the db facade:
+ * nothing live leaves the block AT RUNTIME, and the type constraint is the
+ * compile-time hint that catches the direct form early. `pluck`/`iterate`/
+ * `raw` are deliberately absent — no allowlisted caller (§4.5) needs them, and
+ * `iterate` in particular would hand out a cursor that outlives the block.
+ */
+export interface RawStatement {
+  run(...params: unknown[]): Database.RunResult;
+  get(...params: unknown[]): unknown;
+  all(...params: unknown[]): unknown[];
 }
 
 /**
@@ -232,27 +289,24 @@ export async function withCentralSync<T>(
  *
  * `withRawDb` hands over one of these rather than the better-sqlite3 handle
  * itself, so that a callback cannot stash the live connection somewhere and run
- * statements on it after the lease is released — which is the exact race the
- * lease exists to prevent. Every method re-checks that its own block is still
- * running, so a captured facade is inert the moment the block returns.
- *
- * `prepare` hands back a REAL better-sqlite3 `Statement`, because a facade over
- * statements would be a second wrapper around the same problem. A statement
- * captured and executed after the block is therefore still an escape the
- * runtime cannot see; `NoLiveSqlite` is what stops the direct form of it, and
- * the block-scoped statement is a deliberate boundary, not an oversight.
+ * statements on it after the lease is released. Every method re-checks that its
+ * own block is still running, so a captured facade is inert the moment the
+ * block returns, and does not come back to life on a later block's lease.
  */
 export interface RawDb {
-  prepare(source: string): Database.Statement;
+  prepare(source: string): RawStatement;
   exec(source: string): void;
   readonly inTransaction: boolean;
 }
 
 /**
  * A `withCentralSync` block may not hand back anything that still reaches the
- * connection: the handle, a statement, an open `iterate()` cursor, a
- * better-sqlite3 transaction function, or the facade itself. Compile-time half
- * of the confinement; `BlockScopedRawDb` is the runtime half.
+ * connection: the handle, a statement (real or block-scoped), an open
+ * `iterate()` cursor, a better-sqlite3 transaction function, or the facade
+ * itself. Compile-time half of the confinement; `BlockScopedRawDb` and
+ * `BlockScopedRawStatement` are the runtime half, and the runtime half is the
+ * load-bearing one — a statement nested inside a returned object passes this
+ * type and is still inert.
  */
 export type NoLiveSqlite<T> = T extends
   | Database.Database
@@ -260,6 +314,7 @@ export type NoLiveSqlite<T> = T extends
   | Database.Transaction
   | IterableIterator<unknown>
   | RawDb
+  | RawStatement
   ? [resultMustNotOutliveTheBlock: never]
   : [];
 
@@ -270,6 +325,35 @@ export type NoLiveSqlite<T> = T extends
  */
 let blockEpoch = 0;
 
+/** Shared by both facades: this object's block must still be the running one. */
+function assertBlockStillRunning(epoch: number): void {
+  if (!insideSyncBlock || epoch !== blockEpoch) throw new RawAccessOutsideSyncBlockError();
+}
+
+class BlockScopedRawStatement implements RawStatement {
+  constructor(
+    private readonly statement: Database.Statement<unknown[]>,
+    private readonly epoch: number,
+  ) {}
+
+  private live(): Database.Statement<unknown[]> {
+    assertBlockStillRunning(this.epoch);
+    return this.statement;
+  }
+
+  run(...params: unknown[]): Database.RunResult {
+    return this.live().run(...params);
+  }
+
+  get(...params: unknown[]): unknown {
+    return this.live().get(...params);
+  }
+
+  all(...params: unknown[]): unknown[] {
+    return this.live().all(...params);
+  }
+}
+
 class BlockScopedRawDb implements RawDb {
   constructor(
     private readonly raw: Database.Database,
@@ -277,12 +361,12 @@ class BlockScopedRawDb implements RawDb {
   ) {}
 
   private live(): Database.Database {
-    if (!insideSyncBlock || this.epoch !== blockEpoch) throw new RawAccessOutsideSyncBlockError();
+    assertBlockStillRunning(this.epoch);
     return this.raw;
   }
 
-  prepare(source: string): Database.Statement {
-    return this.live().prepare(source);
+  prepare(source: string): RawStatement {
+    return new BlockScopedRawStatement(this.live().prepare(source), this.epoch);
   }
 
   exec(source: string): void {
@@ -295,6 +379,50 @@ class BlockScopedRawDb implements RawDb {
 }
 
 /**
+ * The handle a raw block reached, remembered for the duration of the enclosing
+ * synchronous block.
+ *
+ * Set only once `withRawDb`'s two checks have passed, which means it is set
+ * only when the connection was verifiably NOT in a transaction at that moment.
+ * A transaction observed on it at the end of the block was therefore opened BY
+ * the block, which is what makes the `withCentralSync` postcondition below able
+ * to distinguish "this block left one open" from "one was already open"
+ * (the fixture `RawAccessDuringTransactionError` refuses, and never sets this).
+ */
+let blockRawHandle: Database.Database | undefined;
+
+/**
+ * Postcondition for a raw block: the shared connection must be out of any
+ * transaction the block opened.
+ *
+ * A `BEGIN` with no matching `COMMIT`/`ROLLBACK` outlives the lease, so the
+ * next `centralTransaction` dies on `BEGIN IMMEDIATE` and unrelated raw
+ * statements silently join the abandoned transaction. Rolls back either way;
+ * returns the error to throw, or `undefined` when the block already threw —
+ * the block's own error is the diagnosis and must not be masked.
+ */
+function settleStrayTransaction(
+  raw: Database.Database,
+  site: string,
+  blockThrew: boolean,
+): RawBlockLeftTransactionOpenError | undefined {
+  if (!raw.inTransaction) return undefined;
+  try {
+    raw.exec('ROLLBACK');
+  } catch (error) {
+    log.warn('Rolling back a transaction left open by a raw central block failed', {
+      site,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  if (blockThrew) {
+    log.warn('A raw central block left a transaction open and then threw; rolled it back', { site });
+    return undefined;
+  }
+  return new RawBlockLeftTransactionOpenError(site);
+}
+
+/**
  * The synchronous better-sqlite3 handle, inside a `withCentralSync` block.
  *
  * Two throws, for two different failures. Outside a block there is no lease and
@@ -304,11 +432,16 @@ class BlockScopedRawDb implements RawDb {
  * construction (the lease is exclusive), so the `inTransaction` check is a belt:
  * a non-zero count in the post-restart gate means a bypass, not a race.
  *
- * The callback gets a `RawDb` facade, not the connection, and may not RETURN
- * anything that still reaches the connection (`NoLiveSqlite`). Both halves
- * close the same hole: a block that hands the live handle to its caller runs
- * statements after the lease is released, which is the race this primitive
- * exists to prevent.
+ * The callback gets a `RawDb` facade, not the connection, and every statement
+ * it prepares is a `RawStatement` facade over the same epoch check, so nothing
+ * that still reaches the connection is live once the block returns —
+ * `NoLiveSqlite` is the compile-time hint on top of that runtime guarantee.
+ *
+ * The third throw is a postcondition rather than a precondition: a callback
+ * that issues `BEGIN` (directly, or in a multi-statement `exec`) passes the
+ * check above and would leave the transaction open past the lease. It is rolled
+ * back on the way out, and reported as `RawBlockLeftTransactionOpenError`
+ * unless the callback threw first, in which case the callback's own error wins.
  *
  * `src/db/migrations/index.ts` and the storage-maintenance worker thread are
  * allowlisted raw users that do NOT come through here: they run with no
@@ -322,7 +455,18 @@ export function withRawDb<T>(
   if (!insideSyncBlock) throw new RawAccessOutsideSyncBlockError();
   const raw = getRawDb();
   if (raw.inTransaction) throw new RawAccessDuringTransactionError();
-  return fn(new BlockScopedRawDb(raw, blockEpoch));
+  blockRawHandle = raw;
+  let callbackThrew = true;
+  let stray: RawBlockLeftTransactionOpenError | undefined;
+  let result!: T;
+  try {
+    result = fn(new BlockScopedRawDb(raw, blockEpoch));
+    callbackThrew = false;
+  } finally {
+    stray = settleStrayTransaction(raw, 'The withRawDb() callback', callbackThrew);
+  }
+  if (stray) throw stray;
+  return result;
 }
 
 /**

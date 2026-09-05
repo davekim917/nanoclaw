@@ -13,12 +13,13 @@ import type Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { log } from '../log.js';
-import type { RawDb } from './central-lease.js';
+import type { RawDb, RawStatement } from './central-lease.js';
 import {
   CentralLeaseReentrancyError,
   GuardNotSynchronousError,
   RawAccessDuringTransactionError,
   RawAccessOutsideSyncBlockError,
+  RawBlockLeftTransactionOpenError,
   _setWarnThresholdForTests,
   centralTransaction,
   evaluateGuardSync,
@@ -248,7 +249,8 @@ describe('withRawDb is confined to a synchronous block', () => {
       withRawDb((r) => r);
       // @ts-expect-error — NoLiveSqlite refuses a prepared statement
       withRawDb((r) => r.prepare(`SELECT 1`));
-      // @ts-expect-error — and the connection reached through a statement
+      // @ts-expect-error — and the connection is not even reachable from the
+      // statement facade, which has no `database`
       withRawDb((r) => r.prepare(`SELECT 1`).database);
       // Reading a ROW out of the block is the whole point, and still compiles.
       expect(withRawDb((r) => r.prepare(`SELECT 1 AS ok`).get())).toEqual({ ok: 1 });
@@ -271,6 +273,112 @@ describe('withRawDb is confined to a synchronous block', () => {
     await withCentralSync(() => {
       expect(() => escaped?.prepare(`SELECT 1`)).toThrow(RawAccessOutsideSyncBlockError);
     }, 'a-different-block');
+  });
+
+  it('run/get/all still work through the statement facade inside the block', async () => {
+    const rows = await withCentralSync(
+      () =>
+        withRawDb((r) => {
+          r.prepare(`INSERT INTO lease_probe (id) VALUES (?)`).run('facade');
+          expect(r.prepare(`SELECT id FROM lease_probe WHERE id = ?`).get('facade')).toEqual({ id: 'facade' });
+          return r.prepare(`SELECT id FROM lease_probe ORDER BY id`).all() as { id: string }[];
+        }),
+      'facade-io',
+    );
+    expect(rows).toEqual([{ id: 'facade' }]);
+  });
+
+  it('a statement captured into an outer variable is inert once the block returns', async () => {
+    // The escape `NoLiveSqlite` cannot see: the block returns nothing, and the
+    // statement leaves through an assignment instead.
+    let escaped: RawStatement | undefined;
+    await withCentralSync(() => {
+      withRawDb((r) => {
+        escaped = r.prepare(`SELECT 1 AS ok`);
+      });
+    }, 'statement-capture');
+
+    expect(() => escaped?.get()).toThrow(RawAccessOutsideSyncBlockError);
+    expect(() => escaped?.all()).toThrow(RawAccessOutsideSyncBlockError);
+    expect(() => escaped?.run()).toThrow(RawAccessOutsideSyncBlockError);
+
+    // And it cannot ride a LATER block's lease either.
+    await withCentralSync(() => {
+      expect(() => escaped?.get()).toThrow(RawAccessOutsideSyncBlockError);
+    }, 'a-later-block');
+  });
+
+  it('a statement returned nested inside an object is inert too', async () => {
+    // `NoLiveSqlite` passes this shape — an object is not a statement — so the
+    // epoch check is the only thing standing between the caller and a live
+    // statement on the shared connection.
+    const smuggled = await withCentralSync(
+      () => withRawDb((r) => ({ statement: r.prepare(`SELECT 1 AS ok`) })),
+      'nested-capture',
+    );
+    expect(() => smuggled.statement.get()).toThrow(RawAccessOutsideSyncBlockError);
+  });
+});
+
+describe('a raw block may not leave a transaction open', () => {
+  it('rolls back and throws when the callback opens a transaction and returns', async () => {
+    await expect(
+      withTimeout(
+        withCentralSync(() => {
+          withRawDb((r) => {
+            r.exec('BEGIN');
+          });
+        }, 'stray-begin'),
+      ),
+    ).rejects.toBeInstanceOf(RawBlockLeftTransactionOpenError);
+
+    expect(sqliteRaw(db).inTransaction, 'the abandoned transaction is rolled back').toBe(false);
+
+    // And the connection is usable: without the rollback this would die on
+    // "cannot start a transaction within a transaction".
+    await withTimeout(
+      centralTransaction(async () => {
+        await db.run(`INSERT INTO lease_probe (id) VALUES ('after-stray')`);
+      }, 'after-stray'),
+    );
+    expect(await db.get(`SELECT id FROM lease_probe WHERE id = 'after-stray'`)).toEqual({ id: 'after-stray' });
+  });
+
+  it("rethrows the callback's own error, unmasked, when it throws after opening one", async () => {
+    class CallbackBoom extends Error {}
+
+    await expect(
+      withTimeout(
+        withCentralSync(() => {
+          // Explicit `void`: a callback that only throws infers `never`, and
+          // `NoLiveSqlite<never>` distributes to `never` for the rest parameter.
+          withRawDb<void>((r) => {
+            r.exec('BEGIN');
+            throw new CallbackBoom('the callback failed mid-transaction');
+          });
+        }, 'stray-begin-then-throw'),
+      ),
+    ).rejects.toBeInstanceOf(CallbackBoom);
+
+    expect(sqliteRaw(db).inTransaction, 'rolled back on the way out all the same').toBe(false);
+  });
+
+  it('catches a BEGIN issued through a facade after its withRawDb call returned', async () => {
+    // Same block, so the epoch still matches and the facade is still live: the
+    // per-callback postcondition cannot see this one, the block-level one can.
+    await expect(
+      withTimeout(
+        withCentralSync(() => {
+          let stillLive!: RawDb;
+          withRawDb((r) => {
+            stillLive = r;
+          });
+          stillLive.exec('BEGIN');
+        }, 'same-block-begin'),
+      ),
+    ).rejects.toBeInstanceOf(RawBlockLeftTransactionOpenError);
+
+    expect(sqliteRaw(db).inTransaction).toBe(false);
   });
 });
 
