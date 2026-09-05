@@ -76,8 +76,8 @@ function str(v: unknown): string | null {
   return typeof v === 'string' && v.length > 0 ? v : null;
 }
 
-function supportTicketPolicy(agentGroupId: string): string | null {
-  const agentGroup = getAgentGroup(agentGroupId);
+async function supportTicketPolicy(agentGroupId: string): Promise<string | null> {
+  const agentGroup = await getAgentGroup(agentGroupId);
   if (!agentGroup) return null;
   const credentialFolder = readContainerConfig(agentGroup.folder).credentialFolder ?? agentGroup.folder;
   const scopedName = `NANOCLAW_SUPPORT_TICKET_POLICY_${credentialFolder.toUpperCase().replace(/-/g, '_')}`;
@@ -256,7 +256,7 @@ async function dispatchSupportIssue(
   const mg = session.messaging_group_id
     ? getMessagingGroup(session.messaging_group_id)
     : taskContext
-      ? getMessagingGroupByPlatform(taskContext.channelType, taskContext.platformId)
+      ? await getMessagingGroupByPlatform(taskContext.channelType, taskContext.platformId)
       : undefined;
   if (!mg) {
     log.warn('dispatch_support_issue: rejected — no host-authoritative messaging group route', {
@@ -278,11 +278,11 @@ async function dispatchSupportIssue(
   // the dispatcher passed (it may know from a legacy flow).
   const linearIssue = existing?.linear_issue ?? str(content.linearIssue);
   const linearTeam = existing?.linear_team ?? str(content.linearTeam);
-  const ticketPolicy = supportTicketPolicy(session.agent_group_id);
+  const ticketPolicy = await supportTicketPolicy(session.agent_group_id);
 
   // ── Follow-up: an open issue with a live Slack thread already exists ──
   if (existing && existing.slack_thread_id) {
-    const bound = existing.session_id ? getSession(existing.session_id) : undefined;
+    const bound = existing.session_id ? await getSession(existing.session_id) : undefined;
     // Reclaim only CLOSES a session row, it never deletes it, so `getSession`
     // still answers for an archived session. Without the status filter the
     // follow-up wrote into (and spawned a container for) a status='closed'
@@ -308,7 +308,8 @@ async function dispatchSupportIssue(
     // same thread, same ticket, ONLY session_id changes — instead of opening a
     // second announcement for one ongoing conversation.
     const target =
-      issueSession ?? resolveSession(existing.agent_group_id, mg.id, existing.slack_thread_id, 'per-thread').session;
+      issueSession ??
+      (await resolveSession(existing.agent_group_id, mg.id, existing.slack_thread_id, 'per-thread')).session;
 
     await writeSessionMessage(target.agent_group_id, target.id, followup);
     if (issueSession) {
@@ -353,7 +354,7 @@ async function dispatchSupportIssue(
   // mirroring orchestrator-dispatch (dispatch.ts:363-364).
   const encodedThreadId = bareThreadId.includes(':') ? bareThreadId : `${mg.platform_id}:${bareThreadId}`;
 
-  const { session: issueSession } = resolveSession(session.agent_group_id, mg.id, encodedThreadId, 'per-thread');
+  const { session: issueSession } = await resolveSession(session.agent_group_id, mg.id, encodedThreadId, 'per-thread');
 
   await writeSessionMessage(issueSession.agent_group_id, issueSession.id, {
     id: randomUUID(),

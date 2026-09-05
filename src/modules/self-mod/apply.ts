@@ -49,13 +49,13 @@ import type { Session } from '../../types.js';
 import { notifyAgent, type ApprovalHandler } from '../approvals/index.js';
 
 export async function applyInstallPackages(payload: Record<string, unknown>, session: Session): Promise<void> {
-  const agentGroup = getAgentGroup(session.agent_group_id);
+  const agentGroup = await getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
     await notifyAgent(session, 'install_packages approved but agent group missing.');
     return;
   }
 
-  const configRow = getContainerConfig(agentGroup.id);
+  const configRow = await getContainerConfig(agentGroup.id);
   if (!configRow) {
     await notifyAgent(session, 'install_packages approved but container config missing.');
     return;
@@ -67,14 +67,14 @@ export async function applyInstallPackages(payload: Record<string, unknown>, ses
     for (const pkg of payload.apt as string[]) {
       if (!existing.includes(pkg)) existing.push(pkg);
     }
-    updateContainerConfigJson(agentGroup.id, 'packages_apt', existing);
+    await updateContainerConfigJson(agentGroup.id, 'packages_apt', existing);
   }
   if (payload.npm) {
     const existing = JSON.parse(configRow.packages_npm) as string[];
     for (const pkg of payload.npm as string[]) {
       if (!existing.includes(pkg)) existing.push(pkg);
     }
-    updateContainerConfigJson(agentGroup.id, 'packages_npm', existing);
+    await updateContainerConfigJson(agentGroup.id, 'packages_npm', existing);
   }
 
   const pkgs = [
@@ -98,8 +98,8 @@ export async function applyInstallPackages(payload: Record<string, unknown>, ses
       }),
       onWake: 1,
     });
-    killContainer(session.id, 'rebuild applied', () => {
-      const s = getSession(session.id);
+    killContainer(session.id, 'rebuild applied', async () => {
+      const s = await getSession(session.id);
       if (s) {
         void wakeContainer(s).catch((err) =>
           log.error('Failed to wake container after install_packages rebuild', { err, sessionId: session.id }),
@@ -128,13 +128,13 @@ export async function applyInstallPackages(payload: Record<string, unknown>, ses
 }
 
 export async function applyAddMcpServer(payload: Record<string, unknown>, session: Session): Promise<void> {
-  const agentGroup = getAgentGroup(session.agent_group_id);
+  const agentGroup = await getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
     await notifyAgent(session, 'add_mcp_server approved but agent group missing.');
     return;
   }
 
-  const configRow = getContainerConfig(agentGroup.id);
+  const configRow = await getContainerConfig(agentGroup.id);
   if (!configRow) {
     await notifyAgent(session, 'add_mcp_server approved but container config missing.');
     return;
@@ -180,7 +180,7 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
     if (!config.mcpServers) config.mcpServers = {};
     config.mcpServers[name] = serverConfig;
   });
-  updateContainerConfigJson(agentGroup.id, 'mcp_servers', fileConfig.mcpServers ?? {});
+  await updateContainerConfigJson(agentGroup.id, 'mcp_servers', fileConfig.mcpServers ?? {});
 
   // Declaring the placeholder wires the header; it does not grant the secret.
   // Keyed on the placeholder VALUE, not on headers being present at all — a
@@ -214,8 +214,8 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
     }),
     onWake: 1,
   });
-  killContainer(session.id, 'mcp server added', () => {
-    const s = getSession(session.id);
+  killContainer(session.id, 'mcp server added', async () => {
+    const s = await getSession(session.id);
     if (s) {
       void wakeContainer(s).catch((err) =>
         log.error('Failed to wake container after add_mcp_server', { err, sessionId: session.id }),
@@ -241,12 +241,12 @@ export async function performModelChange(
   notify: (message: string) => void | Promise<void>,
   logContext: Record<string, unknown> = {},
 ): Promise<void> {
-  const agentGroup = getAgentGroup(session.agent_group_id);
+  const agentGroup = await getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
     await notify('change_model failed: agent group missing.');
     return;
   }
-  const config = getContainerConfig(agentGroup.id);
+  const config = await getContainerConfig(agentGroup.id);
   if (!config) {
     await notify('change_model failed: container config missing.');
     return;
@@ -283,7 +283,7 @@ export async function performModelChange(
   // Effort is applied alongside so the agent gets a coherent next-spawn state.
   const updates: Parameters<typeof updateContainerConfigScalars>[1] = { model: slug };
   if (effort) updates.effort = effort;
-  updateContainerConfigScalars(agentGroup.id, updates);
+  await updateContainerConfigScalars(agentGroup.id, updates);
 
   log.info('Model change applied', {
     agentGroupId: session.agent_group_id,
@@ -310,8 +310,8 @@ export async function performModelChange(
     onWake: 1,
   });
 
-  killContainer(session.id, 'model changed', () => {
-    const s = getSession(session.id);
+  killContainer(session.id, 'model changed', async () => {
+    const s = await getSession(session.id);
     if (s) {
       void wakeContainer(s).catch((err) =>
         log.error('Failed to wake container after model change', { err, sessionId: session.id }),

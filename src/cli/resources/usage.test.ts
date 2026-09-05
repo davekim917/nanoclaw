@@ -31,7 +31,7 @@ describe('ncl usage summary', () => {
     await initTestDb();
     const db = getRawDb();
     runMigrations(db);
-    createAgentGroup({
+    await createAgentGroup({
       id: GID,
       name: 'usage-cli',
       folder: 'usage-cli',

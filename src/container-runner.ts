@@ -73,7 +73,7 @@ import {
 } from './db/agent-groups.js';
 import { getRawDb, hasTableRaw } from './db/connection.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
-import { getSession } from './db/sessions.js';
+import { getSession, SESSION_BY_ID_SQL } from './db/sessions.js';
 import { buildCentralProjection } from './db/per-agent-projections.js';
 import { ensureArchiveProjection } from './db/archive-projection-worker.js';
 import { initGroupFilesystem } from './group-init.js';
@@ -255,7 +255,10 @@ const spawningSessions = new Set<string>();
  * once the wake settles. Either way `onExit` fires exactly once, so exit-driven
  * work runs for a spawning session exactly as it does for a running one.
  */
-const pendingKills = new Map<string, { reason: string; onExit: Array<() => void> }>();
+/** An exit callback may await (it usually re-reads the session row before a wake); its rejection is logged, never thrown into the emitter. */
+export type ContainerExitCallback = () => unknown;
+
+const pendingKills = new Map<string, { reason: string; onExit: ContainerExitCallback[] }>();
 
 /**
  * A caller's precondition, re-proved by the WAKE PATH at the last instant.
@@ -319,9 +322,21 @@ function unwakeableReason(fresh: Session | undefined): string | null {
 
 export function sessionStillActive(sessionId: string): WakeGuard {
   return () => {
-    const reason = unwakeableReason(getSession(sessionId));
+    const reason = unwakeableReason(readSessionSync(sessionId));
     return reason === null ? true : { ok: false, reason };
   };
+}
+
+/**
+ * Seam 3 §4.5 I-1: a guard-path read that stays SYNCHRONOUS forever.
+ * It executes the sessions leaf's own exported `SESSION_BY_ID_SQL` through the
+ * raw handle — one constant, two executors, not a `*Sync` twin of `getSession`
+ * (plan docs/specs/upstream-async-central-db-seam/plan.md §4.5). A `WakeGuard`
+ * is `() => WakeGuardResult` and is evaluated with nothing awaited between it
+ * and the spawn it protects; PR 6 wraps this block in `withCentralSync`.
+ */
+function readSessionSync(sessionId: string): Session | undefined {
+  return getRawDb().prepare(SESSION_BY_ID_SQL).get(sessionId) as Session | undefined;
 }
 
 /** Evaluate a wake guard and normalize its answer. */
@@ -558,10 +573,10 @@ export function resolveWorkgroupIdAtSpawn(
  * Callers own the release of anything already held at their bail point — see
  * each call site; this helper deliberately holds and releases nothing.
  */
-function refreshActiveSession(session: Session, stage: string): Session | null {
+async function refreshActiveSession(session: Session, stage: string): Promise<Session | null> {
   let fresh: Session | undefined;
   try {
-    fresh = getSession(session.id);
+    fresh = await getSession(session.id);
   } catch (err) {
     log.warn('Container wake abandoned — session re-read failed', { sessionId: session.id, stage, err });
     return null;
@@ -639,11 +654,11 @@ export function wakeContainer(
     // First await behind us. Nothing is held yet — storage admission takes no
     // lease and the memory request has not been made — so this bail releases
     // nothing. Everything below runs on the fresh row.
-    const admitted = refreshActiveSession(session, 'storage-admission');
+    const admitted = await refreshActiveSession(session, 'storage-admission');
     if (!admitted) return false;
 
     const admission = getMemoryAdmission();
-    const agentGroup = getAgentGroup(admitted.agent_group_id);
+    const agentGroup = await getAgentGroup(admitted.agent_group_id);
     if (!agentGroup) {
       log.error('Container wake rejected — agent group not found', {
         sessionId: admitted.id,
@@ -732,7 +747,7 @@ function startReservedWake(queued: QueuedWake): Promise<boolean> {
     // the session object captured when the wake was first queued — which can be
     // an arbitrarily long wait. Re-read before spending the slot, and release
     // the reservation on a bail so the next queued session can take it.
-    const dequeued = refreshActiveSession(session, 'memory-admission-dequeue');
+    const dequeued = await refreshActiveSession(session, 'memory-admission-dequeue');
     if (!dequeued) {
       releaseMemoryReservation(session.id);
       return false;
@@ -754,12 +769,12 @@ function startReservedWake(queued: QueuedWake): Promise<boolean> {
       releaseMemoryReservation(dequeued.id);
       return false;
     }
-    const admitted = refreshActiveSession(dequeued, 'queued-storage-admission');
+    const admitted = await refreshActiveSession(dequeued, 'queued-storage-admission');
     if (!admitted) {
       releaseMemoryReservation(dequeued.id);
       return false;
     }
-    return spawnReservedContainer(admitted, guard);
+    return await spawnReservedContainer(admitted, guard);
   });
 }
 
@@ -818,12 +833,12 @@ async function spawnReservedContainer(caller: Session, guard?: WakeGuard): Promi
   // Entry re-read. Reached both straight off an admitted request and as the
   // memory-queue dequeue continuation; either way a reservation is held by now,
   // so a bail here must give it back.
-  const session = refreshActiveSession(caller, 'reserved-spawn');
+  const session = await refreshActiveSession(caller, 'reserved-spawn');
   if (!session) {
     releaseMemoryReservation(caller.id);
     return false;
   }
-  const spawnAgentGroup = getAgentGroup(session.agent_group_id);
+  const spawnAgentGroup = await getAgentGroup(session.agent_group_id);
   if (!spawnAgentGroup) {
     log.error('Container wake rejected — agent group not found at reserved spawn', {
       sessionId: session.id,
@@ -888,7 +903,7 @@ async function spawnReservedContainer(caller: Session, guard?: WakeGuard): Promi
     // spawn. Two things are held here: the storage-activity lease, which the
     // `finally` below releases because `storageActivity` is still non-null, and
     // the memory reservation, which is ours to hand back explicitly.
-    const spawnSession = refreshActiveSession(session, 'pre-spawn');
+    const spawnSession = await refreshActiveSession(session, 'pre-spawn');
     if (!spawnSession) {
       releaseMemoryReservation(session.id);
       return false;
@@ -1205,7 +1220,7 @@ async function spawnContainer(
   // Resolve the effective provider + any host-side contribution it declares
   // (extra mounts, env passthrough). Computed once and threaded through both
   // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
-  const { provider, contribution } = resolveProviderContribution(spawnSession, agentGroup, containerConfig);
+  const { provider, contribution } = await resolveProviderContribution(spawnSession, agentGroup, containerConfig);
 
   // Wraps every stage logged inside buildMounts, so the sum of the parts can
   // be checked against the whole rather than assumed to account for it.
@@ -1226,7 +1241,7 @@ async function spawnContainer(
   let channelInstructionsProfile: string | null = null;
   if (session.messaging_group_id) {
     const { getMessagingGroupAgentByPair } = await import('./db/messaging-groups.js');
-    const wiring = getMessagingGroupAgentByPair(session.messaging_group_id, agentGroup.id);
+    const wiring = await getMessagingGroupAgentByPair(session.messaging_group_id, agentGroup.id);
     if (wiring) {
       channelDefaultModel = wiring.default_model;
       channelDefaultEffort = wiring.default_effort;
@@ -1240,7 +1255,7 @@ async function spawnContainer(
   // delivery destination so the gate judges WHERE THE TASK POSTS instead of
   // fail-closing on null. See resolveSlackSafetyMessagingGroupId.
   const { resolveSlackSafetyMessagingGroupId } = await import('./modules/permissions/task-slack-subject.js');
-  const slackSafetyMessagingGroupId = resolveSlackSafetyMessagingGroupId(session);
+  const slackSafetyMessagingGroupId = await resolveSlackSafetyMessagingGroupId(session);
 
   const args = await buildContainerArgs(
     mounts,
@@ -1277,7 +1292,7 @@ async function spawnContainer(
   // (which has none by construction) this resolves the series' delivery
   // destination so the gate judges WHERE THE TASK POSTS instead of
   // fail-closing on null. See resolveSlackSafetyMessagingGroupId.
-  writeCapabilitiesSnapshot(agentGroup.id, session.id, slackSafetyMessagingGroupId);
+  await writeCapabilitiesSnapshot(agentGroup.id, session.id, slackSafetyMessagingGroupId);
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
 
@@ -1319,20 +1334,16 @@ async function spawnContainer(
     storageActivity,
   });
   everSeenRunningSessions.add(session.id);
-  markContainerRunning(session.id);
+  // The `running` status write is awaited AFTER the exit handlers below are
+  // attached (see the end of this function): with a delayed driver a
+  // container that dies at boot would otherwise emit close/error while the
+  // write is pending, before finalizeContainer and the kill callbacks exist.
 
   // Log stderr. A container that dies at boot (unknown provider, missing
   // binary, bad config) explains itself only here — and debug is below the
   // default log level — so keep a tail to surface on a non-zero exit.
   const stderrTail: string[] = [];
-  container.stderr?.on('data', (data) => {
-    for (const line of data.toString().trim().split('\n')) {
-      if (!line) continue;
-      log.debug(line, { container: agentGroup.folder });
-      stderrTail.push(line);
-      if (stderrTail.length > 10) stderrTail.shift();
-    }
-  });
+  captureContainerStderr(container.stderr, containerName, stderrTail);
 
   // stdout is unused in v2 (all IO is via session DB)
   container.stdout?.on('data', () => {});
@@ -1357,7 +1368,11 @@ async function spawnContainer(
         log.warn('Failed to release container storage activity lease', { sessionId: session.id, err });
       });
       releaseMemoryReservation(session.id);
-      markContainerStopped(session.id);
+      // Exit handlers are synchronous; the status write is fire-and-forget here
+      // exactly as it was before the driver went async, with its failure logged.
+      void markContainerStopped(session.id).catch((err: unknown) =>
+        log.warn('markContainerStopped failed after container exit', { sessionId: session.id, err }),
+      );
       stopTypingRefresh(session.id);
       return;
     }
@@ -1389,6 +1404,24 @@ async function spawnContainer(
     finalizeContainer();
     log.error('Container spawn error', { sessionId: session.id, err });
   });
+
+  // Every handler is registered; only now may this function yield.
+  await markContainerRunning(session.id);
+}
+
+export function captureContainerStderr(
+  stderr: NodeJS.ReadableStream | null,
+  containerName: string,
+  stderrTail: string[],
+): void {
+  stderr?.on('data', (data) => {
+    for (const line of data.toString().trim().split('\n')) {
+      if (!line) continue;
+      log.debug(line, { containerName });
+      stderrTail.push(line);
+      if (stderrTail.length > 10) stderrTail.shift();
+    }
+  });
 }
 
 /**
@@ -1416,10 +1449,16 @@ function clearStatusOnKill(sessionId: string, reason: string): void {
 }
 
 /** Stop a RUNNING container, attaching every exit callback before the stop. */
-function stopRunningContainer(sessionId: string, reason: string, onExit: Array<() => void>): void {
+function stopRunningContainer(sessionId: string, reason: string, onExit: ContainerExitCallback[]): void {
   const entry = activeContainers.get(sessionId);
   if (!entry) return;
-  for (const callback of onExit) entry.process.once('close', callback);
+  for (const callback of onExit) {
+    entry.process.once('close', () => {
+      void Promise.resolve()
+        .then(callback)
+        .catch((err: unknown) => log.warn('Container exit callback failed', { sessionId, reason, err }));
+    });
+  }
   log.info('Killing container', { sessionId, reason, containerName: entry.containerName });
   clearStatusOnKill(sessionId, reason);
   try {
@@ -1441,7 +1480,7 @@ function stopRunningContainer(sessionId: string, reason: string, onExit: Array<(
  *     fire. Callers rely on that — `container-restart` treats "not running" as
  *     "this restart did not happen" rather than as an exit.
  */
-export function killContainer(sessionId: string, reason: string, onExit?: () => void): void {
+export function killContainer(sessionId: string, reason: string, onExit?: ContainerExitCallback): void {
   if (!activeContainers.has(sessionId)) {
     if (!isContainerSpawning(sessionId)) return;
     const pending = pendingKills.get(sessionId) ?? { reason, onExit: [] };
@@ -1504,7 +1543,11 @@ function settlePendingKill(sessionId: string): void {
   clearStatusOnKill(sessionId, pending.reason);
   for (const callback of pending.onExit) {
     try {
-      callback();
+      void Promise.resolve()
+        .then(callback)
+        .catch((err: unknown) =>
+          log.warn('Container kill exit callback failed after a cancelled spawn', { sessionId, err }),
+        );
     } catch (err) {
       log.warn('Container kill exit callback threw after a cancelled spawn', { sessionId, err });
     }
@@ -1998,15 +2041,28 @@ function resolveGcpServiceAccountKey(credentialFolder: string): string | null {
  * every container spawn. Container's get_capabilities MCP tool reads
  * this JSON directly — no round-trip, always fresh per spawn.
  */
-function writeCapabilitiesSnapshot(
+/**
+ * The snapshot's bytes, rendered from the AWAITED capabilities. Split out so a
+ * test can prove the await: `JSON.stringify` of a Promise is `{}` and no lint
+ * rule sees it (seam-3 async-hazard class), so the proof is behavioural.
+ */
+export async function renderCapabilitiesSnapshot(
+  agentGroupId: string,
+  sessionMessagingGroupId: string | null,
+): Promise<string> {
+  const caps = await getHostCapabilities(agentGroupId, sessionMessagingGroupId);
+  return JSON.stringify(caps, null, 2) + '\n';
+}
+
+async function writeCapabilitiesSnapshot(
   agentGroupId: string,
   sessionId: string,
   sessionMessagingGroupId: string | null,
-): void {
+): Promise<void> {
   try {
-    const caps = getHostCapabilities(agentGroupId, sessionMessagingGroupId);
+    const rendered = await renderCapabilitiesSnapshot(agentGroupId, sessionMessagingGroupId);
     const outPath = path.join(sessionDir(agentGroupId, sessionId), 'capabilities.json');
-    fs.writeFileSync(outPath, JSON.stringify(caps, null, 2) + '\n');
+    fs.writeFileSync(outPath, rendered);
   } catch (err) {
     log.warn('Failed to write capabilities snapshot', { err });
   }
@@ -2092,15 +2148,15 @@ const SCOPED_CREDENTIAL_VARS = [
 // suite factory-mocks. Re-exported here for existing import sites.
 export { resolveProviderName } from './db/container-configs.js';
 
-function resolveProviderContribution(
+async function resolveProviderContribution(
   session: Session,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
-): { provider: string; contribution: ProviderContainerContribution } {
+): Promise<{ provider: string; contribution: ProviderContainerContribution }> {
   const provider = resolveProviderName(session.agent_provider, containerConfig.provider);
   const fn = getProviderContainerConfig(provider);
   const contribution = fn
-    ? fn({
+    ? await fn({
         sessionDir: sessionDir(agentGroup.id, session.id),
         agentGroupId: agentGroup.id,
         agentGroupFolder: agentGroup.folder,
@@ -2259,7 +2315,7 @@ export async function buildMounts(
     // Compose CLAUDE.md fresh every spawn from the shared base, enabled skill
     // fragments, and MCP server instructions. See `claude-md-compose.ts`.
     const claudeMdStartedAt = Date.now();
-    composeGroupClaudeMd(agentGroup, provider);
+    await composeGroupClaudeMd(agentGroup, provider);
     logSpawnStage('claude-md-compose', claudeMdStartedAt);
   }
 
@@ -2372,7 +2428,7 @@ export async function buildMounts(
   // else is skipped with a loud warning.
   const allowedOverlayRoots = [
     workgroupSharedDir(wgKey),
-    ...getAllAgentGroups()
+    ...(await getAllAgentGroups())
       .filter((g) => (g.workgroup_id ?? g.folder) === wgKey)
       .map((g) => path.resolve(GROUPS_DIR, g.folder)),
     groupDir,
@@ -3930,7 +3986,7 @@ async function buildContainerArgs(
     const { getChannelPeers, getMessagingGroup } = await import('./db/messaging-groups.js');
     const { getSlackBotDisplayName, getKnownSlackBots } = await import('./channels/slack-mentions.js');
     const { getDiscordBotDisplayName, getKnownDiscordBots } = await import('./channels/discord.js');
-    const peers = getChannelPeers(sessionMessagingGroupId, agentGroup.id);
+    const peers = await getChannelPeers(sessionMessagingGroupId, agentGroup.id);
     const slackBots = getKnownSlackBots();
     const discordBots = getKnownDiscordBots();
     const peerEntries = peers.map((p) => {
@@ -4258,8 +4314,8 @@ async function buildContainerArgs(
       // concurrent reconcile flipped it between reconcileWorkgroupAtSpawn
       // and this lookup (race-fix).
       const workgroupSecrets = resolvedWgId
-        ? getWorkgroupOnecliSecretsById(resolvedWgId)
-        : getWorkgroupOnecliSecrets(agentGroup.id);
+        ? await getWorkgroupOnecliSecretsById(resolvedWgId)
+        : await getWorkgroupOnecliSecrets(agentGroup.id);
       const mergedSecrets = mergeWorkgroupAndGroupSecrets(workgroupSecrets, containerConfig.onecliSecrets);
 
       // Slack user-token scoping — the credential-layer half of the Slack
@@ -4859,10 +4915,10 @@ const execAsync = promisify(exec);
 
 /** Build a per-agent-group Docker image with custom packages. */
 export async function buildAgentGroupImage(agentGroupId: string): Promise<void> {
-  const agentGroup = getAgentGroup(agentGroupId);
+  const agentGroup = await getAgentGroup(agentGroupId);
   if (!agentGroup) throw new Error('Agent group not found');
 
-  const configRow = getContainerConfig(agentGroup.id);
+  const configRow = await getContainerConfig(agentGroup.id);
   if (!configRow) throw new Error('Container config not found');
   const aptPackages = JSON.parse(configRow.packages_apt) as string[];
   const npmPackages = JSON.parse(configRow.packages_npm) as string[];
@@ -4915,7 +4971,7 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
   }
 
   // Store the image tag in the DB
-  updateContainerConfigScalars(agentGroup.id, { image_tag: imageTag });
+  await updateContainerConfigScalars(agentGroup.id, { image_tag: imageTag });
 
   log.info('Per-agent-group image built', { agentGroupId, imageTag });
 }

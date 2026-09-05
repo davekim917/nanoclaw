@@ -120,16 +120,22 @@ async function withAdapter<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
-function wire(
+async function wire(
   opts: {
     sessionMode?: SessionMode;
     ignoredMessagePolicy?: IgnoredMessagePolicy;
     engageMode?: 'mention' | 'mention-sticky';
     threads?: 0 | 1 | null;
   } = {},
-): void {
-  createAgentGroup({ id: AG, name: 'Fixture Agent', folder: 'fixture-agent', agent_provider: null, created_at: now() });
-  createMessagingGroup({
+): Promise<void> {
+  await createAgentGroup({
+    id: AG,
+    name: 'Fixture Agent',
+    folder: 'fixture-agent',
+    agent_provider: null,
+    created_at: now(),
+  });
+  await createMessagingGroup({
     id: MG,
     channel_type: CHANNEL,
     platform_id: PLATFORM_ID,
@@ -232,7 +238,7 @@ afterEach(async () => {
 
 describe('non-engaged session skip', () => {
   it('skips the session, archives the message, and replays it on the later mention', async () => {
-    wire();
+    await wire();
     await withAdapter(async () => {
       const { routeInbound } = await import('./router.js');
 
@@ -241,19 +247,19 @@ describe('non-engaged session skip', () => {
       await routeInbound(chatter);
       threadHistory.push({ sender: 'Sender One', text: 'deploy finished, all green', timestamp: now() });
 
-      expect(findSessionForAgent(AG, MG, THREAD)).toBeUndefined();
+      expect(await findSessionForAgent(AG, MG, THREAD)).toBeUndefined();
       expect(archiveMessage).toHaveBeenCalledTimes(1);
 
       // 2. A human replies — also non-waking. Still no session.
       await routeInbound(event({ id: 'm-2', text: 'nice, did staging pick it up?', sender: 'Sender Two' }));
       threadHistory.push({ sender: 'Sender Two', text: 'nice, did staging pick it up?', timestamp: now() });
-      expect(findSessionForAgent(AG, MG, THREAD)).toBeUndefined();
+      expect(await findSessionForAgent(AG, MG, THREAD)).toBeUndefined();
 
       // 3. Someone mentions the agent. NOW the session exists, and both
       //    skipped messages come back as replayed context.
       await routeInbound(event({ id: 'm-3', text: '@agent what happened here?', isMention: true }));
 
-      const session = findSessionForAgent(AG, MG, THREAD);
+      const session = await findSessionForAgent(AG, MG, THREAD);
       expect(session).toBeDefined();
       expect(session!.engaged_at).toBeTruthy();
 
@@ -270,7 +276,7 @@ describe('non-engaged session skip', () => {
     // Defect (a) from the revert: the recovery must not depend on THIS call
     // being the one that created the row. The rule is `engaged_at IS NULL`,
     // which is a property of the session, so any door reaches it.
-    wire();
+    await wire();
     await withAdapter(async () => {
       const { routeInbound } = await import('./router.js');
       await routeInbound(event({ id: 'm-1', text: 'skipped before anyone engaged' }));
@@ -279,11 +285,11 @@ describe('non-engaged session skip', () => {
         text: 'skipped before anyone engaged',
         timestamp: '2026-08-01T00:00:00.000Z',
       });
-      expect(findSessionForAgent(AG, MG, THREAD)).toBeUndefined();
+      expect(await findSessionForAgent(AG, MG, THREAD)).toBeUndefined();
 
       // Some other path mints the session — a scheduled task, an escalation,
       // an agent-to-agent route. It never engaged, so `engaged_at` is NULL.
-      createSession({
+      await createSession({
         id: 'sess-other-path',
         agent_group_id: AG,
         messaging_group_id: MG,
@@ -308,7 +314,7 @@ describe('non-engaged session skip', () => {
     // The load-bearing case. Skipping writes no session row, so the archive
     // row is the message's only remaining copy. If it did not land, the skip
     // must not happen.
-    wire();
+    await wire();
     vi.mocked(archiveMessage).mockImplementation(() => {
       throw new Error('archive.db is locked');
     });
@@ -316,7 +322,7 @@ describe('non-engaged session skip', () => {
       const { routeInbound } = await import('./router.js');
       await routeInbound(event({ id: 'm-1', text: 'must not vanish' }));
 
-      const session = findSessionForAgent(AG, MG, THREAD);
+      const session = await findSessionForAgent(AG, MG, THREAD);
       expect(session).toBeDefined();
       expect(session!.engaged_at).toBeNull();
       expect(inboundRowCount(session!.id)).toBe(1);
@@ -324,76 +330,76 @@ describe('non-engaged session skip', () => {
   });
 
   it('refuses to skip a message carrying attachments — a transcript cannot rebuild a file', async () => {
-    wire();
+    await wire();
     await withAdapter(async () => {
       const { routeInbound } = await import('./router.js');
       await routeInbound(
         event({ id: 'm-1', text: 'here is the trace', attachments: [{ filename: 'trace.txt', data: '' }] }),
       );
-      expect(findSessionForAgent(AG, MG, THREAD)).toBeDefined();
+      expect(await findSessionForAgent(AG, MG, THREAD)).toBeDefined();
     });
   });
 
   it('refuses to skip when the adapter cannot replay a thread', async () => {
-    wire();
+    await wire();
     supportsFetchThreadHistory = false;
     await withAdapter(async () => {
       const { routeInbound } = await import('./router.js');
       await routeInbound(event({ id: 'm-1', text: 'no replay hook here' }));
-      expect(findSessionForAgent(AG, MG, THREAD)).toBeDefined();
+      expect(await findSessionForAgent(AG, MG, THREAD)).toBeDefined();
     });
   });
 
   it('refuses to skip when the wiring has threads disabled', async () => {
-    wire({ threads: 0 });
+    await wire({ threads: 0 });
     await withAdapter(async () => {
       const { routeInbound } = await import('./router.js');
       await routeInbound(event({ id: 'm-1', text: 'threads off' }));
       // Thread policy strips the thread id, so the session is the chat-level one.
-      expect(findSessionForAgent(AG, MG, null)).toBeDefined();
+      expect(await findSessionForAgent(AG, MG, null)).toBeDefined();
     });
   });
 
   it('refuses to skip in a non-per-thread session mode', async () => {
-    wire({ sessionMode: 'agent-shared' });
+    await wire({ sessionMode: 'agent-shared' });
     await withAdapter(async () => {
       const { routeInbound } = await import('./router.js');
       await routeInbound(event({ id: 'm-1', text: 'agent-shared mode' }));
       const { getSessionsByAgentGroup } = await import('./db/sessions.js');
-      expect(getSessionsByAgentGroup(AG)).toHaveLength(1);
+      expect(await getSessionsByAgentGroup(AG)).toHaveLength(1);
     });
   });
 
   it('refuses to skip a channel-root message with no thread id', async () => {
-    wire();
+    await wire();
     await withAdapter(async () => {
       const { routeInbound } = await import('./router.js');
       await routeInbound(event({ id: 'm-1', text: 'channel root', threadId: null }));
-      expect(findSessionForAgent(AG, MG, null)).toBeDefined();
+      expect(await findSessionForAgent(AG, MG, null)).toBeDefined();
     });
   });
 
   it('skips both chat and chat-sdk kinds', async () => {
-    wire();
+    await wire();
     await withAdapter(async () => {
       const { routeInbound } = await import('./router.js');
       await routeInbound(event({ id: 'm-1', text: 'plain chat kind', kind: 'chat' }));
-      expect(findSessionForAgent(AG, MG, THREAD)).toBeUndefined();
+      expect(await findSessionForAgent(AG, MG, THREAD)).toBeUndefined();
       await routeInbound(event({ id: 'm-2', text: 'chat-sdk kind', kind: 'chat-sdk' }));
-      expect(findSessionForAgent(AG, MG, THREAD)).toBeUndefined();
+      expect(await findSessionForAgent(AG, MG, THREAD)).toBeUndefined();
       expect(archiveMessage).toHaveBeenCalledTimes(2);
     });
   });
 
   it('still delivers the mention when the history fetch fails', async () => {
-    wire();
+    await wire();
     await withAdapter(async () => {
       const { routeInbound } = await import('./router.js');
       await routeInbound(event({ id: 'm-1', text: 'skipped' }));
       historyThrows = true;
       await routeInbound(event({ id: 'm-2', text: '@agent hello', isMention: true }));
 
-      const session = findSessionForAgent(AG, MG, THREAD);
+      const session = await findSessionForAgent(AG, MG, THREAD);
       expect(session).toBeDefined();
       const texts = triggerTexts(session!.id);
       expect(texts).toEqual(['@agent hello']);
@@ -401,7 +407,7 @@ describe('non-engaged session skip', () => {
   });
 
   it('asks the platform for at most THREAD_CONTEXT_LIMIT messages', async () => {
-    wire();
+    await wire();
     for (let i = 0; i < 120; i++) {
       threadHistory.push({ sender: 'Sender One', text: `chatter ${i}`, timestamp: now() });
     }
@@ -413,7 +419,7 @@ describe('non-engaged session skip', () => {
       expect(historyCalls).toHaveLength(1);
       expect(historyCalls[0].opts).toEqual({ limit: 50, excludeMessageId: 'm-mention' });
 
-      const session = findSessionForAgent(AG, MG, THREAD)!;
+      const session = (await findSessionForAgent(AG, MG, THREAD))!;
       const text = triggerTexts(session.id)[0];
       // The adapter honored the cap, so the oldest 70 are gone — the accepted
       // cost of replaying instead of accumulating.
@@ -426,14 +432,14 @@ describe('non-engaged session skip', () => {
 
 describe('mention-sticky reads engaged_at, not session existence', () => {
   it('does not stick to a thread the agent has never engaged in', async () => {
-    wire({ engageMode: 'mention-sticky' });
+    await wire({ engageMode: 'mention-sticky' });
     await withAdapter(async () => {
       const { routeInbound } = await import('./router.js');
       const { wakeContainer } = await import('./container-runner.js');
 
       // A session exists but nobody engaged — the exact state the skip's
       // refusal cases leave behind.
-      createSession({
+      await createSession({
         id: 'sess-unengaged',
         agent_group_id: AG,
         messaging_group_id: MG,
@@ -450,7 +456,7 @@ describe('mention-sticky reads engaged_at, not session existence', () => {
 
       // After a real mention, the stick engages.
       await routeInbound(event({ id: 'm-2', text: '@agent hi', isMention: true }));
-      expect(findSessionForAgent(AG, MG, THREAD)!.engaged_at).toBeTruthy();
+      expect((await findSessionForAgent(AG, MG, THREAD))!.engaged_at).toBeTruthy();
       vi.mocked(wakeContainer).mockClear();
 
       await routeInbound(event({ id: 'm-3', text: 'follow-up with no mention' }));
@@ -464,7 +470,7 @@ describe('buildThreadContextBlock is caller-agnostic', () => {
   // It must apply the identical rule, so the rule is exercised directly on
   // the exported function rather than only through the router.
   it('replays the whole thread for an unengaged session, whoever is asking', async () => {
-    wire();
+    await wire();
     await withAdapter(async () => {
       const { routeInbound } = await import('./router.js');
       const { getChannelAdapter } = await import('./channels/channel-registry.js');
@@ -476,7 +482,7 @@ describe('buildThreadContextBlock is caller-agnostic', () => {
         timestamp: '2026-08-01T00:00:00.000Z',
       });
 
-      createSession({
+      await createSession({
         id: 'sess-a2a',
         agent_group_id: AG,
         messaging_group_id: MG,
@@ -487,7 +493,7 @@ describe('buildThreadContextBlock is caller-agnostic', () => {
         last_active: '2026-08-05T00:00:00.000Z',
         created_at: '2026-08-05T00:00:00.000Z',
       });
-      const session = findSessionForAgent(AG, MG, THREAD)!;
+      const session = (await findSessionForAgent(AG, MG, THREAD))!;
 
       const block = await buildThreadContextBlock({
         session,
@@ -500,10 +506,10 @@ describe('buildThreadContextBlock is caller-agnostic', () => {
   });
 
   it('cuts at the last response once the session is engaged', async () => {
-    wire();
+    await wire();
     await withAdapter(async () => {
       const { getChannelAdapter } = await import('./channels/channel-registry.js');
-      createSession({
+      await createSession({
         id: 'sess-engaged',
         agent_group_id: AG,
         messaging_group_id: MG,
@@ -522,7 +528,7 @@ describe('buildThreadContextBlock is caller-agnostic', () => {
         { sender: 'Sender Two', text: 'after the reply', timestamp: '2026-08-04T00:00:00.000Z' },
       );
 
-      const session = findSessionForAgent(AG, MG, THREAD)!;
+      const session = (await findSessionForAgent(AG, MG, THREAD))!;
       const block = await buildThreadContextBlock({
         session,
         adapter: getChannelAdapter(CHANNEL),
@@ -534,7 +540,7 @@ describe('buildThreadContextBlock is caller-agnostic', () => {
 
   it('prependThreadContext composes the same block onto plain text', async () => {
     // The composed entry point takes RAW TEXT, not a JSON content string.
-    wire();
+    await wire();
     await withAdapter(async () => {
       const { routeInbound } = await import('./router.js');
       const { prependThreadContext } = await import('./thread-context.js');
@@ -542,7 +548,7 @@ describe('buildThreadContextBlock is caller-agnostic', () => {
 
       await routeInbound(event({ id: 'm-1', text: 'skipped earlier' }));
       threadHistory.push({ sender: 'Sender One', text: 'skipped earlier', timestamp: '2026-08-01T00:00:00.000Z' });
-      createSession({
+      await createSession({
         id: 'sess-plain',
         agent_group_id: AG,
         messaging_group_id: MG,
@@ -554,7 +560,7 @@ describe('buildThreadContextBlock is caller-agnostic', () => {
         created_at: now(),
       });
       const opts = {
-        session: findSessionForAgent(AG, MG, THREAD)!,
+        session: (await findSessionForAgent(AG, MG, THREAD))!,
         adapter: getChannelAdapter(CHANNEL),
         threadId: THREAD as string | null,
       };
@@ -567,11 +573,11 @@ describe('buildThreadContextBlock is caller-agnostic', () => {
   });
 
   it('returns null when the adapter has no fetchThreadHistory', async () => {
-    wire();
+    await wire();
     supportsFetchThreadHistory = false;
     await withAdapter(async () => {
       const { getChannelAdapter } = await import('./channels/channel-registry.js');
-      createSession({
+      await createSession({
         id: 'sess-nohook',
         agent_group_id: AG,
         messaging_group_id: MG,
@@ -583,7 +589,7 @@ describe('buildThreadContextBlock is caller-agnostic', () => {
         created_at: now(),
       });
       const block = await buildThreadContextBlock({
-        session: findSessionForAgent(AG, MG, THREAD)!,
+        session: (await findSessionForAgent(AG, MG, THREAD))!,
         adapter: getChannelAdapter(CHANNEL),
         threadId: THREAD,
       });

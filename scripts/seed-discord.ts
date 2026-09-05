@@ -9,11 +9,7 @@ import { DATA_DIR } from '../src/config.js';
 import { initDb, getRawDb } from '../src/db/connection.js';
 import { runMigrations } from '../src/db/migrations/index.js';
 import { createAgentGroup, getAgentGroup } from '../src/db/agent-groups.js';
-import {
-  createMessagingGroup,
-  createMessagingGroupAgent,
-  getMessagingGroup,
-} from '../src/db/messaging-groups.js';
+import { createMessagingGroup, createMessagingGroupAgent, getMessagingGroup } from '../src/db/messaging-groups.js';
 
 await initDb(path.join(DATA_DIR, 'v2.db'));
 const db = getRawDb();
@@ -24,8 +20,8 @@ const MESSAGING_GROUP_ID = 'mg-discord';
 const CHANNEL_ID = 'discord:123456789000000001:123456789000000005';
 
 // Agent group
-if (!getAgentGroup(AGENT_GROUP_ID)) {
-  createAgentGroup({
+if (!(await getAgentGroup(AGENT_GROUP_ID))) {
+  await createAgentGroup({
     id: AGENT_GROUP_ID,
     name: 'Main',
     folder: 'main',
@@ -39,7 +35,7 @@ if (!getAgentGroup(AGENT_GROUP_ID)) {
 
 // Messaging group
 if (!getMessagingGroup(MESSAGING_GROUP_ID)) {
-  createMessagingGroup({
+  await createMessagingGroup({
     id: MESSAGING_GROUP_ID,
     channel_type: 'discord',
     platform_id: CHANNEL_ID,

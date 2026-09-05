@@ -37,8 +37,8 @@ beforeEach(async () => {
   const db = getRawDb();
   runMigrations(db);
 
-  createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
-  createSession({
+  (await createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() }));
+  (await createSession({
     id: 'sess-1',
     agent_group_id: 'ag-1',
     messaging_group_id: null,
@@ -48,7 +48,7 @@ beforeEach(async () => {
     container_status: 'stopped',
     last_active: now(),
     created_at: now(),
-  });
+  }));
 });
 
 afterEach(async () => {
@@ -63,7 +63,7 @@ describe('approval response authorization', () => {
     const handler = vi.fn().mockResolvedValue(undefined);
     registerApprovalHandler('install_packages', handler);
 
-    createPendingApproval({
+    (await createPendingApproval({
       approval_id: 'appr-1',
       session_id: 'sess-1',
       request_id: 'appr-1',
@@ -72,7 +72,7 @@ describe('approval response authorization', () => {
       created_at: now(),
       title: 'Install packages',
       options_json: JSON.stringify([]),
-    });
+    }));
 
     const claimed = await handleApprovalsResponse({
       questionId: 'appr-1',
@@ -85,7 +85,7 @@ describe('approval response authorization', () => {
 
     expect(claimed).toBe(true);
     expect(handler).not.toHaveBeenCalled();
-    expect(getPendingApproval('appr-1')).toBeDefined();
+    expect((await getPendingApproval('appr-1'))).toBeDefined();
   });
 
   it('allows an owner/admin click to dispatch the registered approval handler', async () => {
@@ -97,7 +97,7 @@ describe('approval response authorization', () => {
     const handler = vi.fn().mockResolvedValue(undefined);
     registerApprovalHandler('install_packages_allowed', handler);
 
-    createPendingApproval({
+    (await createPendingApproval({
       approval_id: 'appr-2',
       session_id: 'sess-1',
       request_id: 'appr-2',
@@ -106,7 +106,7 @@ describe('approval response authorization', () => {
       created_at: now(),
       title: 'Install packages',
       options_json: JSON.stringify([]),
-    });
+    }));
 
     const claimed = await handleApprovalsResponse({
       questionId: 'appr-2',
@@ -120,7 +120,7 @@ describe('approval response authorization', () => {
     expect(claimed).toBe(true);
     expect(handler).toHaveBeenCalledTimes(1);
     expect(handler).toHaveBeenCalledWith(expect.objectContaining({ userId: 'telegram:owner' }));
-    expect(getPendingApproval('appr-2')).toBeUndefined();
+    expect((await getPendingApproval('appr-2'))).toBeUndefined();
   });
 
   it('allows global admins to resolve approvals without a session-scoped agent group', async () => {
@@ -138,7 +138,7 @@ describe('approval response authorization', () => {
     const handler = vi.fn().mockResolvedValue(undefined);
     registerApprovalHandler('global_admin_allowed', handler);
 
-    createPendingApproval({
+    (await createPendingApproval({
       approval_id: 'appr-3',
       session_id: 'sess-1',
       agent_group_id: null,
@@ -148,7 +148,7 @@ describe('approval response authorization', () => {
       created_at: now(),
       title: 'Install packages',
       options_json: JSON.stringify([]),
-    });
+    }));
 
     const claimed = await handleApprovalsResponse({
       questionId: 'appr-3',
@@ -161,7 +161,7 @@ describe('approval response authorization', () => {
 
     expect(claimed).toBe(true);
     expect(handler).toHaveBeenCalledTimes(1);
-    expect(getPendingApproval('appr-3')).toBeUndefined();
+    expect((await getPendingApproval('appr-3'))).toBeUndefined();
   });
 
   it('keeps an approval pending when an authorized click carries an unknown value', async () => {
@@ -173,7 +173,7 @@ describe('approval response authorization', () => {
     const handler = vi.fn().mockResolvedValue(undefined);
     registerApprovalHandler('malformed_value_guard', handler);
 
-    createPendingApproval({
+    (await createPendingApproval({
       approval_id: 'appr-malformed',
       session_id: 'sess-1',
       request_id: 'appr-malformed',
@@ -182,7 +182,7 @@ describe('approval response authorization', () => {
       created_at: now(),
       title: 'Approval',
       options_json: JSON.stringify([]),
-    });
+    }));
 
     const claimed = await handleApprovalsResponse({
       questionId: 'appr-malformed',
@@ -195,7 +195,7 @@ describe('approval response authorization', () => {
 
     expect(claimed).toBe(true);
     expect(handler).not.toHaveBeenCalled();
-    expect(getPendingApproval('appr-malformed')).toBeDefined();
+    expect((await getPendingApproval('appr-malformed'))).toBeDefined();
   });
 
   it('an approval with approver_user_id is resolvable by that user, not a non-assignee', async () => {
@@ -204,7 +204,7 @@ describe('approval response authorization', () => {
     const handler = vi.fn().mockResolvedValue(undefined);
     registerApprovalHandler('assigned_approver_action', handler);
 
-    createPendingApproval({
+    (await createPendingApproval({
       approval_id: 'appr-4',
       session_id: 'sess-1',
       request_id: 'appr-4',
@@ -214,7 +214,7 @@ describe('approval response authorization', () => {
       title: 'Assigned approval',
       options_json: JSON.stringify([]),
       approver_user_id: 'telegram:dana',
-    });
+    }));
 
     // A non-assignee (no global/owner role) cannot resolve it.
     await handleApprovalsResponse({
@@ -226,7 +226,7 @@ describe('approval response authorization', () => {
       threadId: null,
     });
     expect(handler).not.toHaveBeenCalled();
-    expect(getPendingApproval('appr-4')).toBeDefined();
+    expect((await getPendingApproval('appr-4'))).toBeDefined();
 
     // The named approver resolves it.
     await handleApprovalsResponse({
@@ -238,6 +238,6 @@ describe('approval response authorization', () => {
       threadId: null,
     });
     expect(handler).toHaveBeenCalledTimes(1);
-    expect(getPendingApproval('appr-4')).toBeUndefined();
+    expect((await getPendingApproval('appr-4'))).toBeUndefined();
   });
 });

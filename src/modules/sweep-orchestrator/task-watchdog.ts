@@ -127,7 +127,7 @@ export async function sweepTaskWatchdog(): Promise<void> {
         parentSessionId: task.parent_session_id,
       });
 
-      const parentSession = getSession(task.parent_session_id);
+      const parentSession = await getSession(task.parent_session_id);
       if (!parentSession) continue;
 
       try {

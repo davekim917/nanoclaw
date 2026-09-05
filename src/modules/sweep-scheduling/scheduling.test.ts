@@ -402,7 +402,7 @@ beforeEach(async () => {
   const db = getRawDb();
   db.pragma('foreign_keys = ON');
   runMigrations(db);
-  createAgentGroup({
+  await createAgentGroup({
     id: 'ag-test',
     name: 'ag-test',
     folder: 'g-test',

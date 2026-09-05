@@ -13,7 +13,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR } from '../src/config.js';
-import { getAgentGroupByFolder, deleteAgentGroup } from '../src/db/agent-groups.js';
+import { getAgentGroupByFolder } from '../src/db/agent-groups.js';
 import { initDb, getRawDb } from '../src/db/connection.js';
 import { runMigrations } from '../src/db/migrations/index.js';
 
@@ -40,7 +40,7 @@ await initDb(path.join(DATA_DIR, 'v2.db'));
 const db = getRawDb();
 runMigrations(db);
 
-const ag = getAgentGroupByFolder(args.folder);
+const ag = await getAgentGroupByFolder(args.folder);
 if (!ag) {
   console.log(`No agent group with folder "${args.folder}" — nothing to delete.`);
   process.exit(0);
@@ -57,7 +57,9 @@ const cleanup = db.transaction(() => {
   for (const { name } of tables) {
     db.prepare(`DELETE FROM ${name} WHERE agent_group_id = ?`).run(ag.id);
   }
-  deleteAgentGroup(ag.id);
+  // Inside a raw transaction closure the leaf's SQL runs on the raw handle
+  // (seam-3 plan §4.2): the async export cannot be awaited here.
+  db.prepare('DELETE FROM agent_groups WHERE id = ?').run(ag.id);
 });
 cleanup();
 

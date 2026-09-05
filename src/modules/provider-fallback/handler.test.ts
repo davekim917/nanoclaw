@@ -47,7 +47,7 @@ describe('provider_unavailable handler', () => {
     await initTestDb();
     const db = getRawDb();
     runMigrations(db);
-    createAgentGroup({
+    await createAgentGroup({
       id: GID,
       name: FOLDER,
       folder: FOLDER,

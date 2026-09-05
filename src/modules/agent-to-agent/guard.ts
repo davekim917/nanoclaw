@@ -17,8 +17,9 @@
  * outcome. Policy rows can only tighten (hold), never allow: absence of a
  * row falls through to the structural checks.
  */
-import { getAgentGroup } from '../../db/agent-groups.js';
-import { getContainerConfig } from '../../db/container-configs.js';
+import { AGENT_GROUP_BY_ID_SQL } from '../../db/agent-groups.js';
+import { getRawDb } from '../../db/connection.js';
+import { CONTAINER_CONFIG_BY_GROUP_SQL } from '../../db/container-configs.js';
 import { ALLOW, DENY, HOLD, defineGuardedAction } from '../../guard/index.js';
 import { hasDestination } from './db/agent-destinations.js';
 import { getMessagePolicy } from './db/agent-message-policies.js';
@@ -43,7 +44,7 @@ export const agentsCreate = defineGuardedAction({
   },
   decide: (input) => {
     if (input.actor.kind !== 'agent') return DENY('create_agent is a container-originated action.');
-    const cliScope = getContainerConfig(input.actor.agentGroupId)?.cli_scope ?? 'group';
+    const cliScope = cliScopeOf(input.actor.agentGroupId);
     if (cliScope === 'global') {
       // Trusted owner agent group — an approval tap on every sub-agent spawn
       // would be needless friction.
@@ -75,7 +76,7 @@ export const a2aSend = defineGuardedAction({
     if (!isSelf && !hasDestination(from, 'agent', to)) {
       return DENY(`unauthorized agent-to-agent: ${from} has no destination for ${to}`);
     }
-    if (!getAgentGroup(to)) {
+    if (getRawDb().prepare(AGENT_GROUP_BY_ID_SQL).get(to) === undefined) {
       return DENY(`target agent group ${to} not found for message ${String(input.payload.id)}`);
     }
     if (isSelf) return ALLOW('self-send');
@@ -86,3 +87,15 @@ export const a2aSend = defineGuardedAction({
     return ALLOW('destination grant exists');
   },
 });
+
+// Synchronous by design (seam-3 plan §4.5, I-1): this decision runs inside
+// callers' guard-adjacent blocks — `guard(a2aSend)` inside the agent-route
+// WriteGuard, `guard(threadsClose)` inside thread-close's one synchronous
+// decision — so it never awaits. Its central reads use the leaf's exported SQL
+// on the raw handle; PR 6 wraps them in `withRawDb` inside `withCentralSync`.
+function cliScopeOf(agentGroupId: string): string {
+  const row = getRawDb().prepare(CONTAINER_CONFIG_BY_GROUP_SQL).get(agentGroupId) as
+    | { cli_scope: string | null }
+    | undefined;
+  return row?.cli_scope ?? 'group';
+}

@@ -33,6 +33,7 @@
  * safe — worst case we round-trip redundantly.
  */
 import { getChannelAdapter } from '../../channels/channel-registry.js';
+import { insertOrAdopt } from '../../db/insert-or-adopt.js';
 import { getMessagingGroup, getMessagingGroupByPlatform, createMessagingGroup } from '../../db/messaging-groups.js';
 import { log } from '../../log.js';
 import type { MessagingGroup, User } from '../../types.js';
@@ -107,7 +108,7 @@ export async function ensureUserDm(userId: string, instance?: string): Promise<M
   // table is UNIQUE(channel_type, platform_id, instance), so a per-instance
   // row is the intended shape; exact-only here means a miss creates one.
   const now = new Date().toISOString();
-  let mg = getMessagingGroupByPlatform(channelType, dmPlatformId, instance);
+  let mg = await getMessagingGroupByPlatform(channelType, dmPlatformId, instance);
   if (!mg) {
     const mgId = `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     mg = {
@@ -127,13 +128,30 @@ export async function ensureUserDm(userId: string, instance?: string): Promise<M
       unknown_sender_policy: 'strict',
       created_at: now,
     };
-    createMessagingGroup(mg);
-    log.info('ensureUserDm: created DM messaging_group', {
-      userId,
-      channelType,
-      instance: mg.instance ?? channelType,
-      messagingGroupId: mgId,
-    });
+    // The lookup above yields (async driver), so two cold DMs to the same
+    // user can both miss and both insert on the UNIQUE(channel_type,
+    // platform_id, instance) key. The loser adopts the winner's row and
+    // continues to `upsertUserDm` + delivery, so both callers cache and DM the
+    // SAME messaging group rather than one aborting mid-approval.
+    const { row: resolved, created } = await insertOrAdopt(mg, createMessagingGroup, () =>
+      getMessagingGroupByPlatform(channelType, dmPlatformId, instance),
+    );
+    mg = resolved;
+    if (created) {
+      log.info('ensureUserDm: created DM messaging_group', {
+        userId,
+        channelType,
+        instance: mg.instance ?? channelType,
+        messagingGroupId: mgId,
+      });
+    } else {
+      log.info('ensureUserDm: adopted concurrently created DM messaging_group', {
+        userId,
+        channelType,
+        instance: mg.instance ?? channelType,
+        messagingGroupId: mg.id,
+      });
+    }
   }
 
   upsertUserDm({

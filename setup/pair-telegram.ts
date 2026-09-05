@@ -22,16 +22,40 @@ import path from 'path';
 
 import * as p from '@clack/prompts';
 
-import {
-  createPairing,
-  waitForPairing,
-  type PairingIntent,
-} from '../src/channels/telegram-pairing.js';
 import { DATA_DIR } from '../src/config.js';
 import { initDb, getRawDb } from '../src/db/connection.js';
 import { runMigrations } from '../src/db/migrations/index.js';
 
 import { emitStatus } from './status.js';
+
+type PairingIntent =
+  | 'main'
+  | { kind: 'wire-to'; folder: string }
+  | { kind: 'new-agent'; folder: string };
+
+type PairingRecord = {
+  code: string;
+  intent: PairingIntent;
+  consumed?: {
+    platformId: string;
+    isGroup: boolean;
+    adminUserId: string | null;
+  };
+};
+
+type TelegramPairingModule = {
+  createPairing: (intent: PairingIntent) => Promise<PairingRecord>;
+  waitForPairing: (
+    code: string,
+    options: { onAttempt?: (attempt: { candidate: string }) => void },
+  ) => Promise<PairingRecord>;
+};
+
+const telegramPairingModule = '../src/channels/telegram-pairing.js';
+
+async function loadTelegramPairing(): Promise<TelegramPairingModule> {
+  return import(telegramPairingModule);
+}
 
 function parseArgs(args: string[]): PairingIntent {
   let intent: PairingIntent = 'main';
@@ -82,6 +106,7 @@ function printAttempt(candidate: string): void {
 
 export async function run(args: string[]): Promise<void> {
   const intent = parseArgs(args);
+  const { createPairing, waitForPairing } = await loadTelegramPairing();
 
   // Pairing stores state under DATA_DIR; the DB isn't strictly needed for the
   // pairing primitive itself, but the inbound interceptor running inside the

@@ -28,7 +28,7 @@ import {
   type SessionReadLocation,
 } from '../../modules/mailbox/index.js';
 import { wakeContainer } from '../../container-runner.js';
-import { admitDueTaskContexts, withExistingMailboxSession } from '../../session-manager.js';
+import { admitDueTaskContextsFor, resolveRecallCentral, withExistingMailboxSession } from '../../session-manager.js';
 import { log } from '../../log.js';
 import { parseUtcTimestampMs } from '../../thread-context.js';
 import { emitDashboardEvent } from './events.js';
@@ -475,7 +475,7 @@ export const editHandler: AuthHandler = async (req, params, ctx) => {
   if (body.script !== undefined) update.script = body.script;
   if (body.cron !== undefined) {
     update.recurrence = body.cron;
-    update.processAfter = nextSlot(body.cron, nowMs, resolveGroupTimezone(t.agentGroupId));
+    update.processAfter = nextSlot(body.cron, nowMs, await resolveGroupTimezone(t.agentGroupId));
   }
 
   // Existing-only: a mutation must never provision the session it edits
@@ -548,13 +548,16 @@ export const resumeHandler: AuthHandler = async (_req, params, ctx) => {
   });
   if (!verdict.allowed) return verdictResponse(verdict);
 
+  // Resolved before the session so the mutation action stays one synchronous
+  // block from its verdict to its writes.
+  const timezone = t.live.recurrence ? await resolveGroupTimezone(t.agentGroupId) : null;
   const outcome = await mutateWithInvalidation(t, 'resume', nowMs, (mailbox) => {
     // §4.7: recompute process_after to the next FUTURE slot BEFORE flipping to
     // pending (skip-don't-replay, D3) — a paused-past-its-slot series must not
     // fire immediately on resume.
-    if (t.live.recurrence) {
+    if (t.live.recurrence && timezone !== null) {
       mailbox.updateTask(t.seriesId, {
-        processAfter: nextSlot(t.live.recurrence, nowMs, resolveGroupTimezone(t.agentGroupId)),
+        processAfter: nextSlot(t.live.recurrence, nowMs, timezone),
       });
     }
     return mailbox.resumeTask(t.seriesId);
@@ -605,6 +608,9 @@ export const runNowHandler: AuthHandler = async (req, params, ctx) => {
   // Fire: process_after = now, then wake the container. Recurrence advances
   // normally on completion (an early fire does not shift the schedule — §4.6).
   let admittedTarget = false;
+  // The recall's one central read, before the session: the mutation action
+  // proves its verdict and mutates in one synchronous block.
+  const recallCentral = await resolveRecallCentral(t.agentGroupId, t.sessionId);
   const outcome = await mutateWithInvalidation(
     t,
     'run_now',
@@ -618,7 +624,7 @@ export const runNowHandler: AuthHandler = async (req, params, ctx) => {
         keepScheduledFor: true,
       });
       if (n > 0) {
-        admitDueTaskContexts(mailbox, t.agentGroupId, t.sessionId);
+        admitDueTaskContextsFor(mailbox, t.agentGroupId, t.sessionId, recallCentral);
         admittedTarget = mailbox.taskPairIsAdmitted(t.live.id);
         if (!admittedTarget) {
           // Do not silently turn a failed run-now request into a later run-now.
@@ -643,7 +649,7 @@ export const runNowHandler: AuthHandler = async (req, params, ctx) => {
     );
   }
 
-  const session = getSession(t.sessionId);
+  const session = await getSession(t.sessionId);
   if (session) {
     void wakeContainer(session).catch((err) => log.warn('scheduled-mutations: run-now wake failed', { err }));
   }

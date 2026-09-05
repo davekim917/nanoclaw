@@ -51,7 +51,7 @@ afterAll(() => {
 });
 
 describe('codex provider container-config: agents/ mount', () => {
-  it('test_mounts_group_owned_agents_dir_readonly_never_host', () => {
+  it('test_mounts_group_owned_agents_dir_readonly_never_host', async () => {
     const fn = getProviderContainerConfig('codex');
     expect(fn).toBeDefined();
 
@@ -61,7 +61,7 @@ describe('codex provider container-config: agents/ mount', () => {
     fs.mkdirSync(path.join(groupDir, '.codex', 'agents'), { recursive: true });
     fs.writeFileSync(path.join(groupDir, '.codex', 'agents', 'qa-worker.toml'), 'name = "qa-worker"\n');
 
-    const contribution = fn!(makeCtx({ groupDir }));
+    const contribution = await fn!(makeCtx({ groupDir }));
     const agentsMount = (contribution.mounts ?? []).find((m) => m.containerPath === '/home/node/.codex/agents');
 
     expect(agentsMount).toBeDefined();
@@ -70,13 +70,13 @@ describe('codex provider container-config: agents/ mount', () => {
     expect(agentsMount!.overlayAllowedRoots).toEqual([fs.realpathSync(groupDir)]);
   });
 
-  it('test_no_agents_mount_when_group_dir_absent_even_with_host_agents', () => {
+  it('test_no_agents_mount_when_group_dir_absent_even_with_host_agents', async () => {
     const fn = getProviderContainerConfig('codex')!;
     // Host home HAS an agents/ dir (beforeAll), but the group owns none —
     // no mount. Host defs must never fall through to a container.
     const emptyGroupDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-codex-nogroup-'));
     try {
-      const contribution = fn(makeCtx({ groupDir: emptyGroupDir }));
+      const contribution = await fn(makeCtx({ groupDir: emptyGroupDir }));
       const agentsMount = (contribution.mounts ?? []).find((m) => m.containerPath === '/home/node/.codex/agents');
       expect(agentsMount).toBeUndefined();
     } finally {
@@ -84,7 +84,7 @@ describe('codex provider container-config: agents/ mount', () => {
     }
   });
 
-  it('test_codex_config_is_generated_never_copied_from_host', () => {
+  it('test_codex_config_is_generated_never_copied_from_host', async () => {
     const fn = getProviderContainerConfig('codex')!;
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-codex-sanitize-'));
     const sessionDir = path.join(home, 'session');
@@ -114,7 +114,7 @@ describe('codex provider container-config: agents/ mount', () => {
     fs.writeFileSync(path.join(codexHome, 'config.toml'), hostConfig);
 
     try {
-      fn(
+      await fn(
         makeCtx({
           sessionDir,
           agentGroupFolder: 'sanitize',
@@ -145,7 +145,7 @@ describe('codex provider container-config: agents/ mount', () => {
     }
   });
 
-  it('test_spawn_replaces_poisoned_runtime_entries_and_clears_stale_config_without_host_config', () => {
+  it('test_spawn_replaces_poisoned_runtime_entries_and_clears_stale_config_without_host_config', async () => {
     const fn = getProviderContainerConfig('codex')!;
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-codex-poisoned-'));
     const home = path.join(root, 'home');
@@ -170,7 +170,7 @@ describe('codex provider container-config: agents/ mount', () => {
     fs.symlinkSync(path.join(outside, 'auth-victim'), path.join(runtimeHome, 'auth.json'));
 
     try {
-      fn(
+      await fn(
         makeCtx({
           sessionDir,
           agentGroupFolder: 'poisoned',
@@ -196,7 +196,7 @@ describe('codex provider container-config: agents/ mount', () => {
     }
   });
 
-  it('test_spawn_rejects_a_symlinked_runtime_root', () => {
+  it('test_spawn_rejects_a_symlinked_runtime_root', async () => {
     const fn = getProviderContainerConfig('codex')!;
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-codex-root-link-'));
     const home = path.join(root, 'home');

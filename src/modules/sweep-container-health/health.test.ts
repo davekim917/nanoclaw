@@ -18,6 +18,7 @@ import { type ContainerState } from '../mailbox/ops/sweep.js';
 import { composeNanoclawSession, type NanoclawMailboxSession } from '../mailbox/index.js';
 import { getAgentMailbox } from '../../mailbox/index.js';
 import { closeDb, initTestDb, runMigrations, getRawDb } from '../../db/index.js';
+import { createSession } from '../../db/sessions.js';
 import {
   ABSOLUTE_CEILING_MS,
   CLAIM_STUCK_MS,
@@ -885,6 +886,13 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
     await initTestDb();
     const db = getRawDb();
     runMigrations(db);
+    // The heal's "target still live" check re-reads the session on the RAW
+    // handle (seam-3 §4.5 I-1, `sessionStillActive`), so the row has to exist
+    // in the test DB and not only behind the `getSession` mock.
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-test', 'test', 'group-folder', ?)`,
+    ).run(new Date().toISOString());
+    await createSession(fakeSession());
     armSelfHeal(true);
     _resetProviderHealTicksForTesting();
     mockMarkProviderUnavailable.mockReset();
@@ -1375,6 +1383,8 @@ describe('provider self-heal claims the health phase and the later branches do n
 
     const session: Session = { ...fakeSession(), id: 'sess-health', agent_group_id: 'ag-health' };
     mockGetSession.mockReturnValue(session);
+    // The heal's liveness re-read is a raw-handle read (seam-3 §4.5 I-1).
+    await createSession(session);
 
     getAgentMailbox().prepare({ agentGroupId: session.agent_group_id, sessionId: session.id });
 
@@ -1461,13 +1471,23 @@ describe('provider self-heal claims the health phase and the later branches do n
 // `claims`/`run` itself, pinning the registration's own wiring (which fields
 // of `ctx` it reads, in what order) independently of the full driver.
 describe('registered S11/S14/S16 entries reach their bodies', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    // The heal's liveness re-read is a raw-handle read (seam-3 §4.5 I-1): the
+    // session row must exist in a real test DB, not only behind the mock.
+    await initTestDb();
+    const central = getRawDb();
+    runMigrations(central);
+    central
+      .prepare(`INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-test', 'test', 'group-folder', ?)`)
+      .run(new Date().toISOString());
+    await createSession(fakeSession());
     mockKillContainer.mockReset();
     mockGetSession.mockReset();
     mockWakeContainer.mockReset();
     mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'codex' });
     _resetProviderHealTicksForTesting();
   });
+  afterEach(() => closeDb());
 
   it('S11: the registered claims() delegates to sweepProviderHeal and reaches killContainer', async () => {
     const { duties } = _listSweepRegistrationsForTesting();

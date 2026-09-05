@@ -34,7 +34,7 @@ import {
   isWorkgroupRepositoryMountClaimed,
   resolveRepositoryWorkUnit,
 } from './repository-workspaces.js';
-import type { Session } from './types.js';
+import type { Session, AgentGroup } from './types.js';
 
 export interface OrphanedRepoFenceRecovery {
   /** Sessions whose inbound DB was actually opened and inspected. */
@@ -90,8 +90,7 @@ async function yieldEventLoop(index: number): Promise<void> {
  * Throws rather than guessing when identity cannot be resolved; the caller
  * counts that session as unreadable and never releases it (fail closed).
  */
-function repositoryTransitionInFlight(session: Session): boolean {
-  const group = getAgentGroup(session.agent_group_id);
+function repositoryTransitionInFlight(session: Session, group: AgentGroup | undefined): boolean {
   // No agent group row means no workgroup for a publication to be claiming.
   if (!group) return false;
   const workgroupId = group.workgroup_id ?? group.folder;
@@ -125,7 +124,7 @@ export async function releaseOrphanedRepoIngressFences(
   const report = emptyRecovery();
   let sessions: Session[];
   try {
-    sessions = candidates ?? getActiveSessions();
+    sessions = candidates ?? (await getActiveSessions());
   } catch (err) {
     log.error('Orphaned repository fence pass could not load sessions', { reason, err });
     return report;
@@ -139,6 +138,11 @@ export async function releaseOrphanedRepoIngressFences(
       // and a session with no mailbox has no fence — the ordinary steady state.
       // The wake happens after the loop, so no mailbox session is ever held
       // across `wakeRepositoryMountSessions` (invariant I-3).
+      // The one central read the in-flight check needs, taken BEFORE the
+      // session opens so the action below stays synchronous from its fence
+      // read to its release. A throw here is "identity unresolvable" and is
+      // counted as unreadable by the catch, exactly as the read inside used to.
+      const group = await getAgentGroup(session.agent_group_id);
       const needsWake = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
         report.scanned += 1;
         const fence = mailbox.readRepoIngressFence();
@@ -148,7 +152,7 @@ export async function releaseOrphanedRepoIngressFences(
         // owning publication has released its own barriers, so a synchronous
         // check-then-release cannot tear a live publication's fence out from
         // under it.
-        if (repositoryTransitionInFlight(session)) {
+        if (repositoryTransitionInFlight(session, group)) {
           report.inFlight += 1;
           return false;
         }
@@ -273,12 +277,15 @@ export async function releaseOrphanedRepoIngressFencesForDroppedMessage(
   // publish/transfer actions there can fence anything. A dropped chat row
   // never justifies opening every inbound DB in a workgroup.
   if (msg.kind !== 'system') return null;
-  const group = getAgentGroup(session.agent_group_id);
+  const group = await getAgentGroup(session.agent_group_id);
   if (!group) return null;
   const workgroupId = group.workgroup_id ?? group.folder;
-  const workgroupSessions = getAllAgentGroups()
-    .filter((candidate) => (candidate.workgroup_id ?? candidate.folder) === workgroupId)
-    .flatMap((candidate) => getSessionsByAgentGroup(candidate.id));
+  const workgroupGroups = (await getAllAgentGroups()).filter(
+    (candidate) => (candidate.workgroup_id ?? candidate.folder) === workgroupId,
+  );
+  const workgroupSessions = (
+    await Promise.all(workgroupGroups.map((candidate) => getSessionsByAgentGroup(candidate.id)))
+  ).flat();
   const report = await releaseOrphanedRepoIngressFences('dropped delivery', workgroupSessions);
   if (report.released > 0 || report.failed > 0) {
     log.warn('Released orphaned repository ingress fences after a dropped delivery', {

@@ -28,8 +28,8 @@ async function setupDb(): Promise<void> {
   runMigrations(db);
 }
 
-function seedAgentAndSession(agId: string, sessId: string): void {
-  createAgentGroup({ id: agId, name: agId, folder: agId, agent_provider: null, created_at: now() });
+async function seedAgentAndSession(agId: string, sessId: string): Promise<void> {
+  await createAgentGroup({ id: agId, name: agId, folder: agId, agent_provider: null, created_at: now() });
   getRawDb().prepare(`INSERT INTO sessions (id, agent_group_id, created_at) VALUES (?, ?, ?)`).run(sessId, agId, now());
 }
 
@@ -70,8 +70,8 @@ function makeTask(overrides: Partial<Omit<Task, 'created_at'>> = {}): Omit<Task,
 describe('tasks CRUD', () => {
   it('test_insert_atomic_idempotent_collision', async () => {
     await setupDb();
-    seedAgentAndSession('ag-parent', 'sess-parent');
-    seedAgentAndSession('ag-target', 'sess-target');
+    await seedAgentAndSession('ag-parent', 'sess-parent');
+    await seedAgentAndSession('ag-target', 'sess-target');
 
     const t = makeTask();
     const first = insertTaskAtomic(t);
@@ -84,8 +84,8 @@ describe('tasks CRUD', () => {
 
   it('test_get_by_id', async () => {
     await setupDb();
-    seedAgentAndSession('ag-parent', 'sess-parent');
-    seedAgentAndSession('ag-target', 'sess-target');
+    await seedAgentAndSession('ag-parent', 'sess-parent');
+    await seedAgentAndSession('ag-target', 'sess-target');
 
     insertTaskAtomic(makeTask());
     const found = getTaskById('task-1');
@@ -96,8 +96,8 @@ describe('tasks CRUD', () => {
 
   it('test_get_by_parent_and_idempotency', async () => {
     await setupDb();
-    seedAgentAndSession('ag-parent', 'sess-parent');
-    seedAgentAndSession('ag-target', 'sess-target');
+    await seedAgentAndSession('ag-parent', 'sess-parent');
+    await seedAgentAndSession('ag-target', 'sess-target');
 
     insertTaskAtomic(makeTask());
     const found = getTaskByParentAndIdempotency('sess-parent', 'ik-1');
@@ -110,8 +110,8 @@ describe('tasks CRUD', () => {
 
   it('test_acquire_lease_blocks_concurrent', async () => {
     await setupDb();
-    seedAgentAndSession('ag-parent', 'sess-parent');
-    seedAgentAndSession('ag-target', 'sess-target');
+    await seedAgentAndSession('ag-parent', 'sess-parent');
+    await seedAgentAndSession('ag-target', 'sess-target');
 
     insertTaskAtomic(makeTask());
 
@@ -124,8 +124,8 @@ describe('tasks CRUD', () => {
 
   it('test_update_artifact_status_guard', async () => {
     await setupDb();
-    seedAgentAndSession('ag-parent', 'sess-parent');
-    seedAgentAndSession('ag-target', 'sess-target');
+    await seedAgentAndSession('ag-parent', 'sess-parent');
+    await seedAgentAndSession('ag-target', 'sess-target');
 
     // Insert in cancelled status by inserting then directly updating
     insertTaskAtomic(makeTask());
@@ -140,8 +140,8 @@ describe('tasks CRUD', () => {
 
   it('test_update_artifact_succeeds_for_pending', async () => {
     await setupDb();
-    seedAgentAndSession('ag-parent', 'sess-parent');
-    seedAgentAndSession('ag-target', 'sess-target');
+    await seedAgentAndSession('ag-parent', 'sess-parent');
+    await seedAgentAndSession('ag-target', 'sess-target');
 
     insertTaskAtomic(makeTask());
     const updated = updateArtifactColumn('task-1', 'parent_platform_message_id', 'msg-1');
@@ -153,8 +153,8 @@ describe('tasks CRUD', () => {
 
   it('test_transition_terminal_only_from_active', async () => {
     await setupDb();
-    seedAgentAndSession('ag-parent', 'sess-parent');
-    seedAgentAndSession('ag-target', 'sess-target');
+    await seedAgentAndSession('ag-parent', 'sess-parent');
+    await seedAgentAndSession('ag-target', 'sess-target');
 
     insertTaskAtomic(makeTask());
     // First transition to completed
@@ -171,8 +171,8 @@ describe('tasks CRUD', () => {
 
   it('test_transition_to_cancelled', async () => {
     await setupDb();
-    seedAgentAndSession('ag-parent', 'sess-parent');
-    seedAgentAndSession('ag-target', 'sess-target');
+    await seedAgentAndSession('ag-parent', 'sess-parent');
+    await seedAgentAndSession('ag-target', 'sess-target');
 
     insertTaskAtomic(makeTask());
     const ok = transitionToTerminal('task-1', 'cancelled', { cancelled_at: now() });
@@ -184,8 +184,8 @@ describe('tasks CRUD', () => {
 
   it('test_increment_completion_attempts', async () => {
     await setupDb();
-    seedAgentAndSession('ag-parent', 'sess-parent');
-    seedAgentAndSession('ag-target', 'sess-target');
+    await seedAgentAndSession('ag-parent', 'sess-parent');
+    await seedAgentAndSession('ag-target', 'sess-target');
 
     insertTaskAtomic(makeTask());
     const count = incrementCompletionAttempts('task-1');
@@ -197,8 +197,8 @@ describe('tasks CRUD', () => {
 
   it('test_get_orphaned_tasks', async () => {
     await setupDb();
-    seedAgentAndSession('ag-parent', 'sess-parent');
-    seedAgentAndSession('ag-target', 'sess-target');
+    await seedAgentAndSession('ag-parent', 'sess-parent');
+    await seedAgentAndSession('ag-target', 'sess-target');
 
     // Insert task with no child_session_id and no lease
     insertTaskAtomic(makeTask());
@@ -210,8 +210,8 @@ describe('tasks CRUD', () => {
 
   it('test_get_orphaned_tasks_excludes_leased', async () => {
     await setupDb();
-    seedAgentAndSession('ag-parent', 'sess-parent');
-    seedAgentAndSession('ag-target', 'sess-target');
+    await seedAgentAndSession('ag-parent', 'sess-parent');
+    await seedAgentAndSession('ag-target', 'sess-target');
 
     insertTaskAtomic(makeTask());
     acquireCompletionLease('task-1', 60);

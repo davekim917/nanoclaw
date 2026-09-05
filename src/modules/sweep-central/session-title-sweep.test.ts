@@ -163,7 +163,7 @@ beforeEach(async () => {
   const db = getRawDb();
   db.pragma('foreign_keys = ON');
   runMigrations(db);
-  createAgentGroup({ id: 'ag-1', name: 'ag-1', folder: 'ag-1', agent_provider: null, created_at: now() });
+  await createAgentGroup({ id: 'ag-1', name: 'ag-1', folder: 'ag-1', agent_provider: null, created_at: now() });
   __resetCallHaikuSlotCacheForTest();
   __resetCredentialRotationGateForTest();
   __setCredentialRotationGateMinIntervalForTest(0);

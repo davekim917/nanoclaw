@@ -73,7 +73,7 @@ export async function dispatch(
   // Group-scope mechanics for agent callers (visibility, not policy — the
   // allow/hold/deny decisions live in the guard decision, cli/guard.ts).
   if (ctx.caller === 'agent') {
-    const configRow = getContainerConfig(ctx.agentGroupId);
+    const configRow = await getContainerConfig(ctx.agentGroupId);
     const cliScope = configRow?.cli_scope ?? 'group';
 
     if (cliScope === 'group') {
@@ -94,7 +94,7 @@ export async function dispatch(
       // regardless of whether the UUID exists in another group, preventing an
       // existence oracle across group boundaries.
       if (cmd.resource === 'sessions' && req.command === 'sessions-get' && req.args.id) {
-        const s = getSession(req.args.id as string);
+        const s = await getSession(req.args.id as string);
         if (!s || s.agent_group_id !== ctx.agentGroupId) {
           return err(req.id, 'handler-error', `session not found: ${req.args.id}`);
         }
@@ -129,11 +129,11 @@ export async function dispatch(
       // fail closed rather than card a ghost.
       return err(req.id, 'forbidden', decision.reason);
     }
-    const session = getSession(ctx.sessionId);
+    const session = await getSession(ctx.sessionId);
     if (!session) {
       return err(req.id, 'handler-error', 'Session not found.');
     }
-    const agentGroup = getAgentGroup(ctx.agentGroupId);
+    const agentGroup = await getAgentGroup(ctx.agentGroupId);
     const agentName = agentGroup?.name ?? ctx.agentGroupId;
 
     const argSummary = Object.entries(req.args)
@@ -175,7 +175,7 @@ export async function dispatch(
     // pre-handler `--id` auto-fill (groups/destinations) or gated behind approval,
     // so they can't reach another group's data anyway.
     if (ctx.caller === 'agent' && cmd.resource && cmd.generic) {
-      const configRow = getContainerConfig(ctx.agentGroupId);
+      const configRow = await getContainerConfig(ctx.agentGroupId);
       if ((configRow?.cli_scope ?? 'group') === 'group') {
         const def = getResource(cmd.resource);
         const groupField = def?.scopeField;
@@ -230,13 +230,15 @@ registerApprovalHandler('cli_command', async ({ payload, approval, notify }) => 
   if (response.ok) {
     const localized = localizeIsoTimestamps(response.data);
     const data = typeof localized === 'string' ? localized : JSON.stringify(localized, null, 2);
-    void Promise.resolve(
-      notify(`Your \`ncl ${frame.command}\` request was approved and executed.\n\n${data}`),
-    ).catch((err) => log.warn('cli_command approval notification failed', { command: frame.command, err: errMsg(err) }));
+    void Promise.resolve(notify(`Your \`ncl ${frame.command}\` request was approved and executed.\n\n${data}`)).catch(
+      (err) => log.warn('cli_command approval notification failed', { command: frame.command, err: errMsg(err) }),
+    );
   } else {
     void Promise.resolve(
       notify(`Your \`ncl ${frame.command}\` request was approved but failed: ${response.error.message}`),
-    ).catch((err) => log.warn('cli_command approval notification failed', { command: frame.command, err: errMsg(err) }));
+    ).catch((err) =>
+      log.warn('cli_command approval notification failed', { command: frame.command, err: errMsg(err) }),
+    );
   }
 });
 

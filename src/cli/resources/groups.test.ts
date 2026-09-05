@@ -77,8 +77,8 @@ describe('groups CLI delete cascades dependent rows (#2525)', () => {
     const MGID = 'mg-1';
     const UID = 'tg:42';
 
-    createAgentGroup({ id: GID, name: 'victim', folder: 'victim', agent_provider: null, created_at: now() });
-    createSession({
+    await createAgentGroup({ id: GID, name: 'victim', folder: 'victim', agent_provider: null, created_at: now() });
+    await createSession({
       id: SID,
       agent_group_id: GID,
       messaging_group_id: null,
@@ -201,8 +201,8 @@ describe('groups CLI delete cascades dependent rows (#2525)', () => {
   it('removes polymorphic agent_destinations that point at the deleted group', async () => {
     const A = 'ag-a';
     const B = 'ag-b';
-    createAgentGroup({ id: A, name: 'a', folder: 'a', agent_provider: null, created_at: now() });
-    createAgentGroup({ id: B, name: 'b', folder: 'b', agent_provider: null, created_at: now() });
+    await createAgentGroup({ id: A, name: 'a', folder: 'a', agent_provider: null, created_at: now() });
+    await createAgentGroup({ id: B, name: 'b', folder: 'b', agent_provider: null, created_at: now() });
 
     const db = getRawDb();
 
@@ -242,8 +242,14 @@ describe('groups CLI delete cascades dependent rows (#2525)', () => {
     const TWIN = 'ag-seed-codex';
     const WG = 'example-retail';
     const db = getRawDb();
-    createAgentGroup({ id: SEED, name: 'seed', folder: 'seed', agent_provider: null, created_at: now() });
-    createAgentGroup({ id: TWIN, name: 'seed-codex', folder: 'seed-codex', agent_provider: null, created_at: now() });
+    await createAgentGroup({ id: SEED, name: 'seed', folder: 'seed', agent_provider: null, created_at: now() });
+    await createAgentGroup({
+      id: TWIN,
+      name: 'seed-codex',
+      folder: 'seed-codex',
+      agent_provider: null,
+      created_at: now(),
+    });
     // Workgroups row must exist before workgroup_id FK can be set.
     db.prepare(`INSERT INTO workgroups (id, onecli_secrets, created_at) VALUES (?, '[]', ?)`).run(WG, now());
     // Bind both to the same workgroup (the migration-036 invariant)
@@ -272,7 +278,7 @@ describe('groups CLI delete cascades dependent rows (#2525)', () => {
     const SOLO = 'ag-solo';
     const WG = 'solo';
     const db = getRawDb();
-    createAgentGroup({ id: SOLO, name: 'solo', folder: 'solo', agent_provider: null, created_at: now() });
+    await createAgentGroup({ id: SOLO, name: 'solo', folder: 'solo', agent_provider: null, created_at: now() });
     // Seed the workgroups row as migration-036 would for a solo agent.
     db.prepare(`INSERT INTO workgroups (id, onecli_secrets, created_at) VALUES (?, '[]', ?)`).run(WG, now());
     db.prepare('UPDATE agent_groups SET workgroup_id = ? WHERE id = ?').run(WG, SOLO);
@@ -307,7 +313,7 @@ describe('groups CLI resource config', () => {
   it('test_groups_config_update_persists_file_canonical_resources', async () => {
     const id = 'ag-resource-test';
     const folder = 'resource-test';
-    createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    await createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
     getRawDb()
       .prepare(
         `INSERT INTO container_configs
@@ -359,7 +365,7 @@ describe('groups CLI resource config', () => {
     // a narrowed capDrop or a disabled no-new-privileges from every operator.
     const id = 'ag-security-audit';
     const folder = 'security-audit';
-    createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    await createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
     getRawDb()
       .prepare(
         `INSERT INTO container_configs
@@ -399,7 +405,7 @@ describe('groups CLI resource config', () => {
   it('test_groups_config_get_reports_safe_effective_security_when_undeclared', async () => {
     const id = 'ag-security-default';
     const folder = 'security-default';
-    createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    await createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
     getRawDb()
       .prepare(
         `INSERT INTO container_configs
@@ -434,7 +440,7 @@ describe('groups CLI resource config', () => {
     // OLD provider while `config get` reported the new one.
     const id = 'ag-provider-mirror';
     const folder = 'provider-mirror';
-    createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    await createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
     getRawDb()
       .prepare(
         `INSERT INTO container_configs
@@ -474,13 +480,13 @@ describe('groups CLI resource config', () => {
     // Unrelated operator-owned fields survive the mirror.
     expect(file.onecliSecrets).toEqual(['Keep-Me']);
     // DB projection still updated too.
-    expect(getContainerConfig(id)?.provider).toBe('claude');
+    expect((await getContainerConfig(id))?.provider).toBe('claude');
   });
 
   it('test_groups_config_update_without_runtime_scalars_leaves_provider_alone', async () => {
     const id = 'ag-no-mirror';
     const folder = 'no-mirror';
-    createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    await createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
     getRawDb()
       .prepare(
         `INSERT INTO container_configs
@@ -510,8 +516,8 @@ describe('groups CLI resource config', () => {
   it('test_groups_config_add_mcp_server_accepts_a_remote_http_url', async () => {
     const id = 'ag-remote-mcp';
     const folder = 'remote-mcp';
-    createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
-    ensureContainerConfig(id);
+    await createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    await ensureContainerConfig(id);
     const groupDir = `${TEST_DIR}/groups/${folder}`;
     fs.mkdirSync(groupDir, { recursive: true });
     fs.writeFileSync(
@@ -541,14 +547,14 @@ describe('groups CLI resource config', () => {
       url: 'https://app.datafold.com/mcp/',
       headers: { Authorization: 'Key onecli-managed' },
     });
-    expect(JSON.parse(getContainerConfig(id)!.mcp_servers).datafold).toMatchObject({ type: 'http' });
+    expect(JSON.parse((await getContainerConfig(id))!.mcp_servers).datafold).toMatchObject({ type: 'http' });
   });
 
   it('test_groups_config_add_mcp_server_rejects_an_unsafe_remote_url', async () => {
     const id = 'ag-remote-mcp-bad';
     const folder = 'remote-mcp-bad';
-    createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
-    ensureContainerConfig(id);
+    await createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    await ensureContainerConfig(id);
 
     const insecure = await dispatch(
       {
@@ -578,7 +584,7 @@ describe('groups CLI resource config', () => {
     expect(JSON.stringify(leaky)).toMatch(/onecli-managed/);
 
     // Nothing was written on either rejection.
-    expect(JSON.parse(getContainerConfig(id)!.mcp_servers)).toEqual({});
+    expect(JSON.parse((await getContainerConfig(id))!.mcp_servers)).toEqual({});
   });
 
   it('test_groups_create_timezone_lands_in_the_db_row_not_only_container_json', async () => {
@@ -598,7 +604,7 @@ describe('groups CLI resource config', () => {
     if (!response.ok) return;
 
     const created = response.data as { id: string; folder: string };
-    expect(getContainerConfig(created.id)?.timezone).toBe('Europe/Lisbon');
+    expect((await getContainerConfig(created.id))?.timezone).toBe('Europe/Lisbon');
     expect(readContainerConfig(created.folder).timezone).toBe('Europe/Lisbon');
   });
 
@@ -607,8 +613,8 @@ describe('groups CLI resource config', () => {
     // env comes from container.json. A one-sided write splits the two.
     const id = 'ag-timezone';
     const folder = 'timezone-group';
-    createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
-    ensureContainerConfig(id);
+    await createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    await ensureContainerConfig(id);
     const groupDir = `${TEST_DIR}/groups/${folder}`;
     fs.mkdirSync(groupDir, { recursive: true });
     fs.writeFileSync(
@@ -621,7 +627,7 @@ describe('groups CLI resource config', () => {
       { caller: 'host' },
     );
     expect(set.ok).toBe(true);
-    expect(getContainerConfig(id)?.timezone).toBe('Europe/Lisbon');
+    expect((await getContainerConfig(id))?.timezone).toBe('Europe/Lisbon');
     expect(readContainerConfig(folder).timezone).toBe('Europe/Lisbon');
 
     // `--timezone ""` clears both sides back to the install default.
@@ -630,15 +636,15 @@ describe('groups CLI resource config', () => {
       { caller: 'host' },
     );
     expect(clear.ok).toBe(true);
-    expect(getContainerConfig(id)?.timezone).toBeNull();
+    expect((await getContainerConfig(id))?.timezone).toBeNull();
     expect(readContainerConfig(folder).timezone).toBeUndefined();
   });
 
   it('test_groups_config_update_rejects_a_fixed_offset_and_canonicalizes_an_alias', async () => {
     const id = 'ag-timezone-canon';
     const folder = 'timezone-canon';
-    createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
-    ensureContainerConfig(id);
+    await createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    await ensureContainerConfig(id);
     const groupDir = `${TEST_DIR}/groups/${folder}`;
     fs.mkdirSync(groupDir, { recursive: true });
     fs.writeFileSync(
@@ -660,7 +666,7 @@ describe('groups CLI resource config', () => {
       expect(rejected.ok).toBe(false);
       expect(JSON.stringify(rejected)).toMatch(/invalid --timezone/);
     }
-    expect(getContainerConfig(id)?.timezone).toBeNull();
+    expect((await getContainerConfig(id))?.timezone).toBeNull();
 
     // A spelling the zone database has is stored VERBATIM — no ICU rewriting.
     // That is the whole point: ICU maps Asia/Kolkata onto Asia/Calcutta, whose
@@ -676,7 +682,7 @@ describe('groups CLI resource config', () => {
         { caller: 'host' },
       );
       expect(ok.ok).toBe(true);
-      expect(getContainerConfig(id)?.timezone).toBe(typed);
+      expect((await getContainerConfig(id))?.timezone).toBe(typed);
       expect(readContainerConfig(folder).timezone).toBe(typed);
     }
   });
@@ -684,8 +690,8 @@ describe('groups CLI resource config', () => {
   it('test_groups_config_update_rejects_a_non_iana_timezone', async () => {
     const id = 'ag-timezone-bad';
     const folder = 'timezone-bad';
-    createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
-    ensureContainerConfig(id);
+    await createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    await ensureContainerConfig(id);
 
     const response = await dispatch(
       { id: 'req-tz-bad', command: 'groups-config-update', args: { id, timezone: 'Not/AZone' } },
@@ -693,7 +699,7 @@ describe('groups CLI resource config', () => {
     );
     expect(response.ok).toBe(false);
     expect(JSON.stringify(response)).toMatch(/invalid --timezone/);
-    expect(getContainerConfig(id)?.timezone).toBeNull();
+    expect((await getContainerConfig(id))?.timezone).toBeNull();
   });
 
   it('test_legacy_gitnexus_key_is_behaviorally_inert', () => {
@@ -734,8 +740,8 @@ describe('groups config add-mount / remove-mount (host-only)', () => {
 
   it('adds a mount idempotently and removes it (host caller)', async () => {
     const GID = 'ag-mount';
-    createAgentGroup({ id: GID, name: 'm', folder: 'm', agent_provider: null, created_at: now() });
-    ensureContainerConfig(GID);
+    await createAgentGroup({ id: GID, name: 'm', folder: 'm', agent_provider: null, created_at: now() });
+    await ensureContainerConfig(GID);
     const groupDir = `${TEST_DIR}/groups/m`;
     fs.mkdirSync(groupDir, { recursive: true });
     fs.writeFileSync(
@@ -748,12 +754,12 @@ describe('groups config add-mount / remove-mount (host-only)', () => {
     const add = await dispatch({ id: 'r1', command: 'groups-config-add-mount', args }, { caller: 'host' });
     expect(add.ok).toBe(true);
     const expectedMounts = [{ hostPath: '/data/.gmail-mcp', containerPath: '/home/node/.gmail-mcp', readonly: true }];
-    expect(JSON.parse(getContainerConfig(GID)!.additional_mounts)).toEqual(expectedMounts);
+    expect(JSON.parse((await getContainerConfig(GID))!.additional_mounts)).toEqual(expectedMounts);
     expect(readContainerConfig('m').additionalMounts).toEqual(expectedMounts);
 
     // idempotent: a second add does not duplicate
     await dispatch({ id: 'r2', command: 'groups-config-add-mount', args }, { caller: 'host' });
-    expect(JSON.parse(getContainerConfig(GID)!.additional_mounts)).toHaveLength(1);
+    expect(JSON.parse((await getContainerConfig(GID))!.additional_mounts)).toHaveLength(1);
     expect(readContainerConfig('m').additionalMounts).toHaveLength(1);
 
     const rm = await dispatch(
@@ -765,7 +771,7 @@ describe('groups config add-mount / remove-mount (host-only)', () => {
       { caller: 'host' },
     );
     expect(rm.ok).toBe(true);
-    expect(JSON.parse(getContainerConfig(GID)!.additional_mounts)).toEqual([]);
+    expect(JSON.parse((await getContainerConfig(GID))!.additional_mounts)).toEqual([]);
     expect(readContainerConfig('m').additionalMounts).toEqual([]);
   });
 });

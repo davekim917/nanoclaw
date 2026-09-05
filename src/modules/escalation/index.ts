@@ -83,7 +83,7 @@ export async function applyOwnerEscalation(
   recent.push(now);
   recentBySession.set(session.id, recent);
 
-  const agentName = getAgentGroup(session.agent_group_id)?.name ?? session.agent_group_id;
+  const agentName = (await getAgentGroup(session.agent_group_id))?.name ?? session.agent_group_id;
   const delivered = await requestApproval({
     session,
     agentName,

@@ -76,7 +76,7 @@ describe('rollupSessionUsage', () => {
     await initTestDb();
     const db = getRawDb();
     runMigrations(db);
-    createAgentGroup({
+    await createAgentGroup({
       id: GID,
       name: 'usage',
       folder: 'usage',
@@ -201,7 +201,7 @@ describe('rollupSessionUsage — central turn_usage mirror', () => {
     await initTestDb();
     const db = getRawDb();
     runMigrations(db);
-    createAgentGroup({
+    await createAgentGroup({
       id: GID,
       name: 'usage',
       folder: 'usage',
@@ -313,14 +313,14 @@ describe('listUsageDaily filters', () => {
     await initTestDb();
     const db = getRawDb();
     runMigrations(db);
-    createAgentGroup({
+    await createAgentGroup({
       id: GID,
       name: 'usage',
       folder: 'usage',
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-other',
       name: 'other',
       folder: 'other',

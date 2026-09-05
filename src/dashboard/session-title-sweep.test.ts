@@ -93,8 +93,8 @@ async function setupDb(): Promise<void> {
   runMigrations(db);
 }
 
-function seedAgentGroup(id: string): void {
-  createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: now() });
+async function seedAgentGroup(id: string): Promise<void> {
+  await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: now() });
 }
 
 function seedSession(
@@ -164,7 +164,7 @@ function writeInboundMessages(
 beforeEach(async () => {
   TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'session-title-'));
   await setupDb();
-  seedAgentGroup('ag-1');
+  await seedAgentGroup('ag-1');
 
   originalCredentialEnv = {};
   for (const key of CREDENTIAL_ENV_KEYS) {

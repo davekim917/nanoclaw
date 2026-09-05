@@ -162,9 +162,9 @@ export const HELP_ESCAPE_SENTINEL = '__NANOCLAW_HELP_ESCAPE__';
  *   if (answer === HELP_ESCAPE_SENTINEL) { await offerClaudeHandoff(ctx); ... }
  */
 export function validateWithHelpEscape(
-  inner?: (value: string) => string | Error | undefined,
-): (value: string) => string | Error | undefined {
-  return (value: string) => {
+  inner?: (value: string | undefined) => string | Error | undefined,
+): (value: string | undefined) => string | Error | undefined {
+  return (value: string | undefined) => {
     if ((value ?? '').trim() === '?') {
       // Returning undefined lets clack accept the `?` as the "answer". The
       // caller sees a literal "?" and should compare + escape to handoff.

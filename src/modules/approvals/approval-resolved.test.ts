@@ -36,8 +36,8 @@ function now() {
   return new Date().toISOString();
 }
 
-function seedApproval(approvalId: string, action: string): void {
-  createPendingApproval({
+async function seedApproval(approvalId: string, action: string): Promise<void> {
+  await createPendingApproval({
     approval_id: approvalId,
     session_id: 'sess-1',
     request_id: approvalId,
@@ -56,8 +56,8 @@ beforeEach(async () => {
   const db = getRawDb();
   runMigrations(db);
 
-  createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
-  createSession({
+  await createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
+  await createSession({
     id: 'sess-1',
     agent_group_id: 'ag-1',
     messaging_group_id: null,
@@ -87,7 +87,7 @@ describe('approval-resolved callbacks', () => {
       events.push(event);
     });
 
-    seedApproval('appr-reject-1', 'test_reject_action');
+    await seedApproval('appr-reject-1', 'test_reject_action');
     const claimed = await handleApprovalsResponse({
       questionId: 'appr-reject-1',
       value: 'reject',
@@ -115,7 +115,7 @@ describe('approval-resolved callbacks', () => {
       calls.push(`resolved:${outcome}`);
     });
 
-    seedApproval('appr-approve-1', 'test_approve_action');
+    await seedApproval('appr-approve-1', 'test_approve_action');
     await handleApprovalsResponse({
       questionId: 'appr-approve-1',
       value: 'approve',
@@ -138,7 +138,7 @@ describe('approval-resolved callbacks', () => {
       events.push('after');
     });
 
-    seedApproval('appr-reject-2', 'test_isolation_action');
+    await seedApproval('appr-reject-2', 'test_isolation_action');
     const claimed = await handleApprovalsResponse({
       questionId: 'appr-reject-2',
       value: 'reject',

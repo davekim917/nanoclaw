@@ -69,7 +69,7 @@ export interface PreflightDeps {
   /** The dry-run call. Mirrors `OneCLI#getContainerConfig`. */
   getContainerConfig: (options: { agent?: string }) => Promise<unknown>;
   /** Identifier to probe with, or null to probe the default agent. */
-  probeAgent: () => string | null;
+  probeAgent: () => Promise<string | null>;
   /** Whether this install is wired to a OneCLI gateway at all. */
   onecliConfigured: () => boolean;
   now: () => number;
@@ -82,7 +82,7 @@ export interface PreflightDeps {
 const realDeps: PreflightDeps = {
   getContainerConfig: (options) =>
     new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY, timeout: PREFLIGHT_TIMEOUT_MS }).getContainerConfig(options),
-  probeAgent: () => pickProbeAgent(getAllAgentGroups()),
+  probeAgent: async () => pickProbeAgent(await getAllAgentGroups()),
   onecliConfigured: () => Boolean(ONECLI_URL || ONECLI_API_KEY),
   now: () => Date.now(),
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -171,7 +171,7 @@ export async function probeOnecliControlApi(deps: PreflightDeps): Promise<Prefli
     return { status: 'skipped', reason: 'neither ONECLI_URL nor ONECLI_API_KEY is configured' };
   }
 
-  const agent = deps.probeAgent();
+  const agent = await deps.probeAgent();
   let lastErr: unknown;
   let lastHttpStatus: number | undefined;
   let attemptsUsed = 0;

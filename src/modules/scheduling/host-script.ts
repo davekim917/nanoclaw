@@ -464,7 +464,7 @@ export async function runHostGatedTaskScripts(
   // path would get (container-runner.ts's `TZ=` push) — a gate that reads
   // local-time logic must not disagree with the container it might still hand
   // off to.
-  const tz = resolveGroupTimezone(agentGroupId);
+  const tz = await resolveGroupTimezone(agentGroupId);
 
   for (const row of due) {
     let content: Record<string, unknown>;

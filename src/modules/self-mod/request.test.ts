@@ -101,7 +101,7 @@ beforeEach(async () => {
   runMigrations(db);
   delivered = [];
 
-  createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
+  await createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
   session = {
     id: 'sess-1',
     agent_group_id: 'ag-1',
@@ -113,13 +113,13 @@ beforeEach(async () => {
     last_active: now(),
     created_at: now(),
   };
-  createSession(session);
+  await createSession(session);
 
   // Authorized approver + a cached DM so ensureUserDm resolves without a
   // platform openDM call.
   upsertUser({ id: 'slack:admin-1', kind: 'slack', display_name: 'Admin', created_at: now() });
   grantRole({ user_id: 'slack:admin-1', role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });
-  createMessagingGroup({
+  await createMessagingGroup({
     id: 'mg-dm-1',
     channel_type: DM_CHANNEL,
     platform_id: DM_PLATFORM,
@@ -168,9 +168,9 @@ async function submitAddMcpServer(content: Record<string, unknown>, s: Session):
 }
 
 /** Assert the handler rejected: no card delivered, no row, agent notified with a failure. */
-function expectRejected(): string {
+async function expectRejected(): Promise<string> {
   expect(delivered).toHaveLength(0);
-  expect(getPendingApprovalsByAction('add_mcp_server')).toHaveLength(0);
+  expect(await getPendingApprovalsByAction('add_mcp_server')).toHaveLength(0);
   expect(vi.mocked(writeSessionMessage)).toHaveBeenCalled();
   const text = lastNotifyText();
   expect(text).toMatch(/add_mcp_server failed/);
@@ -276,12 +276,12 @@ describe('add_mcp_server approval card', () => {
 describe('add_mcp_server validation', () => {
   it('rejects a non-string element in args before creating an approval', async () => {
     await submitAddMcpServer({ name: 'bad', command: 'node', args: ['ok', 123] }, session);
-    expectRejected();
+    await expectRejected();
   });
 
   it('rejects a non-record env before creating an approval', async () => {
     await submitAddMcpServer({ name: 'bad', command: 'node', env: ['not', 'a', 'record'] }, session);
-    expectRejected();
+    await expectRejected();
   });
 
   it('accepts 32 args and rejects 33', async () => {
@@ -362,7 +362,7 @@ describe('add_mcp_server remote Streamable HTTP servers', () => {
     // The stdio-only fields must not appear on a remote card.
     expect(question).not.toContain('command:');
 
-    const [row] = getPendingApprovalsByAction('add_mcp_server');
+    const [row] = await getPendingApprovalsByAction('add_mcp_server');
     expect(JSON.parse(row.payload as string)).toEqual({
       name: 'deepwiki',
       type: 'http',
@@ -384,12 +384,12 @@ describe('add_mcp_server remote Streamable HTTP servers', () => {
       { name: 'zapier', url: 'https://hooks.example.com/s/sk-ant-api03-J8sK2mN9pQ4rT6vX1zA3/mcp' },
       session,
     );
-    expect(expectRejected()).toMatch(/url path carries a raw credential/);
+    expect(await expectRejected()).toMatch(/url path carries a raw credential/);
   });
 
   it('rejects a raw credential in a query value', async () => {
     await submitAddMcpServer({ name: 'q', url: 'https://example.com/mcp?tools=ghp_deadbeefcafe1234' }, session);
-    expect(expectRejected()).toMatch(/carries a raw credential/);
+    expect(await expectRejected()).toMatch(/carries a raw credential/);
   });
 
   it('shows the remote url unredacted on the card — recognizable credentials are already rejected', async () => {
@@ -399,7 +399,7 @@ describe('add_mcp_server remote Streamable HTTP servers', () => {
     expect(question).toContain(`url: ${JSON.stringify(url)}`);
     // An ordinary endpoint carries no warning.
     expect(question).not.toContain('opaque');
-    const [row] = getPendingApprovalsByAction('add_mcp_server');
+    const [row] = await getPendingApprovalsByAction('add_mcp_server');
     expect(JSON.parse(row.payload as string).url).toBe(url);
   });
 
@@ -414,7 +414,7 @@ describe('add_mcp_server remote Streamable HTTP servers', () => {
     expect(question).toContain('onecli-managed');
     // Still approved, still persisted verbatim — the warning informs, it does
     // not block.
-    const [row] = getPendingApprovalsByAction('add_mcp_server');
+    const [row] = await getPendingApprovalsByAction('add_mcp_server');
     expect(JSON.parse(row.payload as string).url).toBe(url);
   });
 
@@ -427,7 +427,7 @@ describe('add_mcp_server remote Streamable HTTP servers', () => {
       },
       session,
     );
-    expect(expectRejected()).toMatch(/must be exactly/);
+    expect(await expectRejected()).toMatch(/must be exactly/);
   });
 
   it('carries OneCLI placeholder headers through to the payload and the card', async () => {
@@ -436,7 +436,7 @@ describe('add_mcp_server remote Streamable HTTP servers', () => {
       session,
     );
     expect(lastQuestion()).toContain('headers: {"Authorization":"Key onecli-managed"}');
-    const [row] = getPendingApprovalsByAction('add_mcp_server');
+    const [row] = await getPendingApprovalsByAction('add_mcp_server');
     expect(JSON.parse(row.payload as string).headers).toEqual({ Authorization: 'Key onecli-managed' });
   });
 
@@ -445,7 +445,7 @@ describe('add_mcp_server remote Streamable HTTP servers', () => {
       { name: 'leaky', url: 'https://example.com/mcp', headers: { Authorization: 'Bearer real-token-here' } },
       session,
     );
-    expect(expectRejected()).toMatch(/onecli-managed/);
+    expect(await expectRejected()).toMatch(/onecli-managed/);
   });
 
   it('rejects a literal on any header outside the configuration allowlist', async () => {
@@ -456,7 +456,7 @@ describe('add_mcp_server remote Streamable HTTP servers', () => {
         { name: 'leaky', url: 'https://example.com/mcp', headers: { 'X-Functions-Key': value } },
         session,
       );
-      expect(expectRejected()).toMatch(/not a known configuration header/);
+      expect(await expectRejected()).toMatch(/not a known configuration header/);
     }
   });
 
@@ -465,12 +465,12 @@ describe('add_mcp_server remote Streamable HTTP servers', () => {
       { name: 'leaky', url: 'https://example.com/mcp', headers: { 'User-Agent': 'ghp_deadbeefcafe1234' } },
       session,
     );
-    expect(expectRejected()).toMatch(/raw credential/);
+    expect(await expectRejected()).toMatch(/raw credential/);
   });
 
   it('rejects plain http except for localhost and host.docker.internal', async () => {
     await submitAddMcpServer({ name: 'insecure', url: 'http://example.com/mcp' }, session);
-    expect(expectRejected()).toMatch(/must use HTTPS/);
+    expect(await expectRejected()).toMatch(/must use HTTPS/);
 
     delivered = [];
     await submitAddMcpServer({ name: 'local', url: 'http://localhost:8080/mcp' }, session);
@@ -490,31 +490,31 @@ describe('add_mcp_server remote Streamable HTTP servers', () => {
     ]) {
       delivered = [];
       await submitAddMcpServer({ name: 'bad', url }, session);
-      expectRejected();
+      await expectRejected();
     }
   });
 
   it('rejects command and url together, and stdio-only fields on a remote server', async () => {
     await submitAddMcpServer({ name: 'both', command: 'node', url: 'https://example.com/mcp' }, session);
-    expect(expectRejected()).toMatch(/exactly one of command or url/);
+    expect(await expectRejected()).toMatch(/exactly one of command or url/);
 
     delivered = [];
     await submitAddMcpServer({ name: 'mixed', url: 'https://example.com/mcp', env: { K: 'v' } }, session);
-    expect(expectRejected()).toMatch(/only valid with command/);
+    expect(await expectRejected()).toMatch(/only valid with command/);
 
     delivered = [];
     await submitAddMcpServer({ name: 'mixed', command: 'node', headers: { 'X-A': 'b' } }, session);
-    expect(expectRejected()).toMatch(/headers are only valid with url/);
+    expect(await expectRejected()).toMatch(/headers are only valid with url/);
   });
 
   it('rejects a server name outside the [A-Za-z0-9_-] charset', async () => {
     await submitAddMcpServer({ name: 'bad name!', url: 'https://example.com/mcp' }, session);
-    expect(expectRejected()).toMatch(/1-64 characters/);
+    expect(await expectRejected()).toMatch(/1-64 characters/);
   });
 
   it('rejects an env key that is not a valid environment variable name', async () => {
     await submitAddMcpServer({ name: 'ok', command: 'node', env: { 'not-an-env-key': 'v' } }, session);
-    expect(expectRejected()).toMatch(/environment variable name/);
+    expect(await expectRejected()).toMatch(/environment variable name/);
   });
 });
 
@@ -548,7 +548,7 @@ describe('add_mcp_server secret redaction', () => {
     expect(question).toContain('--token');
 
     // The approval payload carries the verbatim values — applied unchanged.
-    const rows = getPendingApprovalsByAction('add_mcp_server');
+    const rows = await getPendingApprovalsByAction('add_mcp_server');
     expect(rows).toHaveLength(1);
     const payload = JSON.parse(rows[0].payload) as {
       args: string[];

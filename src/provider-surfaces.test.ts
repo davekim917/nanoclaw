@@ -92,17 +92,21 @@ function containerConfig(): ContainerConfig {
   return { mcpServers: {}, packages: { apt: [], npm: [] }, additionalMounts: [], skills: [] };
 }
 
-function providerContribution(provider: string, ag: AgentGroup, sess: Session): ProviderContainerContribution {
+async function providerContribution(
+  provider: string,
+  ag: AgentGroup,
+  sess: Session,
+): Promise<ProviderContainerContribution> {
   const factory = getProviderContainerConfig(provider);
   return (
-    factory?.({
+    (await factory?.({
       sessionDir: path.join(DATA_DIR, 'v2-sessions', ag.id, sess.id),
       agentGroupId: ag.id,
       agentGroupFolder: ag.folder,
       groupDir: path.join(GROUPS_DIR, ag.folder),
       selectedSkills: [],
       hostEnv: { HOME: path.join(TEST_ROOT, 'home') },
-    }) ?? {}
+    })) ?? {}
   );
 }
 
@@ -241,7 +245,7 @@ describe('container instruction contracts', async () => {
 describe('initGroupFilesystem agent surfaces', async () => {
   it('preserves local instructions and stages default Claude support files', async () => {
     const ag = group('ag-default', 'default-group');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
 
     initGroupFilesystem(ag, { instructions: 'hello' });
 
@@ -266,7 +270,7 @@ describe('initGroupFilesystem agent surfaces', async () => {
     expect(settings.hooks.PreToolUse).toBeUndefined();
 
     withWorkgroup(ag);
-    ensureContainerConfig(ag.id);
+    await ensureContainerConfig(ag.id);
     const mounts = await buildMounts(ag, session('s-default-instructions', ag.id), containerConfig(), 'claude', {});
     // Inlined, not `@`-imported: Claude Code drops imports that resolve
     // outside the project directory (issue #233).
@@ -282,7 +286,7 @@ describe('initGroupFilesystem agent surfaces', async () => {
 
   it('reconciles the managed Bash maximum while preserving an operator-owned default', async () => {
     const ag = group('ag-bash-timeout', 'bash-timeout-group');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
     initGroupFilesystem(ag, {});
 
     const settingsFile = path.join(DATA_DIR, 'v2-sessions', ag.id, '.claude-shared', 'settings.json');
@@ -300,7 +304,7 @@ describe('initGroupFilesystem agent surfaces', async () => {
 
   it('stages instructions outside memory for a provider with its own surfaces and is idempotent', async () => {
     const ag = group('ag-surfy', 'surfy-group');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
 
     initGroupFilesystem(ag, { instructions: 'hello', provider: 'surfaces-test-provider' });
     initGroupFilesystem(ag, { instructions: 'replacement', provider: 'surfaces-test-provider' });
@@ -324,7 +328,7 @@ describe('initGroupFilesystem agent surfaces', async () => {
 
   it('leaves container-resolvable placeholder symlinks alone instead of writing through them', async () => {
     const ag = group('ag-danglink', 'danglink-group');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
     const groupDir = path.join(GROUPS_DIR, ag.folder);
     fs.mkdirSync(groupDir, { recursive: true });
     // Targets that only resolve inside the container. existsSync FOLLOWS these
@@ -345,7 +349,7 @@ describe('initGroupFilesystem agent surfaces', async () => {
 
   it('writes nothing at all for a surfaces-owning provider without instructions', async () => {
     const ag = group('ag-surfy-bare', 'surfy-bare-group');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
 
     initGroupFilesystem(ag, { provider: 'surfaces-test-provider' });
 
@@ -357,7 +361,7 @@ describe('initGroupFilesystem agent surfaces', async () => {
 
   it('treats an unregistered provider name as default support files without creating memory', async () => {
     const ag = group('ag-unknown', 'unknown-group');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
 
     initGroupFilesystem(ag, { provider: 'not-registered' });
 
@@ -370,7 +374,7 @@ describe('initGroupFilesystem agent surfaces', async () => {
 describe('initGroupFilesystem legacy seed isolation', async () => {
   it('never reads, transforms, or deletes .seed.md', async () => {
     const ag = group('ag-seed', 'seed-group');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
     const groupDir = path.join(GROUPS_DIR, ag.folder);
     const seedFile = path.join(groupDir, '.seed.md');
     const seedBytes = Buffer.from('seeded identity\r\n  trailing bytes \n');
@@ -394,7 +398,7 @@ describe('initGroupFilesystem legacy seed isolation', async () => {
 
   it('does not overwrite existing nonempty instruction surfaces', async () => {
     const ag = group('ag-existing-instructions', 'existing-instructions-group');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
     const groupDir = path.join(GROUPS_DIR, ag.folder);
     fs.mkdirSync(groupDir, { recursive: true });
     fs.writeFileSync(path.join(groupDir, STANDING_INSTRUCTIONS_FILE), 'operator persona\n');
@@ -412,9 +416,9 @@ describe('buildMounts agent surfaces', async () => {
   it('canonical-working-tree-is-not-container-accessible', async () => {
     const workgroupId = 'wg-repositories';
     const ag = group('ag-repositories', 'repositories-agent');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
     assignWorkgroup(ag, workgroupId);
-    ensureContainerConfig(ag.id);
+    await ensureContainerConfig(ag.id);
     initGroupFilesystem({ ...ag, workgroup_id: workgroupId }, { provider: 'claude' });
 
     const canonical = path.join(DATA_DIR, 'repositories', workgroupId, 'proj');
@@ -489,9 +493,9 @@ describe('buildMounts agent surfaces', async () => {
   // as root inside the operator's host ~/.codex-<folder>/.
   it('never nests global-codex config.toml or plugins inside a scoped ~/.codex home', async () => {
     const ag = group('ag-codex-peer', 'codex-peer');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
     withWorkgroup(ag);
-    ensureContainerConfig(ag.id);
+    await ensureContainerConfig(ag.id);
     initGroupFilesystem({ ...ag, workgroup_id: ag.folder }, { provider: 'claude' });
 
     const fakeHome = path.join(TEST_ROOT, 'codex-home');
@@ -530,10 +534,10 @@ describe('buildMounts agent surfaces', async () => {
 
   it('uses the OpenCode Go default at high effort when no DB override exists', async () => {
     const ag = group('ag-opencode-defaults', 'opencode-defaults');
-    createAgentGroup(ag);
-    ensureContainerConfig(ag.id);
+    await createAgentGroup(ag);
+    await ensureContainerConfig(ag.id);
 
-    const contribution = providerContribution('opencode', ag, session('s-opencode-defaults', ag.id));
+    const contribution = await providerContribution('opencode', ag, session('s-opencode-defaults', ag.id));
 
     expect(contribution.env).toMatchObject({
       OPENCODE_MODEL: 'opencode-go/glm-5.3-flash',
@@ -544,11 +548,11 @@ describe('buildMounts agent surfaces', async () => {
 
   it('keeps explicit OpenCode DB model and effort overrides authoritative', async () => {
     const ag = group('ag-opencode-overrides', 'opencode-overrides');
-    createAgentGroup(ag);
-    ensureContainerConfig(ag.id);
-    updateContainerConfigScalars(ag.id, { model: 'opencode-go/kimi-k3', effort: 'high' });
+    await createAgentGroup(ag);
+    await ensureContainerConfig(ag.id);
+    await updateContainerConfigScalars(ag.id, { model: 'opencode-go/kimi-k3', effort: 'high' });
 
-    const contribution = providerContribution('opencode', ag, session('s-opencode-overrides', ag.id));
+    const contribution = await providerContribution('opencode', ag, session('s-opencode-overrides', ag.id));
 
     expect(contribution.env).toMatchObject({
       OPENCODE_MODEL: 'opencode-go/kimi-k3',
@@ -566,9 +570,9 @@ describe('buildMounts agent surfaces', async () => {
     ];
 
     for (const { provider, ag } of providerGroups) {
-      createAgentGroup(ag);
+      await createAgentGroup(ag);
       assignWorkgroup(ag, workgroupId);
-      ensureContainerConfig(ag.id);
+      await ensureContainerConfig(ag.id);
       initGroupFilesystem({ ...ag, workgroup_id: workgroupId }, { provider });
     }
 
@@ -579,7 +583,7 @@ describe('buildMounts agent surfaces', async () => {
         sess,
         containerConfig(),
         provider,
-        providerContribution(provider, ag, sess),
+        await providerContribution(provider, ag, sess),
         workgroupId,
       );
     };
@@ -628,9 +632,9 @@ describe('buildMounts agent surfaces', async () => {
     expect(fullIdentities[0]).toEqual(memoryOnlyIdentities[0]);
 
     const outsider = group('ag-lock-outsider', 'lock-outsider');
-    createAgentGroup(outsider);
+    await createAgentGroup(outsider);
     assignWorkgroup(outsider, 'other-house');
-    ensureContainerConfig(outsider.id);
+    await ensureContainerConfig(outsider.id);
     initGroupFilesystem({ ...outsider, workgroup_id: 'other-house' }, { provider: 'claude' });
     const outsiderSession = session('s-lock-outsider', outsider.id);
     const outsiderLock = (
@@ -639,7 +643,7 @@ describe('buildMounts agent surfaces', async () => {
         outsiderSession,
         containerConfig(),
         'claude',
-        providerContribution('claude', outsider, outsiderSession),
+        await providerContribution('claude', outsider, outsiderSession),
         'other-house',
       )
     ).find((mount) => mount.containerPath === '/workspace/workgroup/.memory-write.lock');
@@ -649,9 +653,9 @@ describe('buildMounts agent surfaces', async () => {
 
   it('mounts the default surfaces for an unregistered provider (today’s behavior)', async () => {
     const ag = group('ag-mounts-default', 'mounts-default');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
     withWorkgroup(ag);
-    ensureContainerConfig(ag.id);
+    await ensureContainerConfig(ag.id);
     initGroupFilesystem(ag, {});
 
     const mounts = await buildMounts(ag, session('s1', ag.id), containerConfig(), 'claude', {});
@@ -670,9 +674,9 @@ describe('buildMounts agent surfaces', async () => {
 
   it('suppresses the default surfaces and keeps contributed mounts for a surfaces-providing provider', async () => {
     const ag = group('ag-mounts-surfy', 'mounts-surfy');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
     withWorkgroup(ag);
-    ensureContainerConfig(ag.id);
+    await ensureContainerConfig(ag.id);
     initGroupFilesystem(ag, { provider: 'surfaces-test-provider' });
 
     const contributed = {
@@ -714,9 +718,9 @@ describe('buildMounts agent surfaces', async () => {
 
     for (const testCase of cases) {
       const ag = group(`ag-skills-${testCase.suffix}`, `skills-${testCase.suffix}`);
-      createAgentGroup(ag);
+      await createAgentGroup(ag);
       withWorkgroup(ag);
-      ensureContainerConfig(ag.id);
+      await ensureContainerConfig(ag.id);
       initGroupFilesystem(ag, {});
 
       await buildMounts(
@@ -748,9 +752,9 @@ describe('buildMounts agent surfaces', async () => {
 
     try {
       const ag = group('ag-plugin-shadow', 'plugin-shadow');
-      createAgentGroup(ag);
+      await createAgentGroup(ag);
       withWorkgroup(ag);
-      ensureContainerConfig(ag.id);
+      await ensureContainerConfig(ag.id);
       initGroupFilesystem(ag, {});
 
       const mounts = await buildMounts(ag, session('s-plugin-shadow', ag.id), containerConfig(), 'claude', {});
@@ -767,9 +771,9 @@ describe('buildMounts agent surfaces', async () => {
 describe('worker agent def sync (orchestrator roster)', async () => {
   it('copies trunk defs for a claude spawn, prunes retired managed defs, preserves operator files', async () => {
     const ag = group('ag-worker-defs', 'worker-defs');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
     withWorkgroup(ag);
-    ensureContainerConfig(ag.id);
+    await ensureContainerConfig(ag.id);
     initGroupFilesystem(ag, {});
 
     const agentsDir = path.join(DATA_DIR, 'v2-sessions', ag.id, '.claude-shared', 'agents');
@@ -831,9 +835,9 @@ describe('worker agent def sync (orchestrator roster)', async () => {
 
   it('never deletes outside the agents dir even if a poisoned file is planted (F1 traversal guard)', async () => {
     const ag = group('ag-worker-defs-sec', 'worker-defs-sec');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
     withWorkgroup(ag);
-    ensureContainerConfig(ag.id);
+    await ensureContainerConfig(ag.id);
     initGroupFilesystem(ag, {});
 
     // A canary the old manifest-driven prune could have deleted via traversal.
@@ -855,9 +859,9 @@ describe('worker agent def sync (orchestrator roster)', async () => {
 
   it('skips the worker-def sync when the spawn-resolved provider is codex', async () => {
     const ag = group('ag-worker-defs-cx', 'worker-defs-cx');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
     withWorkgroup(ag);
-    ensureContainerConfig(ag.id);
+    await ensureContainerConfig(ag.id);
     initGroupFilesystem(ag, {});
 
     await buildMounts(ag, session('s-wd-cx', ag.id), containerConfig(), 'codex', {});
@@ -869,9 +873,9 @@ describe('worker agent def sync (orchestrator roster)', async () => {
 describe('retired mirror snapshot topology', async () => {
   it('does not expose old mirror-backed snapshots as repository canonicals', async () => {
     const ag = group('ag-snap', 'snap-group');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
     assignWorkgroup(ag, 'wg-snap');
-    ensureContainerConfig(ag.id);
+    await ensureContainerConfig(ag.id);
     fs.mkdirSync(path.join(GROUPS_DIR, ag.folder), { recursive: true });
 
     const wgShared = path.join(DATA_DIR, 'workgroups', 'wg-snap');
@@ -896,13 +900,13 @@ describe('symlink overlay workgroup allowlist', async () => {
     const ag = group('ag-sym', 'sym-main');
     const sib = group('ag-sym-sib', 'sym-sib');
     const outsider = group('ag-out', 'out-group');
-    createAgentGroup(ag);
-    createAgentGroup(sib);
-    createAgentGroup(outsider);
+    await createAgentGroup(ag);
+    await createAgentGroup(sib);
+    await createAgentGroup(outsider);
     assignWorkgroup(ag, 'wg-sym');
     assignWorkgroup(sib, 'wg-sym');
     assignWorkgroup(outsider, 'wg-other');
-    ensureContainerConfig(ag.id);
+    await ensureContainerConfig(ag.id);
 
     const groupDir = path.join(GROUPS_DIR, ag.folder);
     const sibTarget = path.join(GROUPS_DIR, sib.folder, 'SHARED-REPO');
@@ -928,11 +932,11 @@ describe('symlink overlay workgroup allowlist', async () => {
   it('declares the redirected destination for an upward-escaping relative symlink', async () => {
     const ag = group('ag-rel', 'rel-main');
     const sib = group('ag-rel-sib', 'rel-sib');
-    createAgentGroup(ag);
-    createAgentGroup(sib);
+    await createAgentGroup(ag);
+    await createAgentGroup(sib);
     assignWorkgroup(ag, 'wg-rel');
     assignWorkgroup(sib, 'wg-rel');
-    ensureContainerConfig(ag.id);
+    await ensureContainerConfig(ag.id);
 
     const groupDir = path.join(GROUPS_DIR, ag.folder);
     fs.mkdirSync(groupDir, { recursive: true });
@@ -961,11 +965,11 @@ describe('symlink overlay workgroup allowlist', async () => {
   it('redirects relative targets that escape only after normalization', async () => {
     const ag = group('ag-norm', 'norm-main');
     const sib = group('ag-norm-sib', 'norm-sib');
-    createAgentGroup(ag);
-    createAgentGroup(sib);
+    await createAgentGroup(ag);
+    await createAgentGroup(sib);
     assignWorkgroup(ag, 'wg-norm');
     assignWorkgroup(sib, 'wg-norm');
-    ensureContainerConfig(ag.id);
+    await ensureContainerConfig(ag.id);
 
     const groupDir = path.join(GROUPS_DIR, ag.folder);
     fs.mkdirSync(groupDir, { recursive: true });
@@ -991,11 +995,11 @@ describe('symlink overlay workgroup allowlist', async () => {
   it('redirects through an intermediate symlink that only the filesystem can resolve', async () => {
     const ag = group('ag-chain', 'chain-main');
     const sib = group('ag-chain-sib', 'chain-sib');
-    createAgentGroup(ag);
-    createAgentGroup(sib);
+    await createAgentGroup(ag);
+    await createAgentGroup(sib);
     assignWorkgroup(ag, 'wg-chain');
     assignWorkgroup(sib, 'wg-chain');
-    ensureContainerConfig(ag.id);
+    await ensureContainerConfig(ag.id);
 
     const groupDir = path.join(GROUPS_DIR, ag.folder);
     fs.mkdirSync(path.join(groupDir, 'sub'), { recursive: true });
@@ -1022,9 +1026,9 @@ describe('symlink overlay workgroup allowlist', async () => {
 describe('runner session context file', () => {
   it('spawn writes the session context file and mounts it read-only at /app/.nanoclaw-session.json', async () => {
     const ag = group('ag-ctx', 'ctx-group');
-    createAgentGroup(ag);
+    await createAgentGroup(ag);
     withWorkgroup(ag);
-    ensureContainerConfig(ag.id);
+    await ensureContainerConfig(ag.id);
     initGroupFilesystem(ag, {});
     const sess = session('s-ctx', ag.id);
 

@@ -724,12 +724,24 @@ describe('storage-manager.ts / storage-activity.ts contain no literal seam call'
       'src/container-mounts.ts': ['runningContainerMounts as inspectRunningContainerMounts'],
       'src/container-runtime.ts': ['CONTAINER_RUNTIME_BIN'],
       'src/db/connection.ts': ['getRawDb'],
-      'src/db/container-configs.ts': ['getAllContainerConfigs'],
+      // Seam 3 PR 4 moved this off the async driver's getAllContainerConfigs
+      // to a raw, synchronous prepare — see the doc comment at the call site
+      // (storage-manager.ts's configuredImageProtection) for why: this runs
+      // inside the storage maintenance worker thread and the synchronous
+      // reclaim executors, neither of which can await the async driver.
+      'src/db/container-configs.ts': ['CONTAINER_CONFIGS_ALL_SQL'],
       'src/log.ts': ['log'],
       'src/modules/mailbox/index.ts': ['sessionMailboxPath'],
       'src/repository-workspaces.ts': ['resolveRepositoryWorkUnit'],
       'src/session-manager.ts': ['sessionContextPathFor', 'sessionsBaseDir', 'threadsBaseDir', 'threadWorktreeDir'],
       'src/storage-activity.ts': ['tryRunWithStorageCleanupClaim'],
+      // `import type { ContainerConfigRow }` — a whole-clause type-only
+      // import, erased at compile time. discoverRelativeModules still
+      // records the module-graph edge (it doesn't distinguish type-only
+      // imports), but collectModuleBindings correctly excludes it from the
+      // binding list, so this file contributes no runtime binding — never a
+      // path to the mailbox seam.
+      'src/types.ts': [],
     });
   });
 });

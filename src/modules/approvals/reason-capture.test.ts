@@ -63,8 +63,8 @@ const fakeAdapter: ChannelDeliveryAdapter = {
   },
 };
 
-function seedApproval(approvalId: string, action = 'create_agent'): void {
-  createPendingApproval({
+async function seedApproval(approvalId: string, action = 'create_agent'): Promise<void> {
+  await createPendingApproval({
     approval_id: approvalId,
     session_id: 'sess-1',
     request_id: approvalId,
@@ -116,8 +116,8 @@ beforeEach(async () => {
   runMigrations(db);
   delivered = [];
 
-  createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
-  createSession({
+  await createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
+  await createSession({
     id: 'sess-1',
     agent_group_id: 'ag-1',
     messaging_group_id: null,
@@ -133,7 +133,7 @@ beforeEach(async () => {
   // platform openDM call.
   upsertUser({ id: 'slack:admin-1', kind: 'slack', display_name: 'Admin', created_at: now() });
   grantRole({ user_id: 'slack:admin-1', role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });
-  createMessagingGroup({
+  await createMessagingGroup({
     id: 'mg-dm-1',
     channel_type: DM_CHANNEL,
     platform_id: DM_PLATFORM,
@@ -159,10 +159,10 @@ afterEach(async () => {
 
 describe('reject with reason', () => {
   it('holds the row and prompts the admin instead of finalizing', async () => {
-    seedApproval('appr-1');
+    await seedApproval('appr-1');
     await clickRejectWithReason('appr-1');
 
-    const row = getPendingApproval('appr-1');
+    const row = await getPendingApproval('appr-1');
     expect(row?.status).toBe('awaiting_reason');
     expect(row?.expires_at).toBeTruthy();
 
@@ -178,19 +178,19 @@ describe('reject with reason', () => {
 
   it('relays the captured reason as one combined message and clears the row', async () => {
     const { captureReasonReply } = await import('./reason-capture.js');
-    seedApproval('appr-2', 'install_packages');
+    await seedApproval('appr-2', 'install_packages');
     await clickRejectWithReason('appr-2');
 
     const consumed = await captureReasonReply(dmReply('too risky for prod'));
 
     expect(consumed).toBe(true);
-    expect(getPendingApproval('appr-2')).toBeUndefined();
+    expect(await getPendingApproval('appr-2')).toBeUndefined();
     expect(lastRelayedText()).toBe('Your install_packages request was rejected by admin: "too risky for prod"');
   });
 
   it('truncates an over-long reason to 280 chars with an ellipsis', async () => {
     const { captureReasonReply } = await import('./reason-capture.js');
-    seedApproval('appr-3');
+    await seedApproval('appr-3');
     await clickRejectWithReason('appr-3');
 
     await captureReasonReply(dmReply('x'.repeat(400)));
@@ -202,22 +202,22 @@ describe('reject with reason', () => {
 
   it('finalizes a plain reject when the captured reply carries no text', async () => {
     const { captureReasonReply } = await import('./reason-capture.js');
-    seedApproval('appr-4');
+    await seedApproval('appr-4');
     await clickRejectWithReason('appr-4');
 
     const consumed = await captureReasonReply(dmReply(undefined));
 
     expect(consumed).toBe(true);
-    expect(getPendingApproval('appr-4')).toBeUndefined();
+    expect(await getPendingApproval('appr-4')).toBeUndefined();
     expect(lastRelayedText()).toBe('Your create_agent request was rejected by admin.');
   });
 
   it('does not swallow a later DM once the hold was already finalized', async () => {
     const { captureReasonReply } = await import('./reason-capture.js');
-    seedApproval('appr-5');
+    await seedApproval('appr-5');
     await clickRejectWithReason('appr-5');
     // Simulate the sweep (or any other path) finalizing first.
-    deletePendingApproval('appr-5');
+    await deletePendingApproval('appr-5');
 
     const consumed = await captureReasonReply(dmReply('late reason'));
 
@@ -239,23 +239,23 @@ describe('reject with reason', () => {
 describe('reject-with-reason host sweep', () => {
   it('finalizes a hold whose window elapsed as a plain reject', async () => {
     const { sweepAwaitingReasonRejects } = await import('./reason-capture.js');
-    seedApproval('appr-ghost', 'add_mcp_server');
-    markApprovalAwaitingReason('appr-ghost', new Date(Date.now() - 1000).toISOString());
+    await seedApproval('appr-ghost', 'add_mcp_server');
+    await markApprovalAwaitingReason('appr-ghost', new Date(Date.now() - 1000).toISOString());
 
     await sweepAwaitingReasonRejects();
 
-    expect(getPendingApproval('appr-ghost')).toBeUndefined();
+    expect(await getPendingApproval('appr-ghost')).toBeUndefined();
     expect(lastRelayedText()).toBe('Your add_mcp_server request was rejected by admin.');
   });
 
   it('leaves a still-open hold untouched', async () => {
     const { sweepAwaitingReasonRejects } = await import('./reason-capture.js');
-    seedApproval('appr-open');
-    markApprovalAwaitingReason('appr-open', new Date(Date.now() + 60_000).toISOString());
+    await seedApproval('appr-open');
+    await markApprovalAwaitingReason('appr-open', new Date(Date.now() + 60_000).toISOString());
 
     await sweepAwaitingReasonRejects();
 
-    expect(getPendingApproval('appr-open')?.status).toBe('awaiting_reason');
+    expect((await getPendingApproval('appr-open'))?.status).toBe('awaiting_reason');
     expect(vi.mocked(writeSessionMessage)).not.toHaveBeenCalled();
   });
 });
@@ -263,7 +263,7 @@ describe('reject-with-reason host sweep', () => {
 describe('plain reject (regression)', () => {
   it('finalizes immediately with no reason and no DM prompt', async () => {
     const { handleApprovalsResponse } = await import('./response-handler.js');
-    seedApproval('appr-plain', 'install_packages');
+    await seedApproval('appr-plain', 'install_packages');
 
     await handleApprovalsResponse({
       questionId: 'appr-plain',
@@ -274,7 +274,7 @@ describe('plain reject (regression)', () => {
       threadId: null,
     });
 
-    expect(getPendingApproval('appr-plain')).toBeUndefined();
+    expect(await getPendingApproval('appr-plain')).toBeUndefined();
     expect(delivered).toHaveLength(0);
     expect(lastRelayedText()).toBe('Your install_packages request was rejected by admin.');
   });

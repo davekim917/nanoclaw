@@ -137,6 +137,26 @@ vi.mock('../../db/sessions.js', async (importOriginal) => {
   };
 });
 
+// Seam 3 §4.5 I-1: the wake guard stays SYNCHRONOUS — `sessionStillActive`
+// re-reads the session row by running the sessions leaf's `SESSION_BY_ID_SQL`
+// on the raw handle, not through the now-async `getSession()`. This file opens
+// no central DB, so the fake answers a `FROM sessions` lookup from
+// `mockGetSession` and nothing else.
+// The auto-archive cases below open a real in-memory DB and seed rows, so the
+// real handle wins whenever one is initialized (`preferRealDb`). The watchdog
+// cases open none, and fall back to the shared fake for the one guard-path
+// lookup.
+// The fixture is imported INSIDE the factory: a hoisted `vi.mock` runs before
+// this file's own import bindings are initialized.
+vi.mock('../../db/connection.js', async (importOriginal) => {
+  const { rawDbConnectionMock } = await import('../../test-fixtures/raw-db-fake.js');
+  return rawDbConnectionMock(
+    await importOriginal<typeof import('../../db/connection.js')>(),
+    { sessions: (id) => mockGetSession(id) },
+    { preferRealDb: true },
+  );
+});
+
 // Wrap (not replace) the three duty bodies: `vi.fn(real)` still calls the real
 // implementation by default, so every case below and above keeps its existing
 // behavior. The wrapping only exists so the registered-duty-wrapper cases

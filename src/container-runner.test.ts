@@ -1,4 +1,13 @@
+import { EventEmitter } from 'node:events';
+
 import { afterEach, describe, expect, it, beforeEach, vi } from 'vitest';
+
+const { TEST_DATA_DIR } = vi.hoisted(() => ({ TEST_DATA_DIR: uniqueTmpRoot('container-runner') }));
+
+vi.mock('./config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./config.js')>()),
+  DATA_DIR: TEST_DATA_DIR,
+}));
 
 // Only the wake-admission block below needs this; an unguarded wakeContainer
 // also resolves false here by throwing on the uninitialized DB and being caught.
@@ -132,6 +141,7 @@ import {
   materializeCodexFallbackRuntime,
   resolveProviderName,
   channelInstructionsMounts,
+  captureContainerStderr,
   resolveAtlassianMcpServer,
   resolveWorkgroupMemoryLockMount,
   resolveWorkgroupMemoryMount,
@@ -147,12 +157,14 @@ import {
   sessionStillActive,
   isContainerRunning,
   isContainerSpawning,
+  renderCapabilitiesSnapshot,
 } from './container-runner.js';
 import { formatMemoryMb, resolveContainerResources } from './container-resources.js';
 import { mergeWorkgroupAndGroupSecrets } from './onecli-secrets.js';
 import { getProviderContainerConfig } from './providers/provider-container-registry.js';
 import { log } from './log.js';
 import { closeDb, getRawDb, initTestDb } from './db/connection.js';
+import { runMigrations } from './db/index.js';
 import { allowSubprocess } from './test-hermeticity.js';
 import type { MemoryAdmissionResult } from './memory-admission.js';
 import type { Session } from './types.js';
@@ -864,7 +876,7 @@ describe('codex provider host auth', () => {
     return JSON.parse(fs.readFileSync(path.join(sessionDir, 'codex', 'auth.json'), 'utf-8'));
   }
 
-  it('copies scoped Codex auth for the agent group folder without DB lookup', () => {
+  it('copies scoped Codex auth for the agent group folder without DB lookup', async () => {
     const home = makeHome();
     const sessionDir = makeSessionDir();
     writeAuth(path.join(home, '.codex'), 'global');
@@ -872,7 +884,7 @@ describe('codex provider host auth', () => {
 
     const fn = getProviderContainerConfig('codex');
     expect(fn).toBeDefined();
-    const contribution = fn!({
+    const contribution = await fn!({
       sessionDir,
       agentGroupId: 'ag-does-not-match-folder',
       agentGroupFolder: 'example-retail-codex',
@@ -889,14 +901,14 @@ describe('codex provider host auth', () => {
     });
   });
 
-  it('falls back to global Codex auth when no scoped auth exists', () => {
+  it('falls back to global Codex auth when no scoped auth exists', async () => {
     const home = makeHome();
     const sessionDir = makeSessionDir();
     writeAuth(path.join(home, '.codex'), 'global');
 
     const fn = getProviderContainerConfig('codex');
     expect(fn).toBeDefined();
-    fn!({
+    await fn!({
       sessionDir,
       agentGroupId: 'example-retail-codex',
       agentGroupFolder: 'example-retail-codex',
@@ -1447,6 +1459,22 @@ describe('container boot-failure tripwire (structural)', () => {
     const src = fs.readFileSync(path.join(process.cwd(), 'src', 'container-runner.ts'), 'utf-8');
     expect(src).toContain('stderrTail.push(line)');
     expect(src).toMatch(/Container exited non-zero.*stderrTail/s);
+  });
+});
+
+describe('container stderr attribution', () => {
+  it('records stderr bytes with the actual container name and preserves the exit tail', () => {
+    const stderr = new EventEmitter();
+    const tail: string[] = [];
+    const lines = Array.from({ length: 12 }, (_, index) => `line ${index + 1}`);
+    vi.mocked(log.debug).mockClear();
+
+    captureContainerStderr(stderr as unknown as NodeJS.ReadableStream, 'container-fixture', tail);
+    stderr.emit('data', Buffer.from(`${lines.join('\n')}\n`));
+
+    expect(log.debug).toHaveBeenNthCalledWith(1, 'line 1', { containerName: 'container-fixture' });
+    expect(log.debug).toHaveBeenNthCalledWith(12, 'line 12', { containerName: 'container-fixture' });
+    expect(tail).toEqual(lines.slice(-10));
   });
 });
 
@@ -2260,5 +2288,21 @@ describe('NANOCLAW_INSTRUCTIONS_PROFILE reaches the container', () => {
     // second group-level slot here would only be a way for the two to
     // disagree.
     expect(source).toMatch(/const instructionsProfile = channelDefaults\?\.channelInstructionsProfile \?\? null;/);
+  });
+});
+
+describe('renderCapabilitiesSnapshot (seam 3: getHostCapabilities is async)', () => {
+  it('renders the AWAITED capabilities, never a Promise serialized as {}', async () => {
+    // A Promise reaching JSON.stringify is `{}` and no lint rule sees it, so
+    // the proof is behavioural: the snapshot carries the capabilities shape.
+    await initTestDb();
+    try {
+      runMigrations(getRawDb());
+      const parsed = JSON.parse(await renderCapabilitiesSnapshot('ag-none', null)) as Record<string, unknown>;
+      expect(typeof parsed.version).toBe('string');
+      expect(parsed).toHaveProperty('channels');
+    } finally {
+      await closeDb();
+    }
   });
 });

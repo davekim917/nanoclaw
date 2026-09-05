@@ -122,7 +122,7 @@ export async function resolveOneCLIApproval(
   selectedOption: string,
   userId: string,
 ): Promise<boolean> {
-  const row = getPendingApproval(approvalId);
+  const row = await getPendingApproval(approvalId);
   if (!row || row.action !== ONECLI_ACTION) return false;
 
   // SECURITY (cross-tenant audit 2026-05-03): require the clicker to be in
@@ -175,10 +175,12 @@ export async function resolveOneCLIApproval(
   // Claim the row before touching anything else. The card outlives the process
   // that posted it, so the expiry sweep and a click can race for the same row;
   // exactly one of them may decide it.
-  if (!transitionPendingApprovalStatus(approvalId, 'pending', decision === 'approve' ? 'approved' : 'rejected')) {
+  if (
+    !(await transitionPendingApprovalStatus(approvalId, 'pending', decision === 'approve' ? 'approved' : 'rejected'))
+  ) {
     log.warn('OneCLI approval already resolved — ignoring duplicate click', {
       approvalId,
-      status: getPendingApproval(approvalId)?.status ?? 'gone',
+      status: (await getPendingApproval(approvalId))?.status ?? 'gone',
       userId,
     });
     return true;
@@ -190,7 +192,7 @@ export async function resolveOneCLIApproval(
     clearTimeout(state.timer);
     // Card is auto-edited to "✅ <option>" by chat-sdk-bridge's onAction
     // handler, so the happy path needs no edit here.
-    deletePendingApproval(approvalId);
+    await deletePendingApproval(approvalId);
     state.resolve(decision);
     log.info('OneCLI approval resolved', { approvalId, decision, userId });
     return true;
@@ -230,7 +232,7 @@ async function settleUnconsumedDecision(row: PendingApproval): Promise<void> {
       '✅ Approved — recorded, but the original request ended when the host restarted. Ask the agent to retry the action.',
     );
   }
-  deletePendingApproval(row.approval_id);
+  await deletePendingApproval(row.approval_id);
   log.info('OneCLI approval decision expired undelivered', {
     approvalId: row.approval_id,
     status: row.status,
@@ -310,13 +312,13 @@ async function handleRequest(request: ApprovalRequest): Promise<Decision> {
   // second one — that is what makes the pre-restart card resolve the real
   // request. A redelivery while we are still armed (poll race) shares the
   // Promise already waiting rather than arming a competing one.
-  const existing = getPendingApprovalsByAction(ONECLI_ACTION).find((row) => row.request_id === request.id);
+  const existing = (await getPendingApprovalsByAction(ONECLI_ACTION)).find((row) => row.request_id === request.id);
   if (existing && existing.status !== 'pending') {
     // The human already decided, in the window between this process starting
     // and the gateway's first redelivery. The decision was held on the row
     // precisely for this moment — consume it and give the held request the
     // real answer instead of a second card.
-    deletePendingApproval(existing.approval_id);
+    await deletePendingApproval(existing.approval_id);
     const decided: Decision = existing.status === 'approved' ? 'approve' : 'deny';
     log.info('Applied a decision recorded before the gateway redelivered', {
       approvalId: existing.approval_id,
@@ -338,7 +340,7 @@ async function handleRequest(request: ApprovalRequest): Promise<Decision> {
   // Originating agent group is carried on the request via OneCLI's agent
   // identifier (set by container-runner.ts to agentGroup.id). Use it as
   // the scope for approver selection: admin @ group → global admin → owner.
-  const originGroup = request.agent.externalId ? getAgentGroup(request.agent.externalId) : undefined;
+  const originGroup = request.agent.externalId ? await getAgentGroup(request.agent.externalId) : undefined;
   const agentGroupId = originGroup?.id ?? null;
   const approvers = pickApprover(agentGroupId);
   if (approvers.length === 0) {
@@ -398,7 +400,7 @@ async function handleRequest(request: ApprovalRequest): Promise<Decision> {
     return 'deny';
   }
 
-  createPendingApproval({
+  await createPendingApproval({
     approval_id: approvalId,
     session_id: null,
     request_id: request.id,
@@ -429,14 +431,14 @@ async function handleRequest(request: ApprovalRequest): Promise<Decision> {
 }
 
 async function expireApproval(approvalId: string, reason: ExpiryReason): Promise<void> {
-  const row = getPendingApproval(approvalId);
+  const row = await getPendingApproval(approvalId);
   if (!row || row.action !== ONECLI_ACTION) return;
 
   // Same claim as a click: whichever of sweep/timer/click gets the row decides
   // it, and the losers do nothing.
-  if (!transitionPendingApprovalStatus(approvalId, 'pending', 'expired')) return;
+  if (!(await transitionPendingApprovalStatus(approvalId, 'pending', 'expired'))) return;
   await editCardExpired(row, reason);
-  deletePendingApproval(approvalId);
+  await deletePendingApproval(approvalId);
   log.info('OneCLI approval expired', { approvalId, reason });
 }
 
@@ -446,7 +448,7 @@ async function expireApproval(approvalId: string, reason: ExpiryReason): Promise
  * gets an honest timeout edit.
  */
 async function reattachSurvivingApprovals(): Promise<void> {
-  const rows = getPendingApprovalsByAction(ONECLI_ACTION);
+  const rows = await getPendingApprovalsByAction(ONECLI_ACTION);
   if (rows.length === 0) return;
 
   let rearmed = 0;
@@ -481,7 +483,7 @@ async function reattachSurvivingApprovals(): Promise<void> {
 export async function expireOverdueApprovals(): Promise<void> {
   /* eslint-disable no-catch-all/no-catch-all -- the sweep must survive any single row's failure */
   try {
-    for (const row of getPendingApprovalsByAction(ONECLI_ACTION)) {
+    for (const row of await getPendingApprovalsByAction(ONECLI_ACTION)) {
       if (row.expires_at !== null && new Date(row.expires_at).getTime() > Date.now()) continue;
       if (row.status !== 'pending') {
         // A recorded decision the gateway never came back for. Past the TTL the

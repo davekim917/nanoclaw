@@ -48,7 +48,7 @@ beforeEach(async () => {
   const db = getRawDb();
   runMigrations(db);
 
-  createAgentGroup({ id: AG, name: 'SaveAtt', folder: 'saveatt', agent_provider: null, created_at: now() });
+  await createAgentGroup({ id: AG, name: 'SaveAtt', folder: 'saveatt', agent_provider: null, created_at: now() });
   const sess: Session = {
     id: SESS,
     agent_group_id: AG,
@@ -60,7 +60,7 @@ beforeEach(async () => {
     last_active: null,
     created_at: now(),
   };
-  createSession(sess);
+  await createSession(sess);
   initSessionFolder(AG, SESS);
 });
 

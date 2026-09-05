@@ -15,6 +15,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { getAgentMailbox } from './mailbox/index.js';
 import { withExistingMailboxSession } from './session-manager.js';
 import { closeDb, initTestDb, runMigrations } from './db/index.js';
+import { createSession } from './db/sessions.js';
 import {
   ABSOLUTE_CEILING_MS,
   _resetSweepRegistryForTesting,
@@ -848,6 +849,9 @@ describe('sweepSession on a session with no mailbox', () => {
     inDb.close();
 
     // The row was closed by the reclaim after the tick's snapshot was taken.
+    // The wake guard re-reads it on the RAW handle (seam-3 §4.5 I-1), so the
+    // closed row has to exist in the test DB, not only behind the leaf mock.
+    await createSession({ ...snapshot, status: 'closed' });
     mockGetSession.mockReset().mockReturnValue({ ...snapshot, status: 'closed' });
 
     await _sweepSessionForTesting(snapshot);

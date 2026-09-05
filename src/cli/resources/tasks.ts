@@ -103,8 +103,8 @@ function groupArg(args: Record<string, unknown>, ctx: CallerContext): string | u
   return str(args.group) ?? str(args.agent_group_id);
 }
 
-function ownSession(sessionId: string, ctx: CallerContext): ScopedSession {
-  const session = getSession(sessionId);
+async function ownSession(sessionId: string, ctx: CallerContext): Promise<ScopedSession> {
+  const session = await getSession(sessionId);
   if (!session) throw new Error(`session not found: ${sessionId}`);
   if (ctx.caller === 'agent' && session.agent_group_id !== ctx.agentGroupId) {
     throw new Error(`session not found: ${sessionId}`);
@@ -112,18 +112,18 @@ function ownSession(sessionId: string, ctx: CallerContext): ScopedSession {
   return { id: session.id, agent_group_id: session.agent_group_id };
 }
 
-function selectedSessions(args: Record<string, unknown>, ctx: CallerContext): ScopedSession[] {
+async function selectedSessions(args: Record<string, unknown>, ctx: CallerContext): Promise<ScopedSession[]> {
   const sessionId = str(args.session);
-  if (sessionId) return [ownSession(sessionId, ctx)];
+  if (sessionId) return [await ownSession(sessionId, ctx)];
 
   const group = groupArg(args, ctx);
   if (group) {
     // One session per live task series — the loops below already fan out across them.
-    return findTaskSessions(group).map((s) => ({ id: s.id, agent_group_id: s.agent_group_id }));
+    return (await findTaskSessions(group)).map((s) => ({ id: s.id, agent_group_id: s.agent_group_id }));
   }
 
   if (ctx.caller === 'agent') return [];
-  return getActiveSessions().map((s) => ({ id: s.id, agent_group_id: s.agent_group_id }));
+  return (await getActiveSessions()).map((s) => ({ id: s.id, agent_group_id: s.agent_group_id }));
 }
 
 /**
@@ -237,10 +237,10 @@ function taskId(args: Record<string, unknown>): string {
  *
  * Host callers get no implicit stamp — routing only via the host-only flags.
  */
-function resolveTaskRouting(
+async function resolveTaskRouting(
   args: Record<string, unknown>,
   ctx: CallerContext,
-): { routing: TaskRouting; note?: string } {
+): Promise<{ routing: TaskRouting; note?: string }> {
   const messagingGroupArg = str(args.messaging_group);
   const threadIdArg = str(args.thread_id);
 
@@ -250,7 +250,7 @@ function resolveTaskRouting(
     }
     if (bool(args.isolated)) return { routing: NO_ROUTING };
 
-    const callingSession = getSession(ctx.sessionId);
+    const callingSession = await getSession(ctx.sessionId);
     if (!callingSession?.messaging_group_id) return { routing: NO_ROUTING };
 
     const mg = getMessagingGroup(callingSession.messaging_group_id);
@@ -298,14 +298,14 @@ async function createTask(args: Record<string, unknown>, ctx: CallerContext) {
   }
   // Wall-clock fields (--process-after, the cron grid) are interpreted in the
   // owning group's timezone, not the install's.
-  const tz = resolveGroupTimezone(group);
+  const tz = await resolveGroupTimezone(group);
   validateRecurrence(recurrence, tz);
   enforceRecurrenceLimit(recurrence, bool(args.dangerously_override_recurrence_limit), script != null, tz);
   const processAfter = firstRunIso(args.process_after, recurrence, tz);
   const id = makeTaskId(args.name);
   const originSessionId = ctx.caller === 'agent' ? ctx.sessionId : null;
-  const { routing, note: routingNote } = resolveTaskRouting(args, ctx);
-  const { flagIntent, error: flagError } = resolveTaskFlagIntent(
+  const { routing, note: routingNote } = await resolveTaskRouting(args, ctx);
+  const { flagIntent, error: flagError } = await resolveTaskFlagIntent(
     { model: str(args.model), effort: str(args.effort) },
     { agent_group_id: group },
   );
@@ -318,7 +318,7 @@ async function createTask(args: Record<string, unknown>, ctx: CallerContext) {
   // same value, two readers. The row is what the fire path uses; the session
   // column is what the console reads to place a task in the channel it is
   // routed to (migration 056). NO_ROUTING passes null and stamps nothing.
-  const { session } = resolveTaskSession(group, id, routing.platformId);
+  const { session } = await resolveTaskSession(group, id, routing.platformId);
 
   const created = await withInbound(session, (mailbox) =>
     withQuietInvalidationSync(session.id, () => {
@@ -373,17 +373,17 @@ async function createTask(args: Record<string, unknown>, ctx: CallerContext) {
  * can see when and why each run happened. Inside a task run the series is derived from
  * the caller's own task session, so the agent supplies only --msg.
  */
-function appendTaskLog(
+async function appendTaskLog(
   args: Record<string, unknown>,
   ctx: CallerContext,
-): { series: string; timestamp: string; path: string; ok: true } {
+): Promise<{ series: string; timestamp: string; path: string; ok: true }> {
   const msg = str(args.msg);
   if (!msg) throw new Error('--msg is required');
 
   let series = str(args.id);
   let group = groupArg(args, ctx);
   if (!series && ctx.caller === 'agent' && ctx.sessionId) {
-    const sess = getSession(ctx.sessionId);
+    const sess = await getSession(ctx.sessionId);
     if (sess && sess.thread_id && isTaskThread(sess.thread_id)) {
       series = sess.thread_id.slice(`${TASKS_SYSTEM_THREAD_ID}:`.length);
       group ??= sess.agent_group_id;
@@ -395,7 +395,7 @@ function appendTaskLog(
   // Group scope is enforced by groupArg (a cli_scope=group caller can only
   // ever resolve its own folder), so a foreign id at worst writes a stray log
   // under the caller's OWN folder — no leak. appendRunLog guards the charset.
-  return { ...appendRunLog(group, series, msg), ok: true };
+  return { ...(await appendRunLog(group, series, msg)), ok: true };
 }
 
 /**
@@ -416,8 +416,8 @@ function seriesStats(
 }
 
 /** Last ~10 lines of a series' run log (`tasks/<series>.md`), newest last. */
-function tailRunLog(agentGroupId: string, seriesKey: string, lines = 10): string[] {
-  const ag = getAgentGroup(agentGroupId);
+async function tailRunLog(agentGroupId: string, seriesKey: string, lines = 10): Promise<string[]> {
+  const ag = await getAgentGroup(agentGroupId);
   if (!ag) return [];
   const file = `${GROUPS_DIR}/${ag.folder}/tasks/${seriesKey}.md`;
   if (!fs.existsSync(file)) return [];
@@ -448,7 +448,7 @@ function enrichListRow(mailbox: NanoclawMailboxSession, base: ReturnType<typeof 
 async function listTasks(args: Record<string, unknown>, ctx: CallerContext) {
   const status = statusFilter(args);
   const rows = [];
-  for (const session of selectedSessions(args, ctx)) {
+  for (const session of await selectedSessions(args, ctx)) {
     const sessionRows = await withInbound(session, (mailbox) =>
       mailbox.listCliTaskSeries(status).map((row) => enrichListRow(mailbox, toOutput(session, row))),
     );
@@ -459,7 +459,7 @@ async function listTasks(args: Record<string, unknown>, ctx: CallerContext) {
 
 async function getTask(args: Record<string, unknown>, ctx: CallerContext) {
   const id = taskId(args);
-  for (const session of selectedSessions(args, ctx)) {
+  for (const session of await selectedSessions(args, ctx)) {
     const found = await withInbound(session, (mailbox) => {
       const row = mailbox.getCliTaskRow(id);
       if (!row) return undefined;
@@ -473,10 +473,16 @@ async function getTask(args: Record<string, unknown>, ctx: CallerContext) {
         origin_session_id: content.originSessionId,
         completed_runs: stats.runs,
         failed_runs: stats.failed_runs,
-        recent_log: tailRunLog(session.agent_group_id, seriesKey),
+        seriesKey,
       };
     });
-    if (found) return found;
+    if (found) {
+      // Read after the mailbox action: the log lives on disk and its lookup
+      // goes through the async agent-groups leaf, so it cannot sit inside
+      // the synchronous callback.
+      const { seriesKey, ...output } = found;
+      return { ...output, recent_log: await tailRunLog(session.agent_group_id, seriesKey) };
+    }
   }
   throw new Error(`task not found: ${id}`);
 }
@@ -489,7 +495,7 @@ async function mutateTask(
 ) {
   const id = taskId(args);
   let touched = 0;
-  for (const session of selectedSessions(args, ctx)) {
+  for (const session of await selectedSessions(args, ctx)) {
     const n =
       (await withInbound(session, (mailbox) => {
         // Probe (see the seam note above): no task row for this id/series here
@@ -564,7 +570,7 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
   // session's mailbox and closes it before the next, exactly as the raw open
   // this replaced did.
   const matched: { session: ScopedSession; row: TaskRow }[] = [];
-  for (const session of selectedSessions(args, ctx)) {
+  for (const session of await selectedSessions(args, ctx)) {
     const row = await withInbound(session, (mailbox) => mailbox.getCliTaskRow(id));
     if (row && (row.status === 'pending' || row.status === 'paused')) matched.push({ session, row });
   }
@@ -577,13 +583,18 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
         [{ tz: TIMEZONE, row: undefined }];
 
   for (const { tz, row } of validationZones) {
-    if (args.process_after !== undefined) parseProcessAfter(args.process_after, tz);
+    if (args.process_after !== undefined) parseProcessAfter(args.process_after, await tz);
     if (recurrence !== undefined) {
-      validateRecurrence(recurrence, tz);
+      validateRecurrence(recurrence, await tz);
       // Effective script AFTER this update: the new value when provided
       // (including an explicit clear), else whatever THIS task already has.
       const scriptAfter: string | null = script !== undefined ? script : row ? parseContent(row.content).script : null;
-      enforceRecurrenceLimit(recurrence, bool(args.dangerously_override_recurrence_limit), scriptAfter != null, tz);
+      enforceRecurrenceLimit(
+        recurrence,
+        bool(args.dangerously_override_recurrence_limit),
+        scriptAfter != null,
+        await tz,
+      );
     }
   }
   if (recurrence !== undefined) update.recurrence = recurrence;
@@ -594,9 +605,8 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
   const rearmFromCron = recurrence !== undefined && recurrence !== null && args.process_after === undefined;
   const hasWallClockUpdate = args.process_after !== undefined || rearmFromCron;
 
-  function wallClockUpdate(agentGroupId: string): TaskUpdate {
+  function wallClockUpdate(tz: string): TaskUpdate {
     if (!hasWallClockUpdate) return {};
-    const tz = resolveGroupTimezone(agentGroupId);
     if (args.process_after !== undefined) return { processAfter: parseProcessAfter(args.process_after, tz) };
     return { processAfter: CronExpressionParser.parse(recurrence!, { tz }).next().toDate().toISOString() };
   }
@@ -622,7 +632,7 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
   if (model !== undefined || effort !== undefined) {
     const group = groupArg(args, ctx);
     if (!group) throw new Error('--group is required to validate --model/--effort');
-    const { flagIntent, error: flagError } = resolveTaskFlagIntent({ model, effort }, { agent_group_id: group });
+    const { flagIntent, error: flagError } = await resolveTaskFlagIntent({ model, effort }, { agent_group_id: group });
     if (flagError) throw new Error(flagError);
     if (flagIntent && (flagIntent.turnModel || flagIntent.turnEffort)) update.flagIntent = flagIntent;
   }
@@ -638,7 +648,11 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
     // audited and what gets reported. Merging the per-session part at the
     // `updateTask` call while the audit kept reading the pre-merge object is
     // how a schedule-only update wrote a new instant and recorded nothing.
-    const sessionUpdate: TaskUpdate = { ...update, ...wallClockUpdate(session.agent_group_id) };
+    // The group's zone is the one central read this write needs; resolved
+    // BEFORE the session opens so the block below stays synchronous from its
+    // row read to its write.
+    const tz = await resolveGroupTimezone(session.agent_group_id);
+    const sessionUpdate: TaskUpdate = { ...update, ...wallClockUpdate(tz) };
     const result = await withInbound(session, (mailbox) => {
       const before = mailbox.getCliTaskRow(id);
       // The probe is free here: `before` is the same superset read the seam
@@ -672,12 +686,7 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
       if (recurrence !== undefined) {
         const scriptNow: string | null =
           script !== undefined ? script : before ? parseContent(before.content).script : null;
-        enforceRecurrenceLimit(
-          recurrence,
-          bool(args.dangerously_override_recurrence_limit),
-          scriptNow != null,
-          resolveGroupTimezone(session.agent_group_id),
-        );
+        enforceRecurrenceLimit(recurrence, bool(args.dangerously_override_recurrence_limit), scriptNow != null, tz);
       }
       const n = withQuietInvalidationSync(session.id, () => mailbox.updateTask(id, sessionUpdate));
       return { before, n };
@@ -714,7 +723,7 @@ async function cancelTaskCommand(args: Record<string, unknown>, ctx: CallerConte
   }
 
   let touched = 0;
-  for (const session of selectedSessions(args, ctx)) {
+  for (const session of await selectedSessions(args, ctx)) {
     const result = await withInbound(session, (mailbox) => {
       const seriesIds = mailbox.listCliTaskSeries().map((r) => r.series_id ?? r.row_id);
       // The listing is the probe: `listCliTaskSeries()` returns the
@@ -751,7 +760,7 @@ async function cancelTaskCommand(args: Record<string, unknown>, ctx: CallerConte
  */
 async function runTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
   const id = taskId(args);
-  for (const session of selectedSessions(args, ctx)) {
+  for (const session of await selectedSessions(args, ctx)) {
     const fired = await withInbound(session, (mailbox) => {
       const row = mailbox.getCliTaskRow(id);
       // The probe is free here too — no row, no fire, no invalidation.

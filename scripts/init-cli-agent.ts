@@ -109,17 +109,17 @@ async function main(): Promise<void> {
   // 2. Agent group + filesystem.
   const folder = args.folder || `cli-with-${normalizeName(args.displayName)}`;
   const pickedProvider = process.env.NANOCLAW_PICKED_PROVIDER?.trim().toLowerCase();
-  let ag: AgentGroup | undefined = getAgentGroupByFolder(folder);
+  let ag: AgentGroup | undefined = await getAgentGroupByFolder(folder);
   if (!ag) {
     const agId = generateId('ag');
-    createAgentGroup({
+    await createAgentGroup({
       id: agId,
       name: args.agentName,
       folder,
       agent_provider: null,
       created_at: now,
     });
-    ag = getAgentGroupByFolder(folder)!;
+    ag = (await getAgentGroupByFolder(folder))!;
     console.log(`Created agent group: ${ag.id} (${folder})`);
   } else {
     console.log(`Reusing agent group: ${ag.id} (${folder})`);
@@ -136,7 +136,7 @@ async function main(): Promise<void> {
   });
 
   // 3. CLI messaging group + wiring.
-  let cliMg: MessagingGroup | undefined = getMessagingGroupByPlatform(CLI_CHANNEL, CLI_PLATFORM_ID);
+  let cliMg: MessagingGroup | undefined = await getMessagingGroupByPlatform(CLI_CHANNEL, CLI_PLATFORM_ID);
   if (!cliMg) {
     cliMg = {
       id: generateId('mg'),
@@ -149,11 +149,11 @@ async function main(): Promise<void> {
       unknown_sender_policy: resolveUnknownSenderPolicy(CLI_CHANNEL, false),
       created_at: now,
     };
-    createMessagingGroup(cliMg);
+    await createMessagingGroup(cliMg);
     console.log(`Created CLI messaging group: ${cliMg.id}`);
   }
 
-  const existing = getMessagingGroupAgentByPair(cliMg.id, ag.id);
+  const existing = await getMessagingGroupAgentByPair(cliMg.id, ag.id);
   if (!existing) {
     // cli declares pattern '.' for DMs — every line the operator types is
     // for the agent. Identical to the pre-declaration hardcodes.

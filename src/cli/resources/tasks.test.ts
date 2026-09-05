@@ -15,14 +15,17 @@ vi.mock('../../config.js', async () => {
 // A hook that fires INSIDE each mailbox acquisition, numbered, so a test can
 // act in the window the async funnel opened between two passes over the same
 // session. Real implementation otherwise.
-const onMailboxAcquire = vi.hoisted(() => ({ run: null as ((call: number) => void) | null, calls: 0 }));
+const onMailboxAcquire = vi.hoisted(() => ({ run: null as ((call: number) => void | Promise<void>) | null, calls: 0 }));
 vi.mock('../../session-manager.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../session-manager.js')>();
   return {
     ...real,
     withExistingMailboxSession: async (agentGroupId: string, sessionId: string, action: never) => {
       onMailboxAcquire.calls += 1;
-      onMailboxAcquire.run?.(onMailboxAcquire.calls);
+      // Awaited: the hook reads the session list through the async central
+      // leaf now, and the whole point is that its mutation lands BEFORE the
+      // session opens, not somewhere in the middle of the action.
+      await onMailboxAcquire.run?.(onMailboxAcquire.calls);
       return real.withExistingMailboxSession(agentGroupId, sessionId, action);
     },
   };
@@ -55,12 +58,12 @@ function now(): string {
   return new Date().toISOString();
 }
 
-function createGroup(id: string): void {
-  createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: now() });
+async function createGroup(id: string): Promise<void> {
+  await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: now() });
 }
 
-function createChatSession(group: string, id: string): void {
-  createSession({
+async function createChatSession(group: string, id: string): Promise<void> {
+  await createSession({
     id,
     agent_group_id: group,
     messaging_group_id: null,
@@ -75,8 +78,8 @@ function createChatSession(group: string, id: string): void {
 }
 
 /** A session wired to a real messaging group — the shape a channel session actually has. */
-function createMgSession(group: string, id: string, mgId: string, threadId: string | null = null): void {
-  createSession({
+async function createMgSession(group: string, id: string, mgId: string, threadId: string | null = null): Promise<void> {
+  await createSession({
     id,
     agent_group_id: group,
     messaging_group_id: mgId,
@@ -90,8 +93,8 @@ function createMgSession(group: string, id: string, mgId: string, threadId: stri
   initSessionFolder(group, id);
 }
 
-function createMg(id: string, channelType = 'slack', platformId = 'C123'): void {
-  createMessagingGroup({
+async function createMg(id: string, channelType = 'slack', platformId = 'C123'): Promise<void> {
+  await createMessagingGroup({
     id,
     channel_type: channelType,
     platform_id: platformId,
@@ -125,10 +128,10 @@ describe('tasks CLI resource', () => {
     await initTestDb();
     const db = getRawDb();
     runMigrations(db);
-    createGroup('ag-1');
-    createGroup('ag-2');
-    createChatSession('ag-1', 'chat-1');
-    createChatSession('ag-2', 'chat-2');
+    await createGroup('ag-1');
+    await createGroup('ag-2');
+    await createChatSession('ag-1', 'chat-1');
+    await createChatSession('ag-2', 'chat-2');
   });
 
   afterEach(async () => {
@@ -141,12 +144,12 @@ describe('tasks CLI resource', () => {
     // which can span groups whose timezone overrides differ. Computing the
     // instant once from whichever group matched first would write one group's
     // wall-clock reading onto another group's series.
-    createGroup('ag-tokyo');
-    createGroup('ag-kolkata');
-    ensureContainerConfig('ag-tokyo');
-    ensureContainerConfig('ag-kolkata');
-    updateContainerConfigScalars('ag-tokyo', { timezone: 'Asia/Tokyo' }); // UTC+9, no DST
-    updateContainerConfigScalars('ag-kolkata', { timezone: 'Asia/Kolkata' }); // UTC+5:30, no DST
+    await createGroup('ag-tokyo');
+    await createGroup('ag-kolkata');
+    await ensureContainerConfig('ag-tokyo');
+    await ensureContainerConfig('ag-kolkata');
+    await updateContainerConfigScalars('ag-tokyo', { timezone: 'Asia/Tokyo' }); // UTC+9, no DST
+    await updateContainerConfigScalars('ag-kolkata', { timezone: 'Asia/Kolkata' }); // UTC+5:30, no DST
 
     const made: Record<string, { series_id: string; session_id: string }> = {};
     for (const group of ['ag-tokyo', 'ag-kolkata']) {
@@ -201,12 +204,12 @@ describe('tasks CLI resource', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-01-05T00:00:00.000Z'));
     try {
-      createGroup('ag-honolulu');
-      createGroup('ag-tokyo-cap');
-      ensureContainerConfig('ag-honolulu');
-      ensureContainerConfig('ag-tokyo-cap');
-      updateContainerConfigScalars('ag-honolulu', { timezone: 'Pacific/Honolulu' });
-      updateContainerConfigScalars('ag-tokyo-cap', { timezone: 'Asia/Tokyo' });
+      await createGroup('ag-honolulu');
+      await createGroup('ag-tokyo-cap');
+      await ensureContainerConfig('ag-honolulu');
+      await ensureContainerConfig('ag-tokyo-cap');
+      await updateContainerConfigScalars('ag-honolulu', { timezone: 'Pacific/Honolulu' });
+      await updateContainerConfigScalars('ag-tokyo-cap', { timezone: 'Asia/Tokyo' });
 
       const made: Record<string, { series_id: string; session_id: string }> = {};
       // Honolulu first: it is the permissive zone, so it is what a
@@ -257,8 +260,8 @@ describe('tasks CLI resource', () => {
     // updateTask() can actually mutate. Left unfiltered, a scriptless
     // terminal row in one session could subject a SCRIPTED live task in
     // another session to the (script-exempt) recurrence ceiling.
-    createGroup('ag-terminal-a');
-    createGroup('ag-terminal-b');
+    await createGroup('ag-terminal-a');
+    await createGroup('ag-terminal-b');
 
     const a = await dispatch(
       {
@@ -332,7 +335,7 @@ describe('tasks CLI resource', () => {
     expect(created.session_id).not.toBe('chat-1');
 
     // The task lands in its own isolated per-series session, not the chat session.
-    const sessions = getSessionsByAgentGroup('ag-1');
+    const sessions = await getSessionsByAgentGroup('ag-1');
     const taskSession = sessions.find((s) => s.id === created.session_id);
     expect(taskSession?.thread_id).toBe(taskThreadId(created.series_id));
 
@@ -387,7 +390,9 @@ describe('tasks CLI resource', () => {
     // The per-series session was resolved (and its inbound.db provisioned)
     // before the bracket, so an empty mailbox is the abort, not a missing
     // session.
-    const taskSessions = getSessionsByAgentGroup('ag-1').filter((sess) => sess.thread_id?.startsWith('system:tasks'));
+    const taskSessions = (await getSessionsByAgentGroup('ag-1')).filter((sess) =>
+      sess.thread_id?.startsWith('system:tasks'),
+    );
     expect(taskSessions).toHaveLength(1);
     const db = new Database(inboundDbPath('ag-1', taskSessions[0]!.id), { readonly: true });
     expect(db.prepare("SELECT COUNT(*) AS count FROM messages_in WHERE kind = 'task'").get()).toEqual({ count: 0 });
@@ -544,8 +549,8 @@ describe('tasks CLI resource', () => {
   it('update rejects an empty --prompt instead of blanking the series', async () => {
     // A wired channel session, so the create actually stamps routing and the
     // "nothing was touched" assertion below has something real to check.
-    createMg('mg-1');
-    createMgSession('ag-1', 'chan-1', 'mg-1');
+    await createMg('mg-1');
+    await createMgSession('ag-1', 'chan-1', 'mg-1');
     const created = await dispatch(
       {
         id: 'c',
@@ -660,9 +665,9 @@ describe('tasks CLI resource', () => {
     const seriesId = (scripted.data as { series_id: string }).series_id;
 
     onMailboxAcquire.calls = 0;
-    onMailboxAcquire.run = (call) => {
+    onMailboxAcquire.run = async (call) => {
       if (call !== 2) return; // 1 is the match read; act just before the write
-      const sess = getSessionsByAgentGroup('ag-1').find((x) => x.thread_id === taskThreadId(seriesId));
+      const sess = (await getSessionsByAgentGroup('ag-1')).find((x) => x.thread_id === taskThreadId(seriesId));
       const db = new Database(inboundDbPath('ag-1', sess!.id));
       const row = db
         .prepare("SELECT id, content FROM messages_in WHERE series_id = ? AND kind = 'task'")
@@ -893,7 +898,7 @@ describe('tasks CLI resource', () => {
       agentCtx(),
     );
 
-    expect(findSessionByAgentGroup('ag-1')?.id).toBe('chat-1');
+    expect((await findSessionByAgentGroup('ag-1'))?.id).toBe('chat-1');
   });
 
   it('group-scoped agents cannot list tasks from another group session', async () => {
@@ -1218,8 +1223,8 @@ describe('tasks CLI resource', () => {
     });
 
     it("default stamps the calling session's own channel, thread null", async () => {
-      createMg('mg-1');
-      createMgSession('ag-1', 'chan-1', 'mg-1');
+      await createMg('mg-1');
+      await createMgSession('ag-1', 'chan-1', 'mg-1');
       const r = await dispatch(
         { id: 'r2', command: 'tasks-create', args: { prompt: 'x', process_after: '2999-01-01T00:00:00Z' } },
         agentCtx('ag-1', 'chan-1'),
@@ -1247,8 +1252,8 @@ describe('tasks CLI resource', () => {
     it('an --isolated task stamps nothing on its session either', async () => {
       // Absent is honest: an isolated series has no destination, so the console
       // leaves it in the "Unrouted tasks" bucket rather than inventing one.
-      createMg('mg-1');
-      createMgSession('ag-1', 'chan-iso', 'mg-1');
+      await createMg('mg-1');
+      await createMgSession('ag-1', 'chan-iso', 'mg-1');
       const r = await dispatch(
         {
           id: 'r2b',
@@ -1270,8 +1275,8 @@ describe('tasks CLI resource', () => {
     });
 
     it("--thread additionally binds the calling session's own thread", async () => {
-      createMg('mg-1');
-      createMgSession('ag-1', 'thread-1', 'mg-1', 'thread-xyz');
+      await createMg('mg-1');
+      await createMgSession('ag-1', 'thread-1', 'mg-1', 'thread-xyz');
       const r = await dispatch(
         {
           id: 'r3',
@@ -1288,8 +1293,8 @@ describe('tasks CLI resource', () => {
     });
 
     it('--thread from a non-thread session falls back to channel-only with a note', async () => {
-      createMg('mg-1');
-      createMgSession('ag-1', 'chan-2', 'mg-1'); // channel-root session, no thread_id
+      await createMg('mg-1');
+      await createMgSession('ag-1', 'chan-2', 'mg-1'); // channel-root session, no thread_id
       const r = await dispatch(
         {
           id: 'r4',
@@ -1306,8 +1311,8 @@ describe('tasks CLI resource', () => {
     });
 
     it('--isolated stamps nothing even from a messaging-group-wired session', async () => {
-      createMg('mg-1');
-      createMgSession('ag-1', 'chan-3', 'mg-1');
+      await createMg('mg-1');
+      await createMgSession('ag-1', 'chan-3', 'mg-1');
       const r = await dispatch(
         {
           id: 'r5',
@@ -1348,7 +1353,7 @@ describe('tasks CLI resource', () => {
     });
 
     it('a host caller stamps routing only via --messaging-group/--thread-id, never implicitly', async () => {
-      createMg('mg-1');
+      await createMg('mg-1');
       const bare = await dispatch(
         {
           id: 'r8',
@@ -1397,8 +1402,8 @@ describe('tasks CLI resource', () => {
     });
 
     it('run copies routing forward from the source row', async () => {
-      createMg('mg-1');
-      createMgSession('ag-1', 'chan-4', 'mg-1');
+      await createMg('mg-1');
+      await createMgSession('ag-1', 'chan-4', 'mg-1');
       const created = await dispatch(
         { id: 'r11', command: 'tasks-create', args: { prompt: 'x', process_after: '2999-01-01T00:00:00Z' } },
         agentCtx('ag-1', 'chan-4'),
@@ -1533,12 +1538,12 @@ describe('tasks CLI resource', () => {
       // the per-session merge happened at the write call while the audit read
       // the pre-merge update, a schedule-only edit wrote a new instant and
       // recorded nothing — and each group can receive a different instant.
-      createGroup('ag-audit-tokyo');
-      createGroup('ag-audit-kolkata');
-      ensureContainerConfig('ag-audit-tokyo');
-      ensureContainerConfig('ag-audit-kolkata');
-      updateContainerConfigScalars('ag-audit-tokyo', { timezone: 'Asia/Tokyo' });
-      updateContainerConfigScalars('ag-audit-kolkata', { timezone: 'Asia/Kolkata' });
+      await createGroup('ag-audit-tokyo');
+      await createGroup('ag-audit-kolkata');
+      await ensureContainerConfig('ag-audit-tokyo');
+      await ensureContainerConfig('ag-audit-kolkata');
+      await updateContainerConfigScalars('ag-audit-tokyo', { timezone: 'Asia/Tokyo' });
+      await updateContainerConfigScalars('ag-audit-kolkata', { timezone: 'Asia/Kolkata' });
 
       const made: Record<string, { series_id: string }> = {};
       for (const group of ['ag-audit-tokyo', 'ag-audit-kolkata']) {
@@ -1555,7 +1560,7 @@ describe('tasks CLI resource', () => {
         made[group] = r.data as { series_id: string };
       }
       const sharedId = made['ag-audit-tokyo'].series_id;
-      const kolkataSession = getSessionsByAgentGroup('ag-audit-kolkata').find(
+      const kolkataSession = (await getSessionsByAgentGroup('ag-audit-kolkata')).find(
         (sess) => sess.thread_id === taskThreadId(made['ag-audit-kolkata'].series_id),
       )!;
       const kdb = new Database(inboundDbPath('ag-audit-kolkata', kolkataSession.id));

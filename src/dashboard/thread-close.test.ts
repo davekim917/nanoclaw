@@ -163,8 +163,8 @@ async function seed(): Promise<void> {
   const db = getRawDb();
   db.pragma('foreign_keys = ON');
   runMigrations(db);
-  createAgentGroup({ id: 'ag1', name: 'ag1', folder: 'ag1', agent_provider: null, created_at: iso(0) });
-  createAgentGroup({ id: 'ag2', name: 'ag2', folder: 'ag2', agent_provider: null, created_at: iso(0) });
+  await createAgentGroup({ id: 'ag1', name: 'ag1', folder: 'ag1', agent_provider: null, created_at: iso(0) });
+  await createAgentGroup({ id: 'ag2', name: 'ag2', folder: 'ag2', agent_provider: null, created_at: iso(0) });
   db.prepare(`INSERT INTO users (id, kind, display_name, created_at) VALUES ('admin', 'dashboard', 'admin', ?)`).run(
     iso(0),
   );
@@ -213,7 +213,7 @@ describe('threads.close guard', () => {
       payload: { agentGroupIds: ['ag1'], agentProposed: false, confirmations: 2, ...over },
     });
 
-  it('an agent-proposed close needs one confirmation, an operator-initiated one needs two', async () => {
+  it('an agent-proposed close needs one confirmation, an operator-initiated one needs two', () => {
     expect(requiredConfirmations(true)).toBe(1);
     expect(requiredConfirmations(false)).toBe(2);
     expect(consult({ agentProposed: true, confirmations: 1 }).effect).toBe('allow');
@@ -222,14 +222,14 @@ describe('threads.close guard', () => {
     expect(consult({ agentProposed: false, confirmations: 2 }).effect).toBe('allow');
   });
 
-  it('names the missing confirmation count so the surface can say so honestly', async () => {
+  it('names the missing confirmation count so the surface can say so honestly', () => {
     const denial = consult({ agentProposed: false, confirmations: 0 });
     expect(denial.effect).toBe('deny');
     expect(denial.reason).toContain('2 explicit operator confirmation');
     expect(denial.reason).toContain('no agent has proposed');
   });
 
-  it('refuses a non-human actor — an agent may propose, never close', async () => {
+  it('refuses a non-human actor — an agent may propose, never close', () => {
     for (const actor of [
       { kind: 'agent' as const, agentGroupId: 'ag1' },
       { kind: 'host' as const },
@@ -242,12 +242,12 @@ describe('threads.close guard', () => {
     }
   });
 
-  it('refuses a caller with no admin privilege on any agent group backing the thread', async () => {
+  it('refuses a caller with no admin privilege on any agent group backing the thread', () => {
     expect(consult({}, 'nobody').effect).toBe('deny');
     expect(consult({ agentGroupIds: [] }).effect).toBe('deny');
   });
 
-  it('never holds — closure has no approval path and therefore no settle-by-silence', async () => {
+  it('never holds — closure has no approval path and therefore no settle-by-silence', () => {
     expect(threadsClose.grantActionName).toBeUndefined();
     for (const confirmations of [0, 1, 2, 3]) {
       expect(consult({ confirmations }).effect).not.toBe('hold');

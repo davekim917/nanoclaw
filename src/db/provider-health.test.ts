@@ -17,7 +17,7 @@ describe('provider health cooldown', () => {
     await initTestDb();
     const db = getRawDb();
     runMigrations(db);
-    createAgentGroup({
+    await createAgentGroup({
       id: GID,
       name: 'health',
       folder: 'health',

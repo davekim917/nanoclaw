@@ -92,7 +92,7 @@ describe('createAgentFromTemplate', () => {
   it('writes MCP servers to the container config and context extras at their template-relative paths', async () => {
     const g = await createAgentFromTemplate('sales/sdr', { name: 'SDR Mcp' });
 
-    const cfg = getContainerConfig(g.id);
+    const cfg = await getContainerConfig(g.id);
     expect(cfg).toBeTruthy();
     expect(JSON.parse(cfg!.mcp_servers)).toHaveProperty('hubspot');
     // Extras land relative to the group root, exactly as they sit relative to
@@ -107,7 +107,7 @@ describe('createAgentFromTemplate', () => {
     writeTask('weekday-briefing', '0 9 * * 1-5', 'Send the weekday briefing.');
 
     const g = await createAgentFromTemplate('sales/sdr', { name: 'SDR Tasks' });
-    const sessions = findTaskSessions(g.id);
+    const sessions = await findTaskSessions(g.id);
     expect(sessions).toHaveLength(1);
 
     const db = new Database(inboundDbPath(g.id, sessions[0].id), { readonly: true });
@@ -131,14 +131,14 @@ describe('createAgentFromTemplate', () => {
     writeTask('daily-digest', '0 9 * * *', 'Send the digest.');
 
     const g = await createAgentFromTemplate('sales/sdr', { name: 'SDR TZ', timezone: 'Asia/Tokyo' });
-    expect(getContainerConfig(g.id)?.timezone).toBe('Asia/Tokyo');
+    expect((await getContainerConfig(g.id))?.timezone).toBe('Asia/Tokyo');
     // Mirrored to the file the spawn path reads for the container's TZ env.
     const fileConfig = JSON.parse(fs.readFileSync(path.join(GROUPS_DIR, g.folder, 'container.json'), 'utf8')) as {
       timezone?: string;
     };
     expect(fileConfig.timezone).toBe('Asia/Tokyo');
 
-    const sessions = findTaskSessions(g.id);
+    const sessions = await findTaskSessions(g.id);
     const db = new Database(inboundDbPath(g.id, sessions[0].id), { readonly: true });
     const row = db.prepare("SELECT process_after FROM messages_in WHERE kind = 'task'").get() as {
       process_after: string;
@@ -153,7 +153,7 @@ describe('createAgentFromTemplate', () => {
 
   it('ignores an invalid timezone — the group follows the install default', async () => {
     const g = await createAgentFromTemplate('sales/sdr', { name: 'SDR Bad TZ', timezone: 'Not/AZone' });
-    expect(getContainerConfig(g.id)?.timezone).toBeNull();
+    expect((await getContainerConfig(g.id))?.timezone).toBeNull();
   });
 
   it('writes template MCP servers into container.json, not only the DB projection', async () => {
@@ -166,7 +166,7 @@ describe('createAgentFromTemplate', () => {
     expect(fileConfig.mcpServers).toEqual({
       hubspot: { command: 'npx', args: ['-y', '@hubspot/mcp-server'], env: {} },
     });
-    expect(JSON.parse(getContainerConfig(g.id)!.mcp_servers)).toEqual(fileConfig.mcpServers);
+    expect(JSON.parse((await getContainerConfig(g.id))!.mcp_servers)).toEqual(fileConfig.mcpServers);
   });
 
   it('forwards multiline scripts unchanged through the shared task creation path', async () => {
@@ -174,7 +174,7 @@ describe('createAgentFromTemplate', () => {
     writeTask('alert-watch', '*/15 * * * *', 'Investigate new alerts.', script);
 
     const g = await createAgentFromTemplate('sales/sdr', { name: 'Scripted Tasks' });
-    const sessions = findTaskSessions(g.id);
+    const sessions = await findTaskSessions(g.id);
     expect(sessions).toHaveLength(1);
 
     const db = new Database(inboundDbPath(g.id, sessions[0].id), { readonly: true });
@@ -200,7 +200,7 @@ describe('createAgentFromTemplate', () => {
     writeTask('broken', schedule, 'Never created.');
 
     await expect(createAgentFromTemplate('sales/sdr', { name: 'Broken Tasks' })).rejects.toThrow(expected);
-    expect(getAllAgentGroups()).toEqual([]);
+    expect(await getAllAgentGroups()).toEqual([]);
     expect(fs.existsSync(path.join(GROUPS_DIR, 'broken-tasks'))).toBe(false);
   });
 });

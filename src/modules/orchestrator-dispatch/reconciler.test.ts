@@ -26,8 +26,8 @@ async function setupDb(): Promise<void> {
   runMigrations(db);
 }
 
-function seedGroups(): void {
-  createAgentGroup({
+async function seedGroups(): Promise<void> {
+  await createAgentGroup({
     id: 'ag-parent',
     name: 'ag-parent',
     folder: 'ag-parent',
@@ -58,7 +58,7 @@ afterEach(async () => {
 describe('runReconcilerSweep', () => {
   it('test_reconciler_picks_up_orphan: schedules side-effects for orphaned task', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     insertOrphanedTask('task-orphan', null); // no lease
 
     const setImmediateSpy = vi.spyOn(global, 'setImmediate');
@@ -72,7 +72,7 @@ describe('runReconcilerSweep', () => {
 
   it('test_reconciler_skips_active_lease: does not schedule when lease is held', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     // lease set to NOW (not expired — within 60s TTL)
     insertOrphanedTask('task-leased', now());
 
@@ -87,7 +87,7 @@ describe('runReconcilerSweep', () => {
 
   it('picks up multiple orphans in one sweep', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     insertOrphanedTask('task-a');
     insertOrphanedTask('task-b');
 
@@ -106,7 +106,7 @@ describe('runReconcilerSweep', () => {
 
   it('does nothing when no orphans exist', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
 
     const setImmediateSpy = vi.spyOn(global, 'setImmediate');
     runReconcilerSweep();

@@ -36,15 +36,21 @@ async function setupDb(): Promise<void> {
   runMigrations(db);
 }
 
-function seedGroups(): void {
-  createAgentGroup({
+async function seedGroups(): Promise<void> {
+  await createAgentGroup({
     id: 'ag-parent',
     name: 'ag-parent',
     folder: 'ag-parent',
     agent_provider: null,
     created_at: now(),
   });
-  createAgentGroup({ id: 'ag-child', name: 'ag-child', folder: 'ag-child', agent_provider: null, created_at: now() });
+  await createAgentGroup({
+    id: 'ag-child',
+    name: 'ag-child',
+    folder: 'ag-child',
+    agent_provider: null,
+    created_at: now(),
+  });
   getRawDb()
     .prepare(`INSERT INTO sessions (id, agent_group_id, created_at) VALUES (?, ?, ?)`)
     .run('sess-parent', 'ag-parent', now());
@@ -133,11 +139,11 @@ afterEach(async () => {
 describe('applySpawnComplete', () => {
   it('test_complete_happy_path: transitions to completed and notifies parent', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     makeRunningTask();
 
     const { getSession } = await import('../../db/sessions.js');
-    vi.mocked(getSession).mockReturnValue(makeParentSession());
+    vi.mocked(getSession).mockResolvedValue(makeParentSession());
 
     await applySpawnComplete({ task_id: 'task-1', summary: 'Done!' }, makeChildSession());
 
@@ -156,7 +162,7 @@ describe('applySpawnComplete', () => {
 
   it('ASSERT: rejects when content lacks task_id', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     makeRunningTask();
 
     await applySpawnComplete({}, makeChildSession()); // no task_id
@@ -167,7 +173,7 @@ describe('applySpawnComplete', () => {
 
   it('test_auth_rejects_wrong_session: does not transition when child_session_id mismatch', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     makeRunningTask();
 
     await applySpawnComplete({ task_id: 'task-1', summary: 'Done' }, makeWrongSession());
@@ -181,7 +187,7 @@ describe('applySpawnComplete', () => {
 
   it('test_complete_after_cancel_skips_notify: skips parent notify when already terminal', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     const task = makeRunningTask();
 
     // Pre-cancel the task
@@ -201,11 +207,11 @@ describe('applySpawnComplete', () => {
 describe('applySpawnFailed', () => {
   it('test_failed_includes_reason: stores fail_reason and transitions to failed', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     makeRunningTask();
 
     const { getSession } = await import('../../db/sessions.js');
-    vi.mocked(getSession).mockReturnValue(makeParentSession());
+    vi.mocked(getSession).mockResolvedValue(makeParentSession());
 
     await applySpawnFailed(
       { task_id: 'task-1', summary: 'Error occurred', fail_reason: 'agent_error' },
@@ -220,7 +226,7 @@ describe('applySpawnFailed', () => {
 
   it('ASSERT: two-column auth enforced for failed', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     makeRunningTask();
 
     await applySpawnFailed({ task_id: 'task-1', summary: 'X' }, makeWrongSession());
@@ -231,7 +237,7 @@ describe('applySpawnFailed', () => {
 
   it('ASSERT: skips parent notify when transition returns false', async () => {
     await setupDb();
-    seedGroups();
+    await seedGroups();
     makeRunningTask();
 
     // Pre-complete the task

@@ -25,8 +25,8 @@ vi.mock('../../container-runner.js', async () => {
     killContainer: vi.fn(),
     // The real definition. The route hands its liveness proof to the wake path
     // rather than proving it before the call; it only builds the guard here.
-    sessionStillActive: (sessionId: string) => () => {
-      const fresh = getSession(sessionId);
+    sessionStillActive: (sessionId: string) => async () => {
+      const fresh = await getSession(sessionId);
       if (!fresh) return { ok: false, reason: 'session no longer exists' };
       if (fresh.status !== 'active') return { ok: false, reason: `session is ${fresh.status}` };
       if (fresh.archived_at != null) return { ok: false, reason: 'session is archived' };
@@ -173,8 +173,8 @@ describe('routeAgentMessage return-path', () => {
     const db = getRawDb();
     runMigrations(db);
 
-    createAgentGroup({ id: A, name: 'A', folder: 'a', agent_provider: null, created_at: now() });
-    createAgentGroup({ id: B, name: 'B', folder: 'b', agent_provider: null, created_at: now() });
+    await createAgentGroup({ id: A, name: 'A', folder: 'a', agent_provider: null, created_at: now() });
+    await createAgentGroup({ id: B, name: 'B', folder: 'b', agent_provider: null, created_at: now() });
 
     // S1 (older), S2 (newer) — both active sessions on A.
     S1 = {
@@ -214,9 +214,9 @@ describe('routeAgentMessage return-path', () => {
       last_active: null,
       created_at: '2026-01-15T00:00:00.000Z',
     };
-    createSession(S1);
-    createSession(S2);
-    createSession(SB);
+    await createSession(S1);
+    await createSession(S2);
+    await createSession(SB);
     initSessionFolder(A, S1.id);
     initSessionFolder(A, S2.id);
     initSessionFolder(B, SB.id);
@@ -370,7 +370,7 @@ describe('routeAgentMessage return-path', () => {
     const inboundId = bRows[0].id;
 
     // Close S1 — simulates session cleanup or channel disconnect.
-    updateSession(S1.id, { status: 'closed' });
+    await updateSession(S1.id, { status: 'closed' });
 
     // B replies. origin points to S1 (closed), should fall through to S2.
     await routeAgentMessage(
@@ -387,7 +387,7 @@ describe('routeAgentMessage return-path', () => {
   it('cross-agent-group guard: origin session belonging to wrong agent group is rejected', async () => {
     // Third agent group C sends to B, stamping source_session_id = SC on B's inbound.
     const C = 'ag-C';
-    createAgentGroup({ id: C, name: 'C', folder: 'c', agent_provider: null, created_at: now() });
+    await createAgentGroup({ id: C, name: 'C', folder: 'c', agent_provider: null, created_at: now() });
     const SC: Session = {
       id: 'sess-C',
       agent_group_id: C,
@@ -399,7 +399,7 @@ describe('routeAgentMessage return-path', () => {
       last_active: null,
       created_at: '2026-03-01T00:00:00.000Z',
     };
-    createSession(SC);
+    await createSession(SC);
     initSessionFolder(C, SC.id);
     createDestination({ agent_group_id: C, local_name: 'b', target_type: 'agent', target_id: B, created_at: now() });
 

@@ -54,7 +54,7 @@ describe('opencode provider container-config reconciliation', () => {
     await closeDb();
   });
 
-  it('creates a missing runtime parent chain, reconciles stale entries, and preserves opencode.db', () => {
+  it('creates a missing runtime parent chain, reconciles stale entries, and preserves opencode.db', async () => {
     const fn = getProviderContainerConfig('opencode')!;
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-opencode-stale-'));
     const ctx = makeCtx(root);
@@ -63,7 +63,7 @@ describe('opencode provider container-config reconciliation', () => {
     writeGlobalSources(home);
 
     try {
-      fn(ctx);
+      await fn(ctx);
       fs.writeFileSync(path.join(runtime, 'opencode.db'), 'session-state');
       expect(fs.existsSync(path.join(runtime, 'auth.json'))).toBe(true);
       expect(fs.existsSync(path.join(runtime, 'agent', 'global.md'))).toBe(true);
@@ -72,7 +72,7 @@ describe('opencode provider container-config reconciliation', () => {
       fs.rmSync(path.join(home, '.local', 'share', 'opencode', 'auth.json'));
       fs.rmSync(path.join(home, '.config', 'opencode', 'agent'), { recursive: true });
       fs.rmSync(path.join(home, '.config', 'opencode', 'skill'), { recursive: true });
-      fn(ctx);
+      await fn(ctx);
 
       expect(fs.existsSync(path.join(runtime, 'auth.json'))).toBe(false);
       expect(fs.existsSync(path.join(runtime, 'agent'))).toBe(false);
@@ -83,7 +83,7 @@ describe('opencode provider container-config reconciliation', () => {
     }
   });
 
-  it('uses scoped definitions without requiring scoped auth', () => {
+  it('uses scoped definitions without requiring scoped auth', async () => {
     const fn = getProviderContainerConfig('opencode')!;
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-opencode-scoped-defs-'));
     const ctx = makeCtx(root);
@@ -98,7 +98,7 @@ describe('opencode provider container-config reconciliation', () => {
     fs.writeFileSync(path.join(scoped, 'skill', 'scoped-skill', 'SKILL.md'), '# scoped skill\n');
 
     try {
-      const contribution = fn(ctx);
+      const contribution = await fn(ctx);
 
       expect(fs.readFileSync(path.join(runtime, 'auth.json'), 'utf8')).toBe('{"opencode-go":{"type":"oauth"}}');
       expect(fs.existsSync(path.join(runtime, 'agent', 'scoped.md'))).toBe(true);
@@ -111,7 +111,7 @@ describe('opencode provider container-config reconciliation', () => {
     }
   });
 
-  it('keeps scoped auth authoritative when shared auth has a different provider', () => {
+  it('keeps scoped auth authoritative when shared auth has a different provider', async () => {
     const fn = getProviderContainerConfig('opencode')!;
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-opencode-scoped-auth-'));
     const ctx = makeCtx(root);
@@ -124,7 +124,7 @@ describe('opencode provider container-config reconciliation', () => {
     fs.writeFileSync(path.join(scoped, 'auth.json'), '{"opencode-go":{"type":"oauth"}}');
 
     try {
-      fn(ctx);
+      await fn(ctx);
       expect(fs.readFileSync(path.join(runtimeDir(ctx.sessionDir), 'auth.json'), 'utf8')).toBe(
         '{"opencode-go":{"type":"oauth"}}',
       );
@@ -133,7 +133,7 @@ describe('opencode provider container-config reconciliation', () => {
     }
   });
 
-  it('replaces poisoned managed entries without following their links', () => {
+  it('replaces poisoned managed entries without following their links', async () => {
     const fn = getProviderContainerConfig('opencode')!;
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-opencode-poisoned-'));
     const ctx = makeCtx(root);
@@ -152,7 +152,7 @@ describe('opencode provider container-config reconciliation', () => {
     fs.symlinkSync(path.join(outside, 'skill'), path.join(runtime, 'skill'), 'dir');
 
     try {
-      fn(ctx);
+      await fn(ctx);
 
       expect(fs.readFileSync(path.join(outside, 'auth-sentinel'), 'utf8')).toBe('keep');
       expect(fs.readFileSync(path.join(outside, 'agent', 'sentinel'), 'utf8')).toBe('keep');
@@ -166,7 +166,7 @@ describe('opencode provider container-config reconciliation', () => {
     }
   });
 
-  it('fails closed when the OpenCode runtime root is a symlink', () => {
+  it('fails closed when the OpenCode runtime root is a symlink', async () => {
     const fn = getProviderContainerConfig('opencode')!;
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-opencode-root-link-'));
     const ctx = makeCtx(root);
@@ -176,13 +176,13 @@ describe('opencode provider container-config reconciliation', () => {
     fs.symlinkSync(outside, path.join(ctx.sessionDir, 'opencode-xdg'), 'dir');
 
     try {
-      expect(() => fn(ctx)).toThrow(/Unsafe runtime directory/);
+      await expect(fn(ctx)).rejects.toThrow(/Unsafe runtime directory/);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
-  it('fails closed when the OpenCode runtime subdirectory is a symlink', () => {
+  it('fails closed when the OpenCode runtime subdirectory is a symlink', async () => {
     const fn = getProviderContainerConfig('opencode')!;
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-opencode-subdir-link-'));
     const ctx = makeCtx(root);
@@ -192,20 +192,20 @@ describe('opencode provider container-config reconciliation', () => {
     fs.symlinkSync(outside, runtimeDir(ctx.sessionDir), 'dir');
 
     try {
-      expect(() => fn(ctx)).toThrow(/Unsafe runtime directory/);
+      await expect(fn(ctx)).rejects.toThrow(/Unsafe runtime directory/);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
-  it('leaves effective-model proxy routing to the container runtime', () => {
+  it('leaves effective-model proxy routing to the container runtime', async () => {
     const fn = getProviderContainerConfig('opencode')!;
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-opencode-matching-auth-'));
     const ctx = makeCtx(root);
     writeGlobalSources(ctx.hostEnv.HOME!);
 
     try {
-      const contribution = fn(ctx);
+      const contribution = await fn(ctx);
       expect(contribution.env?.OPENCODE_PROVIDER).toBe('opencode-go');
       expect(contribution.env?.NO_PROXY?.split(',')).not.toContain('opencode.ai');
       expect(contribution.env?.no_proxy?.split(',')).not.toContain('opencode.ai');
@@ -217,7 +217,7 @@ describe('opencode provider container-config reconciliation', () => {
   it.each([
     ['unrelated auth', '{"nvidia":{"type":"api"}}'],
     ['malformed auth', '{not-json'],
-  ])('keeps OneCLI active for %s', (_label, auth) => {
+  ])('keeps OneCLI active for %s', async (_label, auth) => {
     const fn = getProviderContainerConfig('opencode')!;
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-opencode-nonmatching-auth-'));
     const ctx = makeCtx(root);
@@ -226,7 +226,7 @@ describe('opencode provider container-config reconciliation', () => {
     fs.writeFileSync(path.join(home, '.local', 'share', 'opencode', 'auth.json'), auth);
 
     try {
-      const contribution = fn(ctx);
+      const contribution = await fn(ctx);
       expect(contribution.env?.OPENCODE_PROVIDER).toBe('opencode-go');
       expect(contribution.env?.NO_PROXY?.split(',')).not.toContain('opencode.ai');
       expect(contribution.env?.no_proxy?.split(',')).not.toContain('opencode.ai');
@@ -235,7 +235,7 @@ describe('opencode provider container-config reconciliation', () => {
     }
   });
 
-  it('forwards model capability declarations only when the host env sets them', () => {
+  it('forwards model capability declarations only when the host env sets them', async () => {
     const fn = getProviderContainerConfig('opencode')!;
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-opencode-caps-'));
     const ctx = makeCtx(root);
@@ -243,12 +243,12 @@ describe('opencode provider container-config reconciliation', () => {
 
     try {
       // Default: a group that declares nothing gets exactly the env it got before.
-      const bare = fn(ctx);
+      const bare = await fn(ctx);
       expect(bare.env?.OPENCODE_MODEL_CONTEXT_LIMIT).toBeUndefined();
       expect(bare.env?.OPENCODE_MODEL_OUTPUT_LIMIT).toBeUndefined();
       expect(bare.env?.OPENCODE_MODEL_INPUT_MODALITIES).toBeUndefined();
 
-      const declared = fn(
+      const declared = await fn(
         makeCtx(root, {
           hostEnv: {
             HOME: ctx.hostEnv.HOME,
@@ -266,7 +266,7 @@ describe('opencode provider container-config reconciliation', () => {
     }
   });
 
-  it('prefers the folder-scoped capability var over the bare one, and drops blanks', () => {
+  it('prefers the folder-scoped capability var over the bare one, and drops blanks', async () => {
     const fn = getProviderContainerConfig('opencode')!;
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-opencode-caps-scoped-'));
     const base = makeCtx(root);
@@ -274,7 +274,7 @@ describe('opencode provider container-config reconciliation', () => {
 
     try {
       // agentGroupFolder is 'example-opencode' -> EXAMPLE_OPENCODE.
-      const contribution = fn(
+      const contribution = await fn(
         makeCtx(root, {
           hostEnv: {
             HOME: base.hostEnv.HOME,
@@ -293,7 +293,7 @@ describe('opencode provider container-config reconciliation', () => {
     }
   });
 
-  it('keeps OneCLI active when auth is absent', () => {
+  it('keeps OneCLI active when auth is absent', async () => {
     const fn = getProviderContainerConfig('opencode')!;
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-opencode-no-auth-'));
     const ctx = makeCtx(root);
@@ -302,7 +302,7 @@ describe('opencode provider container-config reconciliation', () => {
     fs.rmSync(path.join(home, '.local', 'share', 'opencode', 'auth.json'));
 
     try {
-      const contribution = fn(ctx);
+      const contribution = await fn(ctx);
       expect(contribution.env?.NO_PROXY?.split(',')).not.toContain('opencode.ai');
       expect(contribution.env?.no_proxy?.split(',')).not.toContain('opencode.ai');
     } finally {

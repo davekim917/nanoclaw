@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { runChannelSkill } from './run-channel-skill.js';
+import { runChannelSkill, type WireArgs } from './run-channel-skill.js';
 import { runSkill } from '../lib/skill-driver.js';
 import { fullyApplied } from '../../scripts/skill-apply.js';
 import { parseDirectives } from '../../scripts/skill-directives.js';
@@ -44,7 +44,7 @@ describe('runChannelSkill adapter (Option A)', () => {
       // writing an empty file (skill-apply.ts's owned-by-fork branch).
       if (c.startsWith('git show')) return '// placeholder branch content\n';
     };
-    const wired: Array<Record<string, unknown>> = [];
+    const wired: WireArgs[] = [];
 
     await runChannelSkill('slack', 'Bob Smith', {
       projectRoot: root,
@@ -437,7 +437,7 @@ describe('runChannelSkill adapter (Option A)', () => {
       ].join('\n'),
     );
 
-    const wired: Array<Record<string, unknown>> = [];
+    const wired: WireArgs[] = [];
     await runChannelSkill(wireChannel, 'Dan Mill', {
       projectRoot: root,
       exec: (c) => {

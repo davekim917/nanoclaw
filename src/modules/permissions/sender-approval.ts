@@ -324,7 +324,7 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
   // fall back to the first one (same reference-group pattern as the channel
   // card flow); with zero agent groups the stamp is skipped (no dedupe, rare
   // bootstrap state) but the decline still goes out.
-  const stampAgentGroupId = agentGroupId ?? getAllAgentGroups()[0]?.id;
+  const stampAgentGroupId = agentGroupId ?? (await getAllAgentGroups())[0]?.id;
   if (stampAgentGroupId) {
     // Converting a pending CARD into a stamp destroys the retained event, and
     // that event is the only thing that can resolve its ingress receipt. The

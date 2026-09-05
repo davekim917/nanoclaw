@@ -862,7 +862,7 @@ async function buildAgents(
 
   return Promise.all(
     agentRows.map(async (row) => {
-      const sessions = getSessionsByAgentGroup(row.id);
+      const sessions = await getSessionsByAgentGroup(row.id);
       const awake = sessions.some((s) => activeSessionIds.has(s.id));
 
       // Two separate trackers on purpose. lastSeenAt is "last spoke anywhere",
@@ -913,7 +913,7 @@ async function buildAgents(
             }
           : null;
 
-      const provider = getContainerConfig(row.id)?.provider ?? row.agent_provider ?? '';
+      const provider = (await getContainerConfig(row.id))?.provider ?? row.agent_provider ?? '';
       const containerConfig = readContainerConfig(row.folder);
       const name = await resolvePersonaName(row, containerConfig, deps);
 

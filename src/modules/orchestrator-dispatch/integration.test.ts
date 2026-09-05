@@ -176,10 +176,13 @@ async function setupDb(): Promise<void> {
   runMigrations(db);
 }
 
-function seedGroups({ withMg = false }: { withMg?: boolean } = {}): { orchSession: Session; mgId: string | null } {
+async function seedGroups({ withMg = false }: { withMg?: boolean } = {}): Promise<{
+  orchSession: Session;
+  mgId: string | null;
+}> {
   // Self-orchestration: only one agent group is needed. The "child" sessions
   // resolveSession returns will live in the SAME group (ag-orch).
-  createAgentGroup({ id: 'ag-orch', name: 'ag-orch', folder: 'ag-orch', agent_provider: null, created_at: ts() });
+  await createAgentGroup({ id: 'ag-orch', name: 'ag-orch', folder: 'ag-orch', agent_provider: null, created_at: ts() });
 
   const capConfig = JSON.stringify({
     concurrencyCap: 5,
@@ -196,7 +199,7 @@ function seedGroups({ withMg = false }: { withMg?: boolean } = {}): { orchSessio
   let mgId: string | null = null;
   if (withMg) {
     mgId = 'mg-shared';
-    createMessagingGroup({
+    await createMessagingGroup({
       id: mgId,
       channel_type: 'slack',
       platform_id: 'C-123',
@@ -282,7 +285,7 @@ afterEach(async () => {
 describe('F1: e2e threaded happy path', () => {
   it('test_e2e_threaded_happy_path: full admit → thread → child complete → parent notified', async () => {
     await setupDb();
-    const { orchSession } = seedGroups({ withMg: true });
+    const { orchSession } = await seedGroups({ withMg: true });
 
     const { getChannelAdapter } = await import('../../channels/channel-registry.js');
     vi.mocked(getChannelAdapter).mockReturnValue(
@@ -366,7 +369,7 @@ describe('F1: e2e threaded happy path', () => {
 describe('F1: e2e headless happy path', () => {
   it('test_e2e_headless_happy_path: no createThread → headless surface_mode', async () => {
     await setupDb();
-    const { orchSession } = seedGroups({ withMg: false }); // no messaging group
+    const { orchSession } = await seedGroups({ withMg: false }); // no messaging group
 
     const { getChannelAdapter } = await import('../../channels/channel-registry.js');
     vi.mocked(getChannelAdapter).mockReturnValue(
@@ -426,7 +429,7 @@ describe('F1: e2e headless happy path', () => {
 describe('F1: e2e idempotency replay', () => {
   it('test_e2e_idempotent_replay: same idempotency_key does not insert new task row', async () => {
     await setupDb();
-    const { orchSession } = seedGroups({ withMg: false });
+    const { orchSession } = await seedGroups({ withMg: false });
 
     const { getChannelAdapter } = await import('../../channels/channel-registry.js');
     vi.mocked(getChannelAdapter).mockReturnValue(undefined);
@@ -448,7 +451,7 @@ describe('F1: e2e idempotency replay', () => {
 
   it('test_e2e_idempotent_replay_at_concurrency_cap: replay succeeds even when cap is reached', async () => {
     await setupDb();
-    const { orchSession } = seedGroups({ withMg: false });
+    const { orchSession } = await seedGroups({ withMg: false });
 
     // Set cap to 1
     const capCfg = JSON.stringify({
@@ -544,7 +547,7 @@ describe('F1: e2e idempotency replay', () => {
 describe('F1: e2e cancel during running', () => {
   it('test_e2e_cancel_during_running: cancel writes _spawn_cancel and arms kill timer', async () => {
     await setupDb();
-    const { orchSession } = seedGroups({ withMg: false });
+    const { orchSession } = await seedGroups({ withMg: false });
 
     const { getChannelAdapter } = await import('../../channels/channel-registry.js');
     vi.mocked(getChannelAdapter).mockReturnValue(undefined);
@@ -609,7 +612,7 @@ describe('F1: e2e cancel during running', () => {
 
   it('test_e2e_complete_after_cancel_is_no_op: CAS prevents overwriting cancelled status', async () => {
     await setupDb();
-    const { orchSession } = seedGroups({ withMg: false });
+    const { orchSession } = await seedGroups({ withMg: false });
 
     const { getChannelAdapter } = await import('../../channels/channel-registry.js');
     vi.mocked(getChannelAdapter).mockReturnValue(undefined);
@@ -658,7 +661,7 @@ describe('F1: e2e cancel during running', () => {
 describe('F1: e2e watchdog terminates no-progress task', () => {
   it('test_e2e_watchdog_terminates_no_progress: sweep reaps task with stale last_progress_at', async () => {
     await setupDb();
-    const { orchSession } = seedGroups({ withMg: false });
+    const { orchSession } = await seedGroups({ withMg: false });
 
     const { getChannelAdapter } = await import('../../channels/channel-registry.js');
     vi.mocked(getChannelAdapter).mockReturnValue(undefined);
@@ -700,7 +703,7 @@ describe('F1: e2e watchdog terminates no-progress task', () => {
 describe('F1: e2e orphan recovery', () => {
   it('test_e2e_orphan_recovery: reconciler picks up admitted-but-incomplete task', async () => {
     await setupDb();
-    seedGroups({ withMg: false });
+    await seedGroups({ withMg: false });
 
     const { getChannelAdapter } = await import('../../channels/channel-registry.js');
     vi.mocked(getChannelAdapter).mockReturnValue(undefined);

@@ -234,7 +234,7 @@ export async function sendThreadMessage(
       .get(channelKey)
       ?.find((a) => a.agent_group_id === agentGroupId);
     if (!wired) return { status: 409, body: { error: 'agent_not_wired_to_thread_channel', channel: channelKey } };
-    const resolved = resolveSession(agentGroupId, wired.messaging_group_id, threadId, wired.session_mode);
+    const resolved = await resolveSession(agentGroupId, wired.messaging_group_id, threadId, wired.session_mode);
     sessionId = resolved.session.id;
     createdSession = resolved.created;
   }

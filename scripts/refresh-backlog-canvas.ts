@@ -28,14 +28,18 @@ const run = preview
       // Linear is reached with the OPTED-IN GROUP's OneCLI identity, because
       // the Linear credential is scoped to that workgroup's agent and not to
       // the host's default one. Same resolution runTick does.
-      const group = getAllAgentGroups().find((g) => readContainerConfig(g.folder).backlogCanvas?.messagingGroupId);
+      const group = (await getAllAgentGroups()).find(
+        (g) => readContainerConfig(g.folder).backlogCanvas?.messagingGroupId,
+      );
       if (!group) {
         console.error('No group declares backlogCanvas.messagingGroupId — nothing to preview.');
         process.exit(1);
       }
       const issues = await fetchLinearIssues(team, group.id);
       const md = renderBoard(issues);
-      console.log(`--- ${issues.length} issues · ${md.length} bytes · ${(md.match(/^#/gm) || []).length} header(s) ---`);
+      console.log(
+        `--- ${issues.length} issues · ${md.length} bytes · ${(md.match(/^#/gm) || []).length} header(s) ---`,
+      );
       console.log(md);
     }
   : runTick;

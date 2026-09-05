@@ -104,7 +104,7 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
     await notifyAgent(session, `grant_access failed: role must be \`member\` or \`admin\`, got \`${role}\`.`);
     return;
   }
-  if (!getAgentGroup(targetAgentGroupId)) {
+  if (!(await getAgentGroup(targetAgentGroupId))) {
     await notifyAgent(session, `grant_access failed: agent group \`${targetAgentGroupId}\` does not exist.`);
     return;
   }
@@ -124,11 +124,17 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
       targetAgentGroupId,
       authority: describeAuthority(callerId, targetAgentGroupId),
     });
-    await notifyAgent(session, `grant_access denied: you don't have authority over agent group \`${targetAgentGroupId}\`.`);
+    await notifyAgent(
+      session,
+      `grant_access denied: you don't have authority over agent group \`${targetAgentGroupId}\`.`,
+    );
     return;
   }
   if (role === 'admin' && !callerIsGlobal) {
-    await notifyAgent(session, 'grant_access denied: only owner / global admin can grant `admin`. You can grant `member`.');
+    await notifyAgent(
+      session,
+      'grant_access denied: only owner / global admin can grant `admin`. You can grant `member`.',
+    );
     return;
   }
 
@@ -194,7 +200,7 @@ export async function handleRevokeAccess(content: Record<string, unknown>, sessi
     await notifyAgent(session, 'revoke_access failed: `user` is required.');
     return;
   }
-  if (!getAgentGroup(targetAgentGroupId)) {
+  if (!(await getAgentGroup(targetAgentGroupId))) {
     await notifyAgent(session, `revoke_access failed: agent group \`${targetAgentGroupId}\` does not exist.`);
     return;
   }
@@ -208,7 +214,10 @@ export async function handleRevokeAccess(content: Record<string, unknown>, sessi
   const callerIsGlobal = isOwner(callerId) || isGlobalAdmin(callerId);
   const callerIsScopedAdmin = isAdminOfAgentGroup(callerId, targetAgentGroupId);
   if (!callerIsGlobal && !callerIsScopedAdmin) {
-    await notifyAgent(session, `revoke_access denied: you don't have authority over agent group \`${targetAgentGroupId}\`.`);
+    await notifyAgent(
+      session,
+      `revoke_access denied: you don't have authority over agent group \`${targetAgentGroupId}\`.`,
+    );
     return;
   }
 
@@ -260,7 +269,7 @@ export async function handleRevokeAccess(content: Record<string, unknown>, sessi
 export async function handleListAccess(content: Record<string, unknown>, session: Session): Promise<void> {
   const args = content as GrantArgs;
   const targetAgentGroupId = typeof args.agentGroupId === 'string' ? args.agentGroupId : session.agent_group_id;
-  if (!getAgentGroup(targetAgentGroupId)) {
+  if (!(await getAgentGroup(targetAgentGroupId))) {
     await notifyAgent(session, `list_access failed: agent group \`${targetAgentGroupId}\` does not exist.`);
     return;
   }

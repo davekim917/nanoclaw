@@ -49,15 +49,15 @@ function now(): string {
   return new Date().toISOString();
 }
 
-function seedAgentAndChannel(): void {
-  createAgentGroup({
+async function seedAgentAndChannel(): Promise<void> {
+  await createAgentGroup({
     id: 'ag-1',
     name: 'Test Agent',
     folder: 'test-agent',
     agent_provider: null,
     created_at: now(),
   });
-  createMessagingGroup({
+  await createMessagingGroup({
     id: 'mg-1',
     channel_type: 'telegram',
     platform_id: 'telegram:123',
@@ -111,8 +111,8 @@ afterEach(async () => {
 
 describe('deliverSessionMessages — concurrent invocations', () => {
   it('delivers a message exactly once when active and sweep polls overlap', async () => {
-    seedAgentAndChannel();
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     insertOutbound('ag-1', session.id, 'out-1');
 
     const calls: string[] = [];
@@ -134,8 +134,8 @@ describe('deliverSessionMessages — concurrent invocations', () => {
   });
 
   it('still delivers on a subsequent call after the first finishes', async () => {
-    seedAgentAndChannel();
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     insertOutbound('ag-1', session.id, 'out-first');
 
     const calls: string[] = [];
@@ -161,8 +161,8 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     // Cleanup must fire deleteMessage with the SAME route the status was
     // posted to — even if the chat reply hypothetically targeted a different
     // route, we must not delete via the chat reply's route.
-    seedAgentAndChannel();
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
 
     // First insert a status row.
     insertOutboundKind('ag-1', session.id, 'status-1', 'status', 'telegram', 'telegram:123', {
@@ -210,8 +210,8 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     // and a task session (support-inbox poller, scheduled job) never gets one,
     // so the 💭 stands in the channel as the "answer" forever. The container
     // emits a `turn_end` system row after markCompleted; it must clean up.
-    seedAgentAndChannel();
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
 
     const deletes: string[] = [];
     setDeliveryAdapter({
@@ -257,8 +257,8 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     // emitTurnEnd, are never reached. Observed on the support-inbox poller:
     // the 💭 stood as the run's only visible output in #support, twice.
     // The host must not depend on a dying process to clean up after itself.
-    seedAgentAndChannel();
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
 
     const deletes: string[] = [];
     setDeliveryAdapter({
@@ -302,8 +302,8 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     // rows now carry their turn's batch anchor in in_reply_to; a status with a
     // different anchor than the tracked one must delete the stale orphan and
     // post fresh instead of editing.
-    seedAgentAndChannel();
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
 
     type DeliverCall = { kind: string; content: string };
     const delivers: DeliverCall[] = [];
@@ -378,14 +378,14 @@ describe('deliverSessionMessages — concurrent invocations', () => {
   it.each(['discord', 'discord-codex'] as const)(
     'posts and tracks a fresh %s status after edit error 30046',
     async (channelType) => {
-      createAgentGroup({
+      await createAgentGroup({
         id: 'ag-1',
         name: 'Test Agent',
         folder: 'test-agent',
         agent_provider: null,
         created_at: now(),
       });
-      createMessagingGroup({
+      await createMessagingGroup({
         id: 'mg-1',
         channel_type: channelType,
         platform_id: 'discord:guild-1:channel-1',
@@ -394,7 +394,7 @@ describe('deliverSessionMessages — concurrent invocations', () => {
         unknown_sender_policy: 'public',
         created_at: now(),
       });
-      const { session } = resolveSession('ag-1', 'mg-1', 'thread-1', 'per-thread');
+      const { session } = await resolveSession('ag-1', 'mg-1', 'thread-1', 'per-thread');
 
       type DeliverCall = { operation?: string; messageId?: string; text?: string };
       const calls: DeliverCall[] = [];
@@ -476,14 +476,14 @@ describe('deliverSessionMessages — concurrent invocations', () => {
   );
 
   it('preserves status order when a Discord 30046 replacement post fails transiently', async () => {
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-1',
       name: 'Test Agent',
       folder: 'test-agent',
       agent_provider: null,
       created_at: now(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-1',
       channel_type: 'discord-codex',
       platform_id: 'discord:guild-1:channel-1',
@@ -492,7 +492,7 @@ describe('deliverSessionMessages — concurrent invocations', () => {
       unknown_sender_policy: 'public',
       created_at: now(),
     });
-    const { session } = resolveSession('ag-1', 'mg-1', 'thread-1', 'per-thread');
+    const { session } = await resolveSession('ag-1', 'mg-1', 'thread-1', 'per-thread');
 
     type DeliverCall = { operation?: string; messageId?: string; text?: string };
     const calls: DeliverCall[] = [];
@@ -596,14 +596,14 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     // from different bot identities and the delete misroutes to the default
     // adapter. Regression for the merged channel-instance dimension (the status
     // branch previously dropped the instance arg).
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-1',
       name: 'Test Agent',
       folder: 'test-agent',
       agent_provider: null,
       created_at: now(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-1',
       channel_type: 'telegram',
       platform_id: 'telegram:123',
@@ -613,7 +613,7 @@ describe('deliverSessionMessages — concurrent invocations', () => {
       unknown_sender_policy: 'public',
       created_at: now(),
     });
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
 
     insertOutboundKind('ag-1', session.id, 'status-1', 'status', 'telegram', 'telegram:123', {
       text: '> 💭 thinking...',
@@ -646,8 +646,8 @@ describe('deliverSessionMessages — concurrent invocations', () => {
   });
 
   it('suppresses status messages in chat for spawn-child sessions', async () => {
-    seedAgentAndChannel();
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
 
     // Mark this session as a spawn-child by inserting a task row with
     // child_session_id = session.id. `isSpawnChildSession` queries the
@@ -693,8 +693,8 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     // If the platform delete fails (network, permission, message-not-found),
     // the chat reply must still mark delivered. Otherwise the reply gets
     // retried and the user sees a duplicate.
-    seedAgentAndChannel();
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
 
     insertOutboundKind('ag-1', session.id, 'status-1', 'status', 'telegram', 'telegram:123', {
       text: '> 💭 thinking...',
@@ -734,8 +734,8 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     // still landed on the user's screen — the catch path must not trigger
     // a re-send. We simulate by having the adapter succeed on the first
     // call and recording how many times it's invoked across two attempts.
-    seedAgentAndChannel();
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     insertOutbound('ag-1', session.id, 'out-once');
 
     let callCount = 0;
@@ -757,8 +757,8 @@ describe('deliverSessionMessages — concurrent invocations', () => {
 
 describe('deliverSessionMessages — retry and permanent failure', () => {
   it('retries on adapter failure and marks failed after MAX_DELIVERY_ATTEMPTS (3)', async () => {
-    seedAgentAndChannel();
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     insertOutbound('ag-1', session.id, 'out-flaky');
 
     let callCount = 0;
@@ -799,8 +799,8 @@ describe('deliverSessionMessages — retry and permanent failure', () => {
     // throw so the row takes the normal retry → failed path. Uses the REAL
     // createChannelDeliveryAdapter with an empty registry — the state after
     // an adapter factory returns null (missing credentials) at startup.
-    seedAgentAndChannel();
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     insertOutbound('ag-1', session.id, 'out-offline');
 
     setDeliveryAdapter(createChannelDeliveryAdapter());
@@ -827,8 +827,8 @@ describe('deliverSessionMessages — retry and permanent failure', () => {
   });
 
   it('clears attempt counter on successful delivery', async () => {
-    seedAgentAndChannel();
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     insertOutbound('ag-1', session.id, 'out-retry-ok');
 
     let callCount = 0;
@@ -856,7 +856,7 @@ describe('deliverSessionMessages — retry and permanent failure', () => {
 
 describe('deliverSessionMessages — instance resolution', () => {
   it('delivers via the origin session instance when sibling rows share (channel_type, platform_id)', async () => {
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-1',
       name: 'Test Agent',
       folder: 'test-agent',
@@ -866,7 +866,7 @@ describe('deliverSessionMessages — instance resolution', () => {
     // Two instances own the same chat address. The named row sorts before
     // 'slack', so a plain by-platform lookup (default-instance-first) would
     // pick mg-default — only origin-session preference selects mg-tester.
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-default',
       channel_type: 'slack',
       platform_id: 'slack:C1',
@@ -875,7 +875,7 @@ describe('deliverSessionMessages — instance resolution', () => {
       unknown_sender_policy: 'public',
       created_at: now(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-tester',
       channel_type: 'slack',
       platform_id: 'slack:C1',
@@ -886,7 +886,7 @@ describe('deliverSessionMessages — instance resolution', () => {
       created_at: now(),
     });
 
-    const { session } = resolveSession('ag-1', 'mg-tester', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-tester', null, 'shared');
     const db = new Database(outboundDbPath('ag-1', session.id));
     db.prepare(
       `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content)
@@ -907,8 +907,8 @@ describe('deliverSessionMessages — instance resolution', () => {
   });
 
   it('default session passes the backfilled default instance (= channel_type)', async () => {
-    seedAgentAndChannel();
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     insertOutbound('ag-1', session.id, 'out-default-inst');
 
     const instances: Array<string | undefined> = [];
@@ -926,10 +926,10 @@ describe('deliverSessionMessages — instance resolution', () => {
 
 describe('deliverSessionMessages — permission check', () => {
   it('rejects delivery to an unauthorized channel destination', async () => {
-    seedAgentAndChannel();
+    await seedAgentAndChannel();
 
     // Create a second messaging group that the agent is NOT wired to
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-2',
       channel_type: 'discord',
       platform_id: 'discord:456',
@@ -940,7 +940,7 @@ describe('deliverSessionMessages — permission check', () => {
     });
 
     // Session is on mg-1 (telegram)
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
 
     // Insert an outbound message targeting mg-2 (discord) — not the origin chat
     const outDb = new Database(outboundDbPath('ag-1', session.id));
@@ -1024,8 +1024,8 @@ describe('per-turn channel-root threading', () => {
   }
 
   it('threads a turn’s follow-up messages under the first root post', async () => {
-    seedAgentAndChannel();
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     // Two messages, same turn (same in_reply_to), both thread-unbound — the
     // scheduled-task shape: first posts at root, second replies under it.
     insertChatReply('ag-1', session.id, 'out-1', 'task-fire-A', '2026-05-30T12:00:00.000Z');
@@ -1058,8 +1058,8 @@ describe('per-turn channel-root threading', () => {
   });
 
   it('falls back to root instead of dropping when threading under the anchor fails', async () => {
-    seedAgentAndChannel();
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     insertChatReply('ag-1', session.id, 'out-1', 'task-fire-A', '2026-05-30T12:00:00.000Z');
     insertChatReply('ag-1', session.id, 'out-2', 'task-fire-A', '2026-05-30T12:00:01.000Z');
     insertChatReply('ag-1', session.id, 'out-3', 'task-fire-A', '2026-05-30T12:00:02.000Z');
@@ -1090,8 +1090,8 @@ describe('per-turn channel-root threading', () => {
   });
 
   it('starts a new root thread when the turn (in_reply_to) changes', async () => {
-    seedAgentAndChannel();
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     insertChatReply('ag-1', session.id, 'out-1', 'task-fire-A', '2026-05-30T12:00:00.000Z');
     insertChatReply('ag-1', session.id, 'out-2', 'task-fire-B', '2026-05-30T12:00:01.000Z');
 
@@ -1114,8 +1114,8 @@ describe('per-turn channel-root threading', () => {
   });
 
   it('leaves an agent-targeted thread_id untouched (no anchoring)', async () => {
-    seedAgentAndChannel();
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     // thread_id explicitly set — a per-thread reply, not a root post.
     const db = new Database(outboundDbPath('ag-1', session.id));
     db.prepare(
@@ -1167,9 +1167,9 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
   }
 
   it('first post: no anchor yet — posts at root and stores the anchor', async () => {
-    seedAgentAndChannel();
+    await seedAgentAndChannel();
     grantChannelDestination('ag-1', 'mg-1');
-    const { session } = resolveTaskSession('ag-1', 'series-1');
+    const { session } = await resolveTaskSession('ag-1', 'series-1');
     insertTaskChat('ag-1', session.id, 'out-1', '2026-08-10T09:00:00.000Z');
 
     const calls: Array<{ threadId: string | null }> = [];
@@ -1203,9 +1203,9 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
   // still has a NULL messaging_group_id, and still behaves as a task-session
   // post end to end (root post + stored anchor).
   it('a routing-stamped task session keeps messaging_group_id NULL and still anchors', async () => {
-    seedAgentAndChannel();
+    await seedAgentAndChannel();
     grantChannelDestination('ag-1', 'mg-1');
-    const { session } = resolveTaskSession('ag-1', 'series-1', 'telegram:123');
+    const { session } = await resolveTaskSession('ag-1', 'series-1', 'telegram:123');
 
     // The stamp landed on its own column, and the discriminator column did not
     // move — read straight from the DB, not from the in-memory object.
@@ -1237,9 +1237,9 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
   });
 
   it('second post same UTC day: threads under the stored anchor', async () => {
-    seedAgentAndChannel();
+    await seedAgentAndChannel();
     grantChannelDestination('ag-1', 'mg-1');
-    const { session } = resolveTaskSession('ag-1', 'series-1');
+    const { session } = await resolveTaskSession('ag-1', 'series-1');
     // Now-relative: rotation compares against the real clock, so a hardcoded
     // date makes this test fail the day after it was written.
     setTaskThreadAnchor(session.id, 'telegram', 'telegram:123', 'plat-1', new Date().toISOString());
@@ -1262,9 +1262,9 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
   });
 
   it('day rollover: posts a fresh root message and replaces the anchor', async () => {
-    seedAgentAndChannel();
+    await seedAgentAndChannel();
     grantChannelDestination('ag-1', 'mg-1');
-    const { session } = resolveTaskSession('ag-1', 'series-1');
+    const { session } = await resolveTaskSession('ag-1', 'series-1');
     setTaskThreadAnchor(
       session.id,
       'telegram',
@@ -1290,8 +1290,8 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
   });
 
   it('interactive (non-task) session posts are never anchored in task_thread_anchors', async () => {
-    seedAgentAndChannel();
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     const db = new Database(outboundDbPath('ag-1', session.id));
     db.prepare(
       `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, in_reply_to, content)
@@ -1311,9 +1311,9 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
   });
 
   it('a task post that already targets an explicit thread is left untouched (not anchored)', async () => {
-    seedAgentAndChannel();
+    await seedAgentAndChannel();
     grantChannelDestination('ag-1', 'mg-1');
-    const { session } = resolveTaskSession('ag-1', 'series-1');
+    const { session } = await resolveTaskSession('ag-1', 'series-1');
     insertTaskChat('ag-1', session.id, 'out-1', '2026-08-10T09:00:00.000Z', 'thr-9');
 
     const calls: Array<{ threadId: string | null }> = [];
@@ -1331,9 +1331,9 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
   });
 
   it('a series with threadAnchor:false posts every message at root and stores no anchor', async () => {
-    seedAgentAndChannel();
+    await seedAgentAndChannel();
     grantChannelDestination('ag-1', 'mg-1');
-    const { session } = resolveTaskSession('ag-1', 'series-exempt');
+    const { session } = await resolveTaskSession('ag-1', 'series-exempt');
     // The exemption is read from the series' own task row (content.threadAnchor
     // === false, set via `ncl tasks … --thread-anchor false`).
     const inDb = new Database(inboundDbPath('ag-1', session.id));
@@ -1441,13 +1441,13 @@ describe('quietDeliveryDeadlineMs (A13)', () => {
 });
 
 describe('delivery sweep gate — arming rules (A6-A12)', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     _resetQuietDeliveryCacheForTest();
-    seedAgentAndChannel();
+    await seedAgentAndChannel();
   });
 
   it('A6 never arms for a session left holding an undelivered row', async () => {
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     insertOutbound('ag-1', session.id, 'out-1');
     setDeliveryAdapter({
       async deliver() {
@@ -1460,7 +1460,7 @@ describe('delivery sweep gate — arming rules (A6-A12)', () => {
   });
 
   it('A7 never arms for a session holding a future deliver_after row', async () => {
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     const db = new Database(outboundDbPath('ag-1', session.id));
     db.prepare(
       `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content, deliver_after)
@@ -1478,7 +1478,7 @@ describe('delivery sweep gate — arming rules (A6-A12)', () => {
   });
 
   it('A8 arms only after a drain that leaves zero undelivered rows', async () => {
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     insertOutbound('ag-1', session.id, 'out-1');
     setDeliveryAdapter({
       async deliver() {
@@ -1502,7 +1502,7 @@ describe('delivery sweep gate — arming rules (A6-A12)', () => {
     // fails. `isContainerRunning` is authoritative because spawn records its
     // in-memory entry before the central row is updated, so a swept snapshot
     // can still read 'stopped' for a container that is already writing.
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     setDeliveryAdapter({
       async deliver() {
         return 'plat-1';
@@ -1539,7 +1539,7 @@ describe('delivery sweep gate — arming rules (A6-A12)', () => {
   });
 
   it('A10 polls when a hot journal exists', async () => {
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     setDeliveryAdapter({
       async deliver() {
         return 'plat-1';
@@ -1554,7 +1554,7 @@ describe('delivery sweep gate — arming rules (A6-A12)', () => {
   });
 
   it('A11 does not lose a commit that lands after the pre-open stat', async () => {
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     insertOutbound('ag-1', session.id, 'out-1');
     setDeliveryAdapter({
       async deliver() {
@@ -1586,7 +1586,7 @@ describe('delivery sweep gate — arming rules (A6-A12)', () => {
     // through the mailbox seam, opening a session runs the fork's schema
     // ensure first, so a missing `delivered` table is recreated rather than
     // raised. Unreadable now means the bytes are not a database at all.
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-2',
       channel_type: 'telegram',
       platform_id: 'telegram:456',
@@ -1595,8 +1595,8 @@ describe('delivery sweep gate — arming rules (A6-A12)', () => {
       unknown_sender_policy: 'public',
       created_at: now(),
     });
-    const { session: broken } = resolveSession('ag-1', 'mg-2', null, 'shared');
-    const { session: healthy } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session: broken } = await resolveSession('ag-1', 'mg-2', null, 'shared');
+    const { session: healthy } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     insertOutbound('ag-1', healthy.id, 'out-ok');
     fs.writeFileSync(inboundDbPath('ag-1', broken.id), 'this is not a sqlite database');
 
@@ -1615,7 +1615,7 @@ describe('delivery sweep gate — arming rules (A6-A12)', () => {
   });
 
   it('A12 records polled and skipped counts every cycle', async () => {
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     setDeliveryAdapter({
       async deliver() {
         return 'plat-1';
@@ -1641,13 +1641,13 @@ describe('delivery sweep gate — arming rules (A6-A12)', () => {
 });
 
 describe('delivery sweep gate — delivery is never stranded (A14-A17)', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     _resetQuietDeliveryCacheForTest();
-    seedAgentAndChannel();
+    await seedAgentAndChannel();
   });
 
   it('A14 delivers by the backoff deadline even when the change signal never moves', async () => {
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     setDeliveryAdapter({
       async deliver() {
         return 'plat-1';
@@ -1689,7 +1689,7 @@ describe('delivery sweep gate — delivery is never stranded (A14-A17)', () => {
   });
 
   it('A15 delivers a row written between the pre-open stat and arming, on the next sweep', async () => {
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     insertOutbound('ag-1', session.id, 'out-1');
     setDeliveryAdapter({
       async deliver() {
@@ -1714,7 +1714,7 @@ describe('delivery sweep gate — delivery is never stranded (A14-A17)', () => {
   });
 
   it('A16 does not arm while pollActive owns the session', async () => {
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     insertOutbound('ag-1', session.id, 'out-1');
     let release: () => void = () => {};
     const held = new Promise<void>((r) => (release = r));
@@ -1734,7 +1734,7 @@ describe('delivery sweep gate — delivery is never stranded (A14-A17)', () => {
   });
 
   it('A17 does not arm when delivery failed this cycle, and retries next sweep', async () => {
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     insertOutbound('ag-1', session.id, 'out-1');
     let attempts = 0;
     setDeliveryAdapter({
@@ -1780,8 +1780,8 @@ describe('deliverSessionMessages — deferAck system actions', () => {
   }
 
   it('does not hold the rest of the queue behind a deferred action, and stays pending', async () => {
-    seedAgentAndChannel();
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     registerDeliveryAction(
       'test_defer_ack',
       async () => ({ deferAck: true }) as const,
@@ -1874,9 +1874,9 @@ describe('delivery through the mailbox seam', () => {
   }
 
   it('a delivery action handler that writes to its own session succeeds and the action is acked', async () => {
-    seedAgentAndChannel();
+    await seedAgentAndChannel();
     setNoopAdapter();
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
 
     // The handler does what `spawn_cancel` does — writes an inbound row for a
     // session through the ordinary writer — and, on top of that, opens a
@@ -1915,9 +1915,9 @@ describe('delivery through the mailbox seam', () => {
   });
 
   it('a deferAck handler that writes to its own session leaves the delivered row to itself', async () => {
-    seedAgentAndChannel();
+    await seedAgentAndChannel();
     setNoopAdapter();
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
 
     registerDeliveryAction(
       'test_writes_own_session_defer',
@@ -1952,8 +1952,8 @@ describe('delivery through the mailbox seam', () => {
   });
 
   it('an outbound row with no thread origin is delivered top-level', async () => {
-    seedAgentAndChannel();
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
 
     // No thread_id and no in_reply_to: nothing anchors this row to a thread,
     // so it must post at the channel root rather than being held or dropped.

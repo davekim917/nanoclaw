@@ -20,7 +20,7 @@ import { registerResource } from '../crud.js';
 export async function projectDestinationsToSessions(agentGroupId: string): Promise<void> {
   if (!hasTableRaw(getRawDb(), 'agent_destinations')) return;
   const { writeDestinations } = await import('../../modules/agent-to-agent/write-destinations.js');
-  for (const session of getSessionsByAgentGroup(agentGroupId)) {
+  for (const session of await getSessionsByAgentGroup(agentGroupId)) {
     try {
       await writeDestinations(agentGroupId, session.id);
     } catch (err) {

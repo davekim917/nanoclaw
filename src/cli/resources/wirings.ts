@@ -235,7 +235,11 @@ registerResource({
           if (!channelType || !platformId) {
             throw new Error('provide --messaging-group-id, or --channel-type and --platform-id to resolve it');
           }
-          const mg = getMessagingGroupByPlatform(channelType, platformId, (args.instance as string) ?? channelType);
+          const mg = await getMessagingGroupByPlatform(
+            channelType,
+            platformId,
+            (args.instance as string) ?? channelType,
+          );
           if (!mg) throw new Error(`no messaging group for ${channelType} ${platformId} — create it first`);
           mgId = mg.id;
         }
@@ -245,14 +249,14 @@ registerResource({
         if (!agId) {
           const ref = args.agent_group as string;
           if (!ref) throw new Error('provide --agent-group-id or --agent-group <folder>');
-          const ag = getAgentGroup(ref) ?? getAgentGroupByFolder(ref);
+          const ag = (await getAgentGroup(ref)) ?? (await getAgentGroupByFolder(ref));
           if (!ag) throw new Error(`no agent group "${ref}" (by id or folder)`);
           agId = ag.id;
         }
 
         // Idempotent: a wiring for this pair already exists → return it
         // (defaults/validation/side-effects are skipped — nothing new is written).
-        const existing = getMessagingGroupAgentByPair(mgId, agId);
+        const existing = await getMessagingGroupAgentByPair(mgId, agId);
         if (existing) return existing;
 
         // Pass-1 parity: only defined keys enter `values` (an unset
@@ -291,7 +295,7 @@ registerResource({
         // change ncl's creation defaults for adapters without a declaration.
         if (values.engage_mode === undefined) {
           if (hasDeclaredChannelDefaults(channelKey, mg.channel_type)) {
-            const ag = getAgentGroup(String(values.agent_group_id));
+            const ag = await getAgentGroup(String(values.agent_group_id));
             if (!ag) throw new Error(`agent group not found: ${values.agent_group_id}`);
             const resolved = resolveWiringDefaults(channelKey, mg.is_group === 1, ag.name, mg.channel_type);
             values.engage_mode = resolved.engage_mode;

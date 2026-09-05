@@ -127,17 +127,17 @@ function scheduleRecoveryRetry(adapter: ChannelAdapter, info: ChannelConnectionR
  * includes sessions with activity at or after it; sessions with no parseable
  * activity timestamp are included (fail-open — never silently drop coverage).
  */
-export function getChannelRecoveryTargets(
+export async function getChannelRecoveryTargets(
   adapter: ChannelAdapter,
   opts: { activeSinceMs?: number } = {},
-): ChannelRecoveryTarget[] {
+): Promise<ChannelRecoveryTarget[]> {
   const key = adapterKey(adapter);
-  const groups = getMessagingGroupsByChannel(adapter.channelType).filter(
+  const groups = (await getMessagingGroupsByChannel(adapter.channelType)).filter(
     (group) => (group.instance ?? group.channel_type) === key,
   );
   const sessionsByGroup = new Map<string, Set<string>>();
   if (adapter.recoveryDiscoversThreads !== true) {
-    for (const session of getActiveSessions()) {
+    for (const session of await getActiveSessions()) {
       if (!session.messaging_group_id || !session.thread_id) continue;
       if (opts.activeSinceMs !== undefined) {
         const activityMs = Date.parse(session.last_active ?? session.created_at ?? '');
@@ -183,7 +183,7 @@ export function recoverChannelAdapter(adapter: ChannelAdapter, info: ChannelConn
       const next = drain.pending;
       drain.pending = null;
       try {
-        const targets = getChannelRecoveryTargets(
+        const targets = await getChannelRecoveryTargets(
           adapter,
           next.reason === 'event-loop-stall' ? { activeSinceMs: Date.now() - STALL_TARGET_ACTIVITY_HORIZON_MS } : {},
         );

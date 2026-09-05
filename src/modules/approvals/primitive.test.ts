@@ -59,7 +59,7 @@ beforeEach(async () => {
   const db = getRawDb();
   runMigrations(db);
 
-  createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
+  (await createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() }));
   session = {
     id: 'sess-1',
     agent_group_id: 'ag-1',
@@ -71,13 +71,13 @@ beforeEach(async () => {
     last_active: now(),
     created_at: now(),
   };
-  createSession(session);
+  (await createSession(session));
 
   // Authorized approver + a cached DM so ensureUserDm resolves without a
   // platform openDM call.
   upsertUser({ id: 'slack:admin-1', kind: 'slack', display_name: 'Admin', created_at: now() });
   grantRole({ user_id: 'slack:admin-1', role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });
-  createMessagingGroup({
+  (await createMessagingGroup({
     id: 'mg-dm-1',
     channel_type: DM_CHANNEL,
     platform_id: DM_PLATFORM,
@@ -85,7 +85,7 @@ beforeEach(async () => {
     is_group: 0,
     unknown_sender_policy: 'strict',
     created_at: now(),
-  });
+  }));
   upsertUserDm({
     user_id: 'slack:admin-1',
     channel_type: DM_CHANNEL,
@@ -125,7 +125,7 @@ describe('requestApproval delivery failure', () => {
     });
 
     // No orphan: the row created before the delivery attempt is gone.
-    expect(getPendingApprovalsByAction('test_action')).toHaveLength(0);
+    expect((await getPendingApprovalsByAction('test_action'))).toHaveLength(0);
     expect(lastNotifyText()).toMatch(/test_action failed: could not deliver/);
   });
 
@@ -146,7 +146,7 @@ describe('requestApproval delivery failure', () => {
       question: 'Approve the thing?',
     });
 
-    expect(getPendingApprovalsByAction('test_action')).toHaveLength(1);
+    expect((await getPendingApprovalsByAction('test_action'))).toHaveLength(1);
     expect(vi.mocked(writeSessionMessage)).not.toHaveBeenCalled();
   });
 });

@@ -10,9 +10,9 @@ import { renderVerbHelp, summaryLine } from '../help-render.js';
 import type { CallerContext } from '../frame.js';
 import { GROUP_SCOPE_RESOURCES, listCommands, register } from '../registry.js';
 
-function getCliScope(ctx: CallerContext): string | undefined {
+async function getCliScope(ctx: CallerContext): Promise<string | undefined> {
   if (ctx.caller !== 'agent') return undefined;
-  return getContainerConfig(ctx.agentGroupId)?.cli_scope ?? 'group';
+  return (await getContainerConfig(ctx.agentGroupId))?.cli_scope ?? 'group';
 }
 
 register({
@@ -21,7 +21,7 @@ register({
   access: 'open',
   parseArgs: () => ({}),
   handler: async (_args, ctx) => {
-    const cliScope = getCliScope(ctx);
+    const cliScope = await getCliScope(ctx);
     let resources = getResources();
     if (cliScope === 'group') {
       resources = resources.filter((r) => GROUP_SCOPE_RESOURCES.has(r.plural));
@@ -99,7 +99,7 @@ export function registerResourceHelpCommands(): void {
 
           lines.push(`${res.plural}: ${res.description}`);
 
-          if (cliScope === 'group' && GROUP_SCOPE_RESOURCES.has(res.plural)) {
+          if ((await cliScope) === 'group' && GROUP_SCOPE_RESOURCES.has(res.plural)) {
             lines.push('');
             lines.push('Note: --id and group args are auto-filled to your agent group. You do not need to pass them.');
           }
@@ -108,7 +108,8 @@ export function registerResourceHelpCommands(): void {
 
           // Verbs — one summary line each; deep help is a verb away. Only the
           // exceptional access levels are tagged: `open` is the unmarked default.
-          const idAutoFilled = cliScope === 'group' && (res.plural === 'groups' || res.plural === 'destinations');
+          const idAutoFilled =
+            (await cliScope) === 'group' && (res.plural === 'groups' || res.plural === 'destinations');
           const idHint = idAutoFilled ? '' : ' <id>';
           const tag = (access: string | undefined) => (!access || access === 'open' ? '' : ` [${access}]`);
           const verbs: string[] = [];
@@ -130,7 +131,7 @@ export function registerResourceHelpCommands(): void {
 
           // Columns
           const autoFilledFields =
-            cliScope === 'group' ? new Set(['id', 'agent_group_id', 'group']) : new Set<string>();
+            (await cliScope) === 'group' ? new Set(['id', 'agent_group_id', 'group']) : new Set<string>();
           lines.push('Fields:');
           for (const col of res.columns) {
             const tags: string[] = [];

@@ -62,7 +62,8 @@
  * module matches upstream exactly. Candidate for upstreaming later.
  */
 import { getAgentGroupByFolder } from '../../db/agent-groups.js';
-import { createMessagingGroupAgent, updateMessagingGroup } from '../../db/messaging-groups.js';
+import { createMessagingGroupAgent, updateMessagingGroup, getMessagingGroupAgents } from '../../db/messaging-groups.js';
+import { insertOrAdopt } from '../../db/insert-or-adopt.js';
 import { log } from '../../log.js';
 import { setUnwiredChannelResolver, type UnwiredChannelResolverFn } from '../../router.js';
 import type { MessagingGroup, MessagingGroupAgent, SessionMode } from '../../types.js';
@@ -133,11 +134,11 @@ function newId(): string {
   return `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-export const resolver: UnwiredChannelResolverFn = (event, mg) => {
+export const resolver: UnwiredChannelResolverFn = async (event, mg) => {
   const folder = resolveDefaultAgentFolder(event.channelType);
   if (!folder) return [];
 
-  const agentGroup = getAgentGroupByFolder(folder);
+  const agentGroup = await getAgentGroupByFolder(folder);
   if (!agentGroup) {
     log.warn('channel-auto-wire: default agent folder not found, skipping', {
       channelType: event.channelType,
@@ -165,7 +166,7 @@ export const resolver: UnwiredChannelResolverFn = (event, mg) => {
   // update is what persists the change for subsequent messages.
   const senderPolicy = resolveDefaultSenderPolicy(event.channelType);
   if (senderPolicy && senderPolicy !== mg.unknown_sender_policy) {
-    updateMessagingGroup(mg.id, { unknown_sender_policy: senderPolicy });
+    await updateMessagingGroup(mg.id, { unknown_sender_policy: senderPolicy });
     mg.unknown_sender_policy = senderPolicy;
     log.info('channel-auto-wire: relaxed unknown_sender_policy', {
       messagingGroupId: mg.id,
@@ -192,12 +193,29 @@ export const resolver: UnwiredChannelResolverFn = (event, mg) => {
     created_at: new Date().toISOString(),
   };
 
+  // The lookups above yield (async driver), so two initial messages for one
+  // unwired channel can both reach this insert; the loser adopts the wiring
+  // the winner created (seam 3 primitive) instead of reporting the channel
+  // as unwired. Anything but a unique-key loss still drops this message, as
+  // before.
   try {
-    createMessagingGroupAgent(mga);
+    const { row, created } = await insertOrAdopt(
+      mga,
+      async (candidate) => {
+        createMessagingGroupAgent(candidate);
+      },
+      async () => (await getMessagingGroupAgents(mg.id)).find((w) => w.agent_group_id === agentGroup.id),
+    );
+    if (!created) {
+      log.info('channel-auto-wire: adopted the wiring a concurrent inbound created', {
+        messagingGroupId: mg.id,
+        channelType: event.channelType,
+        wiringId: row.id,
+      });
+      return [row];
+    }
   } catch (err) {
-    // Most likely cause: another concurrent inbound just wired this group.
-    // Re-read; if still zero, return empty so core drops this message.
-    log.warn('channel-auto-wire: createMessagingGroupAgent threw, probing for concurrent wire', {
+    log.warn('channel-auto-wire: createMessagingGroupAgent threw and no concurrent wire was found', {
       err,
       messagingGroupId: mg.id,
       channelType: event.channelType,

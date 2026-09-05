@@ -427,7 +427,7 @@ export const scheduledDetailHandler: AuthHandler = async (_req, params, ctx) => 
   // off it. Build it with the same assembly machinery (health + verbs + joins),
   // never a thin projection (that would make the drawer's verb buttons throw on
   // `row.available_verbs`).
-  const row = buildDetailRow(decoded.agentGroupId, decoded.sessionId, decoded.seriesId, dataDir, nowMs) ?? null;
+  const row = (await buildDetailRow(decoded.agentGroupId, decoded.sessionId, decoded.seriesId, dataDir, nowMs)) ?? null;
   if (!row) return json({ error: 'not_found' }, 404);
 
   let parsed: Record<string, unknown> = {};

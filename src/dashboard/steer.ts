@@ -268,7 +268,7 @@ async function _writeAndEchoSteer(
     // non-fatal
   }
 
-  const childSession = getSession(exec.childSessionId);
+  const childSession = await getSession(exec.childSessionId);
   if (childSession) {
     void wakeContainer(childSession).catch((err) =>
       log.warn('steer: wakeContainer failed', { target: exec.target, err }),
@@ -375,7 +375,7 @@ export async function applySessionSteer(
   body: { idempotency_key: string; text: string },
   ctx: AuthedRequestContext,
 ): Promise<SteerResult> {
-  const session = getSession(sessionId);
+  const session = await getSession(sessionId);
   if (!session) return { status: 404, body: { error: 'session_not_found' } };
 
   if (!ctx.scopes.no_filter && !ctx.scopes.allowed_group_ids.includes(session.agent_group_id)) {

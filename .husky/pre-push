@@ -141,6 +141,15 @@ snapshot_commit() {
     (cd "$snapshot_root" && nice -n 10 node_modules/.bin/eslint --quiet src/ scripts/) </dev/null
   fi
 
+  # Include setup and scripts in the same typecheck command used by CI/builds
+  # (pnpm run typecheck), gated against this pushed commit's own snapshot
+  # rather than the live worktree, same as the boundary and lint checks above.
+  if command -v ionice >/dev/null 2>&1; then
+    (cd "$snapshot_root" && ionice -c3 nice -n 10 node_modules/.bin/tsc --noEmit && ionice -c3 nice -n 10 node_modules/.bin/tsc -p tsconfig.scripts.json) </dev/null
+  else
+    (cd "$snapshot_root" && nice -n 10 node_modules/.bin/tsc --noEmit && nice -n 10 node_modules/.bin/tsc -p tsconfig.scripts.json) </dev/null
+  fi
+
   rm "$snapshot_root/node_modules"
   snapshot_node_modules_link=''
   git -C "$worktree_root" worktree remove "$snapshot_root"

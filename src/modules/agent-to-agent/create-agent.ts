@@ -36,7 +36,7 @@ async function notifyAgent(session: Session, text: string): Promise<void> {
     threadId: null,
     content: JSON.stringify({ text, sender: 'system', senderId: 'system' }),
   });
-  const fresh = getSession(session.id);
+  const fresh = await getSession(session.id);
   if (fresh) {
     wakeContainer(fresh).catch((err) => log.error('Failed to wake container after notification', { err }));
   }
@@ -48,6 +48,26 @@ async function notifyAgent(session: Session, text: string): Promise<void> {
  * disk and the caller should surface that to the user via notifyAgent so
  * they know manual cleanup may be needed.
  */
+/**
+ * Folder allocation is lookup-then-insert, and every lookup now yields (async
+ * driver): two approved create_agent requests with the same or a
+ * prefix-colliding name could both validate against the same pre-insert
+ * snapshot, both touch one directory, and the loser's rollback would delete
+ * the winner's configuration. One in-process lock serializes the whole
+ * derivation → validation → filesystem → insert sequence; the host is a
+ * single process, and create_agent is operator-approved and rare.
+ */
+let folderAllocationChain: Promise<void> = Promise.resolve();
+function acquireFolderAllocationLock(): Promise<() => void> {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const prior = folderAllocationChain;
+  folderAllocationChain = prior.then(() => gate);
+  return prior.then(() => release);
+}
+
 function safeRemoveFolder(folder: string): boolean {
   const groupPath = path.resolve(GROUPS_DIR, folder);
   try {
@@ -92,7 +112,7 @@ export async function handleCreateAgent(content: Record<string, unknown>, sessio
     return;
   }
 
-  const sourceGroup = getAgentGroup(session.agent_group_id);
+  const sourceGroup = await getAgentGroup(session.agent_group_id);
   if (!sourceGroup) {
     await notifyAgent(session, `create_agent failed: source agent group not found.`);
     log.warn('create_agent failed: missing source group', { sessionAgentGroup: session.agent_group_id, name });
@@ -131,7 +151,7 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
   const provider = (payload.provider as string | null) ?? undefined;
   const providerConfig = (payload.providerConfig as Record<string, unknown> | null) ?? undefined;
 
-  const sourceGroup = getAgentGroup(session.agent_group_id);
+  const sourceGroup = await getAgentGroup(session.agent_group_id);
   if (!sourceGroup) {
     await notify('create_agent approved but source agent group not found.');
     return;
@@ -139,161 +159,174 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
 
   const localName = normalizeName(name);
 
-  // Collision in the creator's destination namespace
-  if (getDestinationByName(sourceGroup.id, localName)) {
-    await notifyAgent(session, `Cannot create agent "${name}": you already have a destination named "${localName}".`);
-    return;
-  }
-
-  // SECURITY (cross-tenant audit 2026-05-03): cap children per parent. Even
-  // with admin approval, an attacker can social-engineer one approval per
-  // request — bounding total children per parent prevents resource
-  // exhaustion + persistent-foothold accumulation.
-  const CHILDREN_PER_PARENT_CAP = 10;
-  const childCount = (
-    getRawDb()
-      .prepare("SELECT COUNT(*) AS c FROM agent_destinations WHERE agent_group_id = ? AND target_type = 'agent'")
-      .get(sourceGroup.id) as { c: number }
-  ).c;
-  if (childCount >= CHILDREN_PER_PARENT_CAP) {
-    await notifyAgent(
-      session,
-      `Cannot create agent "${name}": parent agent "${sourceGroup.name}" has reached the child-agent cap (${CHILDREN_PER_PARENT_CAP}). Manually delete unused children before creating more.`,
-    );
-    log.warn('create_agent: child cap reached', { parent: sourceGroup.id, childCount });
-    return;
-  }
-
-  // Derive a safe folder name, deduplicated globally across agent_groups.folder.
-  // Name-squatting is mitigated by the approval gate (operator sees the
-  // requested name in the card) rather than by mandatory parent prefix —
-  // forcing a parent-folder prefix breaks scoped-env token boundaries
-  // (e.g. PARENT_FOLDER__CHILD's tokens overlap with PARENT_FOLDER_*).
-  let folder = localName;
-  let suffix = 2;
-  while (getAgentGroupByFolder(folder)) {
-    folder = `${localName}-${suffix}`;
-    suffix++;
-  }
-
-  // SECURITY (cross-tenant audit 2026-05-03): folder-name prefix collision
-  // would let scoped-env env-var matching cross-leak (e.g. folder=example-agent
-  // inheriting EXAMPLE_DEV_* vars from folder=example-dev). Normalize tokens and
-  // refuse if any existing folder's token is a prefix of this one or vice
-  // versa.
-  const newTok = folder.toUpperCase().replace(/-/g, '_');
-  for (const existing of getAllAgentGroups()) {
-    if (existing.folder === folder) continue;
-    const existTok = existing.folder.toUpperCase().replace(/-/g, '_');
-    if (newTok === existTok || newTok.startsWith(existTok + '_') || existTok.startsWith(newTok + '_')) {
-      await notifyAgent(
-        session,
-        `Cannot create agent "${name}": folder "${folder}" collides with existing folder "${existing.folder}" under scoped-env token boundaries. Pick a different name.`,
-      );
-      log.warn('create_agent: folder token collision', { newFolder: folder, existing: existing.folder });
+  // The lock covers the PARENT invariants too: two approved requests for one
+  // parent could otherwise both pass the destination-name and child-cap
+  // checks before either inserts (an orphaned agent group whose grant then
+  // hits the parent's primary key, or eleven children under a cap of ten).
+  const releaseAllocation = await acquireFolderAllocationLock();
+  try {
+    // Collision in the creator's destination namespace
+    if (getDestinationByName(sourceGroup.id, localName)) {
+      await notifyAgent(session, `Cannot create agent "${name}": you already have a destination named "${localName}".`);
       return;
     }
-  }
 
-  const groupPath = path.join(GROUPS_DIR, folder);
-  const resolvedPath = path.resolve(groupPath);
-  const resolvedGroupsDir = path.resolve(GROUPS_DIR);
-  if (!resolvedPath.startsWith(resolvedGroupsDir + path.sep)) {
-    await notifyAgent(session, `Cannot create agent "${name}": invalid folder path.`);
-    log.error('create_agent path traversal attempt', { folder, resolvedPath });
-    return;
-  }
+    // SECURITY (cross-tenant audit 2026-05-03): cap children per parent. Even
+    // with admin approval, an attacker can social-engineer one approval per
+    // request — bounding total children per parent prevents resource
+    // exhaustion + persistent-foothold accumulation.
+    const CHILDREN_PER_PARENT_CAP = 10;
+    const childCount = (
+      getRawDb()
+        .prepare("SELECT COUNT(*) AS c FROM agent_destinations WHERE agent_group_id = ? AND target_type = 'agent'")
+        .get(sourceGroup.id) as { c: number }
+    ).c;
+    if (childCount >= CHILDREN_PER_PARENT_CAP) {
+      await notifyAgent(
+        session,
+        `Cannot create agent "${name}": parent agent "${sourceGroup.name}" has reached the child-agent cap (${CHILDREN_PER_PARENT_CAP}). Manually delete unused children before creating more.`,
+      );
+      log.warn('create_agent: child cap reached', { parent: sourceGroup.id, childCount });
+      return;
+    }
 
-  const agentGroupId = `ag-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const now = new Date().toISOString();
+    // Derive a safe folder name, deduplicated globally across agent_groups.folder.
+    // Name-squatting is mitigated by the approval gate (operator sees the
+    // requested name in the card) rather than by mandatory parent prefix —
+    // forcing a parent-folder prefix breaks scoped-env token boundaries
+    // (e.g. PARENT_FOLDER__CHILD's tokens overlap with PARENT_FOLDER_*).
+    let folder = localName;
+    let suffix = 2;
+    while (await getAgentGroupByFolder(folder)) {
+      folder = `${localName}-${suffix}`;
+      suffix++;
+    }
 
-  const newGroup: AgentGroup = {
-    id: agentGroupId,
-    name,
-    folder,
-    agent_provider: provider ?? null,
-    created_at: now,
-  };
+    // SECURITY (cross-tenant audit 2026-05-03): folder-name prefix collision
+    // would let scoped-env env-var matching cross-leak (e.g. folder=example-agent
+    // inheriting EXAMPLE_DEV_* vars from folder=example-dev). Normalize tokens and
+    // refuse if any existing folder's token is a prefix of this one or vice
+    // versa.
+    const newTok = folder.toUpperCase().replace(/-/g, '_');
+    for (const existing of await getAllAgentGroups()) {
+      if (existing.folder === folder) continue;
+      const existTok = existing.folder.toUpperCase().replace(/-/g, '_');
+      if (newTok === existTok || newTok.startsWith(existTok + '_') || existTok.startsWith(newTok + '_')) {
+        await notifyAgent(
+          session,
+          `Cannot create agent "${name}": folder "${folder}" collides with existing folder "${existing.folder}" under scoped-env token boundaries. Pick a different name.`,
+        );
+        log.warn('create_agent: folder token collision', { newFolder: folder, existing: existing.folder });
+        return;
+      }
+    }
 
-  // STEP 1: Create folder + baseline container.json + CLAUDE.local.md + skills
-  //         symlinks. initGroupFilesystem is idempotent; writes an empty
-  //         container.json via initContainerConfig.
-  initGroupFilesystem(newGroup, { instructions: instructions ?? undefined });
+    const groupPath = path.join(GROUPS_DIR, folder);
+    // Rollback may only remove a directory THIS attempt created.
+    const folderPreExisted = fs.existsSync(groupPath);
+    const resolvedPath = path.resolve(groupPath);
+    const resolvedGroupsDir = path.resolve(GROUPS_DIR);
+    if (!resolvedPath.startsWith(resolvedGroupsDir + path.sep)) {
+      await notifyAgent(session, `Cannot create agent "${name}": invalid folder path.`);
+      log.error('create_agent path traversal attempt', { folder, resolvedPath });
+      return;
+    }
 
-  // STEP 2: Mutate container.json to set provider + providerConfig +
-  //         agentGroupId. Persisting agentGroupId BEFORE the DB insert
-  //         (rather than after) means a downstream failure can't leave us
-  //         in the awkward state where the DB has the row but container.json
-  //         lacks the ID — recovery from that state currently isn't supported
-  //         by enable-memory.ts (Codex F9). Doing it before DB-insert keeps
-  //         the rollback story clean: any failure here also rolls back the
-  //         folder via safeRemoveFolder.
-  try {
-    updateContainerConfig(folder, (c) => {
-      c.agentGroupId = agentGroupId;
-      if (provider !== undefined) c.provider = provider;
-      if (providerConfig !== undefined) c.providerConfig = providerConfig;
+    const agentGroupId = `ag-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const now = new Date().toISOString();
+
+    const newGroup: AgentGroup = {
+      id: agentGroupId,
+      name,
+      folder,
+      agent_provider: provider ?? null,
+      created_at: now,
+    };
+
+    // STEP 1: Create folder + baseline container.json + CLAUDE.local.md + skills
+    //         symlinks. initGroupFilesystem is idempotent; writes an empty
+    //         container.json via initContainerConfig.
+    initGroupFilesystem(newGroup, { instructions: instructions ?? undefined });
+
+    // STEP 2: Mutate container.json to set provider + providerConfig +
+    //         agentGroupId. Persisting agentGroupId BEFORE the DB insert
+    //         (rather than after) means a downstream failure can't leave us
+    //         in the awkward state where the DB has the row but container.json
+    //         lacks the ID — recovery from that state currently isn't supported
+    //         by enable-memory.ts (Codex F9). Doing it before DB-insert keeps
+    //         the rollback story clean: any failure here also rolls back the
+    //         folder via safeRemoveFolder.
+    try {
+      updateContainerConfig(folder, (c) => {
+        c.agentGroupId = agentGroupId;
+        if (provider !== undefined) c.provider = provider;
+        if (providerConfig !== undefined) c.providerConfig = providerConfig;
+      });
+    } catch (err) {
+      log.error('create_agent: updateContainerConfig failed, rolling back folder', { err, folder });
+      const cleaned = folderPreExisted ? false : safeRemoveFolder(folder);
+      await notifyAgent(
+        session,
+        `create_agent failed: could not write config for "${name}".${orphanSuffix(folder, cleaned)}`,
+      );
+      return;
+    }
+
+    // STEP 3: DB INSERT. On failure, rollback the folder from step 1
+    //         (including the agentGroupId / provider config written in step 2).
+    try {
+      await createAgentGroup(newGroup);
+    } catch (err) {
+      log.error('create_agent: createAgentGroup failed, rolling back folder', { err, folder });
+      const cleaned = folderPreExisted ? false : safeRemoveFolder(folder);
+      await notifyAgent(
+        session,
+        `create_agent failed: database insert failed for "${name}".${orphanSuffix(folder, cleaned)}`,
+      );
+      return;
+    }
+
+    // Insert bidirectional destination rows (= ACL grants).
+    // Creator refers to child by the name it chose; child refers to creator as "parent".
+    createDestination({
+      agent_group_id: sourceGroup.id,
+      local_name: localName,
+      target_type: 'agent',
+      target_id: agentGroupId,
+      created_at: now,
     });
-  } catch (err) {
-    log.error('create_agent: updateContainerConfig failed, rolling back folder', { err, folder });
-    const cleaned = safeRemoveFolder(folder);
+    // Handle the unlikely case where the child already has a "parent" destination
+    // (shouldn't happen for a brand-new agent, but be safe).
+    let parentName = 'parent';
+    let parentSuffix = 2;
+    while (getDestinationByName(agentGroupId, parentName)) {
+      parentName = `parent-${parentSuffix}`;
+      parentSuffix++;
+    }
+    createDestination({
+      agent_group_id: agentGroupId,
+      local_name: parentName,
+      target_type: 'agent',
+      target_id: sourceGroup.id,
+      created_at: now,
+    });
+
+    // REQUIRED: project the new destination into the running container's
+    // inbound.db. See the top-of-file invariant in db/agent-destinations.ts
+    // — forgetting this causes "dropped: unknown destination" when the parent
+    // tries to send to the newly-created child.
+    await writeDestinations(session.agent_group_id, session.id);
+
+    // notifyAgent is async since the writeSessionMessage signature change.
+    // Awaiting ensures the notification commits before the container wakes.
     await notifyAgent(
       session,
-      `create_agent failed: could not write config for "${name}".${orphanSuffix(folder, cleaned)}`,
+      `Agent "${localName}" created. You can now message it with <message to="${localName}">...</message>.`,
     );
-    return;
+    log.info('Agent group created', { agentGroupId, name, localName, folder, parent: sourceGroup.id });
+  } finally {
+    // Held through the grants and the destination projection as well: a
+    // sibling request must see the finished agent, not a half-built one.
+    releaseAllocation();
   }
-
-  // STEP 3: DB INSERT. On failure, rollback the folder from step 1
-  //         (including the agentGroupId / provider config written in step 2).
-  try {
-    createAgentGroup(newGroup);
-  } catch (err) {
-    log.error('create_agent: createAgentGroup failed, rolling back folder', { err, folder });
-    const cleaned = safeRemoveFolder(folder);
-    await notifyAgent(
-      session,
-      `create_agent failed: database insert failed for "${name}".${orphanSuffix(folder, cleaned)}`,
-    );
-    return;
-  }
-
-  // Insert bidirectional destination rows (= ACL grants).
-  // Creator refers to child by the name it chose; child refers to creator as "parent".
-  createDestination({
-    agent_group_id: sourceGroup.id,
-    local_name: localName,
-    target_type: 'agent',
-    target_id: agentGroupId,
-    created_at: now,
-  });
-  // Handle the unlikely case where the child already has a "parent" destination
-  // (shouldn't happen for a brand-new agent, but be safe).
-  let parentName = 'parent';
-  let parentSuffix = 2;
-  while (getDestinationByName(agentGroupId, parentName)) {
-    parentName = `parent-${parentSuffix}`;
-    parentSuffix++;
-  }
-  createDestination({
-    agent_group_id: agentGroupId,
-    local_name: parentName,
-    target_type: 'agent',
-    target_id: sourceGroup.id,
-    created_at: now,
-  });
-
-  // REQUIRED: project the new destination into the running container's
-  // inbound.db. See the top-of-file invariant in db/agent-destinations.ts
-  // — forgetting this causes "dropped: unknown destination" when the parent
-  // tries to send to the newly-created child.
-  await writeDestinations(session.agent_group_id, session.id);
-
-  // notifyAgent is async since the writeSessionMessage signature change.
-  // Awaiting ensures the notification commits before the container wakes.
-  await notifyAgent(
-    session,
-    `Agent "${localName}" created. You can now message it with <message to="${localName}">...</message>.`,
-  );
-  log.info('Agent group created', { agentGroupId, name, localName, folder, parent: sourceGroup.id });
 };

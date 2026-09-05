@@ -15,9 +15,11 @@ vi.mock('../../session-manager.js', async (importOriginal) => {
   };
 });
 
-vi.mock('fs', async () => {
+vi.mock('fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fs')>();
   return {
     default: {
+      ...actual,
       statSync: vi.fn().mockImplementation(() => {
         throw new Error('ENOENT');
       }),
@@ -61,8 +63,8 @@ async function setupDb(): Promise<void> {
   runMigrations(db);
 }
 
-function seedAgentGroup(id: string): void {
-  createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: now() });
+async function seedAgentGroup(id: string): Promise<void> {
+  await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: now() });
 }
 
 function insertSession(sessId: string, agId: string, mgId: string | null = null): void {
@@ -132,8 +134,8 @@ describe('sessionsHandler — D4', () => {
       throw new Error('ENOENT');
     });
     await setupDb();
-    seedAgentGroup('ag-1');
-    seedAgentGroup('ag-2');
+    await seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-2');
   });
 
   afterEach(async () => {
@@ -499,8 +501,8 @@ describe('sessionsDetailHandler', () => {
       throw new Error('ENOENT');
     });
     await setupDb();
-    seedAgentGroup('ag-1');
-    seedAgentGroup('ag-2');
+    await seedAgentGroup('ag-1');
+    await seedAgentGroup('ag-2');
   });
 
   afterEach(async () => {

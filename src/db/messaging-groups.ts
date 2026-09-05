@@ -14,19 +14,28 @@ import {
   getDestinationByTarget,
   normalizeName,
 } from '../modules/agent-to-agent/db/agent-destinations.js';
-import { getRawDb, hasTableRaw } from './connection.js';
+import { getDb, getRawDb, hasTableRaw } from './connection.js';
 
 // ── Messaging Groups ──
 
-export function createMessagingGroup(group: MessagingGroup): void {
-  getRawDb()
-    .prepare(
-      `INSERT INTO messaging_groups (id, channel_type, platform_id, instance, name, is_group, unknown_sender_policy, created_at)
+export async function createMessagingGroup(group: MessagingGroup): Promise<void> {
+  await getDb().run(
+    `INSERT INTO messaging_groups (id, channel_type, platform_id, instance, name, is_group, unknown_sender_policy, created_at)
        VALUES (@id, @channel_type, @platform_id, @instance, @name, @is_group, @unknown_sender_policy, @created_at)`,
-    )
-    .run({ ...group, instance: group.instance ?? group.channel_type });
+    { ...group, instance: group.instance ?? group.channel_type },
+  );
 }
 
+/**
+ * Seam 3: stays SYNCHRONOUS on the raw handle, with NO async form.
+ *
+ * It is invoked from inside two pinned raw `db.transaction(() => …)()`
+ * closures — `modules/orchestrator-dispatch/dispatch.ts` (surface-mode
+ * resolution, step 4) and `ensureAgentDestinationForWiring` below, itself
+ * called from `cli/resources/wirings.ts`'s wiring transaction — and a
+ * synchronous closure cannot await. Plan §4.2; it converts with those
+ * closures in PR 6.
+ */
 export function getMessagingGroup(id: string): MessagingGroup | undefined {
   return getRawDb().prepare('SELECT * FROM messaging_groups WHERE id = ?').get(id) as MessagingGroup | undefined;
 }
@@ -41,24 +50,27 @@ export function getMessagingGroup(id: string): MessagingGroup | undefined {
  * falling back deterministically to the lexically-first named instance.
  * A set `instance` is exact-only — unknown instance returns undefined.
  */
-export function getMessagingGroupByPlatform(
+export async function getMessagingGroupByPlatform(
   channelType: string,
   platformId: string,
   instance?: string,
-): MessagingGroup | undefined {
+): Promise<MessagingGroup | undefined> {
   if (instance !== undefined) {
-    return getRawDb()
-      .prepare('SELECT * FROM messaging_groups WHERE channel_type = ? AND platform_id = ? AND instance = ?')
-      .get(channelType, platformId, instance) as MessagingGroup | undefined;
+    return getDb().get<MessagingGroup>(
+      'SELECT * FROM messaging_groups WHERE channel_type = ? AND platform_id = ? AND instance = ?',
+      channelType,
+      platformId,
+      instance,
+    );
   }
-  return getRawDb()
-    .prepare(
-      `SELECT * FROM messaging_groups
+  return getDb().get<MessagingGroup>(
+    `SELECT * FROM messaging_groups
         WHERE channel_type = ? AND platform_id = ?
      ORDER BY (instance = channel_type) DESC, instance ASC
         LIMIT 1`,
-    )
-    .get(channelType, platformId) as MessagingGroup | undefined;
+    channelType,
+    platformId,
+  );
 }
 
 /**
@@ -81,27 +93,28 @@ export function getMessagingGroupByPlatform(
  * default param (= channelType) keeps instance-less callers resolving the
  * default instance, identical to pre-instance behavior.
  */
-export function getMessagingGroupWithAgentCount(
+export async function getMessagingGroupWithAgentCount(
   channelType: string,
   platformId: string,
   instance: string = channelType,
-): { mg: MessagingGroup; agentCount: number } | null {
-  const row = getRawDb()
-    .prepare(
-      `SELECT mg.*, COUNT(mga.id) AS agent_count
+): Promise<{ mg: MessagingGroup; agentCount: number } | null> {
+  const row = await getDb().get<MessagingGroup & { agent_count: number }>(
+    `SELECT mg.*, COUNT(mga.id) AS agent_count
          FROM messaging_groups mg
     LEFT JOIN messaging_group_agents mga ON mga.messaging_group_id = mg.id
         WHERE mg.channel_type = ? AND mg.platform_id = ? AND mg.instance = ?
      GROUP BY mg.id`,
-    )
-    .get(channelType, platformId, instance) as (MessagingGroup & { agent_count: number }) | undefined;
+    channelType,
+    platformId,
+    instance,
+  );
   if (!row) return null;
   const { agent_count, ...mg } = row;
   return { mg: mg as MessagingGroup, agentCount: agent_count };
 }
 
-export function getAllMessagingGroups(): MessagingGroup[] {
-  return getRawDb().prepare('SELECT * FROM messaging_groups ORDER BY name').all() as MessagingGroup[];
+export async function getAllMessagingGroups(): Promise<MessagingGroup[]> {
+  return getDb().all<MessagingGroup>('SELECT * FROM messaging_groups ORDER BY name');
 }
 
 /**
@@ -110,10 +123,8 @@ export function getAllMessagingGroups(): MessagingGroup[] {
  * stays the semantic platform key. No live caller today; if a caller needs
  * a single instance's rows, filter on `mg.instance`.
  */
-export function getMessagingGroupsByChannel(channelType: string): MessagingGroup[] {
-  return getRawDb()
-    .prepare('SELECT * FROM messaging_groups WHERE channel_type = ?')
-    .all(channelType) as MessagingGroup[];
+export async function getMessagingGroupsByChannel(channelType: string): Promise<MessagingGroup[]> {
+  return getDb().all<MessagingGroup>('SELECT * FROM messaging_groups WHERE channel_type = ?', channelType);
 }
 
 /**
@@ -193,7 +204,7 @@ export function channelNameProvenanceAccepts(
 export type MessagingGroupUpdates = Partial<Pick<MessagingGroup, 'is_group' | 'unknown_sender_policy'>> &
   ({ name: string; name_source: string } | { name?: never; name_source?: never });
 
-export function updateMessagingGroup(id: string, updates: MessagingGroupUpdates): void {
+export async function updateMessagingGroup(id: string, updates: MessagingGroupUpdates): Promise<void> {
   const fields: string[] = [];
   const values: Record<string, unknown> = { id };
 
@@ -205,13 +216,11 @@ export function updateMessagingGroup(id: string, updates: MessagingGroupUpdates)
   }
   if (fields.length === 0) return;
 
-  getRawDb()
-    .prepare(`UPDATE messaging_groups SET ${fields.join(', ')} WHERE id = @id`)
-    .run(values);
+  await getDb().run(`UPDATE messaging_groups SET ${fields.join(', ')} WHERE id = @id`, values);
 }
 
-export function deleteMessagingGroup(id: string): void {
-  getRawDb().prepare('DELETE FROM messaging_groups WHERE id = ?').run(id);
+export async function deleteMessagingGroup(id: string): Promise<void> {
+  await getDb().run('DELETE FROM messaging_groups WHERE id = ?', id);
 }
 
 /**
@@ -224,8 +233,8 @@ export function deleteMessagingGroup(id: string): void {
  * Passing null unsets the flag (used by tests or a future "unblock channel"
  * admin command).
  */
-export function setMessagingGroupDeniedAt(id: string, deniedAt: string | null): void {
-  getRawDb().prepare('UPDATE messaging_groups SET denied_at = ? WHERE id = ?').run(deniedAt, id);
+export async function setMessagingGroupDeniedAt(id: string, deniedAt: string | null): Promise<void> {
+  await getDb().run('UPDATE messaging_groups SET denied_at = ? WHERE id = ?', deniedAt, id);
 }
 
 // ── Messaging Group Agents ──
@@ -236,6 +245,13 @@ export function setMessagingGroupDeniedAt(id: string, deniedAt: string | null): 
  * worktrees, so a row never spans workgroups. Workgroup
  * identity falls back to the group folder for pre-workgroup rows, matching
  * container-runner's resolution.
+ */
+/*
+ * Seam 3: stays SYNCHRONOUS on the raw handle, with NO async form — it runs
+ * inside two pinned raw transaction closures (`createMessagingGroupAgent`
+ * below and `cli/resources/wirings.ts`'s wiring transaction), whose whole
+ * point is that the guard and the INSERT are atomic. Plan §4.2; converts in
+ * PR 6 with those closures.
  */
 export function assertSameWorkgroupWiring(messagingGroupId: string, agentGroupId: string): void {
   // Scope: THIS messaging-group row only. Cross-row sharing on the same
@@ -281,6 +297,10 @@ export function assertSameWorkgroupWiring(messagingGroupId: string, agentGroupId
  * field when set, falling back to `${channel_type}-${mg_id prefix}`, with
  * a numeric suffix to break collisions within the agent's namespace. This
  * mirrors the backfill logic in migration 004.
+ */
+/*
+ * Seam 3: stays SYNCHRONOUS — it IS one of the eleven pinned central raw
+ * `db.transaction(...)` sites (plan §4.4). Converts in PR 6.
  */
 export function createMessagingGroupAgent(mga: MessagingGroupAgent): void {
   // Immediate transaction so guard + insert are atomic against a concurrent
@@ -338,6 +358,12 @@ function insertMessagingGroupAgentRow(mga: MessagingGroupAgent): void {
  * process and need the refresh to happen immediately, explicitly call the
  * module's `writeDestinations(mga.agent_group_id, <sessionId>)` afterwards.
  */
+/*
+ * Seam 3: stays SYNCHRONOUS on the raw handle, with NO async form — it is
+ * called from inside `cli/resources/wirings.ts`'s pinned raw transaction
+ * closure (and from `createMessagingGroupAgent` above). Its `hasTableRaw`
+ * guard therefore stays raw too. Plan §4.2; converts in PR 6.
+ */
 export function ensureAgentDestinationForWiring(mga: MessagingGroupAgent): void {
   // Guarded: when the agent-to-agent module isn't installed the table
   // doesn't exist — skip silently. Without the module, the ACL check in
@@ -367,7 +393,7 @@ export function ensureAgentDestinationForWiring(mga: MessagingGroupAgent): void 
   });
 }
 
-export function getMessagingGroupAgents(messagingGroupId: string): MessagingGroupAgent[] {
+export async function getMessagingGroupAgents(messagingGroupId: string): Promise<MessagingGroupAgent[]> {
   // COALESCE-hydrate nullable columns to OPERATIONAL defaults (not the schema
   // CREATE TABLE defaults) so manually-inserted rows match how the router
   // actually wires new MGs. The schema defaults (`drop`, `shared`) are stale
@@ -382,9 +408,8 @@ export function getMessagingGroupAgents(messagingGroupId: string): MessagingGrou
   //     unrelated conversations.
   //
   // Schema CREATE TABLE defaults need a separate migration to match.
-  return getRawDb()
-    .prepare(
-      `SELECT
+  return getDb().all<MessagingGroupAgent>(
+    `SELECT
          id, messaging_group_id, agent_group_id,
          COALESCE(engage_mode, 'mention') AS engage_mode,
          engage_pattern,
@@ -398,17 +423,19 @@ export function getMessagingGroupAgents(messagingGroupId: string): MessagingGrou
        FROM messaging_group_agents
        WHERE messaging_group_id = ?
        ORDER BY priority DESC`,
-    )
-    .all(messagingGroupId) as MessagingGroupAgent[];
+    messagingGroupId,
+  );
 }
 
-export function getMessagingGroupAgentByPair(
+export async function getMessagingGroupAgentByPair(
   messagingGroupId: string,
   agentGroupId: string,
-): MessagingGroupAgent | undefined {
-  return getRawDb()
-    .prepare('SELECT * FROM messaging_group_agents WHERE messaging_group_id = ? AND agent_group_id = ?')
-    .get(messagingGroupId, agentGroupId) as MessagingGroupAgent | undefined;
+): Promise<MessagingGroupAgent | undefined> {
+  return getDb().get<MessagingGroupAgent>(
+    'SELECT * FROM messaging_group_agents WHERE messaging_group_id = ? AND agent_group_id = ?',
+    messagingGroupId,
+    agentGroupId,
+  );
 }
 
 /**
@@ -449,9 +476,9 @@ export interface ChannelPeer {
   channel_type: string;
 }
 
-export function getChannelPeers(messagingGroupId: string, agentGroupId: string): ChannelPeer[] {
-  const db = getRawDb();
-  const cols = db.prepare(`PRAGMA table_info(agent_groups)`).all() as Array<{ name: string }>;
+export async function getChannelPeers(messagingGroupId: string, agentGroupId: string): Promise<ChannelPeer[]> {
+  const db = getDb();
+  const cols = await db.all<{ name: string }>(`PRAGMA table_info(agent_groups)`);
   const hasWorkgroupId = cols.some((c) => c.name === 'workgroup_id');
   // Workgroup-scoped query (post-migration-036). The self-side workgroup is
   // resolved by joining agent_groups twice: once for the peer (ag), once for
@@ -460,9 +487,8 @@ export function getChannelPeers(messagingGroupId: string, agentGroupId: string):
   // OTHER workgroups are correctly excluded even if a Slack channel-id
   // collision were to occur.
   if (hasWorkgroupId) {
-    return db
-      .prepare(
-        `SELECT ag.id   AS agent_group_id,
+    return db.all<ChannelPeer>(
+      `SELECT ag.id   AS agent_group_id,
                 ag.name AS name,
                 mg.channel_type AS channel_type
          FROM   messaging_group_agents mga
@@ -475,13 +501,14 @@ export function getChannelPeers(messagingGroupId: string, agentGroupId: string):
            AND  ag.workgroup_id IS NOT NULL
            AND  ag.workgroup_id = ag_self.workgroup_id
          ORDER BY ag.name`,
-      )
-      .all(messagingGroupId, agentGroupId, agentGroupId) as ChannelPeer[];
+      messagingGroupId,
+      agentGroupId,
+      agentGroupId,
+    );
   }
   // Pre-036 fallback: platform_id only (no workgroup column to filter on).
-  return db
-    .prepare(
-      `SELECT ag.id   AS agent_group_id,
+  return db.all<ChannelPeer>(
+    `SELECT ag.id   AS agent_group_id,
               ag.name AS name,
               mg.channel_type AS channel_type
        FROM   messaging_group_agents mga
@@ -491,17 +518,16 @@ export function getChannelPeers(messagingGroupId: string, agentGroupId: string):
        WHERE  mg.platform_id    = mg_self.platform_id
          AND  mga.agent_group_id != ?
        ORDER BY ag.name`,
-    )
-    .all(messagingGroupId, agentGroupId) as ChannelPeer[];
+    messagingGroupId,
+    agentGroupId,
+  );
 }
 
-export function getMessagingGroupAgent(id: string): MessagingGroupAgent | undefined {
-  return getRawDb().prepare('SELECT * FROM messaging_group_agents WHERE id = ?').get(id) as
-    | MessagingGroupAgent
-    | undefined;
+export async function getMessagingGroupAgent(id: string): Promise<MessagingGroupAgent | undefined> {
+  return getDb().get<MessagingGroupAgent>('SELECT * FROM messaging_group_agents WHERE id = ?', id);
 }
 
-export function updateMessagingGroupAgent(
+export async function updateMessagingGroupAgent(
   id: string,
   updates: Partial<
     Pick<
@@ -517,7 +543,7 @@ export function updateMessagingGroupAgent(
       | 'default_tone'
     >
   >,
-): void {
+): Promise<void> {
   const fields: string[] = [];
   const values: Record<string, unknown> = { id };
 
@@ -529,24 +555,21 @@ export function updateMessagingGroupAgent(
   }
   if (fields.length === 0) return;
 
-  getRawDb()
-    .prepare(`UPDATE messaging_group_agents SET ${fields.join(', ')} WHERE id = @id`)
-    .run(values);
+  await getDb().run(`UPDATE messaging_group_agents SET ${fields.join(', ')} WHERE id = @id`, values);
 }
 
-export function deleteMessagingGroupAgent(id: string): void {
-  getRawDb().prepare('DELETE FROM messaging_group_agents WHERE id = ?').run(id);
+export async function deleteMessagingGroupAgent(id: string): Promise<void> {
+  await getDb().run('DELETE FROM messaging_group_agents WHERE id = ?', id);
 }
 
 /** Get all messaging groups wired to an agent group (reverse lookup). */
-export function getMessagingGroupsByAgentGroup(agentGroupId: string): MessagingGroup[] {
-  return getRawDb()
-    .prepare(
-      `SELECT mg.* FROM messaging_groups mg
+export async function getMessagingGroupsByAgentGroup(agentGroupId: string): Promise<MessagingGroup[]> {
+  return getDb().all<MessagingGroup>(
+    `SELECT mg.* FROM messaging_groups mg
        JOIN messaging_group_agents mga ON mga.messaging_group_id = mg.id
        WHERE mga.agent_group_id = ?`,
-    )
-    .all(agentGroupId) as MessagingGroup[];
+    agentGroupId,
+  );
 }
 
 /**
@@ -557,15 +580,14 @@ export function getMessagingGroupsByAgentGroup(agentGroupId: string): MessagingG
  * group has no wired channels yet (e.g. brand-new agents from create_agent
  * before any wiring); callers must handle that case.
  */
-export function getPrimaryMessagingGroupByAgentGroup(agentGroupId: string): MessagingGroup | null {
-  const row = getRawDb()
-    .prepare(
-      `SELECT mg.* FROM messaging_groups mg
+export async function getPrimaryMessagingGroupByAgentGroup(agentGroupId: string): Promise<MessagingGroup | null> {
+  const row = await getDb().get<MessagingGroup>(
+    `SELECT mg.* FROM messaging_groups mg
        JOIN messaging_group_agents mga ON mga.messaging_group_id = mg.id
        WHERE mga.agent_group_id = ?
        ORDER BY mga.priority DESC, mg.created_at ASC
        LIMIT 1`,
-    )
-    .get(agentGroupId);
-  return (row as MessagingGroup | undefined) ?? null;
+    agentGroupId,
+  );
+  return row ?? null;
 }

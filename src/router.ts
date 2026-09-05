@@ -34,6 +34,7 @@ import {
   updateMessagingGroup,
 } from './db/messaging-groups.js';
 import { getRawDb } from './db/connection.js';
+import { insertOrAdopt } from './db/insert-or-adopt.js';
 import {
   claimChannelIngress,
   claimDeferredChannelIngress,
@@ -296,7 +297,38 @@ export function setAccessGate(fn: AccessGateFn): void {
  * so subsequent messages resolve via the normal path; returning an empty
  * array falls through to the standard "no agent wired" drop.
  */
-export type UnwiredChannelResolverFn = (event: InboundEvent, mg: MessagingGroup) => MessagingGroupAgent[];
+/**
+ * Insert the auto-created messaging group, or adopt the row a concurrent route
+ * won with. The lookup above yields (async driver), so two addressed messages
+ * for a never-seen channel can both see no row and both insert on the same
+ * `(channel_type, platform_id, instance)` unique key; the loser re-reads the
+ * winner instead of aborting its route — the same shape as
+ * `resolveActiveSession` in db/scheduled-tasks.ts. Exported for its test.
+ */
+export async function autoCreateMessagingGroup(
+  mg: MessagingGroup,
+  instance: string,
+): Promise<{ mg: MessagingGroup; agentCount: number }> {
+  // `getMessagingGroupWithAgentCount` returns the row AND its wiring count,
+  // but the primitive's `reload` is row-shaped — carry the count out sideways
+  // so the adopted row keeps the wirings the winner may already have, instead
+  // of the 0 a freshly-inserted row has.
+  let adoptedAgentCount = 0;
+  const { row, created } = await insertOrAdopt(mg, createMessagingGroup, async () => {
+    const winner = await getMessagingGroupWithAgentCount(mg.channel_type, mg.platform_id, instance);
+    if (!winner) return undefined;
+    adoptedAgentCount = winner.agentCount;
+    return winner.mg;
+  });
+  if (!created) return { mg: row, agentCount: adoptedAgentCount };
+  log.info('Auto-created messaging group', { id: mg.id, channelType: mg.channel_type, platformId: mg.platform_id });
+  return { mg: row, agentCount: 0 };
+}
+
+export type UnwiredChannelResolverFn = (
+  event: InboundEvent,
+  mg: MessagingGroup,
+) => MessagingGroupAgent[] | Promise<MessagingGroupAgent[]>;
 
 let unwiredChannelResolver: UnwiredChannelResolverFn | null = null;
 
@@ -520,7 +552,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
   //    resolution, no log spam. Exact-on-instance: an unknown named
   //    instance falls through to auto-create rather than hijacking a
   //    sibling instance's row.
-  const found = getMessagingGroupWithAgentCount(
+  const found = await getMessagingGroupWithAgentCount(
     event.channelType,
     event.platformId,
     event.instance ?? event.channelType,
@@ -562,13 +594,9 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
       denied_at: null,
       created_at: new Date().toISOString(),
     };
-    createMessagingGroup(mg);
-    log.info('Auto-created messaging group', {
-      id: mgId,
-      channelType: event.channelType,
-      platformId: event.platformId,
-    });
-    agentCount = 0;
+    const created = await autoCreateMessagingGroup(mg, event.instance ?? event.channelType);
+    mg = created.mg;
+    agentCount = created.agentCount;
   } else {
     mg = found.mg;
     agentCount = found.agentCount;
@@ -615,7 +643,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
         // pin to every future channel is a worse bug than the one this fixes.
         const inheritedTone = unanimousToneFor(inheritedAgent.id, mg.channel_type);
         const isGroup = event.message.isGroup ?? mg.is_group === 1;
-        createMessagingGroupAgent({
+        const wiring: MessagingGroupAgent = {
           id: `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           messaging_group_id: mg.id,
           agent_group_id: inheritedAgent.id,
@@ -638,7 +666,16 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
           // silently extend a scoped rule set past its scope.
           instructions_profile: null,
           created_at: new Date().toISOString(),
-        });
+        };
+        // Lookup-then-insert on the async driver: a concurrent route can win the
+        // same wiring; adopt it instead of failing this message (seam 3 primitive).
+        await insertOrAdopt(
+          wiring,
+          async (candidate) => {
+            createMessagingGroupAgent(candidate);
+          },
+          async () => (await getMessagingGroupAgents(mg.id)).find((w) => w.agent_group_id === inheritedAgent.id),
+        );
         log.info('Workspace-trust auto-wire', {
           messagingGroupId: mg.id,
           inheritedFrom: inheritedAgent.sourceMessagingGroupId,
@@ -660,7 +697,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
             // answer, and it must outrank the generic metadata fetch that will
             // report this same channel's raw platform name later.
             if (name) {
-              updateMessagingGroup(mg.id, {
+              await updateMessagingGroup(mg.id, {
                 name,
                 name_source: channelNameProvenance(mg.channel_type, 'classified'),
               });
@@ -686,7 +723,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
     // place. Resolver returns [] when no env var is set / folder is missing
     // / the wiring insert raced — falls through to the approval gate below.
     if (unwiredChannelResolver) {
-      const wirings = unwiredChannelResolver(event, mg);
+      const wirings = await unwiredChannelResolver(event, mg);
       if (wirings.length > 0) {
         log.info('Env-var auto-wire', {
           messagingGroupId: mg.id,
@@ -846,7 +883,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
 
   // 3. Fetch wired agents in full (we already know the count is > 0; now
   //    we need their actual rows for fan-out).
-  const agents = getMessagingGroupAgents(mg.id);
+  const agents = await getMessagingGroupAgents(mg.id);
 
   // 4. Fan-out: evaluate each wired agent independently against engage_mode,
   //    sender_scope, and access gate. An agent that engages gets its own
@@ -876,7 +913,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
   let subscribed = false;
 
   for (const agent of agents) {
-    const agentGroup = getAgentGroup(agent.agent_group_id);
+    const agentGroup = await getAgentGroup(agent.agent_group_id);
     if (!agentGroup) continue;
 
     // Effective thread id for THIS wiring: the event-derived address is
@@ -894,7 +931,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
     );
     const effectiveThreadId = threadsEnabled ? event.threadId : null;
 
-    const engages = evaluateEngage(agent, messageText, isMention, mg, effectiveThreadId, supportsThreads);
+    const engages = await evaluateEngage(agent, messageText, isMention, mg, effectiveThreadId, supportsThreads);
 
     const accessDecision =
       engages && accessGate ? await accessGate(event, userId, mg, agent.agent_group_id, effectiveThreadId) : null;
@@ -1003,14 +1040,14 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
  *                      a thread has engaged us once, follow-ups arrive
  *                      with no mention and should still fire.
  */
-function evaluateEngage(
+async function evaluateEngage(
   agent: MessagingGroupAgent,
   text: string,
   isMention: boolean,
   mg: MessagingGroup,
   threadId: string | null,
   adapterSupportsThreads: boolean,
-): boolean {
+): Promise<boolean> {
   switch (agent.engage_mode) {
     case 'pattern': {
       const pat = agent.engage_pattern ?? '.';
@@ -1056,7 +1093,7 @@ function evaluateEngage(
       // forced the non-engaged skip below to exempt mention-sticky wirings.
       // `engaged_at` states the fact outright (migration 052), so a thread the
       // agent has never engaged in does not stick, whether or not a row exists.
-      const existing = findSessionForAgent(agent.agent_group_id, mg.id, threadId);
+      const existing = await findSessionForAgent(agent.agent_group_id, mg.id, threadId);
       return existing?.engaged_at != null;
     }
     default:
@@ -1228,7 +1265,7 @@ async function deliverToAgent(
     effectiveSessionMode === 'per-thread' &&
     effectiveThreadId !== null &&
     typeof adapter?.fetchThreadHistory === 'function' &&
-    findSessionForAgent(agent.agent_group_id, mg.id, effectiveThreadId) === undefined &&
+    (await findSessionForAgent(agent.agent_group_id, mg.id, effectiveThreadId)) === undefined &&
     archiveInboundUserMessage(agent, mg, event, userId, parsedContent, effectiveThreadId)
   ) {
     log.debug('Skipped session creation for non-engaged thread message', {
@@ -1240,7 +1277,12 @@ async function deliverToAgent(
     return;
   }
 
-  const { session, created } = resolveSession(agent.agent_group_id, mg.id, effectiveThreadId, effectiveSessionMode);
+  const { session, created } = await resolveSession(
+    agent.agent_group_id,
+    mg.id,
+    effectiveThreadId,
+    effectiveSessionMode,
+  );
   const routedMessageId = messageIdForAgent(event.message.id, agent.agent_group_id);
 
   // A receipt table added after existing session DBs cannot retroactively know
@@ -1367,7 +1409,7 @@ async function deliverToAgent(
     // next restart (codex-review finding on PR #124).
     const provider = resolveProviderName(
       session.agent_provider,
-      getContainerConfig(session.agent_group_id)?.provider ?? agentGroup.agent_provider,
+      (await getContainerConfig(session.agent_group_id))?.provider ?? agentGroup.agent_provider,
     );
     const parsed = parseMessageFlags(rawText, provider);
     if (parsed.intent || parsed.errors.length > 0 || parsed.warnings.length > 0) {
@@ -1473,7 +1515,7 @@ async function deliverToAgent(
   // The message is durable and this wiring engaged — record the fact. Stamped
   // AFTER the backfill read above, which needs the pre-wake state, and after
   // the write, so a duplicate or a failed insert never claims engagement.
-  if (wake) markSessionEngaged(session.id);
+  if (wake) await markSessionEngaged(session.id);
 
   log.info('Message routed', {
     sessionId: session.id,

@@ -245,13 +245,13 @@ function createGateHandler(category: GateCategory) {
           'timeout',
           `${category.logPrefix} gate timed out after ${BASH_GATE_TIMEOUT_MS / 60_000} minutes.`,
         );
-        const pending = getPendingApprovalByRequestId(requestId);
+        const pending = await getPendingApprovalByRequestId(requestId);
         if (pending) {
           await editApprovalCard(
             pending,
             `🕒 *${pending.title}* — timed out\n\nNo approval received within ${BASH_GATE_TIMEOUT_MS / 60_000} minutes. The ${category.kindNoun} was not run.`,
           );
-          deletePendingApproval(pending.approval_id);
+          await deletePendingApproval(pending.approval_id);
         }
       })().catch((err) => {
         log.error(`${category.logPrefix} gate timeout handler failed`, { requestId, err });
@@ -318,7 +318,7 @@ function createApprovalHandler(logPrefix: string) {
     clearPending(p.requestId);
     sessionsWithActiveGates.delete(p.sessionId);
 
-    const session = getSession(p.sessionId);
+    const session = await getSession(p.sessionId);
     if (!session) {
       log.warn(`${logPrefix} gate approval for unknown session`, { sessionId: p.sessionId, requestId: p.requestId });
       return;
@@ -401,12 +401,12 @@ registerApprovalHandler(DESTRUCTIVE_GATE.approvalAction, createApprovalHandler(D
  * Safe to call with no pending gates — returns immediately.
  */
 export async function cancelPendingGatesForSession(sessionId: string, reason: string): Promise<void> {
-  const pending: PendingApproval[] = getPendingApprovalsBySession(sessionId).filter(
+  const pending: PendingApproval[] = (await getPendingApprovalsBySession(sessionId)).filter(
     (p) => p.action === BASH_GATE.approvalAction || p.action === DESTRUCTIVE_GATE.approvalAction,
   );
   if (pending.length === 0) return;
 
-  const session = getSession(sessionId);
+  const session = await getSession(sessionId);
   if (!session) {
     log.warn('cancelPendingGatesForSession called for unknown session', { sessionId });
     return;
@@ -429,7 +429,7 @@ export async function cancelPendingGatesForSession(sessionId: string, reason: st
       log.warn('Failed to edit cancelled approval card', { approvalId: p.approval_id, err });
     }
     await writeGateAck(session, p.request_id, 'rejected', reason);
-    deletePendingApproval(p.approval_id);
+    await deletePendingApproval(p.approval_id);
   }
   sessionsWithActiveGates.delete(sessionId);
 }

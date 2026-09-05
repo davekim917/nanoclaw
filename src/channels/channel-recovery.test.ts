@@ -68,7 +68,7 @@ beforeEach(() => {
 });
 
 describe('channel recovery coordinator', () => {
-  it('builds roots plus active threads and keeps adapter instances isolated', () => {
+  it('builds roots plus active threads and keeps adapter instances isolated', async () => {
     mocks.groups = [
       { id: 'mg-1', channel_type: 'discord', instance: 'discord', platform_id: 'discord:g:c', is_group: 1 },
       { id: 'mg-2', channel_type: 'discord', instance: 'discord-codex', platform_id: 'discord:g:c', is_group: 1 },
@@ -79,19 +79,19 @@ describe('channel recovery coordinator', () => {
       { messaging_group_id: 'mg-2', thread_id: 'discord:g:c:t2' },
     ];
 
-    expect(getChannelRecoveryTargets(adapter('discord'))).toEqual([
+    expect(await getChannelRecoveryTargets(adapter('discord'))).toEqual([
       { platformId: 'discord:g:c', threadId: null, isDM: false },
       { platformId: 'discord:g:c', threadId: 'discord:g:c:t1', isDM: false },
     ]);
   });
 
-  it('supplies roots only when the adapter discovers changed threads itself', () => {
+  it('supplies roots only when the adapter discovers changed threads itself', async () => {
     mocks.groups = [{ id: 'mg-s', channel_type: 'slack', instance: 'slack', platform_id: 'slack:C1', is_group: 1 }];
     mocks.sessions = [{ messaging_group_id: 'mg-s', thread_id: 'slack:C1:old-thread' }];
     const slack = adapter('slack');
     slack.recoveryDiscoversThreads = true;
 
-    expect(getChannelRecoveryTargets(slack)).toEqual([{ platformId: 'slack:C1', threadId: null, isDM: false }]);
+    expect(await getChannelRecoveryTargets(slack)).toEqual([{ platformId: 'slack:C1', threadId: null, isDM: false }]);
   });
 
   it('invokes the same recovery contract for every active channel type after a host stall', async () => {
@@ -112,7 +112,7 @@ describe('channel recovery coordinator', () => {
     expect(slackRecover.mock.calls[0][0]).toMatchObject({ reason: 'event-loop-stall' });
   });
 
-  it('bounds stall-pass thread expansion to recently-active sessions, fail-open on missing timestamps', () => {
+  it('bounds stall-pass thread expansion to recently-active sessions, fail-open on missing timestamps', async () => {
     const now = Date.now();
     const fresh = new Date(now - 60_000).toISOString();
     const stale = new Date(now - STALL_TARGET_ACTIVITY_HORIZON_MS - 60_000).toISOString();
@@ -128,11 +128,11 @@ describe('channel recovery coordinator', () => {
     const bounded = getChannelRecoveryTargets(adapter('discord'), {
       activeSinceMs: now - STALL_TARGET_ACTIVITY_HORIZON_MS,
     });
-    expect(bounded.map((t) => t.threadId)).toEqual([null, 'discord:g:c:fresh', 'discord:g:c:untimed']);
+    expect((await bounded).map((t) => t.threadId)).toEqual([null, 'discord:g:c:fresh', 'discord:g:c:untimed']);
 
     // Unbounded (transport/startup) passes keep the stale thread.
     const full = getChannelRecoveryTargets(adapter('discord'));
-    expect(full.map((t) => t.threadId)).toContain('discord:g:c:stale');
+    expect((await full).map((t) => t.threadId)).toContain('discord:g:c:stale');
   });
 
   it('coalesces stalls inside the cooldown into one deferred pass with the earliest since', async () => {
@@ -189,7 +189,9 @@ describe('channel recovery coordinator', () => {
     ];
     const first = recoverChannelAdapter(live, { since: '2026-07-21T18:16:00Z', reason: 'transport-ready' });
     const second = recoverChannelAdapter(live, { since: '2026-07-21T18:16:01Z', reason: 'transport-resumed' });
-    expect(recover).toHaveBeenCalledOnce();
+    // The target read is async now (seam 3), so the first pass starts a
+    // microtask later than the call.
+    await vi.waitFor(() => expect(recover).toHaveBeenCalledOnce());
     releases[0]();
     await vi.waitFor(() => expect(recover).toHaveBeenCalledTimes(2));
     releases[1]();
@@ -238,6 +240,8 @@ describe('channel recovery coordinator', () => {
         since: '2026-07-21T18:16:01Z',
         reason: 'event-loop-stall',
       });
+      // Let the first pass reach `recover` (its target read is async now).
+      await vi.advanceTimersByTimeAsync(0);
       finishFirst({ scannedTargets: 1, recoveredMessages: 0, failedTargets: 1 });
       await first;
 
