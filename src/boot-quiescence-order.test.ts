@@ -45,7 +45,7 @@ function childProcessTripwire(record: string[]): Record<string, (...args: unknow
 vi.mock('child_process', () => childProcessTripwire(spawns));
 vi.mock('node:child_process', () => childProcessTripwire(spawns));
 
-import { BootQuiescencePartialStopError, quiesceWorkgroupsForBootMountChange } from './container-restart.js';
+import { quiesceWorkgroupsForBootMountChange } from './container-restart.js';
 import type { InstallContainerScope } from './container-runtime.js';
 import { runBootMountQuiescence, runWorkgroupMemoryStartupGate } from './main.js';
 import {
@@ -154,15 +154,23 @@ describe('boot mount-change ordering', () => {
       memoryWouldChange: () => true,
       sharedWouldChange: () => true,
       sharedFsEnabled: true,
-      quiesce: async (changed) => {
-        calls.push(`quiesce(${changed.join(',')})`);
+      quiesce: async (changed, options) => {
+        calls.push(`quiesce(${changed.join(',')}, of ${options.workgroupsTotal})`);
         // Suspend inside the door: anything that runs before it resolves is a
         // mutation racing a live container.
         await new Promise<void>((resolve) => {
           resolveQuiesce = resolve;
         });
         calls.push('quiesce:resolved');
-        return { containers: 1, stopped: 1, survivable: 0, unlabeled: 0 };
+        return {
+          workgroups: 1,
+          containers: 1,
+          stopped: 1,
+          survivable: 0,
+          unlabeled: 0,
+          survivableSessionIds: [],
+          mustStopSessionIds: ['s1'],
+        };
       },
       warnStartup: async () => {
         calls.push('warn');
@@ -181,15 +189,15 @@ describe('boot mount-change ordering', () => {
 
     // Let every already-scheduled microtask drain while the door is suspended.
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(calls).toEqual(['quiesce(wgx)']);
+    expect(calls).toEqual(['warn', 'quiesce(wgx, of 1)']);
 
     resolveQuiesce!();
     await pending;
 
     expect(calls).toEqual([
-      'quiesce(wgx)',
-      'quiesce:resolved',
       'warn',
+      'quiesce(wgx, of 1)',
+      'quiesce:resolved',
       'reconcileWorkgroupSharedDirs',
       'reconcileWorkgroupMemory',
       'pruneAgentRunnerSnapshots',
@@ -210,7 +218,15 @@ describe('boot mount-change ordering', () => {
       sharedFsEnabled: true,
       quiesce: async () => {
         calls.push('quiesce');
-        return { containers: 0, stopped: 0, survivable: 0, unlabeled: 0 };
+        return {
+          workgroups: 0,
+          containers: 0,
+          stopped: 0,
+          survivable: 0,
+          unlabeled: 0,
+          survivableSessionIds: [],
+          mustStopSessionIds: [],
+        };
       },
       warnStartup: async () => undefined,
       reconcileShared: () => {
@@ -223,7 +239,7 @@ describe('boot mount-change ordering', () => {
     expect(calls).toEqual(['quiesce', 'reconcileWorkgroupSharedDirs']);
 
     const source = fs.readFileSync(path.resolve('src/main.ts'), 'utf8');
-    const proof = source.indexOf('quiesceWorkgroupsForBootMountChange)(changedWorkgroupIds)');
+    const proof = source.indexOf('quiesceWorkgroupsForBootMountChange)(changedWorkgroupIds, {');
     const shared = source.indexOf('reconcileWorkgroupSharedDirs)(db, { workgroupIds: changedWorkgroupIds })');
     expect(proof).toBeGreaterThanOrEqual(0);
     expect(shared).toBeGreaterThan(proof);
@@ -247,9 +263,9 @@ describe('boot mount-change ordering', () => {
       memoryWouldChange: (database, id) => workgroupMemoryReconcileWouldChange(database, id, { groupsDir, dataDir }),
       sharedWouldChange: (database, id) => sharedDirsReconcileWouldChange(database, id, { groupsDir, dataDir }),
       sharedFsEnabled: true,
-      quiesce: (changed) => {
+      quiesce: (changed, options) => {
         quiesceArg = changed;
-        return quiesceWorkgroupsForBootMountChange(changed, runtime);
+        return quiesceWorkgroupsForBootMountChange(changed, { ...runtime, ...options });
       },
       warnStartup: async () => undefined,
       reconcileShared: () => undefined,
@@ -262,7 +278,17 @@ describe('boot mount-change ordering', () => {
     // D1: the scope is empty and BOTH containers are still stopped. The D2 PR
     // changes this to `stopped: 0` and `runtime.stops` empty — that flip is
     // the whole of milestone 1's first line of evidence (plan §6).
-    expect(scope).toEqual({ containers: 2, stopped: 2, survivable: 2, unlabeled: 0 });
+    expect(scope).toEqual({
+      workgroups: 1,
+      containers: 2,
+      stopped: 2,
+      survivable: 2,
+      unlabeled: 0,
+      // Both are identified and outside the changed set — the milestone-1
+      // counterfactual, named session by session for seam-4 E and G.
+      survivableSessionIds: ['s1', 's2'],
+      mustStopSessionIds: [],
+    });
     expect(scope.stopped).toBe(scope.containers);
     expect(runtime.stops).toEqual(['nanoclaw-v2-a-1', 'nanoclaw-v2-b-1']);
     db.close();
@@ -285,7 +311,7 @@ describe('boot mount-change ordering', () => {
       memoryWouldChange: (database, id) => workgroupMemoryReconcileWouldChange(database, id, { groupsDir, dataDir }),
       sharedWouldChange: (database, id) => sharedDirsReconcileWouldChange(database, id, { groupsDir, dataDir }),
       sharedFsEnabled: true,
-      quiesce: (changed) => quiesceWorkgroupsForBootMountChange(changed, runtime),
+      quiesce: (changed, options) => quiesceWorkgroupsForBootMountChange(changed, { ...runtime, ...options }),
       warnStartup: async () => undefined,
       reconcileShared: () => undefined,
       memoryGate: (database, opts) =>
@@ -306,10 +332,48 @@ describe('boot mount-change ordering', () => {
     db.close();
   });
 
-  it('a door that dies part way still writes the host-restart note before rethrowing', async () => {
-    // The containers it did stop took real sessions down with them. Those
-    // sessions get the same accountability note they would have got on a clean
-    // pass; the failure still propagates and no reconcile runs.
+  it('the startup warn runs before the first stop', async () => {
+    // main() has always captured this evidence ahead of the fleet-wide stop.
+    // §7.D's listed order puts the warn after the door, which would leave the
+    // sessions a half-failed door already killed with no note at all. The
+    // primitive is real here, so `stops` is the actual stop sequence.
+    const db = makeDb();
+    const calls: string[] = [];
+    const runtime = fakeRuntime([{ name: 'nanoclaw-v2-a-1', workgroupId: 'wgx', sessionId: 's1', groupId: 'g1' }]);
+
+    await runBootMountQuiescence(db, {
+      workgroupIds: () => ['wgx'],
+      memoryWouldChange: () => true,
+      sharedWouldChange: () => false,
+      sharedFsEnabled: true,
+      quiesce: (changed, options) => {
+        calls.push('quiesce');
+        return quiesceWorkgroupsForBootMountChange(changed, {
+          ...options,
+          list: runtime.list,
+          stop: (name: string) => {
+            calls.push(`stop:${name}`);
+            runtime.stop(name);
+          },
+        });
+      },
+      warnStartup: async () => {
+        calls.push('warn');
+      },
+      reconcileShared: () => undefined,
+      memoryGate: () => [],
+      prune: () => undefined,
+    });
+
+    expect(calls).toEqual(['warn', 'quiesce', 'stop:nanoclaw-v2-a-1']);
+    expect(calls.indexOf('warn')).toBeLessThan(calls.findIndex((c) => c.startsWith('stop:')));
+    db.close();
+  });
+
+  it('a door that fails part way leaves the warn already written and no reconcile run', async () => {
+    // The note covers every session an unclean previous host left marked
+    // running, and it is written before the door touches anything — so a stop
+    // that throws mid-pass needs no recovery path of its own.
     const db = makeDb();
     const calls: string[] = [];
     const runtime = fakeRuntime(
@@ -326,7 +390,7 @@ describe('boot mount-change ordering', () => {
         memoryWouldChange: () => true,
         sharedWouldChange: () => false,
         sharedFsEnabled: true,
-        quiesce: (changed) => quiesceWorkgroupsForBootMountChange(changed, runtime),
+        quiesce: (changed, options) => quiesceWorkgroupsForBootMountChange(changed, { ...runtime, ...options }),
         warnStartup: async () => {
           calls.push('warn');
         },
@@ -341,57 +405,14 @@ describe('boot mount-change ordering', () => {
           calls.push('pruneAgentRunnerSnapshots');
         },
       }),
-    ).rejects.toBeInstanceOf(BootQuiescencePartialStopError);
+    ).rejects.toThrow(/prove install-scoped container absence: failed to stop nanoclaw-v2-b-1/);
 
     expect(runtime.stops).toEqual(['nanoclaw-v2-a-1']);
     expect(calls).toEqual(['warn']);
     db.close();
   });
 
-  it('a post-stop listing failure still writes the host-restart note before rethrowing', async () => {
-    // The stops all took; docker went away before the proof. The containers
-    // are gone either way, so the sessions get their note and the failure
-    // still stops startup ahead of every reconcile.
-    const db = makeDb();
-    const calls: string[] = [];
-    const runtime = fakeRuntime(
-      [
-        { name: 'nanoclaw-v2-a-1', workgroupId: 'wgx', sessionId: 's1', groupId: 'g1' },
-        { name: 'nanoclaw-v2-b-1', workgroupId: 'wg-other', sessionId: 's2', groupId: 'g2' },
-      ],
-      undefined,
-      2,
-    );
-
-    await expect(
-      runBootMountQuiescence(db, {
-        workgroupIds: () => ['wgx'],
-        memoryWouldChange: () => true,
-        sharedWouldChange: () => false,
-        sharedFsEnabled: true,
-        quiesce: (changed) => quiesceWorkgroupsForBootMountChange(changed, runtime),
-        warnStartup: async () => {
-          calls.push('warn');
-        },
-        reconcileShared: () => {
-          calls.push('reconcileWorkgroupSharedDirs');
-        },
-        memoryGate: () => {
-          calls.push('reconcileWorkgroupMemory');
-          return [];
-        },
-        prune: () => {
-          calls.push('pruneAgentRunnerSnapshots');
-        },
-      }),
-    ).rejects.toBeInstanceOf(BootQuiescencePartialStopError);
-
-    expect(runtime.stops).toEqual(['nanoclaw-v2-a-1', 'nanoclaw-v2-b-1']);
-    expect(calls).toEqual(['warn']);
-    db.close();
-  });
-
-  it('a door that stopped nothing writes no host-restart note', async () => {
+  it('a failing door still stops startup before any reconcile', async () => {
     const db = makeDb();
     const calls: string[] = [];
 
@@ -424,8 +445,8 @@ describe('boot mount-change ordering', () => {
       }),
     ).rejects.toThrow(/prove install-scoped container absence/);
 
-    // Nothing was interrupted, so nothing is announced as interrupted.
-    expect(calls).toEqual([]);
+    // The warn already ran; nothing below the door did.
+    expect(calls).toEqual(['warn']);
     db.close();
   });
 });

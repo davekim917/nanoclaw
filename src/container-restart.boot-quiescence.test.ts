@@ -68,7 +68,7 @@ vi.mock('./container-runtime.js', () => ({
   }),
 }));
 
-import { BootQuiescencePartialStopError, quiesceWorkgroupsForBootMountChange } from './container-restart.js';
+import { quiesceWorkgroupsForBootMountChange } from './container-restart.js';
 import type { InstallContainerScope } from './container-runtime.js';
 import { log } from './log.js';
 
@@ -133,10 +133,18 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
   it('a container in a changed workgroup is stopped', async () => {
     const runtime = fakeRuntime([container('nanoclaw-v2-a-1', 'wg-a')]);
 
-    const scope = await quiesceWorkgroupsForBootMountChange(['wg-a'], runtime);
+    const scope = await quiesceWorkgroupsForBootMountChange(['wg-a'], { ...runtime, workgroupsTotal: 1 });
 
     expect(runtime.stops).toEqual(['nanoclaw-v2-a-1']);
-    expect(scope).toEqual({ containers: 1, stopped: 1, survivable: 0, unlabeled: 0 });
+    expect(scope).toEqual({
+      workgroups: 1,
+      containers: 1,
+      stopped: 1,
+      survivable: 0,
+      unlabeled: 0,
+      survivableSessionIds: [],
+      mustStopSessionIds: ['nanoclaw-v2-a-1-session'],
+    });
     expect(spawns).toEqual([]);
   });
 
@@ -146,6 +154,8 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
     const scope = await quiesceWorkgroupsForBootMountChange(['wg-a'], runtime);
 
     expect(scope.survivable).toBe(1);
+    expect(scope.survivableSessionIds).toEqual(['nanoclaw-v2-b-1-session']);
+    expect(scope.mustStopSessionIds).toEqual([]);
     // D1 STILL STOPS IT. This assertion is the D2 acceptance criterion: the
     // flip changes it to `expect(runtime.stops).toEqual([])` and
     // `stopped: 0`. Until then `survivable` is only a counterfactual.
@@ -160,10 +170,18 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
     // and it is never counted survivable.
     const runtime = fakeRuntime([container('nanoclaw-v2-legacy-1', null), container('nanoclaw-v2-b-1', 'wg-b')]);
 
-    const scope = await quiesceWorkgroupsForBootMountChange([], runtime);
+    const scope = await quiesceWorkgroupsForBootMountChange([], { ...runtime, workgroupsTotal: 3 });
 
     expect(runtime.stops).toContain('nanoclaw-v2-legacy-1');
-    expect(scope).toEqual({ containers: 2, stopped: 2, survivable: 1, unlabeled: 1 });
+    expect(scope).toEqual({
+      workgroups: 3,
+      containers: 2,
+      stopped: 2,
+      survivable: 1,
+      unlabeled: 1,
+      survivableSessionIds: ['nanoclaw-v2-b-1-session'],
+      mustStopSessionIds: ['nanoclaw-v2-legacy-1-session'],
+    });
     expect(spawns).toEqual([]);
   });
 
@@ -217,75 +235,63 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
     expect(spawns).toEqual([]);
   });
 
-  it('a failure after a stop carries the names it already stopped', async () => {
-    // The caller writes the host-restart accountability note AFTER the door
-    // returns. Without the stopped set on the error, a door that dies half way
-    // leaves those sessions with no container and no note.
+  it('a stop that throws fails closed', async () => {
     const runtime = fakeRuntime([container('nanoclaw-v2-a-1', 'wg-a'), container('nanoclaw-v2-b-1', 'wg-b')], {
       failStopOf: 'nanoclaw-v2-b-1',
     });
 
-    const error: unknown = await quiesceWorkgroupsForBootMountChange(['wg-a', 'wg-b'], runtime).then(
-      () => null,
-      (err: unknown) => err,
+    await expect(quiesceWorkgroupsForBootMountChange(['wg-a', 'wg-b'], runtime)).rejects.toThrow(
+      /prove install-scoped container absence: failed to stop nanoclaw-v2-b-1/,
     );
 
-    expect(error).toBeInstanceOf(BootQuiescencePartialStopError);
-    const partial = error as BootQuiescencePartialStopError;
-    expect(partial.message).toMatch(/failed to stop nanoclaw-v2-b-1/);
-    expect(partial.stoppedNames).toEqual(['nanoclaw-v2-a-1']);
-    expect(spawns).toEqual([]);
-  });
-
-  it('a listing failure carries no stopped names', async () => {
-    const error = await quiesceWorkgroupsForBootMountChange(['wg-a'], {
-      list: () => {
-        throw new Error('Cannot prove install-scoped container absence: runtime listing failed');
-      },
-      stop: () => undefined,
-    }).then(
-      () => null,
-      (err: unknown) => err,
-    );
-
-    // Nothing was interrupted, so the caller must NOT write an accountability
-    // note — a false "your container was stopped" is its own bug.
-    expect(error).not.toBeInstanceOf(BootQuiescencePartialStopError);
-    expect(spawns).toEqual([]);
-  });
-
-  it('a post-stop listing failure carries the names it already stopped', async () => {
-    // Docker going away AFTER the stops is still a failure with real
-    // casualties: those sessions lost their container, and the caller has to
-    // announce it. A plain Error here would look identical to "nothing was
-    // touched" and the accountability note would be skipped.
-    const runtime = fakeRuntime([container('nanoclaw-v2-a-1', 'wg-a'), container('nanoclaw-v2-b-1', 'wg-b')], {
-      failListCall: 2,
-    });
-
-    const error: unknown = await quiesceWorkgroupsForBootMountChange(['wg-a', 'wg-b'], runtime).then(
-      () => null,
-      (err: unknown) => err,
-    );
-
-    expect(error).toBeInstanceOf(BootQuiescencePartialStopError);
-    const partial = error as BootQuiescencePartialStopError;
-    expect(partial.message).toMatch(/prove install-scoped container absence: post-stop runtime listing failed/);
-    expect(partial.stoppedNames).toEqual(['nanoclaw-v2-a-1', 'nanoclaw-v2-b-1']);
+    expect(runtime.stops).toEqual(['nanoclaw-v2-a-1']);
     expect(log.info).not.toHaveBeenCalledWith('Boot quiescence scope', expect.anything());
     expect(spawns).toEqual([]);
   });
 
-  it('a proof failure carries the names it already stopped', async () => {
-    const runtime = fakeRuntime([container('nanoclaw-v2-a-1', 'wg-a')], { stubborn: ['nanoclaw-v2-a-1'] });
+  it('a post-stop listing failure fails closed', async () => {
+    // Docker going away AFTER the stops is not "none running" either. The
+    // accountability note for those sessions was already written before this
+    // door ran (src/main.ts), so the door has nothing to hand back — it just
+    // has to refuse to report quiescence.
+    const runtime = fakeRuntime([container('nanoclaw-v2-a-1', 'wg-a'), container('nanoclaw-v2-b-1', 'wg-b')], {
+      failListCall: 2,
+    });
 
-    const error: unknown = await quiesceWorkgroupsForBootMountChange(['wg-a'], runtime).then(
-      () => null,
-      (err: unknown) => err,
+    await expect(quiesceWorkgroupsForBootMountChange(['wg-a', 'wg-b'], runtime)).rejects.toThrow(
+      /prove install-scoped container absence/,
     );
 
-    expect(error).toBeInstanceOf(BootQuiescencePartialStopError);
-    expect((error as BootQuiescencePartialStopError).stoppedNames).toEqual(['nanoclaw-v2-a-1']);
+    expect(runtime.stops).toEqual(['nanoclaw-v2-a-1', 'nanoclaw-v2-b-1']);
+    expect(log.info).not.toHaveBeenCalledWith('Boot quiescence scope', expect.anything());
+    expect(spawns).toEqual([]);
+  });
+
+  it('the partition names the survivors seam-4 E and G will consume', async () => {
+    // The counts are what an operator reads; the ids are what the later series
+    // act on. They have to agree, and the partition has to be exact — every
+    // container is on one side or the other.
+    const runtime = fakeRuntime([
+      container('nanoclaw-v2-a-1', 'wg-a'), // changed workgroup  → must stop
+      container('nanoclaw-v2-b-1', 'wg-b'), // unchanged          → survivable
+      container('nanoclaw-v2-c-1', 'wg-c'), // unchanged          → survivable
+      container('nanoclaw-v2-legacy-1', null), // no workgroup    → must stop
+      // A workgroup label but NO session label: adoption could never claim it,
+      // so leaving it running under D2 would leak it. Fail closed.
+      { name: 'nanoclaw-v2-nosession-1', workgroupId: 'wg-b', sessionId: null, groupId: 'g' },
+    ]);
+
+    const scope = await quiesceWorkgroupsForBootMountChange(['wg-a'], { ...runtime, workgroupsTotal: 4 });
+
+    expect(scope.survivableSessionIds).toEqual(['nanoclaw-v2-b-1-session', 'nanoclaw-v2-c-1-session']);
+    expect(scope.survivable).toBe(scope.survivableSessionIds.length);
+    expect(scope.mustStopSessionIds).toEqual(['nanoclaw-v2-a-1-session', 'nanoclaw-v2-legacy-1-session']);
+    // The session-less container is in must-stop and contributes no id, so the
+    // two arrays are one short of `containers` by exactly that container.
+    expect(scope.containers).toBe(5);
+    expect(scope.survivableSessionIds.length + scope.mustStopSessionIds.length).toBe(scope.containers - 1);
+    // …and it was stopped all the same.
+    expect(runtime.stops).toContain('nanoclaw-v2-nosession-1');
     expect(spawns).toEqual([]);
   });
 
@@ -296,18 +302,21 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
       container('nanoclaw-v2-legacy-1', null),
     ]);
 
-    await quiesceWorkgroupsForBootMountChange(['wg-a', 'wg-c'], runtime);
+    await quiesceWorkgroupsForBootMountChange(['wg-a', 'wg-c'], { ...runtime, workgroupsTotal: 5 });
 
     const scopeLines = (log.info as unknown as { mock: { calls: unknown[][] } }).mock.calls.filter(
       (call) => call[0] === 'Boot quiescence scope',
     );
     expect(scopeLines).toHaveLength(1);
+    // Plan §6's measurement shape in full: `changed` is only readable against
+    // the total the predicates were asked about.
     expect(scopeLines[0][1]).toEqual({
+      workgroups: 5,
+      changed: 2,
       containers: 3,
       stopped: 3,
       survivable: 1,
       unlabeled: 1,
-      changed: 2,
       mustStop: 2,
     });
     expect(spawns).toEqual([]);

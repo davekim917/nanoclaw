@@ -207,7 +207,10 @@ it('test_startup_runs_strict_quiescence_before_any_memory_cutover', async () => 
     }),
   ).rejects.toThrow('listing unavailable');
 
-  expect(calls).toEqual(['quiescence']);
+  // The accountability note is written BEFORE the door touches anything, so a
+  // door that cannot prove its scope still leaves it written — and nothing
+  // below the door ran.
+  expect(calls).toEqual(['warn', 'quiescence']);
   db.close();
 });
 
@@ -220,9 +223,18 @@ it('runs reconciliation only after runtime and strict absence proof succeed', as
     memoryWouldChange: () => true,
     sharedWouldChange: () => false,
     sharedFsEnabled: true,
-    quiesce: () => {
+    quiesce: (_changed, options) => {
       calls.push('quiescence');
-      return Promise.resolve({ containers: 0, stopped: 0, survivable: 0, unlabeled: 0 });
+      expect(options.workgroupsTotal).toBe(1);
+      return Promise.resolve({
+        workgroups: 0,
+        containers: 0,
+        stopped: 0,
+        survivable: 0,
+        unlabeled: 0,
+        survivableSessionIds: [],
+        mustStopSessionIds: [],
+      });
     },
     warnStartup: async () => {
       calls.push('warn');
@@ -240,7 +252,7 @@ it('runs reconciliation only after runtime and strict absence proof succeed', as
     },
   });
 
-  expect(calls).toEqual(['quiescence', 'warn', 'reconcile-shared', 'reconcile-memory', 'prune']);
+  expect(calls).toEqual(['warn', 'quiescence', 'reconcile-shared', 'reconcile-memory', 'prune']);
   db.close();
 });
 

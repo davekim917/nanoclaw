@@ -31,11 +31,7 @@ import { warnActiveContainersOfShutdown, warnMarkedRunningSessionsOfStartup } fr
 import { resetPhantomContainerStatus } from './db/sessions.js';
 import { resetProcessingChannelIngress } from './db/channel-ingress-receipts.js';
 import { getActiveContainerSessionIds, stopAllContainers } from './container-runner.js';
-import {
-  BootQuiescencePartialStopError,
-  quiesceWorkgroupsForBootMountChange,
-  type BootQuiescenceScope,
-} from './container-restart.js';
+import { quiesceWorkgroupsForBootMountChange, type BootQuiescenceScope } from './container-restart.js';
 import { writeUpstreamPolicySnapshot } from './container-updates.js';
 import { setDeliveryAdapter, startActiveDeliveryPoll, startSweepDeliveryPoll, stopDeliveryPolls } from './delivery.js';
 import { getHostInstanceId, startHostInstanceLease, stopHostInstanceLease } from './host-instance.js';
@@ -194,7 +190,7 @@ export interface BootMountQuiescenceDeps {
   memoryWouldChange?: (db: Database.Database, workgroupId: string) => boolean;
   sharedWouldChange?: (db: Database.Database, workgroupId: string) => boolean;
   sharedFsEnabled?: boolean;
-  quiesce?: (changedWorkgroupIds: string[]) => Promise<BootQuiescenceScope>;
+  quiesce?: (changedWorkgroupIds: string[], options: { workgroupsTotal: number }) => Promise<BootQuiescenceScope>;
   warnStartup?: (reason: string, skipSessionIds: ReadonlySet<string>) => Promise<void>;
   reconcileShared?: (db: Database.Database, dirs: { workgroupIds?: string[] }) => void;
   memoryGate?: (db: Database.Database, opts: { mutateWorkgroupIds?: string[] }) => WorkgroupMemoryReport[];
@@ -239,14 +235,20 @@ function bootFatal(message: string, err: unknown): never {
  * asserted in src/boot-quiescence-order.test.ts:
  *
  *   1. compute which workgroups a startup reconcile would actually change;
- *   2. quiesce — the ONLY thing that stops containers at boot, and it throws
+ *   2. warn sessions still marked 'running' by an unclean previous host —
+ *      BEFORE anything is stopped, which is where `main()` has always had it;
+ *   3. quiesce — the ONLY thing that stops containers at boot, and it throws
  *      before anything below runs if it cannot prove its scope is down;
- *   3. warn sessions still marked 'running' by an unclean previous host;
  *   4. shared-FS consolidation, scoped to the changed set. It used to run
  *      BEFORE the quiescence proof (plan §3.5, divergence 4), masked only by
  *      the flag defaulting off;
  *   5. canonical-memory cutover, scoped to the same set;
  *   6. snapshot pruning, after both cutovers.
+ *
+ * Steps 2 and 3 are swapped relative to §7.D's listed order, deliberately: the
+ * plan's order writes the accountability note after the stops, so a door that
+ * fails part way through them would leave the sessions it already killed with
+ * no note at all. Warning first is what `main()` did before this PR.
  *
  * D1 measures: `quiesceWorkgroupsForBootMountChange` still stops the whole
  * install regardless of the scope it computes, so this boot behaves exactly
@@ -267,37 +269,31 @@ export async function runBootMountQuiescence(
   const sharedWouldChange = deps.sharedWouldChange ?? sharedDirsReconcileWouldChange;
   const fatal = deps.fatal ?? bootFatal;
 
-  const changedWorkgroupIds = listWorkgroupIds(db).filter(
+  const allWorkgroupIds = listWorkgroupIds(db);
+  const changedWorkgroupIds = allWorkgroupIds.filter(
     (id) => memoryWouldChange(db, id) || (sharedFsEnabled && sharedWouldChange(db, id)),
   );
 
-  // Warn sessions still marked 'running' (unclean previous host) that their
-  // containers have been stopped — the on_wake note makes the next spawn
-  // account publicly instead of the session going dark until a human pings.
-  const warnStopped = async (): Promise<void> => {
-    try {
-      await (deps.warnStartup ?? warnMarkedRunningSessionsOfStartup)('host startup after an unclean stop');
-    } catch (err) {
-      log.error('host-restart startup warn failed', { err });
-    }
-  };
-
-  let scope: BootQuiescenceScope;
+  // Warn FIRST, before anything is stopped. `main()` has always captured this
+  // evidence ahead of the fleet-wide stop (the warn sat above the memory gate
+  // that held `cleanupOrphansStrict`), and it has to stay there: the note is
+  // written from the session rows an unclean previous host left marked
+  // 'running', and a door that dies half way through its stops would otherwise
+  // leave the sessions it did kill with no accountability at all. §7.D's
+  // listed order puts the warn after the door; that regresses this, so the
+  // order here is main's, not the plan's — recorded as a deviation.
   try {
-    scope = await (deps.quiesce ?? quiesceWorkgroupsForBootMountChange)(changedWorkgroupIds);
-  } catch (quiesceErr) {
-    // A door that fails PART WAY through has already killed containers. Those
-    // sessions lost their turn exactly as they would have on a clean pass, so
-    // they get the same accountability note before the failure propagates.
-    // A door that failed before stopping anything gets no note: nothing was
-    // interrupted, and a false "your container was stopped" is its own bug.
-    if (quiesceErr instanceof BootQuiescencePartialStopError && quiesceErr.stoppedNames.length > 0) {
-      await warnStopped();
-    }
-    throw quiesceErr;
+    await (deps.warnStartup ?? warnMarkedRunningSessionsOfStartup)(
+      'host startup after an unclean stop',
+      BOOT_WARN_SKIP_SESSION_IDS,
+    );
+  } catch (err) {
+    log.error('host-restart startup warn failed', { err });
   }
 
-  await warnStopped();
+  const scope = await (deps.quiesce ?? quiesceWorkgroupsForBootMountChange)(changedWorkgroupIds, {
+    workgroupsTotal: allWorkgroupIds.length,
+  });
 
   // Workgroup shared-FS consolidation — flag-gated (NANOCLAW_WORKGROUP_SHARED_FS,
   // default off). Moves each workgroup's shared dirs into data/workgroups/<id>/

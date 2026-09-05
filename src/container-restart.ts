@@ -478,46 +478,57 @@ export async function quiesceSessionsForRepositoryMounts(
   }
 }
 
-/** Counts from one boot quiescence pass — the §6 `Boot quiescence scope` line. */
+/**
+ * One boot quiescence pass: the §6 `Boot quiescence scope` counts, plus the
+ * partition the later series consume.
+ *
+ * The arrays are the consumer contract, not decoration. Seam-4 E adopts the
+ * survivors by session id, and seam-4 G skips the host-restart warn for
+ * exactly those sessions; both need the identity, not the count. D1 still
+ * stops everything, so under D1 they are measurement — `survivableSessionIds`
+ * is the milestone-1 counterfactual named session by session.
+ */
 export interface BootQuiescenceScope {
+  /** Workgroups the predicates were asked about — the §6 denominator. */
+  workgroups: number;
   /** Install-labeled containers the runtime reported. */
   containers: number;
   /** Containers this pass actually stopped. */
   stopped: number;
   /**
-   * Containers that carry a workgroup label outside the changed set — the ones
-   * milestone 1 will leave running once D2 flips the stop set. D1 stops them
-   * anyway; this count is the counterfactual the flip is measured against.
+   * Containers that carry a workgroup AND a session label, whose workgroup is
+   * outside the changed set — the ones milestone 1 will leave running once D2
+   * flips the stop set. D1 stops them anyway.
    */
   survivable: number;
   /** Containers carrying no workgroup label: unknown scope, always stopped. */
   unlabeled: number;
-}
-
-/** Injection seam for the boot door's runtime access — real docker by default. */
-export interface BootQuiescenceRuntime {
-  list?: () => InstallContainerScope[];
-  stop?: (name: string) => void;
+  /** Session ids of the survivable containers. Length equals `survivable`. */
+  survivableSessionIds: string[];
+  /**
+   * Session ids of the containers that must be stopped whatever D2 does.
+   *
+   * A container with no session label is in the must-stop partition but
+   * contributes no id here — it is stopped by name, and there is no session to
+   * hand to adoption. That is the fail-closed direction: an unidentifiable
+   * container is never survivable.
+   */
+  mustStopSessionIds: string[];
 }
 
 /**
- * A boot-door failure that happened AFTER at least one container was stopped.
- *
- * The names matter to the caller, not to the message: those sessions have lost
- * their container, and the host-restart accountability note is written after
- * the door returns. Without this the caller cannot tell "the listing failed and
- * nothing was touched" from "half the fleet is down and the proof failed", and
- * the second case would leave those sessions dark with no note
- * (docs/specs/upstream-restart-survival-seam/plan.md §7.D, property 4).
+ * The boot door's second argument: the measurement context plus the runtime
+ * seam. `list`/`stop` default to real docker; tests inject fakes.
  */
-export class BootQuiescencePartialStopError extends Error {
-  readonly stoppedNames: string[];
-
-  constructor(message: string, stoppedNames: string[], options?: ErrorOptions) {
-    super(message, options);
-    this.name = 'BootQuiescencePartialStopError';
-    this.stoppedNames = stoppedNames;
-  }
+export interface BootQuiescenceOptions {
+  /**
+   * How many workgroups this boot inspected — the `workgroups` field of the
+   * §6 `Boot quiescence scope` line, and the denominator `changed` is read
+   * against. The boot block always supplies it (src/main.ts).
+   */
+  workgroupsTotal?: number;
+  list?: () => InstallContainerScope[];
+  stop?: (name: string) => void;
 }
 
 /**
@@ -545,30 +556,34 @@ export class BootQuiescencePartialStopError extends Error {
  */
 export async function quiesceWorkgroupsForBootMountChange(
   changedWorkgroupIds: string[],
-  runtime: BootQuiescenceRuntime = {},
+  options: BootQuiescenceOptions = {},
 ): Promise<BootQuiescenceScope> {
-  const list = runtime.list ?? listInstallContainersWithScope;
-  const stop = runtime.stop ?? stopContainer;
+  const list = options.list ?? listInstallContainersWithScope;
+  const stop = options.stop ?? stopContainer;
   const changed = new Set(changedWorkgroupIds);
 
   const containers = list();
   const unlabeled = containers.filter((entry) => entry.workgroupId === null);
-  const mustStop = containers.filter((entry) => entry.workgroupId === null || changed.has(entry.workgroupId));
-  const survivable = containers.filter((entry) => entry.workgroupId !== null && !changed.has(entry.workgroupId));
+  // The partition is exact: every container is in one side or the other.
+  //
+  // A container is survivable only if it can be IDENTIFIED — a workgroup label
+  // outside the changed set AND a session label. A missing workgroup label is
+  // unknown scope (plan §3.5, divergence 7); a missing session label is a
+  // container adoption could never claim, so leaving it running under D2 would
+  // leak it. Both fail closed into must-stop.
+  const survivable = containers.filter(
+    (entry) => entry.workgroupId !== null && entry.sessionId !== null && !changed.has(entry.workgroupId),
+  );
+  const survivableNames = new Set(survivable.map((entry) => entry.name));
+  const mustStop = containers.filter((entry) => !survivableNames.has(entry.name));
 
   // D1: the stop set is the whole install. D2 replaces this with `mustStop`.
   const stopSet = containers;
-  const stopped: string[] = [];
   for (const entry of stopSet) {
     try {
       stop(entry.name);
-      stopped.push(entry.name);
     } catch (err) {
-      throw new BootQuiescencePartialStopError(
-        `Cannot prove install-scoped container absence: failed to stop ${entry.name}`,
-        stopped,
-        { cause: err },
-      );
+      throw new Error(`Cannot prove install-scoped container absence: failed to stop ${entry.name}`, { cause: err });
     }
   }
 
@@ -584,37 +599,38 @@ export async function quiesceWorkgroupsForBootMountChange(
   // (null workgroup, or a workgroup in `changed`) — never from the first
   // listing's names, for the same reason.
   //
-  // Every failure from here down carries `stopped`: once a container is gone
-  // its session lost its turn, and the caller must write the accountability
-  // note whether the pass failed on the stop, on this listing, or on the proof
-  // itself. A listing that throws is not "none running" — that is the whole
-  // fail-closed contract — but it is also not "nothing was interrupted".
-  let remaining: InstallContainerScope[];
-  try {
-    remaining = list();
-  } catch (err) {
-    throw new BootQuiescencePartialStopError(
-      'Cannot prove install-scoped container absence: post-stop runtime listing failed',
-      stopped,
-      { cause: err },
-    );
-  }
+  // Nothing here has to carry which containers it managed to stop: the caller
+  // writes the host-restart accountability note BEFORE this door runs, so a
+  // failure at any point leaves that note already written for every session
+  // that was marked running (src/main.ts, `runBootMountQuiescence`).
+  const remaining = list();
   if (remaining.length > 0) {
-    throw new BootQuiescencePartialStopError(
+    throw new Error(
       `Install-scoped containers still running after boot quiescence: ${remaining.map((e) => e.name).join(', ')}`,
-      stopped,
     );
   }
 
   const scope: BootQuiescenceScope = {
+    workgroups: options.workgroupsTotal ?? changedWorkgroupIds.length,
     containers: containers.length,
     stopped: stopSet.length,
     survivable: survivable.length,
     unlabeled: unlabeled.length,
+    survivableSessionIds: survivable.map((entry) => entry.sessionId as string),
+    mustStopSessionIds: mustStop
+      .map((entry) => entry.sessionId)
+      .filter((sessionId): sessionId is string => sessionId !== null),
   };
+  // Plan §6's measurement shape, in its order. The session-id arrays stay out
+  // of the line: they are the consumer contract for E and G, and a boot with a
+  // large fleet would bury the counts an operator reads.
   log.info('Boot quiescence scope', {
-    ...scope,
+    workgroups: scope.workgroups,
     changed: changedWorkgroupIds.length,
+    containers: scope.containers,
+    stopped: scope.stopped,
+    survivable: scope.survivable,
+    unlabeled: scope.unlabeled,
     // `mustStop` is what D2 will stop; under D1 it is a subset of `stopped`.
     mustStop: mustStop.length,
   });
