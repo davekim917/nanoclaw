@@ -152,18 +152,59 @@ describe('upstream dry-run owner notification', () => {
     );
   });
 
-  it('surfaces a socket timeout when a connection never completes', async () => {
+  it('times out while a socket connection never completes', async () => {
     const socket = new EventEmitter() as EventEmitter & { destroy: () => void; write: () => void };
     socket.destroy = vi.fn();
     socket.write = vi.fn();
 
-    await expect(
-      submitOwnerReport(
-        { socketPath: 'pending.sock', dm: testDm(), report: 'report', timeoutMs: 1 },
+    vi.useFakeTimers();
+    try {
+      const submission = submitOwnerReport(
+        { socketPath: 'pending.sock', dm: testDm(), report: 'report', connectionTimeoutMs: 5_000 },
         () => socket as unknown as net.Socket,
-      ),
-    ).rejects.toThrow(/timed out/);
-    expect(socket.destroy).toHaveBeenCalledOnce();
+      );
+      const rejected = expect(submission).rejects.toThrow(/timed out.*before submitting/);
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      await rejected;
+      expect(socket.destroy).toHaveBeenCalledOnce();
+      socket.emit('connect');
+      expect(socket.write).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('waits beyond the connection timeout for a delivery acknowledgement', async () => {
+    const socket = new EventEmitter() as EventEmitter & {
+      destroy: () => void;
+      write: (payload: string, callback: (err?: Error | null) => void) => void;
+    };
+    let requestId = '';
+    socket.destroy = vi.fn();
+    socket.write = (payload, callback) => {
+      requestId = (JSON.parse(payload) as { id: string }).id;
+      callback();
+    };
+
+    vi.useFakeTimers();
+    try {
+      const submission = submitOwnerReport(
+        { socketPath: 'delayed.sock', dm: testDm(), report: 'report', connectionTimeoutMs: 5_000 },
+        () => socket as unknown as net.Socket,
+      );
+      socket.emit('connect');
+      await vi.advanceTimersByTimeAsync(5_001);
+      expect(socket.destroy).not.toHaveBeenCalled();
+
+      socket.emit(
+        'data',
+        Buffer.from(JSON.stringify({ id: requestId, ok: true, data: { delivered: delivery() } }) + '\n'),
+      );
+      await expect(submission).resolves.toEqual(delivery());
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('surfaces a socket error reported by the write callback', async () => {
@@ -257,7 +298,7 @@ describe('upstream dry-run owner notification', () => {
     await expect(submission).rejects.toThrow(/delivery rejected/);
   });
 
-  it('rejects a closed connection before an acknowledgement', async () => {
+  it('reports an unknown delivery outcome when the connection closes after submission', async () => {
     const socket = new EventEmitter() as EventEmitter & {
       destroy: () => void;
       write: (payload: string, callback: (err?: Error | null) => void) => void;
@@ -274,7 +315,27 @@ describe('upstream dry-run owner notification', () => {
     );
     socket.emit('connect');
 
-    await expect(submission).rejects.toThrow(/closed before acknowledging/);
+    await expect(submission).rejects.toThrow(/closed after submitting.*outcome is unknown/);
+  });
+
+  it('reports an unknown delivery outcome when the socket errors after submission', async () => {
+    const socket = new EventEmitter() as EventEmitter & {
+      destroy: () => void;
+      write: (payload: string, callback: (err?: Error | null) => void) => void;
+    };
+    socket.destroy = vi.fn();
+    socket.write = (_payload, callback) => {
+      callback();
+      socket.emit('error', new Error('connection lost'));
+    };
+
+    const submission = submitOwnerReport(
+      { socketPath: 'errored.sock', dm: testDm(), report: 'report' },
+      () => socket as unknown as net.Socket,
+    );
+    socket.emit('connect');
+
+    await expect(submission).rejects.toThrow(/errored after submitting.*outcome is unknown.*connection lost/);
   });
 
   it('keeps the default invocation stdout-only without opening the DB or socket', async () => {

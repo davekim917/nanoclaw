@@ -19,7 +19,7 @@ import { fileURLToPath } from 'node:url';
 import { generateDryRunReport } from '../src/upstream-dry-run-report.js';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const NCL_SOCKET_TIMEOUT_MS = 5_000;
+const NCL_SOCKET_CONNECT_TIMEOUT_MS = 5_000;
 
 export interface OwnerDm {
   messagingGroupId: string;
@@ -101,8 +101,8 @@ export async function submitOwnerReport(
     socketPath,
     dm,
     report,
-    timeoutMs = NCL_SOCKET_TIMEOUT_MS,
-  }: { socketPath: string; dm: OwnerDm; report: string; timeoutMs?: number },
+    connectionTimeoutMs = NCL_SOCKET_CONNECT_TIMEOUT_MS,
+  }: { socketPath: string; dm: OwnerDm; report: string; connectionTimeoutMs?: number },
   connectSocket: SocketConnector = (target) => net.createConnection(target),
 ): Promise<DeliveryResult> {
   const requestId = randomUUID();
@@ -115,11 +115,12 @@ export async function submitOwnerReport(
   return new Promise<DeliveryResult>((resolve, reject) => {
     let socket: net.Socket | undefined;
     let settled = false;
+    let submitted = false;
     let buffer = '';
     const settle = (result?: DeliveryResult, err?: Error): void => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      clearTimeout(connectionTimer);
       socket?.destroy();
       if (err) {
         reject(err);
@@ -128,29 +129,37 @@ export async function submitOwnerReport(
       }
     };
 
-    const timer = setTimeout(
+    const connectionTimer = setTimeout(
       () =>
         settle(
           undefined,
-          new Error(`CLI socket at ${socketPath} timed out after ${timeoutMs}ms while submitting the weekly report.`),
+          new Error(
+            `CLI socket at ${socketPath} timed out after ${connectionTimeoutMs}ms while connecting, before submitting the weekly report.`,
+          ),
         ),
-      timeoutMs,
+      connectionTimeoutMs,
     );
 
     try {
       socket = connectSocket(socketPath);
     } catch (err) {
       if (!(err instanceof Error)) throw err;
-      settle(undefined, new Error(`CLI socket at ${socketPath} submission failed: ${err.message}`));
+      settle(undefined, new Error(`CLI socket at ${socketPath} submission failed before connecting: ${err.message}`));
       return;
     }
 
-    socket.once('error', (err) =>
-      settle(undefined, new Error(`CLI socket at ${socketPath} submission failed: ${err.message}`)),
-    );
+    socket.once('error', (err) => {
+      const phase = submitted
+        ? `errored after submitting the weekly report; delivery outcome is unknown: ${err.message}`
+        : `submission failed before submitting the weekly report: ${err.message}`;
+      settle(undefined, new Error(`CLI socket at ${socketPath} ${phase}`));
+    });
     socket.once('close', () => {
       if (!settled) {
-        settle(undefined, new Error(`CLI socket at ${socketPath} closed before acknowledging the weekly report.`));
+        const phase = submitted
+          ? 'closed after submitting the weekly report; delivery outcome is unknown.'
+          : 'closed before submitting the weekly report.';
+        settle(undefined, new Error(`CLI socket at ${socketPath} ${phase}`));
       }
     });
     socket.on('data', (chunk) => {
@@ -173,9 +182,17 @@ export async function submitOwnerReport(
       }
     });
     socket.once('connect', () => {
+      if (settled) return;
+      clearTimeout(connectionTimer);
+      submitted = true;
       socket.write(payload + '\n', (err?: Error | null) => {
         if (err) {
-          settle(undefined, new Error(`CLI socket at ${socketPath} submission failed: ${err.message}`));
+          settle(
+            undefined,
+            new Error(
+              `CLI socket at ${socketPath} write failed after submitting the weekly report; delivery outcome is unknown: ${err.message}`,
+            ),
+          );
           return;
         }
       });
