@@ -38,9 +38,22 @@
  * signature.
  */
 
-/** True for the driver error that means "another writer won this unique key". */
+/**
+ * True for the driver error that means "another writer won this unique key".
+ *
+ * `SQLITE_CONSTRAINT_PRIMARYKEY` counts too, not just `_UNIQUE`: a natural
+ * key backed directly by a TEXT PRIMARY KEY (e.g. `users.id`) fails the
+ * losing concurrent INSERT with the PRIMARYKEY code, not UNIQUE — SQLite
+ * only raises `_UNIQUE` for a separate `UNIQUE` constraint/index, and the
+ * PRIMARY KEY itself is exactly such an index by another name. Missing this
+ * meant `insertOrAdopt` rethrew instead of adopting for any PRIMARY KEY
+ * natural key (github Codex review, PR #437, src/cli/crud.ts:294 — `users`
+ * declares `naturalKey: ['id']`).
+ */
 export function isUniqueViolation(err: unknown): boolean {
-  return typeof err === 'object' && err !== null && (err as { code?: unknown }).code === 'SQLITE_CONSTRAINT_UNIQUE';
+  if (typeof err !== 'object' || err === null) return false;
+  const code = (err as { code?: unknown }).code;
+  return code === 'SQLITE_CONSTRAINT_UNIQUE' || code === 'SQLITE_CONSTRAINT_PRIMARYKEY';
 }
 
 /**

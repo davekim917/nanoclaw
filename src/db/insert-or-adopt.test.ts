@@ -10,8 +10,9 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { closeDb, getDb, getRawDb, initTestDb } from './connection.js';
 import { insertOrAdopt, isUniqueViolation } from './insert-or-adopt.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -40,6 +41,56 @@ describe('insertOrAdopt', () => {
     expect(reload).toHaveBeenCalledTimes(1);
   });
 
+  it('adopts the winner with created=false on a PRIMARY KEY violation', async () => {
+    // A natural key backed directly by a TEXT PRIMARY KEY (e.g. `users.id`)
+    // fails the losing INSERT with SQLITE_CONSTRAINT_PRIMARYKEY, not _UNIQUE —
+    // github Codex review, PR #437, src/cli/crud.ts:294.
+    const winner = { id: 'winner' };
+    const insert = vi.fn().mockRejectedValue({ code: 'SQLITE_CONSTRAINT_PRIMARYKEY' });
+    const reload = vi.fn().mockResolvedValue(winner);
+
+    const result = await insertOrAdopt({ id: 'loser' }, insert, reload);
+
+    expect(result).toEqual({ row: winner, created: false });
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  describe('against a real TEXT PRIMARY KEY table', () => {
+    // Same shape as the mocked case above, but through the real driver and a
+    // real schema — the mocked test only proves insertOrAdopt's own branching
+    // is correct; this proves better-sqlite3 actually raises
+    // SQLITE_CONSTRAINT_PRIMARYKEY (not _UNIQUE) for this exact constraint
+    // shape, which is the fact the fix depends on.
+    beforeEach(async () => {
+      await initTestDb();
+      getRawDb().exec('CREATE TABLE pk_race (id TEXT PRIMARY KEY, val TEXT NOT NULL)');
+    });
+
+    afterEach(async () => {
+      await closeDb();
+    });
+
+    it('two overlapping inserts for the same id: one creates, one adopts', async () => {
+      const reload = () => getDb().get<{ id: string; val: string }>('SELECT id, val FROM pk_race WHERE id = ?', 'r1');
+      const insertRow = (row: { id: string; val: string }) =>
+        getDb().run('INSERT INTO pk_race (id, val) VALUES (?, ?)', row.id, row.val).then(() => undefined);
+
+      // The first insert lands normally.
+      const first = await insertOrAdopt({ id: 'r1', val: 'from-first' }, insertRow, reload);
+      expect(first).toEqual({ row: { id: 'r1', val: 'from-first' }, created: true });
+
+      // A second caller racing for the same natural key sees the PRIMARYKEY
+      // violation on its own INSERT and adopts the first caller's row instead
+      // of throwing.
+      const second = await insertOrAdopt({ id: 'r1', val: 'from-second' }, insertRow, reload);
+      expect(second).toEqual({ row: { id: 'r1', val: 'from-first' }, created: false });
+
+      // Exactly one row persisted, with the winner's value.
+      const rows = await getDb().get<{ count: number }>('SELECT COUNT(*) as count FROM pk_race');
+      expect(rows?.count).toBe(1);
+    });
+  });
+
   it('rethrows the ORIGINAL unique violation when reload finds no winner', async () => {
     // The constraint that fired is not the one `reload` looks up — a real bug,
     // and swallowing it would return a row nobody created.
@@ -62,8 +113,9 @@ describe('insertOrAdopt', () => {
 });
 
 describe('isUniqueViolation', () => {
-  it('accepts only the driver code', () => {
+  it('accepts the UNIQUE and PRIMARYKEY driver codes, nothing else', () => {
     expect(isUniqueViolation({ code: 'SQLITE_CONSTRAINT_UNIQUE' })).toBe(true);
+    expect(isUniqueViolation({ code: 'SQLITE_CONSTRAINT_PRIMARYKEY' })).toBe(true);
     expect(isUniqueViolation({ code: 'SQLITE_CONSTRAINT_FOREIGNKEY' })).toBe(false);
     expect(isUniqueViolation(new Error('UNIQUE constraint failed'))).toBe(false);
     expect(isUniqueViolation(null)).toBe(false);
