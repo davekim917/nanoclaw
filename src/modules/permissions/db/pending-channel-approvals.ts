@@ -79,6 +79,19 @@ export async function updatePendingChannelApprovalCard(
   );
 }
 
-export async function deletePendingChannelApproval(messagingGroupId: string): Promise<void> {
-  await getDb().run('DELETE FROM pending_channel_approvals WHERE messaging_group_id = ?', messagingGroupId);
+/**
+ * Delete the row, and say whether THIS caller is the one that deleted it.
+ *
+ * The twin of `deletePendingSenderApproval`'s claim, for the same reason: the
+ * click handler resolves the card across several awaits, so two callbacks for
+ * one card can both reach the branch that wires the channel and admits the
+ * sender. SQLite applies the DELETE once, so exactly one caller sees
+ * `changes === 1`. See `handleChannelApprovalResponse` in ../index.ts.
+ */
+export async function deletePendingChannelApproval(messagingGroupId: string): Promise<boolean> {
+  const info = await getDb().run(
+    'DELETE FROM pending_channel_approvals WHERE messaging_group_id = ?',
+    messagingGroupId,
+  );
+  return info.changes > 0;
 }

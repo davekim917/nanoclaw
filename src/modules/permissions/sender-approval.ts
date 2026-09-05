@@ -43,12 +43,11 @@ import type { InboundEvent } from '../../channels/adapter.js';
 import { pickApprovalDelivery, pickApprover } from '../approvals/primitive.js';
 import { AGENT_ACCESS_SCOPE_WARNING } from './channel-approval.js';
 import {
+  claimDeclineStamp,
   clearDeclineStamp,
   createPendingSenderApproval,
-  getDeclineStampAt,
   getInFlightSenderApproval,
   isDeclineStampId,
-  upsertDeclineStamp,
 } from './db/pending-sender-approvals.js';
 import { getAdminsOfAgentGroup, getGlobalAdmins, getOwners } from './db/user-roles.js';
 import { getUser } from './db/users.js';
@@ -307,11 +306,6 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
   // Dedupe: at most one decline + FYI per (sender, messaging group) per 24h,
   // or per (conversation) when the caller supplies its own key.
   const senderKey = input.dedupeKey ?? senderIdentity ?? UNKNOWN_SENDER_KEY;
-  const stampedAt = await getDeclineStampAt(messagingGroupId, senderKey);
-  if (stampedAt && Date.now() - new Date(stampedAt).getTime() < DECLINE_NOTIFY_DEDUPE_MS) {
-    log.debug('decline_notify deduped — declined within the last 24h', { messagingGroupId, senderIdentity });
-    return;
-  }
 
   const adapter = getDeliveryAdapter();
   if (!adapter) {
@@ -330,10 +324,32 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
     // that event is the only thing that can resolve its ingress receipt. The
     // first message left the receipt `deferred` (a card was pending); if we
     // overwrite without closing it, the receipt stays falsely deferred until
-    // the 7-day prune with nothing left to resolve it. Close it first, and
-    // only for a real card row — a stamp being refreshed has no receipt of
-    // its own, and its body is the sentinel, not an event.
+    // the 7-day prune with nothing left to resolve it. Read it BEFORE the
+    // claim below overwrites it, and close it only for a real card row and
+    // only if we go on to win — a stamp being refreshed has no receipt of its
+    // own, and its body is the sentinel, not an event.
     const existing = await getInFlightSenderApproval(messagingGroupId, senderKey);
+
+    // The dedupe decision and the stamp are ONE statement (issue #443, Codex
+    // round 1). Reading the stamp first and writing it after is the async
+    // read-then-write race: the read yields, two overlapping declines both
+    // conclude the 24h window has expired, and the sender gets refused twice
+    // while the owner gets two FYIs. `claimDeclineStamp` folds the freshness
+    // test into the upsert's conflict clause, so exactly one caller comes back
+    // true and only that caller sends.
+    const claimed = await claimDeclineStamp(
+      {
+        messaging_group_id: messagingGroupId,
+        agent_group_id: stampAgentGroupId,
+        sender_identity: senderKey,
+      },
+      new Date(Date.now() - DECLINE_NOTIFY_DEDUPE_MS).toISOString(),
+    );
+    if (!claimed) {
+      log.debug('decline_notify deduped — declined within the last 24h', { messagingGroupId, senderIdentity });
+      return;
+    }
+
     if (existing && !isDeclineStampId(existing.id)) {
       try {
         completeDeferredInbound(JSON.parse(existing.original_message) as InboundEvent);
@@ -345,12 +361,10 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
         });
       }
     }
-    await upsertDeclineStamp({
-      messaging_group_id: messagingGroupId,
-      agent_group_id: stampAgentGroupId,
-      sender_identity: senderKey,
-    });
   } else {
+    // No agent group means no stamp and therefore no claim: unchanged from
+    // before this fix, a rare bootstrap state where the decline still goes out
+    // and nothing dedupes it.
     log.debug('decline_notify stamp skipped — no agent groups exist', { messagingGroupId });
   }
 

@@ -370,17 +370,47 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
   // card there is a legitimate explicit grant, and that behavior predates
   // this policy.
   const currentMg = getMessagingGroup(row.messaging_group_id);
-  if (currentMg?.unknown_sender_policy === 'decline_notify') {
+  const voidedByPolicyFlip = currentMg?.unknown_sender_policy === 'decline_notify';
+
+  // ── Claim the card before acting on it (issue #443, Codex round 1) ──
+  //
+  // `getPendingSenderApproval` above is awaited, so it yields. Two callbacks
+  // for the SAME card — an adapter retry, a double-click — can therefore both
+  // find the row live, and every branch below ends in an effect that must not
+  // happen twice: the approve branch replays the retained message
+  // (`replayDeferredInbound`), which is a real second delivery to the agent,
+  // and the deny and policy-flip branches each close out the deferred inbound.
+  //
+  // The DELETE is the arbiter rather than a lock: SQLite applies it once, so
+  // exactly one caller sees `changes === 1`. The loser returns `true` — the
+  // response IS claimed, by the winner, so reporting it unclaimed would be
+  // wrong — and does nothing else.
+  //
+  // It also has to happen HERE, before the approve branch's `addMember`, and
+  // that is the same ordering the pre-seam code already needed for a different
+  // reason: the row must be gone before `replayDeferredInbound` runs, or the
+  // second routing attempt sees an in-flight row and short-circuits.
+  const claimed = await deletePendingSenderApproval(row.id);
+  if (!claimed) {
+    log.debug('Unknown-sender approval click ignored — another callback already resolved this card', {
+      approvalId: row.id,
+      clickerId,
+    });
+    return true;
+  }
+
+  // The card is only actionable while the group still runs the flow that
+  // issued it — see the comment above the policy read.
+  if (voidedByPolicyFlip) {
     log.warn('Unknown-sender approval click rejected — group switched to decline_notify', {
       approvalId: row.id,
       senderIdentity: row.sender_identity,
       messagingGroupId: row.messaging_group_id,
       clickerId,
     });
-    // Void the card the same way a deny does: drop the row (and with it the
-    // retained message body) and close out the deferred inbound so it does
-    // not sit unresolved.
-    await deletePendingSenderApproval(row.id);
+    // Void the card the same way a deny does: the row (and with it the
+    // retained message body) is already dropped by the claim above; close out
+    // the deferred inbound so it does not sit unresolved.
     completeStoredDeferredInbound(row.original_message);
     return true;
   }
@@ -402,10 +432,6 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
       approverId,
     });
 
-    // Clear the pending row BEFORE re-routing so the gate check on the
-    // second attempt doesn't see the in-flight row and short-circuit.
-    await deletePendingSenderApproval(row.id);
-
     try {
       const event = JSON.parse(row.original_message) as InboundEvent;
       await replayDeferredInbound(event);
@@ -421,7 +447,6 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
     agentGroupId: row.agent_group_id,
     approverId,
   });
-  await deletePendingSenderApproval(row.id);
   completeStoredDeferredInbound(row.original_message);
   return true;
 }
@@ -462,6 +487,21 @@ async function wireApprovedChannel(
     return false;
   }
 
+  // Claim the card before any write. This is the terminal branch — it creates
+  // the wiring, admits the sender and replays the retained message — and the
+  // caller reached it across several awaits, so a duplicate callback can be
+  // here too. Every individual effect below is already idempotent or
+  // self-claiming (`insertOrAdopt` on the wiring, INSERT OR IGNORE on the
+  // member, `replayDeferredInbound`'s own receipt claim), so the claim is the
+  // belt rather than the only guard — but it means the log lines and the
+  // approver's confirmation reflect one act, not two.
+  if (!(await deletePendingChannelApproval(row.messaging_group_id))) {
+    log.debug('Channel registration: another callback already wired this channel', {
+      messagingGroupId: row.messaging_group_id,
+    });
+    return false;
+  }
+
   const mg = getMessagingGroup(row.messaging_group_id);
   const isGroup = event.message.isGroup ?? mg?.is_group === 1;
   const agentGroupName = (await getAgentGroup(agentGroupId))?.name ?? '';
@@ -481,7 +521,6 @@ async function wireApprovedChannel(
       messagingGroupId: row.messaging_group_id,
       err,
     });
-    await deletePendingChannelApproval(row.messaging_group_id);
     completeDeferredInbound(event);
     return false;
   }
@@ -534,8 +573,6 @@ async function wireApprovedChannel(
       added_at: new Date().toISOString(),
     });
   }
-
-  await deletePendingChannelApproval(row.messaging_group_id);
 
   try {
     await replayDeferredInbound(event);
@@ -590,8 +627,12 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
 
   // ── Reject / Cancel ──
   if (payload.value === REJECT_VALUE) {
+    // Claim before acting, same rule as the sender card: this branch is
+    // terminal, so a duplicate callback must not run it twice. The
+    // intermediate branches below (choose_existing, new_agent) deliberately do
+    // NOT claim — they leave the card live for a second click by design.
+    if (!(await deletePendingChannelApproval(row.messaging_group_id))) return true;
     await setMessagingGroupDeniedAt(row.messaging_group_id, new Date().toISOString());
-    await deletePendingChannelApproval(row.messaging_group_id);
     completeStoredDeferredInbound(row.original_message);
     log.info('Channel registration denied', {
       messagingGroupId: row.messaging_group_id,

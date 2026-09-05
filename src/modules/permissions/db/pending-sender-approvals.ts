@@ -62,8 +62,20 @@ export async function getInFlightSenderApproval(
   );
 }
 
-export async function deletePendingSenderApproval(id: string): Promise<void> {
-  await getDb().run('DELETE FROM pending_sender_approvals WHERE id = ?', id);
+/**
+ * Delete the row, and say whether THIS caller is the one that deleted it.
+ *
+ * The boolean is the claim. Under the async driver the click handler's
+ * `getPendingSenderApproval` read yields, so two callbacks for one card (an
+ * adapter retry, a double-click) can both find the row live and both act on
+ * it — and "act" ends in `replayDeferredInbound`, so the retained message
+ * would be delivered twice. This DELETE is the arbiter: SQLite applies it
+ * once, exactly one caller sees `changes === 1`, and only that caller
+ * proceeds. See `handleSenderApprovalResponse` in ../index.ts.
+ */
+export async function deletePendingSenderApproval(id: string): Promise<boolean> {
+  const info = await getDb().run('DELETE FROM pending_sender_approvals WHERE id = ?', id);
+  return info.changes > 0;
 }
 
 // ── Decline stamps (decline_notify dedupe) ──
@@ -117,18 +129,27 @@ export async function getDeclineStampAt(messagingGroupId: string, senderIdentity
 }
 
 /**
- * Record (or refresh) the decline stamp. `agent_group_id` must reference a
- * real agent group (FK). title / question / options_json keep their column
- * defaults, so `getAskQuestionRender` can never build a clickable card out of
- * a stamp; `sender_name` and `original_message` are deliberately not taken
- * from the caller — the dedupe key and the timestamp are the whole record.
+ * Freshness check and stamp write as ONE statement, returning whether this
+ * caller won.
+ *
+ * `declineAndNotify` used to read `getDeclineStampAt`, decide the window had
+ * expired, and only then write the stamp. Under the async driver that read
+ * yields, so two overlapping declines both saw "no fresh stamp" and both sent
+ * — a decline plus an owner FYI, twice, to someone we are in the middle of
+ * refusing. The conflict clause below is the arbiter instead: the upsert
+ * applies only when the existing row is NOT a fresh decline stamp, so exactly
+ * one caller gets `changes === 1` and sends.
+ *
+ * The two rows it must still overwrite, both deliberate and both preserved:
+ * a stale stamp (past the dedupe window) is refreshed, and a real card row is
+ * converted into a stamp, because a group that has flipped to decline_notify
+ * no longer cards. Only a FRESH stamp blocks.
  */
-export async function upsertDeclineStamp(stamp: {
-  messaging_group_id: string;
-  agent_group_id: string;
-  sender_identity: string;
-}): Promise<void> {
-  await getDb().run(
+export async function claimDeclineStamp(
+  stamp: { messaging_group_id: string; agent_group_id: string; sender_identity: string },
+  freshSince: string,
+): Promise<boolean> {
+  const info = await getDb().run(
     `INSERT INTO pending_sender_approvals (
          id, messaging_group_id, agent_group_id, sender_identity,
          sender_name, original_message, approver_user_id, created_at
@@ -145,16 +166,18 @@ export async function upsertDeclineStamp(stamp: {
          approver_user_id = excluded.approver_user_id,
          title = excluded.title,
          question = excluded.question,
-         options_json = excluded.options_json`,
+         options_json = excluded.options_json
+       WHERE pending_sender_approvals.id NOT LIKE '${DECLINE_STAMP_ID_PREFIX}%'
+          OR datetime(pending_sender_approvals.created_at) <= datetime(@freshSince)`,
     {
       id: `${DECLINE_STAMP_ID_PREFIX}${stamp.messaging_group_id}:${stamp.sender_identity}`,
       ...stamp,
-      // Overwrites a converted card row's retained body too, so flipping a
-      // messaging group to decline_notify drops the pending card's content.
       original_message: DECLINE_STAMP_BODY,
       created_at: new Date().toISOString(),
+      freshSince,
     },
   );
+  return info.changes > 0;
 }
 
 /** Remove any decline stamp for this pair — real card rows are untouched. */
