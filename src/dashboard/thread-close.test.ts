@@ -288,7 +288,9 @@ describe('requestThreadClose', () => {
     expect(row.reason).toBe('shipped');
     expect(row.agent_proposed).toBe(0);
     expect(new Set(JSON.parse(row.session_ids) as string[])).toEqual(new Set(['s1', 's2']));
-    expect(readThreadClosures(['slack:C1:1.1']).get('slack:C1:1.1')).toMatchObject({ state: 'awaiting_confirmation' });
+    expect((await readThreadClosures(['slack:C1:1.1'])).get('slack:C1:1.1')).toMatchObject({
+      state: 'awaiting_confirmation',
+    });
   });
 
   /**

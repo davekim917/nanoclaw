@@ -26,8 +26,8 @@ afterEach(async () => {
 });
 
 describe('dashboard_tokens DAO', () => {
-  it('test_issueDashboardToken_creates_row', () => {
-    const record = issueDashboardToken('u1', 'hmac-abc', 24);
+  it('test_issueDashboardToken_creates_row', async () => {
+    const record = await issueDashboardToken('u1', 'hmac-abc', 24);
     expect(record.user_id).toBe('u1');
     expect(record.token_hmac).toBe('hmac-abc');
     expect(record.used_at).toBeNull();
@@ -40,14 +40,14 @@ describe('dashboard_tokens DAO', () => {
     expect(row?.used_at).toBeNull();
   });
 
-  it('test_issueDashboardToken_duplicate_hmac_throws', () => {
-    issueDashboardToken('u1', 'hmac-abc', 24);
-    expect(() => issueDashboardToken('u2', 'hmac-abc', 24)).toThrow();
+  it('test_issueDashboardToken_duplicate_hmac_throws', async () => {
+    await issueDashboardToken('u1', 'hmac-abc', 24);
+    await expect(issueDashboardToken('u2', 'hmac-abc', 24)).rejects.toThrow();
   });
 
-  it('test_consumeDashboardToken_valid', () => {
-    issueDashboardToken('u1', 'hmac-x', 24);
-    const record = consumeDashboardToken('hmac-x');
+  it('test_consumeDashboardToken_valid', async () => {
+    await issueDashboardToken('u1', 'hmac-x', 24);
+    const record = await consumeDashboardToken('hmac-x');
     expect(record).not.toBeNull();
     expect(record!.user_id).toBe('u1');
     expect(record!.used_at).not.toBeNull();
@@ -58,29 +58,32 @@ describe('dashboard_tokens DAO', () => {
     expect(row?.used_at).not.toBeNull();
   });
 
-  it('test_consumeDashboardToken_already_used', () => {
-    issueDashboardToken('u1', 'hmac-y', 24);
-    consumeDashboardToken('hmac-y');
-    const second = consumeDashboardToken('hmac-y');
+  it('test_consumeDashboardToken_already_used', async () => {
+    await issueDashboardToken('u1', 'hmac-y', 24);
+    await consumeDashboardToken('hmac-y');
+    const second = await consumeDashboardToken('hmac-y');
     expect(second).toBeNull();
   });
 
-  it('test_consumeDashboardToken_expired', () => {
+  it('test_consumeDashboardToken_expired', async () => {
     getRawDb()
       .prepare(
         `INSERT INTO dashboard_tokens (user_id, token_hmac, issued_at, expires_at)
          VALUES ('u1', 'hmac-z', datetime('now', '-25 hours'), datetime('now', '-1 hour'))`,
       )
       .run();
-    const result = consumeDashboardToken('hmac-z');
+    const result = await consumeDashboardToken('hmac-z');
     expect(result).toBeNull();
   });
 
-  it('test_consumeDashboardToken_concurrent_safety', () => {
-    issueDashboardToken('u1', 'hmac-c', 24);
-    // better-sqlite3 is synchronous; two sequential calls simulate concurrent attempts
-    const r1 = consumeDashboardToken('hmac-c');
-    const r2 = consumeDashboardToken('hmac-c');
+  it('test_consumeDashboardToken_concurrent_safety', async () => {
+    await issueDashboardToken('u1', 'hmac-c', 24);
+    // The driver serializes non-transactional statements onto one connection
+    // (no driver transaction opens here — seam 3 §4.1), so two sequential
+    // awaits still simulate concurrent attempts the same way the original
+    // synchronous calls did.
+    const r1 = await consumeDashboardToken('hmac-c');
+    const r2 = await consumeDashboardToken('hmac-c');
     const successes = [r1, r2].filter((r) => r !== null);
     expect(successes).toHaveLength(1);
   });

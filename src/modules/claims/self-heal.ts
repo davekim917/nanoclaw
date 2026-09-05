@@ -684,7 +684,7 @@ export async function wiredCandidates(workgroupId: string, threadId: string): Pr
          JOIN agent_groups ag ON ag.id = mga.agent_group_id
         WHERE ag.workgroup_id = ? AND mg.platform_id = ?`,
     )
-    .all(workgroupId, threadPlatformId(threadId)) as WiredCandidate[];
+    .all(workgroupId, await threadPlatformId(threadId)) as WiredCandidate[];
 }
 
 /**

@@ -1,4 +1,4 @@
-import { getRawDb, hasTableRaw } from '../../db/connection.js';
+import { getDb, hasTable } from '../../db/connection.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
 import { log } from '../../log.js';
 import { registerResource } from '../crud.js';
@@ -6,7 +6,7 @@ import { registerResource } from '../crud.js';
 /**
  * Project the agent's central `agent_destinations` rows into every active
  * session's `inbound.db`. The agent-to-agent module is optional, so we guard
- * on `hasTableRaw('agent_destinations')` and load `writeDestinations` lazily —
+ * on `hasTable(getDb(), 'agent_destinations')` and load `writeDestinations` lazily —
  * same pattern as container-runner.ts on container wake.
  *
  * Called from every destination-mutating ncl command — `add` and `remove`
@@ -18,7 +18,7 @@ import { registerResource } from '../crud.js';
  * src/modules/agent-to-agent/db/agent-destinations.ts.
  */
 export async function projectDestinationsToSessions(agentGroupId: string): Promise<void> {
-  if (!hasTableRaw(getRawDb(), 'agent_destinations')) return;
+  if (!(await hasTable(getDb(), 'agent_destinations'))) return;
   const { writeDestinations } = await import('../../modules/agent-to-agent/write-destinations.js');
   for (const session of await getSessionsByAgentGroup(agentGroupId)) {
     try {
@@ -74,23 +74,22 @@ registerResource({
         const params: unknown[] = [];
         const where = agentGroupId ? 'WHERE ad.agent_group_id = ?' : '';
         if (agentGroupId) params.push(agentGroupId);
-        return getRawDb()
-          .prepare(
-            `SELECT
-               ad.agent_group_id,
-               ad.local_name,
-               ad.target_type,
-               ad.target_id,
-               CASE WHEN ad.target_type = 'channel' THEN mg.channel_type ELSE NULL END AS channel_type,
-               CASE WHEN ad.target_type = 'channel' THEN mg.name ELSE ag.name END AS display_name,
-               ad.created_at
-             FROM agent_destinations ad
-             LEFT JOIN messaging_groups mg ON ad.target_type = 'channel' AND ad.target_id = mg.id
-             LEFT JOIN agent_groups ag ON ad.target_type = 'agent' AND ad.target_id = ag.id
-             ${where}
-             ORDER BY ad.agent_group_id, ad.local_name`,
-          )
-          .all(...params);
+        return getDb().all(
+          `SELECT
+             ad.agent_group_id,
+             ad.local_name,
+             ad.target_type,
+             ad.target_id,
+             CASE WHEN ad.target_type = 'channel' THEN mg.channel_type ELSE NULL END AS channel_type,
+             CASE WHEN ad.target_type = 'channel' THEN mg.name ELSE ag.name END AS display_name,
+             ad.created_at
+           FROM agent_destinations ad
+           LEFT JOIN messaging_groups mg ON ad.target_type = 'channel' AND ad.target_id = mg.id
+           LEFT JOIN agent_groups ag ON ad.target_type = 'agent' AND ad.target_id = ag.id
+           ${where}
+           ORDER BY ad.agent_group_id, ad.local_name`,
+          ...params,
+        );
       },
     },
     add: {
@@ -107,12 +106,15 @@ registerResource({
           throw new Error('--target-type must be channel or agent');
         }
         if (!targetId) throw new Error('--target-id is required');
-        getRawDb()
-          .prepare(
-            `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
-             VALUES (?, ?, ?, ?, ?)`,
-          )
-          .run(agentGroupId, localName, targetType, targetId, new Date().toISOString());
+        await getDb().run(
+          `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
+           VALUES (?, ?, ?, ?, ?)`,
+          agentGroupId,
+          localName,
+          targetType,
+          targetId,
+          new Date().toISOString(),
+        );
         await projectDestinationsToSessions(agentGroupId);
         return { agent_group_id: agentGroupId, local_name: localName, target_type: targetType, target_id: targetId };
       },
@@ -125,9 +127,11 @@ registerResource({
         const localName = args.local_name as string;
         if (!agentGroupId) throw new Error('--agent-group-id is required');
         if (!localName) throw new Error('--local-name is required');
-        const result = getRawDb()
-          .prepare('DELETE FROM agent_destinations WHERE agent_group_id = ? AND local_name = ?')
-          .run(agentGroupId, localName);
+        const result = await getDb().run(
+          'DELETE FROM agent_destinations WHERE agent_group_id = ? AND local_name = ?',
+          agentGroupId,
+          localName,
+        );
         if (result.changes === 0) throw new Error('destination not found');
         await projectDestinationsToSessions(agentGroupId);
         return { removed: { agent_group_id: agentGroupId, local_name: localName } };

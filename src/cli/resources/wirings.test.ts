@@ -37,12 +37,14 @@ vi.mock('../../db/messaging-groups.js', async (importOriginal) => {
 
 import type { ChannelDefaults } from '../../channels/adapter.js';
 import { registerChannelAdapter } from '../../channels/channel-registry.js';
+import { validateEngageAgainstChannel } from '../../channels/channel-defaults.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from '../../db/index.js';
 import { getRawDb } from '../../db/connection.js';
 import {
   createMessagingGroupAgent,
   ensureAgentDestinationForWiring,
   getMessagingGroupAgent,
+  getMessagingGroup,
 } from '../../db/messaging-groups.js';
 import { lookup } from '../registry.js';
 // Side-effect import: registers wirings-create / wirings-update.
@@ -85,6 +87,10 @@ async function create(args: Record<string, unknown>) {
 
 async function update(args: Record<string, unknown>) {
   return (await lookup('wirings-update')!.handler(args, hostCtx)) as Record<string, unknown>;
+}
+
+async function del(args: Record<string, unknown>) {
+  return lookup('wirings-delete')!.handler(args, hostCtx);
 }
 
 beforeEach(async () => {
@@ -256,6 +262,95 @@ describe('wirings-update — same validation as create', () => {
     // But actually changing the pattern fields to an invalid combination
     // still rejects.
     await expect(update({ id: 'mga-legacy', engage_pattern: '' })).rejects.toThrow(/--engage-pattern/);
+  });
+
+  // github Codex review, PR #437 (src/cli/crud.ts:336): genericUpdate's
+  // preUpdate hook validates `updates` merged against a snapshot of the row
+  // read moments earlier. Under the async driver that read-then-write is no
+  // longer one synchronous step, so two concurrent updates that are each
+  // individually valid against the SAME stale snapshot could previously both
+  // write, landing a combination neither one's own validation allowed.
+  it('two concurrent updates, each valid against the stale row, never land an invalid combination', async () => {
+    // mode='mention' with a pattern already stored (harmless — the pattern
+    // column is simply unused while mode isn't 'pattern') on an undeclared
+    // channel, so no adapter-declaration logic complicates the race.
+    createMessagingGroupAgent({
+      id: 'mga-race',
+      messaging_group_id: 'mg-stale',
+      agent_group_id: 'ag-1',
+      engage_mode: 'mention',
+      engage_pattern: 'somepattern',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      default_model: null,
+      default_effort: null,
+      default_tone: null,
+      instructions_profile: null,
+      created_at: now(),
+    });
+
+    // A: mode -> 'pattern' alone — valid against the stale row because its
+    // pattern column is still 'somepattern'.
+    // B: pattern -> '' (clear) alone — valid against the stale row because
+    // its mode column is still 'mention' (pattern is unused there).
+    // Naively applying both would leave mode='pattern' with an empty
+    // pattern — invalid, and neither update's own validation would have
+    // allowed it.
+    const results = await Promise.allSettled([
+      update({ id: 'mga-race', engage_mode: 'pattern' }),
+      update({ id: 'mga-race', engage_pattern: '' }),
+    ]);
+
+    const fulfilled = results.filter((r) => r.status === 'fulfilled');
+    const rejected = results.filter((r) => r.status === 'rejected') as PromiseRejectedResult[];
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0].reason).toMatchObject({ message: expect.stringMatching(/--engage-pattern/) });
+
+    // Whichever update landed, the persisted row is a combination the same
+    // validator accepts — re-running it must not throw.
+    const persisted = (await getMessagingGroupAgent('mga-race'))!;
+    const mg = getMessagingGroup('mg-stale')!;
+    expect(() =>
+      validateEngageAgainstChannel(
+        { engage_mode: persisted.engage_mode, engage_pattern: persisted.engage_pattern, threads: persisted.threads },
+        mg,
+      ),
+    ).not.toThrow();
+  });
+
+  // github Codex review, PR #437, src/cli/crud.ts:377 (fourth and final round
+  // on this race class): genericUpdate used to reload the row with a SEPARATE
+  // `getDb().get` SELECT after the UPDATE landed. That reload is itself an
+  // awaited step, so a concurrent delete of the same row in the gap between
+  // "the UPDATE committed" and "the reload ran" made the reload find nothing
+  // — the handler returned `undefined`, which the dispatcher reports as
+  // `{ ok: true }` with no row, not the documented not-found error.
+  it('an update overlapping a delete of the same wiring reports not-found, never ok with no row', async () => {
+    const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1' });
+
+    const [updateResult, deleteResult] = await Promise.allSettled([
+      update({ id: row.id, threads: 'true' }),
+      del({ id: row.id }),
+    ]);
+
+    // Whichever ran second sees the other's effect: either the update ran
+    // first and its own row is what gets deleted (delete fulfills, update
+    // fulfills with real data), or the delete lands first/mid-flight and the
+    // update must refuse with the documented not-found error — it must NEVER
+    // resolve to `undefined`/a row-less success.
+    if (updateResult.status === 'fulfilled') {
+      expect(updateResult.value).toBeDefined();
+      expect((updateResult.value as { id: string }).id).toBe(row.id);
+    } else {
+      expect(updateResult.reason).toMatchObject({ message: expect.stringMatching(/not found/i) });
+    }
+    expect(deleteResult.status).toBe('fulfilled');
+
+    // The row is gone either way — the update never resurrects or half-applies.
+    expect(await getMessagingGroupAgent(row.id as string)).toBeUndefined();
   });
 });
 

@@ -220,7 +220,7 @@ describe('cli_request execution is at most once per request id', () => {
   it('a claim left executing by a host that died mid-command is answered, never re-run', async () => {
     // No release, no completion: what a SIGKILL between dispatch and the
     // ledger write leaves behind.
-    claimCliRequest(SESSION_ID, 'req-1', 'tasks-create');
+    await claimCliRequest(SESSION_ID, 'req-1', 'tasks-create');
 
     await attempt(true);
 
@@ -230,39 +230,39 @@ describe('cli_request execution is at most once per request id', () => {
     expect(frame.error.message).toMatch(/NOT run again/);
   });
 
-  it('scopes the ledger to the session, since request ids are only unique per session', () => {
-    expect(claimCliRequest('sess-a', 'req-1', 'tasks-create').state).toBe('fresh');
-    expect(claimCliRequest('sess-b', 'req-1', 'tasks-create').state).toBe('fresh');
-    expect(claimCliRequest('sess-a', 'req-1', 'tasks-create').state).toBe('executing');
+  it('scopes the ledger to the session, since request ids are only unique per session', async () => {
+    expect((await claimCliRequest('sess-a', 'req-1', 'tasks-create')).state).toBe('fresh');
+    expect((await claimCliRequest('sess-b', 'req-1', 'tasks-create')).state).toBe('fresh');
+    expect((await claimCliRequest('sess-a', 'req-1', 'tasks-create')).state).toBe('executing');
   });
 });
 
 describe('ledger mechanics', () => {
-  beforeEach(() => {
-    claimCliRequest(SESSION_ID, 'req-9', 'groups-list');
+  beforeEach(async () => {
+    await claimCliRequest(SESSION_ID, 'req-9', 'groups-list');
   });
 
-  it('completeCliRequest makes the next claim a done replay', () => {
-    completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: [1, 2] });
-    const claim = claimCliRequest(SESSION_ID, 'req-9', 'groups-list');
+  it('completeCliRequest makes the next claim a done replay', async () => {
+    await completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: [1, 2] });
+    const claim = await claimCliRequest(SESSION_ID, 'req-9', 'groups-list');
     expect(claim).toEqual({ state: 'done', response: { id: 'req-9', ok: true, data: [1, 2] } });
   });
 
-  it('completeCliRequest never overwrites a recorded outcome', () => {
-    completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 'first' });
-    completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 'second' });
-    const claim = claimCliRequest(SESSION_ID, 'req-9', 'groups-list');
+  it('completeCliRequest never overwrites a recorded outcome', async () => {
+    await completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 'first' });
+    await completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 'second' });
+    const claim = await claimCliRequest(SESSION_ID, 'req-9', 'groups-list');
     expect(claim).toEqual({ state: 'done', response: { id: 'req-9', ok: true, data: 'first' } });
   });
 
-  it('an unparseable stored frame reports ambiguity rather than re-running the command', () => {
+  it('an unparseable stored frame reports ambiguity rather than re-running the command', async () => {
     getRawDb()
       .prepare(`UPDATE cli_request_executions SET status = 'done', response = 'not json' WHERE request_id = 'req-9'`)
       .run();
-    expect(claimCliRequest(SESSION_ID, 'req-9', 'groups-list').state).toBe('executing');
+    expect((await claimCliRequest(SESSION_ID, 'req-9', 'groups-list')).state).toBe('executing');
   });
 
-  it('prune keeps an aged claim that nothing has superseded — age alone is not terminal', () => {
+  it('prune keeps an aged claim that nothing has superseded — age alone is not terminal', async () => {
     // A host that restarts mid-retry resets the delivery loop's attempt
     // counter, so an hours-old undelivered outbound row is still retryable.
     // Dropping its claim on a clock would let the command run twice.
@@ -273,13 +273,13 @@ describe('ledger mechanics', () => {
     expect(requestIds()).toEqual(['req-9']);
   });
 
-  it('prune drops a claim a newer completed request from the same session has superseded', () => {
+  it('prune drops a claim a newer completed request from the same session has superseded', async () => {
     // `drainSession` breaks on the first failed row, so a later row could only
     // be delivered once this one reached delivered-or-dropped.
-    completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 1 });
+    await completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 1 });
     age('req-9', '2026-09-01T00:00:00.000Z');
-    claimCliRequest(SESSION_ID, 'req-10', 'groups-list');
-    completeCliRequest(SESSION_ID, 'req-10', { id: 'req-10', ok: true, data: 2 });
+    await claimCliRequest(SESSION_ID, 'req-10', 'groups-list');
+    await completeCliRequest(SESSION_ID, 'req-10', { id: 'req-10', ok: true, data: 2 });
     age('req-10', '2026-09-02T00:00:00.000Z');
 
     pruneCliRequestExecutions();
@@ -287,7 +287,7 @@ describe('ledger mechanics', () => {
     expect(requestIds()).toEqual(['req-10']);
   });
 
-  it('supersession survives a backward clock step — insertion order wins, not claimed_at', () => {
+  it('supersession survives a backward clock step — insertion order wins, not claimed_at', async () => {
     // Codex review round 11: a host restart followed by an NTP correction can
     // hand a chronologically LATER claim an EARLIER `claimed_at` than the row
     // before it. req-10 is inserted (and completed) strictly after req-9, but
@@ -295,10 +295,10 @@ describe('ledger mechanics', () => {
     // "newer" test used claimed_at, req-9 would incorrectly survive as
     // unsuperseded — reopening the at-most-once hole this table exists to
     // close. It must use insertion order (rowid) instead.
-    completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 1 });
+    await completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 1 });
     age('req-9', '2026-09-01T00:00:00.000Z');
-    claimCliRequest(SESSION_ID, 'req-10', 'groups-list');
-    completeCliRequest(SESSION_ID, 'req-10', { id: 'req-10', ok: true, data: 2 });
+    await claimCliRequest(SESSION_ID, 'req-10', 'groups-list');
+    await completeCliRequest(SESSION_ID, 'req-10', { id: 'req-10', ok: true, data: 2 });
     age('req-10', '1970-01-01T00:00:00.000Z'); // clock stepped backward after req-9
 
     pruneCliRequestExecutions();
@@ -310,27 +310,27 @@ describe('ledger mechanics', () => {
     expect(requestIds()).toEqual(['req-10']);
   });
 
-  it("prune never drops another session's claim, however new this session's requests are", () => {
-    completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 1 });
+  it("prune never drops another session's claim, however new this session's requests are", async () => {
+    await completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 1 });
     age('req-9', '2026-09-01T00:00:00.000Z');
-    claimCliRequest('other-session', 'req-8', 'groups-list');
-    completeCliRequest('other-session', 'req-8', { id: 'req-8', ok: true, data: 0 });
+    await claimCliRequest('other-session', 'req-8', 'groups-list');
+    await completeCliRequest('other-session', 'req-8', { id: 'req-8', ok: true, data: 0 });
     age('req-8', '2026-09-01T00:00:00.000Z');
-    claimCliRequest(SESSION_ID, 'req-10', 'groups-list');
-    completeCliRequest(SESSION_ID, 'req-10', { id: 'req-10', ok: true, data: 2 });
+    await claimCliRequest(SESSION_ID, 'req-10', 'groups-list');
+    await completeCliRequest(SESSION_ID, 'req-10', { id: 'req-10', ok: true, data: 2 });
 
     pruneCliRequestExecutions();
 
     expect(requestIds().sort()).toEqual(['req-10', 'req-8']);
   });
 
-  it('prune leaves a superseded claim alone inside the floor, and never drops an executing one', () => {
+  it('prune leaves a superseded claim alone inside the floor, and never drops an executing one', async () => {
     // Fresh rows are untouchable, and an `executing` claim is the one that most
     // needs to survive — it is the marker of a host that died mid-command.
-    completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 1 });
-    claimCliRequest(SESSION_ID, 'req-10', 'groups-list');
-    completeCliRequest(SESSION_ID, 'req-10', { id: 'req-10', ok: true, data: 2 });
-    claimCliRequest(SESSION_ID, 'req-11', 'groups-list'); // never completed
+    await completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 1 });
+    await claimCliRequest(SESSION_ID, 'req-10', 'groups-list');
+    await completeCliRequest(SESSION_ID, 'req-10', { id: 'req-10', ok: true, data: 2 });
+    await claimCliRequest(SESSION_ID, 'req-11', 'groups-list'); // never completed
     age('req-11', '2020-01-01T00:00:00.000Z');
 
     pruneCliRequestExecutions();
@@ -338,11 +338,11 @@ describe('ledger mechanics', () => {
     expect(requestIds().sort()).toEqual(['req-10', 'req-11', 'req-9']);
   });
 
-  it('deleting the session takes its claims with it — nothing is left to retry them', () => {
+  it('deleting the session takes its claims with it — nothing is left to retry them', async () => {
     // The newest claim per session has no age at which it expires, so session
     // teardown is the only thing that can clear it.
-    completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 1 });
-    claimCliRequest('survivor-session', 'req-8', 'groups-list');
+    await completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 1 });
+    await claimCliRequest('survivor-session', 'req-8', 'groups-list');
 
     deleteSession(SESSION_ID);
 
@@ -374,15 +374,15 @@ describe('ledger mechanics', () => {
     expect((await getDeliveryAttempt('out-survivor'))?.session_id).toBe('survivor-session');
   });
 
-  it('a week-old unsuperseded claim keeps the fact it ran and loses only its payload', () => {
-    completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 'stale' });
+  it('a week-old unsuperseded claim keeps the fact it ran and loses only its payload', async () => {
+    await completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 'stale' });
     age('req-9', '2020-01-01T00:00:00.000Z');
 
     pruneCliRequestExecutions();
 
     // Still refuses to re-run — a dropped payload downgrades a replay to the
     // ambiguous answer, it does not restore at-least-once.
-    expect(claimCliRequest(SESSION_ID, 'req-9', 'groups-list').state).toBe('executing');
+    expect((await claimCliRequest(SESSION_ID, 'req-9', 'groups-list')).state).toBe('executing');
     expect(requestIds()).toEqual(['req-9']);
   });
 });

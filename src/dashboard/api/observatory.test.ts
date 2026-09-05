@@ -295,14 +295,14 @@ describe('readReleaseState', () => {
     expect(scene.releaseState?.items[0]).toMatchObject({ id: 'X#1', nextMover: 'human' });
   });
 
-  it('is null when absent and skips an unparseable file without throwing', () => {
+  it('is null when absent and skips an unparseable file without throwing', async () => {
     addWorkgroup('wg-1');
     addGroup('ag-1', 'wg-1', 'ava', 'ava-folder');
-    expect(readReleaseState('wg-1', groupsDir({}))).toBeNull();
-    expect(readReleaseState('wg-1', groupsDir({ 'ava-folder/releases/release-state.json': '{nope' }))).toBeNull();
+    expect(await readReleaseState('wg-1', groupsDir({}))).toBeNull();
+    expect(await readReleaseState('wg-1', groupsDir({ 'ava-folder/releases/release-state.json': '{nope' }))).toBeNull();
   });
 
-  it('prefers the newest artifact when two member folders carry one', () => {
+  it('prefers the newest artifact when two member folders carry one', async () => {
     addWorkgroup('wg-1');
     addGroup('ag-1', 'wg-1', 'ava', 'ava-folder');
     addGroup('ag-2', 'wg-1', 'kit', 'kit-folder');
@@ -312,7 +312,7 @@ describe('readReleaseState', () => {
     });
     fs.utimesSync(path.join(dir, 'ava-folder/releases/release-state.json'), new Date(0), new Date(0));
 
-    expect(readReleaseState('wg-1', dir)?.asOf).toBe('new');
+    expect((await readReleaseState('wg-1', dir))?.asOf).toBe('new');
   });
 
   /* obs.C.33 — an item carries no thread of its own, so the board could not
@@ -854,7 +854,7 @@ describe('threadPermalink — multi-workspace adapter resolution', () => {
     vi.mocked(getChannelAdapter).mockImplementation(() => undefined);
   });
 
-  it('resolves through the workspace-specific channel_type the thread’s channel is wired to', () => {
+  it('resolves through the workspace-specific channel_type the thread’s channel is wired to', async () => {
     addMessagingGroup('mg-a', 'slack-acme-support', 'slack:C0AAA', '#dispatch');
 
     // Only the workspace-specific key is registered — the bare "slack" prefix
@@ -864,40 +864,40 @@ describe('threadPermalink — multi-workspace adapter resolution', () => {
       'slack-acme-support': { permalink: (p, t) => `https://acme.slack.com/archives/${p}/${t}` },
     });
 
-    expect(threadPermalink('slack:C0AAA:1786901676.029669')).toBe(
+    expect(await threadPermalink('slack:C0AAA:1786901676.029669')).toBe(
       'https://acme.slack.com/archives/slack:C0AAA/slack:C0AAA:1786901676.029669',
     );
   });
 
-  it('falls back to the bare platform prefix for a single-workspace install', () => {
+  it('falls back to the bare platform prefix for a single-workspace install', async () => {
     // No messaging_groups row for this channel at all — the prefix IS the key.
     registerAdapters({ slack: { permalink: () => 'https://one.slack.com/archives/C0BBB/p1786901676029669' } });
 
-    expect(threadPermalink('slack:C0BBB:1786901676.029669')).toBe(
+    expect(await threadPermalink('slack:C0BBB:1786901676.029669')).toBe(
       'https://one.slack.com/archives/C0BBB/p1786901676029669',
     );
   });
 
-  it('skips a sibling type whose adapter is offline and keeps trying the rest', () => {
+  it('skips a sibling type whose adapter is offline and keeps trying the rest', async () => {
     addMessagingGroup('mg-b1', 'slack-acme-alpha', 'slack:C0CCC', '#dispatch');
     addMessagingGroup('mg-b2', 'slack-acme-beta', 'slack:C0CCC', '#dispatch');
 
     // alpha sorts first but is not registered; beta must still answer.
     registerAdapters({ 'slack-acme-beta': { permalink: () => 'https://acme.slack.com/archives/C0CCC/p1' } });
 
-    expect(threadPermalink('slack:C0CCC:1786901676.029669')).toBe('https://acme.slack.com/archives/C0CCC/p1');
+    expect(await threadPermalink('slack:C0CCC:1786901676.029669')).toBe('https://acme.slack.com/archives/C0CCC/p1');
   });
 
-  it('returns null for a platform no adapter owns — including non-channel thread ids', () => {
+  it('returns null for a platform no adapter owns — including non-channel thread ids', async () => {
     registerAdapters({ 'slack-acme-support': { permalink: () => 'https://acme.slack.com/archives/x/p1' } });
 
     // A task thread id ('system:tasks:<slug>') is not a channel and must not
     // be talked into one.
-    expect(threadPermalink('system:tasks:nightly-sweep-f2ee')).toBeNull();
-    expect(threadPermalink('teams:19:meeting')).toBeNull();
+    expect(await threadPermalink('system:tasks:nightly-sweep-f2ee')).toBeNull();
+    expect(await threadPermalink('teams:19:meeting')).toBeNull();
   });
 
-  it('never throws when the owning adapter does', () => {
+  it('never throws when the owning adapter does', async () => {
     addMessagingGroup('mg-c', 'slack-acme-support', 'slack:C0DDD', '#dispatch');
     registerAdapters({
       'slack-acme-support': {
@@ -907,7 +907,7 @@ describe('threadPermalink — multi-workspace adapter resolution', () => {
       },
     });
 
-    expect(threadPermalink('slack:C0DDD:1786901676.029669')).toBeNull();
+    expect(await threadPermalink('slack:C0DDD:1786901676.029669')).toBeNull();
   });
 
   it('carries the resolved link onto every claim on the board', async () => {
@@ -1219,23 +1219,23 @@ describe('the scene carries signals additively', () => {
 });
 
 describe('threadPlatformId — the channel key, whatever shape the platform uses', () => {
-  it('resolves a Discord thread to its CHANNEL, not its guild', () => {
+  it('resolves a Discord thread to its CHANNEL, not its guild', async () => {
     // Discord keys a channel `discord:<guild>:<channel>` and its threads carry
     // a fourth segment. A fixed two-segment slice yielded `discord:<guild>`,
     // which matches no row, so every Discord thread resolved to nothing.
     addMessagingGroup('mg-d', 'discord', 'discord:guild-1:chan-1');
-    expect(threadPlatformId('discord:guild-1:chan-1:thread-1')).toBe('discord:guild-1:chan-1');
+    expect(await threadPlatformId('discord:guild-1:chan-1:thread-1')).toBe('discord:guild-1:chan-1');
   });
 
-  it('still resolves a Slack thread to its channel', () => {
+  it('still resolves a Slack thread to its channel', async () => {
     addMessagingGroup('mg-s', 'slack', 'slack:chan-1');
-    expect(threadPlatformId('slack:chan-1:ts-1')).toBe('slack:chan-1');
+    expect(await threadPlatformId('slack:chan-1:ts-1')).toBe('slack:chan-1');
   });
 
-  it('falls back to the two-segment key when nothing matches', () => {
+  it('falls back to the two-segment key when nothing matches', async () => {
     // A task session's thread has no channel at all, and callers JOIN on the
     // result — a miss has to stay a harmless miss rather than throw.
-    expect(threadPlatformId('system:tasks:example-series-0001')).toBe('system:tasks');
-    expect(threadPlatformId('slack:chan-unwired:ts-1')).toBe('slack:chan-unwired');
+    expect(await threadPlatformId('system:tasks:example-series-0001')).toBe('system:tasks');
+    expect(await threadPlatformId('slack:chan-unwired:ts-1')).toBe('slack:chan-unwired');
   });
 });

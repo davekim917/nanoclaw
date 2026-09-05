@@ -4,7 +4,7 @@ import { computeScopes } from '../auth/compute-scopes.js';
 
 export const authMeHandler: AuthHandler = async (_req, _params, ctx) => {
   const userId = ctx.user.id;
-  const scopes = computeScopes(userId);
+  const scopes = await computeScopes(userId);
 
   return new Response(JSON.stringify({ user_id: userId, scopes }), {
     status: 200,

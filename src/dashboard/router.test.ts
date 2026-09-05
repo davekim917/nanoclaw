@@ -6,11 +6,13 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // canAccessAgentGroup approach that was leaving scoped admins with empty groups).
 vi.mock('./auth/compute-scopes.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./auth/compute-scopes.js')>()),
-  computeScopes: vi.fn(() => ({
-    role: 'owner' as const,
-    allowed_group_ids: [],
-    no_filter: true,
-  })),
+  computeScopes: vi.fn(() =>
+    Promise.resolve({
+      role: 'owner' as const,
+      allowed_group_ids: [],
+      no_filter: true,
+    }),
+  ),
 }));
 
 // requireAuth resolves the real display_name for ctx.user via getUser (a DB call) —
@@ -48,7 +50,7 @@ function makeWebRequest(url: string, options: RequestInit = {}): Request {
 beforeEach(() => {
   clearCookieVerifier();
   vi.mocked(scopesMod.computeScopes).mockReset();
-  vi.mocked(scopesMod.computeScopes).mockReturnValue({
+  vi.mocked(scopesMod.computeScopes).mockResolvedValue({
     role: 'owner',
     allowed_group_ids: [],
     no_filter: true,

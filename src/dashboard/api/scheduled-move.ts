@@ -23,7 +23,7 @@ import { DATA_DIR, GROUPS_DIR } from '../../config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getWorkgroupOnecliSecrets } from '../../db/agent-groups.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
-import { getRawDb } from '../../db/connection.js';
+import { getDb, getRawDb } from '../../db/connection.js';
 import { findSystemSession, taskThreadId, withQuietInvalidationSync } from '../../db/sessions.js';
 import { readSessionInbound, type ScheduledTaskRow } from '../../modules/mailbox/index.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
@@ -162,10 +162,12 @@ export { computeSecretDelta };
  * an unwired pair means the move would route output to a chat the target agent
  * isn't authorized for.
  */
-function isWired(agentGroupId: string, messagingGroupId: string): boolean {
-  const row = getRawDb()
-    .prepare('SELECT 1 AS ok FROM messaging_group_agents WHERE agent_group_id = ? AND messaging_group_id = ?')
-    .get(agentGroupId, messagingGroupId) as { ok: number } | undefined;
+async function isWired(agentGroupId: string, messagingGroupId: string): Promise<boolean> {
+  const row = await getDb().get(
+    'SELECT 1 AS ok FROM messaging_group_agents WHERE agent_group_id = ? AND messaging_group_id = ?',
+    agentGroupId,
+    messagingGroupId,
+  );
   return !!row;
 }
 
@@ -297,7 +299,7 @@ export const movePreviewHandler: AuthHandler = async (req, params, ctx) => {
   if ('error' in resolved) return resolved.error;
   const { source, target } = resolved.ok;
 
-  const wiringOk = isWired(target.agentGroupId, target.messagingGroupId);
+  const wiringOk = await isWired(target.agentGroupId, target.messagingGroupId);
   const delta = computeSecretDelta(
     source.agentGroupId,
     source.folder,
@@ -470,6 +472,13 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
 
   const wasPaused = snapshot.status === 'paused';
   const correlationId = randomUUID();
+  // 5c deferral (seam 3, deployer call 2026-09-05): kept raw/sync here because
+  // it feeds writeAudit/purgeIntentBody (scheduled-shared.ts), which are also
+  // called from src/modules/sweep-scheduled-move/index.ts (PR 5b's file) —
+  // §4.2 cannot be honored split across two parallel PRs. A follow-up "5c" PR
+  // converts writeAudit/purgeIntentBody together with every caller (this
+  // file, scheduled-mutations.ts, cli/resources/tasks.ts, and the
+  // sweep-scheduled-move helpers) once 5a and 5b are both merged.
   const central = getRawDb();
 
   // Step 2b: durable move_intent BEFORE cancel (F2). Full snapshot in

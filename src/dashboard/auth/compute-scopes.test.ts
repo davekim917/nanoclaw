@@ -35,18 +35,18 @@ afterEach(async () => {
 });
 
 describe('computeScopes', () => {
-  it('test_computeScopes_no_roles_no_membership_locked_out', () => {
+  it('test_computeScopes_no_roles_no_membership_locked_out', async () => {
     seedUser('telegram:nobody');
-    expect(computeScopes('telegram:nobody')).toEqual({ role: 'member', allowed_group_ids: [], no_filter: false });
+    expect(await computeScopes('telegram:nobody')).toEqual({ role: 'member', allowed_group_ids: [], no_filter: false });
   });
 
-  it('test_computeScopes_owner_no_filter', () => {
+  it('test_computeScopes_owner_no_filter', async () => {
     seedUser('telegram:owner');
     grantRole({ user_id: 'telegram:owner', role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });
-    expect(computeScopes('telegram:owner')).toEqual({ role: 'owner', allowed_group_ids: [], no_filter: true });
+    expect(await computeScopes('telegram:owner')).toEqual({ role: 'owner', allowed_group_ids: [], no_filter: true });
   });
 
-  it('test_computeScopes_scoped_admin_unchanged', () => {
+  it('test_computeScopes_scoped_admin_unchanged', async () => {
     seedUser('telegram:admin');
     grantRole({
       user_id: 'telegram:admin',
@@ -55,33 +55,33 @@ describe('computeScopes', () => {
       granted_by: null,
       granted_at: now(),
     });
-    expect(computeScopes('telegram:admin')).toEqual({
+    expect(await computeScopes('telegram:admin')).toEqual({
       role: 'admin_of_group',
       allowed_group_ids: ['ag-1'],
       no_filter: false,
     });
   });
 
-  it('test_computeScopes_member_via_agent_group_members', () => {
+  it('test_computeScopes_member_via_agent_group_members', async () => {
     seedUser('telegram:member');
     addMember({ user_id: 'telegram:member', agent_group_id: 'ag-1', added_by: null, added_at: now() });
-    expect(computeScopes('telegram:member')).toEqual({
+    expect(await computeScopes('telegram:member')).toEqual({
       role: 'member',
       allowed_group_ids: ['ag-1'],
       no_filter: false,
     });
   });
 
-  it('test_computeScopes_member_scope_only_covers_their_own_groups', () => {
+  it('test_computeScopes_member_scope_only_covers_their_own_groups', async () => {
     seedUser('telegram:member');
     addMember({ user_id: 'telegram:member', agent_group_id: 'ag-1', added_by: null, added_at: now() });
     // ag-2 exists but the member was never added to it — must not leak in.
-    const scopes = computeScopes('telegram:member');
+    const scopes = await computeScopes('telegram:member');
     expect(scopes.allowed_group_ids).toEqual(['ag-1']);
     expect(scopes.allowed_group_ids).not.toContain('ag-2');
   });
 
-  it('test_computeScopes_member_unions_legacy_role_rows_and_agent_group_members', () => {
+  it('test_computeScopes_member_unions_legacy_role_rows_and_agent_group_members', async () => {
     seedUser('telegram:member');
     // Legacy path: a 'member' row directly in user_roles (dead-write path, kept for compat).
     getRawDb()
@@ -91,18 +91,18 @@ describe('computeScopes', () => {
       .run('telegram:member', 'member', 'ag-1', now());
     // Real grant path: agent_group_members, on a different group.
     addMember({ user_id: 'telegram:member', agent_group_id: 'ag-2', added_by: null, added_at: now() });
-    expect(computeScopes('telegram:member')).toEqual({
+    expect(await computeScopes('telegram:member')).toEqual({
       role: 'member',
       allowed_group_ids: ['ag-1', 'ag-2'],
       no_filter: false,
     });
   });
 
-  it('test_computeScopes_admin_and_global_admin_unaffected_by_membership_rows', () => {
+  it('test_computeScopes_admin_and_global_admin_unaffected_by_membership_rows', async () => {
     seedUser('telegram:owner');
     grantRole({ user_id: 'telegram:owner', role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });
     // Even with a membership row on top, owner behavior must stay byte-identical.
     addMember({ user_id: 'telegram:owner', agent_group_id: 'ag-1', added_by: null, added_at: now() });
-    expect(computeScopes('telegram:owner')).toEqual({ role: 'owner', allowed_group_ids: [], no_filter: true });
+    expect(await computeScopes('telegram:owner')).toEqual({ role: 'owner', allowed_group_ids: [], no_filter: true });
   });
 });

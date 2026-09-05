@@ -29,7 +29,7 @@
  * §2a still applies on top: out-of-scope, unprivileged and nonexistent all
  * collapse to one 404, so the gate never discloses that a thread exists.
  */
-import { getRawDb } from '../db/index.js';
+import { getDb } from '../db/connection.js';
 import { log } from '../log.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
 import { parseUtcTimestampMs } from '../thread-context.js';
@@ -64,17 +64,17 @@ export function isSnoozed(snoozedAtActivity: string | null | undefined, lastActi
  * A read failure degrades to "nothing is snoozed", which shows the operator
  * more than they asked for rather than silently hiding live work.
  */
-export function readThreadSnoozes(userId: string, threadIds: string[]): Map<string, string | null> {
+export async function readThreadSnoozes(userId: string, threadIds: string[]): Promise<Map<string, string | null>> {
   const out = new Map<string, string | null>();
   if (threadIds.length === 0) return out;
   try {
-    const rows = getRawDb()
-      .prepare(
-        `SELECT thread_id, snoozed_at_activity
-           FROM thread_snoozes
-          WHERE user_id = ? AND thread_id IN (${threadIds.map(() => '?').join(', ')})`,
-      )
-      .all(userId, ...threadIds) as ThreadSnoozeRow[];
+    const rows = await getDb().all<ThreadSnoozeRow>(
+      `SELECT thread_id, snoozed_at_activity
+         FROM thread_snoozes
+        WHERE user_id = ? AND thread_id IN (${threadIds.map(() => '?').join(', ')})`,
+      userId,
+      ...threadIds,
+    );
     for (const r of rows) out.set(r.thread_id, r.snoozed_at_activity);
   } catch (err) {
     log.warn('thread-snooze: read failed — treating the page as un-snoozed', { err });
@@ -89,19 +89,21 @@ export function readThreadSnoozes(userId: string, threadIds: string[]): Map<stri
  * a NULL `thread_id`) so the same id the console renders addresses the same
  * thread here.
  */
-function loadThreadForSnooze(threadId: string, ctx: AuthedRequestContext): { lastActivityAt: string | null } | null {
-  const rows = getRawDb()
-    .prepare(
-      `SELECT agent_group_id, last_outbound_at, last_active, created_at
-         FROM sessions
-        WHERE status = 'active' AND COALESCE(thread_id, 'session:' || id) = ?`,
-    )
-    .all(threadId) as {
+async function loadThreadForSnooze(
+  threadId: string,
+  ctx: AuthedRequestContext,
+): Promise<{ lastActivityAt: string | null } | null> {
+  const rows = await getDb().all<{
     agent_group_id: string;
     last_outbound_at: string | null;
     last_active: string | null;
     created_at: string;
-  }[];
+  }>(
+    `SELECT agent_group_id, last_outbound_at, last_active, created_at
+       FROM sessions
+      WHERE status = 'active' AND COALESCE(thread_id, 'session:' || id) = ?`,
+    threadId,
+  );
   if (rows.length === 0) return null;
 
   const visible = ctx.scopes.no_filter
@@ -144,18 +146,20 @@ const NOT_FOUND = (): Response => json(404, { error: 'thread_not_found' });
 export const threadSnoozeHandler: AuthHandler = async (_req, params, ctx) => {
   const threadId = threadIdOf(params);
   if (!threadId) return NOT_FOUND();
-  const thread = loadThreadForSnooze(threadId, ctx);
+  const thread = await loadThreadForSnooze(threadId, ctx);
   if (!thread) return NOT_FOUND();
 
   try {
-    getRawDb()
-      .prepare(
-        `INSERT INTO thread_snoozes (thread_id, user_id, snoozed_at_activity, created_at)
-         VALUES (?, ?, ?, ?)
-         ON CONFLICT(thread_id, user_id)
-         DO UPDATE SET snoozed_at_activity = excluded.snoozed_at_activity, created_at = excluded.created_at`,
-      )
-      .run(threadId, ctx.user.id, thread.lastActivityAt, new Date().toISOString());
+    await getDb().run(
+      `INSERT INTO thread_snoozes (thread_id, user_id, snoozed_at_activity, created_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(thread_id, user_id)
+       DO UPDATE SET snoozed_at_activity = excluded.snoozed_at_activity, created_at = excluded.created_at`,
+      threadId,
+      ctx.user.id,
+      thread.lastActivityAt,
+      new Date().toISOString(),
+    );
   } catch (err) {
     log.warn('threadSnoozeHandler: DB error', { threadId, err });
     return json(500, { error: 'internal_error' });
@@ -167,10 +171,10 @@ export const threadSnoozeHandler: AuthHandler = async (_req, params, ctx) => {
 export const threadUnsnoozeHandler: AuthHandler = async (_req, params, ctx) => {
   const threadId = threadIdOf(params);
   if (!threadId) return NOT_FOUND();
-  if (!loadThreadForSnooze(threadId, ctx)) return NOT_FOUND();
+  if (!(await loadThreadForSnooze(threadId, ctx))) return NOT_FOUND();
 
   try {
-    getRawDb().prepare(`DELETE FROM thread_snoozes WHERE thread_id = ? AND user_id = ?`).run(threadId, ctx.user.id);
+    await getDb().run(`DELETE FROM thread_snoozes WHERE thread_id = ? AND user_id = ?`, threadId, ctx.user.id);
   } catch (err) {
     log.warn('threadUnsnoozeHandler: DB error', { threadId, err });
     return json(500, { error: 'internal_error' });

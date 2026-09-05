@@ -8,7 +8,8 @@
  */
 import { randomUUID } from 'crypto';
 
-import { getRawDb } from '../db/connection.js';
+import { getDb, getRawDb } from '../db/connection.js';
+import { insertOrAdopt } from '../db/insert-or-adopt.js';
 import { renderVerbHelp } from './help-render.js';
 import { register } from './registry.js';
 import type { Access } from './registry.js';
@@ -188,9 +189,7 @@ function genericList(def: ResourceDef) {
     // Newest first: without an ORDER BY the LIMIT silently hides the most
     // recently inserted rows once a table outgrows it (bit `sessions list`
     // past 200 sessions — a just-created session was invisible).
-    return getRawDb()
-      .prepare(`SELECT ${cols} FROM ${def.table}${where} ORDER BY rowid DESC LIMIT ?`)
-      .all(...params);
+    return getDb().all(`SELECT ${cols} FROM ${def.table}${where} ORDER BY rowid DESC LIMIT ?`, ...params);
   };
 }
 
@@ -199,7 +198,7 @@ function genericGet(def: ResourceDef) {
   return async (args: Record<string, unknown>) => {
     const id = args.id as string;
     if (!id) throw new Error(`${def.name} id is required`);
-    const row = getRawDb().prepare(`SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`).get(id);
+    const row = await getDb().get(`SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`, id);
     if (!row) throw new Error(`${def.name} not found: ${id}`);
     return row;
   };
@@ -247,20 +246,6 @@ function genericCreate(def: ResourceDef) {
       }
     }
 
-    // Idempotent create: if a row already matches the natural key, return it
-    // rather than hitting a UNIQUE violation. Lets a skill re-run `ncl … create`.
-    // Runs after pass 3 so defaultFrom-filled columns (e.g. messaging-groups'
-    // `instance`) participate in the match. No new row means postCreate /
-    // postCommit are correctly skipped — no new companion rows to create.
-    if (def.naturalKey && def.naturalKey.length > 0) {
-      const where = def.naturalKey.map((c) => `${c} = ?`).join(' AND ');
-      const params = def.naturalKey.map((c) => values[c]);
-      const existing = getRawDb()
-        .prepare(`SELECT ${visibleColumns(def).join(', ')} FROM ${def.table} WHERE ${where}`)
-        .get(...params);
-      if (existing) return existing;
-    }
-
     const colNames = Object.keys(values);
     const placeholders = colNames.map((c) => `@${c}`);
     // Single transaction so a postCreate throw rolls back the parent INSERT —
@@ -269,11 +254,49 @@ function genericCreate(def: ResourceDef) {
     // must only touch the central DB (it's the atomic companion-row write).
     // Anything async or outside the central DB — filesystem, session-DB
     // projection — belongs in `postCommit`, which runs after commit below.
+    //
+    // This stays on the RAW synchronous handle deliberately (seam 3 §4.2 — a
+    // fork transaction converts to the driver only in PR 6, all ten sites at
+    // once). insertOrAdopt below just wraps this synchronous transaction in
+    // an async function; it does not make the transaction itself async.
     const db = getRawDb();
-    db.transaction(() => {
-      db.prepare(`INSERT INTO ${def.table} (${colNames.join(', ')}) VALUES (${placeholders.join(', ')})`).run(values);
-      if (def.postCreate) def.postCreate(values);
-    })();
+    const insert = (): void => {
+      db.transaction(() => {
+        db.prepare(`INSERT INTO ${def.table} (${colNames.join(', ')}) VALUES (${placeholders.join(', ')})`).run(values);
+        if (def.postCreate) def.postCreate(values);
+      })();
+    };
+
+    // Idempotent create: if a row already matches the natural key, return it
+    // rather than hitting a UNIQUE violation. Lets a skill re-run `ncl … create`.
+    // Runs after pass 3 so defaultFrom-filled columns (e.g. messaging-groups'
+    // `instance`) participate in the match. No new row means postCreate /
+    // postCommit are correctly skipped — no new companion rows to create.
+    //
+    // The pre-check below and the INSERT are no longer one synchronous step
+    // now that the check is an awaited driver call (seam 3) — two concurrent
+    // creates for the same natural key can both see "no existing row" and
+    // both attempt the INSERT. `insertOrAdopt` (src/db/insert-or-adopt.ts) is
+    // the primitive for exactly that race: the loser adopts the winner's row
+    // instead of throwing a raw unique-constraint error at the caller.
+    if (def.naturalKey && def.naturalKey.length > 0) {
+      const where = def.naturalKey.map((c) => `${c} = ?`).join(' AND ');
+      const params = def.naturalKey.map((c) => values[c]);
+      const reload = (): Promise<Record<string, unknown> | undefined> =>
+        getDb().get<Record<string, unknown>>(
+          `SELECT ${visibleColumns(def).join(', ')} FROM ${def.table} WHERE ${where}`,
+          ...params,
+        );
+
+      const existing = await reload();
+      if (existing) return existing;
+
+      const { row, created } = await insertOrAdopt(values, async () => insert(), reload);
+      if (!created) return row;
+    } else {
+      insert();
+    }
+
     if (def.postCommit) await def.postCommit(values);
     return values;
   };
@@ -310,22 +333,82 @@ function genericUpdate(def: ResourceDef) {
     }
 
     if (def.preUpdate) {
-      const current = getRawDb().prepare(`SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`).get(id) as
-        | Record<string, unknown>
-        | undefined;
+      // `preUpdate` validates `updates` against a point-in-time snapshot of
+      // the row (e.g. wirings' validateEngageAgainstChannel checks the
+      // engage_mode/engage_pattern pairing across BOTH `current` and
+      // `updates`). Under the async driver the read and the write below are
+      // no longer one synchronous step, so two concurrent updates can each
+      // read the same stale `current`, each individually pass validation,
+      // and then both write — landing a combination neither update's own
+      // validation would have allowed on its own (github Codex review on
+      // #437, src/cli/crud.ts:336).
+      //
+      // Fix: make the write conditional on the exact row state `preUpdate`
+      // just validated (optimistic concurrency) rather than an unconditional
+      // `WHERE id = ?`. If the row moved between read and write, `changes`
+      // is 0 — re-read and re-validate once against the fresh row and retry;
+      // a second miss is a genuine conflict, not a transient race, and is
+      // surfaced as a normal CLI refusal rather than silently overwriting.
+      let current = await getDb().get<Record<string, unknown>>(
+        `SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`,
+        id,
+      );
       if (!current) throw new Error(`${def.name} not found: ${id}`);
-      def.preUpdate(updates, current);
+
+      for (let attempt = 0; attempt < 2; attempt++) {
+        def.preUpdate(updates, current);
+
+        const setClause = Object.keys(updates)
+          .map((k) => `${k} = @${k}`)
+          .join(', ');
+        // `IS` (not `=`) so a NULL column in `current` still pins correctly —
+        // SQLite's `IS` is a null-safe equality, `=` against NULL is never true.
+        const checkClause = Object.keys(current)
+          .map((k) => `${k} IS @__orig_${k}`)
+          .join(' AND ');
+        const checkParams: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(current)) checkParams[`__orig_${k}`] = v;
+
+        // `RETURNING` makes the write and the reload ONE statement — github
+        // Codex review, PR #437, src/cli/crud.ts:377: a separate `getDb().get`
+        // reload after the UPDATE is itself an awaited step, so a concurrent
+        // delete of this same row in that gap made the reload find nothing
+        // and the handler return `undefined` — an `{ ok: true }` response
+        // with no row, not the documented not-found/conflict error. Folding
+        // the reload into the UPDATE's own RETURNING clause closes that gap:
+        // there is no longer a second await between "the write landed" and
+        // "here is the row it produced".
+        const updated = await getDb().get<Record<string, unknown>>(
+          `UPDATE ${def.table} SET ${setClause} WHERE ${def.idColumn} = @_id AND ${checkClause} RETURNING ${cols}`,
+          { ...updates, ...checkParams, _id: id },
+        );
+        if (updated) return updated;
+
+        current = await getDb().get<Record<string, unknown>>(
+          `SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`,
+          id,
+        );
+        if (!current) throw new Error(`${def.name} not found: ${id}`);
+      }
+
+      throw new Error(
+        `${def.name} update conflict: ${id} changed concurrently — re-run the update to retry against the current row`,
+      );
     }
 
     const setClause = Object.keys(updates)
       .map((k) => `${k} = @${k}`)
       .join(', ');
-    const result = getRawDb()
-      .prepare(`UPDATE ${def.table} SET ${setClause} WHERE ${def.idColumn} = @_id`)
-      .run({ ...updates, _id: id });
-    if (result.changes === 0) throw new Error(`${def.name} not found: ${id}`);
+    // Same RETURNING fold as the preUpdate branch above — a separate reload
+    // after the UPDATE would have the identical gap (github Codex review, PR
+    // #437, src/cli/crud.ts:377), just without a `preUpdate` validating it.
+    const updated = await getDb().get<Record<string, unknown>>(
+      `UPDATE ${def.table} SET ${setClause} WHERE ${def.idColumn} = @_id RETURNING ${cols}`,
+      { ...updates, _id: id },
+    );
+    if (!updated) throw new Error(`${def.name} not found: ${id}`);
 
-    return getRawDb().prepare(`SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`).get(id);
+    return updated;
   };
 }
 
@@ -333,7 +416,7 @@ function genericDelete(def: ResourceDef) {
   return async (args: Record<string, unknown>) => {
     const id = args.id as string;
     if (!id) throw new Error(`${def.name} id is required`);
-    const result = getRawDb().prepare(`DELETE FROM ${def.table} WHERE ${def.idColumn} = ?`).run(id);
+    const result = await getDb().run(`DELETE FROM ${def.table} WHERE ${def.idColumn} = ?`, id);
     if (result.changes === 0) throw new Error(`${def.name} not found: ${id}`);
     return { deleted: id };
   };

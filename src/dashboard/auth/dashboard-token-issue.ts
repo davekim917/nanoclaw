@@ -15,7 +15,7 @@ import { log } from '../../log.js';
  * (`../../channels/slash-commands.ts`) — so the token/HMAC/URL logic exists
  * exactly once.
  */
-export function mintDashboardTokenUrl(userId: string): { url: string; ttlHours: number } {
+export async function mintDashboardTokenUrl(userId: string): Promise<{ url: string; ttlHours: number }> {
   const rawToken = crypto.randomBytes(32).toString('hex');
   const serverKey = resolveServerKey();
   const tokenHmac = crypto.createHmac('sha256', serverKey).update(rawToken).digest('hex');
@@ -24,7 +24,7 @@ export function mintDashboardTokenUrl(userId: string): { url: string; ttlHours: 
   // server-side cookie expiry and client-side cookie deletion end at the
   // same wall-clock time — both read from `dashboardSessionTtlHours()`.
   const ttlHours = dashboardSessionTtlHours();
-  issueDashboardToken(userId, tokenHmac, ttlHours);
+  await issueDashboardToken(userId, tokenHmac, ttlHours);
 
   // Build the URL to send to the user. Three env vars give precise control:
   //   NANOCLAW_DASHBOARD_URL      — full URL (e.g. https://dash.example.com); takes precedence
@@ -94,7 +94,7 @@ export async function dashboardTokenIssue(ctx: InterceptContext): Promise<void> 
     return;
   }
 
-  const { url, ttlHours } = mintDashboardTokenUrl(ctx.userId);
+  const { url, ttlHours } = await mintDashboardTokenUrl(ctx.userId);
   await adapter.deliver(
     deliveryMg.channel_type,
     deliveryMg.platform_id,

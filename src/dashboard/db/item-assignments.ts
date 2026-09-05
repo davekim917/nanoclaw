@@ -7,7 +7,7 @@
  * attention feed out of `api/threads.ts`, and `api/threads.ts` decorates its
  * rows with the assignment. See migration 058 for why the table exists at all.
  */
-import { getRawDb } from '../../db/connection.js';
+import { getDb } from '../../db/connection.js';
 import { log } from '../../log.js';
 
 /**
@@ -63,27 +63,25 @@ export interface ItemAssignmentRow extends ItemAssignment {
  * for the same reason: a record written after its side effect cannot prevent
  * the side effect happening twice.
  */
-export function reserveItemAssignment(
+export async function reserveItemAssignment(
   workgroupId: string,
   itemId: string,
   agentGroupId: string,
   userId: string,
   now: number,
   windowMs: number,
-): boolean {
+): Promise<boolean> {
   const staleBefore = new Date(now - windowMs).toISOString();
-  const res = getRawDb()
-    .prepare(
-      `INSERT INTO observatory_item_assignments
-         (workgroup_id, item_id, agent_group_id, assigned_at, assigned_by)
-       VALUES (@workgroup_id, @item_id, @agent_group_id, @assigned_at, @assigned_by)
-       ON CONFLICT(workgroup_id, item_id) DO UPDATE SET
-         agent_group_id = excluded.agent_group_id,
-         assigned_at    = excluded.assigned_at,
-         assigned_by    = excluded.assigned_by
-       WHERE observatory_item_assignments.assigned_at < @stale_before`,
-    )
-    .run({
+  const res = await getDb().run(
+    `INSERT INTO observatory_item_assignments
+       (workgroup_id, item_id, agent_group_id, assigned_at, assigned_by)
+     VALUES (@workgroup_id, @item_id, @agent_group_id, @assigned_at, @assigned_by)
+     ON CONFLICT(workgroup_id, item_id) DO UPDATE SET
+       agent_group_id = excluded.agent_group_id,
+       assigned_at    = excluded.assigned_at,
+       assigned_by    = excluded.assigned_by
+     WHERE observatory_item_assignments.assigned_at < @stale_before`,
+    {
       workgroup_id: workgroupId,
       item_id: itemId,
       agent_group_id: agentGroupId,
@@ -91,7 +89,8 @@ export function reserveItemAssignment(
       assigned_at: new Date(now).toISOString(),
       assigned_by: userId,
       stale_before: staleBefore,
-    });
+    },
+  );
   return res.changes > 0;
 }
 
@@ -109,26 +108,28 @@ export function reserveItemAssignment(
  * ponytail: unconditional delete. Make it a compare-and-delete on
  * `assigned_at` if a cross-process host ever serves this endpoint.
  */
-export function releaseItemAssignment(workgroupId: string, itemId: string): void {
+export async function releaseItemAssignment(workgroupId: string, itemId: string): Promise<void> {
   try {
-    getRawDb()
-      .prepare(`DELETE FROM observatory_item_assignments WHERE workgroup_id = ? AND item_id = ?`)
-      .run(workgroupId, itemId);
+    await getDb().run(
+      `DELETE FROM observatory_item_assignments WHERE workgroup_id = ? AND item_id = ?`,
+      workgroupId,
+      itemId,
+    );
   } catch (err) {
     log.warn('observatory assign: could not release a failed reservation', { workgroupId, itemId, err });
   }
 }
 
 /** The standing assignment for one item, or null. */
-export function readItemAssignment(workgroupId: string, itemId: string): ItemAssignment | null {
+export async function readItemAssignment(workgroupId: string, itemId: string): Promise<ItemAssignment | null> {
   try {
-    const row = getRawDb()
-      .prepare(
-        `SELECT agent_group_id, assigned_at, assigned_by
-           FROM observatory_item_assignments
-          WHERE workgroup_id = ? AND item_id = ?`,
-      )
-      .get(workgroupId, itemId) as { agent_group_id: string; assigned_at: string; assigned_by: string } | undefined;
+    const row = await getDb().get<{ agent_group_id: string; assigned_at: string; assigned_by: string }>(
+      `SELECT agent_group_id, assigned_at, assigned_by
+         FROM observatory_item_assignments
+        WHERE workgroup_id = ? AND item_id = ?`,
+      workgroupId,
+      itemId,
+    );
     if (!row) return null;
     return { agentGroupId: row.agent_group_id, assignedAt: row.assigned_at, assignedBy: row.assigned_by };
   } catch (err) {
@@ -148,23 +149,22 @@ export function readItemAssignment(workgroupId: string, itemId: string): ItemAss
  * rather than blanking it, exactly as `decorateSteeredThreads` does for
  * migration 050.
  */
-export function readItemAssignments(workgroupIds: string[]): Map<string, ItemAssignmentRow> {
+export async function readItemAssignments(workgroupIds: string[]): Promise<Map<string, ItemAssignmentRow>> {
   const out = new Map<string, ItemAssignmentRow>();
   if (workgroupIds.length === 0) return out;
   try {
-    const rows = getRawDb()
-      .prepare(
-        `SELECT workgroup_id, item_id, agent_group_id, assigned_at, assigned_by
-           FROM observatory_item_assignments
-          WHERE workgroup_id IN (${workgroupIds.map(() => '?').join(', ')})`,
-      )
-      .all(...workgroupIds) as {
+    const rows = await getDb().all<{
       workgroup_id: string;
       item_id: string;
       agent_group_id: string;
       assigned_at: string;
       assigned_by: string;
-    }[];
+    }>(
+      `SELECT workgroup_id, item_id, agent_group_id, assigned_at, assigned_by
+         FROM observatory_item_assignments
+        WHERE workgroup_id IN (${workgroupIds.map(() => '?').join(', ')})`,
+      ...workgroupIds,
+    );
     for (const r of rows) {
       out.set(assignmentKey(r.workgroup_id, r.item_id), {
         workgroupId: r.workgroup_id,
@@ -193,13 +193,14 @@ export function assignmentKey(workgroupId: string, itemId: string): string {
  * simply has no entry and the caller falls back to the raw id: knowing an item
  * was assigned matters more than knowing who by.
  */
-export function readUserDisplayNames(userIds: string[]): Map<string, string> {
+export async function readUserDisplayNames(userIds: string[]): Promise<Map<string, string>> {
   const out = new Map<string, string>();
   if (userIds.length === 0) return out;
   try {
-    const rows = getRawDb()
-      .prepare(`SELECT id, display_name FROM users WHERE id IN (${userIds.map(() => '?').join(', ')})`)
-      .all(...userIds) as { id: string; display_name: string | null }[];
+    const rows = await getDb().all<{ id: string; display_name: string | null }>(
+      `SELECT id, display_name FROM users WHERE id IN (${userIds.map(() => '?').join(', ')})`,
+      ...userIds,
+    );
     for (const r of rows) if (r.display_name) out.set(r.id, r.display_name);
   } catch (err) {
     log.warn('observatory assign: could not resolve assigner display names', { err });

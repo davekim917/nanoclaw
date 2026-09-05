@@ -1,4 +1,4 @@
-import { getRawDb } from '../../db/connection.js';
+import { getDb } from '../../db/connection.js';
 
 export interface DashboardTokenRecord {
   id: number;
@@ -9,25 +9,29 @@ export interface DashboardTokenRecord {
   used_at: string | null;
 }
 
-export function issueDashboardToken(userId: string, tokenHmac: string, ttlHours: number): DashboardTokenRecord {
+export async function issueDashboardToken(
+  userId: string,
+  tokenHmac: string,
+  ttlHours: number,
+): Promise<DashboardTokenRecord> {
   const now = new Date();
   const expiresAt = new Date(now.getTime() + ttlHours * 60 * 60 * 1000).toISOString();
   const issuedAt = now.toISOString();
-  return getRawDb()
-    .prepare(
-      `INSERT INTO dashboard_tokens (user_id, token_hmac, issued_at, expires_at)
-       VALUES (@user_id, @token_hmac, @issued_at, @expires_at)
-       RETURNING *`,
-    )
-    .get({
+  const row = await getDb().get<DashboardTokenRecord>(
+    `INSERT INTO dashboard_tokens (user_id, token_hmac, issued_at, expires_at)
+     VALUES (@user_id, @token_hmac, @issued_at, @expires_at)
+     RETURNING *`,
+    {
       user_id: userId,
       token_hmac: tokenHmac,
       issued_at: issuedAt,
       expires_at: expiresAt,
-    }) as DashboardTokenRecord;
+    },
+  );
+  return row!;
 }
 
-export function consumeDashboardToken(tokenHmac: string): DashboardTokenRecord | null {
+export async function consumeDashboardToken(tokenHmac: string): Promise<DashboardTokenRecord | null> {
   // One bound ISO value for both the comparison and the write. NOT
   // `datetime('now')`, and NOT `datetime(expires_at) > datetime('now')` either:
   //
@@ -44,18 +48,16 @@ export function consumeDashboardToken(tokenHmac: string): DashboardTokenRecord |
   // `used_at` still writing the naive shape, so the same class of bug simply
   // moves to the next reader of that column. Binding one ISO value fixes both.
   const nowIso = new Date().toISOString();
-  return (
-    (getRawDb()
-      .prepare(
-        `UPDATE dashboard_tokens
-         SET used_at = @now
-         WHERE token_hmac = @token_hmac
-           AND used_at IS NULL
-           AND expires_at > @now
-         RETURNING *`,
-      )
-      .get({ token_hmac: tokenHmac, now: nowIso }) as DashboardTokenRecord | undefined) ?? null
+  const row = await getDb().get<DashboardTokenRecord>(
+    `UPDATE dashboard_tokens
+       SET used_at = @now
+     WHERE token_hmac = @token_hmac
+       AND used_at IS NULL
+       AND expires_at > @now
+     RETURNING *`,
+    { token_hmac: tokenHmac, now: nowIso },
   );
+  return row ?? null;
 }
 
 /**
@@ -67,6 +69,6 @@ export function consumeDashboardToken(tokenHmac: string): DashboardTokenRecord |
  * "expired" rows briefly so an operator chasing an issue can confirm a token was
  * issued; production cookies are tied to fresh tokens that get consumed quickly.
  */
-export function pruneDashboardTokens(): void {
-  getRawDb().prepare(`DELETE FROM dashboard_tokens WHERE expires_at < datetime('now', '-1 day')`).run();
+export async function pruneDashboardTokens(): Promise<void> {
+  await getDb().run(`DELETE FROM dashboard_tokens WHERE expires_at < datetime('now', '-1 day')`);
 }

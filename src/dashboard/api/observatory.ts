@@ -12,7 +12,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { getRawDb } from '../../db/connection.js';
+import { getDb } from '../../db/connection.js';
 import { getContainerConfig } from '../../db/container-configs.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
@@ -186,10 +186,14 @@ export interface ReleaseState {
  * mtime wins. Absent or unparseable → null, and the UI says "no release
  * desk" rather than inventing one.
  */
-export function readReleaseState(workgroupId: string, groupsDir: string = GROUPS_DIR): ReleaseState | null {
-  const members = getRawDb().prepare('SELECT folder FROM agent_groups WHERE workgroup_id = ?').all(workgroupId) as {
-    folder: string;
-  }[];
+export async function readReleaseState(
+  workgroupId: string,
+  groupsDir: string = GROUPS_DIR,
+): Promise<ReleaseState | null> {
+  const members = await getDb().all<{ folder: string }>(
+    'SELECT folder FROM agent_groups WHERE workgroup_id = ?',
+    workgroupId,
+  );
 
   let best: { mtime: number; state: ReleaseState } | null = null;
   for (const { folder } of members) {
@@ -218,22 +222,21 @@ export function readReleaseState(workgroupId: string, groupsDir: string = GROUPS
  * Read-time resolution on purpose: `observatory_item_threads` stores a
  * `users.id`, so a display-name change is never frozen into the table.
  */
-export function decorateSteeredThreads(
+export async function decorateSteeredThreads(
   workgroupId: string,
   state: ReleaseState | null,
-  linkFor: (threadId: string) => string | null = threadPermalink,
-): ReleaseState | null {
+  linkFor: (threadId: string) => string | null | Promise<string | null> = threadPermalink,
+): Promise<ReleaseState | null> {
   if (!state || state.items.length === 0) return state;
   let rows: { item_id: string; thread_id: string; created_at: string; by: string | null }[];
   try {
-    rows = getRawDb()
-      .prepare(
-        `SELECT t.item_id, t.thread_id, t.created_at, u.display_name AS by
-           FROM observatory_item_threads t
-           LEFT JOIN users u ON u.id = t.created_by
-          WHERE t.workgroup_id = ?`,
-      )
-      .all(workgroupId) as typeof rows;
+    rows = await getDb().all(
+      `SELECT t.item_id, t.thread_id, t.created_at, u.display_name AS by
+         FROM observatory_item_threads t
+         LEFT JOIN users u ON u.id = t.created_by
+        WHERE t.workgroup_id = ?`,
+      workgroupId,
+    );
   } catch (err) {
     // The table arrives with migration 050; a host running an older schema must
     // still render its board rather than blanking the scene.
@@ -245,19 +248,21 @@ export function decorateSteeredThreads(
   const byItem = new Map(rows.map((r) => [r.item_id, r]));
   return {
     ...state,
-    items: state.items.map((i) => {
-      const hit = byItem.get(i.id);
-      if (!hit) return i;
-      return {
-        ...i,
-        steeredThread: {
-          threadId: hit.thread_id,
-          threadUrl: linkFor(hit.thread_id),
-          at: hit.created_at,
-          by: hit.by ?? 'someone',
-        },
-      };
-    }),
+    items: await Promise.all(
+      state.items.map(async (i) => {
+        const hit = byItem.get(i.id);
+        if (!hit) return i;
+        return {
+          ...i,
+          steeredThread: {
+            threadId: hit.thread_id,
+            threadUrl: await linkFor(hit.thread_id),
+            at: hit.created_at,
+            by: hit.by ?? 'someone',
+          },
+        };
+      }),
+    ),
   };
 }
 
@@ -546,13 +551,15 @@ export function readWorkgroupSignals(
  * nonexistent workgroup id naturally yields empty query results below, so
  * there's no separate not-found branch to maintain).
  */
-function hasWorkgroupAccess(workgroupId: string, ctx: AuthedRequestContext): boolean {
+async function hasWorkgroupAccess(workgroupId: string, ctx: AuthedRequestContext): Promise<boolean> {
   if (ctx.scopes.no_filter) return true;
   if (ctx.scopes.allowed_group_ids.length === 0) return false;
   const placeholders = ctx.scopes.allowed_group_ids.map(() => '?').join(', ');
-  const hit = getRawDb()
-    .prepare(`SELECT 1 FROM agent_groups WHERE workgroup_id = ? AND id IN (${placeholders}) LIMIT 1`)
-    .get(workgroupId, ...ctx.scopes.allowed_group_ids);
+  const hit = await getDb().get(
+    `SELECT 1 FROM agent_groups WHERE workgroup_id = ? AND id IN (${placeholders}) LIMIT 1`,
+    workgroupId,
+    ...ctx.scopes.allowed_group_ids,
+  );
   return !!hit;
 }
 
@@ -602,10 +609,11 @@ interface WiringRow {
  * Slack hide dormant wiring on another platform without un-wiring it. Absent =
  * every platform shows.
  */
-export function observatoryHiddenRooms(workgroupId: string): string[] {
-  const members = getRawDb().prepare('SELECT folder FROM agent_groups WHERE workgroup_id = ?').all(workgroupId) as {
-    folder: string;
-  }[];
+export async function observatoryHiddenRooms(workgroupId: string): Promise<string[]> {
+  const members = await getDb().all<{ folder: string }>(
+    'SELECT folder FROM agent_groups WHERE workgroup_id = ?',
+    workgroupId,
+  );
   for (const { folder } of members) {
     try {
       const declared = readContainerConfig(folder).observatory?.hideRooms;
@@ -617,10 +625,11 @@ export function observatoryHiddenRooms(workgroupId: string): string[] {
   return [];
 }
 
-export function observatoryPlatforms(workgroupId: string): string[] | null {
-  const members = getRawDb().prepare('SELECT folder FROM agent_groups WHERE workgroup_id = ?').all(workgroupId) as {
-    folder: string;
-  }[];
+export async function observatoryPlatforms(workgroupId: string): Promise<string[] | null> {
+  const members = await getDb().all<{ folder: string }>(
+    'SELECT folder FROM agent_groups WHERE workgroup_id = ?',
+    workgroupId,
+  );
   for (const { folder } of members) {
     try {
       const declared = readContainerConfig(folder).observatory?.platforms;
@@ -685,12 +694,13 @@ export function roomPermalink(platform: string, platformId: string): string | nu
  * collide across workspaces), so which sibling type wins doesn't change the
  * resulting link — only whether the owning adapter happens to be online.
  */
-function threadChannelTypes(threadId: string): string[] {
+async function threadChannelTypes(threadId: string): Promise<string[]> {
   const prefix = threadId.split(':')[0] ?? '';
   try {
-    const rows = getRawDb()
-      .prepare(`SELECT DISTINCT channel_type FROM messaging_groups WHERE platform_id = ? ORDER BY channel_type`)
-      .all(threadPlatformId(threadId)) as { channel_type: string }[];
+    const rows = await getDb().all<{ channel_type: string }>(
+      `SELECT DISTINCT channel_type FROM messaging_groups WHERE platform_id = ? ORDER BY channel_type`,
+      await threadPlatformId(threadId),
+    );
     return [...rows.map((r) => r.channel_type), prefix];
   } catch {
     // No DB (early boot, unit tests) — the bare prefix is the only candidate.
@@ -704,10 +714,11 @@ function threadChannelTypes(threadId: string): string[] {
  * same place. Never throws — a dead link is worse than none, and a blank scene
  * is worse than both.
  */
-export function threadPermalink(threadId: string): string | null {
-  for (const channelType of threadChannelTypes(threadId)) {
+export async function threadPermalink(threadId: string): Promise<string | null> {
+  const platformId = await threadPlatformId(threadId);
+  for (const channelType of await threadChannelTypes(threadId)) {
     try {
-      const link = getChannelAdapter(channelType)?.permalink?.(threadPlatformId(threadId), threadId);
+      const link = getChannelAdapter(channelType)?.permalink?.(platformId, threadId);
       if (link) return link;
     } catch {
       continue;
@@ -733,12 +744,10 @@ export function threadPermalink(threadId: string): string | null {
  * path drift apart, and the display side is where the rule is already tested.
  * The wired platform ids are the authority it prefers, so pass them in.
  */
-export function threadPlatformId(threadId: string): string {
+export async function threadPlatformId(threadId: string): Promise<string> {
   let known: Set<string> | undefined;
   try {
-    const rows = getRawDb().prepare('SELECT DISTINCT platform_id FROM messaging_groups').all() as {
-      platform_id: string;
-    }[];
+    const rows = await getDb().all<{ platform_id: string }>('SELECT DISTINCT platform_id FROM messaging_groups');
     known = new Set(rows.map((r) => r.platform_id));
   } catch {
     // No DB (early boot, unit tests) — the parser's own segment rule stands in.
@@ -746,17 +755,20 @@ export function threadPlatformId(threadId: string): string {
   return threadChannelKey(threadId, known);
 }
 
-function buildRooms(workgroupId: string, allowed: string[] | null, hidden: string[] = []): ObservatoryRoom[] {
-  const wiringRows = getRawDb()
-    .prepare(
-      `SELECT mg.id AS messaging_group_id, mg.platform_id AS platform_id, mg.channel_type AS channel_type,
-              mg.name AS name, ag.id AS agent_group_id
-         FROM messaging_group_agents mga
-         JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
-         JOIN agent_groups ag ON ag.id = mga.agent_group_id
-        WHERE ag.workgroup_id = ?`,
-    )
-    .all(workgroupId) as WiringRow[];
+async function buildRooms(
+  workgroupId: string,
+  allowed: string[] | null,
+  hidden: string[] = [],
+): Promise<ObservatoryRoom[]> {
+  const wiringRows = await getDb().all<WiringRow>(
+    `SELECT mg.id AS messaging_group_id, mg.platform_id AS platform_id, mg.channel_type AS channel_type,
+            mg.name AS name, ag.id AS agent_group_id
+       FROM messaging_group_agents mga
+       JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+       JOIN agent_groups ag ON ag.id = mga.agent_group_id
+      WHERE ag.workgroup_id = ?`,
+    workgroupId,
+  );
 
   const onFloor = (
     allowed
@@ -794,15 +806,14 @@ function buildRooms(workgroupId: string, allowed: string[] | null, hidden: strin
     // one shape, which is luck rather than a guarantee: any writer using
     // `datetime('now')` reintroduces the naive form and silently re-breaks this.
     // `datetime()` parses both shapes, so this stays correct by construction.
-    const activityRow = getRawDb()
-      .prepare(
-        `SELECT last_outbound_at AS last FROM sessions
-          WHERE messaging_group_id IN (${placeholders})
-            AND last_outbound_at IS NOT NULL
-          ORDER BY datetime(last_outbound_at) DESC
-          LIMIT 1`,
-      )
-      .get(...mgIds) as { last: string | null } | undefined;
+    const activityRow = await getDb().get<{ last: string | null }>(
+      `SELECT last_outbound_at AS last FROM sessions
+        WHERE messaging_group_id IN (${placeholders})
+          AND last_outbound_at IS NOT NULL
+        ORDER BY datetime(last_outbound_at) DESC
+        LIMIT 1`,
+      ...mgIds,
+    );
 
     rooms.push({
       key: room.key,
@@ -853,9 +864,7 @@ async function buildAgents(
   claims: ObservatoryClaim[],
   deps: ObservatoryDeps,
 ): Promise<ObservatoryAgent[]> {
-  const agentRows = getRawDb()
-    .prepare('SELECT * FROM agent_groups WHERE workgroup_id = ?')
-    .all(workgroupId) as AgentGroup[];
+  const agentRows = await getDb().all<AgentGroup>('SELECT * FROM agent_groups WHERE workgroup_id = ?', workgroupId);
 
   const activeSessionIds = new Set(deps.getActiveContainerSessionIds());
   const nowMs = Date.now();
@@ -908,7 +917,7 @@ async function buildAgents(
           ? {
               channelKey: location,
               sessionId: roomSessionId,
-              threadUrl: roomThreadId ? linkForThread(roomThreadId) : null,
+              threadUrl: roomThreadId ? await linkForThread(roomThreadId) : null,
               lastOutboundAt: roomAt,
             }
           : null;
@@ -922,13 +931,12 @@ async function buildAgents(
       // The agent's face: its own bot's Slack avatar, found via whichever of
       // its wired channel types carries a registered identity with an image.
       const lookup = deps.avatarByChannelType ?? ((ct: string) => getKnownSlackBots().get(ct)?.imageUrl ?? null);
-      const channelTypes = getRawDb()
-        .prepare(
-          `SELECT DISTINCT mg.channel_type FROM messaging_group_agents mga
-             JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
-            WHERE mga.agent_group_id = ?`,
-        )
-        .all(row.id) as { channel_type: string }[];
+      const channelTypes = await getDb().all<{ channel_type: string }>(
+        `SELECT DISTINCT mg.channel_type FROM messaging_group_agents mga
+           JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+          WHERE mga.agent_group_id = ?`,
+        row.id,
+      );
       let avatarUrl: string | null = null;
       for (const { channel_type } of channelTypes) {
         avatarUrl = lookup(channel_type);
@@ -970,16 +978,24 @@ async function buildAgents(
  * Mutates rather than re-maps because `buildAgents` already consumed the claim
  * array to compute `holding`, and that join is exactly what names the owner.
  */
-function attachClaimSessions(workgroupId: string, claims: ObservatoryClaim[], agents: ObservatoryAgent[]): void {
+async function attachClaimSessions(
+  workgroupId: string,
+  claims: ObservatoryClaim[],
+  agents: ObservatoryAgent[],
+): Promise<void> {
   if (!claims.some((c) => c.threadId)) return;
-  const rows = getRawDb()
-    .prepare(
-      `SELECT s.id, s.agent_group_id, s.thread_id, s.last_outbound_at
-         FROM sessions s
-         JOIN agent_groups g ON g.id = s.agent_group_id
-        WHERE g.workgroup_id = ? AND s.thread_id IS NOT NULL AND s.status = 'active'`,
-    )
-    .all(workgroupId) as { id: string; agent_group_id: string; thread_id: string; last_outbound_at: string | null }[];
+  const rows = await getDb().all<{
+    id: string;
+    agent_group_id: string;
+    thread_id: string;
+    last_outbound_at: string | null;
+  }>(
+    `SELECT s.id, s.agent_group_id, s.thread_id, s.last_outbound_at
+       FROM sessions s
+       JOIN agent_groups g ON g.id = s.agent_group_id
+      WHERE g.workgroup_id = ? AND s.thread_id IS NOT NULL AND s.status = 'active'`,
+    workgroupId,
+  );
   if (rows.length === 0) return;
 
   const byThread = new Map<string, typeof rows>();
@@ -1020,7 +1036,7 @@ export interface ObservatoryDeps {
   /** Bot avatar by channel type — defaults to the live Slack bot registry. Injected so tests never need an adapter. */
   avatarByChannelType?: (channelType: string) => string | null;
   /** Thread-id → permalink; defaults to resolving through the owning channel adapter. */
-  resolveThreadUrl?: (threadId: string) => string | null;
+  resolveThreadUrl?: (threadId: string) => string | null | Promise<string | null>;
   /** Platform allow-list override for tests; defaults to the workgroup's declared observatory.platforms. */
   platforms?: string[] | null;
   /** Explicitly hidden room ids; defaults to the workgroup's declared observatory.hideRooms. */
@@ -1047,30 +1063,31 @@ export async function buildObservatoryScene(
   // thread_id already encodes its channel type + channel + ts, so the adapter
   // that owns that platform resolves it — one hop, no extra state.
   const linkFor = deps.resolveThreadUrl ?? threadPermalink;
-  const claims: ObservatoryClaim[] = rawClaims.map((c) => ({
-    ...c,
-    threadUrl: c.threadId ? linkFor(c.threadId) : null,
-    sessionId: null,
-  }));
+  const claims: ObservatoryClaim[] = await Promise.all(
+    rawClaims.map(async (c) => ({
+      ...c,
+      threadUrl: c.threadId ? await linkFor(c.threadId) : null,
+      sessionId: null,
+    })),
+  );
 
   const agents = await buildAgents(workgroupId, claims, deps);
-  attachClaimSessions(workgroupId, claims, agents);
+  await attachClaimSessions(workgroupId, claims, agents);
+
+  const platforms = deps.platforms !== undefined ? deps.platforms : await observatoryPlatforms(workgroupId);
+  const hiddenRooms = deps.hiddenRooms ?? (await observatoryHiddenRooms(workgroupId));
+  const releaseStateRaw =
+    deps.groupsDir !== undefined
+      ? await readReleaseState(workgroupId, deps.groupsDir)
+      : await readReleaseState(workgroupId);
 
   return {
     workgroupId,
     asOf: new Date().toISOString(),
-    rooms: buildRooms(
-      workgroupId,
-      deps.platforms !== undefined ? deps.platforms : observatoryPlatforms(workgroupId),
-      deps.hiddenRooms ?? observatoryHiddenRooms(workgroupId),
-    ),
+    rooms: await buildRooms(workgroupId, platforms, hiddenRooms),
     agents,
     claims,
-    releaseState: decorateSteeredThreads(
-      workgroupId,
-      deps.groupsDir !== undefined ? readReleaseState(workgroupId, deps.groupsDir) : readReleaseState(workgroupId),
-      linkFor,
-    ),
+    releaseState: await decorateSteeredThreads(workgroupId, releaseStateRaw, linkFor),
     themedSlots: deps.themedSlots !== undefined ? deps.themedSlots : readOfficeThemes(),
     signals: 'signals' in deps ? deps.signals : readWorkgroupSignals(workgroupId),
   };
@@ -1079,7 +1096,7 @@ export async function buildObservatoryScene(
 export const observatoryHandler: AuthHandler = async (req, _params, ctx) => {
   const url = new URL(req.url);
   const workgroupId = url.searchParams.get('workgroup') ?? '';
-  if (!workgroupId || !hasWorkgroupAccess(workgroupId, ctx)) {
+  if (!workgroupId || !(await hasWorkgroupAccess(workgroupId, ctx))) {
     return json(emptyScene(workgroupId));
   }
   return json(await buildObservatoryScene(workgroupId));

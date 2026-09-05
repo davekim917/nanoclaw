@@ -14,7 +14,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR, GROUPS_DIR } from '../../config.js';
-import { getRawDb } from '../../db/connection.js';
+import { getDb } from '../../db/connection.js';
 import type { UsageDailyRow } from '../../db/usage.js';
 import { isCostApplicable } from '../../db/usage.js';
 import { log } from '../../log.js';
@@ -41,24 +41,24 @@ interface WorkgroupRow {
  * must have at least one allowed agent group whose `workgroup_id` matches.
  * Returns null on either not-found or out-of-scope (disclose-as-not-found).
  */
-function resolveWorkgroup(id: string, ctx: AuthedRequestContext): WorkgroupRow | null {
-  const row = getRawDb().prepare('SELECT id, display_name FROM workgroups WHERE id = ?').get(id) as
-    | WorkgroupRow
-    | undefined;
+async function resolveWorkgroup(id: string, ctx: AuthedRequestContext): Promise<WorkgroupRow | null> {
+  const row = await getDb().get<WorkgroupRow>('SELECT id, display_name FROM workgroups WHERE id = ?', id);
   if (!row) return null;
   if (ctx.scopes.no_filter) return row;
   if (ctx.scopes.allowed_group_ids.length === 0) return null;
   const placeholders = ctx.scopes.allowed_group_ids.map(() => '?').join(', ');
-  const hit = getRawDb()
-    .prepare(`SELECT 1 FROM agent_groups WHERE workgroup_id = ? AND id IN (${placeholders}) LIMIT 1`)
-    .get(row.id, ...ctx.scopes.allowed_group_ids);
+  const hit = await getDb().get(
+    `SELECT 1 FROM agent_groups WHERE workgroup_id = ? AND id IN (${placeholders}) LIMIT 1`,
+    row.id,
+    ...ctx.scopes.allowed_group_ids,
+  );
   return hit ? row : null;
 }
 
-function workgroupAgentGroupIds(workgroupId: string): string[] {
-  return (
-    getRawDb().prepare('SELECT id FROM agent_groups WHERE workgroup_id = ?').all(workgroupId) as Array<{ id: string }>
-  ).map((r) => r.id);
+async function workgroupAgentGroupIds(workgroupId: string): Promise<string[]> {
+  return (await getDb().all<{ id: string }>('SELECT id FROM agent_groups WHERE workgroup_id = ?', workgroupId)).map(
+    (r) => r.id,
+  );
 }
 
 // ── GET /dashboard/api/workgroups ───────────────────────────────────────────
@@ -67,21 +67,20 @@ export const workgroupsListHandler: AuthHandler = async (_req, _params, ctx) => 
   let rows: WorkgroupRow[];
   try {
     if (ctx.scopes.no_filter) {
-      rows = getRawDb()
-        .prepare('SELECT id, display_name FROM workgroups ORDER BY COALESCE(display_name, id)')
-        .all() as WorkgroupRow[];
+      rows = await getDb().all<WorkgroupRow>(
+        'SELECT id, display_name FROM workgroups ORDER BY COALESCE(display_name, id)',
+      );
     } else if (ctx.scopes.allowed_group_ids.length === 0) {
       rows = [];
     } else {
       const placeholders = ctx.scopes.allowed_group_ids.map(() => '?').join(', ');
-      rows = getRawDb()
-        .prepare(
-          `SELECT DISTINCT w.id, w.display_name FROM workgroups w
-             JOIN agent_groups a ON a.workgroup_id = w.id
-            WHERE a.id IN (${placeholders})
-            ORDER BY COALESCE(w.display_name, w.id)`,
-        )
-        .all(...ctx.scopes.allowed_group_ids) as WorkgroupRow[];
+      rows = await getDb().all<WorkgroupRow>(
+        `SELECT DISTINCT w.id, w.display_name FROM workgroups w
+           JOIN agent_groups a ON a.workgroup_id = w.id
+          WHERE a.id IN (${placeholders})
+          ORDER BY COALESCE(w.display_name, w.id)`,
+        ...ctx.scopes.allowed_group_ids,
+      );
     }
   } catch (err) {
     log.warn('workgroupsListHandler: DB error', { err });
@@ -137,7 +136,7 @@ function readNewestGatesTail(releasesDir: string, tailLines: number): Record<str
 const GATE_TAIL_LINES = 50;
 
 export const workgroupSummaryHandler: AuthHandler = async (_req, params, ctx) => {
-  const wg = resolveWorkgroup(params['id'] ?? '', ctx);
+  const wg = await resolveWorkgroup(params['id'] ?? '', ctx);
   if (!wg) return json({ error: 'not_found' }, 404);
 
   const releasesDir = path.join(GROUPS_DIR, wg.id, 'releases');
@@ -153,7 +152,7 @@ const DEFAULT_USAGE_DAYS = 14;
 const MAX_USAGE_DAYS = 90;
 
 export const workgroupUsageHandler: AuthHandler = async (req, params, ctx) => {
-  const wg = resolveWorkgroup(params['id'] ?? '', ctx);
+  const wg = await resolveWorkgroup(params['id'] ?? '', ctx);
   if (!wg) return json({ error: 'not_found' }, 404);
 
   const url = new URL(req.url);
@@ -166,18 +165,18 @@ export const workgroupUsageHandler: AuthHandler = async (req, params, ctx) => {
 
   let usage: UsageDailyRow[];
   try {
-    const agentGroupIds = workgroupAgentGroupIds(wg.id);
+    const agentGroupIds = await workgroupAgentGroupIds(wg.id);
     if (agentGroupIds.length === 0) {
       usage = [];
     } else {
       const placeholders = agentGroupIds.map(() => '?').join(', ');
-      const rawRows = getRawDb()
-        .prepare(
-          `SELECT * FROM usage_daily
-            WHERE agent_group_id IN (${placeholders}) AND date >= ?
-            ORDER BY date DESC, agent_group_id, provider, model`,
-        )
-        .all(...agentGroupIds, sinceDate) as Omit<UsageDailyRow, 'cost_applicable'>[];
+      const rawRows = await getDb().all<Omit<UsageDailyRow, 'cost_applicable'>>(
+        `SELECT * FROM usage_daily
+          WHERE agent_group_id IN (${placeholders}) AND date >= ?
+          ORDER BY date DESC, agent_group_id, provider, model`,
+        ...agentGroupIds,
+        sinceDate,
+      );
       // cost_applicable is computed from provider, not a stored column — see
       // isCostApplicable's doc for why (Codex has no per-token cost field, so
       // its rows sum cost_usd to 0 identically to a real zero-spend row).
@@ -268,14 +267,14 @@ export interface WorkgroupSeriesRow {
 }
 
 export const workgroupClaimsHandler: AuthHandler = async (_req, params, ctx) => {
-  const wg = resolveWorkgroup(params['id'] ?? '', ctx);
+  const wg = await resolveWorkgroup(params['id'] ?? '', ctx);
   if (!wg) return json({ error: 'not_found' }, 404);
 
   const claims = readClaims(DATA_DIR, wg.id, Date.now());
 
   let series: WorkgroupSeriesRow[] = [];
   try {
-    const agentGroupIds = new Set(workgroupAgentGroupIds(wg.id));
+    const agentGroupIds = new Set(await workgroupAgentGroupIds(wg.id));
     if (agentGroupIds.size > 0) {
       const nowMs = Date.now();
       // Reuse the scheduled-board's warm full-fleet cache (never assemble

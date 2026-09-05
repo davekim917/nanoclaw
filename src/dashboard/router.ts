@@ -170,7 +170,7 @@ export function requireAuth(handler: AuthHandler): Handler {
     // depends on db/connection which can't be imported at module-init time before
     // initDb runs).
     const { computeScopes } = await import('./auth/compute-scopes.js');
-    const scopes = computeScopes(payload.user_id);
+    const scopes = await computeScopes(payload.user_id);
 
     // Same lazy-import reason as computeScopes above: db/connection can't load
     // before initDb runs. Resolves the real display_name so every ctx.user.display_name

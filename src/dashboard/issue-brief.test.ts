@@ -48,13 +48,13 @@ describe('observatoryIssueBriefHandler', () => {
     getRawDb()
       .prepare(`INSERT INTO workgroups (id, display_name, created_at) VALUES ('wg-1', 'Example', ?)`)
       .run(new Date().toISOString());
-    (await createAgentGroup({
+    await createAgentGroup({
       id: 'ag-1',
       name: 'example',
       folder: 'example-co',
       agent_provider: null,
       created_at: new Date().toISOString(),
-    }));
+    });
     getRawDb().prepare(`UPDATE agent_groups SET workgroup_id = 'wg-1' WHERE id = 'ag-1'`).run();
     vi.stubEnv('GITHUB_TOKEN_EXAMPLE_CO', 'tok-scoped');
     _resetIssueBriefCacheForTesting();
@@ -67,7 +67,7 @@ describe('observatoryIssueBriefHandler', () => {
   });
 
   it('serves body, labels and the LAST comments from the item recorded URL', async () => {
-    mockReadReleaseState.mockReturnValue(boardItem('https://github.com/example-org/example-repo/issues/803'));
+    mockReadReleaseState.mockResolvedValue(boardItem('https://github.com/example-org/example-repo/issues/803'));
     ghResponses(
       { state: 'open', body: 'the body QA wrote', labels: [{ name: 'needs-product-decision' }, 'p2'], comments: 5 },
       [
@@ -97,20 +97,20 @@ describe('observatoryIssueBriefHandler', () => {
   });
 
   it('refuses a recorded URL that is not a github issue/PR — the client cannot pick the host', async () => {
-    mockReadReleaseState.mockReturnValue(boardItem('https://evil.example.com/github.com/x/y/issues/1'));
+    mockReadReleaseState.mockResolvedValue(boardItem('https://evil.example.com/github.com/x/y/issues/1'));
     const resp = await observatoryIssueBriefHandler(get('workgroup=wg-1&item=XZO%231'), {}, ctx);
     expect(resp!.status).toBe(404);
     expect(((await resp!.json()) as { error: string }).error).toBe('item_url_not_github');
   });
 
   it('404s an item with no url, and an item not on the board', async () => {
-    mockReadReleaseState.mockReturnValue(boardItem());
+    mockReadReleaseState.mockResolvedValue(boardItem());
     expect((await observatoryIssueBriefHandler(get('workgroup=wg-1&item=XZO%231'), {}, ctx))!.status).toBe(404);
     expect((await observatoryIssueBriefHandler(get('workgroup=wg-1&item=XZO%232'), {}, ctx))!.status).toBe(404);
   });
 
   it('a GitHub failure is a 502, never a crash — and is not cached', async () => {
-    mockReadReleaseState.mockReturnValue(boardItem('https://github.com/o/r/issues/1'));
+    mockReadReleaseState.mockResolvedValue(boardItem('https://github.com/o/r/issues/1'));
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('nope', { status: 500 })));
     const r1 = await observatoryIssueBriefHandler(get('workgroup=wg-1&item=XZO%231'), {}, ctx);
     expect(r1!.status).toBe(502);
@@ -121,7 +121,7 @@ describe('observatoryIssueBriefHandler', () => {
   });
 
   it('second read inside the TTL is served from cache — one GitHub round-trip per item', async () => {
-    mockReadReleaseState.mockReturnValue(boardItem('https://github.com/o/r/pull/9'));
+    mockReadReleaseState.mockResolvedValue(boardItem('https://github.com/o/r/pull/9'));
     ghResponses({ state: 'open', body: 'b', labels: [], comments: 0 }, []);
     await observatoryIssueBriefHandler(get('workgroup=wg-1&item=XZO%231'), {}, ctx);
     const callsAfterFirst = vi.mocked(fetch).mock.calls.length;
@@ -130,7 +130,7 @@ describe('observatoryIssueBriefHandler', () => {
   });
 
   it('long bodies are truncated server-side and say so', async () => {
-    mockReadReleaseState.mockReturnValue(boardItem('https://github.com/o/r/issues/2'));
+    mockReadReleaseState.mockResolvedValue(boardItem('https://github.com/o/r/issues/2'));
     ghResponses({ state: 'open', body: 'x'.repeat(5000), labels: [], comments: 0 }, []);
     const resp = await observatoryIssueBriefHandler(get('workgroup=wg-1&item=XZO%231'), {}, ctx);
     const brief = (await resp!.json()) as { body: string; bodyTruncated: boolean };

@@ -54,6 +54,7 @@
  * step (e) of a completed close.
  */
 import { containerOwnsOutbound, killContainer } from '../container-runner.js';
+import { getDb } from '../db/connection.js';
 import { getRawDb } from '../db/index.js';
 import { archiveSessionById, withQuietInvalidationSync } from '../db/sessions.js';
 import { guard } from '../guard/index.js';
@@ -108,6 +109,12 @@ const CLOSE_WAKE_ID_PREFIX = 'thread-close-';
  *
  * Returns the proposal it was given, so the sweep's call site stays one line.
  */
+// 5c deferral (seam 3, deployer call 2026-09-05): stays raw/sync in PR 5a —
+// its only caller is src/modules/sweep-continuation/index.ts:543 (a bare
+// sync call inside a duty), owned by PR 5b, so §4.2 (leaf + every importer
+// in one PR) cannot be honored split across two parallel PRs. A follow-up
+// "5c" PR converts this together with all its callers once 5a and 5b are
+// both merged.
 export function syncDoneProposalMirror(sessionId: string, proposal: DoneProposal | null): DoneProposal | null {
   const encoded = proposal ? JSON.stringify(proposal) : null;
   try {
@@ -168,6 +175,15 @@ interface CloseSession {
  * The thread's active sessions, using the same synthetic-key rule the list and
  * snooze paths use (`session:<id>` for a session with a NULL `thread_id`), so
  * the id the console renders addresses the same thread here.
+ *
+ * PERMANENT raw/sync exception (§4.5-class, not a 5c deferral): this function
+ * is called both before AND inside `requestThreadClose`'s documented "ONE
+ * synchronous decision, no await from here to the reservation" span (see
+ * `ClosureDecision`'s doc comment and "THIS IS THE LAST AWAIT" below) — the
+ * whole point of `sampleProposalsSync`/`readSessionProposalSync` existing as
+ * synchronous twins is to keep that span awaitless. Converting this function
+ * would break the invariant at its in-span call site regardless of which PR
+ * does it, so it stays on the raw handle even after 5c.
  */
 function sessionsOnThread(threadId: string): CloseSession[] {
   return getRawDb()
@@ -183,6 +199,13 @@ function sessionsOnThread(threadId: string): CloseSession[] {
  * Is this ONE session still active and still on this thread? Same predicate as
  * `sessionsOnThread`, keyed to a single id, so a caller holding a snapshot can
  * re-ask the question it snapshotted without re-running the fan-out.
+ *
+ * PERMANENT raw/sync exception (§4.5-class, not a 5c deferral): called from
+ * inside `writeCloseWrapUp`'s mailbox-action callback, which must stay
+ * "synchronous, so nothing yields before the insert below" (the
+ * `withQuietInvalidationSync` precondition a few lines down that call site).
+ * Converting this to the async driver would introduce exactly the yield that
+ * comment forbids.
  */
 function stillOnThread(sessionId: string, threadId: string): boolean {
   return (
@@ -421,6 +444,11 @@ export async function requestThreadClose(
     };
   }
 
+  // PERMANENT raw/sync exception (§4.5-class, not a 5c deferral): this read,
+  // the reservation INSERT below, and the loser's read on a lost race all
+  // sit inside (or feed) the "ONE synchronous decision, no await from here
+  // to the reservation" span documented above `ClosureDecision` — see
+  // `sessionsOnThread`'s doc comment for the full reasoning.
   const existing = getRawDb().prepare('SELECT * FROM thread_closures WHERE thread_id = ?').get(threadId) as
     | ThreadClosureRow
     | undefined;
@@ -886,9 +914,9 @@ export async function advanceThreadClosures(deps: ThreadCloseDeps = {}): Promise
   const now = deps.now ?? Date.now();
   let rows: ThreadClosureRow[];
   try {
-    rows = getRawDb()
-      .prepare(`SELECT * FROM thread_closures WHERE state IN ('awaiting_confirmation', 'finalizing')`)
-      .all() as ThreadClosureRow[];
+    rows = await getDb().all<ThreadClosureRow>(
+      `SELECT * FROM thread_closures WHERE state IN ('awaiting_confirmation', 'finalizing')`,
+    );
   } catch (err) {
     log.warn('thread-close: could not read pending closures', { err });
     return;
@@ -908,23 +936,22 @@ async function advanceOneClosure(row: ThreadClosureRow, now: number, deps: Threa
     sessionIds = JSON.parse(row.session_ids) as string[];
   } catch {
     log.warn('thread-close: unreadable session_ids — closing the row out', { threadId: row.thread_id });
-    markClosed(row.thread_id, now, row.forced === 1);
+    await markClosed(row.thread_id, now, row.forced === 1);
     return;
   }
   if (sessionIds.length === 0) {
-    markClosed(row.thread_id, now, row.forced === 1);
+    await markClosed(row.thread_id, now, row.forced === 1);
     return;
   }
 
-  const live = getRawDb()
-    .prepare(
-      `SELECT id, agent_group_id, archived_at FROM sessions WHERE id IN (${sessionIds.map(() => '?').join(', ')})`,
-    )
-    .all(...sessionIds) as CloseSession[];
+  const live = await getDb().all<CloseSession>(
+    `SELECT id, agent_group_id, archived_at FROM sessions WHERE id IN (${sessionIds.map(() => '?').join(', ')})`,
+    ...sessionIds,
+  );
   // A session that no longer exists cannot be left running, so it does not hold
   // the close open.
   if (live.length === 0) {
-    markClosed(row.thread_id, now, row.forced === 1);
+    await markClosed(row.thread_id, now, row.forced === 1);
     return;
   }
 
@@ -949,20 +976,20 @@ async function advanceOneClosure(row: ThreadClosureRow, now: number, deps: Threa
     });
     if (!decision.finalize) return;
     forced = decision.forced;
-    getRawDb()
-      // `AND state = 'awaiting_confirmation'`: `row` was read before the
-      // proposal reads above, which await, so the state that authorized this
-      // transition is not the state at the moment of it. Without the predicate
-      // the statement will move a row from 'closed' back to 'finalizing' and
-      // re-run the kills. Nothing can do that today — the sweep is a
-      // self-rescheduling chain, so ticks never overlap — but that is a
-      // property of the scheduler, not of this statement, and the statement is
-      // where it belongs.
-      .prepare(
-        `UPDATE thread_closures SET state = 'finalizing', forced = ?
-          WHERE thread_id = ? AND state = 'awaiting_confirmation'`,
-      )
-      .run(forced ? 1 : 0, row.thread_id);
+    // `AND state = 'awaiting_confirmation'`: `row` was read before the
+    // proposal reads above, which await, so the state that authorized this
+    // transition is not the state at the moment of it. Without the predicate
+    // the statement will move a row from 'closed' back to 'finalizing' and
+    // re-run the kills. Nothing can do that today — the sweep is a
+    // self-rescheduling chain, so ticks never overlap — but that is a
+    // property of the scheduler, not of this statement, and the statement is
+    // where it belongs.
+    await getDb().run(
+      `UPDATE thread_closures SET state = 'finalizing', forced = ?
+        WHERE thread_id = ? AND state = 'awaiting_confirmation'`,
+      forced ? 1 : 0,
+      row.thread_id,
+    );
     log.info('thread-close: finalizing', {
       threadId: row.thread_id,
       requestedBy: row.requested_by,
@@ -981,19 +1008,21 @@ async function advanceOneClosure(row: ThreadClosureRow, now: number, deps: Threa
   // Re-read rather than trusting the loop above: `finalizeSession` archives
   // inside `killContainer`'s exit callback, so a session stopping right now is
   // still open and this closure simply advances on the next tick.
-  const remaining = getRawDb()
-    .prepare(
-      `SELECT COUNT(*) AS n FROM sessions
-        WHERE archived_at IS NULL AND id IN (${sessionIds.map(() => '?').join(', ')})`,
-    )
-    .get(...sessionIds) as { n: number };
-  if (remaining.n === 0) markClosed(row.thread_id, now, forced);
+  const remaining = await getDb().get<{ n: number }>(
+    `SELECT COUNT(*) AS n FROM sessions
+      WHERE archived_at IS NULL AND id IN (${sessionIds.map(() => '?').join(', ')})`,
+    ...sessionIds,
+  );
+  if (remaining?.n === 0) await markClosed(row.thread_id, now, forced);
 }
 
-function markClosed(threadId: string, now: number, forced: boolean): void {
-  getRawDb()
-    .prepare(`UPDATE thread_closures SET state = 'closed', forced = ?, closed_at = ? WHERE thread_id = ?`)
-    .run(forced ? 1 : 0, new Date(now).toISOString(), threadId);
+async function markClosed(threadId: string, now: number, forced: boolean): Promise<void> {
+  await getDb().run(
+    `UPDATE thread_closures SET state = 'closed', forced = ?, closed_at = ? WHERE thread_id = ?`,
+    forced ? 1 : 0,
+    new Date(now).toISOString(),
+    threadId,
+  );
   log.info('thread-close: closed', { threadId, forced });
 }
 
@@ -1007,22 +1036,21 @@ export interface ThreadCloseState {
 }
 
 /** Pending closes for exactly the threads on the page — one query, never per row. */
-export function readThreadClosures(threadIds: string[]): Map<string, ThreadCloseState> {
+export async function readThreadClosures(threadIds: string[]): Promise<Map<string, ThreadCloseState>> {
   const out = new Map<string, ThreadCloseState>();
   if (threadIds.length === 0) return out;
   try {
-    const rows = getRawDb()
-      .prepare(
-        `SELECT thread_id, state, requested_by, requested_at, forced FROM thread_closures
-          WHERE thread_id IN (${threadIds.map(() => '?').join(', ')})`,
-      )
-      .all(...threadIds) as {
+    const rows = await getDb().all<{
       thread_id: string;
       state: ThreadClosureRow['state'];
       requested_by: string;
       requested_at: string;
       forced: number;
-    }[];
+    }>(
+      `SELECT thread_id, state, requested_by, requested_at, forced FROM thread_closures
+        WHERE thread_id IN (${threadIds.map(() => '?').join(', ')})`,
+      ...threadIds,
+    );
     for (const r of rows) {
       out.set(r.thread_id, {
         state: r.state,

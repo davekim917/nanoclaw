@@ -68,7 +68,7 @@ export const exchangeHandler: Handler = async (req) => {
   const serverKey = resolveServerKey();
   const tokenHmac = crypto.createHmac('sha256', serverKey).update(rawToken).digest('hex');
 
-  const record = consumeDashboardToken(tokenHmac);
+  const record = await consumeDashboardToken(tokenHmac);
   if (!record) {
     return new Response(JSON.stringify({ error: 'invalid_token' }), {
       status: 400,

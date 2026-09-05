@@ -41,7 +41,7 @@ import { createHash, randomUUID } from 'crypto';
 import { readClaims } from '../claims-board.js';
 import { getChannelAdapter } from '../channels/channel-registry.js';
 import { dispatch } from '../cli/dispatch.js';
-import { getRawDb } from '../db/index.js';
+import { getDb } from '../db/connection.js';
 import { log } from '../log.js';
 import { claimsBaseDir } from '../modules/claims/escalation.js';
 import { canAssign } from './assign.js';
@@ -102,15 +102,15 @@ async function withItemThreadLock<T>(key: string, fn: () => Promise<T>): Promise
 }
 
 /** The thread an item's work already lives in, or null when nobody has opened one. */
-export function readItemThread(workgroupId: string, itemId: string): ItemThreadRow | null {
+export async function readItemThread(workgroupId: string, itemId: string): Promise<ItemThreadRow | null> {
   return (
-    (getRawDb()
-      .prepare(
-        `SELECT thread_id, created_at, created_by
-           FROM observatory_item_threads
-          WHERE workgroup_id = ? AND item_id = ?`,
-      )
-      .get(workgroupId, itemId) as ItemThreadRow | undefined) ?? null
+    (await getDb().get<ItemThreadRow>(
+      `SELECT thread_id, created_at, created_by
+         FROM observatory_item_threads
+        WHERE workgroup_id = ? AND item_id = ?`,
+      workgroupId,
+      itemId,
+    )) ?? null
   );
 }
 
@@ -125,31 +125,37 @@ export interface ItemThreadRow {
  * landed, the incumbent's if we lost the race — so the caller always has
  * somewhere real to post and never a second thread to apologise for.
  */
-function claimItemThread(workgroupId: string, itemId: string, threadId: string, userId: string): string {
-  const res = getRawDb()
-    .prepare(
-      `INSERT INTO observatory_item_threads (workgroup_id, item_id, thread_id, created_at, created_by)
-       VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT(workgroup_id, item_id) DO NOTHING`,
-    )
-    .run(workgroupId, itemId, threadId, new Date().toISOString(), userId);
+async function claimItemThread(workgroupId: string, itemId: string, threadId: string, userId: string): Promise<string> {
+  const res = await getDb().run(
+    `INSERT INTO observatory_item_threads (workgroup_id, item_id, thread_id, created_at, created_by)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(workgroup_id, item_id) DO NOTHING`,
+    workgroupId,
+    itemId,
+    threadId,
+    new Date().toISOString(),
+    userId,
+  );
   if (res.changes > 0) return threadId;
-  return readItemThread(workgroupId, itemId)?.thread_id ?? threadId;
+  return (await readItemThread(workgroupId, itemId))?.thread_id ?? threadId;
 }
 
 /**
  * The wired messaging group behind a thread id — the same "an agent can only be
  * made to speak where it belongs" check the claim-with-a-thread branch runs.
  */
-function wiredGroupForThread(agentGroupId: string, threadId: string): { id: string; name: string } | undefined {
-  return getRawDb()
-    .prepare(
-      `SELECT mg.id, mg.name
-         FROM messaging_group_agents mga
-         JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
-        WHERE mga.agent_group_id = ? AND mg.platform_id = ?`,
-    )
-    .get(agentGroupId, threadPlatformId(threadId)) as { id: string; name: string } | undefined;
+async function wiredGroupForThread(
+  agentGroupId: string,
+  threadId: string,
+): Promise<{ id: string; name: string } | undefined> {
+  return getDb().get<{ id: string; name: string }>(
+    `SELECT mg.id, mg.name
+       FROM messaging_group_agents mga
+       JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+      WHERE mga.agent_group_id = ? AND mg.platform_id = ?`,
+    agentGroupId,
+    await threadPlatformId(threadId),
+  );
 }
 
 /** '#Qa-Room' / 'qa-room' → 'qa-room', for name matching. Assign's rule, same reason. */
@@ -203,14 +209,13 @@ async function openThreadFor(
   title: string,
   firstMessage: string,
 ): Promise<{ threadId: string; messagingGroupId: string } | { error: Response }> {
-  const wired = getRawDb()
-    .prepare(
-      `SELECT mg.id, mg.name, mg.platform_id, mg.channel_type
-         FROM messaging_group_agents mga
-         JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
-        WHERE mga.agent_group_id = ?`,
-    )
-    .all(agentGroupId) as { id: string; name: string; platform_id: string; channel_type: string }[];
+  const wired = await getDb().all<{ id: string; name: string; platform_id: string; channel_type: string }>(
+    `SELECT mg.id, mg.name, mg.platform_id, mg.channel_type
+       FROM messaging_group_agents mga
+       JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+      WHERE mga.agent_group_id = ?`,
+    agentGroupId,
+  );
   const target = wired.find((m) => channelKey(m.name) === channelKey(channel));
   if (!target) return { error: json(409, { error: 'agent_not_wired_to_channel', channel }) };
 
@@ -266,9 +271,11 @@ export const observatorySteerHandler: AuthHandler = async (req, _params, ctx) =>
   const role = canAssign(ctx.user.id, agentGroupId);
   if (!role.ok) return json(role.reason === 'not_found' ? 404 : 403, { error: role.reason });
 
-  const agent = getRawDb()
-    .prepare(`SELECT * FROM agent_groups WHERE id = ? AND workgroup_id = ?`)
-    .get(agentGroupId, workgroupId) as AgentGroup | undefined;
+  const agent = await getDb().get<AgentGroup>(
+    `SELECT * FROM agent_groups WHERE id = ? AND workgroup_id = ?`,
+    agentGroupId,
+    workgroupId,
+  );
   if (!agent) return json(404, { error: 'agent_group_not_in_workgroup' });
 
   const targetId = claimSlug ?? itemId!;
@@ -287,7 +294,7 @@ export const observatorySteerHandler: AuthHandler = async (req, _params, ctx) =>
   let recordedOnClaim: boolean | null = null;
 
   if (itemId) {
-    const item = readReleaseState(workgroupId)?.items.find((i) => i.id === itemId);
+    const item = (await readReleaseState(workgroupId))?.items.find((i) => i.id === itemId);
     if (!item) return json(404, { error: 'item_not_on_board' });
     subject = `the board item ${item.id} — "${item.title}"`;
 
@@ -299,9 +306,9 @@ export const observatorySteerHandler: AuthHandler = async (req, _params, ctx) =>
     // twice in two places with no way to see the other.
     type Resolved = { error: Response } | { threadId: string; messagingGroupId: string; created: boolean };
     const resolved = await withItemThreadLock<Resolved>(`${workgroupId}:${itemId}`, async () => {
-      const known = readItemThread(workgroupId, itemId);
+      const known = await readItemThread(workgroupId, itemId);
       if (known) {
-        const target = wiredGroupForThread(agentGroupId, known.thread_id);
+        const target = await wiredGroupForThread(agentGroupId, known.thread_id);
         if (!target) return { error: json(409, { error: 'agent_not_wired_to_thread_channel' }) };
         return { threadId: known.thread_id, messagingGroupId: target.id, created: false };
       }
@@ -328,9 +335,9 @@ export const observatorySteerHandler: AuthHandler = async (req, _params, ctx) =>
       // Claim it before returning. Under the lock this always wins in-process;
       // the ON CONFLICT is what covers a restart landing mid-window, and it
       // hands back the incumbent rather than the thread we just opened.
-      const won = claimItemThread(workgroupId, itemId, opened.threadId, ctx.user.id);
+      const won = await claimItemThread(workgroupId, itemId, opened.threadId, ctx.user.id);
       if (won !== opened.threadId) {
-        const target = wiredGroupForThread(agentGroupId, won);
+        const target = await wiredGroupForThread(agentGroupId, won);
         if (!target) return { error: json(409, { error: 'agent_not_wired_to_thread_channel' }) };
         return { threadId: won, messagingGroupId: target.id, created: false };
       }
@@ -349,14 +356,14 @@ export const observatorySteerHandler: AuthHandler = async (req, _params, ctx) =>
 
     if (claim.threadId) {
       // Same rule as nudge: an agent can only be made to speak where it belongs.
-      const target = getRawDb()
-        .prepare(
-          `SELECT mg.id, mg.name
-           FROM messaging_group_agents mga
-           JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
-          WHERE mga.agent_group_id = ? AND mg.platform_id = ?`,
-        )
-        .get(agentGroupId, threadPlatformId(claim.threadId)) as { id: string; name: string } | undefined;
+      const target = await getDb().get<{ id: string; name: string }>(
+        `SELECT mg.id, mg.name
+         FROM messaging_group_agents mga
+         JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+        WHERE mga.agent_group_id = ? AND mg.platform_id = ?`,
+        agentGroupId,
+        await threadPlatformId(claim.threadId),
+      );
       if (!target) return json(409, { error: 'agent_not_wired_to_thread_channel' });
       threadId = claim.threadId;
       messagingGroupId = target.id;
@@ -421,7 +428,7 @@ export const observatorySteerHandler: AuthHandler = async (req, _params, ctx) =>
     ok: true,
     seriesId,
     threadId,
-    threadUrl: threadPermalink(threadId),
+    threadUrl: await threadPermalink(threadId),
     threadCreated,
     // The board already had a thread for this item and we posted into it, not
     // a new one. The UI says so rather than reporting a fresh send.

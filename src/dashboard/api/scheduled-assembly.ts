@@ -20,7 +20,7 @@ import { CronExpressionParser } from 'cron-parser';
 
 import { DATA_DIR, TIMEZONE } from '../../config.js';
 import { resolveGroupTimezone } from '../../container-config.js';
-import { getRawDb } from '../../db/connection.js';
+import { getDb } from '../../db/connection.js';
 import { log } from '../../log.js';
 import {
   readSessionInbound,
@@ -528,10 +528,10 @@ export async function buildDetailRow(
 ): Promise<ScheduledRow | null> {
   const location = locate(dataDir, agentGroupId, sessionId);
   const timezone = await resolveGroupTimezone(agentGroupId);
-  const central = getRawDb();
-  const ag = central.prepare('SELECT name, agent_provider FROM agent_groups WHERE id = ?').get(agentGroupId) as
-    | { name: string; agent_provider: string | null }
-    | undefined;
+  const ag = await getDb().get<{ name: string; agent_provider: string | null }>(
+    'SELECT name, agent_provider FROM agent_groups WHERE id = ?',
+    agentGroupId,
+  );
   // Key MUST match channelNameOf's lookup format (S7). channelNameOf is the
   // shared getter for BOTH the list and detail paths, and it (plus doAssemble's
   // list-path map) keys on a NUL (\0) separator — channel_type and platform_id
@@ -539,11 +539,12 @@ export async function buildDetailRow(
   // \0 cannot appear in either. All three sites must agree or the join silently
   // returns null.
   const mgByDest = new Map<string, string>();
-  for (const m of central.prepare('SELECT channel_type, platform_id, name FROM messaging_groups').all() as Array<{
+  const mgRows = await getDb().all<{
     channel_type: string;
     platform_id: string;
     name: string | null;
-  }>) {
+  }>('SELECT channel_type, platform_id, name FROM messaging_groups');
+  for (const m of mgRows) {
     if (m.name) mgByDest.set(`${m.channel_type}\0${m.platform_id}`, m.name);
   }
 
@@ -645,27 +646,21 @@ async function doAssemble(scopes: AuthScopes, options: ScheduledAssemblyOptions)
   const startGen = getScheduledCache().gen;
   const startedAt = Date.now();
 
-  const central = getRawDb();
-  const agentGroups = new Map(
-    (
-      central.prepare('SELECT id, name, agent_provider FROM agent_groups').all() as Array<{
-        id: string;
-        name: string;
-        agent_provider: string | null;
-      }>
-    ).map((g) => [g.id, g]),
-  );
+  const agentGroupRows = await getDb().all<{
+    id: string;
+    name: string;
+    agent_provider: string | null;
+  }>('SELECT id, name, agent_provider FROM agent_groups');
+  const agentGroups = new Map(agentGroupRows.map((g) => [g.id, g]));
+  const mgRows = await getDb().all<{
+    channel_type: string;
+    platform_id: string;
+    name: string | null;
+  }>('SELECT channel_type, platform_id, name FROM messaging_groups');
   const mgByDest = new Map(
-    (
-      central.prepare('SELECT channel_type, platform_id, name FROM messaging_groups').all() as Array<{
-        channel_type: string;
-        platform_id: string;
-        name: string | null;
-      }>
-    )
-      // S7: NUL (\0) key — byte-identical to channelNameOf's lookup + buildDetailRow's
-      // build map (collision-safe; channel_type/platform_id can't contain \0).
-      .map((m) => [`${m.channel_type}\0${m.platform_id}`, m.name ?? '']),
+    // S7: NUL (\0) key — byte-identical to channelNameOf's lookup + buildDetailRow's
+    // build map (collision-safe; channel_type/platform_id can't contain \0).
+    mgRows.map((m) => [`${m.channel_type}\0${m.platform_id}`, m.name ?? '']),
   );
 
   // Enumerate authorized sessions (scope filter — C7).
@@ -685,10 +680,10 @@ async function doAssemble(scopes: AuthScopes, options: ScheduledAssemblyOptions)
     sessionSql += ` AND agent_group_id IN (${scopes.allowed_group_ids.map(() => '?').join(', ')})`;
     sessionParams.push(...scopes.allowed_group_ids);
   }
-  const sessionRows = central.prepare(sessionSql).all(...sessionParams) as Array<{
+  const sessionRows = await getDb().all<{
     id: string;
     agent_group_id: string;
-  }>;
+  }>(sessionSql, ...sessionParams);
 
   const rows: ScheduledRow[] = [];
   const counts: Record<string, number> = { ...EMPTY_COUNTS };

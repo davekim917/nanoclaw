@@ -54,7 +54,7 @@
  * precisely `claim.sh`'s exit-3 condition. `expiring` and `stale` are both
  * already takeable, and `parked` is explicitly free.
  */
-import { getRawDb } from '../db/index.js';
+import { getDb } from '../db/connection.js';
 import { log } from '../log.js';
 import { resolveSession } from '../session-manager.js';
 import { readChannelDirectory, readClaimsByThread, threadChannelKey, wiredAgentsByChannel } from './api/threads.js';
@@ -113,21 +113,20 @@ interface ThreadAgent {
 }
 
 /** Active sessions on this thread, with the identity a claim owner is matched against. */
-function agentsOnThread(threadId: string): ThreadAgent[] {
-  return getRawDb()
-    .prepare(
-      `SELECT s.id AS session_id, ag.id AS agent_group_id, ag.name AS name, ag.folder AS folder
-         FROM sessions s
-         JOIN agent_groups ag ON ag.id = s.agent_group_id
-        WHERE s.thread_id = ? AND s.status = 'active'
-        ORDER BY COALESCE(s.last_outbound_at, s.last_active, s.created_at) DESC`,
-    )
-    .all(threadId) as ThreadAgent[];
+async function agentsOnThread(threadId: string): Promise<ThreadAgent[]> {
+  return getDb().all<ThreadAgent>(
+    `SELECT s.id AS session_id, ag.id AS agent_group_id, ag.name AS name, ag.folder AS folder
+       FROM sessions s
+       JOIN agent_groups ag ON ag.id = s.agent_group_id
+      WHERE s.thread_id = ? AND s.status = 'active'
+      ORDER BY COALESCE(s.last_outbound_at, s.last_active, s.created_at) DESC`,
+    threadId,
+  );
 }
 
 /** The workgroup-scoped claim on this thread, if any. */
-function claimOnThread(agentGroupIds: string[], threadId: string, now: number, claimsRoot?: string) {
-  return readClaimsByThread(agentGroupIds, now, claimsRoot).get(threadId) ?? null;
+async function claimOnThread(agentGroupIds: string[], threadId: string, now: number, claimsRoot?: string) {
+  return (await readClaimsByThread(agentGroupIds, now, claimsRoot)).get(threadId) ?? null;
 }
 
 /**
@@ -218,7 +217,7 @@ export async function sendThreadMessage(
   }
   if (!canSteer(ctx.user.id, agentGroupId).ok) return { status: 404, body: { error: 'not_found' } };
 
-  const onThread = agentsOnThread(threadId);
+  const onThread = await agentsOnThread(threadId);
   const target = onThread.find((a) => a.agent_group_id === agentGroupId) ?? null;
 
   let sessionId: string;
@@ -229,10 +228,8 @@ export async function sendThreadMessage(
     // Assign: the agent has never spoken here. Same wiring rule steer enforces —
     // an agent that is not wired to this thread's channel cannot be made to
     // speak in it, and a thread whose channel nothing names has no room at all.
-    const channelKey = threadChannelKey(threadId, readChannelDirectory().known);
-    const wired = wiredAgentsByChannel()
-      .get(channelKey)
-      ?.find((a) => a.agent_group_id === agentGroupId);
+    const channelKey = threadChannelKey(threadId, (await readChannelDirectory()).known);
+    const wired = (await wiredAgentsByChannel()).get(channelKey)?.find((a) => a.agent_group_id === agentGroupId);
     if (!wired) return { status: 409, body: { error: 'agent_not_wired_to_thread_channel', channel: channelKey } };
     const resolved = await resolveSession(agentGroupId, wired.messaging_group_id, threadId, wired.session_mode);
     sessionId = resolved.session.id;
@@ -240,13 +237,13 @@ export async function sendThreadMessage(
   }
 
   // ── Hand-over (§4 of the action model) ────────────────────────────────────
-  const claim = claimOnThread(
+  const claim = await claimOnThread(
     [...new Set([agentGroupId, ...onThread.map((a) => a.agent_group_id)])],
     threadId,
     now,
     deps.claimsRoot,
   );
-  const chosenName = target?.name ?? agentNameOf(agentGroupId);
+  const chosenName = target?.name ?? (await agentNameOf(agentGroupId));
   const holder =
     claim && claim.state === 'live'
       ? (onThread.find((a) => ownerMatchesAgent(claim.owner, { name: a.name, folder: a.folder })) ?? null)
@@ -319,10 +316,8 @@ export async function sendThreadMessage(
   };
 }
 
-function agentNameOf(agentGroupId: string): string {
-  const row = getRawDb().prepare('SELECT name FROM agent_groups WHERE id = ?').get(agentGroupId) as
-    | { name: string }
-    | undefined;
+async function agentNameOf(agentGroupId: string): Promise<string> {
+  const row = await getDb().get<{ name: string }>('SELECT name FROM agent_groups WHERE id = ?', agentGroupId);
   return row?.name ?? agentGroupId;
 }
 

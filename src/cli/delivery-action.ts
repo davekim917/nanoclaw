@@ -117,7 +117,7 @@ async function executeOnce(
   req: RequestFrame,
   ctx: { caller: 'agent'; sessionId: string; agentGroupId: string; messagingGroupId: string },
 ): Promise<ResponseFrame> {
-  const claim = claimCliRequest(ctx.sessionId, req.id, req.command);
+  const claim = await claimCliRequest(ctx.sessionId, req.id, req.command);
 
   if (claim.state === 'done') {
     log.info('CLI request replayed from the execution ledger — command not re-run', {
@@ -144,7 +144,7 @@ async function executeOnce(
           `It was NOT run again — check whether it took effect, then reissue the command if it did not.`,
       },
     };
-    completeCliRequest(ctx.sessionId, req.id, ambiguous);
+    await completeCliRequest(ctx.sessionId, req.id, ambiguous);
     return ambiguous;
   }
 
@@ -153,6 +153,6 @@ async function executeOnce(
   // A throw propagates with the claim still standing, so the delivery loop's
   // retry takes the `executing` branch above rather than dispatching again.
   const response = await dispatch(req, ctx);
-  completeCliRequest(ctx.sessionId, req.id, response);
+  await completeCliRequest(ctx.sessionId, req.id, response);
   return response;
 }

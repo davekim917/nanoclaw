@@ -55,7 +55,8 @@
  * target to be indistinguishable from a missing one and a guard can only ever
  * answer "denied".
  */
-import { getRawDb } from '../db/index.js';
+import { getAgentGroup } from '../db/agent-groups.js';
+import { getMessagingGroup } from '../db/messaging-groups.js';
 import { log } from '../log.js';
 import { ATTENTION_ITEM_PREFIX, type AttentionSourceEnv } from '../attention-sources.js';
 import { dispatch } from '../cli/dispatch.js';
@@ -66,7 +67,6 @@ import { personaName, roomPermalink } from './api/observatory.js';
 import { selectScopedAttentionItems, wiredAgentsByChannel } from './api/threads.js';
 import { ASSIGN_DEDUPE_MS, releaseItemAssignment, reserveItemAssignment } from './db/item-assignments.js';
 import { observatoryAssign, type ObservatoryAssignPayload } from './observatory-assign-guard.js';
-import type { AgentGroup } from '../types.js';
 import type { AuthHandler, AuthedRequestContext } from './router.js';
 
 const json = (status: number, body: unknown): Response =>
@@ -172,7 +172,7 @@ export async function assignAttentionItem(
 
   // The SAME join that produced the row's `assignable_agents`. Re-derived, never
   // trusted from the request.
-  const wired = wiredAgentsByChannel().get(item.channel_key) ?? [];
+  const wired = (await wiredAgentsByChannel()).get(item.channel_key) ?? [];
   const target = wired.find((a) => a.agent_group_id === agentGroupId) ?? null;
 
   const payload: ObservatoryAssignPayload = {
@@ -203,15 +203,13 @@ export async function assignAttentionItem(
     return json(404, { error: 'not_found' });
   }
 
-  const agent = getRawDb().prepare(`SELECT * FROM agent_groups WHERE id = ?`).get(agentGroupId) as
-    | AgentGroup
-    | undefined;
+  const agent = await getAgentGroup(agentGroupId);
   if (!agent) return json(404, { error: 'not_found' });
 
   // RESERVE BEFORE DISPATCH. A losing double-click fails here, having queued
   // nothing — a record written after its side effect cannot prevent the side
   // effect happening twice.
-  if (!reserveItemAssignment(item.workgroupId, itemId, agentGroupId, ctx.user.id, now, ASSIGN_DEDUPE_MS)) {
+  if (!(await reserveItemAssignment(item.workgroupId, itemId, agentGroupId, ctx.user.id, now, ASSIGN_DEDUPE_MS))) {
     return json(409, { error: 'already_assigned' });
   }
 
@@ -249,14 +247,14 @@ export async function assignAttentionItem(
 
   if (!res.ok) {
     // Nothing was queued, so nothing may keep holding the item.
-    releaseItemAssignment(item.workgroupId, itemId);
+    await releaseItemAssignment(item.workgroupId, itemId);
     log.warn('observatory assign: task create failed', { itemId: item.id, agentGroupId, error: res });
     return json(502, { error: 'task_create_failed' });
   }
 
-  const room = getRawDb()
-    .prepare(`SELECT name, channel_type, platform_id FROM messaging_groups WHERE id = ?`)
-    .get(target!.messaging_group_id) as { name: string; channel_type: string; platform_id: string } | undefined;
+  // `getMessagingGroup` stays synchronous forever (seam 3 §4.2 — it is called
+  // from inside raw transaction closures elsewhere); no await here.
+  const room = getMessagingGroup(target!.messaging_group_id);
   const seriesId = (res.data as { series_id?: string } | null | undefined)?.series_id ?? null;
   log.info('observatory assign', {
     userId: ctx.user.id,

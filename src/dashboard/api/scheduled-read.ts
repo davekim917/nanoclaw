@@ -13,7 +13,7 @@
  * See docs/specs/scheduled-tasks-board/design.md §3a, §4.1, §4.2, §4.4, §4.5.
  */
 import { DATA_DIR } from '../../config.js';
-import { getRawDb } from '../../db/connection.js';
+import { getDb } from '../../db/connection.js';
 import { log } from '../../log.js';
 import {
   readSessionInbound,
@@ -95,18 +95,15 @@ interface RepairAuditRow {
   ts: string;
 }
 
-function repairRows(nowMs: number, liveSeriesIds: Set<string>): ScheduledRow[] {
-  const db = getRawDb();
+async function repairRows(nowMs: number, liveSeriesIds: Set<string>): Promise<ScheduledRow[]> {
   let auditRows: RepairAuditRow[];
   try {
-    auditRows = db
-      .prepare(
-        `SELECT action, agent_group_id, session_id, series_id, ts
-           FROM scheduled_audit
-          WHERE action IN ('move_restore_failed', 'move_intent')
-            AND resolved_at IS NULL`,
-      )
-      .all() as RepairAuditRow[];
+    auditRows = await getDb().all<RepairAuditRow>(
+      `SELECT action, agent_group_id, session_id, series_id, ts
+         FROM scheduled_audit
+        WHERE action IN ('move_restore_failed', 'move_intent')
+          AND resolved_at IS NULL`,
+    );
   } catch {
     // Table absent (uninstalled / pre-migration) — no repair rows to surface.
     return [];
@@ -177,7 +174,7 @@ export const scheduledListHandler: AuthHandler = async (req, _params, ctx) => {
   }
 
   const liveSeriesIds = new Set(snapshot.rows.map((r) => r.series_id));
-  const repair = repairRows(nowMs, liveSeriesIds);
+  const repair = await repairRows(nowMs, liveSeriesIds);
   const allRows = [...snapshot.rows, ...repair];
 
   // Per-caller scope filter (C7 — disclose-as-not-found: out-of-scope rows are
@@ -334,24 +331,24 @@ interface AuditTailRow {
   correlation_id: string | null;
 }
 
-function readAuditTail(seriesId: string): AuditTailRow[] {
+async function readAuditTail(seriesId: string): Promise<AuditTailRow[]> {
   try {
-    return getRawDb()
-      .prepare(
-        `SELECT ts, actor, action, before_preview, after_preview, correlation_id
-           FROM scheduled_audit WHERE series_id = ? ORDER BY id DESC LIMIT 20`,
-      )
-      .all(seriesId) as AuditTailRow[];
+    return await getDb().all<AuditTailRow>(
+      `SELECT ts, actor, action, before_preview, after_preview, correlation_id
+         FROM scheduled_audit WHERE series_id = ? ORDER BY id DESC LIMIT 20`,
+      seriesId,
+    );
   } catch {
     return [];
   }
 }
 
-function cancelAuditTsMs(seriesId: string): number | null {
+async function cancelAuditTsMs(seriesId: string): Promise<number | null> {
   try {
-    const row = getRawDb()
-      .prepare("SELECT ts FROM scheduled_audit WHERE series_id = ? AND action = 'cancel' ORDER BY id ASC LIMIT 1")
-      .get(seriesId) as { ts: string } | undefined;
+    const row = await getDb().get<{ ts: string }>(
+      "SELECT ts FROM scheduled_audit WHERE series_id = ? AND action = 'cancel' ORDER BY id ASC LIMIT 1",
+      seriesId,
+    );
     return row ? parseUtcMs(row.ts) : null;
   } catch {
     return null;
@@ -439,7 +436,7 @@ export const scheduledDetailHandler: AuthHandler = async (_req, params, ctx) => 
   const prompt = typeof parsed.prompt === 'string' ? parsed.prompt : live.content;
   const script = typeof parsed.script === 'string' ? (parsed.script as string) : null;
 
-  const cancelTsMs = cancelAuditTsMs(decoded.seriesId);
+  const cancelTsMs = await cancelAuditTsMs(decoded.seriesId);
   const history = readHistory(location, decoded.seriesId, cancelTsMs);
 
   const body: Record<string, unknown> = { row, prompt, script, history };
@@ -448,7 +445,7 @@ export const scheduledDetailHandler: AuthHandler = async (_req, params, ctx) => 
   // read-only in-scope caller never sees the tail (M5 — delta hashes/previews
   // and move provenance stay above the read tier).
   if (canManageScheduled(ctx.user.id)) {
-    body.audit_tail = readAuditTail(decoded.seriesId);
+    body.audit_tail = await readAuditTail(decoded.seriesId);
   }
 
   return json(body);

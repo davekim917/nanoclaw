@@ -85,7 +85,7 @@ beforeEach(async () => {
   vi.clearAllMocks();
   _resetSteerDedupeForTesting();
   mockGetAdapter.mockReturnValue(undefined);
-  mockReleaseState.mockReturnValue(null);
+  mockReleaseState.mockResolvedValue(null);
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'steer-claims-'));
   mockClaimsRoot.mockReturnValue(tmpRoot);
 
@@ -294,7 +294,7 @@ describe('observatorySteerHandler — a claim with no thread', () => {
 });
 
 describe('observatorySteerHandler — release-board items', () => {
-  const itemsAre = (items: object[]) => mockReleaseState.mockReturnValue({ asOf: '', items } as never);
+  const itemsAre = (items: object[]) => mockReleaseState.mockResolvedValue({ asOf: '', items } as never);
 
   it('opens a thread in the room the BOARD gives the item, and steers into it', async () => {
     const postParent = vi.fn().mockResolvedValue({ messageId: '1712999999.000100' });
