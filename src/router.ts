@@ -643,7 +643,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
         // pin to every future channel is a worse bug than the one this fixes.
         const inheritedTone = unanimousToneFor(inheritedAgent.id, mg.channel_type);
         const isGroup = event.message.isGroup ?? mg.is_group === 1;
-        createMessagingGroupAgent({
+        const wiring: MessagingGroupAgent = {
           id: `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           messaging_group_id: mg.id,
           agent_group_id: inheritedAgent.id,
@@ -666,7 +666,16 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
           // silently extend a scoped rule set past its scope.
           instructions_profile: null,
           created_at: new Date().toISOString(),
-        });
+        };
+        // Lookup-then-insert on the async driver: a concurrent route can win the
+        // same wiring; adopt it instead of failing this message (seam 3 primitive).
+        await insertOrAdopt(
+          wiring,
+          async (candidate) => {
+            createMessagingGroupAgent(candidate);
+          },
+          async () => (await getMessagingGroupAgents(mg.id)).find((w) => w.agent_group_id === inheritedAgent.id),
+        );
         log.info('Workspace-trust auto-wire', {
           messagingGroupId: mg.id,
           inheritedFrom: inheritedAgent.sourceMessagingGroupId,

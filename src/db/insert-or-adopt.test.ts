@@ -75,7 +75,7 @@ describe('isUniqueViolation', () => {
 // ── Tripwire ──
 
 /** The three central-DB inserts whose tables carry a racy unique key. */
-const GUARDED_CALLS = ['createSession(', 'createMessagingGroup(', 'createAgentGroup('];
+const GUARDED_CALLS = ['createSession(', 'createMessagingGroup(', 'createAgentGroup(', 'createMessagingGroupAgent('];
 
 /** Roots scanned for bare callers. Relative to the repo root. */
 const SCAN_ROOTS = ['src', 'scripts', 'setup'];

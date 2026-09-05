@@ -17,7 +17,13 @@
  */
 import { recordDroppedMessage } from '../../db/dropped-messages.js';
 import { getAgentGroup, getAllAgentGroups } from '../../db/agent-groups.js';
-import { createMessagingGroupAgent, getMessagingGroup, setMessagingGroupDeniedAt } from '../../db/messaging-groups.js';
+import {
+  createMessagingGroupAgent,
+  getMessagingGroup,
+  setMessagingGroupDeniedAt,
+  getMessagingGroupAgents,
+} from '../../db/messaging-groups.js';
+import { insertOrAdopt } from '../../db/insert-or-adopt.js';
 import { resolveWiringDefaults } from '../../channels/channel-defaults.js';
 import {
   completeDeferredInbound,
@@ -476,7 +482,7 @@ async function wireApprovedChannel(
   }
 
   const mgaId = `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  createMessagingGroupAgent({
+  const wiring: MessagingGroupAgent = {
     id: mgaId,
     messaging_group_id: row.messaging_group_id,
     agent_group_id: agentGroupId,
@@ -496,7 +502,16 @@ async function wireApprovedChannel(
     default_tone: null,
     instructions_profile: null,
     created_at: new Date().toISOString(),
-  });
+  };
+  // Lookup-then-insert on the async driver: a concurrent route can win the
+  // same wiring; adopt it instead of failing this message (seam 3 primitive).
+  await insertOrAdopt(
+    wiring,
+    async (candidate) => {
+      createMessagingGroupAgent(candidate);
+    },
+    async () => (await getMessagingGroupAgents(row.messaging_group_id)).find((w) => w.agent_group_id === agentGroupId),
+  );
   log.info('Channel registration approved — wiring created', {
     messagingGroupId: row.messaging_group_id,
     agentGroupId,
