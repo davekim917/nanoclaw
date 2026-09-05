@@ -58,9 +58,12 @@ import {
   CONTAINER_RUNTIME_BIN,
   hostGatewayArgs,
   killContainerHard,
+  listInstallContainersWithScope,
   readonlyMountArgs,
   runtimeShowsRunning,
   stopContainer,
+  waitForContainerExit,
+  type InstallContainerScope,
 } from './container-runtime.js';
 import { checkAgentRunnerDepsDrift } from './agent-runner-image-check.js';
 import { requestContainerRebuild } from './container-rebuild-watcher.js';
@@ -1002,7 +1005,12 @@ export function wakeContainer(
     log.debug('Container wake ignored — host shutdown in progress', { sessionId: session.id });
     return Promise.resolve(false);
   }
-  if (activeContainers.has(session.id)) {
+  // P4 (plan §4.3.4): a survivor of the previous host that this one could not
+  // claim at boot is alive and UNTRACKED, so the running fast path below cannot
+  // see it. Consulted first, and routed to the adoption retry — never to the
+  // spawn path, which would start a second container beside it.
+  const pendingAdoption = pendingAdoptions.has(session.id);
+  if (!pendingAdoption && activeContainers.has(session.id)) {
     log.debug('Container already running', { sessionId: session.id });
     return Promise.resolve(true);
   }
@@ -1032,70 +1040,85 @@ export function wakeContainer(
   }
 
   return trackWake(session.id, async () => {
-    if (!(await checkStorageAdmission(session, false))) return false;
-    // First await behind us. Nothing is held yet — storage admission takes no
-    // lease and the memory request has not been made — so this bail releases
-    // nothing. Everything below runs on the fresh row.
-    const admitted = await refreshActiveSession(session, 'storage-admission');
-    if (!admitted) return false;
-
-    const admission = getMemoryAdmission();
-    const agentGroup = await getAgentGroup(admitted.agent_group_id);
-    if (!agentGroup) {
-      log.error('Container wake rejected — agent group not found', {
-        sessionId: admitted.id,
-        agentGroupId: admitted.agent_group_id,
-      });
-      return false;
+    if (pendingAdoption) {
+      if (await retryPendingAdoption(session)) return true;
+      // The survivor is gone: a fresh spawn is the correct answer, and the
+      // ordinary path below takes it — the claim fence (P2) re-proves absence
+      // on its own before the process exists.
     }
-    let effectiveResources;
-    try {
-      effectiveResources = resolveContainerResources(readContainerConfig(agentGroup.folder).resources);
-    } catch (err) {
-      log.error('Container wake rejected — invalid resource configuration', {
-        sessionId: admitted.id,
-        agentGroup: agentGroup.folder,
-        err,
-      });
-      return false;
-    }
-
-    // Priority is part of the atomic admission decision. A task-only wake must
-    // never enter as interactive and be demoted afterward: it could otherwise
-    // reserve free memory and bypass an older scheduled head before demotion.
-    // The queued payload is what startReservedWake later resumes on, so it must
-    // be the fresh row — not the caller's snapshot — even though that row is
-    // itself re-read again at dequeue.
-    const decision = admission.request(
-      admitted.id,
-      effectiveResources.memory.requestMb,
-      { session: admitted, guard: options.guard },
-      priority,
-    );
-    if (decision.status === 'rejected') {
-      log.error('Container wake rejected — memory request exceeds host budget', {
-        sessionId: admitted.id,
-        agentGroup: agentGroup.folder,
-        requestMb: decision.requestMb,
-        budgetMb: decision.budgetMb,
-      });
-      return false;
-    }
-    if (decision.status === 'queued') {
-      log.warn('Container wake queued — memory budget exhausted', {
-        sessionId: admitted.id,
-        agentGroup: agentGroup.folder,
-        requestMb: decision.requestMb,
-        budgetMb: decision.budgetMb,
-        reservedMb: admission.reservedMb,
-        position: decision.position,
-        priority,
-      });
-      return false;
-    }
-
-    return spawnReservedContainer(admitted, options.guard);
+    return runWake(session, priority, options);
   });
+}
+
+/** The ordinary wake: storage admission → memory admission → reserved spawn. */
+async function runWake(
+  session: Session,
+  priority: MemoryAdmissionPriority,
+  options: WakeContainerOptions,
+): Promise<boolean> {
+  if (!(await checkStorageAdmission(session, false))) return false;
+  // First await behind us. Nothing is held yet — storage admission takes no
+  // lease and the memory request has not been made — so this bail releases
+  // nothing. Everything below runs on the fresh row.
+  const admitted = await refreshActiveSession(session, 'storage-admission');
+  if (!admitted) return false;
+
+  const admission = getMemoryAdmission();
+  const agentGroup = await getAgentGroup(admitted.agent_group_id);
+  if (!agentGroup) {
+    log.error('Container wake rejected — agent group not found', {
+      sessionId: admitted.id,
+      agentGroupId: admitted.agent_group_id,
+    });
+    return false;
+  }
+  let effectiveResources;
+  try {
+    effectiveResources = resolveContainerResources(readContainerConfig(agentGroup.folder).resources);
+  } catch (err) {
+    log.error('Container wake rejected — invalid resource configuration', {
+      sessionId: admitted.id,
+      agentGroup: agentGroup.folder,
+      err,
+    });
+    return false;
+  }
+
+  // Priority is part of the atomic admission decision. A task-only wake must
+  // never enter as interactive and be demoted afterward: it could otherwise
+  // reserve free memory and bypass an older scheduled head before demotion.
+  // The queued payload is what startReservedWake later resumes on, so it must
+  // be the fresh row — not the caller's snapshot — even though that row is
+  // itself re-read again at dequeue.
+  const decision = admission.request(
+    admitted.id,
+    effectiveResources.memory.requestMb,
+    { session: admitted, guard: options.guard },
+    priority,
+  );
+  if (decision.status === 'rejected') {
+    log.error('Container wake rejected — memory request exceeds host budget', {
+      sessionId: admitted.id,
+      agentGroup: agentGroup.folder,
+      requestMb: decision.requestMb,
+      budgetMb: decision.budgetMb,
+    });
+    return false;
+  }
+  if (decision.status === 'queued') {
+    log.warn('Container wake queued — memory budget exhausted', {
+      sessionId: admitted.id,
+      agentGroup: agentGroup.folder,
+      requestMb: decision.requestMb,
+      budgetMb: decision.budgetMb,
+      reservedMb: admission.reservedMb,
+      position: decision.position,
+      priority,
+    });
+    return false;
+  }
+
+  return spawnReservedContainer(admitted, options.guard);
 }
 
 /**
@@ -1120,6 +1143,12 @@ export function isContainerSpawnWorkgroupAllowed(
 
 function startReservedWake(queued: QueuedWake): Promise<boolean> {
   const { session, guard } = queued;
+  // The second running fast path, and P4 sits in front of it too: a queued
+  // wake for a pending adoption must not spend its reservation on a spawn.
+  if (pendingAdoptions.has(session.id)) {
+    releaseMemoryReservation(session.id);
+    return wakeContainer(session, 'interactive', { guard });
+  }
   if (activeContainers.has(session.id)) return Promise.resolve(true);
   const existing = wakePromises.get(session.id);
   if (existing) return existing;
@@ -2031,6 +2060,384 @@ export function killContainer(
   }
   recordStopIntent(sessionId, intent);
   stopRunningContainer(sessionId, reason, onExit ? [onExit] : []);
+}
+
+// ── Adoption (seam 4 series E, plan §4.3, §7.E) ───────────────────────────────
+
+/** What `adoptRunningSessions` found and did, logged once per boot. */
+export interface StartupReconciliation {
+  /** Containers registered as adopted entries. */
+  adopted: number;
+  /** Containers stopped: no session label, no session row, or a session that cannot take a wake. */
+  stopped: number;
+  /** Containers left running unadopted because the claim could not be taken; the wake path retries (P4). */
+  pendingClaim: number;
+  /** Adopted sessions whose inbound DB carries an ACTIVE repository ingress fence (counted, not acted on). */
+  fencedInbound: number;
+}
+
+/**
+ * Sessions whose survivor could not be claimed at adoption: a write failure, a
+ * lost CAS, or a claim a live peer holds. Alive and untracked — exactly what
+ * the running fast path cannot see — so `wakeContainer` consults this set
+ * FIRST and routes a hit to `retryPendingAdoption` rather than the spawn path.
+ */
+const pendingAdoptions = new Set<string>();
+
+/**
+ * The runtime listing adoption reads, replaceable for tests. `adoptRunningSessions`
+ * pins whatever it was handed so the wake-path retry re-lists through the same
+ * source the boot pass did.
+ */
+let adoptionListing: () => InstallContainerScope[] = listInstallContainersWithScope;
+
+/**
+ * Backoff before an adopted entry's waiter is re-armed after a close the
+ * runtime contradicted. `docker wait` against an unreachable daemon exits at
+ * once, so a re-arm without a pause would spin.
+ */
+const ADOPTED_WAITER_REARM_MS = 5_000;
+let adoptedWaiterRearmMs = ADOPTED_WAITER_REARM_MS;
+
+export function hasPendingAdoption(sessionId: string): boolean {
+  return pendingAdoptions.has(sessionId);
+}
+
+export function _resetAdoptionStateForTesting(options: { waiterRearmMs?: number } = {}): void {
+  pendingAdoptions.clear();
+  adoptionListing = listInstallContainersWithScope;
+  adoptedWaiterRearmMs = options.waiterRearmMs ?? ADOPTED_WAITER_REARM_MS;
+}
+
+/**
+ * F1 hook: reconcile a survivor's unconsumed `on_wake` rows.
+ *
+ * Series F (seam4/f-on-wake-stop-intent) supplies the body — the mailbox op
+ * that converts or withdraws the rows a dead host left for a container that
+ * was never stopped. E owns the call site: once per adopted session, after the
+ * claim fence and the registry write (`registerAdoptedContainer`). Until F
+ * lands this reconciles nothing and reports zeros.
+ */
+export async function reconcileSurvivorWakeRows(_session: Session): Promise<{ converted: number; withdrawn: number }> {
+  return { converted: 0, withdrawn: 0 };
+}
+
+type AdoptedChannel = Extract<SupervisionChannel, { kind: 'adopted' }>;
+
+/**
+ * Listen on the CURRENT waiter of an adopted channel. `close` is a hint, not a
+ * terminal (§4.3.3): `onWaiterClose` checks it against the runtime first.
+ * `error` (the waiter could not even start) is handled the same way; the
+ * `handled` latch keeps the pair from re-reading truth twice for one exit.
+ */
+function armAdoptedWaiter(sessionId: string, channel: AdoptedChannel, containerName: string): void {
+  const waiter = channel.waiter;
+  const stderrTail: string[] = [];
+  waiter.stdout?.on('data', () => {});
+  waiter.stderr?.on('data', (chunk: Buffer | string) => {
+    const line = String(chunk).trim();
+    if (!line) return;
+    stderrTail.push(line);
+    if (stderrTail.length > 5) stderrTail.shift();
+  });
+  let handled = false;
+  const onExit = (code: number | null): void => {
+    if (handled) return;
+    handled = true;
+    onWaiterClose(sessionId, channel, containerName, code, stderrTail);
+  };
+  waiter.on('close', onExit);
+  waiter.on('error', (err) => {
+    log.warn('Adopted container waiter failed', { sessionId, containerName, err });
+    onExit(null);
+  });
+}
+
+/**
+ * The waiter-close truth re-read (plan §4.3.3, property 5). A docker-daemon
+ * restart exits every waiter at once and would read as a fleet-wide terminal;
+ * so the runtime is asked before anything is finalized. Still running →
+ * re-arm. Cannot be asked → treated as still running, re-arm. Gone → the
+ * container's real terminal, finalize. `No such container` from `docker wait`
+ * lands on the "gone" side through the same read, so it is never re-armed.
+ */
+function onWaiterClose(
+  sessionId: string,
+  channel: AdoptedChannel,
+  containerName: string,
+  code: number | null,
+  stderrTail: string[],
+): void {
+  if (activeContainers.get(sessionId)?.channel !== channel) {
+    // A waiter the registry no longer owns (the entry was replaced or already
+    // finalized). Nothing shared to touch; the fence inside logs it.
+    finalizeSession(sessionId, channel, null, containerName);
+    return;
+  }
+  let running: boolean;
+  try {
+    running = runtimeShowsRunning(containerName);
+  } catch (err) {
+    log.warn(
+      'Adopted container waiter exited but the runtime could not be asked — treating it as running and re-arming',
+      {
+        sessionId,
+        containerName,
+        code,
+        stderrTail,
+        err,
+      },
+    );
+    scheduleWaiterRearm(sessionId, channel, containerName);
+    return;
+  }
+  if (running) {
+    log.warn('Adopted container waiter exited but the container is still running — re-arming', {
+      sessionId,
+      containerName,
+      code,
+      stderrTail,
+    });
+    scheduleWaiterRearm(sessionId, channel, containerName);
+    return;
+  }
+  log.info('Adopted container exited', { sessionId, containerName, code, stderrTail });
+  finalizeSession(sessionId, channel, null, containerName);
+}
+
+function scheduleWaiterRearm(sessionId: string, channel: AdoptedChannel, containerName: string): void {
+  const timer = setTimeout(() => {
+    // Replaced or finalized while the backoff ran: nothing to observe any more.
+    if (activeContainers.get(sessionId)?.channel !== channel) return;
+    try {
+      channel.waiter = waitForContainerExit(containerName);
+    } catch (err) {
+      log.warn('Could not re-arm the adopted container waiter — retrying after backoff', {
+        sessionId,
+        containerName,
+        err,
+      });
+      scheduleWaiterRearm(sessionId, channel, containerName);
+      return;
+    }
+    armAdoptedWaiter(sessionId, channel, containerName);
+  }, adoptedWaiterRearmMs);
+  timer.unref();
+}
+
+/**
+ * Register a container this host did not spawn, after its claim is held.
+ *
+ * Mirrors the spawn path's registration with three deliberate differences:
+ * the channel is a `docker wait` observer, `storageActivity` is null (no lease
+ * is held for a container this host did not start), and `spawnedAt` is the
+ * adoption instant — the honest ceiling anchor for a container whose real
+ * start this host never saw. The heartbeat file is NOT cleared: it is the
+ * survivor's own, and the sweep reads it as evidence the container is alive.
+ * The `running` status write is awaited only after the waiter is armed, for
+ * the same reason the spawn path attaches its exit handlers first.
+ */
+async function registerAdoptedContainer(
+  session: Session,
+  containerName: string,
+  claimIncarnation: number,
+): Promise<void> {
+  const channel: AdoptedChannel = {
+    kind: 'adopted',
+    waiter: waitForContainerExit(containerName),
+    terminal: new EventEmitter(),
+    settled: false,
+  };
+  activeContainers.set(session.id, {
+    channel,
+    containerName,
+    spawnedAt: Date.now(),
+    adopted: true,
+    storageActivity: null,
+    claimIncarnation,
+  });
+  everSeenRunningSessions.add(session.id);
+  armAdoptedWaiter(session.id, channel, containerName);
+  // F1 hook: reconcileSurvivorWakeRows(session)
+  await reconcileSurvivorWakeRows(session);
+  try {
+    await markContainerRunning(session.id);
+  } catch (err) {
+    log.warn('markContainerRunning failed after adoption', { sessionId: session.id, err });
+  }
+}
+
+type AdoptionOutcome = { outcome: 'adopted'; fencedInbound: boolean } | { outcome: 'pending' };
+
+/**
+ * Take the claim for a survivor and register it. Property 1 (§7.E): claim
+ * before adopt, and never adopt unfenced — every path out of a failed or lost
+ * claim leaves the container running and untracked, recorded in
+ * `pendingAdoptions` so the wake path retries rather than spawning into it.
+ */
+async function adoptRunningSession(session: Session, containerName: string): Promise<AdoptionOutcome> {
+  let claimIncarnation: number | null;
+  try {
+    claimIncarnation = await claimSessionRun(session.id, containerName, { adopting: true });
+  } catch (err) {
+    log.error('Session claim write failed during adoption — leaving the container unadopted for retry', {
+      sessionId: session.id,
+      containerName,
+      err,
+    });
+    pendingAdoptions.add(session.id);
+    return { outcome: 'pending' };
+  }
+  if (claimIncarnation === null) {
+    log.warn('Session adoption skipped — another live host process holds the claim', {
+      sessionId: session.id,
+      containerName,
+    });
+    pendingAdoptions.add(session.id);
+    return { outcome: 'pending' };
+  }
+  try {
+    await registerAdoptedContainer(session, containerName, claimIncarnation);
+  } catch (err) {
+    // The waiter could not be created: the claim is held with nothing to
+    // supervise it. Hand it back and let the wake path retry the whole step.
+    log.error('Could not register an adopted container — releasing its claim for retry', {
+      sessionId: session.id,
+      containerName,
+      err,
+    });
+    activeContainers.delete(session.id);
+    await releaseClaimQuietly(session.id, claimIncarnation);
+    pendingAdoptions.add(session.id);
+    return { outcome: 'pending' };
+  }
+  pendingAdoptions.delete(session.id);
+  // §4.3.6: a survivor may sit behind an ACTIVE fence the dead host wrote.
+  // Counted so the case is visible; `releaseOrphanedRepoIngressFencesAtStartup`
+  // owns the release and runs after adoption.
+  let fencedInbound = false;
+  try {
+    fencedInbound =
+      (await withExistingMailboxSession(
+        session.agent_group_id,
+        session.id,
+        (mailbox) => mailbox.readRepoIngressFence()?.state === 'active',
+      )) === true;
+  } catch (err) {
+    log.warn("Could not read an adopted session's inbound fence", { sessionId: session.id, err });
+  }
+  return { outcome: 'adopted', fencedInbound };
+}
+
+function stopUnadoptable(containerName: string, why: string, sessionId: string | null): void {
+  try {
+    stopContainer(containerName);
+    log.info('Stopped an unadoptable container at startup', { containerName, sessionId, why });
+  } catch (err) {
+    log.warn('Failed to stop an unadoptable container at startup', { containerName, sessionId, why, err });
+  }
+}
+
+/**
+ * Adopt the containers a previous host process left running (plan §7.E).
+ *
+ * Runs once at boot, after the quiescence door and BEFORE every wake source and
+ * before the orphaned-fence recovery (P3; `src/adoption-order.test.ts` pins
+ * both). A listing failure adopts nothing and returns all zeros: adoption that
+ * cannot see the runtime must not guess, and the boot door has already run its
+ * own fail-closed proof. A container with no session label, no session row, or
+ * a session that cannot take a wake is stopped — a survivor without an owner
+ * is a writer without a reader.
+ */
+export async function adoptRunningSessions(
+  deps: { list?: () => InstallContainerScope[] } = {},
+): Promise<StartupReconciliation> {
+  if (deps.list) adoptionListing = deps.list;
+  const counts: StartupReconciliation = { adopted: 0, stopped: 0, pendingClaim: 0, fencedInbound: 0 };
+  let containers: InstallContainerScope[];
+  try {
+    containers = adoptionListing();
+  } catch (err) {
+    log.warn('Session adoption skipped — runtime listing failed', { err });
+    return counts;
+  }
+  for (const container of containers) {
+    if (!container.sessionId) {
+      stopUnadoptable(container.name, 'no session label', null);
+      counts.stopped += 1;
+      continue;
+    }
+    let session: Session | undefined;
+    try {
+      session = await getSession(container.sessionId);
+    } catch (err) {
+      log.error('Session adoption deferred — the session row could not be read', {
+        sessionId: container.sessionId,
+        containerName: container.name,
+        err,
+      });
+      pendingAdoptions.add(container.sessionId);
+      counts.pendingClaim += 1;
+      continue;
+    }
+    const reason = unwakeableReason(session);
+    if (reason !== null) {
+      stopUnadoptable(container.name, reason, container.sessionId);
+      counts.stopped += 1;
+      continue;
+    }
+    if (activeContainers.has(container.sessionId)) {
+      // A second container for a session already tracked: two writers.
+      stopUnadoptable(container.name, 'session already has a tracked container', container.sessionId);
+      counts.stopped += 1;
+      continue;
+    }
+    const result = await adoptRunningSession(session!, container.name);
+    if (result.outcome === 'pending') {
+      counts.pendingClaim += 1;
+      continue;
+    }
+    counts.adopted += 1;
+    if (result.fencedInbound) counts.fencedInbound += 1;
+  }
+  // F2 hook: honorPendingStopIntents() — series F re-issues the durable stop
+  // intents a dead host left mid-restart, here, after every survivor is tracked.
+  log.info('Reconciled sessions at startup', { ...counts });
+  return counts;
+}
+
+/**
+ * P4: a wake for a session whose survivor could not be claimed at boot.
+ *
+ * Re-lists from the runtime. Container gone → cleared, `false`, and the caller
+ * falls through to a fresh spawn, which is correct. Still there → the same
+ * claim-then-register step boot took; a claim the runtime or the store refuses
+ * THROWS, so `trackWake` reports the wake failed and the sweep retries — and
+ * no spawn happens. A listing that cannot be taken throws for the same reason.
+ */
+async function retryPendingAdoption(session: Session): Promise<boolean> {
+  const survivor = adoptionListing().find((container) => container.sessionId === session.id);
+  if (!survivor) {
+    pendingAdoptions.delete(session.id);
+    log.info('Pending adoption cleared — the container is gone, a fresh spawn is correct', {
+      sessionId: session.id,
+    });
+    return false;
+  }
+  const fresh = await refreshActiveSession(session, 'pending-adoption');
+  if (!fresh) {
+    // The session stopped being wakeable while its survivor waited: the same
+    // answer boot gives such a container.
+    stopUnadoptable(survivor.name, 'session cannot take a wake', session.id);
+    pendingAdoptions.delete(session.id);
+    return false;
+  }
+  const result = await adoptRunningSession(fresh, survivor.name);
+  if (result.outcome === 'pending') {
+    throw new Error(`session ${session.id} has a running container this host could not claim — not spawning`);
+  }
+  log.info('Adopted a pending survivor on wake', { sessionId: session.id, containerName: survivor.name });
+  return true;
 }
 
 /**

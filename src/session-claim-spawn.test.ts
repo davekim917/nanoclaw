@@ -65,6 +65,23 @@ vi.mock('./container-runtime.js', async (importOriginal) => ({
     if (hooks.runtimeListingFails) throw new Error('Cannot connect to the Docker daemon');
     return hooks.runtimeRunning.has(name);
   },
+  // The adopter's supervision channel, faked so the P2-bypass case never
+  // spawns a real `docker wait`. Never exits; the case releases it explicitly.
+  waitForContainerExit: () => {
+    const waiter = new (hooks.EventEmitter as typeof import('node:events').EventEmitter)() as unknown as {
+      exitCode: number | null;
+      kill: () => boolean;
+      stdout: null;
+      stderr: null;
+      emit: (event: string, ...args: unknown[]) => boolean;
+    };
+    waiter.exitCode = null;
+    waiter.stdout = null;
+    waiter.stderr = null;
+    waiter.kill = () => true;
+    hooks.waiters.push(waiter);
+    return waiter as unknown as import('child_process').ChildProcess;
+  },
 }));
 
 /**
@@ -102,7 +119,11 @@ const hooks = vi.hoisted(() => ({
   runtimeListingFails: false,
   /** How many times the claim asked the runtime. */
   runtimeCalls: 0,
+  /** Fake `docker wait` observers handed to the adopter. */
+  waiters: [] as Array<{ exitCode: number | null; emit: (event: string, ...args: unknown[]) => boolean }>,
+  EventEmitter: null as null | typeof import('node:events').EventEmitter,
   reset(): void {
+    this.waiters = [];
     this.events.length = 0;
     this.runtimeRunning.clear();
     this.runtimeListingFails = false;
@@ -270,6 +291,7 @@ vi.mock('fs', async (importOriginal) => {
 });
 
 import crypto from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import fsNode from 'node:fs';
 import path from 'node:path';
 import BetterSqlite3 from 'better-sqlite3';
@@ -277,11 +299,13 @@ import ts from 'typescript';
 import type fs from 'fs';
 
 import {
+  adoptRunningSessions,
   hasContainerEverRun,
   isContainerRunning,
   killContainer,
   stopAllContainers,
   wakeContainer,
+  _resetAdoptionStateForTesting,
   _resetEverSeenRunningForTest,
 } from './container-runner.js';
 import { getSessionClaim } from './db/coordination.js';
@@ -293,6 +317,8 @@ import { log } from './log.js';
 import { allowSubprocess } from './test-hermeticity.js';
 import type { MemoryAdmissionResult } from './memory-admission.js';
 import type { Session } from './types.js';
+
+hooks.EventEmitter = EventEmitter;
 
 const STAMP = '2026-09-05T00:00:00.000Z';
 const AGENT_GROUP_ID = 'ag-session-claim';
@@ -421,6 +447,7 @@ async function waitForFinalize(sessionId: string): Promise<void> {
 describe('claim-first spawn', () => {
   beforeEach(async () => {
     hooks.reset();
+    _resetAdoptionStateForTesting();
     _resetEverSeenRunningForTest();
     vi.mocked(log.warn).mockClear();
     vi.mocked(log.info).mockClear();
@@ -857,6 +884,44 @@ describe('claim-first spawn', () => {
     ).toHaveLength(1);
     const claim = await getSessionClaim('sess-unprovable');
     expect([claim?.incarnation, claim?.claimed_by]).toEqual([3, 'dead-host']);
+  });
+
+  it('the adopter bypasses P2', async () => {
+    await seedSession('sess-adopter');
+    // The exact state P2 refuses a SPAWN in: a takeover-able claim whose
+    // container is still running. The adopter is holding that container by
+    // definition, so it must take the claim without asking the runtime.
+    await seedForeignClaim('sess-adopter', 'dead-host', 3);
+    hooks.runtimeRunning.add('nanoclaw-v2-dead-host');
+
+    const reconciled = await adoptRunningSessions({
+      list: () => [
+        {
+          name: 'nanoclaw-v2-dead-host',
+          workgroupId: 'wg-session-claim',
+          sessionId: 'sess-adopter',
+          groupId: AGENT_GROUP_ID,
+        },
+      ],
+    });
+
+    expect(reconciled.adopted).toBe(1);
+    expect(hooks.runtimeCalls, 'the adopter asked the runtime about its own container').toBe(0);
+    expect(hooks.events).toContain('claim:sess-adopter:4');
+    const claim = await getSessionClaim('sess-adopter');
+    expect([claim?.incarnation, claim?.claimed_by, claim?.container_ref]).toEqual([
+      4,
+      getHostInstanceId(),
+      'nanoclaw-v2-dead-host',
+    ]);
+    expect(isContainerRunning('sess-adopter')).toBe(true);
+
+    // Let the survivor exit so the entry does not outlive the case.
+    hooks.runtimeRunning.clear();
+    const waiter = hooks.waiters.at(-1)!;
+    waiter.exitCode = 0;
+    waiter.emit('close', 0);
+    await waitForFinalize('sess-adopter');
   });
 
   // LAST runtime case in the file, deliberately: `stopAllContainers()` latches
