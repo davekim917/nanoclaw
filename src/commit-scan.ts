@@ -42,7 +42,7 @@ let timer: NodeJS.Timeout | null = null;
 export function startCommitScan(): void {
   if (timer) return;
   timer = setTimeout(function tick() {
-    runScan().catch((err) => log.error('Commit scan failed', { err }));
+    runCommitScanOnce().catch((error) => log.error('Commit scan failed', { error: errorMessage(error) }));
     timer = setTimeout(tick, SCAN_INTERVAL_MS);
     timer.unref?.();
   }, STARTUP_DELAY_MS);
@@ -65,17 +65,17 @@ onHostStart(function commitScanHostStart() {
 onHostShutdown(function commitScanHostShutdown() {
   try {
     stopCommitScan();
-  } catch (err) {
-    log.error('Commit scan failed to stop', { err });
+  } catch (error) {
+    log.error('Commit scan failed to stop', { error: errorMessage(error) });
   }
 });
 
-async function runScan(): Promise<void> {
+export async function runCommitScanOnce(groupsDir: string = GROUPS_DIR): Promise<void> {
   const groups = await getAllAgentGroups();
   let totalRepos = 0;
   let totalCommits = 0;
   for (const group of groups) {
-    const groupDir = path.join(GROUPS_DIR, group.folder);
+    const groupDir = path.join(groupsDir, group.folder);
     if (!fs.existsSync(groupDir)) continue;
     const repos = discoverRepos(groupDir);
     for (const repoDir of repos) {
@@ -90,14 +90,11 @@ async function runScan(): Promise<void> {
 }
 
 function isGitRepo(dir: string): boolean {
-  try {
-    return fs.existsSync(path.join(dir, '.git'));
-  } catch {
-    return false;
-  }
+  if (!fs.existsSync(path.join(dir, '.git'))) return false;
+  return readGit(dir, ['rev-parse', '--is-inside-work-tree'], 'validate checkout')?.trim() === 'true';
 }
 
-function discoverRepos(root: string): string[] {
+export function discoverRepos(root: string): string[] {
   const repos: string[] = [];
   if (isGitRepo(root)) repos.push(root);
   let entries: fs.Dirent[];
@@ -114,6 +111,31 @@ function discoverRepos(root: string): string[] {
   return repos;
 }
 
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
+
+function readGit(repoDir: string, args: string[], operation: string, timeout = 5000): string | null {
+  try {
+    return execFileSync('git', args, {
+      cwd: repoDir,
+      encoding: 'utf-8',
+      timeout,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).toString();
+  } catch (error) {
+    const stderr = (error as { stderr?: unknown }).stderr;
+    const stderrText = Buffer.isBuffer(stderr) ? stderr.toString('utf8').trim() : String(stderr ?? '').trim();
+    log.debug('Commit scan Git command failed', {
+      repo: repoDir,
+      operation,
+      error: stderrText ? `${errorMessage(error)}: ${stderrText}` : errorMessage(error),
+    });
+    return null;
+  }
+}
+
 interface CommitInfo {
   sha: string;
   shortSha: string;
@@ -128,26 +150,15 @@ function parseCommitLine(line: string): CommitInfo {
 }
 
 function getDefaultBranch(repoDir: string): string | null {
-  try {
-    const stdout = execFileSync('git', ['symbolic-ref', 'refs/remotes/origin/HEAD'], {
-      cwd: repoDir,
-      encoding: 'utf-8',
-      timeout: 5000,
-    }).toString();
+  const stdout = readGit(repoDir, ['symbolic-ref', 'refs/remotes/origin/HEAD'], 'read default branch');
+  if (stdout !== null) {
     const ref = stdout.trim();
     const match = ref.match(/^refs\/remotes\/origin\/(.+)$/);
     if (match) return match[1];
-  } catch {
+  } else {
     for (const branch of ['main', 'master', 'develop']) {
-      try {
-        execFileSync('git', ['rev-parse', '--verify', `refs/heads/${branch}`], {
-          cwd: repoDir,
-          encoding: 'utf-8',
-          timeout: 5000,
-        });
+      if (readGit(repoDir, ['rev-parse', '--verify', `refs/heads/${branch}`], `verify default branch ${branch}`)) {
         return branch;
-      } catch {
-        continue;
       }
     }
   }
@@ -155,14 +166,7 @@ function getDefaultBranch(repoDir: string): string | null {
 }
 
 function fetchOrigin(repoDir: string): void {
-  try {
-    execFileSync('git', ['fetch', '--quiet', '--no-tags', 'origin'], {
-      cwd: repoDir,
-      encoding: 'utf-8',
-      timeout: 30_000,
-      stdio: ['ignore', 'ignore', 'ignore'],
-    });
-  } catch {
+  if (readGit(repoDir, ['fetch', '--quiet', '--no-tags', 'origin'], 'fetch origin', 30_000) === null) {
     // Network failure, auth missing, repo without origin — fall through and
     // scan whatever the local refs already have. Loud failure here would
     // suppress every repo's data on a transient blip.
@@ -170,53 +174,39 @@ function fetchOrigin(repoDir: string): void {
 }
 
 function getLatestCommitSha(repoDir: string, branch: string): string | null {
-  try {
-    const stdout = execFileSync('git', ['rev-parse', branch], {
-      cwd: repoDir,
-      encoding: 'utf-8',
-      timeout: 5000,
-    }).toString();
-    return stdout.trim() || null;
-  } catch {
-    return null;
-  }
+  const stdout = readGit(repoDir, ['rev-parse', branch], `read latest commit ${branch}`);
+  return stdout?.trim() || null;
 }
 
 function getDirectCommitsSince(repoDir: string, branch: string, sinceSha: string): CommitInfo[] {
-  try {
-    const stdout = execFileSync(
-      'git',
-      ['log', '--no-merges', '--first-parent', '--format=%H%x00%h%x00%s%x00%an%x00%aI', `${sinceSha}..${branch}`],
-      { cwd: repoDir, encoding: 'utf-8', timeout: 10000 },
-    ).toString();
-    if (!stdout.trim()) return [];
-    return stdout.trim().split('\n').map(parseCommitLine).reverse();
-  } catch {
-    return [];
-  }
+  const stdout = readGit(
+    repoDir,
+    ['log', '--no-merges', '--first-parent', '--format=%H%x00%h%x00%s%x00%an%x00%aI', `${sinceSha}..${branch}`],
+    'read direct commits',
+    10_000,
+  );
+  if (!stdout?.trim()) return [];
+  return stdout.trim().split('\n').map(parseCommitLine).reverse();
 }
 
 function getRecentCommits(repoDir: string, branch: string, limit: number): CommitInfo[] {
-  try {
-    const stdout = execFileSync(
-      'git',
-      [
-        'log',
-        '--no-merges',
-        '--first-parent',
-        '-n',
-        String(limit),
-        '--format=%H%x00%h%x00%s%x00%an%x00%aI',
-        `--since=${FIRST_SCAN_WINDOW_HOURS} hours ago`,
-        branch,
-      ],
-      { cwd: repoDir, encoding: 'utf-8', timeout: 10000 },
-    ).toString();
-    if (!stdout.trim()) return [];
-    return stdout.trim().split('\n').map(parseCommitLine).reverse();
-  } catch {
-    return [];
-  }
+  const stdout = readGit(
+    repoDir,
+    [
+      'log',
+      '--no-merges',
+      '--first-parent',
+      '-n',
+      String(limit),
+      '--format=%H%x00%h%x00%s%x00%an%x00%aI',
+      `--since=${FIRST_SCAN_WINDOW_HOURS} hours ago`,
+      branch,
+    ],
+    'read recent commits',
+    10_000,
+  );
+  if (!stdout?.trim()) return [];
+  return stdout.trim().split('\n').map(parseCommitLine).reverse();
 }
 
 function scanRepo(repoDir: string, agentGroupId: string): number {

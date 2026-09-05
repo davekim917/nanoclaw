@@ -1,4 +1,13 @@
+import { EventEmitter } from 'node:events';
+
 import { afterEach, describe, expect, it, beforeEach, vi } from 'vitest';
+
+const { TEST_DATA_DIR } = vi.hoisted(() => ({ TEST_DATA_DIR: uniqueTmpRoot('container-runner') }));
+
+vi.mock('./config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./config.js')>()),
+  DATA_DIR: TEST_DATA_DIR,
+}));
 
 // Only the wake-admission block below needs this; an unguarded wakeContainer
 // also resolves false here by throwing on the uninitialized DB and being caught.
@@ -132,6 +141,7 @@ import {
   materializeCodexFallbackRuntime,
   resolveProviderName,
   channelInstructionsMounts,
+  captureContainerStderr,
   resolveAtlassianMcpServer,
   resolveWorkgroupMemoryLockMount,
   resolveWorkgroupMemoryMount,
@@ -1449,6 +1459,22 @@ describe('container boot-failure tripwire (structural)', () => {
     const src = fs.readFileSync(path.join(process.cwd(), 'src', 'container-runner.ts'), 'utf-8');
     expect(src).toContain('stderrTail.push(line)');
     expect(src).toMatch(/Container exited non-zero.*stderrTail/s);
+  });
+});
+
+describe('container stderr attribution', () => {
+  it('records stderr bytes with the actual container name and preserves the exit tail', () => {
+    const stderr = new EventEmitter();
+    const tail: string[] = [];
+    const lines = Array.from({ length: 12 }, (_, index) => `line ${index + 1}`);
+    vi.mocked(log.debug).mockClear();
+
+    captureContainerStderr(stderr as unknown as NodeJS.ReadableStream, 'container-fixture', tail);
+    stderr.emit('data', Buffer.from(`${lines.join('\n')}\n`));
+
+    expect(log.debug).toHaveBeenNthCalledWith(1, 'line 1', { containerName: 'container-fixture' });
+    expect(log.debug).toHaveBeenNthCalledWith(12, 'line 12', { containerName: 'container-fixture' });
+    expect(tail).toEqual(lines.slice(-10));
   });
 });
 

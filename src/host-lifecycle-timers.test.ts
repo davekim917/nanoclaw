@@ -184,7 +184,7 @@ describe('a timer that fails to start still aborts boot, and a failing interval 
     process.on('unhandledRejection', onUnhandledRejection);
 
     let callCount = 0;
-    // commit-scan's runScan() calls getAllAgentGroups() unguarded at its top
+    // commit-scan's runCommitScanOnce() calls getAllAgentGroups() unguarded at its top
     // — a real external dependency, not a same-module binding — so mocking
     // it to throw exercises the module's actual (already-`.catch`ed) wiring
     // rather than a synthetic stand-in.
@@ -212,13 +212,10 @@ describe('a timer that fails to start still aborts boot, and a failing interval 
       const commitScan = await import('./commit-scan.js');
       commitScan.startCommitScan();
 
-      // STARTUP_DELAY_MS (90s): fires the first tick, which throws inside runScan().
+      // STARTUP_DELAY_MS (90s): fires the first tick, which throws inside runCommitScanOnce().
       await vi.advanceTimersByTimeAsync(90_000);
       expect(callCount).toBe(1);
-      expect(logMock.error).toHaveBeenCalledWith(
-        'Commit scan failed',
-        expect.objectContaining({ err: expect.any(Error) }),
-      );
+      expect(logMock.error).toHaveBeenCalledWith('Commit scan failed', { error: 'tick boom' });
 
       // SCAN_INTERVAL_MS (10min): the next tick still fires despite the prior throw.
       await vi.advanceTimersByTimeAsync(10 * 60 * 1000);

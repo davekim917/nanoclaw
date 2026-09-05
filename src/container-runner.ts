@@ -1343,14 +1343,7 @@ async function spawnContainer(
   // binary, bad config) explains itself only here — and debug is below the
   // default log level — so keep a tail to surface on a non-zero exit.
   const stderrTail: string[] = [];
-  container.stderr?.on('data', (data) => {
-    for (const line of data.toString().trim().split('\n')) {
-      if (!line) continue;
-      log.debug(line, { container: agentGroup.folder });
-      stderrTail.push(line);
-      if (stderrTail.length > 10) stderrTail.shift();
-    }
-  });
+  captureContainerStderr(container.stderr, containerName, stderrTail);
 
   // stdout is unused in v2 (all IO is via session DB)
   container.stdout?.on('data', () => {});
@@ -1414,6 +1407,21 @@ async function spawnContainer(
 
   // Every handler is registered; only now may this function yield.
   await markContainerRunning(session.id);
+}
+
+export function captureContainerStderr(
+  stderr: NodeJS.ReadableStream | null,
+  containerName: string,
+  stderrTail: string[],
+): void {
+  stderr?.on('data', (data) => {
+    for (const line of data.toString().trim().split('\n')) {
+      if (!line) continue;
+      log.debug(line, { containerName });
+      stderrTail.push(line);
+      if (stderrTail.length > 10) stderrTail.shift();
+    }
+  });
 }
 
 /**
