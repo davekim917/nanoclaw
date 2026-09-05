@@ -18,6 +18,7 @@ import {
   assertDistinctInstances,
   assertSameWorkspace,
   channelTypeForInstance,
+  main,
   normalizeInstance,
   parseArgs,
   tokenEnvKey,
@@ -168,4 +169,25 @@ describe('open-a2a-room refuses two spellings of one instance', () => {
     // bots must not pass for them.
     expect(() => assertDistinctInstances(['dana', 'eli', 'slack-eli'])).toThrow(/lists the same instance twice/);
   });
+});
+
+it('stops duplicate resolved identities before opening a room', async () => {
+  env.values = { SLACK_BOT_TOKEN_SYNTHETIC_ONE: 'xoxb-test-one', SLACK_BOT_TOKEN_SYNTHETIC_TWO: 'xoxb-test-two' };
+  const fetchMock = vi.fn().mockResolvedValue({
+    json: async () => ({ ok: true, user_id: 'U0BOT', team_id: 'T0TEST' }),
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+  try {
+    await expect(main(['--instances', 'synthetic-one,synthetic-two', '--user', 'U0HUMAN'])).rejects.toThrow(
+      'instances "synthetic-one" and "synthetic-two" resolve to the same Slack bot user',
+    );
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      'https://slack.com/api/auth.test',
+      'https://slack.com/api/auth.test',
+    ]);
+  } finally {
+    vi.unstubAllGlobals();
+    log.mockRestore();
+  }
 });

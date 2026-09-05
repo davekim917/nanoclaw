@@ -243,8 +243,8 @@ async function resolveAuth(name: string): Promise<SlackAuth> {
   };
 }
 
-async function main(): Promise<void> {
-  const { instances, user } = parseArgs(process.argv.slice(2));
+export async function main(argv = process.argv.slice(2)): Promise<void> {
+  const { instances, user } = parseArgs(argv);
 
   console.log(`Resolving bot identities for: ${instances.join(', ')}`);
   const auths: SlackAuth[] = [];
