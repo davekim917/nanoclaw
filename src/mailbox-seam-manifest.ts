@@ -107,11 +107,12 @@ export const UNPORTABLE_UPSTREAM_FILES: ReadonlyArray<{
     forkTest: 'src/modules/mailbox/registry.test.ts',
     reason:
       "Four assertions describe upstream's tree, not the migration's end state. It reads " +
-      'src/modules/scheduling/task-content.ts and src/modules/cross-session-context/prune.ts, neither of ' +
-      'which exists in this fork. It forbids better-sqlite3 and .prepare( in session-manager.ts and ' +
-      'host-sweep.ts, where the fork legitimately holds CENTRAL-DB access the seam never claimed. And it ' +
-      'expects src/index.ts to import the modules barrel, where the fork keeps a three-line deploy ' +
-      'crash-guard shim and the barrel import is one file further in (main.ts).',
+      'src/modules/cross-session-context/prune.ts, which does not exist in this fork (theme T3 — scheduling — ' +
+      'ported src/modules/scheduling/task-content.ts, so that half of the original objection no longer holds, ' +
+      'but the assertion as a whole still describes upstream, not this fork). It forbids better-sqlite3 and ' +
+      '.prepare( in session-manager.ts and host-sweep.ts, where the fork legitimately holds CENTRAL-DB access ' +
+      'the seam never claimed. And it expects src/index.ts to import the modules barrel, where the fork keeps ' +
+      'a three-line deploy crash-guard shim and the barrel import is one file further in (main.ts).',
   },
 ] as const;
 

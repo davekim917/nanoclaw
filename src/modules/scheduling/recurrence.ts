@@ -6,10 +6,9 @@
  * cron-parser, insert a fresh pending row (copying series_id forward), then
  * clear the recurrence on the original so it isn't re-cloned next tick.
  *
- * Called from `src/host-sweep.ts` inside `MODULE-HOOK:scheduling-recurrence`.
- * When scheduling ships inline (current state through PR #7), the hook is a
- * direct dynamic import. When scheduling moves to the modules branch in
- * PR #8, the install skill re-fills the marker on install.
+ * Called from `src/modules/sweep-scheduling/index.ts` (the S18 duty, inside
+ * the `MODULE-HOOK:scheduling-recurrence` marker) via a dynamic import of
+ * this file.
  */
 import { withQuietInvalidationSync } from '../../db/sessions.js';
 import { CronExpressionParser } from 'cron-parser';

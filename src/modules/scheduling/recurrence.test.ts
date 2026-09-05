@@ -238,6 +238,53 @@ describe('handleRecurrence', () => {
     expect(follow.process_after).toMatch(/T03:30:00/);
   });
 
+  // CLAUDE.md: "an already-armed occurrence keeps the absolute instant it was
+  // armed at — a live series moves onto the new grid at its next re-arm, so a
+  // daily task can fire once more at the old local time." `handleRecurrence`
+  // only ever reads COMPLETED rows (`getCompletedRecurringRows`), so a live
+  // PENDING successor is simply never touched by a later sweep tick — this
+  // pins that the timezone change does not reach into it.
+  it('keeps an already-armed occurrence at its instant across a group timezone change; the next re-arm uses the new grid', async () => {
+    // Zone A: no override → falls back to the mocked install TIMEZONE (Asia/Tokyo).
+    containerConfigState.timezone = null;
+    const db = freshDb();
+    insertTaskRow(db, {
+      id: 'task-cross-tz',
+      seriesId: 'task-cross-tz',
+      processAfter: '2020-01-01T00:00:00.000Z',
+      recurrence: '0 9 * * *',
+      content: JSON.stringify({ prompt: 'daily digest' }),
+    });
+    db.prepare(`UPDATE messages_in SET status='completed' WHERE id='task-cross-tz'`).run();
+
+    // Arm the first successor under zone A (Asia/Tokyo: 09:00 local === 00:00 UTC).
+    await handleRecurrence(sessionFor(db), fakeSession());
+    const armedUnderA = db.prepare(`SELECT id, process_after FROM messages_in WHERE id != 'task-cross-tz'`).get() as {
+      id: string;
+      process_after: string;
+    };
+    expect(armedUnderA.process_after).toMatch(/T00:00:00/);
+
+    // Change the group's override to zone B (Asia/Kolkata) with the successor
+    // still PENDING — no re-arm has run on it yet.
+    containerConfigState.timezone = 'Asia/Kolkata';
+    await handleRecurrence(sessionFor(db), fakeSession());
+    const stillPending = db
+      .prepare(`SELECT process_after, status FROM messages_in WHERE id = ?`)
+      .get(armedUnderA.id) as { process_after: string; status: string };
+    expect(stillPending.status).toBe('pending');
+    expect(stillPending.process_after, 'the armed occurrence must keep its instant').toBe(armedUnderA.process_after);
+
+    // Only once that occurrence itself completes does the NEXT re-arm land on
+    // the new grid (Asia/Kolkata: 09:00 local === 03:30 UTC).
+    db.prepare(`UPDATE messages_in SET status='completed' WHERE id = ?`).run(armedUnderA.id);
+    await handleRecurrence(sessionFor(db), fakeSession());
+    const armedUnderB = db
+      .prepare(`SELECT process_after FROM messages_in WHERE id NOT IN ('task-cross-tz', ?)`)
+      .get(armedUnderA.id) as { process_after: string };
+    expect(armedUnderB.process_after).toMatch(/T03:30:00/);
+  });
+
   it('does not clone rows whose recurrence is already cleared', async () => {
     const db = freshDb();
     insertTaskRow(db, {

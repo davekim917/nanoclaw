@@ -1649,6 +1649,38 @@ describe('tasks CLI resource', () => {
       expect(rows.map((r) => r.action)).toEqual(['create', 'delete']);
     });
 
+    // The fork treats the run-log file as durable history that survives a
+    // series' close (src/modules/sweep-scheduling/index.ts's S19 duty comment).
+    // `deleteRunLog` exists (ported from upstream) but `mutateTask`'s delete
+    // path never calls it — this pins that `ncl tasks delete` is a mailbox-row
+    // operation only, never a filesystem one.
+    it('delete leaves the series run log on disk', async () => {
+      const created = await dispatch(
+        { id: 'a-d2', command: 'tasks-create', args: { prompt: 'x', process_after: '2999-01-01T00:00:00Z' } },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(created.ok).toBe(true);
+      if (!created.ok) return;
+      const { series_id } = created.data as { series_id: string };
+
+      const logged = await dispatch(
+        { id: 'a-d2-log', command: 'tasks-append-log', args: { id: series_id, msg: 'ran once' } },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(logged.ok).toBe(true);
+      const logPath = `${TEST_DIR}/groups/ag-1/tasks/${series_id}.md`;
+      expect(fs.existsSync(logPath)).toBe(true);
+
+      const deleted = await dispatch(
+        { id: 'a-d2-del', command: 'tasks-delete', args: { id: series_id } },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(deleted.ok).toBe(true);
+
+      expect(fs.existsSync(logPath), 'the run log must survive the delete').toBe(true);
+      expect(fs.readFileSync(logPath, 'utf8')).toContain('ran once');
+    });
+
     it('pause, resume, and run each write their own action row; a host caller is recorded as actor "host"', async () => {
       const created = await dispatch(
         {

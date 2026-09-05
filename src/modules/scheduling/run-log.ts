@@ -32,3 +32,19 @@ export async function appendRunLog(
   fs.appendFileSync(file, `${timestamp} — ${msg}\n`);
   return { series, timestamp, path: file };
 }
+
+/**
+ * Delete a series' run-log file. Exported for parity with upstream's
+ * `deleteRunLog`, but **not called from `ncl tasks delete`**: the fork treats
+ * the run log as durable history that survives a series' close (see
+ * `src/modules/sweep-scheduling/index.ts`'s S19 duty comment — "the durable
+ * history and survives the close"). A future `--purge-log` flag on `ncl tasks
+ * delete` is the sanctioned way to wire this in; that is a product decision
+ * for the operator, not a port decision, and is out of scope here.
+ */
+export async function deleteRunLog(agentGroupId: string, series: string): Promise<void> {
+  if (!/^[a-z0-9-]+$/.test(series)) throw new Error(`invalid task id: ${series}`);
+  const ag = await getAgentGroup(agentGroupId);
+  if (!ag) throw new Error(`agent group not found: ${agentGroupId}`);
+  fs.rmSync(`${GROUPS_DIR}/${ag.folder}/tasks/${series}.md`, { force: true });
+}
