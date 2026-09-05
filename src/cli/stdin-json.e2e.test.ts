@@ -1,4 +1,11 @@
 import { spawn } from 'node:child_process';
+
+// Node prints an `[UNDICI-EHPA]` warning to stderr when NODE_USE_ENV_PROXY is set in the
+// parent shell; these tests assert an empty stderr, so the child gets a copy without it.
+function childEnv(): NodeJS.ProcessEnv {
+  const { NODE_USE_ENV_PROXY: _drop, ...env } = process.env;
+  return env;
+}
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -119,7 +126,7 @@ function runCli(
       '--stdin-json',
       '--json',
     ],
-    { cwd, stdio: ['pipe', 'pipe', 'pipe'] },
+    { cwd, stdio: ['pipe', 'pipe', 'pipe'], env: childEnv() },
   );
 
   let stdout = '';

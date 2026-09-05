@@ -105,6 +105,8 @@ describe('host CLI flags', () => {
         cwd: process.cwd(),
         encoding: 'utf8',
         input: '{"broken":',
+        // strip the NODE_USE_ENV_PROXY undici warning from the child's stderr
+        env: (({ NODE_USE_ENV_PROXY: _drop, ...env }) => env)(process.env),
       },
     );
 
