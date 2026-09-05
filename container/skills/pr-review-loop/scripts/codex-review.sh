@@ -10,7 +10,9 @@
 #   codex-review.sh push [git push args…]     # gate, then push — the loop's only push path
 #   codex-review.sh reply <comment_id> <text> # reply on that thread
 #   codex-review.sh resolve <thread_id>       # mark the thread resolved
-#   codex-review.sh status <sha> <since_iso>  # codex=<pending|clean|findings> open=<n> review=<n> reaction=<n> rounds=<n>
+#   codex-review.sh status <sha> <since_iso>  # codex=<pending|clean|findings|head-changed> head=<sha> open=<n> review=<n> last_review_at=<iso|none> reaction=<n> last_thumbs_up_at=<iso|none> rounds=<n>
+#   codex-review.sh wait <sha> <since_iso> [minutes]
+#                                             # foreground GraphQL poll, default $CODEX_REVIEW_WAIT_MINUTES or 15
 #                                             # open/status print a STOP banner at rounds>=4 — diagnose, do not push
 #
 # `gate` is the rule the advisory detector never was: three rounds on ONE
@@ -122,6 +124,157 @@ threads() {
   printf '%s' "$raw" | jq -c '.data.repository.pullRequest.reviewThreads.nodes[]
           | select(.isResolved | not)
           | select(.comments.nodes[0].author.login | ascii_downcase | startswith("chatgpt-codex-connector"))'
+}
+
+# The status poll uses GraphQL for each connection rather than REST's separate
+# /reviews and /reactions surfaces. Each connection paginates independently:
+# `reviewThreads`, reviews, and reactions can all exceed one page at different
+# times, so a shared cursor would either skip data or loop forever.
+review_threads_page() {
+  gh api graphql -f query='
+    query($owner:String!,$name:String!,$pr:Int!,$after:String){
+      repository(owner:$owner,name:$name){ pullRequest(number:$pr){
+        headRefOid reviewThreads(first:100,after:$after){ pageInfo{hasNextPage endCursor} nodes{
+          isResolved comments(first:1){ nodes{ author{login} pullRequestReview{id} } }
+        } }
+      } }
+    }' \
+    -F owner="$OWNER" -F name="$NAME" -F pr="$PR" -F after="$1"
+}
+
+reviews_page() {
+  gh api graphql -f query='
+    query($owner:String!,$name:String!,$pr:Int!,$after:String){
+      repository(owner:$owner,name:$name){ pullRequest(number:$pr){
+        headRefOid reviews(first:100,after:$after){ pageInfo{hasNextPage endCursor} nodes{
+          author{login} submittedAt commit{oid}
+        } }
+      } }
+    }' \
+    -F owner="$OWNER" -F name="$NAME" -F pr="$PR" -F after="$1"
+}
+
+reactions_page() {
+  gh api graphql -f query='
+    query($owner:String!,$name:String!,$pr:Int!,$after:String){
+      repository(owner:$owner,name:$name){ pullRequest(number:$pr){
+        headRefOid reactions(first:100,after:$after){ pageInfo{hasNextPage endCursor} nodes{
+          content createdAt user{login}
+        } }
+      } }
+    }' \
+    -F owner="$OWNER" -F name="$NAME" -F pr="$PR" -F after="$1"
+}
+
+paginate_connection() {
+  local connection="$1" page_fn="$2" cursor="null" page has_next next_cursor seen_cursors=$'\nnull\n'
+  while :; do
+    page=$("$page_fn" "$cursor") || {
+      echo "GraphQL $connection request failed" >&2
+      return 1
+    }
+    printf '%s\n' "$page"
+    has_next=$(printf '%s' "$page" | jq -r ".data.repository.pullRequest.$connection.pageInfo.hasNextPage | if type == \"boolean\" then tostring else error(\"hasNextPage is not boolean\") end") || {
+      echo "GraphQL $connection response is missing pagination metadata" >&2
+      return 1
+    }
+    case "$has_next" in
+      false) return 0 ;;
+      true) ;;
+      *)
+        echo "GraphQL $connection pagination returned invalid hasNextPage=$has_next" >&2
+        return 1
+        ;;
+    esac
+    next_cursor=$(printf '%s' "$page" | jq -er ".data.repository.pullRequest.$connection.pageInfo.endCursor") || {
+      echo "GraphQL $connection pagination returned no next cursor" >&2
+      return 1
+    }
+    if [[ "$seen_cursors" == *$'\n'"$next_cursor"$'\n'* ]]; then
+      echo "GraphQL $connection pagination repeated cursor $next_cursor" >&2
+      return 1
+    fi
+    seen_cursors+="$next_cursor"$'\n'
+    cursor="$next_cursor"
+  done
+}
+
+# One complete observation of the exact pushed head. Review and reaction
+# evidence must be newer than SINCE so a previous round cannot bless this one.
+# Unresolved Codex threads intentionally have no date filter: an older thread
+# remains open work until it is replied to and resolved.
+status_observation() {
+  local sha="$1" since="$2" thread_pages review_pages reaction_pages
+  local observed_heads head_count head_changed head_oid open_count review_matches review_count last_review_at reaction_matches reaction_count last_thumbs_up_at rounds codex
+
+  # Read verdict evidence before threads: a review submitted between these
+  # requests must have its findings included before we can declare it clean.
+  review_pages=$(paginate_connection reviews reviews_page) || return 1
+  reaction_pages=$(paginate_connection reactions reactions_page) || return 1
+  thread_pages=$(paginate_connection reviewThreads review_threads_page) || return 1
+
+  observed_heads=$(printf '%s\n%s\n%s\n' "$thread_pages" "$review_pages" "$reaction_pages" | jq -ers '
+    [ .[] | .data.repository.pullRequest.headRefOid ] | unique') || return 1
+  head_count=$(printf '%s' "$observed_heads" | jq -er 'length') || return 1
+  if [ "$head_count" -eq 0 ]; then
+    echo "GraphQL poll did not return a PR head" >&2
+    return 1
+  fi
+  if [ "$head_count" -ne 1 ]; then
+    head_oid=inconsistent
+    head_changed=1
+  else
+    head_oid=$(printf '%s' "$observed_heads" | jq -er '.[0]') || return 1
+    if [[ "$head_oid" != "$sha"* ]]; then head_changed=1; else head_changed=0; fi
+  fi
+
+  open_count=$(printf '%s\n' "$thread_pages" | jq -s '
+    [ .[] | .data.repository.pullRequest.reviewThreads.nodes[]
+      | select(.isResolved | not)
+      | select((.comments.nodes[0].author.login // "") | ascii_downcase | startswith("chatgpt-codex-connector"))
+    ] | length') || return 1
+  rounds=$(printf '%s\n' "$thread_pages" | jq -s '
+    [ .[] | .data.repository.pullRequest.reviewThreads.nodes[]
+      | select((.comments.nodes[0].author.login // "") | ascii_downcase | startswith("chatgpt-codex-connector"))
+      | .comments.nodes[0].pullRequestReview.id // empty
+    ] | unique | length') || return 1
+  review_matches=$(printf '%s\n' "$review_pages" | jq -cs --arg sha "$head_oid" --arg since "$since" '
+    [ .[] | .data.repository.pullRequest.reviews.nodes[]
+      | select((.author.login // "") | ascii_downcase | startswith("chatgpt-codex-connector"))
+      | select((.commit.oid // "") | startswith($sha))
+      | select(.submittedAt != null and .submittedAt > $since)
+    ]') || return 1
+  review_count=$(printf '%s' "$review_matches" | jq -er 'length') || return 1
+  last_review_at=$(printf '%s\n' "$review_pages" | jq -ers '
+    ([ .[] | .data.repository.pullRequest.reviews.nodes[]
+       | select((.author.login // "") | ascii_downcase | startswith("chatgpt-codex-connector"))
+       | .submittedAt
+     ] | max) // "none"') || return 1
+  reaction_matches=$(printf '%s\n' "$reaction_pages" | jq -cs --arg since "$since" '
+    [ .[] | .data.repository.pullRequest.reactions.nodes[]
+      | select((.user.login // "") | ascii_downcase | startswith("chatgpt-codex-connector"))
+      | select(.content == "THUMBS_UP")
+      | select(.createdAt > $since)
+    ]') || return 1
+  reaction_count=$(printf '%s' "$reaction_matches" | jq -er 'length') || return 1
+  last_thumbs_up_at=$(printf '%s\n' "$reaction_pages" | jq -ers '
+    ([ .[] | .data.repository.pullRequest.reactions.nodes[]
+       | select((.user.login // "") | ascii_downcase | startswith("chatgpt-codex-connector"))
+       | select(.content == "THUMBS_UP")
+       | .createdAt
+     ] | max) // "none"') || return 1
+
+  if [ "$head_changed" -eq 1 ]; then
+    codex=head-changed
+  elif [ "$open_count" -gt 0 ]; then
+    codex=findings
+  elif [ "$review_count" -gt 0 ] || [ "$reaction_count" -gt 0 ]; then
+    codex=clean
+  else
+    codex=pending
+  fi
+  rounds_banner "$rounds"
+  echo "codex=$codex head=$head_oid open=$open_count review=$review_count last_review_at=$last_review_at reaction=$reaction_count last_thumbs_up_at=$last_thumbs_up_at rounds=$rounds"
 }
 
 # Distinct Codex reviews that produced findings — the PR's round count.
@@ -237,7 +390,7 @@ run_gate() {
   return 0
 }
 
-case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status}" in
+case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait}" in
   open)
     # thread_id  comment_id  file:line  outdated?  severity  title
     rounds_banner "$(rounds_count)"
@@ -449,39 +602,45 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status}" in
       -F id="${2:?thread id}" --jq '"resolved: \(.data.resolveReviewThread.thread.isResolved)"'
     ;;
   status)
-    # Prints: codex=<pending|clean|findings> open=<n> review=<n> reaction=<n> rounds=<n>
-    #
     # `codex=` is only about whether the reviewer answered THIS commit; `open=`
-    # is the separate merge gate. They are printed apart on purpose: a 👍 on a
-    # fresh commit does not mean the PR is clean if threads from an earlier
-    # round are still unresolved, and collapsing the two hides exactly that.
-    # Wait until codex= leaves pending. Merge only on codex=clean open=0.
-    sha="${2:?head sha}"; since="${3:?iso timestamp captured before you asked for the review}"
-    # --paginate is load-bearing: both endpoints return 30 per page, oldest
-    # first, so on a long PR the newest review sits on the LAST page and a
-    # page-1-only query reports "no review" forever. (--slurp can't be combined
-    # with gh's --jq, hence the pipe into jq.)
-    review=$(gh api --paginate --slurp "repos/$REPO/pulls/$PR/reviews" \
-      | jq --arg sha "$sha" --arg since "$since" \
-           '[.[][] | select(.commit_id | startswith($sha))
-                   | select(.user.login | ascii_downcase | startswith("chatgpt-codex-connector"))
-                   | select(.submitted_at > $since)] | length')
-    reaction=$(gh api --paginate --slurp "repos/$REPO/issues/$PR/reactions" \
-      | jq --arg since "$since" \
-           '[.[][] | select(.user.login | ascii_downcase | startswith("chatgpt-codex-connector"))
-                   | select(.content == "+1")
-                   | select(.created_at > $since)] | length')
-    open_count=$(threads | grep -c . || true)
-    if [ "$review" -gt 0 ]; then
-      [ "$open_count" -gt 0 ] && codex=findings || codex=clean
-    elif [ "$reaction" -gt 0 ]; then
-      codex=clean
-    else
-      codex=pending
+    # is the separate merge gate. A fresh THUMBS_UP says nothing about threads
+    # left over from an earlier round, so unresolved threads win over clean
+    # review/reaction evidence regardless of their age.
+    sha="${2:?head sha}"; since="${3:?iso timestamp captured before the push}"
+    status_observation "$sha" "$since"
+    ;;
+  wait)
+    sha="${2:?head sha}"; since="${3:?iso timestamp captured before the push}"
+    minutes="${4:-${CODEX_REVIEW_WAIT_MINUTES:-15}}"
+    if ! [[ "$minutes" =~ ^[1-9][0-9]*$ ]]; then
+      echo "wait minutes must be a positive whole number" >&2
+      exit 2
     fi
-    rounds=$(rounds_count)
-    rounds_banner "$rounds"
-    echo "codex=$codex open=$open_count review=$review reaction=$reaction rounds=$rounds"
+    timeout_seconds=$((minutes * 60))
+    start_seconds=$(date +%s) || exit 1
+    deadline_seconds=$((start_seconds + timeout_seconds))
+    tick=0
+    while :; do
+      now_seconds=$(date +%s) || exit 1
+      elapsed_seconds=$((now_seconds - start_seconds))
+      observation=$(status_observation "$sha" "$since") || exit 1
+      echo "wait tick=$tick elapsed=${elapsed_seconds}s/${timeout_seconds}s $observation"
+      case "$observation" in
+        codex=findings*) exit 10 ;;
+        codex=clean*) exit 0 ;;
+        codex=head-changed*) exit 12 ;;
+      esac
+      now_seconds=$(date +%s) || exit 1
+      if [ "$now_seconds" -ge "$deadline_seconds" ]; then
+        echo "wait timeout after ${minutes}m; last observation: $observation" >&2
+        exit 11
+      fi
+      remaining_seconds=$((deadline_seconds - now_seconds))
+      sleep_seconds=60
+      if [ "$remaining_seconds" -lt "$sleep_seconds" ]; then sleep_seconds="$remaining_seconds"; fi
+      sleep "$sleep_seconds"
+      tick=$((tick + 1))
+    done
     ;;
   *) echo "unknown command: $1" >&2; exit 2 ;;
 esac
