@@ -1334,7 +1334,10 @@ async function spawnContainer(
     storageActivity,
   });
   everSeenRunningSessions.add(session.id);
-  await markContainerRunning(session.id);
+  // The `running` status write is awaited AFTER the exit handlers below are
+  // attached (see the end of this function): with a delayed driver a
+  // container that dies at boot would otherwise emit close/error while the
+  // write is pending, before finalizeContainer and the kill callbacks exist.
 
   // Log stderr. A container that dies at boot (unknown provider, missing
   // binary, bad config) explains itself only here — and debug is below the
@@ -1408,6 +1411,9 @@ async function spawnContainer(
     finalizeContainer();
     log.error('Container spawn error', { sessionId: session.id, err });
   });
+
+  // Every handler is registered; only now may this function yield.
+  await markContainerRunning(session.id);
 }
 
 /**

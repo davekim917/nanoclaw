@@ -249,7 +249,7 @@ async function main(): Promise<void> {
   // otherwise the persisted instance default. Workspace scaffolding is deferred
   // to the first spawn (group-init). A reused group keeps its provider
   // (INSERT OR IGNORE).
-  ensureContainerConfig(ag.id, pickedProvider);
+  await ensureContainerConfig(ag.id, pickedProvider);
   stageGroupPersona(
     path.resolve(GROUPS_DIR, folder),
     `# ${args.agentName}\n\n` +
