@@ -15,6 +15,8 @@ import '../modules/index.js';
 import { getAgentMailbox, readMailboxContext } from '../mailbox/index.js';
 import type { AgentMailbox } from '../mailbox/types.js';
 
+import { readStdinJsonArgs, StdinJsonInputError, type StdinJsonStream } from './stdin-json.js';
+
 // ---------------------------------------------------------------------------
 // Frame types (mirrors src/cli/frame.ts on the host)
 // ---------------------------------------------------------------------------
@@ -96,19 +98,25 @@ export async function pollResponse(
 // Arg parsing (mirrors host-side client.ts)
 // ---------------------------------------------------------------------------
 
-function parseArgv(argv: string[]): {
+export function parseArgv(argv: string[]): {
   command: string;
   args: Record<string, unknown>;
   json: boolean;
+  stdinJson: boolean;
 } {
   const positional: string[] = [];
   const args: Record<string, unknown> = {};
   let json = false;
+  let stdinJson = false;
 
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--json') {
       json = true;
+      continue;
+    }
+    if (a === '--stdin-json') {
+      stdinJson = true;
       continue;
     }
     if (a.startsWith('--')) {
@@ -135,14 +143,31 @@ function parseArgv(argv: string[]): {
   // segment as a target ID if the full name isn't a registered command.
   const command = positional.join('-');
 
-  return { command, args, json };
+  return { command, args, json, stdinJson };
+}
+
+async function readRequestArgs(
+  stdin: StdinJsonStream & { isTTY?: boolean },
+  args: Record<string, unknown>,
+  stdinJson: boolean,
+): Promise<Record<string, unknown>> {
+  if (!stdinJson) return args;
+  if (stdin.isTTY) {
+    throw new StdinJsonInputError('--stdin-json requires piped stdin (e.g. `echo {...} | ncl ...`)');
+  }
+  return readStdinJsonArgs(stdin, args);
 }
 
 function printUsage(): void {
   process.stdout.write(
-    ['Usage: ncl <command> [--key value ...] [--json]', '', 'Run `ncl help` to list available commands.', ''].join(
-      '\n',
-    ),
+    [
+      'Usage: ncl <command> [--key value ...] [--stdin-json] [--json]',
+      '',
+      '  --stdin-json  Read one bounded JSON object from stdin and merge it with argv flags.',
+      '',
+      'Run `ncl help` to list available commands.',
+      '',
+    ].join('\n'),
   );
 }
 
@@ -222,22 +247,33 @@ function formatHuman(resp: ResponseFrame): string {
 // Main
 // ---------------------------------------------------------------------------
 
-async function main(): Promise<void> {
-  const argv = process.argv.slice(2);
+export async function main(
+  argv = process.argv.slice(2),
+  stdin: StdinJsonStream & { isTTY?: boolean } = process.stdin,
+): Promise<void> {
 
   if (argv.length === 0 || argv[0] === '--help' || argv[0] === '-h') {
     printUsage();
     return;
   }
 
-  const { command, args, json } = parseArgv(argv);
+  const { command, args, json, stdinJson } = parseArgv(argv);
+  let requestArgs: Record<string, unknown>;
+  try {
+    requestArgs = await readRequestArgs(stdin, args, stdinJson);
+  } catch (err) {
+    if (!(err instanceof StdinJsonInputError)) throw err;
+    process.stderr.write(`ncl: ${err.message}\n`);
+    process.exitCode = 2;
+    return;
+  }
 
   const context = await readMailboxContext();
   const mailbox = getAgentMailbox();
   await mailbox.start(context);
   try {
     const requestId = generateId();
-    await writeRequest(mailbox, { id: requestId, command, args });
+    await writeRequest(mailbox, { id: requestId, command, args: requestArgs });
     const resp = await pollResponse(mailbox, requestId, 30_000);
 
     if (!resp) {
