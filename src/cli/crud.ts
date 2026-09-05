@@ -8,7 +8,8 @@
  */
 import { randomUUID } from 'crypto';
 
-import { getRawDb } from '../db/connection.js';
+import { getDb, getRawDb } from '../db/connection.js';
+import { insertOrAdopt } from '../db/insert-or-adopt.js';
 import { renderVerbHelp } from './help-render.js';
 import { register } from './registry.js';
 import type { Access } from './registry.js';
@@ -188,9 +189,7 @@ function genericList(def: ResourceDef) {
     // Newest first: without an ORDER BY the LIMIT silently hides the most
     // recently inserted rows once a table outgrows it (bit `sessions list`
     // past 200 sessions — a just-created session was invisible).
-    return getRawDb()
-      .prepare(`SELECT ${cols} FROM ${def.table}${where} ORDER BY rowid DESC LIMIT ?`)
-      .all(...params);
+    return getDb().all(`SELECT ${cols} FROM ${def.table}${where} ORDER BY rowid DESC LIMIT ?`, ...params);
   };
 }
 
@@ -199,7 +198,7 @@ function genericGet(def: ResourceDef) {
   return async (args: Record<string, unknown>) => {
     const id = args.id as string;
     if (!id) throw new Error(`${def.name} id is required`);
-    const row = getRawDb().prepare(`SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`).get(id);
+    const row = await getDb().get(`SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`, id);
     if (!row) throw new Error(`${def.name} not found: ${id}`);
     return row;
   };
@@ -247,20 +246,6 @@ function genericCreate(def: ResourceDef) {
       }
     }
 
-    // Idempotent create: if a row already matches the natural key, return it
-    // rather than hitting a UNIQUE violation. Lets a skill re-run `ncl … create`.
-    // Runs after pass 3 so defaultFrom-filled columns (e.g. messaging-groups'
-    // `instance`) participate in the match. No new row means postCreate /
-    // postCommit are correctly skipped — no new companion rows to create.
-    if (def.naturalKey && def.naturalKey.length > 0) {
-      const where = def.naturalKey.map((c) => `${c} = ?`).join(' AND ');
-      const params = def.naturalKey.map((c) => values[c]);
-      const existing = getRawDb()
-        .prepare(`SELECT ${visibleColumns(def).join(', ')} FROM ${def.table} WHERE ${where}`)
-        .get(...params);
-      if (existing) return existing;
-    }
-
     const colNames = Object.keys(values);
     const placeholders = colNames.map((c) => `@${c}`);
     // Single transaction so a postCreate throw rolls back the parent INSERT —
@@ -269,11 +254,46 @@ function genericCreate(def: ResourceDef) {
     // must only touch the central DB (it's the atomic companion-row write).
     // Anything async or outside the central DB — filesystem, session-DB
     // projection — belongs in `postCommit`, which runs after commit below.
+    //
+    // This stays on the RAW synchronous handle deliberately (seam 3 §4.2 — a
+    // fork transaction converts to the driver only in PR 6, all ten sites at
+    // once). insertOrAdopt below just wraps this synchronous transaction in
+    // an async function; it does not make the transaction itself async.
     const db = getRawDb();
-    db.transaction(() => {
-      db.prepare(`INSERT INTO ${def.table} (${colNames.join(', ')}) VALUES (${placeholders.join(', ')})`).run(values);
-      if (def.postCreate) def.postCreate(values);
-    })();
+    const insert = (): void => {
+      db.transaction(() => {
+        db.prepare(`INSERT INTO ${def.table} (${colNames.join(', ')}) VALUES (${placeholders.join(', ')})`).run(values);
+        if (def.postCreate) def.postCreate(values);
+      })();
+    };
+
+    // Idempotent create: if a row already matches the natural key, return it
+    // rather than hitting a UNIQUE violation. Lets a skill re-run `ncl … create`.
+    // Runs after pass 3 so defaultFrom-filled columns (e.g. messaging-groups'
+    // `instance`) participate in the match. No new row means postCreate /
+    // postCommit are correctly skipped — no new companion rows to create.
+    //
+    // The pre-check below and the INSERT are no longer one synchronous step
+    // now that the check is an awaited driver call (seam 3) — two concurrent
+    // creates for the same natural key can both see "no existing row" and
+    // both attempt the INSERT. `insertOrAdopt` (src/db/insert-or-adopt.ts) is
+    // the primitive for exactly that race: the loser adopts the winner's row
+    // instead of throwing a raw unique-constraint error at the caller.
+    if (def.naturalKey && def.naturalKey.length > 0) {
+      const where = def.naturalKey.map((c) => `${c} = ?`).join(' AND ');
+      const params = def.naturalKey.map((c) => values[c]);
+      const reload = (): Promise<Record<string, unknown> | undefined> =>
+        getDb().get<Record<string, unknown>>(`SELECT ${visibleColumns(def).join(', ')} FROM ${def.table} WHERE ${where}`, ...params);
+
+      const existing = await reload();
+      if (existing) return existing;
+
+      const { row, created } = await insertOrAdopt(values, async () => insert(), reload);
+      if (!created) return row;
+    } else {
+      insert();
+    }
+
     if (def.postCommit) await def.postCommit(values);
     return values;
   };
@@ -310,9 +330,10 @@ function genericUpdate(def: ResourceDef) {
     }
 
     if (def.preUpdate) {
-      const current = getRawDb().prepare(`SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`).get(id) as
-        | Record<string, unknown>
-        | undefined;
+      const current = await getDb().get<Record<string, unknown>>(
+        `SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`,
+        id,
+      );
       if (!current) throw new Error(`${def.name} not found: ${id}`);
       def.preUpdate(updates, current);
     }
@@ -320,12 +341,13 @@ function genericUpdate(def: ResourceDef) {
     const setClause = Object.keys(updates)
       .map((k) => `${k} = @${k}`)
       .join(', ');
-    const result = getRawDb()
-      .prepare(`UPDATE ${def.table} SET ${setClause} WHERE ${def.idColumn} = @_id`)
-      .run({ ...updates, _id: id });
+    const result = await getDb().run(`UPDATE ${def.table} SET ${setClause} WHERE ${def.idColumn} = @_id`, {
+      ...updates,
+      _id: id,
+    });
     if (result.changes === 0) throw new Error(`${def.name} not found: ${id}`);
 
-    return getRawDb().prepare(`SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`).get(id);
+    return getDb().get(`SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`, id);
   };
 }
 
@@ -333,7 +355,7 @@ function genericDelete(def: ResourceDef) {
   return async (args: Record<string, unknown>) => {
     const id = args.id as string;
     if (!id) throw new Error(`${def.name} id is required`);
-    const result = getRawDb().prepare(`DELETE FROM ${def.table} WHERE ${def.idColumn} = ?`).run(id);
+    const result = await getDb().run(`DELETE FROM ${def.table} WHERE ${def.idColumn} = ?`, id);
     if (result.changes === 0) throw new Error(`${def.name} not found: ${id}`);
     return { deleted: id };
   };
