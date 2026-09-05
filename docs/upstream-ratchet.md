@@ -198,6 +198,104 @@ A PR that touches an upstream-owned file regenerates `src/upstream-ratchet.json`
 A PR that **grows** a diff carries the `--accept` in that manifest change and one line of justification in
 the PR body. Shrink needs neither.
 
+## Checking a PR head before merge
+
+The default report measures the **working tree** of the checkout it runs in — it needs a worktree checked
+out to the PR's commit. A merge gate does not have that: it has a remote ref. `--check <ref>` evaluates
+`<ref>`'s own committed tree exactly as the default report evaluates the working tree, with no writes and
+no dependence on the working tree of the checkout it runs in. This is what would have caught a real miss —
+a PR merged without regenerating the manifest, so `main` went `Δ 187` and failed only after the merge,
+not before it.
+
+```bash
+git fetch origin <branch> && ./node_modules/.bin/tsx scripts/upstream-ratchet-report.ts --check FETCH_HEAD
+```
+
+`<ref>` is anything `git rev-parse` understands: a sha, `origin/<branch>`, `FETCH_HEAD`. Two things run,
+each reported in its own section:
+
+- the same GROWTH/NEW/SHRINK/STALE classification the default report runs, against the manifest
+  **committed at `<ref>`** (not the local `src/upstream-ratchet.json`) — the same arbitration, just pointed
+  at a ref instead of a checkout. That manifest is itself read through the SAME filtered path every other
+  regular file in `<ref>` goes through (`cat-file --filters`, `--attr-source=<ref>`), not a raw `git show`:
+  if `<ref>` ever assigned a clean/smudge or LFS filter to `src/upstream-ratchet.json` itself, a raw read
+  would see the CLEAN (stored) form while a real checkout — and the working-tree report run against it —
+  would see the SMUDGED one. Filter DRIVERS still come from the RUNNING repository's config either way, per
+  "Checkout filters" below;
+- a **STALE-MANIFEST** currency check — the same per-entry logic the hermetic host-suite test
+  (`src/upstream-ratchet.test.ts`) runs against a local working tree, run here against `<ref>`'s own tree
+  instead. It catches a manifest whose `sha256`/`mode`/`deleted` bookkeeping disagrees with `<ref>`'s real
+  content even in a case the diff-line arithmetic alone would not flag (an equal-size text edit, which the
+  default classification deliberately allows through).
+
+Either section failing exits 1. Exit codes are otherwise unchanged: **2** means "cannot measure" — `<ref>`
+does not resolve to a commit in this clone, `<ref>` carries no manifest at `src/upstream-ratchet.json`, or
+its pinned upstream commit is not in this clone (with the `git fetch upstream <sha>` to run, same as the
+default report). `--json` works. `--check` is incompatible with `--write`, `--accept`, `--accept-all` and
+`--upstream` — a ref that is not this checkout's HEAD is nothing any of them could act on. `--check`
+requires **git 2.40 or newer** (for the global `--attr-source` flag — see below) and refuses outright, with
+a clear message, on anything older; every other mode of this script has no such requirement.
+
+Every git call `--check` makes about `<ref>`'s own content passes `--attr-source=<ref>`, so `.gitattributes`
+resolution comes from `<ref>`'s OWN tree rather than the running checkout's — git otherwise always resolves
+attributes from whatever is currently checked out, regardless of which commit's content is being asked
+about. This is not just about file *bytes* (see "Checkout filters" below): `git diff --numstat`'s decision
+that a path is BINARY (`-diff`, `binary`, or a `diff=<driver>` rule) is *also* an attribute lookup, and
+without `--attr-source` it would silently use the WRONG tree's rule — a `-diff` marker added only in
+`<ref>` would be invisible, and `<ref>`'s divergence from a file the running checkout still treats as text
+would be measured as a text diff instead of the binary marker a real checkout of `<ref>` implies. The
+default (working-tree) report is deliberately unaffected: reading the WORKING TREE's own attributes is
+exactly right there, because a real checkout is what it is measuring.
+
+What does not apply to a bare commit, and is skipped rather than approximated: `git check-ignore` needs a
+live index and working tree, so an upstream path the fork deleted and gitignored just reads as plain
+`deleted` there — it does not change a GROWTH/NEW/SHRINK verdict, only the `ignored` flag on a manifest
+entry that `--check` never writes. The untracked-shadow check has no meaning either: it exists to catch
+bytes sitting at a path the fork's index does not track, which cannot happen inside a single commit's own
+tree.
+
+### Checkout filters (CRLF, working-tree-encoding, ident, smudge)
+
+A ref's raw git blob bytes are not always what a real checkout produces: `.gitattributes` can declare
+`text`/`eol` (CRLF conversion), `working-tree-encoding` (a codec other than UTF-8), `ident`, or a `filter`
+(a clean/smudge pair), and `core.autocrlf` can convert line endings with **no attribute at all**.
+`hashFile` — what the default report and the local currency test hash — always reads the CHECKED-OUT
+(post-filter) bytes, so `--check` has to match that or it can disagree with a clean working tree.
+
+**Every upstream-owned regular file is re-hashed via one `git cat-file --filters <ref>:<path>` process,
+unconditionally — never a subset chosen by asking which attributes are set.** An attribute selector was
+tried first and rejected: it would need to enumerate every attribute that can move a checkout byte
+(`text`, `eol`, `working-tree-encoding`, `ident`, `filter`, and `core.autocrlf` with none of them present),
+and a `filter=X` value can itself literally be the string `unspecified` — indistinguishable by string
+comparison from git's own "no rule applies" sentinel. Hashing unconditionally has no list to keep complete.
+
+This costs one subprocess per upstream-owned regular file (959 in this repo today, one `cat-file --filters`
+each) rather than one batched call, and that is deliberate, not an oversight: `git cat-file --batch
+--filters` was tested by hand across every documented invocation shape and reports the **pre-filter** blob
+size in its header while writing the **post-filter** (different-length) bytes to stdout — a real, measured
+git behavior on the git version this fork runs, not a parsing mistake. A size that lies desyncs the
+size-driven framing every other record in the same batch depends on, so batching it is not safe on this git
+version; git's own test suite has no case for this exact combination (`--batch` is only tested with
+`--textconv`, whose one fixture happens not to change length). A single, non-batch `--filters` call has no
+such problem — its entire stdout, to EOF, is the filtered content, with nothing to misparse.
+
+`--attr-source=<ref>` pins WHICH `.gitattributes` git consults to `<ref>`'s own tree, not the running
+checkout's — confirmed by hand: without it, querying an attribute-bearing commit while the current checkout
+carries no `.gitattributes` at all silently returns the unfiltered bytes. Filter **drivers** are
+deliberately handled the opposite way: `filter.<name>.smudge`/`.clean` live in git CONFIG, never in a
+commit, so `--check` reads them from the RUNNING repository's config, exactly like a real `git checkout
+<ref>` in that same checkout would — there is no ref-sourced equivalent to pin them to, because git itself
+has none.
+
+A symlink (`120000`) is never a candidate for any of this: git does not run checkout filters on a symlink's
+target string, so the plain (raw, batched) blob hash already agrees with `hashFile`, which now hashes a
+symlink target as raw bytes rather than decoding and re-encoding it as UTF-8 — the only way to agree with
+git's blob for a non-UTF8 target, since git stores that target as opaque bytes with no encoding of its own.
+
+Neither this fork's tree nor the pinned upstream commit declares any `.gitattributes` rule today, so a real
+`--check` run hits none of this — every path lands on the "no filter changed anything" branch of
+`cat-file --filters` — but the mechanism exists correctly for the day either tree adds one.
+
 ## From a linked worktree
 
 Run the boundary check as

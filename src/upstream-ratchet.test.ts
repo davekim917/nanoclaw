@@ -27,6 +27,8 @@ import {
   fileModeOf,
   formatFindings,
   hashFile,
+  isManifestSymlink,
+  manifestPath,
   MANIFEST_REL,
   pathsSeal,
   readManifest,
@@ -35,6 +37,7 @@ import {
   serializeManifest,
   shellQuote,
   validateRelPath,
+  type TreeReader,
   type UpstreamRatchetManifest,
 } from './upstream-ratchet.js';
 
@@ -327,6 +330,49 @@ describe('upstream-ownership ratchet', () => {
     );
   });
 
+  it('checkTree runs the SAME per-entry logic against an injected TreeReader — no fs, no second implementation', () => {
+    // This is what `scripts/upstream-ratchet-report.ts --check <ref>` relies
+    // on: a ref has no working tree to lstat, so it supplies a TreeReader
+    // backed by `git ls-tree`/`cat-file --batch` instead. Simulated here with a
+    // plain Map so the test stays hermetic (no git), while still exercising
+    // checkEntry's real missing/resurrected/mode/changed/ignored branches.
+    const files = new Map<string, { mode: '100644' | '100755' | '120000'; sha256: string }>([
+      ['kept.txt', { mode: '100644', sha256: '1'.repeat(64) }],
+      ['edited.txt', { mode: '100644', sha256: '2'.repeat(64) }],
+      // 'gone.txt' intentionally absent — recorded as present in the manifest.
+      // 'resurrected.txt' intentionally absent from the manifest's deleted set's
+      // complement — see fixture below.
+    ]);
+    const reader: TreeReader = {
+      exists: (p) => files.has(p),
+      modeOf: (p) => files.get(p)?.mode ?? null,
+      hashOf: (p) => files.get(p)?.sha256 ?? null,
+    };
+
+    const fixture = sealed({
+      'kept.txt': { diff: 3, mode: '100644', sha256: '1'.repeat(64) },
+      'edited.txt': { diff: 3, mode: '100644', sha256: '9'.repeat(64) }, // stale — reader disagrees
+      'gone.txt': { diff: 7, mode: '100644', sha256: '3'.repeat(64) }, // present in manifest, absent from reader
+      'resurrected.txt': { diff: 12, mode: '100644', sha256: null, deleted: true }, // deleted in manifest, present in reader
+      '.claude/scheduled_tasks.lock': { diff: 1, mode: '100644', sha256: null, deleted: true, ignored: true },
+    });
+    files.set('resurrected.txt', { mode: '100644', sha256: '4'.repeat(64) });
+
+    // A path other than repoRoot is passed for `validateRelPath`'s lexical
+    // arithmetic only — no fs access happens against it when a reader is given.
+    const findings = checkTree(fixture, '/does/not/exist/on/this/machine', reader);
+    expect(findings.map((f) => [f.kind, f.path]).sort()).toEqual(
+      [
+        ['changed', 'edited.txt'],
+        ['missing', 'gone.txt'],
+        ['resurrected', 'resurrected.txt'],
+      ].sort(),
+    );
+    // The ignored entry is skipped exactly as it is for the fs reader — no
+    // finding for it even though the reader has no opinion on it at all.
+    expect(findings.some((f) => f.path === '.claude/scheduled_tasks.lock')).toBe(false);
+  });
+
   it('checkTree rejects unusable manifest paths before touching the filesystem', () => {
     const root = uniqueTmpRoot('upstream-ratchet-paths');
     fs.mkdirSync(root, { recursive: true });
@@ -463,6 +509,33 @@ describe('upstream-ownership ratchet', () => {
     fs.mkdirSync(root, { recursive: true });
     const findings = checkTree(sealed({ 'a file.md': { diff: 4, mode: '100644', sha256: 'f'.repeat(64) } }), root);
     expect(findings[0].hint).toContain("--accept 'a file.md'");
+  });
+
+  describe('isManifestSymlink', () => {
+    // `fs.readFileSync` (via `readManifest`) FOLLOWS a symlink to whatever it
+    // points at, while `--check <ref>`'s `cat-file --filters` on a 120000
+    // entry returns the raw target string unfiltered — the two would silently
+    // measure two different files. `isManifestSymlink` is the working-tree
+    // half of the refusal; `manifestSymlinkFinding`
+    // (src/upstream-ratchet-core.test.ts) is the ref-tree half.
+    it('is true when the manifest path is a real symlink, checked with lstat (not followed)', () => {
+      const root = uniqueTmpRoot('upstream-ratchet-manifest-symlink');
+      fs.mkdirSync(path.dirname(manifestPath(root)), { recursive: true });
+      fs.writeFileSync(path.join(root, 'real-manifest.json'), '{}\n');
+      fs.symlinkSync('real-manifest.json', manifestPath(root));
+      expect(isManifestSymlink(root)).toBe(true);
+    });
+
+    it('is false for a regular-file manifest', () => {
+      const root = uniqueTmpRoot('upstream-ratchet-manifest-not-symlink');
+      fs.mkdirSync(path.dirname(manifestPath(root)), { recursive: true });
+      fs.writeFileSync(manifestPath(root), '{}\n');
+      expect(isManifestSymlink(root)).toBe(false);
+    });
+
+    it("is false for a genuinely missing manifest — that is readManifest's failure to report, not this check's", () => {
+      expect(isManifestSymlink(uniqueTmpRoot('upstream-ratchet-manifest-missing'))).toBe(false);
+    });
   });
 
   it('the ratchet library never spawns a subprocess or reaches the network', () => {

@@ -190,6 +190,31 @@ export function readManifest(repoRoot: string = REPO_ROOT): UpstreamRatchetManif
   return JSON.parse(fs.readFileSync(manifestPath(repoRoot), 'utf8')) as UpstreamRatchetManifest;
 }
 
+/**
+ * Whether the LOCAL manifest is committed as a symlink rather than a regular
+ * file — checked with `lstat` (which does not follow the link), before
+ * `readManifest`'s `fs.readFileSync` (which does) ever reads through it.
+ * `false` for a genuinely missing manifest too: that is `readManifest`'s job
+ * to report, not this check's.
+ *
+ * `src/upstream-ratchet.json` is a generated artifact this tool itself always
+ * writes as a regular file. A symlinked one is refused outright rather than
+ * reconciled, in both the working-tree report and `--check <ref>` (see
+ * `manifestSymlinkFinding` in `src/upstream-ratchet-core.ts` for the ref-tree
+ * counterpart and the reason: `cat-file --filters` on a 120000 entry returns
+ * the raw target string, unfiltered, while a real checkout's
+ * `fs.readFileSync` follows the link — the two would silently measure two
+ * different files.
+ */
+export function isManifestSymlink(repoRoot: string = REPO_ROOT): boolean {
+  try {
+    return fs.lstatSync(manifestPath(repoRoot)).isSymbolicLink();
+    // eslint-disable-next-line no-catch-all/no-catch-all
+  } catch {
+    return false;
+  }
+}
+
 export function writeManifest(manifest: UpstreamRatchetManifest, repoRoot: string = REPO_ROOT): void {
   const target = manifestPath(repoRoot);
   fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -356,11 +381,23 @@ function realpath(abs: string): string | null {
  * (`.agents/skills`, `AGENTS.md`), and git's content for those is the target
  * string. Following them instead would hash the pointee, so a re-aimed symlink
  * would read as unchanged and a dangling one would read as deleted.
+ *
+ * Reads the target as RAW BYTES (`{ encoding: 'buffer' }`), not as a decoded
+ * string re-encoded to UTF-8: a symlink target is whatever byte sequence the
+ * OS stores, with no encoding guarantee, and `readlinkSync` (string mode)
+ * decodes it as UTF-8 first — silently mangling a non-UTF8 target before this
+ * function ever sees it. `scripts/upstream-ratchet-report.ts --check <ref>`
+ * hashes a symlink's git blob content directly (git stores the target string
+ * verbatim, byte for byte, with no encoding of its own), so the two sides
+ * must both be byte-based to ever agree on a non-UTF8 target. Both of this
+ * fork's real symlinks are plain ASCII, so this is unobservable on the
+ * committed manifest today — ASCII round-trips identically through UTF-8
+ * either way — and changes no recorded hash.
  */
 export function hashFile(abs: string): string | null {
   const stat = lstat(abs);
   if (stat === null) return null;
-  const content = stat.isSymbolicLink() ? Buffer.from(fs.readlinkSync(abs), 'utf8') : fs.readFileSync(abs);
+  const content = stat.isSymbolicLink() ? fs.readlinkSync(abs, { encoding: 'buffer' }) : fs.readFileSync(abs);
   return createHash('sha256').update(content).digest('hex');
 }
 
@@ -426,16 +463,92 @@ const SHA256_RE = /^[0-9a-f]{64}$/;
 const COMMIT_RE = /^[0-9a-f]{40}$/;
 
 /**
- * Every way the working tree and the committed manifest disagree.
+ * Where `checkTree`/`checkEntry` read presence, mode and content from.
  *
- * An empty result means the manifest is CURRENT — not that the fork is at zero
- * divergence, and not that the recorded `diff` values are the smallest they
- * could be. See the reach note at the top of this file.
+ * The default is the local working tree (`fsTreeReader`), which is what every
+ * existing caller gets when it omits the parameter — behavior is unchanged.
+ * `scripts/upstream-ratchet-report.ts --check <ref>` supplies a reader backed
+ * by `git ls-tree`/`cat-file --batch` over a commit instead, so the SAME
+ * per-entry currency logic (missing / resurrected / mode / changed, and the
+ * `ignored` skip) runs against a bare ref with no working tree at all.
  */
-export function checkTree(manifest: UpstreamRatchetManifest, repoRoot: string = REPO_ROOT): Finding[] {
-  const findings: Finding[] = [];
+export interface TreeReader {
+  exists(relPath: string): boolean;
+  modeOf(relPath: string): GitMode | null;
+  hashOf(relPath: string): string | null;
+}
 
-  if (typeof manifest.upstream !== 'string' || !COMMIT_RE.test(manifest.upstream)) {
+/** The default `TreeReader`: the local working tree under `repoRoot`. */
+export function fsTreeReader(repoRoot: string): TreeReader {
+  return {
+    exists: (relPath) => pathExists(path.join(repoRoot, relPath)),
+    modeOf: (relPath) => fileModeOf(path.join(repoRoot, relPath)),
+    hashOf: (relPath) => hashFile(path.join(repoRoot, relPath)),
+  };
+}
+
+/**
+ * Whether `value` even has the SHAPE of a manifest — an object (never `null`,
+ * never an array) with `upstream`/`paths` as strings and `files` as a
+ * (possibly empty, but non-null, non-array) object. Called BEFORE
+ * `checkTree`, `classify`, `counts`, or `resolveCommit` ever read a property
+ * off the parsed value, on BOTH the working-tree path (right after
+ * `readManifest`, in `main()`) and the `--check <ref>` path (right after
+ * `JSON.parse`-ing `git show <ref>:...json`, in `runCheck`) — closing the
+ * whole "throws instead of reporting" class in this one place rather than
+ * guarding each call site separately, which is how it stayed open long enough
+ * for a top-level `null` to reach `resolveCommit` uncaught.
+ *
+ * `--check` reads `committed` from an ARBITRARY ref's content, never
+ * guaranteed well-formed the way `readManifest`'s local file effectively
+ * always is (this tool is the only thing that ever writes it) — but the
+ * working tree is not exempt either: a hand-edited or corrupted local
+ * `src/upstream-ratchet.json` hits the exact same `.upstream` dereference in
+ * `main()`, so both paths get the same guard rather than treating the local
+ * file as trusted by convention.
+ *
+ * ALSO validates the SHAPE of `upstream` (a 40-character commit sha, or the
+ * empty string — the not-yet-pinned baseline `main()` synthesizes on a first
+ * run) and `paths` (a 64-character sha256 hex digest, or empty, for the same
+ * reason) rather than just their type. This used to be `checkTree`'s own
+ * `COMMIT_RE` check, run AFTER this function, on the next line — which meant
+ * an invalid-but-string pin like `"not-a-sha"` or a 7-character short sha
+ * passed here and reached `resolveCommit`'s `git rev-parse` UNCAUGHT: that
+ * call is itself an object lookup, so it either misreports the failure as
+ * "not in this clone, run: git fetch" (exit 2, wrong diagnosis) or — for a
+ * short sha that happens to resolve locally — silently accepts a pin this
+ * tool never writes in that form. Moved here so both call sites (`runCheck`
+ * and `main()`) catch it before any object lookup, with one JSON-safe
+ * MALFORMED finding, exit 1. The seal-equality check (`paths` against the
+ * ACTUAL computed seal of `files`' keys) still lives in `checkTree`, since it
+ * needs the file list this function deliberately does not require.
+ *
+ * Per-entry validation (`diff`/`mode`/`sha256`/`deleted`/`ignored`/`binary`
+ * shapes) stays in `checkEntry`, which already never crashes anything
+ * downstream because every field read there is either optional-chained or
+ * already defended.
+ */
+export function validateManifestShape(value: unknown): Finding[] {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return [
+      {
+        kind: 'malformed',
+        path: MANIFEST_REL,
+        detail: `the manifest is not an object: ${JSON.stringify(value)}`,
+        hint: `regenerate: ${REGENERATE_HINT}`,
+      },
+    ];
+  }
+  const manifest = value as { upstream?: unknown; paths?: unknown; files?: unknown };
+  const findings: Finding[] = [];
+  if (typeof manifest.upstream !== 'string') {
+    findings.push({
+      kind: 'malformed',
+      path: MANIFEST_REL,
+      detail: `"upstream" is not a string: ${JSON.stringify(manifest.upstream)}`,
+      hint: `regenerate: ${REGENERATE_HINT}`,
+    });
+  } else if (manifest.upstream !== '' && !COMMIT_RE.test(manifest.upstream)) {
     findings.push({
       kind: 'malformed',
       path: MANIFEST_REL,
@@ -443,15 +556,61 @@ export function checkTree(manifest: UpstreamRatchetManifest, repoRoot: string = 
       hint: 're-pin deliberately: pnpm run ratchet:report -- --upstream <rev>',
     });
   }
-  if (manifest.files === null || typeof manifest.files !== 'object') {
+  if (typeof manifest.paths !== 'string') {
+    findings.push({
+      kind: 'malformed',
+      path: MANIFEST_REL,
+      detail: `"paths" is not a string: ${JSON.stringify(manifest.paths)}`,
+      hint: `regenerate: ${REGENERATE_HINT}`,
+    });
+  } else if (manifest.paths !== '' && !SHA256_RE.test(manifest.paths)) {
+    findings.push({
+      kind: 'malformed',
+      path: MANIFEST_REL,
+      detail: `"paths" is not a 64-character sha256 hex digest: ${JSON.stringify(manifest.paths)}`,
+      hint: `regenerate: ${REGENERATE_HINT}`,
+    });
+  }
+  if (manifest.files === null || typeof manifest.files !== 'object' || Array.isArray(manifest.files)) {
     findings.push({
       kind: 'malformed',
       path: MANIFEST_REL,
       detail: '"files" is missing or is not an object',
       hint: `regenerate: ${REGENERATE_HINT}`,
     });
-    return findings;
   }
+  return findings;
+}
+
+/**
+ * Every way the tree and the committed manifest disagree.
+ *
+ * An empty result means the manifest is CURRENT — not that the fork is at zero
+ * divergence, and not that the recorded `diff` values are the smallest they
+ * could be. See the reach note at the top of this file.
+ *
+ * `reader` defaults to the local working tree; passing a git-commit-backed one
+ * (see `TreeReader` above) checks a ref's tree instead, with no fs access.
+ * The physical ancestor-symlink-escape check (`ancestorEscape`) only applies to
+ * a real filesystem, so it runs only for the default reader.
+ */
+export function checkTree(
+  manifest: UpstreamRatchetManifest,
+  repoRoot: string = REPO_ROOT,
+  reader?: TreeReader,
+): Finding[] {
+  // `validateManifestShape` is what stands between this function and a crash
+  // on a top-level `null`/array/primitive — everything below assumes `manifest`
+  // is at least a plain object, which is exactly (and only) what that check
+  // guarantees. It ALSO now covers the `upstream`/`paths` regex-shape checks
+  // that used to live inline here (see its docstring), so any shape finding
+  // at all — including an invalid pin — stops here: with `upstream` not even
+  // a usable commit sha, neither the seal check nor a per-entry walk means
+  // anything.
+  const shapeFindings = validateManifestShape(manifest);
+  if (shapeFindings.length > 0) return shapeFindings;
+
+  const findings: Finding[] = [];
 
   // The coverage seal. This is the only check that can tell a complete manifest
   // from one an entry was deleted out of — every other check here is per-entry,
@@ -469,29 +628,33 @@ export function checkTree(manifest: UpstreamRatchetManifest, repoRoot: string = 
   }
 
   for (const [relPath, entry] of Object.entries(manifest.files)) {
-    findings.push(...checkEntry(relPath, entry, repoRoot));
+    findings.push(...checkEntry(relPath, entry, repoRoot, reader));
   }
   return findings;
 }
 
-function checkEntry(relPath: string, entry: UpstreamRatchetEntry, repoRoot: string): Finding[] {
+function checkEntry(relPath: string, entry: UpstreamRatchetEntry, repoRoot: string, reader?: TreeReader): Finding[] {
   const findings: Finding[] = [];
   const malformed = (detail: string): void => {
     findings.push({ kind: 'malformed', path: relPath, detail, hint: `regenerate: ${REGENERATE_HINT}` });
   };
 
-  // BEFORE any filesystem access. Lexical rules first, then the physical check:
-  // an ancestor directory can be a symlink out of the tree even when every
-  // lexical rule passes.
+  // BEFORE any filesystem access. Lexical rules first, then (for the default,
+  // fs-backed reader only) the physical check: an ancestor directory can be a
+  // symlink out of the tree even when every lexical rule passes. A git commit
+  // has no such concept — ls-tree already yields clean, tree-relative paths —
+  // so a non-default reader skips it.
   const invalidPath = validateRelPath(relPath, repoRoot);
   if (invalidPath !== null) {
     malformed(`not a usable repo-relative path: ${invalidPath}`);
     return findings;
   }
-  const escape = ancestorEscape(relPath, repoRoot);
-  if (escape !== null) {
-    malformed(`not a usable repo-relative path: ${escape}`);
-    return findings;
+  if (reader === undefined) {
+    const escape = ancestorEscape(relPath, repoRoot);
+    if (escape !== null) {
+      malformed(`not a usable repo-relative path: ${escape}`);
+      return findings;
+    }
   }
 
   if (entry === null || typeof entry !== 'object') {
@@ -546,8 +709,8 @@ function checkEntry(relPath: string, entry: UpstreamRatchetEntry, repoRoot: stri
   // check nothing else about it.
   if (entry.ignored === true) return findings;
 
-  const abs = path.join(repoRoot, relPath);
-  const present = pathExists(abs);
+  const active = reader ?? fsTreeReader(repoRoot);
+  const present = active.exists(relPath);
 
   if (entry.deleted === true) {
     if (present) {
@@ -571,7 +734,7 @@ function checkEntry(relPath: string, entry: UpstreamRatchetEntry, repoRoot: stri
     return findings;
   }
 
-  const actualMode = fileModeOf(abs);
+  const actualMode = active.modeOf(relPath);
   if (actualMode === null) {
     findings.push({
       kind: 'mode',
@@ -590,7 +753,7 @@ function checkEntry(relPath: string, entry: UpstreamRatchetEntry, repoRoot: stri
     });
   }
 
-  const actual = hashFile(abs);
+  const actual = active.hashOf(relPath);
   if (actual !== entry.sha256) {
     findings.push({
       kind: 'changed',
