@@ -78,27 +78,27 @@ afterEach(async () => {
 
 // ── Gate ────────────────────────────────────────────────────────────────────
 describe('canManageScheduled', () => {
-  it('test_gate_allows_owner', () => {
+  it('test_gate_allows_owner', async () => {
     expect(canManageScheduled(OWNER)).toBe(true);
   });
-  it('allows global admin', () => {
+  it('allows global admin', async () => {
     expect(canManageScheduled(GLOBAL_ADMIN)).toBe(true);
   });
-  it('test_gate_rejects_member', () => {
+  it('test_gate_rejects_member', async () => {
     expect(canManageScheduled(MEMBER)).toBe(false);
   });
-  it('rejects scoped admin (mutation tier is global-only, D7)', () => {
+  it('rejects scoped admin (mutation tier is global-only, D7)', async () => {
     expect(canManageScheduled(SCOPED_ADMIN)).toBe(false);
   });
-  it('rejects unknown user', () => {
+  it('rejects unknown user', async () => {
     expect(canManageScheduled(UNKNOWN)).toBe(false);
   });
 });
 
 // ── Audit writer ─────────────────────────────────────────────────────────────
 describe('writeAudit', () => {
-  it('test_audit_script_hash_only', () => {
-    writeAudit(getRawDb(), {
+  it('test_audit_script_hash_only', async () => {
+    await writeAudit({
       actor: OWNER,
       action: 'edit',
       agentGroupId: AGENT_GROUP,
@@ -127,9 +127,9 @@ describe('writeAudit', () => {
     expect((detail.scriptAfterHash as string).length).toBe(64); // sha256 hex
   });
 
-  it('hashes and previews prompt bodies (512-char cap), records lengths', () => {
+  it('hashes and previews prompt bodies (512-char cap), records lengths', async () => {
     const longPrompt = 'x'.repeat(900);
-    writeAudit(getRawDb(), {
+    await writeAudit({
       actor: OWNER,
       action: 'edit',
       agentGroupId: AGENT_GROUP,
@@ -158,8 +158,8 @@ describe('writeAudit', () => {
     expect(row.before_len).toBe('short before'.length);
   });
 
-  it('does not persist secret NAMES for a move audit — counts + hashes only', () => {
-    writeAudit(getRawDb(), {
+  it('does not persist secret NAMES for a move audit — counts + hashes only', async () => {
+    await writeAudit({
       actor: OWNER,
       action: 'move',
       agentGroupId: AGENT_GROUP,
@@ -187,8 +187,8 @@ describe('writeAudit', () => {
     expect(detail.target).toBe('ag-2');
   });
 
-  it('move_intent persists the full snapshot in detail_json (the F5 exception)', () => {
-    writeAudit(getRawDb(), {
+  it('move_intent persists the full snapshot in detail_json (the F5 exception)', async () => {
+    await writeAudit({
       actor: OWNER,
       action: 'move_intent',
       agentGroupId: AGENT_GROUP,
@@ -206,8 +206,8 @@ describe('writeAudit', () => {
 });
 
 describe('purgeIntentBody', () => {
-  it('test_purge_intent_clears_body', () => {
-    writeAudit(getRawDb(), {
+  it('test_purge_intent_clears_body', async () => {
+    await writeAudit({
       actor: OWNER,
       action: 'move_intent',
       agentGroupId: AGENT_GROUP,
@@ -223,7 +223,7 @@ describe('purgeIntentBody', () => {
     expect(before.detail_json).toBeTruthy();
     expect(before.resolved_at).toBeNull();
 
-    purgeIntentBody(getRawDb(), 'corr-3');
+    await purgeIntentBody('corr-3');
 
     const after = getRawDb()
       .prepare("SELECT detail_json, resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-3'")
@@ -236,7 +236,7 @@ describe('purgeIntentBody', () => {
 
 // ── Rate limit ────────────────────────────────────────────────────────────────
 describe('rateLimit', () => {
-  it('allows the first call and reports retryAfter once exhausted', () => {
+  it('allows the first call and reports retryAfter once exhausted', async () => {
     // Drain the window for run_now.
     let lastOk = true;
     let exhausted = false;
@@ -254,7 +254,7 @@ describe('rateLimit', () => {
     expect(lastOk).toBe(false);
   });
 
-  it('keys per (user, verb) — separate verbs do not share a window', () => {
+  it('keys per (user, verb) — separate verbs do not share a window', async () => {
     // Exhaust run_now for OWNER.
     for (let i = 0; i < 200; i++) {
       if (!rateLimit(OWNER, 'run_now').ok) break;
@@ -268,13 +268,13 @@ describe('rateLimit', () => {
 
 // ── Key codec ─────────────────────────────────────────────────────────────────
 describe('encodeKey / decodeKey', () => {
-  it('round-trips a key', () => {
+  it('round-trips a key', async () => {
     const key = encodeKey('ag-1', 'sess-2', 'series-3');
     const decoded = decodeKey(key);
     expect(decoded).toEqual({ agentGroupId: 'ag-1', sessionId: 'sess-2', seriesId: 'series-3' });
   });
 
-  it('produces a base64url string (no +, /, or = padding)', () => {
+  it('produces a base64url string (no +, /, or = padding)', async () => {
     // A seriesId may itself contain '/' (agentGroupId/sessionId never do — they
     // are slugs/sess-ids); decode must round-trip it by splitting on the first
     // two delimiters only. The base64url output carries no +, /, or = chars.
@@ -286,35 +286,35 @@ describe('encodeKey / decodeKey', () => {
     expect(decoded?.seriesId).toBe('series/with/slashes');
   });
 
-  it('test_decodekey_malformed_null', () => {
+  it('test_decodekey_malformed_null', async () => {
     expect(decodeKey('@@not-b64@@')).toBeNull();
   });
 
-  it('returns null when decoded payload lacks all three segments', () => {
+  it('returns null when decoded payload lacks all three segments', async () => {
     // base64url of "only-one-segment" with no separators.
     const bad = Buffer.from('only-one-segment').toString('base64url');
     expect(decodeKey(bad)).toBeNull();
   });
 
   // ── M4: path-traversal segment rejection ─────────────────────────────────────
-  it('test_decodekey_rejects_dotdot_traversal', () => {
+  it('test_decodekey_rejects_dotdot_traversal', async () => {
     // base64url of "../../x/series" → a traversal-laden agentGroupId/sessionId.
     const key = Buffer.from('../../x/series', 'utf8').toString('base64url');
     expect(decodeKey(key)).toBeNull();
   });
 
-  it('rejects a "." or ".." segment in any position', () => {
+  it('rejects a "." or ".." segment in any position', async () => {
     expect(decodeKey(Buffer.from('./sess/series', 'utf8').toString('base64url'))).toBeNull();
     expect(decodeKey(Buffer.from('ag/../series', 'utf8').toString('base64url'))).toBeNull();
     expect(decodeKey(Buffer.from('ag/sess/..', 'utf8').toString('base64url'))).toBeNull();
   });
 
-  it('rejects a backslash or NUL char in a segment', () => {
+  it('rejects a backslash or NUL char in a segment', async () => {
     expect(decodeKey(Buffer.from('ag\\x/sess/series', 'utf8').toString('base64url'))).toBeNull();
     expect(decodeKey(Buffer.from('ag/se\x00ss/series', 'utf8').toString('base64url'))).toBeNull();
   });
 
-  it('still accepts a clean three-segment key (no traversal)', () => {
+  it('still accepts a clean three-segment key (no traversal)', async () => {
     const decoded = decodeKey(encodeKey('ag-1', 'sess-2', 'series-3'));
     expect(decoded).toEqual({ agentGroupId: 'ag-1', sessionId: 'sess-2', seriesId: 'series-3' });
   });
@@ -324,12 +324,12 @@ describe('encodeKey / decodeKey', () => {
 describe('sessionInboundPathFor', () => {
   const BASE = '/tmp/nc-base-dir';
 
-  it('builds the canonical inbound.db path for a clean locator', () => {
+  it('builds the canonical inbound.db path for a clean locator', async () => {
     const p = sessionInboundPathFor(BASE, 'ag-1', 'sess-1');
     expect(p).toBe(path.join(BASE, 'v2-sessions', 'ag-1', 'sess-1', 'inbound.db'));
   });
 
-  it('test_session_path_rejects_traversal_escape', () => {
+  it('test_session_path_rejects_traversal_escape', async () => {
     // A segment that would escape the v2-sessions base → null (containment).
     expect(sessionInboundPathFor(BASE, '..', 'sess-1')).toBeNull();
     expect(sessionInboundPathFor(BASE, 'ag-1', '../../etc')).toBeNull();
@@ -339,13 +339,13 @@ describe('sessionInboundPathFor', () => {
 
 // ── Cache singleton ─────────────────────────────────────────────────────────────
 describe('scheduledCache', () => {
-  it('test_invalidate_bumps_gen', () => {
+  it('test_invalidate_bumps_gen', async () => {
     const gen0 = getScheduledCache().gen;
     invalidateScheduledCache();
     expect(getScheduledCache().gen).toBeGreaterThan(gen0);
   });
 
-  it('invalidate clears stored data', () => {
+  it('invalidate clears stored data', async () => {
     invalidateScheduledCache();
     const c = getScheduledCache();
     expect(c.data).toBeNull();
@@ -354,7 +354,7 @@ describe('scheduledCache', () => {
 
 // ── Constant ──────────────────────────────────────────────────────────────────
 describe('SWEEP_INTERVAL_MS', () => {
-  it('matches the host sweep cadence (60s)', () => {
+  it('matches the host sweep cadence (60s)', async () => {
     expect(SWEEP_INTERVAL_MS).toBe(60_000);
   });
 });

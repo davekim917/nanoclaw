@@ -18,15 +18,6 @@ import fs from 'fs';
 
 import { DATA_DIR, TIMEZONE } from '../../config.js';
 import { resolveGroupTimezone } from '../../container-config.js';
-// 5c deferral (seam 3, deployer call 2026-09-05): every getRawDb() call in
-// this file feeds writeAudit (scheduled-shared.ts), which is also called
-// from src/modules/sweep-scheduled-move/index.ts (PR 5b's file) — §4.2
-// cannot be honored split across two parallel PRs. A follow-up "5c" PR
-// converts writeAudit/purgeIntentBody together with every caller (this
-// file, scheduled-move.ts, cli/resources/tasks.ts, and the
-// sweep-scheduled-move helpers) once 5a and 5b are both merged. Nothing in
-// this file was changed by seam 3 PR 5a for that reason.
-import { getRawDb } from '../../db/connection.js';
 import { withCentralSync } from '../../db/central-lease.js';
 import { getSession, QuietInvalidationError, withQuietInvalidationSync } from '../../db/sessions.js';
 import {
@@ -501,7 +492,7 @@ export const editHandler: AuthHandler = async (req, params, ctx) => {
   if ('refused' in outcome) return outcome.refused;
   if (outcome.touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
 
-  writeAudit(getRawDb(), {
+  await writeAudit({
     actor: ctx.user.id,
     action: 'edit',
     agentGroupId: t.agentGroupId,
@@ -537,7 +528,7 @@ export const pauseHandler: AuthHandler = async (_req, params, ctx) => {
   if ('refused' in outcome) return outcome.refused;
   if (outcome.touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
 
-  writeAudit(getRawDb(), {
+  await writeAudit({
     actor: ctx.user.id,
     action: 'pause',
     agentGroupId: t.agentGroupId,
@@ -580,7 +571,7 @@ export const resumeHandler: AuthHandler = async (_req, params, ctx) => {
   if ('refused' in outcome) return outcome.refused;
   if (outcome.touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
 
-  writeAudit(getRawDb(), {
+  await writeAudit({
     actor: ctx.user.id,
     action: 'resume',
     agentGroupId: t.agentGroupId,
@@ -671,7 +662,7 @@ export const runNowHandler: AuthHandler = async (req, params, ctx) => {
     );
   }
 
-  writeAudit(getRawDb(), {
+  await writeAudit({
     actor: ctx.user.id,
     action: 'run_now',
     agentGroupId: t.agentGroupId,
@@ -725,7 +716,7 @@ export const cancelHandler: AuthHandler = async (_req, params, ctx) => {
   // touched 0 → nothing live AND no terminal recurrence to clear → stale key.
   if (touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
 
-  writeAudit(getRawDb(), {
+  await writeAudit({
     actor: ctx.user.id,
     action: 'cancel',
     agentGroupId: decoded.agentGroupId,

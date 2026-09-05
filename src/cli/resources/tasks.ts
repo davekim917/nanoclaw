@@ -5,15 +5,6 @@ import { CronExpressionParser } from 'cron-parser';
 import { GROUPS_DIR, TIMEZONE } from '../../config.js';
 import { resolveGroupTimezone } from '../../container-config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
-// 5c deferral (seam 3, deployer call 2026-09-05): every getRawDb() call in
-// this file feeds writeAudit (dashboard/api/scheduled-shared.ts), which is
-// also called from src/modules/sweep-scheduled-move/index.ts (PR 5b's file)
-// — §4.2 cannot be honored split across two parallel PRs. A follow-up "5c"
-// PR converts writeAudit/purgeIntentBody together with every caller (this
-// file, dashboard/api/scheduled-move.ts, scheduled-mutations.ts, and the
-// sweep-scheduled-move helpers) once 5a and 5b are both merged. Nothing in
-// this file was changed by seam 3 PR 5a for that reason.
-import { getRawDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import {
   findTaskSessions,
@@ -343,7 +334,7 @@ async function createTask(args: Record<string, unknown>, ctx: CallerContext) {
     ),
   );
   if (!created) throw new Error('task system session inbound.db not found');
-  writeAudit(getRawDb(), {
+  await writeAudit({
     actor: actorFor(ctx),
     action: 'create',
     agentGroupId: session.agent_group_id,
@@ -501,7 +492,7 @@ async function mutateTask(
       // No before/after body: pause/resume/delete/cancel don't touch the
       // prompt, matching the dashboard's own pause/resume/cancel audit rows
       // (scheduled-mutations.ts) — a status-only change is the "after" here.
-      writeAudit(getRawDb(), {
+      await writeAudit({
         actor: actorFor(ctx),
         action,
         agentGroupId: session.agent_group_id,
@@ -690,7 +681,7 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
     if (!result) continue;
     const { before, n } = result;
     if (n > 0) {
-      writeAudit(getRawDb(), {
+      await writeAudit({
         actor: actorFor(ctx),
         action: 'update',
         agentGroupId: session.agent_group_id,
@@ -734,7 +725,7 @@ async function cancelTaskCommand(args: Record<string, unknown>, ctx: CallerConte
     if (!result) continue;
     if (result.n > 0) {
       for (const seriesId of result.seriesIds) {
-        writeAudit(getRawDb(), {
+        await writeAudit({
           actor: actorFor(ctx),
           action: 'cancel',
           agentGroupId: session.agent_group_id,
@@ -786,7 +777,7 @@ async function runTaskCommand(args: Record<string, unknown>, ctx: CallerContext)
       }, 'ncl tasks run'),
     );
     if (fired) {
-      writeAudit(getRawDb(), {
+      await writeAudit({
         actor: actorFor(ctx),
         action: 'run_now',
         agentGroupId: session.agent_group_id,

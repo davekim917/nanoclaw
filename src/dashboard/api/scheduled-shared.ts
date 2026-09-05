@@ -108,9 +108,11 @@ function buildDetailJson(e: AuditEntry): string | null {
 /**
  * Write one audit row. Prompt bodies are hashed + previewed (≤512 chars);
  * scripts are hash-only; secret names never persist; `move_intent` rows carry
- * the verbatim snapshot in detail_json until purged on resolve. Central DB.
+ * the verbatim snapshot in detail_json until purged on resolve. Central DB,
+ * on the async driver (seam 3 PR 6, the "5c" family: this body and every
+ * caller converted together).
  */
-export function writeAudit(db: Database.Database, e: AuditEntry): void {
+export async function writeAudit(e: AuditEntry): Promise<void> {
   const beforeHash = e.before !== undefined ? sha256(e.before) : null;
   const afterHash = e.after !== undefined ? sha256(e.after) : null;
   // A script-only edit must still leave a provable after_hash even when the
@@ -123,7 +125,7 @@ export function writeAudit(db: Database.Database, e: AuditEntry): void {
   const beforeLen = e.before !== undefined ? e.before.length : null;
   const afterLen = e.after !== undefined ? e.after.length : null;
 
-  db.prepare(
+  await getDb().run(
     `INSERT INTO scheduled_audit
        (ts, actor, action, agent_group_id, session_id, series_id,
         before_hash, after_hash, before_preview, after_preview, before_len, after_len,
@@ -131,26 +133,27 @@ export function writeAudit(db: Database.Database, e: AuditEntry): void {
      VALUES (@ts, @actor, @action, @agentGroupId, @sessionId, @seriesId,
         @beforeHash, @afterHash, @beforePreview, @afterPreview, @beforeLen, @afterLen,
         @detailJson, @correlationId)`,
-  ).run({
-    // Explicit ISO ts, not the column's `datetime('now')` default (CLAUDE.md
-    // Timestamps rule — datetime('now') is naive UTC and gets misparsed as
-    // local by `new Date()`; every downstream reader already tolerates the
-    // 'Z'-suffixed form, e.g. scheduled-move.ts's tsMs parse).
-    ts: new Date().toISOString(),
-    actor: e.actor,
-    action: e.action,
-    agentGroupId: e.agentGroupId,
-    sessionId: e.sessionId,
-    seriesId: e.seriesId,
-    beforeHash: beforeHashOrScript,
-    afterHash: afterHashOrScript,
-    beforePreview,
-    afterPreview,
-    beforeLen,
-    afterLen,
-    detailJson: buildDetailJson(e),
-    correlationId: e.correlationId ?? null,
-  });
+    {
+      // Explicit ISO ts, not the column's `datetime('now')` default (CLAUDE.md
+      // Timestamps rule — datetime('now') is naive UTC and gets misparsed as
+      // local by `new Date()`; every downstream reader already tolerates the
+      // 'Z'-suffixed form, e.g. scheduled-move.ts's tsMs parse).
+      ts: new Date().toISOString(),
+      actor: e.actor,
+      action: e.action,
+      agentGroupId: e.agentGroupId,
+      sessionId: e.sessionId,
+      seriesId: e.seriesId,
+      beforeHash: beforeHashOrScript,
+      afterHash: afterHashOrScript,
+      beforePreview,
+      afterPreview,
+      beforeLen,
+      afterLen,
+      detailJson: buildDetailJson(e),
+      correlationId: e.correlationId ?? null,
+    },
+  );
 }
 
 /**
@@ -200,11 +203,12 @@ export async function hasUnresolvedMoveIntent(sessionId: string): Promise<boolea
   }
 }
 
-export function purgeIntentBody(db: Database.Database, correlationId: string): void {
+export async function purgeIntentBody(correlationId: string): Promise<void> {
   // Explicit ISO, for the same reason the insert above already documents at the
   // `ts` field — this statement was writing the naive `datetime('now')` shape
   // into the very same table, contradicting that comment three lines up.
-  db.prepare('UPDATE scheduled_audit SET detail_json = NULL, resolved_at = ? WHERE correlation_id = ?').run(
+  await getDb().run(
+    'UPDATE scheduled_audit SET detail_json = NULL, resolved_at = ? WHERE correlation_id = ?',
     new Date().toISOString(),
     correlationId,
   );

@@ -24,7 +24,7 @@ import { getAgentGroup } from '../../db/agent-groups.js';
 import { getWorkgroupOnecliSecrets } from '../../db/agent-groups.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { withCentralSync } from '../../db/central-lease.js';
-import { getDb, getRawDb } from '../../db/connection.js';
+import { getDb } from '../../db/connection.js';
 import { findSystemSession, taskThreadId, withQuietInvalidationSync } from '../../db/sessions.js';
 import { readSessionInbound, type ScheduledTaskRow } from '../../modules/mailbox/index.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
@@ -473,18 +473,10 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
 
   const wasPaused = snapshot.status === 'paused';
   const correlationId = randomUUID();
-  // 5c deferral (seam 3, deployer call 2026-09-05): kept raw/sync here because
-  // it feeds writeAudit/purgeIntentBody (scheduled-shared.ts), which are also
-  // called from src/modules/sweep-scheduled-move/index.ts (PR 5b's file) —
-  // §4.2 cannot be honored split across two parallel PRs. A follow-up "5c" PR
-  // converts writeAudit/purgeIntentBody together with every caller (this
-  // file, scheduled-mutations.ts, cli/resources/tasks.ts, and the
-  // sweep-scheduled-move helpers) once 5a and 5b are both merged.
-  const central = getRawDb();
 
   // Step 2b: durable move_intent BEFORE cancel (F2). Full snapshot in
   // detail_json; correlation_id links the recovery.
-  writeAudit(central, {
+  await writeAudit({
     actor: ctx.user.id,
     action: 'move_intent',
     agentGroupId: source.agentGroupId,
@@ -704,7 +696,7 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
       });
     }
     if (!restored) {
-      writeAudit(central, {
+      await writeAudit({
         actor: ctx.user.id,
         action: 'move_restore_failed',
         agentGroupId: source.agentGroupId,
@@ -713,7 +705,7 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
         correlationId,
       });
     } else {
-      purgeIntentBody(central, correlationId);
+      await purgeIntentBody(correlationId);
     }
     invalidateScheduledCache();
     return json({ error: 'move_failed', reason: 'move_failed' }, 500);
@@ -750,9 +742,9 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
   // Step 7: resolve the intent (stamp + purge body, F5) + two-sided move audit
   // (one row per side, shared correlation_id) + invalidate cache. Same-agent
   // reroutes intentionally write both directions against the same group.
-  purgeIntentBody(central, correlationId);
+  await purgeIntentBody(correlationId);
   const secretDetail = { secretGainsCount: (await delta).gains.length, secretLossesCount: (await delta).losses.length };
-  writeAudit(central, {
+  await writeAudit({
     actor: ctx.user.id,
     action: 'move',
     agentGroupId: source.agentGroupId,
@@ -761,7 +753,7 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
     correlationId,
     detail: { direction: 'source', target: target.agentGroupId, ...secretDetail },
   });
-  writeAudit(central, {
+  await writeAudit({
     actor: ctx.user.id,
     action: 'move',
     agentGroupId: target.agentGroupId,
