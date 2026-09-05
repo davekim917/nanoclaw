@@ -2,6 +2,10 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+const { TEST_DIR } = vi.hoisted(() => ({
+  TEST_DIR: globalThis.uniqueTmpRoot('scheduled-wake'),
+}));
+
 // applyScheduleWake opens the calling session's real mailbox now — the
 // delivery loop no longer lends it a handle (plan §4.5b) — so these tests run
 // against a real temp session mailbox instead of an in-memory stand-in.
@@ -9,12 +13,10 @@ vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
   return {
     ...actual,
-    DATA_DIR: '/tmp/nanoclaw-test-scheduled-wake',
-    GROUPS_DIR: '/tmp/nanoclaw-test-scheduled-wake/groups',
+    DATA_DIR: TEST_DIR,
+    GROUPS_DIR: `${TEST_DIR}/groups`,
   };
 });
-
-const TEST_DIR = '/tmp/nanoclaw-test-scheduled-wake';
 
 import { getDeliveryAction } from '../../delivery.js';
 import { initSessionFolder } from '../../session-manager.js';

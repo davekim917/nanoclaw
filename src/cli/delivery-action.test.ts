@@ -12,10 +12,14 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+const { TEST_DIR } = vi.hoisted(() => ({
+  TEST_DIR: globalThis.uniqueTmpRoot('cli-delivery-action'),
+}));
+
 vi.mock('../config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../config.js')>()),
-  DATA_DIR: '/tmp/nanoclaw-test-cli-delivery-action',
-  GROUPS_DIR: '/tmp/nanoclaw-test-cli-delivery-action/groups',
+  DATA_DIR: TEST_DIR,
+  GROUPS_DIR: `${TEST_DIR}/groups`,
 }));
 
 const dispatch = vi.fn();
@@ -33,8 +37,6 @@ vi.mock('../log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
   isSurvivableIoError: vi.fn(() => false),
 }));
-
-const TEST_DIR = '/tmp/nanoclaw-test-cli-delivery-action';
 
 import { closeDb, initTestDb, runMigrations, getRawDb } from '../db/index.js';
 import { getDeliveryAction } from '../delivery.js';

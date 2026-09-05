@@ -11,18 +11,19 @@
 import fs from 'fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-// Inlined, not a module-level const: vi.mock factories are hoisted above
-// every declaration in the file, so referencing one here throws a TDZ error.
+const { TEST_DIR } = vi.hoisted(() => ({
+  TEST_DIR: globalThis.uniqueTmpRoot('self-mod-apply'),
+}));
+
+// The hoisted root is available when the mock factory runs.
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
   return {
     ...actual,
-    DATA_DIR: '/tmp/nanoclaw-test-mcp-apply',
-    GROUPS_DIR: '/tmp/nanoclaw-test-mcp-apply/groups',
+    DATA_DIR: TEST_DIR,
+    GROUPS_DIR: `${TEST_DIR}/groups`,
   };
 });
-
-const TEST_DIR = '/tmp/nanoclaw-test-mcp-apply';
 
 vi.mock('../../container-runner.js', () => ({
   buildAgentGroupImage: vi.fn().mockResolvedValue(undefined),
