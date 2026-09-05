@@ -159,33 +159,37 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
 
   const localName = normalizeName(name);
 
-  // Collision in the creator's destination namespace
-  if (getDestinationByName(sourceGroup.id, localName)) {
-    await notifyAgent(session, `Cannot create agent "${name}": you already have a destination named "${localName}".`);
-    return;
-  }
-
-  // SECURITY (cross-tenant audit 2026-05-03): cap children per parent. Even
-  // with admin approval, an attacker can social-engineer one approval per
-  // request — bounding total children per parent prevents resource
-  // exhaustion + persistent-foothold accumulation.
-  const CHILDREN_PER_PARENT_CAP = 10;
-  const childCount = (
-    getRawDb()
-      .prepare("SELECT COUNT(*) AS c FROM agent_destinations WHERE agent_group_id = ? AND target_type = 'agent'")
-      .get(sourceGroup.id) as { c: number }
-  ).c;
-  if (childCount >= CHILDREN_PER_PARENT_CAP) {
-    await notifyAgent(
-      session,
-      `Cannot create agent "${name}": parent agent "${sourceGroup.name}" has reached the child-agent cap (${CHILDREN_PER_PARENT_CAP}). Manually delete unused children before creating more.`,
-    );
-    log.warn('create_agent: child cap reached', { parent: sourceGroup.id, childCount });
-    return;
-  }
-
+  // The lock covers the PARENT invariants too: two approved requests for one
+  // parent could otherwise both pass the destination-name and child-cap
+  // checks before either inserts (an orphaned agent group whose grant then
+  // hits the parent's primary key, or eleven children under a cap of ten).
   const releaseAllocation = await acquireFolderAllocationLock();
   try {
+    // Collision in the creator's destination namespace
+    if (getDestinationByName(sourceGroup.id, localName)) {
+      await notifyAgent(session, `Cannot create agent "${name}": you already have a destination named "${localName}".`);
+      return;
+    }
+
+    // SECURITY (cross-tenant audit 2026-05-03): cap children per parent. Even
+    // with admin approval, an attacker can social-engineer one approval per
+    // request — bounding total children per parent prevents resource
+    // exhaustion + persistent-foothold accumulation.
+    const CHILDREN_PER_PARENT_CAP = 10;
+    const childCount = (
+      getRawDb()
+        .prepare("SELECT COUNT(*) AS c FROM agent_destinations WHERE agent_group_id = ? AND target_type = 'agent'")
+        .get(sourceGroup.id) as { c: number }
+    ).c;
+    if (childCount >= CHILDREN_PER_PARENT_CAP) {
+      await notifyAgent(
+        session,
+        `Cannot create agent "${name}": parent agent "${sourceGroup.name}" has reached the child-agent cap (${CHILDREN_PER_PARENT_CAP}). Manually delete unused children before creating more.`,
+      );
+      log.warn('create_agent: child cap reached', { parent: sourceGroup.id, childCount });
+      return;
+    }
+
     // Derive a safe folder name, deduplicated globally across agent_groups.folder.
     // Name-squatting is mitigated by the approval gate (operator sees the
     // requested name in the card) rather than by mandatory parent prefix —

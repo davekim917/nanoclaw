@@ -589,4 +589,68 @@ describe('concurrent approvals (seam 3: every lookup yields)', () => {
     expect(cfg.agentGroupId).toBe(winner!.id);
     expect(fs.existsSync(path.join(TEST_GROUPS_DIR, 'twin-2'))).toBe(false);
   });
+
+  it('two approved requests from ONE parent for the same name: one agent, the other refused by the destination-name check', async () => {
+    const apply = (requestId: string) => {
+      const session = makeSession('ag-parent');
+      const payload = {
+        name: 'Solo',
+        localPreview: 'solo',
+        instructions: null,
+        provider: null,
+        providerConfig: null,
+        requestId,
+      };
+      return applyCreateAgent({
+        session,
+        payload,
+        approval: {
+          approval_id: `approval-${requestId}`,
+          session_id: session.id,
+          request_id: requestId,
+          action: 'create_agent',
+          payload: JSON.stringify(payload),
+          created_at: now(),
+          agent_group_id: 'ag-parent',
+          channel_type: null,
+          platform_id: null,
+          instance: null,
+          thread_id: null,
+          platform_message_id: null,
+          expires_at: null,
+          status: 'pending',
+          title: 'Create agent',
+          question: 'Create this agent?',
+          options_json: '[]',
+          approver_user_id: 'test-admin',
+        } satisfies PendingApproval,
+        userId: 'test-admin',
+        notify: async () => {},
+      });
+    };
+    // Unserialized, both pass the parent's destination-name check, the second
+    // creates `solo-2` and then its grant hits the parent's primary key —
+    // an orphaned agent group. Under the lock the second is refused up front.
+    await Promise.all([apply('solo-1'), apply('solo-2')]);
+    const rows = getRawDb()
+      .prepare(`SELECT folder FROM agent_groups WHERE folder LIKE 'solo%' ORDER BY folder`)
+      .all() as Array<{ folder: string }>;
+    expect(rows.map((r) => r.folder)).toEqual(['solo']);
+    expect(fs.existsSync(path.join(TEST_GROUPS_DIR, 'solo-2'))).toBe(false);
+  });
+
+  it('the lock is acquired BEFORE the parent invariants (destination name, child cap)', () => {
+    // The interleaving Codex described — the first insert landing between the
+    // second request's parent checks and its folder dedupe — cannot be forced
+    // from outside the handler, so the ordering is pinned on the source: the
+    // lock must precede both parent checks in applyCreateAgent.
+    const source = fs.readFileSync(path.join(__dirname, 'create-agent.ts'), 'utf8');
+    const handler = source.slice(source.indexOf('export const applyCreateAgent'));
+    const lock = handler.indexOf('await acquireFolderAllocationLock()');
+    const nameCheck = handler.indexOf('getDestinationByName(sourceGroup.id, localName)');
+    const childCap = handler.indexOf('CHILDREN_PER_PARENT_CAP');
+    expect(lock).toBeGreaterThan(-1);
+    expect(nameCheck).toBeGreaterThan(lock);
+    expect(childCap).toBeGreaterThan(lock);
+  });
 });
