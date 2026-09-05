@@ -18,7 +18,7 @@ const mockIsContainerSpawning = vi.fn<(id: string) => boolean>();
 // replacement spawning during the restart's async pending read.
 const mockGetContainerSpawnedAt = vi.fn<(id: string) => number>(() => 1000);
 const mockKillContainer = vi.fn<(id: string, reason: string, onExit?: () => void) => void>();
-const mockWakeContainer = vi.fn();
+const mockWakeContainer = vi.fn<(...args: unknown[]) => Promise<void>>(async () => undefined);
 vi.mock('./container-runner.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('./container-runner.js')>();
   return {
