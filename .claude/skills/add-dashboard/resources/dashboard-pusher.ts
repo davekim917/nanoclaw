@@ -105,25 +105,39 @@ function startLogTail(config: PusherConfig): void {
 
   // Send last 200 lines as backfill
   try {
-    const allLines = fs.readFileSync(logFile, 'utf-8').split('\n').filter((l) => l.trim());
+    const allLines = fs
+      .readFileSync(logFile, 'utf-8')
+      .split('\n')
+      .filter((l) => l.trim());
     logOffset = fs.statSync(logFile).size;
     const tail = allLines.slice(-200).map((l) => l.replace(ANSI_RE, ''));
     if (tail.length > 0) postJson(config, '/api/logs/push', { lines: tail });
-  } catch { return; }
+  } catch {
+    return;
+  }
 
   // Poll every 2s for new lines
   logTimer = setInterval(() => {
     try {
       const stat = fs.statSync(logFile);
-      if (stat.size <= logOffset) { logOffset = stat.size; return; }
+      if (stat.size <= logOffset) {
+        logOffset = stat.size;
+        return;
+      }
       const buf = Buffer.alloc(stat.size - logOffset);
       const fd = fs.openSync(logFile, 'r');
       fs.readSync(fd, buf, 0, buf.length, logOffset);
       fs.closeSync(fd);
       logOffset = stat.size;
-      const lines = buf.toString().split('\n').filter((l) => l.trim()).map((l) => l.replace(ANSI_RE, ''));
+      const lines = buf
+        .toString()
+        .split('\n')
+        .filter((l) => l.trim())
+        .map((l) => l.replace(ANSI_RE, ''));
       if (lines.length > 0) postJson(config, '/api/logs/push', { lines });
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
   }, 2000);
 }
 
@@ -148,7 +162,7 @@ async function collectSnapshot(): Promise<Record<string, unknown>> {
     agent_groups: agentGroups,
     sessions,
     channels,
-    users: collectUsers(),
+    users: await collectUsers(),
     tokens,
     context_windows: contextWindows,
     activity: collectActivity(),
@@ -158,45 +172,51 @@ async function collectSnapshot(): Promise<Record<string, unknown>> {
 
 async function collectAgentGroups() {
   const groups = await getAllAgentGroups();
-  return Promise.all(groups.map(async (g) => {
-    const sessions = await getSessionsByAgentGroup(g.id);
-    const running = sessions.filter((s) => s.container_status === 'running' || s.container_status === 'idle');
-    const destinations = getDestinations(g.id);
-    const members = getMembers(g.id).map((m) => {
-      const user = getUser(m.user_id);
-      return { ...m, display_name: user?.display_name ?? null };
-    });
-    const admins = getAdminsOfAgentGroup(g.id).map((a) => {
-      const user = getUser(a.user_id);
-      return { ...a, display_name: user?.display_name ?? null };
-    });
+  return Promise.all(
+    groups.map(async (g) => {
+      const sessions = await getSessionsByAgentGroup(g.id);
+      const running = sessions.filter((s) => s.container_status === 'running' || s.container_status === 'idle');
+      const destinations = getDestinations(g.id);
+      const members = await Promise.all(
+        (await getMembers(g.id)).map(async (m) => {
+          const user = await getUser(m.user_id);
+          return { ...m, display_name: user?.display_name ?? null };
+        }),
+      );
+      const admins = await Promise.all(
+        (await getAdminsOfAgentGroup(g.id)).map(async (a) => {
+          const user = await getUser(a.user_id);
+          return { ...a, display_name: user?.display_name ?? null };
+        }),
+      );
 
-    // Wirings
-    const db = getRawDb();
-    const wirings = db
-      .prepare(
-        `SELECT mga.*, mg.channel_type, mg.platform_id, mg.name as mg_name, mg.is_group, mg.unknown_sender_policy
+      // Wirings
+      const db = getRawDb();
+      const wirings = db
+        .prepare(
+          `SELECT mga.*, mg.channel_type, mg.platform_id, mg.name as mg_name, mg.is_group, mg.unknown_sender_policy
          FROM messaging_group_agents mga
          JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
          WHERE mga.agent_group_id = ?`,
-      )
-      .all(g.id) as Array<Record<string, unknown>>;
+        )
+        .all(g.id) as Array<Record<string, unknown>>;
 
-    return {
-      id: g.id,
-      name: g.name,
-      folder: g.folder,
-      agent_provider: g.agent_provider,
-      container_config: (await getContainerConfig(g.id)) ?? null,
-      sessionCount: sessions.length,
-      runningSessions: running.length,
-      wirings,
-      destinations,
-      members,
-      admins,
-      created_at: g.created_at,
-    };
-  }));
+      return {
+        id: g.id,
+        name: g.name,
+        folder: g.folder,
+        agent_provider: g.agent_provider,
+        container_config: (await getContainerConfig(g.id)) ?? null,
+        sessionCount: sessions.length,
+        runningSessions: running.length,
+        wirings,
+        destinations,
+        members,
+        admins,
+        created_at: g.created_at,
+      };
+    }),
+  );
 }
 
 async function collectSessions() {
@@ -230,10 +250,12 @@ async function collectChannels() {
       };
     }
 
-    const agents = await Promise.all((await getMessagingGroupAgents(mg.id)).map(async (a) => {
-      const group = await getAgentGroup(a.agent_group_id);
-      return { agent_group_id: a.agent_group_id, agent_group_name: group?.name ?? null, priority: a.priority };
-    }));
+    const agents = await Promise.all(
+      (await getMessagingGroupAgents(mg.id)).map(async (a) => {
+        const group = await getAgentGroup(a.agent_group_id);
+        return { agent_group_id: a.agent_group_id, agent_group_name: group?.name ?? null, priority: a.priority };
+      }),
+    );
 
     byType[mg.channel_type].groups.push({
       messagingGroup: {
@@ -257,43 +279,53 @@ async function collectChannels() {
   return Object.values(byType).sort((a, b) => a.channelType.localeCompare(b.channelType));
 }
 
-function collectUsers() {
-  return getAllUsers().map((u) => {
-    const roles = getUserRoles(u.id);
-    const dms = getUserDmsForUser(u.id);
+async function collectUsers() {
+  const users = await getAllUsers();
+  return Promise.all(
+    users.map(async (u) => {
+      const roles = await getUserRoles(u.id);
+      const dms = await getUserDmsForUser(u.id);
 
-    const db = getRawDb();
-    const memberships = db
-      .prepare(
-        `SELECT agm.agent_group_id, ag.name as agent_group_name
+      const db = getRawDb();
+      const memberships = db
+        .prepare(
+          `SELECT agm.agent_group_id, ag.name as agent_group_name
          FROM agent_group_members agm
          JOIN agent_groups ag ON ag.id = agm.agent_group_id
          WHERE agm.user_id = ?`,
-      )
-      .all(u.id) as Array<Record<string, unknown>>;
+        )
+        .all(u.id) as Array<Record<string, unknown>>;
 
-    let privilege = 'none';
-    if (roles.some((r) => r.role === 'owner')) privilege = 'owner';
-    else if (roles.some((r) => r.role === 'admin' && !r.agent_group_id)) privilege = 'global_admin';
-    else if (roles.some((r) => r.role === 'admin')) privilege = 'admin';
-    else if (memberships.length > 0) privilege = 'member';
+      let privilege = 'none';
+      if (roles.some((r) => r.role === 'owner')) privilege = 'owner';
+      else if (roles.some((r) => r.role === 'admin' && !r.agent_group_id)) privilege = 'global_admin';
+      else if (roles.some((r) => r.role === 'admin')) privilege = 'admin';
+      else if (memberships.length > 0) privilege = 'member';
 
-    return {
-      id: u.id,
-      kind: u.kind,
-      display_name: u.display_name,
-      privilege,
-      roles,
-      memberships,
-      dmChannels: dms.map((d) => ({ channel_type: d.channel_type })),
-      created_at: u.created_at,
-    };
-  });
+      return {
+        id: u.id,
+        kind: u.kind,
+        display_name: u.display_name,
+        privilege,
+        roles,
+        memberships,
+        dmChannels: dms.map((d) => ({ channel_type: d.channel_type })),
+        created_at: u.created_at,
+      };
+    }),
+  );
 }
 
 async function collectTokens() {
   const sessionsDir = path.join(DATA_DIR, 'v2-sessions');
-  const allEntries: Array<{ model: string; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; agentGroupId: string }> = [];
+  const allEntries: Array<{
+    model: string;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
+    agentGroupId: string;
+  }> = [];
   const agentGroups = await getAllAgentGroups();
   const nameMap = new Map(agentGroups.map((g) => [g.id, g.name]));
 
@@ -304,19 +336,47 @@ async function collectTokens() {
     }
   }
 
-  const byModel: Record<string, { requests: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number }> = {};
-  const byGroup: Record<string, { requests: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; name: string }> = {};
+  const byModel: Record<
+    string,
+    {
+      requests: number;
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens: number;
+      cacheCreationTokens: number;
+    }
+  > = {};
+  const byGroup: Record<
+    string,
+    {
+      requests: number;
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens: number;
+      cacheCreationTokens: number;
+      name: string;
+    }
+  > = {};
   const totals = { requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
 
   for (const e of allEntries) {
-    if (!byModel[e.model]) byModel[e.model] = { requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
+    if (!byModel[e.model])
+      byModel[e.model] = { requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
     byModel[e.model].requests++;
     byModel[e.model].inputTokens += e.inputTokens;
     byModel[e.model].outputTokens += e.outputTokens;
     byModel[e.model].cacheReadTokens += e.cacheReadTokens;
     byModel[e.model].cacheCreationTokens += e.cacheCreationTokens;
 
-    if (!byGroup[e.agentGroupId]) byGroup[e.agentGroupId] = { requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, name: nameMap.get(e.agentGroupId) || e.agentGroupId };
+    if (!byGroup[e.agentGroupId])
+      byGroup[e.agentGroupId] = {
+        requests: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        name: nameMap.get(e.agentGroupId) || e.agentGroupId,
+      };
     byGroup[e.agentGroupId].requests++;
     byGroup[e.agentGroupId].inputTokens += e.inputTokens;
     byGroup[e.agentGroupId].outputTokens += e.outputTokens;
@@ -337,7 +397,13 @@ function scanJsonlTokens(agentDir: string) {
   const claudeDir = path.join(agentDir, '.claude-shared', 'projects');
   if (!fs.existsSync(claudeDir)) return [];
 
-  const entries: Array<{ model: string; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number }> = [];
+  const entries: Array<{
+    model: string;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
+  }> = [];
 
   const walk = (dir: string): void => {
     try {
@@ -360,12 +426,18 @@ function scanJsonlTokens(agentDir: string) {
                     cacheCreationTokens: u.cache_creation_input_tokens || 0,
                   });
                 }
-              } catch { /* skip line */ }
+              } catch {
+                /* skip line */
+              }
             }
-          } catch { /* skip file */ }
+          } catch {
+            /* skip file */
+          }
         }
       }
-    } catch { /* skip dir */ }
+    } catch {
+      /* skip dir */
+    }
   };
   walk(claudeDir);
   return entries;
@@ -392,13 +464,19 @@ async function collectContextWindows() {
           if (entry.isDirectory()) walk(full);
           else if (entry.name.endsWith('.jsonl')) jsonlFiles.push(full);
         }
-      } catch { /* skip */ }
+      } catch {
+        /* skip */
+      }
     };
     walk(claudeDir);
     if (jsonlFiles.length === 0) continue;
 
     jsonlFiles.sort((a, b) => {
-      try { return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs; } catch { return 0; }
+      try {
+        return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs;
+      } catch {
+        return 0;
+      }
     });
 
     // Read last assistant turn from newest file
@@ -428,7 +506,9 @@ async function collectContextWindows() {
           });
           break;
         }
-      } catch { /* skip */ }
+      } catch {
+        /* skip */
+      }
     }
   }
 
@@ -461,23 +541,32 @@ function collectActivity() {
     for (const agDir of fs.readdirSync(sessionsDir).filter((d) => d.startsWith('ag-'))) {
       const agPath = path.join(sessionsDir, agDir);
       for (const sessDir of fs.readdirSync(agPath).filter((d) => d.startsWith('sess-'))) {
-        for (const [dbName, direction] of [['outbound.db', 'outbound'], ['inbound.db', 'inbound']] as const) {
+        for (const [dbName, direction] of [
+          ['outbound.db', 'outbound'],
+          ['inbound.db', 'inbound'],
+        ] as const) {
           const dbPath = path.join(agPath, sessDir, dbName);
           if (!fs.existsSync(dbPath)) continue;
           try {
             const db = new Database(dbPath, { readonly: true });
             const table = direction === 'outbound' ? 'messages_out' : 'messages_in';
-            const rows = db.prepare(`SELECT timestamp FROM ${table} WHERE timestamp > ?`).all(cutoff) as { timestamp: string }[];
+            const rows = db.prepare(`SELECT timestamp FROM ${table} WHERE timestamp > ?`).all(cutoff) as {
+              timestamp: string;
+            }[];
             for (const row of rows) {
               const key = localHourKey(new Date(row.timestamp));
               if (buckets[key]) buckets[key][direction]++;
             }
             db.close();
-          } catch { /* skip */ }
+          } catch {
+            /* skip */
+          }
         }
       }
     }
-  } catch { /* skip */ }
+  } catch {
+    /* skip */
+  }
 
   return toBucketArray(buckets);
 }
@@ -509,7 +598,9 @@ function collectMessages() {
             const rows = db.prepare('SELECT * FROM messages_in ORDER BY seq DESC LIMIT ?').all(limit);
             inbound.push(...(rows as unknown[]).reverse());
             db.close();
-          } catch { /* skip */ }
+          } catch {
+            /* skip */
+          }
         }
 
         const outDbPath = path.join(agPath, sessDir, 'outbound.db');
@@ -519,7 +610,9 @@ function collectMessages() {
             const rows = db.prepare('SELECT * FROM messages_out ORDER BY seq DESC LIMIT ?').all(limit);
             outbound.push(...(rows as unknown[]).reverse());
             db.close();
-          } catch { /* skip */ }
+          } catch {
+            /* skip */
+          }
         }
 
         if (inbound.length > 0 || outbound.length > 0) {
@@ -527,7 +620,9 @@ function collectMessages() {
         }
       }
     }
-  } catch { /* skip */ }
+  } catch {
+    /* skip */
+  }
 
   return results;
 }

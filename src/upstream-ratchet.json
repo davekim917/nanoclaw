@@ -52,7 +52,7 @@
 ".claude/skills/add-codex/SKILL.md":{"diff":135,"mode":"100644","sha256":"4a7bb35165db90e3a496edbdf0c0763d056f31ebbfcaa4231831505af4a08e82"},
 ".claude/skills/add-dashboard/SKILL.md":{"diff":10,"mode":"100644","sha256":"29288d171ad74c7c93149821e33b8a12b1350a2c784c1dbfa092ce7747994cf8"},
 ".claude/skills/add-dashboard/resources/dashboard-pusher.test.ts":{"diff":145,"mode":"100644","sha256":null,"deleted":true},
-".claude/skills/add-dashboard/resources/dashboard-pusher.ts":{"diff":300,"mode":"100644","sha256":"e0d9f744c526e39a5d559bbfadcc669d8646b83ecb8f53c73d50a424a806cc63"},
+".claude/skills/add-dashboard/resources/dashboard-pusher.ts":{"diff":69,"mode":"100644","sha256":"a8276d0e2a793b61e9fe5505e29a4a12595241a64071cd60444b61bbe3bf458b"},
 ".claude/skills/add-dashboard/resources/dashboard-wiring.test.ts":{"diff":81,"mode":"100644","sha256":null,"deleted":true},
 ".claude/skills/add-deltachat/REMOVE.md":{"diff":0,"mode":"100644","sha256":"4410425cce0a09439f7247184f04ea1599820610e09c86cf263e12833959b82d"},
 ".claude/skills/add-deltachat/SKILL.md":{"diff":45,"mode":"100644","sha256":"445c0755aa95d1ead9b74c39d4907632660cb197051de8eb4ddd2fbd77318d14"},
