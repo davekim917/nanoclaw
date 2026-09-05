@@ -58,6 +58,8 @@ const fakes = vi.hoisted(() => {
   return {
     listing: [] as Scope[],
     listingFails: false,
+    /** `docker stop` throws and the container keeps running. */
+    stopFails: false,
     running: new Set<string>(),
     stopped: [] as string[],
     waiters: [] as Array<{ name: string; waiter: Waiter }>,
@@ -85,6 +87,7 @@ const fakes = vi.hoisted(() => {
     reset(): void {
       this.listing = [];
       this.listingFails = false;
+      this.stopFails = false;
       this.running.clear();
       this.stopped = [];
       this.waiters = [];
@@ -100,7 +103,9 @@ vi.mock('./container-runtime.js', async (importOriginal) => ({
   CONTAINER_RUNTIME_BIN: ABSENT_CONTAINER_RUNTIME_BIN,
   listInstallContainersWithScope: () => fakes.list(),
   stopContainer: (name: string) => {
+    if (fakes.stopFails) throw new Error('docker stop failed');
     fakes.stopped.push(name);
+    fakes.running.delete(name);
     fakes.listing = fakes.listing.filter((scope) => scope.name !== name);
   },
   runtimeShowsRunning: (name: string) => {
@@ -522,12 +527,53 @@ describe('adoptRunningSessions', () => {
     fakes.listing = [survivor('sess-unlisted')];
     fakes.listingFails = true;
 
+    // With the door's partition, the survivors it named are held pending —
+    // owned and leased — rather than left for the sweep to treat as unowned.
+    const reconciled = await adoptRunningSessions({ list: fakes.list, survivableSessionIds: ['sess-unlisted'] });
+
+    expect(reconciled).toEqual({ adopted: 0, stopped: 0, pendingClaim: 1, fencedInbound: 0 });
+    expect(warnings('Session adoption listing failed — holding every survivable session as pending')).toHaveLength(1);
+    expect(isContainerRunning('sess-unlisted')).toBe(false);
+    expect(hasPendingAdoption('sess-unlisted')).toBe(true);
+    expect(containerOwnsOutbound('sess-unlisted')).toBe(true);
+    expect(fakes.stopped).toEqual([]);
+    expect(await getSessionClaim('sess-unlisted')).toBeUndefined();
+
+    // Without a partition there is nothing to hold: zeros, one WARN.
+    fakes.reset();
+    fakes.listingFails = true;
+    expect(await adoptRunningSessions({ list: fakes.list })).toEqual({
+      adopted: 0,
+      stopped: 0,
+      pendingClaim: 0,
+      fencedInbound: 0,
+    });
+    expect(warnings('Session adoption skipped — runtime listing failed')).toHaveLength(1);
+  });
+
+  it('a failed stop keeps the claim and the pending entry', async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-unstoppable');
+    fakes.listing = [survivor('sess-unstoppable')];
+    fakes.running.add('nanoclaw-v2-sess-unstoppable');
+    fakes.stopFails = true;
+    // Memory refuses the survivor, so adoption tries to stop it — and cannot.
+    memoryStub.budgetMb = 1;
+
     const reconciled = await adoptRunningSessions({ list: fakes.list });
 
-    expect(reconciled).toEqual({ adopted: 0, stopped: 0, pendingClaim: 0, fencedInbound: 0 });
-    expect(warnings('Session adoption skipped — runtime listing failed')).toHaveLength(1);
-    expect(isContainerRunning('sess-unlisted')).toBe(false);
-    expect(fakes.stopped).toEqual([]);
+    // Still running, still claimed by THIS host, still owned: a later wake
+    // retries the adoption rather than spawning a second writer beside it.
+    expect(reconciled).toEqual({ adopted: 0, stopped: 0, pendingClaim: 1, fencedInbound: 0 });
+    expect(hasPendingAdoption('sess-unstoppable')).toBe(true);
+    expect(containerOwnsOutbound('sess-unstoppable')).toBe(true);
+    const claim = await getSessionClaim('sess-unstoppable');
+    expect([claim?.claimed_by, claim?.container_ref]).toEqual([getHostInstanceId(), 'nanoclaw-v2-sess-unstoppable']);
+    expect(
+      warnings(
+        'Adoption refused for memory but the container is not proven gone — keeping its claim and retrying on wake',
+      ),
+    ).toHaveLength(1);
+    expect(memoryStub.reservedMb()).toBe(0);
   });
 
   it('an adopted container holds a memory reservation until it finishes', async () => {

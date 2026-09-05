@@ -109,19 +109,34 @@ vi.mock('./container-runtime.js', async (importOriginal) => ({
 }));
 
 /** Parks the NEXT `getSessionClaim` read once — the finish's fence read, in the interleaving case. */
-const claimReads = vi.hoisted(() => ({ parkNext: null as Promise<void> | null, count: 0 }));
+const claimReads = vi.hoisted(() => ({
+  parkNext: null as Promise<void> | null,
+  count: 0,
+  /** The next N `getSessionClaim` reads throw — the central DB is unavailable. */
+  failNext: 0,
+  /** `tryClaimSession` rejects — a claim that cannot be recorded. */
+  claimWriteFails: false,
+}));
 vi.mock('./db/coordination.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('./db/coordination.js')>();
   return {
     ...real,
     getSessionClaim: async (sessionId: string) => {
       claimReads.count += 1;
+      if (claimReads.failNext > 0) {
+        claimReads.failNext -= 1;
+        throw new Error('central DB unavailable');
+      }
       const gate = claimReads.parkNext;
       if (gate) {
         claimReads.parkNext = null;
         await gate;
       }
       return real.getSessionClaim(sessionId);
+    },
+    tryClaimSession: async (args: Parameters<typeof real.tryClaimSession>[0]) => {
+      if (claimReads.claimWriteFails) throw new Error('session_claims write failed');
+      return real.tryClaimSession(args);
     },
   };
 });
@@ -211,6 +226,7 @@ import fs from 'node:fs';
 import {
   adoptRunningSessions,
   getAdoptedSessionIds,
+  hasPendingAdoption,
   beginContainerShutdown,
   finalizeSession,
   planContainerShutdown,
@@ -297,6 +313,8 @@ describe('supervision channel', () => {
     fakes.reset();
     claimReads.parkNext = null;
     claimReads.count = 0;
+    claimReads.failNext = 0;
+    claimReads.claimWriteFails = false;
     leases.acquired.length = 0;
     leases.released.length = 0;
     // A short re-arm backoff: the daemon-restart cases wait for the second waiter.
@@ -304,6 +322,7 @@ describe('supervision channel', () => {
     _resetEverSeenRunningForTest();
     vi.mocked(log.warn).mockClear();
     vi.mocked(log.info).mockClear();
+    vi.mocked(log.error).mockClear();
     await openClaimHarnessDb(TEST_DATA_DIR, TEST_GROUPS_DIR);
     // The fake client: alive on `run` (so a spawned entry has something to
     // kill), a prompt failure on every other verb.
@@ -473,6 +492,74 @@ describe('supervision channel', () => {
     fakes.stopThrows = true;
     killContainer('sess-interleave', 'test');
     await until(() => !isContainerRunning('sess-interleave'), 'the replacement never finalized');
+  });
+
+  it('a pending survivor holds its storage leases; they release when the re-list shows it gone', async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-pending-lease');
+    fakes.listing = [survivor('sess-pending-lease')];
+    claimReads.claimWriteFails = true;
+    const reconciled = await adoptRunningSessions({ list: fakes.list });
+    expect(reconciled.pendingClaim).toBe(1);
+    expect(hasPendingAdoption('sess-pending-lease')).toBe(true);
+
+    // Leased before the claim, and kept while pending: the storage manager
+    // must not clean a root an untracked survivor is using.
+    const pendingRoots = [...leases.acquired];
+    expect(pendingRoots).toHaveLength(2);
+    expect(leases.released).toEqual([]);
+
+    // The re-list proves it gone: the lease goes back and the ordinary path
+    // spawns (a real `sleep` client here, killed below).
+    fakes.listing = [];
+    claimReads.claimWriteFails = false;
+    await expect(wakeContainer(callerSnapshot('sess-pending-lease'))).resolves.toBe(true);
+    expect(hasPendingAdoption('sess-pending-lease')).toBe(false);
+    for (const root of pendingRoots) expect(leases.released).toContain(root);
+
+    fakes.stopThrows = true;
+    killContainer('sess-pending-lease', 'test');
+    await until(() => !isContainerRunning('sess-pending-lease'), 'the spawned client never finalized');
+  });
+
+  it('a listing failure seeds the survivable ids as pending, with their leases', async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-unlisted-lease');
+
+    const reconciled = await adoptRunningSessions({
+      list: () => {
+        throw new Error('Cannot connect to the Docker daemon');
+      },
+      survivableSessionIds: ['sess-unlisted-lease'],
+    });
+
+    expect(reconciled.pendingClaim).toBe(1);
+    expect(hasPendingAdoption('sess-unlisted-lease')).toBe(true);
+    expect(leases.acquired).toHaveLength(2);
+    expect(leases.released).toEqual([]);
+  });
+
+  it('a fence failure never writes unfenced', async () => {
+    await adopt('sess-fence-down');
+    // Every fence attempt fails: the central DB cannot answer the claim read.
+    claimReads.failNext = 10;
+
+    fakes.exit('nanoclaw-v2-sess-fence-down', 0);
+    await until(() => !isContainerRunning('sess-fence-down'), 'the adopted entry never finalized');
+    await until(
+      () =>
+        vi
+          .mocked(log.error)
+          .mock.calls.some((call) => call[0] === 'Stale-finish fence unavailable; leaving container_status untouched'),
+      'the fence never gave up',
+    );
+
+    // The row keeps whatever it had — here `running` — rather than an unfenced
+    // `stopped` that could overwrite a replacement's live status. The scoped
+    // claim release still lands: it is a no-op against any newer incarnation.
+    expect(await containerStatusOf('sess-fence-down')).toBe('running');
+    expect(warnings('Stale-finish fence failed — retrying')).toHaveLength(3);
+    claimReads.failNext = 0;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect((await getSessionClaim('sess-fence-down'))?.claimed_by).toBeNull();
   });
 
   it('an adopted entry holds the storage-activity leases until it finishes', async () => {

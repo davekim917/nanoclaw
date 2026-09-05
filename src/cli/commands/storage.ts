@@ -1,4 +1,4 @@
-import { getActiveContainerSessionIds } from '../../container-runner.js';
+import { getStorageProtectedSessionIds } from '../../container-runner.js';
 import { getStorageReportInBackground } from '../../storage-maintenance-worker.js';
 import { register } from '../registry.js';
 
@@ -11,7 +11,7 @@ register({
   description: 'Show reclaimable host storage without deleting anything.',
   access: 'approval',
   parseArgs: () => ({}),
-  handler: async () => getStorageReportInBackground(getActiveContainerSessionIds(), { mode: 'dry-run' }),
+  handler: async () => getStorageReportInBackground(getStorageProtectedSessionIds(), { mode: 'dry-run' }),
 });
 
 register({
@@ -20,7 +20,7 @@ register({
   access: 'approval',
   parseArgs: parseApply,
   handler: async ({ apply }) =>
-    getStorageReportInBackground(getActiveContainerSessionIds(), {
+    getStorageReportInBackground(getStorageProtectedSessionIds(), {
       mode: apply ? 'apply' : 'dry-run',
       force: apply,
     }),

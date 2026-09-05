@@ -39,11 +39,13 @@ const SCAN_ROOTS = ['src', 'scripts', 'setup'] as const;
  *  - `session-claim-spawn.test.ts` is the acceptance suite for the one caller;
  *    it wraps the real accessor to inject a lost CAS and a failed write, which
  *    is the only way a single process can produce either.
- *  - `container-adoption.test.ts` (seam 4 E) wraps it the same way, to inject
- *    the failed write the pending-adoption cases need.
+ *  - `container-adoption.test.ts` and `container-supervision-channel.test.ts`
+ *    (seam 4 E) wrap it the same way, to inject the failed write the
+ *    pending-adoption cases need.
  */
 const NOT_CALLERS: readonly string[] = [
   'src/container-adoption.test.ts',
+  'src/container-supervision-channel.test.ts',
   'src/db/coordination.test.ts',
   'src/db/coordination.ts',
   'src/session-claim-callers.test.ts',

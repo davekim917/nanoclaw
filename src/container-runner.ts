@@ -861,6 +861,16 @@ export function getActiveContainerSessionIds(): string[] {
   return [...activeContainers.keys()];
 }
 
+/**
+ * The sessions whose storage the maintenance worker must not touch: every
+ * tracked container plus every pending adoption — a survivor this host could
+ * not claim is alive, untracked, and still using its directories, and it holds
+ * its storage-activity lease until a runtime re-list proves it gone.
+ */
+export function getStorageProtectedSessionIds(): string[] {
+  return [...new Set([...activeContainers.keys(), ...pendingAdoptions])];
+}
+
 // ── Workgroup reconciler ────────────────────────────────────────────────────
 //
 // Exported for unit testing. Production callers go through spawnContainer.
@@ -1221,7 +1231,7 @@ function trackWake(sessionId: string, run: () => Promise<boolean>): Promise<bool
 
 async function checkStorageAdmission(session: Session, queued: boolean): Promise<boolean> {
   try {
-    const storageAdmission = await assertStorageAdmissionInBackground(getActiveContainerSessionIds());
+    const storageAdmission = await assertStorageAdmissionInBackground(getStorageProtectedSessionIds());
     if (storageAdmission.allowed) return true;
     log.warn(
       queued
@@ -1927,39 +1937,55 @@ export function finalizeSession(
  * incarnation (the claim was refused, or never taken under a durable id) have
  * nothing to fence on and write as they always did.
  */
+const FINISH_FENCE_ATTEMPTS = 3;
+const FINISH_FENCE_RETRY_MS = 100;
+
 async function finishSessionBookkeeping(sessionId: string, claimIncarnation: number | undefined): Promise<void> {
-  let fenced: 'ours' | 'stale' | 'unfenced' = 'unfenced';
+  let fenced: 'ours' | 'stale' | 'unfenced' | 'unavailable' = 'unfenced';
   if (claimIncarnation !== undefined) {
     const self = getHostInstanceId();
-    try {
-      fenced = await centralTransaction(async () => {
-        const claim = await getSessionClaim(sessionId);
-        if (claim) {
-          const movedOn = claim.incarnation !== claimIncarnation;
-          const heldByAnother = claim.claimed_by !== null && claim.claimed_by !== self;
-          if (movedOn || heldByAnother) {
-            log.warn('Ignoring stale session finish', {
-              sessionId,
-              fence: 'claim',
-              ourIncarnation: claimIncarnation,
-              incarnation: claim.incarnation,
-              holder: claim.claimed_by,
-            });
-            return 'stale';
+    fenced = 'unavailable';
+    for (let attempt = 1; attempt <= FINISH_FENCE_ATTEMPTS && fenced === 'unavailable'; attempt += 1) {
+      try {
+        fenced = await centralTransaction(async () => {
+          const claim = await getSessionClaim(sessionId);
+          if (claim) {
+            const movedOn = claim.incarnation !== claimIncarnation;
+            const heldByAnother = claim.claimed_by !== null && claim.claimed_by !== self;
+            if (movedOn || heldByAnother) {
+              log.warn('Ignoring stale session finish', {
+                sessionId,
+                fence: 'claim',
+                ourIncarnation: claimIncarnation,
+                incarnation: claim.incarnation,
+                holder: claim.claimed_by,
+              });
+              return 'stale';
+            }
           }
+          await updateSession(sessionId, { container_status: 'stopped' });
+          return 'ours';
+        }, 'session-finish');
+      } catch (err) {
+        log.warn('Stale-finish fence failed — retrying', { sessionId, attempt, err });
+        if (attempt < FINISH_FENCE_ATTEMPTS) {
+          await new Promise((resolve) => setTimeout(resolve, FINISH_FENCE_RETRY_MS * attempt));
         }
-        await updateSession(sessionId, { container_status: 'stopped' });
-        return 'ours';
-      }, 'session-finish');
-    } catch (err) {
-      log.warn('Could not fence the finish on the session claim — proceeding unfenced', { sessionId, err });
-      fenced = 'unfenced';
+      }
+    }
+    // Never write unfenced: a missed `stopped` stamp is recovered by the
+    // phantom reset at the next boot, an overwritten `running` is not.
+    if (fenced === 'unavailable') {
+      log.error('Stale-finish fence unavailable; leaving container_status untouched', {
+        sessionId,
+        attempts: FINISH_FENCE_ATTEMPTS,
+      });
     }
   }
   if (fenced === 'stale') return;
   try {
     if (fenced === 'ours') await _emitContainerStateEvent(sessionId, 'stopped');
-    else await markContainerStopped(sessionId);
+    else if (fenced === 'unfenced') await markContainerStopped(sessionId);
   } catch (err) {
     log.warn('markContainerStopped failed after container exit', { sessionId, err });
   }
@@ -2098,6 +2124,35 @@ export interface StartupReconciliation {
 const pendingAdoptions = new Set<string>();
 
 /**
+ * Storage-activity leases held for the pending survivors above: taken before
+ * the claim, for EVERY listed survivor, and kept until the container is either
+ * adopted (the registry entry takes the lease over) or proven gone by a
+ * runtime re-list (`retryPendingAdoption`). Without it the storage manager,
+ * which sees only the registry, could clean a directory a survivor is using.
+ */
+const pendingAdoptionLeases = new Map<string, StorageActivityLease>();
+
+async function releasePendingAdoptionLease(sessionId: string): Promise<void> {
+  const lease = pendingAdoptionLeases.get(sessionId);
+  pendingAdoptionLeases.delete(sessionId);
+  if (!lease) return;
+  try {
+    await lease.release();
+  } catch (err) {
+    log.warn("Failed to release a pending survivor's storage activity lease", { sessionId, err });
+  }
+}
+
+/** Is the container provably gone? A runtime that cannot be asked never proves absence. */
+function containerProvenGone(containerName: string): boolean {
+  try {
+    return !runtimeShowsRunning(containerName);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * The runtime listing adoption reads, replaceable for tests. `adoptRunningSessions`
  * pins whatever it was handed so the wake-path retry re-lists through the same
  * source the boot pass did.
@@ -2118,6 +2173,7 @@ export function hasPendingAdoption(sessionId: string): boolean {
 
 export function _resetAdoptionStateForTesting(options: { waiterRearmMs?: number } = {}): void {
   pendingAdoptions.clear();
+  pendingAdoptionLeases.clear();
   adoptionListing = listInstallContainersWithScope;
   adoptedWaiterRearmMs = options.waiterRearmMs ?? ADOPTED_WAITER_REARM_MS;
 }
@@ -2341,7 +2397,33 @@ async function adoptRunningSession(
   containerName: string,
   workgroupId: string | null,
 ): Promise<AdoptionOutcome> {
-  // Claim FIRST. Only a container this host has claimed may be stopped for
+  // Storage-activity leases FIRST, for every listed survivor — the same
+  // session-dir and worktree roots a spawn holds, under the container's own
+  // workgroup (its label; the group's declared workgroup when it carries
+  // none). `main()` resets the previous host's markers before adoption, so
+  // this fresh marker is the only one. A survivor that ends up pending keeps
+  // the lease in `pendingAdoptionLeases` until it is adopted or proven gone:
+  // the storage manager must not clean a root an untracked survivor is using.
+  let storageActivity = pendingAdoptionLeases.get(session.id) ?? null;
+  if (!storageActivity) {
+    try {
+      storageActivity = await acquireContainerStorageActivity(session, await adoptedWorkgroupId(session, workgroupId));
+    } catch (err) {
+      log.error('Could not take the storage-activity lease for a survivor — leaving it unadopted for retry', {
+        sessionId: session.id,
+        containerName,
+        err,
+      });
+      pendingAdoptions.add(session.id);
+      return { outcome: 'pending' };
+    }
+    pendingAdoptionLeases.set(session.id, storageActivity);
+  }
+  const keepPending = (): AdoptionOutcome => {
+    pendingAdoptions.add(session.id);
+    return { outcome: 'pending' };
+  };
+  // Claim next. Only a container this host has claimed may be stopped for
   // local admission pressure: a survivor a live peer holds is the peer's turn,
   // and stopping it for our budget would be the interruption the lost-claim
   // path exists to avoid. Unclaimed and over-budget both leave it running.
@@ -2354,20 +2436,19 @@ async function adoptRunningSession(
       containerName,
       err,
     });
-    pendingAdoptions.add(session.id);
-    return { outcome: 'pending' };
+    return keepPending();
   }
   if (claimIncarnation === null) {
     log.warn('Session adoption skipped — another live host process holds the claim', {
       sessionId: session.id,
       containerName,
     });
-    pendingAdoptions.add(session.id);
-    return { outcome: 'pending' };
+    return keepPending();
   }
-  // Memory second, under our own claim. A survivor that does not fit is ours
-  // to stop; the claim goes back with it so the next wake re-enters admission
-  // like any spawn.
+  // Memory, under our own claim. A survivor that does not fit is ours to
+  // stop — but the claim goes back only once the container is PROVEN gone. A
+  // stop that fails leaves a running container that must stay claimed and
+  // pending, or a later wake would spawn a second writer beside it.
   const memory = await reserveAdoptedMemory(session);
   if (!memory.ok) {
     log.warn('Adoption refused — the container does not fit the memory admission budget; stopping it', {
@@ -2375,23 +2456,29 @@ async function adoptRunningSession(
       containerName,
       reason: memory.reason,
     });
-    stopUnadoptable(containerName, memory.reason, session.id);
+    const stopped = stopUnadoptable(containerName, memory.reason, session.id);
+    if (!stopped || !containerProvenGone(containerName)) {
+      log.warn(
+        'Adoption refused for memory but the container is not proven gone — keeping its claim and retrying on wake',
+        {
+          sessionId: session.id,
+          containerName,
+          stopIssued: stopped,
+        },
+      );
+      return keepPending();
+    }
     await releaseClaimQuietly(session.id, claimIncarnation);
+    await releasePendingAdoptionLease(session.id);
+    pendingAdoptions.delete(session.id);
     return { outcome: 'stopped', reason: memory.reason };
   }
-  // Storage-activity leases, the same session-dir and worktree roots a spawn
-  // holds, under the container's own workgroup (its label; the group's
-  // declared workgroup when it carries none). `main()` resets the previous
-  // host's markers BEFORE adoption, so this fresh marker is the only one and
-  // the storage manager cannot clean a root a survivor is still using.
-  let storageActivity: StorageActivityLease | null = null;
   try {
-    storageActivity = await acquireContainerStorageActivity(session, await adoptedWorkgroupId(session, workgroupId));
     await registerAdoptedContainer(session, containerName, claimIncarnation, storageActivity);
   } catch (err) {
-    // The lease or the waiter could not be created: the claim is held with
-    // nothing to supervise it. Hand everything back and let the wake path
-    // retry the whole step.
+    // The waiter could not be created: the claim is held with nothing to
+    // supervise it. Hand the claim and the reservation back (the lease stays
+    // with the pending entry) and let the wake path retry the whole step.
     log.error('Could not register an adopted container — releasing its claim for retry', {
       sessionId: session.id,
       containerName,
@@ -2399,11 +2486,11 @@ async function adoptRunningSession(
     });
     activeContainers.delete(session.id);
     releaseMemoryReservation(session.id);
-    if (storageActivity) await storageActivity.release();
     await releaseClaimQuietly(session.id, claimIncarnation);
-    pendingAdoptions.add(session.id);
-    return { outcome: 'pending' };
+    return keepPending();
   }
+  // The registry entry owns the lease from here; `finalizeSession` releases it.
+  pendingAdoptionLeases.delete(session.id);
   pendingAdoptions.delete(session.id);
   // §4.3.6: a survivor may sit behind an ACTIVE fence the dead host wrote.
   // Counted so the case is visible; `releaseOrphanedRepoIngressFencesAtStartup`
@@ -2422,12 +2509,36 @@ async function adoptRunningSession(
   return { outcome: 'adopted', fencedInbound };
 }
 
-function stopUnadoptable(containerName: string, why: string, sessionId: string | null): void {
+/** Issue `docker stop`; true when the stop call succeeded (not a proof the container is gone). */
+function stopUnadoptable(containerName: string, why: string, sessionId: string | null): boolean {
   try {
     stopContainer(containerName);
     log.info('Stopped an unadoptable container at startup', { containerName, sessionId, why });
+    return true;
   } catch (err) {
     log.warn('Failed to stop an unadoptable container at startup', { containerName, sessionId, why, err });
+    return false;
+  }
+}
+
+/**
+ * Hold a survivor pending without having seen its container: the inventory
+ * could not be read, and the door said this session's container survived.
+ * Fail closed — owned, leased, retried on wake — rather than letting the sweep
+ * and the wake path treat it as unowned.
+ */
+async function holdSurvivorPending(sessionId: string): Promise<void> {
+  pendingAdoptions.add(sessionId);
+  if (pendingAdoptionLeases.has(sessionId)) return;
+  try {
+    const session = await getSession(sessionId);
+    if (!session) return;
+    pendingAdoptionLeases.set(
+      sessionId,
+      await acquireContainerStorageActivity(session, await adoptedWorkgroupId(session, null)),
+    );
+  } catch (err) {
+    log.warn('Could not take the storage-activity lease for an unlisted survivor', { sessionId, err });
   }
 }
 
@@ -2469,6 +2580,21 @@ export async function adoptRunningSessions(
   try {
     containers = adoptionListing();
   } catch (err) {
+    if (survivable && survivable.size > 0) {
+      // The door proved these containers survived; a listing this process
+      // cannot take is no evidence they are gone. Every one is held pending —
+      // owned and leased — until `retryPendingAdoption` can re-list.
+      log.warn('Session adoption listing failed — holding every survivable session as pending', {
+        err,
+        sessions: [...survivable],
+      });
+      for (const sessionId of survivable) {
+        await holdSurvivorPending(sessionId);
+        counts.pendingClaim += 1;
+      }
+      log.info('Reconciled sessions at startup', { ...counts });
+      return counts;
+    }
     log.warn('Session adoption skipped — runtime listing failed', { err });
     return counts;
   }
@@ -2543,6 +2669,7 @@ async function retryPendingAdoption(session: Session): Promise<boolean> {
   const survivor = adoptionListing().find((container) => container.sessionId === session.id);
   if (!survivor) {
     pendingAdoptions.delete(session.id);
+    await releasePendingAdoptionLease(session.id);
     log.info('Pending adoption cleared — the container is gone, a fresh spawn is correct', {
       sessionId: session.id,
     });
@@ -2551,9 +2678,16 @@ async function retryPendingAdoption(session: Session): Promise<boolean> {
   const fresh = await refreshActiveSession(session, 'pending-adoption');
   if (!fresh) {
     // The session stopped being wakeable while its survivor waited: the same
-    // answer boot gives such a container.
-    stopUnadoptable(survivor.name, 'session cannot take a wake', session.id);
+    // answer boot gives such a container. Ownership is dropped only once the
+    // stop is proven; otherwise it stays pending for the next wake.
+    if (
+      !stopUnadoptable(survivor.name, 'session cannot take a wake', session.id) ||
+      !containerProvenGone(survivor.name)
+    ) {
+      throw new Error(`session ${session.id} has a running container that could not be stopped — not spawning`);
+    }
     pendingAdoptions.delete(session.id);
+    await releasePendingAdoptionLease(session.id);
     return false;
   }
   const result = await adoptRunningSession(fresh, survivor.name, survivor.workgroupId);
