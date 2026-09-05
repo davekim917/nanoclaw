@@ -163,15 +163,17 @@ codex-review.sh gate [--committed-only]   # the reframe gate — exit 3 when a c
 codex-review.sh push [git push args…]     # gate, then push — the loop's only push path
 codex-review.sh reply <comment_id> <text> # reply on that thread
 codex-review.sh resolve <thread_id>       # mark it resolved
-codex-review.sh status <sha> <since_iso>  # codex=<pending|clean|findings> open=<n> review=<n> reaction=<n> rounds=<n>
+codex-review.sh status <sha> <since_iso>  # one GraphQL observation, including last review/reaction timestamps
+codex-review.sh wait <sha> <since_iso> [minutes]
+                                         # foreground 60s GraphQL poll; default $CODEX_REVIEW_WAIT_MINUTES or 15
 ```
 
 Three details it encodes, each of which has cost real debugging time — keep them if you ever hand-roll the API calls:
 
 - `open` and `status` print the PR's total round count (distinct findings-bearing Codex reviews) and a STOP banner at 4+. The banner is the round-4+ diagnosis path above made deterministic: per-file churn detection missed a 16-round PR whose findings hopped between files, so the tripwire fires on total rounds regardless of where the findings land. Acknowledge it by diagnosing, never by pushing.
-- The reviewer is `chatgpt-codex-connector` in GraphQL and `chatgpt-codex-connector[bot]` in REST. Match case-insensitively on a prefix, never `==` against one spelling.
-- `commit_id` comes back as the full 40-char SHA. `startswith` your short SHA; `==` never matches.
-- Codex signals a clean review two ways: a review with no findings, **or** just a 👍 reaction on the PR. Poll only `/reviews` and you wait forever on a clean PR. An `eyes` reaction means the review is still running — not a result.
+- The reviewer is `chatgpt-codex-connector` in GraphQL. Match case-insensitively on a prefix, never `==` against one spelling.
+- `status` and `wait` page through GraphQL `reviewThreads`, reviews, and reactions separately. They verify the current PR head still starts with the supplied SHA, count unresolved Codex threads from every round, ignore stale reviews and 👍 reactions, and print the last review/reaction timestamp even while still pending.
+- Codex signals a clean review two ways: a review with no unresolved threads, **or** just a 👍 reaction on the PR. An `eyes` reaction means the review is still running — not a result.
 
 ## Step 1 — Collect the full open set
 
@@ -281,34 +283,47 @@ just never with the trigger phrase in it:
 gh pr comment "$PR" --repo "$REPO" --body "Round <n>. Batched fixes at ${SHA:0:8}: <one line>. Rejected with evidence: <one line>."
 ```
 
-Then wait on `codex=`:
+Then run the bounded foreground poll. It makes the GraphQL observation itself
+every 60 seconds and prints the latest head, unresolved count, review timestamp,
+and 👍 timestamp at every tick; do not hand it to a background monitor, task, or
+`wait` tool.
 
 ```bash
-codex-review.sh status "$SHA" "$SINCE"     # → codex=pending open=0 review=0 reaction=0
+codex-review.sh wait "$SHA" "$SINCE"        # default: 15 minutes
+# CODEX_REVIEW_WAIT_MINUTES=10 codex-review.sh wait "$SHA" "$SINCE"
+# codex-review.sh wait "$SHA" "$SINCE" 10  # explicit positive-minute bound
 ```
 
-Reviews take minutes, so how you wait depends on where you're running:
+Capture the full SHA with `git rev-parse HEAD`; a short SHA is accepted for
+status compatibility, but the foreground poll reports the full PR head it
+verified. The exits are deliberate:
 
-- **In an agent container:** don't park the poll as a background shell and end your turn — the container dies after ~30 minutes idle and takes the loop with it. Use the `wait` tool, which brings the wake back into this thread with full context:
-  ```
-  wait({ minutes: 5, prompt: "Run codex-review.sh status <sha> <since> for PR #<n>; if codex=findings go back to step 1 as round <n+1>, if codex=clean and open=0 merge, else wait again" })
-  ```
-- **On a host session:** just re-run `status` between other work, or poll it on an interval. There's no idle ceiling to lose the loop to.
+- `0` with `codex=clean head=<sha> open=0` — the reviewer answered cleanly.
+  Run the PR's required gates, then merge only within the user's existing
+  authorization; ask if no such authorization exists.
+- `10` with `codex=findings` — return to step 1 and work the whole new round.
+- `12` with `codex=head-changed` — stop. The PR head changed during the wait;
+  recapture the head SHA and timestamp only after reconciling that change.
+- `1` — the GraphQL request, pagination, or observation validation failed.
+  Stop: it is no verdict and must never read as clean.
+- `11` after the bound — **not approval**. Do not merge or ping Codex. Run one
+  available independent review of exactly `$SHA`, supplying
+  `docs/review-policy.md`; triage and work any findings through steps 1–4.
+  After a clean fallback review and the required gates, merge only within the
+  user's existing authorization; ask if no such authorization exists.
 
 `codex=findings` → back to step 1, increment the round.
 
-**`codex=pending` is not a permanent state to sit in.** Now that nobody asks
-for the review, a head the reviewer declined to look at never produces a
-verdict — it stays `pending` forever, and a loop that waits for one waits until
-the container dies. So bound it: after **20 minutes** of `pending` with CI green
-and `open=0`, the reviewer has declined, and a declined re-review is a merge
-signal, not a missing one. Say that is what you concluded, and merge.
+**`codex=pending` is not a permanent state to sit in.** It is bounded by the
+foreground poll, and its 15-minute timeout routes to independent review rather
+than treating silence as a clean result.
 
-## Step 6 — Merge
+## Step 6 — Merge with authorization
 
-Merge on `open=0` plus either `codex=clean` or a bounded decline (above). Never
-on `open=0` alone: that says nothing is outstanding, not that the last commit was
-looked at.
+Never merge merely because `open=0`, the foreground poll timed out, or a 👍
+arrived. After a clean Codex or fallback review and the required PR gates, state
+that evidence and merge only within the user's existing authorization; ask if
+no such authorization exists. Only then merge:
 
 ```bash
 gh pr merge "$PR" --repo "$REPO" --squash --delete-branch
