@@ -1707,6 +1707,40 @@ export function killContainer(sessionId: string, reason: string, onExit?: Contai
 }
 
 /**
+ * Reconcile the unconsumed `on_wake` rows an ADOPTED session is carrying.
+ *
+ * E integration (seam4/e-adoption): called per adopted session from
+ * `adoptRunningSessions`, after the claim fence and the registry write.
+ *
+ * `withExistingMailboxSession`, never the provisioning opener: a session with
+ * no mailbox was never adoptable in the first place, and creating one here
+ * would author an `outbound.db` the host must never create (invariant I-10).
+ * An absent mailbox reads as `undefined` and reconciles nothing.
+ *
+ * Best-effort by construction. Adoption runs before every wake source at boot,
+ * so one session whose inbound DB cannot be read must not abort the pass for
+ * every other survivor; the cost of the failure is a stale note, and the sweep
+ * has its own paths for that.
+ */
+export async function reconcileSurvivorWakeRows(session: Session): Promise<{ converted: number; withdrawn: number }> {
+  /* eslint-disable no-catch-all/no-catch-all -- one unreadable session DB must not abort the boot pass */
+  try {
+    const result = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+      mailbox.reconcileSurvivorWakeRows(),
+    );
+    if (!result) return { converted: 0, withdrawn: 0 };
+    if (result.converted > 0 || result.withdrawn > 0) {
+      log.info('Reconciled unconsumed on_wake rows for an adopted session', { sessionId: session.id, ...result });
+    }
+    return result;
+  } catch (err) {
+    log.warn('Could not reconcile on_wake rows for an adopted session', { sessionId: session.id, err });
+    return { converted: 0, withdrawn: 0 };
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+}
+
+/**
  * The error a spawn should abort with when a kill was requested mid-wake.
  *
  * Consulted at BOTH points a spawn can still be stopped: once at the reserved
