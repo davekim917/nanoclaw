@@ -209,7 +209,7 @@ export async function assignAttentionItem(
   // RESERVE BEFORE DISPATCH. A losing double-click fails here, having queued
   // nothing — a record written after its side effect cannot prevent the side
   // effect happening twice.
-  if (!reserveItemAssignment(item.workgroupId, itemId, agentGroupId, ctx.user.id, now, ASSIGN_DEDUPE_MS)) {
+  if (!(await reserveItemAssignment(item.workgroupId, itemId, agentGroupId, ctx.user.id, now, ASSIGN_DEDUPE_MS))) {
     return json(409, { error: 'already_assigned' });
   }
 
@@ -247,7 +247,7 @@ export async function assignAttentionItem(
 
   if (!res.ok) {
     // Nothing was queued, so nothing may keep holding the item.
-    releaseItemAssignment(item.workgroupId, itemId);
+    await releaseItemAssignment(item.workgroupId, itemId);
     log.warn('observatory assign: task create failed', { itemId: item.id, agentGroupId, error: res });
     return json(502, { error: 'task_create_failed' });
   }

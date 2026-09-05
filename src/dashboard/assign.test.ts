@@ -179,17 +179,17 @@ describe('assignAttentionItem', () => {
   it('records the assignment, so the row can stop reading as ownerless', async () => {
     await assign();
     // The NATURAL id — the `board:` stamp is a rendering concern (migration 058).
-    expect(readItemAssignment(WG, ITEM_ID)).toMatchObject({
+    expect(await readItemAssignment(WG, ITEM_ID)).toMatchObject({
       agentGroupId: 'ag-wired',
       assignedBy: OWNER,
     });
-    expect(readItemAssignment(WG, `board:${ITEM_ID}`)).toBeNull();
+    expect(await readItemAssignment(WG, `board:${ITEM_ID}`)).toBeNull();
   });
 
   it('accepts the natural id as well as the stamped one — same item, same row', async () => {
     const res = await assign(OWNER, { itemId: ITEM_ID, agentGroupId: 'ag-wired' });
     expect(res.status).toBe(200);
-    expect(readItemAssignment(WG, ITEM_ID)).not.toBeNull();
+    expect(await readItemAssignment(WG, ITEM_ID)).not.toBeNull();
   });
 
   // ── The refusals ──────────────────────────────────────────────────────────
@@ -199,7 +199,7 @@ describe('assignAttentionItem', () => {
     expect(res.status).toBe(409);
     expect(await res.json()).toEqual({ error: 'agent_not_wired_to_channel', channel: CHANNEL_KEY });
     expect(mockDispatch).not.toHaveBeenCalled();
-    expect(readItemAssignment(WG, ITEM_ID)).toBeNull();
+    expect(await readItemAssignment(WG, ITEM_ID)).toBeNull();
   });
 
   it('404s an out-of-scope agent group, and the body reveals nothing about it', async () => {
@@ -382,7 +382,7 @@ describe('assignAttentionItem', () => {
     mockDispatch.mockResolvedValueOnce({ id: 'x', ok: false, error: 'boom' } as never);
     const failed = await assign();
     expect(failed.status).toBe(502);
-    expect(readItemAssignment(WG, ITEM_ID)).toBeNull();
+    expect(await readItemAssignment(WG, ITEM_ID)).toBeNull();
     expect((await assign()).status).toBe(200);
   });
 });

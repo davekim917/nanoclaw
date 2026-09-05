@@ -1587,8 +1587,8 @@ export async function buildThreadList(
   const closures: Map<string, ThreadCloseState> = readThreadClosures(grouped.map((t) => t.threadId));
   // Same rule again: one query for every attention item on the page. Empty when
   // there are none, which is every install that declares no attention source.
-  const assignments = readItemAssignments([...new Set(attentionItems.map((i) => i.workgroupId))]);
-  const assignerNames = readUserDisplayNames([...new Set([...assignments.values()].map((a) => a.assignedBy))]);
+  const assignments = await readItemAssignments([...new Set(attentionItems.map((i) => i.workgroupId))]);
+  const assignerNames = await readUserDisplayNames([...new Set([...assignments.values()].map((a) => a.assignedBy))]);
 
   const threads: ThreadSummary[] = grouped.map((thread) => {
     const ordered = [...thread.rows].sort((a, b) => activityMs(b) - activityMs(a));
