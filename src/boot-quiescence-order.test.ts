@@ -45,10 +45,11 @@ function childProcessTripwire(record: string[]): Record<string, (...args: unknow
 vi.mock('child_process', () => childProcessTripwire(spawns));
 vi.mock('node:child_process', () => childProcessTripwire(spawns));
 
-import { quiesceWorkgroupsForBootMountChange } from './container-restart.js';
+import { BootQuiescencePartialStopError, quiesceWorkgroupsForBootMountChange } from './container-restart.js';
 import type { InstallContainerScope } from './container-runtime.js';
-import { runBootMountQuiescence } from './main.js';
+import { runBootMountQuiescence, runWorkgroupMemoryStartupGate } from './main.js';
 import {
+  reconcileWorkgroupMemory,
   sharedDirsReconcileWouldChange,
   workgroupMemoryReconcileWouldChange,
   WORKGROUP_MEMORY_CONTAINER_PATH,
@@ -68,7 +69,7 @@ afterEach(() => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-function makeDb(): Database.Database {
+function makeDb(extraWorkgroups: string[] = []): Database.Database {
   const db = new Database(':memory:');
   db.exec(
     `CREATE TABLE workgroups (id TEXT PRIMARY KEY);
@@ -76,26 +77,59 @@ function makeDb(): Database.Database {
   );
   db.prepare(`INSERT INTO workgroups (id) VALUES (?)`).run('wgx');
   db.prepare(`INSERT INTO agent_groups (id, folder, workgroup_id) VALUES (?,?,?)`).run('ag-seed', 'wgx', 'wgx');
+  for (const id of extraWorkgroups) {
+    db.prepare(`INSERT INTO workgroups (id) VALUES (?)`).run(id);
+    db.prepare(`INSERT INTO agent_groups (id, folder, workgroup_id) VALUES (?,?,?)`).run(`ag-${id}`, id, id);
+  }
   return db;
 }
 
-/** A workgroup whose boot reconciles are both settled: nothing would change. */
-function buildSettledTree(): { groupsDir: string; dataDir: string } {
+/** Workgroups whose boot reconciles are all settled: nothing would change. */
+function buildSettledTree(workgroupIds: string[] = ['wgx']): { groupsDir: string; dataDir: string } {
   const groupsDir = path.join(root, 'groups');
   const dataDir = path.join(root, 'data');
-  fs.mkdirSync(path.join(workgroupMemoryDir('wgx', dataDir), 'preferences'), { recursive: true });
-  fs.mkdirSync(path.join(groupsDir, 'wgx'), { recursive: true });
-  fs.symlinkSync(WORKGROUP_MEMORY_CONTAINER_PATH, path.join(groupsDir, 'wgx', 'memory'));
+  for (const id of workgroupIds) {
+    fs.mkdirSync(path.join(workgroupMemoryDir(id, dataDir), 'preferences'), { recursive: true });
+    fs.mkdirSync(path.join(groupsDir, id), { recursive: true });
+    fs.symlinkSync(WORKGROUP_MEMORY_CONTAINER_PATH, path.join(groupsDir, id, 'memory'));
+  }
   return { groupsDir, dataDir };
 }
 
-function fakeRuntime(initial: InstallContainerScope[]) {
+/** Content hash of a fixture tree: file bytes, symlink targets, directory shape. */
+function hashTree(rootDir: string): string {
+  const lines: string[] = [];
+  const visit = (absolute: string, relative: string): void => {
+    const st = fs.lstatSync(absolute);
+    if (st.isSymbolicLink()) {
+      lines.push(`symlink\0${relative}\0${fs.readlinkSync(absolute)}`);
+      return;
+    }
+    if (st.isFile()) {
+      lines.push(`file\0${relative}\0${fs.readFileSync(absolute).toString('base64')}`);
+      return;
+    }
+    if (!st.isDirectory()) {
+      lines.push(`other\0${relative}\0${st.mode}`);
+      return;
+    }
+    lines.push(`dir\0${relative}`);
+    for (const child of fs.readdirSync(absolute).sort()) {
+      visit(path.join(absolute, child), relative ? path.join(relative, child) : child);
+    }
+  };
+  visit(rootDir, '');
+  return lines.join('\n');
+}
+
+function fakeRuntime(initial: InstallContainerScope[], failStopOf?: string) {
   let running = [...initial];
   const stops: string[] = [];
   return {
     stops,
     list: (): InstallContainerScope[] => [...running],
     stop: (name: string): void => {
+      if (failStopOf === name) throw new Error(`docker stop ${name}: no such container`);
       stops.push(name);
       running = running.filter((entry) => entry.name !== name);
     },
@@ -224,6 +258,124 @@ describe('boot mount-change ordering', () => {
     expect(scope).toEqual({ containers: 2, stopped: 2, survivable: 2, unlabeled: 0 });
     expect(scope.stopped).toBe(scope.containers);
     expect(runtime.stops).toEqual(['nanoclaw-v2-a-1', 'nanoclaw-v2-b-1']);
+    db.close();
+  });
+
+  it('an empty-changed boot still reports every workgroup for the pending-upgrade pass', async () => {
+    // `main()` derives the pending-pre-turn-context targets AND the
+    // migration-required operator warnings from these reports. An ordinary boot
+    // changes nothing, so scoping the REPORT set to the changed workgroups —
+    // rather than only the writes — would skip the session-DB admission pass on
+    // almost every start. The predicates, the primitive, the memory gate and
+    // the memory reconcile are all real here.
+    const { groupsDir, dataDir } = buildSettledTree(['wgx', 'wgy']);
+    const db = makeDb(['wgy']);
+    const runtime = fakeRuntime([{ name: 'nanoclaw-v2-a-1', workgroupId: 'wgx', sessionId: 's1', groupId: 'g1' }]);
+    const before = hashTree(root);
+
+    const { changedWorkgroupIds, memoryReports } = await runBootMountQuiescence(db, {
+      workgroupIds: () => ['wgx', 'wgy'],
+      memoryWouldChange: (database, id) => workgroupMemoryReconcileWouldChange(database, id, { groupsDir, dataDir }),
+      sharedWouldChange: (database, id) => sharedDirsReconcileWouldChange(database, id, { groupsDir, dataDir }),
+      sharedFsEnabled: true,
+      quiesce: (changed) => quiesceWorkgroupsForBootMountChange(changed, runtime),
+      warnStartup: async () => undefined,
+      reconcileShared: () => undefined,
+      memoryGate: (database, opts) =>
+        runWorkgroupMemoryStartupGate(database, {
+          ...opts,
+          ensureRuntime: () => undefined,
+          reconcile: (inner, dirs) => reconcileWorkgroupMemory(inner, { ...dirs, groupsDir, dataDir }),
+        }),
+      prune: () => undefined,
+    });
+
+    expect(changedWorkgroupIds).toEqual([]);
+    // One report per workgroup, none of them claiming a change…
+    expect(memoryReports.map((report) => report.workgroupId).sort()).toEqual(['wgx', 'wgy']);
+    expect(memoryReports.every((report) => report.changed === false)).toBe(true);
+    // …and nothing on disk moved, because the WRITES were scoped to the empty set.
+    expect(hashTree(root)).toBe(before);
+    db.close();
+  });
+
+  it('a door that dies part way still writes the host-restart note before rethrowing', async () => {
+    // The containers it did stop took real sessions down with them. Those
+    // sessions get the same accountability note they would have got on a clean
+    // pass; the failure still propagates and no reconcile runs.
+    const db = makeDb();
+    const calls: string[] = [];
+    const runtime = fakeRuntime(
+      [
+        { name: 'nanoclaw-v2-a-1', workgroupId: 'wgx', sessionId: 's1', groupId: 'g1' },
+        { name: 'nanoclaw-v2-b-1', workgroupId: 'wg-other', sessionId: 's2', groupId: 'g2' },
+      ],
+      'nanoclaw-v2-b-1',
+    );
+
+    await expect(
+      runBootMountQuiescence(db, {
+        workgroupIds: () => ['wgx'],
+        memoryWouldChange: () => true,
+        sharedWouldChange: () => false,
+        sharedFsEnabled: true,
+        quiesce: (changed) => quiesceWorkgroupsForBootMountChange(changed, runtime),
+        warnStartup: async () => {
+          calls.push('warn');
+        },
+        reconcileShared: () => {
+          calls.push('reconcileWorkgroupSharedDirs');
+        },
+        memoryGate: () => {
+          calls.push('reconcileWorkgroupMemory');
+          return [];
+        },
+        prune: () => {
+          calls.push('pruneAgentRunnerSnapshots');
+        },
+      }),
+    ).rejects.toBeInstanceOf(BootQuiescencePartialStopError);
+
+    expect(runtime.stops).toEqual(['nanoclaw-v2-a-1']);
+    expect(calls).toEqual(['warn']);
+    db.close();
+  });
+
+  it('a door that stopped nothing writes no host-restart note', async () => {
+    const db = makeDb();
+    const calls: string[] = [];
+
+    await expect(
+      runBootMountQuiescence(db, {
+        workgroupIds: () => ['wgx'],
+        memoryWouldChange: () => true,
+        sharedWouldChange: () => false,
+        sharedFsEnabled: true,
+        quiesce: () =>
+          quiesceWorkgroupsForBootMountChange([], {
+            list: () => {
+              throw new Error('Cannot prove install-scoped container absence: runtime listing failed');
+            },
+            stop: () => undefined,
+          }),
+        warnStartup: async () => {
+          calls.push('warn');
+        },
+        reconcileShared: () => {
+          calls.push('reconcileWorkgroupSharedDirs');
+        },
+        memoryGate: () => {
+          calls.push('reconcileWorkgroupMemory');
+          return [];
+        },
+        prune: () => {
+          calls.push('pruneAgentRunnerSnapshots');
+        },
+      }),
+    ).rejects.toThrow(/prove install-scoped container absence/);
+
+    // Nothing was interrupted, so nothing is announced as interrupted.
+    expect(calls).toEqual([]);
     db.close();
   });
 });

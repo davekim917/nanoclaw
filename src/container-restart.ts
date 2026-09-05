@@ -501,6 +501,26 @@ export interface BootQuiescenceRuntime {
 }
 
 /**
+ * A boot-door failure that happened AFTER at least one container was stopped.
+ *
+ * The names matter to the caller, not to the message: those sessions have lost
+ * their container, and the host-restart accountability note is written after
+ * the door returns. Without this the caller cannot tell "the listing failed and
+ * nothing was touched" from "half the fleet is down and the proof failed", and
+ * the second case would leave those sessions dark with no note
+ * (docs/specs/upstream-restart-survival-seam/plan.md §7.D, property 4).
+ */
+export class BootQuiescencePartialStopError extends Error {
+  readonly stoppedNames: string[];
+
+  constructor(message: string, stoppedNames: string[], options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'BootQuiescencePartialStopError';
+    this.stoppedNames = stoppedNames;
+  }
+}
+
+/**
  * The BOOT quiescence door (docs/specs/upstream-restart-survival-seam/plan.md
  * §4.2, §7.D). Stops the containers whose mounts a startup reconcile is about
  * to invalidate, and proves they are gone before the caller mutates anything.
@@ -538,19 +558,36 @@ export async function quiesceWorkgroupsForBootMountChange(
 
   // D1: the stop set is the whole install. D2 replaces this with `mustStop`.
   const stopSet = containers;
+  const stopped: string[] = [];
   for (const entry of stopSet) {
     try {
       stop(entry.name);
+      stopped.push(entry.name);
     } catch (err) {
-      throw new Error(`Cannot prove install-scoped container absence: failed to stop ${entry.name}`, { cause: err });
+      throw new BootQuiescencePartialStopError(
+        `Cannot prove install-scoped container absence: failed to stop ${entry.name}`,
+        stopped,
+        { cause: err },
+      );
     }
   }
 
-  const stopNames = new Set(stopSet.map((entry) => entry.name));
-  const remaining = list().filter((entry) => stopNames.has(entry.name));
+  // The proof is over the SECOND inventory, not over the names from the first.
+  // Intersecting with the original names would discard a container that
+  // appeared between the two listings — another host, or a spawn racing the
+  // boot — and report quiescence with a live container holding the mounts this
+  // boot is about to rewrite.
+  //
+  // D1 rejects any install-labeled container at all, which is exactly
+  // `cleanupOrphansStrict`'s semantics. D2 narrows this to the containers the
+  // second inventory shows as still in scope, recomputed from THEIR OWN labels
+  // (null workgroup, or a workgroup in `changed`) — never from the first
+  // listing's names, for the same reason.
+  const remaining = list();
   if (remaining.length > 0) {
-    throw new Error(
+    throw new BootQuiescencePartialStopError(
       `Install-scoped containers still running after boot quiescence: ${remaining.map((e) => e.name).join(', ')}`,
+      stopped,
     );
   }
 

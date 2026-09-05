@@ -66,7 +66,20 @@ export interface WorkgroupMemoryReport {
 export interface WorkgroupMemoryDirs {
   groupsDir?: string;
   dataDir?: string;
+  /** Restrict BOTH the report set and the mutations to these workgroups. */
   workgroupIds?: string[];
+  /**
+   * Restrict only the MUTATIONS. Every workgroup still gets a report, built
+   * from the non-mutating inventory, so a caller that derives work from the
+   * report set keeps seeing all of them.
+   *
+   * This exists because the boot door may mutate only the workgroups it proved
+   * quiescent, while `src/main.ts` derives the pending-pre-turn-context targets
+   * and the migration-required operator warnings from the SAME reports. Scoping
+   * the report set to the changed workgroups would make an ordinary boot — one
+   * where nothing would change — skip both.
+   */
+  mutateWorkgroupIds?: string[];
 }
 
 const MEMORY_MANIFEST = '.memory-migration.json';
@@ -414,6 +427,11 @@ function linkMembersToCanonical(
  * Canonical-only automatic reconciliation. It may materialize a genuinely
  * empty/scaffold-only canon and compatibility links, but never imports or
  * replaces substantive provider-local bytes.
+ *
+ * Two selectors, and the difference matters: `workgroupIds` narrows the whole
+ * pass (report and mutation), while `mutateWorkgroupIds` narrows only the
+ * mutations and still reports every workgroup from the inventory. See
+ * `WorkgroupMemoryDirs`.
  */
 export function reconcileWorkgroupMemory(
   db: Database.Database,
@@ -422,6 +440,7 @@ export function reconcileWorkgroupMemory(
   const groupsDir = dirs.groupsDir ?? GROUPS_DIR;
   const dataDir = dirs.dataDir ?? DATA_DIR;
   const selected = dirs.workgroupIds ? new Set(dirs.workgroupIds) : null;
+  const mutable = dirs.mutateWorkgroupIds ? new Set(dirs.mutateWorkgroupIds) : null;
   const workgroups = db.prepare(`SELECT id FROM workgroups ORDER BY id`).all() as Array<{ id: string }>;
   const reports: WorkgroupMemoryReport[] = [];
 
@@ -429,6 +448,13 @@ export function reconcileWorkgroupMemory(
     if (selected && !selected.has(id)) continue;
     const before = inspectWorkgroupMemoryState(db, id, { groupsDir, dataDir });
     if (before.status === 'migration-required') {
+      reports.push({ workgroupId: id, state: before, changed: false });
+      continue;
+    }
+    if (mutable && !mutable.has(id)) {
+      // Outside the quiesced scope: inventory only. `changed: false` is the
+      // truth here — nothing was written — and the report still reaches the
+      // callers that derive per-workgroup work from it.
       reports.push({ workgroupId: id, state: before, changed: false });
       continue;
     }

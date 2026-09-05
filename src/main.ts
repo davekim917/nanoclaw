@@ -31,7 +31,11 @@ import { warnActiveContainersOfShutdown, warnMarkedRunningSessionsOfStartup } fr
 import { resetPhantomContainerStatus } from './db/sessions.js';
 import { resetProcessingChannelIngress } from './db/channel-ingress-receipts.js';
 import { getActiveContainerSessionIds, stopAllContainers } from './container-runner.js';
-import { quiesceWorkgroupsForBootMountChange, type BootQuiescenceScope } from './container-restart.js';
+import {
+  BootQuiescencePartialStopError,
+  quiesceWorkgroupsForBootMountChange,
+  type BootQuiescenceScope,
+} from './container-restart.js';
 import { writeUpstreamPolicySnapshot } from './container-updates.js';
 import { setDeliveryAdapter, startActiveDeliveryPoll, startSweepDeliveryPoll, stopDeliveryPolls } from './delivery.js';
 import { getHostInstanceId, startHostInstanceLease, stopHostInstanceLease } from './host-instance.js';
@@ -168,13 +172,20 @@ import type Database from 'better-sqlite3';
 export function runWorkgroupMemoryStartupGate(
   db: Database.Database,
   deps: {
-    workgroupIds?: string[];
+    /**
+     * Confines the cutover's WRITES to the workgroups the boot door proved
+     * quiescent. Every workgroup is still reported: `main()` derives the
+     * pending-pre-turn-context targets and the migration-required operator
+     * warnings from these reports, and an ordinary boot changes nothing, so
+     * scoping the report set would silently skip both on almost every start.
+     */
+    mutateWorkgroupIds?: string[];
     ensureRuntime?: () => void;
-    reconcile?: (db: Database.Database, dirs: { workgroupIds?: string[] }) => WorkgroupMemoryReport[];
+    reconcile?: (db: Database.Database, dirs: { mutateWorkgroupIds?: string[] }) => WorkgroupMemoryReport[];
   } = {},
 ): WorkgroupMemoryReport[] {
   (deps.ensureRuntime ?? ensureContainerRuntimeRunning)();
-  return (deps.reconcile ?? reconcileWorkgroupMemory)(db, { workgroupIds: deps.workgroupIds });
+  return (deps.reconcile ?? reconcileWorkgroupMemory)(db, { mutateWorkgroupIds: deps.mutateWorkgroupIds });
 }
 
 /** Seams the boot mount-change block injects in tests; real work by default. */
@@ -186,7 +197,7 @@ export interface BootMountQuiescenceDeps {
   quiesce?: (changedWorkgroupIds: string[]) => Promise<BootQuiescenceScope>;
   warnStartup?: (reason: string, skipSessionIds: ReadonlySet<string>) => Promise<void>;
   reconcileShared?: (db: Database.Database, dirs: { workgroupIds?: string[] }) => void;
-  memoryGate?: (db: Database.Database, opts: { workgroupIds?: string[] }) => WorkgroupMemoryReport[];
+  memoryGate?: (db: Database.Database, opts: { mutateWorkgroupIds?: string[] }) => WorkgroupMemoryReport[];
   prune?: () => void;
   fatal?: (message: string, err: unknown) => never;
 }
@@ -260,19 +271,33 @@ export async function runBootMountQuiescence(
     (id) => memoryWouldChange(db, id) || (sharedFsEnabled && sharedWouldChange(db, id)),
   );
 
-  const scope = await (deps.quiesce ?? quiesceWorkgroupsForBootMountChange)(changedWorkgroupIds);
-
-  // FIRST warn sessions still marked 'running' (unclean previous host) that
-  // their containers have been stopped — the on_wake note makes the next spawn
+  // Warn sessions still marked 'running' (unclean previous host) that their
+  // containers have been stopped — the on_wake note makes the next spawn
   // account publicly instead of the session going dark until a human pings.
+  const warnStopped = async (): Promise<void> => {
+    try {
+      await (deps.warnStartup ?? warnMarkedRunningSessionsOfStartup)('host startup after an unclean stop');
+    } catch (err) {
+      log.error('host-restart startup warn failed', { err });
+    }
+  };
+
+  let scope: BootQuiescenceScope;
   try {
-    await (deps.warnStartup ?? warnMarkedRunningSessionsOfStartup)(
-      'host startup after an unclean stop',
-      BOOT_WARN_SKIP_SESSION_IDS,
-    );
-  } catch (err) {
-    log.error('host-restart startup warn failed', { err });
+    scope = await (deps.quiesce ?? quiesceWorkgroupsForBootMountChange)(changedWorkgroupIds);
+  } catch (quiesceErr) {
+    // A door that fails PART WAY through has already killed containers. Those
+    // sessions lost their turn exactly as they would have on a clean pass, so
+    // they get the same accountability note before the failure propagates.
+    // A door that failed before stopping anything gets no note: nothing was
+    // interrupted, and a false "your container was stopped" is its own bug.
+    if (quiesceErr instanceof BootQuiescencePartialStopError && quiesceErr.stoppedNames.length > 0) {
+      await warnStopped();
+    }
+    throw quiesceErr;
   }
+
+  await warnStopped();
 
   // Workgroup shared-FS consolidation — flag-gated (NANOCLAW_WORKGROUP_SHARED_FS,
   // default off). Moves each workgroup's shared dirs into data/workgroups/<id>/
@@ -286,7 +311,7 @@ export async function runBootMountQuiescence(
   }
 
   const memoryReports = (deps.memoryGate ?? runWorkgroupMemoryStartupGate)(db, {
-    workgroupIds: changedWorkgroupIds,
+    mutateWorkgroupIds: changedWorkgroupIds,
   });
 
   // Prune old agent-runner-source snapshots now that the boot door above has

@@ -232,7 +232,7 @@ it('runs reconciliation only after runtime and strict absence proof succeed', as
     },
     memoryGate: (_db, opts) => {
       calls.push('reconcile-memory');
-      expect(opts.workgroupIds).toEqual(['wg-1']);
+      expect(opts.mutateWorkgroupIds).toEqual(['wg-1']);
       return [];
     },
     prune: () => {
@@ -249,13 +249,14 @@ it('keeps the memory gate a runtime check plus the cutover, with nothing stopped
   const calls: string[] = [];
 
   const reports = runWorkgroupMemoryStartupGate(db, {
-    workgroupIds: ['wg-1'],
+    mutateWorkgroupIds: ['wg-1'],
     ensureRuntime: () => {
       calls.push('runtime');
     },
     reconcile: (_db, dirs) => {
       calls.push('reconcile');
-      expect(dirs.workgroupIds).toEqual(['wg-1']);
+      // The WRITES are scoped; the report set is not (see WorkgroupMemoryDirs).
+      expect(dirs.mutateWorkgroupIds).toEqual(['wg-1']);
       return [];
     },
   });

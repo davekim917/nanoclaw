@@ -259,6 +259,64 @@ describe('workgroupMemoryReconcileWouldChange', () => {
     }
   });
 
+  it('an empty mutate set still reports every workgroup and mutates nothing', () => {
+    // `mutateWorkgroupIds` scopes the WRITES, not the report set. src/main.ts
+    // derives the pending-pre-turn-context targets and the migration-required
+    // operator warnings from these reports, and an ordinary boot has an empty
+    // changed set — scoping the reports too would skip both on almost every
+    // start.
+    const base = makeTree('empty-mutate-set', ({ groupsDir, dataDir }) => {
+      for (const wg of ['wga', 'wgb']) {
+        fs.mkdirSync(path.join(workgroupMemoryDir(wg, dataDir), 'preferences'), { recursive: true });
+        fs.mkdirSync(path.join(groupsDir, wg), { recursive: true });
+        fs.symlinkSync(WORKGROUP_MEMORY_CONTAINER_PATH, path.join(groupsDir, wg, 'memory'));
+      }
+    });
+    const dirs = { groupsDir: path.join(base, 'groups'), dataDir: path.join(base, 'data') };
+    const db = makeDb(
+      ['wga', 'wgb'],
+      [
+        { id: 'ag-a', folder: 'wga', workgroupId: 'wga' },
+        { id: 'ag-b', folder: 'wgb', workgroupId: 'wgb' },
+      ],
+    );
+    const before = hashTree(base);
+
+    const reports = reconcileWorkgroupMemory(db, { ...dirs, mutateWorkgroupIds: [] });
+
+    expect(reports.map((report) => report.workgroupId)).toEqual(['wga', 'wgb']);
+    expect(reports.every((report) => report.changed === false)).toBe(true);
+    expect(reports.every((report) => report.state.status === 'canonical')).toBe(true);
+    expect(hashTree(base)).toBe(before);
+    db.close();
+  });
+
+  it('a mutate set writes only its own workgroup while still reporting both', () => {
+    const base = makeTree('partial-mutate-set', ({ groupsDir }) => {
+      for (const wg of ['wga', 'wgb']) fs.mkdirSync(path.join(groupsDir, wg), { recursive: true });
+    });
+    const groupsDir = path.join(base, 'groups');
+    const dataDir = path.join(base, 'data');
+    const db = makeDb(
+      ['wga', 'wgb'],
+      [
+        { id: 'ag-a', folder: 'wga', workgroupId: 'wga' },
+        { id: 'ag-b', folder: 'wgb', workgroupId: 'wgb' },
+      ],
+    );
+    const untouchedBefore = hashTree(path.join(groupsDir, 'wgb'));
+
+    const reports = reconcileWorkgroupMemory(db, { groupsDir, dataDir, mutateWorkgroupIds: ['wga'] });
+
+    expect(reports.map((report) => report.workgroupId)).toEqual(['wga', 'wgb']);
+    expect(reports.find((report) => report.workgroupId === 'wga')!.changed).toBe(true);
+    expect(reports.find((report) => report.workgroupId === 'wgb')!.changed).toBe(false);
+    expect(fs.readlinkSync(path.join(groupsDir, 'wga', 'memory'))).toBe(WORKGROUP_MEMORY_CONTAINER_PATH);
+    expect(hashTree(path.join(groupsDir, 'wgb'))).toBe(untouchedBefore);
+    expect(fs.existsSync(workgroupMemoryDir('wgb', dataDir))).toBe(false);
+    db.close();
+  });
+
   it('a migration-required workgroup reports no change', () => {
     const base = makeTree('migration-required-alone', ({ groupsDir }) => {
       const legacy = path.join(groupsDir, 'wgx', 'memory', 'memories');

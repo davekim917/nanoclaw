@@ -68,7 +68,7 @@ vi.mock('./container-runtime.js', () => ({
   }),
 }));
 
-import { quiesceWorkgroupsForBootMountChange } from './container-restart.js';
+import { BootQuiescencePartialStopError, quiesceWorkgroupsForBootMountChange } from './container-restart.js';
 import type { InstallContainerScope } from './container-runtime.js';
 import { log } from './log.js';
 
@@ -85,20 +85,37 @@ function container(name: string, workgroupId: string | null): InstallContainerSc
  * A fake runtime: `list()` returns whatever is still "running", `stop()`
  * removes it. `stubborn` models a container that does not go away.
  */
-function fakeRuntime(initial: InstallContainerScope[], stubborn: string[] = []) {
+/**
+ * A fake runtime: `list()` returns whatever is still "running", `stop()`
+ * removes it.
+ *
+ * `stubborn` models a container that does not go away. `arrivesLate` models one
+ * that appears BETWEEN the two listings — another host, or a spawn racing the
+ * boot. `failStopOf` models a stop that throws.
+ */
+function fakeRuntime(
+  initial: InstallContainerScope[],
+  opts: { stubborn?: string[]; arrivesLate?: InstallContainerScope; failStopOf?: string } = {},
+) {
   let running = [...initial];
   const stops: string[] = [];
   const listings: number[] = [];
+  let calls = 0;
   return {
     stops,
     listings,
     list: (): InstallContainerScope[] => {
+      calls += 1;
+      if (calls > 1 && opts.arrivesLate && !running.some((e) => e.name === opts.arrivesLate!.name)) {
+        running = [...running, opts.arrivesLate];
+      }
       listings.push(running.length);
       return [...running];
     },
     stop: (name: string): void => {
+      if (opts.failStopOf === name) throw new Error(`docker stop ${name}: no such container`);
       stops.push(name);
-      if (!stubborn.includes(name)) running = running.filter((entry) => entry.name !== name);
+      if (!(opts.stubborn ?? []).includes(name)) running = running.filter((entry) => entry.name !== name);
     },
   };
 }
@@ -163,7 +180,7 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
   });
 
   it('a stop that does not take fails closed', async () => {
-    const runtime = fakeRuntime([container('nanoclaw-v2-a-1', 'wg-a')], ['nanoclaw-v2-a-1']);
+    const runtime = fakeRuntime([container('nanoclaw-v2-a-1', 'wg-a')], { stubborn: ['nanoclaw-v2-a-1'] });
 
     await expect(quiesceWorkgroupsForBootMountChange(['wg-a'], runtime)).rejects.toThrow(
       /still running after boot quiescence/,
@@ -171,6 +188,60 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
 
     expect(runtime.stops).toEqual(['nanoclaw-v2-a-1']);
     expect(log.info).not.toHaveBeenCalledWith('Boot quiescence scope', expect.anything());
+    expect(spawns).toEqual([]);
+  });
+
+  it('a container that appears between the two listings fails closed', async () => {
+    // The proof is over the SECOND inventory, not over the first listing's
+    // names. A newcomer holds the very mounts this boot is about to rewrite, so
+    // intersecting it away would report quiescence with a live container.
+    const runtime = fakeRuntime([container('nanoclaw-v2-a-1', 'wg-a')], {
+      arrivesLate: container('nanoclaw-v2-newcomer-1', 'wg-a'),
+    });
+
+    await expect(quiesceWorkgroupsForBootMountChange(['wg-a'], runtime)).rejects.toThrow(
+      /still running after boot quiescence: nanoclaw-v2-newcomer-1/,
+    );
+
+    expect(runtime.stops).toEqual(['nanoclaw-v2-a-1']);
+    expect(log.info).not.toHaveBeenCalledWith('Boot quiescence scope', expect.anything());
+    expect(spawns).toEqual([]);
+  });
+
+  it('a failure after a stop carries the names it already stopped', async () => {
+    // The caller writes the host-restart accountability note AFTER the door
+    // returns. Without the stopped set on the error, a door that dies half way
+    // leaves those sessions with no container and no note.
+    const runtime = fakeRuntime([container('nanoclaw-v2-a-1', 'wg-a'), container('nanoclaw-v2-b-1', 'wg-b')], {
+      failStopOf: 'nanoclaw-v2-b-1',
+    });
+
+    const error: unknown = await quiesceWorkgroupsForBootMountChange(['wg-a', 'wg-b'], runtime).then(
+      () => null,
+      (err: unknown) => err,
+    );
+
+    expect(error).toBeInstanceOf(BootQuiescencePartialStopError);
+    const partial = error as BootQuiescencePartialStopError;
+    expect(partial.message).toMatch(/failed to stop nanoclaw-v2-b-1/);
+    expect(partial.stoppedNames).toEqual(['nanoclaw-v2-a-1']);
+    expect(spawns).toEqual([]);
+  });
+
+  it('a listing failure carries no stopped names', async () => {
+    const error = await quiesceWorkgroupsForBootMountChange(['wg-a'], {
+      list: () => {
+        throw new Error('Cannot prove install-scoped container absence: runtime listing failed');
+      },
+      stop: () => undefined,
+    }).then(
+      () => null,
+      (err: unknown) => err,
+    );
+
+    // Nothing was interrupted, so the caller must NOT write an accountability
+    // note — a false "your container was stopped" is its own bug.
+    expect(error).not.toBeInstanceOf(BootQuiescencePartialStopError);
     expect(spawns).toEqual([]);
   });
 
