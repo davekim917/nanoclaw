@@ -771,9 +771,9 @@ describe('unknown-channel registration flow', () => {
     // Path 2: "Create new agent" free-text name prompt.
     await routeInbound(groupMention('chat-instance-newagent'));
     await new Promise((r) => setTimeout(r, 10));
-    const pendingNew = getRawDb().prepare(
-      "SELECT messaging_group_id FROM pending_channel_approvals WHERE messaging_group_id != ?",
-    ).get(pendingChoose.messaging_group_id) as { messaging_group_id: string };
+    const pendingNew = getRawDb()
+      .prepare('SELECT messaging_group_id FROM pending_channel_approvals WHERE messaging_group_id != ?')
+      .get(pendingChoose.messaging_group_id) as { messaging_group_id: string };
     deliverMock.mockClear();
     for (const handler of getResponseHandlers()) {
       const claimed = await handler({
@@ -834,9 +834,7 @@ describe('unknown-channel registration flow', () => {
     });
     await new Promise((r) => setTimeout(r, 10));
 
-    expect(
-      getRawDb().prepare("SELECT id FROM agent_groups WHERE name = 'WrongInstance'").get(),
-    ).toBeUndefined();
+    expect(getRawDb().prepare("SELECT id FROM agent_groups WHERE name = 'WrongInstance'").get()).toBeUndefined();
 
     // The matching-instance reply is still awaited and gets consumed.
     await routeInbound({
