@@ -192,6 +192,7 @@ it('test_startup_runs_strict_quiescence_before_any_memory_cutover', async () => 
         return Promise.reject(new Error('listing unavailable'));
       },
       activeSessionIds: async () => [],
+      ensureRuntime: () => undefined,
       warnStartup: async () => {
         calls.push('warn');
       },
@@ -241,6 +242,7 @@ it('runs reconciliation only after runtime and strict absence proof succeed', as
       });
     },
     activeSessionIds: async () => [],
+    ensureRuntime: () => undefined,
     warnStartup: async () => {
       calls.push('warn');
     },

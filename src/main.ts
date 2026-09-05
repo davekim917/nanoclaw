@@ -191,6 +191,7 @@ export interface BootMountQuiescenceDeps {
   sharedWouldChange?: (db: Database.Database, workgroupId: string) => boolean;
   sharedFsEnabled?: boolean;
   activeSessionIds?: () => Promise<string[]>;
+  ensureRuntime?: () => void;
   quiesce?: (
     changedWorkgroupIds: string[],
     options: {
@@ -243,20 +244,23 @@ function bootFatal(message: string, err: unknown): never {
  * asserted in src/boot-quiescence-order.test.ts:
  *
  *   1. warn sessions still marked 'running' by an unclean previous host —
- *      BEFORE anything is stopped, which is where `main()` has always had it;
- *   2. evaluate the predicates once, as the door's input;
- *   3. quiesce — the ONLY thing that stops containers at boot, and it throws
+ *      BEFORE anything is stopped, which is where `main()` has always had it,
+ *      and it is DB-only so it stays ahead of every docker call;
+ *   2. probe the container runtime, bounded, before the door's unbounded
+ *      inventory — the order main has;
+ *   3. evaluate the predicates once, as the door's input;
+ *   4. quiesce — the ONLY thing that stops containers at boot, and it throws
  *      before anything below runs if it cannot prove its scope is down;
- *   4. the door re-evaluates the predicates on the now-quiescent tree and
+ *   5. the door re-evaluates the predicates on the now-quiescent tree and
  *      partitions against THAT answer; the same set drives the reconciles.
  *      Group directories are container-writable, so the pre-stop snapshot can
  *      be stale by the time the stops finish, and a scope built from it would
  *      call a flipped workgroup's sessions survivable;
- *   5. shared-FS consolidation, scoped to the post-stop set. It used to run
+ *   6. shared-FS consolidation, scoped to the post-stop set. It used to run
  *      BEFORE the quiescence proof (plan §3.5, divergence 4), masked only by
  *      the flag defaulting off;
- *   6. canonical-memory cutover, scoped to the same set;
- *   7. snapshot pruning, after both cutovers.
+ *   7. canonical-memory cutover, scoped to the same set;
+ *   8. snapshot pruning, after both cutovers.
  *
  * Steps 2 and 3 are swapped relative to §7.D's listed order, deliberately: the
  * plan's order writes the accountability note after the stops, so a door that
@@ -302,6 +306,14 @@ export async function runBootMountQuiescence(
   } catch (err) {
     log.error('host-restart startup warn failed', { err });
   }
+
+  // Bounded probe BEFORE the unbounded inventory, which is the order main has.
+  // There `ensureContainerRuntimeRunning()` (a 10 s-timeout `docker info`) ran
+  // immediately ahead of `cleanupOrphansStrict()`; here the door's
+  // `listInstallContainersWithScope` is an unbounded `docker ps`, so without
+  // this a stalled daemon hangs the boot instead of failing it. The memory
+  // gate keeps its own call: idempotent, and fast when the daemon is healthy.
+  (deps.ensureRuntime ?? ensureContainerRuntimeRunning)();
 
   // The pre-stop evaluation is the door's INPUT, and nothing more. The group
   // directories these predicates read are bind-mounted writable into live

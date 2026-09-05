@@ -174,6 +174,7 @@ describe('boot mount-change ordering', () => {
         };
       },
       activeSessionIds: async () => ['s1', 's2'],
+      ensureRuntime: () => undefined,
       warnStartup: async () => {
         calls.push('warn');
       },
@@ -232,6 +233,7 @@ describe('boot mount-change ordering', () => {
         };
       },
       activeSessionIds: async () => ['s1', 's2'],
+      ensureRuntime: () => undefined,
       warnStartup: async () => undefined,
       reconcileShared: () => {
         calls.push('reconcileWorkgroupSharedDirs');
@@ -275,6 +277,7 @@ describe('boot mount-change ordering', () => {
         return quiesceWorkgroupsForBootMountChange(changed, { ...runtime, ...options });
       },
       activeSessionIds: async () => ['s1', 's2'],
+      ensureRuntime: () => undefined,
       warnStartup: async () => undefined,
       reconcileShared: () => undefined,
       memoryGate: () => [],
@@ -335,6 +338,7 @@ describe('boot mount-change ordering', () => {
         });
       },
       activeSessionIds: async () => ['s1', 's2'],
+      ensureRuntime: () => undefined,
       warnStartup: async () => undefined,
       reconcileShared: () => undefined,
       memoryGate: (_db, opts) => {
@@ -377,6 +381,7 @@ describe('boot mount-change ordering', () => {
       sharedFsEnabled: true,
       quiesce: (changed, options) => quiesceWorkgroupsForBootMountChange(changed, { ...runtime, ...options }),
       activeSessionIds: async () => ['s1', 's2'],
+      ensureRuntime: () => undefined,
       warnStartup: async () => undefined,
       reconcileShared: () => undefined,
       memoryGate: (database, opts) =>
@@ -394,6 +399,91 @@ describe('boot mount-change ordering', () => {
     expect(memoryReports.every((report) => report.changed === false)).toBe(true);
     // …and nothing on disk moved, because the WRITES were scoped to the empty set.
     expect(hashTree(root)).toBe(before);
+    db.close();
+  });
+
+  it('the bounded runtime probe runs after the warn and before the door', async () => {
+    // Regression guard. On main the only 10 s-bounded docker probe
+    // (`ensureContainerRuntimeRunning`) ran immediately ahead of
+    // `cleanupOrphansStrict()`. The door's inventory is an UNBOUNDED
+    // `docker ps`, so with the probe left to the memory gate a stalled daemon
+    // would hang the boot instead of failing it. The warn is DB-only and stays
+    // first.
+    const db = makeDb();
+    const calls: string[] = [];
+
+    await runBootMountQuiescence(db, {
+      workgroupIds: () => ['wgx'],
+      memoryWouldChange: () => false,
+      sharedWouldChange: () => false,
+      sharedFsEnabled: true,
+      activeSessionIds: async () => [],
+      ensureRuntime: () => {
+        calls.push('ensureRuntime');
+      },
+      warnStartup: async () => {
+        calls.push('warn');
+      },
+      quiesce: async () => {
+        calls.push('quiesce');
+        return {
+          workgroups: 1,
+          changedWorkgroupIds: [],
+          containers: 0,
+          stopped: 0,
+          survivable: 0,
+          unlabeled: 0,
+          survivors: [],
+          survivableSessionIds: [],
+          mustStopSessionIds: [],
+        };
+      },
+      reconcileShared: () => undefined,
+      memoryGate: () => [],
+      prune: () => undefined,
+    });
+
+    expect(calls).toEqual(['warn', 'ensureRuntime', 'quiesce']);
+    db.close();
+  });
+
+  it('a runtime probe that throws aborts before the door lists anything', async () => {
+    const db = makeDb();
+    const calls: string[] = [];
+
+    await expect(
+      runBootMountQuiescence(db, {
+        workgroupIds: () => ['wgx'],
+        memoryWouldChange: () => false,
+        sharedWouldChange: () => false,
+        sharedFsEnabled: true,
+        activeSessionIds: async () => [],
+        ensureRuntime: () => {
+          calls.push('ensureRuntime');
+          throw new Error('Container runtime is required but failed to start');
+        },
+        warnStartup: async () => {
+          calls.push('warn');
+        },
+        quiesce: async () => {
+          calls.push('quiesce');
+          throw new Error('the door must not be reached');
+        },
+        reconcileShared: () => {
+          calls.push('reconcileWorkgroupSharedDirs');
+        },
+        memoryGate: () => {
+          calls.push('reconcileWorkgroupMemory');
+          return [];
+        },
+        prune: () => {
+          calls.push('pruneAgentRunnerSnapshots');
+        },
+      }),
+    ).rejects.toThrow(/Container runtime is required/);
+
+    // The warn already ran; the door never listed, and nothing reconciled.
+    expect(calls).toEqual(['warn', 'ensureRuntime']);
     db.close();
   });
 
@@ -423,6 +513,7 @@ describe('boot mount-change ordering', () => {
         });
       },
       activeSessionIds: async () => ['s1', 's2'],
+      ensureRuntime: () => undefined,
       warnStartup: async () => {
         calls.push('warn');
       },
@@ -453,6 +544,7 @@ describe('boot mount-change ordering', () => {
     await expect(
       runBootMountQuiescence(db, {
         activeSessionIds: async () => ['s1', 's2'],
+        ensureRuntime: () => undefined,
         workgroupIds: () => ['wgx'],
         memoryWouldChange: () => true,
         sharedWouldChange: () => false,
@@ -486,6 +578,7 @@ describe('boot mount-change ordering', () => {
     await expect(
       runBootMountQuiescence(db, {
         activeSessionIds: async () => ['s1', 's2'],
+        ensureRuntime: () => undefined,
         workgroupIds: () => ['wgx'],
         memoryWouldChange: () => true,
         sharedWouldChange: () => false,
