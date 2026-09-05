@@ -243,6 +243,13 @@ export interface StdioMcpServerConfig {
    * silently launch in the wrong directory. (upstream 5e15069da)
    */
   cwd?: string;
+  /**
+   * Container-side root of the plugin this server shipped in, recorded by
+   * the host at stamp time. Consumed (and stripped) by plugin-mcp.ts, which
+   * expands ${PLUGIN_ROOT}/${PLUGIN_DATA} and injects both env vars before
+   * the config reaches a provider.
+   */
+  pluginRoot?: string;
 }
 
 /**

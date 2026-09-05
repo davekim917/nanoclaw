@@ -30,6 +30,7 @@ import { buildSystemPromptAddendum } from './destinations.js';
 import { getTaskSeriesId } from './db/session-routing.js';
 import { ensureMemoryScaffold } from './memory/scaffold.js';
 import { MEMORY_SESSION_HOOK } from './memory/session-hook.js';
+import { resolvePluginServer } from './plugin-mcp.js';
 // Module barrel — loads registration modules, including the singular mailbox slot.
 import './modules/index.js';
 import { getAgentMailbox, readMailboxContext } from './mailbox/index.js';
@@ -221,7 +222,9 @@ async function main(): Promise<void> {
       );
       continue;
     }
-    mcpServers[name] = serverConfig;
+    // Plugin-shipped servers get ${PLUGIN_ROOT}/${PLUGIN_DATA} expansion and
+    // the two injected env vars; everything else passes through untouched.
+    mcpServers[name] = resolvePluginServer(serverConfig);
     log(`Additional MCP server: ${name} (${mcpServerSummary(name, serverConfig)})`);
   }
 

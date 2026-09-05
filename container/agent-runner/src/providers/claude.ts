@@ -17,6 +17,7 @@ import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/cont
 import { recordRateLimitSamples, type AccountIdentity, type RateLimitSample } from '../modules/mailbox/index.js';
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { TIMEZONE, formatLocalStamp } from '../timezone.js';
+import { shimCwd } from './cwd-shim.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
 import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
 import type {
@@ -2121,7 +2122,13 @@ export class ClaudeProvider implements AgentProvider {
 
   constructor(options: ProviderOptions = {}) {
     this.assistantName = options.assistantName;
-    this.mcpServers = options.mcpServers ?? {};
+    // The Agent SDK's McpStdioServerConfig has no cwd field (checked against
+    // 0.3.197) — shim any cwd-bearing stdio server through cwd-shim.ts so a
+    // plugin server that declares one launches in the right directory instead
+    // of silently starting at the container's default cwd.
+    this.mcpServers = Object.fromEntries(
+      Object.entries(options.mcpServers ?? {}).map(([name, server]) => [name, shimCwd(server)]),
+    );
     this.additionalDirectories = options.additionalDirectories;
     this.env = filterSdkEnv({ ...(options.env ?? {}), CLAUDE_CODE_AUTO_COMPACT_WINDOW });
     this.stickyConfig = claudeConfigSchema.parse(options.providerConfig ?? {});

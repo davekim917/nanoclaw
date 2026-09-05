@@ -25,7 +25,10 @@ function pluginDataDir(pluginRoot: string): string {
 }
 
 export function resolvePluginServer(config: McpServerConfig): McpServerConfig {
-  if (config.type === 'http') return config;
+  // The fork's McpServerConfig carries a third `sse` arm upstream doesn't have
+  // (deprecated transport, rejected host-side at parseMcpServerConfig) —
+  // excluded here purely to narrow the type; it can never reach this call.
+  if (config.type === 'http' || config.type === 'sse') return config;
   const { pluginRoot, ...server } = config;
   if (!pluginRoot) return config;
 
