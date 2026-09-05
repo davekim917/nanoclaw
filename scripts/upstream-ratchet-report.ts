@@ -88,6 +88,7 @@ import {
   sealManifest,
   shellQuote,
   totalDiffLines,
+  validateManifestShape,
   writeManifest,
   type Finding,
   type GitMode,
@@ -435,13 +436,16 @@ function catFileBatch(root: string, ref: string, ids: readonly string[]): Buffer
  * batched raw hash already agrees with `hashFile`'s (now byte-based, see
  * src/upstream-ratchet.ts) symlink handling with no extra work.
  */
-function hashFilteredBlob(root: string, ref: string, relPath: string): string {
-  const content = execFileSync(
+function catFileFiltered(root: string, ref: string, relPath: string): Buffer {
+  return execFileSync(
     'git',
     ['-C', root, `--attr-source=${ref}`, 'cat-file', '--filters', `${ref}:${relPath}`],
     { maxBuffer: 512 * 1024 * 1024, stdio: ['ignore', 'pipe', 'inherit'] },
   ) as Buffer;
-  return hashBlobContent(content);
+}
+
+function hashFilteredBlob(root: string, ref: string, relPath: string): string {
+  return hashBlobContent(catFileFiltered(root, ref, relPath));
 }
 
 /**
@@ -653,9 +657,17 @@ function runCheck(options: Options): never {
     process.exit(2);
   }
 
+  // Read through the SAME filtered path every other regular file in <ref>
+  // goes through (`hashFilteredBlob`/`catFileFiltered`), not `git show`: `git
+  // show <ref>:<path>` returns the raw, UNfiltered blob, so a ref that assigns
+  // a clean/smudge or LFS filter to src/upstream-ratchet.json itself would
+  // have `--check` reading the CLEAN (stored) form while a real checkout of
+  // that ref — and the working-tree report run against it — would see the
+  // SMUDGED form. Proven by hand with a reversible base64 clean/smudge filter;
+  // see docs/upstream-ratchet.md.
   let manifestText: string;
   try {
-    manifestText = git(root, ['show', `${resolvedRef}:${MANIFEST_REL}`], true);
+    manifestText = catFileFiltered(root, resolvedRef, MANIFEST_REL).toString('utf8');
     // eslint-disable-next-line no-catch-all/no-catch-all
   } catch (error) {
     void error;
@@ -670,6 +682,43 @@ function runCheck(options: Options): never {
     fail(
       `could not parse the manifest at ${ref}:${MANIFEST_REL}: ${error instanceof Error ? error.message : String(error)}`,
     );
+  }
+
+  // `validateManifestShape` is what stands between here and a crash: a
+  // top-level `null`/array/primitive, or a non-string `upstream`, would throw
+  // on the very next line (`committed.upstream`) otherwise. `--check` reads
+  // `committed` from an ARBITRARY ref's content, so this cannot be skipped the
+  // way a trusted local file arguably could be — and `main()`'s working-tree
+  // path runs the identical check for the identical reason.
+  const shapeFindings = validateManifestShape(committed);
+  if (shapeFindings.length > 0) {
+    if (options.json) {
+      console.log(
+        JSON.stringify(
+          {
+            mode: 'check',
+            ref,
+            resolvedRef,
+            staleManifest: shapeFindings.map((f) => ({ path: f.path, kind: f.kind, detail: f.detail })),
+            exitCode: 1,
+          },
+          null,
+          2,
+        ),
+      );
+    } else {
+      console.log(
+        `Checking ${ref} (${resolvedRef.slice(0, 8)}) — its own manifest at ${MANIFEST_REL} is not shaped like ` +
+          `a manifest, so nothing else about it can be measured:\n`,
+      );
+      console.log(`STALE-MANIFEST (${n(shapeFindings.length)})`);
+      for (const f of shapeFindings) console.log(renderCurrencyFinding(f));
+      console.error(
+        `\nupstream-ratchet: --check failing — the manifest committed at ${ref} is not usable; regenerate on ` +
+          `that branch: ${REGENERATE_HINT}`,
+      );
+    }
+    process.exit(1);
   }
 
   const sha = resolveCommit(root, committed.upstream);
@@ -804,6 +853,33 @@ function main(): void {
       fail(`could not read ${committedPath}: ${error instanceof Error ? error.message : String(error)}`);
     }
     committed = { upstream: '', paths: '', files: {} };
+  }
+
+  // Same guard as `runCheck`'s, for the same reason: `resolveCommit` on the
+  // very next line dereferences `committed.upstream`, which throws instead of
+  // reporting on a top-level `null`/array or a non-string `upstream`. The
+  // local file is not exempt just because this tool is the only thing that
+  // usually writes it — a hand-edited or corrupted one hits the same crash.
+  const shapeFindings = validateManifestShape(committed);
+  if (shapeFindings.length > 0) {
+    if (options.json) {
+      console.log(
+        JSON.stringify(
+          {
+            staleManifest: shapeFindings.map((f) => ({ path: f.path, kind: f.kind, detail: f.detail })),
+            exitCode: 1,
+          },
+          null,
+          2,
+        ),
+      );
+    } else {
+      console.log(`${committedPath} is not shaped like a manifest, so nothing else about it can be measured:\n`);
+      console.log(`STALE-MANIFEST (${n(shapeFindings.length)})`);
+      for (const f of shapeFindings) console.log(renderCurrencyFinding(f));
+      console.error(`\nupstream-ratchet: refusing to measure — ${committedPath} is not usable; regenerate: ${REGENERATE_HINT}`);
+    }
+    process.exit(1);
   }
 
   const sha = resolveCommit(root, options.upstream ?? committed.upstream);

@@ -463,6 +463,74 @@ export function fsTreeReader(repoRoot: string): TreeReader {
 }
 
 /**
+ * Whether `value` even has the SHAPE of a manifest — an object (never `null`,
+ * never an array) with `upstream`/`paths` as strings and `files` as a
+ * (possibly empty, but non-null, non-array) object. Called BEFORE
+ * `checkTree`, `classify`, `counts`, or `resolveCommit` ever read a property
+ * off the parsed value, on BOTH the working-tree path (right after
+ * `readManifest`, in `main()`) and the `--check <ref>` path (right after
+ * `JSON.parse`-ing `git show <ref>:...json`, in `runCheck`) — closing the
+ * whole "throws instead of reporting" class in this one place rather than
+ * guarding each call site separately, which is how it stayed open long enough
+ * for a top-level `null` to reach `resolveCommit` uncaught.
+ *
+ * `--check` reads `committed` from an ARBITRARY ref's content, never
+ * guaranteed well-formed the way `readManifest`'s local file effectively
+ * always is (this tool is the only thing that ever writes it) — but the
+ * working tree is not exempt either: a hand-edited or corrupted local
+ * `src/upstream-ratchet.json` hits the exact same `.upstream` dereference in
+ * `main()`, so both paths get the same guard rather than treating the local
+ * file as trusted by convention.
+ *
+ * Deliberately coarser than `checkTree`'s own field checks: a `upstream` of
+ * `"not-a-sha"` passes here (it IS a string) and is caught by `checkTree`'s
+ * `COMMIT_RE` check instead — this function's only job is making every later
+ * property access SAFE, not validating content. Per-entry validation
+ * (`diff`/`mode`/`sha256`/`deleted`/`ignored`/`binary` shapes) stays in
+ * `checkEntry`, which already never crashes anything downstream because every
+ * field read there is either optional-chained or already defended.
+ */
+export function validateManifestShape(value: unknown): Finding[] {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return [
+      {
+        kind: 'malformed',
+        path: MANIFEST_REL,
+        detail: `the manifest is not an object: ${JSON.stringify(value)}`,
+        hint: `regenerate: ${REGENERATE_HINT}`,
+      },
+    ];
+  }
+  const manifest = value as { upstream?: unknown; paths?: unknown; files?: unknown };
+  const findings: Finding[] = [];
+  if (typeof manifest.upstream !== 'string') {
+    findings.push({
+      kind: 'malformed',
+      path: MANIFEST_REL,
+      detail: `"upstream" is not a string: ${JSON.stringify(manifest.upstream)}`,
+      hint: `regenerate: ${REGENERATE_HINT}`,
+    });
+  }
+  if (typeof manifest.paths !== 'string') {
+    findings.push({
+      kind: 'malformed',
+      path: MANIFEST_REL,
+      detail: `"paths" is not a string: ${JSON.stringify(manifest.paths)}`,
+      hint: `regenerate: ${REGENERATE_HINT}`,
+    });
+  }
+  if (manifest.files === null || typeof manifest.files !== 'object' || Array.isArray(manifest.files)) {
+    findings.push({
+      kind: 'malformed',
+      path: MANIFEST_REL,
+      detail: '"files" is missing or is not an object',
+      hint: `regenerate: ${REGENERATE_HINT}`,
+    });
+  }
+  return findings;
+}
+
+/**
  * Every way the tree and the committed manifest disagree.
  *
  * An empty result means the manifest is CURRENT — not that the fork is at zero
@@ -479,24 +547,24 @@ export function checkTree(
   repoRoot: string = REPO_ROOT,
   reader?: TreeReader,
 ): Finding[] {
+  // `validateManifestShape` is what stands between this function and a crash
+  // on a top-level `null`/array/primitive — everything below assumes `manifest`
+  // is at least a plain object, which is exactly (and only) what that check
+  // guarantees. Any shape finding at all stops here: with `upstream`, `paths`
+  // or `files` not even the right TYPE, neither the seal check nor a per-entry
+  // walk means anything.
+  const shapeFindings = validateManifestShape(manifest);
+  if (shapeFindings.length > 0) return shapeFindings;
+
   const findings: Finding[] = [];
 
-  if (typeof manifest.upstream !== 'string' || !COMMIT_RE.test(manifest.upstream)) {
+  if (!COMMIT_RE.test(manifest.upstream)) {
     findings.push({
       kind: 'malformed',
       path: MANIFEST_REL,
       detail: `"upstream" is not a 40-character commit sha: ${JSON.stringify(manifest.upstream)}`,
       hint: 're-pin deliberately: pnpm run ratchet:report -- --upstream <rev>',
     });
-  }
-  if (manifest.files === null || typeof manifest.files !== 'object') {
-    findings.push({
-      kind: 'malformed',
-      path: MANIFEST_REL,
-      detail: '"files" is missing or is not an object',
-      hint: `regenerate: ${REGENERATE_HINT}`,
-    });
-    return findings;
   }
 
   // The coverage seal. This is the only check that can tell a complete manifest

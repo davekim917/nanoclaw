@@ -216,7 +216,12 @@ each reported in its own section:
 
 - the same GROWTH/NEW/SHRINK/STALE classification the default report runs, against the manifest
   **committed at `<ref>`** (not the local `src/upstream-ratchet.json`) — the same arbitration, just pointed
-  at a ref instead of a checkout;
+  at a ref instead of a checkout. That manifest is itself read through the SAME filtered path every other
+  regular file in `<ref>` goes through (`cat-file --filters`, `--attr-source=<ref>`), not a raw `git show`:
+  if `<ref>` ever assigned a clean/smudge or LFS filter to `src/upstream-ratchet.json` itself, a raw read
+  would see the CLEAN (stored) form while a real checkout — and the working-tree report run against it —
+  would see the SMUDGED one. Filter DRIVERS still come from the RUNNING repository's config either way, per
+  "Checkout filters" below;
 - a **STALE-MANIFEST** currency check — the same per-entry logic the hermetic host-suite test
   (`src/upstream-ratchet.test.ts`) runs against a local working tree, run here against `<ref>`'s own tree
   instead. It catches a manifest whose `sha256`/`mode`/`deleted` bookkeeping disagrees with `<ref>`'s real

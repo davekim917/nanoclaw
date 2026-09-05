@@ -43,6 +43,7 @@ import {
   checkTree,
   hashFile,
   sealManifest,
+  validateManifestShape,
   type Finding,
   type GitMode,
   type UpstreamRatchetEntry,
@@ -410,6 +411,56 @@ describe('--check exit decision (decideCheckOutcome)', () => {
 
       const outcome = decideCheckOutcome([], findings);
       expect(outcome.failing).toBe(true);
+    });
+  });
+
+  describe('validateManifestShape — the ONE place that closes the "throws instead of reporting" class', () => {
+    // Every shape here would otherwise throw on the very next dereference
+    // (`committed.upstream` in `resolveCommit`, called by BOTH `runCheck` and
+    // `main()`) rather than report a finding. Each case is driven through
+    // `decideCheckOutcome` with an EMPTY rows array — what both call sites now
+    // pass when `validateManifestShape` (or `checkTree`, which calls it first)
+    // finds anything wrong — to prove the exit-1 decision, not just that a
+    // finding exists.
+    const rejects = (value: unknown, expectDetail: RegExp): void => {
+      const findings = validateManifestShape(value);
+      expect(findings.length).toBeGreaterThan(0);
+      expect(findings.every((f) => f.kind === 'malformed')).toBe(true);
+      expect(findings.some((f) => expectDetail.test(f.detail))).toBe(true);
+      expect(decideCheckOutcome([], findings).failing).toBe(true);
+    };
+
+    it('rejects a top-level null without throwing', () => {
+      expect(() => validateManifestShape(null)).not.toThrow();
+      rejects(null, /not an object/);
+    });
+
+    it('rejects a top-level array without throwing', () => {
+      expect(() => validateManifestShape([])).not.toThrow();
+      rejects([], /not an object/);
+    });
+
+    it('rejects a missing/non-string "upstream" without throwing', () => {
+      rejects({ paths: '', files: {} }, /"upstream" is not a string/);
+      rejects({ upstream: 12345, paths: '', files: {} }, /"upstream" is not a string/);
+    });
+
+    it('rejects a non-object "files" (including null) without throwing', () => {
+      rejects({ upstream: 'a'.repeat(40), paths: '', files: null }, /"files" is missing or is not an object/);
+      rejects({ upstream: 'a'.repeat(40), paths: '', files: [] }, /"files" is missing or is not an object/);
+    });
+
+    it('accepts a well-shaped manifest (empty findings) — a real one, and the first-run empty fallback', () => {
+      expect(validateManifestShape(manifestOf({}))).toEqual([]);
+      expect(validateManifestShape({ upstream: '', paths: '', files: {} })).toEqual([]);
+    });
+
+    it('checkTree calls validateManifestShape FIRST, so it never reaches its own field checks on an unusable value', () => {
+      // Same shape as the top-level-null case above, but through checkTree —
+      // proves the wiring, not just the standalone function.
+      expect(() => checkTree(null as unknown as UpstreamRatchetManifest, uniqueTmpRoot('validate-shape-checktree'))).not.toThrow();
+      const findings = checkTree(null as unknown as UpstreamRatchetManifest, uniqueTmpRoot('validate-shape-checktree-2'));
+      expect(findings).toEqual(validateManifestShape(null));
     });
   });
 });
