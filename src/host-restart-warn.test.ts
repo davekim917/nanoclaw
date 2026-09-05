@@ -587,9 +587,9 @@ describe('the heartbeat is paired with provider_executing', () => {
  *
  * Both wrappers now take the set they apply to rather than deriving it — the
  * shutdown side the sessions actually being stopped, the startup side the ones
- * this host adopted and must therefore NOT warn. These cases drive the real
- * exported wrappers so the set arithmetic is exercised, not just the per-session
- * predicate the suites above cover.
+ * whose containers will survive the boot and must therefore NOT be warned.
+ * These cases drive the real exported wrappers so the set arithmetic is
+ * exercised, not just the per-session predicate the suites above cover.
  */
 describe('the warn is scoped to the containers this restart interrupts', () => {
   /** A session with a provisioned mailbox and a fixture row the wrappers can find. */
@@ -617,19 +617,20 @@ describe('the warn is scoped to the containers this restart interrupts', () => {
     );
   }
 
-  it('an adopted session gets no startup note', async () => {
-    // Milestone 1: the container survived the restart, so nothing was
+  it('a session whose container will survive gets no startup note', async () => {
+    // Milestone 1: the container survives the restart, so nothing was
     // interrupted and there is no lost turn to account for. The central DB
     // still marks the session running — that mark is the dead host's, which is
-    // exactly why the adopted set has to come from the caller.
-    const { session, inDb, outDb } = fixtureSession('sess-adopted');
-    storeContinuation(outDb, 'cont-adopted');
+    // exactly why the skip set has to come from the caller's boot-scope
+    // partition rather than from anything this module can read.
+    const { session, inDb, outDb } = fixtureSession('sess-survivor');
+    storeContinuation(outDb, 'cont-survivor');
     runningSessionFixtures.push(session);
 
     await warnMarkedRunningSessionsOfStartup('host startup after an unclean stop', new Set([session.id]));
 
     expect(noteRows(inDb)).toHaveLength(0);
-    expect(noSignalLogCalls(), 'an adopted session is skipped, not evaluated and rejected').toHaveLength(0);
+    expect(noSignalLogCalls(), 'a survivor is skipped, not evaluated and rejected').toHaveLength(0);
   });
 
   it('a session marked running whose container did not survive still gets one', async () => {

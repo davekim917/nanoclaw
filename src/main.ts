@@ -313,24 +313,27 @@ export async function main(): Promise<void> {
   // Canonical memory reconciliation can create links only after install-scoped
   // container absence has been proved. A failed runtime listing is not
   // equivalent to "none running": cleanupOrphansStrict throws and startup
-  // stops before any filesystem cutover.
-  const memoryReports = runWorkgroupMemoryStartupGate(db);
-
-  // E integration: adopted ids from adoptRunningSessions() (seam4/e-adoption).
-  // Adoption sits exactly here — after the boot quiescence door, before the
-  // orphaned-fence recovery — so the warn runs once the set of containers that
-  // actually survived is knowable. Until E lands nothing is adopted, so the
-  // set is empty and every session the previous host left marked running is
-  // treated as interrupted, exactly as before. The warn must stay after the
-  // gate: `running`/`idle` in the central DB is a mark left by the dead host,
-  // not proof a container is gone, so warning earlier warns sessions whose
-  // containers may still be alive. The on_wake note makes the next spawn
-  // account publicly instead of the session going dark until a human pings.
+  // stops before any filesystem cutover. FIRST warn sessions still marked
+  // 'running' (unclean previous host) whose containers this boot will stop —
+  // the on_wake note makes the next spawn account publicly instead of the
+  // session going dark until a human pings.
+  //
+  // BEFORE the stop pass, deliberately. That pass is sequential and can run
+  // longer than the heartbeat freshness window end to end, so warning after it
+  // would find the earliest-stopped sessions' heartbeat evidence already aged
+  // out and leave exactly the interrupted sessions unwarned. The skip set is
+  // therefore a prediction of which containers survive, not an observation.
+  //
+  // D1/E integration: survivable session ids from the boot-scope partition
+  // (seam4/d1, #440). Until that lands the boot stops every container, so the
+  // set is empty and every session marked running is treated as interrupted,
+  // exactly as before.
   try {
     await warnMarkedRunningSessionsOfStartup('host startup after an unclean stop', new Set<string>());
   } catch (err) {
     log.error('host-restart startup warn failed', { err });
   }
+  const memoryReports = runWorkgroupMemoryStartupGate(db);
 
   // Prune old agent-runner-source snapshots now that cleanupOrphansStrict()
   // (inside runWorkgroupMemoryStartupGate, above) has stopped every
@@ -670,9 +673,9 @@ async function shutdown(signal: string): Promise<void> {
     // on_wake note (due immediately) makes the post-restart spawn account
     // for the interruption publicly instead of the session going dark.
     try {
-      // E integration: adopted ids from adoptRunningSessions() (seam4/e-adoption).
-      // The stopping set is every tracked container today, because that is
-      // exactly what stopAllContainers() below stops. E narrows both.
+      // E integration: the narrowed stopping set from beginContainerShutdown()
+      // (seam4/e-adoption). Today it is every tracked container, because that
+      // is exactly what stopAllContainers() below stops.
       await warnActiveContainersOfShutdown('graceful host shutdown', new Set(getActiveContainerSessionIds()));
     } catch (err) {
       log.error('host-restart shutdown warn failed', { err });

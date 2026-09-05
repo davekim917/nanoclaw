@@ -4,13 +4,14 @@
  * and self-accounted instead of silent.
  *
  * A note is for a session whose container THIS restart actually interrupts —
- * one the host is stopping on the way down, or one it found dead on the way
- * up — and never for one it adopted. Both call sites are handed the set they
- * apply to, because "every container this host tracks" and "every container
- * this restart interrupts" stopped being the same set once containers began
- * surviving a restart. Without the note, an interrupted session loses its turn
- * and its background workers with no explanation, and only comes back when a
- * human pings — the exact "said it was working, then silence" failure family.
+ * one the host is stopping on the way down, or one whose container this boot
+ * will stop on the way up — and never for one that survives. Both call sites
+ * are handed the set they apply to, because "every container this host tracks"
+ * and "every container this restart interrupts" stopped being the same set
+ * once containers began surviving a restart. Without the note, an interrupted
+ * session loses its turn and its background workers with no explanation, and
+ * only comes back when a human pings — the exact "said it was working, then
+ * silence" failure family.
  *
  * The note and an inert recall marker are written atomically with on_wake=1.
  * The sweep replaces the marker with fresh recall, flips the note to
@@ -34,8 +35,8 @@
  * dead container last wrote), so a session interrupted mid-turn with more than
  * RESTART_WARN_HEARTBEAT_FRESH_MS of provider silence — a long quiet Codex tool
  * call, say — still gets no note on that path. A session whose container
- * survived the restart and was adopted also gets no note, which is correct:
- * nothing interrupted it, and there is no lost turn to account for.
+ * survives the restart also gets no note, which is correct: nothing
+ * interrupted it, and there is no lost turn to account for.
  */
 import { createHash } from 'crypto';
 import fs from 'node:fs';
@@ -350,21 +351,29 @@ export async function warnActiveContainersOfShutdown(
 
 /**
  * Startup backstop (crash and first-rollout paths): inspect only sessions the
- * central DB still marks running/idle, minus the ones whose containers this
- * host adopted. Within that genuinely-interrupted set, durable continuation is
- * authoritative while tool and processing signals are freshness-bound.
+ * central DB still marks running/idle, minus the ones whose containers will
+ * survive this boot. Within that genuinely-interrupted set, durable
+ * continuation is authoritative while tool and processing signals are
+ * freshness-bound.
  *
- * `adoptedSessionIds` is REQUIRED and computed by the caller, for the same
- * reason the shutdown side takes a set: `running`/`idle` in the central DB is
- * a mark left by the previous host, not proof that the container is gone. An
- * adopted session was not interrupted and must get no note.
+ * `skipSessionIds` is REQUIRED and computed by the caller: the sessions whose
+ * container this boot will NOT stop. `running`/`idle` in the central DB is a
+ * mark left by the previous host, not proof that a container is gone, so the
+ * partition has to come from the boot scope rather than from this module. A
+ * session that keeps its container was not interrupted and must get no note.
+ *
+ * This runs BEFORE the boot stop pass, not after it. The stop pass is
+ * sequential and can exceed RESTART_WARN_HEARTBEAT_FRESH_MS end to end, which
+ * would age heartbeat-only evidence out of the window and leave the sessions
+ * stopped first with no note at all. Predicting the partition and warning
+ * early is what keeps that evidence readable.
  */
 export async function warnMarkedRunningSessionsOfStartup(
   reason: string,
-  adoptedSessionIds: ReadonlySet<string>,
+  skipSessionIds: ReadonlySet<string>,
 ): Promise<void> {
   for (const session of await getRunningSessions()) {
-    if (adoptedSessionIds.has(session.id)) continue;
+    if (skipSessionIds.has(session.id)) continue;
     await warnSessions(session, reason);
   }
 }
