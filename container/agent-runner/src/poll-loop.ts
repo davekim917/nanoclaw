@@ -650,7 +650,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // runs on Sonnet at xhigh effort, independent of any interactive sticky
     // model — the task's OWN -m/-e (its stored flagIntent) is the only thing
     // that overrides it. Interactive chat keeps its Opus default. Codex and
-    // opencode manage their own task defaults (gpt-6-astra/high, model-native).
+    // opencode manage their own task defaults (gpt-5.6-sol/high, model-native).
     if (config.providerName === 'claude') {
       const task = taskWakeIntent(keep);
       if (task.isPureTaskWake) {
