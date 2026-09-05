@@ -1003,10 +1003,18 @@ describe('nothing is awaited between the guard and spawn', () => {
       return false;
     };
 
-    // Not vacuous: the scanner does see awaits in this span. The only one is
-    // the claim release, and it is reachable only when the spawn is refused.
-    expect(inSpan.map(text).length).toBeGreaterThan(0);
-    expect(inSpan.filter((node) => !inCatch(node)).map(text)).toEqual([]);
-    expect(inSpan.map((node) => text(node.expression).split('(')[0])).toEqual(['releaseClaimQuietly']);
+    // Seam 3 PR 6: the guard and `spawn()` sit inside ONE `withCentralSync`
+    // block, so the span between them holds NO await at all — the claim
+    // release moved to the catch clause AROUND that block, after `spawn()` in
+    // source order and reachable only when the spawn is refused.
+    expect(inSpan.map(text)).toEqual([]);
+    // Not vacuous: the scanner does see the release await in this function,
+    // and it lives in a catch clause after the spawn call.
+    const releases = awaits.filter((node) => text(node.expression).split('(')[0] === 'releaseClaimQuietly');
+    expect(releases.length).toBeGreaterThan(0);
+    for (const release of releases) {
+      expect(inCatch(release), 'the claim release is not in a catch clause').toBe(true);
+      expect(release.getStart(source)).toBeGreaterThan(spawnCall!.getEnd());
+    }
   });
 });

@@ -9,7 +9,7 @@
 import { randomUUID } from 'crypto';
 
 import { centralTransaction } from '../db/central-lease.js';
-import { getDb, getRawDb } from '../db/connection.js';
+import { getDb } from '../db/connection.js';
 import { insertOrAdopt } from '../db/insert-or-adopt.js';
 import { renderVerbHelp } from './help-render.js';
 import { register } from './registry.js';
@@ -259,7 +259,10 @@ function genericCreate(def: ResourceDef) {
     // commit below and never after a rollback.
     const insert = (): Promise<void> =>
       centralTransaction(async () => {
-        await getDb().run(`INSERT INTO ${def.table} (${colNames.join(', ')}) VALUES (${placeholders.join(', ')})`, values);
+        await getDb().run(
+          `INSERT INTO ${def.table} (${colNames.join(', ')}) VALUES (${placeholders.join(', ')})`,
+          values,
+        );
         if (def.postCreate) await def.postCreate(values);
       }, `ncl ${def.plural} create`);
 

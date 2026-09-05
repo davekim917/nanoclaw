@@ -199,7 +199,7 @@ registerResource({
       ],
       handler: async (args) => {
         const id = args.id as string;
-        const mg = getMessagingGroup(id);
+        const mg = await getMessagingGroup(id);
         if (!mg) throw new Error(`messaging group not found: ${id}`);
         if (mg.channel_type === 'cli') {
           throw new Error('CLI messaging groups cannot receive host notifications');

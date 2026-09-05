@@ -92,19 +92,20 @@ const NOT_CALLERS: readonly string[] = [DEFINER, SELF];
  * authorization predicates, and §4.2 is satisfied either way: there is exactly
  * one form of each function, never two.
  *
- * PR 5c removed TWO entries (197 → 195): `src/cli/request-ledger.ts`
- * (`pruneCliRequestExecutions` converted onto `getDb()`, its only caller
- * `sweep-central/index.ts` awaits it) and `src/modules/sweep-scheduling/index.ts`
- * (its one raw call, `hasUnresolvedMoveIntent(getRawDb(), ...)`, converted to
- * `await hasUnresolvedMoveIntent(...)` with the helper itself dropping its
- * `Database.Database` param — defined in `src/dashboard/api/scheduled-shared.ts`,
- * which never called `getRawDb()` itself and so was never on this list). The
- * two test files that still exercise these areas (`request-ledger.test.ts`,
- * `sweep-scheduling/scheduling.test.ts`) keep their entries: both still call
- * `getRawDb()` directly for their own fixture scaffolding and assertions,
- * independent of the functions this PR converted. `writeAudit` / `purgeIntentBody`
- * / the PR 6-owned callers in the same file are untouched — PR 5c does not add
- * or remove anything for them.
+ * PR 6 removed SIX more (186 → 180): the eleven central transaction closures
+ * moved onto `centralTransaction`, taking their §4.2 leaf exports with them
+ * (`cli/crud.ts`, `cli/resources/groups.ts`, `orchestrator-dispatch/dispatch.ts`,
+ * `agent-destinations.ts`, `agent-message-policies.ts`), and the guard
+ * implementations now reach the central DB through `withRawDb` inside the
+ * caller's `withCentralSync` block (`agent-to-agent/guard.ts`; `guard/guard.ts`
+ * and `cli/guard.ts` had already left). The sync central blocks that remain
+ * by design — the three guard implementations, `agent-route.ts`'s
+ * `targetWiredToMessagingGroup`, `write-destinations.ts`, `db/sessions.ts`'s
+ * `withQuietInvalidationSync` and `container-runner.ts`'s `readSessionSync` —
+ * name `withRawDb`, not this handle, so they are not on this list at all. What
+ * is left here is direct raw SQL in files outside PR 6's scope (dashboard
+ * helpers, storage-manager, the boot reconcilers in `main.ts`, scripts/setup)
+ * plus the test fixtures; it keeps shrinking under the same rule.
  */
 export const RAW_DB_IMPORTERS: readonly string[] = [
   'scripts/bust-slack-profile-cache.ts',
@@ -136,13 +137,12 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/claude-md-compose.ts',
   'src/cli/crud-validate.test.ts',
   'src/cli/crud.test.ts',
-  'src/cli/crud.ts',
   'src/cli/delivery-action.test.ts',
   'src/cli/request-ledger.test.ts',
+  'src/cli/request-ledger.ts',
   'src/cli/resources/destinations.test.ts',
   'src/cli/resources/groups-create-adopt.test.ts',
   'src/cli/resources/groups.test.ts',
-  'src/cli/resources/groups.ts',
   'src/cli/resources/messaging-groups.test.ts',
   'src/cli/resources/programmatic-wiring.test.ts',
   'src/cli/resources/tasks.test.ts',
@@ -211,9 +211,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/agent-to-agent/agent-route-parity.test.ts',
   'src/modules/agent-to-agent/agent-route.test.ts',
   'src/modules/agent-to-agent/create-agent.test.ts',
-  'src/modules/agent-to-agent/db/agent-destinations.ts',
-  'src/modules/agent-to-agent/db/agent-message-policies.ts',
-  'src/modules/agent-to-agent/guard.ts',
   'src/modules/agent-to-agent/message-gate.test.ts',
   'src/modules/agent-to-agent/write-destinations.test.ts',
   'src/modules/approvals/approval-resolved.test.ts',
@@ -234,7 +231,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/orchestrator-dispatch/db/tasks.test.ts',
   'src/modules/orchestrator-dispatch/db/tasks.ts',
   'src/modules/orchestrator-dispatch/dispatch.test.ts',
-  'src/modules/orchestrator-dispatch/dispatch.ts',
   'src/modules/orchestrator-dispatch/integration.test.ts',
   'src/modules/orchestrator-dispatch/needs-input.test.ts',
   'src/modules/orchestrator-dispatch/progress.test.ts',
@@ -268,6 +264,7 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/sweep-orchestrator/orchestrator.test.ts',
   'src/modules/sweep-scheduled-move/index.ts',
   'src/modules/sweep-scheduled-move/scheduled-move.test.ts',
+  'src/modules/sweep-scheduling/index.ts',
   'src/modules/sweep-scheduling/scheduling.test.ts',
   'src/modules/sweep-usage/usage.test.ts',
   'src/provider-fallback.test.ts',

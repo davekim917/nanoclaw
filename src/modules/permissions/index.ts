@@ -55,6 +55,7 @@ import {
 } from './channel-approval.js';
 import { addMember } from './db/agent-group-members.js';
 import {
+  createPendingChannelApproval,
   deletePendingChannelApproval,
   getPendingChannelApproval,
   updatePendingChannelApprovalCard,
@@ -563,7 +564,54 @@ async function wireApprovedChannel(
     return false;
   }
 
+  // Everything from here to the member write runs with the card already
+  // claimed (deleted) and the retained inbound still deferred. A failure in
+  // this stretch used to lose the retry path: no card, no wiring, a receipt
+  // nothing would ever complete (fork issue #452, site 2). The claim stays a
+  // DELETE — it is the arbiter between duplicate callbacks — so the recovery
+  // is to put the full row BACK on failure: the next click (or the retained
+  // inbound's own retry) finds the card exactly as it was.
   const mgaId = `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    await wireAndAdmit(row, agentGroupId, approverId, engage, mgaId, event);
+  } catch (err) {
+    const restored = await createPendingChannelApproval(row).catch((restoreErr: unknown) => {
+      log.error('Channel registration: wiring failed AND the pending card could not be restored', {
+        messagingGroupId: row.messaging_group_id,
+        err,
+        restoreErr,
+      });
+      return false;
+    });
+    log.error('Channel registration: wiring failed after the card was claimed — card restored for retry', {
+      messagingGroupId: row.messaging_group_id,
+      agentGroupId,
+      restored,
+      err,
+    });
+    throw err;
+  }
+
+  try {
+    await replayDeferredInbound(event);
+  } catch (err) {
+    log.error('Failed to replay message after channel approval', {
+      messagingGroupId: row.messaging_group_id,
+      err,
+    });
+  }
+  return true;
+}
+
+/** The central writes of an approved channel registration: wiring row + sender membership. */
+async function wireAndAdmit(
+  row: PendingChannelApproval,
+  agentGroupId: string,
+  approverId: string,
+  engage: { engage_mode: MessagingGroupAgent['engage_mode']; engage_pattern: string | null },
+  mgaId: string,
+  event: InboundEvent,
+): Promise<void> {
   const wiring: MessagingGroupAgent = {
     id: mgaId,
     messaging_group_id: row.messaging_group_id,
@@ -611,16 +659,6 @@ async function wireApprovedChannel(
       added_at: new Date().toISOString(),
     });
   }
-
-  try {
-    await replayDeferredInbound(event);
-  } catch (err) {
-    log.error('Failed to replay message after channel approval', {
-      messagingGroupId: row.messaging_group_id,
-      err,
-    });
-  }
-  return true;
 }
 
 /**

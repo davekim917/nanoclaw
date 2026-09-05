@@ -261,7 +261,7 @@ export async function assignAttentionItem(
 
   // `getMessagingGroup` stays synchronous forever (seam 3 §4.2 — it is called
   // from inside raw transaction closures elsewhere); no await here.
-  const room = getMessagingGroup(target!.messaging_group_id);
+  const room = await getMessagingGroup(target!.messaging_group_id);
   const seriesId = (res.data as { series_id?: string } | null | undefined)?.series_id ?? null;
   log.info('observatory assign', {
     userId: ctx.user.id,

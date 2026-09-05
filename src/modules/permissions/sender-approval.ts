@@ -37,6 +37,7 @@ import { normalizeOptions, type RawOption } from '../../channels/ask-question.js
 import { getAllAgentGroups } from '../../db/agent-groups.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getDeliveryAdapter } from '../../delivery.js';
+import { centralTransaction } from '../../db/central-lease.js';
 import { completeDeferredInbound } from '../../router.js';
 import { log } from '../../log.js';
 import type { InboundEvent } from '../../channels/adapter.js';
@@ -339,23 +340,28 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
     // claim below overwrites it, and close it only for a real card row and
     // only if we go on to win — a stamp being refreshed has no receipt of its
     // own, and its body is the sentinel, not an event.
-    const existing = await getInFlightSenderApproval(messagingGroupId, senderKey);
-
+    //
     // The dedupe decision and the stamp are ONE statement (issue #443, Codex
-    // round 1). Reading the stamp first and writing it after is the async
-    // read-then-write race: the read yields, two overlapping declines both
-    // conclude the 24h window has expired, and the sender gets refused twice
-    // while the owner gets two FYIs. `claimDeclineStamp` folds the freshness
-    // test into the upsert's conflict clause, so exactly one caller comes back
-    // true and only that caller sends.
-    const claimed = await claimDeclineStamp(
-      {
-        messaging_group_id: messagingGroupId,
-        agent_group_id: stampAgentGroupId,
-        sender_identity: senderKey,
-      },
-      new Date(Date.now() - DECLINE_NOTIFY_DEDUPE_MS).toISOString(),
-    );
+    // round 1): `claimDeclineStamp` folds the freshness test into the upsert's
+    // conflict clause, so exactly one caller comes back true and only that
+    // caller sends. The pre-claim READ and that claim are one central
+    // transaction (fork issue #452, site 3): read outside it, the read can
+    // find no row, yield, and the claim then overwrites a card inserted in
+    // the gap — whose deferred receipt is never completed. Under BEGIN
+    // IMMEDIATE the card is either already there (read, then closed below) or
+    // lands after this commit, on top of a stamp. DB-only closure (§4.4).
+    const { existing, claimed } = await centralTransaction(async () => {
+      const before = await getInFlightSenderApproval(messagingGroupId, senderKey);
+      const won = await claimDeclineStamp(
+        {
+          messaging_group_id: messagingGroupId,
+          agent_group_id: stampAgentGroupId,
+          sender_identity: senderKey,
+        },
+        new Date(Date.now() - DECLINE_NOTIFY_DEDUPE_MS).toISOString(),
+      );
+      return { existing: before, claimed: won };
+    }, 'decline_notify stamp claim');
     if (!claimed) {
       log.debug('decline_notify deduped — declined within the last 24h', { messagingGroupId, senderIdentity });
       return;

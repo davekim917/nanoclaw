@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 
 import { getChannelAdapter } from '../../channels/channel-registry.js';
 import { centralTransaction } from '../../db/central-lease.js';
-import { getDb, getRawDb } from '../../db/connection.js';
+import { getDb } from '../../db/connection.js';
 // Lazy import to avoid module-init cycle (events.ts imports nothing from dispatch.ts).
 // The import() call is memoized by Node's module cache after the first resolution.
 //
@@ -74,19 +74,10 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
     return;
   }
 
-  // Auth: caller's agent_group must have orchestrator capability
-  if (!(await hasOrchestratorCapability(callerSession.agent_group_id))) {
-    await _notifyCaller(callerSession, 'spawn rejected: not an orchestrator');
-    return;
-  }
-
   // Self-orchestration: spawned children always run in the SAME agent group as
   // the parent. They share workspace, memory, CLAUDE.md, channels — only the
   // session/thread is isolated. There is no cross-group dispatch primitive.
   const childAgentGroupId = callerSession.agent_group_id;
-
-  const capConfig =
-    (await getCapabilityConfig(callerSession.agent_group_id, 'orchestrator')) ?? DEFAULT_CAPABILITY_CONFIG;
 
   // Surface mode — per-channel capability check (cycle-3 S24). Resolved BEFORE
   // the admission transaction: it reads the messaging group (whose channel
@@ -113,8 +104,23 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
   // and dashboard event below runs after commit, never after a rollback.
   let taskRow: Task | null = null;
   let replayResult: { message: string } | null = null;
+  let notOrchestrator = false;
 
   await centralTransaction(async () => {
+    // Step 0: Auth — the caller's agent_group must hold the orchestrator
+    // capability, read INSIDE the transaction (fork issue #452, site 1). Read
+    // before the closure, the awaited check yields, and a `revokeCapability`
+    // landing in that window admits one task after the revoke. Under BEGIN
+    // IMMEDIATE the revoke either commits before this read (rejected here) or
+    // waits for this commit (the task is admitted while the capability still
+    // held). The same holds for the cap config the count below is judged by.
+    if (!(await hasOrchestratorCapability(callerSession.agent_group_id))) {
+      notOrchestrator = true;
+      return;
+    }
+    const capConfig =
+      (await getCapabilityConfig(callerSession.agent_group_id, 'orchestrator')) ?? DEFAULT_CAPABILITY_CONFIG;
+
     // Step 1: Idempotency replay PRECEDES cap (cycle-3 M20)
     const existingByIdempotency = await getTaskByParentAndIdempotency(callerSession.id, idempotencyKey);
     if (existingByIdempotency) {
@@ -186,7 +192,12 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
     }
   }, 'applySpawnTask');
 
-  // Post-transaction handling
+  // Post-transaction handling — every notification/wake is an external effect
+  // and runs after commit, never inside the closure.
+  if (notOrchestrator) {
+    await _notifyCaller(callerSession, 'spawn rejected: not an orchestrator');
+    return;
+  }
   // TypeScript doesn't track mutation through the transaction callback,
   // so we assert the type here.
   const postTxnReplay = replayResult as { message: string } | null;
