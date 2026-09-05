@@ -42,8 +42,16 @@ const SELF = 'src/db/raw-db-ratchet.test.ts';
 const NOT_CALLERS: readonly string[] = [DEFINER, SELF];
 
 /**
- * Every file referencing `getRawDb` or `hasTableRaw` as of seam 3 PR 1.
- * A PR may delete entries. Adding one fails this test.
+ * Every file referencing `getRawDb` or `hasTableRaw` as of seam 3 PR 1, plus
+ * the ONE sanctioned addition: `src/db/central-lease.ts` (PR 6a).
+ *
+ * That file is the module that will REPLACE every other importer. Its
+ * `withRawDb()` is the only way an allowlisted synchronous block reaches the
+ * raw handle from PR 6 on — it takes the fork lease first and refuses outside a
+ * `withCentralSync` block — so the raw seam moving into it is the shrink this
+ * list exists to track, arriving one commit ahead of the removals.
+ *
+ * Otherwise: a PR may delete entries. Adding one fails this test.
  */
 export const RAW_DB_IMPORTERS: readonly string[] = [
   'scripts/bust-slack-profile-cache.ts',
@@ -146,6 +154,7 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/db/agent-groups.ts',
   'src/db/backlog.ts',
   'src/db/boot-order.test.ts',
+  'src/db/central-lease.ts',
   'src/db/channel-ingress-receipts.test.ts',
   'src/db/channel-ingress-receipts.ts',
   'src/db/container-configs.test.ts',
