@@ -56,7 +56,7 @@ function loginLinkText(url: string, ttlHours: number): string {
 }
 
 export async function dashboardTokenIssue(ctx: InterceptContext): Promise<void> {
-  const mg = getMessagingGroup(ctx.replyMessagingGroupId);
+  const mg = await getMessagingGroup(ctx.replyMessagingGroupId);
   if (!mg) {
     log.error('dashboardTokenIssue: messaging group not found', { replyMessagingGroupId: ctx.replyMessagingGroupId });
     return;

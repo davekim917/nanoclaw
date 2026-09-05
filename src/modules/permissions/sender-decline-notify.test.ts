@@ -120,7 +120,7 @@ beforeEach(async () => {
     unknown_sender_policy: 'decline_notify',
     created_at: now(),
   });
-  createMessagingGroupAgent({
+  await createMessagingGroupAgent({
     id: 'mga-1',
     messaging_group_id: 'mg-dm-stranger',
     agent_group_id: 'ag-1',
@@ -499,7 +499,7 @@ describe('unknown-sender decline_notify flow', () => {
       unknown_sender_policy: 'decline_notify',
       created_at: now(),
     });
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       id: 'mga-team',
       messaging_group_id: 'mg-team',
       agent_group_id: 'ag-1',
@@ -616,7 +616,7 @@ describe('unknown-sender decline_notify flow', () => {
       unknown_sender_policy: 'decline_notify',
       created_at: now(),
     });
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       id: 'mga-named',
       messaging_group_id: 'mg-dm-named',
       agent_group_id: 'ag-1',

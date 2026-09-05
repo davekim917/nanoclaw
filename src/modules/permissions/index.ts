@@ -38,6 +38,7 @@ import {
 import type { InboundEvent } from '../../channels/adapter.js';
 import { registerResponseHandler, type ResponsePayload } from '../../response-registry.js';
 import { getDeliveryAdapter } from '../../delivery.js';
+import { withCentralSync } from '../../db/central-lease.js';
 import { guard } from '../../guard/index.js';
 import { log } from '../../log.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent } from '../../types.js';
@@ -164,15 +165,21 @@ async function handleUnknownSender(
   // — unknown_sender_policy verbatim: strict → deny, request_approval → hold,
   // decline_notify → deny, public → allow (short-circuited before the gate).
   // Drop-recording, the hold creation and the decline side effects stay here.
-  const decision = guard(sendersAdmit, {
-    actor: userId ? { kind: 'human', userId } : { kind: 'system' },
-    payload: {
-      messagingGroupId: mg.id,
-      agentGroupId,
-      senderIdentity: userId,
-      policy: mg.unknown_sender_policy,
-    },
-  });
+  // Under the central lease: `guard()`'s reads are raw by design (seam 3
+  // §4.5 I-1).
+  const decision = await withCentralSync(
+    () =>
+      guard(sendersAdmit, {
+        actor: userId ? { kind: 'human', userId } : { kind: 'system' },
+        payload: {
+          messagingGroupId: mg.id,
+          agentGroupId,
+          senderIdentity: userId,
+          policy: mg.unknown_sender_policy,
+        },
+      }),
+    'senders.admit guard',
+  );
 
   if (decision.effect === 'allow') return false; // public is handled before this gate.
 
@@ -377,7 +384,7 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
   // promises there is no approval path, so an admin approving an outstanding
   // card there is a legitimate explicit grant, and that behavior predates
   // this policy.
-  const currentMg = getMessagingGroup(row.messaging_group_id);
+  const currentMg = await getMessagingGroup(row.messaging_group_id);
   const voidedByPolicyFlip = currentMg?.unknown_sender_policy === 'decline_notify';
 
   // ── Claim the card before acting on it (issue #443, Codex round 1) ──
@@ -533,7 +540,7 @@ async function wireApprovedChannel(
     return false;
   }
 
-  const mg = getMessagingGroup(row.messaging_group_id);
+  const mg = await getMessagingGroup(row.messaging_group_id);
   const isGroup = event.message.isGroup ?? mg?.is_group === 1;
   const agentGroupName = (await getAgentGroup(agentGroupId))?.name ?? '';
 
@@ -583,7 +590,7 @@ async function wireApprovedChannel(
   await insertOrAdopt(
     wiring,
     async (candidate) => {
-      createMessagingGroupAgent(candidate);
+      await createMessagingGroupAgent(candidate);
     },
     async () => (await getMessagingGroupAgents(row.messaging_group_id)).find((w) => w.agent_group_id === agentGroupId),
   );
@@ -647,10 +654,14 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
       ? payload.userId
       : `${payload.channelType}:${payload.userId}`
     : null;
-  const decision = guard(channelsRegister, {
-    actor: { kind: 'human', userId: clickerId ?? '' },
-    payload: { questionId: payload.questionId },
-  });
+  const decision = await withCentralSync(
+    () =>
+      guard(channelsRegister, {
+        actor: { kind: 'human', userId: clickerId ?? '' },
+        payload: { questionId: payload.questionId },
+      }),
+    'channels.register guard',
+  );
   if (!clickerId || decision.effect !== 'allow') {
     log.warn('Channel registration click rejected — unauthorized clicker', {
       messagingGroupId: row.messaging_group_id,

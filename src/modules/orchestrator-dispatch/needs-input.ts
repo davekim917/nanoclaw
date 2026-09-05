@@ -62,7 +62,7 @@ export async function applySpawnNeedsInput(content: Record<string, unknown>, cal
     return;
   }
 
-  const mg = getMessagingGroup(task.child_messaging_group_id);
+  const mg = await getMessagingGroup(task.child_messaging_group_id);
   if (!mg) return;
 
   const adapter = getChannelAdapter(mg.channel_type);

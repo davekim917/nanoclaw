@@ -138,7 +138,7 @@ describe('genericCreate postCreate hook', () => {
     // address this chat as a delivery target. Without postCreate, this was
     // empty and the agent's replies were silently dropped by the delivery
     // ACL — issue #2389.
-    const destinations = getDestinations('ag-1');
+    const destinations = await getDestinations('ag-1');
     expect(destinations).toHaveLength(1);
     expect(destinations[0].target_type).toBe('channel');
     expect(destinations[0].target_id).toBe('mg-1');

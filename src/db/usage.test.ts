@@ -2,7 +2,13 @@ import { describe, expect, it, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from './index.js';
-import { rollupSessionUsage, listUsageDaily, pruneOldTurnUsage, summarizeTurnUsage } from './usage.js';
+import {
+  getUsageWatermark,
+  rollupSessionUsage,
+  listUsageDaily,
+  pruneOldTurnUsage,
+  summarizeTurnUsage,
+} from './usage.js';
 import { listTurnUsageSince } from '../modules/mailbox/ops/reads.js';
 
 /**
@@ -19,6 +25,15 @@ function sessionOf(db: Database.Database): {
 
 const GID = 'ag-usage';
 const SESSION_DIR = `${GID}/sess-1`;
+
+/**
+ * The sweep's three steps in one helper (seam 3 PR 6): the central watermark,
+ * the outbound rows above it, the central transaction that folds them in.
+ */
+async function rollup(outDb: Database.Database, gid: string = GID, dir: string = SESSION_DIR): Promise<number> {
+  const rows = sessionOf(outDb).listTurnUsageSince(await getUsageWatermark(dir));
+  return rollupSessionUsage(rows, gid, dir);
+}
 
 /** Fixture outbound.db — same shape the container writes (contract in the plan). */
 function makeOutboundDb(): Database.Database {
@@ -92,7 +107,7 @@ describe('rollupSessionUsage', () => {
     insertTurn(outDb, { ts: '2026-08-10T23:00:00.000Z' });
     insertTurn(outDb, { ts: '2026-08-11T01:00:00.000Z', provider: 'codex', model: 'gpt-5' });
 
-    const rolled = rollupSessionUsage(sessionOf(outDb), GID, SESSION_DIR);
+    const rolled = await rollup(outDb);
     expect(rolled).toBe(3);
 
     const rows = await listUsageDaily({ agentGroupId: GID });
@@ -122,10 +137,10 @@ describe('rollupSessionUsage', () => {
     insertTurn(outDb, { ts: '2026-08-10T01:00:00.000Z' });
     insertTurn(outDb, { ts: '2026-08-10T02:00:00.000Z' });
 
-    expect(rollupSessionUsage(sessionOf(outDb), GID, SESSION_DIR)).toBe(2);
+    expect(await rollup(outDb)).toBe(2);
     // Second sweep, no new rows written in between: watermark already covers
     // everything, so nothing is re-added.
-    expect(rollupSessionUsage(sessionOf(outDb), GID, SESSION_DIR)).toBe(0);
+    expect(await rollup(outDb)).toBe(0);
 
     const rows = await listUsageDaily({ agentGroupId: GID });
     expect(rows).toHaveLength(1);
@@ -133,7 +148,7 @@ describe('rollupSessionUsage', () => {
 
     // A third turn lands; only the NEW row is picked up.
     insertTurn(outDb, { ts: '2026-08-10T03:00:00.000Z' });
-    expect(rollupSessionUsage(sessionOf(outDb), GID, SESSION_DIR)).toBe(1);
+    expect(await rollup(outDb)).toBe(1);
     expect((await listUsageDaily({ agentGroupId: GID }))[0].turns).toBe(3);
   });
 
@@ -148,7 +163,7 @@ describe('rollupSessionUsage', () => {
       cost_usd: null,
     });
 
-    expect(rollupSessionUsage(sessionOf(outDb), GID, SESSION_DIR)).toBe(1);
+    expect(await rollup(outDb)).toBe(1);
     const [row] = await listUsageDaily({ agentGroupId: GID });
     expect(row.model).toBe('');
     expect(row.input_tokens).toBe(0);
@@ -164,8 +179,8 @@ describe('rollupSessionUsage', () => {
 
   it('a session outbound.db with no turn_usage table is skipped without error', async () => {
     const outDb = new Database(':memory:'); // no turn_usage table at all
-    expect(() => rollupSessionUsage(sessionOf(outDb), GID, SESSION_DIR)).not.toThrow();
-    expect(rollupSessionUsage(sessionOf(outDb), GID, SESSION_DIR)).toBe(0);
+    await expect(rollup(outDb)).resolves.toBe(0);
+    await expect(rollup(outDb)).resolves.toBe(0);
     await expect(listUsageDaily({ agentGroupId: GID })).resolves.toHaveLength(0);
   });
 });
@@ -220,7 +235,7 @@ describe('rollupSessionUsage — central turn_usage mirror', () => {
       )
       .run();
 
-    expect(rollupSessionUsage(sessionOf(outDb), GID, SESSION_DIR)).toBe(1);
+    expect(await rollup(outDb)).toBe(1);
 
     // usage_daily is untouched by the mirror — same shape as the existing contract.
     const daily = await listUsageDaily({ agentGroupId: GID });
@@ -249,7 +264,7 @@ describe('rollupSessionUsage — central turn_usage mirror', () => {
     });
   });
 
-  it('two turn_usage rows sharing one turn_id (a multi-model turn) roll up into two central rows carrying that SAME turn_id', () => {
+  it('two turn_usage rows sharing one turn_id (a multi-model turn) roll up into two central rows carrying that SAME turn_id', async () => {
     // The regression this whole fix targets: usage_daily's turns column
     // counts rows, and a multi-model turn writes N of them. Once turn_id
     // survives the rollup unmolested, COUNT(DISTINCT turn_id) against the
@@ -264,7 +279,7 @@ describe('rollupSessionUsage — central turn_usage mirror', () => {
       )
       .run();
 
-    expect(rollupSessionUsage(sessionOf(outDb), GID, SESSION_DIR)).toBe(2);
+    expect(await rollup(outDb)).toBe(2);
 
     const centralRows = getRawDb().prepare('SELECT turn_id FROM turn_usage ORDER BY id ASC').all() as Array<{
       turn_id: string | null;
@@ -277,12 +292,12 @@ describe('rollupSessionUsage — central turn_usage mirror', () => {
     expect(distinct.n).toBe(1);
   });
 
-  it('an old-shape turn_usage row (missing steps/duration_ms/trigger/rate_limit_*/turn_id columns) rolls up without throwing, central row is NULL', () => {
+  it('an old-shape turn_usage row (missing steps/duration_ms/trigger/rate_limit_*/turn_id columns) rolls up without throwing, central row is NULL', async () => {
     const outDb = makeOutboundDb(); // the pre-Phase-0.1-follow-up fixture, no new columns at all
     insertTurn(outDb, { ts: '2026-08-10T01:00:00.000Z' });
 
-    expect(() => rollupSessionUsage(sessionOf(outDb), GID, SESSION_DIR)).not.toThrow();
-    expect(rollupSessionUsage(sessionOf(outDb), GID, SESSION_DIR)).toBe(0); // watermark already advanced by the call above
+    await expect(rollup(outDb)).resolves.toBe(1);
+    expect(await rollup(outDb)).toBe(0); // watermark already advanced by the call above
 
     const centralRows = getRawDb().prepare('SELECT * FROM turn_usage').all() as Array<Record<string, unknown>>;
     expect(centralRows).toHaveLength(1);
@@ -295,14 +310,14 @@ describe('rollupSessionUsage — central turn_usage mirror', () => {
     expect(centralRows[0].turn_id).toBeNull();
   });
 
-  it('derives session_id from sessionDirKey (<agent-group>/<session>)', () => {
+  it('derives session_id from sessionDirKey (<agent-group>/<session>)', async () => {
     const outDb = makeOutboundDbWithTurnMeta();
     outDb
       .prepare(
         `INSERT INTO turn_usage (ts, provider, trigger) VALUES ('2026-08-10T01:00:00.000Z', 'codex', 'scheduled')`,
       )
       .run();
-    rollupSessionUsage(sessionOf(outDb), GID, `${GID}/sess-xyz`);
+    await rollup(outDb, GID, `${GID}/sess-xyz`);
     const row = getRawDb().prepare('SELECT session_id FROM turn_usage').get() as { session_id: string };
     expect(row.session_id).toBe('sess-xyz');
   });
@@ -330,8 +345,8 @@ describe('listUsageDaily filters', () => {
     const outDb = makeOutboundDb();
     insertTurn(outDb, { ts: '2026-08-01T00:00:00.000Z' });
     insertTurn(outDb, { ts: '2026-08-09T00:00:00.000Z' });
-    rollupSessionUsage(sessionOf(outDb), GID, SESSION_DIR);
-    rollupSessionUsage(sessionOf(outDb), 'ag-other', 'ag-other/sess-1');
+    await rollup(outDb);
+    await rollup(outDb, 'ag-other', 'ag-other/sess-1');
   });
   afterEach(() => closeDb());
 

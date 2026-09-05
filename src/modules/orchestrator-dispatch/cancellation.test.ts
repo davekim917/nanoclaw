@@ -60,8 +60,8 @@ async function seedGroups(): Promise<void> {
     .run('sess-child', 'ag-child', now());
 }
 
-function makeRunningTask(): Task {
-  return insertTaskAtomic({
+async function makeRunningTask(): Promise<Task> {
+  return (await insertTaskAtomic({
     task_id: 'task-1',
     idempotency_key: 'ik-1',
     parent_session_id: 'sess-parent',
@@ -87,11 +87,11 @@ function makeRunningTask(): Task {
     dispatch_completion_attempts: 0,
     completion_lease_at: null,
     surface_mode: 'headless',
-  })!;
+  }))!;
 }
 
-function makePendingTask(): Task {
-  return insertTaskAtomic({
+async function makePendingTask(): Promise<Task> {
+  return (await insertTaskAtomic({
     task_id: 'task-pend',
     idempotency_key: 'ik-p',
     parent_session_id: 'sess-parent',
@@ -117,7 +117,7 @@ function makePendingTask(): Task {
     dispatch_completion_attempts: 0,
     completion_lease_at: null,
     surface_mode: 'headless',
-  })!;
+  }))!;
 }
 
 function makeParentSession(): Session {
@@ -172,7 +172,7 @@ describe('applySpawnCancel', () => {
   it('test_cancel_parent_session_id_required: other orchestrator cannot cancel', async () => {
     await setupDb();
     await seedGroups();
-    makeRunningTask();
+    await makeRunningTask();
 
     await applySpawnCancel({ task_id: 'task-1' }, makeOtherOrchestratorSession());
 
@@ -186,7 +186,7 @@ describe('applySpawnCancel', () => {
   it('cancel pending task transitions to cancelled, no child envelope', async () => {
     await setupDb();
     await seedGroups();
-    makePendingTask();
+    await makePendingTask();
 
     const { getSession } = await import('../../db/sessions.js');
     vi.mocked(getSession).mockImplementation(async (id: string) => {
@@ -212,7 +212,7 @@ describe('applySpawnCancel', () => {
   it('test_cancel_running_writes_envelope_and_arms_kill: running task gets cancel envelope + 2-min timer', async () => {
     await setupDb();
     await seedGroups();
-    makeRunningTask();
+    await makeRunningTask();
 
     vi.useFakeTimers();
 
@@ -250,7 +250,7 @@ describe('applySpawnCancel', () => {
   it('test_cancel_envelope_format: envelope has correct JSON structure', async () => {
     await setupDb();
     await seedGroups();
-    makeRunningTask();
+    await makeRunningTask();
 
     vi.useFakeTimers();
 
@@ -278,7 +278,7 @@ describe('applySpawnCancel', () => {
   it('ASSERT: 2-min timer calls killContainer regardless of agent acknowledgement', async () => {
     await setupDb();
     await seedGroups();
-    makeRunningTask();
+    await makeRunningTask();
 
     vi.useFakeTimers();
 

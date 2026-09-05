@@ -52,7 +52,7 @@ interface GrantArgs {
 }
 
 /** Strip `<@…>` wrapping and prepend channel_type when needed. */
-function resolveTargetUserId(rawUser: string, session: Session): string | null {
+async function resolveTargetUserId(rawUser: string, session: Session): Promise<string | null> {
   let handle = rawUser.trim();
   if (handle.startsWith('<@') && handle.endsWith('>')) {
     handle = handle.slice(2, -1);
@@ -64,7 +64,7 @@ function resolveTargetUserId(rawUser: string, session: Session): string | null {
   }
   if (!handle) return null;
   if (handle.includes(':')) return handle;
-  const mg = session.messaging_group_id ? getMessagingGroup(session.messaging_group_id) : undefined;
+  const mg = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
   const channelType = mg?.channel_type ?? null;
   if (!channelType) return null;
   return `${channelType}:${handle}`;
@@ -138,7 +138,7 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
     return;
   }
 
-  const targetUserId = resolveTargetUserId(rawUser, session);
+  const targetUserId = await resolveTargetUserId(rawUser, session);
   if (!targetUserId) {
     await notifyAgent(
       session,
@@ -221,7 +221,7 @@ export async function handleRevokeAccess(content: Record<string, unknown>, sessi
     return;
   }
 
-  const targetUserId = resolveTargetUserId(rawUser, session);
+  const targetUserId = await resolveTargetUserId(rawUser, session);
   if (!targetUserId) {
     await notifyAgent(session, `revoke_access failed: could not resolve \`${rawUser}\`.`);
     return;

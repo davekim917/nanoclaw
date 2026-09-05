@@ -27,7 +27,7 @@ import { ensureContainedInboxDir, isPathInside } from '../../inbox-safety.js';
 import { getChannelAdapter } from '../../channels/channel-registry.js';
 import { gateCommand } from '../../command-gate.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
-import { getRawDb } from '../../db/connection.js';
+import { withCentralSync, withRawDb } from '../../db/central-lease.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getSession, markSessionEngaged } from '../../db/sessions.js';
 import { sessionStillActive } from '../../container-runner.js';
@@ -269,7 +269,7 @@ async function resolveTargetSession(
   // below awaits — so a value computed by the caller is a proof from before
   // the yield, used to link a session created after it. Evaluated once, after
   // the await, immediately before the branch that resolves or creates.
-  freshFallback: () => SessionFallback,
+  freshFallback: () => Promise<SessionFallback>,
   // Returns the fallback it actually used, so callers that need the caller's
   // effective mg context after this point read the same one that governed the
   // session link rather than their own pre-await copy.
@@ -305,7 +305,7 @@ async function resolveTargetSession(
   // created. If the wiring was revoked in the window this now takes the same
   // agent-shared path the pre-check takes on failure, so the outcome matches
   // what an identical request arriving a moment later would get.
-  const fallback = freshFallback();
+  const fallback = await freshFallback();
   if (originSessionId) {
     const candidate = await getSession(originSessionId);
     if (candidate && candidate.agent_group_id === targetAgentGroupId && candidate.status === 'active') {
@@ -338,7 +338,10 @@ async function resolveTargetSession(
       const candidateWiringHolds =
         candidateMgId === null || targetAgentGroupId === sourceSession.agent_group_id
           ? true
-          : targetWiredToMessagingGroup(targetAgentGroupId, candidateMgId);
+          : await withCentralSync(
+              () => targetWiredToMessagingGroup(targetAgentGroupId, candidateMgId),
+              'agent-route candidate wiring',
+            );
       if (!candidateWiringHolds) {
         log.info('agent-route: return-path candidate abandoned — target no longer wired to its chat', {
           from: sourceSession.agent_group_id,
@@ -362,10 +365,16 @@ async function resolveTargetSession(
  * drift into different definitions of "wired".
  */
 function targetWiredToMessagingGroup(agentGroupId: string, messagingGroupId: string): boolean {
+  // Synchronous by design (seam-3 plan §4.5, I-1): this is the agent-route
+  // guard, evaluated inside `writeSessionMessage`'s `withCentralSync` block
+  // with nothing awaited between it and the insert. Every other caller takes
+  // the lease itself (`withCentralSync`) around the block that asks.
   return (
-    getRawDb()
-      .prepare('SELECT 1 AS ok FROM messaging_group_agents WHERE agent_group_id = ? AND messaging_group_id = ?')
-      .get(agentGroupId, messagingGroupId) !== undefined
+    withRawDb((raw) =>
+      raw
+        .prepare('SELECT 1 AS ok FROM messaging_group_agents WHERE agent_group_id = ? AND messaging_group_id = ?')
+        .get(agentGroupId, messagingGroupId),
+    ) !== undefined
   );
 }
 
@@ -414,12 +423,16 @@ export async function routeAgentMessage(
     return;
   }
 
-  const decision = guard(a2aSend, {
-    actor: { kind: 'agent', agentGroupId: sourceAgentGroupId, sessionId: session.id },
-    resource: { from: sourceAgentGroupId, to: targetAgentGroupId },
-    payload: { id: msg.id, platform_id: targetAgentGroupId, content: msg.content, in_reply_to: msg.in_reply_to },
-    grant: opts.grant ?? null,
-  });
+  const decision = await withCentralSync(
+    () =>
+      guard(a2aSend, {
+        actor: { kind: 'agent', agentGroupId: sourceAgentGroupId, sessionId: session.id },
+        resource: { from: sourceAgentGroupId, to: targetAgentGroupId },
+        payload: { id: msg.id, platform_id: targetAgentGroupId, content: msg.content, in_reply_to: msg.in_reply_to },
+        grant: opts.grant ?? null,
+      }),
+    'a2a.send gate',
+  );
   if (decision.effect === 'deny') {
     throw new GuardDenyError(decision.reason);
   }
@@ -547,7 +560,9 @@ async function performAgentRoute(
     msg,
     session,
     targetAgentGroupId,
-    resolveFallback,
+    // The wiring read inside is the agent-route guard's raw read, so the
+    // re-run takes the lease around it.
+    () => withCentralSync(resolveFallback, 'agent-route fallback'),
   );
 
   const a2aMsgId = `a2a-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -595,8 +610,9 @@ async function performAgentRoute(
   };
 
   // PROOF ONE, before the copy. Nothing has been written yet, so this refusal
-  // leaves nothing to undo.
-  const beforeCopy = proveDestination();
+  // leaves nothing to undo. Under the lease, because the guard's reads are
+  // raw; proof TWO runs inside the writer's own block.
+  const beforeCopy = await withCentralSync(proveDestination, 'a2a.send proof before copy');
   if (beforeCopy.effect !== 'allow') refuse(beforeCopy.reason, 'before the file copy');
 
   // If the source message references files (via `send_file`), forward the
@@ -759,7 +775,7 @@ async function addThreadContext(
   target: Session,
 ): Promise<string> {
   if (!mgId || !threadId) return content;
-  const mg = getMessagingGroup(mgId);
+  const mg = await getMessagingGroup(mgId);
   if (!mg) return content;
   const adapter = getChannelAdapter(mg.instance ?? mg.channel_type);
   if (!adapter?.fetchThreadHistory) return content;

@@ -143,12 +143,12 @@ function providerHealLastAttemptId(mailbox: NanoclawMailboxSession): string | nu
  * even if the kill fizzles; on_wake rows are only consumed by a fresh
  * container's first poll, so the dying one cannot steal it.
  */
-function applyProviderHeal(
+async function applyProviderHeal(
   mailbox: NanoclawMailboxSession,
   session: Session,
   agentGroupFolder: string,
   containerState: ContainerState | null,
-): void {
+): Promise<void> {
   const failureReason = containerState?.provider_failure_reason ?? null;
   let primaryProvider: string | null = null;
   let routedTo: string | null = null;
@@ -159,14 +159,16 @@ function applyProviderHeal(
       sessionProvider: session.agent_provider,
       containerConfig,
     };
-    primaryProvider = resolveSpawnProvider(resolveArgs).primaryProvider;
+    primaryProvider = (await resolveSpawnProvider(resolveArgs)).primaryProvider;
     // A group with no declared fallback has nowhere to route, so recording a
     // health window would only delay the honest error an operator needs to see.
     // Owner-approved: respawn on the primary anyway, under the same cap.
     if (containerConfig.providerFallback?.provider && failureReason) {
-      markProviderUnavailable(session.agent_group_id, primaryProvider, 'unavailable', { message: failureReason });
+      await markProviderUnavailable(session.agent_group_id, primaryProvider, 'unavailable', {
+        message: failureReason,
+      });
     }
-    routedTo = resolveSpawnProvider(resolveArgs).provider;
+    routedTo = (await resolveSpawnProvider(resolveArgs)).provider;
   } catch (err) {
     log.warn('self-heal: provider routing lookup failed — respawning as configured', { sessionId: session.id, err });
   }
@@ -394,8 +396,8 @@ async function sweepProviderHeal(
 
   // Wake row first (durably counted even if the kill fizzles), session closed,
   // then the kill and its respawn.
-  const wrote = await run((mailbox) => {
-    applyProviderHeal(mailbox, session, agentGroupFolder, containerState);
+  const wrote = await run(async (mailbox) => {
+    await applyProviderHeal(mailbox, session, agentGroupFolder, containerState);
     return true;
   });
   if (!wrote) return false;

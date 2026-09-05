@@ -37,9 +37,9 @@ import { armReasonCapture } from './reason-capture.js';
  * thread access IS the approval authority — see primitive.ts. Admin-target
  * cards require clicker-identity verification (isAuthorizedApprovalClick).
  */
-function isThreadDelivery(approval: PendingApproval, session: Session): boolean {
+async function isThreadDelivery(approval: PendingApproval, session: Session): Promise<boolean> {
   if (!session.messaging_group_id) return false;
-  const mg = getMessagingGroup(session.messaging_group_id);
+  const mg = await getMessagingGroup(session.messaging_group_id);
   if (!mg) return false;
   return approval.channel_type === mg.channel_type && approval.platform_id === mg.platform_id;
 }
@@ -212,7 +212,7 @@ async function isAuthorizedApprovalClick(approval: PendingApproval, payload: Res
   // approval authority — any thread member may resolve. See primitive.ts.
   if (approval.session_id) {
     const session = await getSession(approval.session_id);
-    if (session && isThreadDelivery(approval, session)) return true;
+    if (session && (await isThreadDelivery(approval, session))) return true;
   }
 
   const agentGroupId =

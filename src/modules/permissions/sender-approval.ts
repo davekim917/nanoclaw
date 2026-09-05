@@ -115,7 +115,7 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
     return false;
   }
 
-  const originMg = getMessagingGroup(messagingGroupId);
+  const originMg = await getMessagingGroup(messagingGroupId);
   const originChannelType = originMg?.channel_type ?? '';
   // Same-channel-type only: the card contains the sender's user-originated
   // identity and (often) message body from this workspace — don't fall
@@ -379,7 +379,7 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
     log.debug('decline_notify stamp skipped — no agent groups exist', { messagingGroupId });
   }
 
-  const originMg = getMessagingGroup(messagingGroupId);
+  const originMg = await getMessagingGroup(messagingGroupId);
 
   // (a) Polite decline in the sender's DM, as the bot. Instance-addressed so
   // a per-agent bot identity registered as its own adapter instance answers

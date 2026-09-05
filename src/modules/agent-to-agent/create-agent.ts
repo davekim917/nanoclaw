@@ -169,7 +169,7 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
   const releaseAllocation = await acquireFolderAllocationLock();
   try {
     // Collision in the creator's destination namespace
-    if (getDestinationByName(sourceGroup.id, localName)) {
+    if (await getDestinationByName(sourceGroup.id, localName)) {
       await notifyAgent(session, `Cannot create agent "${name}": you already have a destination named "${localName}".`);
       return;
     }
@@ -325,7 +325,7 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
 
     // Insert bidirectional destination rows (= ACL grants).
     // Creator refers to child by the name it chose; child refers to creator as "parent".
-    createDestination({
+    await createDestination({
       agent_group_id: sourceGroup.id,
       local_name: localName,
       target_type: 'agent',
@@ -336,11 +336,11 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
     // (shouldn't happen for a brand-new agent, but be safe).
     let parentName = 'parent';
     let parentSuffix = 2;
-    while (getDestinationByName(agentGroupId, parentName)) {
+    while (await getDestinationByName(agentGroupId, parentName)) {
       parentName = `parent-${parentSuffix}`;
       parentSuffix++;
     }
-    createDestination({
+    await createDestination({
       agent_group_id: agentGroupId,
       local_name: parentName,
       target_type: 'agent',

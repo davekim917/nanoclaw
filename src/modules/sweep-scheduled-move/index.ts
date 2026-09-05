@@ -18,6 +18,7 @@ import path from 'path';
 
 import { log } from '../../log.js';
 import { getRawDb } from '../../db/connection.js';
+import { withCentralSync } from '../../db/central-lease.js';
 import { withQuietInvalidationSync } from '../../db/sessions.js';
 import { sessionsBaseDir } from '../../session-manager.js';
 import { parseSqliteUtc } from '../mailbox/sqlite-utc.js';
@@ -231,59 +232,61 @@ export async function recoverMoveIntents(centralDb: Database.Database, options: 
       // Existing-only: the existsSync above already answered "is there a
       // session to restore into", and a recovery pass must never re-provision
       // one it has just been told is gone (invariant I-10).
-      outcome = await withExistingMailboxSession(intent.agent_group_id, intent.session_id, (mailbox) => {
-        // Idempotency re-check: the restore + the resolved_at stamp span two DB
-        // files (not atomic), so re-confirm a readable zero-live IMMEDIATELY before
-        // insert. An unreadable re-check defers (never restore on unknown).
-        const recheck = countLiveRowsInSessions(dataDir, [source, target], intent.series_id);
-        if (recheck.unreadable) return 'deferred' as const;
-        if (recheck.count === 0) {
-          // This duty runs in tick:housekeeping — AFTER the session fan-out and
-          // after the quiet-mark flush. The fan-out saw a source with no live
-          // task (that is the crash state this recovery exists for) and may have
-          // just marked it quiet, so the row about to be restored is a DUE task
-          // hiding behind a mark taken seconds ago, and S2-PR15 would carry that
-          // mark across a restart. The central-DB invalidation clears it.
-          //
-          // Invalidate BEFORE the restore, in the same synchronous turn (Codex
-          // pre-pass Part C, round 3 H1): inbound.db and the central DB are two
-          // separate files with no shared transaction, so a crash between the
-          // two statements is possible even with no `await` between them.
-          // Invalidate-then-restore's worst case is one wasted sweep of a
-          // session that then finds nothing new to restore (the idempotency
-          // re-check above already tolerates a repeated call); the reverse
-          // leaves the restored row durable while the persisted quiet mark
-          // survives the crash, hiding a due task for up to
-          // `QUIET_SESSION_BACKOFF_MS` after a warmed restart.
-          //
-          // FAIL-CLOSED (Codex round 2, H1; round 3, H2): the invalidation
-          // throws — on a central-DB error AND on a session row that is gone or
-          // no longer active — and the throw escapes the mailbox action into
-          // this loop's catch, which logs and leaves the intent UNRESOLVED for
-          // the next recovery pass. A swallowed failure would instead restore
-          // the row behind a mark nothing clears and then stamp the intent
-          // resolved — the one outcome no later pass can repair.
-          withQuietInvalidationSync(intent.session_id, () =>
-            mailbox.restoreTaskRow({
-              // Fresh id — the cancelled source row may still hold the snapshot id.
-              id: `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-              series_id: snapshot.series_id,
-              status: snapshot.status,
-              process_after: snapshot.process_after,
-              // Optional on the parsed audit body: an intent written before the
-              // column existed has none, and restoreTaskRow falls back.
-              scheduled_for: snapshot.scheduled_for,
-              recurrence: snapshot.recurrence,
-              content: snapshot.content,
-              platform_id: snapshot.platform_id,
-              channel_type: snapshot.channel_type,
-              thread_id: snapshot.thread_id,
-              kind: snapshot.kind,
-            }),
-          );
-        }
-        return 'restored' as const;
-      });
+      outcome = await withExistingMailboxSession(intent.agent_group_id, intent.session_id, (mailbox) =>
+        withCentralSync(() => {
+          // Idempotency re-check: the restore + the resolved_at stamp span two DB
+          // files (not atomic), so re-confirm a readable zero-live IMMEDIATELY before
+          // insert. An unreadable re-check defers (never restore on unknown).
+          const recheck = countLiveRowsInSessions(dataDir, [source, target], intent.series_id);
+          if (recheck.unreadable) return 'deferred' as const;
+          if (recheck.count === 0) {
+            // This duty runs in tick:housekeeping — AFTER the session fan-out and
+            // after the quiet-mark flush. The fan-out saw a source with no live
+            // task (that is the crash state this recovery exists for) and may have
+            // just marked it quiet, so the row about to be restored is a DUE task
+            // hiding behind a mark taken seconds ago, and S2-PR15 would carry that
+            // mark across a restart. The central-DB invalidation clears it.
+            //
+            // Invalidate BEFORE the restore, in the same synchronous turn (Codex
+            // pre-pass Part C, round 3 H1): inbound.db and the central DB are two
+            // separate files with no shared transaction, so a crash between the
+            // two statements is possible even with no `await` between them.
+            // Invalidate-then-restore's worst case is one wasted sweep of a
+            // session that then finds nothing new to restore (the idempotency
+            // re-check above already tolerates a repeated call); the reverse
+            // leaves the restored row durable while the persisted quiet mark
+            // survives the crash, hiding a due task for up to
+            // `QUIET_SESSION_BACKOFF_MS` after a warmed restart.
+            //
+            // FAIL-CLOSED (Codex round 2, H1; round 3, H2): the invalidation
+            // throws — on a central-DB error AND on a session row that is gone or
+            // no longer active — and the throw escapes the mailbox action into
+            // this loop's catch, which logs and leaves the intent UNRESOLVED for
+            // the next recovery pass. A swallowed failure would instead restore
+            // the row behind a mark nothing clears and then stamp the intent
+            // resolved — the one outcome no later pass can repair.
+            withQuietInvalidationSync(intent.session_id, () =>
+              mailbox.restoreTaskRow({
+                // Fresh id — the cancelled source row may still hold the snapshot id.
+                id: `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                series_id: snapshot.series_id,
+                status: snapshot.status,
+                process_after: snapshot.process_after,
+                // Optional on the parsed audit body: an intent written before the
+                // column existed has none, and restoreTaskRow falls back.
+                scheduled_for: snapshot.scheduled_for,
+                recurrence: snapshot.recurrence,
+                content: snapshot.content,
+                platform_id: snapshot.platform_id,
+                channel_type: snapshot.channel_type,
+                thread_id: snapshot.thread_id,
+                kind: snapshot.kind,
+              }),
+            );
+          }
+          return 'restored' as const;
+        }, 'scheduled-move recovery restore'),
+      );
     } catch (err) {
       log.error('scheduled-move-recovery: restore failed', {
         seriesId: intent.series_id,

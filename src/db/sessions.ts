@@ -1,5 +1,6 @@
 import type { PendingApproval, PendingQuestion, Session } from '../types.js';
-import { getDb, getRawDb, hasTable } from './connection.js';
+import { centralTransaction, withRawDb } from './central-lease.js';
+import { getDb, hasTable } from './connection.js';
 
 // ── Sessions ──
 
@@ -288,25 +289,33 @@ export class QuietInvalidationError extends Error {
  */
 export function withQuietInvalidationSync<T>(sessionId: string, write: () => T): T {
   const now = new Date().toISOString();
-  let changes: number;
-  try {
-    changes = getRawDb()
-      .prepare(
-        `UPDATE sessions
-            SET last_active = CASE
-                  WHEN last_active IS NULL OR last_active < @now THEN @now
-                  -- Strictly increasing even when the clock has not moved: see
-                  -- the first ordering case above.
-                  ELSE strftime('%Y-%m-%dT%H:%M:%fZ', last_active, '+0.001 seconds')
-                END,
-                sweep_quiet_until = NULL
-          WHERE id = @id
-            AND status = 'active'`,
-      )
-      .run({ id: sessionId, now }).changes;
-  } catch (err) {
-    throw new QuietInvalidationError(sessionId, err);
-  }
+  // Seam 3 §4.5 I-1: the invalidation executes through `withRawDb`, so this
+  // helper is only callable inside a `withCentralSync` block — the caller
+  // takes the lease around the invalidation AND the write it protects, and
+  // the pair runs with nothing interleaving. Outside a block the raw access
+  // throws its own contract error, which is deliberately NOT wrapped as a
+  // `QuietInvalidationError`: it is a programming error at the call site, not
+  // a central-DB refusal.
+  const changes = withRawDb((raw) => {
+    try {
+      return raw
+        .prepare(
+          `UPDATE sessions
+              SET last_active = CASE
+                    WHEN last_active IS NULL OR last_active < @now THEN @now
+                    -- Strictly increasing even when the clock has not moved: see
+                    -- the first ordering case above.
+                    ELSE strftime('%Y-%m-%dT%H:%M:%fZ', last_active, '+0.001 seconds')
+                  END,
+                  sweep_quiet_until = NULL
+            WHERE id = @id
+              AND status = 'active'`,
+        )
+        .run({ id: sessionId, now }).changes;
+    } catch (err) {
+      throw new QuietInvalidationError(sessionId, err);
+    }
+  });
   if (changes !== 1) {
     throw new QuietInvalidationError(
       sessionId,
@@ -404,17 +413,16 @@ export async function getWarmQuietSessionMarks(nowIso: string): Promise<WarmQuie
  * count is keyed to the session, has no cascading foreign key, and is only
  * ever cleared by a delivery loop this session no longer has.
  *
- * Seam 3: stays SYNCHRONOUS — it IS one of the eleven pinned central raw
- * `db.transaction(...)` sites (plan §4.4), and the three DELETEs are atomic by
- * construction. Converts in PR 6.
+ * The three DELETEs are one central transaction (`centralTransaction`, plan
+ * §4.4): DB-only, awaited in sequence.
  */
-export function deleteSession(id: string): void {
-  const db = getRawDb();
-  db.transaction(() => {
-    db.prepare('DELETE FROM cli_request_executions WHERE session_id = ?').run(id);
-    db.prepare('DELETE FROM delivery_attempts WHERE session_id = ?').run(id);
-    db.prepare('DELETE FROM sessions WHERE id = ?').run(id);
-  })();
+export async function deleteSession(id: string): Promise<void> {
+  await centralTransaction(async () => {
+    const db = getDb();
+    await db.run('DELETE FROM cli_request_executions WHERE session_id = ?', id);
+    await db.run('DELETE FROM delivery_attempts WHERE session_id = ?', id);
+    await db.run('DELETE FROM sessions WHERE id = ?', id);
+  }, 'deleteSession');
 }
 
 /**

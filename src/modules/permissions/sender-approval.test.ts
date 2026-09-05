@@ -116,7 +116,7 @@ beforeEach(async () => {
     unknown_sender_policy: 'request_approval',
     created_at: now(),
   });
-  createMessagingGroupAgent({
+  await createMessagingGroupAgent({
     id: 'mga-1',
     messaging_group_id: 'mg-chat',
     agent_group_id: 'ag-1',

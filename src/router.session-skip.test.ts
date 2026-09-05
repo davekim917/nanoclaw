@@ -144,7 +144,7 @@ async function wire(
     unknown_sender_policy: 'public',
     created_at: now(),
   });
-  createMessagingGroupAgent({
+  await createMessagingGroupAgent({
     id: 'mga-fixture',
     messaging_group_id: MG,
     agent_group_id: AG,

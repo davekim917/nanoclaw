@@ -31,9 +31,9 @@
  * lease itself. No wait cycle exists, and the re-entrancy guard below turns the
  * one shape that could produce one into an immediate throw.
  *
- * ZERO production callers as of seam 3 PR 6a. PR 6 wires the guards,
- * `withQuietInvalidationSync`, `write-destinations.ts` and the eleven
- * transactions onto it.
+ * Production callers since seam 3 PR 6: the wake/write/agent-route guards and
+ * the `guard()` consult sites, `withQuietInvalidationSync` and its callers,
+ * `write-destinations.ts`, and every central transaction in the fork.
  *
  * See docs/specs/upstream-async-central-db-seam/plan.md §4.1, §4.4, §4.5.
  */
@@ -348,6 +348,15 @@ export type NoLiveSqlite<T> = T extends
   : [];
 
 /**
+ * The `withRawDb` callback contract, both halves at once (#408): it may not be
+ * async — a promise-returning callback passes `NoLiveSqlite` (a promise is not
+ * a live object) and leaves the lease released with raw work still pending —
+ * and it may not hand back anything live. Checked in that order so the more
+ * specific message wins for an `async` callback.
+ */
+export type RawCallbackOnly<T> = T extends PromiseLike<unknown> ? [callbackMustNotBeAsync: never] : NoLiveSqlite<T>;
+
+/**
  * Bumped when a synchronous block starts, so a facade can tell "my block is
  * still running" from "a LATER block is running" — `insideSyncBlock` alone
  * would let a stale facade ride a subsequent block's lease.
@@ -498,7 +507,7 @@ function settleStrayTransaction(
 export function withRawDb<T>(
   fn: (db: RawDb) => T,
   // eslint-disable-next-line @typescript-eslint/no-unused-vars -- type-level only
-  ..._confined: NoLiveSqlite<T>
+  ..._confined: RawCallbackOnly<T>
 ): T {
   if (!insideSyncBlock) throw new RawAccessOutsideSyncBlockError();
   const raw = getRawDb();
@@ -509,6 +518,13 @@ export function withRawDb<T>(
   let result!: T;
   try {
     result = fn(new BlockScopedRawDb(raw, blockEpoch));
+    if (isThenable(result)) {
+      // An `async` callback (#408): its first statement may already have run,
+      // but everything after its first await would land outside the lease.
+      // The facades refuse that work at runtime; this refuses the shape.
+      disownThenable(result, 'The withRawDb callback');
+      throw new GuardNotSynchronousError('The withRawDb callback');
+    }
     callbackThrew = false;
   } finally {
     stray = settleStrayTransaction(raw, 'The withRawDb() callback', callbackThrew);

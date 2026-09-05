@@ -62,8 +62,8 @@ async function seedGroups(): Promise<void> {
     .run('sess-child', 'ag-child', now());
 }
 
-function makeTask(overrides: Partial<Parameters<typeof insertTaskAtomic>[0]> = {}): Task {
-  return insertTaskAtomic({
+async function makeTask(overrides: Partial<Parameters<typeof insertTaskAtomic>[0]> = {}): Promise<Task> {
+  return (await insertTaskAtomic({
     task_id: 'task-1',
     idempotency_key: 'ik-1',
     parent_session_id: 'sess-parent',
@@ -92,7 +92,7 @@ function makeTask(overrides: Partial<Parameters<typeof insertTaskAtomic>[0]> = {
     needs_input: 0,
     steer_question: null,
     ...overrides,
-  })!;
+  }))!;
 }
 
 const mockChildMg = {
@@ -107,7 +107,7 @@ const mockChildMg = {
 
 async function stubChildMgPresent(): Promise<void> {
   const { getMessagingGroup } = await import('../../db/messaging-groups.js');
-  vi.mocked(getMessagingGroup).mockReturnValue(mockChildMg);
+  vi.mocked(getMessagingGroup).mockResolvedValue(mockChildMg);
 }
 
 function makeChildSession(): Session {
@@ -148,7 +148,7 @@ describe('applySpawnNeedsInput', () => {
   it('flips needs_input and stores question on a running task', async () => {
     await setupDb();
     await seedGroups();
-    makeTask();
+    await makeTask();
 
     await applySpawnNeedsInput({ task_id: 'task-1', question: 'Repo path A or B?' }, makeChildSession());
 
@@ -160,7 +160,7 @@ describe('applySpawnNeedsInput', () => {
   it('truncates question to 500 chars', async () => {
     await setupDb();
     await seedGroups();
-    makeTask();
+    await makeTask();
 
     await applySpawnNeedsInput({ task_id: 'task-1', question: 'X'.repeat(1000) }, makeChildSession());
 
@@ -171,7 +171,7 @@ describe('applySpawnNeedsInput', () => {
   it('accepts no question and leaves steer_question null', async () => {
     await setupDb();
     await seedGroups();
-    makeTask();
+    await makeTask();
 
     await applySpawnNeedsInput({ task_id: 'task-1' }, makeChildSession());
 
@@ -183,7 +183,7 @@ describe('applySpawnNeedsInput', () => {
   it('does not flip on a terminal task (completed)', async () => {
     await setupDb();
     await seedGroups();
-    makeTask();
+    await makeTask();
     getRawDb().prepare(`UPDATE tasks SET status = 'completed' WHERE task_id = 'task-1'`).run();
 
     await applySpawnNeedsInput({ task_id: 'task-1', question: 'too late' }, makeChildSession());
@@ -196,7 +196,7 @@ describe('applySpawnNeedsInput', () => {
   it('silently skips on auth mismatch (wrong child_session)', async () => {
     await setupDb();
     await seedGroups();
-    makeTask();
+    await makeTask();
 
     await expect(
       applySpawnNeedsInput({ task_id: 'task-1', question: 'spoof?' }, makeWrongSession()),
@@ -215,7 +215,7 @@ describe('applySpawnNeedsInput', () => {
   it('posts into the task thread via the channel adapter when the flag flips', async () => {
     await setupDb();
     await seedGroups();
-    makeTask();
+    await makeTask();
     await stubChildMgPresent();
 
     await applySpawnNeedsInput({ task_id: 'task-1', question: 'Repo path A or B?' }, makeChildSession());
@@ -231,7 +231,7 @@ describe('applySpawnNeedsInput', () => {
   it('does not double-notify when worker re-asks with the same question', async () => {
     await setupDb();
     await seedGroups();
-    makeTask();
+    await makeTask();
     await stubChildMgPresent();
 
     await applySpawnNeedsInput({ task_id: 'task-1', question: 'Same q' }, makeChildSession());
@@ -243,7 +243,7 @@ describe('applySpawnNeedsInput', () => {
   it('re-notifies when the question text changes', async () => {
     await setupDb();
     await seedGroups();
-    makeTask();
+    await makeTask();
     await stubChildMgPresent();
 
     await applySpawnNeedsInput({ task_id: 'task-1', question: 'First?' }, makeChildSession());
@@ -255,7 +255,7 @@ describe('applySpawnNeedsInput', () => {
   it('skips the adapter post for headless tasks but still flips the row', async () => {
     await setupDb();
     await seedGroups();
-    makeTask({ surface_mode: 'headless', child_platform_thread_id: null, child_messaging_group_id: null });
+    await makeTask({ surface_mode: 'headless', child_platform_thread_id: null, child_messaging_group_id: null });
     await stubChildMgPresent();
 
     await applySpawnNeedsInput({ task_id: 'task-1', question: 'q' }, makeChildSession());
@@ -268,9 +268,9 @@ describe('applySpawnNeedsInput', () => {
   it('skips the adapter post when the messaging group is gone', async () => {
     await setupDb();
     await seedGroups();
-    makeTask();
+    await makeTask();
     const { getMessagingGroup } = await import('../../db/messaging-groups.js');
-    vi.mocked(getMessagingGroup).mockReturnValue(undefined);
+    vi.mocked(getMessagingGroup).mockResolvedValue(undefined);
 
     await applySpawnNeedsInput({ task_id: 'task-1', question: 'q' }, makeChildSession());
 

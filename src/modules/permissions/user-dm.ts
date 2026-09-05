@@ -93,7 +93,7 @@ export async function ensureUserDm(
   // Cache hit: existing user_dms row → load and return the messaging_group.
   const cached = await getUserDm(userId, channelType);
   if (cached) {
-    const mg = getMessagingGroup(cached.messaging_group_id);
+    const mg = await getMessagingGroup(cached.messaging_group_id);
     if (mg) {
       // The cache key is (user_id, channel_type), not instance. A caller
       // that named an instance is about to dispatch delivery on THIS row's

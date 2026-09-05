@@ -182,8 +182,13 @@ function grantOrchestratorCap1(agId: string): void {
     .run(agId, config, now());
 }
 
-function insertActiveTask(taskId: string, idempotencyKey: string, sessionId: string, agId: string): Task {
-  return insertTaskAtomic({
+async function insertActiveTask(
+  taskId: string,
+  idempotencyKey: string,
+  sessionId: string,
+  agId: string,
+): Promise<Task> {
+  return (await insertTaskAtomic({
     task_id: taskId,
     idempotency_key: idempotencyKey,
     parent_session_id: sessionId,
@@ -209,7 +214,7 @@ function insertActiveTask(taskId: string, idempotencyKey: string, sessionId: str
     dispatch_completion_attempts: 0,
     completion_lease_at: null,
     surface_mode: 'headless',
-  })!;
+  }))!;
 }
 
 beforeEach(async () => {
@@ -233,7 +238,7 @@ describe('applySpawnTask', () => {
     const caller = makeCallerSession();
     await applySpawnTask({ content: 'Do X', idempotency_key: 'k1' }, caller);
 
-    const task = getTaskByParentAndIdempotency('sess-caller', 'k1');
+    const task = await getTaskByParentAndIdempotency('sess-caller', 'k1');
     expect(task).toBeNull();
 
     const { writeSessionMessage } = await import('../../session-manager.js');
@@ -256,7 +261,7 @@ describe('applySpawnTask', () => {
     const caller = makeCallerSession();
     await applySpawnTask({ content: 'Do X', idempotency_key: 'k1' }, caller);
 
-    const task = getTaskByParentAndIdempotency('sess-caller', 'k1');
+    const task = await getTaskByParentAndIdempotency('sess-caller', 'k1');
     expect(task).not.toBeNull();
     expect(task!.status).toBe('pending');
     expect(task!.surface_mode).toBe('headless');
@@ -270,11 +275,11 @@ describe('applySpawnTask', () => {
     grantOrchestratorCap1('ag-caller');
 
     // Insert one active task (at cap)
-    insertActiveTask('task-existing', 'k-other', 'sess-caller', 'ag-caller');
+    await insertActiveTask('task-existing', 'k-other', 'sess-caller', 'ag-caller');
 
     // Also insert the idempotency key we'll replay
     const replayHash = computeRequestHash('Do X', null);
-    insertTaskAtomic({
+    await insertTaskAtomic({
       task_id: 'task-replay',
       idempotency_key: 'k1',
       parent_session_id: 'sess-caller',
@@ -323,7 +328,7 @@ describe('applySpawnTask', () => {
 
     // Insert existing task with hash for ('X', null)
     const originalHash = computeRequestHash('X', null);
-    insertTaskAtomic({
+    await insertTaskAtomic({
       task_id: 'task-orig',
       idempotency_key: 'k1',
       parent_session_id: 'sess-caller',
@@ -372,12 +377,12 @@ describe('applySpawnTask', () => {
     grantOrchestratorCap1('ag-caller');
 
     // Insert one active (running) task → at cap
-    insertActiveTask('task-existing', 'k-other', 'sess-caller', 'ag-caller');
+    await insertActiveTask('task-existing', 'k-other', 'sess-caller', 'ag-caller');
 
     const caller = makeCallerSession();
     await applySpawnTask({ content: 'New work', idempotency_key: 'k-new' }, caller);
 
-    const newTask = getTaskByParentAndIdempotency('sess-caller', 'k-new');
+    const newTask = await getTaskByParentAndIdempotency('sess-caller', 'k-new');
     expect(newTask).toBeNull();
 
     const { writeSessionMessage } = await import('../../session-manager.js');
@@ -401,7 +406,7 @@ describe('applySpawnTask', () => {
     const caller = makeCallerSession({ messaging_group_id: 'mg-1' });
     await applySpawnTask({ content: 'Do X', idempotency_key: 'k1' }, caller);
 
-    const task = getTaskByParentAndIdempotency('sess-caller', 'k1');
+    const task = await getTaskByParentAndIdempotency('sess-caller', 'k1');
     expect(task).not.toBeNull();
     expect(task!.surface_mode).toBe('headless');
   });
@@ -419,7 +424,7 @@ describe('applySpawnTask', () => {
     const caller = makeCallerSession({ messaging_group_id: 'mg-1' });
     await applySpawnTask({ content: 'Do X', idempotency_key: 'k1' }, caller);
 
-    const task = getTaskByParentAndIdempotency('sess-caller', 'k1');
+    const task = await getTaskByParentAndIdempotency('sess-caller', 'k1');
     expect(task).not.toBeNull();
     expect(task!.surface_mode).toBe('native_thread');
   });
@@ -737,7 +742,7 @@ describe('D6: emitDashboardEvent emits after apply functions commit', () => {
     await applySpawnTask({ content: 'Do X', idempotency_key: 'd6-k1' }, caller);
 
     // Emit fires AFTER the transaction — task must exist in DB
-    const task = getTaskByParentAndIdempotency('sess-caller', 'd6-k1');
+    const task = await getTaskByParentAndIdempotency('sess-caller', 'd6-k1');
     expect(task).not.toBeNull();
 
     // Wait for async lazyEmit to resolve
@@ -754,7 +759,7 @@ describe('D6: emitDashboardEvent emits after apply functions commit', () => {
     grantOrchestratorCap1('ag-caller');
 
     // Fill cap
-    insertActiveTask('task-existing', 'k-other', 'sess-caller', 'ag-caller');
+    await insertActiveTask('task-existing', 'k-other', 'sess-caller', 'ag-caller');
 
     const { emitDashboardEvent } = await import('../../dashboard/api/events.js');
     vi.mocked(emitDashboardEvent).mockClear();

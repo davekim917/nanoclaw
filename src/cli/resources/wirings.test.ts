@@ -237,7 +237,7 @@ describe('wirings-update — same validation as create', () => {
   it('allows unrelated updates to a legacy pattern row with NULL engage_pattern', async () => {
     // Rows created on main before engage_pattern defaults existed: pattern
     // mode + NULL pattern, which the router evaluates as match-all.
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       id: 'mga-legacy',
       messaging_group_id: 'mg-stale',
       agent_group_id: 'ag-1',

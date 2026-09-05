@@ -304,7 +304,7 @@ describe('ensureUserDm', () => {
     expect(mg).toBeDefined();
     // Read the row back: createMessagingGroup defaults an unset instance to
     // the channel type, so the persisted value is what matters.
-    const row = getMessagingGroup(mg!.id);
+    const row = await getMessagingGroup(mg!.id);
     expect(row?.instance).toBe('slack-labs');
   });
 
@@ -316,7 +316,7 @@ describe('ensureUserDm', () => {
     await seedUser('slack:U-owner', 'slack');
 
     const mg = await ensureUserDm('slack:U-owner');
-    expect(getMessagingGroup(mg!.id)?.instance).toBe('slack');
+    expect((await getMessagingGroup(mg!.id))?.instance).toBe('slack');
   });
 
   it('does not reuse a sibling instance row for the same platform_id', async () => {
@@ -340,7 +340,7 @@ describe('ensureUserDm', () => {
 
     const mg = await ensureUserDm('telegram:U-owner', { instance: 'telegram-bot-a' });
     expect(mg!.id).not.toBe('mg-sibling');
-    expect(getMessagingGroup(mg!.id)?.instance).toBe('telegram-bot-a');
+    expect((await getMessagingGroup(mg!.id))?.instance).toBe('telegram-bot-a');
   });
 
   // Codex round 1 on #465: the (user_id, channel_type) cache key ignores

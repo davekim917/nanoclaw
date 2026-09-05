@@ -576,8 +576,8 @@ function uniqueSessionsById(...groups: Session[][]): Session[] {
   return [...new Map(groups.flat().map((candidate) => [candidate.id, candidate])).values()];
 }
 
-function workUnitForSession(session: Session, workgroupId: string): RepositoryWorkUnit {
-  const messagingGroup = session.messaging_group_id ? getMessagingGroup(session.messaging_group_id) : null;
+async function workUnitForSession(session: Session, workgroupId: string): Promise<RepositoryWorkUnit> {
+  const messagingGroup = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : null;
   return resolveRepositoryWorkUnit({
     workgroupId,
     sessionId: session.id,
@@ -906,7 +906,7 @@ export async function applyRepositoryTransferAction(content: Record<string, unkn
     // lookup rejection must therefore produce the same explicit failure wake
     // as a later Git/quiescence rejection instead of becoming a log-only job.
     const workgroupId = await workgroupForSession(session);
-    const destination = workUnitForSession(session, workgroupId);
+    const destination = await workUnitForSession(session, workgroupId);
     if (destination.key !== destinationWorkUnitKey) throw new Error('destination repository work-unit changed');
     const sourceRows = getRawDb()
       .prepare(

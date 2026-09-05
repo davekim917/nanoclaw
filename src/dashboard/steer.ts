@@ -322,7 +322,7 @@ async function _fireEchoAsync(exec: SteerExecution, text: string, ctx: AuthedReq
     return;
   }
 
-  const mg = getMessagingGroup(exec.echo.messagingGroupId);
+  const mg = await getMessagingGroup(exec.echo.messagingGroupId);
   if (!mg) {
     await _emitEchoStatus('adapter_unavailable', exec);
     return;

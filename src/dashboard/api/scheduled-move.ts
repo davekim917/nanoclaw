@@ -23,6 +23,7 @@ import { DATA_DIR, GROUPS_DIR } from '../../config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getWorkgroupOnecliSecrets } from '../../db/agent-groups.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
+import { withCentralSync } from '../../db/central-lease.js';
 import { getDb, getRawDb } from '../../db/connection.js';
 import { findSystemSession, taskThreadId, withQuietInvalidationSync } from '../../db/sessions.js';
 import { readSessionInbound, type ScheduledTaskRow } from '../../modules/mailbox/index.js';
@@ -261,7 +262,7 @@ async function resolveAndGate(
 
   const targetAg = await getAgentGroup(targetAgId);
   if (!targetAg) return { error: json({ error: 'not_found' }, 404) };
-  const targetMg = getMessagingGroup(targetMgId);
+  const targetMg = await getMessagingGroup(targetMgId);
   if (!targetMg) return { error: json({ error: 'not_found' }, 404) };
 
   return {
@@ -420,7 +421,7 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
   const rl = rateLimit(ctx.user.id, 'move');
   if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.retryAfter }, 429);
 
-  const targetMg = getMessagingGroup(target.messagingGroupId);
+  const targetMg = await getMessagingGroup(target.messagingGroupId);
   if (!targetMg) return json({ error: 'not_found' }, 404);
 
   // Step 0a: M4 — containment-checked source open (null → 404; decodeKey already
@@ -664,35 +665,37 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
       );
       if (!live.unreadable && live.count === 0) {
         restored =
-          (await withExistingMailboxSession(source.agentGroupId, source.sessionId, (mailbox) => {
-            // The source was cancelled, then the target insert was AWAITED — a
-            // sweep tick can land in that await, see a source with no live task
-            // and mark it quiet. Restoring the pending row here puts due work
-            // back behind that mark, and S2-PR15 would carry it across a
-            // restart. The central-DB invalidation is what clears it.
-            //
-            // Invalidate BEFORE the restore, in the same synchronous turn
-            // (Codex pre-pass Part C, round 3 H1): inbound.db and the central DB
-            // are two separate files with no shared transaction, so a crash
-            // between them is survivable only if the mark dies first. Its worst
-            // case is one wasted sweep of a session whose restore then fails;
-            // the reverse leaves a restored due row hidden behind a persisted
-            // quiet mark for up to `QUIET_SESSION_BACKOFF_MS` after a warmed
-            // restart. This also keeps the invalidation before `purgeIntentBody`
-            // below: a crash between the two still leaves the intent for
-            // `recoverMoveIntents` to finish.
-            //
-            // FAIL-CLOSED (Codex round 2, H1; round 3, H2): the invalidation
-            // inside `withQuietInvalidationSync` throws — on a central-DB error
-            // AND on a session row that is gone or no longer active — and the
-            // throw escapes into the `restoreErr` catch below. `restored` stays
-            // false, the `move_restore_failed` audit row is written and
-            // `purgeIntentBody` is SKIPPED, so `recoverMoveIntents` still owns
-            // the repair. A swallowed failure would restore the row behind a
-            // mark nothing clears and then purge the only record of it.
-            withQuietInvalidationSync(source.sessionId, () => mailbox.restoreTaskRow(restoreSnapshot));
-            return true;
-          })) ?? false;
+          (await withExistingMailboxSession(source.agentGroupId, source.sessionId, (mailbox) =>
+            withCentralSync(() => {
+              // The source was cancelled, then the target insert was AWAITED — a
+              // sweep tick can land in that await, see a source with no live task
+              // and mark it quiet. Restoring the pending row here puts due work
+              // back behind that mark, and S2-PR15 would carry it across a
+              // restart. The central-DB invalidation is what clears it.
+              //
+              // Invalidate BEFORE the restore, in the same synchronous turn
+              // (Codex pre-pass Part C, round 3 H1): inbound.db and the central DB
+              // are two separate files with no shared transaction, so a crash
+              // between them is survivable only if the mark dies first. Its worst
+              // case is one wasted sweep of a session whose restore then fails;
+              // the reverse leaves a restored due row hidden behind a persisted
+              // quiet mark for up to `QUIET_SESSION_BACKOFF_MS` after a warmed
+              // restart. This also keeps the invalidation before `purgeIntentBody`
+              // below: a crash between the two still leaves the intent for
+              // `recoverMoveIntents` to finish.
+              //
+              // FAIL-CLOSED (Codex round 2, H1; round 3, H2): the invalidation
+              // inside `withQuietInvalidationSync` throws — on a central-DB error
+              // AND on a session row that is gone or no longer active — and the
+              // throw escapes into the `restoreErr` catch below. `restored` stays
+              // false, the `move_restore_failed` audit row is written and
+              // `purgeIntentBody` is SKIPPED, so `recoverMoveIntents` still owns
+              // the repair. A swallowed failure would restore the row behind a
+              // mark nothing clears and then purge the only record of it.
+              withQuietInvalidationSync(source.sessionId, () => mailbox.restoreTaskRow(restoreSnapshot));
+              return true;
+            }, 'scheduled-move source restore'),
+          )) ?? false;
       }
     } catch (restoreErr) {
       log.error('scheduled-move: source restore ALSO failed', {

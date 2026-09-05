@@ -8,13 +8,13 @@
  * installed, the central table doesn't exist and the projection is skipped.
  */
 import { AGENT_GROUP_BY_ID_SQL } from '../../db/agent-groups.js';
-import { getRawDb } from '../../db/connection.js';
-import { getMessagingGroup } from '../../db/messaging-groups.js';
-import type { AgentGroup } from '../../types.js';
+import { withCentralSync, withRawDb } from '../../db/central-lease.js';
+import { MESSAGING_GROUP_BY_ID_SQL } from '../../db/messaging-groups.js';
+import type { AgentDestination, AgentGroup, MessagingGroup } from '../../types.js';
 import { log } from '../../log.js';
 import type { DestinationRow } from '../mailbox/index.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
-import { getDestinations } from './db/agent-destinations.js';
+import { AGENT_DESTINATIONS_BY_GROUP_SQL } from './db/agent-destinations.js';
 
 export async function writeDestinations(agentGroupId: string, sessionId: string): Promise<void> {
   // Resolved INSIDE the session, not before it. `getDestinations` and the
@@ -27,20 +27,23 @@ export async function writeDestinations(agentGroupId: string, sessionId: string)
   // All three lookups are synchronous, so there is no yield left between the
   // resolution and the write.
   //
-  // Seam 3 §4.5 I-1: that is why the agent-group read below executes the
-  // agent-groups leaf's exported `AGENT_GROUP_BY_ID_SQL` through the raw handle
-  // rather than calling the now-async `getAgentGroup` — one constant, two
+  // Seam 3 §4.5 I-1: that is why every read below executes its leaf's
+  // exported SQL constant (`AGENT_DESTINATIONS_BY_GROUP_SQL`,
+  // `MESSAGING_GROUP_BY_ID_SQL`, `AGENT_GROUP_BY_ID_SQL`) through `withRawDb`
+  // rather than calling the leaves' async exports — one constant, two
   // executors, not a `*Sync` twin (plan
-  // docs/specs/upstream-async-central-db-seam/plan.md §4.5). `getMessagingGroup`
-  // is still synchronous for its own reason (§4.2). PR 6 wraps this block in
-  // `withCentralSync`.
+  // docs/specs/upstream-async-central-db-seam/plan.md §4.5). The whole
+  // resolve-then-replace pair runs inside ONE `withCentralSync` block below,
+  // so no driver transaction can be open while these raw reads execute.
   const resolve = (): DestinationRow[] => {
-    const rows = getDestinations(agentGroupId);
+    const rows = withRawDb((raw) => raw.prepare(AGENT_DESTINATIONS_BY_GROUP_SQL).all(agentGroupId)) as AgentDestination[];
     const resolved: DestinationRow[] = [];
 
     for (const row of rows) {
       if (row.target_type === 'channel') {
-        const mg = getMessagingGroup(row.target_id);
+        const mg = withRawDb((raw) => raw.prepare(MESSAGING_GROUP_BY_ID_SQL).get(row.target_id)) as
+          | MessagingGroup
+          | undefined;
         if (!mg) continue;
         resolved.push({
           name: row.local_name,
@@ -51,7 +54,7 @@ export async function writeDestinations(agentGroupId: string, sessionId: string)
           agent_group_id: null,
         });
       } else if (row.target_type === 'agent') {
-        const ag = getRawDb().prepare(AGENT_GROUP_BY_ID_SQL).get(row.target_id) as AgentGroup | undefined;
+        const ag = withRawDb((raw) => raw.prepare(AGENT_GROUP_BY_ID_SQL).get(row.target_id)) as AgentGroup | undefined;
         if (!ag) continue;
         resolved.push({
           name: row.local_name,
@@ -70,11 +73,18 @@ export async function writeDestinations(agentGroupId: string, sessionId: string)
   // edits, and a session with no mailbox has no container to resolve names
   // for. Provisioning here would recreate a reclaimed directory (I-10); the
   // old code expressed the same rule as an existsSync on inbound.db.
-  const count = await withExistingMailboxSession(agentGroupId, sessionId, (mailbox) => {
-    const resolved = resolve();
-    mailbox.replaceDestinationRows(resolved);
-    return resolved.length;
-  });
+  // The lease is taken AROUND the mailbox write, not inside it: the
+  // resolution and the replace are one synchronous block under
+  // `withCentralSync`, so an admin's revoke cannot land between them
+  // (plan §4.1, "sites that evaluate ... inside a synchronous mailbox action
+  // take the lease around the mailbox action").
+  const count = await withExistingMailboxSession(agentGroupId, sessionId, (mailbox) =>
+    withCentralSync(() => {
+      const resolved = resolve();
+      mailbox.replaceDestinationRows(resolved);
+      return resolved.length;
+    }, 'writeDestinations'),
+  );
   if (count === undefined) return;
   log.debug('Destination map written', { sessionId, count });
 }

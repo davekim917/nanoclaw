@@ -315,7 +315,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<boo
       await notifyAgent(session, `${action} failed: session has no originating channel to post approval in.`);
       return false;
     }
-    const mg = getMessagingGroup(session.messaging_group_id);
+    const mg = await getMessagingGroup(session.messaging_group_id);
     if (!mg) {
       await notifyAgent(session, `${action} failed: originating channel not found.`);
       return false;
@@ -337,7 +337,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<boo
       return false;
     }
     const originChannelType = session.messaging_group_id
-      ? (getMessagingGroup(session.messaging_group_id)?.channel_type ?? '')
+      ? ((await getMessagingGroup(session.messaging_group_id))?.channel_type ?? '')
       : '';
     const target = await pickApprovalDelivery(approvers, originChannelType);
     if (!target) {

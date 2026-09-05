@@ -65,22 +65,16 @@ const EXCLUDED_DIRS = ['src/db/drivers/', 'src/db/testing/', 'src/db/transaction
 export const DRIVER_TRANSACTION_FILES: readonly string[] = ['src/db/central-lease.ts'];
 
 /**
- * The ten CENTRAL-DB (`data/v2.db`) raw transaction sites. These are the ones
- * PR 6 converts to `centralTransaction`, and the list plan §3 names.
+ * The CENTRAL-DB (`data/v2.db`) raw transaction sites that remain after PR 6.
+ *
+ * The plan's ten `db.transaction(() => …)()` closures moved onto
+ * `centralTransaction` (which is the ONLY caller of `DbDriver.transaction`),
+ * so they no longer have a raw `.transaction(` receiver. What is left is the
+ * migration runner: it runs at boot with no concurrent central-DB activity,
+ * stays synchronous on the raw handle (plan §4.3 amendment), and is the one
+ * central file still allowed a raw `db.transaction`.
  */
-export const CENTRAL_DB_RAW_TRANSACTION_FILES: readonly string[] = [
-  'src/cli/crud.ts',
-  'src/cli/resources/groups.ts',
-  'src/cli/resources/wirings.ts',
-  'src/container-runner.ts',
-  'src/db/messaging-groups.ts',
-  'src/db/migrations/index.ts',
-  'src/db/provider-health.ts',
-  'src/db/scheduled-tasks.ts',
-  'src/db/sessions.ts',
-  'src/db/usage.ts',
-  'src/modules/orchestrator-dispatch/dispatch.ts',
-];
+export const CENTRAL_DB_RAW_TRANSACTION_FILES: readonly string[] = ['src/db/migrations/index.ts'];
 
 /**
  * Raw transactions on a better-sqlite3 handle that is NOT the central DB —
@@ -278,5 +272,153 @@ describe('the receiver resolver sees both shapes', () => {
   it('classifies a DbDriver receiver as a driver transaction', () => {
     const driver = calls.filter((c) => c.file === 'src/db/transaction-fixtures/driver-receiver.ts');
     expect(driver.map((c) => c.kind)).toEqual(['db-driver']);
+  });
+});
+
+/**
+ * A `centralTransaction`/`DbDriver.transaction` closure may await ONLY DB work
+ * (plan §4.4): the driver runs each statement synchronously on the shared
+ * handle, so an await into a NON-DB subsystem inside the open `BEGIN
+ * IMMEDIATE` would fire from a suspended continuation — after a rollback, or
+ * joining a transaction it knows nothing about. The forbidden subsystems are
+ * exactly the ones §4.4 names: the mailbox/session layer, the container
+ * runner, a channel adapter, `fetch`/network, and the lease itself
+ * (`centralTransaction`/`withCentralSync`, which would deadlock). Awaiting an
+ * async DB-leaf helper (`getProviderHealth`, `insertTaskAtomic`, …) is fine —
+ * those issue only driver statements, and a purity check that refused them
+ * would forbid the very shape the plan uses.
+ *
+ * The check resolves the DECLARATION FILE of every awaited callee inside a
+ * `centralTransaction` closure with the TypeScript checker, and flags one whose
+ * declaration is in a denylisted module (or a `fetch`/global with no local
+ * declaration, or a nested `DbDriver.transaction`). Text cannot tell
+ * `await getDb().run(...)` from `await writeSessionMessage(...)`.
+ *
+ * Two fixtures prove it is not vacuous: `db-only-closure.ts` awaits only DB
+ * work and must pass; `impure-closure.ts` awaits `fetch` and a nested
+ * `getDb().transaction` and must be flagged.
+ */
+const FORBIDDEN_AWAIT_DECL = [
+  '/src/session-manager.ts',
+  '/src/container-runner.ts',
+  '/src/delivery.ts',
+  '/src/channels/',
+  '/src/modules/mailbox/',
+  '/src/db/central-lease.ts',
+] as const;
+
+interface AwaitClassification {
+  file: string;
+  line: number;
+  callee: string;
+  forbidden: boolean;
+}
+
+function awaitedCalleesInCentralTransactions(rootFiles: string[]): AwaitClassification[] {
+  const program = ts.createProgram(rootFiles, compilerOptions());
+  const checker = program.getTypeChecker();
+  const rootSet = new Set(rootFiles.map((f) => path.resolve(f)));
+  const results: AwaitClassification[] = [];
+
+  const receiverIsDbDriver = (call: ts.CallExpression): boolean => {
+    if (!ts.isPropertyAccessExpression(call.expression)) return false;
+    const type = checker.getTypeAtLocation(call.expression.expression);
+    const check = (t: ts.Type): boolean => {
+      const sym = t.getSymbol() ?? t.aliasSymbol;
+      const decl = sym?.declarations?.[0];
+      return (
+        sym?.getName() === 'DbDriver' &&
+        (decl?.getSourceFile().fileName.split(path.sep).join('/').endsWith('/src/db/driver.ts') ?? false)
+      );
+    };
+    return type.isUnion() ? type.types.some(check) : check(type);
+  };
+
+  const classify = (call: ts.CallExpression): { callee: string; forbidden: boolean } => {
+    // A nested driver transaction bypasses the fork lease — always forbidden.
+    if (
+      ts.isPropertyAccessExpression(call.expression) &&
+      call.expression.name.text === 'transaction' &&
+      receiverIsDbDriver(call)
+    ) {
+      return { callee: 'DbDriver.transaction', forbidden: true };
+    }
+    const target = ts.isPropertyAccessExpression(call.expression) ? call.expression.name : call.expression;
+    const sym = checker.getSymbolAtLocation(target);
+    const name = ts.isIdentifier(target) ? target.text : checker.typeToString(checker.getTypeAtLocation(target));
+    const decls = sym?.declarations ?? [];
+    if (decls.length === 0) {
+      // No local declaration (a global like `fetch`) — forbidden unless it is a
+      // driver method (whose symbol resolves into src/db/driver.ts, handled above).
+      return { callee: name, forbidden: name === 'fetch' };
+    }
+    const declFile = decls[0].getSourceFile().fileName.split(path.sep).join('/');
+    const forbidden = FORBIDDEN_AWAIT_DECL.some((frag) => declFile.includes(frag));
+    return { callee: name, forbidden };
+  };
+
+  for (const sourceFile of program.getSourceFiles()) {
+    if (!rootSet.has(path.resolve(sourceFile.fileName))) continue;
+    const rel = toRel(sourceFile.fileName);
+    let depth = 0;
+    const visit = (node: ts.Node): void => {
+      let pushed = false;
+      if (
+        ts.isCallExpression(node) &&
+        ((ts.isIdentifier(node.expression) && node.expression.text === 'centralTransaction') ||
+          (ts.isPropertyAccessExpression(node.expression) &&
+            node.expression.name.text === 'transaction' &&
+            receiverIsDbDriver(node)))
+      ) {
+        const closure = node.arguments.find((a) => ts.isArrowFunction(a) || ts.isFunctionExpression(a));
+        if (closure) {
+          depth += 1;
+          pushed = true;
+        }
+      }
+      if (depth > 0 && ts.isAwaitExpression(node) && ts.isCallExpression(node.expression)) {
+        const { callee, forbidden } = classify(node.expression);
+        results.push({
+          file: rel,
+          line: sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1,
+          callee,
+          forbidden,
+        });
+      }
+      ts.forEachChild(node, visit);
+      if (pushed) depth -= 1;
+    };
+    ts.forEachChild(sourceFile, visit);
+  }
+  return results;
+}
+
+describe('centralTransaction closures await only DB work', () => {
+  it('flags a fixture that awaits fetch or a nested driver transaction', () => {
+    const impure = path.join(SRC_ROOT, 'db', 'transaction-fixtures', 'impure-closure.ts');
+    const dbOnly = path.join(SRC_ROOT, 'db', 'transaction-fixtures', 'db-only-closure.ts');
+    const impureAwaits = awaitedCalleesInCentralTransactions([impure]);
+    const dbOnlyAwaits = awaitedCalleesInCentralTransactions([dbOnly]);
+    // Non-vacuous: the resolver actually finds awaits in both fixtures.
+    expect(impureAwaits.length).toBeGreaterThan(0);
+    expect(dbOnlyAwaits.length).toBeGreaterThan(0);
+    expect(impureAwaits.some((a) => a.forbidden)).toBe(true);
+    expect(dbOnlyAwaits.every((a) => !a.forbidden)).toBe(true);
+  });
+
+  it('no production centralTransaction closure awaits a forbidden subsystem', () => {
+    const offenders = awaitedCalleesInCentralTransactions(transactionCallFiles())
+      // `src/db/drivers/**` and `src/db/testing/**` ARE the driver and its
+      // upstream conformance contract, whose job is to drive nested
+      // `DbDriver.transaction`; both are byte-identical ports pinned elsewhere.
+      .filter((a) => a.forbidden && !isExcluded(a.file))
+      .map((a) => `${a.file}:${a.line} awaits ${a.callee}`);
+    expect(
+      offenders,
+      'a centralTransaction closure awaits a mailbox/container/adapter/network/lease call. The driver runs ' +
+        'each statement synchronously on the shared handle, so that await inside the open BEGIN IMMEDIATE fires ' +
+        'from a suspended continuation — after a rollback, or joining an unrelated transaction. Move the effect ' +
+        'after the transaction resolves. See plan §4.4.',
+    ).toEqual([]);
   });
 });

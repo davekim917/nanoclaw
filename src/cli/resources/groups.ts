@@ -17,7 +17,8 @@ import { buildAgentGroupImage, killContainer } from '../../container-runner.js';
 import { restartAgentGroupContainers } from '../../container-restart.js';
 import { requestWake } from '../../request-wake.js';
 import { createAgentGroup, getAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
-import { getDb, getRawDb, hasTable } from '../../db/connection.js';
+import { centralTransaction } from '../../db/central-lease.js';
+import { getDb, hasTable } from '../../db/connection.js';
 import { insertOrAdopt } from '../../db/insert-or-adopt.js';
 import { getSession } from '../../db/sessions.js';
 import { writeSessionMessage } from '../../session-manager.js';
@@ -229,34 +230,30 @@ registerResource({
         const hasPendingApprovals = await hasTable(getDb(), 'pending_approvals');
         const hasWorkgroups = await hasTable(getDb(), 'workgroups');
 
-        // The transaction below stays on the RAW synchronous handle
-        // deliberately (seam 3 §4.2 — a fork transaction converts to the
-        // driver only in PR 6, all ten sites at once); only fetched now,
-        // right before it, since everything above this line already moved
-        // to the async driver.
-        const db = getRawDb();
+        const db = getDb();
 
-        // FK-ordered cascade. Single sync IMMEDIATE transaction — better-sqlite3
-        // rolls back the whole thing if any statement throws (e.g. an FK
-        // constraint we missed), so the central DB stays consistent. IMMEDIATE
-        // grabs the writer lock up front so a parallel INSERT into
+        // FK-ordered cascade. One central transaction (`centralTransaction`,
+        // plan §4.4) — the driver rolls back the whole thing if any statement
+        // throws (e.g. an FK constraint we missed), so the central DB stays
+        // consistent. The driver opens it IMMEDIATE, so a parallel INSERT into
         // agent_groups between the sibling-refuse check and the dependent
-        // DELETEs can't slip through and surface as a FK error.
+        // DELETEs can't slip through and surface as a FK error. The closure is
+        // DB-only: driver statements, awaited in sequence.
         //
         // The `removed` counts are sourced from each DELETE's `changes` so
         // they describe exactly what the transaction did, not a separate
         // pre-flight snapshot.
-        const cascade = db.transaction((groupId: string) => {
+        const cascade = async (groupId: string) => {
           // The AUTHORITATIVE existence check — repeated here, inside the
           // transaction, because the awaited one above can go stale between
           // two overlapping deletes for the same id. Without this, the
           // second caller runs the whole cascade below against a row that's
           // already gone: every DELETE matches 0 rows, and the handler would
           // return `{ deleted: id, removed: {...all zeros} }` as if it had
-          // succeeded. IMMEDIATE (below, at `.immediate(id)`) has already
-          // taken the writer lock by the time this runs, so nothing can
-          // delete the row out from under this check before the DELETEs run.
-          if (!db.prepare('SELECT 1 FROM agent_groups WHERE id = ?').get(groupId)) {
+          // succeeded. The driver opens the transaction IMMEDIATE, so the
+          // writer lock is held by the time this runs and nothing can delete
+          // the row out from under this check before the DELETEs run.
+          if (!(await db.get('SELECT 1 FROM agent_groups WHERE id = ?', groupId))) {
             throw new Error(`group not found: ${groupId}`);
           }
           // Pre-flight: refuse to delete a paired sibling. A workgroup is the
@@ -267,13 +264,16 @@ registerResource({
           // sibling workgroup_id = NULL) or migrate the twin before retrying.
           let workgroupIdToCleanup: string | null = null;
           if (hasWorkgroups) {
-            const ag = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').get(groupId) as
-              | { workgroup_id: string | null }
-              | undefined;
+            const ag = await db.get<{ workgroup_id: string | null }>(
+              'SELECT workgroup_id FROM agent_groups WHERE id = ?',
+              groupId,
+            );
             if (ag?.workgroup_id) {
-              const siblings = db
-                .prepare(`SELECT id, folder FROM agent_groups WHERE workgroup_id = ? AND id != ?`)
-                .all(ag.workgroup_id, groupId) as Array<{ id: string; folder: string }>;
+              const siblings = await db.all<{ id: string; folder: string }>(
+                `SELECT id, folder FROM agent_groups WHERE workgroup_id = ? AND id != ?`,
+                ag.workgroup_id,
+                groupId,
+              );
               if (siblings.length > 0) {
                 throw new Error(
                   `group ${groupId} is paired in workgroup ${ag.workgroup_id} with ${siblings.length} sibling(s): ` +
@@ -304,74 +304,79 @@ registerResource({
           };
 
           if (hasAgentDestinations) {
-            counts.agent_destinations_owned = db
-              .prepare('DELETE FROM agent_destinations WHERE agent_group_id = ?')
-              .run(groupId).changes;
-            counts.agent_destinations_pointing = db
-              .prepare('DELETE FROM agent_destinations WHERE target_type = ? AND target_id = ?')
-              .run('agent', groupId).changes;
+            counts.agent_destinations_owned = (
+              await db.run('DELETE FROM agent_destinations WHERE agent_group_id = ?', groupId)
+            ).changes;
+            counts.agent_destinations_pointing = (
+              await db.run('DELETE FROM agent_destinations WHERE target_type = ? AND target_id = ?', 'agent', groupId)
+            ).changes;
           }
-          counts.pending_questions = db
-            .prepare(
+          counts.pending_questions = (
+            await db.run(
               'DELETE FROM pending_questions WHERE session_id IN (SELECT id FROM sessions WHERE agent_group_id = ?)',
+              groupId,
             )
-            .run(groupId).changes;
+          ).changes;
           // The ncl execution ledger (src/cli/request-ledger.ts) retains its
           // newest claim per session on a terminal signal, not a clock, so a
           // deleted session's claim would otherwise never expire. Must run
           // before the sessions delete below — it resolves them by subquery.
-          counts.cli_request_executions = db
-            .prepare(
+          counts.cli_request_executions = (
+            await db.run(
               'DELETE FROM cli_request_executions WHERE session_id IN (SELECT id FROM sessions WHERE agent_group_id = ?)',
+              groupId,
             )
-            .run(groupId).changes;
+          ).changes;
           // Delivery retry counts (migration 071) are keyed to the session and
           // have no cascading foreign key. Nothing clears an orphan afterwards:
           // the row is only ever cleared by a delivery loop for a session that
           // no longer exists. Must run before the sessions delete below — it
           // resolves them by subquery.
-          counts.delivery_attempts = db
-            .prepare(
+          counts.delivery_attempts = (
+            await db.run(
               'DELETE FROM delivery_attempts WHERE session_id IN (SELECT id FROM sessions WHERE agent_group_id = ?)',
+              groupId,
             )
-            .run(groupId).changes;
+          ).changes;
           if (hasPendingApprovals) {
-            counts.pending_approvals = db
-              .prepare(
+            counts.pending_approvals = (
+              await db.run(
                 'DELETE FROM pending_approvals WHERE agent_group_id = ? OR session_id IN (SELECT id FROM sessions WHERE agent_group_id = ?)',
+                groupId,
+                groupId,
               )
-              .run(groupId, groupId).changes;
+            ).changes;
           }
-          counts.sessions = db.prepare('DELETE FROM sessions WHERE agent_group_id = ?').run(groupId).changes;
-          counts.pending_sender_approvals = db
-            .prepare('DELETE FROM pending_sender_approvals WHERE agent_group_id = ?')
-            .run(groupId).changes;
-          counts.pending_channel_approvals = db
-            .prepare('DELETE FROM pending_channel_approvals WHERE agent_group_id = ?')
-            .run(groupId).changes;
-          counts.messaging_group_agents = db
-            .prepare('DELETE FROM messaging_group_agents WHERE agent_group_id = ?')
-            .run(groupId).changes;
-          counts.agent_group_members = db
-            .prepare('DELETE FROM agent_group_members WHERE agent_group_id = ?')
-            .run(groupId).changes;
-          counts.user_roles = db.prepare('DELETE FROM user_roles WHERE agent_group_id = ?').run(groupId).changes;
+          counts.sessions = (await db.run('DELETE FROM sessions WHERE agent_group_id = ?', groupId)).changes;
+          counts.pending_sender_approvals = (
+            await db.run('DELETE FROM pending_sender_approvals WHERE agent_group_id = ?', groupId)
+          ).changes;
+          counts.pending_channel_approvals = (
+            await db.run('DELETE FROM pending_channel_approvals WHERE agent_group_id = ?', groupId)
+          ).changes;
+          counts.messaging_group_agents = (
+            await db.run('DELETE FROM messaging_group_agents WHERE agent_group_id = ?', groupId)
+          ).changes;
+          counts.agent_group_members = (
+            await db.run('DELETE FROM agent_group_members WHERE agent_group_id = ?', groupId)
+          ).changes;
+          counts.user_roles = (await db.run('DELETE FROM user_roles WHERE agent_group_id = ?', groupId)).changes;
           // migration-014 has ON DELETE CASCADE on container_configs.agent_group_id;
           // the explicit delete here mirrors the other tables and surfaces the count.
-          counts.container_configs = db
-            .prepare('DELETE FROM container_configs WHERE agent_group_id = ?')
-            .run(groupId).changes;
-          db.prepare('DELETE FROM agent_groups WHERE id = ?').run(groupId);
+          counts.container_configs = (
+            await db.run('DELETE FROM container_configs WHERE agent_group_id = ?', groupId)
+          ).changes;
+          await db.run('DELETE FROM agent_groups WHERE id = ?', groupId);
           // Clean up the now-orphan workgroup row (only set when no siblings
           // existed at pre-flight; the sibling-refuse path above never reaches
           // this point). Done last so the FK from agent_groups.workgroup_id is
           // already gone.
           if (workgroupIdToCleanup) {
-            counts.workgroups = db.prepare('DELETE FROM workgroups WHERE id = ?').run(workgroupIdToCleanup).changes;
+            counts.workgroups = (await db.run('DELETE FROM workgroups WHERE id = ?', workgroupIdToCleanup)).changes;
           }
           return counts;
-        });
-        const removed = cascade.immediate(id);
+        };
+        const removed = await centralTransaction(() => cascade(id), 'ncl groups delete');
 
         return { deleted: id, removed };
       },

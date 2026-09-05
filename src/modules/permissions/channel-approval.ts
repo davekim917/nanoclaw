@@ -304,7 +304,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     return false;
   }
 
-  const originMg = getMessagingGroup(messagingGroupId);
+  const originMg = await getMessagingGroup(messagingGroupId);
   const originChannelType = originMg?.channel_type ?? '';
 
   // Classify the conversation once, and reuse it for both the persisted name

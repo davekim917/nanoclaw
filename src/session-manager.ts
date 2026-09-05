@@ -22,6 +22,7 @@ import { DATA_DIR } from './config.js';
 import { assertChannelRoutingConsistency } from './delivery.js';
 import { ensureContainedInboxDir, isPathInside } from './inbox-safety.js';
 import { acquireStorageActivityLease } from './storage-activity.js';
+import { evaluateGuardSync, withCentralSync } from './db/central-lease.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { resolveSessionServicesCentral, type SessionServicesCentral } from './capabilities.js';
 import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
@@ -605,7 +606,7 @@ export async function writeSessionRouting(agentGroupId: string, sessionId: strin
     let channelType: string | null = null;
     let platformId: string | null = null;
     if (session.messaging_group_id) {
-      const mg = getMessagingGroup(session.messaging_group_id);
+      const mg = await getMessagingGroup(session.messaging_group_id);
       if (mg) {
         channelType = mg.channel_type;
         platformId = mg.platform_id;
@@ -949,14 +950,19 @@ export class SessionWriteRefusedError extends Error {
 /**
  * Evaluate a guard and normalize its answer.
  *
- * Called ONLY from inside the mailbox action, with nothing awaited between here
- * and the insert.
+ * Called ONLY from inside a `withCentralSync` block — the one wrapping the
+ * mailbox insert action, with nothing awaited between here and the insert,
+ * and the pre-extract ask. `evaluateGuardSync` is the runtime half of the
+ * guard contract (seam 3 §4.5 I-1): a guard that hands back a promise — cast,
+ * or accidentally `async` — is a contract violation, not a verdict, and it is
+ * reported as a refusal so the caller's `SessionWriteRefusedError` contract
+ * ("nothing was written") holds for it too.
  */
 function refusalFrom(guard: WriteGuard | undefined): string | null {
   if (!guard) return null;
   let verdict: WriteGuardResult;
   try {
-    verdict = guard();
+    verdict = evaluateGuardSync(guard);
   } catch (err) {
     // A THROWN guard is a refusal. Letting it propagate out of the mailbox
     // action would surface as the funnel's own error rather than a refusal,
@@ -1111,8 +1117,8 @@ async function writeSessionMessageLocked(
   //
   // Cheap to ask twice: the guard is synchronous by contract, and the second
   // ask inside the insert is the one that closes the window this function's own
-  // awaits open.
-  const refusedBeforeExtract = refusalFrom(guard);
+  // awaits open. Under the lease, because the guard's reads are raw.
+  const refusedBeforeExtract = await withCentralSync(() => refusalFrom(guard), 'write guard before extract');
   if (refusedBeforeExtract !== null) {
     log.warn('Session write refused by its guard before extracting attachments', {
       agentGroupId,
@@ -1177,18 +1183,26 @@ async function writeSessionMessageLocked(
 
   // THE GUARD POINT. Inside the mailbox action, after every await this function
   // performs — the storage-activity lease, the reclaim-journal import, the
-  // provider read, the funnel's own open — and with nothing awaited between it
-  // and the insert below. A caller's precondition proved out here is proved at
-  // the instant the row lands, which is the only instant that matters. The
-  // action is deliberately NOT async: the funnel admits promises, and a yield
-  // between the guard and the insert would reopen exactly the window this
-  // closes.
+  // provider read, the funnel's own open, the central lease — and with nothing
+  // awaited between it and the insert below. A caller's precondition proved
+  // out here is proved at the instant the row lands, which is the only instant
+  // that matters. The block handed to `withCentralSync` is deliberately NOT
+  // async: the funnel admits promises, and a yield between the guard and the
+  // insert would reopen exactly the window this closes — `withCentralSync`
+  // refuses a promise-returning block at runtime, and
+  // `src/db/central-lease.test.ts` pins that no `await` sits between
+  // `evaluateGuardSync` and the insert inside it.
+  //
+  // The lease is taken AROUND the mailbox action, not inside it (plan §4.1):
+  // the guard's reads are raw, and the lease is what keeps them out of an
+  // open driver transaction. A sync block never has to REFUSE a legitimate
+  // write because a transaction happened to be open — it waits its turn.
   //
   // The refusal is carried out rather than thrown from inside the action: the
   // mailbox session should close normally, and the caller's error is raised
   // once, after it does.
   let refusedReason: string | null = null;
-  const insert = (mailbox: NanoclawMailboxSession): boolean => {
+  const insertUnderLease = (mailbox: NanoclawMailboxSession): boolean => {
     refusedReason = refusalFrom(guard);
     if (refusedReason !== null) return false;
     const recallRow =
@@ -1197,6 +1211,8 @@ async function writeSessionMessageLocked(
     mailbox.insertMessageWithContext(row, recallRow);
     return true;
   };
+  const insert = (mailbox: NanoclawMailboxSession): Promise<boolean> =>
+    withCentralSync(() => insertUnderLease(mailbox), 'writeSessionMessage insert');
   const inserted =
     (await withExistingMailboxSession(agentGroupId, sessionId, insert)) ??
     (await withMailboxSession(agentGroupId, sessionId, insert));

@@ -17,12 +17,13 @@
  * outcome. Policy rows can only tighten (hold), never allow: absence of a
  * row falls through to the structural checks.
  */
+import type { AgentMessagePolicy } from '../../types.js';
 import { AGENT_GROUP_BY_ID_SQL } from '../../db/agent-groups.js';
-import { getRawDb } from '../../db/connection.js';
+import { withRawDb } from '../../db/central-lease.js';
 import { CONTAINER_CONFIG_BY_GROUP_SQL } from '../../db/container-configs.js';
 import { ALLOW, DENY, HOLD, defineGuardedAction } from '../../guard/index.js';
-import { hasDestination } from './db/agent-destinations.js';
-import { getMessagePolicy } from './db/agent-message-policies.js';
+import { AGENT_DESTINATION_EXISTS_SQL } from './db/agent-destinations.js';
+import { AGENT_MESSAGE_POLICY_BY_PAIR_SQL } from './db/agent-message-policies.js';
 
 /**
  * pending_approvals action string for held a2a messages. Lives here (not in
@@ -73,14 +74,21 @@ export const a2aSend = defineGuardedAction({
     const from = input.actor.agentGroupId;
     const to = input.resource?.to ?? '';
     const isSelf = to === from;
-    if (!isSelf && !hasDestination(from, 'agent', to)) {
+    // Synchronous by design (seam-3 plan §4.5, I-1): this decide runs inside
+    // the agent-route WriteGuard — itself inside `writeSessionMessage`'s
+    // `withCentralSync` block, with nothing awaited between it and the insert
+    // — so it never awaits. Its central reads execute the leaves' exported
+    // SQL constants through `withRawDb`, not the leaves' async exports.
+    if (!isSelf && withRawDb((raw) => raw.prepare(AGENT_DESTINATION_EXISTS_SQL).get(from, 'agent', to)) === undefined) {
       return DENY(`unauthorized agent-to-agent: ${from} has no destination for ${to}`);
     }
-    if (getRawDb().prepare(AGENT_GROUP_BY_ID_SQL).get(to) === undefined) {
+    if (withRawDb((raw) => raw.prepare(AGENT_GROUP_BY_ID_SQL).get(to)) === undefined) {
       return DENY(`target agent group ${to} not found for message ${String(input.payload.id)}`);
     }
     if (isSelf) return ALLOW('self-send');
-    const policy = getMessagePolicy(from, to);
+    const policy = withRawDb((raw) => raw.prepare(AGENT_MESSAGE_POLICY_BY_PAIR_SQL).get(from, to)) as
+      | AgentMessagePolicy
+      | undefined;
     if (policy) {
       return HOLD(`a2a message policy ${from}→${to} holds for ${policy.approver}`, policy.approver);
     }
@@ -88,13 +96,11 @@ export const a2aSend = defineGuardedAction({
   },
 });
 
-// Synchronous by design (seam-3 plan §4.5, I-1): this decision runs inside
-// callers' guard-adjacent blocks — `guard(a2aSend)` inside the agent-route
-// WriteGuard, `guard(threadsClose)` inside thread-close's one synchronous
-// decision — so it never awaits. Its central reads use the leaf's exported SQL
-// on the raw handle; PR 6 wraps them in `withRawDb` inside `withCentralSync`.
+// Synchronous by design (seam-3 plan §4.5, I-1): runs inside the consult
+// site's `withCentralSync` block and never awaits. The central read executes
+// the leaf's exported SQL through `withRawDb`.
 function cliScopeOf(agentGroupId: string): string {
-  const row = getRawDb().prepare(CONTAINER_CONFIG_BY_GROUP_SQL).get(agentGroupId) as
+  const row = withRawDb((raw) => raw.prepare(CONTAINER_CONFIG_BY_GROUP_SQL).get(agentGroupId)) as
     | { cli_scope: string | null }
     | undefined;
   return row?.cli_scope ?? 'group';

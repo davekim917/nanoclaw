@@ -673,7 +673,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
         await insertOrAdopt(
           wiring,
           async (candidate) => {
-            createMessagingGroupAgent(candidate);
+            await createMessagingGroupAgent(candidate);
           },
           async () => (await getMessagingGroupAgents(mg.id)).find((w) => w.agent_group_id === inheritedAgent.id),
         );

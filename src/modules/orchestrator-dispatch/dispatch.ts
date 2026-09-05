@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 
 import { getChannelAdapter } from '../../channels/channel-registry.js';
+import { centralTransaction } from '../../db/central-lease.js';
 import { getDb, getRawDb } from '../../db/connection.js';
 // Lazy import to avoid module-init cycle (events.ts imports nothing from dispatch.ts).
 // The import() call is memoized by Node's module cache after the first resolution.
@@ -87,25 +88,35 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
   const capConfig =
     (await getCapabilityConfig(callerSession.agent_group_id, 'orchestrator')) ?? DEFAULT_CAPABILITY_CONFIG;
 
-  // All admission steps inside a single better-sqlite3 transaction. Seam 3
-  // keeps this ONE raw transaction (and only it) on `getRawDb()`: it is one of
-  // the eleven central sites `src/db/transaction-closures.test.ts` pins, and it
-  // converts to `centralTransaction` in PR 6 together with the leaf exports its
-  // closure calls. Every non-transactional statement in this file is on the
-  // async driver.
-  //
-  // Use IMMEDIATE (write lock from BEGIN) instead of DEFERRED (default) so the
-  // cap-count read holds the write lock through the INSERT — prevents two parallel
-  // delivery drains from the same orchestrator both reading the same count, both
-  // passing the cap check, and both succeeding INSERT (cap exceeded). Cycle-3
-  // S3-C / Concurrency-reviewer #5.
-  const db = getRawDb();
+  // Surface mode — per-channel capability check (cycle-3 S24). Resolved BEFORE
+  // the admission transaction: it reads the messaging group (whose channel
+  // type never changes) and consults the in-memory adapter registry, and a
+  // central transaction closure is DB-only (plan §4.4) — no adapter lookups
+  // inside it.
+  let surfaceMode: 'native_thread' | 'headless' = 'headless';
+  if (callerSession.messaging_group_id !== null) {
+    const mg = await getMessagingGroup(callerSession.messaging_group_id);
+    if (mg) {
+      const adapter = getChannelAdapter(mg.channel_type);
+      if (adapter && typeof adapter.createThread === 'function') {
+        surfaceMode = 'native_thread';
+      }
+    }
+  }
+
+  // All admission steps inside a single central transaction. The driver opens
+  // it IMMEDIATE (write lock from BEGIN) so the cap-count read holds the write
+  // lock through the INSERT — prevents two parallel delivery drains from the
+  // same orchestrator both reading the same count, both passing the cap check,
+  // and both succeeding INSERT (cap exceeded). Cycle-3 S3-C /
+  // Concurrency-reviewer #5. The closure is DB-only: every notification, wake
+  // and dashboard event below runs after commit, never after a rollback.
   let taskRow: Task | null = null;
   let replayResult: { message: string } | null = null;
 
-  db.transaction(() => {
+  await centralTransaction(async () => {
     // Step 1: Idempotency replay PRECEDES cap (cycle-3 M20)
-    const existingByIdempotency = getTaskByParentAndIdempotency(callerSession.id, idempotencyKey);
+    const existingByIdempotency = await getTaskByParentAndIdempotency(callerSession.id, idempotencyKey);
     if (existingByIdempotency) {
       const computedHash = computeRequestHash(taskContent, deadline);
       if (existingByIdempotency.request_hash !== computedHash) {
@@ -119,7 +130,7 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
     }
 
     // Step 2: Concurrency cap — only for NEW admissions
-    const activeCount = countActiveByParent(callerSession.id);
+    const activeCount = await countActiveByParent(callerSession.id);
     if (activeCount >= capConfig.concurrencyCap) {
       replayResult = {
         message: `spawn rejected: concurrency cap reached (${activeCount}/${capConfig.concurrencyCap})`,
@@ -130,22 +141,12 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
     // Step 3: Compute request_hash
     const requestHash = computeRequestHash(taskContent, deadline);
 
-    // Step 4: Determine surface_mode — per-channel capability check (cycle-3 S24)
-    let surfaceMode: 'native_thread' | 'headless' = 'headless';
-    if (callerSession.messaging_group_id !== null) {
-      const mg = getMessagingGroup(callerSession.messaging_group_id);
-      if (mg) {
-        const adapter = getChannelAdapter(mg.channel_type);
-        if (adapter && typeof adapter.createThread === 'function') {
-          surfaceMode = 'native_thread';
-        }
-      }
-    }
+    // Step 4: surface_mode was resolved above, before the transaction.
 
     // Step 5: Atomic INSERT
     const taskId = deriveSpawnTaskId(callerSession.id, idempotencyKey);
     const now = new Date().toISOString();
-    taskRow = insertTaskAtomic({
+    taskRow = await insertTaskAtomic({
       task_id: taskId,
       idempotency_key: idempotencyKey,
       parent_session_id: callerSession.id,
@@ -175,7 +176,7 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
 
     // Parallel admit race: if INSERT returned null, SELECT the winner
     if (taskRow === null) {
-      taskRow = getTaskByParentAndIdempotency(callerSession.id, idempotencyKey);
+      taskRow = await getTaskByParentAndIdempotency(callerSession.id, idempotencyKey);
       if (taskRow) {
         replayResult = {
           message: `Task already exists (parallel admit): task_id=${taskRow.task_id} status=${taskRow.status}`,
@@ -183,7 +184,7 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
         taskRow = null;
       }
     }
-  }).immediate();
+  }, 'applySpawnTask');
 
   // Post-transaction handling
   // TypeScript doesn't track mutation through the transaction callback,
@@ -306,7 +307,7 @@ async function _runThreadedPath(task: Task, childAgentGroupId: string): Promise<
 
   // Resolve adapter — if adapter no longer has createThread, mark failed immediately
   // (adapter_unavailable does NOT consume retry budget — cycle-3 fix / Codex #43)
-  const mg = task.parent_messaging_group_id ? getMessagingGroup(task.parent_messaging_group_id) : undefined;
+  const mg = task.parent_messaging_group_id ? await getMessagingGroup(task.parent_messaging_group_id) : undefined;
   if (!mg) {
     transitionToTerminal(taskId, 'failed', {
       fail_reason: 'adapter_unavailable',

@@ -42,21 +42,16 @@ const SELF = 'src/db/raw-db-ratchet.test.ts';
 const NOT_CALLERS: readonly string[] = [DEFINER, SELF];
 
 /**
- * Every file referencing `getRawDb` or `hasTableRaw` as of seam 3 PR 1.
- * A PR may delete entries. Adding one fails this test.
+ * Every file referencing `getRawDb` or `hasTableRaw`, shrink-only.
  *
- * Four entries were ADDED by PR 4 (the big-four leaf flip) and are the plan's
- * own allowlist, not growth of the transitional seam (§4.5, I-1): the guard
- * decision seam (`src/guard/guard.ts`, `src/cli/guard.ts`,
- * `src/modules/agent-to-agent/guard.ts`) is evaluated inside callers'
- * guard-adjacent synchronous blocks, so it never awaits and reads the central
- * DB through the leaves' exported SQL; `write-destinations.ts` resolves its
- * three central reads inside the mailbox action immediately before a
- * REPLACE-shaped write. PR 6 wraps each of them in `withRawDb` inside
- * `withCentralSync` and pins the terminal set. Two TEST files joined with
- * them: `guard/guard.test.ts` stubs the raw handle the sync guard now reads,
- * and `db/sessions.test.ts` drops module tables through it to pin the
- * `hasTable` early return.
+ * PR 6 removed the guard-path files from this list: the three guard
+ * implementations (`guard/guard.ts`, `cli/guard.ts`,
+ * `agent-to-agent/guard.ts`), `write-destinations.ts` and the wake/write
+ * guard reads in `container-runner.ts`/`session-manager.ts` now reach the
+ * central DB through `withRawDb` inside `withCentralSync` (the lease that
+ * keeps a synchronous central read out of an open driver transaction), and the
+ * eleven central `db.transaction` closures now go through `centralTransaction`
+ * — so those files no longer name `getRawDb`.
  *
  * `src/test-fixtures/raw-db-fake.ts` is the one further entry, and it exists to
  * KEEP this list small: every test whose subject reaches the sync guard path
@@ -143,7 +138,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/cli/crud.test.ts',
   'src/cli/crud.ts',
   'src/cli/delivery-action.test.ts',
-  'src/cli/guard.ts',
   'src/cli/request-ledger.test.ts',
   'src/cli/resources/destinations.test.ts',
   'src/cli/resources/groups-create-adopt.test.ts',
@@ -155,7 +149,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/cli/resources/tasks.ts',
   'src/cli/resources/usage.test.ts',
   'src/cli/resources/wirings.test.ts',
-  'src/cli/resources/wirings.ts',
   'src/command-gate.test.ts',
   'src/container-config.test.ts',
   'src/container-runner.test.ts',
@@ -199,24 +192,18 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/db/denied-models.ts',
   'src/db/index.ts',
   'src/db/messaging-groups-instance.test.ts',
-  'src/db/messaging-groups.ts',
   'src/db/migrations/068-sessions-sweep-quiet-until.test.ts',
   'src/db/provider-health.test.ts',
-  'src/db/provider-health.ts',
   'src/db/scheduled-tasks.test.ts',
-  'src/db/scheduled-tasks.ts',
   'src/db/sessions.test.ts',
-  'src/db/sessions.ts',
   'src/db/support-threads.ts',
   'src/db/task-thread-anchors.ts',
   'src/db/thread-titles.ts',
   'src/db/usage.test.ts',
-  'src/db/usage.ts',
   'src/delivery.test.ts',
   'src/delivery.ts',
   'src/group-init.settings.test.ts',
   'src/guard/guard.test.ts',
-  'src/guard/guard.ts',
   'src/host-core.test.ts',
   'src/host-lifecycle-timers.test.ts',
   'src/host-sweep.test.ts',
@@ -224,14 +211,12 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/main.ts',
   'src/modules/agent-to-agent/agent-route-parity.test.ts',
   'src/modules/agent-to-agent/agent-route.test.ts',
-  'src/modules/agent-to-agent/agent-route.ts',
   'src/modules/agent-to-agent/create-agent.test.ts',
   'src/modules/agent-to-agent/db/agent-destinations.ts',
   'src/modules/agent-to-agent/db/agent-message-policies.ts',
   'src/modules/agent-to-agent/guard.ts',
   'src/modules/agent-to-agent/message-gate.test.ts',
   'src/modules/agent-to-agent/write-destinations.test.ts',
-  'src/modules/agent-to-agent/write-destinations.ts',
   'src/modules/approvals/approval-resolved.test.ts',
   'src/modules/approvals/onecli-approvals.test.ts',
   'src/modules/approvals/picks.test.ts',

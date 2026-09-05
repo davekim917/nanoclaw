@@ -1,4 +1,4 @@
-import { getRawDb } from '../../../db/connection.js';
+import { getDb, getRawDb } from '../../../db/connection.js';
 import { log } from '../../../log.js';
 import type { Session } from '../../../types.js';
 
@@ -49,7 +49,14 @@ const ALLOWED_ARTIFACT_COLUMNS = new Set([
 type TaskInsert = Omit<Task, 'created_at' | 'needs_input' | 'steer_question' | 'archived_at'> &
   Partial<Pick<Task, 'needs_input' | 'steer_question' | 'archived_at'>>;
 
-export function insertTaskAtomic(row: TaskInsert): Task | null {
+/**
+ * Seam 3 PR 6: the three exports `applySpawnTask`'s admission transaction
+ * calls — `insertTaskAtomic`, `getTaskByParentAndIdempotency`,
+ * `countActiveByParent` — are on the async driver, because a
+ * `centralTransaction` closure may await driver statements and nothing else
+ * (plan §4.4). The rest of this leaf converts with its importers in PR 5b.
+ */
+export async function insertTaskAtomic(row: TaskInsert): Promise<Task | null> {
   const createdAt = new Date().toISOString();
   const params = {
     ...row,
@@ -58,9 +65,8 @@ export function insertTaskAtomic(row: TaskInsert): Task | null {
     archived_at: row.archived_at ?? null,
     created_at: createdAt,
   };
-  const result = getRawDb()
-    .prepare(
-      `INSERT INTO tasks (
+  const result = await getDb().get<Task>(
+    `INSERT INTO tasks (
         task_id, idempotency_key, parent_session_id, parent_agent_group_id,
         parent_messaging_group_id, child_session_id,
         status, task_content, request_hash, deadline, parent_platform_message_id,
@@ -81,8 +87,8 @@ export function insertTaskAtomic(row: TaskInsert): Task | null {
       )
       ON CONFLICT(parent_session_id, idempotency_key) DO NOTHING
       RETURNING *`,
-    )
-    .get(params) as Task | undefined;
+    params,
+  );
 
   return result ?? null;
 }
@@ -91,11 +97,16 @@ export function getTaskById(id: string): Task | null {
   return (getRawDb().prepare(`SELECT * FROM tasks WHERE task_id = ?`).get(id) as Task | undefined) ?? null;
 }
 
-export function getTaskByParentAndIdempotency(parentSessionId: string, idempotencyKey: string): Task | null {
+export async function getTaskByParentAndIdempotency(
+  parentSessionId: string,
+  idempotencyKey: string,
+): Promise<Task | null> {
   return (
-    (getRawDb()
-      .prepare(`SELECT * FROM tasks WHERE parent_session_id = ? AND idempotency_key = ?`)
-      .get(parentSessionId, idempotencyKey) as Task | undefined) ?? null
+    (await getDb().get<Task>(
+      `SELECT * FROM tasks WHERE parent_session_id = ? AND idempotency_key = ?`,
+      parentSessionId,
+      idempotencyKey,
+    )) ?? null
   );
 }
 
@@ -331,12 +342,11 @@ export function autoArchiveCompletedBefore(cutoffIso: string, archivedAt: string
   return result.changes;
 }
 
-export function countActiveByParent(parentSessionId: string): number {
-  const row = getRawDb()
-    .prepare(
-      `SELECT COUNT(*) as cnt FROM tasks
+export async function countActiveByParent(parentSessionId: string): Promise<number> {
+  const row = await getDb().get<{ cnt: number }>(
+    `SELECT COUNT(*) as cnt FROM tasks
         WHERE parent_session_id = ? AND status IN ('pending', 'running')`,
-    )
-    .get(parentSessionId) as { cnt: number };
-  return row.cnt;
+    parentSessionId,
+  );
+  return row?.cnt ?? 0;
 }

@@ -10,6 +10,7 @@
  * the `MODULE-HOOK:scheduling-recurrence` marker) via a dynamic import of
  * this file.
  */
+import { withCentralSync } from '../../db/central-lease.js';
 import { withQuietInvalidationSync } from '../../db/sessions.js';
 import { CronExpressionParser } from 'cron-parser';
 
@@ -131,8 +132,12 @@ export async function handleRecurrence(mailbox: NanoclawMailboxSession, session:
         // series in place; leave the why in the run log. Insert + clear are
         // one transaction: a crash between them would leave the predecessor
         // still recurrence-armed next to a live successor → double-fire.
-        withQuietInvalidationSync(session.id, () =>
-          mailbox.armNextRecurrence(msg.id, msg, newId, cronNext.toISOString(), 'paused'),
+        await withCentralSync(
+          () =>
+            withQuietInvalidationSync(session.id, () =>
+              mailbox.armNextRecurrence(msg.id, msg, newId, cronNext.toISOString(), 'paused'),
+            ),
+          'recurrence re-arm paused',
         );
         await appendHostTaskNote(
           session.agent_group_id,
@@ -180,7 +185,10 @@ export async function handleRecurrence(mailbox: NanoclawMailboxSession, session:
       // column here fails that flush's `WHERE last_active IS <basis>` guard, and
       // the in-memory mark's `mark.lastActive === session.last_active` check on
       // the next tick with it.
-      withQuietInvalidationSync(session.id, () => mailbox.armNextRecurrence(msg.id, msg, newId, nextRun));
+      await withCentralSync(
+        () => withQuietInvalidationSync(session.id, () => mailbox.armNextRecurrence(msg.id, msg, newId, nextRun)),
+        'recurrence re-arm',
+      );
 
       log.info('Inserted next recurrence', {
         originalId: msg.id,

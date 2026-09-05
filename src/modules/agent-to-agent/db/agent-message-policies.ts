@@ -1,19 +1,20 @@
 /** Per-message approval policies for agent-to-agent connections; no row = free flow. */
 import type { AgentMessagePolicy } from '../../../types.js';
-import { getDb, getRawDb } from '../../../db/connection.js';
+import { getDb } from '../../../db/connection.js';
 
+/**
+ * The `getMessagePolicy` read as a constant: the `a2a.send` guard
+ * (`../guard.ts`) is synchronous by design (seam 3 §4.5 I-1) and executes this
+ * statement through `withRawDb` inside its caller's lease block.
+ */
 export const AGENT_MESSAGE_POLICY_BY_PAIR_SQL =
   'SELECT * FROM agent_message_policies WHERE from_agent_group_id = ? AND to_agent_group_id = ?';
 
-/**
- * Synchronous by design (seam-3 plan §4.5, I-1): the `a2a.send` guard in
- * `../guard.ts` consults the policy inside its `decide` body, which never
- * awaits. One form, not a `*Sync` twin; PR 6 moves it inside `withRawDb`.
- */
-export function getMessagePolicy(fromAgentGroupId: string, toAgentGroupId: string): AgentMessagePolicy | undefined {
-  return getRawDb().prepare(AGENT_MESSAGE_POLICY_BY_PAIR_SQL).get(fromAgentGroupId, toAgentGroupId) as
-    | AgentMessagePolicy
-    | undefined;
+export async function getMessagePolicy(
+  fromAgentGroupId: string,
+  toAgentGroupId: string,
+): Promise<AgentMessagePolicy | undefined> {
+  return getDb().get<AgentMessagePolicy>(AGENT_MESSAGE_POLICY_BY_PAIR_SQL, fromAgentGroupId, toAgentGroupId);
 }
 
 export async function setMessagePolicy(

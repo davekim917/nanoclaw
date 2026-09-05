@@ -57,6 +57,7 @@ import { containerOwnsOutbound, killContainer } from '../container-runner.js';
 import { getDb } from '../db/connection.js';
 import { getRawDb } from '../db/index.js';
 import { archiveSessionById, withQuietInvalidationSync } from '../db/sessions.js';
+import { withCentralSync } from '../db/central-lease.js';
 import { guard } from '../guard/index.js';
 import { log } from '../log.js';
 import {
@@ -258,61 +259,63 @@ async function writeCloseWrapUp(
     // Existing-only: the wrap-up asks a live agent to land its work, and a
     // session with no mailbox has no agent to ask. Provisioning one here would
     // author an outbound.db the host must never create (invariant I-10).
-    const inserted = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
-      // Membership and liveness, re-asked in-session. `freshVisible` was
-      // sampled once and the fan-out awaits per session, so by this iteration
-      // the snapshot can name a session that has since closed or moved off the
-      // thread. Asking an agent that is not on this thread to wrap up for it is
-      // the "who told you that?" shape this file exists to avoid, and a closed
-      // session has no one to ask. Synchronous, so nothing yields before the
-      // insert below.
-      if (!stillOnThread(session.id, threadId)) return false;
-      // Same primitive and row shape as `writeCeilingRespawn`'s `writeSystemWake`
-      // in host-sweep.ts — a deferred trigger row plus its inert recall marker,
-      // admitted by the next sweep tick with fresh context. `onWake: 0` because
-      // the container that is running RIGHT NOW is exactly who this is for; the
-      // ceiling path's `1` exists to keep a DYING container from eating its own
-      // accountability notice, which is not the situation here.
-      //
-      // Due-ness. The wrap-up is a deferred trigger row, and both the sweep's
-      // quiet cache and the delivery sweep's activity horizon key on
-      // `last_active` — a row written into a quiet session without an
-      // invalidation sits unseen until the cache expires, or indefinitely past
-      // the 7-day horizon. The wake this row triggers would bump it, but not
-      // until the wake happens; the insert-to-wake window is exactly the gap.
-      //
-      // `withQuietInvalidationSync` is the single form every due-ness write in
-      // the fork takes (`modules/scheduling/create.ts`, `recurrence.ts`,
-      // `cli/resources/tasks.ts`, `db/scheduled-tasks.ts`): the mark dies in
-      // the same synchronous turn as the row, inside the mailbox callback so
-      // no await can sit between them, and FAIL-CLOSED — the advisory bump
-      // this replaced swallowed a central-DB refusal and left the row behind a
-      // mark nothing would clear. A refusal now throws into the catch below,
-      // which logs and answers `false`, so the close simply has no wrap-up
-      // request this pass rather than a silently unseen one. A session with no
-      // ACTIVE central row is also refused, and that is right: it has no sweep
-      // to reach it.
-      const wrote = withQuietInvalidationSync(session.id, () =>
-        mailbox.insertDeferredMessageWithContextIfNew({
-          id: `${CLOSE_WAKE_ID_PREFIX}${session.id}-${requestedAt}`,
-          kind: 'chat',
-          timestamp: requestedAt,
-          platformId: session.agent_group_id,
-          channelType: 'agent',
-          threadId: null,
-          content: JSON.stringify({
-            text,
-            sender: 'system',
-            senderId: 'system',
-            _system: { kind: 'thread_close_wrap_up', thread_id: threadId },
+    const inserted = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+      withCentralSync(() => {
+        // Membership and liveness, re-asked in-session. `freshVisible` was
+        // sampled once and the fan-out awaits per session, so by this iteration
+        // the snapshot can name a session that has since closed or moved off the
+        // thread. Asking an agent that is not on this thread to wrap up for it is
+        // the "who told you that?" shape this file exists to avoid, and a closed
+        // session has no one to ask. Synchronous, so nothing yields before the
+        // insert below.
+        if (!stillOnThread(session.id, threadId)) return false;
+        // Same primitive and row shape as `writeCeilingRespawn`'s `writeSystemWake`
+        // in host-sweep.ts — a deferred trigger row plus its inert recall marker,
+        // admitted by the next sweep tick with fresh context. `onWake: 0` because
+        // the container that is running RIGHT NOW is exactly who this is for; the
+        // ceiling path's `1` exists to keep a DYING container from eating its own
+        // accountability notice, which is not the situation here.
+        //
+        // Due-ness. The wrap-up is a deferred trigger row, and both the sweep's
+        // quiet cache and the delivery sweep's activity horizon key on
+        // `last_active` — a row written into a quiet session without an
+        // invalidation sits unseen until the cache expires, or indefinitely past
+        // the 7-day horizon. The wake this row triggers would bump it, but not
+        // until the wake happens; the insert-to-wake window is exactly the gap.
+        //
+        // `withQuietInvalidationSync` is the single form every due-ness write in
+        // the fork takes (`modules/scheduling/create.ts`, `recurrence.ts`,
+        // `cli/resources/tasks.ts`, `db/scheduled-tasks.ts`): the mark dies in
+        // the same synchronous turn as the row, inside the mailbox callback so
+        // no await can sit between them, and FAIL-CLOSED — the advisory bump
+        // this replaced swallowed a central-DB refusal and left the row behind a
+        // mark nothing would clear. A refusal now throws into the catch below,
+        // which logs and answers `false`, so the close simply has no wrap-up
+        // request this pass rather than a silently unseen one. A session with no
+        // ACTIVE central row is also refused, and that is right: it has no sweep
+        // to reach it.
+        const wrote = withQuietInvalidationSync(session.id, () =>
+          mailbox.insertDeferredMessageWithContextIfNew({
+            id: `${CLOSE_WAKE_ID_PREFIX}${session.id}-${requestedAt}`,
+            kind: 'chat',
+            timestamp: requestedAt,
+            platformId: session.agent_group_id,
+            channelType: 'agent',
+            threadId: null,
+            content: JSON.stringify({
+              text,
+              sender: 'system',
+              senderId: 'system',
+              _system: { kind: 'thread_close_wrap_up', thread_id: threadId },
+            }),
+            processAfter: null,
+            recurrence: null,
+            onWake: 0,
           }),
-          processAfter: null,
-          recurrence: null,
-          onWake: 0,
-        }),
-      );
-      return wrote;
-    });
+        );
+        return wrote;
+      }, 'thread-close wrap-up'),
+    );
     return inserted ?? false;
   } catch (err) {
     log.warn('thread-close: could not write the wrap-up request', { sessionId: session.id, err });
@@ -509,10 +512,18 @@ export async function requestThreadClose(
 
   const proposalsBySession = new Map(freshVisible.map((s) => [s.id, sampled.get(s.id) != null] as const));
 
-  const decision = decideClosure(freshVisible, proposalsBySession, confirmations, {
-    userId: ctx.user.id,
-    threadId,
-  });
+  // Under the central lease: `guard()`'s reads are raw by design (seam 3
+  // §4.5 I-1). The reservation below is its own CAS (`WHERE state = 'closed'`),
+  // so the lease hop between the decision and the write changes nothing about
+  // who wins a race — the row does.
+  const decision = await withCentralSync(
+    () =>
+      decideClosure(freshVisible, proposalsBySession, confirmations, {
+        userId: ctx.user.id,
+        threadId,
+      }),
+    'thread close decision',
+  );
   if (decision.outcome === 'confirmation-required') {
     return {
       status: 409,

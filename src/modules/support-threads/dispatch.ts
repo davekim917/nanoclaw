@@ -254,7 +254,7 @@ async function dispatchSupportIssue(
 ): Promise<void> {
   const taskContext = await getSupportTaskContext(session);
   const mg = session.messaging_group_id
-    ? getMessagingGroup(session.messaging_group_id)
+    ? await getMessagingGroup(session.messaging_group_id)
     : taskContext
       ? await getMessagingGroupByPlatform(taskContext.channelType, taskContext.platformId)
       : undefined;
@@ -428,7 +428,7 @@ export async function handleUpdateSupportTicket(content: Record<string, unknown>
   // Best-effort announcement edit — recompose the full announcement (subject +
   // sender are stored on the row) so the parent message now shows the ticket id.
   if (row.slack_parent_msg_id && row.messaging_group_id) {
-    const mg = getMessagingGroup(row.messaging_group_id);
+    const mg = await getMessagingGroup(row.messaging_group_id);
     const adapter = mg ? getChannelAdapter(mg.channel_type) : undefined;
     if (mg && adapter) {
       const text = announcementText(

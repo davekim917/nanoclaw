@@ -8,6 +8,7 @@
  */
 import { randomUUID } from 'crypto';
 
+import { centralTransaction } from '../db/central-lease.js';
 import { getDb, getRawDb } from '../db/connection.js';
 import { insertOrAdopt } from '../db/insert-or-adopt.js';
 import { renderVerbHelp } from './help-render.js';
@@ -120,7 +121,7 @@ export interface ResourceDef {
    * whose column combinations need cross-checks — a partial update must not
    * be able to produce a combination `create` would have rejected.
    */
-  preUpdate?: (updates: Record<string, unknown>, current: Record<string, unknown>) => void;
+  preUpdate?: (updates: Record<string, unknown>, current: Record<string, unknown>) => void | Promise<void>;
   /**
    * Runs after a successful `create` INSERT, with the row that was just
    * written. Used to wire in side effects that the central row alone
@@ -129,14 +130,15 @@ export interface ResourceDef {
    * wiring is added. The hook receives the same `values` object that was
    * inserted, so generated fields like `id` and `created_at` are populated.
    */
-  postCreate?: (row: Record<string, unknown>) => void;
+  postCreate?: (row: Record<string, unknown>) => void | Promise<void>;
   /**
    * Runs AFTER the create transaction has committed, with the row that was
    * written. Use this — not `postCreate` — for side effects that live
    * OUTSIDE the central DB (filesystem writes, projecting rows into a
-   * running agent's session `inbound.db`) or that are async: those must not
-   * sit inside the better-sqlite3 transaction, which only covers central-DB
-   * statements and is synchronous.
+   * running agent's session `inbound.db`): the create transaction is a
+   * `centralTransaction` whose closure may await driver statements and
+   * nothing else (plan §4.4), so `postCreate` is for central-DB companion
+   * rows only, and anything with an external effect belongs here.
    *
    * The canonical case is live-refresh parity with `ncl destinations add`:
    * after `ncl wirings create` writes the companion `agent_destinations`
@@ -248,24 +250,18 @@ function genericCreate(def: ResourceDef) {
 
     const colNames = Object.keys(values);
     const placeholders = colNames.map((c) => `@${c}`);
-    // Single transaction so a postCreate throw rolls back the parent INSERT —
-    // closes the partial-state class this PR exists to fix (#2415, #2389).
-    // better-sqlite3 .transaction() is sync, so `postCreate` is sync too and
-    // must only touch the central DB (it's the atomic companion-row write).
-    // Anything async or outside the central DB — filesystem, session-DB
-    // projection — belongs in `postCommit`, which runs after commit below.
-    //
-    // This stays on the RAW synchronous handle deliberately (seam 3 §4.2 — a
-    // fork transaction converts to the driver only in PR 6, all ten sites at
-    // once). insertOrAdopt below just wraps this synchronous transaction in
-    // an async function; it does not make the transaction itself async.
-    const db = getRawDb();
-    const insert = (): void => {
-      db.transaction(() => {
-        db.prepare(`INSERT INTO ${def.table} (${colNames.join(', ')}) VALUES (${placeholders.join(', ')})`).run(values);
-        if (def.postCreate) def.postCreate(values);
-      })();
-    };
+    // Single central transaction so a postCreate throw rolls back the parent
+    // INSERT — closes the partial-state class this PR exists to fix (#2415,
+    // #2389). `postCreate` is awaited inside the closure, so it is bound by
+    // the closure rule (plan §4.4): central-DB companion rows through the
+    // driver, nothing else. Anything outside the central DB — filesystem,
+    // session-DB projection — belongs in `postCommit`, which runs after the
+    // commit below and never after a rollback.
+    const insert = (): Promise<void> =>
+      centralTransaction(async () => {
+        await getDb().run(`INSERT INTO ${def.table} (${colNames.join(', ')}) VALUES (${placeholders.join(', ')})`, values);
+        if (def.postCreate) await def.postCreate(values);
+      }, `ncl ${def.plural} create`);
 
     // Idempotent create: if a row already matches the natural key, return it
     // rather than hitting a UNIQUE violation. Lets a skill re-run `ncl … create`.
@@ -291,10 +287,10 @@ function genericCreate(def: ResourceDef) {
       const existing = await reload();
       if (existing) return existing;
 
-      const { row, created } = await insertOrAdopt(values, async () => insert(), reload);
+      const { row, created } = await insertOrAdopt(values, insert, reload);
       if (!created) return row;
     } else {
-      insert();
+      await insert();
     }
 
     if (def.postCommit) await def.postCommit(values);
@@ -356,7 +352,7 @@ function genericUpdate(def: ResourceDef) {
       if (!current) throw new Error(`${def.name} not found: ${id}`);
 
       for (let attempt = 0; attempt < 2; attempt++) {
-        def.preUpdate(updates, current);
+        await def.preUpdate(updates, current);
 
         const setClause = Object.keys(updates)
           .map((k) => `${k} = @${k}`)

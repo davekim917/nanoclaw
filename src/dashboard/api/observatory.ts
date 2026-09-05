@@ -906,7 +906,9 @@ async function buildAgents(
       }
 
       const location =
-        roomMgId && nowMs - roomMs <= LOCATION_WINDOW_MS ? (getMessagingGroup(roomMgId)?.platform_id ?? null) : null;
+        roomMgId && nowMs - roomMs <= LOCATION_WINDOW_MS
+          ? ((await getMessagingGroup(roomMgId))?.platform_id ?? null)
+          : null;
       const active = awake && location !== null && nowMs - roomMs <= WORKING_WINDOW_MS;
 
       // Same window and same winning session as `location` — this just also

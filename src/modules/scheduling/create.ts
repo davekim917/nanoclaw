@@ -1,4 +1,5 @@
 import { randomUUID } from 'crypto';
+import { withCentralSync } from '../../db/central-lease.js';
 import { withQuietInvalidationSync } from '../../db/sessions.js';
 
 import { CronExpressionParser } from 'cron-parser';
@@ -174,25 +175,29 @@ export async function createScheduledTask(
   // refused invalidation aborts the create rather than landing a row behind a
   // mark nothing will clear.
   const row = await withExistingMailboxSession(agentGroupId, session.id, (mailbox) =>
-    withQuietInvalidationSync(session.id, () => {
-      mailbox.insertTaskRow({
-        id,
-        seriesId: id,
-        processAfter: task.processAfter,
-        recurrence: task.recurrence,
-        content: JSON.stringify({
-          prompt: task.prompt,
-          script: task.script,
-          originSessionId: options?.originSessionId ?? null,
-          // Physical send suppression: the agent-runner drops chat-kind
-          // outbound writes for tasks carrying muteChat (watcher-style tasks
-          // whose contract is board/file output, never channel posts).
-          ...(task.muteChat ? { muteChat: true } : {}),
+    withCentralSync(
+      () =>
+        withQuietInvalidationSync(session.id, () => {
+          mailbox.insertTaskRow({
+            id,
+            seriesId: id,
+            processAfter: task.processAfter,
+            recurrence: task.recurrence,
+            content: JSON.stringify({
+              prompt: task.prompt,
+              script: task.script,
+              originSessionId: options?.originSessionId ?? null,
+              // Physical send suppression: the agent-runner drops chat-kind
+              // outbound writes for tasks carrying muteChat (watcher-style tasks
+              // whose contract is board/file output, never channel posts).
+              ...(task.muteChat ? { muteChat: true } : {}),
+            }),
+            status: options?.status ?? 'pending',
+          });
+          return mailbox.getCreatedTaskRow(id) as ScheduledTaskRow;
         }),
-        status: options?.status ?? 'pending',
-      });
-      return mailbox.getCreatedTaskRow(id) as ScheduledTaskRow;
-    }),
+      'scheduled task create',
+    ),
   );
   if (!row) throw new Error('task system session inbound.db not found');
 

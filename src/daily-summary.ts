@@ -188,7 +188,7 @@ async function fireDigests(): Promise<void> {
       const poster = members.find((m) => readContainerConfig(m.folder).provider === 'codex');
       if (!poster) continue; // no Codex sibling → workgroup not eligible
 
-      const target = resolveTarget(poster);
+      const target = await resolveTarget(poster);
       if (!target) continue; // no dailySummary override → workgroup opted out
 
       const posterConfig = readContainerConfig(poster.folder);
@@ -506,11 +506,11 @@ function isEmpty(s: Summary): boolean {
  * than silently falling back to a different channel, since the override is the
  * deliberate routing choice (Discord vs Slack).
  */
-function resolveTarget(poster: AgentGroup): MessagingGroup | null {
+async function resolveTarget(poster: AgentGroup): Promise<MessagingGroup | null> {
   const config = readContainerConfig(poster.folder);
   const overrideId = config.dailySummary?.messagingGroupId;
   if (!overrideId) return null;
-  const mg = getMessagingGroup(overrideId);
+  const mg = await getMessagingGroup(overrideId);
   if (mg) return mg;
   log.warn('Daily summary: dailySummary.messagingGroupId not found — skipping workgroup', {
     posterAgentGroupId: poster.id,

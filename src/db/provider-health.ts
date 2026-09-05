@@ -19,7 +19,8 @@
  * outlive an operator fixing the account, and a one-second reset should not
  * produce a hot loop.
  */
-import { getDb, getRawDb } from './connection.js';
+import { centralTransaction } from './central-lease.js';
+import { getDb } from './connection.js';
 
 /** Never trust an unbounded reset promise from a provider. */
 const MAX_COOLDOWN_MS = 7 * 24 * 60 * 60_000;
@@ -62,33 +63,28 @@ function cooldownMs(consecutiveFailures: number, resetAtMs: number | null, nowMs
   return clampCooldown(backoff);
 }
 
-/**
- * Seam 3: stays SYNCHRONOUS on the raw handle. `markProviderUnavailable` calls
- * it from inside a raw `db.transaction(() => …)()` closure, which cannot await
- * — the plan's §4.2 exception, so there is no async form of this read. It
- * converts with that closure in PR 6.
- */
-export function getProviderHealth(agentGroupId: string, provider: string): ProviderHealthRow | undefined {
-  return getRawDb()
-    .prepare(`SELECT * FROM provider_health WHERE agent_group_id = ? AND provider = ?`)
-    .get(agentGroupId, provider) as ProviderHealthRow | undefined;
+export async function getProviderHealth(
+  agentGroupId: string,
+  provider: string,
+): Promise<ProviderHealthRow | undefined> {
+  return getDb().get<ProviderHealthRow>(
+    `SELECT * FROM provider_health WHERE agent_group_id = ? AND provider = ?`,
+    agentGroupId,
+    provider,
+  );
 }
 
 /**
  * True while the group's provider is inside a recorded cooldown window.
  * Absence of a row — the normal case — is always "available": this must fail
  * OPEN, or a bookkeeping gap would strand every group on its fallback.
- *
- * Seam 3: stays SYNCHRONOUS. It issues no statement of its own — its only DB
- * access is `getProviderHealth`, which the §4.2 exception keeps on the raw
- * handle — so there is nothing here to convert and its callers are unchanged.
  */
-export function isProviderUnavailable(
+export async function isProviderUnavailable(
   agentGroupId: string,
   provider: string,
   options: { nowMs?: number } = {},
-): boolean {
-  const row = getProviderHealth(agentGroupId, provider);
+): Promise<boolean> {
+  const row = await getProviderHealth(agentGroupId, provider);
   if (!row?.unavailable_until) return false;
   const until = Date.parse(row.unavailable_until);
   if (!Number.isFinite(until)) return false;
@@ -99,30 +95,28 @@ export function isProviderUnavailable(
  * Record a provider as unavailable and return the window end.
  * `resetAt` is the provider's own stated recovery time when it gave one.
  *
- * Seam 3: stays SYNCHRONOUS on the raw handle — the read-then-upsert is one
- * raw `db.transaction(() => …)()` closure, which is what keeps the failure
- * streak from racing itself. It converts with the other ten central
- * transaction sites in PR 6 (plan §4.2, §4.4).
+ * The read-then-upsert is one central transaction (`centralTransaction`,
+ * plan §4.4), which is what keeps the failure streak from racing itself. The
+ * closure is DB-only: nothing but driver statements, sequentially awaited.
  */
-export function markProviderUnavailable(
+export async function markProviderUnavailable(
   agentGroupId: string,
   provider: string,
   errorClass: ProviderErrorClass,
   options: { nowMs?: number; resetAt?: string | null; message?: string | null } = {},
-): string {
+): Promise<string> {
   if (!agentGroupId) throw new Error('agent group id is required');
   if (!provider) throw new Error('provider is required');
-  const db = getRawDb();
   const nowMs = options.nowMs ?? Date.now();
   const now = new Date(nowMs).toISOString();
   const resetAtMs = options.resetAt ? Date.parse(options.resetAt) : null;
-  return db.transaction(() => {
-    const prior = getProviderHealth(agentGroupId, provider);
+  return centralTransaction(async () => {
+    const prior = await getProviderHealth(agentGroupId, provider);
     const consecutiveFailures = (prior?.consecutive_failures ?? 0) + 1;
     const unavailableUntil = new Date(
       nowMs + cooldownMs(consecutiveFailures, Number.isFinite(resetAtMs as number) ? resetAtMs : null, nowMs),
     ).toISOString();
-    db.prepare(
+    await getDb().run(
       `INSERT INTO provider_health
          (agent_group_id, provider, unavailable_until, consecutive_failures,
           last_error_class, last_error_message, updated_at)
@@ -133,7 +127,6 @@ export function markProviderUnavailable(
          last_error_class = excluded.last_error_class,
          last_error_message = excluded.last_error_message,
          updated_at = excluded.updated_at`,
-    ).run(
       agentGroupId,
       provider,
       unavailableUntil,
@@ -143,18 +136,16 @@ export function markProviderUnavailable(
       now,
     );
     return unavailableUntil;
-  })();
+  }, 'markProviderUnavailable');
 }
 
 /**
  * Clear a cooldown — a turn completed on this provider, so it works.
  *
- * The read stays on the synchronous `getProviderHealth` above (§4.2) and only
- * the UPDATE moves onto the driver. That is not a check-then-act race this
- * function has to care about: a concurrent `markProviderUnavailable` either
- * commits before the read (whose row this then clears) or after the write
- * (whose window then stands), and both orderings are the same two outcomes the
- * all-synchronous version produced.
+ * Read then UPDATE, not a transaction: a concurrent `markProviderUnavailable`
+ * either commits before the read (whose row this then clears) or after the
+ * write (whose window then stands), and both orderings are the same two
+ * outcomes the all-synchronous version produced.
  */
 export async function markProviderAvailable(
   agentGroupId: string,
@@ -162,7 +153,7 @@ export async function markProviderAvailable(
   options: { nowMs?: number } = {},
 ): Promise<void> {
   if (!agentGroupId || !provider) return;
-  const row = getProviderHealth(agentGroupId, provider);
+  const row = await getProviderHealth(agentGroupId, provider);
   // Only write when there is something to clear: a healthy provider must not
   // generate a DB write on every successful turn.
   if (!row || (row.unavailable_until === null && row.consecutive_failures === 0)) return;

@@ -34,12 +34,12 @@ export interface SpawnProviderDecision {
   fallbackApplied: boolean;
 }
 
-export function resolveSpawnProvider(options: {
+export async function resolveSpawnProvider(options: {
   agentGroupId: string;
   sessionProvider: string | null | undefined;
   containerConfig: Pick<ContainerConfig, 'provider' | 'model' | 'effort' | 'providerFallback'>;
   nowMs?: number;
-}): SpawnProviderDecision {
+}): Promise<SpawnProviderDecision> {
   const { agentGroupId, sessionProvider, containerConfig, nowMs } = options;
   const primaryProvider = resolveProviderName(sessionProvider ?? null, containerConfig.provider);
   const fallback = containerConfig.providerFallback;
@@ -55,12 +55,12 @@ export function resolveSpawnProvider(options: {
   if (fallbackProvider === primaryProvider) {
     return { provider: primaryProvider, primaryProvider, fallbackApplied: false };
   }
-  if (!isProviderUnavailable(agentGroupId, primaryProvider, { nowMs })) {
+  if (!(await isProviderUnavailable(agentGroupId, primaryProvider, { nowMs }))) {
     return { provider: primaryProvider, primaryProvider, fallbackApplied: false };
   }
   // Never bounce onto a fallback that is itself in cooldown — running the
   // primary and failing is more honest than thrashing between dead providers.
-  if (isProviderUnavailable(agentGroupId, fallbackProvider, { nowMs })) {
+  if (await isProviderUnavailable(agentGroupId, fallbackProvider, { nowMs })) {
     return { provider: primaryProvider, primaryProvider, fallbackApplied: false };
   }
 

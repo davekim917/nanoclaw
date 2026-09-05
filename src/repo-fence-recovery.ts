@@ -34,7 +34,7 @@ import {
   isWorkgroupRepositoryMountClaimed,
   resolveRepositoryWorkUnit,
 } from './repository-workspaces.js';
-import type { Session, AgentGroup } from './types.js';
+import type { AgentGroup, MessagingGroup, Session } from './types.js';
 
 export interface OrphanedRepoFenceRecovery {
   /** Sessions whose inbound DB was actually opened and inspected. */
@@ -90,12 +90,15 @@ async function yieldEventLoop(index: number): Promise<void> {
  * Throws rather than guessing when identity cannot be resolved; the caller
  * counts that session as unreadable and never releases it (fail closed).
  */
-function repositoryTransitionInFlight(session: Session, group: AgentGroup | undefined): boolean {
+function repositoryTransitionInFlight(
+  session: Session,
+  group: AgentGroup | undefined,
+  messagingGroup: MessagingGroup | null,
+): boolean {
   // No agent group row means no workgroup for a publication to be claiming.
   if (!group) return false;
   const workgroupId = group.workgroup_id ?? group.folder;
   if (isWorkgroupRepositoryMountClaimed(workgroupId)) return true;
-  const messagingGroup = session.messaging_group_id ? getMessagingGroup(session.messaging_group_id) : null;
   return isRepositoryLifecycleClaimed(
     resolveRepositoryWorkUnit({
       workgroupId,
@@ -138,11 +141,16 @@ export async function releaseOrphanedRepoIngressFences(
       // and a session with no mailbox has no fence — the ordinary steady state.
       // The wake happens after the loop, so no mailbox session is ever held
       // across `wakeRepositoryMountSessions` (invariant I-3).
-      // The one central read the in-flight check needs, taken BEFORE the
+      // The two central reads the in-flight check needs, taken BEFORE the
       // session opens so the action below stays synchronous from its fence
-      // read to its release. A throw here is "identity unresolvable" and is
-      // counted as unreadable by the catch, exactly as the read inside used to.
+      // read to its release (the messaging group joined the agent group here
+      // in seam 3 PR 6, when `getMessagingGroup` went async). A throw here is
+      // "identity unresolvable" and is counted as unreadable by the catch,
+      // exactly as the read inside used to.
       const group = await getAgentGroup(session.agent_group_id);
+      const messagingGroup = session.messaging_group_id
+        ? ((await getMessagingGroup(session.messaging_group_id)) ?? null)
+        : null;
       const needsWake = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
         report.scanned += 1;
         const fence = mailbox.readRepoIngressFence();
@@ -152,7 +160,7 @@ export async function releaseOrphanedRepoIngressFences(
         // owning publication has released its own barriers, so a synchronous
         // check-then-release cannot tear a live publication's fence out from
         // under it.
-        if (repositoryTransitionInFlight(session, group)) {
+        if (repositoryTransitionInFlight(session, group, messagingGroup)) {
           report.inFlight += 1;
           return false;
         }

@@ -60,6 +60,7 @@ import { getMessagingGroup } from '../db/messaging-groups.js';
 import { log } from '../log.js';
 import { ATTENTION_ITEM_PREFIX, type AttentionSourceEnv } from '../attention-sources.js';
 import { dispatch } from '../cli/dispatch.js';
+import { withCentralSync } from '../db/central-lease.js';
 import { guard } from '../guard/index.js';
 import { isOwner, isGlobalAdmin, isAdminOfAgentGroup } from '../modules/permissions/db/user-roles.js';
 import { isMember } from '../modules/permissions/db/agent-group-members.js';
@@ -180,11 +181,17 @@ export async function assignAttentionItem(
     channelKey: item.channel_key,
     wiredToItemChannel: target !== null,
   };
-  const decision = guard(observatoryAssign, {
-    actor: { kind: 'human', userId: ctx.user.id },
-    resource: { itemId: item.id, workgroupId: item.workgroupId },
-    payload,
-  });
+  // Under the central lease: `guard()`'s reads are raw by design (seam 3
+  // §4.5 I-1).
+  const decision = await withCentralSync(
+    () =>
+      guard(observatoryAssign, {
+        actor: { kind: 'human', userId: ctx.user.id },
+        resource: { itemId: item.id, workgroupId: item.workgroupId },
+        payload,
+      }),
+    'observatory assign guard',
+  );
   if (decision.effect !== 'allow') {
     // Two refusals that must not look alike. "Not wired to this room" is a
     // state the operator can act on — pick a different agent — and the row

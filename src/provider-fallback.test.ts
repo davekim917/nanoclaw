@@ -32,13 +32,13 @@ describe('spawn-time provider fallback', () => {
   });
   afterEach(() => closeDb());
 
-  it('stays on the primary while it is healthy', () => {
-    expect(decide()).toMatchObject({ provider: 'codex', fallbackApplied: false });
+  it('stays on the primary while it is healthy', async () => {
+    expect(await decide()).toMatchObject({ provider: 'codex', fallbackApplied: false });
   });
 
-  it('routes to the fallback while the primary is in cooldown', () => {
-    markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW });
-    expect(decide()).toMatchObject({
+  it('routes to the fallback while the primary is in cooldown', async () => {
+    await markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW });
+    expect(await decide()).toMatchObject({
       provider: 'claude',
       model: 'claude-opus-5[1m]',
       effort: 'high',
@@ -47,10 +47,10 @@ describe('spawn-time provider fallback', () => {
     });
   });
 
-  it('routes a Claude primary to Codex while Claude is in cooldown', () => {
-    markProviderUnavailable(GID, 'claude', 'quota', { nowMs: NOW });
+  it('routes a Claude primary to Codex while Claude is in cooldown', async () => {
+    await markProviderUnavailable(GID, 'claude', 'quota', { nowMs: NOW });
     expect(
-      resolveSpawnProvider({
+      await resolveSpawnProvider({
         agentGroupId: GID,
         sessionProvider: null,
         containerConfig: { provider: 'claude', providerFallback: { provider: 'codex' } },
@@ -63,11 +63,11 @@ describe('spawn-time provider fallback', () => {
     });
   });
 
-  it('returns to the primary once the window expires — no cron required', () => {
-    const until = markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW });
+  it('returns to the primary once the window expires — no cron required', async () => {
+    const until = await markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW });
     const after = Date.parse(until) + 1;
     expect(
-      resolveSpawnProvider({
+      await resolveSpawnProvider({
         agentGroupId: GID,
         sessionProvider: null,
         containerConfig: { provider: 'codex', providerFallback: FALLBACK },
@@ -76,9 +76,9 @@ describe('spawn-time provider fallback', () => {
     ).toMatchObject({ provider: 'codex', fallbackApplied: false });
   });
 
-  it('beats a stamped session.agent_provider, which normally shadows the file', () => {
-    markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW });
-    const decision = resolveSpawnProvider({
+  it('beats a stamped session.agent_provider, which normally shadows the file', async () => {
+    await markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW });
+    const decision = await resolveSpawnProvider({
       agentGroupId: GID,
       sessionProvider: 'codex',
       containerConfig: { provider: 'claude', providerFallback: FALLBACK },
@@ -87,22 +87,22 @@ describe('spawn-time provider fallback', () => {
     expect(decision).toMatchObject({ provider: 'claude', primaryProvider: 'codex', fallbackApplied: true });
   });
 
-  it('an undeclared fallback keeps the outage loud', () => {
-    markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW });
-    expect(decide({ providerFallback: undefined })).toMatchObject({ provider: 'codex', fallbackApplied: false });
+  it('an undeclared fallback keeps the outage loud', async () => {
+    await markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW });
+    expect(await decide({ providerFallback: undefined })).toMatchObject({ provider: 'codex', fallbackApplied: false });
   });
 
-  it('ignores a fallback that points back at the primary', () => {
-    markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW });
-    expect(decide({ providerFallback: { provider: 'CODEX' } })).toMatchObject({
+  it('ignores a fallback that points back at the primary', async () => {
+    await markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW });
+    expect(await decide({ providerFallback: { provider: 'CODEX' } })).toMatchObject({
       provider: 'codex',
       fallbackApplied: false,
     });
   });
 
-  it('does not thrash onto a fallback that is itself in cooldown', () => {
-    markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW });
-    markProviderUnavailable(GID, 'claude', 'quota', { nowMs: NOW });
-    expect(decide()).toMatchObject({ provider: 'codex', fallbackApplied: false });
+  it('does not thrash onto a fallback that is itself in cooldown', async () => {
+    await markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW });
+    await markProviderUnavailable(GID, 'claude', 'quota', { nowMs: NOW });
+    expect(await decide()).toMatchObject({ provider: 'codex', fallbackApplied: false });
   });
 });

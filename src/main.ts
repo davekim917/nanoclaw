@@ -17,13 +17,13 @@ import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { shadowWrite } from './db/coordination.js';
 import { getDb, getRawDb, initDb } from './db/connection.js';
-import { runMigrations } from './db/migrations/index.js';
+import { runCentralMigrations } from './db/migrations/index.js';
 import { registerSecretsFromEnv } from './secret-scrubber.js';
 import {
   channelNameProvenance,
   channelNameProvenanceAccepts,
   getMessagingGroupByPlatform,
-  updateMessagingGroup,
+  applyChannelMetadataUpdates,
 } from './db/messaging-groups.js';
 import type { ChannelNameSource, MessagingGroupUpdates } from './db/messaging-groups.js';
 import { ensureContainerRuntimeRunning } from './container-runtime.js';
@@ -466,8 +466,11 @@ export async function main(): Promise<void> {
   // 1. Init central DB
   const dbPath = path.join(DATA_DIR, 'v2.db');
   await initDb(dbPath);
+  runCentralMigrations();
+  // The boot-time workgroup reconcilers below still take the raw handle (they
+  // run before any concurrent central-DB activity exists); they convert with
+  // their owning modules, not with the migration entry above.
   const db = getRawDb();
-  runMigrations(db);
 
   // 1-a. Register this host process in `host_instances` and start renewing
   // its lease. Ahead of everything that can spawn, so the row exists before
@@ -780,12 +783,13 @@ export async function main(): Promise<void> {
       async onMetadata(platformId, name, isGroup) {
         const mg = await getMessagingGroupByPlatform(adapter.channelType, platformId);
         if (!mg) return; // router hasn't auto-created it yet — next inbound will
-        const updates = resolveChannelMetadataUpdates(mg, name, isGroup, {
-          platform: adapter.channelType,
-          source: 'adapter',
-        });
+        const incoming = { platform: adapter.channelType, source: 'adapter' as const };
+        const updates = resolveChannelMetadataUpdates(mg, name, isGroup, incoming);
         if (Object.keys(updates).length === 0) return;
-        await updateMessagingGroup(mg.id, updates);
+        // The provenance check runs again INSIDE the write (#416 site 5): the
+        // read above and this write are separated by an await, and the
+        // router's classified name may land between them.
+        await applyChannelMetadataUpdates(mg.id, updates, incoming);
         log.info('Channel metadata persisted', {
           channelType: adapter.channelType,
           platformId,

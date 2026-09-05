@@ -208,7 +208,7 @@ async function seedGroups({ withMg = false }: { withMg?: boolean } = {}): Promis
       unknown_sender_policy: 'public',
       created_at: ts(),
     });
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       id: 'mga-orch',
       messaging_group_id: mgId,
       agent_group_id: 'ag-orch',
@@ -478,7 +478,7 @@ describe('F1: e2e idempotency replay', () => {
       .run('some-child-sess', 'ag-orch', 'system:tasks:some-child', ts());
 
     const replayHash = computeRequestHash('Do X', null);
-    insertTaskAtomic({
+    await insertTaskAtomic({
       task_id: 'task-filler',
       idempotency_key: 'k-other',
       parent_session_id: 'sess-orch',
@@ -507,7 +507,7 @@ describe('F1: e2e idempotency replay', () => {
     });
 
     // Insert the task we want to replay
-    insertTaskAtomic({
+    await insertTaskAtomic({
       task_id: 'task-replay',
       idempotency_key: 'k-replay',
       parent_session_id: 'sess-orch',
@@ -712,7 +712,7 @@ describe('F1: e2e orphan recovery', () => {
     const taskId = deriveSpawnTaskId('sess-orch', 'k-orphan');
     // Use a past admitted_at > 60s ago so getOrphanedTasks picks it up
     const oldTs = new Date(Date.now() - 90_000).toISOString();
-    insertTaskAtomic({
+    await insertTaskAtomic({
       task_id: taskId,
       idempotency_key: 'k-orphan',
       parent_session_id: 'sess-orch',

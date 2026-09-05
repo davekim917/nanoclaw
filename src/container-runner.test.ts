@@ -127,7 +127,6 @@ vi.mock('./memory-admission.js', () => {
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import BetterSQLite3 from 'better-sqlite3';
 import type Database from 'better-sqlite3';
 
 import {
@@ -212,36 +211,38 @@ describe('operator canary workgroup spawn fence', () => {
     expect(isContainerSpawnWorkgroupAllowed('workgroup-a', ' , ')).toBe(false);
   });
 
-  it('uses container.json identity ahead of a stale DB workgroup', () => {
-    const db = new BetterSQLite3(':memory:');
+  it('uses container.json identity ahead of a stale DB workgroup', async () => {
+    await initTestDb();
+    const db = getRawDb();
     try {
       db.exec('CREATE TABLE agent_groups (id TEXT PRIMARY KEY, workgroup_id TEXT)');
       db.prepare('INSERT INTO agent_groups (id, workgroup_id) VALUES (?, ?)').run('ag-a', 'workgroup-a');
-      const resolved = resolveWorkgroupIdAtSpawn(
-        db,
+      const resolved = await resolveWorkgroupIdAtSpawn(
         { id: 'ag-a', folder: 'agent-a' },
         { workgroup_id: 'workgroup-b' },
       );
       expect(resolved).toBe('workgroup-b');
       expect(isContainerSpawnWorkgroupAllowed(resolved, 'workgroup-a')).toBe(false);
     } finally {
-      db.close();
+      await closeDb();
     }
   });
 
-  it('uses the DB workgroup when container.json is silent', () => {
-    const db = new BetterSQLite3(':memory:');
+  it('uses the DB workgroup when container.json is silent', async () => {
+    await initTestDb();
+    const db = getRawDb();
     try {
       db.exec('CREATE TABLE agent_groups (id TEXT PRIMARY KEY, workgroup_id TEXT)');
       db.prepare('INSERT INTO agent_groups (id, workgroup_id) VALUES (?, ?)').run('ag-a', 'workgroup-a');
-      expect(resolveWorkgroupIdAtSpawn(db, { id: 'ag-a', folder: 'agent-a' }, {})).toBe('workgroup-a');
+      expect(await resolveWorkgroupIdAtSpawn({ id: 'ag-a', folder: 'agent-a' }, {})).toBe('workgroup-a');
     } finally {
-      db.close();
+      await closeDb();
     }
   });
 
-  it('persists the fenced identity even if the DB changes after admission', () => {
-    const db = new BetterSQLite3(':memory:');
+  it('persists the fenced identity even if the DB changes after admission', async () => {
+    await initTestDb();
+    const db = getRawDb();
     try {
       db.exec(`
         CREATE TABLE workgroups (
@@ -254,14 +255,14 @@ describe('operator canary workgroup spawn fence', () => {
       `);
       db.prepare('INSERT INTO agent_groups (id, workgroup_id) VALUES (?, ?)').run('ag-a', 'workgroup-a');
       const agentGroup = { id: 'ag-a', folder: 'agent-a' };
-      const admitted = resolveWorkgroupIdAtSpawn(db, agentGroup, {});
+      const admitted = await resolveWorkgroupIdAtSpawn(agentGroup, {});
       expect(isContainerSpawnWorkgroupAllowed(admitted, 'workgroup-a')).toBe(true);
 
       db.prepare('UPDATE agent_groups SET workgroup_id = ? WHERE id = ?').run('workgroup-b', 'ag-a');
-      expect(persistResolvedWorkgroupAtSpawn(db, agentGroup, admitted)).toEqual({ workgroupId: 'workgroup-a' });
+      expect(await persistResolvedWorkgroupAtSpawn(agentGroup, admitted)).toEqual({ workgroupId: 'workgroup-a' });
       expect(db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').pluck().get('ag-a')).toBe('workgroup-a');
     } finally {
-      db.close();
+      await closeDb();
     }
   });
 });
@@ -1211,8 +1212,11 @@ describe('dependency-audit script mount', () => {
 // ── Workgroup reconciler tests (C1) ──────────────────────────────────────────
 
 /** Create a minimal in-memory DB with the workgroup schema (migration 036). */
-function makeWorkgroupDb(): Database.Database {
-  const db = new BetterSQLite3(':memory:');
+async function makeWorkgroupDb(): Promise<Database.Database> {
+  // The reconciler writes through the central driver (seam 3 PR 6), so the
+  // fixture IS the central test database; the raw handle is for the asserts.
+  await initTestDb();
+  const db = getRawDb();
   db.pragma('foreign_keys = ON');
   db.exec(`
     CREATE TABLE agent_groups (
@@ -1251,11 +1255,11 @@ function insertWorkgroup(db: Database.Database, id: string, onecliSecrets = '[]'
 describe('reconcileWorkgroupAtSpawn — C1', () => {
   let db: Database.Database;
 
-  beforeEach(() => {
-    db = makeWorkgroupDb();
+  beforeEach(async () => {
+    db = await makeWorkgroupDb();
   });
 
-  it('test_reconciler_creates_workgroup_and_updates_membership', () => {
+  it('test_reconciler_creates_workgroup_and_updates_membership', async () => {
     // Seed helper (parent) and helper-codex (sibling)
     insertGroup(db, 'ag-helper', 'example-labs');
     insertGroup(db, 'ag-helper-codex', 'example-labs-codex');
@@ -1264,7 +1268,7 @@ describe('reconcileWorkgroupAtSpawn — C1', () => {
     const agentGroup = { id: 'ag-helper-codex', folder: 'example-labs-codex' };
     const containerConfig = { workgroup_id: 'example-labs' };
 
-    reconcileWorkgroupAtSpawn(db, agentGroup, containerConfig);
+    await reconcileWorkgroupAtSpawn(agentGroup, containerConfig);
 
     const wg = db.prepare('SELECT id FROM workgroups WHERE id = ?').get('example-labs') as { id: string };
     expect(wg).toBeDefined();
@@ -1277,7 +1281,7 @@ describe('reconcileWorkgroupAtSpawn — C1', () => {
     expect(ag.workgroup_id).toBe('example-labs');
   });
 
-  it('test_reconciler_preserves_existing_workgroup_row', () => {
+  it('test_reconciler_preserves_existing_workgroup_row', async () => {
     // Pre-seed workgroup with operator-owned secret configuration.
     insertGroup(db, 'ag-helper', 'example-labs');
     insertGroup(db, 'ag-helper-codex', 'example-labs-codex');
@@ -1286,7 +1290,7 @@ describe('reconcileWorkgroupAtSpawn — C1', () => {
     const agentGroup = { id: 'ag-helper-codex', folder: 'example-labs-codex' };
     const containerConfig = { workgroup_id: 'example-labs' };
 
-    reconcileWorkgroupAtSpawn(db, agentGroup, containerConfig);
+    await reconcileWorkgroupAtSpawn(agentGroup, containerConfig);
 
     const wg = db.prepare('SELECT onecli_secrets FROM workgroups WHERE id = ?').get('example-labs') as {
       onecli_secrets: string;
@@ -1294,14 +1298,14 @@ describe('reconcileWorkgroupAtSpawn — C1', () => {
     expect(wg.onecli_secrets).toBe('["Shared-Secret"]');
   });
 
-  it('test_reconciler_standalone_fallback_to_self', () => {
+  it('test_reconciler_standalone_fallback_to_self', async () => {
     // Standalone group — no parent, no sibling
     insertGroup(db, 'ag-solo', 'solo-agent');
 
     const agentGroup = { id: 'ag-solo', folder: 'solo-agent' };
     const containerConfig = {}; // no workgroup_id declared
 
-    reconcileWorkgroupAtSpawn(db, agentGroup, containerConfig);
+    await reconcileWorkgroupAtSpawn(agentGroup, containerConfig);
 
     const wg = db.prepare('SELECT id FROM workgroups WHERE id = ?').get('solo-agent') as { id: string };
     expect(wg).toBeDefined();
@@ -1313,11 +1317,11 @@ describe('reconcileWorkgroupAtSpawn — C1', () => {
     expect(ag.workgroup_id).toBe('solo-agent');
   });
 
-  it('test_reconciler_atomic_workgroup_id_update', () => {
+  it('test_reconciler_atomic_workgroup_id_update', async () => {
     // Start with NULL workgroup_id; reconciler must set it
     insertGroup(db, 'ag-foo', 'foo');
 
-    reconcileWorkgroupAtSpawn(db, { id: 'ag-foo', folder: 'foo' }, {});
+    await reconcileWorkgroupAtSpawn({ id: 'ag-foo', folder: 'foo' }, {});
 
     const ag = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').get('ag-foo') as {
       workgroup_id: string;
@@ -1325,20 +1329,19 @@ describe('reconcileWorkgroupAtSpawn — C1', () => {
     expect(ag.workgroup_id).toBe('foo');
   });
 
-  it('test_reconciler_returns_resolved_workgroup_id_for_threading', () => {
+  it('test_reconciler_returns_resolved_workgroup_id_for_threading', async () => {
     // Contract: spawnContainer threads the resolved wgId from reconcile
     // through to buildMounts / buildArchiveProjection so they don't re-derive
     // (race-fix). The reconciler must return what it settled on.
     insertGroup(db, 'ag-helper-codex', 'example-labs-codex');
-    const result = reconcileWorkgroupAtSpawn(
-      db,
+    const result = await reconcileWorkgroupAtSpawn(
       { id: 'ag-helper-codex', folder: 'example-labs-codex' },
       { workgroup_id: 'example-labs' },
     );
     expect(result.workgroupId).toBe('example-labs');
   });
 
-  it('test_reconciler_noop_when_unchanged', () => {
+  it('test_reconciler_noop_when_unchanged', async () => {
     // Pre-set workgroup_id correctly
     insertGroup(db, 'ag-bar', 'bar', 'bar');
     insertWorkgroup(db, 'bar');
@@ -1349,7 +1352,7 @@ describe('reconcileWorkgroupAtSpawn — C1', () => {
     };
     expect(before.workgroup_id).toBe('bar');
 
-    reconcileWorkgroupAtSpawn(db, { id: 'ag-bar', folder: 'bar' }, {});
+    await reconcileWorkgroupAtSpawn({ id: 'ag-bar', folder: 'bar' }, {});
 
     // workgroup_id unchanged after noop
     const after = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').get('ag-bar') as {
@@ -1368,11 +1371,11 @@ describe('reconcileWorkgroupAtSpawn — C1', () => {
 describe('reconcileWorkgroupAtSpawn — workgroup_id preservation', () => {
   let db: Database.Database;
 
-  beforeEach(() => {
-    db = makeWorkgroupDb();
+  beforeEach(async () => {
+    db = await makeWorkgroupDb();
   });
 
-  it('test_preserves_migrated_workgroup_id_when_container_config_silent', () => {
+  it('test_preserves_migrated_workgroup_id_when_container_config_silent', async () => {
     // Simulate post-migration-036 state for helper + helper-codex pair:
     // both agent_groups rows have workgroup_id='example-labs' set by migration,
     // while existing container.json files did not declare workgroup_id.
@@ -1382,7 +1385,7 @@ describe('reconcileWorkgroupAtSpawn — workgroup_id preservation', () => {
 
     // Spawn helper-codex with no workgroup_id in containerConfig — must preserve
     // the migrated pairing rather than overwriting to 'example-labs-codex'.
-    reconcileWorkgroupAtSpawn(db, { id: 'ag-helper-codex', folder: 'example-labs-codex' }, {});
+    await reconcileWorkgroupAtSpawn({ id: 'ag-helper-codex', folder: 'example-labs-codex' }, {});
 
     const after = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').get('ag-helper-codex') as {
       workgroup_id: string;
@@ -1393,12 +1396,12 @@ describe('reconcileWorkgroupAtSpawn — workgroup_id preservation', () => {
     expect(wg.id).toBe('example-labs');
   });
 
-  it('test_explicit_config_workgroup_id_overrides_db_value', () => {
+  it('test_explicit_config_workgroup_id_overrides_db_value', async () => {
     // If container.json explicitly sets workgroup_id, operator intent wins
     // (e.g., operator moves a sibling to a different workgroup).
     insertGroup(db, 'ag-foo', 'foo', 'old-workgroup');
 
-    reconcileWorkgroupAtSpawn(db, { id: 'ag-foo', folder: 'foo' }, { workgroup_id: 'new-workgroup' });
+    await reconcileWorkgroupAtSpawn({ id: 'ag-foo', folder: 'foo' }, { workgroup_id: 'new-workgroup' });
 
     const after = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').get('ag-foo') as {
       workgroup_id: string;
@@ -1406,12 +1409,12 @@ describe('reconcileWorkgroupAtSpawn — workgroup_id preservation', () => {
     expect(after.workgroup_id).toBe('new-workgroup'); // operator intent honored
   });
 
-  it('test_defaults_to_own_folder_when_db_value_null', () => {
+  it('test_defaults_to_own_folder_when_db_value_null', async () => {
     // Fresh install: no migration ran, agent_groups.workgroup_id is NULL,
     // container.json silent → default to workgroup-of-1 (own folder).
     insertGroup(db, 'ag-fresh', 'fresh'); // no workgroup_id set
 
-    reconcileWorkgroupAtSpawn(db, { id: 'ag-fresh', folder: 'fresh' }, {});
+    await reconcileWorkgroupAtSpawn({ id: 'ag-fresh', folder: 'fresh' }, {});
 
     const after = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').get('ag-fresh') as {
       workgroup_id: string;

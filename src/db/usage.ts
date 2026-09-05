@@ -41,7 +41,8 @@
  * (usage_daily is an additive upsert over a watermark, so it never sees a
  * turn's rows together) and would silently redefine an existing column.
  */
-import { getDb, getRawDb } from './connection.js';
+import { centralTransaction } from './central-lease.js';
+import { getDb } from './connection.js';
 import { log } from '../log.js';
 import type { NanoclawMailboxSession } from '../modules/mailbox/index.js';
 
@@ -92,49 +93,51 @@ export function isCostApplicable(provider: string): boolean {
   return !PROVIDERS_WITHOUT_COST.has(provider);
 }
 
+/** The turn_usage rows one session read hands over, in the mailbox's own shape. */
+export type TurnUsageBatch = ReturnType<NanoclawMailboxSession['listTurnUsageSince']>;
+
 /**
- * Seam 3: stays SYNCHRONOUS on the raw handle. It is called from
- * `rollupSessionUsage`, which is itself a raw `db.transaction(() => …)()`
- * closure and cannot await — the plan's §4.2 exception. It converts in PR 6
- * with its caller.
+ * The rollup watermark for one `<agent-group>/<session>`: the highest
+ * outbound turn_usage id already folded into the central tables (0 when the
+ * session has never been rolled up).
+ *
+ * Read BEFORE the session's outbound.db is opened, so the caller asks the
+ * mailbox for exactly the rows above it (`listTurnUsageSince`), and read
+ * AGAIN inside `rollupSessionUsage`'s transaction, which is what keeps the
+ * fold exactly-once when two sweeps race on one session.
  */
-function getWatermark(sessionDirKey: string): number {
-  const row = getRawDb()
-    .prepare('SELECT last_turn_usage_id FROM usage_rollup_state WHERE session_dir = ?')
-    .get(sessionDirKey) as { last_turn_usage_id: number } | undefined;
+export async function getUsageWatermark(sessionDirKey: string): Promise<number> {
+  const row = await getDb().get<{ last_turn_usage_id: number }>(
+    'SELECT last_turn_usage_id FROM usage_rollup_state WHERE session_dir = ?',
+    sessionDirKey,
+  );
   return row?.last_turn_usage_id ?? 0;
 }
 
 /**
- * Roll a session's new turn_usage rows (id > watermark) into usage_daily and
- * advance the watermark, in one central-DB transaction.
+ * Roll a batch of a session's turn_usage rows into usage_daily and the central
+ * turn_usage mirror and advance the watermark, in one central-DB transaction.
  *
- * Takes the session's MAILBOX, not a raw outbound handle: the module owns
- * every session-DB statement, and `listTurnUsageSince` is the named read this
- * rollup needs (docs/specs/upstream-mailbox-seam/plan.md I-2, and the ratchet
- * pattern that forbids a passed handle). Only the read op is required, so that
- * is all the parameter asks for — the sweep passes its whole session and a
- * test passes just this one op.
+ * Takes the ROWS, not the mailbox. The outbound read funnel
+ * (`readSessionOutbound`) closes the session file the moment its synchronous
+ * action returns, and the central transaction is asynchronous, so the two
+ * cannot nest: the caller reads `getUsageWatermark` → opens the outbound
+ * mailbox → `listTurnUsageSince(watermark)` → hands the rows here. Nothing is
+ * written to outbound.db by any of that, which is the single-writer split (the
+ * container writes it, the host reads it).
  *
- * Nothing is written to outbound.db here, which is the single-writer split
- * (the container writes it, the host reads it). Missing table, empty result,
- * or an already-caught-up watermark are all the normal "nothing to do" case,
- * not an error. Returns the row count rolled up.
- *
- * Seam 3: stays SYNCHRONOUS on the raw handle. The usage_daily upsert, the
- * central turn_usage mirror and the watermark advance are one raw
- * `db.transaction(() => …)()`; a synchronous closure cannot be interleaved,
- * which is what keeps raw and driver statements safe on one connection while
- * the fork converts leaf-by-leaf. It converts with the other ten central
- * transaction sites in PR 6 (plan §4.2, §4.4).
+ * The closure is DB-only (plan §4.4): driver statements, awaited in sequence.
+ * The watermark is re-read INSIDE the transaction and rows at or below it are
+ * skipped, so a second sweep that read the same batch before this one
+ * committed folds nothing twice — the pre-seam guarantee, now held by the
+ * transaction rather than by a synchronous closure. Returns the row count
+ * actually rolled up; an empty batch or a fully-superseded one is 0.
  */
-export function rollupSessionUsage(
-  mailbox: Pick<NanoclawMailboxSession, 'listTurnUsageSince'>,
+export async function rollupSessionUsage(
+  rows: TurnUsageBatch,
   agentGroupId: string,
   sessionDirKey: string,
-): number {
-  const watermark = getWatermark(sessionDirKey);
-  const rows = mailbox.listTurnUsageSince(watermark);
+): Promise<number> {
   if (rows.length === 0) return 0;
 
   // sessionDirKey is the fixed `<agent-group>/<session>` contract (see the
@@ -145,76 +148,81 @@ export function rollupSessionUsage(
     ? sessionDirKey.slice(agentGroupId.length + 1)
     : sessionDirKey;
 
-  const db = getRawDb();
-  let maxId = watermark;
-  db.transaction(() => {
-    const upsert = db.prepare(`
-      INSERT INTO usage_daily
-        (date, agent_group_id, provider, model, turns, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
-      VALUES (@date, @agent_group_id, @provider, @model, 1, @input_tokens, @output_tokens, @cache_read_tokens, @cache_write_tokens, @cost_usd)
-      ON CONFLICT(date, agent_group_id, provider, model) DO UPDATE SET
-        turns = turns + 1,
-        input_tokens = input_tokens + excluded.input_tokens,
-        output_tokens = output_tokens + excluded.output_tokens,
-        cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
-        cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
-        cost_usd = cost_usd + excluded.cost_usd
-    `);
-    // Fleet-hardening Phase 0.1 follow-up: a faithful 1:1 per-turn mirror,
-    // written alongside the usage_daily upsert above rather than replacing
-    // it — `ncl usage` and the dashboard read usage_daily and must not see
-    // any behavior change. Unlike usage_daily, NULLs stay NULL here (this is
-    // a detail ledger, not an additive aggregate with an identity element).
-    const insertCentral = db.prepare(`
-      INSERT INTO turn_usage
-        (ts, session_id, agent_group_id, provider, model, turn_id, steps, duration_ms, trigger, rate_limit_type, rate_limit_utilization, rate_limit_resets_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
-      VALUES (@ts, @session_id, @agent_group_id, @provider, @model, @turn_id, @steps, @duration_ms, @trigger, @rate_limit_type, @rate_limit_utilization, @rate_limit_resets_at, @input_tokens, @output_tokens, @cache_read_tokens, @cache_write_tokens, @cost_usd)
-    `);
-    for (const row of rows) {
+  return centralTransaction(async () => {
+    const db = getDb();
+    const watermark = await getUsageWatermark(sessionDirKey);
+    const fresh = rows.filter((row) => row.id > watermark);
+    if (fresh.length === 0) return 0;
+    let maxId = watermark;
+    for (const row of fresh) {
       maxId = Math.max(maxId, row.id);
       // NULL numeric columns (provider didn't report that field) aggregate as
       // 0; NULL model aggregates as '' — both match the usage_daily schema
       // defaults so a partial turn_usage row never breaks the rollup.
-      upsert.run({
-        date: row.ts.slice(0, 10), // ts is ISO-8601 UTC; the date prefix IS the UTC day.
-        agent_group_id: agentGroupId,
-        provider: row.provider,
-        model: row.model ?? '',
-        input_tokens: row.input_tokens ?? 0,
-        output_tokens: row.output_tokens ?? 0,
-        cache_read_tokens: row.cache_read_tokens ?? 0,
-        cache_write_tokens: row.cache_write_tokens ?? 0,
-        cost_usd: row.cost_usd ?? 0,
-      });
-      insertCentral.run({
-        ts: row.ts,
-        session_id: sessionId,
-        agent_group_id: agentGroupId,
-        provider: row.provider,
-        model: row.model ?? null,
-        turn_id: row.turn_id ?? null,
-        // `??` (not `||`) so a real 0 steps/duration_ms survives — only an
-        // absent/null value (old container, or a provider with no signal)
-        // becomes NULL.
-        steps: row.steps ?? null,
-        duration_ms: row.duration_ms ?? null,
-        trigger: row.trigger ?? null,
-        rate_limit_type: row.rate_limit_type ?? null,
-        rate_limit_utilization: row.rate_limit_utilization ?? null,
-        rate_limit_resets_at: row.rate_limit_resets_at ?? null,
-        input_tokens: row.input_tokens ?? null,
-        output_tokens: row.output_tokens ?? null,
-        cache_read_tokens: row.cache_read_tokens ?? null,
-        cache_write_tokens: row.cache_write_tokens ?? null,
-        cost_usd: row.cost_usd ?? null,
-      });
+      await db.run(
+        `INSERT INTO usage_daily
+           (date, agent_group_id, provider, model, turns, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
+         VALUES (@date, @agent_group_id, @provider, @model, 1, @input_tokens, @output_tokens, @cache_read_tokens, @cache_write_tokens, @cost_usd)
+         ON CONFLICT(date, agent_group_id, provider, model) DO UPDATE SET
+           turns = turns + 1,
+           input_tokens = input_tokens + excluded.input_tokens,
+           output_tokens = output_tokens + excluded.output_tokens,
+           cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+           cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
+           cost_usd = cost_usd + excluded.cost_usd`,
+        {
+          date: row.ts.slice(0, 10), // ts is ISO-8601 UTC; the date prefix IS the UTC day.
+          agent_group_id: agentGroupId,
+          provider: row.provider,
+          model: row.model ?? '',
+          input_tokens: row.input_tokens ?? 0,
+          output_tokens: row.output_tokens ?? 0,
+          cache_read_tokens: row.cache_read_tokens ?? 0,
+          cache_write_tokens: row.cache_write_tokens ?? 0,
+          cost_usd: row.cost_usd ?? 0,
+        },
+      );
+      // Fleet-hardening Phase 0.1 follow-up: a faithful 1:1 per-turn mirror,
+      // written alongside the usage_daily upsert above rather than replacing
+      // it — `ncl usage` and the dashboard read usage_daily and must not see
+      // any behavior change. Unlike usage_daily, NULLs stay NULL here (this is
+      // a detail ledger, not an additive aggregate with an identity element).
+      await db.run(
+        `INSERT INTO turn_usage
+           (ts, session_id, agent_group_id, provider, model, turn_id, steps, duration_ms, trigger, rate_limit_type, rate_limit_utilization, rate_limit_resets_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
+         VALUES (@ts, @session_id, @agent_group_id, @provider, @model, @turn_id, @steps, @duration_ms, @trigger, @rate_limit_type, @rate_limit_utilization, @rate_limit_resets_at, @input_tokens, @output_tokens, @cache_read_tokens, @cache_write_tokens, @cost_usd)`,
+        {
+          ts: row.ts,
+          session_id: sessionId,
+          agent_group_id: agentGroupId,
+          provider: row.provider,
+          model: row.model ?? null,
+          turn_id: row.turn_id ?? null,
+          // `??` (not `||`) so a real 0 steps/duration_ms survives — only an
+          // absent/null value (old container, or a provider with no signal)
+          // becomes NULL.
+          steps: row.steps ?? null,
+          duration_ms: row.duration_ms ?? null,
+          trigger: row.trigger ?? null,
+          rate_limit_type: row.rate_limit_type ?? null,
+          rate_limit_utilization: row.rate_limit_utilization ?? null,
+          rate_limit_resets_at: row.rate_limit_resets_at ?? null,
+          input_tokens: row.input_tokens ?? null,
+          output_tokens: row.output_tokens ?? null,
+          cache_read_tokens: row.cache_read_tokens ?? null,
+          cache_write_tokens: row.cache_write_tokens ?? null,
+          cost_usd: row.cost_usd ?? null,
+        },
+      );
     }
-    db.prepare(
+    await db.run(
       `INSERT INTO usage_rollup_state (session_dir, last_turn_usage_id) VALUES (?, ?)
        ON CONFLICT(session_dir) DO UPDATE SET last_turn_usage_id = excluded.last_turn_usage_id`,
-    ).run(sessionDirKey, maxId);
-  })();
-  return rows.length;
+      sessionDirKey,
+      maxId,
+    );
+    return fresh.length;
+  }, 'rollupSessionUsage');
 }
 
 /** Read-side query backing `ncl usage list`. Filters are optional and AND'd. */
