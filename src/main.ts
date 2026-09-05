@@ -15,6 +15,7 @@ import { formatBuildInfoLog, readBuildInfo } from './build-info.js';
 import { DATA_DIR, REPO_ROOT } from './config.js';
 import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
+import { shadowWrite } from './db/coordination.js';
 import { getDb, getRawDb, initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
 import { registerSecretsFromEnv } from './secret-scrubber.js';
@@ -247,8 +248,11 @@ export async function main(): Promise<void> {
   // 1-a. Register this host process in `host_instances` and start renewing
   // its lease. Ahead of everything that can spawn, so the row exists before
   // any container work; write-only shadow state — nothing reads it yet
-  // (docs/specs/upstream-restart-survival-seam/plan.md §7.A).
-  await startHostInstanceLease();
+  // (docs/specs/upstream-restart-survival-seam/plan.md §7.A). Through
+  // `shadowWrite` for the same reason: a failed INSERT (contention, a locked
+  // file) must log and let boot continue, never turn shadow state into a
+  // startup dependency. The double-start throw is unreachable here (one call).
+  await shadowWrite('host instance lease start', () => startHostInstanceLease());
 
   // 1-0. Materialize the archive schema before ANY service that can spawn.
   //

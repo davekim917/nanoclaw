@@ -44,3 +44,23 @@ describe('coordination.ts and host-instance.ts are byte-identical to upstream', 
     });
   }
 });
+
+describe('main.ts wires the lease as shadow state', () => {
+  const main = fs.readFileSync(path.join(REPO_ROOT, 'src/main.ts'), 'utf8');
+
+  // A failed `host_instances` INSERT at boot must log and let the host come
+  // up — the lease is write-only shadow state (plan §7.A), never a startup
+  // dependency. Pinned structurally: the only call to the starter goes
+  // through upstream's `shadowWrite`, which swallows and warns.
+  it('starts the lease only through shadowWrite so a failed registration cannot abort boot', () => {
+    const calls = main.match(/startHostInstanceLease\(\)/g) ?? [];
+    expect(calls).toHaveLength(1);
+    expect(main).toMatch(/shadowWrite\([^)]*\(\) => startHostInstanceLease\(\)\)/);
+  });
+
+  it("stops the lease as the first statement of shutdown()'s finally block", () => {
+    const finallyBlock = main.slice(main.indexOf('} finally {', main.indexOf('async function shutdown')));
+    const firstStatement = finallyBlock.replace(/^\} finally \{\s*/, '').replace(/^(\s*\/\/[^\n]*\n)+/, '');
+    expect(firstStatement.startsWith('await stopHostInstanceLease();')).toBe(true);
+  });
+});
