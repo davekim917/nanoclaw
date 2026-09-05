@@ -25,6 +25,7 @@ import {
   CONTAINER_WORKGROUP_LABEL_KEY,
   DATA_DIR,
   GROUPS_DIR,
+  HOST_LEASE_TTL_MS,
   MAX_CONCURRENT_CONTAINERS,
   ONECLI_API_KEY,
   ONECLI_URL,
@@ -84,7 +85,7 @@ import {
   shadowWrite,
   tryClaimSession,
 } from './db/coordination.js';
-import { getHostInstanceId } from './host-instance.js';
+import { getHostInstanceId, startHostInstanceLease } from './host-instance.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { getSession, SESSION_BY_ID_SQL } from './db/sessions.js';
 import { buildCentralProjection } from './db/per-agent-projections.js';
@@ -207,22 +208,37 @@ const activeContainers = new Map<
   }
 >();
 
-// Claimant identity for the session_claims rows: the host's durable lease
-// instance id when the lease is running, else a process-scoped fallback
-// (tests, tools, and any path that runs before startHostInstanceLease()).
-//
-// Fork-forward on upstream: upstream `6b0411c47` shipped the hostname:pid form
-// and its own later commit `692a0b603` ("claims answer to the host-instance
-// lease") replaced it with the lease id. The fork takes the end state directly,
-// so the claimant vocabulary never has to be migrated.
-//
-// This id is what makes a claim ANSWERABLE against `host_instances` liveness:
-// `claimSessionRun` below is the fork's first reader of that table, and the
-// series A lease is what puts a row there to read. A fallback id never matches
-// a lease row, so a claim held under one always reads as not-live — which is
-// the right answer for a tool or a test, neither of which renews a lease.
-function claimantId(): string {
-  return getHostInstanceId() ?? `${os.hostname()}:${process.pid}`;
+/**
+ * The claimant id for `session_claims`, or null when this process has none.
+ *
+ * It is the host's durable lease instance id and nothing else. There is NO
+ * `hostname:pid` fallback — plan §7.A′ point 2 proposed one and it is dropped
+ * deliberately: a claim is only worth taking if a peer can answer it against
+ * `host_instances` liveness, and an id that was never registered there always
+ * reads as dead. A host running under a fallback id would therefore have every
+ * one of its claims taken over by any overlapping host, which is the duplicate
+ * container the claim exists to prevent. Refusing to claim is the safe half of
+ * that trade, and it costs a single-host install nothing: a central DB that
+ * cannot take the one-row lease INSERT could not take the claim row either.
+ *
+ * Fork-forward on upstream: upstream `6b0411c47` shipped the hostname:pid form
+ * and its own later commit `692a0b603` ("claims answer to the host-instance
+ * lease") replaced it with the lease id. The fork takes the end state directly,
+ * so the claimant vocabulary never has to be migrated.
+ *
+ * The lease start in `main()` is fail-open by design (`shadowWrite`, #421), so
+ * a host whose registration failed at boot reaches here with no id. One late
+ * start is attempted from the spawn path — the DB may well be healthy again by
+ * then — and it is also `shadowWrite`-wrapped, because a failed retry must
+ * refuse this one spawn, not throw out of the wake path.
+ */
+async function resolveClaimantId(): Promise<string | null> {
+  const existing = getHostInstanceId();
+  if (existing) return existing;
+  await shadowWrite('host instance lease (late start from the spawn path)', () =>
+    startHostInstanceLease({ leaseTtlMs: HOST_LEASE_TTL_MS }),
+  );
+  return getHostInstanceId();
 }
 
 /**
@@ -245,13 +261,21 @@ function claimantId(): string {
  * unaffected: the whole claim is still the last `await` in the spawn path, and
  * the guard point stays adjacent to `spawn()`.
  *
+ * A process with no durable instance id claims nothing at all — see
+ * `resolveClaimantId` — so a spawn is refused rather than fenced by an id no
+ * peer can answer.
+ *
  * The container half of the fence — refusing a claim whose container is still
  * running untracked — lands with adoption, the series that creates that state
  * (plan §4.3.4, P2).
  */
 async function claimSessionRun(sessionId: string, containerRef: string): Promise<number | null> {
+  const self = await resolveClaimantId();
+  if (!self) {
+    log.warn('Refusing session claim: no durable host instance id — lease not started', { sessionId });
+    return null;
+  }
   const current = await getSessionClaim(sessionId);
-  const self = claimantId();
   if (current?.claimed_by && current.claimed_by !== self) {
     const holder = await getLiveHostInstance(current.claimed_by, new Date().toISOString());
     if (holder) {
@@ -275,10 +299,14 @@ async function claimSessionRun(sessionId: string, containerRef: string): Promise
 /** Release our claim at this incarnation. Never throws — a failed release is
  *  self-healing (the next claimant's CAS supersedes it). */
 async function releaseClaimQuietly(sessionId: string, incarnation: number): Promise<void> {
+  const self = getHostInstanceId();
+  // No id means no claim was ever taken under one (`claimSessionRun` refuses
+  // without it), so there is nothing this process could scope a release to.
+  if (!self) return;
   await shadowWrite('session-claim-release', () =>
     releaseSessionClaim({
       sessionId,
-      instanceId: claimantId(),
+      instanceId: self,
       incarnation,
       now: new Date().toISOString(),
     }),

@@ -72,6 +72,8 @@ const hooks = vi.hoisted(() => ({
   staleRead: false,
   /** `tryClaimSession` rejects — a claim that cannot be recorded. */
   claimWriteFails: false,
+  /** `startHostInstanceLease` rejects — the host has no durable id at all. */
+  leaseStartFails: false,
   /** Parks inside `getSessionClaim`, i.e. immediately before the claim. */
   preClaimGate: null as Promise<void> | null,
   /** Parks `releaseSessionClaim` for one incarnation, keyed by that number. */
@@ -82,6 +84,7 @@ const hooks = vi.hoisted(() => ({
     this.events.length = 0;
     this.staleRead = false;
     this.claimWriteFails = false;
+    this.leaseStartFails = false;
     this.preClaimGate = null;
     this.releaseGates.clear();
     this.storageGate = null;
@@ -115,6 +118,20 @@ vi.mock('./db/coordination.js', async (importOriginal) => {
       const gate = hooks.releaseGates.get(args.incarnation);
       if (gate) await gate;
       return real.releaseSessionClaim(args);
+    },
+  };
+});
+
+// The lease itself is real — `getHostInstanceId` must keep answering from the
+// module's own state — but its registration can be made to fail, which is the
+// state main.ts's fail-open boot leaves behind when the INSERT does not land.
+vi.mock('./host-instance.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./host-instance.js')>();
+  return {
+    ...real,
+    startHostInstanceLease: async (options?: Parameters<typeof real.startHostInstanceLease>[0]) => {
+      if (hooks.leaseStartFails) throw new Error('host_instances INSERT failed');
+      return real.startHostInstanceLease(options);
     },
   };
 });
@@ -231,7 +248,7 @@ import { getSessionClaim } from './db/coordination.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { closeDb, getDb, initDb } from './db/connection.js';
 import { runMigrations } from './db/index.js';
-import { startHostInstanceLease, stopHostInstanceLease } from './host-instance.js';
+import { getHostInstanceId, startHostInstanceLease, stopHostInstanceLease } from './host-instance.js';
 import { log } from './log.js';
 import { allowSubprocess } from './test-hermeticity.js';
 import type { MemoryAdmissionResult } from './memory-admission.js';
@@ -457,6 +474,44 @@ describe('claim-first spawn', () => {
     expect(hasContainerEverRun(sessionId), 'a dead host wedged the session').toBe(true);
     expect(liveHolderRefusals()).toEqual([]);
     await waitForFinalize(sessionId);
+  });
+
+  it('a host without a lease refuses to claim and starts no container', async () => {
+    await seedSession('sess-no-lease');
+    // Boot's lease registration is fail-open (`shadowWrite`), so a host whose
+    // INSERT never landed runs on with no durable id. The retry from the spawn
+    // path fails the same way here.
+    hooks.leaseStartFails = true;
+
+    await expect(wakeContainer(callerSnapshot('sess-no-lease'))).resolves.toBe(false);
+
+    expect(hasContainerEverRun('sess-no-lease'), 'a container started under an unanswerable claimant').toBe(false);
+    expect(
+      vi
+        .mocked(log.warn)
+        .mock.calls.filter(
+          (call) => call[0] === 'Refusing session claim: no durable host instance id — lease not started',
+        )
+        .map((call) => call[1] as { sessionId: string }),
+    ).toEqual([{ sessionId: 'sess-no-lease' }]);
+    // Nothing was written: a claim no peer can answer is worse than no claim.
+    expect(await getSessionClaim('sess-no-lease')).toBeUndefined();
+  });
+
+  it('a late lease start recovers the claim', async () => {
+    await seedSession('sess-late-lease');
+    // No lease from boot — the id only exists because the spawn path started
+    // one on its way to the claim.
+    expect(getHostInstanceId()).toBeNull();
+
+    await wakeContainer(callerSnapshot('sess-late-lease'));
+
+    const instanceId = getHostInstanceId();
+    expect(instanceId, 'the spawn path did not start a lease').not.toBeNull();
+    const claim = await getSessionClaim('sess-late-lease');
+    expect([claim?.incarnation, claim?.claimed_by]).toEqual([1, instanceId]);
+    expect(hasContainerEverRun('sess-late-lease')).toBe(true);
+    await waitForFinalize('sess-late-lease');
   });
 
   it('a claim write failure starts no container', async () => {

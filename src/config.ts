@@ -138,6 +138,15 @@ export const CONTAINER_IMAGE = process.env.CONTAINER_IMAGE || getDefaultContaine
 // Install slug — stamped onto every spawned container via --label so
 // cleanupOrphans only reaps containers from this install, not peers.
 export const INSTALL_SLUG = getInstallSlug(PROJECT_ROOT);
+/**
+ * Lease TTL handed to `startHostInstanceLease`, logged with the §6 evidence
+ * line, and used by the spawn path's late lease start, so the value operators
+ * read is the one in force everywhere. 3x the 30 s renewal interval, matching
+ * upstream's default (src/host-instance.ts). It lives here rather than in
+ * main.ts because `src/container-runner.ts` needs the same number and must not
+ * import the entrypoint.
+ */
+export const HOST_LEASE_TTL_MS = 90_000;
 export const CONTAINER_INSTALL_LABEL = `nanoclaw-install=${INSTALL_SLUG}`;
 // Container name prefix. Load-bearing, and deliberately NOT upstream's `ncl-…`
 // grammar: the snapshot pruner selects live containers by
