@@ -74,6 +74,8 @@ const hooks = vi.hoisted(() => ({
   claimWriteFails: false,
   /** `startHostInstanceLease` rejects — the host has no durable id at all. */
   leaseStartFails: false,
+  /** `renewHostInstanceLease` rejects — a lapsed self lease cannot be re-armed. */
+  leaseRenewalFails: false,
   /** Parks inside `getSessionClaim`, i.e. immediately before the claim. */
   preClaimGate: null as Promise<void> | null,
   /** Parks `releaseSessionClaim` for one incarnation, keyed by that number. */
@@ -85,6 +87,7 @@ const hooks = vi.hoisted(() => ({
     this.staleRead = false;
     this.claimWriteFails = false;
     this.leaseStartFails = false;
+    this.leaseRenewalFails = false;
     this.preClaimGate = null;
     this.releaseGates.clear();
     this.storageGate = null;
@@ -112,6 +115,11 @@ vi.mock('./db/coordination.js', async (importOriginal) => {
       const incarnation = await real.tryClaimSession(args);
       hooks.events.push(`claim:${args.sessionId}:${incarnation}`);
       return incarnation;
+    },
+    renewHostInstanceLease: async (instanceId: string, leaseExpiresAt: string) => {
+      if (hooks.leaseRenewalFails) throw new Error('host_instances renewal failed');
+      hooks.events.push(`renew:${instanceId}`);
+      return real.renewHostInstanceLease(instanceId, leaseExpiresAt);
     },
     releaseSessionClaim: async (args: Parameters<typeof real.releaseSessionClaim>[0]) => {
       hooks.events.push(`release:${args.sessionId}:${args.incarnation}`);
@@ -512,6 +520,41 @@ describe('claim-first spawn', () => {
     expect([claim?.incarnation, claim?.claimed_by]).toEqual([1, instanceId]);
     expect(hasContainerEverRun('sess-late-lease')).toBe(true);
     await waitForFinalize('sess-late-lease');
+  });
+
+  it('an expired self lease refuses the claim and starts no container', async () => {
+    await seedSession('sess-lapsed');
+    // A lease registered with an already-past expiry: `getHostInstanceId()`
+    // still answers from process memory, exactly as it does after ~90 s of
+    // failed renewals, but every peer reads this host as dead.
+    const instanceId = await startHostInstanceLease({ leaseTtlMs: -60_000 });
+    hooks.leaseRenewalFails = true;
+
+    await expect(wakeContainer(callerSnapshot('sess-lapsed'))).resolves.toBe(false);
+
+    expect(hasContainerEverRun('sess-lapsed'), 'a container started under a dead lease').toBe(false);
+    expect(
+      vi
+        .mocked(log.warn)
+        .mock.calls.filter((call) => call[0] === "Refusing session claim: this host's lease is not live")
+        .map((call) => call[1] as { sessionId: string; instanceId: string }),
+    ).toEqual([{ sessionId: 'sess-lapsed', instanceId }]);
+    expect(await getSessionClaim('sess-lapsed')).toBeUndefined();
+  });
+
+  it('a lapsed self lease is renewed inline before the claim', async () => {
+    await seedSession('sess-relapsed');
+    const instanceId = await startHostInstanceLease({ leaseTtlMs: -60_000 });
+
+    await wakeContainer(callerSnapshot('sess-relapsed'));
+
+    // One inline renewal re-armed the row, so the claim went ahead rather than
+    // waiting for the 30 s timer to fire.
+    expect(hooks.events).toContain(`renew:${instanceId}`);
+    const claim = await getSessionClaim('sess-relapsed');
+    expect([claim?.incarnation, claim?.claimed_by]).toEqual([1, instanceId]);
+    expect(hasContainerEverRun('sess-relapsed')).toBe(true);
+    await waitForFinalize('sess-relapsed');
   });
 
   it('a claim write failure starts no container', async () => {

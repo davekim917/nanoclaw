@@ -82,6 +82,7 @@ import {
   getLiveHostInstance,
   getSessionClaim,
   releaseSessionClaim,
+  renewHostInstanceLease,
   shadowWrite,
   tryClaimSession,
 } from './db/coordination.js';
@@ -242,6 +243,39 @@ async function resolveClaimantId(): Promise<string | null> {
 }
 
 /**
+ * Is THIS host's own lease still live, and can it be made live if not?
+ *
+ * `getHostInstanceId()` answers from process memory and keeps answering after
+ * the renewal timer has been failing for longer than the TTL — upstream's
+ * renew path only warns (src/host-instance.ts). Claiming under an expired
+ * lease is the mirror image of the peer check below: our row reads as dead to
+ * everyone else, so a peer takes the session over and spawns a duplicate while
+ * our container is still running.
+ *
+ * So the lease is validated as a durable fact, not a remembered one, and one
+ * inline renewal is attempted before giving up — a lapse is usually a
+ * transient DB blip, and re-arming here is cheaper than refusing every spawn
+ * until the 30 s timer next fires. The renewal is awaited and its failure
+ * swallowed: it is shadow state, and a spawn refusal is the answer either way.
+ *
+ * Scope: this is the self-fence for the SPAWN path only. Containers that are
+ * already running when the lease lapses are not touched — fencing those is
+ * adoption's problem (series E/F), which is where a host learns what it is
+ * still supervising.
+ */
+async function selfLeaseIsLive(instanceId: string): Promise<boolean> {
+  if (await getLiveHostInstance(instanceId, new Date().toISOString())) return true;
+  /* eslint-disable no-catch-all/no-catch-all -- the renewal is shadow state; its failure is answered by refusing the spawn */
+  try {
+    await renewHostInstanceLease(instanceId, new Date(Date.now() + HOST_LEASE_TTL_MS).toISOString());
+  } catch (err) {
+    log.warn('Inline host instance lease renewal failed', { instanceId, err });
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+  return (await getLiveHostInstance(instanceId, new Date().toISOString())) !== undefined;
+}
+
+/**
  * Claim a session this process is about to run. The `session_claims` row is the
  * authority for which process/incarnation owns a session: losing the
  * compare-and-set means another live claimant got there first, and the caller
@@ -256,14 +290,15 @@ async function resolveClaimantId(): Promise<string | null> {
  * crashed claimant must never wedge a session. A claim this same process
  * already holds is takeover-able too, which is what lets a respawn win.
  *
- * The liveness read happens HERE, before the compare-and-set and therefore
- * before this function returns, so the ordering argument at the call site is
- * unaffected: the whole claim is still the last `await` in the spawn path, and
- * the guard point stays adjacent to `spawn()`.
- *
  * A process with no durable instance id claims nothing at all — see
  * `resolveClaimantId` — so a spawn is refused rather than fenced by an id no
- * peer can answer.
+ * peer can answer, and a process whose OWN lease has lapsed is refused too
+ * (`selfLeaseIsLive`): a claim every peer reads as dead is not a claim.
+ *
+ * Both of those reads, and the peer read below, happen inside this function
+ * and therefore inside the single `await` the spawn path makes for the claim.
+ * The ordering argument is unchanged: the claim is still the last `await`
+ * before `spawn()`, and the guard point stays adjacent to it.
  *
  * The container half of the fence — refusing a claim whose container is still
  * running untracked — lands with adoption, the series that creates that state
@@ -273,6 +308,10 @@ async function claimSessionRun(sessionId: string, containerRef: string): Promise
   const self = await resolveClaimantId();
   if (!self) {
     log.warn('Refusing session claim: no durable host instance id — lease not started', { sessionId });
+    return null;
+  }
+  if (!(await selfLeaseIsLive(self))) {
+    log.warn("Refusing session claim: this host's lease is not live", { sessionId, instanceId: self });
     return null;
   }
   const current = await getSessionClaim(sessionId);
