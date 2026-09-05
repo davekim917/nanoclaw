@@ -97,7 +97,7 @@ function canonicalArgKey(key: string): string {
  * past this point — so every such alias is a hard conflict, whether the pair
  * is stdin-vs-argv or two stdin keys.
  *
- * `__proto__` is rejected outright as a prototype-pollution guard: parsed
+ * `__proto__` and keys that normalize to it are rejected outright as a prototype-pollution guard: parsed
  * args flow into downstream handlers that copy them by plain assignment.
  */
 function assertNoKeyConflicts(
@@ -112,15 +112,15 @@ function assertNoKeyConflicts(
 
   const stdinKeysByCanonical = new Map<string, string>();
   for (const key of Object.keys(stdinArgs)) {
-    if (key === '__proto__') {
-      throw new StdinJsonInputError('--stdin-json key "__proto__" is not allowed');
+    const canonical = canonicalArgKey(key);
+    if (canonical === '__proto__') {
+      throw new StdinJsonInputError(`--stdin-json key "${key}" is not allowed`);
     }
 
     if (Object.prototype.hasOwnProperty.call(argvArgs, key)) {
       throw new StdinJsonInputError(`--stdin-json key "${key}" is also supplied on argv`);
     }
 
-    const canonical = canonicalArgKey(key);
     const argvKey = argvKeysByCanonical.get(canonical);
     if (argvKey !== undefined) {
       throw new StdinJsonInputError(

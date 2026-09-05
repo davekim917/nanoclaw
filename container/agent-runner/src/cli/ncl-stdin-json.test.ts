@@ -59,4 +59,15 @@ describe('container CLI --stdin-json entry point', () => {
     expect(result.stdout).toBe('');
     expect(result.stderr).toBe('ncl: --stdin-json input is not valid UTF-8\n');
   });
+  test.each(['--proto--', '__proto--', '--proto__', '_-proto-_'])(
+    'rejects prototype key alias %s before dispatch',
+    (key) => {
+      const result = runClient(JSON.stringify({ [key]: { cli_scope: 'global' } }));
+
+      expect(result.status).toBe(2);
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toBe(`ncl: --stdin-json key "${key}" is not allowed\n`);
+    },
+  );
+
 });
