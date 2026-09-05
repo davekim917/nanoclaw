@@ -32,6 +32,7 @@ import { resetProcessingChannelIngress } from './db/channel-ingress-receipts.js'
 import { stopAllContainers } from './container-runner.js';
 import { writeUpstreamPolicySnapshot } from './container-updates.js';
 import { setDeliveryAdapter, startActiveDeliveryPoll, startSweepDeliveryPoll, stopDeliveryPolls } from './delivery.js';
+import { startHostInstanceLease, stopHostInstanceLease } from './host-instance.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { ensureArchiveSchema } from './message-archive.js';
 import { startHostModules, stopHostModules } from './host-lifecycle.js';
@@ -242,6 +243,12 @@ export async function main(): Promise<void> {
   await initDb(dbPath);
   const db = getRawDb();
   runMigrations(db);
+
+  // 1-a. Register this host process in `host_instances` and start renewing
+  // its lease. Ahead of everything that can spawn, so the row exists before
+  // any container work; write-only shadow state — nothing reads it yet
+  // (docs/specs/upstream-restart-survival-seam/plan.md §7.A).
+  await startHostInstanceLease();
 
   // 1-0. Materialize the archive schema before ANY service that can spawn.
   //
@@ -658,6 +665,11 @@ async function shutdown(signal: string): Promise<void> {
       log.error('stopAllContainers threw', { err });
     }
   } finally {
+    // Stamp `stopped_at` FIRST so a graceful exit is durably distinguishable
+    // from a crash even if the teardown above threw — in the `try` a throw
+    // from teardownChannelAdapters() would skip it and leave the row looking
+    // crash-ended for the 90 s lease TTL. Never throws.
+    await stopHostInstanceLease();
     // Always reset on graceful shutdown — even if teardown threw, we got here
     // via SIGTERM/SIGINT, not a crash, so the next start shouldn't be counted
     // as one.
