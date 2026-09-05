@@ -16,12 +16,18 @@
  * TypeScript checker rather than by text — `db`, `raw`, `conn` and `driver` are
  * all just names, and a grep cannot tell which handle any of them holds:
  *
- *   1. a receiver typed `DbDriver` is forbidden anywhere in src/;
+ *   1. a receiver typed `DbDriver` appears only in `src/db/central-lease.ts`;
  *   2. a receiver typed better-sqlite3 `Database` appears only in the pinned
  *      files below.
  *
- * PR 6 flips (1) in the same commit that converts all ten central sites onto
- * `centralTransaction`.
+ * (1) opened up in PR 6a, which landed the lease itself: `centralTransaction`
+ * acquires a fork-level lease before it calls `DbDriver.transaction`, so a
+ * synchronous central block can no longer land inside an open `BEGIN
+ * IMMEDIATE` — it waits for the lease instead. Every OTHER file is still
+ * forbidden to call `DbDriver.transaction`, because going around the lease is
+ * exactly the hazard the lease removes. PR 6 moves the eleven central sites
+ * from a raw receiver onto `centralTransaction`, which is when list (2) starts
+ * shrinking.
  *
  * Both positive fixtures live in src/db/transaction-fixtures/ and are analyzed
  * by the same resolver, so a resolver that silently stopped seeing either shape
@@ -47,6 +53,16 @@ const SRC_ROOT = path.join(REPO_ROOT, 'src');
  * editing them is already a failure — they need no rule here.
  */
 const EXCLUDED_DIRS = ['src/db/drivers/', 'src/db/testing/', 'src/db/transaction-fixtures/'] as const;
+
+/**
+ * The only fork file allowed to call `DbDriver.transaction` (plan §4.4).
+ *
+ * It is also the POSITIVE fixture for the driver-receiver half of the resolver:
+ * the test below asserts the call is still found there, so a resolver that
+ * silently stopped classifying driver receivers fails instead of reporting an
+ * empty offender list.
+ */
+export const DRIVER_TRANSACTION_FILES: readonly string[] = ['src/db/central-lease.ts'];
 
 /**
  * The ten CENTRAL-DB (`data/v2.db`) raw transaction sites. These are the ones
@@ -204,14 +220,21 @@ describe('every .transaction( receiver in src/', () => {
     expect(inScope.filter((c) => c.kind === 'other')).toEqual([]);
   });
 
-  it('opens NO driver transaction anywhere', () => {
-    const offenders = inScope.filter((c) => c.kind === 'db-driver').map((c) => `${c.file}:${c.line}`);
+  it('opens a driver transaction only inside the central lease', () => {
+    const offenders = inScope
+      .filter((c) => c.kind === 'db-driver' && !DRIVER_TRANSACTION_FILES.includes(c.file))
+      .map((c) => `${c.file}:${c.line}`);
     expect(
       offenders,
-      'DbDriver.transaction() is forbidden until seam-3 PR 6 lands src/db/central-lease.ts: while raw ' +
-        'and driver statements share one connection, an open driver transaction yields at every await ' +
-        'and a raw statement can execute inside it. See plan §4.1 / risk R4.',
+      'DbDriver.transaction() belongs to src/db/central-lease.ts alone. Calling it directly skips the ' +
+        'fork lease, and a synchronous central block can then land inside the open BEGIN IMMEDIATE and ' +
+        'roll back with it. Use centralTransaction(). See plan §4.1 / §4.4 / risk R4.',
     ).toEqual([]);
+  });
+
+  it('still finds the driver-receiver call it allows, so the rule is not vacuous', () => {
+    const inLease = inScope.filter((c) => c.file === 'src/db/central-lease.ts');
+    expect(inLease.map((c) => c.kind)).toEqual(['db-driver']);
   });
 
   it('keeps raw better-sqlite3 transactions inside the pinned file set', () => {
@@ -229,7 +252,11 @@ describe('every .transaction( receiver in src/', () => {
   });
 
   it('pins real, unique, sorted paths', () => {
-    for (const list of [CENTRAL_DB_RAW_TRANSACTION_FILES, OTHER_SQLITE_RAW_TRANSACTION_FILES]) {
+    for (const list of [
+      CENTRAL_DB_RAW_TRANSACTION_FILES,
+      OTHER_SQLITE_RAW_TRANSACTION_FILES,
+      DRIVER_TRANSACTION_FILES,
+    ]) {
       expect(list).toEqual([...list].sort());
       expect(new Set(list).size).toBe(list.length);
       expect(list.filter((f) => !fs.existsSync(path.join(REPO_ROOT, f)))).toEqual([]);
