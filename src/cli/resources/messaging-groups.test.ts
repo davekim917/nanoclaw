@@ -201,7 +201,7 @@ describe('messaging-groups CLI notify', () => {
       group.platform_id,
       null,
       'chat',
-      JSON.stringify({ text: 'Weekly report body' }),
+      JSON.stringify({ text: 'Weekly report body', requireCompleteDelivery: true }),
       undefined,
       group.instance,
     );
@@ -209,6 +209,32 @@ describe('messaging-groups CLI notify', () => {
       .prepare('SELECT COUNT(*) AS count FROM messaging_group_agents WHERE messaging_group_id = ?')
       .get(group.id) as { count: number };
     expect(wiringCount.count).toBe(0);
+  });
+
+  it('rejects CLI groups instead of treating an absent terminal client as delivered', async () => {
+    const cliGroup: MessagingGroup = {
+      id: 'mg-cli-notify',
+      channel_type: 'cli',
+      platform_id: 'local',
+      instance: 'cli',
+      name: null,
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: new Date().toISOString(),
+    };
+    createMessagingGroup(cliGroup);
+
+    const response = await dispatch(
+      {
+        id: 'notify-cli',
+        command: 'messaging-groups-notify',
+        args: { id: cliGroup.id, text: 'Weekly report body' },
+      },
+      { caller: 'host' },
+    );
+
+    expect(response).toMatchObject({ ok: false, error: { code: 'handler-error', message: /CLI messaging groups/ } });
+    expect(getDeliveryAdapter).not.toHaveBeenCalled();
   });
 
   it('fails cleanly when the target or delivery adapter is unavailable', async () => {

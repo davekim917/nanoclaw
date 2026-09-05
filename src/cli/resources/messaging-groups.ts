@@ -142,6 +142,9 @@ registerResource({
         const id = args.id as string;
         const mg = getMessagingGroup(id);
         if (!mg) throw new Error(`messaging group not found: ${id}`);
+        if (mg.channel_type === 'cli') {
+          throw new Error('CLI messaging groups cannot receive host notifications');
+        }
 
         const adapter = getDeliveryAdapter();
         if (!adapter) throw new Error('delivery adapter unavailable');
@@ -151,7 +154,7 @@ registerResource({
           mg.platform_id,
           null,
           'chat',
-          JSON.stringify({ text: args.text as string }),
+          JSON.stringify({ text: args.text as string, requireCompleteDelivery: true }),
           undefined,
           mg.instance ?? mg.channel_type,
         );

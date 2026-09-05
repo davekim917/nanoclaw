@@ -23,13 +23,18 @@ function createOwnerDb(dbPath: string, includeDm = true): void {
   db.exec(`
     CREATE TABLE user_roles (user_id TEXT NOT NULL, role TEXT NOT NULL);
     CREATE TABLE user_dms (user_id TEXT NOT NULL, messaging_group_id TEXT NOT NULL, channel_type TEXT NOT NULL, resolved_at TEXT NOT NULL);
-    CREATE TABLE messaging_groups (id TEXT PRIMARY KEY, platform_id TEXT NOT NULL, instance TEXT NOT NULL DEFAULT 'test-channel');
+    CREATE TABLE messaging_groups (
+      id TEXT PRIMARY KEY,
+      channel_type TEXT NOT NULL,
+      platform_id TEXT NOT NULL,
+      instance TEXT NOT NULL DEFAULT 'test-channel'
+    );
   `);
   db.exec(`INSERT INTO user_roles VALUES ('test-channel:owner-user', 'owner');`);
   if (includeDm) {
     db.exec(`
-      INSERT INTO messaging_groups (id, platform_id) VALUES ('older-dm', 'destination-older');
-      INSERT INTO messaging_groups (id, platform_id) VALUES ('newer-dm', 'destination-newer');
+      INSERT INTO messaging_groups (id, channel_type, platform_id) VALUES ('older-dm', 'test-channel', 'destination-older');
+      INSERT INTO messaging_groups (id, channel_type, platform_id) VALUES ('newer-dm', 'test-channel', 'destination-newer');
       INSERT INTO user_dms VALUES ('test-channel:owner-user', 'older-dm', 'test-channel', '2026-01-01T00:00:00.000Z');
       INSERT INTO user_dms VALUES ('test-channel:owner-user', 'newer-dm', 'test-channel', '2026-02-01T00:00:00.000Z');
     `);
@@ -75,6 +80,19 @@ describe('upstream dry-run owner notification', () => {
   it('resolves the latest owner DM through roles, DM cache, and messaging groups', () => {
     const dbPath = path.join(fixtureRoot(), 'v2.db');
     createOwnerDb(dbPath);
+
+    expect(resolveLatestOwnerDm(dbPath)).toEqual({ messagingGroupId: 'newer-dm' });
+  });
+
+  it('skips a newer CLI cache row because it has no durable delivery target', () => {
+    const dbPath = path.join(fixtureRoot(), 'v2.db');
+    createOwnerDb(dbPath);
+    const db = new Database(dbPath);
+    db.exec(`
+      INSERT INTO messaging_groups (id, channel_type, platform_id) VALUES ('cli-dm', 'cli', 'local');
+      INSERT INTO user_dms VALUES ('test-channel:owner-user', 'cli-dm', 'cli', '2026-03-01T00:00:00.000Z');
+    `);
+    db.close();
 
     expect(resolveLatestOwnerDm(dbPath)).toEqual({ messagingGroupId: 'newer-dm' });
   });

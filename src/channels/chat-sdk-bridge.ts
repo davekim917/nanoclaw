@@ -1438,6 +1438,11 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       const rawText = (content.markdown as string) || (content.text as string);
       const text = rawText ? transformStatusOrText(rawText, message.kind) : rawText;
       if (text) {
+        // Host notifications use this opt-in to make an incomplete multi-chunk
+        // report fail instead of looking delivered. Ordinary chat keeps the
+        // truncation path below: rethrowing there would retry chunks that the
+        // platform already accepted and duplicate a user's reply.
+        const requireCompleteDelivery = content.requireCompleteDelivery === true;
         // Attach files if present (FileUpload format: { data, filename })
         const fileUploads = message.files?.map((f: { data: Buffer; filename: string }) => ({
           data: f.data,
@@ -1513,7 +1518,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
               // would re-post every chunk that already landed and the user
               // sees duplicates (in extreme cases MAX_DELIVERY_ATTEMPTS ×
               // successful chunks).
-              if (i === 0) throw err;
+              if (i === 0 || requireCompleteDelivery) throw err;
               log.warn('chat-sdk-bridge: chunk post failed mid-message; truncating to avoid duplicate-on-retry', {
                 chunkIndex: i,
                 totalChunks: chunks.length,

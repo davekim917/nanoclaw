@@ -35,10 +35,10 @@ export function resolveLatestOwnerDm(dbPath: string): OwnerDm | undefined {
       (db
         .prepare(
           `SELECT mg.id AS messagingGroupId
-             FROM user_roles ur
-             JOIN user_dms ud ON ud.user_id = ur.user_id
-             JOIN messaging_groups mg ON mg.id = ud.messaging_group_id
-            WHERE ur.role = 'owner'
+            FROM user_roles ur
+            JOIN user_dms ud ON ud.user_id = ur.user_id
+            JOIN messaging_groups mg ON mg.id = ud.messaging_group_id
+            WHERE ur.role = 'owner' AND mg.channel_type <> 'cli'
             ORDER BY ud.resolved_at DESC
             LIMIT 1`,
         )
