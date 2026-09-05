@@ -135,9 +135,7 @@ describe('coordination accessors', () => {
   });
 
   it('recordDeliveryAttempt returns the running count and clearDeliveryAttempt removes the row', async () => {
-    expect(
-      await recordDeliveryAttempt({ messageId: 'm1', sessionId: 's1', now: NOW, nextAttemptAt: LATER }),
-    ).toBe(1);
+    expect(await recordDeliveryAttempt({ messageId: 'm1', sessionId: 's1', now: NOW, nextAttemptAt: LATER })).toBe(1);
     expect(
       await recordDeliveryAttempt({
         messageId: 'm1',
