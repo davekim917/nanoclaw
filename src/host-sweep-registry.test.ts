@@ -225,7 +225,7 @@ vi.mock('./modules/orchestrator-dispatch/db/tasks.js', async (importOriginal) =>
 });
 vi.mock('./modules/orchestrator-dispatch/db/agent-group-capabilities.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./modules/orchestrator-dispatch/db/agent-group-capabilities.js')>()),
-  getCapabilityConfig: () => undefined,
+  getCapabilityConfig: async () => undefined,
 }));
 vi.mock('./modules/orchestrator-dispatch/watchdog.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('./modules/orchestrator-dispatch/watchdog.js')>();

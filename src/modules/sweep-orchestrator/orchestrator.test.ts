@@ -271,7 +271,7 @@ describe('the task watchdog transitions and parent notifications are unchanged',
     mockHasContainerEverRun.mockReturnValue(true);
     mockWakeContainer.mockResolvedValue(true);
     mockWriteSessionMessage.mockResolvedValue(undefined);
-    mockGetCapabilityConfig.mockReturnValue(null); // use defaults
+    mockGetCapabilityConfig.mockResolvedValue(null); // use defaults
     mockPendingTerminalDispatchOutboundSeenAt.mockReturnValue(null);
   });
 
@@ -424,7 +424,7 @@ describe('the task watchdog transitions and parent notifications are unchanged',
       last_progress_at: new Date(NOW - 35 * 60 * 1000).toISOString(), // 35 min ago
     });
     // Custom timeout of 60 min — 35 min is within timeout, so no reap
-    mockGetCapabilityConfig.mockReturnValue({
+    mockGetCapabilityConfig.mockResolvedValue({
       noProgressTimeoutSec: 3600,
       spawnDeadlineSec: 600,
       drainGraceSec: 180,
@@ -444,7 +444,7 @@ describe('the task watchdog transitions and parent notifications are unchanged',
     const task = makeTask({
       last_progress_at: new Date(NOW - 35 * 60 * 1000).toISOString(), // 35 min ago — past 30 min default
     });
-    mockGetCapabilityConfig.mockReturnValue(null); // no config
+    mockGetCapabilityConfig.mockResolvedValue(null); // no config
     mockGetActiveTasks.mockReturnValue([task]);
     mockTransitionToTerminal.mockReturnValue(true);
 
@@ -688,7 +688,7 @@ describe('the dormant module takes no action when the spawn_task capability is r
     capabilityGranted = false;
     mockGetActiveTasks.mockImplementation(() => (capabilityGranted ? [eligibleActiveTask] : []));
     mockGetOrphanedTasks.mockImplementation(() => (capabilityGranted ? [eligibleOrphanedTask] : []));
-    mockGetCapabilityConfig.mockImplementation(() => (capabilityGranted ? { noProgressTimeoutSec: 1800 } : null));
+    mockGetCapabilityConfig.mockImplementation(async () => (capabilityGranted ? { noProgressTimeoutSec: 1800 } : null));
     mockGetSession.mockReturnValue(fakeParentSession());
     mockTransitionToTerminal.mockReturnValue(true);
     mockIsContainerRunning.mockReturnValue(true);

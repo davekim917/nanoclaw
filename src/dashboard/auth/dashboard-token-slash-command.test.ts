@@ -68,8 +68,8 @@ afterEach(() => {
 
 describe('dashboardTokenSlashCommand', () => {
   it('test_authorized_admin_mints_and_replies_ephemerally', async () => {
-    vi.mocked(isAnyAdmin).mockReturnValue(true);
-    vi.mocked(hasAnyMembership).mockReturnValue(false);
+    vi.mocked(isAnyAdmin).mockResolvedValue(true);
+    vi.mocked(hasAnyMembership).mockResolvedValue(false);
     vi.mocked(mintDashboardTokenUrl).mockResolvedValue({
       url: 'http://localhost:3000/observatory/#token=abc123',
       ttlHours: 720,
@@ -94,8 +94,8 @@ describe('dashboardTokenSlashCommand', () => {
   });
 
   it('test_authorized_member_without_admin_role_mints', async () => {
-    vi.mocked(isAnyAdmin).mockReturnValue(false);
-    vi.mocked(hasAnyMembership).mockReturnValue(true);
+    vi.mocked(isAnyAdmin).mockResolvedValue(false);
+    vi.mocked(hasAnyMembership).mockResolvedValue(true);
     vi.mocked(mintDashboardTokenUrl).mockResolvedValue({ url: 'http://x/#token=y', ttlHours: 24 });
 
     await dashboardTokenSlashCommand(makeEvent());
@@ -105,8 +105,8 @@ describe('dashboardTokenSlashCommand', () => {
   });
 
   it('test_unauthorized_user_gets_ephemeral_denial_no_mint', async () => {
-    vi.mocked(isAnyAdmin).mockReturnValue(false);
-    vi.mocked(hasAnyMembership).mockReturnValue(false);
+    vi.mocked(isAnyAdmin).mockResolvedValue(false);
+    vi.mocked(hasAnyMembership).mockResolvedValue(false);
 
     await dashboardTokenSlashCommand(makeEvent());
 
@@ -122,7 +122,7 @@ describe('dashboardTokenSlashCommand', () => {
   });
 
   it('test_missing_response_url_is_a_noop', async () => {
-    vi.mocked(isAnyAdmin).mockReturnValue(true);
+    vi.mocked(isAnyAdmin).mockResolvedValue(true);
 
     await dashboardTokenSlashCommand(makeEvent({ raw: {} }));
 
@@ -133,7 +133,7 @@ describe('dashboardTokenSlashCommand', () => {
   it('test_reply_never_carries_channel_id_only_response_url', async () => {
     // Regression guard: the handler must never fall back to posting via a
     // channel/messaging-group path (which would require bot membership).
-    vi.mocked(isAnyAdmin).mockReturnValue(true);
+    vi.mocked(isAnyAdmin).mockResolvedValue(true);
     vi.mocked(mintDashboardTokenUrl).mockResolvedValue({ url: 'http://x/#token=z', ttlHours: 1 });
 
     await dashboardTokenSlashCommand(makeEvent({ raw: { response_url: 'https://hooks.slack.com/commands/T1/2/def' } }));
