@@ -49,9 +49,9 @@ function commit(root: string, value: string, message = value): string {
   return runGit(root, ['rev-parse', 'HEAD']);
 }
 
-function fixture(): { root: string; hook: string; log: string; bin: string } {
+function fixture(objectFormat?: 'sha256'): { root: string; hook: string; log: string; bin: string } {
   const root = tempRoot();
-  runGit(root, ['init', '--quiet']);
+  runGit(root, objectFormat ? ['init', `--object-format=${objectFormat}`, '--quiet'] : ['init', '--quiet']);
   runGit(root, ['config', 'user.email', 'test@example.invalid']);
   runGit(root, ['config', 'user.name', 'Hook Test']);
   fs.mkdirSync(path.join(root, '.nanoclaw'), { recursive: true });
@@ -337,6 +337,38 @@ describe('.husky/pre-push', () => {
       expect(records(f.log).join('\n')).toContain('configured-new-ref');
     },
   );
+
+  it.each([
+    ['tree', 'Private Customer', 'clean message', 'boundary:Private Customer'],
+    ['message', 'clean-original', 'fix: Private Customer', undefined],
+  ] as const)('gates the original replaced commit %s', (_surface, originalValue, originalMessage, fail) => {
+    const f = fixture();
+    const base = commit(f.root, 'base');
+    const original = commit(f.root, originalValue, originalMessage);
+    runGit(f.root, ['-c', 'core.hooksPath=/dev/null', 'checkout', '--detach', base, '--quiet']);
+    const replacement = commit(f.root, 'clean-replacement', 'clean replacement');
+    runGit(f.root, ['replace', original, replacement]);
+
+    const result = push(f, `refs/heads/current ${original} refs/heads/current ${zeroSha}\n`, { fail });
+
+    expect(result.status).toBe(1);
+    if (fail) {
+      expect(records(f.log).join('\n')).toContain('Private Customer');
+      expect(records(f.log).join('\n')).not.toContain('clean-replacement');
+    } else {
+      expect(result.stderr).toContain('private-identifier');
+    }
+  });
+
+  it('skips SHA-256 ref deletions', () => {
+    const f = fixture('sha256');
+    const pushed = commit(f.root, 'sha256-pushed');
+    const zeroSha256 = '0'.repeat(64);
+    const result = push(f, `refs/heads/deleted ${zeroSha256} refs/heads/deleted ${pushed}\n`);
+
+    expect(result.status).toBe(0);
+    expect(fs.existsSync(f.log)).toBe(false);
+  });
 
   it.each([
     [

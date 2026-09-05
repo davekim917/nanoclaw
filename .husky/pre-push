@@ -12,9 +12,15 @@ for git_env in $git_local_env; do
     *) unset "$git_env" ;;
   esac
 done
+# Pack transfer sends original objects, even when local replacement refs exist.
+export GIT_NO_REPLACE_OBJECTS=1
 remote_name=$1
 remote_url=$2
-zero_sha=0000000000000000000000000000000000000000
+case "$(git -C "$worktree_root" rev-parse --show-object-format)" in
+  sha1) zero_sha=$(printf '%040d' 0) ;;
+  sha256) zero_sha=$(printf '%064d' 0) ;;
+  *) echo "pre-push: unsupported repository object format" >&2; exit 1 ;;
+esac
 refs_file=''
 seen_commits=''
 advertised_refs=''
