@@ -172,7 +172,7 @@ export async function assignAttentionItem(
 
   // The SAME join that produced the row's `assignable_agents`. Re-derived, never
   // trusted from the request.
-  const wired = wiredAgentsByChannel().get(item.channel_key) ?? [];
+  const wired = (await wiredAgentsByChannel()).get(item.channel_key) ?? [];
   const target = wired.find((a) => a.agent_group_id === agentGroupId) ?? null;
 
   const payload: ObservatoryAssignPayload = {

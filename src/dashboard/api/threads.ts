@@ -26,7 +26,7 @@
  * {@link liveContainerState}). Everything else on the row comes from one
  * central-DB query plus a `statSync` per session.
  */
-import { getRawDb } from '../../db/connection.js';
+import { getDb } from '../../db/connection.js';
 import { getContainerConfig, resolveProviderName } from '../../db/container-configs.js';
 import { TASKS_SYSTEM_THREAD_ID } from '../../db/sessions.js';
 import { readSessionOutbound, type ContainerState } from '../../modules/mailbox/index.js';
@@ -609,7 +609,7 @@ const MAX_LIMIT = 1000;
  * happens in JS below (`parseUtcTimestampMs`) rather than in SQL — a string comparison
  * between the two shapes silently sorts every ISO value above every naive one.
  */
-function selectScopedSessions(
+async function selectScopedSessions(
   ctx: AuthedRequestContext,
   opts: {
     workgroupId?: string | null;
@@ -619,7 +619,7 @@ function selectScopedSessions(
     threadId?: string | null;
   },
   now: number,
-): ThreadSessionRow[] {
+): Promise<ThreadSessionRow[]> {
   const conditions: string[] = ["s.status = 'active'"];
   const values: unknown[] = [];
 
@@ -682,9 +682,7 @@ function selectScopedSessions(
             ) t ON t.child_session_id = s.id AND t.rn = 1
      WHERE ${conditions.join(' AND ')}
   `;
-  return getRawDb()
-    .prepare(sql)
-    .all(...(values as [])) as ThreadSessionRow[];
+  return getDb().all<ThreadSessionRow>(sql, ...values);
 }
 
 export interface ChannelDirectory {
@@ -701,17 +699,17 @@ export interface ChannelDirectory {
 }
 
 /** `messaging_groups.platform_id` → friendly name, and the key set §3.2 parses against. */
-export function readChannelDirectory(): ChannelDirectory {
+export async function readChannelDirectory(): Promise<ChannelDirectory> {
   const known = new Set<string>();
   const names = new Map<string, string>();
   const byId = new Map<string, string>();
   const dmDedupeKey = new Map<string, string>();
   try {
-    const rows = getRawDb().prepare('SELECT id, platform_id, name FROM messaging_groups').all() as {
+    const rows = await getDb().all<{
       id: string;
       platform_id: string;
       name: string | null;
-    }[];
+    }>('SELECT id, platform_id, name FROM messaging_groups');
     for (const r of rows) {
       known.add(r.platform_id);
       byId.set(r.id, r.platform_id);
@@ -745,15 +743,18 @@ export function readChannelDirectory(): ChannelDirectory {
   // that needs the fallback today (zero name collisions among the uncovered
   // rows), so it is left out rather than built speculatively.
   try {
-    const dmRows = getRawDb()
-      .prepare(
-        `SELECT mg.platform_id AS platform_id, ud.channel_type AS channel_type, ud.user_id AS user_id,
-                u.display_name AS display_name
-           FROM user_dms ud
-           JOIN messaging_groups mg ON mg.id = ud.messaging_group_id
-           LEFT JOIN users u ON u.id = ud.user_id`,
-      )
-      .all() as { platform_id: string; channel_type: string; user_id: string; display_name: string | null }[];
+    const dmRows = await getDb().all<{
+      platform_id: string;
+      channel_type: string;
+      user_id: string;
+      display_name: string | null;
+    }>(
+      `SELECT mg.platform_id AS platform_id, ud.channel_type AS channel_type, ud.user_id AS user_id,
+              u.display_name AS display_name
+         FROM user_dms ud
+         JOIN messaging_groups mg ON mg.id = ud.messaging_group_id
+         LEFT JOIN users u ON u.id = ud.user_id`,
+    );
     for (const r of dmRows) {
       const rawUserId = r.user_id.startsWith(`${r.channel_type}:`)
         ? r.user_id.slice(r.channel_type.length + 1)
@@ -806,28 +807,26 @@ export interface WiredAgent {
   session_mode: SessionMode;
 }
 
-export function wiredAgentsByChannel(): Map<string, WiredAgent[]> {
+export async function wiredAgentsByChannel(): Promise<Map<string, WiredAgent[]>> {
   const byChannel = new Map<string, WiredAgent[]>();
   let rows: (WiredAgent & { platform_id: string })[];
   try {
-    rows = getRawDb()
-      .prepare(
-        // `session_mode` is per WIRING (messaging_group_agents), not per
-        // channel, and the COALESCE default is `per-thread` — the operational
-        // default `getMessagingGroupAgents` hydrates to, not the stale `shared`
-        // in the CREATE TABLE. Reading it off `messaging_groups` would not even
-        // compile against the real schema.
-        `SELECT mg.platform_id                          AS platform_id,
-                mg.id                                   AS messaging_group_id,
-                COALESCE(mga.session_mode,'per-thread') AS session_mode,
-                ag.id                                   AS agent_group_id,
-                ag.name                                 AS name,
-                ag.folder                               AS folder
-           FROM messaging_group_agents mga
-           JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
-           JOIN agent_groups     ag ON ag.id = mga.agent_group_id`,
-      )
-      .all() as (WiredAgent & { platform_id: string })[];
+    // `session_mode` is per WIRING (messaging_group_agents), not per channel,
+    // and the COALESCE default is `per-thread` — the operational default
+    // `getMessagingGroupAgents` hydrates to, not the stale `shared` in the
+    // CREATE TABLE. Reading it off `messaging_groups` would not even compile
+    // against the real schema.
+    rows = await getDb().all<WiredAgent & { platform_id: string }>(
+      `SELECT mg.platform_id                          AS platform_id,
+              mg.id                                   AS messaging_group_id,
+              COALESCE(mga.session_mode,'per-thread') AS session_mode,
+              ag.id                                   AS agent_group_id,
+              ag.name                                 AS name,
+              ag.folder                               AS folder
+         FROM messaging_group_agents mga
+         JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+         JOIN agent_groups     ag ON ag.id = mga.agent_group_id`,
+    );
   } catch (err) {
     log.warn('threads: wiring lookup failed', { err });
     return byChannel;
@@ -961,9 +960,7 @@ async function resolveIdentities(
   const agentIds = [...new Set([...wanted.values()].map((p) => p.agentGroupId))];
   const groups = new Map(
     (
-      getRawDb()
-        .prepare(`SELECT * FROM agent_groups WHERE id IN (${agentIds.map(() => '?').join(', ')})`)
-        .all(...agentIds) as AgentGroup[]
+      await getDb().all<AgentGroup>(`SELECT * FROM agent_groups WHERE id IN (${agentIds.map(() => '?').join(', ')})`, ...agentIds)
     ).map((g) => [g.id, g]),
   );
 
@@ -972,14 +969,13 @@ async function resolveIdentities(
   // ~20 round trips here.
   const avatars = new Map<string, string | null>();
   try {
-    const rows = getRawDb()
-      .prepare(
-        `SELECT mga.agent_group_id AS agent_group_id, mg.channel_type AS channel_type
-           FROM messaging_group_agents mga
-           JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
-          WHERE mga.agent_group_id IN (${agentIds.map(() => '?').join(', ')})`,
-      )
-      .all(...agentIds) as { agent_group_id: string; channel_type: string }[];
+    const rows = await getDb().all<{ agent_group_id: string; channel_type: string }>(
+      `SELECT mga.agent_group_id AS agent_group_id, mg.channel_type AS channel_type
+         FROM messaging_group_agents mga
+         JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+        WHERE mga.agent_group_id IN (${agentIds.map(() => '?').join(', ')})`,
+      ...agentIds,
+    );
     for (const r of rows) {
       if (avatars.get(r.agent_group_id)) continue;
       avatars.set(r.agent_group_id, avatarByChannelType(r.channel_type));
@@ -1033,18 +1029,21 @@ async function resolveIdentities(
  * claim-derived, and claims are per-workgroup files rather than DB rows. One
  * directory scan per workgroup — a handful — not one per thread.
  */
-export function readClaimsByThread(agentGroupIds: string[], now: number, claimsRoot?: string): Map<string, BoardClaim> {
+export async function readClaimsByThread(
+  agentGroupIds: string[],
+  now: number,
+  claimsRoot?: string,
+): Promise<Map<string, BoardClaim>> {
   const byThread = new Map<string, BoardClaim>();
   if (agentGroupIds.length === 0) return byThread;
   let workgroupIds: string[];
   try {
     workgroupIds = (
-      getRawDb()
-        .prepare(
-          `SELECT DISTINCT workgroup_id FROM agent_groups
-            WHERE workgroup_id IS NOT NULL AND id IN (${agentGroupIds.map(() => '?').join(', ')})`,
-        )
-        .all(...agentGroupIds) as { workgroup_id: string }[]
+      await getDb().all<{ workgroup_id: string }>(
+        `SELECT DISTINCT workgroup_id FROM agent_groups
+          WHERE workgroup_id IS NOT NULL AND id IN (${agentGroupIds.map(() => '?').join(', ')})`,
+        ...agentGroupIds,
+      )
     ).map((r) => r.workgroup_id);
   } catch (err) {
     log.warn('threads: workgroup lookup for claims failed', { err });
@@ -1089,17 +1088,16 @@ export interface TaskAnchor {
  * One query for the whole page's session ids — never one per thread, same
  * rule `liveContainerState` already enforces for `container_state`.
  */
-function readTaskThreadAnchors(sessionIds: string[]): Map<string, TaskAnchor> {
+async function readTaskThreadAnchors(sessionIds: string[]): Promise<Map<string, TaskAnchor>> {
   const bySession = new Map<string, TaskAnchor>();
   if (sessionIds.length === 0) return bySession;
   let rows: { session_id: string; platform_id: string; created_at: string }[];
   try {
-    rows = getRawDb()
-      .prepare(
-        `SELECT session_id, platform_id, created_at FROM task_thread_anchors
-          WHERE session_id IN (${sessionIds.map(() => '?').join(', ')})`,
-      )
-      .all(...sessionIds) as { session_id: string; platform_id: string; created_at: string }[];
+    rows = await getDb().all<{ session_id: string; platform_id: string; created_at: string }>(
+      `SELECT session_id, platform_id, created_at FROM task_thread_anchors
+        WHERE session_id IN (${sessionIds.map(() => '?').join(', ')})`,
+      ...sessionIds,
+    );
   } catch (err) {
     log.warn('threads: task_thread_anchors lookup failed', { err });
     return bySession;
@@ -1248,7 +1246,7 @@ export interface ThreadListDeps {
   claimsRoot?: string;
   avatarByChannelType?: (channelType: string) => string | null;
   /** Wiring lookup for the assign selector; defaults to {@link wiredAgentsByChannel}. */
-  wiredAgents?: () => Map<string, WiredAgent[]>;
+  wiredAgents?: () => Map<string, WiredAgent[]> | Promise<Map<string, WiredAgent[]>>;
   /** Injected roots for attention sources (tests); defaults to the live ones. */
   attentionEnv?: AttentionSourceEnv;
 }
@@ -1477,10 +1475,10 @@ export async function buildThreadList(
   // per poll.
   const attentionItems = selectScopedAttentionItems(ctx, opts, now, deps.attentionEnv ?? {});
 
-  const rows = selectScopedSessions(ctx, opts, now);
+  const rows = await selectScopedSessions(ctx, opts, now);
   if (rows.length === 0 && attentionItems.length === 0) return { threads: [] };
 
-  const { known, names, byId, dmDedupeKey } = readChannelDirectory();
+  const { known, names, byId, dmDedupeKey } = await readChannelDirectory();
   const grouped = groupByThread(rows)
     .map((t) => ({ ...t, activity: Math.max(...t.rows.map(activityMs)) }))
     .sort((a, b) => b.activity - a.activity)
@@ -1489,10 +1487,10 @@ export async function buildThreadList(
   const pagedRows = grouped.flatMap((t) => t.rows);
   const liveIds = new Set((deps.activeContainerSessionIds ?? getActiveContainerSessionIds)());
   const states = liveContainerState(pagedRows, liveIds, probeState);
-  const claims = readClaimsByThread([...new Set(pagedRows.map((r) => r.agent_group_id))], now, deps.claimsRoot);
+  const claims = await readClaimsByThread([...new Set(pagedRows.map((r) => r.agent_group_id))], now, deps.claimsRoot);
   // One query for every task-thread session on the page — never one per
   // thread. See `readTaskThreadAnchors`.
-  const taskAnchors = readTaskThreadAnchors(
+  const taskAnchors = await readTaskThreadAnchors(
     pagedRows.filter((r) => r.thread_id && isScheduledTaskThread(r.thread_id)).map((r) => r.id),
   );
 
@@ -1546,7 +1544,7 @@ export async function buildThreadList(
       return [t.threadId, threadChannelKey(t.threadId, known)] as const;
     }),
   );
-  const wiredByChannel = (deps.wiredAgents ?? wiredAgentsByChannel)();
+  const wiredByChannel = await (deps.wiredAgents ?? wiredAgentsByChannel)();
   const inScope = (agentGroupId: string): boolean =>
     ctx.scopes.no_filter || ctx.scopes.allowed_group_ids.includes(agentGroupId);
 
@@ -2037,9 +2035,10 @@ export async function buildThreadDetail(
   if (thread.session_ids.length === 0) return { thread, transcript: [] };
 
   const byName = new Map(thread.participants.map((p) => [p.agent_group_id, p.name]));
-  const rows = getRawDb()
-    .prepare(`SELECT id, agent_group_id FROM sessions WHERE id IN (${thread.session_ids.map(() => '?').join(', ')})`)
-    .all(...thread.session_ids) as { id: string; agent_group_id: string }[];
+  const rows = await getDb().all<{ id: string; agent_group_id: string }>(
+    `SELECT id, agent_group_id FROM sessions WHERE id IN (${thread.session_ids.map(() => '?').join(', ')})`,
+    ...thread.session_ids,
+  );
 
   return {
     thread,
