@@ -2,10 +2,60 @@ import { randomUUID } from 'crypto';
 
 import { resolveUnknownSenderPolicy } from '../../channels/channel-defaults.js';
 import { hasDeclaredChannelDefaults } from '../../channels/channel-registry.js';
-import { getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
+import { getDb } from '../../db/connection.js';
+import { getMessagingGroup, getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
+import { getDeliveryAdapter } from '../../delivery.js';
 import { log } from '../../log.js';
+import { isOwner } from '../../modules/permissions/db/user-roles.js';
 import { routeInbound } from '../../router.js';
+import type { MessagingGroup } from '../../types.js';
 import { registerResource } from '../crud.js';
+
+/**
+ * Select through the host role predicate, which includes same-workspace Slack
+ * sibling identities after the adapters have registered their team ids.
+ */
+async function resolveLatestOwnerDm(): Promise<MessagingGroup | undefined> {
+  const candidates = await getDb().all<MessagingGroup & { user_id: string }>(
+    `SELECT mg.*, ud.user_id
+       FROM user_dms ud
+       JOIN messaging_groups mg ON mg.id = ud.messaging_group_id
+      WHERE mg.channel_type <> 'cli'
+      ORDER BY ud.resolved_at DESC`,
+  );
+  for (const candidate of candidates) {
+    if (isOwner(candidate.user_id)) return candidate;
+  }
+  return undefined;
+}
+
+async function deliverHostNotification(mg: MessagingGroup, text: string): Promise<{
+  messaging_group_id: string;
+  channel_type: string;
+  platform_id: string;
+  instance: string;
+  platform_message_id: string | null;
+}> {
+  const adapter = getDeliveryAdapter();
+  if (!adapter) throw new Error('delivery adapter unavailable');
+
+  const platformMessageId = await adapter.deliver(
+    mg.channel_type,
+    mg.platform_id,
+    null,
+    'chat',
+    JSON.stringify({ text, requireCompleteDelivery: true }),
+    undefined,
+    mg.instance ?? mg.channel_type,
+  );
+  return {
+    messaging_group_id: mg.id,
+    channel_type: mg.channel_type,
+    platform_id: mg.platform_id,
+    instance: mg.instance ?? mg.channel_type,
+    platform_message_id: platformMessageId ?? null,
+  };
+}
 
 registerResource({
   name: 'messaging-group',
@@ -126,6 +176,38 @@ registerResource({
           },
         });
         return { sent: { channel_type: channelType, platform_id: platformId } };
+      },
+    },
+    notify: {
+      access: 'approval',
+      hostOnly: true,
+      description:
+        'Deliver a host notification directly to a messaging group without routing it through an agent. OPERATOR-ONLY. Use --id <messaging-group-id> --text <message>.',
+      args: [
+        { name: 'id', type: 'string', description: 'Messaging group UUID.', required: true },
+        { name: 'text', type: 'string', description: 'Notification text.', required: true },
+      ],
+      handler: async (args) => {
+        const id = args.id as string;
+        const mg = getMessagingGroup(id);
+        if (!mg) throw new Error(`messaging group not found: ${id}`);
+        if (mg.channel_type === 'cli') {
+          throw new Error('CLI messaging groups cannot receive host notifications');
+        }
+
+        return { delivered: await deliverHostNotification(mg, args.text as string) };
+      },
+    },
+    'notify-owner': {
+      access: 'approval',
+      hostOnly: true,
+      description:
+        'Deliver a host notification to the newest non-CLI owner DM. Same-workspace Slack sibling identities count as the same owner. OPERATOR-ONLY. Use --text <message>.',
+      args: [{ name: 'text', type: 'string', description: 'Notification text.', required: true }],
+      handler: async (args) => {
+        const mg = await resolveLatestOwnerDm();
+        if (!mg) throw new Error('no owner DM found through the host owner predicate');
+        return { delivered: await deliverHostNotification(mg, args.text as string) };
       },
     },
   },

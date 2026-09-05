@@ -1070,6 +1070,24 @@ describe('createChatSdkBridge.deliver — post path 429 retry', () => {
     expect(id).toBe('id-1');
   });
 
+  it('strict complete delivery rejects a later chunk failure', async () => {
+    const calls: number[] = [];
+    const adapter = stubAdapter({
+      postMessage: async () => {
+        calls.push(calls.length + 1);
+        if (calls.length === 2) throw new Error('connection reset');
+        return { id: `id-${calls.length}`, threadId: 'x', raw: {} };
+      },
+    } as unknown as Partial<Adapter>);
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: true, maxTextLength: 30 });
+    const text = 'A'.repeat(30) + '\n' + 'B'.repeat(30);
+
+    await expect(
+      bridge.deliver('discord:c1', null, { kind: 'chat', content: { text, requireCompleteDelivery: true } }),
+    ).rejects.toThrow('connection reset');
+    expect(calls).toHaveLength(2);
+  });
+
   it('non-429 first-chunk error throws so host can retry from scratch', async () => {
     const adapter = stubAdapter({
       postMessage: async () => {
