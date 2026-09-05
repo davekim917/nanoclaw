@@ -212,9 +212,10 @@ const activeContainers = new Map<
     /**
      * True for a container this host ADOPTED rather than spawned.
      *
-     * E integration (seam4/e-adoption): series E introduces the supervision
-     * union and sets this at adoption; its declaration subsumes this one at
-     * the merge. Series F only reads it, through `isAdoptedContainer`.
+     * E integration (seam4/e-adoption): E declares this NON-optional as part of
+     * the supervision union and sets it in `registerAdoptedContainer`. Its
+     * declaration replaces this one at the merge, and the optional marker goes
+     * with it. Series F only reads the field, through `isAdoptedContainer`.
      */
     adopted?: boolean;
   }
@@ -223,11 +224,14 @@ const activeContainers = new Map<
 /**
  * Sessions whose surviving container could not be claim-fenced at adoption.
  *
- * E integration (seam4/e-adoption): `adoptRunningSessions` populates and drains
- * this set, and `wakeContainer` routes a hit to `retryPendingAdoption` instead
- * of spawning a duplicate. Series F only READS it, in `honorPendingStopIntents`
- * — a container that is alive but not yet fenced must not have a stop intent
- * acted on, because the kill could land on the wrong incarnation.
+ * E integration (seam4/e-adoption): E declares the same `const
+ * pendingAdoptions = new Set<string>()`, and its `adoptRunningSessions`
+ * populates it while `wakeContainer` routes a hit to `retryPendingAdoption`
+ * rather than spawning a duplicate. At the merge E's declaration wins and the
+ * two test helpers below move beside it — E ships neither, and F's deferral
+ * case needs both. Series F only READS the set, in `honorPendingStopIntents`: a
+ * container that is alive but not yet fenced must not have a stop intent acted
+ * on, because the kill could land on the wrong incarnation.
  */
 const pendingAdoptions = new Set<string>();
 
@@ -239,9 +243,9 @@ export function _resetAdoptionRetryStateForTesting(): void {
  * Test-only: stand in for an adoption that failed its claim write.
  *
  * Series F ships the READER of `pendingAdoptions` before series E ships the
- * writer, so its deferral case has no other way to reach that state. Delete
- * this alongside E's merge if `adoptRunningSessions` gives the suite a real
- * route into it.
+ * writer, so its deferral case has no other way to reach that state. Keep it
+ * after E's merge only until `adoptRunningSessions` gives the suite a real
+ * route into the state.
  */
 export function _markPendingAdoptionForTesting(sessionId: string): void {
   pendingAdoptions.add(sessionId);
@@ -450,6 +454,11 @@ export function getContainerSpawnedAt(sessionId: string): number {
  * instant, and the heartbeat older than it is the container's OWN — so the same
  * predicate would hand a wedged survivor a free grace window on every host
  * restart (plan §3.5 divergence 11).
+ *
+ * E integration (seam4/e-adoption): replaced by E's accessor at merge — E
+ * exports the same predicate (`?? false` over the same field) alongside
+ * `getAdoptedSessionIds()`, which series F has no caller for. Take E's pair and
+ * drop this one; the F3 call site in `sweep-container-health` needs no change.
  */
 export function isAdoptedContainer(sessionId: string): boolean {
   return activeContainers.get(sessionId)?.adopted === true;
@@ -1792,8 +1801,11 @@ function recordStopIntent(sessionId: string, onExit?: ContainerExitCallback): vo
 /**
  * Reconcile the unconsumed `on_wake` rows an ADOPTED session is carrying.
  *
- * E integration (seam4/e-adoption): called per adopted session from
- * `adoptRunningSessions`, after the claim fence and the registry write.
+ * E integration (seam4/e-adoption): E owns the CALL SITE and ships this as a
+ * no-op stub of the same name and signature, called once per adopted session
+ * from `registerAdoptedContainer` after the claim fence and the registry write
+ * (its `// F1 hook` marker). At the merge E's stub body is replaced by this
+ * one and the call site needs no change.
  *
  * `withExistingMailboxSession`, never the provisioning opener: a session with
  * no mailbox was never adoptable in the first place, and creating one here
