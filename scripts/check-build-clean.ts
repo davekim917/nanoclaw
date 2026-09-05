@@ -197,8 +197,34 @@ function execCaptureStdout(cmd: string, args: string[], options: { cwd: string }
  */
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
+export interface GuardStepResult {
+  ok: boolean;
+  /** Printed when the guard refuses the step. */
+  message?: string;
+}
+
+export interface CheckBuildCleanSteps {
+  typecheck(): GuardStepResult;
+  lint(): GuardStepResult;
+  status(): string[];
+  freshness(): { head: string; originMain: string };
+  fingerprint(blockingLines: string[]): string;
+  recordBuildStart(head: string, dirtFingerprint: string): void;
+}
+
+export interface CheckBuildCleanOptions {
+  /** Override individual I/O-heavy steps for decision-logic tests. */
+  steps?: Partial<CheckBuildCleanSteps>;
+  env?: Partial<Pick<NodeJS.ProcessEnv, 'BUILD_ALLOW_DIRTY' | 'BUILD_ALLOW_LOCAL'>>;
+  log?: Pick<Console, 'error' | 'warn'>;
+}
+
+function failure(message: string): GuardStepResult {
+  return { ok: false, message };
+}
+
 /** Prebuild lint gate: refuses to build if `pnpm run lint`'s eslint invocation finds errors. */
-function runLintGate(): void {
+function runLintGate(): GuardStepResult {
   const eslintBin = path.join(REPO_ROOT, 'node_modules', '.bin', 'eslint');
   const eslintArgs = ['src/', 'scripts/', '--quiet', '-f', 'json'];
   let stdout: string;
@@ -206,16 +232,27 @@ function runLintGate(): void {
     stdout = execCaptureStdout('ionice', ['-c3', 'nice', '-n', '10', eslintBin, ...eslintArgs], { cwd: REPO_ROOT });
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      console.error('BUILD REFUSED: lint gate could not run.');
-      console.error(err instanceof Error ? err.message : String(err));
-      process.exit(1);
+      return failure(`BUILD REFUSED: lint gate could not run.\n${err instanceof Error ? err.message : String(err)}`);
     }
     // ionice isn't installed on this host — throttling is a courtesy to
     // co-resident builders, not a build-correctness requirement.
-    stdout = execCaptureStdout(eslintBin, eslintArgs, { cwd: REPO_ROOT });
+    try {
+      stdout = execCaptureStdout(eslintBin, eslintArgs, { cwd: REPO_ROOT });
+    } catch (fallbackError) {
+      return failure(
+        `BUILD REFUSED: lint gate could not run.\n${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`,
+      );
+    }
   }
 
-  const results = JSON.parse(stdout) as EslintFileResult[];
+  let results: EslintFileResult[];
+  try {
+    results = JSON.parse(stdout) as EslintFileResult[];
+  } catch (err) {
+    return failure(
+      `BUILD REFUSED: lint gate produced invalid JSON.\n${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
   const errors: Array<{ filePath: string; line: number; ruleId: string | null; message: string }> = [];
   for (const result of results) {
     for (const m of result.messages) {
@@ -224,19 +261,19 @@ function runLintGate(): void {
       }
     }
   }
-  if (errors.length === 0) return;
+  if (errors.length === 0) return { ok: true };
 
-  console.error(`BUILD REFUSED: \`pnpm run lint\` found ${errors.length} error(s).\n`);
+  const lines = [`BUILD REFUSED: \`pnpm run lint\` found ${errors.length} error(s).`, ''];
   for (const e of errors.slice(0, 20)) {
-    console.error(`  ${e.filePath}:${e.line}  ${e.ruleId ?? '(parse error)'}  ${e.message}`);
+    lines.push(`  ${e.filePath}:${e.line}  ${e.ruleId ?? '(parse error)'}  ${e.message}`);
   }
-  if (errors.length > 20) console.error(`  ... and ${errors.length - 20} more`);
-  console.error('\nRun `pnpm run lint` to see the full list, fix, then rebuild.');
-  process.exit(1);
+  if (errors.length > 20) lines.push(`  ... and ${errors.length - 20} more`);
+  lines.push('', 'Run `pnpm run lint` to see the full list, fix, then rebuild.');
+  return failure(lines.join('\n'));
 }
 
 /** Typecheck host, scripts, and setup before accepting a build. */
-function runTypecheckGate(): void {
+function runTypecheckGate(): GuardStepResult {
   try {
     try {
       execFileSync('ionice', ['-c3', 'nice', '-n', '10', 'pnpm', 'run', 'typecheck'], {
@@ -248,16 +285,12 @@ function runTypecheckGate(): void {
       execFileSync('nice', ['-n', '10', 'pnpm', 'run', 'typecheck'], { cwd: REPO_ROOT, stdio: 'inherit' });
     }
   } catch (err) {
-    console.error('BUILD REFUSED: typecheck gate failed.');
-    console.error(err instanceof Error ? err.message : String(err));
-    process.exit(1);
+    return failure(`BUILD REFUSED: typecheck gate failed.\n${err instanceof Error ? err.message : String(err)}`);
   }
+  return { ok: true };
 }
 
-function main(): void {
-  runTypecheckGate();
-  runLintGate();
-
+function readStatus(): string[] {
   // NOTE: don't .trim() the raw output before splitting — porcelain status
   // codes can start with a leading space (e.g. " M path" for an unstaged
   // modification), and trimming the whole multi-line string strips that
@@ -265,62 +298,114 @@ function main(): void {
   // prefix slice by one and corrupting the path. Split first, then drop the
   // empty trailing element from the output's final newline.
   const raw = execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' });
-  const files = raw.trim() ? raw.split('\n').filter((line) => line.length > 0) : [];
+  return raw.trim() ? raw.split('\n').filter((line) => line.length > 0) : [];
+}
+
+function readFreshness(): { head: string; originMain: string } {
+  execFileSync('git', ['fetch', '-q', 'origin', 'main']);
+  return {
+    head: execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
+    originMain: execFileSync('git', ['rev-parse', 'origin/main'], { encoding: 'utf8' }).trim(),
+  };
+}
+
+function recordBuildStart(head: string, dirtFingerprint: string): void {
+  fs.mkdirSync('dist', { recursive: true });
+  fs.writeFileSync(path.join('dist', '.build-start-sha'), `${head}\n`);
+  fs.writeFileSync(path.join('dist', '.build-allowed-dirt-fingerprint'), dirtFingerprint);
+}
+
+const realSteps: CheckBuildCleanSteps = {
+  typecheck: runTypecheckGate,
+  lint: runLintGate,
+  status: readStatus,
+  freshness: readFreshness,
+  fingerprint: fingerprintDirt,
+  recordBuildStart,
+};
+
+/**
+ * Runs the prebuild decision flow and returns an exit code. The direct CLI
+ * entry point below is intentionally the only place that calls process.exit;
+ * tests inject the expensive steps and assert this return value in process.
+ */
+export function runCheckBuildClean(options: CheckBuildCleanOptions = {}): number {
+  const steps = { ...realSteps, ...options.steps };
+  const env = options.env ?? process.env;
+  const log = options.log ?? console;
+
+  for (const step of [steps.typecheck, steps.lint]) {
+    const result = step();
+    if (!result.ok) {
+      log.error(result.message ?? 'BUILD REFUSED: build gate failed.');
+      return 1;
+    }
+  }
+
+  let files: string[];
+  try {
+    files = steps.status();
+  } catch (err) {
+    log.error('BUILD REFUSED: could not read working tree status.');
+    log.error(err instanceof Error ? err.message : String(err));
+    return 1;
+  }
 
   let blocking: string[] = [];
   if (files.length > 0) {
     const partition = partitionDirt(files);
     blocking = partition.blocking;
 
-    if (process.env.BUILD_ALLOW_DIRTY === '1') {
-      console.warn('WARNING: BUILD_ALLOW_DIRTY=1 — building a dirty working tree. dist/ will not match HEAD:');
-      for (const f of files) console.warn(`  ${f}`);
+    if (env.BUILD_ALLOW_DIRTY === '1') {
+      log.warn('WARNING: BUILD_ALLOW_DIRTY=1 — building a dirty working tree. dist/ will not match HEAD:');
+      for (const f of files) log.warn(`  ${f}`);
     } else {
       if (partition.ignored.length > 0) {
-        console.warn(`ignoring docs-only dirt: ${partition.ignored.map((line) => line.slice(3)).join(', ')}`);
+        log.warn(`ignoring docs-only dirt: ${partition.ignored.map((line) => line.slice(3)).join(', ')}`);
       }
 
       if (blocking.length > 0) {
-        console.error('BUILD REFUSED: working tree is dirty.\n');
-        console.error('dist/ is compiled from the working tree, not from HEAD. Building now would bake');
-        console.error('these uncommitted changes into dist/, which a restart could then run.\n');
-        console.error('Dirty paths (git status --porcelain):');
-        for (const f of blocking) console.error(`  ${f}`);
-        console.error('\nTo proceed, either:');
-        console.error('  1. Commit or stash the changes above, then rebuild.');
-        console.error('  2. Set BUILD_ALLOW_DIRTY=1 to build anyway (prints a warning, stamps dirty:true).');
-        process.exit(1);
+        log.error('BUILD REFUSED: working tree is dirty.\n');
+        log.error('dist/ is compiled from the working tree, not from HEAD. Building now would bake');
+        log.error('these uncommitted changes into dist/, which a restart could then run.\n');
+        log.error('Dirty paths (git status --porcelain):');
+        for (const f of blocking) log.error(`  ${f}`);
+        log.error('\nTo proceed, either:');
+        log.error('  1. Commit or stash the changes above, then rebuild.');
+        log.error('  2. Set BUILD_ALLOW_DIRTY=1 to build anyway (prints a warning, stamps dirty:true).');
+        return 1;
       }
     }
   }
 
-  let head: string;
-  let originMain: string;
+  let freshnessInputs: { head: string; originMain: string };
   try {
-    execFileSync('git', ['fetch', '-q', 'origin', 'main']);
-    head = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
-    originMain = execFileSync('git', ['rev-parse', 'origin/main'], { encoding: 'utf8' }).trim();
+    freshnessInputs = steps.freshness();
   } catch (err) {
-    console.error('BUILD REFUSED: could not verify HEAD against origin/main.');
-    console.error(err instanceof Error ? err.message : String(err));
-    process.exit(1);
+    log.error('BUILD REFUSED: could not verify HEAD against origin/main.');
+    log.error(err instanceof Error ? err.message : String(err));
+    return 1;
   }
 
-  const freshness = checkFreshness(head, originMain, process.env.BUILD_ALLOW_LOCAL === '1');
+  const freshness = checkFreshness(freshnessInputs.head, freshnessInputs.originMain, env.BUILD_ALLOW_LOCAL === '1');
   if (freshness.message) {
-    if (freshness.ok) console.warn(freshness.message);
-    else console.error(freshness.message);
+    if (freshness.ok) log.warn(freshness.message);
+    else log.error(freshness.message);
   }
-  if (!freshness.ok) process.exit(1);
+  if (!freshness.ok) return 1;
 
-  fs.mkdirSync('dist', { recursive: true });
-  fs.writeFileSync(path.join('dist', '.build-start-sha'), `${head}\n`);
-  fs.writeFileSync(path.join('dist', '.build-allowed-dirt-fingerprint'), fingerprintDirt(blocking));
-  process.exit(0);
+  try {
+    steps.recordBuildStart(freshnessInputs.head, steps.fingerprint(blocking));
+  } catch (err) {
+    log.error('BUILD REFUSED: could not record build start.');
+    log.error(err instanceof Error ? err.message : String(err));
+    return 1;
+  }
+  return 0;
 }
 
 // tsx runs this file directly; vitest imports it for the pure helpers above,
 // so guard the side-effecting entry point behind a direct-execution check.
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main();
+  process.exit(runCheckBuildClean());
 }
