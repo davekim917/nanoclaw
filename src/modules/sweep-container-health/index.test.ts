@@ -56,9 +56,10 @@ function childProcessTripwire(record: string[]): Record<string, (...args: unknow
 vi.mock('child_process', () => childProcessTripwire(spawns));
 vi.mock('node:child_process', () => childProcessTripwire(spawns));
 
-vi.mock('../../log.js', () => ({
-  log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
-}));
+// `log.js` is NOT mocked: `secret-scrubber.ts` calls `setLogScrubber` at module
+// scope on the way in, so a factory that returns only `log` breaks the import
+// graph (src/log-mock-tripwire.test.ts is the standing rule). The guard path
+// under test logs nothing anyway.
 
 import { closeDb, getDb, initTestDb } from '../../db/connection.js';
 import { sessionStillActive } from '../../container-runner.js';
