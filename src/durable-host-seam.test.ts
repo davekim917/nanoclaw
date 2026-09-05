@@ -59,8 +59,14 @@ describe('main.ts wires the lease as shadow state', () => {
   });
 
   it("stops the lease as the first statement of shutdown()'s finally block", () => {
-    const finallyBlock = main.slice(main.indexOf('} finally {', main.indexOf('async function shutdown')));
-    const firstStatement = finallyBlock.replace(/^\} finally \{\s*/, '').replace(/^(\s*\/\/[^\n]*\n)+/, '');
-    expect(firstStatement.startsWith('await stopHostInstanceLease();')).toBe(true);
+    const shutdownStart = main.indexOf('async function shutdown(');
+    const finallyStart = main.indexOf('} finally {', shutdownStart);
+    expect(finallyStart).toBeGreaterThan(shutdownStart);
+    const firstStatement = main
+      .slice(finallyStart + '} finally {'.length)
+      .split('\n')
+      .map((line) => line.trim())
+      .find((line) => line !== '' && !line.startsWith('//'));
+    expect(firstStatement).toBe('await stopHostInstanceLease();');
   });
 });
