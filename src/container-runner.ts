@@ -14,15 +14,15 @@ import { OneCLI } from '@onecli-sh/sdk';
 import { agentRunnerSourcePath } from './agent-runner-source.js';
 import { getHostCapabilities } from './capabilities.js';
 import {
+  CONTAINER_GROUP_LABEL_KEY,
   CONTAINER_IMAGE,
   CONTAINER_IMAGE_BASE,
-  CONTAINER_GROUP_LABEL_KEY,
   CONTAINER_INSTALL_LABEL,
+  CONTAINER_MEMORY_BUDGET,
   CONTAINER_NAME_PREFIX,
   CONTAINER_ROLE_LABEL_KEY,
   CONTAINER_SESSION_LABEL_KEY,
   CONTAINER_WORKGROUP_LABEL_KEY,
-  CONTAINER_MEMORY_BUDGET,
   DATA_DIR,
   GROUPS_DIR,
   MAX_CONCURRENT_CONTAINERS,
@@ -4891,18 +4891,6 @@ async function buildContainerArgs(
 }
 
 /**
- * Build the container PRIVILEGE hardening flags: drop every Linux capability
- * and forbid setuid escalation, overridable per-group via container.json
- * `security`. Defaults come from `resolveContainerSecurity`, the same
- * resolver `ncl groups config get` reports, so the audit and the spawn can
- * never disagree. Pure, so precedence is unit-testable without spawning.
- *
- * Resource ceilings (--memory, --pids-limit, --cpus) deliberately do NOT
- * belong here — `dockerResourceLimitArgs` below owns those, driven by
- * container.json `resources`. Emitting a flag from both builders is how a
- * spawn ends up with two contradictory values for the same Docker option.
- */
-/**
  * Build the container SCOPE labels: the install label every container has
  * always carried, plus the four scope labels a boot inventory reads to decide
  * what a surviving container belongs to. Pure and exported for the same
@@ -4928,6 +4916,18 @@ export function containerLabelArgs(agentGroupId: string, sessionId: string, work
   ];
 }
 
+/**
+ * Build the container PRIVILEGE hardening flags: drop every Linux capability
+ * and forbid setuid escalation, overridable per-group via container.json
+ * `security`. Defaults come from `resolveContainerSecurity`, the same
+ * resolver `ncl groups config get` reports, so the audit and the spawn can
+ * never disagree. Pure, so precedence is unit-testable without spawning.
+ *
+ * Resource ceilings (--memory, --pids-limit, --cpus) deliberately do NOT
+ * belong here — `dockerResourceLimitArgs` below owns those, driven by
+ * container.json `resources`. Emitting a flag from both builders is how a
+ * spawn ends up with two contradictory values for the same Docker option.
+ */
 export function securityArgs(security?: SecurityConfig): string[] {
   const effective = resolveContainerSecurity(security);
   const args: string[] = [];
