@@ -12,7 +12,7 @@
  * parse as a github.com issue/PR path — the browser can pick which item,
  * never which host gets called.
  */
-import { getRawDb } from '../db/index.js';
+import { getDb } from '../db/connection.js';
 import { log } from '../log.js';
 import { readReleaseState } from './api/observatory.js';
 import type { AuthHandler } from './router.js';
@@ -45,10 +45,11 @@ export function _resetIssueBriefCacheForTesting(): void {
 }
 
 /** Mirror of capabilities.ts resolveScopedEnvVar — deliberate duplication, same as there. */
-function githubTokenFor(workgroupId: string): string | null {
-  const folders = getRawDb().prepare('SELECT folder FROM agent_groups WHERE workgroup_id = ?').all(workgroupId) as {
-    folder: string;
-  }[];
+async function githubTokenFor(workgroupId: string): Promise<string | null> {
+  const folders = await getDb().all<{ folder: string }>(
+    'SELECT folder FROM agent_groups WHERE workgroup_id = ?',
+    workgroupId,
+  );
   for (const { folder } of folders) {
     const conv = `GITHUB_TOKEN_${folder.toUpperCase().replace(/-/g, '_')}`;
     if (process.env[conv]) return process.env[conv]!;
@@ -78,7 +79,7 @@ export const observatoryIssueBriefHandler: AuthHandler = async (req, _params, _c
   const itemId = url.searchParams.get('item');
   if (!workgroupId || !itemId) return json(400, { error: 'workgroup and item are required' });
 
-  const state = readReleaseState(workgroupId);
+  const state = await readReleaseState(workgroupId);
   const item = state?.items.find((i) => i.id === itemId);
   if (!item) return json(404, { error: 'item_not_on_board' });
   if (!item.url) return json(404, { error: 'item_has_no_url' });
@@ -92,7 +93,7 @@ export const observatoryIssueBriefHandler: AuthHandler = async (req, _params, _c
   const hit = cache.get(cacheKey);
   if (hit && Date.now() - hit.at < CACHE_TTL_MS) return json(200, hit.brief);
 
-  const token = githubTokenFor(workgroupId);
+  const token = await githubTokenFor(workgroupId);
   if (!token) return json(502, { error: 'no_github_token' });
 
   try {

@@ -19,7 +19,7 @@
  */
 import { readClaims } from '../claims-board.js';
 import { dispatch } from '../cli/dispatch.js';
-import { getRawDb } from '../db/index.js';
+import { getDb } from '../db/connection.js';
 import { log } from '../log.js';
 import { buildNudgePrompt, NUDGE_TASK_QUIET_ARGS } from '../modules/claims/self-heal.js';
 import { canAssign } from './assign.js';
@@ -54,9 +54,11 @@ export const observatoryNudgeHandler: AuthHandler = async (req, _params, ctx) =>
   const role = canAssign(ctx.user.id, agentGroupId);
   if (!role.ok) return json(role.reason === 'not_found' ? 404 : 403, { error: role.reason });
 
-  const agent = getRawDb()
-    .prepare(`SELECT * FROM agent_groups WHERE id = ? AND workgroup_id = ?`)
-    .get(agentGroupId, workgroupId) as AgentGroup | undefined;
+  const agent = await getDb().get<AgentGroup>(
+    `SELECT * FROM agent_groups WHERE id = ? AND workgroup_id = ?`,
+    agentGroupId,
+    workgroupId,
+  );
   if (!agent) return json(404, { error: 'agent_group_not_in_workgroup' });
 
   // Same read the board is rendered from, so "nudgeable" and "on the board"
@@ -76,14 +78,14 @@ export const observatoryNudgeHandler: AuthHandler = async (req, _params, ctx) =>
 
   // The thread's channel must be one this agent group is wired to — a nudge
   // can't make an agent speak somewhere it doesn't belong (assign's rule).
-  const target = getRawDb()
-    .prepare(
-      `SELECT mg.id, mg.name
-         FROM messaging_group_agents mga
-         JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
-        WHERE mga.agent_group_id = ? AND mg.platform_id = ?`,
-    )
-    .get(agentGroupId, threadPlatformId(claim.threadId)) as { id: string; name: string } | undefined;
+  const target = await getDb().get<{ id: string; name: string }>(
+    `SELECT mg.id, mg.name
+       FROM messaging_group_agents mga
+       JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+      WHERE mga.agent_group_id = ? AND mg.platform_id = ?`,
+    agentGroupId,
+    await threadPlatformId(claim.threadId),
+  );
   if (!target) return json(409, { error: 'agent_not_wired_to_thread_channel' });
 
   // Composed entirely from the claim file — nothing client-authored reaches it.
@@ -119,5 +121,5 @@ export const observatoryNudgeHandler: AuthHandler = async (req, _params, ctx) =>
   recentNudges.set(dedupeKey, Date.now());
   const seriesId = (res.data as { series_id?: string } | null | undefined)?.series_id ?? null;
   log.info('observatory nudge', { userId: ctx.user.id, claimSlug, agentGroupId, channel: target.name, seriesId });
-  return json(200, { ok: true, seriesId, threadUrl: threadPermalink(claim.threadId) });
+  return json(200, { ok: true, seriesId, threadUrl: await threadPermalink(claim.threadId) });
 };
