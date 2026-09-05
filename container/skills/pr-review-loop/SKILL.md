@@ -294,6 +294,17 @@ codex-review.sh wait "$SHA" "$SINCE"        # default: 15 minutes
 # codex-review.sh wait "$SHA" "$SINCE" 10  # explicit positive-minute bound
 ```
 
+**Set the tool timeout explicitly.** When invoking this command through an
+agent's Bash tool, use `timeout: 1020000` (17 minutes) for the default 15-minute
+poll and keep `run_in_background: false`. For a custom bound of `N` minutes,
+set the tool timeout to at least `(N + 2) * 60000` milliseconds so GraphQL
+requests have headroom. The runtime raises `BASH_MAX_TIMEOUT_MS` but deliberately
+leaves the ordinary Bash timeout short; the shell command above alone does not
+extend it. If the tool cannot stay attached that long, use foreground `status`
+calls every 60 seconds with the same SHA, since timestamp, and elapsed deadline;
+apply the same verdict and timeout handling below. A tool timeout is an
+interrupted wait, never review approval.
+
 Capture the full SHA with `git rev-parse HEAD`; a short SHA is accepted for
 status compatibility, but the foreground poll reports the full PR head it
 verified. The exits are deliberate:
