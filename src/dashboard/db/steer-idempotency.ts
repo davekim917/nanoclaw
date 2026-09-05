@@ -106,7 +106,17 @@ export async function reserveIdempotency(
   const existing = await selectExisting(userId, idempotencyKey);
   if (existing) return fromExistingRow(existing, target, requestHash);
 
-  const candidate = {
+  // Typed as the wide `Record<string, unknown>` rather than the literal
+  // insert-column shape on purpose: `insertOrAdopt`'s type parameter is
+  // shared between `candidate` and `reload`'s return, and `reload` here is
+  // `selectExisting`, which returns the narrower `ExistingRow` (a SELECT
+  // projection, not the INSERT columns) — the two shapes genuinely differ
+  // (e.g. `reserved_at` vs `status`/`echo_attempted`). Neither branch's
+  // result is read off the primitive's own return value below (both re-read
+  // via `selectExisting` directly at line ~138), so the exact row shape
+  // insertOrAdopt threads through is never observed — only that both
+  // arguments satisfy ONE shared type, which `Record<string, unknown>` does.
+  const candidate: Record<string, unknown> = {
     user_id: userId,
     idempotency_key: idempotencyKey,
     target_type: target.type,
