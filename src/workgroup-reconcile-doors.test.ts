@@ -33,6 +33,7 @@ const SRC_ROOT = path.join(REPO_ROOT, 'src');
 
 const RECONCILERS = ['reconcileWorkgroupMemory', 'reconcileWorkgroupSharedDirs'] as const;
 const BOOT_DOOR = 'quiesceWorkgroupsForBootMountChange';
+const MEMORY_GATE = 'runWorkgroupMemoryStartupGate';
 
 /**
  * Every call site allowed to enter a reconciler, as `file::function`.
@@ -45,6 +46,7 @@ const BOOT_DOOR = 'quiesceWorkgroupsForBootMountChange';
  */
 const PINNED_CALLERS: readonly string[] = [
   'src/main.ts::runBootMountQuiescence',
+  'src/main.ts::runWorkgroupMemoryStartupGate',
   'src/container-runner.ts::spawnContainer',
 ];
 
@@ -150,35 +152,49 @@ describe('workgroup reconcile doors', () => {
     const mainFile = path.join(SRC_ROOT, 'main.ts');
     const reconcileSites = callSites(mainFile, RECONCILERS);
     const doorSites = callSites(mainFile, [BOOT_DOOR]);
+    const gateSites = callSites(mainFile, [MEMORY_GATE]);
 
     expect(reconcileSites.length).toBeGreaterThan(0);
-    expect(doorSites.length).toBe(1);
+    // Exactly one boot door in the module, and it is inside the continuation.
+    expect(doorSites).toHaveLength(1);
+    const door = doorSites[0];
+    expect(door.fn).toBe('runBootMountQuiescence');
 
-    // `main()` itself no longer reconciles anything; the block moved into the
-    // boot continuation, and that is where the door lives too.
+    // `main()` itself reconciles nothing: the whole block moved into the
+    // continuation, which is where the door lives too.
     expect(reconcileSites.filter((site) => site.fn === 'main')).toEqual([]);
+    expect(gateSites.filter((site) => site.fn === 'main')).toEqual([]);
 
+    // Two functions carry a reconciler, and both are behind the same door.
+    // `runBootMountQuiescence` calls the shared-dirs reconcile directly, after
+    // awaiting the door. `runWorkgroupMemoryStartupGate` calls the memory
+    // reconcile, and its ONLY call site is inside the continuation, also after
+    // the door — so no reconciler is reachable from a boot path that has not
+    // already proved its scope quiescent.
     for (const site of reconcileSites) {
-      const door = doorSites.find((entry) => entry.fn === site.fn);
-      expect(door, `${site.callee} in ${site.fn}() is not preceded by a ${BOOT_DOOR} call`).toBeDefined();
-      expect(door!.pos).toBeLessThan(site.pos);
+      expect(['runBootMountQuiescence', MEMORY_GATE]).toContain(site.fn);
+      if (site.fn === 'runBootMountQuiescence') expect(door.pos).toBeLessThan(site.pos);
     }
+    expect(gateSites).toHaveLength(1);
+    expect(gateSites[0].fn).toBe('runBootMountQuiescence');
+    expect(door.pos).toBeLessThan(gateSites[0].pos);
 
-    // …and the door is awaited, not fired and forgotten: the reconciles below
-    // it must observe a resolved proof, not a pending promise.
+    // …and the door is awaited, not fired and forgotten: everything below it
+    // must observe a resolved proof, not a pending promise.
     const source = parse(mainFile);
-    const doorNode = (() => {
-      let hit: ts.CallExpression | null = null;
-      const visit = (node: ts.Node): void => {
-        if (ts.isCallExpression(node) && calledIdentifiers(node).includes(BOOT_DOOR)) hit = node;
-        ts.forEachChild(node, visit);
-      };
-      visit(source);
-      return hit as ts.CallExpression | null;
-    })();
+    let doorNode: ts.CallExpression | null = null;
+    const findDoor = (node: ts.Node): void => {
+      if (ts.isCallExpression(node) && calledIdentifiers(node).includes(BOOT_DOOR)) doorNode = node;
+      ts.forEachChild(node, findDoor);
+    };
+    findDoor(source);
     expect(doorNode).not.toBeNull();
     let awaited = false;
-    for (let cursor: ts.Node | undefined = doorNode!.parent; cursor; cursor = cursor.parent) {
+    for (
+      let cursor: ts.Node | undefined = (doorNode as unknown as ts.CallExpression).parent;
+      cursor;
+      cursor = cursor.parent
+    ) {
       if (ts.isAwaitExpression(cursor)) {
         awaited = true;
         break;
