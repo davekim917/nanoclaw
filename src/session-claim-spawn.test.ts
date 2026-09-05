@@ -237,6 +237,7 @@ import { allowSubprocess } from './test-hermeticity.js';
 import type { MemoryAdmissionResult } from './memory-admission.js';
 import type { Session } from './types.js';
 
+const STAMP = '2026-09-05T00:00:00.000Z';
 const AGENT_GROUP_ID = 'ag-session-claim';
 // Deliberately a folder that does not exist under groups/: readContainerConfig
 // returns the empty config for it, so the spawn path runs end to end with no
@@ -270,6 +271,47 @@ function callerSnapshot(id: string): Session {
     last_active: null,
     created_at: '2026-09-05T00:00:00.000Z',
   };
+}
+
+/** A `session_claims` row held by someone else, at the given incarnation. */
+async function seedForeignClaim(sessionId: string, holder: string, incarnation: number): Promise<void> {
+  await getDb().run(
+    `INSERT INTO session_claims (session_id, incarnation, claimed_by, claimed_at, container_ref, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    sessionId,
+    incarnation,
+    holder,
+    STAMP,
+    `nanoclaw-v2-${holder}`,
+    STAMP,
+  );
+}
+
+/**
+ * A `host_instances` row for a peer. `lease`: 'live' is an unexpired lease,
+ * 'expired' is a host that crashed without stamping `stopped_at`, and 'stopped'
+ * is one that shut down gracefully. Only the first reads as live.
+ */
+async function seedHostInstance(instanceId: string, lease: 'live' | 'expired' | 'stopped'): Promise<void> {
+  await getDb().run(
+    `INSERT INTO host_instances (instance_id, install_id, hostname, pid, started_at, lease_expires_at, stopped_at)
+     VALUES (?, 'test-install', 'peer', 4242, ?, ?, ?)`,
+    instanceId,
+    STAMP,
+    lease === 'expired' ? STAMP : new Date(Date.now() + 90_000).toISOString(),
+    lease === 'stopped' ? new Date().toISOString() : null,
+  );
+}
+
+/** The refusals `claimSessionRun` logs when a live peer holds the claim. */
+function liveHolderRefusals(): Array<{ sessionId: string; holder: string }> {
+  return vi
+    .mocked(log.warn)
+    .mock.calls.filter((call) => call[0] === 'Refusing session claim held by a live peer host')
+    .map((call) => {
+      const meta = call[1] as { sessionId: string; holder: string };
+      return { sessionId: meta.sessionId, holder: meta.holder };
+    });
 }
 
 /** The `wakeContainer failed` errors, which is how a refused spawn surfaces. */
@@ -356,14 +398,11 @@ describe('claim-first spawn', () => {
 
   it('a lost claim starts no container', async () => {
     await seedSession('sess-lost');
-    // Another live claimant already holds this session at incarnation 5.
-    await getDb().run(
-      `INSERT INTO session_claims (session_id, incarnation, claimed_by, claimed_at, container_ref, updated_at)
-       VALUES ('sess-lost', 5, 'peer-host', ?, 'nanoclaw-v2-peer', ?)`,
-      '2026-09-05T00:00:00.000Z',
-      '2026-09-05T00:00:00.000Z',
-    );
-    // ...and bumped it again between our read and our compare-and-set.
+    // A holder with no `host_instances` row at all — an unknown claimant, which
+    // reads as not-live and is therefore takeover-able. What loses this claim
+    // is the CAS alone: someone bumped the incarnation between our read and our
+    // compare-and-set.
+    await seedForeignClaim('sess-lost', 'peer-host', 5);
     hooks.staleRead = true;
 
     await expect(wakeContainer(callerSnapshot('sess-lost'))).resolves.toBe(false);
@@ -376,6 +415,48 @@ describe('claim-first spawn', () => {
     hooks.staleRead = false;
     const claim = await getSessionClaim('sess-lost');
     expect([claim?.incarnation, claim?.claimed_by]).toEqual([5, 'peer-host']);
+  });
+
+  it('a claim held by a live host is refused and starts no container', async () => {
+    await seedSession('sess-peer-live');
+    // A peer host process that registered a lease and is still renewing it.
+    await seedHostInstance('peer-instance', 'live');
+    await seedForeignClaim('sess-peer-live', 'peer-instance', 3);
+
+    await expect(wakeContainer(callerSnapshot('sess-peer-live'))).resolves.toBe(false);
+
+    expect(hasContainerEverRun('sess-peer-live'), 'a second host started a duplicate container').toBe(false);
+    expect(liveHolderRefusals()).toEqual([{ sessionId: 'sess-peer-live', holder: 'peer-instance' }]);
+    expect(wakeFailures()).toEqual([
+      'Error: session sess-peer-live is claimed by another live host process — not spawning a duplicate',
+    ]);
+    // Refused before the compare-and-set, so the peer's row is byte-for-byte
+    // what it was: two live hosts never trade a session back and forth.
+    const claim = await getSessionClaim('sess-peer-live');
+    expect([claim?.incarnation, claim?.claimed_by, claim?.container_ref]).toEqual([
+      3,
+      'peer-instance',
+      'nanoclaw-v2-peer-instance',
+    ]);
+  });
+
+  it.each([
+    ['crashed without stamping stopped_at', 'expired' as const],
+    ['shut down gracefully', 'stopped' as const],
+  ])('a claim held by a dead host is taken over — %s', async (_why, lease) => {
+    const sessionId = `sess-peer-${lease}`;
+    await seedSession(sessionId);
+    await seedHostInstance(`peer-${lease}`, lease);
+    await seedForeignClaim(sessionId, `peer-${lease}`, 3);
+
+    await wakeContainer(callerSnapshot(sessionId));
+
+    // A dead claimant must never wedge a session: the CAS ran on the
+    // incarnation it left behind and the container started.
+    expect(hooks.events).toContain(`claim:${sessionId}:4`);
+    expect(hasContainerEverRun(sessionId), 'a dead host wedged the session').toBe(true);
+    expect(liveHolderRefusals()).toEqual([]);
+    await waitForFinalize(sessionId);
   });
 
   it('a claim write failure starts no container', async () => {
@@ -501,12 +582,34 @@ describe('claim-first spawn', () => {
   it('the claimant id is the host instance id when the lease is running', async () => {
     await seedSession('sess-lease');
     const instanceId = await startHostInstanceLease({ leaseTtlMs: 90_000 });
+    // Hold the exiting container's release so the respawn below runs against a
+    // claim this same process still holds — the case the liveness check must
+    // not refuse, since `host_instances` says THIS host is live.
+    let letTheReleaseLand!: () => void;
+    hooks.releaseGates.set(
+      1,
+      new Promise<void>((resolve) => {
+        letTheReleaseLand = resolve;
+      }),
+    );
 
-    await wakeContainer(callerSnapshot('sess-lease'));
+    try {
+      await wakeContainer(callerSnapshot('sess-lease'));
+      const claim = await getSessionClaim('sess-lease');
+      expect(claim?.claimed_by).toBe(instanceId);
+      await waitForFinalize('sess-lease');
 
-    const claim = await getSessionClaim('sess-lease');
-    expect(claim?.claimed_by).toBe(instanceId);
-    await waitForFinalize('sess-lease');
+      // A respawn while our own claim still stands: same claimant, so the
+      // liveness check does not apply and the CAS wins the next incarnation.
+      await wakeContainer(callerSnapshot('sess-lease'));
+      expect(liveHolderRefusals()).toEqual([]);
+      expect(hooks.events).toContain('claim:sess-lease:2');
+      const respawned = await getSessionClaim('sess-lease');
+      expect(respawned?.claimed_by).toBe(instanceId);
+      await waitForFinalize('sess-lease');
+    } finally {
+      letTheReleaseLand();
+    }
   });
 
   // LAST runtime case in the file, deliberately: `stopAllContainers()` latches

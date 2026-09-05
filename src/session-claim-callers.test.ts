@@ -56,6 +56,16 @@ function stripComments(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:"'`])\/\/[^\n]*/g, (_m, lead: string) => lead);
 }
 
+/**
+ * Blank out `import … from '…'` statements, single- and multi-line, keeping
+ * every character position so reported line numbers stay true. An import
+ * BINDING is not a call site, and a formatter wrapping one across lines must
+ * not read as a second claimant.
+ */
+function blankImports(source: string): string {
+  return source.replace(/^import\s[\s\S]*?from\s+['"][^'"]+['"];?/gm, (match) => match.replace(/[^\n]/g, ' '));
+}
+
 function listTsFiles(): string[] {
   const out: string[] = [];
   const walk = (dir: string): void => {
@@ -110,7 +120,7 @@ describe('tryClaimSession has exactly one caller', () => {
 
   it('each pinned file claims from the pinned function, and only there', () => {
     for (const { file, fn } of TRY_CLAIM_SESSION_CALLERS) {
-      const source = stripComments(fs.readFileSync(path.join(REPO_ROOT, file), 'utf8'));
+      const source = blankImports(stripComments(fs.readFileSync(path.join(REPO_ROOT, file), 'utf8')));
       const declaration = source.indexOf(`function ${fn}(`);
       expect(declaration, `${file} no longer declares ${fn}`).toBeGreaterThan(-1);
 
@@ -118,9 +128,7 @@ describe('tryClaimSession has exactly one caller', () => {
       // the pinned function's body, which ends at the next top-level `\n}`.
       const bodyEnd = source.indexOf('\n}\n', declaration);
       expect(bodyEnd, `${fn} has no top-level body end in ${file}`).toBeGreaterThan(declaration);
-      const callSites = [...source.matchAll(/\btryClaimSession\b/g)]
-        .map((match) => match.index)
-        .filter((index) => !/^\s*import\b[^;]*$/.test(source.slice(source.lastIndexOf('\n', index) + 1, index)));
+      const callSites = [...source.matchAll(/\btryClaimSession\b/g)].map((match) => match.index);
       const outside = callSites.filter((index) => index < declaration || index > bodyEnd);
       expect(
         outside.map((index) => source.slice(0, index).split('\n').length),

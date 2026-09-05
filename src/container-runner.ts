@@ -77,7 +77,13 @@ import {
   getWorkgroupOnecliSecretsById,
 } from './db/agent-groups.js';
 import { getRawDb, hasTableRaw } from './db/connection.js';
-import { getSessionClaim, releaseSessionClaim, shadowWrite, tryClaimSession } from './db/coordination.js';
+import {
+  getLiveHostInstance,
+  getSessionClaim,
+  releaseSessionClaim,
+  shadowWrite,
+  tryClaimSession,
+} from './db/coordination.js';
 import { getHostInstanceId } from './host-instance.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { getSession, SESSION_BY_ID_SQL } from './db/sessions.js';
@@ -209,6 +215,12 @@ const activeContainers = new Map<
 // and its own later commit `692a0b603` ("claims answer to the host-instance
 // lease") replaced it with the lease id. The fork takes the end state directly,
 // so the claimant vocabulary never has to be migrated.
+//
+// This id is what makes a claim ANSWERABLE against `host_instances` liveness:
+// `claimSessionRun` below is the fork's first reader of that table, and the
+// series A lease is what puts a row there to read. A fallback id never matches
+// a lease row, so a claim held under one always reads as not-live — which is
+// the right answer for a tool or a test, neither of which renews a lease.
 function claimantId(): string {
   return getHostInstanceId() ?? `${os.hostname()}:${process.pid}`;
 }
@@ -221,15 +233,39 @@ function claimantId(): string {
  * when the claim was lost. Throws on a failed write — a claim that cannot be
  * recorded is a claim not held.
  *
- * The liveness half of the fence (refusing a claim held by a LIVE peer host,
- * and refusing one whose container is still running untracked) lands with
- * adoption, which is the series that creates those states — plan §4.3.4.
+ * A claim held by a LIVE peer host (a `host_instances` row that is not stopped
+ * and whose lease is unexpired) is refused outright — two live hosts must never
+ * trade a session back and forth. A claim whose holder is stopped,
+ * lease-expired, or unknown (older claimant-id schemes) stays takeover-able: a
+ * crashed claimant must never wedge a session. A claim this same process
+ * already holds is takeover-able too, which is what lets a respawn win.
+ *
+ * The liveness read happens HERE, before the compare-and-set and therefore
+ * before this function returns, so the ordering argument at the call site is
+ * unaffected: the whole claim is still the last `await` in the spawn path, and
+ * the guard point stays adjacent to `spawn()`.
+ *
+ * The container half of the fence — refusing a claim whose container is still
+ * running untracked — lands with adoption, the series that creates that state
+ * (plan §4.3.4, P2).
  */
 async function claimSessionRun(sessionId: string, containerRef: string): Promise<number | null> {
   const current = await getSessionClaim(sessionId);
+  const self = claimantId();
+  if (current?.claimed_by && current.claimed_by !== self) {
+    const holder = await getLiveHostInstance(current.claimed_by, new Date().toISOString());
+    if (holder) {
+      log.warn('Refusing session claim held by a live peer host', {
+        sessionId,
+        holder: current.claimed_by,
+        claimant: self,
+      });
+      return null;
+    }
+  }
   return tryClaimSession({
     sessionId,
-    instanceId: claimantId(),
+    instanceId: self,
     expectedIncarnation: current?.incarnation ?? 0,
     containerRef,
     now: new Date().toISOString(),
