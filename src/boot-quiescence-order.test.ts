@@ -155,7 +155,7 @@ describe('boot mount-change ordering', () => {
       sharedWouldChange: () => true,
       sharedFsEnabled: true,
       quiesce: async (changed, options) => {
-        calls.push(`quiesce(${changed.join(',')}, of ${options.workgroupsTotal})`);
+        calls.push(`quiesce(${changed.join(',')}, of ${options.knownWorkgroupIds.length})`);
         // Suspend inside the door: anything that runs before it resolves is a
         // mutation racing a live container.
         await new Promise<void>((resolve) => {
@@ -239,7 +239,7 @@ describe('boot mount-change ordering', () => {
     expect(calls).toEqual(['quiesce', 'reconcileWorkgroupSharedDirs']);
 
     const source = fs.readFileSync(path.resolve('src/main.ts'), 'utf8');
-    const proof = source.indexOf('quiesceWorkgroupsForBootMountChange)(changedWorkgroupIds, {');
+    const proof = source.indexOf('quiesceWorkgroupsForBootMountChange)(changedBeforeQuiescence, {');
     const shared = source.indexOf('reconcileWorkgroupSharedDirs)(db, { workgroupIds: changedWorkgroupIds })');
     expect(proof).toBeGreaterThanOrEqual(0);
     expect(shared).toBeGreaterThan(proof);
@@ -254,7 +254,10 @@ describe('boot mount-change ordering', () => {
     const db = makeDb();
     const runtime = fakeRuntime([
       { name: 'nanoclaw-v2-a-1', workgroupId: 'wgx', sessionId: 's1', groupId: 'g1' },
-      { name: 'nanoclaw-v2-b-1', workgroupId: 'wg-other', sessionId: 's2', groupId: 'g2' },
+      // Same workgroup: `wgx` is the only id the fixture DB holds, and a label
+      // naming a workgroup the DB does not have is must-stop by construction
+      // (see the deleted-workgroup case in the primitive's suite).
+      { name: 'nanoclaw-v2-b-1', workgroupId: 'wgx', sessionId: 's2', groupId: 'g2' },
     ]);
     let quiesceArg: string[] | null = null;
 
@@ -291,6 +294,55 @@ describe('boot mount-change ordering', () => {
     });
     expect(scope.stopped).toBe(scope.containers);
     expect(runtime.stops).toEqual(['nanoclaw-v2-a-1', 'nanoclaw-v2-b-1']);
+    db.close();
+  });
+
+  it('a workgroup that flips while the door is stopping is still reconciled', async () => {
+    // The group directories the predicates read are bind-mounted WRITABLE into
+    // live containers. A still-running agent can write one between the
+    // pre-stop snapshot and the stops completing; the pre-stop set would then
+    // exclude it, D1 would stop it anyway, and its reconcile would be skipped.
+    // The fix is the second evaluation, on the quiescent tree.
+    //
+    // `stop` here stands in for that agent's last write: it removes the exact
+    // compatibility symlink, which flips the memory predicate to true.
+    const { groupsDir, dataDir } = buildSettledTree();
+    const db = makeDb();
+    const scopes: Array<string[]> = [];
+    let mutated = false;
+
+    const { changedWorkgroupIds } = await runBootMountQuiescence(db, {
+      workgroupIds: () => ['wgx'],
+      memoryWouldChange: (database, id) => workgroupMemoryReconcileWouldChange(database, id, { groupsDir, dataDir }),
+      sharedWouldChange: (database, id) => sharedDirsReconcileWouldChange(database, id, { groupsDir, dataDir }),
+      sharedFsEnabled: true,
+      quiesce: (changed, options) => {
+        scopes.push([...changed]);
+        return quiesceWorkgroupsForBootMountChange(changed, {
+          ...options,
+          list: () =>
+            mutated ? [] : [{ name: 'nanoclaw-v2-a-1', workgroupId: 'wgx', sessionId: 's1', groupId: 'g1' }],
+          stop: () => {
+            fs.unlinkSync(path.join(groupsDir, 'wgx', 'memory'));
+            mutated = true;
+          },
+        });
+      },
+      warnStartup: async () => undefined,
+      reconcileShared: () => undefined,
+      memoryGate: (_db, opts) => {
+        scopes.push([...(opts.mutateWorkgroupIds ?? [])]);
+        return [];
+      },
+      prune: () => undefined,
+    });
+
+    // Pre-stop the tree was settled, so the door's input was empty…
+    expect(scopes[0]).toEqual([]);
+    // …and the post-stop evaluation caught the flip, so the reconcile is scoped
+    // to it rather than skipping it.
+    expect(changedWorkgroupIds).toEqual(['wgx']);
+    expect(scopes[1]).toEqual(['wgx']);
     db.close();
   });
 

@@ -225,7 +225,7 @@ it('runs reconciliation only after runtime and strict absence proof succeed', as
     sharedFsEnabled: true,
     quiesce: (_changed, options) => {
       calls.push('quiescence');
-      expect(options.workgroupsTotal).toBe(1);
+      expect(options.knownWorkgroupIds).toEqual(['wg-1']);
       return Promise.resolve({
         workgroups: 0,
         containers: 0,

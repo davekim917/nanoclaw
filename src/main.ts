@@ -190,7 +190,7 @@ export interface BootMountQuiescenceDeps {
   memoryWouldChange?: (db: Database.Database, workgroupId: string) => boolean;
   sharedWouldChange?: (db: Database.Database, workgroupId: string) => boolean;
   sharedFsEnabled?: boolean;
-  quiesce?: (changedWorkgroupIds: string[], options: { workgroupsTotal: number }) => Promise<BootQuiescenceScope>;
+  quiesce?: (changedWorkgroupIds: string[], options: { knownWorkgroupIds: string[] }) => Promise<BootQuiescenceScope>;
   warnStartup?: (reason: string, skipSessionIds: ReadonlySet<string>) => Promise<void>;
   reconcileShared?: (db: Database.Database, dirs: { workgroupIds?: string[] }) => void;
   memoryGate?: (db: Database.Database, opts: { mutateWorkgroupIds?: string[] }) => WorkgroupMemoryReport[];
@@ -234,16 +234,19 @@ function bootFatal(message: string, err: unknown): never {
  * Order is the safety argument (plan §4.1, §7.D), and every step of it is
  * asserted in src/boot-quiescence-order.test.ts:
  *
- *   1. compute which workgroups a startup reconcile would actually change;
- *   2. warn sessions still marked 'running' by an unclean previous host —
+ *   1. warn sessions still marked 'running' by an unclean previous host —
  *      BEFORE anything is stopped, which is where `main()` has always had it;
+ *   2. evaluate the predicates once, as the door's input;
  *   3. quiesce — the ONLY thing that stops containers at boot, and it throws
  *      before anything below runs if it cannot prove its scope is down;
- *   4. shared-FS consolidation, scoped to the changed set. It used to run
+ *   4. evaluate the predicates AGAIN, on the now-quiescent tree, and use that
+ *      set for the reconciles. Group directories are container-writable, so
+ *      the pre-stop snapshot can be stale by the time the stops finish;
+ *   5. shared-FS consolidation, scoped to the post-stop set. It used to run
  *      BEFORE the quiescence proof (plan §3.5, divergence 4), masked only by
  *      the flag defaulting off;
- *   5. canonical-memory cutover, scoped to the same set;
- *   6. snapshot pruning, after both cutovers.
+ *   6. canonical-memory cutover, scoped to the same set;
+ *   7. snapshot pruning, after both cutovers.
  *
  * Steps 2 and 3 are swapped relative to §7.D's listed order, deliberately: the
  * plan's order writes the accountability note after the stops, so a door that
@@ -270,9 +273,8 @@ export async function runBootMountQuiescence(
   const fatal = deps.fatal ?? bootFatal;
 
   const allWorkgroupIds = listWorkgroupIds(db);
-  const changedWorkgroupIds = allWorkgroupIds.filter(
-    (id) => memoryWouldChange(db, id) || (sharedFsEnabled && sharedWouldChange(db, id)),
-  );
+  const evaluateChanged = (): string[] =>
+    allWorkgroupIds.filter((id) => memoryWouldChange(db, id) || (sharedFsEnabled && sharedWouldChange(db, id)));
 
   // Warn FIRST, before anything is stopped. `main()` has always captured this
   // evidence ahead of the fleet-wide stop (the warn sat above the memory gate
@@ -291,8 +293,29 @@ export async function runBootMountQuiescence(
     log.error('host-restart startup warn failed', { err });
   }
 
-  const scope = await (deps.quiesce ?? quiesceWorkgroupsForBootMountChange)(changedWorkgroupIds, {
-    workgroupsTotal: allWorkgroupIds.length,
+  // The pre-stop evaluation is the door's INPUT, and nothing more. The group
+  // directories these predicates read are bind-mounted writable into live
+  // containers, so a still-running agent can flip a workgroup from settled to
+  // needs-reconcile between this snapshot and the stops completing.
+  const changedBeforeQuiescence = evaluateChanged();
+
+  const scope = await (deps.quiesce ?? quiesceWorkgroupsForBootMountChange)(changedBeforeQuiescence, {
+    knownWorkgroupIds: allWorkgroupIds,
+  });
+
+  // …so the RECONCILE scope is re-evaluated on the quiescent tree. Nothing can
+  // write to a group directory now: the door has proved every install-labeled
+  // container is gone. A workgroup that flipped during the stops joins the set
+  // here rather than being stopped and then silently skipped.
+  const changedWorkgroupIds = evaluateChanged();
+  const flipped = changedWorkgroupIds.filter((id) => !changedBeforeQuiescence.includes(id));
+  log.info('Boot quiescence rescope', {
+    changedBefore: changedBeforeQuiescence.length,
+    changedAfter: changedWorkgroupIds.length,
+    // Non-empty means a live agent wrote to a group directory while the door
+    // was stopping it. Harmless under D1; under D2 it is the case the door's
+    // own re-validation has to cover (see quiesceWorkgroupsForBootMountChange).
+    ...(flipped.length > 0 ? { flipped } : {}),
   });
 
   // Workgroup shared-FS consolidation — flag-gated (NANOCLAW_WORKGROUP_SHARED_FS,

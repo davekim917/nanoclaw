@@ -133,7 +133,7 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
   it('a container in a changed workgroup is stopped', async () => {
     const runtime = fakeRuntime([container('nanoclaw-v2-a-1', 'wg-a')]);
 
-    const scope = await quiesceWorkgroupsForBootMountChange(['wg-a'], { ...runtime, workgroupsTotal: 1 });
+    const scope = await quiesceWorkgroupsForBootMountChange(['wg-a'], { ...runtime, knownWorkgroupIds: ['wg-a'] });
 
     expect(runtime.stops).toEqual(['nanoclaw-v2-a-1']);
     expect(scope).toEqual({
@@ -151,7 +151,10 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
   it('a container in an unchanged workgroup is counted survivable', async () => {
     const runtime = fakeRuntime([container('nanoclaw-v2-b-1', 'wg-b')]);
 
-    const scope = await quiesceWorkgroupsForBootMountChange(['wg-a'], runtime);
+    const scope = await quiesceWorkgroupsForBootMountChange(['wg-a'], {
+      ...runtime,
+      knownWorkgroupIds: ['wg-a', 'wg-b'],
+    });
 
     expect(scope.survivable).toBe(1);
     expect(scope.survivableSessionIds).toEqual(['nanoclaw-v2-b-1-session']);
@@ -170,7 +173,10 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
     // and it is never counted survivable.
     const runtime = fakeRuntime([container('nanoclaw-v2-legacy-1', null), container('nanoclaw-v2-b-1', 'wg-b')]);
 
-    const scope = await quiesceWorkgroupsForBootMountChange([], { ...runtime, workgroupsTotal: 3 });
+    const scope = await quiesceWorkgroupsForBootMountChange([], {
+      ...runtime,
+      knownWorkgroupIds: ['wg-a', 'wg-b', 'wg-c'],
+    });
 
     expect(runtime.stops).toContain('nanoclaw-v2-legacy-1');
     expect(scope).toEqual({
@@ -281,7 +287,10 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
       { name: 'nanoclaw-v2-nosession-1', workgroupId: 'wg-b', sessionId: null, groupId: 'g' },
     ]);
 
-    const scope = await quiesceWorkgroupsForBootMountChange(['wg-a'], { ...runtime, workgroupsTotal: 4 });
+    const scope = await quiesceWorkgroupsForBootMountChange(['wg-a'], {
+      ...runtime,
+      knownWorkgroupIds: ['wg-a', 'wg-b', 'wg-c', 'wg-d'],
+    });
 
     expect(scope.survivableSessionIds).toEqual(['nanoclaw-v2-b-1-session', 'nanoclaw-v2-c-1-session']);
     expect(scope.survivable).toBe(scope.survivableSessionIds.length);
@@ -295,6 +304,28 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
     expect(spawns).toEqual([]);
   });
 
+  it('a container whose workgroup no longer exists is stopped, never survivable', async () => {
+    // An approved `ncl groups delete` leaves the container running. Its
+    // workgroup is in no reconcile scope and resolves to no row, so adoption
+    // has nothing to claim and D2 would leak it. Unknown is stopped.
+    const runtime = fakeRuntime([
+      container('nanoclaw-v2-live-1', 'wg-b'), // known, unchanged  → survivable
+      container('nanoclaw-v2-deleted-1', 'wg-gone'), // not in the DB → must stop
+    ]);
+
+    const scope = await quiesceWorkgroupsForBootMountChange(['wg-a'], {
+      ...runtime,
+      knownWorkgroupIds: ['wg-a', 'wg-b'],
+    });
+
+    expect(scope.survivableSessionIds).toEqual(['nanoclaw-v2-live-1-session']);
+    expect(scope.survivableSessionIds).not.toContain('nanoclaw-v2-deleted-1-session');
+    expect(scope.mustStopSessionIds).toEqual(['nanoclaw-v2-deleted-1-session']);
+    expect(scope.survivable).toBe(1);
+    expect(runtime.stops).toContain('nanoclaw-v2-deleted-1');
+    expect(spawns).toEqual([]);
+  });
+
   it('the scope log carries every count', async () => {
     const runtime = fakeRuntime([
       container('nanoclaw-v2-a-1', 'wg-a'),
@@ -302,7 +333,10 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
       container('nanoclaw-v2-legacy-1', null),
     ]);
 
-    await quiesceWorkgroupsForBootMountChange(['wg-a', 'wg-c'], { ...runtime, workgroupsTotal: 5 });
+    await quiesceWorkgroupsForBootMountChange(['wg-a', 'wg-c'], {
+      ...runtime,
+      knownWorkgroupIds: ['wg-a', 'wg-b', 'wg-c', 'wg-d', 'wg-e'],
+    });
 
     const scopeLines = (log.info as unknown as { mock: { calls: unknown[][] } }).mock.calls.filter(
       (call) => call[0] === 'Boot quiescence scope',

@@ -692,7 +692,7 @@
 "src/container-config.ts":{"diff":1097,"mode":"100644","sha256":"28fb6566c8ff2b6cd03ea95bf2f54c340d937bff5ce278ea9f239ec5e9bd16df"},
 "src/container-restart-shadow.test.ts":{"diff":87,"mode":"100644","sha256":null,"deleted":true},
 "src/container-restart.test.ts":{"diff":855,"mode":"100644","sha256":"5e72e7ea98300ccaf01b327d7e1a854d6d47fb1f875632ab9ebd44c9ebfe28f7"},
-"src/container-restart.ts":{"diff":812,"mode":"100644","sha256":"30a5d3a0c6064bca492dd3f8c36f33aa6719dbe922811f2a05c9597d554efdc7"},
+"src/container-restart.ts":{"diff":849,"mode":"100644","sha256":"2843bf2ee80683d79a50a66d55336810e8a7c9f642dffecffab32c3d5ee06f1c"},
 "src/container-runner.claims.test.ts":{"diff":111,"mode":"100644","sha256":null,"deleted":true},
 "src/container-runner.test.ts":{"diff":2526,"mode":"100644","sha256":"ff71c74fe33bf668e19b32d7e66c69d0f42aa545607e69567556fb9ab1a0d428"},
 "src/container-runner.ts":{"diff":5782,"mode":"100644","sha256":"4bbd6f46a530e39328e0a2fe8b8cd8487191218dcf76646811fe2f64142fb7cc"},

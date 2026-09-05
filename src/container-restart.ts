@@ -522,11 +522,20 @@ export interface BootQuiescenceScope {
  */
 export interface BootQuiescenceOptions {
   /**
-   * How many workgroups this boot inspected — the `workgroups` field of the
-   * §6 `Boot quiescence scope` line, and the denominator `changed` is read
-   * against. The boot block always supplies it (src/main.ts).
+   * Every workgroup id the central DB currently holds.
+   *
+   * Two uses, one source of truth. Its length is the `workgroups` field of the
+   * §6 `Boot quiescence scope` line — the denominator `changed` is read
+   * against. Its membership decides whether a container's workgroup label
+   * still names something: an approved `ncl groups delete` leaves the
+   * container running, and a survivor whose workgroup is gone has no reconcile
+   * to be scoped by and nothing for adoption to resolve. Unknown is stopped.
+   *
+   * Omitted, the door falls back to the changed set, which makes every
+   * container's label look unknown — fail-closed, and only reachable from a
+   * caller that forgot to pass it. The boot block always supplies it.
    */
-  workgroupsTotal?: number;
+  knownWorkgroupIds?: string[];
   list?: () => InstallContainerScope[];
   stop?: (name: string) => void;
 }
@@ -551,6 +560,18 @@ export interface BootQuiescenceOptions {
  * D2 is the one-branch flip to stopping only `mustStop`, and it is gated on
  * adoption (plan §4.1).
  *
+ * `changedWorkgroupIds` is a snapshot taken BEFORE this door runs, and the
+ * group directories it was computed from are container-writable — a live agent
+ * can flip a workgroup from settled to needs-reconcile while the stops are in
+ * flight. Under D1 that is only a partition-accuracy question, because the
+ * caller re-evaluates the predicates on the quiescent tree and reconciles the
+ * post-stop set (src/main.ts). **Under D2 it is a correctness question**: a
+ * workgroup that flips after being classified survivable would have its
+ * container left running across a mount cutover. D2 must therefore re-validate
+ * the predicates after quiescence and either stop the newly-changed
+ * workgroups' containers too, or refuse the boot — never silently skip the
+ * reconcile for them.
+ *
  * Fail-closed like the call it replaces: a listing failure, or a stop that does
  * not take, throws — startup stops before any reconcile runs.
  */
@@ -561,18 +582,34 @@ export async function quiesceWorkgroupsForBootMountChange(
   const list = options.list ?? listInstallContainersWithScope;
   const stop = options.stop ?? stopContainer;
   const changed = new Set(changedWorkgroupIds);
+  const known = new Set(options.knownWorkgroupIds ?? changedWorkgroupIds);
 
   const containers = list();
   const unlabeled = containers.filter((entry) => entry.workgroupId === null);
   // The partition is exact: every container is in one side or the other.
   //
-  // A container is survivable only if it can be IDENTIFIED — a workgroup label
-  // outside the changed set AND a session label. A missing workgroup label is
-  // unknown scope (plan §3.5, divergence 7); a missing session label is a
-  // container adoption could never claim, so leaving it running under D2 would
-  // leak it. Both fail closed into must-stop.
+  // A container is survivable only if it is IDENTIFIED, KNOWN and UNCHANGED:
+  //
+  //   - a workgroup label — a missing one is unknown scope (plan §3.5,
+  //     divergence 7), and on the first restart after C that is every
+  //     container;
+  //   - a session label — a container adoption could never claim, so leaving
+  //     it running under D2 would leak it;
+  //   - a workgroup that still exists in the central DB — an approved
+  //     `ncl groups delete` leaves the container running, and its workgroup is
+  //     in no reconcile scope and resolves to no row;
+  //   - a workgroup outside the changed set.
+  //
+  // Everything else fails closed into must-stop. The door does NOT read the
+  // sessions table, so it cannot tell a live session id from a deleted one:
+  // seam-4 E must re-check the session row before adopting, and treat an
+  // unresolvable one the same way this does.
   const survivable = containers.filter(
-    (entry) => entry.workgroupId !== null && entry.sessionId !== null && !changed.has(entry.workgroupId),
+    (entry) =>
+      entry.workgroupId !== null &&
+      entry.sessionId !== null &&
+      known.has(entry.workgroupId) &&
+      !changed.has(entry.workgroupId),
   );
   const survivableNames = new Set(survivable.map((entry) => entry.name));
   const mustStop = containers.filter((entry) => !survivableNames.has(entry.name));
@@ -611,7 +648,7 @@ export async function quiesceWorkgroupsForBootMountChange(
   }
 
   const scope: BootQuiescenceScope = {
-    workgroups: options.workgroupsTotal ?? changedWorkgroupIds.length,
+    workgroups: known.size,
     containers: containers.length,
     stopped: stopSet.length,
     survivable: survivable.length,
