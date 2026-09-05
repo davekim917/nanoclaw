@@ -146,7 +146,7 @@ sudo systemctl restart nanoclaw-v2
 
 **Checkpoint caveat:** the host logs rotate daily with `copytruncate`; if rotation fires between the checkpoint and the read, the file shrinks and the scoped tail is empty. If `wc -l < logs/nanoclaw.log` is smaller than `$LOG0`, scope from the last `OneCLI preflight ok` line instead (`tail -n +$(grep -n 'OneCLI preflight ok' logs/nanoclaw.log | tail -1 | cut -d: -f1)`), and likewise for the error log from its first line after the restart timestamp.
 
-**Post-restart gate, read at +2.5 minutes with ANSI codes stripped, scoped to `tail -n +$((LOG0+1)) logs/nanoclaw.log` / `tail -n +$((ERR0+1)) logs/nanoclaw.error.log` — all required rows, or it is not deployed:**
+**Post-restart gate, read at +2.5 minutes with ANSI codes stripped, scoped to `tail -n +$((LOG0+1)) logs/nanoclaw.log` / `tail -n +$((ERR0+1)) logs/nanoclaw.error.log`: before every count, retain only timestamp-prefixed rows matching `^\[[0-9]{4}-[0-9]{2}-[0-9]{2}[ T]` — all required rows, or it is not deployed:**
 
 | Check                       | What passes                                                                                                                                                                                                                                                                                      |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
