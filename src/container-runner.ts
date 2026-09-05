@@ -236,16 +236,29 @@ const activeContainers = new Map<
 const pendingAdoptions = new Set<string>();
 
 /**
- * Sessions this process has promised to bring back — the in-memory shadow of
- * the `respawn_after_stop` rows it wrote itself.
+ * Sessions this process has promised to bring back, each holding the TOKEN of
+ * the promise — the in-memory shadow of the `respawn_after_stop` rows this host
+ * wrote itself.
  *
- * Exists so the discharge is free for every wake that owes nothing: without it
- * `clearRespawnIntentOnWake` would put a central-DB write in front of every
- * ordinary message-driven spawn. Empty at boot by construction, which is right:
- * a promise made by a PREVIOUS host is owed to `honorPendingStopIntents`, not
- * to this set.
+ * The token is what makes the discharge safe against an in-flight wake. A wake
+ * reads the session's token when it STARTS, and may only discharge a promise
+ * whose token it read: a wake already running when the kill arrived read
+ * `undefined` (or the previous promise's token) and so cannot clear the promise
+ * the kill just made, even though it can still resolve `true` for a container
+ * this kill is about to stop. Without that, the original wake's `true` cleared
+ * the row while the replacement wake merely JOINED it, and the session went
+ * down with nothing left for the next boot to recover.
+ *
+ * The map also keeps the discharge free for every wake that owes nothing:
+ * without it `clearRespawnIntentOnWake` would put a central-DB write in front
+ * of every ordinary message-driven spawn. Empty at boot by construction, which
+ * is right — a promise made by a PREVIOUS host is owed to
+ * `honorPendingStopIntents`, not to this map.
  */
-const respawnIntents = new Set<string>();
+const respawnIntents = new Map<string, number>();
+
+/** Monotonic source of the promise tokens above; never reused within a process. */
+let respawnIntentSeq = 0;
 
 export function _resetAdoptionRetryStateForTesting(): void {
   pendingAdoptions.clear();
@@ -254,6 +267,14 @@ export function _resetAdoptionRetryStateForTesting(): void {
 /** Test-only: drop this process's record of outstanding respawn promises. */
 export function _resetStopIntentStateForTesting(): void {
   respawnIntents.clear();
+}
+
+/**
+ * Test-only: the promise token a wake starting NOW would read, or undefined
+ * when this host owes the session nothing.
+ */
+export function _respawnIntentTokenForTesting(sessionId: string): number | undefined {
+  return respawnIntents.get(sessionId);
 }
 
 /**
@@ -1033,6 +1054,11 @@ function startReservedWake(queued: QueuedWake): Promise<boolean> {
 }
 
 function trackWake(sessionId: string, run: () => Promise<boolean>): Promise<boolean> {
+  // Read at the START of this wake, which is what makes the discharge below
+  // safe: `wakeContainer` hands a caller the EXISTING promise when one is in
+  // flight, so a joined wake never reaches here and carries the original
+  // wake's token rather than earning a fresh one.
+  const respawnToken = respawnIntents.get(sessionId);
   const tracked = run()
     .catch((err) => {
       log.warn('wakeContainer failed — host-sweep will retry', { sessionId, err });
@@ -1043,7 +1069,7 @@ function trackWake(sessionId: string, run: () => Promise<boolean>): Promise<bool
       // rather than in each respawning caller's callback: those are all
       // fire-and-forget `void wakeContainer(...)`, so the callback resolving
       // says nothing about whether a container actually came back.
-      if (woke) clearRespawnIntentOnWake(sessionId);
+      if (woke) clearRespawnIntentOnWake(sessionId, respawnToken);
       return woke;
     })
     .finally(() => {
@@ -1841,7 +1867,7 @@ export function killContainer(
  * that was never written.
  */
 function recordStopIntent(sessionId: string, intent: StopIntent): void {
-  if (intent === 'respawn_after_stop') respawnIntents.add(sessionId);
+  if (intent === 'respawn_after_stop') respawnIntents.set(sessionId, ++respawnIntentSeq);
   else respawnIntents.delete(sessionId);
   void shadowWrite('stop-intent', () => setStopIntent(sessionId, intent, new Date().toISOString()));
 }
@@ -1855,17 +1881,28 @@ function recordStopIntent(sessionId: string, intent: StopIntent): void {
  * boot replays it — waking a session nobody asked for, once per restart,
  * forever.
  *
+ * `token` is what the waking side read from `respawnIntents` when it STARTED,
+ * and only a wake that read THIS promise may discharge it. A wake already in
+ * flight when the kill arrived read `undefined`, or an older promise's token,
+ * and its `true` says nothing about the container this kill is about to stop —
+ * clearing on it would leave the session down with nothing owed. A later wake
+ * that merely joins that in-flight promise inherits its token and is refused
+ * for the same reason; the replacement wake the kill's own callback starts
+ * reads the current token and qualifies.
+ *
  * Gated on `respawnIntents` so an ordinary message-driven wake costs no central
- * DB write: the set holds only the promises THIS process made and has not yet
+ * DB write: the map holds only the promises THIS process made and has not yet
  * discharged. A promise made by a host that died is not in it, which is
  * correct — that one belongs to `honorPendingStopIntents` at the next boot, and
  * it clears the row itself.
  *
  * Whoever woke the session discharges the promise: the promise is "this session
- * gets a container back", so a wake from any source satisfies it.
+ * gets a container back", so a qualifying wake from any source satisfies it.
  */
-function clearRespawnIntentOnWake(sessionId: string): void {
-  if (!respawnIntents.delete(sessionId)) return;
+function clearRespawnIntentOnWake(sessionId: string, token: number | undefined): void {
+  if (token === undefined) return;
+  if (respawnIntents.get(sessionId) !== token) return;
+  respawnIntents.delete(sessionId);
   void shadowWrite('stop-intent-clear', () => setStopIntent(sessionId, null, new Date().toISOString()));
 }
 

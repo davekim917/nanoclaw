@@ -544,27 +544,6 @@ export async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Re-issue any restart that a previous host ordered but did not live to
-  // finish. `respawn_after_stop` is the durable half of a kill whose respawn
-  // was only ever a process-memory callback, so this is where "rebuild applied"
-  // with nothing coming back gets recovered.
-  //
-  // E integration (seam4/e-adoption): E's `adoptRunningSessions()` lands ABOVE
-  // this, immediately after `runBootMountQuiescence(db)` — D1's boot door,
-  // whose returned `scope.survivableSessionIds` is the candidate set adoption
-  // takes. The order is required, not incidental: a survivor has to be
-  // registered and claim-fenced before an intent against it is acted on, and a
-  // session still awaiting its fence is skipped here rather than killed at the
-  // wrong incarnation.
-  //
-  // E leaves a `// F2 hook` marker at the END of `adoptRunningSessions`, and
-  // this call deliberately does NOT move there. Two reasons: this can spawn a
-  // container, and adoption must stay a pure inventory pass whose contract is
-  // that no wake starts inside it; and the pending pre-turn-context
-  // reconciliation above must finish before any container is woken, which is
-  // only true at this position. §7.F says `main()` for the same reasons.
-  await honorPendingStopIntents();
-
   // Incident 2026-09-01: a failed repository publication left 1401 session
   // inbound DBs fenced with no publication left to release them, and the
   // workgroup went silently deaf. The mount/lifecycle claims that mark a
@@ -664,6 +643,39 @@ export async function main(): Promise<void> {
   if (resetCount > 0) {
     log.info('Reset phantom container_status rows on startup', { count: resetCount });
   }
+
+  // 2b. Re-issue any restart a previous host ordered but did not live to
+  // finish. `respawn_after_stop` is the durable half of a kill whose respawn
+  // was only ever a process-memory callback, so this is where "rebuild
+  // applied" with nothing coming back gets recovered.
+  //
+  // This is the FIRST thing in startup that may deliberately spawn a
+  // container, so it sits below every startup-only reset and every pre-spawn
+  // gate, and `src/stop-intent-recovery.test.ts` pins that order:
+  //
+  //   - `resetStorageActivityState()` recursively deletes the active-lease
+  //     directory. Above it, a recovery spawn's own lease is deleted out from
+  //     under the live container it belongs to.
+  //   - `resetPhantomContainerStatus()` rewrites every `running` row to
+  //     `stopped` on the premise that no container survived the restart.
+  //     Above it, the recovery's fresh container is flipped to `stopped` while
+  //     it runs, and the sweep then reasons about a session it cannot see.
+  //   - `runOnecliBootPreflight()` proves the credential API every spawn calls.
+  //   - `releaseOrphanedRepoIngressFencesAtStartup()` treats every active fence
+  //     as orphaned because a fresh process holds no mount claims. A spawn
+  //     above it can break that premise; below it, nothing does.
+  //
+  // E integration (seam4/e-adoption): E's `adoptRunningSessions()` lands
+  // earlier, right after D1's boot door, and E moves the two resets above it.
+  // Either way this call stays BELOW adoption, which is the ordering that
+  // matters: a survivor must be registered and claim-fenced before an intent
+  // against it is acted on, and a session still awaiting its fence is skipped
+  // here rather than killed at the wrong incarnation.
+  //
+  // E also leaves a `// F2 hook` marker at the END of `adoptRunningSessions`,
+  // and this call deliberately does NOT move there: it can spawn, and adoption
+  // must stay a pure inventory pass with no wake inside it. §7.F says `main()`.
+  await honorPendingStopIntents();
 
   // 3. Channel adapters
   // Gateway READY can arrive while adapters are still initializing. Hold its

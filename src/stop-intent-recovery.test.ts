@@ -79,13 +79,36 @@ vi.mock('./onecli-secrets.js', async (importOriginal) => ({
   applyOnecliSecrets: async () => undefined,
 }));
 
-/** Parks the wake at its first await, so a kill can arrive mid-spawn. */
+/** Gates inside the spawn path, so a kill can arrive at a chosen instant. */
 const hooks = vi.hoisted(() => ({
+  /** Parks the wake at its FIRST await, before any cancellation point. */
   storageGate: null as Promise<void> | null,
+  /**
+   * Parks the wake at `markContainerRunning`, which is AFTER the container is
+   * registered and after the last cancellation check — the only window in
+   * which a kill request and a wake that still resolves `true` overlap.
+   */
+  runningGate: null as Promise<void> | null,
+  /** How many times the spawn path has reached that gate. */
+  runningGateHits: 0,
   reset(): void {
     this.storageGate = null;
+    this.runningGate = null;
+    this.runningGateHits = 0;
   },
 }));
+
+vi.mock('./session-manager.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./session-manager.js')>();
+  return {
+    ...actual,
+    markContainerRunning: async (sessionId: string) => {
+      hooks.runningGateHits += 1;
+      if (hooks.runningGate) await hooks.runningGate;
+      return actual.markContainerRunning(sessionId);
+    },
+  };
+});
 
 vi.mock('./storage-maintenance-worker.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./storage-maintenance-worker.js')>()),
@@ -139,13 +162,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import BetterSqlite3 from 'better-sqlite3';
+import ts from 'typescript';
 
 import {
   honorPendingStopIntents,
+  isContainerRunning,
   killContainer,
   wakeContainer,
   _markPendingAdoptionForTesting,
   _resetAdoptionRetryStateForTesting,
+  _respawnIntentTokenForTesting,
   _resetStopIntentStateForTesting,
 } from './container-runner.js';
 import { getSessionClaim, setStopIntent } from './db/coordination.js';
@@ -472,6 +498,60 @@ describe('durable stop intent', () => {
     expect(await storedIntent('sess-pending-adoption')).toBe('respawn_after_stop');
   });
 
+  it('a wake in flight across the kill does not clear the intent', async () => {
+    await seedSession('sess-inflight');
+
+    // Park PAST the registration and past the last cancellation check, so the
+    // kill below takes the running path and this wake still resolves `true`.
+    // That overlap is the whole bug: the original wake's `true` used to
+    // discharge a promise made for the container it was about to lose, and the
+    // replacement wake merely JOINED it, so the session went down with nothing
+    // left for the next boot to recover.
+    let releaseRunning!: () => void;
+    hooks.runningGate = new Promise<void>((resolve) => {
+      releaseRunning = resolve;
+    });
+    const inFlight = wakeContainer(callerSnapshot('sess-inflight'));
+    // Reaching the gate proves the container was registered and the last
+    // cancellation check is behind us. `isContainerRunning` is deliberately NOT
+    // the sync point: the fixture's container binary does not exist, so the
+    // child can die and finalize while this wake is still parked here — and the
+    // wake still resolves `true`, which is exactly the state under test.
+    await vi.waitFor(() => expect(hooks.runningGateHits).toBe(1));
+
+    // A restart whose callback never gets to run its wake — a host that died
+    // between the kill and the respawn, which is the case the durable intent
+    // exists for.
+    const fired: string[] = [];
+    killContainer(
+      'sess-inflight',
+      'restarted via ncl',
+      () => {
+        fired.push('onExit');
+      },
+      'respawn_after_stop',
+    );
+    const token = _respawnIntentTokenForTesting('sess-inflight');
+    expect(token).toBeDefined();
+
+    releaseRunning();
+    await expect(inFlight).resolves.toBe(true);
+
+    // The promise is still outstanding: this wake read no token, so its `true`
+    // cannot discharge a promise made after it started.
+    expect(_respawnIntentTokenForTesting('sess-inflight')).toBe(token);
+    expect(await storedIntent('sess-inflight')).toBe('respawn_after_stop');
+    expect(fired).toEqual(['onExit']);
+
+    // The post-stop replacement wake is the one that qualifies: it starts after
+    // the kill, so it reads the current token.
+    await vi.waitFor(() => expect(isContainerRunning('sess-inflight')).toBe(false));
+    hooks.runningGate = null;
+    await expect(wakeContainer(callerSnapshot('sess-inflight'))).resolves.toBe(true);
+    await vi.waitFor(async () => expect(await storedIntent('sess-inflight')).toBeNull());
+    expect(_respawnIntentTokenForTesting('sess-inflight')).toBeUndefined();
+  });
+
   it("an archived session's intent is cleared without a respawn", async () => {
     await seedSession('sess-archived', 'closed');
     await setStopIntent('sess-archived', 'respawn_after_stop', STAMP);
@@ -487,5 +567,63 @@ describe('durable stop intent', () => {
 
     expect(woke).toEqual([]);
     expect(await storedIntent('sess-archived')).toBeNull();
+  });
+});
+
+/**
+ * The startup position, pinned at the source rather than by driving `main()`.
+ *
+ * `honorPendingStopIntents` is the first thing in startup that deliberately
+ * spawns, so it has to sit below every startup-only reset: the storage reset
+ * recursively deletes the active-lease directory, and the phantom-status reset
+ * rewrites every `running` row to `stopped` on the premise that nothing
+ * survived. Either one, above the recovery, corrupts the container it just
+ * brought back.
+ */
+describe('honorPendingStopIntents runs after the startup-only resets', () => {
+  /**
+   * Every startup gate the recovery has to follow, in the order `main()` runs
+   * them. The load-bearing claim is that `honorPendingStopIntents` is LAST;
+   * the four ahead of it are listed in their current order so that moving any
+   * one of them past the recovery fails here rather than in production.
+   */
+  const ORDERED = [
+    'releaseOrphanedRepoIngressFencesAtStartup',
+    'runOnecliBootPreflight',
+    'resetStorageActivityState',
+    'resetPhantomContainerStatus',
+    'honorPendingStopIntents',
+  ] as const;
+
+  /** Call positions inside `main()`, in source order, for the names given. */
+  function mainCallOrder(wanted: readonly string[]): string[] {
+    const file = path.join(__dirname, 'main.ts');
+    const source = ts.createSourceFile(file, fs.readFileSync(file, 'utf8'), ts.ScriptTarget.ES2022, true);
+    const found: Array<{ name: string; pos: number }> = [];
+    const enclosingIsMain = (node: ts.Node): boolean => {
+      for (let cursor: ts.Node | undefined = node.parent; cursor; cursor = cursor.parent) {
+        if (ts.isFunctionDeclaration(cursor)) return cursor.name?.getText() === 'main';
+      }
+      return false;
+    };
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && wanted.includes(node.expression.text)) {
+        if (enclosingIsMain(node)) found.push({ name: node.expression.text, pos: node.getStart(source) });
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+    return found.sort((a, b) => a.pos - b.pos).map((entry) => entry.name);
+  }
+
+  it('the recovery is the last of the startup gates, after both resets', () => {
+    const order = mainCallOrder(ORDERED);
+    // Each gate is called exactly once from main(), so the sequence is total.
+    expect(order).toEqual([...ORDERED]);
+    // Stated separately from the sequence above, because this is the property
+    // the fix is about and it must survive any future reshuffle of the rest.
+    expect(order.at(-1)).toBe('honorPendingStopIntents');
+    expect(order.indexOf('honorPendingStopIntents')).toBeGreaterThan(order.indexOf('resetStorageActivityState'));
+    expect(order.indexOf('honorPendingStopIntents')).toBeGreaterThan(order.indexOf('resetPhantomContainerStatus'));
   });
 });
