@@ -626,11 +626,17 @@ function describeMode(report: RunReport): string {
   return usedFallback ? 'identifiers from main checkout' : 'identifiers from local install';
 }
 
-function describeStructuralFallback(report: RunReport): string {
-  return (
-    `no identifier registry found; registry paths tried: ${report.registryPathsTried.join(', ') || '(none)'}; ` +
-    `identifier inventory paths tried: ${report.identifiersPathsTried.join(', ') || '(none)'}`
-  );
+function describeMissingIdentifierSources(report: RunReport): string {
+  const sources: string[] = [];
+  if (report.registryOrigin === 'none') {
+    sources.push(`missing install registry; registry paths tried: ${report.registryPathsTried.join(', ') || '(none)'}`);
+  }
+  if (report.identifiersOrigin === 'none') {
+    sources.push(
+      `missing identifier inventory; identifier inventory paths tried: ${report.identifiersPathsTried.join(', ') || '(none)'}`,
+    );
+  }
+  return sources.join('; ');
 }
 
 export function main(argv = process.argv.slice(2)): number {
@@ -638,13 +644,18 @@ export function main(argv = process.argv.slice(2)): number {
     const options = resolveOptions(argv);
     const report = runReport(options);
     const { findings } = report;
-    if (report.mode === 'structural-fallback') {
-      process.stderr.write(
-        `WARNING: ${describeStructuralFallback(report)} — running structural-pattern checks only; real names and tenant identifiers will NOT be caught\n`,
-      );
+    const missingIdentifierSources =
+      !options.portable && (report.registryOrigin === 'none' || report.identifiersOrigin === 'none');
+    if (missingIdentifierSources) {
+      const missing = describeMissingIdentifierSources(report);
+      const coverage =
+        report.mode === 'structural-fallback'
+          ? `no identifier registry found; ${missing} — running structural-pattern checks only; real names and tenant identifiers will NOT be caught`
+          : `install-aware checks are incomplete; ${missing}`;
+      process.stderr.write(`WARNING: ${coverage}\n`);
       if (options.index && !options.allowStructural) {
         process.stderr.write(
-          'public boundary check failed: indexed scans require an identifier registry; use --allow-structural only for read-only structural reporting\n',
+          'public boundary check failed: indexed scans require both an install registry and identifier inventory; use --allow-structural only for read-only structural reporting\n',
         );
         return 1;
       }

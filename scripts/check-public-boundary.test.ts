@@ -44,9 +44,7 @@ function input(file: string, text: string): { file: string; content: Buffer } {
 // A "main checkout": a committed repo carrying the gitignored install state
 // (data/v2.db + .nanoclaw/public-boundary-identifiers) that a linked worktree
 // never gets a copy of, since both are gitignored.
-function initInstallRepo(registryIdentifier: string, localIdentifier: string): string {
-  const root = initRepo();
-  execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: root });
+function addInstallRegistry(root: string, identifier: string): void {
   fs.mkdirSync(path.join(root, 'data'), { recursive: true });
   const db = new Database(path.join(root, 'data', 'v2.db'));
   db.exec(`
@@ -55,10 +53,20 @@ function initInstallRepo(registryIdentifier: string, localIdentifier: string): s
     CREATE TABLE messaging_groups (id TEXT, platform_id TEXT, instance TEXT, name TEXT);
     CREATE TABLE users (id TEXT, display_name TEXT);
   `);
-  db.prepare('INSERT INTO workgroups (id, display_name) VALUES (?, ?)').run('main-house', registryIdentifier);
+  db.prepare('INSERT INTO workgroups (id, display_name) VALUES (?, ?)').run('main-house', identifier);
   db.close();
+}
+
+function addIdentifierInventory(root: string, identifier: string): void {
   fs.mkdirSync(path.join(root, '.nanoclaw'), { recursive: true });
-  fs.writeFileSync(path.join(root, '.nanoclaw', 'public-boundary-identifiers'), `${localIdentifier}\n`);
+  fs.writeFileSync(path.join(root, '.nanoclaw', 'public-boundary-identifiers'), `${identifier}\n`);
+}
+
+function initInstallRepo(registryIdentifier: string, localIdentifier: string): string {
+  const root = initRepo();
+  execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: root });
+  addInstallRegistry(root, registryIdentifier);
+  addIdentifierInventory(root, localIdentifier);
   return root;
 }
 
@@ -392,7 +400,40 @@ describe('Git surfaces and modes', () => {
     expect(output).toContain(
       `identifier inventory paths tried: ${path.join(root, '.nanoclaw', 'public-boundary-identifiers')}`,
     );
-    expect(output).toContain('indexed scans require an identifier registry');
+    expect(output).toContain('indexed scans require both an install registry and identifier inventory');
+  });
+
+  it.each([
+    {
+      missing: 'install registry',
+      addAvailableSource: (root: string) => addIdentifierInventory(root, 'Synthetic Local'),
+      expectedPath: (root: string) => path.join(root, 'data', 'v2.db'),
+    },
+    {
+      missing: 'identifier inventory',
+      addAvailableSource: (root: string) => addInstallRegistry(root, 'Synthetic Registry'),
+      expectedPath: (root: string) => path.join(root, '.nanoclaw', 'public-boundary-identifiers'),
+    },
+  ])('fails closed when $missing does not resolve', ({ missing, addAvailableSource, expectedPath }) => {
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    for (const surface of ['--index', '--staged']) {
+      const root = initRepo();
+      addAvailableSource(root);
+      stdout.mockClear();
+      stderr.mockClear();
+
+      expect(main(['--root', root, surface])).toBe(1);
+      expect(stdout).not.toHaveBeenCalled();
+      expect(stderr.mock.calls.flat().join('')).toContain(`missing ${missing}`);
+      expect(stderr.mock.calls.flat().join('')).toContain(expectedPath(root));
+
+      const at = String.fromCharCode(64);
+      fs.writeFileSync(path.join(root, 'structural.md'), `person${at}company.dev\n`);
+      execFileSync('git', ['add', 'structural.md'], { cwd: root });
+      expect(main(['--root', root, surface, '--allow-structural'])).toBe(1);
+      expect(stderr.mock.calls.flat().join('')).toContain('structural.md:1 email-address');
+    }
   });
 
   it('allows explicit structural reporting for an indexed surface but still reports structural findings', () => {
