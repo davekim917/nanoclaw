@@ -1584,7 +1584,7 @@ export async function buildThreadList(
   // Same rule: one query for the page's in-flight closes, never one per row.
   // Fleet-wide (not per-user) — a close is a decision about the WORK, unlike a
   // snooze, so every operator looking at the row must see that it is closing.
-  const closures: Map<string, ThreadCloseState> = readThreadClosures(grouped.map((t) => t.threadId));
+  const closures: Map<string, ThreadCloseState> = await readThreadClosures(grouped.map((t) => t.threadId));
   // Same rule again: one query for every attention item on the page. Empty when
   // there are none, which is every install that declares no attention source.
   const assignments = await readItemAssignments([...new Set(attentionItems.map((i) => i.workgroupId))]);
