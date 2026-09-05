@@ -4,7 +4,14 @@ set -e
 repo_root=$(dirname "$(cd "$(git rev-parse --git-common-dir)" && pwd)")
 worktree_root=$(git rev-parse --show-toplevel)
 git_local_env=$(git rev-parse --local-env-vars)
-unset $git_local_env
+# Git hooks export the invoking checkout's repository selection variables.
+# Keep command-scoped `git -c` configuration so remote access still inherits it.
+for git_env in $git_local_env; do
+  case "$git_env" in
+    GIT_CONFIG*) ;;
+    *) unset "$git_env" ;;
+  esac
+done
 remote_name=$1
 remote_url=$2
 zero_sha=0000000000000000000000000000000000000000
@@ -13,6 +20,8 @@ seen_commits=''
 advertised_refs=''
 known_remote_tips=''
 commit_list=''
+commit_message=''
+worktree_node_modules_link=''
 snapshot_parent=''
 snapshot_root=''
 snapshot_node_modules_link=''
@@ -38,6 +47,10 @@ cleanup() {
     echo "pre-push: failed to remove temporary snapshot directory" >&2
   fi
   remove_file "$commit_list"
+  remove_file "$commit_message"
+  if [ "$worktree_node_modules_link" = 1 ] && [ -L "$worktree_root/node_modules" ] && ! rm "$worktree_root/node_modules"; then
+    echo "pre-push: failed to remove worktree node_modules link" >&2
+  fi
   remove_file "$advertised_refs"
   remove_file "$known_remote_tips"
   remove_file "$seen_commits"
@@ -89,6 +102,15 @@ snapshot_commit() {
   ln -s "$repo_root/node_modules" "$snapshot_root/node_modules"
   snapshot_node_modules_link=1
 
+  commit_message=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-message.XXXXXX")
+  git -C "$worktree_root" show --no-patch --format=%B "$1" > "$commit_message"
+  if [ ! -e "$worktree_root/node_modules" ] && [ ! -L "$worktree_root/node_modules" ]; then
+    ln -s "$repo_root/node_modules" "$worktree_root/node_modules"
+    worktree_node_modules_link=1
+  fi
+  "$worktree_root/node_modules/.bin/tsx" "$worktree_root/scripts/check-public-boundary.ts" --root "$snapshot_root" --message "$commit_message" --message-raw </dev/null
+  remove_file "$commit_message"
+  commit_message=''
   (cd "$repo_root" && pnpm run check:public-boundary -- --root "$snapshot_root" --index) </dev/null
   if command -v ionice >/dev/null 2>&1; then
     (cd "$snapshot_root" && ionice -c3 nice -n 10 node_modules/.bin/eslint --quiet src/ scripts/) </dev/null

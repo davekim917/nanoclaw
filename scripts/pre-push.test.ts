@@ -9,6 +9,7 @@ const roots: string[] = [];
 const linkedWorktrees: Array<{ main: string; root: string }> = [];
 const zeroSha = '0000000000000000000000000000000000000000';
 const realGit = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+const realTsx = path.resolve('node_modules/.bin/tsx');
 
 function tempRoot(): string {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pre-push-'));
@@ -30,14 +31,21 @@ function linkSystemCommand(bin: string, command: string): void {
   fs.symlinkSync(executable, path.join(bin, command));
 }
 
-function commit(root: string, value: string): string {
+function commit(root: string, value: string, message = value): string {
   fs.mkdirSync(path.join(root, 'src'), { recursive: true });
   fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
   fs.writeFileSync(path.join(root, 'eslint.config.js'), 'export default [];\n');
   fs.writeFileSync(path.join(root, 'src', 'gate.ts'), `${value}\n`);
   fs.writeFileSync(path.join(root, 'scripts', 'gate.ts'), `${value}\n`);
-  runGit(root, ['add', 'eslint.config.js', 'src/gate.ts', 'scripts/gate.ts']);
-  runGit(root, ['commit', '-m', value, '--quiet']);
+  runGit(root, [
+    'add',
+    'eslint.config.js',
+    '.nanoclaw/public-boundary-identifiers',
+    '.public-boundary-allowlist.json',
+    'src/gate.ts',
+    'scripts/gate.ts',
+  ]);
+  runGit(root, ['commit', '-m', message, '--quiet']);
   return runGit(root, ['rev-parse', 'HEAD']);
 }
 
@@ -46,6 +54,14 @@ function fixture(): { root: string; hook: string; log: string; bin: string } {
   runGit(root, ['init', '--quiet']);
   runGit(root, ['config', 'user.email', 'test@example.invalid']);
   runGit(root, ['config', 'user.name', 'Hook Test']);
+  fs.mkdirSync(path.join(root, '.nanoclaw'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.nanoclaw', 'public-boundary-identifiers'), 'Private Customer\n');
+  fs.writeFileSync(path.join(root, '.public-boundary-allowlist.json'), '{"entries": []}\n');
+  fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
+  fs.symlinkSync(
+    new URL('../scripts/check-public-boundary.ts', import.meta.url),
+    path.join(root, 'scripts', 'check-public-boundary.ts'),
+  );
   const hook = path.join(root, '.husky', 'pre-push');
   fs.mkdirSync(path.dirname(hook), { recursive: true });
   fs.copyFileSync(new URL('../.husky/pre-push', import.meta.url), hook);
@@ -66,11 +82,24 @@ printf 'boundary|%s|%s|%s\\n' "$root" "$value" "$consumed" >> "$HOOK_LOG"
 `,
   );
   writeExecutable(
+    path.join(modules, 'tsx'),
+    `#!/bin/sh
+printf 'message|%s|\\n' "$*" >> "$HOOK_LOG"
+script=$(node -e 'process.stdout.write(require("node:fs").realpathSync(process.argv[1]))' "$1")
+shift
+exec "$HOOK_REAL_TSX" "$script" "$@"
+`,
+  );
+  writeExecutable(
     path.join(bin, 'git'),
     `#!/bin/sh
 if [ "$1" = -C ] && [ "$3" = ls-remote ]; then shift 2; fi
 if [ "$1" = ls-remote ]; then
   [ "\${HOOK_LS_REMOTE_FAIL:-}" != 1 ] || exit 1
+  case "\${HOOK_REQUIRE_CONFIG:-}" in
+    count) [ "\${GIT_CONFIG_COUNT:-}" = 1 ] || exit 1 ;;
+    parameters) [ "$("$HOOK_REAL_GIT" config --get hook.prepushprobe)" = parameters ] || exit 1 ;;
+  esac
   printf '%s' "\${HOOK_REMOTE_REFS:-}"
   exit 0
 fi
@@ -101,11 +130,14 @@ function push(
     remoteRefs?: string;
     remoteFailure?: boolean;
     sourceGitEnv?: boolean;
+    commandScopedConfig?: 'count' | 'parameters';
     withoutIonice?: boolean;
   } = {},
 ) {
   if (options.withoutIonice) {
-    for (const command of ['dirname', 'mktemp', 'rm', 'rmdir', 'ln', 'grep', 'cat']) linkSystemCommand(f.bin, command);
+    for (const command of ['dirname', 'mktemp', 'rm', 'rmdir', 'ln', 'grep', 'cat', 'node', 'sed', 'uname']) {
+      linkSystemCommand(f.bin, command);
+    }
     writeExecutable(
       path.join(f.bin, 'nice'),
       `#!/bin/sh
@@ -128,8 +160,16 @@ exec "$@"
       HOOK_FAIL: options.fail ?? '',
       HOOK_REMOTE_REFS: options.remoteRefs ?? '',
       HOOK_LS_REMOTE_FAIL: options.remoteFailure ? '1' : '',
+      HOOK_REQUIRE_CONFIG: options.commandScopedConfig ?? '',
       HOOK_REAL_GIT: realGit,
+      HOOK_REAL_TSX: realTsx,
       ...(options.sourceGitEnv ? { GIT_DIR: path.join(f.root, '.git'), GIT_WORK_TREE: f.root } : {}),
+      ...(options.commandScopedConfig === 'count'
+        ? { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'user.name', GIT_CONFIG_VALUE_0: 'Hook Test' }
+        : {}),
+      ...(options.commandScopedConfig === 'parameters'
+        ? { GIT_CONFIG_PARAMETERS: "'hook.prepushprobe=parameters'" }
+        : {}),
     },
   });
 }
@@ -141,6 +181,9 @@ function records(log: string): string[] {
 afterEach(() => {
   for (const worktree of linkedWorktrees.splice(0)) {
     fs.rmSync(path.join(worktree.root, '.husky'), { recursive: true, force: true });
+    fs.rmSync(path.join(worktree.root, 'hook.log'), { force: true });
+    fs.rmSync(path.join(worktree.root, 'scripts', 'check-public-boundary.ts'), { force: true });
+    runGit(worktree.root, ['clean', '-fd']);
     runGit(worktree.main, ['worktree', 'remove', worktree.root]);
   }
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
@@ -164,12 +207,13 @@ describe('.husky/pre-push', () => {
     );
 
     expect(result.status).toBe(0);
-    expect(records(f.log)).toHaveLength(4);
+    expect(records(f.log)).toHaveLength(6);
     expect(records(f.log).join('\n')).toContain('first-pushed');
     expect(records(f.log).join('\n')).toContain('second-pushed');
     expect(records(f.log).join('\n')).not.toContain('dirty-worktree');
-    expect(records(f.log).every((record) => record.endsWith('|'))).toBe(true);
-    for (const record of records(f.log)) {
+    const snapshotRecords = records(f.log).filter((record) => /^(boundary|lint)\|/.test(record));
+    expect(snapshotRecords.every((record) => record.endsWith('|'))).toBe(true);
+    for (const record of snapshotRecords) {
       const snapshot = record.split('|')[1];
       expect(fs.existsSync(snapshot)).toBe(false);
       expect(fs.existsSync(path.dirname(snapshot))).toBe(false);
@@ -191,8 +235,12 @@ describe('.husky/pre-push', () => {
     expect(records(f.log).join('\n')).toContain('rejected-push');
     expect(records(f.log).join('\n')).not.toContain('clean-head');
     expect(records(f.log).join('\n')).not.toContain('dirty-clean');
-    expect(records(f.log)).toHaveLength(gate === 'boundary' ? 1 : 2);
-    const snapshot = records(f.log)[0].split('|')[1];
+    expect(records(f.log)).toHaveLength(gate === 'boundary' ? 2 : 3);
+    const snapshot = records(f.log)
+      .find((record) => record.startsWith('boundary|'))
+      ?.split('|')[1];
+    expect(snapshot).toBeDefined();
+    if (!snapshot) throw new Error('boundary gate did not record a snapshot');
     expect(fs.existsSync(snapshot)).toBe(false);
     expect(fs.existsSync(path.dirname(snapshot))).toBe(false);
     expect(runGit(f.root, ['worktree', 'list', '--porcelain'])).not.toContain(snapshot);
@@ -274,6 +322,43 @@ describe('.husky/pre-push', () => {
     expect(fs.existsSync(f.log)).toBe(false);
   });
 
+  it.each(['count', 'parameters'] as const)(
+    'preserves GIT_CONFIG_%s while listing live refs',
+    (commandScopedConfig) => {
+      const f = fixture();
+      const base = commit(f.root, 'remote-base');
+      const pushed = commit(f.root, 'configured-new-ref');
+      const result = push(f, `refs/heads/new ${pushed} refs/heads/new ${zeroSha}\n`, {
+        remoteRefs: `${base}\trefs/heads/main\n`,
+        commandScopedConfig,
+      });
+
+      expect(result.status).toBe(0);
+      expect(records(f.log).join('\n')).toContain('configured-new-ref');
+    },
+  );
+
+  it.each([
+    [
+      'exact scissors',
+      'fix: imported\n# ------------------------ >8 ------------------------\nPrivate Customer after scissors',
+    ],
+    ['trailing comment block', 'fix: imported\n\n# Private Customer in history\n#'],
+  ])('rejects a committed %s message verbatim', (_shape, message) => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const pushed = commit(f.root, 'clean-tree', message);
+    const result = push(f, `refs/heads/current ${pushed} refs/heads/current ${base}\n`);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('private-identifier');
+    expect(records(f.log).join('\n')).toContain('--message-raw');
+    const snapshot = records(f.log)[0].match(/--root ([^ ]+)/)?.[1];
+    expect(snapshot).toBeDefined();
+    expect(fs.existsSync(snapshot!)).toBe(false);
+    expect(runGit(f.root, ['worktree', 'list', '--porcelain'])).not.toContain(snapshot!);
+  });
+
   it('clears the source Git environment before the boundary gate reads a snapshot index', () => {
     const f = fixture();
     const snapshot = commit(f.root, 'snapshot-index');
@@ -282,8 +367,33 @@ describe('.husky/pre-push', () => {
     const result = push(f, `refs/heads/snapshot ${snapshot} refs/heads/snapshot ${zeroSha}\n`, { sourceGitEnv: true });
 
     expect(result.status).toBe(0);
-    expect(records(f.log)[0]).toContain('snapshot-index');
-    expect(records(f.log)[0]).not.toContain('source-index');
+    const boundaryRecord = records(f.log).find((record) => record.startsWith('boundary|'))!;
+    expect(boundaryRecord).toContain('snapshot-index');
+    expect(boundaryRecord).not.toContain('source-index');
+  });
+
+  it('uses and removes a caller worktree node_modules link for raw message scanning', () => {
+    const main = fixture();
+    const base = commit(main.root, 'base');
+    const linkedRoot = tempRoot();
+    runGit(main.root, ['-c', 'core.hooksPath=/dev/null', 'worktree', 'add', '--detach', '--quiet', linkedRoot, base]);
+    linkedWorktrees.push({ main: main.root, root: linkedRoot });
+    const hook = path.join(linkedRoot, '.husky', 'pre-push');
+    fs.mkdirSync(path.dirname(hook), { recursive: true });
+    fs.copyFileSync(new URL('../.husky/pre-push', import.meta.url), hook);
+    fs.symlinkSync(
+      new URL('../scripts/check-public-boundary.ts', import.meta.url),
+      path.join(linkedRoot, 'scripts', 'check-public-boundary.ts'),
+    );
+
+    const result = push(
+      { ...main, root: linkedRoot, hook, log: path.join(linkedRoot, 'hook.log') },
+      `refs/heads/current ${base} refs/heads/current ${zeroSha}\n`,
+    );
+
+    expect(result.status).toBe(0);
+    expect(records(path.join(linkedRoot, 'hook.log')).join('\n')).toContain('--message-raw');
+    expect(fs.existsSync(path.join(linkedRoot, 'node_modules'))).toBe(false);
   });
 
   it('runs eslint through nice when ionice is unavailable', () => {
