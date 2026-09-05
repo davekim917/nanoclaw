@@ -110,7 +110,24 @@ scan_message() {
 scan_tag() {
   snapshot_parent=$(mktemp -d "${TMPDIR:-/tmp}/nanoclaw-pre-push.XXXXXX")
   commit_message="$snapshot_parent/TAG_EDITMSG"
+  # Keep the raw object on disk until its separator has been validated. Command
+  # substitution drops trailing newlines, including a valid empty annotation.
   git -C "$worktree_root" cat-file tag "$1" > "$commit_message"
+  if ! awk '
+    NR == 1 { if ($0 !~ /^object /) exit 1; next }
+    NR == 2 { if ($0 !~ /^type /) exit 1; next }
+    NR == 3 { if ($0 !~ /^tag /) exit 1; next }
+    NR == 4 && /^tagger / { next }
+    /^$/ { found = 1; exit }
+    { exit 1 }
+    END { exit !found }
+  ' "$commit_message"; then
+    echo "pre-push: malformed annotated tag object: expected header separator" >&2
+    exit 1
+  fi
+  # Tagger identity is object metadata; only the annotation is published prose.
+  tag_annotation=$(sed '1,/^$/d' "$commit_message")
+  printf '%s\n' "$tag_annotation" > "$commit_message"
   scan_message "$worktree_root" "$commit_message"
   remove_file "$commit_message"
   commit_message=''

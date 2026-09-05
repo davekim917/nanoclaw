@@ -146,7 +146,7 @@ function push(
   } = {},
 ) {
   if (options.withoutIonice) {
-    for (const command of ['dirname', 'mktemp', 'rm', 'rmdir', 'ln', 'grep', 'cat', 'node', 'sed', 'uname']) {
+    for (const command of ['dirname', 'mktemp', 'rm', 'rmdir', 'ln', 'grep', 'cat', 'node', 'sed', 'awk', 'uname']) {
       linkSystemCommand(f.bin, command);
     }
     writeExecutable(
@@ -378,7 +378,15 @@ describe('.husky/pre-push', () => {
     (nested) => {
       const f = fixture();
       const base = commit(f.root, 'remote-base');
-      runGit(f.root, ['tag', '-a', 'synthetic-inner', '-m', 'Private Customer annotation', base]);
+      runGit(f.root, [
+        'tag',
+        '-a',
+        'synthetic-inner',
+        '--cleanup=verbatim',
+        '-m',
+        'clean first paragraph\n\n# Private Customer annotation',
+        base,
+      ]);
       if (nested)
         runGit(f.root, [
           '-c',
@@ -401,6 +409,82 @@ describe('.husky/pre-push', () => {
       expect(fs.readdirSync(f.root).some((name) => name.startsWith('nanoclaw-pre-push.'))).toBe(false);
     },
   );
+
+  it('accepts an annotation with a tagger outside the synthetic email exemptions', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    // Deliberately outside the boundary check's synthetic-identity exemptions.
+    // The reserved .invalid domain keeps this fixture independent of any person.
+    const email = ['release', 'publisher.invalid'].join('@');
+    runGit(f.root, [
+      '-c',
+      'user.name=Release Publisher',
+      '-c',
+      `user.email=${email}`,
+      'tag',
+      '-a',
+      'ordinary-tagger',
+      '-m',
+      'clean annotation',
+      base,
+    ]);
+    const tag = runGit(f.root, ['rev-parse', 'ordinary-tagger']);
+    expect(runGit(f.root, ['cat-file', 'tag', tag])).toContain(`<${email}>`);
+    const result = push(f, `refs/tags/release ${tag} refs/tags/release ${zeroSha}\n`, {
+      remoteRefs: `${base}\trefs/heads/main\n`,
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(records(f.log)).toHaveLength(1);
+  });
+
+  it.each([
+    ['no later blank line', 'Private Customer annotation\n'],
+    [
+      'a later blank line after private pre-separator content',
+      'Private Customer annotation\n\nclean second paragraph\n',
+    ],
+  ])('rejects an annotated tag with %s', (_shape, contentAfterHeaders) => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const tagFile = path.join(f.root, 'malformed-tag');
+    fs.writeFileSync(
+      tagFile,
+      [
+        `object ${base}`,
+        'type commit',
+        'tag missing-separator',
+        'tagger Synthetic Tag <tagger@example.invalid> 0 +0000',
+        contentAfterHeaders,
+      ].join('\n'),
+    );
+    const tag = runGit(f.root, ['hash-object', '-t', 'tag', '-w', tagFile]);
+
+    const result = push(f, `refs/tags/release ${tag} refs/tags/release ${zeroSha}\n`, {
+      remoteRefs: `${base}\trefs/heads/main\n`,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('malformed annotated tag object: expected header separator');
+    expect(fs.existsSync(f.log)).toBe(false);
+  });
+
+  it('accepts a raw annotated tag with an empty annotation after its separator', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const tagFile = path.join(f.root, 'empty-annotation-tag');
+    fs.writeFileSync(
+      tagFile,
+      `object ${base}\ntype commit\ntag empty-annotation\ntagger Synthetic Tag <tagger@example.invalid> 0 +0000\n\n`,
+    );
+    const tag = runGit(f.root, ['hash-object', '-t', 'tag', '-w', tagFile]);
+
+    const result = push(f, `refs/tags/release ${tag} refs/tags/release ${zeroSha}\n`, {
+      remoteRefs: `${base}\trefs/heads/main\n`,
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(records(f.log)).toHaveLength(1);
+  });
 
   it('accepts clean annotated and lightweight tags and scans shared tag objects once', () => {
     const f = fixture();
