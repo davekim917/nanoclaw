@@ -217,10 +217,10 @@ Divergence 9 is the finding that reorders this section's priority: **Node's `sto
 
 **`TimeoutStopSec` becomes 30, down from 60.** Its 60 s value was sized for door 1: `stopAllContainers` waits up to 10 s for close events and then hard-kills, and `ExecStop`'s parallel `docker stop -t 10` could take longer under load. With both gone, the stop path is Node's own `shutdown()` — module stops, adapter teardown, CLI server — none of which wait on a container. 30 s keeps a generous safety bound while halving the worst case a hung shutdown costs a deploy. It is a bound, not a budget: nothing in the new path is expected to use it.
 
-Two consequences to verify on the live host rather than assert, because they are runtime-version-dependent and cannot be established from source (§7.E, verification):
+Two runtime-version facts, **verified on the live host 2026-09-05 03:35Z (Docker Engine 29.3.1)** rather than asserted from source:
 
-- whether `--rm` cleanup is daemon-side (`HostConfig.AutoRemove`) and therefore survives its client being killed. If it is not, an exited survivor leaves a container record behind and the boot door must reap it — the fork's equivalent of upstream's `reapResidue`.
-- whether a `docker wait` on a container that `--rm` removed between the listing and the wait exits promptly with an error rather than hanging.
+- `--rm` cleanup **is daemon-side** (`HostConfig.AutoRemove`): a `--rm` container whose client is gone leaves zero `docker ps -a` rows after exit, so an exited survivor leaves no record and the boot door has nothing to reap — no `reapResidue` equivalent is needed.
+- `docker wait` on a container already removed **exits promptly** (exit 1, `No such container`, 20 ms), never hangs. The adopted-entry waiter therefore treats a non-zero `docker wait` exit with that error as terminal after the one `docker inspect` truth re-read (§4.3.3) — it must not be re-armed.
 
 #### 4.3.6 What adoption must not silently paper over
 
