@@ -191,6 +191,7 @@ it('test_startup_runs_strict_quiescence_before_any_memory_cutover', async () => 
         calls.push('quiescence');
         return Promise.reject(new Error('listing unavailable'));
       },
+      activeSessionIds: async () => [],
       warnStartup: async () => {
         calls.push('warn');
       },
@@ -226,6 +227,7 @@ it('runs reconciliation only after runtime and strict absence proof succeed', as
     quiesce: (_changed, options) => {
       calls.push('quiescence');
       expect(options.knownWorkgroupIds).toEqual(['wg-1']);
+      expect(options.knownSessionIds).toEqual([]);
       return Promise.resolve({
         workgroups: 0,
         containers: 0,
@@ -236,6 +238,7 @@ it('runs reconciliation only after runtime and strict absence proof succeed', as
         mustStopSessionIds: [],
       });
     },
+    activeSessionIds: async () => [],
     warnStartup: async () => {
       calls.push('warn');
     },

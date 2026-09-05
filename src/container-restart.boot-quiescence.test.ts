@@ -133,7 +133,11 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
   it('a container in a changed workgroup is stopped', async () => {
     const runtime = fakeRuntime([container('nanoclaw-v2-a-1', 'wg-a')]);
 
-    const scope = await quiesceWorkgroupsForBootMountChange(['wg-a'], { ...runtime, knownWorkgroupIds: ['wg-a'] });
+    const scope = await quiesceWorkgroupsForBootMountChange(['wg-a'], {
+      ...runtime,
+      knownWorkgroupIds: ['wg-a'],
+      knownSessionIds: ['nanoclaw-v2-a-1-session'],
+    });
 
     expect(runtime.stops).toEqual(['nanoclaw-v2-a-1']);
     expect(scope).toEqual({
@@ -154,6 +158,7 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
     const scope = await quiesceWorkgroupsForBootMountChange(['wg-a'], {
       ...runtime,
       knownWorkgroupIds: ['wg-a', 'wg-b'],
+      knownSessionIds: ['nanoclaw-v2-b-1-session'],
     });
 
     expect(scope.survivable).toBe(1);
@@ -176,6 +181,7 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
     const scope = await quiesceWorkgroupsForBootMountChange([], {
       ...runtime,
       knownWorkgroupIds: ['wg-a', 'wg-b', 'wg-c'],
+      knownSessionIds: ['nanoclaw-v2-b-1-session', 'nanoclaw-v2-legacy-1-session'],
     });
 
     expect(runtime.stops).toContain('nanoclaw-v2-legacy-1');
@@ -290,6 +296,12 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
     const scope = await quiesceWorkgroupsForBootMountChange(['wg-a'], {
       ...runtime,
       knownWorkgroupIds: ['wg-a', 'wg-b', 'wg-c', 'wg-d'],
+      knownSessionIds: [
+        'nanoclaw-v2-a-1-session',
+        'nanoclaw-v2-b-1-session',
+        'nanoclaw-v2-c-1-session',
+        'nanoclaw-v2-legacy-1-session',
+      ],
     });
 
     expect(scope.survivableSessionIds).toEqual(['nanoclaw-v2-b-1-session', 'nanoclaw-v2-c-1-session']);
@@ -316,6 +328,7 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
     const scope = await quiesceWorkgroupsForBootMountChange(['wg-a'], {
       ...runtime,
       knownWorkgroupIds: ['wg-a', 'wg-b'],
+      knownSessionIds: ['nanoclaw-v2-live-1-session', 'nanoclaw-v2-deleted-1-session'],
     });
 
     expect(scope.survivableSessionIds).toEqual(['nanoclaw-v2-live-1-session']);
@@ -323,6 +336,45 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
     expect(scope.mustStopSessionIds).toEqual(['nanoclaw-v2-deleted-1-session']);
     expect(scope.survivable).toBe(1);
     expect(runtime.stops).toContain('nanoclaw-v2-deleted-1');
+    expect(spawns).toEqual([]);
+  });
+
+  it('a container whose session no longer exists is stopped, never survivable', async () => {
+    // Same rule as the deleted workgroup, one level down: the session row is
+    // gone or archived, so adoption has nothing to resolve and D2 would leak
+    // the container.
+    const runtime = fakeRuntime([
+      container('nanoclaw-v2-live-1', 'wg-b'), // session known    → survivable
+      container('nanoclaw-v2-orphan-1', 'wg-b'), // session absent → must stop
+    ]);
+
+    const scope = await quiesceWorkgroupsForBootMountChange(['wg-a'], {
+      ...runtime,
+      knownWorkgroupIds: ['wg-a', 'wg-b'],
+      knownSessionIds: ['nanoclaw-v2-live-1-session'],
+    });
+
+    expect(scope.survivableSessionIds).toEqual(['nanoclaw-v2-live-1-session']);
+    expect(scope.survivableSessionIds).not.toContain('nanoclaw-v2-orphan-1-session');
+    expect(scope.mustStopSessionIds).toEqual(['nanoclaw-v2-orphan-1-session']);
+    expect(scope.survivable).toBe(1);
+    expect(runtime.stops).toContain('nanoclaw-v2-orphan-1');
+    expect(spawns).toEqual([]);
+  });
+
+  it('an omitted known-session set makes nothing survivable', async () => {
+    // Harsher than the workgroup fallback on purpose: a caller that cannot say
+    // which sessions exist cannot license any container to outlive the boot.
+    const runtime = fakeRuntime([container('nanoclaw-v2-b-1', 'wg-b')]);
+
+    const scope = await quiesceWorkgroupsForBootMountChange(['wg-a'], {
+      ...runtime,
+      knownWorkgroupIds: ['wg-a', 'wg-b'],
+    });
+
+    expect(scope.survivable).toBe(0);
+    expect(scope.survivableSessionIds).toEqual([]);
+    expect(scope.mustStopSessionIds).toEqual(['nanoclaw-v2-b-1-session']);
     expect(spawns).toEqual([]);
   });
 
@@ -336,6 +388,7 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
     await quiesceWorkgroupsForBootMountChange(['wg-a', 'wg-c'], {
       ...runtime,
       knownWorkgroupIds: ['wg-a', 'wg-b', 'wg-c', 'wg-d', 'wg-e'],
+      knownSessionIds: ['nanoclaw-v2-a-1-session', 'nanoclaw-v2-b-1-session', 'nanoclaw-v2-legacy-1-session'],
     });
 
     const scopeLines = (log.info as unknown as { mock: { calls: unknown[][] } }).mock.calls.filter(

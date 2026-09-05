@@ -536,6 +536,19 @@ export interface BootQuiescenceOptions {
    * caller that forgot to pass it. The boot block always supplies it.
    */
   knownWorkgroupIds?: string[];
+  /**
+   * Every session id the central DB currently holds as active.
+   *
+   * Same rule as `knownWorkgroupIds`, one level down: a container whose
+   * session label names a row that is gone or archived has nothing for
+   * adoption to resolve, so leaving it running under D2 would leak it.
+   *
+   * Omitted, NOTHING is survivable. That is deliberately harsher than the
+   * workgroup fallback: a caller that cannot say which sessions exist cannot
+   * license any container to outlive the boot. The boot block always supplies
+   * it (src/main.ts).
+   */
+  knownSessionIds?: string[];
   list?: () => InstallContainerScope[];
   stop?: (name: string) => void;
 }
@@ -583,6 +596,7 @@ export async function quiesceWorkgroupsForBootMountChange(
   const stop = options.stop ?? stopContainer;
   const changed = new Set(changedWorkgroupIds);
   const known = new Set(options.knownWorkgroupIds ?? changedWorkgroupIds);
+  const knownSessions = new Set(options.knownSessionIds ?? []);
 
   const containers = list();
   const unlabeled = containers.filter((entry) => entry.workgroupId === null);
@@ -598,17 +612,21 @@ export async function quiesceWorkgroupsForBootMountChange(
   //   - a workgroup that still exists in the central DB — an approved
   //     `ncl groups delete` leaves the container running, and its workgroup is
   //     in no reconcile scope and resolves to no row;
+  //   - a session that still exists and is active — same rule one level down;
   //   - a workgroup outside the changed set.
   //
-  // Everything else fails closed into must-stop. The door does NOT read the
-  // sessions table, so it cannot tell a live session id from a deleted one:
-  // seam-4 E must re-check the session row before adopting, and treat an
-  // unresolvable one the same way this does.
+  // Everything else fails closed into must-stop.
+  //
+  // The known-session test is a snapshot taken at boot, not a liveness claim:
+  // seam-4 E still re-checks the session row when it claims, because a session
+  // can be archived between this listing and the adoption, and an
+  // unresolvable one has to be treated exactly the way this does.
   const survivable = containers.filter(
     (entry) =>
       entry.workgroupId !== null &&
       entry.sessionId !== null &&
       known.has(entry.workgroupId) &&
+      knownSessions.has(entry.sessionId) &&
       !changed.has(entry.workgroupId),
   );
   const survivableNames = new Set(survivable.map((entry) => entry.name));

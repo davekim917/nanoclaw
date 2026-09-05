@@ -172,6 +172,7 @@ describe('boot mount-change ordering', () => {
           mustStopSessionIds: ['s1'],
         };
       },
+      activeSessionIds: async () => ['s1', 's2'],
       warnStartup: async () => {
         calls.push('warn');
       },
@@ -228,6 +229,7 @@ describe('boot mount-change ordering', () => {
           mustStopSessionIds: [],
         };
       },
+      activeSessionIds: async () => ['s1', 's2'],
       warnStartup: async () => undefined,
       reconcileShared: () => {
         calls.push('reconcileWorkgroupSharedDirs');
@@ -270,6 +272,7 @@ describe('boot mount-change ordering', () => {
         quiesceArg = changed;
         return quiesceWorkgroupsForBootMountChange(changed, { ...runtime, ...options });
       },
+      activeSessionIds: async () => ['s1', 's2'],
       warnStartup: async () => undefined,
       reconcileShared: () => undefined,
       memoryGate: () => [],
@@ -328,6 +331,7 @@ describe('boot mount-change ordering', () => {
           },
         });
       },
+      activeSessionIds: async () => ['s1', 's2'],
       warnStartup: async () => undefined,
       reconcileShared: () => undefined,
       memoryGate: (_db, opts) => {
@@ -364,6 +368,7 @@ describe('boot mount-change ordering', () => {
       sharedWouldChange: (database, id) => sharedDirsReconcileWouldChange(database, id, { groupsDir, dataDir }),
       sharedFsEnabled: true,
       quiesce: (changed, options) => quiesceWorkgroupsForBootMountChange(changed, { ...runtime, ...options }),
+      activeSessionIds: async () => ['s1', 's2'],
       warnStartup: async () => undefined,
       reconcileShared: () => undefined,
       memoryGate: (database, opts) =>
@@ -409,6 +414,7 @@ describe('boot mount-change ordering', () => {
           },
         });
       },
+      activeSessionIds: async () => ['s1', 's2'],
       warnStartup: async () => {
         calls.push('warn');
       },
@@ -438,6 +444,7 @@ describe('boot mount-change ordering', () => {
 
     await expect(
       runBootMountQuiescence(db, {
+        activeSessionIds: async () => ['s1', 's2'],
         workgroupIds: () => ['wgx'],
         memoryWouldChange: () => true,
         sharedWouldChange: () => false,
@@ -470,6 +477,7 @@ describe('boot mount-change ordering', () => {
 
     await expect(
       runBootMountQuiescence(db, {
+        activeSessionIds: async () => ['s1', 's2'],
         workgroupIds: () => ['wgx'],
         memoryWouldChange: () => true,
         sharedWouldChange: () => false,

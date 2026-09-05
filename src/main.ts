@@ -28,7 +28,7 @@ import {
 import type { ChannelNameSource, MessagingGroupUpdates } from './db/messaging-groups.js';
 import { ensureContainerRuntimeRunning } from './container-runtime.js';
 import { warnActiveContainersOfShutdown, warnMarkedRunningSessionsOfStartup } from './host-restart-warn.js';
-import { resetPhantomContainerStatus } from './db/sessions.js';
+import { getActiveSessions, resetPhantomContainerStatus } from './db/sessions.js';
 import { resetProcessingChannelIngress } from './db/channel-ingress-receipts.js';
 import { getActiveContainerSessionIds, stopAllContainers } from './container-runner.js';
 import { quiesceWorkgroupsForBootMountChange, type BootQuiescenceScope } from './container-restart.js';
@@ -190,7 +190,11 @@ export interface BootMountQuiescenceDeps {
   memoryWouldChange?: (db: Database.Database, workgroupId: string) => boolean;
   sharedWouldChange?: (db: Database.Database, workgroupId: string) => boolean;
   sharedFsEnabled?: boolean;
-  quiesce?: (changedWorkgroupIds: string[], options: { knownWorkgroupIds: string[] }) => Promise<BootQuiescenceScope>;
+  activeSessionIds?: () => Promise<string[]>;
+  quiesce?: (
+    changedWorkgroupIds: string[],
+    options: { knownWorkgroupIds: string[]; knownSessionIds: string[] },
+  ) => Promise<BootQuiescenceScope>;
   warnStartup?: (reason: string, skipSessionIds: ReadonlySet<string>) => Promise<void>;
   reconcileShared?: (db: Database.Database, dirs: { workgroupIds?: string[] }) => void;
   memoryGate?: (db: Database.Database, opts: { mutateWorkgroupIds?: string[] }) => WorkgroupMemoryReport[];
@@ -299,8 +303,16 @@ export async function runBootMountQuiescence(
   // needs-reconcile between this snapshot and the stops completing.
   const changedBeforeQuiescence = evaluateChanged();
 
+  // One read, for the door's known-session test. A container whose session row
+  // is gone or archived has nothing for adoption to resolve, so it can never
+  // be classified survivable.
+  const knownSessionIds = await (
+    deps.activeSessionIds ?? (async () => (await getActiveSessions()).map((session) => session.id))
+  )();
+
   const scope = await (deps.quiesce ?? quiesceWorkgroupsForBootMountChange)(changedBeforeQuiescence, {
     knownWorkgroupIds: allWorkgroupIds,
+    knownSessionIds,
   });
 
   // …so the RECONCILE scope is re-evaluated on the quiescent tree. Nothing can
