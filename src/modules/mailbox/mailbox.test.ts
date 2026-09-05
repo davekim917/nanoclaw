@@ -12,22 +12,10 @@ import fs from 'fs';
 import path from 'path';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-// Per-process fixture root. The constant this replaced was byte-identical in
-// every worktree on the host, and this file `rmSync`s the whole root in both
-// beforeEach and afterEach — so any two concurrent runs, from any two
-// worktrees or agents, deleted each other's session directories mid-test.
-// Observed here as 16 of 18 failing on one run and 18/18 on the next four,
-// which is untrustworthy green as much as red. Same defect and same fix as
-// #287 (`test/unique-tmp-fixture-roots`) on main.
-//
-// ponytail: `process.pid`, NOT `fs.mkdtempSync` — measured, not assumed.
-// `vi.hoisted` runs above the import statements, so the `fs` binding is not
-// initialized yet and the mock factory below cannot see a module-level const
-// either; the mkdtemp form fails with "Cannot access 'TEST_ROOT' before
-// initialization". `process` is a global and is available. One root per
-// process is all this file needs. Do not "improve" this to mkdtemp.
+// `vi.hoisted` runs before imports and mocks. The global test setup installs
+// uniqueTmpRoot before this module loads, so the mock can use this per-run root.
 const { TEST_ROOT } = vi.hoisted(() => ({
-  TEST_ROOT: `/tmp/nanoclaw-mailbox-module-test-${process.pid}`,
+  TEST_ROOT: globalThis.uniqueTmpRoot('mailbox-module-test'),
 }));
 
 vi.mock('../../config.js', async (importOriginal) => ({

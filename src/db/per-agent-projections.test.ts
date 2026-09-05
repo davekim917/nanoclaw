@@ -1145,7 +1145,7 @@ describe('readArchiveScopeSignature — #360', () => {
   }, 30_000);
 
   it('reads a missing source as an empty, unedited scope', () => {
-    expect(readArchiveScopeSignature(path.join(os.tmpdir(), 'ncproj-absent.db'), 'ag-test-a')).toEqual({
+    expect(readArchiveScopeSignature(tmpPath('absent'), 'ag-test-a')).toEqual({
       count: 0,
       maxRowid: 0,
       mutations: 0,
