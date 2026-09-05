@@ -362,6 +362,69 @@ describe('.husky/pre-push', () => {
     }
   });
 
+  it.each([false, true])(
+    'rejects a private annotated tag even when its commit is already remote (nested=%s)',
+    (nested) => {
+      const f = fixture();
+      const base = commit(f.root, 'remote-base');
+      runGit(f.root, ['tag', '-a', 'synthetic-inner', '-m', 'Private Customer annotation', base]);
+      if (nested)
+        runGit(f.root, [
+          '-c',
+          'advice.nestedTag=false',
+          'tag',
+          '-a',
+          'synthetic-outer',
+          '-m',
+          'clean annotation',
+          'synthetic-inner',
+        ]);
+      const tag = runGit(f.root, ['rev-parse', nested ? 'synthetic-outer' : 'synthetic-inner']);
+      const result = push(f, `refs/tags/release ${tag} refs/tags/release ${zeroSha}\n`, {
+        remoteRefs: `${base}\trefs/heads/main\n`,
+      });
+
+      expect(result.status, result.stderr).toBe(1);
+      expect(result.stderr).toContain('TAG_EDITMSG:');
+      expect(result.stderr).toContain('private-identifier');
+      expect(fs.readdirSync(f.root).some((name) => name.startsWith('nanoclaw-pre-push.'))).toBe(false);
+    },
+  );
+
+  it('accepts clean annotated and lightweight tags and scans shared tag objects once', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    runGit(f.root, ['tag', '-a', 'synthetic-release', '-m', 'clean annotation', base]);
+    const tag = runGit(f.root, ['rev-parse', 'synthetic-release']);
+    const result = push(
+      f,
+      [
+        `refs/tags/release ${tag} refs/tags/release ${zeroSha}`,
+        `refs/tags/alias ${tag} refs/tags/alias ${zeroSha}`,
+        `refs/tags/lightweight ${base} refs/tags/lightweight ${zeroSha}`,
+      ].join('\n') + '\n',
+      { remoteRefs: `${base}\trefs/heads/main\n` },
+    );
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(records(f.log)).toHaveLength(1);
+    expect(records(f.log)[0]).toContain('/TAG_EDITMSG --message-raw');
+    expect(fs.readdirSync(f.root).some((name) => name.startsWith('nanoclaw-pre-push.'))).toBe(false);
+  });
+
+  it.each(['tree', 'blob'] as const)('fails closed for a tag pointing to an unsupported %s target', (kind) => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const target = runGit(f.root, ['rev-parse', kind === 'tree' ? `${base}^{tree}` : `${base}:src/gate.ts`]);
+    runGit(f.root, ['tag', '-a', 'synthetic-object', '-m', 'clean annotation', target]);
+    const tag = runGit(f.root, ['rev-parse', 'synthetic-object']);
+    const result = push(f, `refs/tags/object ${tag} refs/tags/object ${zeroSha}\n`, {
+      remoteRefs: `${base}\trefs/heads/main\n`,
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('unsupported ref target');
+  });
+
   it('skips SHA-256 ref deletions', () => {
     const f = fixture('sha256');
     const pushed = commit(f.root, 'sha256-pushed');

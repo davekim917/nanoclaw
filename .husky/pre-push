@@ -24,10 +24,10 @@ case "$(git -C "$worktree_root" rev-parse --show-object-format)" in
   *) echo "pre-push: unsupported repository object format" >&2; exit 1 ;;
 esac
 refs_file=''
-seen_commits=''
+seen_objects=''
 advertised_refs=''
 known_remote_tips=''
-commit_list=''
+object_list=''
 commit_message=''
 worktree_node_modules_link=''
 snapshot_parent=''
@@ -55,13 +55,13 @@ cleanup() {
   if [ -n "$snapshot_parent" ] && [ -d "$snapshot_parent" ] && ! rmdir "$snapshot_parent"; then
     echo "pre-push: failed to remove temporary snapshot directory" >&2
   fi
-  remove_file "$commit_list"
+  remove_file "$object_list"
   if [ "$worktree_node_modules_link" = 1 ] && [ -L "$worktree_root/node_modules" ] && ! rm "$worktree_root/node_modules"; then
     echo "pre-push: failed to remove worktree node_modules link" >&2
   fi
   remove_file "$advertised_refs"
   remove_file "$known_remote_tips"
-  remove_file "$seen_commits"
+  remove_file "$seen_objects"
   remove_file "$refs_file"
   exit "$status"
 }
@@ -71,7 +71,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 refs_file=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-refs.XXXXXX")
-seen_commits=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-seen.XXXXXX")
+seen_objects=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-seen.XXXXXX")
 cat > "$refs_file"
 
 needs_remote_tips=''
@@ -99,6 +99,25 @@ if [ -n "$needs_remote_tips" ]; then
   advertised_refs=''
 fi
 
+scan_message() {
+  if [ ! -e "$worktree_root/node_modules" ] && [ ! -L "$worktree_root/node_modules" ]; then
+    ln -s "$repo_root/node_modules" "$worktree_root/node_modules"
+    worktree_node_modules_link=1
+  fi
+  "$worktree_root/node_modules/.bin/tsx" "$worktree_root/scripts/check-public-boundary.ts" --root "$1" --message "$2" --message-raw --allowlist "$allowlist_path" </dev/null
+}
+
+scan_tag() {
+  snapshot_parent=$(mktemp -d "${TMPDIR:-/tmp}/nanoclaw-pre-push.XXXXXX")
+  commit_message="$snapshot_parent/TAG_EDITMSG"
+  git -C "$worktree_root" cat-file tag "$1" > "$commit_message"
+  scan_message "$worktree_root" "$commit_message"
+  remove_file "$commit_message"
+  commit_message=''
+  rmdir "$snapshot_parent"
+  snapshot_parent=''
+}
+
 snapshot_commit() {
   snapshot_parent=$(mktemp -d "${TMPDIR:-/tmp}/nanoclaw-pre-push.XXXXXX")
   snapshot_root="$snapshot_parent/tree"
@@ -112,11 +131,7 @@ snapshot_commit() {
 
   commit_message="$snapshot_parent/COMMIT_EDITMSG"
   git -C "$worktree_root" show --no-patch --format=%B "$1" > "$commit_message"
-  if [ ! -e "$worktree_root/node_modules" ] && [ ! -L "$worktree_root/node_modules" ]; then
-    ln -s "$repo_root/node_modules" "$worktree_root/node_modules"
-    worktree_node_modules_link=1
-  fi
-  "$worktree_root/node_modules/.bin/tsx" "$worktree_root/scripts/check-public-boundary.ts" --root "$snapshot_root" --message "$commit_message" --message-raw --allowlist "$allowlist_path" </dev/null
+  scan_message "$snapshot_root" "$commit_message"
   remove_file "$commit_message"
   commit_message=''
   (cd "$repo_root" && pnpm run check:public-boundary -- --root "$snapshot_root" --index --allowlist "$allowlist_path") </dev/null
@@ -134,12 +149,12 @@ snapshot_commit() {
   snapshot_root=''
 }
 
-commits_for_ref() {
+objects_for_ref() {
   local_sha=$1
   remote_sha=$2
-  commit_list=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-commits.XXXXXX")
+  object_list=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-commits.XXXXXX")
   if [ "$remote_sha" != "$zero_sha" ] && git -C "$worktree_root" cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
-    git -C "$worktree_root" rev-list "$remote_sha..$local_sha" > "$commit_list"
+    git -C "$worktree_root" rev-list --objects --no-object-names --filter=tree:0 "$remote_sha..$local_sha" > "$object_list"
   else
     set --
     if [ -n "$known_remote_tips" ]; then
@@ -148,23 +163,33 @@ commits_for_ref() {
       done < "$known_remote_tips"
     fi
     if [ "$#" -eq 0 ]; then
-      git -C "$worktree_root" rev-list "$local_sha" > "$commit_list"
+      git -C "$worktree_root" rev-list --objects --no-object-names --filter=tree:0 "$local_sha" > "$object_list"
     else
-      git -C "$worktree_root" rev-list "$local_sha" --not "$@" > "$commit_list"
+      git -C "$worktree_root" rev-list --objects --no-object-names --filter=tree:0 "$local_sha" --not "$@" > "$object_list"
     fi
   fi
-  while read -r commit_sha; do
-    if grep -Fqx "$commit_sha" "$seen_commits"; then
+  # Keep annotated tag objects (including nested tags), not just peeled commits.
+  # Commit snapshots cover their trees, so omit tree/blob traversal here.
+  while read -r object_sha; do
+    if grep -Fqx "$object_sha" "$seen_objects"; then
       continue
     fi
-    printf '%s\n' "$commit_sha" >> "$seen_commits"
-    snapshot_commit "$commit_sha"
-  done < "$commit_list"
-  remove_file "$commit_list"
-  commit_list=''
+    printf '%s\n' "$object_sha" >> "$seen_objects"
+    case "$(git -C "$worktree_root" cat-file -t "$object_sha")" in
+      commit) snapshot_commit "$object_sha" ;;
+      tag) scan_tag "$object_sha" ;;
+      *) echo "pre-push: unsupported pushed object type" >&2; exit 1 ;;
+    esac
+  done < "$object_list"
+  remove_file "$object_list"
+  object_list=''
 }
 
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ "$local_sha" = "$zero_sha" ] && continue
-  commits_for_ref "$local_sha" "$remote_sha"
+  if ! git -C "$worktree_root" cat-file -e "$local_sha^{commit}" 2>/dev/null; then
+    echo "pre-push: unsupported ref target; expected a commit or tag pointing to a commit" >&2
+    exit 1
+  fi
+  objects_for_ref "$local_sha" "$remote_sha"
 done < "$refs_file"
