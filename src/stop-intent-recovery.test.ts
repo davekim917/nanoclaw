@@ -195,18 +195,24 @@ function sessionDir(sessionId: string): string {
   return path.join(TEST_DATA_DIR, 'v2-sessions', AGENT_GROUP_ID, sessionId);
 }
 
-async function seedSession(id: string, status: 'active' | 'closed' = 'active'): Promise<void> {
+/**
+ * `archived` is the archive-ONLY close: `archiveSessionById` stamps
+ * `archived_at` and leaves `status` reading `active`, which is the ordinary
+ * outcome of a thread close and the representation a `status` test misses.
+ */
+async function seedSession(id: string, state: 'active' | 'closed' | 'archived' = 'active'): Promise<void> {
   fs.mkdirSync(sessionDir(id), { recursive: true });
   getAgentMailbox().prepare({ agentGroupId: AGENT_GROUP_ID, sessionId: id });
   await getDb().run(
     `INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status,
-                           container_status, last_active, created_at)
-     VALUES (?, ?, NULL, ?, NULL, ?, 'stopped', NULL, ?)`,
+                           container_status, last_active, created_at, archived_at)
+     VALUES (?, ?, NULL, ?, NULL, ?, 'stopped', NULL, ?, ?)`,
     id,
     AGENT_GROUP_ID,
     id,
-    status,
+    state === 'closed' ? 'closed' : 'active',
     STAMP,
+    state === 'archived' ? STAMP : null,
   );
 }
 
@@ -553,8 +559,15 @@ describe('durable stop intent', () => {
   });
 
   it("an archived session's intent is cleared without a respawn", async () => {
-    await seedSession('sess-archived', 'closed');
-    await setStopIntent('sess-archived', 'respawn_after_stop', STAMP);
+    // Both representations of a session that can no longer take a wake. The
+    // second is the one a `status` test misses: `archiveSessionById` stamps
+    // only `archived_at`, so the row still reads `active` while
+    // `wakeContainer` refuses it — and the intent would sit there being
+    // reread and declined at every boot, forever.
+    await seedSession('sess-closed', 'closed');
+    await seedSession('sess-archived-active', 'archived');
+    await setStopIntent('sess-closed', 'respawn_after_stop', STAMP);
+    await setStopIntent('sess-archived-active', 'respawn_after_stop', STAMP);
 
     const woke: string[] = [];
     await honorPendingStopIntents(
@@ -566,7 +579,8 @@ describe('durable stop intent', () => {
     );
 
     expect(woke).toEqual([]);
-    expect(await storedIntent('sess-archived')).toBeNull();
+    expect(await storedIntent('sess-closed')).toBeNull();
+    expect(await storedIntent('sess-archived-active')).toBeNull();
   });
 });
 

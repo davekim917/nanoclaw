@@ -1986,7 +1986,17 @@ export async function honorPendingStopIntents(
       continue;
     }
     const session = await getSession(intent.session_id);
-    if (!session || session.status !== 'active') {
+    // `unwakeableReason`, not a `status` test: `archiveSessionById` stamps only
+    // `archived_at` and leaves `status` reading `active`, so an archive-only
+    // close looks recoverable to a status check while `wakeContainer` refuses
+    // it on the same axis. The intent would then never clear and never fire —
+    // a row this pass rereads, and declines, at every boot forever.
+    const unwakeable = session ? unwakeableReason(session) : 'session no longer exists';
+    if (!session || unwakeable !== null) {
+      log.info('Clearing a stop intent for a session that can no longer be woken', {
+        sessionId: intent.session_id,
+        reason: unwakeable,
+      });
       await shadowWrite('stop-intent-clear', () => setStopIntent(intent.session_id, null, new Date().toISOString()));
       continue;
     }

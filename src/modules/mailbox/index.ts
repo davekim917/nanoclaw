@@ -1054,6 +1054,16 @@ function forkOps(
         // onward. The only survivor that could still consume one is a container
         // still ON its first poll when the host adopted it, and that is exactly
         // what a `processing_ack` read catches.
+        //
+        // KNOWN WINDOW, deferred (fork issue #TBD): a survivor that has SELECTED
+        // an `on_wake` row on its first poll but has not yet written the
+        // `processing_ack` reads here as unclaimed, so the row can be converted
+        // or withdrawn under it. Closing it needs a fence across the host/runner
+        // boundary — the runner would have to publish selection, not just
+        // acknowledgement — which is a protocol change, not a probe change, so
+        // the probe deliberately stays as it is. The blast radius is one turn's
+        // worth of rows in the milliseconds between a survivor's first select
+        // and its ack, on the one boot that adopts it.
         if (!outboundPresent) return false;
         try {
           return hasProcessingAck(readableOutbound(), messageId);
