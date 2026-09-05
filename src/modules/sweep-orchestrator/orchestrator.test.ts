@@ -21,6 +21,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { closeDb, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
+import { withCentralSync } from '../../db/central-lease.js';
 import { log } from '../../log.js';
 
 // Hermeticity tripwire (brief-common.md HARD RULE): every case below runs a
@@ -352,7 +353,12 @@ describe('the task watchdog transitions and parent notifications are unchanged',
     // Issued with a guard rather than skipped: the parent can also be archived
     // during the wake's own awaits, which a re-read here could never see.
     const { guard } = mockWakeContainer.mock.calls[0][2] as { guard: () => unknown };
-    expect(guard()).toEqual({ ok: false, reason: 'session no longer exists' });
+    // The guard's read is raw (seam 3 §4.5 I-1), answered by the raw-db fake
+    // inside the lease block.
+    expect(await withCentralSync(() => guard(), 'test-guard')).toEqual({
+      ok: false,
+      reason: 'session no longer exists',
+    });
   });
 
   it('test_watchdog_skips_when_drain_active: task with recent terminal outbound is not reaped', async () => {
