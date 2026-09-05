@@ -48,11 +48,14 @@ describe('boot wiring', () => {
    * the exit would kill a host that has already taken work on.
    */
   it('runs the preflight before the dashboard and the channel adapters', () => {
-    const main = fs.readFileSync(path.join(import.meta.dirname, 'main.ts'), 'utf-8');
+    const source = fs.readFileSync(path.join(import.meta.dirname, 'main.ts'), 'utf-8');
+    const mainStart = source.indexOf('export async function main(): Promise<void> {');
+    expect(mainStart).toBeGreaterThan(-1);
+    const main = source.slice(mainStart);
 
-    const preflight = main.indexOf('await runOnecliBootPreflight(');
-    const dashboard = main.indexOf('startDashboard()');
-    const adapters = main.indexOf('await initChannelAdapters(');
+    const preflight = main.indexOf('\n  await runOnecliBootPreflight();');
+    const dashboard = main.indexOf('\n  startDashboard();');
+    const adapters = main.indexOf('\n  await initChannelAdapters(');
 
     expect(preflight).toBeGreaterThan(-1);
     expect(dashboard).toBeGreaterThan(-1);
