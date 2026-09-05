@@ -14,10 +14,15 @@ import { OneCLI } from '@onecli-sh/sdk';
 import { agentRunnerSourcePath } from './agent-runner-source.js';
 import { getHostCapabilities } from './capabilities.js';
 import {
+  CONTAINER_GROUP_LABEL_KEY,
   CONTAINER_IMAGE,
   CONTAINER_IMAGE_BASE,
   CONTAINER_INSTALL_LABEL,
   CONTAINER_MEMORY_BUDGET,
+  CONTAINER_NAME_PREFIX,
+  CONTAINER_ROLE_LABEL_KEY,
+  CONTAINER_SESSION_LABEL_KEY,
+  CONTAINER_WORKGROUP_LABEL_KEY,
   DATA_DIR,
   GROUPS_DIR,
   MAX_CONCURRENT_CONTAINERS,
@@ -1227,7 +1232,7 @@ async function spawnContainer(
   const buildMountsStartedAt = Date.now();
   const mounts = await buildMounts(agentGroup, session, containerConfig, provider, contribution, resolvedWgId);
   logSpawnStage('build-mounts', buildMountsStartedAt);
-  const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
+  const containerName = `${CONTAINER_NAME_PREFIX}${agentGroup.folder}-${Date.now()}`;
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
   const agentIdentifier = agentGroup.id;
@@ -1260,6 +1265,7 @@ async function spawnContainer(
   const args = await buildContainerArgs(
     mounts,
     containerName,
+    session.id,
     agentGroup,
     containerConfig,
     provider,
@@ -3693,6 +3699,13 @@ export function selectedSkillNames(containerConfig: import('./container-config.j
 async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
+  /**
+   * Session this container is being spawned for. Stamped as the
+   * `nanoclaw-session` label so a boot inventory can map a surviving
+   * container back to its session without the in-process registry, which is
+   * empty at startup.
+   */
+  sessionId: string,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
   provider: string,
@@ -3746,7 +3759,14 @@ async function buildContainerArgs(
   // --init: tini as PID 1 reaps orphaned children (esbuild/gh corpses were
   // accumulating as zombies under bun, which doesn't reap as PID 1) and still
   // forwards signals to the entrypoint, so SIGTERM handling is unchanged.
-  const args: string[] = ['run', '--rm', '--init', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
+  const args: string[] = [
+    'run',
+    '--rm',
+    '--init',
+    '--name',
+    containerName,
+    ...containerLabelArgs(agentGroup.id, sessionId, resolvedWgId),
+  ];
   args.push(...dockerResourceLimitArgs(containerConfig.resources));
   // Privilege hardening — capabilities and setuid escalation. Resource
   // ceilings came from dockerResourceLimitArgs above; these two builders
@@ -4868,6 +4888,32 @@ async function buildContainerArgs(
   args.push('-c', 'exec /app/entrypoint.sh');
 
   return args;
+}
+
+/**
+ * Build the container SCOPE labels: the install label every container has
+ * always carried, plus the four scope labels a boot inventory reads to decide
+ * what a surviving container belongs to. Pure and exported for the same
+ * reason `securityArgs` and `dockerResourceLimitArgs` are — the flag list is
+ * testable without spawning, and only `buildContainerArgs` spreads it.
+ *
+ * `workgroupId` emits an EMPTY value rather than dropping the label, so
+ * "this session has no workgroup" and "this container predates the labels"
+ * stay distinguishable at the inventory.
+ */
+export function containerLabelArgs(agentGroupId: string, sessionId: string, workgroupId?: string): string[] {
+  return [
+    '--label',
+    CONTAINER_INSTALL_LABEL,
+    '--label',
+    `${CONTAINER_GROUP_LABEL_KEY}=${agentGroupId}`,
+    '--label',
+    `${CONTAINER_SESSION_LABEL_KEY}=${sessionId}`,
+    '--label',
+    `${CONTAINER_WORKGROUP_LABEL_KEY}=${workgroupId ?? ''}`,
+    '--label',
+    `${CONTAINER_ROLE_LABEL_KEY}=agent`,
+  ];
 }
 
 /**
