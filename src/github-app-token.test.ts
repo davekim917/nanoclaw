@@ -1,9 +1,10 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 
-vi.mock('./log.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('./log.js')>();
-  return { ...actual, log: { ...actual.log, warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() } };
-});
+vi.mock('./log.js', () => ({
+  setLogScrubber: vi.fn(),
+  log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
+  isSurvivableIoError: vi.fn(() => false),
+}));
 
 import crypto from 'crypto';
 import fs from 'fs';
