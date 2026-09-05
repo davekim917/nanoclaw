@@ -17,7 +17,12 @@ import {
 } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getRawDb, hasTableRaw } from './db/connection.js';
-import { clearDeliveryAttempt, getDeliveryAttempt, recordDeliveryAttempt } from './db/coordination.js';
+import {
+  clearDeliveryAttempt,
+  getDeliveryAttempt,
+  recordDeliveryAttempt,
+  type DeliveryAttemptRow,
+} from './db/coordination.js';
 import {
   getTaskThreadAnchor,
   setTaskThreadAnchor,
@@ -108,11 +113,16 @@ async function recordAttemptRow(messageId: string, sessionId: string, err: unkno
   /* eslint-enable no-catch-all/no-catch-all */
 }
 
-/** The stored count, or `undefined` when there is none and when the read failed. */
-async function readAttemptRow(messageId: string): Promise<number | undefined> {
+/**
+ * The stored row, or `undefined` when there is none and when the read failed.
+ * The whole row rather than just the count: `last_error` is the only surviving
+ * description of why the message failed under the previous host, and the
+ * terminal give-up has to carry it forward.
+ */
+async function readAttemptRow(messageId: string): Promise<DeliveryAttemptRow | undefined> {
   /* eslint-disable no-catch-all/no-catch-all -- attempt bookkeeping must never block delivery */
   try {
-    return (await getDeliveryAttempt(messageId))?.attempts;
+    return await getDeliveryAttempt(messageId);
   } catch (err) {
     log.warn('Failed to read delivery attempt row — delivering without a stored count', { messageId, err });
     return undefined;
@@ -707,15 +717,23 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
     // spending attempt N+1, and stops a re-send of a message whose failure
     // happened after it had already left the previous host.
     const stored = await readAttemptRow(msg.id);
-    if (stored !== undefined && stored >= MAX_DELIVERY_ATTEMPTS) {
+    if (stored !== undefined && stored.attempts >= MAX_DELIVERY_ATTEMPTS) {
       // Terminal, like the give-up below, so the drain must not arm the quiet
       // cache this tick. The `delivered` row it writes takes the message out
       // of `outstanding` on the next drain.
       sawError = true;
+      // The persisted adapter error, verbatim, because it is what the failure
+      // actually was: the runner surfaces `delivered.error` to synchronous
+      // callers (`send_file` and friends, container/agent-runner/src/db/
+      // delivery-acks.ts), and a missing scope or an oversized file is only
+      // actionable if that text survives the restart. The generic line is a
+      // fallback for a row with no error stored, never a replacement.
       await giveUpOnMessage(
         msg,
-        stored,
-        `delivery abandoned: ${stored} attempts recorded before this host started`,
+        stored.attempts,
+        stored.last_error && stored.last_error.length > 0
+          ? stored.last_error
+          : `delivery abandoned: ${stored.attempts} attempts recorded before this host started`,
         'a count stored before this host started',
       );
       // Nothing was sent, so nothing can overtake this row: unlike the retry

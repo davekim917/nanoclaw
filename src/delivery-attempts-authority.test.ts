@@ -166,14 +166,19 @@ function insertOutbound(sessionId: string, msgId: string): void {
 }
 
 /** Attempts a previous host recorded — rows only, no module state. */
-async function seedPriorAttempts(messageId: string, sessionId: string, count: number): Promise<void> {
+async function seedPriorAttempts(
+  messageId: string,
+  sessionId: string,
+  count: number,
+  error = 'failure from before the restart',
+): Promise<void> {
   for (let i = 0; i < count; i++) {
     await host!.coord.recordDeliveryAttempt({
       messageId,
       sessionId,
       now: now(),
       nextAttemptAt: null,
-      error: 'failure from before the restart',
+      error,
     });
   }
 }
@@ -206,11 +211,11 @@ function attemptRow(messageId: string): { attempts: number } | undefined {
   }
 }
 
-function deliveredRow(sessionId: string, messageId: string): { status: string } | undefined {
+function deliveredRow(sessionId: string, messageId: string): { status: string; error: string | null } | undefined {
   const db = new Database(inboundDbPath('ag-1', sessionId), { readonly: true });
   try {
-    return db.prepare('SELECT status FROM delivered WHERE message_out_id = ?').get(messageId) as
-      | { status: string }
+    return db.prepare('SELECT status, error FROM delivered WHERE message_out_id = ?').get(messageId) as
+      | { status: string; error: string | null }
       | undefined;
   } finally {
     db.close();
@@ -372,8 +377,11 @@ describe('delivery_attempts is the retry authority', () => {
     const session = await seedSession();
     insertOutbound(session.id, 'out-stranded');
     // The crash window: a previous host recorded the capped attempt and died
-    // before it could write the terminal `delivered` row.
-    await seedPriorAttempts('out-stranded', session.id, 3);
+    // before it could write the terminal `delivered` row. Its adapter error is
+    // the only description of the failure that survives, and the runner hands
+    // it back to synchronous callers like send_file.
+    const lastError = 'missing_scope: files:write';
+    await seedPriorAttempts('out-stranded', session.id, 3, lastError);
 
     const { delivery } = await restartHost();
     expect(await delivery.deliverSessionMessages(session)).toBe('error');
@@ -381,7 +389,7 @@ describe('delivery_attempts is the retry authority', () => {
     // The adapter was never consulted, so no fourth attempt and no chance of
     // re-sending a message the previous host had already put on the wire.
     expect(attempted).toEqual([]);
-    expect(deliveredRow(session.id, 'out-stranded')?.status).toBe('failed');
+    expect(deliveredRow(session.id, 'out-stranded')).toMatchObject({ status: 'failed', error: lastError });
     expect(attemptRow('out-stranded')).toBeUndefined();
     expect(gaveUpCalls()).toEqual([
       expect.objectContaining({
