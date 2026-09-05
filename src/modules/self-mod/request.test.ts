@@ -117,8 +117,14 @@ beforeEach(async () => {
 
   // Authorized approver + a cached DM so ensureUserDm resolves without a
   // platform openDM call.
-  upsertUser({ id: 'slack:admin-1', kind: 'slack', display_name: 'Admin', created_at: now() });
-  grantRole({ user_id: 'slack:admin-1', role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });
+  await upsertUser({ id: 'slack:admin-1', kind: 'slack', display_name: 'Admin', created_at: now() });
+  await grantRole({
+    user_id: 'slack:admin-1',
+    role: 'owner',
+    agent_group_id: null,
+    granted_by: null,
+    granted_at: now(),
+  });
   await createMessagingGroup({
     id: 'mg-dm-1',
     channel_type: DM_CHANNEL,
@@ -128,7 +134,7 @@ beforeEach(async () => {
     unknown_sender_policy: 'strict',
     created_at: now(),
   });
-  upsertUserDm({
+  await upsertUserDm({
     user_id: 'slack:admin-1',
     channel_type: DM_CHANNEL,
     messaging_group_id: 'mg-dm-1',

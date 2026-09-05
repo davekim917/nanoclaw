@@ -43,22 +43,22 @@ describe('agent-group-capabilities CRUD', () => {
     createUser('user-system');
     await createAgentGroup({ id: 'ag-x', name: 'X', folder: 'x', agent_provider: null, created_at: now() });
 
-    grantCapability('ag-x', 'orchestrator', defaultConfig, 'user-system');
-    expect(hasOrchestratorCapability('ag-x')).toBe(true);
+    await grantCapability('ag-x', 'orchestrator', defaultConfig, 'user-system');
+    expect(await hasOrchestratorCapability('ag-x')).toBe(true);
   });
 
   it('test_has_capability_false_when_absent', async () => {
     await setupDb();
     await createAgentGroup({ id: 'ag-y', name: 'Y', folder: 'y', agent_provider: null, created_at: now() });
 
-    expect(hasOrchestratorCapability('ag-y')).toBe(false);
+    expect(await hasOrchestratorCapability('ag-y')).toBe(false);
   });
 
   it('test_revoke_blocks_when_tasks_in_flight', async () => {
     await setupDb();
     createUser('user-system');
     await createAgentGroup({ id: 'ag-x', name: 'X', folder: 'x', agent_provider: null, created_at: now() });
-    grantCapability('ag-x', 'orchestrator', defaultConfig, 'user-system');
+    await grantCapability('ag-x', 'orchestrator', defaultConfig, 'user-system');
 
     const db = getRawDb();
     db.exec(`INSERT INTO sessions (id, agent_group_id, created_at) VALUES ('sess-x', 'ag-x', '${now()}')`);
@@ -69,20 +69,20 @@ describe('agent-group-capabilities CRUD', () => {
       ) VALUES ('t1', 'k1', 'sess-x', 'ag-x', 'content', 'hash', '${now()}', 'running', '${now()}')
     `);
 
-    const result = revokeCapability('ag-x', 'orchestrator');
+    const result = await revokeCapability('ag-x', 'orchestrator');
     expect(result).toEqual({ success: false, reason: 'tasks_in_flight' });
-    expect(hasOrchestratorCapability('ag-x')).toBe(true);
+    expect(await hasOrchestratorCapability('ag-x')).toBe(true);
   });
 
   it('test_revoke_succeeds_when_no_tasks_in_flight', async () => {
     await setupDb();
     createUser('user-system');
     await createAgentGroup({ id: 'ag-x', name: 'X', folder: 'x', agent_provider: null, created_at: now() });
-    grantCapability('ag-x', 'orchestrator', defaultConfig, 'user-system');
+    await grantCapability('ag-x', 'orchestrator', defaultConfig, 'user-system');
 
-    const result = revokeCapability('ag-x', 'orchestrator');
+    const result = await revokeCapability('ag-x', 'orchestrator');
     expect(result).toEqual({ success: true });
-    expect(hasOrchestratorCapability('ag-x')).toBe(false);
+    expect(await hasOrchestratorCapability('ag-x')).toBe(false);
   });
 
   it('test_get_config_returns_parsed', async () => {
@@ -96,9 +96,9 @@ describe('agent-group-capabilities CRUD', () => {
       spawnDeadlineSec: 120,
       drainGraceSec: 60,
     };
-    grantCapability('ag-x', 'orchestrator', cfg, 'user-system');
+    await grantCapability('ag-x', 'orchestrator', cfg, 'user-system');
 
-    const returned = getCapabilityConfig('ag-x', 'orchestrator');
+    const returned = await getCapabilityConfig('ag-x', 'orchestrator');
     expect(returned).not.toBeNull();
     expect(returned!.concurrencyCap).toBe(7);
     expect(returned!.noProgressTimeoutSec).toBe(900);
@@ -109,16 +109,16 @@ describe('agent-group-capabilities CRUD', () => {
     createUser('user-system');
     await createAgentGroup({ id: 'ag-x', name: 'X', folder: 'x', agent_provider: null, created_at: now() });
 
-    grantCapability('ag-x', 'orchestrator', defaultConfig, 'user-system');
+    await grantCapability('ag-x', 'orchestrator', defaultConfig, 'user-system');
     const cfg2: CapabilityConfig = {
       concurrencyCap: 10,
       noProgressTimeoutSec: 600,
       spawnDeadlineSec: 120,
       drainGraceSec: 60,
     };
-    expect(() => grantCapability('ag-x', 'orchestrator', cfg2, 'user-system')).not.toThrow();
+    await expect(grantCapability('ag-x', 'orchestrator', cfg2, 'user-system')).resolves.toBeUndefined();
 
-    const returned = getCapabilityConfig('ag-x', 'orchestrator');
+    const returned = await getCapabilityConfig('ag-x', 'orchestrator');
     expect(returned!.concurrencyCap).toBe(10);
   });
 });

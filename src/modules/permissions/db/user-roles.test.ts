@@ -40,29 +40,29 @@ afterEach(async () => {
 });
 
 describe('isAnyAdmin', () => {
-  it('test_isAnyAdmin_owner_true', () => {
+  it('test_isAnyAdmin_owner_true', async () => {
     insertUser('u1');
     insertRole('u1', 'owner', null);
-    expect(isAnyAdmin('u1')).toBe(true);
+    expect(await isAnyAdmin('u1')).toBe(true);
   });
 
-  it('test_isAnyAdmin_global_admin_true', () => {
+  it('test_isAnyAdmin_global_admin_true', async () => {
     // Global admin = role='admin' with no agent_group_id scope
     insertUser('u2');
     insertRole('u2', 'admin', null);
-    expect(isAnyAdmin('u2')).toBe(true);
+    expect(await isAnyAdmin('u2')).toBe(true);
   });
 
-  it('test_isAnyAdmin_scoped_admin_true', () => {
+  it('test_isAnyAdmin_scoped_admin_true', async () => {
     insertUser('u3');
     getRawDb()
       .prepare("INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-1', 'Test', 'test', ?)")
       .run(now());
     insertRole('u3', 'admin', 'ag-1');
-    expect(isAnyAdmin('u3')).toBe(true);
+    expect(await isAnyAdmin('u3')).toBe(true);
   });
 
-  it('test_isAnyAdmin_member_false', () => {
+  it('test_isAnyAdmin_member_false', async () => {
     insertUser('u4');
     getRawDb()
       .prepare("INSERT INTO agent_groups (id, name, folder, created_at) VALUES ('ag-2', 'Test2', 'test2', ?)")
@@ -73,10 +73,10 @@ describe('isAnyAdmin', () => {
         'INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at) VALUES (?, ?, ?, NULL, ?)',
       )
       .run('u4', 'member', 'ag-2', now());
-    expect(isAnyAdmin('u4')).toBe(false);
+    expect(await isAnyAdmin('u4')).toBe(false);
   });
 
-  it('test_isAnyAdmin_no_role_false', () => {
-    expect(isAnyAdmin('u-nonexistent')).toBe(false);
+  it('test_isAnyAdmin_no_role_false', async () => {
+    expect(await isAnyAdmin('u-nonexistent')).toBe(false);
   });
 });

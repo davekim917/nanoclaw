@@ -135,7 +135,7 @@ describe('pruneSteerIdempotency — D7', () => {
     await closeDb();
   });
 
-  it('test_prune_removes_old_applied', () => {
+  it('test_prune_removes_old_applied', async () => {
     // applied row 2 min ago — should be deleted
     getRawDb()
       .prepare(
@@ -151,7 +151,7 @@ describe('pruneSteerIdempotency — D7', () => {
       )
       .run();
 
-    pruneSteerIdempotency();
+    await pruneSteerIdempotency();
 
     const rows = getRawDb().prepare("SELECT idempotency_key FROM steer_idempotency WHERE status = 'applied'").all() as {
       idempotency_key: string;
@@ -160,7 +160,7 @@ describe('pruneSteerIdempotency — D7', () => {
     expect(rows.map((r) => r.idempotency_key)).toContain('key-fresh');
   });
 
-  it('test_prune_removes_old_pending', () => {
+  it('test_prune_removes_old_pending', async () => {
     getRawDb()
       .prepare(
         `INSERT INTO steer_idempotency (user_id, idempotency_key, target_type, target_id, message_id, text, request_hash, reserved_at, status, echo_attempted)
@@ -168,13 +168,13 @@ describe('pruneSteerIdempotency — D7', () => {
       )
       .run();
 
-    pruneSteerIdempotency();
+    await pruneSteerIdempotency();
 
     const rows = getRawDb().prepare("SELECT idempotency_key FROM steer_idempotency WHERE status = 'pending'").all();
     expect(rows.length).toBe(0);
   });
 
-  it('test_prune_preserves_recent_pending', () => {
+  it('test_prune_preserves_recent_pending', async () => {
     getRawDb()
       .prepare(
         `INSERT INTO steer_idempotency (user_id, idempotency_key, target_type, target_id, message_id, text, request_hash, reserved_at, status, echo_attempted)
@@ -182,7 +182,7 @@ describe('pruneSteerIdempotency — D7', () => {
       )
       .run();
 
-    pruneSteerIdempotency();
+    await pruneSteerIdempotency();
 
     const rows = getRawDb()
       .prepare("SELECT idempotency_key FROM steer_idempotency WHERE idempotency_key = 'pend-new'")
@@ -190,9 +190,9 @@ describe('pruneSteerIdempotency — D7', () => {
     expect(rows.length).toBe(1);
   });
 
-  it('test_sweep_calls_prune: pruneSteerIdempotency is exported and callable', () => {
+  it('test_sweep_calls_prune: pruneSteerIdempotency is exported and callable', async () => {
     // Verify the function is exported and can be called without error on an empty table
-    expect(() => pruneSteerIdempotency()).not.toThrow();
+    await expect(pruneSteerIdempotency()).resolves.toBeUndefined();
   });
 });
 

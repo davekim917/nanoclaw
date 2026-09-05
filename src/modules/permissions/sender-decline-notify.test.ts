@@ -138,8 +138,8 @@ beforeEach(async () => {
   });
 
   // Owner (display name feeds the decline copy) + their DM.
-  upsertUser({ id: 'telegram:owner', kind: 'telegram', display_name: 'Owner', created_at: now() });
-  grantRole({
+  await upsertUser({ id: 'telegram:owner', kind: 'telegram', display_name: 'Owner', created_at: now() });
+  await grantRole({
     user_id: 'telegram:owner',
     role: 'owner',
     agent_group_id: null,
@@ -506,8 +506,8 @@ describe('unknown-sender decline_notify flow', () => {
     // this channel — the beforeEach owner ('Owner') keeps their user_dms row,
     // so make them unreachable by pointing it at a different channel_type.
     (await db()).prepare('DELETE FROM user_dms WHERE user_id = ?').run('telegram:owner');
-    upsertUser({ id: 'telegram:second', kind: 'telegram', display_name: 'Second', created_at: now() });
-    grantRole({
+    await upsertUser({ id: 'telegram:second', kind: 'telegram', display_name: 'Second', created_at: now() });
+    await grantRole({
       user_id: 'telegram:second',
       role: 'owner',
       agent_group_id: null,
@@ -593,8 +593,8 @@ describe('unknown-sender decline_notify flow', () => {
     // owner has no display_name, falling back to another owner's name would
     // reintroduce the mismatch — say "my owner" instead.
     (await db()).prepare('DELETE FROM user_dms WHERE user_id = ?').run('telegram:owner');
-    upsertUser({ id: 'telegram:nameless', kind: 'telegram', display_name: null, created_at: now() });
-    grantRole({
+    await upsertUser({ id: 'telegram:nameless', kind: 'telegram', display_name: null, created_at: now() });
+    await grantRole({
       user_id: 'telegram:nameless',
       role: 'owner',
       agent_group_id: null,
@@ -634,8 +634,8 @@ describe('unknown-sender decline_notify flow', () => {
     // A scoped admin of ag-1 with a reachable DM. pickApprover puts this
     // user FIRST (scoped admins → global admins → owners), so a card would
     // land here; the personal FYI must not.
-    upsertUser({ id: 'telegram:admin', kind: 'telegram', display_name: 'Admin', created_at: now() });
-    grantRole({
+    await upsertUser({ id: 'telegram:admin', kind: 'telegram', display_name: 'Admin', created_at: now() });
+    await grantRole({
       user_id: 'telegram:admin',
       role: 'admin',
       agent_group_id: 'ag-1',
@@ -661,7 +661,7 @@ describe('unknown-sender decline_notify flow', () => {
 
     // Sanity: the card audience really does put the admin first.
     const { pickApprover } = await import('../approvals/primitive.js');
-    expect(pickApprover('ag-1')[0]).toBe('telegram:admin');
+    expect((await pickApprover('ag-1'))[0]).toBe('telegram:admin');
 
     const { routeInbound } = await import('../../router.js');
     await routeInbound(strangerDm('hello'));

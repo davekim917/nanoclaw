@@ -71,8 +71,14 @@ beforeEach(async () => {
   initSessionFolder('ag-1', 'sess-1');
 
   // Resolution only happens for authorized clicks — seed the clicking admin.
-  upsertUser({ id: 'slack:admin-1', kind: 'slack', display_name: 'Admin', created_at: now() });
-  grantRole({ user_id: 'slack:admin-1', role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });
+  await upsertUser({ id: 'slack:admin-1', kind: 'slack', display_name: 'Admin', created_at: now() });
+  await grantRole({
+    user_id: 'slack:admin-1',
+    role: 'owner',
+    agent_group_id: null,
+    granted_by: null,
+    granted_at: now(),
+  });
 });
 
 afterEach(async () => {

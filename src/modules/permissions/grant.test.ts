@@ -141,20 +141,25 @@ beforeEach(async () => {
   await createAgentGroup(makeAg('ag-helper', 'example-labs-v2', 'helper'));
   await createAgentGroup(makeAg('ag-other', 'other', 'other'));
 
-  createUser({ id: 'slack-example-labs:OWNER', kind: 'slack-example-labs', display_name: 'Owner', created_at: now() });
-  createUser({
+  await createUser({
+    id: 'slack-example-labs:OWNER',
+    kind: 'slack-example-labs',
+    display_name: 'Owner',
+    created_at: now(),
+  });
+  await createUser({
     id: 'slack-example-labs:GADMIN',
     kind: 'slack-example-labs',
     display_name: 'GlobalAdmin',
     created_at: now(),
   });
-  createUser({
+  await createUser({
     id: 'slack-example-labs:SADMIN',
     kind: 'slack-example-labs',
     display_name: 'ScopedAdmin',
     created_at: now(),
   });
-  createUser({
+  await createUser({
     id: 'slack-example-labs:STRANGER',
     kind: 'slack-example-labs',
     display_name: 'Stranger',
@@ -162,24 +167,34 @@ beforeEach(async () => {
   });
   // Target users that test-local addMember/grantRole calls reference before
   // the handler's own ensureUserExists has a chance to create them.
-  createUser({ id: 'slack-example-labs:BOB', kind: 'slack-example-labs', display_name: 'Bob', created_at: now() });
-  createUser({ id: 'slack-example-labs:CAROL', kind: 'slack-example-labs', display_name: 'Carol', created_at: now() });
+  await createUser({
+    id: 'slack-example-labs:BOB',
+    kind: 'slack-example-labs',
+    display_name: 'Bob',
+    created_at: now(),
+  });
+  await createUser({
+    id: 'slack-example-labs:CAROL',
+    kind: 'slack-example-labs',
+    display_name: 'Carol',
+    created_at: now(),
+  });
 
-  grantRole({
+  await grantRole({
     user_id: 'slack-example-labs:OWNER',
     role: 'owner',
     agent_group_id: null,
     granted_by: null,
     granted_at: now(),
   });
-  grantRole({
+  await grantRole({
     user_id: 'slack-example-labs:GADMIN',
     role: 'admin',
     agent_group_id: null,
     granted_by: null,
     granted_at: now(),
   });
-  grantRole({
+  await grantRole({
     user_id: 'slack-example-labs:SADMIN',
     role: 'admin',
     agent_group_id: 'ag-helper',
@@ -319,14 +334,19 @@ describe('handleGrantAccess', () => {
 
 describe('handleRevokeAccess', () => {
   it('owner can revoke a member', async () => {
-    addMember({ user_id: 'slack-example-labs:BOB', agent_group_id: 'ag-helper', added_by: null, added_at: now() });
+    await addMember({
+      user_id: 'slack-example-labs:BOB',
+      agent_group_id: 'ag-helper',
+      added_by: null,
+      added_at: now(),
+    });
     insertChatInbound({ senderId: 'OWNER' });
     await handleRevokeAccess({ user: '<@BOB>' }, makeSession());
     expect(isMember('slack-example-labs:BOB', 'ag-helper')).toBe(false);
   });
 
   it('scoped admin cannot revoke another admin', async () => {
-    grantRole({
+    await grantRole({
       user_id: 'slack-example-labs:CAROL',
       role: 'admin',
       agent_group_id: 'ag-helper',
@@ -349,7 +369,12 @@ describe('handleRevokeAccess', () => {
 
 describe('handleListAccess', () => {
   it('lists owners, global admins, scoped admins, members', async () => {
-    addMember({ user_id: 'slack-example-labs:BOB', agent_group_id: 'ag-helper', added_by: null, added_at: now() });
+    await addMember({
+      user_id: 'slack-example-labs:BOB',
+      agent_group_id: 'ag-helper',
+      added_by: null,
+      added_at: now(),
+    });
     await handleListAccess({}, makeSession());
     const text = notifyCalls.at(-1)?.text ?? '';
     expect(text).toMatch(/Access for `ag-helper`/);

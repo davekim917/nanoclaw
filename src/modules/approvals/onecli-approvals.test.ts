@@ -123,9 +123,9 @@ async function boot(seed?: boolean): Promise<Boot> {
       created_at: '2026-09-01T00:00:00.000Z',
     });
     for (const id of [ADMIN, OUTSIDER]) {
-      users.upsertUser({ id, kind: 'human', display_name: id, created_at: '2026-09-01T00:00:00.000Z' });
+      await users.upsertUser({ id, kind: 'human', display_name: id, created_at: '2026-09-01T00:00:00.000Z' });
     }
-    roles.grantRole({
+    await roles.grantRole({
       user_id: ADMIN,
       role: 'admin',
       agent_group_id: 'ag-1',

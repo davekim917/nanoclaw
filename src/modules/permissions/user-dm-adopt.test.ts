@@ -55,7 +55,7 @@ describe('ensureUserDm adopts a concurrently created DM messaging group', () => 
   beforeEach(async () => {
     await initTestDb();
     runMigrations(getRawDb());
-    upsertUser({ id: USER_ID, kind: 'telegram', display_name: 'Ada', created_at: now() });
+    await upsertUser({ id: USER_ID, kind: 'telegram', display_name: 'Ada', created_at: now() });
   });
 
   afterEach(async () => {
