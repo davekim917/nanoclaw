@@ -37,7 +37,7 @@ import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getSession } from '../../db/sessions.js';
 import { log } from '../../log.js';
 import { resolveSession, withMailboxSession, writeSessionMessage } from '../../session-manager.js';
-import { wakeContainer } from '../../container-runner.js';
+import { requestWake } from '../../request-wake.js';
 import type { Session } from '../../types.js';
 import { CapabilityConfig, getCapabilityConfig, hasOrchestratorCapability } from './db/agent-group-capabilities.js';
 import {
@@ -192,7 +192,7 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
   if (postTxnReplay) {
     await _notifyCaller(callerSession, postTxnReplay.message);
     // P11 carry-forward: wake caller so it sees the notification on next turn
-    void wakeContainer(callerSession).catch((err) =>
+    void requestWake(callerSession, 'inbound-message').catch((err) =>
       log.warn('wakeContainer(caller) failed after replay notification', { err }),
     );
     return;
@@ -210,7 +210,7 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
   await _notifyCaller(callerSession, `Task admitted: ${admittedTask.task_id}`);
 
   // P11 carry-forward: wake caller so it sees the admit notification
-  void wakeContainer(callerSession).catch((err) =>
+  void requestWake(callerSession, 'inbound-message').catch((err) =>
     log.warn('wakeContainer(caller) failed after admit notification', { err }),
   );
 
@@ -423,7 +423,7 @@ async function _runThreadedPath(task: Task, childAgentGroupId: string): Promise<
       });
 
       // d. Wake child LAST (cycle-3 M21)
-      void wakeContainer(childSession).catch((err) =>
+      void requestWake(childSession, 'agent-created').catch((err) =>
         log.warn('wakeContainer(child) failed in threaded path', { taskId, err }),
       );
 
@@ -432,7 +432,7 @@ async function _runThreadedPath(task: Task, childAgentGroupId: string): Promise<
       if (parentSession) {
         const threadUrl = `Thread started: ${current.child_platform_thread_id}`;
         await _notifyParent(task, threadUrl);
-        void wakeContainer(parentSession).catch((err: unknown) =>
+        void requestWake(parentSession, 'inbound-message').catch((err: unknown) =>
           log.warn('wakeContainer(parent) failed after threaded completion', { taskId, err }),
         );
       }
@@ -478,7 +478,7 @@ async function _runHeadlessPath(task: Task, childAgentGroupId: string): Promise<
     });
 
     // d. Wake child LAST
-    void wakeContainer(childSession).catch((err) =>
+    void requestWake(childSession, 'agent-created').catch((err) =>
       log.warn('wakeContainer(child) failed in headless path', { taskId, err }),
     );
 
@@ -486,7 +486,7 @@ async function _runHeadlessPath(task: Task, childAgentGroupId: string): Promise<
     await _notifyParent(task, `Headless task running: ${taskId}`);
     const parentSession = await _resolveParentSession(task);
     if (parentSession) {
-      void wakeContainer(parentSession).catch((err: unknown) =>
+      void requestWake(parentSession, 'inbound-message').catch((err: unknown) =>
         log.warn('wakeContainer(parent) failed after headless completion', { taskId, err }),
       );
     }

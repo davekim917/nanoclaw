@@ -12,7 +12,8 @@
 import { randomUUID } from 'crypto';
 
 import { getSession } from '../../db/sessions.js';
-import { hasContainerEverRun, isContainerRunning, sessionStillActive, wakeContainer } from '../../container-runner.js';
+import { hasContainerEverRun, isContainerRunning, sessionStillActive } from '../../container-runner.js';
+import { requestWake } from '../../request-wake.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import { getActiveTasks, transitionToTerminal } from '../orchestrator-dispatch/db/tasks.js';
@@ -159,7 +160,8 @@ export async function sweepTaskWatchdog(): Promise<void> {
         // and the parent can be archived in that window — but so can it be
         // archived during the wake's own awaits, which a re-read here cannot
         // see. The proof travels with the wake.
-        void wakeContainer(parentSession, 'interactive', {
+        void requestWake(parentSession, 'inbound-message', {
+          priority: 'interactive',
           guard: sessionStillActive(parentSession.id),
         }).catch((err) => log.warn('Task watchdog: wakeContainer(parent) failed', { taskId: task.task_id, err }));
       } catch (err) {

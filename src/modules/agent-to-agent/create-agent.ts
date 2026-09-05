@@ -16,7 +16,7 @@ import { GROUPS_DIR } from '../../config.js';
 import { createAgentGroup, getAgentGroup, getAgentGroupByFolder, getAllAgentGroups } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
-import { wakeContainer } from '../../container-runner.js';
+import { requestWake } from '../../request-wake.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { updateContainerConfig } from '../../container-config.js';
 import { log } from '../../log.js';
@@ -38,7 +38,9 @@ async function notifyAgent(session: Session, text: string): Promise<void> {
   });
   const fresh = await getSession(session.id);
   if (fresh) {
-    wakeContainer(fresh).catch((err) => log.error('Failed to wake container after notification', { err }));
+    requestWake(fresh, 'agent-created').catch((err) =>
+      log.error('Failed to wake container after notification', { err }),
+    );
   }
 }
 

@@ -11,8 +11,8 @@ import {
   isContainerSpawning,
   killContainer,
   sessionStillActive,
-  wakeContainer,
 } from './container-runner.js';
+import { requestWake } from './request-wake.js';
 import { randomUUID } from 'crypto';
 import { listInstallContainersWithScope, stopContainer, type InstallContainerScope } from './container-runtime.js';
 import { getSessionsByAgentGroup } from './db/sessions.js';
@@ -733,7 +733,7 @@ export async function quiesceWorkgroupsForBootMountChange(
 
 export function wakeRepositoryMountSessions(sessions: Session[]): void {
   for (const session of sessions) {
-    void wakeContainer(session).catch((err) =>
+    void requestWake(session, 'container-restart').catch((err) =>
       log.warn('Failed to wake session after repository mount quiescence', { sessionId: session.id, err }),
     );
   }
@@ -898,7 +898,10 @@ export async function restartAgentGroupContainers(
             // `wakeContainer` awaits admission, the memory queue and the whole
             // spawn preparation, and a `getSession` here proves nothing about
             // any of that.
-            void wakeContainer(session, 'interactive', { guard: sessionStillActive(session.id) });
+            void requestWake(session, 'container-restart', {
+              priority: 'interactive',
+              guard: sessionStillActive(session.id),
+            });
           }
         : undefined,
       // The durable half of the same decision. The branch above is the only
