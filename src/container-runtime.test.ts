@@ -244,6 +244,9 @@ describe('listInstallContainersWithScope', () => {
     });
 
     expect(() => listInstallContainersWithScope()).toThrow(/prove install-scoped container absence/);
+  });
+});
+
 // --- adoption helpers (seam 4 series E) ---
 
 describe('runtimeShowsRunning', () => {

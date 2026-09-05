@@ -30,7 +30,12 @@ import { ensureContainerRuntimeRunning } from './container-runtime.js';
 import { warnActiveContainersOfShutdown, warnMarkedRunningSessionsOfStartup } from './host-restart-warn.js';
 import { getActiveSessions, resetPhantomContainerStatus } from './db/sessions.js';
 import { resetProcessingChannelIngress } from './db/channel-ingress-receipts.js';
-import { getActiveContainerSessionIds, honorPendingStopIntents, stopAllContainers } from './container-runner.js';
+import {
+  adoptRunningSessions,
+  beginContainerShutdown,
+  getActiveContainerSessionIds,
+  honorPendingStopIntents,
+} from './container-runner.js';
 import { quiesceWorkgroupsForBootMountChange, type BootQuiescenceScope } from './container-restart.js';
 import { writeUpstreamPolicySnapshot } from './container-updates.js';
 import { setDeliveryAdapter, startActiveDeliveryPoll, startSweepDeliveryPoll, stopDeliveryPolls } from './delivery.js';
@@ -529,7 +534,23 @@ export async function main(): Promise<void> {
   // snapshot prune. Nothing here mutates a mount before the proof returns; a
   // listing failure or a stop that does not take throws out of startup, which
   // is what "prove install-scoped container absence" has always meant.
-  const { memoryReports } = await runBootMountQuiescence(db);
+  const { scope, memoryReports } = await runBootMountQuiescence(db);
+
+  // Adopt the containers the boot door left running (seam 4 series E, plan
+  // §7.E). Immediately after the door's return, and before every wake source
+  // (the dashboard, the channel adapters, the sweep, delivery) and before the
+  // orphaned-fence recovery below — src/adoption-order.test.ts pins both: no
+  // wake can spawn a second container beside an untracked survivor, and the
+  // recovery still runs against its premise (a fresh process holds no mount
+  // claims, so every active fence it finds is orphaned).
+  //
+  // The candidate set is the door's own partition, `survivableSessionIds` —
+  // the same set the startup warn skips. Under D1 that partition is computed
+  // AFTER the stops and the door still stops the survivable containers too, so
+  // the set is empty and this adopts nothing until D2 flips the stop set. D2
+  // also needs a PRE-stop partition for the warn's skip set (the door's D2
+  // note); this post-stop one is the adoption contract.
+  const reconciled = await adoptRunningSessions({ survivableSessionIds: scope.survivableSessionIds });
   for (const report of memoryReports) {
     if (report.state.status === 'migration-required') {
       log.warn('Workgroup memory requires operator migration; automatic startup left it untouched', {
@@ -570,7 +591,12 @@ export async function main(): Promise<void> {
   try {
     const fences = await releaseOrphanedRepoIngressFencesAtStartup();
     if (fences.released > 0 || fences.failed > 0) {
-      log.warn('Released orphaned repository ingress fences at startup', { ...fences });
+      // An adopted session behind an active fence is one of these releases;
+      // the count from adoption makes that visible beside the release count.
+      log.warn('Released orphaned repository ingress fences at startup', {
+        ...fences,
+        adoptedWithActiveFence: reconciled.fencedInbound,
+      });
     }
   } catch (fenceErr) {
     log.error('Orphaned repository ingress fence recovery failed at startup', { err: fenceErr });
@@ -906,13 +932,19 @@ async function shutdown(signal: string): Promise<void> {
     } catch (err) {
       log.error('host-restart shutdown warn failed', { err });
     }
-    // Synchronously stop agent containers before exit. Without this, child
-    // subprocesses linger in the cgroup and systemd TimeoutStopSec stalls
-    // every restart. Matches v1's GroupQueue.shutdown semantics.
+    // Door 1 (plan §4.3.5): close the spawn path and let in-flight wakes
+    // settle, but leave running containers ALONE — the next host adopts them.
+    // This used to be `stopAllContainers()`, added because lingering client
+    // children stalled systemd for `TimeoutStopSec` on every restart; the unit
+    // now carries `KillMode=mixed` (the client children are reaped by systemd
+    // once this process exits, without touching the daemon-owned containers)
+    // and no `ExecStop` sweep, which is what makes leaving them alive here
+    // both safe and observable. Both unit-file lines are the other two doors;
+    // rollback restores them FIRST (plan §5).
     try {
-      await stopAllContainers();
+      await beginContainerShutdown();
     } catch (err) {
-      log.error('stopAllContainers threw', { err });
+      log.error('beginContainerShutdown threw', { err });
     }
   } finally {
     // Stamp `stopped_at` FIRST so a graceful exit is durably distinguishable

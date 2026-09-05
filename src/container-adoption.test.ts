@@ -196,6 +196,7 @@ import { EventEmitter } from 'node:events';
 
 import {
   adoptRunningSessions,
+  getAdoptedSessionIds,
   getContainerSpawnedAt,
   hasContainerEverRun,
   hasPendingAdoption,
@@ -264,14 +265,22 @@ function wakeFailures(): string[] {
   );
 }
 
-/** Let every adopted container exit so no waiter or registry entry outlives its case. */
+/**
+ * Let every adopted container exit so no waiter or registry entry outlives its
+ * case. Loops because a case may leave a re-arm pending: the waiter armed
+ * after the backoff is the one whose close finalizes the entry.
+ */
 async function drainAdopted(): Promise<void> {
   fakes.running.clear();
   fakes.listingFails = false;
-  for (const { name } of [...fakes.waiters]) {
-    if (fakes.waitersFor(name).at(-1)?.exitCode === null) fakes.exit(name, 0);
+  for (let attempt = 0; attempt < 50 && getAdoptedSessionIds().length > 0; attempt += 1) {
+    for (const sessionId of getAdoptedSessionIds()) {
+      const waiter = fakes.waitersFor(`nanoclaw-v2-${sessionId}`).at(-1);
+      if (waiter && waiter.exitCode === null) fakes.exit(`nanoclaw-v2-${sessionId}`, 0);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(getAdoptedSessionIds(), 'an adopted entry outlived its case').toEqual([]);
 }
 
 describe('adoptRunningSessions', () => {

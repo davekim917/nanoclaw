@@ -192,6 +192,8 @@ import fs from 'node:fs';
 
 import {
   adoptRunningSessions,
+  getAdoptedSessionIds,
+  beginContainerShutdown,
   finalizeSession,
   isAdoptedContainer,
   isContainerRunning,
@@ -253,14 +255,22 @@ async function adopt(sessionId: string): Promise<void> {
   expect(isAdoptedContainer(sessionId)).toBe(true);
 }
 
-/** Let every adopted container exit so no waiter or registry entry outlives its case. */
+/**
+ * Let every adopted container exit so no waiter or registry entry outlives its
+ * case. Loops because a case may leave a re-arm pending: the waiter armed
+ * after the backoff is the one whose close finalizes the entry.
+ */
 async function drainAdopted(): Promise<void> {
   fakes.running.clear();
   fakes.listingFails = false;
-  for (const { name } of [...fakes.waiters]) {
-    if (fakes.waitersFor(name).at(-1)?.exitCode === null) fakes.exit(name, 0);
+  for (let attempt = 0; attempt < 50 && getAdoptedSessionIds().length > 0; attempt += 1) {
+    for (const sessionId of getAdoptedSessionIds()) {
+      const waiter = fakes.waitersFor(`nanoclaw-v2-${sessionId}`).at(-1);
+      if (waiter && waiter.exitCode === null) fakes.exit(`nanoclaw-v2-${sessionId}`, 0);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(getAdoptedSessionIds(), 'an adopted entry outlived its case').toEqual([]);
 }
 
 describe('supervision channel', () => {
@@ -420,5 +430,20 @@ describe('supervision channel', () => {
     // acquired at adoption, so nothing is released at exit.
     expect(leases.acquired).toEqual([]);
     expect(leases.released).toEqual([]);
+  });
+  // LAST case in the file, deliberately: `beginContainerShutdown()` latches
+  // `containerShutdownInProgress` for the life of the module, and nothing
+  // resets it — every later wake would be refused before it reached a claim.
+  it('beginContainerShutdown leaves a running container alone and closes the spawn path', async () => {
+    await adopt('sess-door-1');
+
+    const left = await beginContainerShutdown(0);
+
+    expect(left).toEqual({ running: 1, adopted: 1, spawning: 0 });
+    expect(isContainerRunning('sess-door-1')).toBe(true);
+    expect(fakes.calls).toEqual([]);
+    expect(await containerStatusOf('sess-door-1')).toBe('running');
+    await seedSession(TEST_DATA_DIR, 'sess-after-door');
+    await expect(wakeContainer(callerSnapshot('sess-after-door'))).resolves.toBe(false);
   });
 });

@@ -2677,13 +2677,62 @@ function settlePendingKill(sessionId: string): void {
 }
 
 /**
+ * Door 1 of host shutdown (plan §4.3.5): close the spawn path, leave every
+ * running container alone.
+ *
+ * Replaces `stopAllContainers()` on the shutdown path. It keeps the two things
+ * the shutdown flag actually buys — `containerShutdownInProgress`, which every
+ * spawn re-checks up to the last word before `docker run`, and the memory
+ * admission controller's shutdown, which drops its queue — and then waits only
+ * for wakes still IN FLIGHT to settle, bounded by the grace period, so no
+ * spawn can slip in after the snapshot. Containers already running are what
+ * the next host adopts (`adoptRunningSessions`); stopping them here is the
+ * per-restart interruption this seam removes. The unit file's `KillMode=mixed`
+ * and the removal of its `ExecStop` are the other two doors — without those,
+ * systemd still kills the client children and their containers with them.
+ *
+ * Returns what was left running, for the operator log and for the restart
+ * warning's stopping set (series G): under this door that set is empty.
+ */
+export async function beginContainerShutdown(
+  gracePeriodMs: number = 10_000,
+): Promise<{ running: number; adopted: number; spawning: number }> {
+  containerShutdownInProgress = true;
+  memoryAdmission?.shutdown();
+  const inFlight = [...wakePromises.values()];
+  const running = activeContainers.size;
+  const adopted = getAdoptedSessionIds().length;
+  log.info('Container shutdown begun — leaving running containers for the next host to adopt', {
+    running,
+    adopted,
+    spawning: inFlight.length,
+    gracePeriodMs,
+  });
+  if (inFlight.length > 0) {
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<void>((resolve) => {
+      timeoutHandle = setTimeout(resolve, gracePeriodMs);
+    });
+    await Promise.race([Promise.allSettled(inFlight).then(() => undefined), timeout]);
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
+  return { running, adopted, spawning: inFlight.length };
+}
+
+/**
  * Stop every active container synchronously at host shutdown.
  *
- * Load-bearing: without this, child container subprocesses linger in the
- * cgroup after the parent exits and systemd stalls for `TimeoutStopSec`
- * (default 90s) on every restart before SIGKILLing them. v1 wired this
- * into `GroupQueue.shutdown`; v2 lost it during the v1→v2 rewrite and the
- * host lingers similarly.
+ * NO LONGER on the shutdown path (plan §4.3.5, door 1): `beginContainerShutdown`
+ * replaced it so containers survive a host restart and are adopted by the next
+ * process. Kept exported, with its tests, as the rollback path — a build
+ * reverted onto a unit that still stops nothing needs something that does —
+ * and it is on the dead-code kill list for the day that rollback is no longer
+ * plausible. Its pre-E rationale, for that reader:
+ *
+ * Without it, child container subprocesses lingered in the cgroup after the
+ * parent exited and systemd stalled for `TimeoutStopSec` on every restart
+ * before SIGKILLing them. v1 wired this into `GroupQueue.shutdown`; v2 lost it
+ * during the v1→v2 rewrite and the host lingered similarly.
  *
  * Issues `docker stop` (SIGTERM then docker's own timeout → SIGKILL) to
  * every tracked container in parallel, waits for their close events up
