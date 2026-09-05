@@ -174,7 +174,7 @@
 ".claude/skills/migrate-slack-agents/SKILL.md":{"diff":293,"mode":"100644","sha256":null,"deleted":true},
 ".claude/skills/setup/SKILL.md":{"diff":0,"mode":"100644","sha256":"10aa0c0ff8f016f805ba480bed0a953553fef3cc81cdb6ab05a8b12fad7f48e4"},
 ".claude/skills/slack-a2a-rooms/SKILL.md":{"diff":415,"mode":"100644","sha256":"ea044c24eac32dd75a26b29b6dec624291ad15fec7800e9f76dd8336d43c2d03"},
-".claude/skills/slack-a2a-rooms/scripts/open-a2a-room.ts":{"diff":250,"mode":"100644","sha256":"39aa3261c9d6a37b2edeee7469bab6a83ffb5bb921c9ae435768165d6940fb14"},
+".claude/skills/slack-a2a-rooms/scripts/open-a2a-room.ts":{"diff":262,"mode":"100644","sha256":"f132850ba1d0563351818d50e4967e51908340a7fedca821acc11addb674d909"},
 ".claude/skills/slack-a2a-rooms/src/channels/slack-a2a.test.ts":{"diff":235,"mode":"100644","sha256":null,"deleted":true},
 ".claude/skills/slack-a2a-rooms/src/channels/slack-a2a.ts":{"diff":135,"mode":"100644","sha256":null,"deleted":true},
 ".claude/skills/slack-agent-flow/REMOVE.md":{"diff":45,"mode":"100644","sha256":null,"deleted":true},

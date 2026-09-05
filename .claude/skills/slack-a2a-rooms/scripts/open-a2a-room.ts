@@ -82,6 +82,17 @@ export function assertSameWorkspace(auths: SlackAuth[]): void {
   throw new Error(`instances span ${teams.length} Slack workspaces, and a group DM cannot cross one — ${byTeam}`);
 }
 
+export function assertDistinctBotUsers(auths: SlackAuth[]): void {
+  const byUser = new Map<string, string>();
+  for (const auth of auths) {
+    const previous = byUser.get(auth.userId);
+    if (previous !== undefined) {
+      throw new Error(`instances "${previous}" and "${auth.name}" resolve to the same Slack bot user`);
+    }
+    byUser.set(auth.userId, auth.name);
+  }
+}
+
 function fail(msg: string): never {
   console.error(`open-a2a-room: ${msg}`);
   process.exit(1);
@@ -243,6 +254,7 @@ async function main(): Promise<void> {
     auths.push(auth);
   }
   assertSameWorkspace(auths);
+  assertDistinctBotUsers(auths);
 
   const caller = auths[0]!;
   const otherBotUserIds = auths.slice(1).map((a) => a.userId);

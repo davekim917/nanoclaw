@@ -14,6 +14,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  assertDistinctBotUsers,
   assertDistinctInstances,
   assertSameWorkspace,
   channelTypeForInstance,
@@ -98,6 +99,16 @@ describe('open-a2a-room refuses a roster that spans Slack workspaces', () => {
     userId: `U0${name.toUpperCase()}`,
     botId: null,
     teamId,
+  });
+
+  it('rejects different suffixes that authenticate as the same bot user', () => {
+    const first = auth('synthetic-one', 'T000TEST');
+    const second = auth('synthetic-two', 'T000TEST');
+    expect(() => assertDistinctBotUsers([first, second])).not.toThrow();
+    second.userId = first.userId;
+    expect(() => assertDistinctBotUsers([first, second])).toThrow(
+      'instances "synthetic-one" and "synthetic-two" resolve to the same Slack bot user',
+    );
   });
 
   it('test_same_workspace_passes: every bot in one workspace is accepted', () => {
