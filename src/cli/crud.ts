@@ -333,12 +333,60 @@ function genericUpdate(def: ResourceDef) {
     }
 
     if (def.preUpdate) {
-      const current = await getDb().get<Record<string, unknown>>(
+      // `preUpdate` validates `updates` against a point-in-time snapshot of
+      // the row (e.g. wirings' validateEngageAgainstChannel checks the
+      // engage_mode/engage_pattern pairing across BOTH `current` and
+      // `updates`). Under the async driver the read and the write below are
+      // no longer one synchronous step, so two concurrent updates can each
+      // read the same stale `current`, each individually pass validation,
+      // and then both write — landing a combination neither update's own
+      // validation would have allowed on its own (github Codex review on
+      // #437, src/cli/crud.ts:336).
+      //
+      // Fix: make the write conditional on the exact row state `preUpdate`
+      // just validated (optimistic concurrency) rather than an unconditional
+      // `WHERE id = ?`. If the row moved between read and write, `changes`
+      // is 0 — re-read and re-validate once against the fresh row and retry;
+      // a second miss is a genuine conflict, not a transient race, and is
+      // surfaced as a normal CLI refusal rather than silently overwriting.
+      let current = await getDb().get<Record<string, unknown>>(
         `SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`,
         id,
       );
       if (!current) throw new Error(`${def.name} not found: ${id}`);
-      def.preUpdate(updates, current);
+
+      for (let attempt = 0; attempt < 2; attempt++) {
+        def.preUpdate(updates, current);
+
+        const setClause = Object.keys(updates)
+          .map((k) => `${k} = @${k}`)
+          .join(', ');
+        // `IS` (not `=`) so a NULL column in `current` still pins correctly —
+        // SQLite's `IS` is a null-safe equality, `=` against NULL is never true.
+        const checkClause = Object.keys(current)
+          .map((k) => `${k} IS @__orig_${k}`)
+          .join(' AND ');
+        const checkParams: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(current)) checkParams[`__orig_${k}`] = v;
+
+        const result = await getDb().run(
+          `UPDATE ${def.table} SET ${setClause} WHERE ${def.idColumn} = @_id AND ${checkClause}`,
+          { ...updates, ...checkParams, _id: id },
+        );
+        if (result.changes > 0) {
+          return getDb().get(`SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`, id);
+        }
+
+        current = await getDb().get<Record<string, unknown>>(
+          `SELECT ${cols} FROM ${def.table} WHERE ${def.idColumn} = ?`,
+          id,
+        );
+        if (!current) throw new Error(`${def.name} not found: ${id}`);
+      }
+
+      throw new Error(
+        `${def.name} update conflict: ${id} changed concurrently — re-run the update to retry against the current row`,
+      );
     }
 
     const setClause = Object.keys(updates)
