@@ -63,6 +63,26 @@ const NOT_CALLERS: readonly string[] = [DEFINER, SELF];
  * without opening a central DB needs a stub handle, and routing them all
  * through one shared fake means the identifier is named once instead of once
  * per test file. Migrating an existing test entry onto it removes that entry.
+ *
+ * PR 5b removed EIGHT entries (226 → 218): `users`, `user_dms`,
+ * `pending_sender_approvals`, the orchestrator capability leaf, `progress.ts`,
+ * agent-to-agent `create-agent.ts` and `steer-idempotency.ts` are wholly on
+ * the driver now, and `modules/interactive/index.ts` traded `hasTableRaw` for
+ * the async `hasTable`. Nine files in PR 5b's own areas KEEP their entry on
+ * purpose, each for one of the two reasons the plan already names, with the
+ * reason written at the export itself: a leaf export reachable from a raw
+ * transaction closure (§4.2 — `orchestrator-dispatch/dispatch.ts` and the
+ * `db/tasks.ts` exports its closure calls; `agent-destinations.ts`'s
+ * `createDestination` / `getDestinationByName` / `getDestinationByTarget`,
+ * which `ensureAgentDestinationForWiring` calls inside
+ * `cli/resources/wirings.ts`'s closure), or one reachable from a synchronous
+ * guard or mailbox block (§4.5 I-1 — `user_roles`'s privilege predicates,
+ * `agent_group_members`'s membership predicates,
+ * `pending-channel-approvals`'s `getPendingChannelApproval`,
+ * `agent-message-policies`'s `getMessagePolicy`, `agent-destinations`'s
+ * `hasDestination` / `getDestinations`, and `agent-route.ts`'s
+ * `targetWiredToMessagingGroup`). None of them has an async twin; they convert
+ * in PR 6 with their closure or inside `withCentralSync`.
  */
 export const RAW_DB_IMPORTERS: readonly string[] = [
   'scripts/bust-slack-profile-cache.ts',
@@ -180,7 +200,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/agent-to-agent/agent-route.test.ts',
   'src/modules/agent-to-agent/agent-route.ts',
   'src/modules/agent-to-agent/create-agent.test.ts',
-  'src/modules/agent-to-agent/create-agent.ts',
   'src/modules/agent-to-agent/db/agent-destinations.ts',
   'src/modules/agent-to-agent/db/agent-message-policies.ts',
   'src/modules/agent-to-agent/guard.ts',
@@ -197,13 +216,11 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/channel-auto-wire/index.test.ts',
   'src/modules/claims/self-heal.test.ts',
   'src/modules/claims/self-heal.ts',
-  'src/modules/interactive/index.ts',
   'src/modules/memory/pre-turn-context.test.ts',
   'src/modules/memory/pre-turn-context.ts',
   'src/modules/orchestrator-dispatch/cancellation.test.ts',
   'src/modules/orchestrator-dispatch/completion.test.ts',
   'src/modules/orchestrator-dispatch/db/agent-group-capabilities.test.ts',
-  'src/modules/orchestrator-dispatch/db/agent-group-capabilities.ts',
   'src/modules/orchestrator-dispatch/db/tasks.test.ts',
   'src/modules/orchestrator-dispatch/db/tasks.ts',
   'src/modules/orchestrator-dispatch/dispatch.test.ts',
@@ -211,17 +228,13 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/orchestrator-dispatch/integration.test.ts',
   'src/modules/orchestrator-dispatch/needs-input.test.ts',
   'src/modules/orchestrator-dispatch/progress.test.ts',
-  'src/modules/orchestrator-dispatch/progress.ts',
   'src/modules/orchestrator-dispatch/reconciler.test.ts',
   'src/modules/permissions/channel-approval-folder-race.test.ts',
   'src/modules/permissions/channel-approval.test.ts',
   'src/modules/permissions/db/agent-group-members.ts',
   'src/modules/permissions/db/pending-channel-approvals.ts',
-  'src/modules/permissions/db/pending-sender-approvals.ts',
-  'src/modules/permissions/db/user-dms.ts',
   'src/modules/permissions/db/user-roles.test.ts',
   'src/modules/permissions/db/user-roles.ts',
-  'src/modules/permissions/db/users.ts',
   'src/modules/permissions/grant.test.ts',
   'src/modules/permissions/permissions.test.ts',
   'src/modules/permissions/sender-approval.test.ts',
@@ -237,7 +250,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/support-threads/dispatch.test.ts',
   'src/modules/sweep-central/central.test.ts',
   'src/modules/sweep-central/session-title-sweep.test.ts',
-  'src/modules/sweep-central/steer-idempotency.ts',
   'src/modules/sweep-central/thread-title-retry.test.ts',
   'src/modules/sweep-claims/claims-throttle.test.ts',
   'src/modules/sweep-container-health/health.test.ts',

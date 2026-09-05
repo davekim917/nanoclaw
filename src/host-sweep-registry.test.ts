@@ -1457,7 +1457,112 @@ describe('sweep duty registry (S2-PR2)', () => {
     // functionality that arrived after the plan's line budget was written. The
     // three structural assertions above are the criterion; this number only has
     // to fail when a duty body comes home.
-    expect(source.split('\n').length).toBeLessThanOrEqual(1450);
+    //
+    // ── Re-measured for seam 3 PR 5b (plan §8.5) ────────────────────────────
+    // seam-3 PR 5b: 0 awaits. The PR converts the sweep DUTIES, not the
+    // driver — `steer-idempotency` became async and its registration awaits it,
+    // but that registration lives in `src/modules/sweep-central/index.ts`, and
+    // host-sweep.ts's own leaf calls (`getActiveSessions`,
+    // `getWarmQuietSessionMarks`, `persistQuietSessionMarks`, `getAgentGroup`)
+    // were already awaited by PR 4. `SweepDuty.run` already returns
+    // `void | Promise<void>` and `runDutyBody` already awaits it, so a duty
+    // body turning async needs no driver-side change at all. Not one line of
+    // this file moves in PR 5b.
+    //
+    // The measurement did move, and the ratchet has to follow it or the next
+    // unrelated PR fails on 11 lines of headroom. 1,439 by this measure
+    // (1,438 by `wc -l`), which is +29 on the 1,410 above, all of it landed
+    // between that measurement and PR 5b's base 75736c04 —
+    // `git log --numstat 75736c04 -- src/host-sweep.ts`, three commits:
+    //  - 388153827 (+11/-1): a detached follow-up failure keeps its duty
+    //    classification — driver-owned error accounting, beside the error rule.
+    //  - 598ad4736 (+7/-2): seam-3 PR 0's promise lint — `void`+`.catch()`
+    //    wrappers on fire-and-forget calls the driver already made.
+    //  - 7c0d6010b (+26/-12): seam-3 PR 4's leaf flip — `await` on the four
+    //    sessions/agent-groups reads above, which prettier re-wrapped.
+    // None of it is a duty body: no duty originates here, no registration
+    // surface is called inline, and the export allowlist is unchanged — the
+    // three structural assertions above, which are the criterion.
+    //
+    // Section breakdown, in `split('\n')` elements, is the 1,410 list above
+    // plus that +29 (error rule + SLA hooks + kill follow-ups + windowedRunner
+    // 182 → 192; driver start/stop/sweep/sweepOnce 253 → 258; sweepSession +
+    // helpers 262 → 276; every other section unchanged), summing to 1,439.
+    //
+    // Ratchet raised 1,450 → 1,480: measured (1,439) + 41, the same
+    // measured-plus-headroom rule 1,400 and 1,450 were set by, and under the
+    // 50-line cap the rule allows. Headroom nobody has audited is headroom a
+    // duty body can come home into, which is the one thing this number exists
+    // to catch.
+    expect(source.split('\n').length).toBeLessThanOrEqual(1480);
+    expect(h.spawns).toEqual([]);
+  });
+
+  // ── F-14.3 (seam 3 PR 5b, async-central-db plan §4.6) ────────────────────────
+  //
+  // The exclusive `session:health` window is a registry `claims()` ordering over
+  // the session MAILBOX (`runIn` → `windowedRunner`), NOT a central-DB
+  // transaction — and PR 5b must never make it one. A `db.transaction` around
+  // `runIn` or `killContainer` would hold `BEGIN IMMEDIATE` across a container
+  // stop and a mailbox open: upstream's own rule (src/db/driver.ts, "never await
+  // mailbox, container, adapter, or network work while a central transaction is
+  // open"), and under the async driver the 10 s watchdog would roll the
+  // transaction back while the kill kept running.
+  //
+  // Structural, in the style of the F-14.x checks above, and receiver-agnostic
+  // on purpose: `src/db/transaction-closures.test.ts` already resolves WHICH
+  // handle every `.transaction(` call holds. What that file cannot say is
+  // whether a call sits inside one, which is the property this case pins. The
+  // scan is AST, not text, so a closure spanning many lines is still seen.
+  it('no central db.transaction wraps runIn or killContainer', async () => {
+    const ts = await import('typescript');
+    const FILES = ['src/host-sweep.ts', 'src/modules/sweep-container-health/index.ts'] as const;
+    const GUARDED = ['runIn', 'killContainer'] as const;
+
+    const offenders: string[] = [];
+    const seen: string[] = [];
+
+    for (const rel of FILES) {
+      const text = fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8');
+      const sf = ts.createSourceFile(rel, text, ts.ScriptTarget.Latest, true);
+
+      /** `x.transaction(...)` — the shape both a raw handle and the driver use. */
+      const isTransactionCall = (node: import('typescript').Node): boolean =>
+        ts.isCallExpression(node) &&
+        ts.isPropertyAccessExpression(node.expression) &&
+        node.expression.name.text === 'transaction';
+
+      /** The callee name of a call, whether bare or a property access. */
+      const calleeName = (node: import('typescript').CallExpression): string | null => {
+        if (ts.isIdentifier(node.expression)) return node.expression.text;
+        if (ts.isPropertyAccessExpression(node.expression)) return node.expression.name.text;
+        return null;
+      };
+
+      const walk = (node: import('typescript').Node, insideTransaction: boolean): void => {
+        const nowInside = insideTransaction || isTransactionCall(node);
+        if (ts.isCallExpression(node)) {
+          const name = calleeName(node);
+          if (name && (GUARDED as readonly string[]).includes(name)) {
+            const line = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1;
+            seen.push(`${rel}:${line} ${name}`);
+            if (nowInside) offenders.push(`${rel}:${line} ${name}() inside a .transaction(...) closure`);
+          }
+        }
+        ts.forEachChild(node, (child) => walk(child, nowInside));
+      };
+      walk(sf, false);
+    }
+
+    expect(
+      offenders,
+      'a central transaction now wraps a mailbox open or a container kill — plan §4.6 forbids it: ' +
+        'the session:health window is a claims() ordering, not a transaction.',
+    ).toEqual([]);
+
+    // Not vacuous: the walker really does find both call shapes it is guarding.
+    expect(seen.some((s) => s.endsWith('runIn'))).toBe(true);
+    expect(seen.some((s) => s.endsWith('killContainer'))).toBe(true);
     expect(h.spawns).toEqual([]);
   });
 
