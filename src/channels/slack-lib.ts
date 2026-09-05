@@ -186,12 +186,24 @@ function envSuffix(slug: string): string {
 export const DEFAULT_SLACK_CHANNEL_TYPE = 'slack';
 
 /**
- * slug → the fork's channel type. The empty slug (and the literal 'slack')
- * is the default adapter, which carries no suffix anywhere.
+ * slug → the fork's channel type.
+ *
+ * ONLY the empty slug is the default adapter. `'slack'` is a perfectly legal
+ * slug — it is what `normalizeName` returns for an agent named "Slack" — and
+ * it maps to `slack-slack`, a separate adapter with its own
+ * `SLACK_BOT_TOKEN_SLACK`. Treating it as the default instead would point the
+ * token helpers at the unsuffixed `SLACK_BOT_TOKEN`, so provisioning that
+ * agent would overwrite the install's existing default Slack app credentials
+ * rather than creating a new bot.
+ *
+ * The asymmetry with `slugForSlackChannelType` is deliberate and not a broken
+ * round trip: that direction takes a CHANNEL TYPE, where `slack` really is
+ * the default adapter and its slug really is empty. Every non-empty slug
+ * round-trips exactly.
  */
 export function slackChannelTypeForSlug(slug: string): string {
   const trimmed = slug.trim();
-  if (!trimmed || trimmed === DEFAULT_SLACK_CHANNEL_TYPE) return DEFAULT_SLACK_CHANNEL_TYPE;
+  if (!trimmed) return DEFAULT_SLACK_CHANNEL_TYPE;
   return `${DEFAULT_SLACK_CHANNEL_TYPE}-${trimmed}`;
 }
 

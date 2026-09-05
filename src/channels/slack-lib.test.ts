@@ -267,15 +267,29 @@ describe('appTokenKeyForChannelType', () => {
 
 describe('slackChannelTypeForSlug / slugForSlackChannelType', () => {
   it('round-trips a slug through the channel type', () => {
-    for (const slug of ['zulu', 'growth-bot', 'research-2']) {
+    for (const slug of ['zulu', 'growth-bot', 'research-2', 'slack']) {
       expect(slugForSlackChannelType(slackChannelTypeForSlug(slug))).toBe(slug);
     }
   });
 
-  it('treats the empty slug and the literal default as the unsuffixed adapter', () => {
+  it('reserves only the empty slug for the unsuffixed adapter', () => {
     expect(slackChannelTypeForSlug('')).toBe('slack');
-    expect(slackChannelTypeForSlug('slack')).toBe('slack');
     expect(slugForSlackChannelType('slack')).toBe('');
+  });
+
+  it('an agent named "Slack" gets its own adapter, not the default one', () => {
+    // normalizeName('Slack') is the legal slug 'slack'. Mapping it onto the
+    // default channel type would point the token helpers at the unsuffixed
+    // SLACK_BOT_TOKEN, and provisioning would overwrite the install's existing
+    // default Slack app instead of creating a new bot.
+    const channelType = slackChannelTypeForSlug(normalizeName('Slack'));
+    expect(channelType).toBe('slack-slack');
+    expect(botTokenKeyForChannelType(channelType)).toBe('SLACK_BOT_TOKEN_SLACK');
+    expect(appTokenKeyForChannelType(channelType)).toBe('SLACK_APP_TOKEN_SLACK');
+    expect(botTokenKeyForChannelType(channelType)).not.toBe(botTokenKeyForChannelType('slack'));
+    expect(parseSlackWorkspaces({ SLACK_BOT_TOKEN_SLACK: 'xoxb', SLACK_APP_TOKEN_SLACK: 'xapp' })[0].channelType).toBe(
+      'slack-slack',
+    );
   });
 });
 
@@ -287,7 +301,7 @@ describe('slackChannelTypeForSlug / slugForSlackChannelType', () => {
  * failure mode the SLACK_ENV_PATTERN comment in slack.ts records.
  */
 describe('slug ↔ env suffix ↔ channel type, pinned against parseSlackWorkspaces', () => {
-  const slugs = ['zulu', 'growth-bot', 'research-2', normalizeName('Research 2'), normalizeName('Demo Bot')];
+  const slugs = ['zulu', 'growth-bot', 'research-2', 'slack', normalizeName('Research 2'), normalizeName('Demo Bot')];
 
   it.each(slugs)('a %s token pair parses back to slackChannelTypeForSlug of the same slug', (slug) => {
     const channelType = slackChannelTypeForSlug(slug);
