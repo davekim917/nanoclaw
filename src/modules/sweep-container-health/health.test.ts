@@ -974,7 +974,14 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
     expect(healRows(inDb)).toHaveLength(0);
 
     expect(await _sweepProviderHealForTesting(mailbox, fakeSession(), 'group-folder', FAILED)).toBe(true);
-    expect(mockKillContainer).toHaveBeenCalledWith('sess-test', 'provider-failed-selfheal', expect.any(Function));
+    expect(mockKillContainer).toHaveBeenCalledWith(
+      'sess-test',
+      'provider-failed-selfheal',
+      expect.any(Function),
+      // The heal is a restart, so it carries the durable respawn promise —
+      // unlike the ceiling kill, whose `onExit` is bookkeeping only.
+      'respawn_after_stop',
+    );
   });
 
   it('cancels the debounce when a healthy status lands in between', async () => {
@@ -1019,7 +1026,14 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
     const { outDb, mailbox } = makeSessionDbs();
     await twoFailedTicks(mailbox, outDb);
     expect(mockMarkProviderUnavailable).not.toHaveBeenCalled();
-    expect(mockKillContainer).toHaveBeenCalledWith('sess-test', 'provider-failed-selfheal', expect.any(Function));
+    expect(mockKillContainer).toHaveBeenCalledWith(
+      'sess-test',
+      'provider-failed-selfheal',
+      expect.any(Function),
+      // The heal is a restart, so it carries the durable respawn promise —
+      // unlike the ceiling kill, whose `onExit` is bookkeeping only.
+      'respawn_after_stop',
+    );
   });
 
   it('holds off inside the 10-minute cooldown', async () => {
@@ -1470,7 +1484,14 @@ describe('provider self-heal claims the health phase and the later branches do n
     await _sweepSessionForTesting(session);
 
     expect(mockKillContainer).toHaveBeenCalledTimes(1);
-    expect(mockKillContainer).toHaveBeenCalledWith('sess-health', 'provider-failed-selfheal', expect.any(Function));
+    expect(mockKillContainer).toHaveBeenCalledWith(
+      'sess-health',
+      'provider-failed-selfheal',
+      expect.any(Function),
+      // The heal is a restart, so it carries the durable respawn promise —
+      // unlike the ceiling kill, whose `onExit` is bookkeeping only.
+      'respawn_after_stop',
+    );
     // Not reaped, not killed for the ceiling or a stuck claim.
     for (const wrongReason of ['scheduled-task-idle', 'chat-idle-reap', 'absolute-ceiling', 'claim-stuck']) {
       expect(mockKillContainer).not.toHaveBeenCalledWith('sess-health', wrongReason, expect.anything());
@@ -1550,7 +1571,14 @@ describe('registered S11/S14/S16 entries reach their bodies', () => {
     // Two consecutive ticks — the debounce s11.claims() itself advances.
     expect(await s11.claims!(ctx)).toBe(false);
     expect(await s11.claims!(ctx)).toBe(true);
-    expect(mockKillContainer).toHaveBeenCalledWith('sess-test', 'provider-failed-selfheal', expect.any(Function));
+    expect(mockKillContainer).toHaveBeenCalledWith(
+      'sess-test',
+      'provider-failed-selfheal',
+      expect.any(Function),
+      // The heal is a restart, so it carries the durable respawn promise —
+      // unlike the ceiling kill, whose `onExit` is bookkeeping only.
+      'respawn_after_stop',
+    );
 
     // run() is the no-op log branch taken when claims() already handled it.
     expect(() => s11.run(ctx)).not.toThrow();

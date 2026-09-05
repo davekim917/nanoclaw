@@ -235,8 +235,25 @@ const activeContainers = new Map<
  */
 const pendingAdoptions = new Set<string>();
 
+/**
+ * Sessions this process has promised to bring back — the in-memory shadow of
+ * the `respawn_after_stop` rows it wrote itself.
+ *
+ * Exists so the discharge is free for every wake that owes nothing: without it
+ * `clearRespawnIntentOnWake` would put a central-DB write in front of every
+ * ordinary message-driven spawn. Empty at boot by construction, which is right:
+ * a promise made by a PREVIOUS host is owed to `honorPendingStopIntents`, not
+ * to this set.
+ */
+const respawnIntents = new Set<string>();
+
 export function _resetAdoptionRetryStateForTesting(): void {
   pendingAdoptions.clear();
+}
+
+/** Test-only: drop this process's record of outstanding respawn promises. */
+export function _resetStopIntentStateForTesting(): void {
+  respawnIntents.clear();
 }
 
 /**
@@ -1021,6 +1038,14 @@ function trackWake(sessionId: string, run: () => Promise<boolean>): Promise<bool
       log.warn('wakeContainer failed — host-sweep will retry', { sessionId, err });
       return false;
     })
+    .then((woke) => {
+      // The one place every wake ends, which is why the discharge sits here
+      // rather than in each respawning caller's callback: those are all
+      // fire-and-forget `void wakeContainer(...)`, so the callback resolving
+      // says nothing about whether a container actually came back.
+      if (woke) clearRespawnIntentOnWake(sessionId);
+      return woke;
+    })
     .finally(() => {
       if (wakePromises.get(sessionId) === tracked) wakePromises.delete(sessionId);
       settlePendingKill(sessionId);
@@ -1746,7 +1771,23 @@ function stopRunningContainer(sessionId: string, reason: string, onExit: Contain
 }
 
 /**
+ * What a caller owes the session after the stop.
+ *
+ * `'respawn_after_stop'` is a PROMISE: this host will bring the session back,
+ * and if it dies before doing so the next boot must finish the job. `'stop'`
+ * means the session is meant to stay down. The two are not inferable from the
+ * presence of an `onExit` callback — several callers pass one purely for
+ * bookkeeping (`killThenFollowUp` resets orphaned claims and writes the ceiling
+ * accounting for a kill that must STAY stopped), so the caller states it.
+ */
+export type StopIntent = 'stop' | 'respawn_after_stop';
+
+/**
  * Kill a container for a session, INCLUDING one that is still spawning.
+ *
+ * `intent` records what the caller owes the session, durably, BEFORE the stop
+ * is issued — it defaults to `'stop'`, so a caller has to opt in to a promise
+ * it is going to keep.
  *
  * Three states, and only the third is a no-op:
  *   - running: stop it, and `onExit` fires on the process close, as always.
@@ -1757,17 +1798,22 @@ function stopRunningContainer(sessionId: string, reason: string, onExit: Contain
  *     fire. Callers rely on that — `container-restart` treats "not running" as
  *     "this restart did not happen" rather than as an exit.
  */
-export function killContainer(sessionId: string, reason: string, onExit?: ContainerExitCallback): void {
+export function killContainer(
+  sessionId: string,
+  reason: string,
+  onExit?: ContainerExitCallback,
+  intent: StopIntent = 'stop',
+): void {
   if (!activeContainers.has(sessionId)) {
     if (!isContainerSpawning(sessionId)) return;
-    recordStopIntent(sessionId, onExit);
+    recordStopIntent(sessionId, intent);
     const pending = pendingKills.get(sessionId) ?? { reason, onExit: [] };
     if (onExit) pending.onExit.push(onExit);
     pendingKills.set(sessionId, pending);
     log.info('Container kill deferred — a wake is in flight for this session', { sessionId, reason });
     return;
   }
-  recordStopIntent(sessionId, onExit);
+  recordStopIntent(sessionId, intent);
   stopRunningContainer(sessionId, reason, onExit ? [onExit] : []);
 }
 
@@ -1780,11 +1826,13 @@ export function killContainer(sessionId: string, reason: string, onExit?: Contai
  * restart entirely, and the operator saw "rebuild applied" with nothing coming
  * back. `honorPendingStopIntents()` consumes the row at the next startup.
  *
- * `onExit` is the whole signal. A caller that supplied one wants the session
- * back — that is what `respawn_after_stop` means — and a caller that did not
- * wants it down. Putting the write HERE rather than at each caller is the
- * point: `killContainer` is the single door every stop goes through, so no
- * caller can forget to arm the recovery.
+ * The intent comes from the CALLER, not from the presence of an `onExit`
+ * callback. Several callers pass one for bookkeeping alone — the ceiling kill
+ * resets orphaned claims and posts its accounting through `onExit`, and it must
+ * stay stopped — so deriving the promise from the callback would resurrect
+ * every one of those sessions at the next boot. Routing the write through this
+ * one door is still the point: `killContainer` is the single stop every caller
+ * goes through, so no caller can forget to ARM a recovery it did promise.
  *
  * Not awaited, because `killContainer` is synchronous and every one of its
  * callers depends on that. `shadowWrite` already swallows its own failures, so
@@ -1792,10 +1840,33 @@ export function killContainer(sessionId: string, reason: string, onExit?: Contai
  * intent that lost its race with a host crash is exactly as recoverable as one
  * that was never written.
  */
-function recordStopIntent(sessionId: string, onExit?: ContainerExitCallback): void {
-  void shadowWrite('stop-intent', () =>
-    setStopIntent(sessionId, onExit ? 'respawn_after_stop' : 'stop', new Date().toISOString()),
-  );
+function recordStopIntent(sessionId: string, intent: StopIntent): void {
+  if (intent === 'respawn_after_stop') respawnIntents.add(sessionId);
+  else respawnIntents.delete(sessionId);
+  void shadowWrite('stop-intent', () => setStopIntent(sessionId, intent, new Date().toISOString()));
+}
+
+/**
+ * Discharge a respawn promise this process made, now that the session has a
+ * container again.
+ *
+ * Without this only `honorPendingStopIntents` ever clears the row, so a restart
+ * that COMPLETED normally leaves `respawn_after_stop` behind and every later
+ * boot replays it — waking a session nobody asked for, once per restart,
+ * forever.
+ *
+ * Gated on `respawnIntents` so an ordinary message-driven wake costs no central
+ * DB write: the set holds only the promises THIS process made and has not yet
+ * discharged. A promise made by a host that died is not in it, which is
+ * correct — that one belongs to `honorPendingStopIntents` at the next boot, and
+ * it clears the row itself.
+ *
+ * Whoever woke the session discharges the promise: the promise is "this session
+ * gets a container back", so a wake from any source satisfies it.
+ */
+function clearRespawnIntentOnWake(sessionId: string): void {
+  if (!respawnIntents.delete(sessionId)) return;
+  void shadowWrite('stop-intent-clear', () => setStopIntent(sessionId, null, new Date().toISOString()));
 }
 
 /**
@@ -1892,7 +1963,7 @@ export async function honorPendingStopIntents(
       // The kill never completed — the container outlived the host that
       // ordered it. Re-issue the kill with the respawn re-armed.
       log.info('Re-issuing interrupted restart', { sessionId: session.id });
-      killContainer(session.id, 'restart-intent-recovery', () => void respawn());
+      killContainer(session.id, 'restart-intent-recovery', () => void respawn(), 'respawn_after_stop');
     } else {
       await respawn();
     }

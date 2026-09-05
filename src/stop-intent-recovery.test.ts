@@ -48,6 +48,37 @@ vi.mock('./container-runtime.js', async (importOriginal) => ({
   CONTAINER_RUNTIME_BIN: ABSENT_CONTAINER_RUNTIME_BIN,
 }));
 
+// The image deps-drift check is a `docker inspect` round-trip, which a unit
+// test must not make and which the absent runtime binary above turns into a
+// hard spawn refusal. Answer it as "in sync": the completed-restart case needs
+// a respawn that actually reaches `docker run`.
+vi.mock('./agent-runner-image-check.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./agent-runner-image-check.js')>()),
+  checkAgentRunnerDepsDrift: async (imageRef: string) => ({
+    ok: true,
+    imageRef,
+    expected: 'test',
+    actual: 'test',
+    lookup: { kind: 'found' as const, value: 'test' },
+    retried: false,
+    message: 'in sync',
+  }),
+}));
+
+// The OneCLI gateway apply and the secret assignment are live control-API
+// round-trips on every spawn. Answered as "applied, nothing to assign"; the
+// gateway contract has its own suites, and a spawn that cannot reach it is
+// refused before it ever registers.
+vi.mock('./onecli-apply.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./onecli-apply.js')>()),
+  applyOnecliContainerConfig: async () => ({ applied: true, attempts: 1, durationsMs: [0], diagnosis: null }),
+}));
+vi.mock('./onecli-secrets.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./onecli-secrets.js')>()),
+  ensureOnecliAgent: async () => undefined,
+  applyOnecliSecrets: async () => undefined,
+}));
+
 /** Parks the wake at its first await, so a kill can arrive mid-spawn. */
 const hooks = vi.hoisted(() => ({
   storageGate: null as Promise<void> | null,
@@ -115,6 +146,7 @@ import {
   wakeContainer,
   _markPendingAdoptionForTesting,
   _resetAdoptionRetryStateForTesting,
+  _resetStopIntentStateForTesting,
 } from './container-runner.js';
 import { getSessionClaim, setStopIntent } from './db/coordination.js';
 import { closeDb, getDb, initDb } from './db/connection.js';
@@ -223,6 +255,7 @@ describe('durable stop intent', () => {
   beforeEach(async () => {
     hooks.reset();
     _resetAdoptionRetryStateForTesting();
+    _resetStopIntentStateForTesting();
     vi.mocked(log.info).mockClear();
     vi.mocked(log.warn).mockClear();
     // A real, fully migrated central DB rather than a hand-rolled subset: the
@@ -283,28 +316,84 @@ describe('durable stop intent', () => {
     return { release, wake };
   }
 
-  it('killContainer records a respawn intent when an onExit is supplied, and a plain stop otherwise', async () => {
-    await seedSession('sess-respawn');
-    await seedSession('sess-plain');
+  it('a ceiling kill with a bookkeeping onExit records `stop`, not `respawn_after_stop`', async () => {
+    await seedSession('sess-ceiling');
+    const parked = await parkSpawningWake('sess-ceiling');
 
-    const respawning = await parkSpawningWake('sess-respawn');
-    killContainer('sess-respawn', 'restart with a message', () => {});
+    // The shape `killThenFollowUp` uses in sweep-container-health: an `onExit`
+    // that resets the orphaned claims and posts the ceiling accounting, and
+    // nothing that brings the session back. Deriving the promise from the
+    // callback's PRESENCE would resurrect this session at the next boot.
+    const bookkeeping: string[] = [];
+    killContainer('sess-ceiling', 'absolute-ceiling', () => {
+      bookkeeping.push('reset-claims-and-account');
+    });
+
     // The write is a `shadowWrite` fired without an await — `killContainer` is
     // synchronous and every caller depends on that — so let it settle.
-    await vi.waitFor(async () => expect(await storedIntent('sess-respawn')).toBe('respawn_after_stop'));
-    respawning.release();
-    await respawning.wake;
+    await vi.waitFor(async () => expect(await storedIntent('sess-ceiling')).toBe('stop'));
+    parked.release();
+    await parked.wake;
 
-    const plain = await parkSpawningWake('sess-plain');
-    killContainer('sess-plain', 'thread close');
-    await vi.waitFor(async () => expect(await storedIntent('sess-plain')).toBe('stop'));
-    plain.release();
-    await plain.wake;
+    // The callback still ran; it simply says nothing about the durable intent.
+    expect(bookkeeping).toEqual(['reset-claims-and-account']);
+    expect(await storedIntent('sess-ceiling')).toBe('stop');
+  });
 
-    // `onExit` is the whole signal: a caller that supplied one wants the
-    // session back, and only that intent arms a respawn at the next boot.
-    expect(await storedIntent('sess-respawn')).toBe('respawn_after_stop');
-    expect(await storedIntent('sess-plain')).toBe('stop');
+  it('a restart-with-message records `respawn_after_stop`', async () => {
+    await seedSession('sess-restart-msg');
+    const parked = await parkSpawningWake('sess-restart-msg');
+
+    // The shape `ncl groups restart --message` and `restartAgentGroupContainers`
+    // use: the same callback shape as the ceiling kill above, and the opposite
+    // durable intent — which is the whole point of it being explicit.
+    killContainer('sess-restart-msg', 'restarted via ncl', () => {}, 'respawn_after_stop');
+
+    await vi.waitFor(async () => expect(await storedIntent('sess-restart-msg')).toBe('respawn_after_stop'));
+    parked.release();
+    await parked.wake;
+  });
+
+  it('a completed restart leaves no pending intent for the next boot', async () => {
+    await seedSession('sess-completed');
+    const parked = await parkSpawningWake('sess-completed');
+
+    // Production shape end to end: kill with a respawn promise, the callback
+    // wakes the session, the wake succeeds.
+    let respawn: Promise<boolean> | null = null;
+    killContainer(
+      'sess-completed',
+      'restarted via ncl',
+      () => {
+        respawn = wakeContainer(callerSnapshot('sess-completed'));
+      },
+      'respawn_after_stop',
+    );
+    await vi.waitFor(async () => expect(await storedIntent('sess-completed')).toBe('respawn_after_stop'));
+
+    parked.release();
+    await parked.wake;
+    await vi.waitFor(() => expect(respawn).not.toBeNull());
+    // The discharge is gated on a wake that SUCCEEDED, so the case is only
+    // meaningful once this is true. A refused respawn has to leave the promise
+    // standing instead, which is what the clears-only-on-success case covers.
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- guarded by the waitFor above
+    await expect(respawn!).resolves.toBe(true);
+
+    // Nothing is owed any more, so the row must not survive: only
+    // `honorPendingStopIntents` used to clear it, which meant a restart that
+    // COMPLETED normally was replayed at every later boot, forever.
+    await vi.waitFor(async () => expect(await storedIntent('sess-completed')).toBeNull());
+
+    const replayed: string[] = [];
+    await honorPendingStopIntents(
+      async (session) => {
+        replayed.push(session.id);
+        return true;
+      },
+      () => false,
+    );
+    expect(replayed).toEqual([]);
   });
 
   it('a host that died between the wake write and the kill re-issues the kill at the next boot', async () => {

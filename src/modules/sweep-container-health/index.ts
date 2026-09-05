@@ -205,9 +205,16 @@ function applyProviderHeal(
  * which is the ordering the heal has always relied on.
  */
 function killForProviderHeal(session: Session): void {
-  killContainer(session.id, 'provider-failed-selfheal', () => {
-    void wakeContainer(session, 'interactive', { guard: sessionStillActive(session.id) });
-  });
+  killContainer(
+    session.id,
+    'provider-failed-selfheal',
+    () => {
+      void wakeContainer(session, 'interactive', { guard: sessionStillActive(session.id) });
+    },
+    // The heal is a restart: the wake row is already durable, so a host that
+    // dies before the respawn still owes the session a container.
+    'respawn_after_stop',
+  );
 }
 
 /**

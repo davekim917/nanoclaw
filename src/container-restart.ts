@@ -901,6 +901,10 @@ export async function restartAgentGroupContainers(
             void wakeContainer(session, 'interactive', { guard: sessionStillActive(session.id) });
           }
         : undefined,
+      // The durable half of the same decision. The branch above is the only
+      // one that brings the session back, so it is the only one that may
+      // promise a boot after this host dies that it still owes a respawn.
+      wakeMessage || hasPending || options.respawnAll ? 'respawn_after_stop' : 'stop',
     );
     restarted += 1;
   }
