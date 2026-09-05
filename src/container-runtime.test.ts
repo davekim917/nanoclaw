@@ -17,10 +17,16 @@ vi.mock('./log.js', () => ({
   isSurvivableIoError: vi.fn(() => false),
 }));
 
-// Mock child_process — store the mock fn so tests can configure it
+// Mock child_process — store the mock fns so tests can configure them. The
+// adoption helpers use the argv forms (`execFileSync`, `spawn`) so a container
+// name never meets a shell; the legacy helpers use the string form.
 const mockExecSync = vi.fn();
+const mockExecFileSync = vi.fn();
+const mockSpawn = vi.fn();
 vi.mock('child_process', () => ({
   execSync: (...args: unknown[]) => mockExecSync(...args),
+  execFileSync: (...args: unknown[]) => mockExecFileSync(...args),
+  spawn: (...args: unknown[]) => mockSpawn(...args),
 }));
 
 import {
@@ -31,6 +37,9 @@ import {
   cleanupOrphans,
   cleanupOrphansStrict,
   listInstallContainersWithScope,
+  killContainerHard,
+  runtimeShowsRunning,
+  waitForContainerExit,
 } from './container-runtime.js';
 import {
   CONTAINER_GROUP_LABEL_KEY,
@@ -235,5 +244,85 @@ describe('listInstallContainersWithScope', () => {
     });
 
     expect(() => listInstallContainersWithScope()).toThrow(/prove install-scoped container absence/);
+// --- adoption helpers (seam 4 series E) ---
+
+describe('runtimeShowsRunning', () => {
+  it('is true only for an exact-name match', () => {
+    // The runtime's `name=` filter is a substring match, so a listing for
+    // `nanoclaw-v2-a-1` can carry `nanoclaw-v2-a-10` too.
+    mockExecFileSync.mockReturnValueOnce('nanoclaw-v2-a-10\nnanoclaw-v2-a-1\n');
+    expect(runtimeShowsRunning('nanoclaw-v2-a-1')).toBe(true);
+
+    mockExecFileSync.mockReturnValueOnce('nanoclaw-v2-a-10\n');
+    expect(runtimeShowsRunning('nanoclaw-v2-a-1')).toBe(false);
+
+    mockExecFileSync.mockReturnValueOnce('');
+    expect(runtimeShowsRunning('nanoclaw-v2-a-1')).toBe(false);
+
+    expect(mockExecFileSync).toHaveBeenCalledWith(
+      CONTAINER_RUNTIME_BIN,
+      [
+        'ps',
+        '--filter',
+        `label=${CONTAINER_INSTALL_LABEL}`,
+        '--filter',
+        'name=nanoclaw-v2-a-1',
+        '--format',
+        '{{.Names}}',
+      ],
+      expect.objectContaining({ encoding: 'utf-8' }),
+    );
+    expect(mockExecSync).not.toHaveBeenCalled();
+  });
+
+  it('a listing failure throws (not false)', () => {
+    mockExecFileSync.mockImplementationOnce(() => {
+      throw new Error('Cannot connect to the Docker daemon');
+    });
+    // "Cannot prove absence" is never "absent": the caller picks its closed side.
+    expect(() => runtimeShowsRunning('nanoclaw-v2-a-1')).toThrow('Cannot connect to the Docker daemon');
+  });
+
+  it('an invalid name is refused before any subprocess', () => {
+    expect(() => runtimeShowsRunning('foo; rm -rf /')).toThrow('Invalid container name');
+    expect(() => runtimeShowsRunning('')).toThrow('Invalid container name');
+    expect(mockExecFileSync).not.toHaveBeenCalled();
+    expect(mockSpawn).not.toHaveBeenCalled();
+  });
+});
+
+describe('waitForContainerExit', () => {
+  it('spawns `docker wait <name>` with argv, no shell', () => {
+    const child = { pid: 4242 };
+    mockSpawn.mockReturnValueOnce(child);
+
+    expect(waitForContainerExit('nanoclaw-v2-a-1')).toBe(child);
+
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+    const [bin, args, options] = mockSpawn.mock.calls[0] as [string, string[], { shell?: unknown; stdio: unknown }];
+    expect(bin).toBe(CONTAINER_RUNTIME_BIN);
+    expect(args).toEqual(['wait', 'nanoclaw-v2-a-1']);
+    expect(options.shell).toBeUndefined();
+    expect(options.stdio).toEqual(['ignore', 'pipe', 'pipe']);
+    expect(mockExecSync).not.toHaveBeenCalled();
+  });
+
+  it('an invalid name is refused before any subprocess', () => {
+    expect(() => waitForContainerExit('foo$(whoami)')).toThrow('Invalid container name');
+    expect(mockSpawn).not.toHaveBeenCalled();
+  });
+});
+
+describe('killContainerHard', () => {
+  it('issues `docker kill <name>` with argv', () => {
+    killContainerHard('nanoclaw-v2-a-1');
+    expect(mockExecFileSync).toHaveBeenCalledWith(CONTAINER_RUNTIME_BIN, ['kill', 'nanoclaw-v2-a-1'], {
+      stdio: 'pipe',
+    });
+  });
+
+  it('an invalid name is refused before any subprocess', () => {
+    expect(() => killContainerHard('foo`id`')).toThrow('Invalid container name');
+    expect(mockExecFileSync).not.toHaveBeenCalled();
   });
 });
