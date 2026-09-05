@@ -15,8 +15,8 @@ vi.mock('./config.js', async (importOriginal) => ({
   WORKGROUP_SHARED_FS: false,
 }));
 
-vi.mock('./log.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('./log.js')>()),
+vi.mock('./log.js', () => ({
+  setLogScrubber: vi.fn(),
   log: {
     debug: vi.fn(),
     info: vi.fn(),
@@ -24,6 +24,7 @@ vi.mock('./log.js', async (importOriginal) => ({
     error: vi.fn(),
     fatal: vi.fn(),
   },
+  isSurvivableIoError: vi.fn(() => false),
 }));
 
 import { buildMounts } from './container-runner.js';

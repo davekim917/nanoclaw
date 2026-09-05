@@ -19,19 +19,11 @@ vi.mock('./session-manager.js', async (importOriginal) => ({
     path.join(heartbeatRoot, `${agentGroupId}__${sessionId}.heartbeat`),
 }));
 
-/**
- * Partial, not wholesale: `log.js` also exports `setLogScrubber`, which
- * `secret-scrubber.ts` reaches for at import time through this module's own
- * dependency graph. Replacing the module outright makes that import throw
- * before a single case runs.
- */
-vi.mock('./log.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('./log.js')>();
-  return {
-    ...actual,
-    log: { ...actual.log, info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
-  };
-});
+vi.mock('./log.js', () => ({
+  setLogScrubber: vi.fn(),
+  log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
+  isSurvivableIoError: vi.fn(() => false),
+}));
 
 import { log } from './log.js';
 import { RESTART_WARN_HEARTBEAT_FRESH_MS, warnSessionIfWorkInFlight } from './host-restart-warn.js';

@@ -1,14 +1,14 @@
 import { afterEach, describe, expect, it, beforeEach, vi } from 'vitest';
 
-// Only the wake-admission block below needs this; nothing else in the file
-// asserts on logs. The refusal's log line is the ONLY observable difference —
-// an unguarded wakeContainer also resolves false here, by throwing on the
-// uninitialized DB and being caught, so asserting the return value alone
-// passes whether or not the guard exists.
-vi.mock('./log.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('./log.js')>();
-  return { ...actual, log: { ...actual.log, warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() } };
-});
+// Only the wake-admission block below needs this; an unguarded wakeContainer
+// also resolves false here by throwing on the uninitialized DB and being caught.
+// The refusal's log line is the only observable difference, so the return
+// value alone passes whether or not the guard exists.
+vi.mock('./log.js', () => ({
+  setLogScrubber: vi.fn(),
+  isSurvivableIoError: vi.fn(() => false),
+  log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
+}));
 
 // getMemoryAdmission() sizes its budget from a `docker info` probe at first
 // use. That is a real daemon round-trip from a unit test — the hermeticity

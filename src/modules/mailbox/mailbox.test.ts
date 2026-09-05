@@ -35,9 +35,10 @@ vi.mock('../../config.js', async (importOriginal) => ({
   DATA_DIR: `${TEST_ROOT}/data`,
 }));
 
-vi.mock('../../log.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../log.js')>()),
+vi.mock('../../log.js', () => ({
+  setLogScrubber: vi.fn(),
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
+  isSurvivableIoError: vi.fn(() => false),
 }));
 
 import { getAgentMailbox } from '../../mailbox/index.js';
