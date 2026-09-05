@@ -255,7 +255,7 @@ describe('F-4.1 — each prune duty deletes exactly the rows its retention windo
       )
       .run();
 
-    pruneDashboardTokens();
+    await pruneDashboardTokens();
 
     const remaining = getRawDb().prepare('SELECT token_hmac FROM dashboard_tokens ORDER BY token_hmac').all() as {
       token_hmac: string;
