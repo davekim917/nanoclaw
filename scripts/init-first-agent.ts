@@ -216,7 +216,7 @@ async function main(): Promise<void> {
 
   // 1. User + (conditional) owner grant.
   const userId = namespacedUserId(args.channel, args.userId);
-  upsertUser({
+  await upsertUser({
     id: userId,
     kind: args.channel,
     display_name: args.displayName,
@@ -264,11 +264,11 @@ async function main(): Promise<void> {
   //  - member: no role grant, just the membership row below.
   // grantRole inserts a new row per call — idempotence check against
   // getUserRoles prevents duplicates on re-runs.
-  const existingRoles = getUserRoles(userId);
+  const existingRoles = await getUserRoles(userId);
   if (args.role === 'owner') {
     const alreadyOwner = existingRoles.some((r) => r.role === 'owner' && r.agent_group_id === null);
     if (!alreadyOwner) {
-      grantRole({
+      await grantRole({
         user_id: userId,
         role: 'owner',
         agent_group_id: null,
@@ -281,7 +281,7 @@ async function main(): Promise<void> {
   } else if (args.role === 'admin') {
     const alreadyAdmin = existingRoles.some((r) => r.role === 'admin' && r.agent_group_id === ag.id);
     if (!alreadyAdmin) {
-      grantRole({
+      await grantRole({
         user_id: userId,
         role: 'admin',
         agent_group_id: ag.id,
@@ -295,7 +295,7 @@ async function main(): Promise<void> {
   // yes/no even for users without a role grant. INSERT OR IGNORE, so this
   // is a no-op when the row already exists (e.g. re-runs, owners whose
   // access already passes via role).
-  addMember({
+  await addMember({
     user_id: userId,
     agent_group_id: ag.id,
     added_by: null,

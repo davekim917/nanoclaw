@@ -95,7 +95,7 @@ async function main(): Promise<void> {
   const now = new Date().toISOString();
 
   // 1. Synthetic CLI user + owner grant if none exists.
-  upsertUser({
+  await upsertUser({
     id: CLI_SYNTHETIC_USER_ID,
     kind: CLI_CHANNEL,
     display_name: args.displayName,

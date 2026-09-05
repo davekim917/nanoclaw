@@ -28,7 +28,7 @@ import { getAdminsOfAgentGroup, getGlobalAdmins, getOwners } from '../permission
  * answer it (observed live: the card landed in a teammate's DM while the
  * owner saw nothing). Admins remain as reachability fallback only.
  */
-function escalationApprovers(agentGroupId: string): string[] {
+async function escalationApprovers(agentGroupId: string): Promise<string[]> {
   const ordered: string[] = [];
   const seen = new Set<string>();
   const add = (id: string): void => {
@@ -37,9 +37,9 @@ function escalationApprovers(agentGroupId: string): string[] {
       ordered.push(id);
     }
   };
-  for (const r of getOwners()) add(r.user_id);
-  for (const r of getGlobalAdmins()) add(r.user_id);
-  for (const r of getAdminsOfAgentGroup(agentGroupId)) add(r.user_id);
+  for (const r of await getOwners()) add(r.user_id);
+  for (const r of await getGlobalAdmins()) add(r.user_id);
+  for (const r of await getAdminsOfAgentGroup(agentGroupId)) add(r.user_id);
   return ordered;
 }
 
@@ -92,7 +92,7 @@ export async function applyOwnerEscalation(
     title: `🚩 Escalation from ${agentName}`,
     question,
     deliveryTarget: 'admin',
-    approvers: escalationApprovers(session.agent_group_id),
+    approvers: await escalationApprovers(session.agent_group_id),
   });
   if (!delivered) {
     // requestApproval already notified the agent about the specific failure.

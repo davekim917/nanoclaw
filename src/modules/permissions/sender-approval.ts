@@ -92,12 +92,12 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
   // flipping back to request_approval) occupies the
   // UNIQUE(messaging_group_id, sender_identity) key this flow needs — clear
   // it so the in-flight check and the row insert see a clean slate.
-  clearDeclineStamp(messagingGroupId, senderIdentity);
+  await clearDeclineStamp(messagingGroupId, senderIdentity);
 
   // In-flight dedup: don't spam the admin if the same unknown sender
   // retries while a card is already pending. A replay of the retained event
   // stays deferred; a later, different message is intentionally dropped.
-  const existing = getInFlightSenderApproval(messagingGroupId, senderIdentity);
+  const existing = await getInFlightSenderApproval(messagingGroupId, senderIdentity);
   if (existing) {
     log.debug('Unknown-sender approval already in flight — dropping retry', {
       messagingGroupId,
@@ -106,7 +106,7 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
     return isSameInboundEvent(existing.original_message, event);
   }
 
-  const approvers = pickApprover(agentGroupId);
+  const approvers = await pickApprover(agentGroupId);
   if (approvers.length === 0) {
     log.warn('Unknown-sender approval skipped — no owner or admin configured', {
       messagingGroupId,
@@ -142,7 +142,7 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
   const question = `${senderDisplay} wants to talk to your agent in ${originName}. ${AGENT_ACCESS_SCOPE_WARNING} Allow?`;
   const options = normalizeOptions(APPROVAL_OPTIONS);
 
-  const created = createPendingSenderApproval({
+  const created = await createPendingSenderApproval({
     id: approvalId,
     messaging_group_id: messagingGroupId,
     agent_group_id: agentGroupId,
@@ -156,7 +156,7 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
     options_json: JSON.stringify(options),
   });
   if (!created) {
-    const raced = getInFlightSenderApproval(messagingGroupId, senderIdentity);
+    const raced = await getInFlightSenderApproval(messagingGroupId, senderIdentity);
     return raced ? isSameInboundEvent(raced.original_message, event) : false;
   }
 
@@ -229,7 +229,7 @@ const UNKNOWN_SENDER_KEY = 'unknown';
  * a teammate's DM while the owner saw nothing. Admins stay on as
  * reachability fallback.
  */
-function fyiRecipients(agentGroupId: string | null): string[] {
+async function fyiRecipients(agentGroupId: string | null): Promise<string[]> {
   const ordered: string[] = [];
   const seen = new Set<string>();
   const add = (id: string): void => {
@@ -238,10 +238,10 @@ function fyiRecipients(agentGroupId: string | null): string[] {
       ordered.push(id);
     }
   };
-  for (const r of getOwners()) add(r.user_id);
-  for (const r of getGlobalAdmins()) add(r.user_id);
+  for (const r of await getOwners()) add(r.user_id);
+  for (const r of await getGlobalAdmins()) add(r.user_id);
   if (agentGroupId) {
-    for (const r of getAdminsOfAgentGroup(agentGroupId)) add(r.user_id);
+    for (const r of await getAdminsOfAgentGroup(agentGroupId)) add(r.user_id);
   }
   return ordered;
 }
@@ -255,9 +255,9 @@ function nonEmpty(name: string | null | undefined): string | null {
  * First owner with a display_name, for the decline copy. Used only when the
  * FYI recipient is not itself an owner we can name — see declineAndNotify.
  */
-function ownerDisplayName(): string | null {
-  for (const owner of getOwners()) {
-    const name = getUser(owner.user_id)?.display_name;
+async function ownerDisplayName(): Promise<string | null> {
+  for (const owner of await getOwners()) {
+    const name = (await getUser(owner.user_id))?.display_name;
     if (name && name.length > 0) return name;
   }
   return null;
@@ -307,7 +307,7 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
   // Dedupe: at most one decline + FYI per (sender, messaging group) per 24h,
   // or per (conversation) when the caller supplies its own key.
   const senderKey = input.dedupeKey ?? senderIdentity ?? UNKNOWN_SENDER_KEY;
-  const stampedAt = getDeclineStampAt(messagingGroupId, senderKey);
+  const stampedAt = await getDeclineStampAt(messagingGroupId, senderKey);
   if (stampedAt && Date.now() - new Date(stampedAt).getTime() < DECLINE_NOTIFY_DEDUPE_MS) {
     log.debug('decline_notify deduped — declined within the last 24h', { messagingGroupId, senderIdentity });
     return;
@@ -333,7 +333,7 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
     // the 7-day prune with nothing left to resolve it. Close it first, and
     // only for a real card row — a stamp being refreshed has no receipt of
     // its own, and its body is the sentinel, not an event.
-    const existing = getInFlightSenderApproval(messagingGroupId, senderKey);
+    const existing = await getInFlightSenderApproval(messagingGroupId, senderKey);
     if (existing && !isDeclineStampId(existing.id)) {
       try {
         completeDeferredInbound(JSON.parse(existing.original_message) as InboundEvent);
@@ -345,7 +345,7 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
         });
       }
     }
-    upsertDeclineStamp({
+    await upsertDeclineStamp({
       messaging_group_id: messagingGroupId,
       agent_group_id: stampAgentGroupId,
       sender_identity: senderKey,
@@ -382,7 +382,7 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
   // composing first told the stranger they had reached one owner's agent while
   // a different owner got the notice — the wrong name disclosed to someone we
   // are in the middle of refusing.
-  const approvers = fyiRecipients(agentGroupId);
+  const approvers = await fyiRecipients(agentGroupId);
   const target =
     approvers.length > 0
       ? // Same-channel-type only: the FYI names a sender identity originating
@@ -410,9 +410,9 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
   // another owner's name: falling through to `ownerDisplayName()` there would
   // reintroduce exactly the mismatch this ordering exists to prevent, telling
   // the stranger they reached one owner while a different one is notified.
-  const ownerIds = new Set(getOwners().map((r) => r.user_id));
+  const ownerIds = new Set((await getOwners()).map((r) => r.user_id));
   const targetIsOwner = target !== null && ownerIds.has(target.userId);
-  const namedOwner = targetIsOwner ? nonEmpty(getUser(target.userId)?.display_name) : ownerDisplayName();
+  const namedOwner = targetIsOwner ? nonEmpty((await getUser(target.userId))?.display_name) : await ownerDisplayName();
   const declineText =
     input.declineText ?? `I'm ${namedOwner ?? 'my owner'}'s personal agent — I can't help you directly.`;
   let declined = true;

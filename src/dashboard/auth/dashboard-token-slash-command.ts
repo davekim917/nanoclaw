@@ -76,7 +76,7 @@ export async function dashboardTokenSlashCommand(event: SlashCommandEvent): Prom
   // member, can mint their own read-only login link. Everyone else is denied
   // — the token binds to the invoker's identity, so this is not "mint for
   // anyone," only "mint for yourself."
-  if (!isAnyAdmin(userId) && !hasAnyMembership(userId)) {
+  if (!(await isAnyAdmin(userId)) && !(await hasAnyMembership(userId))) {
     await postEphemeralViaResponseUrl(responseUrl, "You don't have dashboard access. Ask an admin to add you.");
     return;
   }
@@ -84,7 +84,7 @@ export async function dashboardTokenSlashCommand(event: SlashCommandEvent): Prom
   // dashboard_tokens.user_id is FK'd to users(id) — ensure the row exists
   // before minting (same upsert shape the chat-inbound path uses in
   // modules/permissions/index.ts's extractAndUpsertUser).
-  upsertUser({
+  await upsertUser({
     id: userId,
     kind: event.adapter.name,
     display_name: event.user.fullName || event.user.userName || null,

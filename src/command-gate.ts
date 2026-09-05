@@ -88,7 +88,7 @@ function stripLeadingMentions(text: string): string {
  * Handles INTERCEPT_COMMANDS (e.g. /dashboard-token) and FILTERED_COMMANDS.
  * ADMIN_COMMANDS are NOT intercepted here — they flow through to gateCommand at fan-out.
  */
-export function preFanoutGate(content: string, userId: string): GateResult {
+export async function preFanoutGate(content: string, userId: string): Promise<GateResult> {
   let text: string;
   try {
     const parsed = JSON.parse(content);
@@ -121,7 +121,8 @@ export function preFanoutGate(content: string, userId: string): GateResult {
       // their own read-only login link — they just can't mint one for anyone
       // else (the token binds to ctx.userId). A user with neither an admin
       // role nor any agent_group_members row still gets denied.
-      if (!isAnyAdmin(userId) && !hasAnyMembership(userId)) return { action: 'deny', command, leadingMention };
+      if (!(await isAnyAdmin(userId)) && !(await hasAnyMembership(userId)))
+        return { action: 'deny', command, leadingMention };
     }
     return { action: 'intercept', handlerName: intercept.handlerName, command, args, leadingMention };
   }

@@ -78,11 +78,11 @@ function describeAuthority(userId: string, agentGroupId: string): string {
   return parts.length > 0 ? parts.join(', ') : 'none';
 }
 
-function ensureUserExists(userId: string): void {
-  if (getUser(userId)) return;
+async function ensureUserExists(userId: string): Promise<void> {
+  if (await getUser(userId)) return;
   const [kind] = userId.split(':', 1);
   // createUser shape matches upsertUser; upsert is no-op safe.
-  upsertUser({ id: userId, kind: kind ?? 'unknown', display_name: null, created_at: new Date().toISOString() });
+  await upsertUser({ id: userId, kind: kind ?? 'unknown', display_name: null, created_at: new Date().toISOString() });
   void createUser; // imported for parity; upsertUser is the idempotent path.
 }
 
@@ -147,14 +147,14 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
     return;
   }
 
-  ensureUserExists(targetUserId);
+  await ensureUserExists(targetUserId);
 
   if (role === 'member') {
     if (isMember(targetUserId, targetAgentGroupId) || hasAdminPrivilege(targetUserId, targetAgentGroupId)) {
       await notifyAgent(session, `\`${targetUserId}\` already has access to \`${targetAgentGroupId}\`.`);
       return;
     }
-    addMember({
+    await addMember({
       user_id: targetUserId,
       agent_group_id: targetAgentGroupId,
       added_by: callerId,
@@ -177,7 +177,7 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
     await notifyAgent(session, `\`${targetUserId}\` is already admin of \`${targetAgentGroupId}\`.`);
     return;
   }
-  grantRole({
+  await grantRole({
     user_id: targetUserId,
     role: 'admin',
     agent_group_id: targetAgentGroupId,
@@ -245,11 +245,11 @@ export async function handleRevokeAccess(content: Record<string, unknown>, sessi
 
   let revoked = false;
   if (isMember(targetUserId, targetAgentGroupId)) {
-    removeMember(targetUserId, targetAgentGroupId);
+    await removeMember(targetUserId, targetAgentGroupId);
     revoked = true;
   }
   if (isAdminOfAgentGroup(targetUserId, targetAgentGroupId)) {
-    revokeRole(targetUserId, 'admin', targetAgentGroupId);
+    await revokeRole(targetUserId, 'admin', targetAgentGroupId);
     revoked = true;
   }
 
@@ -274,10 +274,10 @@ export async function handleListAccess(content: Record<string, unknown>, session
     return;
   }
 
-  const owners = getOwners();
-  const globalAdmins = getGlobalAdmins();
-  const scopedAdmins = getAdminsOfAgentGroup(targetAgentGroupId);
-  const members = getMembers(targetAgentGroupId);
+  const owners = await getOwners();
+  const globalAdmins = await getGlobalAdmins();
+  const scopedAdmins = await getAdminsOfAgentGroup(targetAgentGroupId);
+  const members = await getMembers(targetAgentGroupId);
 
   const lines: string[] = [`Access for \`${targetAgentGroupId}\`:`];
   lines.push(`  owners (global): ${owners.length ? owners.map((r) => r.user_id).join(', ') : '(none)'}`);

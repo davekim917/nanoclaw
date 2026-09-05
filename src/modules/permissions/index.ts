@@ -77,7 +77,7 @@ interface PendingNameInput {
 }
 const awaitingNameInput = new Map<string, PendingNameInput>();
 
-function extractAndUpsertUser(event: InboundEvent): string | null {
+async function extractAndUpsertUser(event: InboundEvent): Promise<string | null> {
   let content: Record<string, unknown>;
   try {
     content = JSON.parse(event.message.content) as Record<string, unknown>;
@@ -104,8 +104,8 @@ function extractAndUpsertUser(event: InboundEvent): string | null {
   if (!rawHandle) return null;
 
   const userId = rawHandle.includes(':') ? rawHandle : `${event.channelType}:${rawHandle}`;
-  if (!getUser(userId)) {
-    upsertUser({
+  if (!(await getUser(userId))) {
+    await upsertUser({
       id: userId,
       kind: event.channelType,
       display_name: senderName ?? null,
@@ -268,7 +268,7 @@ setAccessGate(async (event, userId, mg, agentGroupId, effectiveThreadId): Promis
     };
   }
 
-  const decision = canAccessAgentGroup(userId, agentGroupId);
+  const decision = await canAccessAgentGroup(userId, agentGroupId);
   if (decision.allowed) {
     return { allowed: true };
   }
@@ -305,10 +305,15 @@ setAccessGate(async (event, userId, mg, agentGroupId, effectiveThreadId): Promis
  * canAccessAgentGroup accepts (owner, admin, or group member).
  */
 setSenderScopeGate(
-  (_event: InboundEvent, userId: string | null, _mg: MessagingGroup, agent: MessagingGroupAgent): AccessGateResult => {
+  async (
+    _event: InboundEvent,
+    userId: string | null,
+    _mg: MessagingGroup,
+    agent: MessagingGroupAgent,
+  ): Promise<AccessGateResult> => {
     if (agent.sender_scope === 'all') return { allowed: true };
     if (!userId) return { allowed: false, reason: 'unknown_user_scope' };
-    const decision = canAccessAgentGroup(userId, agent.agent_group_id);
+    const decision = await canAccessAgentGroup(userId, agent.agent_group_id);
     if (decision.allowed) return { allowed: true };
     return { allowed: false, reason: `sender_scope_${decision.reason}` };
   },
@@ -329,7 +334,7 @@ setSenderScopeGate(
  * fresh card per ACTION-ITEMS item 5 "no denial persistence").
  */
 async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<boolean> {
-  const row = getPendingSenderApproval(payload.questionId);
+  const row = await getPendingSenderApproval(payload.questionId);
   if (!row) return false;
 
   // payload.userId is the raw platform userId (e.g. "6037840640"); namespace it
@@ -375,7 +380,7 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
     // Void the card the same way a deny does: drop the row (and with it the
     // retained message body) and close out the deferred inbound so it does
     // not sit unresolved.
-    deletePendingSenderApproval(row.id);
+    await deletePendingSenderApproval(row.id);
     completeStoredDeferredInbound(row.original_message);
     return true;
   }
@@ -384,7 +389,7 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
   const approved = payload.value === 'approve';
 
   if (approved) {
-    addMember({
+    await addMember({
       user_id: row.sender_identity,
       agent_group_id: row.agent_group_id,
       added_by: approverId,
@@ -399,7 +404,7 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
 
     // Clear the pending row BEFORE re-routing so the gate check on the
     // second attempt doesn't see the in-flight row and short-circuit.
-    deletePendingSenderApproval(row.id);
+    await deletePendingSenderApproval(row.id);
 
     try {
       const event = JSON.parse(row.original_message) as InboundEvent;
@@ -416,7 +421,7 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
     agentGroupId: row.agent_group_id,
     approverId,
   });
-  deletePendingSenderApproval(row.id);
+  await deletePendingSenderApproval(row.id);
   completeStoredDeferredInbound(row.original_message);
   return true;
 }
@@ -453,7 +458,7 @@ async function wireApprovedChannel(
       messagingGroupId: row.messaging_group_id,
       err,
     });
-    deletePendingChannelApproval(row.messaging_group_id);
+    await deletePendingChannelApproval(row.messaging_group_id);
     return false;
   }
 
@@ -476,7 +481,7 @@ async function wireApprovedChannel(
       messagingGroupId: row.messaging_group_id,
       err,
     });
-    deletePendingChannelApproval(row.messaging_group_id);
+    await deletePendingChannelApproval(row.messaging_group_id);
     completeDeferredInbound(event);
     return false;
   }
@@ -520,9 +525,9 @@ async function wireApprovedChannel(
     approverId,
   });
 
-  const senderUserId = extractAndUpsertUser(event);
+  const senderUserId = await extractAndUpsertUser(event);
   if (senderUserId) {
-    addMember({
+    await addMember({
       user_id: senderUserId,
       agent_group_id: agentGroupId,
       added_by: approverId,
@@ -530,7 +535,7 @@ async function wireApprovedChannel(
     });
   }
 
-  deletePendingChannelApproval(row.messaging_group_id);
+  await deletePendingChannelApproval(row.messaging_group_id);
 
   try {
     await replayDeferredInbound(event);
@@ -586,7 +591,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
   // ── Reject / Cancel ──
   if (payload.value === REJECT_VALUE) {
     await setMessagingGroupDeniedAt(row.messaging_group_id, new Date().toISOString());
-    deletePendingChannelApproval(row.messaging_group_id);
+    await deletePendingChannelApproval(row.messaging_group_id);
     completeStoredDeferredInbound(row.original_message);
     log.info('Channel registration denied', {
       messagingGroupId: row.messaging_group_id,
@@ -613,7 +618,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
     const options = buildAgentSelectionOptions(agentGroups, approverId);
     const title = '📋 Choose an agent';
     const question = `Which agent should handle this channel? ${AGENT_ACCESS_SCOPE_WARNING}`;
-    updatePendingChannelApprovalCard(row.messaging_group_id, title, question, JSON.stringify(options));
+    await updatePendingChannelApprovalCard(row.messaging_group_id, title, question, JSON.stringify(options));
 
     try {
       await adapter.deliver(
@@ -692,7 +697,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
         messagingGroupId: row.messaging_group_id,
         targetAgentGroupId,
       });
-      deletePendingChannelApproval(row.messaging_group_id);
+      await deletePendingChannelApproval(row.messaging_group_id);
       completeStoredDeferredInbound(row.original_message);
       return true;
     }
@@ -724,7 +729,7 @@ registerResponseHandler(handleChannelApprovalResponse);
 // creates the agent immediately, wires the channel, and replays.
 
 registerMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
-  const userId = extractAndUpsertUser(event);
+  const userId = await extractAndUpsertUser(event);
   if (!userId) return false;
 
   const pending = awaitingNameInput.get(userId);

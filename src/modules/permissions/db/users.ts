@@ -19,8 +19,16 @@ export async function upsertUser(user: User): Promise<void> {
   );
 }
 
+/**
+ * The one-row lookup `modules/memory/pre-turn-context.ts` executes on the raw
+ * handle: `buildPreTurnContext` runs inside `writeSessionMessage`'s
+ * synchronous recall block, which must not gain a suspension point (seam-3
+ * plan §4.5, I-1). One constant, two executors — not a `*Sync` twin.
+ */
+export const USER_BY_ID_SQL = 'SELECT * FROM users WHERE id = ?';
+
 export async function getUser(id: string): Promise<User | undefined> {
-  return getDb().get<User>('SELECT * FROM users WHERE id = ?', id);
+  return getDb().get<User>(USER_BY_ID_SQL, id);
 }
 
 export async function getAllUsers(): Promise<User[]> {
