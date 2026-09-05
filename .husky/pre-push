@@ -49,11 +49,11 @@ cleanup() {
       echo "pre-push: failed to remove temporary snapshot" >&2
     fi
   fi
+  remove_file "$commit_message"
   if [ -n "$snapshot_parent" ] && [ -d "$snapshot_parent" ] && ! rmdir "$snapshot_parent"; then
     echo "pre-push: failed to remove temporary snapshot directory" >&2
   fi
   remove_file "$commit_list"
-  remove_file "$commit_message"
   if [ "$worktree_node_modules_link" = 1 ] && [ -L "$worktree_root/node_modules" ] && ! rm "$worktree_root/node_modules"; then
     echo "pre-push: failed to remove worktree node_modules link" >&2
   fi
@@ -108,7 +108,7 @@ snapshot_commit() {
   ln -s "$repo_root/node_modules" "$snapshot_root/node_modules"
   snapshot_node_modules_link=1
 
-  commit_message=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-message.XXXXXX")
+  commit_message="$snapshot_parent/COMMIT_EDITMSG"
   git -C "$worktree_root" show --no-patch --format=%B "$1" > "$commit_message"
   if [ ! -e "$worktree_root/node_modules" ] && [ ! -L "$worktree_root/node_modules" ]; then
     ln -s "$repo_root/node_modules" "$worktree_root/node_modules"

@@ -388,7 +388,27 @@ describe('.husky/pre-push', () => {
     const snapshot = records(f.log)[0].match(/--root ([^ ]+)/)?.[1];
     expect(snapshot).toBeDefined();
     expect(fs.existsSync(snapshot!)).toBe(false);
+    expect(fs.existsSync(path.dirname(snapshot!))).toBe(false);
     expect(runGit(f.root, ['worktree', 'list', '--porcelain'])).not.toContain(snapshot!);
+  });
+
+  it('matches reviewed commit-message exceptions with a stable filename and cleans up each scan', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    fs.writeFileSync(
+      path.join(f.root, '.public-boundary-allowlist.json'),
+      JSON.stringify({ entries: [{ path: 'COMMIT_EDITMSG', value: 'Private Customer', reason: 'synthetic fixture' }] }),
+    );
+    const pushed = commit(f.root, 'clean-tree', 'fix: Private Customer');
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const result = push(f, `refs/heads/current ${pushed} refs/heads/current ${base}\n`);
+      expect(result.status).toBe(0);
+      expect(fs.readdirSync(f.root).some((name) => name.startsWith('nanoclaw-pre-push.'))).toBe(false);
+    }
+    const messages = records(f.log).filter((record) => record.startsWith('message|'));
+    expect(messages).toHaveLength(2);
+    expect(messages.every((record) => record.includes('/COMMIT_EDITMSG --message-raw'))).toBe(true);
   });
 
   it('clears the source Git environment before the boundary gate reads a snapshot index', () => {
