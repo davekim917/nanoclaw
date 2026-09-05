@@ -227,6 +227,36 @@ describe('groups CLI delete cascades dependent rows (#2525)', () => {
     expect(count('SELECT COUNT(*) AS c FROM agent_destinations WHERE agent_group_id = ?', B)).toBe(0);
   });
 
+  it('two overlapping deletes for the same group: one succeeds, the other refuses instead of a hollow cascade', async () => {
+    // github Codex review, PR #437, groups.ts:218: the awaited existence
+    // check before the transaction is a fast-path UX check, not the
+    // authoritative one — two overlapping approved `groups delete` calls for
+    // the same id can both pass it. Without a re-check INSIDE the
+    // transaction, the second caller's cascade runs against an
+    // already-deleted row: every DELETE matches 0 rows, and it would report
+    // `{ ok: true, data: { removed: {...all zeros} } }` as if it succeeded.
+    const GID = 'ag-race';
+    await createAgentGroup({ id: GID, name: 'race', folder: 'race', agent_provider: null, created_at: now() });
+
+    const [first, second] = await Promise.all([
+      dispatch({ id: 'req-del-race-1', command: 'groups-delete', args: { id: GID } }, { caller: 'host' }),
+      dispatch({ id: 'req-del-race-2', command: 'groups-delete', args: { id: GID } }, { caller: 'host' }),
+    ]);
+
+    const outcomes = [first, second];
+    const succeeded = outcomes.filter((o) => o.ok);
+    const failed = outcomes.filter((o) => !o.ok) as { ok: false; error: { code: string; message: string } }[];
+
+    // Exactly one lands; the other gets the same documented not-found error
+    // a delete against an unknown id gets — never a silent no-op success.
+    expect(succeeded).toHaveLength(1);
+    expect(failed).toHaveLength(1);
+    expect(failed[0].error.message).toMatch(/not found/i);
+
+    // The one that landed actually removed the row.
+    expect(count('SELECT COUNT(*) AS c FROM agent_groups WHERE id = ?', GID)).toBe(0);
+  });
+
   it('returns a handler error for an unknown group id', async () => {
     const resp = await dispatch(
       { id: 'req-missing', command: 'groups-delete', args: { id: 'ag-does-not-exist' } },

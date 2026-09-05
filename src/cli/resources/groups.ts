@@ -214,6 +214,13 @@ registerResource({
 
         // Verify the group exists before doing anything — preserves the
         // genericDelete behaviour of throwing "not found" for unknown IDs.
+        // This is a fast-path UX check only, NOT the authoritative one: it is
+        // an awaited read, and two overlapping approved `groups delete` calls
+        // for the same id can both pass it before either's transaction runs.
+        // The re-check inside the transaction below (immediately before any
+        // DELETE) is what actually prevents the second caller from running a
+        // full cascade over an already-deleted row and reporting success with
+        // every count at 0 (github Codex review, PR #437, groups.ts:218).
         const exists = await getDb().get('SELECT 1 FROM agent_groups WHERE id = ? LIMIT 1', id);
         if (!exists) throw new Error(`group not found: ${id}`);
 
@@ -239,6 +246,18 @@ registerResource({
         // they describe exactly what the transaction did, not a separate
         // pre-flight snapshot.
         const cascade = db.transaction((groupId: string) => {
+          // The AUTHORITATIVE existence check — repeated here, inside the
+          // transaction, because the awaited one above can go stale between
+          // two overlapping deletes for the same id. Without this, the
+          // second caller runs the whole cascade below against a row that's
+          // already gone: every DELETE matches 0 rows, and the handler would
+          // return `{ deleted: id, removed: {...all zeros} }` as if it had
+          // succeeded. IMMEDIATE (below, at `.immediate(id)`) has already
+          // taken the writer lock by the time this runs, so nothing can
+          // delete the row out from under this check before the DELETEs run.
+          if (!db.prepare('SELECT 1 FROM agent_groups WHERE id = ?').get(groupId)) {
+            throw new Error(`group not found: ${groupId}`);
+          }
           // Pre-flight: refuse to delete a paired sibling. A workgroup is the
           // data-pool boundary (CLAUDE.md, docs/workgroups.md) — deleting the
           // seed leaves the twin with a dangling workgroup_id, which after
