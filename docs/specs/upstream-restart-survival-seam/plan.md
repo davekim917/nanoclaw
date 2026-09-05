@@ -578,8 +578,9 @@ Body: list with scope → partition into `mustStop` (workgroup id is `null` — 
 
 ```
 const changed = workgroups.filter(id => memoryWouldChange(id) || (WORKGROUP_SHARED_FS && sharedWouldChange(id)));
+const survivable = partitionBootScope(changed).survivable;   // D1 exposes the partition; empty until D2 flips
+await warnMarkedRunningSessionsOfStartup(reason, survivable) // BEFORE the stop pass — main's order, see the note below
 const scope   = await quiesceWorkgroupsForBootMountChange(changed);
-await warnMarkedRunningSessionsOfStartup(...)          // unchanged, still :304
 if (WORKGROUP_SHARED_FS) reconcileWorkgroupSharedDirs(db, { workgroupIds: changed });
 const memoryReports = runWorkgroupMemoryStartupGate(db, { workgroupIds: changed });
 pruneAgentRunnerSnapshots();
@@ -588,6 +589,8 @@ pruneAgentRunnerSnapshots();
 `runWorkgroupMemoryStartupGate` keeps `ensureContainerRuntimeRunning()` and `reconcileWorkgroupMemory`, and drops `cleanupOrphansStrict()` — the quiescence has already happened, in one place, with its scope proved.
 
 **Ordering and safety.** Four properties, each asserted:
+
+**Correction (2026-09-05, D1 review round 4 on #440, fork issue #441).** Revision 1 of this block put the startup warn _after_ the door. That regressed main's order: a long sequential stop pass (longer than `RESTART_WARN_HEARTBEAT_FRESH_MS`, 120 s) ages out heartbeat-only evidence before the warn runs, so an early-stopped session with a pushed follow-up gets no `host-restart-*` note. The warn therefore keeps main's position — before the stop pass — and takes its skip set from the door's _partition_ (the sessions whose containers will survive), computed before anything is stopped; D2's narrowed stop set does not change the argument. §7.G's parameter is that survivable set, not a post-adoption set.
 
 1. **Nothing mutates before the quiescence returns.** This fixes divergence 4 as a side effect: `reconcileWorkgroupSharedDirs` moves from `:289` (before the proof) to after it.
 2. **The predicate never under-reports.** Its acceptance test compares it against the observed `changed` flag on a fixture matrix, and a mismatch fails the build.
@@ -814,7 +817,7 @@ In `src/modules/sweep-container-health/`:
 
 `src/host-restart-warn.ts:326-334`, `warnActiveContainersOfShutdown(reason)` gains a required `stoppingSessionIds: ReadonlySet<string>` and iterates that instead of `getActiveContainerSessionIds()`. Required rather than optional: an omitted argument would silently restore today's fleet-wide behavior, and the whole point of the change is that "every tracked container" and "every container being stopped" have stopped being the same set. The call at `src/main.ts:648` passes the set `beginContainerShutdown()` will actually stop — spawning entries only, in the steady state.
 
-`src/host-restart-warn.ts:340-348`, `warnMarkedRunningSessionsOfStartup(reason)` gains `adoptedSessionIds: ReadonlySet<string>` and skips them. Its call moves from `src/main.ts:304` to after `adoptRunningSessions()`, which is what makes the set knowable. That move is also a correctness fix independent of the note text: today the warn runs against `getRunningSessions()` before anything has proved which of those sessions still have containers.
+`src/host-restart-warn.ts:340-348`, `warnMarkedRunningSessionsOfStartup(reason)` gains `survivableSessionIds: ReadonlySet<string>` and skips them. Its call does **not** move (correction 2026-09-05, see §7.D): it stays in main's position, before the boot stop pass, because a long stop pass ages out heartbeat-only evidence and the early-stopped sessions would otherwise get no note (#441). The set is knowable there because it comes from the door's partition — the sessions whose containers will survive this boot — computed from the runtime listing before anything is stopped, not from adoption. Adoption (E) consumes the same partition; a survivor whose adoption is later lost keeps running untracked and is not interrupted, so its absent note is correct.
 
 `src/host-restart-warn.ts:1-35`, the module header. Its second paragraph ("Every host start stops all install-labeled containers — graceful shutdown via `stopAllContainers`, startup via `cleanupOrphansStrict`") describes precisely the world seam 4 removes, and it is the paragraph a future reader would reason from. Rewritten to state the new rule: a note is for a session whose container this host is stopping or has found dead, never for one it adopted. The "Known residual" paragraph gains the survivor case — a session adopted while genuinely mid-turn gets no note, which is correct, because nothing interrupted it.
 
@@ -822,12 +825,12 @@ In `src/modules/sweep-container-health/`:
 
 **Acceptance tests** — in `src/host-restart-warn.test.ts`:
 
-- _"an adopted session gets no startup note"_ — the milestone-1 case.
+- _"a session whose container will survive gets no startup note"_ — the milestone-1 case.
 - _"a session marked running whose container did not survive still gets one"_ — proving G narrowed and did not disable.
 - _"the shutdown warn covers only the sessions being stopped"_ — two tracked sessions, one in the stopping set; assert exactly one note.
 - _"an empty stopping set writes no notes"_ — the steady-state restart.
 - _"the work-in-flight signals are unchanged"_ — the existing spam-guard cases pass unmodified, including the heartbeat-plus-`provider_executing` pair and the deliberate exclusion of narration.
-- _"the dedupe id still collapses the shutdown and startup notes for one interruption"_ — the `:277-283` minute-bucket contract, which G must not break by moving the startup call later.
+- _"the dedupe id still collapses the shutdown and startup notes for one interruption"_ — the `:277-283` minute-bucket contract.
 
 **Rollback.** Revert; both call sites return to their fleet-wide form. No durable state.
 
