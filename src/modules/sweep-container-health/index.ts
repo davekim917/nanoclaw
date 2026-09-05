@@ -31,9 +31,9 @@ import {
   isContainerSpawning,
   killContainer,
   sessionStillActive,
-  wakeContainer,
   containerOwnsOutbound,
 } from '../../container-runner.js';
+import { requestWake } from '../../request-wake.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 import { type ForkContainerStateRow as ContainerState, type NanoclawMailboxSession } from '../mailbox/index.js';
@@ -209,7 +209,7 @@ function killForProviderHeal(session: Session): void {
     session.id,
     'provider-failed-selfheal',
     () => {
-      void wakeContainer(session, 'interactive', { guard: sessionStillActive(session.id) });
+      void requestWake(session, 'container-restart', { priority: 'interactive', guard: sessionStillActive(session.id) });
     },
     // The heal is a restart: the wake row is already durable, so a host that
     // dies before the respawn still owes the session a container.

@@ -716,8 +716,8 @@ export async function applyRepositoryRefreshAction(content: Record<string, unkno
         senderId: 'system',
       }),
     });
-    const { wakeContainer } = await import('../../container-runner.js');
-    await wakeContainer(session);
+    const { requestWake } = await import('../../request-wake.js');
+    await requestWake(session, 'inbound-message');
     throw error;
   }
 }
