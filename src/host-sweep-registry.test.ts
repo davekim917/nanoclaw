@@ -1470,10 +1470,9 @@ describe('sweep duty registry (S2-PR2)', () => {
     // body turning async needs no driver-side change at all. Not one line of
     // this file moves in PR 5b.
     //
-    // The measurement did move, and the ratchet has to follow it or the next
-    // unrelated PR fails on 11 lines of headroom. 1,439 by this measure
-    // (1,438 by `wc -l`), which is +29 on the 1,410 above, all of it landed
-    // between that measurement and PR 5b's base 75736c04 —
+    // The MEASUREMENT moved; the ceiling deliberately does not. 1,439 by this
+    // measure (1,438 by `wc -l`), which is +29 on the 1,410 above, all of it
+    // landed between that measurement and PR 5b's base 75736c04 —
     // `git log --numstat 75736c04 -- src/host-sweep.ts`, three commits:
     //  - 388153827 (+11/-1): a detached follow-up failure keeps its duty
     //    classification — driver-owned error accounting, beside the error rule.
@@ -1490,12 +1489,14 @@ describe('sweep duty registry (S2-PR2)', () => {
     // 182 → 192; driver start/stop/sweep/sweepOnce 253 → 258; sweepSession +
     // helpers 262 → 276; every other section unchanged), summing to 1,439.
     //
-    // Ratchet raised 1,450 → 1,480: measured (1,439) + 41, the same
-    // measured-plus-headroom rule 1,400 and 1,450 were set by, and under the
-    // 50-line cap the rule allows. Headroom nobody has audited is headroom a
-    // duty body can come home into, which is the one thing this number exists
-    // to catch.
-    expect(source.split('\n').length).toBeLessThanOrEqual(1480);
+    // **The ceiling stays at 1,450.** A raise is earned by a measured change to
+    // this file, and PR 5b makes none — raising it here would be pure unaudited
+    // headroom, which is precisely the space a duty body comes home into and
+    // the one thing this number exists to catch. Headroom is now 11 lines
+    // (1,450 − 1,439), which is tight on purpose: the next PR that genuinely
+    // grows the driver re-measures and raises with its own reason, exactly as
+    // the 1,300 → 1,400 → 1,450 raises each did.
+    expect(source.split('\n').length).toBeLessThanOrEqual(1450);
     expect(h.spawns).toEqual([]);
   });
 
