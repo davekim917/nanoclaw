@@ -11,9 +11,13 @@
  * `delivery.ts` against the SAME central DB file: fresh module memory, same
  * rows. An in-memory DB would prove nothing, so this suite runs on a file.
  *
- * Bookkeeping is deliberately non-fatal, and two of these cases pin that: a
- * failed record skips the give-up decision for the tick (the message retries)
- * and a failed clear costs only a WARN.
+ * The count is also read BEFORE the adapter runs, so a row a dead host left at
+ * the cap is terminal without spending another attempt or re-sending a message
+ * that had already left that host.
+ *
+ * Bookkeeping is deliberately non-fatal, and three of these cases pin that: a
+ * failed read still delivers, a failed record skips the give-up decision for
+ * the tick (the message retries) and a failed clear costs only a WARN.
  */
 import Database from 'better-sqlite3';
 import fs from 'fs';
@@ -69,6 +73,7 @@ interface Host {
   delivery: typeof import('./delivery.js');
   db: typeof import('./db/index.js');
   sessions: typeof import('./session-manager.js');
+  coord: typeof import('./db/coordination.js');
 }
 
 /** Message ids the adapter must refuse; everything else delivers. */
@@ -110,7 +115,12 @@ async function bootHost(): Promise<Host> {
   await db.initDb(DB_PATH);
   const delivery = await import('./delivery.js');
   delivery.setDeliveryAdapter(adapter);
-  host = { delivery, db, sessions: await import('./session-manager.js') };
+  host = {
+    delivery,
+    db,
+    sessions: await import('./session-manager.js'),
+    coord: await import('./db/coordination.js'),
+  };
   return host;
 }
 
@@ -155,8 +165,21 @@ function insertOutbound(sessionId: string, msgId: string): void {
   db.close();
 }
 
+/** Attempts a previous host recorded — rows only, no module state. */
+async function seedPriorAttempts(messageId: string, sessionId: string, count: number): Promise<void> {
+  for (let i = 0; i < count; i++) {
+    await host!.coord.recordDeliveryAttempt({
+      messageId,
+      sessionId,
+      now: now(),
+      nextAttemptAt: null,
+      error: 'failure from before the restart',
+    });
+  }
+}
+
 /**
- * Make both coordination accessors fail the way a broken bookkeeping write
+ * Make every coordination accessor fail the way a broken bookkeeping write
  * does, without mocking them: the table they address is gone. Injecting the
  * fault in the DB rather than in a module factory keeps the real accessors and
  * the real driver in the path, which matters because the point of this suite
@@ -342,5 +365,50 @@ describe('delivery_attempts is the retry authority', () => {
     expect(fenceRecovery).toHaveBeenCalledTimes(1);
     expect(fenceRecovery.mock.calls[0][0]).toMatchObject({ id: 'out-fenced' });
     expect(fenceRecovery.mock.calls[0][1]).toMatchObject({ id: session.id });
+  });
+
+  it('a stored count at the cap gives up before the adapter is called', async () => {
+    await bootHost();
+    const session = await seedSession();
+    insertOutbound(session.id, 'out-stranded');
+    // The crash window: a previous host recorded the capped attempt and died
+    // before it could write the terminal `delivered` row.
+    await seedPriorAttempts('out-stranded', session.id, 3);
+
+    const { delivery } = await restartHost();
+    expect(await delivery.deliverSessionMessages(session)).toBe('error');
+
+    // The adapter was never consulted, so no fourth attempt and no chance of
+    // re-sending a message the previous host had already put on the wire.
+    expect(attempted).toEqual([]);
+    expect(deliveredRow(session.id, 'out-stranded')?.status).toBe('failed');
+    expect(attemptRow('out-stranded')).toBeUndefined();
+    expect(gaveUpCalls()).toEqual([
+      expect.objectContaining({
+        messageId: 'out-stranded',
+        attempts: 3,
+        decidedFrom: 'a count stored before this host started',
+      }),
+    ]);
+  });
+
+  it('a failed pre-delivery read still delivers', async () => {
+    const { delivery } = await bootHost();
+    const session = await seedSession();
+    insertOutbound(session.id, 'out-readfail');
+    breakAttemptsTable();
+
+    expect(await delivery.deliverSessionMessages(session)).toBe('clean');
+
+    // No stored count is not a reason to hold a message back.
+    expect(attempted).toEqual(['out-readfail']);
+    expect(deliveredRow(session.id, 'out-readfail')?.status).toBe('delivered');
+    expect(
+      logSpy.warn.mock.calls.filter(
+        (c) => c[0] === 'Failed to read delivery attempt row — delivering without a stored count',
+      ),
+    ).toHaveLength(1);
+    expect(gaveUpCalls()).toHaveLength(0);
+    expect(logSpy.error).not.toHaveBeenCalled();
   });
 });
