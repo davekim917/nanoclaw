@@ -250,7 +250,7 @@ function parseMcpServerInput(args: Record<string, unknown>): { config: ParsedMcp
   const url = typeof args.url === 'string' && args.url.trim() ? args.url.trim() : undefined;
 
   if (url !== undefined) {
-    if (command !== undefined) return { error: 'Provide exactly one of command or url' };
+    if (args.command !== undefined) return { error: 'Provide exactly one of command or url' };
     // A declared type that contradicts the fields is a mistake, not something
     // to silently rewrite.
     if (declaredType === 'stdio') return { error: 'type "stdio" cannot be used with url; use "http"' };
@@ -294,6 +294,12 @@ function parseMcpServerInput(args: Record<string, unknown>): { config: ParsedMcp
     if (args.headers === undefined) return { config: { type: 'http', url } };
     const normalized = normalizeMcpHeaders(args.headers);
     if ('error' in normalized) return normalized;
+    if (loopback && Object.values(normalized.headers).some((value) => ONECLI_HEADER_VALUE_RE.test(value))) {
+      return {
+        error:
+          'placeholder headers are not allowed for local MCP servers because the OneCLI gateway cannot inject credentials',
+      };
+    }
     return {
       config: {
         type: 'http',
@@ -303,6 +309,7 @@ function parseMcpServerInput(args: Record<string, unknown>): { config: ParsedMcp
     };
   }
   if (command === undefined) return { error: 'Provide exactly one of command or url' };
+  if (args.url !== undefined) return { error: 'Provide exactly one of command or url' };
   if (declaredType !== undefined && declaredType !== 'stdio') {
     return { error: `type ${JSON.stringify(declaredType)} cannot be used with command; use "stdio" or omit it` };
   }

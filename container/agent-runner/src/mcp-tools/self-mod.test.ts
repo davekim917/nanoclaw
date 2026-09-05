@@ -130,12 +130,22 @@ describe('add_mcp_server remote Streamable HTTP', () => {
 
   it('rejects plain http off-loopback but allows localhost and host.docker.internal', async () => {
     expect((await submit({ name: 'insecure', url: 'http://example.com/mcp' })).error).toContain('HTTPS');
-    expect((await submit({ name: 'local', url: 'http://localhost:8080/mcp' })).payload?.url).toBe(
-      'http://localhost:8080/mcp',
-    );
-    expect((await submit({ name: 'hostgw', url: 'http://host.docker.internal:8080/mcp' })).payload?.url).toBe(
-      'http://host.docker.internal:8080/mcp',
-    );
+    for (const scheme of ['https', 'http']) {
+      for (const host of ['localhost', '127.0.0.1', '[::1]', 'host.docker.internal']) {
+        const url = `${scheme}://${host}:8080/mcp`;
+        expect((await submit({ name: 'local', url })).payload?.url).toBe(url);
+        expect(
+          (await submit({ name: 'local-auth', url, headers: { Authorization: 'Bearer onecli-managed' } })).error,
+        ).toContain('placeholder headers are not allowed');
+      }
+    }
+    expect(
+      (await submit({
+        name: 'local-config',
+        url: 'http://localhost:8080/mcp',
+        headers: { 'Content-Type': 'application/json' },
+      })).payload?.headers,
+    ).toEqual({ 'Content-Type': 'application/json' });
   });
 
   it('rejects credentials, fragments, and credential-shaped query keys', async () => {
@@ -209,6 +219,14 @@ describe('add_mcp_server remote Streamable HTTP', () => {
     expect((await submit({ name: 'both', command: 'node', url: 'https://example.com/mcp' })).error).toContain(
       'exactly one of command or url',
     );
+    for (const secondary of ['', ' ', 1, null]) {
+      expect((await submit({ name: 'both', command: 'node', url: secondary })).error).toContain(
+        'exactly one of command or url',
+      );
+      expect((await submit({ name: 'both', url: 'https://example.com/mcp', command: secondary })).error).toContain(
+        'exactly one of command or url',
+      );
+    }
     expect((await submit({ name: 'mixed', url: 'https://example.com/mcp', env: { K: 'v' } })).error).toContain(
       'only valid with command',
     );

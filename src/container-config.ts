@@ -332,7 +332,7 @@ export function parseMcpServerConfig(input: Record<string, unknown>): ParsedMcpS
   }
 
   if (url !== undefined) {
-    if (command !== undefined) throw new Error('Provide exactly one of command or url');
+    if (input.command !== undefined) throw new Error('Provide exactly one of command or url');
     // A declared type that contradicts the fields is a mistake, not something
     // to silently rewrite — the whole point of parsing strictly is that a
     // pasted vendor snippet fails loudly.
@@ -377,6 +377,11 @@ export function parseMcpServerConfig(input: Record<string, unknown>): ParsedMcpS
       }
     }
     const headers = input.headers === undefined ? undefined : normalizeMcpHeaders(input.headers);
+    if (loopback && headers && Object.values(headers).some(isOneCliPlaceholder)) {
+      throw new Error(
+        'placeholder headers are not allowed for local MCP servers because the OneCLI gateway cannot inject credentials',
+      );
+    }
     return {
       type: 'http',
       url,
@@ -385,6 +390,7 @@ export function parseMcpServerConfig(input: Record<string, unknown>): ParsedMcpS
     };
   }
   if (command === undefined) throw new Error('Provide exactly one of command or url');
+  if (input.url !== undefined) throw new Error('Provide exactly one of command or url');
   if (declaredType !== undefined && declaredType !== 'stdio') {
     throw new Error(`type ${JSON.stringify(declaredType)} cannot be used with command; use "stdio" or omit it`);
   }

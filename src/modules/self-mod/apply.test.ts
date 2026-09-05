@@ -158,4 +158,33 @@ describe('applyAddMcpServer', () => {
     expect(readContainerConfig('agent').mcpServers.leaky).toBeUndefined();
     expect(JSON.parse(getContainerConfig('ag-1')!.mcp_servers).leaky).toBeUndefined();
   });
+
+  it.each([
+    ['a missing name', {}],
+    ['invalid config', { name: 'bad', url: 'https://example.com/mcp?api_key=abc' }],
+  ])('waits to report %s before returning', async (_description, payload) => {
+    let releaseNotification: (() => void) | undefined;
+    vi.mocked(writeSessionMessage).mockImplementationOnce(
+      () => new Promise<void>((resolve) => (releaseNotification = resolve)),
+    );
+    let settled = false;
+    const applying = applyAddMcpServer(payload, session).then(() => {
+      settled = true;
+    });
+
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    releaseNotification!();
+    await applying;
+  });
+
+  it.each([
+    ['a missing name', {}],
+    ['invalid config', { name: 'bad', url: 'https://example.com/mcp?api_key=abc' }],
+  ])('settles when reporting %s fails', async (_description, payload) => {
+    vi.mocked(writeSessionMessage).mockRejectedValueOnce(new Error('session DB unavailable'));
+
+    await expect(applyAddMcpServer(payload, session)).resolves.toBeUndefined();
+    expect(readContainerConfig('agent').mcpServers.bad).toBeUndefined();
+  });
 });
