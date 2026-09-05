@@ -5,6 +5,11 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { allowSubprocess, enforceHermeticity } from '../src/test-hermeticity.js';
+
+allowSubprocess(['bash']);
+enforceHermeticity();
+
 const roots: string[] = [];
 const HELPER = path.resolve('container/skills/pr-review-loop/scripts/codex-review.sh');
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
