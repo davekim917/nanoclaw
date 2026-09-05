@@ -1055,7 +1055,7 @@ function forkOps(
         // still ON its first poll when the host adopted it, and that is exactly
         // what a `processing_ack` read catches.
         //
-        // KNOWN WINDOW, deferred (fork issue #TBD): a survivor that has SELECTED
+        // KNOWN WINDOW, deferred (fork issue #459): a survivor that has SELECTED
         // an `on_wake` row on its first poll but has not yet written the
         // `processing_ack` reads here as unclaimed, so the row can be converted
         // or withdrawn under it. Closing it needs a fence across the host/runner
