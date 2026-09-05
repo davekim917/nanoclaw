@@ -13,10 +13,40 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
  * call `warnSessionIfWorkInFlight` directly) stays the real one.
  */
 const heartbeatRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-restart-warn-'));
+
+/**
+ * The two wrapper suites below go through the real `warnSessions`, so they DO
+ * reach `withExistingMailboxSession`. It resolves an agent-group/session key to
+ * a provisioned mailbox, which on a fixture install is this map — an unknown
+ * key answers `undefined`, exactly as a session with no storage would.
+ */
+const mailboxFixtures = new Map<string, NanoclawMailboxSession>();
+
 vi.mock('./session-manager.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./session-manager.js')>()),
   heartbeatPath: (agentGroupId: string, sessionId: string) =>
     path.join(heartbeatRoot, `${agentGroupId}__${sessionId}.heartbeat`),
+  withExistingMailboxSession: async <T>(
+    agentGroupId: string,
+    sessionId: string,
+    action: (mailbox: NanoclawMailboxSession) => T | Promise<T>,
+  ): Promise<T | undefined> => {
+    const mailbox = mailboxFixtures.get(`${agentGroupId}/${sessionId}`);
+    return mailbox === undefined ? undefined : action(mailbox);
+  },
+}));
+
+/**
+ * Central-DB reads, over fixture rows. Partial mock: every other export stays
+ * real, so nothing else in the import graph loses a binding.
+ */
+const sessionFixtures = new Map<string, Session>();
+const runningSessionFixtures: Session[] = [];
+
+vi.mock('./db/sessions.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./db/sessions.js')>()),
+  getSession: async (id: string) => sessionFixtures.get(id),
+  getRunningSessions: async () => [...runningSessionFixtures],
 }));
 
 vi.mock('./log.js', () => ({
@@ -26,7 +56,12 @@ vi.mock('./log.js', () => ({
 }));
 
 import { log } from './log.js';
-import { RESTART_WARN_HEARTBEAT_FRESH_MS, warnSessionIfWorkInFlight } from './host-restart-warn.js';
+import {
+  RESTART_WARN_HEARTBEAT_FRESH_MS,
+  warnActiveContainersOfShutdown,
+  warnMarkedRunningSessionsOfStartup,
+  warnSessionIfWorkInFlight,
+} from './host-restart-warn.js';
 import { hasRestartNoteSince } from './modules/mailbox/ops/lookups.js';
 import { getContainerState, getProcessingClaims } from './modules/mailbox/ops/sweep.js';
 import { insertDeferredMessageWithContextIfNew } from './modules/mailbox/ops/ingress.js';
@@ -163,6 +198,9 @@ function touchHeartbeat(session: Session, agoMs: number): void {
 
 afterEach(() => {
   for (const entry of fs.readdirSync(heartbeatRoot)) fs.rmSync(path.join(heartbeatRoot, entry), { force: true });
+  mailboxFixtures.clear();
+  sessionFixtures.clear();
+  runningSessionFixtures.length = 0;
   vi.clearAllMocks();
 });
 
@@ -541,5 +579,133 @@ describe('the heartbeat is paired with provider_executing', () => {
 
     expect(warnSessionIfWorkInFlight(mailboxOver(inDb, outDb), session, 'graceful host shutdown')).toBe(true);
     expect(noteRows(inDb)).toHaveLength(1);
+  });
+});
+
+/**
+ * The narrowing itself (seam 4 series G): which sessions each side considers.
+ *
+ * Both wrappers now take the set they apply to rather than deriving it — the
+ * shutdown side the sessions actually being stopped, the startup side the ones
+ * this host adopted and must therefore NOT warn. These cases drive the real
+ * exported wrappers so the set arithmetic is exercised, not just the per-session
+ * predicate the suites above cover.
+ */
+describe('the warn is scoped to the containers this restart interrupts', () => {
+  /** A session with a provisioned mailbox and a fixture row the wrappers can find. */
+  function fixtureSession(id: string): { session: Session; inDb: Database.Database; outDb: Database.Database } {
+    const session = { ...fakeSession(), id };
+    const { inDb, outDb } = makeDbs();
+    sessionFixtures.set(id, session);
+    mailboxFixtures.set(`${session.agent_group_id}/${id}`, mailboxOver(inDb, outDb));
+    return { session, inDb, outDb };
+  }
+
+  /** A durable, freshness-independent work-in-flight signal — true on both paths. */
+  function storeContinuation(outDb: Database.Database, id: string): void {
+    outDb.prepare('INSERT INTO session_state VALUES (?, ?, ?)').run(
+      'work_continuation',
+      JSON.stringify({
+        id,
+        task: 'write the dbt tests',
+        phase: 'queued',
+        chain: 2,
+        resume_attempts: 0,
+        recovery_episode: 0,
+      }),
+      new Date().toISOString(),
+    );
+  }
+
+  it('an adopted session gets no startup note', async () => {
+    // Milestone 1: the container survived the restart, so nothing was
+    // interrupted and there is no lost turn to account for. The central DB
+    // still marks the session running — that mark is the dead host's, which is
+    // exactly why the adopted set has to come from the caller.
+    const { session, inDb, outDb } = fixtureSession('sess-adopted');
+    storeContinuation(outDb, 'cont-adopted');
+    runningSessionFixtures.push(session);
+
+    await warnMarkedRunningSessionsOfStartup('host startup after an unclean stop', new Set([session.id]));
+
+    expect(noteRows(inDb)).toHaveLength(0);
+    expect(noSignalLogCalls(), 'an adopted session is skipped, not evaluated and rejected').toHaveLength(0);
+  });
+
+  it('a session marked running whose container did not survive still gets one', async () => {
+    // G narrowed the set; it did not disable the backstop.
+    const { session, inDb, outDb } = fixtureSession('sess-dead');
+    storeContinuation(outDb, 'cont-dead');
+    runningSessionFixtures.push(session);
+
+    await warnMarkedRunningSessionsOfStartup('host startup after an unclean stop', new Set(['sess-someone-else']));
+
+    expect(noteRows(inDb)).toHaveLength(1);
+  });
+
+  it('the shutdown warn covers only the sessions being stopped', async () => {
+    const stopping = fixtureSession('sess-stopping');
+    const surviving = fixtureSession('sess-surviving');
+    storeContinuation(stopping.outDb, 'cont-stopping');
+    storeContinuation(surviving.outDb, 'cont-surviving');
+
+    await warnActiveContainersOfShutdown('graceful host shutdown', new Set([stopping.session.id]));
+
+    expect(noteRows(stopping.inDb)).toHaveLength(1);
+    expect(noteRows(surviving.inDb), 'a container this shutdown leaves alone is not interrupted').toHaveLength(0);
+  });
+
+  it('an empty stopping set writes no notes', async () => {
+    // The steady-state restart once containers survive it: the host stops
+    // nothing, so it announces nothing.
+    const { inDb, outDb } = fixtureSession('sess-untouched');
+    storeContinuation(outDb, 'cont-untouched');
+
+    await warnActiveContainersOfShutdown('graceful host shutdown', new Set<string>());
+
+    expect(noteRows(inDb)).toHaveLength(0);
+    expect(noSignalLogCalls()).toHaveLength(0);
+  });
+
+  it('the work-in-flight signals are unchanged', async () => {
+    // G changes WHICH sessions are considered, never WHAT counts as work in
+    // flight. Driven through the wrappers so the spam guard is proved intact on
+    // the far side of the new parameters: narration is still not evidence, and
+    // a fresh heartbeat paired with a raised provider_executing still is.
+    const narrating = fixtureSession('sess-narrating');
+    narrating.outDb
+      .prepare("INSERT INTO messages_out (id, seq, timestamp, kind, content) VALUES ('o1', 1, ?, 'status', '{}')")
+      .run(new Date().toISOString());
+
+    const streaming = fixtureSession('sess-streaming');
+    withProviderExecuting(streaming.outDb, 1);
+    touchHeartbeat(streaming.session, 5_000);
+
+    await warnActiveContainersOfShutdown(
+      'graceful host shutdown',
+      new Set([narrating.session.id, streaming.session.id]),
+    );
+
+    expect(noteRows(narrating.inDb)).toHaveLength(0);
+    expect(noteRows(streaming.inDb)).toHaveLength(1);
+    const skipped = noSignalLogCalls();
+    expect(skipped, 'the considered-and-rejected session still leaves its one reason line').toHaveLength(1);
+    expect((skipped[0][1] as { sessionId: string }).sessionId).toBe(narrating.session.id);
+  });
+
+  it('the dedupe id still collapses the shutdown and startup notes for one interruption', async () => {
+    // The minute-bucket contract: both sides derive the SAME id from the
+    // heartbeat mtime, so the second call is a no-op rather than a duplicate.
+    // Moving the startup call later in main() must not break that, which is
+    // why this drives the wrappers rather than the predicate.
+    const { session, inDb, outDb } = fixtureSession('sess-one-interruption');
+    withProviderExecuting(outDb, 1);
+    touchHeartbeat(session, 5_000);
+    runningSessionFixtures.push(session);
+
+    await warnActiveContainersOfShutdown('graceful host shutdown', new Set([session.id]));
+    await warnMarkedRunningSessionsOfStartup('host startup after an unclean stop', new Set<string>());
+
+    expect(noteRows(inDb), 'one interruption, one note').toHaveLength(1);
   });
 });
