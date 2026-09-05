@@ -41,7 +41,13 @@ function fixture(valid: boolean): string {
   fs.renameSync(path.join(root, 'scripts/check-build-clean.ts'), path.join(root, 'scripts/check-build-clean.mts'));
   fs.symlinkSync(path.join(repoRoot, 'node_modules/.bin/tsc'), path.join(root, 'node_modules/.bin/tsc'));
   fs.symlinkSync(path.join(repoRoot, 'node_modules/typescript'), path.join(root, 'node_modules/typescript'));
-  executable(path.join(root, 'node_modules/.bin/eslint'), "printf '[]\\n'");
+  executable(
+    path.join(root, 'node_modules/.bin/eslint'),
+    `case " $* " in
+      *" setup/ "*) printf '[]\\n' ;;
+      *) printf '[{"messages":[{"message":"setup missing from lint gate"}]}]\\n'; exit 1 ;;
+    esac`,
+  );
   executable(
     path.join(root, 'bin/pnpm'),
     `if [ "$1" = run ] && [ "$2" = check:public-boundary ]; then exit 0; fi\nexec /usr/bin/env PATH=${quote(process.env.PATH ?? '')} pnpm "$@"`,
