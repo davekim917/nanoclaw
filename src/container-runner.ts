@@ -77,6 +77,8 @@ import {
   getWorkgroupOnecliSecretsById,
 } from './db/agent-groups.js';
 import { getRawDb, hasTableRaw } from './db/connection.js';
+import { getSessionClaim, releaseSessionClaim, shadowWrite, tryClaimSession } from './db/coordination.js';
+import { getHostInstanceId } from './host-instance.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { getSession, SESSION_BY_ID_SQL } from './db/sessions.js';
 import { buildCentralProjection } from './db/per-agent-projections.js';
@@ -194,8 +196,58 @@ const activeContainers = new Map<
     containerName: string;
     spawnedAt: number;
     storageActivity: StorageActivityLease;
+    /** Incarnation this process claimed in `session_claims` for this runtime. */
+    claimIncarnation?: number;
   }
 >();
+
+// Claimant identity for the session_claims rows: the host's durable lease
+// instance id when the lease is running, else a process-scoped fallback
+// (tests, tools, and any path that runs before startHostInstanceLease()).
+//
+// Fork-forward on upstream: upstream `6b0411c47` shipped the hostname:pid form
+// and its own later commit `692a0b603` ("claims answer to the host-instance
+// lease") replaced it with the lease id. The fork takes the end state directly,
+// so the claimant vocabulary never has to be migrated.
+function claimantId(): string {
+  return getHostInstanceId() ?? `${os.hostname()}:${process.pid}`;
+}
+
+/**
+ * Claim a session this process is about to run. The `session_claims` row is the
+ * authority for which process/incarnation owns a session: losing the
+ * compare-and-set means another live claimant got there first, and the caller
+ * must not start a container for it. Returns the claimed incarnation, or null
+ * when the claim was lost. Throws on a failed write — a claim that cannot be
+ * recorded is a claim not held.
+ *
+ * The liveness half of the fence (refusing a claim held by a LIVE peer host,
+ * and refusing one whose container is still running untracked) lands with
+ * adoption, which is the series that creates those states — plan §4.3.4.
+ */
+async function claimSessionRun(sessionId: string, containerRef: string): Promise<number | null> {
+  const current = await getSessionClaim(sessionId);
+  return tryClaimSession({
+    sessionId,
+    instanceId: claimantId(),
+    expectedIncarnation: current?.incarnation ?? 0,
+    containerRef,
+    now: new Date().toISOString(),
+  });
+}
+
+/** Release our claim at this incarnation. Never throws — a failed release is
+ *  self-healing (the next claimant's CAS supersedes it). */
+async function releaseClaimQuietly(sessionId: string, incarnation: number): Promise<void> {
+  await shadowWrite('session-claim-release', () =>
+    releaseSessionClaim({
+      sessionId,
+      instanceId: claimantId(),
+      incarnation,
+      now: new Date().toISOString(),
+    }),
+  );
+}
 
 /**
  * Sticky set: every session id whose container has *ever* been observed
@@ -1302,34 +1354,61 @@ async function spawnContainer(
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
 
-  // Clear any orphan heartbeat from a previous container instance — the
-  // sweep's ceiling check treats a missing file as "fresh spawn, give grace"
-  // (host-sweep.ts line 87). Without this, the stale mtime can trigger an
-  // immediate kill before the new container touches the file itself.
-  fs.rmSync(heartbeatPath(agentGroup.id, session.id), { force: true });
-
-  // Admission and container preparation are asynchronous. Shutdown may begin
-  // after wakeContainer's entry check but before the process exists; refuse
-  // that late spawn so stopAllContainers cannot miss it in its snapshot.
-  if (containerShutdownInProgress) {
-    throw new Error('Container spawn cancelled because host shutdown is in progress');
+  // THE CROSS-PROCESS SPAWN FENCE. Winning the claim is what licenses touching
+  // this session's runtime state — the heartbeat clear immediately below
+  // included. Losing it means another live claimant runs this session: abort,
+  // and `trackWake` turns the throw into `false` so the sweep re-checks next
+  // tick. A failed write throws for the same reason; a claim that cannot be
+  // recorded is a claim not held.
+  //
+  // This is also the LAST `await` in the spawn path. Everything from here to
+  // `spawn()` is synchronous, so the guard point below and the process creation
+  // stay adjacent — the contract the comment block there states and seam 3
+  // §4.5 I-1 pins.
+  const claimIncarnation = await claimSessionRun(session.id, containerName);
+  if (claimIncarnation === null) {
+    throw new Error(`session ${session.id} is claimed by another live host process — not spawning a duplicate`);
   }
-  // The LAST word before the process exists. Everything above this line awaits,
-  // so a request landing in any of those windows is seen here even though the
-  // earlier check at the reserved spawn boundary already passed. Nothing awaits
-  // between here and `activeContainers.set` below, so a request either loses to
-  // that whole block and is honoured here, or arrives after registration and
-  // takes the ordinary running-container path. `trackWake` settles it either way.
-  const lateCancellation = pendingKillCancellation(session.id);
-  if (lateCancellation) throw lateCancellation;
-  // THE GUARD POINT. Everything above this line awaits — routing writes, the
-  // mailbox context, the dependency check, mount construction, argument
-  // construction — and the caller's precondition was last proved before all of
-  // it. This is the only place in the wake path where "still true?" and "the
-  // process now exists" are adjacent, so this is where the question belongs.
-  const guardRefusal = wakeRefusalFrom(guard);
-  if (guardRefusal !== null) {
-    throw new Error(`Container spawn refused by its guard: ${guardRefusal}`);
+
+  try {
+    // Clear any orphan heartbeat from a previous container instance — the
+    // sweep's ceiling check treats a missing file as "fresh spawn, give grace"
+    // (host-sweep.ts line 87). Without this, the stale mtime can trigger an
+    // immediate kill before the new container touches the file itself.
+    fs.rmSync(heartbeatPath(agentGroup.id, session.id), { force: true });
+
+    // Admission and container preparation are asynchronous. Shutdown may begin
+    // after wakeContainer's entry check but before the process exists; refuse
+    // that late spawn so stopAllContainers cannot miss it in its snapshot.
+    if (containerShutdownInProgress) {
+      throw new Error('Container spawn cancelled because host shutdown is in progress');
+    }
+    // The LAST word before the process exists. Everything above the claim
+    // awaits, so a request landing in any of those windows is seen here even
+    // though the earlier check at the reserved spawn boundary already passed.
+    // Nothing awaits between here and `activeContainers.set` below, so a
+    // request either loses to that whole block and is honoured here, or arrives
+    // after registration and takes the ordinary running-container path.
+    // `trackWake` settles it either way.
+    const lateCancellation = pendingKillCancellation(session.id);
+    if (lateCancellation) throw lateCancellation;
+    // THE GUARD POINT. Everything above the claim awaits — routing writes, the
+    // mailbox context, the dependency check, mount construction, argument
+    // construction — and the caller's precondition was last proved before all of
+    // it. This is the only place in the wake path where "still true?" and "the
+    // process now exists" are adjacent, so this is where the question belongs.
+    const guardRefusal = wakeRefusalFrom(guard);
+    if (guardRefusal !== null) {
+      throw new Error(`Container spawn refused by its guard: ${guardRefusal}`);
+    }
+  } catch (err) {
+    // Every refusal in the block above happens with the claim already held and
+    // no process to release it: hand it back here, or the next legitimate wake
+    // for this session is fenced out by a spawn that never happened. This is
+    // the only `await` between the guard and `spawn()`, and it is unreachable
+    // from the path that reaches `spawn()`.
+    await releaseClaimQuietly(session.id, claimIncarnation);
+    throw err;
   }
   const container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
@@ -1338,6 +1417,7 @@ async function spawnContainer(
     containerName,
     spawnedAt: Date.now(),
     storageActivity,
+    claimIncarnation,
   });
   everSeenRunningSessions.add(session.id);
   // The `running` status write is awaited AFTER the exit handlers below are
@@ -1379,10 +1459,21 @@ async function spawnContainer(
       void markContainerStopped(session.id).catch((err: unknown) =>
         log.warn('markContainerStopped failed after container exit', { sessionId: session.id, err }),
       );
+      // The durable half of the same fence, and a detached tail for the same
+      // reason. The release is scoped to THIS runtime's own incarnation
+      // (`releaseSessionClaim` matches on `claimed_by` AND `incarnation`), so a
+      // release still in flight when a fresh spawn wins the next incarnation
+      // lands as a no-op instead of unclaiming the live container.
+      if (active.claimIncarnation !== undefined) void releaseClaimQuietly(session.id, active.claimIncarnation);
       stopTypingRefresh(session.id);
       return;
     }
 
+    // A terminal event from a runtime the registry has already replaced. It
+    // owns nothing shared any more: releasing its claim would clear the
+    // REPLACEMENT's row and the status write would report a live container
+    // stopped, so only its own storage lease is handed back.
+    log.warn('Ignoring stale session finish', { sessionId: session.id, containerName });
     void storageActivity.release().catch((err) => {
       log.warn('Failed to release untracked container storage activity lease', { sessionId: session.id, err });
     });

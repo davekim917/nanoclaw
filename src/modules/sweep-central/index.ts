@@ -19,6 +19,11 @@
  * host-sweep-registry.test.ts stays an exact accounting of every registered
  * duty, ported or fork-only.
  *
+ * FORK2 coordination-orphans (130) is likewise a fork addition, from seam 4
+ * series A' (issue #430): the coordination tables gained writers, and a write
+ * that lands after session teardown leaves a row no foreign key removes. Last
+ * in the phase because the rows are inert and nothing else here reads them.
+ *
  * T23 cli-request-execution-prune (42) was added later (issue #273's
  * at-most-once ncl ledger): slotted right after T10 since both are
  * order-free receipt/ledger prunes with no dependency on one another (42, not
@@ -38,6 +43,7 @@ import { pruneCliRequestExecutions } from '../../cli/request-ledger.js';
 import { pruneChannelIngressReceipts } from '../../db/channel-ingress-receipts.js';
 import { registerSweepDuty, registerSweepDutySource, SWEEP_DUTY_INVENTORY } from '../../host-sweep.js';
 import { log } from '../../log.js';
+import { sweepCoordinationOrphans } from './coordination-orphans.js';
 import { pruneSteerIdempotency } from './steer-idempotency.js';
 
 function registerCentralSweepDuties(): void {
@@ -155,6 +161,18 @@ function registerCentralSweepDuties(): void {
           /* dashboard module may not be initialized in tests */
         });
     },
+  });
+
+  registerSweepDuty({
+    name: id.FORK2,
+    phase: 'tick:housekeeping',
+    order: 130,
+    // Drop coordination rows whose session no longer exists (issue #430). A
+    // delete that lands while a delivery is mid-flight, or while the spawn path
+    // holds a claim, loses the race and leaves an inert row behind; migration
+    // 071 declares no foreign key. Order-free and last in the phase: the rows
+    // it removes are inert, and nothing else in this window reads them.
+    run: () => sweepCoordinationOrphans(),
   });
 }
 
