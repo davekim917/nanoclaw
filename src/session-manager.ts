@@ -458,7 +458,21 @@ export async function resolveTaskSession(
     created_at: new Date().toISOString(),
   };
 
-  await createSession(session);
+  try {
+    await createSession(session);
+  } catch (err) {
+    // Same race as `resolveSession`: two scheduling operations on one series
+    // can both yield at the lookup; the unique active-session index lets one
+    // insert win, and the loser adopts it (mirrors `resolveActiveSession`).
+    if ((err as { code?: string }).code !== 'SQLITE_CONSTRAINT_UNIQUE') throw err;
+    const winner = await findSystemSession(agentGroupId, threadId);
+    if (!winner) throw err;
+    if (routingPlatformId != null && winner.task_routing_platform_id !== routingPlatformId) {
+      await setTaskRoutingPlatformId(winner.id, routingPlatformId);
+      winner.task_routing_platform_id = routingPlatformId;
+    }
+    return { session: winner, created: false };
+  }
   if (routingPlatformId != null) {
     await setTaskRoutingPlatformId(id, routingPlatformId);
     session.task_routing_platform_id = routingPlatformId;

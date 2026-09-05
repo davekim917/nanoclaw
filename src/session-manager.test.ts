@@ -2583,3 +2583,33 @@ describe('resolveSession under two concurrent first messages (seam 3: the lookup
     expect(rows.n).toBe(1);
   });
 });
+
+describe('resolveTaskSession under two concurrent schedulers (seam 3: the lookup yields)', () => {
+  const AG_RACE = 'ag-task-race';
+  beforeEach(async () => {
+    await initTestDb();
+    runMigrations(getRawDb());
+    await createAgentGroup({
+      id: AG_RACE,
+      name: 'TaskRace',
+      folder: 'task-race',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+  });
+  afterEach(async () => {
+    await closeDb();
+  });
+
+  it('both schedulers end up on the ONE task session the unique index let win', async () => {
+    const { resolveTaskSession } = await import('./session-manager.js');
+    const [a, b] = await Promise.all([
+      resolveTaskSession(AG_RACE, 'series-race', 'slack:C-ROUTE'),
+      resolveTaskSession(AG_RACE, 'series-race', 'slack:C-ROUTE'),
+    ]);
+    expect(a.session.id).toBe(b.session.id);
+    expect([a.created, b.created].filter(Boolean)).toHaveLength(1);
+    expect(a.session.task_routing_platform_id).toBe('slack:C-ROUTE');
+    expect(b.session.task_routing_platform_id).toBe('slack:C-ROUTE');
+  });
+});

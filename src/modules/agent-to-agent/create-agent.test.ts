@@ -523,3 +523,70 @@ describe('envelope guard — undefined provider_config is OK', () => {
     expect(row!.agent_provider).toBe('claude');
   });
 });
+
+describe('concurrent approvals (seam 3: every lookup yields)', () => {
+  it('two approved requests for the same name are serialized: one agent, the other refused, the winner untouched', async () => {
+    // Two PARENTS: a same-parent repeat is refused earlier by the creator's
+    // destination-name check, so it never reaches folder allocation. The
+    // helper's capture array is shared, so the approved handler is driven
+    // directly here.
+    await createAgentGroup({
+      id: 'ag-parent-2',
+      name: 'Second Parent',
+      folder: 'second-parent',
+      agent_provider: null,
+      created_at: now(),
+    });
+    const apply = (parent: string, requestId: string) => {
+      const session = makeSession(parent);
+      const payload = {
+        name: 'Twin',
+        localPreview: 'twin',
+        instructions: null,
+        provider: null,
+        providerConfig: null,
+        requestId,
+      };
+      return applyCreateAgent({
+        session,
+        payload,
+        approval: {
+          approval_id: `approval-${requestId}`,
+          session_id: session.id,
+          request_id: requestId,
+          action: 'create_agent',
+          payload: JSON.stringify(payload),
+          created_at: now(),
+          agent_group_id: parent,
+          channel_type: null,
+          platform_id: null,
+          instance: null,
+          thread_id: null,
+          platform_message_id: null,
+          expires_at: null,
+          status: 'pending',
+          title: 'Create agent',
+          question: 'Create this agent?',
+          options_json: '[]',
+          approver_user_id: 'test-admin',
+        } satisfies PendingApproval,
+        userId: 'test-admin',
+        notify: async () => {},
+      });
+    };
+    await Promise.all([apply('ag-parent', 'twin-1'), apply('ag-parent-2', 'twin-2')]);
+
+    // Serialized: the second attempt sees the first's row, derives `twin-2`,
+    // and the scoped-env prefix rule refuses it (TWIN_2 starts with TWIN_).
+    // Unserialized, both derive `twin`, the loser's insert fails on the
+    // unique folder, and its rollback deletes the WINNER's directory.
+    const winner = await getAgentGroupByFolder('twin');
+    expect(winner).toBeDefined();
+    expect(await getAgentGroupByFolder('twin-2')).toBeUndefined();
+    const cfg = JSON.parse(fs.readFileSync(path.join(TEST_GROUPS_DIR, 'twin', 'container.json'), 'utf8')) as {
+      agentGroupId?: string;
+    };
+    expect(cfg.agentGroupId).toBe(winner!.id);
+    expect(fs.existsSync(path.join(TEST_GROUPS_DIR, 'twin-2'))).toBe(false);
+  });
+});
