@@ -58,6 +58,12 @@ describe('main.ts wires the lease as shadow state', () => {
     expect(main).toMatch(/shadowWrite\([^)]*\(\) => startHostInstanceLease\(\)\)/);
   });
 
+  it('logs the §6 evidence line exactly once, with the instance id and the ttl it passed in', () => {
+    expect(main.match(/'Host instance lease started'/g)).toHaveLength(1);
+    expect(main).toMatch(/startHostInstanceLease\(\{ leaseTtlMs: HOST_LEASE_TTL_MS \}\)/);
+    expect(main).toMatch(/'Host instance lease started', \{ instanceId: hostInstanceId, ttlMs: HOST_LEASE_TTL_MS \}/);
+  });
+
   it("stops the lease as the first statement of shutdown()'s finally block", () => {
     const shutdownStart = main.indexOf('async function shutdown(');
     const finallyStart = main.indexOf('} finally {', shutdownStart);
