@@ -1441,7 +1441,7 @@ describe('readDoneProposal / syncDoneProposalMirror', () => {
   it('mirrors onto the session row, and clears it when the agent retracts', async () => {
     insertSession('s1', 'ag1', 'slack:C1:1.1');
     const proposed = withProposal(JSON.stringify({ reason: 'finished', proposed_at: iso(0) }));
-    syncDoneProposalMirror('s1', readDoneProposal(proposed));
+    await syncDoneProposalMirror('s1', readDoneProposal(proposed));
     const mirrored = getRawDb().prepare('SELECT done_proposal FROM sessions WHERE id = ?').get('s1') as {
       done_proposal: string;
     };
@@ -1449,7 +1449,7 @@ describe('readDoneProposal / syncDoneProposalMirror', () => {
 
     // continue_work / real inbound delete the container-side record; the next
     // sweep must take the flag back off the row.
-    syncDoneProposalMirror('s1', readDoneProposal(outboundStub()));
+    await syncDoneProposalMirror('s1', readDoneProposal(outboundStub()));
     expect(getRawDb().prepare('SELECT done_proposal FROM sessions WHERE id = ?').get('s1')).toMatchObject({
       done_proposal: null,
     });

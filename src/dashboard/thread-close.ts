@@ -110,20 +110,22 @@ const CLOSE_WAKE_ID_PREFIX = 'thread-close-';
  *
  * Returns the proposal it was given, so the sweep's call site stays one line.
  */
-// 5c deferral (seam 3, deployer call 2026-09-05): stays raw/sync in PR 5a —
-// its only caller is src/modules/sweep-continuation/index.ts:543 (a bare
-// sync call inside a duty), owned by PR 5b, so §4.2 (leaf + every importer
-// in one PR) cannot be honored split across two parallel PRs. A follow-up
-// "5c" PR converts this together with all its callers once 5a and 5b are
-// both merged.
-export function syncDoneProposalMirror(sessionId: string, proposal: DoneProposal | null): DoneProposal | null {
+// On the async driver since seam 3 PR 6 (the "5c" family, converted with its
+// one sweep-continuation caller): a best-effort mirror, so the read→write pair
+// needs no transaction — a stale mirror is refreshed by the next tick, and the
+// close path never trusts this copy.
+export async function syncDoneProposalMirror(
+  sessionId: string,
+  proposal: DoneProposal | null,
+): Promise<DoneProposal | null> {
   const encoded = proposal ? JSON.stringify(proposal) : null;
   try {
-    const current = getRawDb().prepare('SELECT done_proposal FROM sessions WHERE id = ?').get(sessionId) as
-      | { done_proposal: string | null }
-      | undefined;
+    const current = await getDb().get<{ done_proposal: string | null }>(
+      'SELECT done_proposal FROM sessions WHERE id = ?',
+      sessionId,
+    );
     if (!current || current.done_proposal === encoded) return proposal;
-    getRawDb().prepare('UPDATE sessions SET done_proposal = ? WHERE id = ?').run(encoded, sessionId);
+    await getDb().run('UPDATE sessions SET done_proposal = ? WHERE id = ?', encoded, sessionId);
   } catch (err) {
     log.warn('thread-close: done_proposal mirror failed', { sessionId, err });
   }
