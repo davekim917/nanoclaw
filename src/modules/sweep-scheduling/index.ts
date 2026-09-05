@@ -19,7 +19,6 @@
  */
 import { isContainerRunning } from '../../container-runner.js';
 import { advanceThreadClosures } from '../../dashboard/thread-close.js';
-import { getRawDb } from '../../db/connection.js';
 import { hasUnresolvedMoveIntent } from '../../dashboard/api/scheduled-shared.js';
 import { isTaskThread, updateSession } from '../../db/sessions.js';
 import {
@@ -152,7 +151,7 @@ export function registerSchedulingSweepDuties(): void {
         // Asked only once the cheap predicate above has already said "close",
         // so the ordinary spent session pays one central-DB read and a live
         // one pays nothing.
-        if (hasUnresolvedMoveIntent(getRawDb(), session.id)) {
+        if (await hasUnresolvedMoveIntent(session.id)) {
           log.info('Kept a spent task session open — an unresolved move intent still names it', {
             sessionId: session.id,
             threadId: session.thread_id,

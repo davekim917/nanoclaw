@@ -11,6 +11,7 @@ import path from 'path';
 
 import type Database from 'better-sqlite3';
 
+import { getDb } from '../../db/connection.js';
 import { log } from '../../log.js';
 import { isOwner, isGlobalAdmin } from '../../modules/permissions/db/user-roles.js';
 import type { ScheduledTaskRow } from '../../modules/mailbox/index.js';
@@ -181,15 +182,14 @@ export function writeAudit(db: Database.Database, e: AuditEntry): void {
  * spent task session staying open and quiet for another tick; the cost of the
  * other way is unrecoverable.
  */
-export function hasUnresolvedMoveIntent(db: Database.Database, sessionId: string): boolean {
+export async function hasUnresolvedMoveIntent(sessionId: string): Promise<boolean> {
   try {
-    const row = db
-      .prepare(
-        `SELECT 1 AS present FROM scheduled_audit
+    const row = await getDb().get(
+      `SELECT 1 AS present FROM scheduled_audit
           WHERE action = 'move_intent' AND resolved_at IS NULL AND session_id = ?
           LIMIT 1`,
-      )
-      .get(sessionId);
+      sessionId,
+    );
     return row !== undefined;
   } catch (err) {
     log.warn('Could not read move intents before closing a spent task session — keeping it open', {

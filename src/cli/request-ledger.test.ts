@@ -268,7 +268,7 @@ describe('ledger mechanics', () => {
     // Dropping its claim on a clock would let the command run twice.
     age('req-9', '2020-01-01T00:00:00.000Z');
 
-    pruneCliRequestExecutions();
+    await pruneCliRequestExecutions();
 
     expect(requestIds()).toEqual(['req-9']);
   });
@@ -282,7 +282,7 @@ describe('ledger mechanics', () => {
     await completeCliRequest(SESSION_ID, 'req-10', { id: 'req-10', ok: true, data: 2 });
     age('req-10', '2026-09-02T00:00:00.000Z');
 
-    pruneCliRequestExecutions();
+    await pruneCliRequestExecutions();
 
     expect(requestIds()).toEqual(['req-10']);
   });
@@ -301,7 +301,7 @@ describe('ledger mechanics', () => {
     await completeCliRequest(SESSION_ID, 'req-10', { id: 'req-10', ok: true, data: 2 });
     age('req-10', '1970-01-01T00:00:00.000Z'); // clock stepped backward after req-9
 
-    pruneCliRequestExecutions();
+    await pruneCliRequestExecutions();
 
     // req-9 is superseded (req-10 exists, completed, inserted after it) and
     // past the floor — pruned despite its claimed_at looking "newer" than
@@ -319,7 +319,7 @@ describe('ledger mechanics', () => {
     await claimCliRequest(SESSION_ID, 'req-10', 'groups-list');
     await completeCliRequest(SESSION_ID, 'req-10', { id: 'req-10', ok: true, data: 2 });
 
-    pruneCliRequestExecutions();
+    await pruneCliRequestExecutions();
 
     expect(requestIds().sort()).toEqual(['req-10', 'req-8']);
   });
@@ -333,7 +333,7 @@ describe('ledger mechanics', () => {
     await claimCliRequest(SESSION_ID, 'req-11', 'groups-list'); // never completed
     age('req-11', '2020-01-01T00:00:00.000Z');
 
-    pruneCliRequestExecutions();
+    await pruneCliRequestExecutions();
 
     expect(requestIds().sort()).toEqual(['req-10', 'req-11', 'req-9']);
   });
@@ -378,7 +378,7 @@ describe('ledger mechanics', () => {
     await completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 'stale' });
     age('req-9', '2020-01-01T00:00:00.000Z');
 
-    pruneCliRequestExecutions();
+    await pruneCliRequestExecutions();
 
     // Still refuses to re-run — a dropped payload downgrades a replay to the
     // ambiguous answer, it does not restore at-least-once.
