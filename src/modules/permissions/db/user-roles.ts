@@ -28,7 +28,12 @@ function hasEquivalentRole(userId: string, predicate: (candidate: string) => boo
   return equivalentSlackUserIds(userId).some(predicate);
 }
 
-/** `hasEquivalentRole`'s async twin — same short-circuit, one statement at a time. */
+/**
+ * The async form of the same loop, for `isAnyAdmin`. Not a `*Sync` twin in
+ * §4.2's sense — that rule is about a LEAF EXPORT gaining a second public
+ * shape; this is a private helper serving one export each. Sequential, so the
+ * short-circuit and the one-statement-at-a-time driver contract both hold.
+ */
 async function hasEquivalentRoleAsync(
   userId: string,
   predicate: (candidate: string) => Promise<boolean>,
