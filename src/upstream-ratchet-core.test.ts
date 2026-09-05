@@ -458,8 +458,13 @@ describe('--check exit decision (decideCheckOutcome)', () => {
     it('checkTree calls validateManifestShape FIRST, so it never reaches its own field checks on an unusable value', () => {
       // Same shape as the top-level-null case above, but through checkTree —
       // proves the wiring, not just the standalone function.
-      expect(() => checkTree(null as unknown as UpstreamRatchetManifest, uniqueTmpRoot('validate-shape-checktree'))).not.toThrow();
-      const findings = checkTree(null as unknown as UpstreamRatchetManifest, uniqueTmpRoot('validate-shape-checktree-2'));
+      expect(() =>
+        checkTree(null as unknown as UpstreamRatchetManifest, uniqueTmpRoot('validate-shape-checktree')),
+      ).not.toThrow();
+      const findings = checkTree(
+        null as unknown as UpstreamRatchetManifest,
+        uniqueTmpRoot('validate-shape-checktree-2'),
+      );
       expect(findings).toEqual(validateManifestShape(null));
     });
   });

@@ -437,11 +437,10 @@ function catFileBatch(root: string, ref: string, ids: readonly string[]): Buffer
  * src/upstream-ratchet.ts) symlink handling with no extra work.
  */
 function catFileFiltered(root: string, ref: string, relPath: string): Buffer {
-  return execFileSync(
-    'git',
-    ['-C', root, `--attr-source=${ref}`, 'cat-file', '--filters', `${ref}:${relPath}`],
-    { maxBuffer: 512 * 1024 * 1024, stdio: ['ignore', 'pipe', 'inherit'] },
-  ) as Buffer;
+  return execFileSync('git', ['-C', root, `--attr-source=${ref}`, 'cat-file', '--filters', `${ref}:${relPath}`], {
+    maxBuffer: 512 * 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'inherit'],
+  }) as Buffer;
 }
 
 function hashFilteredBlob(root: string, ref: string, relPath: string): string {
@@ -877,7 +876,9 @@ function main(): void {
       console.log(`${committedPath} is not shaped like a manifest, so nothing else about it can be measured:\n`);
       console.log(`STALE-MANIFEST (${n(shapeFindings.length)})`);
       for (const f of shapeFindings) console.log(renderCurrencyFinding(f));
-      console.error(`\nupstream-ratchet: refusing to measure — ${committedPath} is not usable; regenerate: ${REGENERATE_HINT}`);
+      console.error(
+        `\nupstream-ratchet: refusing to measure — ${committedPath} is not usable; regenerate: ${REGENERATE_HINT}`,
+      );
     }
     process.exit(1);
   }
