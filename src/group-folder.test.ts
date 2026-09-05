@@ -83,4 +83,17 @@ describe('groupFolderExistsOnDisk', () => {
   it('throws when the name escapes the groups dir', () => {
     expect(() => groupFolderExistsOnDisk('../../etc')).toThrow(/escapes/);
   });
+
+  it('"..legacy" inside GROUPS_DIR counts as present, not an escape', () => {
+    // A same-level entry whose name happens to start with ".." never leaves
+    // GROUPS_DIR — path.relative(GROUPS_DIR, GROUPS_DIR/..legacy) is the
+    // literal string "..legacy", which must not be confused with the
+    // parent-directory token "..".
+    fs.mkdirSync(path.join(GROUPS_TEST_DIR, '..legacy'));
+    expect(groupFolderExistsOnDisk('..legacy')).toBe(true);
+  });
+
+  it('"../outside" throws — a real escape', () => {
+    expect(() => groupFolderExistsOnDisk('../outside')).toThrow(/escapes/);
+  });
 });

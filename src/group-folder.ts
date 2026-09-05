@@ -24,7 +24,18 @@ export function assertValidGroupFolder(folder: string): void {
 
 function ensureWithinBase(baseDir: string, resolvedPath: string): void {
   const rel = path.relative(baseDir, resolvedPath);
-  if (rel.startsWith('..') || path.isAbsolute(rel)) {
+  // Exact-segment check, not a prefix test: `rel.startsWith('..')` would also
+  // reject a same-level entry whose name merely starts with the two
+  // characters "..", e.g. `baseDir/..legacy` (rel === '..legacy'). That is
+  // not an escape — it never leaves baseDir — so only `rel === '..'` or
+  // `rel` starting with `..` + the path separator (a real parent-then-descend)
+  // counts. This function is private to this module; both callers below are
+  // covered by the fix. resolveGroupFolderPath is unaffected in practice
+  // (assertValidGroupFolder's charset excludes '.' entirely, so it can never
+  // pass a name that would have hit the old bug), but groupFolderExistsOnDisk
+  // deliberately probes names the grammar refuses too, so a legacy directory
+  // like `..legacy` must read as present rather than throw.
+  if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
     throw new Error(`Path escapes base directory: ${resolvedPath}`);
   }
 }
