@@ -129,6 +129,10 @@ export async function reserveIdempotency(
     reserved_at: new Date().toISOString(),
   };
 
+  // `ExistingRow` (a plain `interface`) has no index signature, so it is not
+  // structurally assignable to `Record<string, unknown>` even though every
+  // one of its properties is — hence the explicit widening cast on reload's
+  // return rather than relying on assignability.
   const { created } = await insertOrAdopt(
     candidate,
     async (row) => {
@@ -139,7 +143,7 @@ export async function reserveIdempotency(
         row,
       );
     },
-    () => selectExisting(userId, idempotencyKey),
+    async () => (await selectExisting(userId, idempotencyKey)) as Record<string, unknown> | undefined,
   );
 
   // Re-read regardless of `created`: the plain INSERT above carries no
