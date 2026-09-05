@@ -283,7 +283,10 @@ function genericCreate(def: ResourceDef) {
       const where = def.naturalKey.map((c) => `${c} = ?`).join(' AND ');
       const params = def.naturalKey.map((c) => values[c]);
       const reload = (): Promise<Record<string, unknown> | undefined> =>
-        getDb().get<Record<string, unknown>>(`SELECT ${visibleColumns(def).join(', ')} FROM ${def.table} WHERE ${where}`, ...params);
+        getDb().get<Record<string, unknown>>(
+          `SELECT ${visibleColumns(def).join(', ')} FROM ${def.table} WHERE ${where}`,
+          ...params,
+        );
 
       const existing = await reload();
       if (existing) return existing;

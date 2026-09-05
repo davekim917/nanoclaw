@@ -36,11 +36,7 @@ export type CliRequestClaim =
  * Claim the request for execution, or report what a previous attempt did with
  * it. Atomic: the INSERT either wins the row or conflicts, in one statement.
  */
-export async function claimCliRequest(
-  sessionId: string,
-  requestId: string,
-  command: string,
-): Promise<CliRequestClaim> {
+export async function claimCliRequest(sessionId: string, requestId: string, command: string): Promise<CliRequestClaim> {
   const claimed = await getDb().get<{ request_id: string }>(
     `INSERT INTO cli_request_executions (session_id, request_id, command, status, claimed_at)
      VALUES (@session_id, @request_id, @command, 'executing', @claimed_at)

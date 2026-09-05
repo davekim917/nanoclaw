@@ -229,9 +229,7 @@ export async function sendThreadMessage(
     // an agent that is not wired to this thread's channel cannot be made to
     // speak in it, and a thread whose channel nothing names has no room at all.
     const channelKey = threadChannelKey(threadId, (await readChannelDirectory()).known);
-    const wired = (await wiredAgentsByChannel())
-      .get(channelKey)
-      ?.find((a) => a.agent_group_id === agentGroupId);
+    const wired = (await wiredAgentsByChannel()).get(channelKey)?.find((a) => a.agent_group_id === agentGroupId);
     if (!wired) return { status: 409, body: { error: 'agent_not_wired_to_thread_channel', channel: channelKey } };
     const resolved = await resolveSession(agentGroupId, wired.messaging_group_id, threadId, wired.session_mode);
     sessionId = resolved.session.id;

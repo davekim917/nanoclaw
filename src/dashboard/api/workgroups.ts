@@ -56,9 +56,9 @@ async function resolveWorkgroup(id: string, ctx: AuthedRequestContext): Promise<
 }
 
 async function workgroupAgentGroupIds(workgroupId: string): Promise<string[]> {
-  return (
-    await getDb().all<{ id: string }>('SELECT id FROM agent_groups WHERE workgroup_id = ?', workgroupId)
-  ).map((r) => r.id);
+  return (await getDb().all<{ id: string }>('SELECT id FROM agent_groups WHERE workgroup_id = ?', workgroupId)).map(
+    (r) => r.id,
+  );
 }
 
 // ── GET /dashboard/api/workgroups ───────────────────────────────────────────
@@ -67,7 +67,9 @@ export const workgroupsListHandler: AuthHandler = async (_req, _params, ctx) => 
   let rows: WorkgroupRow[];
   try {
     if (ctx.scopes.no_filter) {
-      rows = await getDb().all<WorkgroupRow>('SELECT id, display_name FROM workgroups ORDER BY COALESCE(display_name, id)');
+      rows = await getDb().all<WorkgroupRow>(
+        'SELECT id, display_name FROM workgroups ORDER BY COALESCE(display_name, id)',
+      );
     } else if (ctx.scopes.allowed_group_ids.length === 0) {
       rows = [];
     } else {

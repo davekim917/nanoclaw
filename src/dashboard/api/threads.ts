@@ -960,7 +960,10 @@ async function resolveIdentities(
   const agentIds = [...new Set([...wanted.values()].map((p) => p.agentGroupId))];
   const groups = new Map(
     (
-      await getDb().all<AgentGroup>(`SELECT * FROM agent_groups WHERE id IN (${agentIds.map(() => '?').join(', ')})`, ...agentIds)
+      await getDb().all<AgentGroup>(
+        `SELECT * FROM agent_groups WHERE id IN (${agentIds.map(() => '?').join(', ')})`,
+        ...agentIds,
+      )
     ).map((g) => [g.id, g]),
   );
 
