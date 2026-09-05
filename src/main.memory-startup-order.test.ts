@@ -224,12 +224,14 @@ it('runs reconciliation only after runtime and strict absence proof succeed', as
     memoryWouldChange: () => true,
     sharedWouldChange: () => false,
     sharedFsEnabled: true,
-    quiesce: (_changed, options) => {
+    quiesce: (changed, options) => {
       calls.push('quiescence');
       expect(options.knownWorkgroupIds).toEqual(['wg-1']);
       expect(options.knownSessionIds).toEqual([]);
       return Promise.resolve({
         workgroups: 0,
+        // No flip: the door's post-stop re-evaluation agrees with its input.
+        changedWorkgroupIds: changed,
         containers: 0,
         stopped: 0,
         survivable: 0,

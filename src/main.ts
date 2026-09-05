@@ -193,7 +193,11 @@ export interface BootMountQuiescenceDeps {
   activeSessionIds?: () => Promise<string[]>;
   quiesce?: (
     changedWorkgroupIds: string[],
-    options: { knownWorkgroupIds: string[]; knownSessionIds: string[] },
+    options: {
+      knownWorkgroupIds: string[];
+      knownSessionIds: string[];
+      reevaluateChanged: () => string[];
+    },
   ) => Promise<BootQuiescenceScope>;
   warnStartup?: (reason: string, skipSessionIds: ReadonlySet<string>) => Promise<void>;
   reconcileShared?: (db: Database.Database, dirs: { workgroupIds?: string[] }) => void;
@@ -243,9 +247,11 @@ function bootFatal(message: string, err: unknown): never {
  *   2. evaluate the predicates once, as the door's input;
  *   3. quiesce — the ONLY thing that stops containers at boot, and it throws
  *      before anything below runs if it cannot prove its scope is down;
- *   4. evaluate the predicates AGAIN, on the now-quiescent tree, and use that
- *      set for the reconciles. Group directories are container-writable, so
- *      the pre-stop snapshot can be stale by the time the stops finish;
+ *   4. the door re-evaluates the predicates on the now-quiescent tree and
+ *      partitions against THAT answer; the same set drives the reconciles.
+ *      Group directories are container-writable, so the pre-stop snapshot can
+ *      be stale by the time the stops finish, and a scope built from it would
+ *      call a flipped workgroup's sessions survivable;
  *   5. shared-FS consolidation, scoped to the post-stop set. It used to run
  *      BEFORE the quiescence proof (plan §3.5, divergence 4), masked only by
  *      the flag defaulting off;
@@ -313,13 +319,16 @@ export async function runBootMountQuiescence(
   const scope = await (deps.quiesce ?? quiesceWorkgroupsForBootMountChange)(changedBeforeQuiescence, {
     knownWorkgroupIds: allWorkgroupIds,
     knownSessionIds,
+    // Re-run on the quiescent tree. The door partitions against THIS answer,
+    // so the scope it returns and the cutover below can never disagree about
+    // which workgroups changed.
+    reevaluateChanged: evaluateChanged,
   });
 
-  // …so the RECONCILE scope is re-evaluated on the quiescent tree. Nothing can
-  // write to a group directory now: the door has proved every install-labeled
-  // container is gone. A workgroup that flipped during the stops joins the set
-  // here rather than being stopped and then silently skipped.
-  const changedWorkgroupIds = evaluateChanged();
+  // The authoritative set: one evaluation, inside the door, after the proof.
+  // A workgroup that flipped while the stops were in flight is in it, so it is
+  // reconciled here and is must-stop in the partition — never left out of both.
+  const changedWorkgroupIds = scope.changedWorkgroupIds;
   const flipped = changedWorkgroupIds.filter((id) => !changedBeforeQuiescence.includes(id));
   log.info('Boot quiescence rescope', {
     changedBefore: changedBeforeQuiescence.length,

@@ -142,6 +142,7 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
     expect(runtime.stops).toEqual(['nanoclaw-v2-a-1']);
     expect(scope).toEqual({
       workgroups: 1,
+      changedWorkgroupIds: ['wg-a'],
       containers: 1,
       stopped: 1,
       survivable: 0,
@@ -187,6 +188,7 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
     expect(runtime.stops).toContain('nanoclaw-v2-legacy-1');
     expect(scope).toEqual({
       workgroups: 3,
+      changedWorkgroupIds: [],
       containers: 2,
       stopped: 2,
       survivable: 1,
@@ -375,6 +377,45 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
     expect(scope.survivable).toBe(0);
     expect(scope.survivableSessionIds).toEqual([]);
     expect(scope.mustStopSessionIds).toEqual(['nanoclaw-v2-b-1-session']);
+    expect(spawns).toEqual([]);
+  });
+
+  it('a workgroup that flips between the two evaluations leaves the survivable set', async () => {
+    // The set handed in is a snapshot taken while containers were still
+    // running. Partitioning against it would call a flipped workgroup's
+    // sessions survivable in the very scope that says its mounts are about to
+    // move, and hand that to adoption. The door partitions against the
+    // POST-STOP answer instead.
+    const runtime = fakeRuntime([container('nanoclaw-v2-b-1', 'wg-b'), container('nanoclaw-v2-c-1', 'wg-c')]);
+    const options = {
+      ...runtime,
+      knownWorkgroupIds: ['wg-b', 'wg-c'],
+      knownSessionIds: ['nanoclaw-v2-b-1-session', 'nanoclaw-v2-c-1-session'],
+    };
+
+    // Nothing changed pre-stop; `wg-b` flips while the stops are in flight.
+    const before = await quiesceWorkgroupsForBootMountChange([], options);
+    expect(before.survivableSessionIds).toEqual(['nanoclaw-v2-b-1-session', 'nanoclaw-v2-c-1-session']);
+    expect(before.survivable).toBe(2);
+
+    vi.clearAllMocks();
+    const after = await quiesceWorkgroupsForBootMountChange([], {
+      ...fakeRuntime([container('nanoclaw-v2-b-1', 'wg-b'), container('nanoclaw-v2-c-1', 'wg-c')]),
+      knownWorkgroupIds: options.knownWorkgroupIds,
+      knownSessionIds: options.knownSessionIds,
+      reevaluateChanged: () => ['wg-b'],
+    });
+
+    expect(after.changedWorkgroupIds).toEqual(['wg-b']);
+    expect(after.survivableSessionIds).toEqual(['nanoclaw-v2-c-1-session']);
+    expect(after.survivable).toBe(1);
+    expect(after.survivable).toBe(after.survivableSessionIds.length);
+    expect(after.mustStopSessionIds).toEqual(['nanoclaw-v2-b-1-session']);
+    // …and the log agrees with the returned scope.
+    const line = (log.info as unknown as { mock: { calls: unknown[][] } }).mock.calls.find(
+      (call) => call[0] === 'Boot quiescence scope',
+    );
+    expect(line?.[1]).toMatchObject({ changed: 1, survivable: 1, mustStop: 1 });
     expect(spawns).toEqual([]);
   });
 

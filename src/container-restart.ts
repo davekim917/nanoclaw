@@ -491,6 +491,13 @@ export async function quiesceSessionsForRepositoryMounts(
 export interface BootQuiescenceScope {
   /** Workgroups the predicates were asked about — the §6 denominator. */
   workgroups: number;
+  /**
+   * The changed set the partition below was computed against: the caller's
+   * post-stop re-evaluation when it supplied one, otherwise the set passed in.
+   * The caller reconciles exactly these workgroups, so the scope and the
+   * cutover can never disagree about which workgroups changed.
+   */
+  changedWorkgroupIds: string[];
   /** Install-labeled containers the runtime reported. */
   containers: number;
   /** Containers this pass actually stopped. */
@@ -549,8 +556,61 @@ export interface BootQuiescenceOptions {
    * it (src/main.ts).
    */
   knownSessionIds?: string[];
+  /**
+   * Re-evaluate the change predicates once the install is proved quiescent.
+   *
+   * The set passed as `changedWorkgroupIds` is a snapshot taken while
+   * containers were still running, and the group directories it was computed
+   * from are container-writable. This callback runs after the stop proof,
+   * when nothing can write to them, and its answer is what the partition and
+   * the returned scope are built from. Omitted, the passed-in set is used.
+   */
+  reevaluateChanged?: () => string[] | Promise<string[]>;
   list?: () => InstallContainerScope[];
   stop?: (name: string) => void;
+}
+
+/**
+ * Split an inventory into the containers that must be stopped and the ones a
+ * narrowed stop set could leave running.
+ *
+ * A container is survivable only if it is IDENTIFIED, KNOWN and UNCHANGED:
+ *
+ *   - a workgroup label — a missing one is unknown scope (plan §3.5,
+ *     divergence 7), and on the first restart after C that is every container;
+ *   - a session label — a container adoption could never claim, so leaving it
+ *     running under D2 would leak it;
+ *   - a workgroup that still exists in the central DB — an approved
+ *     `ncl groups delete` leaves the container running, and its workgroup is
+ *     in no reconcile scope and resolves to no row;
+ *   - a session that still exists and is active — the same rule one level down;
+ *   - a workgroup outside the changed set.
+ *
+ * Everything else fails closed into must-stop, and the split is exact: every
+ * container is on one side or the other.
+ *
+ * ONE function, and D1 calls it ONCE, with the post-stop changed set. D2 needs
+ * it twice — once with the pre-stop set to choose what to stop, and once with
+ * the post-stop set for the partition it hands adoption — and a workgroup that
+ * flips between the two is must-stop, so D2's stop set is the union.
+ */
+function partitionInstallContainers(
+  containers: InstallContainerScope[],
+  changedWorkgroupIds: string[],
+  knownWorkgroupIds: Set<string>,
+  knownSessionIds: Set<string>,
+): { survivable: InstallContainerScope[]; mustStop: InstallContainerScope[] } {
+  const changed = new Set(changedWorkgroupIds);
+  const survivable = containers.filter(
+    (entry) =>
+      entry.workgroupId !== null &&
+      entry.sessionId !== null &&
+      knownWorkgroupIds.has(entry.workgroupId) &&
+      knownSessionIds.has(entry.sessionId) &&
+      !changed.has(entry.workgroupId),
+  );
+  const survivableNames = new Set(survivable.map((entry) => entry.name));
+  return { survivable, mustStop: containers.filter((entry) => !survivableNames.has(entry.name)) };
 }
 
 /**
@@ -594,43 +654,11 @@ export async function quiesceWorkgroupsForBootMountChange(
 ): Promise<BootQuiescenceScope> {
   const list = options.list ?? listInstallContainersWithScope;
   const stop = options.stop ?? stopContainer;
-  const changed = new Set(changedWorkgroupIds);
   const known = new Set(options.knownWorkgroupIds ?? changedWorkgroupIds);
   const knownSessions = new Set(options.knownSessionIds ?? []);
 
   const containers = list();
   const unlabeled = containers.filter((entry) => entry.workgroupId === null);
-  // The partition is exact: every container is in one side or the other.
-  //
-  // A container is survivable only if it is IDENTIFIED, KNOWN and UNCHANGED:
-  //
-  //   - a workgroup label — a missing one is unknown scope (plan §3.5,
-  //     divergence 7), and on the first restart after C that is every
-  //     container;
-  //   - a session label — a container adoption could never claim, so leaving
-  //     it running under D2 would leak it;
-  //   - a workgroup that still exists in the central DB — an approved
-  //     `ncl groups delete` leaves the container running, and its workgroup is
-  //     in no reconcile scope and resolves to no row;
-  //   - a session that still exists and is active — same rule one level down;
-  //   - a workgroup outside the changed set.
-  //
-  // Everything else fails closed into must-stop.
-  //
-  // The known-session test is a snapshot taken at boot, not a liveness claim:
-  // seam-4 E still re-checks the session row when it claims, because a session
-  // can be archived between this listing and the adoption, and an
-  // unresolvable one has to be treated exactly the way this does.
-  const survivable = containers.filter(
-    (entry) =>
-      entry.workgroupId !== null &&
-      entry.sessionId !== null &&
-      known.has(entry.workgroupId) &&
-      knownSessions.has(entry.sessionId) &&
-      !changed.has(entry.workgroupId),
-  );
-  const survivableNames = new Set(survivable.map((entry) => entry.name));
-  const mustStop = containers.filter((entry) => !survivableNames.has(entry.name));
 
   // D1: the stop set is the whole install. D2 replaces this with `mustStop`.
   const stopSet = containers;
@@ -665,8 +693,18 @@ export async function quiesceWorkgroupsForBootMountChange(
     );
   }
 
+  // The install is quiescent, so NOW the predicates can be trusted: nothing can
+  // write to a group directory any more. The set that came in was a snapshot
+  // taken while containers were still running, and a live agent's last write
+  // could have flipped a workgroup since. Partition against the answer from
+  // here, not that snapshot — otherwise a flipped workgroup's sessions read as
+  // survivable in the very scope that says its mounts are about to move.
+  const finalChanged = (await options.reevaluateChanged?.()) ?? changedWorkgroupIds;
+  const { survivable, mustStop } = partitionInstallContainers(containers, finalChanged, known, knownSessions);
+
   const scope: BootQuiescenceScope = {
     workgroups: known.size,
+    changedWorkgroupIds: finalChanged,
     containers: containers.length,
     stopped: stopSet.length,
     survivable: survivable.length,
@@ -676,12 +714,13 @@ export async function quiesceWorkgroupsForBootMountChange(
       .map((entry) => entry.sessionId)
       .filter((sessionId): sessionId is string => sessionId !== null),
   };
-  // Plan §6's measurement shape, in its order. The session-id arrays stay out
+  // Plan §6's measurement shape, in its order. `changed` is the post-stop
+  // count, the same set the caller reconciles. The session-id arrays stay out
   // of the line: they are the consumer contract for E and G, and a boot with a
   // large fleet would bury the counts an operator reads.
   log.info('Boot quiescence scope', {
     workgroups: scope.workgroups,
-    changed: changedWorkgroupIds.length,
+    changed: finalChanged.length,
     containers: scope.containers,
     stopped: scope.stopped,
     survivable: scope.survivable,

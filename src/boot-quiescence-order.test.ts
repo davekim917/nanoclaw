@@ -164,6 +164,7 @@ describe('boot mount-change ordering', () => {
         calls.push('quiesce:resolved');
         return {
           workgroups: 1,
+          changedWorkgroupIds: changed,
           containers: 1,
           stopped: 1,
           survivable: 0,
@@ -221,6 +222,7 @@ describe('boot mount-change ordering', () => {
         calls.push('quiesce');
         return {
           workgroups: 0,
+          changedWorkgroupIds: [],
           containers: 0,
           stopped: 0,
           survivable: 0,
@@ -286,6 +288,7 @@ describe('boot mount-change ordering', () => {
     // the whole of milestone 1's first line of evidence (plan §6).
     expect(scope).toEqual({
       workgroups: 1,
+      changedWorkgroupIds: [],
       containers: 2,
       stopped: 2,
       survivable: 2,
@@ -314,7 +317,7 @@ describe('boot mount-change ordering', () => {
     const scopes: Array<string[]> = [];
     let mutated = false;
 
-    const { changedWorkgroupIds } = await runBootMountQuiescence(db, {
+    const { changedWorkgroupIds, scope } = await runBootMountQuiescence(db, {
       workgroupIds: () => ['wgx'],
       memoryWouldChange: (database, id) => workgroupMemoryReconcileWouldChange(database, id, { groupsDir, dataDir }),
       sharedWouldChange: (database, id) => sharedDirsReconcileWouldChange(database, id, { groupsDir, dataDir }),
@@ -347,6 +350,11 @@ describe('boot mount-change ordering', () => {
     // to it rather than skipping it.
     expect(changedWorkgroupIds).toEqual(['wgx']);
     expect(scopes[1]).toEqual(['wgx']);
+    // The scope handed to seam-4 E and G is built from the SAME set: `wgx` is
+    // changed, so its session is not offered as survivable.
+    expect(scope.changedWorkgroupIds).toEqual(['wgx']);
+    expect(scope.survivableSessionIds).toEqual([]);
+    expect(scope.survivable).toBe(0);
     db.close();
   });
 
