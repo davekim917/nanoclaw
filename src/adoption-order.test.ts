@@ -70,7 +70,13 @@ const ADOPT = 'await adoptRunningSessions';
 /** The boot mount-change block: D1's scoped quiescence door, both reconciles, the snapshot prune. */
 const DOOR = 'await runBootMountQuiescence';
 const FENCE_RECOVERY = 'await releaseOrphanedRepoIngressFencesAtStartup';
-/** Everything that can issue a wake once started. */
+/**
+ * Everything that can issue a wake once started. The `ncl` socket is gated by
+ * `markCliServerReady`, not `startCliServer`: since #453 the socket BINDS early
+ * (its O_EXCL lock is what catches a second host before the boot door stops
+ * anything) but answers every request `not-ready` until the ready mark, so the
+ * bind is not a wake source and the mark is.
+ */
 const WAKE_SOURCES = [
   'startDashboard',
   'await initChannelAdapters',
@@ -78,7 +84,7 @@ const WAKE_SOURCES = [
   'startActiveDeliveryPoll',
   'startSweepDeliveryPoll',
   'startHostSweep',
-  'await startCliServer',
+  'markCliServerReady',
 ];
 
 function indexOfCall(calls: string[], call: string): number {
@@ -98,6 +104,15 @@ describe('adoption order (P3)', () => {
     for (const source of WAKE_SOURCES) {
       expect(indexOfCall(calls, source), `${source} starts before adoption resolves`).toBeGreaterThan(adopt);
     }
+  });
+
+  it('the CLI socket binds before the door, and dispatch opens only after adoption resolves', () => {
+    // #453's placement, kept: ownership of the socket must be proven before
+    // the door's stop pass, which assumes this is the sole live host. The
+    // early-bound socket refuses dispatch, so it cannot wake anything; the
+    // mark that opens dispatch is what must wait for adoption.
+    expect(indexOfCall(calls, 'await startCliServer')).toBeLessThan(indexOfCall(calls, DOOR));
+    expect(indexOfCall(calls, 'markCliServerReady')).toBeGreaterThan(indexOfCall(calls, ADOPT));
   });
 
   it('adoption runs after the boot quiescence door and before the orphaned-fence recovery', () => {
