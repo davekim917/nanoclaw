@@ -234,24 +234,24 @@ describe('resolveGroupTimezone', () => {
   beforeEach(async () => {
     await initTestDb();
     runMigrations(getRawDb());
-    (await createAgentGroup(TZ_GROUP));
-    (await ensureContainerConfig(TZ_GROUP.id));
+    await createAgentGroup(TZ_GROUP);
+    await ensureContainerConfig(TZ_GROUP.id);
   });
   afterEach(async () => {
     await closeDb();
   });
 
-  it('returns the install-global timezone when no override is set', () => {
-    expect(resolveGroupTimezone(TZ_GROUP.id)).toBe(TIMEZONE);
-    expect(resolveGroupTimezone('ag-no-such-group')).toBe(TIMEZONE);
+  it('returns the install-global timezone when no override is set', async () => {
+    expect(await resolveGroupTimezone(TZ_GROUP.id)).toBe(TIMEZONE);
+    expect(await resolveGroupTimezone('ag-no-such-group')).toBe(TIMEZONE);
   });
 
   it('returns a valid override, and falls back to global on an invalid stored value', async () => {
-    (await updateContainerConfigScalars(TZ_GROUP.id, { timezone: 'Asia/Tokyo' }));
-    expect(resolveGroupTimezone(TZ_GROUP.id)).toBe('Asia/Tokyo');
+    await updateContainerConfigScalars(TZ_GROUP.id, { timezone: 'Asia/Tokyo' });
+    expect(await resolveGroupTimezone(TZ_GROUP.id)).toBe('Asia/Tokyo');
 
-    (await updateContainerConfigScalars(TZ_GROUP.id, { timezone: 'Not/AZone' }));
-    expect(resolveGroupTimezone(TZ_GROUP.id)).toBe(TIMEZONE);
+    await updateContainerConfigScalars(TZ_GROUP.id, { timezone: 'Not/AZone' });
+    expect(await resolveGroupTimezone(TZ_GROUP.id)).toBe(TIMEZONE);
   });
 
   it('refuses a stored value the write path would have rewritten or refused', async () => {
@@ -261,8 +261,8 @@ describe('resolveGroupTimezone', () => {
     // zoneinfo file at all. A hand-edited row must not split the host clock
     // from the container clock.
     for (const bad of ['+01:00', '-05:00', 'CST', 'EST', 'europe/lisbon']) {
-      (await updateContainerConfigScalars(TZ_GROUP.id, { timezone: bad }));
-      expect(resolveGroupTimezone(TZ_GROUP.id)).toBe(TIMEZONE);
+      await updateContainerConfigScalars(TZ_GROUP.id, { timezone: bad });
+      expect(await resolveGroupTimezone(TZ_GROUP.id)).toBe(TIMEZONE);
       expect(configFromDb((await getContainerConfig(TZ_GROUP.id))!, TZ_GROUP).timezone).toBeUndefined();
     }
     // Whether a given alias resolves is a property of THIS machine's tzdata,
@@ -272,9 +272,9 @@ describe('resolveGroupTimezone', () => {
     // rather than hard-coding which names a host happens to carry. This is
     // still what catches storing an ICU-canonical name the host lacks.
     for (const alias of ['Asia/Kolkata', 'Asia/Calcutta', 'Europe/Kyiv', 'Europe/Kiev']) {
-      (await updateContainerConfigScalars(TZ_GROUP.id, { timezone: alias }));
+      await updateContainerConfigScalars(TZ_GROUP.id, { timezone: alias });
       const expected = fs.existsSync(path.join('/usr/share/zoneinfo', alias)) ? alias : TIMEZONE;
-      expect(resolveGroupTimezone(TZ_GROUP.id)).toBe(expected);
+      expect(await resolveGroupTimezone(TZ_GROUP.id)).toBe(expected);
     }
   });
 
@@ -282,11 +282,11 @@ describe('resolveGroupTimezone', () => {
     // The one caller with a better default than config's TIMEZONE is the
     // fleet report, which reads the running service's own TZ off its systemd
     // unit. An override still outranks it.
-    expect(resolveGroupTimezone(TZ_GROUP.id, 'America/Denver')).toBe('America/Denver');
-    expect(resolveGroupTimezone('ag-no-such-group', 'America/Denver')).toBe('America/Denver');
+    expect(await resolveGroupTimezone(TZ_GROUP.id, 'America/Denver')).toBe('America/Denver');
+    expect(await resolveGroupTimezone('ag-no-such-group', 'America/Denver')).toBe('America/Denver');
 
-    (await updateContainerConfigScalars(TZ_GROUP.id, { timezone: 'Asia/Tokyo' }));
-    expect(resolveGroupTimezone(TZ_GROUP.id, 'America/Denver')).toBe('Asia/Tokyo');
+    await updateContainerConfigScalars(TZ_GROUP.id, { timezone: 'Asia/Tokyo' });
+    expect(await resolveGroupTimezone(TZ_GROUP.id, 'America/Denver')).toBe('Asia/Tokyo');
   });
 
   it('effectiveTimezone is the one predicate the spawn path shares', () => {
@@ -303,10 +303,10 @@ describe('resolveGroupTimezone', () => {
   });
 
   it('configFromDb ships a valid timezone to the container and drops an invalid one', async () => {
-    (await updateContainerConfigScalars(TZ_GROUP.id, { timezone: 'Asia/Tokyo' }));
+    await updateContainerConfigScalars(TZ_GROUP.id, { timezone: 'Asia/Tokyo' });
     expect(configFromDb((await getContainerConfig(TZ_GROUP.id))!, TZ_GROUP).timezone).toBe('Asia/Tokyo');
 
-    (await updateContainerConfigScalars(TZ_GROUP.id, { timezone: 'Not/AZone' }));
+    await updateContainerConfigScalars(TZ_GROUP.id, { timezone: 'Not/AZone' });
     expect(configFromDb((await getContainerConfig(TZ_GROUP.id))!, TZ_GROUP).timezone).toBeUndefined();
   });
 

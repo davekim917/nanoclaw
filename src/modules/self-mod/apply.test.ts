@@ -172,10 +172,16 @@ describe('applyAddMcpServer', () => {
       settled = true;
     });
 
-    await Promise.resolve();
+    // Seam 3: the two reads before the report (`getAgentGroup`,
+    // `getContainerConfig`) are async on the driver, so the report is no
+    // longer reached within a fixed number of microtask ticks. Wait for it to
+    // be issued, then prove the call has NOT returned while it is in flight —
+    // which is the invariant this case exists for.
+    await vi.waitFor(() => expect(releaseNotification).toBeDefined());
     expect(settled).toBe(false);
     releaseNotification!();
     await applying;
+    expect(settled).toBe(true);
   });
 
   it.each([

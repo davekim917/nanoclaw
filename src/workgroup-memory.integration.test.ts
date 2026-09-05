@@ -15,19 +15,29 @@ vi.mock('./config.js', async (importOriginal) => ({
   GROUPS_DIR: path.join(TEST_ROOT, 'groups'),
 }));
 
+// Seam 3 PR 4 moved the synchronous recall-build's services read off
+// buildSessionServicesSnapshot (which itself awaits the two central reads)
+// onto buildSessionServicesSnapshotFrom, a purely synchronous function fed a
+// pre-resolved `SessionServicesCentral` by the caller (session-manager.ts,
+// before its no-await write block — see pre-turn-context.ts's doc comment).
+// Mock the leaf the production call site actually reaches now; the unmocked
+// resolveSessionServicesCentral still runs for real against the test DB,
+// which is fine — it's just not what this fixture is asserting on.
 vi.mock('./capabilities.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./capabilities.js')>()),
-  buildSessionServicesSnapshot: vi.fn((agentGroupId: string, messagingGroupId: string | null) => ({
-    agentGroupId,
-    services: [
-      {
-        name: `safe-for:${messagingGroupId ?? 'none'}`,
-        declaredTools: messagingGroupId === 'mg-discord' ? ['snowflake'] : ['thread-search'],
-        scopes: [],
-        credentialPaths: [],
-      },
-    ],
-  })),
+  buildSessionServicesSnapshotFrom: vi.fn(
+    (agentGroupId: string, _central: unknown, messagingGroupId?: string | null) => ({
+      agentGroupId,
+      services: [
+        {
+          name: `safe-for:${messagingGroupId ?? 'none'}`,
+          declaredTools: messagingGroupId === 'mg-discord' ? ['snowflake'] : ['thread-search'],
+          scopes: [],
+          credentialPaths: [],
+        },
+      ],
+    }),
+  ),
 }));
 
 vi.mock('./message-archive.js', async (importOriginal) => {

@@ -52,6 +52,19 @@ vi.mock('./db/sessions.js', async (importOriginal) => ({
   getSession: (...args: unknown[]) => mockGetSession(...args),
 }));
 
+// Seam 3 §4.5 I-1: the wake guard (`sessionStillActive`) reads the session row
+// SYNCHRONOUSLY through the raw handle — `readSessionSync` runs the sessions
+// leaf's `SESSION_BY_ID_SQL`, not `getSession()` — so the shared fake answers
+// that lookup from `mockGetSession`. No central DB is opened in this file.
+// The fixture is imported INSIDE the factory: a hoisted `vi.mock` runs before
+// this file's own import bindings are initialized.
+vi.mock('./db/connection.js', async (importOriginal) => {
+  const { rawDbConnectionMock } = await import('./test-fixtures/raw-db-fake.js');
+  return rawDbConnectionMock(await importOriginal<typeof import('./db/connection.js')>(), {
+    sessions: (id) => mockGetSession(id),
+  });
+});
+
 const mockWriteSessionMessage = vi.fn();
 /** Session rows that exist in the central DB but own no mailbox. */
 const missingInboundDbs = new Set<string>();

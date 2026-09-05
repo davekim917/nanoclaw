@@ -57,6 +57,12 @@ const NOT_CALLERS: readonly string[] = [DEFINER, SELF];
  * them: `guard/guard.test.ts` stubs the raw handle the sync guard now reads,
  * and `db/sessions.test.ts` drops module tables through it to pin the
  * `hasTable` early return.
+ *
+ * `src/test-fixtures/raw-db-fake.ts` is the one further entry, and it exists to
+ * KEEP this list small: every test whose subject reaches the sync guard path
+ * without opening a central DB needs a stub handle, and routing them all
+ * through one shared fake means the identifier is named once instead of once
+ * per test file. Migrating an existing test entry onto it removes that entry.
  */
 export const RAW_DB_IMPORTERS: readonly string[] = [
   'scripts/bust-slack-profile-cache.ts',
@@ -188,7 +194,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/guard/guard.ts',
   'src/host-core.test.ts',
   'src/host-lifecycle-timers.test.ts',
-  'src/host-sweep-registry.test.ts',
   'src/host-sweep.test.ts',
   'src/mailbox-seam-unreachable-scripts.test.ts',
   'src/main.ts',
@@ -281,6 +286,7 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/storage-pressure-alert.test.ts',
   'src/storage-pressure-alert.ts',
   'src/templates/create-agent.test.ts',
+  'src/test-fixtures/raw-db-fake.ts',
   'src/topic-title.test.ts',
   'src/workgroup-memory.integration.test.ts',
   'src/worktree-cleanup.test.ts',

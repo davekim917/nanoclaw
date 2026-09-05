@@ -61,6 +61,22 @@ vi.mock('../db/sessions.js', async (importOriginal) => ({
   getPendingApproval: (...args: unknown[]) => mockGetPendingApproval(...args),
 }));
 
+// Seam 3 §4.5 I-1: the guard path stays SYNCHRONOUS — the CLI guard's
+// `cliScopeOf` and `guard()`'s grant liveness check run the leaves' exported
+// SQL on the raw handle rather than calling the now-async leaf functions. This
+// file opens no central DB, so the shared fake answers those lookups from the
+// same mocks the async leaves are stubbed with.
+// The fixture is imported INSIDE the factory: a hoisted `vi.mock` runs before
+// this file's own import bindings are initialized.
+vi.mock('../db/connection.js', async (importOriginal) => {
+  const { rawDbConnectionMock } = await import('../test-fixtures/raw-db-fake.js');
+  return rawDbConnectionMock(await importOriginal<typeof import('../db/connection.js')>(), {
+    containerConfigs: (id) => mockGetContainerConfig(id),
+    pendingApprovals: (id) => mockGetPendingApproval(id),
+    sessions: (id) => mockGetSession(id),
+  });
+});
+
 // dispatch's post-handler looks up the resource's `scopeField` via getResource.
 // The real resources aren't registered in this unit test, so mock it.
 const mockGetResource = vi.fn();
