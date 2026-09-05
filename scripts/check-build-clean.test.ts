@@ -663,6 +663,8 @@ describe('scripts/check-build-clean.ts and scripts/write-build-info.ts', () => {
   // exceed Vitest's five-second default even though the fixture is minimal.
   it('runs the actual guard once in a self-contained fixture', () => {
     fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'setup'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'setup', 'smoke.ts'), 'export const setup = true;\n');
     fs.copyFileSync(checkScript, path.join(dir, 'scripts', 'check-build-clean.ts'));
     fs.copyFileSync(path.join(repoRoot, 'eslint.config.js'), path.join(dir, 'eslint.config.js'));
     fs.writeFileSync(
@@ -680,7 +682,7 @@ describe('scripts/check-build-clean.ts and scripts/write-build-info.ts', () => {
           noEmit: true,
           types: ['node'],
         },
-        include: ['src/**/*.ts', 'scripts/**/*.ts'],
+        include: ['src/**/*.ts', 'scripts/**/*.ts', 'setup/**/*.ts'],
       }),
     );
     fs.symlinkSync(path.join(repoRoot, 'node_modules'), path.join(dir, 'node_modules'));

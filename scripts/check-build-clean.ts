@@ -226,7 +226,7 @@ function failure(message: string): GuardStepResult {
 /** Prebuild lint gate: refuses to build if `pnpm run lint`'s eslint invocation finds errors. */
 function runLintGate(): GuardStepResult {
   const eslintBin = path.join(REPO_ROOT, 'node_modules', '.bin', 'eslint');
-  const eslintArgs = ['src/', 'scripts/', '--quiet', '-f', 'json'];
+  const eslintArgs = ['src/', 'scripts/', 'setup/', '--quiet', '-f', 'json'];
   let stdout: string;
   try {
     stdout = execCaptureStdout('ionice', ['-c3', 'nice', '-n', '10', eslintBin, ...eslintArgs], { cwd: REPO_ROOT });

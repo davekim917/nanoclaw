@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 
 import type { VaultAgent } from './onecli-agents.js';
-import { buildRemovalPlan, type Decisions, type RemovalAction } from './plan.js';
+import { buildRemovalPlan, type Decisions } from './plan.js';
 import type { Inventory, PathItem } from './scan.js';
 
 const item = (p: string, what: string): PathItem => ({ what, where: p, path: p });
@@ -47,8 +47,6 @@ const allYes = (onecliDelete: VaultAgent[] = []): Decisions => ({
   user: true,
   onecliDelete,
 });
-
-const kinds = (actions: RemovalAction[]) => actions.map((a) => a.kind);
 
 describe('buildRemovalPlan ordering invariants', () => {
   it('removes .env only via the atomic backup action, never a bare delete', () => {

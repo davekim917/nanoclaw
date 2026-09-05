@@ -67,7 +67,7 @@ export function getOnecliApiHost(): string | null {
 }
 
 function extractUrlFromOutput(output: string): string | null {
-  const match = output.match(/https?:\/\/[\w.\-]+(?::\d+)?/);
+  const match = output.match(/https?:\/\/[\w.-]+(?::\d+)?/);
   return match ? match[0] : null;
 }
 
@@ -122,7 +122,7 @@ const ONECLI_CLI_REPO = 'onecli/onecli-cli';
 // the new bring-up. Filed upstream; this is the downstream workaround.
 function removeLegacyOnecliContainers(): string {
   const out: string[] = [];
-  let list = '';
+  let list: string;
   try {
     list = execSync(
       `docker ps -a --filter "label=com.docker.compose.project=onecli" --format '{{.Names}}|{{.Label "com.docker.compose.service"}}'`,

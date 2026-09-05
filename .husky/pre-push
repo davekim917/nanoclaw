@@ -153,9 +153,9 @@ snapshot_commit() {
   commit_message=''
   (cd "$repo_root" && pnpm run check:public-boundary -- --root "$snapshot_root" --index --allowlist "$allowlist_path") </dev/null
   if command -v ionice >/dev/null 2>&1; then
-    (cd "$snapshot_root" && ionice -c3 nice -n 10 node_modules/.bin/eslint --quiet src/ scripts/) </dev/null
+    (cd "$snapshot_root" && ionice -c3 nice -n 10 node_modules/.bin/eslint --quiet src/ scripts/ setup/) </dev/null
   else
-    (cd "$snapshot_root" && nice -n 10 node_modules/.bin/eslint --quiet src/ scripts/) </dev/null
+    (cd "$snapshot_root" && nice -n 10 node_modules/.bin/eslint --quiet src/ scripts/ setup/) </dev/null
   fi
 
   # Include setup and scripts in the same typecheck command used by CI/builds

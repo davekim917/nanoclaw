@@ -194,7 +194,7 @@ function scanService(deps: ScanDeps, slug: string, containerRuntime: string, not
   }
 
   const link = path.join(home, '.local', 'bin', 'ncl');
-  let linkStat: fs.Stats | null = null;
+  let linkStat: fs.Stats | null;
   try {
     linkStat = fs.lstatSync(link);
   } catch {

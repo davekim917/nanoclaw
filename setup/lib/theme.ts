@@ -11,6 +11,8 @@
  *   - COLORTERM truecolor/24bit  → 24-bit ANSI (exact brand cyan)
  *   - Otherwise                  → kleur's 16-color cyan (closest fallback)
  */
+import { stripVTControlCharacters } from 'node:util';
+
 import * as p from '@clack/prompts';
 import k from 'kleur';
 
@@ -130,10 +132,8 @@ export function note(message: string, title?: string): void {
   p.note(message, title, { format: brandBody });
 }
 
-const ANSI_RE = /\x1b\[[0-9;]*m/g;
-
 function visibleLength(s: string): number {
-  return s.replace(ANSI_RE, '').length;
+  return stripVTControlCharacters(s).length;
 }
 
 /**

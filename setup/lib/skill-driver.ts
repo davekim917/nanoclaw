@@ -219,7 +219,7 @@ async function reuseFromEnv(
       if (typeof d.attrs.reuse === 'string') varToKey.set(v, d.attrs.reuse);
     }
   }
-  let env: Record<string, string> = {};
+  let env: Record<string, string>;
   try {
     env = parseEnv(readFileSync(join(projectRoot, '.env'), 'utf8'));
   } catch {
