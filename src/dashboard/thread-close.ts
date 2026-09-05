@@ -109,6 +109,12 @@ const CLOSE_WAKE_ID_PREFIX = 'thread-close-';
  *
  * Returns the proposal it was given, so the sweep's call site stays one line.
  */
+// 5c deferral (seam 3, deployer call 2026-09-05): stays raw/sync in PR 5a —
+// its only caller is src/modules/sweep-continuation/index.ts:543 (a bare
+// sync call inside a duty), owned by PR 5b, so §4.2 (leaf + every importer
+// in one PR) cannot be honored split across two parallel PRs. A follow-up
+// "5c" PR converts this together with all its callers once 5a and 5b are
+// both merged.
 export function syncDoneProposalMirror(sessionId: string, proposal: DoneProposal | null): DoneProposal | null {
   const encoded = proposal ? JSON.stringify(proposal) : null;
   try {
@@ -169,6 +175,15 @@ interface CloseSession {
  * The thread's active sessions, using the same synthetic-key rule the list and
  * snooze paths use (`session:<id>` for a session with a NULL `thread_id`), so
  * the id the console renders addresses the same thread here.
+ *
+ * PERMANENT raw/sync exception (§4.5-class, not a 5c deferral): this function
+ * is called both before AND inside `requestThreadClose`'s documented "ONE
+ * synchronous decision, no await from here to the reservation" span (see
+ * `ClosureDecision`'s doc comment and "THIS IS THE LAST AWAIT" below) — the
+ * whole point of `sampleProposalsSync`/`readSessionProposalSync` existing as
+ * synchronous twins is to keep that span awaitless. Converting this function
+ * would break the invariant at its in-span call site regardless of which PR
+ * does it, so it stays on the raw handle even after 5c.
  */
 function sessionsOnThread(threadId: string): CloseSession[] {
   return getRawDb()
@@ -184,6 +199,13 @@ function sessionsOnThread(threadId: string): CloseSession[] {
  * Is this ONE session still active and still on this thread? Same predicate as
  * `sessionsOnThread`, keyed to a single id, so a caller holding a snapshot can
  * re-ask the question it snapshotted without re-running the fan-out.
+ *
+ * PERMANENT raw/sync exception (§4.5-class, not a 5c deferral): called from
+ * inside `writeCloseWrapUp`'s mailbox-action callback, which must stay
+ * "synchronous, so nothing yields before the insert below" (the
+ * `withQuietInvalidationSync` precondition a few lines down that call site).
+ * Converting this to the async driver would introduce exactly the yield that
+ * comment forbids.
  */
 function stillOnThread(sessionId: string, threadId: string): boolean {
   return (
@@ -422,6 +444,11 @@ export async function requestThreadClose(
     };
   }
 
+  // PERMANENT raw/sync exception (§4.5-class, not a 5c deferral): this read,
+  // the reservation INSERT below, and the loser's read on a lost race all
+  // sit inside (or feed) the "ONE synchronous decision, no await from here
+  // to the reservation" span documented above `ClosureDecision` — see
+  // `sessionsOnThread`'s doc comment for the full reasoning.
   const existing = getRawDb().prepare('SELECT * FROM thread_closures WHERE thread_id = ?').get(threadId) as
     | ThreadClosureRow
     | undefined;

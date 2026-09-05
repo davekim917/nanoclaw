@@ -18,6 +18,14 @@ import fs from 'fs';
 
 import { DATA_DIR, TIMEZONE } from '../../config.js';
 import { resolveGroupTimezone } from '../../container-config.js';
+// 5c deferral (seam 3, deployer call 2026-09-05): every getRawDb() call in
+// this file feeds writeAudit (scheduled-shared.ts), which is also called
+// from src/modules/sweep-scheduled-move/index.ts (PR 5b's file) — §4.2
+// cannot be honored split across two parallel PRs. A follow-up "5c" PR
+// converts writeAudit/purgeIntentBody together with every caller (this
+// file, scheduled-move.ts, cli/resources/tasks.ts, and the
+// sweep-scheduled-move helpers) once 5a and 5b are both merged. Nothing in
+// this file was changed by seam 3 PR 5a for that reason.
 import { getRawDb } from '../../db/connection.js';
 import { getSession, QuietInvalidationError, withQuietInvalidationSync } from '../../db/sessions.js';
 import {

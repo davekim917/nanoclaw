@@ -472,6 +472,13 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
 
   const wasPaused = snapshot.status === 'paused';
   const correlationId = randomUUID();
+  // 5c deferral (seam 3, deployer call 2026-09-05): kept raw/sync here because
+  // it feeds writeAudit/purgeIntentBody (scheduled-shared.ts), which are also
+  // called from src/modules/sweep-scheduled-move/index.ts (PR 5b's file) —
+  // §4.2 cannot be honored split across two parallel PRs. A follow-up "5c" PR
+  // converts writeAudit/purgeIntentBody together with every caller (this
+  // file, scheduled-mutations.ts, cli/resources/tasks.ts, and the
+  // sweep-scheduled-move helpers) once 5a and 5b are both merged.
   const central = getRawDb();
 
   // Step 2b: durable move_intent BEFORE cancel (F2). Full snapshot in

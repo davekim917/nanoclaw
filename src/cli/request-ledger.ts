@@ -149,6 +149,13 @@ const PAYLOAD_RETENTION_DAYS = 7;
  * after a week, which costs a replay its stored frame but not the at-most-once
  * guarantee: a claim with no payload reports `executing`, and the agent is told
  * the command was dispatched rather than having it run again.
+ *
+ * Deferred (seam 3, same shape as the writeAudit/scheduled-shared.ts "5c"
+ * finding, not itself part of that grouping): stays raw/sync because its
+ * only caller is src/modules/sweep-central/index.ts:111
+ * (`run: () => { pruneCliRequestExecutions(); }`, a bare sync call), which
+ * is under src/modules/sweep- and out of bounds for this PR. Convert
+ * together with that call site in a follow-up once the sweep-side PR lands.
  */
 export function pruneCliRequestExecutions(): void {
   try {

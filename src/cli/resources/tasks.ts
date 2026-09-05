@@ -5,6 +5,14 @@ import { CronExpressionParser } from 'cron-parser';
 import { GROUPS_DIR, TIMEZONE } from '../../config.js';
 import { resolveGroupTimezone } from '../../container-config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
+// 5c deferral (seam 3, deployer call 2026-09-05): every getRawDb() call in
+// this file feeds writeAudit (dashboard/api/scheduled-shared.ts), which is
+// also called from src/modules/sweep-scheduled-move/index.ts (PR 5b's file)
+// — §4.2 cannot be honored split across two parallel PRs. A follow-up "5c"
+// PR converts writeAudit/purgeIntentBody together with every caller (this
+// file, dashboard/api/scheduled-move.ts, scheduled-mutations.ts, and the
+// sweep-scheduled-move helpers) once 5a and 5b are both merged. Nothing in
+// this file was changed by seam 3 PR 5a for that reason.
 import { getRawDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import {
