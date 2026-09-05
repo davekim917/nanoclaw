@@ -654,3 +654,68 @@ describe('concurrent approvals (seam 3: every lookup yields)', () => {
     expect(childCap).toBeGreaterThan(lock);
   });
 });
+
+// ── Workgroup inheritance (T6 PR 1) ─────────────────────────────────────────
+describe('workgroup inheritance', () => {
+  /** Put the parent in a real workgroup. `agent_groups.workgroup_id` is a
+   *  foreign key, so the `workgroups` row has to exist first. */
+  function placeParentInWorkgroup(workgroupId: string): void {
+    const db = getRawDb();
+    db.prepare(`INSERT OR IGNORE INTO workgroups (id, onecli_secrets, created_at) VALUES (?, '[]', ?)`).run(
+      workgroupId,
+      now(),
+    );
+    db.prepare(`UPDATE agent_groups SET workgroup_id = ? WHERE id = 'ag-parent'`).run(workgroupId);
+  }
+
+  function containerConfig(folder: string): Record<string, unknown> {
+    return JSON.parse(fs.readFileSync(path.join(TEST_GROUPS_DIR, folder, 'container.json'), 'utf8'));
+  }
+
+  it('a child inherits the parent workgroup in the DB row and in container.json', async () => {
+    placeParentInWorkgroup('parent-agent');
+
+    await runCreateAgent({ requestId: 'wg1', name: 'Helper', instructions: null }, makeSession());
+
+    const row = await getAgentGroupByFolder('helper');
+    expect(row).toBeDefined();
+    expect(row!.workgroup_id).toBe('parent-agent');
+    expect(containerConfig('helper').workgroup_id).toBe('parent-agent');
+  });
+
+  it('writes the workgroup into container.json before the DB insert, so the first spawn sees it', async () => {
+    // The spawn path reads container.json, not the agent_groups row. Pinned on
+    // the source because the ordering cannot be observed from outside once the
+    // handler has returned.
+    const source = fs.readFileSync(path.join(__dirname, 'create-agent.ts'), 'utf8');
+    const handler = source.slice(source.indexOf('export const applyCreateAgent'));
+    const configWrite = handler.indexOf('c.workgroup_id = workgroupId');
+    const dbInsert = handler.indexOf('await createAgentGroup(newGroup)');
+    expect(configWrite).toBeGreaterThan(-1);
+    expect(dbInsert).toBeGreaterThan(configWrite);
+  });
+
+  it('a grandchild inherits the same workgroup, so a chain stays in one data pool', async () => {
+    placeParentInWorkgroup('parent-agent');
+    await runCreateAgent({ requestId: 'wg2', name: 'Child', instructions: null }, makeSession());
+
+    const child = await getAgentGroupByFolder('child');
+    expect(child).toBeDefined();
+    await runCreateAgent({ requestId: 'wg3', name: 'Grandchild', instructions: null }, makeSession(child!.id));
+
+    const grandchild = await getAgentGroupByFolder('grandchild');
+    expect(grandchild!.workgroup_id).toBe('parent-agent');
+    expect(containerConfig('grandchild').workgroup_id).toBe('parent-agent');
+  });
+
+  it('a parent with no workgroup still produces a NULL child and no container.json key', async () => {
+    // Unchanged behaviour for a pre-036 row that was never backfilled: NULL is
+    // what the column held before it was named in the INSERT, and a fabricated
+    // id would fail the foreign key.
+    await runCreateAgent({ requestId: 'wg4', name: 'Orphan', instructions: null }, makeSession());
+
+    const row = await getAgentGroupByFolder('orphan');
+    expect(row!.workgroup_id ?? null).toBeNull();
+    expect(containerConfig('orphan')).not.toHaveProperty('workgroup_id');
+  });
+});
