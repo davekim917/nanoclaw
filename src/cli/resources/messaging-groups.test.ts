@@ -35,7 +35,8 @@ vi.mock('../../delivery.js', async (importOriginal) => ({
 
 import type { ChannelDefaults } from '../../channels/adapter.js';
 import { registerChannelAdapter } from '../../channels/channel-registry.js';
-import { initTestDb, closeDb, runMigrations, getRawDb } from '../../db/index.js';
+import { registerSlackBot } from '../../channels/slack-mentions.js';
+import { initTestDb, closeDb, runMigrations, getDb, getRawDb } from '../../db/index.js';
 import { createMessagingGroup, getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
 import type { ChannelDeliveryAdapter } from '../../delivery.js';
 import type { MessagingGroup } from '../../types.js';
@@ -155,7 +156,7 @@ describe('messaging-groups CLI notify', () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 
-  function createUnwiredNamedInstanceGroup(): MessagingGroup {
+  async function createUnwiredNamedInstanceGroup(): Promise<MessagingGroup> {
     const group: MessagingGroup = {
       id: 'mg-notify',
       channel_type: 'test-channel',
@@ -166,12 +167,12 @@ describe('messaging-groups CLI notify', () => {
       unknown_sender_policy: 'strict',
       created_at: new Date().toISOString(),
     };
-    createMessagingGroup(group);
+    await createMessagingGroup(group);
     return group;
   }
 
   it('delivers directly to an unwired group through its exact named adapter instance', async () => {
-    const group = createUnwiredNamedInstanceGroup();
+    const group = await createUnwiredNamedInstanceGroup();
     const deliver = vi.fn().mockResolvedValue('platform-message');
     vi.mocked(getDeliveryAdapter).mockReturnValue({ deliver } as ChannelDeliveryAdapter);
 
@@ -211,6 +212,176 @@ describe('messaging-groups CLI notify', () => {
     expect(wiringCount.count).toBe(0);
   });
 
+  it('reports when no owner DM is available without attempting delivery', async () => {
+    const response = await dispatch(
+      {
+        id: 'notify-owner-none',
+        command: 'messaging-groups-notify-owner',
+        args: { text: 'Weekly report body' },
+      },
+      { caller: 'host' },
+    );
+
+    expect(response).toMatchObject({ ok: false, error: { code: 'handler-error', message: /no owner DM found/ } });
+    expect(getDeliveryAdapter).not.toHaveBeenCalled();
+  });
+
+  it('skips a newer CLI owner DM and delivers to the latest eligible owner DM', async () => {
+    const db = getDb();
+    const userId = 'test-channel:owner-user';
+    const resolvedAt = '2026-01-01T00:00:00.000Z';
+    const ownerDm: MessagingGroup = {
+      id: 'mg-owner-deliverable',
+      channel_type: 'test-channel',
+      platform_id: 'owner-destination',
+      instance: 'test-channel-secondary',
+      name: null,
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: resolvedAt,
+    };
+    const cliDm: MessagingGroup = {
+      id: 'mg-owner-cli',
+      channel_type: 'cli',
+      platform_id: 'local',
+      instance: 'cli',
+      name: null,
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: resolvedAt,
+    };
+    await db.run(
+      'INSERT INTO users (id, kind, display_name, created_at) VALUES (?, ?, NULL, ?)',
+      userId,
+      'test-channel',
+      resolvedAt,
+    );
+    await db.run(
+      'INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at) VALUES (?, ?, NULL, NULL, ?)',
+      userId,
+      'owner',
+      resolvedAt,
+    );
+    await createMessagingGroup(ownerDm);
+    await createMessagingGroup(cliDm);
+    await db.run(
+      'INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at) VALUES (?, ?, ?, ?)',
+      userId,
+      'test-channel',
+      ownerDm.id,
+      resolvedAt,
+    );
+    await db.run(
+      'INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at) VALUES (?, ?, ?, ?)',
+      userId,
+      'cli',
+      cliDm.id,
+      '2026-02-01T00:00:00.000Z',
+    );
+    const deliver = vi.fn().mockResolvedValue('platform-message');
+    vi.mocked(getDeliveryAdapter).mockReturnValue({ deliver } as ChannelDeliveryAdapter);
+
+    const response = await dispatch(
+      {
+        id: 'notify-owner-skip-cli',
+        command: 'messaging-groups-notify-owner',
+        args: { text: 'Weekly report body' },
+      },
+      { caller: 'host' },
+    );
+
+    expect(response).toMatchObject({ ok: true, data: { delivered: { messaging_group_id: ownerDm.id } } });
+    expect(deliver).toHaveBeenCalledWith(
+      ownerDm.channel_type,
+      ownerDm.platform_id,
+      null,
+      'chat',
+      JSON.stringify({ text: 'Weekly report body', requireCompleteDelivery: true }),
+      undefined,
+      ownerDm.instance,
+    );
+  });
+
+  it('selects the newest same-workspace Slack sibling owner DM and its exact adapter instance', async () => {
+    const primary = 'slack-owner-primary-test';
+    const sibling = 'slack-owner-sibling-test';
+    const foreign = 'slack-owner-foreign-test';
+    const teamId = 'T-OWNER-TEST';
+    registerSlackBot(primary, { userId: 'U-BOT-PRIMARY', username: 'primary', teamId });
+    registerSlackBot(sibling, { userId: 'U-BOT-SIBLING', username: 'sibling', teamId });
+    registerSlackBot(foreign, { userId: 'U-BOT-FOREIGN', username: 'foreign', teamId: 'T-FOREIGN-TEST' });
+    try {
+      const db = getDb();
+      const resolvedAt = '2026-01-01T00:00:00.000Z';
+      const dms = [
+        { id: 'mg-owner-older', channelType: primary, platformId: 'D-OWNER-OLDER', resolvedAt },
+        { id: 'mg-owner-newest', channelType: sibling, platformId: 'D-OWNER-NEWEST', resolvedAt: '2026-02-01T00:00:00.000Z' },
+        { id: 'mg-owner-foreign', channelType: foreign, platformId: 'D-OWNER-FOREIGN', resolvedAt: '2026-03-01T00:00:00.000Z' },
+      ];
+      for (const dm of dms) {
+        const userId = `${dm.channelType}:U-OWNER`;
+        await db.run(
+          'INSERT INTO users (id, kind, display_name, created_at) VALUES (?, ?, NULL, ?)',
+          userId,
+          dm.channelType,
+          resolvedAt,
+        );
+        await createMessagingGroup({
+          id: dm.id,
+          channel_type: dm.channelType,
+          platform_id: dm.platformId,
+          instance: dm.channelType,
+          name: null,
+          is_group: 0,
+          unknown_sender_policy: 'strict',
+          created_at: resolvedAt,
+        });
+        await db.run(
+          'INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at) VALUES (?, ?, ?, ?)',
+          userId,
+          dm.channelType,
+          dm.id,
+          dm.resolvedAt,
+        );
+      }
+      await db.run(
+        'INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at) VALUES (?, ?, NULL, NULL, ?)',
+        `${primary}:U-OWNER`,
+        'owner',
+        resolvedAt,
+      );
+      const deliver = vi.fn().mockResolvedValue('platform-message');
+      vi.mocked(getDeliveryAdapter).mockReturnValue({ deliver } as ChannelDeliveryAdapter);
+
+      const response = await dispatch(
+        {
+          id: 'notify-owner-1',
+          command: 'messaging-groups-notify-owner',
+          args: { text: 'Weekly report body' },
+        },
+        { caller: 'host' },
+      );
+
+      expect(response).toMatchObject({
+        ok: true,
+        data: { delivered: { messaging_group_id: dms[1]!.id, instance: sibling } },
+      });
+      expect(deliver).toHaveBeenCalledWith(
+        sibling,
+        dms[1]!.platformId,
+        null,
+        'chat',
+        JSON.stringify({ text: 'Weekly report body', requireCompleteDelivery: true }),
+        undefined,
+        sibling,
+      );
+    } finally {
+      registerSlackBot(primary, { userId: 'U-CLEARED', username: 'cleared', teamId: 'T-CLEARED-PRIMARY' });
+      registerSlackBot(sibling, { userId: 'U-CLEARED', username: 'cleared', teamId: 'T-CLEARED-SIBLING' });
+      registerSlackBot(foreign, { userId: 'U-CLEARED', username: 'cleared', teamId: 'T-CLEARED-FOREIGN' });
+    }
+  });
+
   it('rejects CLI groups instead of treating an absent terminal client as delivered', async () => {
     const cliGroup: MessagingGroup = {
       id: 'mg-cli-notify',
@@ -222,7 +393,7 @@ describe('messaging-groups CLI notify', () => {
       unknown_sender_policy: 'public',
       created_at: new Date().toISOString(),
     };
-    createMessagingGroup(cliGroup);
+    await createMessagingGroup(cliGroup);
 
     const response = await dispatch(
       {
@@ -248,7 +419,7 @@ describe('messaging-groups CLI notify', () => {
     );
     expect(missing).toMatchObject({ ok: false, error: { code: 'handler-error', message: /not found/ } });
 
-    const group = createUnwiredNamedInstanceGroup();
+    const group = await createUnwiredNamedInstanceGroup();
     vi.mocked(getDeliveryAdapter).mockReturnValue(null);
     const unavailable = await dispatch(
       {

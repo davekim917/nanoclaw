@@ -10,7 +10,6 @@
  * Usage: pnpm exec tsx scripts/upstream-dry-run-report.ts
  *        pnpm exec tsx scripts/upstream-dry-run-report.ts --notify-owner
  */
-import Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
 import net from 'node:net';
 import path from 'node:path';
@@ -21,33 +20,7 @@ import { generateDryRunReport } from '../src/upstream-dry-run-report.js';
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const NCL_SOCKET_CONNECT_TIMEOUT_MS = 5_000;
 
-export interface OwnerDm {
-  messagingGroupId: string;
-}
-
 type SocketConnector = (socketPath: string) => net.Socket;
-
-/** Resolve the most recently used DM for any user with the owner role. */
-export function resolveLatestOwnerDm(dbPath: string): OwnerDm | undefined {
-  const db = new Database(dbPath, { readonly: true, fileMustExist: true });
-  try {
-    return (
-      (db
-        .prepare(
-          `SELECT mg.id AS messagingGroupId
-            FROM user_roles ur
-            JOIN user_dms ud ON ud.user_id = ur.user_id
-            JOIN messaging_groups mg ON mg.id = ud.messaging_group_id
-            WHERE ur.role = 'owner' AND mg.channel_type <> 'cli'
-            ORDER BY ud.resolved_at DESC
-            LIMIT 1`,
-        )
-        .get() as OwnerDm | undefined) ?? undefined
-    );
-  } finally {
-    db.close();
-  }
-}
 
 export interface DeliveryResult {
   messaging_group_id: string;
@@ -59,7 +32,7 @@ export interface DeliveryResult {
 
 class InvalidDeliveryResponseError extends Error {}
 
-function parseDeliveryResult(response: unknown, requestId: string, messagingGroupId: string): DeliveryResult {
+function parseDeliveryResult(response: unknown, requestId: string): DeliveryResult {
   if (!response || typeof response !== 'object') {
     throw new InvalidDeliveryResponseError(
       'Host CLI returned a malformed response while delivering the weekly report.',
@@ -83,11 +56,11 @@ function parseDeliveryResult(response: unknown, requestId: string, messagingGrou
     throw new InvalidDeliveryResponseError('Host CLI returned no delivery result for the weekly report.');
   }
   const delivered = (frame.data as Record<string, unknown>).delivered;
-  if (
-    !delivered ||
-    typeof delivered !== 'object' ||
-    (delivered as Record<string, unknown>).messaging_group_id !== messagingGroupId
-  ) {
+  const messagingGroupId =
+    delivered && typeof delivered === 'object'
+      ? (delivered as Record<string, unknown>).messaging_group_id
+      : undefined;
+  if (typeof messagingGroupId !== 'string' || messagingGroupId.length === 0) {
     throw new InvalidDeliveryResponseError('Host CLI returned an invalid delivery result for the weekly report.');
   }
   return delivered as DeliveryResult;
@@ -99,17 +72,16 @@ function parseDeliveryResult(response: unknown, requestId: string, messagingGrou
 export async function submitOwnerReport(
   {
     socketPath,
-    dm,
     report,
     connectionTimeoutMs = NCL_SOCKET_CONNECT_TIMEOUT_MS,
-  }: { socketPath: string; dm: OwnerDm; report: string; connectionTimeoutMs?: number },
+  }: { socketPath: string; report: string; connectionTimeoutMs?: number },
   connectSocket: SocketConnector = (target) => net.createConnection(target),
 ): Promise<DeliveryResult> {
   const requestId = randomUUID();
   const payload = JSON.stringify({
     id: requestId,
-    command: 'messaging-groups-notify',
-    args: { id: dm.messagingGroupId, text: report },
+    command: 'messaging-groups-notify-owner',
+    args: { text: report },
   });
 
   return new Promise<DeliveryResult>((resolve, reject) => {
@@ -167,7 +139,7 @@ export async function submitOwnerReport(
       const newline = buffer.indexOf('\n');
       if (newline < 0) return;
       try {
-        settle(parseDeliveryResult(JSON.parse(buffer.slice(0, newline)), requestId, dm.messagingGroupId));
+        settle(parseDeliveryResult(JSON.parse(buffer.slice(0, newline)), requestId));
       } catch (err) {
         if (err instanceof InvalidDeliveryResponseError) {
           settle(undefined, err);
@@ -202,7 +174,6 @@ export async function submitOwnerReport(
 
 export interface MainDependencies {
   generateReport: typeof generateDryRunReport;
-  resolveOwnerDm: typeof resolveLatestOwnerDm;
   submitReport: typeof submitOwnerReport;
 }
 
@@ -216,20 +187,13 @@ export async function main(
   }
 
   const generateReport = dependencies.generateReport ?? generateDryRunReport;
-  const resolveOwnerDm = dependencies.resolveOwnerDm ?? resolveLatestOwnerDm;
   const submitReport = dependencies.submitReport ?? submitOwnerReport;
   const report = generateReport({ repoRoot: root });
   console.log(report);
 
   if (!args.includes('--notify-owner')) return;
 
-  const dbPath = path.join(root, 'data', 'v2.db');
-  const dm = resolveOwnerDm(dbPath);
-  if (!dm) {
-    throw new Error('Cannot notify the owner: no owner DM found through user_roles + user_dms.');
-  }
-
-  await submitReport({ socketPath: path.join(root, 'data', 'ncl.sock'), dm, report });
+  await submitReport({ socketPath: path.join(root, 'data', 'ncl.sock'), report });
   console.log('upstream-dry-run-report: report delivered to the owner DM through the host CLI.');
 }
 

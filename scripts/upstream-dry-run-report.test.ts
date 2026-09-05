@@ -3,10 +3,9 @@ import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 
-import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { main, resolveLatestOwnerDm, submitOwnerReport } from './upstream-dry-run-report.js';
+import { main, submitOwnerReport } from './upstream-dry-run-report.js';
 
 const roots: string[] = [];
 
@@ -15,31 +14,6 @@ function fixtureRoot(): string {
   roots.push(root);
   fs.mkdirSync(root, { recursive: true });
   return root;
-}
-
-function createOwnerDb(dbPath: string, includeDm = true): void {
-  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-  const db = new Database(dbPath);
-  db.exec(`
-    CREATE TABLE user_roles (user_id TEXT NOT NULL, role TEXT NOT NULL);
-    CREATE TABLE user_dms (user_id TEXT NOT NULL, messaging_group_id TEXT NOT NULL, channel_type TEXT NOT NULL, resolved_at TEXT NOT NULL);
-    CREATE TABLE messaging_groups (
-      id TEXT PRIMARY KEY,
-      channel_type TEXT NOT NULL,
-      platform_id TEXT NOT NULL,
-      instance TEXT NOT NULL DEFAULT 'test-channel'
-    );
-  `);
-  db.exec(`INSERT INTO user_roles VALUES ('test-channel:owner-user', 'owner');`);
-  if (includeDm) {
-    db.exec(`
-      INSERT INTO messaging_groups (id, channel_type, platform_id) VALUES ('older-dm', 'test-channel', 'destination-older');
-      INSERT INTO messaging_groups (id, channel_type, platform_id) VALUES ('newer-dm', 'test-channel', 'destination-newer');
-      INSERT INTO user_dms VALUES ('test-channel:owner-user', 'older-dm', 'test-channel', '2026-01-01T00:00:00.000Z');
-      INSERT INTO user_dms VALUES ('test-channel:owner-user', 'newer-dm', 'test-channel', '2026-02-01T00:00:00.000Z');
-    `);
-  }
-  db.close();
 }
 
 function listen(server: net.Server, socketPath: string): Promise<void> {
@@ -55,10 +29,6 @@ function listen(server: net.Server, socketPath: string): Promise<void> {
 
 function close(server: net.Server): Promise<void> {
   return new Promise((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
-}
-
-function testDm() {
-  return { messagingGroupId: 'newer-dm' };
 }
 
 function delivery(messageId = 'platform-message'): Record<string, string | null> {
@@ -77,33 +47,6 @@ afterEach(() => {
 });
 
 describe('upstream dry-run owner notification', () => {
-  it('resolves the latest owner DM through roles, DM cache, and messaging groups', () => {
-    const dbPath = path.join(fixtureRoot(), 'v2.db');
-    createOwnerDb(dbPath);
-
-    expect(resolveLatestOwnerDm(dbPath)).toEqual({ messagingGroupId: 'newer-dm' });
-  });
-
-  it('skips a newer CLI cache row because it has no durable delivery target', () => {
-    const dbPath = path.join(fixtureRoot(), 'v2.db');
-    createOwnerDb(dbPath);
-    const db = new Database(dbPath);
-    db.exec(`
-      INSERT INTO messaging_groups (id, channel_type, platform_id) VALUES ('cli-dm', 'cli', 'local');
-      INSERT INTO user_dms VALUES ('test-channel:owner-user', 'cli-dm', 'cli', '2026-03-01T00:00:00.000Z');
-    `);
-    db.close();
-
-    expect(resolveLatestOwnerDm(dbPath)).toEqual({ messagingGroupId: 'newer-dm' });
-  });
-
-  it('returns no target when no owner has a DM cache row', () => {
-    const dbPath = path.join(fixtureRoot(), 'v2.db');
-    createOwnerDb(dbPath, false);
-
-    expect(resolveLatestOwnerDm(dbPath)).toBeUndefined();
-  });
-
   it('submits the report to the host CLI and awaits its direct delivery result', async () => {
     const root = fixtureRoot();
     const socketPath = path.join(root, 'ncl.sock');
@@ -117,13 +60,11 @@ describe('upstream dry-run owner notification', () => {
     await listen(server, socketPath);
 
     try {
-      await expect(submitOwnerReport({ socketPath, dm: testDm(), report: 'Weekly report body' })).resolves.toEqual(
-        delivery(),
-      );
+      await expect(submitOwnerReport({ socketPath, report: 'Weekly report body' })).resolves.toEqual(delivery());
       expect(request).toMatchObject({
         id: expect.any(String),
-        command: 'messaging-groups-notify',
-        args: { id: 'newer-dm', text: 'Weekly report body' },
+        command: 'messaging-groups-notify-owner',
+        args: { text: 'Weekly report body' },
       });
       expect(request).not.toHaveProperty('senderId');
       expect(request).not.toHaveProperty('isMention');
@@ -132,13 +73,7 @@ describe('upstream dry-run owner notification', () => {
     }
   });
 
-  it('accepts a named-instance owner DM because the host resolves the messaging group', async () => {
-    const dbPath = path.join(fixtureRoot(), 'v2.db');
-    createOwnerDb(dbPath);
-    const db = new Database(dbPath);
-    db.prepare('UPDATE messaging_groups SET instance = ? WHERE id = ?').run('test-channel-secondary', 'newer-dm');
-    db.close();
-    const dm = resolveLatestOwnerDm(dbPath)!;
+  it('leaves the named-instance owner DM selection to the host', async () => {
     const socket = new EventEmitter() as EventEmitter & {
       destroy: () => void;
       write: (payload: string, callback: (err?: Error | null) => void) => void;
@@ -154,7 +89,7 @@ describe('upstream dry-run owner notification', () => {
     };
 
     const submission = submitOwnerReport(
-      { socketPath: 'test.sock', dm, report: 'report' },
+      { socketPath: 'test.sock', report: 'report' },
       () => socket as unknown as net.Socket,
     );
     socket.emit('connect');
@@ -165,9 +100,7 @@ describe('upstream dry-run owner notification', () => {
   it('surfaces socket connection errors', async () => {
     const socketPath = path.join(fixtureRoot(), 'missing.sock');
 
-    await expect(submitOwnerReport({ socketPath, dm: testDm(), report: 'report' })).rejects.toThrow(
-      /submission failed/,
-    );
+    await expect(submitOwnerReport({ socketPath, report: 'report' })).rejects.toThrow(/submission failed/);
   });
 
   it('times out while a socket connection never completes', async () => {
@@ -178,7 +111,7 @@ describe('upstream dry-run owner notification', () => {
     vi.useFakeTimers();
     try {
       const submission = submitOwnerReport(
-        { socketPath: 'pending.sock', dm: testDm(), report: 'report', connectionTimeoutMs: 5_000 },
+        { socketPath: 'pending.sock', report: 'report', connectionTimeoutMs: 5_000 },
         () => socket as unknown as net.Socket,
       );
       const rejected = expect(submission).rejects.toThrow(/timed out.*before submitting/);
@@ -208,7 +141,7 @@ describe('upstream dry-run owner notification', () => {
     vi.useFakeTimers();
     try {
       const submission = submitOwnerReport(
-        { socketPath: 'delayed.sock', dm: testDm(), report: 'report', connectionTimeoutMs: 5_000 },
+        { socketPath: 'delayed.sock', report: 'report', connectionTimeoutMs: 5_000 },
         () => socket as unknown as net.Socket,
       );
       socket.emit('connect');
@@ -234,7 +167,7 @@ describe('upstream dry-run owner notification', () => {
     socket.write = (_payload, callback) => callback(new Error('write failed'));
 
     const submission = submitOwnerReport(
-      { socketPath: 'failed.sock', dm: testDm(), report: 'report' },
+      { socketPath: 'failed.sock', report: 'report' },
       () => socket as unknown as net.Socket,
     );
     socket.emit('connect');
@@ -255,12 +188,42 @@ describe('upstream dry-run owner notification', () => {
     };
 
     const submission = submitOwnerReport(
-      { socketPath: 'malformed.sock', dm: testDm(), report: 'report' },
+      { socketPath: 'malformed.sock', report: 'report' },
       () => socket as unknown as net.Socket,
     );
     socket.emit('connect');
 
     await expect(submission).rejects.toThrow(/malformed response/);
+  });
+
+  it('rejects an empty owner-DM id in a successful host response', async () => {
+    const socket = new EventEmitter() as EventEmitter & {
+      destroy: () => void;
+      write: (payload: string, callback: (err?: Error | null) => void) => void;
+    };
+    socket.destroy = vi.fn();
+    socket.write = (payload, callback) => {
+      callback();
+      const request = JSON.parse(payload) as { id: string };
+      socket.emit(
+        'data',
+        Buffer.from(
+          JSON.stringify({
+            id: request.id,
+            ok: true,
+            data: { delivered: { ...delivery(), messaging_group_id: '' } },
+          }) + '\n',
+        ),
+      );
+    };
+
+    const submission = submitOwnerReport(
+      { socketPath: 'empty-owner-dm.sock', report: 'report' },
+      () => socket as unknown as net.Socket,
+    );
+    socket.emit('connect');
+
+    await expect(submission).rejects.toThrow(/invalid delivery result/);
   });
 
   it('rejects a host CLI response for another request', async () => {
@@ -278,7 +241,7 @@ describe('upstream dry-run owner notification', () => {
     };
 
     const submission = submitOwnerReport(
-      { socketPath: 'wrong-id.sock', dm: testDm(), report: 'report' },
+      { socketPath: 'wrong-id.sock', report: 'report' },
       () => socket as unknown as net.Socket,
     );
     socket.emit('connect');
@@ -308,7 +271,7 @@ describe('upstream dry-run owner notification', () => {
     };
 
     const submission = submitOwnerReport(
-      { socketPath: 'rejected.sock', dm: testDm(), report: 'report' },
+      { socketPath: 'rejected.sock', report: 'report' },
       () => socket as unknown as net.Socket,
     );
     socket.emit('connect');
@@ -328,7 +291,7 @@ describe('upstream dry-run owner notification', () => {
     };
 
     const submission = submitOwnerReport(
-      { socketPath: 'closed.sock', dm: testDm(), report: 'report' },
+      { socketPath: 'closed.sock', report: 'report' },
       () => socket as unknown as net.Socket,
     );
     socket.emit('connect');
@@ -348,7 +311,7 @@ describe('upstream dry-run owner notification', () => {
     };
 
     const submission = submitOwnerReport(
-      { socketPath: 'errored.sock', dm: testDm(), report: 'report' },
+      { socketPath: 'errored.sock', report: 'report' },
       () => socket as unknown as net.Socket,
     );
     socket.emit('connect');
@@ -359,22 +322,19 @@ describe('upstream dry-run owner notification', () => {
   it('keeps the default invocation stdout-only without opening the DB or socket', async () => {
     const root = fixtureRoot();
     const generateReport = vi.fn(() => 'Manual report');
-    const resolveOwnerDm = vi.fn();
     const submitReport = vi.fn();
     const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
 
-    await main([], root, { generateReport, resolveOwnerDm, submitReport });
+    await main([], root, { generateReport, submitReport });
 
     expect(generateReport).toHaveBeenCalledWith({ repoRoot: root });
-    expect(resolveOwnerDm).not.toHaveBeenCalled();
     expect(submitReport).not.toHaveBeenCalled();
     expect(log).toHaveBeenCalledOnce();
     expect(log).toHaveBeenCalledWith('Manual report');
   });
 
-  it('resolves a temporary owner DB and delivers the generated report when requested', async () => {
+  it('submits the generated report to the host owner resolver when requested', async () => {
     const root = fixtureRoot();
-    createOwnerDb(path.join(root, 'data', 'v2.db'));
     const generateReport = vi.fn(() => 'Generated report');
     const submitReport = vi.fn().mockResolvedValue(delivery());
     const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
@@ -384,7 +344,6 @@ describe('upstream dry-run owner notification', () => {
     expect(submitReport).toHaveBeenCalledOnce();
     expect(submitReport).toHaveBeenCalledWith({
       socketPath: path.join(root, 'data', 'ncl.sock'),
-      dm: { messagingGroupId: 'newer-dm' },
       report: 'Generated report',
     });
     expect(log).toHaveBeenNthCalledWith(1, 'Generated report');
@@ -394,17 +353,19 @@ describe('upstream dry-run owner notification', () => {
     );
   });
 
-  it('prints the report before rejecting an owner notification with no cached DM', async () => {
+  it('prints the report before surfacing a host owner-resolution failure', async () => {
     const root = fixtureRoot();
-    createOwnerDb(path.join(root, 'data', 'v2.db'), false);
     const generateReport = vi.fn(() => 'Generated report');
-    const submitReport = vi.fn();
+    const submitReport = vi.fn().mockRejectedValue(new Error('no owner DM found through the host owner predicate'));
     const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
 
     await expect(main(['--notify-owner'], root, { generateReport, submitReport })).rejects.toThrow(/no owner DM found/);
 
     expect(log).toHaveBeenCalledOnce();
     expect(log).toHaveBeenCalledWith('Generated report');
-    expect(submitReport).not.toHaveBeenCalled();
+    expect(submitReport).toHaveBeenCalledWith({
+      socketPath: path.join(root, 'data', 'ncl.sock'),
+      report: 'Generated report',
+    });
   });
 });
