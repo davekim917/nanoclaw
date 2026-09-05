@@ -140,11 +140,17 @@ function defaultReferencedPaths(): Set<string> | null {
  * Removes every snapshot under `data/agent-runner-src/` except the active
  * one and any still mounted by a running container. Best-effort: a failure
  * removing one entry is logged and skipped, never thrown — pruning is
- * housekeeping, not a boot-blocking step. Call only after orphan containers
- * from a previous host process have been stopped (`main.ts` calls this
- * right after `cleanupOrphansStrict()`); once container adoption across
- * restarts (mailbox seam 2) lands, `referencedPaths` must keep covering
- * adopted containers too, or a live one can lose its mount out from under it.
+ * housekeeping, not a boot-blocking step. Call only after the boot quiescence
+ * door has proved its stop set gone — `main.ts` calls this last in
+ * `runBootMountQuiescence`, after both reconciles.
+ *
+ * It stays correct once containers start surviving a restart (seam 4, D2 + E):
+ * `defaultReferencedPaths` above reads docker, not the in-process registry,
+ * so an adopted container's mounts are covered the same way a freshly spawned
+ * one's are. What it depends on is the container NAME PREFIX — that listing
+ * selects by `name=nanoclaw-v2-`, and a successful listing that matches
+ * nothing prunes everything, so the prefix is pinned in one constant
+ * (src/config.ts) rather than adopted from upstream's `ncl-…` grammar.
  */
 export function pruneAgentRunnerSnapshots(opts?: {
   dataDir?: string;
