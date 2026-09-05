@@ -228,28 +228,28 @@ afterEach(async () => {
 });
 
 describe('_resolveTargetUserId', () => {
-  it('returns a namespaced id as-is', () => {
-    expect(_resolveTargetUserId('slack-example-labs:U1', makeSession())).toBe('slack-example-labs:U1');
+  it('returns a namespaced id as-is', async () => {
+    expect(await _resolveTargetUserId('slack-example-labs:U1', makeSession())).toBe('slack-example-labs:U1');
   });
 
-  it('unwraps <@Uxxx> mentions and prepends channel_type', () => {
-    expect(_resolveTargetUserId('<@U12345>', makeSession())).toBe('slack-example-labs:U12345');
+  it('unwraps <@Uxxx> mentions and prepends channel_type', async () => {
+    expect(await _resolveTargetUserId('<@U12345>', makeSession())).toBe('slack-example-labs:U12345');
   });
 
-  it('strips a Slack display-alias pipe in the mention', () => {
-    expect(_resolveTargetUserId('<@U12345|operator>', makeSession())).toBe('slack-example-labs:U12345');
+  it('strips a Slack display-alias pipe in the mention', async () => {
+    expect(await _resolveTargetUserId('<@U12345|operator>', makeSession())).toBe('slack-example-labs:U12345');
   });
 
-  it('rejects Discord role mentions (<@&snowflake>)', () => {
-    expect(_resolveTargetUserId('<@&12345>', makeSession())).toBeNull();
+  it('rejects Discord role mentions (<@&snowflake>)', async () => {
+    expect(await _resolveTargetUserId('<@&12345>', makeSession())).toBeNull();
   });
 
-  it('accepts bare handles and prepends channel_type', () => {
-    expect(_resolveTargetUserId('U12345', makeSession())).toBe('slack-example-labs:U12345');
+  it('accepts bare handles and prepends channel_type', async () => {
+    expect(await _resolveTargetUserId('U12345', makeSession())).toBe('slack-example-labs:U12345');
   });
 
-  it('returns null when the session has no messaging group', () => {
-    expect(_resolveTargetUserId('U12345', makeSession({ messaging_group_id: null }))).toBeNull();
+  it('returns null when the session has no messaging group', async () => {
+    expect(await _resolveTargetUserId('U12345', makeSession({ messaging_group_id: null }))).toBeNull();
   });
 });
 

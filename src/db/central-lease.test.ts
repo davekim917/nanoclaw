@@ -275,6 +275,36 @@ describe('withRawDb is confined to a synchronous block', () => {
     }, 'a-different-block');
   });
 
+  it('rejects an async callback at the callback boundary (#408), and consumes its later rejection', async () => {
+    // A callback declared `async` returns a promise: `NoLiveSqlite`/`RawCallbackOnly`
+    // refuse it at compile time, and the runtime check throws so the lease is
+    // never released with raw work still pending. Its later rejection is
+    // consumed, so vitest does not fail the run on an unhandled rejection.
+    await withCentralSync(() => {
+      expect(() =>
+        // @ts-expect-error — RawCallbackOnly<Promise<void>> demands an argument no caller can produce
+        withRawDb(async (r: RawDb) => {
+          await Promise.resolve();
+          r.prepare(`SELECT 1`).run();
+        }),
+      ).toThrow(GuardNotSynchronousError);
+    }, 'async-callback');
+    // Let any abandoned promise settle before the test ends.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  });
+
+  it('consumes an async withRawDb callback that later rejects, so its rejection is never unhandled', async () => {
+    await withCentralSync(() => {
+      expect(() =>
+        withRawDb((async () => {
+          await Promise.resolve();
+          throw new Error('withRawDb callback rejected later');
+        }) as unknown as () => void),
+      ).toThrow(GuardNotSynchronousError);
+    }, 'async-callback-rejects');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  });
+
   it('run/get/all still work through the statement facade inside the block', async () => {
     const rows = await withCentralSync(
       () =>

@@ -20,6 +20,7 @@ import fs from 'fs';
 import { SELF_HEAL_ENABLED } from '../../config.js';
 import { readContainerConfig } from '../../container-config.js';
 import { resolveContainerResources } from '../../container-resources.js';
+import { withCentralSync } from '../../db/central-lease.js';
 import { markProviderUnavailable } from '../../db/provider-health.js';
 import { resolveSpawnProvider } from '../../provider-fallback.js';
 import { OomKillObserver } from '../../resource-oom-observer.js';
@@ -281,9 +282,10 @@ export function notifyProviderHealParked(
  * `killContainer`: the attempt is what must not be spent, and the attempt is
  * written before the kill.
  *
- * Synchronous and cheap — one central-DB row and the container-state lookup
- * the host already keeps in memory — so it adds no suspension point of its own
- * to widen the window it closes.
+ * Cheap — one central-DB row and the container-state lookup the host already
+ * keeps in memory. The DB read is the wake guard's own raw read, so it runs
+ * inside the central lease; the caller takes the lease around this whole check
+ * (seam 3 §4.5 I-1).
  */
 function providerHealTargetUnavailableReason(sessionId: string): string | null {
   const liveness = sessionStillActive(sessionId)();
@@ -355,7 +357,10 @@ async function sweepProviderHeal(
   // attempt and returned `true`, so the chain stopped. Claiming the slot keeps
   // that behaviour exactly and drops only the wasted attempt, which is the
   // whole point of the fix.
-  const unavailable = providerHealTargetUnavailableReason(session.id);
+  const unavailable = await withCentralSync(
+    () => providerHealTargetUnavailableReason(session.id),
+    'provider-heal target check',
+  );
   if (unavailable) {
     log.info(`self-heal: ${decision} target already gone — nothing to do this pass`, {
       ...bounds,
