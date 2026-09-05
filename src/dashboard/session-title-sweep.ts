@@ -27,7 +27,7 @@
  */
 import { EnvHttpProxyAgent, fetch as undiciFetch, type Dispatcher } from 'undici';
 
-import { getRawDb } from '../db/connection.js';
+import { getDb } from '../db/connection.js';
 import { log } from '../log.js';
 import { readSessionInbound, readSessionOutbound, type MessageTailRow } from '../modules/mailbox/index.js';
 import {
@@ -316,7 +316,7 @@ export function postProcessTitle(raw: string): string {
  * mtime would be faster but unreliable; we just open the DB and run a
  * MAX(seq) lookup.
  */
-function pickCandidates(cap: number): CandidateRow[] {
+async function pickCandidates(cap: number): Promise<CandidateRow[]> {
   const cooldownIso = new Date(Date.now() - COOLDOWN_HOURS * 3600_000).toISOString();
   // Gate purely on `title_generated_at` — a stamped failure-backoff row
   // (see `stampFailureBackoff`) shouldn't slip back into the candidate
@@ -332,17 +332,16 @@ function pickCandidates(cap: number): CandidateRow[] {
   // empties next tick, starving every real session forever. Prioritizing
   // recently-active untitled sessions titles the visible inbox cards first; the
   // empty-skip stamp in the loop below drains the rest of the shells.
-  const rows = getRawDb()
-    .prepare(
-      `SELECT id, agent_group_id, title, title_generated_at, title_basis_seq
-         FROM sessions
-        WHERE status = 'active'
-          AND (title_generated_at IS NULL OR title_generated_at < ?)
-        ORDER BY (title IS NOT NULL), COALESCE(last_active, created_at) DESC
-        LIMIT ?`,
-    )
-    .all(cooldownIso, cap * 4) as CandidateRow[];
-  return rows;
+  return getDb().all<CandidateRow>(
+    `SELECT id, agent_group_id, title, title_generated_at, title_basis_seq
+       FROM sessions
+      WHERE status = 'active'
+        AND (title_generated_at IS NULL OR title_generated_at < ?)
+      ORDER BY (title IS NOT NULL), COALESCE(last_active, created_at) DESC
+      LIMIT ?`,
+    cooldownIso,
+    cap * 4,
+  );
 }
 
 interface SliceResult {
@@ -431,16 +430,18 @@ function readSessionSlice(agentGroupId: string, sessionId: string): SliceResult 
   return { text: lines.join('\n'), maxSeq: tail[tail.length - 1]!.seq, neverWoken };
 }
 
-function persistTitle(sessionId: string, title: string, basisSeq: number, generatedAt: string): void {
-  getRawDb()
-    .prepare(
-      `UPDATE sessions
-          SET title = ?,
-              title_generated_at = ?,
-              title_basis_seq = ?
-        WHERE id = ?`,
-    )
-    .run(title, generatedAt, basisSeq, sessionId);
+async function persistTitle(sessionId: string, title: string, basisSeq: number, generatedAt: string): Promise<void> {
+  await getDb().run(
+    `UPDATE sessions
+        SET title = ?,
+            title_generated_at = ?,
+            title_basis_seq = ?
+      WHERE id = ?`,
+    title,
+    generatedAt,
+    basisSeq,
+    sessionId,
+  );
 }
 
 /**
@@ -456,9 +457,9 @@ function persistTitle(sessionId: string, title: string, basisSeq: number, genera
  * a NULL title is still the operator-visible truth (the inbox falls back
  * to the session id).
  */
-function stampFailureBackoff(sessionId: string): void {
+async function stampFailureBackoff(sessionId: string): Promise<void> {
   const stamp = new Date(Date.now() - (COOLDOWN_HOURS * 60 - FAILURE_BACKOFF_MINUTES) * 60_000).toISOString();
-  getRawDb().prepare(`UPDATE sessions SET title_generated_at = ? WHERE id = ?`).run(stamp, sessionId);
+  await getDb().run(`UPDATE sessions SET title_generated_at = ? WHERE id = ?`, stamp, sessionId);
 }
 
 /**
@@ -526,7 +527,7 @@ async function _runSessionTitleSweepLocked(): Promise<{ generated: number; skipp
     return { generated: 0, skipped: 0 };
   }
 
-  const candidates = pickCandidates(CONCURRENCY_CAP);
+  const candidates = await pickCandidates(CONCURRENCY_CAP);
   if (candidates.length === 0) return { generated: 0, skipped: 0 };
 
   let generated = 0;
@@ -546,7 +547,7 @@ async function _runSessionTitleSweepLocked(): Promise<{ generated: number; skipp
     // a real wake re-enters after the cooldown ages out and gets titled then.
     if (slice.maxSeq < 0 || !slice.text || slice.neverWoken) {
       try {
-        stampFailureBackoff(row.id);
+        await stampFailureBackoff(row.id);
       } catch {
         /* stamp failure is non-fatal — next tick will retry */
       }
@@ -574,12 +575,12 @@ async function _runSessionTitleSweepLocked(): Promise<{ generated: number; skipp
             skipped++;
             return { sessionId: row.id, ok: true };
           }
-          persistTitle(row.id, title, slice.maxSeq, new Date().toISOString());
+          await persistTitle(row.id, title, slice.maxSeq, new Date().toISOString());
           generated++;
           return { sessionId: row.id, ok: true };
         } catch (err) {
           try {
-            stampFailureBackoff(row.id);
+            await stampFailureBackoff(row.id);
           } catch {
             /* stamp failure is non-fatal — next tick will retry */
           }
