@@ -227,16 +227,19 @@ describe('role helpers', () => {
 
   it('rejects owner rows with a scope', async () => {
     await seedUser('u-1', 'telegram');
-    expect(
-      async () =>
-        await grantRole({
-          user_id: 'u-1',
-          role: 'owner',
-          agent_group_id: 'ag-1',
-          granted_by: null,
-          granted_at: now(),
-        }),
-    ).toThrow();
+    // `.rejects`, not `.toThrow()`: the owner-scope check still runs before the
+    // first await, but `grantRole` is async now, so the throw surfaces as a
+    // rejected promise. `expect(asyncFn).toThrow()` sees the promise, not the
+    // error, and passes vacuously.
+    await expect(
+      grantRole({
+        user_id: 'u-1',
+        role: 'owner',
+        agent_group_id: 'ag-1',
+        granted_by: null,
+        granted_at: now(),
+      }),
+    ).rejects.toThrow('owner role must be global (agent_group_id = null)');
   });
 
   it('hasAnyOwner reflects owner grants', async () => {
