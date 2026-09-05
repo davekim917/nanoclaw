@@ -2,7 +2,8 @@ import { randomUUID } from 'crypto';
 
 import { resolveUnknownSenderPolicy } from '../../channels/channel-defaults.js';
 import { hasDeclaredChannelDefaults } from '../../channels/channel-registry.js';
-import { getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
+import { getMessagingGroup, getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
+import { getDeliveryAdapter } from '../../delivery.js';
 import { log } from '../../log.js';
 import { routeInbound } from '../../router.js';
 import { registerResource } from '../crud.js';
@@ -126,6 +127,43 @@ registerResource({
           },
         });
         return { sent: { channel_type: channelType, platform_id: platformId } };
+      },
+    },
+    notify: {
+      access: 'approval',
+      hostOnly: true,
+      description:
+        'Deliver a host notification directly to a messaging group without routing it through an agent. OPERATOR-ONLY. Use --id <messaging-group-id> --text <message>.',
+      args: [
+        { name: 'id', type: 'string', description: 'Messaging group UUID.', required: true },
+        { name: 'text', type: 'string', description: 'Notification text.', required: true },
+      ],
+      handler: async (args) => {
+        const id = args.id as string;
+        const mg = getMessagingGroup(id);
+        if (!mg) throw new Error(`messaging group not found: ${id}`);
+
+        const adapter = getDeliveryAdapter();
+        if (!adapter) throw new Error('delivery adapter unavailable');
+
+        const platformMessageId = await adapter.deliver(
+          mg.channel_type,
+          mg.platform_id,
+          null,
+          'chat',
+          JSON.stringify({ text: args.text as string }),
+          undefined,
+          mg.instance ?? mg.channel_type,
+        );
+        return {
+          delivered: {
+            messaging_group_id: mg.id,
+            channel_type: mg.channel_type,
+            platform_id: mg.platform_id,
+            instance: mg.instance ?? mg.channel_type,
+            platform_message_id: platformMessageId ?? null,
+          },
+        };
       },
     },
   },

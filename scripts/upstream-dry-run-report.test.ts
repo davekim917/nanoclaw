@@ -52,6 +52,20 @@ function close(server: net.Server): Promise<void> {
   return new Promise((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
 }
 
+function testDm() {
+  return { messagingGroupId: 'newer-dm' };
+}
+
+function delivery(messageId = 'platform-message'): Record<string, string | null> {
+  return {
+    messaging_group_id: 'newer-dm',
+    channel_type: 'test-channel',
+    platform_id: 'destination-current',
+    instance: 'test-channel-secondary',
+    platform_message_id: messageId,
+  };
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
@@ -62,12 +76,7 @@ describe('upstream dry-run owner notification', () => {
     const dbPath = path.join(fixtureRoot(), 'v2.db');
     createOwnerDb(dbPath);
 
-    expect(resolveLatestOwnerDm(dbPath)).toEqual({
-      ownerUserId: 'test-channel:owner-user',
-      instance: 'test-channel',
-      channelType: 'test-channel',
-      platformId: 'destination-newer',
-    });
+    expect(resolveLatestOwnerDm(dbPath)).toEqual({ messagingGroupId: 'newer-dm' });
   });
 
   it('returns no target when no owner has a DM cache row', () => {
@@ -77,150 +86,195 @@ describe('upstream dry-run owner notification', () => {
     expect(resolveLatestOwnerDm(dbPath)).toBeUndefined();
   });
 
-  it('submits a mention-addressed relay request without waiting for an acknowledgement', async () => {
+  it('submits the report to the host CLI and awaits its direct delivery result', async () => {
     const root = fixtureRoot();
-    const socketPath = path.join(root, 'cli.sock');
-    let received = '';
-    let receivePayload!: (payload: string) => void;
-    const receivedPayload = new Promise<string>((resolve) => {
-      receivePayload = resolve;
-    });
+    const socketPath = path.join(root, 'ncl.sock');
+    let request: Record<string, unknown> | undefined;
     const server = net.createServer((socket) => {
-      socket.on('data', (chunk) => {
-        received += chunk.toString('utf8');
+      socket.once('data', (chunk) => {
+        request = JSON.parse(chunk.toString('utf8')) as Record<string, unknown>;
+        socket.end(JSON.stringify({ id: request.id, ok: true, data: { delivered: delivery() } }) + '\n');
       });
-      socket.on('end', () => receivePayload(received));
     });
     await listen(server, socketPath);
 
     try {
-      await submitOwnerReport({
-        socketPath,
-        dm: {
-          ownerUserId: 'test-channel:owner-user',
-          instance: 'test-channel',
-          channelType: 'test-channel',
-          platformId: 'destination-current',
-        },
-        report: 'Weekly report body',
+      await expect(submitOwnerReport({ socketPath, dm: testDm(), report: 'Weekly report body' })).resolves.toEqual(
+        delivery(),
+      );
+      expect(request).toMatchObject({
+        id: expect.any(String),
+        command: 'messaging-groups-notify',
+        args: { id: 'newer-dm', text: 'Weekly report body' },
       });
-
-      const payload = JSON.parse((await receivedPayload).trim()) as Record<string, unknown>;
-      expect(payload).toMatchObject({
-        senderId: 'test-channel:owner-user',
-        sender: 'Upstream Dry Run',
-        isMention: true,
-        to: { channelType: 'test-channel', platformId: 'destination-current', threadId: 'destination-current' },
-      });
-      expect(payload.text).toContain('Please relay');
-      expect(payload.text).toContain('Weekly report body');
+      expect(request).not.toHaveProperty('senderId');
+      expect(request).not.toHaveProperty('isMention');
     } finally {
       await close(server);
     }
   });
 
-  it('retains a named instance and refuses to silently route it through the default adapter', async () => {
+  it('accepts a named-instance owner DM because the host resolves the messaging group', async () => {
     const dbPath = path.join(fixtureRoot(), 'v2.db');
     createOwnerDb(dbPath);
     const db = new Database(dbPath);
     db.prepare('UPDATE messaging_groups SET instance = ? WHERE id = ?').run('test-channel-secondary', 'newer-dm');
     db.close();
     const dm = resolveLatestOwnerDm(dbPath)!;
-    expect(dm.instance).toBe('test-channel-secondary');
-    const connectSocket = vi.fn();
+    const socket = new EventEmitter() as EventEmitter & {
+      destroy: () => void;
+      write: (payload: string, callback: (err?: Error | null) => void) => void;
+    };
+    socket.destroy = vi.fn();
+    socket.write = (payload, callback) => {
+      callback();
+      const request = JSON.parse(payload) as { id: string };
+      socket.emit(
+        'data',
+        Buffer.from(JSON.stringify({ id: request.id, ok: true, data: { delivered: delivery() } }) + '\n'),
+      );
+    };
 
-    await expect(submitOwnerReport({ socketPath: 'unused.sock', dm, report: 'report' }, connectSocket)).rejects.toThrow(
-      /named adapter instance/,
+    const submission = submitOwnerReport(
+      { socketPath: 'test.sock', dm, report: 'report' },
+      () => socket as unknown as net.Socket,
     );
-    expect(connectSocket).not.toHaveBeenCalled();
-  });
+    socket.emit('connect');
 
-  it('rejects an owner identity that would be renamespaced by the receiver', async () => {
-    const connectSocket = vi.fn();
-    await expect(
-      submitOwnerReport(
-        {
-          socketPath: 'unused.sock',
-          dm: {
-            ownerUserId: 'owner-without-namespace',
-            instance: 'test-channel',
-            channelType: 'test-channel',
-            platformId: 'destination-current',
-          },
-          report: 'report',
-        },
-        connectSocket,
-      ),
-    ).rejects.toThrow(/not namespaced/);
-    expect(connectSocket).not.toHaveBeenCalled();
+    await expect(submission).resolves.toEqual(delivery());
   });
 
   it('surfaces socket connection errors', async () => {
     const socketPath = path.join(fixtureRoot(), 'missing.sock');
 
-    await expect(
-      submitOwnerReport({
-        socketPath,
-        dm: {
-          ownerUserId: 'test-channel:owner-user',
-          instance: 'test-channel',
-          channelType: 'test-channel',
-          platformId: 'destination-current',
-        },
-        report: 'report',
-      }),
-    ).rejects.toThrow(/submission failed/);
+    await expect(submitOwnerReport({ socketPath, dm: testDm(), report: 'report' })).rejects.toThrow(
+      /submission failed/,
+    );
   });
 
   it('surfaces a socket timeout when a connection never completes', async () => {
-    const socket = new EventEmitter() as EventEmitter & { destroy: () => void; end: () => void };
+    const socket = new EventEmitter() as EventEmitter & { destroy: () => void; write: () => void };
     socket.destroy = vi.fn();
-    socket.end = vi.fn();
+    socket.write = vi.fn();
 
     await expect(
       submitOwnerReport(
-        {
-          socketPath: 'pending.sock',
-          dm: {
-            ownerUserId: 'test-channel:owner-user',
-            instance: 'test-channel',
-            channelType: 'test-channel',
-            platformId: 'destination-current',
-          },
-          report: 'report',
-          timeoutMs: 1,
-        },
+        { socketPath: 'pending.sock', dm: testDm(), report: 'report', timeoutMs: 1 },
         () => socket as unknown as net.Socket,
       ),
     ).rejects.toThrow(/timed out/);
     expect(socket.destroy).toHaveBeenCalledOnce();
   });
 
-  it('surfaces a socket error reported by the end callback', async () => {
+  it('surfaces a socket error reported by the write callback', async () => {
     const socket = new EventEmitter() as EventEmitter & {
       destroy: () => void;
-      end: (payload: string, callback: (err?: Error | null) => void) => void;
+      write: (payload: string, callback: (err?: Error | null) => void) => void;
     };
     socket.destroy = vi.fn();
-    socket.end = (_payload, callback) => callback(new Error('write failed'));
+    socket.write = (_payload, callback) => callback(new Error('write failed'));
 
     const submission = submitOwnerReport(
-      {
-        socketPath: 'failed.sock',
-        dm: {
-          ownerUserId: 'test-channel:owner-user',
-          instance: 'test-channel',
-          channelType: 'test-channel',
-          platformId: 'destination-current',
-        },
-        report: 'report',
-      },
+      { socketPath: 'failed.sock', dm: testDm(), report: 'report' },
       () => socket as unknown as net.Socket,
     );
     socket.emit('connect');
 
     await expect(submission).rejects.toThrow(/write failed/);
     expect(socket.destroy).toHaveBeenCalledOnce();
+  });
+
+  it('rejects a malformed host CLI response', async () => {
+    const socket = new EventEmitter() as EventEmitter & {
+      destroy: () => void;
+      write: (payload: string, callback: (err?: Error | null) => void) => void;
+    };
+    socket.destroy = vi.fn();
+    socket.write = (_payload, callback) => {
+      callback();
+      socket.emit('data', Buffer.from('not-json\n'));
+    };
+
+    const submission = submitOwnerReport(
+      { socketPath: 'malformed.sock', dm: testDm(), report: 'report' },
+      () => socket as unknown as net.Socket,
+    );
+    socket.emit('connect');
+
+    await expect(submission).rejects.toThrow(/malformed response/);
+  });
+
+  it('rejects a host CLI response for another request', async () => {
+    const socket = new EventEmitter() as EventEmitter & {
+      destroy: () => void;
+      write: (payload: string, callback: (err?: Error | null) => void) => void;
+    };
+    socket.destroy = vi.fn();
+    socket.write = (_payload, callback) => {
+      callback();
+      socket.emit(
+        'data',
+        Buffer.from(JSON.stringify({ id: 'other-request', ok: true, data: { delivered: delivery() } }) + '\n'),
+      );
+    };
+
+    const submission = submitOwnerReport(
+      { socketPath: 'wrong-id.sock', dm: testDm(), report: 'report' },
+      () => socket as unknown as net.Socket,
+    );
+    socket.emit('connect');
+
+    await expect(submission).rejects.toThrow(/malformed response/);
+  });
+
+  it('surfaces a host CLI negative acknowledgement', async () => {
+    const socket = new EventEmitter() as EventEmitter & {
+      destroy: () => void;
+      write: (payload: string, callback: (err?: Error | null) => void) => void;
+    };
+    socket.destroy = vi.fn();
+    socket.write = (payload, callback) => {
+      callback();
+      const request = JSON.parse(payload) as { id: string };
+      socket.emit(
+        'data',
+        Buffer.from(
+          JSON.stringify({
+            id: request.id,
+            ok: false,
+            error: { code: 'handler-error', message: 'delivery rejected' },
+          }) + '\n',
+        ),
+      );
+    };
+
+    const submission = submitOwnerReport(
+      { socketPath: 'rejected.sock', dm: testDm(), report: 'report' },
+      () => socket as unknown as net.Socket,
+    );
+    socket.emit('connect');
+
+    await expect(submission).rejects.toThrow(/delivery rejected/);
+  });
+
+  it('rejects a closed connection before an acknowledgement', async () => {
+    const socket = new EventEmitter() as EventEmitter & {
+      destroy: () => void;
+      write: (payload: string, callback: (err?: Error | null) => void) => void;
+    };
+    socket.destroy = vi.fn();
+    socket.write = (_payload, callback) => {
+      callback();
+      socket.emit('close');
+    };
+
+    const submission = submitOwnerReport(
+      { socketPath: 'closed.sock', dm: testDm(), report: 'report' },
+      () => socket as unknown as net.Socket,
+    );
+    socket.emit('connect');
+
+    await expect(submission).rejects.toThrow(/closed before acknowledging/);
   });
 
   it('keeps the default invocation stdout-only without opening the DB or socket', async () => {
@@ -239,30 +293,25 @@ describe('upstream dry-run owner notification', () => {
     expect(log).toHaveBeenCalledWith('Manual report');
   });
 
-  it('resolves a temporary owner DB and submits the generated report when requested', async () => {
+  it('resolves a temporary owner DB and delivers the generated report when requested', async () => {
     const root = fixtureRoot();
     createOwnerDb(path.join(root, 'data', 'v2.db'));
     const generateReport = vi.fn(() => 'Generated report');
-    const submitReport = vi.fn().mockResolvedValue(undefined);
+    const submitReport = vi.fn().mockResolvedValue(delivery());
     const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
 
     await main(['--notify-owner'], root, { generateReport, submitReport });
 
     expect(submitReport).toHaveBeenCalledOnce();
     expect(submitReport).toHaveBeenCalledWith({
-      socketPath: path.join(root, 'data', 'cli.sock'),
-      dm: {
-        ownerUserId: 'test-channel:owner-user',
-        instance: 'test-channel',
-        channelType: 'test-channel',
-        platformId: 'destination-newer',
-      },
+      socketPath: path.join(root, 'data', 'ncl.sock'),
+      dm: { messagingGroupId: 'newer-dm' },
       report: 'Generated report',
     });
     expect(log).toHaveBeenNthCalledWith(1, 'Generated report');
     expect(log).toHaveBeenNthCalledWith(
       2,
-      'upstream-dry-run-report: report submitted to the owner DM agent via the CLI socket; delivery is unconfirmed.',
+      'upstream-dry-run-report: report delivered to the owner DM through the host CLI.',
     );
   });
 

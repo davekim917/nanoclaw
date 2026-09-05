@@ -11,6 +11,7 @@
  *        pnpm exec tsx scripts/upstream-dry-run-report.ts --notify-owner
  */
 import Database from 'better-sqlite3';
+import { randomUUID } from 'node:crypto';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,13 +19,10 @@ import { fileURLToPath } from 'node:url';
 import { generateDryRunReport } from '../src/upstream-dry-run-report.js';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const CLI_SOCKET_TIMEOUT_MS = 5_000;
+const NCL_SOCKET_TIMEOUT_MS = 5_000;
 
 export interface OwnerDm {
-  ownerUserId: string;
-  instance: string;
-  channelType: string;
-  platformId: string;
+  messagingGroupId: string;
 }
 
 type SocketConnector = (socketPath: string) => net.Socket;
@@ -36,7 +34,7 @@ export function resolveLatestOwnerDm(dbPath: string): OwnerDm | undefined {
     return (
       (db
         .prepare(
-          `SELECT ur.user_id AS ownerUserId, mg.instance AS instance, mg.platform_id AS platformId, ud.channel_type AS channelType
+          `SELECT mg.id AS messagingGroupId
              FROM user_roles ur
              JOIN user_dms ud ON ud.user_id = ur.user_id
              JOIN messaging_groups mg ON mg.id = ud.messaging_group_id
@@ -51,46 +49,74 @@ export function resolveLatestOwnerDm(dbPath: string): OwnerDm | undefined {
   }
 }
 
+export interface DeliveryResult {
+  messaging_group_id: string;
+  channel_type: string;
+  platform_id: string;
+  instance: string;
+  platform_message_id: string | null;
+}
+
+class InvalidDeliveryResponseError extends Error {}
+
+function parseDeliveryResult(response: unknown, requestId: string, messagingGroupId: string): DeliveryResult {
+  if (!response || typeof response !== 'object') {
+    throw new InvalidDeliveryResponseError(
+      'Host CLI returned a malformed response while delivering the weekly report.',
+    );
+  }
+  const frame = response as Record<string, unknown>;
+  if (frame.id !== requestId || typeof frame.ok !== 'boolean') {
+    throw new InvalidDeliveryResponseError(
+      'Host CLI returned a malformed response while delivering the weekly report.',
+    );
+  }
+  if (!frame.ok) {
+    const error = frame.error;
+    const message =
+      error && typeof error === 'object' && typeof (error as Record<string, unknown>).message === 'string'
+        ? (error as Record<string, unknown>).message
+        : 'unknown error';
+    throw new InvalidDeliveryResponseError(`Host CLI rejected the weekly report notification: ${message}`);
+  }
+  if (!frame.data || typeof frame.data !== 'object') {
+    throw new InvalidDeliveryResponseError('Host CLI returned no delivery result for the weekly report.');
+  }
+  const delivered = (frame.data as Record<string, unknown>).delivered;
+  if (
+    !delivered ||
+    typeof delivered !== 'object' ||
+    (delivered as Record<string, unknown>).messaging_group_id !== messagingGroupId
+  ) {
+    throw new InvalidDeliveryResponseError('Host CLI returned an invalid delivery result for the weekly report.');
+  }
+  return delivered as DeliveryResult;
+}
+
 /**
- * Submit a routed system message. The CLI socket has no acknowledgement, so
- * resolving means the payload was submitted to the socket, not delivered.
+ * Deliver the report through the host-only ncl command and await its result.
  */
 export async function submitOwnerReport(
   {
     socketPath,
     dm,
     report,
-    timeoutMs = CLI_SOCKET_TIMEOUT_MS,
+    timeoutMs = NCL_SOCKET_TIMEOUT_MS,
   }: { socketPath: string; dm: OwnerDm; report: string; timeoutMs?: number },
   connectSocket: SocketConnector = (target) => net.createConnection(target),
-): Promise<void> {
-  if (!dm.ownerUserId.includes(':')) {
-    throw new Error('Cannot notify the owner: the stored owner identity is not namespaced.');
-  }
-  if (dm.instance !== dm.channelType) {
-    throw new Error(
-      'Cannot notify the owner: this DM uses a named adapter instance that the current CLI transport cannot preserve. See issue #390.',
-    );
-  }
+): Promise<DeliveryResult> {
+  const requestId = randomUUID();
+  const payload = JSON.stringify({
+    id: requestId,
+    command: 'messaging-groups-notify',
+    args: { id: dm.messagingGroupId, text: report },
+  });
 
-  const payload =
-    JSON.stringify({
-      text: `System notification (weekly upstream dry-run): Please relay the following weekly upstream dry-run report to the operator:\n\n${report}`,
-      // This owner-only local transport acts on behalf of the selected owner.
-      senderId: dm.ownerUserId,
-      sender: 'Upstream Dry Run',
-      isMention: true,
-      to: {
-        channelType: dm.channelType,
-        platformId: dm.platformId,
-        threadId: dm.platformId,
-      },
-    }) + '\n';
-
-  await new Promise<void>((resolve, reject) => {
+  return new Promise<DeliveryResult>((resolve, reject) => {
     let socket: net.Socket | undefined;
     let settled = false;
-    const settle = (err?: Error): void => {
+    let buffer = '';
+    const settle = (result?: DeliveryResult, err?: Error): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -98,13 +124,14 @@ export async function submitOwnerReport(
       if (err) {
         reject(err);
       } else {
-        resolve();
+        resolve(result as DeliveryResult);
       }
     };
 
     const timer = setTimeout(
       () =>
         settle(
+          undefined,
           new Error(`CLI socket at ${socketPath} timed out after ${timeoutMs}ms while submitting the weekly report.`),
         ),
       timeoutMs,
@@ -113,20 +140,44 @@ export async function submitOwnerReport(
     try {
       socket = connectSocket(socketPath);
     } catch (err) {
-      settle(
-        new Error(`CLI socket at ${socketPath} submission failed: ${err instanceof Error ? err.message : String(err)}`),
-      );
+      if (!(err instanceof Error)) throw err;
+      settle(undefined, new Error(`CLI socket at ${socketPath} submission failed: ${err.message}`));
       return;
     }
 
-    socket.once('error', (err) => settle(new Error(`CLI socket at ${socketPath} submission failed: ${err.message}`)));
+    socket.once('error', (err) =>
+      settle(undefined, new Error(`CLI socket at ${socketPath} submission failed: ${err.message}`)),
+    );
+    socket.once('close', () => {
+      if (!settled) {
+        settle(undefined, new Error(`CLI socket at ${socketPath} closed before acknowledging the weekly report.`));
+      }
+    });
+    socket.on('data', (chunk) => {
+      buffer += chunk.toString('utf8');
+      const newline = buffer.indexOf('\n');
+      if (newline < 0) return;
+      try {
+        settle(parseDeliveryResult(JSON.parse(buffer.slice(0, newline)), requestId, dm.messagingGroupId));
+      } catch (err) {
+        if (err instanceof InvalidDeliveryResponseError) {
+          settle(undefined, err);
+        } else if (err instanceof SyntaxError) {
+          settle(
+            undefined,
+            new Error(`Host CLI returned a malformed response while delivering the weekly report: ${err.message}`),
+          );
+        } else {
+          throw err;
+        }
+      }
+    });
     socket.once('connect', () => {
-      socket.end(payload, (err?: Error | null) => {
+      socket.write(payload + '\n', (err?: Error | null) => {
         if (err) {
-          settle(new Error(`CLI socket at ${socketPath} submission failed: ${err.message}`));
+          settle(undefined, new Error(`CLI socket at ${socketPath} submission failed: ${err.message}`));
           return;
         }
-        settle();
       });
     });
   });
@@ -161,10 +212,8 @@ export async function main(
     throw new Error('Cannot notify the owner: no owner DM found through user_roles + user_dms.');
   }
 
-  await submitReport({ socketPath: path.join(root, 'data', 'cli.sock'), dm, report });
-  console.log(
-    'upstream-dry-run-report: report submitted to the owner DM agent via the CLI socket; delivery is unconfirmed.',
-  );
+  await submitReport({ socketPath: path.join(root, 'data', 'ncl.sock'), dm, report });
+  console.log('upstream-dry-run-report: report delivered to the owner DM through the host CLI.');
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
