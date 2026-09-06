@@ -3273,24 +3273,24 @@ export async function honorPendingStopIntents(
 
 /**
  * Clear the plain `'stop'` rows the boot pass read, in one conditional write
- * (#474). Conditional on the value still being `'stop'`, so a row a kill
- * re-armed to `respawn_after_stop` since the read is never flattened; scoped to
- * the ids read, so a `'stop'` recorded after the read is left for the next
- * boot. Never a row whose session is pending adoption.
+ * (#474). Each row is matched on the value AND the `updated_at` that was read,
+ * so only the row version the pass saw is cleared: a kill that re-armed the
+ * row to `respawn_after_stop` since, or recorded a fresh `'stop'` for the same
+ * session (a thread close landing while an earlier respawn was awaited), wrote
+ * a newer stamp and is left for the next boot. Never a row whose session is
+ * pending adoption.
  */
 async function clearHonouredStopIntents(intents: SessionClaimRow[]): Promise<void> {
   const plain = intents.filter((intent) => intent.stop_intent === 'stop');
-  const honoured = plain
-    .filter((intent) => !pendingAdoptions.has(intent.session_id))
-    .map((intent) => intent.session_id);
+  const honoured = plain.filter((intent) => !pendingAdoptions.has(intent.session_id));
   if (honoured.length === 0) return;
   let cleared = 0;
   await shadowWrite('stop-intent-clear', async () => {
     const result = await getDb().run(
       `UPDATE session_claims SET stop_intent = NULL, updated_at = ?
-         WHERE stop_intent = 'stop' AND session_id IN (${honoured.map(() => '?').join(', ')})`,
+         WHERE stop_intent = 'stop' AND (session_id, updated_at) IN (VALUES ${honoured.map(() => '(?, ?)').join(', ')})`,
       new Date().toISOString(),
-      ...honoured,
+      ...honoured.flatMap((intent) => [intent.session_id, intent.updated_at]),
     );
     cleared = result.changes;
   });

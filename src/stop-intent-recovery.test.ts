@@ -566,6 +566,34 @@ describe('durable stop intent', () => {
     ).toEqual([['Cleared honoured stop intents at startup', { cleared: 1, deferredPendingAdoption: 1 }]]);
   });
 
+  it('a plain stop row rewritten after the read is left for the next boot', async () => {
+    await seedSession('sess-owed');
+    await seedSession('sess-stopped');
+    await seedSession('sess-reissued');
+    await setStopIntent('sess-owed', 'respawn_after_stop', STAMP);
+    await setStopIntent('sess-stopped', 'stop', STAMP);
+    await setStopIntent('sess-reissued', 'stop', STAMP);
+
+    const LATER = '2026-09-05T00:00:01.000Z';
+    await honorPendingStopIntents(
+      async () => {
+        // The window: a kill for a session whose plain row the pass already
+        // read lands while an earlier respawn is awaited. The row it writes is
+        // a newer version than the one read, and is not the pass's to clear.
+        await setStopIntent('sess-reissued', 'stop', LATER);
+        return true;
+      },
+      () => false,
+    );
+
+    expect(await storedIntent('sess-stopped')).toBeNull();
+    expect(await storedIntent('sess-reissued')).toBe('stop');
+    expect((await getSessionClaim('sess-reissued'))?.updated_at).toBe(LATER);
+    expect(
+      vi.mocked(log.info).mock.calls.filter((call) => call[0] === 'Cleared honoured stop intents at startup'),
+    ).toEqual([['Cleared honoured stop intents at startup', { cleared: 1, deferredPendingAdoption: 0 }]]);
+  });
+
   it('a boot with no plain stop rows logs no clear', async () => {
     await seedSession('sess-owed');
     await setStopIntent('sess-owed', 'respawn_after_stop', STAMP);
