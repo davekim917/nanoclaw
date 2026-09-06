@@ -981,11 +981,12 @@ it('passes exact-thread context requests through the scoped source loader withou
       new Request('http://localhost/dashboard/api/observatory/v2?workgroup=w&thread_id=synthetic-thread&thread_offset=200'),
       {}, ctx('j', 'member', ['a']),
     );
+    if (!response) throw new Error('Expected the Signal endpoint to respond');
     expect(response.status).toBe(200);
     expect(observed).toEqual([expect.objectContaining({ threadId: 'synthetic-thread', threadOffset: 0 })]);
     const body = await response.json();
-    expect(body.agents.map((agent: { id: string }) => agent.id)).toEqual(['a']);
-    expect(body.rawDecisions).toBeUndefined();
+    expect(body).toMatchObject({ agents: [{ id: 'a' }] });
+    expect(body).not.toHaveProperty('rawDecisions');
   } finally {
     spy.mockRestore();
   }
