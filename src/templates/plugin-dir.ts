@@ -33,13 +33,18 @@ export interface PluginFile {
  * found. Throws on the first symlink, special file, path escape, or cap
  * violation — the caller must treat that as "reject the whole plugin".
  */
-export function walkPluginDir(root: string): PluginFile[] {
+export function walkPluginDir(root: string): { files: PluginFile[]; dirs: string[] } {
   const resolvedRoot = path.resolve(root);
   const rootStat = fs.lstatSync(resolvedRoot);
   if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
     throw new Error('Plugin rejected: the plugin root must be a regular directory');
   }
   const files: PluginFile[] = [];
+  // Directories are recorded as well as walked: `copyPluginDir` recreates only
+  // the parents of files, so an intentionally EMPTY shipped directory — the
+  // `./work` a server declares as its `cwd` — vanished from the stamp and the
+  // server's `cd` failed at first launch (Codex on #500 round 8).
+  const dirs: string[] = [];
   // Directories count toward the entry cap too — a breadth bomb of empty
   // dirs must trip the same abuse bound as a file bomb.
   let entries = 0;
@@ -67,6 +72,7 @@ export function walkPluginDir(root: string): PluginFile[] {
         throw new Error(`Plugin rejected: more than ${MAX_PLUGIN_FILES} entries`);
       }
       if (entry.isDirectory()) {
+        dirs.push(rel);
         visit(rel, depth + 1);
         continue;
       }
@@ -83,7 +89,7 @@ export function walkPluginDir(root: string): PluginFile[] {
   };
 
   visit('', 0);
-  return files;
+  return { files, dirs };
 }
 
 /**
@@ -92,9 +98,12 @@ export function walkPluginDir(root: string): PluginFile[] {
  * see the same tree.
  */
 export function copyPluginDir(src: string, dest: string): void {
-  const files = walkPluginDir(src);
+  const { files, dirs } = walkPluginDir(src);
   fs.rmSync(dest, { recursive: true, force: true });
   fs.mkdirSync(dest, { recursive: true });
+  // Every source directory, not just the ones holding files: an empty shipped
+  // directory is a legitimate `cwd` target and must survive the stamp.
+  for (const dir of dirs) fs.mkdirSync(path.join(dest, ...dir.split('/')), { recursive: true });
   for (const file of files) {
     const target = path.join(dest, ...file.rel.split('/'));
     fs.mkdirSync(path.dirname(target), { recursive: true });

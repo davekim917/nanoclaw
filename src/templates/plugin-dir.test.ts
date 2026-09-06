@@ -74,7 +74,7 @@ describe('walkPluginDir', () => {
     write('skills/a/SKILL.md', 'skill');
     expect(
       walkPluginDir(src)
-        .map((f) => f.rel)
+        .files.map((f) => f.rel)
         .sort(),
     ).toEqual(['plugin.json', 'skills/a/SKILL.md']);
   });

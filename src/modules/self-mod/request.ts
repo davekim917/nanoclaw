@@ -104,8 +104,11 @@ const MCP_PAYLOAD_MAX_BYTES = 16384;
  * `<redacted: N bytes, sha256 XXXXXXXX>` placeholder — but the verbatim
  * value still goes into the approval payload and is applied unchanged.
  */
-const SECRET_ENV_KEY_RE = /(TOKEN|SECRET|PASSW(OR)?D|API_?KEY|APIKEY|CREDENTIAL|PRIVATE_?KEY|AUTH)/i;
-const SECRET_VALUE_RE = /^(sk-|ghp_|github_pat_|xox[a-z]-|AKIA|-----BEGIN )/;
+// Exported for the template/plugin stamp path, where the same patterns drive
+// rejection (a real key must never ship inside a template) instead of card
+// redaction. Keep the two uses on one definition.
+export const SECRET_ENV_KEY_RE = /(TOKEN|SECRET|PASSW(OR)?D|API_?KEY|APIKEY|CREDENTIAL|PRIVATE_?KEY|AUTH)/i;
+export const SECRET_VALUE_RE = /^(sk-|ghp_|github_pat_|xox[a-z]-|AKIA|-----BEGIN )/;
 
 /** Card-only placeholder for a secret-shaped value: byte length + sha256 fingerprint. */
 function redactSecret(value: string): string {

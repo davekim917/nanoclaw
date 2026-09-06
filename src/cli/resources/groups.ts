@@ -145,16 +145,24 @@ registerResource({
       access: 'approval',
       description:
         'Create (or return the existing) agent group with its container config. Idempotent on --folder. ' +
-        'With --template <ref>, stamp from a local template under templates/ (MCP servers + instructions ' +
-        '+ skills + paused recurring tasks). Use --folder <slug> and --name <display name>. ' +
+        'With --template <ref>, stamp from a local Agent Plugins 1.0.0 plugin directory under templates/ ' +
+        '(plugin.json, plus optional skills/, mcp.json and an ai.nanoco.nanoclaw/ extension carrying ' +
+        'instructions, context extras and paused recurring tasks). The plugin is copied to ' +
+        'groups/<folder>/plugins/<name> read-only, with plugin-data/<name> as its writable sibling; ' +
+        'a pre-plugin template folder is refused with a migration error. Use --folder <slug> and --name <display name>. ' +
         'Optional --timezone <IANA id> sets the group timezone (template task schedules fire in it); like --name, it is ignored when the folder already exists.',
       handler: async (args) => {
         const timezone = parseTimezoneFlag(args.timezone) ?? undefined;
         if (args.template) {
-          return await createAgentFromTemplate(String(args.template), {
+          // `report` names every plugin component that was skipped (a
+          // non-conforming skill, an invalid server, an ignored manifest field).
+          // Surfaced to the operator who ran the stamp, not only logged; the
+          // result shape is unchanged when the plugin was clean.
+          const { group: stamped, report } = await createAgentFromTemplate(String(args.template), {
             name: args.name ? String(args.name) : undefined,
             timezone,
           });
+          return report.length > 0 ? { ...stamped, report } : stamped;
         }
         const folder = args.folder as string;
         if (!folder) throw new Error('--folder is required');

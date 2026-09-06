@@ -33,6 +33,16 @@ import type { AgentGroup, ContainerConfigRow } from './types.js';
  * at the HTTPS_PROXY layer by OneCLI — the container never sees the token.
  * SSE is deprecated and rejected by config validation.
  */
+/**
+ * Container-side path where a group's stamped plugins are mounted read-only.
+ * Lockstep: create-agent.ts records `pluginRoot` under this prefix and
+ * container-runner.ts mounts groups/<folder>/plugins here.
+ *
+ * Not the fork's fleet-wide `~/plugins` -> /workspace/plugins mount, which is
+ * operator-curated, live, and shared by every group.
+ */
+export const CONTAINER_PLUGINS_DIR = '/workspace/agent/plugins';
+
 export type McpServerConfig = StdioMcpServerConfig | HttpMcpServerConfig | SseMcpServerConfig;
 
 /**
@@ -65,6 +75,16 @@ export interface StdioMcpServerConfig {
    * it and injects both env vars when building the provider's server map.
    */
   pluginRoot?: string;
+  /**
+   * Name of the plugin that stamped this server. Ownership marker: plugin-owned
+   * servers reject CLI/self-mod edits and are swapped wholesale on restamp
+   * (`ncl groups create --template`). Internal — never CLI input, and never
+   * written to container.json: that file IS the spawn-time config here, so the
+   * marker would flow into every provider's server map. Ownership is read from
+   * the `container_configs.mcp_servers` projection, which every guard site
+   * already has in hand.
+   */
+  plugin?: string;
   instructions?: string;
 }
 
@@ -72,6 +92,8 @@ export interface HttpMcpServerConfig {
   type: 'http';
   url: string;
   headers?: Record<string, string>;
+  /** See StdioMcpServerConfig.plugin — same ownership marker. */
+  plugin?: string;
   // Optional always-in-context guidance; host imports into composed CLAUDE.md.
   instructions?: string;
 }

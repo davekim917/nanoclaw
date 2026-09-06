@@ -262,6 +262,16 @@ export function initGroupFilesystem(
     initialized.push('spawn-template.md');
   }
 
+  // plugins/ always exists (even for plugin-less groups) so the read-only
+  // plugins mount in container-runner.ts is unconditional. Without the dir,
+  // Docker creates that mount's destination ROOT-owned inside the group folder
+  // — the same trap spawn-template.md above exists to avoid.
+  const pluginsDir = path.join(groupDir, 'plugins');
+  if (!fs.existsSync(pluginsDir)) {
+    fs.mkdirSync(pluginsDir, { recursive: true });
+    initialized.push('plugins/');
+  }
+
   // Note: the container_configs DB row is NOT created here. Local's
   // applyCreateAgent ordering puts initGroupFilesystem BEFORE the
   // agent_groups insert (so a DB failure can roll back the FS via

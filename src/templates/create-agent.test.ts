@@ -25,30 +25,41 @@ vi.mock('../log.js', () => ({
   isSurvivableIoError: vi.fn(() => false),
 }));
 
+import { CONTAINER_PLUGINS_DIR } from '../container-config.js';
 import { closeDb, getAllAgentGroups, initTestDb, runMigrations, getRawDb } from '../db/index.js';
 import { getContainerConfig } from '../db/container-configs.js';
 import { findTaskSessions } from '../db/sessions.js';
 import { STANDING_INSTRUCTIONS_FILE } from '../group-persona.js';
 import { inboundDbPath } from '../mailbox/sqlite/paths.js';
 import { createAgentFromTemplate } from './create-agent.js';
+import { NANOCLAW_EXTENSION_NS } from './extension.js';
+import { MCP_SCHEMA_URL, PLUGIN_SCHEMA_URL } from './manifest.js';
 
+const TEMPLATE_DIR = path.join(TEMPLATES_DIR, 'sales', 'sdr');
+
+/** The stamp fixture, as an Agent Plugins 1.0.0 plugin directory. */
 function writeTemplate(): void {
-  const t = path.join(TEMPLATES_DIR, 'sales', 'sdr');
-  fs.mkdirSync(path.join(t, 'context', 'additional_context'), { recursive: true });
-  fs.writeFileSync(path.join(t, 'context', 'instructions.md'), 'You are an SDR agent.\n');
-  fs.writeFileSync(path.join(t, 'context', 'playbook.md'), '# Playbook\n');
-  fs.writeFileSync(path.join(t, 'context', 'additional_context', 'faq.md'), '# FAQ\n');
+  const t = TEMPLATE_DIR;
+  const ctx = path.join(t, NANOCLAW_EXTENSION_NS, 'context');
+  fs.mkdirSync(path.join(ctx, 'additional_context'), { recursive: true });
+  fs.writeFileSync(path.join(t, 'plugin.json'), JSON.stringify({ $schema: PLUGIN_SCHEMA_URL, name: 'sdr' }));
+  fs.writeFileSync(path.join(ctx, 'instructions.md'), 'You are an SDR agent.\n');
+  fs.writeFileSync(path.join(ctx, 'playbook.md'), '# Playbook\n');
+  fs.writeFileSync(path.join(ctx, 'additional_context', 'faq.md'), '# FAQ\n');
   fs.writeFileSync(
-    path.join(t, '.mcp.json'),
-    JSON.stringify({ mcpServers: { hubspot: { command: 'npx', args: ['-y', '@hubspot/mcp-server'] } } }),
+    path.join(t, 'mcp.json'),
+    JSON.stringify({
+      $schema: MCP_SCHEMA_URL,
+      mcpServers: { hubspot: { type: 'stdio', command: 'npx', args: ['-y', '@hubspot/mcp-server'] } },
+    }),
   );
   const skillDir = path.join(t, 'skills', 'widget');
   fs.mkdirSync(skillDir, { recursive: true });
-  fs.writeFileSync(path.join(skillDir, 'SKILL.md'), '---\nname: widget\n---\n');
+  fs.writeFileSync(path.join(skillDir, 'SKILL.md'), '---\nname: widget\ndescription: does widget things\n---\n');
 }
 
 function writeTask(name: string, schedule: string, prompt: string, script?: string): void {
-  const dir = path.join(TEMPLATES_DIR, 'sales', 'sdr', 'tasks');
+  const dir = path.join(TEMPLATE_DIR, NANOCLAW_EXTENSION_NS, 'tasks');
   fs.mkdirSync(dir, { recursive: true });
   const scriptBlock = script
     ? `script: |\n${script
@@ -74,7 +85,7 @@ afterEach(async () => {
 
 describe('createAgentFromTemplate', () => {
   it('writes the persona prepend verbatim — no injected context refs, no .seed.md', async () => {
-    const g = await createAgentFromTemplate('sales/sdr', { name: 'SDR Test' });
+    const { group: g } = await createAgentFromTemplate('sales/sdr', { name: 'SDR Test' });
 
     const groupDir = path.join(GROUPS_DIR, g.folder);
     const prepend = fs.readFileSync(path.join(groupDir, STANDING_INSTRUCTIONS_FILE), 'utf-8');
@@ -83,14 +94,14 @@ describe('createAgentFromTemplate', () => {
   });
 
   it('copies template skills into the group-private Claude-plane skills dir', async () => {
-    const g = await createAgentFromTemplate('sales/sdr', { name: 'SDR Skills' });
+    const { group: g } = await createAgentFromTemplate('sales/sdr', { name: 'SDR Skills' });
 
     const skill = path.join(DATA_DIR, 'v2-sessions', g.id, '.claude-shared', 'skills', 'widget', 'SKILL.md');
     expect(fs.existsSync(skill)).toBe(true);
   });
 
   it('writes MCP servers to the container config and context extras at their template-relative paths', async () => {
-    const g = await createAgentFromTemplate('sales/sdr', { name: 'SDR Mcp' });
+    const { group: g } = await createAgentFromTemplate('sales/sdr', { name: 'SDR Mcp' });
 
     const cfg = await getContainerConfig(g.id);
     expect(cfg).toBeTruthy();
@@ -106,7 +117,7 @@ describe('createAgentFromTemplate', () => {
   it('creates template tasks paused through the normal isolated task-session path', async () => {
     writeTask('weekday-briefing', '0 9 * * 1-5', 'Send the weekday briefing.');
 
-    const g = await createAgentFromTemplate('sales/sdr', { name: 'SDR Tasks' });
+    const { group: g } = await createAgentFromTemplate('sales/sdr', { name: 'SDR Tasks' });
     const sessions = await findTaskSessions(g.id);
     expect(sessions).toHaveLength(1);
 
@@ -130,7 +141,7 @@ describe('createAgentFromTemplate', () => {
   it('stamps a valid timezone onto the config row, container.json, and template first runs', async () => {
     writeTask('daily-digest', '0 9 * * *', 'Send the digest.');
 
-    const g = await createAgentFromTemplate('sales/sdr', { name: 'SDR TZ', timezone: 'Asia/Tokyo' });
+    const { group: g } = await createAgentFromTemplate('sales/sdr', { name: 'SDR TZ', timezone: 'Asia/Tokyo' });
     expect((await getContainerConfig(g.id))?.timezone).toBe('Asia/Tokyo');
     // Mirrored to the file the spawn path reads for the container's TZ env.
     const fileConfig = JSON.parse(fs.readFileSync(path.join(GROUPS_DIR, g.folder, 'container.json'), 'utf8')) as {
@@ -152,20 +163,34 @@ describe('createAgentFromTemplate', () => {
   });
 
   it('ignores an invalid timezone — the group follows the install default', async () => {
-    const g = await createAgentFromTemplate('sales/sdr', { name: 'SDR Bad TZ', timezone: 'Not/AZone' });
+    const { group: g } = await createAgentFromTemplate('sales/sdr', { name: 'SDR Bad TZ', timezone: 'Not/AZone' });
     expect((await getContainerConfig(g.id))?.timezone).toBeNull();
   });
 
   it('writes template MCP servers into container.json, not only the DB projection', async () => {
     // The spawn path reads container.json; a DB-only write left a stamped
     // template's servers unwired, since the absent file materializes empty.
-    const g = await createAgentFromTemplate('sales/sdr', { name: 'SDR MCP' });
+    const { group: g } = await createAgentFromTemplate('sales/sdr', { name: 'SDR MCP' });
     const fileConfig = JSON.parse(fs.readFileSync(path.join(GROUPS_DIR, g.folder, 'container.json'), 'utf8')) as {
-      mcpServers?: Record<string, unknown>;
+      mcpServers: Record<string, Record<string, unknown>>;
     };
+    // Marked for the container: an explicit `cwd` (the spec's plugin-root
+    // default, materialized once at stamp time) and the `pluginRoot` the
+    // agent-runner expands ${PLUGIN_ROOT}/${PLUGIN_DATA} against.
     expect(fileConfig.mcpServers).toEqual({
-      hubspot: { command: 'npx', args: ['-y', '@hubspot/mcp-server'], env: {} },
+      hubspot: {
+        cwd: '${PLUGIN_ROOT}',
+        command: 'npx',
+        args: ['-y', '@hubspot/mcp-server'],
+        env: {},
+        pluginRoot: `${CONTAINER_PLUGINS_DIR}/sdr`,
+        plugin: 'sdr',
+      },
     });
+    // BOTH stores carry the ownership marker: every mutation guard reads the
+    // FILE, so a DB-only marker would guard nothing (Codex on #500). The
+    // runner strips `plugin` and `pluginRoot` before any provider sees them.
+    expect(fileConfig.mcpServers.hubspot).toMatchObject({ plugin: 'sdr' });
     expect(JSON.parse((await getContainerConfig(g.id))!.mcp_servers)).toEqual(fileConfig.mcpServers);
   });
 
@@ -173,7 +198,7 @@ describe('createAgentFromTemplate', () => {
     const script = 'count=2\necho \'{"wakeAgent": true, "data": {"count": 2}}\'';
     writeTask('alert-watch', '*/15 * * * *', 'Investigate new alerts.', script);
 
-    const g = await createAgentFromTemplate('sales/sdr', { name: 'Scripted Tasks' });
+    const { group: g } = await createAgentFromTemplate('sales/sdr', { name: 'Scripted Tasks' });
     const sessions = await findTaskSessions(g.id);
     expect(sessions).toHaveLength(1);
 
