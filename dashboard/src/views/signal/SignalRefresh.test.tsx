@@ -80,6 +80,58 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 describe('Signal live refresh and paging', () => {
+  it('shows Saturday cadence only when its configured workspace is authorized and loaded', async () => {
+    vi.stubEnv('VITE_SATURDAY_RELEASE_WORKGROUP', 'private-workspace');
+    mount();
+    await tick();
+    expect(screen.queryByRole('region', { name: 'Saturday release' })).not.toBeInTheDocument();
+    cleanup();
+    vi.stubEnv('VITE_SATURDAY_RELEASE_WORKGROUP', 'wg');
+    mount();
+    await tick();
+    expect(screen.getByRole('region', { name: 'Saturday release' })).toHaveTextContent('develop → main');
+    expect(screen.getByRole('region', { name: 'Saturday release' })).toHaveTextContent('0 source-reported human calls');
+    expect(screen.queryByRole('button', { name: 'Review release blockers →' })).not.toBeInTheDocument();
+  });
+  it('hides Saturday cadence after switching to a different workspace even when the release workspace remains visible', async () => {
+    vi.stubEnv('VITE_SATURDAY_RELEASE_WORKGROUP', 'release-workspace');
+    const all = overview();
+    all.workgroups = [
+      { id: 'release-workspace', name: 'Release workspace' },
+      { id: 'other-workspace', name: 'Other workspace' },
+    ];
+    all.projects[0]!.workgroup_id = 'other-workspace';
+    const other = { ...all, projects: [...all.projects], decisions: [...all.decisions] };
+    vi.mocked(api.getSignalOverview).mockImplementation((workspace) =>
+      Promise.resolve(workspace === 'other-workspace' ? other : all),
+    );
+    mount();
+    await tick();
+    expect(screen.getByRole('region', { name: 'Saturday release' })).toBeInTheDocument();
+    fireEvent.change(screen.getByRole('combobox', { name: 'Workspace' }), { target: { value: 'other-workspace' } });
+    await tick();
+    expect(screen.queryByRole('region', { name: 'Saturday release' })).not.toBeInTheDocument();
+  });
+  it('continues to render and refresh when accessing browser storage is denied', async () => {
+    const original = Object.getOwnPropertyDescriptor(window, 'localStorage');
+    Object.defineProperty(window, 'localStorage', {
+      configurable: true,
+      get: () => {
+        throw new DOMException('Storage access denied', 'SecurityError');
+      },
+    });
+    try {
+      mount();
+      await tick();
+      expect(screen.getAllByText('First project').length).toBeGreaterThan(0);
+      fireEvent.click(screen.getByRole('button', { name: 'Refresh records' }));
+      await tick(1001);
+      expect(api.getSignalOverview).toHaveBeenCalledTimes(2);
+    } finally {
+      if (original) Object.defineProperty(window, 'localStorage', original);
+      else Reflect.deleteProperty(window, 'localStorage');
+    }
+  });
   it('replays a connection opened before mount and coalesces reconnect event bursts', async () => {
     startSSE();
     Source.latest.emit('open');

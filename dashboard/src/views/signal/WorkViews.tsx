@@ -3,6 +3,7 @@ import useSWR from 'swr';
 import type { SignalAgent, SignalDecision, SignalOverview } from '../../../../src/dashboard/observatory-v2/types.js';
 import { getThreadDetail, listThreads, postThreadMessage, type AuthMe, type ApiError } from '../../lib/api.js';
 import { subscribe } from '../../lib/sse.ts';
+import { getSignalThreadContext } from '../../lib/signal-api.js';
 import { ThreadConsole } from '../console/ThreadConsole.js';
 import { CloseThreadControl } from '../console/CloseControl.js';
 import { setSnoozed } from '../console/actions.js';
@@ -17,7 +18,9 @@ export function DecisionQueue({
   selectedId,
   onSelect,
   baseline = null,
+  timezone,
 }: {
+  timezone: string | null;
   baseline?: VisitBaseline | null;
   decisions: SignalDecision[];
   selectedId: string | null;
@@ -57,7 +60,7 @@ export function DecisionQueue({
                         ? 'Approval'
                         : 'Agent question'}
                   </span>
-                  <time title={d.source_as_of ?? undefined}>{sourceAge(d.source_as_of)}</time>
+                  <time title={signalStamp(d.source_as_of, timezone)}>{sourceAge(d.source_as_of)}</time>
                 </span>
                 <span className="work-row-owner">
                   {d.owner ? `${d.owner.name} reviewing` : 'Unclaimed'}
@@ -294,6 +297,11 @@ export function ThreadWorkspace({
     () => getThreadDetail(selectedId!),
     { refreshInterval: 30000 },
   );
+  const { data: context, error: contextError, mutate: refreshContext } = useSWR(
+    selectedId ? ['work-thread-context', authMe.user_id, workgroup, selectedId] : null,
+    () => getSignalThreadContext(selectedId!, workgroup),
+    { refreshInterval: 30000 },
+  );
   const [tab, setTab] = useState<'context' | 'conversation'>('context');
   const [recipient, setRecipient] = useState('');
   const [text, setText] = useState('');
@@ -330,6 +338,7 @@ export function ThreadWorkspace({
           timer = undefined;
           void mutate();
           void refreshList();
+          void refreshContext();
         }, 400);
     };
     const off = (['connection', 'session_event', 'inbound_message'] as const).map((kind) => subscribe(kind, refresh));
@@ -337,18 +346,34 @@ export function ThreadWorkspace({
       off.forEach((fn) => fn());
       clearTimeout(timer);
     };
-  }, [mutate, refreshList]);
+  }, [mutate, refreshList, refreshContext]);
   const thread = data?.thread;
+  const hasConversation = (thread?.session_ids.length ?? 0) > 0;
+  const contextUnavailable = context?.sources.some(
+    (source) => source.source === 'threads' && source.status === 'unavailable',
+  );
+  // A healthy exact response is authoritative, including an empty mapping.
+  // Preserve already-loaded context while the exact source is unavailable.
+  const workContext = context && !contextUnavailable ? context : overview ?? context;
   const related =
-    overview?.decisions.filter((d) => d.thread_id === selectedId || d.dispatch_target_thread_id === selectedId) ?? [];
-  const project = overview?.projects.find((p) => p.thread_ids.includes(selectedId ?? ''));
+    workContext?.decisions.filter((d) => d.thread_id === selectedId || d.dispatch_target_thread_id === selectedId) ?? [];
+  const project = workContext?.projects.find((p) => p.thread_ids.includes(selectedId ?? ''));
+  const contextStatus = contextError
+    ? 'Exact work context could not be loaded.'
+    : !context
+      ? 'Loading exact work context…'
+      : contextUnavailable
+        ? 'Exact thread source is unavailable; project and decision coverage may be incomplete.'
+        : null;
   const maySend = authMe.scopes.role !== 'member';
   async function send() {
     if (!thread || !recipient || !text.trim()) return;
     setBusy(true);
     setFailure('');
     setSent('');
-    const sending = attempts.current.get(scopeKey) ?? { text, recipient, key: crypto.randomUUID() };
+    // A retry keeps the same immutable payload and delivery key, but gets a new
+    // object identity. Older requests can then no longer settle the newer one.
+    const sending = { ...(attempts.current.get(scopeKey) ?? { text, recipient, key: crypto.randomUUID() }) };
     attempts.current.set(scopeKey, sending);
     try {
       const result = await postThreadMessage(thread.thread_id, {
@@ -444,7 +469,7 @@ export function ThreadWorkspace({
                   <div className="work-context-grid">
                     <section>
                       <h3>Objective</h3>
-                      <p>{project?.description || 'No explicit project objective is mapped to this conversation.'}</p>
+                      <p>{project?.description || contextStatus || 'No explicit project objective is mapped to this conversation.'}</p>
                       {project && <small>{project.name}</small>}
                     </section>
                     <section>
@@ -477,7 +502,7 @@ export function ThreadWorkspace({
                     </a>
                   ))}
                   {!related.length && (
-                    <p className="work-missing">No decision explicitly references this conversation.</p>
+                    <p className="work-missing">{contextStatus || 'No decision explicitly references this conversation.'}</p>
                   )}
                   <details className="work-evidence">
                     <summary>Source evidence & participants</summary>
@@ -504,81 +529,90 @@ export function ThreadWorkspace({
                   {!data.transcript.length && <p>No conversation entries available.</p>}
                 </div>
               )}
-              <section className="work-composer">
-                <h3>Give the work direction</h3>
-                <p>Send one instruction to one named agent in this conversation.</p>
-                <form
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    void send();
-                  }}
-                >
-                  <label className="signal-field">
-                    Recipient
-                    <select
-                      required
-                      aria-label="Work instruction recipient"
-                      value={recipient}
-                      onChange={(e) => setRecipient(e.target.value)}
-                      disabled={busy || !!attempt || !maySend}
+              {hasConversation ? (
+                <>
+                  <section className="work-composer">
+                    <h3>Give the work direction</h3>
+                    <p>Send one instruction to one named agent in this conversation.</p>
+                    <form
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        void send();
+                      }}
                     >
-                      <option value="">Choose an agent</option>
-                      {[
-                        ...thread.participants,
-                        ...thread.assignable_agents.filter(
-                          (a) => !thread.participants.some((p) => p.agent_group_id === a.agent_group_id),
-                        ),
-                      ].map((a) => (
-                        <option key={a.agent_group_id} value={a.agent_group_id}>
-                          {a.name}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="signal-field">
-                    Instruction
-                    <textarea
-                      aria-label="Work instruction"
-                      value={text}
-                      onChange={(e) => setText(e.target.value)}
-                      disabled={busy || !!attempt || !maySend}
-                      placeholder="Describe the next action and its constraints…"
-                    />
-                  </label>
-                  <button className="signal-primary" disabled={busy || !maySend || !recipient || !text.trim()}>
-                    {attempt ? 'Retry same instruction →' : 'Send instruction →'}
-                  </button>
-                </form>
-                {attempt && !busy && (
-                  <p role="status">Delivery is unresolved. Retry preserves the exact instruction and delivery key.</p>
-                )}
-                {!maySend && <p>Read-only access. An authorized reviewer can send instructions.</p>}
-                {failure && (
-                  <p className="signal-alert" role="alert">
-                    {failure}
-                  </p>
-                )}
-                {sent && (
-                  <p role="status" className="signal-notice">
-                    {sent}
-                  </p>
-                )}
-              </section>
-              <div className="work-secondary-actions">
-                <button
-                  onClick={async () => {
-                    try {
-                      await setSnoozed(thread.thread_id, !thread.snoozed);
-                      await mutate();
-                    } catch (err) {
-                      if (activeScope.current === scopeKey) setFailure(actionError(err));
-                    }
-                  }}
-                >
-                  {thread.snoozed ? 'Unsnooze' : 'Snooze'}
-                </button>
-                <CloseThreadControl thread={thread} onClosed={() => void mutate()} />
-              </div>
+                      <label className="signal-field">
+                        Recipient
+                        <select
+                          required
+                          aria-label="Work instruction recipient"
+                          value={recipient}
+                          onChange={(e) => setRecipient(e.target.value)}
+                          disabled={busy || !!attempt || !maySend}
+                        >
+                          <option value="">Choose an agent</option>
+                          {[
+                            ...thread.participants,
+                            ...thread.assignable_agents.filter(
+                              (a) => !thread.participants.some((p) => p.agent_group_id === a.agent_group_id),
+                            ),
+                          ].map((a) => (
+                            <option key={a.agent_group_id} value={a.agent_group_id}>
+                              {a.name}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="signal-field">
+                        Instruction
+                        <textarea
+                          aria-label="Work instruction"
+                          value={text}
+                          onChange={(e) => setText(e.target.value)}
+                          disabled={busy || !!attempt || !maySend}
+                          placeholder="Describe the next action and its constraints…"
+                        />
+                      </label>
+                      <button className="signal-primary" disabled={busy || !maySend || !recipient || !text.trim()}>
+                        {attempt ? 'Retry same instruction →' : 'Send instruction →'}
+                      </button>
+                    </form>
+                    {attempt && !busy && (
+                      <p role="status">Delivery is unresolved. Retry preserves the exact instruction and delivery key.</p>
+                    )}
+                    {!maySend && <p>Read-only access. An authorized reviewer can send instructions.</p>}
+                    {failure && (
+                      <p className="signal-alert" role="alert">
+                        {failure}
+                      </p>
+                    )}
+                    {sent && (
+                      <p role="status" className="signal-notice">
+                        {sent}
+                      </p>
+                    )}
+                  </section>
+                  <div className="work-secondary-actions">
+                    <button
+                      onClick={async () => {
+                        try {
+                          await setSnoozed(thread.thread_id, !thread.snoozed);
+                          await mutate();
+                        } catch (err) {
+                          if (activeScope.current === scopeKey) setFailure(actionError(err));
+                        }
+                      }}
+                    >
+                      {thread.snoozed ? 'Unsnooze' : 'Snooze'}
+                    </button>
+                    <CloseThreadControl thread={thread} onClosed={() => void mutate()} />
+                  </div>
+                </>
+              ) : (
+                <section className="work-composer" role="status">
+                  <h3>Source record has no conversation yet</h3>
+                  <p>Open Full conversation to assign this source in its work context.</p>
+                </section>
+              )}
             </>
           )}
         </section>
