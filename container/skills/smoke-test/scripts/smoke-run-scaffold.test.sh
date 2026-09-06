@@ -166,10 +166,16 @@ jq -e '.ready == false and (.invalid | sort == ["markers/B1.json","markers/S1.js
 # two writers that make it real.
 FRESH="$(dirname "$FIXTURE_DIR")/gen-fixture"
 mkdir -p "$FRESH"
+mkdir -p "$FRESH/evidence"
+printf '%s\n' 'B1 first receipt' >"$FRESH/evidence/b1-first.txt"
+printf '%s\n' 'B2 first receipt' >"$FRESH/evidence/b2-first.txt"
+printf '%s\n' 'B1 replay receipt' >"$FRESH/evidence/b1-replay.txt"
+printf '%s\n' 'B2 replay receipt' >"$FRESH/evidence/b2-replay.txt"
+printf '%s\n' 'B2 redispatch receipt' >"$FRESH/evidence/b2-redispatch.txt"
 gate_owns "$(basename "$FRESH")"
 scaffold contract "$FRESH" "$SHA" B1:browser B2:browser >/dev/null
-scaffold marker "$FRESH" B1 pass 'lane one' >/dev/null
-scaffold marker "$FRESH" B2 pass 'lane two' >/dev/null
+scaffold marker "$FRESH" B1 pass 'lane one' 'evidence/b1-first.txt' >/dev/null
+scaffold marker "$FRESH" B2 pass 'lane two' 'evidence/b2-first.txt' >/dev/null
 mkdir -p "$FRESH/coordinator" "$FRESH/challenger"
 printf '# p\n' >"$FRESH/coordinator/preliminary.md"
 printf '# d\n' >"$FRESH/challenger/disposition.md"
@@ -244,9 +250,11 @@ jq -e '.ready == false and (.invalid | sort == ["markers/B1.json","markers/B2.js
   echo "expected bumped generations to retire every stale marker, got: $REGEN" >&2
   exit 1; }
 
-# Fresh markers land at the new generation and the barrier clears again.
-scaffold marker "$FRESH" B1 pass 'redone' | jq -e '.generation == 2' >/dev/null
-scaffold marker "$FRESH" B2 pass 'redone' >/dev/null
+# Fresh markers land at the new generation with fresh receipts and the barrier
+# clears again. This is the recovery path after a stale or missing pass marker:
+# redispatch first, then a new timestamped marker — never backfill the old one.
+scaffold marker "$FRESH" B1 pass 'redone' 'evidence/b1-replay.txt' | jq -e '.generation == 2' >/dev/null
+scaffold marker "$FRESH" B2 pass 'redone' 'evidence/b2-replay.txt' >/dev/null
 barrier "$FRESH" lanes | jq -e '.ready == true' >/dev/null
 
 # redispatch bumps ONE lane: its old marker is retired, the finished lane keeps
@@ -255,8 +263,62 @@ scaffold redispatch "$FRESH" B2 | jq -e '.ok == true and .generation == 3 and .r
 ONE="$(barrier "$FRESH" lanes || true)"
 jq -e '.ready == false and (.invalid == ["markers/B2.json"])' <<<"$ONE" >/dev/null || {
   echo "expected redispatch to retire only its own lane, got: $ONE" >&2; exit 1; }
-scaffold marker "$FRESH" B2 pass 'second attempt' | jq -e '.generation == 3' >/dev/null
+scaffold marker "$FRESH" B2 pass 'second attempt' 'evidence/b2-redispatch.txt' | jq -e '.generation == 3' >/dev/null
 barrier "$FRESH" lanes | jq -e '.ready == true' >/dev/null
+
+# A receipt-recovery replay must preserve the original empty-evidence marker
+# byte-for-byte before replacing it with the next generation's fresh pass.
+RECOVERY="$(dirname "$FIXTURE_DIR")/receipt-recovery"
+mkdir -p "$RECOVERY/evidence"
+printf '%s\n' 'fresh recovery receipt' >"$RECOVERY/evidence/r1-replay.txt"
+gate_owns "$(basename "$RECOVERY")"
+scaffold contract "$RECOVERY" "$SHA" R1:browser >/dev/null
+scaffold marker "$RECOVERY" R1 pass 'original pass lost its receipt' >/dev/null
+OLD_MARKER_SHA="$(sha256sum "$RECOVERY/markers/R1.json")"
+OLD_MARKER_SHA="${OLD_MARKER_SHA%% *}"
+OLD_COMPLETED="$(jq -r '.completedAt' "$RECOVERY/markers/R1.json")"
+RECOVERY_BLOCKED="$(barrier "$RECOVERY" lanes || true)"
+jq -e '(.ready == false) and (.invalidReasons[0] | contains("nonempty evidence array"))' \
+  <<<"$RECOVERY_BLOCKED" >/dev/null || {
+  echo "expected the original empty-evidence pass to block recovery" >&2; exit 1; }
+
+scaffold redispatch "$RECOVERY" R1 | jq -e '.generation == 2' >/dev/null
+scaffold marker "$RECOVERY" R1 pass 'fresh recovery replay' 'evidence/r1-replay.txt' \
+  | jq -e '.generation == 2 and .status == "pass"' >/dev/null
+ARCHIVE="$RECOVERY/markers/history/R1.generation-1.json"
+[ -f "$ARCHIVE" ] || { echo "expected superseded marker history to exist" >&2; exit 1; }
+ARCHIVED_SHA="$(sha256sum "$ARCHIVE")"
+ARCHIVED_SHA="${ARCHIVED_SHA%% *}"
+[ "$ARCHIVED_SHA" = "$OLD_MARKER_SHA" ] || {
+  echo "expected archived marker to preserve the original raw bytes" >&2; exit 1; }
+jq -e --arg at "$OLD_COMPLETED" \
+  '.generation == 1 and .evidence == [] and .completedAt == $at' "$ARCHIVE" >/dev/null
+jq -e '.generation == 2 and .evidence == ["evidence/r1-replay.txt"]' \
+  "$RECOVERY/markers/R1.json" >/dev/null
+barrier "$RECOVERY" lanes | jq -e '.ready == true' >/dev/null
+
+# Rewriting an ordinary same-generation marker keeps existing behavior: it is
+# not a recovery boundary and must not create synthetic history.
+scaffold marker "$RECOVERY" R1 pass 'same generation update' 'evidence/r1-replay.txt' >/dev/null
+[ ! -e "$RECOVERY/markers/history/R1.generation-2.json" ] || {
+  echo "ordinary same-generation marker update was incorrectly archived" >&2; exit 1; }
+
+# A pre-existing, different history record is never overwritten. The new pass
+# is refused before the live old marker can be replaced.
+CONFLICT="$(dirname "$FIXTURE_DIR")/receipt-conflict"
+mkdir -p "$CONFLICT/evidence" "$CONFLICT/markers/history"
+printf '%s\n' 'conflict replay receipt' >"$CONFLICT/evidence/c1-replay.txt"
+gate_owns "$(basename "$CONFLICT")"
+scaffold contract "$CONFLICT" "$SHA" C1:browser >/dev/null
+scaffold marker "$CONFLICT" C1 pass 'original' >/dev/null
+scaffold redispatch "$CONFLICT" C1 >/dev/null
+printf '%s\n' 'different history must survive' >"$CONFLICT/markers/history/C1.generation-1.json"
+OUT="$(scaffold marker "$CONFLICT" C1 pass 'replacement' 'evidence/c1-replay.txt' 2>&1 || true)"
+jq -e '.ok == false and (.error | test("different raw evidence"))' <<<"$OUT" >/dev/null || {
+  echo "expected unequal marker history to refuse replacement, got: $OUT" >&2; exit 1; }
+jq -e '.generation == 1 and .evidence == []' "$CONFLICT/markers/C1.json" >/dev/null
+[ "$(cat "$CONFLICT/markers/history/C1.generation-1.json")" = 'different history must survive' ] || {
+  echo "unequal history was overwritten" >&2; exit 1; }
 
 # redispatch is coordinator-owned and gate-fenced like every other write.
 gate_owns "someone-else"
