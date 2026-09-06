@@ -150,7 +150,7 @@ export async function prepareDestination(
   record: ReviewRecord,
   deps: CreationDeps = {},
 ): Promise<ReviewRecord['dispatch']> {
-  let dispatch = record.dispatch!;
+  const dispatch = record.dispatch!;
   const persist = async () => {
     const row = await readReview(source.id);
     const current = readRecord(row);

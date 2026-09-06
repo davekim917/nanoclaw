@@ -100,7 +100,6 @@ export async function decisionDetail(
   const evidence: SignalDecisionDetail['evidence'] = [
     { title: source.question, text: source.context, at: source.source_as_of, url: source.source_url },
   ];
-  let recipients: SignalDecisionDetail['recipients'] = [];
   if (source.thread_id) {
     const detail = await (deps.threadDetail ?? scopedThreadDetail)(source.thread_id, ctx);
     if (detail) {
@@ -109,14 +108,6 @@ export async function decisionDetail(
       evidence.push(
         ...detail.transcript.map((e) => ({ title: e.agent_name, text: e.text, at: e.timestamp, url: null })),
       );
-      // `canSteer` is async since seam 3 PR 6 (its role reads run under the
-      // central lease); resolve the gate per participant before filtering.
-      const canSend = deps.canSend ?? canSteer;
-      const sendable: typeof detail.thread.participants = [];
-      for (const p of detail.thread.participants) {
-        if (groupVisible(ctx, p.agent_group_id) && (await canSend(ctx.user.id, p.agent_group_id)).ok) sendable.push(p);
-      }
-      recipients = sendable.map((p) => ({ id: p.agent_group_id, name: p.name }));
     }
   }
   if (decision.owner?.id && decision.owner.id !== ctx.user.id) {
@@ -125,7 +116,7 @@ export async function decisionDetail(
   }
   const resolved = await resolveDestination(source, ctx, deps.canSend);
   const { candidates, session_thread_id: _, ...destination } = resolved;
-  recipients = await Promise.all(
+  const recipients = await Promise.all(
     candidates.map(async ({ id, name }) => {
       const agent = await getAgentGroup(id);
       return { id, name: agent ? await personaName(agent) : name };
