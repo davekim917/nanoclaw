@@ -34,10 +34,25 @@ export interface RoomParticipant {
   teamId: string;
 }
 
-/** A room the caller may name: one Slack conversation, one row per bot. */
+/**
+ * A room the caller may name: one Slack conversation, one row per bot.
+ *
+ * Identity is `(teamId, platformId)`, NOT the platform id alone. Slack channel
+ * ids are workspace-scoped, and this fork runs several workspaces in one host,
+ * so two unrelated channels can carry the same id. Keying on the id alone
+ * collapsed them into one room whose name came from whichever row sorted
+ * first, made an id lookup silently ambiguous, and could hand `roomInviter`
+ * the wrong workspace's bot.
+ *
+ * `teamId` is null only when NO row's channel type has a registered bot — the
+ * workspace is then genuinely unknown, and `roomInviter` refuses such a room
+ * rather than guessing.
+ */
 export interface CandidateRoom {
   /** `slack:C…` — the canonical `messaging_groups.platform_id` form. */
   platformId: string;
+  /** Slack `T…` of the workspace these rows live in; null when unknowable. */
+  teamId: string | null;
   name: string;
   rows: MessagingGroup[];
 }
@@ -167,19 +182,30 @@ export function assertSameWorkspace(participants: RoomParticipant[]): void {
   );
 }
 
-/** Group the candidate rows into rooms — one entry per Slack conversation. */
-export async function candidateRooms(callerAgentGroupId: string): Promise<CandidateRoom[]> {
-  const byPlatformId = new Map<string, CandidateRoom>();
+/**
+ * Group the candidate rows into rooms — one entry per Slack conversation,
+ * keyed by `(teamId, platformId)`. See CandidateRoom for why the workspace is
+ * half of the key.
+ */
+export async function candidateRooms(
+  callerAgentGroupId: string,
+  bots: ReadonlyMap<string, SlackBotIdentity> = getKnownSlackBots(),
+): Promise<CandidateRoom[]> {
+  const byKey = new Map<string, CandidateRoom>();
   for (const row of await getCandidateRoomRows(callerAgentGroupId)) {
-    const existing = byPlatformId.get(row.platform_id);
+    const teamId = bots.get(row.instance ?? row.channel_type)?.teamId ?? null;
+    // NUL is not a legal character in either half, so the composite key
+    // cannot be forged by a channel id that happens to contain the separator.
+    const key = `${teamId ?? ''}\u0000${row.platform_id}`;
+    const existing = byKey.get(key);
     if (existing) {
       existing.rows.push(row);
       if (!existing.name && row.name) existing.name = row.name;
       continue;
     }
-    byPlatformId.set(row.platform_id, { platformId: row.platform_id, name: row.name ?? '', rows: [row] });
+    byKey.set(key, { platformId: row.platform_id, teamId, name: row.name ?? '', rows: [row] });
   }
-  return [...byPlatformId.values()];
+  return [...byKey.values()];
 }
 
 /**
@@ -291,9 +317,18 @@ export async function resolveRoomByName(callerAgentGroupId: string, roomName: st
  * shortcut past name resolution, never past authorization.
  */
 export async function resolveRoomByPlatformId(callerAgentGroupId: string, platformId: string): Promise<CandidateRoom> {
-  const room = (await candidateRooms(callerAgentGroupId)).find((r) => r.platformId === platformId);
-  if (!room) {
+  const matches = (await candidateRooms(callerAgentGroupId)).filter((r) => r.platformId === platformId);
+  if (matches.length === 0) {
     throw new RoomActionError(`room ${platformId} is no longer wired to you or to another agent in your workgroup`);
   }
-  return room;
+  if (matches.length > 1) {
+    // Slack channel ids are workspace-scoped, so one id in two of this host's
+    // workspaces is two different rooms. Naming one by id is then genuinely
+    // ambiguous, and guessing would be picking a workspace at random.
+    throw new RoomActionError(
+      `${platformId} names a room in ${matches.length} of this host's Slack workspaces ` +
+        `(${matches.map((m) => m.teamId ?? 'unknown workspace').join(', ')}) — name the room instead.`,
+    );
+  }
+  return matches[0]!;
 }

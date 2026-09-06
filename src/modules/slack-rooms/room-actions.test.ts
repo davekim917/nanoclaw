@@ -71,6 +71,20 @@ const BETA: SlackBotIdentity = { userId: 'UBETA', username: 'beta', teamId: 'T1'
 const GAMMA: SlackBotIdentity = { userId: 'UGAMMA', username: 'gamma', teamId: 'T1' };
 const FOREIGN: SlackBotIdentity = { userId: 'UFOREIGN', username: 'foreign', teamId: 'T2' };
 
+/**
+ * The Slack bot registry is module-global and `unregisterSlackBot` only
+ * deletes on OBJECT identity, so a case that registers a variant identity
+ * (same channel type, different team) leaks it into every later case — which
+ * is exactly how a two-workspace fixture silently became a one-workspace one.
+ * Every registration in this file goes through here, and afterEach undoes them
+ * newest-first so a channel type registered twice ends up genuinely absent.
+ */
+const registeredBots: Array<[string, SlackBotIdentity]> = [];
+function useBot(channelType: string, identity: SlackBotIdentity): void {
+  registeredBots.push([channelType, identity]);
+  registerSlackBot(channelType, identity);
+}
+
 async function makeWorkgroup(id: string): Promise<void> {
   await getDb().run('INSERT INTO workgroups (id, onecli_secrets, created_at) VALUES (?, ?, ?)', id, '[]', now());
 }
@@ -91,7 +105,7 @@ async function makeAgent(opts: {
     created_at: now(),
     workgroup_id: opts.workgroup,
   });
-  registerSlackBot(opts.channelType, opts.identity);
+  useBot(opts.channelType, opts.identity);
   await wire(`mg-dm-${opts.id}`, opts.channelType, `slack:D-${opts.id}`, null, 0, opts.id);
 }
 
@@ -216,10 +230,9 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  unregisterSlackBot('slack-alpha', ALPHA);
-  unregisterSlackBot('slack-beta', BETA);
-  unregisterSlackBot('slack-gamma', GAMMA);
-  unregisterSlackBot('slack-foreign', FOREIGN);
+  for (const [channelType, identity] of registeredBots.splice(0).reverse()) {
+    unregisterSlackBot(channelType, identity);
+  }
   await closeDb();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
@@ -453,7 +466,7 @@ describe('add_to_room', () => {
     await destination('ag-caller', 'outsider', 'ag-outsider');
     // Put the outsider's bot in the caller's workspace so the cross-workspace
     // refusal is not what this case measures.
-    registerSlackBot('slack-foreign', { ...FOREIGN, teamId: 'T1' });
+    useBot('slack-foreign', { ...FOREIGN, teamId: 'T1' });
 
     await getDeliveryAction('add_to_room')!({ action: 'add_to_room', room: 'ops', agent: 'outsider' }, callerSession);
     expect(requestApprovalMock).toHaveBeenCalledTimes(1);
@@ -544,6 +557,41 @@ describe('add_to_room', () => {
     inviteUsersMock.mockClear();
     await getDeliveryAction('add_to_room')!({ action: 'add_to_room', room: 'CHOME2', agent: 'mate' }, callerSession);
     expect(lastNotice()).toMatch(/already in room/);
+    expect(inviteUsersMock).not.toHaveBeenCalled();
+  });
+
+  it('keys a room by workspace as well as channel id, so one id in two workspaces is two rooms', async () => {
+    // Slack channel ids are workspace-scoped and this host runs several
+    // workspaces, so the same id can name two unrelated channels.
+    await makeAgent({
+      id: 'ag-third',
+      folder: 'third',
+      workgroup: 'home',
+      channelType: 'slack-gamma',
+      identity: GAMMA,
+    });
+    await makeAgent({
+      id: 'ag-far',
+      folder: 'far',
+      workgroup: 'home',
+      channelType: 'slack-foreign',
+      identity: FOREIGN,
+    });
+    await destination('ag-caller', 'third', 'ag-third');
+    await wire('mg-dup-t1', 'slack-alpha', 'slack:CDUP', 'dup', 1, 'ag-caller');
+    await wire('mg-dup-t2', 'slack-foreign', 'slack:CDUP', 'dup', 1, 'ag-far');
+
+    const { candidateRooms } = await import('./resolve.js');
+    const rooms = (await candidateRooms('ag-caller')).filter((r) => r.platformId === 'slack:CDUP');
+    expect(rooms).toHaveLength(2);
+    expect(rooms.map((r) => r.teamId).sort()).toEqual(['T1', 'T2']);
+
+    // Naming it by id is therefore ambiguous rather than a coin flip.
+    await getDeliveryAction('add_to_room')!(
+      { action: 'add_to_room', room: 'slack:CDUP', agent: 'third' },
+      callerSession,
+    );
+    expect(lastNotice()).toMatch(/Slack workspaces/);
     expect(inviteUsersMock).not.toHaveBeenCalled();
   });
 
