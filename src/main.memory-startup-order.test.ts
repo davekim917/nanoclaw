@@ -267,11 +267,13 @@ it('runs reconciliation only after runtime and strict absence proof succeed', as
 
 it('with survivors the adoption seed is the post-stop survivable set', () => {
   // The fail-closed seed adoption holds when its own inventory cannot be read
-  // is only what the door LEFT running: the survivable partition when the
-  // door stopped fewer containers than it found, nothing when it stopped all.
-  expect(adoptionSeedFor({ containers: 3, stopped: 1, survivableSessionIds: ['s1', 's2'] })).toEqual(['s1', 's2']);
-  expect(adoptionSeedFor({ containers: 2, stopped: 2, survivableSessionIds: ['s1'] })).toEqual([]);
-  expect(adoptionSeedFor({ containers: 0, stopped: 0, survivableSessionIds: [] })).toEqual([]);
+  // is exactly what the door returned as still running after its last pass —
+  // never inferred from the counts. One initial survivor plus a late newcomer
+  // stopped in the second pass reads `containers: 1, stopped: 1` and still has
+  // a survivor (#479 round 1); a door that stopped everything returns none.
+  expect(adoptionSeedFor({ survivableSessionIds: ['s1', 's2'] })).toEqual(['s1', 's2']);
+  expect(adoptionSeedFor({ survivableSessionIds: ['s1'] })).toEqual(['s1']);
+  expect(adoptionSeedFor({ survivableSessionIds: [] })).toEqual([]);
 });
 
 it('keeps the memory gate a runtime check plus the cutover, with nothing stopped inside it', () => {

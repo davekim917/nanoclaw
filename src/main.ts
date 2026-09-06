@@ -221,16 +221,17 @@ export interface BootMountQuiescenceDeps {
 /**
  * The sessions whose containers a boot leaves running, as the fail-closed seed
  * adoption holds pending when its own inventory cannot be taken (seam 4 E,
- * `heldOnInventoryFailure`). A door that stopped every container it found
- * left nothing to hold — seeding its partition then would create phantom
- * storage and memory holds for containers the door just proved gone. Under D2
- * the door leaves the survivable partition running, so this is the real
- * survivor set. Exported for the unit test only.
+ * `heldOnInventoryFailure`). Under D2 the door's returned survivors ARE the
+ * post-stop inventory — the containers it proved still running after its
+ * last pass — so they are the seed directly. Not inferred from the counts: a
+ * newcomer stopped in the second pass makes `stopped` reach `containers`
+ * while the final partition still holds survivors, and those must be held
+ * (owned, leased, counted) rather than left unprotected. A door that stopped
+ * everything returns no survivors, and the seed is then empty on its own.
+ * Exported for the unit test only.
  */
-export function adoptionSeedFor(
-  scope: Pick<BootQuiescenceScope, 'containers' | 'stopped' | 'survivableSessionIds'>,
-): string[] {
-  return scope.stopped < scope.containers ? scope.survivableSessionIds : [];
+export function adoptionSeedFor(scope: Pick<BootQuiescenceScope, 'survivableSessionIds'>): string[] {
+  return [...scope.survivableSessionIds];
 }
 
 function bootFatal(message: string, err: unknown): never {
