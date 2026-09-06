@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { getDb } from '../../db/connection.js';
 import { defineGuardedAction, guard, ALLOW, DENY } from '../../guard/index.js';
 import { log } from '../../log.js';
+import { readChannelDirectory } from '../api/threads.js';
 import { applySessionSteer, canSteer } from '../steer.js';
 import type { AuthHandler, AuthedRequestContext } from '../router.js';
 import type { SignalDecisionDetail, SignalReviewRequest, SignalDispatchRequest, SignalDecision } from './types.js';
@@ -284,7 +285,11 @@ export async function updateProject(id: string, body: unknown, ctx: AuthedReques
     `SELECT DISTINCT m.platform_id FROM messaging_groups m JOIN messaging_group_agents ma ON ma.messaging_group_id=m.id JOIN agent_groups a ON a.id=ma.agent_group_id WHERE a.workgroup_id=?`,
     body.workgroup_id,
   );
-  if (body.channel_keys.some((c) => !channels.some((r) => r.platform_id === c)))
+  const { dmDedupeKey } = await readChannelDirectory();
+  const validChannelKeys = new Set(
+    channels.flatMap(({ platform_id }) => [platform_id, dmDedupeKey.get(platform_id)].filter(Boolean)),
+  );
+  if ((body.channel_keys as string[]).some((c) => !validChannelKeys.has(c)))
     throw new SignalError(400, 'channel_not_in_workgroup');
   const existing = await getDb().get<{ version: number; workgroup_id: string }>(
     'SELECT version,workgroup_id FROM observatory_projects WHERE id=?',

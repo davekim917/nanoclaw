@@ -105,11 +105,12 @@ async function setup() {
  CREATE TABLE users(id TEXT PRIMARY KEY,display_name TEXT);
  CREATE TABLE observatory_item_threads(workgroup_id TEXT,item_id TEXT,thread_id TEXT,created_at TEXT,created_by TEXT);
  CREATE TABLE pending_approvals(approval_id TEXT PRIMARY KEY,agent_group_id TEXT,session_id TEXT,title TEXT,action TEXT,created_at TEXT,expires_at TEXT,approver_user_id TEXT,channel_type TEXT,platform_id TEXT,platform_message_id TEXT,status TEXT);
- CREATE TABLE messaging_groups(id TEXT PRIMARY KEY,platform_id TEXT);
+ CREATE TABLE messaging_groups(id TEXT PRIMARY KEY,platform_id TEXT,name TEXT);
  CREATE TABLE messaging_group_agents(messaging_group_id TEXT,agent_group_id TEXT);
+ CREATE TABLE user_dms(user_id TEXT,channel_type TEXT,messaging_group_id TEXT,resolved_at TEXT);
  INSERT INTO workgroups(id,display_name) VALUES('w','Workspace'),('other','Other');
  INSERT INTO agent_groups VALUES('a','w','A'),('b','w','B'),('c','other','C');
- INSERT INTO messaging_groups VALUES('m','slack:C');
+ INSERT INTO messaging_groups(id,platform_id) VALUES('m','slack:C');
  INSERT INTO messaging_group_agents VALUES('m','a');
  `);
   await getDb().exec(SIGNAL_SCHEMA);
@@ -205,6 +206,69 @@ describe('Signal source and authority boundaries', () => {
         ctx(),
       ),
     ).rejects.toThrow('cross_workgroup');
+  });
+  it('accepts a workgroup canonical DM key for project create and update, but not a foreign one', async () => {
+    await getDb().exec(`
+      INSERT INTO users VALUES('slack-workspace:Uallowed','Synthetic allowed'),('slack-workspace:Uforeign','Synthetic foreign');
+      INSERT INTO messaging_groups VALUES('dm-allowed','slack:dm-allowed','Synthetic direct message'),('dm-foreign','slack:dm-foreign','Synthetic foreign message');
+      INSERT INTO messaging_group_agents VALUES('dm-allowed','a'),('dm-foreign','c');
+      INSERT INTO user_dms VALUES('slack-workspace:Uallowed','slack-workspace','dm-allowed','2026-09-05T00:00:00Z'),('slack-workspace:Uforeign','slack-workspace','dm-foreign','2026-09-05T00:00:00Z');
+    `);
+    const canonical = 'dm:slack:Uallowed';
+    await expect(
+      updateProject(
+        'canonical-dm',
+        {
+          workgroup_id: 'w',
+          name: 'Canonical DM',
+          description: 'Maps a direct message',
+          repositories: [],
+          channel_keys: [canonical],
+          expected_version: 0,
+        },
+        ctx(),
+      ),
+    ).resolves.toEqual({ id: 'canonical-dm', version: 1 });
+    await expect(
+      updateProject(
+        'canonical-dm',
+        {
+          workgroup_id: 'w',
+          name: 'Canonical DM',
+          description: 'Updated direct message mapping',
+          repositories: [],
+          channel_keys: [canonical],
+          expected_version: 1,
+        },
+        ctx(),
+      ),
+    ).resolves.toEqual({ id: 'canonical-dm', version: 2 });
+    const thread = {
+      thread_id: 'slack:dm-allowed:101',
+      session_ids: ['synthetic-session'],
+      participants: [{ agent_group_id: 'a', session_id: 'synthetic-session', name: 'A' }],
+      channel_key: canonical,
+      channel_name: 'Synthetic direct message',
+      title: 'Canonical direct message',
+      state: 'active',
+      last_activity_at: '2026-09-05T00:00:00Z',
+    } as unknown as ThreadSummary;
+    const data = await buildSignalData(ctx(), 'w', { ...deps([]), threads: async () => [thread] });
+    expect(data.projects.find((p) => p.id === 'canonical-dm')!.thread_ids).toEqual([thread.thread_id]);
+    await expect(
+      updateProject(
+        'foreign-dm',
+        {
+          workgroup_id: 'w',
+          name: 'Foreign DM',
+          description: 'Must stay out of this workgroup',
+          repositories: [],
+          channel_keys: ['dm:slack:Uforeign'],
+          expected_version: 0,
+        },
+        ctx(),
+      ),
+    ).rejects.toThrow('channel_not_in_workgroup');
   });
   it('retains reviewed source context/history on disappearance and disables mutations', async () => {
     const s = (await buildSignalData(ctx(), 'w', deps())).decisions[0]!;

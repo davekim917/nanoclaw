@@ -117,6 +117,63 @@ export function safeUrl(value: unknown): string | null {
     return null;
   }
 }
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function optionalString(value: unknown): boolean {
+  return value === undefined || value === null || typeof value === 'string';
+}
+
+function optionalBoolean(value: unknown): boolean {
+  return value === undefined || value === null || typeof value === 'boolean';
+}
+
+function optionalStringArray(value: unknown): boolean {
+  return (
+    value === undefined || value === null || (Array.isArray(value) && value.every((entry) => typeof entry === 'string'))
+  );
+}
+
+function validSteeredThread(value: unknown): boolean {
+  return (
+    value === undefined ||
+    value === null ||
+    (isRecord(value) &&
+      typeof value.threadId === 'string' &&
+      optionalString(value.threadUrl) &&
+      typeof value.at === 'string' &&
+      typeof value.by === 'string')
+  );
+}
+
+/** Release boards are external JSON; malformed rows must not reach the typed overview. */
+function validReleaseItem(value: unknown): value is ReleaseStateItem {
+  if (!isRecord(value)) return false;
+  const nextMover = value.nextMover;
+  const meta = value.meta;
+  return (
+    typeof value.id === 'string' &&
+    typeof value.kind === 'string' &&
+    typeof value.title === 'string' &&
+    (nextMover === 'human' || nextMover === 'agent' || nextMover === 'nobody') &&
+    optionalString(value.owner) &&
+    optionalBoolean(value.blocksRelease) &&
+    optionalString(value.why) &&
+    optionalString(value.since) &&
+    optionalString(value.url) &&
+    optionalString(value.dueAt) &&
+    optionalString(value.nextAction) &&
+    optionalString(value.channel) &&
+    optionalStringArray(value.dependsOn) &&
+    validSteeredThread(value.steeredThread) &&
+    (meta === undefined || meta === null || (isRecord(meta) && optionalString(meta.repo))) &&
+    optionalString(value.headSha) &&
+    optionalString(value.head)
+  );
+}
+
 /** Only structured repository metadata or an exact GitHub URL can name a repo. */
 export function repositoryOf(item: ReleaseStateItem): string | null {
   const meta = (item as ReleaseStateItem & { meta?: { repo?: unknown } }).meta;
@@ -230,6 +287,13 @@ export function releaseDecision(wg: string, item: ReleaseStateItem, asOf: string
 function projectMatches(p: SignalProject, repository: string | null, channel: string | null): boolean {
   return (!!repository && p.repositories.includes(repository)) || (!!channel && p.channel_keys.includes(channel));
 }
+function matchingProjects(
+  projects: SignalProject[],
+  repository: string | null,
+  channel: string | null,
+): SignalProject[] {
+  return projects.filter((project) => !project.unmapped && projectMatches(project, repository, channel));
+}
 function health(
   wg: string,
   source: string,
@@ -319,6 +383,8 @@ export async function buildSignalData(
     projects.push(unmapped);
     let scene: ObservatoryScene | null = null;
     let threads: ThreadSummary[] = [];
+    let malformedReleaseItem = false;
+    let ambiguousProjectMapping = false;
     try {
       scene = await (deps.runtimeScene ?? deps.scene ?? buildObservatoryScene)(wg.id);
     } catch {
@@ -381,15 +447,6 @@ export async function buildSignalData(
     threads = backed.slice(localOffset, localOffset + limit);
     const realThreads = threads.filter((t) => t.session_ids.length > 0);
     if (scene) {
-      result.sources.push(
-        health(
-          wg.id,
-          'release board',
-          scene.releaseState?.asOf ?? null,
-          now,
-          scene.releaseState ? null : 'No release board has been published.',
-        ),
-      );
       for (const agent of scene.agents.filter((a) => allowed.has(a.id))) {
         const nextScheduled = scheduled?.rows
           .filter((r) => r.agent_group_id === agent.id && r.next_fire_utc && r.health !== 'paused')
@@ -412,12 +469,17 @@ export async function buildSignalData(
         });
       }
       for (const item of scene.releaseState?.items ?? []) {
-        if (typeof item.id !== 'string' || typeof item.title !== 'string') continue;
+        if (!validReleaseItem(item)) {
+          malformedReleaseItem = true;
+          continue;
+        }
         const matchingRooms = scene.rooms.filter(
           (r) => r.key === item.channel || r.name.replace(/^#/, '') === item.channel?.replace(/^#/, ''),
         );
         const channel = matchingRooms.length === 1 ? matchingRooms[0]!.key : null;
-        const project = projects.find((p) => !p.unmapped && projectMatches(p, repositoryOf(item), channel)) ?? unmapped;
+        const matches = matchingProjects(projects, repositoryOf(item), channel);
+        const project = matches.length === 1 ? matches[0]! : unmapped;
+        ambiguousProjectMapping ||= matches.length > 1;
         const work: SignalWorkItem = {
           id: item.id,
           title: item.title,
@@ -437,7 +499,9 @@ export async function buildSignalData(
       }
     }
     for (const thread of realThreads) {
-      const project = projects.find((p) => !p.unmapped && p.channel_keys.includes(thread.channel_key)) ?? unmapped;
+      const matches = matchingProjects(projects, null, thread.channel_key);
+      const project = matches.length === 1 ? matches[0]! : unmapped;
+      ambiguousProjectMapping ||= matches.length > 1;
       project.thread_ids.push(thread.thread_id);
       if (thread.last_activity_at)
         result.activity.push({
@@ -486,6 +550,30 @@ export async function buildSignalData(
       d.evidence_hash = materialThread(d, sequence);
       result.rawDecisions.push(d);
     }
+    if (scene)
+      result.sources.push(
+        health(
+          wg.id,
+          'release board',
+          malformedReleaseItem ? null : (scene.releaseState?.asOf ?? null),
+          now,
+          malformedReleaseItem
+            ? 'Skipped malformed release-board item; healthy items remain available.'
+            : scene.releaseState
+              ? null
+              : 'No release board has been published.',
+        ),
+      );
+    if (ambiguousProjectMapping)
+      result.sources.push(
+        health(
+          wg.id,
+          'project mappings',
+          null,
+          now,
+          'Multiple project mappings match source facts; affected work remains under Unmapped work.',
+        ),
+      );
     // Never serialize approval payload/options; titles can be reviewed only by
     // the named approver or an appropriate administrator, plus exact group scope.
     const approvals = await getDb()
