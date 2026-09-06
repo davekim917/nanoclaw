@@ -1,6 +1,6 @@
 ---
 name: slack-a2a-rooms
-description: How to behave in a shared Slack room with sibling agents — mention-driven turn taking, who posts an introduction, the bot-to-bot hop budget, and why room history is not shared memory. Read this when you are in a Slack group DM that holds other agents, when a sibling @-mentions you, or before introducing a new sibling in a room.
+description: How to behave in a shared Slack room with sibling agents, and how to open one yourself with create_room / add_to_room — mention-driven turn taking, who posts an introduction, the bot-to-bot hop budget, and why room history is not shared memory. Read this when you are in a Slack room that holds other agents, when a sibling @-mentions you, before introducing a new sibling, or when asked to put several agents in one room.
 ---
 
 # Sharing a Slack room with sibling agents
@@ -55,13 +55,38 @@ introduction — nobody else does. Keep it to one or two lines in your own voice
 what the new agent is for, and an `@name` mention of it. No mechanics, no
 member list, no setup narration.
 
+## Opening a room yourself
+
+`create_room` opens one shared room — a private Slack channel holding you, the
+operator and the agents you name — and wires every one of them to it, so the
+room works the moment you are told it is live. Name agents by the same names
+`send_message` takes; every agent you name must have a Slack bot in the same
+workspace as yours, and a roster spanning two workspaces is refused. Expect an
+approval tap before anything happens.
+
+`add_to_room` adds one agent to a room that already exists. The room keeps its
+conversation, so nothing has to be re-invited and no link goes stale. The room
+is looked up by name among the rooms wired to you or to another agent in your
+workgroup and nowhere else, so a name that matches two of them comes back as an
+error listing both, and a room belonging to another workgroup is simply not
+found. Adding an agent from your own workgroup happens straight away; adding
+one from outside it needs an approval, because it lets them read everything
+posted there from then on.
+
+Both return immediately and report the outcome as a system note later. When the
+note says the room is live, post the introduction yourself — see above.
+
 ## Teams get one room
 
 When the user asks for several agents on one project, they want **one** shared
 room with all of them, not one room per pair. Say so if the request is
-drifting toward the second. Slack mints a _new_ conversation whenever a group
-DM's membership changes, so a room cannot grow in place — an agent added later
-means a new room and fresh wiring. Ask for the full roster up front.
+drifting toward the second, and prefer one complete `create_room` over a chain
+of `add_to_room` calls: ask for the full roster up front.
+
+A room someone opened for you by hand may be a group DM rather than a private
+channel. Slack mints a _new_ conversation whenever a group DM's membership
+changes, so those rooms cannot grow at all — adding an agent there means a new
+room and fresh wiring, and it is an operator step.
 
 ## Room history is not memory
 

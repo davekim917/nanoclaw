@@ -57,9 +57,7 @@ import './repository-workspaces/index.js';
 // tick) and the onHostShutdown that stops the persistent worker, in one module.
 import './sweep-storage/index.js';
 
-// Slack rooms — create_room / add_to_room from chat on the bot tokens this
-// install already has. Depends on approvals (hold cards + approval handlers)
-// and on the delivery action registry being up, both satisfied above.
+// Slack rooms — create_room / add_to_room from chat on existing bot tokens.
 import './slack-rooms/index.js';
 
 import './escalation/index.js';
