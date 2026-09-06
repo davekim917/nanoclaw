@@ -18,6 +18,7 @@ import { SignalError } from '../src/dashboard/observatory-v2/state.js';
 import type { SignalOverview, SignalDecisionDetail } from '../src/dashboard/observatory-v2/types.js';
 import type { ReleaseStateItem } from '../src/dashboard/api/observatory.js';
 import type { ThreadSummary } from '../src/dashboard/api/threads.js';
+import type { Session } from '../src/types.js';
 
 let server: http.Server;
 let origin: string;
@@ -52,6 +53,16 @@ const deps: ApiDeps = {
           transcript: [],
         }
       : null,
+  session: async (agentGroupId, messagingGroupId, threadId) => {
+    const session = await getDb().get<Session>(
+      'SELECT * FROM sessions WHERE agent_group_id=? AND messaging_group_id=? AND thread_id=?',
+      agentGroupId,
+      messagingGroupId,
+      threadId,
+    );
+    if (!session) throw new Error('fixture destination session not found');
+    return { session, created: false };
+  },
   send: async (session, body) => {
     if (!delivered.has(body.idempotency_key)) delivered.set(body.idempotency_key, { session, text: body.text });
     return { status: 202, body: {} };
@@ -100,19 +111,22 @@ beforeAll(async () => {
  CREATE TABLE user_roles(user_id TEXT,role TEXT,agent_group_id TEXT);
  CREATE TABLE agent_group_members(user_id TEXT,agent_group_id TEXT);
  CREATE TABLE workgroups(id TEXT PRIMARY KEY,display_name TEXT,attention_sources TEXT);
- CREATE TABLE agent_groups(id TEXT PRIMARY KEY,workgroup_id TEXT,name TEXT);
- CREATE TABLE sessions(id TEXT PRIMARY KEY,agent_group_id TEXT);
+ CREATE TABLE user_dms(user_id TEXT,channel_type TEXT,messaging_group_id TEXT,resolved_at TEXT);
+ CREATE TABLE agent_groups(id TEXT PRIMARY KEY,workgroup_id TEXT,name TEXT,folder TEXT);
+ CREATE TABLE sessions(id TEXT PRIMARY KEY,agent_group_id TEXT,messaging_group_id TEXT,thread_id TEXT);
+ CREATE TABLE observatory_item_threads(workgroup_id TEXT,item_id TEXT,thread_id TEXT,created_at TEXT,created_by TEXT,PRIMARY KEY(workgroup_id,item_id));
  CREATE TABLE pending_approvals(approval_id TEXT PRIMARY KEY,agent_group_id TEXT,session_id TEXT,title TEXT,action TEXT,created_at TEXT,expires_at TEXT,approver_user_id TEXT,channel_type TEXT,platform_id TEXT,platform_message_id TEXT,status TEXT);
- CREATE TABLE messaging_groups(id TEXT PRIMARY KEY,platform_id TEXT);
- CREATE TABLE messaging_group_agents(messaging_group_id TEXT,agent_group_id TEXT);
+ CREATE TABLE messaging_groups(id TEXT PRIMARY KEY,platform_id TEXT,name TEXT,channel_type TEXT);
+ CREATE TABLE messaging_group_agents(messaging_group_id TEXT,agent_group_id TEXT,priority INTEGER DEFAULT 0);
  INSERT INTO users VALUES('d','human','Reviewer One','2026-09-05T00:00:00Z'),('j','human','Reviewer Two','2026-09-05T00:00:00Z'),('member','human','Member','2026-09-05T00:00:00Z');
  INSERT INTO user_roles VALUES('d','owner',NULL),('j','admin',NULL);
  INSERT INTO agent_group_members VALUES('member','a');
  INSERT INTO workgroups VALUES('w','Workspace',NULL),('other','Other',NULL);
- INSERT INTO agent_groups VALUES('a','w','Agent A'),('hidden','other','Hidden agent');
- INSERT INTO sessions VALUES('isolated-session','a');
- INSERT INTO messaging_groups VALUES('m','slack:C');
- INSERT INTO messaging_group_agents VALUES('m','a');
+ INSERT INTO agent_groups VALUES('a','w','Agent A','fixture-agent-a'),('hidden','other','Hidden agent','fixture-hidden');
+ INSERT INTO sessions VALUES('isolated-session','a','m','slack:C:123');
+ INSERT INTO observatory_item_threads VALUES('w','policy','slack:C:123','2026-09-05T00:00:00Z','d');
+ INSERT INTO messaging_groups VALUES('m','slack:C','fixture-channel','slack');
+ INSERT INTO messaging_group_agents(messaging_group_id,agent_group_id) VALUES('m','a');
  `);
   await getDb().exec(SIGNAL_SCHEMA);
   registerCookieVerifier((value) => parseAndVerifyCookie(value, key));
@@ -205,6 +219,7 @@ it('authenticated HTTP ownership, delivery, project persistence and evidence con
   const winner = race[0]!.status === 200 ? 'd' : 'j';
   const loser = winner === 'd' ? 'j' : 'd';
   const shared = await request(path, loser);
+  expect(shared.status, JSON.stringify(shared.body)).toBe(200);
   expect(shared.body.decision.owner?.id).toBe(winner);
   expect(shared.body.decision.version).toBe(1);
   const answer = await request(path + '/review', winner, 'POST', {
