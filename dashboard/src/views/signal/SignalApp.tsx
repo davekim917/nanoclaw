@@ -11,7 +11,12 @@ import {
   Search,
   RefreshCw,
 } from 'lucide-react';
-import type { SignalProject, SignalOverview } from '../../../../src/dashboard/observatory-v2/types.js';
+import type {
+  SignalProject,
+  SignalOverview,
+  SignalDecision,
+  SignalReviewRequest,
+} from '../../../../src/dashboard/observatory-v2/types.js';
 import { listThreads, type AuthMe } from '../../lib/api.js';
 import {
   getSignalOverview,
@@ -67,6 +72,7 @@ export function SignalApp({ authMe }: { authMe: AuthMe }) {
   const [route, setRoute] = useState(() => signalRoute(location.hash));
   const [workgroup, setWorkgroup] = useState('all');
   const pendingInstructions = useRef<PendingInstructions>(new Map());
+  const pendingDecisions = useRef<PendingDecisions>(new Map());
   useEffect(() => {
     if (!route.id || window.innerWidth > 850) return;
     const timer = window.setTimeout(() => {
@@ -470,7 +476,7 @@ export function SignalApp({ authMe }: { authMe: AuthMe }) {
                         {route.page !== 'projects' &&
                           (route.id || selected ? (
                             <DecisionPane
-                              key={route.id ?? selected!.id}
+                              pendingDecisions={pendingDecisions.current}
                               id={route.id ?? selected!.id}
                               authMe={authMe}
                               refresh={() => void mutate()}
@@ -672,7 +678,47 @@ function Project({ project: p, canEdit, refresh }: { project: SignalProject; can
     </article>
   );
 }
-export function DecisionPane({ id, authMe, refresh }: { id: string; authMe: AuthMe; refresh: () => void }) {
+interface DecisionAttempt {
+  request: SignalReviewRequest;
+  recipient: string;
+  saved?: SignalDecision;
+  running?: Promise<void>;
+  failure?: string;
+}
+export type PendingDecisions = Map<string, DecisionAttempt>;
+export function DecisionPane({
+  id,
+  authMe,
+  refresh,
+  pendingDecisions,
+}: {
+  id: string;
+  authMe: AuthMe;
+  refresh: () => void;
+  pendingDecisions?: PendingDecisions;
+}) {
+  const local = useRef<PendingDecisions>(new Map());
+  return (
+    <DecisionCompose
+      key={`${authMe.user_id}:${id}`}
+      id={id}
+      authMe={authMe}
+      refresh={refresh}
+      pendingDecisions={pendingDecisions ?? local.current}
+    />
+  );
+}
+function DecisionCompose({
+  id,
+  authMe,
+  refresh,
+  pendingDecisions,
+}: {
+  id: string;
+  authMe: AuthMe;
+  refresh: () => void;
+  pendingDecisions: PendingDecisions;
+}) {
   const stamp = useStamp();
   const { data, error, mutate } = useSWR(['signal-decision', id], () => getSignalDecision(id), {
     refreshInterval: 30000,
@@ -695,81 +741,153 @@ export function DecisionPane({ id, authMe, refresh }: { id: string; authMe: Auth
       clearTimeout(timer);
     };
   }, [mutate]);
-  const [text, setText] = useState('');
-  const [recipient, setRecipient] = useState<{ decisionId: string; agentId: string } | null>(null);
-  useEffect(() => setRecipient(null), [id]);
-  const [busy, setBusy] = useState(false);
+  const attemptKey = `${authMe.user_id}:${id}`;
+  const [, redraw] = useState(0);
+  const pending = pendingDecisions.get(attemptKey);
+  const [text, setText] = useState<string | null>(null);
+  const [recipient, setRecipient] = useState<string | null>(null);
+  const [reviewBusy, setReviewBusy] = useState(false);
+  const [reviewRequired, setReviewRequired] = useState(false);
   const [failure, setFailure] = useState('');
   const [notice, setNotice] = useState('');
-  const attempt = useRef<{ fingerprint: string; key: string } | null>(null);
   const draftEvidence = useRef<{ version: number; evidence_hash: string } | null>(null);
+  const busy = reviewBusy || !!pending?.running;
+  useEffect(() => {
+    let active = true;
+    void pending?.running?.finally(() => {
+      if (active) redraw((n) => n + 1);
+    });
+    return () => {
+      active = false;
+    };
+  }, [pending?.running]);
   const d = data?.decision;
+  useEffect(() => {
+    if (
+      pending?.saved?.dispatch_state === 'sent' &&
+      !pending.running &&
+      d &&
+      ((d.dispatch_state === 'sent' && d.version >= pending.saved.version) ||
+        d.version > pending.saved.version ||
+        d.evidence_hash !== pending.saved.evidence_hash)
+    ) {
+      pendingDecisions.delete(attemptKey);
+      setText(null);
+      draftEvidence.current = null;
+      redraw((n) => n + 1);
+    }
+  }, [d, pending, pendingDecisions, attemptKey]);
+  const saved = pending?.saved ?? d;
   const recipients = data?.recipients ?? [];
-  const explicitRecipient =
-    recipient?.decisionId === id && recipients.some((r) => r.id === recipient.agentId) ? recipient.agentId : null;
+  const explicitRecipient = recipient && recipients.some((r) => r.id === recipient) ? recipient : null;
+  const oldDelivery = d?.state === 'changed' && d.dispatch_state === 'sent';
   const dispatchRecipient =
-    d?.dispatch_agent_group_id ?? explicitRecipient ?? data?.destination.default_agent_group_id ?? '';
-  const dispatchTarget = d?.dispatch_target_thread_id ?? data?.destination.thread_id;
-  const destinationError = d?.dispatch_agent_group_id ? null : data?.destination.error;
+    pending?.recipient ??
+    (oldDelivery ? null : d?.dispatch_agent_group_id) ??
+    explicitRecipient ??
+    data?.destination.default_agent_group_id ??
+    '';
+  const dispatchTarget = (oldDelivery ? null : d?.dispatch_target_thread_id) ?? data?.destination.thread_id;
+  const destinationError = d?.dispatch_agent_group_id && !oldDelivery ? null : data?.destination.error;
+  const reserved = !!d?.dispatch_agent_group_id && !oldDelivery;
+  const locked = !!pending || reserved;
+  const draft = pending?.request.text ?? text ?? d?.answer ?? '';
+  const sent = pending?.saved?.dispatch_state === 'sent' || (!oldDelivery && d?.dispatch_state === 'sent');
+  const canDispatch =
+    !!d?.capabilities.dispatch &&
+    (d.state === 'answered' || d.dispatch_state === 'pending' || d.dispatch_state === 'failed');
   const defaultReason = {
     origin: 'Default: agent from the original source.',
     owner: 'Default: agent identified by the source owner.',
     channel_default: 'Default: channel agent.',
   };
-  async function act(action: 'claim' | 'release' | 'answer' | 'dispatch') {
-    if (!d) return;
-    setBusy(true);
+  async function act(action: 'claim' | 'release') {
+    if (!d || busy) return;
+    setReviewBusy(true);
     setFailure('');
-    setNotice('');
     try {
-      if (action === 'dispatch')
-        await dispatchSignalDecision(id, {
-          expected_version: d.version,
-          evidence_hash: d.dispatch_evidence_hash ?? d.evidence_hash,
-          agent_group_id: dispatchRecipient,
-        });
-      else {
-        const evidence = action === 'answer' ? (draftEvidence.current ?? d) : d;
-        const fingerprint = JSON.stringify([action, evidence.version, evidence.evidence_hash, text]);
-        if (attempt.current?.fingerprint !== fingerprint) attempt.current = { fingerprint, key: crypto.randomUUID() };
-        await reviewSignalDecision(id, {
-          expected_version: evidence.version,
-          evidence_hash: evidence.evidence_hash,
-          action,
-          ...(action === 'answer' ? { text } : {}),
-          idempotency_key: attempt.current.key,
-        });
-      }
-      setNotice(
-        action === 'answer'
-          ? 'Decision recorded. No instruction has been sent.'
-          : action === 'dispatch'
-            ? 'Delivery request processed. See delivery state below.'
-            : action === 'claim'
-              ? 'You are reviewing this decision.'
-              : 'Review ownership released.',
-      );
-      if (action === 'answer') {
-        draftEvidence.current = null;
-        setText('');
-      }
+      await reviewSignalDecision(id, {
+        expected_version: d.version,
+        evidence_hash: d.evidence_hash,
+        action,
+        idempotency_key: crypto.randomUUID(),
+      });
+      setNotice(action === 'claim' ? 'You are reviewing this decision.' : 'Review ownership released.');
       await mutate();
       refresh();
     } catch (err) {
-      await mutate();
-      refresh();
-      setFailure(
-        err instanceof SignalApiError && err.status === 409
-          ? 'This decision changed or another reviewer owns it. The latest record has been requested; review it before trying again.'
-          : message(err),
-      );
-      if (err instanceof SignalApiError && err.status === 409) {
+      setFailure(message(err));
+    } finally {
+      setReviewBusy(false);
+    }
+  }
+  function send() {
+    if (!d || busy || reviewRequired || error || !dispatchRecipient || destinationError || sent || ownedElsewhere)
+      return;
+    let current = pendingDecisions.get(attemptKey);
+    if (!current) {
+      const evidence = draftEvidence.current ?? d;
+      current = {
+        recipient: dispatchRecipient,
+        request: {
+          action: 'answer',
+          text: draft,
+          expected_version: evidence.version,
+          evidence_hash: evidence.evidence_hash,
+          idempotency_key: crypto.randomUUID(),
+        },
+        ...(canDispatch && draft === d.answer ? { saved: d } : {}),
+      };
+      pendingDecisions.set(attemptKey, current);
+    }
+    if (current.running) return;
+    const attempt = current;
+    attempt.failure = '';
+    setFailure('');
+    setNotice('');
+    attempt.running = (async () => {
+      try {
+        if (!attempt.saved) {
+          const reviewed = (await reviewSignalDecision(id, attempt.request)).decision;
+          if (
+            reviewed.answer !== attempt.request.text?.trim() ||
+            reviewed.evidence_hash !== attempt.request.evidence_hash ||
+            reviewed.state !== 'answered' ||
+            reviewed.answered_by?.id !== authMe.user_id ||
+            !reviewed.capabilities.dispatch ||
+            (reviewed.owner && reviewed.owner.id !== authMe.user_id) ||
+            (reviewed.dispatch_agent_group_id && reviewed.dispatch_agent_group_id !== attempt.recipient)
+          ) {
+            throw new SignalApiError(409, 'The recorded decision changed. Review it before sending.');
+          }
+          attempt.saved = reviewed;
+        }
+        const result = await dispatchSignalDecision(id, {
+          expected_version: attempt.saved.version,
+          evidence_hash: attempt.saved.dispatch_evidence_hash ?? attempt.saved.evidence_hash,
+          agent_group_id: attempt.recipient,
+        });
+        attempt.saved = result.decision;
+      } catch (err) {
+        attempt.failure = `${attempt.saved ? 'Decision saved. Delivery not confirmed. ' : 'Save could not be confirmed. '}${message(err)}`;
+        if (err instanceof SignalApiError && err.status >= 400 && err.status < 500) {
+          // A definitive rejection permits reviewing the fresh source and editing again.
+          pendingDecisions.delete(attemptKey);
+          draftEvidence.current = null;
+          setText(attempt.request.text ?? draft);
+          setReviewRequired(true);
+          setFailure(
+            `${attempt.saved ? 'Decision saved. Delivery not confirmed. ' : ''}Review the latest source and edit your decision before trying again. ${message(err)}`,
+          );
+        }
+      } finally {
+        delete attempt.running;
+        redraw((n) => n + 1);
         await mutate();
         refresh();
       }
-    } finally {
-      setBusy(false);
-    }
+    })();
+    redraw((n) => n + 1);
   }
   const ownedElsewhere = !!d?.owner && d.owner.id !== authMe.user_id;
   return (
@@ -908,114 +1026,107 @@ export function DecisionPane({ id, authMe, refresh }: { id: string; authMe: Auth
                   </button>
                 )}
               </div>
-              {d.answer && (
-                <div className="signal-recorded">
-                  <h3>Recorded decision</h3>
-                  <p>{d.answer}</p>
-                  <small>
-                    {d.answered_by?.name} · {stamp(d.answered_at)}
-                  </small>
-                </div>
-              )}
-              {d.capabilities.answer && (
+              {(d.capabilities.answer || canDispatch || pending || sent) && (
                 <form
                   onSubmit={(e) => {
                     e.preventDefault();
-                    void act('answer');
+                    send();
                   }}
                 >
                   <label className="signal-field">
                     Your decision
                     <textarea
                       aria-label="Your decision"
-                      value={text}
+                      value={draft}
                       onChange={(e) => {
-                        const next = e.target.value;
-                        if (!next.trim()) draftEvidence.current = null;
-                        else if (!draftEvidence.current)
-                          draftEvidence.current = { version: d.version, evidence_hash: d.evidence_hash };
-                        setText(next);
+                        draftEvidence.current ??= { version: d.version, evidence_hash: d.evidence_hash };
+                        setReviewRequired(false);
+                        setText(e.target.value);
                       }}
                       placeholder="Write the decision and relevant constraints…"
-                      disabled={ownedElsewhere || busy || !!error}
+                      disabled={ownedElsewhere || busy || !!error || locked || sent || !d.capabilities.answer}
                     />
                   </label>
-                  <button className="signal-primary" disabled={!text.trim() || ownedElsewhere || busy || !!error}>
-                    Record decision →
-                  </button>
-                  <p className="signal-action-note">Saves shared review history. Sending is a separate step.</p>
-                </form>
-              )}
-              {ownedElsewhere && <p className="signal-muted">{d.owner?.name} owns this review.</p>}
-              {d.answer && (
-                <div className="signal-dispatch">
-                  <h3>Instruction delivery</h3>
-                  <p>
-                    {d.dispatch_error === 'thread_creation_uncertain_reconciliation_required'
-                      ? message(new Error(d.dispatch_error))
-                      : d.dispatch_state === 'sent'
-                        ? 'Instruction sent. Agent work is not yet verified complete.'
-                        : d.dispatch_state === 'pending'
-                          ? 'Delivery pending or uncertain. Retry checks the same instruction.'
-                          : d.dispatch_state === 'failed'
-                            ? `Delivery failed: ${d.dispatch_error ?? 'See source thread.'}`
-                            : 'No instruction sent.'}
+                  <label className="signal-field">
+                    Recipient
+                    <select
+                      aria-label="Instruction recipient"
+                      value={dispatchRecipient}
+                      disabled={busy || locked || sent || ownedElsewhere || !!error}
+                      onChange={(e) => setRecipient(e.target.value)}
+                    >
+                      <option value="">Choose an agent</option>
+                      {dispatchRecipient && !recipients.some((r) => r.id === dispatchRecipient) && (
+                        <option value={dispatchRecipient}>{dispatchRecipient} · reserved recipient</option>
+                      )}
+                      {recipients.map((r) => (
+                        <option key={r.id} value={r.id}>
+                          {r.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <p className="signal-action-note">
+                    {locked
+                      ? 'Recipient reserved for this instruction. Retry keeps the same destination.'
+                      : explicitRecipient
+                        ? 'Recipient selected by you.'
+                        : data.destination.default_reason
+                          ? defaultReason[data.destination.default_reason]
+                          : 'Choose an agent to receive this instruction.'}
                   </p>
-                  {d.capabilities.dispatch &&
-                  (d.state === 'answered' || d.dispatch_state === 'pending' || d.dispatch_state === 'failed') &&
-                  d.dispatch_state !== 'sent' ? (
-                    <>
-                      <p className="signal-action-note">
-                        {dispatchTarget ? 'Replies in the existing thread' : 'Starts a new thread'}
-                        {data.destination.channel_name ? ` in ${data.destination.channel_name}` : ''}.
-                      </p>
-                      {destinationError && <p role="alert">{destinationError}</p>}
-                      <label className="signal-field">
-                        Recipient
-                        <select
-                          disabled={busy || !!d.dispatch_agent_group_id}
-                          aria-label="Instruction recipient"
-                          value={dispatchRecipient}
-                          onChange={(e) => setRecipient({ decisionId: id, agentId: e.target.value })}
-                        >
-                          <option value="">Choose an agent</option>
-                          {d.dispatch_agent_group_id && !recipients.some((r) => r.id === d.dispatch_agent_group_id) && (
-                            <option value={d.dispatch_agent_group_id}>
-                              {d.dispatch_agent_group_id} · reserved recipient
-                            </option>
-                          )}
-                          {recipients.map((r) => (
-                            <option key={r.id} value={r.id}>
-                              {r.name}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                      <p className="signal-action-note">
-                        {d.dispatch_agent_group_id
-                          ? 'Recipient reserved for this instruction. Retry keeps the same destination.'
-                          : explicitRecipient
-                            ? 'Recipient selected by you.'
-                            : data.destination.default_reason
-                              ? defaultReason[data.destination.default_reason]
-                              : 'Choose an agent to receive this instruction.'}
-                      </p>
-                      <button
-                        disabled={!dispatchRecipient || busy || !!error || !!destinationError}
-                        onClick={() => void act('dispatch')}
-                      >
-                        Send recorded instruction →
-                      </button>
-                    </>
+                  <p className="signal-action-note">
+                    {dispatchTarget ? 'Replies in the existing thread' : 'Starts a new thread'}
+                    {data.destination.channel_name ? ` in ${data.destination.channel_name}` : ''}.
+                  </p>
+                  {destinationError && <p role="alert">{destinationError}</p>}
+                  {!sent && (
+                    <button
+                      className="signal-primary"
+                      disabled={
+                        reviewRequired ||
+                        !draft.trim() ||
+                        !dispatchRecipient ||
+                        busy ||
+                        !!error ||
+                        !!destinationError ||
+                        ownedElsewhere ||
+                        (!d.capabilities.answer && !canDispatch)
+                      }
+                    >
+                      {busy
+                        ? 'Sending…'
+                        : pending?.saved || reserved || d.dispatch_state === 'failed'
+                          ? 'Retry send →'
+                          : pending
+                            ? 'Retry decision →'
+                            : 'Send decision →'}
+                    </button>
+                  )}
+                  {oldDelivery && !pending ? (
+                    <p role="status">
+                      Previous instruction sent. Review the changed evidence before sending a new decision.
+                    </p>
+                  ) : sent ? (
+                    <p role="status">Instruction sent. Agent work is not yet verified complete.</p>
+                  ) : pending?.failure ? (
+                    <p role="alert">{pending.failure}</p>
+                  ) : d.dispatch_error ? (
+                    <p role="alert">{message(new Error(d.dispatch_error))}</p>
+                  ) : saved?.dispatch_state === 'pending' ? (
+                    <p role="status">Delivery pending or uncertain. Retry checks the same instruction.</p>
                   ) : (
-                    d.dispatch_state !== 'sent' && (
-                      <p className="signal-muted">
-                        No safe delivery path is available here. Inspect the original source.
+                    (pending?.saved || d.answer) && (
+                      <p role="status">
+                        {busy
+                          ? 'Saved. Sending instruction…'
+                          : 'Saved but not sent. Retry checks the same instruction.'}
                       </p>
                     )
                   )}
-                </div>
+                </form>
               )}
+              {ownedElsewhere && <p className="signal-muted">{d.owner?.name} owns this review.</p>}
             </>
           )}
           {failure && (

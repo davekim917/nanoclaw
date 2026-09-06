@@ -67,7 +67,18 @@ const mount = () =>
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(api.getSignalDecision).mockResolvedValue(structuredClone(fixture));
-  vi.mocked(api.reviewSignalDecision).mockResolvedValue({ decision: fixture.decision });
+  vi.mocked(api.reviewSignalDecision).mockImplementation(async (_, body) => ({
+    decision: {
+      ...fixture.decision,
+      version: 3,
+      state: 'answered',
+      answer: body.text?.trim() ?? null,
+      answered_by: { id: authMe.user_id, name: 'Reviewer One' },
+    },
+  }));
+  vi.mocked(api.dispatchSignalDecision).mockResolvedValue({
+    decision: { ...fixture.decision, dispatch_state: 'sent' },
+  });
 });
 afterEach(() => vi.useRealTimers());
 describe('decision context and distinct authority', () => {
@@ -79,7 +90,7 @@ describe('decision context and distinct authority', () => {
     expect(screen.getByText('A source key repeats in two markets.')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /approve/i })).not.toBeInTheDocument();
     fireEvent.change(screen.getByLabelText('Your decision'), { target: { value: 'Use the internal ID.' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Record decision →' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Send decision →' }));
     await waitFor(() =>
       expect(api.reviewSignalDecision).toHaveBeenCalledWith(
         'd1',
@@ -91,8 +102,14 @@ describe('decision context and distinct authority', () => {
         }),
       ),
     );
-    expect(api.dispatchSignalDecision).not.toHaveBeenCalled();
-    await screen.findByText('Decision recorded. No instruction has been sent.');
+    await waitFor(() =>
+      expect(api.dispatchSignalDecision).toHaveBeenCalledWith('d1', {
+        expected_version: 3,
+        evidence_hash: 'hash7',
+        agent_group_id: 'a1',
+      }),
+    );
+    await screen.findByText('Instruction sent. Agent work is not yet verified complete.');
   });
   it('submits an existing draft against the evidence that began it after refresh', async () => {
     vi.useFakeTimers();
@@ -110,7 +127,7 @@ describe('decision context and distinct authority', () => {
     });
     expect(screen.getByText('v3')).toBeInTheDocument();
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Record decision →' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Send decision →' }));
     });
     expect(api.reviewSignalDecision).toHaveBeenCalledWith(
       'd1',
@@ -132,7 +149,7 @@ describe('decision context and distinct authority', () => {
     vi.mocked(api.getSignalDecision).mockResolvedValue(answered);
     vi.mocked(api.dispatchSignalDecision).mockResolvedValue({ decision: answered.decision });
     mount();
-    const send = await screen.findByRole('button', { name: 'Send recorded instruction →' });
+    const send = await screen.findByRole('button', { name: 'Send decision →' });
     expect(send).toBeEnabled();
     expect(screen.getByLabelText('Instruction recipient')).toHaveValue('a1');
     expect(screen.queryByLabelText('Destination thread')).not.toBeInTheDocument();
@@ -170,7 +187,7 @@ describe('decision context and distinct authority', () => {
     expect(screen.getByLabelText('Instruction recipient')).toHaveValue('a2');
     expect(screen.getByText('Recipient selected by you.')).toBeInTheDocument();
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Send recorded instruction →' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Send decision →' }));
     });
     expect(api.dispatchSignalDecision).toHaveBeenCalledWith('d1', {
       expected_version: 2,
@@ -212,7 +229,7 @@ describe('decision context and distinct authority', () => {
         }),
     );
     mount();
-    fireEvent.click(await screen.findByRole('button', { name: 'Send recorded instruction →' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Send decision →' }));
     expect(screen.getByLabelText('Instruction recipient')).toBeDisabled();
     await act(async () => {
       finish({ decision: answered.decision });
@@ -251,7 +268,7 @@ describe('decision context and distinct authority', () => {
       vi.mocked(api.getSignalDecision).mockResolvedValue(pending);
       vi.mocked(api.dispatchSignalDecision).mockResolvedValue({ decision: pending.decision });
       mount();
-      fireEvent.click(await screen.findByRole('button', { name: 'Send recorded instruction →' }));
+      fireEvent.click(await screen.findByRole('button', { name: 'Retry send →' }));
       await waitFor(() =>
         expect(api.dispatchSignalDecision).toHaveBeenCalledWith('d1', {
           expected_version: 2,
@@ -271,9 +288,163 @@ describe('decision context and distinct authority', () => {
       new api.SignalApiError(503, 'thread_creation_uncertain_reconciliation_required'),
     );
     mount();
-    fireEvent.click(await screen.findByRole('button', { name: 'Send recorded instruction →' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Send decision →' }));
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'An operator must reconcile the source channel before delivery can continue.',
+    );
+  });
+
+  it('keeps the chosen agent in the same form and sends with one click', async () => {
+    mount();
+    const input = await screen.findByLabelText('Your decision');
+    const select = screen.getByLabelText('Instruction recipient');
+    expect(select.closest('form')).toBe(input.closest('form'));
+    fireEvent.change(input, { target: { value: 'Use internal ID.' } });
+    fireEvent.change(select, { target: { value: 'a2' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send decision →' }));
+    await waitFor(() =>
+      expect(api.dispatchSignalDecision).toHaveBeenCalledWith('d1', {
+        expected_version: 3,
+        evidence_hash: 'hash7',
+        agent_group_id: 'a2',
+      }),
+    );
+  });
+
+  it.each(['save', 'dispatch'])('retries uncertain %s without changing the attempt', async (stage) => {
+    const failing = stage === 'save' ? api.reviewSignalDecision : api.dispatchSignalDecision;
+    vi.mocked(failing).mockRejectedValueOnce(new Error('Connection lost'));
+    mount();
+    fireEvent.change(await screen.findByLabelText('Your decision'), { target: { value: 'Use internal ID.' } });
+    fireEvent.change(screen.getByLabelText('Instruction recipient'), { target: { value: 'a2' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send decision →' }));
+    await screen.findByText(/Connection lost/);
+    if (stage === 'save') expect(api.dispatchSignalDecision).not.toHaveBeenCalled();
+    expect(screen.getByLabelText('Instruction recipient')).toBeDisabled();
+    expect(screen.getByLabelText('Your decision')).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: stage === 'save' ? 'Retry decision →' : 'Retry send →' }));
+    await screen.findByText('Instruction sent. Agent work is not yet verified complete.');
+    expect(vi.mocked(failing).mock.calls[0]).toEqual(vi.mocked(failing).mock.calls[1]);
+    if (stage === 'dispatch') expect(api.reviewSignalDecision).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([403, 409])('does not send after save rejection %s', async (status) => {
+    vi.mocked(api.reviewSignalDecision).mockRejectedValueOnce(new api.SignalApiError(status, 'Changed or denied'));
+    mount();
+    fireEvent.change(await screen.findByLabelText('Your decision'), { target: { value: 'Use internal ID.' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send decision →' }));
+    await screen.findByText(/Review the latest source and edit/);
+    expect(api.dispatchSignalDecision).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'Send decision →' })).toBeDisabled();
+    expect(screen.getByLabelText('Your decision')).toBeEnabled();
+  });
+
+  it('rejects a different answer returned by an old save replay', async () => {
+    vi.mocked(api.reviewSignalDecision).mockResolvedValue({
+      decision: {
+        ...fixture.decision,
+        state: 'answered',
+        answer: 'A different answer',
+        answered_by: { id: authMe.user_id, name: 'Reviewer One' },
+      },
+    });
+    mount();
+    fireEvent.change(await screen.findByLabelText('Your decision'), { target: { value: 'Use internal ID.' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send decision →' }));
+    await screen.findByText(/The recorded decision changed/);
+    expect(api.dispatchSignalDecision).not.toHaveBeenCalled();
+  });
+
+  it('keeps an in-flight attempt across navigation without contaminating another decision', async () => {
+    let finish!: (value: Awaited<ReturnType<typeof api.reviewSignalDecision>>) => void;
+    vi.mocked(api.reviewSignalDecision).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    vi.mocked(api.getSignalDecision).mockImplementation(async (id) => ({
+      ...fixture,
+      decision: { ...fixture.decision, id },
+    }));
+    const cache = new Map();
+    const pane = (id: string) => (
+      <SWRConfig value={{ provider: () => cache, dedupingInterval: 0 }}>
+        <DecisionPane id={id} authMe={authMe} refresh={() => {}} />
+      </SWRConfig>
+    );
+    const view = render(pane('d1'));
+    fireEvent.change(await screen.findByLabelText('Your decision'), { target: { value: 'Use internal ID.' } });
+    fireEvent.change(screen.getByLabelText('Instruction recipient'), { target: { value: 'a2' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send decision →' }));
+    view.rerender(pane('d2'));
+    await waitFor(() => expect(screen.getByLabelText('Your decision')).toHaveValue(''));
+    expect(screen.getByLabelText('Instruction recipient')).toHaveValue('a1');
+    view.rerender(pane('d1'));
+    await waitFor(() => expect(screen.getByLabelText('Your decision')).toHaveValue('Use internal ID.'));
+    expect(screen.getByLabelText('Instruction recipient')).toBeDisabled();
+    await act(async () =>
+      finish({
+        decision: {
+          ...fixture.decision,
+          version: 3,
+          state: 'answered',
+          answer: 'Use internal ID.',
+          answered_by: { id: authMe.user_id, name: 'Reviewer One' },
+        },
+      }),
+    );
+    await screen.findByText('Instruction sent. Agent work is not yet verified complete.');
+    expect(api.reviewSignalDecision).toHaveBeenCalledTimes(1);
+    expect(api.dispatchSignalDecision).toHaveBeenCalledWith('d1', expect.objectContaining({ agent_group_id: 'a2' }));
+  });
+
+  it('reports pending response truthfully and retries without another save', async () => {
+    vi.mocked(api.dispatchSignalDecision).mockResolvedValue({
+      decision: {
+        ...fixture.decision,
+        version: 4,
+        answer: 'Use internal ID.',
+        state: 'answered',
+        dispatch_state: 'pending',
+      },
+    });
+    mount();
+    fireEvent.change(await screen.findByLabelText('Your decision'), { target: { value: 'Use internal ID.' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send decision →' }));
+    await screen.findByText('Delivery pending or uncertain. Retry checks the same instruction.');
+    expect(screen.queryByText('Instruction sent. Agent work is not yet verified complete.')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Retry send →' }));
+    await waitFor(() => expect(api.dispatchSignalDecision).toHaveBeenCalledTimes(2));
+    expect(api.reviewSignalDecision).toHaveBeenCalledTimes(1);
+  });
+
+  it('allows a new answer when the source changes after a completed delivery', async () => {
+    const changed = structuredClone(fixture);
+    Object.assign(changed.decision, {
+      state: 'changed',
+      answer: 'Previous answer',
+      dispatch_state: 'sent',
+      dispatch_agent_group_id: 'a1',
+      dispatch_evidence_hash: 'old-hash',
+      evidence_hash: 'hash7',
+    });
+    vi.mocked(api.getSignalDecision).mockResolvedValue(changed);
+    mount();
+    expect(await screen.findByLabelText('Your decision')).toBeEnabled();
+    expect(
+      screen.getByText('Previous instruction sent. Review the changed evidence before sending a new decision.'),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText('Instruction recipient')).toBeEnabled();
+    fireEvent.change(screen.getByLabelText('Your decision'), { target: { value: 'New answer' } });
+    fireEvent.change(screen.getByLabelText('Instruction recipient'), { target: { value: 'a2' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send decision →' }));
+    await waitFor(() =>
+      expect(api.dispatchSignalDecision).toHaveBeenCalledWith('d1', {
+        expected_version: 3,
+        evidence_hash: 'hash7',
+        agent_group_id: 'a2',
+      }),
     );
   });
 
