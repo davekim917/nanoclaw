@@ -14,7 +14,7 @@ vi.mock('../log.js', () => ({
   isSurvivableIoError: vi.fn(() => false),
 }));
 
-import { initMigratedTestDb, closeDb, getRawDb } from '../db/index.js';
+import { initMigratedTestDb, closeDb, getDb } from '../db/index.js';
 import { registerResource } from './crud.js';
 import { lookup } from './registry.js';
 
@@ -69,8 +69,8 @@ afterEach(async () => {
 });
 
 describe('genericCreate natural-key lookup — NULL matching (case 15)', () => {
-  beforeEach(() => {
-    getRawDb().exec(
+  beforeEach(async () => {
+    await getDb().exec(
       `CREATE TABLE crudtest_rows (
          id TEXT PRIMARY KEY, scope TEXT, name TEXT NOT NULL,
          enabled INTEGER, score INTEGER, payload TEXT, created_at TEXT NOT NULL
@@ -83,7 +83,7 @@ describe('genericCreate natural-key lookup — NULL matching (case 15)', () => {
     const first = (await lookup('crudtests-create')!.handler({ name: 'alpha' }, hostCtx)) as { id: string };
     const second = (await lookup('crudtests-create')!.handler({ name: 'alpha' }, hostCtx)) as { id: string };
     expect(second.id).toBe(first.id);
-    const count = getRawDb().prepare('SELECT COUNT(*) AS n FROM crudtest_rows').get() as { n: number };
+    const count = (await getDb().get<{ n: number }>('SELECT COUNT(*) AS n FROM crudtest_rows'))!;
     expect(count.n).toBe(1);
   });
 
@@ -105,8 +105,8 @@ describe('genericCreate natural-key lookup — NULL matching (case 15)', () => {
 });
 
 describe('genericList coerceListFilter (cases 16, 17)', () => {
-  beforeEach(() => {
-    getRawDb().exec(
+  beforeEach(async () => {
+    await getDb().exec(
       `CREATE TABLE crudtest_rows (
          id TEXT PRIMARY KEY, scope TEXT, name TEXT NOT NULL,
          enabled INTEGER, score INTEGER, payload TEXT, created_at TEXT NOT NULL
@@ -119,12 +119,20 @@ describe('genericList coerceListFilter (cases 16, 17)', () => {
     // boolean coercion genericCreate does on write is unchanged by this PR;
     // seed the rows directly so this test isolates `list`'s read-side
     // coercion (case 16).
-    getRawDb()
-      .prepare('INSERT INTO crudtest_rows (id, name, enabled, created_at) VALUES (?, ?, ?, ?)')
-      .run('row-a', 'a', 1, new Date().toISOString());
-    getRawDb()
-      .prepare('INSERT INTO crudtest_rows (id, name, enabled, created_at) VALUES (?, ?, ?, ?)')
-      .run('row-b', 'b', 0, new Date().toISOString());
+    await getDb().run(
+      'INSERT INTO crudtest_rows (id, name, enabled, created_at) VALUES (?, ?, ?, ?)',
+      'row-a',
+      'a',
+      1,
+      new Date().toISOString(),
+    );
+    await getDb().run(
+      'INSERT INTO crudtest_rows (id, name, enabled, created_at) VALUES (?, ?, ?, ?)',
+      'row-b',
+      'b',
+      0,
+      new Date().toISOString(),
+    );
     const rows = (await lookup('crudtests-list')!.handler({ enabled: 'true' }, hostCtx)) as { name: string }[];
     expect(rows.map((r) => r.name)).toEqual(['a']);
   });
@@ -150,17 +158,48 @@ describe('genericList coerceListFilter (cases 16, 17)', () => {
   });
 });
 
+// Synthetic resource whose first `_at` column is a nullable event stamp
+// declared BEFORE `created_at` (messaging-groups' `denied_at` shape): the
+// default order must still be `created_at DESC`, not the NULL stamp.
+registerResource({
+  name: 'stamptest',
+  plural: 'stamptests',
+  table: 'stamptest_rows',
+  description: 'Synthetic resource for the created_at-over-first-_at default order.',
+  idColumn: 'id',
+  columns: [
+    { name: 'id', type: 'string', description: 'UUID.', generated: true },
+    { name: 'denied_at', type: 'string', description: 'nullable event stamp declared first' },
+    { name: 'name', type: 'string', description: 'label', required: true },
+    { name: 'created_at', type: 'string', description: 'Auto-set.', generated: true },
+  ],
+  operations: { list: 'open', create: 'open' },
+});
+
 describe('genericList listOrder (cases 18, 19)', () => {
-  beforeEach(() => {
-    getRawDb().exec(
+  beforeEach(async () => {
+    await getDb().exec(
       `CREATE TABLE crudtest_rows (
          id TEXT PRIMARY KEY, scope TEXT, name TEXT NOT NULL,
          enabled INTEGER, score INTEGER, payload TEXT, created_at TEXT NOT NULL
        )`,
     );
-    getRawDb().exec(
+    await getDb().exec(
       `CREATE TABLE ordertest_rows (id TEXT PRIMARY KEY, seq INTEGER NOT NULL, created_at TEXT NOT NULL)`,
     );
+    await getDb().exec(
+      `CREATE TABLE stamptest_rows (id TEXT PRIMARY KEY, denied_at TEXT, name TEXT NOT NULL, created_at TEXT NOT NULL)`,
+    );
+  });
+
+  it('prefers created_at over an earlier nullable _at column (Codex, #492)', async () => {
+    const ids: string[] = [];
+    for (const name of ['first', 'second', 'third']) {
+      ids.push(((await lookup('stamptests-create')!.handler({ name }, hostCtx)) as { id: string }).id);
+      await new Promise((r) => setTimeout(r, 2));
+    }
+    const rows = (await lookup('stamptests-list')!.handler({ limit: 1 }, hostCtx)) as { id: string }[];
+    expect(rows.map((r) => r.id)).toEqual([ids[2]]);
   });
 
   it('generic list orders by the resource timestamp column, newest first (case 18)', async () => {
