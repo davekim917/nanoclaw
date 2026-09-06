@@ -594,6 +594,24 @@ describe('durable stop intent', () => {
     ).toEqual([['Cleared honoured stop intents at startup', { cleared: 1, deferredPendingAdoption: 0 }]]);
   });
 
+  it('a boot that defers every plain stop row still logs the count', async () => {
+    await seedSession('sess-pending-only');
+    await setStopIntent('sess-pending-only', 'stop', STAMP);
+    _markPendingAdoptionForTesting('sess-pending-only');
+
+    await honorPendingStopIntents(
+      async () => true,
+      () => false,
+    );
+
+    expect(await storedIntent('sess-pending-only')).toBe('stop');
+    // Distinguishable from a boot with no plain rows: the line says why
+    // nothing was cleared.
+    expect(
+      vi.mocked(log.info).mock.calls.filter((call) => call[0] === 'Cleared honoured stop intents at startup'),
+    ).toEqual([['Cleared honoured stop intents at startup', { cleared: 0, deferredPendingAdoption: 1 }]]);
+  });
+
   it('a boot with no plain stop rows logs no clear', async () => {
     await seedSession('sess-owed');
     await setStopIntent('sess-owed', 'respawn_after_stop', STAMP);

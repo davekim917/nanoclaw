@@ -3282,18 +3282,22 @@ export async function honorPendingStopIntents(
  */
 async function clearHonouredStopIntents(intents: SessionClaimRow[]): Promise<void> {
   const plain = intents.filter((intent) => intent.stop_intent === 'stop');
+  if (plain.length === 0) return;
   const honoured = plain.filter((intent) => !pendingAdoptions.has(intent.session_id));
-  if (honoured.length === 0) return;
   let cleared = 0;
-  await shadowWrite('stop-intent-clear', async () => {
-    const result = await getDb().run(
-      `UPDATE session_claims SET stop_intent = NULL, updated_at = ?
-         WHERE stop_intent = 'stop' AND (session_id, updated_at) IN (VALUES ${honoured.map(() => '(?, ?)').join(', ')})`,
-      new Date().toISOString(),
-      ...honoured.flatMap((intent) => [intent.session_id, intent.updated_at]),
-    );
-    cleared = result.changes;
-  });
+  if (honoured.length > 0) {
+    await shadowWrite('stop-intent-clear', async () => {
+      const result = await getDb().run(
+        `UPDATE session_claims SET stop_intent = NULL, updated_at = ?
+           WHERE stop_intent = 'stop' AND (session_id, updated_at) IN (VALUES ${honoured.map(() => '(?, ?)').join(', ')})`,
+        new Date().toISOString(),
+        ...honoured.flatMap((intent) => [intent.session_id, intent.updated_at]),
+      );
+      cleared = result.changes;
+    });
+  }
+  // Logged whenever a plain row was read, so a boot that deferred every one
+  // of them reads as such rather than as a boot that had nothing to clear.
   log.info('Cleared honoured stop intents at startup', {
     cleared,
     deferredPendingAdoption: plain.length - honoured.length,
