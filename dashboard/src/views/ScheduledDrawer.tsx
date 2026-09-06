@@ -97,7 +97,8 @@ export const ScheduledDrawer: React.FC<ScheduledDrawerProps> = ({ rowKey, groupN
   const { data, mutate } = useSWR<ScheduledDetail>(
     ['/dashboard/api/scheduled', rowKey],
     () => getScheduledDetail(rowKey),
-    { refreshInterval: 0 },
+    // Keep server-authorized actions current when the sweep changes the series.
+    { refreshInterval: 30_000 },
   );
   const [pane, setPane] = useState<Pane>({ kind: 'none' });
   const [busy, setBusy] = useState(false);

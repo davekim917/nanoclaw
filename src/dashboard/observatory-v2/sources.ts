@@ -559,8 +559,21 @@ export async function buildSignalData(
           kind: 'thread',
         });
       if (thread.state !== 'needs_you') continue;
-      const target =
-        thread.participants.find((p) => p.session_id === thread.reply_target_session_id) ?? thread.participants[0];
+      // Participants are display identities, collapsed to one session per agent.
+      // A different session of that same agent can be the one awaiting input.
+      let target: { session_id: string; agent_group_id: string } | undefined = thread.reply_target_session_id
+        ? thread.participants.find((p) => p.session_id === thread.reply_target_session_id)
+        : thread.participants[0];
+      if (!target && thread.reply_target_session_id && thread.session_ids.includes(thread.reply_target_session_id)) {
+        target = await getDb().get<{ session_id: string; agent_group_id: string }>(
+          `SELECT s.id AS session_id, s.agent_group_id FROM sessions s
+           JOIN agent_groups a ON a.id=s.agent_group_id
+           WHERE s.id=? AND a.workgroup_id=? AND COALESCE(s.thread_id, 'session:' || s.id)=?`,
+          thread.reply_target_session_id,
+          wg.id,
+          thread.thread_id,
+        );
+      }
       if (!target || !allowed.has(target.agent_group_id)) continue;
       let question = thread.needs_you_reason?.text ?? 'Open the thread to inspect what input is needed.';
       let sequence: string | number = thread.last_activity_at ?? 'unknown';

@@ -15,11 +15,13 @@ import Database from 'better-sqlite3';
 
 import { initTestDb, closeDb, getRawDb } from '../../db/connection.js';
 import { openInboundDb } from '../../modules/mailbox/openers.js';
+import { readSessionInbound } from '../../modules/mailbox/read-only.js';
 import { ensureSchema } from '../../modules/mailbox/schema.js';
 import { invalidateScheduledCache, getScheduledCache, SWEEP_INTERVAL_MS } from './scheduled-shared.js';
 import {
   assembleSnapshot,
   deriveHealth,
+  buildDetailRow,
   _resetAssemblyInFlightForTesting,
   type HealthCtx,
   type ScheduledAssemblyOptions,
@@ -125,7 +127,7 @@ function insertInboundRow(inboundPath: string, row: SeedRow): void {
     timestamp: row.timestamp ?? isoIn(-3600_000),
     status: row.status ?? 'pending',
     processAfter: row.process_after ?? null,
-    recurrence: row.recurrence ?? '0 9 * * *',
+    recurrence: row.recurrence === undefined ? '0 9 * * *' : row.recurrence,
     seriesId: row.series_id ?? row.id,
     content: row.content ?? JSON.stringify({ prompt: 'do thing' }),
     platformId: row.platform_id ?? null,
@@ -286,7 +288,7 @@ describe('assembleSnapshot — chunking + cache + partial', () => {
     expect(snap.rows.some((r) => r.series_id === 'r2')).toBe(false);
   });
 
-  it('returns ALL live rows for a duplicate-successor series', async () => {
+  it('flags a duplicate-successor series once with a unique locator', async () => {
     addGroup('ag-1', 'G1', 'g1');
     addMg('mg-1', 'discord', 'd:1', 'chan-1');
     addSession('sess-1', 'ag-1', 'mg-1');
@@ -297,8 +299,95 @@ describe('assembleSnapshot — chunking + cache + partial', () => {
 
     const snap = await assembleSnapshot(ALL_SCOPES, opts());
     const dupRows = snap.rows.filter((r) => r.series_id === 'dup');
-    // Both fireable rows surface (not just MAX(seq)) so neither stays hidden.
-    expect(dupRows.length).toBe(2);
+    // The duplicate remains unhealthy without duplicate series-level UI keys.
+    expect(dupRows.length).toBe(1);
+    expect(dupRows[0].health).toBe('stalled');
+  });
+});
+
+describe('assembleSnapshot — intentional manual occurrences', () => {
+  it.each(['pending', 'completed'])(
+    'keeps a terminal recurring strand distinct from a %s manual run',
+    async (manualStatus) => {
+      addGroup('ag-1', 'G1', 'g1');
+      addSession('sess-1', 'ag-1', null, 'system:tasks:daily');
+      const { inbound } = seedSessionDbs('ag-1', 'sess-1');
+      insertInboundRow(inbound, {
+        id: 'stranded',
+        series_id: 'daily',
+        status: 'completed',
+        process_after: isoIn(-3600_000),
+      });
+      insertInboundRow(inbound, {
+        id: 'manual',
+        series_id: 'daily',
+        status: manualStatus,
+        recurrence: null,
+        process_after: isoIn(-60_000),
+      });
+      const snap = await assembleSnapshot(ALL_SCOPES, opts());
+      expect(snap.rows).toHaveLength(1);
+      expect(snap.rows[0]).toMatchObject({ kind: 'recurring', health: 'strand' });
+      const detail = await buildDetailRow('ag-1', 'sess-1', 'daily', TEST_DIR, NOW);
+      expect(detail).toMatchObject({ kind: 'recurring', health: 'strand', available_verbs: ['cancel'] });
+      const selected = readSessionInbound(
+        { dataDir: TEST_DIR, agentGroupId: 'ag-1', sessionId: 'sess-1' },
+        (mailbox) => ({
+          live: mailbox.getLiveTaskRow('daily'),
+          latest: mailbox.getLatestTaskRow('daily')?.id,
+        }),
+      );
+      expect(selected).toMatchObject({ live: null, latest: 'stranded' });
+    },
+  );
+
+  it.each([
+    ['pending', 'pending'],
+    ['pending', 'completed'],
+    ['paused', 'pending'],
+    ['paused', 'completed'],
+  ])('keeps the %s recurring chain alongside a %s manual run', async (status, manualStatus) => {
+    addGroup('ag-1', 'G1', 'g1');
+    addSession('sess-1', 'ag-1', null, 'system:tasks:daily');
+    const { inbound } = seedSessionDbs('ag-1', 'sess-1');
+    insertInboundRow(inbound, {
+      id: 'armed',
+      series_id: 'daily',
+      status,
+      process_after: isoIn(3600_000),
+      content: JSON.stringify({ prompt: 'scheduled definition' }),
+    });
+    insertInboundRow(inbound, {
+      id: 'manual',
+      series_id: 'daily',
+      status: manualStatus,
+      recurrence: null,
+      process_after: isoIn(-60_000),
+      content: JSON.stringify({ prompt: 'manual copy' }),
+    });
+
+    const snap = await assembleSnapshot(ALL_SCOPES, opts());
+    expect(snap.rows).toHaveLength(1);
+    expect(snap.rows[0]).toMatchObject({
+      series_id: 'daily',
+      kind: 'recurring',
+      cron: '0 9 * * *',
+      health: status === 'paused' ? 'paused' : 'healthy',
+      next_fire_utc: isoIn(3600_000),
+    });
+    // The detail and mutation selectors must resolve the same schedule, even
+    // when the pending manual row has a newer sequence.
+    const selected = readSessionInbound(
+      { dataDir: TEST_DIR, agentGroupId: 'ag-1', sessionId: 'sess-1' },
+      (mailbox) => ({
+        detail: mailbox.getLiveSeriesRow('daily')?.id,
+        mutation: mailbox.getLiveTaskRow('daily')?.id,
+        history: mailbox.listRecentTaskFires('daily', 5).map((row) => row.id),
+      }),
+    );
+    expect(selected?.detail).toBe('armed');
+    expect(selected?.mutation).toBe('armed');
+    expect(selected?.history).toEqual(manualStatus === 'completed' ? ['manual'] : []);
   });
 });
 
@@ -523,8 +612,8 @@ describe('residual-strand + duplicate detection', () => {
 
     const snap = await assembleSnapshot(ALL_SCOPES, opts());
     const rows = snap.rows.filter((r) => r.series_id === 'dups');
-    expect(rows.length).toBe(2);
-    // Both flagged unhealthy (duplicate-successor) — not silently healthy.
+    expect(rows.length).toBe(1);
+    // The duplicate series is still flagged unhealthy.
     expect(rows.every((r) => r.health === 'stalled')).toBe(true);
   });
 

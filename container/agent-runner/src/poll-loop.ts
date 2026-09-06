@@ -2558,6 +2558,14 @@ async function sendToDestination(dest: DestinationEntry, body: string, routing: 
   // different destinations have different thread contexts — using a single
   // routing.threadId would stamp one channel's thread onto another.
   const destRouting = resolveDestinationThread(channelType, platformId);
+  // Dashboard messages can have no routing stamp in a freshly bound session.
+  // Only that origin may inherit the resolved session route. A routed inbound,
+  // including an explicit channel-root null, remains authoritative.
+  const threadId = destRouting
+    ? destRouting.threadId
+    : channelType === routing.channelType && platformId === routing.platformId
+      ? routing.threadId
+      : null;
   await writeMessageOut({
     id: generateId(),
     // Batch anchor, not the channel's latest inbound row — see the poison
@@ -2566,7 +2574,7 @@ async function sendToDestination(dest: DestinationEntry, body: string, routing: 
     kind: 'chat',
     platform_id: platformId,
     channel_type: channelType,
-    thread_id: destRouting?.threadId ?? null,
+    thread_id: threadId,
     content: JSON.stringify({ text: body }),
   });
 }

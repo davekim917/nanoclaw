@@ -92,7 +92,11 @@ export function ScheduleLens({
   agentGroupIds: ReadonlySet<string> | null;
   groups: GroupSummary[];
 }) {
-  const { data, error, mutate } = useSWR('/dashboard/api/scheduled', () => listScheduled(), { refreshInterval: 0 });
+  // CLI writes and sweep lifecycle changes need no dashboard SSE event. Poll
+  // only while this lens is mounted; Signal never waits for this fleet scan.
+  const { data, error, mutate } = useSWR('/dashboard/api/scheduled', () => listScheduled(), {
+    refreshInterval: 30_000,
+  });
   const [openKey, setOpenKey] = useState<string | null>(null);
 
   const names = useMemo(() => new Map(groups.map((g) => [g.id, g.name])), [groups]);
