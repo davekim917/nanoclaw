@@ -149,13 +149,22 @@ function readServerEntry(name: string, entry: unknown, report: string[]): Parsed
   // Shared intake gate: names reach provider config writers with structural
   // syntax (codex TOML table headers), so the charset allowlist applies here
   // exactly as in the approval and ncl paths.
+  if (!isPlainObject(entry)) return 'not an object';
+
+  // FATAL lint FIRST, before any per-server skip below can return: a skipped
+  // server is still copied verbatim into the agent-readable plugin tree, so an
+  // entry carrying a real credential AND an unknown field, a bad name, or a
+  // bad transport would have been accepted with the secret intact (Codex on
+  // #500). Severity belongs to the credential, not to the other defect.
+  lintSecrets(name, 'env', stringValues(entry.env), report);
+  lintSecrets(name, 'header', stringValues(entry.headers), report);
+
   // eslint-disable-next-line no-catch-all/no-catch-all -- a bad server name is expected input, reported as a skip
   try {
     validateMcpServerName(name);
   } catch (err) {
     return err instanceof Error ? err.message : String(err);
   }
-  if (!isPlainObject(entry)) return 'not an object';
 
   // The published mcp schema requires a declared transport on every entry.
   const type = entry.type;
@@ -168,12 +177,6 @@ function readServerEntry(name: string, entry: unknown, report: string[]): Parsed
   for (const key of Object.keys(entry)) {
     if (!allowed.has(key)) return `unknown field "${key}"`;
   }
-
-  // FATAL lint first, on the RAW values. The fork's header allowlist would
-  // otherwise turn `Authorization: Bearer sk-…` into a per-server skip, which
-  // is the wrong severity for a real credential shipped in a template.
-  lintSecrets(name, 'env', stringValues(entry.env), report);
-  lintSecrets(name, 'header', stringValues(entry.headers), report);
 
   let server: ParsedMcpServerConfig;
   // eslint-disable-next-line no-catch-all/no-catch-all -- template authoring errors are expected input errors

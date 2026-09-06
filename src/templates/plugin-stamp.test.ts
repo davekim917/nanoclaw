@@ -330,7 +330,9 @@ describe('the templates module never copies plugin content with fs.cpSync', () =
     const commentOnly = '/** never through raw fs.cpSync */\nexport const x = 1;\n';
     expect(CALL_SITE_RE.test(stripComments(commentOnly))).toBe(false);
   });
+});
 
+describe('the plugin ownership marker and the stamp-time secret lint', () => {
   it('a stamped server is refused by every mutation guard (marker → guard contract, #500)', () => {
     // The three guard sites all read container.json, so this is the entry the
     // guard actually sees after a stamp.
@@ -343,5 +345,21 @@ describe('the templates module never copies plugin content with fs.cpSync', () =
     expect(() =>
       assertMcpServerNotPluginOwned({ command: 'npx', args: [], env: {} }, 'mine', 'sdr-group'),
     ).not.toThrow();
+  });
+
+  it('a smuggled credential is fatal even when the server is otherwise skippable (#500 round 2)', () => {
+    // A skipped server is still copied verbatim into the agent-readable
+    // plugins/ tree, so the credential decides the outcome — not the other
+    // defect that used to return before the lint ran.
+    const secret = { API_KEY: 'sk-live-AbC123RealLookingKey456' };
+    for (const servers of [
+      { 'bad name!': { type: 'stdio', command: 'server', env: secret } },
+      { ok: { type: 'stdio', command: 'server', nope: 1, env: secret } },
+      { ok: { type: 'ftp', command: 'server', env: secret } },
+    ]) {
+      writeManifest();
+      writeMcp(servers as Parameters<typeof writeMcp>[0]);
+      expect(() => parseTemplate(PLUGIN_DIR)).toThrow(/looks like a real credential/);
+    }
   });
 });

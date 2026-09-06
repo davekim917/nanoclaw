@@ -63,7 +63,7 @@ is optional and defaults sensibly:
 │   ├── instructions.md        # REQUIRED: the agent's standing persona; marks the folder as a template
 │   └── additional_context/    # optional: extra .md files, referenced from instructions.md by relative path
 │       └── *.md
-├── .mcp.json             # optional: MCP servers (command + args, or url), NO secrets
+├── mcp.json              # optional: MCP servers (command + args, or url), NO secrets
 ├── skills/<name>/        # optional: one folder per skill (SKILL.md + any references/), copied whole
 ├── tasks/*.md             # optional: recurring tasks, created paused
 └── README.md             # recommended: per-template docs
@@ -73,7 +73,7 @@ is optional and defaults sensibly:
 | -------------------------- | ------------------------------------------------------------------------------------------------------------ | -------- |
 | `context/instructions.md`  | The agent's persona, prepended to its `CLAUDE.md`/`AGENTS.md` every spawn (system-prompt tier, any provider) | **Yes**  |
 | `context/**/*.md` (others) | Extra context, copied into the agent's workspace with the same layout relative to `instructions.md`          | No       |
-| `.mcp.json` → `mcpServers` | MCP tool servers (written verbatim to container config)                                                      | No       |
+| `mcp.json` → `mcpServers`  | MCP tool servers (written verbatim to container config)                                                      | No       |
 | `skills/<name>/`           | A skill, auto-triggered by its `description`                                                                 | No       |
 | `tasks/*.md`               | Recurring scheduled tasks, created paused pending user activation                                            | No       |
 
@@ -111,7 +111,7 @@ Investigate the alerts reported by the script and notify me if they are serious.
 
 `schedule` is required. `script` is optional and may be a single-line or
 multiline YAML string. The frontmatter accepts no other fields, so typos cannot
-silently change behavior. Task files are template input, like `.mcp.json`: they
+silently change behavior. Task files are template input, like `mcp.json`: they
 are not copied into the agent workspace after stamping.
 
 Template tasks use the same creation path as `ncl tasks create`, including cron
@@ -199,7 +199,7 @@ credentials out of the URL and put them in a header with the placeholder.
 
 Credentials are held by the **credentials proxy** and injected into outbound
 HTTPS calls at the proxy boundary, matched by API host, at request time. The key
-never sits in `.mcp.json`, the container env, or chat context. See
+never sits in `mcp.json`, the container env, or chat context. See
 [the credentials proxy section in CLAUDE.md](../CLAUDE.md#secrets--credentials--onecli)
 for the model.
 
@@ -217,7 +217,7 @@ Two ways a credential gets connected:
 ### MCP servers that require an env var to boot
 
 Some MCP servers refuse to start unless an env var is _present_, even though the
-real credential should come from the credentials proxy, not the env. Because `.mcp.json`'s `env`
+real credential should come from the credentials proxy, not the env. Because `mcp.json`'s `env`
 block passes through verbatim to the agent's container config, put a **placeholder
 value** there to satisfy the boot check:
 
@@ -264,7 +264,7 @@ category conventions, and checklist.
 
 The reader accepts Agent Plugins only; a pre-plugin template folder is refused
 with a migration error and never parsed as a fallback. Re-fetch the template in
-plugin layout (a `plugin.json` manifest, `skills/`, `.mcp.json`, and the
+plugin layout (a `plugin.json` manifest, `skills/`, `mcp.json`, and the
 NanoClaw extension carrying persona, context, and tasks), then re-run
 `ncl groups create --template <ref>`. Groups already created are untouched —
 only the create path reads templates. The `[BREAKING]` entry in
