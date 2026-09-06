@@ -1,6 +1,6 @@
 ---
 name: slack-a2a-rooms
-description: Open a Slack agent-to-agent room — a group DM (MPIM) holding a human plus two or more of this host's sibling bots, each hearing the room over its own connection. Ships scripts/open-a2a-room.ts to create the room and prints the ncl commands that wire it to each agent group. Use when the user wants two or more agents talking to each other and to a human in one Slack conversation.
+description: Open a Slack agent-to-agent room — one conversation holding a human plus two or more of this host's sibling bots, each hearing the room over its own connection. Agents open rooms themselves with the create_room / add_to_room tools; this skill covers the scopes that path needs and ships scripts/open-a2a-room.ts as the operator fallback, which creates a group DM and prints the ncl commands that wire it to each agent group. Use when the user wants two or more agents talking to each other and to a human in one Slack conversation.
 ---
 
 # Slack agent-to-agent rooms
@@ -91,6 +91,27 @@ pnpm exec vitest run --config vitest.skills.config.ts .claude/skills/slack-a2a-r
 ```
 
 ## Opening a room
+
+**An agent can now do this itself.** The `create_room` and `add_to_room` MCP
+tools (`src/modules/slack-rooms/`) run the whole sequence below on the host —
+open the conversation, invite each bot and the operator, and write every
+wiring row — from a sentence in chat like "open a room with Dana and Eli".
+They need no scope this install does not already have, and they hold for
+admin approval unless the caller is a trusted `global` cli_scope group or is
+adding an agent from its own workgroup. Two differences from this script are
+worth knowing before choosing between them:
+
+- `create_room` opens a **private channel**, not a group DM. A private channel
+  grows in place, so `add_to_room` invites into the same conversation and the
+  room's id, links and history survive. The MPIM this script opens cannot grow
+  — every added member mints a new conversation.
+- A private channel needs `groups:write` on the calling agent's app, where an
+  MPIM needs `mpim:write`. Add whichever the path you pick requires.
+
+The script below stays as the operator fallback, and is still the right tool
+when there is no agent to ask (a room between bots with no human, a room the
+operator wants to open before any agent is wired) or when the automated path
+refuses and you want to see each step.
 
 ```bash
 pnpm exec tsx scripts/open-a2a-room.ts --instances dana,eli --user <your-slack-user-id>
