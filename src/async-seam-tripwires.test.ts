@@ -40,24 +40,30 @@ describe('spawnContainer attaches the exit handlers before its first await', () 
   });
 });
 
-/** Converted async leaf exports a script may call (seam 3 PR 3/PR 4). */
-const ASYNC_LEAF_CALLS = [
-  'resolveSession',
-  'resolveTaskSession',
-  'ensureContainerConfig',
-  'updateContainerConfigScalars',
-  'createAgentGroup',
-  'createMessagingGroup',
-  'createSession',
-  'getSession',
-  'getAgentGroup',
-  'getAgentGroupByFolder',
-  'getAllAgentGroups',
-  'getMessagingGroupByPlatform',
-  'resolveGroupTimezone',
-  'deleteAgentGroup',
-  'getWorkgroupOnecliSecrets',
-] as const;
+/**
+ * Every async export of the central-DB leaves — derived from the tree, not
+ * enumerated, so the next conversion cannot float a call in `scripts/` or
+ * `setup/` without failing here (Codex round 1 on #460).
+ */
+function asyncLeafExports(): string[] {
+  const names = new Set<string>();
+  const leafDirs = [path.join(REPO_ROOT, 'src/db')];
+  const modulesRoot = path.join(REPO_ROOT, 'src/modules');
+  for (const entry of fs.readdirSync(modulesRoot, { withFileTypes: true })) {
+    if (entry.isDirectory()) {
+      const db = path.join(modulesRoot, entry.name, 'db');
+      if (fs.existsSync(db)) leafDirs.push(db);
+    }
+  }
+  for (const dir of leafDirs) {
+    for (const file of fs.readdirSync(dir)) {
+      if (!file.endsWith('.ts') || file.endsWith('.test.ts')) continue;
+      const source = fs.readFileSync(path.join(dir, file), 'utf8');
+      for (const m of source.matchAll(/^export async function (\w+)/gm)) names.add(m[1]);
+    }
+  }
+  return [...names].sort();
+}
 
 function listTs(dir: string): string[] {
   const out: string[] = [];
@@ -75,7 +81,16 @@ function stripComments(source: string): string {
 }
 
 describe('scripts/ and setup/ await every converted leaf call', () => {
+  it('derives a leaf set that contains the seam', () => {
+    const leaves = asyncLeafExports();
+    expect(leaves.length).toBeGreaterThan(100);
+    for (const name of ['getSession', 'createMessagingGroupAgent', 'getMessagingGroup', 'ensureContainerConfig']) {
+      expect(leaves).toContain(name);
+    }
+  });
+
   it('has no bare call to an async leaf export', () => {
+    const ASYNC_LEAF_CALLS = asyncLeafExports();
     const offenders: string[] = [];
     for (const root of ['scripts', 'setup']) {
       for (const file of listTs(path.join(REPO_ROOT, root))) {

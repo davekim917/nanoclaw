@@ -158,7 +158,7 @@ async function main(): Promise<void> {
     // cli declares pattern '.' for DMs — every line the operator types is
     // for the agent. Identical to the pre-declaration hardcodes.
     const engage = resolveWiringDefaults(CLI_CHANNEL, false, ag.name);
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       id: generateId('mga'),
       messaging_group_id: cliMg.id,
       agent_group_id: ag.id,

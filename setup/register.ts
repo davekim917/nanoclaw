@@ -269,7 +269,7 @@ export async function run(args: string[]): Promise<void> {
     // channels declaring mentions:'never'; coerces mention-sticky→mention
     // when the channel context has no thread ids.
     validateEngageAgainstChannel(engage, messagingGroup);
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       id: mgaId,
       messaging_group_id: messagingGroup.id,
       agent_group_id: agentGroup.id,
