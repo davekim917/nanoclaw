@@ -75,7 +75,7 @@ export async function run(_args: string[]): Promise<void> {
   if (platform === 'macos') {
     setupLaunchd(projectRoot, nodePath, homeDir, flockPath);
   } else if (platform === 'linux') {
-    setupLinux(projectRoot, nodePath, homeDir);
+    setupLinux(projectRoot, nodePath, homeDir, flockPath);
   } else {
     emitStatus('SETUP_SERVICE', {
       SERVICE_TYPE: 'unknown',
@@ -175,7 +175,7 @@ function isExecutable(file: string): boolean {
   }
 }
 
-export function launchdRuntimePath(homeDir: string, flockPath: string): string {
+export function runtimePath(homeDir: string, flockPath: string): string {
   return [...new Set([path.dirname(flockPath), '/usr/local/bin', '/usr/bin', '/bin', `${homeDir}/.local/bin`])].join(
     ':',
   );
@@ -241,7 +241,7 @@ function setupLaunchd(projectRoot: string, nodePath: string, homeDir: string, fl
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>${launchdRuntimePath(homeDir, flockPath)}</string>
+        <string>${runtimePath(homeDir, flockPath)}</string>
         <key>HOME</key>
         <string>${homeDir}</string>
     </dict>
@@ -302,14 +302,14 @@ function setupLaunchd(projectRoot: string, nodePath: string, homeDir: string, fl
   });
 }
 
-function setupLinux(projectRoot: string, nodePath: string, homeDir: string): void {
+function setupLinux(projectRoot: string, nodePath: string, homeDir: string, flockPath: string): void {
   const serviceManager = getServiceManager();
 
   if (serviceManager === 'systemd') {
-    setupSystemd(projectRoot, nodePath, homeDir);
+    setupSystemd(projectRoot, nodePath, homeDir, flockPath);
   } else {
     // WSL without systemd or other Linux without systemd
-    setupNohupFallback(projectRoot, nodePath, homeDir);
+    setupNohupFallback(projectRoot, nodePath, homeDir, flockPath);
   }
 }
 
@@ -379,7 +379,34 @@ ${projectRoot}/logs/nanoclaw.error.log {
 `;
 }
 
-function setupSystemd(projectRoot: string, nodePath: string, homeDir: string): void {
+export function renderSystemdUnit(
+  nodePath: string,
+  projectRoot: string,
+  homeDir: string,
+  isSystem: boolean,
+  flockPath: string,
+): string {
+  return `[Unit]
+Description=NanoClaw Personal Assistant
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${nodePath} ${projectRoot}/dist/index.js
+WorkingDirectory=${projectRoot}
+Restart=always
+RestartSec=5
+KillMode=process
+Environment=HOME=${homeDir}
+Environment=PATH=${runtimePath(homeDir, flockPath)}
+StandardOutput=append:${projectRoot}/logs/nanoclaw.log
+StandardError=append:${projectRoot}/logs/nanoclaw.error.log
+
+[Install]
+WantedBy=${isSystem ? 'multi-user.target' : 'default.target'}`;
+}
+
+function setupSystemd(projectRoot: string, nodePath: string, homeDir: string, flockPath: string): void {
   const runningAsRoot = isRoot();
   const unitName = getSystemdUnit(projectRoot);
   const unitFileName = `${unitName}.service`;
@@ -398,7 +425,7 @@ function setupSystemd(projectRoot: string, nodePath: string, homeDir: string): v
       execSync('systemctl --user daemon-reload', { stdio: 'pipe' });
     } catch {
       log.warn('systemd user session not available — falling back to nohup wrapper');
-      setupNohupFallback(projectRoot, nodePath, homeDir);
+      setupNohupFallback(projectRoot, nodePath, homeDir, flockPath);
       return;
     }
     const unitDir = path.join(homeDir, '.config', 'systemd', 'user');
@@ -407,24 +434,7 @@ function setupSystemd(projectRoot: string, nodePath: string, homeDir: string): v
     systemctlPrefix = 'systemctl --user';
   }
 
-  const unit = `[Unit]
-Description=NanoClaw Personal Assistant
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=${nodePath} ${projectRoot}/dist/index.js
-WorkingDirectory=${projectRoot}
-Restart=always
-RestartSec=5
-KillMode=process
-Environment=HOME=${homeDir}
-Environment=PATH=/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin
-StandardOutput=append:${projectRoot}/logs/nanoclaw.log
-StandardError=append:${projectRoot}/logs/nanoclaw.error.log
-
-[Install]
-WantedBy=${runningAsRoot ? 'multi-user.target' : 'default.target'}`;
+  const unit = renderSystemdUnit(nodePath, projectRoot, homeDir, runningAsRoot, flockPath);
 
   fs.writeFileSync(unitPath, unit);
   log.info('Wrote systemd unit', { unitPath });
@@ -527,18 +537,15 @@ WantedBy=${runningAsRoot ? 'multi-user.target' : 'default.target'}`;
   });
 }
 
-function setupNohupFallback(projectRoot: string, nodePath: string, _homeDir: string): void {
-  log.warn('No systemd detected — generating nohup wrapper script');
-
-  const wrapperPath = path.join(projectRoot, 'start-nanoclaw.sh');
+export function renderNohupWrapper(projectRoot: string, nodePath: string, homeDir: string, flockPath: string): string {
   const pidFile = path.join(projectRoot, 'nanoclaw.pid');
-
   const lines = [
     '#!/bin/bash',
     '# start-nanoclaw.sh — Start NanoClaw without systemd',
     `# To stop: kill \\$(cat ${pidFile})`,
     '',
     'set -euo pipefail',
+    `export PATH=${JSON.stringify(runtimePath(homeDir, flockPath))}`,
     '',
     `cd ${JSON.stringify(projectRoot)}`,
     '',
@@ -561,7 +568,14 @@ function setupNohupFallback(projectRoot: string, nodePath: string, _homeDir: str
     'echo "NanoClaw started (PID $!)"',
     `echo "Logs: tail -f ${projectRoot}/logs/nanoclaw.log"`,
   ];
-  const wrapper = lines.join('\n') + '\n';
+  return lines.join('\n') + '\n';
+}
+
+function setupNohupFallback(projectRoot: string, nodePath: string, homeDir: string, flockPath: string): void {
+  log.warn('No systemd detected — generating nohup wrapper script');
+
+  const wrapperPath = path.join(projectRoot, 'start-nanoclaw.sh');
+  const wrapper = renderNohupWrapper(projectRoot, nodePath, homeDir, flockPath);
 
   fs.writeFileSync(wrapperPath, wrapper, { mode: 0o755 });
   log.info('Wrote nohup wrapper script', { wrapperPath });

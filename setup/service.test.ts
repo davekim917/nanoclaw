@@ -5,7 +5,14 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 import { getLaunchdLabel } from '../src/install-slug.js';
-import { ensureHostFlock, launchdRuntimePath, renderLogrotateConfig, type FlockCommandOverrides } from './service.js';
+import {
+  ensureHostFlock,
+  renderLogrotateConfig,
+  renderNohupWrapper,
+  renderSystemdUnit,
+  runtimePath,
+  type FlockCommandOverrides,
+} from './service.js';
 
 /**
  * Tests for service configuration generation.
@@ -47,27 +54,6 @@ function generatePlist(nodePath: string, projectRoot: string, homeDir: string): 
     <string>${projectRoot}/logs/nanoclaw.error.log</string>
 </dict>
 </plist>`;
-}
-
-function generateSystemdUnit(nodePath: string, projectRoot: string, homeDir: string, isSystem: boolean): string {
-  return `[Unit]
-Description=NanoClaw Personal Assistant
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=${nodePath} ${projectRoot}/dist/index.js
-WorkingDirectory=${projectRoot}
-Restart=always
-RestartSec=5
-KillMode=process
-Environment=HOME=${homeDir}
-Environment=PATH=/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin
-StandardOutput=append:${projectRoot}/logs/nanoclaw.log
-StandardError=append:${projectRoot}/logs/nanoclaw.error.log
-
-[Install]
-WantedBy=${isSystem ? 'multi-user.target' : 'default.target'}`;
 }
 
 const tempDirs: string[] = [];
@@ -120,14 +106,12 @@ describe('plist generation', () => {
   });
 
   it('includes the Homebrew flock directory in launchd PATH on Apple Silicon', () => {
-    expect(launchdRuntimePath('/Users/test', '/opt/homebrew/opt/flock/bin/flock')).toContain(
-      '/opt/homebrew/opt/flock/bin',
-    );
+    expect(runtimePath('/Users/test', '/opt/homebrew/opt/flock/bin/flock')).toContain('/opt/homebrew/opt/flock/bin');
   });
 
   it('renders launchd PATH from the provisioned flock location', () => {
     const source = fs.readFileSync(fileURLToPath(new URL('./service.ts', import.meta.url)), 'utf8');
-    expect(source).toContain('<string>${launchdRuntimePath(homeDir, flockPath)}</string>');
+    expect(source).toContain('<string>${runtimePath(homeDir, flockPath)}</string>');
   });
 
   it('installs the Homebrew formula when its prefix has no executable, then probes inherited fd 3', () => {
@@ -177,29 +161,38 @@ describe('plist generation', () => {
 
 describe('systemd unit generation', () => {
   it('user unit uses default.target', () => {
-    const unit = generateSystemdUnit('/usr/bin/node', '/home/user/nanoclaw', '/home/user', false);
+    const unit = renderSystemdUnit('/usr/bin/node', '/home/user/nanoclaw', '/home/user', false, '/usr/bin/flock');
     expect(unit).toContain('WantedBy=default.target');
   });
 
   it('system unit uses multi-user.target', () => {
-    const unit = generateSystemdUnit('/usr/bin/node', '/home/user/nanoclaw', '/home/user', true);
+    const unit = renderSystemdUnit('/usr/bin/node', '/home/user/nanoclaw', '/home/user', true, '/usr/bin/flock');
     expect(unit).toContain('WantedBy=multi-user.target');
   });
 
   it('contains restart policy', () => {
-    const unit = generateSystemdUnit('/usr/bin/node', '/home/user/nanoclaw', '/home/user', false);
+    const unit = renderSystemdUnit('/usr/bin/node', '/home/user/nanoclaw', '/home/user', false, '/usr/bin/flock');
     expect(unit).toContain('Restart=always');
     expect(unit).toContain('RestartSec=5');
   });
 
   it('uses KillMode=process to preserve detached children', () => {
-    const unit = generateSystemdUnit('/usr/bin/node', '/home/user/nanoclaw', '/home/user', false);
+    const unit = renderSystemdUnit('/usr/bin/node', '/home/user/nanoclaw', '/home/user', false, '/usr/bin/flock');
     expect(unit).toContain('KillMode=process');
   });
 
   it('sets correct ExecStart', () => {
-    const unit = generateSystemdUnit('/usr/bin/node', '/srv/nanoclaw', '/home/user', false);
+    const unit = renderSystemdUnit('/usr/bin/node', '/srv/nanoclaw', '/home/user', false, '/usr/bin/flock');
     expect(unit).toContain('ExecStart=/usr/bin/node /srv/nanoclaw/dist/index.js');
+  });
+
+  it('keeps a custom flock directory in the generated Linux service PATH', () => {
+    const flockPath = '/nix/store/synthetic-flock/bin/flock';
+    const unit = renderSystemdUnit('/usr/bin/node', '/srv/nanoclaw', '/home/user', false, flockPath);
+
+    expect(unit).toContain(
+      'Environment=PATH=/nix/store/synthetic-flock/bin:/usr/local/bin:/usr/bin:/bin:/home/user/.local/bin',
+    );
   });
 });
 
@@ -236,22 +229,21 @@ describe('logrotate config generation', () => {
 });
 
 describe('WSL nohup fallback', () => {
-  it('generates a valid wrapper script', () => {
-    const projectRoot = '/home/user/nanoclaw';
-    const nodePath = '/usr/bin/node';
-    const pidFile = path.join(projectRoot, 'nanoclaw.pid');
-
-    // Simulate what service.ts generates
-    const wrapper = `#!/bin/bash
-set -euo pipefail
-cd ${JSON.stringify(projectRoot)}
-nohup ${JSON.stringify(nodePath)} ${JSON.stringify(projectRoot)}/dist/index.js >> ${JSON.stringify(projectRoot)}/logs/nanoclaw.log 2>> ${JSON.stringify(projectRoot)}/logs/nanoclaw.error.log &
-echo $! > ${JSON.stringify(pidFile)}`;
+  it('generates a valid wrapper script with the resolved flock directory on PATH', () => {
+    const wrapper = renderNohupWrapper(
+      '/home/user/nanoclaw',
+      '/usr/bin/node',
+      '/home/user',
+      '/nix/store/synthetic-flock/bin/flock',
+    );
 
     expect(wrapper).toContain('#!/bin/bash');
     expect(wrapper).toContain('nohup');
-    expect(wrapper).toContain(nodePath);
+    expect(wrapper).toContain('/usr/bin/node');
     expect(wrapper).toContain('nanoclaw.pid');
+    expect(wrapper).toContain(
+      'export PATH="/nix/store/synthetic-flock/bin:/usr/local/bin:/usr/bin:/bin:/home/user/.local/bin"',
+    );
   });
 });
 
