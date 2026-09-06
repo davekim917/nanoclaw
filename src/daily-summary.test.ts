@@ -502,9 +502,9 @@ describe('GitHub Issues-backed daily backlog', () => {
         : { provider: 'claude' },
     );
     dailySummaryMocks.getMessagingGroup.mockReturnValue(target);
-    dailySummaryMocks.getShipLogSince.mockReturnValue([]);
-    dailySummaryMocks.getBacklog.mockReturnValue([backlogItem({ title: 'stale SQLite backlog row' })]);
-    dailySummaryMocks.getBacklogResolvedSince.mockReturnValue([
+    dailySummaryMocks.getShipLogSince.mockResolvedValue([]);
+    dailySummaryMocks.getBacklog.mockResolvedValue([backlogItem({ title: 'stale SQLite backlog row' })]);
+    dailySummaryMocks.getBacklogResolvedSince.mockResolvedValue([
       backlogItem({ title: 'stale SQLite resolved row', status: 'resolved' }),
     ]);
     dailySummaryMocks.resolveGitHubToken.mockResolvedValue('github-token');

@@ -9,9 +9,9 @@ const groups = vi.hoisted(() => ({ rows: [] as Array<{ id: string; folder: strin
 
 vi.mock('./db/agent-groups.js', () => ({ getAllAgentGroups: () => groups.rows }));
 vi.mock('./db/backlog.js', () => ({
-  addShipLogEntry: vi.fn(),
-  getCommitDigestState: vi.fn(),
-  upsertCommitDigestState: vi.fn(),
+  addShipLogEntry: vi.fn(async () => undefined),
+  getCommitDigestState: vi.fn(async () => null),
+  upsertCommitDigestState: vi.fn(async () => undefined),
 }));
 vi.mock('./host-lifecycle.js', () => ({ onHostShutdown: vi.fn(), onHostStart: vi.fn() }));
 vi.mock('./log.js', () => ({
