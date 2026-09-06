@@ -3306,21 +3306,29 @@ async function clearHonouredStopIntents(
     // chunks run inside one transaction so the clear is all-or-nothing, and a
     // failure is a WARN with the count, never a swallowed shadow write.
     const now = new Date().toISOString();
+    // `RETURNING session_id` names the rows the conditional UPDATE actually
+    // touched, which is a strict subset of `honoured`: a row rewritten since
+    // the read carries a newer stamp and is skipped. The per-session lines
+    // below are driven by that subset, so a line never claims a clear that did
+    // not happen (#501). Row count and `changes` are the same number here, so
+    // the aggregate `cleared` count is unchanged.
+    let clearedIds: string[];
     /* eslint-disable no-catch-all/no-catch-all -- a failed clear must not block startup; it is reported and retried next boot */
     try {
-      cleared = await centralTransaction(async () => {
-        let changes = 0;
+      clearedIds = await centralTransaction(async () => {
+        const ids: string[] = [];
         for (let at = 0; at < honoured.length; at += STOP_INTENT_CLEAR_CHUNK) {
           const chunk = honoured.slice(at, at + STOP_INTENT_CLEAR_CHUNK);
-          const result = await getDb().run(
+          const rows = await getDb().all<{ session_id: string }>(
             `UPDATE session_claims SET stop_intent = NULL, updated_at = ?
-               WHERE stop_intent = 'stop' AND (session_id, updated_at) IN (VALUES ${chunk.map(() => '(?, ?)').join(', ')})`,
+               WHERE stop_intent = 'stop' AND (session_id, updated_at) IN (VALUES ${chunk.map(() => '(?, ?)').join(', ')})
+             RETURNING session_id`,
             now,
             ...chunk.flatMap((intent) => [intent.session_id, intent.updated_at]),
           );
-          changes += result.changes;
+          for (const row of rows) ids.push(row.session_id);
         }
-        return changes;
+        return ids;
       }, 'stop-intent-clear');
     } catch (err) {
       log.warn('Failed to clear honoured stop intents at startup — left for the next boot', {
@@ -3330,9 +3338,10 @@ async function clearHonouredStopIntents(
       return;
     }
     /* eslint-enable no-catch-all/no-catch-all */
-    for (const intent of honoured) {
-      if (hasContainer(intent.session_id)) {
-        log.info('Cleared a stale plain stop intent for an adopted survivor', { sessionId: intent.session_id });
+    cleared = clearedIds.length;
+    for (const sessionId of clearedIds) {
+      if (hasContainer(sessionId)) {
+        log.info('Cleared a stale plain stop intent for an adopted survivor', { sessionId });
       }
     }
   }

@@ -612,6 +612,39 @@ describe('durable stop intent', () => {
     ).toEqual([['Cleared honoured stop intents at startup', { cleared: 0, deferredPendingAdoption: 1 }]]);
   });
 
+  it('a rewritten row for an adopted survivor is named on no line, while the row actually cleared is (#501)', async () => {
+    await seedSession('sess-owed');
+    await seedSession('sess-live-cleared');
+    await seedSession('sess-live-reissued');
+    await setStopIntent('sess-owed', 'respawn_after_stop', STAMP);
+    await setStopIntent('sess-live-cleared', 'stop', STAMP);
+    await setStopIntent('sess-live-reissued', 'stop', STAMP);
+
+    const LATER = '2026-09-05T00:00:01.000Z';
+    await honorPendingStopIntents(
+      async () => {
+        // Both live sessions were adopted at this boot, so both would be named
+        // by a loop over the pre-update snapshot. Only one row is still the
+        // version the pass read; the other is rewritten in this window and
+        // left for the next boot, so a line claiming it was cleared is false.
+        await setStopIntent('sess-live-reissued', 'stop', LATER);
+        return true;
+      },
+      (sessionId) => sessionId !== 'sess-owed',
+    );
+
+    expect(await storedIntent('sess-live-cleared')).toBeNull();
+    expect(await storedIntent('sess-live-reissued')).toBe('stop');
+    expect(
+      vi
+        .mocked(log.info)
+        .mock.calls.filter((call) => call[0] === 'Cleared a stale plain stop intent for an adopted survivor'),
+    ).toEqual([['Cleared a stale plain stop intent for an adopted survivor', { sessionId: 'sess-live-cleared' }]]);
+    expect(
+      vi.mocked(log.info).mock.calls.filter((call) => call[0] === 'Cleared honoured stop intents at startup'),
+    ).toEqual([['Cleared honoured stop intents at startup', { cleared: 1, deferredPendingAdoption: 0 }]]);
+  });
+
   it('a plain stop row for a session adopted at this boot is cleared as stale, its container untouched', async () => {
     await seedSession('sess-stopped');
     await seedSession('sess-live');
