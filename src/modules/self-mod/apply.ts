@@ -98,14 +98,19 @@ export async function applyInstallPackages(payload: Record<string, unknown>, ses
       }),
       onWake: 1,
     });
-    killContainer(session.id, 'rebuild applied', async () => {
-      const s = await getSession(session.id);
-      if (s) {
-        void wakeContainer(s).catch((err) =>
-          log.error('Failed to wake container after install_packages rebuild', { err, sessionId: session.id }),
-        );
-      }
-    });
+    killContainer(
+      session.id,
+      'rebuild applied',
+      async () => {
+        const s = await getSession(session.id);
+        if (s) {
+          void wakeContainer(s).catch((err) =>
+            log.error('Failed to wake container after install_packages rebuild', { err, sessionId: session.id }),
+          );
+        }
+      },
+      'respawn_after_stop',
+    );
     log.info('Container rebuild completed (bundled with install)', { agentGroupId: session.agent_group_id });
   } catch (e) {
     // Best-effort: updateContainerConfigJson above (before this try block)
@@ -214,14 +219,19 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
     }),
     onWake: 1,
   });
-  killContainer(session.id, 'mcp server added', async () => {
-    const s = await getSession(session.id);
-    if (s) {
-      void wakeContainer(s).catch((err) =>
-        log.error('Failed to wake container after add_mcp_server', { err, sessionId: session.id }),
-      );
-    }
-  });
+  killContainer(
+    session.id,
+    'mcp server added',
+    async () => {
+      const s = await getSession(session.id);
+      if (s) {
+        void wakeContainer(s).catch((err) =>
+          log.error('Failed to wake container after add_mcp_server', { err, sessionId: session.id }),
+        );
+      }
+    },
+    'respawn_after_stop',
+  );
   log.info('MCP server add approved', { agentGroupId: session.agent_group_id });
 }
 
@@ -310,14 +320,19 @@ export async function performModelChange(
     onWake: 1,
   });
 
-  killContainer(session.id, 'model changed', async () => {
-    const s = await getSession(session.id);
-    if (s) {
-      void wakeContainer(s).catch((err) =>
-        log.error('Failed to wake container after model change', { err, sessionId: session.id }),
-      );
-    }
-  });
+  killContainer(
+    session.id,
+    'model changed',
+    async () => {
+      const s = await getSession(session.id);
+      if (s) {
+        void wakeContainer(s).catch((err) =>
+          log.error('Failed to wake container after model change', { err, sessionId: session.id }),
+        );
+      }
+    },
+    'respawn_after_stop',
+  );
 }
 
 /**

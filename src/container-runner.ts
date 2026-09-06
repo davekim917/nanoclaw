@@ -81,10 +81,13 @@ import { getRawDb, hasTableRaw } from './db/connection.js';
 import {
   getLiveHostInstance,
   getSessionClaim,
+  listSessionsWithStopIntent,
   releaseSessionClaim,
   renewHostInstanceLease,
+  setStopIntent,
   shadowWrite,
   tryClaimSession,
+  type SessionClaimRow,
 } from './db/coordination.js';
 import { getHostInstanceId, startHostInstanceLease } from './host-instance.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
@@ -206,8 +209,85 @@ const activeContainers = new Map<
     storageActivity: StorageActivityLease;
     /** Incarnation this process claimed in `session_claims` for this runtime. */
     claimIncarnation?: number;
+    /**
+     * True for a container this host ADOPTED rather than spawned.
+     *
+     * E integration (seam4/e-adoption): E declares this NON-optional as part of
+     * the supervision union and sets it in `registerAdoptedContainer`. Its
+     * declaration replaces this one at the merge, and the optional marker goes
+     * with it. Series F only reads the field, through `isAdoptedContainer`.
+     */
+    adopted?: boolean;
   }
 >();
+
+/**
+ * Sessions whose surviving container could not be claim-fenced at adoption.
+ *
+ * E integration (seam4/e-adoption): E declares the same `const
+ * pendingAdoptions = new Set<string>()`, and its `adoptRunningSessions`
+ * populates it while `wakeContainer` routes a hit to `retryPendingAdoption`
+ * rather than spawning a duplicate. At the merge E's declaration wins and the
+ * two test helpers below move beside it — E ships neither, and F's deferral
+ * case needs both. Series F only READS the set, in `honorPendingStopIntents`: a
+ * container that is alive but not yet fenced must not have a stop intent acted
+ * on, because the kill could land on the wrong incarnation.
+ */
+const pendingAdoptions = new Set<string>();
+
+/**
+ * Sessions this process has promised to bring back, each holding the TOKEN of
+ * the promise — the in-memory shadow of the `respawn_after_stop` rows this host
+ * wrote itself.
+ *
+ * The token is what makes the discharge safe against an in-flight wake. A wake
+ * reads the session's token when it STARTS, and may only discharge a promise
+ * whose token it read: a wake already running when the kill arrived read
+ * `undefined` (or the previous promise's token) and so cannot clear the promise
+ * the kill just made, even though it can still resolve `true` for a container
+ * this kill is about to stop. Without that, the original wake's `true` cleared
+ * the row while the replacement wake merely JOINED it, and the session went
+ * down with nothing left for the next boot to recover.
+ *
+ * The map also keeps the discharge free for every wake that owes nothing:
+ * without it `clearRespawnIntentOnWake` would put a central-DB write in front
+ * of every ordinary message-driven spawn. Empty at boot by construction, which
+ * is right — a promise made by a PREVIOUS host is owed to
+ * `honorPendingStopIntents`, not to this map.
+ */
+const respawnIntents = new Map<string, number>();
+
+/** Monotonic source of the promise tokens above; never reused within a process. */
+let respawnIntentSeq = 0;
+
+export function _resetAdoptionRetryStateForTesting(): void {
+  pendingAdoptions.clear();
+}
+
+/** Test-only: drop this process's record of outstanding respawn promises. */
+export function _resetStopIntentStateForTesting(): void {
+  respawnIntents.clear();
+}
+
+/**
+ * Test-only: the promise token a wake starting NOW would read, or undefined
+ * when this host owes the session nothing.
+ */
+export function _respawnIntentTokenForTesting(sessionId: string): number | undefined {
+  return respawnIntents.get(sessionId);
+}
+
+/**
+ * Test-only: stand in for an adoption that failed its claim write.
+ *
+ * Series F ships the READER of `pendingAdoptions` before series E ships the
+ * writer, so its deferral case has no other way to reach that state. Keep it
+ * after E's merge only until `adoptRunningSessions` gives the suite a real
+ * route into the state.
+ */
+export function _markPendingAdoptionForTesting(sessionId: string): void {
+  pendingAdoptions.add(sessionId);
+}
 
 /**
  * The claimant id for `session_claims`, or null when this process has none.
@@ -399,6 +479,27 @@ export function _resetEverSeenRunningForTest(): void {
  */
 export function getContainerSpawnedAt(sessionId: string): number {
   return activeContainers.get(sessionId)?.spawnedAt ?? 0;
+}
+
+/**
+ * Was this session's container ADOPTED from a previous host, rather than
+ * spawned by this one?
+ *
+ * The sweep's ceiling check asks, because `spawnedAt` means something different
+ * for the two. For a spawned container it is the moment the process started, so
+ * a heartbeat older than it belongs to a PRIOR container and the fresh one
+ * deserves its spawn grace. For an adopted container it is merely the adoption
+ * instant, and the heartbeat older than it is the container's OWN — so the same
+ * predicate would hand a wedged survivor a free grace window on every host
+ * restart (plan §3.5 divergence 11).
+ *
+ * E integration (seam4/e-adoption): replaced by E's accessor at merge — E
+ * exports the same predicate (`?? false` over the same field) alongside
+ * `getAdoptedSessionIds()`, which series F has no caller for. Take E's pair and
+ * drop this one; the F3 call site in `sweep-container-health` needs no change.
+ */
+export function isAdoptedContainer(sessionId: string): boolean {
+  return activeContainers.get(sessionId)?.adopted === true;
 }
 
 /**
@@ -953,10 +1054,23 @@ function startReservedWake(queued: QueuedWake): Promise<boolean> {
 }
 
 function trackWake(sessionId: string, run: () => Promise<boolean>): Promise<boolean> {
+  // Read at the START of this wake, which is what makes the discharge below
+  // safe: `wakeContainer` hands a caller the EXISTING promise when one is in
+  // flight, so a joined wake never reaches here and carries the original
+  // wake's token rather than earning a fresh one.
+  const respawnToken = respawnIntents.get(sessionId);
   const tracked = run()
     .catch((err) => {
       log.warn('wakeContainer failed — host-sweep will retry', { sessionId, err });
       return false;
+    })
+    .then((woke) => {
+      // The one place every wake ends, which is why the discharge sits here
+      // rather than in each respawning caller's callback: those are all
+      // fire-and-forget `void wakeContainer(...)`, so the callback resolving
+      // says nothing about whether a container actually came back.
+      if (woke) clearRespawnIntentOnWake(sessionId, respawnToken);
+      return woke;
     })
     .finally(() => {
       if (wakePromises.get(sessionId) === tracked) wakePromises.delete(sessionId);
@@ -1683,7 +1797,23 @@ function stopRunningContainer(sessionId: string, reason: string, onExit: Contain
 }
 
 /**
+ * What a caller owes the session after the stop.
+ *
+ * `'respawn_after_stop'` is a PROMISE: this host will bring the session back,
+ * and if it dies before doing so the next boot must finish the job. `'stop'`
+ * means the session is meant to stay down. The two are not inferable from the
+ * presence of an `onExit` callback — several callers pass one purely for
+ * bookkeeping (`killThenFollowUp` resets orphaned claims and writes the ceiling
+ * accounting for a kill that must STAY stopped), so the caller states it.
+ */
+export type StopIntent = 'stop' | 'respawn_after_stop';
+
+/**
  * Kill a container for a session, INCLUDING one that is still spawning.
+ *
+ * `intent` records what the caller owes the session, durably, BEFORE the stop
+ * is issued — it defaults to `'stop'`, so a caller has to opt in to a promise
+ * it is going to keep.
  *
  * Three states, and only the third is a no-op:
  *   - running: stop it, and `onExit` fires on the process close, as always.
@@ -1694,16 +1824,197 @@ function stopRunningContainer(sessionId: string, reason: string, onExit: Contain
  *     fire. Callers rely on that — `container-restart` treats "not running" as
  *     "this restart did not happen" rather than as an exit.
  */
-export function killContainer(sessionId: string, reason: string, onExit?: ContainerExitCallback): void {
+export function killContainer(
+  sessionId: string,
+  reason: string,
+  onExit?: ContainerExitCallback,
+  intent: StopIntent = 'stop',
+): void {
   if (!activeContainers.has(sessionId)) {
     if (!isContainerSpawning(sessionId)) return;
+    recordStopIntent(sessionId, intent);
     const pending = pendingKills.get(sessionId) ?? { reason, onExit: [] };
     if (onExit) pending.onExit.push(onExit);
     pendingKills.set(sessionId, pending);
     log.info('Container kill deferred — a wake is in flight for this session', { sessionId, reason });
     return;
   }
+  recordStopIntent(sessionId, intent);
   stopRunningContainer(sessionId, reason, onExit ? [onExit] : []);
+}
+
+/**
+ * Record the DURABLE half of a stop request, so a host that dies mid-restart
+ * does not forget it.
+ *
+ * A kill-with-respawn lives in an `onExit` callback, which is process memory: a
+ * host that went down between the kill and the callback firing forgot the
+ * restart entirely, and the operator saw "rebuild applied" with nothing coming
+ * back. `honorPendingStopIntents()` consumes the row at the next startup.
+ *
+ * The intent comes from the CALLER, not from the presence of an `onExit`
+ * callback. Several callers pass one for bookkeeping alone — the ceiling kill
+ * resets orphaned claims and posts its accounting through `onExit`, and it must
+ * stay stopped — so deriving the promise from the callback would resurrect
+ * every one of those sessions at the next boot. Routing the write through this
+ * one door is still the point: `killContainer` is the single stop every caller
+ * goes through, so no caller can forget to ARM a recovery it did promise.
+ *
+ * Not awaited, because `killContainer` is synchronous and every one of its
+ * callers depends on that. `shadowWrite` already swallows its own failures, so
+ * the only thing an await would buy is ordering against the stop — and a stop
+ * intent that lost its race with a host crash is exactly as recoverable as one
+ * that was never written.
+ */
+function recordStopIntent(sessionId: string, intent: StopIntent): void {
+  if (intent === 'respawn_after_stop') respawnIntents.set(sessionId, ++respawnIntentSeq);
+  else respawnIntents.delete(sessionId);
+  void shadowWrite('stop-intent', () => setStopIntent(sessionId, intent, new Date().toISOString()));
+}
+
+/**
+ * Discharge a respawn promise this process made, now that the session has a
+ * container again.
+ *
+ * Without this only `honorPendingStopIntents` ever clears the row, so a restart
+ * that COMPLETED normally leaves `respawn_after_stop` behind and every later
+ * boot replays it — waking a session nobody asked for, once per restart,
+ * forever.
+ *
+ * `token` is what the waking side read from `respawnIntents` when it STARTED,
+ * and only a wake that read THIS promise may discharge it. A wake already in
+ * flight when the kill arrived read `undefined`, or an older promise's token,
+ * and its `true` says nothing about the container this kill is about to stop —
+ * clearing on it would leave the session down with nothing owed. A later wake
+ * that merely joins that in-flight promise inherits its token and is refused
+ * for the same reason; the replacement wake the kill's own callback starts
+ * reads the current token and qualifies.
+ *
+ * Gated on `respawnIntents` so an ordinary message-driven wake costs no central
+ * DB write: the map holds only the promises THIS process made and has not yet
+ * discharged. A promise made by a host that died is not in it, which is
+ * correct — that one belongs to `honorPendingStopIntents` at the next boot, and
+ * it clears the row itself.
+ *
+ * Whoever woke the session discharges the promise: the promise is "this session
+ * gets a container back", so a qualifying wake from any source satisfies it.
+ */
+function clearRespawnIntentOnWake(sessionId: string, token: number | undefined): void {
+  if (token === undefined) return;
+  if (respawnIntents.get(sessionId) !== token) return;
+  respawnIntents.delete(sessionId);
+  void shadowWrite('stop-intent-clear', () => setStopIntent(sessionId, null, new Date().toISOString()));
+}
+
+/**
+ * Reconcile the unconsumed `on_wake` rows an ADOPTED session is carrying.
+ *
+ * E integration (seam4/e-adoption): E owns the CALL SITE and ships this as a
+ * no-op stub of the same name and signature, called once per adopted session
+ * from `registerAdoptedContainer` after the claim fence and the registry write
+ * (its `// F1 hook` marker). At the merge E's stub body is replaced by this
+ * one and the call site needs no change.
+ *
+ * `withExistingMailboxSession`, never the provisioning opener: a session with
+ * no mailbox was never adoptable in the first place, and creating one here
+ * would author an `outbound.db` the host must never create (invariant I-10).
+ * An absent mailbox reads as `undefined` and reconciles nothing.
+ *
+ * Best-effort by construction. Adoption runs before every wake source at boot,
+ * so one session whose inbound DB cannot be read must not abort the pass for
+ * every other survivor; the cost of the failure is a stale note, and the sweep
+ * has its own paths for that.
+ */
+export async function reconcileSurvivorWakeRows(session: Session): Promise<{ converted: number; withdrawn: number }> {
+  /* eslint-disable no-catch-all/no-catch-all -- one unreadable session DB must not abort the boot pass */
+  try {
+    const result = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+      mailbox.reconcileSurvivorWakeRows(),
+    );
+    if (!result) return { converted: 0, withdrawn: 0 };
+    if (result.converted > 0 || result.withdrawn > 0) {
+      log.info('Reconciled unconsumed on_wake rows for an adopted session', { sessionId: session.id, ...result });
+    }
+    return result;
+  } catch (err) {
+    log.warn('Could not reconcile on_wake rows for an adopted session', { sessionId: session.id, err });
+    return { converted: 0, withdrawn: 0 };
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+}
+
+/**
+ * Honor stop intents that outlived their process.
+ *
+ * A kill-with-respawn used to live only in a volatile `onExit` callback: a host
+ * dying between the kill and the respawn forgot the restart entirely. The
+ * durable `respawn_after_stop` row is consumed here at startup — a session
+ * whose container is still up gets its kill re-issued with the respawn
+ * re-armed; one without a container gets the respawn directly. The intent
+ * clears only once the respawn wake actually succeeds, so a failed wake is
+ * retried at the next startup while the sweep retries it sooner.
+ *
+ * A plain `'stop'` intent is left where it is. The container is already down
+ * and nothing is owed; the row is one upsert per session of inert shadow state,
+ * and clearing it here would cost a write per boot to no end.
+ *
+ * `wake` and `hasContainer` are injected with their production defaults. The
+ * second exists because the branch it selects is the one an interrupted restart
+ * takes, and a unit test cannot put a container into the registry without a
+ * container runtime; both are `activeContainers` reads in production.
+ */
+export async function honorPendingStopIntents(
+  wake: (session: Session) => Promise<boolean> = wakeContainer,
+  hasContainer: (sessionId: string) => boolean = isContainerRunning,
+): Promise<void> {
+  let intents: SessionClaimRow[];
+  /* eslint-disable no-catch-all/no-catch-all -- an unreadable coordination table must not block startup */
+  try {
+    intents = await listSessionsWithStopIntent();
+  } catch (err) {
+    log.warn('Failed to read pending stop intents', { err });
+    return;
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
+  for (const intent of intents) {
+    if (intent.stop_intent !== 'respawn_after_stop') continue;
+    if (pendingAdoptions.has(intent.session_id)) {
+      // The session's container is alive but not yet re-fenced; acting on the
+      // intent now could kill or respawn the wrong incarnation. The row stays
+      // for the next recovery pass.
+      log.warn('Deferring stop intent — session awaits claim-fenced adoption', { sessionId: intent.session_id });
+      continue;
+    }
+    const session = await getSession(intent.session_id);
+    // `unwakeableReason`, not a `status` test: `archiveSessionById` stamps only
+    // `archived_at` and leaves `status` reading `active`, so an archive-only
+    // close looks recoverable to a status check while `wakeContainer` refuses
+    // it on the same axis. The intent would then never clear and never fire —
+    // a row this pass rereads, and declines, at every boot forever.
+    const unwakeable = session ? unwakeableReason(session) : 'session no longer exists';
+    if (!session || unwakeable !== null) {
+      log.info('Clearing a stop intent for a session that can no longer be woken', {
+        sessionId: intent.session_id,
+        reason: unwakeable,
+      });
+      await shadowWrite('stop-intent-clear', () => setStopIntent(intent.session_id, null, new Date().toISOString()));
+      continue;
+    }
+    const respawn = async (): Promise<void> => {
+      const woke = await wake(session);
+      if (woke) {
+        await shadowWrite('stop-intent-clear', () => setStopIntent(session.id, null, new Date().toISOString()));
+      }
+    };
+    if (hasContainer(session.id)) {
+      // The kill never completed — the container outlived the host that
+      // ordered it. Re-issue the kill with the respawn re-armed.
+      log.info('Re-issuing interrupted restart', { sessionId: session.id });
+      killContainer(session.id, 'restart-intent-recovery', () => void respawn(), 'respawn_after_stop');
+    } else {
+      await respawn();
+    }
+  }
 }
 
 /**

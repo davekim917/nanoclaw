@@ -83,8 +83,16 @@ export async function handleProviderUnavailable(content: Record<string, unknown>
   // failed, so the fresh container answers it on the fallback provider —
   // session-scoped on purpose: one exhausted account must not bounce every
   // live container in the group.
-  killContainer(session.id, 'provider quota exhausted — respawning on fallback', async () => {
-    const fresh = await getSession(session.id);
-    if (fresh) void wakeContainer(fresh);
-  });
+  killContainer(
+    session.id,
+    'provider quota exhausted — respawning on fallback',
+    async () => {
+      const fresh = await getSession(session.id);
+      if (fresh) void wakeContainer(fresh);
+    },
+    // A real respawn, so a host that dies between the kill and the wake still
+    // owes it. The boot respawn re-resolves the provider, so the session comes
+    // back on the fallback either way.
+    'respawn_after_stop',
+  );
 }

@@ -419,6 +419,9 @@ registerResource({
                   }
                 }
               : undefined,
+            // `--message` is what makes this a restart rather than a stop, on
+            // the durable row as well as in process memory.
+            message ? 'respawn_after_stop' : 'stop',
           );
           return { restarted: 1, rebuilt: !!args.rebuild };
         }

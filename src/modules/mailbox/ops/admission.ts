@@ -152,6 +152,119 @@ export function admitDueRow(db: Database.Database, recall: MessageInsert, taskId
   })();
 }
 
+/* ─── Survivor reconciliation (restart-survival seam §7.F1) ────────────────── */
+
+/**
+ * The accountability note whose own text is false for an adopted container.
+ *
+ * `src/host-restart-warn.ts` stamps it into `_system.kind`; it says the host
+ * "stopped your container mid-work" and that the in-flight turn was lost.
+ */
+const HOST_RESTART_NOTE_KIND = 'agent_host_restart';
+
+/** One unconsumed `on_wake` trigger row, with its note kind if it carries one. */
+interface SurvivorWakeRow {
+  id: string;
+  system_kind: string | null;
+}
+
+/**
+ * Reconcile the `on_wake` rows a SURVIVING container can never select.
+ *
+ * `on_wake = 1` means "only visible on a container's FIRST poll" — the runner
+ * adds `AND on_wake = 0` to every selection query from poll 2 onward. A
+ * container the host adopts across a restart is long past its first poll, so
+ * every such row it still holds is unreachable: nothing will ever deliver it
+ * and nothing will ever clear it.
+ *
+ * Two outcomes, chosen by the note's own `_system.kind`:
+ *
+ *  - `agent_host_restart` is WITHDRAWN with its recall partner. Delivering it
+ *    would tell an agent whose turn was never interrupted that its work was
+ *    lost, and the correct response to that note is to discard live state.
+ *  - everything else is CONVERTED: `on_wake` clears on both halves and the pair
+ *    is re-seqed to the front. Re-seqing is not cosmetic — the selection
+ *    queries are `ORDER BY seq DESC LIMIT n`, so a row left at its old seq can
+ *    fall outside the survivor's window and never surface. The pair keeps the
+ *    `recall.seq = task.seq - 2` spacing the admission checker relies on.
+ *
+ * `claimed` is the caller's proof that no container has taken the row already;
+ * it is invoked immediately before each row is touched, never read ahead. A row
+ * it answers for is left exactly as it is — including the unprovable case,
+ * which must answer `true`.
+ */
+export function reconcileSurvivorWakeRows(
+  db: Database.Database,
+  claimed: (messageId: string) => boolean,
+): { converted: number; withdrawn: number } {
+  // `kind != 'system'`: a recall marker inherits its trigger's `on_wake`, and
+  // it is handled with the trigger it belongs to rather than on its own.
+  // `json_extract` in SQL rather than a parse-and-catch here: content is
+  // caller-supplied text and need not be JSON at all.
+  const rows = db
+    .prepare(
+      `SELECT id,
+              CASE WHEN json_valid(content) THEN json_extract(content, '$._system.kind') END AS system_kind
+         FROM messages_in
+        WHERE status = 'pending'
+          AND on_wake = 1
+          AND kind != 'system'
+        ORDER BY seq`,
+    )
+    .all() as SurvivorWakeRow[];
+
+  let converted = 0;
+  let withdrawn = 0;
+  for (const row of rows) {
+    if (claimed(row.id)) continue;
+    if (row.system_kind === HOST_RESTART_NOTE_KIND) {
+      if (withdrawWakePair(db, row.id)) withdrawn += 1;
+      continue;
+    }
+    if (convertWakePair(db, row.id)) converted += 1;
+  }
+  return { converted, withdrawn };
+}
+
+/** Delete an unconsumed `on_wake` trigger and its recall partner. */
+function withdrawWakePair(db: Database.Database, messageId: string): boolean {
+  return db.transaction(() => {
+    const gone =
+      db.prepare("DELETE FROM messages_in WHERE id = ? AND status = 'pending' AND on_wake = 1").run(messageId).changes >
+      0;
+    if (gone) db.prepare("DELETE FROM messages_in WHERE id = ? AND kind = 'system'").run(`recall-${messageId}`);
+    return gone;
+  })();
+}
+
+/**
+ * Clear `on_wake` on an unconsumed pair and move it to the front of the queue.
+ *
+ * Both target seqs are above the current maximum, so neither collides with the
+ * `seq` uniqueness constraint. A pair moves as a unit inside one transaction;
+ * a lone trigger (`groups restart --message` writes one) takes the recall slot
+ * itself, since there is no partner whose spacing has to be preserved.
+ */
+function convertWakePair(db: Database.Database, messageId: string): boolean {
+  return db.transaction(() => {
+    const recallId = `recall-${messageId}`;
+    const hasRecall =
+      db.prepare("SELECT 1 FROM messages_in WHERE id = ? AND kind = 'system' LIMIT 1").get(recallId) !== undefined;
+    const recallSeq = nextEvenSeq(db);
+    const moved =
+      db
+        .prepare("UPDATE messages_in SET seq = ?, on_wake = 0 WHERE id = ? AND status = 'pending' AND on_wake = 1")
+        .run(hasRecall ? recallSeq + 2 : recallSeq, messageId).changes > 0;
+    if (moved && hasRecall) {
+      db.prepare("UPDATE messages_in SET seq = ?, on_wake = 0 WHERE id = ? AND kind = 'system'").run(
+        recallSeq,
+        recallId,
+      );
+    }
+    return moved;
+  })();
+}
+
 /**
  * Has a task row been admitted — a `trigger = 1` pending task sitting exactly
  * two seqs after its own inert recall row?

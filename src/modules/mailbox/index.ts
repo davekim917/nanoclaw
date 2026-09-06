@@ -87,6 +87,7 @@ import {
   demoteUnpairedLegacyTasks,
   listDueAdmissionRows,
   listUnpairedPendingUpgradeRows,
+  reconcileSurvivorWakeRows,
   restoreInertTaskSchedule,
   taskPairIsAdmitted,
   type DueAdmissionRow,
@@ -351,6 +352,15 @@ export interface NanoclawMailboxSession extends MailboxSession {
    * `status` cannot answer this.
    */
   withdrawUnconsumedWake(messageId: string, containerOwnsOutbound: () => boolean): boolean;
+  /**
+   * Reconcile every unconsumed `on_wake` row a SURVIVING container can no
+   * longer select — withdrawing the host-restart accountability note, and
+   * converting the rest to ordinary pending rows at the front of the queue.
+   *
+   * Takes no ownership probe, unlike `withdrawUnconsumedWake`: see the wiring
+   * for why the container registry is the wrong authority here.
+   */
+  reconcileSurvivorWakeRows(): { converted: number; withdrawn: number };
   nextEvenSeq(): number;
   upsertSessionRouting(routing: {
     channel_type: string | null;
@@ -1026,6 +1036,40 @@ function forkOps(
           // Unopenable, corrupt, or missing the table: consumption is
           // unprovable, so preserve the row. Losing the message costs more than
           // one stale restart notice.
+          return true;
+        }
+      }),
+    reconcileSurvivorWakeRows: () =>
+      reconcileSurvivorWakeRows(inbound, (messageId) => {
+        // The ack half of `withdrawUnconsumedWake`'s proof, MINUS its ownership
+        // half, and the subtraction is the load-bearing part.
+        // `containerOwnsOutbound` short-circuits to "a claim is possible" for
+        // any RUNNING container — which is true of every adopted session by
+        // construction — so reusing it here would refuse every reconciliation
+        // this op exists to perform.
+        //
+        // The ack read alone is the honest probe: a container past its first
+        // poll provably cannot select an `on_wake = 1` row, because the runner
+        // adds `AND on_wake = 0` to all three selection queries from poll 2
+        // onward. The only survivor that could still consume one is a container
+        // still ON its first poll when the host adopted it, and that is exactly
+        // what a `processing_ack` read catches.
+        //
+        // KNOWN WINDOW, deferred (fork issue #459): a survivor that has SELECTED
+        // an `on_wake` row on its first poll but has not yet written the
+        // `processing_ack` reads here as unclaimed, so the row can be converted
+        // or withdrawn under it. Closing it needs a fence across the host/runner
+        // boundary — the runner would have to publish selection, not just
+        // acknowledgement — which is a protocol change, not a probe change, so
+        // the probe deliberately stays as it is. The blast radius is one turn's
+        // worth of rows in the milliseconds between a survivor's first select
+        // and its ack, on the one boot that adopts it.
+        if (!outboundPresent) return false;
+        try {
+          return hasProcessingAck(readableOutbound(), messageId);
+        } catch {
+          // Unopenable, corrupt, or missing the table: consumption is
+          // unprovable, so leave the row exactly as it is.
           return true;
         }
       }),
