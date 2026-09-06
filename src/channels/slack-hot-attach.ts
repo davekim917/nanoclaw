@@ -22,6 +22,7 @@ import {
 import { centralTransaction } from '../db/central-lease.js';
 import { getDb } from '../db/connection.js';
 import { upsertEnvKeys } from '../env-file.js';
+import { log } from '../log.js';
 import { getOwners } from '../modules/permissions/db/user-roles.js';
 import { normalizeName } from '../modules/agent-to-agent/db/agent-destinations.js';
 import { registerSecrets, scrubSecrets } from '../secret-scrubber.js';
@@ -286,12 +287,19 @@ async function addSlackWorkspaceInner(input: AddSlackWorkspaceInput): Promise<Sl
     throw attachError(`active Slack workspace ${channelType} has a different bot identity; refusing to replace it`);
   }
   // A configured app may be offline, so the live identity cache alone cannot
-  // prove that its team is available. Validate those saved bot tokens too.
+  // identify every duplicate bot. Try those saved tokens independently so a
+  // revoked sibling cannot block attachment of an unrelated app.
   const knownBots = new Map<string, Pick<SlackBotIdentity, 'teamId' | 'userId'>>(getKnownSlackBots());
   for (const workspace of loadSlackWorkspaces()) {
     if (workspace.channelType === channelType || knownBots.has(workspace.channelType)) continue;
     registerSecrets({ botToken: workspace.botToken });
-    knownBots.set(workspace.channelType, await validateSlackIdentity(workspace.botToken));
+    try {
+      knownBots.set(workspace.channelType, await validateSlackIdentity(workspace.botToken));
+    } catch {
+      log.warn('Slack sibling identity unavailable; skipping duplicate check for this instance', {
+        channelType: workspace.channelType,
+      });
+    }
   }
   const duplicateChannelType = duplicateSlackBotChannelType(channelType, identity, knownBots);
   if (duplicateChannelType) {
