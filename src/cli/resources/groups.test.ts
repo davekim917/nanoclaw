@@ -899,7 +899,13 @@ describe('plugin-owned MCP server guard on config add/remove-mcp-server (cases 1
     );
 
     expect(res.ok).toBe(false);
-    if (!res.ok) expect(res.error.message).toMatch(/owned by plugin "sdr".*restamp/);
+    if (!res.ok) {
+      // Pinned wording, not upstream's: this fork has no in-place restamp
+      // verb (github Codex review, PR #486) — the remediation must point at
+      // something that exists today, and never mention `restamp`.
+      expect(res.error.message).toMatch(/managed by plugin "sdr"/);
+      expect(res.error.message).not.toMatch(/restamp/i);
+    }
     expect(readContainerConfig('plugin-guard-add').mcpServers.docs).toMatchObject({
       url: 'https://mcp.example.com/mcp',
     });
@@ -918,7 +924,10 @@ describe('plugin-owned MCP server guard on config add/remove-mcp-server (cases 1
     );
 
     expect(res.ok).toBe(false);
-    if (!res.ok) expect(res.error.message).toMatch(/owned by plugin "sdr"/);
+    if (!res.ok) {
+      expect(res.error.message).toMatch(/managed by plugin "sdr"/);
+      expect(res.error.message).not.toMatch(/restamp/i);
+    }
     expect(readContainerConfig('plugin-guard-remove').mcpServers.docs).toBeDefined();
     expect(JSON.parse((await getContainerConfig(id))!.mcp_servers).docs).toBeDefined();
   });

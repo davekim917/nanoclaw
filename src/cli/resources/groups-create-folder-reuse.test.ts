@@ -50,7 +50,7 @@ vi.mock('../../config.js', async () => {
 const GROUPS_DIR = path.join(TEST_ROOT, 'groups');
 
 import { initMigratedTestDb, closeDb } from '../../db/index.js';
-import { getAgentGroupByFolder } from '../../db/agent-groups.js';
+import { createAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
 import { getContainerConfig } from '../../db/container-configs.js';
 import { dispatch } from '../dispatch.js';
 // Side-effect import: registers the `groups-*` commands (including create).
@@ -144,5 +144,28 @@ describe('groups-create — bare create validates the folder grammar (case 14)',
     const error = (resp as { ok: false; error: { message: string } }).error;
     expect(error.message).toMatch(/Invalid group folder/);
     expect(await getAgentGroupByFolder('has a space')).toBeUndefined();
+  });
+
+  it('returns a LIVE group whose folder predates the current grammar, unchanged (github Codex review, PR #486)', async () => {
+    // Grammar validation must sit strictly after the existing-row lookup and
+    // the on-disk probe, not before — an older bare-create path accepted
+    // folder names the current grammar refuses (e.g. a dot), and that group
+    // is still live. Validating earlier would break documented idempotence
+    // on --folder for every such legacy group: a repeat `groups create` with
+    // its own folder would throw "Invalid group folder" instead of returning
+    // the existing row.
+    const legacyFolder = 'legacy.folder';
+    await createAgentGroup({
+      id: 'ag-legacy',
+      name: 'Legacy',
+      folder: legacyFolder,
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+
+    const resp = await create(legacyFolder);
+
+    expect(resp.ok).toBe(true);
+    expect((resp as { ok: true; data: { id: string } }).data.id).toBe('ag-legacy');
   });
 });
