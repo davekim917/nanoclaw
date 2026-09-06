@@ -3,7 +3,7 @@ import { createHash } from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   aggregateCapacityEvidence,
@@ -28,6 +28,16 @@ import { canonicalRepoDir, resolveRepositoryWorkUnit } from '../src/repository-w
  * this case has a 30 s budget.
  */
 const GIT_HEAVY_TEST_TIMEOUT_MS = 30_000;
+
+/**
+ * Every case in this file creates and mutates real Git repositories, so all of
+ * them are git-heavy — not just the ones that happen to be annotated. Two
+ * separate cases timed out at the 5 s default during full-suite runs at load
+ * ~12 on 2026-09-06 and passed in isolation at the same head (#497), and
+ * annotating each `it()` leaves every future case on the default again. One
+ * file-level budget covers them all.
+ */
+vi.setConfig({ testTimeout: GIT_HEAVY_TEST_TIMEOUT_MS });
 
 let root: string;
 let dataDir: string;
