@@ -104,8 +104,14 @@ const MCP_PAYLOAD_MAX_BYTES = 16384;
  * `<redacted: N bytes, sha256 XXXXXXXX>` placeholder — but the verbatim
  * value still goes into the approval payload and is applied unchanged.
  */
-const SECRET_ENV_KEY_RE = /(TOKEN|SECRET|PASSW(OR)?D|API_?KEY|APIKEY|CREDENTIAL|PRIVATE_?KEY|AUTH)/i;
-const SECRET_VALUE_RE = /^(sk-|ghp_|github_pat_|xox[a-z]-|AKIA|-----BEGIN )/;
+/**
+ * Exported for the stamp-time secret lint in `src/templates/mcp.ts`: a plugin
+ * that ships a real credential in `mcp.json` is rejected outright, using the
+ * same two shapes the approval card redacts with here.
+ */
+export const SECRET_ENV_KEY_RE = /(TOKEN|SECRET|PASSW(OR)?D|API_?KEY|APIKEY|CREDENTIAL|PRIVATE_?KEY|AUTH)/i;
+/** See SECRET_ENV_KEY_RE — known credential prefixes, ^-anchored. */
+export const SECRET_VALUE_RE = /^(sk-|ghp_|github_pat_|xox[a-z]-|AKIA|-----BEGIN )/;
 
 /** Card-only placeholder for a secret-shaped value: byte length + sha256 fingerprint. */
 function redactSecret(value: string): string {

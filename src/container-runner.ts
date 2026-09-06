@@ -34,6 +34,7 @@ import {
   WORKGROUP_SHARED_FS,
 } from './config.js';
 import {
+  CONTAINER_PLUGINS_DIR,
   effectiveTimezone,
   readContainerConfig,
   readContainerConfigForSpawn,
@@ -4490,6 +4491,22 @@ export async function buildMounts(
   if (fs.existsSync(containerJsonPath)) {
     mounts.push({ hostPath: containerJsonPath, containerPath: '/workspace/agent/container.json', readonly: true });
   }
+
+  // Stamped plugin content is immutable at runtime (the Agent Plugins
+  // contract: writes go to plugin-data/, which stays RW via the group mount).
+  // Same nested-RO pattern as container.json; initGroupFilesystem creates the
+  // dir just above (spawnContainer calls it before buildMounts), so the mount
+  // is unconditional and a group carrying no plugin gets an empty read-only
+  // directory rather than a missing path.
+  //
+  // Distinct from the fleet-wide `~/plugins` -> /workspace/plugins mount below:
+  // that one is operator-curated and shared by every group; this one is
+  // per-group and stamped from a template.
+  mounts.push({
+    hostPath: path.join(groupDir, 'plugins'),
+    containerPath: CONTAINER_PLUGINS_DIR,
+    readonly: true,
+  });
 
   // Composer-managed CLAUDE.md — nested RO mount. Regenerated from the
   // shared base + fragments, all INLINED, on every spawn (claude-md-compose.ts);

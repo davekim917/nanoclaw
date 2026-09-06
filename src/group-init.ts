@@ -262,6 +262,18 @@ export function initGroupFilesystem(
     initialized.push('spawn-template.md');
   }
 
+  // Stamped plugin content (groups/<folder>/plugins/<name>) is nested-mounted
+  // read-only at CONTAINER_PLUGINS_DIR by container-runner.ts. Created
+  // unconditionally, even for a group that carries no plugin: buildMounts runs
+  // right after this and the mount is unconditional, so without the dir Docker
+  // would create the destination ROOT-owned — the same trap spawn-template.md
+  // above exists to avoid. Writable plugin-data/ stays under the RW group mount.
+  const pluginsDir = path.join(groupDir, 'plugins');
+  if (!fs.existsSync(pluginsDir)) {
+    fs.mkdirSync(pluginsDir, { recursive: true });
+    initialized.push('plugins/');
+  }
+
   // Note: the container_configs DB row is NOT created here. Local's
   // applyCreateAgent ordering puts initGroupFilesystem BEFORE the
   // agent_groups insert (so a DB failure can roll back the FS via
