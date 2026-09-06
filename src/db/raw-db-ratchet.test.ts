@@ -270,7 +270,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/storage-gc.test.ts',
   'src/storage-manager.test.ts',
   'src/storage-manager.ts',
-  'src/storage-pressure-alert.test.ts',
   'src/templates/create-agent.test.ts',
   'src/test-fixtures/raw-db-fake.ts',
   'src/topic-title.test.ts',
