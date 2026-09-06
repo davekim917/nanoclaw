@@ -1129,3 +1129,14 @@ describe('choosing a filter while Schedule is open returns to the queue (item 4)
     expect(screen.getByLabelText('Triage')).toBeTruthy();
   });
 });
+
+
+describe('Signal exact thread bookmarks', () => {
+  it('loads the exact requested thread even when it is absent from the queue', async () => {
+    listThreads.mockResolvedValue({ threads: [] });
+    getThreadDetail.mockResolvedValue({ thread: thread('outside-window', { title: 'Exact older discussion' }), transcript: [] });
+    const { container } = render(<SWRConfig value={{ provider: () => new Map() }}><ThreadConsole authMe={authMe} deepLinkId="outside-window" externalWorkgroup="all" /></SWRConfig>);
+    await waitFor(() => expect(getThreadDetail).toHaveBeenCalledWith('outside-window'));
+    await waitFor(() => expect(container.querySelector('.ncc')).toHaveAttribute('data-pane', 'detail'));
+  });
+});

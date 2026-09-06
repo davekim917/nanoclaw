@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { createRoot } from 'react-dom/client';
 import { AuthGate } from './auth/AuthGate.js';
-import { ThreadConsole } from './views/console/ThreadConsole.js';
+import { SignalApp } from './views/signal/SignalApp.js';
 import { authMe as fetchAuthMe, exchangeToken } from './lib/api.js';
 import { startSSE } from './lib/sse.ts';
 import { takeUrlToken } from './lib/url-token.js';
@@ -12,17 +12,12 @@ import './theme.css';
 import './styles.css';
 // The console's own token layer, scoped under `.ncc`.
 import './views/console/console.css';
+import './views/signal/signal.css';
 
 // Design-tool tweak variant. Switchable classes documented in styles.css.
 const TWEAK_CLASS = 'tw-no-heat tw-no-grid';
 
-/**
- * One surface. The legacy `#/observatory`, `#/inbox`, `#/workgroup` and
- * `#/session/:id` routes are gone with the views behind them, so every hash —
- * including a bookmark to one of those — lands on the console rather than
- * rendering nothing. There is nothing left to route BETWEEN, which is why this
- * no longer returns a route at all.
- */
+// Authentication remains shared; Signal owns authenticated application routing.
 
 function App() {
   const [authState, setAuthState] = useState<'loading' | 'unauthenticated' | 'authenticated'>('loading');
@@ -88,10 +83,7 @@ function App() {
   }
 
   return (
-    /* No `minHeight: 100vh` here: the console owns its own height (`100dvh`,
-       see console.css) and a 100vh wrapper around a 100dvh shell is exactly the
-       browser-chrome-sized page scroll that height is there to remove. */
-    <div className={TWEAK_CLASS}>{me && <ThreadConsole authMe={me} />}</div>
+    <div className={TWEAK_CLASS}>{me && <SignalApp authMe={me} />}</div>
   );
 }
 
