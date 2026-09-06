@@ -17,6 +17,7 @@ import { createAgentGroup, getAgentGroup, getAgentGroupByFolder, getAllAgentGrou
 import { getDb } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
 import { requestWake } from '../../request-wake.js';
+import { assertValidGroupFolder, groupFolderExistsOnDisk } from '../../group-folder.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { updateContainerConfig } from '../../container-config.js';
 import { log } from '../../log.js';
@@ -194,17 +195,27 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
       return;
     }
 
-    // Derive a safe folder name, deduplicated globally across agent_groups.folder.
-    // Name-squatting is mitigated by the approval gate (operator sees the
-    // requested name in the card) rather than by mandatory parent prefix —
-    // forcing a parent-folder prefix breaks scoped-env token boundaries
-    // (e.g. PARENT_FOLDER__CHILD's tokens overlap with PARENT_FOLDER_*).
+    // Derive a safe folder name, deduplicated globally across
+    // agent_groups.folder AND the on-disk groups/ dir: a folder present on
+    // disk with no claiming DB row is deleted-group residue, and adopting it
+    // would silently re-scope the old group's data under the new agent's
+    // identity — skip to the next suffix instead. Name-squatting is
+    // mitigated by the approval gate (operator sees the requested name in
+    // the card) rather than by mandatory parent prefix — forcing a
+    // parent-folder prefix breaks scoped-env token boundaries (e.g.
+    // PARENT_FOLDER__CHILD's tokens overlap with PARENT_FOLDER_*).
     let folder = localName;
     let suffix = 2;
-    while (await getAgentGroupByFolder(folder)) {
+    while ((await getAgentGroupByFolder(folder)) || groupFolderExistsOnDisk(folder)) {
       folder = `${localName}-${suffix}`;
       suffix++;
     }
+    // The suffix can push a 63/64-char name past the folder grammar. A DB-row
+    // collision is caught by the prefix guard below (the row's token is a
+    // prefix of ours), but disk-only residue has no row, so validate the
+    // generated name explicitly rather than persist a folder every provider
+    // spawn will refuse (assertValidGroupFolder, src/group-folder.ts).
+    assertValidGroupFolder(folder);
 
     // SECURITY (cross-tenant audit 2026-05-03): folder-name prefix collision
     // would let scoped-env env-var matching cross-leak (e.g. folder=example-agent
