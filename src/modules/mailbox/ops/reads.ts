@@ -79,16 +79,15 @@ function scheduledColumns(db: Database.Database): string {
 }
 
 /**
- * Series ids with MORE THAN ONE live task row — the duplicate-fire signature
- * the board flags. Every live row of such a series is surfaced (see
- * {@link listLiveTaskRowsForSeries}), because the second fireable row is the
- * one a MAX(seq) view hides.
+ * Series ids with more than one live recurring successor. The board marks
+ * the series unhealthy without giving its shared locator duplicate rows.
+ * Intentional manual runs share the series id but have no recurrence.
  */
 export function listDuplicateLiveTaskSeriesIds(db: Database.Database): string[] {
   const rows = db
     .prepare(
       `SELECT series_id FROM messages_in
-        WHERE status IN ('pending', 'paused') AND kind = 'task'
+        WHERE status IN ('pending', 'paused') AND kind = 'task' AND recurrence IS NOT NULL
         GROUP BY series_id HAVING COUNT(*) > 1`,
     )
     .all() as Array<{ series_id: string | null }>;
@@ -96,7 +95,8 @@ export function listDuplicateLiveTaskSeriesIds(db: Database.Database): string[] 
 }
 
 /**
- * The newest row of every RECURRING series, cancelled series excluded.
+ * The newest recurrence-bearing row of every series, cancelled series excluded.
+ * A newer manual occurrence must not hide the still-armed recurring chain.
  *
  * Terminal-but-still-recurring rows are deliberately included: the board's
  * strand detector needs to see a fired series that minted no successor, which
@@ -109,18 +109,22 @@ export function listLatestRecurringSeriesRows(db: Database.Database): ScheduledT
          FROM messages_in
         WHERE recurrence IS NOT NULL
           AND status != 'cancelled'
-          AND seq = (SELECT MAX(m2.seq) FROM messages_in m2 WHERE m2.series_id = messages_in.series_id)`,
+          AND seq = (SELECT MAX(m2.seq) FROM messages_in m2
+            WHERE m2.series_id = messages_in.series_id AND m2.recurrence IS NOT NULL)`,
     )
     .all() as ScheduledTaskRow[];
 }
 
-/** Live (pending|paused) one-off task rows — no recurrence. */
+/** Live standalone one-off series; manual runs of recurring series stay in that series. */
 export function listLiveOneOffTaskRows(db: Database.Database): ScheduledTaskRow[] {
   return db
     .prepare(
       `SELECT ${scheduledColumns(db)}
          FROM messages_in
         WHERE recurrence IS NULL AND kind = 'task' AND status IN ('pending', 'paused')
+          AND NOT EXISTS (SELECT 1 FROM messages_in recurring
+            WHERE recurring.series_id = messages_in.series_id AND recurring.recurrence IS NOT NULL
+              AND recurring.status != 'cancelled')
           AND seq = (SELECT MAX(m2.seq) FROM messages_in m2 WHERE m2.series_id = messages_in.series_id)`,
     )
     .all() as ScheduledTaskRow[];
@@ -156,7 +160,8 @@ export function listLiveTaskRowsForSeries(db: Database.Database, seriesId: strin
 }
 
 /**
- * The newest LIVE row of a series, whatever its kind.
+ * The live recurring chain, or newest LIVE standalone one-off. A terminal
+ * recurring chain resolves through getLatestSeriesRow, never a manual run.
  *
  * Kind-agnostic on purpose — the detail drawer resolves a board row the list
  * built from `recurrence IS NOT NULL`, which is not restricted to `task`.
@@ -167,23 +172,30 @@ export function getLiveSeriesRow(db: Database.Database, seriesId: string): Sched
       .prepare(
         `SELECT ${scheduledColumns(db)} FROM messages_in
           WHERE series_id = ? AND status IN ('pending', 'paused')
-          ORDER BY seq DESC LIMIT 1`,
+            AND (recurrence IS NOT NULL OR NOT EXISTS (SELECT 1 FROM messages_in chain
+              WHERE chain.series_id = messages_in.series_id AND chain.recurrence IS NOT NULL AND chain.status != 'cancelled'))
+          ORDER BY (recurrence IS NOT NULL) DESC, seq DESC LIMIT 1`,
       )
       .get(seriesId) as ScheduledTaskRow | undefined) ?? null
   );
 }
 
-/** The newest row of a series regardless of status — an ended series still renders. */
+/** Prefer the recurring chain, including a terminal strand, over manual-run history. */
 export function getLatestSeriesRow(db: Database.Database, seriesId: string): ScheduledTaskRow | null {
   return (
     (db
-      .prepare(`SELECT ${scheduledColumns(db)} FROM messages_in WHERE series_id = ? ORDER BY seq DESC LIMIT 1`)
+      .prepare(
+        `SELECT ${scheduledColumns(db)} FROM messages_in WHERE series_id = ?
+          ORDER BY (recurrence IS NOT NULL AND status != 'cancelled') DESC, seq DESC LIMIT 1`,
+      )
       .get(seriesId) as ScheduledTaskRow | undefined) ?? null
   );
 }
 
 /**
- * The newest LIVE `task` row of a series.
+ * The live recurring task chain, or newest LIVE standalone one-off. A terminal
+ * recurring chain has no editable live schedule, even with a pending manual run.
+ * Board controls target the schedule even when a newer manual run shares its id.
  *
  * The kind-filtered twin of {@link getLiveSeriesRow}: the mutation gate, the
  * move flow and the detail bodies all mean "the scheduled task", and a
@@ -195,18 +207,21 @@ export function getLiveTaskRow(db: Database.Database, seriesId: string): Schedul
       .prepare(
         `SELECT ${scheduledColumns(db)} FROM messages_in
           WHERE series_id = ? AND kind = 'task' AND status IN ('pending', 'paused')
-          ORDER BY seq DESC LIMIT 1`,
+            AND (recurrence IS NOT NULL OR NOT EXISTS (SELECT 1 FROM messages_in chain
+              WHERE chain.series_id = messages_in.series_id AND chain.recurrence IS NOT NULL AND chain.status != 'cancelled'))
+          ORDER BY (recurrence IS NOT NULL) DESC, seq DESC LIMIT 1`,
       )
       .get(seriesId) as ScheduledTaskRow | undefined) ?? null
   );
 }
 
-/** The newest `task` row of a series regardless of status. */
+/** The recurring task definition, including a terminal strand, or newest one-off. */
 export function getLatestTaskRow(db: Database.Database, seriesId: string): ScheduledTaskRow | null {
   return (
     (db
       .prepare(
-        `SELECT ${scheduledColumns(db)} FROM messages_in WHERE series_id = ? AND kind = 'task' ORDER BY seq DESC LIMIT 1`,
+        `SELECT ${scheduledColumns(db)} FROM messages_in WHERE series_id = ? AND kind = 'task'
+          ORDER BY (recurrence IS NOT NULL AND status != 'cancelled') DESC, seq DESC LIMIT 1`,
       )
       .get(seriesId) as ScheduledTaskRow | undefined) ?? null
   );

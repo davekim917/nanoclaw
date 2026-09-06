@@ -404,3 +404,23 @@ describe('the operator\u2019s words are wrapped, never replaced', () => {
     expect(worst.length).toBeLessThanOrEqual(4000);
   });
 });
+
+it.each(['shared', 'agent-shared'])('honors an explicit thread despite %s ingress wiring', async (mode) => {
+  await seedAgent('ag-shared');
+  wire('ag-shared', mode);
+  seedSession('s-shared', 'ag-shared', null);
+  if (mode === 'agent-shared') {
+    getRawDb().prepare('UPDATE sessions SET messaging_group_id = NULL WHERE id = ?').run('s-shared');
+  }
+  const res = await send({ agent_group_id: 'ag-shared', idempotency_key: 'explicit-thread', text: 'reply here' });
+  expect(res.status).toBe(202);
+  const sessionId = applySessionSteer.mock.calls[0]![0];
+  expect(sessionId).not.toBe('s-shared');
+  expect(getRawDb().prepare('SELECT messaging_group_id, thread_id FROM sessions WHERE id = ?').get(sessionId)).toEqual({
+    messaging_group_id: 'mg-1',
+    thread_id: THREAD,
+  });
+  expect(getRawDb().prepare('SELECT thread_id FROM sessions WHERE id = ?').get('s-shared')).toEqual({
+    thread_id: null,
+  });
+});
