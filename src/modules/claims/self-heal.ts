@@ -555,30 +555,29 @@ interface WiredCandidate {
  * agent group actually belongs to.
  */
 async function taskSeriesCandidates(workgroupId: string, threadId: string): Promise<WiredCandidate[]> {
-  const { withCentralSync, withRawDb } = await import('../../db/central-lease.js');
-  const located = await withCentralSync(
-    () =>
-      withRawDb((db) => {
-        const owner = db
-          .prepare(
-            `SELECT s.id AS sessionId, ag.id AS agentGroupId, ag.name AS name, ag.folder AS folder
+  const { getDb } = await import('../../db/connection.js');
+  const owner = await getDb().get<{ sessionId: string; agentGroupId: string; name: string; folder: string }>(
+    `SELECT s.id AS sessionId, ag.id AS agentGroupId, ag.name AS name, ag.folder AS folder
          FROM sessions s
          JOIN agent_groups ag ON ag.id = s.agent_group_id
         WHERE s.thread_id = ? AND ag.workgroup_id = ?
         ORDER BY s.created_at DESC
         LIMIT 1`,
-          )
-          .get(threadId, workgroupId) as
-          | { sessionId: string; agentGroupId: string; name: string; folder: string }
-          | undefined;
-        if (!owner) return null;
+    threadId,
+    workgroupId,
+  );
+  if (!owner) return [];
 
-        // Newest anchor wins — a series that has posted in two channels is talking in
-        // the one it spoke in last, and picking arbitrarily is how a nudge lands in a
-        // room nobody is reading.
-        const anchor = db
-          .prepare(
-            `SELECT a.channel_type AS channelType, a.platform_id AS platformId, a.thread_platform_id AS threadPlatformId,
+  // Newest anchor wins — a series that has posted in two channels is talking in
+  // the one it spoke in last, and picking arbitrarily is how a nudge lands in a
+  // room nobody is reading.
+  const anchor = await getDb().get<{
+    channelType: string;
+    platformId: string;
+    threadPlatformId: string;
+    messagingGroupId: string;
+  }>(
+    `SELECT a.channel_type AS channelType, a.platform_id AS platformId, a.thread_platform_id AS threadPlatformId,
               mg.id AS messagingGroupId
          FROM task_thread_anchors a
          JOIN messaging_groups mg ON mg.platform_id = a.platform_id AND mg.channel_type = a.channel_type
@@ -587,16 +586,9 @@ async function taskSeriesCandidates(workgroupId: string, threadId: string): Prom
         WHERE a.session_id = ?
         ORDER BY a.created_at DESC
         LIMIT 1`,
-          )
-          .get(owner.agentGroupId, owner.sessionId) as
-          | { channelType: string; platformId: string; threadPlatformId: string; messagingGroupId: string }
-          | undefined;
-        return { owner, anchor };
-      }),
-    'self-heal task series candidates',
+    owner.agentGroupId,
+    owner.sessionId,
   );
-  if (!located) return [];
-  const { owner, anchor } = located;
   const where = anchor
     ? { messagingGroupId: anchor.messagingGroupId, deliverThreadId: `${anchor.platformId}:${anchor.threadPlatformId}` }
     : // `system:tasks:<seriesId>` — the series id is everything after the prefix.
@@ -639,34 +631,34 @@ async function seriesRoutingStamp(
   //
   // What the conversion still drops is the schema-ensure, the migration and
   // the reclaim-blocking activity marker, which is the whole point of it.
-  const [{ readSessionInbound }, { withCentralSync, withRawDb }] = await Promise.all([
+  const [{ readSessionInbound }, { getDb }] = await Promise.all([
     import('../mailbox/index.js'),
-    import('../../db/central-lease.js'),
+    import('../../db/connection.js'),
   ]);
-  // The stamp read is a synchronous session-DB open and the central lookup
-  // follows it immediately, so both sit in one lease block.
-  return withCentralSync(() => {
-    const stamp = readSessionInbound(
-      { agentGroupId, sessionId },
-      (mailbox) => mailbox.getLatestTaskRoutingStamp(seriesId),
-      { busyTimeoutMs: 5000, recoverJournal: true },
-    );
-    if (!stamp) return null; // `--isolated`: stamped no routing on purpose
+  // Both reads are read-only, so they no longer share a lease block: the stamp
+  // read is a synchronous session-DB open and the central lookup that follows
+  // it is one awaited SELECT. Holding the lease across a mailbox file open was
+  // the belt PR 6 needed while this leaf was synchronous, and nothing here
+  // writes, so a row changing between them costs at most one stale nudge
+  // destination — which a later tick re-resolves.
+  const stamp = readSessionInbound(
+    { agentGroupId, sessionId },
+    (mailbox) => mailbox.getLatestTaskRoutingStamp(seriesId),
+    { busyTimeoutMs: 5000, recoverJournal: true },
+  );
+  if (!stamp) return null; // `--isolated`: stamped no routing on purpose
 
-    const mg = withRawDb(
-      (db) =>
-        db
-          .prepare(
-            `SELECT mg.id AS messagingGroupId
+  const mg = await getDb().get<{ messagingGroupId: string }>(
+    `SELECT mg.id AS messagingGroupId
          FROM messaging_groups mg
          JOIN messaging_group_agents mga
               ON mga.messaging_group_id = mg.id AND mga.agent_group_id = ?
         WHERE mg.platform_id = ? AND mg.channel_type = ?`,
-          )
-          .get(agentGroupId, stamp.platformId, stamp.channelType) as { messagingGroupId: string } | undefined,
-    );
-    return mg ? { messagingGroupId: mg.messagingGroupId, deliverThreadId: stamp.threadId } : null;
-  }, 'self-heal series routing stamp');
+    agentGroupId,
+    stamp.platformId,
+    stamp.channelType,
+  );
+  return mg ? { messagingGroupId: mg.messagingGroupId, deliverThreadId: stamp.threadId } : null;
 }
 
 /**
@@ -687,28 +679,21 @@ async function seriesRoutingStamp(
  * one place the "which room can we actually reach?" question is answered.
  */
 export async function wiredCandidates(workgroupId: string, threadId: string): Promise<WiredCandidate[]> {
-  const [{ withCentralSync, withRawDb }, { threadPlatformId }, { isTaskThread }] = await Promise.all([
-    import('../../db/central-lease.js'),
+  const [{ getDb }, { threadPlatformId }, { isTaskThread }] = await Promise.all([
+    import('../../db/connection.js'),
     import('../../dashboard/api/observatory.js'),
     import('../../db/sessions.js'),
   ]);
   if (isTaskThread(threadId)) return taskSeriesCandidates(workgroupId, threadId);
   const platformId = await threadPlatformId(threadId);
-  return withCentralSync(
-    () =>
-      withRawDb(
-        (db) =>
-          db
-            .prepare(
-              `SELECT ag.id AS agentGroupId, ag.name AS name, ag.folder AS folder, mg.id AS messagingGroupId
+  return getDb().all<WiredCandidate>(
+    `SELECT ag.id AS agentGroupId, ag.name AS name, ag.folder AS folder, mg.id AS messagingGroupId
          FROM messaging_group_agents mga
          JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
          JOIN agent_groups ag ON ag.id = mga.agent_group_id
         WHERE ag.workgroup_id = ? AND mg.platform_id = ?`,
-            )
-            .all(workgroupId, platformId) as WiredCandidate[],
-      ),
-    'self-heal wired candidates',
+    workgroupId,
+    platformId,
   );
 }
 

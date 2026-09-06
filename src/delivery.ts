@@ -15,7 +15,6 @@ import {
   isTaskThread,
   TASKS_SYSTEM_THREAD_ID,
 } from './db/sessions.js';
-import { withCentralSync, withRawDb } from './db/central-lease.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import {
@@ -654,15 +653,10 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
   // "progress" makes the no-progress timer mean what it says.
   if (await isSpawnChildSession(session.id)) {
     try {
-      await withCentralSync(
-        () =>
-          withRawDb((db) => {
-            db.prepare(`UPDATE tasks SET last_progress_at = ? WHERE child_session_id = ?`).run(
-              new Date().toISOString(),
-              session.id,
-            );
-          }),
-        'spawn child progress bump',
+      await getDb().run(
+        `UPDATE tasks SET last_progress_at = ? WHERE child_session_id = ?`,
+        new Date().toISOString(),
+        session.id,
       );
     } catch (err) {
       log.warn('Failed to bump last_progress_at for spawn child', {
@@ -1091,16 +1085,11 @@ async function deliverMessage(
     // origin-chat case is always allowed regardless). Inlined SQL instead
     // of importing `hasDestination` so core doesn't depend on the module.
     if (!isOriginChat && (await hasTable(getDb(), 'agent_destinations'))) {
-      const row = await withCentralSync(
-        () =>
-          withRawDb((db) =>
-            db
-              .prepare(
-                'SELECT 1 FROM agent_destinations WHERE agent_group_id = ? AND target_type = ? AND target_id = ? LIMIT 1',
-              )
-              .get(session.agent_group_id, 'channel', mg.id),
-          ),
-        'channel destination check',
+      const row = await getDb().get(
+        'SELECT 1 FROM agent_destinations WHERE agent_group_id = ? AND target_type = ? AND target_id = ? LIMIT 1',
+        session.agent_group_id,
+        'channel',
+        mg.id,
       );
       if (!row) {
         throw new Error(

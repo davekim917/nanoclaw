@@ -30,13 +30,13 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { withCentralSync, withRawDb } from './db/central-lease.js';
 import { GROUPS_DIR } from './config.js';
 import { readContainerConfig, validateMcpServers, type McpServerConfig } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { flattenClaudeMd } from './agents-md-flatten.js';
 import { CODEX_PROJECT_DOC_CONFIGURED_MAX_BYTES, warnIfOversized } from './codex-project-doc-cap.js';
 import { readGroupPersona } from './group-persona.js';
+import { getDb } from './db/connection.js';
 import { log } from './log.js';
 import type { AgentGroup } from './types.js';
 
@@ -74,15 +74,9 @@ const COMPOSED_HEADER =
 async function personaSymlinkRoots(group: AgentGroup, groupDir: string): Promise<string[]> {
   if (!group.workgroup_id) return [groupDir];
   try {
-    const siblings = await withCentralSync(
-      () =>
-        withRawDb(
-          (db) =>
-            db.prepare(`SELECT folder FROM agent_groups WHERE workgroup_id = ?`).all(group.workgroup_id) as Array<{
-              folder: string;
-            }>,
-        ),
-      'persona symlink roots',
+    const siblings = await getDb().all<{ folder: string }>(
+      `SELECT folder FROM agent_groups WHERE workgroup_id = ?`,
+      group.workgroup_id,
     );
     return [groupDir, ...siblings.map((s) => path.resolve(GROUPS_DIR, s.folder))];
   } catch (err) {

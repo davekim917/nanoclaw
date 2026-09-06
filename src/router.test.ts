@@ -9,8 +9,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 
 vi.mock('./db/connection.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./db/connection.js')>()),
-  getRawDb: vi.fn(),
-  hasTableRaw: vi.fn(() => true),
+  getDb: vi.fn(),
 }));
 vi.mock('./db/channel-ingress-receipts.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./db/channel-ingress-receipts.js')>()),
@@ -205,7 +204,7 @@ import {
   createMessagingGroup,
   createMessagingGroupAgent,
 } from './db/messaging-groups.js';
-import { getRawDb } from './db/connection.js';
+import { getDb } from './db/connection.js';
 import { writeSessionMessageIfNew, resolveSession } from './session-manager.js';
 import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
@@ -269,14 +268,12 @@ function makeChatEvent(text: string, overrides: Partial<InboundEvent> = {}): Inb
   };
 }
 
-/** Stub getRawDb() for the sole-intercept-responder tiebreak query in router.ts —
- *  it runs a single `prepare(...).get(mgId, platformId)` and expects
+/** Stub the driver for the sole-intercept-responder tiebreak query in router.ts —
+ *  it runs a single `getDb().get(sql, mgId, platformId)` and expects
  *  `{ mg_id }` (the deterministic winner) or undefined. */
 function mockInterceptTiebreakWinner(winnerMgId: string | undefined): void {
-  vi.mocked(getRawDb).mockReturnValue({
-    prepare: vi.fn(() => ({
-      get: vi.fn(() => (winnerMgId === undefined ? undefined : { mg_id: winnerMgId })),
-    })),
+  vi.mocked(getDb).mockReturnValue({
+    get: vi.fn(async () => (winnerMgId === undefined ? undefined : { mg_id: winnerMgId })),
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } as any);
 }
@@ -713,15 +710,13 @@ describe('workspace-trust auto-wire inherits voice and engagement defaults', () 
       .mockResolvedValueOnce({ mg, agentCount: 0 })
       .mockResolvedValue({ mg, agentCount: 1 });
     vi.mocked(getMessagingGroupAgents).mockResolvedValue([makeAgent({ messaging_group_id: 'mg-new' })]);
-    vi.mocked(getRawDb).mockReturnValue({
-      prepare: (sql: string) => ({
-        // inheritedAgentGroupFor picks the incumbent; unanimousToneFor asks
-        // what tone that agent already uses on this platform.
-        all: () =>
-          /DISTINCT/.test(sql)
-            ? existingTones.map((tone) => ({ tone }))
-            : [{ agent_group_id: 'ag-1', messaging_group_id: 'mg-src', cnt: 3 }],
-      }),
+    vi.mocked(getDb).mockReturnValue({
+      // inheritedAgentGroupFor picks the incumbent; unanimousToneFor asks
+      // what tone that agent already uses on this platform.
+      all: async (sql: string) =>
+        /DISTINCT/.test(sql)
+          ? existingTones.map((tone) => ({ tone }))
+          : [{ agent_group_id: 'ag-1', messaging_group_id: 'mg-src', cnt: 3 }],
     } as never);
   }
 

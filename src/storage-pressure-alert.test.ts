@@ -10,7 +10,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('./db/connection.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./db/connection.js')>()),
-  getRawDb: () => ({ prepare: () => ({ all: () => mocks.roleRows }) }),
+  getDb: () => ({ all: async () => mocks.roleRows }),
 }));
 vi.mock('./modules/permissions/user-dm.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./modules/permissions/user-dm.js')>()),

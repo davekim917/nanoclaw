@@ -10,9 +10,9 @@ import {
   RepositoryMountQuiescenceError,
   type RepositoryMountQuiescence,
 } from '../../container-restart.js';
-import { withCentralSync, withRawDb } from '../../db/central-lease.js';
 import { REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS } from '../../config.js';
 import { getAgentGroup, getAllAgentGroups } from '../../db/agent-groups.js';
+import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
 import { registerDeliveryAction } from '../../delivery.js';
@@ -722,32 +722,27 @@ export async function applyRepositoryRefreshAction(content: Record<string, unkno
   }
 }
 
-function sessionsForWorkUnit(workUnit: RepositoryWorkUnit): Promise<Array<Session & { platform_id: string | null }>> {
-  return withCentralSync(
-    () =>
-      withRawDb((db) => {
-        const rows = db
-          .prepare(
-            `SELECT s.*, mg.platform_id
+async function sessionsForWorkUnit(
+  workUnit: RepositoryWorkUnit,
+): Promise<Array<Session & { platform_id: string | null }>> {
+  const rows = await getDb().all<Session & { platform_id: string | null }>(
+    `SELECT s.*, mg.platform_id
          FROM sessions s
          JOIN agent_groups ag ON ag.id = s.agent_group_id
          LEFT JOIN messaging_groups mg ON mg.id = s.messaging_group_id
         WHERE COALESCE(ag.workgroup_id, ag.folder) = ?`,
-          )
-          .all(workUnit.workgroupId) as Array<Session & { platform_id: string | null }>;
-        return rows.filter((row) => {
-          const unit = resolveRepositoryWorkUnit({
-            workgroupId: workUnit.workgroupId,
-            sessionId: row.id,
-            platformId: row.platform_id,
-            messagingGroupId: row.messaging_group_id,
-            threadId: row.thread_id,
-          });
-          return unit.key === workUnit.key;
-        });
-      }),
-    'repository sessions for work unit',
+    workUnit.workgroupId,
   );
+  return rows.filter((row) => {
+    const unit = resolveRepositoryWorkUnit({
+      workgroupId: workUnit.workgroupId,
+      sessionId: row.id,
+      platformId: row.platform_id,
+      messagingGroupId: row.messaging_group_id,
+      threadId: row.thread_id,
+    });
+    return unit.key === workUnit.key;
+  });
 }
 
 type TransferSourceRow = Pick<Session, 'id' | 'messaging_group_id' | 'thread_id'> & {
@@ -915,21 +910,13 @@ export async function applyRepositoryTransferAction(content: Record<string, unkn
     const workgroupId = await workgroupForSession(session);
     const destination = await workUnitForSession(session, workgroupId);
     if (destination.key !== destinationWorkUnitKey) throw new Error('destination repository work-unit changed');
-    const sourceRows = await withCentralSync(
-      () =>
-        withRawDb(
-          (db) =>
-            db
-              .prepare(
-                `SELECT s.id, s.messaging_group_id, s.thread_id, mg.platform_id
+    const sourceRows = await getDb().all<TransferSourceRow>(
+      `SELECT s.id, s.messaging_group_id, s.thread_id, mg.platform_id
            FROM sessions s
            JOIN agent_groups ag ON ag.id = s.agent_group_id
            LEFT JOIN messaging_groups mg ON mg.id = s.messaging_group_id
           WHERE COALESCE(ag.workgroup_id, ag.folder) = ?`,
-              )
-              .all(workgroupId) as TransferSourceRow[],
-        ),
-      'repository transfer source rows',
+      workgroupId,
     );
     const source = resolveTransferSourceWorkUnit(workgroupId, sourceThreadId, sourceRows);
 

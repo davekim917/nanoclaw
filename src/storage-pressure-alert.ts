@@ -1,4 +1,4 @@
-import { withCentralSync, withRawDb } from './db/central-lease.js';
+import { getDb } from './db/connection.js';
 import { getDeliveryAdapter } from './delivery.js';
 import { log } from './log.js';
 import { ensureUserDm } from './modules/permissions/user-dm.js';
@@ -65,22 +65,13 @@ export async function handleStoragePressureAlert(report: StorageReport, now = Da
 
   let recipients: Array<{ user_id: string }>;
   try {
-    recipients = await withCentralSync(
-      () =>
-        withRawDb(
-          (db) =>
-            db
-              .prepare(
-                `SELECT user_id, MIN(CASE role WHEN 'owner' THEN 0 ELSE 1 END) AS priority
+    recipients = await getDb().all<{ user_id: string }>(
+      `SELECT user_id, MIN(CASE role WHEN 'owner' THEN 0 ELSE 1 END) AS priority
            FROM user_roles
           WHERE role = 'owner'
              OR (role = 'admin' AND agent_group_id IS NULL)
           GROUP BY user_id
           ORDER BY priority, user_id`,
-              )
-              .all() as Array<{ user_id: string }>,
-        ),
-      'storage pressure alert recipients',
     );
   } catch (err) {
     log.warn('storage-manager: cannot resolve pressure alert recipients', { err });

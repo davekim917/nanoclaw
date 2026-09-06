@@ -291,12 +291,12 @@ describe("module intervals are unref'd and cleared on shutdown", () => {
       mockWorktreeCleanupDeps(logMock, tmpRoot);
       vi.doMock('./db/agent-groups.js', () => ({ getAllAgentGroups: () => [] }));
       vi.doMock('./db/backlog.js', () => ({
-        getBacklog: () => [],
-        getBacklogResolvedSince: () => [],
-        getShipLogSince: () => [],
-        addShipLogEntry: () => undefined,
-        getCommitDigestState: () => null,
-        upsertCommitDigestState: () => undefined,
+        getBacklog: async () => [],
+        getBacklogResolvedSince: async () => [],
+        getShipLogSince: async () => [],
+        addShipLogEntry: async () => undefined,
+        getCommitDigestState: async () => null,
+        upsertCommitDigestState: async () => undefined,
       }));
       vi.doMock('./db/messaging-groups.js', () => ({ getMessagingGroup: () => null }));
       // NOT mocked: ./delivery.js. repo-freshness.js pulls in
