@@ -737,6 +737,62 @@ describe('unknown-channel registration flow', () => {
     expect(stillPending).toBe(0);
   });
 
+  // T4 PR3 (§5 case 17): group creation refuses an undisposed folder,
+  // including a dangling symlink — a folder occupying the name on disk with
+  // no claiming DB row is deleted-group residue, and adopting it would
+  // silently re-scope the old group's data under the new agent's identity.
+  // A dangling symlink specifically exercises the lstat-not-existsSync
+  // distinction: existsSync follows the link and reports the name as free,
+  // but the allocator must still treat it as occupied.
+  it('create new agent: refuses an undisposed folder, including a dangling symlink', async () => {
+    const { routeInbound } = await import('../../router.js');
+    const { getResponseHandlers } = await import('../../response-registry.js');
+    const { getRawDb } = await import('../../db/connection.js');
+
+    fs.mkdirSync(`${TEST_DIR}/groups`, { recursive: true });
+    fs.symlinkSync(`${TEST_DIR}/groups/nowhere-${Math.random()}`, `${TEST_DIR}/groups/dangler`);
+    expect(fs.existsSync(`${TEST_DIR}/groups/dangler`)).toBe(false); // dangling: existsSync follows and reports absent
+
+    await routeInbound(groupMention('chat-create-dangler'));
+    await new Promise((r) => setTimeout(r, 10));
+    const pending = getRawDb().prepare('SELECT messaging_group_id FROM pending_channel_approvals').get() as {
+      messaging_group_id: string;
+    };
+
+    for (const handler of getResponseHandlers()) {
+      const claimed = await handler({
+        questionId: pending.messaging_group_id,
+        value: 'new_agent',
+        userId: 'owner',
+        channelType: 'telegram',
+        platformId: 'dm-owner',
+        threadId: null,
+      });
+      if (claimed) break;
+    }
+
+    await routeInbound({
+      channelType: 'telegram',
+      platformId: 'dm-owner',
+      threadId: null,
+      message: {
+        id: 'name-reply-dangler',
+        kind: 'chat' as const,
+        content: JSON.stringify({ senderId: 'owner', senderName: 'Owner', text: 'Dangler' }),
+        timestamp: now(),
+      },
+    });
+
+    const created = getRawDb().prepare("SELECT id, folder FROM agent_groups WHERE name = 'Dangler'").get() as
+      | { id: string; folder: string }
+      | undefined;
+    expect(created).toBeDefined();
+    // Skipped to the next suffix rather than colliding with the dangling
+    // symlink (or throwing) — the bounded-retry behavior is unchanged.
+    expect(created!.folder).toBe('dangler-2');
+    expect(fs.lstatSync(`${TEST_DIR}/groups/dangler`).isSymbolicLink()).toBe(true); // left alone, not overwritten
+  });
+
   // T4 PR1 (§5 case 13): both the "choose existing agent" follow-up card and
   // the free-text name prompt are DMs to the approver, so they must carry the
   // approver DM's own instance too — same defect, two more sites in index.ts.

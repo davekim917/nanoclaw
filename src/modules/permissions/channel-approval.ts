@@ -52,6 +52,7 @@ import { insertOrAdopt } from '../../db/insert-or-adopt.js';
 import { getChannelAdapter } from '../../channels/channel-registry.js';
 import { channelNameProvenance, getMessagingGroup, updateMessagingGroup } from '../../db/messaging-groups.js';
 import { getDeliveryAdapter } from '../../delivery.js';
+import { groupFolderExistsOnDisk } from '../../group-folder.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { log } from '../../log.js';
 import { conversationDisplayName, formatParticipantList } from '../../channels/adapter.js';
@@ -464,7 +465,13 @@ export async function createNewAgentGroup(name: string): Promise<AgentGroup> {
 
   let allocated = false;
   for (let attempt = 1; attempt <= FOLDER_ALLOCATION_ATTEMPTS && !allocated; attempt++) {
-    while (await getAgentGroupByFolder(folder)) {
+    // Disk-aware dedupe: a folder present on disk with no claiming DB row is
+    // deleted-group residue (or a dangling symlink — groupFolderExistsOnDisk
+    // uses lstat, not existsSync, so it still counts as present). Adopting it
+    // would silently re-scope the old group's data under the new agent's
+    // identity, so skip to the next suffix instead — same behavior as the
+    // agent-reachable minted-name path (templates/create-agent.ts).
+    while ((await getAgentGroupByFolder(folder)) || groupFolderExistsOnDisk(folder)) {
       folder = `${baseFolder}-${suffix}`;
       suffix++;
     }
