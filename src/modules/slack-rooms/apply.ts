@@ -21,13 +21,17 @@
  * and only adds the newcomer's row. Upstream's "the room moved" notice has no
  * analogue here.
  *
- * PARTIAL FAILURE. The Slack call happens first and the rows follow. A failure
- * between them leaves a real Slack channel with some rows missing, which the
- * agent is told about verbatim — re-running the same request adopts the
- * existing rows (`insertOrAdopt`) and re-invites idempotently
- * (`already_in_channel` is swallowed), so the recovery is "ask again".
+ * PARTIAL FAILURE, and why create_room adopts. Slack refuses a second channel
+ * with the same name (`name_taken`), so a naive retry after a half-finished
+ * create can never complete: the channel exists, the rows do not, and every
+ * re-run dies on the name. create_room therefore looks for the room in the
+ * caller's own candidate set FIRST and adopts it, and the rows are written
+ * BEFORE the invites so that a create which succeeded is immediately
+ * findable. What remains is a one-write window — a create that succeeds and a
+ * first row insert that does not leaves an orphan channel — and the agent is
+ * told exactly that rather than told to retry into `name_taken`.
  */
-import { createConversation, inviteUsers } from '../../channels/slack.js';
+import { createConversation, inviteUsers, isSlackNameTaken, setConversationPurpose } from '../../channels/slack.js';
 import { resolveUnknownSenderPolicy } from '../../channels/channel-defaults.js';
 import { insertOrAdopt } from '../../db/insert-or-adopt.js';
 import {
@@ -43,7 +47,7 @@ import { pickApprover } from '../approvals/primitive.js';
 import { resolveOperatorSlackUserId } from '../../slack-user-identity.js';
 import { ROOM_PLATFORM_ID_KEY } from './guard.js';
 import { RESOLVED_PARTICIPANTS_KEY, RESOLVED_ROOM_NAME_KEY } from './request.js';
-import { RoomActionError, resolveRoomByPlatformId, type RoomParticipant } from './resolve.js';
+import { RoomActionError, findRoomsByName, resolveRoomByPlatformId, type RoomParticipant } from './resolve.js';
 
 function randomSuffix(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -120,6 +124,7 @@ async function wireParticipant(
 
 export async function handleCreateRoom(content: Record<string, unknown>, session: Session): Promise<void> {
   const name = String(content.name);
+  const purpose = typeof content.purpose === 'string' ? content.purpose : '';
   const participants = (content[RESOLVED_PARTICIPANTS_KEY] as RoomParticipant[] | undefined) ?? [];
 
   try {
@@ -127,17 +132,45 @@ export async function handleCreateRoom(content: Record<string, unknown>, session
     const creator = participants[0]!;
     const operator = await operatorSlackUserId(session.agent_group_id, creator.channelType);
 
-    const room = await createConversation(creator.channelType, { name, isPrivate: true });
+    // Adopt before creating. A room this caller already has under this name is
+    // either a finished room being asked for twice or the residue of a run
+    // that created the channel and then failed; both want the same thing, and
+    // neither can be reached by calling conversations.create again.
+    const existing = await findRoomsByName(session.agent_group_id, name);
+    if (existing.length > 1) {
+      throw new RoomActionError(
+        `"${name}" already names ${existing.length} of your rooms (${existing
+          .map((r) => r.platformId)
+          .join(', ')}) — pick a different name.`,
+      );
+    }
+    const adopted = existing[0];
+    const room = adopted
+      ? { channelId: adopted.platformId.slice('slack:'.length), name: adopted.name || name }
+      : await createConversation(creator.channelType, { name, isPrivate: true }).catch((err: unknown) => {
+          if (!isSlackNameTaken(err)) throw err;
+          throw new RoomActionError(
+            `Slack already has a channel named "${name}" that is not wired to you. Pick a different name, or ` +
+              `ask the operator to wire the existing channel (the slack-a2a-rooms skill has the commands).`,
+          );
+        });
+
+    const platformId = `slack:${room.channelId}`;
+    // Rows BEFORE invites: a channel that exists but is in no row is
+    // unreachable by a retry, while a channel whose rows exist is adopted by
+    // the branch above however far the invites got.
+    for (const participant of participants) {
+      await wireParticipant(participant, platformId, room.name);
+    }
+
     const invitees = [
       ...participants.filter((p) => p.agentGroupId !== creator.agentGroupId).map((p) => p.botUserId),
       ...(operator ? [operator] : []),
     ];
     await inviteUsers(creator.channelType, room.channelId, invitees);
-
-    const platformId = `slack:${room.channelId}`;
-    for (const participant of participants) {
-      await wireParticipant(participant, platformId, room.name);
-    }
+    // Best effort, and only on a room this call created — overwriting the
+    // purpose of a room that already existed is not what "create" asked for.
+    const purposeApplied = adopted ? false : await setConversationPurpose(creator.channelType, room.channelId, purpose);
 
     const members = participants.map((p) => p.agentGroupName).join(', ');
     const mentions = participants
@@ -147,13 +180,17 @@ export async function handleCreateRoom(content: Record<string, unknown>, session
     await notifyAgent(
       session,
       `Room "${room.name}" is live (${platformId}) with ${members}${operator ? ' and the operator' : ''}` +
-        `${operator ? '' : ' — no approver with a Slack identity in your workspace was found, so it holds bots only'}. ` +
+        `${operator ? '' : ' — no approver with a Slack identity in your workspace was found, so it holds bots only'}` +
+        `${adopted ? ' — it already existed and everyone missing from it has now been wired and invited' : ''}` +
+        `${purpose && !purposeApplied && !adopted ? ' — Slack would not accept the purpose line, so the room has none' : ''}. ` +
         `Everyone is wired, so post a short introduction there now in your own voice, tagging each agent ` +
         `literally (${mentions}) — the tags render as mentions and are how you engage them in that room.`,
     );
     log.info('create_room completed', {
       platformId,
       roomName: room.name,
+      adopted: Boolean(adopted),
+      purposeApplied,
       participantCount: participants.length,
       agentGroupId: session.agent_group_id,
     });
@@ -173,8 +210,11 @@ export async function handleAddToRoom(content: Record<string, unknown>, session:
 
   try {
     const target = participants[1];
-    const caller = participants[0];
-    if (!caller || !target) throw new RoomActionError('participants were not resolved');
+    // participants[0] is a bot already IN the room (resolve.ts::roomInviter),
+    // which is not always the caller: a room wired only to a sibling is a
+    // legitimate candidate, and the caller's own bot is not a member of it.
+    const inviter = participants[0];
+    if (!inviter || !target) throw new RoomActionError('participants were not resolved');
 
     // Re-read by ID, never by name: the approval bound to this conversation.
     const room = await resolveRoomByPlatformId(session.agent_group_id, platformId);
@@ -183,9 +223,9 @@ export async function handleAddToRoom(content: Record<string, unknown>, session:
       return;
     }
 
-    // The INVITE goes out on the caller's bot — the caller is a member of the
-    // room and the newcomer is not, so it is the only side that can invite.
-    await inviteUsers(caller.channelType, platformId.slice('slack:'.length), [target.botUserId]);
+    // conversations.invite only works from a member, so it goes out on the
+    // inviter's bot.
+    await inviteUsers(inviter.channelType, platformId.slice('slack:'.length), [target.botUserId]);
     await wireParticipant(target, platformId, room.name || roomName);
 
     await notifyAgent(

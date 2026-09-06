@@ -182,6 +182,69 @@ export async function candidateRooms(callerAgentGroupId: string): Promise<Candid
   return [...byPlatformId.values()];
 }
 
+/**
+ * A Slack channel id supplied where a room name is expected, canonicalized to
+ * the `slack:C…` form `messaging_groups.platform_id` carries — or null when
+ * the value is an ordinary name.
+ *
+ * The ambiguity error tells the agent to name the room by its channel id, and
+ * the tool's own description repeats that, so the id has to arrive through the
+ * PUBLIC `room` argument: it is the only field the tool emits. Accepting it
+ * there is safe for the same reason accepting a stamped id is — the result is
+ * checked against the caller's candidate set, so an id is a shortcut past name
+ * resolution and never past authorization.
+ *
+ * Slack ids are `C…` for public channels and `G…` for the private ones this
+ * module creates; `D…` (a DM) is deliberately not accepted, because a DM is
+ * never a room.
+ */
+export function parseSlackChannelId(value: string): string | null {
+  const bare = value.trim().replace(/^slack:/, '');
+  return /^[CG][A-Z0-9]{2,}$/.test(bare) ? `slack:${bare}` : null;
+}
+
+/**
+ * The bot that will do the inviting for an existing room, and its workspace.
+ *
+ * NOT the caller's bot. A room reaches the candidate set when it is wired to
+ * the caller OR to a sibling, and in the second case the caller's own bot is
+ * not a member of that Slack channel at all — inviting through it fails with
+ * `not_in_channel`. Siblings deliberately keep separate bot identities, so
+ * sharing a workgroup never implies sharing channel membership. The room's own
+ * rows are the authoritative record of which bots are in it, so the inviter is
+ * picked from them, and the room's workspace (not the caller's) is what the
+ * newcomer has to match.
+ *
+ * The caller is preferred when it IS in the room — it is the bot the human is
+ * talking to, so its failures are the ones the agent can explain.
+ */
+export function roomInviter(
+  room: CandidateRoom,
+  callerAgentGroupId: string,
+  bots: ReadonlyMap<string, SlackBotIdentity> = getKnownSlackBots(),
+): RoomParticipant {
+  const rows = room.rows.filter((r) => bots.has(r.instance ?? r.channel_type));
+  if (rows.length === 0) {
+    throw new RoomActionError(
+      `no bot in room ${room.platformId} is running on this host, so nobody can invite into it ` +
+        `(rows: ${room.rows.map((r) => r.instance ?? r.channel_type).join(', ') || 'none'})`,
+    );
+  }
+  return {
+    agentGroupId: callerAgentGroupId,
+    agentGroupName: 'room member',
+    channelType: rows[0]!.instance ?? rows[0]!.channel_type,
+    botUserId: bots.get(rows[0]!.instance ?? rows[0]!.channel_type)!.userId,
+    teamId: bots.get(rows[0]!.instance ?? rows[0]!.channel_type)!.teamId,
+  };
+}
+
+/** Rooms in the caller's candidate set carrying this name. Never throws. */
+export async function findRoomsByName(callerAgentGroupId: string, roomName: string): Promise<CandidateRoom[]> {
+  const wanted = roomKey(roomName);
+  return (await candidateRooms(callerAgentGroupId)).filter((room) => roomKey(room.name) === wanted);
+}
+
 /** `"ops room"` and `"Ops-Room"` name the same room. Slack normalizes too. */
 function roomKey(name: string): string {
   return normalizeName(name);
@@ -197,8 +260,7 @@ function roomKey(name: string): string {
  * a conversation the requester never meant.
  */
 export async function resolveRoomByName(callerAgentGroupId: string, roomName: string): Promise<CandidateRoom> {
-  const wanted = roomKey(roomName);
-  const matches = (await candidateRooms(callerAgentGroupId)).filter((room) => roomKey(room.name) === wanted);
+  const matches = await findRoomsByName(callerAgentGroupId, roomName);
   if (matches.length === 0) {
     throw new RoomActionError(
       `no Slack room named "${roomName}" is wired to you or to another agent in your workgroup`,

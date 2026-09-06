@@ -27,7 +27,8 @@ vi.mock('../env.js', () => ({
   readEnvFile: () => ({}),
 }));
 
-const { createConversation, inviteUsers, UnknownSlackInstanceError } = await import('./slack.js');
+const { createConversation, inviteUsers, isSlackNameTaken, setConversationPurpose, UnknownSlackInstanceError } =
+  await import('./slack.js');
 const { SlackApiError } = await import('./slack-lib.js');
 
 type Call = { token: string; method: string; body: Record<string, unknown>; step: string };
@@ -142,5 +143,38 @@ describe('inviteUsers', () => {
     const err = await inviteUsers('slack-alpha', 'C100', ['U1'], api).catch((e: unknown) => e);
     expect(String(err)).toContain('channel_not_found');
     expect(String(err)).not.toContain('xoxb-');
+  });
+});
+
+describe('setConversationPurpose', () => {
+  it('sets the trimmed purpose on the named instance token', async () => {
+    const { calls, api } = recorder({ 'conversations.setPurpose': { ok: true } });
+
+    expect(await setConversationPurpose('slack-alpha', 'C100', '  ship the release  ', api)).toBe(true);
+    expect(calls[0]!.token).toBe('xoxb-alpha');
+    expect(calls[0]!.body).toEqual({ channel: 'C100', purpose: 'ship the release' });
+  });
+
+  it('is a no-op for an empty purpose', async () => {
+    const { calls, api } = recorder({});
+
+    expect(await setConversationPurpose('slack-alpha', 'C100', '   ', api)).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  it('reports failure instead of throwing — a room without its purpose line is still the room', async () => {
+    const api = async (_t: string, method: string, _b: Record<string, unknown>, step: string) => {
+      throw new SlackApiError(step, `slack ${method} failed: missing_scope`);
+    };
+
+    expect(await setConversationPurpose('slack-alpha', 'C100', 'x', api)).toBe(false);
+  });
+});
+
+describe('isSlackNameTaken', () => {
+  it('recognizes the one error that means "adopt, do not create"', () => {
+    expect(isSlackNameTaken(new SlackApiError('s', 'slack conversations.create failed: name_taken'))).toBe(true);
+    expect(isSlackNameTaken(new SlackApiError('s', 'slack conversations.create failed: invalid_name'))).toBe(false);
+    expect(isSlackNameTaken(new Error('name_taken'))).toBe(false);
   });
 });

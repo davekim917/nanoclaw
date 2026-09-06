@@ -45,8 +45,10 @@ import {
   callerParticipant,
   participantForAgentGroup,
   resolveAgentByName,
+  parseSlackChannelId,
   resolveRoomByName,
   resolveRoomByPlatformId,
+  roomInviter,
   type CandidateRoom,
   type RoomParticipant,
 } from './resolve.js';
@@ -165,18 +167,27 @@ export async function validateAddToRoom(content: Record<string, unknown>, sessio
   try {
     const callerGroup = await getAgentGroup(session.agent_group_id);
     if (!callerGroup) throw new RoomActionError('source agent group not found');
-    const caller = await callerParticipant(session);
 
-    // Case 12: bind to the id when one is already stamped. Validated against
-    // the live candidate set either way, so this is a shortcut past NAME
-    // resolution and never past authorization.
-    const room: CandidateRoom = stampedRoomId
-      ? await resolveRoomByPlatformId(session.agent_group_id, stampedRoomId)
+    // Three ways to name the room, all landing on the same candidate-set
+    // check. A stamped id is case 12 (an approved replay binds to the room
+    // that was carded, never to the name). An id in the PUBLIC `room`
+    // argument is the recovery the ambiguity error itself prescribes — it is
+    // the only field the tool emits, so refusing it there would make that
+    // advice impossible to follow. Otherwise the name resolves.
+    const suppliedId = stampedRoomId || parseSlackChannelId(roomArg);
+    const room: CandidateRoom = suppliedId
+      ? await resolveRoomByPlatformId(session.agent_group_id, suppliedId)
       : await resolveRoomByName(session.agent_group_id, roomArg);
 
+    // The INVITER is a bot already in that room, not necessarily the caller:
+    // a room reaches the candidate set when it is wired to the caller OR to a
+    // sibling, and siblings keep separate bot identities, so sharing a
+    // workgroup never implies sharing channel membership. The room's
+    // workspace, not the caller's, is therefore what the newcomer must match.
+    const inviter = roomInviter(room, session.agent_group_id);
     const targetGroup = await resolveAgentByName(session.agent_group_id, agentArg);
-    const target = await participantForAgentGroup(targetGroup, caller.teamId);
-    assertSameWorkspace([caller, target]);
+    const target = await participantForAgentGroup(targetGroup, inviter.teamId);
+    assertSameWorkspace([inviter, target]);
 
     content.room = roomArg || room.name;
     content.agent = agentArg;
@@ -185,7 +196,7 @@ export async function validateAddToRoom(content: Record<string, unknown>, sessio
     content[TARGET_WORKGROUP_KEY] = workgroupOf(targetGroup);
     content[ROOM_PLATFORM_ID_KEY] = room.platformId;
     content[RESOLVED_ROOM_NAME_KEY] = room.name;
-    content[RESOLVED_PARTICIPANTS_KEY] = [caller, target];
+    content[RESOLVED_PARTICIPANTS_KEY] = [inviter, target];
     return true;
   } catch (err) {
     return refuse(session, 'add_to_room', err);
