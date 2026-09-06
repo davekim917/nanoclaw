@@ -504,6 +504,80 @@ describe('durable stop intent', () => {
     expect(await storedIntent('sess-pending-adoption')).toBe('respawn_after_stop');
   });
 
+  it('a plain stop row is cleared by the boot pass once the respawn promises are handled (#474)', async () => {
+    await seedSession('sess-stopped-1');
+    await seedSession('sess-stopped-2');
+    await setStopIntent('sess-stopped-1', 'stop', STAMP);
+    await setStopIntent('sess-stopped-2', 'stop', STAMP);
+
+    const woke: string[] = [];
+    await honorPendingStopIntents(
+      async (session) => {
+        woke.push(session.id);
+        return true;
+      },
+      () => false,
+    );
+
+    // Nothing was owed: the stop each row recorded was honoured by the exit.
+    expect(woke).toEqual([]);
+    expect(await storedIntent('sess-stopped-1')).toBeNull();
+    expect(await storedIntent('sess-stopped-2')).toBeNull();
+    expect(
+      vi.mocked(log.info).mock.calls.filter((call) => call[0] === 'Cleared honoured stop intents at startup'),
+    ).toEqual([['Cleared honoured stop intents at startup', { cleared: 2, deferredPendingAdoption: 0 }]]);
+  });
+
+  it('the clear leaves a respawn_after_stop row alone', async () => {
+    await seedSession('sess-stopped');
+    await seedSession('sess-owed');
+    await setStopIntent('sess-stopped', 'stop', STAMP);
+    await setStopIntent('sess-owed', 'respawn_after_stop', STAMP);
+
+    // The respawn wake fails, so its promise must stand for the next boot while
+    // the plain row beside it is cleared.
+    await honorPendingStopIntents(
+      async () => false,
+      () => false,
+    );
+
+    expect(await storedIntent('sess-stopped')).toBeNull();
+    expect(await storedIntent('sess-owed')).toBe('respawn_after_stop');
+  });
+
+  it('the clear leaves a plain stop row alone while its session awaits adoption', async () => {
+    await seedSession('sess-stopped');
+    await seedSession('sess-pending-stop');
+    await setStopIntent('sess-stopped', 'stop', STAMP);
+    await setStopIntent('sess-pending-stop', 'stop', STAMP);
+    // Its container is alive and not yet re-fenced: the row is not evidence of
+    // anything this pass may act on, and stays for the next one.
+    _markPendingAdoptionForTesting('sess-pending-stop');
+
+    await honorPendingStopIntents(
+      async () => true,
+      () => false,
+    );
+
+    expect(await storedIntent('sess-stopped')).toBeNull();
+    expect(await storedIntent('sess-pending-stop')).toBe('stop');
+    expect(
+      vi.mocked(log.info).mock.calls.filter((call) => call[0] === 'Cleared honoured stop intents at startup'),
+    ).toEqual([['Cleared honoured stop intents at startup', { cleared: 1, deferredPendingAdoption: 1 }]]);
+  });
+
+  it('a boot with no plain stop rows logs no clear', async () => {
+    await seedSession('sess-owed');
+    await setStopIntent('sess-owed', 'respawn_after_stop', STAMP);
+
+    await honorPendingStopIntents(
+      async () => false,
+      () => false,
+    );
+
+    expect(loggedAt('info', 'Cleared honoured stop intents at startup')).toBe(false);
+  });
+
   it('a wake in flight across the kill does not clear the intent', async () => {
     await seedSession('sess-inflight');
 

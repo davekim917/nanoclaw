@@ -3203,9 +3203,13 @@ export async function reconcileSurvivorWakeRows(session: Session): Promise<{ con
  * clears only once the respawn wake actually succeeds, so a failed wake is
  * retried at the next startup while the sweep retries it sooner.
  *
- * A plain `'stop'` intent is left where it is. The container is already down
- * and nothing is owed; the row is one upsert per session of inert shadow state,
- * and clearing it here would cost a write per boot to no end.
+ * A plain `'stop'` intent is honoured by the time this runs — by the process
+ * exit that recorded it, by the boot door, or by the wake that later gave the
+ * session a container again, which never touches the row — so every plain
+ * row this pass reads is cleared after the respawn promises are handled
+ * (#474). Left alone, the rows accumulate one per session and the table stops
+ * being evidence of anything. A session still awaiting claim-fenced adoption
+ * keeps its row: its container is alive and not yet re-fenced.
  *
  * `wake` and `hasContainer` are injected with their production defaults. The
  * second exists because the branch it selects is the one an interrupted restart
@@ -3264,6 +3268,36 @@ export async function honorPendingStopIntents(
       await respawn();
     }
   }
+  await clearHonouredStopIntents(intents);
+}
+
+/**
+ * Clear the plain `'stop'` rows the boot pass read, in one conditional write
+ * (#474). Conditional on the value still being `'stop'`, so a row a kill
+ * re-armed to `respawn_after_stop` since the read is never flattened; scoped to
+ * the ids read, so a `'stop'` recorded after the read is left for the next
+ * boot. Never a row whose session is pending adoption.
+ */
+async function clearHonouredStopIntents(intents: SessionClaimRow[]): Promise<void> {
+  const plain = intents.filter((intent) => intent.stop_intent === 'stop');
+  const honoured = plain
+    .filter((intent) => !pendingAdoptions.has(intent.session_id))
+    .map((intent) => intent.session_id);
+  if (honoured.length === 0) return;
+  let cleared = 0;
+  await shadowWrite('stop-intent-clear', async () => {
+    const result = await getDb().run(
+      `UPDATE session_claims SET stop_intent = NULL, updated_at = ?
+         WHERE stop_intent = 'stop' AND session_id IN (${honoured.map(() => '?').join(', ')})`,
+      new Date().toISOString(),
+      ...honoured,
+    );
+    cleared = result.changes;
+  });
+  log.info('Cleared honoured stop intents at startup', {
+    cleared,
+    deferredPendingAdoption: plain.length - honoured.length,
+  });
 }
 
 /**
