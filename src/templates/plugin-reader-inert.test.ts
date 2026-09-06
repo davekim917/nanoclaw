@@ -62,7 +62,7 @@ const GUARD_SITE_FILES = new Set([
   // The self-mod approval apply path writes the same map and shares the
   // centralised refusal (assertMcpServerNotPluginOwned) — Codex on #486.
   'modules/self-mod/apply.ts',
-  'modules/self-mod/apply.test.ts',
+  'modules/self-mod/apply-plugin-owned.test.ts',
 ]);
 
 describe('Agent Plugins reader leaves have zero callers (T5 PR 1 — inert by design)', () => {

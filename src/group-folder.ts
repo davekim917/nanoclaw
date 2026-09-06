@@ -60,6 +60,12 @@ export function resolveGroupFolderPath(folder: string): string {
 export function groupFolderExistsOnDisk(folder: string): boolean {
   const groupPath = path.resolve(GROUPS_DIR, folder);
   ensureWithinBase(GROUPS_DIR, groupPath);
+  // A base-directory alias (`.`, `x/..`, `./`) resolves to GROUPS_DIR itself,
+  // which always exists — reporting it as occupied residue would tell the
+  // operator to move or remove every group's workspace (Codex on #486).
+  if (path.relative(GROUPS_DIR, groupPath) === '') {
+    throw new Error(`Invalid group folder "${folder}": names the groups directory itself`);
+  }
   // lstat, not existsSync: existsSync follows symlinks, so a dangling
   // symlink at groups/<folder> would read as absent even though it occupies
   // the name (mkdir would fail on it with EEXIST). lstat probes the entry
