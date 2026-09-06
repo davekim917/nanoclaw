@@ -231,7 +231,15 @@ export async function sendThreadMessage(
     const channelKey = threadChannelKey(threadId, (await readChannelDirectory()).known);
     const wired = (await wiredAgentsByChannel()).get(channelKey)?.find((a) => a.agent_group_id === agentGroupId);
     if (!wired) return { status: 409, body: { error: 'agent_not_wired_to_thread_channel', channel: channelKey } };
-    const resolved = await resolveSession(agentGroupId, wired.messaging_group_id, threadId, wired.session_mode);
+    // An operator chose this exact conversation. Shared ingress wiring must
+    // not redirect the instruction into the channel-wide or agent-wide session.
+    const resolved = await resolveSession(agentGroupId, wired.messaging_group_id, threadId, 'per-thread');
+    if (
+      resolved.session.thread_id !== threadId ||
+      resolved.session.messaging_group_id !== wired.messaging_group_id ||
+      resolved.session.agent_group_id !== agentGroupId
+    )
+      return { status: 409, body: { error: 'session_destination_mismatch' } };
     sessionId = resolved.session.id;
     createdSession = resolved.created;
   }

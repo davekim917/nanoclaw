@@ -1538,6 +1538,51 @@ describe('dispatchResultText — unwrapped output fallback', () => {
     return { channelType, platformId, threadId: null, inReplyTo: null, quietStatus: false };
   }
 
+  it.each(['<message to="here">Completed</message>', 'Completed'])(
+    'preserves a fresh Observatory session thread for final output: %s',
+    async (text) => {
+      seedDestination('slack-main', 'slack', 'C-MAIN');
+      const db = getInboundDb();
+      db.run(
+        'CREATE TABLE IF NOT EXISTS session_routing (id INTEGER PRIMARY KEY, channel_type TEXT, platform_id TEXT, thread_id TEXT)',
+      );
+      db.run("INSERT OR REPLACE INTO session_routing VALUES (1, 'slack', 'C-MAIN', 'thread-observatory')");
+      insertMessage('dashboard-steer', 'chat', { text: 'Act in this thread', _via: 'dashboard' });
+      const context = extractRouting(getPendingMessages());
+      expect(context.threadId).toBe('thread-observatory');
+      await dispatchResultText(text, context);
+      expect(getUndeliveredMessages()[0].thread_id).toBe('thread-observatory');
+    },
+  );
+
+  it.each([null, 'explicit-thread'])(
+    'preserves explicit inbound routing over the origin fallback: %s',
+    async (threadId) => {
+      seedDestination('slack-main', 'slack', 'C-MAIN');
+      getInboundDb()
+        .prepare(
+          `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, thread_id, content)
+         VALUES ('routed', 'chat', ?, 'pending', 'C-MAIN', 'slack', ?, '{}')`,
+        )
+        .run(new Date().toISOString(), threadId);
+      await dispatchResultText('<message to="here">Completed</message>', {
+        ...routing('slack', 'C-MAIN'),
+        threadId: 'origin-thread',
+      });
+      expect(getUndeliveredMessages()[0].thread_id).toBe(threadId);
+    },
+  );
+
+  it('does not carry the origin thread into an unrouted other destination', async () => {
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+    seedDestination('slack-other', 'slack', 'C-OTHER');
+    await dispatchResultText('<message to="slack-other">Other room</message>', {
+      ...routing('slack', 'C-MAIN'),
+      threadId: 'origin-thread',
+    });
+    expect(getUndeliveredMessages()[0].thread_id).toBeNull();
+  });
+
   it('routes wrapped <message to=...> blocks to their named destinations', async () => {
     seedDestination('slack-main', 'slack', 'C-MAIN');
     seedDestination('discord-side', 'discord', 'chan-9');

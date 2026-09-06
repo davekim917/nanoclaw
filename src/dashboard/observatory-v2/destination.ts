@@ -54,6 +54,29 @@ export async function resolveDestination(
       )
     : undefined;
   const synthetic = !!threadId && (threadId.startsWith('session:') || threadId.startsWith('system:'));
+  // Headless spawn IDs are task IDs, not platform thread IDs. Require the
+  // durable child relation before using their session directly; a prefix is
+  // neither routing evidence nor authority.
+  const headless =
+    !synthetic && origin && origin.messaging_group_id === null && origin.thread_id === threadId
+      ? await getDb().get(
+          "SELECT 1 FROM tasks WHERE child_session_id=? AND task_id=? AND surface_mode='headless'",
+          origin.session_id,
+          threadId,
+        )
+      : undefined;
+  if (headless && origin) {
+    const permitted = groupVisible(ctx, origin.id) && (await canSend(ctx.user.id, origin.id)).ok;
+    return {
+      thread_id: threadId,
+      channel_name: null,
+      default_agent_group_id: permitted ? origin.id : null,
+      default_reason: permitted ? 'origin' : null,
+      error: permitted ? null : 'no_eligible_agent',
+      candidates: permitted ? [origin] : [],
+      ...(permitted ? { session_thread_id: origin.thread_id } : {}),
+    };
+  }
   const channelKey = synthetic
     ? (origin?.platform_id ?? source.channel_key)
     : threadId
@@ -107,10 +130,11 @@ export async function resolveDestination(
     if (
       !groupVisible(ctx, r.id) ||
       !(await canSend(ctx.user.id, r.id)).ok ||
-      result.candidates.some((c) => c.id === r.id)
+      result.candidates.some((c) => c.id === r.id) ||
+      (origin?.id === r.id && origin.messaging_group_id !== r.messaging_group_id)
     )
       continue;
-    result.candidates.push(origin?.id === r.id ? { ...r, session_id: origin.session_id } : r);
+    result.candidates.push(origin?.id === r.id ? origin : r);
   }
   const exactAgent = result.candidates.find((r) => r.id === source.agent_group_id);
   const ownerMatches = exactAgent

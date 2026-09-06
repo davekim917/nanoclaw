@@ -451,13 +451,8 @@ async function readSession(
     // rationale in src/modules/mailbox/read-only.ts).
     const read = readSessionInbound(location, (mailbox) => {
       const dupSeries = new Set(mailbox.listDuplicateLiveTaskSeriesIds());
-      // For duplicate series, return ALL live rows (not just MAX(seq)) so the
-      // hidden second fireable row is visible.
-      const dupRows: RawRow[] = [];
-      for (const seriesId of dupSeries) dupRows.push(...mailbox.listLiveTaskRowsForSeries(seriesId));
       return {
         dupSeries,
-        dupRows,
         latest: mailbox.listLatestRecurringSeriesRows(),
         oneOffs: mailbox.listLiveOneOffTaskRows(),
       };
@@ -465,7 +460,7 @@ async function readSession(
     // No mailbox on disk — nothing to contribute, and NOT an unreadable
     // session: absence is a complete answer, a failed read is not.
     if (!read) return { rows: [], searchByKey: {}, unreadable: 0 };
-    const { dupSeries, dupRows, latest, oneOffs } = read;
+    const { dupSeries, latest, oneOffs } = read;
 
     const outbound = readOutbound(location);
 
@@ -477,16 +472,11 @@ async function readSession(
       searchByKey[row.key] = searchTextFor(raw, row);
     };
 
-    // Duplicate series: every live row, all flagged.
-    for (const raw of dupRows) {
-      emit(raw, true);
-    }
-    // Latest-per-series recurring rows, skipping any series already emitted as
-    // duplicates (the MAX(seq) row of a dup series is one of the dupRows).
+    // One row per series locator. Multiple recurring successors still mark the
+    // series unhealthy, but cannot become duplicate React keys or controls.
     for (const raw of latest) {
       const seriesId = raw.series_id ?? raw.id;
-      if (dupSeries.has(seriesId)) continue;
-      emit(raw, false);
+      emit(raw, dupSeries.has(seriesId));
     }
     // One-off live rows (recurrence NULL), skipping dup series.
     for (const raw of oneOffs) {
