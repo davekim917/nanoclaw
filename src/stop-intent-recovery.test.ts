@@ -642,6 +642,41 @@ describe('durable stop intent', () => {
     expect(loggedAt('warn', 'Deferring stop intent — session awaits claim-fenced adoption')).toBe(false);
   });
 
+  it('an install-sized backlog of plain stop rows is cleared in one boot pass, the kept rows surviving', async () => {
+    // More rows than one statement could bind (two variables per row against
+    // SQLite's 32,766 limit): a single dynamic IN list would fail with "too
+    // many SQL variables" and clear nothing, at every boot.
+    const BACKLOG = 17_000;
+    await getDb().run(
+      `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?)
+       INSERT INTO session_claims (session_id, incarnation, stop_intent, updated_at)
+       SELECT 'sess-backlog-' || i, 0, 'stop', ? FROM n`,
+      BACKLOG,
+      STAMP,
+    );
+    await seedSession('sess-owed');
+    await setStopIntent('sess-owed', 'respawn_after_stop', STAMP);
+    await setStopIntent('sess-pending-stop', 'stop', STAMP);
+    _markPendingAdoptionForTesting('sess-pending-stop');
+
+    await honorPendingStopIntents(
+      async () => false,
+      () => false,
+    );
+
+    const remaining = await getDb().all<{ session_id: string; stop_intent: string }>(
+      'SELECT session_id, stop_intent FROM session_claims WHERE stop_intent IS NOT NULL ORDER BY session_id',
+    );
+    expect(remaining).toEqual([
+      { session_id: 'sess-owed', stop_intent: 'respawn_after_stop' },
+      { session_id: 'sess-pending-stop', stop_intent: 'stop' },
+    ]);
+    expect(loggedAt('warn', 'Failed to clear honoured stop intents at startup — left for the next boot')).toBe(false);
+    expect(
+      vi.mocked(log.info).mock.calls.filter((call) => call[0] === 'Cleared honoured stop intents at startup'),
+    ).toEqual([['Cleared honoured stop intents at startup', { cleared: BACKLOG, deferredPendingAdoption: 1 }]]);
+  });
+
   it('a boot with no plain stop rows logs no clear', async () => {
     await seedSession('sess-owed');
     await setStopIntent('sess-owed', 'respawn_after_stop', STAMP);

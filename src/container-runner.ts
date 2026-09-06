@@ -3287,6 +3287,9 @@ export async function honorPendingStopIntents(
  * acted on: the sweep re-issues a kill on its own evidence if one is still
  * warranted. `respawn_after_stop` rows keep the honour path above.
  */
+/** Rows per clear statement: two bound variables each, well inside SQLite's limit. */
+const STOP_INTENT_CLEAR_CHUNK = 400;
+
 async function clearHonouredStopIntents(
   intents: SessionClaimRow[],
   hasContainer: (sessionId: string) => boolean,
@@ -3295,22 +3298,43 @@ async function clearHonouredStopIntents(
   if (plain.length === 0) return;
   const pending = plain.filter((intent) => pendingAdoptions.has(intent.session_id));
   const honoured = plain.filter((intent) => !pendingAdoptions.has(intent.session_id));
-  for (const intent of honoured) {
-    if (hasContainer(intent.session_id)) {
-      log.info('Cleared a stale plain stop intent for an adopted survivor', { sessionId: intent.session_id });
-    }
-  }
   let cleared = 0;
   if (honoured.length > 0) {
-    await shadowWrite('stop-intent-clear', async () => {
-      const result = await getDb().run(
-        `UPDATE session_claims SET stop_intent = NULL, updated_at = ?
-           WHERE stop_intent = 'stop' AND (session_id, updated_at) IN (VALUES ${honoured.map(() => '(?, ?)').join(', ')})`,
-        new Date().toISOString(),
-        ...honoured.flatMap((intent) => [intent.session_id, intent.updated_at]),
-      );
-      cleared = result.changes;
-    });
+    // Bounded statements: one `(session_id, updated_at)` pair costs two bound
+    // variables, and one statement over an install's whole backlog would trip
+    // SQLite's bound-variable limit — then clear nothing, at every boot. The
+    // chunks run inside one transaction so the clear is all-or-nothing, and a
+    // failure is a WARN with the count, never a swallowed shadow write.
+    const now = new Date().toISOString();
+    /* eslint-disable no-catch-all/no-catch-all -- a failed clear must not block startup; it is reported and retried next boot */
+    try {
+      cleared = await centralTransaction(async () => {
+        let changes = 0;
+        for (let at = 0; at < honoured.length; at += STOP_INTENT_CLEAR_CHUNK) {
+          const chunk = honoured.slice(at, at + STOP_INTENT_CLEAR_CHUNK);
+          const result = await getDb().run(
+            `UPDATE session_claims SET stop_intent = NULL, updated_at = ?
+               WHERE stop_intent = 'stop' AND (session_id, updated_at) IN (VALUES ${chunk.map(() => '(?, ?)').join(', ')})`,
+            now,
+            ...chunk.flatMap((intent) => [intent.session_id, intent.updated_at]),
+          );
+          changes += result.changes;
+        }
+        return changes;
+      }, 'stop-intent-clear');
+    } catch (err) {
+      log.warn('Failed to clear honoured stop intents at startup — left for the next boot', {
+        rows: honoured.length,
+        err,
+      });
+      return;
+    }
+    /* eslint-enable no-catch-all/no-catch-all */
+    for (const intent of honoured) {
+      if (hasContainer(intent.session_id)) {
+        log.info('Cleared a stale plain stop intent for an adopted survivor', { sessionId: intent.session_id });
+      }
+    }
   }
   // Logged whenever a plain row was read, so a boot that deferred every one
   // of them reads as such rather than as a boot that had nothing to clear.
