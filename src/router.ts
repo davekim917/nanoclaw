@@ -34,6 +34,7 @@ import {
   getMessagingGroupWithAgentCount,
   updateMessagingGroup,
 } from './db/messaging-groups.js';
+import { centralTransaction } from './db/central-lease.js';
 import { insertOrAdopt } from './db/insert-or-adopt.js';
 import {
   claimChannelIngress,
@@ -114,6 +115,17 @@ async function unanimousToneFor(agentGroupId: string, channelType: string): Prom
   );
   return rows.length === 1 ? rows[0].tone : null;
 }
+
+/**
+ * The workspace stopped having exactly one incumbent between the auto-wire
+ * decision and its insert (#482).
+ *
+ * Thrown so the refusal leaves through the caller's existing "could not
+ * auto-wire" path — the operator approval gate — rather than duplicating that
+ * fall-through. Distinguished from a real failure at the catch, because a race
+ * lost on purpose is not an error to warn about.
+ */
+class AutoWireUniquenessLost extends Error {}
 
 async function inheritedAgentGroupFor(
   mg: MessagingGroup,
@@ -675,15 +687,33 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
           instructions_profile: null,
           created_at: new Date().toISOString(),
         };
+        // The uniqueness proof and the insert are ONE transaction (#482).
+        //
+        // `inheritedAgentGroupFor` refuses a workspace wired to more than one
+        // agent group — that refusal is the whole reason a second tenant's
+        // channel cannot be auto-claimed. But it ran before the tone lookup and
+        // before this insert, both of which await, and another channel in the
+        // same workspace can be wired to a DIFFERENT agent in that window. The
+        // insert would then connect a new channel to a stale incumbent, past a
+        // gate that has since started saying no, with no approval anywhere.
+        //
+        // So it is re-run here, on the lease that also carries the insert, and
+        // the row goes in only while its own precondition still holds. The
+        // check excludes this messaging group, so re-running it is idempotent.
+        //
         // Lookup-then-insert on the async driver: a concurrent route can win the
         // same wiring; adopt it instead of failing this message (seam 3 primitive).
-        await insertOrAdopt(
-          wiring,
-          async (candidate) => {
-            await createMessagingGroupAgent(candidate);
-          },
-          async () => (await getMessagingGroupAgents(mg.id)).find((w) => w.agent_group_id === inheritedAgent.id),
-        );
+        await centralTransaction(async () => {
+          const incumbent = await inheritedAgentGroupFor(mg);
+          if (!incumbent || incumbent.id !== inheritedAgent.id) throw new AutoWireUniquenessLost();
+          await insertOrAdopt(
+            wiring,
+            async (candidate) => {
+              await createMessagingGroupAgent(candidate);
+            },
+            async () => (await getMessagingGroupAgents(mg.id)).find((w) => w.agent_group_id === inheritedAgent.id),
+          );
+        }, 'auto-wire uniqueness proof + wiring insert');
         log.info('Workspace-trust auto-wire', {
           messagingGroupId: mg.id,
           inheritedFrom: inheritedAgent.sourceMessagingGroupId,
@@ -717,10 +747,19 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
         // Re-enter routing with the fresh wiring in place.
         return routeInboundClaimed(event, markReplayPending);
       } catch (err) {
-        log.warn('Workspace-trust auto-wire failed — falling through to approval', {
-          messagingGroupId: mg.id,
-          err: err instanceof Error ? err.message : String(err),
-        });
+        if (err instanceof AutoWireUniquenessLost) {
+          log.info('auto-wire refused: workspace uniqueness was lost before the wiring landed', {
+            messagingGroupId: mg.id,
+            channelType: event.channelType,
+            platformId: event.platformId,
+            candidate: inheritedAgent.id,
+          });
+        } else {
+          log.warn('Workspace-trust auto-wire failed — falling through to approval', {
+            messagingGroupId: mg.id,
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
       }
     }
 

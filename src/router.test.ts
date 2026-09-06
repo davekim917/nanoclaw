@@ -716,9 +716,23 @@ describe('workspace-trust auto-wire inherits voice and engagement defaults', () 
       all: async (sql: string) =>
         /DISTINCT/.test(sql)
           ? existingTones.map((tone) => ({ tone }))
-          : [{ agent_group_id: 'ag-1', messaging_group_id: 'mg-src', cnt: 3 }],
+          : (incumbentRows.shift() ?? [{ agent_group_id: 'ag-1', messaging_group_id: 'mg-src', cnt: 3 }]),
+      // The uniqueness proof and the wiring insert share one transaction
+      // (#482); the fake driver has to model the primitive that carries them.
+      transaction: async (fn: () => Promise<unknown>) => fn(),
     } as never);
   }
+
+  /**
+   * Successive answers for the workspace-incumbent lookup, consumed in order;
+   * once empty, every call gets the single-incumbent default. Lets a case
+   * answer the pre-await decision and the in-transaction re-check differently,
+   * which is the whole window #482 is about.
+   */
+  let incumbentRows: Array<Array<{ agent_group_id: string; messaging_group_id: string; cnt: number }>> = [];
+  beforeEach(() => {
+    incumbentRows = [];
+  });
 
   it('adopts the tone when every existing channel agrees', async () => {
     arrangeAutoWire(['engineering']);
@@ -759,6 +773,33 @@ describe('workspace-trust auto-wire inherits voice and engagement defaults', () 
     expect(createMessagingGroupAgent).toHaveBeenCalledWith(
       expect.objectContaining({ default_model: null, default_effort: null }),
     );
+  });
+
+  /**
+   * A second tenant's agent wired into the workspace mid-route must stop the
+   * auto-wire (#482).
+   *
+   * `inheritedAgentGroupFor` refuses a workspace wired to more than one agent
+   * group — that refusal is what keeps one tenant's agent from claiming
+   * another's channel. It ran before the tone lookup and the insert, both of
+   * which await, so the row could still land on a gate that had since started
+   * saying no. The check now shares the insert's transaction.
+   */
+  it('refuses to wire the stale incumbent when a second agent joins the workspace mid-route (#482)', async () => {
+    // Call 1 — the decision — sees one incumbent; call 2, inside the insert's
+    // transaction, sees the workspace the competing wiring left behind.
+    incumbentRows = [
+      [{ agent_group_id: 'ag-1', messaging_group_id: 'mg-src', cnt: 3 }],
+      [
+        { agent_group_id: 'ag-1', messaging_group_id: 'mg-src', cnt: 3 },
+        { agent_group_id: 'ag-2', messaging_group_id: 'mg-other', cnt: 1 },
+      ],
+    ];
+    arrangeAutoWire(['engineering']);
+
+    await routeInbound(makeChatEvent('@bot hello', { platformId: 'slack:CNEW' }));
+
+    expect(createMessagingGroupAgent).not.toHaveBeenCalled();
   });
 
   it('uses always-on accumulation for an auto-wired DM', async () => {
