@@ -4,17 +4,23 @@ import { getDb } from '../../../db/connection.js';
 import { equivalentSlackUserIds } from '../../../slack-user-identity.js';
 import { isAdminOfAgentGroup, isGlobalAdmin, isOwner } from './user-roles.js';
 
-export async function addMember(row: AgentGroupMember): Promise<void> {
-  await getDb().run(
-    `INSERT INTO agent_group_members (user_id, agent_group_id, added_by, added_at)
+/**
+ * The membership writes as SQL constants: executed on the driver by
+ * `addMember`/`removeMember`, and through `withRawDb` by `grant.ts`, whose
+ * grant/revoke apply the write in the same synchronous lease block as the
+ * caller's authority re-check (#460 round 2). One constant, two executors.
+ */
+export const ADD_MEMBER_SQL = `INSERT INTO agent_group_members (user_id, agent_group_id, added_by, added_at)
        VALUES (@user_id, @agent_group_id, @added_by, @added_at)
-       ON CONFLICT (user_id, agent_group_id) DO NOTHING`,
-    row,
-  );
+       ON CONFLICT (user_id, agent_group_id) DO NOTHING`;
+export const REMOVE_MEMBER_SQL = 'DELETE FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?';
+
+export async function addMember(row: AgentGroupMember): Promise<void> {
+  await getDb().run(ADD_MEMBER_SQL, row);
 }
 
 export async function removeMember(userId: string, agentGroupId: string): Promise<void> {
-  await getDb().run('DELETE FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?', userId, agentGroupId);
+  await getDb().run(REMOVE_MEMBER_SQL, userId, agentGroupId);
 }
 
 export async function getMembers(agentGroupId: string): Promise<AgentGroupMember[]> {

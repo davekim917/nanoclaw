@@ -54,27 +54,28 @@ const SCOPED_ROLE_SQL = 'SELECT 1 FROM user_roles WHERE user_id = ? AND role = ?
  * Grant a role. Owner rows must have agent_group_id = null (enforced here,
  * not by schema, so callers get a clean error path).
  */
+/**
+ * The role writes as SQL constants: executed on the driver by
+ * `grantRole`/`revokeRole`, and through `withRawDb` by `grant.ts`, whose
+ * grant/revoke apply the write in the same synchronous lease block as the
+ * caller's authority re-check (#460 round 2). One constant, two executors.
+ */
+export const GRANT_ROLE_SQL = `INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at)
+       VALUES (@user_id, @role, @agent_group_id, @granted_by, @granted_at)`;
+export const REVOKE_SCOPED_ROLE_SQL = 'DELETE FROM user_roles WHERE user_id = ? AND role = ? AND agent_group_id = ?';
+
 export async function grantRole(row: UserRole): Promise<void> {
   if (row.role === 'owner' && row.agent_group_id !== null) {
     throw new Error('owner role must be global (agent_group_id = null)');
   }
-  await getDb().run(
-    `INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at)
-       VALUES (@user_id, @role, @agent_group_id, @granted_by, @granted_at)`,
-    row,
-  );
+  await getDb().run(GRANT_ROLE_SQL, row);
 }
 
 export async function revokeRole(userId: string, role: UserRoleKind, agentGroupId: string | null): Promise<void> {
   if (agentGroupId === null) {
     await getDb().run('DELETE FROM user_roles WHERE user_id = ? AND role = ? AND agent_group_id IS NULL', userId, role);
   } else {
-    await getDb().run(
-      'DELETE FROM user_roles WHERE user_id = ? AND role = ? AND agent_group_id = ?',
-      userId,
-      role,
-      agentGroupId,
-    );
+    await getDb().run(REVOKE_SCOPED_ROLE_SQL, userId, role, agentGroupId);
   }
 }
 
