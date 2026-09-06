@@ -3,21 +3,11 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Agent Board</title>
-    <!--
-      color-scheme on the root element + the matching background colour avoids
-      a flash of the wrong ground before the bundled stylesheet (and React)
-      mount. Browsers use the meta to pick the scrollbar / form-control
-      palette; the inline values are the tom-modern canvas and ink, so first
-      paint already looks like the app.
-
-      No prefers-color-scheme branch: the app has ONE theme (see theme.css), and
-      a guard that flipped on the system setting would flash a ground the
-      stylesheet then contradicts.
-    -->
-    <meta name="color-scheme" content="light" />
+    <title>Observatory · Signal</title>
+    <!-- Match the Signal canvas before React and bundled fonts load. -->
+    <meta name="color-scheme" content="dark" />
     <style>
-      html, body { background: #fafafa; color: #27272a; margin: 0; }
+      html, body { background: #101112; color: #eef0f2; margin: 0; }
     </style>
   </head>
   <body>

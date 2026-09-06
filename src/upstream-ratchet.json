@@ -736,7 +736,7 @@
 "src/db/migrations/022-messaging-group-detached.ts":{"diff":22,"mode":"100644","sha256":null,"deleted":true},
 "src/db/migrations/023-approvals-instance.ts":{"diff":4,"mode":"100644","sha256":"f7da2d57511bb8da8848a42b2270ba685d2982a6969e9872b0e9a9f8029a83c7"},
 "src/db/migrations/024-host-coordination.ts":{"diff":72,"mode":"100644","sha256":null,"deleted":true},
-"src/db/migrations/index.ts":{"diff":424,"mode":"100644","sha256":"0340fa1f1e9957d7e9627c77c1ade94d8c417e482b2f8a5a52bda60119aa9d30"},
+"src/db/migrations/index.ts":{"diff":426,"mode":"100644","sha256":"990ed615b4c7e05e46b975e017a58ac458da10b481d5022bb469b8b7507d4a7b"},
 "src/db/migrations/module-agent-to-agent-destinations.ts":{"diff":0,"mode":"100644","sha256":"4b579c912260da065dde6549b19c76efa272edafaabb583106028362d6e35e2b"},
 "src/db/migrations/module-approvals-pending-approvals.ts":{"diff":0,"mode":"100644","sha256":"b91305e1eb527b7eda50e6a6744f990ed783505c5f909d4a77ca6d0ffd118950"},
 "src/db/migrations/module-approvals-title-options.ts":{"diff":0,"mode":"100644","sha256":"bc18ee398104bbbb9fda8611db192008b804c2e1cee94b9934ea8234e57a3102"},

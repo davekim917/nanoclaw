@@ -81,6 +81,7 @@ import { migration069 } from './069-messaging-group-name-source.js';
 // fork writers (plan §4.3).
 import { migration070 } from './070-messaging-group-detached-at.js';
 import { migration071 } from './071-host-coordination.js';
+import { migration072 } from './072-observatory-signal.js';
 // Upstream's 014/015 — file numbers clash with local but uniqueness is by `name`.
 // Aliased to avoid JS identifier collisions with the local 014/015 above.
 import { migration014 as containerConfigs } from './014-container-configs.js';
@@ -223,6 +224,7 @@ export const migrations: Migration[] = [
   // Shadow schema — four tables with zero fork writers. Creates no timestamp
   // for 053 to normalize, so its position relative to 053 is irrelevant.
   migration071,
+  migration072,
   // Last on purpose: normalizes whatever naive timestamps every migration
   // above has left behind (016's messaging_groups recreate copies created_at
   // through as-is).
