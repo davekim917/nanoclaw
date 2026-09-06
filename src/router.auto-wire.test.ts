@@ -51,14 +51,13 @@ vi.mock('./topic-title.js', async (importOriginal) => ({
 }));
 
 import {
-  initTestDb,
+  initMigratedTestDb,
   closeDb,
-  getRawDb,
-  runMigrations,
   createAgentGroup,
   createMessagingGroup,
   createMessagingGroupAgent,
 } from './db/index.js';
+import { getDb } from './db/connection.js';
 import type { InboundEvent } from './channels/adapter.js';
 
 // A Slack variant, so the channel type carries the workspace identity that
@@ -156,23 +155,30 @@ function mentionInNewRoom(): InboundEvent {
 }
 
 /** Every wiring row for the freshly created channel, whatever agent it names. */
-function wiringsForNewRoom(): Array<{ agent_group_id: string; default_tone: string | null }> {
-  return getRawDb()
-    .prepare(
-      `SELECT mga.agent_group_id, mga.default_tone
-         FROM messaging_group_agents mga
-         JOIN messaging_groups m ON m.id = mga.messaging_group_id
-        WHERE m.platform_id = ?`,
-    )
-    .all(NEW_PLATFORM_ID) as Array<{ agent_group_id: string; default_tone: string | null }>;
+async function wiringsForNewRoom(): Promise<Array<{ agent_group_id: string; default_tone: string | null }>> {
+  return getDb().all<{ agent_group_id: string; default_tone: string | null }>(
+    `SELECT mga.agent_group_id, mga.default_tone
+       FROM messaging_group_agents mga
+       JOIN messaging_groups m ON m.id = mga.messaging_group_id
+      WHERE m.platform_id = ?`,
+    NEW_PLATFORM_ID,
+  );
+}
+
+/** Destinations allocated for an agent group — one per channel it is wired to. */
+async function destinationCount(agentGroupId: string): Promise<number | undefined> {
+  const row = await getDb().get<{ n: number }>(
+    'SELECT COUNT(*) AS n FROM agent_destinations WHERE agent_group_id = ?',
+    agentGroupId,
+  );
+  return row?.n;
 }
 
 beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
   vi.clearAllMocks();
-  await initTestDb();
-  runMigrations(getRawDb());
+  await initMigratedTestDb();
 });
 
 afterEach(async () => {
@@ -190,13 +196,11 @@ describe('workspace-trust auto-wire, real insertion path', () => {
     // The row is the assertion. A writer that threw — reentrancy included —
     // is swallowed by the caller's fall-through, so only the DB can tell a
     // successful auto-wire from a silent refusal.
-    expect(wiringsForNewRoom()).toEqual([{ agent_group_id: AG_INCUMBENT, default_tone: 'engineering' }]);
+    expect(await wiringsForNewRoom()).toEqual([{ agent_group_id: AG_INCUMBENT, default_tone: 'engineering' }]);
     // And the companion destination the writer allocates in the same
     // transaction, which a caller that skipped the leaf would also have lost.
     // Two: one for the seeded incumbent channel, one for this new one.
-    expect(
-      getRawDb().prepare('SELECT COUNT(*) AS n FROM agent_destinations WHERE agent_group_id = ?').get(AG_INCUMBENT),
-    ).toEqual({ n: 2 });
+    expect(await destinationCount(AG_INCUMBENT)).toBe(2);
   });
 
   it('refuses when the workspace already holds wirings to two agent groups', async () => {
@@ -207,6 +211,6 @@ describe('workspace-trust auto-wire, real insertion path', () => {
     await routeInbound(mentionInNewRoom());
 
     // Falls through to the approval gate instead: no wiring, either way.
-    expect(wiringsForNewRoom()).toEqual([]);
+    expect(await wiringsForNewRoom()).toEqual([]);
   });
 });

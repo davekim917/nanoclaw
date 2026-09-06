@@ -422,3 +422,189 @@ describe('centralTransaction closures await only DB work', () => {
     ).toEqual([]);
   });
 });
+
+/**
+ * A callee reached from inside a `centralTransaction` closure must not open a
+ * `centralTransaction` of its own.
+ *
+ * The lease is deliberately not re-entrant: `assertLeaseNotHeld` throws
+ * `CentralLeaseReentrancyError` rather than deadlocking. That makes nesting a
+ * loud failure at the call — but only for callers that let it out. The shape
+ * that shipped as a P1 on #505 was `centralTransaction(async () => { await
+ * createMessagingGroupAgent(row); })`, where the callee is an ordinary exported
+ * writer that opens its own transaction: correct alone, correct for every
+ * caller outside a transaction, fatal here. The throw landed in the caller's
+ * existing "could not auto-wire" catch and every eligible channel fell through
+ * to the approval gate, so workspace-trust auto-wire would have been silently
+ * dead on main. Nothing in the type system says which functions carry a lease.
+ *
+ * The check above cannot see it. It classifies an awaited callee by its
+ * DECLARATION FILE, which for the offender is a perfectly ordinary DB module,
+ * and it only scans files whose text contains `.transaction(` — which
+ * `centralTransaction` callers usually do not.
+ *
+ * So this one selects files by `centralTransaction(`, and for every call inside
+ * such a closure resolves the callee's declaration and looks for a
+ * `centralTransaction` call in ITS body. One hop, deliberately: a full call
+ * graph would be far more machinery for a shape that has always been one
+ * import-and-call away. The fix is to split the callee — a lease-free inner
+ * function holding the statements, called by both the exported wrapper and the
+ * caller that already holds the lease (`createMessagingGroupAgentInTransaction`
+ * is that split).
+ */
+
+/**
+ * Callees allowed to open a transaction despite being reachable from inside
+ * one, each with the reason it is safe. EMPTY on purpose today: the fix for
+ * #505 was to split the writer rather than to except it, and
+ * `createMessagingGroupAgentInTransaction` needs no entry because it opens no
+ * lease. An entry belongs here only when the nesting call is provably
+ * unreachable while the lease is held — not when it merely looks unlikely.
+ */
+const NESTED_TRANSACTION_EXCEPTIONS: ReadonlyArray<{ callee: string; reason: string }> = [];
+
+interface NestingCall {
+  file: string;
+  line: number;
+  callee: string;
+  declaredIn: string;
+}
+
+/** Every src/ file that calls `centralTransaction`, tests included. */
+function centralTransactionFiles(): string[] {
+  const out: string[] = [];
+  const walk = (dir: string): void => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name.startsWith('.')) continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (
+        entry.isFile() &&
+        entry.name.endsWith('.ts') &&
+        /centralTransaction\s*\(/.test(fs.readFileSync(full, 'utf8'))
+      ) {
+        out.push(full);
+      }
+    }
+  };
+  walk(SRC_ROOT);
+  return out.sort();
+}
+
+/** Does this declaration's body call `centralTransaction`? */
+function bodyOpensCentralTransaction(declaration: ts.Declaration): boolean {
+  const body = ts.isVariableDeclaration(declaration) ? declaration.initializer : declaration;
+  if (!body) return false;
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (found) return;
+    if (
+      ts.isCallExpression(node) &&
+      ts.isIdentifier(node.expression) &&
+      node.expression.text === 'centralTransaction'
+    ) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(body, visit);
+  return found;
+}
+
+function nestingCallsInCentralTransactions(rootFiles: string[]): NestingCall[] {
+  const program = ts.createProgram(rootFiles, compilerOptions());
+  const checker = program.getTypeChecker();
+  const rootSet = new Set(rootFiles.map((f) => path.resolve(f)));
+  const results: NestingCall[] = [];
+
+  for (const sourceFile of program.getSourceFiles()) {
+    if (!rootSet.has(path.resolve(sourceFile.fileName))) continue;
+    const rel = toRel(sourceFile.fileName);
+    let depth = 0;
+    const visit = (node: ts.Node): void => {
+      let pushed = false;
+      const opensBlock =
+        ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'centralTransaction';
+      if (opensBlock) {
+        const closure = (node as ts.CallExpression).arguments.find(
+          (a) => ts.isArrowFunction(a) || ts.isFunctionExpression(a),
+        );
+        if (closure) {
+          depth += 1;
+          pushed = true;
+        }
+      }
+      // Skip the block-opening call itself: it is the lease, not a nested one.
+      if (depth > 0 && !opensBlock && ts.isCallExpression(node)) {
+        const target = ts.isPropertyAccessExpression(node.expression) ? node.expression.name : node.expression;
+        if (ts.isIdentifier(target)) {
+          // Resolve through the import: `getSymbolAtLocation` on an imported
+          // name yields the ALIAS, whose only declaration is the
+          // `ImportSpecifier` in THIS file. Following it is the difference
+          // between reading the callee's body and reading the import line —
+          // and every call this rule exists to catch is an imported one.
+          let symbol = checker.getSymbolAtLocation(target);
+          if (symbol && symbol.flags & ts.SymbolFlags.Alias) symbol = checker.getAliasedSymbol(symbol);
+          const declaration = symbol?.declarations?.[0];
+          if (declaration && bodyOpensCentralTransaction(declaration)) {
+            results.push({
+              file: rel,
+              line: sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1,
+              callee: target.text,
+              declaredIn: toRel(declaration.getSourceFile().fileName),
+            });
+          }
+        }
+      }
+      ts.forEachChild(node, visit);
+      if (pushed) depth -= 1;
+    };
+    ts.forEachChild(sourceFile, visit);
+  }
+  return results;
+}
+
+describe('nothing called from inside a centralTransaction opens another one', () => {
+  const fixtureDir = path.join(SRC_ROOT, 'db', 'transaction-fixtures');
+
+  it('flags the nesting fixture and clears the participating one', () => {
+    const found = nestingCallsInCentralTransactions([path.join(fixtureDir, 'nesting-callee.ts')]);
+    // Non-vacuous: exactly the one offending call, and nothing else in a file
+    // that also holds a correct closure calling a lease-free leaf.
+    expect(found.map((c) => c.callee)).toEqual(['opensItsOwnTransaction']);
+  });
+
+  it('no production centralTransaction closure calls a callee that opens its own', () => {
+    const offenders = nestingCallsInCentralTransactions(centralTransactionFiles())
+      .filter((c) => !isExcluded(c.file))
+      .filter((c) => !NESTED_TRANSACTION_EXCEPTIONS.some((e) => e.callee === c.callee))
+      .map((c) => `${c.file}:${c.line} calls ${c.callee}() (declared in ${c.declaredIn}), which opens its own`);
+    expect(
+      offenders,
+      'a centralTransaction closure calls a function that opens a centralTransaction of its own. The lease ' +
+        'is not re-entrant, so this throws CentralLeaseReentrancyError at run time — and if the call site has ' +
+        'a catch, the feature dies silently instead. Split the callee: a lease-free inner function holding the ' +
+        'statements, called by both the exported wrapper and this caller (see ' +
+        'createMessagingGroupAgentInTransaction). Except it here only if the nesting call is provably ' +
+        'unreachable while the lease is held.',
+    ).toEqual([]);
+  });
+
+  it('lists real, unique exceptions with a reason each', () => {
+    const callees = NESTED_TRANSACTION_EXCEPTIONS.map((e) => e.callee);
+    expect(new Set(callees).size).toBe(callees.length);
+    expect(NESTED_TRANSACTION_EXCEPTIONS.filter((e) => e.reason.trim() === '')).toEqual([]);
+  });
+
+  it('scans the files the other checks miss, so the rule is not vacuous', () => {
+    const files = centralTransactionFiles().map(toRel);
+    // `src/router.ts` holds the auto-wire that shipped the P1 and contains no
+    // `.transaction(` text at all, so the receiver-based file selection above
+    // never looks at it. If this stops being true the two selections have
+    // converged and this check's separate walk can go.
+    expect(files).toContain('src/router.ts');
+    expect(transactionCallFiles().map(toRel)).not.toContain('src/router.ts');
+    expect(files.length).toBeGreaterThan(10);
+  });
+});
