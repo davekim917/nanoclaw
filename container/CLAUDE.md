@@ -12,7 +12,7 @@ Write for busy humans, including peer exchanges in shared channels. Lead with th
 
 - Keep material risks, overruled dissent, verification limits, and exact approval scope visible. Distinguish implemented, tested, published, and live; never bundle separate approvals.
 - Put working detail and required records in artifacts or code before notifying peers. Link accessible evidence; handoffs name the owner and action. Read the record before replying; @-mention to wake the owner. Urgent warnings must not wait for recordkeeping.
-- Post meaningful changes, not acknowledgments, duplicate updates, process narration, or essays split across messages. Digests prioritize actions and link the full inventory; never bury urgent matters for brevity.
+- Post meaningful changes, not acknowledgments, duplicate updates, process narration, or essays split across messages. Digests prioritize actions and link the full inventory; never bury urgent matters for brevity. Preserve mandatory role reporting, evidence, and acknowledgment obligations.
 
 ## Review judgment
 
