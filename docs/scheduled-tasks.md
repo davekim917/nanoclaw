@@ -95,22 +95,62 @@ or:
 - `wakeAgent: false` completes the run without calling the model.
 - `wakeAgent: true` wakes the agent and adds `data` to its prompt.
 
-Scripts run with Bash, a 30-second timeout, and a 1 MB output limit. The JSON
+Scripts run with Bash, a 120-second default timeout (overridden by
+`NANOCLAW_TASK_SCRIPT_TIMEOUT_MS`), and a 1 MB output limit. The JSON
 decision must be the final line written to standard output. Keep `data` small
 and include only what the agent needs.
 
-For example, save this as `check-marker.sh`:
+For example, have the producer atomically replace the marker with a new opaque
+event or generation ID for each observation, then save this as
+`check-marker.sh`. This gate keeps the marker as the observed source until the
+agent records a durable completion receipt. The marker ID is its observation
+identity, so later work remains pending even when an older marker was completed:
 
 ```bash
 marker=/workspace/agent/wake-next-task
+receipt=/workspace/agent/wake-next-task.completed
 
-if [ -f "$marker" ]; then
-  rm -f "$marker"
-  echo '{"wakeAgent": true, "data": {"reason": "marker found"}}'
-else
+if [ ! -f "$marker" ]; then
   echo '{"wakeAgent": false}'
+  exit 0
+fi
+
+if ! marker_id="$(tr -d '\r\n' < "$marker")"; then
+  echo "could not read marker" >&2
+  exit 1
+fi
+case "$marker_id" in
+  ""|*[![:alnum:].:_-]*)
+    echo "marker must contain a nonempty safe ID" >&2
+    exit 1
+    ;;
+esac
+
+if [ -e "$receipt" ] && [ ! -r "$receipt" ]; then
+  echo "could not read completion receipt" >&2
+  exit 1
+fi
+receipt_id=""
+if [ -r "$receipt" ]; then
+  if ! receipt_id="$(tr -d '\r\n' < "$receipt")"; then
+    echo "could not read completion receipt" >&2
+    exit 1
+  fi
+fi
+
+if [ "$receipt_id" = "$marker_id" ]; then
+  echo '{"wakeAgent": false}'
+else
+  printf '{"wakeAgent": true, "data": {"reason": "marker pending", "markerId": "%s"}}\n' "$marker_id"
 fi
 ```
+
+The task prompt should tell the agent to record `markerId` in `receipt` only
+after it has verified the required outcome, using a same-directory temporary
+file and atomic rename. Do not delete the marker when a wake is queued. On a
+failed or killed turn, the missing receipt keeps the same marker pending; if the
+producer atomically writes a new marker ID, it remains pending rather than being
+consumed by the older receipt.
 
 Test it before scheduling, then pass its contents to `ncl`:
 
@@ -121,7 +161,7 @@ ncl tasks create \
   --group <agent-group-id> \
   --name "marker check" \
   --recurrence "*/15 * * * *" \
-  --prompt "Handle the condition reported by the script" \
+  --prompt "Handle the reported marker. After verifying the required outcome, write the supplied markerId as the sole line of a same-directory temporary file, then atomically rename it to /workspace/agent/wake-next-task.completed. Do not remove the marker." \
   --script "$(cat check-marker.sh)"
 ```
 
