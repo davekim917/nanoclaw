@@ -71,6 +71,18 @@ export interface SignalDecision {
   capabilities: { claim: boolean; answer: boolean; dispatch: boolean; release?: boolean };
   history: SignalDecisionEvent[];
 }
+export interface SignalClaimDetail {
+  slug: string;
+  owner: string;
+  /** Source-provided note headline, not a generated task title or verified outcome. */
+  note: string;
+  state: 'live' | 'expiring' | 'stale' | 'parked';
+  /** Expiry delta (negative while live), or elapsed parked time; not creation age. */
+  stale_ms: number;
+  escalated: boolean;
+  thread_id: string | null;
+  source_url: string | null;
+}
 export interface SignalAgent {
   id: string;
   workgroup_id: string;
@@ -82,6 +94,7 @@ export interface SignalAgent {
   thread_ids: string[];
   current_tool: string | null;
   claims?: string[];
+  claim_details?: SignalClaimDetail[];
   next_task?: { title: string; at: string } | null;
 }
 export interface SignalActivity {

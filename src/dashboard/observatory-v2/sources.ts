@@ -1,7 +1,7 @@
 import { GROUPS_DIR, TIMEZONE } from '../../config.js';
 import { parseAttentionSources } from '../../attention-sources.js';
 import { resolveContainedRoot, readContainedFile } from '../api/attention-fs.js';
-import { assembleSnapshot, type ScheduledSnapshot } from '../api/scheduled-assembly.js';
+import type { ScheduledSnapshot } from '../api/scheduled-assembly.js';
 import { getScheduledCache } from '../api/scheduled-shared.js';
 import { getDb } from '../../db/connection.js';
 import {
@@ -326,10 +326,8 @@ export async function buildSignalData(
   if (!deps.scene) {
     try {
       const cache = getScheduledCache();
-      scheduled =
-        cache.data && cache.expiresMs > now
-          ? (cache.data as unknown as ScheduledSnapshot)
-          : await assembleSnapshot(ctx.scopes, { nowMs: now });
+      // Full schedule scans belong to Schedule, never the decision critical path.
+      scheduled = cache.data && cache.expiresMs > now ? (cache.data as unknown as ScheduledSnapshot) : null;
     } catch {
       /* per-workgroup health below */
     }
@@ -350,7 +348,9 @@ export async function buildSignalData(
   // Sequential workgroups bounds heavy scene/transcript IO, including All.
   for (const wg of workgroups) {
     if (!deps.scene && !scheduled)
-      result.sources.push(health(wg.id, 'scheduled work', null, now, 'Upcoming schedule could not be read.'));
+      result.sources.push(
+        health(wg.id, 'scheduled work', null, now, 'No fresh schedule snapshot. Open Schedule to load upcoming work.'),
+      );
     const groupRows = await getDb().all<{ id: string }>('SELECT id FROM agent_groups WHERE workgroup_id=?', wg.id);
     const allowed = new Set(groupRows.map((g) => g.id).filter((g) => groupVisible(ctx, g)));
     const stored = await getDb().all<ProjectRow>(
@@ -447,6 +447,17 @@ export async function buildSignalData(
     threads = backed.slice(localOffset, localOffset + limit);
     const realThreads = threads.filter((t) => t.session_ids.length > 0);
     if (scene) {
+      // Existing scene ownership is an exact normalized name/folder match.
+      // Only unique slug ownership may expose richer context; never infer it
+      // from a similar name or the scene's fallback session attachment.
+      const claimThreads = scene.claims.length
+        ? await getDb().all<{ agent_group_id: string; thread_id: string }>(
+            `SELECT DISTINCT s.agent_group_id,s.thread_id FROM sessions s
+             JOIN agent_groups a ON a.id=s.agent_group_id
+             WHERE a.workgroup_id=? AND s.thread_id IS NOT NULL`,
+            wg.id,
+          )
+        : [];
       for (const agent of scene.agents.filter((a) => allowed.has(a.id))) {
         const nextScheduled = scheduled?.rows
           .filter((r) => r.agent_group_id === agent.id && r.next_fire_utc && r.health !== 'paused')
@@ -463,6 +474,30 @@ export async function buildSignalData(
           thread_ids: ownThreads.map((t) => t.thread_id),
           current_tool: ownThreads.find((t) => t.current_tool)?.current_tool ?? null,
           claims: agent.holding,
+          claim_details: scene.claims
+            .filter(
+              (claim) =>
+                agent.holding.includes(claim.slug) &&
+                scene.agents.filter((candidate) => candidate.holding.includes(claim.slug)).length === 1 &&
+                scene.claims.filter((candidate) => candidate.slug === claim.slug).length === 1,
+            )
+            .map((claim) => {
+              const linked =
+                claim.threadId !== null &&
+                claimThreads.some(
+                  (thread) => thread.agent_group_id === agent.id && thread.thread_id === claim.threadId,
+                );
+              return {
+                slug: claim.slug,
+                owner: claim.owner,
+                note: claim.note,
+                state: claim.state,
+                stale_ms: claim.staleMs,
+                escalated: claim.escalated,
+                thread_id: linked ? claim.threadId : null,
+                source_url: linked ? safeUrl(claim.threadUrl) : null,
+              };
+            }),
           next_task: nextScheduled
             ? { title: nextScheduled.series_id, at: nextScheduled.next_fire_utc! }
             : agent.nextTask,

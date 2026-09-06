@@ -1,3 +1,5 @@
+import * as scheduleAssembly from '../api/scheduled-assembly.js';
+import { getScheduledCache } from '../api/scheduled-shared.js';
 import type http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -898,4 +900,69 @@ it('original rejection cannot release a reservation while its retry is in flight
   ).rejects.toThrow('delivery_pending');
   finishRetry({ status: 202, body: {} });
   expect((await retry).dispatch_state).toBe('sent');
+});
+
+it('exposes exact uniquely owned claim notes and only same-agent thread links within scope', async () => {
+  await getDb().exec(`ALTER TABLE sessions ADD COLUMN thread_id TEXT;
+    INSERT INTO sessions VALUES('sa','a','thread-a'),('sb','b','thread-b'),('sc','c','thread-other');`);
+  const snapshot = scene([]);
+  snapshot.agents[0]!.holding = ['owned', 'hidden-link', 'cross-link', 'ambiguous'];
+  snapshot.agents[1]!.holding = ['private', 'ambiguous'];
+  const claim = (slug: string, threadId: string, owner = 'A') => ({
+    slug,
+    owner,
+    note: `Source note for ${slug}`,
+    threadId,
+    state: 'parked' as const,
+    staleMs: 1234,
+    escalated: false,
+    threadUrl: `https://example.com/${threadId}`,
+    sessionId: null,
+  });
+  snapshot.claims = [
+    claim('owned', 'thread-a'),
+    claim('hidden-link', 'thread-b'),
+    claim('cross-link', 'thread-other'),
+    claim('ambiguous', 'thread-a'),
+    claim('private', 'thread-b', 'B'),
+  ];
+  const d = { ...deps([]), scene: async () => snapshot };
+  const result = await buildSignalData(ctx('j', 'member', ['a']), 'w', d);
+  expect(result.agents).toHaveLength(1);
+  const details = result.agents[0]!.claim_details!;
+  expect(details.map((c) => c.slug)).toEqual(['owned', 'hidden-link', 'cross-link']);
+  expect(details[0]).toEqual({
+    slug: 'owned',
+    owner: 'A',
+    note: 'Source note for owned',
+    state: 'parked',
+    stale_ms: 1234,
+    escalated: false,
+    thread_id: 'thread-a',
+    source_url: 'https://example.com/thread-a',
+  });
+  expect(details.slice(1).every((c) => c.thread_id === null && c.source_url === null)).toBe(true);
+  expect(JSON.stringify(result)).not.toContain('Source note for private');
+  expect((await buildSignalData(ctx('j', 'member', ['a']), 'other', d)).agents).toEqual([]);
+});
+
+it('serves decisions without assembling schedule history when its cache is cold', async () => {
+  const assemble = vi.spyOn(scheduleAssembly, 'assembleSnapshot');
+  const cache = getScheduledCache();
+  const previous = { data: cache.data, expiresMs: cache.expiresMs };
+  cache.data = null;
+  cache.expiresMs = 0;
+  try {
+    const data = await buildSignalData(ctx(), 'w', {
+      runtimeScene: async () => scene(),
+      release: async () => ({ asOf: '2026-09-05T00:00:00Z', items: [item] }),
+      threads: async () => [],
+    });
+    expect(data.decisions.some((d) => d.source_id === item.id)).toBe(true);
+    expect(data.sources.some((s) => s.source === 'scheduled work' && s.status === 'unavailable')).toBe(true);
+    expect(assemble).not.toHaveBeenCalled();
+  } finally {
+    Object.assign(cache, previous);
+    assemble.mockRestore();
+  }
 });

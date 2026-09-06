@@ -22,8 +22,10 @@ import {
   SignalApiError,
 } from '../../lib/signal-api.js';
 import { subscribe } from '../../lib/sse.ts';
+import { DecisionQueue, AgentWorkspace, ThreadWorkspace, type PendingInstructions } from './WorkViews.js';
 import { ThreadConsole } from '../console/ThreadConsole.js';
 import { signalRoute, threadHref } from './routes.js';
+import { readVisitBaseline, saveVisitBaseline, type VisitBaseline } from './visit-changes.js';
 import { mergeSignalPages } from './paging.js';
 import { signalStamp, resolveDependency } from './source-display.js';
 
@@ -45,8 +47,26 @@ const message = (error: unknown) => (error instanceof Error ? error.message : 'R
 export function SignalApp({ authMe }: { authMe: AuthMe }) {
   const [route, setRoute] = useState(() => signalRoute(location.hash));
   const [workgroup, setWorkgroup] = useState('all');
+  const pendingInstructions = useRef<PendingInstructions>(new Map());
+  useEffect(() => {
+    if (!route.id || window.innerWidth > 850) return;
+    const timer = window.setTimeout(() => {
+      document
+        .querySelector('.signal-decision, [data-testid="agent-work"], [data-testid="work-brief"]')
+        ?.scrollIntoView?.({ block: 'start' });
+    }, 100);
+    return () => window.clearTimeout(timer);
+  }, [route.page, route.id]);
+
   const [query, setQuery] = useState('');
-  const [decisionFilter, setDecisionFilter] = useState<'all' | 'open' | 'mine' | 'unclaimed' | 'recorded'>('all');
+  const [decisionFilter, setDecisionFilter] = useState<'all' | 'open' | 'mine' | 'unclaimed' | 'recorded' | 'release'>(
+    'all',
+  );
+  const visitBaselines = useRef(new Map<string, VisitBaseline | null>());
+  const visitKey = `${authMe.user_id}:${workgroup}`;
+  if (!visitBaselines.current.has(visitKey))
+    visitBaselines.current.set(visitKey, readVisitBaseline(localStorage, authMe.user_id, workgroup));
+  const baseline = visitBaselines.current.get(visitKey) ?? null;
   const [connection, setConnection] = useState('Connecting');
   const search = useRef<HTMLInputElement>(null);
   const {
@@ -54,11 +74,19 @@ export function SignalApp({ authMe }: { authMe: AuthMe }) {
     error,
     mutate,
     isValidating,
-  } = useSWR(['signal', workgroup], () => getSignalOverview(workgroup).then(result => { setExtraPages(null); return result; }), {
-    refreshInterval: 30000,
-    revalidateOnFocus: true,
-    dedupingInterval: 1000,
-  });
+  } = useSWR(
+    ['signal', workgroup],
+    () =>
+      getSignalOverview(workgroup).then((result) => {
+        setExtraPages(null);
+        return result;
+      }),
+    {
+      refreshInterval: 30000,
+      revalidateOnFocus: true,
+      dedupingInterval: 1000,
+    },
+  );
   const [extraPages, setExtraPages] = useState<{ base: SignalOverview; pages: SignalOverview[] } | null>(null);
   const [pageLoading, setPageLoading] = useState(false);
   const [pageError, setPageError] = useState('');
@@ -81,6 +109,9 @@ export function SignalApp({ authMe }: { authMe: AuthMe }) {
       setPageLoading(false);
     }
   }
+  useEffect(() => {
+    if (data) saveVisitBaseline(localStorage, authMe.user_id, workgroup, data.decisions);
+  }, [data, authMe.user_id, workgroup]);
   const timezone = data?.timezone ?? null;
   const stamp = (value: string | null) => signalStamp(value, timezone);
   useEffect(() => {
@@ -132,8 +163,9 @@ export function SignalApp({ authMe }: { authMe: AuthMe }) {
       .filter(
         (d) =>
           matches(d.question, d.context, d.owner?.name ?? null, d.owner_hint) &&
-          (route.page !== 'decisions' ||
+          ((route.page !== 'decisions' && route.page !== 'overview') ||
             decisionFilter === 'all' ||
+            (decisionFilter === 'release' && d.blocks_release && d.state !== 'answered') ||
             (decisionFilter === 'open' && d.state !== 'answered') ||
             (decisionFilter === 'mine' && d.owner?.id === authMe.user_id) ||
             (decisionFilter === 'unclaimed' && !d.owner && d.state !== 'answered') ||
@@ -146,11 +178,16 @@ export function SignalApp({ authMe }: { authMe: AuthMe }) {
           Number(b.state === 'changed') - Number(a.state === 'changed') ||
           (b.source_as_of ?? '').localeCompare(a.source_as_of ?? ''),
       ) ?? [];
+  const releaseWorkspace = data?.workgroups.find((w) => w.id === import.meta.env.VITE_SATURDAY_RELEASE_WORKGROUP);
+  const releaseCalls =
+    data?.decisions.filter(
+      (d) => d.workgroup_id === releaseWorkspace?.id && d.blocks_release && d.state !== 'answered',
+    ) ?? [];
   const selected = route.id
     ? decisions.find((d) => d.id === route.id)
     : (decisions.find((d) => d.state !== 'answered') ?? decisions[0]);
   const label = navigation.find((n) => n.page === route.page)!.label;
-  const operational = route.page === 'threads' || route.page === 'schedule';
+  const operational = route.page === 'schedule';
   const unavailable = data?.sources.filter((s) => s.status !== 'available') ?? [];
   return (
     <TimezoneContext.Provider value={timezone}>
@@ -239,18 +276,27 @@ export function SignalApp({ authMe }: { authMe: AuthMe }) {
                 />
               </div>
             ) : (
-              <div className="signal-content">
+              <div className={`signal-content ${route.id ? 'work-explicit-detail' : ''}`}>
+                {route.id && (
+                  <a className="work-back-list" href={`#/${route.page}`}>
+                    ← Back to {label.toLowerCase()}
+                  </a>
+                )}
                 <div className="signal-title">
                   <div>
-                    <div className="signal-overline">Signal / {label}</div>
+                    {route.page !== 'agents' && route.page !== 'threads' && (
+                      <div className="signal-overline">Signal / {label}</div>
+                    )}
                     <h1>
                       {route.page === 'overview'
-                        ? 'Keep the work moving.'
+                        ? 'Decide what moves next.'
                         : label === 'Decisions'
                           ? 'Give the work direction.'
                           : label === 'Projects'
                             ? 'Where the work stands.'
-                            : 'The people behind the work.'}
+                            : route.page === 'threads'
+                              ? 'Work in context.'
+                              : 'The people behind the work.'}
                     </h1>
                   </div>
                   <button className="signal-refresh" onClick={() => void mutate()} aria-label="Refresh records">
@@ -269,7 +315,39 @@ export function SignalApp({ authMe }: { authMe: AuthMe }) {
                     'Reading workspace records and source evidence.'
                   )}
                 </p>
-                {data?.thread_coverage?.some(c => c.has_more) && <p className="signal-alert" role="status">Historical thread coverage is incomplete. Counts and search cover loaded pages; use Load more below to inspect older work.</p>}
+                {releaseWorkspace && (route.page === 'overview' || route.page === 'decisions') && (
+                  <section className="work-release-focus" aria-label="Saturday release">
+                    <div>
+                      <strong>{releaseWorkspace.name} · Saturday release</strong>
+                      <p>
+                        <code>develop → main</code> · {releaseCalls.length} source-reported human{' '}
+                        {releaseCalls.length === 1 ? 'call' : 'calls'} blocking promotion
+                      </p>
+                      <small>Standing weekly cadence. Source flags are not a fresh release-readiness check.</small>
+                    </div>
+                    {releaseCalls.length > 0 && (
+                      <button
+                        onClick={() => {
+                          setQuery('');
+                          setWorkgroup(releaseWorkspace.id);
+                          setDecisionFilter('release');
+                          location.hash = `#/decisions/${encodeURIComponent(releaseCalls[0]!.id)}`;
+                        }}
+                      >
+                        Review release blockers →
+                      </button>
+                    )}
+                  </section>
+                )}
+                {data?.thread_coverage?.some((c) => c.has_more) && (
+                  <details className="work-coverage">
+                    <summary>Historical coverage is partial</summary>
+                    <p>
+                      Historical thread coverage is incomplete. Counts and search cover loaded pages; use Load more
+                      below to inspect older work.
+                    </p>
+                  </details>
+                )}
                 {connection === 'Disconnected' && (
                   <div className="signal-alert" role="status">
                     Live connection interrupted. Records refresh every 30 seconds; reconnecting.
@@ -289,7 +367,7 @@ export function SignalApp({ authMe }: { authMe: AuthMe }) {
                   </div>
                 )}
                 {!!unavailable.length && (
-                  <details className="signal-alert">
+                  <details className="work-source-health">
                     <summary>{unavailable.length} sources stale or unavailable — coverage is partial</summary>
                     {unavailable.map((s, i) => (
                       <p key={i}>
@@ -301,12 +379,14 @@ export function SignalApp({ authMe }: { authMe: AuthMe }) {
                 {data && (
                   <>
                     {(route.page === 'overview' || route.page === 'projects' || route.page === 'decisions') && (
-                      <div className={`signal-area ${route.page === 'projects' ? 'signal-projects-only' : ''}`}>
+                      <div
+                        className={`signal-area ${route.page === 'projects' ? 'signal-projects-only' : 'work-decision-workspace'}`}
+                      >
                         <section className="signal-projects">
-                          {route.page === 'decisions' ? (
+                          {route.page !== 'projects' ? (
                             <>
                               <div className="signal-section-head">
-                                <h2>Decision inbox</h2>
+                                <h2>Decision queue</h2>
                                 <span>{decisions.length} records</span>
                               </div>
                               <div className="signal-decision-filters" aria-label="Filter decisions">
@@ -314,6 +394,7 @@ export function SignalApp({ authMe }: { authMe: AuthMe }) {
                                   [
                                     ['all', 'All'],
                                     ['open', 'Open'],
+                                    ['release', 'Release blockers'],
                                     ['mine', 'My reviews'],
                                     ['unclaimed', 'Unclaimed'],
                                     ['recorded', 'Recorded'],
@@ -328,21 +409,14 @@ export function SignalApp({ authMe }: { authMe: AuthMe }) {
                                   </button>
                                 ))}
                               </div>
-                              {decisions.map((d) => (
-                                <a
-                                  className={`signal-decision-row ${d.id === selected?.id ? 'selected' : ''}`}
-                                  key={d.id}
-                                  href={`#/decisions/${encodeURIComponent(d.id)}`}
-                                >
-                                  <span className="signal-meta">
-                                    {d.source_kind} · {d.state}
-                                  </span>
-                                  <h3>{d.question}</h3>
-                                  <p>
-                                    {d.owner ? `${d.owner.name} reviewing` : 'Unclaimed'} · {d.workgroup_id}
-                                  </p>
-                                </a>
-                              ))}
+                              <DecisionQueue
+                                baseline={baseline}
+                                decisions={decisions}
+                                selectedId={selected?.id ?? null}
+                                onSelect={(id) => {
+                                  location.hash = `#/decisions/${encodeURIComponent(id)}`;
+                                }}
+                              />
                               {!decisions.length && (
                                 <p className="signal-empty">
                                   No decisions match this view. Source availability is shown above.
@@ -388,59 +462,22 @@ export function SignalApp({ authMe }: { authMe: AuthMe }) {
                       </div>
                     )}
                     {route.page === 'agents' && (
-                      <div className="signal-agents">
-                        {data.agents
-                          .filter((a) => matches(a.name, a.provider, a.current_tool))
-                          .map((a) => (
-                            <article className="signal-agent" key={a.id}>
-                              <div className="signal-section-head">
-                                <h2>{a.name}</h2>
-                                <span>{a.active ? 'Working' : a.awake ? 'Awake · not working' : 'Not awake'}</span>
-                              </div>
-                              <p>
-                                {a.provider} · {a.workgroup_id}
-                              </p>
-                              <p>{a.current_tool ? `Current tool: ${a.current_tool}` : 'No current tool reported'}</p>
-                              <small>Last seen {stamp(a.last_seen_at)}</small>
-                              <div className="signal-links">
-                                {a.thread_ids.map((id, i) => (
-                                  <a key={id} href={threadHref(id)}>
-                                    Thread {i + 1} ↗
-                                  </a>
-                                ))}
-                              </div>
-                              <p>Claims: {a.claims?.length ? a.claims.join(' · ') : 'No active claims reported'}</p>
-                              <p>
-                                {a.next_task
-                                  ? `Next scheduled: ${a.next_task.title} · ${stamp(a.next_task.at)}`
-                                  : 'No next scheduled work reported'}
-                              </p>
-                              <a href="#/schedule">Inspect scheduled work →</a>
-                            </article>
-                          ))}
-                      </div>
+                      <AgentWorkspace
+                        agents={data.agents.filter((a) => matches(a.name, a.provider, ...(a.claims ?? [])))}
+                        decisions={data.decisions}
+                        selectedId={route.id}
+                        timezone={timezone}
+                      />
                     )}
-                    {route.page === 'overview' && (
-                      <section className="signal-timeline">
-                        <div className="signal-section-head">
-                          <h2>Latest work</h2>
-                          <span>Recorded events · {timezone ?? 'timezone unavailable'}</span>
-                        </div>
-                        {data.activity
-                          .filter((a) => matches(a.title, a.detail))
-                          .slice(0, 12)
-                          .map((a) => (
-                            <div className="signal-event" key={a.id}>
-                              <time>{stamp(a.at)}</time>
-                              <span>{a.workgroup_id}</span>
-                              <div>
-                                {a.thread_id ? <a href={threadHref(a.thread_id)}>{a.title} ↗</a> : a.title}
-                                <p>{a.detail}</p>
-                              </div>
-                            </div>
-                          ))}
-                        {!data.activity.length && <p className="signal-empty">No recent activity reported.</p>}
-                      </section>
+                    {route.page === 'threads' && (
+                      <ThreadWorkspace
+                        pendingInstructions={pendingInstructions.current}
+                        authMe={authMe}
+                        workgroup={workgroup}
+                        query={query}
+                        id={route.id}
+                        overview={data}
+                      />
                     )}
                     {!!data.thread_coverage?.some((c) => c.has_more) && (
                       <section className="signal-page-coverage" aria-label="Thread coverage">
@@ -737,14 +774,30 @@ export function DecisionPane({ id, authMe, refresh }: { id: string; authMe: Auth
             </span>
             <span>v{d.version}</span>
           </div>
-          <h2>{d.question.length > 180 ? `${d.question.slice(0, 180)}…` : d.question}</h2>
-          {d.question.length > 180 && (
+          <h2>{d.question.length > 260 ? `${d.question.slice(0, 260)}…` : d.question}</h2>
+          {d.question.length > 260 && (
             <details>
               <summary>Read full question</summary>
               <p>{d.question}</p>
             </details>
           )}
+          <p className="work-footnote">Source observed {stamp(d.source_as_of)}</p>
+          {d.capabilities.answer && (
+            <button
+              className="signal-primary work-decision-jump"
+              onClick={(event) => {
+                const input = event.currentTarget
+                  .closest('aside')
+                  ?.querySelector<HTMLTextAreaElement>('textarea[aria-label="Your decision"]');
+                input?.scrollIntoView({ block: 'center' });
+                input?.focus({ preventScroll: true });
+              }}
+            >
+              Write your decision ↓
+            </button>
+          )}
           <div className="signal-intro">
+            <h3>Why this needs a decision</h3>
             {d.context ? (
               <SourceExcerpt text={d.context} limit={300} label="Read full source reason" />
             ) : (
@@ -753,13 +806,13 @@ export function DecisionPane({ id, authMe, refresh }: { id: string; authMe: Auth
           </div>
           <div className="signal-ownership">
             <span>
-              Source owner <strong>{d.owner_hint || 'Not declared'}</strong>
+              Source owner hint <strong>{d.owner_hint || 'Not declared'}</strong>
             </span>
             <span>
               Reviewing <strong>{d.owner?.name || 'Unclaimed'}</strong>
             </span>
           </div>
-          <h3>Source next step</h3>
+          <h3>Next action from source</h3>
           <div className="signal-recommendation">
             <SourceExcerpt
               text={d.next_action || 'No recommendation or next step supplied.'}
@@ -784,12 +837,13 @@ export function DecisionPane({ id, authMe, refresh }: { id: string; authMe: Auth
               <p className="signal-muted">No additional evidence supplied.</p>
             )}
           </details>
-          <div className="signal-version">
-            <span>Review applies to</span>
-            <code>{d.evidence_hash.slice(0, 16)}</code>
-          </div>
           <details>
             <summary>Source identity and review history</summary>
+            <div className="signal-version">
+              <span>Review applies to</span>
+              <code>{d.evidence_hash.slice(0, 16)}</code>
+            </div>
+
             <code>
               {d.source_kind} / {d.source_id}
             </code>

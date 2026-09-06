@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, cleanup } from '@testing-library/react';
+import { act, fireEvent, render, screen, cleanup, within } from '@testing-library/react';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { SWRConfig } from 'swr';
 import type { SignalOverview } from '../../../../src/dashboard/observatory-v2/types.js';
@@ -165,7 +165,7 @@ describe('Signal live refresh and paging', () => {
     vi.mocked(api.getSignalOverview).mockResolvedValue(base);
     mount();
     await tick();
-    expect(screen.getByText('Current tool: write_summary')).toBeInTheDocument();
+    expect(screen.getByText(/Using write_summary/)).toBeInTheDocument();
 
     const older = overview();
     older.agents = [{ ...base.agents[0]!, thread_ids: ['slack:CFIXTURE01:older'], current_tool: null }];
@@ -173,16 +173,18 @@ describe('Signal live refresh and paging', () => {
     vi.mocked(api.getSignalOverview).mockResolvedValueOnce(older);
     fireEvent.click(screen.getByRole('button', { name: 'Load more threads · Workspace' }));
     await tick();
-    expect(screen.getByText('Current tool: write_summary')).toBeInTheDocument();
+    expect(screen.getByText(/Using write_summary/)).toBeInTheDocument();
 
     const refreshed = overview();
     refreshed.agents = [{ ...base.agents[0]!, current_tool: null }];
     vi.mocked(api.getSignalOverview).mockResolvedValue(refreshed);
     fireEvent.click(screen.getByRole('button', { name: 'Refresh records' }));
     await tick(1001);
-    expect(screen.getByText('No current tool reported')).toBeInTheDocument();
+    expect(screen.queryByText(/Using write_summary/)).not.toBeInTheDocument();
+    expect(screen.getByTestId('agent-work')).toBeInTheDocument();
   });
   it('keeps the project revision that initialized an open edit form', async () => {
+    location.hash = '#/projects';
     const initial = overview('Initial project');
     initial.projects[0]!.version = 2;
     initial.capabilities.manage_projects = true;
@@ -191,14 +193,15 @@ describe('Signal live refresh and paging', () => {
     mount();
     await tick();
     fireEvent.click(screen.getByRole('button', { name: 'Edit project mapping' }));
-    fireEvent.change(screen.getByLabelText('Project name'), { target: { value: 'Local project edit' } });
+    const editForm = screen.getByDisplayValue('Initial project').closest('form')!;
+    fireEvent.change(within(editForm).getByLabelText('Project name'), { target: { value: 'Local project edit' } });
     const refreshed = overview('Remote project edit');
     refreshed.projects[0]!.version = 3;
     refreshed.capabilities.manage_projects = true;
     vi.mocked(api.getSignalOverview).mockResolvedValue(refreshed);
     fireEvent.click(screen.getByRole('button', { name: 'Refresh records' }));
     await tick(1001);
-    fireEvent.click(screen.getByRole('button', { name: 'Save project mapping' }));
+    fireEvent.click(within(editForm).getByRole('button', { name: 'Save project mapping' }));
     await tick();
     expect(api.saveSignalProject).toHaveBeenCalledWith(
       'p',
@@ -227,6 +230,6 @@ describe('Signal live refresh and paging', () => {
     expect(api.getSignalDecision).toHaveBeenCalledWith('off-page');
     expect(screen.getByRole('alert')).toHaveTextContent('Could not load exact decision context');
     expect(screen.getByText('A different question')).toBeInTheDocument();
-    expect(container.querySelector('.signal-decision-row.selected')).toBeNull();
+    expect(container.querySelector('.work-queue-row.selected')).toBeNull();
   });
 });
