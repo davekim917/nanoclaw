@@ -1,10 +1,12 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { SWRConfig } from 'swr';
-import type { SignalDecision, SignalAgent } from '../../../../src/dashboard/observatory-v2/types.js';
+import type { SignalDecision, SignalAgent, SignalOverview } from '../../../../src/dashboard/observatory-v2/types.js';
 import type { ThreadDetailResponse } from '../../lib/api.js';
 import { DecisionQueue, AgentWorkspace, ThreadWorkspace } from './WorkViews.js';
 import * as api from '../../lib/api.js';
+import * as signalApi from '../../lib/signal-api.js';
+vi.mock('../../lib/signal-api.js', () => ({ getSignalThreadContext: vi.fn() }));
 vi.mock('../../lib/api.js', async (original) => ({
   ...(await original<typeof api>()),
   listThreads: vi.fn(),
@@ -93,8 +95,30 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(api.listThreads).mockResolvedValue({ threads: [detail.thread] });
   vi.mocked(api.getThreadDetail).mockResolvedValue(detail);
+  vi.mocked(signalApi.getSignalThreadContext).mockResolvedValue({
+    as_of: '2026-09-06T00:00:00Z', workgroups: [], projects: [], decisions: [], agents: [], activity: [], sources: [],
+    capabilities: { manage_projects: false },
+  });
 });
 describe('work-first interaction', () => {
+  it('loads project and decision context for an exact off-page thread', async () => {
+    vi.mocked(api.listThreads).mockResolvedValue({ threads: [] });
+    const context: SignalOverview = {
+      as_of: '2026-09-06T00:00:00Z', workgroups: [{ id: 'wg', name: 'Workspace' }],
+      projects: [{ id: 'mapped', workgroup_id: 'wg', name: 'Mapped project', description: 'Exact mapped objective',
+        repositories: [], channel_keys: ['channel'], version: 1, updated_at: null, unmapped: false,
+        thread_ids: ['t1'], decision_ids: ['off-page'], items: [] }],
+      decisions: [decision('off-page')], agents: [], activity: [], sources: [], capabilities: { manage_projects: false },
+    };
+    vi.mocked(signalApi.getSignalThreadContext).mockResolvedValue(context);
+    render(<SWRConfig value={{ provider: () => new Map() }}>
+      <ThreadWorkspace authMe={authMe} workgroup="all" query="" id="t1" overview={{ ...context, projects: [], decisions: [] }} />
+    </SWRConfig>);
+    expect(await screen.findByText('Exact mapped objective')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Question off-page/ })).toBeInTheDocument();
+    expect(signalApi.getSignalThreadContext).toHaveBeenCalledWith('t1');
+  });
+
   it('selects an exact decision from a grouped queue and distinguishes reviewed from sent', () => {
     const choose = vi.fn();
     render(

@@ -3,6 +3,7 @@ import useSWR from 'swr';
 import type { SignalAgent, SignalDecision, SignalOverview } from '../../../../src/dashboard/observatory-v2/types.js';
 import { getThreadDetail, listThreads, postThreadMessage, type AuthMe, type ApiError } from '../../lib/api.js';
 import { subscribe } from '../../lib/sse.ts';
+import { getSignalThreadContext } from '../../lib/signal-api.js';
 import { ThreadConsole } from '../console/ThreadConsole.js';
 import { CloseThreadControl } from '../console/CloseControl.js';
 import { setSnoozed } from '../console/actions.js';
@@ -294,6 +295,11 @@ export function ThreadWorkspace({
     () => getThreadDetail(selectedId!),
     { refreshInterval: 30000 },
   );
+  const { data: context, error: contextError, mutate: refreshContext } = useSWR(
+    selectedId ? ['work-thread-context', authMe.user_id, selectedId] : null,
+    () => getSignalThreadContext(selectedId!),
+    { refreshInterval: 30000 },
+  );
   const [tab, setTab] = useState<'context' | 'conversation'>('context');
   const [recipient, setRecipient] = useState('');
   const [text, setText] = useState('');
@@ -330,6 +336,7 @@ export function ThreadWorkspace({
           timer = undefined;
           void mutate();
           void refreshList();
+          void refreshContext();
         }, 400);
     };
     const off = (['connection', 'session_event', 'inbound_message'] as const).map((kind) => subscribe(kind, refresh));
@@ -337,12 +344,19 @@ export function ThreadWorkspace({
       off.forEach((fn) => fn());
       clearTimeout(timer);
     };
-  }, [mutate, refreshList]);
+  }, [mutate, refreshList, refreshContext]);
   const thread = data?.thread;
   const hasConversation = (thread?.session_ids.length ?? 0) > 0;
   const related =
-    overview?.decisions.filter((d) => d.thread_id === selectedId || d.dispatch_target_thread_id === selectedId) ?? [];
-  const project = overview?.projects.find((p) => p.thread_ids.includes(selectedId ?? ''));
+    context?.decisions.filter((d) => d.thread_id === selectedId || d.dispatch_target_thread_id === selectedId) ?? [];
+  const project = context?.projects.find((p) => p.thread_ids.includes(selectedId ?? ''));
+  const contextStatus = contextError
+    ? 'Exact work context could not be loaded.'
+    : !context
+      ? 'Loading exact work context…'
+      : context.sources.some((source) => source.source === 'threads' && source.status === 'unavailable')
+        ? 'Exact thread source is unavailable; project and decision coverage may be incomplete.'
+        : null;
   const maySend = authMe.scopes.role !== 'member';
   async function send() {
     if (!thread || !recipient || !text.trim()) return;
@@ -447,7 +461,7 @@ export function ThreadWorkspace({
                   <div className="work-context-grid">
                     <section>
                       <h3>Objective</h3>
-                      <p>{project?.description || 'No explicit project objective is mapped to this conversation.'}</p>
+                      <p>{project?.description || contextStatus || 'No explicit project objective is mapped to this conversation.'}</p>
                       {project && <small>{project.name}</small>}
                     </section>
                     <section>
@@ -480,7 +494,7 @@ export function ThreadWorkspace({
                     </a>
                   ))}
                   {!related.length && (
-                    <p className="work-missing">No decision explicitly references this conversation.</p>
+                    <p className="work-missing">{contextStatus || 'No decision explicitly references this conversation.'}</p>
                   )}
                   <details className="work-evidence">
                     <summary>Source evidence & participants</summary>
