@@ -249,6 +249,21 @@ describe('dashboardTokenIssue', () => {
     expect(channelContent.text).not.toMatch(/https?:\/\//);
   });
 
+  it('the refuse-to-mint warn carries no handle when the private path is missing (#480 round 2)', async () => {
+    const { log } = await import('../../log.js');
+    vi.mocked(log.warn).mockClear();
+    vi.mocked(getMessagingGroup).mockReturnValue(makeSlackChannelMg());
+    vi.mocked(ensureUserDm).mockResolvedValue(null);
+
+    await dashboardTokenIssue(makeCtx());
+
+    const warn = vi.mocked(log.warn).mock.calls.find(([msg]) => String(msg).includes('refusing to mint'));
+    expect(warn, 'the refuse-to-mint warn fired').toBeDefined();
+    const payload = (warn?.[1] ?? {}) as Record<string, unknown>;
+    expect(Object.keys(payload)).not.toContain('userId');
+    expect(JSON.stringify(payload)).not.toContain('u1');
+  });
+
   it('test_dashboardTokenIssue_group_no_dm_path_fails_closed', async () => {
     const deliverMock = vi.fn().mockResolvedValue('msg-id');
     vi.mocked(getDeliveryAdapter).mockReturnValue({ deliver: deliverMock } as never);

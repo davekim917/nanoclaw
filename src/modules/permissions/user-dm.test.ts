@@ -200,4 +200,16 @@ describe('ensureUserDm privacy-safe logging', () => {
       new Set(['src/modules/approvals/primitive.ts', 'src/dashboard/auth/dashboard-token-issue.ts']),
     );
   });
+
+  it('the failure branches next to each privacy-safe call stay handle-free (#480 round 2)', async () => {
+    const fs2 = await import('node:fs');
+    const path = await import('node:path');
+    const repoRoot = path.resolve(__dirname, '..', '..', '..');
+    const dashboard = fs2.readFileSync(path.join(repoRoot, 'src/dashboard/auth/dashboard-token-issue.ts'), 'utf8');
+    const onecli = fs2.readFileSync(path.join(repoRoot, 'src/modules/approvals/onecli-approvals.ts'), 'utf8');
+    // The warn that follows a null ensureUserDm must not log the invoker.
+    expect(/refusing to mint'[\s\S]{0,300}?\}\);/.exec(dashboard)?.[0]).not.toMatch(/userId/);
+    // The OneCLI auto-deny must log a count, never the approver handles.
+    expect(/no DM channel for any approver'[\s\S]{0,300}?\}\);/.exec(onecli)?.[0]).not.toMatch(/\bapprovers,/);
+  });
 });
