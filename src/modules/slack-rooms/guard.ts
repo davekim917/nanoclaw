@@ -1,0 +1,121 @@
+/**
+ * Slack-rooms guard adapter — the module's catalog entries, composed at the
+ * module edge (imported by ./index.ts).
+ *
+ * `rooms.create` — opening a Slack conversation and wiring it to N agent
+ * groups is central-DB state plus an outward-facing side effect, so it takes
+ * the same posture `agents.create` takes: a trusted `global` cli_scope group
+ * acts directly, and everything else — the default `group` scope, and any
+ * unknown value, fail-closed — holds for the requesting group's admin chain.
+ *
+ * `rooms.add_agent` — same, with one widening the fork's data-pool boundary
+ * already justifies: adding a SIBLING (an agent group in the caller's own
+ * workgroup) is allowed unheld. Siblings already share the workgroup's chat
+ * archive, files and secret union, so a room between them exposes nothing an
+ * approval would be protecting; a non-sibling crosses that boundary and holds.
+ *
+ * Both decisions stay SYNCHRONOUS (seam-3 plan §4.5, I-1). The only central
+ * read here is `cli_scope`, executed through the container-configs leaf's
+ * exported SQL under `withRawDb` — exactly the shape `agents.create` uses. The
+ * facts that would otherwise need an await (which agent group a name resolves
+ * to, which workgroup each side belongs to) are derived by the delivery
+ * guard's PRECHECK and stamped onto the request payload before this runs. The
+ * precheck re-runs on every approved replay, so those facts are live on the
+ * replay too — a sibling relationship revoked between card and click is
+ * caught, and the decision falls back to a hold rather than executing.
+ */
+import { withRawDb } from '../../db/central-lease.js';
+import { CONTAINER_CONFIG_BY_GROUP_SQL } from '../../db/container-configs.js';
+import { ALLOW, DENY, HOLD, defineGuardedAction, type GuardInput } from '../../guard/index.js';
+
+/** pending_approvals.action strings — the keys a grant is matched on. */
+export const CREATE_ROOM_ACTION = 'create_room';
+export const ADD_TO_ROOM_ACTION = 'add_to_room';
+
+/**
+ * Payload keys the precheck stamps for the guard. Named here so the two sides
+ * cannot drift: a key renamed on one side is a compile error on the other.
+ */
+export const CALLER_WORKGROUP_KEY = 'caller_workgroup_id';
+export const TARGET_WORKGROUP_KEY = 'target_workgroup_id';
+export const TARGET_AGENT_GROUP_KEY = 'target_agent_group_id';
+export const ROOM_PLATFORM_ID_KEY = 'room_platform_id';
+
+// Synchronous by design (seam-3 plan §4.5, I-1): runs inside the delivery
+// guard's `withCentralSync` block and never awaits. The central read executes
+// the leaf's exported SQL through `withRawDb`.
+function cliScopeOf(agentGroupId: string): string {
+  const row = withRawDb((raw) => raw.prepare(CONTAINER_CONFIG_BY_GROUP_SQL).get(agentGroupId)) as
+    | { cli_scope: string | null }
+    | undefined;
+  return row?.cli_scope ?? 'group';
+}
+
+function stringOf(input: GuardInput, key: string): string | null {
+  const value = input.payload[key];
+  return typeof value === 'string' && value !== '' ? value : null;
+}
+
+export const roomsCreate = defineGuardedAction({
+  action: 'rooms.create',
+  grantActionName: CREATE_ROOM_ACTION,
+  // Bind a create_room grant to the room name that was approved.
+  grantCoversRequest: (grant, input) => {
+    try {
+      return (JSON.parse(grant.payload) as { name?: string }).name === input.payload.name;
+    } catch {
+      return false;
+    }
+  },
+  decide: (input) => {
+    if (input.actor.kind !== 'agent') return DENY('create_room is a container-originated action.');
+    if (cliScopeOf(input.actor.agentGroupId) === 'global') {
+      return ALLOW('trusted global-scope agent group');
+    }
+    return HOLD('agent-initiated create_room requires admin approval');
+  },
+});
+
+export const roomsAddAgent = defineGuardedAction({
+  action: 'rooms.add_agent',
+  grantActionName: ADD_TO_ROOM_ACTION,
+  /**
+   * Bind an add_to_room grant to BOTH halves of what was approved.
+   *
+   * The room half is bound by id rather than by name (case 12): the precheck
+   * deliberately does not re-resolve a stamped `room_platform_id` from the
+   * name, so a rename — or a second room created under the same name while the
+   * card sat unanswered — cannot redirect the approval.
+   *
+   * The agent half is NOT symmetric: the precheck re-resolves the agent name
+   * through the caller's destination namespace on every run, so this
+   * comparison is live. A destination repointed at a different agent group
+   * between card and click fails the check and the replay denies rather than
+   * adding an agent nobody approved.
+   */
+  grantCoversRequest: (grant, input) => {
+    try {
+      const approved = JSON.parse(grant.payload) as Record<string, unknown>;
+      return (
+        approved[ROOM_PLATFORM_ID_KEY] === input.payload[ROOM_PLATFORM_ID_KEY] &&
+        approved[TARGET_AGENT_GROUP_KEY] === input.payload[TARGET_AGENT_GROUP_KEY]
+      );
+    } catch {
+      return false;
+    }
+  },
+  decide: (input) => {
+    if (input.actor.kind !== 'agent') return DENY('add_to_room is a container-originated action.');
+    if (cliScopeOf(input.actor.agentGroupId) === 'global') {
+      return ALLOW('trusted global-scope agent group');
+    }
+    // Fail closed: an unstamped payload (a hand-rolled consult, or a precheck
+    // that could not resolve the workgroups) is never a sibling.
+    const callerWorkgroup = stringOf(input, CALLER_WORKGROUP_KEY);
+    const targetWorkgroup = stringOf(input, TARGET_WORKGROUP_KEY);
+    if (callerWorkgroup && targetWorkgroup && callerWorkgroup === targetWorkgroup) {
+      return ALLOW(`sibling agent group — both sides are in workgroup ${callerWorkgroup}`);
+    }
+    return HOLD('adding an agent outside your workgroup requires admin approval');
+  },
+});
