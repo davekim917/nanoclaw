@@ -26,6 +26,29 @@ const raceCloses = vi.hoisted(() => ({ sessionId: null as string | null }));
 // row is written. Inert unless a test arms it.
 const raceRevokes = vi.hoisted(() => ({ sessionId: null as string | null }));
 
+// Revokes the wiring LATER than `raceRevokes`: inside the mailbox action, after
+// the in-session `resolveAndValidateDestination` has passed and immediately
+// before the upsert's lease block runs — the window a revocation that queued
+// behind the validation's transaction commits into (#460 round 2). Inert
+// unless a test arms it.
+const raceRevokesBeforeUpsert = vi.hoisted(() => ({ agentGroupId: null as string | null }));
+
+vi.mock('./central-lease.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./central-lease.js')>();
+  return {
+    ...actual,
+    withCentralSync: (async (fn: () => unknown, label?: string) => {
+      if (label === 'scheduleTask upsert' && raceRevokesBeforeUpsert.agentGroupId) {
+        const agentGroupId = raceRevokesBeforeUpsert.agentGroupId;
+        raceRevokesBeforeUpsert.agentGroupId = null;
+        const { getRawDb: centralDb } = await import('./connection.js');
+        centralDb().prepare('DELETE FROM messaging_group_agents WHERE agent_group_id = ?').run(agentGroupId);
+      }
+      return (actual.withCentralSync as (fn: () => unknown, label?: string) => Promise<unknown>)(fn, label);
+    }) as typeof actual.withCentralSync,
+  };
+});
+
 // Makes the guarded task-row write itself fail — a busy or corrupt session DB —
 // so a test can see which of the two synchronous statements committed. Inert
 // unless a test arms it.
@@ -1594,6 +1617,44 @@ describe('test_scheduleTask_revalidates_the_session_after_the_await', () => {
     const rows = db.prepare("SELECT id FROM messages_in WHERE series_id = 's-revoke'").all() as Array<{ id: string }>;
     db.close();
     expect(rows.map((r) => r.id)).toEqual(['t-revoke-1']);
+  });
+});
+
+/**
+ * The in-session re-validation runs in its own central transaction; the upsert
+ * runs in a later lease block. A revocation queued behind that transaction
+ * commits in between, and the task persists a route the agent has just lost.
+ * Since #460 round 2 the validation is re-run as raw leased reads INSIDE the
+ * upsert's own synchronous block — the revoke either lands before the block
+ * (rejected there) or after the row (and the next schedule sees it).
+ *
+ * Reverting the in-block validation fails this test: the task persists.
+ */
+describe('destination re-validation shares the upsert lease block', () => {
+  it('refuses to persist a task when the wiring is revoked between the validation and the upsert', async () => {
+    const processAfter = new Date(Date.now() + 86400000).toISOString();
+    const base = {
+      agentGroupId: AGENT_GROUP_ID,
+      cron: '0 5 * * *',
+      processAfter,
+      seriesId: 's-revoke-late',
+      destination: TEST_DESTINATION,
+    };
+    await scheduleTask({ ...base, id: 't-revoke-late-1', prompt: 'first' });
+    const sessionId = taskSessionIdFor('s-revoke-late');
+
+    raceRevokesBeforeUpsert.agentGroupId = AGENT_GROUP_ID;
+    await expect(scheduleTask({ ...base, id: 't-revoke-late-2', prompt: 'second' })).rejects.toThrow(
+      /is not wired to messaging group/,
+    );
+    expect(raceRevokesBeforeUpsert.agentGroupId, 'the interleave armed above must have fired').toBeNull();
+
+    const db = openInboundDb(inboundPath(sessionId));
+    const rows = db.prepare("SELECT id FROM messages_in WHERE series_id = 's-revoke-late'").all() as Array<{
+      id: string;
+    }>;
+    db.close();
+    expect(rows.map((r) => r.id)).toEqual(['t-revoke-late-1']);
   });
 });
 

@@ -32,8 +32,7 @@ import {
   setTaskRoutingPlatformId,
   withQuietInvalidationSync,
 } from './sessions.js';
-import { centralTransaction, withCentralSync } from './central-lease.js';
-import { getDb } from './connection.js';
+import { withCentralSync, withRawDb } from './central-lease.js';
 
 /** Did the row land, or was the session closed under us before the write? */
 type StampOutcome = 'written' | 'session-closed';
@@ -184,33 +183,30 @@ export async function resolveActiveSession(agentGroupId: string, messagingGroupI
  * `destination` is required by `TaskDef`'s type — TypeScript prevents
  * callers from omitting it; no runtime guard needed.
  *
- * One central transaction (`centralTransaction`, plan §4.4): BEGIN IMMEDIATE
- * under the driver, so a parallel INSERT into messaging_group_agents can't
- * slip a cross-workgroup peer in between the wiring check and the peer
- * SELECT. The closure is DB-only — reads, awaited in sequence, no side
- * effects — which is also what lets `stamp` below re-run it inside a mailbox
- * action: the inbound.db write happens after it, against a different file,
- * once the central wiring has been serialized under the writer lock.
+ * SYNCHRONOUS and lease-only (seam 3 §4.5 I-1, #460 round 2): the reads go
+ * through `withRawDb`, so this runs only inside a `withCentralSync` block,
+ * where no driver transaction can be open and nothing can interleave — a
+ * parallel INSERT into messaging_group_agents (itself a `centralTransaction`)
+ * either committed before the block or waits behind it. That is what lets
+ * `stamp` below run the validation in the SAME synchronous block as the task
+ * upsert: a revocation that queued behind an earlier check cannot commit
+ * between the proof and the row. `resolveAndValidateDestination` is the
+ * standalone form for the pre-check at the top of `scheduleTask`.
  */
-async function resolveAndValidateDestination(def: TaskDef): Promise<{ messagingGroupId: string }> {
+function validateDestinationUnderLease(def: TaskDef): { messagingGroupId: string } {
   const { platformId, channelType } = def.destination;
-  return centralTransaction(async () => {
-    const db = getDb();
-    const mg = await db.get<{ id: string }>(
-      'SELECT id FROM messaging_groups WHERE platform_id = ? AND channel_type = ?',
-      platformId,
-      channelType,
-    );
+  return withRawDb((db) => {
+    const mg = db
+      .prepare('SELECT id FROM messaging_groups WHERE platform_id = ? AND channel_type = ?')
+      .get(platformId, channelType) as { id: string } | undefined;
     if (!mg) {
       throw new Error(
         `scheduleTask: no messaging group found for ${channelType}:${platformId} (task ${def.id}). The destination must reference an existing messaging group.`,
       );
     }
-    const wired = await db.get<{ ok: number }>(
-      'SELECT 1 AS ok FROM messaging_group_agents WHERE agent_group_id = ? AND messaging_group_id = ?',
-      def.agentGroupId,
-      mg.id,
-    );
+    const wired = db
+      .prepare('SELECT 1 AS ok FROM messaging_group_agents WHERE agent_group_id = ? AND messaging_group_id = ?')
+      .get(def.agentGroupId, mg.id);
     if (!wired) {
       throw new Error(
         `scheduleTask: agent group ${def.agentGroupId} is not wired to messaging group ${mg.id} (${channelType}:${platformId}). Refusing to schedule task ${def.id} — this would route output to a chat the agent isn't authorized for. Wire the messaging group via messaging_group_agents first, or correct the agentGroupId.`,
@@ -226,23 +222,22 @@ async function resolveAndValidateDestination(def: TaskDef): Promise<{ messagingG
     // installers, the scheduled-tasks-board) must too. NULL workgroup_id on
     // either side is treated as a boundary violation (defensive: matches
     // dashboard isCrossWorkgroup's null-handling).
-    const hasWorkgroupsCol = (await db.all<{ name: string }>(`PRAGMA table_info(agent_groups)`)).some(
+    const hasWorkgroupsCol = (db.prepare(`PRAGMA table_info(agent_groups)`).all() as Array<{ name: string }>).some(
       (c) => c.name === 'workgroup_id',
     );
     if (hasWorkgroupsCol) {
-      const schedulingAg = await db.get<{ workgroup_id: string | null }>(
-        'SELECT workgroup_id FROM agent_groups WHERE id = ?',
-        def.agentGroupId,
-      );
+      const schedulingAg = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').get(def.agentGroupId) as
+        | { workgroup_id: string | null }
+        | undefined;
       const schedulingWg = schedulingAg?.workgroup_id ?? null;
-      const peerWorkgroups = await db.all<{ id: string; workgroup_id: string | null }>(
-        `SELECT ag.id, ag.workgroup_id
+      const peerWorkgroups = db
+        .prepare(
+          `SELECT ag.id, ag.workgroup_id
              FROM messaging_group_agents mga
              JOIN agent_groups ag ON ag.id = mga.agent_group_id
             WHERE mga.messaging_group_id = ? AND mga.agent_group_id != ?`,
-        mg.id,
-        def.agentGroupId,
-      );
+        )
+        .all(mg.id, def.agentGroupId) as Array<{ id: string; workgroup_id: string | null }>;
       for (const peer of peerWorkgroups) {
         if (peer.workgroup_id == null || schedulingWg == null || peer.workgroup_id !== schedulingWg) {
           throw new Error(
@@ -256,7 +251,12 @@ async function resolveAndValidateDestination(def: TaskDef): Promise<{ messagingG
     }
 
     return { messagingGroupId: mg.id };
-  }, 'resolveAndValidateDestination');
+  });
+}
+
+/** The pre-check form: one lease block around `validateDestinationUnderLease`. */
+async function resolveAndValidateDestination(def: TaskDef): Promise<{ messagingGroupId: string }> {
+  return withCentralSync(() => validateDestinationUnderLease(def), 'resolveAndValidateDestination');
 }
 
 export async function scheduleTask(def: TaskDef): Promise<void> {
@@ -311,19 +311,22 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
       // check-then-write adjacency the seam's await broke, at the seam rather
       // than at each call site.
       if ((await getSession(sessionId))?.status !== 'active') return 'session-closed';
-      // AUTHORIZATION, re-validated here too, for the same reason and in the
-      // same place: `resolveAndValidateDestination` ran before the funnel's
-      // await, and the wiring it proved can be revoked in that window — a
+      // AUTHORIZATION, re-validated INSIDE the upsert's lease block below (see
+      // `validateDestinationUnderLease`), for the same reason and in the same
+      // place: `resolveAndValidateDestination` ran before the funnel's await,
+      // and the wiring it proved can be revoked in that window — a
       // `messaging_group_agents` row removed, or a cross-workgroup peer added.
       // The task row persists the route, and `delivery.ts` permits a
       // non-origin send when `agent_destinations` has no entry, so a stale
-      // authorization here becomes a real one at fire time.
+      // authorization here becomes a real one at fire time. Re-running it in
+      // its OWN transaction ahead of the block was not enough (#460 round 2):
+      // a revocation queued behind that transaction commits the moment it
+      // ends, before the block's lease is taken. Sharing the block closes it.
       //
       // It throws on failure, exactly as the pre-check does, so the caller's
       // contract is unchanged and nothing is written — the throw lands before
-      // `upsertTaskSeries`. Re-running it is a read-only IMMEDIATE transaction
-      // on the central DB; it has no side effects.
-      await resolveAndValidateDestination(def);
+      // `upsertTaskSeries`, and the quiet mark is untouched.
+      //
       // The ROUTING STAMP lands here, not in `resolveTaskSession` above.
       // `sessions.task_routing_platform_id` is what the Observatory derives a
       // task thread's channel from, and re-scheduling an existing series
@@ -379,23 +382,22 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
       // caller of the failed attempt already sees as an error; making the
       // restore conditional on the row still matching this attempt needs a
       // mailbox-side compare-and-restore and is left on #416.
-      const upserted = await withCentralSync(
-        () =>
-          withQuietInvalidationSync(sessionId, () =>
-            mailbox.upsertTaskSeries({
-              id: def.id,
-              seriesId: def.seriesId,
-              processAfter: def.processAfter,
-              scheduledFor: def.scheduledFor,
-              recurrence: def.cron,
-              content,
-              platformId: def.destination.platformId,
-              channelType: def.destination.channelType,
-              threadId: def.destination.threadId,
-            }),
-          ),
-        'scheduleTask upsert',
-      );
+      const upserted = await withCentralSync(() => {
+        validateDestinationUnderLease(def);
+        return withQuietInvalidationSync(sessionId, () =>
+          mailbox.upsertTaskSeries({
+            id: def.id,
+            seriesId: def.seriesId,
+            processAfter: def.processAfter,
+            scheduledFor: def.scheduledFor,
+            recurrence: def.cron,
+            content,
+            platformId: def.destination.platformId,
+            channelType: def.destination.channelType,
+            threadId: def.destination.threadId,
+          }),
+        );
+      }, 'scheduleTask upsert');
       try {
         await setTaskRoutingPlatformId(sessionId, def.destination.platformId);
       } catch (err) {
