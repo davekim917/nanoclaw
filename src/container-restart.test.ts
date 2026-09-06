@@ -16,6 +16,9 @@ vi.mock('./log.js', () => ({
 const mockIsContainerRunning = vi.fn<(id: string) => boolean>();
 const mockIsContainerSpawning = vi.fn<(id: string) => boolean>();
 const mockHasPendingAdoption = vi.fn<(id: string) => boolean>(() => false);
+const mockResolvePendingSurvivor = vi.fn<(id: string) => Promise<'running' | 'gone' | 'unknown'>>(
+  async () => 'running',
+);
 // Process generation for a session's container. Constant unless a test models a
 // replacement spawning during the restart's async pending read.
 const mockGetContainerSpawnedAt = vi.fn<(id: string) => number>(() => 1000);
@@ -28,6 +31,7 @@ vi.mock('./container-runner.js', async (importOriginal) => {
     isContainerRunning: (...args: unknown[]) => mockIsContainerRunning(args[0] as string),
     isContainerSpawning: (...args: unknown[]) => mockIsContainerSpawning(args[0] as string),
     hasPendingAdoption: (...args: unknown[]) => mockHasPendingAdoption(args[0] as string),
+    resolvePendingSurvivor: (...args: unknown[]) => mockResolvePendingSurvivor(args[0] as string),
     // The real definition, over the same mocks: a container "owns"
     // outbound.db while it is running, still spawning, or a pending survivor.
     containerOwnsOutbound: (...args: unknown[]) =>
@@ -257,6 +261,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockIsContainerSpawning.mockReturnValue(false);
   mockGetContainerSpawnedAt.mockReset().mockReturnValue(1000);
+  mockResolvePendingSurvivor.mockReset().mockResolvedValue('running');
   activeEpochs.clear();
   acknowledgedEpochs.clear();
   processingSessions.clear();
@@ -740,6 +745,34 @@ describe('restartAgentGroupContainers', () => {
 
     expect(mockKillContainer.mock.calls.map((c) => c[0])).toEqual(['s-tracked', 's-pending']);
     expect(count).toBe(2);
+    mockHasPendingAdoption.mockReset();
+    mockHasPendingAdoption.mockReturnValue(false);
+  });
+
+  it('an unlisted pending survivor is resolved before its restart is counted', async () => {
+    // A hold seeded on an inventory failure has no container name; the restart
+    // re-lists it first. Gone → nothing restarted and no wake row written;
+    // unknown → reported as failed, not restarted; running → restarted.
+    mockGetSessionsByAgentGroup.mockReturnValue([makeSession('s-unlisted', 'g1')]);
+    mockIsContainerRunning.mockReturnValue(false);
+    mockHasPendingAdoption.mockImplementation((id) => id === 's-unlisted');
+
+    mockResolvePendingSurvivor.mockResolvedValueOnce('gone');
+    expect(await restartAgentGroupContainers('g1', 'test', 'Resuming.')).toBe(0);
+    expect(mockKillContainer).not.toHaveBeenCalled();
+    expect(mockWriteSessionMessage).not.toHaveBeenCalled();
+
+    mockResolvePendingSurvivor.mockResolvedValueOnce('unknown');
+    expect(await restartAgentGroupContainers('g1', 'test', 'Resuming.')).toBe(0);
+    expect(mockKillContainer).not.toHaveBeenCalled();
+    expect(log.warn).toHaveBeenCalledWith(
+      'Restart: could not resolve a pending survivor; leaving it running',
+      expect.objectContaining({ sessionId: 's-unlisted' }),
+    );
+
+    mockResolvePendingSurvivor.mockResolvedValueOnce('running');
+    expect(await restartAgentGroupContainers('g1', 'test', 'Resuming.')).toBe(1);
+    expect(mockKillContainer.mock.calls.map((c) => c[0])).toEqual(['s-unlisted']);
     mockHasPendingAdoption.mockReset();
     mockHasPendingAdoption.mockReturnValue(false);
   });

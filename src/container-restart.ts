@@ -11,6 +11,7 @@ import {
   isContainerRunning,
   isContainerSpawning,
   killContainer,
+  resolvePendingSurvivor,
   sessionStillActive,
 } from './container-runner.js';
 import { requestWake } from './request-wake.js';
@@ -844,6 +845,23 @@ export async function restartAgentGroupContainers(
   let restarted = 0;
   let failed = 0;
   for (const session of sessions) {
+    // A pending survivor held on an adoption-inventory failure has no
+    // container name yet, and nothing can stop a container it cannot name.
+    // Resolve it from the runtime BEFORE the wake row is written: gone means
+    // there is nothing to restart (and no row to leave behind); unknown means
+    // this restart cannot be performed or reported (#479 round 2).
+    if (hasPendingAdoption(session.id)) {
+      const resolved = await resolvePendingSurvivor(session.id);
+      if (resolved === 'gone') continue;
+      if (resolved === 'unknown') {
+        failed += 1;
+        log.warn('Restart: could not resolve a pending survivor; leaving it running', {
+          agentGroupId,
+          sessionId: session.id,
+        });
+        continue;
+      }
+    }
     // WRITE FIRST. `on_wake` rows are visible only on a container's FIRST poll
     // (`selection.ts` adds `AND on_wake = 0` to every later one), so the row
     // has to exist before any fresh container looks — writing it after the

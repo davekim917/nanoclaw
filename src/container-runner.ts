@@ -2403,6 +2403,36 @@ function stopPendingSurvivor(sessionId: string, reason: string, onExit: Containe
   void releasePendingHold(sessionId);
 }
 
+/**
+ * Make an unlisted pending survivor stoppable (#479 round 2): a hold seeded on
+ * an inventory failure carries no container name, so nothing can stop it by
+ * name. Re-list from the runtime: found → the name is recorded and the exit
+ * observer armed, `'running'`; not listed → the survivor is gone and its hold
+ * is released, `'gone'`; the runtime cannot be asked → `'unknown'`, and the
+ * caller must not report a restart it could not perform. A hold that already
+ * carries a name is `'running'` without a listing.
+ */
+export async function resolvePendingSurvivor(sessionId: string): Promise<'running' | 'gone' | 'unknown'> {
+  const hold = pendingHolds.get(sessionId);
+  if (!hold) return pendingAdoptions.has(sessionId) ? 'unknown' : 'gone';
+  if (hold.containerName) return 'running';
+  let listed: InstallContainerScope | undefined;
+  try {
+    listed = adoptionListing().find((container) => container.sessionId === sessionId);
+  } catch (err) {
+    log.warn('Could not re-list an unlisted pending survivor', { sessionId, err });
+    return 'unknown';
+  }
+  if (!listed) {
+    log.info('Unlisted pending survivor is gone — releasing its hold', { sessionId });
+    await releasePendingHold(sessionId);
+    return 'gone';
+  }
+  hold.containerName = listed.name;
+  observePending(sessionId);
+  return 'running';
+}
+
 /** Is the container provably gone? A runtime that cannot be asked never proves absence. */
 function containerProvenGone(containerName: string): boolean {
   try {

@@ -53,6 +53,7 @@ vi.mock('./container-runner.js', () => ({
   containerOwnsOutbound: vi.fn(() => false),
   getContainerSpawnedAt: vi.fn(() => 0),
   hasPendingAdoption: vi.fn(() => false),
+  resolvePendingSurvivor: vi.fn(async () => 'gone'),
   isContainerRunning: vi.fn(() => false),
   isContainerSpawning: vi.fn(() => false),
   killContainer: vi.fn(),
