@@ -33,6 +33,7 @@
  *      every sweep for 24h, holding a memory-budget slot the whole time.
  */
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
@@ -89,7 +90,7 @@ function bindingNameText(node: ts.PropertyName | ts.BindingName | undefined): st
 interface Importer {
   file: string;
   line: number;
-  form: 'static' | 'dynamic';
+  form: 'static' | 'dynamic' | 'namespace' | 'dynamic-namespace';
 }
 
 /**
@@ -119,6 +120,14 @@ function findImportersOf(files: string[], targetPath: string, bindingName: strin
           const hit = namedBindings.elements.some((el) => bindingNameText(el.propertyName ?? el.name) === bindingName);
           if (hit) results.push({ file: rel, line: lineOf(node), form: 'static' });
         }
+        // Namespace: import * as runner from '<specifier>'; runner.bindingName(...).
+        // Flagged conservatively: the binding is reachable through the
+        // namespace, and the cheap prefilter above already proved the file
+        // mentions the name, so treating the import itself as the caller is
+        // the fail-closed reading (Codex on #470).
+        if (resolved === targetPath && namedBindings && ts.isNamespaceImport(namedBindings)) {
+          results.push({ file: rel, line: lineOf(node), form: 'namespace' });
+        }
       }
       // Dynamic: const { bindingName } = await import('<specifier>');
       // `ts.isImportCall` is not part of the public typings (present at
@@ -136,6 +145,13 @@ function findImportersOf(files: string[], targetPath: string, bindingName: strin
                 (el) => bindingNameText(el.propertyName ?? el.name) === bindingName,
               );
               if (hit) results.push({ file: rel, line: lineOf(node), form: 'dynamic' });
+            } else {
+              // Any other consumer of the module namespace — `const m = await
+              // import(...)`, `(await import(...)).bindingName`, `.then(m => ...)` —
+              // is flagged conservatively for the same reason as the static
+              // namespace import: the file mentions the name and holds the
+              // whole module.
+              results.push({ file: rel, line: lineOf(node), form: 'dynamic-namespace' });
             }
           }
         }
@@ -146,6 +162,37 @@ function findImportersOf(files: string[], targetPath: string, bindingName: strin
   }
   return results;
 }
+
+describe('the resolver flags every import shape that can reach the binding (not vacuous)', () => {
+  const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wake-chokepoint-'));
+  const target = path.join(fixtureDir, 'target.ts');
+  fs.writeFileSync(target, 'export function wakeContainer(): void {}\n');
+  const cases: Array<[string, string, Importer['form']]> = [
+    ['named.ts', "import { wakeContainer } from './target.js';\nwakeContainer();\n", 'static'],
+    ['aliased.ts', "import { wakeContainer as w } from './target.js';\nw();\n", 'static'],
+    ['namespace.ts', "import * as runner from './target.js';\nrunner.wakeContainer();\n", 'namespace'],
+    ['dynamic.ts', "const { wakeContainer } = await import('./target.js');\nwakeContainer();\n", 'dynamic'],
+    ['dynamic-ns.ts', "const m = await import('./target.js');\nm.wakeContainer();\n", 'dynamic-namespace'],
+    ['dynamic-member.ts', "(await import('./target.js')).wakeContainer();\n", 'dynamic-namespace'],
+  ];
+  for (const [name, source] of cases) fs.writeFileSync(path.join(fixtureDir, name), source);
+  const found = findImportersOf(
+    cases.map(([name]) => path.join(fixtureDir, name)),
+    path.resolve(target),
+    'wakeContainer',
+  );
+
+  it.each(cases)('%s is reported as %s', (name, _source, form) => {
+    const hit = found.find((i) => path.basename(i.file) === name);
+    expect(hit?.form, `${name} bypassed the resolver`).toBe(form);
+  });
+
+  it('does not flag a file that imports something else from the module', () => {
+    const other = path.join(fixtureDir, 'other.ts');
+    fs.writeFileSync(other, "import { somethingElse } from './target.js';\nsomethingElse();\n");
+    expect(findImportersOf([other], path.resolve(target), 'wakeContainer')).toEqual([]);
+  });
+});
 
 describe('wakeContainer has exactly one importer', () => {
   const files = allSourceFiles();
