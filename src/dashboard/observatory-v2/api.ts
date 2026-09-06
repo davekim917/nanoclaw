@@ -130,7 +130,8 @@ export async function reviewDecision(
     typeof body.idempotency_key !== 'string' ||
     body.idempotency_key.length < 1 ||
     body.idempotency_key.length > 128 ||
-    !['claim', 'release', 'answer'].includes(String(body.action)) ||
+    typeof body.action !== 'string' ||
+    !['claim', 'release', 'answer'].includes(body.action) ||
     ('text' in body && typeof body.text !== 'string')
   )
     throw new SignalError(400, 'invalid_request');

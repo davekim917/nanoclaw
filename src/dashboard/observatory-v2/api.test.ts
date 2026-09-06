@@ -134,6 +134,23 @@ describe('Signal source and authority boundaries', () => {
     ).rejects.toThrow('not_found');
     expect((await buildSignalData(member, 'other', deps())).decisions).toEqual([]);
   });
+  it('rejects a non-string review action without creating a review', async () => {
+    const source = (await buildSignalData(ctx(), 'w', deps())).decisions[0]!;
+    await expect(
+      reviewDecision(
+        source.id,
+        {
+          expected_version: 0,
+          evidence_hash: source.evidence_hash,
+          action: ['claim'],
+          idempotency_key: 'invalid-action',
+        },
+        ctx(),
+        deps(),
+      ),
+    ).rejects.toThrow('invalid_request');
+    expect(await readReview(source.id)).toBeUndefined();
+  });
   it('keeps exact named approval authority even for global owner, without payload', async () => {
     await getDb().run(
       `INSERT INTO pending_approvals VALUES('p','a',NULL,'Exact approval','install_packages',?,NULL,'j','slack','C','123.456','pending')`,
@@ -389,6 +406,37 @@ it('reads the declared canonical workgroup board when legacy group copies are ab
       dataRoot: path.join(root, 'data'),
     });
     expect(release?.items[0]!.id).toBe(item.id);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+it('skips a malformed release board timestamp before a healthy declaration', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'signal-release-'));
+  try {
+    const invalid = path.join(root, 'data', 'workgroups', 'w', 'invalid');
+    const healthy = path.join(root, 'data', 'workgroups', 'w', 'healthy');
+    fs.mkdirSync(invalid, { recursive: true });
+    fs.mkdirSync(healthy, { recursive: true });
+    fs.writeFileSync(path.join(invalid, 'release-state.json'), JSON.stringify({ asOf: 'not-a-date', items: [item] }));
+    fs.writeFileSync(
+      path.join(healthy, 'release-state.json'),
+      JSON.stringify({ asOf: '2026-09-05T00:00:00Z', items: [item] }),
+    );
+    await getDb().run(
+      'UPDATE workgroups SET attention_sources=? WHERE id=?',
+      JSON.stringify([
+        { kind: 'release-board', root: 'invalid', channel_key: 'slack:C' },
+        { kind: 'release-board', root: 'healthy', channel_key: 'slack:C' },
+      ]),
+      'w',
+    );
+    expect(
+      (await readSignalRelease('w', {
+        groupsRoot: path.join(root, 'groups'),
+        dataRoot: path.join(root, 'data'),
+      }))?.asOf,
+    ).toBe('2026-09-05T00:00:00Z');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

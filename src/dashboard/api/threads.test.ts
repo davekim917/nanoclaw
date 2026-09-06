@@ -502,6 +502,87 @@ describe('buildThreadList — grouping', () => {
     expect(new Set(threads.map((t) => t.channel_key))).toEqual(new Set(['slack:CTESTCHAN01']));
   });
 
+  it('keeps sibling sessions together when an observatory page crosses their thread boundary', async () => {
+    const sharedThread = 'slack:CTESTCHAN01:shared';
+    for (const id of ['ag-fresh', 'ag-before', 'ag-shared-a', 'ag-shared-b', 'ag-late-a', 'ag-late-b']) {
+      await seedAgentGroup(id);
+    }
+
+    // The newest thread uses the legacy naive timestamp shape while the rest
+    // use ISO values, so the SQL page ordering must normalize both forms.
+    insertSession({
+      id: 's-fresh',
+      agentGroupId: 'ag-fresh',
+      threadId: 'slack:CTESTCHAN01:fresh',
+      lastActive: '2026-08-20 11:59:59',
+      lastOutboundAt: '2026-08-20 11:59:59',
+    });
+    insertSession({
+      id: 's-before',
+      agentGroupId: 'ag-before',
+      threadId: 'slack:CTESTCHAN01:before',
+      lastActive: iso(20_000),
+      lastOutboundAt: iso(20_000),
+    });
+    insertSession({
+      id: 's-shared-a',
+      agentGroupId: 'ag-shared-a',
+      threadId: sharedThread,
+      lastActive: iso(30_000),
+      lastOutboundAt: iso(30_000),
+    });
+    insertSession({
+      id: 's-shared-b',
+      agentGroupId: 'ag-shared-b',
+      threadId: sharedThread,
+      lastActive: iso(60_000),
+      lastOutboundAt: iso(60_000),
+    });
+    insertSession({
+      id: 's-late-a',
+      agentGroupId: 'ag-late-a',
+      threadId: 'slack:CTESTCHAN01:late-a',
+      lastActive: iso(90_000),
+      lastOutboundAt: iso(90_000),
+    });
+    insertSession({
+      id: 's-late-b',
+      agentGroupId: 'ag-late-b',
+      threadId: 'slack:CTESTCHAN01:late-b',
+      lastActive: iso(120_000),
+      lastOutboundAt: iso(120_000),
+    });
+
+    // SQL applies the offset to grouped thread keys and returns one lookahead
+    // thread. Later pages must not load sessions from the preceding pages.
+    const page = async (offset: number) => {
+      const pageSize = 2;
+      const { threads } = await buildThreadList(
+        makeCtx(),
+        { ...LIST_OPTS, limit: pageSize + 1, offset },
+        deps(),
+      );
+      return {
+        threads: threads.slice(0, pageSize),
+        hasMore: threads.length > pageSize,
+      };
+    };
+
+    const firstPage = await page(0);
+    const secondPage = await page(2);
+    const lastPage = await page(4);
+
+    expect(firstPage.threads.map((thread) => thread.thread_id)).toEqual([
+      'slack:CTESTCHAN01:fresh',
+      'slack:CTESTCHAN01:before',
+    ]);
+    expect(secondPage.threads.map((thread) => thread.thread_id)).toEqual([sharedThread, 'slack:CTESTCHAN01:late-a']);
+    expect([...secondPage.threads[0]!.session_ids].sort()).toEqual(['s-shared-a', 's-shared-b']);
+    expect(secondPage.threads.flatMap((thread) => thread.session_ids)).not.toContain('s-fresh');
+    expect(lastPage.threads.map((thread) => thread.thread_id)).toEqual(['slack:CTESTCHAN01:late-b']);
+    expect([firstPage.hasMore, secondPage.hasMore, lastPage.hasMore]).toEqual([true, true, false]);
+  });
+
   it('does not drop sessions with a NULL thread_id — they get a synthetic key', async () => {
     await seedAgentGroup('ag-1');
     insertSession({ id: 's-null', agentGroupId: 'ag-1', threadId: null });

@@ -606,8 +606,8 @@ const MAX_LIMIT = 1000;
  * `datetime()` wraps both sides because the columns are NOT one format:
  * `last_active` / `created_at` are ISO-8601 with `Z`, while `last_outbound_at`
  * is written naive by `bumpLastOutbound`. The same mismatch is why ordering
- * happens in JS below (`parseUtcTimestampMs`) rather than in SQL — a string comparison
- * between the two shapes silently sorts every ISO value above every naive one.
+ * uses numeric `julianday()` values in SQL rather than a string comparison,
+ * which silently sorts every ISO value above every naive one.
  */
 async function selectScopedSessions(
   ctx: AuthedRequestContext,
@@ -616,6 +616,8 @@ async function selectScopedSessions(
     groupId: string | null;
     includeArchived: boolean;
     sinceHours: number | null;
+    limit: number;
+    offset?: number;
     threadId?: string | null;
   },
   now: number,
@@ -665,24 +667,49 @@ async function selectScopedSessions(
   // agent mints a session row and would otherwise clutter the queue forever.
   conditions.push("(s.last_outbound_at IS NOT NULL OR s.container_status <> 'stopped' OR t.task_id IS NOT NULL)");
 
+  // Limit thread keys rather than sessions: sibling adapters can contribute
+  // multiple rows to one thread, and callers need all of those participants.
+  // `julianday()` gives the SQL page boundary the same ordering as `activityMs`
+  // for both ISO-8601 and legacy naive UTC timestamps.
   const sql = `
-    SELECT s.id, s.agent_group_id, s.messaging_group_id, s.thread_id, s.task_routing_platform_id, s.agent_provider,
-           s.title, s.title_generated_at, s.last_active, s.last_outbound_at, s.last_outbound_kind,
-           s.archived_at, s.created_at, s.done_proposal,
-           t.status         AS attached_task_status,
-           t.needs_input    AS attached_task_needs_input,
-           t.steer_question AS attached_task_steer_question
-      FROM sessions s
- LEFT JOIN (
+    WITH scoped_sessions AS (
+      SELECT s.id, s.agent_group_id, s.messaging_group_id, s.thread_id, s.task_routing_platform_id, s.agent_provider,
+             s.title, s.title_generated_at, s.last_active, s.last_outbound_at, s.last_outbound_kind,
+             s.archived_at, s.created_at, s.done_proposal,
+             t.status         AS attached_task_status,
+             t.needs_input    AS attached_task_needs_input,
+             t.steer_question AS attached_task_steer_question,
+             COALESCE(s.thread_id, 'session:' || s.id) AS thread_key,
+             MAX(
+               COALESCE(julianday(s.last_outbound_at), -1.0e300),
+               COALESCE(julianday(s.last_active), -1.0e300),
+               COALESCE(julianday(s.created_at), -1.0e300)
+             ) AS activity
+        FROM sessions s
+   LEFT JOIN (
               SELECT task_id, child_session_id, status, needs_input, steer_question, admitted_at,
                      ROW_NUMBER() OVER (PARTITION BY child_session_id ORDER BY admitted_at DESC) AS rn
                 FROM tasks
                WHERE child_session_id IS NOT NULL
                  AND status IN ('pending', 'running')
             ) t ON t.child_session_id = s.id AND t.rn = 1
-     WHERE ${conditions.join(' AND ')}
+       WHERE ${conditions.join(' AND ')}
+    ), thread_page AS (
+      SELECT thread_key
+        FROM scoped_sessions
+       GROUP BY thread_key
+       ORDER BY MAX(activity) DESC, thread_key ASC
+       LIMIT ?
+      OFFSET ?
+    )
+    SELECT id, agent_group_id, messaging_group_id, thread_id, task_routing_platform_id, agent_provider,
+           title, title_generated_at, last_active, last_outbound_at, last_outbound_kind,
+           archived_at, created_at, done_proposal,
+           attached_task_status, attached_task_needs_input, attached_task_steer_question
+      FROM scoped_sessions
+     WHERE thread_key IN (SELECT thread_key FROM thread_page)
   `;
-  return getDb().all<ThreadSessionRow>(sql, ...values);
+  return getDb().all<ThreadSessionRow>(sql, ...values, opts.limit, opts.offset ?? 0);
 }
 
 export interface ChannelDirectory {
@@ -1463,6 +1490,8 @@ export async function buildThreadList(
     includeArchived: boolean;
     sinceHours: number | null;
     limit: number;
+    /** Number of grouped session threads to skip before collecting this page. */
+    offset?: number;
     threadId?: string | null;
   },
   deps: ThreadListDeps = {},

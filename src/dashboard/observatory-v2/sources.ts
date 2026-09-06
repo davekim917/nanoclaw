@@ -74,7 +74,9 @@ export async function readSignalRelease(
     try {
       const state = JSON.parse(file.text) as ReleaseState;
       if (typeof state.asOf !== 'string' || !Array.isArray(state.items)) continue;
-      if (!newest || Date.parse(state.asOf) > Date.parse(newest.asOf)) newest = state;
+      const asOf = Date.parse(state.asOf);
+      if (!Number.isFinite(asOf)) continue;
+      if (!newest || asOf > Date.parse(newest.asOf)) newest = state;
     } catch (error) {
       if (!(error instanceof SyntaxError)) throw error;
       /* health surface reports unavailable rather than an empty board */
@@ -344,6 +346,9 @@ export async function buildSignalData(
       scene = sceneBase;
       result.sources.push(health(wg.id, 'release board', null, now, 'Declared release source could not be read.'));
     }
+    const offset = deps.threadOffset ?? 0;
+    const limit = deps.threadLimit ?? 200;
+    const injectedThreads = !!deps.threads;
     try {
       threads = await (
         deps.threads ??
@@ -354,7 +359,8 @@ export async function buildSignalData(
               groupId: null,
               includeArchived: false,
               sinceHours: null,
-              limit: (deps.threadOffset ?? 0) + (deps.threadLimit ?? 200) + 1,
+              limit: limit + 1,
+              offset,
               threadId: deps.threadId,
             })
           ).threads)
@@ -362,10 +368,9 @@ export async function buildSignalData(
     } catch {
       result.sources.push(health(wg.id, 'threads', null, now, 'Thread source could not be read.'));
     }
-    const offset = deps.threadOffset ?? 0;
-    const limit = deps.threadLimit ?? 200;
+    const localOffset = injectedThreads ? offset : 0;
     const backed = threads.filter((t) => t.session_ids.length > 0);
-    const hasMore = backed.length > offset + limit;
+    const hasMore = backed.length > localOffset + limit;
     result.thread_coverage!.push({
       workgroup_id: wg.id,
       offset,
@@ -373,7 +378,7 @@ export async function buildSignalData(
       has_more: hasMore,
       next_offset: hasMore ? offset + limit : null,
     });
-    threads = backed.slice(offset, offset + limit);
+    threads = backed.slice(localOffset, localOffset + limit);
     const realThreads = threads.filter((t) => t.session_ids.length > 0);
     if (scene) {
       result.sources.push(
