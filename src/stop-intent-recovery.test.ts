@@ -525,7 +525,9 @@ describe('durable stop intent', () => {
     expect(await storedIntent('sess-stopped-2')).toBeNull();
     expect(
       vi.mocked(log.info).mock.calls.filter((call) => call[0] === 'Cleared honoured stop intents at startup'),
-    ).toEqual([['Cleared honoured stop intents at startup', { cleared: 2, deferredPendingAdoption: 0 }]]);
+    ).toEqual([
+      ['Cleared honoured stop intents at startup', { cleared: 2, deferredPendingAdoption: 0, deferredRunning: 0 }],
+    ]);
   });
 
   it('the clear leaves a respawn_after_stop row alone', async () => {
@@ -563,7 +565,9 @@ describe('durable stop intent', () => {
     expect(await storedIntent('sess-pending-stop')).toBe('stop');
     expect(
       vi.mocked(log.info).mock.calls.filter((call) => call[0] === 'Cleared honoured stop intents at startup'),
-    ).toEqual([['Cleared honoured stop intents at startup', { cleared: 1, deferredPendingAdoption: 1 }]]);
+    ).toEqual([
+      ['Cleared honoured stop intents at startup', { cleared: 1, deferredPendingAdoption: 1, deferredRunning: 0 }],
+    ]);
   });
 
   it('a plain stop row rewritten after the read is left for the next boot', async () => {
@@ -591,7 +595,9 @@ describe('durable stop intent', () => {
     expect((await getSessionClaim('sess-reissued'))?.updated_at).toBe(LATER);
     expect(
       vi.mocked(log.info).mock.calls.filter((call) => call[0] === 'Cleared honoured stop intents at startup'),
-    ).toEqual([['Cleared honoured stop intents at startup', { cleared: 1, deferredPendingAdoption: 0 }]]);
+    ).toEqual([
+      ['Cleared honoured stop intents at startup', { cleared: 1, deferredPendingAdoption: 0, deferredRunning: 0 }],
+    ]);
   });
 
   it('a boot that defers every plain stop row still logs the count', async () => {
@@ -609,7 +615,32 @@ describe('durable stop intent', () => {
     // nothing was cleared.
     expect(
       vi.mocked(log.info).mock.calls.filter((call) => call[0] === 'Cleared honoured stop intents at startup'),
-    ).toEqual([['Cleared honoured stop intents at startup', { cleared: 0, deferredPendingAdoption: 1 }]]);
+    ).toEqual([
+      ['Cleared honoured stop intents at startup', { cleared: 0, deferredPendingAdoption: 1, deferredRunning: 0 }],
+    ]);
+  });
+
+  it('the clear leaves a plain stop row alone while its container is running', async () => {
+    await seedSession('sess-stopped');
+    await seedSession('sess-live');
+    await setStopIntent('sess-stopped', 'stop', STAMP);
+    await setStopIntent('sess-live', 'stop', STAMP);
+
+    // The host died between recording the stop and issuing it; this boot
+    // adopted the container. The row is the only record that a stop was asked
+    // for, and the stop it records has not happened.
+    await honorPendingStopIntents(
+      async () => true,
+      (sessionId) => sessionId === 'sess-live',
+    );
+
+    expect(await storedIntent('sess-stopped')).toBeNull();
+    expect(await storedIntent('sess-live')).toBe('stop');
+    expect(
+      vi.mocked(log.info).mock.calls.filter((call) => call[0] === 'Cleared honoured stop intents at startup'),
+    ).toEqual([
+      ['Cleared honoured stop intents at startup', { cleared: 1, deferredPendingAdoption: 0, deferredRunning: 1 }],
+    ]);
   });
 
   it('a boot with no plain stop rows logs no clear', async () => {
