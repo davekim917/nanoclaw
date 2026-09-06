@@ -732,18 +732,6 @@ export async function quiesceWorkgroupsForBootMountChange(
   };
   stopAll(preStop.mustStop);
 
-  // The proof is over the SECOND inventory, by each container's OWN labels,
-  // never over the names from the first: a container that appeared between
-  // the two listings — another host, or a spawn racing the boot — is
-  // classified like every other, and a must-stop one that is still here (a
-  // stop that did not take, a newcomer in a changed workgroup) is stopped in
-  // the second pass.
-  //
-  // Nothing here has to carry which containers it managed to stop: the
-  // accountability note was written by `beforeStop` before the first stop,
-  // so a failure at any point leaves it already written for every session
-  // that was marked running (src/main.ts, `runBootMountQuiescence`).
-  //
   // The reconcile set is re-evaluated NOW, after the first pass: nothing in a
   // changed workgroup can write to its group directory any more. The set that
   // came in was a snapshot taken while those containers were still running,
@@ -751,35 +739,53 @@ export async function quiesceWorkgroupsForBootMountChange(
   // Partition against the answer from here, not that snapshot — otherwise a
   // flipped workgroup's sessions read as survivable in the very scope that
   // says its mounts are about to move.
-  const secondInventory = list();
+  //
+  // Nothing here has to carry which containers it managed to stop: the
+  // accountability note was written by `beforeStop` before the first stop,
+  // so a failure at any point leaves it already written for every session
+  // that was marked running (src/main.ts, `runBootMountQuiescence`).
   const finalChanged = (await options.reevaluateChanged?.()) ?? changedWorkgroupIds;
-  const afterFirstPass = partitionInstallContainers(secondInventory, finalChanged, known, knownSessions);
-  let survivors = afterFirstPass.survivable;
+
+  // The proof is over a SECOND inventory, taken only once the re-evaluation
+  // has been awaited, by each container's OWN labels, never over the names
+  // from the first: a container that appeared since — another host, a spawn
+  // racing the boot, a `docker run` the previous process left completing
+  // while the predicates were re-run — is classified like every other, and a
+  // must-stop one that is still here (a stop that did not take, a newcomer in
+  // a changed workgroup) is stopped in the second pass. An inventory taken
+  // BEFORE that await would hold no record of a newcomer that arrived during
+  // it, and the mounts would be reconciled under a live container (#493).
+  const afterFirstPass = partitionInstallContainers(list(), finalChanged, known, knownSessions);
   if (afterFirstPass.mustStop.length > 0) {
     log.info('Boot quiescence second pass', {
       flipped: finalChanged.filter((id) => !changedWorkgroupIds.includes(id)),
       containers: afterFirstPass.mustStop.map((entry) => entry.name),
     });
-    // Sessions the first note skipped as survivable and which this pass is
-    // about to interrupt after all get their note now, before the stop.
-    const alreadyMustStop = new Set(sessionIdsOf(preStop.mustStop));
-    const reclassified = sessionIdsOf(afterFirstPass.mustStop).filter((id) => !alreadyMustStop.has(id));
-    if (reclassified.length > 0) {
-      await options.beforeStop?.({
-        pass: 2,
-        survivableSessionIds: afterFirstPass.survivable.map((entry) => entry.sessionId as string),
-        mustStopSessionIds: reclassified,
-      });
-    }
-    stopAll(afterFirstPass.mustStop);
-    const afterSecondPass = partitionInstallContainers(list(), finalChanged, known, knownSessions);
-    if (afterSecondPass.mustStop.length > 0) {
-      throw new Error(
-        `Install-scoped containers still running after boot quiescence: ${afterSecondPass.mustStop.map((e) => e.name).join(', ')}`,
-      );
-    }
-    survivors = afterSecondPass.survivable;
   }
+  // Sessions the first note skipped as survivable and which this pass is
+  // about to interrupt after all get their note now, before the stop.
+  const alreadyMustStop = new Set(sessionIdsOf(preStop.mustStop));
+  const reclassified = sessionIdsOf(afterFirstPass.mustStop).filter((id) => !alreadyMustStop.has(id));
+  if (reclassified.length > 0) {
+    await options.beforeStop?.({
+      pass: 2,
+      survivableSessionIds: afterFirstPass.survivable.map((entry) => entry.sessionId as string),
+      mustStopSessionIds: reclassified,
+    });
+  }
+  stopAll(afterFirstPass.mustStop);
+  // The door's last word is always a listing, whether or not the second pass
+  // stopped anything: the scope handed to adoption is built from an inventory
+  // nothing was awaited after, and a must-stop container still in it — a stop
+  // that did not take, a newcomer that slipped in behind the pass-2 note — is
+  // one this boot cannot prove absent.
+  const afterSecondPass = partitionInstallContainers(list(), finalChanged, known, knownSessions);
+  if (afterSecondPass.mustStop.length > 0) {
+    throw new Error(
+      `Install-scoped containers still running after boot quiescence: ${afterSecondPass.mustStop.map((e) => e.name).join(', ')}`,
+    );
+  }
+  const survivors = afterSecondPass.survivable;
 
   const scope: BootQuiescenceScope = {
     workgroups: known.size,

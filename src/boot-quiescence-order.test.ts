@@ -316,9 +316,10 @@ describe('boot mount-change ordering', () => {
     // The fix is the second evaluation after the first pass, and a second
     // stop pass over whatever it classifies must-stop.
     //
-    // The door's second listing stands in for that agent's last write: it
+    // The door's first listing stands in for that agent's last write: it
     // removes the exact compatibility symlink, which flips the memory
-    // predicate to true; the pre-stop pass stopped nothing (the tree was
+    // predicate to true, after the pre-stop snapshot was taken and before the
+    // door re-evaluates. The pre-stop pass stops nothing (the tree was
     // settled), so the survivor was still writing.
     const { groupsDir, dataDir } = buildSettledTree();
     const db = makeDb();
@@ -339,7 +340,7 @@ describe('boot mount-change ordering', () => {
           ...options,
           list: () => {
             listings += 1;
-            if (listings === 2) fs.unlinkSync(path.join(groupsDir, 'wgx', 'memory'));
+            if (listings === 1) fs.unlinkSync(path.join(groupsDir, 'wgx', 'memory'));
             return stopped ? [] : [{ name: 'nanoclaw-v2-a-1', workgroupId: 'wgx', sessionId: 's1', groupId: 'g1' }];
           },
           stop: (name) => {

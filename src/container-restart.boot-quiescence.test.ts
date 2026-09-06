@@ -133,6 +133,10 @@ function fakeRuntime(
       stops.push(name);
       if (!(opts.stubborn ?? []).includes(name)) running = running.filter((entry) => entry.name !== name);
     },
+    /** A container started by something other than the door, at the moment of the call. */
+    add: (entry: InstallContainerScope): void => {
+      running = [...running, entry];
+    },
   };
 }
 
@@ -307,6 +311,47 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
     expect(runtime.stops).toEqual(['nanoclaw-v2-a-1', 'nanoclaw-v2-newcomer-1']);
     expect(scope.stopped).toBe(2);
     expect(scope.survivable).toBe(0);
+    expect(spawns).toEqual([]);
+  });
+
+  it('a container that appears during the awaited re-evaluation is stopped before the mounts are reconciled (#493)', async () => {
+    // The re-evaluation is awaited. A container for the changed workgroup that
+    // something other than this host starts DURING that await — a `docker run`
+    // the previous process left completing, a peer host — is in no inventory
+    // taken before it; the door's proof has to be over one taken after.
+    const runtime = fakeRuntime([container('nanoclaw-v2-a-1', 'wg-a')]);
+    const warned: Array<{ pass: number; mustStop: string[]; beforeStops: number }> = [];
+
+    const scope = await quiesceWorkgroupsForBootMountChange(['wg-a'], {
+      ...runtime,
+      knownWorkgroupIds: ['wg-a'],
+      knownSessionIds: ['nanoclaw-v2-a-1-session', 'nanoclaw-v2-newcomer-1-session'],
+      reevaluateChanged: async () => {
+        await new Promise((resolve) => setImmediate(resolve));
+        runtime.add(container('nanoclaw-v2-newcomer-1', 'wg-a'));
+        return ['wg-a'];
+      },
+      beforeStop: (partition) => {
+        warned.push({
+          pass: partition.pass,
+          mustStop: partition.mustStopSessionIds,
+          beforeStops: runtime.stops.length,
+        });
+      },
+    });
+
+    // Stopped in the second pass, with its note written first, and the door
+    // returns only once a listing shows nothing must-stop.
+    expect(runtime.stops).toEqual(['nanoclaw-v2-a-1', 'nanoclaw-v2-newcomer-1']);
+    expect(warned).toEqual([
+      { pass: 1, mustStop: ['nanoclaw-v2-a-1-session'], beforeStops: 0 },
+      { pass: 2, mustStop: ['nanoclaw-v2-newcomer-1-session'], beforeStops: 1 },
+    ]);
+    expect(runtime.listings).toEqual([1, 1, 0]);
+    expect(scope.stopped).toBe(2);
+    expect(scope.survivable).toBe(0);
+    expect(scope.survivableSessionIds).toEqual([]);
+    expect(scope.mustStopSessionIds).toEqual(['nanoclaw-v2-a-1-session', 'nanoclaw-v2-newcomer-1-session']);
     expect(spawns).toEqual([]);
   });
 
