@@ -29,7 +29,7 @@ import { recordDroppedMessage } from './db/dropped-messages.js';
 import {
   channelNameProvenance,
   createMessagingGroup,
-  createMessagingGroupAgent,
+  createMessagingGroupAgentInTransaction,
   getMessagingGroupAgents,
   getMessagingGroupWithAgentCount,
   updateMessagingGroup,
@@ -709,7 +709,11 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
           await insertOrAdopt(
             wiring,
             async (candidate) => {
-              await createMessagingGroupAgent(candidate);
+              // The in-transaction leaf, not the exported wrapper: that one
+              // opens its OWN `centralTransaction`, and the lease refuses to
+              // nest, so calling it from here would throw
+              // `CentralLeaseReentrancyError` on every eligible channel.
+              await createMessagingGroupAgentInTransaction(candidate);
             },
             async () => (await getMessagingGroupAgents(mg.id)).find((w) => w.agent_group_id === inheritedAgent.id),
           );

@@ -34,6 +34,10 @@ vi.mock('./db/messaging-groups.js', async (importOriginal) => ({
   getMessagingGroupAgents: vi.fn(() => []),
   createMessagingGroup: vi.fn(),
   createMessagingGroupAgent: vi.fn(),
+  // The auto-wire calls the in-transaction leaf, not the exported wrapper
+  // (#482 round 2): the wrapper opens its own transaction and the lease
+  // refuses to nest. Mocked at the seam the router actually reaches for.
+  createMessagingGroupAgentInTransaction: vi.fn(),
 }));
 
 vi.mock('./db/agent-groups.js', async (importOriginal) => ({
@@ -202,7 +206,7 @@ import {
   getMessagingGroupWithAgentCount,
   getMessagingGroupAgents,
   createMessagingGroup,
-  createMessagingGroupAgent,
+  createMessagingGroupAgentInTransaction,
 } from './db/messaging-groups.js';
 import { getDb } from './db/connection.js';
 import { writeSessionMessageIfNew, resolveSession } from './session-manager.js';
@@ -739,7 +743,7 @@ describe('workspace-trust auto-wire inherits voice and engagement defaults', () 
 
     await routeInbound(makeChatEvent('@bot hello', { platformId: 'slack:CNEW' }));
 
-    expect(createMessagingGroupAgent).toHaveBeenCalledWith(
+    expect(createMessagingGroupAgentInTransaction).toHaveBeenCalledWith(
       expect.objectContaining({ agent_group_id: 'ag-1', default_tone: 'engineering' }),
     );
   });
@@ -752,7 +756,7 @@ describe('workspace-trust auto-wire inherits voice and engagement defaults', () 
 
     await routeInbound(makeChatEvent('@bot hello', { platformId: 'slack:CNEW' }));
 
-    expect(createMessagingGroupAgent).toHaveBeenCalledWith(
+    expect(createMessagingGroupAgentInTransaction).toHaveBeenCalledWith(
       expect.objectContaining({ agent_group_id: 'ag-1', default_tone: null }),
     );
   });
@@ -762,7 +766,9 @@ describe('workspace-trust auto-wire inherits voice and engagement defaults', () 
 
     await routeInbound(makeChatEvent('@bot hello', { platformId: 'slack:CNEW' }));
 
-    expect(createMessagingGroupAgent).toHaveBeenCalledWith(expect.objectContaining({ default_tone: null }));
+    expect(createMessagingGroupAgentInTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({ default_tone: null }),
+    );
   });
 
   it('never inherits model or effort — a sticky -m pin must not spread', async () => {
@@ -770,7 +776,7 @@ describe('workspace-trust auto-wire inherits voice and engagement defaults', () 
 
     await routeInbound(makeChatEvent('@bot hello', { platformId: 'slack:CNEW' }));
 
-    expect(createMessagingGroupAgent).toHaveBeenCalledWith(
+    expect(createMessagingGroupAgentInTransaction).toHaveBeenCalledWith(
       expect.objectContaining({ default_model: null, default_effort: null }),
     );
   });
@@ -799,7 +805,7 @@ describe('workspace-trust auto-wire inherits voice and engagement defaults', () 
 
     await routeInbound(makeChatEvent('@bot hello', { platformId: 'slack:CNEW' }));
 
-    expect(createMessagingGroupAgent).not.toHaveBeenCalled();
+    expect(createMessagingGroupAgentInTransaction).not.toHaveBeenCalled();
   });
 
   it('uses always-on accumulation for an auto-wired DM', async () => {
@@ -807,7 +813,7 @@ describe('workspace-trust auto-wire inherits voice and engagement defaults', () 
 
     await routeInbound(makeChatEvent('hello', { isDM: true }));
 
-    expect(createMessagingGroupAgent).toHaveBeenCalledWith(
+    expect(createMessagingGroupAgentInTransaction).toHaveBeenCalledWith(
       expect.objectContaining({
         engage_mode: 'pattern',
         engage_pattern: '.',
@@ -821,7 +827,7 @@ describe('workspace-trust auto-wire inherits voice and engagement defaults', () 
 
     await routeInbound(makeChatEvent('@bot hello', { isDM: false, threadId: 'thread-1' }));
 
-    expect(createMessagingGroupAgent).toHaveBeenCalledWith(
+    expect(createMessagingGroupAgentInTransaction).toHaveBeenCalledWith(
       expect.objectContaining({
         engage_mode: 'mention',
         engage_pattern: null,
