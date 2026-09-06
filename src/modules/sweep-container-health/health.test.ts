@@ -1005,15 +1005,47 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
     );
   });
 
+  /**
+   * Arm the debounce, then hand the ACTING tick a clean call counter.
+   *
+   * Within that tick the registry is read in a fixed order — 1 the identity
+   * paired with the health observation, 2 the guard's re-read, 3 the re-check
+   * before the marker, 4 the kill's fence — so a case names the window it is
+   * about by the call after which the replacement appears. Counting from the
+   * suite's first tick instead would make every index depend on how many reads
+   * the debounce pass happens to take.
+   */
+  async function actingTickWithReplacementAfter(
+    mailbox: NanoclawMailboxSession,
+    outDb: Database.Database,
+    call: number,
+  ): Promise<boolean> {
+    await _sweepProviderHealForTesting(mailbox, fakeSession(), 'group-folder', FAILED, intoOutDb(outDb));
+    registry.calls = 0;
+    registry.replaceAfterCall = call;
+    return _sweepProviderHealForTesting(mailbox, fakeSession(), 'group-folder', FAILED, intoOutDb(outDb));
+  }
+
+  it('refuses the heal when the observed container was replaced before the guard (#505 round 2)', async () => {
+    const { inDb, outDb, mailbox } = makeSessionDbs();
+    // The window the identity fence alone could not see: `decision` rests on
+    // the failed state the observation read, and the container it named exits
+    // while the budget open awaits. Every later read returns the REPLACEMENT,
+    // so a fence that re-read the registry would compare it against itself and
+    // heal a healthy container on the dead one's failure.
+    expect(await actingTickWithReplacementAfter(mailbox, outDb, 1)).toBe(true);
+
+    expect(healRows(inDb)).toHaveLength(0);
+    expect(mockKillContainer).not.toHaveBeenCalled();
+    expect(countProviderHealAttemptsSinceRealInbound(mailbox)).toBe(0);
+  });
+
   it('refuses the heal when a replacement is registered before the marker (#478)', async () => {
-    const { inDb, mailbox } = makeSessionDbs();
-    // The guard takes its snapshot on call 1; the original exits and a wake
+    const { inDb, outDb, mailbox } = makeSessionDbs();
+    // The observation and the guard both saw the original; it exits and a wake
     // registers a replacement while provider resolution awaits, so the
     // re-check before the marker sees a different container.
-    registry.replaceAfterCall = 1;
-
-    await _sweepProviderHealForTesting(mailbox, fakeSession(), 'group-folder', FAILED);
-    expect(await _sweepProviderHealForTesting(mailbox, fakeSession(), 'group-folder', FAILED)).toBe(true);
+    expect(await actingTickWithReplacementAfter(mailbox, outDb, 2)).toBe(true);
 
     // No attempt spent against the replacement, and it keeps running.
     expect(healRows(inDb)).toHaveLength(0);
@@ -1022,14 +1054,11 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
   });
 
   it('leaves a replacement registered after the marker unkilled (#478)', async () => {
-    const { inDb, mailbox } = makeSessionDbs();
+    const { inDb, outDb, mailbox } = makeSessionDbs();
     // Later window: the marker is already durable when the replacement
     // appears, so the attempt is spent, but the kill must not take the new
     // container down and report its work lost.
-    registry.replaceAfterCall = 2;
-
-    await _sweepProviderHealForTesting(mailbox, fakeSession(), 'group-folder', FAILED);
-    expect(await _sweepProviderHealForTesting(mailbox, fakeSession(), 'group-folder', FAILED)).toBe(true);
+    expect(await actingTickWithReplacementAfter(mailbox, outDb, 3)).toBe(true);
 
     expect(healRows(inDb)).toHaveLength(1);
     expect(mockKillContainer).not.toHaveBeenCalled();
@@ -1096,6 +1125,29 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
     expect(await _sweepProviderHealForTesting(mailbox, fakeSession(), 'group-folder', FAILED)).toBe(false);
     expect(mockKillContainer).not.toHaveBeenCalled();
     expect(healRows(inDb)).toHaveLength(1);
+  });
+
+  it('leaves a replacement unparked when it was registered after the observation (#505 round 2)', async () => {
+    const { inDb, outDb, mailbox } = makeSessionDbs();
+    // Spend the budget so the next failed tick decides `park`, which reaches
+    // `killContainer` down a path of its own — it took no identity fence at
+    // all until this round.
+    for (let i = 0; i < PROVIDER_HEAL_MAX_ATTEMPTS; i++) {
+      _resetProviderHealTicksForTesting();
+      expect(await twoFailedTicks(mailbox, outDb)).toBe(true);
+      agePastCooldown(inDb);
+    }
+    mockKillContainer.mockClear();
+    _resetProviderHealTicksForTesting();
+
+    // The container the exhausted budget belongs to exits, and a wake registers
+    // a replacement before the park kill lands.
+    expect(await actingTickWithReplacementAfter(mailbox, outDb, 2)).toBe(true);
+
+    expect(mockKillContainer).not.toHaveBeenCalled();
+    expect(
+      outDb.prepare("SELECT COUNT(*) AS c FROM messages_out WHERE id LIKE 'provider-heal-parked-%'").get(),
+    ).toEqual({ c: 0 });
   });
 
   it('parks with one notice after the attempt budget is spent', async () => {
@@ -1615,7 +1667,15 @@ describe('registered S11/S14/S16 entries reach their bodies', () => {
     const ctx = {
       session,
       agentGroupFolder: 'group-folder',
-      observed: { containerState: FAILED, processingClaimCount: 0, lastOutboundAtMs: null, lastInboundAtMs: null },
+      observed: {
+        containerState: FAILED,
+        processingClaimCount: 0,
+        lastOutboundAtMs: null,
+        lastInboundAtMs: null,
+        // Production's observe reads this in the same turn as the state; the
+        // value is what the registry fake reports while the container runs.
+        containerIdentity: { containerName: 'nanoclaw-group-folder-1', claimIncarnation: 1 },
+      },
       run: async (action: (m: NanoclawMailboxSession) => unknown) => action(mailbox),
     } as unknown as Parameters<NonNullable<typeof s11.claims>>[0];
 

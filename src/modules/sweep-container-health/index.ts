@@ -347,6 +347,7 @@ async function sweepProviderHeal(
   session: Session,
   agentGroupFolder: string,
   containerState: ContainerState | null,
+  observedContainer: ContainerIdentity | null,
   writeParkedMessage?: Parameters<typeof notifyProviderHealParked>[3],
 ): Promise<boolean> {
   const providerStatus = containerState?.provider_status ?? null;
@@ -401,14 +402,14 @@ async function sweepProviderHeal(
   // it names the container every decision below was proven against, so a
   // replacement registered across any later await is refused rather than
   // charged and killed (#478).
-  const { unavailable, target } = await withCentralSync(
+  const { unavailable, registered } = await withCentralSync(
     () => ({
       unavailable: providerHealTargetUnavailableReason(session.id),
-      target: containerIdentityFor(session.id),
+      registered: containerIdentityFor(session.id),
     }),
     'provider-heal target check',
   );
-  if (unavailable || !target) {
+  if (unavailable || !registered) {
     log.info(`self-heal: ${decision} target already gone — nothing to do this pass`, {
       ...bounds,
       reason: unavailable ?? 'no container registered for this session',
@@ -416,12 +417,37 @@ async function sweepProviderHeal(
     return true;
   }
 
+  // The DECISION is only valid for the container it was made about (#505 round
+  // 2). `decision` rests on the `failed` state W3 read, and the budget open
+  // above has yielded since: if that container exited and a wake registered a
+  // replacement, the registry now names a HEALTHY container, and every identity
+  // check below would compare the replacement against itself and pass. So the
+  // comparison is against the identity paired with the observation, not against
+  // one re-read here. Refuse, take no action, let the next tick re-observe.
+  if (!observedContainer || !sameContainerIdentity(registered, observedContainer)) {
+    log.info(`self-heal: ${decision} target was replaced since the health observation — refusing`, {
+      ...bounds,
+      observed: observedContainer?.containerName ?? null,
+      registered: registered.containerName,
+    });
+    return true;
+  }
+  const target = observedContainer;
+
   if (decision === 'park') {
     // Kill first, then post: outbound.db has exactly one writer, and the
     // container must be confirmed stopped before the host writes to it (same
     // ordering as the kill-ceiling notice). No onExit — parked means no
     // respawn until real inbound resets the budget.
     log.warn('self-heal: provider heal budget exhausted — parking', bounds);
+    // Fenced like the heal kill: `killContainer` kills whichever container is
+    // registered, and the park path reaches it through the same stale-decision
+    // window. Re-checked here rather than trusting the check above, because a
+    // replacement can still land between them.
+    if (!sameContainerIdentity(containerIdentityFor(session.id), target)) {
+      log.info('self-heal: park target was replaced before the kill — leaving the live container alone', bounds);
+      return true;
+    }
     killContainer(session.id, 'provider-failed-selfheal-parked');
     try {
       await run((mailbox) =>
@@ -465,12 +491,17 @@ export function _sweepProviderHealForTesting(
   agentGroupFolder: string,
   containerState: ContainerState | null,
   writeParkedMessage?: Parameters<typeof notifyProviderHealParked>[3],
+  // Defaulted so the existing cases read unchanged: production pairs this with
+  // the health observation, and a case that does not care about the pairing
+  // gets whatever is registered when it calls, which is the same container.
+  observedContainer: ContainerIdentity | null = containerIdentityFor(session.id),
 ): Promise<boolean> {
   return sweepProviderHeal(
     async (action) => action(mailbox),
     session,
     agentGroupFolder,
     containerState,
+    observedContainer,
     writeParkedMessage,
   );
 }
@@ -899,7 +930,13 @@ export function registerContainerHealthSweepDuties(): void {
     // below have nothing left to decide this tick — which is exactly the
     // `claims()` contract of an exclusive phase.
     claims: (ctx) =>
-      sweepProviderHeal(ctx.run, ctx.session, ctx.agentGroupFolder, ctx.observed?.containerState ?? null),
+      sweepProviderHeal(
+        ctx.run,
+        ctx.session,
+        ctx.agentGroupFolder,
+        ctx.observed?.containerState ?? null,
+        ctx.observed?.containerIdentity ?? null,
+      ),
     run: (ctx) => {
       log.debug('Provider self-heal handled this tick — skipping reap/SLA checks', {
         sessionId: asSessionContext(ctx).session.id,
