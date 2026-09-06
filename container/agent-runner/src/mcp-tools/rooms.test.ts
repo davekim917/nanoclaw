@@ -138,6 +138,10 @@ describe('registration', () => {
     expect(createRoom.tool.description).toMatch(/same workspace/);
     expect(createRoom.tool.description.toLowerCase()).toContain('fire-and-forget');
     expect(addToRoom.tool.description).toMatch(/does not move/);
+    // The agent proposes the add, so it has to know what it is proposing:
+    // Slack hands a new channel member everything already in the room.
+    expect(addToRoom.tool.description).toMatch(/prior history/i);
+    expect(createRoom.tool.description).toMatch(/never reuses an existing channel/i);
     expect(addToRoom.tool.description).toMatch(/another workgroup/);
     expect(addToRoom.tool.description).toMatch(/admin approval/);
   });

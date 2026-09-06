@@ -228,7 +228,9 @@ export async function requestAddToRoomHold(content: Record<string, unknown>, ses
     title: `Add ${agent} to Slack room: ${roomName}`,
     question:
       `Agent "${sourceGroup.name}" wants to add agent "${agent}" to the Slack room "${roomName}" ` +
-      `(${platformId}). "${agent}" is outside "${sourceGroup.name}"'s workgroup, so approving lets it read ` +
-      `everything posted in that room from now on. Approve only if you asked for this.`,
+      `(${platformId}). "${agent}" is outside "${sourceGroup.name}"'s workgroup. Approving grants it the room's ` +
+      `PRIOR HISTORY as well as everything posted from now on — Slack gives a new member of a channel the ` +
+      `messages and files already in it, so this discloses the whole conversation to date, not just what ` +
+      `follows. Approve only if you asked for this.`,
   });
 }
