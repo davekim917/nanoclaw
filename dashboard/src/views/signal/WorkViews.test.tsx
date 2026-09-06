@@ -119,6 +119,40 @@ describe('work-first interaction', () => {
     expect(signalApi.getSignalThreadContext).toHaveBeenCalledWith('t1');
   });
 
+  it.each(['request failure', 'unavailable source', 'healthy empty source'] as const)(
+    'preserves loaded context only when needed after an exact %s', async (result) => {
+      const overview: SignalOverview = {
+        as_of: '2026-09-06T00:00:00Z', workgroups: [{ id: 'wg', name: 'Workspace' }],
+        projects: [{ id: 'mapped', workgroup_id: 'wg', name: 'Mapped project', description: 'Loaded objective',
+          repositories: [], channel_keys: ['channel'], version: 1, updated_at: null, unmapped: false,
+          thread_ids: ['t1'], decision_ids: ['loaded'], items: [] }],
+        decisions: [decision('loaded'), decision('unrelated', { thread_id: 'other' })],
+        agents: [], activity: [], sources: [], capabilities: { manage_projects: false },
+      };
+      if (result === 'request failure') {
+        vi.mocked(signalApi.getSignalThreadContext).mockRejectedValue(new Error('Unavailable'));
+      } else {
+        vi.mocked(signalApi.getSignalThreadContext).mockResolvedValue({
+          ...overview, projects: [], decisions: [],
+          sources: [{ workgroup_id: 'wg', source: 'threads', as_of: null, detail: null,
+            status: result === 'unavailable source' ? 'unavailable' : 'available' }],
+        });
+      }
+      render(<SWRConfig value={{ provider: () => new Map(), shouldRetryOnError: false }}>
+        <ThreadWorkspace authMe={authMe} workgroup="all" query="" id="t1" overview={overview} />
+      </SWRConfig>);
+      await screen.findByText('Choose the identity key.');
+      if (result === 'healthy empty source') {
+        expect(await screen.findByText('No explicit project objective is mapped to this conversation.')).toBeInTheDocument();
+        expect(screen.queryByText('Question loaded')).toBeNull();
+      } else {
+        expect(screen.getByText('Loaded objective')).toBeInTheDocument();
+        expect(screen.getByRole('link', { name: /Question loaded/ })).toBeInTheDocument();
+      }
+      expect(screen.queryByText('Question unrelated')).toBeNull();
+    },
+  );
+
   it('selects an exact decision from a grouped queue and distinguishes reviewed from sent', () => {
     const choose = vi.fn();
     render(

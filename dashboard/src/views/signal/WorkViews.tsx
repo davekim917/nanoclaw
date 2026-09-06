@@ -349,14 +349,20 @@ export function ThreadWorkspace({
   }, [mutate, refreshList, refreshContext]);
   const thread = data?.thread;
   const hasConversation = (thread?.session_ids.length ?? 0) > 0;
+  const contextUnavailable = context?.sources.some(
+    (source) => source.source === 'threads' && source.status === 'unavailable',
+  );
+  // A healthy exact response is authoritative, including an empty mapping.
+  // Preserve already-loaded context while the exact source is unavailable.
+  const workContext = context && !contextUnavailable ? context : overview ?? context;
   const related =
-    context?.decisions.filter((d) => d.thread_id === selectedId || d.dispatch_target_thread_id === selectedId) ?? [];
-  const project = context?.projects.find((p) => p.thread_ids.includes(selectedId ?? ''));
+    workContext?.decisions.filter((d) => d.thread_id === selectedId || d.dispatch_target_thread_id === selectedId) ?? [];
+  const project = workContext?.projects.find((p) => p.thread_ids.includes(selectedId ?? ''));
   const contextStatus = contextError
     ? 'Exact work context could not be loaded.'
     : !context
       ? 'Loading exact work context…'
-      : context.sources.some((source) => source.source === 'threads' && source.status === 'unavailable')
+      : contextUnavailable
         ? 'Exact thread source is unavailable; project and decision coverage may be incomplete.'
         : null;
   const maySend = authMe.scopes.role !== 'member';
