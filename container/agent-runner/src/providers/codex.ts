@@ -448,10 +448,9 @@ export function resolveQueryEffort(requested: string | undefined, sticky: CodexS
 }
 
 export function buildCodexSubagentLifecycleInstructions(maxConcurrentThreadsPerSession: number): string {
-  const workerSlots = Math.max(0, maxConcurrentThreadsPerSession - 1);
   return `## Codex subagent lifecycle
 
-This session is limited to ${maxConcurrentThreadsPerSession} concurrent threads: one coordinator plus up to ${workerSlots} subagents.
+This session allows up to ${maxConcurrentThreadsPerSession} concurrent subagents, excluding the primary thread.
 
 - Track every subagent you spawn.
 - A completed, errored, or interrupted subagent still owns runtime resources until you call \`close_agent\`.

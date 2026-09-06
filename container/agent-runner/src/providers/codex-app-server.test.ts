@@ -8,6 +8,7 @@ import {
   buildCodexHooksJson,
   createCodexConfigOverrides,
   interruptCodexTurn,
+  steerCodexTurn,
   parseTomlTableHeader,
   probeCodexThreadHealth,
   readCodexTurnSnapshot,
@@ -56,6 +57,28 @@ function fakeAppServer(
 }
 
 describe('Codex app-server liveness RPCs', () => {
+  it('steers an active turn with its expected id without a feature toggle', async () => {
+    const { server, requests } = fakeAppServer(() => ({ result: { turnId: 'turn-active' } }));
+    await expect(
+      steerCodexTurn(server, { threadId: 'thread-1', expectedTurnId: 'turn-active', inputText: 'Focus on the tests' }),
+    ).resolves.toEqual({ turnId: 'turn-active' });
+    expect(requests[0]).toMatchObject({
+      method: 'turn/steer',
+      params: {
+        threadId: 'thread-1',
+        expectedTurnId: 'turn-active',
+        input: [{ type: 'text', text: 'Focus on the tests' }],
+      },
+    });
+  });
+
+  it('surfaces steering rejection so the provider can queue the input', async () => {
+    const { server } = fakeAppServer(() => ({ error: { code: -32600, message: 'no active turn' } }));
+    await expect(
+      steerCodexTurn(server, { threadId: 'thread-1', expectedTurnId: 'turn-ended', inputText: 'Follow-up' }),
+    ).rejects.toThrow('turn/steer failed: no active turn');
+  });
+
   it('reloads one completed turn from persisted thread state', async () => {
     const { server, requests } = fakeAppServer((request) => ({
       result: {
@@ -185,16 +208,8 @@ describe('buildCodexHooksJson', () => {
 });
 
 describe('createCodexConfigOverrides', () => {
-  it('always sets features.steer=true so turn/steer RPC injects mid-turn input', () => {
-    // Issue 2 from the Example Assistant / Example Assistant Codex parity report: Operator's mid-turn
-    // @-mentions weren't steering Example Assistant Codex's reasoning, only landing as
-    // the next turn's input. Root cause: Codex's CLI defaults
-    // `features.steer = false`, in which state the app-server rejects
-    // turn/steer RPCs and our provider's catch path re-queues the
-    // message. Forcing `features.steer=true` at every spawn matches
-    // Operator's local Codex CLI setting.
-    const overrides = createCodexConfigOverrides();
-    expect(overrides).toContain('features.steer=true');
+  it('omits the removed steering toggle', () => {
+    expect(createCodexConfigOverrides().some((value) => value.startsWith('features.steer='))).toBe(false);
   });
 
   it('always sets features.goals=true and disables linux sandbox bwrap', () => {
@@ -203,8 +218,8 @@ describe('createCodexConfigOverrides', () => {
     expect(overrides).toContain('features.use_linux_sandbox_bwrap=false');
   });
 
-  it('always enables the native fast-mode feature', () => {
-    expect(createCodexConfigOverrides()).toContain('features.fast_mode=true');
+  it('disables the native fast-mode feature', () => {
+    expect(createCodexConfigOverrides()).toContain('features.fast_mode=false');
   });
 
   it("always raises project_doc_max_bytes above Codex's 32KB default", () => {
@@ -218,13 +233,13 @@ describe('createCodexConfigOverrides', () => {
 
   it('bounds native subagent concurrency with a safe fleet default', () => {
     const overrides = createCodexConfigOverrides();
-    expect(overrides).toContain('features.multi_agent_v2=true');
-    expect(overrides).toContain('features.multi_agent_v2.max_concurrent_threads_per_session=7');
+    expect(overrides).toContain('features.multi_agent=true');
+    expect(overrides).toContain('agents.max_concurrent_threads_per_session=7');
   });
 
   it('honors the validated per-group native subagent concurrency override', () => {
     expect(createCodexConfigOverrides({ max_concurrent_threads_per_session: 5 })).toContain(
-      'features.multi_agent_v2.max_concurrent_threads_per_session=5',
+      'agents.max_concurrent_threads_per_session=5',
     );
   });
 

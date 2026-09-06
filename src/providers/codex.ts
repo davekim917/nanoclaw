@@ -55,7 +55,7 @@ const CONTAINER_TRUSTED_PROJECTS = ['/workspace/agent', '/workspace/workgroup', 
  * declared here explicitly — nothing is inherited from the host CLI's
  * config. The values mirror what the fleet has always effectively run with;
  * [features] is load-bearing (hooks = the destructive-action guard chain,
- * multi_agent_v2 = native subagents, memories/goals = their MCP surfaces).
+ * multi_agent = native subagents, memories/goals = their MCP surfaces).
  */
 export function buildContainerCodexConfig(): string {
   return [
@@ -66,13 +66,14 @@ export function buildContainerCodexConfig(): string {
     'approvals_reviewer = "auto_review"',
     '',
     '[features]',
+    'context_management = true',
     'hooks = true',
-    'remote_control = true',
+    'fast_mode = false',
     'memories = true',
     'goals = true',
+    'multi_agent = true',
     '',
-    '[features.multi_agent_v2]',
-    'enabled = true',
+    '[agents]',
     'max_concurrent_threads_per_session = 9',
     '',
     ...CONTAINER_TRUSTED_PROJECTS.flatMap((proj) => [`[projects."${proj}"]`, 'trust_level = "trusted"', '']),

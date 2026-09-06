@@ -91,7 +91,7 @@ describe('codexConfigSchema', () => {
 describe('Codex subagent lifecycle instructions', () => {
   it('states both the enforced worker budget and mandatory close behavior', () => {
     const instructions = buildCodexSubagentLifecycleInstructions(7);
-    expect(instructions).toContain('one coordinator plus up to 6 subagents');
+    expect(instructions).toContain('up to 7 concurrent subagents, excluding the primary thread');
     expect(instructions).toContain('call `close_agent`');
     expect(instructions).toContain('Waiting for completion is not cleanup');
     expect(instructions).toContain('including failure and cancellation paths');
