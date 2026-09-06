@@ -29,6 +29,10 @@ export interface SlackRoomCreation {
   room_key: string;
   room_name: string;
   agent_group_id: string;
+  /** Slack `T…` the channel was created in — see migration 074. */
+  team_id: string;
+  /** JSON array: the roster stamp the creating request resolved. */
+  roster: string;
   request_id: string | null;
   created_at: string;
 }
@@ -36,18 +40,24 @@ export interface SlackRoomCreation {
 /** Record a channel the moment Slack returns it, before anything else runs. */
 export async function recordRoomCreation(row: SlackRoomCreation): Promise<void> {
   await getDb().run(
-    `INSERT INTO slack_room_creations (platform_id, room_key, room_name, agent_group_id, request_id, created_at)
-       VALUES (@platform_id, @room_key, @room_name, @agent_group_id, @request_id, @created_at)
+    `INSERT INTO slack_room_creations
+         (platform_id, room_key, room_name, agent_group_id, team_id, roster, request_id, created_at)
+       VALUES (@platform_id, @room_key, @room_name, @agent_group_id, @team_id, @roster, @request_id, @created_at)
      ON CONFLICT(platform_id) DO NOTHING`,
     row,
   );
 }
 
-/** The unfinished channel this caller left under this room key, if any. */
-export async function findRoomCreation(agentGroupId: string, roomKey: string): Promise<SlackRoomCreation | undefined> {
+/** The unfinished channel this caller left in this workspace under this key. */
+export async function findRoomCreation(
+  agentGroupId: string,
+  teamId: string,
+  roomKey: string,
+): Promise<SlackRoomCreation | undefined> {
   return getDb().get<SlackRoomCreation>(
-    'SELECT * FROM slack_room_creations WHERE agent_group_id = ? AND room_key = ?',
+    'SELECT * FROM slack_room_creations WHERE agent_group_id = ? AND team_id = ? AND room_key = ?',
     agentGroupId,
+    teamId,
     roomKey,
   );
 }

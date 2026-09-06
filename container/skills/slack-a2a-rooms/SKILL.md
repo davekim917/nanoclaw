@@ -57,12 +57,13 @@ member list, no setup narration.
 
 ## Opening a room yourself
 
-`create_room` opens one shared room — a private Slack channel holding you, the
-operator and the agents you name — and wires every one of them to it, so the
-room works the moment you are told it is live. Name agents by the same names
-`send_message` takes; every agent you name must have a Slack bot in the same
-workspace as yours, and a roster spanning two workspaces is refused. Expect an
-approval tap before anything happens.
+`create_room` opens one shared room — a NEW private Slack channel holding you,
+the operator and the agents you name — and wires every one of them to it, so
+the room works the moment you are told it is live. It never reuses an existing
+channel, so nobody gains access to a conversation that predates the room. Name
+agents by the same names `send_message` takes; every agent you name must have a
+Slack bot in the same workspace as yours, and a roster spanning two workspaces
+is refused. Expect an approval tap before anything happens.
 
 `add_to_room` adds one agent to a room that already exists. The room keeps its
 conversation, so nothing has to be re-invited and no link goes stale. The room
@@ -70,8 +71,10 @@ is looked up by name among the rooms wired to you or to another agent in your
 workgroup and nowhere else, so a name that matches two of them comes back as an
 error listing both, and a room belonging to another workgroup is simply not
 found. Adding an agent from your own workgroup happens straight away; adding
-one from outside it needs an approval, because it lets them read everything
-posted there from then on.
+one from outside it needs an approval, because Slack hands a new member of a
+channel the messages and files already in it — the whole conversation to date,
+not only what follows. Say that when you propose the add, so the person
+deciding knows what they are deciding.
 
 Both return immediately and report the outcome as a system note later. When the
 note says the room is live, post the introduction yourself — see above.

@@ -31,11 +31,15 @@ import { getAgentGroup } from '../../db/agent-groups.js';
 import { log } from '../../log.js';
 import type { AgentGroup, Session } from '../../types.js';
 import { notifyAgent, requestApproval } from '../approvals/index.js';
+import { pickApprover } from '../approvals/primitive.js';
+import { resolveOperatorSlackUserId } from '../../slack-user-identity.js';
 import {
   ADD_TO_ROOM_ACTION,
   CALLER_WORKGROUP_KEY,
   CREATE_ROOM_ACTION,
+  OPERATOR_KEY,
   ROOM_PLATFORM_ID_KEY,
+  ROOM_TEAM_ID_KEY,
   ROSTER_KEY,
   TARGET_AGENT_GROUP_KEY,
   TARGET_WORKGROUP_KEY,
@@ -115,6 +119,12 @@ export async function validateCreateRoom(content: Record<string, unknown>, sessi
     content.agents = agents;
     content[CALLER_WORKGROUP_KEY] = workgroupOf(callerGroup);
     content[RESOLVED_PARTICIPANTS_KEY] = participants;
+    // Resolved HERE, not in the handler. pickApprover reflects live roles, so
+    // a role granted while the card waits would otherwise change who gets
+    // invited between the promise and the act. Re-derived on every run and
+    // bound by the guard, so a change denies the replay instead.
+    content[OPERATOR_KEY] =
+      resolveOperatorSlackUserId(await pickApprover(session.agent_group_id), caller.channelType)?.slackUserId ?? null;
     // Re-derived on every run, replays included, and compared against the
     // stamp the card carried — see roomsCreate.grantCoversRequest.
     content[ROSTER_KEY] = rosterStamp(participants);
@@ -130,6 +140,7 @@ export async function requestCreateRoomHold(content: Record<string, unknown>, se
   const name = trimmed(content.name);
   const participants = (content[RESOLVED_PARTICIPANTS_KEY] as RoomParticipant[] | undefined) ?? [];
   const members = participants.map((p) => p.agentGroupName).join(', ');
+  const operator = typeof content[OPERATOR_KEY] === 'string' ? (content[OPERATOR_KEY] as string) : '';
 
   await requestApproval({
     session,
@@ -142,18 +153,25 @@ export async function requestCreateRoomHold(content: Record<string, unknown>, se
       name,
       agents: content.agents,
       // The roster the approver is being shown, bound so the replay cannot
-      // invite anyone else.
+      // invite anyone else — the human invitee included.
       [ROSTER_KEY]: content[ROSTER_KEY],
+      [OPERATOR_KEY]: content[OPERATOR_KEY] ?? null,
       ...(trimmed(content.purpose) ? { purpose: trimmed(content.purpose) } : {}),
       requestId: content.requestId ?? null,
     },
     title: `Create Slack room: ${name}`,
     question:
-      `Agent "${sourceGroup.name}" wants to open a private Slack room "${name}" holding you and ${members}. ` +
-      `Approving creates a Slack channel on ${sourceGroup.name}'s own bot token, invites each listed agent's ` +
-      `bot user plus your Slack account, and wires the room to every participating agent group so they can ` +
-      `all read and post there. Approve only if you asked for this — an agent can be talked into opening a ` +
-      `room by anything it reads.`,
+      `Agent "${sourceGroup.name}" wants to open a NEW private Slack room "${name}" holding ${members}` +
+      `${
+        operator
+          ? ` and the Slack account ${operator}`
+          : ' and no human (no approver with a Slack identity in ' + 'that workspace was found)'
+      }. ` +
+      `Approving creates a fresh Slack channel on ${sourceGroup.name}'s own bot token — it never reuses an ` +
+      `existing one, so nobody gains access to a conversation that predates the room — invites each listed ` +
+      `agent's bot user${operator ? ` plus ${operator}` : ''}, and wires the room to every participating agent ` +
+      `group so they can all read and post there. Approve only if you asked for this — an agent can be talked ` +
+      `into opening a room by anything it reads.`,
   });
 }
 
@@ -203,6 +221,7 @@ export async function validateAddToRoom(content: Record<string, unknown>, sessio
     content[TARGET_AGENT_GROUP_KEY] = targetGroup.id;
     content[TARGET_WORKGROUP_KEY] = workgroupOf(targetGroup);
     content[ROOM_PLATFORM_ID_KEY] = room.platformId;
+    content[ROOM_TEAM_ID_KEY] = room.teamId;
     content[RESOLVED_ROOM_NAME_KEY] = room.name;
     content[RESOLVED_PARTICIPANTS_KEY] = [inviter, target];
     return true;
@@ -229,6 +248,7 @@ export async function requestAddToRoomHold(content: Record<string, unknown>, ses
       room: content.room,
       agent,
       [ROOM_PLATFORM_ID_KEY]: platformId,
+      [ROOM_TEAM_ID_KEY]: content[ROOM_TEAM_ID_KEY] ?? null,
       [TARGET_AGENT_GROUP_KEY]: content[TARGET_AGENT_GROUP_KEY],
       [RESOLVED_ROOM_NAME_KEY]: roomName,
       requestId: content.requestId ?? null,

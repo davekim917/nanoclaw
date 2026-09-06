@@ -41,6 +41,21 @@ export const TARGET_WORKGROUP_KEY = 'target_workgroup_id';
 export const TARGET_AGENT_GROUP_KEY = 'target_agent_group_id';
 export const ROOM_PLATFORM_ID_KEY = 'room_platform_id';
 /**
+ * The room's Slack workspace. Slack channel ids are workspace-scoped, so the
+ * id alone does not identify a room on a multi-workspace install: if the
+ * approved room's wiring disappears while the card waits and a sibling room in
+ * ANOTHER workspace is left holding the same id, an id-only comparison accepts
+ * it and the replay discloses a room the approver never saw.
+ */
+export const ROOM_TEAM_ID_KEY = 'room_team_id';
+/**
+ * The Slack account the card said would be invited. `pickApprover` is
+ * recomputed on every run, so a role granted while the card waits can change
+ * who "your Slack account" resolves to — binding it keeps the approval from
+ * admitting a human the approver did not name.
+ */
+export const OPERATOR_KEY = 'operator_slack_user_id';
+/**
  * The resolved roster, as a sorted list of `"<agentGroupId>|<channelType>|<botUserId>|<teamId>"`.
  * A create_room approval binds to it, so a destination repointed between card
  * and click cannot smuggle a different agent — or a different Slack bot for
@@ -91,8 +106,14 @@ export const roomsCreate = defineGuardedAction({
    */
   grantCoversRequest: (grant, input) => {
     try {
-      const approved = JSON.parse(grant.payload) as { name?: string; [ROSTER_KEY]?: unknown };
-      return approved.name === input.payload.name && sameRoster(approved[ROSTER_KEY], input.payload[ROSTER_KEY]);
+      const approved = JSON.parse(grant.payload) as Record<string, unknown>;
+      return (
+        approved.name === input.payload.name &&
+        // The operator is a member of the room like any bot is, so a change of
+        // WHO gets invited is a change of roster even when the agents match.
+        (approved[OPERATOR_KEY] ?? null) === (input.payload[OPERATOR_KEY] ?? null) &&
+        sameRoster(approved[ROSTER_KEY], input.payload[ROSTER_KEY])
+      );
     } catch {
       return false;
     }
@@ -128,6 +149,8 @@ export const roomsAddAgent = defineGuardedAction({
       const approved = JSON.parse(grant.payload) as Record<string, unknown>;
       return (
         approved[ROOM_PLATFORM_ID_KEY] === input.payload[ROOM_PLATFORM_ID_KEY] &&
+        // Workspace as well as id — see ROOM_TEAM_ID_KEY.
+        approved[ROOM_TEAM_ID_KEY] === input.payload[ROOM_TEAM_ID_KEY] &&
         approved[TARGET_AGENT_GROUP_KEY] === input.payload[TARGET_AGENT_GROUP_KEY]
       );
     } catch {

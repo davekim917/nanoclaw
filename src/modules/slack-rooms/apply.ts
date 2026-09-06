@@ -45,11 +45,10 @@ import {
 import { log } from '../../log.js';
 import type { MessagingGroup, MessagingGroupAgent, Session } from '../../types.js';
 import { notifyAgent } from '../approvals/index.js';
-import { pickApprover } from '../approvals/primitive.js';
-import { resolveOperatorSlackUserId } from '../../slack-user-identity.js';
-import { ROOM_PLATFORM_ID_KEY } from './guard.js';
+import { writeDestinations } from '../agent-to-agent/write-destinations.js';
+import { OPERATOR_KEY, ROOM_PLATFORM_ID_KEY } from './guard.js';
 import { RESOLVED_PARTICIPANTS_KEY, RESOLVED_ROOM_NAME_KEY } from './request.js';
-import { RoomActionError, resolveRoomByPlatformId, roomKey, type RoomParticipant } from './resolve.js';
+import { RoomActionError, resolveRoomByPlatformId, roomKey, rosterStamp, type RoomParticipant } from './resolve.js';
 import { clearRoomCreation, findRoomCreation, recordRoomCreation } from './db.js';
 
 function randomSuffix(): string {
@@ -57,13 +56,27 @@ function randomSuffix(): string {
 }
 
 /**
- * The Slack account to invite alongside the bots: the first approver who
- * belongs to the CALLER's workspace (PR 1's workspace-aware helper). Null when
- * nobody qualifies — the room is still created, holding bots only, and the
- * agent is told so rather than the whole action failing on a missing human.
+ * Project the caller's central `agent_destinations` rows into its running
+ * session's `inbound.db`.
+ *
+ * Wiring a room creates the caller's destination for it centrally, but the
+ * container resolves names against its own projection, and a notification's
+ * wake is a no-op for a container that is already running. Without this, the
+ * "post an introduction there now" instruction lands on a session whose map
+ * has no such destination, and `send_message` answers "unknown destination"
+ * until the container next respawns. Same call, same reason, as
+ * `applyCreateAgent`'s. Never fatal: the room exists either way, and the next
+ * wake reprojects.
  */
-async function operatorSlackUserId(agentGroupId: string, callerChannelType: string): Promise<string | null> {
-  return resolveOperatorSlackUserId(await pickApprover(agentGroupId), callerChannelType)?.slackUserId ?? null;
+async function refreshCallerDestinations(session: Session): Promise<void> {
+  try {
+    await writeDestinations(session.agent_group_id, session.id);
+  } catch (err) {
+    log.warn('Room wired but destination projection failed — the caller sees it after its next wake', {
+      sessionId: session.id,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 /**
@@ -133,10 +146,25 @@ export async function handleCreateRoom(content: Record<string, unknown>, session
   try {
     if (participants.length === 0) throw new RoomActionError('no participants resolved');
     const creator = participants[0]!;
-    const operator = await operatorSlackUserId(session.agent_group_id, creator.channelType);
+    // Resolved by the precheck and bound by the guard, so the human the card
+    // named is the human that gets invited even if roles moved in between.
+    const operator = typeof content[OPERATOR_KEY] === 'string' ? (content[OPERATOR_KEY] as string) : null;
+    const roster = JSON.stringify(rosterStamp(participants));
 
-    // Resume only what THIS caller left unfinished under THIS name.
-    const pending = await findRoomCreation(session.agent_group_id, roomKey(name));
+    // Resume only what THIS caller left unfinished, in THIS workspace, under
+    // THIS name — and only when the roster matches. A marker proves the
+    // channel is the caller's unfinished creation; it does not make that
+    // channel right for a LATER request naming different agents, which would
+    // put them into a channel already holding the first request's
+    // participants and messages.
+    const pending = await findRoomCreation(session.agent_group_id, creator.teamId, roomKey(name));
+    if (pending && pending.roster !== roster) {
+      throw new RoomActionError(
+        `an earlier "${name}" is still half-built with a different set of agents ` +
+          `(${JSON.parse(pending.roster).length} of them). Finish or abandon that one first — re-requesting it ` +
+          `with the same agents resumes it — or pick a different name for this room.`,
+      );
+    }
     const adopted = Boolean(pending);
     const room = pending
       ? { channelId: pending.platform_id.slice('slack:'.length), name: pending.room_name }
@@ -158,6 +186,8 @@ export async function handleCreateRoom(content: Record<string, unknown>, session
         room_key: roomKey(name),
         room_name: room.name,
         agent_group_id: session.agent_group_id,
+        team_id: creator.teamId,
+        roster,
         request_id: typeof content.requestId === 'string' ? content.requestId : null,
         created_at: new Date().toISOString(),
       });
@@ -174,12 +204,17 @@ export async function handleCreateRoom(content: Record<string, unknown>, session
       ...(operator ? [operator] : []),
     ];
     await inviteUsers(creator.channelType, room.channelId, invitees);
-    // Best effort, and only on a room this call created — overwriting the
-    // purpose of a room that already existed is not what "create" asked for.
-    const purposeApplied = adopted ? false : await setConversationPurpose(creator.channelType, room.channelId, purpose);
+    // Applied on a resume too. The marker is proof this channel is the
+    // caller's own unfinished creation, so setting the purpose the same
+    // request already asked for is finishing the job, not overwriting
+    // somebody's room — and a first attempt that died during the invites
+    // never reached this line, so skipping it would silently drop the
+    // description for exactly the runs that needed resuming.
+    const purposeApplied = await setConversationPurpose(creator.channelType, room.channelId, purpose);
     // Fully wired and invited — the room is no longer unfinished, so the
     // marker that authorized resuming it goes away.
     await clearRoomCreation(platformId);
+    await refreshCallerDestinations(session);
 
     const members = participants.map((p) => p.agentGroupName).join(', ');
     const mentions = participants
@@ -191,7 +226,7 @@ export async function handleCreateRoom(content: Record<string, unknown>, session
       `Room "${room.name}" is live (${platformId}) with ${members}${operator ? ' and the operator' : ''}` +
         `${operator ? '' : ' — no approver with a Slack identity in your workspace was found, so it holds bots only'}` +
         `${adopted ? ' — an earlier attempt had already created it, and this run finished the wiring and invites' : ''}` +
-        `${purpose && !purposeApplied && !adopted ? ' — Slack would not accept the purpose line, so the room has none' : ''}. ` +
+        `${purpose && !purposeApplied ? ' — Slack would not accept the purpose line, so the room has none' : ''}. ` +
         `Everyone is wired, so post a short introduction there now in your own voice, tagging each agent ` +
         `literally (${mentions}) — the tags render as mentions and are how you engage them in that room.`,
     );
@@ -236,6 +271,9 @@ export async function handleAddToRoom(content: Record<string, unknown>, session:
     // inviter's bot.
     await inviteUsers(inviter.channelType, platformId.slice('slack:'.length), [target.botUserId]);
     await wireParticipant(target, platformId, room.name || roomName);
+    // The newcomer's own projection refreshes on its next wake; the CALLER is
+    // the one holding a live session and being told to post an intro.
+    await refreshCallerDestinations(session);
 
     await notifyAgent(
       session,
