@@ -27,6 +27,23 @@ import { requestApproval, type ApprovalHandler } from '../approvals/index.js';
 import { createDestination, getDestinationByName, normalizeName } from './db/agent-destinations.js';
 import { writeDestinations } from './write-destinations.js';
 
+export interface CreateAgentFollowUpContext {
+  session: Session;
+  group: AgentGroup;
+  notify: (text: string) => Promise<void>;
+}
+const createAgentFollowUps = new Set<(context: CreateAgentFollowUpContext) => Promise<void>>();
+
+/** Optional channel setup runs only after approved creation has committed. */
+export function registerCreateAgentFollowUp(
+  followUp: (context: CreateAgentFollowUpContext) => Promise<void>,
+): () => void {
+  createAgentFollowUps.add(followUp);
+  return () => {
+    createAgentFollowUps.delete(followUp);
+  };
+}
+
 async function notifyAgent(session: Session, text: string): Promise<void> {
   await writeSessionMessage(session.agent_group_id, session.id, {
     id: `sys-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -361,6 +378,15 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
       `Agent "${localName}" created. You can now message it with <message to="${localName}">...</message>.`,
     );
     log.info('Agent group created', { agentGroupId, name, localName, folder, parent: sourceGroup.id });
+    for (const followUp of createAgentFollowUps) {
+      try {
+        await followUp({ session, group: newGroup, notify: (text) => notifyAgent(session, text) });
+      } catch (error) {
+        // The group and grants are already committed; optional channel setup
+        // must not roll them back.
+        log.warn('Agent created; optional channel follow-up failed', { agentGroupId, err: error });
+      }
+    }
   } finally {
     // Held through the grants and the destination projection as well: a
     // sibling request must see the finished agent, not a half-built one.

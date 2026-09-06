@@ -3,7 +3,7 @@ import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { appendToEnvList, readEnvValue, upsertEnvKey } from './env-file.js';
+import { appendToEnvList, readEnvValue, upsertEnvKey, upsertEnvKeys } from './env-file.js';
 
 describe('env-file', () => {
   let rootDir: string;
@@ -15,6 +15,7 @@ describe('env-file', () => {
   afterEach(() => {
     fs.rmSync(rootDir, { recursive: true, force: true });
     vi.unstubAllEnvs();
+    vi.restoreAllMocks();
   });
 
   const envPath = (): string => path.join(rootDir, '.env');
@@ -104,6 +105,42 @@ describe('env-file', () => {
       expect(readEnvValue(rootDir, 'ENVF_INDENTED')).toBe('new');
       expect(read()).not.toContain('old');
     });
+  });
+
+  it('publishes both credentials atomically with mode 0600', () => {
+    write('BOT=old\nAPP=old\n');
+    fs.chmodSync(envPath(), 0o644);
+    const oldFile = fs.openSync(envPath(), 'r');
+    try {
+      upsertEnvKeys(rootDir, { BOT: 'new-bot', APP: 'new-app' });
+      expect(fs.readFileSync(oldFile, 'utf8')).toBe('BOT=old\nAPP=old\n');
+      expect(read()).toBe('BOT=new-bot\nAPP=new-app\n');
+      expect(fs.statSync(envPath()).mode & 0o777).toBe(0o600);
+      expect(fs.readdirSync(rootDir)).toEqual(['.env']);
+    } finally {
+      fs.closeSync(oldFile);
+    }
+  });
+
+  it('keeps the previous credential pair if publication fails', () => {
+    write('BOT=old\nAPP=old\n');
+    vi.spyOn(fs, 'renameSync').mockImplementation(() => {
+      throw new Error('synthetic rename failure');
+    });
+    expect(() => upsertEnvKeys(rootDir, { BOT: 'new-bot', APP: 'new-app' })).toThrow('synthetic rename failure');
+    expect(read()).toBe('BOT=old\nAPP=old\n');
+    expect(fs.readdirSync(rootDir)).toEqual(['.env']);
+  });
+
+  it('propagates read failures without replacing the existing environment', () => {
+    write('KEEP=original\n');
+    const originalRead = fs.readFileSync;
+    const readSpy = vi.spyOn(fs, 'readFileSync').mockImplementation(() => {
+      throw Object.assign(new Error('synthetic access failure'), { code: 'EACCES' });
+    });
+    expect(() => upsertEnvKey(rootDir, 'NEW', 'value')).toThrow('synthetic access failure');
+    readSpy.mockRestore();
+    expect(originalRead(envPath(), 'utf8')).toBe('KEEP=original\n');
   });
 
   describe('appendToEnvList', () => {
