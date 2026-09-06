@@ -142,7 +142,18 @@ function vanishedSessionIsSkippable(err: unknown, session: Session): boolean {
  * poll, so its absence is an inconsistent host view and fails closed.
  */
 function sessionVanishIsSkippable(session: Session): boolean {
-  return !isContainerRunning(session.id) && !isContainerSpawning(session.id);
+  return !sessionHasLiveContainer(session);
+}
+
+/**
+ * Is a container running for this session as far as the host can tell —
+ * tracked, still spawning, or a pending survivor adoption could not yet claim
+ * (seam 4 E/D2, #462)? The barrier predicates ask this rather than the
+ * registry alone: a pending survivor is live, holds the mounts, and must
+ * acknowledge the fence and drain its work before it is stopped.
+ */
+function sessionHasLiveContainer(session: Session): boolean {
+  return isContainerRunning(session.id) || isContainerSpawning(session.id) || hasPendingAdoption(session.id);
 }
 
 /** Sentinel for "the mailbox is gone", distinct from any value an action returns. */
@@ -282,7 +293,7 @@ async function activateRepositoryMountBarriers(
 }
 
 async function sessionReachedRepositoryBarrier(session: Session, expectedAck: string): Promise<boolean> {
-  if (!isContainerRunning(session.id) && !isContainerSpawning(session.id)) return true;
+  if (!sessionHasLiveContainer(session)) return true;
   try {
     // OUTBOUND-keyed: all three reads are outbound-owned and nothing here
     // touches inbound.db, so outbound.db's existence is the question to ask.

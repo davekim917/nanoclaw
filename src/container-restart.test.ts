@@ -364,6 +364,11 @@ describe('repository mount reconciliation', () => {
       expect(fence?.state).toBe('active');
       return fence!.generation;
     });
+    // LIVE for the barrier: a pending survivor is not stopped until it has
+    // acknowledged the exact activation token — a stale ack is not a drain.
+    writeBarrierAck(outboundPath, JSON.stringify([epoch, 'generation-from-a-previous-barrier']));
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(mockKillContainer).not.toHaveBeenCalled();
     writeBarrierAck(outboundPath, JSON.stringify([epoch, generation]));
 
     const quiescence = await quiescing;
