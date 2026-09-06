@@ -262,6 +262,43 @@ describe('create with codex provider', () => {
   });
 });
 
+// ── Folder-residue dedupe (theme T1 PR 2, re-derived from upstream 92a3518b7) ─
+describe('folder-residue dedupe', () => {
+  it('skips a leftover real folder on disk with no claiming DB row, mints the next suffix', async () => {
+    // groups/scout exists on disk (e.g. left behind by `ncl groups delete`)
+    // but no agent_groups row claims it — the loop must treat disk presence
+    // as taken and mint scout-2 rather than adopting the residue.
+    fs.mkdirSync(path.join(TEST_GROUPS_DIR, 'scout'), { recursive: true });
+
+    const session = makeSession();
+    await runCreateAgent({ requestId: 'r4', name: 'Scout', instructions: 'help' }, session);
+
+    expect(await getAgentGroupByFolder('scout')).toBeUndefined();
+    const row = await getAgentGroupByFolder('scout-2');
+    expect(row).toBeDefined();
+  });
+
+  it('skips a dangling symlink occupying the folder name, mints the next suffix', async () => {
+    // A dangling symlink reads as absent under existsSync but still occupies
+    // the name; groupFolderExistsOnDisk uses lstat so it must be treated as
+    // taken, exactly like a real leftover directory.
+    fs.symlinkSync(path.join(TEST_GROUPS_DIR, 'does-not-exist-target'), path.join(TEST_GROUPS_DIR, 'ghost'));
+
+    const session = makeSession();
+    await runCreateAgent({ requestId: 'r5', name: 'Ghost', instructions: 'help' }, session);
+
+    expect(await getAgentGroupByFolder('ghost')).toBeUndefined();
+    const row = await getAgentGroupByFolder('ghost-2');
+    expect(row).toBeDefined();
+  });
+
+  // A folder already claimed by a DB row is unaffected by this change: the
+  // `getAgentGroupByFolder(folder)` disjunct alone is already true, so
+  // `groupFolderExistsOnDisk` never runs. That path (and the existing
+  // scoped-env prefix-collision guard it feeds into) is already pinned by
+  // "concurrent approvals" above and is left unmodified here.
+});
+
 // ── Write sequence ordering (FS before DB) ───────────────────────────────────
 describe('write sequence ordering', () => {
   it('test_create_agent_step_ordering_fs_before_db: calls initGroupFilesystem before updateContainerConfig before createAgentGroup', async () => {

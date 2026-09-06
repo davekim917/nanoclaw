@@ -17,6 +17,7 @@ import { createAgentGroup, getAgentGroup, getAgentGroupByFolder, getAllAgentGrou
 import { getDb } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
 import { requestWake } from '../../request-wake.js';
+import { groupFolderExistsOnDisk } from '../../group-folder.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { updateContainerConfig } from '../../container-config.js';
 import { log } from '../../log.js';
@@ -194,14 +195,18 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
       return;
     }
 
-    // Derive a safe folder name, deduplicated globally across agent_groups.folder.
-    // Name-squatting is mitigated by the approval gate (operator sees the
-    // requested name in the card) rather than by mandatory parent prefix —
-    // forcing a parent-folder prefix breaks scoped-env token boundaries
-    // (e.g. PARENT_FOLDER__CHILD's tokens overlap with PARENT_FOLDER_*).
+    // Derive a safe folder name, deduplicated globally across
+    // agent_groups.folder AND the on-disk groups/ dir: a folder present on
+    // disk with no claiming DB row is deleted-group residue, and adopting it
+    // would silently re-scope the old group's data under the new agent's
+    // identity — skip to the next suffix instead. Name-squatting is
+    // mitigated by the approval gate (operator sees the requested name in
+    // the card) rather than by mandatory parent prefix — forcing a
+    // parent-folder prefix breaks scoped-env token boundaries (e.g.
+    // PARENT_FOLDER__CHILD's tokens overlap with PARENT_FOLDER_*).
     let folder = localName;
     let suffix = 2;
-    while (await getAgentGroupByFolder(folder)) {
+    while ((await getAgentGroupByFolder(folder)) || groupFolderExistsOnDisk(folder)) {
       folder = `${localName}-${suffix}`;
       suffix++;
     }
