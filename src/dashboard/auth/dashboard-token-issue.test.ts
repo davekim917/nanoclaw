@@ -228,7 +228,7 @@ describe('dashboardTokenIssue', () => {
 
     await dashboardTokenIssue(makeCtx());
 
-    expect(ensureUserDm).toHaveBeenCalledWith('u1');
+    expect(ensureUserDm).toHaveBeenCalledWith('u1', { privacySafeLogs: true });
     expect(issueDashboardToken).toHaveBeenCalledOnce();
     expect(deliverMock).toHaveBeenCalledTimes(2);
 

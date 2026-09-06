@@ -201,7 +201,11 @@ export async function pickApprovalDelivery(
       // this (parseUserId falls back to user.kind); asking it is what keeps
       // the two sides from disagreeing.
       if ((await resolveUserChannelType(userId)) !== originChannelType) continue;
-      const mg = await ensureUserDm(userId, options.instance);
+      // privacySafeLogs: this DM is the delivery target for an approval
+      // card — a resolution failure here would otherwise write the
+      // approver's platform handle and any raw platform error into the
+      // host log.
+      const mg = await ensureUserDm(userId, { instance: options.instance, privacySafeLogs: true });
       if (mg) return { userId, messagingGroup: mg };
     }
   }
@@ -209,7 +213,7 @@ export async function pickApprovalDelivery(
   // Cross-channel fallback: the origin instance belongs to a different
   // platform here, so it must not be stamped on this user's DM row.
   for (const userId of approvers) {
-    const mg = await ensureUserDm(userId);
+    const mg = await ensureUserDm(userId, { privacySafeLogs: true });
     if (mg) return { userId, messagingGroup: mg };
   }
   return null;

@@ -74,7 +74,10 @@ export async function dashboardTokenIssue(ctx: InterceptContext): Promise<void> 
   // member sees the message, so the token must never be posted there. Route
   // it to the invoker's DM instead, opening one lazily if needed (same
   // primitive approvals/host notifications already use to cold-DM a user).
-  const deliveryMg = mg.is_group ? await ensureUserDm(ctx.userId) : mg;
+  // privacySafeLogs: this DM is about to carry a bearer dashboard token — a
+  // resolution failure here must not write the invoker's platform handle or
+  // any raw platform error into the host log.
+  const deliveryMg = mg.is_group ? await ensureUserDm(ctx.userId, { privacySafeLogs: true }) : mg;
 
   if (!deliveryMg) {
     // No DM path on this platform (no adapter openDM support, or it threw —
