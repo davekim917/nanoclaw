@@ -84,6 +84,7 @@ import { migration071 } from './071-host-coordination.js';
 import { migration072 } from './072-observatory-signal.js';
 import { migration073 } from './073-observatory-signal-workgroup-cascade.js';
 import { migration074 } from './074-pending-channel-approvals-cascade.js';
+import { migration075 } from './075-slack-room-creations.js';
 // Upstream's 014/015 — file numbers clash with local but uniqueness is by `name`.
 // Aliased to avoid JS identifier collisions with the local 014/015 above.
 import { migration014 as containerConfigs } from './014-container-configs.js';
@@ -232,6 +233,7 @@ export const migrations: Migration[] = [
   // recreates the child table that references it. Creates no timestamp for 053
   // to normalize, so its position relative to 053 is irrelevant.
   migration074,
+  migration075,
   // Last on purpose: normalizes whatever naive timestamps every migration
   // above has left behind (016's messaging_groups recreate copies created_at
   // through as-is).

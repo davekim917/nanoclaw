@@ -280,8 +280,11 @@ export async function findRoomsByName(callerAgentGroupId: string, roomName: stri
   return (await candidateRooms(callerAgentGroupId)).filter((room) => roomKey(room.name) === wanted);
 }
 
-/** `"ops room"` and `"Ops-Room"` name the same room. Slack normalizes too. */
-function roomKey(name: string): string {
+/** `"ops room"` and `"Ops-Room"` name the same room. Slack normalizes too.
+ *  Exported so the create-marker store keys on the same normalization the
+ *  name lookup uses — a marker findable under one spelling and not another
+ *  would resurrect exactly the retry hole it exists to close. */
+export function roomKey(name: string): string {
   return normalizeName(name);
 }
 
