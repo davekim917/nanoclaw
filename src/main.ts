@@ -28,6 +28,7 @@ import {
 import type { ChannelNameSource, MessagingGroupUpdates } from './db/messaging-groups.js';
 import { ensureContainerRuntimeRunning } from './container-runtime.js';
 import { warnActiveContainersOfShutdown, warnMarkedRunningSessionsOfStartup } from './host-restart-warn.js';
+import { requestWake } from './request-wake.js';
 import { getActiveSessions, resetPhantomContainerStatus } from './db/sessions.js';
 import { resetProcessingChannelIngress } from './db/channel-ingress-receipts.js';
 import {
@@ -724,7 +725,11 @@ export async function main(): Promise<void> {
   // E also leaves a `// F2 hook` marker at the END of `adoptRunningSessions`,
   // and this call deliberately does NOT move there: it can spawn, and adoption
   // must stay a pure inventory pass with no wake inside it. §7.F says `main()`.
-  await honorPendingStopIntents();
+  // The recovery wake goes through the seam like every other wake (T0 PR 3
+  // gate): the module-internal default exists for the unit tests, main()
+  // injects requestWake so a recovered restart records the same wake signal a
+  // live one does.
+  await honorPendingStopIntents((session) => requestWake(session, 'container-restart'));
 
   // 3. Channel adapters
   // Gateway READY can arrive while adapters are still initializing. Hold its
