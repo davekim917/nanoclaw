@@ -4,6 +4,7 @@ import path from 'path';
 
 import { GROUPS_DIR } from '../../config.js';
 import {
+  mcpServerPluginOwner,
   parseMcpServerConfig,
   readContainerConfig,
   resolveContainerSecurity,
@@ -29,7 +30,7 @@ import {
   updateContainerConfigJson,
 } from '../../db/container-configs.js';
 import { getDeniedModel } from '../../db/denied-models.js';
-import { assertValidGroupFolder } from '../../group-folder.js';
+import { assertValidGroupFolder, groupFolderExistsOnDisk } from '../../group-folder.js';
 import { log } from '../../log.js';
 import { canonicalizeIanaTimezone, timezoneRejectionReason } from '../../timezone.js';
 import { initGroupFilesystem } from '../../group-init.js';
@@ -157,11 +158,26 @@ registerResource({
         }
         const folder = args.folder as string;
         if (!folder) throw new Error('--folder is required');
+        // The template path validates through createAgentFromTemplate; the bare
+        // path used to validate nowhere, minting folders the runtime label
+        // grammar refuses at every spawn.
+        assertValidGroupFolder(folder);
         const name = (args.name as string) ?? folder;
         const existing = await getAgentGroupByFolder(folder);
         if (existing) {
           initGroupFilesystem(existing); // ensure a reused group is fully configured too (idempotent; also repairs a missing workspace folder)
           return existing;
+        }
+        // Fresh-create branch only: a folder on disk with no claiming DB row
+        // is deleted-group residue (delete never removes groups/<folder>/) or
+        // an operator-placed dir — minting a new id over it would silently
+        // re-scope the old group's data under a new identity.
+        if (groupFolderExistsOnDisk(folder)) {
+          throw new Error(
+            `group folder 'groups/${folder}' already exists on disk but no agent group claims it — ` +
+              `deleting a group never removes its folder, and creating a new group over it would silently ` +
+              `adopt the old group's data under a new identity. Move or remove the folder, or pick a different --folder.`,
+          );
         }
         const id = `ag-${randomUUID()}`;
         const group: AgentGroup = { id, name, folder, agent_provider: null, created_at: new Date().toISOString() };
@@ -209,7 +225,8 @@ registerResource({
       description:
         'Delete an agent group and its dependent rows (sessions, destinations, approvals, role grants, ' +
         'memberships, channel wirings). FK-ordered cascade in a single transaction. ' +
-        'Use --id <group-id>. Out of scope: killing running containers, on-disk cleanup of groups/<folder>/ and data/v2-sessions/<group-id>/.',
+        'Use --id <group-id>. Out of scope: killing running containers, on-disk cleanup of groups/<folder>/ and data/v2-sessions/<group-id>/. ' +
+        'The leftover groups/<folder>/ blocks re-creating a group under the same folder name until it is moved or removed.',
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
@@ -622,6 +639,17 @@ registerResource({
         // those fields from the DB; the backfill-container-configs sync is
         // file→DB one-way, so DB drift gets overwritten on next host start.
         const fileConfig = updateContainerConfig(group.folder, (cfg) => {
+          // Plugin-owned entries are template content — the sanctioned change
+          // path is `ncl groups restamp`, not a direct edit that a later
+          // restamp would silently clobber or that would silently drift from
+          // the plugin's own copy.
+          const owner = mcpServerPluginOwner(cfg.mcpServers?.[name]);
+          if (owner) {
+            throw new Error(
+              `MCP server "${name}" is owned by plugin "${owner}" — ` +
+                'update the plugin and run `ncl groups restamp` instead of editing it directly',
+            );
+          }
           if (!cfg.mcpServers) cfg.mcpServers = {};
           cfg.mcpServers[name] = newEntry;
         });
@@ -650,6 +678,17 @@ registerResource({
         const fileConfig = updateContainerConfig(group.folder, (cfg) => {
           if (!cfg.mcpServers || !cfg.mcpServers[name]) {
             throw new Error(`MCP server "${name}" not found`);
+          }
+          // Plugin-owned entries reappear on the next restamp — removing them
+          // directly would silently drift from the plugin's own copy until
+          // that happens, and the sanctioned removal path is editing the
+          // plugin itself, not this verb.
+          const owner = mcpServerPluginOwner(cfg.mcpServers[name]);
+          if (owner) {
+            throw new Error(
+              `MCP server "${name}" is owned by plugin "${owner}" — ` +
+                'it would reappear on the next restamp; remove it from the plugin instead',
+            );
           }
           delete cfg.mcpServers[name];
         });
