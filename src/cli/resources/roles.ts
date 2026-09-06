@@ -39,8 +39,9 @@ registerResource({
         if (!role || !['owner', 'admin'].includes(role)) throw new Error('--role must be owner or admin');
         if (role === 'owner' && groupId) throw new Error('owner role is always global (do not pass --group)');
         await getDb().run(
-          `INSERT OR IGNORE INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at)
-           VALUES (?, ?, ?, ?, ?)`,
+          `INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT DO NOTHING`,
           userId,
           role,
           groupId,
@@ -60,7 +61,7 @@ registerResource({
         if (!userId) throw new Error('--user is required');
         if (!role) throw new Error('--role is required');
         const result = await getDb().run(
-          'DELETE FROM user_roles WHERE user_id = ? AND role = ? AND agent_group_id IS ?',
+          'DELETE FROM user_roles WHERE user_id = ? AND role = ? AND agent_group_id IS NOT DISTINCT FROM ?',
           userId,
           role,
           groupId,
