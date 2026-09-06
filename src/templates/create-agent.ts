@@ -65,15 +65,17 @@ export function markPluginServers(
 }
 
 /**
- * Add the `plugin` ownership marker — the DB projection only.
+ * Add the `plugin` ownership marker — to BOTH stores.
  *
- * Upstream is DB-first and re-materializes container.json at spawn, so it can
- * carry the marker on the single stored copy and strip it on the way out. This
- * fork is file-first: container.json IS what the runner reads, so a host
- * bookkeeping field written there would flow straight into every provider's
- * server map. The guard sites all already hold the config ROW
- * (`groups.ts` reads `row.mcp_servers`, self-mod reads `getContainerConfig`),
- * so ownership lives there and the file stays free of it.
+ * The fork is file-first: container.json IS what the spawn reads, and all
+ * three mutation guards read the FILE, not the row (`groups.ts:657,687` and
+ * `modules/self-mod/apply.ts:191` all call `assertMcpServerNotPluginOwned`
+ * with an entry from `readContainerConfig`). A marker written only to the DB
+ * projection therefore guards nothing: an `ncl groups config add-mcp-server`
+ * or an approved `add_mcp_server` would silently overwrite a plugin's server
+ * (Codex on #500). The marker rides the file alongside `pluginRoot`, which is
+ * already a host bookkeeping field there; the runner strips both in
+ * `resolvePluginServer` before any provider sees the config.
  */
 export function withPluginOwner(
   servers: Record<string, ParsedMcpServerConfig>,
@@ -190,11 +192,11 @@ export async function createAgentFromTemplate(ref: string, opts?: CreateAgentOpt
   // servers unwired on first spawn, where the absent file materializes as an
   // empty config. The file carries the container-side marks; the ownership
   // marker rides only on the projection (see `withPluginOwner`).
-  const marked = markPluginServers(tpl.mcpServers, tpl.name);
+  const marked = withPluginOwner(markPluginServers(tpl.mcpServers, tpl.name), tpl.name);
   updateContainerConfig(folder, (config) => {
     config.mcpServers = { ...(config.mcpServers ?? {}), ...marked };
   });
-  await updateContainerConfigJson(id, 'mcp_servers', withPluginOwner(marked, tpl.name));
+  await updateContainerConfigJson(id, 'mcp_servers', marked);
 
   // Per-group skills overlay — keyed by group id, never shared. Copied through
   // the hardened copier like everything else that leaves the plugin.

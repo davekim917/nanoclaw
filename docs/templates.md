@@ -259,3 +259,13 @@ end (copy it under `templates/` and run
 any predefined tasks appear under `ncl tasks list --status paused`, confirm no
 secrets are committed, and open a PR. The repo's README has the full anatomy,
 category conventions, and checklist.
+
+## Upgrading from a pre-plugin template
+
+The reader accepts Agent Plugins only; a pre-plugin template folder is refused
+with a migration error and never parsed as a fallback. Re-fetch the template in
+plugin layout (a `plugin.json` manifest, `skills/`, `.mcp.json`, and the
+NanoClaw extension carrying persona, context, and tasks), then re-run
+`ncl groups create --template <ref>`. Groups already created are untouched —
+only the create path reads templates. The `[BREAKING]` entry in
+[CHANGELOG.md](../CHANGELOG.md) carries the same migration for `/update-nanoclaw`.

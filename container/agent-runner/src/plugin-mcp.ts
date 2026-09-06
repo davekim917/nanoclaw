@@ -28,6 +28,15 @@ export function resolvePluginServer(config: McpServerConfig): McpServerConfig {
   // The fork's McpServerConfig carries a third `sse` arm upstream doesn't have
   // (deprecated transport, rejected host-side at parseMcpServerConfig) —
   // excluded here purely to narrow the type; it can never reach this call.
+  // `plugin` is the host's ownership marker (stamped by `withPluginOwner`): it
+  // guards host-side mutations (`assertMcpServerNotPluginOwned` reads
+  // container.json) and must never reach a provider's server map. Stripped
+  // only when present, so an unmarked server is still returned by identity
+  // and every narrowing below is untouched (#500).
+  if ((config as { plugin?: string }).plugin !== undefined) {
+    const { plugin: _owner, ...unmarked } = config as McpServerConfig & { plugin?: string };
+    return resolvePluginServer(unmarked as McpServerConfig);
+  }
   if (config.type === 'http' || config.type === 'sse') return config;
   const { pluginRoot, ...server } = config;
   if (!pluginRoot) return config;

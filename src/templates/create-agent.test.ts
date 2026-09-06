@@ -184,14 +184,14 @@ describe('createAgentFromTemplate', () => {
         args: ['-y', '@hubspot/mcp-server'],
         env: {},
         pluginRoot: `${CONTAINER_PLUGINS_DIR}/sdr`,
+        plugin: 'sdr',
       },
     });
-    // The DB projection carries the same servers PLUS the ownership marker.
-    // `plugin` is host bookkeeping and never reaches container.json, which the
-    // runner hands straight to the provider.
-    expect(JSON.parse((await getContainerConfig(g.id))!.mcp_servers)).toEqual({
-      hubspot: { ...fileConfig.mcpServers.hubspot, plugin: 'sdr' },
-    });
+    // BOTH stores carry the ownership marker: every mutation guard reads the
+    // FILE, so a DB-only marker would guard nothing (Codex on #500). The
+    // runner strips `plugin` and `pluginRoot` before any provider sees them.
+    expect(fileConfig.mcpServers.hubspot).toMatchObject({ plugin: 'sdr' });
+    expect(JSON.parse((await getContainerConfig(g.id))!.mcp_servers)).toEqual(fileConfig.mcpServers);
   });
 
   it('forwards multiline scripts unchanged through the shared task creation path', async () => {

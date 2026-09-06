@@ -41,7 +41,8 @@ import { ensureContainerConfig, getContainerConfig } from '../db/container-confi
 import { initGroupFilesystem } from '../group-init.js';
 import { STANDING_INSTRUCTIONS_FILE } from '../group-persona.js';
 import type { AgentGroup, Session } from '../types.js';
-import { createAgentFromTemplate } from './create-agent.js';
+import { createAgentFromTemplate, markPluginServers, withPluginOwner } from './create-agent.js';
+import { assertMcpServerNotPluginOwned } from '../container-config.js';
 import { NANOCLAW_EXTENSION_NS } from './extension.js';
 import { MCP_SCHEMA_URL, PLUGIN_SCHEMA_URL } from './manifest.js';
 import { parseTemplate } from './parse.js';
@@ -163,9 +164,11 @@ describe('T5 PR 3 — the plugin reader and the stamp path', () => {
     expect(servers.omits).toMatchObject({ cwd: '${PLUGIN_ROOT}', pluginRoot: `${CONTAINER_PLUGINS_DIR}/acme` });
     expect(servers.declares).toMatchObject({ cwd: './work', pluginRoot: `${CONTAINER_PLUGINS_DIR}/acme` });
     // http servers get no cwd and no pluginRoot — there is nothing to launch.
-    expect(servers.remote).toEqual({ type: 'http', url: 'https://mcp.example.com/mcp' });
-    // The ownership marker stays off the file and on the projection.
-    expect(JSON.stringify(servers)).not.toContain('"plugin"');
+    expect(servers.remote).toEqual({ type: 'http', url: 'https://mcp.example.com/mcp', plugin: 'acme' });
+    // The ownership marker rides BOTH stores — every mutation guard reads the
+    // file (Codex on #500); the runner strips it before any provider sees it.
+    expect(servers.omits).toMatchObject({ plugin: 'acme' });
+    expect(servers.declares).toMatchObject({ plugin: 'acme' });
     const row = JSON.parse((await getContainerConfig(group.id))!.mcp_servers) as Record<string, { plugin?: string }>;
     expect(row.omits.plugin).toBe('acme');
     expect(row.remote.plugin).toBe('acme');
@@ -326,5 +329,19 @@ describe('the templates module never copies plugin content with fs.cpSync', () =
     expect(CALL_SITE_RE.test(stripComments(planted))).toBe(true);
     const commentOnly = '/** never through raw fs.cpSync */\nexport const x = 1;\n';
     expect(CALL_SITE_RE.test(stripComments(commentOnly))).toBe(false);
+  });
+
+  it('a stamped server is refused by every mutation guard (marker → guard contract, #500)', () => {
+    // The three guard sites all read container.json, so this is the entry the
+    // guard actually sees after a stamp.
+    const stamped = withPluginOwner(
+      markPluginServers({ hubspot: { command: 'npx', args: [], env: {} } }, 'sdr'),
+      'sdr',
+    ).hubspot;
+    expect(() => assertMcpServerNotPluginOwned(stamped, 'hubspot', 'sdr-group')).toThrow(/managed by plugin "sdr"/);
+    // An operator-added server carries no marker and stays editable.
+    expect(() =>
+      assertMcpServerNotPluginOwned({ command: 'npx', args: [], env: {} }, 'mine', 'sdr-group'),
+    ).not.toThrow();
   });
 });
