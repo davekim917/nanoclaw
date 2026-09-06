@@ -279,7 +279,12 @@ function genericCreate(def: ResourceDef) {
     // the primitive for exactly that race: the loser adopts the winner's row
     // instead of throwing a raw unique-constraint error at the caller.
     if (def.naturalKey && def.naturalKey.length > 0) {
-      const where = def.naturalKey.map((c) => `${c} = ?`).join(' AND ');
+      // `IS NOT DISTINCT FROM` (not `=`) so a NULL natural-key column still
+      // matches: `=` against NULL is never true in SQL, so a natural key that
+      // includes a nullable column (e.g. one left unset with no default) made
+      // "idempotent create" not idempotent — it inserted a duplicate or hit
+      // the unique constraint instead of returning the existing row.
+      const where = def.naturalKey.map((c) => `${c} IS NOT DISTINCT FROM ?`).join(' AND ');
       const params = def.naturalKey.map((c) => values[c]);
       const reload = (): Promise<Record<string, unknown> | undefined> =>
         getDb().get<Record<string, unknown>>(

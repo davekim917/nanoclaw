@@ -80,6 +80,29 @@ registerResource({
   },
 });
 
+// Synthetic resource for the generic-CRUD portability cases (theme T2 PR 4):
+// a nullable natural-key column (case 15), and columns covering every
+// `coerceListFilter` arm — boolean/number/json (cases 16, 17). Table created
+// per-test in the describe's beforeEach, same pattern as hooktest_rows above.
+registerResource({
+  name: 'crudtest',
+  plural: 'crudtests',
+  table: 'crudtest_rows',
+  description: 'Synthetic resource for natural-key and list-filter portability tests.',
+  idColumn: 'id',
+  columns: [
+    { name: 'id', type: 'string', description: 'UUID.', generated: true },
+    { name: 'scope', type: 'string', description: 'nullable natural-key component' },
+    { name: 'name', type: 'string', description: 'required natural-key component', required: true },
+    { name: 'enabled', type: 'boolean', description: 'boolean filter column' },
+    { name: 'score', type: 'number', description: 'numeric filter column' },
+    { name: 'payload', type: 'json', description: 'json filter column' },
+    { name: 'created_at', type: 'string', description: 'Auto-set.', generated: true },
+  ],
+  naturalKey: ['scope', 'name'],
+  operations: { list: 'open', create: 'open' },
+});
+
 beforeEach(async () => {
   await initTestDb();
   const db = getRawDb();
@@ -246,5 +269,41 @@ describe('genericCreate resolveDefaults hook (two-pass create)', () => {
     await expect(lookup('hooktests-create')!.handler({ kind: 'boom' }, hostCtx)).rejects.toThrow('hook rejected');
     const count = getRawDb().prepare('SELECT COUNT(*) AS n FROM hooktest_rows').get() as { n: number };
     expect(count.n).toBe(0);
+  });
+});
+
+describe('genericCreate natural-key lookup — NULL matching (case 15)', () => {
+  beforeEach(() => {
+    getRawDb().exec(
+      `CREATE TABLE crudtest_rows (
+         id TEXT PRIMARY KEY, scope TEXT, name TEXT NOT NULL,
+         enabled INTEGER, score INTEGER, payload TEXT, created_at TEXT NOT NULL
+       )`,
+    );
+  });
+
+  it('idempotent create matches on a NULL natural-key column', async () => {
+    // `scope` is left unset (no default), so it lands as NULL in the row.
+    const first = (await lookup('crudtests-create')!.handler({ name: 'alpha' }, hostCtx)) as { id: string };
+    const second = (await lookup('crudtests-create')!.handler({ name: 'alpha' }, hostCtx)) as { id: string };
+    expect(second.id).toBe(first.id);
+    const count = getRawDb().prepare('SELECT COUNT(*) AS n FROM crudtest_rows').get() as { n: number };
+    expect(count.n).toBe(1);
+  });
+
+  it('a non-NULL natural key still matches normally', async () => {
+    const first = (await lookup('crudtests-create')!.handler({ name: 'beta', scope: 'x' }, hostCtx)) as {
+      id: string;
+    };
+    const second = (await lookup('crudtests-create')!.handler({ name: 'beta', scope: 'x' }, hostCtx)) as {
+      id: string;
+    };
+    expect(second.id).toBe(first.id);
+  });
+
+  it('a different scope value with the same name is a distinct row', async () => {
+    const a = (await lookup('crudtests-create')!.handler({ name: 'gamma', scope: 'x' }, hostCtx)) as { id: string };
+    const b = (await lookup('crudtests-create')!.handler({ name: 'gamma', scope: 'y' }, hostCtx)) as { id: string };
+    expect(b.id).not.toBe(a.id);
   });
 });
