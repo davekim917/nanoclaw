@@ -36,6 +36,7 @@ import { conversationDisplayName } from './adapter.js';
 import type { ChannelConversation, ChannelDefaults, ChannelRecoveryRequest, ChannelRecoveryTarget } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import { extractSlackRawText } from './slack-raw-text.js';
+import { SlackApiError, slackCall } from './slack-lib.js';
 import { createSlackHopGovernor, type SlackHopGovernor } from './slack-hop-limit.js';
 import {
   fetchSlackBotIdentity,
@@ -898,4 +899,111 @@ if (workspaces.length > 1) {
   log.info('Multiple Slack workspaces registered', {
     channelTypes: workspaces.map((w) => w.channelType),
   });
+}
+
+// ── Room actions: the adapter's narrow per-instance call surface ─────────────
+//
+// `src/modules/slack-rooms/` needs exactly two privileged Slack calls, and it
+// must never hold a bot token: the instance → token binding is this module's
+// job, so the feature module names an instance (a channel type) and gets a
+// result back. Deliberately NOT a WebClient handed out through the registry —
+// exporting the client would put every Slack method, and the token behind it,
+// outside the one file that owns the credential convention, and would route
+// around the delivery-side interceptor/guard model.
+//
+// Token resolution goes through `loadSlackWorkspaces()`, this module's single
+// documented entry point for `.env` Slack credentials, rather than a second
+// copy of the suffix derivation (the failure mode SLACK_ENV_PATTERN's comment
+// above already records). Transport is `slackCall` from ./slack-lib.js, the
+// channel layer's one Slack HTTP client — its SlackApiError never interpolates
+// a token value, so a failure is safe to surface to an agent verbatim.
+
+/**
+ * The Slack Web API slice the room actions use. Injectable so unit tests
+ * exercise the instance → token resolution and the argument shapes without a
+ * network call; production callers omit it and get `slackCall`.
+ */
+export type SlackRoomApi = (
+  token: string,
+  method: string,
+  body: Record<string, unknown>,
+  step: string,
+) => Promise<Record<string, unknown>>;
+
+/** Thrown when an instance has no bot token on this install. Never carries a token value. */
+export class UnknownSlackInstanceError extends Error {
+  constructor(readonly instance: string) {
+    super(`no Slack bot token configured for instance "${instance}"`);
+    this.name = 'UnknownSlackInstanceError';
+  }
+}
+
+function botTokenForInstance(instance: string): string {
+  const ws = loadSlackWorkspaces().find((w) => w.channelType === instance);
+  if (!ws) throw new UnknownSlackInstanceError(instance);
+  return ws.botToken;
+}
+
+/**
+ * `conversations.create` as the named instance's bot.
+ *
+ * Private by default: a room holding several agents and one human is a
+ * working space, not an announcement channel, and a private channel is the
+ * only one of the two shapes that cannot be stumbled into by the rest of the
+ * workspace. Unlike an MPIM (upstream's shape) a private channel GROWS IN
+ * PLACE, which is what lets `add_to_room` invite into the same conversation
+ * instead of forking a new one and re-wiring everybody.
+ *
+ * Returns the channel id together with the name Slack actually assigned —
+ * Slack normalizes room names (lowercase, dashes, length cap), so the caller
+ * must persist what came back rather than what it asked for.
+ */
+export async function createConversation(
+  instance: string,
+  opts: { name: string; isPrivate?: boolean },
+  api: SlackRoomApi = slackCall,
+): Promise<{ channelId: string; name: string }> {
+  const json = await api(
+    botTokenForInstance(instance),
+    'conversations.create',
+    { name: opts.name, is_private: opts.isPrivate !== false },
+    'room-create',
+  );
+  const channel = json.channel as Record<string, unknown> | undefined;
+  const channelId = typeof channel?.id === 'string' ? channel.id : null;
+  if (!channelId) {
+    throw new SlackApiError('room-create', 'slack conversations.create failed: no channel id in response');
+  }
+  return { channelId, name: typeof channel?.name === 'string' ? channel.name : opts.name };
+}
+
+/**
+ * `conversations.invite` as the named instance's bot.
+ *
+ * Slack takes the whole invitee list in one call and is idempotent only in
+ * the sense that it names the failure: `already_in_channel` when EVERY id is
+ * already a member. That one error is swallowed — re-running a room action
+ * whose invite half already landed must be a no-op, not a failure — while any
+ * other error propagates as a SlackApiError the caller reports verbatim.
+ * A partial overlap (some already in, some not) succeeds normally on Slack's
+ * side, so no per-user retry loop is needed.
+ */
+export async function inviteUsers(
+  instance: string,
+  channelId: string,
+  userIds: string[],
+  api: SlackRoomApi = slackCall,
+): Promise<void> {
+  if (userIds.length === 0) return;
+  try {
+    await api(
+      botTokenForInstance(instance),
+      'conversations.invite',
+      { channel: channelId, users: userIds.join(',') },
+      'room-invite',
+    );
+  } catch (err) {
+    if (err instanceof SlackApiError && err.message.includes('already_in_channel')) return;
+    throw err;
+  }
 }
