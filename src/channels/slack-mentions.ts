@@ -75,6 +75,11 @@ export function registerSlackBot(channelType: string, identity: SlackBotIdentity
   knownSlackBots.set(channelType, identity);
 }
 
+/** Remove an identity only if it is still the registered identity for this adapter. */
+export function unregisterSlackBot(channelType: string, identity: SlackBotIdentity): void {
+  if (knownSlackBots.get(channelType) === identity) knownSlackBots.delete(channelType);
+}
+
 export function registerSlackWorkspaceHumans(teamId: string, humans: SlackBotIdentity[]): void {
   knownSlackHumans.set(teamId, humans);
 }

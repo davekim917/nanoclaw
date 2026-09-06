@@ -21,6 +21,11 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 
 const registry = new Map<string, ChannelRegistration>();
 const activeAdapters = new Map<string, ChannelAdapter>();
+const startingAdapters = new Map<string, Promise<ChannelAdapterStartResult>>();
+const startingAdapterKeys = new Map<string, Promise<void>>();
+let hotStartSetupFn: ((adapter: ChannelAdapter) => ChannelSetup) | null = null;
+
+type ChannelAdapterStartResult = 'started' | 'already-active' | 'no-credentials';
 
 /** Register a channel adapter factory. Called by channel modules on import. */
 export function registerChannelAdapter(name: string, registration: ChannelRegistration): void {
@@ -267,63 +272,152 @@ export function getChannelContainerConfig(name: string): ChannelRegistration['co
   return registry.get(name)?.containerConfig;
 }
 
+async function setupChannelAdapter(
+  name: string,
+  adapter: ChannelAdapter,
+  setupFn: (adapter: ChannelAdapter) => ChannelSetup,
+  lifecycle: 'startup' | 'hot-start',
+): Promise<void> {
+  const setup = setupFn(adapter);
+  let attempt = 0;
+  while (true) {
+    try {
+      await adapter.setup(setup);
+      return;
+    } catch (err) {
+      if (isNetworkError(err) && attempt < SETUP_RETRY_DELAYS_MS.length) {
+        const delay = SETUP_RETRY_DELAYS_MS[attempt]!;
+        log.warn(
+          lifecycle === 'startup'
+            ? 'Channel adapter setup failed with network error, retrying'
+            : 'Hot-start adapter setup failed with network error, retrying',
+          { channel: name, attempt: attempt + 1, delayMs: delay, err: err.message },
+        );
+        await sleep(delay);
+        attempt += 1;
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+async function startRegisteredChannelAdapter(
+  name: string,
+  registration: ChannelRegistration,
+  setupFn: (adapter: ChannelAdapter) => ChannelSetup,
+  options: { replaceActive: boolean },
+): Promise<ChannelAdapterStartResult> {
+  const adapter = await registration.factory();
+  if (!adapter) {
+    log.warn('Channel credentials missing, skipping', { channel: name });
+    return 'no-credentials';
+  }
+
+  const key = adapter.instance ?? adapter.channelType;
+  if (!options.replaceActive) {
+    // A failed owner releases its key without making it active. Re-check after
+    // every wait so exactly one queued alias claims the retry.
+    while (true) {
+      const pending = startingAdapterKeys.get(key);
+      if (!pending) break;
+      await pending;
+    }
+    if (activeAdapters.has(key)) return 'already-active';
+
+    let releaseStart!: () => void;
+    const started = new Promise<void>((resolve) => {
+      releaseStart = resolve;
+    });
+    startingAdapterKeys.set(key, started);
+    try {
+      await setupChannelAdapter(name, adapter, setupFn, 'hot-start');
+      activeAdapters.set(key, adapter);
+      log.info('Channel adapter hot-started', { channel: name, type: adapter.channelType, instance: key });
+      return 'started';
+    } catch (err) {
+      try {
+        await adapter.teardown();
+      } catch (teardownErr) {
+        log.error('Failed to tear down channel adapter after hot-start failure', { channel: name, err: teardownErr });
+      }
+      throw err;
+    } finally {
+      releaseStart();
+      if (startingAdapterKeys.get(key) === started) startingAdapterKeys.delete(key);
+    }
+  }
+
+  await setupChannelAdapter(name, adapter, setupFn, 'startup');
+
+  // Adapters key by instance (default instance = channelType), so N
+  // instances of one platform coexist. Startup preserves its historical
+  // last-write-wins behavior; a hot start refuses to replace an active
+  // identity so a duplicate provisioning request cannot run two adapters.
+  if (activeAdapters.has(key)) {
+    log.warn('Duplicate adapter instance key — overwriting previous adapter', { key, channel: name });
+  }
+  activeAdapters.set(key, adapter);
+  log.info('Channel adapter started', { channel: name, type: adapter.channelType, instance: key });
+  return 'started';
+}
+
 /**
  * Instantiate and set up all registered channel adapters.
  * Skips adapters that return null (missing credentials).
  */
 export async function initChannelAdapters(setupFn: (adapter: ChannelAdapter) => ChannelSetup): Promise<void> {
+  hotStartSetupFn = null;
   for (const [name, registration] of registry) {
     try {
-      const adapter = await registration.factory();
-      if (!adapter) {
-        log.warn('Channel credentials missing, skipping', { channel: name });
-        continue;
-      }
-
-      const setup = setupFn(adapter);
-      // Transient network failures during adapter init (e.g. Telegram deleteWebhook
-      // hitting a DNS hiccup at boot) would otherwise leave the channel permanently
-      // dead until manual restart. Retry only on NetworkError so misconfigs (bad
-      // tokens, etc.) still fail fast.
-      let attempt = 0;
-      while (true) {
-        try {
-          await adapter.setup(setup);
-          break;
-        } catch (err) {
-          if (isNetworkError(err) && attempt < SETUP_RETRY_DELAYS_MS.length) {
-            const delay = SETUP_RETRY_DELAYS_MS[attempt]!;
-            log.warn('Channel adapter setup failed with network error, retrying', {
-              channel: name,
-              attempt: attempt + 1,
-              delayMs: delay,
-              err: err.message,
-            });
-            await sleep(delay);
-            attempt += 1;
-            continue;
-          }
-          throw err;
-        }
-      }
-      // Adapters key by instance (default instance = channelType), so N
-      // instances of one platform coexist. Duplicate keys warn instead of
-      // throwing — boot stays resilient, matching the historical silent
-      // last-write-wins, but now visibly.
-      const key = adapter.instance ?? adapter.channelType;
-      if (activeAdapters.has(key)) {
-        log.warn('Duplicate adapter instance key — overwriting previous adapter', { key, channel: name });
-      }
-      activeAdapters.set(key, adapter);
-      log.info('Channel adapter started', { channel: name, type: adapter.channelType, instance: key });
+      await startRegisteredChannelAdapter(name, registration, setupFn, { replaceActive: true });
     } catch (err) {
       log.error('Failed to start channel adapter', { channel: name, err });
     }
+  }
+  // Do not expose the callback until the boot pass has finished: a workspace
+  // registered during startup remains the init loop's responsibility.
+  hotStartSetupFn = setupFn;
+}
+
+/**
+ * Start one adapter registered after host boot using the same setup callback,
+ * factory, NetworkError retry policy, and active-instance bookkeeping as
+ * initChannelAdapters. A duplicate request for an active or in-flight key
+ * never creates a second transport; callers can retry a failed start.
+ */
+export async function startChannelAdapter(name: string): Promise<'started' | 'already-active' | 'no-credentials'> {
+  if (activeAdapters.has(name)) return 'already-active';
+
+  const registration = registry.get(name);
+  if (!registration) throw new Error(`startChannelAdapter: no registration for '${name}'`);
+  if (!hotStartSetupFn) throw new Error('startChannelAdapter: initChannelAdapters has not run');
+
+  const pending = startingAdapters.get(name);
+  if (pending) return pending;
+
+  const start = startRegisteredChannelAdapter(name, registration, hotStartSetupFn, {
+    replaceActive: false,
+  });
+  startingAdapters.set(name, start);
+  try {
+    return await start;
+  } catch (err) {
+    const fallback = 'Restart fallback: bash setup/lib/restart.sh';
+    log.error('Failed to hot-start channel adapter; restart with bash setup/lib/restart.sh', { channel: name, err });
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(`${detail}. ${fallback}`, { cause: err });
+  } finally {
+    startingAdapters.delete(name);
   }
 }
 
 /** Tear down all active adapters. */
 export async function teardownChannelAdapters(): Promise<void> {
+  // Block a late caller first, then wait for every admitted hot start so an
+  // adapter cannot be added after this teardown clears the active map.
+  hotStartSetupFn = null;
+  await Promise.allSettled([...startingAdapters.values()]);
   for (const [name, adapter] of activeAdapters) {
     try {
       await adapter.teardown();

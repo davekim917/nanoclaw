@@ -49,6 +49,7 @@ import {
   normalizeSlackOrderedListContinuations,
   resolveInboundSlackIds,
   resolveSlackMentions,
+  unregisterSlackBot,
   upgradeSlackBotProfile,
   type SlackBotIdentity,
 } from './slack-mentions.js';
@@ -676,7 +677,12 @@ for (const channelType of declarationOnlySlackTypes(slackEnv)) {
   registerChannelAdapter(channelType, { defaults: SLACK_DEFAULTS, factory: () => null });
 }
 
-for (const ws of workspaces) {
+/**
+ * Register one fully configured Slack workspace. Provisioning calls this after
+ * adding a new token pair so the registry can start the exact same factory
+ * without waiting for the next host restart.
+ */
+export function registerSlackWorkspace(ws: SlackWorkspace): void {
   registerChannelAdapter(ws.channelType, {
     // Also on the registration, so offline creation paths (setup wizard,
     // scripts, `ncl` against a host whose factory returned null for missing
@@ -715,35 +721,10 @@ for (const ws of workspaces) {
       (slackAdapter as unknown as { name: string }).name = ws.channelType;
       const client = new WebClient(ws.botToken);
 
-      // Discover this bot's user_id + username + team_id so sibling bots in
-      // the same Slack workspace can resolve `@username` → `<@USER_ID>` on
-      // outbound. One auth.test call at adapter init; cached for the
-      // lifetime of the process. Mirrors discord.ts's fetchDiscordBotIdentity.
-      //
-      // Profile alias enrichment (displayName/realName from users.info)
-      // runs as fire-and-forget AFTER registration so it doesn't extend
-      // serial channel-factory startup. The registry has username
-      // resolution working immediately; the additional aliases appear
-      // once the (typically sub-second) users.info call completes.
+      // Discover this bot's identity before building the bridge. Setup publishes
+      // it provisionally before Socket Mode can deliver inbound events, then
+      // rolls it back if setup fails; post-setup refresh work waits for success.
       const identity = await fetchSlackBotIdentity(client);
-      if (identity) {
-        registerSlackBot(ws.channelType, identity);
-        void upgradeSlackBotProfile(client, ws.channelType);
-        // Workspace humans → mention registry, so agent-emitted `@Alice` /
-        // `<@bob>` resolve without a hand-maintained roster. Fire-and-forget
-        // at init (same pattern as profile enrichment) + hourly refresh so
-        // new teammates resolve without a restart. Degrades gracefully when
-        // the token lacks users:read.
-        void syncSlackWorkspaceHumans(client, identity.teamId, ws.channelType);
-        setInterval(
-          () => void syncSlackWorkspaceHumans(client, identity.teamId, ws.channelType),
-          60 * 60 * 1000,
-        ).unref();
-      } else {
-        log.warn('Slack bot identity unavailable — outbound @-mentions for this bot will not resolve', {
-          channelType: ws.channelType,
-        });
-      }
 
       // One governor per bridge instance — each instance is one bot identity.
       const hopGovernor = createSlackHopGovernor(ws.channelType);
@@ -851,9 +832,66 @@ for (const ws of workspaces) {
       bridge.postParent = (platformId, text) => slackPostParent(client, platformId, text);
       bridge.createThread = (platformId, parentMessageId, title, firstMessage) =>
         slackCreateThread(client, platformId, parentMessageId, title, firstMessage);
+
+      let startedPostSetup = false;
+      let workspaceHumansRefresh: ReturnType<typeof setInterval> | undefined;
+      const setupBridge = bridge.setup.bind(bridge);
+      bridge.setup = async (setup) => {
+        if (!identity) {
+          await setupBridge(setup);
+          if (startedPostSetup) return;
+          startedPostSetup = true;
+          log.warn('Slack bot identity unavailable — outbound @-mentions for this bot will not resolve', {
+            channelType: ws.channelType,
+          });
+          return;
+        }
+
+        // Socket Mode can deliver inbound events before setup resolves. Publish the
+        // identity first so its inbound filter observes sibling bots correctly.
+        const previousIdentity = getKnownSlackBots().get(ws.channelType);
+        registerSlackBot(ws.channelType, identity);
+        try {
+          await setupBridge(setup);
+        } catch (err) {
+          // A concurrently registered adapter may have replaced this entry.
+          // Restore only our own registration so it cannot be clobbered.
+          if (getKnownSlackBots().get(ws.channelType) === identity) {
+            if (previousIdentity) registerSlackBot(ws.channelType, previousIdentity);
+            else unregisterSlackBot(ws.channelType, identity);
+          }
+          throw err;
+        }
+
+        if (startedPostSetup) return;
+        startedPostSetup = true;
+        void upgradeSlackBotProfile(client, ws.channelType);
+        // Workspace humans → mention registry, so agent-emitted `@Alice` /
+        // `<@bob>` resolve without a hand-maintained roster. Refresh hourly
+        // only while this bridge remains live.
+        void syncSlackWorkspaceHumans(client, identity.teamId, ws.channelType);
+        workspaceHumansRefresh = setInterval(
+          () => void syncSlackWorkspaceHumans(client, identity.teamId, ws.channelType),
+          60 * 60 * 1000,
+        );
+        workspaceHumansRefresh.unref();
+      };
+
+      const teardownBridge = bridge.teardown.bind(bridge);
+      bridge.teardown = async () => {
+        if (workspaceHumansRefresh) {
+          clearInterval(workspaceHumansRefresh);
+          workspaceHumansRefresh = undefined;
+        }
+        await teardownBridge();
+      };
       return bridge;
     },
   });
+}
+
+for (const ws of workspaces) {
+  registerSlackWorkspace(ws);
 }
 
 if (workspaces.length > 1) {
