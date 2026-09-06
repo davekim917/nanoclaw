@@ -251,7 +251,7 @@ describe('addSlackWorkspace', () => {
     expect(spies.start).not.toHaveBeenCalled();
   });
 
-  it('refuses a second instance for the same Slack team', async () => {
+  it('attaches a sibling bot into an already-wired Slack team and refuses only the same bot user', async () => {
     state.knownBots.set('slack-existing', { teamId: 'TTEST', userId: 'UOTHERBOT' });
     state.auth.set('xoxb-synthetic-sibling', { teamId: 'TTEST', userId: 'USIBLINGBOT', botId: 'BOTHER' });
 
@@ -261,18 +261,32 @@ describe('addSlackWorkspace', () => {
         botToken: 'xoxb-synthetic-sibling',
         appToken: 'xapp-synthetic-sibling',
       }),
-    ).rejects.toThrow('already attached as slack-existing');
-    expect(spies.upsert).not.toHaveBeenCalled();
+    ).resolves.toBeDefined();
+    expect(spies.upsert).toHaveBeenCalledTimes(1);
     expect(
       duplicateSlackBotChannelType('slack-another', { teamId: 'TTEST', userId: 'UOTHERBOT', botId: 'BOTHER' }),
     ).toBe('slack-existing');
+    expect(
+      duplicateSlackBotChannelType('slack-another', { teamId: 'TTEST', userId: 'UTHIRDBOT', botId: 'BTHIRD' }),
+    ).toBeNull();
   });
 
-  it('also refuses a duplicate team belonging to an offline configured app', async () => {
+  it('refuses the same bot user attached under another instance', async () => {
+    state.knownBots.set('slack-existing', { teamId: 'TTEST', userId: 'UOTHERBOT' });
+    state.auth.set('xoxb-synthetic-dup', { teamId: 'TTEST', userId: 'UOTHERBOT', botId: 'BOTHER' });
+
+    await expect(
+      addSlackWorkspace({ instance: 'dup', botToken: 'xoxb-synthetic-dup', appToken: 'xapp-synthetic-dup' }),
+    ).rejects.toThrow('already attached as slack-existing');
+    expect(spies.upsert).not.toHaveBeenCalled();
+  });
+
+  it('also refuses a duplicate bot user belonging to an offline configured app', async () => {
     state.configured = [
       { channelType: 'slack-offline', botToken: 'xoxb-synthetic-offline', appToken: 'xapp-synthetic-offline' },
     ];
     state.auth.set('xoxb-synthetic-offline', { teamId: 'TTEST', userId: 'UOFFLINE', botId: 'BOFFLINE' });
+    state.auth.set('xoxb-synthetic-helper', { teamId: 'TTEST', userId: 'UOFFLINE', botId: 'BHELPER' });
     await expect(
       addSlackWorkspace({ instance: 'helper', botToken: 'xoxb-synthetic-helper', appToken: 'xapp-synthetic-helper' }),
     ).rejects.toThrow('already attached as slack-offline');

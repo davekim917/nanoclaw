@@ -100,9 +100,10 @@ function normalizeInstance(instance: string): string {
 }
 
 /**
- * The current operator policy permits one attached bot per Slack team. Keep
- * the policy isolated here: changing it to permit sibling bots changes this
- * predicate without weakening same-instance identity checks below.
+ * Fork policy: several sibling bots may share ONE Slack team (each agent
+ * group has its own app / bot user in the same workspace). A duplicate is the
+ * same bot user attached under another instance — same team alone is the
+ * sibling case and is allowed. Keep the policy isolated here.
  */
 export function duplicateSlackBotChannelType(
   channelType: string,
@@ -110,7 +111,7 @@ export function duplicateSlackBotChannelType(
   knownBots: ReadonlyMap<string, Pick<SlackBotIdentity, 'teamId' | 'userId'>> = getKnownSlackBots(),
 ): string | null {
   for (const [knownChannelType, known] of knownBots) {
-    if (knownChannelType !== channelType && known.teamId === identity.teamId) {
+    if (knownChannelType !== channelType && known.teamId === identity.teamId && known.userId === identity.userId) {
       return knownChannelType;
     }
   }
