@@ -640,7 +640,7 @@
 "src/cli/commands/index.ts":{"diff":1,"mode":"100644","sha256":"c7fc6da9c525aab3c7ebfd5c51dfd6b57c37aefd637916a3cf8eb327ec10340f"},
 "src/cli/crud-validate.test.ts":{"diff":8,"mode":"100644","sha256":"f005aeebc6bd5f7e3ccd12650d109012c3e2bf6a12526504f747dc5d6e2c2952"},
 "src/cli/crud.test.ts":{"diff":93,"mode":"100644","sha256":"1171169e412cb0bd36609d2ad74a5fb242f170683e10d01c0cac9ebdaa44048a"},
-"src/cli/crud.ts":{"diff":188,"mode":"100644","sha256":"ad99d46d4437e1eaa8742c817c9d8a1fc16ae41f92caeb62c4076bc9fd75f202"},
+"src/cli/crud.ts":{"diff":194,"mode":"100644","sha256":"04845b9d8034cba3e5fd3153f25e8cb4defcd114d4d1a35e36feec86103496cc"},
 "src/cli/delivery-action.ts":{"diff":146,"mode":"100644","sha256":"3b7b01c10ac536e806e3fe42423f51a58d8a2b9fa441105eb576b84e587d05e2"},
 "src/cli/dispatch.test.ts":{"diff":177,"mode":"100644","sha256":"c0efb11fd0d205c9f0def54f5ad1bc3cd4d1da2d4cdc63c47838785593b67dfd"},
 "src/cli/dispatch.ts":{"diff":63,"mode":"100644","sha256":"f7b227f3bc4bf399d4cc95b6847088b4b5824d4fdeff14774cdd6863e34b9453"},

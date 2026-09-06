@@ -17,7 +17,7 @@ vi.mock('../../log.js', () => ({
   isSurvivableIoError: vi.fn(() => false),
 }));
 
-import { initTestDb, closeDb, getRawDb, runMigrations, createAgentGroup } from '../../db/index.js';
+import { initMigratedTestDb, closeDb, getDb, createAgentGroup } from '../../db/index.js';
 import { createUser } from '../../modules/permissions/db/users.js';
 import { lookup } from '../registry.js';
 // Side-effect import: registers `members-add` / `members-remove`.
@@ -26,8 +26,7 @@ import './members.js';
 const hostCtx = { caller: 'host' as const };
 
 beforeEach(async () => {
-  await initTestDb();
-  runMigrations(getRawDb());
+  await initMigratedTestDb();
   await createUser({ id: 'user-1', kind: 'human', display_name: null, created_at: new Date().toISOString() });
   await createAgentGroup({
     id: 'ag-1',
@@ -46,18 +45,22 @@ describe('members-add / members-remove portable SQL (case 20)', () => {
   it('adding a member twice is a no-op', async () => {
     await lookup('members-add')!.handler({ user: 'user-1', group: 'ag-1' }, hostCtx);
     await lookup('members-add')!.handler({ user: 'user-1', group: 'ag-1' }, hostCtx);
-    const row = getRawDb()
-      .prepare('SELECT COUNT(*) AS n FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?')
-      .get('user-1', 'ag-1') as { n: number };
-    expect(row.n).toBe(1);
+    const row = await getDb().get<{ n: number }>(
+      'SELECT COUNT(*) AS n FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?',
+      'user-1',
+      'ag-1',
+    );
+    expect(row!.n).toBe(1);
   });
 
   it('remove deletes the membership', async () => {
     await lookup('members-add')!.handler({ user: 'user-1', group: 'ag-1' }, hostCtx);
     await lookup('members-remove')!.handler({ user: 'user-1', group: 'ag-1' }, hostCtx);
-    const row = getRawDb()
-      .prepare('SELECT * FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?')
-      .get('user-1', 'ag-1');
+    const row = await getDb().get(
+      'SELECT * FROM agent_group_members WHERE user_id = ? AND agent_group_id = ?',
+      'user-1',
+      'ag-1',
+    );
     expect(row).toBeUndefined();
   });
 

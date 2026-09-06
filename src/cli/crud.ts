@@ -200,11 +200,15 @@ function coerceListFilter(column: ColumnDef, value: unknown): unknown {
 }
 
 // Portable `ORDER BY` for `list`: the resource's own declaration wins, else
-// the first `_at` (timestamp) column descending with the id as a tiebreak so
-// ties resolve deterministically instead of falling through to storage order.
+// `created_at` if present, else the first `_at` column — DESC with the id as
+// tiebreak. Fork-ahead: `created_at` is preferred because a nullable event
+// stamp declared earlier (messaging-groups' `denied_at`) would order ordinary
+// rows by random id and let a small LIMIT hide the newest row (Codex, #492).
 function listOrder(def: ResourceDef): string {
   if (def.listOrder) return def.listOrder;
-  const timestamp = def.columns.find((column) => column.name.endsWith('_at'))?.name;
+  const timestamp =
+    def.columns.find((column) => column.name === 'created_at')?.name ??
+    def.columns.find((column) => column.name.endsWith('_at'))?.name;
   return timestamp ? `${timestamp} DESC, ${def.idColumn}` : def.idColumn;
 }
 
