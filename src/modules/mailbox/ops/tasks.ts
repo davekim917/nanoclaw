@@ -132,6 +132,29 @@ export interface TaskUpdate {
   chatLimit?: number;
 }
 
+/**
+ * A host-gated script's output belongs to one fired occurrence, never its
+ * successor. Keep source content byte-for-byte when there is no result so
+ * legacy/plain envelopes are not needlessly rewritten.
+ */
+function withoutScriptOutput(content: string): string {
+  try {
+    const parsed: unknown = JSON.parse(content);
+    if (
+      parsed === null ||
+      typeof parsed !== 'object' ||
+      Array.isArray(parsed) ||
+      !Object.prototype.hasOwnProperty.call(parsed, 'scriptOutput')
+    ) {
+      return content;
+    }
+    delete (parsed as Record<string, unknown>).scriptOutput;
+    return JSON.stringify(parsed);
+  } catch {
+    return content;
+  }
+}
+
 // Merges content JSON in-place so callers can update prompt/script without
 // clobbering other fields. Matches by id OR series_id so the live next
 // occurrence of a recurring task is updated, not just the completed row the
@@ -140,6 +163,7 @@ export function updateTask(db: Database.Database, taskId: string, update: TaskUp
   migrateMessagesInTable(db);
   const setProcessAfter = update.processAfter !== undefined;
   const setRecurrence = update.recurrence !== undefined;
+  const invalidatesScriptOutput = update.script !== undefined || update.scriptHost !== undefined;
   const mergeContent =
     update.prompt !== undefined ||
     update.script !== undefined ||
@@ -177,6 +201,11 @@ export function updateTask(db: Database.Database, taskId: string, update: TaskUp
         if (update.chatLimit !== undefined) parsed.chatLimit = update.chatLimit;
         if (update.script !== undefined) parsed.script = update.script;
         if (update.scriptHost !== undefined) parsed.scriptHost = update.scriptHost;
+        // The result is evidence of one particular script executed in one
+        // particular mode. A changed script or host/container mode needs a
+        // fresh run; prompt and provider-option edits still describe this same
+        // occurrence and retain its already-computed result.
+        if (invalidatesScriptOutput) delete parsed.scriptOutput;
         if (update.threadAnchor !== undefined) parsed.threadAnchor = update.threadAnchor;
         if (update.quietStatus !== undefined) parsed.quietStatus = update.quietStatus;
         if (update.flagIntent !== undefined) {
@@ -268,7 +297,7 @@ export function insertRecurrence(
     seriesId: msg.series_id,
     processAfter: nextRun,
     recurrence: msg.recurrence,
-    content: msg.content,
+    content: withoutScriptOutput(msg.content),
     status,
     // Carry routing forward — a channel/thread-scoped series must keep
     // posting to its channel/thread across every re-arm.
