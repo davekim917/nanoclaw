@@ -110,14 +110,6 @@ const NOT_CALLERS: readonly string[] = [DEFINER, SELF];
  * independent of the functions this PR converted. `writeAudit` / `purgeIntentBody`
  * / the PR 6-owned callers in the same file are untouched — PR 5c does not add
  * or remove anything for them.
- *
- * T4 PR 4 adds TWO test files (195 → 197): `channel-card-interceptor.test.ts`
- * and `user-dm.test.ts` — both re-derived/ported from upstream. Same pattern
- * as every other permissions test file already on this list (`primitive.test.ts`,
- * `channel-approval.test.ts`): `getRawDb()` for `runMigrations(db)` fixture
- * setup and direct SQL scaffolding, not for a synchronous decision seam. No
- * production code this PR touches (`channel-approval.ts`'s interceptor seam,
- * `user-dm.ts`'s privacySafeLogs) reaches `getRawDb`/`hasTableRaw` itself.
  */
 export const RAW_DB_IMPORTERS: readonly string[] = [
   'scripts/bust-slack-profile-cache.ts',
@@ -265,7 +257,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/orchestrator-dispatch/reconciler.test.ts',
   'src/modules/permissions/channel-approval-folder-race.test.ts',
   'src/modules/permissions/channel-approval.test.ts',
-  'src/modules/permissions/channel-card-interceptor.test.ts',
   'src/modules/permissions/db/agent-group-members.ts',
   'src/modules/permissions/db/pending-channel-approvals.ts',
   'src/modules/permissions/db/user-roles.test.ts',
@@ -276,7 +267,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/permissions/sender-decline-notify.test.ts',
   'src/modules/permissions/task-slack-subject.test.ts',
   'src/modules/permissions/user-dm-adopt.test.ts',
-  'src/modules/permissions/user-dm.test.ts',
   'src/modules/provider-fallback/handler.test.ts',
   'src/modules/repository-workspaces/index.test.ts',
   'src/modules/repository-workspaces/index.ts',

@@ -19,7 +19,7 @@
 import fs from 'fs';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
-import { initTestDb, closeDb, runMigrations, getRawDb } from '../../db/index.js';
+import { closeDb, getDb, initMigratedTestDb } from '../../db/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import type { InboundEvent } from '../../channels/adapter.js';
@@ -50,14 +50,13 @@ vi.mock('../../delivery.js', () => ({
 vi.mock('./user-dm.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./user-dm.js')>()),
   ensureUserDm: vi.fn(async (userId: string) => {
-    const { getRawDb } = await import('../../db/connection.js');
-    return getRawDb()
-      .prepare(
-        `SELECT mg.* FROM messaging_groups mg
-           JOIN user_dms ud ON ud.messaging_group_id = mg.id
-          WHERE ud.user_id = ?`,
-      )
-      .get(userId);
+    const { getDb } = await import('../../db/index.js');
+    return getDb().get(
+      `SELECT mg.* FROM messaging_groups mg
+         JOIN user_dms ud ON ud.messaging_group_id = mg.id
+        WHERE ud.user_id = ?`,
+      userId,
+    );
   }),
 }));
 
@@ -75,8 +74,7 @@ function now(): string {
 beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  await initTestDb();
-  runMigrations(getRawDb());
+  await initMigratedTestDb();
 
   // Reset registrations between cases — the map is module-global, so a
   // later `it` must not depend on (or be broken by) an earlier one's
@@ -103,9 +101,13 @@ beforeEach(async () => {
     unknown_sender_policy: 'public',
     created_at: now(),
   });
-  getRawDb()
-    .prepare(`INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at) VALUES (?, ?, ?, ?)`)
-    .run('telegram:owner', 'telegram', 'mg-dm-owner', now());
+  await getDb().run(
+    `INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at) VALUES (?, ?, ?, ?)`,
+    'telegram:owner',
+    'telegram',
+    'mg-dm-owner',
+    now(),
+  );
 
   deliverMock.mockClear();
 });
@@ -148,8 +150,8 @@ function mention(mg: MessagingGroup): InboundEvent {
   };
 }
 
-function pendingCount(): number {
-  return (getRawDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }).c;
+async function pendingCount(): Promise<number> {
+  return (await getDb().get<{ c: number }>('SELECT COUNT(*) AS c FROM pending_channel_approvals'))!.c;
 }
 
 describe('channel-card interceptor seam', () => {
@@ -165,7 +167,7 @@ describe('channel-card interceptor seam', () => {
     expect(interceptor).toHaveBeenCalledTimes(1);
     expect(interceptor).toHaveBeenCalledWith(expect.objectContaining({ id: mg.id }), event);
     expect(deliverMock).not.toHaveBeenCalled();
-    expect(pendingCount()).toBe(0);
+    expect(await pendingCount()).toBe(0);
     // Fork-specific half: no pending row was retained for this event, so the
     // router must not call markReplayPending() for it.
     expect(retained).toBe(false);
@@ -181,7 +183,7 @@ describe('channel-card interceptor seam', () => {
     expect(deliverMock).toHaveBeenCalledTimes(1);
     const payload = JSON.parse(deliverMock.mock.calls[0][4] as string) as { type: string };
     expect(payload.type).toBe('ask_question');
-    expect(pendingCount()).toBe(1);
+    expect(await pendingCount()).toBe(1);
   });
 
   it('an interceptor throw falls back to the card', async () => {
@@ -192,7 +194,7 @@ describe('channel-card interceptor seam', () => {
     await requestChannelApproval({ messagingGroupId: mg.id, event: mention(mg) });
 
     expect(deliverMock).toHaveBeenCalledTimes(1);
-    expect(pendingCount()).toBe(1);
+    expect(await pendingCount()).toBe(1);
   });
 
   it('only consulted for its own channel type', async () => {

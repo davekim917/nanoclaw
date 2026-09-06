@@ -25,9 +25,8 @@ import {
   registerChannelAdapter,
   teardownChannelAdapters,
 } from '../../channels/channel-registry.js';
-import { closeDb, getRawDb, initTestDb } from '../../db/connection.js';
+import { closeDb, getDb, initMigratedTestDb } from '../../db/index.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
-import { runMigrations } from '../../db/migrations/index.js';
 import { log } from '../../log.js';
 import { createUser } from './db/users.js';
 import { upsertUserDm } from './db/user-dms.js';
@@ -69,8 +68,7 @@ async function startRegisteredAdapters(): Promise<void> {
 
 beforeEach(async () => {
   vi.clearAllMocks();
-  await initTestDb();
-  runMigrations(getRawDb());
+  await initMigratedTestDb();
 });
 
 afterEach(async () => {
@@ -124,10 +122,10 @@ describe('ensureUserDm privacy-safe logging', () => {
     });
     // Orphan the cache row (bypassing FK) to exercise the "cached row
     // references missing messaging_group" re-resolve path.
-    const db = getRawDb();
-    db.pragma('foreign_keys = OFF');
-    db.prepare("DELETE FROM messaging_groups WHERE id = 'messaging-group-private-sentinel'").run();
-    db.pragma('foreign_keys = ON');
+    const db = getDb();
+    await db.exec('PRAGMA foreign_keys = OFF');
+    await db.run("DELETE FROM messaging_groups WHERE id = 'messaging-group-private-sentinel'");
+    await db.exec('PRAGMA foreign_keys = ON');
 
     const options = { privacySafeLogs: true };
     await expect(ensureUserDm('unknown-user-private-sentinel', options)).resolves.toBeNull();
