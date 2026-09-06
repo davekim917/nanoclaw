@@ -10,8 +10,9 @@ separately.
 > 1.0.0](https://agent-plugins.org/schemas/1.0.0/) plugin directory (`plugin.json`
 > required; `skills/`, `mcp.json` and the `ai.nanoco.nanoclaw/` extension
 > optional). A folder in the pre-plugin layout described below is refused with a
-> migration error — there is no fallback parse — and this document is rewritten
-> in the docs PR of the same series. Stamping copies the plugin to
+> migration error — there is no fallback parse. The authoring reference below
+> describes the plugin layout the reader actually accepts. Stamping copies the
+> plugin to
 > `groups/<folder>/plugins/<name>` read-only and creates
 > `groups/<folder>/plugin-data/<name>` beside it; **`plugin-data/` is
 > agent-writable and storage maintenance does not sweep it.**
@@ -52,30 +53,37 @@ is never a URL and never changes at runtime.
 
 ## What's in a template
 
-The full authoring reference lives in the
-[templates repo README](https://github.com/nanocoai/nanoclaw-templates#anatomy-of-a-template).
-The short version: only `context/instructions.md` is required; everything else
-is optional and defaults sensibly:
+A template is an [Agent Plugins 1.0.0](https://agent-plugins.org/schemas/1.0.0/)
+plugin directory. Only `plugin.json` is required; everything else is optional
+and defaults sensibly. Persona, extra context and tasks live under the NanoClaw
+extension directory, `ai.nanoco.nanoclaw/`, so the portable half of the plugin
+stays readable by any Agent Plugins consumer.
 
 ```
 <template>/
-├── context/
-│   ├── instructions.md        # REQUIRED: the agent's standing persona; marks the folder as a template
-│   └── additional_context/    # optional: extra .md files, referenced from instructions.md by relative path
-│       └── *.md
-├── mcp.json              # optional: MCP servers (command + args, or url), NO secrets
-├── skills/<name>/        # optional: one folder per skill (SKILL.md + any references/), copied whole
-├── tasks/*.md             # optional: recurring tasks, created paused
-└── README.md             # recommended: per-template docs
+├── plugin.json                       # REQUIRED: the Agent Plugins manifest; marks the folder as a plugin
+├── mcp.json                          # optional: MCP servers ($schema + mcpServers), NO secrets
+├── skills/<name>/                    # optional: one folder per skill (SKILL.md + any references/), copied whole
+├── ai.nanoco.nanoclaw/               # optional: everything specific to this host
+│   ├── context/
+│   │   ├── instructions.md           # optional: the agent's standing persona
+│   │   └── **/*.md                   # optional: extra context, names relative to context/
+│   └── tasks/*.md                    # optional: recurring tasks, created paused
+└── README.md                         # recommended: per-template docs
 ```
 
-| Path                       | Loaded as                                                                                                    | Required |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------ | -------- |
-| `context/instructions.md`  | The agent's persona, prepended to its `CLAUDE.md`/`AGENTS.md` every spawn (system-prompt tier, any provider) | **Yes**  |
-| `context/**/*.md` (others) | Extra context, copied into the agent's workspace with the same layout relative to `instructions.md`          | No       |
-| `mcp.json` → `mcpServers`  | MCP tool servers (written verbatim to container config)                                                      | No       |
-| `skills/<name>/`           | A skill, auto-triggered by its `description`                                                                 | No       |
-| `tasks/*.md`               | Recurring scheduled tasks, created paused pending user activation                                            | No       |
+| Path                                         | Loaded as                                                                                                    | Required |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------ | -------- |
+| `plugin.json`                                | The Agent Plugins manifest; `extensions["ai.nanoco.nanoclaw"].agentName` optionally names the agent          | **Yes**  |
+| `mcp.json` → `mcpServers`                    | MCP tool servers, stamped into both container config stores and marked plugin-owned                          | No       |
+| `skills/<name>/`                             | A skill, auto-triggered by its `description`, copied into that group's own overlay                           | No       |
+| `ai.nanoco.nanoclaw/context/instructions.md` | The agent's persona, prepended to its `CLAUDE.md`/`AGENTS.md` every spawn (system-prompt tier, any provider) | No       |
+| `ai.nanoco.nanoclaw/context/**/*.md`         | Extra context, copied into the agent's workspace with the same layout relative to `instructions.md`          | No       |
+| `ai.nanoco.nanoclaw/tasks/*.md`              | Recurring scheduled tasks, created paused pending user activation                                            | No       |
+
+A folder without `plugin.json` — the pre-plugin layout, with `context/` and
+`tasks/` at the root — is refused with a migration error naming the missing
+manifest. See the upgrade section at the end of this document.
 
 Notes:
 
@@ -140,10 +148,10 @@ run passed while paused, the task is eligible immediately.
 
 ### Referencing extra context files
 
-Extra `.md` files under `context/` (by convention in an `additional_context/`
-subfolder) are copied into the agent's workspace preserving their position
-relative to `instructions.md` — a template file at
-`context/additional_context/pricing.md` is readable by the agent as
+Extra `.md` files under `ai.nanoco.nanoclaw/context/` (by convention in an
+`additional_context/` subfolder) are copied into the agent's workspace
+preserving their position relative to `instructions.md` — a template file at
+`ai.nanoco.nanoclaw/context/additional_context/pricing.md` is readable by the agent as
 `additional_context/pricing.md`, the same relative path you'd use from
 `instructions.md` itself. Nothing is injected automatically: the agent only
 reads an extra file if `instructions.md` points to it, so reference every file
@@ -253,7 +261,7 @@ for a worked example.
 Templates ship in the separate
 [`nanocoai/nanoclaw-templates`](https://github.com/nanocoai/nanoclaw-templates)
 repo, not this one. To add one: fork that repo, drop a folder at
-`<category>/<template>/` with at least `context/instructions.md`, test it end to
+`<category>/<template>/` with at least a `plugin.json`, test it end to
 end (copy it under `templates/` and run
 `ncl groups create --template <category>/<template> --name Test`), confirm
 any predefined tasks appear under `ncl tasks list --status paused`, confirm no

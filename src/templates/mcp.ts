@@ -112,6 +112,15 @@ export function readPluginMcp(pluginDir: string): { servers: Record<string, Pars
     report.push('mcp.json: not a JSON object; MCP component skipped');
     return { servers: {}, report };
   }
+
+  // FATAL lint before ANY component-level skip below. A skipped component
+  // still ships: `createAgentFromTemplate` copies the whole plugin directory
+  // into the agent-readable `groups/<folder>/plugins/<name>` tree, so a
+  // credential sitting in a well-formed entry under a wrong `$schema` or an
+  // unknown top-level key would have reached the agent unlinted (Codex on
+  // #500). The severity belongs to the credential, whatever else is malformed.
+  lintServerCredentials(raw.mcpServers, report);
+
   if (raw.$schema !== MCP_SCHEMA_URL) {
     report.push(`mcp.json: $schema must be "${MCP_SCHEMA_URL}"; MCP component skipped`);
     return { servers: {}, report };
@@ -130,7 +139,7 @@ export function readPluginMcp(pluginDir: string): { servers: Record<string, Pars
   for (const [name, entry] of Object.entries(raw.mcpServers)) {
     // eslint-disable-next-line no-catch-all/no-catch-all -- rethrown; the catch only annotates which server was fatal
     try {
-      const server = readServerEntry(name, entry, report);
+      const server = readServerEntry(name, entry);
       if (typeof server === 'string') report.push(`mcp.json: server "${name}" skipped: ${server}`);
       else servers[name] = server;
     } catch (err) {
@@ -142,22 +151,29 @@ export function readPluginMcp(pluginDir: string): { servers: Record<string, Pars
 }
 
 /**
- * Validate one server entry. Returns the parsed config, or a skip reason.
- * Throws only for smuggled secrets (whole-plugin rejection).
+ * Lint every entry's raw `env`/`headers` for smuggled credentials, whatever
+ * else is wrong with the file. Throws (whole-plugin rejection) on a real
+ * credential; ordinary shape problems are left to the callers below.
  */
-function readServerEntry(name: string, entry: unknown, report: string[]): ParsedMcpServerConfig | string {
+function lintServerCredentials(mcpServers: unknown, report: string[]): void {
+  if (!isPlainObject(mcpServers)) return;
+  for (const [name, entry] of Object.entries(mcpServers)) {
+    if (!isPlainObject(entry)) continue;
+    lintSecrets(name, 'env', stringValues(entry.env), report);
+    lintSecrets(name, 'header', stringValues(entry.headers), report);
+  }
+}
+
+/**
+ * Validate one server entry. Returns the parsed config, or a skip reason.
+ * Never throws: `lintServerCredentials` has already rejected the whole plugin
+ * for a smuggled secret before any entry reaches here (#500 rounds 2-3).
+ */
+function readServerEntry(name: string, entry: unknown): ParsedMcpServerConfig | string {
   // Shared intake gate: names reach provider config writers with structural
   // syntax (codex TOML table headers), so the charset allowlist applies here
   // exactly as in the approval and ncl paths.
   if (!isPlainObject(entry)) return 'not an object';
-
-  // FATAL lint FIRST, before any per-server skip below can return: a skipped
-  // server is still copied verbatim into the agent-readable plugin tree, so an
-  // entry carrying a real credential AND an unknown field, a bad name, or a
-  // bad transport would have been accepted with the secret intact (Codex on
-  // #500). Severity belongs to the credential, not to the other defect.
-  lintSecrets(name, 'env', stringValues(entry.env), report);
-  lintSecrets(name, 'header', stringValues(entry.headers), report);
 
   // eslint-disable-next-line no-catch-all/no-catch-all -- a bad server name is expected input, reported as a skip
   try {

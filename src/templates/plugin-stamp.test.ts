@@ -286,6 +286,51 @@ describe('T5 PR 3 — the plugin reader and the stamp path', () => {
     expect(mount!.readonly).toBe(true);
     expect(mount!.hostPath).toBe(path.join(GROUPS_DIR, group.folder, 'plugins'));
   });
+
+  it('a stamped server is refused by every mutation guard (marker → guard contract, #500)', () => {
+    // The three guard sites all read container.json, so this is the entry the
+    // guard actually sees after a stamp.
+    const stamped = withPluginOwner(
+      markPluginServers({ hubspot: { command: 'npx', args: [], env: {} } }, 'sdr'),
+      'sdr',
+    ).hubspot;
+    expect(() => assertMcpServerNotPluginOwned(stamped, 'hubspot', 'sdr-group')).toThrow(/managed by plugin "sdr"/);
+    // An operator-added server carries no marker and stays editable.
+    expect(() =>
+      assertMcpServerNotPluginOwned({ command: 'npx', args: [], env: {} }, 'mine', 'sdr-group'),
+    ).not.toThrow();
+  });
+
+  it('a smuggled credential is fatal even when the server is otherwise skippable (#500 round 2)', () => {
+    // A skipped server is still copied verbatim into the agent-readable
+    // plugins/ tree, so the credential decides the outcome — not the other
+    // defect that used to return before the lint ran.
+    const secret = { API_KEY: 'sk-live-AbC123RealLookingKey456' };
+    for (const servers of [
+      { 'bad name!': { type: 'stdio', command: 'server', env: secret } },
+      { ok: { type: 'stdio', command: 'server', nope: 1, env: secret } },
+      { ok: { type: 'ftp', command: 'server', env: secret } },
+    ]) {
+      writeManifest();
+      writeMcp(servers as Parameters<typeof writeMcp>[0]);
+      expect(() => parseTemplate(PLUGIN_DIR)).toThrow(/looks like a real credential/);
+    }
+  });
+
+  it('a smuggled credential is fatal even when the whole MCP component is skippable (#500 round 3)', () => {
+    // The component-level skips ($schema, unknown top-level key) return before
+    // any entry is read, but the plugin directory still ships to the agent.
+    const secret = { API_KEY: 'sk-live-AbC123RealLookingKey456' };
+    const entry = { crm: { type: 'stdio', command: 'server', env: secret } };
+    for (const doc of [
+      { $schema: 'https://example.com/wrong', mcpServers: entry },
+      { $schema: MCP_SCHEMA_URL, mcpServers: entry, extra: true },
+    ]) {
+      writeManifest();
+      fs.writeFileSync(path.join(PLUGIN_DIR, 'mcp.json'), JSON.stringify(doc));
+      expect(() => parseTemplate(PLUGIN_DIR)).toThrow(/looks like a real credential/);
+    }
+  });
 });
 
 /**
@@ -329,37 +374,5 @@ describe('the templates module never copies plugin content with fs.cpSync', () =
     expect(CALL_SITE_RE.test(stripComments(planted))).toBe(true);
     const commentOnly = '/** never through raw fs.cpSync */\nexport const x = 1;\n';
     expect(CALL_SITE_RE.test(stripComments(commentOnly))).toBe(false);
-  });
-});
-
-describe('the plugin ownership marker and the stamp-time secret lint', () => {
-  it('a stamped server is refused by every mutation guard (marker → guard contract, #500)', () => {
-    // The three guard sites all read container.json, so this is the entry the
-    // guard actually sees after a stamp.
-    const stamped = withPluginOwner(
-      markPluginServers({ hubspot: { command: 'npx', args: [], env: {} } }, 'sdr'),
-      'sdr',
-    ).hubspot;
-    expect(() => assertMcpServerNotPluginOwned(stamped, 'hubspot', 'sdr-group')).toThrow(/managed by plugin "sdr"/);
-    // An operator-added server carries no marker and stays editable.
-    expect(() =>
-      assertMcpServerNotPluginOwned({ command: 'npx', args: [], env: {} }, 'mine', 'sdr-group'),
-    ).not.toThrow();
-  });
-
-  it('a smuggled credential is fatal even when the server is otherwise skippable (#500 round 2)', () => {
-    // A skipped server is still copied verbatim into the agent-readable
-    // plugins/ tree, so the credential decides the outcome — not the other
-    // defect that used to return before the lint ran.
-    const secret = { API_KEY: 'sk-live-AbC123RealLookingKey456' };
-    for (const servers of [
-      { 'bad name!': { type: 'stdio', command: 'server', env: secret } },
-      { ok: { type: 'stdio', command: 'server', nope: 1, env: secret } },
-      { ok: { type: 'ftp', command: 'server', env: secret } },
-    ]) {
-      writeManifest();
-      writeMcp(servers as Parameters<typeof writeMcp>[0]);
-      expect(() => parseTemplate(PLUGIN_DIR)).toThrow(/looks like a real credential/);
-    }
   });
 });
