@@ -35,7 +35,7 @@ import {
   type ScheduledTaskRow,
   type SessionReadLocation,
 } from '../../modules/mailbox/index.js';
-import { wakeContainer } from '../../container-runner.js';
+import { requestWake } from '../../request-wake.js';
 import { admitDueTaskContextsFor, resolveRecallCentral, withExistingMailboxSession } from '../../session-manager.js';
 import { log } from '../../log.js';
 import { parseUtcTimestampMs } from '../../thread-context.js';
@@ -659,7 +659,9 @@ export const runNowHandler: AuthHandler = async (req, params, ctx) => {
 
   const session = await getSession(t.sessionId);
   if (session) {
-    void wakeContainer(session).catch((err) => log.warn('scheduled-mutations: run-now wake failed', { err }));
+    void requestWake(session, 'due-message').catch((err) =>
+      log.warn('scheduled-mutations: run-now wake failed', { err }),
+    );
   }
 
   writeAudit(getRawDb(), {

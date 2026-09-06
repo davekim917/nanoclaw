@@ -13,8 +13,9 @@ import {
   updateContainerConfig,
 } from '../../container-config.js';
 import { resolveContainerResources, type ContainerResources } from '../../container-resources.js';
-import { buildAgentGroupImage, killContainer, wakeContainer } from '../../container-runner.js';
+import { buildAgentGroupImage, killContainer } from '../../container-runner.js';
 import { restartAgentGroupContainers } from '../../container-restart.js';
+import { requestWake } from '../../request-wake.js';
 import { createAgentGroup, getAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
 import { getDb, getRawDb, hasTable } from '../../db/connection.js';
 import { insertOrAdopt } from '../../db/insert-or-adopt.js';
@@ -413,7 +414,7 @@ registerResource({
               ? async () => {
                   const s = await getSession(ctx.sessionId);
                   if (s) {
-                    void wakeContainer(s).catch((err) =>
+                    void requestWake(s, 'cli').catch((err) =>
                       log.error('Failed to wake container after ncl restart', { err, sessionId: ctx.sessionId }),
                     );
                   }

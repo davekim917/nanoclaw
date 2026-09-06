@@ -3,7 +3,7 @@ import { randomUUID } from 'crypto';
 import { getSession } from '../../db/sessions.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
-import { wakeContainer } from '../../container-runner.js';
+import { requestWake } from '../../request-wake.js';
 import type { Session } from '../../types.js';
 import { authChildTaskAction, transitionToTerminal } from './db/tasks.js';
 
@@ -52,7 +52,7 @@ export async function applySpawnComplete(content: Record<string, unknown>, calle
         _task_update: { task_id: taskId, status: 'completed', result_summary: summary },
       }),
     });
-    void wakeContainer(parentSession).catch((err) =>
+    void requestWake(parentSession, 'inbound-message').catch((err) =>
       log.warn('applySpawnComplete: wakeContainer(parent) failed', { taskId, err }),
     );
   } catch (err) {
@@ -110,7 +110,7 @@ export async function applySpawnFailed(content: Record<string, unknown>, callerS
         },
       }),
     });
-    void wakeContainer(parentSession).catch((err) =>
+    void requestWake(parentSession, 'inbound-message').catch((err) =>
       log.warn('applySpawnFailed: wakeContainer(parent) failed', { taskId, err }),
     );
   } catch (err) {

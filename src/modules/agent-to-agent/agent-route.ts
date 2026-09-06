@@ -30,7 +30,8 @@ import { getAgentGroup } from '../../db/agent-groups.js';
 import { getRawDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getSession, markSessionEngaged } from '../../db/sessions.js';
-import { sessionStillActive, wakeContainer } from '../../container-runner.js';
+import { sessionStillActive } from '../../container-runner.js';
+import { requestWake } from '../../request-wake.js';
 import { GuardDenyError, guard } from '../../guard/index.js';
 import { log } from '../../log.js';
 import { upsertArchiveMessage } from '../../message-archive.js';
@@ -703,7 +704,10 @@ async function performAgentRoute(
   // `status`, and `archiveSessionById` stamps `archived_at` while leaving
   // `status` alone — so an archived target still read `active` here. One
   // definition of "still live" cannot drift from itself.
-  await wakeContainer(targetSession, 'interactive', { guard: sessionStillActive(targetSession.id) });
+  await requestWake(targetSession, 'inbound-message', {
+    priority: 'interactive',
+    guard: sessionStillActive(targetSession.id),
+  });
 }
 
 /**

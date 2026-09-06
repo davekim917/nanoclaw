@@ -16,7 +16,7 @@ import { getMessagingGroup } from '../db/messaging-groups.js';
 import { log } from '../log.js';
 import { writeSessionMessage } from '../session-manager.js';
 import { readSessionInbound } from '../modules/mailbox/index.js';
-import { wakeContainer } from '../container-runner.js';
+import { requestWake } from '../request-wake.js';
 import { getChannelAdapter } from '../channels/channel-registry.js';
 import { isOwner, isGlobalAdmin, isAdminOfAgentGroup } from '../modules/permissions/db/user-roles.js';
 import { isMember } from '../modules/permissions/db/agent-group-members.js';
@@ -270,7 +270,7 @@ async function _writeAndEchoSteer(
 
   const childSession = await getSession(exec.childSessionId);
   if (childSession) {
-    void wakeContainer(childSession).catch((err) =>
+    void requestWake(childSession, 'inbound-message').catch((err) =>
       log.warn('steer: wakeContainer failed', { target: exec.target, err }),
     );
   }

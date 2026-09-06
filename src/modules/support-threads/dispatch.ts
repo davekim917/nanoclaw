@@ -39,7 +39,7 @@ import { randomUUID } from 'node:crypto';
 
 import { getChannelAdapter } from '../../channels/channel-registry.js';
 import { readContainerConfig } from '../../container-config.js';
-import { wakeContainer } from '../../container-runner.js';
+import { requestWake } from '../../request-wake.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getMessagingGroup, getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
 import { getSession } from '../../db/sessions.js';
@@ -323,7 +323,7 @@ async function dispatchSupportIssue(
         sessionId: target.id,
       });
     }
-    void wakeContainer(target).catch((err) =>
+    void requestWake(target, 'inbound-message').catch((err) =>
       log.warn('dispatch_support_issue: wake (follow-up) failed', { gmailThreadId, err }),
     );
     log.info('dispatch_support_issue: routed follow-up into existing thread', {
@@ -388,7 +388,7 @@ async function dispatchSupportIssue(
     now,
   );
 
-  void wakeContainer(issueSession).catch((err) =>
+  void requestWake(issueSession, 'inbound-message').catch((err) =>
     log.warn('dispatch_support_issue: wake (new) failed', { gmailThreadId, err }),
   );
   log.info('dispatch_support_issue: opened support thread', {

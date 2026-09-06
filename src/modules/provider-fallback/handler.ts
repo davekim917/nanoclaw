@@ -11,7 +11,8 @@ import { readContainerConfig } from '../../container-config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { isProviderUnavailable, markProviderUnavailable, parseProviderResetAt } from '../../db/provider-health.js';
 import { getSession } from '../../db/sessions.js';
-import { killContainer, wakeContainer } from '../../container-runner.js';
+import { killContainer } from '../../container-runner.js';
+import { requestWake } from '../../request-wake.js';
 import { log } from '../../log.js';
 import { resolveSpawnProvider } from '../../provider-fallback.js';
 import type { Session } from '../../types.js';
@@ -88,7 +89,7 @@ export async function handleProviderUnavailable(content: Record<string, unknown>
     'provider quota exhausted — respawning on fallback',
     async () => {
       const fresh = await getSession(session.id);
-      if (fresh) void wakeContainer(fresh);
+      if (fresh) void requestWake(fresh, 'container-restart');
     },
     // A real respawn, so a host that dies between the kill and the wake still
     // owes it. The boot respawn re-resolves the provider, so the session comes

@@ -38,9 +38,9 @@ import {
   isContainerRunning,
   isContainerSpawning,
   sessionStillActive,
-  wakeContainer,
   containerOwnsOutbound,
 } from '../../container-runner.js';
+import { requestWake } from '../../request-wake.js';
 import { syncDoneProposalMirror } from '../../dashboard/thread-close.js';
 import { log } from '../../log.js';
 import { withExistingMailboxSession } from '../../session-manager.js';
@@ -678,7 +678,8 @@ export function registerContinuationSweepDuties(): void {
         // Nothing about the wake itself changes: same guard, same priority,
         // same admission, same `wakeContainer`. Only who waits.
         const wakeStartedAtMs = Date.now();
-        const wakeInFlight = wakeContainer(session, plan.wakePriority, {
+        const wakeInFlight = requestWake(session, 'due-message', {
+          priority: plan.wakePriority,
           guard: sessionStillActive(session.id),
         });
         // Time the loop actually spent inside the call — after the detach this

@@ -30,7 +30,7 @@ import {
   updatePendingApprovalMessageId,
 } from '../../db/sessions.js';
 import { getDeliveryAdapter } from '../../delivery.js';
-import { wakeContainer } from '../../container-runner.js';
+import { requestWake } from '../../request-wake.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { MessagingGroup, PendingApproval, Session } from '../../types.js';
@@ -230,7 +230,9 @@ export async function notifyAgent(session: Session, text: string): Promise<void>
   });
   const fresh = await getSession(session.id);
   if (fresh) {
-    wakeContainer(fresh).catch((err) => log.error('Failed to wake container after notification', { err }));
+    requestWake(fresh, 'inbound-message').catch((err) =>
+      log.error('Failed to wake container after notification', { err }),
+    );
   }
 }
 

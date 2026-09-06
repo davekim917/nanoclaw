@@ -54,7 +54,8 @@ import { withExistingNanoclawOutbound } from './modules/mailbox/index.js';
 import { archiveMessage } from './message-archive.js';
 import { parseMessageFlags, formatFlagConfirmation, type FlagIntent } from './flag-parser.js';
 import { maybeRenameNewThread } from './topic-title.js';
-import { sessionStillActive, wakeContainer } from './container-runner.js';
+import { sessionStillActive } from './container-runner.js';
+import { requestWake } from './request-wake.js';
 import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
 import type { AgentGroup, ChannelType, MessagingGroup, MessagingGroupAgent } from './types.js';
 import { isChannelVariant } from './types.js';
@@ -1549,7 +1550,10 @@ async function deliverToAgent(
       // The liveness proof is the wake's, not ours: a `getSession` here proved
       // the row live before the call, and the call then awaits admission, the
       // memory queue and the spawn preparation.
-      const woke = await wakeContainer(session, 'interactive', { guard: sessionStillActive(session.id) });
+      const woke = await requestWake(session, 'inbound-message', {
+        priority: 'interactive',
+        guard: sessionStillActive(session.id),
+      });
       // wakeContainer never throws — it returns false on transient spawn
       // failure (host-sweep retries). Stop the typing indicator we just
       // started so it doesn't leak; the inbound row stays pending.

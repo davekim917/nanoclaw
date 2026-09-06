@@ -26,7 +26,8 @@
  * normalizeMcpHeaders already approved, and claims nothing about whether the
  * placeholder's underlying secret is actually assigned to this group.
  */
-import { buildAgentGroupImage, killContainer, wakeContainer } from '../../container-runner.js';
+import { buildAgentGroupImage, killContainer } from '../../container-runner.js';
+import { requestWake } from '../../request-wake.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import {
   getContainerConfig,
@@ -104,7 +105,7 @@ export async function applyInstallPackages(payload: Record<string, unknown>, ses
       async () => {
         const s = await getSession(session.id);
         if (s) {
-          void wakeContainer(s).catch((err) =>
+          void requestWake(s, 'self-mod-apply').catch((err) =>
             log.error('Failed to wake container after install_packages rebuild', { err, sessionId: session.id }),
           );
         }
@@ -225,7 +226,7 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
     async () => {
       const s = await getSession(session.id);
       if (s) {
-        void wakeContainer(s).catch((err) =>
+        void requestWake(s, 'self-mod-apply').catch((err) =>
           log.error('Failed to wake container after add_mcp_server', { err, sessionId: session.id }),
         );
       }
@@ -326,7 +327,7 @@ export async function performModelChange(
     async () => {
       const s = await getSession(session.id);
       if (s) {
-        void wakeContainer(s).catch((err) =>
+        void requestWake(s, 'self-mod-apply').catch((err) =>
           log.error('Failed to wake container after model change', { err, sessionId: session.id }),
         );
       }
