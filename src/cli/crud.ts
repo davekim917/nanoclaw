@@ -100,6 +100,11 @@ export interface ResourceDef {
    * safe to re-apply).
    */
   naturalKey?: string[];
+  /**
+   * Portable ORDER BY expression for `list`. Defaults to the first timestamp
+   * (`_at`) column descending, then the resource id for deterministic ties.
+   */
+  listOrder?: string;
   /** Non-standard verbs (grant, revoke, add, remove, restart, etc.). */
   customOperations?: Record<string, CustomOperation>;
   /**
@@ -194,6 +199,15 @@ function coerceListFilter(column: ColumnDef, value: unknown): unknown {
   }
 }
 
+// Portable `ORDER BY` for `list`: the resource's own declaration wins, else
+// the first `_at` (timestamp) column descending with the id as a tiebreak so
+// ties resolve deterministically instead of falling through to storage order.
+function listOrder(def: ResourceDef): string {
+  if (def.listOrder) return def.listOrder;
+  const timestamp = def.columns.find((column) => column.name.endsWith('_at'))?.name;
+  return timestamp ? `${timestamp} DESC, ${def.idColumn}` : def.idColumn;
+}
+
 function genericList(def: ResourceDef) {
   const cols = visibleColumns(def).join(', ');
   const filterableColumns = new Map(def.columns.filter((c) => !c.generated).map((c) => [c.name, c]));
@@ -214,7 +228,7 @@ function genericList(def: ResourceDef) {
     // Newest first: without an ORDER BY the LIMIT silently hides the most
     // recently inserted rows once a table outgrows it (bit `sessions list`
     // past 200 sessions — a just-created session was invisible).
-    return getDb().all(`SELECT ${cols} FROM ${def.table}${where} ORDER BY rowid DESC LIMIT ?`, ...params);
+    return getDb().all(`SELECT ${cols} FROM ${def.table}${where} ORDER BY ${listOrder(def)} LIMIT ?`, ...params);
   };
 }
 
