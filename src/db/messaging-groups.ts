@@ -363,14 +363,21 @@ export async function assertSameWorkgroupWiring(messagingGroupId: string, agentG
 export async function createMessagingGroupAgent(mga: MessagingGroupAgent): Promise<void> {
   // One central transaction (BEGIN IMMEDIATE under the driver) so guard +
   // insert are atomic against a concurrent wiring from another process (codex
-  // phase-A review P2). DB-only closure (plan §4.4); the companion
-  // destination row is written after commit, exactly as before.
+  // phase-A review P2). DB-only closure (plan §4.4).
+  //
+  // The companion destination is allocated INSIDE the same transaction
+  // (#460 round 2): its lookup, suffix allocation and insert are serialized
+  // with the wiring row. Written after commit, two concurrent wirings with
+  // the same normalized name both observed the base `local_name` unused, and
+  // the second insert died on the (agent_group_id, local_name) primary key
+  // after its wiring row had already committed. `ensureAgentDestinationForWiring`
+  // is DB-only (driver statements in sequence), which is what lets it sit in
+  // the closure — the same shape `cli/resources/wirings.ts` already uses.
   await centralTransaction(async () => {
     await assertSameWorkgroupWiring(mga.messaging_group_id, mga.agent_group_id);
     await insertMessagingGroupAgentRow(mga);
+    await ensureAgentDestinationForWiring(mga);
   }, 'createMessagingGroupAgent');
-
-  await ensureAgentDestinationForWiring(mga);
 }
 
 async function insertMessagingGroupAgentRow(mga: MessagingGroupAgent): Promise<void> {
@@ -416,8 +423,8 @@ async function insertMessagingGroupAgentRow(mga: MessagingGroupAgent): Promise<v
  * module's `writeDestinations(mga.agent_group_id, <sessionId>)` afterwards.
  */
 /*
- * Called from inside `cli/resources/wirings.ts`'s central transaction closure
- * (and after commit from `createMessagingGroupAgent` above), so it is
+ * Called from inside the central transaction closures of
+ * `cli/resources/wirings.ts` and `createMessagingGroupAgent` above, so it is
  * DB-only: driver statements, awaited in sequence, nothing else (plan §4.4).
  */
 export async function ensureAgentDestinationForWiring(mga: MessagingGroupAgent): Promise<void> {

@@ -1,4 +1,43 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
+// #460 round 2: lets two concurrent wirings both reach the companion
+// destination's name lookup before either inserts. Each armed lookup waits for
+// its peer up to `peerWaitMs`; a caller that holds the central lease alone
+// (the fixed code) times out and proceeds, so the test never deadlocks.
+const nameLookupBarrier = vi.hoisted(() => ({
+  armed: false,
+  peerWaitMs: 50,
+  waiting: [] as Array<() => void>,
+}));
+
+vi.mock('../modules/agent-to-agent/db/agent-destinations.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../modules/agent-to-agent/db/agent-destinations.js')>();
+  return {
+    ...actual,
+    getDestinationByName: async (agentGroupId: string, localName: string) => {
+      if (nameLookupBarrier.armed) {
+        await new Promise<void>((resolve) => {
+          const peer = nameLookupBarrier.waiting.shift();
+          if (peer) {
+            peer();
+            resolve();
+            return;
+          }
+          const timer = setTimeout(() => {
+            nameLookupBarrier.waiting = nameLookupBarrier.waiting.filter((w) => w !== release);
+            resolve();
+          }, nameLookupBarrier.peerWaitMs);
+          const release = (): void => {
+            clearTimeout(timer);
+            resolve();
+          };
+          nameLookupBarrier.waiting.push(release);
+        });
+      }
+      return actual.getDestinationByName(agentGroupId, localName);
+    },
+  };
+});
 
 import { getRawDb } from './connection.js';
 import {
@@ -307,6 +346,40 @@ describe('messaging group agents', () => {
       created_at: now(),
     });
     await createMessagingGroupAgent({ ...mga(), id: 'mga-2', messaging_group_id: 'mg-2' });
+
+    const dests = (await getDestinations('ag-1')).map((d) => d.local_name).sort();
+    expect(dests).toEqual(['gen', 'gen-2']);
+  });
+
+  /**
+   * #460 round 2: the companion destination's lookup + suffix allocation +
+   * insert must be serialized WITH the wiring row. Run after commit, two
+   * concurrent wirings with the same normalized name both observe the base
+   * `local_name` unused and the second insert dies on the
+   * (agent_group_id, local_name) primary key after its wiring row committed.
+   * Reverting the move into `createMessagingGroupAgent`'s transaction fails
+   * this test with that constraint error.
+   */
+  it('allocates distinct local_names for two concurrent wirings with the same name', async () => {
+    const { getDestinations } = await import('../modules/agent-to-agent/db/agent-destinations.js');
+    await createMessagingGroup({
+      id: 'mg-2',
+      channel_type: 'discord',
+      platform_id: 'chan-2',
+      name: 'Gen',
+      is_group: 1,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+    nameLookupBarrier.armed = true;
+    try {
+      await Promise.all([
+        createMessagingGroupAgent(mga()),
+        createMessagingGroupAgent({ ...mga(), id: 'mga-2', messaging_group_id: 'mg-2' }),
+      ]);
+    } finally {
+      nameLookupBarrier.armed = false;
+    }
 
     const dests = (await getDestinations('ag-1')).map((d) => d.local_name).sort();
     expect(dests).toEqual(['gen', 'gen-2']);
