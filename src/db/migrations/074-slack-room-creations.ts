@@ -36,15 +36,27 @@ export const migration074: Migration = {
         room_key       TEXT NOT NULL,
         room_name      TEXT NOT NULL,
         agent_group_id TEXT NOT NULL REFERENCES agent_groups(id) ON DELETE CASCADE,
+        -- The workspace the channel was created in. Slack channel ids are
+        -- workspace-scoped, and one agent group can hold bots in several
+        -- workspaces, so a marker that omitted this would answer a request
+        -- originating in workspace B with workspace A's channel id.
+        team_id        TEXT NOT NULL,
+        -- The roster the creating request resolved. A marker proves the
+        -- channel is this caller's unfinished creation; it does NOT prove the
+        -- channel is right for a LATER request under the same name. Without
+        -- this, a second request naming different agents would adopt a channel
+        -- already holding the first request's participants and their messages
+        -- — the same disclosure the marker exists to prevent, one step later.
+        roster         TEXT NOT NULL,
         request_id     TEXT,
         created_at     TEXT NOT NULL
       );
 
-      -- The lookup the adopt branch makes: "did THIS caller leave a channel
-      -- half-built under THIS name?". room_key is the normalized name, so the
-      -- lookup matches however the caller spelled it.
+      -- The lookup the adopt branch makes: "did THIS caller, in THIS
+      -- workspace, leave a channel half-built under THIS name?". room_key is
+      -- the normalized name, so the lookup matches however it was spelled.
       CREATE UNIQUE INDEX IF NOT EXISTS idx_slack_room_creations_caller_key
-        ON slack_room_creations(agent_group_id, room_key);
+        ON slack_room_creations(agent_group_id, team_id, room_key);
     `);
   },
 };

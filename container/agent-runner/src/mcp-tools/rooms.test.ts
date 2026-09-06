@@ -13,6 +13,8 @@
  * Assert against the real in-memory session DB instead.
  */
 import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
+import fs from 'fs';
+import path from 'path';
 
 import { getOutboundDb } from '../mailbox/sqlite/connection.js';
 import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
@@ -144,5 +146,20 @@ describe('registration', () => {
     expect(createRoom.tool.description).toMatch(/never reuses an existing channel/i);
     expect(addToRoom.tool.description).toMatch(/another workgroup/);
     expect(addToRoom.tool.description).toMatch(/admin approval/);
+  });
+
+  it('the mounted room skill states the same disclosure the tools and the card do', () => {
+    // The skill is what an agent actually reads before proposing an add, so
+    // wording that understated the disclosure there would undo the fix in the
+    // tool description. Same shape as the onecli-gateway assertions in
+    // instruction-fragment-migration.test.ts.
+    const skill = fs.readFileSync(
+      path.join(process.cwd(), '..', '..', 'container', 'skills', 'slack-a2a-rooms', 'SKILL.md'),
+      'utf-8',
+    );
+    // \s+ not a literal space: the file is hard-wrapped, so any of these
+    // phrases can straddle a line break.
+    expect(skill).toMatch(/whole conversation to\s+date/i);
+    expect(skill).toMatch(/never reuses an existing\s+channel/i);
   });
 });

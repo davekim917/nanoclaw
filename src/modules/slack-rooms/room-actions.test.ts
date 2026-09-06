@@ -54,9 +54,15 @@ vi.mock('../approvals/index.js', () => ({
   requestApproval: (...args: Parameters<typeof requestApprovalMock>) => requestApprovalMock(...args),
   registerApprovalHandler: vi.fn(),
 }));
+const pickApproverMock = vi.fn(async () => ['slack-alpha:UOWNER']);
 vi.mock('../approvals/primitive.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../approvals/primitive.js')>()),
-  pickApprover: vi.fn(async () => ['slack-alpha:UOWNER']),
+  pickApprover: (...args: unknown[]) => pickApproverMock(...(args as [])),
+}));
+
+const writeDestinationsMock = vi.fn(async (_agentGroupId: string, _sessionId: string) => {});
+vi.mock('../agent-to-agent/write-destinations.js', () => ({
+  writeDestinations: (...args: Parameters<typeof writeDestinationsMock>) => writeDestinationsMock(...args),
 }));
 
 const { getDeliveryAction } = await import('../../delivery.js');
@@ -225,6 +231,9 @@ beforeEach(async () => {
   inviteUsersMock.mockReset();
   setPurposeMock.mockReset();
   setPurposeMock.mockImplementation(defaultSetPurpose);
+  writeDestinationsMock.mockClear();
+  pickApproverMock.mockReset();
+  pickApproverMock.mockImplementation(async () => ['slack-alpha:UOWNER']);
   notifyAgentMock.mockClear();
   requestApprovalMock.mockClear();
 });
@@ -309,8 +318,10 @@ describe('create_room', () => {
     // A run that got as far as conversations.create and then died: the marker
     // is the only record that the channel is ours and unfinished.
     await getDb().run(
-      `INSERT INTO slack_room_creations (platform_id, room_key, room_name, agent_group_id, request_id, created_at)
-         VALUES ('slack:CHALF', 'ops-room', 'ops-room', 'ag-caller', NULL, ?)`,
+      `INSERT INTO slack_room_creations
+           (platform_id, room_key, room_name, agent_group_id, team_id, roster, request_id, created_at)
+         VALUES ('slack:CHALF', 'ops-room', 'ops-room', 'ag-caller', 'T1', ?, NULL, ?)`,
+      JSON.stringify(['ag-caller|slack-alpha|UALPHA|T1', 'ag-mate|slack-beta|UBETA|T1'].sort()),
       now(),
     );
 
@@ -462,6 +473,101 @@ describe('create_room', () => {
 
     expect(createConversationMock).toHaveBeenCalledWith('slack-alpha', { name: 'Ops Room', isPrivate: true });
     expect(inviteUsersMock).toHaveBeenCalledWith('slack-alpha', 'CROOM1', ['UBETA', 'UOWNER']);
+  });
+
+  it('refuses to resume a half-built room under the same name but a different roster', async () => {
+    await getDb().run(
+      `INSERT INTO container_configs (agent_group_id, cli_scope, updated_at) VALUES (?, 'global', ?)`,
+      'ag-caller',
+      now(),
+    );
+    await makeAgent({
+      id: 'ag-third',
+      folder: 'third',
+      workgroup: 'home',
+      channelType: 'slack-gamma',
+      identity: GAMMA,
+    });
+    await destination('ag-caller', 'third', 'ag-third');
+    // The half-built channel holds the FIRST request's participants, so a
+    // second request naming someone else must not be poured into it.
+    await getDb().run(
+      `INSERT INTO slack_room_creations
+           (platform_id, room_key, room_name, agent_group_id, team_id, roster, request_id, created_at)
+         VALUES ('slack:CHALF', 'ops-room', 'ops-room', 'ag-caller', 'T1', ?, NULL, ?)`,
+      JSON.stringify(['ag-caller|slack-alpha|UALPHA|T1', 'ag-mate|slack-beta|UBETA|T1'].sort()),
+      now(),
+    );
+
+    await getDeliveryAction('create_room')!(
+      { action: 'create_room', name: 'ops-room', agents: ['third'] },
+      callerSession,
+    );
+
+    expect(inviteUsersMock).not.toHaveBeenCalled();
+    expect(createConversationMock).not.toHaveBeenCalled();
+    expect(lastNotice()).toMatch(/different set of agents/);
+  });
+
+  it('applies the purpose when it resumes, because the first attempt never reached it', async () => {
+    await getDb().run(
+      `INSERT INTO container_configs (agent_group_id, cli_scope, updated_at) VALUES (?, 'global', ?)`,
+      'ag-caller',
+      now(),
+    );
+    inviteUsersMock.mockImplementationOnce(async () => {
+      throw new Error('slack conversations.invite failed: ratelimited');
+    });
+    const request = { action: 'create_room', name: 'Ops Room', agents: ['mate'], purpose: 'ship the release' };
+
+    await getDeliveryAction('create_room')!({ ...request }, callerSession);
+    expect(setPurposeMock).not.toHaveBeenCalled();
+
+    await getDeliveryAction('create_room')!({ ...request }, callerSession);
+    expect(setPurposeMock).toHaveBeenCalledWith('slack-alpha', 'CROOM1', 'ship the release');
+  });
+
+  it('binds the invited human to the approval, so a role granted while the card waits cannot change it', async () => {
+    await getDeliveryAction('create_room')!(
+      { action: 'create_room', name: 'Ops Room', agents: ['mate'] },
+      callerSession,
+    );
+    const held = requestApprovalMock.mock.calls[0]![0] as { payload: Record<string, unknown>; question: string };
+    expect(held.payload.operator_slack_user_id).toBe('UOWNER');
+    // The approver is told which human is being let in, by id.
+    expect(held.question).toContain('UOWNER');
+
+    // A different human becomes the first Slack-capable approver while the
+    // card sits unanswered.
+    pickApproverMock.mockImplementation(async () => ['slack-alpha:UNEWADMIN']);
+    const grant = await persistGrant(grantFrom('create_room'));
+    const { reenterGuardedDeliveryAction } = await import('../../delivery.js');
+    await reenterGuardedDeliveryAction('create_room')({
+      session: callerSession,
+      payload: JSON.parse(grant.payload) as Record<string, unknown>,
+      approval: grant,
+    });
+
+    expect(createConversationMock).not.toHaveBeenCalled();
+    expect(inviteUsersMock).not.toHaveBeenCalled();
+    expect(lastNotice()).toMatch(/participants changed since that approval/);
+  });
+
+  it('projects the new room into the caller’s running session so it can post the intro', async () => {
+    await getDb().run(
+      `INSERT INTO container_configs (agent_group_id, cli_scope, updated_at) VALUES (?, 'global', ?)`,
+      'ag-caller',
+      now(),
+    );
+
+    await getDeliveryAction('create_room')!(
+      { action: 'create_room', name: 'Ops Room', agents: ['mate'] },
+      callerSession,
+    );
+
+    // Without this the "post an introduction there now" instruction lands on
+    // a container whose destination map has no such name.
+    expect(writeDestinationsMock).toHaveBeenCalledWith('ag-caller', 'sess-ag-caller');
   });
 
   it('create_room refuses a cross-workspace member', async () => {
@@ -697,6 +803,47 @@ describe('add_to_room', () => {
     );
     expect(lastNotice()).toMatch(/Slack workspaces/);
     expect(inviteUsersMock).not.toHaveBeenCalled();
+  });
+
+  it('refuses an approved add_to_room replay redirected to the same channel id in another workspace', async () => {
+    await makeAgent({
+      id: 'ag-outsider',
+      folder: 'outsider',
+      workgroup: 'away',
+      channelType: 'slack-foreign',
+      identity: { ...FOREIGN, teamId: 'T1' },
+    });
+    await destination('ag-caller', 'outsider', 'ag-outsider');
+
+    await getDeliveryAction('add_to_room')!({ action: 'add_to_room', room: 'ops', agent: 'outsider' }, callerSession);
+    expect(requestApprovalMock).toHaveBeenCalledTimes(1);
+    expect((requestApprovalMock.mock.calls[0]![0] as { payload: Record<string, unknown> }).payload.room_team_id).toBe(
+      'T1',
+    );
+
+    // While the card waits, the approved room's wiring disappears and a room
+    // in ANOTHER workspace is left holding the same workspace-scoped channel
+    // id. An id-only comparison would accept it.
+    await makeAgent({ id: 'ag-far', folder: 'far', workgroup: 'home', channelType: 'slack-gamma', identity: GAMMA });
+    await getDb().run(`DELETE FROM messaging_group_agents WHERE messaging_group_id = 'mg-room-home'`);
+    await getDb().run(`DELETE FROM messaging_groups WHERE id = 'mg-room-home'`);
+    // The substitute room AND the target now live in workspace T9, so the
+    // precheck's same-workspace assert passes and the only thing left to
+    // refuse the replay is the grant's bound room workspace.
+    useBot('slack-gamma', { ...GAMMA, teamId: 'T9' });
+    useBot('slack-foreign', { ...FOREIGN, teamId: 'T9' });
+    await wire('mg-room-other', 'slack-gamma', 'slack:CHOME', 'ops', 1, 'ag-far');
+
+    const grant = await persistGrant(grantFrom('add_to_room'));
+    const { reenterGuardedDeliveryAction } = await import('../../delivery.js');
+    await reenterGuardedDeliveryAction('add_to_room')({
+      session: callerSession,
+      payload: JSON.parse(grant.payload) as Record<string, unknown>,
+      approval: grant,
+    });
+
+    expect(inviteUsersMock).not.toHaveBeenCalled();
+    expect(lastNotice()).toMatch(/participants changed since that approval/);
   });
 
   it('refuses a room outside the caller’s workgroup even when named exactly', async () => {
