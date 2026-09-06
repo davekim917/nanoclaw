@@ -14,7 +14,12 @@ import type { ChannelSetup } from './adapter.js';
 
 const env = vi.hoisted(() => ({ values: {} as Record<string, string> }));
 const adapterCalls = vi.hoisted(() => ({ configs: [] as Array<Record<string, unknown>> }));
-const bridgeLifecycle = vi.hoisted(() => ({ failedSetups: 0, setups: 0, teardowns: 0 }));
+const bridgeLifecycle = vi.hoisted(() => ({
+  failedSetups: 0,
+  setups: 0,
+  teardowns: 0,
+  setupHook: undefined as (() => void | Promise<void>) | undefined,
+}));
 const webApiCalls = vi.hoisted(() => ({ auth: 0, usersList: 0, usersInfo: 0 }));
 
 vi.mock('../env.js', async (importOriginal) => ({
@@ -61,6 +66,7 @@ vi.mock('./chat-sdk-bridge.js', async (importOriginal) => ({
     supportsThreads: true,
     setup: async () => {
       bridgeLifecycle.setups += 1;
+      await bridgeLifecycle.setupHook?.();
       if (bridgeLifecycle.failedSetups > 0) {
         bridgeLifecycle.failedSetups -= 1;
         throw new Error('bridge setup failed');
@@ -98,6 +104,7 @@ afterEach(() => {
   bridgeLifecycle.failedSetups = 0;
   bridgeLifecycle.setups = 0;
   bridgeLifecycle.teardowns = 0;
+  bridgeLifecycle.setupHook = undefined;
   webApiCalls.auth = 0;
   webApiCalls.usersList = 0;
   webApiCalls.usersInfo = 0;
@@ -239,7 +246,7 @@ describe('registerSlackWorkspace hot start', () => {
     await registry.teardownChannelAdapters();
   });
 
-  it('publishes identity and starts the hourly workspace refresh only after a successful setup', async () => {
+  it('publishes identity during bridge setup, rolls it back on failure, and starts the refresh after retry', async () => {
     vi.resetModules();
     env.values = {};
     adapterCalls.configs = [];
@@ -250,6 +257,19 @@ describe('registerSlackWorkspace hot start', () => {
     const interval = { unref: vi.fn() } as unknown as ReturnType<typeof setInterval>;
     const setIntervalSpy = vi.spyOn(global, 'setInterval').mockReturnValue(interval);
     const clearIntervalSpy = vi.spyOn(global, 'clearInterval').mockImplementation(() => undefined);
+
+    let bridgeSetupEntered!: () => void;
+    const bridgeSetupPending = new Promise<void>((resolve) => {
+      bridgeSetupEntered = resolve;
+    });
+    let releaseBridgeSetup!: () => void;
+    const holdBridgeSetup = new Promise<void>((resolve) => {
+      releaseBridgeSetup = resolve;
+    });
+    bridgeLifecycle.setupHook = async () => {
+      bridgeSetupEntered();
+      await holdBridgeSetup;
+    };
 
     const slack = await import('./slack.js');
     const registry = await import('./channel-registry.js');
@@ -262,12 +282,20 @@ describe('registerSlackWorkspace hot start', () => {
     await registry.initChannelAdapters(() => setup);
     slack.registerSlackWorkspace({ channelType: 'slack-hot', botToken: 'xoxb-hot', appToken: 'xapp-hot' });
 
-    await expect(registry.startChannelAdapter('slack-hot')).rejects.toThrow('Restart fallback: bash setup/lib/restart.sh');
     const { getKnownSlackBots } = await import('./slack-mentions.js');
+    const failedStart = registry.startChannelAdapter('slack-hot');
+    await bridgeSetupPending;
+    expect(getKnownSlackBots().get('slack-hot')).toMatchObject({ userId: 'UBOT', teamId: 'T1' });
+    expect(webApiCalls.usersList).toBe(0);
+    expect(setIntervalSpy).not.toHaveBeenCalled();
+
+    releaseBridgeSetup();
+    await expect(failedStart).rejects.toThrow('Restart fallback: bash setup/lib/restart.sh');
     expect(getKnownSlackBots().get('slack-hot')).toBeUndefined();
     expect(webApiCalls.usersList).toBe(0);
     expect(setIntervalSpy).not.toHaveBeenCalled();
 
+    bridgeLifecycle.setupHook = undefined;
     await expect(registry.startChannelAdapter('slack-hot')).resolves.toBe('started');
     expect(getKnownSlackBots().get('slack-hot')).toMatchObject({ userId: 'UBOT', teamId: 'T1' });
     expect(webApiCalls.usersList).toBe(1);

@@ -49,6 +49,7 @@ import {
   normalizeSlackOrderedListContinuations,
   resolveInboundSlackIds,
   resolveSlackMentions,
+  unregisterSlackBot,
   upgradeSlackBotProfile,
   type SlackBotIdentity,
 } from './slack-mentions.js';
@@ -720,9 +721,9 @@ export function registerSlackWorkspace(ws: SlackWorkspace): void {
       (slackAdapter as unknown as { name: string }).name = ws.channelType;
       const client = new WebClient(ws.botToken);
 
-      // Discover this bot's identity before building the bridge, but do not
-      // publish it until bridge.setup succeeds. A failed hot start must leave
-      // no bot directory entry or hourly workspace refresh behind.
+      // Discover this bot's identity before building the bridge. Setup publishes
+      // it provisionally before Socket Mode can deliver inbound events, then
+      // rolls it back if setup fails; post-setup refresh work waits for success.
       const identity = await fetchSlackBotIdentity(client);
 
       // One governor per bridge instance — each instance is one bot identity.
@@ -836,18 +837,34 @@ export function registerSlackWorkspace(ws: SlackWorkspace): void {
       let workspaceHumansRefresh: ReturnType<typeof setInterval> | undefined;
       const setupBridge = bridge.setup.bind(bridge);
       bridge.setup = async (setup) => {
-        await setupBridge(setup);
-        if (startedPostSetup) return;
-        startedPostSetup = true;
-
         if (!identity) {
+          await setupBridge(setup);
+          if (startedPostSetup) return;
+          startedPostSetup = true;
           log.warn('Slack bot identity unavailable — outbound @-mentions for this bot will not resolve', {
             channelType: ws.channelType,
           });
           return;
         }
 
+        // Socket Mode can deliver inbound events before setup resolves. Publish the
+        // identity first so its inbound filter observes sibling bots correctly.
+        const previousIdentity = getKnownSlackBots().get(ws.channelType);
         registerSlackBot(ws.channelType, identity);
+        try {
+          await setupBridge(setup);
+        } catch (err) {
+          // A concurrently registered adapter may have replaced this entry.
+          // Restore only our own registration so it cannot be clobbered.
+          if (getKnownSlackBots().get(ws.channelType) === identity) {
+            if (previousIdentity) registerSlackBot(ws.channelType, previousIdentity);
+            else unregisterSlackBot(ws.channelType, identity);
+          }
+          throw err;
+        }
+
+        if (startedPostSetup) return;
+        startedPostSetup = true;
         void upgradeSlackBotProfile(client, ws.channelType);
         // Workspace humans → mention registry, so agent-emitted `@Alice` /
         // `<@bob>` resolve without a hand-maintained roster. Refresh hourly
