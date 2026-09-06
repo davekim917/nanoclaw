@@ -508,6 +508,11 @@ describe('add_to_room', () => {
     await getDeliveryAction('add_to_room')!({ action: 'add_to_room', room: 'ops', agent: 'outsider' }, callerSession);
     expect(requestApprovalMock).toHaveBeenCalledTimes(1);
     expect(inviteUsersMock).not.toHaveBeenCalled();
+    // The approver is deciding a disclosure, not just a membership change:
+    // Slack hands a new channel member everything already in the room.
+    const card = requestApprovalMock.mock.calls[0]![0] as { question: string };
+    expect(card.question).toMatch(/prior history/i);
+    expect(card.question).toMatch(/whole conversation to date/i);
 
     await getDeliveryAction('add_to_room')!({ action: 'add_to_room', room: 'ops', agent: 'mate' }, callerSession);
     expect(requestApprovalMock).toHaveBeenCalledTimes(1);

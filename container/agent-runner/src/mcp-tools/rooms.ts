@@ -49,8 +49,9 @@ export const createRoom: McpToolDefinition = {
   tool: {
     name: 'create_room',
     description:
-      'Open ONE shared Slack room — a private channel holding you, the operator, and the agents you name — and wire ' +
-      'every one of them to it so they can all read and post there. This is the TEAM primitive: for a team of ' +
+      'Open ONE shared Slack room — a NEW private channel holding you, the operator, and the agents you name — and ' +
+      'wire every one of them to it so they can all read and post there. It never reuses an existing channel, so ' +
+      'nobody gains access to a conversation that predates the room. This is the TEAM primitive: for a team of ' +
       'several agents, call it ONCE naming all of them, never once per agent. Each agent you name must already be a ' +
       'send_message destination of yours, and every agent must have a Slack bot in the same workspace as yours — a ' +
       'roster spanning two workspaces is refused, because one Slack conversation cannot cross workspaces. ' +
@@ -115,9 +116,11 @@ export const addToRoom: McpToolDefinition = {
       'nobody has to be re-invited — so history and links stay valid. The room is looked up by name among the rooms ' +
       'wired to you or to another agent in your workgroup, and nowhere else: a name that matches two of those rooms ' +
       'is an error listing both, and a room belonging to another workgroup is never found. Adding an agent from ' +
-      'your own workgroup happens straight away; adding one from outside it requires admin approval, because it ' +
-      'lets them read everything posted in that room from then on. For a team you already know the shape of, ' +
-      'prefer one complete create_room over a chain of adds. Fire-and-forget: a system note reports the outcome.',
+      'your own workgroup happens straight away; adding one from outside it requires admin approval, because ' +
+      "Slack hands a new member the room's PRIOR HISTORY as well as everything posted afterwards — the whole " +
+      'conversation to date, not just what follows. Say so when you propose it. For a team you already know the ' +
+      'shape of, prefer one complete create_room over a chain of adds. Fire-and-forget: a system note reports the ' +
+      'outcome.',
     inputSchema: {
       type: 'object' as const,
       properties: {
