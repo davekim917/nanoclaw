@@ -418,6 +418,13 @@ RUN printf "%s\n" \
 # output on Debian containers that lack unprivileged user namespaces.
 COPY --chmod=0644 puppeteer-config.json /app/puppeteer-config.json
 
+# Keep pnpm's generated Claude shim beside its package: its basedir-relative
+# node/module lookup keeps working after the public `claude` command becomes
+# the constrained NanoClaw review launcher below.
+RUN mv /pnpm/claude /pnpm/claude-real && test -x /pnpm/claude-real
+COPY --chmod=0755 claude-review-wrapper.sh /pnpm/claude
+RUN test -x /pnpm/claude
+
 # ---- ncl CLI wrapper ----------------------------------------------------------
 # Actual script lives in the mounted source at /app/src/cli/ncl.ts.
 RUN printf '#!/bin/sh\nexec bun /app/src/cli/ncl.ts "$@"\n' > /usr/local/bin/ncl && \

@@ -49,6 +49,8 @@ import {
 } from './codex-companion-setup.js';
 import { activateGcpServiceAccount } from './gcp-auth-setup.js';
 import { startResourceTelemetry } from './resource-telemetry.js';
+import { CLAUDE_REVIEW_SOCKET_ENV } from './cli/claude-review-contract.js';
+import { startClaudeReviewService } from './cli/claude-review-service.js';
 
 function log(msg: string): void {
   console.error(`[agent-runner] ${msg}`);
@@ -66,6 +68,33 @@ const CWD = '/workspace/agent';
 
 async function main(): Promise<void> {
   const config = loadConfig();
+  // Cross-model reviews run from Bash, whose secret sanitization intentionally
+  // strips Claude credentials. Start the trusted runner-owned service before
+  // any provider snapshots process.env; it retains no client-provided env and
+  // reads the current runner env per request so native rotations stay visible.
+  let reviewService: Awaited<ReturnType<typeof startClaudeReviewService>> | undefined;
+  delete process.env[CLAUDE_REVIEW_SOCKET_ENV];
+  try {
+    reviewService = await startClaudeReviewService({ onDiagnostic: log });
+    process.env[CLAUDE_REVIEW_SOCKET_ENV] = reviewService.socketPath;
+  } catch {
+    log('Claude review launcher unavailable: could not start local review service');
+  }
+  let reviewServiceStopped = false;
+  const stopReviewService = async () => {
+    if (reviewServiceStopped) return;
+    reviewServiceStopped = true;
+    delete process.env[CLAUDE_REVIEW_SOCKET_ENV];
+    await reviewService?.stop();
+  };
+  let handlingSignal = false;
+  const stopForSignal = (signal: NodeJS.Signals) => {
+    if (handlingSignal) return;
+    handlingSignal = true;
+    void stopReviewService().finally(() => process.exit(signal === 'SIGINT' ? 130 : 143));
+  };
+  process.once('SIGINT', stopForSignal);
+  process.once('SIGTERM', stopForSignal);
   const providerName = config.provider.toLowerCase() as ProviderName;
   const mailbox = getAgentMailbox();
   await mailbox.start(await readMailboxContext());
@@ -300,6 +329,9 @@ async function main(): Promise<void> {
       systemContext: { instructions },
     });
   } finally {
+    process.off('SIGINT', stopForSignal);
+    process.off('SIGTERM', stopForSignal);
+    await stopReviewService();
     stopResourceTelemetry();
     await mailbox.stop();
   }
