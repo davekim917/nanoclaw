@@ -11,6 +11,7 @@ import { randomUUID } from 'node:crypto';
 
 import { REPO_ROOT } from '../config.js';
 import { getAgentGroup } from '../db/agent-groups.js';
+import { insertOrAdopt } from '../db/insert-or-adopt.js';
 import {
   assertSameWorkgroupWiring,
   createMessagingGroup,
@@ -231,11 +232,17 @@ async function openAndWireOwnerDm(
   };
 
   return centralTransaction(async () => {
-    const messagingGroup = await getMessagingGroupByPlatform(channelType, platformId, channelType);
-    const group = messagingGroup ?? newMessagingGroup;
-    if (!messagingGroup) {
-      await createMessagingGroup(group);
-    }
+    // Two concurrent attaches of the same channel race here: a bare
+    // check-then-insert loses the unique key instead of adopting the winner
+    // (src/db/insert-or-adopt.ts is the seam-3 primitive for exactly this).
+    const existing = await getMessagingGroupByPlatform(channelType, platformId, channelType);
+    const { row: group } = existing
+      ? { row: existing }
+      : await insertOrAdopt(
+          newMessagingGroup,
+          (row) => createMessagingGroup(row),
+          () => getMessagingGroupByPlatform(channelType, platformId, channelType),
+        );
 
     if (await getMessagingGroupAgentByPair(group.id, agentGroupId)) {
       return { messagingGroupId: group.id, wiringCreated: false };
