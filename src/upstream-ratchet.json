@@ -741,7 +741,7 @@
 "src/db/migrations/module-approvals-pending-approvals.ts":{"diff":0,"mode":"100644","sha256":"b91305e1eb527b7eda50e6a6744f990ed783505c5f909d4a77ca6d0ffd118950"},
 "src/db/migrations/module-approvals-title-options.ts":{"diff":0,"mode":"100644","sha256":"bc18ee398104bbbb9fda8611db192008b804c2e1cee94b9934ea8234e57a3102"},
 "src/db/migrations/portability.test.ts":{"diff":57,"mode":"100644","sha256":null,"deleted":true},
-"src/db/migrations/registry.test.ts":{"diff":284,"mode":"100644","sha256":"b8485dfb9da25f166edd19031e4e642b6e58d86025e82ce05d717d1c73d87a96"},
+"src/db/migrations/registry.test.ts":{"diff":289,"mode":"100644","sha256":"9d5f3013518ca92221cb23da713326e224ec9fb47f18be76377832e2ffdc301c"},
 "src/db/schema.ts":{"diff":172,"mode":"100644","sha256":"1e90b6511752958e513ba44ac271ea26f8356863dc0d9b824d1bbddbac69581e"},
 "src/db/sessions.ts":{"diff":557,"mode":"100644","sha256":"13150448204f86b6deb60d8e1daaa4782534c108ad26a62474b388053460f42c"},
 "src/db/testing/driver-conformance.ts":{"diff":0,"mode":"100644","sha256":"772e60b40160d532f4a51cb4169ba18b4453f414110311092d1a03bd56f61d37"},
