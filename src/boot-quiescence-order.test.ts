@@ -158,7 +158,7 @@ describe('boot mount-change ordering', () => {
         calls.push(`quiesce(${changed.join(',')}, of ${options.knownWorkgroupIds.length})`);
         // The real door writes the accountability note after its pre-stop
         // partition and before its first stop.
-        await options.beforeStop({ survivableSessionIds: [], mustStopSessionIds: ['s1'] });
+        await options.beforeStop({ pass: 1, survivableSessionIds: [], mustStopSessionIds: ['s1'] });
         // Suspend inside the door: anything that runs before it resolves is a
         // mutation racing a live container.
         await new Promise<void>((resolve) => {
@@ -324,6 +324,7 @@ describe('boot mount-change ordering', () => {
     const db = makeDb();
     const scopes: Array<string[]> = [];
     const stops: string[] = [];
+    const warns: Array<{ skip: string[]; beforeStops: number }> = [];
     let listings = 0;
     let stopped = false;
 
@@ -349,7 +350,9 @@ describe('boot mount-change ordering', () => {
       },
       activeSessionIds: async () => ['s1', 's2'],
       ensureRuntime: () => undefined,
-      warnStartup: async () => undefined,
+      warnStartup: async (_reason, skipSessionIds) => {
+        warns.push({ skip: [...skipSessionIds].sort(), beforeStops: stops.length });
+      },
       reconcileShared: () => undefined,
       memoryGate: (_db, opts) => {
         scopes.push([...(opts.mutateWorkgroupIds ?? [])]);
@@ -372,6 +375,12 @@ describe('boot mount-change ordering', () => {
     expect(scope.survivableSessionIds).toEqual([]);
     expect(scope.survivable).toBe(0);
     expect(scope.stopped).toBe(1);
+    // The first note skipped s1 as survivable; the reclassification warned it
+    // — and only it — before the second-pass stop (#479 round 1).
+    expect(warns).toEqual([
+      { skip: ['s1'], beforeStops: 0 },
+      { skip: ['s2'], beforeStops: 0 },
+    ]);
     db.close();
   });
 
@@ -440,7 +449,7 @@ describe('boot mount-change ordering', () => {
       },
       quiesce: async (_changed, options) => {
         calls.push('quiesce');
-        await options.beforeStop({ survivableSessionIds: [], mustStopSessionIds: [] });
+        await options.beforeStop({ pass: 1, survivableSessionIds: [], mustStopSessionIds: [] });
         return {
           workgroups: 1,
           changedWorkgroupIds: [],

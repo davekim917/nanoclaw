@@ -230,7 +230,7 @@ it('runs reconciliation only after runtime and strict absence proof succeed', as
       calls.push('quiescence');
       expect(options.knownWorkgroupIds).toEqual(['wg-1']);
       expect(options.knownSessionIds).toEqual([]);
-      await options.beforeStop({ survivableSessionIds: [], mustStopSessionIds: [] });
+      await options.beforeStop({ pass: 1, survivableSessionIds: [], mustStopSessionIds: [] });
       return Promise.resolve({
         workgroups: 0,
         // No flip: the door's post-stop re-evaluation agrees with its input.

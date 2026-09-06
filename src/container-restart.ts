@@ -589,14 +589,21 @@ export interface BootQuiescenceOptions {
    */
   reevaluateChanged?: () => string[] | Promise<string[]>;
   /**
-   * Runs after the PRE-stop partition and before the first stop, with the
-   * sessions that partition would leave running. The boot block writes the
-   * host-restart accountability note here: every session marked running by the
-   * previous host gets one EXCEPT the survivors, whose containers are not
-   * being interrupted — and it is written before the stop pass, which can
-   * outlast the heartbeat freshness window (#441).
+   * Runs before each stop pass with that pass's partition. Pass 1 is the
+   * PRE-stop partition: the boot block writes the host-restart accountability
+   * note here for every session marked running by the previous host EXCEPT
+   * the survivors, whose containers are not being interrupted — before the
+   * stop pass, which can outlast the heartbeat freshness window (#441). Pass 2
+   * runs only when the post-stop re-evaluation moved sessions INTO must-stop
+   * (a flipped workgroup, a newcomer): `mustStopSessionIds` is then exactly
+   * those newly reclassified sessions, which the first note skipped and which
+   * are about to be interrupted after all.
    */
-  beforeStop?: (preStop: { survivableSessionIds: string[]; mustStopSessionIds: string[] }) => Promise<void> | void;
+  beforeStop?: (partition: {
+    pass: 1 | 2;
+    survivableSessionIds: string[];
+    mustStopSessionIds: string[];
+  }) => Promise<void> | void;
   list?: () => InstallContainerScope[];
   stop?: (name: string) => void;
 }
@@ -704,6 +711,7 @@ export async function quiesceWorkgroupsForBootMountChange(
   // stop set and the accountability note's skip set.
   const preStop = partitionInstallContainers(containers, changedWorkgroupIds, known, knownSessions);
   await options.beforeStop?.({
+    pass: 1,
     survivableSessionIds: preStop.survivable.map((entry) => entry.sessionId as string),
     mustStopSessionIds: sessionIdsOf(preStop.mustStop),
   });
@@ -751,6 +759,17 @@ export async function quiesceWorkgroupsForBootMountChange(
       flipped: finalChanged.filter((id) => !changedWorkgroupIds.includes(id)),
       containers: afterFirstPass.mustStop.map((entry) => entry.name),
     });
+    // Sessions the first note skipped as survivable and which this pass is
+    // about to interrupt after all get their note now, before the stop.
+    const alreadyMustStop = new Set(sessionIdsOf(preStop.mustStop));
+    const reclassified = sessionIdsOf(afterFirstPass.mustStop).filter((id) => !alreadyMustStop.has(id));
+    if (reclassified.length > 0) {
+      await options.beforeStop?.({
+        pass: 2,
+        survivableSessionIds: afterFirstPass.survivable.map((entry) => entry.sessionId as string),
+        mustStopSessionIds: reclassified,
+      });
+    }
     stopAll(afterFirstPass.mustStop);
     const afterSecondPass = partitionInstallContainers(list(), finalChanged, known, knownSessions);
     if (afterSecondPass.mustStop.length > 0) {

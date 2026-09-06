@@ -204,7 +204,11 @@ export interface BootMountQuiescenceDeps {
       knownWorkgroupIds: string[];
       knownSessionIds: string[];
       reevaluateChanged: () => string[];
-      beforeStop: (preStop: { survivableSessionIds: string[]; mustStopSessionIds: string[] }) => Promise<void>;
+      beforeStop: (partition: {
+        pass: 1 | 2;
+        survivableSessionIds: string[];
+        mustStopSessionIds: string[];
+      }) => Promise<void>;
     },
   ) => Promise<BootQuiescenceScope>;
   warnStartup?: (reason: string, skipSessionIds: ReadonlySet<string>) => Promise<void>;
@@ -287,24 +291,6 @@ export async function runBootMountQuiescence(
   const evaluateChanged = (): string[] =>
     allWorkgroupIds.filter((id) => memoryWouldChange(db, id) || (sharedFsEnabled && sharedWouldChange(db, id)));
 
-  // The startup warn runs INSIDE the door, after its pre-stop partition and
-  // before its first stop (`beforeStop`): the note is written from the session
-  // rows an unclean previous host left marked 'running', and under D2 it must
-  // skip the survivors — their containers are not interrupted, and the note
-  // says they were. That skip set exists only once the door has listed and
-  // partitioned, and the note still has to precede the stop pass, which can
-  // outlast the heartbeat freshness window (#441). A door that dies half way
-  // through its stops leaves the note already written for every must-stop
-  // session; a door whose listing fails writes none, and the boot fails there.
-  const warnStartup = deps.warnStartup ?? warnMarkedRunningSessionsOfStartup;
-  const beforeStop = async (preStop: { survivableSessionIds: string[] }): Promise<void> => {
-    try {
-      await warnStartup('host startup after an unclean stop', new Set(preStop.survivableSessionIds));
-    } catch (err) {
-      log.error('host-restart startup warn failed', { err });
-    }
-  };
-
   // Bounded probe BEFORE the unbounded inventory, which is the order main has.
   // There `ensureContainerRuntimeRunning()` (a 10 s-timeout `docker info`) ran
   // immediately ahead of `cleanupOrphansStrict()`; here the door's
@@ -325,6 +311,36 @@ export async function runBootMountQuiescence(
   const knownSessionIds = await (
     deps.activeSessionIds ?? (async () => (await getActiveSessions()).map((session) => session.id))
   )();
+
+  // The startup warn runs INSIDE the door, after its pre-stop partition and
+  // before its first stop (`beforeStop`): the note is written from the session
+  // rows an unclean previous host left marked 'running', and under D2 it must
+  // skip the survivors — their containers are not interrupted, and the note
+  // says they were. That skip set exists only once the door has listed and
+  // partitioned, and the note still has to precede the stop pass, which can
+  // outlast the heartbeat freshness window (#441). A door that dies half way
+  // through its stops leaves the note already written for every must-stop
+  // session; a door whose listing fails writes none, and the boot fails there.
+  // The door calls it a second time only when its post-stop re-evaluation
+  // moved sessions INTO must-stop: those were skipped by the first note as
+  // survivable and are about to be interrupted after all, so they — and only
+  // they — get theirs then (the skip set is every other known session).
+  const warnStartup = deps.warnStartup ?? warnMarkedRunningSessionsOfStartup;
+  const beforeStop = async (partition: {
+    pass: 1 | 2;
+    survivableSessionIds: string[];
+    mustStopSessionIds: string[];
+  }): Promise<void> => {
+    const skip =
+      partition.pass === 1
+        ? new Set(partition.survivableSessionIds)
+        : new Set(knownSessionIds.filter((id) => !partition.mustStopSessionIds.includes(id)));
+    try {
+      await warnStartup('host startup after an unclean stop', skip);
+    } catch (err) {
+      log.error('host-restart startup warn failed', { err });
+    }
+  };
 
   const scope = await (deps.quiesce ?? quiesceWorkgroupsForBootMountChange)(changedBeforeQuiescence, {
     knownWorkgroupIds: allWorkgroupIds,

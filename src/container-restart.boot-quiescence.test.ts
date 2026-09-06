@@ -474,16 +474,30 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
 
     vi.clearAllMocks();
     const flipped = fakeRuntime([container('nanoclaw-v2-b-1', 'wg-b'), container('nanoclaw-v2-c-1', 'wg-c')]);
+    const warned: Array<{ pass: number; mustStop: string[]; beforeStops: number }> = [];
     const after = await quiesceWorkgroupsForBootMountChange([], {
       ...flipped,
       knownWorkgroupIds: options.knownWorkgroupIds,
       knownSessionIds: options.knownSessionIds,
       reevaluateChanged: () => ['wg-b'],
+      beforeStop: (partition) => {
+        warned.push({
+          pass: partition.pass,
+          mustStop: partition.mustStopSessionIds,
+          beforeStops: flipped.stops.length,
+        });
+      },
     });
 
     // Nothing was must-stop pre-stop; the flipped workgroup's container is
-    // stopped in the second pass and leaves the survivable set.
+    // stopped in the second pass and leaves the survivable set — and the
+    // session the first note skipped as survivable gets its note BEFORE that
+    // second-pass stop (#479 round 1).
     expect(flipped.stops).toEqual(['nanoclaw-v2-b-1']);
+    expect(warned).toEqual([
+      { pass: 1, mustStop: [], beforeStops: 0 },
+      { pass: 2, mustStop: ['nanoclaw-v2-b-1-session'], beforeStops: 0 },
+    ]);
     expect(after.stopped).toBe(1);
     expect(after.changedWorkgroupIds).toEqual(['wg-b']);
     expect(after.survivableSessionIds).toEqual(['nanoclaw-v2-c-1-session']);
