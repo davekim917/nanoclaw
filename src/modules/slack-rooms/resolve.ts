@@ -205,7 +205,39 @@ export async function candidateRooms(
     }
     byKey.set(key, { platformId: row.platform_id, teamId, name: row.name ?? '', rows: [row] });
   }
-  return [...byKey.values()];
+  return mergeOfflineRows([...byKey.values()]);
+}
+
+/**
+ * Fold rows whose workspace could not be determined into the known room with
+ * the same channel id.
+ *
+ * `teamId` comes from the live bot registry, so a participant whose Slack
+ * adapter is offline resolves to null and its row would otherwise become a
+ * SECOND room sharing one channel id — splitting the real room's membership,
+ * making the name ambiguous, and leaving the inviter picking from half a
+ * roster (Codex on #495). A null-team group is folded into the single known
+ * room carrying that channel id. When two workspaces genuinely hold the same
+ * id, there is no evidence which one the offline row belongs to, so it stays
+ * separate and the caller gets the ambiguity error rather than a guess.
+ */
+function mergeOfflineRows(rooms: CandidateRoom[]): CandidateRoom[] {
+  const knownByPlatformId = new Map<string, CandidateRoom[]>();
+  for (const room of rooms) {
+    if (room.teamId === null) continue;
+    const bucket = knownByPlatformId.get(room.platformId);
+    if (bucket) bucket.push(room);
+    else knownByPlatformId.set(room.platformId, [room]);
+  }
+  return rooms.filter((room) => {
+    if (room.teamId !== null) return true;
+    const known = knownByPlatformId.get(room.platformId);
+    if (known?.length !== 1) return true;
+    const target = known[0]!;
+    target.rows.push(...room.rows);
+    if (!target.name) target.name = room.name;
+    return false;
+  });
 }
 
 /**
@@ -270,8 +302,15 @@ export function roomInviter(
  * happen on is in it: the agent group, the adapter instance that speaks for
  * it, the Slack bot user that actually gets invited, and the workspace.
  */
-export function rosterStamp(participants: RoomParticipant[]): string[] {
-  return participants.map((p) => `${p.agentGroupId}|${p.channelType}|${p.botUserId}|${p.teamId}`).sort();
+export function rosterStamp(participants: RoomParticipant[], operatorUserId: string | null = null): string[] {
+  // The operator is a room MEMBER, not bookkeeping: a retry that adopts the
+  // channel after the eligible operator changed would otherwise invite the new
+  // one while the original keeps standing access (Codex on #495). Stamped in
+  // the same list so a changed operator fails the roster match like any other
+  // participant change. The `operator:` prefix cannot collide with a bot entry,
+  // whose first field is an agent-group id.
+  const bots = participants.map((p) => `${p.agentGroupId}|${p.channelType}|${p.botUserId}|${p.teamId}`);
+  return [...bots, `operator|${operatorUserId ?? ''}`].sort();
 }
 
 /** Rooms in the caller's candidate set carrying this name. Never throws. */

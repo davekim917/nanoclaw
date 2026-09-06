@@ -43,7 +43,7 @@ export async function recordRoomCreation(row: SlackRoomCreation): Promise<void> 
     `INSERT INTO slack_room_creations
          (platform_id, room_key, room_name, agent_group_id, team_id, roster, request_id, created_at)
        VALUES (@platform_id, @room_key, @room_name, @agent_group_id, @team_id, @roster, @request_id, @created_at)
-     ON CONFLICT(platform_id) DO NOTHING`,
+     ON CONFLICT(team_id, platform_id) DO NOTHING`,
     row,
   );
 }

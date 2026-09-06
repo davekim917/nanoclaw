@@ -32,7 +32,7 @@ export const migration075: Migration = {
   up(db: Database.Database) {
     db.exec(`
       CREATE TABLE IF NOT EXISTS slack_room_creations (
-        platform_id    TEXT PRIMARY KEY,
+        platform_id    TEXT NOT NULL,
         room_key       TEXT NOT NULL,
         room_name      TEXT NOT NULL,
         agent_group_id TEXT NOT NULL REFERENCES agent_groups(id) ON DELETE CASCADE,
@@ -49,7 +49,14 @@ export const migration075: Migration = {
         -- — the same disclosure the marker exists to prevent, one step later.
         roster         TEXT NOT NULL,
         request_id     TEXT,
-        created_at     TEXT NOT NULL
+        created_at     TEXT NOT NULL,
+        -- Slack channel ids are WORKSPACE-scoped, so two workspaces can mint
+        -- the same id. Keying on platform_id alone let only one unfinished
+        -- creation hold a marker: the second insert was swallowed by ON
+        -- CONFLICT and completing either room deleted the other's marker
+        -- (Codex on #495). The workspace is half of the identity everywhere
+        -- else in this module; it is half of the key here too.
+        PRIMARY KEY (team_id, platform_id)
       );
 
       -- The lookup the adopt branch makes: "did THIS caller, in THIS

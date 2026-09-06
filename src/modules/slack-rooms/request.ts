@@ -127,7 +127,7 @@ export async function validateCreateRoom(content: Record<string, unknown>, sessi
       resolveOperatorSlackUserId(await pickApprover(session.agent_group_id), caller.channelType)?.slackUserId ?? null;
     // Re-derived on every run, replays included, and compared against the
     // stamp the card carried — see roomsCreate.grantCoversRequest.
-    content[ROSTER_KEY] = rosterStamp(participants);
+    content[ROSTER_KEY] = rosterStamp(participants, content[OPERATOR_KEY] as string | null);
     return true;
   } catch (err) {
     return refuse(session, 'create_room', err);

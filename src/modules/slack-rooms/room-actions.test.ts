@@ -321,7 +321,9 @@ describe('create_room', () => {
       `INSERT INTO slack_room_creations
            (platform_id, room_key, room_name, agent_group_id, team_id, roster, request_id, created_at)
          VALUES ('slack:CHALF', 'ops-room', 'ops-room', 'ag-caller', 'T1', ?, NULL, ?)`,
-      JSON.stringify(['ag-caller|slack-alpha|UALPHA|T1', 'ag-mate|slack-beta|UBETA|T1'].sort()),
+      // The operator is part of the roster: it is a room MEMBER, so a retry
+      // after the eligible operator changed must NOT adopt (#495 round 4).
+      JSON.stringify(['ag-caller|slack-alpha|UALPHA|T1', 'ag-mate|slack-beta|UBETA|T1', 'operator|UOWNER'].sort()),
       now(),
     );
 
@@ -803,6 +805,79 @@ describe('add_to_room', () => {
     );
     expect(lastNotice()).toMatch(/Slack workspaces/);
     expect(inviteUsersMock).not.toHaveBeenCalled();
+  });
+
+  it('refuses to adopt a half-built room whose operator has since changed (#495 round 4)', async () => {
+    await getDb().run(
+      `INSERT INTO container_configs (agent_group_id, cli_scope, updated_at) VALUES (?, 'global', ?)`,
+      'ag-caller',
+      now(),
+    );
+    // Same bots, DIFFERENT operator: adopting would invite the new operator
+    // into a channel the original operator is still a member of.
+    await getDb().run(
+      `INSERT INTO slack_room_creations
+           (platform_id, room_key, room_name, agent_group_id, team_id, roster, request_id, created_at)
+         VALUES ('slack:CHALF', 'ops-room', 'ops-room', 'ag-caller', 'T1', ?, NULL, ?)`,
+      JSON.stringify(
+        ['ag-caller|slack-alpha|UALPHA|T1', 'ag-mate|slack-beta|UBETA|T1', 'operator|USOMEONEELSE'].sort(),
+      ),
+      now(),
+    );
+
+    await getDeliveryAction('create_room')!(
+      { action: 'create_room', name: 'Ops Room', agents: ['mate'] },
+      callerSession,
+    );
+
+    expect(createConversationMock).not.toHaveBeenCalled();
+    expect(inviteUsersMock).not.toHaveBeenCalled();
+    expect(lastNotice()).toMatch(/half-built/);
+  });
+
+  it('keeps a participant whose Slack adapter is offline with its known room (#495 round 4)', async () => {
+    // `teamId` comes from the LIVE bot registry, so an offline participant
+    // resolves to null. Its row must fold into the room the online bot knows,
+    // not become a second room sharing one channel id.
+    await makeAgent({
+      id: 'ag-quiet',
+      folder: 'quiet',
+      workgroup: 'home',
+      channelType: 'slack-gamma',
+      identity: GAMMA,
+    });
+    await destination('ag-caller', 'quiet', 'ag-quiet');
+    await wire('mg-off-live', 'slack-alpha', 'slack:COFF', 'offsite', 1, 'ag-caller');
+    // No useBot() for this channel type: its adapter is offline.
+    await wire('mg-off-dark', 'slack-dark', 'slack:COFF', 'offsite', 1, 'ag-quiet');
+
+    const { candidateRooms } = await import('./resolve.js');
+    const rooms = (await candidateRooms('ag-caller')).filter((r) => r.platformId === 'slack:COFF');
+    expect(rooms).toHaveLength(1);
+    expect(rooms[0]!.teamId).toBe('T1');
+    expect(rooms[0]!.rows).toHaveLength(2);
+    expect(rooms[0]!.name).toBe('offsite');
+  });
+
+  it('leaves an offline row separate when two workspaces share the channel id (#495 round 4)', async () => {
+    // With two known rooms carrying that id there is no evidence which one the
+    // offline row belongs to, so the caller gets the ambiguity error, never a
+    // guess that could invite an agent into the wrong workspace's channel.
+    await makeAgent({
+      id: 'ag-t2',
+      folder: 'far2',
+      workgroup: 'home',
+      channelType: 'slack-foreign',
+      identity: FOREIGN,
+    });
+    await wire('mg-amb-t1', 'slack-alpha', 'slack:CAMB', 'amb', 1, 'ag-caller');
+    await wire('mg-amb-t2', 'slack-foreign', 'slack:CAMB', 'amb', 1, 'ag-t2');
+    await wire('mg-amb-dark', 'slack-dark2', 'slack:CAMB', 'amb', 1, 'ag-caller');
+
+    const { candidateRooms } = await import('./resolve.js');
+    const rooms = (await candidateRooms('ag-caller')).filter((r) => r.platformId === 'slack:CAMB');
+    expect(rooms).toHaveLength(3);
+    expect(rooms.filter((r) => r.teamId === null)).toHaveLength(1);
   });
 
   it('refuses an approved add_to_room replay redirected to the same channel id in another workspace', async () => {

@@ -149,7 +149,10 @@ export async function handleCreateRoom(content: Record<string, unknown>, session
     // Resolved by the precheck and bound by the guard, so the human the card
     // named is the human that gets invited even if roles moved in between.
     const operator = typeof content[OPERATOR_KEY] === 'string' ? (content[OPERATOR_KEY] as string) : null;
-    const roster = JSON.stringify(rosterStamp(participants));
+    // The operator is stamped WITH the bots: a retry after the eligible
+    // operator changed must not adopt the channel and invite the new one while
+    // the original keeps access (Codex on #495).
+    const roster = JSON.stringify(rosterStamp(participants, operator));
 
     // Resume only what THIS caller left unfinished, in THIS workspace, under
     // THIS name — and only when the roster matches. A marker proves the
