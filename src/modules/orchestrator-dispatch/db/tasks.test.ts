@@ -88,7 +88,7 @@ describe('tasks CRUD', () => {
     await seedAgentAndSession('ag-target', 'sess-target');
 
     await insertTaskAtomic(makeTask());
-    const found = getTaskById('task-1');
+    const found = await getTaskById('task-1');
     expect(found).not.toBeNull();
     expect(found!.task_id).toBe('task-1');
     expect(found!.idempotency_key).toBe('ik-1');
@@ -115,10 +115,10 @@ describe('tasks CRUD', () => {
 
     await insertTaskAtomic(makeTask());
 
-    const first = acquireCompletionLease('task-1');
+    const first = await acquireCompletionLease('task-1');
     expect(first).not.toBeNull();
 
-    const second = acquireCompletionLease('task-1');
+    const second = await acquireCompletionLease('task-1');
     expect(second).toBeNull();
   });
 
@@ -131,10 +131,10 @@ describe('tasks CRUD', () => {
     await insertTaskAtomic(makeTask());
     getRawDb().prepare(`UPDATE tasks SET status='cancelled', cancelled_at=? WHERE task_id='task-1'`).run(now());
 
-    const updated = updateArtifactColumn('task-1', 'parent_platform_message_id', 'msg-1');
+    const updated = await updateArtifactColumn('task-1', 'parent_platform_message_id', 'msg-1');
     expect(updated).toBe(false);
 
-    const row = getTaskById('task-1');
+    const row = await getTaskById('task-1');
     expect(row!.parent_platform_message_id).toBeNull();
   });
 
@@ -144,10 +144,10 @@ describe('tasks CRUD', () => {
     await seedAgentAndSession('ag-target', 'sess-target');
 
     await insertTaskAtomic(makeTask());
-    const updated = updateArtifactColumn('task-1', 'parent_platform_message_id', 'msg-1');
+    const updated = await updateArtifactColumn('task-1', 'parent_platform_message_id', 'msg-1');
     expect(updated).toBe(true);
 
-    const row = getTaskById('task-1');
+    const row = await getTaskById('task-1');
     expect(row!.parent_platform_message_id).toBe('msg-1');
   });
 
@@ -158,14 +158,14 @@ describe('tasks CRUD', () => {
 
     await insertTaskAtomic(makeTask());
     // First transition to completed
-    const first = transitionToTerminal('task-1', 'completed', { completed_at: now(), result_summary: 'done' });
+    const first = await transitionToTerminal('task-1', 'completed', { completed_at: now(), result_summary: 'done' });
     expect(first).toBe(true);
 
     // Second transition should fail (already terminal)
-    const second = transitionToTerminal('task-1', 'failed', { failed_at: now(), fail_reason: 'x' });
+    const second = await transitionToTerminal('task-1', 'failed', { failed_at: now(), fail_reason: 'x' });
     expect(second).toBe(false);
 
-    const row = getTaskById('task-1');
+    const row = await getTaskById('task-1');
     expect(row!.status).toBe('completed');
   });
 
@@ -175,10 +175,10 @@ describe('tasks CRUD', () => {
     await seedAgentAndSession('ag-target', 'sess-target');
 
     await insertTaskAtomic(makeTask());
-    const ok = transitionToTerminal('task-1', 'cancelled', { cancelled_at: now() });
+    const ok = await transitionToTerminal('task-1', 'cancelled', { cancelled_at: now() });
     expect(ok).toBe(true);
 
-    const row = getTaskById('task-1');
+    const row = await getTaskById('task-1');
     expect(row!.status).toBe('cancelled');
   });
 
@@ -188,10 +188,10 @@ describe('tasks CRUD', () => {
     await seedAgentAndSession('ag-target', 'sess-target');
 
     await insertTaskAtomic(makeTask());
-    const count = incrementCompletionAttempts('task-1');
+    const count = await incrementCompletionAttempts('task-1');
     expect(count).toBe(1);
 
-    const count2 = incrementCompletionAttempts('task-1');
+    const count2 = await incrementCompletionAttempts('task-1');
     expect(count2).toBe(2);
   });
 
@@ -203,7 +203,7 @@ describe('tasks CRUD', () => {
     // Insert task with no child_session_id and no lease
     await insertTaskAtomic(makeTask());
 
-    const orphans = getOrphanedTasks();
+    const orphans = await getOrphanedTasks();
     expect(orphans.length).toBe(1);
     expect(orphans[0]!.task_id).toBe('task-1');
   });
@@ -214,9 +214,9 @@ describe('tasks CRUD', () => {
     await seedAgentAndSession('ag-target', 'sess-target');
 
     await insertTaskAtomic(makeTask());
-    acquireCompletionLease('task-1', 60);
+    await acquireCompletionLease('task-1', 60);
 
-    const orphans = getOrphanedTasks();
+    const orphans = await getOrphanedTasks();
     expect(orphans.length).toBe(0);
   });
 });

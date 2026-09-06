@@ -301,7 +301,7 @@ describe('F1: e2e threaded happy path', () => {
 
     // Step 3: verify task row is running with all key fields populated
     const taskId = deriveSpawnTaskId('sess-orch', 'k1');
-    const task = getTaskById(taskId);
+    const task = await getTaskById(taskId);
     expect(task).not.toBeNull();
     expect(task!.status).toBe('running');
     expect(task!.surface_mode).toBe('native_thread');
@@ -340,7 +340,7 @@ describe('F1: e2e threaded happy path', () => {
     sessionMap.set(childSessionId, childSession);
 
     await applySpawnProgress({ task_id: taskId, message: 'step 1 done' }, childSession);
-    const afterProgress = getTaskById(taskId);
+    const afterProgress = await getTaskById(taskId);
     expect(afterProgress!.last_progress_at).not.toBeNull();
     expect(afterProgress!.last_progress_message).toBe('step 1 done');
 
@@ -349,7 +349,7 @@ describe('F1: e2e threaded happy path', () => {
     await applySpawnComplete({ task_id: taskId, summary: 'all done' }, childSession);
 
     // Step 8: verify terminal state + parent notification
-    const completedTask = getTaskById(taskId);
+    const completedTask = await getTaskById(taskId);
     expect(completedTask!.status).toBe('completed');
     expect(completedTask!.completed_at).not.toBeNull();
     expect(completedTask!.result_summary).toBe('all done');
@@ -381,7 +381,7 @@ describe('F1: e2e headless happy path', () => {
     await drainImmediate();
 
     const taskId = deriveSpawnTaskId('sess-orch', 'k-headless');
-    const task = getTaskById(taskId);
+    const task = await getTaskById(taskId);
     expect(task).not.toBeNull();
     expect(task!.status).toBe('running');
     expect(task!.surface_mode).toBe('headless');
@@ -421,7 +421,7 @@ describe('F1: e2e headless happy path', () => {
     sessionMap.set('sess-orch', orchSession);
 
     await applySpawnComplete({ task_id: taskId, summary: 'headless done' }, childSession);
-    const completedTask = getTaskById(taskId);
+    const completedTask = await getTaskById(taskId);
     expect(completedTask!.status).toBe('completed');
   }, 10_000);
 });
@@ -558,7 +558,7 @@ describe('F1: e2e cancel during running', () => {
     await drainImmediate();
 
     const taskId = deriveSpawnTaskId('sess-orch', 'k-cancel');
-    const task = getTaskById(taskId);
+    const task = await getTaskById(taskId);
     expect(task!.status).toBe('running');
 
     const childSessionId = task!.child_session_id!;
@@ -583,7 +583,7 @@ describe('F1: e2e cancel during running', () => {
     await applySpawnCancel({ task_id: taskId, reason: 'changed mind' }, orchSession);
 
     // Verify cancelled in DB
-    const cancelledTask = getTaskById(taskId);
+    const cancelledTask = await getTaskById(taskId);
     expect(cancelledTask!.status).toBe('cancelled');
     expect(cancelledTask!.cancelled_at).not.toBeNull();
 
@@ -623,7 +623,7 @@ describe('F1: e2e cancel during running', () => {
     await drainImmediate();
 
     const taskId = deriveSpawnTaskId('sess-orch', 'k-cas');
-    const runningTask = getTaskById(taskId);
+    const runningTask = await getTaskById(taskId);
     const childSessionId = runningTask!.child_session_id!;
 
     const childSession: Session = {
@@ -642,7 +642,7 @@ describe('F1: e2e cancel during running', () => {
 
     // Cancel it
     await applySpawnCancel({ task_id: taskId, reason: 'cancel first' }, orchSession);
-    expect(getTaskById(taskId)!.status).toBe('cancelled');
+    expect((await getTaskById(taskId))!.status).toBe('cancelled');
 
     // Now child tries to complete — CAS should reject (status is already 'cancelled')
     const completionNotifyCountBefore = getWrittenFor('sess-orch').filter((m) => m.includes('Task completed')).length;
@@ -650,7 +650,7 @@ describe('F1: e2e cancel during running', () => {
     await applySpawnComplete({ task_id: taskId, summary: 'too late' }, childSession);
 
     // Status must still be 'cancelled'
-    expect(getTaskById(taskId)!.status).toBe('cancelled');
+    expect((await getTaskById(taskId))!.status).toBe('cancelled');
 
     // No extra 'Task completed' notification sent to parent
     const completionNotifyCountAfter = getWrittenFor('sess-orch').filter((m) => m.includes('Task completed')).length;
@@ -672,7 +672,7 @@ describe('F1: e2e watchdog terminates no-progress task', () => {
     await drainImmediate();
 
     const taskId = deriveSpawnTaskId('sess-orch', 'k-watchdog');
-    let task = getTaskById(taskId);
+    let task = await getTaskById(taskId);
     expect(task!.status).toBe('running');
 
     // Set last_progress_at to 2 hours ago to trigger no-progress timeout
@@ -688,7 +688,7 @@ describe('F1: e2e watchdog terminates no-progress task', () => {
     await _sweepTaskWatchdogForTesting();
 
     // Task should be failed with no_progress_timeout reason (design canonical enum)
-    task = getTaskById(taskId);
+    task = await getTaskById(taskId);
     expect(task!.status).toBe('failed');
     expect(task!.fail_reason).toBe('no_progress_timeout');
 
@@ -741,19 +741,19 @@ describe('F1: e2e orphan recovery', () => {
     });
 
     // Verify the orphan is in 'pending' with no child_session_id
-    const orphan = getTaskById(taskId);
+    const orphan = await getTaskById(taskId);
     expect(orphan!.status).toBe('pending');
     expect(orphan!.child_session_id).toBeNull();
 
     // Run reconciler — it calls setImmediate(completeSpawnSideEffects, taskId, parentAgentGroupId)
-    runReconcilerSweep();
+    await runReconcilerSweep();
 
     // Drain the setImmediate so completeSpawnSideEffects runs
     await drainImmediate();
     await drainImmediate();
 
     // The orphan should now be running with a child session
-    const recovered = getTaskById(taskId);
+    const recovered = await getTaskById(taskId);
     expect(recovered!.status).toBe('running');
     expect(recovered!.child_session_id).not.toBeNull();
   }, 10_000);

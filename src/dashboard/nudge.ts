@@ -51,7 +51,7 @@ export const observatoryNudgeHandler: AuthHandler = async (req, _params, ctx) =>
     return json(400, { error: 'workgroupId, claimSlug and agentGroupId are required' });
   }
 
-  const role = canAssign(ctx.user.id, agentGroupId);
+  const role = await canAssign(ctx.user.id, agentGroupId);
   if (!role.ok) return json(role.reason === 'not_found' ? 404 : 403, { error: role.reason });
 
   const agent = await getDb().get<AgentGroup>(

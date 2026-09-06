@@ -89,7 +89,7 @@ import {
   getWorkgroupOnecliSecretsById,
 } from './db/agent-groups.js';
 import { centralTransaction, evaluateGuardSync, withCentralSync, withRawDb } from './db/central-lease.js';
-import { getDb, getRawDb, hasTable } from './db/connection.js';
+import { getDb, hasTable } from './db/connection.js';
 import {
   getLiveHostInstance,
   getSessionClaim,
@@ -1587,7 +1587,10 @@ async function spawnContainer(
     );
   }
 
-  const [memoryReport] = reconcileWorkgroupMemory(getRawDb(), { workgroupIds: [resolvedWgId] });
+  const [memoryReport] = await withCentralSync(
+    () => withRawDb((db) => reconcileWorkgroupMemory(db, { workgroupIds: [resolvedWgId] })),
+    'workgroup memory reconcile at spawn',
+  );
   if (!memoryReport || memoryReport.state.status === 'migration-required') {
     throw new Error(
       `Workgroup memory migration-required for ${resolvedWgId}; refusing container spawn before operator migration`,
@@ -4175,42 +4178,51 @@ export async function buildMounts(
   const workgroupMembershipStartedAt = Date.now();
   let workgroupMemberIds: string[] | undefined;
   try {
-    if (resolvedWgId) {
-      const memberRows = getRawDb()
-        .prepare(`SELECT id FROM agent_groups WHERE workgroup_id = ?`)
-        .all(resolvedWgId) as Array<{ id: string }>;
-      // W3 fail-closed: if the spawning agent is no longer a member of the
-      // workgroup reconcile settled on, refuse to build a projection that
-      // would silently drop them. The reconcile just updated
-      // agent_groups.workgroup_id for THIS agent to resolvedWgId; if that
-      // write hasn't yet been observed (or if a second reconcile undid it
-      // mid-spawn), the projection would lie.
-      if (!memberRows.some((r) => r.id === agentGroup.id)) {
-        throw new Error(
-          `Workgroup-scoped projection: agent ${agentGroup.id} is not a member of workgroup ${resolvedWgId} at projection time ` +
-            `(refusing to fall through to legacy single-agent filter; this is the W3 fail-closed path).`,
-        );
-      }
-      workgroupMemberIds = memberRows.map((r) => r.id);
-    } else {
-      const centralCheck = getRawDb().prepare(`PRAGMA table_info(agent_groups)`).all() as Array<{ name: string }>;
-      if (centralCheck.some((c) => c.name === 'workgroup_id')) {
-        const agRow = getRawDb().prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ?`).get(agentGroup.id) as
-          | { workgroup_id: string | null }
-          | undefined;
-        if (agRow && agRow.workgroup_id === null) {
-          throw new Error(
-            `Workgroup-scoped projection: invalid workgroup for agent ${agentGroup.id} — workgroup_id is NULL`,
-          );
-        }
-        if (agRow && agRow.workgroup_id) {
-          const memberRows = getRawDb()
-            .prepare(`SELECT id FROM agent_groups WHERE workgroup_id = ?`)
-            .all(agRow.workgroup_id) as Array<{ id: string }>;
-          workgroupMemberIds = memberRows.map((r) => r.id);
-        }
-      }
-    }
+    // One lease block: the membership read and the fail-closed check below
+    // see a single snapshot of agent_groups.
+    workgroupMemberIds = await withCentralSync(
+      () =>
+        withRawDb((db): string[] | undefined => {
+          if (resolvedWgId) {
+            const memberRows = db
+              .prepare(`SELECT id FROM agent_groups WHERE workgroup_id = ?`)
+              .all(resolvedWgId) as Array<{ id: string }>;
+            // W3 fail-closed: if the spawning agent is no longer a member of the
+            // workgroup reconcile settled on, refuse to build a projection that
+            // would silently drop them. The reconcile just updated
+            // agent_groups.workgroup_id for THIS agent to resolvedWgId; if that
+            // write hasn't yet been observed (or if a second reconcile undid it
+            // mid-spawn), the projection would lie.
+            if (!memberRows.some((r) => r.id === agentGroup.id)) {
+              throw new Error(
+                `Workgroup-scoped projection: agent ${agentGroup.id} is not a member of workgroup ${resolvedWgId} at projection time ` +
+                  `(refusing to fall through to legacy single-agent filter; this is the W3 fail-closed path).`,
+              );
+            }
+            return memberRows.map((r) => r.id);
+          } else {
+            const centralCheck = db.prepare(`PRAGMA table_info(agent_groups)`).all() as Array<{ name: string }>;
+            if (centralCheck.some((c) => c.name === 'workgroup_id')) {
+              const agRow = db.prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ?`).get(agentGroup.id) as
+                | { workgroup_id: string | null }
+                | undefined;
+              if (agRow && agRow.workgroup_id === null) {
+                throw new Error(
+                  `Workgroup-scoped projection: invalid workgroup for agent ${agentGroup.id} — workgroup_id is NULL`,
+                );
+              }
+              if (agRow && agRow.workgroup_id) {
+                const memberRows = db
+                  .prepare(`SELECT id FROM agent_groups WHERE workgroup_id = ?`)
+                  .all(agRow.workgroup_id) as Array<{ id: string }>;
+                return memberRows.map((r) => r.id);
+              }
+            }
+          }
+          return undefined;
+        }),
+      'workgroup projection membership',
+    );
   } catch (err) {
     // Re-throw W3 fail-closed (both the NULL-workgroup error and the
     // member-check error share the 'Workgroup-scoped projection' prefix);
@@ -5524,11 +5536,18 @@ async function buildContainerArgs(
     // the /workspace/workgroup mount + archive projection already saw.
     const wgId =
       resolvedWgId ??
-      (
-        getRawDb().prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ?`).get(agentGroup.id) as
-          | { workgroup_id: string | null }
-          | undefined
-      )?.workgroup_id;
+      (await withCentralSync(
+        () =>
+          withRawDb(
+            (db) =>
+              (
+                db.prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ?`).get(agentGroup.id) as
+                  | { workgroup_id: string | null }
+                  | undefined
+              )?.workgroup_id,
+          ),
+        'workgroup id for container env',
+      ));
     if (wgId) {
       args.push('-e', `NANOCLAW_WORKGROUP_ID=${wgId}`);
     }
@@ -5915,11 +5934,17 @@ async function buildContainerArgs(
       let effectiveSecrets = mergedSecrets;
       if (slackSecrets.length > 0) {
         const { isOwnerSafeSlackSession } = await import('./modules/permissions/slack-user-token-gate.js');
-        const ownerSafe = isOwnerSafeSlackSession(
-          getRawDb(),
-          agentGroup.id,
-          slackSafetyMessagingGroupId ?? null,
-          containerConfig.slack_user_token?.also_allowed_in,
+        const ownerSafe = await withCentralSync(
+          () =>
+            withRawDb((db) =>
+              isOwnerSafeSlackSession(
+                db,
+                agentGroup.id,
+                slackSafetyMessagingGroupId ?? null,
+                containerConfig.slack_user_token?.also_allowed_in,
+              ),
+            ),
+          'slack owner-safe check',
         );
         if (!ownerSafe) {
           identity = `${agentIdentifier}-noslack`;
@@ -6381,11 +6406,17 @@ async function buildContainerArgs(
   let slackUserTokenAllowed = false;
   if (containerConfig.slack_user_token?.enabled) {
     const { canUseSlackUserToken } = await import('./modules/permissions/slack-user-token-gate.js');
-    slackUserTokenAllowed = canUseSlackUserToken(
-      getRawDb(),
-      agentGroup.id,
-      slackSafetyMessagingGroupId ?? null,
-      containerConfig.slack_user_token,
+    slackUserTokenAllowed = await withCentralSync(
+      () =>
+        withRawDb((db) =>
+          canUseSlackUserToken(
+            db,
+            agentGroup.id,
+            slackSafetyMessagingGroupId ?? null,
+            containerConfig.slack_user_token,
+          ),
+        ),
+      'slack user-token gate',
     );
   }
   if (slackUserTokenAllowed) {

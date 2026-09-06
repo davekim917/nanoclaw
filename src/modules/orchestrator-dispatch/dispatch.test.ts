@@ -366,7 +366,7 @@ describe('applySpawnTask', () => {
     expect(messages.some((m) => m.includes('idempotency_key_reused_with_different_payload'))).toBe(true);
 
     // Existing task unchanged
-    const existing = getTaskById('task-orig');
+    const existing = await getTaskById('task-orig');
     expect(existing!.task_content).toBe('X');
   });
 
@@ -535,7 +535,7 @@ describe('completeSpawnSideEffects', () => {
 
     await completeSpawnSideEffects(taskId, 'ag-caller');
 
-    const task = getTaskById(taskId);
+    const task = await getTaskById(taskId);
     expect(task!.status).toBe('failed');
     expect(task!.fail_reason).toBe('adapter_unavailable');
     // CRITICAL: dispatch_completion_attempts === 0 (no retry budget consumed)
@@ -567,7 +567,7 @@ describe('completeSpawnSideEffects', () => {
       await completeSpawnSideEffects(taskId, 'ag-caller');
     }
 
-    const task = getTaskById(taskId);
+    const task = await getTaskById(taskId);
     expect(task!.status).toBe('failed');
     expect(task!.fail_reason).toBe('completion_exhausted');
   });
@@ -591,7 +591,7 @@ describe('completeSpawnSideEffects', () => {
 
     // Should have exited immediately — acquireCompletionLease requires status='pending'
     // so it returns null. No writeSessionMessage calls.
-    const task = getTaskById(taskId);
+    const task = await getTaskById(taskId);
     expect(task!.status).toBe('cancelled'); // unchanged
   });
 
@@ -617,7 +617,7 @@ describe('completeSpawnSideEffects', () => {
 
     await completeSpawnSideEffects(taskId, 'ag-caller');
 
-    const task = getTaskById(taskId);
+    const task = await getTaskById(taskId);
     // child_platform_thread_id should be threadId ('parent-ts-123'), NOT messageId ('reply-ts-456')
     if (task && task.child_platform_thread_id !== null) {
       expect(task.child_platform_thread_id).toBe('parent-ts-123');
@@ -646,7 +646,7 @@ describe('completeSpawnSideEffects', () => {
 
     vi.mocked(writeSessionMessage).mockImplementation(async () => {
       // By the time writeSessionMessage is called, child_session_id must be set
-      const task = getTaskById(taskId);
+      const task = await getTaskById(taskId);
       if (task && task.status === 'running') {
         order.push('writeSessionMessage-after-tasks-update');
       }

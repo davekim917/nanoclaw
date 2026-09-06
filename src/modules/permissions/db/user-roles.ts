@@ -1,20 +1,21 @@
 import type { UserRole, UserRoleKind } from '../../../types.js';
-import { getDb, getRawDb } from '../../../db/connection.js';
+import { withRawDb } from '../../../db/central-lease.js';
+import { getDb } from '../../../db/connection.js';
 import { equivalentSlackUserIds } from '../../../slack-user-identity.js';
 
 /**
- * ⚠️  Four exports below stay SYNCHRONOUS through seam 3 (plan §4.5, I-1):
- * `isOwner`, `isGlobalAdmin`, `isAdminOfAgentGroup` and their composite
- * `hasAdminPrivilege`. They are read from inside guard `decide` bodies —
- * `modules/permissions/guard.ts` (channels.register),
+ * ⚠️  Four exports below are SYNCHRONOUS and run only under the central lease
+ * (plan §4.5, I-1): `isOwner`, `isGlobalAdmin`, `isAdminOfAgentGroup` and
+ * their composite `hasAdminPrivilege`. They are read from inside guard
+ * `decide` bodies — `modules/permissions/guard.ts` (channels.register),
  * `dashboard/thread-close-guard.ts` (threads.close),
  * `dashboard/observatory-assign-guard.ts` (observatory.assign) — and a guard
- * never awaits, so an async form would be a promise used as a boolean at three
- * authorization sites. This is §4.2's "leaf exports reachable from a raw
- * transaction closure stay synchronous until PR 6" rule applied to the other
- * synchronous block the plan names: they are NOT `*Sync` twins (there is one
- * form of each, not two), they are simply not yet converted. PR 6 moves them
- * inside `withCentralSync`/`withRawDb` together with `evaluateGuardSync`.
+ * never awaits, so they execute their statement through `withRawDb`, which
+ * only works inside the caller's `withCentralSync` block. A caller that is
+ * not already inside one (an HTTP handler, an approval click) takes the
+ * lease itself: `await withCentralSync(() => isOwner(id), '…')`. Calling one
+ * outside a block throws `RawAccessOutsideSyncBlockError` — there is no
+ * silent path onto the shared connection.
  *
  * Everything else in this file is on the async driver.
  */
@@ -81,25 +82,28 @@ export async function getUserRoles(userId: string): Promise<UserRole[]> {
   return getDb().all<UserRole>('SELECT * FROM user_roles WHERE user_id = ?', userId);
 }
 
-/** Synchronous by design — see the file header. */
+/** Synchronous, lease-only — see the file header. */
 export function isOwner(userId: string): boolean {
-  return hasEquivalentRole(userId, (candidate) => {
-    return getRawDb().prepare(GLOBAL_ROLE_SQL).get(candidate, 'owner') !== undefined;
-  });
+  return withRawDb((db) =>
+    hasEquivalentRole(userId, (candidate) => db.prepare(GLOBAL_ROLE_SQL).get(candidate, 'owner') !== undefined),
+  );
 }
 
-/** Synchronous by design — see the file header. */
+/** Synchronous, lease-only — see the file header. */
 export function isGlobalAdmin(userId: string): boolean {
-  return hasEquivalentRole(userId, (candidate) => {
-    return getRawDb().prepare(GLOBAL_ROLE_SQL).get(candidate, 'admin') !== undefined;
-  });
+  return withRawDb((db) =>
+    hasEquivalentRole(userId, (candidate) => db.prepare(GLOBAL_ROLE_SQL).get(candidate, 'admin') !== undefined),
+  );
 }
 
-/** Synchronous by design — see the file header. */
+/** Synchronous, lease-only — see the file header. */
 export function isAdminOfAgentGroup(userId: string, agentGroupId: string): boolean {
-  return hasEquivalentRole(userId, (candidate) => {
-    return getRawDb().prepare(SCOPED_ROLE_SQL).get(candidate, 'admin', agentGroupId) !== undefined;
-  });
+  return withRawDb((db) =>
+    hasEquivalentRole(
+      userId,
+      (candidate) => db.prepare(SCOPED_ROLE_SQL).get(candidate, 'admin', agentGroupId) !== undefined,
+    ),
+  );
 }
 
 /**

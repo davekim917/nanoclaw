@@ -329,6 +329,19 @@ export interface RawDb {
 }
 
 /**
+ * The connection as a leaf that takes it AS A PARAMETER may require: prepared
+ * statements and nothing else. Satisfied by the `withRawDb` facade (the host,
+ * under the lease) and by the raw better-sqlite3 handle where that handle is
+ * legitimately bare — the boot reconcilers in `main.ts`, and the storage
+ * maintenance worker thread on its own connection. A leaf typed against this
+ * cannot reach `transaction`/`exec`/`pragma`, so it cannot open a transaction
+ * the lease does not know about.
+ */
+export interface RawStatements {
+  prepare(source: string): RawStatement;
+}
+
+/**
  * A `withCentralSync` block may not hand back anything that still reaches the
  * connection: the handle, a statement (real or block-scoped), an open
  * `iterate()` cursor, a better-sqlite3 transaction function, or the facade

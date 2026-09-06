@@ -215,7 +215,7 @@ export async function sendThreadMessage(
   if (!ctx.scopes.no_filter && !ctx.scopes.allowed_group_ids.includes(agentGroupId)) {
     return { status: 404, body: { error: 'not_found' } };
   }
-  if (!canSteer(ctx.user.id, agentGroupId).ok) return { status: 404, body: { error: 'not_found' } };
+  if (!(await canSteer(ctx.user.id, agentGroupId)).ok) return { status: 404, body: { error: 'not_found' } };
 
   const onThread = await agentsOnThread(threadId);
   const target = onThread.find((a) => a.agent_group_id === agentGroupId) ?? null;

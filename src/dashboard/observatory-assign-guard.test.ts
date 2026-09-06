@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { withCentralSync } from '../db/central-lease.js';
 import { closeDb, initTestDb, getRawDb } from '../db/connection.js';
 import { runMigrations } from '../db/migrations/index.js';
 import { ALLOW, guard } from '../guard/index.js';
@@ -14,13 +15,21 @@ const OWNER = 'u-owner';
 const ADMIN = 'u-admin';
 const NOBODY = 'u-nobody';
 
+// The guard's role reads are lease-only (seam 3 §4.5 I-1): the production
+// caller consults it inside `withCentralSync`, so the test does the same.
 function decide(userId: string, payload: Partial<ObservatoryAssignPayload>, actorKind: 'human' | 'agent' = 'human') {
-  return guard(observatoryAssign, {
-    actor:
-      actorKind === 'human' ? { kind: 'human', userId } : { kind: 'agent', agentGroupId: 'ag-wired', sessionId: 's-1' },
-    resource: { itemId: 'board:EXAMPLE-APP#817', workgroupId: 'wg-example' },
-    payload: payload as ObservatoryAssignPayload,
-  });
+  return withCentralSync(
+    () =>
+      guard(observatoryAssign, {
+        actor:
+          actorKind === 'human'
+            ? { kind: 'human', userId }
+            : { kind: 'agent', agentGroupId: 'ag-wired', sessionId: 's-1' },
+        resource: { itemId: 'board:EXAMPLE-APP#817', workgroupId: 'wg-example' },
+        payload: payload as ObservatoryAssignPayload,
+      }),
+    'test decide',
+  );
 }
 
 const wired = { agentGroupId: 'ag-wired', channelKey: 'slack:CEXAMPLE001', wiredToItemChannel: true };
@@ -46,29 +55,29 @@ beforeEach(async () => {
 afterEach(() => closeDb());
 
 describe('observatory.assign guard', () => {
-  it('allows an admin of an agent wired to the item’s channel', () => {
-    expect(decide(OWNER, wired).effect).toBe('allow');
-    expect(decide(ADMIN, wired).effect).toBe('allow');
+  it('allows an admin of an agent wired to the item’s channel', async () => {
+    expect((await decide(OWNER, wired)).effect).toBe('allow');
+    expect((await decide(ADMIN, wired)).effect).toBe('allow');
   });
 
-  it('denies a caller with no admin privilege over the target group', () => {
-    const d = decide(NOBODY, wired);
+  it('denies a caller with no admin privilege over the target group', async () => {
+    const d = await decide(NOBODY, wired);
     expect(d.effect).toBe('deny');
     expect(d.reason).toMatch(/not an admin/);
   });
 
-  it('denies an agent wired nowhere near the item’s room, however privileged the caller', () => {
-    const d = decide(OWNER, { ...wired, wiredToItemChannel: false });
+  it('denies an agent wired nowhere near the item’s room, however privileged the caller', async () => {
+    const d = await decide(OWNER, { ...wired, wiredToItemChannel: false });
     expect(d.effect).toBe('deny');
     expect(d.reason).toContain('slack:CEXAMPLE001');
   });
 
-  it('denies a non-human actor — the host never mints an assignment nobody asked for', () => {
-    expect(decide(OWNER, wired, 'agent').effect).toBe('deny');
+  it('denies a non-human actor — the host never mints an assignment nobody asked for', async () => {
+    expect((await decide(OWNER, wired, 'agent')).effect).toBe('deny');
   });
 
-  it('denies a payload with no target at all rather than falling open', () => {
-    expect(decide(OWNER, { channelKey: 'slack:CEXAMPLE001', wiredToItemChannel: true }).effect).toBe('deny');
+  it('denies a payload with no target at all rather than falling open', async () => {
+    expect((await decide(OWNER, { channelKey: 'slack:CEXAMPLE001', wiredToItemChannel: true })).effect).toBe('deny');
   });
 
   /**
@@ -91,12 +100,12 @@ describe('observatory.assign guard', () => {
     expect(d.effect).toBe('deny');
   });
 
-  it('never HOLDs — assignment resolves in front of the operator, never through an approval card', () => {
+  it('never HOLDs — assignment resolves in front of the operator, never through an approval card', async () => {
     expect(observatoryAssign.grantActionName).toBeUndefined();
     for (const d of [
-      decide(OWNER, wired),
-      decide(NOBODY, wired),
-      decide(OWNER, { ...wired, wiredToItemChannel: false }),
+      await decide(OWNER, wired),
+      await decide(NOBODY, wired),
+      await decide(OWNER, { ...wired, wiredToItemChannel: false }),
     ]) {
       expect(d.effect).not.toBe('hold');
     }

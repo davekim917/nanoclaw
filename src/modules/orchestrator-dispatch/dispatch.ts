@@ -273,7 +273,7 @@ export async function completeSpawnSideEffects(taskId: string, childAgentGroupId
 
 async function _runCompletionSideEffects(taskId: string, childAgentGroupId: string): Promise<void> {
   // Acquire durable lease — returns null if another worker holds it
-  const leaseRow = acquireCompletionLease(taskId);
+  const leaseRow = await acquireCompletionLease(taskId);
   if (!leaseRow) {
     log.debug('completeSpawnSideEffects: lease held by another worker, skipping', { taskId });
     return;
@@ -288,7 +288,7 @@ async function _runCompletionSideEffects(taskId: string, childAgentGroupId: stri
   };
 
   try {
-    const task = getTaskById(taskId);
+    const task = await getTaskById(taskId);
     if (!task || task.status !== 'pending') {
       return;
     }
@@ -300,9 +300,9 @@ async function _runCompletionSideEffects(taskId: string, childAgentGroupId: stri
     }
   } catch (err) {
     log.warn('completeSpawnSideEffects: error during completion', { taskId, err });
-    const attempts = incrementCompletionAttempts(taskId);
+    const attempts = await incrementCompletionAttempts(taskId);
     if (attempts >= 5) {
-      transitionToTerminal(taskId, 'failed', {
+      await transitionToTerminal(taskId, 'failed', {
         fail_reason: 'completion_exhausted',
         failed_at: new Date().toISOString(),
       });
@@ -320,7 +320,7 @@ async function _runThreadedPath(task: Task, childAgentGroupId: string): Promise<
   // (adapter_unavailable does NOT consume retry budget — cycle-3 fix / Codex #43)
   const mg = task.parent_messaging_group_id ? await getMessagingGroup(task.parent_messaging_group_id) : undefined;
   if (!mg) {
-    transitionToTerminal(taskId, 'failed', {
+    await transitionToTerminal(taskId, 'failed', {
       fail_reason: 'adapter_unavailable',
       failed_at: new Date().toISOString(),
     });
@@ -329,7 +329,7 @@ async function _runThreadedPath(task: Task, childAgentGroupId: string): Promise<
 
   const adapter = getChannelAdapter(mg.channel_type);
   if (!adapter || typeof adapter.createThread !== 'function') {
-    transitionToTerminal(taskId, 'failed', {
+    await transitionToTerminal(taskId, 'failed', {
       fail_reason: 'adapter_unavailable',
       failed_at: new Date().toISOString(),
     });
@@ -338,21 +338,21 @@ async function _runThreadedPath(task: Task, childAgentGroupId: string): Promise<
 
   // Step 1: postParent
   {
-    const current = getTaskById(taskId);
+    const current = await getTaskById(taskId);
     if (!current || current.status !== 'pending') return;
 
     if (current.parent_platform_message_id === null) {
       const truncContent = task.task_content.slice(0, 100);
       // Per-adapter signature: postParent(platformId, text) — no channelType prefix
       const { messageId } = await adapter.postParent!(mg.platform_id, `Spawned task: ${truncContent}`);
-      const updated = updateArtifactColumn(taskId, 'parent_platform_message_id', messageId);
+      const updated = await updateArtifactColumn(taskId, 'parent_platform_message_id', messageId);
       if (!updated) return; // status-CAS rejected — another path won
     }
   }
 
   // Step 2: createThread
   {
-    const current = getTaskById(taskId);
+    const current = await getTaskById(taskId);
     if (!current || current.status !== 'pending') return;
 
     if (current.child_platform_thread_id === null) {
@@ -366,17 +366,17 @@ async function _runThreadedPath(task: Task, childAgentGroupId: string): Promise<
       );
       // Slack: threadId IS parent_platform_message_id (cycle-3 M25)
       const childMgId = task.parent_messaging_group_id;
-      const updated = updateArtifactColumn(taskId, 'child_platform_thread_id', threadId);
+      const updated = await updateArtifactColumn(taskId, 'child_platform_thread_id', threadId);
       if (!updated) return;
       if (childMgId) {
-        updateArtifactColumn(taskId, 'child_messaging_group_id', childMgId);
+        await updateArtifactColumn(taskId, 'child_messaging_group_id', childMgId);
       }
     }
   }
 
   // Step 3: openSession (cycle-3 M21 write order)
   {
-    const current = getTaskById(taskId);
+    const current = await getTaskById(taskId);
     if (!current || current.status !== 'pending') return;
 
     if (current.child_session_id === null) {
@@ -455,7 +455,7 @@ async function _runThreadedPath(task: Task, childAgentGroupId: string): Promise<
 async function _runHeadlessPath(task: Task, childAgentGroupId: string): Promise<void> {
   const taskId = task.task_id;
 
-  const current = getTaskById(taskId);
+  const current = await getTaskById(taskId);
   if (!current || current.status !== 'pending') return;
 
   if (current.child_session_id === null) {

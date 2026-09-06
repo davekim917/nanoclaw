@@ -16,6 +16,7 @@
  * The response handler is registered via core's `registerResponseHandler`;
  * core iterates handlers and the first one to return `true` claims the response.
  */
+import { withCentralSync } from '../../db/central-lease.js';
 import { requestWake } from '../../request-wake.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { deletePendingApproval, getPendingApproval, getSession } from '../../db/sessions.js';
@@ -219,8 +220,8 @@ async function isAuthorizedApprovalClick(approval: PendingApproval, payload: Res
     approval.agent_group_id ?? (approval.session_id ? (await getSession(approval.session_id))?.agent_group_id : null);
 
   if (!agentGroupId) {
-    return isOwner(userId) || isGlobalAdmin(userId);
+    return withCentralSync(() => isOwner(userId) || isGlobalAdmin(userId), 'approval click authority');
   }
 
-  return hasAdminPrivilege(userId, agentGroupId);
+  return withCentralSync(() => hasAdminPrivilege(userId, agentGroupId), 'approval click authority');
 }

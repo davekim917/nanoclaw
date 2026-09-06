@@ -512,7 +512,7 @@ export async function main(): Promise<void> {
   // process makes mounts the same tree, not the live checkout mid-`git pull`.
   activateAgentRunnerSource();
 
-  resetProcessingChannelIngress();
+  await resetProcessingChannelIngress();
 
   // Workgroup FS reconciliation — runs after migrations to drain the
   // _migration036_report temp table. On FS failure, exit; restart is the recovery
@@ -657,7 +657,7 @@ export async function main(): Promise<void> {
   // 1b. Orchestrator-dispatch reconciler startup scan — must run after migrations
   // so the tasks table exists. Recovers any tasks left in 'pending' with
   // admitted_at set but no child_session_id (host crashed mid-completion).
-  runDispatchReconcilerOnStartup();
+  await runDispatchReconcilerOnStartup();
 
   // 1c. Backfill container_configs from legacy container.json files.
   // Idempotent — skips groups that already have a config row.
@@ -671,7 +671,7 @@ export async function main(): Promise<void> {
   // 2-bis. Resolve any session archival a previous stop interrupted, before
   // the sweep can hand out work to a row still parked in 'archiving'.
   try {
-    finishInterruptedSessionArchivals();
+    await finishInterruptedSessionArchivals();
   } catch (err) {
     log.error('Interrupted session archival recovery failed', { err });
   }

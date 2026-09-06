@@ -133,9 +133,9 @@ function safeParseContent(raw: string): { text?: string; sender?: string; sender
   }
 }
 
-function completeStoredDeferredInbound(raw: string): void {
+async function completeStoredDeferredInbound(raw: string): Promise<void> {
   try {
-    completeDeferredInbound(JSON.parse(raw) as InboundEvent);
+    await completeDeferredInbound(JSON.parse(raw) as InboundEvent);
   } catch {
     // Malformed legacy approval rows have no recoverable receipt key.
   }
@@ -363,7 +363,9 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
       : `${payload.channelType}:${payload.userId}`
     : null;
   const isAuthorized =
-    clickerId !== null && (clickerId === row.approver_user_id || hasAdminPrivilege(clickerId, row.agent_group_id));
+    clickerId !== null &&
+    (clickerId === row.approver_user_id ||
+      (await withCentralSync(() => hasAdminPrivilege(clickerId, row.agent_group_id), 'sender approval click')));
   if (!isAuthorized) {
     log.warn('Unknown-sender approval click rejected — unauthorized clicker', {
       approvalId: row.id,
@@ -427,7 +429,7 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
     // Void the card the same way a deny does: the row (and with it the
     // retained message body) is already dropped by the claim above; close out
     // the deferred inbound so it does not sit unresolved.
-    completeStoredDeferredInbound(row.original_message);
+    await completeStoredDeferredInbound(row.original_message);
     return true;
   }
 
@@ -486,7 +488,7 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
     agentGroupId: row.agent_group_id,
     approverId,
   });
-  completeStoredDeferredInbound(row.original_message);
+  await completeStoredDeferredInbound(row.original_message);
   return true;
 }
 
@@ -560,7 +562,7 @@ async function wireApprovedChannel(
       messagingGroupId: row.messaging_group_id,
       err,
     });
-    completeDeferredInbound(event);
+    await completeDeferredInbound(event);
     return false;
   }
 
@@ -676,7 +678,7 @@ async function wireAndAdmit(
  *   reject          — set denied_at, delete pending row
  */
 async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<boolean> {
-  const row = getPendingChannelApproval(payload.questionId);
+  const row = await withCentralSync(() => getPendingChannelApproval(payload.questionId), 'pending approval read');
   if (!row) return false;
 
   // Origin conversation's adapter instance — threaded into ensureUserDm below
@@ -719,7 +721,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
     // NOT claim — they leave the card live for a second click by design.
     if (!(await deletePendingChannelApproval(row.messaging_group_id))) return true;
     await setMessagingGroupDeniedAt(row.messaging_group_id, new Date().toISOString());
-    completeStoredDeferredInbound(row.original_message);
+    await completeStoredDeferredInbound(row.original_message);
     log.info('Channel registration denied', {
       messagingGroupId: row.messaging_group_id,
       approverId,
@@ -742,7 +744,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
     if (!adapter) return true;
 
     const agentGroups = await getAllAgentGroups();
-    const options = buildAgentSelectionOptions(agentGroups, approverId);
+    const options = await buildAgentSelectionOptions(agentGroups, approverId);
     const title = '📋 Choose an agent';
     const question = `Which agent should handle this channel? ${AGENT_ACCESS_SCOPE_WARNING}`;
     await updatePendingChannelApprovalCard(row.messaging_group_id, title, question, JSON.stringify(options));
@@ -834,10 +836,10 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
         targetAgentGroupId,
       });
       await deletePendingChannelApproval(row.messaging_group_id);
-      completeStoredDeferredInbound(row.original_message);
+      await completeStoredDeferredInbound(row.original_message);
       return true;
     }
-    if (!hasAdminPrivilege(approverId, targetAgentGroupId)) {
+    if (!(await withCentralSync(() => hasAdminPrivilege(approverId, targetAgentGroupId), 'channel approval target'))) {
       log.warn('Channel registration: target agent group rejected for unauthorized approver', {
         messagingGroupId: row.messaging_group_id,
         targetAgentGroupId,
@@ -893,7 +895,7 @@ registerMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
     return true;
   }
 
-  const row = getPendingChannelApproval(pending.channelMgId);
+  const row = await withCentralSync(() => getPendingChannelApproval(pending.channelMgId), 'pending approval read');
   if (!row) return true;
 
   // Origin instance for the follow-up notifications below, same reasoning as

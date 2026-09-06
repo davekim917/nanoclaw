@@ -802,7 +802,7 @@ describe('storage-manager session archival lifecycle', () => {
     expect(entry!.rescue_path.endsWith('.tar.zst')).toBe(true);
   });
 
-  it('finishes an archival interrupted after publish, exactly once', () => {
+  it('finishes an archival interrupted after publish, exactly once', async () => {
     const dir = seedOne();
     const db = centralDbMock.current!.db;
     // Reproduce the crash window: archive published and journalled, row still
@@ -822,15 +822,15 @@ describe('storage-manager session archival lifecycle', () => {
     );
     db.prepare("UPDATE sessions SET status = 'archiving' WHERE id = 'sess-old'").run();
 
-    expect(finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ released: 0, finished: 1 });
+    expect(await finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ released: 0, finished: 1 });
     expect(sessionStatus(db, 'sess-old')).toBe('closed');
     expect(fs.existsSync(dir)).toBe(false);
 
     // Idempotent: a second startup finds nothing left to do.
-    expect(finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ released: 0, finished: 0 });
+    expect(await finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ released: 0, finished: 0 });
   });
 
-  it('returns an archiving row with an intact dir to active and clears the temp archive', () => {
+  it('returns an archiving row with an intact dir to active and clears the temp archive', async () => {
     const dir = seedOne();
     const db = centralDbMock.current!.db;
     fs.mkdirSync(rescuesDir, { recursive: true });
@@ -838,18 +838,18 @@ describe('storage-manager session archival lifecycle', () => {
     fs.writeFileSync(tempPath, 'half-written');
     db.prepare("UPDATE sessions SET status = 'archiving' WHERE id = 'sess-old'").run();
 
-    expect(finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ released: 1, finished: 0 });
+    expect(await finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ released: 1, finished: 0 });
     expect(sessionStatus(db, 'sess-old')).toBe('active');
     expect(fs.existsSync(dir)).toBe(true);
     expect(fs.existsSync(tempPath)).toBe(false);
   });
 
-  it('never removes a closed session dir the journal does not vouch for', () => {
+  it('never removes a closed session dir the journal does not vouch for', async () => {
     const dir = seedOne();
     const db = centralDbMock.current!.db;
     db.prepare("UPDATE sessions SET status = 'closed' WHERE id = 'sess-old'").run();
 
-    expect(finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ released: 0, finished: 0 });
+    expect(await finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ released: 0, finished: 0 });
     expect(fs.existsSync(dir)).toBe(true);
   });
 
@@ -882,7 +882,7 @@ describe('storage-manager session archival lifecycle', () => {
     expect(sessionStatus(db, 'sess-old')).toBe('active');
   });
 
-  it('does not treat an unlistable archive as published', () => {
+  it('does not treat an unlistable archive as published', async () => {
     const dir = seedOne();
     const db = centralDbMock.current!.db;
     fs.mkdirSync(rescuesDir, { recursive: true });
@@ -905,12 +905,12 @@ describe('storage-manager session archival lifecycle', () => {
       return tarAwareExecFileSync(cmd, cmdArgs);
     });
 
-    expect(finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ released: 1, finished: 0 });
+    expect(await finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ released: 1, finished: 0 });
     expect(sessionStatus(db, 'sess-old')).toBe('active');
     expect(fs.existsSync(dir)).toBe(true);
   });
 
-  it('re-archives an orphan closed dir through the ordinary walk instead of a journal-driven delete', () => {
+  it('re-archives an orphan closed dir through the ordinary walk instead of a journal-driven delete', async () => {
     // A crash between the closing CAS and the rm leaves this shape. There is
     // no journal-gated deletion pass any more; the normal reclaim path is the
     // recovery, which means a stale journal line can never authorize a delete.
@@ -932,7 +932,7 @@ describe('storage-manager session archival lifecycle', () => {
     db.prepare("UPDATE sessions SET status = 'closed' WHERE id = 'sess-old'").run();
 
     // Startup does nothing to it…
-    expect(finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ finished: 0, lost: 0, failed: 0 });
+    expect(await finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ finished: 0, lost: 0, failed: 0 });
     expect(fs.existsSync(dir)).toBe(true);
 
     // …and the next maintenance tick reclaims it as an ordinary closed dir.
@@ -958,7 +958,7 @@ describe('storage-manager session archival lifecycle', () => {
     expect(fs.existsSync(contextFile)).toBe(false);
   });
 
-  it('closes an archiving row whose triple a newer session already claimed', () => {
+  it('closes an archiving row whose triple a newer session already claimed', async () => {
     const dir = seedOne();
     const db = installCentralDb(
       [
@@ -968,13 +968,13 @@ describe('storage-manager session archival lifecycle', () => {
       { activeTripleIndex: true },
     );
 
-    expect(finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ released: 1, failed: 0 });
+    expect(await finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ released: 1, failed: 0 });
     expect(sessionStatus(db, 'sess-old')).toBe('closed');
     expect(sessionStatus(db, 'sess-new')).toBe('active');
     expect(fs.existsSync(dir)).toBe(true);
   });
 
-  it('leaves an archiving row alone when the write fails for any other reason', () => {
+  it('leaves an archiving row alone when the write fails for any other reason', async () => {
     const dir = seedOne();
     // A read-only central DB fails the UPDATE with SQLITE_READONLY — not a
     // constraint, so it must NOT be laundered into a silent close.
@@ -986,18 +986,18 @@ describe('storage-manager session archival lifecycle', () => {
     closeCentralDb();
     centralDbMock.current = { db: new Database(dbPath, { readonly: true }) };
 
-    expect(finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ failed: 1, released: 0, lost: 0 });
+    expect(await finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ failed: 1, released: 0, lost: 0 });
     expect(sessionStatus(centralDbMock.current!.db, 'sess-old')).toBe('archiving');
     expect(fs.existsSync(dir)).toBe(true);
   });
 
-  it('reports a lost session rather than counting it as finished', () => {
+  it('reports a lost session rather than counting it as finished', async () => {
     seedOne();
     const db = centralDbMock.current!.db;
     db.prepare("UPDATE sessions SET status = 'archiving' WHERE id = 'sess-old'").run();
     fs.rmSync(path.join(sessionsRoot, 'ag-1', 'sess-old'), { recursive: true, force: true });
 
-    expect(finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ lost: 1, finished: 0, released: 0 });
+    expect(await finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ lost: 1, finished: 0, released: 0 });
     expect(sessionStatus(db, 'sess-old')).toBe('closed');
     expect(vi.mocked(log.error).mock.calls.some((c) => String(c[0]).includes('lost with no readable rescue'))).toBe(
       true,

@@ -176,7 +176,7 @@ describe('applySpawnCancel', () => {
 
     await applySpawnCancel({ task_id: 'task-1' }, makeOtherOrchestratorSession());
 
-    const task = getTaskById('task-1');
+    const task = await getTaskById('task-1');
     expect(task!.status).toBe('running'); // unchanged
 
     const { writeSessionMessage } = await import('../../session-manager.js');
@@ -196,7 +196,7 @@ describe('applySpawnCancel', () => {
 
     await applySpawnCancel({ task_id: 'task-pend', reason: 'user' }, makeParentSession());
 
-    const task = getTaskById('task-pend');
+    const task = await getTaskById('task-pend');
     expect(task!.status).toBe('cancelled');
 
     const { writeSessionMessage } = await import('../../session-manager.js');
@@ -227,7 +227,7 @@ describe('applySpawnCancel', () => {
 
     await applySpawnCancel({ task_id: 'task-1', reason: 'user' }, makeParentSession());
 
-    const task = getTaskById('task-1');
+    const task = await getTaskById('task-1');
     expect(task!.status).toBe('cancelled');
 
     // Check child envelope was written

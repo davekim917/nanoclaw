@@ -93,12 +93,15 @@ export { ASSIGN_DEDUPE_MS };
  * a stranger to see absence, while a member of the group is someone the surface
  * may honestly tell "not you".
  */
-export function canAssign(userId: string, agentGroupId: string): { ok: boolean; reason?: string } {
-  if (isOwner(userId) || isGlobalAdmin(userId) || isAdminOfAgentGroup(userId, agentGroupId)) {
-    return { ok: true };
-  }
-  if (isMember(userId, agentGroupId)) return { ok: false, reason: 'member_role_cannot_assign' };
-  return { ok: false, reason: 'not_found' };
+export function canAssign(userId: string, agentGroupId: string): Promise<{ ok: boolean; reason?: string }> {
+  // The role predicates are lease-only (§4.5 I-1); one block for the whole decision.
+  return withCentralSync((): { ok: boolean; reason?: string } => {
+    if (isOwner(userId) || isGlobalAdmin(userId) || isAdminOfAgentGroup(userId, agentGroupId)) {
+      return { ok: true };
+    }
+    if (isMember(userId, agentGroupId)) return { ok: false, reason: 'member_role_cannot_assign' };
+    return { ok: false, reason: 'not_found' };
+  }, 'canAssign');
 }
 
 /**
@@ -158,7 +161,7 @@ export async function assignAttentionItem(
   // The stamped id is what `selectScopedAttentionItems` matches on, and the
   // intersection with the caller's scope happens inside it — an unknown item
   // and an out-of-scope one both come back as an empty list.
-  const [item] = selectScopedAttentionItems(
+  const [item] = await selectScopedAttentionItems(
     ctx,
     {
       workgroupId: body.workgroupId ?? null,

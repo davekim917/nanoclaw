@@ -79,19 +79,19 @@ afterEach(async () => {
 // ── Gate ────────────────────────────────────────────────────────────────────
 describe('canManageScheduled', () => {
   it('test_gate_allows_owner', async () => {
-    expect(canManageScheduled(OWNER)).toBe(true);
+    expect(await canManageScheduled(OWNER)).toBe(true);
   });
   it('allows global admin', async () => {
-    expect(canManageScheduled(GLOBAL_ADMIN)).toBe(true);
+    expect(await canManageScheduled(GLOBAL_ADMIN)).toBe(true);
   });
   it('test_gate_rejects_member', async () => {
-    expect(canManageScheduled(MEMBER)).toBe(false);
+    expect(await canManageScheduled(MEMBER)).toBe(false);
   });
   it('rejects scoped admin (mutation tier is global-only, D7)', async () => {
-    expect(canManageScheduled(SCOPED_ADMIN)).toBe(false);
+    expect(await canManageScheduled(SCOPED_ADMIN)).toBe(false);
   });
   it('rejects unknown user', async () => {
-    expect(canManageScheduled(UNKNOWN)).toBe(false);
+    expect(await canManageScheduled(UNKNOWN)).toBe(false);
   });
 });
 

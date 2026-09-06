@@ -32,6 +32,7 @@
  * cycles. notify message says so.
  */
 
+import { withCentralSync } from '../../db/central-lease.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
 import { deriveCallerId } from '../../caller-identity.js';
@@ -49,8 +50,11 @@ import type { Session } from '../../types.js';
 import { notifyAgent } from '../approvals/primitive.js';
 import { isAdminOfAgentGroup, isGlobalAdmin, isOwner } from '../permissions/db/user-roles.js';
 
-function hasMutateAuthority(userId: string, agentGroupId: string): boolean {
-  return isOwner(userId) || isGlobalAdmin(userId) || isAdminOfAgentGroup(userId, agentGroupId);
+function hasMutateAuthority(userId: string, agentGroupId: string): Promise<boolean> {
+  return withCentralSync(
+    () => isOwner(userId) || isGlobalAdmin(userId) || isAdminOfAgentGroup(userId, agentGroupId),
+    'channel-config authority',
+  );
 }
 
 /**
@@ -140,7 +144,7 @@ async function handleSetChannelModel(content: Record<string, unknown>, session: 
     await notifyAgent(session, 'set_channel_model failed: agent group not found.');
     return;
   }
-  if (!hasMutateAuthority(callerId, agent.id)) {
+  if (!(await hasMutateAuthority(callerId, agent.id))) {
     await notifyAgent(session, `set_channel_model denied: ${callerId} is not an owner / admin of ${agent.name}.`);
     return;
   }
@@ -214,7 +218,7 @@ async function handleSetChannelEffort(content: Record<string, unknown>, session:
     await notifyAgent(session, 'set_channel_effort failed: agent group not found.');
     return;
   }
-  if (!hasMutateAuthority(callerId, agent.id)) {
+  if (!(await hasMutateAuthority(callerId, agent.id))) {
     await notifyAgent(session, `set_channel_effort denied: ${callerId} is not an owner / admin of ${agent.name}.`);
     return;
   }

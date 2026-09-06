@@ -15,8 +15,9 @@ import {
   isTaskThread,
   TASKS_SYSTEM_THREAD_ID,
 } from './db/sessions.js';
+import { withCentralSync, withRawDb } from './db/central-lease.js';
 import { getAgentGroup } from './db/agent-groups.js';
-import { getRawDb, hasTableRaw } from './db/connection.js';
+import { getDb, hasTable } from './db/connection.js';
 import {
   clearDeliveryAttempt,
   getDeliveryAttempt,
@@ -61,10 +62,10 @@ import { isChannelVariant, type PendingApproval, type Session } from './types.js
  * for every chat session.
  */
 const spawnChildSessionCache = new Map<string, boolean>();
-function isSpawnChildSession(sessionId: string): boolean {
+async function isSpawnChildSession(sessionId: string): Promise<boolean> {
   const cached = spawnChildSessionCache.get(sessionId);
   if (cached !== undefined) return cached;
-  const isChild = getTaskByChildSession(sessionId) !== null;
+  const isChild = (await getTaskByChildSession(sessionId)) !== null;
   spawnChildSessionCache.set(sessionId, isChild);
   return isChild;
 }
@@ -651,11 +652,18 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
   // before the child called spawn_complete — the agent was delivering
   // status messages within the same second. Counting any outbound row as
   // "progress" makes the no-progress timer mean what it says.
-  if (isSpawnChildSession(session.id)) {
+  if (await isSpawnChildSession(session.id)) {
     try {
-      getRawDb()
-        .prepare(`UPDATE tasks SET last_progress_at = ? WHERE child_session_id = ?`)
-        .run(new Date().toISOString(), session.id);
+      await withCentralSync(
+        () =>
+          withRawDb((db) => {
+            db.prepare(`UPDATE tasks SET last_progress_at = ? WHERE child_session_id = ?`).run(
+              new Date().toISOString(),
+              session.id,
+            );
+          }),
+        'spawn child progress bump',
+      );
     } catch (err) {
       log.warn('Failed to bump last_progress_at for spawn child', {
         sessionId: session.id,
@@ -984,13 +992,13 @@ async function deliverMessage(
   if (msg.kind === 'chat-sdk' && content && typeof content === 'object') {
     const c = content as Record<string, unknown>;
     if (c.type === 'ask_question') {
-      const task = getTaskByChildSession(session.id);
+      const task = await getTaskByChildSession(session.id);
       if (task && task.status === 'running') {
         const title = typeof c.title === 'string' ? c.title : null;
         const questionText = typeof c.question === 'string' ? c.question : null;
         const summary = title ?? questionText ?? null;
         try {
-          if (flagNeedsInput(task.task_id, summary ? summary.slice(0, 500) : null)) {
+          if (await flagNeedsInput(task.task_id, summary ? summary.slice(0, 500) : null)) {
             emitDashboardEvent('task_event', {
               task_id: task.task_id,
               kind: 'needs_input',
@@ -1038,7 +1046,7 @@ async function deliverMessage(
   // `agent_destinations` table won't exist and `routeAgentMessage`'s permission
   // check will throw, which falls into the normal retry → mark-failed path.
   if (msg.channel_type === 'agent') {
-    if (!hasTableRaw(getRawDb(), 'agent_destinations')) {
+    if (!(await hasTable(getDb(), 'agent_destinations'))) {
       throw new Error(`agent-to-agent module not installed — cannot route message ${msg.id}`);
     }
     const { routeAgentMessage } = await import('./modules/agent-to-agent/agent-route.js');
@@ -1082,12 +1090,18 @@ async function deliverMessage(
     // doesn't exist and we permit all non-origin channel sends (the
     // origin-chat case is always allowed regardless). Inlined SQL instead
     // of importing `hasDestination` so core doesn't depend on the module.
-    if (!isOriginChat && hasTableRaw(getRawDb(), 'agent_destinations')) {
-      const row = getRawDb()
-        .prepare(
-          'SELECT 1 FROM agent_destinations WHERE agent_group_id = ? AND target_type = ? AND target_id = ? LIMIT 1',
-        )
-        .get(session.agent_group_id, 'channel', mg.id);
+    if (!isOriginChat && (await hasTable(getDb(), 'agent_destinations'))) {
+      const row = await withCentralSync(
+        () =>
+          withRawDb((db) =>
+            db
+              .prepare(
+                'SELECT 1 FROM agent_destinations WHERE agent_group_id = ? AND target_type = ? AND target_id = ? LIMIT 1',
+              )
+              .get(session.agent_group_id, 'channel', mg.id),
+          ),
+        'channel destination check',
+      );
       if (!row) {
         throw new Error(
           `unauthorized channel destination: ${session.agent_group_id} cannot send to ${mg.channel_type}/${mg.platform_id}`,
@@ -1111,7 +1125,7 @@ async function deliverMessage(
       log.warn('Status message missing routing fields, dropping', { id: msg.id });
       return {};
     }
-    const appendMode = isSpawnChildSession(session.id);
+    const appendMode = await isSpawnChildSession(session.id);
     if (appendMode) {
       // Spawn-task child sessions used to render every thinking block as a
       // durable message in the worker's Slack/Discord thread — a "durable
@@ -1263,7 +1277,7 @@ async function deliverMessage(
   // Guarded: without the interactive module, `pending_questions` doesn't
   // exist and we skip persistence — the card still delivers to the user,
   // but the response path has nowhere to land and will log unclaimed.
-  if (content.type === 'ask_question' && content.questionId && hasTableRaw(getRawDb(), 'pending_questions')) {
+  if (content.type === 'ask_question' && content.questionId && (await hasTable(getDb(), 'pending_questions'))) {
     const title = content.title as string | undefined;
     const rawOptions = content.options as unknown;
     if (!title || !Array.isArray(rawOptions)) {
@@ -1349,7 +1363,7 @@ async function deliverMessage(
   let effectiveThreadId = baseThreadId;
   let usedAnchor = false;
   if (taskAnchorEligible) {
-    const anchor = getTaskThreadAnchor(session.id, msg.channel_type, msg.platform_id);
+    const anchor = await getTaskThreadAnchor(session.id, msg.channel_type, msg.platform_id);
     if (anchor && anchorRotationKey(anchor.createdAt) === anchorRotationKey(new Date().toISOString())) {
       // Same encoding as the turn anchor below: `<platform-address>:<thread>`.
       effectiveThreadId = `${msg.platform_id}:${anchor.threadPlatformId}`;
@@ -1412,7 +1426,7 @@ async function deliverMessage(
       err: err instanceof Error ? err.message : String(err),
     });
     if (taskAnchorEligible) {
-      deleteTaskThreadAnchor(session.id, msg.channel_type, msg.platform_id);
+      await deleteTaskThreadAnchor(session.id, msg.channel_type, msg.platform_id);
     } else {
       chatThreadAnchor.delete(session.id);
       chatThreadAnchorDisabled.set(session.id, msg.in_reply_to as string);
@@ -1435,7 +1449,7 @@ async function deliverMessage(
   // next post would chain off it instead of the original root.
   if (effectiveThreadId === null && platformMsgId) {
     if (taskAnchorEligible) {
-      setTaskThreadAnchor(session.id, msg.channel_type, msg.platform_id, platformMsgId, new Date().toISOString());
+      await setTaskThreadAnchor(session.id, msg.channel_type, msg.platform_id, platformMsgId, new Date().toISOString());
     } else if (turnAnchorEligible) {
       chatThreadAnchor.set(session.id, {
         inReplyTo: msg.in_reply_to as string,
@@ -1471,7 +1485,7 @@ async function deliverMessage(
     // The statusTracking map is also untouched in append mode, but call
     // `delete` anyway as a defensive no-op in case a regular chat row ever
     // got tracked before the session was classified as a spawn child.
-    const isSpawnChild = isSpawnChildSession(session.id);
+    const isSpawnChild = await isSpawnChildSession(session.id);
     await dropOrphanStatus(session.id, { skip: isSpawnChild });
 
     // Mirror agent replies into the central archive (2.9). Scrubbed text

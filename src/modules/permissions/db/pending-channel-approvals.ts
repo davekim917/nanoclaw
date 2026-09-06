@@ -9,7 +9,8 @@
  * `hasInFlightChannelApproval` in the request flow and drops silently
  * instead of spamming the owner.
  */
-import { getDb, getRawDb } from '../../../db/connection.js';
+import { withRawDb } from '../../../db/central-lease.js';
+import { getDb } from '../../../db/connection.js';
 
 export interface PendingChannelApproval {
   messaging_group_id: string;
@@ -45,16 +46,17 @@ export const PENDING_CHANNEL_APPROVAL_BY_GROUP_SQL =
   'SELECT * FROM pending_channel_approvals WHERE messaging_group_id = ?';
 
 /**
- * Synchronous by design (seam-3 plan §4.5, I-1): the `channels.register` guard
- * in `../guard.ts` reads this row inside its `decide` body, which never awaits.
- * Same rule as §4.2's transaction-reachable leaf exports — not a `*Sync` twin
- * (there is one form, not two), simply not yet converted. PR 6 moves it inside
- * `withCentralSync`/`withRawDb`.
+ * Synchronous and lease-only (seam-3 plan §4.5, I-1): the `channels.register`
+ * guard in `../guard.ts` reads this row inside its `decide` body, which never
+ * awaits, so the read goes through `withRawDb` and works only inside a
+ * `withCentralSync` block. The guard's caller holds one; every other caller
+ * takes the lease around this call. One form, no `*Sync` twin.
  */
 export function getPendingChannelApproval(messagingGroupId: string): PendingChannelApproval | undefined {
-  return getRawDb().prepare(PENDING_CHANNEL_APPROVAL_BY_GROUP_SQL).get(messagingGroupId) as
-    | PendingChannelApproval
-    | undefined;
+  return withRawDb(
+    (db) =>
+      db.prepare(PENDING_CHANNEL_APPROVAL_BY_GROUP_SQL).get(messagingGroupId) as PendingChannelApproval | undefined,
+  );
 }
 
 export async function hasInFlightChannelApproval(messagingGroupId: string): Promise<boolean> {

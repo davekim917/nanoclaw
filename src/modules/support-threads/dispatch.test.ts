@@ -151,7 +151,7 @@ describe('handleDispatchSupportIssue — new issue (purest: no ticket from polle
     expect(postParent).toHaveBeenCalledWith('slack:C1', '🎫 Support: Depletions look wrong — Jane <jane@acme.com>');
     expect(createThread).toHaveBeenCalledTimes(1);
 
-    const row = getSupportThread('gthread-A');
+    const row = await getSupportThread('gthread-A');
     expect(row).toBeTruthy();
     expect(row!.slack_thread_id).toBe('slack:C1:thread-ts-1');
     expect(row!.linear_issue).toBeNull();
@@ -194,7 +194,7 @@ describe('handleDispatchSupportIssue — new issue (purest: no ticket from polle
     });
 
     await handleDispatchSupportIssue(dispatchContent('gthread-task', 'new issue'), poller);
-    const row = getSupportThread('gthread-task');
+    const row = await getSupportThread('gthread-task');
     expect(row).toBeTruthy();
     await handleDispatchSupportIssue(dispatchContent('gthread-task', 'customer replied'), poller);
     pollerDb.close();
@@ -220,7 +220,7 @@ describe('handleDispatchSupportIssue — new issue (purest: no ticket from polle
       'slack:C1',
       '🎫 EXAMPLE EXAMPLE-123: Depletions look wrong — Jane <jane@acme.com>',
     );
-    const row = getSupportThread('gthread-B');
+    const row = await getSupportThread('gthread-B');
     expect(row!.linear_issue).toBe('EXAMPLE-123');
     const seeded = inboundOf(row!.session_id!);
     expect(seeded[0].content).toContain('already exists');
@@ -234,13 +234,13 @@ describe('handleDispatchSupportIssue — follow-up + reopen', () => {
     const { session: poller } = await resolveSession('ag-1', 'mg-1', null, 'shared');
 
     await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), poller);
-    const sessionId = getSupportThread('gthread-A')!.session_id!;
+    const sessionId = (await getSupportThread('gthread-A'))!.session_id!;
 
     await handleDispatchSupportIssue(dispatchContent('gthread-A', 'customer replied'), poller);
 
     expect(postParent).toHaveBeenCalledTimes(1);
     expect(createThread).toHaveBeenCalledTimes(1);
-    expect(getSupportThread('gthread-A')!.session_id).toBe(sessionId);
+    expect((await getSupportThread('gthread-A'))!.session_id).toBe(sessionId);
 
     const msgs = inboundOf(sessionId);
     expect(msgs).toHaveLength(2);
@@ -271,7 +271,7 @@ describe('handleDispatchSupportIssue — follow-up + reopen', () => {
       'slack:C1',
       '🎫 EXAMPLE EXAMPLE-86: Depletions look wrong — Jane <jane@acme.com>',
     );
-    const row = getSupportThread('gthread-L')!;
+    const row = (await getSupportThread('gthread-L'))!;
     // …and the upsert records the new session/thread (regression: INSERT OR
     // IGNORE silently dropped this, stranding every future follow-up).
     expect(row.session_id).toBeTruthy();
@@ -288,7 +288,7 @@ describe('handleDispatchSupportIssue — archived session binding', () => {
     await seed();
     const { session: poller } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), poller);
-    const before = getSupportThread('gthread-A')!;
+    const before = (await getSupportThread('gthread-A'))!;
     const archivedId = before.session_id!;
     // Reclaim closes the row and removes the dir; the row itself survives, so
     // a bare getSession still answers for it.
@@ -298,7 +298,7 @@ describe('handleDispatchSupportIssue — archived session binding', () => {
 
     await handleDispatchSupportIssue(dispatchContent('gthread-A', 'customer replied'), poller);
 
-    const after = getSupportThread('gthread-A')!;
+    const after = (await getSupportThread('gthread-A'))!;
     expect(after.session_id).not.toBe(archivedId);
     expect((await getSession(after.session_id!))!.status).toBe('active');
     // session_id is the ONLY column the rebinding owns. Everything else on the
@@ -322,7 +322,7 @@ describe('handleDispatchSupportIssue — archived session binding', () => {
     await seed();
     const { session: poller } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), poller);
-    const archivedId = getSupportThread('gthread-A')!.session_id!;
+    const archivedId = (await getSupportThread('gthread-A'))!.session_id!;
     getRawDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(archivedId);
     fs.rmSync(`${TEST_DIR}/v2-sessions/ag-1/${archivedId}`, { recursive: true, force: true });
     vi.mocked(wakeContainer).mockClear();
@@ -332,7 +332,7 @@ describe('handleDispatchSupportIssue — archived session binding', () => {
       handleDispatchSupportIssue(dispatchContent('gthread-A', 'reply two'), poller),
     ]);
 
-    const after = getSupportThread('gthread-A')!;
+    const after = (await getSupportThread('gthread-A'))!;
     const activeIds = (
       getRawDb().prepare("SELECT id FROM sessions WHERE status = 'active'").all() as Array<{ id: string }>
     ).map((r) => r.id);
@@ -362,7 +362,7 @@ describe('handleDispatchSupportIssue — archived session binding', () => {
 
     expect(postParent).toHaveBeenCalledTimes(1);
     expect(createThread).toHaveBeenCalledTimes(1);
-    const row = getSupportThread('gthread-N')!;
+    const row = (await getSupportThread('gthread-N'))!;
     const bodies = inboundOf(row.session_id!).map((m) => m.content);
     expect(bodies).toHaveLength(2);
     expect(bodies.some((b) => b.includes('first email'))).toBe(true);
@@ -373,11 +373,11 @@ describe('handleDispatchSupportIssue — archived session binding', () => {
     await seed();
     const { session: poller } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), poller);
-    const sessionId = getSupportThread('gthread-A')!.session_id!;
+    const sessionId = (await getSupportThread('gthread-A'))!.session_id!;
 
     await handleDispatchSupportIssue(dispatchContent('gthread-A', 'customer replied'), poller);
 
-    expect(getSupportThread('gthread-A')!.session_id).toBe(sessionId);
+    expect((await getSupportThread('gthread-A'))!.session_id).toBe(sessionId);
     expect(inboundOf(sessionId)).toHaveLength(2);
   });
 });
@@ -387,7 +387,7 @@ describe('handleUpdateSupportTicket', () => {
     await seed();
     const { session: poller } = await resolveSession('ag-1', 'mg-1', null, 'shared');
     await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), poller);
-    const row = getSupportThread('gthread-A')!;
+    const row = (await getSupportThread('gthread-A'))!;
     const issueSession = (await getSession(row.session_id!))!;
 
     await handleUpdateSupportTicket(
@@ -395,7 +395,7 @@ describe('handleUpdateSupportTicket', () => {
       issueSession,
     );
 
-    const updated = getSupportThread('gthread-A')!;
+    const updated = (await getSupportThread('gthread-A'))!;
     expect(updated.linear_issue).toBe('EXAMPLE-200');
     expect(updated.linear_team).toBe('EXAMPLE');
 

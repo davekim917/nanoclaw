@@ -5,6 +5,7 @@
  */
 import { beforeEach, afterEach, describe, expect, it } from 'vitest';
 
+import { withCentralSync } from '../../db/central-lease.js';
 import type { ChannelAdapter, OutboundMessage } from '../../channels/adapter.js';
 import { registerSlackBot } from '../../channels/slack-mentions.js';
 import {
@@ -144,7 +145,7 @@ describe('canAccessAgentGroup', () => {
   it('admin @ group is implicitly a member', async () => {
     await seedUser('u-sa', 'telegram');
     await grantRole({ user_id: 'u-sa', role: 'admin', agent_group_id: 'ag-1', granted_by: null, granted_at: now() });
-    expect(isMember('u-sa', 'ag-1')).toBe(true);
+    expect(await withCentralSync(() => isMember('u-sa', 'ag-1'), 'test')).toBe(true);
   });
 
   it('allows members of the group', async () => {
@@ -215,8 +216,8 @@ describe('role helpers', () => {
     registerSlackBot('slack-authz-codex', siblingIdentity);
     registerSlackBot('slack-authz-other', otherIdentity);
     try {
-      expect(isOwner(siblingUser)).toBe(true);
-      expect(isOwner(otherWorkspaceUser)).toBe(false);
+      expect(await withCentralSync(() => isOwner(siblingUser), 'test')).toBe(true);
+      expect(await withCentralSync(() => isOwner(otherWorkspaceUser), 'test')).toBe(false);
     } finally {
       // The Slack registry is process-global. Keep later tests isolated.
       registerSlackBot('slack-authz-base', { ...baseIdentity, teamId: '__cleared__' });
@@ -247,7 +248,7 @@ describe('role helpers', () => {
     expect(await hasAnyOwner()).toBe(false);
     await grantRole({ user_id: 'u-1', role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });
     expect(await hasAnyOwner()).toBe(true);
-    expect(isOwner('u-1')).toBe(true);
+    expect(await withCentralSync(() => isOwner('u-1'), 'test')).toBe(true);
   });
 });
 

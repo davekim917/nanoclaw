@@ -525,7 +525,7 @@ registerResource({
           if (!effectiveProvider) {
             throw new Error('Cannot validate --model without a provider set on the group');
           }
-          const denied = getDeniedModel(effectiveProvider, updates.model);
+          const denied = await getDeniedModel(effectiveProvider, updates.model);
           if (denied) {
             throw new Error(
               `Model "${updates.model}" is denied for provider "${effectiveProvider}".` +

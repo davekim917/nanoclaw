@@ -4,7 +4,7 @@ import type { Session } from '../../types.js';
 import { authChildTaskAction } from './db/tasks.js';
 
 export async function applySpawnProgress(content: Record<string, unknown>, callerSession: Session): Promise<void> {
-  const auth = authChildTaskAction(content, callerSession, 'applySpawnProgress');
+  const auth = await authChildTaskAction(content, callerSession, 'applySpawnProgress');
   if (!auth) return;
   const { task, taskId } = auth;
 

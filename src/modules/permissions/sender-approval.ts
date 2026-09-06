@@ -369,7 +369,7 @@ export async function declineAndNotify(input: DeclineAndNotifyInput): Promise<vo
 
     if (existing && !isDeclineStampId(existing.id)) {
       try {
-        completeDeferredInbound(JSON.parse(existing.original_message) as InboundEvent);
+        await completeDeferredInbound(JSON.parse(existing.original_message) as InboundEvent);
       } catch (err) {
         log.debug('decline_notify: converted card had no resolvable deferred receipt', {
           messagingGroupId,

@@ -5,6 +5,7 @@ import path from 'path';
 import Database from 'better-sqlite3';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { withCentralSync } from '../db/central-lease.js';
 import { createAgentGroup, getRawDb, initTestDb, runMigrations } from '../db/index.js';
 import { ensureSchema } from '../modules/mailbox/schema.js';
 import { guard } from '../guard/index.js';
@@ -207,50 +208,64 @@ beforeEach(async () => {
 // ── The guard ────────────────────────────────────────────────────────────────
 
 describe('threads.close guard', () => {
+  // The guard's role reads are lease-only (seam 3 §4.5 I-1): the production
+  // caller consults it inside `withCentralSync`, so the test does the same.
   const consult = (over: Record<string, unknown> = {}, userId = 'admin') =>
-    guard(threadsClose, {
-      actor: { kind: 'human', userId },
-      payload: { agentGroupIds: ['ag1'], agentProposed: false, confirmations: 2, ...over },
-    });
+    withCentralSync(
+      () =>
+        guard(threadsClose, {
+          actor: { kind: 'human', userId },
+          payload: { agentGroupIds: ['ag1'], agentProposed: false, confirmations: 2, ...over },
+        }),
+      'test consult',
+    );
 
-  it('an agent-proposed close needs one confirmation, an operator-initiated one needs two', () => {
+  it('an agent-proposed close needs one confirmation, an operator-initiated one needs two', async () => {
     expect(requiredConfirmations(true)).toBe(1);
     expect(requiredConfirmations(false)).toBe(2);
-    expect(consult({ agentProposed: true, confirmations: 1 }).effect).toBe('allow');
+    expect((await consult({ agentProposed: true, confirmations: 1 })).effect).toBe('allow');
     // The distinction lives in the guard, so a UI cannot collapse the two.
-    expect(consult({ agentProposed: false, confirmations: 1 }).effect).toBe('deny');
-    expect(consult({ agentProposed: false, confirmations: 2 }).effect).toBe('allow');
+    expect((await consult({ agentProposed: false, confirmations: 1 })).effect).toBe('deny');
+    expect((await consult({ agentProposed: false, confirmations: 2 })).effect).toBe('allow');
   });
 
-  it('names the missing confirmation count so the surface can say so honestly', () => {
-    const denial = consult({ agentProposed: false, confirmations: 0 });
+  it('names the missing confirmation count so the surface can say so honestly', async () => {
+    const denial = await consult({ agentProposed: false, confirmations: 0 });
     expect(denial.effect).toBe('deny');
     expect(denial.reason).toContain('2 explicit operator confirmation');
     expect(denial.reason).toContain('no agent has proposed');
   });
 
-  it('refuses a non-human actor — an agent may propose, never close', () => {
+  it('refuses a non-human actor — an agent may propose, never close', async () => {
     for (const actor of [
       { kind: 'agent' as const, agentGroupId: 'ag1' },
       { kind: 'host' as const },
       { kind: 'system' as const },
     ]) {
       expect(
-        guard(threadsClose, { actor, payload: { agentGroupIds: ['ag1'], agentProposed: true, confirmations: 9 } })
-          .effect,
+        (
+          await withCentralSync(
+            () =>
+              guard(threadsClose, {
+                actor,
+                payload: { agentGroupIds: ['ag1'], agentProposed: true, confirmations: 9 },
+              }),
+            'test consult',
+          )
+        ).effect,
       ).toBe('deny');
     }
   });
 
-  it('refuses a caller with no admin privilege on any agent group backing the thread', () => {
-    expect(consult({}, 'nobody').effect).toBe('deny');
-    expect(consult({ agentGroupIds: [] }).effect).toBe('deny');
+  it('refuses a caller with no admin privilege on any agent group backing the thread', async () => {
+    expect((await consult({}, 'nobody')).effect).toBe('deny');
+    expect((await consult({ agentGroupIds: [] })).effect).toBe('deny');
   });
 
-  it('never holds — closure has no approval path and therefore no settle-by-silence', () => {
+  it('never holds — closure has no approval path and therefore no settle-by-silence', async () => {
     expect(threadsClose.grantActionName).toBeUndefined();
     for (const confirmations of [0, 1, 2, 3]) {
-      expect(consult({ confirmations }).effect).not.toBe('hold');
+      expect((await consult({ confirmations })).effect).not.toBe('hold');
     }
   });
 });

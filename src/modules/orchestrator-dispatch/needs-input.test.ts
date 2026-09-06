@@ -152,7 +152,7 @@ describe('applySpawnNeedsInput', () => {
 
     await applySpawnNeedsInput({ task_id: 'task-1', question: 'Repo path A or B?' }, makeChildSession());
 
-    const task = getTaskById('task-1');
+    const task = await getTaskById('task-1');
     expect(task!.needs_input).toBe(1);
     expect(task!.steer_question).toBe('Repo path A or B?');
   });
@@ -164,7 +164,7 @@ describe('applySpawnNeedsInput', () => {
 
     await applySpawnNeedsInput({ task_id: 'task-1', question: 'X'.repeat(1000) }, makeChildSession());
 
-    const task = getTaskById('task-1');
+    const task = await getTaskById('task-1');
     expect(task!.steer_question!.length).toBe(500);
   });
 
@@ -175,7 +175,7 @@ describe('applySpawnNeedsInput', () => {
 
     await applySpawnNeedsInput({ task_id: 'task-1' }, makeChildSession());
 
-    const task = getTaskById('task-1');
+    const task = await getTaskById('task-1');
     expect(task!.needs_input).toBe(1);
     expect(task!.steer_question).toBeNull();
   });
@@ -188,7 +188,7 @@ describe('applySpawnNeedsInput', () => {
 
     await applySpawnNeedsInput({ task_id: 'task-1', question: 'too late' }, makeChildSession());
 
-    const task = getTaskById('task-1');
+    const task = await getTaskById('task-1');
     expect(task!.needs_input).toBe(0);
     expect(task!.steer_question).toBeNull();
   });
@@ -202,7 +202,7 @@ describe('applySpawnNeedsInput', () => {
       applySpawnNeedsInput({ task_id: 'task-1', question: 'spoof?' }, makeWrongSession()),
     ).resolves.not.toThrow();
 
-    const task = getTaskById('task-1');
+    const task = await getTaskById('task-1');
     expect(task!.needs_input).toBe(0);
   });
 
@@ -261,7 +261,7 @@ describe('applySpawnNeedsInput', () => {
     await applySpawnNeedsInput({ task_id: 'task-1', question: 'q' }, makeChildSession());
 
     expect(deliverMock).not.toHaveBeenCalled();
-    const task = getTaskById('task-1');
+    const task = await getTaskById('task-1');
     expect(task!.needs_input).toBe(1);
   });
 
@@ -275,7 +275,7 @@ describe('applySpawnNeedsInput', () => {
     await applySpawnNeedsInput({ task_id: 'task-1', question: 'q' }, makeChildSession());
 
     expect(deliverMock).not.toHaveBeenCalled();
-    const task = getTaskById('task-1');
+    const task = await getTaskById('task-1');
     expect(task!.needs_input).toBe(1);
   });
 });

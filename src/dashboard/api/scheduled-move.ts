@@ -246,7 +246,7 @@ async function resolveAndGate(
 
   // Mutation-tier gate (preview reads secret names — M5/SEC-1). Non-manage →
   // 404, never 403 (don't reveal the resource exists).
-  if (!canManageScheduled(ctx.user.id)) return { error: json({ error: 'not_found' }, 404) };
+  if (!(await canManageScheduled(ctx.user.id))) return { error: json({ error: 'not_found' }, 404) };
 
   // Scope re-check from the decoded key (never trust the key as authz, §4.5).
   if (!ctx.scopes.no_filter && !ctx.scopes.allowed_group_ids.includes(decoded.agentGroupId)) {

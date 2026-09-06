@@ -10,7 +10,7 @@
  * commit_digest_state: tracks the last-scanned SHA per repo so scan_commits
  * only picks up new commits on each run.
  */
-import { getRawDb } from './connection.js';
+import { withCentralSync, withRawDb } from './central-lease.js';
 
 // ---- Types ----
 
@@ -50,95 +50,125 @@ export interface CommitDigestState {
 
 // ---- ship_log ----
 
-export function addShipLogEntry(entry: ShipLogEntry): void {
-  const db = getRawDb();
-  db.prepare(
-    `INSERT OR REPLACE INTO ship_log
+export function addShipLogEntry(entry: ShipLogEntry): Promise<void> {
+  return withCentralSync(
+    () =>
+      withRawDb((db) => {
+        db.prepare(
+          `INSERT OR REPLACE INTO ship_log
        (id, agent_group_id, title, description, pr_url, branch, tags, shipped_at)
      VALUES ($id, $agent_group_id, $title, $description, $pr_url, $branch, $tags, $shipped_at)`,
-  ).run({
-    id: entry.id,
-    agent_group_id: entry.agent_group_id,
-    title: entry.title,
-    description: entry.description,
-    pr_url: entry.pr_url,
-    branch: entry.branch,
-    tags: entry.tags,
-    shipped_at: entry.shipped_at,
-  });
+        ).run({
+          id: entry.id,
+          agent_group_id: entry.agent_group_id,
+          title: entry.title,
+          description: entry.description,
+          pr_url: entry.pr_url,
+          branch: entry.branch,
+          tags: entry.tags,
+          shipped_at: entry.shipped_at,
+        });
+      }),
+    'backlog.addShipLogEntry',
+  );
 }
 
-export function getShipLog(agentGroupId: string, limit = 50): ShipLogEntry[] {
-  const db = getRawDb();
-  return db
-    .prepare(
-      `SELECT * FROM ship_log
+export function getShipLog(agentGroupId: string, limit = 50): Promise<ShipLogEntry[]> {
+  return withCentralSync(
+    () =>
+      withRawDb((db) => {
+        return db
+          .prepare(
+            `SELECT * FROM ship_log
          WHERE agent_group_id = $agent_group_id
          ORDER BY shipped_at DESC LIMIT $limit`,
-    )
-    .all({ agent_group_id: agentGroupId, limit: limit }) as ShipLogEntry[];
+          )
+          .all({ agent_group_id: agentGroupId, limit: limit }) as ShipLogEntry[];
+      }),
+    'backlog.getShipLog',
+  );
 }
 
 export function getShipLogPaginated(
   agentGroupId: string,
   limit = 20,
   offset = 0,
-): { data: ShipLogEntry[]; total: number } {
-  const db = getRawDb();
-  const total = (
-    db
-      .prepare('SELECT COUNT(*) AS c FROM ship_log WHERE agent_group_id = $agent_group_id')
-      .get({ agent_group_id: agentGroupId }) as { c: number }
-  ).c;
-  const data = db
-    .prepare(
-      `SELECT * FROM ship_log
+): Promise<{ data: ShipLogEntry[]; total: number }> {
+  return withCentralSync(
+    () =>
+      withRawDb((db) => {
+        const total = (
+          db
+            .prepare('SELECT COUNT(*) AS c FROM ship_log WHERE agent_group_id = $agent_group_id')
+            .get({ agent_group_id: agentGroupId }) as { c: number }
+        ).c;
+        const data = db
+          .prepare(
+            `SELECT * FROM ship_log
          WHERE agent_group_id = $agent_group_id
          ORDER BY shipped_at DESC LIMIT $limit OFFSET $offset`,
-    )
-    .all({ agent_group_id: agentGroupId, limit: limit, offset: offset }) as ShipLogEntry[];
-  return { data, total };
+          )
+          .all({ agent_group_id: agentGroupId, limit: limit, offset: offset }) as ShipLogEntry[];
+        return { data, total };
+      }),
+    'backlog.getShipLogPaginated',
+  );
 }
 
-export function getShipLogSince(agentGroupId: string, since: string): ShipLogEntry[] {
-  const db = getRawDb();
-  return db
-    .prepare(
-      `SELECT * FROM ship_log
+export function getShipLogSince(agentGroupId: string, since: string): Promise<ShipLogEntry[]> {
+  return withCentralSync(
+    () =>
+      withRawDb((db) => {
+        return db
+          .prepare(
+            `SELECT * FROM ship_log
          WHERE agent_group_id = $agent_group_id AND shipped_at >= $since
          ORDER BY shipped_at ASC`,
-    )
-    .all({ agent_group_id: agentGroupId, since: since }) as ShipLogEntry[];
+          )
+          .all({ agent_group_id: agentGroupId, since: since }) as ShipLogEntry[];
+      }),
+    'backlog.getShipLogSince',
+  );
 }
 
 // ---- backlog_items ----
 
-export function getBacklogItemById(id: string): BacklogItem | null {
-  const db = getRawDb();
-  return (db.prepare('SELECT * FROM backlog_items WHERE id = $id').get({ id: id }) as BacklogItem) || null;
+export function getBacklogItemById(id: string): Promise<BacklogItem | null> {
+  return withCentralSync(
+    () =>
+      withRawDb((db) => {
+        return (db.prepare('SELECT * FROM backlog_items WHERE id = $id').get({ id: id }) as BacklogItem) || null;
+      }),
+    'backlog.getBacklogItemById',
+  );
 }
 
-export function addBacklogItem(item: BacklogItem): void {
-  const db = getRawDb();
-  db.prepare(
-    `INSERT OR REPLACE INTO backlog_items
+export function addBacklogItem(item: BacklogItem): Promise<void> {
+  return withCentralSync(
+    () =>
+      withRawDb((db) => {
+        db.prepare(
+          `INSERT OR REPLACE INTO backlog_items
        (id, agent_group_id, title, description, status, priority, tags, notes,
         created_at, updated_at, resolved_at)
      VALUES ($id, $agent_group_id, $title, $description, $status, $priority,
              $tags, $notes, $created_at, $updated_at, $resolved_at)`,
-  ).run({
-    id: item.id,
-    agent_group_id: item.agent_group_id,
-    title: item.title,
-    description: item.description,
-    status: item.status,
-    priority: item.priority,
-    tags: item.tags,
-    notes: item.notes,
-    created_at: item.created_at,
-    updated_at: item.updated_at,
-    resolved_at: item.resolved_at,
-  });
+        ).run({
+          id: item.id,
+          agent_group_id: item.agent_group_id,
+          title: item.title,
+          description: item.description,
+          status: item.status,
+          priority: item.priority,
+          tags: item.tags,
+          notes: item.notes,
+          created_at: item.created_at,
+          updated_at: item.updated_at,
+          resolved_at: item.resolved_at,
+        });
+      }),
+    'backlog.addBacklogItem',
+  );
 }
 
 export function updateBacklogItem(
@@ -147,84 +177,99 @@ export function updateBacklogItem(
     Pick<BacklogItem, 'title' | 'description' | 'status' | 'priority' | 'tags' | 'notes' | 'resolved_at'>
   >,
   agentGroupId?: string,
-): boolean {
-  const db = getRawDb();
-  const fields: string[] = [];
-  const values: Record<string, unknown> = { id: id };
+): Promise<boolean> {
+  return withCentralSync(
+    () =>
+      withRawDb((db) => {
+        const fields: string[] = [];
+        const values: Record<string, unknown> = { id: id };
 
-  if (updates.title !== undefined) {
-    fields.push('title = $title');
-    values.title = updates.title;
-  }
-  if (updates.description !== undefined) {
-    fields.push('description = $description');
-    values.description = updates.description;
-  }
-  if (updates.status !== undefined) {
-    fields.push('status = $status');
-    values.status = updates.status;
-  }
-  if (updates.priority !== undefined) {
-    fields.push('priority = $priority');
-    values.priority = updates.priority;
-  }
-  if (updates.tags !== undefined) {
-    fields.push('tags = $tags');
-    values.tags = updates.tags;
-  }
-  if (updates.notes !== undefined) {
-    fields.push('notes = $notes');
-    values.notes = updates.notes;
-  }
-  if (updates.resolved_at !== undefined) {
-    fields.push('resolved_at = $resolved_at');
-    values.resolved_at = updates.resolved_at;
-  }
+        if (updates.title !== undefined) {
+          fields.push('title = $title');
+          values.title = updates.title;
+        }
+        if (updates.description !== undefined) {
+          fields.push('description = $description');
+          values.description = updates.description;
+        }
+        if (updates.status !== undefined) {
+          fields.push('status = $status');
+          values.status = updates.status;
+        }
+        if (updates.priority !== undefined) {
+          fields.push('priority = $priority');
+          values.priority = updates.priority;
+        }
+        if (updates.tags !== undefined) {
+          fields.push('tags = $tags');
+          values.tags = updates.tags;
+        }
+        if (updates.notes !== undefined) {
+          fields.push('notes = $notes');
+          values.notes = updates.notes;
+        }
+        if (updates.resolved_at !== undefined) {
+          fields.push('resolved_at = $resolved_at');
+          values.resolved_at = updates.resolved_at;
+        }
 
-  if (fields.length === 0) return false;
+        if (fields.length === 0) return false;
 
-  fields.push('updated_at = $updated_at');
-  values.updated_at = new Date().toISOString();
+        fields.push('updated_at = $updated_at');
+        values.updated_at = new Date().toISOString();
 
-  const whereClause =
-    agentGroupId !== undefined ? 'WHERE id = $id AND agent_group_id = $agent_group_id' : 'WHERE id = $id';
-  if (agentGroupId !== undefined) values.agent_group_id = agentGroupId;
+        const whereClause =
+          agentGroupId !== undefined ? 'WHERE id = $id AND agent_group_id = $agent_group_id' : 'WHERE id = $id';
+        if (agentGroupId !== undefined) values.agent_group_id = agentGroupId;
 
-  const result = db.prepare(`UPDATE backlog_items SET ${fields.join(', ')} ${whereClause}`).run(values);
-  return result.changes > 0;
+        const result = db.prepare(`UPDATE backlog_items SET ${fields.join(', ')} ${whereClause}`).run(values);
+        return result.changes > 0;
+      }),
+    'backlog.updateBacklogItem',
+  );
 }
 
-export function deleteBacklogItem(id: string, agentGroupId: string): boolean {
-  const db = getRawDb();
-  const result = db
-    .prepare('DELETE FROM backlog_items WHERE id = $id AND agent_group_id = $agent_group_id')
-    .run({ id: id, agent_group_id: agentGroupId });
-  return result.changes > 0;
+export function deleteBacklogItem(id: string, agentGroupId: string): Promise<boolean> {
+  return withCentralSync(
+    () =>
+      withRawDb((db) => {
+        const result = db
+          .prepare('DELETE FROM backlog_items WHERE id = $id AND agent_group_id = $agent_group_id')
+          .run({ id: id, agent_group_id: agentGroupId });
+        return result.changes > 0;
+      }),
+    'backlog.deleteBacklogItem',
+  );
 }
 
 const PRIORITY_ORDER = `CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END`;
 
-export function getBacklog(agentGroupId: string, status?: string, limit = 100): BacklogItem[] {
-  const db = getRawDb();
-  let rows;
-  if (status) {
-    rows = db
-      .prepare(
-        `SELECT * FROM backlog_items
+export function getBacklog(agentGroupId: string, status?: string, limit = 100): Promise<BacklogItem[]> {
+  return withCentralSync(
+    () =>
+      withRawDb((db) => {
+        let rows;
+        if (status) {
+          rows = db
+            .prepare(
+              `SELECT * FROM backlog_items
            WHERE agent_group_id = $agent_group_id AND status = $status
            ORDER BY ${PRIORITY_ORDER}, created_at DESC LIMIT $limit`,
-      )
-      .all({ agent_group_id: agentGroupId, status: status, limit: limit });
-  } else {
-    rows = db
-      .prepare(
-        `SELECT * FROM backlog_items
+            )
+            .all({ agent_group_id: agentGroupId, status: status, limit: limit });
+        } else {
+          rows = db
+            .prepare(
+              `SELECT * FROM backlog_items
            WHERE agent_group_id = $agent_group_id
            ORDER BY ${PRIORITY_ORDER}, created_at DESC LIMIT $limit`,
-      )
-      .all({ agent_group_id: agentGroupId, limit: limit });
-  }
-  return rows as BacklogItem[];
+            )
+            .all({ agent_group_id: agentGroupId, limit: limit });
+        }
+        return rows as BacklogItem[];
+      }),
+    'backlog.getBacklog',
+  );
 }
 
 export function getBacklogPaginated(
@@ -232,74 +277,96 @@ export function getBacklogPaginated(
   status?: string,
   limit = 20,
   offset = 0,
-): { data: BacklogItem[]; total: number } {
-  const db = getRawDb();
-  let total: number;
-  let rows: BacklogItem[];
-  if (status) {
-    total = (
-      db
-        .prepare('SELECT COUNT(*) AS c FROM backlog_items WHERE agent_group_id = $agent_group_id AND status = $status')
-        .get({ agent_group_id: agentGroupId, status: status }) as { c: number }
-    ).c;
-    rows = db
-      .prepare(
-        `SELECT * FROM backlog_items
+): Promise<{ data: BacklogItem[]; total: number }> {
+  return withCentralSync(
+    () =>
+      withRawDb((db) => {
+        let total: number;
+        let rows: BacklogItem[];
+        if (status) {
+          total = (
+            db
+              .prepare(
+                'SELECT COUNT(*) AS c FROM backlog_items WHERE agent_group_id = $agent_group_id AND status = $status',
+              )
+              .get({ agent_group_id: agentGroupId, status: status }) as { c: number }
+          ).c;
+          rows = db
+            .prepare(
+              `SELECT * FROM backlog_items
            WHERE agent_group_id = $agent_group_id AND status = $status
            ORDER BY ${PRIORITY_ORDER}, created_at DESC LIMIT $limit OFFSET $offset`,
-      )
-      .all({ agent_group_id: agentGroupId, status: status, limit: limit, offset: offset }) as BacklogItem[];
-  } else {
-    total = (
-      db
-        .prepare('SELECT COUNT(*) AS c FROM backlog_items WHERE agent_group_id = $agent_group_id')
-        .get({ agent_group_id: agentGroupId }) as { c: number }
-    ).c;
-    rows = db
-      .prepare(
-        `SELECT * FROM backlog_items
+            )
+            .all({ agent_group_id: agentGroupId, status: status, limit: limit, offset: offset }) as BacklogItem[];
+        } else {
+          total = (
+            db
+              .prepare('SELECT COUNT(*) AS c FROM backlog_items WHERE agent_group_id = $agent_group_id')
+              .get({ agent_group_id: agentGroupId }) as { c: number }
+          ).c;
+          rows = db
+            .prepare(
+              `SELECT * FROM backlog_items
            WHERE agent_group_id = $agent_group_id
            ORDER BY ${PRIORITY_ORDER}, created_at DESC LIMIT $limit OFFSET $offset`,
-      )
-      .all({ agent_group_id: agentGroupId, limit: limit, offset: offset }) as BacklogItem[];
-  }
-  return { data: rows, total };
+            )
+            .all({ agent_group_id: agentGroupId, limit: limit, offset: offset }) as BacklogItem[];
+        }
+        return { data: rows, total };
+      }),
+    'backlog.getBacklogPaginated',
+  );
 }
 
-export function getBacklogResolvedSince(agentGroupId: string, since: string): BacklogItem[] {
-  const db = getRawDb();
-  return db
-    .prepare(
-      `SELECT * FROM backlog_items
+export function getBacklogResolvedSince(agentGroupId: string, since: string): Promise<BacklogItem[]> {
+  return withCentralSync(
+    () =>
+      withRawDb((db) => {
+        return db
+          .prepare(
+            `SELECT * FROM backlog_items
          WHERE agent_group_id = $agent_group_id
            AND status IN ('resolved','wont_fix')
            AND resolved_at >= $since
          ORDER BY resolved_at ASC`,
-    )
-    .all({ agent_group_id: agentGroupId, since: since }) as BacklogItem[];
+          )
+          .all({ agent_group_id: agentGroupId, since: since }) as BacklogItem[];
+      }),
+    'backlog.getBacklogResolvedSince',
+  );
 }
 
 // ---- commit_digest_state ----
 
-export function getCommitDigestState(repoPath: string): CommitDigestState | null {
-  const db = getRawDb();
-  return (
-    (db
-      .prepare('SELECT * FROM commit_digest_state WHERE repo_path = $repo_path')
-      .get({ repo_path: repoPath }) as CommitDigestState) || null
+export function getCommitDigestState(repoPath: string): Promise<CommitDigestState | null> {
+  return withCentralSync(
+    () =>
+      withRawDb((db) => {
+        return (
+          (db
+            .prepare('SELECT * FROM commit_digest_state WHERE repo_path = $repo_path')
+            .get({ repo_path: repoPath }) as CommitDigestState) || null
+        );
+      }),
+    'backlog.getCommitDigestState',
   );
 }
 
-export function upsertCommitDigestState(state: CommitDigestState): void {
-  const db = getRawDb();
-  db.prepare(
-    `INSERT OR REPLACE INTO commit_digest_state
+export function upsertCommitDigestState(state: CommitDigestState): Promise<void> {
+  return withCentralSync(
+    () =>
+      withRawDb((db) => {
+        db.prepare(
+          `INSERT OR REPLACE INTO commit_digest_state
        (repo_path, agent_group_id, last_commit_sha, last_scan)
      VALUES ($repo_path, $agent_group_id, $last_commit_sha, $last_scan)`,
-  ).run({
-    repo_path: state.repo_path,
-    agent_group_id: state.agent_group_id,
-    last_commit_sha: state.last_commit_sha,
-    last_scan: state.last_scan,
-  });
+        ).run({
+          repo_path: state.repo_path,
+          agent_group_id: state.agent_group_id,
+          last_commit_sha: state.last_commit_sha,
+          last_scan: state.last_scan,
+        });
+      }),
+    'backlog.upsertCommitDigestState',
+  );
 }

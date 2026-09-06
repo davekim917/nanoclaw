@@ -171,6 +171,10 @@ function statMtimeMs(filePath: string): number | null {
 
 function sessionInventory(): SessionRow[] | null {
   try {
+    // Bare raw handle on purpose: this module's only caller is
+    // `scripts/storage-gc.ts`, a standalone process that opens its own
+    // connection and runs nothing else against it — no host lease exists to
+    // join. Pinned by `src/db/raw-outside-lease.test.ts`.
     return getRawDb()
       .prepare(
         `SELECT s.id AS session_id, s.agent_group_id, s.status, s.thread_id,

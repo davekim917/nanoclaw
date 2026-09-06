@@ -723,6 +723,10 @@ describe('storage-manager.ts / storage-activity.ts contain no literal seam call'
       'src/config.ts': ['CONTAINER_IMAGE', 'CONTAINER_IMAGE_BASE', 'CONTAINER_INSTALL_LABEL', 'DATA_DIR'],
       'src/container-mounts.ts': ['runningContainerMounts as inspectRunningContainerMounts'],
       'src/container-runtime.ts': ['CONTAINER_RUNTIME_BIN'],
+      // Seam 3 PR 6: the host-side boot finisher takes the central lease; the
+      // `type RawStatements` specifier is inline type-only and contributes no
+      // runtime binding.
+      'src/db/central-lease.ts': ['withCentralSync', 'withRawDb'],
       'src/db/connection.ts': ['getRawDb'],
       // Seam 3 PR 4 moved this off the async driver's getAllContainerConfigs
       // to a raw, synchronous prepare — see the doc comment at the call site

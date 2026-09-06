@@ -84,9 +84,10 @@ function emptyDefectRegister(asOf: string): string {
 }
 
 /** Every item this workgroup emits at {@link NOW}, grouped by the source that produced it. */
-function itemsByKind(groupsRoot: string): Map<string, AttentionItem[]> {
+async function itemsByKind(groupsRoot: string): Promise<Map<string, AttentionItem[]>> {
   const out = new Map<string, AttentionItem[]>();
-  for (const item of readAttentionItems(WORKGROUP, NOW, { groupsRoot, claimsRoot: tmp('nc-attn-claims-') }).items) {
+  for (const item of (await readAttentionItems(WORKGROUP, NOW, { groupsRoot, claimsRoot: tmp('nc-attn-claims-') }))
+    .items) {
     out.set(item.sourceKind, [...(out.get(item.sourceKind) ?? []), item]);
   }
   return out;
@@ -238,36 +239,36 @@ describe('parseAttentionSources', () => {
 });
 
 describe('readAttentionItems', () => {
-  it('emits items for a declared source', () => {
+  it('emits items for a declared source', async () => {
     declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
     const groupsRoot = boardRoot([readyPr()]);
-    const read = readAttentionItems(WORKGROUP, Date.now(), { groupsRoot, claimsRoot: tmp('nc-attn-claims-') });
+    const read = await readAttentionItems(WORKGROUP, Date.now(), { groupsRoot, claimsRoot: tmp('nc-attn-claims-') });
     expect(read.items).toHaveLength(1);
     expect(read.items[0]!.channel_key).toBe(CHANNEL_KEY);
     expect(read.items[0]!.sourceKind).toBe('release-board');
     expect(read.items[0]!.sourceAsOf).toBe(ASOF);
   });
 
-  it('stamps the item id so it can never be read as a thread id', () => {
+  it('stamps the item id so it can never be read as a thread id', async () => {
     declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
     const groupsRoot = boardRoot([readyPr()]);
-    const read = readAttentionItems(WORKGROUP, Date.now(), { groupsRoot, claimsRoot: tmp('nc-attn-claims-') });
+    const read = await readAttentionItems(WORKGROUP, Date.now(), { groupsRoot, claimsRoot: tmp('nc-attn-claims-') });
     expect(read.items[0]!.id).toBe(`${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`);
     expect(isAttentionItemId(read.items[0]!.id)).toBe(true);
   });
 
-  it('emits nothing, and says so, when nothing is declared', () => {
+  it('emits nothing, and says so, when nothing is declared', async () => {
     const debug = vi.spyOn(log, 'debug').mockImplementation(() => {});
     declare(null);
-    const read = readAttentionItems(WORKGROUP, Date.now(), { groupsRoot: boardRoot([readyPr()]) });
+    const read = await readAttentionItems(WORKGROUP, Date.now(), { groupsRoot: boardRoot([readyPr()]) });
     expect(read).toEqual({ items: [] });
     expect(debug).toHaveBeenCalledWith('Attention sources: none declared', expect.objectContaining({}));
   });
 
-  it('reports a malformed declaration as a work item instead of blanking the workgroup', () => {
+  it('reports a malformed declaration as a work item instead of blanking the workgroup', async () => {
     const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
     declare(`[{"kind":"release-board","root":"../escape","channel_key":"${CHANNEL_KEY}"}]`);
-    const read = readAttentionItems(WORKGROUP, NOW, { groupsRoot: boardRoot([readyPr()]) });
+    const read = await readAttentionItems(WORKGROUP, NOW, { groupsRoot: boardRoot([readyPr()]) });
     // The source really is unreadable, so it emits no board rows — but the feed
     // is NOT silent about why.
     expect(read.items.map((i) => i.id)).toEqual([`${ATTENTION_ITEM_PREFIX}misconfigured:release-board:../escape:root`]);
@@ -277,7 +278,7 @@ describe('readAttentionItems', () => {
     );
   });
 
-  it('ignores an unknown kind with a warning rather than throwing, and still reads the known ones', () => {
+  it('ignores an unknown kind with a warning rather than throwing, and still reads the known ones', async () => {
     const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
     declare(
       JSON.stringify([
@@ -286,10 +287,7 @@ describe('readAttentionItems', () => {
       ]),
     );
     const groupsRoot = boardRoot([readyPr()]);
-    let read!: ReturnType<typeof readAttentionItems>;
-    expect(() => {
-      read = readAttentionItems(WORKGROUP, Date.now(), { groupsRoot, claimsRoot: tmp('nc-attn-claims-') });
-    }).not.toThrow();
+    const read = await readAttentionItems(WORKGROUP, Date.now(), { groupsRoot, claimsRoot: tmp('nc-attn-claims-') });
     expect(read.items).toHaveLength(1);
     expect(warn).toHaveBeenCalledWith(
       'Attention sources: unknown kind, ignoring this source',
@@ -297,32 +295,32 @@ describe('readAttentionItems', () => {
     );
   });
 
-  it('returns the memoized read inside the TTL, without re-reading the files', () => {
+  it('returns the memoized read inside the TTL, without re-reading the files', async () => {
     declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
     const groupsRoot = boardRoot([readyPr()]);
     const claimsRoot = tmp('nc-attn-claims-');
     const t0 = Date.parse(ASOF);
-    const first = readAttentionItems(WORKGROUP, t0, { groupsRoot, claimsRoot });
+    const first = await readAttentionItems(WORKGROUP, t0, { groupsRoot, claimsRoot });
     expect(first.items).toHaveLength(1);
 
     // Delete the board out from under it: only a cache hit can still answer.
     fs.rmSync(path.join(groupsRoot, WORKGROUP, 'releases'), { recursive: true, force: true });
-    expect(readAttentionItems(WORKGROUP, t0 + ATTENTION_MEMO_TTL_MS - 1, { groupsRoot, claimsRoot })).toBe(first);
+    expect(await readAttentionItems(WORKGROUP, t0 + ATTENTION_MEMO_TTL_MS - 1, { groupsRoot, claimsRoot })).toBe(first);
   });
 
-  it('re-reads once the TTL has elapsed', () => {
+  it('re-reads once the TTL has elapsed', async () => {
     declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
     const groupsRoot = boardRoot([readyPr()]);
     const claimsRoot = tmp('nc-attn-claims-');
     const t0 = Date.parse(ASOF);
-    expect(readAttentionItems(WORKGROUP, t0, { groupsRoot, claimsRoot }).items).toHaveLength(1);
+    expect((await readAttentionItems(WORKGROUP, t0, { groupsRoot, claimsRoot })).items).toHaveLength(1);
 
     fs.rmSync(path.join(groupsRoot, WORKGROUP, 'releases'), { recursive: true, force: true });
-    const after = readAttentionItems(WORKGROUP, t0 + ATTENTION_MEMO_TTL_MS, { groupsRoot, claimsRoot });
+    const after = await readAttentionItems(WORKGROUP, t0 + ATTENTION_MEMO_TTL_MS, { groupsRoot, claimsRoot });
     expect(after).toEqual({ items: [] });
   });
 
-  it('shows a defect AND the PR that fixes it, even when they share a number', () => {
+  it('shows a defect AND the PR that fixes it, even when they share a number', async () => {
     // Different objects at different stages: the defect asks a human for a
     // ruling, the PR asks a human for a ship. They are also different GitHub
     // NAMESPACES, so number-matching one against the other would silently
@@ -346,7 +344,7 @@ describe('readAttentionItems', () => {
         { kind: 'defect-register', root: 'releases', channel_key: CHANNEL_KEY, file: 'defects.md' },
       ]),
     );
-    const read = readAttentionItems(WORKGROUP, Date.now(), { groupsRoot, claimsRoot: tmp('nc-attn-claims-') });
+    const read = await readAttentionItems(WORKGROUP, Date.now(), { groupsRoot, claimsRoot: tmp('nc-attn-claims-') });
     expect(read.items.map((i) => i.id)).toEqual([
       `${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#201`,
       `${ATTENTION_ITEM_PREFIX}defect:example-org/example-app#201`,
@@ -354,7 +352,7 @@ describe('readAttentionItems', () => {
     expect(read.items.map((i) => i.sourceKind)).toEqual(['release-board', 'defect-register']);
   });
 
-  it('a stale source never drags a fresh sibling back with it — each row wears its OWN age', () => {
+  it('a stale source never drags a fresh sibling back with it — each row wears its OWN age', async () => {
     // The regression this whole per-source design exists for. One generator
     // (`defects.md`) last ran a week before the board did; the aggregate this
     // seam used to return took the OLDEST contributor, so a board refreshed
@@ -368,12 +366,12 @@ describe('readAttentionItems', () => {
         { kind: 'defect-register', root: 'releases', channel_key: CHANNEL_KEY, file: 'defects.md' },
       ]),
     );
-    const byKind = itemsByKind(groupsRoot);
+    const byKind = await itemsByKind(groupsRoot);
     expect(byKind.get('release-board')!.map((i) => i.sourceAsOf)).toEqual([FRESH]);
     expect(byKind.get('defect-register')!.map((i) => i.sourceAsOf)).toEqual([WEEK_OLD]);
   });
 
-  it('stamps every new provider kind with an id that can never be read as a thread id', () => {
+  it('stamps every new provider kind with an id that can never be read as a thread id', async () => {
     const groupsRoot = boardRoot([]);
     const dir = path.join(groupsRoot, WORKGROUP, 'releases');
     fs.writeFileSync(
@@ -395,7 +393,7 @@ describe('readAttentionItems', () => {
         { kind: 'branch-ci', root: 'releases', channel_key: CHANNEL_KEY, file: 'ci.json', branch: 'develop' },
       ]),
     );
-    const read = readAttentionItems(WORKGROUP, Date.now(), { groupsRoot, claimsRoot: tmp('nc-attn-claims-') });
+    const read = await readAttentionItems(WORKGROUP, Date.now(), { groupsRoot, claimsRoot: tmp('nc-attn-claims-') });
     expect(read.items.map((i) => i.sourceKind)).toEqual(['defect-register', 'open-questions', 'branch-ci']);
     for (const item of read.items) {
       expect(isAttentionItemId(item.id)).toBe(true);
@@ -406,7 +404,7 @@ describe('readAttentionItems', () => {
     }
   });
 
-  it('one source that cannot read its file does not blank the others', () => {
+  it('one source that cannot read its file does not blank the others', async () => {
     // A `branch-ci` declaration pointed at a markdown file: the JSON parse
     // fails, that source emits nothing and says so, and the sibling source on
     // the same list is still read in full. Half a feed and no feed are both
@@ -430,7 +428,7 @@ describe('readAttentionItems', () => {
         { kind: 'defect-register', root: 'releases', channel_key: CHANNEL_KEY, file: 'defects.md' },
       ]),
     );
-    const read = readAttentionItems(WORKGROUP, Date.now(), { groupsRoot, claimsRoot: tmp('nc-attn-claims-') });
+    const read = await readAttentionItems(WORKGROUP, Date.now(), { groupsRoot, claimsRoot: tmp('nc-attn-claims-') });
     expect(read.items.map((i) => i.sourceKind)).toEqual(['defect-register']);
     expect(warn).toHaveBeenCalled();
   });
@@ -543,23 +541,23 @@ describe('per-source staleness', () => {
     });
   });
 
-  it('marks ONLY the rows from the stale source; a fresh sibling stays unmarked', () => {
-    const byKind = itemsByKind(twoSources({ defectAsOf: WEEK_OLD, refreshHours: 24 }));
+  it('marks ONLY the rows from the stale source; a fresh sibling stays unmarked', async () => {
+    const byKind = await itemsByKind(twoSources({ defectAsOf: WEEK_OLD, refreshHours: 24 }));
     expect(byKind.get('release-board')!.map((i) => i.sourceStale)).toEqual([false]);
     // The register's own row, plus the synthetic notice about the register.
     expect(byKind.get('defect-register')!.map((i) => i.sourceStale)).toEqual([true, true]);
   });
 
-  it('makes NO staleness claim when the source declares no cadence — and emits no notice', () => {
+  it('makes NO staleness claim when the source declares no cadence — and emits no notice', async () => {
     // Not "fresh", not "stale". Nobody said. A default here would either invent
     // a deadline every source is suddenly late for, or vouch for a generator
     // that died months ago.
-    const items = itemsByKind(twoSources({ defectAsOf: WEEK_OLD })).get('defect-register')!;
+    const items = (await itemsByKind(twoSources({ defectAsOf: WEEK_OLD }))).get('defect-register')!;
     expect(items.map((i) => i.sourceStale)).toEqual([null]);
     expect(notice(items)).toBeUndefined();
   });
 
-  it('emits no notice for a source whose asOf is unknown — unknown is not stale', () => {
+  it('emits no notice for a source whose asOf is unknown — unknown is not stale', async () => {
     // A register with its `Generated` header stripped reports `asOf: null`. Its
     // rows are still real work and still emit; they just carry no claim.
     const groupsRoot = boardRoot([]);
@@ -572,13 +570,13 @@ describe('per-source staleness', () => {
         { kind: 'defect-register', root: 'releases', channel_key: CHANNEL_KEY, file: 'defects.md', refresh_hours: 24 },
       ]),
     );
-    const items = itemsByKind(groupsRoot).get('defect-register')!;
+    const items = (await itemsByKind(groupsRoot)).get('defect-register')!;
     expect(items.map((i) => i.sourceAsOf)).toEqual([null]);
     expect(items.map((i) => i.sourceStale)).toEqual([null]);
     expect(notice(items)).toBeUndefined();
   });
 
-  it('emits EXACTLY ONE notice per stale source, however many rows that source produced', () => {
+  it('emits EXACTLY ONE notice per stale source, however many rows that source produced', async () => {
     const groupsRoot = boardRoot([]);
     fs.writeFileSync(
       path.join(groupsRoot, WORKGROUP, 'releases', 'defects.md'),
@@ -597,23 +595,23 @@ describe('per-source staleness', () => {
         { kind: 'defect-register', root: 'releases', channel_key: CHANNEL_KEY, file: 'defects.md', refresh_hours: 24 },
       ]),
     );
-    const items = itemsByKind(groupsRoot).get('defect-register')!;
+    const items = (await itemsByKind(groupsRoot)).get('defect-register')!;
     expect(items.filter((i) => i.id.startsWith(`${ATTENTION_ITEM_PREFIX}stale:`))).toHaveLength(1);
     expect(items).toHaveLength(4);
   });
 
-  it('emits the notice even when the stale source produced NO rows at all', () => {
+  it('emits the notice even when the stale source produced NO rows at all', async () => {
     // The case that matters most: a generator that stopped is at its most
     // invisible when its last output happened to be empty.
-    const items = itemsByKind(
-      twoSources({ defectAsOf: WEEK_OLD, refreshHours: 24, register: emptyDefectRegister }),
+    const items = (
+      await itemsByKind(twoSources({ defectAsOf: WEEK_OLD, refreshHours: 24, register: emptyDefectRegister }))
     ).get('defect-register')!;
     expect(items).toHaveLength(1);
     expect(notice(items)).toBeDefined();
   });
 
-  it('routes the notice into `needs_you`, dates it from when the source went stale, and keeps a stable id', () => {
-    const items = itemsByKind(twoSources({ defectAsOf: WEEK_OLD, refreshHours: 24 })).get('defect-register')!;
+  it('routes the notice into `needs_you`, dates it from when the source went stale, and keeps a stable id', async () => {
+    const items = (await itemsByKind(twoSources({ defectAsOf: WEEK_OLD, refreshHours: 24 }))).get('defect-register')!;
     const item = notice(items)!;
 
     // `waiting on` verbatim is the ONLY thing that routes a parked row into
@@ -635,8 +633,8 @@ describe('per-source staleness', () => {
     expect(item.id).toBe(`${ATTENTION_ITEM_PREFIX}stale:defect-register:releases:defects.md`);
   });
 
-  it('gives the notice an id that can never become a channel key', () => {
-    const items = itemsByKind(twoSources({ defectAsOf: WEEK_OLD, refreshHours: 24 })).get('defect-register')!;
+  it('gives the notice an id that can never become a channel key', async () => {
+    const items = (await itemsByKind(twoSources({ defectAsOf: WEEK_OLD, refreshHours: 24 }))).get('defect-register')!;
     const item = notice(items)!;
     // The `board:` stamp is what `threadChannelKey` gates on. Without it the
     // parser reads `stale:defect-register:...` as platform plus channel and
@@ -646,7 +644,7 @@ describe('per-source staleness', () => {
     expect(threadChannelKey(item.id)).toBe(UNKNOWN_CHANNEL_KEY);
   });
 
-  it('gives two sources of the same kind their own notices rather than collapsing them', () => {
+  it('gives two sources of the same kind their own notices rather than collapsing them', async () => {
     const groupsRoot = boardRoot([]);
     const dir = path.join(groupsRoot, WORKGROUP, 'releases');
     fs.writeFileSync(path.join(dir, 'defects.md'), emptyDefectRegister(WEEK_OLD));
@@ -663,18 +661,14 @@ describe('per-source staleness', () => {
         },
       ]),
     );
-    expect(
-      itemsByKind(groupsRoot)
-        .get('defect-register')!
-        .map((i) => i.id),
-    ).toEqual([
+    expect((await itemsByKind(groupsRoot)).get('defect-register')!.map((i) => i.id)).toEqual([
       `${ATTENTION_ITEM_PREFIX}stale:defect-register:releases:defects.md`,
       `${ATTENTION_ITEM_PREFIX}stale:defect-register:releases:other-defects.md`,
     ]);
   });
 
-  it('never suppresses a stale source own rows — the rule is mark, never hide', () => {
-    const items = itemsByKind(twoSources({ defectAsOf: WEEK_OLD, refreshHours: 24 })).get('defect-register')!;
+  it('never suppresses a stale source own rows — the rule is mark, never hide', async () => {
+    const items = (await itemsByKind(twoSources({ defectAsOf: WEEK_OLD, refreshHours: 24 }))).get('defect-register')!;
     expect(items.map((i) => i.id)).toContain(`${ATTENTION_ITEM_PREFIX}defect:example-org/example-app#201`);
   });
 });
@@ -693,7 +687,7 @@ describe('per-source staleness', () => {
  * states, not two — healthy, explicitly-not-declared, and
  * misconfigured-and-saying-so.
  */
-describe('misconfigured declarations', () => {
+describe('misconfigured declarations', async () => {
   /** The `misconfigured:` notices among a read's items. */
   function notices(items: AttentionItem[]): AttentionItem[] {
     return items.filter((i) => i.id.startsWith(`${ATTENTION_ITEM_PREFIX}misconfigured:`));
@@ -704,8 +698,8 @@ describe('misconfigured declarations', () => {
     return items.filter((i) => !i.id.startsWith(`${ATTENTION_ITEM_PREFIX}misconfigured:`)).map((i) => i.id);
   }
 
-  function read(groupsRoot: string): AttentionItem[] {
-    return readAttentionItems(WORKGROUP, NOW, { groupsRoot, claimsRoot: tmp('nc-attn-claims-') }).items;
+  async function read(groupsRoot: string): Promise<AttentionItem[]> {
+    return (await readAttentionItems(WORKGROUP, NOW, { groupsRoot, claimsRoot: tmp('nc-attn-claims-') })).items;
   }
 
   /** A groups root with a release board AND a defect register, both readable. */
@@ -715,7 +709,7 @@ describe('misconfigured declarations', () => {
     return groupsRoot;
   }
 
-  it('one malformed declaration does not suppress its siblings', () => {
+  it('one malformed declaration does not suppress its siblings', async () => {
     // Three declarations, one typo. The other two are perfectly readable and
     // their items are real blocked work; subtracting them to signal a bad field
     // is disproportionate, and an empty queue is the lie the queue prevents.
@@ -726,19 +720,19 @@ describe('misconfigured declarations', () => {
         { kind: 'defect-register', root: 'releases', channel_key: CHANNEL_KEY, file: 'defects.md' },
       ]),
     );
-    expect(work(read(twoReadableSources()))).toEqual([
+    expect(work(await read(twoReadableSources()))).toEqual([
       `${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`,
       `${ATTENTION_ITEM_PREFIX}defect:example-org/example-app#201`,
     ]);
   });
 
-  it('a bad `refresh_hours` still emits the source items, with NO staleness claim', () => {
+  it('a bad `refresh_hours` still emits the source items, with NO staleness claim', async () => {
     // A cadence is a display marker. It may gate the marker; it may never gate
     // the rows. `null` and not `false`: unknown is not fresh.
     declare(
       JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY, refresh_hours: '6h' }]),
     );
-    const items = read(twoReadableSources());
+    const items = await read(twoReadableSources());
     const board = items.filter((i) => i.id === `${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`);
     expect(board).toHaveLength(1);
     expect(board[0]!.sourceStale).toBeNull();
@@ -750,14 +744,14 @@ describe('misconfigured declarations', () => {
     ]);
   });
 
-  it('an unusable `file` emits no items for that source, but still emits the notice', () => {
+  it('an unusable `file` emits no items for that source, but still emits the notice', async () => {
     // The other half of the distinction: this declaration names bytes that are
     // not there, so the source genuinely cannot be read and emitting nothing
     // for it is correct — emitting nothing ABOUT it is not.
     declare(
       JSON.stringify([{ kind: 'defect-register', root: 'releases', channel_key: CHANNEL_KEY, file: '../defects.md' }]),
     );
-    const items = read(twoReadableSources());
+    const items = await read(twoReadableSources());
     expect(work(items)).toEqual([]);
     expect(items.map((i) => i.id)).toEqual([
       `${ATTENTION_ITEM_PREFIX}misconfigured:defect-register:releases:../defects.md:file`,
@@ -766,7 +760,7 @@ describe('misconfigured declarations', () => {
     expect(items[0]!.claimNote).toContain('emitting no items at all');
   });
 
-  it('emits EXACTLY ONE notice per malformed declaration', () => {
+  it('emits EXACTLY ONE notice per malformed declaration', async () => {
     // Two broken entries, two notices — one each, never one per bad field
     // restating the same entry.
     declare(
@@ -775,18 +769,18 @@ describe('misconfigured declarations', () => {
         { kind: 'defect-register', root: 'releases', channel_key: CHANNEL_KEY, file: 'defects.md', refresh_hours: 0 },
       ]),
     );
-    const items = read(twoReadableSources());
+    const items = await read(twoReadableSources());
     expect(notices(items).map((i) => i.id)).toEqual([
       `${ATTENTION_ITEM_PREFIX}misconfigured:release-board:/absolute:root`,
       `${ATTENTION_ITEM_PREFIX}misconfigured:defect-register:releases:defects.md:refresh_hours`,
     ]);
   });
 
-  it('still emits a notice for a declaration too broken to name at all', () => {
+  it('still emits a notice for a declaration too broken to name at all', async () => {
     // Not an object, no usable `kind`: position is the only handle it has, and
     // an unnameable error is still an error the operator must see.
     declare(JSON.stringify(['release-board', { kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
-    const items = read(twoReadableSources());
+    const items = await read(twoReadableSources());
     expect(notices(items).map((i) => i.id)).toEqual([`${ATTENTION_ITEM_PREFIX}misconfigured:#0:declaration`]);
     // The healthy sibling still emits, which is the whole point.
     expect(work(items)).toContain(`${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`);
@@ -798,18 +792,18 @@ describe('misconfigured declarations', () => {
     expect(notices(items)[0]!.channel_key).toBe(UNKNOWN_CHANNEL_KEY);
   });
 
-  it('emits a notice even when the whole column is unreadable', () => {
+  it('emits a notice even when the whole column is unreadable', async () => {
     declare('{ not json');
-    expect(read(twoReadableSources()).map((i) => i.id)).toEqual([
+    expect((await read(twoReadableSources())).map((i) => i.id)).toEqual([
       `${ATTENTION_ITEM_PREFIX}misconfigured:declaration:attention_sources`,
     ]);
   });
 
-  it('routes the notice into `needs_you`, and dates it so the age cap can never cut it', () => {
+  it('routes the notice into `needs_you`, and dates it so the age cap can never cut it', async () => {
     declare(
       JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY, refresh_hours: '6h' }]),
     );
-    const item = notices(read(twoReadableSources()))[0]!;
+    const item = notices(await read(twoReadableSources()))[0]!;
 
     // `waiting on` verbatim is the ONLY thing that routes a parked row into
     // `needs_you` (`WAITING_ON_NOTE` in threads.ts). Without it the notice
@@ -854,11 +848,11 @@ describe('misconfigured declarations', () => {
     expect(item.sourceStale).toBeNull();
   });
 
-  it('gives the notice an id that can never become a channel key', () => {
+  it('gives the notice an id that can never become a channel key', async () => {
     declare(
       JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY, refresh_hours: '6h' }]),
     );
-    const item = notices(read(twoReadableSources()))[0]!;
+    const item = notices(await read(twoReadableSources()))[0]!;
     // The `board:` stamp is what `threadChannelKey` gates on. Without it the
     // parser reads `misconfigured:release-board:...` as platform plus channel
     // and mints one fake sidebar bucket per broken declaration — the per-row
@@ -867,28 +861,30 @@ describe('misconfigured declarations', () => {
     expect(threadChannelKey(item.id)).toBe(UNKNOWN_CHANNEL_KEY);
   });
 
-  it('keeps the id stable across polls, so an assignment reservation survives', () => {
+  it('keeps the id stable across polls, so an assignment reservation survives', async () => {
     declare(
       JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY, refresh_hours: '6h' }]),
     );
     const groupsRoot = twoReadableSources();
-    const first = notices(read(groupsRoot))[0]!.id;
+    const first = notices(await read(groupsRoot))[0]!.id;
     clearAttentionMemo();
-    const later = readAttentionItems(WORKGROUP, NOW + 10 * ATTENTION_MEMO_TTL_MS, {
-      groupsRoot,
-      claimsRoot: tmp('nc-attn-claims-'),
-    }).items;
+    const later = (
+      await readAttentionItems(WORKGROUP, NOW + 10 * ATTENTION_MEMO_TTL_MS, {
+        groupsRoot,
+        claimsRoot: tmp('nc-attn-claims-'),
+      })
+    ).items;
     expect(notices(later)[0]!.id).toBe(first);
   });
 
-  it('emits no notices at all for a fully valid workgroup', () => {
+  it('emits no notices at all for a fully valid workgroup', async () => {
     declare(
       JSON.stringify([
         { kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY, refresh_hours: 6 },
         { kind: 'defect-register', root: 'releases', channel_key: CHANNEL_KEY, file: 'defects.md', refresh_hours: 6 },
       ]),
     );
-    const items = read(twoReadableSources());
+    const items = await read(twoReadableSources());
     expect(notices(items)).toEqual([]);
     expect(items.map((i) => i.id)).toEqual([
       `${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`,

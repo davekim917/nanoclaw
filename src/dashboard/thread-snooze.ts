@@ -29,6 +29,7 @@
  * §2a still applies on top: out-of-scope, unprivileged and nonexistent all
  * collapse to one 404, so the gate never discloses that a thread exists.
  */
+import { withCentralSync } from '../db/central-lease.js';
 import { getDb } from '../db/connection.js';
 import { log } from '../log.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
@@ -114,7 +115,11 @@ async function loadThreadForSnooze(
   // why this is stricter than the capability needs. The activity mark below is
   // still taken over every VISIBLE session, so it compares like-for-like with
   // the `last_activity_at` the list computes.
-  if (!visible.some((r) => hasAdminPrivilege(ctx.user.id, r.agent_group_id))) return null;
+  const admin = await withCentralSync(
+    () => visible.some((r) => hasAdminPrivilege(ctx.user.id, r.agent_group_id)),
+    'thread snooze authority',
+  );
+  if (!admin) return null;
 
   let bestMs = -Infinity;
   for (const r of visible) {

@@ -22,6 +22,13 @@ import Database from 'better-sqlite3';
 import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, CONTAINER_INSTALL_LABEL, DATA_DIR } from './config.js';
 import { runningContainerMounts as inspectRunningContainerMounts } from './container-mounts.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
+import { type RawStatements, withCentralSync, withRawDb } from './db/central-lease.js';
+// Every remaining `getRawDb()` in this file executes in the storage maintenance
+// worker thread (`storage-maintenance-worker-thread.ts`), which opens its own
+// connection with `initDb` and has no host lease to join — the report and the
+// reclaim executors are only reachable through that thread. The one host-side
+// entry point, `finishInterruptedSessionArchivals`, takes the lease. Pinned by
+// `src/db/raw-outside-lease.test.ts`.
 import { getRawDb } from './db/connection.js';
 import { CONTAINER_CONFIGS_ALL_SQL } from './db/container-configs.js';
 import type { ContainerConfigRow } from './types.js';
@@ -1255,15 +1262,19 @@ function isConstraintViolation(err: unknown): boolean {
   );
 }
 
-function releaseArchivingRow(sessionId: string): 'active' | 'closed' | 'failed' {
+/**
+ * `db` is the storage worker thread's own handle from the reclaim executors,
+ * or the `withRawDb` facade from the host's boot-time finisher below.
+ */
+function releaseArchivingRow(db: RawStatements, sessionId: string): 'active' | 'closed' | 'failed' {
   try {
-    getRawDb().prepare("UPDATE sessions SET status = 'active' WHERE id = ? AND status = 'archiving'").run(sessionId);
+    db.prepare("UPDATE sessions SET status = 'active' WHERE id = ? AND status = 'archiving'").run(sessionId);
     return 'active';
   } catch (err) {
     // The ONLY expected failure: a fresh session claimed this row's active
     // triple while it was archiving (migration 049). That row is history now.
     if (isConstraintViolation(err)) {
-      getRawDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'").run(sessionId);
+      db.prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'").run(sessionId);
       log.warn('storage-manager: archiving row lost its triple to a newer session, closed instead', { sessionId });
       return 'closed';
     }
@@ -1415,7 +1426,7 @@ function createArchiveSessionAction(args: {
           fsyncDir(args.rescuesDir);
         } catch (err) {
           fs.rmSync(tempPath, { force: true });
-          if (args.sessionStatus === 'active') releaseArchivingRow(args.sessionId);
+          if (args.sessionStatus === 'active') releaseArchivingRow(getRawDb(), args.sessionId);
           throw err;
         }
 
@@ -1459,63 +1470,75 @@ function createArchiveSessionAction(args: {
  * journal line names a published archive for it, so the ~1,200 sessions closed
  * by ordinary session-close paths are never touched.
  */
-export function finishInterruptedSessionArchivals(sessionsRoot: string = sessionsBaseDir()): {
+/**
+ * Host-side, at boot (`main.ts`), so it runs under the central lease: the row
+ * reads and the status flips are one synchronous block with nothing able to
+ * interleave. The reclaim executors above run in the storage worker thread on
+ * that thread's own connection and take no host lease.
+ */
+export async function finishInterruptedSessionArchivals(sessionsRoot: string = sessionsBaseDir()): Promise<{
   released: number;
   finished: number;
   lost: number;
   failed: number;
-} {
+}> {
   const rescuesDir = path.join(path.dirname(sessionsRoot), SESSION_RESCUES_DIRNAME);
   const journal = readReclaimJournal(rescuesDir);
   const result = { released: 0, finished: 0, lost: 0, failed: 0 };
 
-  let archiving: Array<{ id: string; agent_group_id: string }>;
-  try {
-    archiving = getRawDb()
-      .prepare("SELECT id, agent_group_id FROM sessions WHERE status = 'archiving'")
-      .all() as typeof archiving;
-  } catch (err) {
-    log.warn('storage-manager: could not read interrupted archivals', { err });
-    return result;
-  }
+  await withCentralSync(
+    () =>
+      withRawDb((db) => {
+        let archiving: Array<{ id: string; agent_group_id: string }>;
+        try {
+          archiving = db
+            .prepare("SELECT id, agent_group_id FROM sessions WHERE status = 'archiving'")
+            .all() as typeof archiving;
+        } catch (err) {
+          log.warn('storage-manager: could not read interrupted archivals', { err });
+          return;
+        }
 
-  for (const row of archiving) {
-    const sessPath = path.join(sessionsRoot, row.agent_group_id, row.id);
-    const entry = journal.get(row.id);
-    // 'archiving' is a state only this module writes, so a journal line for a
-    // row still in it names THIS attempt — no stale-line ambiguity. The
-    // archive is re-listed here rather than trusted from its size.
-    if (entry && isPublishedArchive(entry.rescue_path)) {
-      const closed = getRawDb()
-        .prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'")
-        .run(row.id).changes;
-      if (closed !== 1) {
-        result.failed += 1;
-        continue;
-      }
-      if (fs.existsSync(sessPath)) fs.rmSync(sessPath, { recursive: true, force: true });
-      // Sibling of the session directory — see the note in the archival path.
-      fs.rmSync(sessionContextPathFor(sessPath), { force: true });
-      result.finished += 1;
-      continue;
-    }
-    if (!fs.existsSync(sessPath)) {
-      // Dir gone with no readable archive behind it. Closing the row is the
-      // only honest state — the session cannot run — but this is data loss and
-      // it gets said out loud rather than counted as a success.
-      getRawDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'").run(row.id);
-      log.error('storage-manager: session directory lost with no readable rescue archive', {
-        sessionId: row.id,
-        agentGroupId: row.agent_group_id,
-        rescuePath: entry?.rescue_path ?? null,
-      });
-      result.lost += 1;
-      continue;
-    }
-    const outcome = releaseArchivingRow(row.id);
-    if (outcome === 'failed') result.failed += 1;
-    else result.released += 1;
-  }
+        for (const row of archiving) {
+          const sessPath = path.join(sessionsRoot, row.agent_group_id, row.id);
+          const entry = journal.get(row.id);
+          // 'archiving' is a state only this module writes, so a journal line for a
+          // row still in it names THIS attempt — no stale-line ambiguity. The
+          // archive is re-listed here rather than trusted from its size.
+          if (entry && isPublishedArchive(entry.rescue_path)) {
+            const closed = db
+              .prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'")
+              .run(row.id).changes;
+            if (closed !== 1) {
+              result.failed += 1;
+              continue;
+            }
+            if (fs.existsSync(sessPath)) fs.rmSync(sessPath, { recursive: true, force: true });
+            // Sibling of the session directory — see the note in the archival path.
+            fs.rmSync(sessionContextPathFor(sessPath), { force: true });
+            result.finished += 1;
+            continue;
+          }
+          if (!fs.existsSync(sessPath)) {
+            // Dir gone with no readable archive behind it. Closing the row is the
+            // only honest state — the session cannot run — but this is data loss and
+            // it gets said out loud rather than counted as a success.
+            db.prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'").run(row.id);
+            log.error('storage-manager: session directory lost with no readable rescue archive', {
+              sessionId: row.id,
+              agentGroupId: row.agent_group_id,
+              rescuePath: entry?.rescue_path ?? null,
+            });
+            result.lost += 1;
+            continue;
+          }
+          const outcome = releaseArchivingRow(db, row.id);
+          if (outcome === 'failed') result.failed += 1;
+          else result.released += 1;
+        }
+      }),
+    'finish interrupted session archivals',
+  );
 
   // Temp archives never became a rescue path; nothing references them.
   try {

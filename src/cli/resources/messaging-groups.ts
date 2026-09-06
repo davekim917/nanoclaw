@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 
+import { withCentralSync } from '../../db/central-lease.js';
 import { resolveUnknownSenderPolicy } from '../../channels/channel-defaults.js';
 import { hasDeclaredChannelDefaults } from '../../channels/channel-registry.js';
 import { getDb } from '../../db/connection.js';
@@ -24,7 +25,7 @@ async function resolveLatestOwnerDm(): Promise<MessagingGroup | undefined> {
       ORDER BY ud.resolved_at DESC`,
   );
   for (const candidate of candidates) {
-    if (isOwner(candidate.user_id)) return candidate;
+    if (await withCentralSync(() => isOwner(candidate.user_id), 'resolveLatestOwnerDm')) return candidate;
   }
   return undefined;
 }

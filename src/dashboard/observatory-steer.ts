@@ -268,7 +268,7 @@ export const observatorySteerHandler: AuthHandler = async (req, _params, ctx) =>
   if (!text) return json(400, { error: 'empty_text' });
   if (text.length > MAX_TEXT) return json(400, { error: 'text_too_long', maxLength: MAX_TEXT });
 
-  const role = canAssign(ctx.user.id, agentGroupId);
+  const role = await canAssign(ctx.user.id, agentGroupId);
   if (!role.ok) return json(role.reason === 'not_found' ? 404 : 403, { error: role.reason });
 
   const agent = await getDb().get<AgentGroup>(

@@ -109,22 +109,22 @@ afterEach(async () => {
 
 describe('F-4.3b — thread-title retry keeps its batch cap, attempt cap and retry window', () => {
   it('excludes rows at the 5-attempt cap', async () => {
-    insertThreadTitleClaim(THREAD_ID, 'discord', 'opener', NOW);
-    for (let i = 0; i < 5; i++) recordThreadTitleAttemptFailure(THREAD_ID);
+    await insertThreadTitleClaim(THREAD_ID, 'discord', 'opener', NOW);
+    for (let i = 0; i < 5; i++) await recordThreadTitleAttemptFailure(THREAD_ID);
     expect(await retryPendingThreadTitles(NOW)).toEqual({ attempted: 0, titled: 0 });
   });
 
   it('excludes rows older than the 24h retry window', async () => {
     const staleId = `${THREAD_ID}:stale`;
-    insertThreadTitleClaim(staleId, 'discord', 'opener', '2026-08-29T12:00:00.000Z'); // 48h before NOW
-    recordThreadTitleAttemptFailure(staleId);
+    await insertThreadTitleClaim(staleId, 'discord', 'opener', '2026-08-29T12:00:00.000Z'); // 48h before NOW
+    await recordThreadTitleAttemptFailure(staleId);
     expect(await retryPendingThreadTitles(NOW)).toEqual({ attempted: 0, titled: 0 });
   });
 
   it('caps at 1 retry per call even with more eligible rows (RETRY_BATCH_CAP)', async () => {
     for (let i = 1; i <= 5; i++) {
-      insertThreadTitleClaim(`discord:g:c:${i}`, 'discord', `opener ${i}`, NOW);
-      recordThreadTitleAttemptFailure(`discord:g:c:${i}`);
+      await insertThreadTitleClaim(`discord:g:c:${i}`, 'discord', `opener ${i}`, NOW);
+      await recordThreadTitleAttemptFailure(`discord:g:c:${i}`);
     }
     const result = await retryPendingThreadTitles(NOW);
     expect(result.attempted).toBe(1);

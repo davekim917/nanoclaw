@@ -7,7 +7,7 @@ import {
   type SessionServicesCentral,
   type SessionServicesSnapshot,
 } from '../../capabilities.js';
-import { getRawDb } from '../../db/connection.js';
+import { type RawStatements, withRawDb } from '../../db/central-lease.js';
 import { log } from '../../log.js';
 import {
   queryArchiveExactLinks,
@@ -317,7 +317,7 @@ function extractSenderId(normalizedContent: string): string | null {
  * channelType as "no verified namespace for this conversation" and skips
  * stripping/prefixing rather than throwing.
  */
-function lookupChannelType(db: ReturnType<typeof getRawDb>, messagingGroupId: string | null): string | null {
+function lookupChannelType(db: RawStatements, messagingGroupId: string | null): string | null {
   if (!messagingGroupId) return null;
   try {
     const row = db.prepare('SELECT channel_type FROM messaging_groups WHERE id = ?').get(messagingGroupId) as
@@ -1857,22 +1857,26 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
   // otherwise make meaningless per line.
   const tokenStatsBefore = { ...TOKEN_STREAM_CACHE_STATS };
   const offsetStatsBefore = { ...OFFSET_SLICE_STATS };
-  const db = getRawDb();
-  const scope = db
-    .prepare(
-      `SELECT s.agent_group_id, s.messaging_group_id, s.thread_id, a.workgroup_id
+  // Lease-only (seam 3 §4.5): this runs inside the caller's `withCentralSync`
+  // block — the recall-row insert, or the admission pass that wraps it.
+  const scope = withRawDb(
+    (db) =>
+      db
+        .prepare(
+          `SELECT s.agent_group_id, s.messaging_group_id, s.thread_id, a.workgroup_id
          FROM sessions s
          JOIN agent_groups a ON a.id = s.agent_group_id
         WHERE s.id = ?`,
-    )
-    .get(input.sessionId) as
-    | {
-        agent_group_id: string;
-        messaging_group_id: string | null;
-        thread_id: string | null;
-        workgroup_id: string | null;
-      }
-    | undefined;
+        )
+        .get(input.sessionId) as
+        | {
+            agent_group_id: string;
+            messaging_group_id: string | null;
+            thread_id: string | null;
+            workgroup_id: string | null;
+          }
+        | undefined,
+  );
   if (!scope || scope.agent_group_id !== input.agentGroupId) {
     throw new Error(`Unable to resolve trusted session scope for ${input.agentGroupId}/${input.sessionId}`);
   }
@@ -1882,19 +1886,26 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
   // Looked up ONCE and reused below by both namespaceTriggerSenderId (trigger
   // fallback) and stripVerifiedPrefix (alreadyRepresented comparison, and
   // threaded into readMemoryEvidence's id tier) — see lookupChannelType.
-  const channelType = lookupChannelType(db, currentMessagingGroupId);
-  const fallbackGroup = db.prepare(`SELECT folder FROM agent_groups WHERE id = ?`).get(input.agentGroupId) as
-    | { folder: string }
-    | undefined;
-  const workgroupId = scope.workgroup_id ?? fallbackGroup?.folder;
-  if (!workgroupId) throw new Error(`Unable to resolve trusted workgroup for ${input.agentGroupId}/${input.sessionId}`);
-  const memberAgentGroupIds = scope.workgroup_id
-    ? (
-        db.prepare(`SELECT id FROM agent_groups WHERE workgroup_id = ? ORDER BY id`).all(workgroupId) as Array<{
-          id: string;
-        }>
-      ).map((row) => row.id)
-    : [input.agentGroupId];
+  // The same lease-only rule as the scope read above: one `withRawDb` block
+  // for the channel type, the fallback folder and the workgroup roster.
+  const { channelType, workgroupId, memberAgentGroupIds } = withRawDb((db) => {
+    const channelType = lookupChannelType(db, currentMessagingGroupId);
+    const fallbackGroup = db.prepare(`SELECT folder FROM agent_groups WHERE id = ?`).get(input.agentGroupId) as
+      | { folder: string }
+      | undefined;
+    const workgroupId = scope.workgroup_id ?? fallbackGroup?.folder;
+    if (!workgroupId) {
+      throw new Error(`Unable to resolve trusted workgroup for ${input.agentGroupId}/${input.sessionId}`);
+    }
+    const memberAgentGroupIds = scope.workgroup_id
+      ? (
+          db.prepare(`SELECT id FROM agent_groups WHERE workgroup_id = ? ORDER BY id`).all(workgroupId) as Array<{
+            id: string;
+          }>
+        ).map((row) => row.id)
+      : [input.agentGroupId];
+    return { channelType, workgroupId, memberAgentGroupIds };
+  });
   if (memberAgentGroupIds.length === 0 || !memberAgentGroupIds.includes(input.agentGroupId)) {
     throw new Error(`Unable to resolve trusted workgroup members for ${input.agentGroupId}/${input.sessionId}`);
   }
@@ -1981,10 +1992,13 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
     })) {
       // Raw, not the async `getUser`: this whole builder runs inside
       // `writeSessionMessage`'s synchronous recall block (seam-3 plan §4.5,
-      // I-1), so it executes the users leaf's exported SQL on the raw handle.
+      // I-1), so it executes the users leaf's exported SQL under that lease.
       const canonicalName = sender.senderId
-        ? (db.prepare(USER_BY_ID_SQL).get(sender.senderId) as { display_name?: string | null } | undefined)
-            ?.display_name
+        ? withRawDb(
+            (db) =>
+              (db.prepare(USER_BY_ID_SQL).get(sender.senderId) as { display_name?: string | null } | undefined)
+                ?.display_name,
+          )
         : undefined;
       const aliases =
         canonicalName && canonicalName !== sender.senderName ? [sender.senderName, canonicalName] : [sender.senderName];

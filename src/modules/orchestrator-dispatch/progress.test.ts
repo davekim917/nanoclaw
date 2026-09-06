@@ -114,7 +114,7 @@ describe('applySpawnProgress', () => {
     await applySpawnProgress({ task_id: 'task-1', message: 'Working' }, makeChildSession());
     const after = Date.now();
 
-    const task = getTaskById('task-1');
+    const task = await getTaskById('task-1');
     expect(task!.last_progress_message).toBe('Working');
     // last_progress_at should be within this test run
     const progressMs = new Date(task!.last_progress_at!).getTime();
@@ -129,7 +129,7 @@ describe('applySpawnProgress', () => {
 
     await applySpawnProgress({ task_id: 'task-1', message: 'X'.repeat(1000) }, makeChildSession());
 
-    const task = getTaskById('task-1');
+    const task = await getTaskById('task-1');
     expect(task!.last_progress_message!.length).toBe(500);
   });
 
@@ -143,7 +143,7 @@ describe('applySpawnProgress', () => {
     ).resolves.not.toThrow();
 
     // Task should be unchanged (no update happened)
-    const task = getTaskById('task-1');
+    const task = await getTaskById('task-1');
     expect(task!.last_progress_message).toBeNull(); // not updated
   });
 

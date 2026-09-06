@@ -84,7 +84,7 @@
  */
 import path from 'path';
 
-import { getRawDb } from './db/connection.js';
+import { withCentralSync, withRawDb } from './db/central-lease.js';
 import { log } from './log.js';
 import { readReleaseBoardSource } from './dashboard/api/board-attention.js';
 import {
@@ -531,12 +531,19 @@ function parseOneDecl(
  * editing a declaration, and a console whose central DB is unreadable has
  * larger problems than this feed. It still warns.
  */
-export function readAttentionSourceDecls(workgroupId: string): AttentionSourceParse {
+export async function readAttentionSourceDecls(workgroupId: string): Promise<AttentionSourceParse> {
   let row: { attention_sources: string | null } | undefined;
   try {
-    row = getRawDb().prepare(`SELECT attention_sources FROM workgroups WHERE id = ?`).get(workgroupId) as
-      | { attention_sources: string | null }
-      | undefined;
+    row = await withCentralSync(
+      () =>
+        withRawDb(
+          (db) =>
+            db.prepare(`SELECT attention_sources FROM workgroups WHERE id = ?`).get(workgroupId) as
+              | { attention_sources: string | null }
+              | undefined,
+        ),
+      'attention source decls',
+    );
   } catch (err) {
     log.warn('Attention sources: workgroup lookup failed, emitting nothing', { workgroupId, err });
     return { decls: [], defects: [] };
@@ -585,18 +592,26 @@ export function clearAttentionMemo(): void {
  * plausible `refresh_hours`, so the memo can never be what makes a source look
  * fresh.
  */
-export function readAttentionItems(workgroupId: string, now: number, env: AttentionSourceEnv = {}): AttentionRead {
+export async function readAttentionItems(
+  workgroupId: string,
+  now: number,
+  env: AttentionSourceEnv = {},
+): Promise<AttentionRead> {
   const key = `${workgroupId} ${env.groupsRoot ?? ''} ${env.claimsRoot ?? ''}`;
   const cached = memo.get(key);
   if (cached && now - cached.at < ATTENTION_MEMO_TTL_MS && now >= cached.at) return cached.read;
 
-  const read = computeAttentionItems(workgroupId, now, env);
+  const read = await computeAttentionItems(workgroupId, now, env);
   memo.set(key, { at: now, read });
   return read;
 }
 
-function computeAttentionItems(workgroupId: string, now: number, env: AttentionSourceEnv): AttentionRead {
-  const { decls, defects } = readAttentionSourceDecls(workgroupId);
+async function computeAttentionItems(
+  workgroupId: string,
+  now: number,
+  env: AttentionSourceEnv,
+): Promise<AttentionRead> {
+  const { decls, defects } = await readAttentionSourceDecls(workgroupId);
   if (decls.length === 0 && defects.length === 0) {
     log.debug('Attention sources: none declared', { workgroupId });
     return EMPTY;
@@ -889,17 +904,23 @@ function formatHours(hours: number): string {
  * pure narrowing — an item is visible exactly when the caller can already see
  * at least one sibling of the workgroup that declared it.
  */
-export function workgroupIdsForAgentGroups(agentGroupIds: string[]): string[] {
+export async function workgroupIdsForAgentGroups(agentGroupIds: string[]): Promise<string[]> {
   if (agentGroupIds.length === 0) return [];
   try {
-    return (
-      getRawDb()
-        .prepare(
-          `SELECT DISTINCT workgroup_id FROM agent_groups
+    const rows = await withCentralSync(
+      () =>
+        withRawDb(
+          (db) =>
+            db
+              .prepare(
+                `SELECT DISTINCT workgroup_id FROM agent_groups
             WHERE workgroup_id IS NOT NULL AND id IN (${agentGroupIds.map(() => '?').join(', ')})`,
-        )
-        .all(...agentGroupIds) as { workgroup_id: string }[]
-    ).map((r) => r.workgroup_id);
+              )
+              .all(...agentGroupIds) as { workgroup_id: string }[],
+        ),
+      'attention workgroups for agent groups',
+    );
+    return rows.map((r) => r.workgroup_id);
   } catch (err) {
     log.warn('Attention sources: workgroup lookup for agent groups failed', { err });
     return [];
@@ -907,11 +928,16 @@ export function workgroupIdsForAgentGroups(agentGroupIds: string[]): string[] {
 }
 
 /** Every workgroup that has declared anything at all — the `no_filter` caller's set. */
-export function workgroupIdsWithAttentionSources(): string[] {
+export async function workgroupIdsWithAttentionSources(): Promise<string[]> {
   try {
-    return (
-      getRawDb().prepare(`SELECT id FROM workgroups WHERE attention_sources IS NOT NULL`).all() as { id: string }[]
-    ).map((r) => r.id);
+    const rows = await withCentralSync(
+      () =>
+        withRawDb(
+          (db) => db.prepare(`SELECT id FROM workgroups WHERE attention_sources IS NOT NULL`).all() as { id: string }[],
+        ),
+      'attention workgroups with sources',
+    );
+    return rows.map((r) => r.id);
   } catch (err) {
     log.warn('Attention sources: workgroup scan failed', { err });
     return [];

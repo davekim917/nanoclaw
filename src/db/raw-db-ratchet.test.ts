@@ -36,10 +36,13 @@ const SCAN_ROOTS = ['src', 'scripts', 'setup'] as const;
  * Not callers, and excluded from the scan:
  *  - `connection.ts` defines both functions.
  *  - this file names them in its own matcher, so it would otherwise match itself.
+ *  - `raw-outside-lease.test.ts` (PR 6) pins the CALL sites the same way.
  */
 const DEFINER = 'src/db/connection.ts';
 const SELF = 'src/db/raw-db-ratchet.test.ts';
-const NOT_CALLERS: readonly string[] = [DEFINER, SELF];
+/** Names the identifier in its own matcher and fixture, like this file. */
+const LEASE_TRIPWIRE = 'src/db/raw-outside-lease.test.ts';
+const NOT_CALLERS: readonly string[] = [DEFINER, SELF, LEASE_TRIPWIRE];
 
 /**
  * Every file referencing `getRawDb` or `hasTableRaw`, shrink-only.
@@ -107,6 +110,12 @@ const NOT_CALLERS: readonly string[] = [DEFINER, SELF];
  * helpers, storage-manager, the boot reconcilers in `main.ts`, scripts/setup)
  * plus the test fixtures; it keeps shrinking under the same rule.
  *
+ * PR 6's Codex round 1 (#460) then put every remaining runtime raw statement
+ * under the lease — `withCentralSync(() => withRawDb(…))` at the leaf, or a
+ * lease-only `withRawDb` leaf whose callers take the lease — which dropped
+ * the importer set to the bare-handle files `src/db/raw-outside-lease.test.ts`
+ * enumerates plus the tests that seed through the raw handle (176 → 154).
+ *
  * PR 6 also carried the three "5c deferral" families 5b left raw (180 → 176):
  * `writeAudit`/`purgeIntentBody` (scheduled-shared.ts, with every caller in
  * cli/resources/tasks.ts, scheduled-move.ts, scheduled-mutations.ts and the
@@ -134,16 +143,13 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'setup/register.ts',
   'src/agent-runner-source.test.ts',
   'src/attention-sources.test.ts',
-  'src/attention-sources.ts',
   'src/capabilities.test.ts',
-  'src/capabilities.ts',
   'src/channels/channel-registry.test.ts',
   'src/channels/chat-sdk-bridge-byline.test.ts',
   'src/channels/chat-sdk-bridge-recovery.test.ts',
   'src/channels/slack-hop-limit.test.ts',
   'src/channels/slack-raw-text.test.ts',
   'src/claude-md-compose.test.ts',
-  'src/claude-md-compose.ts',
   'src/cli/crud-validate.test.ts',
   'src/cli/crud.test.ts',
   'src/cli/delivery-action.test.ts',
@@ -160,7 +166,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/command-gate.test.ts',
   'src/container-config.test.ts',
   'src/container-runner.test.ts',
-  'src/container-runner.ts',
   'src/dashboard/api/auth-me.test.ts',
   'src/dashboard/api/groups.test.ts',
   'src/dashboard/api/messaging-groups.test.ts',
@@ -184,30 +189,22 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/dashboard/session-title-sweep.test.ts',
   'src/dashboard/steer.test.ts',
   'src/dashboard/thread-close.test.ts',
-  'src/dashboard/thread-close.ts',
   'src/dashboard/thread-message.test.ts',
   'src/dashboard/thread-snooze.test.ts',
   'src/db/agent-groups.test.ts',
-  'src/db/backlog.ts',
   'src/db/boot-order.test.ts',
   'src/db/central-lease.ts',
   'src/db/channel-ingress-receipts.test.ts',
-  'src/db/channel-ingress-receipts.ts',
   'src/db/container-configs.test.ts',
   'src/db/db-v2.test.ts',
-  'src/db/denied-models.ts',
   'src/db/index.ts',
   'src/db/messaging-groups-instance.test.ts',
   'src/db/migrations/068-sessions-sweep-quiet-until.test.ts',
   'src/db/provider-health.test.ts',
   'src/db/scheduled-tasks.test.ts',
   'src/db/sessions.test.ts',
-  'src/db/support-threads.ts',
-  'src/db/task-thread-anchors.ts',
-  'src/db/thread-titles.ts',
   'src/db/usage.test.ts',
   'src/delivery.test.ts',
-  'src/delivery.ts',
   'src/group-init.settings.test.ts',
   'src/host-core.test.ts',
   'src/host-lifecycle-timers.test.ts',
@@ -228,14 +225,11 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/bash-gate/index.test.ts',
   'src/modules/channel-auto-wire/index.test.ts',
   'src/modules/claims/self-heal.test.ts',
-  'src/modules/claims/self-heal.ts',
   'src/modules/memory/pre-turn-context.test.ts',
-  'src/modules/memory/pre-turn-context.ts',
   'src/modules/orchestrator-dispatch/cancellation.test.ts',
   'src/modules/orchestrator-dispatch/completion.test.ts',
   'src/modules/orchestrator-dispatch/db/agent-group-capabilities.test.ts',
   'src/modules/orchestrator-dispatch/db/tasks.test.ts',
-  'src/modules/orchestrator-dispatch/db/tasks.ts',
   'src/modules/orchestrator-dispatch/dispatch.test.ts',
   'src/modules/orchestrator-dispatch/integration.test.ts',
   'src/modules/orchestrator-dispatch/needs-input.test.ts',
@@ -243,10 +237,7 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/orchestrator-dispatch/reconciler.test.ts',
   'src/modules/permissions/channel-approval-folder-race.test.ts',
   'src/modules/permissions/channel-approval.test.ts',
-  'src/modules/permissions/db/agent-group-members.ts',
-  'src/modules/permissions/db/pending-channel-approvals.ts',
   'src/modules/permissions/db/user-roles.test.ts',
-  'src/modules/permissions/db/user-roles.ts',
   'src/modules/permissions/grant.test.ts',
   'src/modules/permissions/permissions.test.ts',
   'src/modules/permissions/sender-approval.test.ts',
@@ -255,7 +246,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/permissions/user-dm-adopt.test.ts',
   'src/modules/provider-fallback/handler.test.ts',
   'src/modules/repository-workspaces/index.test.ts',
-  'src/modules/repository-workspaces/index.ts',
   'src/modules/scheduling/create.test.ts',
   'src/modules/self-mod/apply.test.ts',
   'src/modules/self-mod/request.test.ts',
@@ -277,16 +267,13 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/providers/opencode.container-config.test.ts',
   'src/router.session-skip.test.ts',
   'src/router.test.ts',
-  'src/router.ts',
   'src/session-manager.attachments.test.ts',
   'src/session-manager.test.ts',
   'src/state-sqlite.test.ts',
-  'src/state-sqlite.ts',
   'src/storage-gc.test.ts',
   'src/storage-manager.test.ts',
   'src/storage-manager.ts',
   'src/storage-pressure-alert.test.ts',
-  'src/storage-pressure-alert.ts',
   'src/templates/create-agent.test.ts',
   'src/test-fixtures/raw-db-fake.ts',
   'src/topic-title.test.ts',

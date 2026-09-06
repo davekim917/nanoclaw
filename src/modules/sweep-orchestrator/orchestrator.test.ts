@@ -598,11 +598,11 @@ describe('auto-archive covers completed tasks older than 24h and never failed ta
       .run(taskId, taskId, completedAt, completedAt, completedAt);
   }
 
-  it('archives completed tasks older than 24 hours', () => {
+  it('archives completed tasks older than 24 hours', async () => {
     insertCompletedTask('old', new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString());
     insertCompletedTask('fresh', new Date(Date.now() - 1 * 60 * 60 * 1000).toISOString());
 
-    autoArchiveOldCompleted();
+    await autoArchiveOldCompleted();
 
     const rows = getRawDb().prepare('SELECT task_id, archived_at FROM tasks ORDER BY task_id').all() as Array<{
       task_id: string;
@@ -613,12 +613,12 @@ describe('auto-archive covers completed tasks older than 24h and never failed ta
     expect(byId['fresh']).toBeNull();
   });
 
-  it('does not re-archive already-archived rows', () => {
+  it('does not re-archive already-archived rows', async () => {
     const original = '2026-05-01T00:00:00.000Z';
     insertCompletedTask('t1', new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString());
     getRawDb().prepare(`UPDATE tasks SET archived_at = ? WHERE task_id = 't1'`).run(original);
 
-    autoArchiveOldCompleted();
+    await autoArchiveOldCompleted();
 
     const row = getRawDb().prepare('SELECT archived_at FROM tasks WHERE task_id = ?').get('t1') as {
       archived_at: string;
@@ -626,7 +626,7 @@ describe('auto-archive covers completed tasks older than 24h and never failed ta
     expect(row.archived_at).toBe(original);
   });
 
-  it('leaves failed tasks alone regardless of age', () => {
+  it('leaves failed tasks alone regardless of age', async () => {
     getRawDb()
       .prepare(
         `INSERT INTO tasks (
@@ -641,7 +641,7 @@ describe('auto-archive covers completed tasks older than 24h and never failed ta
         new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString(),
       );
 
-    autoArchiveOldCompleted();
+    await autoArchiveOldCompleted();
 
     const row = getRawDb().prepare('SELECT archived_at FROM tasks WHERE task_id = ?').get('f1') as {
       archived_at: string | null;
@@ -744,7 +744,7 @@ describe('the dormant module takes no action when the spawn_task capability is r
     capabilityGranted = true;
     const duty = getDuty('orchestrator-reconciler');
 
-    void duty.run(fakeTickContext());
+    await duty.run(fakeTickContext());
     await new Promise((resolve) => setImmediate(resolve));
 
     expect(completeSpawnSideEffects).toHaveBeenCalledWith('would-be-reconciled', 'parent-ag');
@@ -784,7 +784,7 @@ describe('the registered orchestrator-reconciler wrapper calls runReconcilerSwee
     expect(runReconcilerSweep).toHaveBeenCalledWith();
   });
 
-  it('a throw from runReconcilerSweep propagates out of run(ctx) uncaught', () => {
+  it('a throw from runReconcilerSweep propagates out of run(ctx) uncaught', async () => {
     // T6 "carries no guard of its own" (index.ts's own comment) — the phase
     // runner (src/host-sweep.ts's runTickPhase) is the only thing that
     // catches it and logs 'Host sweep duty failed'. This wrapper must not
@@ -794,7 +794,7 @@ describe('the registered orchestrator-reconciler wrapper calls runReconcilerSwee
       throw new Error('reconciler boom');
     });
 
-    expect(() => duty.run(fakeTickContext())).toThrow('reconciler boom');
+    await expect(duty.run(fakeTickContext())).rejects.toThrow('reconciler boom');
   });
 });
 

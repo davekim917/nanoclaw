@@ -79,7 +79,7 @@ export async function runCommitScanOnce(groupsDir: string = GROUPS_DIR): Promise
     if (!fs.existsSync(groupDir)) continue;
     const repos = discoverRepos(groupDir);
     for (const repoDir of repos) {
-      const commits = scanRepo(repoDir, group.id);
+      const commits = await scanRepo(repoDir, group.id);
       if (commits > 0) totalCommits += commits;
       totalRepos += 1;
     }
@@ -209,7 +209,7 @@ function getRecentCommits(repoDir: string, branch: string, limit: number): Commi
   return stdout.trim().split('\n').map(parseCommitLine).reverse();
 }
 
-function scanRepo(repoDir: string, agentGroupId: string): number {
+async function scanRepo(repoDir: string, agentGroupId: string): Promise<number> {
   const defaultBranch = getDefaultBranch(repoDir);
   if (!defaultBranch) return 0;
 
@@ -227,7 +227,7 @@ function scanRepo(repoDir: string, agentGroupId: string): number {
   const latestSha = getLatestCommitSha(repoDir, remoteRef);
   if (!latestSha) return 0;
 
-  const state = getCommitDigestState(repoDir);
+  const state = await getCommitDigestState(repoDir);
   const lastSha = state?.last_commit_sha ?? null;
   if (lastSha === latestSha) return 0;
 
@@ -235,7 +235,7 @@ function scanRepo(repoDir: string, agentGroupId: string): number {
     ? getDirectCommitsSince(repoDir, remoteRef, lastSha)
     : getRecentCommits(repoDir, remoteRef, FIRST_SCAN_COMMIT_CAP);
 
-  upsertCommitDigestState({
+  await upsertCommitDigestState({
     repo_path: repoDir,
     agent_group_id: agentGroupId,
     last_commit_sha: latestSha,
@@ -256,7 +256,7 @@ function scanRepo(repoDir: string, agentGroupId: string): number {
   }
   const description = lines.join('\n');
 
-  addShipLogEntry({
+  await addShipLogEntry({
     id: `ship-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     agent_group_id: agentGroupId,
     title,

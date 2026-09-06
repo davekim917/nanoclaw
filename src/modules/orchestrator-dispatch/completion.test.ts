@@ -147,7 +147,7 @@ describe('applySpawnComplete', () => {
 
     await applySpawnComplete({ task_id: 'task-1', summary: 'Done!' }, makeChildSession());
 
-    const task = getTaskById('task-1');
+    const task = await getTaskById('task-1');
     expect(task!.status).toBe('completed');
     expect(task!.result_summary).toBe('Done!');
     expect(task!.completed_at).toBeTruthy();
@@ -167,7 +167,7 @@ describe('applySpawnComplete', () => {
 
     await applySpawnComplete({}, makeChildSession()); // no task_id
 
-    const task = getTaskById('task-1');
+    const task = await getTaskById('task-1');
     expect(task!.status).toBe('running'); // unchanged
   });
 
@@ -178,7 +178,7 @@ describe('applySpawnComplete', () => {
 
     await applySpawnComplete({ task_id: 'task-1', summary: 'Done' }, makeWrongSession());
 
-    const task = getTaskById('task-1');
+    const task = await getTaskById('task-1');
     expect(task!.status).toBe('running'); // unchanged
 
     const { writeSessionMessage } = await import('../../session-manager.js');
@@ -198,7 +198,7 @@ describe('applySpawnComplete', () => {
     const { writeSessionMessage } = await import('../../session-manager.js');
     await applySpawnComplete({ task_id: 'task-1', summary: 'Done' }, makeChildSession());
 
-    const updated = getTaskById('task-1');
+    const updated = await getTaskById('task-1');
     expect(updated!.status).toBe('cancelled'); // unchanged — CAS rejected
     expect(vi.mocked(writeSessionMessage)).not.toHaveBeenCalled();
   });
@@ -218,7 +218,7 @@ describe('applySpawnFailed', () => {
       makeChildSession(),
     );
 
-    const task = getTaskById('task-1');
+    const task = await getTaskById('task-1');
     expect(task!.status).toBe('failed');
     expect(task!.fail_reason).toBe('agent_error');
     expect(task!.result_summary).toBe('Error occurred');
@@ -231,7 +231,7 @@ describe('applySpawnFailed', () => {
 
     await applySpawnFailed({ task_id: 'task-1', summary: 'X' }, makeWrongSession());
 
-    const task = getTaskById('task-1');
+    const task = await getTaskById('task-1');
     expect(task!.status).toBe('running'); // unchanged
   });
 

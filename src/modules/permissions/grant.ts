@@ -22,6 +22,7 @@
  *      `/init-first-agent` or a direct DB edit.
  */
 
+import { withCentralSync } from '../../db/central-lease.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
 import { deriveCallerId } from '../../caller-identity.js';
@@ -70,12 +71,14 @@ async function resolveTargetUserId(rawUser: string, session: Session): Promise<s
   return `${channelType}:${handle}`;
 }
 
-function describeAuthority(userId: string, agentGroupId: string): string {
-  const parts: string[] = [];
-  if (isOwner(userId)) parts.push('owner');
-  if (isGlobalAdmin(userId)) parts.push('global_admin');
-  if (isAdminOfAgentGroup(userId, agentGroupId)) parts.push('admin_of_group');
-  return parts.length > 0 ? parts.join(', ') : 'none';
+function describeAuthority(userId: string, agentGroupId: string): Promise<string> {
+  return withCentralSync(() => {
+    const parts: string[] = [];
+    if (isOwner(userId)) parts.push('owner');
+    if (isGlobalAdmin(userId)) parts.push('global_admin');
+    if (isAdminOfAgentGroup(userId, agentGroupId)) parts.push('admin_of_group');
+    return parts.length > 0 ? parts.join(', ') : 'none';
+  }, 'describeAuthority');
 }
 
 async function ensureUserExists(userId: string): Promise<void> {
@@ -115,14 +118,19 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
     return;
   }
 
-  // Authorization.
-  const callerIsGlobal = isOwner(callerId) || isGlobalAdmin(callerId);
-  const callerIsScopedAdmin = isAdminOfAgentGroup(callerId, targetAgentGroupId);
+  // Authorization. The role predicates are lease-only (§4.5 I-1).
+  const { callerIsGlobal, callerIsScopedAdmin } = await withCentralSync(
+    () => ({
+      callerIsGlobal: isOwner(callerId) || isGlobalAdmin(callerId),
+      callerIsScopedAdmin: isAdminOfAgentGroup(callerId, targetAgentGroupId),
+    }),
+    'grant_access authority',
+  );
   if (!callerIsGlobal && !callerIsScopedAdmin) {
     log.info('grant_access denied', {
       callerId,
       targetAgentGroupId,
-      authority: describeAuthority(callerId, targetAgentGroupId),
+      authority: await describeAuthority(callerId, targetAgentGroupId),
     });
     await notifyAgent(
       session,
@@ -150,7 +158,11 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
   await ensureUserExists(targetUserId);
 
   if (role === 'member') {
-    if (isMember(targetUserId, targetAgentGroupId) || hasAdminPrivilege(targetUserId, targetAgentGroupId)) {
+    const alreadyHasAccess = await withCentralSync(
+      () => isMember(targetUserId, targetAgentGroupId) || hasAdminPrivilege(targetUserId, targetAgentGroupId),
+      'grant_access member check',
+    );
+    if (alreadyHasAccess) {
       await notifyAgent(session, `\`${targetUserId}\` already has access to \`${targetAgentGroupId}\`.`);
       return;
     }
@@ -173,7 +185,7 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
   }
 
   // role === 'admin'
-  if (isAdminOfAgentGroup(targetUserId, targetAgentGroupId)) {
+  if (await withCentralSync(() => isAdminOfAgentGroup(targetUserId, targetAgentGroupId), 'grant_access admin check')) {
     await notifyAgent(session, `\`${targetUserId}\` is already admin of \`${targetAgentGroupId}\`.`);
     return;
   }
@@ -211,8 +223,13 @@ export async function handleRevokeAccess(content: Record<string, unknown>, sessi
     return;
   }
 
-  const callerIsGlobal = isOwner(callerId) || isGlobalAdmin(callerId);
-  const callerIsScopedAdmin = isAdminOfAgentGroup(callerId, targetAgentGroupId);
+  const { callerIsGlobal, callerIsScopedAdmin } = await withCentralSync(
+    () => ({
+      callerIsGlobal: isOwner(callerId) || isGlobalAdmin(callerId),
+      callerIsScopedAdmin: isAdminOfAgentGroup(callerId, targetAgentGroupId),
+    }),
+    'revoke_access authority',
+  );
   if (!callerIsGlobal && !callerIsScopedAdmin) {
     await notifyAgent(
       session,
@@ -227,24 +244,34 @@ export async function handleRevokeAccess(content: Record<string, unknown>, sessi
     return;
   }
 
+  // The target's standing, read as one block so the checks below see one snapshot.
+  const target = await withCentralSync(
+    () => ({
+      isGlobal: isOwner(targetUserId) || isGlobalAdmin(targetUserId),
+      isOwner: isOwner(targetUserId),
+      isAdminOfGroup: isAdminOfAgentGroup(targetUserId, targetAgentGroupId),
+      isMember: isMember(targetUserId, targetAgentGroupId),
+    }),
+    'revoke_access target standing',
+  );
   // Never let a scoped admin revoke owner or global admin.
-  if (!callerIsGlobal && (isOwner(targetUserId) || isGlobalAdmin(targetUserId))) {
+  if (!callerIsGlobal && target.isGlobal) {
     await notifyAgent(session, 'revoke_access denied: you cannot revoke an owner or global admin. Ask a global admin.');
     return;
   }
   // Owners are never revoked via this path — sensitive, do it manually.
-  if (isOwner(targetUserId)) {
+  if (target.isOwner) {
     await notifyAgent(session, 'revoke_access refused: owner revocation must be done by direct edit (safety).');
     return;
   }
   // Scoped admins can only revoke `member`, not `admin` (that's an escalation).
-  if (!callerIsGlobal && isAdminOfAgentGroup(targetUserId, targetAgentGroupId)) {
+  if (!callerIsGlobal && target.isAdminOfGroup) {
     await notifyAgent(session, 'revoke_access denied: only a global admin can revoke another admin.');
     return;
   }
 
   let revoked = false;
-  if (isMember(targetUserId, targetAgentGroupId)) {
+  if (target.isMember) {
     await removeMember(targetUserId, targetAgentGroupId);
     revoked = true;
   }
@@ -265,10 +292,10 @@ export async function handleRevokeAccess(content: Record<string, unknown>, sessi
   // for a legitimate flow: a scoped caller that reaches this line was already
   // proven not to be facing an admin target, so this branch was a no-op for
   // them in every non-racing case.
-  if (callerIsGlobal && isAdminOfAgentGroup(targetUserId, targetAgentGroupId)) {
+  if (callerIsGlobal && target.isAdminOfGroup) {
     await revokeRole(targetUserId, 'admin', targetAgentGroupId);
     revoked = true;
-  } else if (!callerIsGlobal && isAdminOfAgentGroup(targetUserId, targetAgentGroupId)) {
+  } else if (!callerIsGlobal && target.isAdminOfGroup) {
     log.warn('revoke_access: target gained an admin role mid-revoke — role left in place', {
       callerId,
       targetUserId,

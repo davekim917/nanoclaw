@@ -8,6 +8,7 @@
  * - Intercept commands: handled by a registered handler before fan-out
  * - Normal messages: pass through unchanged
  */
+import { withCentralSync } from './db/central-lease.js';
 import { hasAdminPrivilege, isAnyAdmin } from './modules/permissions/db/user-roles.js';
 import { hasAnyMembership } from './modules/permissions/db/agent-group-members.js';
 
@@ -136,7 +137,7 @@ export async function preFanoutGate(content: string, userId: string): Promise<Ga
  * 'filter' for silently-dropped commands, 'deny' for unauthorized
  * admin commands.
  */
-export function gateCommand(content: string, userId: string | null, agentGroupId: string): GateResult {
+export async function gateCommand(content: string, userId: string | null, agentGroupId: string): Promise<GateResult> {
   let text: string;
   try {
     const parsed = JSON.parse(content);
@@ -155,7 +156,7 @@ export function gateCommand(content: string, userId: string | null, agentGroupId
   if (FILTERED_COMMANDS.has(command)) return { action: 'filter' };
 
   if (ADMIN_COMMANDS.has(command)) {
-    if (isAdmin(userId, agentGroupId)) {
+    if (await isAdmin(userId, agentGroupId)) {
       return { action: 'pass' };
     }
     return { action: 'deny', command };
@@ -165,7 +166,7 @@ export function gateCommand(content: string, userId: string | null, agentGroupId
   return { action: 'pass' };
 }
 
-function isAdmin(userId: string | null, agentGroupId: string): boolean {
-  if (!userId) return false;
-  return hasAdminPrivilege(userId, agentGroupId);
+function isAdmin(userId: string | null, agentGroupId: string): Promise<boolean> {
+  if (!userId) return Promise.resolve(false);
+  return withCentralSync(() => hasAdminPrivilege(userId, agentGroupId), 'command gate admin check');
 }

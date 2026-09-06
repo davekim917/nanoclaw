@@ -411,7 +411,7 @@ export async function routeAgentMessage(
   // not be able to wipe or reconfigure another agent's session by putting one
   // in a message. Dropped rather than denied — there is no human to explain a
   // refusal to, and the sending agent has no ack channel for send_message.
-  const commandGate = gateCommand(msg.content, null, targetAgentGroupId);
+  const commandGate = await gateCommand(msg.content, null, targetAgentGroupId);
   if (commandGate.action !== 'pass') {
     log.warn('agent-route: dropping privileged slash command from a peer agent', {
       from: sourceAgentGroupId,

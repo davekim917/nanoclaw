@@ -24,9 +24,9 @@ async function setupDb(): Promise<void> {
  * async IIFE settles). Poll instead of counting microtask hops — robust to
  * however many `await`s sit between here and the DB write.
  */
-async function waitUntil(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
+async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs = 1000): Promise<void> {
   const start = Date.now();
-  while (!predicate()) {
+  while (!(await predicate())) {
     if (Date.now() - start > timeoutMs) throw new Error('waitUntil: timed out waiting for condition');
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
@@ -57,20 +57,20 @@ describe('maybeRenameNewThread — durable idempotency (migration 062)', () => {
   });
 
   it('titles a genuinely new thread once', async () => {
-    maybeRenameNewThread('discord', THREAD_ID, 'first message about EXAMPLE-1 rollout');
+    await maybeRenameNewThread('discord', THREAD_ID, 'first message about EXAMPLE-1 rollout');
     await waitUntil(() => fetchMock.mock.calls.length > 0);
 
     expect(callHaiku).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    const row = getThreadTitleRow(THREAD_ID);
+    const row = await getThreadTitleRow(THREAD_ID);
     expect(row?.title).toBe('Rollout fix');
     expect(row?.first_message).toBe('first message about EXAMPLE-1 rollout');
   });
 
   it('does NOT re-title an already-titled thread when a new session is created for it (the archival regression)', async () => {
     // First message on a brand-new thread — titles successfully.
-    maybeRenameNewThread('discord', THREAD_ID, 'first message about EXAMPLE-1 rollout');
-    await waitUntil(() => getThreadTitleRow(THREAD_ID)?.title != null);
+    await maybeRenameNewThread('discord', THREAD_ID, 'first message about EXAMPLE-1 rollout');
+    await waitUntil(async () => (await getThreadTitleRow(THREAD_ID))?.title != null);
     expect(callHaiku).toHaveBeenCalledTimes(1);
 
     // Simulate storage-manager archiving the idle session and a HOST RESTART
@@ -80,7 +80,7 @@ describe('maybeRenameNewThread — durable idempotency (migration 062)', () => {
     // maybeRenameNewThread again with created=true — but this text is a
     // FOLLOW-UP, not the thread's original opener.
     _resetRenamedThreadsForTest();
-    maybeRenameNewThread('discord', THREAD_ID, 'a totally unrelated follow-up message weeks later');
+    await maybeRenameNewThread('discord', THREAD_ID, 'a totally unrelated follow-up message weeks later');
     // Give the (non-existent) second attempt a chance to run before asserting
     // it never did.
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -89,7 +89,7 @@ describe('maybeRenameNewThread — durable idempotency (migration 062)', () => {
     // what must have prevented it.
     expect(callHaiku).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    const row = getThreadTitleRow(THREAD_ID);
+    const row = await getThreadTitleRow(THREAD_ID);
     expect(row?.title).toBe('Rollout fix');
     expect(row?.first_message).toBe('first message about EXAMPLE-1 rollout');
   });
@@ -97,7 +97,7 @@ describe('maybeRenameNewThread — durable idempotency (migration 062)', () => {
   it('resolves the sibling bot token for a discord-<suffix> channelType', async () => {
     process.env.DISCORD_BOT_TOKEN_EXAMPLE_AGENT = 'sibling-token';
     try {
-      maybeRenameNewThread('discord-example-agent', THREAD_ID, 'sibling thread opener');
+      await maybeRenameNewThread('discord-example-agent', THREAD_ID, 'sibling thread opener');
       await waitUntil(() => fetchMock.mock.calls.length > 0);
 
       expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -132,8 +132,8 @@ describe('retryPendingThreadTitles — host-sweep retry step', () => {
   });
 
   it('retries a failed row from its STORED original first_message, not a later follow-up', async () => {
-    insertThreadTitleClaim(THREAD_ID, 'discord', 'the ORIGINAL opening message', NOW);
-    recordThreadTitleAttemptFailure(THREAD_ID); // attempts=1, still under the cap
+    await insertThreadTitleClaim(THREAD_ID, 'discord', 'the ORIGINAL opening message', NOW);
+    await recordThreadTitleAttemptFailure(THREAD_ID); // attempts=1, still under the cap
 
     const result = await retryPendingThreadTitles(NOW);
 
@@ -142,13 +142,13 @@ describe('retryPendingThreadTitles — host-sweep retry step', () => {
     // The prompt handed to Haiku must contain the ORIGINAL message — never a
     // follow-up, since none is stored anywhere for this row to regenerate from.
     expect(vi.mocked(callHaiku).mock.calls[0][0]).toContain('the ORIGINAL opening message');
-    const row = getThreadTitleRow(THREAD_ID);
+    const row = await getThreadTitleRow(THREAD_ID);
     expect(row?.title).toBe('Retried title');
   });
 
   it('excludes rows past the attempt cap', async () => {
-    insertThreadTitleClaim(THREAD_ID, 'discord', 'opener', NOW);
-    for (let i = 0; i < 5; i++) recordThreadTitleAttemptFailure(THREAD_ID); // attempts=5, at the cap
+    await insertThreadTitleClaim(THREAD_ID, 'discord', 'opener', NOW);
+    for (let i = 0; i < 5; i++) await recordThreadTitleAttemptFailure(THREAD_ID); // attempts=5, at the cap
 
     const result = await retryPendingThreadTitles(NOW);
 
@@ -158,8 +158,8 @@ describe('retryPendingThreadTitles — host-sweep retry step', () => {
 
   it('excludes rows older than the 24h retry window', async () => {
     const staleCreatedAt = '2026-08-29T12:00:00.000Z'; // 48h before NOW
-    insertThreadTitleClaim(THREAD_ID, 'discord', 'opener', staleCreatedAt);
-    recordThreadTitleAttemptFailure(THREAD_ID);
+    await insertThreadTitleClaim(THREAD_ID, 'discord', 'opener', staleCreatedAt);
+    await recordThreadTitleAttemptFailure(THREAD_ID);
 
     const result = await retryPendingThreadTitles(NOW);
 
@@ -169,8 +169,8 @@ describe('retryPendingThreadTitles — host-sweep retry step', () => {
 
   it('caps at 1 retry per call even with more eligible rows (dropped from 3 — see src/topic-title.ts RETRY_BATCH_CAP)', async () => {
     for (let i = 1; i <= 5; i++) {
-      insertThreadTitleClaim(`discord:g:c:${i}`, 'discord', `opener ${i}`, NOW);
-      recordThreadTitleAttemptFailure(`discord:g:c:${i}`);
+      await insertThreadTitleClaim(`discord:g:c:${i}`, 'discord', `opener ${i}`, NOW);
+      await recordThreadTitleAttemptFailure(`discord:g:c:${i}`);
     }
 
     const result = await retryPendingThreadTitles(NOW);

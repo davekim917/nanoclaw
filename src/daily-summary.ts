@@ -293,7 +293,7 @@ async function buildSummary(
 ): Promise<Summary> {
   const shipped: ShipLogEntry[] = [];
   for (const m of members) {
-    shipped.push(...getShipLogSince(m.id, since));
+    shipped.push(...(await getShipLogSince(m.id, since)));
   }
 
   const dedupedShipped = dedupeBy(shipped, (e) => e.pr_url || `${e.title} ${e.shipped_at}`);
@@ -301,7 +301,7 @@ async function buildSummary(
   const backlog =
     githubIssuesRepo !== undefined
       ? await buildGitHubIssueBacklog(poster, posterConfig, githubIssuesRepo, since)
-      : buildLegacyBacklog(members, since);
+      : await buildLegacyBacklog(members, since);
 
   return {
     agentShipped: dedupedShipped.filter((e) => !isCommitScanEntry(e)),
@@ -311,12 +311,15 @@ async function buildSummary(
   };
 }
 
-function buildLegacyBacklog(members: AgentGroup[], since: string): Pick<Summary, 'resolved' | 'openBacklog'> {
+async function buildLegacyBacklog(
+  members: AgentGroup[],
+  since: string,
+): Promise<Pick<Summary, 'resolved' | 'openBacklog'>> {
   const resolved: BacklogItem[] = [];
   const openBacklog: BacklogItem[] = [];
   for (const m of members) {
-    resolved.push(...getBacklogResolvedSince(m.id, since));
-    openBacklog.push(...getBacklog(m.id, 'in_progress'), ...getBacklog(m.id, 'open'));
+    resolved.push(...(await getBacklogResolvedSince(m.id, since)));
+    openBacklog.push(...(await getBacklog(m.id, 'in_progress')), ...(await getBacklog(m.id, 'open')));
   }
   return {
     resolved: dedupeBy(resolved, (i) => i.id),

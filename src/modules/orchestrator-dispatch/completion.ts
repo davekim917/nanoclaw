@@ -8,13 +8,13 @@ import type { Session } from '../../types.js';
 import { authChildTaskAction, transitionToTerminal } from './db/tasks.js';
 
 export async function applySpawnComplete(content: Record<string, unknown>, callerSession: Session): Promise<void> {
-  const auth = authChildTaskAction(content, callerSession, 'applySpawnComplete');
+  const auth = await authChildTaskAction(content, callerSession, 'applySpawnComplete');
   if (!auth) return;
   const { task, taskId } = auth;
 
   const summary = (content.summary as string | undefined) ?? '';
   const now = new Date().toISOString();
-  const transitioned = transitionToTerminal(taskId, 'completed', {
+  const transitioned = await transitionToTerminal(taskId, 'completed', {
     completed_at: now,
     result_summary: summary,
   });
@@ -61,14 +61,14 @@ export async function applySpawnComplete(content: Record<string, unknown>, calle
 }
 
 export async function applySpawnFailed(content: Record<string, unknown>, callerSession: Session): Promise<void> {
-  const auth = authChildTaskAction(content, callerSession, 'applySpawnFailed');
+  const auth = await authChildTaskAction(content, callerSession, 'applySpawnFailed');
   if (!auth) return;
   const { task, taskId } = auth;
 
   const summary = (content.summary as string | undefined) ?? '';
   const failReason = (content.fail_reason as string | undefined) ?? 'agent_error';
   const now = new Date().toISOString();
-  const transitioned = transitionToTerminal(taskId, 'failed', {
+  const transitioned = await transitionToTerminal(taskId, 'failed', {
     failed_at: now,
     result_summary: summary,
     fail_reason: failReason,

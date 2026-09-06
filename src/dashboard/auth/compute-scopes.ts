@@ -1,3 +1,4 @@
+import { withCentralSync } from '../../db/central-lease.js';
 import { getDb } from '../../db/connection.js';
 import { getMembershipGroupIds } from '../../modules/permissions/db/agent-group-members.js';
 import type { GroupScope } from '../router.js';
@@ -54,7 +55,8 @@ export async function computeScopes(userId: string): Promise<UserScopes> {
   const roleMemberGroups = rows
     .filter((r) => r.role === 'member' && r.agent_group_id !== null)
     .map((r) => r.agent_group_id as string);
-  const memberGroups = [...new Set([...roleMemberGroups, ...getMembershipGroupIds(userId)])].sort();
+  const membershipGroups = await withCentralSync(() => getMembershipGroupIds(userId), 'computeScopes membership');
+  const memberGroups = [...new Set([...roleMemberGroups, ...membershipGroups])].sort();
 
   return { role: 'member', allowed_group_ids: memberGroups, no_filter: false };
 }

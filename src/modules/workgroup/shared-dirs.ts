@@ -29,9 +29,8 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-import type Database from 'better-sqlite3';
-
 import { DATA_DIR, GROUPS_DIR } from '../../config.js';
+import type { RawStatements } from '../../db/central-lease.js';
 import { log } from '../../log.js';
 
 /** Host path of a workgroup's shared directory. */
@@ -143,7 +142,7 @@ export function memoryTreeSha256(root: string): string {
   return hash.digest('hex');
 }
 
-function memoryMembers(db: Database.Database, workgroupId: string): Array<{ id: string; folder: string }> {
+function memoryMembers(db: RawStatements, workgroupId: string): Array<{ id: string; folder: string }> {
   return db
     .prepare(`SELECT id, folder FROM agent_groups WHERE workgroup_id = ? ORDER BY folder, id`)
     .all(workgroupId) as Array<{ id: string; folder: string }>;
@@ -302,7 +301,7 @@ function hasVerifiedManifest(workgroupId: string, dataDir: string): boolean {
  * substantive unless it is byte-for-byte the shipped missing-only scaffold.
  */
 export function inspectWorkgroupMemoryState(
-  db: Database.Database,
+  db: RawStatements,
   workgroupId: string,
   dirs: WorkgroupMemoryDirs = {},
 ): WorkgroupMemoryState {
@@ -375,7 +374,7 @@ export function inspectWorkgroupMemoryState(
  * report is asserted over a fixture matrix in shared-dirs.wouldchange.test.ts.
  */
 export function workgroupMemoryReconcileWouldChange(
-  db: Database.Database,
+  db: RawStatements,
   workgroupId: string,
   dirs: WorkgroupMemoryDirs = {},
 ): boolean {
@@ -404,12 +403,7 @@ export function workgroupMemoryReconcileWouldChange(
   return false;
 }
 
-function linkMembersToCanonical(
-  db: Database.Database,
-  workgroupId: string,
-  groupsDir: string,
-  dataDir: string,
-): boolean {
+function linkMembersToCanonical(db: RawStatements, workgroupId: string, groupsDir: string, dataDir: string): boolean {
   let changed = false;
   const members = memoryMembers(db, workgroupId).sort((left, right) => {
     const leftScaffold = isExactShippedMemoryScaffold(path.join(groupsDir, left.folder, 'memory'));
@@ -433,10 +427,7 @@ function linkMembersToCanonical(
  * mutations and still reports every workgroup from the inventory. See
  * `WorkgroupMemoryDirs`.
  */
-export function reconcileWorkgroupMemory(
-  db: Database.Database,
-  dirs: WorkgroupMemoryDirs = {},
-): WorkgroupMemoryReport[] {
+export function reconcileWorkgroupMemory(db: RawStatements, dirs: WorkgroupMemoryDirs = {}): WorkgroupMemoryReport[] {
   const groupsDir = dirs.groupsDir ?? GROUPS_DIR;
   const dataDir = dirs.dataDir ?? DATA_DIR;
   const selected = dirs.workgroupIds ? new Set(dirs.workgroupIds) : null;
@@ -499,7 +490,7 @@ interface MigrationReport {
  * cutover to the workgroups it proved quiescent.
  */
 export function reconcileWorkgroupSharedDirs(
-  db: Database.Database,
+  db: RawStatements,
   dirs: { groupsDir?: string; dataDir?: string; workgroupIds?: string[] } = {},
 ): void {
   const groupsDir = dirs.groupsDir ?? GROUPS_DIR;
@@ -528,7 +519,7 @@ interface SharedDirPlan {
  * when there is no seed folder to consolidate.
  */
 function planWorkgroupSharedDirs(
-  db: Database.Database,
+  db: RawStatements,
   workgroupId: string,
   groupsDir: string,
   dataDir: string,
@@ -617,7 +608,7 @@ function planWorkgroupSharedDirs(
  * true here is exactly a boot at which the shared tree moves under a container.
  */
 export function sharedDirsReconcileWouldChange(
-  db: Database.Database,
+  db: RawStatements,
   workgroupId: string,
   dirs: { groupsDir?: string; dataDir?: string } = {},
 ): boolean {
@@ -656,7 +647,7 @@ export function sharedDirsReconcileWouldChange(
   return false;
 }
 
-function migrateWorkgroup(db: Database.Database, workgroupId: string, groupsDir: string, dataDir: string): void {
+function migrateWorkgroup(db: RawStatements, workgroupId: string, groupsDir: string, dataDir: string): void {
   const plan = planWorkgroupSharedDirs(db, workgroupId, groupsDir, dataDir);
   if (!plan) return; // no seed data to consolidate
   const { seedDir, wgDir, siblingFolders, shared, candidates } = plan;

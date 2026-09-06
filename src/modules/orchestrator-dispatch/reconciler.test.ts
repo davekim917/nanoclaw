@@ -63,7 +63,7 @@ describe('runReconcilerSweep', () => {
 
     const setImmediateSpy = vi.spyOn(global, 'setImmediate');
 
-    runReconcilerSweep();
+    await runReconcilerSweep();
 
     expect(setImmediateSpy).toHaveBeenCalledWith(expect.any(Function), 'task-orphan', 'ag-parent');
 
@@ -78,7 +78,7 @@ describe('runReconcilerSweep', () => {
 
     const setImmediateSpy = vi.spyOn(global, 'setImmediate');
 
-    runReconcilerSweep();
+    await runReconcilerSweep();
 
     expect(setImmediateSpy).not.toHaveBeenCalledWith(expect.any(Function), 'task-leased', expect.any(String));
 
@@ -93,7 +93,7 @@ describe('runReconcilerSweep', () => {
 
     const setImmediateSpy = vi.spyOn(global, 'setImmediate');
 
-    runReconcilerSweep();
+    await runReconcilerSweep();
 
     const taskIds = (setImmediateSpy.mock.calls as unknown as [(...args: unknown[]) => void, string, string][]).map(
       (c) => c[1],
@@ -109,7 +109,7 @@ describe('runReconcilerSweep', () => {
     await seedGroups();
 
     const setImmediateSpy = vi.spyOn(global, 'setImmediate');
-    runReconcilerSweep();
+    await runReconcilerSweep();
     expect(setImmediateSpy).not.toHaveBeenCalled();
     setImmediateSpy.mockRestore();
   });

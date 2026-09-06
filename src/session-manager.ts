@@ -1275,32 +1275,36 @@ export async function admitPendingUpgradeContexts(
   // The one central read, before the first inbound read: the loop below is one
   // synchronous pass over a single snapshot of the unpaired rows.
   const central = await resolveRecallCentral(agentGroupId, sessionId);
-  let admitted = 0;
-  for (const message of mailbox.listUnpairedPendingUpgradeRows()) {
-    const recall = buildRecallRow(
-      agentGroupId,
-      sessionId,
-      {
-        id: message.id,
-        kind: message.kind,
-        timestamp: message.timestamp,
-        platformId: message.platform_id,
-        channelType: message.channel_type,
-        threadId: message.thread_id,
-        content: message.content,
-        processAfter: message.process_after,
-        trigger: 1,
-        sourceSessionId: message.source_session_id,
-        onWake: message.on_wake,
-      },
-      message.content,
-      mailbox,
-      central,
-    );
-    if (!recall) continue;
-    if (mailbox.admitPendingUpgradeRow(recall, message.id)) admitted++;
-  }
-  return admitted;
+  // Under the lease: `buildRecallRow`'s pre-turn context carries a lease-only
+  // central read (seam 3 §4.5), and the pass is synchronous anyway.
+  return withCentralSync(() => {
+    let admitted = 0;
+    for (const message of mailbox.listUnpairedPendingUpgradeRows()) {
+      const recall = buildRecallRow(
+        agentGroupId,
+        sessionId,
+        {
+          id: message.id,
+          kind: message.kind,
+          timestamp: message.timestamp,
+          platformId: message.platform_id,
+          channelType: message.channel_type,
+          threadId: message.thread_id,
+          content: message.content,
+          processAfter: message.process_after,
+          trigger: 1,
+          sourceSessionId: message.source_session_id,
+          onWake: message.on_wake,
+        },
+        message.content,
+        mailbox,
+        central,
+      );
+      if (!recall) continue;
+      if (mailbox.admitPendingUpgradeRow(recall, message.id)) admitted++;
+    }
+    return admitted;
+  }, 'admitPendingUpgradeContexts');
 }
 
 /**
@@ -1604,7 +1608,12 @@ export async function admitDueTaskContexts(
   // the admission itself is one synchronous pass: fence check, legacy
   // demotion, due-row select and each paired admission see a single snapshot.
   const central = await resolveRecallCentral(agentGroupId, sessionId);
-  return admitDueTaskContextsFor(mailbox, agentGroupId, sessionId, central);
+  // Under the lease: the recall rows read one lease-only central fact each
+  // (seam 3 §4.5); the dashboard's run-now caller already holds the lease.
+  return withCentralSync(
+    () => admitDueTaskContextsFor(mailbox, agentGroupId, sessionId, central),
+    'admitDueTaskContexts',
+  );
 }
 
 /**

@@ -2286,7 +2286,7 @@ describe('sweep duty registry (S2-PR2)', () => {
           child_session_id: null,
         },
       ] as never);
-      vi.spyOn(tasksModule, 'transitionToTerminal').mockReturnValue(true);
+      vi.spyOn(tasksModule, 'transitionToTerminal').mockResolvedValue(true);
 
       await _sweepTaskWatchdogForTesting();
 

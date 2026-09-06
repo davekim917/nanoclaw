@@ -1183,7 +1183,7 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
     await deliverSessionMessages(session);
 
     expect(calls).toEqual([{ threadId: null }]);
-    const anchor = getTaskThreadAnchor(session.id, 'telegram', 'telegram:123');
+    const anchor = await getTaskThreadAnchor(session.id, 'telegram', 'telegram:123');
     expect(anchor).toEqual({ threadPlatformId: 'plat-1', createdAt: expect.any(String) });
   });
 
@@ -1230,7 +1230,7 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
     await deliverSessionMessages(session);
 
     expect(calls).toEqual([{ threadId: null }]);
-    expect(getTaskThreadAnchor(session.id, 'telegram', 'telegram:123')).toEqual({
+    expect(await getTaskThreadAnchor(session.id, 'telegram', 'telegram:123')).toEqual({
       threadPlatformId: 'plat-1',
       createdAt: expect.any(String),
     });
@@ -1242,7 +1242,7 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
     const { session } = await resolveTaskSession('ag-1', 'series-1');
     // Now-relative: rotation compares against the real clock, so a hardcoded
     // date makes this test fail the day after it was written.
-    setTaskThreadAnchor(session.id, 'telegram', 'telegram:123', 'plat-1', new Date().toISOString());
+    await setTaskThreadAnchor(session.id, 'telegram', 'telegram:123', 'plat-1', new Date().toISOString());
     insertTaskChat('ag-1', session.id, 'out-2', new Date().toISOString());
 
     const calls: Array<{ threadId: string | null }> = [];
@@ -1257,7 +1257,7 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
 
     expect(calls).toEqual([{ threadId: 'telegram:123:plat-1' }]);
     // Threading under an existing anchor must not overwrite it.
-    const anchor = getTaskThreadAnchor(session.id, 'telegram', 'telegram:123');
+    const anchor = await getTaskThreadAnchor(session.id, 'telegram', 'telegram:123');
     expect(anchor?.threadPlatformId).toBe('plat-1');
   });
 
@@ -1265,7 +1265,7 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
     await seedAgentAndChannel();
     grantChannelDestination('ag-1', 'mg-1');
     const { session } = await resolveTaskSession('ag-1', 'series-1');
-    setTaskThreadAnchor(
+    await setTaskThreadAnchor(
       session.id,
       'telegram',
       'telegram:123',
@@ -1285,7 +1285,7 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
     await deliverSessionMessages(session);
 
     expect(calls).toEqual([{ threadId: null }]);
-    const anchor = getTaskThreadAnchor(session.id, 'telegram', 'telegram:123');
+    const anchor = await getTaskThreadAnchor(session.id, 'telegram', 'telegram:123');
     expect(anchor?.threadPlatformId).toBe('plat-3');
   });
 
@@ -1307,7 +1307,7 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
 
     await deliverSessionMessages(session);
 
-    expect(getTaskThreadAnchor(session.id, 'telegram', 'telegram:123')).toBeNull();
+    expect(await getTaskThreadAnchor(session.id, 'telegram', 'telegram:123')).toBeNull();
   });
 
   it('a task post that already targets an explicit thread is left untouched (not anchored)', async () => {
@@ -1327,7 +1327,7 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
     await deliverSessionMessages(session);
 
     expect(calls).toEqual([{ threadId: 'thr-9' }]);
-    expect(getTaskThreadAnchor(session.id, 'telegram', 'telegram:123')).toBeNull();
+    expect(await getTaskThreadAnchor(session.id, 'telegram', 'telegram:123')).toBeNull();
   });
 
   it('a series with threadAnchor:false posts every message at root and stores no anchor', async () => {
@@ -1356,7 +1356,7 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
 
     // Both posts land at root — same UTC day, but the series opted out.
     expect(calls).toEqual([{ threadId: null }, { threadId: null }]);
-    expect(getTaskThreadAnchor(session.id, 'telegram', 'telegram:123')).toBeNull();
+    expect(await getTaskThreadAnchor(session.id, 'telegram', 'telegram:123')).toBeNull();
   });
 });
 

@@ -68,6 +68,7 @@ import {
   runMigrations,
   getRawDb,
 } from '../../db/index.js';
+import { withCentralSync } from '../../db/central-lease.js';
 import { initSessionFolder } from '../../session-manager.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import type { AgentGroup, MessagingGroup, Session } from '../../types.js';
@@ -302,38 +303,40 @@ describe('handleGrantAccess', () => {
   it('owner can grant member', async () => {
     insertChatInbound({ senderId: 'OWNER' });
     await handleGrantAccess({ user: '<@BOB>' }, makeSession());
-    expect(isMember('slack-example-labs:BOB', 'ag-helper')).toBe(true);
+    expect(await withCentralSync(() => isMember('slack-example-labs:BOB', 'ag-helper'), 'test')).toBe(true);
     expect(notifyCalls.at(-1)?.text).toMatch(/Granted member access/);
   });
 
   it('owner can grant admin', async () => {
     insertChatInbound({ senderId: 'OWNER' });
     await handleGrantAccess({ user: '<@BOB>', role: 'admin' }, makeSession());
-    expect(isAdminOfAgentGroup('slack-example-labs:BOB', 'ag-helper')).toBe(true);
+    expect(await withCentralSync(() => isAdminOfAgentGroup('slack-example-labs:BOB', 'ag-helper'), 'test')).toBe(true);
   });
 
   it('scoped admin can grant member but NOT admin', async () => {
     insertChatInbound({ senderId: 'SADMIN' });
     await handleGrantAccess({ user: '<@BOB>' }, makeSession());
-    expect(isMember('slack-example-labs:BOB', 'ag-helper')).toBe(true);
+    expect(await withCentralSync(() => isMember('slack-example-labs:BOB', 'ag-helper'), 'test')).toBe(true);
 
     insertChatInbound({ senderId: 'SADMIN' });
     await handleGrantAccess({ user: '<@CAROL>', role: 'admin' }, makeSession());
-    expect(isAdminOfAgentGroup('slack-example-labs:CAROL', 'ag-helper')).toBe(false);
+    expect(await withCentralSync(() => isAdminOfAgentGroup('slack-example-labs:CAROL', 'ag-helper'), 'test')).toBe(
+      false,
+    );
     expect(notifyCalls.at(-1)?.text).toMatch(/only owner \/ global admin can grant `admin`/);
   });
 
   it('stranger is denied', async () => {
     insertChatInbound({ senderId: 'STRANGER' });
     await handleGrantAccess({ user: '<@BOB>' }, makeSession());
-    expect(isMember('slack-example-labs:BOB', 'ag-helper')).toBe(false);
+    expect(await withCentralSync(() => isMember('slack-example-labs:BOB', 'ag-helper'), 'test')).toBe(false);
     expect(notifyCalls.at(-1)?.text).toMatch(/denied: you don't have authority/);
   });
 
   it('scoped admin is denied on OTHER groups', async () => {
     insertChatInbound({ senderId: 'SADMIN' });
     await handleGrantAccess({ user: '<@BOB>', agentGroupId: 'ag-other' }, makeSession());
-    expect(isMember('slack-example-labs:BOB', 'ag-other')).toBe(false);
+    expect(await withCentralSync(() => isMember('slack-example-labs:BOB', 'ag-other'), 'test')).toBe(false);
   });
 
   it('rejects unknown agent groups', async () => {
@@ -361,7 +364,7 @@ describe('handleRevokeAccess', () => {
     });
     insertChatInbound({ senderId: 'OWNER' });
     await handleRevokeAccess({ user: '<@BOB>' }, makeSession());
-    expect(isMember('slack-example-labs:BOB', 'ag-helper')).toBe(false);
+    expect(await withCentralSync(() => isMember('slack-example-labs:BOB', 'ag-helper'), 'test')).toBe(false);
   });
 
   it('scoped admin cannot revoke another admin', async () => {
@@ -374,7 +377,9 @@ describe('handleRevokeAccess', () => {
     });
     insertChatInbound({ senderId: 'SADMIN' });
     await handleRevokeAccess({ user: '<@CAROL>' }, makeSession());
-    expect(isAdminOfAgentGroup('slack-example-labs:CAROL', 'ag-helper')).toBe(true);
+    expect(await withCentralSync(() => isAdminOfAgentGroup('slack-example-labs:CAROL', 'ag-helper'), 'test')).toBe(
+      true,
+    );
     expect(notifyCalls.at(-1)?.text).toMatch(/only a global admin can revoke another admin/);
   });
 
@@ -411,15 +416,17 @@ describe('handleRevokeAccess', () => {
     // Membership went, which is all a scoped admin may take. Asserted on the
     // ROW, not `isMember`: an admin counts as an implicit member, so `isMember`
     // is true again the moment the grant lands and would hide the removal.
-    expect(hasMembershipRow('slack-example-labs:CAROL', 'ag-helper')).toBe(false);
+    expect(await withCentralSync(() => hasMembershipRow('slack-example-labs:CAROL', 'ag-helper'), 'test')).toBe(false);
     // …and the admin role the owner just granted survives.
-    expect(isAdminOfAgentGroup('slack-example-labs:CAROL', 'ag-helper')).toBe(true);
+    expect(await withCentralSync(() => isAdminOfAgentGroup('slack-example-labs:CAROL', 'ag-helper'), 'test')).toBe(
+      true,
+    );
   });
 
   it('never revokes an owner', async () => {
     insertChatInbound({ senderId: 'GADMIN' });
     await handleRevokeAccess({ user: '<@OWNER>' }, makeSession());
-    expect(isOwner('slack-example-labs:OWNER')).toBe(true);
+    expect(await withCentralSync(() => isOwner('slack-example-labs:OWNER'), 'test')).toBe(true);
     expect(notifyCalls.at(-1)?.text).toMatch(/owner revocation must be done by direct edit/);
   });
 });

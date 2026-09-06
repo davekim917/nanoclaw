@@ -15,10 +15,10 @@ import { autoArchiveCompletedBefore } from '../orchestrator-dispatch/db/tasks.js
 
 const COMPLETED_AUTO_ARCHIVE_AGE_HOURS = 24;
 
-export function autoArchiveOldCompleted(): void {
+export async function autoArchiveOldCompleted(): Promise<void> {
   try {
     const cutoff = new Date(Date.now() - COMPLETED_AUTO_ARCHIVE_AGE_HOURS * 60 * 60 * 1000).toISOString();
-    const count = autoArchiveCompletedBefore(cutoff);
+    const count = await autoArchiveCompletedBefore(cutoff);
     if (count > 0) log.info('Auto-archived completed tasks', { count });
   } catch (err) {
     log.warn('autoArchiveOldCompleted: failed', { err });

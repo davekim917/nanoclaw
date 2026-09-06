@@ -102,8 +102,8 @@ function registerCentralSweepDuties(): void {
     name: id.T10,
     phase: 'tick:housekeeping',
     order: 40,
-    run: () => {
-      pruneChannelIngressReceipts();
+    run: async () => {
+      await pruneChannelIngressReceipts();
     },
   });
 

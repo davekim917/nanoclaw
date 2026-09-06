@@ -11,6 +11,7 @@ import path from 'path';
 
 import type Database from 'better-sqlite3';
 
+import { withCentralSync } from '../../db/central-lease.js';
 import { getDb } from '../../db/connection.js';
 import { log } from '../../log.js';
 import { isOwner, isGlobalAdmin } from '../../modules/permissions/db/user-roles.js';
@@ -37,8 +38,8 @@ export const SWEEP_INTERVAL_MS = 60_000;
  * gated here, so a scoped-admin enumeration path never opens (§4.5). Mirrors
  * the `isOwner`/`isGlobalAdmin` precedent in dashboard/steer.ts.
  */
-export function canManageScheduled(userId: string): boolean {
-  return isOwner(userId) || isGlobalAdmin(userId);
+export function canManageScheduled(userId: string): Promise<boolean> {
+  return withCentralSync(() => isOwner(userId) || isGlobalAdmin(userId), 'canManageScheduled');
 }
 
 // ── Audit writer ──────────────────────────────────────────────────────────────

@@ -63,6 +63,7 @@ import {
   type PreTurnContext,
   type RecallCorpus,
 } from './pre-turn-context.js';
+import { withCentralSync } from '../../db/central-lease.js';
 import { resolveSessionServicesCentral, type SessionServicesCentral } from '../../capabilities.js';
 import { closeDb, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
 import { log } from '../../log.js';
@@ -242,14 +243,18 @@ describe('bounded authoritative pre-turn retrieval', () => {
       '2026-07-25T01:00:00.000Z',
     );
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'Where is siptrue.com DNS hosted?' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'Where is siptrue.com DNS hosted?' }),
+        }),
+      'test',
+    );
 
     expect(result.conversationEvidence.excerpts[0]).toMatchObject({
       id: 'old-wix',
@@ -309,8 +314,8 @@ describe('bounded authoritative pre-turn retrieval', () => {
       trigger: 1 as const,
       normalizedContent: JSON.stringify({ text: 'Who manages SipTrue DNS?', sender: 'Operator' }),
     };
-    const first = buildPreTurnContext(input);
-    const second = buildPreTurnContext(input);
+    const first = await withCentralSync(() => buildPreTurnContext(input), 'test');
+    const second = await withCentralSync(() => buildPreTurnContext(input), 'test');
 
     expect(first.memoryEvidence.core.map((e) => e.path)).toEqual(['index.md']);
     expect(first.memoryEvidence.excerpts.some((e) => e.path === 'preferences/operator.md')).toBe(true);
@@ -334,7 +339,7 @@ describe('bounded authoritative pre-turn retrieval', () => {
       normalizedContent: JSON.stringify({ text: 'anything at all' }),
     };
 
-    const bootstrap = buildPreTurnContext({ ...input, includeBootstrap: true });
+    const bootstrap = await withCentralSync(() => buildPreTurnContext({ ...input, includeBootstrap: true }), 'test');
     const core = bootstrap.memoryEvidence.core.find((row) => row.path === 'index.md');
     expect(core).toBeDefined();
     expect(core!.text).toContain('domain/dns.md');
@@ -344,14 +349,14 @@ describe('bounded authoritative pre-turn retrieval', () => {
 
     // Over the bound it is truncated, never dropped, and says so.
     memoryFile('index.md', `# Canon\n${'map entry line. '.repeat(1_000)}`);
-    const large = buildPreTurnContext({ ...input, includeBootstrap: true });
+    const large = await withCentralSync(() => buildPreTurnContext({ ...input, includeBootstrap: true }), 'test');
     const largeCore = large.memoryEvidence.core.find((row) => row.path === 'index.md')!;
     expect(largeCore.text.length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.markdownCoreChars);
     expect(largeCore.text).toContain('[truncated:markdown-file]');
 
     // Absent index.md is reported, not silently empty.
     fs.rmSync(path.join(TEST_ROOT, 'workgroups', 'wg-a', 'memory', 'index.md'));
-    const missing = buildPreTurnContext({ ...input, includeBootstrap: true });
+    const missing = await withCentralSync(() => buildPreTurnContext({ ...input, includeBootstrap: true }), 'test');
     expect(missing.memoryEvidence.core).toEqual([]);
     expect(missing.notices.some((n) => n.code === 'missing-core-memory')).toBe(true);
   });
@@ -365,14 +370,18 @@ describe('bounded authoritative pre-turn retrieval', () => {
       '2026-07-24T00:00:00.000Z',
     );
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat',
-      trigger: 1,
-      normalizedContent: '{"text":"Who manages SipTrue DNS?"}',
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat',
+          trigger: 1,
+          normalizedContent: '{"text":"Who manages SipTrue DNS?"}',
+        }),
+      'test',
+    );
 
     expect(result.memoryEvidence.excerpts).toEqual([]);
     expect(result.notices.some((notice) => notice.code === 'potential-source-conflict')).toBe(true);
@@ -388,14 +397,18 @@ describe('bounded authoritative pre-turn retrieval', () => {
       );
     }
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat',
-      trigger: 1,
-      normalizedContent: '{"text":"Who is the deployment owner?"}',
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat',
+          trigger: 1,
+          normalizedContent: '{"text":"Who is the deployment owner?"}',
+        }),
+      'test',
+    );
 
     expect(result.conversationEvidence.excerpts).toHaveLength(PRE_TURN_BOUNDS.archiveExcerpts);
     expect(result.conversationEvidence.excerpts.every((row) => row.rank !== 'exact-link')).toBe(true);
@@ -431,14 +444,18 @@ describe('bounded authoritative pre-turn retrieval', () => {
       );
     }
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat',
-      trigger: 1,
-      normalizedContent: '{"text":"https://discord.com/channels/123/456/789 Who is the deployment owner?"}',
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat',
+          trigger: 1,
+          normalizedContent: '{"text":"https://discord.com/channels/123/456/789 Who is the deployment owner?"}',
+        }),
+      'test',
+    );
     const exact = result.conversationEvidence.excerpts.filter((row) => row.rank === 'exact-link');
     const lexical = result.conversationEvidence.excerpts.filter((row) => row.rank !== 'exact-link');
 
@@ -470,9 +487,9 @@ describe('bounded authoritative pre-turn retrieval', () => {
     };
 
     _resetTokenStreamCacheForTest();
-    buildPreTurnContext(input);
+    await withCentralSync(() => buildPreTurnContext(input), 'test');
     const cold = _tokenStreamCacheStatsForTest();
-    buildPreTurnContext(input);
+    await withCentralSync(() => buildPreTurnContext(input), 'test');
     const warm = _tokenStreamCacheStatsForTest();
 
     // The repeat pass reads the same candidates back out of the cache instead
@@ -481,8 +498,8 @@ describe('bounded authoritative pre-turn retrieval', () => {
     expect(warm.hits - cold.hits).toBeGreaterThan(0);
     expect(warm.misses - cold.misses).toBeLessThan(cold.misses);
     // And the cache must not change what is returned.
-    expect(JSON.stringify(buildPreTurnContext(input).memoryEvidence)).toBe(
-      JSON.stringify(buildPreTurnContext(input).memoryEvidence),
+    expect(JSON.stringify((await withCentralSync(() => buildPreTurnContext(input), 'test')).memoryEvidence)).toBe(
+      JSON.stringify((await withCentralSync(() => buildPreTurnContext(input), 'test')).memoryEvidence),
     );
   });
 
@@ -501,14 +518,18 @@ describe('bounded authoritative pre-turn retrieval', () => {
       '2026-07-21T00:00:00.000Z',
     );
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'What is the launch code?' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'What is the launch code?' }),
+        }),
+      'test',
+    );
 
     expect(result.conversationEvidence.excerpts.map((e) => e.id)).toContain('allowed');
     expect(result.conversationEvidence.excerpts.map((e) => e.id)).toContain('allowed-malicious');
@@ -523,15 +544,19 @@ describe('bounded authoritative pre-turn retrieval', () => {
     expect(JSON.stringify(result.trustedCapabilities)).not.toContain('admin');
   });
 
-  it('reports an honest no-match while retaining always-loaded core', () => {
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat',
-      trigger: 1,
-      normalizedContent: '{"text":"zxqv unmatched constellation"}',
-    });
+  it('reports an honest no-match while retaining always-loaded core', async () => {
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat',
+          trigger: 1,
+          normalizedContent: '{"text":"zxqv unmatched constellation"}',
+        }),
+      'test',
+    );
     expect(result.memoryEvidence.core).toHaveLength(1);
     expect(result.memoryEvidence.excerpts).toEqual([]);
     expect(result.conversationEvidence.excerpts).toEqual([]);
@@ -539,7 +564,7 @@ describe('bounded authoritative pre-turn retrieval', () => {
     expect(result.notices.some((n) => n.code === 'no-relevant-conversation')).toBe(true);
   });
 
-  it('uses bounded ephemeral expansion only after direct lexical no-match', () => {
+  it('uses bounded ephemeral expansion only after direct lexical no-match', async () => {
     archive(
       'archive-external-access',
       'ag-a-codex',
@@ -547,21 +572,25 @@ describe('bounded authoritative pre-turn retrieval', () => {
       '2026-07-20T00:00:00.000Z',
     );
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat',
-      trigger: 1,
-      normalizedContent: '{"text":"What should happen before saying an external service is unavailable?"}',
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat',
+          trigger: 1,
+          normalizedContent: '{"text":"What should happen before saying an external service is unavailable?"}',
+        }),
+      'test',
+    );
 
     expect(result.conversationEvidence.excerpts[0]?.id).toBe('archive-external-access');
     expect(result.notices.some((notice) => notice.code === 'ephemeral-query-expansion-used')).toBe(true);
     expect(JSON.stringify(result.notices)).not.toContain('gateway');
   });
 
-  it('test_session_capabilities_use_actual_messaging_group', () => {
+  it('test_session_capabilities_use_actual_messaging_group', async () => {
     const common = {
       agentGroupId: 'ag-a',
       servicesCentral: SERVICES_CENTRAL_AG_A,
@@ -569,26 +598,30 @@ describe('bounded authoritative pre-turn retrieval', () => {
       trigger: 1 as const,
       normalizedContent: '{"text":"available services"}',
     };
-    const discord = buildPreTurnContext({ ...common, sessionId: 'sess-a' });
-    const slack = buildPreTurnContext({ ...common, sessionId: 'sess-other' });
+    const discord = await withCentralSync(() => buildPreTurnContext({ ...common, sessionId: 'sess-a' }), 'test');
+    const slack = await withCentralSync(() => buildPreTurnContext({ ...common, sessionId: 'sess-other' }), 'test');
 
     expect(discord.trustedCapabilities?.services[0]?.name).toBe('safe-for:mg-a');
     expect(slack.trustedCapabilities?.services[0]?.name).toBe('safe-for:mg-other');
   });
 
-  it('uses the actual routed scope for an agent-shared session', () => {
+  it('uses the actual routed scope for an agent-shared session', async () => {
     archive('shared-thread', 'ag-a', 'The shared-thread deployment owner is Jordan.', '2026-07-20T00:00:00.000Z');
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-shared',
-      messagingGroupId: 'mg-a',
-      threadId: 'discord:guild:channel:thread',
-      kind: 'chat',
-      trigger: 1,
-      normalizedContent: '{"text":"Who is the shared-thread deployment owner?"}',
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-shared',
+          messagingGroupId: 'mg-a',
+          threadId: 'discord:guild:channel:thread',
+          kind: 'chat',
+          trigger: 1,
+          normalizedContent: '{"text":"Who is the shared-thread deployment owner?"}',
+        }),
+      'test',
+    );
 
     expect(result.trustedCapabilities?.services[0]?.name).toBe('safe-for:mg-a');
     expect(result.conversationEvidence.excerpts[0]).toMatchObject({
@@ -597,23 +630,27 @@ describe('bounded authoritative pre-turn retrieval', () => {
     });
   });
 
-  it('test_source_failure_degrades_independently', () => {
+  it('test_source_failure_degrades_independently', async () => {
     fs.rmSync(path.join(TEST_ROOT, 'workgroups', 'wg-a', 'memory'), { recursive: true, force: true });
     archive('healthy', 'ag-a', 'The deployment owner is Jordan.', '2026-07-20T00:00:00.000Z');
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat',
-      trigger: 1,
-      normalizedContent: '{"text":"Who is the deployment owner?"}',
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat',
+          trigger: 1,
+          normalizedContent: '{"text":"Who is the deployment owner?"}',
+        }),
+      'test',
+    );
     expect(result.trustedCapabilities?.agentGroupId).toBe('ag-a');
     expect(result.conversationEvidence.excerpts[0]?.id).toBe('healthy');
     expect(result.notices.filter((n) => n.status === 'degraded').map((n) => n.source)).toEqual(['markdown']);
   });
 
-  it('does not follow a Markdown leaf swapped to a symlink between inspection and open', () => {
+  it('does not follow a Markdown leaf swapped to a symlink between inspection and open', async () => {
     const memoryRoot = path.join(TEST_ROOT, 'workgroups', 'wg-a', 'memory');
     const checkedLeaf = path.join(memoryRoot, 'index.md');
     const outsideMemory = path.join(TEST_ROOT, 'outside-memory.md');
@@ -634,14 +671,18 @@ describe('bounded authoritative pre-turn retrieval', () => {
 
     let result: PreTurnContext;
     try {
-      result = buildPreTurnContext({
-        agentGroupId: 'ag-a',
-        servicesCentral: SERVICES_CENTRAL_AG_A,
-        sessionId: 'sess-a',
-        kind: 'chat',
-        trigger: 1,
-        normalizedContent: '{"text":"Who is the deployment owner?"}',
-      });
+      result = await withCentralSync(
+        () =>
+          buildPreTurnContext({
+            agentGroupId: 'ag-a',
+            servicesCentral: SERVICES_CENTRAL_AG_A,
+            sessionId: 'sess-a',
+            kind: 'chat',
+            trigger: 1,
+            normalizedContent: '{"text":"Who is the deployment owner?"}',
+          }),
+        'test',
+      );
     } finally {
       openSpy.mockRestore();
     }
@@ -660,7 +701,7 @@ describe('bounded authoritative pre-turn retrieval', () => {
   // readBoundedFile pins the opened fd and re-validates dev+ino against the
   // path resolved under the canonical root. preferences/ is the one directory
   // recall enumerates per turn, so it is where that check has to hold.
-  it('rejects an ancestor-directory symlink swap for the preferences directory', () => {
+  it('rejects an ancestor-directory symlink swap for the preferences directory', async () => {
     const memoryRoot = path.join(TEST_ROOT, 'workgroups', 'wg-a', 'memory');
     memoryFile('preferences/operator.md', '# Operator\nJordan owns deployment.');
     const checkedLeaf = path.join(memoryRoot, 'preferences', 'operator.md');
@@ -691,14 +732,18 @@ describe('bounded authoritative pre-turn retrieval', () => {
 
     let result: PreTurnContext;
     try {
-      result = buildPreTurnContext({
-        agentGroupId: 'ag-a',
-        servicesCentral: SERVICES_CENTRAL_AG_A,
-        sessionId: 'sess-a',
-        kind: 'chat',
-        trigger: 1,
-        normalizedContent: '{"text":"Who is the deployment owner?"}',
-      });
+      result = await withCentralSync(
+        () =>
+          buildPreTurnContext({
+            agentGroupId: 'ag-a',
+            servicesCentral: SERVICES_CENTRAL_AG_A,
+            sessionId: 'sess-a',
+            kind: 'chat',
+            trigger: 1,
+            normalizedContent: '{"text":"Who is the deployment owner?"}',
+          }),
+        'test',
+      );
     } finally {
       openSpy.mockRestore();
     }
@@ -724,7 +769,7 @@ describe('bounded authoritative pre-turn retrieval', () => {
     };
 
     FAILURES.archive = true;
-    const archiveFailure = buildPreTurnContext(input);
+    const archiveFailure = await withCentralSync(() => buildPreTurnContext(input), 'test');
     expect(archiveFailure.memoryEvidence.excerpts[0]?.path).toBe('preferences/operator.md');
     expect(archiveFailure.trustedCapabilities?.services[0]?.name).toBe('safe-for:mg-a');
     expect(archiveFailure.notices.some((notice) => notice.code === 'archive-read-failed')).toBe(true);
@@ -732,20 +777,20 @@ describe('bounded authoritative pre-turn retrieval', () => {
 
     FAILURES.archive = false;
     FAILURES.exactLink = true;
-    const exactLinkFailure = buildPreTurnContext(input);
+    const exactLinkFailure = await withCentralSync(() => buildPreTurnContext(input), 'test');
     expect(exactLinkFailure.memoryEvidence.excerpts[0]?.path).toBe('preferences/operator.md');
     expect(exactLinkFailure.notices.some((notice) => notice.code === 'exact-link-read-failed')).toBe(true);
     expect(exactLinkFailure.notices.some((notice) => notice.code === 'archive-read-failed')).toBe(false);
 
     FAILURES.exactLink = false;
     FAILURES.capabilities = true;
-    const capabilityFailure = buildPreTurnContext(input);
+    const capabilityFailure = await withCentralSync(() => buildPreTurnContext(input), 'test');
     expect(capabilityFailure.memoryEvidence.excerpts[0]?.path).toBe('preferences/operator.md');
     expect(capabilityFailure.trustedCapabilities).toEqual({ agentGroupId: 'ag-a', services: [] });
     expect(capabilityFailure.notices.some((notice) => notice.code === 'capability-detail-read-failed')).toBe(true);
   });
 
-  it('enforces the final serialized context bound under dense matching input', () => {
+  it('enforces the final serialized context bound under dense matching input', async () => {
     memoryFile('index.md', `# Canon\n${'dense recall detail '.repeat(1_000)}`);
     memoryFile('system/definition.md', `# Definition\n${'dense recall detail '.repeat(1_000)}`);
     for (let index = 0; index < 20; index++) {
@@ -757,20 +802,24 @@ describe('bounded authoritative pre-turn retrieval', () => {
       );
     }
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat',
-      trigger: 1,
-      normalizedContent: '{"text":"dense recall detail"}',
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat',
+          trigger: 1,
+          normalizedContent: '{"text":"dense recall detail"}',
+        }),
+      'test',
+    );
 
     expect(JSON.stringify(result).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.finalChars);
     expect(result.conversationEvidence.excerpts.length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.archiveExcerpts);
   });
 
-  it('bootstraps capabilities and index once, then emits only unseen per-turn evidence', () => {
+  it('bootstraps capabilities and index once, then emits only unseen per-turn evidence', async () => {
     memoryFile('preferences/operator.md', '# Operator\nJordan owns deployment.');
     archive('owner-archive', 'ag-a', 'Jordan owns deployment.', '2026-07-20T00:00:00.000Z');
     const common = {
@@ -784,17 +833,21 @@ describe('bounded authoritative pre-turn retrieval', () => {
       normalizedContent: '{"text":"Who owns deployment?","sender":"Operator"}',
     };
 
-    const bootstrap = buildPreTurnContext({ ...common, includeBootstrap: true });
+    const bootstrap = await withCentralSync(() => buildPreTurnContext({ ...common, includeBootstrap: true }), 'test');
     const seenEvidenceFingerprints = [
       ...bootstrap.memoryEvidence.core,
       ...bootstrap.memoryEvidence.excerpts,
       ...bootstrap.conversationEvidence.excerpts,
     ].map((row) => row.fingerprint);
-    const delta = buildPreTurnContext({
-      ...common,
-      includeBootstrap: false,
-      seenEvidenceFingerprints,
-    });
+    const delta = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          ...common,
+          includeBootstrap: false,
+          seenEvidenceFingerprints,
+        }),
+      'test',
+    );
 
     expect(bootstrap.provider).toBe('claude');
     expect(bootstrap.contextEpoch).toBe(4);
@@ -808,7 +861,7 @@ describe('bounded authoritative pre-turn retrieval', () => {
     expect(delta.notices.some((notice) => notice.code === 'evidence-already-delivered')).toBe(true);
   });
 
-  it('delivers a newly relevant passage from a previously seen archive row', () => {
+  it('delivers a newly relevant passage from a previously seen archive row', async () => {
     archive(
       'multi-topic-archive',
       'ag-a',
@@ -828,25 +881,33 @@ describe('bounded authoritative pre-turn retrieval', () => {
       provider: 'claude',
       contextEpoch: 6,
     };
-    const first = buildPreTurnContext({
-      ...common,
-      normalizedContent: '{"text":"Who owns Orion deployment?"}',
-    });
+    const first = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          ...common,
+          normalizedContent: '{"text":"Who owns Orion deployment?"}',
+        }),
+      'test',
+    );
     const firstRow = first.conversationEvidence.excerpts.find((row) => row.id === 'multi-topic-archive')!;
     expect(firstRow.text).toContain('Orion deployment');
 
-    const second = buildPreTurnContext({
-      ...common,
-      normalizedContent: '{"text":"Who has Pegasus billing authority?"}',
-      seenEvidenceFingerprints: [firstRow.fingerprint],
-    });
+    const second = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          ...common,
+          normalizedContent: '{"text":"Who has Pegasus billing authority?"}',
+          seenEvidenceFingerprints: [firstRow.fingerprint],
+        }),
+      'test',
+    );
     const secondRow = second.conversationEvidence.excerpts.find((row) => row.id === 'multi-topic-archive');
 
     expect(secondRow?.text).toContain('Pegasus billing');
     expect(secondRow?.fingerprint).not.toBe(firstRow.fingerprint);
   });
 
-  it('does not suppress exact-link or correction evidence already seen in the context epoch', () => {
+  it('does not suppress exact-link or correction evidence already seen in the context epoch', async () => {
     upsertArchiveMessage({
       id: '123456789000000007:ag-a',
       agentGroupId: 'ag-a',
@@ -872,12 +933,16 @@ describe('bounded authoritative pre-turn retrieval', () => {
       contextEpoch: 9,
       normalizedContent: '{"text":"https://discord.com/channels/123456789000000002/123456789000000007"}',
     };
-    const firstLink = buildPreTurnContext(linkInput);
+    const firstLink = await withCentralSync(() => buildPreTurnContext(linkInput), 'test');
     const linkedFingerprint = firstLink.conversationEvidence.excerpts[0]!.fingerprint;
-    const repeatedLink = buildPreTurnContext({
-      ...linkInput,
-      seenEvidenceFingerprints: [linkedFingerprint],
-    });
+    const repeatedLink = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          ...linkInput,
+          seenEvidenceFingerprints: [linkedFingerprint],
+        }),
+      'test',
+    );
     expect(repeatedLink.conversationEvidence.excerpts[0]?.rank).toBe('exact-link');
     expect(repeatedLink.conversationEvidence.excerpts[0]?.fingerprint).toBe(linkedFingerprint);
 
@@ -891,18 +956,22 @@ describe('bounded authoritative pre-turn retrieval', () => {
       ...linkInput,
       normalizedContent: '{"text":"Correction: where is SipTrue DNS actually managed?"}',
     };
-    const firstCorrection = buildPreTurnContext(correctionInput);
+    const firstCorrection = await withCentralSync(() => buildPreTurnContext(correctionInput), 'test');
     const correctionFingerprint = firstCorrection.conversationEvidence.excerpts.find(
       (row) => row.id === 'correction-row',
     )!.fingerprint;
-    const repeatedCorrection = buildPreTurnContext({
-      ...correctionInput,
-      seenEvidenceFingerprints: [correctionFingerprint],
-    });
+    const repeatedCorrection = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          ...correctionInput,
+          seenEvidenceFingerprints: [correctionFingerprint],
+        }),
+      'test',
+    );
     expect(repeatedCorrection.conversationEvidence.excerpts.some((row) => row.id === 'correction-row')).toBe(true);
   });
 
-  it('keeps normal deltas within the approved evidence counts and size ceiling', () => {
+  it('keeps normal deltas within the approved evidence counts and size ceiling', async () => {
     memoryFile(
       'preferences/operator.md',
       `# Operator\nBounded relevant detail. ${'bounded relevant detail '.repeat(200)}`,
@@ -916,17 +985,21 @@ describe('bounded authoritative pre-turn retrieval', () => {
       );
     }
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat',
-      trigger: 1,
-      includeBootstrap: false,
-      provider: 'claude',
-      contextEpoch: 1,
-      normalizedContent: '{"text":"bounded relevant detail","sender":"Operator"}',
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat',
+          trigger: 1,
+          includeBootstrap: false,
+          provider: 'claude',
+          contextEpoch: 1,
+          normalizedContent: '{"text":"bounded relevant detail","sender":"Operator"}',
+        }),
+      'test',
+    );
 
     expect(result.memoryEvidence.excerpts.map((row) => row.path)).toEqual(['preferences/operator.md']);
     expect(result.memoryEvidence.excerpts.length).toBeLessThanOrEqual(3);
@@ -934,17 +1007,21 @@ describe('bounded authoritative pre-turn retrieval', () => {
     expect(JSON.stringify(result).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.finalChars);
   });
 
-  it('fails closed when trusted session scope does not match the caller', () => {
-    expect(() =>
-      buildPreTurnContext({
-        agentGroupId: 'ag-b',
-        servicesCentral: SERVICES_CENTRAL_AG_B,
-        sessionId: 'sess-a',
-        kind: 'chat',
-        trigger: 1,
-        normalizedContent: '{"text":"steal wg-a"}',
-      }),
-    ).toThrow(/trusted session scope/i);
+  it('fails closed when trusted session scope does not match the caller', async () => {
+    await expect(
+      withCentralSync(
+        () =>
+          buildPreTurnContext({
+            agentGroupId: 'ag-b',
+            servicesCentral: SERVICES_CENTRAL_AG_B,
+            sessionId: 'sess-a',
+            kind: 'chat',
+            trigger: 1,
+            normalizedContent: '{"text":"steal wg-a"}',
+          }),
+        'test',
+      ),
+    ).rejects.toThrow(/trusted session scope/i);
   });
 });
 
@@ -980,14 +1057,18 @@ describe('per-person preference recall', () => {
 
   it('injects the trigger sender preference file deterministically, outside the ranked lane', async () => {
     memoryFile('preferences/alex.md', '# Alex\nProduct altitude always. No file paths or code identifiers.');
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'what shipped this week?', sender: 'Alex Stone' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'what shipped this week?', sender: 'Alex Stone' }),
+        }),
+      'test',
+    );
 
     const preference = result.memoryEvidence.excerpts.find((row) => row.path === 'preferences/alex.md');
     expect(preference).toBeDefined();
@@ -1004,14 +1085,18 @@ describe('per-person preference recall', () => {
     archiveFrom('m1', 'Rowan Vale', '2026-08-01T00:00:00.000Z');
     archiveFrom('m2', 'Zed Other', '2026-08-01T01:00:00.000Z', 'discord:guild:channel:other-thread');
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+        }),
+      'test',
+    );
 
     const paths = result.memoryEvidence.excerpts.map((row) => row.path);
     expect(paths).toContain('preferences/rowan.md');
@@ -1029,15 +1114,21 @@ describe('per-person preference recall', () => {
       normalizedContent: JSON.stringify({ text: 'update?', sender: 'Alex Stone' }),
     } as const;
 
-    const first = buildPreTurnContext(input);
+    const first = await withCentralSync(() => buildPreTurnContext(input), 'test');
     const fingerprint = first.memoryEvidence.excerpts.find((row) => row.path === 'preferences/alex.md')?.fingerprint;
     expect(fingerprint).toBeDefined();
 
-    const second = buildPreTurnContext({ ...input, seenEvidenceFingerprints: [fingerprint!] });
+    const second = await withCentralSync(
+      () => buildPreTurnContext({ ...input, seenEvidenceFingerprints: [fingerprint!] }),
+      'test',
+    );
     expect(second.memoryEvidence.excerpts.some((row) => row.path === 'preferences/alex.md')).toBe(false);
 
     memoryFile('preferences/alex.md', '# Alex\nCode-level detail is fine now.');
-    const third = buildPreTurnContext({ ...input, seenEvidenceFingerprints: [fingerprint!] });
+    const third = await withCentralSync(
+      () => buildPreTurnContext({ ...input, seenEvidenceFingerprints: [fingerprint!] }),
+      'test',
+    );
     const changed = third.memoryEvidence.excerpts.find((row) => row.path === 'preferences/alex.md');
     expect(changed?.text).toContain('Code-level detail');
   });
@@ -1050,14 +1141,18 @@ describe('per-person preference recall', () => {
     archiveFrom('m1', 'SR Renamed', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack:U1');
     upsertUserRow('slack:U1', 'Sam Rivera');
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+        }),
+      'test',
+    );
 
     const paths = result.memoryEvidence.excerpts.map((row) => row.path);
     expect(paths).toContain('preferences/sam-rivera.md');
@@ -1067,14 +1162,18 @@ describe('per-person preference recall', () => {
     memoryFile('preferences/casey-doe.md', '# Casey Doe\nShort summaries.');
     archiveFrom('m1', 'Casey Doe', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack:U-unknown');
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+        }),
+      'test',
+    );
 
     const paths = result.memoryEvidence.excerpts.map((row) => row.path);
     expect(paths).toContain('preferences/casey-doe.md');
@@ -1086,14 +1185,18 @@ describe('per-person preference recall', () => {
     archiveFrom('m1', 'Jordan Lee', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack:U2');
     upsertUserRow('slack:U2', null);
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+        }),
+      'test',
+    );
 
     const paths = result.memoryEvidence.excerpts.map((row) => row.path);
     expect(paths).toContain('preferences/jordan-lee.md');
@@ -1108,14 +1211,18 @@ describe('per-person preference recall', () => {
     archiveFrom('m1', 'Jamie Frost', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack:U10');
     upsertUserRow('slack:U10', 'Jamie Old');
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+        }),
+      'test',
+    );
 
     const paths = result.memoryEvidence.excerpts.map((row) => row.path);
     expect(paths).toContain('preferences/jamie-frost.md');
@@ -1127,14 +1234,18 @@ describe('per-person preference recall', () => {
     archiveFrom('m1', 'RV New', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack:U11');
     upsertUserRow('slack:U11', 'Robin Vale');
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+        }),
+      'test',
+    );
 
     const paths = result.memoryEvidence.excerpts.map((row) => row.path);
     expect(paths).toContain('preferences/robin-vale.md');
@@ -1152,14 +1263,18 @@ describe('per-person preference recall', () => {
     archiveFrom('m3', 'MF Renamed', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack:U14');
     upsertUserRow('slack:U14', 'Morgan Lee');
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+        }),
+      'test',
+    );
 
     const paths = result.memoryEvidence.excerpts.map((row) => row.path);
     expect(paths).toContain('preferences/morgan-lee.md');
@@ -1178,14 +1293,18 @@ describe('per-person preference recall', () => {
     archiveFrom('m2', 'Sam', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack:U21');
     upsertUserRow('slack:U21', 'Sam Rivera');
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+        }),
+      'test',
+    );
 
     const paths = result.memoryEvidence.excerpts.map((row) => row.path);
     expect(paths).toContain('preferences/sam.md');
@@ -1203,14 +1322,18 @@ describe('per-person preference recall', () => {
     archiveFrom('m1', 'QP Renamed', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'discord:U123');
     upsertUserRow('discord:U123', null);
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+        }),
+      'test',
+    );
 
     const paths = result.memoryEvidence.excerpts.map((row) => row.path);
     expect(paths).toContain('preferences/quinn-park.md');
@@ -1220,14 +1343,18 @@ describe('per-person preference recall', () => {
     memoryFile('preferences/river-cole.md', '---\nids: [slack-x:U123]\n---\n# River\nWants terse replies.');
     archiveFrom('m1', 'RC Alt', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack-x:U123');
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+        }),
+      'test',
+    );
 
     const paths = result.memoryEvidence.excerpts.map((row) => row.path);
     expect(paths).toContain('preferences/river-cole.md');
@@ -1240,14 +1367,18 @@ describe('per-person preference recall', () => {
     // verified prefix is shared.
     archiveFrom('m1', 'RC Alt', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'discord:U9999');
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+        }),
+      'test',
+    );
 
     const paths = result.memoryEvidence.excerpts.map((row) => row.path);
     expect(paths).not.toContain('preferences/river-cole.md');
@@ -1262,14 +1393,18 @@ describe('per-person preference recall', () => {
     // declared id strips and matches via the verified namespace.
     archiveFrom('m1', 'Morgan Park', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'discord:U500');
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+        }),
+      'test',
+    );
 
     const paths = result.memoryEvidence.excerpts.map((row) => row.path);
     expect(paths).toContain('preferences/current.md');
@@ -1280,14 +1415,18 @@ describe('per-person preference recall', () => {
     memoryFile('preferences/sky-vance.md', '---\nids: [U777]\n---\n# Sky Vance\nPrefers bullet points.');
     archiveFrom('m1', 'Sky Vance', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'discord:U777');
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+        }),
+      'test',
+    );
 
     const preference = result.memoryEvidence.excerpts.find((row) => row.path === 'preferences/sky-vance.md');
     expect(preference).toBeDefined();
@@ -1300,14 +1439,18 @@ describe('per-person preference recall', () => {
     memoryFile('preferences/drew-lane.md', '---\nids: [U999]\nnot a closing fence\n# Drew Lane\nPrefers plain text.');
     archiveFrom('m1', 'Drew Lane', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'slack-x:U999');
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+        }),
+      'test',
+    );
 
     // Malformed frontmatter means the id "U999" was never indexed, so the
     // file is reached (if at all) only via the name-matching fallback — and
@@ -1343,14 +1486,18 @@ describe('per-person preference recall', () => {
     );
     archiveFrom('m2', 'River Park', '2026-08-01T00:01:00.000Z', 'discord:guild:channel:thread', 'discord:U0TEST900XYZ');
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+        }),
+      'test',
+    );
 
     const paths = result.memoryEvidence.excerpts.map((row) => row.path);
     expect(paths).toContain('preferences/river-park.md');
@@ -1368,14 +1515,18 @@ describe('per-person preference recall', () => {
       '---\nids: [U0TESTFALLBACK1]\n---\n# Fallback One\nPrefers concise updates.',
     );
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'status?', sender: 'New Person', senderId: 'U0TESTFALLBACK1' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'New Person', senderId: 'U0TESTFALLBACK1' }),
+        }),
+      'test',
+    );
 
     const paths = result.memoryEvidence.excerpts.map((row) => row.path);
     expect(paths).toContain('preferences/fallback-one.md');
@@ -1387,18 +1538,22 @@ describe('per-person preference recall', () => {
       '---\nids: [U0TESTFALLBACK2]\n---\n# Fallback Two\nPrefers detailed updates.',
     );
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({
-        text: 'status?',
-        sender: 'New Person',
-        author: { userId: 'U0TESTFALLBACK2' },
-      }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({
+            text: 'status?',
+            sender: 'New Person',
+            author: { userId: 'U0TESTFALLBACK2' },
+          }),
+        }),
+      'test',
+    );
 
     const paths = result.memoryEvidence.excerpts.map((row) => row.path);
     expect(paths).toContain('preferences/fallback-two.md');
@@ -1415,14 +1570,18 @@ describe('per-person preference recall', () => {
       '---\nids: [discord:U0TESTNS1]\n---\n# NS Fallback\nPrefers concise updates.',
     );
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'status?', sender: 'NS Person', senderId: 'U0TESTNS1' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'NS Person', senderId: 'U0TESTNS1' }),
+        }),
+      'test',
+    );
 
     const paths = result.memoryEvidence.excerpts.map((row) => row.path);
     expect(paths).toContain('preferences/ns-fallback.md');
@@ -1447,14 +1606,18 @@ describe('per-person preference recall', () => {
       'discord:U0TESTOTHERPERSON',
     );
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe', senderId: 'U0TESTTRIGGERPERSON' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe', senderId: 'U0TESTTRIGGERPERSON' }),
+        }),
+      'test',
+    );
 
     // Pre-fix, the name-only suppression check saw "Pat Doe" already present
     // in involvedSenders (the OTHER person's archived group) and dropped the
@@ -1492,14 +1655,18 @@ describe('per-person preference recall', () => {
       'discord:U0TESTSHARED',
     );
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Sam New Name', senderId: 'U0TESTSHARED' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Sam New Name', senderId: 'U0TESTSHARED' }),
+        }),
+      'test',
+    );
 
     const paths = result.memoryEvidence.excerpts.map((row) => row.path);
     expect(paths).toContain('preferences/sam-shared.md');
@@ -1507,7 +1674,7 @@ describe('per-person preference recall', () => {
     expect(paths.filter((p) => p === 'preferences/sam-shared.md')).toHaveLength(1);
   });
 
-  it('reports an id-index read failure exactly once for a file that matches nothing by name', () => {
+  it('reports an id-index read failure exactly once for a file that matches nothing by name', async () => {
     // Ancestor-directory symlink swap, same technique as the "rejects an
     // ancestor-directory symlink swap" test above, but on a file no involved
     // sender's alias slug ever matches — so pre-fix, the excerpt-build loop
@@ -1547,14 +1714,18 @@ describe('per-person preference recall', () => {
 
     let result: PreTurnContext;
     try {
-      result = buildPreTurnContext({
-        agentGroupId: 'ag-a',
-        servicesCentral: SERVICES_CENTRAL_AG_A,
-        sessionId: 'sess-a',
-        kind: 'chat-sdk',
-        trigger: 1,
-        normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
-      });
+      result = await withCentralSync(
+        () =>
+          buildPreTurnContext({
+            agentGroupId: 'ag-a',
+            servicesCentral: SERVICES_CENTRAL_AG_A,
+            sessionId: 'sess-a',
+            kind: 'chat-sdk',
+            trigger: 1,
+            normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+          }),
+        'test',
+      );
     } finally {
       openSpy.mockRestore();
     }
@@ -1567,7 +1738,7 @@ describe('per-person preference recall', () => {
     expect(result.memoryEvidence.excerpts.some((row) => row.path === 'preferences/unmatched-file.md')).toBe(false);
   });
 
-  it('produces identical selection on a second call when preference files are unchanged (frontmatter-id cache)', () => {
+  it('produces identical selection on a second call when preference files are unchanged (frontmatter-id cache)', async () => {
     memoryFile('preferences/cache-one.md', '---\nids: [U0TESTCACHE1]\n---\n# Cache One\nConcise updates, always.');
     const input = {
       agentGroupId: 'ag-a',
@@ -1580,8 +1751,12 @@ describe('per-person preference recall', () => {
 
     const pathsOf = (ctx: ReturnType<typeof buildPreTurnContext>): string[] =>
       ctx.memoryEvidence.excerpts.map((row) => row.path);
-    expect(pathsOf(buildPreTurnContext(input))).toEqual(['preferences/cache-one.md']);
-    expect(pathsOf(buildPreTurnContext(input))).toEqual(['preferences/cache-one.md']);
+    expect(pathsOf(await withCentralSync(() => buildPreTurnContext(input), 'test'))).toEqual([
+      'preferences/cache-one.md',
+    ]);
+    expect(pathsOf(await withCentralSync(() => buildPreTurnContext(input), 'test'))).toEqual([
+      'preferences/cache-one.md',
+    ]);
   });
 
   it('picks up a changed ids: frontmatter after an edit, invalidating the mtime cache', async () => {
@@ -1589,17 +1764,21 @@ describe('per-person preference recall', () => {
     const absolute = path.join(TEST_ROOT, 'workgroups', 'wg-a', 'memory', relative);
     memoryFile(relative, '---\nids: [U0TESTCACHEOLD]\n---\n# Cache Two\nOld preferences.');
 
-    const askAs = (senderId: string) =>
-      buildPreTurnContext({
-        agentGroupId: 'ag-a',
-        servicesCentral: SERVICES_CENTRAL_AG_A,
-        sessionId: 'sess-a',
-        kind: 'chat-sdk',
-        trigger: 1,
-        normalizedContent: JSON.stringify({ text: 'status?', sender: 'Cache Person', senderId }),
-      });
+    const askAs = async (senderId: string) =>
+      await withCentralSync(
+        () =>
+          buildPreTurnContext({
+            agentGroupId: 'ag-a',
+            servicesCentral: SERVICES_CENTRAL_AG_A,
+            sessionId: 'sess-a',
+            kind: 'chat-sdk',
+            trigger: 1,
+            normalizedContent: JSON.stringify({ text: 'status?', sender: 'Cache Person', senderId }),
+          }),
+        'test',
+      );
 
-    expect(askAs('U0TESTCACHEOLD').memoryEvidence.excerpts.map((row) => row.path)).toContain(relative);
+    expect((await askAs('U0TESTCACHEOLD')).memoryEvidence.excerpts.map((row) => row.path)).toContain(relative);
 
     // Same byte length before and after ("OLD"/"NEW" and "Old"/"New" are both
     // 3 chars) so this exercises the mtime half of the (mtimeMs, size) cache
@@ -1610,8 +1789,8 @@ describe('per-person preference recall', () => {
     const bumped = new Date(fs.statSync(absolute).mtime.getTime() + 5000);
     fs.utimesSync(absolute, bumped, bumped);
 
-    expect(askAs('U0TESTCACHEOLD').memoryEvidence.excerpts.map((row) => row.path)).not.toContain(relative);
-    const nowNew = askAs('U0TESTCACHENEW');
+    expect((await askAs('U0TESTCACHEOLD')).memoryEvidence.excerpts.map((row) => row.path)).not.toContain(relative);
+    const nowNew = await askAs('U0TESTCACHENEW');
     const preference = nowNew.memoryEvidence.excerpts.find((row) => row.path === relative);
     expect(preference).toBeDefined();
     expect(preference?.text).toContain('New preferences');
@@ -1624,14 +1803,18 @@ describe('per-person preference recall', () => {
     // fallback" half of the fix is exercised in the same test.
     memoryFile('preferences/dup-person.md', '# Dup Person\nName-matched preferences.');
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Dup Person', senderId: 'U0TESTDUP' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Dup Person', senderId: 'U0TESTDUP' }),
+        }),
+      'test',
+    );
 
     const paths = result.memoryEvidence.excerpts.map((row) => row.path);
     expect(paths).not.toContain('preferences/dup-a.md');
@@ -1663,14 +1846,18 @@ describe('per-person preference recall', () => {
     );
     archiveFrom('m1', 'Bob', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', '@bob:matrix.example');
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Alice', senderId: '@alice:matrix.example' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Alice', senderId: '@alice:matrix.example' }),
+        }),
+      'test',
+    );
 
     const paths = result.memoryEvidence.excerpts.map((row) => row.path);
     expect(paths).toContain('preferences/alice-matrix.md');
@@ -1686,14 +1873,18 @@ describe('per-person preference recall', () => {
     memoryFile('preferences/homeserver-catchall.md', '---\nids: [matrix.example]\n---\n# Catchall\nMust not match.');
     archiveFrom('m1', 'Alice', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', '@alice:matrix.example');
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+        }),
+      'test',
+    );
 
     const paths = result.memoryEvidence.excerpts.map((row) => row.path);
     expect(paths).not.toContain('preferences/homeserver-catchall.md');
@@ -1705,14 +1896,18 @@ describe('per-person preference recall', () => {
     memoryFile('preferences/verified-bare.md', '---\nids: [U0TESTV1]\n---\n# Verified Bare\nCurrent preferences.');
     archiveFrom('m1', 'VB Renamed', '2026-08-01T00:00:00.000Z', 'discord:guild:channel:thread', 'discord:U0TESTV1');
 
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+        }),
+      'test',
+    );
 
     const paths = result.memoryEvidence.excerpts.map((row) => row.path);
     expect(paths).toContain('preferences/verified-bare.md');
@@ -1787,7 +1982,7 @@ describe('bootstrap recall budget (B-AC1..B-AC4, incident 2026-08-13)', () => {
     };
   }
 
-  it('bootstrap turns keep recall alongside a full capability block (B-AC1)', () => {
+  it('bootstrap turns keep recall alongside a full capability block (B-AC1)', async () => {
     seedIncidentShape();
     // A capability block at the (new) cap, like the widest-wired group.
     CAPABILITY_FIXTURE.services = Array.from({ length: 18 }, (_, index) => ({
@@ -1797,7 +1992,7 @@ describe('bootstrap recall budget (B-AC1..B-AC4, incident 2026-08-13)', () => {
       credentialPaths: [],
       activation: `Authenticated via TOKEN_${index}. Operative bottom line ${index}: never tell the owner you lack access before trying. ${'Detail. '.repeat(50)}`,
     }));
-    const result = buildPreTurnContext(bootstrapInput(true));
+    const result = await withCentralSync(() => buildPreTurnContext(bootstrapInput(true)), 'test');
     expect(result.trustedCapabilities).toBeDefined();
     // The incident: these two were zero while capabilities survived.
     expect(result.conversationEvidence.excerpts.length).toBeGreaterThan(0);
@@ -1805,9 +2000,9 @@ describe('bootstrap recall budget (B-AC1..B-AC4, incident 2026-08-13)', () => {
     expect(JSON.stringify(result).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.bootstrapFinalChars);
   });
 
-  it('ordinary turns keep the 12k bound (B-AC2)', () => {
+  it('ordinary turns keep the 12k bound (B-AC2)', async () => {
     seedIncidentShape();
-    const result = buildPreTurnContext(bootstrapInput(false));
+    const result = await withCentralSync(() => buildPreTurnContext(bootstrapInput(false)), 'test');
     expect(JSON.stringify(result).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.finalChars);
   });
 
@@ -1829,11 +2024,11 @@ describe('bootstrap recall budget (B-AC1..B-AC4, incident 2026-08-13)', () => {
     expect(notices.some((n) => n.code === 'capability-total-budget')).toBe(false);
   });
 
-  it('the bootstrap bound applies only with capabilities present (B-AC4)', () => {
+  it('the bootstrap bound applies only with capabilities present (B-AC4)', async () => {
     seedIncidentShape();
-    const withoutCaps = buildPreTurnContext(bootstrapInput(false));
+    const withoutCaps = await withCentralSync(() => buildPreTurnContext(bootstrapInput(false)), 'test');
     expect(JSON.stringify(withoutCaps).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.finalChars);
-    const withCaps = buildPreTurnContext(bootstrapInput(true));
+    const withCaps = await withCentralSync(() => buildPreTurnContext(bootstrapInput(true)), 'test');
     expect(withCaps.trustedCapabilities).toBeDefined();
   });
 });
@@ -2164,19 +2359,23 @@ describe('offset slicing is gated on normalization invariance, not on ASCII', ()
 // claim came from an ad-hoc harness run against a copied tree. This is the
 // permanent replacement: one structured debug line per build.
 describe('per-build structured log line (recall latency instrumentation)', () => {
-  it('fires once per build with workgroup id, timing, cache stats and fast-path count', () => {
+  it('fires once per build with workgroup id, timing, cache stats and fast-path count', async () => {
     archive('deploy-nightly', 'ag-a', 'Deploy pipeline runs nightly.', '2026-07-20T00:00:00.000Z');
     archive('deploy-retry', 'ag-a', 'Deploy pipeline retries on failure.', '2026-07-21T00:00:00.000Z');
 
     const debugSpy = vi.spyOn(log, 'debug').mockImplementation(() => {});
-    buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'deploy pipeline' }),
-    });
+    await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          sessionId: 'sess-a',
+          kind: 'chat-sdk',
+          trigger: 1,
+          normalizedContent: JSON.stringify({ text: 'deploy pipeline' }),
+        }),
+      'test',
+    );
 
     const call = debugSpy.mock.calls.find(([msg]) => msg === 'pre-turn-context: build');
     expect(call).toBeDefined();
@@ -2210,14 +2409,18 @@ it('test_sanitizer_passes_expiresAt_through_to_trustedCapabilities', async () =>
     },
   ];
   try {
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      servicesCentral: SERVICES_CENTRAL_AG_A,
-      kind: 'chat',
-      trigger: 1 as const,
-      normalizedContent: '{"text":"what services"}',
-      sessionId: 'sess-a',
-    });
+    const result = await withCentralSync(
+      () =>
+        buildPreTurnContext({
+          agentGroupId: 'ag-a',
+          servicesCentral: SERVICES_CENTRAL_AG_A,
+          kind: 'chat',
+          trigger: 1 as const,
+          normalizedContent: '{"text":"what services"}',
+          sessionId: 'sess-a',
+        }),
+      'test',
+    );
     const gh = result.trustedCapabilities?.services.find((s) => s.name === 'GitHub');
     // Round-1 blocker regression guard: the pre-turn sanitizer whitelist used
     // to strip expiresAt, so agents never saw the TTL the host intended.

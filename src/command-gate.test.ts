@@ -119,25 +119,25 @@ describe('preFanoutGate', () => {
 });
 
 describe('gateCommand (unchanged regression tests)', () => {
-  it('test_gateCommand_unchanged_filtered', () => {
-    const result = gateCommand(JSON.stringify({ text: '/help' }), 'u1', 'ag-1');
+  it('test_gateCommand_unchanged_filtered', async () => {
+    const result = await gateCommand(JSON.stringify({ text: '/help' }), 'u1', 'ag-1');
     expect(result).toEqual({ action: 'filter' });
   });
 
-  it('test_gateCommand_unchanged_admin_owner_passes', () => {
+  it('test_gateCommand_unchanged_admin_owner_passes', async () => {
     insertUser('u1');
     insertRole('u1', 'owner', null);
-    const result = gateCommand(JSON.stringify({ text: '/clear' }), 'u1', 'ag-1');
+    const result = await gateCommand(JSON.stringify({ text: '/clear' }), 'u1', 'ag-1');
     expect(result).toEqual({ action: 'pass' });
   });
 
-  it('test_gateCommand_admin_command_denied_non_admin', () => {
-    const result = gateCommand(JSON.stringify({ text: '/clear' }), 'u-nobody', 'ag-1');
+  it('test_gateCommand_admin_command_denied_non_admin', async () => {
+    const result = await gateCommand(JSON.stringify({ text: '/clear' }), 'u-nobody', 'ag-1');
     expect(result).toEqual({ action: 'deny', command: '/clear' });
   });
 
-  it('test_gateCommand_plain_text_passes', () => {
-    const result = gateCommand(JSON.stringify({ text: 'hello' }), null, 'ag-1');
+  it('test_gateCommand_plain_text_passes', async () => {
+    const result = await gateCommand(JSON.stringify({ text: 'hello' }), null, 'ag-1');
     expect(result).toEqual({ action: 'pass' });
   });
 });
@@ -230,22 +230,22 @@ describe('threaded inbound — extractUserMessage', () => {
 });
 
 describe('filtered commands', () => {
-  it('drops /start before it reaches the container', () => {
-    expect(gateCommand('/start', 'telegram:1', 'ag-1')).toEqual({ action: 'filter' });
+  it('drops /start before it reaches the container', async () => {
+    expect(await gateCommand('/start', 'telegram:1', 'ag-1')).toEqual({ action: 'filter' });
   });
 
-  it('drops /start regardless of sender', () => {
-    expect(gateCommand('/start', null, 'ag-1')).toEqual({ action: 'filter' });
+  it('drops /start regardless of sender', async () => {
+    expect(await gateCommand('/start', null, 'ag-1')).toEqual({ action: 'filter' });
   });
 });
 
 describe('admin gating goes through roles', () => {
-  it('denies an admin command from a non-admin user', () => {
-    expect(gateCommand('/clear', 'telegram:nobody', 'ag-1')).toEqual({ action: 'deny', command: '/clear' });
+  it('denies an admin command from a non-admin user', async () => {
+    expect(await gateCommand('/clear', 'telegram:nobody', 'ag-1')).toEqual({ action: 'deny', command: '/clear' });
   });
 
-  it('denies an admin command with no sender', () => {
-    expect(gateCommand('/clear', null, 'ag-1')).toEqual({ action: 'deny', command: '/clear' });
+  it('denies an admin command with no sender', async () => {
+    expect(await gateCommand('/clear', null, 'ag-1')).toEqual({ action: 'deny', command: '/clear' });
   });
 
   it('allows an admin command from an owner', async () => {
@@ -257,7 +257,7 @@ describe('admin gating goes through roles', () => {
       granted_by: null,
       granted_at: now(),
     });
-    expect(gateCommand('/clear', 'telegram:owner', 'ag-1')).toEqual({ action: 'pass' });
+    expect(await gateCommand('/clear', 'telegram:owner', 'ag-1')).toEqual({ action: 'pass' });
   });
 
   it('allows an admin command from a scoped admin of the group', async () => {
@@ -269,17 +269,17 @@ describe('admin gating goes through roles', () => {
       granted_by: null,
       granted_at: now(),
     });
-    expect(gateCommand('/clear', 'telegram:admin', 'ag-1')).toEqual({ action: 'pass' });
-    expect(gateCommand('/clear', 'telegram:admin', 'ag-2')).toEqual({ action: 'deny', command: '/clear' });
+    expect(await gateCommand('/clear', 'telegram:admin', 'ag-1')).toEqual({ action: 'pass' });
+    expect(await gateCommand('/clear', 'telegram:admin', 'ag-2')).toEqual({ action: 'deny', command: '/clear' });
   });
 });
 
 describe('normal messages pass through', () => {
-  it('passes a plain message', () => {
-    expect(gateCommand('hello there', 'telegram:1', 'ag-1')).toEqual({ action: 'pass' });
+  it('passes a plain message', async () => {
+    expect(await gateCommand('hello there', 'telegram:1', 'ag-1')).toEqual({ action: 'pass' });
   });
 
-  it('passes an unknown slash command', () => {
-    expect(gateCommand('/whatever', 'telegram:1', 'ag-1')).toEqual({ action: 'pass' });
+  it('passes an unknown slash command', async () => {
+    expect(await gateCommand('/whatever', 'telegram:1', 'ag-1')).toEqual({ action: 'pass' });
   });
 });

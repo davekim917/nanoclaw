@@ -90,17 +90,17 @@ interface ResolvedTarget {
  * unknown / late / healthy) the way the matrix needs. Returns a Response on any
  * reject (404/400/503/409), or the resolved target.
  */
-function resolveTarget(
+async function resolveTarget(
   key: string,
   ctx: AuthedRequestContext,
   nowMs: number,
   dataDir: string,
-): { error: Response } | { ok: ResolvedTarget } {
+): Promise<{ error: Response } | { ok: ResolvedTarget }> {
   const decoded = decodeKey(key);
   if (!decoded) return { error: json({ error: 'bad_key' }, 400) };
 
   // Mutation gate — owner/global-admin only; non-manage → 404 disclose-as-not-found.
-  if (!canManageScheduled(ctx.user.id)) return { error: json({ error: 'not_found' }, 404) };
+  if (!(await canManageScheduled(ctx.user.id))) return { error: json({ error: 'not_found' }, 404) };
   if (!ctx.scopes.no_filter && !ctx.scopes.allowed_group_ids.includes(decoded.agentGroupId)) {
     return { error: json({ error: 'not_found' }, 404) };
   }
@@ -437,7 +437,7 @@ export const editHandler: AuthHandler = async (req, params, ctx) => {
     return json({ error: 'invalid_request' }, 400);
   }
 
-  const r = resolveTarget(params['key'] ?? '', ctx, nowMs, dataDir);
+  const r = await resolveTarget(params['key'] ?? '', ctx, nowMs, dataDir);
   if ('error' in r) return r.error;
   const t = r.ok;
 
@@ -511,7 +511,7 @@ export const editHandler: AuthHandler = async (req, params, ctx) => {
 
 export const pauseHandler: AuthHandler = async (_req, params, ctx) => {
   const { dataDir, nowMs } = mutationOpts();
-  const r = resolveTarget(params['key'] ?? '', ctx, nowMs, dataDir);
+  const r = await resolveTarget(params['key'] ?? '', ctx, nowMs, dataDir);
   if ('error' in r) return r.error;
   const t = r.ok;
 
@@ -541,7 +541,7 @@ export const pauseHandler: AuthHandler = async (_req, params, ctx) => {
 
 export const resumeHandler: AuthHandler = async (_req, params, ctx) => {
   const { dataDir, nowMs } = mutationOpts();
-  const r = resolveTarget(params['key'] ?? '', ctx, nowMs, dataDir);
+  const r = await resolveTarget(params['key'] ?? '', ctx, nowMs, dataDir);
   if ('error' in r) return r.error;
   const t = r.ok;
 
@@ -593,7 +593,7 @@ export const runNowHandler: AuthHandler = async (req, params, ctx) => {
     /* no body — force defaults false */
   }
 
-  const r = resolveTarget(params['key'] ?? '', ctx, nowMs, dataDir);
+  const r = await resolveTarget(params['key'] ?? '', ctx, nowMs, dataDir);
   if ('error' in r) return r.error;
   const t = r.ok;
 
@@ -685,7 +685,7 @@ export const cancelHandler: AuthHandler = async (_req, params, ctx) => {
   // cancelSeriesWithStrandClear, whose touched-count includes terminal clears.
   const decoded = decodeKey(params['key'] ?? '');
   if (!decoded) return json({ error: 'bad_key' }, 400);
-  if (!canManageScheduled(ctx.user.id)) return json({ error: 'not_found' }, 404);
+  if (!(await canManageScheduled(ctx.user.id))) return json({ error: 'not_found' }, 404);
   if (!ctx.scopes.no_filter && !ctx.scopes.allowed_group_ids.includes(decoded.agentGroupId)) {
     return json({ error: 'not_found' }, 404);
   }
