@@ -14,7 +14,7 @@ import { expect, it } from 'vitest';
 
 import type { ResponseFrame } from './frame.js';
 import { register } from './registry.js';
-import { startCliServer, stopCliServer } from './socket-server.js';
+import { markCliServerReady, startCliServer, stopCliServer } from './socket-server.js';
 
 type PrintArgs = {
   'argv-value': string;
@@ -49,6 +49,7 @@ it('pipes stdin JSON through the real CLI and socket server into a registered co
 
   try {
     await startCliServer(socketPath);
+    markCliServerReady(); // #453: dispatch is refused with not-ready until boot marks the server ready
 
     const result = await runCli(tempDir, {
       stdin_value: 'from-stdin',
@@ -83,6 +84,7 @@ it('runs when the CLI entry point is invoked through a symlink', async () => {
 
   try {
     await startCliServer(socketPath);
+    markCliServerReady(); // #453: dispatch is refused with not-ready until boot marks the server ready
 
     const result = await runCli(
       tempDir,
