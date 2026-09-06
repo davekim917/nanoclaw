@@ -168,10 +168,10 @@ afterEach(() => {
 });
 
 describe('per-topic linked worktree cleanup', () => {
-  it('maps same-topic sibling sessions to exactly one cleanup target', () => {
+  it('maps same-topic sibling sessions to exactly one cleanup target', async () => {
     const fixture = repositoryFixture();
     state.rows.push(row('s2'));
-    const targets = _discoverWorktreesForTesting(state.dataDir);
+    const targets = await _discoverWorktreesForTesting(state.dataDir);
     expect(targets).toHaveLength(1);
     expect(targets[0]).toMatchObject({
       repo: fixture.repo,
@@ -183,7 +183,7 @@ describe('per-topic linked worktree cleanup', () => {
 
   it('removes only an inactive clean remote-contained linked checkout', async () => {
     const fixture = repositoryFixture();
-    const [target] = _discoverWorktreesForTesting(state.dataDir);
+    const [target] = await _discoverWorktreesForTesting(state.dataDir);
     await _cleanupOneForTesting(target, state.dataDir);
     expect(fs.existsSync(fixture.worktree)).toBe(false);
     expect(git(fixture.canonical, ['for-each-ref', '--format=%(refname)', `refs/heads/${fixture.branch}`])).toBe('');
@@ -206,7 +206,7 @@ describe('per-topic linked worktree cleanup', () => {
     const branchBefore = git(fixture.canonical, ['rev-parse', `refs/heads/${otherBranch}^{commit}`]);
     fs.rmSync(otherWorktree, { recursive: true, force: true });
 
-    const [target] = _discoverWorktreesForTesting(state.dataDir);
+    const [target] = await _discoverWorktreesForTesting(state.dataDir);
     await _cleanupOneForTesting(target, state.dataDir);
 
     const indexAfter = fs.readFileSync(otherIndex);
@@ -234,7 +234,7 @@ describe('per-topic linked worktree cleanup', () => {
     expect(git(fixture.worktree, ['status', '--porcelain=v1'])).toBe('');
     expect(git(fixture.worktree, ['log', 'HEAD', '--not', '--remotes', '--oneline'])).toBe('');
 
-    const [target] = _discoverWorktreesForTesting(state.dataDir);
+    const [target] = await _discoverWorktreesForTesting(state.dataDir);
     await _cleanupOneForTesting(target, state.dataDir);
 
     expect(fs.existsSync(fixture.worktree)).toBe(true);
@@ -252,7 +252,7 @@ describe('per-topic linked worktree cleanup', () => {
     const fixture = repositoryFixture();
     state.rows.push(row('s2'));
     arrange();
-    const [target] = _discoverWorktreesForTesting(state.dataDir);
+    const [target] = await _discoverWorktreesForTesting(state.dataDir);
     await _cleanupOneForTesting(target, state.dataDir);
     expect(fs.existsSync(fixture.worktree)).toBe(true);
   });
@@ -266,7 +266,7 @@ describe('per-topic linked worktree cleanup', () => {
     const fixture = repositoryFixture();
     arrange();
 
-    const [target] = _discoverWorktreesForTesting(state.dataDir);
+    const [target] = await _discoverWorktreesForTesting(state.dataDir);
     await _cleanupOneForTesting(target, state.dataDir);
 
     expect(fs.existsSync(fixture.worktree)).toBe(true);
@@ -279,7 +279,7 @@ describe('per-topic linked worktree cleanup', () => {
     const fixture = repositoryFixture();
     state.unreadable.add('s1');
 
-    const [target] = _discoverWorktreesForTesting(state.dataDir);
+    const [target] = await _discoverWorktreesForTesting(state.dataDir);
     await _cleanupOneForTesting(target, state.dataDir);
 
     expect(fs.existsSync(fixture.worktree)).toBe(true);
@@ -293,7 +293,7 @@ describe('per-topic linked worktree cleanup', () => {
     markReclaimed('s1');
     state.unreadable.add('s1'); // the dir/DB is in fact gone too, but that's not what's being asserted
 
-    const [target] = _discoverWorktreesForTesting(state.dataDir);
+    const [target] = await _discoverWorktreesForTesting(state.dataDir);
     await _cleanupOneForTesting(target, state.dataDir);
 
     expect(fs.existsSync(fixture.worktree)).toBe(false);
@@ -310,7 +310,7 @@ describe('per-topic linked worktree cleanup', () => {
     fs.writeFileSync(path.join(state.dataDir, 'v2-sessions', 'ag-s1', 's1', 'inbound.db'), '');
     state.unreadable.add('s1'); // falls through to the DB check, which fails closed
 
-    const [target] = _discoverWorktreesForTesting(state.dataDir);
+    const [target] = await _discoverWorktreesForTesting(state.dataDir);
     await _cleanupOneForTesting(target, state.dataDir);
 
     expect(fs.existsSync(fixture.worktree)).toBe(true);
@@ -328,7 +328,7 @@ describe('per-topic linked worktree cleanup', () => {
     fs.mkdirSync(path.join(state.dataDir, 'v2-sessions', 'ag-s1', 's1'), { recursive: true });
     state.unreadable.add('s1'); // irrelevant here — sessionWasReclaimed short-circuits first
 
-    const [target] = _discoverWorktreesForTesting(state.dataDir);
+    const [target] = await _discoverWorktreesForTesting(state.dataDir);
     await _cleanupOneForTesting(target, state.dataDir);
 
     expect(fs.existsSync(fixture.worktree)).toBe(false);
@@ -351,7 +351,7 @@ describe('per-topic linked worktree cleanup', () => {
       fs.mkdirSync(state.dataDir, { recursive: true });
       const fixture = repositoryFixture('thread-1', `repo-${index}`);
       arrange(fixture);
-      const [target] = _discoverWorktreesForTesting(state.dataDir);
+      const [target] = await _discoverWorktreesForTesting(state.dataDir);
       await _cleanupOneForTesting(target, state.dataDir);
       expect(fs.existsSync(fixture.worktree), `scenario ${index}`).toBe(true);
     }
@@ -376,15 +376,15 @@ describe('per-topic linked worktree cleanup', () => {
       },
       state.dataDir,
     );
-    const [target] = _discoverWorktreesForTesting(state.dataDir);
+    const [target] = await _discoverWorktreesForTesting(state.dataDir);
     await _cleanupOneForTesting(target, state.dataDir);
     expect(fs.existsSync(fixture.worktree)).toBe(true);
   });
 
-  it('does not discover unknown topic directories', () => {
+  it('does not discover unknown topic directories', async () => {
     const unknown = path.join(state.dataDir, 'v2-topics', 'wg-a', 'thread-00000000000000000000000000000000');
     fs.mkdirSync(path.join(unknown, 'worktrees', 'important'), { recursive: true });
-    expect(_discoverWorktreesForTesting(state.dataDir)).toEqual([]);
+    expect(await _discoverWorktreesForTesting(state.dataDir)).toEqual([]);
     expect(fs.existsSync(path.join(unknown, 'worktrees', 'important'))).toBe(true);
   });
 
@@ -393,12 +393,12 @@ describe('per-topic linked worktree cleanup', () => {
   // on the first one and killed discovery for the whole fleet.
   it.each(['.pnpm-store', '.nanoclaw-storage-active'])(
     'discovers real checkouts alongside the %s infrastructure directory',
-    (infraName) => {
+    async (infraName) => {
       const fixture = repositoryFixture();
       const infra = path.join(topicWorktreesDir(fixture.workUnit, state.dataDir), infraName);
       fs.mkdirSync(infra, { recursive: true });
 
-      const targets = _discoverWorktreesForTesting(state.dataDir);
+      const targets = await _discoverWorktreesForTesting(state.dataDir);
 
       expect(targets.map((target) => target.repo)).toEqual([fixture.repo]);
       expect(fs.existsSync(infra)).toBe(true);
@@ -441,7 +441,7 @@ describe('per-topic linked worktree cleanup', () => {
     // visible to an operator, not swallowed.
     for (const name of ['.pnpm-store', '.github']) fs.mkdirSync(path.join(root, name), { recursive: true });
 
-    const stats = _discoveryStatsForTesting(state.dataDir);
+    const stats = await _discoveryStatsForTesting(state.dataDir);
     expect(stats.targets.map((t) => t.repo)).toEqual([fixture.repo]);
     // Located, not just named: a bare deduped name reports one `.github` when
     // there are forty, and gives an operator nowhere to look.
@@ -460,7 +460,7 @@ describe('per-topic linked worktree cleanup', () => {
     const root = topicWorktreesDir(fixture.workUnit, state.dataDir);
     fs.chmodSync(root, 0o000);
     try {
-      const stats = _discoveryStatsForTesting(state.dataDir);
+      const stats = await _discoveryStatsForTesting(state.dataDir);
       expect(stats.targets).toEqual([]);
       expect(stats.unreadableRoots).toBe(1);
       expect(log.warn).toHaveBeenCalledWith(
@@ -480,11 +480,11 @@ describe('per-topic linked worktree cleanup', () => {
     expect(fs.existsSync(fixture.worktree)).toBe(true);
   });
 
-  it('reports an absent worktrees root as an ordinary empty topic', () => {
+  it('reports an absent worktrees root as an ordinary empty topic', async () => {
     const fixture = repositoryFixture();
     fs.rmSync(topicWorktreesDir(fixture.workUnit, state.dataDir), { recursive: true, force: true });
 
-    const stats = _discoveryStatsForTesting(state.dataDir);
+    const stats = await _discoveryStatsForTesting(state.dataDir);
     expect(stats).toMatchObject({ targets: [], filteredNames: [], unreadableRoots: 0 });
   });
 });

@@ -804,7 +804,10 @@ describe('worktree-cleanup.ts contains no literal seam call, and the only contai
       'src/config.ts': ['DATA_DIR', 'GROUPS_DIR'],
       'src/container-mounts.ts': ['runningContainerMounts'],
       'src/container-runner.ts': ['isContainerRunning', 'isContainerSpawning'],
-      'src/db/connection.ts': ['getRawDb'],
+      // Seam 3 PR 6 (#460 round 4): the session inventory reads through the
+      // central lease — this module runs on the host from the onHostStart
+      // timer, so its raw SELECT can no longer land in a suspended transaction.
+      'src/db/central-lease.ts': ['withCentralSync', 'withRawDb'],
       'src/host-lifecycle.ts': ['onHostShutdown', 'onHostStart'],
       'src/log.ts': ['log'],
       // PR 7 moved this file's outbound read onto the seam, and the manifest

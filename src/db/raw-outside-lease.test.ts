@@ -40,10 +40,6 @@ export const BARE_RAW_HANDLE_FILES: ReadonlyMap<string, string> = new Map([
       '(`storage-maintenance-worker-thread.ts`, its own connection via initDb — no host lease exists to join); ' +
       'the one host-side entry point, finishInterruptedSessionArchivals, takes the lease',
   ],
-  [
-    'src/worktree-cleanup.ts',
-    'only reachable from scripts/storage-gc.ts, a standalone process with its own connection',
-  ],
   ['src/db/transaction-fixtures/raw-receiver.ts', 'positive fixture for the receiver-aware transaction test'],
   ['src/test-fixtures/raw-db-fake.ts', 'test fixture'],
 ]);

@@ -277,7 +277,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/topic-title.test.ts',
   'src/workgroup-memory.integration.test.ts',
   'src/worktree-cleanup.test.ts',
-  'src/worktree-cleanup.ts',
 ];
 
 function stripComments(source: string): string {
