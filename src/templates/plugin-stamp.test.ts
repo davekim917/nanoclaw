@@ -166,10 +166,7 @@ describe('T5 PR 3 — the plugin reader and the stamp path', () => {
     expect(servers.remote).toEqual({ type: 'http', url: 'https://mcp.example.com/mcp' });
     // The ownership marker stays off the file and on the projection.
     expect(JSON.stringify(servers)).not.toContain('"plugin"');
-    const row = JSON.parse((await getContainerConfig(group.id))!.mcp_servers) as Record<
-      string,
-      { plugin?: string }
-    >;
+    const row = JSON.parse((await getContainerConfig(group.id))!.mcp_servers) as Record<string, { plugin?: string }>;
     expect(row.omits.plugin).toBe('acme');
     expect(row.remote.plugin).toBe('acme');
   });
@@ -273,7 +270,12 @@ describe('T5 PR 3 — the plugin reader and the stamp path', () => {
     expect(fs.readdirSync(path.join(GROUPS_DIR, group.folder, 'plugins'))).toEqual([]);
 
     const session = { id: 's-no-plugin', agent_group_id: group.id } as Session;
-    const config: ContainerConfig = { mcpServers: {}, packages: { apt: [], npm: [] }, additionalMounts: [], skills: [] };
+    const config: ContainerConfig = {
+      mcpServers: {},
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: [],
+    };
     const mounts = await buildMounts(group, session, config, 'claude', {}, group.folder);
 
     const mount = mounts.find((m) => m.containerPath === CONTAINER_PLUGINS_DIR);
@@ -291,26 +293,38 @@ describe('T5 PR 3 — the plugin reader and the stamp path', () => {
  * reopens that hole silently, so the module tree is pinned instead.
  */
 describe('the templates module never copies plugin content with fs.cpSync', () => {
-  it('cpSync has no callers under src/templates/', () => {
-    const dir = path.resolve(__dirname);
-    const offenders = fs
-      .readdirSync(dir)
-      .filter((f) => f.endsWith('.ts'))
-      // This file names the identifier in its own matcher and its message.
-      .filter((f) => f !== path.basename(__filename))
-      .filter((f) => /\bcpSync\b/.test(fs.readFileSync(path.join(dir, f), 'utf8')));
+  /** Comments name the identifier on purpose (plugin-dir.ts says so twice). */
+  const stripComments = (source: string): string =>
+    source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:"'`])\/\/[^\n]*/g, (_m, lead: string) => lead);
 
+  const CALL_SITE_RE = /\bcpSync\b/;
+
+  const callers = (): string[] => {
+    const dir = path.resolve(__dirname);
+    return (
+      fs
+        .readdirSync(dir)
+        .filter((f) => f.endsWith('.ts'))
+        // This file names the identifier in its own matcher and its fixture.
+        .filter((f) => f !== path.basename(__filename))
+        .filter((f) => CALL_SITE_RE.test(stripComments(fs.readFileSync(path.join(dir, f), 'utf8'))))
+    );
+  };
+
+  it('cpSync has no callers under src/templates/', () => {
     expect(
-      offenders,
+      callers(),
       'plugin content must leave a plugin only through copyPluginDir (src/templates/plugin-dir.ts); ' +
         'fs.cpSync follows symlinks and enforces none of the containment caps',
     ).toEqual([]);
   });
 
   it('bites when a caller is planted', () => {
-    // Proves the scan above is not vacuous: the same predicate over a source
-    // that does call cpSync reports it.
-    const planted = 'import fs from "fs";\nfs.cpSync(src, dest, { recursive: true });\n';
-    expect(/\bcpSync\b/.test(planted)).toBe(true);
+    // Proves the scan is not vacuous: the same predicate, over a source that
+    // really calls it outside a comment, reports the call.
+    const planted = 'import fs from "fs";\n// fs.cpSync in a comment is fine\nfs.cpSync(src, dest);\n';
+    expect(CALL_SITE_RE.test(stripComments(planted))).toBe(true);
+    const commentOnly = '/** never through raw fs.cpSync */\nexport const x = 1;\n';
+    expect(CALL_SITE_RE.test(stripComments(commentOnly))).toBe(false);
   });
 });
