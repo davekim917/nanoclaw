@@ -648,42 +648,70 @@ export async function buildSignalData(
       (projects.find((p) => p.id === decision.project_id) ?? unmapped).decision_ids.push(decision.id);
     }
     for (const row of reviews) {
-      // Disappearance never becomes a resolved verdict; preserve the durable
-      // history as source health without leaking thread review text across scope.
-      if (
-        !result.rawDecisions.some((d) => d.id === row.id) &&
-        (row.source_kind === 'release-item' || !!deps.threadId)
-      ) {
-        const saved = readRecord(row) as ReturnType<typeof readRecord> & { snapshot?: SourceDecision };
-        const previous = saved.snapshot;
-        if (previous && (row.source_kind === 'release-item' || groupVisible(ctx, previous.agent_group_id))) {
-          const missing: SourceDecision = {
-            ...previous,
-            evidence_hash: digest([row.evidence_hash, 'source_unavailable']),
-            exact_context: false,
-            capabilities: {
-              claim: false,
-              answer: false,
-              dispatch:
-                saved.dispatch?.state === 'pending' &&
-                saved.owner?.id === ctx.user.id &&
-                canReview(ctx, { ...previous, exact_context: true }),
-            },
-          };
-          result.rawDecisions.push(missing);
-          result.decisions.push(decorateReview(missing, row));
-          (projects.find((p) => p.id === missing.project_id) ?? unmapped).decision_ids.push(missing.id);
-          result.sources.push(
-            health(
-              wg.id,
-              previous.question,
-              null,
-              now,
-              'Previously reviewed source is absent or unreadable. History is retained; absence is not completion.',
-            ),
-          );
-        }
+      if (result.rawDecisions.some((d) => d.id === row.id)) continue;
+      const saved = readRecord(row) as ReturnType<typeof readRecord> & { snapshot?: SourceDecision };
+      const previous = saved.snapshot;
+      if (!previous) continue;
+      const currentThread = previous.thread_id
+        ? realThreads.find((thread) => thread.thread_id === previous.thread_id)
+        : undefined;
+      const currentMember = currentThread?.participants.some(
+        (participant) =>
+          participant.agent_group_id === previous.agent_group_id && allowed.has(participant.agent_group_id),
+      );
+      const snapshotVisible =
+        row.source_kind === 'release-item' ||
+        (previous.agent_group_id !== null &&
+          allowed.has(previous.agent_group_id) &&
+          groupVisible(ctx, previous.agent_group_id));
+      const visibleThreadReview = row.source_kind === 'thread-question' && saved.answer !== null && snapshotVisible;
+      // Retain the recorded answer when the same scoped agent still
+      // participates, including when a later question is now active. A live
+      // decision with this review's id was already handled above. Outside the
+      // bounded page, preserve history without declaring the source unavailable.
+      if (visibleThreadReview && (!currentThread ? !deps.threadId : currentMember)) {
+        const recorded: SourceDecision = {
+          ...previous,
+          evidence_hash: row.evidence_hash,
+          exact_context: false,
+          capabilities: { claim: false, answer: false, dispatch: false },
+        };
+        result.rawDecisions.push(recorded);
+        result.decisions.push(decorateReview(recorded, row));
+        (projects.find((p) => p.id === recorded.project_id) ?? unmapped).decision_ids.push(recorded.id);
+        continue;
       }
+      // Only an exact lookup that does not find its reviewed thread proves a
+      // thread source is gone. Overview pagination leaves that fact unknown.
+      const sourceGone =
+        row.source_kind === 'release-item' ||
+        (!!deps.threadId && previous.thread_id === deps.threadId && !currentThread);
+      if (!sourceGone || !snapshotVisible) continue;
+      const missing: SourceDecision = {
+        ...previous,
+        evidence_hash: digest([row.evidence_hash, 'source_unavailable']),
+        exact_context: false,
+        capabilities: {
+          claim: false,
+          answer: false,
+          dispatch:
+            saved.dispatch?.state === 'pending' &&
+            saved.owner?.id === ctx.user.id &&
+            canReview(ctx, { ...previous, exact_context: true }),
+        },
+      };
+      result.rawDecisions.push(missing);
+      result.decisions.push(decorateReview(missing, row));
+      (projects.find((p) => p.id === missing.project_id) ?? unmapped).decision_ids.push(missing.id);
+      result.sources.push(
+        health(
+          wg.id,
+          previous.question,
+          null,
+          now,
+          'Previously reviewed source is absent or unreadable. History is retained; absence is not completion.',
+        ),
+      );
     }
     result.projects.push(...projects);
   }

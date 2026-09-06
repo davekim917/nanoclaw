@@ -318,6 +318,92 @@ describe('Signal source and authority boundaries', () => {
     expect(first.question).toBe('First?');
     expect(first.id).not.toBe(second.id);
   });
+  it('retains scoped recorded thread answers after completion without marking off-page questions unavailable', async () => {
+    await updateProject(
+      'thread-project',
+      {
+        workgroup_id: 'w',
+        name: 'Thread project',
+        description: 'Tracks synthetic direct work',
+        repositories: [],
+        channel_keys: ['slack:C'],
+        expected_version: 0,
+      },
+      ctx(),
+    );
+    const active = {
+      thread_id: 'slack:C:recorded',
+      session_ids: ['synthetic-recorded-session'],
+      participants: [{ agent_group_id: 'a', session_id: 'synthetic-recorded-session', name: 'A' }],
+      reply_target_session_id: 'synthetic-recorded-session',
+      channel_key: 'slack:C',
+      channel_name: 'dispatch',
+      title: 'Recorded thread question',
+      state: 'needs_you',
+      needs_you_reason: { cause: 'ask_question', text: 'Record this answer' },
+      last_activity_at: '2026-09-05T00:00:00Z',
+    } as unknown as ThreadSummary;
+    const questionDeps: ApiDeps = {
+      ...deps([]),
+      threads: async () => [active],
+      question: () => ({ seq: 1, text: 'Record this answer', timestamp: '2026-09-05T00:00:00Z' }),
+    };
+    const source = (await buildSignalData(ctx(), 'w', questionDeps)).decisions[0]!;
+    await reviewDecision(
+      source.id,
+      {
+        expected_version: 0,
+        evidence_hash: source.evidence_hash,
+        action: 'answer',
+        text: 'Synthetic recorded answer',
+        idempotency_key: 'recorded-answer',
+      },
+      ctx(),
+      questionDeps,
+    );
+    const idle = { ...active, state: 'idle', needs_you_reason: null } as unknown as ThreadSummary;
+    const completed = await buildSignalData(ctx(), 'w', { ...questionDeps, threads: async () => [idle] });
+    const retained = completed.decisions.find((decision) => decision.id === source.id)!;
+    expect(retained).toMatchObject({
+      state: 'answered',
+      project_id: 'thread-project',
+      answer: 'Synthetic recorded answer',
+    });
+    expect(retained.history).toHaveLength(1);
+    expect(retained.capabilities).toEqual({ claim: false, answer: false, dispatch: false });
+    expect(completed.projects.find((project) => project.id === 'thread-project')!.decision_ids).toContain(source.id);
+    expect(
+      completed.sources.some((entry) => entry.source === retained.question && entry.status === 'unavailable'),
+    ).toBe(false);
+    const laterQuestion = await buildSignalData(ctx(), 'w', {
+      ...questionDeps,
+      question: () => ({ seq: 2, text: 'A later question', timestamp: '2026-09-05T01:00:00Z' }),
+    });
+    expect(laterQuestion.decisions.find((decision) => decision.id === source.id)?.state).toBe('answered');
+    expect(laterQuestion.decisions.some((decision) => decision.question === 'A later question')).toBe(true);
+    const outOfScope = await buildSignalData(ctx('j', 'admin_of_group', ['b']), 'w', {
+      ...questionDeps,
+      threads: async () => [idle],
+    });
+    expect(outOfScope.decisions.some((decision) => decision.id === source.id)).toBe(false);
+    const filler = {
+      ...active,
+      thread_id: 'slack:C:filler',
+      session_ids: ['synthetic-filler-session'],
+      participants: [{ agent_group_id: 'a', session_id: 'synthetic-filler-session', name: 'A' }],
+      reply_target_session_id: 'synthetic-filler-session',
+    } as unknown as ThreadSummary;
+    const offPage = await buildSignalData(ctx(), 'w', {
+      ...questionDeps,
+      threads: async () => [filler, active],
+      threadLimit: 1,
+    });
+    expect(offPage.decisions.filter((decision) => decision.id === source.id)).toHaveLength(1);
+    expect(offPage.decisions.find((decision) => decision.id === source.id)!.state).toBe('answered');
+    expect(offPage.sources.some((entry) => entry.source === source.question && entry.status === 'unavailable')).toBe(
+      false,
+    );
+  });
 });
 describe('Signal durable dispatch', () => {
   it('reserves exact target before sending and recovers crash after successful delivery without duplicate', async () => {
@@ -496,10 +582,12 @@ it('skips a malformed release board timestamp before a healthy declaration', asy
       'w',
     );
     expect(
-      (await readSignalRelease('w', {
-        groupsRoot: path.join(root, 'groups'),
-        dataRoot: path.join(root, 'data'),
-      }))?.asOf,
+      (
+        await readSignalRelease('w', {
+          groupsRoot: path.join(root, 'groups'),
+          dataRoot: path.join(root, 'data'),
+        })
+      )?.asOf,
     ).toBe('2026-09-05T00:00:00Z');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });

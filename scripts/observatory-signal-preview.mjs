@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 
 const buildRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const liveRoot = process.env.SIGNAL_SOURCE_ROOT || '/home/ubuntu/nanoclaw-v2';
+const liveRoot = path.resolve(process.env.SIGNAL_SOURCE_ROOT || buildRoot);
 const evidence = process.env.SIGNAL_EVIDENCE_DIR || '/tmp/observatory-signal-evidence';
 const port = Number(process.env.SIGNAL_PREVIEW_PORT || 4318);
 fs.mkdirSync(evidence, { recursive: true, mode: 0o700 });
