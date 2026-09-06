@@ -41,6 +41,7 @@ import { ensureContainerConfig, getContainerConfig } from '../db/container-confi
 import { initGroupFilesystem } from '../group-init.js';
 import { STANDING_INSTRUCTIONS_FILE } from '../group-persona.js';
 import type { AgentGroup, Session } from '../types.js';
+import { copyPluginDir } from './plugin-dir.js';
 import { createAgentFromTemplate, markPluginServers, withPluginOwner } from './create-agent.js';
 import { assertMcpServerNotPluginOwned } from '../container-config.js';
 import { NANOCLAW_EXTENSION_NS } from './extension.js';
@@ -415,6 +416,19 @@ describe('T5 PR 3 — the plugin reader and the stamp path', () => {
       );
       expect(() => parseTemplate(PLUGIN_DIR)).toThrow(/looks like a real credential/);
     }
+  });
+
+  it('an empty shipped directory survives the stamp so a declared cwd still works (#500 round 8)', () => {
+    // copyPluginDir recreated only the parents of files, so `./work` — a
+    // legitimate cwd target the source validation accepts — vanished and the
+    // stamped server's cd failed at first launch.
+    writeManifest();
+    fs.mkdirSync(path.join(PLUGIN_DIR, 'work'), { recursive: true });
+    fs.mkdirSync(path.join(PLUGIN_DIR, 'nested', 'deep'), { recursive: true });
+    const dest = path.join(TEST_ROOT, 'copied');
+    copyPluginDir(PLUGIN_DIR, dest);
+    expect(fs.statSync(path.join(dest, 'work')).isDirectory()).toBe(true);
+    expect(fs.statSync(path.join(dest, 'nested', 'deep')).isDirectory()).toBe(true);
   });
 
   it('the documented mcp.json examples parse and stamp (#500 round 4)', () => {

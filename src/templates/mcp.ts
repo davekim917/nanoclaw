@@ -172,15 +172,17 @@ export function readPluginMcp(pluginDir: string): { servers: Record<string, Pars
  * the unit that must be proven credential-free is the file (#500 rounds 2-7).
  */
 function lintDocumentCredentials(raw: Record<string, unknown>, report: string[]): void {
-  const servers = raw.mcpServers;
-  if (isPlainObject(servers)) {
-    for (const [name, entry] of Object.entries(servers)) {
+  if (isPlainObject(raw.mcpServers)) {
+    for (const [name, entry] of Object.entries(raw.mcpServers)) {
       if (!isPlainObject(entry)) continue;
       // A value the lint cannot read is unlintable, not absent.
       for (const kind of ['env', 'headers'] as const) assertLintableValues(name, kind, entry[kind]);
     }
   }
-  for (const [where, value] of entryStrings(servers, 'mcpServers')) {
+  // `raw`, not `raw.mcpServers`: the FILE is what ships, so a credential parked
+  // in a sibling key (`metadata: { token: "sk-live-…" }`, or a secret-shaped
+  // `$schema`) reaches the agent just the same (Codex on #500 round 8).
+  for (const [where, value] of entryStrings(raw)) {
     lintSecrets(where.split('.')[1] ?? 'mcp.json', where, value, report);
   }
 }
