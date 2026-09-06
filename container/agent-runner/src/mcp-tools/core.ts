@@ -88,6 +88,44 @@ function destinationList(): string {
   return all.map((d) => d.name).join(', ');
 }
 
+// Final response routing uses this envelope, but an MCP tool already has an
+// explicit routing field. A model can carry the final-response habit into a
+// send_message call, which otherwise exposes the envelope as literal chat
+// text. Recognize only one complete, top-level routing envelope: XML in prose
+// or code blocks remains user content.
+const ROUTING_MESSAGE_OPENER_RE = /<message\s+to="([^"]*)"\s*>/g;
+const ROUTING_MESSAGE_ENVELOPE_RE = /^\s*<message\s+to="[^"]*"\s*>([\s\S]*)<\/message>\s*$/;
+
+function normalizeToolMessageText(text: string): { text: string } | { error: string } {
+  // An inline example or fenced code block does not begin with an envelope,
+  // so preserve it exactly. `<message>` without a routing attribute is also
+  // ordinary XML, not a NanoClaw routing instruction.
+  if (!/^\s*<message\s+to="[^"]*"\s*>/.test(text)) return { text };
+
+  const openers = [...text.matchAll(ROUTING_MESSAGE_OPENER_RE)];
+  if (openers.length !== 1) {
+    const destinations = [...new Set(openers.map((opener) => opener[1]))];
+    const detail = destinations.length > 1 ? ` to multiple destinations (${destinations.join(', ')})` : '';
+    return {
+      error:
+        `text contains multiple routing message envelopes${detail}. ` +
+        'Use one send_message or edit_message call per message.',
+    };
+  }
+
+  const envelope = text.match(ROUTING_MESSAGE_ENVELOPE_RE);
+  if (!envelope) {
+    return {
+      error:
+        'text starts with a routing message envelope but is not one complete `<message to="...">...</message>` block.',
+    };
+  }
+
+  // The envelope's `to` is deliberately ignored: the MCP tool's `to` (or its
+  // current-conversation default) is the only routing authority on this path.
+  return { text: envelope[1] };
+}
+
 /**
  * Resolve a destination name to routing fields.
  *
@@ -166,7 +204,11 @@ export const sendMessage: McpToolDefinition = {
     },
   },
   async handler(args) {
-    const text = args.text as string;
+    const rawText = args.text as string;
+    if (!rawText) return err('text is required');
+    const normalized = normalizeToolMessageText(rawText);
+    if ('error' in normalized) return err(normalized.error);
+    const text = normalized.text;
     if (!text) return err('text is required');
 
     const routing = resolveRouting(args.to as string | undefined);
@@ -314,8 +356,12 @@ export const editMessage: McpToolDefinition = {
   },
   async handler(args) {
     const seq = Number(args.messageId);
-    const text = args.text as string;
-    if (!seq || !text) return err('messageId and text are required');
+    const rawText = args.text as string;
+    if (!seq || !rawText) return err('messageId and text are required');
+    const normalized = normalizeToolMessageText(rawText);
+    if ('error' in normalized) return err(normalized.error);
+    const text = normalized.text;
+    if (!text) return err('messageId and text are required');
 
     const platformId = getMessageIdBySeq(seq);
     if (!platformId) return err(`Message #${seq} not found`);

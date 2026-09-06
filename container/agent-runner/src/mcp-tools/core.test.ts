@@ -16,7 +16,7 @@ import { describe, it, test, expect, beforeEach, afterEach } from 'bun:test';
 import { getInboundDb, getOutboundDb } from '../mailbox/sqlite/connection.js';
 import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
-import { sendMessage, isAllowedFilePath } from './core.js';
+import { editMessage, sendMessage, isAllowedFilePath } from './core.js';
 
 /**
  * Publish the a2a reply stamp the way the poll loop does: a direct write to
@@ -111,6 +111,93 @@ describe('send_message MCP tool — default replies in the current conversation'
     expect(out).toHaveLength(1);
     expect(out[0].platform_id).toBe('slack:DTEST00009');
     expect(out[0].thread_id).toBeNull();
+  });
+});
+
+describe('send_message MCP tool — final-output envelope normalization', () => {
+  it('removes an accidentally nested final-output envelope before writing the chat text', async () => {
+    await sendMessage.handler({ to: 'peer', text: '<message to="here">the actual reply</message>' });
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe('the actual reply');
+  });
+
+  it('uses the current conversation when the tool omits `to`, regardless of the envelope destination', async () => {
+    const db = getInboundDb();
+    db.exec(
+      'CREATE TABLE IF NOT EXISTS session_routing (id INTEGER PRIMARY KEY, channel_type TEXT, platform_id TEXT, thread_id TEXT)',
+    );
+    db.prepare(
+      "INSERT INTO session_routing (id, channel_type, platform_id, thread_id) VALUES (1, 'slack', 'C-CURRENT', 'thread-current')",
+    ).run();
+
+    await sendMessage.handler({ text: '<message to="other">reply in place</message>' });
+
+    const [out] = getUndeliveredMessages();
+    expect(out.platform_id).toBe('C-CURRENT');
+    expect(out.thread_id).toBe('thread-current');
+    expect(JSON.parse(out.content).text).toBe('reply in place');
+  });
+
+  it('keeps the explicit tool destination authoritative over the envelope destination', async () => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('other', 'Other', 'agent', NULL, NULL, 'ag-other')`,
+      )
+      .run();
+
+    await sendMessage.handler({ to: 'peer', text: '<message to="other">reply to peer</message>' });
+
+    const [out] = getUndeliveredMessages();
+    expect(out.platform_id).toBe('ag-peer');
+    expect(JSON.parse(out.content).text).toBe('reply to peer');
+  });
+
+  it('preserves plain text, ordinary XML, inline XML examples, and fenced examples unchanged', async () => {
+    const plain = 'Plain reply.';
+    const ordinaryXml = '<message>ordinary XML</message>';
+    const inline = 'Document `<message to="here">body</message>` exactly.';
+    const fenced = '```xml\n<message to="here">body</message>\n```';
+
+    await sendMessage.handler({ to: 'peer', text: plain });
+    await sendMessage.handler({ to: 'peer', text: ordinaryXml });
+    await sendMessage.handler({ to: 'peer', text: inline });
+    await sendMessage.handler({ to: 'peer', text: fenced });
+
+    const texts = getUndeliveredMessages().map((row) => JSON.parse(row.content).text);
+    expect(texts).toEqual([plain, ordinaryXml, inline, fenced]);
+  });
+
+  it('rejects multiple addressed envelopes without writing a potentially misrouted message', async () => {
+    const result = await sendMessage.handler({
+      to: 'peer',
+      text: '<message to="peer">private detail</message><message to="other">separate detail</message>',
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('multiple routing message envelopes');
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
+  it('rejects an unclosed routing envelope instead of leaking it literally', async () => {
+    const result = await sendMessage.handler({ to: 'peer', text: '<message to="here">unfinished reply' });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('one complete');
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
+  it('applies the same normalization to edit_message text', async () => {
+    await sendMessage.handler({ to: 'peer', text: 'original reply' });
+    const [original] = getUndeliveredMessages();
+
+    await editMessage.handler({ messageId: original.seq, text: '<message to="here">edited reply</message>' });
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(2);
+    expect(JSON.parse(out[1].content)).toMatchObject({ operation: 'edit', text: 'edited reply' });
   });
 });
 
