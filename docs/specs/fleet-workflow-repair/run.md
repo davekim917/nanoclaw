@@ -69,6 +69,15 @@ No material correctness finding remains after lead adjudication. The additional
 scheduled-task doc ratchet acceptance corrects that directly linked contract.
 Full host/scripts ESLint completed with no errors.
 
+Follow-up PR review found one concrete contradiction in the scheduled-task
+marker example: it deleted the observed marker when it queued a wake. The
+example now preserves the marker, uses a producer-generated event or generation
+ID as its stable observation identity and quiets only when a durable matching
+completion receipt exists. The producer replaces markers atomically; completion
+receipts use same-directory temporary files and atomic rename. A new marker ID
+cannot be consumed by an older receipt, and read failures remain visible script
+failures rather than quiet success.
+
 All three private monitor migrations are now applied through supported task CLI
 updates. Each cutover paused only its future fire, verified inert input and no
 active execution, dry-ran the exact new state reader, saved current forensic
