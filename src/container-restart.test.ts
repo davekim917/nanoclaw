@@ -729,6 +729,21 @@ describe('restartAgentGroupContainers', () => {
   // an unhandledRejection and the loop always finished. Awaiting it turned that
   // into control flow: the first failure killed the sessions ahead of it and
   // stranded every one behind it, half-restarting the group.
+  it('selects a pending survivor for a host-side group restart', async () => {
+    // A survivor adoption could not yet claim is absent from the registry but
+    // runs the old image; `ncl groups restart` must reach it (#479 round 1).
+    mockGetSessionsByAgentGroup.mockReturnValue([makeSession('s-tracked', 'g1'), makeSession('s-pending', 'g1')]);
+    mockIsContainerRunning.mockImplementation((id) => id === 's-tracked');
+    mockHasPendingAdoption.mockImplementation((id) => id === 's-pending');
+
+    const count = await restartAgentGroupContainers('g1', 'test', 'Resuming.');
+
+    expect(mockKillContainer.mock.calls.map((c) => c[0])).toEqual(['s-tracked', 's-pending']);
+    expect(count).toBe(2);
+    mockHasPendingAdoption.mockReset();
+    mockHasPendingAdoption.mockReturnValue(false);
+  });
+
   it('keeps restarting after one session fails, and never kills that session', async () => {
     mockGetSessionsByAgentGroup.mockReturnValue([
       makeSession('s1', 'g1'),

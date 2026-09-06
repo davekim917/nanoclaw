@@ -834,8 +834,11 @@ export async function restartAgentGroupContainers(
   wakeMessage?: string,
   options: { respawnAll?: boolean } = {},
 ): Promise<number> {
+  // A pending survivor (adoption could not yet claim it, seam 4 E/D2) is
+  // running the OLD image and configuration too; it is selected like a tracked
+  // container and stopped through `killContainer`, which routes it (#462).
   const sessions = (await getSessionsByAgentGroup(agentGroupId)).filter(
-    (s) => s.status === 'active' && isContainerRunning(s.id),
+    (s) => s.status === 'active' && (isContainerRunning(s.id) || hasPendingAdoption(s.id)),
   );
 
   let restarted = 0;
@@ -912,8 +915,9 @@ export async function restartAgentGroupContainers(
 
     // The container can exit during the awaited write above, and killContainer
     // no-ops on a session it no longer tracks — counting that as a restart
-    // reports work that did not happen.
-    if (!isContainerRunning(session.id)) {
+    // reports work that did not happen. A pending survivor is still a
+    // container to restart; its exit clears the pending mark the same way.
+    if (!isContainerRunning(session.id) && !hasPendingAdoption(session.id)) {
       await withdrawWake();
       continue;
     }
