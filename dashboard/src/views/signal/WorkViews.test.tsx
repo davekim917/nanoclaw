@@ -335,4 +335,98 @@ describe('work-first interaction', () => {
     expect(pending.size).toBe(0);
     expect(vi.mocked(api.postThreadMessage).mock.calls[0]).toEqual(vi.mocked(api.postThreadMessage).mock.calls[1]);
   });
+  it('keeps the newer retry busy when an older request rejects after remount', async () => {
+    const pending = new Map();
+    const cache = new Map();
+    let rejectOriginal!: (reason: Error) => void;
+    let finishRetry!: (value: Awaited<ReturnType<typeof api.postThreadMessage>>) => void;
+    vi.mocked(api.postThreadMessage)
+      .mockImplementationOnce(
+        () =>
+          new Promise((_resolve, reject) => {
+            rejectOriginal = reject;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishRetry = resolve;
+          }),
+      );
+    const view = () => (
+      <SWRConfig value={{ provider: () => cache }}>
+        <ThreadWorkspace
+          authMe={authMe}
+          workgroup="all"
+          query=""
+          id="t1"
+          overview={undefined}
+          pendingInstructions={pending}
+        />
+      </SWRConfig>
+    );
+    let rendered = render(view());
+    await screen.findByText('Choose the identity key.');
+    fireEvent.change(screen.getByLabelText('Work instruction recipient'), { target: { value: 'a1' } });
+    fireEvent.change(screen.getByLabelText('Work instruction'), { target: { value: 'One immutable instruction' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send instruction →' }));
+    await waitFor(() => expect(api.postThreadMessage).toHaveBeenCalledTimes(1));
+    rendered.unmount();
+    rendered = render(view());
+    await screen.findByText('Choose the identity key.');
+    fireEvent.click(screen.getByRole('button', { name: 'Retry same instruction →' }));
+    await waitFor(() => expect(api.postThreadMessage).toHaveBeenCalledTimes(2));
+    rejectOriginal(new Error('Original request ended late'));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Retry same instruction →' })).toBeDisabled(),
+    );
+    finishRetry({
+      task_id: 'task',
+      thread_id: 't1',
+      agent_group_id: 'a1',
+      session_id: 's1',
+      message_id: 'message',
+      echo_status: 'sent',
+      created_session: false,
+      handoff: null,
+    });
+    await screen.findByText(/Instruction accepted for Builder/);
+    expect(pending.size).toBe(0);
+  });
+  it('preserves an ownerless source context without offering conversation-only actions', async () => {
+    const source = {
+      ...detail.thread,
+      thread_id: 'board:synthetic-item',
+      title: 'Source-only work',
+      participants: [],
+      assignable_agents: [{ agent_group_id: 'a1', name: 'Builder' }],
+      session_ids: [],
+      reply_target_session_id: null,
+      attention_source: {
+        kind: 'release-board',
+        as_of: '2026-09-05T00:00:00Z',
+        stale: false,
+        url: null,
+        next_action: 'Assign an agent.',
+        assigned: null,
+        assigned_expired: null,
+      },
+    } as ThreadDetailResponse['thread'];
+    vi.mocked(api.listThreads).mockResolvedValue({ threads: [source] });
+    vi.mocked(api.getThreadDetail).mockResolvedValue({ thread: source, transcript: [] });
+    render(
+      <SWRConfig value={{ provider: () => new Map() }}>
+        <ThreadWorkspace authMe={authMe} workgroup="all" query="" id={source.thread_id} overview={undefined} />
+      </SWRConfig>,
+    );
+    await screen.findByText('Source record has no conversation yet');
+    expect(screen.getByRole('heading', { name: 'Source-only work' })).toBeInTheDocument();
+    expect(screen.queryByLabelText('Work instruction recipient')).toBeNull();
+    expect(screen.queryByLabelText('Work instruction')).toBeNull();
+    expect(screen.queryByRole('button', { name: /Snooze/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Close work' })).toBeNull();
+    expect(api.postThreadMessage).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Full conversation ↗' }));
+    expect(screen.getByText('Legacy transcript console')).toBeInTheDocument();
+  });
 });
