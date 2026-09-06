@@ -120,7 +120,12 @@ describe('central migration registry', () => {
     expect(
       newlyApplied,
       'the adopted files (019/020/023) must match live rows by name and be skipped; only the net-new ones run',
-    ).toEqual(['messaging-group-detached-at', 'host-coordination']);
+    ).toEqual([
+      'messaging-group-detached-at',
+      'host-coordination',
+      'observatory-signal',
+      'observatory-signal-workgroup-cascade',
+    ]);
     const liveSchema = schemaObjects(live);
     // Canary: two empty snapshots compare equal, so assert the query actually
     // saw the schema before trusting the comparison below.
