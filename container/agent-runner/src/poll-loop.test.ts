@@ -6,6 +6,7 @@ import path from 'path';
 import { evaluateAdmission, registerAdmissionGate } from './admission-gate.js';
 import { _resetConfig, loadConfig } from './config.js';
 import { clearStaleProcessingAcks, setContainerToolInFlight } from './db/container-state.js';
+import { setContinuation } from './db/session-state.js';
 import { getInboundDb, getOutboundDb } from './mailbox/sqlite/connection.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { closeSessionDb, initTestSessionDb } from './modules/mailbox/testing.js';
@@ -222,6 +223,69 @@ describe('repository mount poll and tool admission barrier', () => {
     });
     abort.abort();
     await loop;
+  }, 5_000);
+
+  it('adds retry provenance after credential rotation while preserving the same unfinished task payload', async () => {
+    insertMessage('task-occurrence-retry', 'task', { prompt: 'Review the release queue once.' });
+    setContinuation('claude', 'retry-provenance-session');
+    const queryInputs: Array<{ prompt: string; continuation?: string }> = [];
+    let queryCalls = 0;
+    const provider = {
+      supportsNativeSlashCommands: false,
+      registerMemorySessionHook: () => {},
+      isSessionInvalid: () => false,
+      isRetryable: () => true,
+      rotateApiKey: () => ({ rotated: true }),
+      query: (input: { prompt: string; continuation?: string }) => {
+        queryInputs.push(input);
+        queryCalls += 1;
+        const attempt = queryCalls;
+        async function* events(): AsyncGenerator<ProviderEvent> {
+          yield { type: 'init', continuation: 'retry-provenance-session' };
+          if (attempt === 1) throw new Error('retryable upstream failure');
+          yield { type: 'result', text: 'Reviewed the release queue.' };
+        }
+        return { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+      },
+    };
+    const abort = new AbortController();
+    const loop = runPollLoop({
+      provider: provider as never,
+      providerName: 'claude',
+      cwd: '/tmp',
+      signal: abort.signal,
+      autosaveWorktrees: async () => ({ committed: [], failed: [], skipped: [] }),
+    });
+
+    try {
+      const deadline = Date.now() + 3_000;
+      while (
+        (
+          getOutboundDb()
+            .prepare('SELECT status FROM processing_ack WHERE message_id = ?')
+            .get('task-occurrence-retry') as { status: string } | undefined
+        )?.status !== 'completed'
+      ) {
+        if (Date.now() >= deadline) throw new Error('timed out waiting for credential-rotation retry completion');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      expect(queryInputs).toHaveLength(2);
+      expect(queryInputs[0].prompt).not.toContain('<runner-retry-provenance>');
+      expect(queryInputs[0].continuation).toBe('retry-provenance-session');
+      expect(queryInputs[1].continuation).toBe('retry-provenance-session');
+      expect(queryInputs[1].prompt).toContain('<runner-retry-provenance>');
+      expect(queryInputs[1].prompt).toContain('Task occurrence ID: "task-occurrence-retry".');
+      expect(queryInputs[1].prompt).toContain('has not recorded a completed result');
+      expect(queryInputs[1].prompt).toContain('inspect durable effects already produced');
+      expect(queryInputs[1].prompt.endsWith(queryInputs[0].prompt)).toBe(true);
+      expect(getOutboundDb().prepare("SELECT COUNT(*) AS count FROM messages_out WHERE kind = 'task_log'").get()).toEqual({
+        count: 1,
+      });
+    } finally {
+      abort.abort();
+      await loop;
+    }
   }, 5_000);
 
   // R-8 (plan §8): the outer loop consults the admission seam, not the fence

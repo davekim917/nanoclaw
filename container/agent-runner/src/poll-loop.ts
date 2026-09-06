@@ -115,6 +115,26 @@ export function transientOverloadDelayMs(n: number, rand: number = Math.random()
   return Math.floor(ceil / 2 + rand * (ceil / 2));
 }
 
+/**
+ * Credential rotation starts a fresh provider query, so its prompt is seen a
+ * second time even though the inbound rows remain one unfinished batch. Keep
+ * the original prompt intact after provenance that distinguishes this retry
+ * from a new delivery without claiming the interrupted attempt had no effects.
+ */
+function formatCredentialRetryPrompt(prompt: string, batch: MessageInRow[]): string {
+  const task = batch.find((message) => message.kind === 'task');
+  const occurrence = task ? ` Task occurrence ID: ${JSON.stringify(task.id)}.` : '';
+  return (
+    '<runner-retry-provenance>\n' +
+    'A retryable upstream failure interrupted an earlier attempt for this same inbound batch.' +
+    `${occurrence} The runner has not recorded a completed result for this batch. ` +
+    'Treat the repeated payload below as retry context, not a new delivery. ' +
+    'Before repeating side effects, inspect durable effects already produced, then continue the unfinished work.\n' +
+    '</runner-retry-provenance>\n\n' +
+    prompt
+  );
+}
+
 // Codex idle-watchdog recovery (provider yields classification 'idle_timeout'
 // after TURN_IDLE_TIMEOUT_MS — 5 min — of app-server silence). At a 5-min
 // floor a fire almost certainly IS a real wedge (codex's normal slowness lives
@@ -931,11 +951,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           ? config.provider.rotateApiKey?.()
           : undefined;
       while (rotation?.rotated && !recovered) {
-        log(`Upstream transient error — rotated credential, retrying same prompt in-turn`);
+        log(`Upstream transient error — rotated credential, retrying same batch in-turn with provenance`);
         if (!repositoryRecoveryAllowed()) break;
         try {
+          const retryPrompt = formatCredentialRetryPrompt(prompt, keep);
           const retryQuery = config.provider.query({
-            prompt,
+            prompt: retryPrompt,
             attachments: batchAttachments,
             continuation,
             cwd: config.cwd,
