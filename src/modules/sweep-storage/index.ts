@@ -19,6 +19,7 @@
  * registration below. Do not add a second stop path here.
  */
 import { onHostShutdown } from '../../host-lifecycle.js';
+import { getStorageProtectedSessionIds } from '../../container-runner.js';
 import { registerSweepDuty, registerSweepDutySource, SWEEP_DUTY_INVENTORY } from '../../host-sweep.js';
 import { log } from '../../log.js';
 import { runStorageMaintenanceInBackground, stopStorageMaintenanceWorker } from '../../storage-maintenance-worker.js';
@@ -67,7 +68,10 @@ export function registerStorageSweepDuties(): void {
     // filesystem/Docker implementation and its cadence state; the host event
     // loop stays available for channel heartbeats and inbound events.
     run: (ctx) => {
-      startStorageMaintenanceOnce([...ctx.activeContainerSessionIds]);
+      // Active containers PLUS the pending survivors adoption could not yet
+      // claim (seam 4 E/D2, #462 item 4): a survivor whose storage lease could
+      // not be taken is otherwise unprotected from the worker's cleanup.
+      startStorageMaintenanceOnce([...new Set([...ctx.activeContainerSessionIds, ...getStorageProtectedSessionIds()])]);
     },
   });
 }

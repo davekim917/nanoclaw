@@ -7,6 +7,7 @@
 import {
   containerOwnsOutbound,
   getContainerSpawnedAt,
+  hasPendingAdoption,
   isContainerRunning,
   isContainerSpawning,
   killContainer,
@@ -379,8 +380,13 @@ export async function quiesceSessionsForRepositoryMounts(
   const known = uniqueSessions(sessions);
   // Runtime process maps are authoritative. A stale inactive DB row can still
   // own a live RW mount and must not escape quiescence — so the stop set is
-  // derived before the fenceable filter, never from it.
-  const affected = known.filter((session) => isContainerRunning(session.id) || isContainerSpawning(session.id));
+  // derived before the fenceable filter, never from it. A pending adoption is
+  // a survivor this host has not claimed but which is running and holds the
+  // mounts all the same (seam 4 E/D2, #462 item 3): it is stopped here like
+  // any running container, through `killContainer`, which routes it.
+  const affected = known.filter(
+    (session) => isContainerRunning(session.id) || isContainerSpawning(session.id) || hasPendingAdoption(session.id),
+  );
   const barrierSessions = known.filter(hasFenceableIngress);
   // A live container always owns an inbound DB to poll. If one is running
   // without a fenceable DB the host's view is inconsistent, and proceeding
@@ -436,10 +442,12 @@ export async function quiesceSessionsForRepositoryMounts(
       timeoutMs,
     );
     for (const session of affected) {
-      if (isContainerRunning(session.id)) killContainer(session.id, 'repository mount set changed');
+      if (isContainerRunning(session.id) || hasPendingAdoption(session.id)) {
+        killContainer(session.id, 'repository mount set changed');
+      }
     }
     await waitUntil(
-      () => affected.every((session) => !isContainerRunning(session.id)),
+      () => affected.every((session) => !isContainerRunning(session.id) && !hasPendingAdoption(session.id)),
       'timed out stopping containers for repository mount reconciliation',
       timeoutMs,
     );
@@ -452,7 +460,9 @@ export async function quiesceSessionsForRepositoryMounts(
     // skip the barrier release below.
     for (const session of affected) {
       try {
-        if (isContainerRunning(session.id)) killContainer(session.id, 'repository mount quiescence failed');
+        if (isContainerRunning(session.id) || hasPendingAdoption(session.id)) {
+          killContainer(session.id, 'repository mount quiescence failed');
+        }
       } catch (killError) {
         log.warn('Failed to stop container after repository mount quiescence failure', {
           sessionId: session.id,

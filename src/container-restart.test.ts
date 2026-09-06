@@ -15,6 +15,7 @@ vi.mock('./log.js', () => ({
 
 const mockIsContainerRunning = vi.fn<(id: string) => boolean>();
 const mockIsContainerSpawning = vi.fn<(id: string) => boolean>();
+const mockHasPendingAdoption = vi.fn<(id: string) => boolean>(() => false);
 // Process generation for a session's container. Constant unless a test models a
 // replacement spawning during the restart's async pending read.
 const mockGetContainerSpawnedAt = vi.fn<(id: string) => number>(() => 1000);
@@ -26,10 +27,13 @@ vi.mock('./container-runner.js', async (importOriginal) => {
     ...real,
     isContainerRunning: (...args: unknown[]) => mockIsContainerRunning(args[0] as string),
     isContainerSpawning: (...args: unknown[]) => mockIsContainerSpawning(args[0] as string),
-    // The real definition, over the same two mocks: a container "owns"
-    // outbound.db while it is running OR still spawning.
+    hasPendingAdoption: (...args: unknown[]) => mockHasPendingAdoption(args[0] as string),
+    // The real definition, over the same mocks: a container "owns"
+    // outbound.db while it is running, still spawning, or a pending survivor.
     containerOwnsOutbound: (...args: unknown[]) =>
-      mockIsContainerRunning(args[0] as string) || mockIsContainerSpawning(args[0] as string),
+      mockIsContainerRunning(args[0] as string) ||
+      mockIsContainerSpawning(args[0] as string) ||
+      mockHasPendingAdoption(args[0] as string),
     // The REAL predicate, not a hand-rolled copy — it closes over `getSession`
     // from `./db/sessions.js`, which this file mocks separately (below) to
     // `mockGetSession`, so it answers what a test has set up rather than what
@@ -333,6 +337,39 @@ describe('repository mount reconciliation', () => {
       expect(mailbox.countDueMessages()).toBe(1);
       expect((mailbox as NanoclawMailboxSession).readRepoIngressFence()?.state).toBe('released');
     });
+  });
+
+  it('a pending survivor holds the repository mounts and is stopped through killContainer', async () => {
+    // #462 item 3: a survivor this host has not claimed is running and holds
+    // the workgroup mounts like any container, but it is in neither the
+    // registry nor the spawning sets. It is affected, fenced, killed through
+    // the one stop every caller goes through (which routes it), and the door
+    // waits for its pending mark to clear.
+    const session = makeSession('s-pending', 'ag-pending');
+    const outboundPath = provisionRealMailbox('ag-pending', 's-pending');
+    mockGetSessionsByAgentGroup.mockReturnValue([session]);
+    const pending = new Set(['s-pending']);
+    mockIsContainerRunning.mockReturnValue(false);
+    mockIsContainerSpawning.mockReturnValue(false);
+    mockHasPendingAdoption.mockImplementation((id) => pending.has(id));
+    mockKillContainer.mockImplementation((id) => {
+      pending.delete(id);
+    });
+
+    const epoch = 'repository-publish:pending-1';
+    const quiescing = quiesceSessionsForRepositoryMounts([session] as never, epoch, 5_000);
+    await new Promise((resolve) => setImmediate(resolve));
+    const generation = await withMailboxSession('ag-pending', 's-pending', (mailbox) => {
+      const fence = (mailbox as NanoclawMailboxSession).readRepoIngressFence();
+      expect(fence?.state).toBe('active');
+      return fence!.generation;
+    });
+    writeBarrierAck(outboundPath, JSON.stringify([epoch, generation]));
+
+    const quiescence = await quiescing;
+    expect(mockKillContainer).toHaveBeenCalledWith('s-pending', 'repository mount set changed', undefined);
+    expect(quiescence.sessions.map((entry) => entry.id)).toEqual(['s-pending']);
+    await releaseRepositoryMountQuiescence(quiescence);
   });
 
   it('stops every affected sibling and wakes the exact set after claim release', async () => {

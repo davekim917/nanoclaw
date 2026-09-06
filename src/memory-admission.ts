@@ -93,6 +93,24 @@ export class MemoryAdmissionController<T> {
     return { status: 'queued', budgetMb: this.budgetMb, requestMb, position: this.positionOf(id) };
   }
 
+  /**
+   * Reserve `requestMb` for `id` whether or not it fits — a SATURATING
+   * reservation for memory that is already in use by a container this host
+   * did not admit (a survivor of the previous host it could not yet adopt,
+   * seam 4 E/D2, #462 item 5). `reservedMb` may then exceed `budgetMb`, and
+   * `request`/`drain` admit nothing further until enough is released: the
+   * budget is a fact about the machine, and an over-committed survivor must
+   * block fresh spawns rather than be left uncounted. A queued request under
+   * the same id is withdrawn; an existing reservation is replaced.
+   */
+  reserveSaturating(id: string, requestMb: number): void {
+    if (!Number.isInteger(requestMb) || requestMb <= 0) {
+      throw new Error(`Memory request must be a positive integer MiB value: ${requestMb}`);
+    }
+    this.removeQueued(id);
+    this.reservations.set(id, requestMb);
+  }
+
   release(id: string): T[] {
     this.reservations.delete(id);
     return this.drain();
