@@ -95,7 +95,8 @@ or:
 - `wakeAgent: false` completes the run without calling the model.
 - `wakeAgent: true` wakes the agent and adds `data` to its prompt.
 
-Scripts run with Bash, a 30-second timeout, and a 1 MB output limit. The JSON
+Scripts run with Bash, a 120-second default timeout (overridden by
+`NANOCLAW_TASK_SCRIPT_TIMEOUT_MS`), and a 1 MB output limit. The JSON
 decision must be the final line written to standard output. Keep `data` small
 and include only what the agent needs.
 

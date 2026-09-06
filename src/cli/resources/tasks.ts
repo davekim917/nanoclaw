@@ -861,15 +861,16 @@ registerResource({
       description:
         `Create a scheduled task (recurring or one-shot) in the agent group system session.\n\n` +
         `Requires --prompt plus EITHER --recurrence (recurring; first run derived from the cron grid) OR --process-after (one-shot, ISO 8601 or naive wall-clock in the group's timezone). Always pass --name for a readable id.\n\n` +
+        `Workflow default: use --script for deterministic polling and observation; wake for meaningful changes or due unfinished/recovery work. Time-driven reasoning, requested reports and full campaigns may run directly; record why in the prompt. Check active tasks for overlapping owner, purpose and schedule before creating a series.\n\n` +
         `--script contract (pre-task gate, runs BEFORE the agent wakes):\n` +
-        `  bash, 30s timeout, 1MB output cap. Its LAST stdout line must be JSON:\n` +
+        `  bash, 120s default timeout (NANOCLAW_TASK_SCRIPT_TIMEOUT_MS override), 1MB output cap. Its LAST stdout line must be JSON:\n` +
         `    {"wakeAgent": <bool>, "data": {...}}\n` +
         `  wakeAgent=false marks the run handled without waking the agent (zero tokens);\n` +
         `  wakeAgent=true wakes the agent with data attached to the prompt.\n` +
         `  DO: print the JSON as the very last line, exit 0, keep data small (a summary, not a dump).\n` +
-        `  DON'T: print anything after the JSON, prompt for input, or rely on state from previous runs.\n` +
+        `  DON'T: print anything after the JSON, prompt for input, or rely on an earlier process's memory or temporary files.\n` +
         `  Always test with bash -c '<script>' before scheduling.\n` +
-        `  Persist state between fires under the group workspace (e.g. a last-seen id file).\n` +
+        `  Persist state between fires under the group workspace. Keep discovered/pending work separate from completed acknowledgements: only acknowledge after the required outcome is verified, so a failed turn remains retryable.\n` +
         `  Use good judgement on whether to share with the user the script (only if they are technical), a description of the script condition, or whether there's no need.\n\n` +
         `Frequency limit: recurrences more frequent than ${MAX_DAILY_FIRES} fires/day are refused unless the task\n` +
         `carries a --script gate (the script decides whether each fire needs you — a gated fire that\n` +

@@ -33,6 +33,21 @@ The idle ceiling is a heartbeat, not a turn timer: it fires once your turn ends 
 
 If `/workspace/workgroup/claims/` exists, claim work before starting and check for an existing claim first (`work-claims` skill). Skip for read-only or private-workspace work.
 
+## Workflow automation
+
+For a monitor with bounded evidence, observe deterministically before waking a
+model; a successful quiet observation with no pending or due recovery work ends
+the fire. A wake is not completion: keep pending work durable until the
+required outcome has a receipt, inspect receipts before retrying, and avoid
+duplicate effects. The owner decides, delegates substantial execution when
+useful, verifies the result, and closes only the authorized outcome.
+
+Briefings, research, planning reviews, and full campaigns may deliberately run
+reasoning on a schedule when their cadence needs judgment; record that reason.
+Host-side task scripts remain an operator-only choice. See
+`/workspace/project/docs/workflow-automation.md` before authoring or changing
+a monitor, event handler, continuation, or recovery wake.
+
 ## Grounding
 
 Training data is how you think, not evidence. For anything checkable that changes — an API, a version, a library's current practice, a file's contents, how your own tools work (source at `/workspace/project`) — check the live source before asserting it, and prefer "not sure, let me check" over a plausible guess. Read referenced content end-to-end; say so if a tool can't return it all.

@@ -119,8 +119,10 @@ Investigate the alerts reported by the script and notify me if they are serious.
 
 `schedule` is required. `script` is optional and may be a single-line or
 multiline YAML string. The frontmatter accepts no other fields, so typos cannot
-silently change behavior. Task files are template input, like `mcp.json`: they
-are not copied into the agent workspace after stamping.
+silently change behavior. In particular, a template cannot opt a task into
+host-side execution: `--script-host` is a host-operator-only choice through
+`ncl`. Task files are template input, like `mcp.json`: they are not copied into
+the agent workspace after stamping.
 
 Template tasks use the same creation path as `ncl tasks create`, including cron
 validation, the install timezone, first-run calculation, isolated task sessions,
@@ -133,6 +135,17 @@ The script is passed unchanged to NanoClaw's normal task creation and execution
 path. See [Scheduled Tasks](scheduled-tasks.md#script-gates) for the script
 contract, testing workflow, frequency limit, and failure behavior. Avoid putting
 secrets directly in scripts; prefer runtime credential injection through OneCLI.
+
+Before adding a recurring template task, compare its owner, cadence, and
+purpose with active series at the installation where it will run. Record whether
+an overlap replaces an existing workflow or has a deliberate parallel purpose;
+matching prompts alone are not a safe deduplication rule. For monitors, make
+the script return a quiet result only after a successful observation with no
+pending work, preserve pending versus completed outcomes outside the prompt,
+and test failure and recovery paths. Requested briefings, research, planning
+reviews, and full campaigns may intentionally run without a gate when their
+cadence needs judgment. The complete authoring and verification contract is in
+[Workflow automation](workflow-automation.md).
 
 Tasks start **paused**, so stamping a template never starts background work
 without user consent. Until the setup welcome flow offers activation, inspect
