@@ -5,8 +5,9 @@ import { isAdminOfAgentGroup, isGlobalAdmin, isOwner } from './user-roles.js';
 
 export async function addMember(row: AgentGroupMember): Promise<void> {
   await getDb().run(
-    `INSERT OR IGNORE INTO agent_group_members (user_id, agent_group_id, added_by, added_at)
-       VALUES (@user_id, @agent_group_id, @added_by, @added_at)`,
+    `INSERT INTO agent_group_members (user_id, agent_group_id, added_by, added_at)
+       VALUES (@user_id, @agent_group_id, @added_by, @added_at)
+       ON CONFLICT (user_id, agent_group_id) DO NOTHING`,
     row,
   );
 }

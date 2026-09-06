@@ -29,7 +29,10 @@ async function resolveLatestOwnerDm(): Promise<MessagingGroup | undefined> {
   return undefined;
 }
 
-async function deliverHostNotification(mg: MessagingGroup, text: string): Promise<{
+async function deliverHostNotification(
+  mg: MessagingGroup,
+  text: string,
+): Promise<{
   messaging_group_id: string;
   channel_type: string;
   platform_id: string;
@@ -104,6 +107,13 @@ registerResource({
     {
       name: 'unknown_sender_policy',
       type: 'string',
+      // Deliberately more specific than upstream's description (which stops
+      // at "declines the sender politely and sends the owner a one-line
+      // FYI"): decline_notify is a DM-only promise (declineAndNotify) and
+      // degrades to 'strict' on a group, so an operator naming this policy
+      // on a group needs to know it won't do what the name implies. Keep
+      // this wording on the next upstream sync — it isn't drift, it's a real
+      // fork behavior this field documents.
       description:
         'What happens when an unrecognized sender posts. "strict" drops silently. "request_approval" sends an approval card to an admin. "decline_notify" declines the sender politely in the DM and sends the owner a one-line FYI (DM-shaped groups only; degrades to "strict" on a group). "public" allows anyone. Default: declared by the channel adapter for this context (DM vs group); "strict" when the channel has no declaration.',
       enum: ['strict', 'request_approval', 'decline_notify', 'public'],
