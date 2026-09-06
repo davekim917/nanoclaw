@@ -196,7 +196,7 @@ vi.mock('../../repo-fence-recovery.js', async (importOriginal) => ({
 }));
 vi.mock('../../db/channel-ingress-receipts.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../db/channel-ingress-receipts.js')>()),
-  pruneChannelIngressReceipts: () => undefined,
+  pruneChannelIngressReceipts: async () => 0,
 }));
 vi.mock('../../github-app-token.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../github-app-token.js')>()),

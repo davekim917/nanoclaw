@@ -264,7 +264,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/provider-surfaces.test.ts',
   'src/providers/opencode.container-config.test.ts',
   'src/router.session-skip.test.ts',
-  'src/router.test.ts',
   'src/session-manager.attachments.test.ts',
   'src/session-manager.test.ts',
   'src/state-sqlite.test.ts',

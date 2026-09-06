@@ -17,7 +17,7 @@
  * drops (no agent wired, no trigger match); the access gate writes rows
  * for policy refusals.
  */
-import { withCentralSync, withRawDb } from './db/central-lease.js';
+import { getDb } from './db/connection.js';
 import { persistInboundAttachments } from './attachment-downloader.js';
 import { getChannelAdapter, getChannelDefaults, hasDeclaredChannelDefaults } from './channels/channel-registry.js';
 import { resolveThreadPolicy, resolveUnknownSenderPolicy } from './channels/channel-defaults.js';
@@ -103,40 +103,33 @@ function adapterHasWorkspaceIdentity(channelType: string): boolean {
  * they unanimously have none), so the wiring falls through to the group
  * default rather than adopting an arbitrary channel's override.
  */
-function unanimousToneFor(agentGroupId: string, channelType: string): Promise<string | null> {
-  return withCentralSync(
-    () =>
-      withRawDb((db) => {
-        const rows = db
-          .prepare(
-            `SELECT DISTINCT mga.default_tone AS tone
+async function unanimousToneFor(agentGroupId: string, channelType: string): Promise<string | null> {
+  const rows = await getDb().all<{ tone: string | null }>(
+    `SELECT DISTINCT mga.default_tone AS tone
          FROM messaging_group_agents mga
          JOIN messaging_groups m ON m.id = mga.messaging_group_id
         WHERE mga.agent_group_id = ? AND m.channel_type = ?`,
-          )
-          .all(agentGroupId, channelType) as Array<{ tone: string | null }>;
-        return rows.length === 1 ? rows[0].tone : null;
-      }),
-    'router unanimousToneFor',
+    agentGroupId,
+    channelType,
   );
+  return rows.length === 1 ? rows[0].tone : null;
 }
 
-function inheritedAgentGroupFor(mg: MessagingGroup): Promise<{ id: string; sourceMessagingGroupId: string } | null> {
-  return withCentralSync(
-    () =>
-      withRawDb((db): { id: string; sourceMessagingGroupId: string } | null => {
-        let rows: Array<{ agent_group_id: string; messaging_group_id: string; cnt: number }>;
+async function inheritedAgentGroupFor(
+  mg: MessagingGroup,
+): Promise<{ id: string; sourceMessagingGroupId: string } | null> {
+  type InheritRow = { agent_group_id: string; messaging_group_id: string; cnt: number };
+  let rows: InheritRow[];
 
-        if (isDiscordChannelType(mg.channel_type) && mg.platform_id.startsWith('discord:')) {
-          const guildId = mg.platform_id.split(':')[1];
-          if (!guildId) return null;
-          // Scope the lookup to the same channel_type (same bot identity). With
-          // multi-bot forks, example-agent + example-agent-codex can both have wirings in the same
-          // guild — they're separate bots, so a fresh channel under one bot should
-          // inherit only that bot's wirings, not the other's.
-          rows = db
-            .prepare(
-              `SELECT mga.agent_group_id, MIN(mga.messaging_group_id) AS messaging_group_id, COUNT(*) AS cnt
+  if (isDiscordChannelType(mg.channel_type) && mg.platform_id.startsWith('discord:')) {
+    const guildId = mg.platform_id.split(':')[1];
+    if (!guildId) return null;
+    // Scope the lookup to the same channel_type (same bot identity). With
+    // multi-bot forks, example-agent + example-agent-codex can both have wirings in the same
+    // guild — they're separate bots, so a fresh channel under one bot should
+    // inherit only that bot's wirings, not the other's.
+    rows = await getDb().all<InheritRow>(
+      `SELECT mga.agent_group_id, MIN(mga.messaging_group_id) AS messaging_group_id, COUNT(*) AS cnt
          FROM messaging_group_agents mga
          JOIN messaging_groups m ON m.id = mga.messaging_group_id
          WHERE m.channel_type = ?
@@ -144,47 +137,46 @@ function inheritedAgentGroupFor(mg: MessagingGroup): Promise<{ id: string; sourc
            AND m.id != ?
          GROUP BY mga.agent_group_id
          ORDER BY COUNT(*) DESC, MIN(m.created_at) ASC`,
-            )
-            .all(mg.channel_type, `discord:${guildId}:%`, mg.id) as typeof rows;
-        } else if (adapterHasWorkspaceIdentity(mg.channel_type)) {
-          rows = db
-            .prepare(
-              `SELECT mga.agent_group_id, MIN(mga.messaging_group_id) AS messaging_group_id, COUNT(*) AS cnt
+      mg.channel_type,
+      `discord:${guildId}:%`,
+      mg.id,
+    );
+  } else if (adapterHasWorkspaceIdentity(mg.channel_type)) {
+    rows = await getDb().all<InheritRow>(
+      `SELECT mga.agent_group_id, MIN(mga.messaging_group_id) AS messaging_group_id, COUNT(*) AS cnt
          FROM messaging_group_agents mga
          JOIN messaging_groups m ON m.id = mga.messaging_group_id
          WHERE m.channel_type = ?
            AND m.id != ?
          GROUP BY mga.agent_group_id
          ORDER BY COUNT(*) DESC, MIN(m.created_at) ASC`,
-            )
-            .all(mg.channel_type, mg.id) as typeof rows;
-        } else {
-          // Adapter without workspace identity — refuse auto-wire. Falls through
-          // to the operator approval gate (channel-registration). Without this
-          // guard, the first Telegram chat from any tenant would auto-claim the
-          // agent already wired for a different Telegram chat (cross-tenant).
-          log.info('auto-wire refused: adapter has no workspace identity', { channelType: mg.channel_type });
-          return null;
-        }
+      mg.channel_type,
+      mg.id,
+    );
+  } else {
+    // Adapter without workspace identity — refuse auto-wire. Falls through
+    // to the operator approval gate (channel-registration). Without this
+    // guard, the first Telegram chat from any tenant would auto-claim the
+    // agent already wired for a different Telegram chat (cross-tenant).
+    log.info('auto-wire refused: adapter has no workspace identity', { channelType: mg.channel_type });
+    return null;
+  }
 
-        if (rows.length === 0) return null;
-        // SECURITY: refuse auto-wire when the workspace/guild has wirings to
-        // multiple distinct agent groups. The original "most existing wirings
-        // wins" heuristic would let the wrong tenant's agent claim a freshly
-        // created channel intended for another tenant — falls through to the
-        // operator approval gate instead.
-        if (rows.length > 1) {
-          log.info('auto-wire refused: workspace has wirings to multiple agent groups', {
-            channelType: mg.channel_type,
-            platformId: mg.platform_id,
-            candidates: rows.map((r) => r.agent_group_id),
-          });
-          return null;
-        }
-        return { id: rows[0].agent_group_id, sourceMessagingGroupId: rows[0].messaging_group_id };
-      }),
-    'router inheritedAgentGroupFor',
-  );
+  if (rows.length === 0) return null;
+  // SECURITY: refuse auto-wire when the workspace/guild has wirings to
+  // multiple distinct agent groups. The original "most existing wirings
+  // wins" heuristic would let the wrong tenant's agent claim a freshly
+  // created channel intended for another tenant — falls through to the
+  // operator approval gate instead.
+  if (rows.length > 1) {
+    log.info('auto-wire refused: workspace has wirings to multiple agent groups', {
+      channelType: mg.channel_type,
+      platformId: mg.platform_id,
+      candidates: rows.map((r) => r.agent_group_id),
+    });
+    return null;
+  }
+  return { id: rows[0].agent_group_id, sourceMessagingGroupId: rows[0].messaging_group_id };
 }
 
 /**
@@ -215,13 +207,8 @@ async function isSoleInterceptResponder(
   if (isMention || mg.is_group === 0) return true;
   if (leadingMention) return false;
 
-  const winner = await withCentralSync(
-    () =>
-      withRawDb(
-        (db) =>
-          db
-            .prepare(
-              `WITH my_wg AS (
+  const winner = await getDb().get<{ mg_id: string }>(
+    `WITH my_wg AS (
          SELECT DISTINCT COALESCE(ag.workgroup_id, ag.folder) AS wg
          FROM messaging_group_agents mga
          JOIN agent_groups ag ON ag.id = mga.agent_group_id
@@ -236,10 +223,8 @@ async function isSoleInterceptResponder(
         GROUP BY mg2.id
         ORDER BY MAX(mga2.priority) DESC, mg2.channel_type ASC, mg2.id ASC
         LIMIT 1`,
-            )
-            .get(mg.id, mg.platform_id) as { mg_id: string } | undefined,
-      ),
-    'router isSoleInterceptResponder',
+    mg.id,
+    mg.platform_id,
   );
 
   // No workgroup context to disambiguate against (standalone install, or the
