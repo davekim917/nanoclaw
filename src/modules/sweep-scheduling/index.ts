@@ -19,7 +19,6 @@
  */
 import { isContainerRunning } from '../../container-runner.js';
 import { advanceThreadClosures } from '../../dashboard/thread-close.js';
-import { getRawDb } from '../../db/connection.js';
 import { hasUnresolvedMoveIntent } from '../../dashboard/api/scheduled-shared.js';
 import { isTaskThread, updateSession } from '../../db/sessions.js';
 import {
@@ -152,8 +151,25 @@ export function registerSchedulingSweepDuties(): void {
         // Asked only once the cheap predicate above has already said "close",
         // so the ordinary spent session pays one central-DB read and a live
         // one pays nothing.
-        if (hasUnresolvedMoveIntent(getRawDb(), session.id)) {
+        if (await hasUnresolvedMoveIntent(session.id)) {
           log.info('Kept a spent task session open — an unresolved move intent still names it', {
+            sessionId: session.id,
+            threadId: session.thread_id,
+          });
+          return;
+        }
+        // Revalidate on the mailbox AFTER the only await on this path. The
+        // count above was taken before that suspension, and a `scheduleTask()`
+        // that raced the intent check has passed its own active-session
+        // recheck and inserted its row by now — closing here would strand a
+        // live task in a session no sweep visits again. No await may sit
+        // between this recount and the UPDATE: the sqlite driver runs the
+        // statement synchronously (`access()` yields only while a central
+        // transaction is active — that residual belongs to PR 6, see #452),
+        // so the decision and the close share one turn again, as they did
+        // when the intent check was a raw synchronous read.
+        if (mailbox!.countLiveTasks() > 0) {
+          log.info('Kept a spent task session open — a task arrived during the intent check', {
             sessionId: session.id,
             threadId: session.thread_id,
           });

@@ -15,7 +15,7 @@
  * it cannot prove that nothing happened — `dispatch()` posts approval cards
  * before it can fail, so an exception is "outcome unknown", not "nothing ran".
  */
-import { getDb, getRawDb } from '../db/connection.js';
+import { getDb } from '../db/connection.js';
 import { log } from '../log.js';
 import type { ResponseFrame } from './frame.js';
 
@@ -150,19 +150,12 @@ const PAYLOAD_RETENTION_DAYS = 7;
  * guarantee: a claim with no payload reports `executing`, and the agent is told
  * the command was dispatched rather than having it run again.
  *
- * 5c deferral (seam 3, deployer call 2026-09-05): stays raw/sync — its
- * only caller is src/modules/sweep-central/index.ts:111
- * (`run: () => { pruneCliRequestExecutions(); }`, a bare sync call), which
- * is under src/modules/sweep- and out of bounds for this PR. Folded into
- * the same "5c" follow-up as writeAudit/purgeIntentBody
- * (scheduled-shared.ts) and syncDoneProposalMirror (thread-close.ts) —
- * convert together with that call site once 5a and 5b are both merged.
+ * Its only caller is src/modules/sweep-central/index.ts's duty `run`, which
+ * awaits it.
  */
-export function pruneCliRequestExecutions(): void {
+export async function pruneCliRequestExecutions(): Promise<void> {
   try {
-    const db = getRawDb();
-
-    db.prepare(
+    await getDb().run(
       `DELETE FROM cli_request_executions
         WHERE completed_at IS NOT NULL
           AND datetime(claimed_at) < datetime('now', '-${PRUNE_FLOOR_SECONDS} seconds')
@@ -173,14 +166,14 @@ export function pruneCliRequestExecutions(): void {
                    AND newer.completed_at IS NOT NULL
                    AND newer.rowid > cli_request_executions.rowid
               )`,
-    ).run();
+    );
 
-    db.prepare(
+    await getDb().run(
       `UPDATE cli_request_executions
           SET response = NULL
         WHERE response IS NOT NULL
           AND datetime(claimed_at) < datetime('now', '-${PAYLOAD_RETENTION_DAYS} days')`,
-    ).run();
+    );
   } catch (err) {
     log.warn('pruneCliRequestExecutions: failed', { err });
   }

@@ -82,6 +82,8 @@ const calls = vi.hoisted(() => ({
   admissions: [] as unknown[][],
   recurrences: [] as unknown[][],
   running: false,
+  /** Runs inside `hasUnresolvedMoveIntent`, after its read and before it resolves — the S19 race window. */
+  intentHook: null as null | (() => void),
   admittedTasks: 0,
   admitImpl: null as null | ((session: unknown) => number),
   hostScriptFails: false,
@@ -205,6 +207,20 @@ vi.mock('../mailbox/index.js', async (importOriginal) => {
  * `runHostGatedTaskScripts` runs opted-in shell scripts — mocked outright, and
  * the tripwire above is what proves no real one ever ran.
  */
+vi.mock('../../dashboard/api/scheduled-shared.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../dashboard/api/scheduled-shared.js')>();
+  return {
+    ...real,
+    // Real predicate, real central DB — plus a seam at the exact point S19 is
+    // suspended, so a case can do what `scheduleTask()` does in production.
+    hasUnresolvedMoveIntent: async (sessionId: string) => {
+      const result = await real.hasUnresolvedMoveIntent(sessionId);
+      calls.intentHook?.();
+      return result;
+    },
+  };
+});
+
 vi.mock('../scheduling/host-script.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../scheduling/host-script.js')>()),
   runHostGatedTaskScripts: async (...args: unknown[]) => {
@@ -426,6 +442,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  calls.intentHook = null;
   expect(spawns).toEqual([]);
   openInbound?.close();
   openInbound = null;
@@ -781,6 +798,34 @@ describe('S2-PR11 scheduling + thread-close', () => {
     await duty(SWEEP_DUTY_INVENTORY.S19).run(ctx);
 
     expect(calls.updates).toEqual([{ id: 'sess-moved', patch: { status: 'closed' } }]);
+  });
+
+  // The intent check is the one await on the close path. A `scheduleTask()`
+  // that lands while S19 is suspended there passes its active-session recheck
+  // (the row is still 'active') and inserts its task; a close that trusted the
+  // pre-await count would strand that task in a session no sweep visits again.
+  it('the registered spent-task GC duty recounts after the intent check and keeps a session a task just landed in', async () => {
+    const db = freshInbound();
+    const session = fakeSession({ id: 'sess-raced', thread_id: TASK_THREAD });
+    const mailbox = sessionFor(db);
+    const ctx = makeCtx({ session, mailbox });
+    calls.intentHook = () => {
+      insertTaskRow(db, {
+        id: 'task-raced',
+        seriesId: 'task-raced',
+        processAfter: '2099-01-01T00:00:00.000Z',
+        recurrence: null,
+        content: JSON.stringify({ prompt: 'landed during the intent check' }),
+      });
+    };
+
+    await duty(SWEEP_DUTY_INVENTORY.S19).run(ctx);
+
+    expect(mailbox.countLiveTasks(), 'the hook inserted a live task').toBe(1);
+    expect(calls.updates, 'the GC closed a session with a live task in it').toEqual([]);
+    expect(getRawDb().prepare("SELECT status FROM sessions WHERE id = 'sess-raced'").get()).toEqual({
+      status: 'active',
+    });
   });
 
   it('the registered spent-task GC duty keeps a session whose container is still running', async () => {

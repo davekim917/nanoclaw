@@ -96,6 +96,20 @@ const NOT_CALLERS: readonly string[] = [DEFINER, SELF];
  * `decide` bodies too. One synchronous export beats three hand-copied
  * authorization predicates, and §4.2 is satisfied either way: there is exactly
  * one form of each function, never two.
+ *
+ * PR 5c removed TWO entries (197 → 195): `src/cli/request-ledger.ts`
+ * (`pruneCliRequestExecutions` converted onto `getDb()`, its only caller
+ * `sweep-central/index.ts` awaits it) and `src/modules/sweep-scheduling/index.ts`
+ * (its one raw call, `hasUnresolvedMoveIntent(getRawDb(), ...)`, converted to
+ * `await hasUnresolvedMoveIntent(...)` with the helper itself dropping its
+ * `Database.Database` param — defined in `src/dashboard/api/scheduled-shared.ts`,
+ * which never called `getRawDb()` itself and so was never on this list). The
+ * two test files that still exercise these areas (`request-ledger.test.ts`,
+ * `sweep-scheduling/scheduling.test.ts`) keep their entries: both still call
+ * `getRawDb()` directly for their own fixture scaffolding and assertions,
+ * independent of the functions this PR converted. `writeAudit` / `purgeIntentBody`
+ * / the PR 6-owned callers in the same file are untouched — PR 5c does not add
+ * or remove anything for them.
  */
 export const RAW_DB_IMPORTERS: readonly string[] = [
   'scripts/bust-slack-profile-cache.ts',
@@ -131,7 +145,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/cli/delivery-action.test.ts',
   'src/cli/guard.ts',
   'src/cli/request-ledger.test.ts',
-  'src/cli/request-ledger.ts',
   'src/cli/resources/destinations.test.ts',
   'src/cli/resources/groups-create-adopt.test.ts',
   'src/cli/resources/groups.test.ts',
@@ -271,7 +284,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/sweep-orchestrator/orchestrator.test.ts',
   'src/modules/sweep-scheduled-move/index.ts',
   'src/modules/sweep-scheduled-move/scheduled-move.test.ts',
-  'src/modules/sweep-scheduling/index.ts',
   'src/modules/sweep-scheduling/scheduling.test.ts',
   'src/modules/sweep-usage/usage.test.ts',
   'src/provider-fallback.test.ts',

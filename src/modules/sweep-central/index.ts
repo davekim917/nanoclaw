@@ -113,8 +113,8 @@ function registerCentralSweepDuties(): void {
     order: 42,
     // Prune the agent `ncl` at-most-once execution ledger (issue #273). Its
     // rows only have to outlive the delivery loop's retry of one outbound row.
-    run: () => {
-      pruneCliRequestExecutions();
+    run: async () => {
+      await pruneCliRequestExecutions();
     },
   });
 
