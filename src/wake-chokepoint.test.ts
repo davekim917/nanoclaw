@@ -104,9 +104,12 @@ function findImportersOf(files: string[], targetPath: string, bindingName: strin
   for (const file of files) {
     if (path.resolve(file) === targetPath) continue;
     const text = fs.readFileSync(file, 'utf8');
-    // Cheap prefilter before parsing. A star re-export barrel never mentions
-    // the binding by name, so it is let through on its own shape.
-    if (!text.includes(bindingName) && !/export\s+\*\s+(as\s+\w+\s+)?from/.test(text)) continue;
+    // Cheap prefilter before parsing. Whole-module shapes — a namespace
+    // import handed to another module (`import * as runner ...;
+    // registerRunner(runner)`), a star re-export barrel, a dynamic import
+    // kept as a module object — never need to spell the binding, so any file
+    // holding one is parsed regardless of the name (Codex rounds 3–4 on #470).
+    if (!text.includes(bindingName) && !/\*\s+as\s+\w+|export\s+\*|\bimport\s*\(/.test(text)) continue;
     const sourceFile = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
     const rel = toRel(file);
     const lineOf = (node: ts.Node): number =>
@@ -163,8 +166,24 @@ function findImportersOf(files: string[], targetPath: string, bindingName: strin
           const resolved = resolveRelativeSpecifier(file, arg.text);
           if (resolved === targetPath) {
             let parent: ts.Node = node.parent;
+            // Promise.all([import(a), import(b)]) → const [{ x }, { y }] = await ...:
+            // map this import's array index onto the array binding element.
+            let arrayIndex = -1;
+            if (ts.isArrayLiteralExpression(parent)) {
+              arrayIndex = parent.elements.indexOf(node as ts.Expression);
+              parent = parent.parent; // the Promise.all(...) call
+              if (ts.isCallExpression(parent)) parent = parent.parent;
+            }
             if (ts.isAwaitExpression(parent)) parent = parent.parent;
-            if (ts.isVariableDeclaration(parent) && ts.isObjectBindingPattern(parent.name)) {
+            if (arrayIndex >= 0 && ts.isVariableDeclaration(parent) && ts.isArrayBindingPattern(parent.name)) {
+              const el = parent.name.elements[arrayIndex];
+              if (el && ts.isBindingElement(el) && ts.isObjectBindingPattern(el.name)) {
+                const hit = el.name.elements.some((e) => bindingNameText(e.propertyName ?? e.name) === bindingName);
+                if (hit) results.push({ file: rel, line: lineOf(node), form: 'dynamic' });
+              } else {
+                results.push({ file: rel, line: lineOf(node), form: 'dynamic-namespace' });
+              }
+            } else if (ts.isVariableDeclaration(parent) && ts.isObjectBindingPattern(parent.name)) {
               const hit = parent.name.elements.some(
                 (el) => bindingNameText(el.propertyName ?? el.name) === bindingName,
               );
@@ -198,6 +217,13 @@ describe('the resolver flags every import shape that can reach the binding (not 
     ['dynamic.ts', "const { wakeContainer } = await import('./target.js');\nwakeContainer();\n", 'dynamic'],
     ['dynamic-ns.ts', "const m = await import('./target.js');\nm.wakeContainer();\n", 'dynamic-namespace'],
     ['dynamic-member.ts', "(await import('./target.js')).wakeContainer();\n", 'dynamic-namespace'],
+    ['namespace-handoff.ts', "import * as runner from './target.js';\nexport const r = runner;\n", 'namespace'],
+    ['dynamic-handoff.ts', "export const m = await import('./target.js');\n", 'dynamic-namespace'],
+    [
+      'promise-all-hit.ts',
+      "const [{ wakeContainer }, { other }] = await Promise.all([import('./target.js'), import('./other.js')]);\nwakeContainer();\nother();\n",
+      'dynamic',
+    ],
     ['barrel-named.ts', "export { wakeContainer } from './target.js';\n", 're-export'],
     ['barrel-star.ts', "export * from './target.js';\n", 'star-re-export'],
     ['barrel-ns.ts', "export * as runner from './target.js';\n", 'star-re-export'],
@@ -212,6 +238,12 @@ describe('the resolver flags every import shape that can reach the binding (not 
   it.each(cases)('%s is reported as %s', (name, _source, form) => {
     const hit = found.find((i) => path.basename(i.file) === name);
     expect(hit?.form, `${name} bypassed the resolver`).toBe(form);
+  });
+
+  it('does not flag a Promise.all destructuring that takes a different export', () => {
+    const f = path.join(fixtureDir, 'promise-all-miss.ts');
+    fs.writeFileSync(f, "const [{ somethingElse }] = await Promise.all([import('./target.js')]);\nsomethingElse();\n");
+    expect(findImportersOf([f], path.resolve(target), 'wakeContainer')).toEqual([]);
   });
 
   it('does not flag a file that imports something else from the module', () => {
