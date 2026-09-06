@@ -4,6 +4,12 @@ import { SWRConfig } from 'swr';
 import { DecisionPane } from './SignalApp.js';
 import type { SignalDecisionDetail } from '../../../../src/dashboard/observatory-v2/types.js';
 import * as api from '../../lib/signal-api.js';
+import * as threadApi from '../../lib/api.js';
+vi.mock('../../lib/api.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof threadApi>()),
+  listThreads: vi.fn(),
+  getThreadDetail: vi.fn(),
+}));
 vi.mock('../../lib/signal-api.js', async (importOriginal) => ({
   ...(await importOriginal<typeof api>()),
   getSignalDecision: vi.fn(),
@@ -40,7 +46,17 @@ const fixture: SignalDecisionDetail = {
     history: [],
   },
   evidence: [{ title: 'Exact question', text: 'A source key repeats in two markets.', at: null, url: null }],
-  recipients: [{ id: 'a1', name: 'Theo' }],
+  recipients: [
+    { id: 'a1', name: 'Theo' },
+    { id: 'a2', name: 'Morgan' },
+  ],
+  destination: {
+    thread_id: 't1',
+    channel_name: '#project',
+    default_agent_group_id: 'a1',
+    default_reason: 'origin',
+    error: null,
+  },
 };
 const mount = () =>
   render(
@@ -109,7 +125,7 @@ describe('decision context and distinct authority', () => {
     await screen.findByText('Reviewer Two owns this review.');
     expect(screen.getByLabelText('Your decision')).toBeDisabled();
   });
-  it('requires an explicit destination recipient for separate dispatch', async () => {
+  it('defaults to the source agent and sends without a thread picker', async () => {
     const answered = structuredClone(fixture);
     answered.decision.answer = 'Use internal ID.';
     answered.decision.state = 'answered';
@@ -117,8 +133,10 @@ describe('decision context and distinct authority', () => {
     vi.mocked(api.dispatchSignalDecision).mockResolvedValue({ decision: answered.decision });
     mount();
     const send = await screen.findByRole('button', { name: 'Send recorded instruction →' });
-    expect(send).toBeDisabled();
-    fireEvent.change(screen.getByLabelText('Instruction recipient'), { target: { value: 'a1' } });
+    expect(send).toBeEnabled();
+    expect(screen.getByLabelText('Instruction recipient')).toHaveValue('a1');
+    expect(screen.queryByLabelText('Destination thread')).not.toBeInTheDocument();
+    expect(screen.getByText('Default: agent from the original source.')).toBeInTheDocument();
     fireEvent.click(send);
     await waitFor(() =>
       expect(api.dispatchSignalDecision).toHaveBeenCalledWith('d1', {
@@ -128,6 +146,79 @@ describe('decision context and distinct authority', () => {
       }),
     );
   });
+  it('preserves an override across refresh and uses it for a new automatic thread', async () => {
+    vi.useFakeTimers();
+    const answered = structuredClone(fixture);
+    Object.assign(answered.decision, { answer: 'Use internal ID.', state: 'answered', thread_id: null });
+    answered.destination.thread_id = null;
+    answered.destination.default_reason = 'owner';
+    vi.mocked(api.getSignalDecision).mockResolvedValue(answered);
+    vi.mocked(api.dispatchSignalDecision).mockResolvedValue({ decision: answered.decision });
+    mount();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByText('Starts a new thread in #project.')).toBeInTheDocument();
+    expect(threadApi.listThreads).not.toHaveBeenCalled();
+    expect(threadApi.getThreadDetail).not.toHaveBeenCalled();
+    expect(screen.queryByLabelText('Destination thread')).not.toBeInTheDocument();
+    expect(screen.getByText('Default: agent identified by the source owner.')).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('Instruction recipient'), { target: { value: 'a2' } });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000);
+    });
+    expect(screen.getByLabelText('Instruction recipient')).toHaveValue('a2');
+    expect(screen.getByText('Recipient selected by you.')).toBeInTheDocument();
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Send recorded instruction →' }));
+    });
+    expect(api.dispatchSignalDecision).toHaveBeenCalledWith('d1', {
+      expected_version: 2,
+      evidence_hash: 'hash7',
+      agent_group_id: 'a2',
+    });
+  });
+
+  it('resets an override when opening another decision', async () => {
+    const answered = structuredClone(fixture);
+    Object.assign(answered.decision, { answer: 'Use internal ID.', state: 'answered' });
+    vi.mocked(api.getSignalDecision).mockImplementation(async (id) => ({
+      ...answered,
+      decision: { ...answered.decision, id },
+    }));
+    const provider = new Map();
+    const pane = (id: string) => (
+      <SWRConfig value={{ provider: () => provider, dedupingInterval: 0 }}>
+        <DecisionPane id={id} authMe={authMe} refresh={() => {}} />
+      </SWRConfig>
+    );
+    const view = render(pane('d1'));
+    fireEvent.change(await screen.findByLabelText('Instruction recipient'), { target: { value: 'a2' } });
+    view.rerender(pane('d2'));
+    await waitFor(() => expect(screen.getByLabelText('Instruction recipient')).toHaveValue('a1'));
+    view.rerender(pane('d1'));
+    await waitFor(() => expect(screen.getByLabelText('Instruction recipient')).toHaveValue('a1'));
+  });
+
+  it('locks the recipient while sending', async () => {
+    const answered = structuredClone(fixture);
+    Object.assign(answered.decision, { answer: 'Use internal ID.', state: 'answered' });
+    vi.mocked(api.getSignalDecision).mockResolvedValue(answered);
+    let finish!: (value: { decision: typeof answered.decision }) => void;
+    vi.mocked(api.dispatchSignalDecision).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    mount();
+    fireEvent.click(await screen.findByRole('button', { name: 'Send recorded instruction →' }));
+    expect(screen.getByLabelText('Instruction recipient')).toBeDisabled();
+    await act(async () => {
+      finish({ decision: answered.decision });
+    });
+  });
+
   it('releases owned review even though claim is unavailable', async () => {
     const owned = structuredClone(fixture);
     owned.decision.owner = { id: 'reviewerOne', name: 'Reviewer One' };
@@ -141,29 +232,49 @@ describe('decision context and distinct authority', () => {
     );
   });
 
-  it('retries uncertain delivery using the persisted recipient and evidence after reload', async () => {
-    const pending = structuredClone(fixture);
-    Object.assign(pending.decision, {
-      answer: 'Use internal ID.',
-      state: 'changed',
-      dispatch_state: 'pending',
-      evidence_hash: 'new-hash',
-      dispatch_evidence_hash: 'reserved-hash',
-      dispatch_agent_group_id: 'a1',
-      dispatch_target_thread_id: 't1',
-    });
-    vi.mocked(api.getSignalDecision).mockResolvedValue(pending);
-    vi.mocked(api.dispatchSignalDecision).mockResolvedValue({ decision: pending.decision });
+  it.each(['t1', ''])(
+    'retries reserved delivery with target %j using persisted recipient and evidence',
+    async (target) => {
+      const pending = structuredClone(fixture);
+      Object.assign(pending.decision, {
+        answer: 'Use internal ID.',
+        state: 'changed',
+        dispatch_state: 'pending',
+        evidence_hash: 'new-hash',
+        dispatch_evidence_hash: 'reserved-hash',
+        dispatch_agent_group_id: 'a1',
+        dispatch_target_thread_id: target,
+      });
+      pending.destination.default_agent_group_id = 'a2';
+      pending.destination.thread_id = 'another-thread';
+      pending.destination.error = 'The source channel is no longer available.';
+      vi.mocked(api.getSignalDecision).mockResolvedValue(pending);
+      vi.mocked(api.dispatchSignalDecision).mockResolvedValue({ decision: pending.decision });
+      mount();
+      fireEvent.click(await screen.findByRole('button', { name: 'Send recorded instruction →' }));
+      await waitFor(() =>
+        expect(api.dispatchSignalDecision).toHaveBeenCalledWith('d1', {
+          expected_version: 2,
+          evidence_hash: 'reserved-hash',
+          agent_group_id: 'a1',
+        }),
+      );
+      expect(screen.getByLabelText('Instruction recipient')).toBeDisabled();
+    },
+  );
+
+  it('explains uncertain thread creation as requiring operator reconciliation', async () => {
+    const answered = structuredClone(fixture);
+    Object.assign(answered.decision, { answer: 'Use internal ID.', state: 'answered' });
+    vi.mocked(api.getSignalDecision).mockResolvedValue(answered);
+    vi.mocked(api.dispatchSignalDecision).mockRejectedValue(
+      new api.SignalApiError(503, 'thread_creation_uncertain_reconciliation_required'),
+    );
     mount();
     fireEvent.click(await screen.findByRole('button', { name: 'Send recorded instruction →' }));
-    await waitFor(() =>
-      expect(api.dispatchSignalDecision).toHaveBeenCalledWith('d1', {
-        expected_version: 2,
-        evidence_hash: 'reserved-hash',
-        agent_group_id: 'a1',
-      }),
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'An operator must reconcile the source channel before delivery can continue.',
     );
-    expect(screen.getByLabelText('Instruction recipient')).toBeDisabled();
   });
 
   it('privileged approvals expose the exact source link and no generic mutation', async () => {

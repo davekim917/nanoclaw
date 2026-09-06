@@ -12,7 +12,7 @@ import {
   RefreshCw,
 } from 'lucide-react';
 import type { SignalProject, SignalOverview } from '../../../../src/dashboard/observatory-v2/types.js';
-import { listThreads, getThreadDetail, type AuthMe } from '../../lib/api.js';
+import { listThreads, type AuthMe } from '../../lib/api.js';
 import {
   getSignalOverview,
   getSignalDecision,
@@ -43,7 +43,12 @@ function useStamp() {
   const timezone = useContext(TimezoneContext);
   return (value: string | null) => signalStamp(value, timezone);
 }
-const message = (error: unknown) => (error instanceof Error ? error.message : 'Request failed. Please retry.');
+const message = (error: unknown) =>
+  error instanceof Error && error.message === 'thread_creation_uncertain_reconciliation_required'
+    ? 'Thread creation could not be confirmed. An operator must reconcile the source channel before delivery can continue. No duplicate post was sent.'
+    : error instanceof Error
+      ? error.message
+      : 'Request failed. Please retry.';
 export function SignalApp({ authMe }: { authMe: AuthMe }) {
   const [route, setRoute] = useState(() => signalRoute(location.hash));
   const [workgroup, setWorkgroup] = useState('all');
@@ -673,28 +678,26 @@ export function DecisionPane({ id, authMe, refresh }: { id: string; authMe: Auth
     };
   }, [mutate]);
   const [text, setText] = useState('');
-  const [recipient, setRecipient] = useState('');
+  const [recipient, setRecipient] = useState<{ decisionId: string; agentId: string } | null>(null);
+  useEffect(() => setRecipient(null), [id]);
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState('');
   const [notice, setNotice] = useState('');
   const attempt = useRef<{ fingerprint: string; key: string } | null>(null);
   const draftEvidence = useRef<{ version: number; evidence_hash: string } | null>(null);
   const d = data?.decision;
-  const [targetThread, setTargetThread] = useState('');
-  const { data: targetThreads, error: targetsError } = useSWR(
-    d?.answer && !d.thread_id && d.capabilities.dispatch ? ['signal-targets', d.workgroup_id] : null,
-    () => listThreads({ workgroup: d!.workgroup_id }),
-    { revalidateOnFocus: true },
-  );
-  const { data: targetDetail, error: targetError } = useSWR(
-    targetThread ? ['signal-target-detail', targetThread] : null,
-    () => getThreadDetail(targetThread),
-  );
-  const dispatchRecipient = d?.dispatch_agent_group_id ?? recipient;
-  const dispatchTarget = d?.dispatch_target_thread_id ?? targetThread;
-  const recipients = d?.thread_id
-    ? (data?.recipients ?? [])
-    : (targetDetail?.thread.participants.map((p) => ({ id: p.agent_group_id, name: p.name })) ?? []);
+  const recipients = data?.recipients ?? [];
+  const explicitRecipient =
+    recipient?.decisionId === id && recipients.some((r) => r.id === recipient.agentId) ? recipient.agentId : null;
+  const dispatchRecipient =
+    d?.dispatch_agent_group_id ?? explicitRecipient ?? data?.destination.default_agent_group_id ?? '';
+  const dispatchTarget = d?.dispatch_target_thread_id ?? data?.destination.thread_id;
+  const destinationError = d?.dispatch_agent_group_id ? null : data?.destination.error;
+  const defaultReason = {
+    origin: 'Default: agent from the original source.',
+    owner: 'Default: agent identified by the source owner.',
+    channel_default: 'Default: channel agent.',
+  };
   async function act(action: 'claim' | 'release' | 'answer' | 'dispatch') {
     if (!d) return;
     setBusy(true);
@@ -706,7 +709,6 @@ export function DecisionPane({ id, authMe, refresh }: { id: string; authMe: Auth
           expected_version: d.version,
           evidence_hash: d.dispatch_evidence_hash ?? d.evidence_hash,
           agent_group_id: dispatchRecipient,
-          ...(!d.thread_id ? { target_thread_id: dispatchTarget } : {}),
         });
       else {
         const evidence = action === 'answer' ? (draftEvidence.current ?? d) : d;
@@ -931,53 +933,35 @@ export function DecisionPane({ id, authMe, refresh }: { id: string; authMe: Auth
                 <div className="signal-dispatch">
                   <h3>Instruction delivery</h3>
                   <p>
-                    {d.dispatch_state === 'sent'
-                      ? 'Instruction sent. Agent work is not yet verified complete.'
-                      : d.dispatch_state === 'pending'
-                        ? 'Delivery pending or uncertain. Retry checks the same instruction.'
-                        : d.dispatch_state === 'failed'
-                          ? `Delivery failed: ${d.dispatch_error ?? 'See source thread.'}`
-                          : 'No instruction sent.'}
+                    {d.dispatch_error === 'thread_creation_uncertain_reconciliation_required'
+                      ? message(new Error(d.dispatch_error))
+                      : d.dispatch_state === 'sent'
+                        ? 'Instruction sent. Agent work is not yet verified complete.'
+                        : d.dispatch_state === 'pending'
+                          ? 'Delivery pending or uncertain. Retry checks the same instruction.'
+                          : d.dispatch_state === 'failed'
+                            ? `Delivery failed: ${d.dispatch_error ?? 'See source thread.'}`
+                            : 'No instruction sent.'}
                   </p>
                   {d.capabilities.dispatch &&
                   (d.state === 'answered' || d.dispatch_state === 'pending' || d.dispatch_state === 'failed') &&
                   d.dispatch_state !== 'sent' ? (
                     <>
-                      {!d.thread_id && !d.dispatch_target_thread_id && (
-                        <label className="signal-field">
-                          Existing destination thread
-                          <select
-                            aria-label="Destination thread"
-                            value={targetThread}
-                            onChange={(e) => {
-                              setTargetThread(e.target.value);
-                              setRecipient('');
-                            }}
-                          >
-                            <option value="">Choose an existing thread</option>
-                            {targetThreads?.threads
-                              .filter((t) => !t.synthetic && t.participants.length)
-                              .map((t) => (
-                                <option key={t.thread_id} value={t.thread_id}>
-                                  {t.channel_name} · {t.title ?? t.thread_id}
-                                </option>
-                              ))}
-                          </select>
-                        </label>
-                      )}
-                      {(targetsError || targetError) && (
-                        <p role="alert">Could not load destination context. Retry by reopening this decision.</p>
-                      )}
+                      <p className="signal-action-note">
+                        {dispatchTarget ? 'Replies in the existing thread' : 'Starts a new thread'}
+                        {data.destination.channel_name ? ` in ${data.destination.channel_name}` : ''}.
+                      </p>
+                      {destinationError && <p role="alert">{destinationError}</p>}
                       <label className="signal-field">
                         Recipient
                         <select
-                          disabled={!!d.dispatch_agent_group_id}
+                          disabled={busy || !!d.dispatch_agent_group_id}
                           aria-label="Instruction recipient"
                           value={dispatchRecipient}
-                          onChange={(e) => setRecipient(e.target.value)}
+                          onChange={(e) => setRecipient({ decisionId: id, agentId: e.target.value })}
                         >
                           <option value="">Choose an agent</option>
-                          {d.dispatch_agent_group_id && (
+                          {d.dispatch_agent_group_id && !recipients.some((r) => r.id === d.dispatch_agent_group_id) && (
                             <option value={d.dispatch_agent_group_id}>
                               {d.dispatch_agent_group_id} · reserved recipient
                             </option>
@@ -989,8 +973,17 @@ export function DecisionPane({ id, authMe, refresh }: { id: string; authMe: Auth
                           ))}
                         </select>
                       </label>
+                      <p className="signal-action-note">
+                        {d.dispatch_agent_group_id
+                          ? 'Recipient reserved for this instruction. Retry keeps the same destination.'
+                          : explicitRecipient
+                            ? 'Recipient selected by you.'
+                            : data.destination.default_reason
+                              ? defaultReason[data.destination.default_reason]
+                              : 'Choose an agent to receive this instruction.'}
+                      </p>
                       <button
-                        disabled={!dispatchRecipient || busy || !!error || (!d.thread_id && !dispatchTarget)}
+                        disabled={!dispatchRecipient || busy || !!error || !!destinationError}
                         onClick={() => void act('dispatch')}
                       >
                         Send recorded instruction →
