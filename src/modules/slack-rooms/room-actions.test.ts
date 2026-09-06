@@ -365,6 +365,58 @@ describe('create_room', () => {
     expect(lastNotice()).toMatch(/would not accept the purpose/);
   });
 
+  it('refuses an approved create_room replay whose roster changed since the card', async () => {
+    await getDeliveryAction('create_room')!(
+      { action: 'create_room', name: 'Ops Room', agents: ['mate'] },
+      callerSession,
+    );
+    expect(requestApprovalMock).toHaveBeenCalledTimes(1);
+
+    // The destination the approver saw is repointed at a different agent
+    // while the card sits unanswered. The replay's precheck faithfully
+    // resolves the NEW agent, which is exactly why the approval must not
+    // still cover it.
+    await makeAgent({
+      id: 'ag-third',
+      folder: 'third',
+      workgroup: 'home',
+      channelType: 'slack-gamma',
+      identity: GAMMA,
+    });
+    await getDb().run(
+      `UPDATE agent_destinations SET target_id = 'ag-third' WHERE agent_group_id = 'ag-caller' AND local_name = 'mate'`,
+    );
+
+    const grant = await persistGrant(grantFrom('create_room'));
+    const { reenterGuardedDeliveryAction } = await import('../../delivery.js');
+    await reenterGuardedDeliveryAction('create_room')({
+      session: callerSession,
+      payload: JSON.parse(grant.payload) as Record<string, unknown>,
+      approval: grant,
+    });
+
+    expect(createConversationMock).not.toHaveBeenCalled();
+    expect(inviteUsersMock).not.toHaveBeenCalled();
+    expect(lastNotice()).toMatch(/participants changed since that approval/);
+  });
+
+  it('lets an approved create_room replay through when the roster is unchanged', async () => {
+    await getDeliveryAction('create_room')!(
+      { action: 'create_room', name: 'Ops Room', agents: ['mate'] },
+      callerSession,
+    );
+    const grant = await persistGrant(grantFrom('create_room'));
+    const { reenterGuardedDeliveryAction } = await import('../../delivery.js');
+    await reenterGuardedDeliveryAction('create_room')({
+      session: callerSession,
+      payload: JSON.parse(grant.payload) as Record<string, unknown>,
+      approval: grant,
+    });
+
+    expect(createConversationMock).toHaveBeenCalledWith('slack-alpha', { name: 'Ops Room', isPrivate: true });
+    expect(inviteUsersMock).toHaveBeenCalledWith('slack-alpha', 'CROOM1', ['UBETA', 'UOWNER']);
+  });
+
   it('create_room refuses a cross-workspace member', async () => {
     await makeWorkgroup('away');
     await makeAgent({

@@ -36,6 +36,7 @@ import {
   CALLER_WORKGROUP_KEY,
   CREATE_ROOM_ACTION,
   ROOM_PLATFORM_ID_KEY,
+  ROSTER_KEY,
   TARGET_AGENT_GROUP_KEY,
   TARGET_WORKGROUP_KEY,
 } from './guard.js';
@@ -49,6 +50,7 @@ import {
   resolveRoomByName,
   resolveRoomByPlatformId,
   roomInviter,
+  rosterStamp,
   type CandidateRoom,
   type RoomParticipant,
 } from './resolve.js';
@@ -113,6 +115,9 @@ export async function validateCreateRoom(content: Record<string, unknown>, sessi
     content.agents = agents;
     content[CALLER_WORKGROUP_KEY] = workgroupOf(callerGroup);
     content[RESOLVED_PARTICIPANTS_KEY] = participants;
+    // Re-derived on every run, replays included, and compared against the
+    // stamp the card carried — see roomsCreate.grantCoversRequest.
+    content[ROSTER_KEY] = rosterStamp(participants);
     return true;
   } catch (err) {
     return refuse(session, 'create_room', err);
@@ -136,6 +141,9 @@ export async function requestCreateRoomHold(content: Record<string, unknown>, se
     payload: {
       name,
       agents: content.agents,
+      // The roster the approver is being shown, bound so the replay cannot
+      // invite anyone else.
+      [ROSTER_KEY]: content[ROSTER_KEY],
       ...(trimmed(content.purpose) ? { purpose: trimmed(content.purpose) } : {}),
       requestId: content.requestId ?? null,
     },

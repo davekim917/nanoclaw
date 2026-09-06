@@ -40,6 +40,21 @@ export const CALLER_WORKGROUP_KEY = 'caller_workgroup_id';
 export const TARGET_WORKGROUP_KEY = 'target_workgroup_id';
 export const TARGET_AGENT_GROUP_KEY = 'target_agent_group_id';
 export const ROOM_PLATFORM_ID_KEY = 'room_platform_id';
+/**
+ * The resolved roster, as a sorted list of `"<agentGroupId>|<channelType>|<botUserId>|<teamId>"`.
+ * A create_room approval binds to it, so a destination repointed between card
+ * and click cannot smuggle a different agent — or a different Slack bot for
+ * the same agent — into the room the approver said yes to.
+ */
+export const ROSTER_KEY = 'resolved_roster';
+
+/** Order-insensitive equality over the roster stamps. */
+function sameRoster(a: unknown, b: unknown): boolean {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length || a.length === 0) return false;
+  const left = [...a].map(String).sort();
+  const right = [...b].map(String).sort();
+  return left.every((value, index) => value === right[index]);
+}
 
 // Synchronous by design (seam-3 plan §4.5, I-1): runs inside the delivery
 // guard's `withCentralSync` block and never awaits. The central read executes
@@ -59,10 +74,25 @@ function stringOf(input: GuardInput, key: string): string | null {
 export const roomsCreate = defineGuardedAction({
   action: 'rooms.create',
   grantActionName: CREATE_ROOM_ACTION,
-  // Bind a create_room grant to the room name that was approved.
+  /**
+   * Bind a create_room grant to the room name AND the resolved roster.
+   *
+   * The name alone was not enough. A non-global caller's card can sit for a
+   * while, and an `agents` destination is repointable in that window: the
+   * replay's precheck faithfully re-resolves the new target, and a name-only
+   * comparison then let an existing approval authorize inviting a participant
+   * the approver never saw. The roster stamp carries each participant's agent
+   * group, channel type, bot user id and workspace, so a swap on any of those
+   * axes — a different agent, or the same agent on a different Slack bot —
+   * fails the check and the replay denies instead of executing.
+   *
+   * Order-insensitive because the participant order is derived from the
+   * caller's argument list, not from anything the approver decided.
+   */
   grantCoversRequest: (grant, input) => {
     try {
-      return (JSON.parse(grant.payload) as { name?: string }).name === input.payload.name;
+      const approved = JSON.parse(grant.payload) as { name?: string; [ROSTER_KEY]?: unknown };
+      return approved.name === input.payload.name && sameRoster(approved[ROSTER_KEY], input.payload[ROSTER_KEY]);
     } catch {
       return false;
     }
