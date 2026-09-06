@@ -4,6 +4,7 @@ import path from 'path';
 
 import { GROUPS_DIR } from '../../config.js';
 import {
+  assertMcpServerNotPluginOwned,
   parseMcpServerConfig,
   readContainerConfig,
   resolveContainerSecurity,
@@ -29,7 +30,7 @@ import {
   updateContainerConfigJson,
 } from '../../db/container-configs.js';
 import { getDeniedModel } from '../../db/denied-models.js';
-import { assertValidGroupFolder } from '../../group-folder.js';
+import { assertValidGroupFolder, groupFolderExistsOnDisk } from '../../group-folder.js';
 import { log } from '../../log.js';
 import { canonicalizeIanaTimezone, timezoneRejectionReason } from '../../timezone.js';
 import { initGroupFilesystem } from '../../group-init.js';
@@ -163,6 +164,28 @@ registerResource({
           initGroupFilesystem(existing); // ensure a reused group is fully configured too (idempotent; also repairs a missing workspace folder)
           return existing;
         }
+        // A folder on disk with no claiming DB row is deleted-group residue
+        // (delete never removes groups/<folder>/) or an operator-placed dir —
+        // minting a new id over it would silently re-scope the old group's
+        // data under a new identity. Checked before the grammar validation
+        // below on purpose (see that comment).
+        if (groupFolderExistsOnDisk(folder)) {
+          throw new Error(
+            `group folder 'groups/${folder}' already exists on disk but no agent group claims it — ` +
+              `deleting a group never removes its folder, and creating a new group over it would silently ` +
+              `adopt the old group's data under a new identity. Move or remove the folder, or pick a different --folder.`,
+          );
+        }
+        // Fresh-create branch only, and after both the lookup above and the
+        // on-disk probe say the folder is genuinely absent — validating
+        // earlier would refuse to reuse a LIVE group whose folder predates
+        // the current grammar (accepted by an older bare-create path),
+        // breaking documented idempotence on --folder for it (github Codex
+        // review, PR #486). The template path validates through
+        // createAgentFromTemplate; the bare path used to validate nowhere for
+        // a truly fresh create, minting folders the runtime label grammar
+        // refuses at every spawn.
+        assertValidGroupFolder(folder);
         const id = `ag-${randomUUID()}`;
         const group: AgentGroup = { id, name, folder, agent_provider: null, created_at: new Date().toISOString() };
         // `getAgentGroupByFolder` yields (async driver), so two concurrent
@@ -209,7 +232,8 @@ registerResource({
       description:
         'Delete an agent group and its dependent rows (sessions, destinations, approvals, role grants, ' +
         'memberships, channel wirings). FK-ordered cascade in a single transaction. ' +
-        'Use --id <group-id>. Out of scope: killing running containers, on-disk cleanup of groups/<folder>/ and data/v2-sessions/<group-id>/.',
+        'Use --id <group-id>. Out of scope: killing running containers, on-disk cleanup of groups/<folder>/ and data/v2-sessions/<group-id>/. ' +
+        'The leftover groups/<folder>/ blocks re-creating a group under the same folder name until it is moved or removed.',
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
@@ -622,6 +646,7 @@ registerResource({
         // those fields from the DB; the backfill-container-configs sync is
         // file→DB one-way, so DB drift gets overwritten on next host start.
         const fileConfig = updateContainerConfig(group.folder, (cfg) => {
+          assertMcpServerNotPluginOwned(cfg.mcpServers?.[name], name, group.folder);
           if (!cfg.mcpServers) cfg.mcpServers = {};
           cfg.mcpServers[name] = newEntry;
         });
@@ -651,6 +676,7 @@ registerResource({
           if (!cfg.mcpServers || !cfg.mcpServers[name]) {
             throw new Error(`MCP server "${name}" not found`);
           }
+          assertMcpServerNotPluginOwned(cfg.mcpServers[name], name, group.folder);
           delete cfg.mcpServers[name];
         });
         await updateContainerConfigJson(id, 'mcp_servers', fileConfig.mcpServers ?? {});

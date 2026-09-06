@@ -150,6 +150,25 @@ export function mcpServerPluginOwner(entry: unknown): string | undefined {
   return typeof plugin === 'string' && plugin !== '' ? plugin : undefined;
 }
 
+/**
+ * The ONE refusal for every mutation path that writes `mcpServers[name]`:
+ * `ncl groups config add/remove-mcp-server` and the self-mod approval apply
+ * both call this, so a plugin-stamped entry cannot be overwritten (and its
+ * provenance marker dropped) through either door. Plugin-owned entries are
+ * template content; the fork has no in-place restamp verb yet (deferred to
+ * the templates theme), so the only sanctioned remediation today is editing
+ * the plugin itself or explicitly taking manual ownership.
+ */
+export function assertMcpServerNotPluginOwned(entry: unknown, name: string, folder: string): void {
+  const owner = mcpServerPluginOwner(entry);
+  if (!owner) return;
+  throw new Error(
+    `MCP server "${name}" is managed by plugin "${owner}"; direct edits are refused. ` +
+      `Update it through the plugin, or remove the "plugin" marker for that server in ` +
+      `groups/${folder}/container.json to take manual ownership.`,
+  );
+}
+
 /** RFC 7230 token charset — what a header field-name may contain. */
 const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$/;
 /**

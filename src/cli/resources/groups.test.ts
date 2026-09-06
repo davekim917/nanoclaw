@@ -40,7 +40,7 @@ import { createSession } from '../../db/sessions.js';
 import { recordDeliveryAttempt } from '../../db/coordination.js';
 import { dispatch } from '../dispatch.js';
 import { readContainerConfig } from '../../container-config.js';
-import { ensureContainerConfig, getContainerConfig } from '../../db/container-configs.js';
+import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
 import { isSiblingBoundField } from '../../sibling-parity.js';
 // Side-effect import: registers the `groups-*` commands (including delete).
 import './groups.js';
@@ -842,5 +842,219 @@ describe('groups config add-mount / remove-mount (host-only)', () => {
     expect(rm.ok).toBe(true);
     expect(JSON.parse((await getContainerConfig(GID))!.additional_mounts)).toEqual([]);
     expect(readContainerConfig('m').additionalMounts).toEqual([]);
+  });
+});
+
+// Cases 9, 10, 14 live in the sibling file groups-create-folder-reuse.test.ts
+// (adopted from upstream, unique-tmp-root fixed — see that file's header).
+
+// Cases 11, 12 — re-derived against `mcpServerPluginOwner` directly (upstream's
+// `groups-plugin-guard.test.ts` is not adopted: it imports `templates/manifest.ts`
+// and `templates/extension.ts`, both absent, and most of its cases are restamp
+// cases this theme defers). Same refusal messages as upstream's guard-site
+// commit (6b08907a7).
+describe('plugin-owned MCP server guard on config add/remove-mcp-server (cases 11, 12)', () => {
+  beforeEach(async () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    await initTestDb();
+    runMigrations(getRawDb());
+  });
+  afterEach(async () => {
+    await closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  async function seedGroupWithPluginServer(folder: string, id: string) {
+    await createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    await ensureContainerConfig(id);
+    const groupDir = `${TEST_DIR}/groups/${folder}`;
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.writeFileSync(
+      `${groupDir}/container.json`,
+      JSON.stringify({
+        mcpServers: {
+          docs: { type: 'http', url: 'https://mcp.example.com/mcp', plugin: 'sdr' },
+        },
+        packages: { apt: [], npm: [] },
+        skills: 'all',
+      }) + '\n',
+    );
+    await updateContainerConfigJson(id, 'mcp_servers', {
+      docs: { type: 'http', url: 'https://mcp.example.com/mcp', plugin: 'sdr' },
+    });
+  }
+
+  it('refuses to overwrite a plugin-owned server (case 11)', async () => {
+    const id = 'ag-plugin-guard-add';
+    await seedGroupWithPluginServer('plugin-guard-add', id);
+
+    const res = await dispatch(
+      {
+        id: 'req-1',
+        command: 'groups-config-add-mcp-server',
+        args: { id, name: 'docs', url: 'https://evil.example.com/mcp' },
+      },
+      { caller: 'host' },
+    );
+
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      // Pinned wording, not upstream's: this fork has no in-place restamp
+      // verb (github Codex review, PR #486) — the remediation must point at
+      // something that exists today, and never mention `restamp`.
+      expect(res.error.message).toMatch(/managed by plugin "sdr"/);
+      expect(res.error.message).not.toMatch(/restamp/i);
+    }
+    expect(readContainerConfig('plugin-guard-add').mcpServers.docs).toMatchObject({
+      url: 'https://mcp.example.com/mcp',
+    });
+    expect(JSON.parse((await getContainerConfig(id))!.mcp_servers).docs).toMatchObject({
+      url: 'https://mcp.example.com/mcp',
+    });
+  });
+
+  it('refuses to remove a plugin-owned server (case 12)', async () => {
+    const id = 'ag-plugin-guard-remove';
+    await seedGroupWithPluginServer('plugin-guard-remove', id);
+
+    const res = await dispatch(
+      { id: 'req-2', command: 'groups-config-remove-mcp-server', args: { id, name: 'docs' } },
+      { caller: 'host' },
+    );
+
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.error.message).toMatch(/managed by plugin "sdr"/);
+      expect(res.error.message).not.toMatch(/restamp/i);
+    }
+    expect(readContainerConfig('plugin-guard-remove').mcpServers.docs).toBeDefined();
+    expect(JSON.parse((await getContainerConfig(id))!.mcp_servers).docs).toBeDefined();
+  });
+
+  it('leaves an unmarked server fully editable (add and remove both succeed)', async () => {
+    const id = 'ag-plugin-guard-unmarked';
+    const folder = 'plugin-guard-unmarked';
+    await createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    await ensureContainerConfig(id);
+    const groupDir = `${TEST_DIR}/groups/${folder}`;
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.writeFileSync(
+      `${groupDir}/container.json`,
+      JSON.stringify({ mcpServers: {}, packages: { apt: [], npm: [] }, skills: 'all' }) + '\n',
+    );
+
+    const added = await dispatch(
+      {
+        id: 'req-3',
+        command: 'groups-config-add-mcp-server',
+        args: { id, name: 'mine', url: 'https://mine.example.com/mcp' },
+      },
+      { caller: 'host' },
+    );
+    expect(added.ok).toBe(true);
+
+    const removed = await dispatch(
+      { id: 'req-4', command: 'groups-config-remove-mcp-server', args: { id, name: 'mine' } },
+      { caller: 'host' },
+    );
+    expect(removed.ok).toBe(true);
+    expect(readContainerConfig(folder).mcpServers.mine).toBeUndefined();
+    expect(JSON.parse((await getContainerConfig(id))!.mcp_servers).mine).toBeUndefined();
+  });
+});
+
+// Case 13 — the structural dual-write test the plan flags as the place the
+// container.json + container_configs invariant (§3.1 of the scope report) can
+// silently die. Walks every config-mutating custom operation this PR touches
+// (plus the pre-existing scalar mirror on `config update`) and asserts BOTH
+// stores were written, not just the one a narrower test happened to check.
+describe('groups config — the container.json + container_configs dual write holds everywhere (case 13)', () => {
+  beforeEach(async () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    await initTestDb();
+    runMigrations(getRawDb());
+  });
+  afterEach(async () => {
+    await closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it('config update mirrors every runtime-selecting scalar into both stores', async () => {
+    const id = 'ag-dual-write-update';
+    const folder = 'dual-write-update';
+    await createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    await ensureContainerConfig(id);
+    const groupDir = `${TEST_DIR}/groups/${folder}`;
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.writeFileSync(
+      `${groupDir}/container.json`,
+      JSON.stringify({ mcpServers: {}, packages: { apt: [], npm: [] }, skills: 'all' }) + '\n',
+    );
+
+    const res = await dispatch(
+      {
+        id: 'req-dual-update',
+        command: 'groups-config-update',
+        args: {
+          id,
+          provider: 'codex',
+          model: 'gpt-6-dual',
+          effort: 'high',
+          assistant_name: 'Dual',
+          timezone: 'Europe/Lisbon',
+        },
+      },
+      { caller: 'host' },
+    );
+    expect(res.ok).toBe(true);
+
+    const file = readContainerConfig(folder);
+    expect(file.provider).toBe('codex');
+    expect(file.model).toBe('gpt-6-dual');
+    expect(file.effort).toBe('high');
+    expect(file.assistantName).toBe('Dual');
+    expect(file.timezone).toBe('Europe/Lisbon');
+
+    const row = (await getContainerConfig(id))!;
+    expect(row.provider).toBe('codex');
+    expect(row.model).toBe('gpt-6-dual');
+    expect(row.effort).toBe('high');
+    expect(row.assistant_name).toBe('Dual');
+    expect(row.timezone).toBe('Europe/Lisbon');
+  });
+
+  it('config add-mcp-server and remove-mcp-server both write file and DB', async () => {
+    const id = 'ag-dual-write-mcp';
+    const folder = 'dual-write-mcp';
+    await createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    await ensureContainerConfig(id);
+    const groupDir = `${TEST_DIR}/groups/${folder}`;
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.writeFileSync(
+      `${groupDir}/container.json`,
+      JSON.stringify({ mcpServers: {}, packages: { apt: [], npm: [] }, skills: 'all' }) + '\n',
+    );
+
+    const added = await dispatch(
+      {
+        id: 'req-dual-add',
+        command: 'groups-config-add-mcp-server',
+        args: { id, name: 'both', url: 'https://both.example.com/mcp' },
+      },
+      { caller: 'host' },
+    );
+    expect(added.ok).toBe(true);
+    expect(readContainerConfig(folder).mcpServers.both).toBeDefined();
+    expect(JSON.parse((await getContainerConfig(id))!.mcp_servers).both).toBeDefined();
+
+    const removed = await dispatch(
+      { id: 'req-dual-remove', command: 'groups-config-remove-mcp-server', args: { id, name: 'both' } },
+      { caller: 'host' },
+    );
+    expect(removed.ok).toBe(true);
+    expect(readContainerConfig(folder).mcpServers.both).toBeUndefined();
+    expect(JSON.parse((await getContainerConfig(id))!.mcp_servers).both).toBeUndefined();
   });
 });
