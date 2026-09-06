@@ -100,6 +100,62 @@ invalid_reason() {
   ' "$marker_path" 2>/dev/null || printf 'not valid JSON'
 }
 
+# A `pass` says the lane has affirmative evidence. Requiring a nonempty,
+# regular file inside the run root makes that claim durable instead of letting
+# an empty evidence array, a future screenshot path, or a host path clear the
+# synthesis barrier. Non-pass markers deliberately do not use this check: a
+# concrete blocker or failure reason is a valid terminal result even when no
+# success evidence exists.
+pass_evidence_problem() {
+  local marker_path="$1" evidence_path candidate run_root resolved
+
+  if ! jq -e '
+    (.evidence | type == "array" and length > 0) and
+    all(.evidence[];
+      type == "string" and length > 0 and
+      (index("\n") | not) and (index("\r") | not))
+  ' "$marker_path" >/dev/null 2>&1; then
+    printf 'pass marker requires a nonempty evidence array of one-line file paths'
+    return
+  fi
+
+  run_root="$(realpath -e "$RUN_DIR" 2>/dev/null || true)"
+  if [ -z "$run_root" ]; then
+    printf 'run root cannot be resolved while validating pass evidence'
+    return
+  fi
+
+  while IFS= read -r evidence_path; do
+    case "$evidence_path" in
+      /*|.|..|../*|*/../*|*/..)
+        printf 'pass marker evidence path is absolute or escapes the run root: %s' "$evidence_path"
+        return
+        ;;
+    esac
+    candidate="$RUN_DIR/$evidence_path"
+    if [ ! -e "$candidate" ]; then
+      printf 'pass marker evidence file is missing: %s' "$evidence_path"
+      return
+    fi
+    resolved="$(realpath -e "$candidate" 2>/dev/null || true)"
+    case "$resolved" in
+      "$run_root"/*) ;;
+      *)
+        printf 'pass marker evidence path resolves outside the run root: %s' "$evidence_path"
+        return
+        ;;
+    esac
+    if [ -L "$candidate" ] || [ ! -f "$candidate" ]; then
+      printf 'pass marker evidence path is not a regular file in the run: %s' "$evidence_path"
+      return
+    fi
+    if [ ! -s "$candidate" ]; then
+      printf 'pass marker evidence file is empty: %s' "$evidence_path"
+      return
+    fi
+  done < <(jq -r '.evidence[]' "$marker_path")
+}
+
 # `disposition` gates the challenger's THREAD POST, not its file write.
 #
 # Independence was ordered around files, but the disposition is posted in the
@@ -153,6 +209,8 @@ while IFS= read -r marker; do
   lane_id="$(basename "$marker" .json)"
   expected_gen="$(expected_generation "$lane_id")"
 
+  marker_valid=true
+  evidence_problem=""
   if ! jq -e --arg sha "$SOURCE_SHA" --arg id "$lane_id" --arg gen "$expected_gen" '
     .sourceSha == $sha and
     ((.lane // $id) == $id) and
@@ -164,8 +222,19 @@ while IFS= read -r marker; do
      .status == "completed") and
     (.completedAt | type == "string" and length > 0)
   ' "$marker_path" >/dev/null 2>&1; then
+    marker_valid=false
+  elif [ "$(jq -r '.status' "$marker_path" 2>/dev/null)" = pass ]; then
+    evidence_problem="$(pass_evidence_problem "$marker_path")"
+    [ -z "$evidence_problem" ] || marker_valid=false
+  fi
+
+  if [ "$marker_valid" != true ]; then
     INVALID+=("$marker")
-    INVALID_REASONS+=("$marker: $(invalid_reason "$marker_path" "$SOURCE_SHA" "$lane_id" "$expected_gen")")
+    if [ -n "$evidence_problem" ]; then
+      INVALID_REASONS+=("$marker: $evidence_problem")
+    else
+      INVALID_REASONS+=("$marker: $(invalid_reason "$marker_path" "$SOURCE_SHA" "$lane_id" "$expected_gen")")
+    fi
   fi
 done < <(jq -r '.requiredLaneMarkers[]' "$CONTRACT")
 

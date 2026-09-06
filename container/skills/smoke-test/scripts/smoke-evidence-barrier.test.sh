@@ -89,7 +89,9 @@ rm -rf "$(dirname "$DISP_DIR")"
 # the `generation` comment block in smoke-evidence-barrier.sh for the two live
 # incidents this closes.
 GEN_DIR="$(mktemp -d)"
-mkdir -p "$GEN_DIR/markers"
+mkdir -p "$GEN_DIR/markers" "$GEN_DIR/evidence"
+printf '%s\n' 'B1 browser proof' >"$GEN_DIR/evidence/b1.txt"
+printf '%s\n' 'B2 browser proof' >"$GEN_DIR/evidence/b2.txt"
 
 cat >"$GEN_DIR/completion-contract.json" <<'JSON'
 {
@@ -107,7 +109,7 @@ JSON
 # a marker that never mentions generation at all — full backward compatibility
 # with every marker written before this feature existed.
 cat >"$GEN_DIR/markers/B1.json" <<'JSON'
-{"schemaVersion":1,"lane":"B1","sourceSha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","status":"pass","completedAt":"2026-08-24T16:00:00Z"}
+{"schemaVersion":1,"lane":"B1","sourceSha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","status":"pass","completedAt":"2026-08-24T16:00:00Z","evidence":["evidence/b1.txt"]}
 JSON
 
 # B2's marker was written against generation 1 (the lane's OLD meaning, before
@@ -115,7 +117,7 @@ JSON
 # stale B2 marker actually had. It must be reported invalid, and reported as
 # stale specifically, not as any other failure mode.
 cat >"$GEN_DIR/markers/B2.json" <<'JSON'
-{"schemaVersion":1,"lane":"B2","sourceSha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","status":"pass","completedAt":"2026-08-24T16:30:00Z"}
+{"schemaVersion":1,"lane":"B2","sourceSha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","status":"pass","completedAt":"2026-08-24T16:30:00Z","evidence":["evidence/b2.txt"]}
 JSON
 
 RESULT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$GEN_DIR" lanes || true)"
@@ -130,7 +132,7 @@ echo "$RESULT" | jq -e '.invalidReasons[0] | contains("stale generation")' >/dev
 # the barrier — this is the re-dispatch actually landing, not just staleness
 # detection working.
 cat >"$GEN_DIR/markers/B2.json" <<'JSON'
-{"schemaVersion":1,"lane":"B2","sourceSha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","status":"pass","completedAt":"2026-08-24T17:00:00Z","generation":2}
+{"schemaVersion":1,"lane":"B2","sourceSha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","status":"pass","completedAt":"2026-08-24T17:00:00Z","generation":2,"evidence":["evidence/b2.txt"]}
 JSON
 bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$GEN_DIR" lanes \
   | jq -e '.ready == true' >/dev/null \
@@ -147,5 +149,59 @@ echo "$RESULT" | jq -e '.invalidReasons[0] | contains("lane field mismatch")' >/
   || { echo "expected a lane/filename mismatch to be reported as an identity mismatch"; echo "$RESULT" >&2; exit 1; }
 
 rm -rf "$GEN_DIR"
+
+# A pass marker needs real, durable evidence under the run root. These cases
+# exercise the barrier directly so a future writer cannot weaken it by merely
+# changing scaffold defaults. A non-pass marker remains a valid terminal
+# account of a concrete blocker without fabricated success evidence.
+EVIDENCE_DIR="$(mktemp -d)"
+mkdir -p "$EVIDENCE_DIR/markers" "$EVIDENCE_DIR/evidence"
+cat >"$EVIDENCE_DIR/completion-contract.json" <<'JSON'
+{"schemaVersion":1,"sourceSha":"cccccccccccccccccccccccccccccccccccccccc","requiredLaneMarkers":["markers/B1.json"]}
+JSON
+
+cat >"$EVIDENCE_DIR/markers/B1.json" <<'JSON'
+{"schemaVersion":1,"lane":"B1","sourceSha":"cccccccccccccccccccccccccccccccccccccccc","status":"pass","completedAt":"2026-08-24T18:00:00Z"}
+JSON
+RESULT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$EVIDENCE_DIR" lanes || true)"
+echo "$RESULT" | jq -e '(.ready == false) and (.invalidReasons[0] | contains("nonempty evidence array"))' >/dev/null || {
+  echo "expected an evidence-free pass marker to fail" >&2; exit 1; }
+
+jq '.evidence = ["evidence/missing.txt"]' "$EVIDENCE_DIR/markers/B1.json" >"$EVIDENCE_DIR/markers/.marker.json"
+mv "$EVIDENCE_DIR/markers/.marker.json" "$EVIDENCE_DIR/markers/B1.json"
+RESULT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$EVIDENCE_DIR" lanes || true)"
+echo "$RESULT" | jq -e '(.ready == false) and (.invalidReasons[0] | contains("evidence file is missing"))' >/dev/null || {
+  echo "expected a missing evidence path to fail" >&2; exit 1; }
+
+: >"$EVIDENCE_DIR/evidence/empty.txt"
+jq '.evidence = ["evidence/empty.txt"]' "$EVIDENCE_DIR/markers/B1.json" >"$EVIDENCE_DIR/markers/.marker.json"
+mv "$EVIDENCE_DIR/markers/.marker.json" "$EVIDENCE_DIR/markers/B1.json"
+RESULT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$EVIDENCE_DIR" lanes || true)"
+echo "$RESULT" | jq -e '(.ready == false) and (.invalidReasons[0] | contains("evidence file is empty"))' >/dev/null || {
+  echo "expected an empty evidence file to fail" >&2; exit 1; }
+
+# Lexical path checks alone are insufficient: a symlinked parent directory can
+# make an apparently in-run path resolve outside the immutable run tree.
+OUTSIDE_DIR="$(mktemp -d)"
+printf '%s\n' 'outside receipt' >"$OUTSIDE_DIR/outside.txt"
+ln -s "$OUTSIDE_DIR" "$EVIDENCE_DIR/evidence/escape"
+jq '.evidence = ["evidence/escape/outside.txt"]' "$EVIDENCE_DIR/markers/B1.json" >"$EVIDENCE_DIR/markers/.marker.json"
+mv "$EVIDENCE_DIR/markers/.marker.json" "$EVIDENCE_DIR/markers/B1.json"
+RESULT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$EVIDENCE_DIR" lanes || true)"
+echo "$RESULT" | jq -e '(.ready == false) and (.invalidReasons[0] | contains("resolves outside the run root"))' >/dev/null || {
+  echo "expected a parent symlink escaping the run root to fail" >&2; exit 1; }
+rm -rf "$OUTSIDE_DIR"
+
+printf '%s\n' 'fresh browser receipt' >"$EVIDENCE_DIR/evidence/fresh.txt"
+jq '.evidence = ["evidence/fresh.txt"]' "$EVIDENCE_DIR/markers/B1.json" >"$EVIDENCE_DIR/markers/.marker.json"
+mv "$EVIDENCE_DIR/markers/.marker.json" "$EVIDENCE_DIR/markers/B1.json"
+bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$EVIDENCE_DIR" lanes \
+  | jq -e '.ready == true' >/dev/null || { echo "expected real evidence to clear a pass marker" >&2; exit 1; }
+
+jq '.status = "blocked" | del(.evidence)' "$EVIDENCE_DIR/markers/B1.json" >"$EVIDENCE_DIR/markers/.marker.json"
+mv "$EVIDENCE_DIR/markers/.marker.json" "$EVIDENCE_DIR/markers/B1.json"
+bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$EVIDENCE_DIR" lanes \
+  | jq -e '.ready == true' >/dev/null || { echo "expected a blocked marker without success evidence to remain terminal" >&2; exit 1; }
+rm -rf "$EVIDENCE_DIR"
 
 echo "smoke evidence barrier tests passed"

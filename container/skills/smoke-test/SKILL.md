@@ -107,6 +107,14 @@ bash /app/skills/smoke-test/scripts/smoke-run-scaffold.sh marker \
   <run-dir> <lane-id> <pass|fail|blocked|void|completed> '<summary>' '<evidence,paths>'
 ```
 
+`pass` is an affirmative certification, so its comma-separated evidence paths
+must name one or more nonempty, regular files already under `<run-dir>`. The
+evidence barrier verifies that invariant; a screenshot path that was never
+written, an empty placeholder, an absolute path, or a path escaping the run
+root cannot clear a lane. `fail`, `blocked`, `void`, and `completed` may record
+their concrete reason with no success evidence — do not manufacture a passing
+artifact merely to satisfy a schema.
+
 `does not hold the gate` from either verb means **this campaign is over**. Stop
 every lane, write nothing further, and do not publish — a successor run owns
 the environment.
@@ -190,6 +198,18 @@ running or failed to report; inspect it, and if you re-run it call
 `smoke-run-scaffold.sh redispatch` FIRST so its old marker cannot answer for the
 new attempt. Never infer completion
 from process age, a screenshot timestamp, a chat status, or an absent process.
+
+**Lost receipts are recovered forward, never reconstructed backward.** Preserve
+the original marker, conclusion, and timestamps. Before a replacement pass,
+redispatch the affected lane and re-run the recorded check against the frozen
+build; the fresh marker must carry its fresh, durable evidence. Write
+`coordinator/recovery-addendum.md` alongside it with the original run and
+marker, recovery start/completion timestamps, exact replayed checks, new
+evidence paths and SHA-256s, outcome, and remaining limitations. Set
+`not_backfilled: true` in the addendum's frontmatter or JSON block. If the
+frozen build is no longer available, create a new linked run instead. Never add
+evidence to an old pass marker, change its `completedAt`, or present a later
+replay as evidence gathered during the original campaign.
 
 ## Non-negotiable frontend rule
 
@@ -478,13 +498,27 @@ because it is the same failure wearing a different name:
 - **The entry goes on the report's Untested line by name** and the run is at
   most `PASS_WITH_GAPS`. Two entries blocked by the same thing are one blocker;
   name it once, as the acceptance table already requires.
-- **A blocked entry that is also past its `max_interval` is `HUMAN_DECISION`,
-  not a gap.** Nobody has proven that journey works in longer than the
-  deployment said it would tolerate, and this run cannot either — on a surface
-  that by construction moves money, destroys data, crosses an authorization
-  boundary, or is a customer's first impression. That is the "nobody knows
-  whether this is safe" case §8 reserves `HUMAN_DECISION` for, and it holds
-  promotion until a human answers.
+- **An overdue blocked entry is an owned floor-coverage breach, not an
+  automatic human-decision verdict.** Write
+  `coordinator/floor-breach-<lane-id>.json` with `floorId`, `sourceSha`,
+  `discoveredAt`, `blocker`, the entry's concrete consequence, an `owner`, a
+  safe `remediation` action and expected artifact, `affectedPromotions`, and
+  `humanDecisionRequired:false`. The coordinator assigns or starts the bounded
+  remediation: seed/fixture repair, a safe harness change, a narrowly scoped
+  code fix, or a fresh replay once the prerequisite exists. Never attempt a
+  production publish merely to force the unsafe branch.
+- **Finish `NO_GO` while the mandatory breach remains open.** This is a
+  demonstrated release-readiness deficiency, not a claim that the product has
+  a defect and not a `HUMAN_DECISION`: the existing gate therefore raises its
+  durable hold. Scope that hold to the record's `affectedPromotions`; it does
+  not block unrelated `develop` work or turn routine QA setup into a ticket for
+  a human. The breach clears only after its newly dispatched lane records a
+  fresh `pass` marker with durable evidence, never because someone relabeled it
+  or acknowledged the remediation plan.
+  `HUMAN_DECISION` remains reserved for a concrete production, privacy, money,
+  authorization, or irreversible action whose safe outcome cannot be chosen
+  from the evidence. In that case set `humanDecisionRequired:true`, name that
+  exact action, and preserve the autonomous remediation work already underway.
 
 **Checkable after the fact**, from a finished run's artifacts alone:
 
@@ -913,6 +947,15 @@ repro_steps, evidence, code_path, challenger, verdict, confidence
 A disagreement is useful evidence, not a vote. Resolve it by tracing the request,
 state transition, specification, and current source.
 
+For a bounded finding on a dev-bound build, the coordinator is the decision
+owner. It chooses and records one of: a narrow fix, a correction to an
+overstated claim or PR description, or a tracked deferral with a recommended
+default, owner, and re-entry condition. An unspecified behavior is evidence to
+reason from — current product patterns, user impact, and the frozen intent —
+not a reason to wait for a human by default. Preserve the dissent and give the
+challenger a concrete adjudication target; do not convert an ordinary severity
+or wording dispute into a release-desk question.
+
 ## 5. Escalate selectively
 
 Use one frontier adjudicator only when at least one condition holds:
@@ -922,6 +965,13 @@ Use one frontier adjudicator only when at least one condition holds:
 - business rules or source specifications conflict;
 - the fix crosses multiple subsystems or changes authorization/data semantics;
 - the proposed repair could mask the symptom without restoring the invariant.
+
+Outside those conditions, the coordinator decides the bounded disposition above
+and continues with independent verification. A human decision is required only
+when the decision itself would commit a production, privacy, money,
+authorization, or irreversible external outcome that the evidence cannot safely
+choose. It is not a substitute for an agent choosing a reversible dev remedy or
+deferral.
 
 First raise the existing frontier parent's effort: the coordinator may use Opus
 xhigh and the challenger may use Sol xhigh. If the dispute remains
@@ -987,10 +1037,15 @@ rules make it consistent with the lifecycle above:
   and awaiting verification, closed-and-marked-after-that-close means verified
   on a deployed build. Every close carries a pending verification, so a closed
   issue is never a silently erased defect.
-- **Classify regression versus gap at filing time.** A regression has evidence
-  of prior working behavior and may be fixed autonomously. A gap — behavior
-  never specified — is a product decision: mark it as such and do not hand it
-  off as fix work. If the two cannot be told apart, it is a gap.
+- **Classify regression, implementation defect, or product gap at filing
+  time.** A regression has evidence of prior working behavior; an implementation
+  defect contradicts a stated claim or existing product pattern; a gap is a
+  behavior never specified. All three may receive an autonomous bounded
+  disposition: a narrow fix, correction of an overstated claim, or tracked
+  deferral with a recommended default, owner, and re-entry condition. A gap is
+  not automatically a human decision. Escalate only when choosing the behavior
+  would commit production, privacy, money, authorization, or irreversible
+  consequences outside the evidence.
 - **A surface with no deployed-verification path stays out of the lifecycle.**
   If nothing in the environment can prove a fix for that surface reached a
   deployed build, its findings cannot reach `verified`; report them and route

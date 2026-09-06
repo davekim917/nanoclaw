@@ -109,6 +109,42 @@ require_active_run() {
   die "run '$run_id' does not hold the gate — it was reclaimed or taken over. STOP this campaign; do not write $1"
 }
 
+# A re-dispatched lane gets a newer generation before its replacement marker
+# lands. Preserve the prior raw marker at that boundary so recovering missing
+# evidence produces an auditable forward replay instead of rewriting history.
+# `ln` creates the history file atomically without overwriting one another
+# worker may already have written; the old marker and its archive remain the
+# same inode until the replacement `mv` below swaps the live path.
+archive_prior_marker_if_superseded() {
+  local marker_path="$1" current_generation="$2" prior_generation history_dir history_path
+  [ -f "$marker_path" ] || return 0
+
+  prior_generation="$(jq -r '(.generation // 1) | tostring' "$marker_path" 2>/dev/null || printf '')"
+  printf '%s' "$prior_generation" | grep -Eq '^[1-9][0-9]*$' || prior_generation=1
+  [ "$prior_generation" -lt "$current_generation" ] || return 0
+
+  history_dir="$RUN_DIR/markers/history"
+  history_path="$history_dir/$LANE.generation-$prior_generation.json"
+  mkdir -p "$history_dir"
+
+  if [ -e "$history_path" ]; then
+    cmp -s "$marker_path" "$history_path" ||
+      die "refusing to replace $marker_path: $history_path already exists with different raw evidence"
+    return 0
+  fi
+
+  if ln "$marker_path" "$history_path" 2>/dev/null; then
+    return 0
+  fi
+
+  # A concurrent recovery may have created the archive after the existence
+  # check. Accept only byte-identical history; never overwrite a disagreement.
+  if [ -e "$history_path" ] && cmp -s "$marker_path" "$history_path"; then
+    return 0
+  fi
+  die "could not atomically archive superseded marker at $history_path; refusing to replace $marker_path"
+}
+
 [ -n "$COMMAND" ] || die "usage: smoke-run-scaffold.sh <contract|marker|redispatch> <run-dir> ..."
 [ -n "$RUN_DIR" ] || die "a run directory is required"
 
@@ -256,6 +292,7 @@ marker)
   NOW="$(iso_now)"
 
   mkdir -p "$RUN_DIR/markers"
+  archive_prior_marker_if_superseded "$RUN_DIR/markers/$LANE.json" "$GENERATION"
   tmp="$(mktemp "$RUN_DIR/markers/.marker.XXXXXX")"
   jq -n \
     --arg lane "$LANE" \
