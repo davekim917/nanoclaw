@@ -61,8 +61,11 @@ import { getUserDm, upsertUserDm } from './db/user-dms.js';
  *
  * Known limitation, unchanged here: `user_dms` is keyed
  * (user_id, channel_type), not instance, so a user already cached from one
- * instance keeps that row even when a different instance asks. Widening the
- * cache key is a schema change and out of scope for this fix.
+ * instance keeps that row even when a different instance asks with no
+ * instance of its own — an unaddressed caller still gets whichever instance
+ * cached first. Widening the cache key is a schema change and out of scope
+ * for this fix. A caller that DOES name an instance, though, never receives
+ * a cached row stamped with a DIFFERENT one: see the cache-hit check below.
  */
 export async function ensureUserDm(userId: string, instance?: string): Promise<MessagingGroup | null> {
   const user = await getUser(userId);
@@ -81,12 +84,30 @@ export async function ensureUserDm(userId: string, instance?: string): Promise<M
   const cached = await getUserDm(userId, channelType);
   if (cached) {
     const mg = getMessagingGroup(cached.messaging_group_id);
-    if (mg) return mg;
-    // Row points to a deleted messaging_group — fall through and re-resolve.
-    log.warn('ensureUserDm: cached row references missing messaging_group, re-resolving', {
-      userId,
-      messagingGroupId: cached.messaging_group_id,
-    });
+    if (mg) {
+      // The cache key is (user_id, channel_type), not instance. A caller
+      // that named an instance is about to dispatch delivery on THIS row's
+      // exact instance key — handing it a row cached from a DIFFERENT
+      // instance would deliver content that originated on bot A through bot
+      // B's adapter/identity. Treat that as a miss and re-resolve on the
+      // requested instance below; the find-or-create re-caches it, so a
+      // user active on two named bots simply alternates which row is
+      // cached, always correct for whichever instance is asking. A caller
+      // that did NOT name an instance keeps today's behavior unchanged.
+      const cachedInstance = mg.instance ?? channelType;
+      if (!instance || cachedInstance === instance) return mg;
+      log.info('ensureUserDm: cached DM is on a different instance, re-resolving', {
+        userId,
+        cachedInstance,
+        requestedInstance: instance,
+      });
+    } else {
+      // Row points to a deleted messaging_group — fall through and re-resolve.
+      log.warn('ensureUserDm: cached row references missing messaging_group, re-resolving', {
+        userId,
+        messagingGroupId: cached.messaging_group_id,
+      });
+    }
   }
 
   // Cache miss: resolve the DM platform_id either via openDM or directly.

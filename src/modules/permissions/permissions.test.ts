@@ -343,6 +343,43 @@ describe('ensureUserDm', () => {
     expect(getMessagingGroup(mg!.id)?.instance).toBe('telegram-bot-a');
   });
 
+  // Codex round 1 on #465: the (user_id, channel_type) cache key ignores
+  // instance on a hit, so a caller naming instance A could be handed a row
+  // cached from instance B and then dispatch delivery — content that
+  // originated on bot A, through bot B's adapter/identity.
+  it('a cache hit on a DIFFERENT instance than requested is treated as a miss and re-resolved', async () => {
+    const mockA = await mountMockAdapter('slack', async (handle) => `dm-a-${handle}`, 'slack-bot-a');
+    await mountMockAdapter('slack', async (handle) => `dm-b-${handle}`, 'slack-bot-b');
+    await seedUser('slack:U-owner', 'slack');
+
+    // Cache the user's DM on instance B first (e.g. an earlier approval on
+    // that workspace/bot).
+    const mgB = await ensureUserDm('slack:U-owner', 'slack-bot-b');
+    expect(getMessagingGroup(mgB!.id)?.instance).toBe('slack-bot-b');
+
+    // A caller asking for instance A must NOT receive B's cached row — it
+    // must re-resolve and land on A's own row.
+    const mgA = await ensureUserDm('slack:U-owner', 'slack-bot-a');
+    expect(mgA!.id).not.toBe(mgB!.id);
+    expect(getMessagingGroup(mgA!.id)?.instance).toBe('slack-bot-a');
+    expect(mockA.openDMCalls).toEqual(['U-owner']);
+  });
+
+  // Pins case 16 (the "cacheable" gate refusal, §3.2): an unaddressed caller
+  // — no instance of its own — keeps today's behavior and still gets the
+  // cached row, whichever instance it happens to be stamped with. Only a
+  // caller that NAMES an instance gets the stricter check above.
+  it('an unaddressed caller still gets the cached row regardless of its instance', async () => {
+    await mountMockAdapter('slack', async (handle) => `dm-b-${handle}`, 'slack-bot-b');
+    await seedUser('slack:U-owner', 'slack');
+
+    const mgB = await ensureUserDm('slack:U-owner', 'slack-bot-b');
+    expect(getMessagingGroup(mgB!.id)?.instance).toBe('slack-bot-b');
+
+    const mgAgain = await ensureUserDm('slack:U-owner');
+    expect(mgAgain!.id).toBe(mgB!.id);
+  });
+
   it('returns null when the adapter is not registered', async () => {
     await seedUser('missing:42', 'missing');
     expect(await ensureUserDm('missing:42')).toBeNull();
