@@ -84,7 +84,11 @@ function resolveRelativeSpecifier(fromFile: string, specifier: string): string |
 }
 
 function bindingNameText(node: ts.PropertyName | ts.BindingName | undefined): string | null {
-  return node && ts.isIdentifier(node) ? node.text : null;
+  if (!node) return null;
+  // `import { "wakeContainer" as wake }` is valid TS (arbitrary module
+  // namespace identifier names): a string-literal name is a name too.
+  if (ts.isIdentifier(node) || ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
+  return null;
 }
 
 interface Importer {
@@ -213,6 +217,8 @@ describe('the resolver flags every import shape that can reach the binding (not 
   const cases: Array<[string, string, Importer['form']]> = [
     ['named.ts', "import { wakeContainer } from './target.js';\nwakeContainer();\n", 'static'],
     ['aliased.ts', "import { wakeContainer as w } from './target.js';\nw();\n", 'static'],
+    ['string-named.ts', 'import { "wakeContainer" as w } from \'./target.js\';\nw();\n', 'static'],
+    ['string-reexport.ts', 'export { "wakeContainer" as wake } from \'./target.js\';\n', 're-export'],
     ['namespace.ts', "import * as runner from './target.js';\nrunner.wakeContainer();\n", 'namespace'],
     ['dynamic.ts', "const { wakeContainer } = await import('./target.js');\nwakeContainer();\n", 'dynamic'],
     ['dynamic-ns.ts', "const m = await import('./target.js');\nm.wakeContainer();\n", 'dynamic-namespace'],
