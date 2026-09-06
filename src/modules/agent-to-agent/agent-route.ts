@@ -609,24 +609,42 @@ async function performAgentRoute(
     throw new GuardDenyError(reason ?? 'destination grant revoked while routing');
   };
 
-  // PROOF ONE, before the copy. Nothing has been written yet, so this refusal
-  // leaves nothing to undo. Under the lease, because the guard's reads are
-  // raw; proof TWO runs inside the writer's own block.
-  const beforeCopy = await withCentralSync(proveDestination, 'a2a.send proof before copy');
-  if (beforeCopy.effect !== 'allow') refuse(beforeCopy.reason, 'before the file copy');
-
-  // If the source message references files (via `send_file`), forward the
-  // bytes from the source's outbox into the target's inbox so the target
-  // agent can actually see and re-send them. Without this, agent-to-agent
-  // file attachments look like they arrive but the target has no way to
-  // read the bytes — they live in a session dir it doesn't mount.
-  const { content: forwardedContent, writtenPaths } = forwardFileAttachments(
-    { ...msg, content: scrubbed },
-    a2aMsgId,
-    session,
-    targetAgentGroupId,
-    targetSession.id,
-  );
+  // PROOF ONE, before the copy — and the copy itself, in the SAME leased block.
+  //
+  // Proving under the lease and copying after it is not enough (#481). The
+  // lease is released when `withCentralSync` resolves, and a revocation queued
+  // behind it commits in that gap, so the bytes land in the target's mounted
+  // inbox on a grant that no longer exists. The later writer-side proof does
+  // reject the message and `removeForwardedFiles` deletes them, but a running
+  // target container can read them first — files are a delivery whether or not
+  // an inbound row ever points at them.
+  //
+  // `forwardFileAttachments` is synchronous, so proof and effect are one turn
+  // with no window between them; `withCentralSync` refuses a thenable body, so
+  // that stays true. The cost is the lease held across a bounded copy: the
+  // attachments this one message names, already on local disk.
+  //
+  // Nothing has been written when the proof fails, so that refusal still
+  // leaves nothing to undo. Proof TWO runs inside the writer's own block.
+  const { content: forwardedContent, writtenPaths } = await withCentralSync(() => {
+    const verdict = proveDestination();
+    // Refusing inside the block is deliberate: the denial is decided on the
+    // same held lease the proof read, and `withCentralSync` releases it on the
+    // way out either way.
+    if (verdict.effect !== 'allow') return refuse(verdict.reason, 'before the file copy');
+    // If the source message references files (via `send_file`), forward the
+    // bytes from the source's outbox into the target's inbox so the target
+    // agent can actually see and re-send them. Without this, agent-to-agent
+    // file attachments look like they arrive but the target has no way to
+    // read the bytes — they live in a session dir it doesn't mount.
+    return forwardFileAttachments(
+      { ...msg, content: scrubbed },
+      a2aMsgId,
+      session,
+      targetAgentGroupId,
+      targetSession.id,
+    );
+  }, 'a2a.send proof and file copy');
 
   // Thread-history backfill, matching what a platform @mention wake gets
   // (router.ts). An a2a hand-off can land in a thread the target has never

@@ -11,6 +11,7 @@ import { createSession, updateSession } from '../../db/sessions.js';
 import { initSessionFolder, sessionDir, writeSessionMessage } from '../../session-manager.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { getRawDb } from '../../db/connection.js';
+import { RawAccessOutsideSyncBlockError, withRawDb } from '../../db/central-lease.js';
 import { SessionDbMissingError } from '../mailbox/index.js';
 import type { Session } from '../../types.js';
 
@@ -828,6 +829,52 @@ describe('routeAgentMessage return-path', () => {
     // Nothing left behind, and no row either.
     expect(inboxFiles(B, SB.id)).toEqual([]);
     expect(readPairedInboundTriggers(B, SB.id)).toHaveLength(0);
+  });
+
+  /**
+   * The proof and the bytes are ONE turn (#481).
+   *
+   * Proving under the lease and copying after it left a real window: the lease
+   * is released when `withCentralSync` resolves, and a revocation queued behind
+   * it commits in that gap, so the bytes land in a mounted inbox on a grant that
+   * no longer exists. The later writer-side proof does refuse and the files are
+   * removed, but a running target container can read them first.
+   *
+   * Probed by what only holding the lease makes possible: raw central access is
+   * an error outside a sync block (`RawAccessOutsideSyncBlockError`), so a
+   * successful raw read from inside the copy proves no other writer could have
+   * committed between the proof and these bytes.
+   */
+  it('copies the bytes inside the same leased block that proved the grant (#481)', async () => {
+    const outboxDir = path.join(sessionDir(A, S1.id), 'outbox', 'msg-copy-under-lease');
+    fs.mkdirSync(outboxDir, { recursive: true });
+    fs.writeFileSync(path.join(outboxDir, 'report.pdf'), 'fake-pdf-bytes');
+
+    let leaseHeldDuringCopy: boolean | null = null;
+    duringFileCopy.run = () => {
+      try {
+        withRawDb((raw) => raw.prepare('SELECT 1 AS ok').get());
+        leaseHeldDuringCopy = true;
+      } catch (err) {
+        if (!(err instanceof RawAccessOutsideSyncBlockError)) throw err;
+        leaseHeldDuringCopy = false;
+      }
+    };
+
+    await routeAgentMessage(
+      {
+        id: 'msg-copy-under-lease',
+        platform_id: B,
+        content: JSON.stringify({ text: 'see attached', files: ['report.pdf'] }),
+        in_reply_to: null,
+      },
+      S1,
+    );
+
+    expect(leaseHeldDuringCopy).toBe(true);
+    // And the route still delivers when nothing is revoked.
+    expect(inboxFiles(B, SB.id).map((file) => path.basename(file))).toEqual(['report.pdf']);
+    expect(readPairedInboundTriggers(B, SB.id)).toHaveLength(1);
   });
 
   it('file forwarding: skips symlinked source files', async () => {
