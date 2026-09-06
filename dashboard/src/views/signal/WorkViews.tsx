@@ -298,8 +298,8 @@ export function ThreadWorkspace({
     { refreshInterval: 30000 },
   );
   const { data: context, error: contextError, mutate: refreshContext } = useSWR(
-    selectedId ? ['work-thread-context', authMe.user_id, selectedId] : null,
-    () => getSignalThreadContext(selectedId!),
+    selectedId ? ['work-thread-context', authMe.user_id, workgroup, selectedId] : null,
+    () => getSignalThreadContext(selectedId!, workgroup),
     { refreshInterval: 30000 },
   );
   const [tab, setTab] = useState<'context' | 'conversation'>('context');

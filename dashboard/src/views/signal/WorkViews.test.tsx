@@ -116,7 +116,39 @@ describe('work-first interaction', () => {
     </SWRConfig>);
     expect(await screen.findByText('Exact mapped objective')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /Question off-page/ })).toBeInTheDocument();
-    expect(signalApi.getSignalThreadContext).toHaveBeenCalledWith('t1');
+    expect(signalApi.getSignalThreadContext).toHaveBeenCalledWith('t1', 'all');
+  });
+
+  it('refetches exact context when the workspace changes for the same thread', async () => {
+    vi.mocked(signalApi.getSignalThreadContext).mockImplementation(async (_id, workgroup) => ({
+      as_of: '2026-09-06T00:00:00Z', workgroups: [], projects: [],
+      decisions: [decision(workgroup, { workgroup_id: workgroup })],
+      agents: [], activity: [], sources: [], capabilities: { manage_projects: false },
+    }));
+    const cache = new Map();
+    const view = (workgroup: string) => <SWRConfig value={{ provider: () => cache }}>
+      <ThreadWorkspace authMe={authMe} workgroup={workgroup} query="" id="t1" overview={undefined} />
+    </SWRConfig>;
+    const rendered = render(view('workspace-one'));
+    expect(await screen.findByText('Question workspace-one')).toBeInTheDocument();
+    rendered.rerender(view('workspace-two'));
+    expect(await screen.findByText('Question workspace-two')).toBeInTheDocument();
+    expect(screen.queryByText('Question workspace-one')).toBeNull();
+    expect(signalApi.getSignalThreadContext).toHaveBeenLastCalledWith('t1', 'workspace-two');
+  });
+
+  it('encodes the selected workspace in the exact context request', async () => {
+    const actual = await vi.importActual<typeof signalApi>('../../lib/signal-api.js');
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{}'));
+    try {
+      await actual.getSignalThreadContext('thread/one', 'workspace/one');
+      expect(fetch).toHaveBeenCalledWith(
+        '/dashboard/api/observatory/v2?workgroup=workspace%2Fone&thread_id=thread%2Fone',
+        expect.objectContaining({ method: 'GET' }),
+      );
+    } finally {
+      fetch.mockRestore();
+    }
   });
 
   it.each(['request failure', 'unavailable source', 'healthy empty source'] as const)(
