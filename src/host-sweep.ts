@@ -43,7 +43,13 @@ import {
 import type { HostWorkContinuation } from './modules/mailbox/ops/continuation.js';
 import { log } from './log.js';
 import { withExistingMailboxSession } from './session-manager.js';
-import { getActiveContainerSessionIds, isContainerRunning, containerOwnsOutbound } from './container-runner.js';
+import {
+  containerIdentityFor,
+  getActiveContainerSessionIds,
+  isContainerRunning,
+  containerOwnsOutbound,
+  type ContainerIdentity,
+} from './container-runner.js';
 import type { Session } from './types.js';
 
 /**
@@ -265,6 +271,12 @@ export interface ContainerObservation {
   processingClaimCount: number;
   lastOutboundAtMs: number | null;
   lastInboundAtMs: number | null;
+  /**
+   * WHICH container the state above is about, read in the same turn so a duty
+   * can tell it apart from a replacement registered while the duty awaited
+   * (#505). Null when nothing is registered.
+   */
+  containerIdentity: ContainerIdentity | null;
 }
 
 /**
@@ -1337,6 +1349,7 @@ async function sweepSession(session: Session, tick: SweepTickContext): Promise<n
             processingClaimCount: m.getProcessingClaimRows().length,
             lastOutboundAtMs: getLastOutboundAtMs(m),
             lastInboundAtMs: getLastInboundAtMs(m),
+            containerIdentity: containerIdentityFor(session.id),
           })),
         )) ?? null;
 

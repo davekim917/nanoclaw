@@ -26,13 +26,16 @@ import { resolveSpawnProvider } from '../../provider-fallback.js';
 import { OomKillObserver } from '../../resource-oom-observer.js';
 import { heartbeatPath } from '../../session-manager.js';
 import {
+  containerIdentityFor,
   getContainerSpawnedAt,
   isAdoptedContainer,
   isContainerRunning,
   isContainerSpawning,
   killContainer,
+  sameContainerIdentity,
   sessionStillActive,
   containerOwnsOutbound,
+  type ContainerIdentity,
 } from '../../container-runner.js';
 import { requestWake } from '../../request-wake.js';
 import { log } from '../../log.js';
@@ -149,7 +152,8 @@ async function applyProviderHeal(
   session: Session,
   agentGroupFolder: string,
   containerState: ContainerState | null,
-): Promise<void> {
+  target: ContainerIdentity | null,
+): Promise<'healed' | 'stale-target'> {
   const failureReason = containerState?.provider_failure_reason ?? null;
   let primaryProvider: string | null = null;
   let routedTo: string | null = null;
@@ -174,6 +178,24 @@ async function applyProviderHeal(
     log.warn('self-heal: provider routing lookup failed — respawning as configured', { sessionId: session.id, err });
   }
 
+  // The last provider await is above. Everything the heal decided was proven
+  // against the container `target` names, and provider resolution, the health
+  // write and this mailbox open have all yielded since. If the original exited
+  // and a wake registered a replacement in that window, the marker below would
+  // be charged to a healthy container and the kill would take it down (#478).
+  // Refuse instead: no marker, no kill, full attempt budget kept for a failure
+  // that is still real.
+  const registered = containerIdentityFor(session.id);
+  if (identityChanged(registered, target)) {
+    log.info('self-heal: heal target was replaced before the marker — refusing', {
+      class: 'failed-provider',
+      sessionId: session.id,
+      expected: target?.containerName ?? null,
+      registered: registered?.containerName ?? null,
+    });
+    return 'stale-target';
+  }
+
   const routedNote =
     routedTo && primaryProvider && routedTo !== primaryProvider ? `; this session is now running on ${routedTo}` : '';
   writeSystemWake(
@@ -195,6 +217,7 @@ async function applyProviderHeal(
     routedTo,
     failureReason,
   });
+  return 'healed';
 }
 
 /**
@@ -206,8 +229,24 @@ async function applyProviderHeal(
  * either from inside a session would trip the same-key nesting guard
  * (invariant I-3); the wake row is already durable by the time we get here,
  * which is the ordering the heal has always relied on.
+ *
+ * Identity-fenced on `target`, the container the heal was decided against. The
+ * mailbox close between the marker and this call is one more yield, and
+ * `killContainer` kills whichever container is registered — so without the
+ * fence a replacement spawned in that window is killed and its work reported
+ * lost (#478). Same fence `finalizeSession` applies to a late terminal event.
  */
-function killForProviderHeal(session: Session): void {
+function killForProviderHeal(session: Session, target: ContainerIdentity | null): void {
+  const registered = containerIdentityFor(session.id);
+  if (identityChanged(registered, target)) {
+    log.info('self-heal: heal target was replaced before the kill — leaving the live container alone', {
+      class: 'failed-provider',
+      sessionId: session.id,
+      expected: target?.containerName ?? null,
+      registered: registered?.containerName ?? null,
+    });
+    return;
+  }
   killContainer(
     session.id,
     'provider-failed-selfheal',
@@ -287,6 +326,25 @@ export function notifyProviderHealParked(
  * inside the central lease; the caller takes the lease around this whole check
  * (seam 3 §4.5 I-1).
  */
+/**
+ * Did the registry move to a DIFFERENT container?
+ *
+ * Absence is not change. A null on either side means "this host has no identity
+ * for the session", which is the state every pre-#478 check already handled on
+ * its own — `providerHealTargetUnavailableReason` for a container that is gone,
+ * and `killContainer` itself, which is a no-op when nothing is registered. A
+ * fence that refused on null would instead disable the whole self-heal wherever
+ * an identity is unavailable, which is a silent feature outage rather than a
+ * safety property.
+ *
+ * So this answers only the question the fences exist for: two identities, both
+ * present, naming different containers.
+ */
+function identityChanged(a: ContainerIdentity | null, b: ContainerIdentity | null): boolean {
+  if (!a || !b) return false;
+  return !sameContainerIdentity(a, b);
+}
+
 function providerHealTargetUnavailableReason(sessionId: string): string | null {
   const liveness = sessionStillActive(sessionId)();
   if (liveness !== true) return typeof liveness === 'object' ? liveness.reason : 'session is not wakeable';
@@ -308,6 +366,7 @@ async function sweepProviderHeal(
   session: Session,
   agentGroupFolder: string,
   containerState: ContainerState | null,
+  observedContainer: ContainerIdentity | null,
   writeParkedMessage?: Parameters<typeof notifyProviderHealParked>[3],
 ): Promise<boolean> {
   const providerStatus = containerState?.provider_status ?? null;
@@ -357,8 +416,16 @@ async function sweepProviderHeal(
   // attempt and returned `true`, so the chain stopped. Claiming the slot keeps
   // that behaviour exactly and drops only the wasted attempt, which is the
   // whole point of the fix.
-  const unavailable = await withCentralSync(
-    () => providerHealTargetUnavailableReason(session.id),
+  //
+  // The guard's own identity snapshot is taken in the SAME synchronous block:
+  // it names the container every decision below was proven against, so a
+  // replacement registered across any later await is refused rather than
+  // charged and killed (#478).
+  const { unavailable, registered } = await withCentralSync(
+    () => ({
+      unavailable: providerHealTargetUnavailableReason(session.id),
+      registered: containerIdentityFor(session.id),
+    }),
     'provider-heal target check',
   );
   if (unavailable) {
@@ -369,12 +436,36 @@ async function sweepProviderHeal(
     return true;
   }
 
+  // The DECISION is only valid for the container it was made about (#505 round
+  // 2). `decision` rests on the `failed` state W3 read, and the budget open
+  // above has yielded since: if that container exited and a wake registered a
+  // replacement, the registry now names a HEALTHY container, and a fence that
+  // re-read it here would compare that replacement against itself and pass. So
+  // the comparison is against the identity paired with the observation.
+  if (identityChanged(registered, observedContainer)) {
+    log.info(`self-heal: ${decision} target was replaced since the health observation — refusing`, {
+      ...bounds,
+      observed: observedContainer?.containerName ?? null,
+      registered: registered?.containerName ?? null,
+    });
+    return true;
+  }
+  const target = observedContainer ?? registered;
+
   if (decision === 'park') {
     // Kill first, then post: outbound.db has exactly one writer, and the
     // container must be confirmed stopped before the host writes to it (same
     // ordering as the kill-ceiling notice). No onExit — parked means no
     // respawn until real inbound resets the budget.
     log.warn('self-heal: provider heal budget exhausted — parking', bounds);
+    // Fenced like the heal kill: `killContainer` kills whichever container is
+    // registered, and the park path reaches it through the same stale-decision
+    // window. Re-checked here rather than trusting the check above, because a
+    // replacement can still land between them.
+    if (identityChanged(containerIdentityFor(session.id), target)) {
+      log.info('self-heal: park target was replaced before the kill — leaving the live container alone', bounds);
+      return true;
+    }
     killContainer(session.id, 'provider-failed-selfheal-parked');
     try {
       await run((mailbox) =>
@@ -401,12 +492,13 @@ async function sweepProviderHeal(
 
   // Wake row first (durably counted even if the kill fizzles), session closed,
   // then the kill and its respawn.
-  const wrote = await run(async (mailbox) => {
-    await applyProviderHeal(mailbox, session, agentGroupFolder, containerState);
-    return true;
-  });
-  if (!wrote) return false;
-  killForProviderHeal(session);
+  const outcome = await run((mailbox) => applyProviderHeal(mailbox, session, agentGroupFolder, containerState, target));
+  if (outcome === undefined) return false;
+  // A refused heal still claims the exclusive phase, for the same reason the
+  // target check above does: the branches below would act on the observation
+  // that brought us here, which named a container that is no longer registered.
+  if (outcome === 'stale-target') return true;
+  killForProviderHeal(session, target);
   return true;
 }
 
@@ -417,12 +509,17 @@ export function _sweepProviderHealForTesting(
   agentGroupFolder: string,
   containerState: ContainerState | null,
   writeParkedMessage?: Parameters<typeof notifyProviderHealParked>[3],
+  // Defaulted so the existing cases read unchanged: production pairs this with
+  // the health observation, and a case that does not care about the pairing
+  // gets whatever is registered when it calls, which is the same container.
+  observedContainer: ContainerIdentity | null = containerIdentityFor(session.id),
 ): Promise<boolean> {
   return sweepProviderHeal(
     async (action) => action(mailbox),
     session,
     agentGroupFolder,
     containerState,
+    observedContainer,
     writeParkedMessage,
   );
 }
@@ -851,7 +948,13 @@ export function registerContainerHealthSweepDuties(): void {
     // below have nothing left to decide this tick — which is exactly the
     // `claims()` contract of an exclusive phase.
     claims: (ctx) =>
-      sweepProviderHeal(ctx.run, ctx.session, ctx.agentGroupFolder, ctx.observed?.containerState ?? null),
+      sweepProviderHeal(
+        ctx.run,
+        ctx.session,
+        ctx.agentGroupFolder,
+        ctx.observed?.containerState ?? null,
+        ctx.observed?.containerIdentity ?? null,
+      ),
     run: (ctx) => {
       log.debug('Provider self-heal handled this tick — skipping reap/SLA checks', {
         sessionId: asSessionContext(ctx).session.id,

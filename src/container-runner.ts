@@ -812,6 +812,36 @@ export function isContainerRunning(sessionId: string): boolean {
   return activeContainers.has(sessionId);
 }
 
+/**
+ * Which container is registered for this session RIGHT NOW.
+ *
+ * `isContainerRunning` answers "is there one", which is not enough for a
+ * caller that decided something about a specific container and then awaited:
+ * the original can exit and a wake can register a replacement in that window,
+ * and the boolean reads the same either way. The name is unique per spawn
+ * (`${prefix}${folder}-${Date.now()}`) and the claim incarnation moves with the
+ * runtime, so the pair identifies the entry across a replacement.
+ *
+ * Compare with `sameContainerIdentity`, never by object identity: this is a
+ * snapshot, not the registry entry.
+ */
+export interface ContainerIdentity {
+  containerName: string;
+  claimIncarnation: number | undefined;
+}
+
+export function containerIdentityFor(sessionId: string): ContainerIdentity | null {
+  const entry = activeContainers.get(sessionId);
+  if (!entry) return null;
+  return { containerName: entry.containerName, claimIncarnation: entry.claimIncarnation };
+}
+
+/** Same registered container? Null on either side is "no identity", never a match. */
+export function sameContainerIdentity(a: ContainerIdentity | null, b: ContainerIdentity | null): boolean {
+  if (!a || !b) return false;
+  return a.containerName === b.containerName && a.claimIncarnation === b.claimIncarnation;
+}
+
 export function isContainerSpawning(sessionId: string): boolean {
   return spawningSessions.has(sessionId) || wakePromises.has(sessionId);
 }

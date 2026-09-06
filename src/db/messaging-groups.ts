@@ -373,11 +373,27 @@ export async function createMessagingGroupAgent(mga: MessagingGroupAgent): Promi
   // after its wiring row had already committed. `ensureAgentDestinationForWiring`
   // is DB-only (driver statements in sequence), which is what lets it sit in
   // the closure — the same shape `cli/resources/wirings.ts` already uses.
-  await centralTransaction(async () => {
-    await assertSameWorkgroupWiring(mga.messaging_group_id, mga.agent_group_id);
-    await insertMessagingGroupAgentRow(mga);
-    await ensureAgentDestinationForWiring(mga);
-  }, 'createMessagingGroupAgent');
+  await centralTransaction(() => createMessagingGroupAgentInTransaction(mga), 'createMessagingGroupAgent');
+}
+
+/**
+ * The same three statements, for a caller that ALREADY holds the lease.
+ *
+ * `centralTransaction` refuses to nest — `assertLeaseNotHeld` throws
+ * `CentralLeaseReentrancyError` — so a caller that opened its own transaction
+ * to keep a proof and this insert in one turn cannot go through the wrapper
+ * above. It calls this instead, and the wrapper stays the entry point for
+ * everyone outside a transaction, so there is one copy of the statements.
+ *
+ * DB-only, like `ensureAgentDestinationForWiring`: driver statements awaited in
+ * sequence, nothing else (plan §4.4). Callers: `createMessagingGroupAgent`
+ * above, and the router's workspace-trust auto-wire, which proves workspace
+ * uniqueness in the same transaction (#482).
+ */
+export async function createMessagingGroupAgentInTransaction(mga: MessagingGroupAgent): Promise<void> {
+  await assertSameWorkgroupWiring(mga.messaging_group_id, mga.agent_group_id);
+  await insertMessagingGroupAgentRow(mga);
+  await ensureAgentDestinationForWiring(mga);
 }
 
 async function insertMessagingGroupAgentRow(mga: MessagingGroupAgent): Promise<void> {
