@@ -300,24 +300,27 @@ describe('create_room', () => {
     ).toEqual(['ag-caller', 'ag-mate']);
   });
 
-  it('adopts a room it already has under that name instead of dying on Slack name_taken', async () => {
+  it('resumes only the channel THIS caller left half-built, keyed on a marker not a name', async () => {
     await getDb().run(
       `INSERT INTO container_configs (agent_group_id, cli_scope, updated_at) VALUES (?, 'global', ?)`,
       'ag-caller',
       now(),
     );
-    // Residue of a run that created the channel and wired the caller, then
-    // failed. conversations.create would answer name_taken forever.
-    await wire('mg-half', 'slack-alpha', 'slack:CHALF', 'ops-room', 1, 'ag-caller');
+    // A run that got as far as conversations.create and then died: the marker
+    // is the only record that the channel is ours and unfinished.
+    await getDb().run(
+      `INSERT INTO slack_room_creations (platform_id, room_key, room_name, agent_group_id, request_id, created_at)
+         VALUES ('slack:CHALF', 'ops-room', 'ops-room', 'ag-caller', NULL, ?)`,
+      now(),
+    );
 
     await getDeliveryAction('create_room')!(
-      { action: 'create_room', name: 'ops-room', agents: ['mate'] },
+      { action: 'create_room', name: 'Ops Room', agents: ['mate'] },
       callerSession,
     );
 
     expect(createConversationMock).not.toHaveBeenCalled();
     expect(inviteUsersMock).toHaveBeenCalledWith('slack-alpha', 'CHALF', ['UBETA', 'UOWNER']);
-    // The missing participant's row is now there; the caller's is adopted.
     expect(
       (
         await getDb().all<MessagingGroup>(
@@ -325,23 +328,67 @@ describe('create_room', () => {
         )
       ).map((r) => r.channel_type),
     ).toEqual(['slack-alpha', 'slack-beta']);
-    expect(lastNotice()).toMatch(/already existed/);
+    expect(lastNotice()).toMatch(/earlier attempt/);
+    // Finished, so the marker is gone and a later run starts clean.
+    expect(await getDb().get(`SELECT platform_id FROM slack_room_creations`)).toBeUndefined();
   });
 
-  it('reports a Slack channel it cannot adopt rather than telling the agent to retry', async () => {
+  it('never adopts a same-named channel it has no marker for, however it is wired', async () => {
     await getDb().run(
       `INSERT INTO container_configs (agent_group_id, cli_scope, updated_at) VALUES (?, 'global', ?)`,
       'ag-caller',
       now(),
     );
+    // An established room of the sibling's that merely shares the name.
+    // Adopting it would put the named agents into its existing history.
+    await wire('mg-sib-room', 'slack-beta', 'slack:CSIBROOM', 'ops-room', 1, 'ag-mate');
     createConversationMock.mockImplementationOnce(async () => {
       throw new Error('slack conversations.create failed: name_taken');
     });
 
-    await getDeliveryAction('create_room')!({ action: 'create_room', name: 'ops', agents: ['mate'] }, callerSession);
+    await getDeliveryAction('create_room')!(
+      { action: 'create_room', name: 'ops-room', agents: ['mate'] },
+      callerSession,
+    );
 
-    expect(lastNotice()).toMatch(/not wired to you/);
-    expect(lastNotice()).toMatch(/different name/);
+    expect(inviteUsersMock).not.toHaveBeenCalled();
+    expect(
+      await getDb().get(
+        `SELECT id FROM messaging_groups WHERE platform_id = 'slack:CSIBROOM' AND channel_type = 'slack-alpha'`,
+      ),
+    ).toBeUndefined();
+    expect(lastNotice()).toMatch(/existing history/);
+  });
+
+  it('records the marker before it invites, so a failure mid-run is resumable', async () => {
+    await getDb().run(
+      `INSERT INTO container_configs (agent_group_id, cli_scope, updated_at) VALUES (?, 'global', ?)`,
+      'ag-caller',
+      now(),
+    );
+    inviteUsersMock.mockImplementationOnce(async () => {
+      throw new Error('slack conversations.invite failed: ratelimited');
+    });
+
+    await getDeliveryAction('create_room')!(
+      { action: 'create_room', name: 'Ops Room', agents: ['mate'] },
+      callerSession,
+    );
+    expect(lastNotice()).toMatch(/ratelimited/);
+    expect(await getDb().get<{ platform_id: string }>(`SELECT platform_id FROM slack_room_creations`)).toMatchObject({
+      platform_id: 'slack:CROOM1',
+    });
+
+    // The re-run finishes it instead of dying on name_taken.
+    createConversationMock.mockImplementationOnce(async () => {
+      throw new Error('slack conversations.create failed: name_taken');
+    });
+    await getDeliveryAction('create_room')!(
+      { action: 'create_room', name: 'Ops Room', agents: ['mate'] },
+      callerSession,
+    );
+    expect(inviteUsersMock).toHaveBeenLastCalledWith('slack-alpha', 'CROOM1', ['UBETA', 'UOWNER']);
+    expect(await getDb().get(`SELECT platform_id FROM slack_room_creations`)).toBeUndefined();
   });
 
   it('applies the purpose it promised, and says so when Slack refuses it', async () => {

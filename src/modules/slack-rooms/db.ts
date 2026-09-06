@@ -20,6 +20,45 @@ import { getDb } from '../../db/connection.js';
 import type { MessagingGroup } from '../../types.js';
 
 /**
+ * An in-flight `create_room`: this caller created this Slack channel for this
+ * room name and has not finished wiring it. Migration 074 explains why a name
+ * collision alone is not allowed to stand in for this evidence.
+ */
+export interface SlackRoomCreation {
+  platform_id: string;
+  room_key: string;
+  room_name: string;
+  agent_group_id: string;
+  request_id: string | null;
+  created_at: string;
+}
+
+/** Record a channel the moment Slack returns it, before anything else runs. */
+export async function recordRoomCreation(row: SlackRoomCreation): Promise<void> {
+  await getDb().run(
+    `INSERT INTO slack_room_creations (platform_id, room_key, room_name, agent_group_id, request_id, created_at)
+       VALUES (@platform_id, @room_key, @room_name, @agent_group_id, @request_id, @created_at)
+     ON CONFLICT(platform_id) DO NOTHING`,
+    row,
+  );
+}
+
+/** The unfinished channel this caller left under this room key, if any. */
+export async function findRoomCreation(agentGroupId: string, roomKey: string): Promise<SlackRoomCreation | undefined> {
+  return getDb().get<SlackRoomCreation>(
+    'SELECT * FROM slack_room_creations WHERE agent_group_id = ? AND room_key = ?',
+    agentGroupId,
+    roomKey,
+  );
+}
+
+/** Drop the marker once the room is fully wired — it is only ever evidence of
+ *  an UNFINISHED create. */
+export async function clearRoomCreation(platformId: string): Promise<void> {
+  await getDb().run('DELETE FROM slack_room_creations WHERE platform_id = ?', platformId);
+}
+
+/**
  * Every Slack group messaging-group row the caller may name, one row per
  * participating bot channel type (the fork keeps a row per bot for one
  * conversation, so a single room appears here as several rows sharing a
