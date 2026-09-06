@@ -17,7 +17,7 @@ import { createAgentGroup, getAgentGroup, getAgentGroupByFolder, getAllAgentGrou
 import { getDb } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
 import { requestWake } from '../../request-wake.js';
-import { groupFolderExistsOnDisk } from '../../group-folder.js';
+import { assertValidGroupFolder, groupFolderExistsOnDisk } from '../../group-folder.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { updateContainerConfig } from '../../container-config.js';
 import { log } from '../../log.js';
@@ -210,6 +210,12 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
       folder = `${localName}-${suffix}`;
       suffix++;
     }
+    // The suffix can push a 63/64-char name past the folder grammar. A DB-row
+    // collision is caught by the prefix guard below (the row's token is a
+    // prefix of ours), but disk-only residue has no row, so validate the
+    // generated name explicitly rather than persist a folder every provider
+    // spawn will refuse (assertValidGroupFolder, src/group-folder.ts).
+    assertValidGroupFolder(folder);
 
     // SECURITY (cross-tenant audit 2026-05-03): folder-name prefix collision
     // would let scoped-env env-var matching cross-leak (e.g. folder=example-agent

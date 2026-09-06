@@ -292,6 +292,23 @@ describe('folder-residue dedupe', () => {
     expect(row).toBeDefined();
   });
 
+  it('refuses a suffixed folder that the residue pushes past the folder grammar (64 chars)', async () => {
+    // A 63-char name normalizes to a 63-char folder; disk-only residue on it
+    // would mint `<name>-2` (65 chars), which every provider spawn refuses
+    // via assertValidGroupFolder. A DB-row collision is caught by the prefix
+    // guard, disk residue has no row — so the generated name is validated.
+    const longName = 'a'.repeat(63);
+    fs.mkdirSync(path.join(TEST_GROUPS_DIR, longName), { recursive: true });
+
+    const session = makeSession();
+    await expect(runCreateAgent({ requestId: 'r6', name: longName, instructions: 'help' }, session)).rejects.toThrow(
+      /Invalid group folder/,
+    );
+
+    expect(await getAgentGroupByFolder(`${longName}-2`)).toBeUndefined();
+    expect(fs.existsSync(path.join(TEST_GROUPS_DIR, `${longName}-2`))).toBe(false);
+  });
+
   // A folder already claimed by a DB row is unaffected by this change: the
   // `getAgentGroupByFolder(folder)` disjunct alone is already true, so
   // `groupFolderExistsOnDisk` never runs. That path (and the existing
