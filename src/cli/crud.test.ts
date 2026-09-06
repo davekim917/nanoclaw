@@ -307,3 +307,49 @@ describe('genericCreate natural-key lookup — NULL matching (case 15)', () => {
     expect(b.id).not.toBe(a.id);
   });
 });
+
+describe('genericList coerceListFilter (cases 16, 17)', () => {
+  beforeEach(() => {
+    getRawDb().exec(
+      `CREATE TABLE crudtest_rows (
+         id TEXT PRIMARY KEY, scope TEXT, name TEXT NOT NULL,
+         enabled INTEGER, score INTEGER, payload TEXT, created_at TEXT NOT NULL
+       )`,
+    );
+  });
+
+  it('a boolean list filter matches integer storage (case 16)', async () => {
+    // Values arrive as strings from argv, same as any other CLI flag — the
+    // boolean coercion genericCreate does on write is unchanged by this PR;
+    // seed the rows directly so this test isolates `list`'s read-side
+    // coercion (case 16).
+    getRawDb()
+      .prepare('INSERT INTO crudtest_rows (id, name, enabled, created_at) VALUES (?, ?, ?, ?)')
+      .run('row-a', 'a', 1, new Date().toISOString());
+    getRawDb()
+      .prepare('INSERT INTO crudtest_rows (id, name, enabled, created_at) VALUES (?, ?, ?, ?)')
+      .run('row-b', 'b', 0, new Date().toISOString());
+    const rows = (await lookup('crudtests-list')!.handler({ enabled: 'true' }, hostCtx)) as { name: string }[];
+    expect(rows.map((r) => r.name)).toEqual(['a']);
+  });
+
+  it('a numeric list filter rejects a non-number (case 17)', async () => {
+    await lookup('crudtests-create')!.handler({ name: 'a', score: 5 }, hostCtx);
+    await expect(lookup('crudtests-list')!.handler({ score: 'not-a-number' }, hostCtx)).rejects.toThrow(
+      'must be a number',
+    );
+  });
+
+  it('a numeric list filter matches on the coerced number (case 17)', async () => {
+    await lookup('crudtests-create')!.handler({ name: 'a', score: 5 }, hostCtx);
+    await lookup('crudtests-create')!.handler({ name: 'b', score: 9 }, hostCtx);
+    const rows = (await lookup('crudtests-list')!.handler({ score: '5' }, hostCtx)) as { name: string }[];
+    expect(rows.map((r) => r.name)).toEqual(['a']);
+  });
+
+  it('a json list filter serializes the filter value (case 17)', async () => {
+    await lookup('crudtests-create')!.handler({ name: 'a', payload: '{"k":1}' }, hostCtx);
+    const rows = (await lookup('crudtests-list')!.handler({ payload: '{"k":1}' }, hostCtx)) as { name: string }[];
+    expect(rows.map((r) => r.name)).toEqual(['a']);
+  });
+});
