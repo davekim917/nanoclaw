@@ -399,6 +399,24 @@ describe('T5 PR 3 — the plugin reader and the stamp path', () => {
     }
   });
 
+  it('scans the whole document, including entries no reader recognises (#500 round 7)', () => {
+    // The unit that must be proven credential-free is the FILE, because the
+    // file is what gets copied into the agent's plugins/ mount. A bare-string
+    // entry is skipped by every reader and still ships.
+    for (const servers of [
+      { crm: 'sk-live-AbC123RealLooking' },
+      { crm: ['sk-live-AbC123RealLooking'] },
+      { crm: { type: 'stdio', command: 'server' }, junk: { nested: { deep: 'sk-live-AbC123RealLooking' } } },
+    ]) {
+      writeManifest();
+      fs.writeFileSync(
+        path.join(PLUGIN_DIR, 'mcp.json'),
+        JSON.stringify({ $schema: MCP_SCHEMA_URL, mcpServers: servers }),
+      );
+      expect(() => parseTemplate(PLUGIN_DIR)).toThrow(/looks like a real credential/);
+    }
+  });
+
   it('the documented mcp.json examples parse and stamp (#500 round 4)', () => {
     // The authoring examples are executable here, so a doc that drifts from
     // the reader's requirements fails the suite instead of a user's stamp.

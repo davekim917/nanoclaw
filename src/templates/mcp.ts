@@ -127,7 +127,7 @@ export function readPluginMcp(pluginDir: string): { servers: Record<string, Pars
   // credential sitting in a well-formed entry under a wrong `$schema` or an
   // unknown top-level key would have reached the agent unlinted (Codex on
   // #500). The severity belongs to the credential, whatever else is malformed.
-  lintServerCredentials(raw.mcpServers, report);
+  lintDocumentCredentials(raw, report);
 
   if (raw.$schema !== MCP_SCHEMA_URL) {
     report.push(`mcp.json: $schema must be "${MCP_SCHEMA_URL}"; MCP component skipped`);
@@ -159,38 +159,41 @@ export function readPluginMcp(pluginDir: string): { servers: Record<string, Pars
 }
 
 /**
- * Lint every entry's raw `env`/`headers` for smuggled credentials, whatever
- * else is wrong with the file. Throws (whole-plugin rejection) on a real
- * credential; ordinary shape problems are left to the callers below.
+ * Lint the WHOLE parsed mcp.json for smuggled credentials before anything
+ * decides to skip part of it. Throws (whole-plugin rejection) on a real
+ * credential; shape problems are left to the readers below.
+ *
+ * Scanning the document rather than a walk of the entries it recognises is the
+ * point. Every earlier version of this scan inspected a SUBSET — first two
+ * fields, then every field of every object entry — and each subset had an edge
+ * just outside it that still shipped: a credential in `args`, a header scheme
+ * off the list, a bare string entry (`"crm": "sk-live-…"`). The file is copied
+ * verbatim into the agent-readable `groups/<folder>/plugins/<name>` mount, so
+ * the unit that must be proven credential-free is the file (#500 rounds 2-7).
  */
-function lintServerCredentials(mcpServers: unknown, report: string[]): void {
-  if (!isPlainObject(mcpServers)) return;
-  for (const [name, entry] of Object.entries(mcpServers)) {
-    if (!isPlainObject(entry)) continue;
-    for (const kind of ['env', 'headers'] as const) {
-      // A value the lint cannot read is unlintable, not absent: `env:
-      // { API_KEY: { value: "sk-live-…" } }` would otherwise pass, fail the
-      // shape check later, and still ship inside the copied plugin.
-      assertLintableValues(name, kind, entry[kind]);
+function lintDocumentCredentials(raw: Record<string, unknown>, report: string[]): void {
+  const servers = raw.mcpServers;
+  if (isPlainObject(servers)) {
+    for (const [name, entry] of Object.entries(servers)) {
+      if (!isPlainObject(entry)) continue;
+      // A value the lint cannot read is unlintable, not absent.
+      for (const kind of ['env', 'headers'] as const) assertLintableValues(name, kind, entry[kind]);
     }
-    // EVERY string in the entry, not an enumerated field list. `args`
-    // (`["--token", "sk-live-…"]`) reached container.json and the copied
-    // mcp.json while only env and headers were scanned (Codex on #500 round
-    // 6); enumerating one more field each round is how that recurs. The whole
-    // entry ships, so the whole entry is scanned.
-    for (const [where, value] of entryStrings(entry)) lintSecrets(name, where, value, report);
+  }
+  for (const [where, value] of entryStrings(servers, 'mcpServers')) {
+    lintSecrets(where.split('.')[1] ?? 'mcp.json', where, value, report);
   }
 }
 
 /**
- * Every string anywhere in a server entry, paired with a dotted path naming
- * where it came from (`args[0]`, `env.API_KEY`, `headers.Authorization`).
+ * Every string anywhere under a value, paired with a dotted path naming where
+ * it came from (`mcpServers.crm.args[0]`, `mcpServers.crm.env.API_KEY`).
  */
-function entryStrings(entry: unknown, prefix = ''): [string, string][] {
-  if (typeof entry === 'string') return [[prefix || 'value', entry]];
-  if (Array.isArray(entry)) return entry.flatMap((item, i) => entryStrings(item, `${prefix}[${i}]`));
-  if (isPlainObject(entry)) {
-    return Object.entries(entry).flatMap(([key, value]) => entryStrings(value, prefix ? `${prefix}.${key}` : key));
+function entryStrings(value: unknown, prefix = ''): [string, string][] {
+  if (typeof value === 'string') return [[prefix || 'value', value]];
+  if (Array.isArray(value)) return value.flatMap((item, i) => entryStrings(item, `${prefix}[${i}]`));
+  if (isPlainObject(value)) {
+    return Object.entries(value).flatMap(([key, child]) => entryStrings(child, prefix ? `${prefix}.${key}` : key));
   }
   return [];
 }
@@ -216,7 +219,7 @@ function assertLintableValues(server: string, kind: 'env' | 'headers', raw: unkn
 
 /**
  * Validate one server entry. Returns the parsed config, or a skip reason.
- * Never throws: `lintServerCredentials` has already rejected the whole plugin
+ * Never throws: `lintDocumentCredentials` has already rejected the whole plugin
  * for a smuggled secret before any entry reaches here (#500 rounds 2-3).
  */
 function readServerEntry(name: string, entry: unknown): ParsedMcpServerConfig | string {
