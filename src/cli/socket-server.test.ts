@@ -1,18 +1,100 @@
-import { spawnSync } from 'child_process';
-import fs from 'fs';
-import net from 'net';
-import os from 'os';
-import path from 'path';
+import { spawn, type ChildProcess } from 'node:child_process';
+import fs from 'node:fs';
+import net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { allowSubprocess, enforceHermeticity } from '../test-hermeticity.js';
+
 import type { ResponseFrame } from './frame.js';
 import { markCliServerReady, startCliServer, stopCliServer } from './socket-server.js';
+
+allowSubprocess([path.basename(process.execPath), 'flock']);
+enforceHermeticity();
 
 // Unix socket paths have a small OS limit — keep them short.
 function tmpSocketPath(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ncl-'));
   return path.join(dir, 's.sock');
+}
+
+/**
+ * Independent holder for the same directory inode used by startCliServer().
+ * `ready` is the barrier: no contender starts until the child has acquired its
+ * inherited-FD kernel lock. SIGKILL then models a host crash.
+ */
+async function holdDirectoryLock(directory: string): Promise<ChildProcess> {
+  const holder = spawn(
+    process.execPath,
+    [
+      '--input-type=module',
+      '--eval',
+      [
+        "import fs from 'node:fs';",
+        "import { spawnSync } from 'node:child_process';",
+        'const directory = process.argv.at(-1);',
+        'const fd = fs.openSync(directory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);',
+        "const result = spawnSync('flock', ['-n', '3'], { stdio: ['ignore', 'ignore', 'pipe', fd] });",
+        'if (result.status !== 0) process.exit(20);',
+        "process.stdout.write('ready\\n');",
+        'process.stdin.resume();',
+        "process.stdin.once('end', () => process.exit(0));",
+      ].join(' '),
+      directory,
+    ],
+    { stdio: ['pipe', 'pipe', 'pipe'] },
+  );
+
+  await new Promise<void>((resolve, reject) => {
+    let output = '';
+    let stderr = '';
+    let settled = false;
+    const fail = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    holder.stdout.on('data', (chunk: Buffer) => {
+      output += chunk.toString('utf8');
+      if (!settled && output.includes('ready\n')) {
+        settled = true;
+        resolve();
+      }
+    });
+    holder.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString('utf8');
+    });
+    holder.once('error', fail);
+    holder.once('close', (code) =>
+      fail(new Error(`independent lock holder exited before ready (${String(code)}): ${stderr.trim()}`)),
+    );
+  });
+  return holder;
+}
+
+async function waitForExit(child: ChildProcess): Promise<void> {
+  await new Promise<void>((resolve) => {
+    if (child.exitCode !== null) return resolve();
+    child.once('close', () => resolve());
+  });
+}
+
+async function flockExitCode(directory: string): Promise<number | null> {
+  const claimant = spawn('flock', ['-n', directory, 'true'], { stdio: 'ignore' });
+  return new Promise((resolve, reject) => {
+    claimant.once('error', reject);
+    claimant.once('close', (code) => resolve(code));
+  });
+}
+
+function connect(socketPath: string): Promise<net.Socket> {
+  return new Promise((resolve, reject) => {
+    const conn = net.createConnection(socketPath);
+    conn.once('connect', () => resolve(conn));
+    conn.once('error', reject);
+  });
 }
 
 function sendFrame(socketPath: string, command: string): Promise<ResponseFrame> {
@@ -129,60 +211,132 @@ describe('startCliServer single-bind', () => {
   });
 });
 
-// PR #453 review, round 2: the probe-then-unlink-then-bind sequence above is
-// still a check-then-act pattern between separate startCliServer() callers —
-// closing that requires a real atomic primitive, not more retries.
-describe('startCliServer ownership lock', () => {
-  it('claims exclusive ownership atomically: a concurrent second call for the same path is refused, naming the live pid', async () => {
+describe('startCliServer kernel ownership lock', () => {
+  it('refuses an independent claimant after its ready barrier, without touching the socket', async () => {
     const socketPath = tmpSocketPath();
-    const results = await Promise.allSettled([startCliServer(socketPath), startCliServer(socketPath)]);
-    const fulfilled = results.filter((r) => r.status === 'fulfilled');
-    const rejected = results.filter((r) => r.status === 'rejected');
-    expect(fulfilled).toHaveLength(1);
-    expect(rejected).toHaveLength(1);
-    expect((rejected[0] as PromiseRejectedResult).reason.message).toMatch(
-      new RegExp(`already holds ${socketPath}\\.lock`),
-    );
-    // Naming its own pid: both calls are this test process.
-    expect((rejected[0] as PromiseRejectedResult).reason.message).toContain(`pid ${process.pid}`);
-    expect(fs.existsSync(socketPath)).toBe(true);
-  });
-
-  it('reclaims a lock file left behind by a process that no longer exists', async () => {
-    const socketPath = tmpSocketPath();
-    // A process that ran and exited — guaranteed dead by the time spawnSync
-    // returns, unlike an arbitrary made-up pid that might collide with
-    // something real.
-    const dead = spawnSync(process.execPath, ['-e', '']);
-    fs.writeFileSync(`${socketPath}.lock`, String(dead.pid));
-    await startCliServer(socketPath);
-    expect(fs.existsSync(socketPath)).toBe(true);
-    // The lock now names us, not the dead process.
-    expect(fs.readFileSync(`${socketPath}.lock`, 'utf8')).toBe(String(process.pid));
-  });
-
-  it('releases the lock on a failed start so a subsequent start can claim it', async () => {
-    const socketPath = tmpSocketPath();
-    const other = net.createServer(() => {});
-    await new Promise<void>((resolve) => other.listen(socketPath, resolve));
+    const holder = await holdDirectoryLock(path.dirname(socketPath));
     try {
-      await expect(startCliServer(socketPath)).rejects.toThrow(/already serving ncl/);
-      // Our own ownership lock must not linger after a failed bind — nothing
-      // else claimed the socket, so the lock and the socket-conflict error
-      // are orthogonal, and a retry (e.g. after the operator stops the
-      // other instance) must not be blocked by our own leftover lock.
-      expect(fs.existsSync(`${socketPath}.lock`)).toBe(false);
+      await expect(startCliServer(socketPath)).rejects.toThrow(/already holds the kernel lock/);
+      expect(fs.existsSync(socketPath)).toBe(false);
     } finally {
-      await new Promise<void>((resolve) => other.close(() => resolve()));
+      holder.kill('SIGKILL');
+      await waitForExit(holder);
     }
   });
 
-  it('releases the lock on stopCliServer so a fresh start can reclaim it', async () => {
+  it('reclaims kernel ownership after a crashed independent holder exits', async () => {
+    const socketPath = tmpSocketPath();
+    const holder = await holdDirectoryLock(path.dirname(socketPath));
+    holder.kill('SIGKILL');
+    await waitForExit(holder);
+
+    await expect(startCliServer(socketPath)).resolves.toBeUndefined();
+  });
+
+  it('rejects a simultaneous same-process start without releasing the winner lock', async () => {
+    const socketPath = tmpSocketPath();
+    const results = await Promise.allSettled([startCliServer(socketPath), startCliServer(socketPath)]);
+
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    expect(fs.existsSync(socketPath)).toBe(true);
+  });
+
+  it('releases ownership after a failed bind so a retry can start', async () => {
+    const socketPath = tmpSocketPath();
+    const other = net.createServer(() => {});
+    await new Promise<void>((resolve) => other.listen(socketPath, resolve));
+    await expect(startCliServer(socketPath)).rejects.toThrow(/already serving ncl/);
+    await new Promise<void>((resolve) => other.close(() => resolve()));
+
+    await expect(startCliServer(socketPath)).resolves.toBeUndefined();
+  });
+
+  it('releases ownership only after normal stop closes the listener', async () => {
     const socketPath = tmpSocketPath();
     await startCliServer(socketPath);
-    expect(fs.existsSync(`${socketPath}.lock`)).toBe(true);
     await stopCliServer();
-    expect(fs.existsSync(`${socketPath}.lock`)).toBe(false);
+
+    await expect(startCliServer(socketPath)).resolves.toBeUndefined();
+  });
+
+  it('waits for an in-flight start to bind and close before releasing ownership', async () => {
+    const socketPath = tmpSocketPath();
+    const start = startCliServer(socketPath);
+    const stop = stopCliServer();
+
+    await Promise.all([start, stop]);
+    expect(await flockExitCode(path.dirname(socketPath))).toBe(0);
+
+    // Mirrors a late main() continuation after SIGTERM: it must not make the
+    // next standalone listener ready after the stopped listener is gone.
+    markCliServerReady();
+    await startCliServer(socketPath);
+    const response = await sendFrame(socketPath, 'groups-list');
+    expect(response.ok).toBe(false);
+    if (!response.ok) expect(response.error.code).toBe('not-ready');
+  });
+
+  it('coalesces stops and keeps ownership until an active connection closes', async () => {
+    const socketPath = tmpSocketPath();
+    await startCliServer(socketPath);
+    const conn = await connect(socketPath);
+
+    const firstStop = stopCliServer();
+    const secondStop = stopCliServer();
+    let stopped = false;
+    void firstStop.then(() => {
+      stopped = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(stopped).toBe(false);
+    expect(await flockExitCode(path.dirname(socketPath))).toBe(1);
+
+    conn.destroy();
+    await Promise.all([firstStop, secondStop]);
+    expect(await flockExitCode(path.dirname(socketPath))).toBe(0);
+  });
+
+  it('retains ownership after closing the listener when shutdown requests it', async () => {
+    const socketPath = tmpSocketPath();
+    await startCliServer(socketPath);
+    await stopCliServer({ retainOwnership: true });
+
+    expect(await flockExitCode(path.dirname(socketPath))).toBe(1);
+
+    // The real shutdown exits immediately after teardown; tests release the
+    // retained fd explicitly so afterEach does not leak it across cases.
+    await stopCliServer();
+    expect(await flockExitCode(path.dirname(socketPath))).toBe(0);
+  });
+
+  it('fails clearly when util-linux flock is unavailable', async () => {
+    const socketPath = tmpSocketPath();
+    const previousPath = process.env.PATH;
+    process.env.PATH = path.dirname(socketPath);
+    try {
+      await expect(startCliServer(socketPath)).rejects.toThrow(
+        process.platform === 'darwin'
+          ? /requires the `flock` executable\. Install it with `brew install flock` and re-run setup/
+          : /requires the `flock` executable\. Install util-linux and re-run setup/,
+      );
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  });
+
+  it('uses the stable directory inode, with no PID or sidecar bookkeeping', () => {
+    const implementation = fs.readFileSync(new URL('./socket-server.ts', import.meta.url), 'utf8');
+
+    expect(implementation).toContain('O_DIRECTORY');
+    expect(implementation).toContain("spawn('flock', ['-n', '3']");
+    expect(implementation).not.toContain('process.pid');
+    expect(implementation).not.toContain('isProcessAlive');
+    expect(implementation).not.toContain('readLockPid');
+    expect(implementation).not.toContain('socketPath}.lock');
+    expect(implementation).toContain('brew install flock');
   });
 });
 

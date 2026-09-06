@@ -395,15 +395,26 @@ If one or more `[BREAKING]` lines are found:
 - Display a warning header to the user: "This update includes breaking changes that may require action:"
 - For each breaking change, display the full description.
 - Collect all skill names referenced in the breaking change entries (the `/<skill-name>` part).
-- Initialize an unresolved-migrations list with every referenced skill. Remove a
-  skill only after it completes successfully.
+- Also collect every explicit command in an entry's `Migration:` instruction.
+  A command migration is required: show the exact command and ask before
+  running it. Commands that reload, restart, or activate the host belong in a
+  separate pending activation-migrations list. Defer those commands to Step 9,
+  after skill updates and every audit, memory, and non-activation migration
+  gate has passed. Keep all other commands unresolved until they succeed.
+- Initialize an unresolved-migrations list with every referenced skill and
+  non-activation migration command. Remove an item only after it completes
+  successfully.
 - Use AskUserQuestion to ask the user which migration skills they want to run now. Options:
   - One recommended option per referenced skill (e.g., "Run /add-whatsapp (Recommended)")
+  - One recommended option per explicit migration command, labeled with the
+    action it performs
   - "Skip — I'll handle these manually"
-- Set `multiSelect: true` so the user can pick multiple skills if there are several breaking changes.
-- For each skill the user selects, invoke it using the Skill tool.
-- Remove a skill from the unresolved list only after it completes successfully.
-  Keep every skipped, failed, or incomplete skill unresolved, then proceed to
+- Set `multiSelect: true` so the user can pick multiple skills or commands if there are several breaking changes.
+- For each selected skill, invoke it using the Skill tool. For each selected
+  non-activation command, run it exactly as the changelog prescribes. Record
+  approval for selected activation commands, but do not execute them yet.
+- Remove an item from the unresolved list only after it completes successfully.
+  Keep every skipped, failed, or incomplete item unresolved, then proceed to
   Step 8.
 
 For `/migrate-memory`, "completes successfully" means its inventory report,
@@ -493,7 +504,8 @@ Show:
 - Customization contract: total rows, high-risk rows, verification commands run, and any compatibility fixes
 - Audit findings (A–F verdicts from Step 6)
 - Breaking changes applied (list skills run, if any)
-- Unresolved breaking migrations (list skipped, failed, or incomplete skills)
+- Unresolved breaking migrations (list skipped, failed, or incomplete skills/commands)
+- Pending activation migrations (including whether execution was approved)
 - Memory activation gate: `MEMORY_ACTIVATION_BLOCKED=yes|no`, with the
   inventory/report/runtime-verification evidence
 - Remaining local diff vs upstream: `git diff --name-only upstream/$UPSTREAM_BRANCH..HEAD`
@@ -514,7 +526,7 @@ affected features may ignore old state until those migrations run. Before
 showing restart commands, offer:
 
 - **Run unresolved migrations (Recommended):** invoke each unresolved skill
-  and remove it only after successful completion.
+  or non-activation command and remove it only after successful completion.
 - **Roll back the update:** use
   `git reset --hard <backup-tag-from-step-1>` and restore any migration with
   its retained report/snapshot procedure.
@@ -522,11 +534,21 @@ showing restart commands, offer:
 If a retried migration remains unresolved, stop. Roll back or finish its
 migration and verification before continuing.
 
+After these gates pass, execute each pending activation migration in its
+changelog-prescribed order, obtaining approval if not already granted. Complete
+any required container rebuild and backup before the first activation command.
+A skipped, failed, or incomplete activation migration blocks ordinary restart
+commands. Remove each only after it succeeds; when it reloads or restarts the
+host service, set `SERVICE_RESTARTED_BY_MIGRATION=yes`.
+
 Tell the user:
 
 - To rollback: `git reset --hard <backup-tag-from-step-1>`
 - Backup branch also exists: `backup/pre-update-<HASH>-<TIMESTAMP>`
-- Restart the service to apply changes (after rebuild/backup if flagged above). Detect platform with `uname -s`:
+- If `SERVICE_RESTARTED_BY_MIGRATION=yes`, state that the completed migration
+  already reloaded the updated service definition and do not show or run an
+  additional restart command.
+- Otherwise, restart the service to apply changes (after rebuild/backup if flagged above). Detect platform with `uname -s`:
   - **macOS (Darwin)**: `launchctl kickstart -k gui/$(id -u)/com.nanoclaw` (or derive the slug: `source setup/lib/install-slug.sh && launchctl kickstart -k gui/$(id -u)/$(launchd_label)`)
   - **Linux (systemd user)**: detect the service name with `systemctl --user list-units --type=service | grep nanoclaw | awk '{print $1}'`, then `systemctl --user restart <detected-name>` (or `source setup/lib/install-slug.sh && systemctl --user restart $(systemd_unit)`)
   - **Linux (systemd system)**: `sudo systemctl restart nanoclaw-v2`

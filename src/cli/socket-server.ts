@@ -7,8 +7,10 @@
  * chat-style CLI channel adapter owns). Socket file is chmod 0600 — only
  * the user that started the host can connect.
  */
-import fs from 'fs';
-import net from 'net';
+import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import net from 'node:net';
+import path from 'node:path';
 
 import { log } from '../log.js';
 import { dispatch } from './dispatch.js';
@@ -16,7 +18,9 @@ import type { CallerContext, RequestFrame, ResponseFrame } from './frame.js';
 import { DEFAULT_SOCKET_PATH } from './socket-client.js';
 
 let server: net.Server | null = null;
-let heldLockPath: string | null = null;
+let heldOwnershipFd: number | null = null;
+let startPromise: Promise<void> | null = null;
+let stopPromise: Promise<void> | null = null;
 
 // Requests are refused with `not-ready` until markCliServerReady() is called.
 // The socket binds (and claims ownership) well before archive init, FS
@@ -40,95 +44,83 @@ const PROBE_TIMEOUT_MS = 1000;
 // worth retrying forever.
 const MAX_BIND_ATTEMPTS = 5;
 
-function lockPathFor(socketPath: string): string {
-  return `${socketPath}.lock`;
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    // Signal 0 sends nothing; it only checks whether the pid exists and is
-    // signalable. EPERM means it exists but is owned by another user — still
-    // alive, just not ours to check further.
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === 'EPERM';
-  }
-}
-
-function readLockPid(lockPath: string): number | null {
-  /* eslint-disable no-catch-all/no-catch-all -- a lock file that vanished or is unreadable between our EEXIST and this read is stale by construction */
-  try {
-    const pid = Number(fs.readFileSync(lockPath, 'utf8').trim());
-    return Number.isInteger(pid) && pid > 0 ? pid : null;
-  } catch {
-    return null;
-  }
-  /* eslint-enable no-catch-all/no-catch-all */
-}
-
 /**
- * Claim exclusive ownership of `socketPath` via `O_EXCL` on a sibling lock
- * file — the actual atomic primitive `startCliServer` was missing (PR #453
- * review, round 2): the probe-then-unlink-then-bind sequence below is a
- * check-then-act pattern with no exclusion between the check and the act, so
- * two processes racing it can still both end up with a live listener, one
- * orphaned. `open(..., 'wx')` either creates the file or fails with `EEXIST`
- * atomically at the kernel level — there is no gap for a second caller to
- * land in.
- *
- * A lock file whose pid is dead is stale (the process that held it crashed
- * without a clean shutdown) and is reclaimed; a lock file whose pid is alive
- * means a real peer holds it, and that is reported by name rather than
- * silently retried. The lock is held for the life of the process — released
- * only by `stopCliServer()` — so it doubles as a liveness fact independent
- * of whether the socket file itself survives.
+ * Claim the data-directory inode with a kernel-held flock before the central
+ * database is opened. The transient flock process locks its inherited fd 3;
+ * the parent keeps the same open-file description for the host lifetime.
+ * Closing that final parent fd releases the lock on graceful or crashed exit.
  */
-function claimOwnershipLock(socketPath: string): void {
-  const lockPath = lockPathFor(socketPath);
-  for (;;) {
-    let fd: number;
-    try {
-      fd = fs.openSync(lockPath, 'wx');
-    } catch (err) {
-      const e = err as NodeJS.ErrnoException;
-      if (e.code !== 'EEXIST') throw err;
-      const holderPid = readLockPid(lockPath);
-      if (holderPid !== null && isProcessAlive(holderPid)) {
-        throw new Error(
-          `another host instance (pid ${holderPid}) already holds ${lockPath} — ` +
-            `refusing to start a second host in this checkout. Stop the other ` +
-            `instance and restart.`,
-          { cause: err },
-        );
-      }
-      // Stale lock from a process that crashed without releasing it.
-      try {
-        fs.unlinkSync(lockPath);
-      } catch (unlinkErr) {
-        const ue = unlinkErr as NodeJS.ErrnoException;
-        if (ue.code !== 'ENOENT') throw unlinkErr;
-      }
-      continue;
+async function claimOwnershipLock(socketPath: string): Promise<number> {
+  const directory = path.dirname(socketPath);
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(directory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+    if (!fs.fstatSync(fd).isDirectory()) {
+      throw new Error(`ncl ownership path is not a directory: ${directory}`);
     }
-    fs.writeSync(fd, String(process.pid));
-    fs.closeSync(fd);
-    heldLockPath = lockPath;
-    return;
+    await lockInheritedFd(fd, directory);
+    return fd;
+  } catch (err) {
+    if (fd !== null) fs.closeSync(fd);
+    throw err;
   }
+}
+
+/** Acquire the kernel flock without keeping a helper process alive. */
+function lockInheritedFd(fd: number, directory: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('flock', ['-n', '3'], { stdio: ['ignore', 'ignore', 'pipe', fd] });
+    let settled = false;
+    const fail = (err: Error): void => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
+
+    child.once('error', (err) => {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') {
+        const installHint =
+          process.platform === 'darwin'
+            ? 'Install it with `brew install flock` and re-run setup.'
+            : 'Install util-linux and re-run setup.';
+        fail(new Error(`ncl single-host ownership requires the \`flock\` executable. ${installHint}`, { cause: err }));
+        return;
+      }
+      fail(new Error(`failed to start ncl ownership lock for ${directory}`, { cause: err }));
+    });
+    child.once('close', (code) => {
+      if (settled) return;
+      settled = true;
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      if (code === 1) {
+        reject(
+          new Error(
+            `another host instance already holds the kernel lock for ${directory} — ` +
+              'refusing to start a second host in this checkout. Stop the other instance and restart.',
+          ),
+        );
+        return;
+      }
+      reject(new Error(`ncl ownership lock failed for ${directory} (flock exited ${String(code)})`));
+    });
+  });
 }
 
 function releaseOwnershipLock(): void {
-  if (!heldLockPath) return;
-  const lockPath = heldLockPath;
-  heldLockPath = null;
-  /* eslint-disable no-catch-all/no-catch-all -- releasing our own lock is best-effort; a failure here must not block shutdown */
+  const fd = heldOwnershipFd;
+  heldOwnershipFd = null;
+  if (fd === null) return;
   try {
-    fs.unlinkSync(lockPath);
+    fs.closeSync(fd);
   } catch (err) {
-    log.warn('Failed to release ncl socket ownership lock', { lockPath, err });
+    log.warn('Failed to release ncl kernel ownership lock', { err });
   }
-  /* eslint-enable no-catch-all/no-catch-all */
 }
 
 /**
@@ -173,7 +165,19 @@ function bindOnce(s: net.Server, socketPath: string): Promise<void> {
 }
 
 export async function startCliServer(socketPath: string = DEFAULT_SOCKET_PATH): Promise<void> {
-  claimOwnershipLock(socketPath);
+  if (startPromise || stopPromise || server || heldOwnershipFd !== null) {
+    throw new Error('ncl CLI server is already starting or running');
+  }
+  startPromise = startCliServerInner(socketPath);
+  try {
+    await startPromise;
+  } finally {
+    startPromise = null;
+  }
+}
+
+async function startCliServerInner(socketPath: string): Promise<void> {
+  heldOwnershipFd = await claimOwnershipLock(socketPath);
   try {
     await bindWithRetry(socketPath);
   } catch (err) {
@@ -242,16 +246,39 @@ async function bindWithRetry(socketPath: string): Promise<void> {
  * `ncl` can mutate central-DB state those gates are still establishing.
  */
 export function markCliServerReady(): void {
-  ready = true;
+  // Shutdown can race an async startup after it has claimed ownership. Once
+  // the listener has been closed, a late startup continuation must not leave
+  // readiness set for a later standalone restart in this process.
+  if (server) ready = true;
 }
 
-export async function stopCliServer(): Promise<void> {
+export async function stopCliServer({ retainOwnership = false }: { retainOwnership?: boolean } = {}): Promise<void> {
   ready = false;
-  releaseOwnershipLock();
-  if (!server) return;
+  if (stopPromise) return stopPromise;
+
+  stopPromise = stopCliServerInner(retainOwnership);
+  try {
+    await stopPromise;
+  } finally {
+    stopPromise = null;
+  }
+}
+
+async function stopCliServerInner(retainOwnership: boolean): Promise<void> {
+  // A signal can arrive while the transient flock subprocess is still
+  // acquiring the claim. Wait for that start to bind, then close it, so this
+  // stop can never release a claim belonging to an in-flight start.
+  const pendingStart = startPromise;
+  if (pendingStart) await pendingStart.catch(() => undefined);
+
   const s = server;
   server = null;
-  await new Promise<void>((resolve) => s.close(() => resolve()));
+  if (s) await new Promise<void>((resolve) => s.close(() => resolve()));
+  if (!retainOwnership) {
+    // Keep ownership until the listener has closed, so a new host cannot
+    // acquire the directory lock while this server still owns the socket.
+    releaseOwnershipLock();
+  }
 }
 
 function handleConnection(conn: net.Socket): void {

@@ -441,6 +441,11 @@ export async function main(): Promise<void> {
     log.warn('dist/BUILD_INFO.json missing — cannot report build provenance (older dist, or a dev run)');
   }
 
+  // 0. Claim exclusive host ownership before any startup work that can
+  // mutate shared state. The socket binds early but remains not-ready until
+  // every existing boot gate has completed below.
+  await startCliServer();
+
   // 0. Circuit breaker — backoff on rapid restarts
   await enforceStartupBackoff();
 
@@ -477,21 +482,6 @@ export async function main(): Promise<void> {
     // absence after a boot means the registration failed (WARN above).
     log.info('Host instance lease started', { instanceId: hostInstanceId, ttlMs: HOST_LEASE_TTL_MS });
   }
-
-  // 1-b. Start the `ncl` CLI socket server (data/ncl.sock) before anything
-  // below can spawn or stop a container. startCliServer() claims exclusive
-  // ownership of the socket path (an O_EXCL lock, src/cli/socket-server.ts)
-  // and refuses to steal one a live host already holds — a refusal that is
-  // only useful this early: runBootMountQuiescence() below calls
-  // quiesceWorkgroupsForBootMountChange(), which stops every install-scoped
-  // container on the assumption that this is the sole live host, and channel
-  // adapters + delivery polls start later still. A second host process must
-  // be caught and exited before any of that runs, not after (PR review
-  // finding on the theme-T2 socket single-bind port). The socket does NOT
-  // accept requests yet — every `ncl` call gets `not-ready` until
-  // markCliServerReady() runs below, after the boot gates that ownership
-  // alone does not wait for.
-  await startCliServer();
 
   // 1-0. Materialize the archive schema before ANY service that can spawn.
   //
@@ -856,7 +846,7 @@ export async function main(): Promise<void> {
   setDeliveryAdapter(createChannelDeliveryAdapter());
 
   // 4a. The `ncl` socket has been bound and refusing a second host since
-  // "1-b." above, but it has been refusing every request with `not-ready`
+  // the pre-DB ownership step above, but it has been refusing every request with `not-ready`
   // until now: everything that can mutate central-DB state on this process's
   // behalf — archive init, FS reconciliation, the OneCLI preflight,
   // container-config backfill, channel adapters, and the delivery bridge
@@ -936,7 +926,10 @@ async function shutdown(signal: string): Promise<void> {
   // summary, backlog canvas, and storage-maintenance stop themselves via
   // stopHostModules() above (each guards its own stop failure).
   await stopDiscordSlashCommands();
-  await stopCliServer();
+  // Stop accepting CLI requests before teardown, but keep the kernel claim
+  // until process exit. A replacement host must not open or migrate the
+  // central DB while this process is still tearing it down.
+  await stopCliServer({ retainOwnership: true });
   try {
     await teardownChannelAdapters();
     // Warn mid-work sessions before their containers are stopped: the
