@@ -331,6 +331,47 @@ describe('T5 PR 3 — the plugin reader and the stamp path', () => {
       expect(() => parseTemplate(PLUGIN_DIR)).toThrow(/looks like a real credential/);
     }
   });
+
+  it('an mcp.json that cannot be linted at all refuses the plugin (#500 round 4)', () => {
+    // Closing the class rather than the leaf: the whole plugin directory ships
+    // to the agent, so a file that cannot be PROVEN credential-free must not
+    // be stamped. A trailing comma beside a real key used to degrade to a
+    // component skip and carry the credential through.
+    writeManifest();
+    fs.writeFileSync(
+      path.join(PLUGIN_DIR, 'mcp.json'),
+      '{"mcpServers":{"crm":{"type":"stdio","command":"server","env":{"API_KEY":"sk-live-AbC123RealLookingKey456"},}}}',
+    );
+    expect(() => parseTemplate(PLUGIN_DIR)).toThrow(/not valid JSON/);
+
+    writeManifest();
+    fs.writeFileSync(path.join(PLUGIN_DIR, 'mcp.json'), '["not","an","object"]');
+    expect(() => parseTemplate(PLUGIN_DIR)).toThrow(/not a JSON object/);
+  });
+
+  it('the documented mcp.json examples parse and stamp (#500 round 4)', () => {
+    // The authoring examples are executable here, so a doc that drifts from
+    // the reader's requirements fails the suite instead of a user's stamp.
+    writeManifest();
+    fs.writeFileSync(
+      path.join(PLUGIN_DIR, 'mcp.json'),
+      JSON.stringify({
+        $schema: MCP_SCHEMA_URL,
+        mcpServers: {
+          hubspot: { type: 'stdio', command: 'npx', args: ['-y', '@hubspot/mcp-server'] },
+          datafold: {
+            type: 'streamable-http',
+            url: 'https://app.datafold.com/mcp/',
+            headers: { Authorization: 'Key onecli-managed' },
+          },
+          acme: { type: 'stdio', command: 'npx', args: [], env: { ACME_API_KEY: 'placeholder' } },
+        },
+      }),
+    );
+    const tpl = parseTemplate(PLUGIN_DIR);
+    expect(Object.keys(tpl.mcpServers).sort()).toEqual(['acme', 'datafold', 'hubspot']);
+    expect(tpl.report.filter((line) => line.includes('mcp.json'))).toEqual([]);
+  });
 });
 
 /**

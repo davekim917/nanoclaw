@@ -100,17 +100,31 @@ export function readPluginMcp(pluginDir: string): { servers: Record<string, Pars
   }
   if (!fs.existsSync(file)) return { servers: {}, report };
 
+  // CLASS INVARIANT (#500 rounds 2-4): no plugin whose `mcp.json` cannot be
+  // PROVEN free of credentials may be stamped. `createAgentFromTemplate` copies
+  // the whole plugin directory into the agent-readable
+  // `groups/<folder>/plugins/<name>` mount, so every skip below ships the file
+  // anyway. A file that cannot be parsed cannot be linted — a trailing comma
+  // beside `API_KEY: "sk-…"` would otherwise carry the credential straight to
+  // the agent — so an unreadable or unparseable mcp.json rejects the plugin
+  // outright rather than degrading to a skip. Skips remain only for shapes the
+  // lint has already inspected.
   let raw: unknown;
-  // eslint-disable-next-line no-catch-all/no-catch-all -- a malformed template file is expected input, not a bug
+  // eslint-disable-next-line no-catch-all/no-catch-all -- a malformed template file is expected input, reported as a rejection
   try {
     raw = JSON.parse(fs.readFileSync(file, 'utf-8'));
-  } catch {
-    report.push('mcp.json: not valid JSON; MCP component skipped');
-    return { servers: {}, report };
+  } catch (err) {
+    throw new Error(
+      `mcp.json is not valid JSON, so it cannot be checked for credentials before it is copied into the agent's ` +
+        `workspace: ${err instanceof Error ? err.message : String(err)}. Fix the syntax and re-stamp.`,
+      { cause: err },
+    );
   }
   if (!isPlainObject(raw)) {
-    report.push('mcp.json: not a JSON object; MCP component skipped');
-    return { servers: {}, report };
+    throw new Error(
+      'mcp.json is not a JSON object, so it cannot be checked for credentials before it is copied into the ' +
+        "agent's workspace. It must be an object with $schema and mcpServers.",
+    );
   }
 
   // FATAL lint before ANY component-level skip below. A skipped component

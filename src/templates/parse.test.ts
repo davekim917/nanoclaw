@@ -183,8 +183,19 @@ describe('parseTemplate', () => {
   });
 
   describe('mcp component', () => {
+    // Fork deviation (#500 round 4): an mcp.json that cannot be PARSED cannot
+    // be linted for credentials, and the file is copied into the agent's
+    // plugins/ mount either way — so it refuses the plugin instead of degrading
+    // to a skip. Shapes the lint has already inspected still skip, as upstream.
+    it('refuses the plugin when mcp.json cannot be parsed, so it cannot be secret-linted', () => {
+      writeManifest();
+      writeSkill('good');
+      write('mcp.json', 'garbage');
+
+      expect(() => parseTemplate(dir)).toThrow(/not valid JSON/);
+    });
+
     it.each([
-      ['bad JSON', 'garbage', /not valid JSON/],
       ['wrong $schema', JSON.stringify({ $schema: 'https://x', mcpServers: {} }), /\$schema must be/],
       [
         'extra top-level field',

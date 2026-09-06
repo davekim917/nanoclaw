@@ -172,17 +172,23 @@ server (`url` + optional `headers`):
 
 ```json
 {
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
   "mcpServers": {
-    "hubspot": { "command": "npx", "args": ["-y", "@hubspot/mcp-server"] },
-    "exa": { "command": "npx", "args": ["-y", "exa-mcp-server"] },
+    "hubspot": { "type": "stdio", "command": "npx", "args": ["-y", "@hubspot/mcp-server"] },
+    "exa": { "type": "stdio", "command": "npx", "args": ["-y", "exa-mcp-server"] },
     "datafold": {
-      "type": "http",
+      "type": "streamable-http",
       "url": "https://app.datafold.com/mcp/",
       "headers": { "Authorization": "Key onecli-managed" }
     }
   }
 }
 ```
+
+Both `$schema` (exactly that URL) and a declared `type` on every entry are
+required: the reader skips the whole MCP component when either is missing, and
+an `mcp.json` that cannot be parsed at all refuses the plugin outright, because
+a file that cannot be checked for credentials must not reach the agent.
 
 Entries are validated at parse time by the same parser the `ncl` and approval
 paths use, so a template cannot stamp a config those paths would reject:
@@ -231,8 +237,10 @@ value** there to satisfy the boot check:
 
 ```json
 {
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
   "mcpServers": {
     "acme": {
+      "type": "stdio",
       "command": "npx",
       "args": ["-y", "@acme/mcp-server"],
       "env": { "ACME_API_KEY": "placeholder" }
