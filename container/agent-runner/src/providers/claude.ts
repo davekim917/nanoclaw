@@ -20,6 +20,18 @@ import { TIMEZONE, formatLocalStamp } from '../timezone.js';
 import { shimCwd } from './cwd-shim.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
 import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
+import {
+  QUOTA_EMBEDDED_RE,
+  QUOTA_RESULT_RE,
+  SUBSCRIPTION_BLOCKED_EMBEDDED_RE,
+  SUBSCRIPTION_BLOCKED_RE,
+} from './claude-review-classification.js';
+export {
+  QUOTA_EMBEDDED_RE,
+  QUOTA_RESULT_RE,
+  SUBSCRIPTION_BLOCKED_EMBEDDED_RE,
+  SUBSCRIPTION_BLOCKED_RE,
+} from './claude-review-classification.js';
 import type {
   AgentProvider,
   AgentQuery,
@@ -670,90 +682,10 @@ const OAUTH_FALLBACK_RE = /^CLAUDE_CODE_OAUTH_TOKEN_(\d+)$/;
 const RETRYABLE_ERROR_RE =
   /429|rate[\s_-]?limit|overloaded|upstream_error|External provider returned|subscription_quota_exhausted|subscription_access_disabled/i;
 
-// Claude Max subscription quota exhaustion. The Agent SDK delivers this
-// as a plain result-text string rather than a thrown error or a
-// `rate_limit_event` system message, so neither the catch-block rotation
-// nor the in-stream rate_limit_event path triggers. Detect the text and
-// re-throw to engage rotation.
-//
-// Four distinct surfacings, all handled here:
-//   - weekly/extra cap: "You're out of extra usage · resets …"
-//   - 5-hour session-window cap: "You've hit your session limit · resets …"
-//   - org/credit spend cap: "You've hit your org's monthly spend limit ·
-//     ask your admin to raise it at claude.ai/settings/usage" (first seen
-//     2026-06-11, ahead of the June-15 Agent SDK credit change; surfaces
-//     with "org" wording even on individual subscription accounts)
-//   - per-seat spend cap: "You've hit your individual spend limit · ask your
-//     admin to raise it at claude.ai/settings/usage · your session limit
-//     resets 6pm" (first seen 2026-09-02 20:18 UTC, on a `worker-high`
-//     subagent; "individual" was absent from the qualifier class, so the
-//     whole sentence failed to match)
-// Each new wording has broken rotation once before being added — four times
-// now. The session-window form wasn't matched by the original usage-only
-// regex; the org-spend form wasn't matched by the enumerated-qualifier form;
-// the individual-spend form wasn't matched by the qualifier word-class. Every
-// time, rotation silently failed with headroom left on the ring and the
-// dead-stop quota message was dispatched to the user (2026-09-02: relayed as
-// "ask your admin to raise it", and an admin raised a cap that did not need
-// raising) instead of advancing to the next OAuth fallback.
-//
-// That track record is why enumerating prose is now only TIER ONE of the
-// subagent classifier. Tier two (AGENT_API_ERROR_TERMINATION_RE +
-// AGENT_API_RATE_LIMIT_SUFFIX_RE, below) keys off the CLI's structured
-// parenthesized suffix instead, and catches a wording nobody has seen yet.
-//
-// Strict-anchored on the "You're/You've …" sentence opener to avoid
-// false-positives on agent prose that mentions "usage" or "limit" in passing.
-// The qualifier between "your" and "limit" is a repeated word-class rather
-// than an enumerated list so the next wording variant ("daily token limit",
-// "org's annual spend limit", …) can't silently re-break rotation; it is
-// deliberately scoped to quota-ish words so "you've hit your retry limit"
-// style prose still doesn't match.
-// The apostrophe class tolerates both straight (U+0027, what the SDK emits
-// today) and curly (U+2019) so a typographic change upstream can't silently
-// re-break rotation.
-//
-// The pattern BODY is defined once, as a string, and both the anchored form
-// (QUOTA_RESULT_RE, for top-level result text) and the unanchored form
-// (QUOTA_EMBEDDED_RE, for a quota message buried inside a subagent's
-// tool_response) are derived from it. Two hand-maintained copies would
-// reproduce the exact failure this comment block documents: a wording is
-// updated in one place, rotation silently keeps working on one surface and
-// silently stops on the other.
-const QUOTA_PATTERN_BODY =
-  "You['’]?(re|ve) (out of (extra |daily |weekly )?usage|(hit|reached) your ((org['’]?s |team['’]?s |account['’]?s |individual |session |usage |weekly |daily |monthly |annual |spend(ing)? |token |credit )*)limit)\\b";
-
-export const QUOTA_RESULT_RE = new RegExp(`^\\s*${QUOTA_PATTERN_BODY}`, 'i');
-
-// Unanchored twin of QUOTA_RESULT_RE. A subagent (the Agent tool, formerly
-// named Task) that exhausts the quota never produces a top-level `result` —
-// the quota prose comes back as a `tool_result` inside the parent's
-// still-running turn, so the anchored form can't see it. Used by the
-// subagent-quota classifier, not the result path; the anchoring is what
-// keeps false positives off the top-level result path, so do NOT swap this in
-// there.
-export const QUOTA_EMBEDDED_RE = new RegExp(QUOTA_PATTERN_BODY, 'i');
-
-// Org-level Claude Code access block, e.g. "Your organization has disabled
-// Claude subscription access for Claude Code · Use an Anthropic API key
-// instead, or ask your admin to enable access" (first seen 2026-06-11 on a
-// fallback account, surfaced mid-rotation after the primary's spend-limit
-// exhaustion). Same delivery quirk as QUOTA_RESULT_RE — plain result text,
-// not a thrown error — and the same remediation: the credential is unusable,
-// so throw to advance rotation to the next OAuth fallback. Distinct marker
-// (`subscription_access_disabled`) so logs distinguish a blocked account
-// from an exhausted one. Anchored on the "Your <org-word> has disabled
-// Claude … access" sentence opener; requires "Claude" + "access" so agent
-// prose about other things an org disabled can't match. Same single-source
-// body/anchored/unanchored split as QUOTA_PATTERN_BODY above, for the same
-// reason.
-const SUBSCRIPTION_BLOCKED_PATTERN_BODY =
-  'Your (organization|org|team|admin|account) has disabled Claude( Code)?( subscription)? access\\b';
-
-export const SUBSCRIPTION_BLOCKED_RE = new RegExp(`^\\s*${SUBSCRIPTION_BLOCKED_PATTERN_BODY}`, 'i');
-
-/** Unanchored twin of SUBSCRIPTION_BLOCKED_RE — see QUOTA_EMBEDDED_RE. */
-export const SUBSCRIPTION_BLOCKED_EMBEDDED_RE = new RegExp(SUBSCRIPTION_BLOCKED_PATTERN_BODY, 'i');
+// Result-text quota/access classification is SDK-free and shared with the
+// constrained cross-model review launcher. Keeping one classifier prevents a
+// new Claude wording from healing native rotation while silently blocking it
+// for review calls (or the reverse).
 
 // Poisoned continuation: the SDK surfaces the thinking-signature 400 as plain
 // result text ("API Error: 400 ... Invalid `signature` in `thinking` block"),
