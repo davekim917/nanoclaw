@@ -978,6 +978,49 @@ export async function createConversation(
 }
 
 /**
+ * `conversations.setPurpose` as the named instance's bot.
+ *
+ * BEST EFFORT BY CONTRACT. The purpose is a one-line description shown beside
+ * the room; a room that exists without it is still the room that was asked
+ * for, so a failure here — an app whose token predates the write scope, a
+ * workspace that restricts channel metadata — must not fail the action that
+ * created it. Returns whether Slack accepted it so the caller can say so.
+ */
+export async function setConversationPurpose(
+  instance: string,
+  channelId: string,
+  purpose: string,
+  api: SlackRoomApi = slackCall,
+): Promise<boolean> {
+  if (!purpose.trim()) return false;
+  try {
+    await api(
+      botTokenForInstance(instance),
+      'conversations.setPurpose',
+      { channel: channelId, purpose: purpose.trim() },
+      'room-purpose',
+    );
+    return true;
+  } catch (err) {
+    log.warn('Slack room purpose not applied', {
+      instance,
+      channelId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return false;
+  }
+}
+
+/**
+ * True when this error is Slack refusing to create a channel because one
+ * already carries the name. It is the signal that a previous attempt got as
+ * far as creating the channel, so the caller adopts instead of failing.
+ */
+export function isSlackNameTaken(err: unknown): boolean {
+  return err instanceof SlackApiError && err.message.includes('name_taken');
+}
+
+/**
  * `conversations.invite` as the named instance's bot.
  *
  * Slack takes the whole invitee list in one call and is idempotent only in
