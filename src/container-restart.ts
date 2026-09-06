@@ -504,8 +504,9 @@ export interface BootQuiescenceScope {
   stopped: number;
   /**
    * Containers that carry a workgroup AND a session label, whose workgroup is
-   * outside the changed set — the ones milestone 1 will leave running once D2
-   * flips the stop set. D1 stops them anyway.
+   * outside the changed set — the ones the door LEFT RUNNING for adoption
+   * (seam 4 D2). Counted from the post-stop inventory against the post-stop
+   * re-evaluation, so it is exactly what adoption can find.
    */
   survivable: number;
   /** Containers carrying no workgroup label: unknown scope, always stopped. */
@@ -566,6 +567,15 @@ export interface BootQuiescenceOptions {
    * the returned scope are built from. Omitted, the passed-in set is used.
    */
   reevaluateChanged?: () => string[] | Promise<string[]>;
+  /**
+   * Runs after the PRE-stop partition and before the first stop, with the
+   * sessions that partition would leave running. The boot block writes the
+   * host-restart accountability note here: every session marked running by the
+   * previous host gets one EXCEPT the survivors, whose containers are not
+   * being interrupted — and it is written before the stop pass, which can
+   * outlast the heartbeat freshness window (#441).
+   */
+  beforeStop?: (preStop: { survivableSessionIds: string[]; mustStopSessionIds: string[] }) => Promise<void> | void;
   list?: () => InstallContainerScope[];
   stop?: (name: string) => void;
 }
@@ -589,10 +599,11 @@ export interface BootQuiescenceOptions {
  * Everything else fails closed into must-stop, and the split is exact: every
  * container is on one side or the other.
  *
- * ONE function, and D1 calls it ONCE, with the post-stop changed set. D2 needs
- * it twice — once with the pre-stop set to choose what to stop, and once with
- * the post-stop set for the partition it hands adoption — and a workgroup that
- * flips between the two is must-stop, so D2's stop set is the union.
+ * ONE function, called twice by the door (seam 4 D2): once with the pre-stop
+ * set to choose what to stop, and once over the post-stop inventory with the
+ * post-stop set for the partition it hands adoption. A workgroup that flips
+ * between the two is must-stop in the second pass, so the stop set is the
+ * union.
  */
 function partitionInstallContainers(
   containers: InstallContainerScope[],
@@ -628,22 +639,30 @@ function partitionInstallContainers(
  * (divergence 7) — on the first restart after the scope labels ship, that is
  * every container.
  *
- * D1 STOPS EVERYTHING. The partition is computed, proved and logged, but the
- * stop set is still the whole install, exactly what `cleanupOrphansStrict` did.
- * D2 is the one-branch flip to stopping only `mustStop`, and it is gated on
- * adoption (plan §4.1).
+ * D2 STOPS ONLY `mustStop` (plan §4.1, §7.D2): the containers of workgroups a
+ * reconcile is about to change, plus everything not provably survivable — no
+ * workgroup or session label, an unknown workgroup, a session that is gone or
+ * cannot take a wake. Survivable containers are left running and reach
+ * adoption (`adoptRunningSessions`) by session id, through the returned scope.
  *
- * `changedWorkgroupIds` is a snapshot taken BEFORE this door runs, and the
- * group directories it was computed from are container-writable — a live agent
- * can flip a workgroup from settled to needs-reconcile while the stops are in
- * flight. Under D1 that is only a partition-accuracy question, because the
- * caller re-evaluates the predicates on the quiescent tree and reconciles the
- * post-stop set (src/main.ts). **Under D2 it is a correctness question**: a
- * workgroup that flips after being classified survivable would have its
- * container left running across a mount cutover. D2 must therefore re-validate
- * the predicates after quiescence and either stop the newly-changed
- * workgroups' containers too, or refuse the boot — never silently skip the
- * reconcile for them.
+ * Two partitions, because `changedWorkgroupIds` is a snapshot taken BEFORE
+ * this door runs and the group directories it was computed from are
+ * container-writable — a live agent can flip a workgroup from settled to
+ * needs-reconcile while the stops are in flight:
+ *
+ *   1. PRE-stop, against the snapshot: chooses the stop set, and is handed to
+ *      `beforeStop` so the accountability note skips exactly the sessions
+ *      whose containers are not interrupted.
+ *   2. POST-stop, over the second inventory against the re-evaluated set: a
+ *      workgroup that flipped is must-stop NOW and is stopped in a second
+ *      pass; so is a container that appeared between the listings and is not
+ *      provably survivable. The third inventory must show nothing left in
+ *      must-stop, or the boot fails — a container that will not stop is never
+ *      argued away. The survivors of THAT partition are the adoption contract.
+ *
+ * Survivors keep running through the re-evaluation, so a workgroup can flip
+ * after the second partition too; the reconcile is scoped to the re-evaluated
+ * set and such a flip is reconciled at the next boot, exactly as under D1.
  *
  * Fail-closed like the call it replaces: a listing failure, or a stop that does
  * not take, throws — startup stops before any reconcile runs.
@@ -660,59 +679,76 @@ export async function quiesceWorkgroupsForBootMountChange(
   const containers = list();
   const unlabeled = containers.filter((entry) => entry.workgroupId === null);
 
-  // D1: the stop set is the whole install. D2 replaces this with `mustStop`.
-  const stopSet = containers;
-  for (const entry of stopSet) {
-    try {
-      stop(entry.name);
-    } catch (err) {
-      throw new Error(`Cannot prove install-scoped container absence: failed to stop ${entry.name}`, { cause: err });
+  // Partition 1: pre-stop, against the caller's snapshot. This chooses the
+  // stop set and the accountability note's skip set.
+  const preStop = partitionInstallContainers(containers, changedWorkgroupIds, known, knownSessions);
+  await options.beforeStop?.({
+    survivableSessionIds: preStop.survivable.map((entry) => entry.sessionId as string),
+    mustStopSessionIds: sessionIdsOf(preStop.mustStop),
+  });
+
+  const stoppedNames = new Set<string>();
+  const mustStopNames = new Set<string>();
+  const stopAll = (entries: InstallContainerScope[]): void => {
+    for (const entry of entries) {
+      mustStopNames.add(entry.name);
+      try {
+        stop(entry.name);
+      } catch (err) {
+        throw new Error(`Cannot prove install-scoped container absence: failed to stop ${entry.name}`, { cause: err });
+      }
+      stoppedNames.add(entry.name);
     }
-  }
+  };
+  stopAll(preStop.mustStop);
 
-  // The proof is over the SECOND inventory, not over the names from the first.
-  // Intersecting with the original names would discard a container that
-  // appeared between the two listings — another host, or a spawn racing the
-  // boot — and report quiescence with a live container holding the mounts this
-  // boot is about to rewrite.
+  // The proof is over the SECOND inventory, by each container's OWN labels,
+  // never over the names from the first: a container that appeared between
+  // the two listings — another host, or a spawn racing the boot — is
+  // classified like every other, and a must-stop one that is still here (a
+  // stop that did not take, a newcomer in a changed workgroup) is stopped in
+  // the second pass.
   //
-  // D1 rejects any install-labeled container at all, which is exactly
-  // `cleanupOrphansStrict`'s semantics. D2 narrows this to the containers the
-  // second inventory shows as still in scope, recomputed from THEIR OWN labels
-  // (null workgroup, or a workgroup in `changed`) — never from the first
-  // listing's names, for the same reason.
-  //
-  // Nothing here has to carry which containers it managed to stop: the caller
-  // writes the host-restart accountability note BEFORE this door runs, so a
-  // failure at any point leaves that note already written for every session
+  // Nothing here has to carry which containers it managed to stop: the
+  // accountability note was written by `beforeStop` before the first stop,
+  // so a failure at any point leaves it already written for every session
   // that was marked running (src/main.ts, `runBootMountQuiescence`).
-  const remaining = list();
-  if (remaining.length > 0) {
-    throw new Error(
-      `Install-scoped containers still running after boot quiescence: ${remaining.map((e) => e.name).join(', ')}`,
-    );
-  }
-
-  // The install is quiescent, so NOW the predicates can be trusted: nothing can
-  // write to a group directory any more. The set that came in was a snapshot
-  // taken while containers were still running, and a live agent's last write
-  // could have flipped a workgroup since. Partition against the answer from
-  // here, not that snapshot — otherwise a flipped workgroup's sessions read as
-  // survivable in the very scope that says its mounts are about to move.
+  //
+  // The reconcile set is re-evaluated NOW, after the first pass: nothing in a
+  // changed workgroup can write to its group directory any more. The set that
+  // came in was a snapshot taken while those containers were still running,
+  // and a live agent's last write could have flipped a workgroup since.
+  // Partition against the answer from here, not that snapshot — otherwise a
+  // flipped workgroup's sessions read as survivable in the very scope that
+  // says its mounts are about to move.
+  const secondInventory = list();
   const finalChanged = (await options.reevaluateChanged?.()) ?? changedWorkgroupIds;
-  const { survivable, mustStop } = partitionInstallContainers(containers, finalChanged, known, knownSessions);
+  const afterFirstPass = partitionInstallContainers(secondInventory, finalChanged, known, knownSessions);
+  let survivors = afterFirstPass.survivable;
+  if (afterFirstPass.mustStop.length > 0) {
+    log.info('Boot quiescence second pass', {
+      flipped: finalChanged.filter((id) => !changedWorkgroupIds.includes(id)),
+      containers: afterFirstPass.mustStop.map((entry) => entry.name),
+    });
+    stopAll(afterFirstPass.mustStop);
+    const afterSecondPass = partitionInstallContainers(list(), finalChanged, known, knownSessions);
+    if (afterSecondPass.mustStop.length > 0) {
+      throw new Error(
+        `Install-scoped containers still running after boot quiescence: ${afterSecondPass.mustStop.map((e) => e.name).join(', ')}`,
+      );
+    }
+    survivors = afterSecondPass.survivable;
+  }
 
   const scope: BootQuiescenceScope = {
     workgroups: known.size,
     changedWorkgroupIds: finalChanged,
     containers: containers.length,
-    stopped: stopSet.length,
-    survivable: survivable.length,
+    stopped: stoppedNames.size,
+    survivable: survivors.length,
     unlabeled: unlabeled.length,
-    survivableSessionIds: survivable.map((entry) => entry.sessionId as string),
-    mustStopSessionIds: mustStop
-      .map((entry) => entry.sessionId)
-      .filter((sessionId): sessionId is string => sessionId !== null),
+    survivableSessionIds: survivors.map((entry) => entry.sessionId as string),
+    mustStopSessionIds: [...new Set(sessionIdsOf([...preStop.mustStop, ...afterFirstPass.mustStop]))],
   };
   // Plan §6's measurement shape, in its order. `changed` is the post-stop
   // count, the same set the caller reconciles. The session-id arrays stay out
@@ -725,10 +761,14 @@ export async function quiesceWorkgroupsForBootMountChange(
     stopped: scope.stopped,
     survivable: scope.survivable,
     unlabeled: scope.unlabeled,
-    // `mustStop` is what D2 will stop; under D1 it is a subset of `stopped`.
-    mustStop: mustStop.length,
+    // Every container either pass classified must-stop; under D2 it equals `stopped`.
+    mustStop: mustStopNames.size,
   });
   return scope;
+}
+
+function sessionIdsOf(entries: InstallContainerScope[]): string[] {
+  return entries.map((entry) => entry.sessionId).filter((sessionId): sessionId is string => sessionId !== null);
 }
 
 export function wakeRepositoryMountSessions(sessions: Session[]): void {

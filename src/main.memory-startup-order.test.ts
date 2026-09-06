@@ -5,6 +5,7 @@ import { pathToFileURL } from 'url';
 import { describe, expect, it } from 'vitest';
 
 import {
+  adoptionSeedFor,
   isDirectExecution,
   resolveChannelMetadataUpdates,
   runBootMountQuiescence,
@@ -209,10 +210,10 @@ it('test_startup_runs_strict_quiescence_before_any_memory_cutover', async () => 
     }),
   ).rejects.toThrow('listing unavailable');
 
-  // The accountability note is written BEFORE the door touches anything, so a
-  // door that cannot prove its scope still leaves it written — and nothing
-  // below the door ran.
-  expect(calls).toEqual(['warn', 'quiescence']);
+  // The accountability note is written by the door itself, between its
+  // pre-stop partition and its first stop (seam 4 D2); a door that cannot even
+  // list writes none — and nothing below the door ran.
+  expect(calls).toEqual(['quiescence']);
   db.close();
 });
 
@@ -225,10 +226,11 @@ it('runs reconciliation only after runtime and strict absence proof succeed', as
     memoryWouldChange: () => true,
     sharedWouldChange: () => false,
     sharedFsEnabled: true,
-    quiesce: (changed, options) => {
+    quiesce: async (changed, options) => {
       calls.push('quiescence');
       expect(options.knownWorkgroupIds).toEqual(['wg-1']);
       expect(options.knownSessionIds).toEqual([]);
+      await options.beforeStop({ survivableSessionIds: [], mustStopSessionIds: [] });
       return Promise.resolve({
         workgroups: 0,
         // No flip: the door's post-stop re-evaluation agrees with its input.
@@ -259,8 +261,17 @@ it('runs reconciliation only after runtime and strict absence proof succeed', as
     },
   });
 
-  expect(calls).toEqual(['warn', 'quiescence', 'reconcile-shared', 'reconcile-memory', 'prune']);
+  expect(calls).toEqual(['quiescence', 'warn', 'reconcile-shared', 'reconcile-memory', 'prune']);
   db.close();
+});
+
+it('with survivors the adoption seed is the post-stop survivable set', () => {
+  // The fail-closed seed adoption holds when its own inventory cannot be read
+  // is only what the door LEFT running: the survivable partition when the
+  // door stopped fewer containers than it found, nothing when it stopped all.
+  expect(adoptionSeedFor({ containers: 3, stopped: 1, survivableSessionIds: ['s1', 's2'] })).toEqual(['s1', 's2']);
+  expect(adoptionSeedFor({ containers: 2, stopped: 2, survivableSessionIds: ['s1'] })).toEqual([]);
+  expect(adoptionSeedFor({ containers: 0, stopped: 0, survivableSessionIds: [] })).toEqual([]);
 });
 
 it('keeps the memory gate a runtime check plus the cutover, with nothing stopped inside it', () => {
