@@ -403,7 +403,7 @@
 "docs/ollama.md":{"diff":0,"mode":"100644","sha256":"ae8fcc1353d0aac86cea7b2f36f5cebe6aaaabcf2daad08763cbbf2999505347"},
 "docs/onecli-upgrades.md":{"diff":4,"mode":"100644","sha256":"65ee622e8d9da9e2881227c9a778f7d5bb0ba14644e2bdb2b4203a7f0d5e927c"},
 "docs/provider-migration.md":{"diff":90,"mode":"100644","sha256":"10f013aa19b571aadfbc959b883f5f86f8bb90a09c23e155245e1100d57369c0"},
-"docs/scheduled-tasks.md":{"diff":3,"mode":"100644","sha256":"fed53d536037025142d0ee1c87792a1b1c76b1c3c6dc19f7c120d338564a8c70"},
+"docs/scheduled-tasks.md":{"diff":54,"mode":"100644","sha256":"fb2b92a30e294e6a231d105a584e32f108dc8bc8d5bc5099c9c45fade9aaf71b"},
 "docs/setup-flow.md":{"diff":0,"mode":"100644","sha256":"13d8cb8072a0664045f473155e7b7633d3c14dc8d3b2e055351ff959d654a65f"},
 "docs/setup-wiring.md":{"diff":9,"mode":"100644","sha256":"5b5453a00528a6d487edcf9072339ae35436fb5d5449ba60e933faffb2f0beae"},
 "docs/skill-directives.md":{"diff":15,"mode":"100644","sha256":"0c50066d3c0806a973bc711d64c15ee6c64d08b5d27bfdf81d401465829bdd84"},
