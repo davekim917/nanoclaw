@@ -27,7 +27,10 @@ const spies = vi.hoisted(() => ({
   createMessagingGroup: vi.fn(),
   ensureDestination: vi.fn(),
   registerSecrets: vi.fn(),
+  warn: vi.fn(),
 }));
+
+vi.mock('../log.js', () => ({ log: { warn: spies.warn } }));
 
 vi.mock('../config.js', () => ({
   get REPO_ROOT() {
@@ -290,6 +293,52 @@ describe('addSlackWorkspace', () => {
     await expect(
       addSlackWorkspace({ instance: 'helper', botToken: 'xoxb-synthetic-helper', appToken: 'xapp-synthetic-helper' }),
     ).rejects.toThrow('already attached as slack-offline');
+    expect(spies.upsert).not.toHaveBeenCalled();
+    expect(spies.start).not.toHaveBeenCalled();
+  });
+
+  it('skips a revoked offline sibling and warns only about its instance', async () => {
+    const stale = {
+      channelType: 'slack-revoked',
+      botToken: 'xoxb-synthetic-revoked',
+      appToken: 'xapp-synthetic-revoked',
+    };
+    state.configured = [stale];
+
+    await expect(
+      addSlackWorkspace({ instance: 'helper', botToken: 'xoxb-synthetic-helper', appToken: 'xapp-synthetic-helper' }),
+    ).resolves.toMatchObject({ status: 'started' });
+    expect(spies.start).toHaveBeenCalledTimes(1);
+    expect(state.configured).toContainEqual(stale);
+    expect(spies.warn).toHaveBeenCalledExactlyOnceWith(
+      'Slack sibling identity unavailable; skipping duplicate check for this instance',
+      { channelType: 'slack-revoked' },
+    );
+    expect(JSON.stringify(spies.warn.mock.calls)).not.toMatch(/xoxb-|xapp-/);
+  });
+
+  it('still detects an offline duplicate after skipping an invalid sibling', async () => {
+    state.configured = [
+      { channelType: 'slack-revoked', botToken: 'xoxb-synthetic-revoked' },
+      { channelType: 'slack-duplicate', botToken: 'xoxb-synthetic-duplicate' },
+    ];
+    state.auth.set('xoxb-synthetic-duplicate', { teamId: 'TTEST', userId: 'UBOTHELPER', botId: 'BTEST' });
+
+    await expect(
+      addSlackWorkspace({ instance: 'helper', botToken: 'xoxb-synthetic-helper', appToken: 'xapp-synthetic-helper' }),
+    ).rejects.toThrow('already attached as slack-duplicate');
+    expect(spies.upsert).not.toHaveBeenCalled();
+    expect(spies.start).not.toHaveBeenCalled();
+  });
+
+  it('still rejects an invalid new bot token before probing siblings or writing credentials', async () => {
+    state.configured = [{ channelType: 'slack-revoked', botToken: 'xoxb-synthetic-revoked' }];
+
+    await expect(
+      addSlackWorkspace({ instance: 'helper', botToken: 'xoxb-synthetic-invalid', appToken: 'xapp-synthetic-helper' }),
+    ).rejects.toThrow('Slack credential validation failed: invalid_auth');
+    expect(spies.auth).toHaveBeenCalledExactlyOnceWith('xoxb-synthetic-invalid');
+    expect(spies.warn).not.toHaveBeenCalled();
     expect(spies.upsert).not.toHaveBeenCalled();
     expect(spies.start).not.toHaveBeenCalled();
   });
