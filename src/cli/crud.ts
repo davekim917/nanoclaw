@@ -172,18 +172,41 @@ function visibleColumns(def: ResourceDef): string[] {
   return def.columns.map((c) => c.name);
 }
 
+// Coerces a raw `--flag value` list-filter argument to the column's declared
+// type before it is bound as a SQL parameter. Without this a boolean column
+// stored as SQLite integer 0/1 never matched the raw string 'true'/'false'
+// argv gave it — `ncl <res> list --enabled true` silently returned nothing.
+function coerceListFilter(column: ColumnDef, value: unknown): unknown {
+  switch (column.type) {
+    case 'number': {
+      const number = Number(value);
+      if (Number.isNaN(number)) throw new Error(`--${column.name.replace(/_/g, '-')} must be a number`);
+      return number;
+    }
+    case 'boolean':
+      if (value === true || value === 'true' || value === '1' || value === 1) return 1;
+      if (value === false || value === 'false' || value === '0' || value === 0) return 0;
+      throw new Error(`--${column.name.replace(/_/g, '-')} must be true or false`);
+    case 'json':
+      return typeof value === 'string' ? value : JSON.stringify(value);
+    case 'string':
+      return String(value);
+  }
+}
+
 function genericList(def: ResourceDef) {
   const cols = visibleColumns(def).join(', ');
-  const filterableNames = new Set(def.columns.filter((c) => !c.generated).map((c) => c.name));
+  const filterableColumns = new Map(def.columns.filter((c) => !c.generated).map((c) => [c.name, c]));
   return async (args: Record<string, unknown>) => {
     const limit = args.limit !== undefined ? Math.max(1, Number(args.limit)) : 200;
     const filters: string[] = [];
     const params: unknown[] = [];
     for (const [k, v] of Object.entries(args)) {
       if (k === 'id' || k === 'limit') continue;
-      if (filterableNames.has(k)) {
+      const column = filterableColumns.get(k);
+      if (column) {
         filters.push(`${k} = ?`);
-        params.push(v);
+        params.push(coerceListFilter(column, v));
       }
     }
     const where = filters.length > 0 ? ` WHERE ${filters.join(' AND ')}` : '';
