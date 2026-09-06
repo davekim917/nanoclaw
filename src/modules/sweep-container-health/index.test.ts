@@ -62,6 +62,7 @@ vi.mock('node:child_process', () => childProcessTripwire(spawns));
 // under test logs nothing anyway.
 
 import { closeDb, getDb, initTestDb } from '../../db/connection.js';
+import { withCentralSync } from '../../db/central-lease.js';
 import { sessionStillActive } from '../../container-runner.js';
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..', '..');
@@ -102,7 +103,9 @@ describe('wake guard is evaluated synchronously at the health tick', () => {
       'active',
     );
 
-    const verdict = sessionStillActive('sess-live')();
+    // The guard's raw read is lease-only (seam 3 PR 6): evaluate it the way
+    // the health tick does, inside withCentralSync, and inspect the plain value.
+    const verdict = await withCentralSync(() => sessionStillActive('sess-live')());
 
     expect(verdict).toBe(true);
     expect(typeof (verdict as { then?: unknown }).then).not.toBe('function');
@@ -128,7 +131,7 @@ describe('wake guard is evaluated synchronously at the health tick', () => {
       ['sess-archived', 'session is archived'],
       ['sess-missing', 'session no longer exists'],
     ] as const) {
-      const verdict = sessionStillActive(sessionId)();
+      const verdict = await withCentralSync(() => sessionStillActive(sessionId)());
       expect(verdict).toEqual({ ok: false, reason });
       expect(typeof (verdict as { then?: unknown }).then).not.toBe('function');
     }
