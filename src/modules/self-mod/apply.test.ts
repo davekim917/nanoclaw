@@ -36,7 +36,7 @@ vi.mock('../../session-manager.js', async () => {
   return { ...actual, writeSessionMessage: vi.fn() };
 });
 
-import { readContainerConfig, writeContainerConfig } from '../../container-config.js';
+import { readContainerConfig, updateContainerConfig, writeContainerConfig } from '../../container-config.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { closeDb, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
@@ -152,6 +152,27 @@ describe('applyAddMcpServer', () => {
   it('writes a stdio server the same way', async () => {
     await applyAddMcpServer({ name: 'fs', command: 'mcp-fs', args: ['/data'], env: {} }, session);
     expect(readContainerConfig('agent').mcpServers.fs).toEqual({ command: 'mcp-fs', args: ['/data'], env: {} });
+  });
+
+  it('refuses to overwrite a plugin-owned server, leaving both stores untouched (#486 round 2)', async () => {
+    updateContainerConfig('agent', (cfg) => {
+      // `plugin` is the provenance marker a template stamps; the runtime type
+      // does not declare it, exactly as on disk.
+      (cfg as { mcpServers?: Record<string, unknown> }).mcpServers = {
+        ...(cfg.mcpServers ?? {}),
+        owned: { command: 'plugin-owned', plugin: 'some-plugin' },
+      };
+    });
+    await applyAddMcpServer({ name: 'owned', command: 'mine', args: [], env: {} }, session);
+    expect(readContainerConfig('agent').mcpServers.owned).toMatchObject({
+      command: 'plugin-owned',
+      plugin: 'some-plugin',
+    });
+    expect(JSON.parse((await getContainerConfig('ag-1'))!.mcp_servers).owned).toBeUndefined();
+    const notes = vi.mocked(writeSessionMessage).mock.calls.map(([, , msg]) => JSON.parse(String(msg.content)).text);
+    expect(notes.some((text: string) => /managed by plugin "some-plugin"/.test(text) && !/restamp/i.test(text))).toBe(
+      true,
+    );
   });
 
   it('refuses an approved payload that no longer validates, leaving both stores untouched', async () => {

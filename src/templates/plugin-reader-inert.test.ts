@@ -56,7 +56,14 @@ const OWN_FILES = new Set([
  * this test. T2 PR 3 landed the guard-site wiring T5 PR 4 reserved; T5 PR 4
  * is a no-op for this site. See the module comment above.
  */
-const GUARD_SITE_FILES = new Set(['cli/resources/groups.ts', 'cli/resources/groups.test.ts']);
+const GUARD_SITE_FILES = new Set([
+  'cli/resources/groups.ts',
+  'cli/resources/groups.test.ts',
+  // The self-mod approval apply path writes the same map and shares the
+  // centralised refusal (assertMcpServerNotPluginOwned) — Codex on #486.
+  'modules/self-mod/apply.ts',
+  'modules/self-mod/apply.test.ts',
+]);
 
 describe('Agent Plugins reader leaves have zero callers (T5 PR 1 — inert by design)', () => {
   it('nothing outside their own sources imports manifest.js, plugin-dir.js or skills.js', () => {

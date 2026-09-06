@@ -38,11 +38,13 @@ import { getDeniedModel } from '../../db/denied-models.js';
 import { getSession } from '../../db/sessions.js';
 import { isOpenCodeModelSlug } from '../../flag-parser.js';
 import {
+  assertMcpServerNotPluginOwned,
   isOneCliPlaceholder,
   parseMcpServerConfig,
+  readContainerConfig,
+  type ParsedMcpServerConfig,
   updateContainerConfig,
   validateMcpServerName,
-  type ParsedMcpServerConfig,
 } from '../../container-config.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
@@ -182,6 +184,16 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
   // projection `groups config get` reports and the next file-to-DB backfill
   // would otherwise overwrite. Writing only the DB restarted the container
   // without the server the admin just approved.
+  // Same refusal as the CLI door: an approved add_mcp_server naming a
+  // plugin-owned server must not overwrite the plugin's entry or drop its
+  // provenance marker (Codex on #486). Checked before either store is touched.
+  try {
+    assertMcpServerNotPluginOwned(readContainerConfig(agentGroup.folder).mcpServers?.[name], name, agentGroup.folder);
+  } catch (err) {
+    await notifyAgent(session, `add_mcp_server refused: ${err instanceof Error ? err.message : String(err)}`);
+    return;
+  }
+
   const fileConfig = updateContainerConfig(agentGroup.folder, (config) => {
     if (!config.mcpServers) config.mcpServers = {};
     config.mcpServers[name] = serverConfig;

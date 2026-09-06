@@ -4,7 +4,7 @@ import path from 'path';
 
 import { GROUPS_DIR } from '../../config.js';
 import {
-  mcpServerPluginOwner,
+  assertMcpServerNotPluginOwned,
   parseMcpServerConfig,
   readContainerConfig,
   resolveContainerSecurity,
@@ -646,18 +646,7 @@ registerResource({
         // those fields from the DB; the backfill-container-configs sync is
         // file→DB one-way, so DB drift gets overwritten on next host start.
         const fileConfig = updateContainerConfig(group.folder, (cfg) => {
-          // Plugin-owned entries are template content stamped by a plugin —
-          // the fork has no in-place restamp verb yet (deferred to the
-          // templates theme), so the only sanctioned remediation today is
-          // editing the plugin itself or explicitly taking manual ownership.
-          const owner = mcpServerPluginOwner(cfg.mcpServers?.[name]);
-          if (owner) {
-            throw new Error(
-              `MCP server "${name}" is managed by plugin "${owner}"; direct edits are refused. ` +
-                `Update it through the plugin, or remove the "plugin" marker for that server in ` +
-                `groups/${group.folder}/container.json to take manual ownership.`,
-            );
-          }
+          assertMcpServerNotPluginOwned(cfg.mcpServers?.[name], name, group.folder);
           if (!cfg.mcpServers) cfg.mcpServers = {};
           cfg.mcpServers[name] = newEntry;
         });
@@ -687,18 +676,7 @@ registerResource({
           if (!cfg.mcpServers || !cfg.mcpServers[name]) {
             throw new Error(`MCP server "${name}" not found`);
           }
-          // Plugin-owned entries are template content stamped by a plugin —
-          // the fork has no in-place restamp verb yet (deferred to the
-          // templates theme), so the only sanctioned remediation today is
-          // editing the plugin itself or explicitly taking manual ownership.
-          const owner = mcpServerPluginOwner(cfg.mcpServers[name]);
-          if (owner) {
-            throw new Error(
-              `MCP server "${name}" is managed by plugin "${owner}"; direct edits are refused. ` +
-                `Update it through the plugin, or remove the "plugin" marker for that server in ` +
-                `groups/${group.folder}/container.json to take manual ownership.`,
-            );
-          }
+          assertMcpServerNotPluginOwned(cfg.mcpServers[name], name, group.folder);
           delete cfg.mcpServers[name];
         });
         await updateContainerConfigJson(id, 'mcp_servers', fileConfig.mcpServers ?? {});
