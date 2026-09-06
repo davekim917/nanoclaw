@@ -995,7 +995,7 @@ describe('source-backed decision destinations', () => {
   async function noThread() {
     await getDb().run('DELETE FROM observatory_item_threads');
     await getDb().run("INSERT INTO messaging_group_agents VALUES('m','b',10)");
-    const d = deps([{ ...item, owner: 'James' }]);
+    const d = deps([{ ...item, owner: 'Owner A' }]);
     const source = (await buildSignalData(ctx(), 'w', d)).decisions[0]!;
     const answer = await reviewDecision(
       source.id,
@@ -1104,7 +1104,7 @@ describe('source-backed decision destinations', () => {
     await expect(
       dispatchDecision(source.id, { ...request, target_thread_id: 'slack:C:random' }, ctx(), run),
     ).rejects.toThrow('source_thread_mismatch');
-    const drift = { ...run, scene: async () => scene([{ ...item, owner: 'James', channel: '#elsewhere' }]) };
+    const drift = { ...run, scene: async () => scene([{ ...item, owner: 'Owner A', channel: '#elsewhere' }]) };
     await expect(dispatchDecision(source.id, request, ctx(), drift)).rejects.toThrow('source_destination_changed');
     expect(platform.postParent).not.toHaveBeenCalled();
   });
