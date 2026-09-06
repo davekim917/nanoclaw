@@ -5,8 +5,13 @@
  * `dispatch_support_issue` delivery-action handler when it opens a new per-issue
  * Slack thread + session, and read by the same handler to route follow-up emails
  * back into the existing thread/session. See migration 041.
+ *
+ * Seam 3 PR 5d: every export runs on the async driver. Each is a single
+ * statement — the upsert is one `INSERT ... ON CONFLICT DO UPDATE`, not a
+ * lookup followed by a write — so none needs `centralTransaction` (plan §4.1,
+ * §4.4).
  */
-import { withCentralSync, withRawDb } from './central-lease.js';
+import { getDb } from './connection.js';
 
 export interface SupportThread {
   gmail_thread_id: string;
@@ -26,15 +31,7 @@ export interface SupportThread {
 }
 
 export function getSupportThread(gmailThreadId: string): Promise<SupportThread | undefined> {
-  return withCentralSync(
-    () =>
-      withRawDb((db) => {
-        return db.prepare('SELECT * FROM support_threads WHERE gmail_thread_id = ?').get(gmailThreadId) as
-          | SupportThread
-          | undefined;
-      }),
-    'support-threads.getSupportThread',
-  );
+  return getDb().get<SupportThread>('SELECT * FROM support_threads WHERE gmail_thread_id = ?', gmailThreadId);
 }
 
 export interface UpsertSupportThread {
@@ -60,12 +57,9 @@ export interface UpsertSupportThread {
  * fields use COALESCE so a dispatch without ticket info never clobbers a
  * recorded ticket; `created_at` is preserved on conflict.
  */
-export function upsertSupportThread(t: UpsertSupportThread, now: string): Promise<void> {
-  return withCentralSync(
-    () =>
-      withRawDb((db) => {
-        db.prepare(
-          `INSERT INTO support_threads
+export async function upsertSupportThread(t: UpsertSupportThread, now: string): Promise<void> {
+  await getDb().run(
+    `INSERT INTO support_threads
          (gmail_thread_id, agent_group_id, messaging_group_id, linear_team, linear_issue,
           slack_parent_msg_id, slack_thread_id, session_id, status, last_gmail_message_id,
           subject, sender, created_at, last_activity_at)
@@ -85,9 +79,7 @@ export function upsertSupportThread(t: UpsertSupportThread, now: string): Promis
          subject = COALESCE(excluded.subject, subject),
          sender = COALESCE(excluded.sender, sender),
          last_activity_at = excluded.last_activity_at`,
-        ).run({ ...t, now });
-      }),
-    'support-threads.upsertSupportThread',
+    { ...t, now },
   );
 }
 
@@ -97,36 +89,23 @@ export function upsertSupportThread(t: UpsertSupportThread, now: string): Promis
  * agent never supplies a cross-row key (same security posture as scheduling).
  */
 export function getSupportThreadBySession(sessionId: string): Promise<SupportThread | undefined> {
-  return withCentralSync(
-    () =>
-      withRawDb((db) => {
-        return db.prepare('SELECT * FROM support_threads WHERE session_id = ?').get(sessionId) as
-          | SupportThread
-          | undefined;
-      }),
-    'support-threads.getSupportThreadBySession',
-  );
+  return getDb().get<SupportThread>('SELECT * FROM support_threads WHERE session_id = ?', sessionId);
 }
 
 /** Record the Linear ticket a per-issue session created for its thread. */
-export function setSupportThreadTicket(
+export async function setSupportThreadTicket(
   gmailThreadId: string,
   linearIssue: string,
   linearTeam: string | null,
   now: string,
 ): Promise<void> {
-  return withCentralSync(
-    () =>
-      withRawDb((db) => {
-        db.prepare(
-          `UPDATE support_threads
+  await getDb().run(
+    `UPDATE support_threads
           SET linear_issue = @linearIssue,
               linear_team = COALESCE(@linearTeam, linear_team),
               last_activity_at = @now
         WHERE gmail_thread_id = @gmailThreadId`,
-        ).run({ gmailThreadId, linearIssue, linearTeam, now });
-      }),
-    'support-threads.setSupportThreadTicket',
+    { gmailThreadId, linearIssue, linearTeam, now },
   );
 }
 
@@ -135,23 +114,18 @@ export function setSupportThreadTicket(
  * `last_activity_at`, refreshes `last_gmail_message_id` when supplied, and
  * reopens a previously-closed thread (a customer reply revives the issue).
  */
-export function touchSupportThread(
+export async function touchSupportThread(
   gmailThreadId: string,
   now: string,
   lastGmailMessageId?: string | null,
 ): Promise<void> {
-  return withCentralSync(
-    () =>
-      withRawDb((db) => {
-        db.prepare(
-          `UPDATE support_threads
+  await getDb().run(
+    `UPDATE support_threads
           SET last_activity_at = @now,
               status = 'open',
               last_gmail_message_id = COALESCE(@lastGmailMessageId, last_gmail_message_id)
         WHERE gmail_thread_id = @gmailThreadId`,
-        ).run({ gmailThreadId, now, lastGmailMessageId: lastGmailMessageId ?? null });
-      }),
-    'support-threads.touchSupportThread',
+    { gmailThreadId, now, lastGmailMessageId: lastGmailMessageId ?? null },
   );
 }
 
@@ -165,28 +139,17 @@ export function touchSupportThread(
  * upsert path) would mint a new Slack thread and a duplicate announcement for
  * what is, to everyone involved, an ongoing conversation.
  */
-export function rebindSupportThreadSession(gmailThreadId: string, sessionId: string): Promise<void> {
-  return withCentralSync(
-    () =>
-      withRawDb((db) => {
-        db.prepare('UPDATE support_threads SET session_id = @sessionId WHERE gmail_thread_id = @gmailThreadId').run({
-          gmailThreadId,
-          sessionId,
-        });
-      }),
-    'support-threads.rebindSupportThreadSession',
-  );
+export async function rebindSupportThreadSession(gmailThreadId: string, sessionId: string): Promise<void> {
+  await getDb().run('UPDATE support_threads SET session_id = @sessionId WHERE gmail_thread_id = @gmailThreadId', {
+    gmailThreadId,
+    sessionId,
+  });
 }
 
-export function closeSupportThread(gmailThreadId: string, now: string): Promise<void> {
-  return withCentralSync(
-    () =>
-      withRawDb((db) => {
-        db.prepare("UPDATE support_threads SET status = 'closed', last_activity_at = ? WHERE gmail_thread_id = ?").run(
-          now,
-          gmailThreadId,
-        );
-      }),
-    'support-threads.closeSupportThread',
+export async function closeSupportThread(gmailThreadId: string, now: string): Promise<void> {
+  await getDb().run(
+    "UPDATE support_threads SET status = 'closed', last_activity_at = ? WHERE gmail_thread_id = ?",
+    now,
+    gmailThreadId,
   );
 }

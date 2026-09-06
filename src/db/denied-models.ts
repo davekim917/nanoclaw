@@ -1,4 +1,4 @@
-import { withCentralSync, withRawDb } from './central-lease.js';
+import { getDb } from './connection.js';
 
 /**
  * Operator-curated blocklist of forbidden (provider, slug) pairs.
@@ -11,6 +11,9 @@ import { withCentralSync, withRawDb } from './central-lease.js';
  *
  * Replaces the 037 allowlist (which was over-engineered) — see migration
  * 039 docstring for rationale.
+ *
+ * Seam 3 PR 5d: all four statements run on the async driver. Each is a single
+ * statement, so none needs `centralTransaction` (plan §4.1, §4.4).
  */
 export interface DeniedModel {
   provider: string;
@@ -20,30 +23,14 @@ export interface DeniedModel {
 }
 
 export function listDeniedModels(provider?: string): Promise<DeniedModel[]> {
-  return withCentralSync(
-    () =>
-      withRawDb((db) => {
-        if (provider) {
-          return db
-            .prepare('SELECT * FROM denied_models WHERE provider = ? ORDER BY slug ASC')
-            .all(provider) as DeniedModel[];
-        }
-        return db.prepare('SELECT * FROM denied_models ORDER BY provider ASC, slug ASC').all() as DeniedModel[];
-      }),
-    'denied-models.listDeniedModels',
-  );
+  if (provider) {
+    return getDb().all<DeniedModel>('SELECT * FROM denied_models WHERE provider = ? ORDER BY slug ASC', provider);
+  }
+  return getDb().all<DeniedModel>('SELECT * FROM denied_models ORDER BY provider ASC, slug ASC');
 }
 
 export function getDeniedModel(provider: string, slug: string): Promise<DeniedModel | undefined> {
-  return withCentralSync(
-    () =>
-      withRawDb((db) => {
-        return db.prepare('SELECT * FROM denied_models WHERE provider = ? AND slug = ?').get(provider, slug) as
-          | DeniedModel
-          | undefined;
-      }),
-    'denied-models.getDeniedModel',
-  );
+  return getDb().get<DeniedModel>('SELECT * FROM denied_models WHERE provider = ? AND slug = ?', provider, slug);
 }
 
 /** True when (provider, slug) is in the blocklist. */
@@ -51,25 +38,17 @@ export async function isDeniedModel(provider: string, slug: string): Promise<boo
   return (await getDeniedModel(provider, slug)) !== undefined;
 }
 
-export function addDeniedModel(provider: string, slug: string, reason: string | null): Promise<void> {
-  return withCentralSync(
-    () =>
-      withRawDb((db) => {
-        db.prepare(
-          `INSERT INTO denied_models (provider, slug, reason, created_at)
+export async function addDeniedModel(provider: string, slug: string, reason: string | null): Promise<void> {
+  await getDb().run(
+    `INSERT INTO denied_models (provider, slug, reason, created_at)
        VALUES (?, ?, ?, ?)`,
-        ).run(provider, slug, reason, new Date().toISOString());
-      }),
-    'denied-models.addDeniedModel',
+    provider,
+    slug,
+    reason,
+    new Date().toISOString(),
   );
 }
 
-export function removeDeniedModel(provider: string, slug: string): Promise<void> {
-  return withCentralSync(
-    () =>
-      withRawDb((db) => {
-        db.prepare('DELETE FROM denied_models WHERE provider = ? AND slug = ?').run(provider, slug);
-      }),
-    'denied-models.removeDeniedModel',
-  );
+export async function removeDeniedModel(provider: string, slug: string): Promise<void> {
+  await getDb().run('DELETE FROM denied_models WHERE provider = ? AND slug = ?', provider, slug);
 }
