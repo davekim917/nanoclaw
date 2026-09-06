@@ -103,6 +103,23 @@ registerResource({
   operations: { list: 'open', create: 'open' },
 });
 
+// Synthetic resource with an explicit `listOrder`, distinct from the
+// default-timestamp-DESC form above (case 18's override half).
+registerResource({
+  name: 'ordertest',
+  plural: 'ordertests',
+  table: 'ordertest_rows',
+  description: 'Synthetic resource for the explicit listOrder override test.',
+  idColumn: 'id',
+  listOrder: 'seq ASC, id',
+  columns: [
+    { name: 'id', type: 'string', description: 'UUID.', generated: true },
+    { name: 'seq', type: 'number', description: 'explicit sort key', required: true },
+    { name: 'created_at', type: 'string', description: 'Auto-set.', generated: true },
+  ],
+  operations: { list: 'open', create: 'open' },
+});
+
 beforeEach(async () => {
   await initTestDb();
   const db = getRawDb();
@@ -351,5 +368,62 @@ describe('genericList coerceListFilter (cases 16, 17)', () => {
     await lookup('crudtests-create')!.handler({ name: 'a', payload: '{"k":1}' }, hostCtx);
     const rows = (await lookup('crudtests-list')!.handler({ payload: '{"k":1}' }, hostCtx)) as { name: string }[];
     expect(rows.map((r) => r.name)).toEqual(['a']);
+  });
+});
+
+describe('genericList listOrder (cases 18, 19)', () => {
+  beforeEach(() => {
+    getRawDb().exec(
+      `CREATE TABLE crudtest_rows (
+         id TEXT PRIMARY KEY, scope TEXT, name TEXT NOT NULL,
+         enabled INTEGER, score INTEGER, payload TEXT, created_at TEXT NOT NULL
+       )`,
+    );
+    getRawDb().exec(
+      `CREATE TABLE ordertest_rows (id TEXT PRIMARY KEY, seq INTEGER NOT NULL, created_at TEXT NOT NULL)`,
+    );
+  });
+
+  it('generic list orders by the resource timestamp column, newest first (case 18)', async () => {
+    const a = (await lookup('crudtests-create')!.handler({ name: 'a' }, hostCtx)) as {
+      id: string;
+      created_at: string;
+    };
+    await new Promise((r) => setTimeout(r, 2));
+    const b = (await lookup('crudtests-create')!.handler({ name: 'b' }, hostCtx)) as {
+      id: string;
+      created_at: string;
+    };
+    const rows = (await lookup('crudtests-list')!.handler({}, hostCtx)) as { id: string }[];
+    expect(rows.map((r) => r.id)).toEqual([b.id, a.id]);
+  });
+
+  it('a resource with an explicit listOrder uses it instead of the default (case 18)', async () => {
+    // Insertion order is REVERSE of `seq` — if the default timestamp order
+    // were used instead of the declared `listOrder: 'seq ASC, id'`, this
+    // would come back newest-created-first (3, 2, 1), not seq-ascending.
+    await lookup('ordertests-create')!.handler({ seq: 3 }, hostCtx);
+    await lookup('ordertests-create')!.handler({ seq: 1 }, hostCtx);
+    await lookup('ordertests-create')!.handler({ seq: 2 }, hostCtx);
+    const rows = (await lookup('ordertests-list')!.handler({}, hostCtx)) as { seq: number }[];
+    expect(rows.map((r) => r.seq)).toEqual([1, 2, 3]);
+  });
+
+  it('a LIMIT still cannot hide the newest rows under the timestamp form (case 19)', async () => {
+    // Same regression `ORDER BY rowid DESC` was introduced to fix
+    // (crud.ts:189-191), re-pinned against the `listOrder(def)` timestamp
+    // form: insert several rows and confirm a small `--limit` still returns
+    // the newest one, not an arbitrary storage-order slice.
+    let last: { id: string } | undefined;
+    for (let i = 0; i < 5; i++) {
+      last = (await lookup('crudtests-create')!.handler({ name: `row-${i}` }, hostCtx)) as { id: string };
+      // Distinct millisecond timestamps so `created_at DESC` orders
+      // deterministically instead of falling through to the random-UUID
+      // `id` tiebreak on a timestamp tie.
+      await new Promise((r) => setTimeout(r, 2));
+    }
+    const rows = (await lookup('crudtests-list')!.handler({ limit: 1 }, hostCtx)) as { id: string }[];
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).toBe(last!.id);
   });
 });
