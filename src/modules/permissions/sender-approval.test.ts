@@ -208,6 +208,22 @@ describe('unknown-sender request_approval flow', () => {
     expect(rows).toHaveLength(1);
   });
 
+  // T4 PR1 (§5 case 12): the unknown-sender card must be delivered through
+  // the approver DM's own adapter instance — same live defect as the
+  // channel-registration card, one call site over in sender-approval.ts.
+  it('the unknown-sender card is delivered on the origin conversation instance', async () => {
+    const { getRawDb } = await import('../../db/connection.js');
+    getRawDb().prepare("UPDATE messaging_groups SET instance = 'telegram-work' WHERE id = 'mg-dm-owner'").run();
+
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(stranger('hi'));
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+    // 7th positional arg is `instance` on ChannelDeliveryAdapter.deliver.
+    expect(deliverMock.mock.calls[0][6]).toBe('telegram-work');
+  });
+
   it('dedups a second message from the same stranger while pending', async () => {
     const { routeInbound } = await import('../../router.js');
     const first = stranger('hello');

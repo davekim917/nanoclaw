@@ -240,6 +240,23 @@ describe('unknown-channel registration flow', () => {
     expect(rows).toHaveLength(1);
   });
 
+  // T4 PR1 (§5 case 11): the registration card must be delivered through the
+  // approver DM's own adapter instance, not the bare channel_type — on an
+  // install whose bots are all named instances, an untagged deliver() call
+  // resolves no adapter or the wrong sibling bot.
+  it('the registration card is delivered on the origin conversation instance', async () => {
+    const { getRawDb } = await import('../../db/connection.js');
+    getRawDb().prepare("UPDATE messaging_groups SET instance = 'telegram-work' WHERE id = 'mg-dm-owner'").run();
+
+    const { routeInbound } = await import('../../router.js');
+    await routeInbound(groupMention('chat-instance'));
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+    // 7th positional arg is `instance` on ChannelDeliveryAdapter.deliver.
+    expect(deliverMock.mock.calls[0][6]).toBe('telegram-work');
+  });
+
   it('delivers a card on DM too (non-threaded event)', async () => {
     const { routeInbound } = await import('../../router.js');
     await routeInbound(dmEvent('dm-new-user'));
@@ -718,6 +735,123 @@ describe('unknown-channel registration flow', () => {
       getRawDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }
     ).c;
     expect(stillPending).toBe(0);
+  });
+
+  // T4 PR1 (§5 case 13): both the "choose existing agent" follow-up card and
+  // the free-text name prompt are DMs to the approver, so they must carry the
+  // approver DM's own instance too — same defect, two more sites in index.ts.
+  it('the agent-selection follow-up and the name prompt are delivered on the approver DM instance', async () => {
+    const { getRawDb } = await import('../../db/connection.js');
+    getRawDb().prepare("UPDATE messaging_groups SET instance = 'telegram-work' WHERE id = 'mg-dm-owner'").run();
+
+    const { routeInbound } = await import('../../router.js');
+    const { getResponseHandlers } = await import('../../response-registry.js');
+
+    // Path 1: "Choose existing agent" follow-up card.
+    await routeInbound(groupMention('chat-instance-choose'));
+    await new Promise((r) => setTimeout(r, 10));
+    const pendingChoose = getRawDb().prepare('SELECT messaging_group_id FROM pending_channel_approvals').get() as {
+      messaging_group_id: string;
+    };
+    deliverMock.mockClear();
+    for (const handler of getResponseHandlers()) {
+      const claimed = await handler({
+        questionId: pendingChoose.messaging_group_id,
+        value: 'choose_existing',
+        userId: 'owner',
+        channelType: 'telegram',
+        platformId: 'dm-owner',
+        threadId: null,
+      });
+      if (claimed) break;
+    }
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+    expect(deliverMock.mock.calls[0][6]).toBe('telegram-work');
+
+    // Path 2: "Create new agent" free-text name prompt.
+    await routeInbound(groupMention('chat-instance-newagent'));
+    await new Promise((r) => setTimeout(r, 10));
+    const pendingNew = getRawDb()
+      .prepare('SELECT messaging_group_id FROM pending_channel_approvals WHERE messaging_group_id != ?')
+      .get(pendingChoose.messaging_group_id) as { messaging_group_id: string };
+    deliverMock.mockClear();
+    for (const handler of getResponseHandlers()) {
+      const claimed = await handler({
+        questionId: pendingNew.messaging_group_id,
+        value: 'new_agent',
+        userId: 'owner',
+        channelType: 'telegram',
+        platformId: 'dm-owner',
+        threadId: null,
+      });
+      if (claimed) break;
+    }
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+    expect(deliverMock.mock.calls[0][6]).toBe('telegram-work');
+  });
+
+  // T4 PR1 (§5 case 14): the free-text name interceptor must match on the
+  // reply's instance too, not just channelType/platformId — a same-channel
+  // reply from a DIFFERENT sibling bot's DM is not the approver answering.
+  it('a name reply from a different instance is not consumed; the matching instance is', async () => {
+    const { getRawDb } = await import('../../db/connection.js');
+    getRawDb().prepare("UPDATE messaging_groups SET instance = 'telegram-work' WHERE id = 'mg-dm-owner'").run();
+
+    const { routeInbound } = await import('../../router.js');
+    const { getResponseHandlers } = await import('../../response-registry.js');
+
+    await routeInbound(groupMention('chat-instance-mismatch'));
+    await new Promise((r) => setTimeout(r, 10));
+    const pending = getRawDb().prepare('SELECT messaging_group_id FROM pending_channel_approvals').get() as {
+      messaging_group_id: string;
+    };
+
+    for (const handler of getResponseHandlers()) {
+      const claimed = await handler({
+        questionId: pending.messaging_group_id,
+        value: 'new_agent',
+        userId: 'owner',
+        channelType: 'telegram',
+        platformId: 'dm-owner',
+        threadId: null,
+      });
+      if (claimed) break;
+    }
+
+    // Same channelType/platformId, but no `instance` — a bare-channel-type
+    // reply on a named-instance approver DM is a different conversation and
+    // must not be consumed.
+    await routeInbound({
+      channelType: 'telegram',
+      platformId: 'dm-owner',
+      threadId: null,
+      message: {
+        id: 'name-reply-mismatch',
+        kind: 'chat' as const,
+        content: JSON.stringify({ senderId: 'owner', senderName: 'Owner', text: 'WrongInstance' }),
+        timestamp: now(),
+      },
+    });
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(getRawDb().prepare("SELECT id FROM agent_groups WHERE name = 'WrongInstance'").get()).toBeUndefined();
+
+    // The matching-instance reply is still awaited and gets consumed.
+    await routeInbound({
+      channelType: 'telegram',
+      instance: 'telegram-work',
+      platformId: 'dm-owner',
+      threadId: null,
+      message: {
+        id: 'name-reply-match',
+        kind: 'chat' as const,
+        content: JSON.stringify({ senderId: 'owner', senderName: 'Owner', text: 'RightInstance' }),
+        timestamp: now(),
+      },
+    });
+
+    const created = getRawDb().prepare("SELECT id FROM agent_groups WHERE name = 'RightInstance'").get();
+    expect(created).toBeDefined();
   });
 
   it('a name reply after the registration vanished is consumed without creating anything', async () => {

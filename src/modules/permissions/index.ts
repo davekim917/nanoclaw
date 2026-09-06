@@ -78,6 +78,10 @@ interface PendingNameInput {
   channelMgId: string;
   dmChannelType: string;
   dmPlatformId: string;
+  // Named-instance approver DM: without this, a reply on the approver's
+  // bare-channel-type conversation would be matched to a different
+  // sibling bot's conversation carrying the same channelType/platformId.
+  dmInstance?: string;
 }
 const awaitingNameInput = new Map<string, PendingNameInput>();
 
@@ -630,6 +634,12 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
   const row = getPendingChannelApproval(payload.questionId);
   if (!row) return false;
 
+  // Origin conversation's adapter instance — threaded into ensureUserDm below
+  // so the follow-up card / name prompt lands on the SAME sibling bot's DM
+  // the registration card itself was delivered on, instead of falling back
+  // to whichever adapter the bare channel_type happens to resolve.
+  const originMg = getMessagingGroup(row.messaging_group_id);
+
   // Click authorization is the guard's channels.register decision (./guard.ts):
   // the delivered approver, or an admin of the pending row's anchor agent group.
   const clickerId = payload.userId
@@ -670,7 +680,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
 
   // ── Choose existing agent — send agent-selection follow-up card ──
   if (payload.value === CHOOSE_EXISTING_VALUE) {
-    const approverDm = await ensureUserDm(row.approver_user_id);
+    const approverDm = await ensureUserDm(row.approver_user_id, originMg?.instance);
     if (!approverDm) {
       log.error('Channel registration: no DM channel for approver', {
         messagingGroupId: row.messaging_group_id,
@@ -689,6 +699,8 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
     await updatePendingChannelApprovalCard(row.messaging_group_id, title, question, JSON.stringify(options));
 
     try {
+      // Instance-addressed: `approverDm.instance` is the exact adapter
+      // instance `ensureUserDm` resolved this DM on above.
       await adapter.deliver(
         approverDm.channel_type,
         approverDm.platform_id,
@@ -701,6 +713,8 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
           question,
           options,
         }),
+        undefined,
+        approverDm.instance,
       );
     } catch (err) {
       log.error('Channel registration: agent-selection card delivery failed', {
@@ -713,7 +727,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
 
   // ── Create new agent — prompt for free-text name ──
   if (payload.value === NEW_AGENT_VALUE) {
-    const approverDm = await ensureUserDm(row.approver_user_id);
+    const approverDm = await ensureUserDm(row.approver_user_id, originMg?.instance);
     if (!approverDm) {
       log.error('Channel registration: no DM channel for approver', {
         messagingGroupId: row.messaging_group_id,
@@ -734,15 +748,20 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
       channelMgId: row.messaging_group_id,
       dmChannelType: approverDm.channel_type,
       dmPlatformId: approverDm.platform_id,
+      dmInstance: approverDm.instance,
     });
 
     try {
+      // Instance-addressed: `approverDm.instance` is the exact adapter
+      // instance `ensureUserDm` resolved this DM on above.
       await adapter.deliver(
         approverDm.channel_type,
         approverDm.platform_id,
         null,
         'chat-sdk',
         JSON.stringify({ text: 'Reply with the name for your new agent:' }),
+        undefined,
+        approverDm.instance,
       );
     } catch (err) {
       log.error('Channel registration: name prompt delivery failed', {
@@ -803,6 +822,12 @@ registerMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
   const pending = awaitingNameInput.get(userId);
   if (!pending) return false;
   if (event.channelType !== pending.dmChannelType || event.platformId !== pending.dmPlatformId) return false;
+  // Instance-matched too: the same channelType/platformId can be shared by
+  // more than one sibling bot's conversation (e.g. a direct-addressable
+  // channel where the platform_id is the user's own handle) — a reply that
+  // arrived on a DIFFERENT instance is a different conversation, not the
+  // approver answering this prompt.
+  if ((event.instance ?? event.channelType) !== (pending.dmInstance ?? pending.dmChannelType)) return false;
 
   awaitingNameInput.delete(userId);
 
@@ -822,6 +847,11 @@ registerMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
   const row = getPendingChannelApproval(pending.channelMgId);
   if (!row) return true;
 
+  // Origin instance for the follow-up notifications below, same reasoning as
+  // handleChannelApprovalResponse: keep every reply to this approver on the
+  // sibling bot the registration started on.
+  const originMg = getMessagingGroup(row.messaging_group_id);
+
   // `awaitingNameInput` is already deleted by here, so a throw out of this
   // interceptor would strand the approver with no card, no agent, and no
   // message. Creation can now legitimately fail (folder allocation gives up
@@ -835,7 +865,11 @@ registerMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
       agentName: text,
       err,
     });
-    await notifyApprover(row.approver_user_id, `⚠️ Couldn't create agent "${text}" — check the host logs.`);
+    await notifyApprover(
+      row.approver_user_id,
+      `⚠️ Couldn't create agent "${text}" — check the host logs.`,
+      originMg?.instance,
+    );
     return true;
   }
 
@@ -853,15 +887,18 @@ registerMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
     wired
       ? `✅ Agent "${ag.name}" created and connected.`
       : `⚠️ Agent "${ag.name}" was created but the channel couldn't be connected — check the host logs.`,
+    originMg?.instance,
   );
   return true;
 });
 
 /** Best-effort DM to the approver; delivery failures are never fatal here. */
-async function notifyApprover(approverUserId: string, text: string): Promise<void> {
+async function notifyApprover(approverUserId: string, text: string, instance?: string): Promise<void> {
   const adapter = getDeliveryAdapter();
   if (!adapter) return;
-  const dm = await ensureUserDm(approverUserId);
+  const dm = await ensureUserDm(approverUserId, instance);
   if (!dm) return;
-  adapter.deliver(dm.channel_type, dm.platform_id, null, 'chat-sdk', JSON.stringify({ text })).catch(() => {});
+  adapter
+    .deliver(dm.channel_type, dm.platform_id, null, 'chat-sdk', JSON.stringify({ text }), undefined, dm.instance)
+    .catch(() => {});
 }
