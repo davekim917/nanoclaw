@@ -60,6 +60,8 @@ const fakes = vi.hoisted(() => {
     listingFails: false,
     /** `docker stop` throws and the container keeps running. */
     stopFails: false,
+    /** Waiters for these names close in a microtask as soon as they are armed. */
+    closeOnArm: new Set<string>(),
     running: new Set<string>(),
     stopped: [] as string[],
     waiters: [] as Array<{ name: string; waiter: Waiter }>,
@@ -72,6 +74,12 @@ const fakes = vi.hoisted(() => {
     arm(name: string): Waiter {
       const waiter = fakes.makeWaiter!();
       fakes.waiters.push({ name, waiter });
+      if (fakes.closeOnArm.has(name)) {
+        queueMicrotask(() => {
+          waiter.exitCode = 0;
+          waiter.emit('close', 0);
+        });
+      }
       return waiter;
     },
     waitersFor(name: string): Waiter[] {
@@ -88,6 +96,7 @@ const fakes = vi.hoisted(() => {
       this.listing = [];
       this.listingFails = false;
       this.stopFails = false;
+      this.closeOnArm.clear();
       this.running.clear();
       this.stopped = [];
       this.waiters = [];
@@ -328,6 +337,7 @@ describe('adoptRunningSessions', () => {
     vi.mocked(log.warn).mockClear();
     vi.mocked(log.info).mockClear();
     vi.mocked(log.error).mockClear();
+    vi.mocked(log.debug).mockClear();
     await openClaimHarnessDb(TEST_DATA_DIR, TEST_GROUPS_DIR);
     vi.stubEnv('NANOCLAW_STORAGE_MANAGER_ENABLED', '0');
     allowSubprocess([ABSENT_CONTAINER_RUNTIME_BIN]);
@@ -718,6 +728,49 @@ describe('adoptRunningSessions', () => {
     expect(containerOwnsOutbound('sess-pending-memory')).toBe(false);
     expect(memoryStub.reservedMb()).toBe(0);
     expect(infos('Spawning container')).toEqual([]);
+  });
+
+  it('with a D1 scope (the door stopped everything) a failing inventory creates no pending holds', async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-counterfactual');
+    fakes.listingFails = true;
+    const requestMb = resolveContainerResources(undefined).memory.requestMb;
+
+    // D1's partition names the session as survivable, but the door stopped it
+    // (stopped == containers): main() passes an empty seed, and nothing is held.
+    const reconciled = await adoptRunningSessions({
+      list: fakes.list,
+      survivableSessionIds: ['sess-counterfactual'],
+      heldOnInventoryFailure: [],
+    });
+
+    expect(reconciled).toEqual({ adopted: 0, stopped: 0, pendingClaim: 0, fencedInbound: 0 });
+    expect(hasPendingAdoption('sess-counterfactual')).toBe(false);
+    expect(containerOwnsOutbound('sess-counterfactual')).toBe(false);
+    expect(memoryStub.reservedMb()).toBe(0);
+    expect(warnings('Adoption inventory failed; nothing left running by the boot door, nothing held')).toHaveLength(1);
+    expect(requestMb).toBeGreaterThan(0);
+  });
+
+  it('a waiter that finalizes during the reconcile await leaves no running stamp', async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-early-exit');
+    fakes.listing = [survivor('sess-early-exit')];
+    fakes.closeOnArm.add('nanoclaw-v2-sess-early-exit');
+
+    await adoptRunningSessions({ list: fakes.list });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // The container exited between the waiter being armed and the reconcile
+    // await resuming: the entry is gone, and the running stamp was skipped
+    // rather than written over the finish.
+    expect(isContainerRunning('sess-early-exit')).toBe(false);
+    expect(await containerStatusOf('sess-early-exit')).toBe('stopped');
+    expect(
+      vi
+        .mocked(log.debug)
+        .mock.calls.filter(
+          (call) => call[0] === 'Adopted container finalized during reconcile — skipping the running stamp',
+        ),
+    ).toHaveLength(1);
   });
 
   it("an adopted session's ceiling uses the adoption instant", async () => {

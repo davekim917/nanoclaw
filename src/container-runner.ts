@@ -2408,6 +2408,13 @@ async function registerAdoptedContainer(
   armAdoptedWaiter(session.id, channel, containerName);
   // F1 hook: reconcileSurvivorWakeRows(session)
   await reconcileSurvivorWakeRows(session);
+  // The waiter is armed and may have finalized during that await: the same
+  // identity fence `finalizeSession` uses decides whether a running stamp is
+  // still ours to write.
+  if (activeContainers.get(session.id)?.channel !== channel) {
+    log.debug('Adopted container finalized during reconcile — skipping the running stamp', { sessionId: session.id });
+    return;
+  }
   try {
     await markContainerRunning(session.id);
   } catch (err) {
@@ -2608,33 +2615,44 @@ export async function adoptRunningSessions(
      * (the pre-D1 tree, and tests that drive the listing directly).
      */
     survivableSessionIds?: ReadonlySet<string> | readonly string[];
+    /**
+     * The sessions whose containers the door actually LEFT running — the
+     * fail-closed seed when this pass's own inventory cannot be taken. Defaults
+     * to `survivableSessionIds`. `main()` derives it from the door's counts:
+     * under D1 the door stops the survivable containers too, so its partition
+     * is a counterfactual and seeding it would create phantom holds for
+     * containers the door just proved gone; the seed is then empty.
+     */
+    heldOnInventoryFailure?: ReadonlySet<string> | readonly string[];
   } = {},
 ): Promise<StartupReconciliation> {
   if (deps.list) adoptionListing = deps.list;
-  const survivable =
-    deps.survivableSessionIds === undefined
-      ? null
-      : deps.survivableSessionIds instanceof Set
-        ? (deps.survivableSessionIds as ReadonlySet<string>)
-        : new Set(deps.survivableSessionIds as readonly string[]);
+  const asSet = (ids: ReadonlySet<string> | readonly string[] | undefined): ReadonlySet<string> | null =>
+    ids === undefined ? null : ids instanceof Set ? (ids as ReadonlySet<string>) : new Set(ids as readonly string[]);
+  const survivable = asSet(deps.survivableSessionIds);
+  const heldOnFailure = asSet(deps.heldOnInventoryFailure) ?? survivable;
   const counts: StartupReconciliation = { adopted: 0, stopped: 0, pendingClaim: 0, fencedInbound: 0 };
   let containers: InstallContainerScope[];
   try {
     containers = adoptionListing();
   } catch (err) {
-    if (survivable && survivable.size > 0) {
-      // The door proved these containers survived; a listing this process
+    if (heldOnFailure && heldOnFailure.size > 0) {
+      // The door left these containers running; a listing this process
       // cannot take is no evidence they are gone. Every one is held pending —
       // owned and leased — until `retryPendingAdoption` can re-list.
       log.warn('Session adoption listing failed — holding every survivable session as pending', {
         err,
-        sessions: [...survivable],
+        sessions: [...heldOnFailure],
       });
-      for (const sessionId of survivable) {
+      for (const sessionId of heldOnFailure) {
         await holdUnlistedSurvivor(sessionId);
         counts.pendingClaim += 1;
       }
       log.info('Reconciled sessions at startup', { ...counts });
+      return counts;
+    }
+    if (heldOnFailure) {
+      log.warn('Adoption inventory failed; nothing left running by the boot door, nothing held', { err });
       return counts;
     }
     log.warn('Session adoption skipped — runtime listing failed', { err });

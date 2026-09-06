@@ -567,7 +567,18 @@ export async function main(): Promise<void> {
   // the set is empty and this adopts nothing until D2 flips the stop set. D2
   // also needs a PRE-stop partition for the warn's skip set (the door's D2
   // note); this post-stop one is the adoption contract.
-  const reconciled = await adoptRunningSessions({ survivableSessionIds: scope.survivableSessionIds });
+  //
+  // If adoption's own inventory then fails, the fail-closed seed is only what
+  // the door actually LEFT running: under D1 `stopped == containers`, so the
+  // partition is a counterfactual and the seed is empty — holding it would
+  // create phantom storage and memory holds for containers the door just
+  // proved gone. Under D2 the door leaves the survivable set running and this
+  // becomes the real survivor set.
+  const leftRunningSessionIds = scope.stopped < scope.containers ? scope.survivableSessionIds : [];
+  const reconciled = await adoptRunningSessions({
+    survivableSessionIds: scope.survivableSessionIds,
+    heldOnInventoryFailure: leftRunningSessionIds,
+  });
   for (const report of memoryReports) {
     if (report.state.status === 'migration-required') {
       log.warn('Workgroup memory requires operator migration; automatic startup left it untouched', {
