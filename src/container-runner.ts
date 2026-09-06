@@ -99,6 +99,7 @@ import {
   setStopIntent,
   shadowWrite,
   tryClaimSession,
+  type SessionClaimRow,
 } from './db/coordination.js';
 import { getHostInstanceId, startHostInstanceLease } from './host-instance.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
@@ -298,20 +299,6 @@ function channelKillFallback(entry: ActiveContainerEntry, sessionId: string): vo
 }
 
 /**
- * Sessions whose surviving container could not be claim-fenced at adoption.
- *
- * E integration (seam4/e-adoption): E declares the same `const
- * pendingAdoptions = new Set<string>()`, and its `adoptRunningSessions`
- * populates it while `wakeContainer` routes a hit to `retryPendingAdoption`
- * rather than spawning a duplicate. At the merge E's declaration wins and the
- * two test helpers below move beside it — E ships neither, and F's deferral
- * case needs both. Series F only READS the set, in `honorPendingStopIntents`: a
- * container that is alive but not yet fenced must not have a stop intent acted
- * on, because the kill could land on the wrong incarnation.
- */
-const pendingAdoptions = new Set<string>();
-
-/**
  * Sessions this process has promised to bring back, each holding the TOKEN of
  * the promise — the in-memory shadow of the `respawn_after_stop` rows this host
  * wrote itself.
@@ -336,10 +323,6 @@ const respawnIntents = new Map<string, number>();
 /** Monotonic source of the promise tokens above; never reused within a process. */
 let respawnIntentSeq = 0;
 
-export function _resetAdoptionRetryStateForTesting(): void {
-  pendingAdoptions.clear();
-}
-
 /** Test-only: drop this process's record of outstanding respawn promises. */
 export function _resetStopIntentStateForTesting(): void {
   respawnIntents.clear();
@@ -351,18 +334,6 @@ export function _resetStopIntentStateForTesting(): void {
  */
 export function _respawnIntentTokenForTesting(sessionId: string): number | undefined {
   return respawnIntents.get(sessionId);
-}
-
-/**
- * Test-only: stand in for an adoption that failed its claim write.
- *
- * Series F ships the READER of `pendingAdoptions` before series E ships the
- * writer, so its deferral case has no other way to reach that state. Keep it
- * after E's merge only until `adoptRunningSessions` gives the suite a real
- * route into the state.
- */
-export function _markPendingAdoptionForTesting(sessionId: string): void {
-  pendingAdoptions.add(sessionId);
 }
 
 /**
@@ -2242,24 +2213,27 @@ export function hasPendingAdoption(sessionId: string): boolean {
   return pendingAdoptions.has(sessionId);
 }
 
+export function _resetAdoptionRetryStateForTesting(): void {
+  pendingAdoptions.clear();
+}
+
+/**
+ * Test-only: stand in for an adoption that failed its claim write.
+ *
+ * Series F ships the READER of `pendingAdoptions` before series E ships the
+ * writer, so its deferral case has no other way to reach that state. Keep it
+ * after E's merge only until `adoptRunningSessions` gives the suite a real
+ * route into the state.
+ */
+export function _markPendingAdoptionForTesting(sessionId: string): void {
+  pendingAdoptions.add(sessionId);
+}
+
 export function _resetAdoptionStateForTesting(options: { waiterRearmMs?: number } = {}): void {
   pendingAdoptions.clear();
   pendingHolds.clear();
   adoptionListing = listInstallContainersWithScope;
   adoptedWaiterRearmMs = options.waiterRearmMs ?? ADOPTED_WAITER_REARM_MS;
-}
-
-/**
- * F1 hook: reconcile a survivor's unconsumed `on_wake` rows.
- *
- * Series F (seam4/f-on-wake-stop-intent) supplies the body — the mailbox op
- * that converts or withdraws the rows a dead host left for a container that
- * was never stopped. E owns the call site: once per adopted session, after the
- * claim fence and the registry write (`registerAdoptedContainer`). Until F
- * lands this reconciles nothing and reports zeros.
- */
-export async function reconcileSurvivorWakeRows(_session: Session): Promise<{ converted: number; withdrawn: number }> {
-  return { converted: 0, withdrawn: 0 };
 }
 
 type AdoptedChannel = Extract<SupervisionChannel, { kind: 'adopted' }>;
@@ -2754,8 +2728,8 @@ export async function adoptRunningSessions(
     counts.adopted += 1;
     if (result.fencedInbound) counts.fencedInbound += 1;
   }
-  // F2 hook: honorPendingStopIntents() — series F re-issues the durable stop
-  // intents a dead host left mid-restart, here, after every survivor is tracked.
+  // F2 lives in `main()`, not here: `honorPendingStopIntents()` can spawn, and
+  // this pass stays a pure inventory with no wake inside it (plan §7.F).
   log.info('Reconciled sessions at startup', { ...counts });
   return counts;
 }
