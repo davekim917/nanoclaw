@@ -641,6 +641,7 @@ export function DecisionPane({ id, authMe, refresh }: { id: string; authMe: Auth
   const [failure, setFailure] = useState('');
   const [notice, setNotice] = useState('');
   const attempt = useRef<{ fingerprint: string; key: string } | null>(null);
+  const draftEvidence = useRef<{ version: number; evidence_hash: string } | null>(null);
   const d = data?.decision;
   const [targetThread, setTargetThread] = useState('');
   const { data: targetThreads, error: targetsError } = useSWR(
@@ -671,11 +672,12 @@ export function DecisionPane({ id, authMe, refresh }: { id: string; authMe: Auth
           ...(!d.thread_id ? { target_thread_id: dispatchTarget } : {}),
         });
       else {
-        const fingerprint = JSON.stringify([action, d.version, d.evidence_hash, text]);
+        const evidence = action === 'answer' ? (draftEvidence.current ?? d) : d;
+        const fingerprint = JSON.stringify([action, evidence.version, evidence.evidence_hash, text]);
         if (attempt.current?.fingerprint !== fingerprint) attempt.current = { fingerprint, key: crypto.randomUUID() };
         await reviewSignalDecision(id, {
-          expected_version: d.version,
-          evidence_hash: d.evidence_hash,
+          expected_version: evidence.version,
+          evidence_hash: evidence.evidence_hash,
           action,
           ...(action === 'answer' ? { text } : {}),
           idempotency_key: attempt.current.key,
@@ -690,7 +692,10 @@ export function DecisionPane({ id, authMe, refresh }: { id: string; authMe: Auth
               ? 'You are reviewing this decision.'
               : 'Review ownership released.',
       );
-      if (action === 'answer') setText('');
+      if (action === 'answer') {
+        draftEvidence.current = null;
+        setText('');
+      }
       await mutate();
       refresh();
     } catch (err) {
@@ -850,7 +855,13 @@ export function DecisionPane({ id, authMe, refresh }: { id: string; authMe: Auth
                     <textarea
                       aria-label="Your decision"
                       value={text}
-                      onChange={(e) => setText(e.target.value)}
+                      onChange={(e) => {
+                        const next = e.target.value;
+                        if (!next.trim()) draftEvidence.current = null;
+                        else if (!draftEvidence.current)
+                          draftEvidence.current = { version: d.version, evidence_hash: d.evidence_hash };
+                        setText(next);
+                      }}
                       placeholder="Write the decision and relevant constraints…"
                       disabled={ownedElsewhere || busy || !!error}
                     />
@@ -992,6 +1003,7 @@ function ProjectForm({
   const [repo, setRepo] = useState(project?.repositories.join('\n') ?? '');
   const [channels, setChannels] = useState<string[]>(project?.channel_keys ?? []);
   const [group, setGroup] = useState(project?.workgroup_id ?? workgroups[0]?.id ?? '');
+  const originalVersion = useRef(project?.version ?? 0);
   const { data: channelThreads, error: channelsError } = useSWR(group ? ['signal-project-channels', group] : null, () =>
     listThreads({ workgroup: group }),
   );
@@ -1020,7 +1032,7 @@ function ProjectForm({
               .map((s) => s.trim())
               .filter(Boolean),
             channel_keys: channels,
-            expected_version: project?.version ?? 0,
+            expected_version: originalVersion.current,
           });
           refresh();
           if (!project) {

@@ -4,12 +4,15 @@ import { SWRConfig } from 'swr';
 import type { SignalOverview } from '../../../../src/dashboard/observatory-v2/types.js';
 import { SignalApp } from './SignalApp.js';
 import * as api from '../../lib/signal-api.js';
+import * as hostApi from '../../lib/api.js';
 import { startSSE, stopSSE } from '../../lib/sse.ts';
 vi.mock('../../lib/signal-api.js', async (original) => ({
   ...(await original<typeof api>()),
   getSignalOverview: vi.fn(),
   getSignalDecision: vi.fn(),
+  saveSignalProject: vi.fn(),
 }));
+vi.mock('../../lib/api.js', async (original) => ({ ...(await original<typeof hostApi>()), listThreads: vi.fn() }));
 class Source {
   static latest: Source;
   handlers = new Map<string, ((event: { data: string }) => void)[]>();
@@ -67,6 +70,7 @@ beforeEach(() => {
   vi.stubGlobal('EventSource', Source);
   location.hash = '';
   vi.mocked(api.getSignalOverview).mockResolvedValue(overview());
+  vi.mocked(hostApi.listThreads).mockResolvedValue({ threads: [] });
 });
 afterEach(() => {
   cleanup();
@@ -118,15 +122,48 @@ describe('Signal live refresh and paging', () => {
     const page = overview('Second-page project');
     page.projects[0]!.id = 'p2';
     page.thread_coverage![0]!.offset = 200;
+    page.sources = [
+      {
+        workgroup_id: 'wg',
+        source: 'threads',
+        as_of: '2026-09-05T00:00:00Z',
+        status: 'unavailable',
+        detail: 'Thread source could not be read.',
+      },
+    ];
     vi.mocked(api.getSignalOverview).mockResolvedValueOnce(page);
     fireEvent.click(screen.getByRole('button', { name: 'Load more threads · Workspace' }));
     await tick();
     expect(api.getSignalOverview).toHaveBeenCalledWith('wg', 200);
     expect(screen.getAllByText('Second-page project').length).toBeGreaterThan(0);
+    expect(screen.getByText('1 sources stale or unavailable — coverage is partial')).toBeInTheDocument();
     vi.mocked(api.getSignalOverview).mockResolvedValue(base);
     fireEvent.click(screen.getByRole('button', { name: 'Refresh records' }));
     await tick(1001);
     expect(screen.queryByText('Second-page project')).not.toBeInTheDocument();
+  });
+  it('keeps the project revision that initialized an open edit form', async () => {
+    const initial = overview('Initial project');
+    initial.projects[0]!.version = 2;
+    initial.capabilities.manage_projects = true;
+    vi.mocked(api.getSignalOverview).mockResolvedValue(initial);
+    vi.mocked(api.saveSignalProject).mockResolvedValue({});
+    mount();
+    await tick();
+    fireEvent.click(screen.getByRole('button', { name: 'Edit project mapping' }));
+    fireEvent.change(screen.getByLabelText('Project name'), { target: { value: 'Local project edit' } });
+    const refreshed = overview('Remote project edit');
+    refreshed.projects[0]!.version = 3;
+    refreshed.capabilities.manage_projects = true;
+    vi.mocked(api.getSignalOverview).mockResolvedValue(refreshed);
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh records' }));
+    await tick(1001);
+    fireEvent.click(screen.getByRole('button', { name: 'Save project mapping' }));
+    await tick();
+    expect(api.saveSignalProject).toHaveBeenCalledWith(
+      'p',
+      expect.objectContaining({ name: 'Local project edit', expected_version: 2 }),
+    );
   });
   it('requests an off-page decision ID without highlighting another record', async () => {
     location.hash = '#/decisions/off-page';

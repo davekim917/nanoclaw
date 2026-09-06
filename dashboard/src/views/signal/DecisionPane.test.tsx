@@ -1,5 +1,5 @@
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { act, render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { SWRConfig } from 'swr';
 import { DecisionPane } from './SignalApp.js';
 import type { SignalDecisionDetail } from '../../../../src/dashboard/observatory-v2/types.js';
@@ -53,6 +53,7 @@ beforeEach(() => {
   vi.mocked(api.getSignalDecision).mockResolvedValue(structuredClone(fixture));
   vi.mocked(api.reviewSignalDecision).mockResolvedValue({ decision: fixture.decision });
 });
+afterEach(() => vi.useRealTimers());
 describe('decision context and distinct authority', () => {
   it('shows exact question, source reason, recommendation and owner without an approval button', async () => {
     mount();
@@ -76,6 +77,29 @@ describe('decision context and distinct authority', () => {
     );
     expect(api.dispatchSignalDecision).not.toHaveBeenCalled();
     await screen.findByText('Decision recorded. No instruction has been sent.');
+  });
+  it('submits an existing draft against the evidence that began it after refresh', async () => {
+    vi.useFakeTimers();
+    const changed = structuredClone(fixture);
+    changed.decision.version = 3;
+    changed.decision.evidence_hash = 'hash8';
+    vi.mocked(api.getSignalDecision).mockResolvedValue(changed).mockResolvedValueOnce(structuredClone(fixture));
+    mount();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    fireEvent.change(screen.getByLabelText('Your decision'), { target: { value: 'Use the internal ID.' } });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000);
+    });
+    expect(screen.getByText('v3')).toBeInTheDocument();
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Record decision →' }));
+    });
+    expect(api.reviewSignalDecision).toHaveBeenCalledWith(
+      'd1',
+      expect.objectContaining({ expected_version: 2, evidence_hash: 'hash7', text: 'Use the internal ID.' }),
+    );
   });
   it('prevents overwriting another reviewer and keeps original approval destination', async () => {
     const other = structuredClone(fixture);
