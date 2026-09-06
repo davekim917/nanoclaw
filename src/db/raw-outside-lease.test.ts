@@ -25,8 +25,8 @@ import { describe, expect, it } from 'vitest';
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
 
 /**
- * Files allowed to call `getRawDb()` outside a lease block. Fixed by design;
- * the two 5c rows leave when that PR lands, and the list only ever shrinks.
+ * Files allowed to call `getRawDb()` outside a lease block. Fixed by design,
+ * and the list only ever shrinks.
  */
 export const BARE_RAW_HANDLE_FILES: ReadonlyMap<string, string> = new Map([
   ['src/db/connection.ts', 'defines getRawDb'],
@@ -46,8 +46,6 @@ export const BARE_RAW_HANDLE_FILES: ReadonlyMap<string, string> = new Map([
   ],
   ['src/db/transaction-fixtures/raw-receiver.ts', 'positive fixture for the receiver-aware transaction test'],
   ['src/test-fixtures/raw-db-fake.ts', 'test fixture'],
-  ['src/cli/request-ledger.ts', '5c row (pruneCliRequestExecutions) — converts in PR 5c'],
-  ['src/modules/sweep-scheduling/index.ts', '5c row (hasUnresolvedMoveIntent) — converts in PR 5c'],
 ]);
 
 function listRuntimeTs(dir: string, out: string[] = []): string[] {

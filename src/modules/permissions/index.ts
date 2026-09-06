@@ -685,7 +685,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
   // so the follow-up card / name prompt lands on the SAME sibling bot's DM
   // the registration card itself was delivered on, instead of falling back
   // to whichever adapter the bare channel_type happens to resolve.
-  const originMg = getMessagingGroup(row.messaging_group_id);
+  const originMg = await getMessagingGroup(row.messaging_group_id);
 
   // Click authorization is the guard's channels.register decision (./guard.ts):
   // the delivered approver, or an admin of the pending row's anchor agent group.
@@ -901,7 +901,7 @@ registerMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
   // Origin instance for the follow-up notifications below, same reasoning as
   // handleChannelApprovalResponse: keep every reply to this approver on the
   // sibling bot the registration started on.
-  const originMg = getMessagingGroup(row.messaging_group_id);
+  const originMg = await getMessagingGroup(row.messaging_group_id);
 
   // `awaitingNameInput` is already deleted by here, so a throw out of this
   // interceptor would strand the approver with no card, no agent, and no

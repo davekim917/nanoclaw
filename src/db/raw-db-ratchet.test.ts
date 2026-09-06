@@ -114,7 +114,7 @@ const NOT_CALLERS: readonly string[] = [DEFINER, SELF, LEASE_TRIPWIRE];
  * under the lease — `withCentralSync(() => withRawDb(…))` at the leaf, or a
  * lease-only `withRawDb` leaf whose callers take the lease — which dropped
  * the importer set to the bare-handle files `src/db/raw-outside-lease.test.ts`
- * enumerates plus the tests that seed through the raw handle (176 → 154).
+ * enumerates plus the tests that seed through the raw handle (176 → 154; 152 after the 5c merge).
  *
  * PR 6 also carried the three "5c deferral" families 5b left raw (180 → 176):
  * `writeAudit`/`purgeIntentBody` (scheduled-shared.ts, with every caller in
@@ -154,7 +154,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/cli/crud.test.ts',
   'src/cli/delivery-action.test.ts',
   'src/cli/request-ledger.test.ts',
-  'src/cli/request-ledger.ts',
   'src/cli/resources/destinations.test.ts',
   'src/cli/resources/groups-create-adopt.test.ts',
   'src/cli/resources/groups.test.ts',
@@ -259,7 +258,6 @@ export const RAW_DB_IMPORTERS: readonly string[] = [
   'src/modules/sweep-idle-reap/idle-reap.test.ts',
   'src/modules/sweep-orchestrator/orchestrator.test.ts',
   'src/modules/sweep-scheduled-move/scheduled-move.test.ts',
-  'src/modules/sweep-scheduling/index.ts',
   'src/modules/sweep-scheduling/scheduling.test.ts',
   'src/modules/sweep-usage/usage.test.ts',
   'src/provider-fallback.test.ts',

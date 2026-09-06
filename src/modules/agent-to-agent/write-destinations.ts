@@ -36,7 +36,9 @@ export async function writeDestinations(agentGroupId: string, sessionId: string)
   // resolve-then-replace pair runs inside ONE `withCentralSync` block below,
   // so no driver transaction can be open while these raw reads execute.
   const resolve = (): DestinationRow[] => {
-    const rows = withRawDb((raw) => raw.prepare(AGENT_DESTINATIONS_BY_GROUP_SQL).all(agentGroupId)) as AgentDestination[];
+    const rows = withRawDb((raw) =>
+      raw.prepare(AGENT_DESTINATIONS_BY_GROUP_SQL).all(agentGroupId),
+    ) as AgentDestination[];
     const resolved: DestinationRow[] = [];
 
     for (const row of rows) {

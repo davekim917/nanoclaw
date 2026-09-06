@@ -9,8 +9,6 @@
 import { createHash } from 'crypto';
 import path from 'path';
 
-import type Database from 'better-sqlite3';
-
 import { withCentralSync } from '../../db/central-lease.js';
 import { getDb } from '../../db/connection.js';
 import { log } from '../../log.js';

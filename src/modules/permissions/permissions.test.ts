@@ -356,13 +356,13 @@ describe('ensureUserDm', () => {
     // Cache the user's DM on instance B first (e.g. an earlier approval on
     // that workspace/bot).
     const mgB = await ensureUserDm('slack:U-owner', { instance: 'slack-bot-b' });
-    expect(getMessagingGroup(mgB!.id)?.instance).toBe('slack-bot-b');
+    expect((await getMessagingGroup(mgB!.id))?.instance).toBe('slack-bot-b');
 
     // A caller asking for instance A must NOT receive B's cached row — it
     // must re-resolve and land on A's own row.
     const mgA = await ensureUserDm('slack:U-owner', { instance: 'slack-bot-a' });
     expect(mgA!.id).not.toBe(mgB!.id);
-    expect(getMessagingGroup(mgA!.id)?.instance).toBe('slack-bot-a');
+    expect((await getMessagingGroup(mgA!.id))?.instance).toBe('slack-bot-a');
     expect(mockA.openDMCalls).toEqual(['U-owner']);
   });
 
@@ -375,7 +375,7 @@ describe('ensureUserDm', () => {
     await seedUser('slack:U-owner', 'slack');
 
     const mgB = await ensureUserDm('slack:U-owner', { instance: 'slack-bot-b' });
-    expect(getMessagingGroup(mgB!.id)?.instance).toBe('slack-bot-b');
+    expect((await getMessagingGroup(mgB!.id))?.instance).toBe('slack-bot-b');
 
     const mgAgain = await ensureUserDm('slack:U-owner');
     expect(mgAgain!.id).toBe(mgB!.id);
