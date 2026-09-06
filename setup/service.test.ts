@@ -1,10 +1,11 @@
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
 import { getLaunchdLabel } from '../src/install-slug.js';
-import { renderLogrotateConfig } from './service.js';
+import { ensureHostFlock, launchdRuntimePath, renderLogrotateConfig, type FlockCommandOverrides } from './service.js';
 
 /**
  * Tests for service configuration generation.
@@ -69,6 +70,31 @@ StandardError=append:${projectRoot}/logs/nanoclaw.error.log
 WantedBy=${isSystem ? 'multi-user.target' : 'default.target'}`;
 }
 
+const tempDirs: string[] = [];
+
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+function makeMacPrefix(): { prefix: string; flockPath: string } {
+  const prefix = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-flock-test-'));
+  tempDirs.push(prefix);
+  return { prefix, flockPath: path.join(prefix, 'bin', 'flock') };
+}
+
+function macCommands(
+  prefix: string,
+  spawnResult = { status: 0, stderr: '' },
+): FlockCommandOverrides & { brew: ReturnType<typeof vi.fn> } {
+  const brew = vi.fn((_command: string, _args: string[]) => prefix);
+  return {
+    commandExists: (command) => command === 'brew',
+    execFileSync: brew,
+    spawnSync: vi.fn(() => spawnResult),
+    brew,
+  };
+}
+
 describe('plist generation', () => {
   it('contains the slug-scoped label', () => {
     const projectRoot = '/home/user/nanoclaw';
@@ -91,6 +117,61 @@ describe('plist generation', () => {
     const plist = generatePlist('/usr/local/bin/node', '/home/user/nanoclaw', '/home/user');
     expect(plist).toContain('nanoclaw.log');
     expect(plist).toContain('nanoclaw.error.log');
+  });
+
+  it('includes the Homebrew flock directory in launchd PATH on Apple Silicon', () => {
+    expect(launchdRuntimePath('/Users/test', '/opt/homebrew/opt/flock/bin/flock')).toContain(
+      '/opt/homebrew/opt/flock/bin',
+    );
+  });
+
+  it('renders launchd PATH from the provisioned flock location', () => {
+    const source = fs.readFileSync(fileURLToPath(new URL('./service.ts', import.meta.url)), 'utf8');
+    expect(source).toContain('<string>${launchdRuntimePath(homeDir, flockPath)}</string>');
+  });
+
+  it('installs the Homebrew formula when its prefix has no executable, then probes inherited fd 3', () => {
+    const { prefix, flockPath } = makeMacPrefix();
+    const commands = macCommands(prefix);
+    commands.brew.mockImplementation((_command: string, args: string[]) => {
+      if (args[0] === 'install') {
+        fs.mkdirSync(path.dirname(flockPath), { recursive: true });
+        fs.writeFileSync(flockPath, '', { mode: 0o755 });
+      }
+      return prefix;
+    });
+
+    expect(ensureHostFlock('macos', commands)).toBe(flockPath);
+    expect(commands.brew).toHaveBeenCalledWith('brew', ['install', 'flock'], { stdio: 'inherit' });
+    expect(commands.spawnSync).toHaveBeenCalledWith(
+      flockPath,
+      ['-n', '3'],
+      expect.objectContaining({ stdio: ['ignore', 'ignore', 'pipe', expect.any(Number)] }),
+    );
+  });
+
+  it('skips Homebrew installation when the formula executable already exists', () => {
+    const { prefix, flockPath } = makeMacPrefix();
+    fs.mkdirSync(path.dirname(flockPath), { recursive: true });
+    fs.writeFileSync(flockPath, '', { mode: 0o755 });
+    const commands = macCommands(prefix);
+
+    expect(ensureHostFlock('macos', commands)).toBe(flockPath);
+    expect(commands.brew).not.toHaveBeenCalledWith('brew', ['install', 'flock'], { stdio: 'inherit' });
+  });
+
+  it('rejects an invalid inherited-fd flock before service build setup', () => {
+    const { prefix, flockPath } = makeMacPrefix();
+    fs.mkdirSync(path.dirname(flockPath), { recursive: true });
+    fs.writeFileSync(flockPath, '', { mode: 0o755 });
+    const commands = macCommands(prefix, { status: 1, stderr: 'invalid fd' });
+
+    expect(() => ensureHostFlock('macos', commands)).toThrow(/inherited-fd preflight failed: invalid fd/);
+    expect(commands.brew).not.toHaveBeenCalledWith('brew', ['install', 'flock'], { stdio: 'inherit' });
+    const source = fs.readFileSync(fileURLToPath(new URL('./service.ts', import.meta.url)), 'utf8');
+    expect(source.indexOf('const flockPath = ensureHostFlock(platform)')).toBeLessThan(
+      source.indexOf("execSync('pnpm run build'"),
+    );
   });
 });
 

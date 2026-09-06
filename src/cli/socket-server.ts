@@ -82,11 +82,11 @@ function lockInheritedFd(fd: number, directory: string): Promise<void> {
     child.once('error', (err) => {
       const code = (err as NodeJS.ErrnoException).code;
       if (code === 'ENOENT') {
-        fail(
-          new Error('ncl single-host ownership requires the util-linux `flock` executable; install it and restart.', {
-            cause: err,
-          }),
-        );
+        const installHint =
+          process.platform === 'darwin'
+            ? 'Install it with `brew install flock` and re-run setup.'
+            : 'Install util-linux and re-run setup.';
+        fail(new Error(`ncl single-host ownership requires the \`flock\` executable. ${installHint}`, { cause: err }));
         return;
       }
       fail(new Error(`failed to start ncl ownership lock for ${directory}`, { cause: err }));

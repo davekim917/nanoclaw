@@ -316,7 +316,11 @@ describe('startCliServer kernel ownership lock', () => {
     const previousPath = process.env.PATH;
     process.env.PATH = path.dirname(socketPath);
     try {
-      await expect(startCliServer(socketPath)).rejects.toThrow(/requires the util-linux `flock` executable/);
+      await expect(startCliServer(socketPath)).rejects.toThrow(
+        process.platform === 'darwin'
+          ? /requires the `flock` executable\. Install it with `brew install flock` and re-run setup/
+          : /requires the `flock` executable\. Install util-linux and re-run setup/,
+      );
     } finally {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
@@ -332,6 +336,7 @@ describe('startCliServer kernel ownership lock', () => {
     expect(implementation).not.toContain('isProcessAlive');
     expect(implementation).not.toContain('readLockPid');
     expect(implementation).not.toContain('socketPath}.lock');
+    expect(implementation).toContain('brew install flock');
   });
 });
 

@@ -4,7 +4,7 @@
  *
  * Fixes: Root→system systemd, WSL nohup fallback, no `|| true` swallowing errors.
  */
-import { execSync } from 'child_process';
+import { execFileSync, execSync, spawnSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -21,8 +21,9 @@ export async function run(_args: string[]): Promise<void> {
   const platform = getPlatform();
   const nodePath = getNodePath();
   const homeDir = os.homedir();
+  const flockPath = ensureHostFlock(platform);
 
-  log.info('Setting up service', { platform, nodePath, projectRoot });
+  log.info('Setting up service', { platform, nodePath, projectRoot, flockPath });
 
   // Build first
   log.info('Building TypeScript');
@@ -72,7 +73,7 @@ export async function run(_args: string[]): Promise<void> {
   }
 
   if (platform === 'macos') {
-    setupLaunchd(projectRoot, nodePath, homeDir);
+    setupLaunchd(projectRoot, nodePath, homeDir, flockPath);
   } else if (platform === 'linux') {
     setupLinux(projectRoot, nodePath, homeDir);
   } else {
@@ -88,6 +89,96 @@ export async function run(_args: string[]): Promise<void> {
   }
 
   installCliSymlink(projectRoot, homeDir);
+}
+
+export type FlockCommandOverrides = {
+  commandExists?: (name: string) => boolean;
+  execFileSync?: (
+    command: string,
+    args: string[],
+    options: { encoding?: string; stdio?: 'inherit' },
+  ) => string | Buffer;
+  spawnSync?: (
+    command: string,
+    args: string[],
+    options: { stdio: ['ignore', 'ignore', 'pipe', number] },
+  ) => { error?: Error; status: number | null; stderr?: string | Buffer | null };
+};
+
+/**
+ * Resolve a flock(1) that supports the inherited-fd form used by the host.
+ * macOS has flock(2) but no bundled flock(1); Homebrew's portable `flock`
+ * formula provides it. The functional probe prevents installing a command
+ * that launchd can find but that cannot acquire the same kernel lock.
+ */
+export function ensureHostFlock(
+  platform: ReturnType<typeof getPlatform>,
+  overrides: FlockCommandOverrides = {},
+): string {
+  const hasCommand = overrides.commandExists ?? commandExists;
+  const runFile = overrides.execFileSync ?? execFileSync;
+  const runFlock = overrides.spawnSync ?? spawnSync;
+
+  let flockPath: string;
+  if (platform === 'macos') {
+    if (!hasCommand('brew')) {
+      throw new Error('ncl ownership requires `flock`; install Homebrew, run `brew install flock`, then re-run setup.');
+    }
+    let installed = false;
+    let prefix: string;
+    try {
+      prefix = String(runFile('brew', ['--prefix', 'flock'], { encoding: 'utf8' })).trim();
+    } catch {
+      runFile('brew', ['install', 'flock'], { stdio: 'inherit' });
+      installed = true;
+      prefix = String(runFile('brew', ['--prefix', 'flock'], { encoding: 'utf8' })).trim();
+    }
+    flockPath = path.join(prefix, 'bin', 'flock');
+    if (!isExecutable(flockPath) && !installed) {
+      runFile('brew', ['install', 'flock'], { stdio: 'inherit' });
+    }
+  } else {
+    if (!hasCommand('flock')) {
+      throw new Error('ncl ownership requires the `flock` executable; install util-linux, then re-run setup.');
+    }
+    flockPath = execSync('command -v flock', { encoding: 'utf8' }).trim();
+  }
+
+  if (!isExecutable(flockPath)) {
+    throw new Error(`ncl ownership flock executable is not usable: ${flockPath}`);
+  }
+
+  const probeDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-flock-'));
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(probeDirectory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+    const result = runFlock(flockPath, ['-n', '3'], { stdio: ['ignore', 'ignore', 'pipe', fd] });
+    if (result.error || result.status !== 0) {
+      const stderr = String(result.stderr ?? '').trim();
+      const detail = result.error?.message ?? (stderr || `exit ${String(result.status)}`);
+      throw new Error(`ncl ownership flock inherited-fd preflight failed: ${detail}`);
+    }
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
+    fs.rmSync(probeDirectory, { recursive: true, force: true });
+  }
+
+  return flockPath;
+}
+
+function isExecutable(file: string): boolean {
+  try {
+    fs.accessSync(file, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function launchdRuntimePath(homeDir: string, flockPath: string): string {
+  return [...new Set([path.dirname(flockPath), '/usr/local/bin', '/usr/bin', '/bin', `${homeDir}/.local/bin`])].join(
+    ':',
+  );
 }
 
 /**
@@ -123,7 +214,7 @@ function installCliSymlink(projectRoot: string, homeDir: string): void {
   }
 }
 
-function setupLaunchd(projectRoot: string, nodePath: string, homeDir: string): void {
+function setupLaunchd(projectRoot: string, nodePath: string, homeDir: string, flockPath: string): void {
   // Per-checkout service label so multiple NanoClaw installs can coexist
   // without clobbering each other's plist.
   const label = getLaunchdLabel(projectRoot);
@@ -150,7 +241,7 @@ function setupLaunchd(projectRoot: string, nodePath: string, homeDir: string): v
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin</string>
+        <string>${launchdRuntimePath(homeDir, flockPath)}</string>
         <key>HOME</key>
         <string>${homeDir}</string>
     </dict>
