@@ -145,6 +145,18 @@ const mockWriteSessionMessage = vi.fn();
 const mockAdmitDueTaskContexts = vi.fn().mockReturnValue(0);
 const mockWakeContainer = vi.fn();
 const mockIsContainerRunning = vi.fn();
+/**
+ * The registry the heal's identity fence (#478) reads. Empty under this
+ * suite's fakes, so it is composed from the same mocked running check the rest
+ * of the duty is driven by: "running" and "which container" cannot disagree
+ * unless a case deliberately makes them.
+ *
+ * `replaceAfterCall` is that deliberate disagreement — the call index after
+ * which a REPLACEMENT is registered, standing in for the original exiting and a
+ * wake spawning a new container while the duty awaits. Call 1 is the guard's
+ * snapshot, call 2 the re-check before the marker, call 3 the kill's fence.
+ */
+const registry = vi.hoisted(() => ({ calls: 0, replaceAfterCall: Number.POSITIVE_INFINITY }));
 const mockIsContainerSpawning = vi.fn();
 const mockHasContainerEverRun = vi.fn();
 const mockGetSession = vi.fn();
@@ -196,6 +208,13 @@ vi.mock('../../container-runner.js', async (importOriginal) => {
     // older base where the helper was local to host-sweep.ts.
     containerOwnsOutbound: (sessionId: string) =>
       Boolean(mockIsContainerRunning(sessionId)) || real.isContainerSpawning(sessionId),
+    containerIdentityFor: (sessionId: string) => {
+      if (!mockIsContainerRunning(sessionId)) return null;
+      registry.calls += 1;
+      return registry.calls > registry.replaceAfterCall
+        ? { containerName: 'nanoclaw-group-folder-2', claimIncarnation: 2 }
+        : { containerName: 'nanoclaw-group-folder-1', claimIncarnation: 1 };
+    },
     isContainerSpawning: (...args: unknown[]) => mockIsContainerSpawning(...args),
     hasContainerEverRun: (...args: unknown[]) => mockHasContainerEverRun(...args),
     wakeContainer: (...args: unknown[]) => mockWakeContainer(...args),
@@ -934,6 +953,8 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
     await createSession(fakeSession());
     armSelfHeal(true);
     _resetProviderHealTicksForTesting();
+    registry.calls = 0;
+    registry.replaceAfterCall = Number.POSITIVE_INFINITY;
     mockMarkProviderUnavailable.mockReset();
     mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'codex' });
     mockGetSession.mockReset().mockReturnValue(fakeSession());
@@ -982,6 +1003,36 @@ describe('sweepProviderHeal — bounds, actions, and accountability', () => {
       // unlike the ceiling kill, whose `onExit` is bookkeeping only.
       'respawn_after_stop',
     );
+  });
+
+  it('refuses the heal when a replacement is registered before the marker (#478)', async () => {
+    const { inDb, mailbox } = makeSessionDbs();
+    // The guard takes its snapshot on call 1; the original exits and a wake
+    // registers a replacement while provider resolution awaits, so the
+    // re-check before the marker sees a different container.
+    registry.replaceAfterCall = 1;
+
+    await _sweepProviderHealForTesting(mailbox, fakeSession(), 'group-folder', FAILED);
+    expect(await _sweepProviderHealForTesting(mailbox, fakeSession(), 'group-folder', FAILED)).toBe(true);
+
+    // No attempt spent against the replacement, and it keeps running.
+    expect(healRows(inDb)).toHaveLength(0);
+    expect(mockKillContainer).not.toHaveBeenCalled();
+    expect(countProviderHealAttemptsSinceRealInbound(mailbox)).toBe(0);
+  });
+
+  it('leaves a replacement registered after the marker unkilled (#478)', async () => {
+    const { inDb, mailbox } = makeSessionDbs();
+    // Later window: the marker is already durable when the replacement
+    // appears, so the attempt is spent, but the kill must not take the new
+    // container down and report its work lost.
+    registry.replaceAfterCall = 2;
+
+    await _sweepProviderHealForTesting(mailbox, fakeSession(), 'group-folder', FAILED);
+    expect(await _sweepProviderHealForTesting(mailbox, fakeSession(), 'group-folder', FAILED)).toBe(true);
+
+    expect(healRows(inDb)).toHaveLength(1);
+    expect(mockKillContainer).not.toHaveBeenCalled();
   });
 
   it('cancels the debounce when a healthy status lands in between', async () => {
