@@ -3203,9 +3203,13 @@ export async function reconcileSurvivorWakeRows(session: Session): Promise<{ con
  * clears only once the respawn wake actually succeeds, so a failed wake is
  * retried at the next startup while the sweep retries it sooner.
  *
- * A plain `'stop'` intent is left where it is. The container is already down
- * and nothing is owed; the row is one upsert per session of inert shadow state,
- * and clearing it here would cost a write per boot to no end.
+ * A plain `'stop'` intent is honoured by the time this runs — by the process
+ * exit that recorded it, by the boot door, or by the wake that later gave the
+ * session a container again, which never touches the row — so every plain
+ * row this pass reads is cleared after the respawn promises are handled
+ * (#474). Left alone, the rows accumulate one per session and the table stops
+ * being evidence of anything. A session still awaiting claim-fenced adoption
+ * keeps its row: its container is alive and not yet re-fenced.
  *
  * `wake` and `hasContainer` are injected with their production defaults. The
  * second exists because the branch it selects is the one an interrupted restart
@@ -3264,6 +3268,80 @@ export async function honorPendingStopIntents(
       await respawn();
     }
   }
+  await clearHonouredStopIntents(intents, hasContainer);
+}
+
+/**
+ * Clear the plain `'stop'` rows the boot pass read, in one conditional write
+ * (#474). Each row is matched on the value AND the `updated_at` that was read,
+ * so only the row version the pass saw is cleared: a kill that re-armed the
+ * row to `respawn_after_stop` since, or recorded a fresh `'stop'` for the same
+ * session (a thread close landing while an earlier respawn was awaited), wrote
+ * a newer stamp and is left for the next boot. Never a row whose session is
+ * pending adoption.
+ *
+ * A plain row whose session was ADOPTED at this boot — its container is still
+ * running — is a STALE request: the host died between recording the stop and
+ * issuing it, and the kill's reason (an idle reap, a ceiling, a cancel) may no
+ * longer hold. It is cleared like the rest, named on its own line, and never
+ * acted on: the sweep re-issues a kill on its own evidence if one is still
+ * warranted. `respawn_after_stop` rows keep the honour path above.
+ */
+/** Rows per clear statement: two bound variables each, well inside SQLite's limit. */
+const STOP_INTENT_CLEAR_CHUNK = 400;
+
+async function clearHonouredStopIntents(
+  intents: SessionClaimRow[],
+  hasContainer: (sessionId: string) => boolean,
+): Promise<void> {
+  const plain = intents.filter((intent) => intent.stop_intent === 'stop');
+  if (plain.length === 0) return;
+  const pending = plain.filter((intent) => pendingAdoptions.has(intent.session_id));
+  const honoured = plain.filter((intent) => !pendingAdoptions.has(intent.session_id));
+  let cleared = 0;
+  if (honoured.length > 0) {
+    // Bounded statements: one `(session_id, updated_at)` pair costs two bound
+    // variables, and one statement over an install's whole backlog would trip
+    // SQLite's bound-variable limit — then clear nothing, at every boot. The
+    // chunks run inside one transaction so the clear is all-or-nothing, and a
+    // failure is a WARN with the count, never a swallowed shadow write.
+    const now = new Date().toISOString();
+    /* eslint-disable no-catch-all/no-catch-all -- a failed clear must not block startup; it is reported and retried next boot */
+    try {
+      cleared = await centralTransaction(async () => {
+        let changes = 0;
+        for (let at = 0; at < honoured.length; at += STOP_INTENT_CLEAR_CHUNK) {
+          const chunk = honoured.slice(at, at + STOP_INTENT_CLEAR_CHUNK);
+          const result = await getDb().run(
+            `UPDATE session_claims SET stop_intent = NULL, updated_at = ?
+               WHERE stop_intent = 'stop' AND (session_id, updated_at) IN (VALUES ${chunk.map(() => '(?, ?)').join(', ')})`,
+            now,
+            ...chunk.flatMap((intent) => [intent.session_id, intent.updated_at]),
+          );
+          changes += result.changes;
+        }
+        return changes;
+      }, 'stop-intent-clear');
+    } catch (err) {
+      log.warn('Failed to clear honoured stop intents at startup — left for the next boot', {
+        rows: honoured.length,
+        err,
+      });
+      return;
+    }
+    /* eslint-enable no-catch-all/no-catch-all */
+    for (const intent of honoured) {
+      if (hasContainer(intent.session_id)) {
+        log.info('Cleared a stale plain stop intent for an adopted survivor', { sessionId: intent.session_id });
+      }
+    }
+  }
+  // Logged whenever a plain row was read, so a boot that deferred every one
+  // of them reads as such rather than as a boot that had nothing to clear.
+  log.info('Cleared honoured stop intents at startup', {
+    cleared,
+    deferredPendingAdoption: pending.length,
+  });
 }
 
 /**
