@@ -253,6 +253,10 @@ describe('create_room', () => {
     // heard by exactly one bot.
     expect(rows.map((r) => r.channel_type)).toEqual(['slack-alpha', 'slack-beta']);
     expect(rows.every((r) => r.instance === r.channel_type && r.is_group === 1 && r.name === 'ops-room')).toBe(true);
+    // The room the operator just approved must not put its own members behind
+    // a sender-approval cascade — same policy the router's group auto-create
+    // branch lands on, resolved through the one helper so the two agree.
+    expect(rows.every((r) => r.unknown_sender_policy === 'public')).toBe(true);
 
     for (const row of rows) {
       const wirings = await getMessagingGroupAgents(row.id);
