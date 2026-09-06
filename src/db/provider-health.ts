@@ -142,29 +142,38 @@ export async function markProviderUnavailable(
 /**
  * Clear a cooldown — a turn completed on this provider, so it works.
  *
- * Read then UPDATE, not a transaction: a concurrent `markProviderUnavailable`
- * either commits before the read (whose row this then clears) or after the
- * write (whose window then stands), and both orderings are the same two
- * outcomes the all-synchronous version produced.
+ * Read then a CONDITIONAL update, not a transaction: the UPDATE only applies
+ * while the row still looks the way the read saw it (`updated_at` is the
+ * version stamp — every writer bumps it). A `markProviderUnavailable` that
+ * commits between the read and this write therefore stands: its newer cooldown
+ * is not clobbered by a success that predates it (Codex P2 on #460). Returns
+ * whether the clear applied.
  */
 export async function markProviderAvailable(
   agentGroupId: string,
   provider: string,
   options: { nowMs?: number } = {},
-): Promise<void> {
-  if (!agentGroupId || !provider) return;
+): Promise<boolean> {
+  if (!agentGroupId || !provider) return false;
   const row = await getProviderHealth(agentGroupId, provider);
   // Only write when there is something to clear: a healthy provider must not
   // generate a DB write on every successful turn.
-  if (!row || (row.unavailable_until === null && row.consecutive_failures === 0)) return;
-  await getDb().run(
+  if (!row || (row.unavailable_until === null && row.consecutive_failures === 0)) return false;
+  const result = await getDb().run(
     `UPDATE provider_health
           SET unavailable_until = NULL, consecutive_failures = 0, updated_at = ?
-        WHERE agent_group_id = ? AND provider = ?`,
+        WHERE agent_group_id = ? AND provider = ?
+          AND updated_at = ?
+          AND unavailable_until IS ?
+          AND consecutive_failures = ?`,
     new Date(options.nowMs ?? Date.now()).toISOString(),
     agentGroupId,
     provider,
+    row.updated_at,
+    row.unavailable_until,
+    row.consecutive_failures,
   );
+  return result.changes > 0;
 }
 
 /**

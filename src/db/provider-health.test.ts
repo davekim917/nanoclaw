@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from './index.js';
+import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb, getRawDb } from './index.js';
 import {
   getProviderHealth,
   isProviderUnavailable,
@@ -76,6 +76,32 @@ describe('provider health cooldown', () => {
     await markProviderAvailable(GID, 'codex', { nowMs: NOW });
     expect(await isProviderUnavailable(GID, 'codex', { nowMs: NOW })).toBe(false);
     expect((await getProviderHealth(GID, 'codex'))?.consecutive_failures).toBe(0);
+  });
+
+  it('does not clear a cooldown written between its read and its write (#460 P2)', async () => {
+    await markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW });
+    const seen = await getProviderHealth(GID, 'codex');
+    expect(seen?.consecutive_failures).toBe(1);
+    // A concurrent failure lands after the success path has read the row but
+    // before it writes: the newer, longer cooldown must stand.
+    await markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW + 1 });
+    const raced = await getDb().run(
+      `UPDATE provider_health SET unavailable_until = NULL, consecutive_failures = 0, updated_at = ?
+        WHERE agent_group_id = ? AND provider = ? AND updated_at = ? AND unavailable_until IS ? AND consecutive_failures = ?`,
+      new Date(NOW).toISOString(),
+      GID,
+      'codex',
+      seen!.updated_at,
+      seen!.unavailable_until,
+      seen!.consecutive_failures,
+    );
+    expect(raced.changes).toBe(0);
+    const after = await getProviderHealth(GID, 'codex');
+    expect(after?.consecutive_failures).toBe(2);
+    expect(await isProviderUnavailable(GID, 'codex', { nowMs: NOW })).toBe(true);
+    // The same clear against the CURRENT row applies and reports it.
+    expect(await markProviderAvailable(GID, 'codex', { nowMs: NOW + 2 })).toBe(true);
+    expect(await markProviderAvailable(GID, 'codex', { nowMs: NOW + 3 })).toBe(false);
   });
 
   it('a fresh episode starts at the first backoff, not where the last one ended', async () => {
