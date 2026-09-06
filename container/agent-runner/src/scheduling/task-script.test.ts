@@ -142,6 +142,28 @@ describe('script-skip ack chain (container leg)', () => {
     expect(keep).toHaveLength(1);
     expect(JSON.parse(keep[0].content).scriptOutput).toEqual({ alerts: 5 });
   });
+
+  it('treats a null scriptOutput as a completed host result and does not re-run the script', async () => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, trigger, content)
+         VALUES ('t-host-gated-null', 'task', strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'pending', 1, ?)`,
+      )
+      .run(
+        JSON.stringify({
+          prompt: 'monitor',
+          script: 'exit 1', // would fail if re-run — null is still a result
+          scriptHost: true,
+          scriptOutput: null,
+        }),
+      );
+
+    const { keep, skipped } = await applyPreTaskScripts(getPendingMessages());
+
+    expect(skipped).toHaveLength(0);
+    expect(keep).toHaveLength(1);
+    expect(JSON.parse(keep[0].content)).toMatchObject({ scriptOutput: null });
+  });
 });
 
 // Fleet-hardening Phase 4, P1 leg 2: a pre-task script runs unattended with no

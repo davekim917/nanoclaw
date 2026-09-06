@@ -297,6 +297,10 @@ describe('cancelTask / pauseTask / resumeTask series matching', () => {
   it('pause/resume touch ONLY status — recurrence and process_after survive the cycle', () => {
     const db = freshDb();
     seedRecurringChain(db);
+    const hostResult = { alerts: 3 };
+    db.prepare("UPDATE messages_in SET content = ? WHERE id = 'task-next'").run(
+      JSON.stringify({ prompt: 'noop', script: 'check-alerts', scriptHost: true, scriptOutput: hostResult }),
+    );
     const before = db.prepare("SELECT recurrence, process_after FROM messages_in WHERE id = 'task-next'").get() as {
       recurrence: string | null;
       process_after: string | null;
@@ -312,6 +316,13 @@ describe('cancelTask / pauseTask / resumeTask series matching', () => {
     // A cancel-style copy-paste (clearing recurrence) would kill the series here.
     expect(after.recurrence).toBe(before.recurrence);
     expect(after.process_after).toBe(before.process_after);
+    // Resume is the same occurrence, so its host-gated result remains valid and
+    // prevents the container from executing the script a second time.
+    expect(
+      JSON.parse(
+        (db.prepare("SELECT content FROM messages_in WHERE id = 'task-next'").get() as { content: string }).content,
+      ),
+    ).toMatchObject({ scriptOutput: hostResult });
     db.close();
   });
 });
@@ -409,6 +420,83 @@ describe('updateTask', () => {
     expect(parsed.prompt).toBe('new');
     expect(parsed.script).toBe('echo old');
     expect(parsed.extra).toBe('keep me');
+  });
+
+  it('keeps the current occurrence host result for edits that do not change its script', () => {
+    const db = freshDb();
+    const scriptOutput = { alerts: 3 };
+    insertTaskRow(db, {
+      id: 'task-current-output',
+      seriesId: 'task-current-output',
+      processAfter: new Date().toISOString(),
+      recurrence: null,
+      content: JSON.stringify({
+        prompt: 'old',
+        script: 'check-alerts',
+        scriptHost: true,
+        scriptOutput,
+        threadAnchor: true,
+        quietStatus: false,
+        chatLimit: 5,
+        flagIntent: { turnModel: 'model-old', turnEffort: 'low' },
+      }),
+    });
+
+    updateTask(db, 'task-current-output', {
+      prompt: 'new',
+      threadAnchor: false,
+      quietStatus: true,
+      chatLimit: 10,
+      flagIntent: { turnModel: 'model-new' },
+    });
+
+    const content = JSON.parse(
+      (db.prepare("SELECT content FROM messages_in WHERE id = 'task-current-output'").get() as { content: string })
+        .content,
+    );
+    expect(content).toMatchObject({
+      prompt: 'new',
+      script: 'check-alerts',
+      scriptHost: true,
+      scriptOutput,
+      threadAnchor: false,
+      quietStatus: true,
+      chatLimit: 10,
+      flagIntent: { turnModel: 'model-new', turnEffort: 'low' },
+    });
+    db.close();
+  });
+
+  it('invalidates the current host result when its script or execution mode changes', () => {
+    const db = freshDb();
+    const base = { prompt: 'monitor', script: 'check-old', scriptHost: true, scriptOutput: null };
+    insertTaskRow(db, {
+      id: 'task-script-change',
+      seriesId: 'task-script-change',
+      processAfter: new Date().toISOString(),
+      recurrence: null,
+      content: JSON.stringify(base),
+    });
+
+    updateTask(db, 'task-script-change', { script: 'check-new' });
+    let content = JSON.parse(
+      (db.prepare("SELECT content FROM messages_in WHERE id = 'task-script-change'").get() as { content: string })
+        .content,
+    );
+    expect(content).toMatchObject({ prompt: 'monitor', script: 'check-new', scriptHost: true });
+    expect(content).not.toHaveProperty('scriptOutput');
+
+    db.prepare("UPDATE messages_in SET content = ? WHERE id = 'task-script-change'").run(
+      JSON.stringify({ ...content, scriptOutput: { stale: true } }),
+    );
+    updateTask(db, 'task-script-change', { scriptHost: false });
+    content = JSON.parse(
+      (db.prepare("SELECT content FROM messages_in WHERE id = 'task-script-change'").get() as { content: string })
+        .content,
+    );
+    expect(content).toMatchObject({ prompt: 'monitor', script: 'check-new', scriptHost: false });
+    expect(content).not.toHaveProperty('scriptOutput');
+    db.close();
   });
 
   it('updates recurrence and process_after when supplied', () => {
@@ -821,6 +909,87 @@ describe('insertRecurrence', () => {
       series_id: string;
     };
     expect(row.series_id).toBe('task-orig');
+    db.close();
+  });
+
+  for (const { status, scriptOutput } of [
+    { status: 'pending' as const, scriptOutput: { alerts: 3 } },
+    { status: 'paused' as const, scriptOutput: null },
+  ]) {
+    it(`starts a ${status} successor without the predecessor host result`, () => {
+      const db = freshDb();
+      const predecessorContent = JSON.stringify({
+        prompt: 'daily brief',
+        script: 'check-alerts',
+        scriptHost: true,
+        scriptOutput,
+        threadAnchor: false,
+        quietStatus: true,
+        chatLimit: 12,
+        flagIntent: { turnModel: 'model-pinned', turnEffort: 'high' },
+        customConfig: { region: 'us-east-1' },
+      });
+      insertTaskRow(db, {
+        id: 'task-host-result',
+        seriesId: 'series-host-result',
+        processAfter: '2026-01-04T09:00:00.000Z',
+        recurrence: '0 9 * * *',
+        content: predecessorContent,
+        platformId: 'C123',
+        channelType: 'slack',
+        threadId: 'C123:1234567890.000001',
+      });
+      db.prepare("UPDATE messages_in SET status = 'completed' WHERE id = 'task-host-result'").run();
+
+      const [previous] = getCompletedRecurring(db);
+      insertRecurrence(db, previous!, 'task-host-result-next', '2026-01-05T09:00:00.000Z', status);
+
+      expect(
+        db
+          .prepare('SELECT status, content, platform_id, channel_type, thread_id FROM messages_in WHERE id = ?')
+          .get('task-host-result-next'),
+      ).toEqual({
+        status,
+        content: JSON.stringify({
+          prompt: 'daily brief',
+          script: 'check-alerts',
+          scriptHost: true,
+          threadAnchor: false,
+          quietStatus: true,
+          chatLimit: 12,
+          flagIntent: { turnModel: 'model-pinned', turnEffort: 'high' },
+          customConfig: { region: 'us-east-1' },
+        }),
+        platform_id: 'C123',
+        channel_type: 'slack',
+        thread_id: 'C123:1234567890.000001',
+      });
+      // Terminal rows are audit history: re-arming must not rewrite their result.
+      expect(db.prepare("SELECT content FROM messages_in WHERE id = 'task-host-result'").get()).toEqual({
+        content: predecessorContent,
+      });
+      db.close();
+    });
+  }
+
+  it('preserves content exactly when the predecessor has no host result', () => {
+    const db = freshDb();
+    const content = '{ "prompt": "daily brief", "script": "check-alerts", "flagIntent": { "turnModel": "pinned" } }';
+    const previous: RecurringMessage = {
+      id: 'task-no-output',
+      kind: 'task',
+      content,
+      recurrence: '0 9 * * *',
+      process_after: '2026-01-04T09:00:00.000Z',
+      platform_id: null,
+      channel_type: null,
+      thread_id: null,
+      series_id: 'task-no-output',
+    };
+
+    insertRecurrence(db, previous, 'task-no-output-next', '2026-01-05T09:00:00.000Z');
+
+    expect(db.prepare('SELECT content FROM messages_in WHERE id = ?').get('task-no-output-next')).toEqual({ content });
     db.close();
   });
 });
