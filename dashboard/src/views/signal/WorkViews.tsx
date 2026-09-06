@@ -18,7 +18,9 @@ export function DecisionQueue({
   selectedId,
   onSelect,
   baseline = null,
+  timezone,
 }: {
+  timezone: string | null;
   baseline?: VisitBaseline | null;
   decisions: SignalDecision[];
   selectedId: string | null;
@@ -58,7 +60,7 @@ export function DecisionQueue({
                         ? 'Approval'
                         : 'Agent question'}
                   </span>
-                  <time title={d.source_as_of ?? undefined}>{sourceAge(d.source_as_of)}</time>
+                  <time title={signalStamp(d.source_as_of, timezone)}>{sourceAge(d.source_as_of)}</time>
                 </span>
                 <span className="work-row-owner">
                   {d.owner ? `${d.owner.name} reviewing` : 'Unclaimed'}

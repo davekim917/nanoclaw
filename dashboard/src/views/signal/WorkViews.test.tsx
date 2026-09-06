@@ -123,6 +123,7 @@ describe('work-first interaction', () => {
     const choose = vi.fn();
     render(
       <DecisionQueue
+        timezone="America/Los_Angeles"
         decisions={[
           decision('blocking', { blocks_release: true, state: 'changed' }),
           decision('recorded', { state: 'answered', answer: 'Use ID' }),
@@ -132,6 +133,7 @@ describe('work-first interaction', () => {
       />,
     );
     expect(screen.getByRole('heading', { name: 'Blocking release' })).toBeInTheDocument();
+    expect(screen.getAllByTitle('Sep 4, 2026, 5:00 PM')).toHaveLength(2);
     expect(screen.getByRole('heading', { name: 'Reviewed' })).toBeInTheDocument();
     expect(screen.getByText(/Recorded only/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /Question recorded/ }));

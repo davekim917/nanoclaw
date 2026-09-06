@@ -427,6 +427,7 @@ export function SignalApp({ authMe }: { authMe: AuthMe }) {
                                 ))}
                               </div>
                               <DecisionQueue
+                                timezone={timezone}
                                 baseline={baseline}
                                 decisions={decisions}
                                 selectedId={selected?.id ?? null}

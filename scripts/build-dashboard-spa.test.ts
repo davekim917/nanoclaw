@@ -141,6 +141,38 @@ describe('scripts/build-dashboard-spa.ts', () => {
       expect(computeInputHash(root)).not.toBe(before);
     });
 
+    it('changes when a Vite-prefixed process setting changes', () => {
+      const before = computeInputHash(root, { VITE_SATURDAY_RELEASE_WORKGROUP: 'release-a' });
+      const after = computeInputHash(root, { VITE_SATURDAY_RELEASE_WORKGROUP: 'release-b' });
+      expect(after).not.toBe(before);
+    });
+
+    it('changes when Vite production dotenv input changes', () => {
+      const env = {};
+      const before = computeInputHash(root, env);
+      const file = path.join(root, 'dashboard', '.env.production');
+      fs.writeFileSync(file, 'VITE_SATURDAY_RELEASE_WORKGROUP=release-a\n');
+      const withValue = computeInputHash(root, env);
+      fs.writeFileSync(file, 'VITE_SATURDAY_RELEASE_WORKGROUP=release-b\n');
+      expect(withValue).not.toBe(before);
+      expect(computeInputHash(root, env)).not.toBe(withValue);
+    });
+
+    it('changes when a Vite dotenv expansion reads a process setting', () => {
+      fs.writeFileSync(
+        path.join(root, 'dashboard', '.env.production'),
+        'VITE_SATURDAY_RELEASE_WORKGROUP=$RELEASE_WORKSPACE\n',
+      );
+      const before = computeInputHash(root, { RELEASE_WORKSPACE: 'release-a' });
+      const after = computeInputHash(root, { RELEASE_WORKSPACE: 'release-b' });
+      expect(after).not.toBe(before);
+    });
+
+    it('does not treat an unreadable Vite dotenv input as absent', () => {
+      fs.mkdirSync(path.join(root, 'dashboard', '.env.production'));
+      expect(() => computeInputHash(root, {})).toThrow();
+    });
+
     it('ignores host source changes outside dashboard/', () => {
       const before = computeInputHash(root);
       fs.mkdirSync(path.join(root, 'src'), { recursive: true });

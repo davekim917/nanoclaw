@@ -42,13 +42,16 @@ import { fileURLToPath } from 'node:url';
  * Bump when the set of hashed inputs or the cache layout changes, so old
  * entries can never be mistaken for a match under new rules.
  */
-export const CACHE_FORMAT_VERSION = 1;
+export const CACHE_FORMAT_VERSION = 2;
 
 /** Keep the last N distinct bundles. Each is ~750KB. */
 export const CACHE_KEEP = 3;
 
 export const CACHE_SUBDIR = path.join('data', 'build-cache', 'dashboard-spa');
 export const BUNDLE_DIR = path.join('dist', 'dashboard-spa');
+const VITE_ENV_FILES = ['.env', '.env.local', '.env.production', '.env.production.local'];
+const VITE_ENV_REFERENCE = /\$(?:\{([A-Za-z_][A-Za-z0-9_]*)[^}]*\}|([A-Za-z_][A-Za-z0-9_]*))/g;
+type Environment = Record<string, string | undefined>;
 
 /**
  * Test files are inputs too, even though they never reach the bundle.
@@ -95,7 +98,7 @@ export function listInputFiles(repoRoot: string): string[] {
  * directly, without the `prebuild` clean-tree guard, and an uncommitted edit
  * must still invalidate the cache.
  */
-export function hashInputs(repoRoot: string, files: string[]): string {
+export function hashInputs(repoRoot: string, files: string[], env: Environment = process.env): string {
   const h = createHash('sha256');
   h.update(`v${CACHE_FORMAT_VERSION}\n`);
   for (const rel of files) {
@@ -110,11 +113,35 @@ export function hashInputs(repoRoot: string, files: string[]): string {
     }
     h.update(`${rel}\0${digest}\n`);
   }
+  // Vite loads these files from its project root for `vite build`'s production
+  // mode, then gives any existing VITE_* process setting precedence. They are
+  // ignored locally, so git-visible dashboard inputs alone cannot see them.
+  const referencedEnvironment = new Set(Object.keys(env).filter((key) => key.startsWith('VITE_')));
+  for (const name of VITE_ENV_FILES) {
+    const abs = path.join(repoRoot, 'dashboard', name);
+    let contents: Buffer;
+    try {
+      contents = fs.readFileSync(abs);
+    } catch (err) {
+      if (err instanceof Error && 'code' in err && err.code === 'ENOENT') {
+        h.update(`vite-env-file:${name}\0absent\n`);
+        continue;
+      }
+      throw err;
+    }
+    h.update(`vite-env-file:${name}\0${createHash('sha256').update(contents).digest('hex')}\n`);
+    for (const match of contents.toString('utf8').matchAll(VITE_ENV_REFERENCE)) {
+      referencedEnvironment.add(match[1] ?? match[2]!);
+    }
+  }
+  for (const key of [...referencedEnvironment].sort()) {
+    h.update(`vite-env:${key}\0${env[key] ?? ''}\n`);
+  }
   return h.digest('hex');
 }
 
-export function computeInputHash(repoRoot: string): string {
-  return hashInputs(repoRoot, listInputFiles(repoRoot));
+export function computeInputHash(repoRoot: string, env: Environment = process.env): string {
+  return hashInputs(repoRoot, listInputFiles(repoRoot), env);
 }
 
 export type BuildDecision =
