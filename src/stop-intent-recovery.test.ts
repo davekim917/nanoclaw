@@ -602,10 +602,13 @@ describe('honorPendingStopIntents runs after the startup-only resets', () => {
    * one of them past the recovery fails here rather than in production.
    */
   const ORDERED = [
-    'releaseOrphanedRepoIngressFencesAtStartup',
-    'runOnecliBootPreflight',
+    // Series E moved both resets ahead of adoption (#456 round 2): a reset
+    // after adoption would strip an adopted entry's storage lease or flip its
+    // `running` row back to `stopped` under a live container.
     'resetStorageActivityState',
     'resetPhantomContainerStatus',
+    'releaseOrphanedRepoIngressFencesAtStartup',
+    'runOnecliBootPreflight',
     'honorPendingStopIntents',
   ] as const;
 

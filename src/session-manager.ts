@@ -1934,7 +1934,12 @@ export function clearOutbox(agentGroupId: string, sessionId: string, messageId: 
  * helpers are called from places that don't all carry that context.
  * Best-effort: lookup miss or unavailable dashboard module → no emit.
  */
-async function _emitContainerStateEvent(
+/**
+ * Exported for the fenced finish in container-runner, which writes the
+ * `stopped` status inside a central transaction (DB calls only) and emits the
+ * dashboard event after it commits.
+ */
+export async function _emitContainerStateEvent(
   sessionId: string,
   containerStatus: 'running' | 'idle' | 'stopped',
 ): Promise<void> {

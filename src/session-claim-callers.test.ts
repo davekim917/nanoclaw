@@ -11,9 +11,12 @@
  * nobody can add by accident.
  *
  * The list may SHRINK, never grow. Seam 4 series E adds `adoptRunningSessions`
- * to it in its own PR, deliberately and visibly — the same shape seam 3 uses
- * for `getRawDb` (src/db/raw-db-ratchet.test.ts) and seam 2 for
- * `computeOffenders`.
+ * in its own PR, deliberately and visibly — the same shape seam 3 uses for
+ * `getRawDb` (src/db/raw-db-ratchet.test.ts) and seam 2 for `computeOffenders`.
+ * The adopter claims THROUGH `claimSessionRun` rather than beside it (it is
+ * the same fence with the container half skipped, plan §4.3.4), so the growth
+ * is visible one layer up: `CLAIM_SESSION_RUN_CALLERS` pins the functions that
+ * reach the fence, and `adoptRunningSessions` is the one entry E adds.
  *
  * Scope note: this counts any reference to the identifier in a file with
  * comments stripped, not only a static `import` — a dynamic `await import(...)`
@@ -36,8 +39,13 @@ const SCAN_ROOTS = ['src', 'scripts', 'setup'] as const;
  *  - `session-claim-spawn.test.ts` is the acceptance suite for the one caller;
  *    it wraps the real accessor to inject a lost CAS and a failed write, which
  *    is the only way a single process can produce either.
+ *  - `container-adoption.test.ts` and `container-supervision-channel.test.ts`
+ *    (seam 4 E) wrap it the same way, to inject the failed write the
+ *    pending-adoption cases need.
  */
 const NOT_CALLERS: readonly string[] = [
+  'src/container-adoption.test.ts',
+  'src/container-supervision-channel.test.ts',
   'src/db/coordination.test.ts',
   'src/db/coordination.ts',
   'src/session-claim-callers.test.ts',
@@ -50,6 +58,18 @@ const NOT_CALLERS: readonly string[] = [
  */
 export const TRY_CLAIM_SESSION_CALLERS: ReadonlyArray<{ file: string; fn: string }> = [
   { file: 'src/container-runner.ts', fn: 'claimSessionRun' },
+];
+
+/**
+ * Every function that reaches the fence itself. Two entries and no more: the
+ * spawn path, and the boot-time adopter that takes over a survivor of the
+ * previous host under `{ adopting: true }`.
+ */
+export const CLAIM_SESSION_RUN_CALLERS: ReadonlyArray<{ file: string; fn: string }> = [
+  // The per-container adopter step, shared by the boot pass (`adoptRunningSessions`)
+  // and the wake-path retry (`retryPendingAdoption`, P4).
+  { file: 'src/container-runner.ts', fn: 'adoptRunningSession' },
+  { file: 'src/container-runner.ts', fn: 'spawnContainer' },
 ];
 
 function stripComments(source: string): string {
@@ -143,5 +163,55 @@ describe('tryClaimSession has exactly one caller', () => {
     const files = TRY_CLAIM_SESSION_CALLERS.map((caller) => caller.file);
     expect(files).toEqual([...files].sort());
     expect(new Set(files).size).toBe(files.length);
+  });
+});
+
+/**
+ * The span of a top-level function declaration in `source`: from its
+ * `function <name>(` to the next top-level `\n}\n`.
+ */
+function functionSpan(source: string, fn: string): { start: number; end: number } {
+  const start = source.indexOf(`function ${fn}(`);
+  expect(start, `no top-level declaration of ${fn}`).toBeGreaterThan(-1);
+  const end = source.indexOf('\n}\n', start);
+  expect(end, `${fn} has no top-level body end`).toBeGreaterThan(start);
+  return { start, end };
+}
+
+describe('claimSessionRun is reached from exactly the pinned functions', () => {
+  it('every call site falls inside a pinned function, and each pinned function calls it', () => {
+    const file = 'src/container-runner.ts';
+    const source = blankImports(stripComments(fs.readFileSync(path.join(REPO_ROOT, file), 'utf8')));
+    const declaration = functionSpan(source, 'claimSessionRun');
+    const spans = CLAIM_SESSION_RUN_CALLERS.map(({ fn }) => ({ fn, ...functionSpan(source, fn) }));
+
+    const callSites = [...source.matchAll(/\bclaimSessionRun\b/g)]
+      .map((match) => match.index)
+      // The declaration itself is not a call.
+      .filter((index) => index < declaration.start || index > declaration.end);
+    const unpinned = callSites.filter((index) => !spans.some((span) => index > span.start && index < span.end));
+    expect(
+      unpinned.map((index) => source.slice(0, index).split('\n').length),
+      'a NEW function claims a session. The claim fence has two callers by design — the spawn path and the ' +
+        'boot-time adopter — and a third reopens the window it closes. Route the caller through one of them, ' +
+        'or extend CLAIM_SESSION_RUN_CALLERS deliberately.',
+    ).toEqual([]);
+    for (const span of spans) {
+      expect(
+        callSites.filter((index) => index > span.start && index < span.end).length,
+        `${span.fn} no longer claims — drop it from CLAIM_SESSION_RUN_CALLERS in this commit`,
+      ).toBeGreaterThan(0);
+    }
+    // The other callers file: no second file may reach the fence at all.
+    const others = listTsFiles()
+      .filter((rel) => rel !== file && !NOT_CALLERS.includes(rel))
+      .filter((rel) => /\bclaimSessionRun\b/.test(stripComments(fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8'))));
+    expect(others).toEqual([]);
+  });
+
+  it('is sorted by function and free of duplicates', () => {
+    const fns = CLAIM_SESSION_RUN_CALLERS.map((caller) => caller.fn);
+    expect(fns).toEqual([...fns].sort());
+    expect(new Set(fns).size).toBe(fns.length);
   });
 });

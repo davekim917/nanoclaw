@@ -2,7 +2,7 @@
  * Container runtime abstraction for NanoClaw.
  * All runtime-specific logic lives here so swapping runtimes means changing one file.
  */
-import { execSync } from 'child_process';
+import { execFileSync, execSync, spawn, type ChildProcess } from 'child_process';
 import os from 'os';
 
 import {
@@ -30,12 +30,76 @@ export function readonlyMountArgs(hostPath: string, containerPath: string): stri
   return ['-v', `${hostPath}:${containerPath}:ro`];
 }
 
-/** Stop a container by name after validating the name against shell metacharacters. */
-export function stopContainer(name: string): void {
+/**
+ * Refuse anything that is not a plain container name. The stop path below
+ * interpolates the name into a shell command; the argv-form helpers do not,
+ * but they share the check so a name the runtime would reject never reaches
+ * a subprocess at all.
+ */
+export function assertContainerName(name: string): void {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(name)) {
     throw new Error(`Invalid container name: ${name}`);
   }
+}
+
+/** Stop a container by name after validating the name against shell metacharacters. */
+export function stopContainer(name: string): void {
+  assertContainerName(name);
   execSync(`${CONTAINER_RUNTIME_BIN} stop -t 1 ${name}`, { stdio: 'pipe' });
+}
+
+/**
+ * SIGKILL a container by name — the fallback when `stopContainer` itself
+ * failed. For a container this host SPAWNED the equivalent is killing the
+ * `docker run` client; for one it ADOPTED there is no client to kill, only a
+ * `docker wait` observer, and killing that would abandon the container rather
+ * than stop it (plan §7.E, the one place a naive channel union is wrong).
+ */
+export function killContainerHard(name: string): void {
+  assertContainerName(name);
+  execFileSync(CONTAINER_RUNTIME_BIN, ['kill', name], { stdio: 'pipe' });
+}
+
+/**
+ * Is a container of THIS install with exactly this name running right now?
+ *
+ * A listing, deliberately not `docker inspect`: after a crash every session
+ * whose container exited during the outage still carries its `container_ref`
+ * (`releaseSessionClaim` nulls it only on a tracked exit), and `inspect` on an
+ * auto-removed container THROWS exactly as a dead daemon does. With `ps`, an
+ * empty result is a successful proof of absence and a throw is "the runtime
+ * could not be asked" — the two callers want opposite closed sides for that
+ * throw, so it is left to them: the claim fence refuses the spawn, the adopted
+ * waiter re-arms (plan §4.3.3, §4.3.4 P2).
+ *
+ * The `name=` filter is a substring match in the runtime; the exact-name check
+ * is made here so the answer never depends on the runtime's regex anchoring.
+ */
+export function runtimeShowsRunning(name: string): boolean {
+  assertContainerName(name);
+  const output = execFileSync(
+    CONTAINER_RUNTIME_BIN,
+    ['ps', '--filter', `label=${CONTAINER_INSTALL_LABEL}`, '--filter', `name=${name}`, '--format', '{{.Names}}'],
+    { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
+  );
+  return output.trim().split('\n').filter(Boolean).includes(name);
+}
+
+/**
+ * The supervision channel for a container this host did not spawn: a
+ * `docker wait <name>` child whose `close` is the container's terminal, so the
+ * `.once('close', …)` shape the kill, shutdown and finalize paths already use
+ * keeps working for an adopted entry (plan §4.3.3).
+ *
+ * Exit vocabulary the caller classifies: exit 0 with the container's exit code
+ * on stdout means it exited; exit 1 with `No such container` on stderr means
+ * it is already gone (terminal, never re-armed); exit 1 with `Cannot connect
+ * to the Docker daemon` means the daemon went away, which is NOT a terminal —
+ * the caller re-reads truth and re-arms.
+ */
+export function waitForContainerExit(name: string): ChildProcess {
+  assertContainerName(name);
+  return spawn(CONTAINER_RUNTIME_BIN, ['wait', name], { stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
 /** Ensure the container runtime is running, starting it if needed. */
