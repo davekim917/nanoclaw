@@ -12,6 +12,7 @@ import { getAgentMailbox, readMailboxContext } from '../mailbox/index.js';
 import './core.js';
 import './interactive.js';
 import './agents.js';
+import './rooms.js';
 import { registerProviderSpecificSelfModTools } from './self-mod.js';
 import './thread-search.js';
 import './git-worktrees.js';
