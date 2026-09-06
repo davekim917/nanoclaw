@@ -19,6 +19,7 @@ const mockHasPendingAdoption = vi.fn<(id: string) => boolean>(() => false);
 const mockResolvePendingSurvivor = vi.fn<(id: string) => Promise<'running' | 'gone' | 'unknown'>>(
   async () => 'running',
 );
+const mockGetContainerIdentity = vi.fn<(id: string) => string | null>(() => 'nanoclaw-v2-identity-1');
 // Process generation for a session's container. Constant unless a test models a
 // replacement spawning during the restart's async pending read.
 const mockGetContainerSpawnedAt = vi.fn<(id: string) => number>(() => 1000);
@@ -32,6 +33,7 @@ vi.mock('./container-runner.js', async (importOriginal) => {
     isContainerSpawning: (...args: unknown[]) => mockIsContainerSpawning(args[0] as string),
     hasPendingAdoption: (...args: unknown[]) => mockHasPendingAdoption(args[0] as string),
     resolvePendingSurvivor: (...args: unknown[]) => mockResolvePendingSurvivor(args[0] as string),
+    getContainerIdentity: (...args: unknown[]) => mockGetContainerIdentity(args[0] as string),
     // The real definition, over the same mocks: a container "owns"
     // outbound.db while it is running, still spawning, or a pending survivor.
     containerOwnsOutbound: (...args: unknown[]) =>
@@ -262,6 +264,7 @@ beforeEach(() => {
   mockIsContainerSpawning.mockReturnValue(false);
   mockGetContainerSpawnedAt.mockReset().mockReturnValue(1000);
   mockResolvePendingSurvivor.mockReset().mockResolvedValue('running');
+  mockGetContainerIdentity.mockReset().mockReturnValue('nanoclaw-v2-identity-1');
   activeEpochs.clear();
   acknowledgedEpochs.clear();
   processingSessions.clear();
@@ -777,6 +780,33 @@ describe('restartAgentGroupContainers', () => {
     mockHasPendingAdoption.mockReturnValue(false);
   });
 
+  it('a pending survivor adopted during the restart is still killed and respawned', async () => {
+    // The mailbox read awaits; an inbound wake adopts the survivor meanwhile.
+    // The same docker process keeps its NAME, so it is still the container this
+    // restart targets — even though the registry timestamp went 0 → adoption.
+    mockGetSessionsByAgentGroup.mockReturnValue([makeSession('s-adopting', 'g1')]);
+    let adopted = false;
+    mockIsContainerRunning.mockImplementation(() => adopted);
+    mockHasPendingAdoption.mockImplementation(() => !adopted);
+    mockGetContainerSpawnedAt.mockImplementation(() => (adopted ? 5_000 : 0));
+    mockGetContainerIdentity.mockReturnValue('nanoclaw-v2-survivor-1');
+    mockCountDueMessages.mockImplementation(() => {
+      adopted = true;
+      return 0;
+    });
+
+    const count = await restartAgentGroupContainers('g1', 'test', 'Resuming.');
+
+    expect(count).toBe(1);
+    expect(mockKillContainer.mock.calls.map((c) => c[0])).toEqual(['s-adopting']);
+    expect(log.info).not.toHaveBeenCalledWith(
+      'Restart: container was replaced while reading pending work; leaving the replacement alone',
+      expect.anything(),
+    );
+    mockHasPendingAdoption.mockReset();
+    mockHasPendingAdoption.mockReturnValue(false);
+  });
+
   it('keeps restarting after one session fails, and never kills that session', async () => {
     mockGetSessionsByAgentGroup.mockReturnValue([
       makeSession('s1', 'g1'),
@@ -875,7 +905,7 @@ describe('restartAgentGroupContainers', () => {
     mockGetSessionsByAgentGroup.mockReturnValue([makeSession('s1', 'g1')]);
     mockIsContainerRunning.mockReturnValue(true);
     // A replacement appears while the pending read is in flight.
-    mockGetContainerSpawnedAt.mockReturnValueOnce(1000).mockReturnValue(2000);
+    mockGetContainerIdentity.mockReturnValueOnce('nanoclaw-v2-old-1').mockReturnValue('nanoclaw-v2-new-1');
 
     const count = await restartAgentGroupContainers('g1', 'test', 'Resuming.');
 
@@ -909,7 +939,7 @@ describe('restartAgentGroupContainers', () => {
     // process. Killing that one is wrong, and silently so — the read saw no due
     // rows, so no onExit would be installed and the replacement's freshly
     // claimed input would go dark until a later recovery pass.
-    mockGetContainerSpawnedAt.mockReturnValueOnce(1000).mockReturnValue(2000);
+    mockGetContainerIdentity.mockReturnValueOnce('nanoclaw-v2-old-1').mockReturnValue('nanoclaw-v2-new-1');
 
     const count = await restartAgentGroupContainers('g1', 'test');
 

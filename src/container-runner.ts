@@ -2433,6 +2433,19 @@ export async function resolvePendingSurvivor(sessionId: string): Promise<'runnin
   return 'running';
 }
 
+/**
+ * The identity of the container running a session — its runtime name — for a
+ * tracked entry or a pending survivor, or null when there is none. Stable
+ * across adoption (the same docker process keeps its name when a pending
+ * survivor is adopted), and different for every spawn (the name carries the
+ * spawn instant), so a caller that must tell "the same container" from "a
+ * replacement" across an await compares this, not `getContainerSpawnedAt`,
+ * which flips from 0 to the adoption instant on adoption (#479 round 2).
+ */
+export function getContainerIdentity(sessionId: string): string | null {
+  return activeContainers.get(sessionId)?.containerName ?? pendingHolds.get(sessionId)?.containerName ?? null;
+}
+
 /** Is the container provably gone? A runtime that cannot be asked never proves absence. */
 function containerProvenGone(containerName: string): boolean {
   try {

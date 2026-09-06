@@ -6,7 +6,7 @@
  */
 import {
   containerOwnsOutbound,
-  getContainerSpawnedAt,
+  getContainerIdentity,
   hasPendingAdoption,
   isContainerRunning,
   isContainerSpawning,
@@ -939,14 +939,16 @@ export async function restartAgentGroupContainers(
       await withdrawWake();
       continue;
     }
-    // Generation token for the process we are about to kill. The pending read
-    // below is async, so the snapshotted container can exit and an inbound wake
-    // can install a REPLACEMENT before control returns — and killing that one
-    // is both wrong and silent: if the read saw no due rows, no onExit is
+    // Identity of the container we are about to kill. The pending read below
+    // is async, so the snapshotted container can exit and an inbound wake can
+    // install a REPLACEMENT before control returns — and killing that one is
+    // both wrong and silent: if the read saw no due rows, no onExit is
     // installed, so the replacement's freshly claimed input goes dark until a
-    // later recovery pass. `spawnedAt` changes on every spawn, so comparing it
-    // across the await identifies the process rather than merely the session.
-    const spawnGeneration = getContainerSpawnedAt(session.id);
+    // later recovery pass. The container NAME identifies the process: every
+    // spawn mints a new one, and a pending survivor adopted during the await
+    // keeps its own — `getContainerSpawnedAt` would flip from 0 to the adoption
+    // instant there and misread adoption as replacement (#479 round 2).
+    const identity = getContainerIdentity(session.id);
 
     // Always respawn after the kill when there is anything to process: an
     // explicit wake message, or in-flight messages the dying container had
@@ -983,7 +985,7 @@ export async function restartAgentGroupContainers(
     // that replacement's first poll already took the wake row, the withdrawal
     // is a no-op and it keeps it; if it polled before the row landed, the
     // withdrawal is what stops the row outliving this restart.
-    if (getContainerSpawnedAt(session.id) !== spawnGeneration) {
+    if (getContainerIdentity(session.id) !== identity) {
       log.info('Restart: container was replaced while reading pending work; leaving the replacement alone', {
         agentGroupId,
         sessionId: session.id,
