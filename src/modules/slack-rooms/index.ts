@@ -36,12 +36,31 @@ import { handleAddToRoom, handleCreateRoom } from './apply.js';
 import { ADD_TO_ROOM_ACTION, CREATE_ROOM_ACTION, roomsAddAgent, roomsCreate } from './guard.js';
 import { requestAddToRoomHold, requestCreateRoomHold, validateAddToRoom, validateCreateRoom } from './request.js';
 
+/**
+ * Turn the guard's one deny reason for a failed grant check into something the
+ * agent can act on.
+ *
+ * Both actions bind their approval to what was resolved when the card went out
+ * — create_room to the roster, add_to_room to the room id and the target agent
+ * group — so "mismatched grant" on a replay means one specific thing: the
+ * world moved between the card and the click, and the approval no longer
+ * covers what would now happen. Re-requesting is the fix, and the requester is
+ * the only one who can do it.
+ */
+function denialNotice(action: string, reason: string): string {
+  if (!reason.includes('mismatched grant')) return `${action} denied: ${reason}`;
+  return (
+    `${action} denied: the participants changed since that approval was given, so it no longer covers what ` +
+    `this would do. Ask again to get a fresh approval for the current roster.`
+  );
+}
+
 registerDeliveryAction(CREATE_ROOM_ACTION, handleCreateRoom, {
   guardAction: roomsCreate,
   precheck: validateCreateRoom,
   requestHold: requestCreateRoomHold,
   onDeny: (_content, session, reason) => {
-    void notifyAgent(session, `create_room denied: ${reason}`).catch((err) =>
+    void notifyAgent(session, denialNotice('create_room', reason)).catch((err) =>
       log.error('Failed to notify agent of create_room denial', { err }),
     );
   },
@@ -52,7 +71,7 @@ registerDeliveryAction(ADD_TO_ROOM_ACTION, handleAddToRoom, {
   precheck: validateAddToRoom,
   requestHold: requestAddToRoomHold,
   onDeny: (_content, session, reason) => {
-    void notifyAgent(session, `add_to_room denied: ${reason}`).catch((err) =>
+    void notifyAgent(session, denialNotice('add_to_room', reason)).catch((err) =>
       log.error('Failed to notify agent of add_to_room denial', { err }),
     );
   },

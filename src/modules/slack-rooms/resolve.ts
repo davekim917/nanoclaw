@@ -265,6 +265,15 @@ export function roomInviter(
   };
 }
 
+/**
+ * One participant as an approval-bindable string. Every axis a swap could
+ * happen on is in it: the agent group, the adapter instance that speaks for
+ * it, the Slack bot user that actually gets invited, and the workspace.
+ */
+export function rosterStamp(participants: RoomParticipant[]): string[] {
+  return participants.map((p) => `${p.agentGroupId}|${p.channelType}|${p.botUserId}|${p.teamId}`).sort();
+}
+
 /** Rooms in the caller's candidate set carrying this name. Never throws. */
 export async function findRoomsByName(callerAgentGroupId: string, roomName: string): Promise<CandidateRoom[]> {
   const wanted = roomKey(roomName);
