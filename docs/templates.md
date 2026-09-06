@@ -6,6 +6,16 @@ and optional recurring tasks, but **no secrets and no provider**. Point `ncl` at
 you get a configured agent in seconds; you choose the runtime/provider
 separately.
 
+> **Format change.** A template is now an [Agent Plugins
+> 1.0.0](https://agent-plugins.org/schemas/1.0.0/) plugin directory (`plugin.json`
+> required; `skills/`, `mcp.json` and the `ai.nanoco.nanoclaw/` extension
+> optional). A folder in the pre-plugin layout described below is refused with a
+> migration error — there is no fallback parse — and this document is rewritten
+> in the docs PR of the same series. Stamping copies the plugin to
+> `groups/<folder>/plugins/<name>` read-only and creates
+> `groups/<folder>/plugin-data/<name>` beside it; **`plugin-data/` is
+> agent-writable and storage maintenance does not sweep it.**
+
 Templates are purely additive and require no DB migration. **Templates
 are resolved only from a local directory**: `templates/` at the
 project root by default (committed but shipped empty), or whatever
