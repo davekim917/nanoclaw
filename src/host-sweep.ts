@@ -272,16 +272,9 @@ export interface ContainerObservation {
   lastOutboundAtMs: number | null;
   lastInboundAtMs: number | null;
   /**
-   * WHICH container this observation is about, read in the same synchronous
-   * turn as the state above.
-   *
-   * A health verdict is only valid for the container it was made about, and
-   * everything between this read and a duty acting on it — the exclusive
-   * phase's own mailbox opens included — is a window in which the observed
-   * container can exit and a wake can register a replacement. Without the
-   * pair, a duty re-reading the registry later gets the replacement and every
-   * identity check it makes compares that replacement against itself (#505
-   * round 2). Null when nothing is registered.
+   * WHICH container the state above is about, read in the same turn so a duty
+   * can tell it apart from a replacement registered while the duty awaited
+   * (#505). Null when nothing is registered.
    */
   containerIdentity: ContainerIdentity | null;
 }
@@ -1356,7 +1349,6 @@ async function sweepSession(session: Session, tick: SweepTickContext): Promise<n
             processingClaimCount: m.getProcessingClaimRows().length,
             lastOutboundAtMs: getLastOutboundAtMs(m),
             lastInboundAtMs: getLastInboundAtMs(m),
-            // Same turn as the state above, deliberately: see the field's note.
             containerIdentity: containerIdentityFor(session.id),
           })),
         )) ?? null;

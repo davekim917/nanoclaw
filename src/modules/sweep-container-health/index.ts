@@ -152,7 +152,7 @@ async function applyProviderHeal(
   session: Session,
   agentGroupFolder: string,
   containerState: ContainerState | null,
-  target: ContainerIdentity,
+  target: ContainerIdentity | null,
 ): Promise<'healed' | 'stale-target'> {
   const failureReason = containerState?.provider_failure_reason ?? null;
   let primaryProvider: string | null = null;
@@ -186,11 +186,11 @@ async function applyProviderHeal(
   // Refuse instead: no marker, no kill, full attempt budget kept for a failure
   // that is still real.
   const registered = containerIdentityFor(session.id);
-  if (!sameContainerIdentity(registered, target)) {
+  if (identityChanged(registered, target)) {
     log.info('self-heal: heal target was replaced before the marker — refusing', {
       class: 'failed-provider',
       sessionId: session.id,
-      expected: target.containerName,
+      expected: target?.containerName ?? null,
       registered: registered?.containerName ?? null,
     });
     return 'stale-target';
@@ -236,13 +236,13 @@ async function applyProviderHeal(
  * fence a replacement spawned in that window is killed and its work reported
  * lost (#478). Same fence `finalizeSession` applies to a late terminal event.
  */
-function killForProviderHeal(session: Session, target: ContainerIdentity): void {
+function killForProviderHeal(session: Session, target: ContainerIdentity | null): void {
   const registered = containerIdentityFor(session.id);
-  if (!sameContainerIdentity(registered, target)) {
+  if (identityChanged(registered, target)) {
     log.info('self-heal: heal target was replaced before the kill — leaving the live container alone', {
       class: 'failed-provider',
       sessionId: session.id,
-      expected: target.containerName,
+      expected: target?.containerName ?? null,
       registered: registered?.containerName ?? null,
     });
     return;
@@ -326,6 +326,25 @@ export function notifyProviderHealParked(
  * inside the central lease; the caller takes the lease around this whole check
  * (seam 3 §4.5 I-1).
  */
+/**
+ * Did the registry move to a DIFFERENT container?
+ *
+ * Absence is not change. A null on either side means "this host has no identity
+ * for the session", which is the state every pre-#478 check already handled on
+ * its own — `providerHealTargetUnavailableReason` for a container that is gone,
+ * and `killContainer` itself, which is a no-op when nothing is registered. A
+ * fence that refused on null would instead disable the whole self-heal wherever
+ * an identity is unavailable, which is a silent feature outage rather than a
+ * safety property.
+ *
+ * So this answers only the question the fences exist for: two identities, both
+ * present, naming different containers.
+ */
+function identityChanged(a: ContainerIdentity | null, b: ContainerIdentity | null): boolean {
+  if (!a || !b) return false;
+  return !sameContainerIdentity(a, b);
+}
+
 function providerHealTargetUnavailableReason(sessionId: string): string | null {
   const liveness = sessionStillActive(sessionId)();
   if (liveness !== true) return typeof liveness === 'object' ? liveness.reason : 'session is not wakeable';
@@ -409,10 +428,10 @@ async function sweepProviderHeal(
     }),
     'provider-heal target check',
   );
-  if (unavailable || !registered) {
+  if (unavailable) {
     log.info(`self-heal: ${decision} target already gone — nothing to do this pass`, {
       ...bounds,
-      reason: unavailable ?? 'no container registered for this session',
+      reason: unavailable,
     });
     return true;
   }
@@ -420,19 +439,18 @@ async function sweepProviderHeal(
   // The DECISION is only valid for the container it was made about (#505 round
   // 2). `decision` rests on the `failed` state W3 read, and the budget open
   // above has yielded since: if that container exited and a wake registered a
-  // replacement, the registry now names a HEALTHY container, and every identity
-  // check below would compare the replacement against itself and pass. So the
-  // comparison is against the identity paired with the observation, not against
-  // one re-read here. Refuse, take no action, let the next tick re-observe.
-  if (!observedContainer || !sameContainerIdentity(registered, observedContainer)) {
+  // replacement, the registry now names a HEALTHY container, and a fence that
+  // re-read it here would compare that replacement against itself and pass. So
+  // the comparison is against the identity paired with the observation.
+  if (identityChanged(registered, observedContainer)) {
     log.info(`self-heal: ${decision} target was replaced since the health observation — refusing`, {
       ...bounds,
       observed: observedContainer?.containerName ?? null,
-      registered: registered.containerName,
+      registered: registered?.containerName ?? null,
     });
     return true;
   }
-  const target = observedContainer;
+  const target = observedContainer ?? registered;
 
   if (decision === 'park') {
     // Kill first, then post: outbound.db has exactly one writer, and the
@@ -444,7 +462,7 @@ async function sweepProviderHeal(
     // registered, and the park path reaches it through the same stale-decision
     // window. Re-checked here rather than trusting the check above, because a
     // replacement can still land between them.
-    if (!sameContainerIdentity(containerIdentityFor(session.id), target)) {
+    if (identityChanged(containerIdentityFor(session.id), target)) {
       log.info('self-heal: park target was replaced before the kill — leaving the live container alone', bounds);
       return true;
     }

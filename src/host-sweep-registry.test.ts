@@ -1497,7 +1497,15 @@ describe('sweep duty registry (S2-PR2)', () => {
     // (1,450 − 1,439), which is tight on purpose: the next PR that genuinely
     // grows the driver re-measures and raises with its own reason, exactly as
     // the 1,300 → 1,400 → 1,450 raises each did.
-    expect(source.split('\n').length).toBeLessThanOrEqual(1450);
+    //
+    // **Raised 1,450 → 1,460 by #505.** Measured, not headroom: +13 for the
+    // `containerIdentity` field on `ContainerObservation` and its read in the
+    // driver's observe closure, which pairs "which container" with the health
+    // state in one turn so a duty cannot act on a verdict about a container
+    // that has since been replaced. No duty body moves here — the three
+    // structural assertions above are unchanged — and 1,456 leaves the same
+    // tight 4-line headroom the 1,450 ceiling had.
+    expect(source.split('\n').length).toBeLessThanOrEqual(1460);
     expect(h.spawns).toEqual([]);
   });
 
