@@ -318,7 +318,7 @@ describe('Signal source and authority boundaries', () => {
     expect(first.question).toBe('First?');
     expect(first.id).not.toBe(second.id);
   });
-  it('retains scoped recorded thread answers after completion without marking off-page questions unavailable', async () => {
+  it('retains scoped thread review history after completion without marking off-page questions unavailable', async () => {
     await updateProject(
       'thread-project',
       {
@@ -343,12 +343,12 @@ describe('Signal source and authority boundaries', () => {
       needs_you_reason: { cause: 'ask_question', text: 'Record this answer' },
       last_activity_at: '2026-09-05T00:00:00Z',
     } as unknown as ThreadSummary;
-    const questionDeps: ApiDeps = {
+    const answerDeps: ApiDeps = {
       ...deps([]),
       threads: async () => [active],
       question: () => ({ seq: 1, text: 'Record this answer', timestamp: '2026-09-05T00:00:00Z' }),
     };
-    const source = (await buildSignalData(ctx(), 'w', questionDeps)).decisions[0]!;
+    const source = (await buildSignalData(ctx(), 'w', answerDeps)).decisions[0]!;
     await reviewDecision(
       source.id,
       {
@@ -359,10 +359,23 @@ describe('Signal source and authority boundaries', () => {
         idempotency_key: 'recorded-answer',
       },
       ctx(),
-      questionDeps,
+      answerDeps,
+    );
+    const claimDeps: ApiDeps = {
+      ...answerDeps,
+      question: () => ({ seq: 2, text: 'Record this claim', timestamp: '2026-09-05T00:00:00Z' }),
+    };
+    const claim = (await buildSignalData(ctx(), 'w', claimDeps)).decisions.find(
+      (decision) => decision.question === 'Record this claim',
+    )!;
+    await reviewDecision(
+      claim.id,
+      { expected_version: 0, evidence_hash: claim.evidence_hash, action: 'claim', idempotency_key: 'recorded-claim' },
+      ctx(),
+      claimDeps,
     );
     const idle = { ...active, state: 'idle', needs_you_reason: null } as unknown as ThreadSummary;
-    const completed = await buildSignalData(ctx(), 'w', { ...questionDeps, threads: async () => [idle] });
+    const completed = await buildSignalData(ctx(), 'w', { ...claimDeps, threads: async () => [idle] });
     const retained = completed.decisions.find((decision) => decision.id === source.id)!;
     expect(retained).toMatchObject({
       state: 'answered',
@@ -375,17 +388,36 @@ describe('Signal source and authority boundaries', () => {
     expect(
       completed.sources.some((entry) => entry.source === retained.question && entry.status === 'unavailable'),
     ).toBe(false);
+    const retainedClaim = completed.decisions.find((decision) => decision.id === claim.id)!;
+    expect(retainedClaim).toMatchObject({ state: 'changed', project_id: 'thread-project', owner: { id: 'd' } });
+    expect(retainedClaim.history).toHaveLength(1);
+    expect(retainedClaim.capabilities).toEqual({ claim: false, answer: false, dispatch: false });
+    expect(completed.projects.find((project) => project.id === 'thread-project')!.decision_ids).toContain(claim.id);
+    expect(
+      completed.sources.some((entry) => entry.source === retainedClaim.question && entry.status === 'unavailable'),
+    ).toBe(true);
+    const detail = await decisionDetail(claim.id, ctx(), {
+      ...claimDeps,
+      threadId: active.thread_id,
+      threads: async () => [idle],
+      threadDetail: async () => null,
+    });
+    expect(detail.decision).toMatchObject({ id: claim.id, state: 'changed', owner: { id: 'd' } });
     const laterQuestion = await buildSignalData(ctx(), 'w', {
-      ...questionDeps,
-      question: () => ({ seq: 2, text: 'A later question', timestamp: '2026-09-05T01:00:00Z' }),
+      ...claimDeps,
+      question: () => ({ seq: 3, text: 'A later question', timestamp: '2026-09-05T01:00:00Z' }),
     });
     expect(laterQuestion.decisions.find((decision) => decision.id === source.id)?.state).toBe('answered');
+    expect(laterQuestion.decisions.find((decision) => decision.id === claim.id)).toMatchObject({
+      state: 'changed', owner: { id: 'd' }, capabilities: { claim: false, answer: false, dispatch: false },
+    });
     expect(laterQuestion.decisions.some((decision) => decision.question === 'A later question')).toBe(true);
     const outOfScope = await buildSignalData(ctx('j', 'admin_of_group', ['b']), 'w', {
-      ...questionDeps,
+      ...claimDeps,
       threads: async () => [idle],
     });
     expect(outOfScope.decisions.some((decision) => decision.id === source.id)).toBe(false);
+    expect(outOfScope.decisions.some((decision) => decision.id === claim.id)).toBe(false);
     const filler = {
       ...active,
       thread_id: 'slack:C:filler',
@@ -394,7 +426,7 @@ describe('Signal source and authority boundaries', () => {
       reply_target_session_id: 'synthetic-filler-session',
     } as unknown as ThreadSummary;
     const offPage = await buildSignalData(ctx(), 'w', {
-      ...questionDeps,
+      ...claimDeps,
       threads: async () => [filler, active],
       threadLimit: 1,
     });
@@ -403,6 +435,10 @@ describe('Signal source and authority boundaries', () => {
     expect(offPage.sources.some((entry) => entry.source === source.question && entry.status === 'unavailable')).toBe(
       false,
     );
+    const offPageClaim = offPage.decisions.find((decision) => decision.id === claim.id)!;
+    expect(offPageClaim).toMatchObject({ state: 'open', owner: { id: 'd' } });
+    expect(offPageClaim.capabilities).toEqual({ claim: false, answer: false, dispatch: false });
+    expect(offPage.sources.some((entry) => entry.source === claim.question && entry.status === 'unavailable')).toBe(false);
   });
 });
 describe('Signal durable dispatch', () => {

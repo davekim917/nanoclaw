@@ -73,6 +73,7 @@ export function decorateReview(source: SignalDecision, row: ReviewRow | undefine
   const record = readRecord(row);
   const changed = !!row && row.evidence_hash !== source.evidence_hash;
   const ownedByOther = record.owner !== null;
+  const answerOwnedByCurrentReviewer = record.owner !== null && record.owner.id === record.answered_by?.id;
   return {
     ...source,
     version: row?.version ?? 0,
@@ -91,7 +92,10 @@ export function decorateReview(source: SignalDecision, row: ReviewRow | undefine
       ...source.capabilities,
       claim: source.capabilities.claim && !ownedByOther,
       dispatch:
-        source.capabilities.dispatch && (!changed || record.dispatch?.state === 'pending') && record.answer !== null,
+        source.capabilities.dispatch &&
+        answerOwnedByCurrentReviewer &&
+        (!changed || record.dispatch?.state === 'pending') &&
+        record.answer !== null,
     },
   };
 }

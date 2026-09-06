@@ -28,7 +28,12 @@ export function mergeSignalPages(base: SignalOverview, page: SignalOverview): Si
   const agents = new Map(base.agents.map((a) => [a.id, a]));
   for (const a of page.agents) {
     const prior = agents.get(a.id);
-    agents.set(a.id, prior ? { ...a, thread_ids: union(prior.thread_ids, a.thread_ids) } : a);
+    agents.set(
+      a.id,
+      prior
+        ? { ...a, current_tool: a.current_tool ?? prior.current_tool, thread_ids: union(prior.thread_ids, a.thread_ids) }
+        : a,
+    );
   }
   return {
     ...base,

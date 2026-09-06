@@ -104,6 +104,52 @@ describe('shared Signal review CAS', () => {
     );
     expect(reviewed.history.map((e) => e.note)).toEqual(['A', 'B']);
   });
+  it('advertises dispatch only while the current owner authored the answer', async () => {
+    const s = { ...source(), capabilities: { ...source().capabilities, dispatch: true } };
+    const answered = await applyReview(
+      s,
+      {
+        expected_version: 0,
+        evidence_hash: s.evidence_hash,
+        action: 'answer',
+        text: 'First answer',
+        idempotency_key: 'a',
+      },
+      reviewerOne,
+      true,
+    );
+    expect(answered.capabilities.dispatch).toBe(true);
+
+    const released = await applyReview(
+      s,
+      { expected_version: 1, evidence_hash: s.evidence_hash, action: 'release', idempotency_key: 'b' },
+      reviewerOne,
+      true,
+    );
+    expect(released.capabilities.dispatch).toBe(false);
+
+    const reclaimed = await applyReview(
+      s,
+      { expected_version: 2, evidence_hash: s.evidence_hash, action: 'claim', idempotency_key: 'c' },
+      reviewerTwo,
+      false,
+    );
+    expect(reclaimed.capabilities.dispatch).toBe(false);
+
+    const reanswered = await applyReview(
+      s,
+      {
+        expected_version: 3,
+        evidence_hash: s.evidence_hash,
+        action: 'answer',
+        text: 'Second answer',
+        idempotency_key: 'd',
+      },
+      reviewerTwo,
+      false,
+    );
+    expect(reanswered.capabilities.dispatch).toBe(true);
+  });
   it('does not let an administrator overwrite another reviewer answer', async () => {
     const s = source();
     await applyReview(

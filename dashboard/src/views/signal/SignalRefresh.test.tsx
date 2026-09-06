@@ -142,6 +142,46 @@ describe('Signal live refresh and paging', () => {
     await tick(1001);
     expect(screen.queryByText('Second-page project')).not.toBeInTheDocument();
   });
+  it('keeps an active tool while loading an older page, but allows a refresh to clear it', async () => {
+    location.hash = '#/agents';
+    const base = overview();
+    base.thread_coverage![0]!.has_more = true;
+    base.thread_coverage![0]!.next_offset = 200;
+    base.agents = [
+      {
+        id: 'agent-fixture',
+        workgroup_id: 'wg',
+        name: 'Fixture agent',
+        provider: 'codex',
+        awake: true,
+        active: true,
+        last_seen_at: '2026-09-05T00:00:00Z',
+        thread_ids: ['slack:CFIXTURE01:newer'],
+        current_tool: 'write_summary',
+        claims: [],
+        next_task: null,
+      },
+    ];
+    vi.mocked(api.getSignalOverview).mockResolvedValue(base);
+    mount();
+    await tick();
+    expect(screen.getByText('Current tool: write_summary')).toBeInTheDocument();
+
+    const older = overview();
+    older.agents = [{ ...base.agents[0]!, thread_ids: ['slack:CFIXTURE01:older'], current_tool: null }];
+    older.thread_coverage![0]!.offset = 200;
+    vi.mocked(api.getSignalOverview).mockResolvedValueOnce(older);
+    fireEvent.click(screen.getByRole('button', { name: 'Load more threads · Workspace' }));
+    await tick();
+    expect(screen.getByText('Current tool: write_summary')).toBeInTheDocument();
+
+    const refreshed = overview();
+    refreshed.agents = [{ ...base.agents[0]!, current_tool: null }];
+    vi.mocked(api.getSignalOverview).mockResolvedValue(refreshed);
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh records' }));
+    await tick(1001);
+    expect(screen.getByText('No current tool reported')).toBeInTheDocument();
+  });
   it('keeps the project revision that initialized an open edit form', async () => {
     const initial = overview('Initial project');
     initial.projects[0]!.version = 2;

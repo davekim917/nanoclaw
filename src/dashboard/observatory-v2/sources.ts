@@ -664,21 +664,36 @@ export async function buildSignalData(
         (previous.agent_group_id !== null &&
           allowed.has(previous.agent_group_id) &&
           groupVisible(ctx, previous.agent_group_id));
-      const visibleThreadReview = row.source_kind === 'thread-question' && saved.answer !== null && snapshotVisible;
-      // Retain the recorded answer when the same scoped agent still
-      // participates, including when a later question is now active. A live
-      // decision with this review's id was already handled above. Outside the
-      // bounded page, preserve history without declaring the source unavailable.
-      if (visibleThreadReview && (!currentThread ? !deps.threadId : currentMember)) {
+      const retainedThreadReview =
+        row.source_kind === 'thread-question' &&
+        (saved.answer !== null || saved.owner !== null || saved.history.length > 0) &&
+        snapshotVisible;
+      // Answered records remain visible when a later question is active. A
+      // claim without an answer becomes unavailable only when this page proves
+      // its question cleared or changed; off-page history stays read-only and unknown.
+      const offPageUnknown = !currentThread && !deps.threadId;
+      const keepRecorded = offPageUnknown || !!currentMember;
+      if (retainedThreadReview && keepRecorded) {
+        const unavailable = saved.answer === null && !!currentThread;
         const recorded: SourceDecision = {
           ...previous,
-          evidence_hash: row.evidence_hash,
+          evidence_hash: unavailable ? digest([row.evidence_hash, 'source_unavailable']) : row.evidence_hash,
           exact_context: false,
           capabilities: { claim: false, answer: false, dispatch: false },
         };
         result.rawDecisions.push(recorded);
         result.decisions.push(decorateReview(recorded, row));
         (projects.find((p) => p.id === recorded.project_id) ?? unmapped).decision_ids.push(recorded.id);
+        if (unavailable)
+          result.sources.push(
+            health(
+              wg.id,
+              previous.question,
+              null,
+              now,
+              'Previously reviewed source is absent or unreadable. History is retained; absence is not completion.',
+            ),
+          );
         continue;
       }
       // Only an exact lookup that does not find its reviewed thread proves a
