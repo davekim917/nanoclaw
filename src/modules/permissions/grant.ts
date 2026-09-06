@@ -22,6 +22,7 @@
  *      `/init-first-agent` or a direct DB edit.
  */
 
+import { withCentralSync, withRawDb } from '../../db/central-lease.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
 import { deriveCallerId } from '../../caller-identity.js';
@@ -30,19 +31,19 @@ import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 import { notifyAgent } from '../approvals/index.js';
-import { addMember, getMembers, isMember, removeMember } from './db/agent-group-members.js';
+import { ADD_MEMBER_SQL, REMOVE_MEMBER_SQL, getMembers, isMember } from './db/agent-group-members.js';
 import { createUser, getUser, upsertUser } from './db/users.js';
 import {
   getAdminsOfAgentGroup,
   getGlobalAdmins,
   getOwners,
+  GRANT_ROLE_SQL,
+  REVOKE_SCOPED_ROLE_SQL,
   getUserRoles,
-  grantRole,
   hasAdminPrivilege,
   isAdminOfAgentGroup,
   isGlobalAdmin,
   isOwner,
-  revokeRole,
 } from './db/user-roles.js';
 
 interface GrantArgs {
@@ -52,7 +53,7 @@ interface GrantArgs {
 }
 
 /** Strip `<@…>` wrapping and prepend channel_type when needed. */
-function resolveTargetUserId(rawUser: string, session: Session): string | null {
+async function resolveTargetUserId(rawUser: string, session: Session): Promise<string | null> {
   let handle = rawUser.trim();
   if (handle.startsWith('<@') && handle.endsWith('>')) {
     handle = handle.slice(2, -1);
@@ -64,18 +65,20 @@ function resolveTargetUserId(rawUser: string, session: Session): string | null {
   }
   if (!handle) return null;
   if (handle.includes(':')) return handle;
-  const mg = session.messaging_group_id ? getMessagingGroup(session.messaging_group_id) : undefined;
+  const mg = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
   const channelType = mg?.channel_type ?? null;
   if (!channelType) return null;
   return `${channelType}:${handle}`;
 }
 
-function describeAuthority(userId: string, agentGroupId: string): string {
-  const parts: string[] = [];
-  if (isOwner(userId)) parts.push('owner');
-  if (isGlobalAdmin(userId)) parts.push('global_admin');
-  if (isAdminOfAgentGroup(userId, agentGroupId)) parts.push('admin_of_group');
-  return parts.length > 0 ? parts.join(', ') : 'none';
+function describeAuthority(userId: string, agentGroupId: string): Promise<string> {
+  return withCentralSync(() => {
+    const parts: string[] = [];
+    if (isOwner(userId)) parts.push('owner');
+    if (isGlobalAdmin(userId)) parts.push('global_admin');
+    if (isAdminOfAgentGroup(userId, agentGroupId)) parts.push('admin_of_group');
+    return parts.length > 0 ? parts.join(', ') : 'none';
+  }, 'describeAuthority');
 }
 
 async function ensureUserExists(userId: string): Promise<void> {
@@ -115,14 +118,19 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
     return;
   }
 
-  // Authorization.
-  const callerIsGlobal = isOwner(callerId) || isGlobalAdmin(callerId);
-  const callerIsScopedAdmin = isAdminOfAgentGroup(callerId, targetAgentGroupId);
+  // Authorization. The role predicates are lease-only (§4.5 I-1).
+  const { callerIsGlobal, callerIsScopedAdmin } = await withCentralSync(
+    () => ({
+      callerIsGlobal: isOwner(callerId) || isGlobalAdmin(callerId),
+      callerIsScopedAdmin: isAdminOfAgentGroup(callerId, targetAgentGroupId),
+    }),
+    'grant_access authority',
+  );
   if (!callerIsGlobal && !callerIsScopedAdmin) {
     log.info('grant_access denied', {
       callerId,
       targetAgentGroupId,
-      authority: describeAuthority(callerId, targetAgentGroupId),
+      authority: await describeAuthority(callerId, targetAgentGroupId),
     });
     await notifyAgent(
       session,
@@ -138,7 +146,7 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
     return;
   }
 
-  const targetUserId = resolveTargetUserId(rawUser, session);
+  const targetUserId = await resolveTargetUserId(rawUser, session);
   if (!targetUserId) {
     await notifyAgent(
       session,
@@ -149,17 +157,42 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
 
   await ensureUserExists(targetUserId);
 
+  // The authority snapshot above is UX — the fast denial before the target is
+  // resolved. The decision that matters is re-taken INSIDE the block that
+  // writes (#460 round 2): the target resolution awaits, and a caller revoked
+  // in that window must not complete a privileged write on stale authority.
+  // Caller re-check, target check and the write are one synchronous lease
+  // block; the write runs the leaf's exported constant through `withRawDb`.
   if (role === 'member') {
-    if (isMember(targetUserId, targetAgentGroupId) || hasAdminPrivilege(targetUserId, targetAgentGroupId)) {
+    const outcome = await withCentralSync((): 'caller-revoked' | 'already' | 'added' => {
+      if (!(isOwner(callerId) || isGlobalAdmin(callerId) || isAdminOfAgentGroup(callerId, targetAgentGroupId))) {
+        return 'caller-revoked';
+      }
+      if (isMember(targetUserId, targetAgentGroupId) || hasAdminPrivilege(targetUserId, targetAgentGroupId)) {
+        return 'already';
+      }
+      withRawDb((db) => {
+        db.prepare(ADD_MEMBER_SQL).run({
+          user_id: targetUserId,
+          agent_group_id: targetAgentGroupId,
+          added_by: callerId,
+          added_at: new Date().toISOString(),
+        });
+      });
+      return 'added';
+    }, 'grant_access apply');
+    if (outcome === 'caller-revoked') {
+      log.info('grant_access denied: caller lost authority before the write', { callerId, targetAgentGroupId });
+      await notifyAgent(
+        session,
+        `grant_access denied: you don't have authority over agent group \`${targetAgentGroupId}\`.`,
+      );
+      return;
+    }
+    if (outcome === 'already') {
       await notifyAgent(session, `\`${targetUserId}\` already has access to \`${targetAgentGroupId}\`.`);
       return;
     }
-    await addMember({
-      user_id: targetUserId,
-      agent_group_id: targetAgentGroupId,
-      added_by: callerId,
-      added_at: new Date().toISOString(),
-    });
     log.info('grant_access: member added', { callerId, targetUserId, targetAgentGroupId });
     // Best-effort: addMember above already committed. This is a system-action
     // delivery handler — an awaited rejection here would leave the message
@@ -172,18 +205,33 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
     return;
   }
 
-  // role === 'admin'
-  if (isAdminOfAgentGroup(targetUserId, targetAgentGroupId)) {
+  // role === 'admin' — same shape: the global re-check and the write share one block.
+  const adminOutcome = await withCentralSync((): 'caller-revoked' | 'already' | 'granted' => {
+    if (!(isOwner(callerId) || isGlobalAdmin(callerId))) return 'caller-revoked';
+    if (isAdminOfAgentGroup(targetUserId, targetAgentGroupId)) return 'already';
+    withRawDb((db) => {
+      db.prepare(GRANT_ROLE_SQL).run({
+        user_id: targetUserId,
+        role: 'admin',
+        agent_group_id: targetAgentGroupId,
+        granted_by: callerId,
+        granted_at: new Date().toISOString(),
+      });
+    });
+    return 'granted';
+  }, 'grant_access apply');
+  if (adminOutcome === 'caller-revoked') {
+    log.info('grant_access denied: caller lost authority before the write', { callerId, targetAgentGroupId });
+    await notifyAgent(
+      session,
+      'grant_access denied: only owner / global admin can grant `admin`. You can grant `member`.',
+    );
+    return;
+  }
+  if (adminOutcome === 'already') {
     await notifyAgent(session, `\`${targetUserId}\` is already admin of \`${targetAgentGroupId}\`.`);
     return;
   }
-  await grantRole({
-    user_id: targetUserId,
-    role: 'admin',
-    agent_group_id: targetAgentGroupId,
-    granted_by: callerId,
-    granted_at: new Date().toISOString(),
-  });
   log.info('grant_access: admin granted', { callerId, targetUserId, targetAgentGroupId });
   // Best-effort — see the matching comment on the member-grant path above.
   void Promise.resolve(notifyAgent(session, `Granted admin: \`${targetUserId}\` → \`${targetAgentGroupId}\`.`)).catch(
@@ -211,8 +259,13 @@ export async function handleRevokeAccess(content: Record<string, unknown>, sessi
     return;
   }
 
-  const callerIsGlobal = isOwner(callerId) || isGlobalAdmin(callerId);
-  const callerIsScopedAdmin = isAdminOfAgentGroup(callerId, targetAgentGroupId);
+  const { callerIsGlobal, callerIsScopedAdmin } = await withCentralSync(
+    () => ({
+      callerIsGlobal: isOwner(callerId) || isGlobalAdmin(callerId),
+      callerIsScopedAdmin: isAdminOfAgentGroup(callerId, targetAgentGroupId),
+    }),
+    'revoke_access authority',
+  );
   if (!callerIsGlobal && !callerIsScopedAdmin) {
     await notifyAgent(
       session,
@@ -221,61 +274,77 @@ export async function handleRevokeAccess(content: Record<string, unknown>, sessi
     return;
   }
 
-  const targetUserId = resolveTargetUserId(rawUser, session);
+  const targetUserId = await resolveTargetUserId(rawUser, session);
   if (!targetUserId) {
     await notifyAgent(session, `revoke_access failed: could not resolve \`${rawUser}\`.`);
     return;
   }
 
-  // Never let a scoped admin revoke owner or global admin.
-  if (!callerIsGlobal && (isOwner(targetUserId) || isGlobalAdmin(targetUserId))) {
+  // ONE synchronous lease block: the caller's authority is RE-CHECKED here,
+  // the target's standing is read, and the removal runs — nothing awaits
+  // between them (#460 round 2). The snapshot taken before `resolveTargetUserId`
+  // is only the fast denial; another owner/admin can revoke this caller during
+  // that await, and the write must see the caller as they are NOW. The writes
+  // execute the leaves' exported constants through `withRawDb` (one constant,
+  // two executors), so the block holds no driver statement.
+  //
+  // `callerIsGlobal` is the load-bearing half of the admin-role branch, not a
+  // shortcut for the refusal above it (issue #443, Codex round 2): a scoped
+  // admin may take membership, never a role, and with the checks and the
+  // writes in one block a role granted concurrently is either seen (refused)
+  // or lands after this block, untouched.
+  type RevokeOutcome = 'caller-revoked' | 'target-global' | 'target-owner' | 'target-admin' | 'nothing' | 'revoked';
+  const outcome = await withCentralSync((): RevokeOutcome => {
+    const callerIsGlobalNow = isOwner(callerId) || isGlobalAdmin(callerId);
+    const callerIsScopedAdminNow = isAdminOfAgentGroup(callerId, targetAgentGroupId);
+    if (!callerIsGlobalNow && !callerIsScopedAdminNow) return 'caller-revoked';
+
+    const targetIsOwner = isOwner(targetUserId);
+    const targetIsGlobal = targetIsOwner || isGlobalAdmin(targetUserId);
+    const targetIsAdminOfGroup = isAdminOfAgentGroup(targetUserId, targetAgentGroupId);
+    const targetIsMember = isMember(targetUserId, targetAgentGroupId);
+    // Never let a scoped admin revoke owner or global admin.
+    if (!callerIsGlobalNow && targetIsGlobal) return 'target-global';
+    // Owners are never revoked via this path — sensitive, do it manually.
+    if (targetIsOwner) return 'target-owner';
+    // Scoped admins can only revoke `member`, not `admin` (that's an escalation).
+    if (!callerIsGlobalNow && targetIsAdminOfGroup) return 'target-admin';
+
+    let revoked = false;
+    withRawDb((db) => {
+      if (targetIsMember) {
+        db.prepare(REMOVE_MEMBER_SQL).run(targetUserId, targetAgentGroupId);
+        revoked = true;
+      }
+      if (callerIsGlobalNow && targetIsAdminOfGroup) {
+        db.prepare(REVOKE_SCOPED_ROLE_SQL).run(targetUserId, 'admin', targetAgentGroupId);
+        revoked = true;
+      }
+    });
+    return revoked ? 'revoked' : 'nothing';
+  }, 'revoke_access apply');
+
+  if (outcome === 'caller-revoked') {
+    log.info('revoke_access denied: caller lost authority before the write', { callerId, targetAgentGroupId });
+    await notifyAgent(
+      session,
+      `revoke_access denied: you don't have authority over agent group \`${targetAgentGroupId}\`.`,
+    );
+    return;
+  }
+  if (outcome === 'target-global') {
     await notifyAgent(session, 'revoke_access denied: you cannot revoke an owner or global admin. Ask a global admin.');
     return;
   }
-  // Owners are never revoked via this path — sensitive, do it manually.
-  if (isOwner(targetUserId)) {
+  if (outcome === 'target-owner') {
     await notifyAgent(session, 'revoke_access refused: owner revocation must be done by direct edit (safety).');
     return;
   }
-  // Scoped admins can only revoke `member`, not `admin` (that's an escalation).
-  if (!callerIsGlobal && isAdminOfAgentGroup(targetUserId, targetAgentGroupId)) {
+  if (outcome === 'target-admin') {
     await notifyAgent(session, 'revoke_access denied: only a global admin can revoke another admin.');
     return;
   }
-
-  let revoked = false;
-  if (isMember(targetUserId, targetAgentGroupId)) {
-    await removeMember(targetUserId, targetAgentGroupId);
-    revoked = true;
-  }
-  // `callerIsGlobal` is the load-bearing half of this condition, not a
-  // shortcut for the check above (issue #443, Codex round 2).
-  //
-  // `removeMember` yields. If an owner grants the target an admin role in that
-  // window, `isAdminOfAgentGroup` — evaluated HERE, after the yield — flips to
-  // true, while the "only a global admin can revoke another admin" refusal was
-  // decided BEFORE it and let this caller through. A scoped admin would then
-  // revoke an admin role, which is exactly the escalation that refusal exists
-  // to prevent.
-  //
-  // Re-testing the predicate is not enough on its own: the predicates are
-  // synchronous on the raw handle by §4.5, but `revokeRole` is not, so any
-  // re-test would still sit on the far side of an await from its write.
-  // Gating on `callerIsGlobal` closes it without a lock, and changes nothing
-  // for a legitimate flow: a scoped caller that reaches this line was already
-  // proven not to be facing an admin target, so this branch was a no-op for
-  // them in every non-racing case.
-  if (callerIsGlobal && isAdminOfAgentGroup(targetUserId, targetAgentGroupId)) {
-    await revokeRole(targetUserId, 'admin', targetAgentGroupId);
-    revoked = true;
-  } else if (!callerIsGlobal && isAdminOfAgentGroup(targetUserId, targetAgentGroupId)) {
-    log.warn('revoke_access: target gained an admin role mid-revoke — role left in place', {
-      callerId,
-      targetUserId,
-      targetAgentGroupId,
-    });
-  }
-
+  const revoked = outcome === 'revoked';
   if (!revoked) {
     await notifyAgent(session, `\`${targetUserId}\` had no access to \`${targetAgentGroupId}\` to revoke.`);
     return;

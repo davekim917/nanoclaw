@@ -44,11 +44,11 @@ registerResource({
         if (!provider) throw new Error('--provider is required');
         if (!slug) throw new Error('--slug is required');
 
-        if (getDeniedModel(provider, slug)) {
+        if (await getDeniedModel(provider, slug)) {
           throw new Error(`Already denied: ${provider} / ${slug}`);
         }
 
-        addDeniedModel(provider, slug, (args.reason as string | undefined) ?? null);
+        await addDeniedModel(provider, slug, (args.reason as string | undefined) ?? null);
         return { added: { provider, slug, reason: (args.reason as string | undefined) ?? null } };
       },
     },
@@ -61,10 +61,10 @@ registerResource({
         if (!provider) throw new Error('--provider is required');
         if (!slug) throw new Error('--slug is required');
 
-        const existing = getDeniedModel(provider, slug);
+        const existing = await getDeniedModel(provider, slug);
         if (!existing) throw new Error(`Not denied: ${provider} / ${slug}`);
 
-        removeDeniedModel(provider, slug);
+        await removeDeniedModel(provider, slug);
         return { removed: { provider, slug } };
       },
     },
@@ -74,7 +74,7 @@ registerResource({
       handler: async (args) => {
         const provider = args.provider as string;
         if (!provider) throw new Error('--provider is required');
-        const denied = listDeniedModels(provider);
+        const denied = await listDeniedModels(provider);
         return { provider, count: denied.length, denied };
       },
     },

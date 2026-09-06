@@ -11,6 +11,7 @@
 import { randomUUID } from 'crypto';
 import { createHash } from 'crypto';
 
+import { withCentralSync } from '../db/central-lease.js';
 import { getSession } from '../db/sessions.js';
 import { getMessagingGroup } from '../db/messaging-groups.js';
 import { log } from '../log.js';
@@ -92,14 +93,17 @@ export function _resetRateLimitForTesting(): void {
  * session row, and creating one is a side effect a caller who cannot steer must
  * never be able to cause. It is the same gate, run earlier — not a second one.
  */
-export function canSteer(userId: string, agentGroupId: string): { ok: boolean; reason?: string } {
-  if (isOwner(userId) || isGlobalAdmin(userId) || isAdminOfAgentGroup(userId, agentGroupId)) {
-    return { ok: true };
-  }
-  if (isMember(userId, agentGroupId)) {
-    return { ok: false, reason: 'member_role_cannot_steer' };
-  }
-  return { ok: false, reason: 'not_found' };
+export function canSteer(userId: string, agentGroupId: string): Promise<{ ok: boolean; reason?: string }> {
+  // The role predicates are lease-only (§4.5 I-1); one block for the whole decision.
+  return withCentralSync((): { ok: boolean; reason?: string } => {
+    if (isOwner(userId) || isGlobalAdmin(userId) || isAdminOfAgentGroup(userId, agentGroupId)) {
+      return { ok: true };
+    }
+    if (isMember(userId, agentGroupId)) {
+      return { ok: false, reason: 'member_role_cannot_steer' };
+    }
+    return { ok: false, reason: 'not_found' };
+  }, 'canSteer');
 }
 
 // ── Shared executor ───────────────────────────────────────────────────────────
@@ -151,7 +155,7 @@ async function _writeAndEchoSteer(
   }
 
   // Role gate — same disclose-as-not-found pattern.
-  const roleCheck = canSteer(userId, exec.agentGroupId);
+  const roleCheck = await canSteer(userId, exec.agentGroupId);
   if (!roleCheck.ok) {
     return { status: 404, body: { error: 'not_found' } };
   }
@@ -322,7 +326,7 @@ async function _fireEchoAsync(exec: SteerExecution, text: string, ctx: AuthedReq
     return;
   }
 
-  const mg = getMessagingGroup(exec.echo.messagingGroupId);
+  const mg = await getMessagingGroup(exec.echo.messagingGroupId);
   if (!mg) {
     await _emitEchoStatus('adapter_unavailable', exec);
     return;

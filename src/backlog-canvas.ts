@@ -245,7 +245,7 @@ async function refreshBoard(
   agentGroupId: string,
   workgroupId: string | null,
 ): Promise<void> {
-  const mg = getMessagingGroup(messagingGroupId);
+  const mg = await getMessagingGroup(messagingGroupId);
   if (!mg) {
     log.warn('Backlog canvas: messagingGroupId not found — skipping', { messagingGroupId });
     return;

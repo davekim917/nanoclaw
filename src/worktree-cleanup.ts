@@ -16,7 +16,7 @@ import path from 'path';
 import { DATA_DIR, GROUPS_DIR } from './config.js';
 import { runningContainerMounts } from './container-mounts.js';
 import { isContainerRunning, isContainerSpawning } from './container-runner.js';
-import { getRawDb } from './db/connection.js';
+import { withCentralSync, withRawDb } from './db/central-lease.js';
 // The GC's reclaim gate is synchronous all the way up through
 // `runStorageGcOnce`, and the mailbox session is async, so the busy probe below
 // uses `readSessionOutbound` — the module's SYNCHRONOUS read funnel — rather
@@ -169,29 +169,47 @@ function statMtimeMs(filePath: string): number | null {
   }
 }
 
+/**
+ * The session inventory, read through `withRawDb`: synchronous and lease-only
+ * (seam 3 §4.5). This module runs ON THE HOST — `main.ts` side-effect-imports
+ * it and its `onHostStart` hook schedules `runWorktreeCleanupOnce` on a timer
+ * — so a bare raw SELECT here could execute while a `centralTransaction` is
+ * suspended and silently join it (#460 round 4). Every reader either takes
+ * the lease for the read alone (`readSessionInventory`, the async entry
+ * points) or holds it across a recheck-then-trash span that must stay one
+ * synchronous turn (`finalizeIdleCollection`'s fence, the GC recheck).
+ */
 function sessionInventory(): SessionRow[] | null {
   try {
-    return getRawDb()
-      .prepare(
-        `SELECT s.id AS session_id, s.agent_group_id, s.status, s.thread_id,
+    return withRawDb(
+      (db) =>
+        db
+          .prepare(
+            `SELECT s.id AS session_id, s.agent_group_id, s.status, s.thread_id,
                 s.messaging_group_id, mg.platform_id, ag.folder,
                 COALESCE(ag.workgroup_id, ag.folder) AS workgroup_id,
                 COALESCE(s.last_active, s.created_at) AS idle_since
            FROM sessions s
            JOIN agent_groups ag ON ag.id = s.agent_group_id
            LEFT JOIN messaging_groups mg ON mg.id = s.messaging_group_id`,
-      )
-      .all() as SessionRow[];
+          )
+          .all() as SessionRow[],
+    );
   } catch (error) {
     log.error('Worktree cleanup: session inventory failed; preserving every topic', { error });
     return null;
   }
 }
 
+/** One lease block around the inventory read, for the async entry points. */
+function readSessionInventory(): Promise<SessionRow[] | null> {
+  return withCentralSync(() => sessionInventory(), 'worktree cleanup inventory');
+}
+
 function participantsByTopic(
   dataDir: string,
+  rows: SessionRow[] | null,
 ): Map<string, { unit: RepositoryWorkUnit; participants: TopicParticipant[] }> {
-  const rows = sessionInventory();
   // A failed inventory is not evidence that nothing is live: preserve everything.
   if (rows === null) return new Map();
 
@@ -240,8 +258,8 @@ export interface DiscoveryResult {
   unreadableRoots: number;
 }
 
-function discover(dataDir: string = DATA_DIR): DiscoveryResult {
-  const mapping = participantsByTopic(dataDir);
+function discover(dataDir: string, rows: SessionRow[] | null): DiscoveryResult {
+  const mapping = participantsByTopic(dataDir, rows);
   const targets: TopicWorktreeTarget[] = [];
   const filteredNames = new Set<string>();
   let unreadableRoots = 0;
@@ -499,7 +517,7 @@ async function cleanupOne(target: TopicWorktreeTarget, dataDir: string = DATA_DI
 }
 
 export async function runWorktreeCleanupOnce(dataDir: string = DATA_DIR): Promise<void> {
-  const { targets, filteredNames, unreadableRoots } = discover(dataDir);
+  const { targets, filteredNames, unreadableRoots } = discover(dataDir, await readSessionInventory());
   // One pathological topic must not cost the fleet its collection pass: a
   // failing target is skipped and counted, never allowed to abort the rest.
   let skipped = 0;
@@ -1774,7 +1792,10 @@ function finalizeCloneCollection(candidate: GcCandidate, dataDir: string): { ok:
   return { ok: true };
 }
 
-function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: boolean; reason?: string } {
+async function finalizeIdleCollection(
+  candidate: GcCandidate,
+  dataDir: string,
+): Promise<{ ok: boolean; reason?: string }> {
   const snapshot = candidate.idleSnapshot!;
   const resolvedOriginal = fs.realpathSync(candidate.path);
   const quarantineRoot = path.join(dataDir, '.gc-quarantine');
@@ -1829,65 +1850,77 @@ function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: 
   // here is not evidence the topic is quiet — participantsByTopic collapses a
   // DB failure into an empty map, indistinguishable from "genuinely no
   // participants" unless checked directly first.
-  if (sessionInventory() === null) {
-    reconcileQuarantine(candidate, quarantinePath, dataDir);
-    return { ok: false, reason: 'aborted-recheck-unavailable' };
-  }
-  const before = new Map(snapshot.map((p) => [p.sessionId, p]));
-  const owner = participantsByTopic(dataDir).get(candidate.path);
-  const activityAdvanced = (owner?.participants ?? []).some((p) => {
-    const prior = before.get(p.sessionId);
-    // Codex P1 (round 4): status/idleSince lag the real admission event —
-    // writeSessionMessageLocked inserts into inbound.db and closes it BEFORE
-    // it updates last_active (session-manager.ts:892-911), two separate
-    // writes. Fence on the durable write itself instead of its lagging
-    // index: inbound.db's mtime moves at the insert, not after. A file that
-    // appeared, or whose mtime moved forward, or that stopped being statable
-    // where it previously was — all count as new activity.
-    const inboundMoved = laterThan(prior?.inboundMtimeMs ?? null, p.inboundMtimeMs);
-    return !prior || prior.status !== p.status || Date.parse(p.idleSince) > Date.parse(prior.idleSince) || inboundMoved;
-  });
-  if (activityAdvanced) {
-    reconcileQuarantine(candidate, quarantinePath, dataDir);
-    return { ok: false, reason: 'aborted-late-activity' };
-  }
+  //
+  // The fence, the journal and the trash are ONE `withCentralSync` block
+  // (seam 3 §4.5): the inventory read is lease-only, and holding the lease to
+  // the rename keeps the span awaitless — the docker inspect and the readdir
+  // above stay outside it.
+  const trashed = await withCentralSync((): { ok: boolean; reason?: string } => {
+    const rows = sessionInventory();
+    if (rows === null) {
+      reconcileQuarantine(candidate, quarantinePath, dataDir);
+      return { ok: false, reason: 'aborted-recheck-unavailable' };
+    }
+    const before = new Map(snapshot.map((p) => [p.sessionId, p]));
+    const owner = participantsByTopic(dataDir, rows).get(candidate.path);
+    const activityAdvanced = (owner?.participants ?? []).some((p) => {
+      const prior = before.get(p.sessionId);
+      // Codex P1 (round 4): status/idleSince lag the real admission event —
+      // writeSessionMessageLocked inserts into inbound.db and closes it BEFORE
+      // it updates last_active (session-manager.ts:892-911), two separate
+      // writes. Fence on the durable write itself instead of its lagging
+      // index: inbound.db's mtime moves at the insert, not after. A file that
+      // appeared, or whose mtime moved forward, or that stopped being statable
+      // where it previously was — all count as new activity.
+      const inboundMoved = laterThan(prior?.inboundMtimeMs ?? null, p.inboundMtimeMs);
+      return (
+        !prior || prior.status !== p.status || Date.parse(p.idleSince) > Date.parse(prior.idleSince) || inboundMoved
+      );
+    });
+    if (activityAdvanced) {
+      reconcileQuarantine(candidate, quarantinePath, dataDir);
+      return { ok: false, reason: 'aborted-late-activity' };
+    }
 
-  // #185: journal the exact deregistrations this trash is about to require BEFORE trashing,
-  // so a crash between the trash succeeding and the loop below finishing
-  // leaves a durable record instead of a silently dangling registration.
-  // runPendingPrunes sweeps this at the start of the next apply pass.
-  const priorPending = readPendingPrunes(dataDir);
-  const journaled = writePendingPrunes(dataDir, [
-    ...priorPending,
-    ...repos.map((repo) => ({
-      workgroupId,
-      repo,
-      worktreePath: path.join(candidate.path, 'worktrees', repo),
-    })),
-  ]);
-  if (!journaled) {
-    // Codex P2: a read-only dataDir or ENOSPC here must not fall through to
-    // trashing anyway — that's exactly the crash-without-a-record window
-    // this journal exists to close. Abort and leave the topic recoverable.
-    reconcileQuarantine(candidate, quarantinePath, dataDir);
-    return { ok: false, reason: 'aborted-prune-journal-unwritable' };
-  }
+    // #185: journal the exact deregistrations this trash is about to require BEFORE trashing,
+    // so a crash between the trash succeeding and the loop below finishing
+    // leaves a durable record instead of a silently dangling registration.
+    // runPendingPrunes sweeps this at the start of the next apply pass.
+    const priorPending = readPendingPrunes(dataDir);
+    const journaled = writePendingPrunes(dataDir, [
+      ...priorPending,
+      ...repos.map((repo) => ({
+        workgroupId,
+        repo,
+        worktreePath: path.join(candidate.path, 'worktrees', repo),
+      })),
+    ]);
+    if (!journaled) {
+      // Codex P2: a read-only dataDir or ENOSPC here must not fall through to
+      // trashing anyway — that's exactly the crash-without-a-record window
+      // this journal exists to close. Abort and leave the topic recoverable.
+      reconcileQuarantine(candidate, quarantinePath, dataDir);
+      return { ok: false, reason: 'aborted-prune-journal-unwritable' };
+    }
 
-  // Genuinely clear — commit the delete FIRST. Deregistration runs only once that
-  // succeeds (Codex P2): a trash failure below leaves every canonical
-  // registration untouched, so the restored checkout stays usable.
-  try {
-    trashPath(quarantinePath);
-  } catch (err) {
-    // Restore the EXACT pre-attempt contents rather than filtering by
-    // workgroupId/repo (Codex P2): a filter would also strip an unrelated
-    // OLDER entry for the same workgroupId/repo left by a previous
-    // interrupted pass, losing its retry record permanently. Nothing else
-    // touches this file mid-pass, so priorPending is still accurate.
-    writePendingPrunes(dataDir, priorPending);
-    reconcileQuarantine(candidate, quarantinePath, dataDir);
-    throw err;
-  }
+    // Genuinely clear — commit the delete FIRST. Deregistration runs only once that
+    // succeeds (Codex P2): a trash failure below leaves every canonical
+    // registration untouched, so the restored checkout stays usable.
+    try {
+      trashPath(quarantinePath);
+    } catch (err) {
+      // Restore the EXACT pre-attempt contents rather than filtering by
+      // workgroupId/repo (Codex P2): a filter would also strip an unrelated
+      // OLDER entry for the same workgroupId/repo left by a previous
+      // interrupted pass, losing its retry record permanently. Nothing else
+      // touches this file mid-pass, so priorPending is still accurate.
+      writePendingPrunes(dataDir, priorPending);
+      reconcileQuarantine(candidate, quarantinePath, dataDir);
+      throw err;
+    }
+    return { ok: true };
+  }, 'storage gc idle fence and trash');
+  if (!trashed.ok) return trashed;
 
   // Deregister each exact linked worktree from its CANONICAL repo, so a
   // resumed thread's later create_worktree doesn't hit git's "already
@@ -1925,6 +1958,10 @@ function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: 
  * The scan snapshotted the inventory; a session can be created, or a container
  * started, while the pass is still walking. Anything unreadable at this point
  * refuses, exactly as it does during the scan.
+ *
+ * Lease-only: the inventory read is `withRawDb`, so this runs inside the
+ * caller's `withCentralSync` block — the same block that trashes a bare topic,
+ * so the recheck and the removal stay one synchronous turn.
  */
 function stillDisposable(
   candidate: GcCandidate,
@@ -1947,7 +1984,7 @@ function stillDisposable(
   if (overlapsAny(candidate.path, mounts)) return { ok: false, reason: 'container-mounted' };
   const rows = sessionInventory();
   if (rows === null) return { ok: false, reason: 'recheck-failed' };
-  const owner = participantsByTopic(dataDir).get(candidate.path);
+  const owner = participantsByTopic(dataDir, rows).get(candidate.path);
   if (!sideAClear(owner?.participants, topicIdleReclaimDays()).pass) {
     return { ok: false, reason: 'recheck-topic-open' };
   }
@@ -2064,9 +2101,9 @@ function recoverOrphanedQuarantine(dataDir: string, report: GcReport): void {
   }
 }
 
-export function runStorageGcOnce(dataDir: string = DATA_DIR, groupsDir: string = GROUPS_DIR): GcReport {
+export async function runStorageGcOnce(dataDir: string = DATA_DIR, groupsDir: string = GROUPS_DIR): Promise<GcReport> {
   const mode = gcMode();
-  const rows = sessionInventory();
+  const rows = await readSessionInventory();
   if (rows === null) {
     const report = emptyReport(mode, false);
     log.error('Storage GC: did not run — session inventory unavailable, nothing evaluated', {
@@ -2080,7 +2117,9 @@ export function runStorageGcOnce(dataDir: string = DATA_DIR, groupsDir: string =
     recoverOrphanedQuarantine(dataDir, report);
     runPendingPrunes(dataDir);
   }
-  const owners = new Map([...participantsByTopic(dataDir)].map(([key, value]) => [key, value.participants] as const));
+  const owners = new Map(
+    [...participantsByTopic(dataDir, rows)].map(([key, value]) => [key, value.participants] as const),
+  );
   collectOrphanTopics(report, dataDir, owners);
   collectClones(report, dataDir, groupsDir, boundGitDirs(dataDir));
 
@@ -2106,12 +2145,22 @@ export function runStorageGcOnce(dataDir: string = DATA_DIR, groupsDir: string =
     } else {
       for (const candidate of report.candidates) {
         if (!candidate.collect) continue;
-        const recheck = stillDisposable(candidate, dataDir, mounts, cwds);
-        if (!recheck.ok) {
-          demote(candidate, recheck.reason);
-          continue;
-        }
         try {
+          // The recheck reads the inventory under the lease. A bare topic (no
+          // idle snapshot, not a clone) is trashed in the SAME block, so its
+          // recheck and its removal are one synchronous turn; a clone re-proves
+          // itself after the quarantine rename, and an idle topic re-fences
+          // inside `finalizeIdleCollection`'s own block.
+          const recheck = await withCentralSync((): { ok: boolean; reason: string; trashed?: boolean } => {
+            const verdict = stillDisposable(candidate, dataDir, mounts, cwds);
+            if (!verdict.ok || candidate.category === 'clone' || candidate.idleSnapshot) return verdict;
+            trashPath(candidate.path);
+            return { ...verdict, trashed: true };
+          }, 'storage gc recheck');
+          if (!recheck.ok) {
+            demote(candidate, recheck.reason);
+            continue;
+          }
           if (candidate.category === 'clone') {
             const finalized = finalizeCloneCollection(candidate, dataDir);
             if (!finalized.ok) {
@@ -2119,13 +2168,11 @@ export function runStorageGcOnce(dataDir: string = DATA_DIR, groupsDir: string =
               continue;
             }
           } else if (candidate.idleSnapshot) {
-            const finalized = finalizeIdleCollection(candidate, dataDir);
+            const finalized = await finalizeIdleCollection(candidate, dataDir);
             if (!finalized.ok) {
               demote(candidate, finalized.reason!);
               continue;
             }
-          } else {
-            trashPath(candidate.path);
           }
           log.info('Storage GC: collected', { path: candidate.path, category: candidate.category });
         } catch (error) {
@@ -2146,12 +2193,12 @@ export function runStorageGcOnce(dataDir: string = DATA_DIR, groupsDir: string =
   return report;
 }
 
-export function _discoverWorktreesForTesting(dataDir: string = DATA_DIR): TopicWorktreeTarget[] {
-  return discover(dataDir).targets;
+export async function _discoverWorktreesForTesting(dataDir: string = DATA_DIR): Promise<TopicWorktreeTarget[]> {
+  return discover(dataDir, await readSessionInventory()).targets;
 }
 
-export function _discoveryStatsForTesting(dataDir: string = DATA_DIR): DiscoveryResult {
-  return discover(dataDir);
+export async function _discoveryStatsForTesting(dataDir: string = DATA_DIR): Promise<DiscoveryResult> {
+  return discover(dataDir, await readSessionInventory());
 }
 
 export async function _cleanupOneForTesting(target: TopicWorktreeTarget, dataDir: string = DATA_DIR): Promise<void> {

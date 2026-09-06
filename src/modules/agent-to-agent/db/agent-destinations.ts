@@ -35,7 +35,7 @@
  *     — iterates over `getSessionsByAgentGroup(agentGroupId)`)
  */
 import type { AgentDestination } from '../../../types.js';
-import { getDb, getRawDb } from '../../../db/connection.js';
+import { getDb } from '../../../db/connection.js';
 import { deletePoliciesTouching, removeMessagePolicy } from './agent-message-policies.js';
 
 /**
@@ -44,65 +44,68 @@ import { deletePoliciesTouching, removeMessagePolicy } from './agent-message-pol
  * session of that agent group so the change propagates to the running
  * container's inbound.db. See the top-of-file invariant.
  */
-/*
- * Seam 3: `createDestination`, `getDestinationByName` and
- * `getDestinationByTarget` stay SYNCHRONOUS with no async form —
- * `db/messaging-groups.ts`'s `ensureAgentDestinationForWiring` calls all
- * three from inside `cli/resources/wirings.ts`'s pinned raw transaction
- * closure, and `getDestinations` is read inside write-destinations' mailbox
- * action. Plan §4.2/§4.5; they convert in PR 6 with their closure.
- */
-export function createDestination(row: AgentDestination): void {
-  getRawDb()
-    .prepare(
-      `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
+export async function createDestination(row: AgentDestination): Promise<void> {
+  await getDb().run(
+    `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
        VALUES (@agent_group_id, @local_name, @target_type, @target_id, @created_at)`,
-    )
-    .run(row);
+    row,
+  );
 }
-
-export const AGENT_DESTINATIONS_BY_GROUP_SQL = 'SELECT * FROM agent_destinations WHERE agent_group_id = ?';
 
 /**
- * Synchronous by design (seam-3 plan §4.5, I-1): `write-destinations.ts`
- * resolves this map INSIDE the mailbox action, immediately before a
- * REPLACE-shaped `replaceDestinationRows`, so a yield between the read and the
- * write could reinstate a destination an admin revoked. Same rule as §4.2's
- * transaction-reachable leaf exports — one form, not a `*Sync` twin. PR 6 wraps
- * the block in `withCentralSync`/`withRawDb`.
+ * The `getDestinations` read as a constant, so the one synchronous caller —
+ * `write-destinations.ts`'s `resolve()`, which runs inside the central lease
+ * immediately before a REPLACE-shaped mailbox write — executes the SAME
+ * statement through `withRawDb`. One constant, two executors, not a `*Sync`
+ * twin (plan docs/specs/upstream-async-central-db-seam/plan.md §4.5 I-1).
  */
-export function getDestinations(agentGroupId: string): AgentDestination[] {
-  return getRawDb().prepare(AGENT_DESTINATIONS_BY_GROUP_SQL).all(agentGroupId) as AgentDestination[];
+export const AGENT_DESTINATIONS_BY_GROUP_SQL = 'SELECT * FROM agent_destinations WHERE agent_group_id = ?';
+
+export async function getDestinations(agentGroupId: string): Promise<AgentDestination[]> {
+  return getDb().all<AgentDestination>(AGENT_DESTINATIONS_BY_GROUP_SQL, agentGroupId);
 }
 
-export function getDestinationByName(agentGroupId: string, localName: string): AgentDestination | undefined {
-  return getRawDb()
-    .prepare('SELECT * FROM agent_destinations WHERE agent_group_id = ? AND local_name = ?')
-    .get(agentGroupId, localName) as AgentDestination | undefined;
+export async function getDestinationByName(
+  agentGroupId: string,
+  localName: string,
+): Promise<AgentDestination | undefined> {
+  return getDb().get<AgentDestination>(
+    'SELECT * FROM agent_destinations WHERE agent_group_id = ? AND local_name = ?',
+    agentGroupId,
+    localName,
+  );
 }
 
 /** Reverse lookup: what does this agent call the given target? */
-export function getDestinationByTarget(
+export async function getDestinationByTarget(
   agentGroupId: string,
   targetType: 'channel' | 'agent',
   targetId: string,
-): AgentDestination | undefined {
-  return getRawDb()
-    .prepare('SELECT * FROM agent_destinations WHERE agent_group_id = ? AND target_type = ? AND target_id = ?')
-    .get(agentGroupId, targetType, targetId) as AgentDestination | undefined;
+): Promise<AgentDestination | undefined> {
+  return getDb().get<AgentDestination>(
+    'SELECT * FROM agent_destinations WHERE agent_group_id = ? AND target_type = ? AND target_id = ?',
+    agentGroupId,
+    targetType,
+    targetId,
+  );
 }
 
+/**
+ * The `hasDestination` read as a constant: the `a2a.send` guard
+ * (`../guard.ts`) is synchronous by design (§4.5 I-1) and executes this
+ * statement through `withRawDb` inside its caller's lease block.
+ */
 export const AGENT_DESTINATION_EXISTS_SQL =
   'SELECT 1 FROM agent_destinations WHERE agent_group_id = ? AND target_type = ? AND target_id = ? LIMIT 1';
 
-/**
- * Permission check: can this agent send to this target?
- *
- * Synchronous by design (seam-3 plan §4.5, I-1): the `a2a.send` guard in
- * `../guard.ts` calls it from inside its `decide` body, which never awaits.
- */
-export function hasDestination(agentGroupId: string, targetType: 'channel' | 'agent', targetId: string): boolean {
-  return getRawDb().prepare(AGENT_DESTINATION_EXISTS_SQL).get(agentGroupId, targetType, targetId) !== undefined;
+/** Permission check: can this agent send to this target? */
+export async function hasDestination(
+  agentGroupId: string,
+  targetType: 'channel' | 'agent',
+  targetId: string,
+): Promise<boolean> {
+  const row = await getDb().get(AGENT_DESTINATION_EXISTS_SQL, agentGroupId, targetType, targetId);
+  return row !== undefined;
 }
 
 /**
@@ -111,17 +114,14 @@ export function hasDestination(agentGroupId: string, targetType: 'channel' | 'ag
  * so the deletion propagates to the running container's inbound.db.
  */
 export async function deleteDestination(agentGroupId: string, localName: string): Promise<void> {
+  const db = getDb();
   // Resolve the target first so we can drop a matching policy for this edge (no ghost gate on re-wire).
-  const row = await getDb().get<{ target_type: string; target_id: string }>(
+  const row = await db.get<{ target_type: string; target_id: string }>(
     'SELECT target_type, target_id FROM agent_destinations WHERE agent_group_id = ? AND local_name = ?',
     agentGroupId,
     localName,
   );
-  await getDb().run(
-    'DELETE FROM agent_destinations WHERE agent_group_id = ? AND local_name = ?',
-    agentGroupId,
-    localName,
-  );
+  await db.run('DELETE FROM agent_destinations WHERE agent_group_id = ? AND local_name = ?', agentGroupId, localName);
   if (row?.target_type === 'agent') {
     await removeMessagePolicy(agentGroupId, row.target_id);
   }

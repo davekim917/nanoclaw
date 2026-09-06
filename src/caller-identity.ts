@@ -53,7 +53,7 @@ export async function deriveCallerId(session: Session): Promise<string | null> {
     if (rawId.includes(':')) return rawId;
     // Fall back to the session's messaging_group for channel_type when
     // the message row didn't carry it.
-    const mgFallback = session.messaging_group_id ? getMessagingGroup(session.messaging_group_id) : undefined;
+    const mgFallback = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
     const channelType = row.channel_type ?? mgFallback?.channel_type ?? null;
     if (!channelType) continue;
     return `${channelType}:${rawId}`;

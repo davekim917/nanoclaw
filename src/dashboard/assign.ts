@@ -60,6 +60,7 @@ import { getMessagingGroup } from '../db/messaging-groups.js';
 import { log } from '../log.js';
 import { ATTENTION_ITEM_PREFIX, type AttentionSourceEnv } from '../attention-sources.js';
 import { dispatch } from '../cli/dispatch.js';
+import { withCentralSync } from '../db/central-lease.js';
 import { guard } from '../guard/index.js';
 import { isOwner, isGlobalAdmin, isAdminOfAgentGroup } from '../modules/permissions/db/user-roles.js';
 import { isMember } from '../modules/permissions/db/agent-group-members.js';
@@ -92,12 +93,15 @@ export { ASSIGN_DEDUPE_MS };
  * a stranger to see absence, while a member of the group is someone the surface
  * may honestly tell "not you".
  */
-export function canAssign(userId: string, agentGroupId: string): { ok: boolean; reason?: string } {
-  if (isOwner(userId) || isGlobalAdmin(userId) || isAdminOfAgentGroup(userId, agentGroupId)) {
-    return { ok: true };
-  }
-  if (isMember(userId, agentGroupId)) return { ok: false, reason: 'member_role_cannot_assign' };
-  return { ok: false, reason: 'not_found' };
+export function canAssign(userId: string, agentGroupId: string): Promise<{ ok: boolean; reason?: string }> {
+  // The role predicates are lease-only (§4.5 I-1); one block for the whole decision.
+  return withCentralSync((): { ok: boolean; reason?: string } => {
+    if (isOwner(userId) || isGlobalAdmin(userId) || isAdminOfAgentGroup(userId, agentGroupId)) {
+      return { ok: true };
+    }
+    if (isMember(userId, agentGroupId)) return { ok: false, reason: 'member_role_cannot_assign' };
+    return { ok: false, reason: 'not_found' };
+  }, 'canAssign');
 }
 
 /**
@@ -157,7 +161,7 @@ export async function assignAttentionItem(
   // The stamped id is what `selectScopedAttentionItems` matches on, and the
   // intersection with the caller's scope happens inside it — an unknown item
   // and an out-of-scope one both come back as an empty list.
-  const [item] = selectScopedAttentionItems(
+  const [item] = await selectScopedAttentionItems(
     ctx,
     {
       workgroupId: body.workgroupId ?? null,
@@ -180,11 +184,17 @@ export async function assignAttentionItem(
     channelKey: item.channel_key,
     wiredToItemChannel: target !== null,
   };
-  const decision = guard(observatoryAssign, {
-    actor: { kind: 'human', userId: ctx.user.id },
-    resource: { itemId: item.id, workgroupId: item.workgroupId },
-    payload,
-  });
+  // Under the central lease: `guard()`'s reads are raw by design (seam 3
+  // §4.5 I-1).
+  const decision = await withCentralSync(
+    () =>
+      guard(observatoryAssign, {
+        actor: { kind: 'human', userId: ctx.user.id },
+        resource: { itemId: item.id, workgroupId: item.workgroupId },
+        payload,
+      }),
+    'observatory assign guard',
+  );
   if (decision.effect !== 'allow') {
     // Two refusals that must not look alike. "Not wired to this room" is a
     // state the operator can act on — pick a different agent — and the row
@@ -254,7 +264,7 @@ export async function assignAttentionItem(
 
   // `getMessagingGroup` stays synchronous forever (seam 3 §4.2 — it is called
   // from inside raw transaction closures elsewhere); no await here.
-  const room = getMessagingGroup(target!.messaging_group_id);
+  const room = await getMessagingGroup(target!.messaging_group_id);
   const seriesId = (res.data as { series_id?: string } | null | undefined)?.series_id ?? null;
   log.info('observatory assign', {
     userId: ctx.user.id,

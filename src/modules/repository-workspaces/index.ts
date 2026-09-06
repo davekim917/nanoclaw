@@ -10,9 +10,9 @@ import {
   RepositoryMountQuiescenceError,
   type RepositoryMountQuiescence,
 } from '../../container-restart.js';
+import { withCentralSync, withRawDb } from '../../db/central-lease.js';
 import { REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS } from '../../config.js';
 import { getAgentGroup, getAllAgentGroups } from '../../db/agent-groups.js';
-import { getRawDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
 import { registerDeliveryAction } from '../../delivery.js';
@@ -576,8 +576,8 @@ function uniqueSessionsById(...groups: Session[][]): Session[] {
   return [...new Map(groups.flat().map((candidate) => [candidate.id, candidate])).values()];
 }
 
-function workUnitForSession(session: Session, workgroupId: string): RepositoryWorkUnit {
-  const messagingGroup = session.messaging_group_id ? getMessagingGroup(session.messaging_group_id) : null;
+async function workUnitForSession(session: Session, workgroupId: string): Promise<RepositoryWorkUnit> {
+  const messagingGroup = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : null;
   return resolveRepositoryWorkUnit({
     workgroupId,
     sessionId: session.id,
@@ -722,26 +722,32 @@ export async function applyRepositoryRefreshAction(content: Record<string, unkno
   }
 }
 
-function sessionsForWorkUnit(workUnit: RepositoryWorkUnit): Array<Session & { platform_id: string | null }> {
-  const rows = getRawDb()
-    .prepare(
-      `SELECT s.*, mg.platform_id
+function sessionsForWorkUnit(workUnit: RepositoryWorkUnit): Promise<Array<Session & { platform_id: string | null }>> {
+  return withCentralSync(
+    () =>
+      withRawDb((db) => {
+        const rows = db
+          .prepare(
+            `SELECT s.*, mg.platform_id
          FROM sessions s
          JOIN agent_groups ag ON ag.id = s.agent_group_id
          LEFT JOIN messaging_groups mg ON mg.id = s.messaging_group_id
         WHERE COALESCE(ag.workgroup_id, ag.folder) = ?`,
-    )
-    .all(workUnit.workgroupId) as Array<Session & { platform_id: string | null }>;
-  return rows.filter((row) => {
-    const unit = resolveRepositoryWorkUnit({
-      workgroupId: workUnit.workgroupId,
-      sessionId: row.id,
-      platformId: row.platform_id,
-      messagingGroupId: row.messaging_group_id,
-      threadId: row.thread_id,
-    });
-    return unit.key === workUnit.key;
-  });
+          )
+          .all(workUnit.workgroupId) as Array<Session & { platform_id: string | null }>;
+        return rows.filter((row) => {
+          const unit = resolveRepositoryWorkUnit({
+            workgroupId: workUnit.workgroupId,
+            sessionId: row.id,
+            platformId: row.platform_id,
+            messagingGroupId: row.messaging_group_id,
+            threadId: row.thread_id,
+          });
+          return unit.key === workUnit.key;
+        });
+      }),
+    'repository sessions for work unit',
+  );
 }
 
 type TransferSourceRow = Pick<Session, 'id' | 'messaging_group_id' | 'thread_id'> & {
@@ -812,8 +818,9 @@ export function resolveTransferSourceWorkUnit(
 
 async function sourceSessionStates(
   source: RepositoryWorkUnit,
-  rows: Array<Session & { platform_id: string | null }> = sessionsForWorkUnit(source),
+  rowsOverride?: Array<Session & { platform_id: string | null }>,
 ): Promise<RepositorySourceSessionState[]> {
+  const rows = rowsOverride ?? (await sessionsForWorkUnit(source));
   const { isContainerRunning, isContainerSpawning } = await import('../../container-runner.js');
   const states: RepositorySourceSessionState[] = [];
   for (const row of rows) {
@@ -906,17 +913,24 @@ export async function applyRepositoryTransferAction(content: Record<string, unkn
     // lookup rejection must therefore produce the same explicit failure wake
     // as a later Git/quiescence rejection instead of becoming a log-only job.
     const workgroupId = await workgroupForSession(session);
-    const destination = workUnitForSession(session, workgroupId);
+    const destination = await workUnitForSession(session, workgroupId);
     if (destination.key !== destinationWorkUnitKey) throw new Error('destination repository work-unit changed');
-    const sourceRows = getRawDb()
-      .prepare(
-        `SELECT s.id, s.messaging_group_id, s.thread_id, mg.platform_id
+    const sourceRows = await withCentralSync(
+      () =>
+        withRawDb(
+          (db) =>
+            db
+              .prepare(
+                `SELECT s.id, s.messaging_group_id, s.thread_id, mg.platform_id
            FROM sessions s
            JOIN agent_groups ag ON ag.id = s.agent_group_id
            LEFT JOIN messaging_groups mg ON mg.id = s.messaging_group_id
           WHERE COALESCE(ag.workgroup_id, ag.folder) = ?`,
-      )
-      .all(workgroupId) as TransferSourceRow[];
+              )
+              .all(workgroupId) as TransferSourceRow[],
+        ),
+      'repository transfer source rows',
+    );
     const source = resolveTransferSourceWorkUnit(workgroupId, sourceThreadId, sourceRows);
 
     await transferRepositoryWorktree({
@@ -925,7 +939,7 @@ export async function applyRepositoryTransferAction(content: Record<string, unkn
       source,
       destination,
       beforeSourceActivityCheckWhileClaimed: async () => {
-        sourceSessions = sessionsForWorkUnit(source);
+        sourceSessions = await sessionsForWorkUnit(source);
         rememberQuiescence(
           await quiesceSessionsForRepositoryMounts(
             sourceSessions,
@@ -936,20 +950,20 @@ export async function applyRepositoryTransferAction(content: Record<string, unkn
         // Re-read under the lifecycle claim. A row created while barriers
         // activated cannot spawn, but it must still participate in the final
         // active-state proof instead of escaping through a stale row snapshot.
-        sourceSessions = sessionsForWorkUnit(source);
+        sourceSessions = await sessionsForWorkUnit(source);
       },
       loadSourceSessions: () => sourceSessionStates(source, sourceSessions),
       beforeMoveWhileClaimed: async () => {
         rememberQuiescence(
           await quiesceSessionsForRepositoryMounts(
-            sessionsForWorkUnit(destination),
+            await sessionsForWorkUnit(destination),
             `repository-transfer:${requestId}`,
             REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS,
           ),
         );
       },
       afterMoveWhileClaimed: async (result) => {
-        const destinationSessions = sessionsForWorkUnit(destination);
+        const destinationSessions = await sessionsForWorkUnit(destination);
         for (const destinationSession of destinationSessions) {
           await writeSessionMessageIfNew(destinationSession.agent_group_id, destinationSession.id, {
             id: `repository-transfer-complete-${requestId}`,

@@ -3,7 +3,7 @@
  * (fleet-hardening Phase 1.4). See migration 048 for the "why" — this module
  * is just get/set/delete plus the rotation predicate delivery.ts consults.
  */
-import { getRawDb } from './connection.js';
+import { withCentralSync, withRawDb } from './central-lease.js';
 
 export interface TaskThreadAnchor {
   threadPlatformId: string;
@@ -14,13 +14,19 @@ export function getTaskThreadAnchor(
   sessionId: string,
   channelType: string,
   platformId: string,
-): TaskThreadAnchor | null {
-  const row = getRawDb()
-    .prepare(
-      'SELECT thread_platform_id, created_at FROM task_thread_anchors WHERE session_id = ? AND channel_type = ? AND platform_id = ?',
-    )
-    .get(sessionId, channelType, platformId) as { thread_platform_id: string; created_at: string } | undefined;
-  return row ? { threadPlatformId: row.thread_platform_id, createdAt: row.created_at } : null;
+): Promise<TaskThreadAnchor | null> {
+  return withCentralSync(
+    () =>
+      withRawDb((db) => {
+        const row = db
+          .prepare(
+            'SELECT thread_platform_id, created_at FROM task_thread_anchors WHERE session_id = ? AND channel_type = ? AND platform_id = ?',
+          )
+          .get(sessionId, channelType, platformId) as { thread_platform_id: string; created_at: string } | undefined;
+        return row ? { threadPlatformId: row.thread_platform_id, createdAt: row.created_at } : null;
+      }),
+    'task-thread-anchors.getTaskThreadAnchor',
+  );
 }
 
 export function setTaskThreadAnchor(
@@ -29,22 +35,34 @@ export function setTaskThreadAnchor(
   platformId: string,
   threadPlatformId: string,
   createdAt: string,
-): void {
-  getRawDb()
-    .prepare(
-      `INSERT INTO task_thread_anchors (session_id, channel_type, platform_id, thread_platform_id, created_at)
+): Promise<void> {
+  return withCentralSync(
+    () =>
+      withRawDb((db) => {
+        db.prepare(
+          `INSERT INTO task_thread_anchors (session_id, channel_type, platform_id, thread_platform_id, created_at)
        VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(session_id, channel_type, platform_id) DO UPDATE SET
          thread_platform_id = excluded.thread_platform_id,
          created_at = excluded.created_at`,
-    )
-    .run(sessionId, channelType, platformId, threadPlatformId, createdAt);
+        ).run(sessionId, channelType, platformId, threadPlatformId, createdAt);
+      }),
+    'task-thread-anchors.setTaskThreadAnchor',
+  );
 }
 
-export function deleteTaskThreadAnchor(sessionId: string, channelType: string, platformId: string): void {
-  getRawDb()
-    .prepare('DELETE FROM task_thread_anchors WHERE session_id = ? AND channel_type = ? AND platform_id = ?')
-    .run(sessionId, channelType, platformId);
+export function deleteTaskThreadAnchor(sessionId: string, channelType: string, platformId: string): Promise<void> {
+  return withCentralSync(
+    () =>
+      withRawDb((db) => {
+        db.prepare('DELETE FROM task_thread_anchors WHERE session_id = ? AND channel_type = ? AND platform_id = ?').run(
+          sessionId,
+          channelType,
+          platformId,
+        );
+      }),
+    'task-thread-anchors.deleteTaskThreadAnchor',
+  );
 }
 
 /**

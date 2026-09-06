@@ -176,7 +176,7 @@ async function collectAgentGroups() {
     groups.map(async (g) => {
       const sessions = await getSessionsByAgentGroup(g.id);
       const running = sessions.filter((s) => s.container_status === 'running' || s.container_status === 'idle');
-      const destinations = getDestinations(g.id);
+      const destinations = await getDestinations(g.id);
       const members = await Promise.all(
         (await getMembers(g.id)).map(async (m) => {
           const user = await getUser(m.user_id);

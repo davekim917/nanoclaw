@@ -59,8 +59,8 @@ async function seedGroups(): Promise<void> {
     .run('sess-child', 'ag-child', now());
 }
 
-function makeRunningTask(): Task {
-  return insertTaskAtomic({
+async function makeRunningTask(): Promise<Task> {
+  return (await insertTaskAtomic({
     task_id: 'task-1',
     idempotency_key: 'ik-1',
     parent_session_id: 'sess-parent',
@@ -86,7 +86,7 @@ function makeRunningTask(): Task {
     dispatch_completion_attempts: 0,
     completion_lease_at: null,
     surface_mode: 'headless',
-  })!;
+  }))!;
 }
 
 function makeChildSession(): Session {
@@ -140,14 +140,14 @@ describe('applySpawnComplete', () => {
   it('test_complete_happy_path: transitions to completed and notifies parent', async () => {
     await setupDb();
     await seedGroups();
-    makeRunningTask();
+    await makeRunningTask();
 
     const { getSession } = await import('../../db/sessions.js');
     vi.mocked(getSession).mockResolvedValue(makeParentSession());
 
     await applySpawnComplete({ task_id: 'task-1', summary: 'Done!' }, makeChildSession());
 
-    const task = getTaskById('task-1');
+    const task = await getTaskById('task-1');
     expect(task!.status).toBe('completed');
     expect(task!.result_summary).toBe('Done!');
     expect(task!.completed_at).toBeTruthy();
@@ -163,22 +163,22 @@ describe('applySpawnComplete', () => {
   it('ASSERT: rejects when content lacks task_id', async () => {
     await setupDb();
     await seedGroups();
-    makeRunningTask();
+    await makeRunningTask();
 
     await applySpawnComplete({}, makeChildSession()); // no task_id
 
-    const task = getTaskById('task-1');
+    const task = await getTaskById('task-1');
     expect(task!.status).toBe('running'); // unchanged
   });
 
   it('test_auth_rejects_wrong_session: does not transition when child_session_id mismatch', async () => {
     await setupDb();
     await seedGroups();
-    makeRunningTask();
+    await makeRunningTask();
 
     await applySpawnComplete({ task_id: 'task-1', summary: 'Done' }, makeWrongSession());
 
-    const task = getTaskById('task-1');
+    const task = await getTaskById('task-1');
     expect(task!.status).toBe('running'); // unchanged
 
     const { writeSessionMessage } = await import('../../session-manager.js');
@@ -188,7 +188,7 @@ describe('applySpawnComplete', () => {
   it('test_complete_after_cancel_skips_notify: skips parent notify when already terminal', async () => {
     await setupDb();
     await seedGroups();
-    const task = makeRunningTask();
+    const task = await makeRunningTask();
 
     // Pre-cancel the task
     getRawDb()
@@ -198,7 +198,7 @@ describe('applySpawnComplete', () => {
     const { writeSessionMessage } = await import('../../session-manager.js');
     await applySpawnComplete({ task_id: 'task-1', summary: 'Done' }, makeChildSession());
 
-    const updated = getTaskById('task-1');
+    const updated = await getTaskById('task-1');
     expect(updated!.status).toBe('cancelled'); // unchanged — CAS rejected
     expect(vi.mocked(writeSessionMessage)).not.toHaveBeenCalled();
   });
@@ -208,7 +208,7 @@ describe('applySpawnFailed', () => {
   it('test_failed_includes_reason: stores fail_reason and transitions to failed', async () => {
     await setupDb();
     await seedGroups();
-    makeRunningTask();
+    await makeRunningTask();
 
     const { getSession } = await import('../../db/sessions.js');
     vi.mocked(getSession).mockResolvedValue(makeParentSession());
@@ -218,7 +218,7 @@ describe('applySpawnFailed', () => {
       makeChildSession(),
     );
 
-    const task = getTaskById('task-1');
+    const task = await getTaskById('task-1');
     expect(task!.status).toBe('failed');
     expect(task!.fail_reason).toBe('agent_error');
     expect(task!.result_summary).toBe('Error occurred');
@@ -227,18 +227,18 @@ describe('applySpawnFailed', () => {
   it('ASSERT: two-column auth enforced for failed', async () => {
     await setupDb();
     await seedGroups();
-    makeRunningTask();
+    await makeRunningTask();
 
     await applySpawnFailed({ task_id: 'task-1', summary: 'X' }, makeWrongSession());
 
-    const task = getTaskById('task-1');
+    const task = await getTaskById('task-1');
     expect(task!.status).toBe('running'); // unchanged
   });
 
   it('ASSERT: skips parent notify when transition returns false', async () => {
     await setupDb();
     await seedGroups();
-    makeRunningTask();
+    await makeRunningTask();
 
     // Pre-complete the task
     getRawDb()

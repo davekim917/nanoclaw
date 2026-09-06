@@ -20,6 +20,7 @@ import fs from 'fs';
 import { SELF_HEAL_ENABLED } from '../../config.js';
 import { readContainerConfig } from '../../container-config.js';
 import { resolveContainerResources } from '../../container-resources.js';
+import { withCentralSync } from '../../db/central-lease.js';
 import { markProviderUnavailable } from '../../db/provider-health.js';
 import { resolveSpawnProvider } from '../../provider-fallback.js';
 import { OomKillObserver } from '../../resource-oom-observer.js';
@@ -143,12 +144,12 @@ function providerHealLastAttemptId(mailbox: NanoclawMailboxSession): string | nu
  * even if the kill fizzles; on_wake rows are only consumed by a fresh
  * container's first poll, so the dying one cannot steal it.
  */
-function applyProviderHeal(
+async function applyProviderHeal(
   mailbox: NanoclawMailboxSession,
   session: Session,
   agentGroupFolder: string,
   containerState: ContainerState | null,
-): void {
+): Promise<void> {
   const failureReason = containerState?.provider_failure_reason ?? null;
   let primaryProvider: string | null = null;
   let routedTo: string | null = null;
@@ -159,14 +160,16 @@ function applyProviderHeal(
       sessionProvider: session.agent_provider,
       containerConfig,
     };
-    primaryProvider = resolveSpawnProvider(resolveArgs).primaryProvider;
+    primaryProvider = (await resolveSpawnProvider(resolveArgs)).primaryProvider;
     // A group with no declared fallback has nowhere to route, so recording a
     // health window would only delay the honest error an operator needs to see.
     // Owner-approved: respawn on the primary anyway, under the same cap.
     if (containerConfig.providerFallback?.provider && failureReason) {
-      markProviderUnavailable(session.agent_group_id, primaryProvider, 'unavailable', { message: failureReason });
+      await markProviderUnavailable(session.agent_group_id, primaryProvider, 'unavailable', {
+        message: failureReason,
+      });
     }
-    routedTo = resolveSpawnProvider(resolveArgs).provider;
+    routedTo = (await resolveSpawnProvider(resolveArgs)).provider;
   } catch (err) {
     log.warn('self-heal: provider routing lookup failed — respawning as configured', { sessionId: session.id, err });
   }
@@ -279,9 +282,10 @@ export function notifyProviderHealParked(
  * `killContainer`: the attempt is what must not be spent, and the attempt is
  * written before the kill.
  *
- * Synchronous and cheap — one central-DB row and the container-state lookup
- * the host already keeps in memory — so it adds no suspension point of its own
- * to widen the window it closes.
+ * Cheap — one central-DB row and the container-state lookup the host already
+ * keeps in memory. The DB read is the wake guard's own raw read, so it runs
+ * inside the central lease; the caller takes the lease around this whole check
+ * (seam 3 §4.5 I-1).
  */
 function providerHealTargetUnavailableReason(sessionId: string): string | null {
   const liveness = sessionStillActive(sessionId)();
@@ -353,7 +357,10 @@ async function sweepProviderHeal(
   // attempt and returned `true`, so the chain stopped. Claiming the slot keeps
   // that behaviour exactly and drops only the wasted attempt, which is the
   // whole point of the fix.
-  const unavailable = providerHealTargetUnavailableReason(session.id);
+  const unavailable = await withCentralSync(
+    () => providerHealTargetUnavailableReason(session.id),
+    'provider-heal target check',
+  );
   if (unavailable) {
     log.info(`self-heal: ${decision} target already gone — nothing to do this pass`, {
       ...bounds,
@@ -394,8 +401,8 @@ async function sweepProviderHeal(
 
   // Wake row first (durably counted even if the kill fizzles), session closed,
   // then the kill and its respawn.
-  const wrote = await run((mailbox) => {
-    applyProviderHeal(mailbox, session, agentGroupFolder, containerState);
+  const wrote = await run(async (mailbox) => {
+    await applyProviderHeal(mailbox, session, agentGroupFolder, containerState);
     return true;
   });
   if (!wrote) return false;

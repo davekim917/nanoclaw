@@ -1,7 +1,8 @@
 import { randomUUID } from 'crypto';
 
 import { getChannelAdapter } from '../../channels/channel-registry.js';
-import { getDb, getRawDb } from '../../db/connection.js';
+import { centralTransaction } from '../../db/central-lease.js';
+import { getDb } from '../../db/connection.js';
 // Lazy import to avoid module-init cycle (events.ts imports nothing from dispatch.ts).
 // The import() call is memoized by Node's module cache after the first resolution.
 //
@@ -73,39 +74,55 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
     return;
   }
 
-  // Auth: caller's agent_group must have orchestrator capability
-  if (!(await hasOrchestratorCapability(callerSession.agent_group_id))) {
-    await _notifyCaller(callerSession, 'spawn rejected: not an orchestrator');
-    return;
-  }
-
   // Self-orchestration: spawned children always run in the SAME agent group as
   // the parent. They share workspace, memory, CLAUDE.md, channels — only the
   // session/thread is isolated. There is no cross-group dispatch primitive.
   const childAgentGroupId = callerSession.agent_group_id;
 
-  const capConfig =
-    (await getCapabilityConfig(callerSession.agent_group_id, 'orchestrator')) ?? DEFAULT_CAPABILITY_CONFIG;
+  // Surface mode — per-channel capability check (cycle-3 S24). Resolved BEFORE
+  // the admission transaction: it reads the messaging group (whose channel
+  // type never changes) and consults the in-memory adapter registry, and a
+  // central transaction closure is DB-only (plan §4.4) — no adapter lookups
+  // inside it.
+  let surfaceMode: 'native_thread' | 'headless' = 'headless';
+  if (callerSession.messaging_group_id !== null) {
+    const mg = await getMessagingGroup(callerSession.messaging_group_id);
+    if (mg) {
+      const adapter = getChannelAdapter(mg.channel_type);
+      if (adapter && typeof adapter.createThread === 'function') {
+        surfaceMode = 'native_thread';
+      }
+    }
+  }
 
-  // All admission steps inside a single better-sqlite3 transaction. Seam 3
-  // keeps this ONE raw transaction (and only it) on `getRawDb()`: it is one of
-  // the eleven central sites `src/db/transaction-closures.test.ts` pins, and it
-  // converts to `centralTransaction` in PR 6 together with the leaf exports its
-  // closure calls. Every non-transactional statement in this file is on the
-  // async driver.
-  //
-  // Use IMMEDIATE (write lock from BEGIN) instead of DEFERRED (default) so the
-  // cap-count read holds the write lock through the INSERT — prevents two parallel
-  // delivery drains from the same orchestrator both reading the same count, both
-  // passing the cap check, and both succeeding INSERT (cap exceeded). Cycle-3
-  // S3-C / Concurrency-reviewer #5.
-  const db = getRawDb();
+  // All admission steps inside a single central transaction. The driver opens
+  // it IMMEDIATE (write lock from BEGIN) so the cap-count read holds the write
+  // lock through the INSERT — prevents two parallel delivery drains from the
+  // same orchestrator both reading the same count, both passing the cap check,
+  // and both succeeding INSERT (cap exceeded). Cycle-3 S3-C /
+  // Concurrency-reviewer #5. The closure is DB-only: every notification, wake
+  // and dashboard event below runs after commit, never after a rollback.
   let taskRow: Task | null = null;
   let replayResult: { message: string } | null = null;
+  let notOrchestrator = false;
 
-  db.transaction(() => {
+  await centralTransaction(async () => {
+    // Step 0: Auth — the caller's agent_group must hold the orchestrator
+    // capability, read INSIDE the transaction (fork issue #452, site 1). Read
+    // before the closure, the awaited check yields, and a `revokeCapability`
+    // landing in that window admits one task after the revoke. Under BEGIN
+    // IMMEDIATE the revoke either commits before this read (rejected here) or
+    // waits for this commit (the task is admitted while the capability still
+    // held). The same holds for the cap config the count below is judged by.
+    if (!(await hasOrchestratorCapability(callerSession.agent_group_id))) {
+      notOrchestrator = true;
+      return;
+    }
+    const capConfig =
+      (await getCapabilityConfig(callerSession.agent_group_id, 'orchestrator')) ?? DEFAULT_CAPABILITY_CONFIG;
+
     // Step 1: Idempotency replay PRECEDES cap (cycle-3 M20)
-    const existingByIdempotency = getTaskByParentAndIdempotency(callerSession.id, idempotencyKey);
+    const existingByIdempotency = await getTaskByParentAndIdempotency(callerSession.id, idempotencyKey);
     if (existingByIdempotency) {
       const computedHash = computeRequestHash(taskContent, deadline);
       if (existingByIdempotency.request_hash !== computedHash) {
@@ -119,7 +136,7 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
     }
 
     // Step 2: Concurrency cap — only for NEW admissions
-    const activeCount = countActiveByParent(callerSession.id);
+    const activeCount = await countActiveByParent(callerSession.id);
     if (activeCount >= capConfig.concurrencyCap) {
       replayResult = {
         message: `spawn rejected: concurrency cap reached (${activeCount}/${capConfig.concurrencyCap})`,
@@ -130,22 +147,12 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
     // Step 3: Compute request_hash
     const requestHash = computeRequestHash(taskContent, deadline);
 
-    // Step 4: Determine surface_mode — per-channel capability check (cycle-3 S24)
-    let surfaceMode: 'native_thread' | 'headless' = 'headless';
-    if (callerSession.messaging_group_id !== null) {
-      const mg = getMessagingGroup(callerSession.messaging_group_id);
-      if (mg) {
-        const adapter = getChannelAdapter(mg.channel_type);
-        if (adapter && typeof adapter.createThread === 'function') {
-          surfaceMode = 'native_thread';
-        }
-      }
-    }
+    // Step 4: surface_mode was resolved above, before the transaction.
 
     // Step 5: Atomic INSERT
     const taskId = deriveSpawnTaskId(callerSession.id, idempotencyKey);
     const now = new Date().toISOString();
-    taskRow = insertTaskAtomic({
+    taskRow = await insertTaskAtomic({
       task_id: taskId,
       idempotency_key: idempotencyKey,
       parent_session_id: callerSession.id,
@@ -175,7 +182,7 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
 
     // Parallel admit race: if INSERT returned null, SELECT the winner
     if (taskRow === null) {
-      taskRow = getTaskByParentAndIdempotency(callerSession.id, idempotencyKey);
+      taskRow = await getTaskByParentAndIdempotency(callerSession.id, idempotencyKey);
       if (taskRow) {
         replayResult = {
           message: `Task already exists (parallel admit): task_id=${taskRow.task_id} status=${taskRow.status}`,
@@ -183,9 +190,14 @@ export async function applySpawnTask(content: Record<string, unknown>, callerSes
         taskRow = null;
       }
     }
-  }).immediate();
+  }, 'applySpawnTask');
 
-  // Post-transaction handling
+  // Post-transaction handling — every notification/wake is an external effect
+  // and runs after commit, never inside the closure.
+  if (notOrchestrator) {
+    await _notifyCaller(callerSession, 'spawn rejected: not an orchestrator');
+    return;
+  }
   // TypeScript doesn't track mutation through the transaction callback,
   // so we assert the type here.
   const postTxnReplay = replayResult as { message: string } | null;
@@ -261,7 +273,7 @@ export async function completeSpawnSideEffects(taskId: string, childAgentGroupId
 
 async function _runCompletionSideEffects(taskId: string, childAgentGroupId: string): Promise<void> {
   // Acquire durable lease — returns null if another worker holds it
-  const leaseRow = acquireCompletionLease(taskId);
+  const leaseRow = await acquireCompletionLease(taskId);
   if (!leaseRow) {
     log.debug('completeSpawnSideEffects: lease held by another worker, skipping', { taskId });
     return;
@@ -276,7 +288,7 @@ async function _runCompletionSideEffects(taskId: string, childAgentGroupId: stri
   };
 
   try {
-    const task = getTaskById(taskId);
+    const task = await getTaskById(taskId);
     if (!task || task.status !== 'pending') {
       return;
     }
@@ -288,9 +300,9 @@ async function _runCompletionSideEffects(taskId: string, childAgentGroupId: stri
     }
   } catch (err) {
     log.warn('completeSpawnSideEffects: error during completion', { taskId, err });
-    const attempts = incrementCompletionAttempts(taskId);
+    const attempts = await incrementCompletionAttempts(taskId);
     if (attempts >= 5) {
-      transitionToTerminal(taskId, 'failed', {
+      await transitionToTerminal(taskId, 'failed', {
         fail_reason: 'completion_exhausted',
         failed_at: new Date().toISOString(),
       });
@@ -306,9 +318,9 @@ async function _runThreadedPath(task: Task, childAgentGroupId: string): Promise<
 
   // Resolve adapter — if adapter no longer has createThread, mark failed immediately
   // (adapter_unavailable does NOT consume retry budget — cycle-3 fix / Codex #43)
-  const mg = task.parent_messaging_group_id ? getMessagingGroup(task.parent_messaging_group_id) : undefined;
+  const mg = task.parent_messaging_group_id ? await getMessagingGroup(task.parent_messaging_group_id) : undefined;
   if (!mg) {
-    transitionToTerminal(taskId, 'failed', {
+    await transitionToTerminal(taskId, 'failed', {
       fail_reason: 'adapter_unavailable',
       failed_at: new Date().toISOString(),
     });
@@ -317,7 +329,7 @@ async function _runThreadedPath(task: Task, childAgentGroupId: string): Promise<
 
   const adapter = getChannelAdapter(mg.channel_type);
   if (!adapter || typeof adapter.createThread !== 'function') {
-    transitionToTerminal(taskId, 'failed', {
+    await transitionToTerminal(taskId, 'failed', {
       fail_reason: 'adapter_unavailable',
       failed_at: new Date().toISOString(),
     });
@@ -326,21 +338,21 @@ async function _runThreadedPath(task: Task, childAgentGroupId: string): Promise<
 
   // Step 1: postParent
   {
-    const current = getTaskById(taskId);
+    const current = await getTaskById(taskId);
     if (!current || current.status !== 'pending') return;
 
     if (current.parent_platform_message_id === null) {
       const truncContent = task.task_content.slice(0, 100);
       // Per-adapter signature: postParent(platformId, text) — no channelType prefix
       const { messageId } = await adapter.postParent!(mg.platform_id, `Spawned task: ${truncContent}`);
-      const updated = updateArtifactColumn(taskId, 'parent_platform_message_id', messageId);
+      const updated = await updateArtifactColumn(taskId, 'parent_platform_message_id', messageId);
       if (!updated) return; // status-CAS rejected — another path won
     }
   }
 
   // Step 2: createThread
   {
-    const current = getTaskById(taskId);
+    const current = await getTaskById(taskId);
     if (!current || current.status !== 'pending') return;
 
     if (current.child_platform_thread_id === null) {
@@ -354,17 +366,17 @@ async function _runThreadedPath(task: Task, childAgentGroupId: string): Promise<
       );
       // Slack: threadId IS parent_platform_message_id (cycle-3 M25)
       const childMgId = task.parent_messaging_group_id;
-      const updated = updateArtifactColumn(taskId, 'child_platform_thread_id', threadId);
+      const updated = await updateArtifactColumn(taskId, 'child_platform_thread_id', threadId);
       if (!updated) return;
       if (childMgId) {
-        updateArtifactColumn(taskId, 'child_messaging_group_id', childMgId);
+        await updateArtifactColumn(taskId, 'child_messaging_group_id', childMgId);
       }
     }
   }
 
   // Step 3: openSession (cycle-3 M21 write order)
   {
-    const current = getTaskById(taskId);
+    const current = await getTaskById(taskId);
     if (!current || current.status !== 'pending') return;
 
     if (current.child_session_id === null) {
@@ -443,7 +455,7 @@ async function _runThreadedPath(task: Task, childAgentGroupId: string): Promise<
 async function _runHeadlessPath(task: Task, childAgentGroupId: string): Promise<void> {
   const taskId = task.task_id;
 
-  const current = getTaskById(taskId);
+  const current = await getTaskById(taskId);
   if (!current || current.status !== 'pending') return;
 
   if (current.child_session_id === null) {

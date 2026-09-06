@@ -49,7 +49,7 @@ export async function handleProviderUnavailable(content: Record<string, unknown>
   // meaningful); 'unavailable' is any other unrecovered provider failure,
   // which only earns a short backoff window.
   const errorClass = str(content.classification) === 'quota' ? 'quota' : 'unavailable';
-  const until = markProviderUnavailable(agentGroup.id, reportedProvider.toLowerCase(), errorClass, {
+  const until = await markProviderUnavailable(agentGroup.id, reportedProvider.toLowerCase(), errorClass, {
     resetAt: errorClass === 'quota' ? parseProviderResetAt(message) : null,
     message,
   });
@@ -65,12 +65,12 @@ export async function handleProviderUnavailable(content: Record<string, unknown>
   // healthy. With every provider in cooldown a respawn would just restart the
   // same failure — the message stays queued and the normal sweep retries it
   // once a window expires.
-  const next = resolveSpawnProvider({
+  const next = await resolveSpawnProvider({
     agentGroupId: agentGroup.id,
     sessionProvider: session.agent_provider,
     containerConfig,
   });
-  if (isProviderUnavailable(agentGroup.id, next.provider)) {
+  if (await isProviderUnavailable(agentGroup.id, next.provider)) {
     log.warn('Provider fallback exhausted too — leaving the session queued rather than respawn-looping', {
       sessionId: session.id,
       agentGroup: agentGroup.name,

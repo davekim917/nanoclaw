@@ -6,7 +6,7 @@
  * Slack thread + session, and read by the same handler to route follow-up emails
  * back into the existing thread/session. See migration 041.
  */
-import { getRawDb } from './connection.js';
+import { withCentralSync, withRawDb } from './central-lease.js';
 
 export interface SupportThread {
   gmail_thread_id: string;
@@ -25,10 +25,16 @@ export interface SupportThread {
   last_activity_at: string;
 }
 
-export function getSupportThread(gmailThreadId: string): SupportThread | undefined {
-  return getRawDb().prepare('SELECT * FROM support_threads WHERE gmail_thread_id = ?').get(gmailThreadId) as
-    | SupportThread
-    | undefined;
+export function getSupportThread(gmailThreadId: string): Promise<SupportThread | undefined> {
+  return withCentralSync(
+    () =>
+      withRawDb((db) => {
+        return db.prepare('SELECT * FROM support_threads WHERE gmail_thread_id = ?').get(gmailThreadId) as
+          | SupportThread
+          | undefined;
+      }),
+    'support-threads.getSupportThread',
+  );
 }
 
 export interface UpsertSupportThread {
@@ -54,10 +60,12 @@ export interface UpsertSupportThread {
  * fields use COALESCE so a dispatch without ticket info never clobbers a
  * recorded ticket; `created_at` is preserved on conflict.
  */
-export function upsertSupportThread(t: UpsertSupportThread, now: string): void {
-  getRawDb()
-    .prepare(
-      `INSERT INTO support_threads
+export function upsertSupportThread(t: UpsertSupportThread, now: string): Promise<void> {
+  return withCentralSync(
+    () =>
+      withRawDb((db) => {
+        db.prepare(
+          `INSERT INTO support_threads
          (gmail_thread_id, agent_group_id, messaging_group_id, linear_team, linear_issue,
           slack_parent_msg_id, slack_thread_id, session_id, status, last_gmail_message_id,
           subject, sender, created_at, last_activity_at)
@@ -77,8 +85,10 @@ export function upsertSupportThread(t: UpsertSupportThread, now: string): void {
          subject = COALESCE(excluded.subject, subject),
          sender = COALESCE(excluded.sender, sender),
          last_activity_at = excluded.last_activity_at`,
-    )
-    .run({ ...t, now });
+        ).run({ ...t, now });
+      }),
+    'support-threads.upsertSupportThread',
+  );
 }
 
 /**
@@ -86,10 +96,16 @@ export function upsertSupportThread(t: UpsertSupportThread, now: string): void {
  * `update_support_ticket` handler — keying on the CALLING session id means the
  * agent never supplies a cross-row key (same security posture as scheduling).
  */
-export function getSupportThreadBySession(sessionId: string): SupportThread | undefined {
-  return getRawDb().prepare('SELECT * FROM support_threads WHERE session_id = ?').get(sessionId) as
-    | SupportThread
-    | undefined;
+export function getSupportThreadBySession(sessionId: string): Promise<SupportThread | undefined> {
+  return withCentralSync(
+    () =>
+      withRawDb((db) => {
+        return db.prepare('SELECT * FROM support_threads WHERE session_id = ?').get(sessionId) as
+          | SupportThread
+          | undefined;
+      }),
+    'support-threads.getSupportThreadBySession',
+  );
 }
 
 /** Record the Linear ticket a per-issue session created for its thread. */
@@ -98,16 +114,20 @@ export function setSupportThreadTicket(
   linearIssue: string,
   linearTeam: string | null,
   now: string,
-): void {
-  getRawDb()
-    .prepare(
-      `UPDATE support_threads
+): Promise<void> {
+  return withCentralSync(
+    () =>
+      withRawDb((db) => {
+        db.prepare(
+          `UPDATE support_threads
           SET linear_issue = @linearIssue,
               linear_team = COALESCE(@linearTeam, linear_team),
               last_activity_at = @now
         WHERE gmail_thread_id = @gmailThreadId`,
-    )
-    .run({ gmailThreadId, linearIssue, linearTeam, now });
+        ).run({ gmailThreadId, linearIssue, linearTeam, now });
+      }),
+    'support-threads.setSupportThreadTicket',
+  );
 }
 
 /**
@@ -115,16 +135,24 @@ export function setSupportThreadTicket(
  * `last_activity_at`, refreshes `last_gmail_message_id` when supplied, and
  * reopens a previously-closed thread (a customer reply revives the issue).
  */
-export function touchSupportThread(gmailThreadId: string, now: string, lastGmailMessageId?: string | null): void {
-  getRawDb()
-    .prepare(
-      `UPDATE support_threads
+export function touchSupportThread(
+  gmailThreadId: string,
+  now: string,
+  lastGmailMessageId?: string | null,
+): Promise<void> {
+  return withCentralSync(
+    () =>
+      withRawDb((db) => {
+        db.prepare(
+          `UPDATE support_threads
           SET last_activity_at = @now,
               status = 'open',
               last_gmail_message_id = COALESCE(@lastGmailMessageId, last_gmail_message_id)
         WHERE gmail_thread_id = @gmailThreadId`,
-    )
-    .run({ gmailThreadId, now, lastGmailMessageId: lastGmailMessageId ?? null });
+        ).run({ gmailThreadId, now, lastGmailMessageId: lastGmailMessageId ?? null });
+      }),
+    'support-threads.touchSupportThread',
+  );
 }
 
 /**
@@ -137,14 +165,28 @@ export function touchSupportThread(gmailThreadId: string, now: string, lastGmail
  * upsert path) would mint a new Slack thread and a duplicate announcement for
  * what is, to everyone involved, an ongoing conversation.
  */
-export function rebindSupportThreadSession(gmailThreadId: string, sessionId: string): void {
-  getRawDb()
-    .prepare('UPDATE support_threads SET session_id = @sessionId WHERE gmail_thread_id = @gmailThreadId')
-    .run({ gmailThreadId, sessionId });
+export function rebindSupportThreadSession(gmailThreadId: string, sessionId: string): Promise<void> {
+  return withCentralSync(
+    () =>
+      withRawDb((db) => {
+        db.prepare('UPDATE support_threads SET session_id = @sessionId WHERE gmail_thread_id = @gmailThreadId').run({
+          gmailThreadId,
+          sessionId,
+        });
+      }),
+    'support-threads.rebindSupportThreadSession',
+  );
 }
 
-export function closeSupportThread(gmailThreadId: string, now: string): void {
-  getRawDb()
-    .prepare("UPDATE support_threads SET status = 'closed', last_activity_at = ? WHERE gmail_thread_id = ?")
-    .run(now, gmailThreadId);
+export function closeSupportThread(gmailThreadId: string, now: string): Promise<void> {
+  return withCentralSync(
+    () =>
+      withRawDb((db) => {
+        db.prepare("UPDATE support_threads SET status = 'closed', last_activity_at = ? WHERE gmail_thread_id = ?").run(
+          now,
+          gmailThreadId,
+        );
+      }),
+    'support-threads.closeSupportThread',
+  );
 }

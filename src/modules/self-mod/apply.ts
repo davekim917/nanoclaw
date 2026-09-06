@@ -280,7 +280,7 @@ export async function performModelChange(
     return;
   }
 
-  const denied = getDeniedModel(config.provider, slug);
+  const denied = await getDeniedModel(config.provider, slug);
   if (denied) {
     await notify(
       `change_model failed: "${slug}" is in the ${config.provider} deny list${

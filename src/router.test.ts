@@ -293,7 +293,7 @@ beforeEach(() => {
   setChannelRequestGate(() => Promise.resolve(false));
   registerMessageInterceptor(() => Promise.resolve(false));
   vi.mocked(isAnyAdmin).mockResolvedValue(true);
-  vi.mocked(claimChannelIngress).mockReturnValue(true);
+  vi.mocked(claimChannelIngress).mockResolvedValue(true);
 });
 
 afterEach(() => {
@@ -302,7 +302,7 @@ afterEach(() => {
 
 describe('C2: pre-fanout intercept dispatch', () => {
   it('drops a replay before intercept handlers run', async () => {
-    vi.mocked(claimChannelIngress).mockReturnValue(false);
+    vi.mocked(claimChannelIngress).mockResolvedValue(false);
     const handlerSpy = vi.fn().mockResolvedValue(undefined);
     registerInterceptHandler('dashboard_token_issue', handlerSpy);
 

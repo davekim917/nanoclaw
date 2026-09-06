@@ -182,8 +182,13 @@ function grantOrchestratorCap1(agId: string): void {
     .run(agId, config, now());
 }
 
-function insertActiveTask(taskId: string, idempotencyKey: string, sessionId: string, agId: string): Task {
-  return insertTaskAtomic({
+async function insertActiveTask(
+  taskId: string,
+  idempotencyKey: string,
+  sessionId: string,
+  agId: string,
+): Promise<Task> {
+  return (await insertTaskAtomic({
     task_id: taskId,
     idempotency_key: idempotencyKey,
     parent_session_id: sessionId,
@@ -209,7 +214,7 @@ function insertActiveTask(taskId: string, idempotencyKey: string, sessionId: str
     dispatch_completion_attempts: 0,
     completion_lease_at: null,
     surface_mode: 'headless',
-  })!;
+  }))!;
 }
 
 beforeEach(async () => {
@@ -233,7 +238,7 @@ describe('applySpawnTask', () => {
     const caller = makeCallerSession();
     await applySpawnTask({ content: 'Do X', idempotency_key: 'k1' }, caller);
 
-    const task = getTaskByParentAndIdempotency('sess-caller', 'k1');
+    const task = await getTaskByParentAndIdempotency('sess-caller', 'k1');
     expect(task).toBeNull();
 
     const { writeSessionMessage } = await import('../../session-manager.js');
@@ -256,7 +261,7 @@ describe('applySpawnTask', () => {
     const caller = makeCallerSession();
     await applySpawnTask({ content: 'Do X', idempotency_key: 'k1' }, caller);
 
-    const task = getTaskByParentAndIdempotency('sess-caller', 'k1');
+    const task = await getTaskByParentAndIdempotency('sess-caller', 'k1');
     expect(task).not.toBeNull();
     expect(task!.status).toBe('pending');
     expect(task!.surface_mode).toBe('headless');
@@ -270,11 +275,11 @@ describe('applySpawnTask', () => {
     grantOrchestratorCap1('ag-caller');
 
     // Insert one active task (at cap)
-    insertActiveTask('task-existing', 'k-other', 'sess-caller', 'ag-caller');
+    await insertActiveTask('task-existing', 'k-other', 'sess-caller', 'ag-caller');
 
     // Also insert the idempotency key we'll replay
     const replayHash = computeRequestHash('Do X', null);
-    insertTaskAtomic({
+    await insertTaskAtomic({
       task_id: 'task-replay',
       idempotency_key: 'k1',
       parent_session_id: 'sess-caller',
@@ -323,7 +328,7 @@ describe('applySpawnTask', () => {
 
     // Insert existing task with hash for ('X', null)
     const originalHash = computeRequestHash('X', null);
-    insertTaskAtomic({
+    await insertTaskAtomic({
       task_id: 'task-orig',
       idempotency_key: 'k1',
       parent_session_id: 'sess-caller',
@@ -361,7 +366,7 @@ describe('applySpawnTask', () => {
     expect(messages.some((m) => m.includes('idempotency_key_reused_with_different_payload'))).toBe(true);
 
     // Existing task unchanged
-    const existing = getTaskById('task-orig');
+    const existing = await getTaskById('task-orig');
     expect(existing!.task_content).toBe('X');
   });
 
@@ -372,12 +377,12 @@ describe('applySpawnTask', () => {
     grantOrchestratorCap1('ag-caller');
 
     // Insert one active (running) task → at cap
-    insertActiveTask('task-existing', 'k-other', 'sess-caller', 'ag-caller');
+    await insertActiveTask('task-existing', 'k-other', 'sess-caller', 'ag-caller');
 
     const caller = makeCallerSession();
     await applySpawnTask({ content: 'New work', idempotency_key: 'k-new' }, caller);
 
-    const newTask = getTaskByParentAndIdempotency('sess-caller', 'k-new');
+    const newTask = await getTaskByParentAndIdempotency('sess-caller', 'k-new');
     expect(newTask).toBeNull();
 
     const { writeSessionMessage } = await import('../../session-manager.js');
@@ -401,7 +406,7 @@ describe('applySpawnTask', () => {
     const caller = makeCallerSession({ messaging_group_id: 'mg-1' });
     await applySpawnTask({ content: 'Do X', idempotency_key: 'k1' }, caller);
 
-    const task = getTaskByParentAndIdempotency('sess-caller', 'k1');
+    const task = await getTaskByParentAndIdempotency('sess-caller', 'k1');
     expect(task).not.toBeNull();
     expect(task!.surface_mode).toBe('headless');
   });
@@ -419,7 +424,7 @@ describe('applySpawnTask', () => {
     const caller = makeCallerSession({ messaging_group_id: 'mg-1' });
     await applySpawnTask({ content: 'Do X', idempotency_key: 'k1' }, caller);
 
-    const task = getTaskByParentAndIdempotency('sess-caller', 'k1');
+    const task = await getTaskByParentAndIdempotency('sess-caller', 'k1');
     expect(task).not.toBeNull();
     expect(task!.surface_mode).toBe('native_thread');
   });
@@ -530,7 +535,7 @@ describe('completeSpawnSideEffects', () => {
 
     await completeSpawnSideEffects(taskId, 'ag-caller');
 
-    const task = getTaskById(taskId);
+    const task = await getTaskById(taskId);
     expect(task!.status).toBe('failed');
     expect(task!.fail_reason).toBe('adapter_unavailable');
     // CRITICAL: dispatch_completion_attempts === 0 (no retry budget consumed)
@@ -562,7 +567,7 @@ describe('completeSpawnSideEffects', () => {
       await completeSpawnSideEffects(taskId, 'ag-caller');
     }
 
-    const task = getTaskById(taskId);
+    const task = await getTaskById(taskId);
     expect(task!.status).toBe('failed');
     expect(task!.fail_reason).toBe('completion_exhausted');
   });
@@ -586,7 +591,7 @@ describe('completeSpawnSideEffects', () => {
 
     // Should have exited immediately — acquireCompletionLease requires status='pending'
     // so it returns null. No writeSessionMessage calls.
-    const task = getTaskById(taskId);
+    const task = await getTaskById(taskId);
     expect(task!.status).toBe('cancelled'); // unchanged
   });
 
@@ -612,7 +617,7 @@ describe('completeSpawnSideEffects', () => {
 
     await completeSpawnSideEffects(taskId, 'ag-caller');
 
-    const task = getTaskById(taskId);
+    const task = await getTaskById(taskId);
     // child_platform_thread_id should be threadId ('parent-ts-123'), NOT messageId ('reply-ts-456')
     if (task && task.child_platform_thread_id !== null) {
       expect(task.child_platform_thread_id).toBe('parent-ts-123');
@@ -641,7 +646,7 @@ describe('completeSpawnSideEffects', () => {
 
     vi.mocked(writeSessionMessage).mockImplementation(async () => {
       // By the time writeSessionMessage is called, child_session_id must be set
-      const task = getTaskById(taskId);
+      const task = await getTaskById(taskId);
       if (task && task.status === 'running') {
         order.push('writeSessionMessage-after-tasks-update');
       }
@@ -737,7 +742,7 @@ describe('D6: emitDashboardEvent emits after apply functions commit', () => {
     await applySpawnTask({ content: 'Do X', idempotency_key: 'd6-k1' }, caller);
 
     // Emit fires AFTER the transaction — task must exist in DB
-    const task = getTaskByParentAndIdempotency('sess-caller', 'd6-k1');
+    const task = await getTaskByParentAndIdempotency('sess-caller', 'd6-k1');
     expect(task).not.toBeNull();
 
     // Wait for async lazyEmit to resolve
@@ -754,7 +759,7 @@ describe('D6: emitDashboardEvent emits after apply functions commit', () => {
     grantOrchestratorCap1('ag-caller');
 
     // Fill cap
-    insertActiveTask('task-existing', 'k-other', 'sess-caller', 'ag-caller');
+    await insertActiveTask('task-existing', 'k-other', 'sess-caller', 'ag-caller');
 
     const { emitDashboardEvent } = await import('../../dashboard/api/events.js');
     vi.mocked(emitDashboardEvent).mockClear();

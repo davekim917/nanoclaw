@@ -176,7 +176,7 @@ async function main(): Promise<void> {
           trigger_pattern: g.trigger_pattern,
           requires_trigger: g.requires_trigger,
         });
-        createMessagingGroupAgent({
+        await createMessagingGroupAgent({
           id: generateId('mga'),
           messaging_group_id: mg.id,
           agent_group_id: ag.id,

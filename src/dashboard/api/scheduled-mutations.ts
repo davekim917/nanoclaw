@@ -18,15 +18,7 @@ import fs from 'fs';
 
 import { DATA_DIR, TIMEZONE } from '../../config.js';
 import { resolveGroupTimezone } from '../../container-config.js';
-// 5c deferral (seam 3, deployer call 2026-09-05): every getRawDb() call in
-// this file feeds writeAudit (scheduled-shared.ts), which is also called
-// from src/modules/sweep-scheduled-move/index.ts (PR 5b's file) — §4.2
-// cannot be honored split across two parallel PRs. A follow-up "5c" PR
-// converts writeAudit/purgeIntentBody together with every caller (this
-// file, scheduled-move.ts, cli/resources/tasks.ts, and the
-// sweep-scheduled-move helpers) once 5a and 5b are both merged. Nothing in
-// this file was changed by seam 3 PR 5a for that reason.
-import { getRawDb } from '../../db/connection.js';
+import { withCentralSync } from '../../db/central-lease.js';
 import { getSession, QuietInvalidationError, withQuietInvalidationSync } from '../../db/sessions.js';
 import {
   readSessionInbound,
@@ -98,17 +90,17 @@ interface ResolvedTarget {
  * unknown / late / healthy) the way the matrix needs. Returns a Response on any
  * reject (404/400/503/409), or the resolved target.
  */
-function resolveTarget(
+async function resolveTarget(
   key: string,
   ctx: AuthedRequestContext,
   nowMs: number,
   dataDir: string,
-): { error: Response } | { ok: ResolvedTarget } {
+): Promise<{ error: Response } | { ok: ResolvedTarget }> {
   const decoded = decodeKey(key);
   if (!decoded) return { error: json({ error: 'bad_key' }, 400) };
 
   // Mutation gate — owner/global-admin only; non-manage → 404 disclose-as-not-found.
-  if (!canManageScheduled(ctx.user.id)) return { error: json({ error: 'not_found' }, 404) };
+  if (!(await canManageScheduled(ctx.user.id))) return { error: json({ error: 'not_found' }, 404) };
   if (!ctx.scopes.no_filter && !ctx.scopes.allowed_group_ids.includes(decoded.agentGroupId)) {
     return { error: json({ error: 'not_found' }, 404) };
   }
@@ -254,70 +246,76 @@ async function withMutationSession(
   action: (mailbox: NanoclawMailboxSession) => number,
   verdictCtx?: { forced?: boolean },
 ): Promise<MutationOutcome> {
-  const outcome = await withExistingMailboxSession(t.agentGroupId, t.sessionId, (mailbox) => {
-    const live = mailbox.getLiveTaskRow(t.seriesId);
-    // No live row, a DIFFERENT one, or the SAME one rewritten underneath us.
-    // The id alone would miss the third: admission mutates a row in place, so
-    // a concurrent run-now flips `trigger` and moves `process_after` while the
-    // id and the status stay put. `approvedRowChanged` is shared with the
-    // board move, which needs the same proof for the same reason.
-    const changed = live ? approvedRowChanged(t.live, live) : 'row';
-    if (!live || changed) {
-      log.warn('scheduled-mutations: the approved row is no longer the one to act on — refusing', {
-        verb,
-        seriesId: t.seriesId,
-        approvedRowId: t.live.id,
-        liveRowId: live?.id ?? null,
-        field: changed,
+  // The re-proof and the write are ONE synchronous block under the central
+  // lease (`withCentralSync`): the quiet-mark invalidation inside it is a raw
+  // central write (seam 3 §4.5 I-1), and nothing yields between the verdict
+  // and the statement it protects.
+  const outcome = await withExistingMailboxSession(t.agentGroupId, t.sessionId, (mailbox) =>
+    withCentralSync(() => {
+      const live = mailbox.getLiveTaskRow(t.seriesId);
+      // No live row, a DIFFERENT one, or the SAME one rewritten underneath us.
+      // The id alone would miss the third: admission mutates a row in place, so
+      // a concurrent run-now flips `trigger` and moves `process_after` while the
+      // id and the status stay put. `approvedRowChanged` is shared with the
+      // board move, which needs the same proof for the same reason.
+      const changed = live ? approvedRowChanged(t.live, live) : 'row';
+      if (!live || changed) {
+        log.warn('scheduled-mutations: the approved row is no longer the one to act on — refusing', {
+          verb,
+          seriesId: t.seriesId,
+          approvedRowId: t.live.id,
+          liveRowId: live?.id ?? null,
+          field: changed,
+        });
+        return { refused: json({ error: 'stale_key', reason: 'stale_key' }, 409) };
+      }
+
+      // Fail-closed exactly as the preflight does: `getProcessingClaimRows`
+      // degrades to empty only when outbound.db is genuinely absent, and throws
+      // when it is present but unopenable. That throw is "unreadable", not
+      // "unclaimed" (F6), and the verdict decides what to do about it.
+      let claim: { claimed: boolean; outboundReadable: boolean };
+      try {
+        claim = {
+          claimed: mailbox.getProcessingClaimRows().some((c) => c.message_id === live.id),
+          outboundReadable: true,
+        };
+      } catch {
+        claim = { claimed: false, outboundReadable: false };
+      }
+      const { claimed } = claim;
+
+      const fresh = gateStateFor(live, claimed, claim.outboundReadable, nowMs);
+      const verdict = verbVerdict(verb, {
+        state: fresh.health,
+        kind: fresh.kind,
+        claimed,
+        processAfterMs: fresh.processAfterMs,
+        nowMs,
+        ...(verdictCtx?.forced === undefined ? {} : { forced: verdictCtx.forced }),
       });
-      return { refused: json({ error: 'stale_key', reason: 'stale_key' }, 409) };
-    }
+      if (!verdict.allowed) {
+        log.warn('scheduled-mutations: the approved verdict no longer holds — refusing', {
+          verb,
+          seriesId: t.seriesId,
+          rowId: live.id,
+          was: t.health,
+          now: fresh.health,
+          reason: verdict.reason,
+        });
+        return { refused: verdictResponse(verdict) };
+      }
 
-    // Fail-closed exactly as the preflight does: `getProcessingClaimRows`
-    // degrades to empty only when outbound.db is genuinely absent, and throws
-    // when it is present but unopenable. That throw is "unreadable", not
-    // "unclaimed" (F6), and the verdict decides what to do about it.
-    let claim: { claimed: boolean; outboundReadable: boolean };
-    try {
-      claim = {
-        claimed: mailbox.getProcessingClaimRows().some((c) => c.message_id === live.id),
-        outboundReadable: true,
-      };
-    } catch {
-      claim = { claimed: false, outboundReadable: false };
-    }
-    const { claimed } = claim;
-
-    const fresh = gateStateFor(live, claimed, claim.outboundReadable, nowMs);
-    const verdict = verbVerdict(verb, {
-      state: fresh.health,
-      kind: fresh.kind,
-      claimed,
-      processAfterMs: fresh.processAfterMs,
-      nowMs,
-      ...(verdictCtx?.forced === undefined ? {} : { forced: verdictCtx.forced }),
-    });
-    if (!verdict.allowed) {
-      log.warn('scheduled-mutations: the approved verdict no longer holds — refusing', {
-        verb,
-        seriesId: t.seriesId,
-        rowId: live.id,
-        was: t.health,
-        now: fresh.health,
-        reason: verdict.reason,
-      });
-      return { refused: verdictResponse(verdict) };
-    }
-
-    // The quiet-mark invalidation sits HERE: inside the session, after the
-    // re-proof above, in the same synchronous turn as the statement it
-    // protects. Outside the callback, `withExistingMailboxSession`'s await
-    // would sit between the invalidation and the row (Codex round 3, H1), and
-    // ahead of the re-proof it would charge a session whose verdict then
-    // refuses. It throws `QuietInvalidationError`, which
-    // `mutateWithInvalidation` maps to the 503 this surface owes.
-    return { touched: withQuietInvalidationSync(t.sessionId, () => action(mailbox)) };
-  });
+      // The quiet-mark invalidation sits HERE: inside the session, after the
+      // re-proof above, in the same synchronous turn as the statement it
+      // protects. Outside the callback, `withExistingMailboxSession`'s await
+      // would sit between the invalidation and the row (Codex round 3, H1), and
+      // ahead of the re-proof it would charge a session whose verdict then
+      // refuses. It throws `QuietInvalidationError`, which
+      // `mutateWithInvalidation` maps to the 503 this surface owes.
+      return { touched: withQuietInvalidationSync(t.sessionId, () => action(mailbox)) };
+    }, `scheduled ${verb}`),
+  );
   return outcome ?? { touched: 0 };
 }
 
@@ -439,7 +437,7 @@ export const editHandler: AuthHandler = async (req, params, ctx) => {
     return json({ error: 'invalid_request' }, 400);
   }
 
-  const r = resolveTarget(params['key'] ?? '', ctx, nowMs, dataDir);
+  const r = await resolveTarget(params['key'] ?? '', ctx, nowMs, dataDir);
   if ('error' in r) return r.error;
   const t = r.ok;
 
@@ -494,7 +492,7 @@ export const editHandler: AuthHandler = async (req, params, ctx) => {
   if ('refused' in outcome) return outcome.refused;
   if (outcome.touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
 
-  writeAudit(getRawDb(), {
+  await writeAudit({
     actor: ctx.user.id,
     action: 'edit',
     agentGroupId: t.agentGroupId,
@@ -513,7 +511,7 @@ export const editHandler: AuthHandler = async (req, params, ctx) => {
 
 export const pauseHandler: AuthHandler = async (_req, params, ctx) => {
   const { dataDir, nowMs } = mutationOpts();
-  const r = resolveTarget(params['key'] ?? '', ctx, nowMs, dataDir);
+  const r = await resolveTarget(params['key'] ?? '', ctx, nowMs, dataDir);
   if ('error' in r) return r.error;
   const t = r.ok;
 
@@ -530,7 +528,7 @@ export const pauseHandler: AuthHandler = async (_req, params, ctx) => {
   if ('refused' in outcome) return outcome.refused;
   if (outcome.touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
 
-  writeAudit(getRawDb(), {
+  await writeAudit({
     actor: ctx.user.id,
     action: 'pause',
     agentGroupId: t.agentGroupId,
@@ -543,7 +541,7 @@ export const pauseHandler: AuthHandler = async (_req, params, ctx) => {
 
 export const resumeHandler: AuthHandler = async (_req, params, ctx) => {
   const { dataDir, nowMs } = mutationOpts();
-  const r = resolveTarget(params['key'] ?? '', ctx, nowMs, dataDir);
+  const r = await resolveTarget(params['key'] ?? '', ctx, nowMs, dataDir);
   if ('error' in r) return r.error;
   const t = r.ok;
 
@@ -573,7 +571,7 @@ export const resumeHandler: AuthHandler = async (_req, params, ctx) => {
   if ('refused' in outcome) return outcome.refused;
   if (outcome.touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
 
-  writeAudit(getRawDb(), {
+  await writeAudit({
     actor: ctx.user.id,
     action: 'resume',
     agentGroupId: t.agentGroupId,
@@ -595,7 +593,7 @@ export const runNowHandler: AuthHandler = async (req, params, ctx) => {
     /* no body — force defaults false */
   }
 
-  const r = resolveTarget(params['key'] ?? '', ctx, nowMs, dataDir);
+  const r = await resolveTarget(params['key'] ?? '', ctx, nowMs, dataDir);
   if ('error' in r) return r.error;
   const t = r.ok;
 
@@ -664,7 +662,7 @@ export const runNowHandler: AuthHandler = async (req, params, ctx) => {
     );
   }
 
-  writeAudit(getRawDb(), {
+  await writeAudit({
     actor: ctx.user.id,
     action: 'run_now',
     agentGroupId: t.agentGroupId,
@@ -687,7 +685,7 @@ export const cancelHandler: AuthHandler = async (_req, params, ctx) => {
   // cancelSeriesWithStrandClear, whose touched-count includes terminal clears.
   const decoded = decodeKey(params['key'] ?? '');
   if (!decoded) return json({ error: 'bad_key' }, 400);
-  if (!canManageScheduled(ctx.user.id)) return json({ error: 'not_found' }, 404);
+  if (!(await canManageScheduled(ctx.user.id))) return json({ error: 'not_found' }, 404);
   if (!ctx.scopes.no_filter && !ctx.scopes.allowed_group_ids.includes(decoded.agentGroupId)) {
     return json({ error: 'not_found' }, 404);
   }
@@ -703,7 +701,11 @@ export const cancelHandler: AuthHandler = async (_req, params, ctx) => {
   try {
     touched =
       (await withExistingMailboxSession(decoded.agentGroupId, decoded.sessionId, (mailbox) =>
-        withQuietInvalidationSync(decoded.sessionId, () => mailbox.cancelSeriesWithStrandClear(decoded.seriesId)),
+        withCentralSync(
+          () =>
+            withQuietInvalidationSync(decoded.sessionId, () => mailbox.cancelSeriesWithStrandClear(decoded.seriesId)),
+          'scheduled cancel',
+        ),
       )) ?? 0;
   } catch (err) {
     const refused = quietRefusal(decoded.sessionId, err);
@@ -714,7 +716,7 @@ export const cancelHandler: AuthHandler = async (_req, params, ctx) => {
   // touched 0 → nothing live AND no terminal recurrence to clear → stale key.
   if (touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
 
-  writeAudit(getRawDb(), {
+  await writeAudit({
     actor: ctx.user.id,
     action: 'cancel',
     agentGroupId: decoded.agentGroupId,

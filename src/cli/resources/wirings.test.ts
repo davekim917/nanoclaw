@@ -237,7 +237,7 @@ describe('wirings-update — same validation as create', () => {
   it('allows unrelated updates to a legacy pattern row with NULL engage_pattern', async () => {
     // Rows created on main before engage_pattern defaults existed: pattern
     // mode + NULL pattern, which the router evaluates as match-all.
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       id: 'mga-legacy',
       messaging_group_id: 'mg-stale',
       agent_group_id: 'ag-1',
@@ -274,7 +274,7 @@ describe('wirings-update — same validation as create', () => {
     // mode='mention' with a pattern already stored (harmless — the pattern
     // column is simply unused while mode isn't 'pattern') on an undeclared
     // channel, so no adapter-declaration logic complicates the race.
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       id: 'mga-race',
       messaging_group_id: 'mg-stale',
       agent_group_id: 'ag-1',
@@ -312,7 +312,7 @@ describe('wirings-update — same validation as create', () => {
     // Whichever update landed, the persisted row is a combination the same
     // validator accepts — re-running it must not throw.
     const persisted = (await getMessagingGroupAgent('mga-race'))!;
-    const mg = getMessagingGroup('mg-stale')!;
+    const mg = (await getMessagingGroup('mg-stale'))!;
     expect(() =>
       validateEngageAgainstChannel(
         { engage_mode: persisted.engage_mode, engage_pattern: persisted.engage_pattern, threads: persisted.threads },

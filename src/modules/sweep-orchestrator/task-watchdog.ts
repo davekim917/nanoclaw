@@ -6,7 +6,7 @@
  * split S2-PR4 used for steer-idempotency.ts.
  *
  * DORMANT: no agent group holds the `orchestrator` capability (parked
- * 2026-08-11 — src/modules/orchestrator-dispatch/index.ts), so `getActiveTasks()`
+ * 2026-08-11 — src/modules/orchestrator-dispatch/index.ts), so `await getActiveTasks()`
  * returns nothing in production and this duty is a no-op.
  */
 import { randomUUID } from 'crypto';
@@ -34,7 +34,7 @@ const ACTION_TO_FAIL_REASON: Record<string, string> = {
 export async function sweepTaskWatchdog(): Promise<void> {
   let tasks;
   try {
-    tasks = getActiveTasks();
+    tasks = await getActiveTasks();
   } catch (err) {
     log.error('Task watchdog: failed to load active tasks', { err });
     return;
@@ -97,7 +97,7 @@ export async function sweepTaskWatchdog(): Promise<void> {
       if (!(decision.action in ACTION_TO_FAIL_REASON)) {
         log.warn('Task watchdog: unknown action, using raw value as fail_reason', { action: decision.action });
       }
-      const transitioned = transitionToTerminal(task.task_id, 'failed', {
+      const transitioned = await transitionToTerminal(task.task_id, 'failed', {
         fail_reason: failReason,
         failed_at: nowIso,
       });

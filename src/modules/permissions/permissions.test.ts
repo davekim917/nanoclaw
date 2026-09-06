@@ -5,6 +5,7 @@
  */
 import { beforeEach, afterEach, describe, expect, it } from 'vitest';
 
+import { withCentralSync } from '../../db/central-lease.js';
 import type { ChannelAdapter, OutboundMessage } from '../../channels/adapter.js';
 import { registerSlackBot } from '../../channels/slack-mentions.js';
 import {
@@ -144,7 +145,7 @@ describe('canAccessAgentGroup', () => {
   it('admin @ group is implicitly a member', async () => {
     await seedUser('u-sa', 'telegram');
     await grantRole({ user_id: 'u-sa', role: 'admin', agent_group_id: 'ag-1', granted_by: null, granted_at: now() });
-    expect(isMember('u-sa', 'ag-1')).toBe(true);
+    expect(await withCentralSync(() => isMember('u-sa', 'ag-1'), 'test')).toBe(true);
   });
 
   it('allows members of the group', async () => {
@@ -215,8 +216,8 @@ describe('role helpers', () => {
     registerSlackBot('slack-authz-codex', siblingIdentity);
     registerSlackBot('slack-authz-other', otherIdentity);
     try {
-      expect(isOwner(siblingUser)).toBe(true);
-      expect(isOwner(otherWorkspaceUser)).toBe(false);
+      expect(await withCentralSync(() => isOwner(siblingUser), 'test')).toBe(true);
+      expect(await withCentralSync(() => isOwner(otherWorkspaceUser), 'test')).toBe(false);
     } finally {
       // The Slack registry is process-global. Keep later tests isolated.
       registerSlackBot('slack-authz-base', { ...baseIdentity, teamId: '__cleared__' });
@@ -247,7 +248,7 @@ describe('role helpers', () => {
     expect(await hasAnyOwner()).toBe(false);
     await grantRole({ user_id: 'u-1', role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });
     expect(await hasAnyOwner()).toBe(true);
-    expect(isOwner('u-1')).toBe(true);
+    expect(await withCentralSync(() => isOwner('u-1'), 'test')).toBe(true);
   });
 });
 
@@ -304,7 +305,7 @@ describe('ensureUserDm', () => {
     expect(mg).toBeDefined();
     // Read the row back: createMessagingGroup defaults an unset instance to
     // the channel type, so the persisted value is what matters.
-    const row = getMessagingGroup(mg!.id);
+    const row = await getMessagingGroup(mg!.id);
     expect(row?.instance).toBe('slack-labs');
   });
 
@@ -316,7 +317,7 @@ describe('ensureUserDm', () => {
     await seedUser('slack:U-owner', 'slack');
 
     const mg = await ensureUserDm('slack:U-owner');
-    expect(getMessagingGroup(mg!.id)?.instance).toBe('slack');
+    expect((await getMessagingGroup(mg!.id))?.instance).toBe('slack');
   });
 
   it('does not reuse a sibling instance row for the same platform_id', async () => {
@@ -340,7 +341,7 @@ describe('ensureUserDm', () => {
 
     const mg = await ensureUserDm('telegram:U-owner', { instance: 'telegram-bot-a' });
     expect(mg!.id).not.toBe('mg-sibling');
-    expect(getMessagingGroup(mg!.id)?.instance).toBe('telegram-bot-a');
+    expect((await getMessagingGroup(mg!.id))?.instance).toBe('telegram-bot-a');
   });
 
   // Codex round 1 on #465: the (user_id, channel_type) cache key ignores
@@ -355,13 +356,13 @@ describe('ensureUserDm', () => {
     // Cache the user's DM on instance B first (e.g. an earlier approval on
     // that workspace/bot).
     const mgB = await ensureUserDm('slack:U-owner', { instance: 'slack-bot-b' });
-    expect(getMessagingGroup(mgB!.id)?.instance).toBe('slack-bot-b');
+    expect((await getMessagingGroup(mgB!.id))?.instance).toBe('slack-bot-b');
 
     // A caller asking for instance A must NOT receive B's cached row — it
     // must re-resolve and land on A's own row.
     const mgA = await ensureUserDm('slack:U-owner', { instance: 'slack-bot-a' });
     expect(mgA!.id).not.toBe(mgB!.id);
-    expect(getMessagingGroup(mgA!.id)?.instance).toBe('slack-bot-a');
+    expect((await getMessagingGroup(mgA!.id))?.instance).toBe('slack-bot-a');
     expect(mockA.openDMCalls).toEqual(['U-owner']);
   });
 
@@ -374,7 +375,7 @@ describe('ensureUserDm', () => {
     await seedUser('slack:U-owner', 'slack');
 
     const mgB = await ensureUserDm('slack:U-owner', { instance: 'slack-bot-b' });
-    expect(getMessagingGroup(mgB!.id)?.instance).toBe('slack-bot-b');
+    expect((await getMessagingGroup(mgB!.id))?.instance).toBe('slack-bot-b');
 
     const mgAgain = await ensureUserDm('slack:U-owner');
     expect(mgAgain!.id).toBe(mgB!.id);

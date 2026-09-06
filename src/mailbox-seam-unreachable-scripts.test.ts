@@ -723,6 +723,10 @@ describe('storage-manager.ts / storage-activity.ts contain no literal seam call'
       'src/config.ts': ['CONTAINER_IMAGE', 'CONTAINER_IMAGE_BASE', 'CONTAINER_INSTALL_LABEL', 'DATA_DIR'],
       'src/container-mounts.ts': ['runningContainerMounts as inspectRunningContainerMounts'],
       'src/container-runtime.ts': ['CONTAINER_RUNTIME_BIN'],
+      // Seam 3 PR 6: the host-side boot finisher takes the central lease; the
+      // `type RawStatements` specifier is inline type-only and contributes no
+      // runtime binding.
+      'src/db/central-lease.ts': ['withCentralSync', 'withRawDb'],
       'src/db/connection.ts': ['getRawDb'],
       // Seam 3 PR 4 moved this off the async driver's getAllContainerConfigs
       // to a raw, synchronous prepare — see the doc comment at the call site
@@ -800,7 +804,10 @@ describe('worktree-cleanup.ts contains no literal seam call, and the only contai
       'src/config.ts': ['DATA_DIR', 'GROUPS_DIR'],
       'src/container-mounts.ts': ['runningContainerMounts'],
       'src/container-runner.ts': ['isContainerRunning', 'isContainerSpawning'],
-      'src/db/connection.ts': ['getRawDb'],
+      // Seam 3 PR 6 (#460 round 4): the session inventory reads through the
+      // central lease — this module runs on the host from the onHostStart
+      // timer, so its raw SELECT can no longer land in a suspended transaction.
+      'src/db/central-lease.ts': ['withCentralSync', 'withRawDb'],
       'src/host-lifecycle.ts': ['onHostShutdown', 'onHostStart'],
       'src/log.ts': ['log'],
       // PR 7 moved this file's outbound read onto the seam, and the manifest

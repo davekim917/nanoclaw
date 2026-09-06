@@ -113,7 +113,7 @@ describe('dashboardTokenIssue', () => {
   it('test_dashboardTokenIssue_inserts_hmac_row', async () => {
     const deliverMock = vi.fn().mockResolvedValue('msg-id');
     vi.mocked(getDeliveryAdapter).mockReturnValue({ deliver: deliverMock } as never);
-    vi.mocked(getMessagingGroup).mockReturnValue(makeSlackMg());
+    vi.mocked(getMessagingGroup).mockResolvedValue(makeSlackMg());
     vi.mocked(issueDashboardToken).mockResolvedValue({
       id: 1,
       user_id: 'u1',
@@ -154,7 +154,7 @@ describe('dashboardTokenIssue', () => {
   it('test_dashboardTokenIssue_reply_text_contains_url', async () => {
     const deliverMock = vi.fn().mockResolvedValue('msg-id');
     vi.mocked(getDeliveryAdapter).mockReturnValue({ deliver: deliverMock } as never);
-    vi.mocked(getMessagingGroup).mockReturnValue(makeSlackMg());
+    vi.mocked(getMessagingGroup).mockResolvedValue(makeSlackMg());
     vi.mocked(issueDashboardToken).mockResolvedValue({
       id: 1,
       user_id: 'u1',
@@ -177,7 +177,7 @@ describe('dashboardTokenIssue', () => {
   it('test_dashboardTokenIssue_token_entropy', async () => {
     const deliverMock = vi.fn().mockResolvedValue('msg-id');
     vi.mocked(getDeliveryAdapter).mockReturnValue({ deliver: deliverMock } as never);
-    vi.mocked(getMessagingGroup).mockReturnValue(makeSlackMg());
+    vi.mocked(getMessagingGroup).mockResolvedValue(makeSlackMg());
     vi.mocked(issueDashboardToken).mockResolvedValue({
       id: 1,
       user_id: 'u1',
@@ -203,7 +203,7 @@ describe('dashboardTokenIssue', () => {
   it('test_dashboardTokenIssue_no_messaging_group', async () => {
     const deliverMock = vi.fn();
     vi.mocked(getDeliveryAdapter).mockReturnValue({ deliver: deliverMock } as never);
-    vi.mocked(getMessagingGroup).mockReturnValue(undefined);
+    vi.mocked(getMessagingGroup).mockResolvedValue(undefined);
 
     await dashboardTokenIssue(makeCtx());
 
@@ -215,7 +215,7 @@ describe('dashboardTokenIssue', () => {
   it('test_dashboardTokenIssue_group_routes_link_to_dm_not_channel', async () => {
     const deliverMock = vi.fn().mockResolvedValue('msg-id');
     vi.mocked(getDeliveryAdapter).mockReturnValue({ deliver: deliverMock } as never);
-    vi.mocked(getMessagingGroup).mockReturnValue(makeSlackChannelMg());
+    vi.mocked(getMessagingGroup).mockResolvedValue(makeSlackChannelMg());
     vi.mocked(ensureUserDm).mockResolvedValue(makeSlackDmMg());
     vi.mocked(issueDashboardToken).mockResolvedValue({
       id: 1,
@@ -252,7 +252,7 @@ describe('dashboardTokenIssue', () => {
   it('the refuse-to-mint warn carries no handle when the private path is missing (#480 round 2)', async () => {
     const { log } = await import('../../log.js');
     vi.mocked(log.warn).mockClear();
-    vi.mocked(getMessagingGroup).mockReturnValue(makeSlackChannelMg());
+    vi.mocked(getMessagingGroup).mockResolvedValue(makeSlackChannelMg());
     vi.mocked(ensureUserDm).mockResolvedValue(null);
 
     await dashboardTokenIssue(makeCtx());
@@ -267,7 +267,7 @@ describe('dashboardTokenIssue', () => {
   it('test_dashboardTokenIssue_group_no_dm_path_fails_closed', async () => {
     const deliverMock = vi.fn().mockResolvedValue('msg-id');
     vi.mocked(getDeliveryAdapter).mockReturnValue({ deliver: deliverMock } as never);
-    vi.mocked(getMessagingGroup).mockReturnValue(makeSlackChannelMg());
+    vi.mocked(getMessagingGroup).mockResolvedValue(makeSlackChannelMg());
     vi.mocked(ensureUserDm).mockResolvedValue(null); // platform has no DM capability, or openDM threw
 
     await dashboardTokenIssue(makeCtx());
@@ -292,7 +292,7 @@ describe('dashboardTokenIssue', () => {
     // extra openDM round trip, and must reply in the same conversation.
     const deliverMock = vi.fn().mockResolvedValue('msg-id');
     vi.mocked(getDeliveryAdapter).mockReturnValue({ deliver: deliverMock } as never);
-    vi.mocked(getMessagingGroup).mockReturnValue(makeSlackMg());
+    vi.mocked(getMessagingGroup).mockResolvedValue(makeSlackMg());
     vi.mocked(issueDashboardToken).mockResolvedValue({
       id: 1,
       user_id: 'u1',

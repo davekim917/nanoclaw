@@ -38,6 +38,7 @@ import {
 import type { InboundEvent } from '../../channels/adapter.js';
 import { registerResponseHandler, type ResponsePayload } from '../../response-registry.js';
 import { getDeliveryAdapter } from '../../delivery.js';
+import { withCentralSync } from '../../db/central-lease.js';
 import { guard } from '../../guard/index.js';
 import { log } from '../../log.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent } from '../../types.js';
@@ -54,6 +55,7 @@ import {
 } from './channel-approval.js';
 import { addMember } from './db/agent-group-members.js';
 import {
+  createPendingChannelApproval,
   deletePendingChannelApproval,
   getPendingChannelApproval,
   updatePendingChannelApprovalCard,
@@ -131,9 +133,9 @@ function safeParseContent(raw: string): { text?: string; sender?: string; sender
   }
 }
 
-function completeStoredDeferredInbound(raw: string): void {
+async function completeStoredDeferredInbound(raw: string): Promise<void> {
   try {
-    completeDeferredInbound(JSON.parse(raw) as InboundEvent);
+    await completeDeferredInbound(JSON.parse(raw) as InboundEvent);
   } catch {
     // Malformed legacy approval rows have no recoverable receipt key.
   }
@@ -164,15 +166,21 @@ async function handleUnknownSender(
   // — unknown_sender_policy verbatim: strict → deny, request_approval → hold,
   // decline_notify → deny, public → allow (short-circuited before the gate).
   // Drop-recording, the hold creation and the decline side effects stay here.
-  const decision = guard(sendersAdmit, {
-    actor: userId ? { kind: 'human', userId } : { kind: 'system' },
-    payload: {
-      messagingGroupId: mg.id,
-      agentGroupId,
-      senderIdentity: userId,
-      policy: mg.unknown_sender_policy,
-    },
-  });
+  // Under the central lease: `guard()`'s reads are raw by design (seam 3
+  // §4.5 I-1).
+  const decision = await withCentralSync(
+    () =>
+      guard(sendersAdmit, {
+        actor: userId ? { kind: 'human', userId } : { kind: 'system' },
+        payload: {
+          messagingGroupId: mg.id,
+          agentGroupId,
+          senderIdentity: userId,
+          policy: mg.unknown_sender_policy,
+        },
+      }),
+    'senders.admit guard',
+  );
 
   if (decision.effect === 'allow') return false; // public is handled before this gate.
 
@@ -355,7 +363,9 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
       : `${payload.channelType}:${payload.userId}`
     : null;
   const isAuthorized =
-    clickerId !== null && (clickerId === row.approver_user_id || hasAdminPrivilege(clickerId, row.agent_group_id));
+    clickerId !== null &&
+    (clickerId === row.approver_user_id ||
+      (await withCentralSync(() => hasAdminPrivilege(clickerId, row.agent_group_id), 'sender approval click')));
   if (!isAuthorized) {
     log.warn('Unknown-sender approval click rejected — unauthorized clicker', {
       approvalId: row.id,
@@ -377,7 +387,7 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
   // promises there is no approval path, so an admin approving an outstanding
   // card there is a legitimate explicit grant, and that behavior predates
   // this policy.
-  const currentMg = getMessagingGroup(row.messaging_group_id);
+  const currentMg = await getMessagingGroup(row.messaging_group_id);
   const voidedByPolicyFlip = currentMg?.unknown_sender_policy === 'decline_notify';
 
   // ── Claim the card before acting on it (issue #443, Codex round 1) ──
@@ -419,7 +429,7 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
     // Void the card the same way a deny does: the row (and with it the
     // retained message body) is already dropped by the claim above; close out
     // the deferred inbound so it does not sit unresolved.
-    completeStoredDeferredInbound(row.original_message);
+    await completeStoredDeferredInbound(row.original_message);
     return true;
   }
 
@@ -478,7 +488,7 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
     agentGroupId: row.agent_group_id,
     approverId,
   });
-  completeStoredDeferredInbound(row.original_message);
+  await completeStoredDeferredInbound(row.original_message);
   return true;
 }
 
@@ -533,7 +543,7 @@ async function wireApprovedChannel(
     return false;
   }
 
-  const mg = getMessagingGroup(row.messaging_group_id);
+  const mg = await getMessagingGroup(row.messaging_group_id);
   const isGroup = event.message.isGroup ?? mg?.is_group === 1;
   const agentGroupName = (await getAgentGroup(agentGroupId))?.name ?? '';
 
@@ -552,11 +562,58 @@ async function wireApprovedChannel(
       messagingGroupId: row.messaging_group_id,
       err,
     });
-    completeDeferredInbound(event);
+    await completeDeferredInbound(event);
     return false;
   }
 
+  // Everything from here to the member write runs with the card already
+  // claimed (deleted) and the retained inbound still deferred. A failure in
+  // this stretch used to lose the retry path: no card, no wiring, a receipt
+  // nothing would ever complete (fork issue #452, site 2). The claim stays a
+  // DELETE — it is the arbiter between duplicate callbacks — so the recovery
+  // is to put the full row BACK on failure: the next click (or the retained
+  // inbound's own retry) finds the card exactly as it was.
   const mgaId = `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    await wireAndAdmit(row, agentGroupId, approverId, engage, mgaId, event);
+  } catch (err) {
+    const restored = await createPendingChannelApproval(row).catch((restoreErr: unknown) => {
+      log.error('Channel registration: wiring failed AND the pending card could not be restored', {
+        messagingGroupId: row.messaging_group_id,
+        err,
+        restoreErr,
+      });
+      return false;
+    });
+    log.error('Channel registration: wiring failed after the card was claimed — card restored for retry', {
+      messagingGroupId: row.messaging_group_id,
+      agentGroupId,
+      restored,
+      err,
+    });
+    throw err;
+  }
+
+  try {
+    await replayDeferredInbound(event);
+  } catch (err) {
+    log.error('Failed to replay message after channel approval', {
+      messagingGroupId: row.messaging_group_id,
+      err,
+    });
+  }
+  return true;
+}
+
+/** The central writes of an approved channel registration: wiring row + sender membership. */
+async function wireAndAdmit(
+  row: PendingChannelApproval,
+  agentGroupId: string,
+  approverId: string,
+  engage: { engage_mode: MessagingGroupAgent['engage_mode']; engage_pattern: string | null },
+  mgaId: string,
+  event: InboundEvent,
+): Promise<void> {
   const wiring: MessagingGroupAgent = {
     id: mgaId,
     messaging_group_id: row.messaging_group_id,
@@ -583,7 +640,7 @@ async function wireApprovedChannel(
   await insertOrAdopt(
     wiring,
     async (candidate) => {
-      createMessagingGroupAgent(candidate);
+      await createMessagingGroupAgent(candidate);
     },
     async () => (await getMessagingGroupAgents(row.messaging_group_id)).find((w) => w.agent_group_id === agentGroupId),
   );
@@ -604,16 +661,6 @@ async function wireApprovedChannel(
       added_at: new Date().toISOString(),
     });
   }
-
-  try {
-    await replayDeferredInbound(event);
-  } catch (err) {
-    log.error('Failed to replay message after channel approval', {
-      messagingGroupId: row.messaging_group_id,
-      err,
-    });
-  }
-  return true;
 }
 
 /**
@@ -631,14 +678,14 @@ async function wireApprovedChannel(
  *   reject          — set denied_at, delete pending row
  */
 async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<boolean> {
-  const row = getPendingChannelApproval(payload.questionId);
+  const row = await withCentralSync(() => getPendingChannelApproval(payload.questionId), 'pending approval read');
   if (!row) return false;
 
   // Origin conversation's adapter instance — threaded into ensureUserDm below
   // so the follow-up card / name prompt lands on the SAME sibling bot's DM
   // the registration card itself was delivered on, instead of falling back
   // to whichever adapter the bare channel_type happens to resolve.
-  const originMg = getMessagingGroup(row.messaging_group_id);
+  const originMg = await getMessagingGroup(row.messaging_group_id);
 
   // Click authorization is the guard's channels.register decision (./guard.ts):
   // the delivered approver, or an admin of the pending row's anchor agent group.
@@ -647,10 +694,14 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
       ? payload.userId
       : `${payload.channelType}:${payload.userId}`
     : null;
-  const decision = guard(channelsRegister, {
-    actor: { kind: 'human', userId: clickerId ?? '' },
-    payload: { questionId: payload.questionId },
-  });
+  const decision = await withCentralSync(
+    () =>
+      guard(channelsRegister, {
+        actor: { kind: 'human', userId: clickerId ?? '' },
+        payload: { questionId: payload.questionId },
+      }),
+    'channels.register guard',
+  );
   if (!clickerId || decision.effect !== 'allow') {
     log.warn('Channel registration click rejected — unauthorized clicker', {
       messagingGroupId: row.messaging_group_id,
@@ -670,7 +721,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
     // NOT claim — they leave the card live for a second click by design.
     if (!(await deletePendingChannelApproval(row.messaging_group_id))) return true;
     await setMessagingGroupDeniedAt(row.messaging_group_id, new Date().toISOString());
-    completeStoredDeferredInbound(row.original_message);
+    await completeStoredDeferredInbound(row.original_message);
     log.info('Channel registration denied', {
       messagingGroupId: row.messaging_group_id,
       approverId,
@@ -693,7 +744,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
     if (!adapter) return true;
 
     const agentGroups = await getAllAgentGroups();
-    const options = buildAgentSelectionOptions(agentGroups, approverId);
+    const options = await buildAgentSelectionOptions(agentGroups, approverId);
     const title = '📋 Choose an agent';
     const question = `Which agent should handle this channel? ${AGENT_ACCESS_SCOPE_WARNING}`;
     await updatePendingChannelApprovalCard(row.messaging_group_id, title, question, JSON.stringify(options));
@@ -785,10 +836,10 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
         targetAgentGroupId,
       });
       await deletePendingChannelApproval(row.messaging_group_id);
-      completeStoredDeferredInbound(row.original_message);
+      await completeStoredDeferredInbound(row.original_message);
       return true;
     }
-    if (!hasAdminPrivilege(approverId, targetAgentGroupId)) {
+    if (!(await withCentralSync(() => hasAdminPrivilege(approverId, targetAgentGroupId), 'channel approval target'))) {
       log.warn('Channel registration: target agent group rejected for unauthorized approver', {
         messagingGroupId: row.messaging_group_id,
         targetAgentGroupId,
@@ -844,13 +895,13 @@ registerMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
     return true;
   }
 
-  const row = getPendingChannelApproval(pending.channelMgId);
+  const row = await withCentralSync(() => getPendingChannelApproval(pending.channelMgId), 'pending approval read');
   if (!row) return true;
 
   // Origin instance for the follow-up notifications below, same reasoning as
   // handleChannelApprovalResponse: keep every reply to this approver on the
   // sibling bot the registration started on.
-  const originMg = getMessagingGroup(row.messaging_group_id);
+  const originMg = await getMessagingGroup(row.messaging_group_id);
 
   // `awaitingNameInput` is already deleted by here, so a throw out of this
   // interceptor would strand the approver with no card, no agent, and no

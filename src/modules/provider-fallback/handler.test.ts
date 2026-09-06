@@ -66,11 +66,11 @@ describe('provider_unavailable handler', () => {
       { action: 'provider_unavailable', provider: 'codex', message: QUOTA_MESSAGE },
       session,
     );
-    expect(isProviderUnavailable(GID, 'codex')).toBe(true);
+    expect(await isProviderUnavailable(GID, 'codex')).toBe(true);
     // The stated reset parsed, but it is only an upper bound: the retry lands
     // on the backoff schedule so an early account restore is discovered
     // quickly instead of waiting out the quoted date.
-    const row = getProviderHealth(GID, 'codex');
+    const row = await getProviderHealth(GID, 'codex');
     const windowMs = Date.parse(row!.unavailable_until as string) - Date.now();
     expect(windowMs).toBeGreaterThan(14 * 60_000);
     expect(windowMs).toBeLessThanOrEqual(15 * 60_000);
@@ -81,31 +81,31 @@ describe('provider_unavailable handler', () => {
   it('does nothing when the group declares no fallback — the outage stays loud', async () => {
     writeConfig({ provider: 'codex' });
     await handleProviderUnavailable({ provider: 'codex', message: QUOTA_MESSAGE }, session);
-    expect(isProviderUnavailable(GID, 'codex')).toBe(false);
+    expect(await isProviderUnavailable(GID, 'codex')).toBe(false);
     expect(killed).toHaveLength(0);
   });
 
   it('does not respawn when the fallback is exhausted too — no bounce loop', async () => {
     writeConfig({ provider: 'codex', providerFallback: { provider: 'claude' } });
     // The fallback died first (this container was already running on it).
-    markProviderUnavailable(GID, 'claude', 'quota', {});
+    await markProviderUnavailable(GID, 'claude', 'quota', {});
     await handleProviderUnavailable({ provider: 'codex', message: QUOTA_MESSAGE }, session);
-    expect(isProviderUnavailable(GID, 'codex')).toBe(true);
+    expect(await isProviderUnavailable(GID, 'codex')).toBe(true);
     expect(killed).toHaveLength(0);
   });
 
   it('ignores a report with no provider', async () => {
     writeConfig({ provider: 'codex', providerFallback: { provider: 'claude' } });
     await handleProviderUnavailable({ message: QUOTA_MESSAGE }, session);
-    expect(getProviderHealth(GID, 'codex')).toBeUndefined();
+    expect(await getProviderHealth(GID, 'codex')).toBeUndefined();
     expect(killed).toHaveLength(0);
   });
 
   it('falls back to backoff when the provider states no reset time', async () => {
     writeConfig({ provider: 'codex', providerFallback: { provider: 'claude' } });
     await handleProviderUnavailable({ provider: 'codex', message: 'usage limit reached' }, session);
-    const row = getProviderHealth(GID, 'codex');
+    const row = await getProviderHealth(GID, 'codex');
     expect(row?.consecutive_failures).toBe(1);
-    expect(isProviderUnavailable(GID, 'codex')).toBe(true);
+    expect(await isProviderUnavailable(GID, 'codex')).toBe(true);
   });
 });

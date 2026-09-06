@@ -45,6 +45,7 @@
  * Once the row exists, delivery failures leave it available for dashboard or
  * manual review; only failures before persistence return without a row.
  */
+import { withCentralSync } from '../../db/central-lease.js';
 import { normalizeOptions, type NormalizedOption, type RawOption } from '../../channels/ask-question.js';
 import { resolveWiringDefaults } from '../../channels/channel-defaults.js';
 import { createAgentGroup, getAgentGroup, getAgentGroupByFolder, getAllAgentGroups } from '../../db/agent-groups.js';
@@ -129,13 +130,16 @@ function toFolder(name: string): string {
 function visibleAgentGroupsForApprover(
   agentGroups: AgentGroup[],
   approverUserId: string | null | undefined,
-): AgentGroup[] {
-  if (!approverUserId) return agentGroups;
-  return agentGroups.filter((agentGroup) => hasAdminPrivilege(approverUserId, agentGroup.id));
+): Promise<AgentGroup[]> {
+  if (!approverUserId) return Promise.resolve(agentGroups);
+  return withCentralSync(
+    () => agentGroups.filter((agentGroup) => hasAdminPrivilege(approverUserId, agentGroup.id)),
+    'approver visibility',
+  );
 }
 
-function buildApprovalOptions(agentGroups: AgentGroup[], approverUserId?: string | null): RawOption[] {
-  const visibleAgentGroups = visibleAgentGroupsForApprover(agentGroups, approverUserId);
+async function buildApprovalOptions(agentGroups: AgentGroup[], approverUserId?: string | null): Promise<RawOption[]> {
+  const visibleAgentGroups = await visibleAgentGroupsForApprover(agentGroups, approverUserId);
   const options: RawOption[] = [];
   if (visibleAgentGroups.length === 1) {
     options.push({
@@ -253,7 +257,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
 
   if (await hasInFlightChannelApproval(messagingGroupId)) {
     log.debug('Channel registration already in flight — dropping retry', { messagingGroupId });
-    const existing = getPendingChannelApproval(messagingGroupId);
+    const existing = await withCentralSync(() => getPendingChannelApproval(messagingGroupId), 'pending approval read');
     return existing ? isSameInboundEvent(existing.original_message, event) : false;
   }
 
@@ -261,11 +265,11 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
   // can auto-wire / decline / suppress for its own channel type. Runs after
   // the in-flight dedupe (a pending card already owns this channel) and
   // before the approver checks (an auto-wire needs no reachable approver).
-  // `getMessagingGroup` is synchronous in the fork, so this is a cheap extra
-  // read rather than a reason to hoist the later `originMg` (card text,
-  // instance) up to here — that lookup stays where it is.
+  // `getMessagingGroup` is one awaited driver read (seam 3), so this is a
+  // cheap extra read rather than a reason to hoist the later `originMg` (card
+  // text, instance) up to here — that lookup stays where it is.
   {
-    const interceptMg = getMessagingGroup(messagingGroupId);
+    const interceptMg = await getMessagingGroup(messagingGroupId);
     const interceptor = interceptMg ? channelCardInterceptors.get(interceptMg.channel_type) : undefined;
     if (interceptMg && interceptor) {
       try {
@@ -304,7 +308,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     return false;
   }
 
-  const originMg = getMessagingGroup(messagingGroupId);
+  const originMg = await getMessagingGroup(messagingGroupId);
   const originChannelType = originMg?.channel_type ?? '';
 
   // Classify the conversation once, and reuse it for both the persisted name
@@ -414,7 +418,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     originChannelType,
   );
   const question = buildQuestionText(isGroup, senderName, channelName, originChannelType, ruleNote, conversation);
-  const options = normalizeOptions(buildApprovalOptions(agentGroups, delivery.userId));
+  const options = normalizeOptions(await buildApprovalOptions(agentGroups, delivery.userId));
 
   const created = await createPendingChannelApproval({
     messaging_group_id: messagingGroupId,
@@ -427,7 +431,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     options_json: JSON.stringify(options),
   });
   if (!created) {
-    const raced = getPendingChannelApproval(messagingGroupId);
+    const raced = await withCentralSync(() => getPendingChannelApproval(messagingGroupId), 'pending approval read');
     return raced ? isSameInboundEvent(raced.original_message, event) : false;
   }
 
@@ -473,11 +477,11 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
 /**
  * Build normalized options for the agent-selection follow-up card.
  */
-export function buildAgentSelectionOptions(
+export async function buildAgentSelectionOptions(
   agentGroups: AgentGroup[],
   approverUserId?: string | null,
-): NormalizedOption[] {
-  const visibleAgentGroups = visibleAgentGroupsForApprover(agentGroups, approverUserId);
+): Promise<NormalizedOption[]> {
+  const visibleAgentGroups = await visibleAgentGroupsForApprover(agentGroups, approverUserId);
   const options: RawOption[] = visibleAgentGroups.map((ag) => ({
     label: ag.name,
     selectedLabel: `✅ Connected to ${ag.name}`,

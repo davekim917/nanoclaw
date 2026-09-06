@@ -444,7 +444,7 @@ export const scheduledDetailHandler: AuthHandler = async (_req, params, ctx) => 
   // Audit tail is served ONLY at the mutation tier (owner/global-admin). A
   // read-only in-scope caller never sees the tail (M5 — delta hashes/previews
   // and move provenance stay above the read tier).
-  if (canManageScheduled(ctx.user.id)) {
+  if (await canManageScheduled(ctx.user.id)) {
     body.audit_tail = await readAuditTail(decoded.seriesId);
   }
 

@@ -15,6 +15,7 @@
 import { getContainerConfig } from '../db/container-configs.js';
 import { getAgentGroup } from '../db/agent-groups.js';
 import { getSession } from '../db/sessions.js';
+import { withCentralSync } from '../db/central-lease.js';
 import { guard, type GuardActor } from '../guard/index.js';
 import { log } from '../log.js';
 import { registerApprovalHandler, requestApproval } from '../modules/approvals/index.js';
@@ -105,11 +106,17 @@ export async function dispatch(
     }
   }
 
-  const decision = guard(commandGuard(cmd.name), {
-    actor: actorFor(ctx),
-    payload: req.args,
-    grant: opts.grant ?? null,
-  });
+  // Under the central lease: the guard's reads (cli_scope, a replay's grant
+  // row) are raw by design (seam 3 §4.5 I-1).
+  const decision = await withCentralSync(
+    () =>
+      guard(commandGuard(cmd.name), {
+        actor: actorFor(ctx),
+        payload: req.args,
+        grant: opts.grant ?? null,
+      }),
+    'ncl command guard',
+  );
 
   if (decision.effect === 'deny') {
     return err(req.id, 'forbidden', decision.reason);

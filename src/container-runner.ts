@@ -88,8 +88,8 @@ import {
   getWorkgroupOnecliSecrets,
   getWorkgroupOnecliSecretsById,
 } from './db/agent-groups.js';
-import { getRawDb, hasTableRaw } from './db/connection.js';
-import { centralTransaction } from './db/central-lease.js';
+import { centralTransaction, evaluateGuardSync, withCentralSync, withRawDb } from './db/central-lease.js';
+import { getDb, hasTable } from './db/connection.js';
 import {
   getLiveHostInstance,
   getSessionClaim,
@@ -123,7 +123,6 @@ import {
   WORKGROUP_CONTAINER_PATH,
   WORKGROUP_MEMORY_CONTAINER_PATH,
 } from './modules/workgroup/shared-dirs.js';
-import type Database from 'better-sqlite3';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
 import YAML from 'yaml';
 
@@ -685,22 +684,33 @@ export function sessionStillActive(sessionId: string): WakeGuard {
 
 /**
  * Seam 3 §4.5 I-1: a guard-path read that stays SYNCHRONOUS forever.
- * It executes the sessions leaf's own exported `SESSION_BY_ID_SQL` through the
- * raw handle — one constant, two executors, not a `*Sync` twin of `getSession`
- * (plan docs/specs/upstream-async-central-db-seam/plan.md §4.5). A `WakeGuard`
- * is `() => WakeGuardResult` and is evaluated with nothing awaited between it
- * and the spawn it protects; PR 6 wraps this block in `withCentralSync`.
+ * It executes the sessions leaf's own exported `SESSION_BY_ID_SQL` through
+ * `withRawDb` — one constant, two executors, not a `*Sync` twin of
+ * `getSession` (plan docs/specs/upstream-async-central-db-seam/plan.md §4.5).
+ * A `WakeGuard` is `() => WakeGuardResult` and is evaluated inside a
+ * `withCentralSync` block with nothing awaited between it and the spawn it
+ * protects (`wakeRefusalFrom`'s three call sites); the lease is what keeps
+ * this raw read out of an open driver transaction.
  */
 function readSessionSync(sessionId: string): Session | undefined {
-  return getRawDb().prepare(SESSION_BY_ID_SQL).get(sessionId) as Session | undefined;
+  return withRawDb((raw) => raw.prepare(SESSION_BY_ID_SQL).get(sessionId)) as Session | undefined;
 }
 
-/** Evaluate a wake guard and normalize its answer. */
+/**
+ * Evaluate a wake guard and normalize its answer.
+ *
+ * Called ONLY from inside a `withCentralSync` block. `evaluateGuardSync` is
+ * the runtime half of the guard contract (§4.5 I-1): a guard that hands back a
+ * promise — cast, or accidentally `async` — is a contract violation, not a
+ * verdict, and it is reported as a refusal here so the caller's own refusal
+ * paths (reservation release, storage-lease release) run exactly as for any
+ * other "the guard did not say yes".
+ */
 function wakeRefusalFrom(guard: WakeGuard | undefined): string | null {
   if (!guard) return null;
   let verdict: WakeGuardResult;
   try {
-    verdict = guard();
+    verdict = evaluateGuardSync(guard);
   } catch (err) {
     // A THROWN guard is a refusal, not an exception to propagate.
     //
@@ -867,39 +877,49 @@ export function getStorageProtectedSessionIds(): string[] {
  *
  * The workgroup row is created idempotently before agent_groups is updated.
  */
-export function reconcileWorkgroupAtSpawn(
-  db: Database.Database,
+export async function reconcileWorkgroupAtSpawn(
   agentGroup: Pick<AgentGroup, 'id' | 'folder'>,
   containerConfig: Pick<ContainerConfig, 'workgroup_id'>,
-): { workgroupId: string } {
-  const declared = resolveWorkgroupIdAtSpawn(db, agentGroup, containerConfig);
+): Promise<{ workgroupId: string }> {
+  const declared = await resolveWorkgroupIdAtSpawn(agentGroup, containerConfig);
 
-  return persistResolvedWorkgroupAtSpawn(db, agentGroup, declared);
+  return persistResolvedWorkgroupAtSpawn(agentGroup, declared);
 }
 
-/** Persist the exact workgroup identity already resolved at admission. */
-export function persistResolvedWorkgroupAtSpawn(
-  db: Database.Database,
+/**
+ * Persist the exact workgroup identity already resolved at admission.
+ *
+ * One central transaction (`centralTransaction`, plan §4.4): two driver
+ * statements, awaited in sequence, nothing else inside the closure.
+ */
+export async function persistResolvedWorkgroupAtSpawn(
   agentGroup: Pick<AgentGroup, 'id' | 'folder'>,
   declared: string,
-): { workgroupId: string } {
-  db.transaction(() => {
-    db.prepare(
+): Promise<{ workgroupId: string }> {
+  await centralTransaction(async () => {
+    const db = getDb();
+    await db.run(
       `
       INSERT INTO workgroups (id, display_name, onecli_secrets, created_at)
       VALUES (?, ?, '[]', ?)
       ON CONFLICT(id) DO NOTHING
     `,
-    ).run(declared, declared, new Date().toISOString());
+      declared,
+      declared,
+      new Date().toISOString(),
+    );
 
     // Atomic conditional update: only update if the column is NULL or stale.
-    db.prepare(
+    await db.run(
       `
       UPDATE agent_groups SET workgroup_id = ?
       WHERE id = ? AND (workgroup_id IS NULL OR workgroup_id != ?)
     `,
-    ).run(declared, agentGroup.id, declared);
-  })();
+      declared,
+      agentGroup.id,
+      declared,
+    );
+  }, 'persistResolvedWorkgroupAtSpawn');
 
   // Return the resolved workgroup id so spawnContainer can thread it
   // through every downstream subsystem (buildMounts /workspace/workgroup
@@ -911,15 +931,15 @@ export function persistResolvedWorkgroupAtSpawn(
 }
 
 /** Resolve the exact workgroup identity spawn reconciliation will persist. */
-export function resolveWorkgroupIdAtSpawn(
-  db: Database.Database,
+export async function resolveWorkgroupIdAtSpawn(
   agentGroup: Pick<AgentGroup, 'id' | 'folder'>,
   containerConfig: Pick<ContainerConfig, 'workgroup_id'>,
-): string {
+): Promise<string> {
   if (containerConfig.workgroup_id !== undefined) return containerConfig.workgroup_id;
-  const existing = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ? LIMIT 1').get(agentGroup.id) as
-    | { workgroup_id: string | null }
-    | undefined;
+  const existing = await getDb().get<{ workgroup_id: string | null }>(
+    'SELECT workgroup_id FROM agent_groups WHERE id = ? LIMIT 1',
+    agentGroup.id,
+  );
   return existing?.workgroup_id ?? agentGroup.folder;
 }
 
@@ -1150,8 +1170,9 @@ function startReservedWake(queued: QueuedWake): Promise<boolean> {
     // The caller's own precondition, asked at the dequeue too. The queue wait
     // is unbounded, and the session row being active again says nothing about
     // whether the caller still wants this wake — a thread the operator closed
-    // while it queued, a destination revoked, a task cancelled.
-    const dequeueRefusal = wakeRefusalFrom(guard);
+    // while it queued, a destination revoked, a task cancelled. Under the
+    // lease: the guard's reads are raw (§4.5 I-1).
+    const dequeueRefusal = await withCentralSync(() => wakeRefusalFrom(guard), 'wake guard at dequeue');
     if (dequeueRefusal !== null) {
       log.warn('Queued container wake refused by its guard at the dequeue', {
         sessionId: session.id,
@@ -1264,7 +1285,7 @@ async function spawnReservedContainer(caller: Session, guard?: WakeGuard): Promi
       spawnAgentGroup.folder,
       process.env.NANOCLAW_CONTAINER_SPAWN_WORKGROUP_ALLOWLIST !== undefined,
     );
-    spawnWorkgroupId = resolveWorkgroupIdAtSpawn(getRawDb(), spawnAgentGroup, spawnContainerConfig);
+    spawnWorkgroupId = await resolveWorkgroupIdAtSpawn(spawnAgentGroup, spawnContainerConfig);
   } catch (err) {
     log.warn('Container wake rejected — unable to resolve authoritative spawn configuration', {
       sessionId: session.id,
@@ -1327,7 +1348,8 @@ async function spawnReservedContainer(caller: Session, guard?: WakeGuard): Promi
     // as the last word before `spawn()`. `spawnContainer` builds mounts, writes
     // a capabilities snapshot and clears the heartbeat file; a wake whose
     // caller no longer wants it should not do that work or leave its traces.
-    const earlyGuardRefusal = wakeRefusalFrom(guard);
+    // Under the lease: the guard's reads are raw (§4.5 I-1).
+    const earlyGuardRefusal = await withCentralSync(() => wakeRefusalFrom(guard), 'wake guard before preparation');
     if (earlyGuardRefusal !== null) {
       throw new Error(`Container spawn refused by its guard: ${earlyGuardRefusal}`);
     }
@@ -1349,7 +1371,7 @@ async function acquireContainerStorageActivity(
   admittedWorkgroupId: string,
 ): Promise<StorageActivityLease> {
   const roots = new Set<string>([sessionDir(session.agent_group_id, session.id)]);
-  roots.add(topicWorktreesDir(resolveSessionRepositoryWorkUnit(session, admittedWorkgroupId)));
+  roots.add(topicWorktreesDir(await resolveSessionRepositoryWorkUnit(session, admittedWorkgroupId)));
 
   const leases: StorageActivityLease[] = [];
   try {
@@ -1371,8 +1393,11 @@ async function acquireContainerStorageActivity(
   };
 }
 
-export function resolveSessionRepositoryWorkUnit(session: Session, workgroupId: string): RepositoryWorkUnit {
-  const messagingGroup = session.messaging_group_id ? getMessagingGroup(session.messaging_group_id) : null;
+export async function resolveSessionRepositoryWorkUnit(
+  session: Session,
+  workgroupId: string,
+): Promise<RepositoryWorkUnit> {
+  const messagingGroup = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : null;
   return resolveRepositoryWorkUnit({
     workgroupId,
     sessionId: session.id,
@@ -1452,7 +1477,7 @@ async function spawnContainer(
   // changes take effect on wake. Destinations come from the agent-to-agent
   // module — skip when the module isn't installed (table absent).
   const routingWritesStartedAt = Date.now();
-  if (hasTableRaw(getRawDb(), 'agent_destinations')) {
+  if (await hasTable(getDb(), 'agent_destinations')) {
     const { writeDestinations } = await import('./modules/agent-to-agent/write-destinations.js');
     await writeDestinations(agentGroup.id, session.id);
   }
@@ -1522,10 +1547,10 @@ async function spawnContainer(
   // downstream subsystems so they don't each re-derive from agentGroups,
   // which would race against any concurrent reconcile.
   const workgroupPersistStartedAt = Date.now();
-  const { workgroupId: resolvedWgId } = persistResolvedWorkgroupAtSpawn(getRawDb(), agentGroup, admittedWorkgroupId);
+  const { workgroupId: resolvedWgId } = await persistResolvedWorkgroupAtSpawn(agentGroup, admittedWorkgroupId);
   logSpawnStage('workgroup-persist', workgroupPersistStartedAt);
   const repositoryFenceStartedAt = Date.now();
-  const repositoryWorkUnit = resolveSessionRepositoryWorkUnit(session, resolvedWgId);
+  const repositoryWorkUnit = await resolveSessionRepositoryWorkUnit(session, resolvedWgId);
   if (isWorkgroupRepositoryMountClaimed(resolvedWgId)) {
     throw new Error(`Repository mount reconciliation in progress for ${resolvedWgId}; spawn will retry`);
   }
@@ -1562,7 +1587,10 @@ async function spawnContainer(
     );
   }
 
-  const [memoryReport] = reconcileWorkgroupMemory(getRawDb(), { workgroupIds: [resolvedWgId] });
+  const [memoryReport] = await withCentralSync(
+    () => withRawDb((db) => reconcileWorkgroupMemory(db, { workgroupIds: [resolvedWgId] })),
+    'workgroup memory reconcile at spawn',
+  );
   if (!memoryReport || memoryReport.state.status === 'migration-required') {
     throw new Error(
       `Workgroup memory migration-required for ${resolvedWgId}; refusing container spawn before operator migration`,
@@ -1583,7 +1611,7 @@ async function spawnContainer(
   logSpawnStage('repository-fence', repositoryFenceStartedAt);
 
   const providerDecisionStartedAt = Date.now();
-  const providerDecision = resolveSpawnProvider({
+  const providerDecision = await resolveSpawnProvider({
     agentGroupId: agentGroup.id,
     sessionProvider: session.agent_provider,
     containerConfig,
@@ -1721,77 +1749,28 @@ async function spawnContainer(
     throw new Error(`session ${session.id} is claimed by another live host process — not spawning a duplicate`);
   }
 
-  try {
-    // Clear any orphan heartbeat from a previous container instance — the
-    // sweep's ceiling check treats a missing file as "fresh spawn, give grace"
-    // (host-sweep.ts line 87). Without this, the stale mtime can trigger an
-    // immediate kill before the new container touches the file itself.
-    fs.rmSync(heartbeatPath(agentGroup.id, session.id), { force: true });
-
-    // Admission and container preparation are asynchronous. Shutdown may begin
-    // after wakeContainer's entry check but before the process exists; refuse
-    // that late spawn so stopAllContainers cannot miss it in its snapshot.
-    if (containerShutdownInProgress) {
-      throw new Error('Container spawn cancelled because host shutdown is in progress');
-    }
-    // The LAST word before the process exists. Everything above the claim
-    // awaits, so a request landing in any of those windows is seen here even
-    // though the earlier check at the reserved spawn boundary already passed.
-    // Nothing awaits between here and `activeContainers.set` below, so a
-    // request either loses to that whole block and is honoured here, or arrives
-    // after registration and takes the ordinary running-container path.
-    // `trackWake` settles it either way.
-    const lateCancellation = pendingKillCancellation(session.id);
-    if (lateCancellation) throw lateCancellation;
-    // THE GUARD POINT. Everything above the claim awaits — routing writes, the
-    // mailbox context, the dependency check, mount construction, argument
-    // construction — and the caller's precondition was last proved before all of
-    // it. This is the only place in the wake path where "still true?" and "the
-    // process now exists" are adjacent, so this is where the question belongs.
-    const guardRefusal = wakeRefusalFrom(guard);
-    if (guardRefusal !== null) {
-      throw new Error(`Container spawn refused by its guard: ${guardRefusal}`);
-    }
-  } catch (err) {
-    // Every refusal in the block above happens with the claim already held and
-    // no process to release it: hand it back here, or the next legitimate wake
-    // for this session is fenced out by a spawn that never happened. This is
-    // the only `await` between the guard and `spawn()`, and it is unreachable
-    // from the path that reaches `spawn()`.
-    await releaseClaimQuietly(session.id, claimIncarnation);
-    throw err;
-  }
-  const container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-
-  const channel: SupervisionChannel = { kind: 'spawned', process: container };
-  activeContainers.set(session.id, {
-    channel,
-    containerName,
-    spawnedAt: Date.now(),
-    adopted: false,
-    storageActivity,
-    claimIncarnation,
-  });
-  everSeenRunningSessions.add(session.id);
-  // The `running` status write is awaited AFTER the exit handlers below are
-  // attached (see the end of this function): with a delayed driver a
-  // container that dies at boot would otherwise emit close/error while the
-  // write is pending, before finalizeContainer and the kill callbacks exist.
-
-  // Log stderr. A container that dies at boot (unknown provider, missing
-  // binary, bad config) explains itself only here — and debug is below the
-  // default log level — so keep a tail to surface on a non-zero exit.
+  // THE GUARD POINT, and the spawn, in ONE synchronous block under the central
+  // lease (`withCentralSync`, plan §4.5 I-1). Everything above the claim
+  // awaits — routing writes, the mailbox context, the dependency check, mount
+  // construction, argument construction — and the caller's precondition was
+  // last proved before all of it. This is the only place in the wake path
+  // where "still true?" and "the process now exists" are adjacent, so this is
+  // where the question belongs; the lease is what makes the guard's raw read
+  // and the `spawn()` one indivisible turn that no driver transaction can
+  // interleave. `src/db/central-lease.test.ts` pins that no `await` sits
+  // between `evaluateGuardSync` and `spawn(` inside this block. The lease
+  // acquire is the one await after the claim, and both questions below are
+  // asked after it.
+  //
+  // The LAST word before the process exists, likewise inside the block: a
+  // kill request landing in any earlier window is seen here even though the
+  // check at the reserved spawn boundary already passed. Nothing awaits
+  // between the check and `activeContainers.set`, so a request either loses to
+  // this whole block and is honoured here, or arrives after registration and
+  // takes the ordinary running-container path. `trackWake` settles it either
+  // way.
+  let channel: SupervisionChannel;
   const stderrTail: string[] = [];
-  captureContainerStderr(container.stderr, containerName, stderrTail);
-
-  // stdout is unused in v2 (all IO is via session DB)
-  container.stdout?.on('data', () => {});
-
-  // No host-side idle timeout. Stale/stuck detection is driven by the host
-  // sweep reading heartbeat mtime + processing_ack claim age + container_state
-  // (see src/host-sweep.ts). This avoids killing long-running legitimate work
-  // on a wall-clock timer.
-
   // ChildProcess emits `close` after `error`; finalize this exact channel once.
   let finalized = false;
   const finalizeContainer = (): void => {
@@ -1799,31 +1778,102 @@ async function spawnContainer(
     finalized = true;
     finalizeSession(session.id, channel, storageActivity, containerName);
   };
+  try {
+    await withCentralSync(() => {
+      // Clear any orphan heartbeat from a previous container instance — the
+      // sweep's ceiling check treats a missing file as "fresh spawn, give grace"
+      // (host-sweep.ts line 87). Without this, the stale mtime can trigger an
+      // immediate kill before the new container touches the file itself.
+      fs.rmSync(heartbeatPath(agentGroup.id, session.id), { force: true });
 
-  container.on('close', (code) => {
-    finalizeContainer();
-    // code null = killed by signal (normal shutdown path), not a boot failure.
-    if (code === 137) {
-      log.warn('Container exited 137 — likely OOM kill or forced SIGKILL', {
-        sessionId: session.id,
+      // Admission and container preparation are asynchronous. Shutdown may begin
+      // after wakeContainer's entry check but before the process exists; refuse
+      // that late spawn so stopAllContainers cannot miss it in its snapshot.
+      if (containerShutdownInProgress) {
+        throw new Error('Container spawn cancelled because host shutdown is in progress');
+      }
+      const lateCancellation = pendingKillCancellation(session.id);
+      if (lateCancellation) throw lateCancellation;
+      const guardRefusal = wakeRefusalFrom(guard);
+      if (guardRefusal !== null) {
+        throw new Error(`Container spawn refused by its guard: ${guardRefusal}`);
+      }
+      const child = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+      // The registry entry and the finalize fence below share this exact
+      // channel object (`active.channel === channel` in finalizeSession).
+      channel = { kind: 'spawned', process: child };
+      activeContainers.set(session.id, {
+        channel,
         containerName,
-        memoryRequestMb: effectiveResources.memory.requestMb,
-        memoryLimitMb: effectiveResources.memory.limitMb,
-        stderrTail,
+        spawnedAt: Date.now(),
+        adopted: false,
+        storageActivity,
+        claimIncarnation,
       });
-    } else if (code !== 0 && code !== null && stderrTail.length > 0) {
-      log.warn('Container exited non-zero', { sessionId: session.id, code, containerName, stderrTail });
-    } else {
-      log.info('Container exited', { sessionId: session.id, code, containerName });
-    }
-  });
+      everSeenRunningSessions.add(session.id);
 
-  container.on('error', (err) => {
-    finalizeContainer();
-    log.error('Container spawn error', { sessionId: session.id, err });
-  });
+      // Every child listener is attached HERE, in the same synchronous turn as
+      // `spawn()`, before the block returns (#460 round 2). A runtime that
+      // cannot launch (ENOENT, EACCES) emits `error` from a `process.nextTick`
+      // queued inside `spawn()`; whether the continuation of the `await`
+      // around this block runs before that tick is a scheduler detail
+      // (Node ≥ 11 drains microtasks first, so today it does), and an `error`
+      // with no listener is an uncaught exception that takes the host down.
+      // Attaching inside the block makes the guarantee structural: the
+      // listeners exist before anything queued by `spawn()` can run.
+      // `src/session-claim-spawn.test.ts` pins it with a child whose `error`
+      // fires from a microtask.
 
-  // Every handler is registered; only now may this function yield.
+      // Log stderr. A container that dies at boot (unknown provider, missing
+      // binary, bad config) explains itself only here — and debug is below the
+      // default log level — so keep a tail to surface on a non-zero exit.
+      captureContainerStderr(child.stderr, containerName, stderrTail);
+
+      // stdout is unused in v2 (all IO is via session DB)
+      child.stdout?.on('data', () => {});
+
+      // No host-side idle timeout. Stale/stuck detection is driven by the host
+      // sweep reading heartbeat mtime + processing_ack claim age + container_state
+      // (see src/host-sweep.ts). This avoids killing long-running legitimate work
+      // on a wall-clock timer.
+
+      child.on('close', (code) => {
+        finalizeContainer();
+        // code null = killed by signal (normal shutdown path), not a boot failure.
+        if (code === 137) {
+          log.warn('Container exited 137 — likely OOM kill or forced SIGKILL', {
+            sessionId: session.id,
+            containerName,
+            memoryRequestMb: effectiveResources.memory.requestMb,
+            memoryLimitMb: effectiveResources.memory.limitMb,
+            stderrTail,
+          });
+        } else if (code !== 0 && code !== null && stderrTail.length > 0) {
+          log.warn('Container exited non-zero', { sessionId: session.id, code, containerName, stderrTail });
+        } else {
+          log.info('Container exited', { sessionId: session.id, code, containerName });
+        }
+      });
+
+      child.on('error', (err) => {
+        finalizeContainer();
+        log.error('Container spawn error', { sessionId: session.id, err });
+      });
+    }, 'wake guard at spawn');
+  } catch (err) {
+    // Every refusal in the block above happens with the claim already held and
+    // no process to release it: hand it back here, or the next legitimate wake
+    // for this session is fenced out by a spawn that never happened. This
+    // `await` is unreachable from the path that reaches `spawn()`.
+    await releaseClaimQuietly(session.id, claimIncarnation);
+    throw err;
+  }
+  // Every handler was registered inside the lease block above; only now may
+  // this function yield. The `running` status write is awaited AFTER the exit
+  // handlers exist: with a delayed driver a container that dies at boot would
+  // otherwise emit close/error while the write is pending, before
+  // finalizeContainer and the kill callbacks exist.
   await markContainerRunning(session.id);
 }
 
@@ -3884,7 +3934,7 @@ export async function buildMounts(
   // contiguous run of sync fs calls with no natural seam.
   const workgroupMountsStartedAt = Date.now();
   const wgKey = resolvedWgId ?? agentGroup.workgroup_id ?? agentGroup.folder;
-  const repositoryWorkUnit = resolveSessionRepositoryWorkUnit(session, wgKey);
+  const repositoryWorkUnit = await resolveSessionRepositoryWorkUnit(session, wgKey);
   const worktrees = topicWorktreesDir(repositoryWorkUnit);
   fs.mkdirSync(worktrees, { recursive: true });
   // Stable agent-facing path plus the exact host path. Git worktree metadata
@@ -4136,42 +4186,51 @@ export async function buildMounts(
   const workgroupMembershipStartedAt = Date.now();
   let workgroupMemberIds: string[] | undefined;
   try {
-    if (resolvedWgId) {
-      const memberRows = getRawDb()
-        .prepare(`SELECT id FROM agent_groups WHERE workgroup_id = ?`)
-        .all(resolvedWgId) as Array<{ id: string }>;
-      // W3 fail-closed: if the spawning agent is no longer a member of the
-      // workgroup reconcile settled on, refuse to build a projection that
-      // would silently drop them. The reconcile just updated
-      // agent_groups.workgroup_id for THIS agent to resolvedWgId; if that
-      // write hasn't yet been observed (or if a second reconcile undid it
-      // mid-spawn), the projection would lie.
-      if (!memberRows.some((r) => r.id === agentGroup.id)) {
-        throw new Error(
-          `Workgroup-scoped projection: agent ${agentGroup.id} is not a member of workgroup ${resolvedWgId} at projection time ` +
-            `(refusing to fall through to legacy single-agent filter; this is the W3 fail-closed path).`,
-        );
-      }
-      workgroupMemberIds = memberRows.map((r) => r.id);
-    } else {
-      const centralCheck = getRawDb().prepare(`PRAGMA table_info(agent_groups)`).all() as Array<{ name: string }>;
-      if (centralCheck.some((c) => c.name === 'workgroup_id')) {
-        const agRow = getRawDb().prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ?`).get(agentGroup.id) as
-          | { workgroup_id: string | null }
-          | undefined;
-        if (agRow && agRow.workgroup_id === null) {
-          throw new Error(
-            `Workgroup-scoped projection: invalid workgroup for agent ${agentGroup.id} — workgroup_id is NULL`,
-          );
-        }
-        if (agRow && agRow.workgroup_id) {
-          const memberRows = getRawDb()
-            .prepare(`SELECT id FROM agent_groups WHERE workgroup_id = ?`)
-            .all(agRow.workgroup_id) as Array<{ id: string }>;
-          workgroupMemberIds = memberRows.map((r) => r.id);
-        }
-      }
-    }
+    // One lease block: the membership read and the fail-closed check below
+    // see a single snapshot of agent_groups.
+    workgroupMemberIds = await withCentralSync(
+      () =>
+        withRawDb((db): string[] | undefined => {
+          if (resolvedWgId) {
+            const memberRows = db
+              .prepare(`SELECT id FROM agent_groups WHERE workgroup_id = ?`)
+              .all(resolvedWgId) as Array<{ id: string }>;
+            // W3 fail-closed: if the spawning agent is no longer a member of the
+            // workgroup reconcile settled on, refuse to build a projection that
+            // would silently drop them. The reconcile just updated
+            // agent_groups.workgroup_id for THIS agent to resolvedWgId; if that
+            // write hasn't yet been observed (or if a second reconcile undid it
+            // mid-spawn), the projection would lie.
+            if (!memberRows.some((r) => r.id === agentGroup.id)) {
+              throw new Error(
+                `Workgroup-scoped projection: agent ${agentGroup.id} is not a member of workgroup ${resolvedWgId} at projection time ` +
+                  `(refusing to fall through to legacy single-agent filter; this is the W3 fail-closed path).`,
+              );
+            }
+            return memberRows.map((r) => r.id);
+          } else {
+            const centralCheck = db.prepare(`PRAGMA table_info(agent_groups)`).all() as Array<{ name: string }>;
+            if (centralCheck.some((c) => c.name === 'workgroup_id')) {
+              const agRow = db.prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ?`).get(agentGroup.id) as
+                | { workgroup_id: string | null }
+                | undefined;
+              if (agRow && agRow.workgroup_id === null) {
+                throw new Error(
+                  `Workgroup-scoped projection: invalid workgroup for agent ${agentGroup.id} — workgroup_id is NULL`,
+                );
+              }
+              if (agRow && agRow.workgroup_id) {
+                const memberRows = db
+                  .prepare(`SELECT id FROM agent_groups WHERE workgroup_id = ?`)
+                  .all(agRow.workgroup_id) as Array<{ id: string }>;
+                return memberRows.map((r) => r.id);
+              }
+            }
+          }
+          return undefined;
+        }),
+      'workgroup projection membership',
+    );
   } catch (err) {
     // Re-throw W3 fail-closed (both the NULL-workgroup error and the
     // member-check error share the 'Workgroup-scoped projection' prefix);
@@ -5169,7 +5228,7 @@ export async function resolveAssistantName(
 
   if (sessionMessagingGroupId) {
     const { getMessagingGroup } = await import('./db/messaging-groups.js');
-    const mg = getMessagingGroup(sessionMessagingGroupId);
+    const mg = await getMessagingGroup(sessionMessagingGroupId);
     if (mg) {
       const { getSlackBotDisplayName } = await import('./channels/slack-mentions.js');
       const slack = getSlackBotDisplayName(mg.channel_type);
@@ -5485,11 +5544,18 @@ async function buildContainerArgs(
     // the /workspace/workgroup mount + archive projection already saw.
     const wgId =
       resolvedWgId ??
-      (
-        getRawDb().prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ?`).get(agentGroup.id) as
-          | { workgroup_id: string | null }
-          | undefined
-      )?.workgroup_id;
+      (await withCentralSync(
+        () =>
+          withRawDb(
+            (db) =>
+              (
+                db.prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ?`).get(agentGroup.id) as
+                  | { workgroup_id: string | null }
+                  | undefined
+              )?.workgroup_id,
+          ),
+        'workgroup id for container env',
+      ));
     if (wgId) {
       args.push('-e', `NANOCLAW_WORKGROUP_ID=${wgId}`);
     }
@@ -5547,7 +5613,7 @@ async function buildContainerArgs(
     // bot handle (say `@beacon-codex`). Supplying
     // both aliases prevents the model from treating its own platform mention
     // as a request for a sibling.
-    const selfMg = getMessagingGroup(sessionMessagingGroupId);
+    const selfMg = await getMessagingGroup(sessionMessagingGroupId);
     let selfUserId: string | undefined;
     let selfName: string | undefined;
     if (selfMg) {
@@ -5876,11 +5942,17 @@ async function buildContainerArgs(
       let effectiveSecrets = mergedSecrets;
       if (slackSecrets.length > 0) {
         const { isOwnerSafeSlackSession } = await import('./modules/permissions/slack-user-token-gate.js');
-        const ownerSafe = isOwnerSafeSlackSession(
-          getRawDb(),
-          agentGroup.id,
-          slackSafetyMessagingGroupId ?? null,
-          containerConfig.slack_user_token?.also_allowed_in,
+        const ownerSafe = await withCentralSync(
+          () =>
+            withRawDb((db) =>
+              isOwnerSafeSlackSession(
+                db,
+                agentGroup.id,
+                slackSafetyMessagingGroupId ?? null,
+                containerConfig.slack_user_token?.also_allowed_in,
+              ),
+            ),
+          'slack owner-safe check',
         );
         if (!ownerSafe) {
           identity = `${agentIdentifier}-noslack`;
@@ -6342,11 +6414,17 @@ async function buildContainerArgs(
   let slackUserTokenAllowed = false;
   if (containerConfig.slack_user_token?.enabled) {
     const { canUseSlackUserToken } = await import('./modules/permissions/slack-user-token-gate.js');
-    slackUserTokenAllowed = canUseSlackUserToken(
-      getRawDb(),
-      agentGroup.id,
-      slackSafetyMessagingGroupId ?? null,
-      containerConfig.slack_user_token,
+    slackUserTokenAllowed = await withCentralSync(
+      () =>
+        withRawDb((db) =>
+          canUseSlackUserToken(
+            db,
+            agentGroup.id,
+            slackSafetyMessagingGroupId ?? null,
+            containerConfig.slack_user_token,
+          ),
+        ),
+      'slack user-token gate',
     );
   }
   if (slackUserTokenAllowed) {

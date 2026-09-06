@@ -16,6 +16,7 @@
  * The response handler is registered via core's `registerResponseHandler`;
  * core iterates handlers and the first one to return `true` claims the response.
  */
+import { withCentralSync } from '../../db/central-lease.js';
 import { requestWake } from '../../request-wake.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { deletePendingApproval, getPendingApproval, getSession } from '../../db/sessions.js';
@@ -37,9 +38,9 @@ import { armReasonCapture } from './reason-capture.js';
  * thread access IS the approval authority — see primitive.ts. Admin-target
  * cards require clicker-identity verification (isAuthorizedApprovalClick).
  */
-function isThreadDelivery(approval: PendingApproval, session: Session): boolean {
+async function isThreadDelivery(approval: PendingApproval, session: Session): Promise<boolean> {
   if (!session.messaging_group_id) return false;
-  const mg = getMessagingGroup(session.messaging_group_id);
+  const mg = await getMessagingGroup(session.messaging_group_id);
   if (!mg) return false;
   return approval.channel_type === mg.channel_type && approval.platform_id === mg.platform_id;
 }
@@ -212,15 +213,15 @@ async function isAuthorizedApprovalClick(approval: PendingApproval, payload: Res
   // approval authority — any thread member may resolve. See primitive.ts.
   if (approval.session_id) {
     const session = await getSession(approval.session_id);
-    if (session && isThreadDelivery(approval, session)) return true;
+    if (session && (await isThreadDelivery(approval, session))) return true;
   }
 
   const agentGroupId =
     approval.agent_group_id ?? (approval.session_id ? (await getSession(approval.session_id))?.agent_group_id : null);
 
   if (!agentGroupId) {
-    return isOwner(userId) || isGlobalAdmin(userId);
+    return withCentralSync(() => isOwner(userId) || isGlobalAdmin(userId), 'approval click authority');
   }
 
-  return hasAdminPrivilege(userId, agentGroupId);
+  return withCentralSync(() => hasAdminPrivilege(userId, agentGroupId), 'approval click authority');
 }

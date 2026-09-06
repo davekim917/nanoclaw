@@ -196,7 +196,8 @@ vi.mock('../../db/channel-ingress-receipts.js', async (importOriginal) => ({
 }));
 vi.mock('../../db/usage.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../db/usage.js')>()),
-  rollupSessionUsage: () => 0,
+  getUsageWatermark: async () => 0,
+  rollupSessionUsage: async () => 0,
   pruneOldTurnUsage: async () => undefined,
 }));
 vi.mock('../../github-app-token.js', async (importOriginal) => ({
@@ -232,14 +233,22 @@ vi.mock('../../db/provider-health.js', async (importOriginal) => {
   return { ...real, markProviderUnavailable: () => undefined };
 });
 
-// getRawDb is THE dependency this family's two duties consume — a spy, not a
-// stub, so the registered-duty cases below can assert on it directly (F-7's
-// "acceptance tests must drive the REGISTERED duty" rule).
+// The central handle is THE dependency this family's two duties consume — a
+// spy, not a stub, so the registered-duty cases below can assert on it
+// directly (F-7's "acceptance tests must drive the REGISTERED duty" rule).
+// Seam 3 PR 6 put `recoverMoveIntents`/`pruneAuditBodies` on the async
+// driver, so `getDb()` hands back upstream's `SqliteDriver` over the SAME raw
+// handle the test built; `getRawDb()` still serves the one synchronous read
+// the restore path takes (`withQuietInvalidationSync`, under the lease).
 const mockGetDb = vi.fn(() => h.centralDb);
-vi.mock('../../db/connection.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../db/connection.js')>()),
-  getRawDb: () => mockGetDb(),
-}));
+vi.mock('../../db/connection.js', async (importOriginal) => {
+  const { SqliteDriver } = await import('../../db/drivers/sqlite.js');
+  return {
+    ...(await importOriginal<typeof import('../../db/connection.js')>()),
+    getRawDb: () => mockGetDb(),
+    getDb: () => new SqliteDriver(mockGetDb() as never),
+  };
+});
 
 // ── imports (after every mock above) ─────────────────────────────────────────
 
@@ -318,7 +327,7 @@ describe('registered scheduled-move-recovery / audit-body-prune duties', () => {
 
     await duty.run({} as never);
 
-    expect(mockGetDb).toHaveBeenCalledTimes(1);
+    expect(mockGetDb).toHaveBeenCalled();
     // recoverMoveIntents's first statement is the move_intent select.
     expect(prepare).toHaveBeenCalledWith(expect.stringContaining('move_intent'));
     expect(h.spawns).toEqual([]);
@@ -332,7 +341,7 @@ describe('registered scheduled-move-recovery / audit-body-prune duties', () => {
 
     await duty.run({} as never);
 
-    expect(mockGetDb).toHaveBeenCalledTimes(1);
+    expect(mockGetDb).toHaveBeenCalled();
     expect(prepare).toHaveBeenCalledWith(expect.stringContaining('scheduled_audit'));
     expect(run).toHaveBeenCalledTimes(1);
     expect(h.spawns).toEqual([]);
@@ -411,6 +420,9 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
 
   function centralDb(): Database.Database {
     const db = new Database(':memory:');
+    // The helpers read through `getDb()` now, which the mock above routes to
+    // whatever `h.centralDb` holds — so building the handle installs it.
+    h.centralDb = db;
     migration043.up(db);
     // Recovery resolves the target channel-root session id from `sessions`
     // (M1 scoped count); provide the table so the lookup is exercised, not a
@@ -499,7 +511,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     insertLive(inbound, 'ser-1'); // a live row exists for the series
     writeIntent(db, { seriesId: 'ser-1', ag: 'src-ag', sess: 'src-sess', tsMs: NOW - 2 * SWEEP_MS });
 
-    await recoverMoveIntents(db, { nowMs: NOW });
+    await recoverMoveIntents({ nowMs: NOW });
 
     const row = db
       .prepare("SELECT detail_json, resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-1'")
@@ -619,7 +631,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       ).run();
       writeIntent(db, { seriesId: 'ser-closed', ag: 'src-ag', sess: 'sess-closed', tsMs: NOW - 2 * SWEEP_MS });
 
-      await recoverMoveIntents(db, { nowMs: NOW });
+      await recoverMoveIntents({ nowMs: NOW });
 
       expect(
         (
@@ -645,7 +657,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       ).run();
       writeIntent(db, { seriesId: 'ser-live', ag: 'src-ag', sess: 'sess-live', tsMs: NOW - 2 * SWEEP_MS });
 
-      await recoverMoveIntents(db, { nowMs: NOW });
+      await recoverMoveIntents({ nowMs: NOW });
 
       expect(
         (
@@ -684,7 +696,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     const inbound = seedInbound('src-ag', 'src-sess');
     writeIntent(db, { seriesId: 'ser-touch', ag: 'src-ag', sess: 'src-sess', tsMs: NOW - 2 * SWEEP_MS });
 
-    await recoverMoveIntents(db, { nowMs: NOW });
+    await recoverMoveIntents({ nowMs: NOW });
 
     const live = openInboundDb(inbound)
       .prepare("SELECT COUNT(*) AS c FROM messages_in WHERE series_id='ser-touch'")
@@ -708,7 +720,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     const spy = vi.spyOn(sessionsModule, 'withQuietInvalidationSync').mockImplementation((id: string) => {
       throw new sessionsModule.QuietInvalidationError(id, new Error('central DB is read-only'));
     });
-    await recoverMoveIntents(db, { nowMs: NOW });
+    await recoverMoveIntents({ nowMs: NOW });
     spy.mockRestore();
 
     const live = openInboundDb(inbound)
@@ -734,7 +746,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     insertLive(inbound, 'ser-notouch');
     writeIntent(db, { seriesId: 'ser-notouch', ag: 'src-ag', sess: 'src-sess', tsMs: NOW - 2 * SWEEP_MS });
 
-    await recoverMoveIntents(db, { nowMs: NOW });
+    await recoverMoveIntents({ nowMs: NOW });
 
     expect(touched).toEqual([]);
     expect(h.spawns).toEqual([]);
@@ -746,7 +758,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     const inbound = seedInbound('src-ag', 'src-sess'); // empty — simulates crash post-cancel
     writeIntent(db, { seriesId: 'ser-2', ag: 'src-ag', sess: 'src-sess', tsMs: NOW - 2 * SWEEP_MS });
 
-    await recoverMoveIntents(db, { nowMs: NOW });
+    await recoverMoveIntents({ nowMs: NOW });
 
     // restoreTaskRow inserted a live row from the snapshot.
     const live = openInboundDb(inbound)
@@ -769,8 +781,8 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     const inbound = seedInbound('src-ag', 'src-sess');
     writeIntent(db, { seriesId: 'ser-3', ag: 'src-ag', sess: 'src-sess', tsMs: NOW - 2 * SWEEP_MS });
 
-    await recoverMoveIntents(db, { nowMs: NOW }); // first pass restores
-    await recoverMoveIntents(db, { nowMs: NOW }); // second pass must be a no-op
+    await recoverMoveIntents({ nowMs: NOW }); // first pass restores
+    await recoverMoveIntents({ nowMs: NOW }); // second pass must be a no-op
 
     const live = openInboundDb(inbound)
       .prepare("SELECT COUNT(*) AS c FROM messages_in WHERE series_id='ser-3' AND status IN ('pending','paused')")
@@ -784,7 +796,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     seedInbound('src-ag', 'src-sess');
     writeIntent(db, { seriesId: 'ser-4', ag: 'src-ag', sess: 'src-sess', tsMs: NOW - 5_000 }); // 5s old
 
-    await recoverMoveIntents(db, { nowMs: NOW });
+    await recoverMoveIntents({ nowMs: NOW });
 
     const row = db.prepare("SELECT resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-4'").get() as {
       resolved_at: string | null;
@@ -816,7 +828,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       targetMessagingGroupId: 'tgt-mg',
     });
 
-    await recoverMoveIntents(db, { nowMs: NOW });
+    await recoverMoveIntents({ nowMs: NOW });
 
     // The scoped {source,target} count is 0 → the crashed source IS restored,
     // the unrelated group's row is ignored.
@@ -850,7 +862,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       targetMessagingGroupId: 'tgt-mg',
     });
 
-    await recoverMoveIntents(db, { nowMs: NOW });
+    await recoverMoveIntents({ nowMs: NOW });
 
     // Source NOT restored (the target's live row is the one live row).
     const srcCount = openInboundDb(srcInbound)
@@ -878,7 +890,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       noSnapshot: true,
     });
 
-    await recoverMoveIntents(db, { nowMs: NOW });
+    await recoverMoveIntents({ nowMs: NOW });
 
     const row = db
       .prepare("SELECT resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-nosnap'")
@@ -898,7 +910,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       tsMs: NOW - 2 * SWEEP_MS,
     });
 
-    await recoverMoveIntents(db, { nowMs: NOW });
+    await recoverMoveIntents({ nowMs: NOW });
 
     const row = db.prepare("SELECT resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-nodir'").get() as {
       resolved_at: string | null;
@@ -927,7 +939,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
   it('test_prune_nulls_bodies_after_90d', async () => {
     const db = centralDb();
     const id = insertAudit(db, { action: 'edit', tsMs: NOW - 91 * 24 * 3600_000 });
-    pruneAuditBodies(db, { nowMs: NOW });
+    await pruneAuditBodies({ nowMs: NOW });
     const row = db
       .prepare('SELECT actor, action, before_preview, after_preview, detail_json FROM scheduled_audit WHERE id = ?')
       .get(id) as Record<string, unknown>;
@@ -942,7 +954,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
   it('test_prune_keeps_recent_bodies', async () => {
     const db = centralDb();
     const id = insertAudit(db, { action: 'edit', tsMs: NOW - 10 * 24 * 3600_000 });
-    pruneAuditBodies(db, { nowMs: NOW });
+    await pruneAuditBodies({ nowMs: NOW });
     const row = db.prepare('SELECT before_preview FROM scheduled_audit WHERE id = ?').get(id) as {
       before_preview: string | null;
     };
@@ -953,7 +965,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
   it('test_prune_preserves_cancel_metadata', async () => {
     const db = centralDb();
     const id = insertAudit(db, { action: 'cancel', tsMs: NOW - 100 * 24 * 3600_000 });
-    pruneAuditBodies(db, { nowMs: NOW });
+    await pruneAuditBodies({ nowMs: NOW });
     const row = db.prepare('SELECT action FROM scheduled_audit WHERE id = ?').get(id) as { action: string };
     expect(row.action).toBe('cancel'); // row survives so history can still label the cancellation
     db.close();
@@ -986,7 +998,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       .prepare("SELECT detail_json FROM scheduled_audit WHERE correlation_id = 'corr-ser-named-unreadable'")
       .get() as { detail_json: string };
 
-    await recoverMoveIntents(db, { nowMs: NOW });
+    await recoverMoveIntents({ nowMs: NOW });
 
     // Branch 1: restored and resolved.
     const restoredLive = openInboundDb(restoreInbound)
@@ -1015,7 +1027,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     const db = centralDb();
     const id = insertAudit(db, { action: 'edit', tsMs: NOW - 91 * 24 * 3600_000 });
 
-    pruneAuditBodies(db, { nowMs: NOW });
+    await pruneAuditBodies({ nowMs: NOW });
 
     const row = db
       .prepare(
@@ -1061,7 +1073,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     expect(inbound).toBe(path.join(DIR, 'v2-sessions', 'seam-ag', 'seam-sess', 'inbound.db'));
     expect(path.resolve(h.dataDir)).toBe(path.resolve(DIR));
 
-    await recoverMoveIntents(db, { nowMs: NOW });
+    await recoverMoveIntents({ nowMs: NOW });
 
     // The restore landed in the SAME file the live-count read and the existence
     // pre-check addressed — one root, three touchpoints.

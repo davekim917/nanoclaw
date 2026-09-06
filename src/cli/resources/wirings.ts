@@ -7,7 +7,8 @@ import {
 } from '../../channels/channel-defaults.js';
 import { hasDeclaredChannelDefaults } from '../../channels/channel-registry.js';
 import { getAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
-import { getRawDb } from '../../db/connection.js';
+import { centralTransaction } from '../../db/central-lease.js';
+import { getDb } from '../../db/connection.js';
 import {
   assertSameWorkgroupWiring,
   ensureAgentDestinationForWiring,
@@ -52,8 +53,8 @@ function validateInstructionsProfile(v: unknown): void {
   }
 }
 
-function requireMessagingGroup(id: unknown): MessagingGroup {
-  const mg = getMessagingGroup(String(id));
+async function requireMessagingGroup(id: unknown): Promise<MessagingGroup> {
+  const mg = await getMessagingGroup(String(id));
   if (!mg) throw new Error(`messaging group not found: ${id}`);
   return mg;
 }
@@ -196,8 +197,8 @@ registerResource({
   // handler (declaration-aware defaults, companion destination row, live
   // session projection) — keep them in sync with genericCreate's semantics.
   operations: { list: 'open', get: 'open', update: 'approval', delete: 'approval' },
-  preUpdate: (updates, current) => {
-    const mg = requireMessagingGroup(current.messaging_group_id);
+  preUpdate: async (updates, current) => {
+    const mg = await requireMessagingGroup(current.messaging_group_id);
     if (updates.threads !== undefined) updates.threads = normalizeThreads(updates.threads);
     // genericUpdate has already turned `--instructions-profile ""` into null
     // (nullable column), so this only ever sees a real value to check.
@@ -286,7 +287,7 @@ registerResource({
         validateInstructionsProfile(values.instructions_profile);
 
         // Pass-2 parity: context-aware defaults + cross-column validation.
-        const mg = requireMessagingGroup(values.messaging_group_id);
+        const mg = await requireMessagingGroup(values.messaging_group_id);
         if (values.threads !== undefined) values.threads = normalizeThreads(values.threads);
 
         const channelKey = mg.instance ?? mg.channel_type;
@@ -331,16 +332,18 @@ registerResource({
         // See issue #2389.
         const colNames = Object.keys(values);
         const placeholders = colNames.map((c) => `@${c}`);
-        const db = getRawDb();
-        // Guard inside an IMMEDIATE transaction so check + insert are atomic
-        // against a concurrent wiring from another process.
-        db.transaction(() => {
-          assertSameWorkgroupWiring(values.messaging_group_id as string, agId);
-          db.prepare(
+        // Guard inside one central transaction (BEGIN IMMEDIATE under the
+        // driver) so check + insert + companion row are atomic against a
+        // concurrent wiring from another process, and a failing companion
+        // rolls the wiring row back. DB-only closure (plan §4.4).
+        await centralTransaction(async () => {
+          await assertSameWorkgroupWiring(values.messaging_group_id as string, agId);
+          await getDb().run(
             `INSERT INTO messaging_group_agents (${colNames.join(', ')}) VALUES (${placeholders.join(', ')})`,
-          ).run(values);
-          ensureAgentDestinationForWiring(values as unknown as MessagingGroupAgent);
-        }).immediate();
+            values,
+          );
+          await ensureAgentDestinationForWiring(values as unknown as MessagingGroupAgent);
+        }, 'ncl wirings create');
 
         // postCommit parity — live-refresh with `ncl destinations add`: the
         // transaction above only wrote the central `agent_destinations` row.

@@ -34,7 +34,7 @@ if (!(await getAgentGroup(AGENT_GROUP_ID))) {
 }
 
 // Messaging group
-if (!getMessagingGroup(MESSAGING_GROUP_ID)) {
+if (!(await getMessagingGroup(MESSAGING_GROUP_ID))) {
   await createMessagingGroup({
     id: MESSAGING_GROUP_ID,
     channel_type: 'discord',
@@ -51,7 +51,7 @@ if (!getMessagingGroup(MESSAGING_GROUP_ID)) {
 
 // Link
 try {
-  createMessagingGroupAgent({
+  await createMessagingGroupAgent({
     id: 'mga-discord',
     messaging_group_id: MESSAGING_GROUP_ID,
     agent_group_id: AGENT_GROUP_ID,

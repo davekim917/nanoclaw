@@ -8,8 +8,10 @@
  * state with no reset, so action names are unique.
  *
  * guard() is synchronous by design (seam-3 plan §4.5, I-1) — its central
- * reads run on the raw handle, never awaited — so these tests call it
- * directly with no await.
+ * reads run through `withRawDb` inside the caller's `withCentralSync` block,
+ * never awaited — so these tests call it directly, with `withRawDb` stubbed to
+ * hand the grant-row read its fake handle (the production consult sites take
+ * the lease; the unit under test is the decision, not the lease).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -17,10 +19,12 @@ import { guard } from './guard.js';
 import { defineGuardedAction, type GuardedAction } from './guard-actions.js';
 import { ALLOW, DENY, HOLD, type GuardInput } from './types.js';
 
-const mockGetRawDb = vi.fn();
-vi.mock('../db/connection.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../db/connection.js')>()),
-  getRawDb: (...args: unknown[]) => mockGetRawDb(...args),
+const mockRawHandle = vi.fn();
+vi.mock('../db/central-lease.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../db/central-lease.js')>()),
+  // The grant read runs through withRawDb; stub it to hand the callback the
+  // fake handle each test primes, without a real lease or DB.
+  withRawDb: (fn: (db: unknown) => unknown) => fn(mockRawHandle()),
 }));
 // NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
 // handlers (including process.exit(1)) at module scope — importOriginal() would
@@ -38,9 +42,9 @@ function input(extra: Partial<GuardInput> = {}): GuardInput {
   return { actor: AGENT, payload: {}, ...extra };
 }
 
-/** Stubs the raw handle so `getRawDb().prepare(sql).get(id)` returns `row`. */
+/** Stubs the raw handle so `withRawDb((raw) => raw.prepare(sql).get(id))` returns `row`. */
 function stubPendingApprovalRow(row: unknown): void {
-  mockGetRawDb.mockReturnValue({
+  mockRawHandle.mockReturnValue({
     prepare: () => ({
       get: () => row,
     }),
@@ -48,7 +52,7 @@ function stubPendingApprovalRow(row: unknown): void {
 }
 
 beforeEach(() => {
-  mockGetRawDb.mockReset();
+  mockRawHandle.mockReset();
 });
 
 afterEach(() => {

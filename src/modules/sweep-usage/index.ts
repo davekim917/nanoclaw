@@ -24,7 +24,7 @@
 import fs from 'fs';
 
 import { log } from '../../log.js';
-import { rollupSessionUsage, pruneOldTurnUsage } from '../../db/usage.js';
+import { getUsageWatermark, rollupSessionUsage, pruneOldTurnUsage } from '../../db/usage.js';
 import type { Session } from '../../types.js';
 import { readSessionOutbound, sessionMailboxPath } from '../mailbox/index.js';
 import { registerSweepDuty, registerSweepDutySource, SWEEP_DUTY_INVENTORY } from '../../host-sweep.js';
@@ -68,12 +68,19 @@ export async function sweepUsageRollup(sessions: readonly Session[]): Promise<vo
       // a hot journal — throws on every tick under the console's 1s
       // fleet-fan-out default and never advances its watermark, so its
       // turn_usage rows never reach the central ledger.
-      const rolledUp = readSessionOutbound(
+      //
+      // Three steps, in this order (seam 3 PR 6): the central watermark is
+      // read first, the outbound read hands back the rows above it while the
+      // session file is open, and the central transaction folds them in after
+      // the file is closed — `readSessionOutbound` closes the handle the moment
+      // its synchronous action returns, and a central transaction is async,
+      // so the two cannot nest. `rollupSessionUsage` re-reads the watermark
+      // inside its transaction, so a batch two sweeps read is folded once.
+      const sessionDirKey = `${session.agent_group_id}/${session.id}`;
+      const watermark = await getUsageWatermark(sessionDirKey);
+      const rows = readSessionOutbound(
         { agentGroupId: session.agent_group_id, sessionId: session.id },
-        (mailbox) => {
-          rollupSessionUsage(mailbox, session.agent_group_id, `${session.agent_group_id}/${session.id}`);
-          return true;
-        },
+        (mailbox) => mailbox.listTurnUsageSince(watermark),
         { busyTimeoutMs: 5000, recoverJournal: true },
       );
       // Only a rollup that RAN may claim this mtime as processed. A session
@@ -81,7 +88,9 @@ export async function sweepUsageRollup(sessions: readonly Session[]): Promise<vo
       // and marking it done would skip it on every later sweep for as long as
       // the outbound file is untouched — its turn_usage rows would never reach
       // the central totals.
-      if (rolledUp) usageRollupMtimeCache.set(session.id, mtimeMs);
+      if (rows === undefined) continue;
+      await rollupSessionUsage(rows, session.agent_group_id, sessionDirKey);
+      usageRollupMtimeCache.set(session.id, mtimeMs);
     } catch (err) {
       log.warn('Usage rollup failed for session', { err, sessionId: session.id });
     }

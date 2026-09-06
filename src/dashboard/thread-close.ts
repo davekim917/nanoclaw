@@ -55,8 +55,8 @@
  */
 import { containerOwnsOutbound, killContainer } from '../container-runner.js';
 import { getDb } from '../db/connection.js';
-import { getRawDb } from '../db/index.js';
 import { archiveSessionById, withQuietInvalidationSync } from '../db/sessions.js';
+import { withCentralSync, withRawDb } from '../db/central-lease.js';
 import { guard } from '../guard/index.js';
 import { log } from '../log.js';
 import {
@@ -109,20 +109,22 @@ const CLOSE_WAKE_ID_PREFIX = 'thread-close-';
  *
  * Returns the proposal it was given, so the sweep's call site stays one line.
  */
-// 5c deferral (seam 3, deployer call 2026-09-05): stays raw/sync in PR 5a —
-// its only caller is src/modules/sweep-continuation/index.ts:543 (a bare
-// sync call inside a duty), owned by PR 5b, so §4.2 (leaf + every importer
-// in one PR) cannot be honored split across two parallel PRs. A follow-up
-// "5c" PR converts this together with all its callers once 5a and 5b are
-// both merged.
-export function syncDoneProposalMirror(sessionId: string, proposal: DoneProposal | null): DoneProposal | null {
+// On the async driver since seam 3 PR 6 (the "5c" family, converted with its
+// one sweep-continuation caller): a best-effort mirror, so the read→write pair
+// needs no transaction — a stale mirror is refreshed by the next tick, and the
+// close path never trusts this copy.
+export async function syncDoneProposalMirror(
+  sessionId: string,
+  proposal: DoneProposal | null,
+): Promise<DoneProposal | null> {
   const encoded = proposal ? JSON.stringify(proposal) : null;
   try {
-    const current = getRawDb().prepare('SELECT done_proposal FROM sessions WHERE id = ?').get(sessionId) as
-      | { done_proposal: string | null }
-      | undefined;
+    const current = await getDb().get<{ done_proposal: string | null }>(
+      'SELECT done_proposal FROM sessions WHERE id = ?',
+      sessionId,
+    );
     if (!current || current.done_proposal === encoded) return proposal;
-    getRawDb().prepare('UPDATE sessions SET done_proposal = ? WHERE id = ?').run(encoded, sessionId);
+    await getDb().run('UPDATE sessions SET done_proposal = ? WHERE id = ?', encoded, sessionId);
   } catch (err) {
     log.warn('thread-close: done_proposal mirror failed', { sessionId, err });
   }
@@ -176,23 +178,26 @@ interface CloseSession {
  * snooze paths use (`session:<id>` for a session with a NULL `thread_id`), so
  * the id the console renders addresses the same thread here.
  *
- * PERMANENT raw/sync exception (§4.5-class, not a 5c deferral): this function
+ * PERMANENT sync, lease-only (§4.5-class, not a 5c deferral): this function
  * is called both before AND inside `requestThreadClose`'s documented "ONE
  * synchronous decision, no await from here to the reservation" span (see
  * `ClosureDecision`'s doc comment and "THIS IS THE LAST AWAIT" below) — the
  * whole point of `sampleProposalsSync`/`readSessionProposalSync` existing as
- * synchronous twins is to keep that span awaitless. Converting this function
- * would break the invariant at its in-span call site regardless of which PR
- * does it, so it stays on the raw handle even after 5c.
+ * synchronous twins is to keep that span awaitless. It reads through
+ * `withRawDb`, so it works only inside a `withCentralSync` block; both callers
+ * hold one.
  */
 function sessionsOnThread(threadId: string): CloseSession[] {
-  return getRawDb()
-    .prepare(
-      `SELECT id, agent_group_id, archived_at
+  return withRawDb(
+    (db) =>
+      db
+        .prepare(
+          `SELECT id, agent_group_id, archived_at
          FROM sessions
         WHERE status = 'active' AND COALESCE(thread_id, 'session:' || id) = ?`,
-    )
-    .all(threadId) as CloseSession[];
+        )
+        .all(threadId) as CloseSession[],
+  );
 }
 
 /**
@@ -200,22 +205,23 @@ function sessionsOnThread(threadId: string): CloseSession[] {
  * `sessionsOnThread`, keyed to a single id, so a caller holding a snapshot can
  * re-ask the question it snapshotted without re-running the fan-out.
  *
- * PERMANENT raw/sync exception (§4.5-class, not a 5c deferral): called from
+ * PERMANENT sync, lease-only (§4.5-class, not a 5c deferral): called from
  * inside `writeCloseWrapUp`'s mailbox-action callback, which must stay
  * "synchronous, so nothing yields before the insert below" (the
  * `withQuietInvalidationSync` precondition a few lines down that call site).
  * Converting this to the async driver would introduce exactly the yield that
- * comment forbids.
+ * comment forbids; it reads through `withRawDb` under that callback's lease.
  */
 function stillOnThread(sessionId: string, threadId: string): boolean {
-  return (
-    getRawDb()
-      .prepare(
-        `SELECT 1
+  return withRawDb(
+    (db) =>
+      db
+        .prepare(
+          `SELECT 1
            FROM sessions
           WHERE id = ? AND status = 'active' AND COALESCE(thread_id, 'session:' || id) = ?`,
-      )
-      .get(sessionId, threadId) !== undefined
+        )
+        .get(sessionId, threadId) !== undefined,
   );
 }
 
@@ -258,61 +264,63 @@ async function writeCloseWrapUp(
     // Existing-only: the wrap-up asks a live agent to land its work, and a
     // session with no mailbox has no agent to ask. Provisioning one here would
     // author an outbound.db the host must never create (invariant I-10).
-    const inserted = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
-      // Membership and liveness, re-asked in-session. `freshVisible` was
-      // sampled once and the fan-out awaits per session, so by this iteration
-      // the snapshot can name a session that has since closed or moved off the
-      // thread. Asking an agent that is not on this thread to wrap up for it is
-      // the "who told you that?" shape this file exists to avoid, and a closed
-      // session has no one to ask. Synchronous, so nothing yields before the
-      // insert below.
-      if (!stillOnThread(session.id, threadId)) return false;
-      // Same primitive and row shape as `writeCeilingRespawn`'s `writeSystemWake`
-      // in host-sweep.ts — a deferred trigger row plus its inert recall marker,
-      // admitted by the next sweep tick with fresh context. `onWake: 0` because
-      // the container that is running RIGHT NOW is exactly who this is for; the
-      // ceiling path's `1` exists to keep a DYING container from eating its own
-      // accountability notice, which is not the situation here.
-      //
-      // Due-ness. The wrap-up is a deferred trigger row, and both the sweep's
-      // quiet cache and the delivery sweep's activity horizon key on
-      // `last_active` — a row written into a quiet session without an
-      // invalidation sits unseen until the cache expires, or indefinitely past
-      // the 7-day horizon. The wake this row triggers would bump it, but not
-      // until the wake happens; the insert-to-wake window is exactly the gap.
-      //
-      // `withQuietInvalidationSync` is the single form every due-ness write in
-      // the fork takes (`modules/scheduling/create.ts`, `recurrence.ts`,
-      // `cli/resources/tasks.ts`, `db/scheduled-tasks.ts`): the mark dies in
-      // the same synchronous turn as the row, inside the mailbox callback so
-      // no await can sit between them, and FAIL-CLOSED — the advisory bump
-      // this replaced swallowed a central-DB refusal and left the row behind a
-      // mark nothing would clear. A refusal now throws into the catch below,
-      // which logs and answers `false`, so the close simply has no wrap-up
-      // request this pass rather than a silently unseen one. A session with no
-      // ACTIVE central row is also refused, and that is right: it has no sweep
-      // to reach it.
-      const wrote = withQuietInvalidationSync(session.id, () =>
-        mailbox.insertDeferredMessageWithContextIfNew({
-          id: `${CLOSE_WAKE_ID_PREFIX}${session.id}-${requestedAt}`,
-          kind: 'chat',
-          timestamp: requestedAt,
-          platformId: session.agent_group_id,
-          channelType: 'agent',
-          threadId: null,
-          content: JSON.stringify({
-            text,
-            sender: 'system',
-            senderId: 'system',
-            _system: { kind: 'thread_close_wrap_up', thread_id: threadId },
+    const inserted = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) =>
+      withCentralSync(() => {
+        // Membership and liveness, re-asked in-session. `freshVisible` was
+        // sampled once and the fan-out awaits per session, so by this iteration
+        // the snapshot can name a session that has since closed or moved off the
+        // thread. Asking an agent that is not on this thread to wrap up for it is
+        // the "who told you that?" shape this file exists to avoid, and a closed
+        // session has no one to ask. Synchronous, so nothing yields before the
+        // insert below.
+        if (!stillOnThread(session.id, threadId)) return false;
+        // Same primitive and row shape as `writeCeilingRespawn`'s `writeSystemWake`
+        // in host-sweep.ts — a deferred trigger row plus its inert recall marker,
+        // admitted by the next sweep tick with fresh context. `onWake: 0` because
+        // the container that is running RIGHT NOW is exactly who this is for; the
+        // ceiling path's `1` exists to keep a DYING container from eating its own
+        // accountability notice, which is not the situation here.
+        //
+        // Due-ness. The wrap-up is a deferred trigger row, and both the sweep's
+        // quiet cache and the delivery sweep's activity horizon key on
+        // `last_active` — a row written into a quiet session without an
+        // invalidation sits unseen until the cache expires, or indefinitely past
+        // the 7-day horizon. The wake this row triggers would bump it, but not
+        // until the wake happens; the insert-to-wake window is exactly the gap.
+        //
+        // `withQuietInvalidationSync` is the single form every due-ness write in
+        // the fork takes (`modules/scheduling/create.ts`, `recurrence.ts`,
+        // `cli/resources/tasks.ts`, `db/scheduled-tasks.ts`): the mark dies in
+        // the same synchronous turn as the row, inside the mailbox callback so
+        // no await can sit between them, and FAIL-CLOSED — the advisory bump
+        // this replaced swallowed a central-DB refusal and left the row behind a
+        // mark nothing would clear. A refusal now throws into the catch below,
+        // which logs and answers `false`, so the close simply has no wrap-up
+        // request this pass rather than a silently unseen one. A session with no
+        // ACTIVE central row is also refused, and that is right: it has no sweep
+        // to reach it.
+        const wrote = withQuietInvalidationSync(session.id, () =>
+          mailbox.insertDeferredMessageWithContextIfNew({
+            id: `${CLOSE_WAKE_ID_PREFIX}${session.id}-${requestedAt}`,
+            kind: 'chat',
+            timestamp: requestedAt,
+            platformId: session.agent_group_id,
+            channelType: 'agent',
+            threadId: null,
+            content: JSON.stringify({
+              text,
+              sender: 'system',
+              senderId: 'system',
+              _system: { kind: 'thread_close_wrap_up', thread_id: threadId },
+            }),
+            processAfter: null,
+            recurrence: null,
+            onWake: 0,
           }),
-          processAfter: null,
-          recurrence: null,
-          onWake: 0,
-        }),
-      );
-      return wrote;
-    });
+        );
+        return wrote;
+      }, 'thread-close wrap-up'),
+    );
     return inserted ?? false;
   } catch (err) {
     log.warn('thread-close: could not write the wrap-up request', { sessionId: session.id, err });
@@ -425,7 +433,18 @@ export async function requestThreadClose(
   const reason = (body.reason ?? '').trim().slice(0, CLOSE_REASON_MAX_CHARS) || null;
   const confirmations = typeof body.confirmations === 'number' ? body.confirmations : 0;
 
-  const all = sessionsOnThread(threadId);
+  // Under the lease (seam 3 §4.5): the membership read and the in-flight
+  // closure check below are one snapshot.
+  const { all, existing } = await withCentralSync(
+    () => ({
+      all: sessionsOnThread(threadId),
+      existing: withRawDb(
+        (db) =>
+          db.prepare('SELECT * FROM thread_closures WHERE thread_id = ?').get(threadId) as ThreadClosureRow | undefined,
+      ),
+    }),
+    'thread close entry read',
+  );
   const visible = ctx.scopes.no_filter
     ? all
     : all.filter((s) => ctx.scopes.allowed_group_ids.includes(s.agent_group_id));
@@ -444,14 +463,11 @@ export async function requestThreadClose(
     };
   }
 
-  // PERMANENT raw/sync exception (§4.5-class, not a 5c deferral): this read,
-  // the reservation INSERT below, and the loser's read on a lost race all
-  // sit inside (or feed) the "ONE synchronous decision, no await from here
-  // to the reservation" span documented above `ClosureDecision` — see
-  // `sessionsOnThread`'s doc comment for the full reasoning.
-  const existing = getRawDb().prepare('SELECT * FROM thread_closures WHERE thread_id = ?').get(threadId) as
-    | ThreadClosureRow
-    | undefined;
+  // PERMANENT sync, lease-only (§4.5-class, not a 5c deferral): this read
+  // (taken above with the membership), the reservation INSERT below, and the
+  // loser's read on a lost race all sit inside (or feed) the "ONE synchronous
+  // decision, no await from here to the reservation" span documented above
+  // `ClosureDecision` — see `sessionsOnThread`'s doc comment.
   if (existing && existing.state !== 'closed') {
     return {
       status: 409,
@@ -496,65 +512,40 @@ export async function requestThreadClose(
   // the first one: closing a thread that now reaches an agent this caller
   // cannot see would either lie or escalate, and refusing here is safe because
   // nothing has been reserved yet.
-  const freshAll = sessionsOnThread(threadId);
-  const freshVisible = ctx.scopes.no_filter
-    ? freshAll
-    : freshAll.filter((s) => ctx.scopes.allowed_group_ids.includes(s.agent_group_id));
-  if (freshVisible.length !== freshAll.length) {
-    return {
-      status: 409,
-      body: { error: 'thread_extends_beyond_your_scope', thread_id: threadId, visible_sessions: freshVisible.length },
-    };
-  }
+  // ONE `withCentralSync` block from the membership re-read through the
+  // reservation (seam 3 §4.5): `sessionsOnThread`, `guard()`'s reads inside
+  // `decideClosure`, the reservation INSERT and the loser's read all execute
+  // on the raw connection under the lease, with no yield between them — the
+  // span the comment above promises is now enforced by the primitive.
+  type SpanOutcome =
+    | { kind: 'scope'; visible: number }
+    | { kind: 'decision'; decision: ClosureDecision }
+    | {
+        kind: 'reserved';
+        decision: ClosureDecision;
+        freshVisible: CloseSession[];
+        requestedAt: string;
+      }
+    | { kind: 'lost'; requestedAt: string | null };
+  const span = await withCentralSync((): SpanOutcome => {
+    const freshAll = sessionsOnThread(threadId);
+    const freshVisible = ctx.scopes.no_filter
+      ? freshAll
+      : freshAll.filter((s) => ctx.scopes.allowed_group_ids.includes(s.agent_group_id));
+    if (freshVisible.length !== freshAll.length) return { kind: 'scope', visible: freshVisible.length };
 
-  const proposalsBySession = new Map(freshVisible.map((s) => [s.id, sampled.get(s.id) != null] as const));
+    const proposalsBySession = new Map(freshVisible.map((s) => [s.id, sampled.get(s.id) != null] as const));
+    const decision = decideClosure(freshVisible, proposalsBySession, confirmations, {
+      userId: ctx.user.id,
+      threadId,
+    });
+    if (decision.outcome !== 'reserve') return { kind: 'decision', decision };
 
-  const decision = decideClosure(freshVisible, proposalsBySession, confirmations, {
-    userId: ctx.user.id,
-    threadId,
-  });
-  if (decision.outcome === 'confirmation-required') {
-    return {
-      status: 409,
-      body: {
-        error: 'confirmation_required',
-        thread_id: threadId,
-        required_confirmations: decision.required,
-        confirmations,
-        agent_proposed: decision.agentProposed,
-      },
-    };
-  }
-  if (decision.outcome === 'refused') {
-    log.info('thread-close: refused', { threadId, userId: ctx.user.id, reason: decision.reason });
-    return NOT_FOUND;
-  }
-
-  const requestedAt = new Date().toISOString();
-  const who = ctx.user.display_name ?? ctx.user.id;
-  const windowMinutes = Math.round(CLOSE_CONFIRM_WINDOW_MS / 60_000);
-  const text = composeCloseWrapUp({ who, reason, windowMinutes });
-
-  // The fan-out is FROZEN here: an agent that joins the thread after this
-  // moment was not part of what the operator closed.
-  //
-  // This is an atomic RESERVATION, not a bare upsert, because the
-  // `thread_closures` check earlier is no longer in the same synchronous step
-  // as this write. `readSessionProposal` became awaiting when it moved behind
-  // the mailbox seam (PR 4; pre-seam it was a synchronous open), so two
-  // sufficiently-confirmed requests for one thread — a double-click, or two
-  // admins — can both pass that check and both yield before either writes. An
-  // unconditional DO UPDATE then let the second silently replace the first's
-  // actor, reason, timestamp and confirmation window, answer 202, and fan out
-  // a second wrap-up.
-  //
-  // `WHERE thread_closures.state = 'closed'` on the DO UPDATE makes the row
-  // itself the lock: a LIVE closure is never overwritten, a finished one still
-  // re-opens (the case the upsert exists for), and zero rows changed means
-  // somebody else reserved it first.
-  const reserved = getRawDb()
-    .prepare(
-      `INSERT INTO thread_closures
+    const requestedAt = new Date().toISOString();
+    const reserved = withRawDb((db) =>
+      db
+        .prepare(
+          `INSERT INTO thread_closures
          (thread_id, requested_by, requested_at, reason, agent_proposed, session_ids, state, forced, closed_at)
        VALUES (?, ?, ?, ?, ?, ?, 'awaiting_confirmation', 0, NULL)
        ON CONFLICT(thread_id) DO UPDATE SET
@@ -563,30 +554,83 @@ export async function requestThreadClose(
          session_ids = excluded.session_ids, state = 'awaiting_confirmation',
          forced = 0, closed_at = NULL
        WHERE thread_closures.state = 'closed'`,
-    )
-    .run(
-      threadId,
-      ctx.user.id,
-      requestedAt,
-      reason,
-      decision.agentProposed ? 1 : 0,
-      JSON.stringify(decision.sessionIds),
+        )
+        .run(
+          threadId,
+          ctx.user.id,
+          requestedAt,
+          reason,
+          decision.agentProposed ? 1 : 0,
+          JSON.stringify(decision.sessionIds),
+        ),
     );
+    if (reserved.changes === 0) {
+      const winner = withRawDb(
+        (db) =>
+          db.prepare('SELECT requested_at FROM thread_closures WHERE thread_id = ?').get(threadId) as
+            | { requested_at: string }
+            | undefined,
+      );
+      return { kind: 'lost', requestedAt: winner?.requested_at ?? null };
+    }
+    return { kind: 'reserved', decision, freshVisible, requestedAt };
+  }, 'thread close decision and reservation');
 
-  if (reserved.changes === 0) {
+  if (span.kind === 'scope') {
+    return {
+      status: 409,
+      body: { error: 'thread_extends_beyond_your_scope', thread_id: threadId, visible_sessions: span.visible },
+    };
+  }
+  if (span.kind === 'lost') {
     // Lost the race. The same refusal the early check gives, reported from the
     // row the winner just wrote — and, the point of returning here, the loser
     // never reaches the fan-out below, so one close request produces one
     // wrap-up.
-    const winner = getRawDb().prepare('SELECT requested_at FROM thread_closures WHERE thread_id = ?').get(threadId) as
-      | { requested_at: string }
-      | undefined;
     log.info('thread-close: lost the reservation race', { threadId, userId: ctx.user.id });
     return {
       status: 409,
-      body: { error: 'close_already_in_progress', thread_id: threadId, requested_at: winner?.requested_at ?? null },
+      body: { error: 'close_already_in_progress', thread_id: threadId, requested_at: span.requestedAt },
     };
   }
+  if (span.kind === 'decision') {
+    const { decision } = span;
+    if (decision.outcome === 'confirmation-required') {
+      return {
+        status: 409,
+        body: {
+          error: 'confirmation_required',
+          thread_id: threadId,
+          required_confirmations: decision.required,
+          confirmations,
+          agent_proposed: decision.agentProposed,
+        },
+      };
+    }
+    log.info('thread-close: refused', { threadId, userId: ctx.user.id, reason: decision.reason });
+    return NOT_FOUND;
+  }
+
+  const { decision, freshVisible, requestedAt } = span;
+  const who = ctx.user.display_name ?? ctx.user.id;
+  const windowMinutes = Math.round(CLOSE_CONFIRM_WINDOW_MS / 60_000);
+  const text = composeCloseWrapUp({ who, reason, windowMinutes });
+
+  // The fan-out was FROZEN at the reservation above: an agent that joins the
+  // thread after that moment was not part of what the operator closed.
+  //
+  // The reservation is an atomic RESERVATION, not a bare upsert, because the
+  // `thread_closures` check at entry is not in the same synchronous step as
+  // the write (the proposal sample between them awaits). Two
+  // sufficiently-confirmed requests for one thread — a double-click, or two
+  // admins — can both pass that check; an unconditional DO UPDATE then let the
+  // second silently replace the first's actor, reason, timestamp and
+  // confirmation window, answer 202, and fan out a second wrap-up.
+  //
+  // `WHERE thread_closures.state = 'closed'` on the DO UPDATE makes the row
+  // itself the lock: a LIVE closure is never overwritten, a finished one still
+  // re-opens (the case the upsert exists for), and zero rows changed means
+  // somebody else reserved it first — the `lost` branch above.
 
   // The fan-out follows the frozen set, so a late joiner gets its wrap-up too.
   // Its `propose_done` is deliberately NOT re-read for `agentProposed` above:

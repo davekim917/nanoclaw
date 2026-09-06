@@ -181,7 +181,7 @@ async function wireIfMissing(
       : isGroup
         ? { engage_mode: 'mention' as const, engage_pattern: null }
         : { engage_mode: 'pattern' as const, engage_pattern: '.' };
-  createMessagingGroupAgent({
+  await createMessagingGroupAgent({
     id: generateId('mga'),
     messaging_group_id: mg.id,
     agent_group_id: ag.id,

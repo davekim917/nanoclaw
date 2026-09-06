@@ -263,8 +263,9 @@ vi.mock('../mailbox/index.js', async (importOriginal) => {
 });
 vi.mock('../../db/usage.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../db/usage.js')>()),
-  rollupSessionUsage: (mailbox: unknown, agentGroupId: string, sessionDirKey: string) =>
-    h.mockRollupSessionUsage(mailbox, agentGroupId, sessionDirKey),
+  getUsageWatermark: async () => 0,
+  rollupSessionUsage: (rows: unknown, agentGroupId: string, sessionDirKey: string) =>
+    h.mockRollupSessionUsage(rows, agentGroupId, sessionDirKey),
   pruneOldTurnUsage: async () => h.mockPruneOldTurnUsage(),
 }));
 
@@ -551,13 +552,11 @@ describe('registered usage-rollup duty (T19)', () => {
       expect.any(Function),
       { busyTimeoutMs: 5000, recoverJournal: true },
     );
-    // And the funnel's own session object is what reaches the rollup — the
-    // op-shaped read, not a raw better-sqlite3 handle.
-    expect(h.mockRollupSessionUsage).toHaveBeenCalledWith(
-      expect.objectContaining({ listTurnUsageSince: expect.any(Function) }),
-      'ag-test',
-      `ag-test/${sessionId}`,
-    );
+    // And what reaches the rollup is what the funnel's own session read
+    // (`listTurnUsageSince` above the watermark) — the op-shaped read's rows,
+    // never a raw better-sqlite3 handle. The rows are read INSIDE the
+    // funnel and folded in AFTER it closes (seam 3 PR 6).
+    expect(h.mockRollupSessionUsage).toHaveBeenCalledWith(expect.any(Array), 'ag-test', `ag-test/${sessionId}`);
     expect(h.spawns).toEqual([]);
   });
 

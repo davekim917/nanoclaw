@@ -83,7 +83,7 @@ vi.mock('../channels/channel-registry.js', async (importOriginal) => ({
 
 vi.mock('../db/messaging-groups.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../db/messaging-groups.js')>()),
-  getMessagingGroup: vi.fn().mockReturnValue(undefined),
+  getMessagingGroup: vi.fn().mockResolvedValue(undefined),
   createMessagingGroup: vi.fn(),
   getMessagingGroupByPlatform: vi.fn().mockReturnValue(undefined),
 }));
@@ -184,7 +184,7 @@ describe('applySessionSteer — C5', () => {
     mockGetChannelAdapter.mockReset();
     mockGetChannelAdapter.mockReturnValue(undefined);
     mockGetMessagingGroup.mockReset();
-    mockGetMessagingGroup.mockReturnValue(undefined);
+    mockGetMessagingGroup.mockResolvedValue(undefined);
     mockEmitDashboardEvent.mockReset();
     await setupDb();
     await seedAgentGroup('ag-1');
@@ -261,7 +261,7 @@ describe('applySessionSteer — C5', () => {
       .run(now());
 
     const deliverMock = vi.fn().mockResolvedValue(undefined);
-    mockGetMessagingGroup.mockReturnValue({
+    mockGetMessagingGroup.mockResolvedValue({
       id: 'mg-s',
       channel_type: 'slack',
       platform_id: 'C-s',

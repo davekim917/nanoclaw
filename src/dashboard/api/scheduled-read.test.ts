@@ -313,7 +313,7 @@ describe('scheduledListHandler', () => {
     grant('owner', 'owner', null);
 
     // An unresolved move_restore_failed audit row for a series with no live row.
-    writeAudit(getRawDb(), {
+    await writeAudit({
       actor: 'owner',
       action: 'move_restore_failed',
       agentGroupId: 'ag-1',
@@ -410,7 +410,7 @@ describe('scheduledDetailHandler', () => {
     addSession('s1', 'ag-1', 'mg-1');
     insertRow(seedSession('ag-1', 's1').inbound, { id: 'r1', series_id: 'ser-1' });
     // An audit row exists for the series.
-    writeAudit(getRawDb(), {
+    await writeAudit({
       actor: 'owner',
       action: 'edit',
       agentGroupId: 'ag-1',

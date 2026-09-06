@@ -9,6 +9,7 @@
  * Approver-picking (`pickApprover`, `pickApprovalDelivery`) lives in the
  * approvals module — see `src/modules/approvals/primitive.ts`.
  */
+import { withCentralSync } from '../../db/central-lease.js';
 import { isMember } from './db/agent-group-members.js';
 import { isAdminOfAgentGroup, isGlobalAdmin, isOwner } from './db/user-roles.js';
 import { getUser } from './db/users.js';
@@ -20,16 +21,19 @@ export type AccessDecision =
 /**
  * Can this user interact with this agent group?
  *
- * The three role predicates stay synchronous (seam-3 plan §4.5, I-1); the two
- * awaited reads keep their original position in the check order.
+ * The role predicates are synchronous and lease-only (seam-3 plan §4.5, I-1),
+ * so the four checks run as one block under the central lease, in the
+ * original order, after the user lookup.
  */
 export async function canAccessAgentGroup(userId: string, agentGroupId: string): Promise<AccessDecision> {
   if (!(await getUser(userId))) return { allowed: false, reason: 'unknown_user' };
-  if (isOwner(userId)) return { allowed: true, reason: 'owner' };
-  if (isGlobalAdmin(userId)) return { allowed: true, reason: 'global_admin' };
-  if (isAdminOfAgentGroup(userId, agentGroupId)) return { allowed: true, reason: 'admin_of_group' };
-  if (isMember(userId, agentGroupId)) return { allowed: true, reason: 'member' };
-  return { allowed: false, reason: 'not_member' };
+  return withCentralSync((): AccessDecision => {
+    if (isOwner(userId)) return { allowed: true, reason: 'owner' };
+    if (isGlobalAdmin(userId)) return { allowed: true, reason: 'global_admin' };
+    if (isAdminOfAgentGroup(userId, agentGroupId)) return { allowed: true, reason: 'admin_of_group' };
+    if (isMember(userId, agentGroupId)) return { allowed: true, reason: 'member' };
+    return { allowed: false, reason: 'not_member' };
+  }, 'canAccessAgentGroup');
 }
 
 /**

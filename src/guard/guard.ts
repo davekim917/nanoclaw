@@ -21,7 +21,7 @@
  *
  * The guard itself fails closed: a throwing decide denies.
  */
-import { getRawDb } from '../db/connection.js';
+import { withRawDb } from '../db/central-lease.js';
 import { PENDING_APPROVAL_BY_ID_SQL } from '../db/sessions.js';
 import type { PendingApproval } from '../types.js';
 import { log } from '../log.js';
@@ -31,8 +31,12 @@ import { ALLOW, DENY, type GuardDecision, type GuardInput } from './types.js';
 // Synchronous by design (seam-3 plan §4.5, I-1): this decision runs inside
 // callers' guard-adjacent blocks — `guard(a2aSend)` inside the agent-route
 // WriteGuard, `guard(threadsClose)` inside thread-close's one synchronous
-// decision — so it never awaits. Its central reads use the leaf's exported SQL
-// on the raw handle; PR 6 wraps them in `withRawDb` inside `withCentralSync`.
+// decision — so it never awaits. Its central reads execute the leaf's exported
+// SQL through `withRawDb`, which means every consult site runs inside a
+// `withCentralSync` block (the lease that keeps a synchronous central read out
+// of an open driver transaction). A consult outside a block throws
+// `RawAccessOutsideSyncBlockError` from the read — a programming error at the
+// call site, surfaced rather than silently allowed.
 export function guard(action: GuardedAction, input: GuardInput): GuardDecision {
   if (!isGuardedAction(action)) {
     // JS-level backstop — the branded type already forbids this. A
@@ -72,7 +76,9 @@ function grantSatisfies(action: GuardedAction, input: GuardInput): boolean {
   if (grant.action !== action.grantActionName) return false;
   // The row must still be live — resolution deletes it, so a grant can only
   // execute once and a fabricated row object doesn't pass.
-  const live = getRawDb().prepare(PENDING_APPROVAL_BY_ID_SQL).get(grant.approval_id) as PendingApproval | undefined;
+  const live = withRawDb((raw) => raw.prepare(PENDING_APPROVAL_BY_ID_SQL).get(grant.approval_id)) as
+    | PendingApproval
+    | undefined;
   if (!live || live.action !== action.grantActionName) return false;
   if (action.grantCoversRequest && !action.grantCoversRequest(grant, input)) return false;
   return true;

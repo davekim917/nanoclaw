@@ -1,4 +1,4 @@
-import type Database from 'better-sqlite3';
+import type { RawStatements } from '../../db/central-lease.js';
 
 import type { SlackUserTokenConfig } from '../../container-config.js';
 
@@ -74,7 +74,7 @@ import type { SlackUserTokenConfig } from '../../container-config.js';
  * (no risk of an LLM bypass, no per-call DB lookup hot path).
  */
 export function canUseSlackUserToken(
-  db: Database.Database,
+  db: RawStatements,
   agentGroupId: string,
   sessionMessagingGroupId: string | null,
   config: SlackUserTokenConfig | undefined,
@@ -119,7 +119,7 @@ export function canUseSlackUserToken(
  * channel can be per-thread and still be non-owner-safe for Slack purposes.
  */
 export function isOwnerSafeSlackSession(
-  db: Database.Database,
+  db: RawStatements,
   agentGroupId: string,
   sessionMessagingGroupId: string | null,
   alsoAllowedIn: string[] | undefined,

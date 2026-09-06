@@ -309,7 +309,7 @@ describe('channel + router integration', () => {
       unknown_sender_policy: 'public',
       created_at: now(),
     });
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       id: 'mga-1',
       messaging_group_id: 'mg-1',
       agent_group_id: 'ag-1',

@@ -105,11 +105,14 @@ export async function decisionDetail(
       evidence.push(
         ...detail.transcript.map((e) => ({ title: e.agent_name, text: e.text, at: e.timestamp, url: null })),
       );
-      recipients = detail.thread.participants
-        .filter(
-          (p) => groupVisible(ctx, p.agent_group_id) && (deps.canSend ?? canSteer)(ctx.user.id, p.agent_group_id).ok,
-        )
-        .map((p) => ({ id: p.agent_group_id, name: p.name }));
+      // `canSteer` is async since seam 3 PR 6 (its role reads run under the
+      // central lease); resolve the gate per participant before filtering.
+      const canSend = deps.canSend ?? canSteer;
+      const sendable: typeof detail.thread.participants = [];
+      for (const p of detail.thread.participants) {
+        if (groupVisible(ctx, p.agent_group_id) && (await canSend(ctx.user.id, p.agent_group_id)).ok) sendable.push(p);
+      }
+      recipients = sendable.map((p) => ({ id: p.agent_group_id, name: p.name }));
     }
   }
   if (decision.owner?.id && decision.owner.id !== ctx.user.id) {
@@ -173,7 +176,10 @@ export async function dispatchDecision(
   if (!row || !record.answer) throw new SignalError(409, 'answer_required');
   if (record.owner?.id !== ctx.user.id || record.answered_by?.id !== ctx.user.id)
     throw new SignalError(409, 'answer_owned_by_another_reviewer');
-  if (!groupVisible(ctx, request.agent_group_id) || !(deps.canSend ?? canSteer)(ctx.user.id, request.agent_group_id).ok)
+  if (
+    !groupVisible(ctx, request.agent_group_id) ||
+    !(await (deps.canSend ?? canSteer)(ctx.user.id, request.agent_group_id)).ok
+  )
     throw new SignalError(404, 'not_found');
   let reservation = record.dispatch;
   let reservedSource = source;

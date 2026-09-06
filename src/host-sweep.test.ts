@@ -56,6 +56,7 @@ import './modules/sweep-scheduling/index.js';
 // S2-PR14's 23f0c4ab added to the family suites, owed here for the same reason.
 import './modules/sweep-session-core/index.js';
 import { getRawDb } from './db/connection.js';
+import { withCentralSync } from './db/central-lease.js';
 import type { Session } from './types.js';
 
 // ─── Module mocks for C3 watchdog integration tests ──────────────────────────
@@ -862,7 +863,8 @@ describe('sweepSession on a session with no mailbox', () => {
     // preparation. The guard is asked where the process is created.
     expect(mockWakeContainer).toHaveBeenCalledTimes(1);
     const { guard } = mockWakeContainer.mock.calls[0][2] as { guard: () => unknown };
-    expect(guard()).toEqual({ ok: false, reason: 'session is closed' });
+    // The guard's read is raw (seam 3 §4.5 I-1), so it runs inside the lease.
+    expect(await withCentralSync(() => guard(), 'test-guard')).toEqual({ ok: false, reason: 'session is closed' });
     await closeDb();
   });
 

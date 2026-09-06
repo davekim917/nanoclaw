@@ -57,7 +57,7 @@ await createMessagingGroup({
   created_at: new Date().toISOString(),
 });
 
-createMessagingGroupAgent({
+await createMessagingGroupAgent({
   id: 'mga-chan',
   messaging_group_id: 'mg-chan',
   agent_group_id: 'ag-chan',

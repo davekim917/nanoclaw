@@ -536,11 +536,11 @@ export function registerContinuationSweepDuties(): void {
     // session. The `hasOutbound` guard is kept for what it costs: a
     // never-woken session has no proposal to mirror and no outbound file to
     // open looking for one.
-    run: (ctx) => {
+    run: async (ctx) => {
       const { session, mailbox } = asSessionContext(ctx);
       if (mailbox!.hasOutbound()) {
         try {
-          syncDoneProposalMirror(session.id, mailbox!.readDoneProposal());
+          await syncDoneProposalMirror(session.id, mailbox!.readDoneProposal());
         } catch (err) {
           log.warn('done_proposal mirror failed', { sessionId: session.id, err });
         }

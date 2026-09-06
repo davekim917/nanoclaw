@@ -254,7 +254,7 @@ async function dispatchSupportIssue(
 ): Promise<void> {
   const taskContext = await getSupportTaskContext(session);
   const mg = session.messaging_group_id
-    ? getMessagingGroup(session.messaging_group_id)
+    ? await getMessagingGroup(session.messaging_group_id)
     : taskContext
       ? await getMessagingGroupByPlatform(taskContext.channelType, taskContext.platformId)
       : undefined;
@@ -273,7 +273,7 @@ async function dispatchSupportIssue(
   const subject = str(content.subject) ?? '(no subject)';
   const date = str(content.date) ?? '(date unavailable)';
 
-  const existing = getSupportThread(gmailThreadId);
+  const existing = await getSupportThread(gmailThreadId);
   // Ticket identity: prefer what the host already recorded; fall back to what
   // the dispatcher passed (it may know from a legacy flow).
   const linearIssue = existing?.linear_issue ?? str(content.linearIssue);
@@ -313,10 +313,10 @@ async function dispatchSupportIssue(
 
     await writeSessionMessage(target.agent_group_id, target.id, followup);
     if (issueSession) {
-      touchSupportThread(gmailThreadId, now, lastMessageId);
+      await touchSupportThread(gmailThreadId, now, lastMessageId);
     } else {
-      rebindSupportThreadSession(gmailThreadId, target.id);
-      touchSupportThread(gmailThreadId, now, lastMessageId);
+      await rebindSupportThreadSession(gmailThreadId, target.id);
+      await touchSupportThread(gmailThreadId, now, lastMessageId);
       log.info('dispatch_support_issue: rebound thread to a fresh session', {
         gmailThreadId,
         previousSessionId: existing.session_id,
@@ -371,7 +371,7 @@ async function dispatchSupportIssue(
     }),
   });
 
-  upsertSupportThread(
+  await upsertSupportThread(
     {
       gmailThreadId,
       agentGroupId: session.agent_group_id,
@@ -411,14 +411,14 @@ export async function handleUpdateSupportTicket(content: Record<string, unknown>
     log.warn('update_support_ticket: rejected — missing linearIssue', { sessionId: session.id });
     return;
   }
-  const row = getSupportThreadBySession(session.id);
+  const row = await getSupportThreadBySession(session.id);
   if (!row) {
     log.warn('update_support_ticket: calling session is not a support-thread session', { sessionId: session.id });
     return;
   }
   const linearTeam = str(content.linearTeam);
   const now = new Date().toISOString();
-  setSupportThreadTicket(row.gmail_thread_id, linearIssue, linearTeam, now);
+  await setSupportThreadTicket(row.gmail_thread_id, linearIssue, linearTeam, now);
   log.info('update_support_ticket: ticket recorded', {
     gmailThreadId: row.gmail_thread_id,
     linearIssue,
@@ -428,7 +428,7 @@ export async function handleUpdateSupportTicket(content: Record<string, unknown>
   // Best-effort announcement edit — recompose the full announcement (subject +
   // sender are stored on the row) so the parent message now shows the ticket id.
   if (row.slack_parent_msg_id && row.messaging_group_id) {
-    const mg = getMessagingGroup(row.messaging_group_id);
+    const mg = await getMessagingGroup(row.messaging_group_id);
     const adapter = mg ? getChannelAdapter(mg.channel_type) : undefined;
     if (mg && adapter) {
       const text = announcementText(

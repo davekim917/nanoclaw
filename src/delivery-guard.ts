@@ -6,6 +6,7 @@
  * guard logic: the spec a privileged registration carries, and runGuarded,
  * the precheck → guard → deny/hold/allow pipeline every consult runs.
  */
+import { withCentralSync } from './db/central-lease.js';
 import { guard, type GuardedAction } from './guard/index.js';
 import { log } from './log.js';
 import type { PendingApproval, Session } from './types.js';
@@ -52,11 +53,17 @@ export async function runGuarded(
 ): Promise<void> {
   if (spec.precheck && !(await spec.precheck(content, session))) return;
 
-  const decision = guard(spec.guardAction, {
-    actor: { kind: 'agent', agentGroupId: session.agent_group_id, sessionId: session.id },
-    payload: content,
-    grant,
-  });
+  // Under the central lease: the guard's reads are raw by design (seam 3
+  // §4.5 I-1).
+  const decision = await withCentralSync(
+    () =>
+      guard(spec.guardAction, {
+        actor: { kind: 'agent', agentGroupId: session.agent_group_id, sessionId: session.id },
+        payload: content,
+        grant,
+      }),
+    `delivery guard ${action}`,
+  );
 
   if (decision.effect === 'deny') {
     log.warn('Delivery action denied by guard', { action, reason: decision.reason });

@@ -34,22 +34,27 @@ vi.mock('../../config.js', async () => {
 const TEST_DIR = '/tmp/nanoclaw-test-permissions-grant';
 
 const notifyCalls: Array<{ sessionId: string; text: string }> = [];
-// Lets a case run arbitrary work INSIDE `removeMember`'s yield, which is what
-// the mid-revoke escalation case needs: the target must gain an admin role
-// between the member removal and the role check that follows it.
-const duringRemoveMember = vi.hoisted(() => ({ run: null as null | (() => Promise<void>) }));
-vi.mock('./db/agent-group-members.js', async (importOriginal) => {
-  const real = await importOriginal<typeof import('./db/agent-group-members.js')>();
+// Lets a case run arbitrary work immediately BEFORE the handler's apply block
+// (`grant_access apply` / `revoke_access apply`) takes the lease — the last
+// point at which a concurrent grant or revoke can still land, since the
+// re-check and the write inside the block are one synchronous turn
+// (#460 round 2). Inert unless a case arms it.
+const beforeApply = vi.hoisted(() => ({
+  label: null as string | null,
+  run: null as null | (() => Promise<void>),
+}));
+vi.mock('../../db/central-lease.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../db/central-lease.js')>();
   return {
     ...real,
-    removeMember: async (userId: string, agentGroupId: string) => {
-      await real.removeMember(userId, agentGroupId);
-      if (duringRemoveMember.run) {
-        const run = duringRemoveMember.run;
-        duringRemoveMember.run = null;
+    withCentralSync: (async (fn: () => unknown, label?: string) => {
+      if (beforeApply.run && label === beforeApply.label) {
+        const run = beforeApply.run;
+        beforeApply.run = null;
         await run();
       }
-    },
+      return (real.withCentralSync as (fn: () => unknown, label?: string) => Promise<unknown>)(fn, label);
+    }) as typeof real.withCentralSync,
   };
 });
 
@@ -68,12 +73,13 @@ import {
   runMigrations,
   getRawDb,
 } from '../../db/index.js';
+import { withCentralSync } from '../../db/central-lease.js';
 import { initSessionFolder } from '../../session-manager.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import type { AgentGroup, MessagingGroup, Session } from '../../types.js';
 import { addMember, hasMembershipRow, isMember } from './db/agent-group-members.js';
 import { createUser } from './db/users.js';
-import { grantRole, isAdminOfAgentGroup, isOwner } from './db/user-roles.js';
+import { grantRole, isAdminOfAgentGroup, isOwner, revokeRole } from './db/user-roles.js';
 import {
   _deriveCallerId,
   _resolveTargetUserId,
@@ -154,6 +160,8 @@ beforeEach(async () => {
   const db = getRawDb();
   runMigrations(db);
   notifyCalls.length = 0;
+  beforeApply.label = null;
+  beforeApply.run = null;
   initSessionFolder('ag-helper', 'sess-test');
 
   await createMessagingGroup(makeMg('mg-test', 'slack-example-labs', 'slack:C1'));
@@ -228,28 +236,28 @@ afterEach(async () => {
 });
 
 describe('_resolveTargetUserId', () => {
-  it('returns a namespaced id as-is', () => {
-    expect(_resolveTargetUserId('slack-example-labs:U1', makeSession())).toBe('slack-example-labs:U1');
+  it('returns a namespaced id as-is', async () => {
+    expect(await _resolveTargetUserId('slack-example-labs:U1', makeSession())).toBe('slack-example-labs:U1');
   });
 
-  it('unwraps <@Uxxx> mentions and prepends channel_type', () => {
-    expect(_resolveTargetUserId('<@U12345>', makeSession())).toBe('slack-example-labs:U12345');
+  it('unwraps <@Uxxx> mentions and prepends channel_type', async () => {
+    expect(await _resolveTargetUserId('<@U12345>', makeSession())).toBe('slack-example-labs:U12345');
   });
 
-  it('strips a Slack display-alias pipe in the mention', () => {
-    expect(_resolveTargetUserId('<@U12345|operator>', makeSession())).toBe('slack-example-labs:U12345');
+  it('strips a Slack display-alias pipe in the mention', async () => {
+    expect(await _resolveTargetUserId('<@U12345|operator>', makeSession())).toBe('slack-example-labs:U12345');
   });
 
-  it('rejects Discord role mentions (<@&snowflake>)', () => {
-    expect(_resolveTargetUserId('<@&12345>', makeSession())).toBeNull();
+  it('rejects Discord role mentions (<@&snowflake>)', async () => {
+    expect(await _resolveTargetUserId('<@&12345>', makeSession())).toBeNull();
   });
 
-  it('accepts bare handles and prepends channel_type', () => {
-    expect(_resolveTargetUserId('U12345', makeSession())).toBe('slack-example-labs:U12345');
+  it('accepts bare handles and prepends channel_type', async () => {
+    expect(await _resolveTargetUserId('U12345', makeSession())).toBe('slack-example-labs:U12345');
   });
 
-  it('returns null when the session has no messaging group', () => {
-    expect(_resolveTargetUserId('U12345', makeSession({ messaging_group_id: null }))).toBeNull();
+  it('returns null when the session has no messaging group', async () => {
+    expect(await _resolveTargetUserId('U12345', makeSession({ messaging_group_id: null }))).toBeNull();
   });
 });
 
@@ -302,38 +310,40 @@ describe('handleGrantAccess', () => {
   it('owner can grant member', async () => {
     insertChatInbound({ senderId: 'OWNER' });
     await handleGrantAccess({ user: '<@BOB>' }, makeSession());
-    expect(isMember('slack-example-labs:BOB', 'ag-helper')).toBe(true);
+    expect(await withCentralSync(() => isMember('slack-example-labs:BOB', 'ag-helper'), 'test')).toBe(true);
     expect(notifyCalls.at(-1)?.text).toMatch(/Granted member access/);
   });
 
   it('owner can grant admin', async () => {
     insertChatInbound({ senderId: 'OWNER' });
     await handleGrantAccess({ user: '<@BOB>', role: 'admin' }, makeSession());
-    expect(isAdminOfAgentGroup('slack-example-labs:BOB', 'ag-helper')).toBe(true);
+    expect(await withCentralSync(() => isAdminOfAgentGroup('slack-example-labs:BOB', 'ag-helper'), 'test')).toBe(true);
   });
 
   it('scoped admin can grant member but NOT admin', async () => {
     insertChatInbound({ senderId: 'SADMIN' });
     await handleGrantAccess({ user: '<@BOB>' }, makeSession());
-    expect(isMember('slack-example-labs:BOB', 'ag-helper')).toBe(true);
+    expect(await withCentralSync(() => isMember('slack-example-labs:BOB', 'ag-helper'), 'test')).toBe(true);
 
     insertChatInbound({ senderId: 'SADMIN' });
     await handleGrantAccess({ user: '<@CAROL>', role: 'admin' }, makeSession());
-    expect(isAdminOfAgentGroup('slack-example-labs:CAROL', 'ag-helper')).toBe(false);
+    expect(await withCentralSync(() => isAdminOfAgentGroup('slack-example-labs:CAROL', 'ag-helper'), 'test')).toBe(
+      false,
+    );
     expect(notifyCalls.at(-1)?.text).toMatch(/only owner \/ global admin can grant `admin`/);
   });
 
   it('stranger is denied', async () => {
     insertChatInbound({ senderId: 'STRANGER' });
     await handleGrantAccess({ user: '<@BOB>' }, makeSession());
-    expect(isMember('slack-example-labs:BOB', 'ag-helper')).toBe(false);
+    expect(await withCentralSync(() => isMember('slack-example-labs:BOB', 'ag-helper'), 'test')).toBe(false);
     expect(notifyCalls.at(-1)?.text).toMatch(/denied: you don't have authority/);
   });
 
   it('scoped admin is denied on OTHER groups', async () => {
     insertChatInbound({ senderId: 'SADMIN' });
     await handleGrantAccess({ user: '<@BOB>', agentGroupId: 'ag-other' }, makeSession());
-    expect(isMember('slack-example-labs:BOB', 'ag-other')).toBe(false);
+    expect(await withCentralSync(() => isMember('slack-example-labs:BOB', 'ag-other'), 'test')).toBe(false);
   });
 
   it('rejects unknown agent groups', async () => {
@@ -351,6 +361,22 @@ describe('handleGrantAccess', () => {
   });
 });
 
+describe('handleGrantAccess — authority re-checked in the apply block (#460 round 2)', () => {
+  it('a caller revoked between the authority snapshot and the apply block cannot grant', async () => {
+    beforeApply.label = 'grant_access apply';
+    beforeApply.run = async () => {
+      await revokeRole('slack-example-labs:SADMIN', 'admin', 'ag-helper');
+    };
+
+    insertChatInbound({ senderId: 'SADMIN' });
+    await handleGrantAccess({ user: '<@BOB>' }, makeSession());
+    expect(beforeApply.run, 'the interleave armed above must have fired').toBeNull();
+
+    expect(notifyCalls.at(-1)?.text).toMatch(/grant_access denied: you don't have authority/);
+    expect(await withCentralSync(() => hasMembershipRow('slack-example-labs:BOB', 'ag-helper'), 'test')).toBe(false);
+  });
+});
+
 describe('handleRevokeAccess', () => {
   it('owner can revoke a member', async () => {
     await addMember({
@@ -361,7 +387,7 @@ describe('handleRevokeAccess', () => {
     });
     insertChatInbound({ senderId: 'OWNER' });
     await handleRevokeAccess({ user: '<@BOB>' }, makeSession());
-    expect(isMember('slack-example-labs:BOB', 'ag-helper')).toBe(false);
+    expect(await withCentralSync(() => isMember('slack-example-labs:BOB', 'ag-helper'), 'test')).toBe(false);
   });
 
   it('scoped admin cannot revoke another admin', async () => {
@@ -374,7 +400,9 @@ describe('handleRevokeAccess', () => {
     });
     insertChatInbound({ senderId: 'SADMIN' });
     await handleRevokeAccess({ user: '<@CAROL>' }, makeSession());
-    expect(isAdminOfAgentGroup('slack-example-labs:CAROL', 'ag-helper')).toBe(true);
+    expect(await withCentralSync(() => isAdminOfAgentGroup('slack-example-labs:CAROL', 'ag-helper'), 'test')).toBe(
+      true,
+    );
     expect(notifyCalls.at(-1)?.text).toMatch(/only a global admin can revoke another admin/);
   });
 
@@ -384,8 +412,11 @@ describe('handleRevokeAccess', () => {
   // `removeMember`, which yields. If an owner grants the target an admin role
   // in that window, the role check AFTER the yield flips to true and the same
   // scoped caller — already waved through by the earlier check — would revoke
-  // an admin. The role-removal branch is now gated on the caller being global,
-  // so the escalation cannot happen no matter when the grant lands.
+  // an admin. Since #460 round 2 the target's standing, the caller's authority
+  // and the removal are one synchronous lease block: a grant that lands
+  // before it is SEEN (the revoke is refused outright), and one that lands
+  // after it touches a row the block never removed. Either way the role
+  // survives.
   it('a grant landing mid-revoke does not let a scoped admin revoke an admin', async () => {
     await addMember({
       user_id: 'slack-example-labs:CAROL',
@@ -393,9 +424,11 @@ describe('handleRevokeAccess', () => {
       added_by: null,
       added_at: now(),
     });
-    // The grant lands inside removeMember's yield, exactly as an owner acting
+    // The grant lands after the caller's snapshot and target resolution, at
+    // the last instant before the apply block — exactly as an owner acting
     // concurrently would.
-    duringRemoveMember.run = async () => {
+    beforeApply.label = 'revoke_access apply';
+    beforeApply.run = async () => {
       await grantRole({
         user_id: 'slack-example-labs:CAROL',
         role: 'admin',
@@ -407,19 +440,49 @@ describe('handleRevokeAccess', () => {
 
     insertChatInbound({ senderId: 'SADMIN' });
     await handleRevokeAccess({ user: '<@CAROL>' }, makeSession());
+    expect(beforeApply.run, 'the interleave armed above must have fired').toBeNull();
 
-    // Membership went, which is all a scoped admin may take. Asserted on the
-    // ROW, not `isMember`: an admin counts as an implicit member, so `isMember`
-    // is true again the moment the grant lands and would hide the removal.
-    expect(hasMembershipRow('slack-example-labs:CAROL', 'ag-helper')).toBe(false);
+    // The block saw the admin role and refused; the membership ROW is intact
+    // (asserted on the row, not `isMember`, which an admin satisfies anyway)…
+    expect(notifyCalls.at(-1)?.text).toMatch(/only a global admin can revoke another admin/);
+    expect(await withCentralSync(() => hasMembershipRow('slack-example-labs:CAROL', 'ag-helper'), 'test')).toBe(true);
     // …and the admin role the owner just granted survives.
-    expect(isAdminOfAgentGroup('slack-example-labs:CAROL', 'ag-helper')).toBe(true);
+    expect(await withCentralSync(() => isAdminOfAgentGroup('slack-example-labs:CAROL', 'ag-helper'), 'test')).toBe(
+      true,
+    );
+  });
+
+  /**
+   * #460 round 2 (Codex, grant.ts): the caller's authority was snapshotted
+   * before the target resolution awaited, and the removal ran on that stale
+   * snapshot. A scoped admin revoked by an owner in that window must not
+   * complete the removal. Reverting the in-block caller re-check fails this
+   * test: the membership row is gone.
+   */
+  it('a caller revoked between the authority snapshot and the apply block cannot revoke', async () => {
+    await addMember({
+      user_id: 'slack-example-labs:BOB',
+      agent_group_id: 'ag-helper',
+      added_by: null,
+      added_at: now(),
+    });
+    beforeApply.label = 'revoke_access apply';
+    beforeApply.run = async () => {
+      await revokeRole('slack-example-labs:SADMIN', 'admin', 'ag-helper');
+    };
+
+    insertChatInbound({ senderId: 'SADMIN' });
+    await handleRevokeAccess({ user: '<@BOB>' }, makeSession());
+    expect(beforeApply.run, 'the interleave armed above must have fired').toBeNull();
+
+    expect(notifyCalls.at(-1)?.text).toMatch(/revoke_access denied: you don't have authority/);
+    expect(await withCentralSync(() => hasMembershipRow('slack-example-labs:BOB', 'ag-helper'), 'test')).toBe(true);
   });
 
   it('never revokes an owner', async () => {
     insertChatInbound({ senderId: 'GADMIN' });
     await handleRevokeAccess({ user: '<@OWNER>' }, makeSession());
-    expect(isOwner('slack-example-labs:OWNER')).toBe(true);
+    expect(await withCentralSync(() => isOwner('slack-example-labs:OWNER'), 'test')).toBe(true);
     expect(notifyCalls.at(-1)?.text).toMatch(/owner revocation must be done by direct edit/);
   });
 });

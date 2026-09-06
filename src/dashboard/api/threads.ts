@@ -1226,28 +1226,28 @@ function threadRoutingChannel(rows: ThreadSessionRow[]): string | null {
  * narrowing above (scope, workgroup, `group_id`, §2a absent-not-403) still
  * applies unchanged.
  */
-export function selectScopedAttentionItems(
+export async function selectScopedAttentionItems(
   ctx: AuthedRequestContext,
   opts: { workgroupId?: string | null; groupId: string | null; sinceHours: number | null; threadId?: string | null },
   now: number,
   env: AttentionSourceEnv,
-): AttentionItem[] {
+): Promise<AttentionItem[]> {
   const empty: AttentionItem[] = [];
   if (opts.groupId) return empty;
 
   let workgroupIds: string[];
   if (ctx.scopes.no_filter) {
-    workgroupIds = workgroupIdsWithAttentionSources();
+    workgroupIds = await workgroupIdsWithAttentionSources();
   } else {
     if (ctx.scopes.allowed_group_ids.length === 0) return empty;
-    workgroupIds = workgroupIdsForAgentGroups(ctx.scopes.allowed_group_ids);
+    workgroupIds = await workgroupIdsForAgentGroups(ctx.scopes.allowed_group_ids);
   }
   if (opts.workgroupId) workgroupIds = workgroupIds.filter((id) => id === opts.workgroupId);
   if (workgroupIds.length === 0) return empty;
 
   const items: AttentionItem[] = [];
   for (const wg of workgroupIds) {
-    for (const item of readAttentionItems(wg, now, env).items) {
+    for (const item of (await readAttentionItems(wg, now, env)).items) {
       // `threadId` narrows to that one row (detail/assign path); every other
       // item is in scope regardless of `since` — see the doc comment above.
       // `opts.sinceHours` is deliberately never read here.
@@ -1505,7 +1505,7 @@ export async function buildThreadList(
   // so an install whose only blocked work is on a board still gets a queue.
   // The reader is memoized (`ATTENTION_MEMO_TTL_MS`); this is not a file open
   // per poll.
-  const attentionItems = selectScopedAttentionItems(ctx, opts, now, deps.attentionEnv ?? {});
+  const attentionItems = await selectScopedAttentionItems(ctx, opts, now, deps.attentionEnv ?? {});
 
   const rows = await selectScopedSessions(ctx, opts, now);
   if (rows.length === 0 && attentionItems.length === 0) return { threads: [] };

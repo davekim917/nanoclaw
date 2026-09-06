@@ -30,9 +30,9 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { withCentralSync, withRawDb } from './db/central-lease.js';
 import { GROUPS_DIR } from './config.js';
 import { readContainerConfig, validateMcpServers, type McpServerConfig } from './container-config.js';
-import { getRawDb } from './db/connection.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { flattenClaudeMd } from './agents-md-flatten.js';
 import { CODEX_PROJECT_DOC_CONFIGURED_MAX_BYTES, warnIfOversized } from './codex-project-doc-cap.js';
@@ -71,12 +71,19 @@ const COMPOSED_HEADER =
  * there would pull that tenant's content into this always-on prompt. A group
  * with no workgroup gets its own directory only.
  */
-function personaSymlinkRoots(group: AgentGroup, groupDir: string): string[] {
+async function personaSymlinkRoots(group: AgentGroup, groupDir: string): Promise<string[]> {
   if (!group.workgroup_id) return [groupDir];
   try {
-    const siblings = getRawDb()
-      .prepare(`SELECT folder FROM agent_groups WHERE workgroup_id = ?`)
-      .all(group.workgroup_id) as Array<{ folder: string }>;
+    const siblings = await withCentralSync(
+      () =>
+        withRawDb(
+          (db) =>
+            db.prepare(`SELECT folder FROM agent_groups WHERE workgroup_id = ?`).all(group.workgroup_id) as Array<{
+              folder: string;
+            }>,
+        ),
+      'persona symlink roots',
+    );
     return [groupDir, ...siblings.map((s) => path.resolve(GROUPS_DIR, s.folder))];
   } catch (err) {
     // Fail closed: an unreadable roster must not widen the boundary.
@@ -171,7 +178,7 @@ export async function composeGroupClaudeMd(group: AgentGroup, provider: string):
 
   // Template persona (if any) — inline; imported first (see the imports
   // assembly) so it prepends the composed system prompt.
-  const persona = readGroupPersona(groupDir, personaSymlinkRoots(group, groupDir));
+  const persona = readGroupPersona(groupDir, await personaSymlinkRoots(group, groupDir));
   if (persona) {
     desired.set(STANDING_INSTRUCTIONS_FRAGMENT, persona);
   }

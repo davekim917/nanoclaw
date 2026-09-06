@@ -137,7 +137,13 @@ describe('agent message policies', () => {
     initSessionFolder(A, SA.id);
     initSessionFolder(B, SB.id);
     // A→B connection wired.
-    createDestination({ agent_group_id: A, local_name: 'b', target_type: 'agent', target_id: B, created_at: now() });
+    await createDestination({
+      agent_group_id: A,
+      local_name: 'b',
+      target_type: 'agent',
+      target_id: B,
+      created_at: now(),
+    });
   });
 
   afterEach(async () => {
@@ -148,10 +154,10 @@ describe('agent message policies', () => {
   // ── policy table round-trip ──
 
   it('set / get / remove round-trip, incl. approver', async () => {
-    expect(getMessagePolicy(A, B)).toBeUndefined();
+    expect(await getMessagePolicy(A, B)).toBeUndefined();
 
     await setMessagePolicy(A, B, 'telegram:sam', now());
-    expect(getMessagePolicy(A, B)).toMatchObject({
+    expect(await getMessagePolicy(A, B)).toMatchObject({
       from_agent_group_id: A,
       to_agent_group_id: B,
       approver: 'telegram:sam',
@@ -160,11 +166,11 @@ describe('agent message policies', () => {
 
     // Upsert updates the approver without inserting a duplicate row.
     await setMessagePolicy(A, B, 'telegram:dana', now());
-    expect(getMessagePolicy(A, B)!.approver).toBe('telegram:dana');
+    expect((await getMessagePolicy(A, B))!.approver).toBe('telegram:dana');
     expect(policyCount()).toBe(1);
 
     expect(await removeMessagePolicy(A, B)).toBe(true);
-    expect(getMessagePolicy(A, B)).toBeUndefined();
+    expect(await getMessagePolicy(A, B)).toBeUndefined();
     expect(await removeMessagePolicy(A, B)).toBe(false);
   });
 
@@ -285,14 +291,14 @@ describe('agent message policies', () => {
   it('deleting the connection drops its policy', async () => {
     await setMessagePolicy(A, B, 'telegram:dana', now());
     await deleteDestination(A, 'b'); // removes the A→B agent destination
-    expect(getMessagePolicy(A, B)).toBeUndefined();
+    expect(await getMessagePolicy(A, B)).toBeUndefined();
   });
 
   it('deleteAllDestinationsTouching drops policies on both sides', async () => {
     await setMessagePolicy(A, B, 'telegram:dana', now());
     await setMessagePolicy(B, A, 'telegram:dana', now());
     await deleteAllDestinationsTouching(A);
-    expect(getMessagePolicy(A, B)).toBeUndefined();
-    expect(getMessagePolicy(B, A)).toBeUndefined();
+    expect(await getMessagePolicy(A, B)).toBeUndefined();
+    expect(await getMessagePolicy(B, A)).toBeUndefined();
   });
 });

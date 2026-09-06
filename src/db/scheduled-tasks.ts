@@ -32,7 +32,7 @@ import {
   setTaskRoutingPlatformId,
   withQuietInvalidationSync,
 } from './sessions.js';
-import { getRawDb } from './connection.js';
+import { withCentralSync, withRawDb } from './central-lease.js';
 
 /** Did the row land, or was the session closed under us before the write? */
 type StampOutcome = 'written' | 'session-closed';
@@ -183,23 +183,19 @@ export async function resolveActiveSession(agentGroupId: string, messagingGroupI
  * `destination` is required by `TaskDef`'s type — TypeScript prevents
  * callers from omitting it; no runtime guard needed.
  *
- * Seam 3: this is the ONLY central-DB access in this file, and it stays
- * SYNCHRONOUS on the raw handle — it is one of the ten pinned raw
- * `db.transaction(...)` closures, and it is re-run inside `stamp` below, which
- * is itself a synchronous mailbox action that must not await. It converts with
- * the other central transaction sites in PR 6 (plan §4.2, §4.4). Every other
- * DB call this file makes goes through the sessions leaf (PR 4) or the
- * mailbox, so nothing else here changes in PR 3.
+ * SYNCHRONOUS and lease-only (seam 3 §4.5 I-1, #460 round 2): the reads go
+ * through `withRawDb`, so this runs only inside a `withCentralSync` block,
+ * where no driver transaction can be open and nothing can interleave — a
+ * parallel INSERT into messaging_group_agents (itself a `centralTransaction`)
+ * either committed before the block or waits behind it. That is what lets
+ * `stamp` below run the validation in the SAME synchronous block as the task
+ * upsert: a revocation that queued behind an earlier check cannot commit
+ * between the proof and the row. `resolveAndValidateDestination` is the
+ * standalone form for the pre-check at the top of `scheduleTask`.
  */
-function resolveAndValidateDestination(def: TaskDef): { messagingGroupId: string } {
+function validateDestinationUnderLease(def: TaskDef): { messagingGroupId: string } {
   const { platformId, channelType } = def.destination;
-  // Wrap validation in an IMMEDIATE transaction on the central DB so a
-  // parallel INSERT into messaging_group_agents can't slip a cross-workgroup
-  // peer in between the wiring check and the peer SELECT. The inbound.db
-  // INSERT happens later against a different DB file, but by then the
-  // central wiring has been serialized under our writer lock.
-  const db = getRawDb();
-  const validate = db.transaction((): { messagingGroupId: string } => {
+  return withRawDb((db) => {
     const mg = db
       .prepare('SELECT id FROM messaging_groups WHERE platform_id = ? AND channel_type = ?')
       .get(platformId, channelType) as { id: string } | undefined;
@@ -210,7 +206,7 @@ function resolveAndValidateDestination(def: TaskDef): { messagingGroupId: string
     }
     const wired = db
       .prepare('SELECT 1 AS ok FROM messaging_group_agents WHERE agent_group_id = ? AND messaging_group_id = ?')
-      .get(def.agentGroupId, mg.id) as { ok: number } | undefined;
+      .get(def.agentGroupId, mg.id);
     if (!wired) {
       throw new Error(
         `scheduleTask: agent group ${def.agentGroupId} is not wired to messaging group ${mg.id} (${channelType}:${platformId}). Refusing to schedule task ${def.id} — this would route output to a chat the agent isn't authorized for. Wire the messaging group via messaging_group_agents first, or correct the agentGroupId.`,
@@ -226,10 +222,9 @@ function resolveAndValidateDestination(def: TaskDef): { messagingGroupId: string
     // installers, the scheduled-tasks-board) must too. NULL workgroup_id on
     // either side is treated as a boundary violation (defensive: matches
     // dashboard isCrossWorkgroup's null-handling).
-    const hasWorkgroupsCol = db
-      .prepare(`PRAGMA table_info(agent_groups)`)
-      .all()
-      .some((c) => (c as { name: string }).name === 'workgroup_id');
+    const hasWorkgroupsCol = (db.prepare(`PRAGMA table_info(agent_groups)`).all() as Array<{ name: string }>).some(
+      (c) => c.name === 'workgroup_id',
+    );
     if (hasWorkgroupsCol) {
       const schedulingAg = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').get(def.agentGroupId) as
         | { workgroup_id: string | null }
@@ -257,11 +252,15 @@ function resolveAndValidateDestination(def: TaskDef): { messagingGroupId: string
 
     return { messagingGroupId: mg.id };
   });
-  return validate.immediate();
+}
+
+/** The pre-check form: one lease block around `validateDestinationUnderLease`. */
+async function resolveAndValidateDestination(def: TaskDef): Promise<{ messagingGroupId: string }> {
+  return withCentralSync(() => validateDestinationUnderLease(def), 'resolveAndValidateDestination');
 }
 
 export async function scheduleTask(def: TaskDef): Promise<void> {
-  resolveAndValidateDestination(def);
+  await resolveAndValidateDestination(def);
   // Stamp the session with the same destination the `messages_in` row below
   // carries. `resolveAndValidateDestination` has already proved it names a
   // real, wired messaging group, so the stamp can never point at a channel the
@@ -312,19 +311,22 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
       // check-then-write adjacency the seam's await broke, at the seam rather
       // than at each call site.
       if ((await getSession(sessionId))?.status !== 'active') return 'session-closed';
-      // AUTHORIZATION, re-validated here too, for the same reason and in the
-      // same place: `resolveAndValidateDestination` ran before the funnel's
-      // await, and the wiring it proved can be revoked in that window — a
+      // AUTHORIZATION, re-validated INSIDE the upsert's lease block below (see
+      // `validateDestinationUnderLease`), for the same reason and in the same
+      // place: `resolveAndValidateDestination` ran before the funnel's await,
+      // and the wiring it proved can be revoked in that window — a
       // `messaging_group_agents` row removed, or a cross-workgroup peer added.
       // The task row persists the route, and `delivery.ts` permits a
       // non-origin send when `agent_destinations` has no entry, so a stale
-      // authorization here becomes a real one at fire time.
+      // authorization here becomes a real one at fire time. Re-running it in
+      // its OWN transaction ahead of the block was not enough (#460 round 2):
+      // a revocation queued behind that transaction commits the moment it
+      // ends, before the block's lease is taken. Sharing the block closes it.
       //
       // It throws on failure, exactly as the pre-check does, so the caller's
       // contract is unchanged and nothing is written — the throw lands before
-      // `upsertTaskSeries`. Re-running it is a read-only IMMEDIATE transaction
-      // on the central DB; it has no side effects.
-      resolveAndValidateDestination(def);
+      // `upsertTaskSeries`, and the quiet mark is untouched.
+      //
       // The ROUTING STAMP lands here, not in `resolveTaskSession` above.
       // `sessions.task_routing_platform_id` is what the Observatory derives a
       // task thread's channel from, and re-scheduling an existing series
@@ -355,29 +357,47 @@ export async function scheduleTask(def: TaskDef): Promise<void> {
       // run` inserts one deliberately), and clearing the series would cancel an
       // occurrence this write never touched.
       //
-      // Nothing awaits between any of these, so no concurrent `scheduleTask`
-      // for this series can interleave with the write-stamp-restore triple.
       // The quiet mark dies in the same synchronous turn as the row that makes
-      // this session due — no await between them, so no sweep tick can flush a
-      // mark over work it cannot yet see (Codex round 3, H1). The helper is
-      // also fail-closed on a vanished or non-active session row, which is the
-      // same race the status check above answers, one layer down and atomically.
-      // It wraps the upsert alone: a refusal must land BEFORE the row, and the
-      // stamp/restore compensation below is about the central-DB side of a row
-      // that has already been written.
-      const upserted = withQuietInvalidationSync(sessionId, () =>
-        mailbox.upsertTaskSeries({
-          id: def.id,
-          seriesId: def.seriesId,
-          processAfter: def.processAfter,
-          scheduledFor: def.scheduledFor,
-          recurrence: def.cron,
-          content,
-          platformId: def.destination.platformId,
-          channelType: def.destination.channelType,
-          threadId: def.destination.threadId,
-        }),
-      );
+      // this session due — the invalidation and the upsert share ONE
+      // `withCentralSync` block, so nothing awaits between them and no sweep
+      // tick can flush a mark over work it cannot yet see (Codex round 3, H1;
+      // seam 3 §4.5 I-1). The helper is also fail-closed on a vanished or
+      // non-active session row, which is the same race the status check above
+      // answers, one layer down and atomically. It wraps the upsert alone: a
+      // refusal must land BEFORE the row, and the stamp/restore compensation
+      // below is about the central-DB side of a row that has already been
+      // written.
+      //
+      // #416 site 3, re-audited under the lease (seam 3 PR 6): the stamp below
+      // is a driver `run`, and under the lease a driver statement can now park
+      // behind an open central transaction, so a second `scheduleTask` for the
+      // same series CAN land its own upsert between this write and the stamp.
+      // Both writers upsert the same row by id, and the restore is addressed
+      // by that row id from this attempt's own snapshot, so the only
+      // interleaving that changes an outcome is: this stamp FAILS (a central-DB
+      // error) after the other writer's upsert — the restore then puts back
+      // this attempt's prior over the other writer's row. That is a
+      // double-fault (a concurrent re-schedule of one series during a central
+      // write failure) whose worst case is one lost re-schedule that the
+      // caller of the failed attempt already sees as an error; making the
+      // restore conditional on the row still matching this attempt needs a
+      // mailbox-side compare-and-restore and is left on #416.
+      const upserted = await withCentralSync(() => {
+        validateDestinationUnderLease(def);
+        return withQuietInvalidationSync(sessionId, () =>
+          mailbox.upsertTaskSeries({
+            id: def.id,
+            seriesId: def.seriesId,
+            processAfter: def.processAfter,
+            scheduledFor: def.scheduledFor,
+            recurrence: def.cron,
+            content,
+            platformId: def.destination.platformId,
+            channelType: def.destination.channelType,
+            threadId: def.destination.threadId,
+          }),
+        );
+      }, 'scheduleTask upsert');
       try {
         await setTaskRoutingPlatformId(sessionId, def.destination.platformId);
       } catch (err) {

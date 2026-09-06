@@ -409,7 +409,9 @@ describe('Signal source and authority boundaries', () => {
     });
     expect(laterQuestion.decisions.find((decision) => decision.id === source.id)?.state).toBe('answered');
     expect(laterQuestion.decisions.find((decision) => decision.id === claim.id)).toMatchObject({
-      state: 'changed', owner: { id: 'd' }, capabilities: { claim: false, answer: false, dispatch: false },
+      state: 'changed',
+      owner: { id: 'd' },
+      capabilities: { claim: false, answer: false, dispatch: false },
     });
     expect(laterQuestion.decisions.some((decision) => decision.question === 'A later question')).toBe(true);
     const outOfScope = await buildSignalData(ctx('j', 'admin_of_group', ['b']), 'w', {
@@ -438,7 +440,9 @@ describe('Signal source and authority boundaries', () => {
     const offPageClaim = offPage.decisions.find((decision) => decision.id === claim.id)!;
     expect(offPageClaim).toMatchObject({ state: 'open', owner: { id: 'd' } });
     expect(offPageClaim.capabilities).toEqual({ claim: false, answer: false, dispatch: false });
-    expect(offPage.sources.some((entry) => entry.source === claim.question && entry.status === 'unavailable')).toBe(false);
+    expect(offPage.sources.some((entry) => entry.source === claim.question && entry.status === 'unavailable')).toBe(
+      false,
+    );
   });
 });
 describe('Signal durable dispatch', () => {
@@ -451,7 +455,7 @@ describe('Signal durable dispatch', () => {
         thread: { participants: [{ agent_group_id: 'a', session_id: 's', name: 'A' }] } as unknown as ThreadSummary,
         transcript: [],
       }),
-      canSend: () => ({ ok: true }),
+      canSend: async () => ({ ok: true }),
       send: async (_session, body) => {
         if (!sent.has(body.idempotency_key)) {
           sent.add(body.idempotency_key);
@@ -493,7 +497,7 @@ describe('Signal durable dispatch', () => {
         thread: { participants: [{ agent_group_id: 'c', session_id: 's', name: 'C' }] } as unknown as ThreadSummary,
         transcript: [],
       }),
-      canSend: () => ({ ok: true }),
+      canSend: async () => ({ ok: true }),
       send,
     };
     const source = (await buildSignalData(ctx(), 'w', d)).decisions[0]!;
@@ -524,7 +528,7 @@ it('marks a failed retry pending before IO and sent cannot be downgraded by a sl
       thread: { participants: [{ agent_group_id: 'a', session_id: 's', name: 'A' }] } as unknown as ThreadSummary,
       transcript: [],
     }),
-    canSend: () => ({ ok: true }),
+    canSend: async () => ({ ok: true }),
     send: async () => {
       calls++;
       if (calls === 1) return { status: 429, body: { error: 'rate_limit' } };
@@ -638,7 +642,7 @@ it('only pending delivery can reconcile an old answer after source disappearance
       thread: { participants: [{ agent_group_id: 'a', session_id: 's', name: 'A' }] } as unknown as ThreadSummary,
       transcript: [],
     }),
-    canSend: () => ({ ok: true }),
+    canSend: async () => ({ ok: true }),
     send: async () => {
       sends++;
       return { status: 202, body: {} };
@@ -723,7 +727,7 @@ it('a fast retry rejection cannot release a reservation while an earlier deliver
       thread: { participants: [{ agent_group_id: 'a', session_id: 's', name: 'A' }] } as unknown as ThreadSummary,
       transcript: [],
     }),
-    canSend: () => ({ ok: true }),
+    canSend: async () => ({ ok: true }),
     send: async () => {
       calls++;
       if (calls === 1)
@@ -776,7 +780,7 @@ it('pending missing-source reconciliation still denies revoked role, recipient s
       thread: { participants: [{ agent_group_id: 'a', session_id: 's', name: 'A' }] } as unknown as ThreadSummary,
       transcript: [],
     }),
-    canSend: () => ({ ok: true }),
+    canSend: async () => ({ ok: true }),
     send,
     afterSend: () => {
       throw new Error('crash');
@@ -846,7 +850,7 @@ it('original rejection cannot release a reservation while its retry is in flight
       thread: { participants: [{ agent_group_id: 'a', session_id: 's', name: 'A' }] } as unknown as ThreadSummary,
       transcript: [],
     }),
-    canSend: () => ({ ok: true }),
+    canSend: async () => ({ ok: true }),
     send: async () => {
       calls++;
       if (calls === 1)

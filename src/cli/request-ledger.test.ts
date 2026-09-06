@@ -344,7 +344,7 @@ describe('ledger mechanics', () => {
     await completeCliRequest(SESSION_ID, 'req-9', { id: 'req-9', ok: true, data: 1 });
     await claimCliRequest('survivor-session', 'req-8', 'groups-list');
 
-    deleteSession(SESSION_ID);
+    await deleteSession(SESSION_ID);
 
     expect(requestIds()).toEqual(['req-8']);
   });
@@ -368,7 +368,7 @@ describe('ledger mechanics', () => {
       error: 'boom',
     });
 
-    deleteSession(SESSION_ID);
+    await deleteSession(SESSION_ID);
 
     expect(await getDeliveryAttempt('out-doomed')).toBeUndefined();
     expect((await getDeliveryAttempt('out-survivor'))?.session_id).toBe('survivor-session');

@@ -144,25 +144,25 @@ async function attemptThreadTitle(
     const botToken = resolveDiscordBotToken(channelType);
     if (!botToken) {
       log.warn('attemptThreadTitle: no bot token configured for channel', { channelType, threadPlatformId });
-      recordThreadTitleAttemptFailure(threadPlatformId);
+      await recordThreadTitleAttemptFailure(threadPlatformId);
       return false;
     }
     const title = await generateTopicTitle(firstMessageText);
     if (!title) {
-      recordThreadTitleAttemptFailure(threadPlatformId);
+      await recordThreadTitleAttemptFailure(threadPlatformId);
       return false;
     }
     const renamed = await renameDiscordThread(threadPlatformId, title, botToken);
     if (!renamed) {
-      recordThreadTitleAttemptFailure(threadPlatformId);
+      await recordThreadTitleAttemptFailure(threadPlatformId);
       return false;
     }
-    markThreadTitled(threadPlatformId, title);
+    await markThreadTitled(threadPlatformId, title);
     return true;
   } catch (err) {
     log.warn('attemptThreadTitle: rename threw', { err, threadPlatformId });
     try {
-      recordThreadTitleAttemptFailure(threadPlatformId);
+      await recordThreadTitleAttemptFailure(threadPlatformId);
     } catch (recErr) {
       log.warn('attemptThreadTitle: failed to record attempt failure', { err: recErr, threadPlatformId });
     }
@@ -202,11 +202,11 @@ export function _resetRenamedThreadsForTest(): void {
   renamedThreads.clear();
 }
 
-export function maybeRenameNewThread(
+export async function maybeRenameNewThread(
   channelType: string,
   threadPlatformId: string | null,
   firstMessageText: string,
-): void {
+): Promise<void> {
   if (!threadPlatformId) return;
   // Only Discord for now. Slack creates threads from the parent
   // message's ts (no rename possible without message edit). Telegram
@@ -223,7 +223,7 @@ export function maybeRenameNewThread(
   // before the current session existed.
   let existing: ThreadTitleRow | undefined;
   try {
-    existing = getThreadTitleRow(threadPlatformId);
+    existing = await getThreadTitleRow(threadPlatformId);
   } catch (err) {
     log.warn('maybeRenameNewThread: thread_titles lookup failed', { err, threadPlatformId });
   }
@@ -247,7 +247,7 @@ export function maybeRenameNewThread(
 
   if (!existing) {
     try {
-      insertThreadTitleClaim(threadPlatformId, channelType, firstMessageText);
+      await insertThreadTitleClaim(threadPlatformId, channelType, firstMessageText);
     } catch (err) {
       log.warn('maybeRenameNewThread: failed to record thread_titles claim', { err, threadPlatformId });
     }
@@ -303,7 +303,7 @@ async function _retryPendingThreadTitlesLocked(nowIso: string): Promise<{ attemp
   const sinceIso = new Date(Date.parse(nowIso) - RETRY_WINDOW_HOURS * 3600_000).toISOString();
   let rows: ThreadTitleRow[];
   try {
-    rows = getPendingThreadTitleRetries(sinceIso, RETRY_MAX_ATTEMPTS, RETRY_BATCH_CAP);
+    rows = await getPendingThreadTitleRetries(sinceIso, RETRY_MAX_ATTEMPTS, RETRY_BATCH_CAP);
   } catch (err) {
     log.warn('retryPendingThreadTitles: candidate query failed', { err });
     return { attempted: 0, titled: 0 };

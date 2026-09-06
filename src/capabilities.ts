@@ -20,10 +20,10 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { withCentralSync, withRawDb } from './db/central-lease.js';
 import { GROUPS_DIR } from './config.js';
 import { getRegisteredChannelNames } from './channels/channel-registry.js';
 import { readContainerConfig } from './container-config.js';
-import { getRawDb } from './db/connection.js';
 import { getAllAgentGroups, getAgentGroup, getWorkgroupOnecliSecrets } from './db/agent-groups.js';
 import type { AgentGroup } from './types.js';
 import { mergeWorkgroupAndGroupSecrets, slackUserTokenSecrets } from './onecli-secrets.js';
@@ -285,14 +285,19 @@ export async function buildSessionServicesSnapshot(
   agentGroupId: string,
   sessionMessagingGroupId?: string | null,
 ): Promise<SessionServicesSnapshot> {
-  return buildSessionServicesSnapshotFrom(
-    agentGroupId,
-    await resolveSessionServicesCentral(agentGroupId),
-    sessionMessagingGroupId,
+  const central = await resolveSessionServicesCentral(agentGroupId);
+  return withCentralSync(
+    () => buildSessionServicesSnapshotFrom(agentGroupId, central, sessionMessagingGroupId),
+    'session services snapshot',
   );
 }
 
-/** Synchronous: filesystem and config only; every central read arrives in `central`. */
+/**
+ * Synchronous: filesystem and config, plus ONE lease-only central read (the
+ * Slack owner-safety probe below, through `withRawDb`); every other central
+ * fact arrives in `central`. Callable only inside a `withCentralSync` block —
+ * the recall-row insert holds one, `buildSessionServicesSnapshot` takes one.
+ */
 export function buildSessionServicesSnapshotFrom(
   agentGroupId: string,
   central: SessionServicesCentral,
@@ -740,11 +745,13 @@ export function buildSessionServicesSnapshotFrom(
     const sessionKnown = sessionMessagingGroupId !== undefined;
     const ownerSafe =
       sessionKnown &&
-      isOwnerSafeSlackSession(
-        getRawDb(),
-        agentGroupId,
-        sessionMessagingGroupId ?? null,
-        cfg?.slack_user_token?.also_allowed_in,
+      withRawDb((db) =>
+        isOwnerSafeSlackSession(
+          db,
+          agentGroupId,
+          sessionMessagingGroupId ?? null,
+          cfg?.slack_user_token?.also_allowed_in,
+        ),
       );
 
     let useFor: string;

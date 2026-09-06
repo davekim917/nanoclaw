@@ -5,15 +5,6 @@ import { CronExpressionParser } from 'cron-parser';
 import { GROUPS_DIR, TIMEZONE } from '../../config.js';
 import { resolveGroupTimezone } from '../../container-config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
-// 5c deferral (seam 3, deployer call 2026-09-05): every getRawDb() call in
-// this file feeds writeAudit (dashboard/api/scheduled-shared.ts), which is
-// also called from src/modules/sweep-scheduled-move/index.ts (PR 5b's file)
-// — §4.2 cannot be honored split across two parallel PRs. A follow-up "5c"
-// PR converts writeAudit/purgeIntentBody together with every caller (this
-// file, dashboard/api/scheduled-move.ts, scheduled-mutations.ts, and the
-// sweep-scheduled-move helpers) once 5a and 5b are both merged. Nothing in
-// this file was changed by seam 3 PR 5a for that reason.
-import { getRawDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import {
   findTaskSessions,
@@ -23,6 +14,7 @@ import {
   TASKS_SYSTEM_THREAD_ID,
   withQuietInvalidationSync,
 } from '../../db/sessions.js';
+import { withCentralSync } from '../../db/central-lease.js';
 import { type TaskUpdate } from '../../modules/scheduling/db.js';
 import type { CliTaskRow, NanoclawMailboxSession } from '../../modules/mailbox/index.js';
 import {
@@ -239,7 +231,7 @@ async function resolveTaskRouting(
     const callingSession = await getSession(ctx.sessionId);
     if (!callingSession?.messaging_group_id) return { routing: NO_ROUTING };
 
-    const mg = getMessagingGroup(callingSession.messaging_group_id);
+    const mg = await getMessagingGroup(callingSession.messaging_group_id);
     if (!mg) throw new Error(`routing failed: messaging group not found for session ${ctx.sessionId}`);
 
     if (bool(args.thread)) {
@@ -261,7 +253,7 @@ async function resolveTaskRouting(
     throw new Error('--thread-id requires --messaging-group');
   }
   if (messagingGroupArg === undefined) return { routing: NO_ROUTING };
-  const mg = getMessagingGroup(messagingGroupArg);
+  const mg = await getMessagingGroup(messagingGroupArg);
   if (!mg) throw new Error(`messaging group not found: ${messagingGroupArg}`);
   return { routing: { platformId: mg.platform_id, channelType: mg.channel_type, threadId: threadIdArg ?? null } };
 }
@@ -307,38 +299,42 @@ async function createTask(args: Record<string, unknown>, ctx: CallerContext) {
   const { session } = await resolveTaskSession(group, id, routing.platformId);
 
   const created = await withInbound(session, (mailbox) =>
-    withQuietInvalidationSync(session.id, () => {
-      mailbox.insertTaskRow({
-        id,
-        seriesId: id,
-        processAfter,
-        recurrence,
-        platformId: routing.platformId,
-        channelType: routing.channelType,
-        threadId: routing.threadId,
-        content: JSON.stringify({
-          prompt,
-          script,
-          ...(scriptHost ? { scriptHost: true } : {}),
-          ...(args.thread_anchor !== undefined && !bool(args.thread_anchor) ? { threadAnchor: false } : {}),
-          originSessionId,
-          ...(flagIntent && (flagIntent.turnModel || flagIntent.turnEffort) ? { flagIntent } : {}),
-          // Physical send suppression, enforced by the agent-runner: chat-kind
-          // outbound writes are dropped for tasks carrying muteChat.
-          ...(bool(args.mute_chat) ? { muteChat: true } : {}),
-          // Streaming status is useful interactively but noisy for scheduled
-          // orchestrators that publish one consolidated channel message.
-          ...(bool(args.quiet_status) ? { quietStatus: true } : {}),
-          // Per-turn chat send budget (e.g. 1 for a standup whose contract is
-          // one digest post — trailing work-log messages get dropped).
-          ...(chatLimitArg(args) !== undefined ? { chatLimit: chatLimitArg(args) } : {}),
+    withCentralSync(
+      () =>
+        withQuietInvalidationSync(session.id, () => {
+          mailbox.insertTaskRow({
+            id,
+            seriesId: id,
+            processAfter,
+            recurrence,
+            platformId: routing.platformId,
+            channelType: routing.channelType,
+            threadId: routing.threadId,
+            content: JSON.stringify({
+              prompt,
+              script,
+              ...(scriptHost ? { scriptHost: true } : {}),
+              ...(args.thread_anchor !== undefined && !bool(args.thread_anchor) ? { threadAnchor: false } : {}),
+              originSessionId,
+              ...(flagIntent && (flagIntent.turnModel || flagIntent.turnEffort) ? { flagIntent } : {}),
+              // Physical send suppression, enforced by the agent-runner: chat-kind
+              // outbound writes are dropped for tasks carrying muteChat.
+              ...(bool(args.mute_chat) ? { muteChat: true } : {}),
+              // Streaming status is useful interactively but noisy for scheduled
+              // orchestrators that publish one consolidated channel message.
+              ...(bool(args.quiet_status) ? { quietStatus: true } : {}),
+              // Per-turn chat send budget (e.g. 1 for a standup whose contract is
+              // one digest post — trailing work-log messages get dropped).
+              ...(chatLimitArg(args) !== undefined ? { chatLimit: chatLimitArg(args) } : {}),
+            }),
+          });
+          return mailbox.getCliTaskRow(id);
         }),
-      });
-      return mailbox.getCliTaskRow(id);
-    }),
+      'ncl tasks create',
+    ),
   );
   if (!created) throw new Error('task system session inbound.db not found');
-  writeAudit(getRawDb(), {
+  await writeAudit({
     actor: actorFor(ctx),
     action: 'create',
     agentGroupId: session.agent_group_id,
@@ -483,18 +479,20 @@ async function mutateTask(
   let touched = 0;
   for (const session of await selectedSessions(args, ctx)) {
     const n =
-      (await withInbound(session, (mailbox) => {
-        // Probe (see the seam note above): no task row for this id/series here
-        // means every verb's UPDATE/DELETE matches nothing, so this session is
-        // owed neither a write nor an invalidation.
-        if (!mailbox.getCliTaskRow(id)) return 0;
-        return withQuietInvalidationSync(session.id, () => fn(mailbox, id));
-      })) ?? 0;
+      (await withInbound(session, (mailbox) =>
+        withCentralSync(() => {
+          // Probe (see the seam note above): no task row for this id/series here
+          // means every verb's UPDATE/DELETE matches nothing, so this session is
+          // owed neither a write nor an invalidation.
+          if (!mailbox.getCliTaskRow(id)) return 0;
+          return withQuietInvalidationSync(session.id, () => fn(mailbox, id));
+        }, `ncl tasks ${action}`),
+      )) ?? 0;
     if (n > 0) {
       // No before/after body: pause/resume/delete/cancel don't touch the
       // prompt, matching the dashboard's own pause/resume/cancel audit rows
       // (scheduled-mutations.ts) — a status-only change is the "after" here.
-      writeAudit(getRawDb(), {
+      await writeAudit({
         actor: actorFor(ctx),
         action,
         agentGroupId: session.agent_group_id,
@@ -640,48 +638,50 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
     // row read to its write.
     const tz = await resolveGroupTimezone(session.agent_group_id);
     const sessionUpdate: TaskUpdate = { ...update, ...wallClockUpdate(tz) };
-    const result = await withInbound(session, (mailbox) => {
-      const before = mailbox.getCliTaskRow(id);
-      // The probe is free here: `before` is the same superset read the seam
-      // note describes, and `updateTask` narrows it further still.
-      if (!before) return { before, n: 0 };
-      // Close the indirect path to host execution: an agent swapping the
-      // script text on a series a host operator flagged scriptHost would get
-      // its own script run on the host next fire. Unless the same call also
-      // clears the flag, reject.
-      if (
-        ctx.caller === 'agent' &&
-        sessionUpdate.script !== undefined &&
-        sessionUpdate.scriptHost !== false &&
-        before &&
-        parseTaskContent(before.content).scriptHost
-      ) {
-        throw new Error('this series runs its script on the host — an operator must make script changes');
-      }
-      // The recurrence ceiling is enforced AGAIN, here, against the row this
-      // write will actually land on. The pre-pass above validates the input
-      // shape and reports a typo before the first write — that part has to
-      // stay ahead of the loop — but its script exemption was decided from a
-      // row read in an EARLIER mailbox pass. Opening a mailbox yields, so
-      // between the two passes another caller can clear the script that
-      // exempted a `*/5 * * * *`, and the high-frequency recurrence lands on a
-      // now-scriptless series. Re-deciding from `before`, with nothing awaited
-      // between the read and the write, is what ties the exemption to the row
-      // it exempts. The inverse ordering is covered too: a change that became
-      // valid while this call was in flight is no longer rejected on a stale
-      // read.
-      if (recurrence !== undefined) {
-        const scriptNow: string | null =
-          script !== undefined ? script : before ? parseTaskContent(before.content).script : null;
-        enforceRecurrenceLimit(recurrence, bool(args.dangerously_override_recurrence_limit), scriptNow != null, tz);
-      }
-      const n = withQuietInvalidationSync(session.id, () => mailbox.updateTask(id, sessionUpdate));
-      return { before, n };
-    });
+    const result = await withInbound(session, (mailbox) =>
+      withCentralSync(() => {
+        const before = mailbox.getCliTaskRow(id);
+        // The probe is free here: `before` is the same superset read the seam
+        // note describes, and `updateTask` narrows it further still.
+        if (!before) return { before, n: 0 };
+        // Close the indirect path to host execution: an agent swapping the
+        // script text on a series a host operator flagged scriptHost would get
+        // its own script run on the host next fire. Unless the same call also
+        // clears the flag, reject.
+        if (
+          ctx.caller === 'agent' &&
+          sessionUpdate.script !== undefined &&
+          sessionUpdate.scriptHost !== false &&
+          before &&
+          parseTaskContent(before.content).scriptHost
+        ) {
+          throw new Error('this series runs its script on the host — an operator must make script changes');
+        }
+        // The recurrence ceiling is enforced AGAIN, here, against the row this
+        // write will actually land on. The pre-pass above validates the input
+        // shape and reports a typo before the first write — that part has to
+        // stay ahead of the loop — but its script exemption was decided from a
+        // row read in an EARLIER mailbox pass. Opening a mailbox yields, so
+        // between the two passes another caller can clear the script that
+        // exempted a `*/5 * * * *`, and the high-frequency recurrence lands on a
+        // now-scriptless series. Re-deciding from `before`, with nothing awaited
+        // between the read and the write, is what ties the exemption to the row
+        // it exempts. The inverse ordering is covered too: a change that became
+        // valid while this call was in flight is no longer rejected on a stale
+        // read.
+        if (recurrence !== undefined) {
+          const scriptNow: string | null =
+            script !== undefined ? script : before ? parseTaskContent(before.content).script : null;
+          enforceRecurrenceLimit(recurrence, bool(args.dangerously_override_recurrence_limit), scriptNow != null, tz);
+        }
+        const n = withQuietInvalidationSync(session.id, () => mailbox.updateTask(id, sessionUpdate));
+        return { before, n };
+      }, 'ncl tasks update'),
+    );
     if (!result) continue;
     const { before, n } = result;
     if (n > 0) {
-      writeAudit(getRawDb(), {
+      await writeAudit({
         actor: actorFor(ctx),
         action: 'update',
         agentGroupId: session.agent_group_id,
@@ -711,19 +711,21 @@ async function cancelTaskCommand(args: Record<string, unknown>, ctx: CallerConte
 
   let touched = 0;
   for (const session of await selectedSessions(args, ctx)) {
-    const result = await withInbound(session, (mailbox) => {
-      const seriesIds = mailbox.listCliTaskSeries().map((r) => r.series_id ?? r.row_id);
-      // The listing is the probe: `listCliTaskSeries()` returns the
-      // pending/paused set, which is exactly what cancel-all updates.
-      if (seriesIds.length === 0) return { seriesIds, n: 0 };
-      // Upstream's `cancelTask()` with no id IS cancel-all; there is one
-      // statement behind both names (invariant I-2).
-      return { seriesIds, n: withQuietInvalidationSync(session.id, () => mailbox.cancelTask()) };
-    });
+    const result = await withInbound(session, (mailbox) =>
+      withCentralSync(() => {
+        const seriesIds = mailbox.listCliTaskSeries().map((r) => r.series_id ?? r.row_id);
+        // The listing is the probe: `listCliTaskSeries()` returns the
+        // pending/paused set, which is exactly what cancel-all updates.
+        if (seriesIds.length === 0) return { seriesIds, n: 0 };
+        // Upstream's `cancelTask()` with no id IS cancel-all; there is one
+        // statement behind both names (invariant I-2).
+        return { seriesIds, n: withQuietInvalidationSync(session.id, () => mailbox.cancelTask()) };
+      }, 'ncl tasks cancel-all'),
+    );
     if (!result) continue;
     if (result.n > 0) {
       for (const seriesId of result.seriesIds) {
-        writeAudit(getRawDb(), {
+        await writeAudit({
           actor: actorFor(ctx),
           action: 'cancel',
           agentGroupId: session.agent_group_id,
@@ -748,32 +750,34 @@ async function cancelTaskCommand(args: Record<string, unknown>, ctx: CallerConte
 async function runTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
   const id = taskId(args);
   for (const session of await selectedSessions(args, ctx)) {
-    const fired = await withInbound(session, (mailbox) => {
-      const row = mailbox.getCliTaskRow(id);
-      // The probe is free here too — no row, no fire, no invalidation.
-      if (!row) return undefined;
-      const seriesKey = row.series_id ?? row.row_id;
-      const rowId = makeTaskId(`${seriesKey}-run`);
-      // recurrence=NULL is load-bearing: a run-now row must not be re-armed by
-      // handleRecurrence into a phantom series. Routing carries forward from
-      // the source row — an on-demand fire reports to the same destination
-      // the series is wired to.
-      withQuietInvalidationSync(session.id, () =>
-        mailbox.insertTaskRow({
-          id: rowId,
-          seriesId: seriesKey,
-          processAfter: new Date().toISOString(),
-          recurrence: null,
-          platformId: row.platform_id,
-          channelType: row.channel_type,
-          threadId: row.thread_id,
-          content: row.content,
-        }),
-      );
-      return { series_id: seriesKey, row_id: rowId, status: 'pending' };
-    });
+    const fired = await withInbound(session, (mailbox) =>
+      withCentralSync(() => {
+        const row = mailbox.getCliTaskRow(id);
+        // The probe is free here too — no row, no fire, no invalidation.
+        if (!row) return undefined;
+        const seriesKey = row.series_id ?? row.row_id;
+        const rowId = makeTaskId(`${seriesKey}-run`);
+        // recurrence=NULL is load-bearing: a run-now row must not be re-armed by
+        // handleRecurrence into a phantom series. Routing carries forward from
+        // the source row — an on-demand fire reports to the same destination
+        // the series is wired to.
+        withQuietInvalidationSync(session.id, () =>
+          mailbox.insertTaskRow({
+            id: rowId,
+            seriesId: seriesKey,
+            processAfter: new Date().toISOString(),
+            recurrence: null,
+            platformId: row.platform_id,
+            channelType: row.channel_type,
+            threadId: row.thread_id,
+            content: row.content,
+          }),
+        );
+        return { series_id: seriesKey, row_id: rowId, status: 'pending' };
+      }, 'ncl tasks run'),
+    );
     if (fired) {
-      writeAudit(getRawDb(), {
+      await writeAudit({
         actor: actorFor(ctx),
         action: 'run_now',
         agentGroupId: session.agent_group_id,

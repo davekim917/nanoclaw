@@ -1,4 +1,43 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
+// #460 round 2: lets two concurrent wirings both reach the companion
+// destination's name lookup before either inserts. Each armed lookup waits for
+// its peer up to `peerWaitMs`; a caller that holds the central lease alone
+// (the fixed code) times out and proceeds, so the test never deadlocks.
+const nameLookupBarrier = vi.hoisted(() => ({
+  armed: false,
+  peerWaitMs: 50,
+  waiting: [] as Array<() => void>,
+}));
+
+vi.mock('../modules/agent-to-agent/db/agent-destinations.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../modules/agent-to-agent/db/agent-destinations.js')>();
+  return {
+    ...actual,
+    getDestinationByName: async (agentGroupId: string, localName: string) => {
+      if (nameLookupBarrier.armed) {
+        await new Promise<void>((resolve) => {
+          const peer = nameLookupBarrier.waiting.shift();
+          if (peer) {
+            peer();
+            resolve();
+            return;
+          }
+          const timer = setTimeout(() => {
+            nameLookupBarrier.waiting = nameLookupBarrier.waiting.filter((w) => w !== release);
+            resolve();
+          }, nameLookupBarrier.peerWaitMs);
+          const release = (): void => {
+            clearTimeout(timer);
+            resolve();
+          };
+          nameLookupBarrier.waiting.push(release);
+        });
+      }
+      return actual.getDestinationByName(agentGroupId, localName);
+    },
+  };
+});
 
 import { getRawDb } from './connection.js';
 import {
@@ -145,7 +184,7 @@ describe('messaging groups', () => {
 
   it('should create and retrieve', async () => {
     await createMessagingGroup(mg());
-    const result = getMessagingGroup('mg-1');
+    const result = await getMessagingGroup('mg-1');
     expect(result).toBeDefined();
     expect(result!.channel_type).toBe('discord');
   });
@@ -165,7 +204,7 @@ describe('messaging groups', () => {
   it('should update', async () => {
     await createMessagingGroup(mg());
     await updateMessagingGroup('mg-1', { name: 'Updated', name_source: 'slack:classified' });
-    const updated = getMessagingGroup('mg-1')!;
+    const updated = (await getMessagingGroup('mg-1'))!;
     expect(updated.name).toBe('Updated');
     // A name write carries its provenance (migration 069) — the pair is what
     // a later metadata refresh consults before overwriting.
@@ -175,7 +214,7 @@ describe('messaging groups', () => {
   it('should delete', async () => {
     await createMessagingGroup(mg());
     await deleteMessagingGroup('mg-1');
-    expect(getMessagingGroup('mg-1')).toBeUndefined();
+    expect(await getMessagingGroup('mg-1')).toBeUndefined();
   });
 });
 
@@ -219,14 +258,14 @@ describe('messaging group agents', () => {
   });
 
   it('should create and list by messaging group', async () => {
-    createMessagingGroupAgent(mga());
+    await createMessagingGroupAgent(mga());
     const results = await getMessagingGroupAgents('mg-1');
     expect(results).toHaveLength(1);
     expect(results[0].agent_group_id).toBe('ag-1');
   });
 
   it('should order by priority descending', async () => {
-    createMessagingGroupAgent(mga());
+    await createMessagingGroupAgent(mga());
     await createAgentGroup({
       id: 'ag-2',
       name: 'Agent2',
@@ -243,60 +282,60 @@ describe('messaging group agents', () => {
       )
       .run();
     getRawDb().prepare("UPDATE agent_groups SET workgroup_id = 'wg-prio' WHERE id IN ('ag-1','ag-2')").run();
-    createMessagingGroupAgent({ ...mga(), id: 'mga-2', agent_group_id: 'ag-2', priority: 10 });
+    await createMessagingGroupAgent({ ...mga(), id: 'mga-2', agent_group_id: 'ag-2', priority: 10 });
     const results = await getMessagingGroupAgents('mg-1');
     expect(results[0].agent_group_id).toBe('ag-2');
     expect(results[1].agent_group_id).toBe('ag-1');
   });
 
-  it('should enforce unique messaging_group + agent_group', () => {
-    createMessagingGroupAgent(mga());
-    expect(() => createMessagingGroupAgent({ ...mga(), id: 'mga-dup' })).toThrow();
+  it('should enforce unique messaging_group + agent_group', async () => {
+    await createMessagingGroupAgent(mga());
+    await expect(createMessagingGroupAgent({ ...mga(), id: 'mga-dup' })).rejects.toThrow();
   });
 
   it('should update', async () => {
-    createMessagingGroupAgent(mga());
+    await createMessagingGroupAgent(mga());
     await updateMessagingGroupAgent('mga-1', { priority: 5 });
     expect((await getMessagingGroupAgent('mga-1'))!.priority).toBe(5);
   });
 
   it('should delete', async () => {
-    createMessagingGroupAgent(mga());
+    await createMessagingGroupAgent(mga());
     await deleteMessagingGroupAgent('mga-1');
     expect(await getMessagingGroupAgents('mg-1')).toHaveLength(0);
   });
 
-  it('should enforce foreign key on agent_group_id', () => {
-    expect(() => createMessagingGroupAgent({ ...mga(), agent_group_id: 'nonexistent' })).toThrow();
+  it('should enforce foreign key on agent_group_id', async () => {
+    await expect(createMessagingGroupAgent({ ...mga(), agent_group_id: 'nonexistent' })).rejects.toThrow();
   });
 
   it('auto-creates an agent_destinations row for the wiring', async () => {
     const { getDestinationByTarget, getDestinations } =
       await import('../modules/agent-to-agent/db/agent-destinations.js');
-    createMessagingGroupAgent(mga());
+    await createMessagingGroupAgent(mga());
 
-    const dest = getDestinationByTarget('ag-1', 'channel', 'mg-1');
+    const dest = await getDestinationByTarget('ag-1', 'channel', 'mg-1');
     expect(dest).toBeDefined();
     expect(dest!.local_name).toBe('gen'); // normalized from mg.name='Gen'
-    expect(getDestinations('ag-1')).toHaveLength(1);
+    expect(await getDestinations('ag-1')).toHaveLength(1);
   });
 
   it('does not duplicate destination row on re-wiring', async () => {
     const { getDestinations } = await import('../modules/agent-to-agent/db/agent-destinations.js');
-    createMessagingGroupAgent(mga());
+    await createMessagingGroupAgent(mga());
     // Re-create the same wiring throws (PK unique), but even if we got the
     // row in some other way (e.g. via createDestination directly followed
     // by createMessagingGroupAgent), we should not end up with two rows.
     await deleteMessagingGroupAgent('mga-1');
-    createMessagingGroupAgent(mga());
-    expect(getDestinations('ag-1')).toHaveLength(1);
+    await createMessagingGroupAgent(mga());
+    expect(await getDestinations('ag-1')).toHaveLength(1);
   });
 
   it('breaks local_name collisions within an agent group', async () => {
     const { getDestinations } = await import('../modules/agent-to-agent/db/agent-destinations.js');
     // Two messaging groups with the same `name` wired to the same agent
     // should get distinct local_names (gen, gen-2).
-    createMessagingGroupAgent(mga());
+    await createMessagingGroupAgent(mga());
     await createMessagingGroup({
       id: 'mg-2',
       channel_type: 'discord',
@@ -306,11 +345,43 @@ describe('messaging group agents', () => {
       unknown_sender_policy: 'strict',
       created_at: now(),
     });
-    createMessagingGroupAgent({ ...mga(), id: 'mga-2', messaging_group_id: 'mg-2' });
+    await createMessagingGroupAgent({ ...mga(), id: 'mga-2', messaging_group_id: 'mg-2' });
 
-    const dests = getDestinations('ag-1')
-      .map((d) => d.local_name)
-      .sort();
+    const dests = (await getDestinations('ag-1')).map((d) => d.local_name).sort();
+    expect(dests).toEqual(['gen', 'gen-2']);
+  });
+
+  /**
+   * #460 round 2: the companion destination's lookup + suffix allocation +
+   * insert must be serialized WITH the wiring row. Run after commit, two
+   * concurrent wirings with the same normalized name both observe the base
+   * `local_name` unused and the second insert dies on the
+   * (agent_group_id, local_name) primary key after its wiring row committed.
+   * Reverting the move into `createMessagingGroupAgent`'s transaction fails
+   * this test with that constraint error.
+   */
+  it('allocates distinct local_names for two concurrent wirings with the same name', async () => {
+    const { getDestinations } = await import('../modules/agent-to-agent/db/agent-destinations.js');
+    await createMessagingGroup({
+      id: 'mg-2',
+      channel_type: 'discord',
+      platform_id: 'chan-2',
+      name: 'Gen',
+      is_group: 1,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+    nameLookupBarrier.armed = true;
+    try {
+      await Promise.all([
+        createMessagingGroupAgent(mga()),
+        createMessagingGroupAgent({ ...mga(), id: 'mga-2', messaging_group_id: 'mg-2' }),
+      ]);
+    } finally {
+      nameLookupBarrier.armed = false;
+    }
+
+    const dests = (await getDestinations('ag-1')).map((d) => d.local_name).sort();
     expect(dests).toEqual(['gen', 'gen-2']);
   });
 });
@@ -393,19 +464,19 @@ describe('getChannelPeers — sibling-adapter awareness', () => {
       instructions_profile: null,
       created_at: now(),
     };
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       ...base,
       id: 'mga-primary',
       messaging_group_id: 'mg-primary',
       agent_group_id: 'primary',
     });
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       ...base,
       id: 'mga-example-assistant-codex',
       messaging_group_id: 'mg-example-assistant-codex',
       agent_group_id: 'example-assistant-codex',
     });
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       ...base,
       id: 'mga-unrelated',
       messaging_group_id: 'mg-other',
@@ -495,13 +566,13 @@ describe('getChannelPeers — workgroup tenant boundary', () => {
       instructions_profile: null,
       created_at: now(),
     };
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       ...base,
       id: 'mga-primary-collide',
       messaging_group_id: 'mg-primary-collide',
       agent_group_id: 'primary',
     });
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       ...base,
       id: 'mga-helper-collide',
       messaging_group_id: 'mg-helper-collide',
@@ -536,7 +607,7 @@ describe('getChannelPeers — workgroup tenant boundary', () => {
       unknown_sender_policy: 'strict',
       created_at: now(),
     });
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       id: 'mga-orphan',
       messaging_group_id: 'mg-orphan',
       agent_group_id: 'orphan',
@@ -665,7 +736,7 @@ describe('sessions', () => {
 
   it('should delete', async () => {
     await createSession(sess());
-    deleteSession('sess-1');
+    await deleteSession('sess-1');
     expect(await getSession('sess-1')).toBeUndefined();
   });
 });
@@ -783,8 +854,8 @@ describe('assertSameWorkgroupWiring (via createMessagingGroupAgent)', () => {
   it('allows wiring agents that share a workgroup', async () => {
     makeWorkgroup('wg-1');
     getRawDb().prepare("UPDATE agent_groups SET workgroup_id = 'wg-1' WHERE id IN ('ag-a','ag-b')").run();
-    createMessagingGroupAgent(mgaRow('mga-a', 'ag-a'));
-    createMessagingGroupAgent(mgaRow('mga-b', 'ag-b'));
+    await createMessagingGroupAgent(mgaRow('mga-a', 'ag-a'));
+    await createMessagingGroupAgent(mgaRow('mga-b', 'ag-b'));
     expect(await getMessagingGroupAgents('mg-wg')).toHaveLength(2);
   });
 
@@ -793,8 +864,8 @@ describe('assertSameWorkgroupWiring (via createMessagingGroupAgent)', () => {
     makeWorkgroup('wg-2');
     getRawDb().prepare("UPDATE agent_groups SET workgroup_id = 'wg-1' WHERE id = 'ag-a'").run();
     getRawDb().prepare("UPDATE agent_groups SET workgroup_id = 'wg-2' WHERE id = 'ag-c'").run();
-    createMessagingGroupAgent(mgaRow('mga-a', 'ag-a'));
-    expect(() => createMessagingGroupAgent(mgaRow('mga-c', 'ag-c'))).toThrow(/same workgroup/);
+    await createMessagingGroupAgent(mgaRow('mga-a', 'ag-a'));
+    await expect(createMessagingGroupAgent(mgaRow('mga-c', 'ag-c'))).rejects.toThrow(/same workgroup/);
     expect(await getMessagingGroupAgents('mg-wg')).toHaveLength(1);
   });
 
@@ -817,17 +888,17 @@ describe('assertSameWorkgroupWiring (via createMessagingGroupAgent)', () => {
     makeWorkgroup('wg-2');
     getRawDb().prepare("UPDATE agent_groups SET workgroup_id = 'wg-1' WHERE id = 'ag-a'").run();
     getRawDb().prepare("UPDATE agent_groups SET workgroup_id = 'wg-2' WHERE id = 'ag-c'").run();
-    createMessagingGroupAgent(mgaRow('mga-a', 'ag-a'));
-    expect(() =>
+    await createMessagingGroupAgent(mgaRow('mga-a', 'ag-a'));
+    await expect(
       createMessagingGroupAgent({ ...mgaRow('mga-c', 'ag-c'), messaging_group_id: 'mg-wg-sibling' }),
-    ).not.toThrow();
+    ).resolves.toBeUndefined();
   });
 
-  it('falls back to folder identity when workgroup_id is null', () => {
+  it('falls back to folder identity when workgroup_id is null', async () => {
     // Pre-workgroup rows: identity = folder, matching container-runner's
     // shared-dir resolution. Different folders → different data pools → reject.
-    createMessagingGroupAgent(mgaRow('mga-a', 'ag-a'));
-    expect(() => createMessagingGroupAgent(mgaRow('mga-b', 'ag-b'))).toThrow(/same workgroup/);
+    await createMessagingGroupAgent(mgaRow('mga-a', 'ag-a'));
+    await expect(createMessagingGroupAgent(mgaRow('mga-b', 'ag-b'))).rejects.toThrow(/same workgroup/);
   });
 });
 

@@ -202,7 +202,7 @@ export const resolver: UnwiredChannelResolverFn = async (event, mg) => {
     const { row, created } = await insertOrAdopt(
       mga,
       async (candidate) => {
-        createMessagingGroupAgent(candidate);
+        await createMessagingGroupAgent(candidate);
       },
       async () => (await getMessagingGroupAgents(mg.id)).find((w) => w.agent_group_id === agentGroup.id),
     );

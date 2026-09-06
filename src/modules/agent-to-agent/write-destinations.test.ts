@@ -103,14 +103,14 @@ beforeEach(async () => {
       created_at: now(),
     });
   }
-  createDestination({
+  await createDestination({
     agent_group_id: AGENT_GROUP_ID,
     local_name: 'keep',
     target_type: 'channel',
     target_id: 'mg-keep',
     created_at: now(),
   });
-  createDestination({
+  await createDestination({
     agent_group_id: AGENT_GROUP_ID,
     local_name: 'revoked',
     target_type: 'channel',

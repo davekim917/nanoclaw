@@ -27,7 +27,7 @@ import { authChildTaskAction, flagNeedsInput } from './db/tasks.js';
  * `src/dashboard/steer.ts:applySteer`.
  */
 export async function applySpawnNeedsInput(content: Record<string, unknown>, callerSession: Session): Promise<void> {
-  const auth = authChildTaskAction(content, callerSession, 'applySpawnNeedsInput');
+  const auth = await authChildTaskAction(content, callerSession, 'applySpawnNeedsInput');
   if (!auth) return;
   const { task, taskId } = auth;
 
@@ -36,7 +36,7 @@ export async function applySpawnNeedsInput(content: Record<string, unknown>, cal
 
   let flipped: boolean;
   try {
-    flipped = flagNeedsInput(taskId, question);
+    flipped = await flagNeedsInput(taskId, question);
   } catch (err) {
     log.warn('applySpawnNeedsInput: DB update failed — silently swallowing', { taskId, err });
     return;
@@ -62,7 +62,7 @@ export async function applySpawnNeedsInput(content: Record<string, unknown>, cal
     return;
   }
 
-  const mg = getMessagingGroup(task.child_messaging_group_id);
+  const mg = await getMessagingGroup(task.child_messaging_group_id);
   if (!mg) return;
 
   const adapter = getChannelAdapter(mg.channel_type);

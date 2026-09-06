@@ -41,8 +41,8 @@ async function seedGroups(): Promise<void> {
     .run('sess-child', 'ag-child', now());
 }
 
-function makeRunningTask(lastProgressAt?: string): Task {
-  return insertTaskAtomic({
+async function makeRunningTask(lastProgressAt?: string): Promise<Task> {
+  return (await insertTaskAtomic({
     task_id: 'task-1',
     idempotency_key: 'ik-1',
     parent_session_id: 'sess-parent',
@@ -68,7 +68,7 @@ function makeRunningTask(lastProgressAt?: string): Task {
     dispatch_completion_attempts: 0,
     completion_lease_at: null,
     surface_mode: 'headless',
-  })!;
+  }))!;
 }
 
 function makeChildSession(): Session {
@@ -108,13 +108,13 @@ describe('applySpawnProgress', () => {
   it('test_progress_resets_timer: updates last_progress_at and last_progress_message', async () => {
     await setupDb();
     await seedGroups();
-    makeRunningTask();
+    await makeRunningTask();
 
     const before = Date.now();
     await applySpawnProgress({ task_id: 'task-1', message: 'Working' }, makeChildSession());
     const after = Date.now();
 
-    const task = getTaskById('task-1');
+    const task = await getTaskById('task-1');
     expect(task!.last_progress_message).toBe('Working');
     // last_progress_at should be within this test run
     const progressMs = new Date(task!.last_progress_at!).getTime();
@@ -125,25 +125,25 @@ describe('applySpawnProgress', () => {
   it('test_progress_truncates_500: truncates message to 500 chars', async () => {
     await setupDb();
     await seedGroups();
-    makeRunningTask();
+    await makeRunningTask();
 
     await applySpawnProgress({ task_id: 'task-1', message: 'X'.repeat(1000) }, makeChildSession());
 
-    const task = getTaskById('task-1');
+    const task = await getTaskById('task-1');
     expect(task!.last_progress_message!.length).toBe(500);
   });
 
   it('test_progress_wrong_session_silent: does not throw on auth mismatch', async () => {
     await setupDb();
     await seedGroups();
-    makeRunningTask();
+    await makeRunningTask();
 
     await expect(
       applySpawnProgress({ task_id: 'task-1', message: 'Working' }, makeWrongSession()),
     ).resolves.not.toThrow();
 
     // Task should be unchanged (no update happened)
-    const task = getTaskById('task-1');
+    const task = await getTaskById('task-1');
     expect(task!.last_progress_message).toBeNull(); // not updated
   });
 
@@ -151,7 +151,7 @@ describe('applySpawnProgress', () => {
     await setupDb();
     await seedGroups();
     // Insert task with status=pending (unusual but should still work)
-    insertTaskAtomic({
+    await insertTaskAtomic({
       task_id: 'task-pend',
       idempotency_key: 'ik-p',
       parent_session_id: 'sess-parent',

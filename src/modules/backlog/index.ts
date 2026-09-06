@@ -31,7 +31,7 @@ async function handleAddShipLog(content: Record<string, unknown>, session: Sessi
   }
 
   const id = (content.id as string) || `ship-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  addShipLogEntry({
+  await addShipLogEntry({
     id,
     agent_group_id: agentGroupId,
     title,
@@ -57,7 +57,7 @@ async function handleAddBacklogItem(content: Record<string, unknown>, session: S
 
   const id = (content.id as string) || `backlog-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const now = new Date().toISOString();
-  addBacklogItem({
+  await addBacklogItem({
     id,
     agent_group_id: agentGroupId,
     title,
@@ -98,7 +98,7 @@ async function handleUpdateBacklogItem(content: Record<string, unknown>, session
   if (content.tags !== undefined) updates.tags = content.tags as string;
   if (content.notes !== undefined) updates.notes = content.notes as string;
 
-  const updated = updateBacklogItem(itemId, updates, agentGroupId ?? undefined);
+  const updated = await updateBacklogItem(itemId, updates, agentGroupId ?? undefined);
   if (updated) {
     log.info('Backlog item updated', { itemId, updates });
   } else {
@@ -119,7 +119,7 @@ async function handleDeleteBacklogItem(content: Record<string, unknown>, session
     return;
   }
 
-  const deleted = deleteBacklogItem(itemId, agentGroupId);
+  const deleted = await deleteBacklogItem(itemId, agentGroupId);
   if (deleted) {
     log.info('Backlog item deleted', { itemId, agentGroupId });
   } else {

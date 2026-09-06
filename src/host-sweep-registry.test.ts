@@ -270,7 +270,8 @@ vi.mock('./db/channel-ingress-receipts.js', async (importOriginal) => ({
 }));
 vi.mock('./db/usage.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./db/usage.js')>()),
-  rollupSessionUsage: () => 0,
+  getUsageWatermark: async () => 0,
+  rollupSessionUsage: async () => 0,
   pruneOldTurnUsage: async () => undefined,
 }));
 vi.mock('./github-app-token.js', async (importOriginal) => ({
@@ -2285,7 +2286,7 @@ describe('sweep duty registry (S2-PR2)', () => {
           child_session_id: null,
         },
       ] as never);
-      vi.spyOn(tasksModule, 'transitionToTerminal').mockReturnValue(true);
+      vi.spyOn(tasksModule, 'transitionToTerminal').mockResolvedValue(true);
 
       await _sweepTaskWatchdogForTesting();
 

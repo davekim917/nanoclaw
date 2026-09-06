@@ -12,12 +12,12 @@
  * `scheduled-move-recovery: sweep hook failed` warn string on both, so a log
  * search for that string still finds every failure it used to.
  */
-import type Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 
 import { log } from '../../log.js';
-import { getRawDb } from '../../db/connection.js';
+import { getDb } from '../../db/connection.js';
+import { withCentralSync } from '../../db/central-lease.js';
 import { withQuietInvalidationSync } from '../../db/sessions.js';
 import { sessionsBaseDir } from '../../session-manager.js';
 import { parseSqliteUtc } from '../mailbox/sqlite-utc.js';
@@ -57,21 +57,25 @@ type MoveIntentSnapshot = TaskRowSnapshot;
  * minimal test DB, or no session exists yet because the move crashed before the
  * target insert). A null target session contributes 0 to the scoped count.
  */
-function resolveTargetSessionId(
-  centralDb: Database.Database,
+async function resolveTargetSessionId(
   targetAgentGroupId: string,
   targetMessagingGroupId: string,
-): string | null {
+): Promise<string | null> {
   try {
-    const row = centralDb
-      .prepare(
-        "SELECT id FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_id IS NULL AND status = 'active' LIMIT 1",
-      )
-      .get(targetAgentGroupId, targetMessagingGroupId) as { id: string } | undefined;
+    const row = await getDb().get<{ id: string }>(
+      "SELECT id FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_id IS NULL AND status = 'active' LIMIT 1",
+      targetAgentGroupId,
+      targetMessagingGroupId,
+    );
     return row?.id ?? null;
   } catch {
     return null;
   }
+}
+
+/** SQLite's "no such table" — the feature is not installed, not a failure. */
+function isMissingTable(err: unknown): boolean {
+  return err instanceof Error && /no such table/i.test(err.message);
 }
 
 interface ParsedIntentDetail {
@@ -120,7 +124,7 @@ function parseIntentDetail(detailJson: string | null): ParsedIntentDetail {
  *
  * Autonomous, not just observable. Additive — no firing-path change (C1).
  */
-export async function recoverMoveIntents(centralDb: Database.Database, options: MoveRecoveryOptions): Promise<void> {
+export async function recoverMoveIntents(options: MoveRecoveryOptions): Promise<void> {
   const nowMs = options.nowMs ?? Date.now();
   // ONE sessions root, always the real one. `dataDir` used to be injectable and
   // no production caller ever injected it — the sweep's only call site passes
@@ -141,16 +145,17 @@ export async function recoverMoveIntents(centralDb: Database.Database, options: 
     ts: string;
   }>;
   try {
-    intents = centralDb
-      .prepare(
-        `SELECT session_id, agent_group_id, series_id, detail_json, correlation_id, ts
+    intents = await getDb().all<(typeof intents)[number]>(
+      `SELECT session_id, agent_group_id, series_id, detail_json, correlation_id, ts
            FROM scheduled_audit
           WHERE action = 'move_intent' AND resolved_at IS NULL`,
-      )
-      .all() as typeof intents;
-  } catch {
-    // Table absent (feature not installed) — nothing to recover.
-    return;
+    );
+  } catch (err) {
+    // Table absent (feature not installed) — nothing to recover. Anything
+    // else (a driver that is not initialized, a locked file) is a real
+    // failure and surfaces through the duty's own catch.
+    if (isMissingTable(err)) return;
+    throw err;
   }
 
   for (const intent of intents) {
@@ -164,7 +169,7 @@ export async function recoverMoveIntents(centralDb: Database.Database, options: 
     const source = { agentGroupId: intent.agent_group_id, sessionId: intent.session_id };
     const targetSessionId =
       detail.targetAgentGroupId && detail.targetMessagingGroupId
-        ? resolveTargetSessionId(centralDb, detail.targetAgentGroupId, detail.targetMessagingGroupId)
+        ? await resolveTargetSessionId(detail.targetAgentGroupId, detail.targetMessagingGroupId)
         : null;
     const target =
       detail.targetAgentGroupId && targetSessionId
@@ -198,7 +203,7 @@ export async function recoverMoveIntents(centralDb: Database.Database, options: 
           { seriesId: intent.series_id, correlationId: intent.correlation_id, liveCount: live.count },
         );
       }
-      purgeIntentBody(centralDb, intent.correlation_id);
+      await purgeIntentBody(intent.correlation_id);
       continue;
     }
 
@@ -210,7 +215,7 @@ export async function recoverMoveIntents(centralDb: Database.Database, options: 
         seriesId: intent.series_id,
         correlationId: intent.correlation_id,
       });
-      purgeIntentBody(centralDb, intent.correlation_id);
+      await purgeIntentBody(intent.correlation_id);
       continue;
     }
 
@@ -222,7 +227,7 @@ export async function recoverMoveIntents(centralDb: Database.Database, options: 
         seriesId: intent.series_id,
         correlationId: intent.correlation_id,
       });
-      purgeIntentBody(centralDb, intent.correlation_id);
+      await purgeIntentBody(intent.correlation_id);
       continue;
     }
     const snapshot = detail.snapshot;
@@ -231,59 +236,61 @@ export async function recoverMoveIntents(centralDb: Database.Database, options: 
       // Existing-only: the existsSync above already answered "is there a
       // session to restore into", and a recovery pass must never re-provision
       // one it has just been told is gone (invariant I-10).
-      outcome = await withExistingMailboxSession(intent.agent_group_id, intent.session_id, (mailbox) => {
-        // Idempotency re-check: the restore + the resolved_at stamp span two DB
-        // files (not atomic), so re-confirm a readable zero-live IMMEDIATELY before
-        // insert. An unreadable re-check defers (never restore on unknown).
-        const recheck = countLiveRowsInSessions(dataDir, [source, target], intent.series_id);
-        if (recheck.unreadable) return 'deferred' as const;
-        if (recheck.count === 0) {
-          // This duty runs in tick:housekeeping — AFTER the session fan-out and
-          // after the quiet-mark flush. The fan-out saw a source with no live
-          // task (that is the crash state this recovery exists for) and may have
-          // just marked it quiet, so the row about to be restored is a DUE task
-          // hiding behind a mark taken seconds ago, and S2-PR15 would carry that
-          // mark across a restart. The central-DB invalidation clears it.
-          //
-          // Invalidate BEFORE the restore, in the same synchronous turn (Codex
-          // pre-pass Part C, round 3 H1): inbound.db and the central DB are two
-          // separate files with no shared transaction, so a crash between the
-          // two statements is possible even with no `await` between them.
-          // Invalidate-then-restore's worst case is one wasted sweep of a
-          // session that then finds nothing new to restore (the idempotency
-          // re-check above already tolerates a repeated call); the reverse
-          // leaves the restored row durable while the persisted quiet mark
-          // survives the crash, hiding a due task for up to
-          // `QUIET_SESSION_BACKOFF_MS` after a warmed restart.
-          //
-          // FAIL-CLOSED (Codex round 2, H1; round 3, H2): the invalidation
-          // throws — on a central-DB error AND on a session row that is gone or
-          // no longer active — and the throw escapes the mailbox action into
-          // this loop's catch, which logs and leaves the intent UNRESOLVED for
-          // the next recovery pass. A swallowed failure would instead restore
-          // the row behind a mark nothing clears and then stamp the intent
-          // resolved — the one outcome no later pass can repair.
-          withQuietInvalidationSync(intent.session_id, () =>
-            mailbox.restoreTaskRow({
-              // Fresh id — the cancelled source row may still hold the snapshot id.
-              id: `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-              series_id: snapshot.series_id,
-              status: snapshot.status,
-              process_after: snapshot.process_after,
-              // Optional on the parsed audit body: an intent written before the
-              // column existed has none, and restoreTaskRow falls back.
-              scheduled_for: snapshot.scheduled_for,
-              recurrence: snapshot.recurrence,
-              content: snapshot.content,
-              platform_id: snapshot.platform_id,
-              channel_type: snapshot.channel_type,
-              thread_id: snapshot.thread_id,
-              kind: snapshot.kind,
-            }),
-          );
-        }
-        return 'restored' as const;
-      });
+      outcome = await withExistingMailboxSession(intent.agent_group_id, intent.session_id, (mailbox) =>
+        withCentralSync(() => {
+          // Idempotency re-check: the restore + the resolved_at stamp span two DB
+          // files (not atomic), so re-confirm a readable zero-live IMMEDIATELY before
+          // insert. An unreadable re-check defers (never restore on unknown).
+          const recheck = countLiveRowsInSessions(dataDir, [source, target], intent.series_id);
+          if (recheck.unreadable) return 'deferred' as const;
+          if (recheck.count === 0) {
+            // This duty runs in tick:housekeeping — AFTER the session fan-out and
+            // after the quiet-mark flush. The fan-out saw a source with no live
+            // task (that is the crash state this recovery exists for) and may have
+            // just marked it quiet, so the row about to be restored is a DUE task
+            // hiding behind a mark taken seconds ago, and S2-PR15 would carry that
+            // mark across a restart. The central-DB invalidation clears it.
+            //
+            // Invalidate BEFORE the restore, in the same synchronous turn (Codex
+            // pre-pass Part C, round 3 H1): inbound.db and the central DB are two
+            // separate files with no shared transaction, so a crash between the
+            // two statements is possible even with no `await` between them.
+            // Invalidate-then-restore's worst case is one wasted sweep of a
+            // session that then finds nothing new to restore (the idempotency
+            // re-check above already tolerates a repeated call); the reverse
+            // leaves the restored row durable while the persisted quiet mark
+            // survives the crash, hiding a due task for up to
+            // `QUIET_SESSION_BACKOFF_MS` after a warmed restart.
+            //
+            // FAIL-CLOSED (Codex round 2, H1; round 3, H2): the invalidation
+            // throws — on a central-DB error AND on a session row that is gone or
+            // no longer active — and the throw escapes the mailbox action into
+            // this loop's catch, which logs and leaves the intent UNRESOLVED for
+            // the next recovery pass. A swallowed failure would instead restore
+            // the row behind a mark nothing clears and then stamp the intent
+            // resolved — the one outcome no later pass can repair.
+            withQuietInvalidationSync(intent.session_id, () =>
+              mailbox.restoreTaskRow({
+                // Fresh id — the cancelled source row may still hold the snapshot id.
+                id: `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                series_id: snapshot.series_id,
+                status: snapshot.status,
+                process_after: snapshot.process_after,
+                // Optional on the parsed audit body: an intent written before the
+                // column existed has none, and restoreTaskRow falls back.
+                scheduled_for: snapshot.scheduled_for,
+                recurrence: snapshot.recurrence,
+                content: snapshot.content,
+                platform_id: snapshot.platform_id,
+                channel_type: snapshot.channel_type,
+                thread_id: snapshot.thread_id,
+                kind: snapshot.kind,
+              }),
+            );
+          }
+          return 'restored' as const;
+        }, 'scheduled-move recovery restore'),
+      );
     } catch (err) {
       log.error('scheduled-move-recovery: restore failed', {
         seriesId: intent.series_id,
@@ -309,7 +316,7 @@ export async function recoverMoveIntents(centralDb: Database.Database, options: 
     }
     // Stamp + purge AFTER the restore (so a crash before this makes the next
     // pass re-evaluate; now a live row exists → it stamps without re-restoring).
-    purgeIntentBody(centralDb, intent.correlation_id);
+    await purgeIntentBody(intent.correlation_id);
   }
 }
 
@@ -323,20 +330,20 @@ const AUDIT_BODY_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
  * cancel-vs-completed distinguishability (the `action='cancel'` join, §4.3)
  * indefinitely. Design §4.4 retention.
  */
-export function pruneAuditBodies(centralDb: Database.Database, options: { nowMs?: number }): void {
+export async function pruneAuditBodies(options: { nowMs?: number }): Promise<void> {
   const nowMs = options.nowMs ?? Date.now();
   const cutoff = new Date(nowMs - AUDIT_BODY_RETENTION_MS).toISOString();
   try {
-    centralDb
-      .prepare(
-        `UPDATE scheduled_audit
-            SET before_preview = NULL, after_preview = NULL, detail_json = NULL
-          WHERE ts < ?
-            AND (before_preview IS NOT NULL OR after_preview IS NOT NULL OR detail_json IS NOT NULL)`,
-      )
-      .run(cutoff);
-  } catch {
-    // Table absent — nothing to prune.
+    await getDb().run(
+      `UPDATE scheduled_audit
+          SET before_preview = NULL, after_preview = NULL, detail_json = NULL
+        WHERE ts < ?
+          AND (before_preview IS NOT NULL OR after_preview IS NOT NULL OR detail_json IS NOT NULL)`,
+      cutoff,
+    );
+  } catch (err) {
+    // Table absent — nothing to prune. Anything else surfaces.
+    if (!isMissingTable(err)) throw err;
   }
 }
 
@@ -359,7 +366,7 @@ export function registerScheduledMoveSweepDuties(): void {
     // firing-path change (C1).
     run: async () => {
       try {
-        await recoverMoveIntents(getRawDb(), {});
+        await recoverMoveIntents({});
       } catch (err) {
         log.warn('scheduled-move-recovery: sweep hook failed', { err });
       }
@@ -371,9 +378,9 @@ export function registerScheduledMoveSweepDuties(): void {
     phase: 'tick:housekeeping',
     order: 60,
     // 90d audit-body prune, the companion of the move recovery above.
-    run: () => {
+    run: async () => {
       try {
-        pruneAuditBodies(getRawDb(), {});
+        await pruneAuditBodies({});
       } catch (err) {
         log.warn('scheduled-move-recovery: sweep hook failed', { err });
       }

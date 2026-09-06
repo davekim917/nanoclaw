@@ -47,8 +47,8 @@ export function registerOrchestratorSweepDuties(): void {
     // state is current. Carries no guard of its own: it was the earliest
     // unguarded call in the old tick body, and the phase runner is now the
     // guard that keeps its throw from costing every duty behind it.
-    run: () => {
-      runReconcilerSweep();
+    run: async () => {
+      await runReconcilerSweep();
     },
   });
 
@@ -70,8 +70,8 @@ export function registerOrchestratorSweepDuties(): void {
     order: 70,
     // Auto-archive completed tasks older than 24h so the "Done" lane stays
     // representative of recent work; failed tasks are intentionally skipped.
-    run: () => {
-      autoArchiveOldCompleted();
+    run: async () => {
+      await autoArchiveOldCompleted();
     },
   });
 }

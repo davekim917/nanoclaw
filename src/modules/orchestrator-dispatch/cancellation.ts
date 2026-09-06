@@ -16,7 +16,7 @@ export async function applySpawnCancel(content: Record<string, unknown>, callerS
     return;
   }
 
-  const task = getTaskById(taskId);
+  const task = await getTaskById(taskId);
   if (!task) {
     log.warn('applySpawnCancel: task not found', { taskId });
     return;
@@ -35,7 +35,7 @@ export async function applySpawnCancel(content: Record<string, unknown>, callerS
   const now = new Date().toISOString();
 
   if (task.status === 'pending' || task.status === 'running') {
-    const transitioned = transitionToTerminal(taskId, 'cancelled', {
+    const transitioned = await transitionToTerminal(taskId, 'cancelled', {
       cancelled_at: now,
     });
 

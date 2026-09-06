@@ -469,7 +469,7 @@ describe('router', () => {
       unknown_sender_policy: 'public',
       created_at: now(),
     });
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       id: 'mga-1',
       messaging_group_id: 'mg-1',
       agent_group_id: 'ag-1',
@@ -607,7 +607,7 @@ describe('router', () => {
     });
     // Fan-out siblings must share a workgroup (assertSameWorkgroupWiring).
     sameWorkgroup('wg-fanout', ['ag-1', 'ag-2']);
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       id: 'mga-2',
       messaging_group_id: 'mg-1',
       agent_group_id: 'ag-2',
@@ -743,7 +743,7 @@ describe('router — channel instances', () => {
       ['mga-default', 'mg-default', 'ag-1'],
       ['mga-tester', 'mg-tester', 'ag-2'],
     ] as const) {
-      createMessagingGroupAgent({
+      await createMessagingGroupAgent({
         id: mgaId,
         messaging_group_id: mgId,
         agent_group_id: agId,
@@ -918,7 +918,7 @@ describe('router — per-wiring thread policy', () => {
       unknown_sender_policy: 'public',
       created_at: now(),
     });
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       id: 'mga-tp',
       messaging_group_id: 'mg-tp',
       agent_group_id: 'ag-tp',
@@ -1094,7 +1094,7 @@ describe('router — per-wiring thread policy', () => {
       unknown_sender_policy: 'public',
       created_at: now(),
     });
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       id: 'mga-ws-seed',
       messaging_group_id: 'mg-ws-seed',
       agent_group_id: 'ag-tp',
@@ -1175,7 +1175,7 @@ describe('routing metadata preservation', () => {
       unknown_sender_policy: 'public',
       created_at: now(),
     });
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       id: 'mga-1',
       messaging_group_id: 'mg-1',
       agent_group_id: 'ag-1',
@@ -1254,7 +1254,7 @@ describe('routing metadata preservation', () => {
     });
     // Fan-out siblings must share a workgroup (assertSameWorkgroupWiring).
     sameWorkgroup('wg-fanout-2', ['ag-1', 'ag-2']);
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       id: 'mga-2',
       messaging_group_id: 'mg-1',
       agent_group_id: 'ag-2',
@@ -1665,7 +1665,7 @@ describe('agent-to-agent routing', () => {
     // registering that wiring, so both of PA's chats need an explicit
     // `messaging_group_agents` row — mirroring the real /manage-channels
     // wiring step this scenario is modeling.
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       id: 'mga-pa-slack',
       messaging_group_id: 'mg-slack',
       agent_group_id: 'ag-pa',
@@ -1692,7 +1692,7 @@ describe('agent-to-agent routing', () => {
       unknown_sender_policy: 'public',
       created_at: now(),
     });
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       id: 'mga-pa-discord',
       messaging_group_id: 'mg-discord',
       agent_group_id: 'ag-pa',

@@ -23,7 +23,7 @@ import {
   channelNameProvenance,
   channelNameProvenanceAccepts,
   getMessagingGroupByPlatform,
-  updateMessagingGroup,
+  applyChannelMetadataUpdates,
 } from './db/messaging-groups.js';
 import type { ChannelNameSource, MessagingGroupUpdates } from './db/messaging-groups.js';
 import { ensureContainerRuntimeRunning } from './container-runtime.js';
@@ -466,6 +466,9 @@ export async function main(): Promise<void> {
   // 1. Init central DB
   const dbPath = path.join(DATA_DIR, 'v2.db');
   await initDb(dbPath);
+  // The migration runner stays synchronous on the raw handle (plan §4.3
+  // amendment): it runs at boot with no concurrent central-DB activity, and
+  // the boot-time workgroup reconcilers below take the same handle.
   const db = getRawDb();
   runMigrations(db);
 
@@ -509,7 +512,7 @@ export async function main(): Promise<void> {
   // process makes mounts the same tree, not the live checkout mid-`git pull`.
   activateAgentRunnerSource();
 
-  resetProcessingChannelIngress();
+  await resetProcessingChannelIngress();
 
   // Workgroup FS reconciliation — runs after migrations to drain the
   // _migration036_report temp table. On FS failure, exit; restart is the recovery
@@ -654,7 +657,7 @@ export async function main(): Promise<void> {
   // 1b. Orchestrator-dispatch reconciler startup scan — must run after migrations
   // so the tasks table exists. Recovers any tasks left in 'pending' with
   // admitted_at set but no child_session_id (host crashed mid-completion).
-  runDispatchReconcilerOnStartup();
+  await runDispatchReconcilerOnStartup();
 
   // 1c. Backfill container_configs from legacy container.json files.
   // Idempotent — skips groups that already have a config row.
@@ -668,7 +671,7 @@ export async function main(): Promise<void> {
   // 2-bis. Resolve any session archival a previous stop interrupted, before
   // the sweep can hand out work to a row still parked in 'archiving'.
   try {
-    finishInterruptedSessionArchivals();
+    await finishInterruptedSessionArchivals();
   } catch (err) {
     log.error('Interrupted session archival recovery failed', { err });
   }
@@ -780,12 +783,13 @@ export async function main(): Promise<void> {
       async onMetadata(platformId, name, isGroup) {
         const mg = await getMessagingGroupByPlatform(adapter.channelType, platformId);
         if (!mg) return; // router hasn't auto-created it yet — next inbound will
-        const updates = resolveChannelMetadataUpdates(mg, name, isGroup, {
-          platform: adapter.channelType,
-          source: 'adapter',
-        });
+        const incoming = { platform: adapter.channelType, source: 'adapter' as const };
+        const updates = resolveChannelMetadataUpdates(mg, name, isGroup, incoming);
         if (Object.keys(updates).length === 0) return;
-        await updateMessagingGroup(mg.id, updates);
+        // The provenance check runs again INSIDE the write (#416 site 5): the
+        // read above and this write are separated by an await, and the
+        // router's classified name may land between them.
+        await applyChannelMetadataUpdates(mg.id, updates, incoming);
         log.info('Channel metadata persisted', {
           channelType: adapter.channelType,
           platformId,

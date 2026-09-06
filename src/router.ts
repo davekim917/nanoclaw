@@ -17,6 +17,7 @@
  * drops (no agent wired, no trigger match); the access gate writes rows
  * for policy refusals.
  */
+import { withCentralSync, withRawDb } from './db/central-lease.js';
 import { persistInboundAttachments } from './attachment-downloader.js';
 import { getChannelAdapter, getChannelDefaults, hasDeclaredChannelDefaults } from './channels/channel-registry.js';
 import { resolveThreadPolicy, resolveUnknownSenderPolicy } from './channels/channel-defaults.js';
@@ -33,7 +34,6 @@ import {
   getMessagingGroupWithAgentCount,
   updateMessagingGroup,
 } from './db/messaging-groups.js';
-import { getRawDb } from './db/connection.js';
 import { insertOrAdopt } from './db/insert-or-adopt.js';
 import {
   claimChannelIngress,
@@ -103,32 +103,40 @@ function adapterHasWorkspaceIdentity(channelType: string): boolean {
  * they unanimously have none), so the wiring falls through to the group
  * default rather than adopting an arbitrary channel's override.
  */
-function unanimousToneFor(agentGroupId: string, channelType: string): string | null {
-  const rows = getRawDb()
-    .prepare(
-      `SELECT DISTINCT mga.default_tone AS tone
+function unanimousToneFor(agentGroupId: string, channelType: string): Promise<string | null> {
+  return withCentralSync(
+    () =>
+      withRawDb((db) => {
+        const rows = db
+          .prepare(
+            `SELECT DISTINCT mga.default_tone AS tone
          FROM messaging_group_agents mga
          JOIN messaging_groups m ON m.id = mga.messaging_group_id
         WHERE mga.agent_group_id = ? AND m.channel_type = ?`,
-    )
-    .all(agentGroupId, channelType) as Array<{ tone: string | null }>;
-  return rows.length === 1 ? rows[0].tone : null;
+          )
+          .all(agentGroupId, channelType) as Array<{ tone: string | null }>;
+        return rows.length === 1 ? rows[0].tone : null;
+      }),
+    'router unanimousToneFor',
+  );
 }
 
-function inheritedAgentGroupFor(mg: MessagingGroup): { id: string; sourceMessagingGroupId: string } | null {
-  const db = getRawDb();
-  let rows: Array<{ agent_group_id: string; messaging_group_id: string; cnt: number }>;
+function inheritedAgentGroupFor(mg: MessagingGroup): Promise<{ id: string; sourceMessagingGroupId: string } | null> {
+  return withCentralSync(
+    () =>
+      withRawDb((db): { id: string; sourceMessagingGroupId: string } | null => {
+        let rows: Array<{ agent_group_id: string; messaging_group_id: string; cnt: number }>;
 
-  if (isDiscordChannelType(mg.channel_type) && mg.platform_id.startsWith('discord:')) {
-    const guildId = mg.platform_id.split(':')[1];
-    if (!guildId) return null;
-    // Scope the lookup to the same channel_type (same bot identity). With
-    // multi-bot forks, example-agent + example-agent-codex can both have wirings in the same
-    // guild — they're separate bots, so a fresh channel under one bot should
-    // inherit only that bot's wirings, not the other's.
-    rows = db
-      .prepare(
-        `SELECT mga.agent_group_id, MIN(mga.messaging_group_id) AS messaging_group_id, COUNT(*) AS cnt
+        if (isDiscordChannelType(mg.channel_type) && mg.platform_id.startsWith('discord:')) {
+          const guildId = mg.platform_id.split(':')[1];
+          if (!guildId) return null;
+          // Scope the lookup to the same channel_type (same bot identity). With
+          // multi-bot forks, example-agent + example-agent-codex can both have wirings in the same
+          // guild — they're separate bots, so a fresh channel under one bot should
+          // inherit only that bot's wirings, not the other's.
+          rows = db
+            .prepare(
+              `SELECT mga.agent_group_id, MIN(mga.messaging_group_id) AS messaging_group_id, COUNT(*) AS cnt
          FROM messaging_group_agents mga
          JOIN messaging_groups m ON m.id = mga.messaging_group_id
          WHERE m.channel_type = ?
@@ -136,44 +144,47 @@ function inheritedAgentGroupFor(mg: MessagingGroup): { id: string; sourceMessagi
            AND m.id != ?
          GROUP BY mga.agent_group_id
          ORDER BY COUNT(*) DESC, MIN(m.created_at) ASC`,
-      )
-      .all(mg.channel_type, `discord:${guildId}:%`, mg.id) as typeof rows;
-  } else if (adapterHasWorkspaceIdentity(mg.channel_type)) {
-    rows = db
-      .prepare(
-        `SELECT mga.agent_group_id, MIN(mga.messaging_group_id) AS messaging_group_id, COUNT(*) AS cnt
+            )
+            .all(mg.channel_type, `discord:${guildId}:%`, mg.id) as typeof rows;
+        } else if (adapterHasWorkspaceIdentity(mg.channel_type)) {
+          rows = db
+            .prepare(
+              `SELECT mga.agent_group_id, MIN(mga.messaging_group_id) AS messaging_group_id, COUNT(*) AS cnt
          FROM messaging_group_agents mga
          JOIN messaging_groups m ON m.id = mga.messaging_group_id
          WHERE m.channel_type = ?
            AND m.id != ?
          GROUP BY mga.agent_group_id
          ORDER BY COUNT(*) DESC, MIN(m.created_at) ASC`,
-      )
-      .all(mg.channel_type, mg.id) as typeof rows;
-  } else {
-    // Adapter without workspace identity — refuse auto-wire. Falls through
-    // to the operator approval gate (channel-registration). Without this
-    // guard, the first Telegram chat from any tenant would auto-claim the
-    // agent already wired for a different Telegram chat (cross-tenant).
-    log.info('auto-wire refused: adapter has no workspace identity', { channelType: mg.channel_type });
-    return null;
-  }
+            )
+            .all(mg.channel_type, mg.id) as typeof rows;
+        } else {
+          // Adapter without workspace identity — refuse auto-wire. Falls through
+          // to the operator approval gate (channel-registration). Without this
+          // guard, the first Telegram chat from any tenant would auto-claim the
+          // agent already wired for a different Telegram chat (cross-tenant).
+          log.info('auto-wire refused: adapter has no workspace identity', { channelType: mg.channel_type });
+          return null;
+        }
 
-  if (rows.length === 0) return null;
-  // SECURITY: refuse auto-wire when the workspace/guild has wirings to
-  // multiple distinct agent groups. The original "most existing wirings
-  // wins" heuristic would let the wrong tenant's agent claim a freshly
-  // created channel intended for another tenant — falls through to the
-  // operator approval gate instead.
-  if (rows.length > 1) {
-    log.info('auto-wire refused: workspace has wirings to multiple agent groups', {
-      channelType: mg.channel_type,
-      platformId: mg.platform_id,
-      candidates: rows.map((r) => r.agent_group_id),
-    });
-    return null;
-  }
-  return { id: rows[0].agent_group_id, sourceMessagingGroupId: rows[0].messaging_group_id };
+        if (rows.length === 0) return null;
+        // SECURITY: refuse auto-wire when the workspace/guild has wirings to
+        // multiple distinct agent groups. The original "most existing wirings
+        // wins" heuristic would let the wrong tenant's agent claim a freshly
+        // created channel intended for another tenant — falls through to the
+        // operator approval gate instead.
+        if (rows.length > 1) {
+          log.info('auto-wire refused: workspace has wirings to multiple agent groups', {
+            channelType: mg.channel_type,
+            platformId: mg.platform_id,
+            candidates: rows.map((r) => r.agent_group_id),
+          });
+          return null;
+        }
+        return { id: rows[0].agent_group_id, sourceMessagingGroupId: rows[0].messaging_group_id };
+      }),
+    'router inheritedAgentGroupFor',
+  );
 }
 
 /**
@@ -196,13 +207,21 @@ function inheritedAgentGroupFor(mg: MessagingGroup): { id: string; sourceMessagi
  *    sibling messaging_group sharing this platform_id and workgroup, tied
  *    broken by channel_type then messaging_group id (stable, no clock).
  */
-function isSoleInterceptResponder(mg: MessagingGroup, isMention: boolean, leadingMention: boolean): boolean {
+async function isSoleInterceptResponder(
+  mg: MessagingGroup,
+  isMention: boolean,
+  leadingMention: boolean,
+): Promise<boolean> {
   if (isMention || mg.is_group === 0) return true;
   if (leadingMention) return false;
 
-  const winner = getRawDb()
-    .prepare(
-      `WITH my_wg AS (
+  const winner = await withCentralSync(
+    () =>
+      withRawDb(
+        (db) =>
+          db
+            .prepare(
+              `WITH my_wg AS (
          SELECT DISTINCT COALESCE(ag.workgroup_id, ag.folder) AS wg
          FROM messaging_group_agents mga
          JOIN agent_groups ag ON ag.id = mga.agent_group_id
@@ -217,8 +236,11 @@ function isSoleInterceptResponder(mg: MessagingGroup, isMention: boolean, leadin
         GROUP BY mg2.id
         ORDER BY MAX(mga2.priority) DESC, mg2.channel_type ASC, mg2.id ASC
         LIMIT 1`,
-    )
-    .get(mg.id, mg.platform_id) as { mg_id: string } | undefined;
+            )
+            .get(mg.id, mg.platform_id) as { mg_id: string } | undefined,
+      ),
+    'router isSoleInterceptResponder',
+  );
 
   // No workgroup context to disambiguate against (standalone install, or the
   // wiring/agent-group rows raced) — fail open so the request still gets
@@ -482,7 +504,7 @@ function effectiveThreadIdForAgent(
  */
 export async function routeInbound(event: InboundEvent): Promise<void> {
   const receipt = receiptKey(event);
-  if (!claimChannelIngress(receipt)) {
+  if (!(await claimChannelIngress(receipt))) {
     log.debug('Duplicate channel event ignored before routing side effects', { ...receipt });
     return;
   }
@@ -501,7 +523,7 @@ function receiptKey(event: InboundEvent): ChannelIngressReceiptKey {
 /** Replay only the event intentionally released by a completed approval. */
 export async function replayDeferredInbound(event: InboundEvent): Promise<void> {
   const receipt = receiptKey(event);
-  if (!claimDeferredChannelIngress(receipt)) {
+  if (!(await claimDeferredChannelIngress(receipt))) {
     log.debug('Deferred channel event replay ignored because it is already claimed or completed', { ...receipt });
     return;
   }
@@ -509,8 +531,8 @@ export async function replayDeferredInbound(event: InboundEvent): Promise<void> 
 }
 
 /** Resolve a denied or abandoned approval without allowing recovery to reopen it. */
-export function completeDeferredInbound(event: InboundEvent): void {
-  completeDeferredChannelIngress(receiptKey(event));
+export async function completeDeferredInbound(event: InboundEvent): Promise<void> {
+  await completeDeferredChannelIngress(receiptKey(event));
 }
 
 async function routeClaimedInbound(event: InboundEvent, receipt: ChannelIngressReceiptKey): Promise<void> {
@@ -519,10 +541,10 @@ async function routeClaimedInbound(event: InboundEvent, receipt: ChannelIngressR
     await routeInboundClaimed(event, () => {
       replayPending = true;
     });
-    if (replayPending) deferChannelIngress(receipt);
-    else completeChannelIngress(receipt);
+    if (replayPending) await deferChannelIngress(receipt);
+    else await completeChannelIngress(receipt);
   } catch (err) {
-    releaseChannelIngress(receipt);
+    await releaseChannelIngress(receipt);
     throw err;
   }
 }
@@ -621,7 +643,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
     // incumbent agent group without an approval card. Matches v1 behavior
     // where adding the bot to a new channel in an already-installed workspace
     // "just worked." First channel in a new workspace/guild still escalates.
-    const inheritedAgent = inheritedAgentGroupFor(mg);
+    const inheritedAgent = await inheritedAgentGroupFor(mg);
     if (inheritedAgent) {
       try {
         // Voice travels with the agent identity, so a channel auto-wired from
@@ -642,7 +664,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
         // Tone ONLY: default_model / default_effort are sticky per-channel
         // operational pins (`-m` / `-e` persist), and spreading one channel's
         // pin to every future channel is a worse bug than the one this fixes.
-        const inheritedTone = unanimousToneFor(inheritedAgent.id, mg.channel_type);
+        const inheritedTone = await unanimousToneFor(inheritedAgent.id, mg.channel_type);
         const isGroup = event.message.isGroup ?? mg.is_group === 1;
         const wiring: MessagingGroupAgent = {
           id: `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -673,7 +695,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
         await insertOrAdopt(
           wiring,
           async (candidate) => {
-            createMessagingGroupAgent(candidate);
+            await createMessagingGroupAgent(candidate);
           },
           async () => (await getMessagingGroupAgents(mg.id)).find((w) => w.agent_group_id === inheritedAgent.id),
         );
@@ -814,7 +836,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
       // still runs once per SIBLING. Without this check every sibling wired
       // into the channel would intercept/deny the same command (observed:
       // three bots each minted a dashboard token for one `/dashboard-token`).
-      if (!isSoleInterceptResponder(mg, isMention, preGate.leadingMention === true)) {
+      if (!(await isSoleInterceptResponder(mg, isMention, preGate.leadingMention === true))) {
         log.debug('Pre-fanout intercept skipped — not the addressed or deterministic sibling', {
           command: preGate.command,
           messagingGroupId: mg.id,
@@ -1324,7 +1346,7 @@ async function deliverToAgent(
   // sibling actually responding to the user names the thread.
   if (created && wake) {
     const firstText = parsedContent.text ?? '';
-    if (firstText) maybeRenameNewThread(event.channelType, effectiveThreadId, firstText);
+    if (firstText) await maybeRenameNewThread(event.channelType, effectiveThreadId, firstText);
   }
 
   // Persist any base64-encoded attachments from chat-sdk-bridge onto the
@@ -1353,7 +1375,7 @@ async function deliverToAgent(
   // Filtered commands are dropped silently. Denied admin commands get a
   // permission-denied response written directly to messages_out.
   if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
-    const gate = gateCommand(event.message.content, userId, agent.agent_group_id);
+    const gate = await gateCommand(event.message.content, userId, agent.agent_group_id);
     if (gate.action === 'filter') {
       log.debug('Filtered command dropped by gate', { agentGroupId: agent.agent_group_id });
       return;

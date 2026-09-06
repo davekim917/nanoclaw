@@ -20,7 +20,7 @@ import { runStorageGcOnce, type GcCategory } from '../src/worktree-cleanup.js';
 
 await initDb(path.join(DATA_DIR, 'v2.db'));
 
-const report = runStorageGcOnce();
+const report = await runStorageGcOnce();
 const gb = (bytes: number): string => `${(bytes / 1024 ** 3).toFixed(2)} GB`;
 
 if (!report.ran) {

@@ -216,16 +216,16 @@ describe('F-4.1 — each prune duty deletes exactly the rows its retention windo
 
   afterEach(() => closeDb());
 
-  it('channel-ingress-receipt prune: deletes completed receipts past the 7-day retention, keeps fresh ones', () => {
-    expect(claimChannelIngress(key)).toBe(true);
-    completeChannelIngress(key);
+  it('channel-ingress-receipt prune: deletes completed receipts past the 7-day retention, keeps fresh ones', async () => {
+    expect(await claimChannelIngress(key)).toBe(true);
+    await completeChannelIngress(key);
     // Ported from src/db/channel-ingress-receipts.test.ts: 7-day default
     // retention, 8 days in the future crosses it.
-    expect(pruneChannelIngressReceipts(Date.now() + 8 * 24 * 60 * 60 * 1000)).toBe(1);
+    expect(await pruneChannelIngressReceipts(Date.now() + 8 * 24 * 60 * 60 * 1000)).toBe(1);
     // A row inside the window is not touched.
-    expect(claimChannelIngress(key)).toBe(true);
-    completeChannelIngress(key);
-    expect(pruneChannelIngressReceipts(Date.now())).toBe(0);
+    expect(await claimChannelIngress(key)).toBe(true);
+    await completeChannelIngress(key);
+    expect(await pruneChannelIngressReceipts(Date.now())).toBe(0);
   });
 
   it('dashboard-token prune: deletes rows past expiry + 1-day grace, keeps rows inside the grace and unexpired rows', async () => {
@@ -419,8 +419,8 @@ describe('the registered central-housekeeping duties call their expected depende
       platformId: 'discord:g:c',
       messageId: 'via-registry',
     };
-    expect(claimChannelIngress(key)).toBe(true);
-    completeChannelIngress(key);
+    expect(await claimChannelIngress(key)).toBe(true);
+    await completeChannelIngress(key);
     getRawDb()
       .prepare(
         `UPDATE channel_ingress_receipts SET completed_at = datetime('now', '-8 days') WHERE message_id = 'via-registry'`,
@@ -431,7 +431,7 @@ describe('the registered central-housekeeping duties call their expected depende
 
     expect(spy).toHaveBeenCalledTimes(1);
     expect(spy).toHaveBeenCalledWith();
-    expect(claimChannelIngress(key)).toBe(true);
+    expect(await claimChannelIngress(key)).toBe(true);
     expect(spawnState.spawns).toEqual([]);
   });
 
