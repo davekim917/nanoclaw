@@ -113,4 +113,39 @@ describe('createNewAgentGroup survives a concurrent folder allocation', () => {
     expect(ag.folder).toBe('helper');
     expect(count('SELECT COUNT(*) AS c FROM agent_groups')).toBe(1);
   });
+
+  // T4 PR 3 (§5 cases 17-18): a folder present on disk with no claiming DB
+  // row is deleted-group residue — adopting it would silently re-scope the
+  // old group's data under the new agent's identity. The allocator must
+  // treat it exactly like a DB-row collision: skip to the next suffix, not
+  // throw, and not overwrite. `groupFolderExistsOnDisk` uses `lstat`, not
+  // `existsSync`, specifically so a DANGLING symlink at the folder path
+  // still counts as present (`existsSync` follows symlinks and would read a
+  // dangling one as absent, letting the allocator collide with it).
+  it('skips to the next suffix when the folder exists on disk with no claiming DB row', async () => {
+    fs.mkdirSync(`${TEST_DIR}/groups/helper`, { recursive: true });
+
+    const ag = await createNewAgentGroup('Helper');
+
+    expect(ag.folder).toBe('helper-2');
+    // The residue folder is left alone, not adopted or overwritten.
+    expect(fs.existsSync(`${TEST_DIR}/groups/helper`)).toBe(true);
+    expect(count("SELECT COUNT(*) AS c FROM agent_groups WHERE folder = 'helper'")).toBe(0);
+    expect(fs.existsSync(`${TEST_DIR}/groups/helper-2`)).toBe(true);
+  });
+
+  it('skips to the next suffix when the folder is a dangling symlink', async () => {
+    fs.mkdirSync(`${TEST_DIR}/groups`, { recursive: true });
+    fs.symlinkSync(`${TEST_DIR}/groups/nowhere-${Math.random()}`, `${TEST_DIR}/groups/helper`);
+    // Confirm the fixture is actually dangling (existsSync follows the link
+    // and reports false) — the case this test pins is exactly the gap
+    // between existsSync and lstat.
+    expect(fs.existsSync(`${TEST_DIR}/groups/helper`)).toBe(false);
+
+    const ag = await createNewAgentGroup('Helper');
+
+    expect(ag.folder).toBe('helper-2');
+    expect(count("SELECT COUNT(*) AS c FROM agent_groups WHERE folder = 'helper'")).toBe(0);
+    expect(fs.existsSync(`${TEST_DIR}/groups/helper-2`)).toBe(true);
+  });
 });
