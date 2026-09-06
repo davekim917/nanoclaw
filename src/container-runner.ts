@@ -3278,9 +3278,14 @@ export async function honorPendingStopIntents(
  * row to `respawn_after_stop` since, or recorded a fresh `'stop'` for the same
  * session (a thread close landing while an earlier respawn was awaited), wrote
  * a newer stamp and is left for the next boot. Never a row whose session is
- * pending adoption, and never one whose container is running: a host that
- * died between recording the stop and issuing it leaves a container the next
- * boot adopts, and the row is the only record that a stop was asked for.
+ * pending adoption.
+ *
+ * A plain row whose session was ADOPTED at this boot — its container is still
+ * running — is a STALE request: the host died between recording the stop and
+ * issuing it, and the kill's reason (an idle reap, a ceiling, a cancel) may no
+ * longer hold. It is cleared like the rest, named on its own line, and never
+ * acted on: the sweep re-issues a kill on its own evidence if one is still
+ * warranted. `respawn_after_stop` rows keep the honour path above.
  */
 async function clearHonouredStopIntents(
   intents: SessionClaimRow[],
@@ -3289,10 +3294,12 @@ async function clearHonouredStopIntents(
   const plain = intents.filter((intent) => intent.stop_intent === 'stop');
   if (plain.length === 0) return;
   const pending = plain.filter((intent) => pendingAdoptions.has(intent.session_id));
-  const running = plain.filter((intent) => !pendingAdoptions.has(intent.session_id) && hasContainer(intent.session_id));
-  const honoured = plain.filter(
-    (intent) => !pendingAdoptions.has(intent.session_id) && !hasContainer(intent.session_id),
-  );
+  const honoured = plain.filter((intent) => !pendingAdoptions.has(intent.session_id));
+  for (const intent of honoured) {
+    if (hasContainer(intent.session_id)) {
+      log.info('Cleared a stale plain stop intent for an adopted survivor', { sessionId: intent.session_id });
+    }
+  }
   let cleared = 0;
   if (honoured.length > 0) {
     await shadowWrite('stop-intent-clear', async () => {
@@ -3310,7 +3317,6 @@ async function clearHonouredStopIntents(
   log.info('Cleared honoured stop intents at startup', {
     cleared,
     deferredPendingAdoption: pending.length,
-    deferredRunning: running.length,
   });
 }
 
