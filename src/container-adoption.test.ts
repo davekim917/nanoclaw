@@ -250,6 +250,7 @@ import {
   adoptRunningSessions,
   containerOwnsOutbound,
   getAdoptedSessionIds,
+  getContainerIdentity,
   killContainer,
   getContainerSpawnedAt,
   hasContainerEverRun,
@@ -940,6 +941,64 @@ describe('adoptRunningSessions', () => {
       /duplicate container nanoclaw-v2-sess-dup-twin for a tracked session could not be stopped/,
     );
     expect(vi.mocked(killContainerHard).mock.calls.map((call) => call[0])).toEqual(['nanoclaw-v2-sess-dup-twin']);
+  });
+
+  it('a second container for a session held pending is stopped; the hold keeps the first and its waiter', async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-dup-pending');
+    const first = survivor('sess-dup-pending');
+    const twin = { ...first, name: 'nanoclaw-v2-sess-dup-pending-twin' };
+    fakes.listing = [first, twin];
+    fakes.running.add(first.name);
+    fakes.running.add(twin.name);
+    hooks.claimWriteFails = true;
+
+    const reconciled = await adoptRunningSessions({ list: fakes.list });
+
+    expect(reconciled).toEqual({ adopted: 0, stopped: 1, pendingClaim: 1, fencedInbound: 0 });
+    expect(fakes.stopped).toEqual([twin.name]);
+    expect(killContainerHard).not.toHaveBeenCalled();
+    // The hold still names the first container, and its observer is still armed.
+    expect(hasPendingAdoption('sess-dup-pending')).toBe(true);
+    expect(getContainerIdentity('sess-dup-pending')).toBe(first.name);
+    expect(fakes.waitersFor(first.name)).toHaveLength(1);
+    expect(fakes.waitersFor(first.name)[0]!.killed).toBe(false);
+    expect(fakes.waitersFor(twin.name)).toEqual([]);
+    expect(infos('Stopped an unadoptable container at startup')).toEqual([
+      [
+        'Stopped an unadoptable container at startup',
+        { containerName: twin.name, sessionId: 'sess-dup-pending', why: 'session already has a pending container' },
+      ],
+    ]);
+  });
+
+  it('a second container for a pending session that cannot be stopped fails the boot without touching the hold', async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-dup-stuck');
+    const first = survivor('sess-dup-stuck');
+    const twin = { ...first, name: 'nanoclaw-v2-sess-dup-stuck-twin' };
+    fakes.listing = [first, twin];
+    fakes.running.add(first.name);
+    fakes.running.add(twin.name);
+    hooks.claimWriteFails = true;
+    fakes.stopFails = true;
+
+    await expect(adoptRunningSessions({ list: fakes.list })).rejects.toThrow(
+      /duplicate container nanoclaw-v2-sess-dup-stuck-twin for a pending session could not be stopped \(nanoclaw-v2-sess-dup-stuck keeps it\)/,
+    );
+    expect(vi.mocked(killContainerHard).mock.calls.map((call) => call[0])).toEqual([twin.name]);
+    expect(getContainerIdentity('sess-dup-stuck')).toBe(first.name);
+    expect(fakes.waitersFor(twin.name)).toEqual([]);
+    expect(
+      vi
+        .mocked(log.error)
+        .mock.calls.filter(
+          (call) => call[0] === 'Boot cannot continue: a duplicate container for an owned session could not be stopped',
+        ),
+    ).toEqual([
+      [
+        'Boot cannot continue: a duplicate container for an owned session could not be stopped',
+        { sessionId: 'sess-dup-stuck', containerName: twin.name, ownedContainerName: first.name, kind: 'pending' },
+      ],
+    ]);
   });
 
   it('pending survivors count toward the concurrency cap (#462 item 7)', async () => {

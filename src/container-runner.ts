@@ -2268,7 +2268,14 @@ async function holdAsPending(
     pendingHolds.set(session.id, hold);
   }
   if (container && hold.containerName !== container.name) {
-    disarmPendingWaiter(hold);
+    if (hold.containerName !== null) {
+      // A named hold is never re-pointed: the container it names is alive
+      // and its waiter is the only thing watching it. Callers remove the
+      // second container instead (`removeDuplicateContainer`).
+      throw new Error(
+        `pending hold for session ${session.id} names ${hold.containerName}; refusing to re-point it at ${container.name}`,
+      );
+    }
     hold.containerName = container.name;
   }
   if (!hold.lease) {
@@ -2813,6 +2820,39 @@ function stopUnadoptable(containerName: string, why: string, sessionId: string |
 }
 
 /**
+ * Remove a second container for a session this host already owns (tracked or
+ * held pending) under `owner`. Stop, escalate to kill, and require proven
+ * absence; a duplicate this host cannot remove fails the boot — when the owned
+ * container exits, finalization would release the claim, reservation and
+ * leases while the duplicate keeps writing the outbound DB, so there is no
+ * safe state to continue from (#462 item 6).
+ */
+function removeDuplicateContainer(
+  container: { name: string; sessionId: string | null },
+  kind: 'tracked' | 'pending',
+  owner: string,
+): void {
+  stopUnadoptable(container.name, `session already has a ${kind} container`, container.sessionId);
+  if (!containerProvenGone(container.name)) {
+    try {
+      killContainerHard(container.name);
+    } catch (err) {
+      log.warn('docker kill failed for a duplicate container', { containerName: container.name, err });
+    }
+  }
+  if (containerProvenGone(container.name)) return;
+  log.error('Boot cannot continue: a duplicate container for an owned session could not be stopped', {
+    sessionId: container.sessionId,
+    containerName: container.name,
+    ownedContainerName: owner,
+    kind,
+  });
+  throw new Error(
+    `Boot cannot continue: duplicate container ${container.name} for a ${kind} session could not be stopped (${owner} keeps it)`,
+  );
+}
+
+/**
  * Hold a survivor pending without having seen its container: the inventory
  * could not be read, and the door said this session's container survived.
  * Fail closed — owned, leased, counted, retried on wake — rather than letting
@@ -2969,27 +3009,23 @@ export async function adoptRunningSessions(
       await stopOrHold(container, reason, session);
       continue;
     }
-    if (activeContainers.has(container.sessionId)) {
+    const tracked = activeContainers.get(container.sessionId);
+    if (tracked) {
       // A second container for a session already tracked: two writers. Not
       // held pending on failure — the session is already owned by the tracked
       // entry, and a pending mark would route its wakes at the wrong container.
-      stopUnadoptable(container.name, 'session already has a tracked container', container.sessionId);
-      if (!containerProvenGone(container.name)) {
-        try {
-          killContainerHard(container.name);
-        } catch (err) {
-          log.warn('docker kill failed for a duplicate container', { containerName: container.name, err });
-        }
-      }
-      if (!containerProvenGone(container.name)) {
-        // Two writers for one session, and this host cannot remove the second:
-        // when the tracked one exits, finalization would release the claim,
-        // reservation and leases while the duplicate keeps writing the
-        // outbound DB. There is no safe state to continue from (#462 item 6).
-        throw new Error(
-          `Boot cannot continue: duplicate container ${container.name} for a tracked session could not be stopped`,
-        );
-      }
+      removeDuplicateContainer(container, 'tracked', tracked.containerName);
+      counts.stopped += 1;
+      continue;
+    }
+    const held = pendingHolds.get(container.sessionId)?.containerName ?? null;
+    if (held !== null && held !== container.name) {
+      // A second container for a session already held pending under another
+      // name: the same two writers. The hold keeps its container and its
+      // waiter — re-pointing it would leave the first alive and untracked,
+      // free to keep writing the outbound DB after the second is adopted or
+      // exits, and a later wake would then start a third writer beside it.
+      removeDuplicateContainer(container, 'pending', held);
       counts.stopped += 1;
       continue;
     }
