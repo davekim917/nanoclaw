@@ -356,9 +356,11 @@ async function handleRequest(request: ApprovalRequest): Promise<Decision> {
   // approver with a reachable DM wins.
   const target = await pickApprovalDelivery(approvers, '');
   if (!target) {
+    // pickApprovalDelivery ran privacy-safe (no handle in its logs); the
+    // failure line here keeps the same contract — a count, not the handles.
     log.warn('OneCLI approval auto-denied: no DM channel for any approver', {
       id: request.id,
-      approvers,
+      approverCount: approvers.length,
     });
     return 'deny';
   }

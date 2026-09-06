@@ -68,8 +68,8 @@ const { ensureUserDmCalls } = vi.hoisted(() => ({
 // the FYI half of the flow throw and silently deliver only the decline.
 vi.mock('./user-dm.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./user-dm.js')>()),
-  ensureUserDm: vi.fn(async (userId: string, instance?: string) => {
-    ensureUserDmCalls.push({ userId, instance });
+  ensureUserDm: vi.fn(async (userId: string, options?: { instance?: string; privacySafeLogs?: boolean }) => {
+    ensureUserDmCalls.push({ userId, instance: options?.instance });
     const { getRawDb } = await import('../../db/connection.js');
     return getRawDb()
       .prepare(

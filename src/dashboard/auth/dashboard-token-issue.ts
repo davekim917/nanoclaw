@@ -74,14 +74,18 @@ export async function dashboardTokenIssue(ctx: InterceptContext): Promise<void> 
   // member sees the message, so the token must never be posted there. Route
   // it to the invoker's DM instead, opening one lazily if needed (same
   // primitive approvals/host notifications already use to cold-DM a user).
-  const deliveryMg = mg.is_group ? await ensureUserDm(ctx.userId) : mg;
+  // privacySafeLogs: this DM is about to carry a bearer dashboard token — a
+  // resolution failure here must not write the invoker's platform handle or
+  // any raw platform error into the host log.
+  const deliveryMg = mg.is_group ? await ensureUserDm(ctx.userId, { privacySafeLogs: true }) : mg;
 
   if (!deliveryMg) {
     // No DM path on this platform (no adapter openDM support, or it threw —
     // e.g. the user has DMs closed). Fail closed: mint nothing, and say
     // nothing that reveals a credential exists to mint.
+    // Same privacy rule as the ensureUserDm call above: the invoker's
+    // namespaced handle stays out of the host log on the failure path too.
     log.warn('dashboardTokenIssue: no private delivery path, refusing to mint', {
-      userId: ctx.userId,
       channelType: mg.channel_type,
     });
     await adapter.deliver(

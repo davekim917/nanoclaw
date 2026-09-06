@@ -680,7 +680,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
 
   // ── Choose existing agent — send agent-selection follow-up card ──
   if (payload.value === CHOOSE_EXISTING_VALUE) {
-    const approverDm = await ensureUserDm(row.approver_user_id, originMg?.instance);
+    const approverDm = await ensureUserDm(row.approver_user_id, { instance: originMg?.instance });
     if (!approverDm) {
       log.error('Channel registration: no DM channel for approver', {
         messagingGroupId: row.messaging_group_id,
@@ -727,7 +727,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
 
   // ── Create new agent — prompt for free-text name ──
   if (payload.value === NEW_AGENT_VALUE) {
-    const approverDm = await ensureUserDm(row.approver_user_id, originMg?.instance);
+    const approverDm = await ensureUserDm(row.approver_user_id, { instance: originMg?.instance });
     if (!approverDm) {
       log.error('Channel registration: no DM channel for approver', {
         messagingGroupId: row.messaging_group_id,
@@ -896,7 +896,7 @@ registerMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
 async function notifyApprover(approverUserId: string, text: string, instance?: string): Promise<void> {
   const adapter = getDeliveryAdapter();
   if (!adapter) return;
-  const dm = await ensureUserDm(approverUserId, instance);
+  const dm = await ensureUserDm(approverUserId, { instance });
   if (!dm) return;
   adapter
     .deliver(dm.channel_type, dm.platform_id, null, 'chat-sdk', JSON.stringify({ text }), undefined, dm.instance)

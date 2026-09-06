@@ -66,17 +66,27 @@ import { getUserDm, upsertUserDm } from './db/user-dms.js';
  * cached first. Widening the cache key is a schema change and out of scope
  * for this fix. A caller that DOES name an instance, though, never receives
  * a cached row stamped with a DIFFERENT one: see the cache-hit check below.
+ *
+ * Set `privacySafeLogs` for security-sensitive flows to omit user, handle,
+ * messaging-group, and raw platform-error details from log data. Requested
+ * only where a failure would otherwise write a stranger-facing platform
+ * handle or raw platform error into the host log on the approval-delivery
+ * and dashboard-token-issue paths — every other caller keeps the detailed
+ * shape, which is what makes "why didn't the owner get the card" debuggable.
  */
-export async function ensureUserDm(userId: string, instance?: string): Promise<MessagingGroup | null> {
+export async function ensureUserDm(
+  userId: string,
+  { instance, privacySafeLogs = false }: { instance?: string; privacySafeLogs?: boolean } = {},
+): Promise<MessagingGroup | null> {
   const user = await getUser(userId);
   if (!user) {
-    log.warn('ensureUserDm: user not found', { userId });
+    log.warn('ensureUserDm: user not found', privacySafeLogs ? undefined : { userId });
     return null;
   }
 
   const { channelType, handle } = parseUserId(user);
   if (!channelType || !handle) {
-    log.warn('ensureUserDm: user id not namespaced', { userId });
+    log.warn('ensureUserDm: user id not namespaced', privacySafeLogs ? undefined : { userId });
     return null;
   }
 
@@ -96,17 +106,18 @@ export async function ensureUserDm(userId: string, instance?: string): Promise<M
       // that did NOT name an instance keeps today's behavior unchanged.
       const cachedInstance = mg.instance ?? channelType;
       if (!instance || cachedInstance === instance) return mg;
-      log.info('ensureUserDm: cached DM is on a different instance, re-resolving', {
-        userId,
-        cachedInstance,
-        requestedInstance: instance,
-      });
+      log.info(
+        'ensureUserDm: cached DM is on a different instance, re-resolving',
+        privacySafeLogs
+          ? { cachedInstance, requestedInstance: instance }
+          : { userId, cachedInstance, requestedInstance: instance },
+      );
     } else {
       // Row points to a deleted messaging_group — fall through and re-resolve.
-      log.warn('ensureUserDm: cached row references missing messaging_group, re-resolving', {
-        userId,
-        messagingGroupId: cached.messaging_group_id,
-      });
+      log.warn(
+        'ensureUserDm: cached row references missing messaging_group, re-resolving',
+        privacySafeLogs ? { channelType } : { userId, messagingGroupId: cached.messaging_group_id },
+      );
     }
   }
 
@@ -114,7 +125,7 @@ export async function ensureUserDm(userId: string, instance?: string): Promise<M
   // Resolved through the requested instance when there is one: on Slack the
   // DM channel a bot opens is per-bot, so asking the wrong sibling would
   // return a channel the intended bot cannot post in.
-  const dmPlatformId = await resolveDmPlatformId(channelType, handle, instance);
+  const dmPlatformId = await resolveDmPlatformId(channelType, handle, instance, privacySafeLogs);
   if (!dmPlatformId) return null;
 
   // Find-or-create the underlying messaging_group. A DM we received
@@ -158,20 +169,21 @@ export async function ensureUserDm(userId: string, instance?: string): Promise<M
       getMessagingGroupByPlatform(channelType, dmPlatformId, instance),
     );
     mg = resolved;
+    const resolvedInstance = mg.instance ?? channelType;
     if (created) {
-      log.info('ensureUserDm: created DM messaging_group', {
-        userId,
-        channelType,
-        instance: mg.instance ?? channelType,
-        messagingGroupId: mgId,
-      });
+      log.info(
+        'ensureUserDm: created DM messaging_group',
+        privacySafeLogs
+          ? { channelType, instance: resolvedInstance }
+          : { userId, channelType, instance: resolvedInstance, messagingGroupId: mgId },
+      );
     } else {
-      log.info('ensureUserDm: adopted concurrently created DM messaging_group', {
-        userId,
-        channelType,
-        instance: mg.instance ?? channelType,
-        messagingGroupId: mg.id,
-      });
+      log.info(
+        'ensureUserDm: adopted concurrently created DM messaging_group',
+        privacySafeLogs
+          ? { channelType, instance: resolvedInstance }
+          : { userId, channelType, instance: resolvedInstance, messagingGroupId: mg.id },
+      );
     }
   }
 
@@ -189,7 +201,12 @@ export async function ensureUserDm(userId: string, instance?: string): Promise<M
  * Call the adapter's openDM if it has one; otherwise fall through to using
  * the handle directly. Returns null if the adapter is missing entirely.
  */
-async function resolveDmPlatformId(channelType: string, handle: string, instance?: string): Promise<string | null> {
+async function resolveDmPlatformId(
+  channelType: string,
+  handle: string,
+  instance: string | undefined,
+  privacySafeLogs: boolean,
+): Promise<string | null> {
   // getChannelAdapter, not the exact variant: this is one of the
   // channelType-only call sites the fallback exists for, so an unnamed or
   // offline instance still resolves through a sibling rather than failing.
@@ -205,7 +222,7 @@ async function resolveDmPlatformId(channelType: string, handle: string, instance
   try {
     return await adapter.openDM(handle);
   } catch (err) {
-    log.error('ensureUserDm: adapter.openDM failed', { channelType, handle, err });
+    log.error('ensureUserDm: adapter.openDM failed', privacySafeLogs ? { channelType } : { channelType, handle, err });
     return null;
   }
 }

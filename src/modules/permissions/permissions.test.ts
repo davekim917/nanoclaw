@@ -300,7 +300,7 @@ describe('ensureUserDm', () => {
     await mountMockAdapter('slack', async (handle) => `dm-${handle}`, 'slack-labs');
     await seedUser('slack:U-owner', 'slack');
 
-    const mg = await ensureUserDm('slack:U-owner', 'slack-labs');
+    const mg = await ensureUserDm('slack:U-owner', { instance: 'slack-labs' });
     expect(mg).toBeDefined();
     // Read the row back: createMessagingGroup defaults an unset instance to
     // the channel type, so the persisted value is what matters.
@@ -338,7 +338,7 @@ describe('ensureUserDm', () => {
       created_at: now(),
     });
 
-    const mg = await ensureUserDm('telegram:U-owner', 'telegram-bot-a');
+    const mg = await ensureUserDm('telegram:U-owner', { instance: 'telegram-bot-a' });
     expect(mg!.id).not.toBe('mg-sibling');
     expect(getMessagingGroup(mg!.id)?.instance).toBe('telegram-bot-a');
   });
@@ -354,12 +354,12 @@ describe('ensureUserDm', () => {
 
     // Cache the user's DM on instance B first (e.g. an earlier approval on
     // that workspace/bot).
-    const mgB = await ensureUserDm('slack:U-owner', 'slack-bot-b');
+    const mgB = await ensureUserDm('slack:U-owner', { instance: 'slack-bot-b' });
     expect(getMessagingGroup(mgB!.id)?.instance).toBe('slack-bot-b');
 
     // A caller asking for instance A must NOT receive B's cached row — it
     // must re-resolve and land on A's own row.
-    const mgA = await ensureUserDm('slack:U-owner', 'slack-bot-a');
+    const mgA = await ensureUserDm('slack:U-owner', { instance: 'slack-bot-a' });
     expect(mgA!.id).not.toBe(mgB!.id);
     expect(getMessagingGroup(mgA!.id)?.instance).toBe('slack-bot-a');
     expect(mockA.openDMCalls).toEqual(['U-owner']);
@@ -373,7 +373,7 @@ describe('ensureUserDm', () => {
     await mountMockAdapter('slack', async (handle) => `dm-b-${handle}`, 'slack-bot-b');
     await seedUser('slack:U-owner', 'slack');
 
-    const mgB = await ensureUserDm('slack:U-owner', 'slack-bot-b');
+    const mgB = await ensureUserDm('slack:U-owner', { instance: 'slack-bot-b' });
     expect(getMessagingGroup(mgB!.id)?.instance).toBe('slack-bot-b');
 
     const mgAgain = await ensureUserDm('slack:U-owner');

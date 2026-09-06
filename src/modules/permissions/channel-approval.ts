@@ -57,7 +57,7 @@ import { initGroupFilesystem } from '../../group-init.js';
 import { log } from '../../log.js';
 import { conversationDisplayName, formatParticipantList } from '../../channels/adapter.js';
 import type { ChannelConversation, InboundEvent } from '../../channels/adapter.js';
-import type { AgentGroup } from '../../types.js';
+import type { AgentGroup, MessagingGroup } from '../../types.js';
 import { pickApprovalDelivery, pickApprover } from '../approvals/primitive.js';
 import {
   createPendingChannelApproval,
@@ -84,6 +84,34 @@ export const REJECT_VALUE = 'reject';
  */
 export const AGENT_ACCESS_SCOPE_WARNING =
   "Anyone approved here can interact with the agent and potentially access anything the agent can access, including other conversations' context, its workspace files and memory, and any connected tools.";
+
+// ── Channel-card interceptor seam (B2/D24) ──
+// A channel module can claim the escalation for its own channel type before
+// a registration card goes out — e.g. the slack-room-membership module's
+// owner-presence rule (owner in the room → auto-wire, no card) and its
+// Slackbot shadow-channel backstop. The seam is deliberately generic: this
+// module registers/consults by channel_type only and never imports channel
+// code. 'handled' = the interceptor consumed the escalation (wired, declined,
+// or deliberately ignored it); 'card' = proceed with today's card flow.
+// Interceptor errors fall back to the card — a broken module must never make
+// escalations silently vanish.
+
+export type ChannelCardDecision = 'card' | 'handled';
+export type ChannelCardInterceptor = (mg: MessagingGroup, event: InboundEvent) => Promise<ChannelCardDecision>;
+
+const channelCardInterceptors = new Map<string, ChannelCardInterceptor>();
+
+export function registerChannelCardInterceptor(channelType: string, fn: ChannelCardInterceptor): void {
+  if (channelCardInterceptors.has(channelType)) {
+    log.warn('Channel-card interceptor overwritten', { channelType });
+  }
+  channelCardInterceptors.set(channelType, fn);
+}
+
+/** Test-only: clear all registrations so cases don't depend on registration order. */
+export function _resetChannelCardInterceptorsForTesting(): void {
+  channelCardInterceptors.clear();
+}
 
 // ── Utilities ──
 
@@ -227,6 +255,33 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     log.debug('Channel registration already in flight — dropping retry', { messagingGroupId });
     const existing = getPendingChannelApproval(messagingGroupId);
     return existing ? isSameInboundEvent(existing.original_message, event) : false;
+  }
+
+  // Channel-module interceptor: consulted before any card work so a module
+  // can auto-wire / decline / suppress for its own channel type. Runs after
+  // the in-flight dedupe (a pending card already owns this channel) and
+  // before the approver checks (an auto-wire needs no reachable approver).
+  // `getMessagingGroup` is synchronous in the fork, so this is a cheap extra
+  // read rather than a reason to hoist the later `originMg` (card text,
+  // instance) up to here — that lookup stays where it is.
+  {
+    const interceptMg = getMessagingGroup(messagingGroupId);
+    const interceptor = interceptMg ? channelCardInterceptors.get(interceptMg.channel_type) : undefined;
+    if (interceptMg && interceptor) {
+      try {
+        if ((await interceptor(interceptMg, event)) === 'handled') {
+          log.debug('Channel registration handled by interceptor — no card', {
+            messagingGroupId,
+            channelType: interceptMg.channel_type,
+          });
+          // false: no pending row was retained for this event, so the
+          // router must not call markReplayPending() for it.
+          return false;
+        }
+      } catch (err) {
+        log.warn('Channel-card interceptor threw — falling back to the card', { messagingGroupId, err });
+      }
+    }
   }
 
   const agentGroups = await getAllAgentGroups();
