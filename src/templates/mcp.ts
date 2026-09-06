@@ -70,12 +70,6 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-/** Only string values can be linted; everything else is the parser's problem. */
-function stringValues(raw: unknown): Record<string, string> {
-  if (!isPlainObject(raw)) return {};
-  return Object.fromEntries(Object.entries(raw).filter(([, v]) => typeof v === 'string')) as Record<string, string>;
-}
-
 /**
  * plugin-data subpaths declared as a server `cwd` (`${PLUGIN_DATA}/sub`).
  * The stamp owns creating these: plugin-data is NanoClaw-managed writable
@@ -174,15 +168,31 @@ function lintServerCredentials(mcpServers: unknown, report: string[]): void {
   for (const [name, entry] of Object.entries(mcpServers)) {
     if (!isPlainObject(entry)) continue;
     for (const kind of ['env', 'headers'] as const) {
-      // Same invariant as the unparseable-file case: `stringValues` drops
-      // non-strings, so `env: { API_KEY: { value: "sk-live-…" } }` would pass
-      // the lint, fail the shape check later, and still ship inside the copied
-      // plugin. A value the lint cannot read is unlintable, not absent.
+      // A value the lint cannot read is unlintable, not absent: `env:
+      // { API_KEY: { value: "sk-live-…" } }` would otherwise pass, fail the
+      // shape check later, and still ship inside the copied plugin.
       assertLintableValues(name, kind, entry[kind]);
     }
-    lintSecrets(name, 'env', stringValues(entry.env), report);
-    lintSecrets(name, 'header', stringValues(entry.headers), report);
+    // EVERY string in the entry, not an enumerated field list. `args`
+    // (`["--token", "sk-live-…"]`) reached container.json and the copied
+    // mcp.json while only env and headers were scanned (Codex on #500 round
+    // 6); enumerating one more field each round is how that recurs. The whole
+    // entry ships, so the whole entry is scanned.
+    for (const [where, value] of entryStrings(entry)) lintSecrets(name, where, value, report);
   }
+}
+
+/**
+ * Every string anywhere in a server entry, paired with a dotted path naming
+ * where it came from (`args[0]`, `env.API_KEY`, `headers.Authorization`).
+ */
+function entryStrings(entry: unknown, prefix = ''): [string, string][] {
+  if (typeof entry === 'string') return [[prefix || 'value', entry]];
+  if (Array.isArray(entry)) return entry.flatMap((item, i) => entryStrings(item, `${prefix}[${i}]`));
+  if (isPlainObject(entry)) {
+    return Object.entries(entry).flatMap(([key, value]) => entryStrings(value, prefix ? `${prefix}.${key}` : key));
+  }
+  return [];
 }
 
 /** Every value in an `env`/`headers` map must be a string the lint can read. */
@@ -273,23 +283,24 @@ function readServerEntry(name: string, entry: unknown): ParsedMcpServerConfig | 
  * reject the whole plugin; a secret-looking KEY with an unrecognized value
  * only warns, so ordinary config values never block a legitimate setup.
  */
-function lintSecrets(server: string, kind: 'env' | 'header', values: Record<string, string>, report: string[]): void {
-  for (const [key, value] of Object.entries(values)) {
-    if (isDeclaredPlaceholder(value)) continue;
-    // SECRET_VALUE_RE is ^-anchored; strip an auth-scheme prefix so
-    // "Bearer sk-…" (the common real-world header shape) still matches.
-    const bare = value.replace(/^(Bearer|Token|Basic)\s+/i, '');
-    if (SECRET_VALUE_RE.test(bare)) {
-      throw new Error(
-        `${kind} "${key}" looks like a real credential; ship the literal "${PLACEHOLDER_VALUE}" instead ` +
-          '(operators supply real values after stamping)',
-      );
-    }
-    if (SECRET_ENV_KEY_RE.test(key)) {
-      report.push(
-        `mcp.json: server "${server}" ${kind} "${key}" has a non-"${PLACEHOLDER_VALUE}" value; ` +
-          'if it is a credential, use the placeholder convention',
-      );
-    }
+function lintSecrets(server: string, where: string, value: string, report: string[]): void {
+  if (isDeclaredPlaceholder(value)) return;
+  // SECRET_VALUE_RE is ^-anchored, so strip a leading auth scheme first. The
+  // surrounding parser accepts ANY single-token scheme, so match that rather
+  // than a fixed list — "Key sk-…" hid its credential from a Bearer/Token/Basic
+  // list while the parser happily accepted the header (Codex on #500 round 6).
+  const bare = value.replace(/^[A-Za-z][A-Za-z0-9-]*\s+/, '');
+  if (SECRET_VALUE_RE.test(value) || SECRET_VALUE_RE.test(bare)) {
+    throw new Error(
+      `${where} looks like a real credential; ship the literal "${PLACEHOLDER_VALUE}" instead ` +
+        '(operators supply real values after stamping)',
+    );
+  }
+  const key = where.slice(where.lastIndexOf('.') + 1);
+  if (SECRET_ENV_KEY_RE.test(key)) {
+    report.push(
+      `mcp.json: server "${server}" ${where} has a non-"${PLACEHOLDER_VALUE}" value; ` +
+        'if it is a credential, use the placeholder convention',
+    );
   }
 }

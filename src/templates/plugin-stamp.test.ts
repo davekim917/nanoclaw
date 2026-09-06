@@ -369,6 +369,36 @@ describe('T5 PR 3 — the plugin reader and the stamp path', () => {
     }
   });
 
+  it('scans every string in an entry, not an enumerated field list (#500 round 6)', () => {
+    // Enumerating one more field per review round is how this class recurs.
+    // args, a nested object, and an arbitrary auth scheme all reach the copied
+    // mcp.json and container.json, so all of them are scanned.
+    for (const entry of [
+      { crm: { type: 'stdio', command: 'server', args: ['--token', 'sk-live-AbC123RealLooking'] } },
+      {
+        crm: {
+          type: 'streamable-http',
+          url: 'https://x.example.com/mcp',
+          headers: { Authorization: 'Key sk-live-AbC123RealLooking' },
+        },
+      },
+      {
+        crm: {
+          type: 'streamable-http',
+          url: 'https://x.example.com/mcp',
+          headers: { Authorization: 'Bearer sk-live-AbC123RealLooking' },
+        },
+      },
+    ]) {
+      writeManifest();
+      fs.writeFileSync(
+        path.join(PLUGIN_DIR, 'mcp.json'),
+        JSON.stringify({ $schema: MCP_SCHEMA_URL, mcpServers: entry }),
+      );
+      expect(() => parseTemplate(PLUGIN_DIR)).toThrow(/looks like a real credential/);
+    }
+  });
+
   it('the documented mcp.json examples parse and stamp (#500 round 4)', () => {
     // The authoring examples are executable here, so a doc that drifts from
     // the reader's requirements fails the suite instead of a user's stamp.
