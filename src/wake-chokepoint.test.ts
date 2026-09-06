@@ -90,7 +90,7 @@ function bindingNameText(node: ts.PropertyName | ts.BindingName | undefined): st
 interface Importer {
   file: string;
   line: number;
-  form: 'static' | 'dynamic' | 'namespace' | 'dynamic-namespace';
+  form: 'static' | 'dynamic' | 'namespace' | 'dynamic-namespace' | 're-export' | 'star-re-export';
 }
 
 /**
@@ -104,7 +104,9 @@ function findImportersOf(files: string[], targetPath: string, bindingName: strin
   for (const file of files) {
     if (path.resolve(file) === targetPath) continue;
     const text = fs.readFileSync(file, 'utf8');
-    if (!text.includes(bindingName)) continue; // cheap prefilter before parsing
+    // Cheap prefilter before parsing. A star re-export barrel never mentions
+    // the binding by name, so it is let through on its own shape.
+    if (!text.includes(bindingName) && !/export\s+\*\s+(as\s+\w+\s+)?from/.test(text)) continue;
     const sourceFile = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
     const rel = toRel(file);
     const lineOf = (node: ts.Node): number =>
@@ -127,6 +129,28 @@ function findImportersOf(files: string[], targetPath: string, bindingName: strin
         // the fail-closed reading (Codex on #470).
         if (resolved === targetPath && namedBindings && ts.isNamespaceImport(namedBindings)) {
           results.push({ file: rel, line: lineOf(node), form: 'namespace' });
+        }
+      }
+      // Re-export: export { bindingName } from '<specifier>' / export * from
+      // '<specifier>'. A barrel like this would let a consumer import the
+      // binding from the barrel, whose specifier does not resolve to the
+      // target — so the barrel itself is the importer, flagged here (star
+      // re-exports conservatively, named ones only when they carry the
+      // binding). Codex round 3 on #470.
+      if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
+        const resolved = resolveRelativeSpecifier(file, node.moduleSpecifier.text);
+        if (resolved === targetPath) {
+          if (!node.exportClause) {
+            results.push({ file: rel, line: lineOf(node), form: 'star-re-export' });
+          } else if (ts.isNamedExports(node.exportClause)) {
+            const hit = node.exportClause.elements.some(
+              (el) => bindingNameText(el.propertyName ?? el.name) === bindingName,
+            );
+            if (hit) results.push({ file: rel, line: lineOf(node), form: 're-export' });
+          } else {
+            // `export * as ns from` — the namespace form of a re-export.
+            results.push({ file: rel, line: lineOf(node), form: 'star-re-export' });
+          }
         }
       }
       // Dynamic: const { bindingName } = await import('<specifier>');
@@ -174,6 +198,9 @@ describe('the resolver flags every import shape that can reach the binding (not 
     ['dynamic.ts', "const { wakeContainer } = await import('./target.js');\nwakeContainer();\n", 'dynamic'],
     ['dynamic-ns.ts', "const m = await import('./target.js');\nm.wakeContainer();\n", 'dynamic-namespace'],
     ['dynamic-member.ts', "(await import('./target.js')).wakeContainer();\n", 'dynamic-namespace'],
+    ['barrel-named.ts', "export { wakeContainer } from './target.js';\n", 're-export'],
+    ['barrel-star.ts', "export * from './target.js';\n", 'star-re-export'],
+    ['barrel-ns.ts', "export * as runner from './target.js';\n", 'star-re-export'],
   ];
   for (const [name, source] of cases) fs.writeFileSync(path.join(fixtureDir, name), source);
   const found = findImportersOf(
