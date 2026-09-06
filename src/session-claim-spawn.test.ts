@@ -119,6 +119,16 @@ const hooks = vi.hoisted(() => ({
   runtimeListingFails: false,
   /** How many times the claim asked the runtime. */
   runtimeCalls: 0,
+  /**
+   * `spawn()` hands back a child whose `error` fires in a MICROTASK queued
+   * inside the spawn call — earlier than any continuation of the `await`
+   * around the lease block can run. Real ENOENT/EACCES errors fire on
+   * `process.nextTick`, which Node drains only after the microtask queue, so
+   * the awaited continuation happens to win there; this hook removes that
+   * scheduler dependence and pins the guarantee itself: the listeners exist
+   * before the lease block returns the child.
+   */
+  spawnErrorsInMicrotask: false,
   /** Fake `docker wait` observers handed to the adopter. */
   waiters: [] as Array<{ exitCode: number | null; emit: (event: string, ...args: unknown[]) => boolean }>,
   EventEmitter: null as null | typeof import('node:events').EventEmitter,
@@ -138,8 +148,36 @@ const hooks = vi.hoisted(() => ({
     this.preClaimGate = null;
     this.releaseGates.clear();
     this.storageGate = null;
+    this.spawnErrorsInMicrotask = false;
   },
 }));
+
+vi.mock('child_process', async (importOriginal) => {
+  const real = await importOriginal<typeof import('child_process')>();
+  return {
+    ...real,
+    spawn: ((...spawnArgs: Parameters<typeof real.spawn>) => {
+      if (!hooks.spawnErrorsInMicrotask) return real.spawn(...spawnArgs);
+      const Emitter = hooks.EventEmitter as typeof import('node:events').EventEmitter;
+      const child = new Emitter() as unknown as import('child_process').ChildProcess & {
+        stdout: import('node:events').EventEmitter;
+        stderr: import('node:events').EventEmitter;
+      };
+      Object.assign(child, {
+        stdout: new Emitter(),
+        stderr: new Emitter(),
+        exitCode: null,
+        pid: undefined,
+        kill: () => true,
+      });
+      queueMicrotask(() => {
+        child.emit('error', Object.assign(new Error('spawn nanoclaw-absent ENOENT'), { code: 'ENOENT' }));
+        child.emit('close', null);
+      });
+      return child;
+    }) as typeof real.spawn,
+  };
+});
 
 vi.mock('./db/coordination.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('./db/coordination.js')>();
@@ -738,6 +776,32 @@ describe('claim-first spawn', () => {
     expect(hooks.events).toContain('release:sess-exit:1');
     const released = await getSessionClaim('sess-exit');
     expect([released?.incarnation, released?.claimed_by, released?.container_ref]).toEqual([1, null, null]);
+  });
+
+  it('a child whose error fires before the lease block returns is finalized, never unhandled (#460 round 2)', async () => {
+    await seedSession('sess-early-error');
+    hooks.spawnErrorsInMicrotask = true;
+    const unhandled: unknown[] = [];
+    const onUncaught = (err: unknown): void => {
+      unhandled.push(err);
+    };
+    process.on('uncaughtException', onUncaught);
+    try {
+      await wakeContainer(callerSnapshot('sess-early-error'));
+      await waitForFinalize('sess-early-error');
+    } finally {
+      process.off('uncaughtException', onUncaught);
+    }
+    // The `error` listener existed when the event fired: it was logged, the
+    // registry entry was finalized, and the claim came back — no unhandled
+    // 'error' escaped the emitter.
+    expect(unhandled).toEqual([]);
+    expect(log.error).toHaveBeenCalledWith(
+      'Container spawn error',
+      expect.objectContaining({ sessionId: 'sess-early-error' }),
+    );
+    expect(isContainerRunning('sess-early-error')).toBe(false);
+    expect(hooks.events).toContain('release:sess-early-error:1');
   });
 
   it('a stale finish does not release a fresh claim', async () => {

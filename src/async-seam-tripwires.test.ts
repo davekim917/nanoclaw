@@ -29,8 +29,10 @@ describe('spawnContainer attaches the exit handlers before its first await', () 
     // The function ends at the next top-level `\n}\n` after its start.
     const end = source.indexOf('\n}\n', start);
     const body = source.slice(start, end);
-    const onClose = body.indexOf("container.on('close'");
-    const onError = body.indexOf("container.on('error'");
+    // Since #460 round 2 the listeners are attached INSIDE the lease block,
+    // on the child `spawn()` just returned, before the block hands it back.
+    const onClose = body.indexOf("child.on('close'");
+    const onError = body.indexOf("child.on('error'");
     const statusAwait = body.indexOf('await markContainerRunning(');
     expect(onClose).toBeGreaterThan(-1);
     expect(onError).toBeGreaterThan(-1);

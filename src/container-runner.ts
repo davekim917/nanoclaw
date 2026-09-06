@@ -1769,10 +1769,17 @@ async function spawnContainer(
   // this whole block and is honoured here, or arrives after registration and
   // takes the ordinary running-container path. `trackWake` settles it either
   // way.
-  let container: ChildProcess;
   let channel: SupervisionChannel;
+  const stderrTail: string[] = [];
+  // ChildProcess emits `close` after `error`; finalize this exact channel once.
+  let finalized = false;
+  const finalizeContainer = (): void => {
+    if (finalized) return;
+    finalized = true;
+    finalizeSession(session.id, channel, storageActivity, containerName);
+  };
   try {
-    container = await withCentralSync(() => {
+    await withCentralSync(() => {
       // Clear any orphan heartbeat from a previous container instance — the
       // sweep's ceiling check treats a missing file as "fresh spawn, give grace"
       // (host-sweep.ts line 87). Without this, the stale mtime can trigger an
@@ -1805,7 +1812,54 @@ async function spawnContainer(
         claimIncarnation,
       });
       everSeenRunningSessions.add(session.id);
-      return child;
+
+      // Every child listener is attached HERE, in the same synchronous turn as
+      // `spawn()`, before the block returns (#460 round 2). A runtime that
+      // cannot launch (ENOENT, EACCES) emits `error` from a `process.nextTick`
+      // queued inside `spawn()`; whether the continuation of the `await`
+      // around this block runs before that tick is a scheduler detail
+      // (Node ≥ 11 drains microtasks first, so today it does), and an `error`
+      // with no listener is an uncaught exception that takes the host down.
+      // Attaching inside the block makes the guarantee structural: the
+      // listeners exist before anything queued by `spawn()` can run.
+      // `src/session-claim-spawn.test.ts` pins it with a child whose `error`
+      // fires from a microtask.
+
+      // Log stderr. A container that dies at boot (unknown provider, missing
+      // binary, bad config) explains itself only here — and debug is below the
+      // default log level — so keep a tail to surface on a non-zero exit.
+      captureContainerStderr(child.stderr, containerName, stderrTail);
+
+      // stdout is unused in v2 (all IO is via session DB)
+      child.stdout?.on('data', () => {});
+
+      // No host-side idle timeout. Stale/stuck detection is driven by the host
+      // sweep reading heartbeat mtime + processing_ack claim age + container_state
+      // (see src/host-sweep.ts). This avoids killing long-running legitimate work
+      // on a wall-clock timer.
+
+      child.on('close', (code) => {
+        finalizeContainer();
+        // code null = killed by signal (normal shutdown path), not a boot failure.
+        if (code === 137) {
+          log.warn('Container exited 137 — likely OOM kill or forced SIGKILL', {
+            sessionId: session.id,
+            containerName,
+            memoryRequestMb: effectiveResources.memory.requestMb,
+            memoryLimitMb: effectiveResources.memory.limitMb,
+            stderrTail,
+          });
+        } else if (code !== 0 && code !== null && stderrTail.length > 0) {
+          log.warn('Container exited non-zero', { sessionId: session.id, code, containerName, stderrTail });
+        } else {
+          log.info('Container exited', { sessionId: session.id, code, containerName });
+        }
+      });
+
+      child.on('error', (err) => {
+        finalizeContainer();
+        log.error('Container spawn error', { sessionId: session.id, err });
+      });
     }, 'wake guard at spawn');
   } catch (err) {
     // Every refusal in the block above happens with the claim already held and
@@ -1815,57 +1869,11 @@ async function spawnContainer(
     await releaseClaimQuietly(session.id, claimIncarnation);
     throw err;
   }
-  // The `running` status write is awaited AFTER the exit handlers below are
-  // attached (see the end of this function): with a delayed driver a
-  // container that dies at boot would otherwise emit close/error while the
-  // write is pending, before finalizeContainer and the kill callbacks exist.
-
-  // Log stderr. A container that dies at boot (unknown provider, missing
-  // binary, bad config) explains itself only here — and debug is below the
-  // default log level — so keep a tail to surface on a non-zero exit.
-  const stderrTail: string[] = [];
-  captureContainerStderr(container.stderr, containerName, stderrTail);
-
-  // stdout is unused in v2 (all IO is via session DB)
-  container.stdout?.on('data', () => {});
-
-  // No host-side idle timeout. Stale/stuck detection is driven by the host
-  // sweep reading heartbeat mtime + processing_ack claim age + container_state
-  // (see src/host-sweep.ts). This avoids killing long-running legitimate work
-  // on a wall-clock timer.
-
-  // ChildProcess emits `close` after `error`; finalize this exact channel once.
-  let finalized = false;
-  const finalizeContainer = (): void => {
-    if (finalized) return;
-    finalized = true;
-    finalizeSession(session.id, channel, storageActivity, containerName);
-  };
-
-  container.on('close', (code) => {
-    finalizeContainer();
-    // code null = killed by signal (normal shutdown path), not a boot failure.
-    if (code === 137) {
-      log.warn('Container exited 137 — likely OOM kill or forced SIGKILL', {
-        sessionId: session.id,
-        containerName,
-        memoryRequestMb: effectiveResources.memory.requestMb,
-        memoryLimitMb: effectiveResources.memory.limitMb,
-        stderrTail,
-      });
-    } else if (code !== 0 && code !== null && stderrTail.length > 0) {
-      log.warn('Container exited non-zero', { sessionId: session.id, code, containerName, stderrTail });
-    } else {
-      log.info('Container exited', { sessionId: session.id, code, containerName });
-    }
-  });
-
-  container.on('error', (err) => {
-    finalizeContainer();
-    log.error('Container spawn error', { sessionId: session.id, err });
-  });
-
-  // Every handler is registered; only now may this function yield.
+  // Every handler was registered inside the lease block above; only now may
+  // this function yield. The `running` status write is awaited AFTER the exit
+  // handlers exist: with a delayed driver a container that dies at boot would
+  // otherwise emit close/error while the write is pending, before
+  // finalizeContainer and the kill callbacks exist.
   await markContainerRunning(session.id);
 }
 
