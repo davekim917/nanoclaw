@@ -370,8 +370,9 @@ export const signalOverviewHandler = endpoint(async (req, _params, ctx) => {
   if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 1000)
     throw new SignalError(400, 'invalid_thread_page');
   const data = await buildSignalData(ctx, query.get('workgroup') ?? 'all', {
-    threadOffset: offset,
+    threadOffset: query.has('thread_id') ? 0 : offset,
     threadLimit: limit,
+    threadId: query.get('thread_id') || undefined,
   });
   const { rawDecisions: _, ...overview } = data;
   return response(overview);

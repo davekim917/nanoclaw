@@ -27,6 +27,8 @@ async function request<T>(path: string, method = 'GET', body?: unknown): Promise
 }
 export const getSignalOverview = (workgroup: string, threadOffset = 0) =>
   request<SignalOverview>(`?workgroup=${encodeURIComponent(workgroup)}&thread_offset=${threadOffset}&thread_limit=200`);
+export const getSignalThreadContext = (threadId: string, workgroup: string) =>
+  request<SignalOverview>(`?workgroup=${encodeURIComponent(workgroup)}&thread_id=${encodeURIComponent(threadId)}`);
 export const getSignalDecision = (id: string) => request<SignalDecisionDetail>(`/decisions/${encodeURIComponent(id)}`);
 export const reviewSignalDecision = (id: string, body: SignalReviewRequest) =>
   request<{ decision: SignalDecision }>(`/decisions/${encodeURIComponent(id)}/review`, 'POST', body);

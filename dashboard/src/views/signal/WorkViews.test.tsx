@@ -1,10 +1,12 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { SWRConfig } from 'swr';
-import type { SignalDecision, SignalAgent } from '../../../../src/dashboard/observatory-v2/types.js';
+import type { SignalDecision, SignalAgent, SignalOverview } from '../../../../src/dashboard/observatory-v2/types.js';
 import type { ThreadDetailResponse } from '../../lib/api.js';
 import { DecisionQueue, AgentWorkspace, ThreadWorkspace } from './WorkViews.js';
 import * as api from '../../lib/api.js';
+import * as signalApi from '../../lib/signal-api.js';
+vi.mock('../../lib/signal-api.js', () => ({ getSignalThreadContext: vi.fn() }));
 vi.mock('../../lib/api.js', async (original) => ({
   ...(await original<typeof api>()),
   listThreads: vi.fn(),
@@ -93,12 +95,101 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(api.listThreads).mockResolvedValue({ threads: [detail.thread] });
   vi.mocked(api.getThreadDetail).mockResolvedValue(detail);
+  vi.mocked(signalApi.getSignalThreadContext).mockResolvedValue({
+    as_of: '2026-09-06T00:00:00Z', workgroups: [], projects: [], decisions: [], agents: [], activity: [], sources: [],
+    capabilities: { manage_projects: false },
+  });
 });
 describe('work-first interaction', () => {
+  it('loads project and decision context for an exact off-page thread', async () => {
+    vi.mocked(api.listThreads).mockResolvedValue({ threads: [] });
+    const context: SignalOverview = {
+      as_of: '2026-09-06T00:00:00Z', workgroups: [{ id: 'wg', name: 'Workspace' }],
+      projects: [{ id: 'mapped', workgroup_id: 'wg', name: 'Mapped project', description: 'Exact mapped objective',
+        repositories: [], channel_keys: ['channel'], version: 1, updated_at: null, unmapped: false,
+        thread_ids: ['t1'], decision_ids: ['off-page'], items: [] }],
+      decisions: [decision('off-page')], agents: [], activity: [], sources: [], capabilities: { manage_projects: false },
+    };
+    vi.mocked(signalApi.getSignalThreadContext).mockResolvedValue(context);
+    render(<SWRConfig value={{ provider: () => new Map() }}>
+      <ThreadWorkspace authMe={authMe} workgroup="all" query="" id="t1" overview={{ ...context, projects: [], decisions: [] }} />
+    </SWRConfig>);
+    expect(await screen.findByText('Exact mapped objective')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /Question off-page/ })).toBeInTheDocument();
+    expect(signalApi.getSignalThreadContext).toHaveBeenCalledWith('t1', 'all');
+  });
+
+  it('refetches exact context when the workspace changes for the same thread', async () => {
+    vi.mocked(signalApi.getSignalThreadContext).mockImplementation(async (_id, workgroup) => ({
+      as_of: '2026-09-06T00:00:00Z', workgroups: [], projects: [],
+      decisions: [decision(workgroup, { workgroup_id: workgroup })],
+      agents: [], activity: [], sources: [], capabilities: { manage_projects: false },
+    }));
+    const cache = new Map();
+    const view = (workgroup: string) => <SWRConfig value={{ provider: () => cache }}>
+      <ThreadWorkspace authMe={authMe} workgroup={workgroup} query="" id="t1" overview={undefined} />
+    </SWRConfig>;
+    const rendered = render(view('workspace-one'));
+    expect(await screen.findByText('Question workspace-one')).toBeInTheDocument();
+    rendered.rerender(view('workspace-two'));
+    expect(await screen.findByText('Question workspace-two')).toBeInTheDocument();
+    expect(screen.queryByText('Question workspace-one')).toBeNull();
+    expect(signalApi.getSignalThreadContext).toHaveBeenLastCalledWith('t1', 'workspace-two');
+  });
+
+  it('encodes the selected workspace in the exact context request', async () => {
+    const actual = await vi.importActual<typeof signalApi>('../../lib/signal-api.js');
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{}'));
+    try {
+      await actual.getSignalThreadContext('thread/one', 'workspace/one');
+      expect(fetch).toHaveBeenCalledWith(
+        '/dashboard/api/observatory/v2?workgroup=workspace%2Fone&thread_id=thread%2Fone',
+        expect.objectContaining({ method: 'GET' }),
+      );
+    } finally {
+      fetch.mockRestore();
+    }
+  });
+
+  it.each(['request failure', 'unavailable source', 'healthy empty source'] as const)(
+    'preserves loaded context only when needed after an exact %s', async (result) => {
+      const overview: SignalOverview = {
+        as_of: '2026-09-06T00:00:00Z', workgroups: [{ id: 'wg', name: 'Workspace' }],
+        projects: [{ id: 'mapped', workgroup_id: 'wg', name: 'Mapped project', description: 'Loaded objective',
+          repositories: [], channel_keys: ['channel'], version: 1, updated_at: null, unmapped: false,
+          thread_ids: ['t1'], decision_ids: ['loaded'], items: [] }],
+        decisions: [decision('loaded'), decision('unrelated', { thread_id: 'other' })],
+        agents: [], activity: [], sources: [], capabilities: { manage_projects: false },
+      };
+      if (result === 'request failure') {
+        vi.mocked(signalApi.getSignalThreadContext).mockRejectedValue(new Error('Unavailable'));
+      } else {
+        vi.mocked(signalApi.getSignalThreadContext).mockResolvedValue({
+          ...overview, projects: [], decisions: [],
+          sources: [{ workgroup_id: 'wg', source: 'threads', as_of: null, detail: null,
+            status: result === 'unavailable source' ? 'unavailable' : 'available' }],
+        });
+      }
+      render(<SWRConfig value={{ provider: () => new Map(), shouldRetryOnError: false }}>
+        <ThreadWorkspace authMe={authMe} workgroup="all" query="" id="t1" overview={overview} />
+      </SWRConfig>);
+      await screen.findByText('Choose the identity key.');
+      if (result === 'healthy empty source') {
+        expect(await screen.findByText('No explicit project objective is mapped to this conversation.')).toBeInTheDocument();
+        expect(screen.queryByText('Question loaded')).toBeNull();
+      } else {
+        expect(screen.getByText('Loaded objective')).toBeInTheDocument();
+        expect(screen.getByRole('link', { name: /Question loaded/ })).toBeInTheDocument();
+      }
+      expect(screen.queryByText('Question unrelated')).toBeNull();
+    },
+  );
+
   it('selects an exact decision from a grouped queue and distinguishes reviewed from sent', () => {
     const choose = vi.fn();
     render(
       <DecisionQueue
+        timezone="America/Los_Angeles"
         decisions={[
           decision('blocking', { blocks_release: true, state: 'changed' }),
           decision('recorded', { state: 'answered', answer: 'Use ID' }),
@@ -108,6 +199,7 @@ describe('work-first interaction', () => {
       />,
     );
     expect(screen.getByRole('heading', { name: 'Blocking release' })).toBeInTheDocument();
+    expect(screen.getAllByTitle('Sep 4, 2026, 5:00 PM')).toHaveLength(2);
     expect(screen.getByRole('heading', { name: 'Reviewed' })).toBeInTheDocument();
     expect(screen.getByText(/Recorded only/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /Question recorded/ }));
@@ -334,5 +426,99 @@ describe('work-first interaction', () => {
     expect(screen.getByLabelText('Work instruction')).not.toBeDisabled();
     expect(pending.size).toBe(0);
     expect(vi.mocked(api.postThreadMessage).mock.calls[0]).toEqual(vi.mocked(api.postThreadMessage).mock.calls[1]);
+  });
+  it('keeps the newer retry busy when an older request rejects after remount', async () => {
+    const pending = new Map();
+    const cache = new Map();
+    let rejectOriginal!: (reason: Error) => void;
+    let finishRetry!: (value: Awaited<ReturnType<typeof api.postThreadMessage>>) => void;
+    vi.mocked(api.postThreadMessage)
+      .mockImplementationOnce(
+        () =>
+          new Promise((_resolve, reject) => {
+            rejectOriginal = reject;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishRetry = resolve;
+          }),
+      );
+    const view = () => (
+      <SWRConfig value={{ provider: () => cache }}>
+        <ThreadWorkspace
+          authMe={authMe}
+          workgroup="all"
+          query=""
+          id="t1"
+          overview={undefined}
+          pendingInstructions={pending}
+        />
+      </SWRConfig>
+    );
+    let rendered = render(view());
+    await screen.findByText('Choose the identity key.');
+    fireEvent.change(screen.getByLabelText('Work instruction recipient'), { target: { value: 'a1' } });
+    fireEvent.change(screen.getByLabelText('Work instruction'), { target: { value: 'One immutable instruction' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send instruction →' }));
+    await waitFor(() => expect(api.postThreadMessage).toHaveBeenCalledTimes(1));
+    rendered.unmount();
+    rendered = render(view());
+    await screen.findByText('Choose the identity key.');
+    fireEvent.click(screen.getByRole('button', { name: 'Retry same instruction →' }));
+    await waitFor(() => expect(api.postThreadMessage).toHaveBeenCalledTimes(2));
+    rejectOriginal(new Error('Original request ended late'));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Retry same instruction →' })).toBeDisabled(),
+    );
+    finishRetry({
+      task_id: 'task',
+      thread_id: 't1',
+      agent_group_id: 'a1',
+      session_id: 's1',
+      message_id: 'message',
+      echo_status: 'sent',
+      created_session: false,
+      handoff: null,
+    });
+    await screen.findByText(/Instruction accepted for Builder/);
+    expect(pending.size).toBe(0);
+  });
+  it('preserves an ownerless source context without offering conversation-only actions', async () => {
+    const source = {
+      ...detail.thread,
+      thread_id: 'board:synthetic-item',
+      title: 'Source-only work',
+      participants: [],
+      assignable_agents: [{ agent_group_id: 'a1', name: 'Builder' }],
+      session_ids: [],
+      reply_target_session_id: null,
+      attention_source: {
+        kind: 'release-board',
+        as_of: '2026-09-05T00:00:00Z',
+        stale: false,
+        url: null,
+        next_action: 'Assign an agent.',
+        assigned: null,
+        assigned_expired: null,
+      },
+    } as ThreadDetailResponse['thread'];
+    vi.mocked(api.listThreads).mockResolvedValue({ threads: [source] });
+    vi.mocked(api.getThreadDetail).mockResolvedValue({ thread: source, transcript: [] });
+    render(
+      <SWRConfig value={{ provider: () => new Map() }}>
+        <ThreadWorkspace authMe={authMe} workgroup="all" query="" id={source.thread_id} overview={undefined} />
+      </SWRConfig>,
+    );
+    await screen.findByText('Source record has no conversation yet');
+    expect(screen.getByRole('heading', { name: 'Source-only work' })).toBeInTheDocument();
+    expect(screen.queryByLabelText('Work instruction recipient')).toBeNull();
+    expect(screen.queryByLabelText('Work instruction')).toBeNull();
+    expect(screen.queryByRole('button', { name: /Snooze/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Close work' })).toBeNull();
+    expect(api.postThreadMessage).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Full conversation ↗' }));
+    expect(screen.getByText('Legacy transcript console')).toBeInTheDocument();
   });
 });

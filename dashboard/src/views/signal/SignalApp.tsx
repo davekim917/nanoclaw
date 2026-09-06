@@ -39,6 +39,20 @@ const navigation = [
 ] as const;
 const TimezoneContext = createContext<string | null>(null);
 const ProjectsContext = createContext<SignalProject[]>([]);
+function readBrowserVisitBaseline(user: string, workspace: string): VisitBaseline | null {
+  try {
+    return readVisitBaseline(window.localStorage, user, workspace);
+  } catch {
+    return null;
+  }
+}
+function saveBrowserVisitBaseline(user: string, workspace: string, decisions: SignalOverview['decisions']): void {
+  try {
+    saveVisitBaseline(window.localStorage, user, workspace, decisions);
+  } catch {
+    /* Browser storage permission must not prevent reviewing work. */
+  }
+}
 function useStamp() {
   const timezone = useContext(TimezoneContext);
   return (value: string | null) => signalStamp(value, timezone);
@@ -65,7 +79,7 @@ export function SignalApp({ authMe }: { authMe: AuthMe }) {
   const visitBaselines = useRef(new Map<string, VisitBaseline | null>());
   const visitKey = `${authMe.user_id}:${workgroup}`;
   if (!visitBaselines.current.has(visitKey))
-    visitBaselines.current.set(visitKey, readVisitBaseline(localStorage, authMe.user_id, workgroup));
+    visitBaselines.current.set(visitKey, readBrowserVisitBaseline(authMe.user_id, workgroup));
   const baseline = visitBaselines.current.get(visitKey) ?? null;
   const [connection, setConnection] = useState('Connecting');
   const search = useRef<HTMLInputElement>(null);
@@ -110,7 +124,7 @@ export function SignalApp({ authMe }: { authMe: AuthMe }) {
     }
   }
   useEffect(() => {
-    if (data) saveVisitBaseline(localStorage, authMe.user_id, workgroup, data.decisions);
+    if (data) saveBrowserVisitBaseline(authMe.user_id, workgroup, data.decisions);
   }, [data, authMe.user_id, workgroup]);
   const timezone = data?.timezone ?? null;
   const stamp = (value: string | null) => signalStamp(value, timezone);
@@ -178,7 +192,10 @@ export function SignalApp({ authMe }: { authMe: AuthMe }) {
           Number(b.state === 'changed') - Number(a.state === 'changed') ||
           (b.source_as_of ?? '').localeCompare(a.source_as_of ?? ''),
       ) ?? [];
-  const releaseWorkspace = data?.workgroups.find((w) => w.id === import.meta.env.VITE_SATURDAY_RELEASE_WORKGROUP);
+  const releaseWorkspace =
+    workgroup === 'all' || workgroup === import.meta.env.VITE_SATURDAY_RELEASE_WORKGROUP
+      ? data?.workgroups.find((w) => w.id === import.meta.env.VITE_SATURDAY_RELEASE_WORKGROUP)
+      : undefined;
   const releaseCalls =
     data?.decisions.filter(
       (d) => d.workgroup_id === releaseWorkspace?.id && d.blocks_release && d.state !== 'answered',
@@ -410,6 +427,7 @@ export function SignalApp({ authMe }: { authMe: AuthMe }) {
                                 ))}
                               </div>
                               <DecisionQueue
+                                timezone={timezone}
                                 baseline={baseline}
                                 decisions={decisions}
                                 selectedId={selected?.id ?? null}

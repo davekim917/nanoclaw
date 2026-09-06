@@ -14,11 +14,12 @@ import {
   pendingQuestionFromRows,
   type SourceDeps,
 } from './sources.js';
-import { decisionDetail, reviewDecision, dispatchDecision, updateProject, type ApiDeps } from './api.js';
+import { decisionDetail, reviewDecision, dispatchDecision, updateProject, signalOverviewHandler, type ApiDeps } from './api.js';
 import type { AuthedRequestContext } from '../router.js';
 import type { ObservatoryScene, ReleaseStateItem } from '../api/observatory.js';
 import type { ThreadSummary } from '../api/threads.js';
 import { readReview, readRecord } from './state.js';
+import * as signalSources from './sources.js';
 
 const item: ReleaseStateItem = {
   id: 'decision-1',
@@ -964,5 +965,29 @@ it('serves decisions without assembling schedule history when its cache is cold'
   } finally {
     Object.assign(cache, previous);
     assemble.mockRestore();
+  }
+});
+
+
+it('passes exact-thread context requests through the scoped source loader without a page offset', async () => {
+  const load = signalSources.buildSignalData;
+  const observed: SourceDeps[] = [];
+  const spy = vi.spyOn(signalSources, 'buildSignalData').mockImplementation(async (context, workspace, options = {}) => {
+    observed.push(options);
+    return load(context, workspace, { ...options, ...deps([]) });
+  });
+  try {
+    const response = await signalOverviewHandler(
+      new Request('http://localhost/dashboard/api/observatory/v2?workgroup=w&thread_id=synthetic-thread&thread_offset=200'),
+      {}, ctx('j', 'member', ['a']),
+    );
+    if (!response) throw new Error('Expected the Signal endpoint to respond');
+    expect(response.status).toBe(200);
+    expect(observed).toEqual([expect.objectContaining({ threadId: 'synthetic-thread', threadOffset: 0 })]);
+    const body = await response.json();
+    expect(body).toMatchObject({ agents: [{ id: 'a' }] });
+    expect(body).not.toHaveProperty('rawDecisions');
+  } finally {
+    spy.mockRestore();
   }
 });
