@@ -349,6 +349,26 @@ describe('T5 PR 3 — the plugin reader and the stamp path', () => {
     expect(() => parseTemplate(PLUGIN_DIR)).toThrow(/not a JSON object/);
   });
 
+  it('a value the lint cannot read refuses the plugin (#500 round 5)', () => {
+    // Same invariant, one level down: stringValues drops non-strings, so a
+    // nested object would pass the lint, fail the shape check later, and still
+    // ship inside the copied plugin directory.
+    for (const entry of [
+      { crm: { type: 'stdio', command: 'server', env: { API_KEY: { value: 'sk-live-AbC123RealLooking' } } } },
+      {
+        crm: { type: 'streamable-http', url: 'https://x.example.com/mcp', headers: { Authorization: ['Bearer', 'x'] } },
+      },
+      { crm: { type: 'stdio', command: 'server', env: 'not-an-object' } },
+    ]) {
+      writeManifest();
+      fs.writeFileSync(
+        path.join(PLUGIN_DIR, 'mcp.json'),
+        JSON.stringify({ $schema: MCP_SCHEMA_URL, mcpServers: entry }),
+      );
+      expect(() => parseTemplate(PLUGIN_DIR)).toThrow(/cannot be checked for credentials/);
+    }
+  });
+
   it('the documented mcp.json examples parse and stamp (#500 round 4)', () => {
     // The authoring examples are executable here, so a doc that drifts from
     // the reader's requirements fails the suite instead of a user's stamp.

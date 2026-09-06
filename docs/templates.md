@@ -280,8 +280,19 @@ category conventions, and checklist.
 
 The reader accepts Agent Plugins only; a pre-plugin template folder is refused
 with a migration error and never parsed as a fallback. Re-fetch the template in
-plugin layout (a `plugin.json` manifest, `skills/`, `mcp.json`, and the
-NanoClaw extension carrying persona, context, and tasks), then re-run
-`ncl groups create --template <ref>`. Groups already created are untouched —
-only the create path reads templates. The `[BREAKING]` entry in
-[CHANGELOG.md](../CHANGELOG.md) carries the same migration for `/update-nanoclaw`.
+plugin layout (a `plugin.json` manifest, `skills/`, `mcp.json` with its
+`$schema` and a declared `type` per entry, and the NanoClaw extension carrying
+persona, context, and tasks).
+
+**`--template` creates; it does not update.** `groups create --template` always
+mints a new group id, and suffixes the folder when the derived one is taken, so
+running it again against an updated template produces a SECOND group and leaves
+the existing one exactly as it was stamped. Updating a stamped group in place
+needs the restamp verb, which lands later in this series. Until then the
+supported paths are: create a new group from the updated template and retire
+the old one, or leave the existing group alone — nothing about it changes when
+the template does. Groups already created are untouched by the format change;
+only the create path reads templates.
+
+The `[BREAKING]` entry in [CHANGELOG.md](../CHANGELOG.md) carries the same
+migration for `/update-nanoclaw`.

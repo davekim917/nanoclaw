@@ -173,8 +173,34 @@ function lintServerCredentials(mcpServers: unknown, report: string[]): void {
   if (!isPlainObject(mcpServers)) return;
   for (const [name, entry] of Object.entries(mcpServers)) {
     if (!isPlainObject(entry)) continue;
+    for (const kind of ['env', 'headers'] as const) {
+      // Same invariant as the unparseable-file case: `stringValues` drops
+      // non-strings, so `env: { API_KEY: { value: "sk-live-…" } }` would pass
+      // the lint, fail the shape check later, and still ship inside the copied
+      // plugin. A value the lint cannot read is unlintable, not absent.
+      assertLintableValues(name, kind, entry[kind]);
+    }
     lintSecrets(name, 'env', stringValues(entry.env), report);
     lintSecrets(name, 'header', stringValues(entry.headers), report);
+  }
+}
+
+/** Every value in an `env`/`headers` map must be a string the lint can read. */
+function assertLintableValues(server: string, kind: 'env' | 'headers', raw: unknown): void {
+  if (raw === undefined) return;
+  if (!isPlainObject(raw)) {
+    throw new Error(
+      `mcp.json server "${server}": ${kind} must be an object of string values — it cannot be checked for ` +
+        `credentials otherwise, and the file is copied into the agent's workspace either way.`,
+    );
+  }
+  for (const [key, value] of Object.entries(raw)) {
+    if (typeof value !== 'string') {
+      throw new Error(
+        `mcp.json server "${server}": ${kind}."${key}" is not a string, so it cannot be checked for credentials ` +
+          `before the file is copied into the agent's workspace. Use a string, or remove the entry.`,
+      );
+    }
   }
 }
 
