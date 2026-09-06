@@ -702,25 +702,8 @@ export function createCodexConfigOverrides(
   },
   fast = false,
 ): string[] {
-  // `features.goals=true` enables Codex's goals feature for every container
-  // agent — same always-on pattern as `features.use_linux_sandbox_bwrap`.
-  //
-  // `features.steer=true` enables the `turn/steer` RPC path so mid-stream
-  // follow-up messages inject into the active turn instead of being queued
-  // for the next one. Without it, our codex provider's `push()` calls
-  // `steerCodexTurn` (an RPC the app-server then rejects), the catch path
-  // re-queues the message via `pending.push`, and the operator's
-  // mid-stream "steer left" effectively waits for the current turn to
-  // finish — observed during Example Assistant Codex's 5.5-min response to a mid-turn
-  // @-mention from Operator (session sess-1779235256589, May 2026). The Codex
-  // CLI defaults this off; Operator's local Codex CLI sets it in
-  // `[features] steer = true`. Containerized installs need the same toggle.
-  //
-  // Using the `-c` CLI override (rather than persisting in config.toml)
-  // because writeCodexMcpConfigToml regenerates the config file per-spawn
-  // and CLI overrides take precedence either way; keeping the toggle here
-  // means it survives a config.toml rewrite and doesn't need a [features]
-  // block injected into the writer.
+  // CLI overrides survive per-spawn config rewrites and fallback-home rotation.
+  // Steering is built into turn/steer; its former feature toggle was removed.
   const overrides = [
     'features.use_linux_sandbox_bwrap=false',
     'features.goals=true',
@@ -730,14 +713,13 @@ export function createCodexConfigOverrides(
     // the largest current doc. Keep src/codex-project-doc-cap.ts's warn
     // threshold numerically in sync with this value.
     'project_doc_max_bytes=262144',
-    'features.steer=true',
-    'features.fast_mode=true',
+    'features.fast_mode=false',
     // Bound native collaboration at the app-server boundary. Each Codex
     // subagent owns a full MCP subprocess tree, so an inherited host setting
     // that permits an unbounded/high worker count can exhaust the container's
     // PID cgroup and surface as a misleading protocol-desync error.
-    'features.multi_agent_v2=true',
-    `features.multi_agent_v2.max_concurrent_threads_per_session=${
+    'features.multi_agent=true',
+    `agents.max_concurrent_threads_per_session=${
       stickyConfig?.max_concurrent_threads_per_session ?? DEFAULT_CODEX_MAX_CONCURRENT_THREADS_PER_SESSION
     }`,
     // The canonical Markdown memory tree is the sole retrieval layer. Codex's
@@ -763,8 +745,8 @@ export function createCodexConfigOverrides(
   return overrides;
 }
 
-// The coordinator consumes one slot, leaving six worker slots by default.
-// Six is the minimum required by the deep-security workflow while remaining
+// The native cap counts spawned agents, excluding the primary thread.
+// Seven workers keep the default above the deep-security workflow minimum and
 // comfortably inside the install-wide 1024 PID ceiling for the MCP-heavy
 // production groups observed during the July 2026 incident. Operators can
 // override this per group through providerConfig when a workload warrants it.

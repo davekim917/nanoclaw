@@ -1041,7 +1041,11 @@ describe('materializeCodexFallbackRuntime', () => {
       ]);
       const generated = fs.readFileSync(path.join(runtimeHome, 'config.toml'), 'utf8');
       expect(generated).toContain('[features]');
-      expect(generated).toContain('[features.multi_agent_v2]');
+      expect(generated).toContain('[agents]');
+      expect(generated).toContain('multi_agent = true');
+      expect(generated).toContain('fast_mode = false');
+      expect(generated).toContain('context_management = true');
+      expect(generated).not.toContain('remote_control');
       // Host config never reaches the runtime home — generated base only.
       expect(generated).not.toContain('stale@host');
       expect(generated).not.toContain('codex_hooks');
