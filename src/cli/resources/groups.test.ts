@@ -845,85 +845,8 @@ describe('groups config add-mount / remove-mount (host-only)', () => {
   });
 });
 
-// Cases 9, 10, 14 (theme T2 PR 3, docs/specs/upstream-theme-ports/plan.md §5) —
-// re-derived from upstream 92a3518b7 + a951e74b7. Folded into this file rather
-// than adopting upstream's separate `groups-create-folder-reuse.test.ts`: this
-// file already mocks GROUPS_DIR through a unique `uniqueTmpRoot` root (the fix
-// §3.6 calls for — upstream's file hardcodes a shared `/tmp` path), and it is
-// already in `src/db/raw-db-ratchet.test.ts`'s pinned file set, so extending it
-// adds no new entry to that pin.
-describe('groups-create — folder-reuse refusal and folder-grammar validation (cases 9, 10, 14)', () => {
-  beforeEach(async () => {
-    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
-    fs.mkdirSync(TEST_DIR, { recursive: true });
-    await initTestDb();
-    runMigrations(getRawDb());
-  });
-  afterEach(async () => {
-    await closeDb();
-    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
-  });
-
-  async function create(folder: string) {
-    return dispatch(
-      {
-        id: `req-create-${folder}-${Math.random().toString(36).slice(2, 8)}`,
-        command: 'groups-create',
-        args: { folder },
-      },
-      { caller: 'host' },
-    );
-  }
-
-  it('refuses to mint a new group over undisposed on-disk residue (case 9)', async () => {
-    const groupsDir = `${TEST_DIR}/groups`;
-    fs.mkdirSync(path.join(groupsDir, 'recycled'), { recursive: true });
-    fs.writeFileSync(path.join(groupsDir, 'recycled', 'memory.md'), 'old group memory\n');
-
-    const resp = await create('recycled');
-
-    expect(resp.ok).toBe(false);
-    const error = (resp as { ok: false; error: { message: string } }).error;
-    expect(error.message).toContain('already exists on disk');
-    expect(error.message).toContain('recycled');
-    expect(getRawDb().prepare('SELECT * FROM agent_groups WHERE folder = ?').get('recycled')).toBeUndefined();
-    expect(fs.readFileSync(path.join(groupsDir, 'recycled', 'memory.md'), 'utf8')).toBe('old group memory\n');
-  });
-
-  it('refuses when the residue is a dangling symlink at groups/<folder> (case 9)', async () => {
-    const groupsDir = `${TEST_DIR}/groups`;
-    fs.mkdirSync(groupsDir, { recursive: true });
-    fs.symlinkSync(path.join(TEST_DIR, 'no-such-target'), path.join(groupsDir, 'linked'));
-
-    const resp = await create('linked');
-
-    expect(resp.ok).toBe(false);
-    const error = (resp as { ok: false; error: { message: string } }).error;
-    expect(error.message).toContain('already exists on disk');
-    expect(getRawDb().prepare('SELECT * FROM agent_groups WHERE folder = ?').get('linked')).toBeUndefined();
-  });
-
-  it('returns the SAME group when the folder is live — idempotency on --folder unaffected (case 10)', async () => {
-    const first = await create('steady');
-    expect(first.ok).toBe(true);
-    const firstId = (first as { ok: true; data: { id: string } }).data.id;
-
-    // The folder now exists on disk AND a DB row claims it. The refusal must
-    // sit on the fresh-create branch only.
-    const second = await create('steady');
-    expect(second.ok).toBe(true);
-    expect((second as { ok: true; data: { id: string } }).data.id).toBe(firstId);
-  });
-
-  it('refuses a folder the runtime label grammar would reject (case 14)', async () => {
-    const resp = await create('has a space');
-
-    expect(resp.ok).toBe(false);
-    const error = (resp as { ok: false; error: { message: string } }).error;
-    expect(error.message).toMatch(/Invalid group folder/);
-    expect(getRawDb().prepare('SELECT * FROM agent_groups WHERE folder = ?').get('has a space')).toBeUndefined();
-  });
-});
+// Cases 9, 10, 14 live in the sibling file groups-create-folder-reuse.test.ts
+// (adopted from upstream, unique-tmp-root fixed — see that file's header).
 
 // Cases 11, 12 — re-derived against `mcpServerPluginOwner` directly (upstream's
 // `groups-plugin-guard.test.ts` is not adopted: it imports `templates/manifest.ts`
