@@ -4492,21 +4492,15 @@ export async function buildMounts(
     mounts.push({ hostPath: containerJsonPath, containerPath: '/workspace/agent/container.json', readonly: true });
   }
 
-  // Stamped plugin content is immutable at runtime (the Agent Plugins
-  // contract: writes go to plugin-data/, which stays RW via the group mount).
-  // Same nested-RO pattern as container.json; initGroupFilesystem creates the
-  // dir just above (spawnContainer calls it before buildMounts), so the mount
-  // is unconditional and a group carrying no plugin gets an empty read-only
-  // directory rather than a missing path.
-  //
-  // Distinct from the fleet-wide `~/plugins` -> /workspace/plugins mount below:
-  // that one is operator-curated and shared by every group; this one is
-  // per-group and stamped from a template.
-  mounts.push({
-    hostPath: path.join(groupDir, 'plugins'),
-    containerPath: CONTAINER_PLUGINS_DIR,
-    readonly: true,
-  });
+  // Stamped plugin content — nested RO mount, same pattern as container.json
+  // just above. Immutable at runtime by the Agent Plugins contract: writes go
+  // to plugin-data/, which stays RW via the group mount. initGroupFilesystem
+  // creates the dir before mounts are built, so this is unconditional and a
+  // group carrying no plugin gets an empty read-only directory. Distinct from
+  // the fleet-wide ~/plugins -> /workspace/plugins mount, which is
+  // operator-curated and shared by every group.
+  const stampedPluginsDir = path.join(groupDir, 'plugins');
+  mounts.push({ hostPath: stampedPluginsDir, containerPath: CONTAINER_PLUGINS_DIR, readonly: true });
 
   // Composer-managed CLAUDE.md — nested RO mount. Regenerated from the
   // shared base + fragments, all INLINED, on every spawn (claude-md-compose.ts);

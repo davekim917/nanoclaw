@@ -34,14 +34,12 @@ import type { AgentGroup, ContainerConfigRow } from './types.js';
  * SSE is deprecated and rejected by config validation.
  */
 /**
- * Container-side path where a group's STAMPED plugins are mounted read-only.
- * Lockstep: `src/templates/create-agent.ts` records `pluginRoot` under this
- * prefix and `src/container-runner.ts` mounts `groups/<folder>/plugins` here.
+ * Container-side path where a group's stamped plugins are mounted read-only.
+ * Lockstep: create-agent.ts records `pluginRoot` under this prefix and
+ * container-runner.ts mounts groups/<folder>/plugins here.
  *
- * Not to be confused with the fork's fleet-wide plugin mount: `~/plugins/<name>`
- * is mounted at `/workspace/plugins` for every group by `/enable-agent-plugins`.
- * That one is operator-curated and live; this one is per-group, stamped from a
- * template, and immutable at runtime.
+ * Not the fork's fleet-wide `~/plugins` -> /workspace/plugins mount, which is
+ * operator-curated, live, and shared by every group.
  */
 export const CONTAINER_PLUGINS_DIR = '/workspace/agent/plugins';
 
@@ -79,12 +77,12 @@ export interface StdioMcpServerConfig {
   pluginRoot?: string;
   /**
    * Name of the plugin that stamped this server. Ownership marker: plugin-owned
-   * servers reject CLI/self-mod edits and are swapped wholesale on restamp.
-   * Internal — never CLI input, and deliberately NOT written to container.json:
-   * in this fork the file IS the spawn-time config, so host bookkeeping there
-   * would flow straight into every provider's server map. Ownership is read
-   * from the `container_configs.mcp_servers` projection instead, which every
-   * guard site already has in hand.
+   * servers reject CLI/self-mod edits and are swapped wholesale on restamp
+   * (`ncl groups create --template`). Internal — never CLI input, and never
+   * written to container.json: that file IS the spawn-time config here, so the
+   * marker would flow into every provider's server map. Ownership is read from
+   * the `container_configs.mcp_servers` projection, which every guard site
+   * already has in hand.
    */
   plugin?: string;
   instructions?: string;

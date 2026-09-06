@@ -146,24 +146,22 @@ registerResource({
       description:
         'Create (or return the existing) agent group with its container config. Idempotent on --folder. ' +
         'With --template <ref>, stamp from a local Agent Plugins 1.0.0 plugin directory under templates/ ' +
-        '(a plugin.json manifest plus optional skills/, mcp.json, and an ai.nanoco.nanoclaw/ extension ' +
-        'carrying instructions, context extras and paused recurring tasks). The whole plugin is copied to ' +
-        'groups/<folder>/plugins/<name> and mounted read-only; groups/<folder>/plugin-data/<name> is its ' +
-        'writable sibling. A pre-plugin template folder is refused with a migration error. ' +
-        'Use --folder <slug> and --name <display name>. ' +
+        '(plugin.json, plus optional skills/, mcp.json and an ai.nanoco.nanoclaw/ extension carrying ' +
+        'instructions, context extras and paused recurring tasks). The plugin is copied to ' +
+        'groups/<folder>/plugins/<name> read-only, with plugin-data/<name> as its writable sibling; ' +
+        'a pre-plugin template folder is refused with a migration error. Use --folder <slug> and --name <display name>. ' +
         'Optional --timezone <IANA id> sets the group timezone (template task schedules fire in it); like --name, it is ignored when the folder already exists.',
       handler: async (args) => {
         const timezone = parseTimezoneFlag(args.timezone) ?? undefined;
         if (args.template) {
+          // `report` names every plugin component that was skipped (a
+          // non-conforming skill, an invalid server, an ignored manifest field).
+          // Surfaced to the operator who ran the stamp, not only logged; the
+          // result shape is unchanged when the plugin was clean.
           const { group: stamped, report } = await createAgentFromTemplate(String(args.template), {
             name: args.name ? String(args.name) : undefined,
             timezone,
           });
-          // Reader notices name every component the plugin shipped that was
-          // skipped (a non-conforming skill, an invalid server, an ignored
-          // manifest field). Surfaced on the result rather than only logged —
-          // the operator who ran the stamp is the one who can fix the plugin.
-          // Shape is unchanged when the plugin was clean.
           return report.length > 0 ? { ...stamped, report } : stamped;
         }
         const folder = args.folder as string;
