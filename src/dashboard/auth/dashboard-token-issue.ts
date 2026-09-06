@@ -83,8 +83,9 @@ export async function dashboardTokenIssue(ctx: InterceptContext): Promise<void> 
     // No DM path on this platform (no adapter openDM support, or it threw —
     // e.g. the user has DMs closed). Fail closed: mint nothing, and say
     // nothing that reveals a credential exists to mint.
+    // Same privacy rule as the ensureUserDm call above: the invoker's
+    // namespaced handle stays out of the host log on the failure path too.
     log.warn('dashboardTokenIssue: no private delivery path, refusing to mint', {
-      userId: ctx.userId,
       channelType: mg.channel_type,
     });
     await adapter.deliver(
