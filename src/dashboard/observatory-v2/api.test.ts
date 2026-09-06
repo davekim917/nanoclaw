@@ -1068,6 +1068,9 @@ describe('source-backed decision destinations', () => {
     expect(platform.createThread).not.toHaveBeenCalled();
     expect(send).not.toHaveBeenCalled();
     expect(readRecord(await readReview(source.id)).dispatch?.creation?.phase).toBe('posting_parent');
+    expect((await decisionDetail(source.id, ctx(), d)).decision.dispatch_error).toBe(
+      'thread_creation_uncertain_reconciliation_required',
+    );
   });
   it('never repeats an uncertain thread creation, and overlapping first sends create once', async () => {
     const { d, source, request } = await noThread();

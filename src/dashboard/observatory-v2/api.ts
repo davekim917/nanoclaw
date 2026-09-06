@@ -274,7 +274,19 @@ export async function dispatchDecision(
     async () => {
       const current = readRecord(await readReview(id));
       if (current.dispatch?.key !== reservation!.key) throw new SignalError(409, 'dispatch_reservation_changed');
-      return (await prepareDestination(reservedSource, current, deps))!;
+      try {
+        return (await prepareDestination(reservedSource, current, deps))!;
+      } catch (error) {
+        if (error instanceof SignalError && error.message === 'thread_creation_uncertain_reconciliation_required') {
+          const latest = await readReview(id);
+          const record = readRecord(latest);
+          if (latest && record.dispatch?.key === reservation!.key && record.dispatch.error !== error.message) {
+            record.dispatch.error = error.message;
+            await saveReview(reservedSource, latest.version, record);
+          }
+        }
+        throw error;
+      }
     },
   );
   let delivery: Awaited<ReturnType<typeof applySessionSteer>>;
