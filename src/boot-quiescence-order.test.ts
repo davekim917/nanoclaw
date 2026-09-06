@@ -156,6 +156,9 @@ describe('boot mount-change ordering', () => {
       sharedFsEnabled: true,
       quiesce: async (changed, options) => {
         calls.push(`quiesce(${changed.join(',')}, of ${options.knownWorkgroupIds.length})`);
+        // The real door writes the accountability note after its pre-stop
+        // partition and before its first stop.
+        await options.beforeStop({ pass: 1, survivableSessionIds: [], mustStopSessionIds: ['s1'] });
         // Suspend inside the door: anything that runs before it resolves is a
         // mutation racing a live container.
         await new Promise<void>((resolve) => {
@@ -192,14 +195,14 @@ describe('boot mount-change ordering', () => {
 
     // Let every already-scheduled microtask drain while the door is suspended.
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(calls).toEqual(['warn', 'quiesce(wgx, of 1)']);
+    expect(calls).toEqual(['quiesce(wgx, of 1)', 'warn']);
 
     resolveQuiesce!();
     await pending;
 
     expect(calls).toEqual([
-      'warn',
       'quiesce(wgx, of 1)',
+      'warn',
       'quiesce:resolved',
       'reconcileWorkgroupSharedDirs',
       'reconcileWorkgroupMemory',
@@ -286,39 +289,44 @@ describe('boot mount-change ordering', () => {
 
     expect(changedWorkgroupIds).toEqual([]);
     expect(quiesceArg).toEqual([]);
-    // D1: the scope is empty and BOTH containers are still stopped. The D2 PR
-    // changes this to `stopped: 0` and `runtime.stops` empty — that flip is
-    // the whole of milestone 1's first line of evidence (plan §6).
+    // D2: the scope is empty and BOTH containers are left running — milestone
+    // 1's first line of evidence (plan §6): `stopped: 0`, `survivable: 2`.
     expect(scope).toEqual({
       workgroups: 1,
       changedWorkgroupIds: [],
       containers: 2,
-      stopped: 2,
+      stopped: 0,
       survivable: 2,
       unlabeled: 0,
-      // Both are identified and outside the changed set — the milestone-1
-      // counterfactual, named session by session for seam-4 E and G.
+      // Both are identified and outside the changed set — the survivors, named
+      // session by session for seam-4 E (adoption) and G (the warn's skip set).
       survivableSessionIds: ['s1', 's2'],
       mustStopSessionIds: [],
     });
-    expect(scope.stopped).toBe(scope.containers);
-    expect(runtime.stops).toEqual(['nanoclaw-v2-a-1', 'nanoclaw-v2-b-1']);
+    expect(scope.stopped).toBe(0);
+    expect(runtime.stops).toEqual([]);
     db.close();
   });
 
-  it('a workgroup that flips while the door is stopping is still reconciled', async () => {
+  it('a workgroup that flips during the stops is stopped in the second pass', async () => {
     // The group directories the predicates read are bind-mounted WRITABLE into
     // live containers. A still-running agent can write one between the
-    // pre-stop snapshot and the stops completing; the pre-stop set would then
-    // exclude it, D1 would stop it anyway, and its reconcile would be skipped.
-    // The fix is the second evaluation, on the quiescent tree.
+    // pre-stop snapshot and the first pass completing; the pre-stop set would
+    // then exclude it and leave its container running across a mount cutover.
+    // The fix is the second evaluation after the first pass, and a second
+    // stop pass over whatever it classifies must-stop.
     //
-    // `stop` here stands in for that agent's last write: it removes the exact
-    // compatibility symlink, which flips the memory predicate to true.
+    // The door's second listing stands in for that agent's last write: it
+    // removes the exact compatibility symlink, which flips the memory
+    // predicate to true; the pre-stop pass stopped nothing (the tree was
+    // settled), so the survivor was still writing.
     const { groupsDir, dataDir } = buildSettledTree();
     const db = makeDb();
     const scopes: Array<string[]> = [];
-    let mutated = false;
+    const stops: string[] = [];
+    const warns: Array<{ skip: string[]; beforeStops: number }> = [];
+    let listings = 0;
+    let stopped = false;
 
     const { changedWorkgroupIds, scope } = await runBootMountQuiescence(db, {
       workgroupIds: () => ['wgx'],
@@ -329,17 +337,22 @@ describe('boot mount-change ordering', () => {
         scopes.push([...changed]);
         return quiesceWorkgroupsForBootMountChange(changed, {
           ...options,
-          list: () =>
-            mutated ? [] : [{ name: 'nanoclaw-v2-a-1', workgroupId: 'wgx', sessionId: 's1', groupId: 'g1' }],
-          stop: () => {
-            fs.unlinkSync(path.join(groupsDir, 'wgx', 'memory'));
-            mutated = true;
+          list: () => {
+            listings += 1;
+            if (listings === 2) fs.unlinkSync(path.join(groupsDir, 'wgx', 'memory'));
+            return stopped ? [] : [{ name: 'nanoclaw-v2-a-1', workgroupId: 'wgx', sessionId: 's1', groupId: 'g1' }];
+          },
+          stop: (name) => {
+            stops.push(name);
+            stopped = true;
           },
         });
       },
       activeSessionIds: async () => ['s1', 's2'],
       ensureRuntime: () => undefined,
-      warnStartup: async () => undefined,
+      warnStartup: async (_reason, skipSessionIds) => {
+        warns.push({ skip: [...skipSessionIds].sort(), beforeStops: stops.length });
+      },
       reconcileShared: () => undefined,
       memoryGate: (_db, opts) => {
         scopes.push([...(opts.mutateWorkgroupIds ?? [])]);
@@ -354,11 +367,20 @@ describe('boot mount-change ordering', () => {
     // to it rather than skipping it.
     expect(changedWorkgroupIds).toEqual(['wgx']);
     expect(scopes[1]).toEqual(['wgx']);
-    // The scope handed to seam-4 E and G is built from the SAME set: `wgx` is
+    // The flipped workgroup's container was stopped in the second pass, and
+    // the scope handed to seam-4 E is built from the SAME set: `wgx` is
     // changed, so its session is not offered as survivable.
+    expect(stops).toEqual(['nanoclaw-v2-a-1']);
     expect(scope.changedWorkgroupIds).toEqual(['wgx']);
     expect(scope.survivableSessionIds).toEqual([]);
     expect(scope.survivable).toBe(0);
+    expect(scope.stopped).toBe(1);
+    // The first note skipped s1 as survivable; the reclassification warned it
+    // — and only it — before the second-pass stop (#479 round 1).
+    expect(warns).toEqual([
+      { skip: ['s1'], beforeStops: 0 },
+      { skip: ['s2'], beforeStops: 0 },
+    ]);
     db.close();
   });
 
@@ -402,13 +424,14 @@ describe('boot mount-change ordering', () => {
     db.close();
   });
 
-  it('the bounded runtime probe runs after the warn and before the door', async () => {
+  it('the bounded runtime probe runs before the door, and the warn runs inside it', async () => {
     // Regression guard. On main the only 10 s-bounded docker probe
     // (`ensureContainerRuntimeRunning`) ran immediately ahead of
     // `cleanupOrphansStrict()`. The door's inventory is an UNBOUNDED
     // `docker ps`, so with the probe left to the memory gate a stalled daemon
-    // would hang the boot instead of failing it. The warn is DB-only and stays
-    // first.
+    // would hang the boot instead of failing it. Under D2 the warn moves
+    // INSIDE the door (its pre-stop partition is the note's skip set), so it
+    // follows the probe and precedes the first stop.
     const db = makeDb();
     const calls: string[] = [];
 
@@ -424,8 +447,9 @@ describe('boot mount-change ordering', () => {
       warnStartup: async () => {
         calls.push('warn');
       },
-      quiesce: async () => {
+      quiesce: async (_changed, options) => {
         calls.push('quiesce');
+        await options.beforeStop({ pass: 1, survivableSessionIds: [], mustStopSessionIds: [] });
         return {
           workgroups: 1,
           changedWorkgroupIds: [],
@@ -443,7 +467,7 @@ describe('boot mount-change ordering', () => {
       prune: () => undefined,
     });
 
-    expect(calls).toEqual(['warn', 'ensureRuntime', 'quiesce']);
+    expect(calls).toEqual(['ensureRuntime', 'quiesce', 'warn']);
     db.close();
   });
 
@@ -482,16 +506,20 @@ describe('boot mount-change ordering', () => {
       }),
     ).rejects.toThrow(/Container runtime is required/);
 
-    // The warn already ran; the door never listed, and nothing reconciled.
-    expect(calls).toEqual(['warn', 'ensureRuntime']);
+    // The door never listed, so no note was written either (the warn lives
+    // inside the door under D2, and a boot that cannot reach the runtime fails
+    // here; the next boot warns), and nothing reconciled.
+    expect(calls).toEqual(['ensureRuntime']);
     db.close();
   });
 
   it('the startup warn runs before the first stop', async () => {
-    // main() has always captured this evidence ahead of the fleet-wide stop.
-    // §7.D's listed order puts the warn after the door, which would leave the
-    // sessions a half-failed door already killed with no note at all. The
-    // primitive is real here, so `stops` is the actual stop sequence.
+    // main() has always captured this evidence ahead of the stop pass. §7.D's
+    // listed order puts the warn after the door, which would leave the
+    // sessions a half-failed door already killed with no note at all. Under D2
+    // the door itself calls the warn between its pre-stop partition and its
+    // first stop. The primitive is real here, so `stops` is the actual stop
+    // sequence.
     const db = makeDb();
     const calls: string[] = [];
     const runtime = fakeRuntime([{ name: 'nanoclaw-v2-a-1', workgroupId: 'wgx', sessionId: 's1', groupId: 'g1' }]);
@@ -522,8 +550,53 @@ describe('boot mount-change ordering', () => {
       prune: () => undefined,
     });
 
-    expect(calls).toEqual(['warn', 'quiesce', 'stop:nanoclaw-v2-a-1']);
+    expect(calls).toEqual(['quiesce', 'warn', 'stop:nanoclaw-v2-a-1']);
     expect(calls.indexOf('warn')).toBeLessThan(calls.findIndex((c) => c.startsWith('stop:')));
+    db.close();
+  });
+
+  it('survivors get no accountability note; must-stop sessions get theirs before the stop', async () => {
+    // Two workgroups, one changed. The note claims the session's container was
+    // stopped by this restart, so the survivor must not get one — and the
+    // must-stop session's note has to land before its container is stopped.
+    const db = makeDb(['wgy']);
+    const calls: string[] = [];
+    let skipped: ReadonlySet<string> | null = null;
+    const runtime = fakeRuntime([
+      { name: 'nanoclaw-v2-a-1', workgroupId: 'wgx', sessionId: 's1', groupId: 'g1' },
+      { name: 'nanoclaw-v2-b-1', workgroupId: 'wgy', sessionId: 's2', groupId: 'g2' },
+    ]);
+
+    const { scope } = await runBootMountQuiescence(db, {
+      workgroupIds: () => ['wgx', 'wgy'],
+      memoryWouldChange: (_database, id) => id === 'wgx',
+      sharedWouldChange: () => false,
+      sharedFsEnabled: true,
+      quiesce: (changed, options) =>
+        quiesceWorkgroupsForBootMountChange(changed, {
+          ...options,
+          list: runtime.list,
+          stop: (name: string) => {
+            calls.push(`stop:${name}`);
+            runtime.stop(name);
+          },
+        }),
+      activeSessionIds: async () => ['s1', 's2'],
+      ensureRuntime: () => undefined,
+      warnStartup: async (_reason, skipSessionIds) => {
+        calls.push('warn');
+        skipped = skipSessionIds;
+      },
+      reconcileShared: () => undefined,
+      memoryGate: () => [],
+      prune: () => undefined,
+    });
+
+    expect(calls).toEqual(['warn', 'stop:nanoclaw-v2-a-1']);
+    // The skip set is the PRE-stop survivable partition: the survivor only.
+    expect([...skipped!]).toEqual(['s2']);
+    expect(scope.survivableSessionIds).toEqual(['s2']);
+    expect(scope.mustStopSessionIds).toEqual(['s1']);
     db.close();
   });
 
@@ -607,7 +680,10 @@ describe('boot mount-change ordering', () => {
     ).rejects.toThrow(/prove install-scoped container absence/);
 
     // The warn already ran; nothing below the door did.
-    expect(calls).toEqual(['warn']);
+    // A door whose LISTING fails never reaches its pre-stop partition, so no
+    // note is written (the boot fails; the next boot warns) — and nothing
+    // below the door ran.
+    expect(calls).toEqual([]);
     db.close();
   });
 });

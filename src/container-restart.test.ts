@@ -15,6 +15,11 @@ vi.mock('./log.js', () => ({
 
 const mockIsContainerRunning = vi.fn<(id: string) => boolean>();
 const mockIsContainerSpawning = vi.fn<(id: string) => boolean>();
+const mockHasPendingAdoption = vi.fn<(id: string) => boolean>(() => false);
+const mockResolvePendingSurvivor = vi.fn<(id: string) => Promise<'running' | 'gone' | 'unknown'>>(
+  async () => 'running',
+);
+const mockGetContainerIdentity = vi.fn<(id: string) => string | null>(() => 'nanoclaw-v2-identity-1');
 // Process generation for a session's container. Constant unless a test models a
 // replacement spawning during the restart's async pending read.
 const mockGetContainerSpawnedAt = vi.fn<(id: string) => number>(() => 1000);
@@ -26,10 +31,15 @@ vi.mock('./container-runner.js', async (importOriginal) => {
     ...real,
     isContainerRunning: (...args: unknown[]) => mockIsContainerRunning(args[0] as string),
     isContainerSpawning: (...args: unknown[]) => mockIsContainerSpawning(args[0] as string),
-    // The real definition, over the same two mocks: a container "owns"
-    // outbound.db while it is running OR still spawning.
+    hasPendingAdoption: (...args: unknown[]) => mockHasPendingAdoption(args[0] as string),
+    resolvePendingSurvivor: (...args: unknown[]) => mockResolvePendingSurvivor(args[0] as string),
+    getContainerIdentity: (...args: unknown[]) => mockGetContainerIdentity(args[0] as string),
+    // The real definition, over the same mocks: a container "owns"
+    // outbound.db while it is running, still spawning, or a pending survivor.
     containerOwnsOutbound: (...args: unknown[]) =>
-      mockIsContainerRunning(args[0] as string) || mockIsContainerSpawning(args[0] as string),
+      mockIsContainerRunning(args[0] as string) ||
+      mockIsContainerSpawning(args[0] as string) ||
+      mockHasPendingAdoption(args[0] as string),
     // The REAL predicate, not a hand-rolled copy — it closes over `getSession`
     // from `./db/sessions.js`, which this file mocks separately (below) to
     // `mockGetSession`, so it answers what a test has set up rather than what
@@ -253,6 +263,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockIsContainerSpawning.mockReturnValue(false);
   mockGetContainerSpawnedAt.mockReset().mockReturnValue(1000);
+  mockResolvePendingSurvivor.mockReset().mockResolvedValue('running');
+  mockGetContainerIdentity.mockReset().mockReturnValue('nanoclaw-v2-identity-1');
   activeEpochs.clear();
   acknowledgedEpochs.clear();
   processingSessions.clear();
@@ -333,6 +345,44 @@ describe('repository mount reconciliation', () => {
       expect(mailbox.countDueMessages()).toBe(1);
       expect((mailbox as NanoclawMailboxSession).readRepoIngressFence()?.state).toBe('released');
     });
+  });
+
+  it('a pending survivor holds the repository mounts and is stopped through killContainer', async () => {
+    // #462 item 3: a survivor this host has not claimed is running and holds
+    // the workgroup mounts like any container, but it is in neither the
+    // registry nor the spawning sets. It is affected, fenced, killed through
+    // the one stop every caller goes through (which routes it), and the door
+    // waits for its pending mark to clear.
+    const session = makeSession('s-pending', 'ag-pending');
+    const outboundPath = provisionRealMailbox('ag-pending', 's-pending');
+    mockGetSessionsByAgentGroup.mockReturnValue([session]);
+    const pending = new Set(['s-pending']);
+    mockIsContainerRunning.mockReturnValue(false);
+    mockIsContainerSpawning.mockReturnValue(false);
+    mockHasPendingAdoption.mockImplementation((id) => pending.has(id));
+    mockKillContainer.mockImplementation((id) => {
+      pending.delete(id);
+    });
+
+    const epoch = 'repository-publish:pending-1';
+    const quiescing = quiesceSessionsForRepositoryMounts([session] as never, epoch, 5_000);
+    await new Promise((resolve) => setImmediate(resolve));
+    const generation = await withMailboxSession('ag-pending', 's-pending', (mailbox) => {
+      const fence = (mailbox as NanoclawMailboxSession).readRepoIngressFence();
+      expect(fence?.state).toBe('active');
+      return fence!.generation;
+    });
+    // LIVE for the barrier: a pending survivor is not stopped until it has
+    // acknowledged the exact activation token — a stale ack is not a drain.
+    writeBarrierAck(outboundPath, JSON.stringify([epoch, 'generation-from-a-previous-barrier']));
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(mockKillContainer).not.toHaveBeenCalled();
+    writeBarrierAck(outboundPath, JSON.stringify([epoch, generation]));
+
+    const quiescence = await quiescing;
+    expect(mockKillContainer).toHaveBeenCalledWith('s-pending', 'repository mount set changed', undefined);
+    expect(quiescence.sessions.map((entry) => entry.id)).toEqual(['s-pending']);
+    await releaseRepositoryMountQuiescence(quiescence);
   });
 
   it('stops every affected sibling and wakes the exact set after claim release', async () => {
@@ -687,6 +737,76 @@ describe('restartAgentGroupContainers', () => {
   // an unhandledRejection and the loop always finished. Awaiting it turned that
   // into control flow: the first failure killed the sessions ahead of it and
   // stranded every one behind it, half-restarting the group.
+  it('selects a pending survivor for a host-side group restart', async () => {
+    // A survivor adoption could not yet claim is absent from the registry but
+    // runs the old image; `ncl groups restart` must reach it (#479 round 1).
+    mockGetSessionsByAgentGroup.mockReturnValue([makeSession('s-tracked', 'g1'), makeSession('s-pending', 'g1')]);
+    mockIsContainerRunning.mockImplementation((id) => id === 's-tracked');
+    mockHasPendingAdoption.mockImplementation((id) => id === 's-pending');
+
+    const count = await restartAgentGroupContainers('g1', 'test', 'Resuming.');
+
+    expect(mockKillContainer.mock.calls.map((c) => c[0])).toEqual(['s-tracked', 's-pending']);
+    expect(count).toBe(2);
+    mockHasPendingAdoption.mockReset();
+    mockHasPendingAdoption.mockReturnValue(false);
+  });
+
+  it('an unlisted pending survivor is resolved before its restart is counted', async () => {
+    // A hold seeded on an inventory failure has no container name; the restart
+    // re-lists it first. Gone → nothing restarted and no wake row written;
+    // unknown → reported as failed, not restarted; running → restarted.
+    mockGetSessionsByAgentGroup.mockReturnValue([makeSession('s-unlisted', 'g1')]);
+    mockIsContainerRunning.mockReturnValue(false);
+    mockHasPendingAdoption.mockImplementation((id) => id === 's-unlisted');
+
+    mockResolvePendingSurvivor.mockResolvedValueOnce('gone');
+    expect(await restartAgentGroupContainers('g1', 'test', 'Resuming.')).toBe(0);
+    expect(mockKillContainer).not.toHaveBeenCalled();
+    expect(mockWriteSessionMessage).not.toHaveBeenCalled();
+
+    mockResolvePendingSurvivor.mockResolvedValueOnce('unknown');
+    expect(await restartAgentGroupContainers('g1', 'test', 'Resuming.')).toBe(0);
+    expect(mockKillContainer).not.toHaveBeenCalled();
+    expect(log.warn).toHaveBeenCalledWith(
+      'Restart: could not resolve a pending survivor; leaving it running',
+      expect.objectContaining({ sessionId: 's-unlisted' }),
+    );
+
+    mockResolvePendingSurvivor.mockResolvedValueOnce('running');
+    expect(await restartAgentGroupContainers('g1', 'test', 'Resuming.')).toBe(1);
+    expect(mockKillContainer.mock.calls.map((c) => c[0])).toEqual(['s-unlisted']);
+    mockHasPendingAdoption.mockReset();
+    mockHasPendingAdoption.mockReturnValue(false);
+  });
+
+  it('a pending survivor adopted during the restart is still killed and respawned', async () => {
+    // The mailbox read awaits; an inbound wake adopts the survivor meanwhile.
+    // The same docker process keeps its NAME, so it is still the container this
+    // restart targets — even though the registry timestamp went 0 → adoption.
+    mockGetSessionsByAgentGroup.mockReturnValue([makeSession('s-adopting', 'g1')]);
+    let adopted = false;
+    mockIsContainerRunning.mockImplementation(() => adopted);
+    mockHasPendingAdoption.mockImplementation(() => !adopted);
+    mockGetContainerSpawnedAt.mockImplementation(() => (adopted ? 5_000 : 0));
+    mockGetContainerIdentity.mockReturnValue('nanoclaw-v2-survivor-1');
+    mockCountDueMessages.mockImplementation(() => {
+      adopted = true;
+      return 0;
+    });
+
+    const count = await restartAgentGroupContainers('g1', 'test', 'Resuming.');
+
+    expect(count).toBe(1);
+    expect(mockKillContainer.mock.calls.map((c) => c[0])).toEqual(['s-adopting']);
+    expect(log.info).not.toHaveBeenCalledWith(
+      'Restart: container was replaced while reading pending work; leaving the replacement alone',
+      expect.anything(),
+    );
+    mockHasPendingAdoption.mockReset();
+    mockHasPendingAdoption.mockReturnValue(false);
+  });
+
   it('keeps restarting after one session fails, and never kills that session', async () => {
     mockGetSessionsByAgentGroup.mockReturnValue([
       makeSession('s1', 'g1'),
@@ -785,7 +905,7 @@ describe('restartAgentGroupContainers', () => {
     mockGetSessionsByAgentGroup.mockReturnValue([makeSession('s1', 'g1')]);
     mockIsContainerRunning.mockReturnValue(true);
     // A replacement appears while the pending read is in flight.
-    mockGetContainerSpawnedAt.mockReturnValueOnce(1000).mockReturnValue(2000);
+    mockGetContainerIdentity.mockReturnValueOnce('nanoclaw-v2-old-1').mockReturnValue('nanoclaw-v2-new-1');
 
     const count = await restartAgentGroupContainers('g1', 'test', 'Resuming.');
 
@@ -819,7 +939,7 @@ describe('restartAgentGroupContainers', () => {
     // process. Killing that one is wrong, and silently so — the read saw no due
     // rows, so no onExit would be installed and the replacement's freshly
     // claimed input would go dark until a later recovery pass.
-    mockGetContainerSpawnedAt.mockReturnValueOnce(1000).mockReturnValue(2000);
+    mockGetContainerIdentity.mockReturnValueOnce('nanoclaw-v2-old-1').mockReturnValue('nanoclaw-v2-new-1');
 
     const count = await restartAgentGroupContainers('g1', 'test');
 

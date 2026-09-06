@@ -204,6 +204,11 @@ export interface BootMountQuiescenceDeps {
       knownWorkgroupIds: string[];
       knownSessionIds: string[];
       reevaluateChanged: () => string[];
+      beforeStop: (partition: {
+        pass: 1 | 2;
+        survivableSessionIds: string[];
+        mustStopSessionIds: string[];
+      }) => Promise<void>;
     },
   ) => Promise<BootQuiescenceScope>;
   warnStartup?: (reason: string, skipSessionIds: ReadonlySet<string>) => Promise<void>;
@@ -214,29 +219,20 @@ export interface BootMountQuiescenceDeps {
 }
 
 /**
- * Sessions the startup warn skips. EMPTY under D1, and that is the correct
- * value, not a placeholder.
- *
- * Series G narrowed the warn to the sessions a restart actually interrupts and
- * takes the skip set from the caller (`src/host-restart-warn.ts`). Two reasons
- * it stays empty here:
- *
- *   - D1 stops EVERY install-labeled container, the survivable partition
- *     included. Skipping the sessions the door reports survivable would leave
- *     unwarned exactly the sessions D1 goes on to stop — the inversion of what
- *     the note is for.
- *   - The partition does not exist yet at this point. It is computed AFTER
- *     quiescence, deliberately (see `quiesceWorkgroupsForBootMountChange`), and
- *     the warn has to run before the stops because that pass can outlast the
- *     heartbeat freshness window.
- *
- * D2 is where this becomes `new Set(preStopScope.survivableSessionIds)`, and it
- * has to be the PRE-stop partition for exactly the ordering reason above. The
- * door's own D2 note already records that D2 partitions twice — once pre-stop
- * to choose the stop set, once post-stop for the adoption contract — and this
- * skip set is the first of those two.
+ * The sessions whose containers a boot leaves running, as the fail-closed seed
+ * adoption holds pending when its own inventory cannot be taken (seam 4 E,
+ * `heldOnInventoryFailure`). Under D2 the door's returned survivors ARE the
+ * post-stop inventory — the containers it proved still running after its
+ * last pass — so they are the seed directly. Not inferred from the counts: a
+ * newcomer stopped in the second pass makes `stopped` reach `containers`
+ * while the final partition still holds survivors, and those must be held
+ * (owned, leased, counted) rather than left unprotected. A door that stopped
+ * everything returns no survivors, and the seed is then empty on its own.
+ * Exported for the unit test only.
  */
-const BOOT_WARN_SKIP_SESSION_IDS: ReadonlySet<string> = new Set<string>();
+export function adoptionSeedFor(scope: Pick<BootQuiescenceScope, 'survivableSessionIds'>): string[] {
+  return [...scope.survivableSessionIds];
+}
 
 function bootFatal(message: string, err: unknown): never {
   log.error(message, { err });
@@ -296,23 +292,6 @@ export async function runBootMountQuiescence(
   const evaluateChanged = (): string[] =>
     allWorkgroupIds.filter((id) => memoryWouldChange(db, id) || (sharedFsEnabled && sharedWouldChange(db, id)));
 
-  // Warn FIRST, before anything is stopped. `main()` has always captured this
-  // evidence ahead of the fleet-wide stop (the warn sat above the memory gate
-  // that held `cleanupOrphansStrict`), and it has to stay there: the note is
-  // written from the session rows an unclean previous host left marked
-  // 'running', and a door that dies half way through its stops would otherwise
-  // leave the sessions it did kill with no accountability at all. §7.D's
-  // listed order puts the warn after the door; that regresses this, so the
-  // order here is main's, not the plan's — recorded as a deviation.
-  try {
-    await (deps.warnStartup ?? warnMarkedRunningSessionsOfStartup)(
-      'host startup after an unclean stop',
-      BOOT_WARN_SKIP_SESSION_IDS,
-    );
-  } catch (err) {
-    log.error('host-restart startup warn failed', { err });
-  }
-
   // Bounded probe BEFORE the unbounded inventory, which is the order main has.
   // There `ensureContainerRuntimeRunning()` (a 10 s-timeout `docker info`) ran
   // immediately ahead of `cleanupOrphansStrict()`; here the door's
@@ -334,6 +313,36 @@ export async function runBootMountQuiescence(
     deps.activeSessionIds ?? (async () => (await getActiveSessions()).map((session) => session.id))
   )();
 
+  // The startup warn runs INSIDE the door, after its pre-stop partition and
+  // before its first stop (`beforeStop`): the note is written from the session
+  // rows an unclean previous host left marked 'running', and under D2 it must
+  // skip the survivors — their containers are not interrupted, and the note
+  // says they were. That skip set exists only once the door has listed and
+  // partitioned, and the note still has to precede the stop pass, which can
+  // outlast the heartbeat freshness window (#441). A door that dies half way
+  // through its stops leaves the note already written for every must-stop
+  // session; a door whose listing fails writes none, and the boot fails there.
+  // The door calls it a second time only when its post-stop re-evaluation
+  // moved sessions INTO must-stop: those were skipped by the first note as
+  // survivable and are about to be interrupted after all, so they — and only
+  // they — get theirs then (the skip set is every other known session).
+  const warnStartup = deps.warnStartup ?? warnMarkedRunningSessionsOfStartup;
+  const beforeStop = async (partition: {
+    pass: 1 | 2;
+    survivableSessionIds: string[];
+    mustStopSessionIds: string[];
+  }): Promise<void> => {
+    const skip =
+      partition.pass === 1
+        ? new Set(partition.survivableSessionIds)
+        : new Set(knownSessionIds.filter((id) => !partition.mustStopSessionIds.includes(id)));
+    try {
+      await warnStartup('host startup after an unclean stop', skip);
+    } catch (err) {
+      log.error('host-restart startup warn failed', { err });
+    }
+  };
+
   const scope = await (deps.quiesce ?? quiesceWorkgroupsForBootMountChange)(changedBeforeQuiescence, {
     knownWorkgroupIds: allWorkgroupIds,
     knownSessionIds,
@@ -341,6 +350,7 @@ export async function runBootMountQuiescence(
     // so the scope it returns and the cutover below can never disagree about
     // which workgroups changed.
     reevaluateChanged: evaluateChanged,
+    beforeStop,
   });
 
   // The authoritative set: one evaluation, inside the door, after the proof.
@@ -563,15 +573,11 @@ export async function main(): Promise<void> {
   // note); this post-stop one is the adoption contract.
   //
   // If adoption's own inventory then fails, the fail-closed seed is only what
-  // the door actually LEFT running: under D1 `stopped == containers`, so the
-  // partition is a counterfactual and the seed is empty — holding it would
-  // create phantom storage and memory holds for containers the door just
-  // proved gone. Under D2 the door leaves the survivable set running and this
-  // becomes the real survivor set.
-  const leftRunningSessionIds = scope.stopped < scope.containers ? scope.survivableSessionIds : [];
+  // the door actually LEFT running (`adoptionSeedFor`): under D2 that is the
+  // post-stop survivable set; a boot that stopped everything seeds nothing.
   const reconciled = await adoptRunningSessions({
     survivableSessionIds: scope.survivableSessionIds,
-    heldOnInventoryFailure: leftRunningSessionIds,
+    heldOnInventoryFailure: adoptionSeedFor(scope),
   });
   for (const report of memoryReports) {
     if (report.state.status === 'migration-required') {

@@ -6,10 +6,12 @@
  */
 import {
   containerOwnsOutbound,
-  getContainerSpawnedAt,
+  getContainerIdentity,
+  hasPendingAdoption,
   isContainerRunning,
   isContainerSpawning,
   killContainer,
+  resolvePendingSurvivor,
   sessionStillActive,
 } from './container-runner.js';
 import { requestWake } from './request-wake.js';
@@ -141,7 +143,18 @@ function vanishedSessionIsSkippable(err: unknown, session: Session): boolean {
  * poll, so its absence is an inconsistent host view and fails closed.
  */
 function sessionVanishIsSkippable(session: Session): boolean {
-  return !isContainerRunning(session.id) && !isContainerSpawning(session.id);
+  return !sessionHasLiveContainer(session);
+}
+
+/**
+ * Is a container running for this session as far as the host can tell —
+ * tracked, still spawning, or a pending survivor adoption could not yet claim
+ * (seam 4 E/D2, #462)? The barrier predicates ask this rather than the
+ * registry alone: a pending survivor is live, holds the mounts, and must
+ * acknowledge the fence and drain its work before it is stopped.
+ */
+function sessionHasLiveContainer(session: Session): boolean {
+  return isContainerRunning(session.id) || isContainerSpawning(session.id) || hasPendingAdoption(session.id);
 }
 
 /** Sentinel for "the mailbox is gone", distinct from any value an action returns. */
@@ -281,7 +294,7 @@ async function activateRepositoryMountBarriers(
 }
 
 async function sessionReachedRepositoryBarrier(session: Session, expectedAck: string): Promise<boolean> {
-  if (!isContainerRunning(session.id) && !isContainerSpawning(session.id)) return true;
+  if (!sessionHasLiveContainer(session)) return true;
   try {
     // OUTBOUND-keyed: all three reads are outbound-owned and nothing here
     // touches inbound.db, so outbound.db's existence is the question to ask.
@@ -379,8 +392,13 @@ export async function quiesceSessionsForRepositoryMounts(
   const known = uniqueSessions(sessions);
   // Runtime process maps are authoritative. A stale inactive DB row can still
   // own a live RW mount and must not escape quiescence — so the stop set is
-  // derived before the fenceable filter, never from it.
-  const affected = known.filter((session) => isContainerRunning(session.id) || isContainerSpawning(session.id));
+  // derived before the fenceable filter, never from it. A pending adoption is
+  // a survivor this host has not claimed but which is running and holds the
+  // mounts all the same (seam 4 E/D2, #462 item 3): it is stopped here like
+  // any running container, through `killContainer`, which routes it.
+  const affected = known.filter(
+    (session) => isContainerRunning(session.id) || isContainerSpawning(session.id) || hasPendingAdoption(session.id),
+  );
   const barrierSessions = known.filter(hasFenceableIngress);
   // A live container always owns an inbound DB to poll. If one is running
   // without a fenceable DB the host's view is inconsistent, and proceeding
@@ -436,10 +454,12 @@ export async function quiesceSessionsForRepositoryMounts(
       timeoutMs,
     );
     for (const session of affected) {
-      if (isContainerRunning(session.id)) killContainer(session.id, 'repository mount set changed');
+      if (isContainerRunning(session.id) || hasPendingAdoption(session.id)) {
+        killContainer(session.id, 'repository mount set changed');
+      }
     }
     await waitUntil(
-      () => affected.every((session) => !isContainerRunning(session.id)),
+      () => affected.every((session) => !isContainerRunning(session.id) && !hasPendingAdoption(session.id)),
       'timed out stopping containers for repository mount reconciliation',
       timeoutMs,
     );
@@ -452,7 +472,9 @@ export async function quiesceSessionsForRepositoryMounts(
     // skip the barrier release below.
     for (const session of affected) {
       try {
-        if (isContainerRunning(session.id)) killContainer(session.id, 'repository mount quiescence failed');
+        if (isContainerRunning(session.id) || hasPendingAdoption(session.id)) {
+          killContainer(session.id, 'repository mount quiescence failed');
+        }
       } catch (killError) {
         log.warn('Failed to stop container after repository mount quiescence failure', {
           sessionId: session.id,
@@ -504,8 +526,9 @@ export interface BootQuiescenceScope {
   stopped: number;
   /**
    * Containers that carry a workgroup AND a session label, whose workgroup is
-   * outside the changed set — the ones milestone 1 will leave running once D2
-   * flips the stop set. D1 stops them anyway.
+   * outside the changed set — the ones the door LEFT RUNNING for adoption
+   * (seam 4 D2). Counted from the post-stop inventory against the post-stop
+   * re-evaluation, so it is exactly what adoption can find.
    */
   survivable: number;
   /** Containers carrying no workgroup label: unknown scope, always stopped. */
@@ -566,6 +589,22 @@ export interface BootQuiescenceOptions {
    * the returned scope are built from. Omitted, the passed-in set is used.
    */
   reevaluateChanged?: () => string[] | Promise<string[]>;
+  /**
+   * Runs before each stop pass with that pass's partition. Pass 1 is the
+   * PRE-stop partition: the boot block writes the host-restart accountability
+   * note here for every session marked running by the previous host EXCEPT
+   * the survivors, whose containers are not being interrupted — before the
+   * stop pass, which can outlast the heartbeat freshness window (#441). Pass 2
+   * runs only when the post-stop re-evaluation moved sessions INTO must-stop
+   * (a flipped workgroup, a newcomer): `mustStopSessionIds` is then exactly
+   * those newly reclassified sessions, which the first note skipped and which
+   * are about to be interrupted after all.
+   */
+  beforeStop?: (partition: {
+    pass: 1 | 2;
+    survivableSessionIds: string[];
+    mustStopSessionIds: string[];
+  }) => Promise<void> | void;
   list?: () => InstallContainerScope[];
   stop?: (name: string) => void;
 }
@@ -589,10 +628,11 @@ export interface BootQuiescenceOptions {
  * Everything else fails closed into must-stop, and the split is exact: every
  * container is on one side or the other.
  *
- * ONE function, and D1 calls it ONCE, with the post-stop changed set. D2 needs
- * it twice — once with the pre-stop set to choose what to stop, and once with
- * the post-stop set for the partition it hands adoption — and a workgroup that
- * flips between the two is must-stop, so D2's stop set is the union.
+ * ONE function, called twice by the door (seam 4 D2): once with the pre-stop
+ * set to choose what to stop, and once over the post-stop inventory with the
+ * post-stop set for the partition it hands adoption. A workgroup that flips
+ * between the two is must-stop in the second pass, so the stop set is the
+ * union.
  */
 function partitionInstallContainers(
   containers: InstallContainerScope[],
@@ -628,22 +668,30 @@ function partitionInstallContainers(
  * (divergence 7) — on the first restart after the scope labels ship, that is
  * every container.
  *
- * D1 STOPS EVERYTHING. The partition is computed, proved and logged, but the
- * stop set is still the whole install, exactly what `cleanupOrphansStrict` did.
- * D2 is the one-branch flip to stopping only `mustStop`, and it is gated on
- * adoption (plan §4.1).
+ * D2 STOPS ONLY `mustStop` (plan §4.1, §7.D2): the containers of workgroups a
+ * reconcile is about to change, plus everything not provably survivable — no
+ * workgroup or session label, an unknown workgroup, a session that is gone or
+ * cannot take a wake. Survivable containers are left running and reach
+ * adoption (`adoptRunningSessions`) by session id, through the returned scope.
  *
- * `changedWorkgroupIds` is a snapshot taken BEFORE this door runs, and the
- * group directories it was computed from are container-writable — a live agent
- * can flip a workgroup from settled to needs-reconcile while the stops are in
- * flight. Under D1 that is only a partition-accuracy question, because the
- * caller re-evaluates the predicates on the quiescent tree and reconciles the
- * post-stop set (src/main.ts). **Under D2 it is a correctness question**: a
- * workgroup that flips after being classified survivable would have its
- * container left running across a mount cutover. D2 must therefore re-validate
- * the predicates after quiescence and either stop the newly-changed
- * workgroups' containers too, or refuse the boot — never silently skip the
- * reconcile for them.
+ * Two partitions, because `changedWorkgroupIds` is a snapshot taken BEFORE
+ * this door runs and the group directories it was computed from are
+ * container-writable — a live agent can flip a workgroup from settled to
+ * needs-reconcile while the stops are in flight:
+ *
+ *   1. PRE-stop, against the snapshot: chooses the stop set, and is handed to
+ *      `beforeStop` so the accountability note skips exactly the sessions
+ *      whose containers are not interrupted.
+ *   2. POST-stop, over the second inventory against the re-evaluated set: a
+ *      workgroup that flipped is must-stop NOW and is stopped in a second
+ *      pass; so is a container that appeared between the listings and is not
+ *      provably survivable. The third inventory must show nothing left in
+ *      must-stop, or the boot fails — a container that will not stop is never
+ *      argued away. The survivors of THAT partition are the adoption contract.
+ *
+ * Survivors keep running through the re-evaluation, so a workgroup can flip
+ * after the second partition too; the reconcile is scoped to the re-evaluated
+ * set and such a flip is reconciled at the next boot, exactly as under D1.
  *
  * Fail-closed like the call it replaces: a listing failure, or a stop that does
  * not take, throws — startup stops before any reconcile runs.
@@ -660,59 +708,88 @@ export async function quiesceWorkgroupsForBootMountChange(
   const containers = list();
   const unlabeled = containers.filter((entry) => entry.workgroupId === null);
 
-  // D1: the stop set is the whole install. D2 replaces this with `mustStop`.
-  const stopSet = containers;
-  for (const entry of stopSet) {
-    try {
-      stop(entry.name);
-    } catch (err) {
-      throw new Error(`Cannot prove install-scoped container absence: failed to stop ${entry.name}`, { cause: err });
+  // Partition 1: pre-stop, against the caller's snapshot. This chooses the
+  // stop set and the accountability note's skip set.
+  const preStop = partitionInstallContainers(containers, changedWorkgroupIds, known, knownSessions);
+  await options.beforeStop?.({
+    pass: 1,
+    survivableSessionIds: preStop.survivable.map((entry) => entry.sessionId as string),
+    mustStopSessionIds: sessionIdsOf(preStop.mustStop),
+  });
+
+  const stoppedNames = new Set<string>();
+  const mustStopNames = new Set<string>();
+  const stopAll = (entries: InstallContainerScope[]): void => {
+    for (const entry of entries) {
+      mustStopNames.add(entry.name);
+      try {
+        stop(entry.name);
+      } catch (err) {
+        throw new Error(`Cannot prove install-scoped container absence: failed to stop ${entry.name}`, { cause: err });
+      }
+      stoppedNames.add(entry.name);
     }
-  }
+  };
+  stopAll(preStop.mustStop);
 
-  // The proof is over the SECOND inventory, not over the names from the first.
-  // Intersecting with the original names would discard a container that
-  // appeared between the two listings — another host, or a spawn racing the
-  // boot — and report quiescence with a live container holding the mounts this
-  // boot is about to rewrite.
+  // The proof is over the SECOND inventory, by each container's OWN labels,
+  // never over the names from the first: a container that appeared between
+  // the two listings — another host, or a spawn racing the boot — is
+  // classified like every other, and a must-stop one that is still here (a
+  // stop that did not take, a newcomer in a changed workgroup) is stopped in
+  // the second pass.
   //
-  // D1 rejects any install-labeled container at all, which is exactly
-  // `cleanupOrphansStrict`'s semantics. D2 narrows this to the containers the
-  // second inventory shows as still in scope, recomputed from THEIR OWN labels
-  // (null workgroup, or a workgroup in `changed`) — never from the first
-  // listing's names, for the same reason.
-  //
-  // Nothing here has to carry which containers it managed to stop: the caller
-  // writes the host-restart accountability note BEFORE this door runs, so a
-  // failure at any point leaves that note already written for every session
+  // Nothing here has to carry which containers it managed to stop: the
+  // accountability note was written by `beforeStop` before the first stop,
+  // so a failure at any point leaves it already written for every session
   // that was marked running (src/main.ts, `runBootMountQuiescence`).
-  const remaining = list();
-  if (remaining.length > 0) {
-    throw new Error(
-      `Install-scoped containers still running after boot quiescence: ${remaining.map((e) => e.name).join(', ')}`,
-    );
-  }
-
-  // The install is quiescent, so NOW the predicates can be trusted: nothing can
-  // write to a group directory any more. The set that came in was a snapshot
-  // taken while containers were still running, and a live agent's last write
-  // could have flipped a workgroup since. Partition against the answer from
-  // here, not that snapshot — otherwise a flipped workgroup's sessions read as
-  // survivable in the very scope that says its mounts are about to move.
+  //
+  // The reconcile set is re-evaluated NOW, after the first pass: nothing in a
+  // changed workgroup can write to its group directory any more. The set that
+  // came in was a snapshot taken while those containers were still running,
+  // and a live agent's last write could have flipped a workgroup since.
+  // Partition against the answer from here, not that snapshot — otherwise a
+  // flipped workgroup's sessions read as survivable in the very scope that
+  // says its mounts are about to move.
+  const secondInventory = list();
   const finalChanged = (await options.reevaluateChanged?.()) ?? changedWorkgroupIds;
-  const { survivable, mustStop } = partitionInstallContainers(containers, finalChanged, known, knownSessions);
+  const afterFirstPass = partitionInstallContainers(secondInventory, finalChanged, known, knownSessions);
+  let survivors = afterFirstPass.survivable;
+  if (afterFirstPass.mustStop.length > 0) {
+    log.info('Boot quiescence second pass', {
+      flipped: finalChanged.filter((id) => !changedWorkgroupIds.includes(id)),
+      containers: afterFirstPass.mustStop.map((entry) => entry.name),
+    });
+    // Sessions the first note skipped as survivable and which this pass is
+    // about to interrupt after all get their note now, before the stop.
+    const alreadyMustStop = new Set(sessionIdsOf(preStop.mustStop));
+    const reclassified = sessionIdsOf(afterFirstPass.mustStop).filter((id) => !alreadyMustStop.has(id));
+    if (reclassified.length > 0) {
+      await options.beforeStop?.({
+        pass: 2,
+        survivableSessionIds: afterFirstPass.survivable.map((entry) => entry.sessionId as string),
+        mustStopSessionIds: reclassified,
+      });
+    }
+    stopAll(afterFirstPass.mustStop);
+    const afterSecondPass = partitionInstallContainers(list(), finalChanged, known, knownSessions);
+    if (afterSecondPass.mustStop.length > 0) {
+      throw new Error(
+        `Install-scoped containers still running after boot quiescence: ${afterSecondPass.mustStop.map((e) => e.name).join(', ')}`,
+      );
+    }
+    survivors = afterSecondPass.survivable;
+  }
 
   const scope: BootQuiescenceScope = {
     workgroups: known.size,
     changedWorkgroupIds: finalChanged,
     containers: containers.length,
-    stopped: stopSet.length,
-    survivable: survivable.length,
+    stopped: stoppedNames.size,
+    survivable: survivors.length,
     unlabeled: unlabeled.length,
-    survivableSessionIds: survivable.map((entry) => entry.sessionId as string),
-    mustStopSessionIds: mustStop
-      .map((entry) => entry.sessionId)
-      .filter((sessionId): sessionId is string => sessionId !== null),
+    survivableSessionIds: survivors.map((entry) => entry.sessionId as string),
+    mustStopSessionIds: [...new Set(sessionIdsOf([...preStop.mustStop, ...afterFirstPass.mustStop]))],
   };
   // Plan §6's measurement shape, in its order. `changed` is the post-stop
   // count, the same set the caller reconciles. The session-id arrays stay out
@@ -725,10 +802,14 @@ export async function quiesceWorkgroupsForBootMountChange(
     stopped: scope.stopped,
     survivable: scope.survivable,
     unlabeled: scope.unlabeled,
-    // `mustStop` is what D2 will stop; under D1 it is a subset of `stopped`.
-    mustStop: mustStop.length,
+    // Every container either pass classified must-stop; under D2 it equals `stopped`.
+    mustStop: mustStopNames.size,
   });
   return scope;
+}
+
+function sessionIdsOf(entries: InstallContainerScope[]): string[] {
+  return entries.map((entry) => entry.sessionId).filter((sessionId): sessionId is string => sessionId !== null);
 }
 
 export function wakeRepositoryMountSessions(sessions: Session[]): void {
@@ -754,13 +835,33 @@ export async function restartAgentGroupContainers(
   wakeMessage?: string,
   options: { respawnAll?: boolean } = {},
 ): Promise<number> {
+  // A pending survivor (adoption could not yet claim it, seam 4 E/D2) is
+  // running the OLD image and configuration too; it is selected like a tracked
+  // container and stopped through `killContainer`, which routes it (#462).
   const sessions = (await getSessionsByAgentGroup(agentGroupId)).filter(
-    (s) => s.status === 'active' && isContainerRunning(s.id),
+    (s) => s.status === 'active' && (isContainerRunning(s.id) || hasPendingAdoption(s.id)),
   );
 
   let restarted = 0;
   let failed = 0;
   for (const session of sessions) {
+    // A pending survivor held on an adoption-inventory failure has no
+    // container name yet, and nothing can stop a container it cannot name.
+    // Resolve it from the runtime BEFORE the wake row is written: gone means
+    // there is nothing to restart (and no row to leave behind); unknown means
+    // this restart cannot be performed or reported (#479 round 2).
+    if (hasPendingAdoption(session.id)) {
+      const resolved = await resolvePendingSurvivor(session.id);
+      if (resolved === 'gone') continue;
+      if (resolved === 'unknown') {
+        failed += 1;
+        log.warn('Restart: could not resolve a pending survivor; leaving it running', {
+          agentGroupId,
+          sessionId: session.id,
+        });
+        continue;
+      }
+    }
     // WRITE FIRST. `on_wake` rows are visible only on a container's FIRST poll
     // (`selection.ts` adds `AND on_wake = 0` to every later one), so the row
     // has to exist before any fresh container looks — writing it after the
@@ -832,19 +933,22 @@ export async function restartAgentGroupContainers(
 
     // The container can exit during the awaited write above, and killContainer
     // no-ops on a session it no longer tracks — counting that as a restart
-    // reports work that did not happen.
-    if (!isContainerRunning(session.id)) {
+    // reports work that did not happen. A pending survivor is still a
+    // container to restart; its exit clears the pending mark the same way.
+    if (!isContainerRunning(session.id) && !hasPendingAdoption(session.id)) {
       await withdrawWake();
       continue;
     }
-    // Generation token for the process we are about to kill. The pending read
-    // below is async, so the snapshotted container can exit and an inbound wake
-    // can install a REPLACEMENT before control returns — and killing that one
-    // is both wrong and silent: if the read saw no due rows, no onExit is
+    // Identity of the container we are about to kill. The pending read below
+    // is async, so the snapshotted container can exit and an inbound wake can
+    // install a REPLACEMENT before control returns — and killing that one is
+    // both wrong and silent: if the read saw no due rows, no onExit is
     // installed, so the replacement's freshly claimed input goes dark until a
-    // later recovery pass. `spawnedAt` changes on every spawn, so comparing it
-    // across the await identifies the process rather than merely the session.
-    const spawnGeneration = getContainerSpawnedAt(session.id);
+    // later recovery pass. The container NAME identifies the process: every
+    // spawn mints a new one, and a pending survivor adopted during the await
+    // keeps its own — `getContainerSpawnedAt` would flip from 0 to the adoption
+    // instant there and misread adoption as replacement (#479 round 2).
+    const identity = getContainerIdentity(session.id);
 
     // Always respawn after the kill when there is anything to process: an
     // explicit wake message, or in-flight messages the dying container had
@@ -881,7 +985,7 @@ export async function restartAgentGroupContainers(
     // that replacement's first poll already took the wake row, the withdrawal
     // is a no-op and it keeps it; if it polled before the row landed, the
     // withdrawal is what stops the row outliving this restart.
-    if (getContainerSpawnedAt(session.id) !== spawnGeneration) {
+    if (getContainerIdentity(session.id) !== identity) {
       log.info('Restart: container was replaced while reading pending work; leaving the replacement alone', {
         agentGroupId,
         sessionId: session.id,

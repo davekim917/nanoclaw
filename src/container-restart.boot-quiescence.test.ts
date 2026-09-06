@@ -8,9 +8,11 @@
  * is the ONE place at boot that stops containers, so a stray spawn from
  * anywhere in the import graph is a finding, not noise.
  *
- * D1 is the measurement PR: the door partitions `mustStop` from `survivable`,
- * logs the counts, and then stops EVERYTHING, exactly as `cleanupOrphansStrict`
- * did. The "counted survivable — and still stopped" case is the one D2 flips.
+ * D1 measured: the door partitioned `mustStop` from `survivable`, logged the
+ * counts, and stopped EVERYTHING. D2 flips the stop set to `mustStop` alone —
+ * survivable containers are left running and named to adoption — with a
+ * second pass over whatever the post-stop re-evaluation still classifies
+ * must-stop (a flipped workgroup, a newcomer, a stop that did not take).
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
@@ -50,6 +52,9 @@ vi.mock('./log.js', () => ({
 vi.mock('./container-runner.js', () => ({
   containerOwnsOutbound: vi.fn(() => false),
   getContainerSpawnedAt: vi.fn(() => 0),
+  hasPendingAdoption: vi.fn(() => false),
+  resolvePendingSurvivor: vi.fn(async () => 'gone'),
+  getContainerIdentity: vi.fn(() => null),
   isContainerRunning: vi.fn(() => false),
   isContainerSpawning: vi.fn(() => false),
   killContainer: vi.fn(),
@@ -115,7 +120,9 @@ function fakeRuntime(
       if (opts.failListCall === calls) {
         throw new Error('Cannot prove install-scoped container absence: runtime listing failed');
       }
-      if (calls > 1 && opts.arrivesLate && !running.some((e) => e.name === opts.arrivesLate!.name)) {
+      // Appears exactly once, on the second listing; a stop afterwards removes
+      // it like any other container (unless it is `stubborn`).
+      if (calls === 2 && opts.arrivesLate && !running.some((e) => e.name === opts.arrivesLate!.name)) {
         running = [...running, opts.arrivesLate];
       }
       listings.push(running.length);
@@ -153,31 +160,84 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
     expect(spawns).toEqual([]);
   });
 
-  it('a container in an unchanged workgroup is counted survivable', async () => {
-    const runtime = fakeRuntime([container('nanoclaw-v2-b-1', 'wg-b')]);
+  it('the door stops only the must-stop partition', async () => {
+    const runtime = fakeRuntime([
+      container('nanoclaw-v2-a-1', 'wg-a'),
+      container('nanoclaw-v2-b-1', 'wg-b'),
+      container('nanoclaw-v2-legacy-1', null),
+    ]);
 
     const scope = await quiesceWorkgroupsForBootMountChange(['wg-a'], {
       ...runtime,
       knownWorkgroupIds: ['wg-a', 'wg-b'],
-      knownSessionIds: ['nanoclaw-v2-b-1-session'],
+      knownSessionIds: ['nanoclaw-v2-a-1-session', 'nanoclaw-v2-b-1-session', 'nanoclaw-v2-legacy-1-session'],
     });
 
-    expect(scope.survivable).toBe(1);
-    expect(scope.survivableSessionIds).toEqual(['nanoclaw-v2-b-1-session']);
-    expect(scope.mustStopSessionIds).toEqual([]);
-    // D1 STILL STOPS IT. This assertion is the D2 acceptance criterion: the
-    // flip changes it to `expect(runtime.stops).toEqual([])` and
-    // `stopped: 0`. Until then `survivable` is only a counterfactual.
-    expect(runtime.stops).toEqual(['nanoclaw-v2-b-1']);
-    expect(scope.stopped).toBe(scope.containers);
+    // The changed workgroup's container and the unlabeled one are stopped;
+    // the identified, known, unchanged one is left running.
+    expect(runtime.stops).toEqual(['nanoclaw-v2-a-1', 'nanoclaw-v2-legacy-1']);
+    expect(scope).toEqual({
+      workgroups: 2,
+      changedWorkgroupIds: ['wg-a'],
+      containers: 3,
+      stopped: 2,
+      survivable: 1,
+      unlabeled: 1,
+      survivableSessionIds: ['nanoclaw-v2-b-1-session'],
+      mustStopSessionIds: ['nanoclaw-v2-a-1-session', 'nanoclaw-v2-legacy-1-session'],
+    });
+    expect(scope.stopped).toBeLessThan(scope.containers);
     expect(spawns).toEqual([]);
   });
 
-  it('a container with no workgroup label is always stopped', async () => {
+  it('survivable containers reach adoption with their session ids', async () => {
+    const runtime = fakeRuntime([container('nanoclaw-v2-b-1', 'wg-b'), container('nanoclaw-v2-c-1', 'wg-c')]);
+
+    const scope = await quiesceWorkgroupsForBootMountChange(['wg-a'], {
+      ...runtime,
+      knownWorkgroupIds: ['wg-a', 'wg-b', 'wg-c'],
+      knownSessionIds: ['nanoclaw-v2-b-1-session', 'nanoclaw-v2-c-1-session'],
+    });
+
+    // Left running, and named session by session — the adoption contract.
+    expect(runtime.stops).toEqual([]);
+    expect(scope.stopped).toBe(0);
+    expect(scope.survivable).toBe(2);
+    expect(scope.survivableSessionIds).toEqual(['nanoclaw-v2-b-1-session', 'nanoclaw-v2-c-1-session']);
+    expect(scope.mustStopSessionIds).toEqual([]);
+    expect(spawns).toEqual([]);
+  });
+
+  it("a mount-changed workgroup's containers are stopped and respawn on the next wake", async () => {
+    // The door side: the changed workgroup's container is stopped and its
+    // session lands in `mustStopSessionIds`, never in the survivable set. The
+    // wake side — a stopped container's session spawns fresh on its next wake
+    // — is series E's ordinary path, pinned in src/container-adoption.test.ts
+    // ("a must-stop session spawns fresh on its next wake").
+    const runtime = fakeRuntime([container('nanoclaw-v2-a-1', 'wg-a'), container('nanoclaw-v2-b-1', 'wg-b')]);
+
+    const scope = await quiesceWorkgroupsForBootMountChange(['wg-a'], {
+      ...runtime,
+      knownWorkgroupIds: ['wg-a', 'wg-b'],
+      knownSessionIds: ['nanoclaw-v2-a-1-session', 'nanoclaw-v2-b-1-session'],
+    });
+
+    expect(runtime.stops).toEqual(['nanoclaw-v2-a-1']);
+    expect(scope.mustStopSessionIds).toEqual(['nanoclaw-v2-a-1-session']);
+    expect(scope.survivableSessionIds).toEqual(['nanoclaw-v2-b-1-session']);
+    expect(spawns).toEqual([]);
+  });
+
+  it('an unlabeled or unknown-session container is still stopped (fail-closed)', async () => {
     // Divergence 7: on the first restart after the scope labels ship, every
-    // live container looks like this. Unknown scope is stopped, fail-closed,
-    // and it is never counted survivable.
-    const runtime = fakeRuntime([container('nanoclaw-v2-legacy-1', null), container('nanoclaw-v2-b-1', 'wg-b')]);
+    // live container looks like the unlabeled one. Unknown scope is stopped,
+    // fail-closed, and never counted survivable; so is a container whose
+    // session label names no active row — adoption could not claim it.
+    const runtime = fakeRuntime([
+      container('nanoclaw-v2-legacy-1', null),
+      container('nanoclaw-v2-b-1', 'wg-b'),
+      container('nanoclaw-v2-c-1', 'wg-c'),
+    ]);
 
     const scope = await quiesceWorkgroupsForBootMountChange([], {
       ...runtime,
@@ -185,16 +245,16 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
       knownSessionIds: ['nanoclaw-v2-b-1-session', 'nanoclaw-v2-legacy-1-session'],
     });
 
-    expect(runtime.stops).toContain('nanoclaw-v2-legacy-1');
+    expect(runtime.stops).toEqual(['nanoclaw-v2-legacy-1', 'nanoclaw-v2-c-1']);
     expect(scope).toEqual({
       workgroups: 3,
       changedWorkgroupIds: [],
-      containers: 2,
+      containers: 3,
       stopped: 2,
       survivable: 1,
       unlabeled: 1,
       survivableSessionIds: ['nanoclaw-v2-b-1-session'],
-      mustStopSessionIds: ['nanoclaw-v2-legacy-1-session'],
+      mustStopSessionIds: ['nanoclaw-v2-legacy-1-session', 'nanoclaw-v2-c-1-session'],
     });
     expect(spawns).toEqual([]);
   });
@@ -227,24 +287,40 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
       /still running after boot quiescence/,
     );
 
-    expect(runtime.stops).toEqual(['nanoclaw-v2-a-1']);
+    // Stopped in both passes, still listed after the second: fail closed.
+    expect(runtime.stops).toEqual(['nanoclaw-v2-a-1', 'nanoclaw-v2-a-1']);
     expect(log.info).not.toHaveBeenCalledWith('Boot quiescence scope', expect.anything());
     expect(spawns).toEqual([]);
   });
 
-  it('a container that appears between the two listings fails closed', async () => {
+  it('a container that appears between the two listings is classified by its labels and stopped in the second pass', async () => {
     // The proof is over the SECOND inventory, not over the first listing's
-    // names. A newcomer holds the very mounts this boot is about to rewrite, so
-    // intersecting it away would report quiescence with a live container.
+    // names. A newcomer in a changed workgroup holds the very mounts this boot
+    // is about to rewrite, so it is stopped in the second pass rather than
+    // intersected away.
     const runtime = fakeRuntime([container('nanoclaw-v2-a-1', 'wg-a')], {
       arrivesLate: container('nanoclaw-v2-newcomer-1', 'wg-a'),
+    });
+
+    const scope = await quiesceWorkgroupsForBootMountChange(['wg-a'], runtime);
+
+    expect(runtime.stops).toEqual(['nanoclaw-v2-a-1', 'nanoclaw-v2-newcomer-1']);
+    expect(scope.stopped).toBe(2);
+    expect(scope.survivable).toBe(0);
+    expect(spawns).toEqual([]);
+  });
+
+  it('a newcomer that will not stop fails closed', async () => {
+    const runtime = fakeRuntime([container('nanoclaw-v2-a-1', 'wg-a')], {
+      arrivesLate: container('nanoclaw-v2-newcomer-1', 'wg-a'),
+      stubborn: ['nanoclaw-v2-newcomer-1'],
     });
 
     await expect(quiesceWorkgroupsForBootMountChange(['wg-a'], runtime)).rejects.toThrow(
       /still running after boot quiescence: nanoclaw-v2-newcomer-1/,
     );
 
-    expect(runtime.stops).toEqual(['nanoclaw-v2-a-1']);
+    expect(runtime.stops).toEqual(['nanoclaw-v2-a-1', 'nanoclaw-v2-newcomer-1']);
     expect(log.info).not.toHaveBeenCalledWith('Boot quiescence scope', expect.anything());
     expect(spawns).toEqual([]);
   });
@@ -380,7 +456,7 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
     expect(spawns).toEqual([]);
   });
 
-  it('a workgroup that flips between the two evaluations leaves the survivable set', async () => {
+  it('a workgroup that flips during the stops is stopped in the second pass', async () => {
     // The set handed in is a snapshot taken while containers were still
     // running. Partitioning against it would call a flipped workgroup's
     // sessions survivable in the very scope that says its mounts are about to
@@ -399,13 +475,32 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
     expect(before.survivable).toBe(2);
 
     vi.clearAllMocks();
+    const flipped = fakeRuntime([container('nanoclaw-v2-b-1', 'wg-b'), container('nanoclaw-v2-c-1', 'wg-c')]);
+    const warned: Array<{ pass: number; mustStop: string[]; beforeStops: number }> = [];
     const after = await quiesceWorkgroupsForBootMountChange([], {
-      ...fakeRuntime([container('nanoclaw-v2-b-1', 'wg-b'), container('nanoclaw-v2-c-1', 'wg-c')]),
+      ...flipped,
       knownWorkgroupIds: options.knownWorkgroupIds,
       knownSessionIds: options.knownSessionIds,
       reevaluateChanged: () => ['wg-b'],
+      beforeStop: (partition) => {
+        warned.push({
+          pass: partition.pass,
+          mustStop: partition.mustStopSessionIds,
+          beforeStops: flipped.stops.length,
+        });
+      },
     });
 
+    // Nothing was must-stop pre-stop; the flipped workgroup's container is
+    // stopped in the second pass and leaves the survivable set — and the
+    // session the first note skipped as survivable gets its note BEFORE that
+    // second-pass stop (#479 round 1).
+    expect(flipped.stops).toEqual(['nanoclaw-v2-b-1']);
+    expect(warned).toEqual([
+      { pass: 1, mustStop: [], beforeStops: 0 },
+      { pass: 2, mustStop: ['nanoclaw-v2-b-1-session'], beforeStops: 0 },
+    ]);
+    expect(after.stopped).toBe(1);
     expect(after.changedWorkgroupIds).toEqual(['wg-b']);
     expect(after.survivableSessionIds).toEqual(['nanoclaw-v2-c-1-session']);
     expect(after.survivable).toBe(1);
@@ -442,7 +537,7 @@ describe('quiesceWorkgroupsForBootMountChange', () => {
       workgroups: 5,
       changed: 2,
       containers: 3,
-      stopped: 3,
+      stopped: 2,
       survivable: 1,
       unlabeled: 1,
       mustStop: 2,

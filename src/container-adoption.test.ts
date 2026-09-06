@@ -30,6 +30,9 @@ vi.mock('./config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./config.js')>()),
   DATA_DIR: TEST_DATA_DIR,
   GROUPS_DIR: TEST_GROUPS_DIR,
+  // Small enough for the concurrency-cap case, large enough that no other
+  // case here ever holds three containers at once.
+  MAX_CONCURRENT_CONTAINERS: 3,
 }));
 
 // NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
@@ -122,7 +125,11 @@ vi.mock('./container-runtime.js', async (importOriginal) => ({
     return fakes.running.has(name);
   },
   waitForContainerExit: (name: string) => fakes.arm(name),
-  killContainerHard: vi.fn(),
+  killContainerHard: vi.fn((name: string) => {
+    if (fakes.stopFails) return;
+    fakes.running.delete(name);
+    fakes.listing = fakes.listing.filter((scope) => scope.name !== name);
+  }),
 }));
 
 const hooks = vi.hoisted(() => ({
@@ -216,6 +223,9 @@ vi.mock('./memory-admission.js', () => {
       memoryStub.reservations.set(id, requestMb);
       return { status: 'admitted', budgetMb, requestMb };
     }
+    reserveSaturating(id: string, requestMb: number): void {
+      memoryStub.reservations.set(id, requestMb);
+    }
     release(id: string): T[] {
       memoryStub.reservations.delete(id);
       return [];
@@ -240,6 +250,8 @@ import {
   adoptRunningSessions,
   containerOwnsOutbound,
   getAdoptedSessionIds,
+  getContainerIdentity,
+  killContainer,
   getContainerSpawnedAt,
   hasContainerEverRun,
   hasPendingAdoption,
@@ -250,6 +262,7 @@ import {
   _resetEverSeenRunningForTest,
 } from './container-runner.js';
 import { resolveContainerResources } from './container-resources.js';
+import { killContainerHard } from './container-runtime.js';
 import { closeDb, getDb } from './db/connection.js';
 import { getSessionClaim } from './db/coordination.js';
 import { getHostInstanceId, stopHostInstanceLease } from './host-instance.js';
@@ -331,6 +344,7 @@ describe('adoptRunningSessions', () => {
   beforeEach(async () => {
     fakes.reset();
     memoryStub.reset();
+    vi.mocked(killContainerHard).mockClear();
     hooks.claimWriteFails = false;
     _resetAdoptionStateForTesting();
     _resetEverSeenRunningForTest();
@@ -344,10 +358,13 @@ describe('adoptRunningSessions', () => {
   });
 
   afterEach(async () => {
-    await drainAdopted();
-    await stopHostInstanceLease();
-    vi.unstubAllEnvs();
-    await closeDb();
+    try {
+      await drainAdopted();
+    } finally {
+      await stopHostInstanceLease();
+      vi.unstubAllEnvs();
+      await closeDb();
+    }
   });
 
   it('a running container for an active session is adopted and registered', async () => {
@@ -427,7 +444,9 @@ describe('adoptRunningSessions', () => {
     expect(reconciled).toEqual({ adopted: 0, stopped: 0, pendingClaim: 1, fencedInbound: 0 });
     expect(fakes.stopped).toEqual([]);
     expect(isContainerRunning('sess-held')).toBe(false);
-    expect(fakes.waiters).toEqual([]);
+    // Not adopted — the one waiter is the pending survivor's exit observer.
+    expect(getAdoptedSessionIds()).toEqual([]);
+    expect(fakes.waitersFor('nanoclaw-v2-sess-held')).toHaveLength(1);
     expect(warnings('Session adoption skipped — another live host process holds the claim')).toHaveLength(1);
     // The peer's row is untouched.
     const claim = await getSessionClaim('sess-held');
@@ -445,7 +464,8 @@ describe('adoptRunningSessions', () => {
     expect(hasPendingAdoption('sess-pending')).toBe(true);
     expect(fakes.stopped).toEqual([]);
     expect(isContainerRunning('sess-pending')).toBe(false);
-    expect(fakes.waiters).toEqual([]);
+    expect(getAdoptedSessionIds()).toEqual([]);
+    expect(fakes.waitersFor('nanoclaw-v2-sess-pending')).toHaveLength(1);
     expect(
       vi
         .mocked(log.error)
@@ -470,7 +490,9 @@ describe('adoptRunningSessions', () => {
     expect(isContainerRunning('sess-retry')).toBe(true);
     expect(isAdoptedContainer('sess-retry')).toBe(true);
     expect(hasPendingAdoption('sess-retry')).toBe(false);
-    expect(fakes.waitersFor('nanoclaw-v2-sess-retry')).toHaveLength(1);
+    // The boot pass's pending observer was stood down; the adopted waiter took over.
+    expect(fakes.waitersFor('nanoclaw-v2-sess-retry')).toHaveLength(2);
+    expect(fakes.waitersFor('nanoclaw-v2-sess-retry')[0]!.killed).toBe(true);
     expect(await containerStatusOf('sess-retry')).toBe('running');
     expect((await getSessionClaim('sess-retry'))?.claimed_by).toBe(getHostInstanceId());
   });
@@ -489,7 +511,10 @@ describe('adoptRunningSessions', () => {
 
     expect(hasPendingAdoption('sess-vanished')).toBe(false);
     expect(infos('Spawning container')).toHaveLength(1);
-    expect(fakes.waiters).toEqual([]);
+    // The pending observer was stood down with the hold; nothing was adopted.
+    expect(getAdoptedSessionIds()).toEqual([]);
+    expect(fakes.waitersFor('nanoclaw-v2-sess-vanished')).toHaveLength(1);
+    expect(fakes.waitersFor('nanoclaw-v2-sess-vanished')[0]!.killed).toBe(true);
     // The absent runtime binary ENOENTs the spawned child into finalization.
     await until(() => !isContainerRunning('sess-vanished'), 'the spawned container never finalized');
   });
@@ -583,7 +608,8 @@ describe('adoptRunningSessions', () => {
         'Adoption refused for memory but the container is not proven gone — keeping its claim and retrying on wake',
       ),
     ).toHaveLength(1);
-    expect(memoryStub.reservedMb()).toBe(0);
+    // Still running, so still counted — saturating, over the 1 MiB budget.
+    expect(memoryStub.reservedMb()).toBe(resolveContainerResources(undefined).memory.requestMb);
   });
 
   it('an adopted container holds a memory reservation until it finishes', async () => {
@@ -644,7 +670,8 @@ describe('adoptRunningSessions', () => {
     expect(warnings('Adoption refused — the container does not fit the memory admission budget; stopping it')).toEqual(
       [],
     );
-    expect(memoryStub.reservedMb()).toBe(0);
+    // Left running under the peer's claim, and counted, saturating.
+    expect(memoryStub.reservedMb()).toBe(resolveContainerResources(undefined).memory.requestMb);
   });
 
   it("a pending adoption keeps the session's outbound owned", async () => {
@@ -771,6 +798,238 @@ describe('adoptRunningSessions', () => {
           (call) => call[0] === 'Adopted container finalized during reconcile — skipping the running stamp',
         ),
     ).toHaveLength(1);
+  });
+
+  // ── #462: pending survivors are first-class (reachable once D2 leaves them running) ──
+
+  it('a must-stop session spawns fresh on its next wake', async () => {
+    // The wake half of "a mount-changed workgroup's containers are stopped and
+    // respawn on the next wake": the door stopped the container, so the
+    // ordinary path spawns (here an ENOENT child that finalizes itself).
+    await seedSession(TEST_DATA_DIR, 'sess-must-stop');
+    fakes.listing = [];
+
+    const reconciled = await adoptRunningSessions({ list: fakes.list, survivableSessionIds: [] });
+    expect(reconciled).toEqual({ adopted: 0, stopped: 0, pendingClaim: 0, fencedInbound: 0 });
+
+    await expect(wakeContainer(callerSnapshot('sess-must-stop'))).resolves.toBe(true);
+    expect(infos('Spawning container')).toHaveLength(1);
+    await until(() => !isContainerRunning('sess-must-stop'), 'the spawned container never finalized');
+  });
+
+  it("a pending survivor's exit releases its holds without a wake (#462 item 1)", async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-observed');
+    fakes.listing = [survivor('sess-observed')];
+    hooks.claimWriteFails = true;
+    await adoptRunningSessions({ list: fakes.list });
+    expect(hasPendingAdoption('sess-observed')).toBe(true);
+    // The pending observer is a `docker wait` on the survivor's name.
+    expect(fakes.waitersFor('nanoclaw-v2-sess-observed')).toHaveLength(1);
+    expect(memoryStub.reservedMb()).toBeGreaterThan(0);
+
+    // The survivor exits with no message ever arriving for it.
+    fakes.listing = [];
+    fakes.exit('nanoclaw-v2-sess-observed', 0);
+    await until(() => !hasPendingAdoption('sess-observed'), 'the pending hold was never released');
+
+    expect(containerOwnsOutbound('sess-observed')).toBe(false);
+    expect(memoryStub.reservedMb()).toBe(0);
+    expect(infos('Pending survivor exited — releasing its hold')).toHaveLength(1);
+  });
+
+  it('a pending survivor whose waiter closes while it still runs is re-observed, not released', async () => {
+    _resetAdoptionStateForTesting({ waiterRearmMs: 5 });
+    await seedSession(TEST_DATA_DIR, 'sess-reobserved');
+    fakes.listing = [survivor('sess-reobserved')];
+    fakes.running.add('nanoclaw-v2-sess-reobserved');
+    hooks.claimWriteFails = true;
+    await adoptRunningSessions({ list: fakes.list });
+
+    fakes.exit('nanoclaw-v2-sess-reobserved', 1);
+    await until(() => fakes.waitersFor('nanoclaw-v2-sess-reobserved').length === 2, 'no second observer was armed');
+    expect(hasPendingAdoption('sess-reobserved')).toBe(true);
+    expect(containerOwnsOutbound('sess-reobserved')).toBe(true);
+  });
+
+  it('killContainer stops a pending survivor, proves it gone, releases the hold and runs the exit work (#462 item 2)', async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-kill-pending');
+    fakes.listing = [survivor('sess-kill-pending')];
+    fakes.running.add('nanoclaw-v2-sess-kill-pending');
+    hooks.claimWriteFails = true;
+    await adoptRunningSessions({ list: fakes.list });
+    expect(containerOwnsOutbound('sess-kill-pending')).toBe(true);
+
+    const exits: string[] = [];
+    killContainer('sess-kill-pending', 'thread close', () => {
+      exits.push('exit');
+    });
+
+    expect(fakes.stopped).toEqual(['nanoclaw-v2-sess-kill-pending']);
+    await until(() => exits.length === 1, 'the exit work never ran');
+    expect(hasPendingAdoption('sess-kill-pending')).toBe(false);
+    expect(containerOwnsOutbound('sess-kill-pending')).toBe(false);
+    expect(memoryStub.reservedMb()).toBe(0);
+  });
+
+  it('killContainer keeps a pending survivor that will not stop, and runs no exit work', async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-kill-stuck');
+    fakes.listing = [survivor('sess-kill-stuck')];
+    fakes.running.add('nanoclaw-v2-sess-kill-stuck');
+    fakes.stopFails = true;
+    hooks.claimWriteFails = true;
+    await adoptRunningSessions({ list: fakes.list });
+
+    const exits: string[] = [];
+    killContainer('sess-kill-stuck', 'thread close', () => {
+      exits.push('exit');
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    // Escalated to `docker kill`, still there: owned and pending, the caller
+    // retries on its next tick — the exit contract ("no container any more")
+    // is not claimed for a container that is still running.
+    expect(vi.mocked(killContainerHard).mock.calls.map((call) => call[0])).toEqual(['nanoclaw-v2-sess-kill-stuck']);
+    expect(exits).toEqual([]);
+    expect(hasPendingAdoption('sess-kill-stuck')).toBe(true);
+    expect(containerOwnsOutbound('sess-kill-stuck')).toBe(true);
+
+    // The exit work is PARKED on the hold (#479 round 2): when the observer
+    // later proves the container gone, it runs exactly once — a one-shot
+    // caller's replacement request is not lost with the failed stop.
+    fakes.stopFails = false;
+    fakes.running.delete('nanoclaw-v2-sess-kill-stuck');
+    fakes.exit('nanoclaw-v2-sess-kill-stuck', 0);
+    await until(() => exits.length === 1, 'the parked exit work never ran');
+    expect(hasPendingAdoption('sess-kill-stuck')).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(exits).toEqual(['exit']);
+  });
+
+  it('a pending survivor that does not fit is counted saturating and blocks fresh admission (#462 item 5)', async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-fits-first');
+    await seedSession(TEST_DATA_DIR, 'sess-over');
+    await seedSession(TEST_DATA_DIR, 'sess-wants-in');
+    await seedHostInstance('peer-live', 'live');
+    await seedForeignClaim('sess-over', 'peer-live', 5);
+    fakes.listing = [survivor('sess-fits-first'), survivor('sess-over')];
+    fakes.running.add('nanoclaw-v2-sess-over');
+    const requestMb = resolveContainerResources(undefined).memory.requestMb;
+    // Room for exactly one: the second survivor does not fit, and a live peer
+    // holds its claim, so it cannot be stopped either.
+    memoryStub.budgetMb = requestMb;
+
+    const reconciled = await adoptRunningSessions({ list: fakes.list });
+
+    expect(reconciled).toEqual({ adopted: 1, stopped: 0, pendingClaim: 1, fencedInbound: 0 });
+    // Counted against the budget even though it does not fit…
+    expect(memoryStub.reservedMb()).toBe(2 * requestMb);
+    expect(memoryStub.reservations.get('sess-over')).toBe(requestMb);
+    // …so a fresh wake is not admitted on top of it.
+    await expect(wakeContainer(callerSnapshot('sess-wants-in'))).resolves.toBe(false);
+    expect(infos('Spawning container')).toEqual([]);
+    expect(warnings('Container wake queued — memory budget exhausted')).toHaveLength(1);
+  });
+
+  it('a duplicate container for a tracked session that cannot be stopped fails the boot (#462 item 6)', async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-dup');
+    const twin = { ...survivor('sess-dup'), name: 'nanoclaw-v2-sess-dup-twin' };
+    fakes.listing = [survivor('sess-dup'), twin];
+    fakes.running.add('nanoclaw-v2-sess-dup-twin');
+    fakes.stopFails = true;
+
+    await expect(adoptRunningSessions({ list: fakes.list })).rejects.toThrow(
+      /duplicate container nanoclaw-v2-sess-dup-twin for a tracked session could not be stopped/,
+    );
+    expect(vi.mocked(killContainerHard).mock.calls.map((call) => call[0])).toEqual(['nanoclaw-v2-sess-dup-twin']);
+  });
+
+  it('a second container for a session held pending is stopped; the hold keeps the first and its waiter', async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-dup-pending');
+    const first = survivor('sess-dup-pending');
+    const twin = { ...first, name: 'nanoclaw-v2-sess-dup-pending-twin' };
+    fakes.listing = [first, twin];
+    fakes.running.add(first.name);
+    fakes.running.add(twin.name);
+    hooks.claimWriteFails = true;
+
+    const reconciled = await adoptRunningSessions({ list: fakes.list });
+
+    expect(reconciled).toEqual({ adopted: 0, stopped: 1, pendingClaim: 1, fencedInbound: 0 });
+    expect(fakes.stopped).toEqual([twin.name]);
+    expect(killContainerHard).not.toHaveBeenCalled();
+    // The hold still names the first container, and its observer is still armed.
+    expect(hasPendingAdoption('sess-dup-pending')).toBe(true);
+    expect(getContainerIdentity('sess-dup-pending')).toBe(first.name);
+    expect(fakes.waitersFor(first.name)).toHaveLength(1);
+    expect(fakes.waitersFor(first.name)[0]!.killed).toBe(false);
+    expect(fakes.waitersFor(twin.name)).toEqual([]);
+    expect(infos('Stopped an unadoptable container at startup')).toEqual([
+      [
+        'Stopped an unadoptable container at startup',
+        { containerName: twin.name, sessionId: 'sess-dup-pending', why: 'session already has a pending container' },
+      ],
+    ]);
+  });
+
+  it('a second container for a pending session that cannot be stopped fails the boot without touching the hold', async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-dup-stuck');
+    const first = survivor('sess-dup-stuck');
+    const twin = { ...first, name: 'nanoclaw-v2-sess-dup-stuck-twin' };
+    fakes.listing = [first, twin];
+    fakes.running.add(first.name);
+    fakes.running.add(twin.name);
+    hooks.claimWriteFails = true;
+    fakes.stopFails = true;
+
+    await expect(adoptRunningSessions({ list: fakes.list })).rejects.toThrow(
+      /duplicate container nanoclaw-v2-sess-dup-stuck-twin for a pending session could not be stopped \(nanoclaw-v2-sess-dup-stuck keeps it\)/,
+    );
+    expect(vi.mocked(killContainerHard).mock.calls.map((call) => call[0])).toEqual([twin.name]);
+    expect(getContainerIdentity('sess-dup-stuck')).toBe(first.name);
+    expect(fakes.waitersFor(twin.name)).toEqual([]);
+    expect(
+      vi
+        .mocked(log.error)
+        .mock.calls.filter(
+          (call) => call[0] === 'Boot cannot continue: a duplicate container for an owned session could not be stopped',
+        ),
+    ).toEqual([
+      [
+        'Boot cannot continue: a duplicate container for an owned session could not be stopped',
+        { sessionId: 'sess-dup-stuck', containerName: twin.name, ownedContainerName: first.name, kind: 'pending' },
+      ],
+    ]);
+  });
+
+  it('pending survivors count toward the concurrency cap (#462 item 7)', async () => {
+    await seedSession(TEST_DATA_DIR, 'sess-slot-1');
+    await seedSession(TEST_DATA_DIR, 'sess-slot-2');
+    await seedSession(TEST_DATA_DIR, 'sess-slot-3');
+    await seedHostInstance('peer-live', 'live');
+    await seedForeignClaim('sess-slot-2', 'peer-live', 5);
+    fakes.listing = [survivor('sess-slot-1'), survivor('sess-slot-2')];
+    fakes.running.add('nanoclaw-v2-sess-slot-2');
+
+    // One adopted, one pending: two of the three slots are occupied.
+    const reconciled = await adoptRunningSessions({ list: fakes.list });
+    expect(reconciled).toEqual({ adopted: 0 + 1, stopped: 0, pendingClaim: 1, fencedInbound: 0 });
+
+    // A wake for a third session takes the last slot; a fourth would not — but
+    // without the pending survivor counted, the cap would read 1 of 3 and the
+    // fourth container would be admitted.
+    await seedSession(TEST_DATA_DIR, 'sess-slot-4');
+    await expect(wakeContainer(callerSnapshot('sess-slot-3'))).resolves.toBe(true);
+    await until(() => !isContainerRunning('sess-slot-3'), 'the third container never finalized');
+    // Refill the third slot with a container that stays: adopt another survivor.
+    await seedSession(TEST_DATA_DIR, 'sess-slot-5');
+    fakes.listing = [survivor('sess-slot-1'), survivor('sess-slot-2'), survivor('sess-slot-5')];
+    await adoptRunningSessions({ list: fakes.list });
+    expect(getAdoptedSessionIds()).toEqual(['sess-slot-1', 'sess-slot-5']);
+
+    await expect(wakeContainer(callerSnapshot('sess-slot-4'))).resolves.toBe(false);
+    const capped = warnings('Container wake deferred — concurrency cap reached');
+    expect(capped).toHaveLength(1);
+    expect(capped[0]![1]).toMatchObject({ activeCount: 2, pendingSurvivors: 1, maxConcurrentContainers: 3 });
   });
 
   it("an adopted session's ceiling uses the adoption instant", async () => {
