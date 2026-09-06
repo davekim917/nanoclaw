@@ -96,24 +96,39 @@ function scene(items: ReleaseStateItem[] = [item]): ObservatoryScene {
   };
 }
 function deps(items: ReleaseStateItem[] = [item]): ApiDeps {
-  return { scene: async () => scene(items), threads: async () => [], now: Date.parse('2026-09-05T00:30:00Z') };
+  return {
+    scene: async () => scene(items),
+    threads: async () => [],
+    now: Date.parse('2026-09-05T00:30:00Z'),
+    canSend: async () => ({ ok: true }),
+    session: async (agent, mg, thread) => ({
+      created: false,
+      session: {
+        id: 's',
+        agent_group_id: agent,
+        messaging_group_id: mg,
+        thread_id: thread,
+      } as import('../../types.js').Session,
+    }),
+  };
 }
 async function setup() {
   await initTestDb();
   await getDb().exec(`
  CREATE TABLE workgroups(id TEXT PRIMARY KEY,display_name TEXT,attention_sources TEXT);
- CREATE TABLE agent_groups(id TEXT PRIMARY KEY,workgroup_id TEXT,name TEXT);
- CREATE TABLE sessions(id TEXT PRIMARY KEY,agent_group_id TEXT);
+ CREATE TABLE agent_groups(id TEXT PRIMARY KEY,workgroup_id TEXT,name TEXT,folder TEXT);
+ CREATE TABLE sessions(id TEXT PRIMARY KEY,agent_group_id TEXT,thread_id TEXT,messaging_group_id TEXT);
  CREATE TABLE users(id TEXT PRIMARY KEY,display_name TEXT);
- CREATE TABLE observatory_item_threads(workgroup_id TEXT,item_id TEXT,thread_id TEXT,created_at TEXT,created_by TEXT);
+ CREATE TABLE observatory_item_threads(workgroup_id TEXT,item_id TEXT,thread_id TEXT,created_at TEXT,created_by TEXT,PRIMARY KEY(workgroup_id,item_id));
  CREATE TABLE pending_approvals(approval_id TEXT PRIMARY KEY,agent_group_id TEXT,session_id TEXT,title TEXT,action TEXT,created_at TEXT,expires_at TEXT,approver_user_id TEXT,channel_type TEXT,platform_id TEXT,platform_message_id TEXT,status TEXT);
- CREATE TABLE messaging_groups(id TEXT PRIMARY KEY,platform_id TEXT,name TEXT);
- CREATE TABLE messaging_group_agents(messaging_group_id TEXT,agent_group_id TEXT);
+ CREATE TABLE messaging_groups(id TEXT PRIMARY KEY,platform_id TEXT,name TEXT,channel_type TEXT);
+ CREATE TABLE messaging_group_agents(messaging_group_id TEXT,agent_group_id TEXT,priority INTEGER DEFAULT 0);
  CREATE TABLE user_dms(user_id TEXT,channel_type TEXT,messaging_group_id TEXT,resolved_at TEXT);
  INSERT INTO workgroups(id,display_name) VALUES('w','Workspace'),('other','Other');
- INSERT INTO agent_groups VALUES('a','w','A'),('b','w','B'),('c','other','C');
- INSERT INTO messaging_groups(id,platform_id) VALUES('m','slack:C');
- INSERT INTO messaging_group_agents VALUES('m','a');
+ INSERT INTO agent_groups VALUES('a','w','A','a'),('b','w','B','b'),('c','other','C','c');
+ INSERT INTO messaging_groups(id,platform_id,name,channel_type) VALUES('m','slack:C','dispatch','slack');
+ INSERT INTO messaging_group_agents(messaging_group_id,agent_group_id) VALUES('m','a');
+ INSERT INTO observatory_item_threads VALUES('w','decision-1','slack:C:123','2026-09-05T00:00:00Z','d');
  `);
   await getDb().exec(SIGNAL_SCHEMA);
 }
@@ -212,8 +227,8 @@ describe('Signal source and authority boundaries', () => {
   it('accepts a workgroup canonical DM key for project create and update, but not a foreign one', async () => {
     await getDb().exec(`
       INSERT INTO users VALUES('slack-workspace:Uallowed','Synthetic allowed'),('slack-workspace:Uforeign','Synthetic foreign');
-      INSERT INTO messaging_groups VALUES('dm-allowed','slack:dm-allowed','Synthetic direct message'),('dm-foreign','slack:dm-foreign','Synthetic foreign message');
-      INSERT INTO messaging_group_agents VALUES('dm-allowed','a'),('dm-foreign','c');
+      INSERT INTO messaging_groups(id,platform_id,name) VALUES('dm-allowed','slack:dm-allowed','Synthetic direct message'),('dm-foreign','slack:dm-foreign','Synthetic foreign message');
+      INSERT INTO messaging_group_agents(messaging_group_id,agent_group_id) VALUES('dm-allowed','a'),('dm-foreign','c');
       INSERT INTO user_dms VALUES('slack-workspace:Uallowed','slack-workspace','dm-allowed','2026-09-05T00:00:00Z'),('slack-workspace:Uforeign','slack-workspace','dm-foreign','2026-09-05T00:00:00Z');
     `);
     const canonical = 'dm:slack:Uallowed';
@@ -903,8 +918,9 @@ it('original rejection cannot release a reservation while its retry is in flight
 });
 
 it('exposes exact uniquely owned claim notes and only same-agent thread links within scope', async () => {
-  await getDb().exec(`ALTER TABLE sessions ADD COLUMN thread_id TEXT;
-    INSERT INTO sessions VALUES('sa','a','thread-a'),('sb','b','thread-b'),('sc','c','thread-other');`);
+  await getDb().exec(
+    `INSERT INTO sessions(id,agent_group_id,thread_id) VALUES('sa','a','thread-a'),('sb','b','thread-b'),('sc','c','thread-other');`,
+  );
   const snapshot = scene([]);
   snapshot.agents[0]!.holding = ['owned', 'hidden-link', 'cross-link', 'ambiguous'];
   snapshot.agents[1]!.holding = ['private', 'ambiguous'];
@@ -965,4 +981,167 @@ it('serves decisions without assembling schedule history when its cache is cold'
     Object.assign(cache, previous);
     assemble.mockRestore();
   }
+});
+
+describe('source-backed decision destinations', () => {
+  async function noThread() {
+    await getDb().run('DELETE FROM observatory_item_threads');
+    await getDb().run("INSERT INTO messaging_group_agents VALUES('m','b',10)");
+    const d = deps([{ ...item, owner: 'James' }]);
+    const source = (await buildSignalData(ctx(), 'w', d)).decisions[0]!;
+    const answer = await reviewDecision(
+      source.id,
+      {
+        expected_version: 0,
+        evidence_hash: source.evidence_hash,
+        action: 'answer',
+        text: 'Go ahead',
+        idempotency_key: 'answer',
+      },
+      ctx(),
+      d,
+    );
+    return {
+      d,
+      source,
+      request: { expected_version: answer.version, evidence_hash: source.evidence_hash, agent_group_id: 'b' },
+    };
+  }
+  function adapter() {
+    return {
+      postParent: vi.fn().mockResolvedValue({ messageId: 'parent' }),
+      createThread: vi.fn().mockResolvedValue({ threadId: 'fresh', messageId: 'first' }),
+    };
+  }
+  it('defaults a human-owned item to highest priority channel wiring and allows an eligible override', async () => {
+    const { d, source, request } = await noThread();
+    const detail = await decisionDetail(source.id, ctx(), d);
+    expect(detail.destination).toMatchObject({
+      thread_id: null,
+      channel_name: 'dispatch',
+      default_agent_group_id: 'b',
+      default_reason: 'channel_default',
+    });
+    expect(detail.recipients.map((r) => r.id)).toEqual(['b', 'a']);
+    const platform = adapter();
+    const send = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const session = vi.fn(d.session!);
+    const result = await dispatchDecision(source.id, { ...request, agent_group_id: 'a' }, ctx(), {
+      ...d,
+      adapter: () => platform as never,
+      session,
+      send,
+    });
+    expect(result.dispatch_agent_group_id).toBe('a');
+    expect(session).toHaveBeenCalledWith('a', 'm', 'slack:C:fresh', 'per-thread');
+    expect(send).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0]![1].text).toContain('Go ahead');
+    expect(platform.createThread.mock.calls[0]![3]).not.toContain('Go ahead');
+  });
+  it('reuses the source thread on delivery retry without another platform post', async () => {
+    const { d, source, request } = await noThread();
+    const platform = adapter();
+    let deliveryCalls = 0;
+    const send = vi.fn(async () => {
+      deliveryCalls++;
+      return { status: deliveryCalls === 1 ? (429 as const) : (202 as const), body: {} };
+    });
+    const run = { ...d, adapter: () => platform as never, send };
+    expect((await dispatchDecision(source.id, request, ctx(), run)).dispatch_state).toBe('pending');
+    expect((await dispatchDecision(source.id, request, ctx(), run)).dispatch_state).toBe('sent');
+    expect(platform.postParent).toHaveBeenCalledOnce();
+    expect(platform.createThread).toHaveBeenCalledOnce();
+    expect(await getDb().get('SELECT thread_id FROM observatory_item_threads WHERE item_id=?', item.id)).toEqual({
+      thread_id: 'slack:C:fresh',
+    });
+    expect(send.mock.calls).toHaveLength(2);
+  });
+  it('never repeats a parent post when its result is uncertain', async () => {
+    const { d, source, request } = await noThread();
+    const platform = adapter();
+    platform.postParent.mockRejectedValue(new Error('response lost'));
+    const send = vi.fn();
+    const run = { ...d, adapter: () => platform as never, send };
+    await expect(dispatchDecision(source.id, request, ctx(), run)).rejects.toThrow();
+    await expect(dispatchDecision(source.id, request, ctx(), run)).rejects.toThrow('thread_creation_uncertain');
+    expect(platform.postParent).toHaveBeenCalledOnce();
+    expect(platform.createThread).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(readRecord(await readReview(source.id)).dispatch?.creation?.phase).toBe('posting_parent');
+  });
+  it('never repeats an uncertain thread creation, and overlapping first sends create once', async () => {
+    const { d, source, request } = await noThread();
+    const platform = adapter();
+    platform.createThread.mockRejectedValue(new Error('response lost'));
+    const run = { ...d, adapter: () => platform as never, send: vi.fn() };
+    const results = await Promise.allSettled([
+      dispatchDecision(source.id, request, ctx(), run),
+      dispatchDecision(source.id, request, ctx(), run),
+    ]);
+    expect(results.every((r) => r.status === 'rejected')).toBe(true);
+    await expect(dispatchDecision(source.id, request, ctx(), run)).rejects.toThrow('thread_creation_uncertain');
+    expect(platform.postParent).toHaveBeenCalledOnce();
+    expect(platform.createThread).toHaveBeenCalledOnce();
+  });
+  it('rejects hidden recipients, arbitrary threads, and changed routing evidence before creation', async () => {
+    const { d, source, request } = await noThread();
+    const platform = adapter();
+    const run = { ...d, adapter: () => platform as never, send: vi.fn() };
+    await expect(dispatchDecision(source.id, request, ctx('d', 'admin_of_group', ['a']), run)).rejects.toThrow(
+      'not_found',
+    );
+    await expect(
+      dispatchDecision(source.id, { ...request, target_thread_id: 'slack:C:random' }, ctx(), run),
+    ).rejects.toThrow('source_thread_mismatch');
+    const drift = { ...run, scene: async () => scene([{ ...item, owner: 'James', channel: '#elsewhere' }]) };
+    await expect(dispatchDecision(source.id, request, ctx(), drift)).rejects.toThrow('source_destination_changed');
+    expect(platform.postParent).not.toHaveBeenCalled();
+  });
+  it('gives exact agent identity precedence over an ambiguous owner label', async () => {
+    const { d, source } = await noThread();
+    const { resolveDestination } = await import('./destination.js');
+    const resolved = await resolveDestination(
+      { ...source, source_kind: 'thread-question', agent_group_id: 'a', owner_hint: 'B', thread_id: 'slack:C:123' },
+      ctx(),
+      d.canSend,
+    );
+    expect(resolved.default_agent_group_id).toBe('a');
+    expect(resolved.default_reason).toBe('origin');
+  });
+});
+
+it('preserves null-thread and task-question origin sessions without inventing platform threads', async () => {
+  const { resolveDestination, prepareDestination } = await import('./destination.js');
+  await getDb().run("INSERT INTO sessions VALUES('origin','a',NULL,'m')");
+  const source = {
+    ...releaseDecision('w', item, '2026-09-05T00:00:00Z'),
+    source_kind: 'thread-question' as const,
+    source_id: JSON.stringify(['origin', 'ask_question', 1]),
+    agent_group_id: 'a',
+    thread_id: 'session:origin',
+    channel_key: 'slack:C',
+  };
+  const root = await resolveDestination(source, ctx(), deps().canSend);
+  expect(root.default_agent_group_id).toBe('a');
+  expect(root.candidates[0]!.session_id).toBe('origin');
+  expect(root.session_thread_id).toBeNull();
+  await getDb().run("UPDATE sessions SET thread_id='system:tasks:series',messaging_group_id=NULL WHERE id='origin'");
+  const task = await resolveDestination({ ...source, thread_id: 'system:tasks:series' }, ctx(), deps().canSend);
+  expect(task.default_reason).toBe('origin');
+  expect(task.candidates[0]!.session_id).toBe('origin');
+  expect(task.error).toBeNull();
+  const record = readRecord(undefined);
+  record.dispatch = {
+    key: 'k',
+    user_id: 'd',
+    agent_group_id: 'a',
+    session_id: 'origin',
+    thread_id: 'system:tasks:series',
+    text: 'Answer',
+    state: 'pending',
+    error: null,
+  };
+  const session = vi.fn();
+  expect((await prepareDestination(source, record, { session }))?.session_id).toBe('origin');
+  expect(session).not.toHaveBeenCalled();
 });

@@ -10,6 +10,7 @@ import {
   type ReleaseStateItem,
   type ReleaseState,
   decorateSteeredThreads,
+  ownerMatchesAgent,
   threadPermalink,
 } from '../api/observatory.js';
 import { buildThreadList, buildThreadDetail, type ThreadSummary } from '../api/threads.js';
@@ -277,6 +278,7 @@ export function releaseDecision(wg: string, item: ReleaseStateItem, asOf: string
     d.context,
     d.next_action,
     d.source_url,
+
     item.dependsOn ?? null,
     item.blocksRelease ?? null,
     materialMeta(extended.meta),
@@ -529,6 +531,14 @@ export async function buildSignalData(
         if (item.nextMover === 'human') {
           const decision = releaseDecision(wg.id, item, scene.releaseState!.asOf);
           decision.project_id = project.id;
+          const owners = scene.agents.filter(
+            (a) =>
+              allowed.has(a.id) &&
+              item.owner &&
+              (ownerMatchesAgent(item.owner, a) ||
+                item.owner.trim().toLowerCase() === a.canonicalName.trim().toLowerCase()),
+          );
+          decision.agent_group_id = owners.length === 1 ? owners[0]!.id : null;
           result.rawDecisions.push(decision);
         }
       }

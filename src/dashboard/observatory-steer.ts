@@ -83,7 +83,7 @@ export function _resetSteerDedupeForTesting(): void {
  */
 const itemThreadLocks = new Map<string, Promise<unknown>>();
 
-async function withItemThreadLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+export async function withItemThreadLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
   const ahead = itemThreadLocks.get(key);
   let release!: () => void;
   const mine = new Promise<void>((resolve) => {
@@ -125,7 +125,12 @@ export interface ItemThreadRow {
  * landed, the incumbent's if we lost the race — so the caller always has
  * somewhere real to post and never a second thread to apologise for.
  */
-async function claimItemThread(workgroupId: string, itemId: string, threadId: string, userId: string): Promise<string> {
+export async function claimItemThread(
+  workgroupId: string,
+  itemId: string,
+  threadId: string,
+  userId: string,
+): Promise<string> {
   const res = await getDb().run(
     `INSERT INTO observatory_item_threads (workgroup_id, item_id, thread_id, created_at, created_by)
      VALUES (?, ?, ?, ?, ?)

@@ -128,6 +128,13 @@ export interface SignalDecisionDetail {
   decision: SignalDecision;
   evidence: { title: string; text: string; at: string | null; url: string | null }[];
   recipients: SignalPerson[];
+  destination: {
+    thread_id: string | null;
+    channel_name: string | null;
+    default_agent_group_id: string | null;
+    default_reason: 'origin' | 'owner' | 'channel_default' | null;
+    error: string | null;
+  };
 }
 export interface SignalReviewRequest {
   expected_version: number;

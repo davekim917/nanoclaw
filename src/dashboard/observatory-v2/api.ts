@@ -1,3 +1,7 @@
+import { getAgentGroup } from '../../db/agent-groups.js';
+import { personaName } from '../api/observatory.js';
+import { withItemThreadLock } from '../observatory-steer.js';
+import { resolveDestination, prepareDestination, type CreationDeps } from './destination.js';
 import { randomUUID } from 'node:crypto';
 import { getDb } from '../../db/connection.js';
 import { defineGuardedAction, guard, ALLOW, DENY } from '../../guard/index.js';
@@ -46,7 +50,7 @@ function integer(value: unknown): value is number {
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
-export interface ApiDeps extends SourceDeps {
+export interface ApiDeps extends SourceDeps, CreationDeps {
   threadDetail?: typeof scopedThreadDetail;
   send?: typeof applySessionSteer;
   canSend?: typeof canSteer;
@@ -119,7 +123,19 @@ export async function decisionDetail(
     decision.capabilities.answer = false;
     decision.capabilities.dispatch = false;
   }
-  return { decision, evidence, recipients };
+  const resolved = await resolveDestination(source, ctx, deps.canSend);
+  const { candidates, session_thread_id: _, ...destination } = resolved;
+  recipients = await Promise.all(
+    candidates.map(async ({ id, name }) => {
+      const agent = await getAgentGroup(id);
+      return { id, name: agent ? await personaName(agent) : name };
+    }),
+  );
+  if (record.dispatch) {
+    destination.thread_id = record.dispatch.thread_id || destination.thread_id;
+    destination.default_agent_group_id = record.dispatch.agent_group_id;
+  }
+  return { decision, evidence, recipients, destination };
 }
 export async function reviewDecision(
   id: string,
@@ -205,27 +221,46 @@ export async function dispatchDecision(
     if (request.expected_version !== row.version) throw new SignalError(409, 'revision_conflict');
     if (request.evidence_hash !== source.evidence_hash || row.evidence_hash !== source.evidence_hash)
       throw new SignalError(409, 'evidence_changed');
-    const threadId = source.thread_id ?? request.target_thread_id;
-    if (!threadId) throw new SignalError(409, 'select_existing_thread');
-    if (source.thread_id && request.target_thread_id && source.thread_id !== request.target_thread_id)
-      throw new SignalError(409, 'source_thread_mismatch');
-    const detail = await (deps.threadDetail ?? scopedThreadDetail)(threadId, ctx);
-    const participant = detail?.thread.participants.find((p) => p.agent_group_id === request.agent_group_id);
-    if (!participant) throw new SignalError(404, 'not_found');
+    const snapshot = record.snapshot as SourceDecision | undefined;
+    if (
+      snapshot &&
+      source.source_kind === 'release-item' &&
+      (snapshot.owner_hint !== source.owner_hint || snapshot.channel_key !== source.channel_key)
+    )
+      throw new SignalError(409, 'source_destination_changed_review_again');
     const group = await getDb().get<{ workgroup_id: string }>(
       'SELECT workgroup_id FROM agent_groups WHERE id=?',
-      participant.agent_group_id,
+      request.agent_group_id,
     );
     if (group?.workgroup_id !== source.workgroup_id) throw new SignalError(409, 'cross_workgroup_target');
+    const destination = await resolveDestination(source, ctx, deps.canSend);
+    if (destination.error) throw new SignalError(409, destination.error);
+    const candidate = destination.candidates.find((c) => c.id === request.agent_group_id);
+    if (!candidate) throw new SignalError(404, 'not_found');
+    const threadId = destination.thread_id;
+    if (request.target_thread_id && request.target_thread_id !== threadId)
+      throw new SignalError(409, 'source_thread_mismatch');
     // Fixed wrapper is persisted, rather than regenerated on retry after a
     // display-name or claim change. The stored answer is reproduced verbatim.
     const text = `${ctx.user.display_name ?? ctx.user.id} sent a decision from the Observatory.\n\nQuestion: ${source.question.slice(0, 500)}\n\nTheir answer, verbatim:\n${record.answer}\n\nReply in this thread with what you did or what prevents action.`;
     if (text.length > 4000) throw new SignalError(400, 'message_too_long');
     reservation = {
       key: `signal:${randomUUID()}`,
-      agent_group_id: participant.agent_group_id,
-      session_id: participant.session_id,
-      thread_id: threadId,
+      agent_group_id: candidate.id,
+      session_id: candidate.session_id ?? '',
+      ...(destination.session_thread_id !== undefined ? { session_thread_id: destination.session_thread_id } : {}),
+      thread_id: threadId ?? '',
+      messaging_group_id: candidate.messaging_group_id,
+      ...(!threadId
+        ? {
+            creation: {
+              messaging_group_id: candidate.messaging_group_id,
+              platform_id: candidate.platform_id,
+              channel_type: candidate.channel_type,
+              phase: 'ready' as const,
+            },
+          }
+        : {}),
       user_id: ctx.user.id,
       text,
       state: 'pending',
@@ -234,6 +269,14 @@ export async function dispatchDecision(
     record.dispatch = reservation;
     await saveReview(source, row.version, record);
   }
+  reservation = await withItemThreadLock(
+    `${source.workgroup_id}:${source.source_kind === 'release-item' ? source.source_id : id}`,
+    async () => {
+      const current = readRecord(await readReview(id));
+      if (current.dispatch?.key !== reservation!.key) throw new SignalError(409, 'dispatch_reservation_changed');
+      return (await prepareDestination(reservedSource, current, deps))!;
+    },
+  );
   let delivery: Awaited<ReturnType<typeof applySessionSteer>>;
   try {
     delivery = await (deps.send ?? applySessionSteer)(

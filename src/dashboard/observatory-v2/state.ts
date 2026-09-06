@@ -1,3 +1,4 @@
+import type { Creation } from './destination.js';
 import { createHash } from 'node:crypto';
 import { getDb } from '../../db/connection.js';
 import type { SignalDecision, SignalPerson, SignalReviewRequest } from './types.js';
@@ -48,6 +49,9 @@ export interface ReviewRecord {
     error: string | null;
     session_id: string;
     thread_id: string;
+    messaging_group_id?: string;
+    session_thread_id?: string | null;
+    creation?: Creation;
   } | null;
 }
 export interface ReviewRow {
