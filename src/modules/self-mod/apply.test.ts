@@ -175,6 +175,26 @@ describe('applyAddMcpServer', () => {
     );
   });
 
+  it('finalizes a plugin-owned refusal even when the notification cannot be written (#486 round 3)', async () => {
+    updateContainerConfig('agent', (cfg) => {
+      (cfg as { mcpServers?: Record<string, unknown> }).mcpServers = {
+        ...(cfg.mcpServers ?? {}),
+        owned: { command: 'plugin-owned', plugin: 'some-plugin' },
+      };
+    });
+    vi.mocked(writeSessionMessage).mockRejectedValueOnce(new Error('session DB unavailable'));
+    // A rejected notify must not escape: the approval handler's catch would
+    // otherwise retry the same dead session DB and leave the approval pending.
+    await expect(
+      applyAddMcpServer({ name: 'owned', command: 'mine', args: [], env: {} }, session),
+    ).resolves.toBeUndefined();
+    expect(readContainerConfig('agent').mcpServers.owned).toMatchObject({
+      command: 'plugin-owned',
+      plugin: 'some-plugin',
+    });
+    expect(JSON.parse((await getContainerConfig('ag-1'))!.mcp_servers).owned).toBeUndefined();
+  });
+
   it('refuses an approved payload that no longer validates, leaving both stores untouched', async () => {
     await applyAddMcpServer({ name: 'leaky', url: 'https://example.com/mcp?api_key=abc' }, session);
     expect(readContainerConfig('agent').mcpServers.leaky).toBeUndefined();
