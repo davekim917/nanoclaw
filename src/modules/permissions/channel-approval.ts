@@ -265,11 +265,11 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
   // can auto-wire / decline / suppress for its own channel type. Runs after
   // the in-flight dedupe (a pending card already owns this channel) and
   // before the approver checks (an auto-wire needs no reachable approver).
-  // `getMessagingGroup` is synchronous in the fork, so this is a cheap extra
-  // read rather than a reason to hoist the later `originMg` (card text,
-  // instance) up to here — that lookup stays where it is.
+  // `getMessagingGroup` is one awaited driver read (seam 3), so this is a
+  // cheap extra read rather than a reason to hoist the later `originMg` (card
+  // text, instance) up to here — that lookup stays where it is.
   {
-    const interceptMg = getMessagingGroup(messagingGroupId);
+    const interceptMg = await getMessagingGroup(messagingGroupId);
     const interceptor = interceptMg ? channelCardInterceptors.get(interceptMg.channel_type) : undefined;
     if (interceptMg && interceptor) {
       try {

@@ -867,7 +867,7 @@
 "src/modules/mount-security/index.ts":{"diff":36,"mode":"100644","sha256":"d9bc7052c46d9c767e952b2ab49ef738aedf0704e130a285e6abba6b7b22cce6"},
 "src/modules/permissions/access.ts":{"diff":51,"mode":"100644","sha256":"63daf58c19facfdf69815c9acb01567cbbe4ca466fdb101cde92331a6e37f072"},
 "src/modules/permissions/channel-approval.test.ts":{"diff":873,"mode":"100644","sha256":"9fc45535edc169096b24c41e32cdc1fc36bfd4ed0a50f4d5b633aed21e30c7ef"},
-"src/modules/permissions/channel-approval.ts":{"diff":344,"mode":"100644","sha256":"b82c30555312c00a49886209fb13db44eb1678c18b4f9e42b676a73941c943db"},
+"src/modules/permissions/channel-approval.ts":{"diff":344,"mode":"100644","sha256":"91891b04d073b71404562859a363c4f81d714868397eb6933202a83a2b500bf8"},
 "src/modules/permissions/channel-card-interceptor.test.ts":{"diff":106,"mode":"100644","sha256":"63bb203cc17e7e636bc0200824fe97e438c6c23435fc4c26fc8c1c8500ac5617"},
 "src/modules/permissions/db/agent-group-members.ts":{"diff":88,"mode":"100644","sha256":"75cc49de79b59803e20fd7fd1a425b6f26d87583d7e8e2ea3b783f35b49a1d27"},
 "src/modules/permissions/db/pending-channel-approvals.ts":{"diff":44,"mode":"100644","sha256":"ca5c69d96ffdd01b7f8bd5627a3bf4bbfb6ad82f4c7db16dbf755ff2e64ffd7b"},

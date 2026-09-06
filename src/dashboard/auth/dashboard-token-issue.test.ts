@@ -252,7 +252,7 @@ describe('dashboardTokenIssue', () => {
   it('the refuse-to-mint warn carries no handle when the private path is missing (#480 round 2)', async () => {
     const { log } = await import('../../log.js');
     vi.mocked(log.warn).mockClear();
-    vi.mocked(getMessagingGroup).mockReturnValue(makeSlackChannelMg());
+    vi.mocked(getMessagingGroup).mockResolvedValue(makeSlackChannelMg());
     vi.mocked(ensureUserDm).mockResolvedValue(null);
 
     await dashboardTokenIssue(makeCtx());
