@@ -40,8 +40,8 @@ registerResource({
         if (!groupId) throw new Error('--group is required');
         await getDb().run(
           `INSERT INTO agent_group_members (user_id, agent_group_id, added_by, added_at)
-           VALUES (?, ?, ?, ?)
-           ON CONFLICT (user_id, agent_group_id) DO NOTHING`,
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT (user_id, agent_group_id) DO NOTHING`,
           userId,
           groupId,
           addedBy,

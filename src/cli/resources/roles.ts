@@ -40,8 +40,8 @@ registerResource({
         if (role === 'owner' && groupId) throw new Error('owner role is always global (do not pass --group)');
         await getDb().run(
           `INSERT INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at)
-           VALUES (?, ?, ?, ?, ?)
-           ON CONFLICT DO NOTHING`,
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT DO NOTHING`,
           userId,
           role,
           groupId,
