@@ -891,6 +891,17 @@ describe('adoptRunningSessions', () => {
     expect(exits).toEqual([]);
     expect(hasPendingAdoption('sess-kill-stuck')).toBe(true);
     expect(containerOwnsOutbound('sess-kill-stuck')).toBe(true);
+
+    // The exit work is PARKED on the hold (#479 round 2): when the observer
+    // later proves the container gone, it runs exactly once — a one-shot
+    // caller's replacement request is not lost with the failed stop.
+    fakes.stopFails = false;
+    fakes.running.delete('nanoclaw-v2-sess-kill-stuck');
+    fakes.exit('nanoclaw-v2-sess-kill-stuck', 0);
+    await until(() => exits.length === 1, 'the parked exit work never ran');
+    expect(hasPendingAdoption('sess-kill-stuck')).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(exits).toEqual(['exit']);
   });
 
   it('a pending survivor that does not fit is counted saturating and blocks fresh admission (#462 item 5)', async () => {

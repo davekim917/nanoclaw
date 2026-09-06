@@ -2176,6 +2176,13 @@ interface PendingHold {
   fits: boolean | null;
   /** The `docker wait` exit observer, armed when the name is known (#462 item 1). */
   waiter: ChildProcess | null;
+  /**
+   * Exit work handed to `killContainer` by a stop that could not be proven:
+   * run once, when the observer (or a re-list) proves the container gone. A
+   * one-shot caller — a restart with a wake message, a self-mod or provider
+   * restart — relies on it to request the replacement.
+   */
+  parkedExits: ContainerExitCallback[];
 }
 const pendingHolds = new Map<string, PendingHold>();
 
@@ -2257,7 +2264,7 @@ async function holdAsPending(
   pendingAdoptions.add(session.id);
   let hold = pendingHolds.get(session.id);
   if (!hold) {
-    hold = { containerName: null, lease: null, reservedMb: null, fits: null, waiter: null };
+    hold = { containerName: null, lease: null, reservedMb: null, fits: null, waiter: null, parkedExits: [] };
     pendingHolds.set(session.id, hold);
   }
   if (container && hold.containerName !== container.name) {
@@ -2306,7 +2313,11 @@ async function holdAsPending(
   return hold;
 }
 
-/** Proven absence: give back everything the pending survivor held. */
+/**
+ * Proven absence: give back everything the pending survivor held, then run
+ * the exit work a stop parked on it — exactly once, after the release, in the
+ * order a tracked container's `close` would have run it.
+ */
 async function releasePendingHold(sessionId: string): Promise<void> {
   pendingAdoptions.delete(sessionId);
   const hold = pendingHolds.get(sessionId);
@@ -2320,6 +2331,12 @@ async function releasePendingHold(sessionId: string): Promise<void> {
     } catch (err) {
       log.warn("Failed to release a pending survivor's storage activity lease", { sessionId, err });
     }
+  }
+  const parked = hold.parkedExits.splice(0);
+  for (const callback of parked) {
+    void Promise.resolve()
+      .then(callback)
+      .catch((err: unknown) => log.warn('Container exit callback failed', { sessionId, err }));
   }
 }
 
@@ -2371,21 +2388,19 @@ function stopPendingSurvivor(sessionId: string, reason: string, onExit: Containe
       log.warn('docker kill failed for a pending survivor', { sessionId, containerName, err });
     }
   }
+  // The exit work rides the hold either way: released now if the container is
+  // proven gone, or by the observer when it eventually exits (#479 round 2).
+  hold.parkedExits.push(...onExit);
   if (!containerProvenGone(containerName)) {
-    log.warn('A pending survivor could not be stopped — keeping it pending; the caller retries', {
+    log.warn('A pending survivor could not be stopped — keeping it pending with its exit work parked', {
       sessionId,
       containerName,
       reason,
+      parkedExits: hold.parkedExits.length,
     });
     return;
   }
-  void releasePendingHold(sessionId).then(() => {
-    for (const callback of onExit) {
-      void Promise.resolve()
-        .then(callback)
-        .catch((err: unknown) => log.warn('Container exit callback failed', { sessionId, reason, err }));
-    }
-  });
+  void releasePendingHold(sessionId);
 }
 
 /** Is the container provably gone? A runtime that cannot be asked never proves absence. */
