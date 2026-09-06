@@ -5,6 +5,7 @@
  * Help commands are registered after resources are loaded.
  */
 import '../resources/index.js';
+import './slack-workspaces.js';
 import './storage.js';
 import { registerResourceHelpCommands } from './help.js';
 

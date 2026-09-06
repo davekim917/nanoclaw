@@ -1,6 +1,6 @@
 ---
 name: slack-agent-flow
-description: Give one or more agents their own Slack bot and put a team of them in a single shared room. Walks the fork's flow end to end — create the agent groups, install a Slack app per agent as a suffix token, restart, wire each bot's DM, then open one shared room. Use for "build me a team of agents in Slack", "give this agent its own Slack bot", or "put these agents in a room together".
+description: Give one or more agents their own Slack bot and put a team of them in a single shared room. Walks the fork's flow end to end — create the agent groups, create a Slack app per agent from its manifest, hot-attach and wire each bot's DM, then open one shared room. Use for "build me a team of agents in Slack", "give this agent its own Slack bot", or "put these agents in a room together".
 ---
 
 # Slack agent flow
@@ -10,7 +10,7 @@ working Slack construct: each agent as its own bot with its own DM, plus one
 shared room holding all of them and the human.
 
 This is an operational skill — it installs no code. Everything it does is
-`ncl` work, `/add-slack`'s app install repeated per agent, and one run of the
+`ncl` work, a manual Slack app creation per agent, and one run of the
 `/slack-a2a-rooms` opener.
 
 Each agent gets its own Slack app, installed by hand and held in `.env` as a
@@ -88,11 +88,10 @@ step 3, and it is the one an agent cannot do for itself.
 Put the whole team in **one workgroup** before any of them spawns. The
 workgroup is the data-pool boundary — shared chat archive, the one memory
 canon, shared files, workgroup-level OneCLI secrets ([docs/workgroups.md](../../../docs/workgroups.md)).
-Neither creation path sets it: `createAgentGroup`'s INSERT omits
-`workgroup_id`, so `resolveWorkgroupIdAtSpawn` falls back to the folder name
-and the first spawn writes each agent into a workgroup of one. Routed messages
-between them still work, which is what makes this easy to miss — the agents
-talk and share nothing.
+Approved `create_agent` now inherits the parent's workgroup in both the DB
+and `container.json` before any spawn. Those children need no manual rehome.
+The following rehome instructions apply only to manually created or legacy
+groups; inspect their existing membership first.
 
 `workgroup_id` lives on the `agent_groups` row and no `ncl` verb owns it, so
 this is the query wrapper's job (the same way `/clone-as-codex` does it):
@@ -220,71 +219,60 @@ own, so a secret the old workgroup supplied has to be declared again. Archive
 recall is projected per spawn from the central archive, so it follows the new
 workgroup on its own and needs nothing.
 
-### 3. Install one Slack app per agent
+### 3. Create one Slack app per agent from its manifest
 
-Repeat `/add-slack`'s app-creation steps once per agent, in the same
-workspace. Name each bot after its agent plus a suffix so Slack's
-`@`-autocomplete groups them (`helper`, `helper-research`). The bot display
-name, the env suffix and the resulting channelType are independent but should
-be kept aligned:
+After an approved `create_agent` from Slack, the follow-up includes the app
+manifest JSON and the existing child group's attach command. At
+https://api.slack.com/apps choose **Create New App → From a manifest**, select
+the same workspace as the parent, and paste that JSON. The plain manifest
+keeps guests supported and includes the bot scopes needed for DMs and rooms.
+No manager app, broker, or automatic Slack app creation is involved.
+
+Install the app to the workspace, obtaining any required workspace approval.
+Copy the **Bot User OAuth Token** (`xoxb-…`). In **Basic Information → App-Level
+Tokens**, generate an `xapp-…` token with `connections:write`.
+
+Keep the existing group if setup is interrupted. Do not call `create_agent`
+again merely to resume the Slack attachment.
+
+### 4. Attach the app live from the owner's host terminal
+
+Paste the two tokens into the host command, **never into the chat**:
 
 ```bash
-SLACK_BOT_TOKEN_<SUFFIX>=xoxb-…      # → channelType slack-<suffix-lowercased-with-dashes>
-SLACK_APP_TOKEN_<SUFFIX>=xapp-…      # Socket Mode
+ncl slack workspaces add --instance <slug> --agent-group-id <existing-group-id> \
+  --bot-token <xoxb-token> --app-token <xapp-token>
 ```
 
-`/clone-as-codex` and `/clone-as-opencode` are a different entry point, not a
-shortcut for this step: each one creates its own new agent group, folder and
-container config alongside the app. Reach for one **instead of** step 2 when
-what you want is a provider sibling of an existing agent. For the groups step 2
-created, do the app install here and read `/clone-as-codex`'s env-var section
-as the reference for the token layout.
+The command validates the bot, saves the canonical
+`SLACK_BOT_TOKEN_<SUFFIX>` / `SLACK_APP_TOKEN_<SUFFIX>` pair in `.env`, reloads
+that file, and starts the adapter live. It is owner-only on the host socket;
+container callers are rejected even with global CLI scope. There is no host
+restart step. Tokens are not printed, logged, or stored in the database.
 
-Add `mpim:write` to exactly **one** app — the one that will open rooms, which
-is the first name you pass to `--instances` in step 6. The rest need only the
-`mpim:read` and `mpim:history` that `/add-slack` already asks for. Adding a
-scope requires a reinstall, which mints a new bot token, so add it before you
-paste that app's token rather than after.
-
-### 4. Restart the host
-
-The adapter reads the suffix tokens at startup. There is no hot-start here, so
-a new bot is invisible until a restart. Use the install's own helper — it picks
-launchd or systemd, derives the unit from the install slug, and waits for the
-`ncl` socket so the wiring step below does not race the restart:
+### 5. Verify the attachment and DM wiring
 
 ```bash
-bash setup/lib/restart.sh
-```
-
-Confirm each new channelType registered:
-
-```bash
-grep 'Slack workspace connecting' logs/nanoclaw.log | tail
-```
-
-### 5. Wire each agent's DM
-
-Have the human DM each new bot once. The host auto-creates the
-`messaging_groups` row; on an install with auto-wire on, the wiring too.
-Confirm and fill in what is missing:
-
-```bash
+ncl slack workspaces list
 ncl messaging-groups list --channel-type slack-<suffix> --json
-ncl wirings create --messaging-group-id <id> --agent-group-id <agent group id> \
+```
+
+With `--agent-group-id`, the attach command opens the workspace operator's DM
+and wires it to the existing group using `per-thread` sessions and
+`accumulate` ignored messages. Send a DM to verify that the bot answers.
+Without the group flag, the command starts the adapter only; run it again
+with the same instance and group to finish the wiring.
+
+The operator must have a recognized owner identity in that Slack workspace.
+If DM wiring fails after the adapter starts, repair that identity and rerun
+the same attach command; do not create a second app or agent group.
+
+For additional hand-wired conversations, retain both flags:
+
+```bash
+ncl wirings create --messaging-group-id <id> --agent-group-id <group-id> \
   --session-mode per-thread --ignored-message-policy accumulate
 ```
-
-`/manage-channels` does the same conversationally.
-
-**Both flags are load-bearing, on DM and room wirings alike.** A wiring the
-router creates by itself is stamped `session_mode: 'per-thread'` and
-`ignored_message_policy: 'accumulate'` (`src/router.ts`), but `ncl wirings
-create` resolves only `engage_mode` from the channel declaration and falls back
-to `shared` and `drop` for these two. So a hand-made wiring silently behaves
-differently from every auto-wired one: every Slack thread collapses into one
-session, and each turn the agent was not addressed in is discarded instead of
-being kept as background context.
 
 ### 6. Open one shared room
 
@@ -342,10 +330,10 @@ mention-sticky` if that is what the team wants. A reply that names a sibling
 
 ## Troubleshooting
 
-**A new bot never connects after the restart.** Its suffix is missing a second
-credential. The adapter skips a workspace that has a bot token but neither an
-app token nor a signing secret, and logs `Slack workspace has no signing secret
-and no app token, skipping`.
+**Hot attach fails.** Confirm that both tokens belong to the intended app,
+that the app is installed in the intended workspace, and that Socket Mode is
+enabled. Correct the input and retry the same instance; preserve the existing
+agent group. An active instance cannot be replaced with a different bot.
 
 **The bot connects but never answers a DM.** No wiring on its
 `messaging_groups` row (step 5), or the row's `unknown_sender_policy` is

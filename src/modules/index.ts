@@ -23,6 +23,7 @@ import './approvals/index.js';
 import './interactive/index.js';
 import './permissions/index.js';
 import './agent-to-agent/index.js';
+import './slack-agent-flow/index.js';
 import './self-mod/index.js';
 import './remote-control/index.js';
 import './channel-auto-wire/index.js';

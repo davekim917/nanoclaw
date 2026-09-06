@@ -92,7 +92,7 @@ vi.mock('../approvals/index.js', async (importOriginal) => ({
 import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from '../../db/index.js';
 import { getAgentGroupByFolder } from '../../db/agent-groups.js';
 import { STANDING_INSTRUCTIONS_FILE } from '../../group-persona.js';
-import { applyCreateAgent, handleCreateAgent } from './create-agent.js';
+import { applyCreateAgent, handleCreateAgent, registerCreateAgentFollowUp } from './create-agent.js';
 import type { PendingApproval, Session } from '../../types.js';
 
 /**
@@ -771,5 +771,23 @@ describe('workgroup inheritance', () => {
     const row = await getAgentGroupByFolder('orphan');
     expect(row!.workgroup_id ?? null).toBeNull();
     expect(containerConfig('orphan')).not.toHaveProperty('workgroup_id');
+  });
+});
+
+describe('approved creation follow-up', () => {
+  it('runs after the group and filesystem exist and retains the group when follow-up fails', async () => {
+    const followUp = vi.fn(async ({ group }: { group: { folder: string } }) => {
+      expect(await getAgentGroupByFolder(group.folder)).toBeDefined();
+      expect(fs.existsSync(path.join(TEST_GROUPS_DIR, group.folder, 'container.json'))).toBe(true);
+      throw new Error('synthetic optional setup failure');
+    });
+    const unregister = registerCreateAgentFollowUp(followUp);
+    try {
+      await runCreateAgent({ requestId: 'follow-up', name: 'Fixture Followup' }, makeSession());
+      expect(followUp).toHaveBeenCalledOnce();
+      expect(await getAgentGroupByFolder('fixture-followup')).toBeDefined();
+    } finally {
+      unregister();
+    }
   });
 });
