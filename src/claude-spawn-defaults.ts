@@ -85,7 +85,7 @@ export interface ClaudeSpawnDefaults {
  * unchallenged. Candidates are checked against the SAME tables the chat
  * `-m`/`-e` parser uses (`vocabFor('claude')`), and an invalid one is DROPPED
  * so the next layer gets its turn — never passed through, never fatal.
-  */
+ */
 export function resolveClaudeSpawnDefaults(
   containerConfig: ClaudeSpawnConfig,
   channel: { model?: string | null; effort?: string | null } = {},
