@@ -55,7 +55,7 @@ The report goes to stdout; progress and warnings go to stderr.
 Exit codes:
   0  swept the whole fleet
   ${EXIT_USAGE}  bad usage
-  ${EXIT_BUDGET}  sweep aborted at the --timeout ceiling (partial report on stdout)
+  ${EXIT_BUDGET}  sweep breached the --timeout ceiling (aborted early, or overran while finishing)
 `;
 
 /** Thrown for anything the caller typed wrong; the CLI turns it into exit ${EXIT_USAGE}. */
@@ -226,9 +226,9 @@ async function run(opts: Options): Promise<void> {
       const inboundPath = path.join(groupPath, sessDir, 'inbound.db');
       if (!fs.existsSync(inboundPath)) continue;
 
-      // Checked between databases, so it bounds the sweep as a whole. A spin
-      // inside one database is not bounded here — that is what `lastOpened`
-      // below is for: the last stderr line names the database to look at.
+      // Checked before starting more work, so it bounds the sweep as a whole.
+      // A spin inside one database is not interruptible here — that is what the
+      // eager line below is for.
       if (opts.budgetMs > 0 && Date.now() - startedAt > opts.budgetMs) {
         aborted = true;
         note(
@@ -239,6 +239,13 @@ async function run(opts: Options): Promise<void> {
       }
 
       lastOpened = `${groupDir}/${sessDir}`;
+      // Written BEFORE the open, not after the query. If opening or querying a
+      // database wedges — the one case the ceiling above cannot interrupt —
+      // this is the only record that names it: `lastOpened` is process memory
+      // that dies with the kill, and the every-100 heartbeat can be up to 99
+      // databases stale. One line per database is the cost of the last stderr
+      // line being the answer.
+      note(`> ${lastOpened}`);
       scanned++;
       const openedAt = Date.now();
 
@@ -308,12 +315,30 @@ async function run(opts: Options): Promise<void> {
     }
   }
 
+  // The check above only fires before starting another database, so it misses
+  // two ways the ceiling is breached: the last database overrunning while it
+  // renders, and pre-sweep work overrunning when there is no database to stop
+  // at. Neither is a partial sweep — the report is complete — but both breached
+  // a limit the operator asked to be held to, so both are said out loud.
+  const overran = !aborted && opts.budgetMs > 0 && Date.now() - startedAt > opts.budgetMs;
+  if (overran) {
+    note(
+      `OVER BUDGET: swept all ${scanned} session DBs but took ${elapsed()}s, ` +
+        `past the ${opts.budgetMs / 1000}s --timeout ceiling.`,
+    );
+  }
+
+  const ceilingNote = aborted
+    ? ' — PARTIAL, sweep hit the --timeout ceiling'
+    : overran
+      ? ' — complete, but the sweep ran past the --timeout ceiling'
+      : '';
   console.log(
-    `\n${count} ${opts.showAll ? 'series' : 'active series'} total${aborted ? ' — PARTIAL, sweep hit the --timeout ceiling' : ''}.` +
+    `\n${count} ${opts.showAll ? 'series' : 'active series'} total${ceilingNote}.` +
       ` (--all includes non-pending, --full prints whole prompts/scripts)`,
   );
   note(`${aborted ? 'aborted' : 'done'} after ${scanned} session DBs`);
-  if (aborted) process.exitCode = EXIT_BUDGET;
+  if (aborted || overran) process.exitCode = EXIT_BUDGET;
 }
 
 if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
