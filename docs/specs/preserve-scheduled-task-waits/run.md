@@ -2,8 +2,8 @@
 
 Implemented and rebased in an isolated worktree. The change adds a narrowly
 scoped recall-pair predicate to the mailbox admission seam and uses it in S19
-before and after the existing asynchronous move-intent check. S19 reads the
-continuation from that same mailbox seam at both points.
+before and after the existing asynchronous move-intent check. S19 reads raw
+continuation presence from that same mailbox seam at both points.
 
 Regression coverage uses production-shaped SQLite fixtures and registered
 sweep duties. It proves future inert waits stay active, a due wait is admitted
@@ -18,10 +18,10 @@ new case distinguishes the repair from the previous behavior.
 ## Review follow-up dispositions
 
 - The pre- and post-await continuation reads now use
-  `mailbox.readWorkContinuation()`; the continuation race regression covers
-  the post-await read. The sweep plan already obtains that same value from the
-  mailbox, so removing the duplicate plan dependency does not expand its
-  retention rule.
+  `mailbox.readContinuationPresence()`. This deliberately preserves both
+  continuation keys even when their content is malformed; the validating
+  parser remains for recovery admission. Regressions cover valid, malformed,
+  legacy, absent, and arrival-during-await presence states.
 - `shouldCloseTaskSession` requires explicit paired-wait and continuation
   facts. Its unit cases state both values at every call site.
 - The pair query names its primary row `pending_turn`, avoiding ambiguity with
@@ -47,6 +47,14 @@ Validation after rebasing onto `origin/main` completed:
 - An inherited runner-provider fixture label was made neutral so the full
   indexed public-boundary scan passes. This does not change the fixture's
   setup or assertions.
+
+Follow-up validation for raw continuation presence:
+
+- `pnpm exec vitest run src/modules/sweep-scheduling/scheduling.test.ts --reporter=dot --maxWorkers=1` — 1 file, 29 tests passed.
+- `pnpm run typecheck`
+- `pnpm run lint`
+- `pnpm run ratchet:report -- --write` — delta 0.
+- `pnpm run check:public-boundary -- --root <worktree> --index`
 
 Publication, review, deployment, and runtime verification remain separate from
 this source-only implementation.

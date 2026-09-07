@@ -149,7 +149,7 @@ export function registerSchedulingSweepDuties(): void {
       if (isTaskThread(session.thread_id)) {
         const liveTasks = mailbox!.countLiveTasks();
         const hasPendingWait = mailbox!.hasPendingRecallPairedTrigger();
-        const hasWorkContinuation = mailbox!.readWorkContinuation() !== null;
+        const hasWorkContinuation = mailbox!.readContinuationPresence() !== null;
         if (
           !shouldCloseTaskSession(
             session.thread_id,
@@ -188,7 +188,7 @@ export function registerSchedulingSweepDuties(): void {
         const workArrived =
           mailbox!.countLiveTasks() > 0 ||
           mailbox!.hasPendingRecallPairedTrigger() ||
-          mailbox!.readWorkContinuation() !== null;
+          mailbox!.readContinuationPresence() !== null;
         if (workArrived) {
           log.info('Kept a spent task session open — work arrived during the intent check', {
             sessionId: session.id,

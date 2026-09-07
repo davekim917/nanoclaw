@@ -844,13 +844,10 @@ describe('S2-PR11 scheduling + thread-close', () => {
     const db = freshInbound();
     const session = fakeSession({ id: 'sess-continuation', thread_id: TASK_THREAD });
     const mailbox = sessionFor(db);
-    vi.spyOn(mailbox, 'readWorkContinuation').mockReturnValue({
+    vi.spyOn(mailbox, 'readContinuationPresence').mockReturnValue({
+      key: 'work_continuation',
       id: 'continuation-1',
       task: 'finish the bounded work',
-      phase: 'queued',
-      chain: 0,
-      resume_attempts: 0,
-      recovery_episode: 0,
     });
 
     await duty(SWEEP_DUTY_INVENTORY.S19).run(makeCtx({ session, mailbox }));
@@ -862,27 +859,60 @@ describe('S2-PR11 scheduling + thread-close', () => {
     const db = freshInbound();
     const session = fakeSession({ id: 'sess-continuation-raced', thread_id: TASK_THREAD });
     const mailbox = sessionFor(db);
-    const continuation = {
-      id: 'continuation-raced',
-      task: 'finish after the interrupted turn',
-      phase: 'queued' as const,
-      chain: 0,
-      resume_attempts: 0,
-      recovery_episode: 0,
+    const presence = {
+      key: 'work_continuation',
+      id: null,
+      task: null,
     };
     let continuationLanded = false;
-    vi.spyOn(mailbox, 'readWorkContinuation').mockImplementation(() => (continuationLanded ? continuation : null));
+    vi.spyOn(mailbox, 'readContinuationPresence').mockImplementation(() => (continuationLanded ? presence : null));
     calls.intentHook = () => {
       continuationLanded = true;
     };
 
     await duty(SWEEP_DUTY_INVENTORY.S19).run(makeCtx({ session, mailbox }));
 
-    expect(mailbox.readWorkContinuation(), 'the hook made a continuation readable').toEqual(continuation);
+    expect(mailbox.readContinuationPresence(), 'the hook made an unparseable continuation present').toEqual(presence);
     expect(calls.updates, 'the GC closed a session with continuation work that landed during its intent check').toEqual(
       [],
     );
     expect(getRawDb().prepare("SELECT status FROM sessions WHERE id = 'sess-continuation-raced'").get()).toEqual({
+      status: 'active',
+    });
+  });
+
+  it('the registered spent-task GC duty keeps malformed current continuation presence', async () => {
+    const db = freshInbound();
+    const session = fakeSession({ id: 'sess-malformed-continuation', thread_id: TASK_THREAD });
+    const mailbox = sessionFor(db);
+    vi.spyOn(mailbox, 'readContinuationPresence').mockReturnValue({
+      key: 'work_continuation',
+      id: null,
+      task: null,
+    });
+
+    await duty(SWEEP_DUTY_INVENTORY.S19).run(makeCtx({ session, mailbox }));
+
+    expect(calls.updates).toEqual([]);
+    expect(getRawDb().prepare("SELECT status FROM sessions WHERE id = 'sess-malformed-continuation'").get()).toEqual({
+      status: 'active',
+    });
+  });
+
+  it('the registered spent-task GC duty keeps legacy continuation presence', async () => {
+    const db = freshInbound();
+    const session = fakeSession({ id: 'sess-legacy-continuation', thread_id: TASK_THREAD });
+    const mailbox = sessionFor(db);
+    vi.spyOn(mailbox, 'readContinuationPresence').mockReturnValue({
+      key: 'pending_next',
+      id: null,
+      task: 'legacy work',
+    });
+
+    await duty(SWEEP_DUTY_INVENTORY.S19).run(makeCtx({ session, mailbox }));
+
+    expect(calls.updates).toEqual([]);
+    expect(getRawDb().prepare("SELECT status FROM sessions WHERE id = 'sess-legacy-continuation'").get()).toEqual({
       status: 'active',
     });
   });
@@ -910,7 +940,7 @@ describe('S2-PR11 scheduling + thread-close', () => {
     expect(calls.updates).toEqual([{ id: 'sess-wait-consumed', patch: { status: 'closed' } }]);
   });
 
-  it('the registered spent-task GC duty closes a completed task session with only historical context left', async () => {
+  it('the registered spent-task GC duty closes a completed task session with no continuation presence and only historical context left', async () => {
     const db = freshInbound();
     const session = fakeSession({ id: 'sess-spent', thread_id: TASK_THREAD });
     db.prepare(
