@@ -115,7 +115,7 @@ cd container/agent-runner && bun run test  # bun:test + hermeticity
 
 Container typecheck is a separate tsconfig — after editing `container/agent-runner/src/`, run `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit` (or `bun run typecheck` from that dir).
 
-Service management: macOS `launchctl load/unload ~/Library/LaunchAgents/com.nanoclaw.plist` (`kickstart -k gui/$(id -u)/com.nanoclaw` to restart); Linux `systemctl --user start|stop|restart nanoclaw`.
+Service management: the host runs as a **system** unit, `nanoclaw-v2.service` — `sudo systemctl start|stop|restart nanoclaw-v2`. There is no `--user` unit; `systemctl --user` finds nothing.
 
 ## Module System (host)
 
@@ -172,7 +172,6 @@ Tracks latest stable, including majors; prerelease/beta/RC/dev/nightly/draft/yan
 | Templates | `templates.md` |
 | Memory | `memory.md` |
 | Setup, customizing | `setup-wiring.md`, `customizing.md` |
-| CJK fonts | `cjk-fonts.md` |
 | Directive audit | `always-on-directive-classification.md`, `always-on-directive-baseline.md` |
 | Agent mailbox seam | `docs/specs/upstream-mailbox-seam/plan.md` §5 (upstream doc = end state) |
 | Upstream divergence ratchet | `upstream-ratchet.md` |

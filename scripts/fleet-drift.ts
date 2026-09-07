@@ -420,27 +420,20 @@ function detectBreaches(metrics: StoredMetrics, priorMetrics: StoredMetrics[]): 
 // supposed to hold only timeless rules. No LLM, no history, no new timer —
 // this reads the current tree and reports, same as any other check here.
 
-/** container/CLAUDE.md alone (shared base, not persona/fragments). */
-export const CONTAINER_BYTES_CEILING = 10_240;
-/** Repo-root CLAUDE.md alone — loads into every host session and any container agent working on the nanoclaw repo itself. */
-export const TRUNK_DOC_BYTES_CEILING = 16_384;
-/** Per group: its standing-instructions/persona file(s) + CLAUDE.local.md. */
-export const GROUP_STANDING_BYTES_CEILING = 8_192;
+// Ceilings and the banned-pattern scan live in ./instruction-surface.ts so the CI
+// gate can import them without loading this module (and better-sqlite3 with it).
+// Re-exported here so existing callers and tests are unchanged.
+import {
+  CONTAINER_BYTES_CEILING,
+  TRUNK_DOC_BYTES_CEILING,
+  GROUP_STANDING_BYTES_CEILING,
+  scanBannedPatterns,
+} from './instruction-surface.js';
+
+export { CONTAINER_BYTES_CEILING, TRUNK_DOC_BYTES_CEILING, GROUP_STANDING_BYTES_CEILING, scanBannedPatterns };
 
 /** A group's standing-instructions file plus its CLAUDE.local.md. */
 const GROUP_STANDING_FILENAMES = ['standing-instructions.md', 'CLAUDE.local.md'];
-
-const BANNED_PATTERNS: Array<{ name: string; re: RegExp }> = [
-  { name: 'iso_date', re: /\b20\d{2}-\d{2}-\d{2}\b/ },
-  { name: 'issue_or_pr_ref', re: /(?:^|[\s(])#\d{2,}\b/ },
-  { name: 'xzo_ref', re: /\bXZO-\d+\b/ },
-  { name: 'current_focus_header', re: /^#+\s*Current Focus/im },
-];
-
-/** Names every banned pattern found in `content` — point-in-time facts that don't belong in a standing instruction file. */
-export function scanBannedPatterns(content: string): string[] {
-  return BANNED_PATTERNS.filter(({ re }) => re.test(content)).map(({ name }) => name);
-}
 
 export interface InstructionStackBreach {
   metric: 'containerBytes' | 'trunkDocBytes' | 'groupStandingBytes' | 'effectiveStackBytes';
