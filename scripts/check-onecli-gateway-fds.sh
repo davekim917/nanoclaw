@@ -36,14 +36,19 @@ cd "$NANOCLAW_DIR"
 
 
 # Read a key from NanoClaw's .env the way src/env.ts does: trim, then strip one
-# matching pair of single OR double quotes. The host honours .env for these
-# settings, so a shell expansion that only sees exported variables silently
-# disagrees with the host about which container and which timezone are in use.
-env_get() {  # <key>
-  [ -r "$NANOCLAW_DIR/.env" ] || return 0
-  sed -n "s/^[[:space:]]*$1=//p" "$NANOCLAW_DIR/.env" | tail -1 | tr -d '\r' | awk '
+# matching pair of single OR double quotes. The host reads process env THEN
+# .env for these settings, so a shell expansion that only sees exported
+# variables silently disagrees with the host about which container and which
+# timezone are in use. Takes the file as an argument so it is testable —
+# scripts/check-onecli-gateway-fds.test.sh asserts it against the same vectors
+# src/env-file.test.ts uses on the real parser, because a mirror that drifts is
+# worse than no mirror.
+# Args: <key> <env-file>
+read_env_value() {
+  [ -r "${2:-}" ] || return 0
+  sed -n "s/^[[:space:]]*$1[[:space:]]*=//p" "$2" | tail -1 | tr -d '\r' | awk '
     { gsub(/^[[:space:]]+|[[:space:]]+$/, "")
-      if (length($0) >= 2 && ((substr($0,1,1)=="\"" && substr($0,length($0),1)=="\"") || (substr($0,1,1)=="'"'"'" && substr($0,length($0),1)=="'"'"'"))) 
+      if (length($0) >= 2 && ((substr($0,1,1)=="\"" && substr($0,length($0),1)=="\"") || (substr($0,1,1)=="'"'"'" && substr($0,length($0),1)=="'"'"'")))
         $0 = substr($0, 2, length($0)-2)
       print }'
 }
@@ -51,7 +56,7 @@ env_get() {  # <key>
 # Same key and the same sources the host uses (src/config.ts reads process env
 # THEN .env); ONECLI_CONTAINER stays accepted so existing drop-ins keep working.
 CONTAINER="${ONECLI_GATEWAY_CONTAINER:-${ONECLI_CONTAINER:-}}"
-[ -n "$CONTAINER" ] || CONTAINER="$(env_get ONECLI_GATEWAY_CONTAINER)"
+[ -n "$CONTAINER" ] || CONTAINER="$(read_env_value ONECLI_GATEWAY_CONTAINER "$NANOCLAW_DIR/.env")"
 CONTAINER="${CONTAINER:-onecli}"
 RESTART_PCT="${RESTART_PCT:-70}"   # restart at/above this % of the soft limit
 DRY_RUN="${DRY_RUN:-0}"
@@ -69,17 +74,22 @@ fail() { echo "fd-watchdog: $1" >&2; exit 1; }
 # reported as a failed one. Same root cause, so one gate rather than a guard per
 # variable: the first version of this validated only RESTART_PCT and review
 # found the identical defect at RECOVER_WAIT_S one round later.
-require_int() {  # <name> <value> [max]
+# One gate for every numeric knob. An empty value is NOT invalid — `${X:-default}`
+# already treated it as unset, matching src/env.ts, where `if (value)` means an
+# empty assignment is no assignment. Rejecting zero matters: RESTART_PCT=0 would
+# restart the gateway on every tick, and RECOVER_WAIT_S=0 makes `seq 1 0` yield
+# no iterations, so the recovery poll never runs and a healthy restart is
+# reported as a failed one.
+require_range() {  # <name> <value> <min> <max>
   case "$2" in
-    ''|*[!0-9]*) fail "$1 must be a non-negative integer, got '$2'" ;;
+    ''|*[!0-9]*) fail "$1 must be an integer $3-$4, got '$2'" ;;
   esac
-  if [ -n "${3:-}" ] && [ "$2" -gt "$3" ]; then
-    fail "$1 must be <= $3, got '$2'"
+  if [ "$2" -lt "$3" ] || [ "$2" -gt "$4" ]; then
+    fail "$1 must be $3-$4, got '$2'"
   fi
 }
-require_int RESTART_PCT "$RESTART_PCT" 100
-require_int RECOVER_WAIT_S "$RECOVER_WAIT_S"
-[ "$RECOVER_WAIT_S" -gt 0 ] || fail "RECOVER_WAIT_S must be > 0, got '$RECOVER_WAIT_S'"
+require_range RESTART_PCT "$RESTART_PCT" 1 100
+require_range RECOVER_WAIT_S "$RECOVER_WAIT_S" 1 300
 
 docker inspect "$CONTAINER" >/dev/null 2>&1 || fail "container '$CONTAINER' not found"
 
@@ -209,7 +219,7 @@ if [ -z "$INSTALL_TZ" ]; then
   INSTALL_TZ="$(systemctl show "${NANOCLAW_SERVICE_UNIT:-nanoclaw-v2}" -p Environment --value 2>/dev/null \
     | tr ' ' '\n' | sed -n 's/^TZ=//p' | head -1)" || INSTALL_TZ=''
 fi
-[ -n "$INSTALL_TZ" ] || INSTALL_TZ="$(env_get TZ)"
+[ -n "$INSTALL_TZ" ] || INSTALL_TZ="$(read_env_value TZ "$NANOCLAW_DIR/.env")"
 INSTALL_TZ="${INSTALL_TZ:-UTC}"
 
 # One atomic create-and-write. `set -C` makes `>` use O_CREAT|O_EXCL, which
