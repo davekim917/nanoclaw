@@ -13,22 +13,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NANOCLAW_DIR="${NANOCLAW_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 cd "$NANOCLAW_DIR"
 
-CLI_SOCK="$NANOCLAW_DIR/data/cli.sock"
-ADMIN_DM_ROW="$(pnpm exec tsx scripts/q.ts "$NANOCLAW_DIR/data/v2.db" "
-  SELECT mg.platform_id, ud.channel_type
-    FROM user_roles ur
-    JOIN user_dms ud ON ud.user_id = ur.user_id
-    JOIN messaging_groups mg ON mg.id = ud.messaging_group_id
-   WHERE ur.role = 'owner'
-   ORDER BY ud.resolved_at DESC
-   LIMIT 1
-")"
-IFS='|' read -r ADMIN_DM_PLATFORM_ID ADMIN_DM_CHANNEL_TYPE <<< "$ADMIN_DM_ROW"
-
-if [ -z "${ADMIN_DM_PLATFORM_ID:-}" ] || [ -z "${ADMIN_DM_CHANNEL_TYPE:-}" ]; then
-  echo "drift-check: cannot resolve an owner DM from user_roles + user_dms" >&2
-  exit 1
-fi
+# No owner-DM lookup and no CLI socket: delivery is the outbox. The old lookup
+# gated the whole run, so a transient central-DB failure — or an install with
+# no resolved owner DM — silently suppressed drift reports even when a
+# perfectly good outbox was configured.
 
 # The runbook lives in the private operator repo, not here: it names this
 # install's agent groups, vault entries, and private repos, so it cannot satisfy
@@ -81,16 +69,17 @@ if [ ! -d "$OUTBOX" ] || [ ! -w "$OUTBOX" ]; then
   echo "drift-check: DRIFT DETECTED but outbox unusable ($OUTBOX): $NOTIFICATION" >&2
   exit 1
 fi
-# O_EXCL temp then rename, same reasoning as health-sentinel.sh: a predictable
-# name in an agent-writable outbox could be pre-created as a symlink.
-TMP_OUT="$(mktemp "$OUTBOX/$(date -u +%Y%m%dT%H%M%S)-onecli-drift.XXXXXX")" || {
-  echo "drift-check: DRIFT DETECTED but could not create an alert file: $NOTIFICATION" >&2
+# Atomic O_EXCL create, same reasoning as health-sentinel.sh.
+RAND="$(od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+OUT="$OUTBOX/$(date -u +%Y%m%dT%H%M%S)-onecli-drift.${RAND:-$$}.md"
+umask 022
+set -C
+printf '*OneCLI gateway drift*\n_host: %s · %s UTC_\n\n%s\n' \
+  "$(hostname)" "$(date -u '+%Y-%m-%d %H:%M')" "$NOTIFICATION" > "$OUT" || {
+  set +C
+  echo "drift-check: DRIFT DETECTED but could not create $OUT: $NOTIFICATION" >&2
   exit 1
 }
-OUT="$TMP_OUT.md"
-printf '*OneCLI gateway drift*\n_host: %s · %s UTC_\n\n%s\n' \
-  "$(hostname)" "$(date -u '+%Y-%m-%d %H:%M')" "$NOTIFICATION" > "$TMP_OUT"
-chmod 0644 "$TMP_OUT"
-mv -f "$TMP_OUT" "$OUT"
+set +C
 [ -s "$OUT" ] || { echo "drift-check: wrote an empty alert to $OUT" >&2; exit 1; }
 echo "drift-check: queued alert $OUT"
