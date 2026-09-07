@@ -2,21 +2,42 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FIXTURE_DIR="$(mktemp -d)/run-fixture"
-trap 'rm -rf "$(dirname "$FIXTURE_DIR")"' EXIT
+FIXTURE_BASE="$(mktemp -d)"
+FIXTURE_DIR="$FIXTURE_BASE/run-fixture"
+STUB_BIN="$FIXTURE_BASE/bin"
+SHARED_ROOT="$FIXTURE_BASE/workgroup"
+export SMOKE_GATE_SHARED_ROOT="$SHARED_ROOT"
+export SMOKE_GATE_LEASE_DIR="$SHARED_ROOT/lease-fixture"
+export SMOKE_GATE_OWNER=scaffold-owner
+trap 'rm -rf "$FIXTURE_BASE"' EXIT
 mkdir -p "$FIXTURE_DIR"
+mkdir -p "$STUB_BIN" "$SHARED_ROOT"
+cat > "$STUB_BIN/mountpoint" <<'STUB'
+#!/usr/bin/env bash
+[ "${1:-}" = "-q" ] && [ "${2:-}" = "${SMOKE_GATE_SHARED_ROOT:-}" ]
+STUB
+chmod +x "$STUB_BIN/mountpoint"
+export PATH="$STUB_BIN:$PATH"
 
 SHA="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 OTHER_SHA="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 # Every legitimate caller of the scaffold is coordinator-side; the role checks
 # below are the only cases that override this.
 export SMOKE_LANE_ROLE=coordinator
-# ...and holds the gate. The scaffold reads the gate's own state file rather
-# than taking a second token: `activeRunId` IS the fencing token.
-GATE_STATE="$(mktemp -d)"
+# ...and holds the gate plus its shared coordinator lease.
+GATE_STATE="$FIXTURE_BASE/gate-state"
+mkdir -p "$GATE_STATE" "$SMOKE_GATE_LEASE_DIR"
 export SMOKE_GATE_STATE_DIR="$GATE_STATE"
 gate_owns() {
-  printf '{"schemaVersion":1,"pr":5,"activeRunId":"%s"}\n' "$1" > "$GATE_STATE/pr-5-state.json"
+  local run="$1" active_sha="${2:-$SHA}" owner="${3:-$SMOKE_GATE_OWNER}" now expires
+  now="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+  expires="$(date -u -d '@'$(( $(date -u +%s) + 3600 )) +'%Y-%m-%dT%H:%M:%SZ')"
+  printf '{"schemaVersion":1,"pr":5,"activeRunId":"%s","activeSha":"%s","activeLeaseOwner":"%s"}\n' \
+    "$run" "$active_sha" "$owner" > "$GATE_STATE/pr-5-state.json"
+  printf '{"schemaVersion":1,"pr":5,"owner":"%s","claimedAt":"%s","renewedAt":"%s","expiresAt":"%s"}\n' \
+    "$owner" "$now" "$now" "$expires" > "$SMOKE_GATE_LEASE_DIR/lease-$run.json"
+  printf '{"schemaVersion":1,"pr":5,"runId":"%s","owner":"%s","boundAt":"%s"}\n' \
+    "$run" "$owner" "$now" > "$SMOKE_GATE_LEASE_DIR/pr-5-authority.json"
 }
 gate_owns "$(basename "$FIXTURE_DIR")"
 scaffold() { bash "$SCRIPT_DIR/smoke-run-scaffold.sh" "$@"; }
@@ -55,6 +76,15 @@ SMOKE_CONTRACT_EXTRA="{\"sourceSha\":\"$OTHER_SHA\",\"requiredLaneMarkers\":[]}"
   scaffold contract "$FIXTURE_DIR" "$SHA" B1:browser S1:source --regenerate >/dev/null
 jq -e --arg sha "$SHA" '.sourceSha == $sha and (.requiredLaneMarkers | length == 2)' \
   "$FIXTURE_DIR/completion-contract.json" >/dev/null
+
+# Valid JSON with an invalid UTC timestamp is not a usable shared lease.
+jq '.expiresAt="not-a-timestamp"' "$SMOKE_GATE_LEASE_DIR/lease-$(basename "$FIXTURE_DIR").json" \
+  > "$SMOKE_GATE_LEASE_DIR/.bad-time"
+mv "$SMOKE_GATE_LEASE_DIR/.bad-time" "$SMOKE_GATE_LEASE_DIR/lease-$(basename "$FIXTURE_DIR").json"
+OUT="$(scaffold marker "$FIXTURE_DIR" B1 fail bad-time 2>&1 || true)"
+jq -e '.ok == false and (.error | test("missing or malformed|invalid UTC timestamp"))' <<<"$OUT" >/dev/null
+[ ! -e "$FIXTURE_DIR/markers/B1.json" ]
+gate_owns "$(basename "$FIXTURE_DIR")"
 
 if barrier "$FIXTURE_DIR" lanes >/dev/null 2>&1; then
   echo "expected missing markers to block the lanes phase" >&2
@@ -121,6 +151,64 @@ jq -e '.ok == false and (.error | test("SMOKE_GATE_STATE_DIR"))' <<<"$OUT" >/dev
   echo "expected an unverifiable gate claim to fail closed, got: $OUT" >&2; exit 1; }
 gate_owns "$(basename "$FIXTURE_DIR")"
 
+# Expiry/reclaim may preserve the published run id. A stale coordinator must
+# not adopt the successor's token from shared state or keep writing contract,
+# marker, or generation metadata under that same basename.
+STALE="$FIXTURE_BASE/stale-owner-run"
+mkdir -p "$STALE"
+gate_owns "$(basename "$STALE")" "$SHA" owner-a
+SMOKE_GATE_OWNER=owner-a scaffold contract "$STALE" "$SHA" B1:browser >/dev/null
+STALE_CONTRACT_SHA="$(sha256sum "$STALE/completion-contract.json" | cut -d' ' -f1)"
+gate_owns "$(basename "$STALE")" "$OTHER_SHA" owner-b
+for stale_verb in marker redispatch contract; do
+  case "$stale_verb" in
+    marker) OUT="$(SMOKE_GATE_OWNER=owner-a scaffold marker "$STALE" B1 fail stale 2>&1 || true)" ;;
+    redispatch) OUT="$(SMOKE_GATE_OWNER=owner-a scaffold redispatch "$STALE" B1 2>&1 || true)" ;;
+    contract) OUT="$(SMOKE_GATE_OWNER=owner-a scaffold contract "$STALE" "$SHA" B1:source --regenerate 2>&1 || true)" ;;
+  esac
+  jq -e '.ok == false and (.error | test("caller owner does not match"))' <<<"$OUT" >/dev/null || {
+    echo "expected stale owner $stale_verb to be refused, got: $OUT" >&2; exit 1; }
+done
+[ "$(sha256sum "$STALE/completion-contract.json" | cut -d' ' -f1)" = "$STALE_CONTRACT_SHA" ]
+[ ! -e "$STALE/markers/B1.json" ]
+# The successor cannot inherit A's contract. It explicitly regenerates the
+# same-SHA contract under B's token before any B marker can count.
+OUT="$(SMOKE_GATE_OWNER=owner-b scaffold marker "$STALE" B1 fail successor 2>&1 || true)"
+jq -e '.ok == false and (.error | test("different coordinator owner"))' <<<"$OUT" >/dev/null
+SMOKE_GATE_OWNER=owner-b scaffold contract "$STALE" "$OTHER_SHA" B1:browser --regenerate >/dev/null
+SMOKE_GATE_OWNER=owner-b scaffold marker "$STALE" B1 fail successor >/dev/null
+
+# Separate private state roots are the original failure shape: A's state still
+# names A while B has reclaimed the one shared lease. Shared validation must
+# stop A before it can alter either contract or marker.
+SEPARATE="$FIXTURE_BASE/separate-owner-run"
+SEP_A="$FIXTURE_BASE/state-a" SEP_B="$FIXTURE_BASE/state-b"
+mkdir -p "$SEPARATE" "$SEP_A" "$SEP_B"
+GATE_STATE="$SEP_A"; export SMOKE_GATE_STATE_DIR="$SEP_A"
+gate_owns "$(basename "$SEPARATE")" "$SHA" owner-a
+SMOKE_GATE_OWNER=owner-a scaffold contract "$SEPARATE" "$SHA" B1:browser >/dev/null
+SMOKE_GATE_OWNER=owner-a scaffold marker "$SEPARATE" B1 fail original >/dev/null
+SEP_CONTRACT_HASH="$(sha256sum "$SEPARATE/completion-contract.json" | cut -d' ' -f1)"
+SEP_MARKER_HASH="$(sha256sum "$SEPARATE/markers/B1.json" | cut -d' ' -f1)"
+GATE_STATE="$SEP_B"; export SMOKE_GATE_STATE_DIR="$SEP_B"
+gate_owns "$(basename "$SEPARATE")" "$OTHER_SHA" owner-b
+export SMOKE_GATE_STATE_DIR="$SEP_A"
+for stale_verb in marker redispatch contract; do
+  case "$stale_verb" in
+    marker) OUT="$(SMOKE_GATE_OWNER=owner-a scaffold marker "$SEPARATE" B1 fail stale 2>&1 || true)" ;;
+    redispatch) OUT="$(SMOKE_GATE_OWNER=owner-a scaffold redispatch "$SEPARATE" B1 2>&1 || true)" ;;
+    contract) OUT="$(SMOKE_GATE_OWNER=owner-a scaffold contract "$SEPARATE" "$SHA" B1:source --regenerate 2>&1 || true)" ;;
+  esac
+  jq -e '.ok == false and (.error | test("another owner|different coordinator|belongs to another"))' <<<"$OUT" >/dev/null || {
+    echo "expected separate-state stale owner $stale_verb to be refused, got: $OUT" >&2; exit 1; }
+done
+[ "$(sha256sum "$SEPARATE/completion-contract.json" | cut -d' ' -f1)" = "$SEP_CONTRACT_HASH" ]
+[ "$(sha256sum "$SEPARATE/markers/B1.json" | cut -d' ' -f1)" = "$SEP_MARKER_HASH" ]
+GATE_STATE="$FIXTURE_BASE/gate-state"; export SMOKE_GATE_STATE_DIR="$GATE_STATE"
+
+# Resume the ordinary fixture as its original owner.
+gate_owns "$(basename "$FIXTURE_DIR")"
+
 scaffold marker "$FIXTURE_DIR" B1 fail 'three P1 defects' 'screenshots/a.png,evidence/b.json' \
   | jq -e '.ok == true' >/dev/null
 scaffold marker "$FIXTURE_DIR" S1 completed 'wallet math deviates' >/dev/null
@@ -153,6 +241,7 @@ barrier "$FIXTURE_DIR" synthesis | jq -e '.ready == true' >/dev/null
 
 # Re-freezing on a new build must invalidate every marker bound to the old one,
 # rather than letting stale lanes vouch for a build they never touched.
+gate_owns "$(basename "$FIXTURE_DIR")" "$OTHER_SHA"
 scaffold contract "$FIXTURE_DIR" "$OTHER_SHA" B1:browser S1:source >/dev/null
 # The barrier exits non-zero when not ready, so capture before asserting —
 # under `pipefail` a direct pipe would fail the test on the exit code alone.

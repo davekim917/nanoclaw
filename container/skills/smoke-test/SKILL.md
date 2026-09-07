@@ -85,10 +85,17 @@ both:
    never waits on it.
 2. **The run must still hold the gate.** The scaffold reads
    `$SMOKE_GATE_STATE_DIR` and requires the run directory's basename to be some
-   state file's current `activeRunId`. A reclaim or a `--takeover` flips that
-   field and nothing else, so without this check a displaced coordinator keeps
-   writing markers into the run tree its successor is now using. Both variables
-   must therefore be in every dispatched worker's environment.
+   state file's current `activeRunId`. For a PR campaign it also requires the
+   live owner lease under the shared workgroup mount, and holds the shared PR
+   and run locks through the artifact write. Export the poll-provided
+   `coordinatorOwnerToken` as `SMOKE_GATE_OWNER` in the coordinator, every
+   native lane worker, and the later synthesis continuation. Never derive it
+   from mutable gate state. The completion contract binds the token so a stale
+   owner cannot write into the same run tree after a successor reclaims it.
+3. **The artifact SHA must still be the claimed SHA.** Contract, marker, and
+   redispatch writes compare the contract/source SHA with the active gate slot
+   while the ownership locks are held. A changed claim cannot inherit evidence
+   from the previous build.
 
 Before dispatch, the coordinator writes the contract with the frozen SHA and
 every lane it is committing to:
@@ -1527,8 +1534,9 @@ Same conventions as the develop gate otherwise: env-only config, jq-composed
 state, fail-closed on every fetch, one-line JSON stdout.
 
 Commands: `poll` (default), `check <pr>` (read-only, mirrors the develop
-gate's `check`), `claim <run-id> <pr> <sha>`, `progress <run-id>`,
-`release <run-id>`, `finish <sha> <run-id> <verdict>`. `progress`/`release`/
+gate's `check`), `claim <run-id> <pr> <sha> [owner-token]`,
+`progress <run-id> [owner-token]`, `release <run-id> [owner-token]`,
+`finish <sha> <run-id> <verdict> [owner-token]`. `progress`/`release`/
 `finish` take no PR argument — the gate recovers it by locating whichever
 PR's state currently holds that run id. That resolution is only unambiguous
 if run ids are unique across the whole gate, not just within one PR, so
@@ -1536,12 +1544,56 @@ if run ids are unique across the whole gate, not just within one PR, so
 *different* PR, so a caller-chosen id (from `claim`) is always safe to pass
 to `progress`/`release`/`finish` exactly like a gate-generated one.
 
+`poll` claims the shared coordinator lease before it emits
+`pr_build_settled`. Its payload includes `coordinatorOwnerToken`; treat that
+opaque value as part of the run identity. Pass it explicitly to every gate
+verb above and export it as `SMOKE_GATE_OWNER` for every
+`smoke-run-scaffold.sh` contract, marker, and redispatch writer. Native lane
+workers and the separate synthesis session receive the same token in their
+briefs. A caller must never copy `.activeLeaseOwner` from mutable PR state:
+after a reclaim that field names the successor, and adopting it would let a
+stale process impersonate the new owner.
+
+The shared lease lives under `/workspace/workgroup/qa-coordinator/leases`,
+separate from each container's private `SMOKE_GATE_STATE_DIR`. Missing,
+unmounted, aliased-to-private, malformed, unwritable, or un-lockable lease
+storage fails closed. `claim`, `progress`, `release`, `challenger-timeout`, and
+`finish` validate the caller token under shared locks. `finish` holds those
+locks across preview suspension, run/PR verdict receipts, promotion hold,
+publish record, ledger append, lease removal, and the terminal state commit;
+an expired predecessor therefore cannot publish after a successor reclaims.
+One shared per-PR binding points to the current run and owner while the run
+lease remains the only TTL authority. The lease also binds that run id to its
+PR, so the same owner token cannot reuse one live run id on a different PR.
+This prevents two private state roots
+from opening different live run IDs for the same PR; only an explicitly
+authorized `--takeover` may replace a live different-run binding.
+
+The default lease lasts 15 minutes. While a coordinator is actively running,
+call `progress <run-id> <owner-token>` at least every 10 minutes; a successful
+progress atomically renews only that live owner's lease. Do not wake an LLM
+only to heartbeat. When work yields to lanes or a later synthesis session and
+the lease expires, resume with the existing run id and token:
+
+```bash
+bash /workspace/agent/smoke-pr-gate.sh claim \
+  <run-id> <pr> <claimed-sha> <coordinator-owner-token>
+```
+
+That same-run claim safely reacquires an expired lease without a human. A
+different token may reclaim only after expiry; it must then regenerate the
+completion contract before writing markers. `lease-renew` and `lease-release`
+never revive or remove an expired lease. Explicit operator `--takeover`
+restrictions remain the only way to replace a still-active different run.
+The low-level compatibility verb is `lease-claim <run-id> <owner-token> <pr>`
+for a new lease. A same-owner renewal of an existing valid lease may omit the
+PR; it is inferred from the immutable lease binding and never changed.
+
 `claim` also refuses a *new* run id on a PR whose current run is still
 stamping `progress` — same PR and same frozen SHA included, which is precisely
 how a rival campaign once displaced a live coordinator. Only a human passing
-`--takeover`, and only once the active run is past
-`SMOKE_GATE_ACTIVE_STALE_SECONDS`, can override that; the success line then
-carries `tookOverFrom`. `poll` never takes over.
+the explicit `--takeover` flag can override that, at any age; the success line
+then carries `tookOverFrom`. `poll` never takes over.
 
 A PR settles when: it is open and carries `SMOKE_GATE_LABEL` (default
 `render-preview`); its backend preview exists, is `live`, and its deploy
