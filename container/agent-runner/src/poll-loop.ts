@@ -661,23 +661,19 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     applyChatBudget(keep);
     const flagBatch = applyFlagBatch(keep, routing, config.providerName);
-    let effectiveModel = flagBatch.model;
-    let effectiveEffort = flagBatch.effort;
+    const effectiveModel = flagBatch.model;
+    const effectiveEffort = flagBatch.effort;
     const effectiveUltracode = flagBatch.ultracode;
     const effectiveFast = flagBatch.fast;
 
-    // Scheduled-task default (Claude only): an unpinned scheduled-task fire
-    // runs on Sonnet at xhigh effort, independent of any interactive sticky
-    // model — the task's OWN -m/-e (its stored flagIntent) is the only thing
-    // that overrides it. Interactive chat keeps its Opus default. Codex and
-    // opencode manage their own task defaults (gpt-5.6-sol/high, model-native).
-    if (config.providerName === 'claude') {
-      const task = taskWakeIntent(keep);
-      if (task.isPureTaskWake) {
-        if (!task.turnModel) effectiveModel = 'sonnet';
-        if (!task.turnEffort) effectiveEffort = 'xhigh';
-      }
-    }
+    // NOTE: a scheduled task has NO default of its own. An unpinned task wake
+    // resolves exactly like interactive chat — the group's configured model and
+    // effort, or the provider's own default when the group sets none. Until
+    // 2026-09-07 a Claude-only branch here forced an unpinned pure task wake
+    // onto sonnet/xhigh, which meant "scheduled" silently implied "cheaper and
+    // differently tuned than the same agent answering in chat". Its own pin
+    // (`flagIntent`, applied by applyFlagBatch above) is the only thing that
+    // moves a task off the group default, and that is deliberate.
 
     // Format messages: passthrough commands get raw text (only if the
     // provider natively handles slash commands), others get XML.
@@ -2727,35 +2723,4 @@ export function applyFlagBatch(
   const fast = providerName === 'codex' ? (intent?.turnFast ?? getStickyFast() ?? false) : false;
 
   return { model, effort, ultracode, fast };
-}
-
-// A scheduled-task wake is a batch driven purely by kind='task' rows with no
-// interactive chat riding along. Returns the task's own per-fire model/effort
-// (its stored flagIntent) so the caller can apply the scheduled-task default
-// only when the task itself didn't pin one — and skip the default entirely for
-// a mixed chat+task turn (don't downgrade a chat turn a task coincided with).
-function taskWakeIntent(messages: MessageInRow[]): {
-  isPureTaskWake: boolean;
-  turnModel?: string;
-  turnEffort?: string;
-} {
-  let hasTask = false;
-  let hasChat = false;
-  let turnModel: string | undefined;
-  let turnEffort: string | undefined;
-  for (const m of messages) {
-    if (m.kind === 'task') {
-      hasTask = true;
-      try {
-        const fi = (JSON.parse(m.content) as { flagIntent?: FlagIntent }).flagIntent;
-        if (fi?.turnModel) turnModel = fi.turnModel;
-        if (fi?.turnEffort) turnEffort = fi.turnEffort;
-      } catch {
-        // malformed content row — treat as unpinned
-      }
-    } else if (m.kind === 'chat' || m.kind === 'chat-sdk') {
-      hasChat = true;
-    }
-  }
-  return { isPureTaskWake: hasTask && !hasChat, turnModel, turnEffort };
 }

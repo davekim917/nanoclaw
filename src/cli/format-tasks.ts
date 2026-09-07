@@ -18,9 +18,24 @@ interface TaskListRow {
   log?: string | null;
   created_at?: string | null;
   prompt?: string | null;
+  /** Per-fire pins. Rendered because an operator told to fix a pin has to be
+   *  able to SEE it — the --json path is not where `ncl tasks list` is read. */
+  model_pin?: string | null;
+  effort_pin?: string | null;
 }
 
-const COLS = ['SERIES', 'SCHEDULE', 'RUNS', 'FAILED', 'LAST RUN', 'NEXT RUN', 'STATUS', 'AGE', 'PROMPT'] as const;
+const COLS = [
+  'SERIES',
+  'SCHEDULE',
+  'RUNS',
+  'FAILED',
+  'LAST RUN',
+  'NEXT RUN',
+  'STATUS',
+  'PIN',
+  'AGE',
+  'PROMPT',
+] as const;
 
 function parseMs(iso: string): number {
   return Date.parse(/[Z+]|[+-]\d\d:\d\d$/.test(iso) ? iso : iso + 'Z');
@@ -56,6 +71,17 @@ function age(iso: string | null | undefined, now: number): string {
   return Number.isNaN(t) ? '-' : duration(now - t);
 }
 
+/**
+ * The per-fire pin as one cell: `model@effort`, either half alone, `-` when
+ * unpinned. Compact on purpose — two more columns would push PROMPT off an
+ * 80-column terminal, and the pin is read as one thing.
+ */
+function pin(model: string | null | undefined, effort: string | null | undefined): string {
+  if (!model && !effort) return '-';
+  if (model && effort) return `${model}@${effort}`;
+  return model ?? `@${effort}`;
+}
+
 function clip(s: string | null | undefined, n: number): string {
   const v = (s ?? '').replace(/\s+/g, ' ').trim();
   return v.length > n ? v.slice(0, n - 1) + '…' : v;
@@ -71,6 +97,7 @@ export function formatTasksTable(rows: TaskListRow[], now: number = Date.now()):
     lastRun(r.last_run, now),
     nextRun(r.next_run, now),
     r.status ?? '-',
+    pin(r.model_pin, r.effort_pin),
     age(r.created_at, now),
     clip(r.prompt, 40),
   ]);

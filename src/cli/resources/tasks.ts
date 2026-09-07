@@ -4,7 +4,8 @@ import { CronExpressionParser } from 'cron-parser';
 
 import { GROUPS_DIR, TIMEZONE } from '../../config.js';
 import { resolveGroupTimezone } from '../../container-config.js';
-import { getAgentGroup } from '../../db/agent-groups.js';
+import { getAgentGroup, getAllAgentGroups } from '../../db/agent-groups.js';
+import { getContainerConfig, resolveProviderName } from '../../db/container-configs.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import {
   findTaskSessions,
@@ -24,10 +25,11 @@ import {
   parseProcessAfter,
   validateRecurrence,
 } from '../../modules/scheduling/create.js';
-import { resolveTaskFlagIntent } from '../../modules/scheduling/task-flags.js';
-import { parseTaskContent } from '../../modules/scheduling/task-content.js';
+import { resolveTaskFlagIntent, validateTaskPin } from '../../modules/scheduling/task-flags.js';
+import { parseTaskContent, parseTaskPin } from '../../modules/scheduling/task-content.js';
 import { writeAudit } from '../../dashboard/api/scheduled-shared.js';
 import { resolveTaskSession, withExistingMailboxSession } from '../../session-manager.js';
+import { resolveEffectiveModel, vocabFor } from '../../flag-parser.js';
 import { registerResource } from '../crud.js';
 import { appendRunLog } from '../../modules/scheduling/run-log.js';
 import { formatTasksTable } from '../format-tasks.js';
@@ -232,6 +234,7 @@ function withInbound<T>(session: ScopedSession, fn: (mailbox: NanoclawMailboxSes
 
 function toOutput(session: ScopedSession, row: TaskRow) {
   const content = parseTaskContent(row.content);
+  const pin = parseTaskPin(row.content);
   return {
     agent_group_id: session.agent_group_id,
     session_id: session.id,
@@ -245,6 +248,11 @@ function toOutput(session: ScopedSession, row: TaskRow) {
     script_host: content.scriptHost ? 1 : 0,
     thread_anchor: content.threadAnchor ? 1 : 0,
     origin_session_id: content.originSessionId, // which session created the task (null for CLI-created)
+    // The per-fire pin, EXACTLY as stored. Until this landed, `ncl tasks` had
+    // no way to show an operator what a series was pinned to — which is half
+    // of why a stranded `gpt-6-astra` pin survived 21 failed fires unnoticed.
+    model_pin: pin.model,
+    effort_pin: pin.effort,
     created_at: row.timestamp,
     tries: row.tries,
     // Where an unaddressed reply lands on fire; null = discarded (isolated).
@@ -862,6 +870,391 @@ async function runTaskCommand(args: Record<string, unknown>, ctx: CallerContext)
   throw new Error(`task not found: ${id}`);
 }
 
+/**
+ * `ncl tasks repin` — retarget per-fire pins in bulk.
+ *
+ * The operator case is "a new model shipped; move everything pinned to the old
+ * one" and, harder, "I am migrating this group's provider and every pin has to
+ * move first". The second is why `--target-provider` exists: a pin is
+ * validated against the group's CURRENT provider, so re-pinning a codex group's
+ * tasks to a claude model ahead of the switch would be rejected by the very
+ * check that is supposed to protect them. `--target-provider` says "validate
+ * against the provider this group is about to become".
+ *
+ * MATCHING IS LITERAL by default. The fleet stores both `sonnet` (family alias
+ * — deliberately tracks the install default across future bumps) and
+ * `claude-sonnet-5` (frozen id) as pins for the same intent, and rewriting the
+ * first is not the same act as rewriting the second: it converts a floating
+ * choice into a frozen one. So `--from-model sonnet` hits only the literal
+ * `sonnet` pins, `--match-resolved` unifies the two, and either way the report
+ * lists the near-misses (same resolved model, different literal pin) so a
+ * conservative default can never read as "there was nothing else".
+ *
+ * ALL-OR-NOTHING by default: every match is validated before the first write,
+ * and one invalid target aborts the whole run rather than leaving half the
+ * fleet re-pinned. `--skip-invalid` applies the valid subset instead.
+ */
+interface RepinCandidate {
+  session: ScopedSession;
+  seriesId: string;
+  status: string;
+  current: { model: string | null; effort: string | null };
+  /** What the operator asked for, verbatim — may be an alias (`astra`). */
+  next: { model?: string; effort?: string };
+  /**
+   * What actually gets written: the validator's RESOLVED values, for the axes
+   * the operator set. Filled during validation, because the resolution and the
+   * acceptance are one act — `astra` is accepted only BECAUSE it resolves to
+   * `gpt-6-astra`, so storing the raw alias would persist a value the check
+   * never approved. `codex.ts::resolveQueryModel` accepts only `gpt-*` and
+   * silently falls back otherwise, which is a wrong-model-forever fire with no
+   * error anywhere.
+   */
+  write: { model?: string; effort?: string };
+  matchedVia: 'literal' | 'resolved';
+}
+
+interface RepinRejection {
+  session_id: string;
+  series_id: string;
+  reason: string;
+}
+
+/**
+ * Does a stored pin match what the operator asked to move?
+ *
+ * `normalize` is applied UNCONDITIONALLY and is where an axis declares what
+ * counts as the same value written differently; `resolver` is the semantic
+ * widening that `--match-resolved` gates. The two are different questions:
+ * `XHIGH` and `xhigh` are one effort spelled two ways, while `sonnet` and
+ * `claude-sonnet-5` are two DIFFERENT pins that happen to resolve alike — the
+ * first tracks the install default across bumps, the second freezes it.
+ */
+/**
+ * Model resolution for MATCHING, in the vocabulary of the group whose task is
+ * being matched. `resolveEffectiveModel` only expands Claude family aliases, so
+ * using it everywhere meant `--from-model astra --match-resolved` found nothing
+ * on a codex group whose pin is stored as `gpt-6-astra` — the alias resolves in
+ * the codex vocabulary, not the claude one.
+ */
+function modelResolverFor(provider: string): (v: string) => string {
+  const vocab = vocabFor(provider);
+  return (v: string) => resolveEffectiveModel(vocab.resolveModel(v.trim()));
+}
+
+function pinMatches(
+  stored: string | null,
+  wanted: string | undefined,
+  normalize: (v: string) => string,
+  resolver: (v: string) => string,
+  matchResolved: boolean,
+): 'literal' | 'resolved' | null {
+  if (wanted === undefined) return 'literal'; // no constraint on this axis
+  if (stored === null) return null;
+  if (normalize(stored) === normalize(wanted)) return 'literal';
+  if (matchResolved && resolver(stored) === resolver(wanted)) return 'resolved';
+  return null;
+}
+
+/** Model ids are case-sensitive; only surrounding whitespace is noise. */
+function modelLiteral(v: string): string {
+  return v.trim();
+}
+
+/**
+ * Effort has no alias layer and no case significance — `XHIGH` IS `xhigh`, so
+ * matching it is normalization, not the semantic widening `--match-resolved`
+ * gates. Documented as a case-insensitive compare; this is what makes that true.
+ */
+function effortIdentity(v: string): string {
+  return v.trim().toLowerCase();
+}
+
+/**
+ * The sessions a repin run walks.
+ *
+ * `--session` and `--group` defer to `selectedSessions` (which already narrows
+ * a group to its task-system sessions). A fleet-wide run does NOT: the
+ * unscoped `selectedSessions` fallback is every ACTIVE session on the host,
+ * which is hundreds of mailbox opens for a handful of task rows, and mailbox
+ * churn at that scale is a known way to stall the sweep. Every task series
+ * lives in its own task-system session, so fanning out over `findTaskSessions`
+ * per group reaches the same rows — and exactly the population `auditTaskPins`
+ * reports, which is what makes the audit's suggested remedy actually apply.
+ */
+async function repinSessions(args: Record<string, unknown>, ctx: CallerContext): Promise<ScopedSession[]> {
+  // The cross-group `--session` refusal lives in `selectedSessions` itself, so
+  // every caller inherits it — including this one. Deliberately NOT repeated
+  // here: a second copy of an invariant one layer down is how the two drift.
+  if (str(args.session) || groupArg(args, ctx)) return selectedSessions(args, ctx);
+  const sessions: ScopedSession[] = [];
+  for (const group of await getAllAgentGroups()) {
+    sessions.push(...(await findTaskSessions(group.id)).map((s) => ({ id: s.id, agent_group_id: s.agent_group_id })));
+  }
+  return sessions;
+}
+
+/**
+ * ── CONTRADICTORY-INPUT REFUSALS ──
+ *
+ * One defect class, found five times in this file: TWO INPUTS THAT CANNOT BOTH
+ * BE TRUE, RECONCILED BY SILENTLY CHOOSING ONE INSTEAD OF REFUSING. Silently
+ * picking a winner is indefensible because BOTH readings are plausible to the
+ * caller, so whichever the code drops was — half the time — the one that was
+ * meant, and the command reports success either way.
+ *
+ * The two refusals below are the ones `repin` owns:
+ *   `--target-provider` with `--all` — validated the whole fleet against one
+ *     group's FUTURE provider, writing claude ids onto codex/opencode series;
+ *   `--group` with `--all` — contradictory scopes, silently narrowed;
+ *   `--all` with `--session` — `--all` says fleet-wide, `--session` says one
+ *     session, and the session silently won.
+ *
+ * A sharper sub-shape, and the reason `suppliedFlag` is used below rather than
+ * `str`: A GUARD DEFEATED BY ITS OWN PRESENCE TEST. `str('')` is `undefined`,
+ * so `--group ""` read as "no group supplied" and the contradiction guards
+ * never fired — silently widening a scoped repin to fleet-wide.
+ *
+ * The rest of the class lives elsewhere, deliberately not duplicated here:
+ *   `--group A --session <B's>` — fixed in `selectedSessions` (#567), which
+ *     every verb in this file inherits, this one included;
+ *   `cancel --id X --all` — dropped the id and cancelled everything in scope;
+ *     owned by its own single-purpose change;
+ *   `create --isolated --thread` — silently prefers `--isolated`. Documented,
+ *     not patched: it is non-destructive and fails safe toward the NARROWER
+ *     option, so refusing would cost more than it buys.
+ */
+async function repinTasks(args: Record<string, unknown>, ctx: CallerContext) {
+  // `suppliedFlag`, not `str`: `str('')` is `undefined`, so an empty flag reads
+  // as ABSENT and skips the guard written to catch it. On this verb that fails
+  // OPEN — `--group "" --all` and `--all --session ""` both silently widen a
+  // scoped repin to fleet-wide. One helper, shared with every other verb here.
+  const fromModel = suppliedFlag(args, 'from_model', '--from-model');
+  const toModel = suppliedFlag(args, 'to_model', '--to-model');
+  const fromEffort = suppliedFlag(args, 'from_effort', '--from-effort');
+  const toEffort = suppliedFlag(args, 'to_effort', '--to-effort');
+  if (!toModel && !toEffort) {
+    throw new Error('nothing to set — pass --to-model and/or --to-effort');
+  }
+  if (toModel && !fromModel) throw new Error('--to-model requires --from-model (repin retargets an existing pin)');
+  if (toEffort && !fromEffort) throw new Error('--to-effort requires --from-effort (repin retargets an existing pin)');
+
+  const group = groupArg(args, ctx);
+  const sessionId = suppliedFlag(args, 'session', '--session');
+  if (!group && !sessionId && !bool(args.all)) {
+    throw new Error('a scope is required: --group <id>, --session <id>, or --all for fleet-wide');
+  }
+  if (group && bool(args.all)) {
+    throw new Error('--group and --all are contradictory scopes; pass one or the other');
+  }
+  if (bool(args.all) && sessionId !== undefined) {
+    throw new Error(
+      '--all and --session are contradictory scopes: --all is fleet-wide, --session is one session. ' +
+        '--session alone is already a complete scope.',
+    );
+  }
+  const targetProvider = suppliedFlag(args, 'target_provider', '--target-provider');
+  // `--target-provider` describes ONE group's migration — it is the answer to
+  // "what will this group's provider be after the switch". Applied fleet-wide
+  // it validates every group against a provider only one of them is moving to,
+  // so `--all --target-provider claude` would write claude model ids onto codex
+  // and opencode series and report success: the exact stranded-pin condition
+  // this PR exists to prevent, manufactured by the tool built to remedy it.
+  if (targetProvider && !group) {
+    throw new Error(
+      '--target-provider requires --group: it names the provider ONE group is migrating to, ' +
+        'and applying it fleet-wide would validate every group against a provider it is not moving to.',
+    );
+  }
+  const matchResolved = bool(args.match_resolved);
+  const dryRun = bool(args.dry_run);
+  const skipInvalid = bool(args.skip_invalid);
+
+  // One provider read per group, not per task: the fan-out below can span
+  // every group on the host and each lookup is a central-DB round trip.
+  // TWO providers, for two different questions, and conflating them broke both
+  // halves of a migration repin:
+  //
+  //   MATCHING asks "what vocabulary was this stored pin WRITTEN in" — always
+  //     the group's CURRENT provider. Resolving `astra` with claude's tables
+  //     because the group is moving to claude finds nothing, since the stored
+  //     value is `gpt-6-astra` in codex's.
+  //   VALIDATION asks "will the new value RUN" — the target provider when one
+  //     is given, because that is the whole point of re-pinning before a switch.
+  const providerCache = new Map<string, string>();
+  const currentProviderFor = async (agentGroupId: string): Promise<string> => {
+    const cached = providerCache.get(agentGroupId);
+    if (cached) return cached;
+    const resolved = resolveProviderName(null, (await getContainerConfig(agentGroupId))?.provider);
+    providerCache.set(agentGroupId, resolved);
+    return resolved;
+  };
+  const validationProviderFor = async (agentGroupId: string): Promise<string> =>
+    targetProvider ?? currentProviderFor(agentGroupId);
+
+  const candidates: RepinCandidate[] = [];
+  const nearMisses: Array<{ session_id: string; series_id: string; model: string | null; effort: string | null }> = [];
+
+  for (const session of await repinSessions(args, ctx)) {
+    const rows =
+      (await withInbound(session, (mailbox) =>
+        mailbox.listCliTaskSeries().map((row) => ({
+          seriesId: row.series_id ?? row.row_id,
+          status: row.status,
+          pin: parseTaskPin(row.content),
+        })),
+      )) ?? [];
+    for (const row of rows) {
+      const resolveModel = modelResolverFor(await currentProviderFor(session.agent_group_id));
+      const modelHit = pinMatches(row.pin.model, fromModel, modelLiteral, resolveModel, matchResolved);
+      const effortHit = pinMatches(row.pin.effort, fromEffort, effortIdentity, effortIdentity, matchResolved);
+      if (modelHit === null || effortHit === null) {
+        // Would this have matched if --match-resolved were on? Report it, so a
+        // conservative literal match never silently looks exhaustive.
+        const asResolvedModel = pinMatches(row.pin.model, fromModel, modelLiteral, resolveModel, true);
+        const asResolvedEffort = pinMatches(row.pin.effort, fromEffort, effortIdentity, effortIdentity, true);
+        if (!matchResolved && asResolvedModel !== null && asResolvedEffort !== null) {
+          nearMisses.push({
+            session_id: session.id,
+            series_id: row.seriesId,
+            model: row.pin.model,
+            effort: row.pin.effort,
+          });
+        }
+        continue;
+      }
+      const next: { model?: string; effort?: string } = {};
+      if (toModel) next.model = toModel;
+      if (toEffort) next.effort = toEffort;
+      candidates.push({
+        session,
+        seriesId: row.seriesId,
+        status: row.status,
+        current: row.pin,
+        next,
+        write: {},
+        matchedVia: modelHit === 'resolved' || effortHit === 'resolved' ? 'resolved' : 'literal',
+      });
+    }
+  }
+
+  // Validate EVERY match before writing anything. The target is checked against
+  // each candidate's OWN group provider (a fleet-wide run spans providers), or
+  // against --target-provider when re-pinning ahead of a migration.
+  //
+  // Validate the MERGED pin, not the delta. `updateTask` merges flagIntent, so
+  // a model-only repin leaves the existing effort in place: a codex task at
+  // {gpt-6-astra, ultra} repinned to a Claude model would store
+  // {claude-…, ultra}, which is still invalid for Claude. Validating only the
+  // half being written reports success and leaves the series broken — and it
+  // breaks the one workflow this command exists for, because the provider
+  // migration it was meant to unblock stays blocked.
+  const rejected: RepinRejection[] = [];
+  const applicable: RepinCandidate[] = [];
+  for (const candidate of candidates) {
+    const provider = await validationProviderFor(candidate.session.agent_group_id);
+    const merged = {
+      model: candidate.next.model ?? candidate.current.model,
+      effort: candidate.next.effort ?? candidate.current.effort,
+    };
+    const { flagIntent, error } = validateTaskPin(merged, provider);
+    if (error) {
+      rejected.push({ session_id: candidate.session.id, series_id: candidate.seriesId, reason: error });
+      continue;
+    }
+    // Persist the RESOLVED value, but ONLY for the axis the operator asked to
+    // change. Writing the resolved form of an untouched axis would rewrite a
+    // pin nobody asked to rewrite — the exact thing this whole change exists
+    // to prevent (`sonnet` quietly becoming `claude-sonnet-5`).
+    // NO `?? candidate.next.*` fallback. That would persist the operator's raw
+    // request when the validator returned something different — which is the
+    // very defect this loop was added to fix, reintroduced one line later.
+    // `validateTaskPin` now rejects a dropped axis outright, so a requested
+    // axis always comes back resolved or not at all.
+    if (candidate.next.model !== undefined) candidate.write.model = flagIntent?.turnModel;
+    if (candidate.next.effort !== undefined) candidate.write.effort = flagIntent?.turnEffort;
+    applicable.push(candidate);
+  }
+
+  const report = (applied: number) => ({
+    matched: candidates.length,
+    applied,
+    rejected,
+    dry_run: dryRun,
+    match_resolved: matchResolved,
+    changes: candidates.map((c) => ({
+      agent_group_id: c.session.agent_group_id,
+      session_id: c.session.id,
+      series_id: c.seriesId,
+      status: c.status,
+      matched_via: c.matchedVia,
+      from: { model: c.current.model, effort: c.current.effort },
+      // Resolved, so a dry run shows the value that will actually be stored.
+      to: {
+        model: c.write.model ?? c.next.model ?? c.current.model,
+        effort: c.write.effort ?? c.next.effort ?? c.current.effort,
+      },
+    })),
+    // Series whose RESOLVED pin matches but whose literal pin does not. Left
+    // untouched by design; `--match-resolved` includes them.
+    near_misses: nearMisses,
+  });
+
+  if (rejected.length > 0 && !skipInvalid) {
+    throw new Error(
+      `refusing to re-pin: ${rejected.length} of ${candidates.length} matched series would get an invalid pin, ` +
+        `and a half-applied bulk re-pin is worse than none.\n` +
+        rejected.map((r) => `  ${r.series_id}: ${r.reason}`).join('\n') +
+        `\n\nFix the target value, pass --target-provider <provider> if you are re-pinning ahead of a provider ` +
+        `migration, or pass --skip-invalid to apply the ${applicable.length} valid change(s) and skip these.`,
+    );
+  }
+
+  if (dryRun) return report(0);
+
+  let applied = 0;
+  for (const candidate of applicable) {
+    const flagIntent: TaskUpdate['flagIntent'] = {};
+    if (candidate.write.model) flagIntent.turnModel = candidate.write.model;
+    if (candidate.write.effort) flagIntent.turnEffort = candidate.write.effort;
+    const n =
+      (await withInbound(candidate.session, (mailbox) =>
+        withCentralSync(() => {
+          // Same probe as every other mutating verb here (see the seam note):
+          // no row for this series in this session means no write and no
+          // invalidation is owed.
+          if (!mailbox.getCliTaskRow(candidate.seriesId)) return 0;
+          return withQuietInvalidationSync(candidate.session.id, () =>
+            mailbox.updateTask(candidate.seriesId, { flagIntent }),
+          );
+        }, 'ncl tasks repin'),
+      )) ?? 0;
+    if (n > 0) {
+      await writeAudit({
+        actor: actorFor(ctx),
+        action: 'update',
+        agentGroupId: candidate.session.agent_group_id,
+        sessionId: candidate.session.id,
+        seriesId: candidate.seriesId,
+        detail: {
+          repin: {
+            from: { model: candidate.current.model, effort: candidate.current.effort },
+            // `updateTask` MERGES, so an axis this run did not touch survives.
+            // Recording it as null would say the pin was cleared — a durable
+            // audit row that is wrong is worse than no row during an incident.
+            to: {
+              model: candidate.write.model ?? candidate.current.model,
+              effort: candidate.write.effort ?? candidate.current.effort,
+            },
+          },
+        },
+      });
+      applied += 1;
+    }
+  }
+  return report(applied);
+}
+
 registerResource({
   name: 'task',
   plural: 'tasks',
@@ -1141,6 +1534,66 @@ registerResource({
         },
       ],
       handler: async (args, ctx) => updateTaskCommand(args, ctx),
+    },
+    repin: {
+      access: 'approval',
+      // Host-only: a bulk pin rewrite is an operator act. An agent caller is
+      // already scoped to its own group by groupArg, but the blast radius of a
+      // wrong --from-model is every armed series it can see, and nothing about
+      // running a scheduled fire needs it.
+      hostOnly: true,
+      description:
+        'Retarget per-fire model/effort pins in bulk (e.g. move everything pinned to one model onto its successor). OPERATOR-ONLY.\n\n' +
+        'Matching is LITERAL: --from-model sonnet matches only pins stored as "sonnet", not "claude-sonnet-5". That is deliberate — the family alias tracks the install default across future bumps while the frozen id does not, so rewriting one is not the same act as rewriting the other. --match-resolved unifies them; either way the report lists near-misses (same resolved model, different literal pin) so a literal run never reads as exhaustive.\n\n' +
+        "Every match is validated against its own group's provider BEFORE the first write, and one invalid target aborts the whole run — a half-applied bulk re-pin is worse than none. --skip-invalid applies the valid subset instead.\n\n" +
+        'Re-pinning AHEAD of a provider migration needs --target-provider: pins are otherwise validated against the provider the group still has, which would reject every correct new value. That is the supported path out of a `groups config update --provider` refusal.\n\n' +
+        'Always --dry-run first.',
+      args: [
+        {
+          name: 'from_model',
+          type: 'string',
+          description: 'Match series whose stored model pin is exactly this (see --match-resolved).',
+        },
+        { name: 'to_model', type: 'string', description: 'New model pin. Requires --from-model.' },
+        {
+          name: 'from_effort',
+          type: 'string',
+          description: 'Match series whose stored effort pin is exactly this (case-insensitive).',
+        },
+        { name: 'to_effort', type: 'string', description: 'New effort pin. Requires --from-effort.' },
+        {
+          name: 'match_resolved',
+          type: 'boolean',
+          description:
+            'Also match pins that resolve to the same model (unifies the family alias "opus" with the frozen id "claude-opus-5[1m]"). Off by default: it converts a floating pin into a frozen one.',
+        },
+        {
+          name: 'target_provider',
+          type: 'string',
+          description:
+            "Validate the new pins against this provider instead of each group's current one. Use when re-pinning ahead of a `groups config update --provider` migration.",
+          enum: ['claude', 'codex', 'opencode'],
+        },
+        {
+          name: 'dry_run',
+          type: 'boolean',
+          description: 'Report what WOULD change (and what would be rejected) without writing anything.',
+        },
+        {
+          name: 'skip_invalid',
+          type: 'boolean',
+          description: 'Apply the valid subset instead of refusing the whole run when some targets are invalid.',
+        },
+        { name: 'group', type: 'string', description: 'Limit to one agent group id.' },
+        { name: 'all', type: 'boolean', description: 'Run fleet-wide across every group (required without --group).' },
+        { name: 'session', type: 'string', description: 'Limit to one task session id.' },
+      ],
+      examples: [
+        `# See what a model bump would touch, fleet-wide, before touching anything:\nncl tasks repin --all --from-model claude-opus-5[1m] --to-model claude-opus-5-1[1m] --dry-run`,
+        `# Fix an effort pin the target provider does not have (claude/codex xhigh -> opencode high):\nncl tasks repin --group ag-123 --target-provider opencode --from-effort xhigh --to-effort high`,
+        `# Clear the way for a codex -> claude migration, then run the switch:\nncl tasks repin --group ag-123 --target-provider claude --from-model gpt-6-astra --to-model claude-sonnet-5`,
+      ],
+      handler: async (args, ctx) => repinTasks(args, ctx),
     },
     cancel: {
       access: 'open',

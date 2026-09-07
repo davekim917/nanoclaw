@@ -26,10 +26,12 @@ import { writeSessionMessage } from '../../session-manager.js';
 import {
   ensureContainerConfig,
   getContainerConfig,
+  resolveProviderName,
   updateContainerConfigScalars,
   updateContainerConfigJson,
 } from '../../db/container-configs.js';
 import { getDeniedModel } from '../../db/denied-models.js';
+import { auditTaskPins, formatStrandedPins } from '../../modules/scheduling/pin-audit.js';
 import { assertValidGroupFolder, groupFolderExistsOnDisk } from '../../group-folder.js';
 import { log } from '../../log.js';
 import { canonicalizeIanaTimezone, timezoneRejectionReason } from '../../timezone.js';
@@ -488,7 +490,9 @@ registerResource({
         'Update container config fields. Changes are saved but do NOT take effect until you run `ncl groups restart`. ' +
         'Use --id <group-id> and scalar flags, or resource flags: --memory-request-mb, --memory-limit-mb, ' +
         '--memory-swap-limit-mb, --cpus, --cpu-shares, --pids-limit. ' +
-        '--timezone takes an IANA id like "Europe/Lisbon" ("" clears back to the install default). Tasks created or edited afterwards use the new zone; an already-armed occurrence keeps its absolute fire time and the series moves onto the new grid at its next re-arm. The container clock follows after a restart.',
+        '--timezone takes an IANA id like "Europe/Lisbon" ("" clears back to the install default). Tasks created or edited afterwards use the new zone; an already-armed occurrence keeps its absolute fire time and the series moves onto the new grid at its next re-arm. The container clock follows after a restart. ' +
+        '--provider REFUSES the switch when any armed scheduled-task pin would be invalid under the new provider (model/effort vocabularies do not nest: claude has ultracode, codex has ultra, opencode has neither and no xhigh). ' +
+        'Task pins are never rewritten for you and there is no --force: clear the refusal with `ncl tasks repin --target-provider <new>`, which validates against the provider you are moving TO and therefore works before the switch.',
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
@@ -564,6 +568,48 @@ registerResource({
                 (denied.reason ? ` Reason: ${denied.reason}` : '') +
                 `\n\nOperator can remove via: ncl denied-models remove --provider ${effectiveProvider} --slug ${updates.model}`,
             );
+          }
+        }
+
+        // Provider-migration pin audit (2026-09-07 incident). Pins are validated
+        // at CREATE time against the then-current provider and never
+        // re-validated at fire time, so a bare `--provider` switch strands
+        // every pin the new vocabulary rejects and the only symptom is a
+        // per-fire provider error nobody is watching for. REFUSE rather than
+        // warn: this verb already runs behind an approval gate, so a refusal is
+        // read and acted on, while a warning printed into a scrollback is
+        // precisely what produced a 14-hour outage. The audit never rewrites a
+        // pin — that is the operator's call, via `ncl tasks repin`, whose
+        // --target-provider makes the remedy reachable BEFORE the switch and is
+        // therefore what makes refusing safe rather than a wedge.
+        //
+        // Runs before any write, so a refusal leaves both stores untouched.
+        if (updates.provider !== undefined) {
+          // The provider this group ACTUALLY runs is `container.json` — the
+          // spawn path and the in-container runner read the file; the
+          // `container_configs` row is a read-side projection that can lag it
+          // (a DB-only edit, a restore, an older code path). Deciding "is this
+          // a migration?" from the projection means a group whose row already
+          // says `claude` while the file still says `codex` skips the audit
+          // entirely — and then this handler writes the file, performing the
+          // real runtime switch with every gpt-* pin carried into Claude
+          // unexamined. The audit exists to tell an operator the truth before a
+          // switch; reading a non-authoritative source makes it answer for a
+          // group that isn't the one being changed.
+          const fileProvider = readContainerConfig(group.folder)?.provider;
+          const fromProvider = resolveProviderName(null, fileProvider ?? row.provider);
+          const toProvider = resolveProviderName(null, updates.provider);
+          if (fromProvider !== toProvider) {
+            const stranded = await auditTaskPins(id, toProvider);
+            if (stranded.length > 0) {
+              log.warn('Refused provider switch: armed task pins would be invalid', {
+                agentGroupId: id,
+                fromProvider,
+                toProvider,
+                stranded: stranded.map((p) => ({ seriesId: p.seriesId, model: p.model, effort: p.effort })),
+              });
+              throw new Error(formatStrandedPins(stranded, id, fromProvider, toProvider));
+            }
           }
         }
 
