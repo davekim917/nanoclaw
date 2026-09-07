@@ -16,16 +16,12 @@ import {
   computeSeriesStats,
   countRecentErrorLines,
   scanBannedPatterns,
-  checkContainerBytes,
-  checkTrunkDocBytes,
-  checkGroupStandingBytes,
-  checkEffectiveStackBytes,
+  checkContainerPatterns,
+  checkTrunkDocPatterns,
+  checkGroupStandingPatterns,
+  checkEffectiveStackSafety,
   checkInstructionStack,
   instructionStackBreachKind,
-  CONTAINER_BYTES_CEILING,
-  TRUNK_DOC_BYTES_CEILING,
-  GROUP_STANDING_BYTES_CEILING,
-  EFFECTIVE_STACK_BYTES_CEILING,
 } from './fleet-drift.js';
 
 /** Mirrors src/log.ts's `ts()` — local wall-clock, not UTC. Kept TZ-agnostic by building both the log
@@ -309,7 +305,7 @@ describe('advancePauseState', () => {
 // ────────────────────── L4: instruction-stack tripwire ─────────────────────
 // docs/specs/instruction-stack-prune/plan.md
 
-/** Pure-ASCII filler so byte length == character length; lets fixtures hit exact sizes via slice(). */
+/** Pattern-clean filler prose of a requested length (pure ASCII, so length == byte length). */
 function cleanContent(bytes: number): string {
   const line = 'This is a timeless standing rule with no dates or references.\n';
   let out = '';
@@ -338,7 +334,7 @@ describe('scanBannedPatterns', () => {
   });
 });
 
-describe('checkContainerBytes', () => {
+describe('checkContainerPatterns', () => {
   const TMP = uniqueTmpRoot('fleet-drift-container-test');
   const containerPath = () => path.join(TMP, 'CLAUDE.md');
 
@@ -348,28 +344,22 @@ describe('checkContainerBytes', () => {
   });
   afterEach(() => fs.rmSync(TMP, { recursive: true, force: true }));
 
-  it('passes a clean file under the ceiling', () => {
-    fs.writeFileSync(containerPath(), cleanContent(5000));
-    expect(checkContainerBytes(containerPath())).toBeNull();
+  // Length is deliberately not a signal: a long file of timeless rules is clean.
+  it('passes a clean file however long it is', () => {
+    fs.writeFileSync(containerPath(), cleanContent(60_000));
+    expect(checkContainerPatterns(containerPath())).toBeNull();
   });
 
-  it('flags a ceiling breach independently of any banned pattern', () => {
-    fs.writeFileSync(containerPath(), cleanContent(CONTAINER_BYTES_CEILING + 500));
-    const breach = checkContainerBytes(containerPath());
-    expect(breach?.metric).toBe('containerBytes');
-    expect(breach?.overCeiling).toBe(true);
-    expect(breach?.bannedHits).toEqual([]);
-  });
-
-  it('flags a banned pattern even under the ceiling', () => {
+  it('flags a banned pattern in a file of any size', () => {
     fs.writeFileSync(containerPath(), 'Fixed on 2026-08-31.\n');
-    const breach = checkContainerBytes(containerPath());
-    expect(breach?.overCeiling).toBe(false);
+    const breach = checkContainerPatterns(containerPath());
+    expect(breach?.metric).toBe('container');
+    expect(breach?.scope).toBe('container/CLAUDE.md');
     expect(breach?.bannedHits[0].patterns).toContain('iso_date');
   });
 });
 
-describe('checkTrunkDocBytes', () => {
+describe('checkTrunkDocPatterns', () => {
   const TMP = uniqueTmpRoot('fleet-drift-trunk-doc-test');
   const trunkPath = () => path.join(TMP, 'CLAUDE.md');
 
@@ -379,28 +369,21 @@ describe('checkTrunkDocBytes', () => {
   });
   afterEach(() => fs.rmSync(TMP, { recursive: true, force: true }));
 
-  it('passes a clean file under the ceiling', () => {
-    fs.writeFileSync(trunkPath(), cleanContent(5000));
-    expect(checkTrunkDocBytes(trunkPath())).toBeNull();
+  it('passes a clean file however long it is', () => {
+    fs.writeFileSync(trunkPath(), cleanContent(60_000));
+    expect(checkTrunkDocPatterns(trunkPath())).toBeNull();
   });
 
-  it('flags a ceiling breach independently of any banned pattern', () => {
-    fs.writeFileSync(trunkPath(), cleanContent(TRUNK_DOC_BYTES_CEILING + 500));
-    const breach = checkTrunkDocBytes(trunkPath());
-    expect(breach?.metric).toBe('trunkDocBytes');
-    expect(breach?.overCeiling).toBe(true);
-    expect(breach?.bannedHits).toEqual([]);
-  });
-
-  it('flags a banned pattern even under the ceiling', () => {
+  it('flags a banned pattern in a file of any size', () => {
     fs.writeFileSync(trunkPath(), 'Fixed on 2026-08-31.\n');
-    const breach = checkTrunkDocBytes(trunkPath());
-    expect(breach?.overCeiling).toBe(false);
+    const breach = checkTrunkDocPatterns(trunkPath());
+    expect(breach?.metric).toBe('trunkDoc');
+    expect(breach?.scope).toBe('CLAUDE.md');
     expect(breach?.bannedHits[0].patterns).toContain('iso_date');
   });
 });
 
-describe('checkGroupStandingBytes', () => {
+describe('checkGroupStandingPatterns', () => {
   const TMP = uniqueTmpRoot('fleet-drift-group-standing-test');
   const groupsRoot = () => path.join(TMP, 'groups');
 
@@ -410,29 +393,20 @@ describe('checkGroupStandingBytes', () => {
   });
   afterEach(() => fs.rmSync(TMP, { recursive: true, force: true }));
 
-  it('passes a clean group under the ceiling', () => {
+  // Length is deliberately not a signal: a long standing file of timeless rules is clean.
+  it('passes a clean group however long its standing files are', () => {
     const g = path.join(groupsRoot(), 'clean-group');
     fs.mkdirSync(g, { recursive: true });
-    fs.writeFileSync(path.join(g, 'standing-instructions.md'), cleanContent(2000));
-    fs.writeFileSync(path.join(g, 'CLAUDE.local.md'), cleanContent(500));
-    expect(checkGroupStandingBytes(groupsRoot())).toEqual([]);
-  });
-
-  it('flags a ceiling breach for one group', () => {
-    const g = path.join(groupsRoot(), 'big-group');
-    fs.mkdirSync(g, { recursive: true });
-    fs.writeFileSync(path.join(g, 'standing-instructions.md'), cleanContent(GROUP_STANDING_BYTES_CEILING + 1000));
-    const breaches = checkGroupStandingBytes(groupsRoot());
-    expect(breaches).toHaveLength(1);
-    expect(breaches[0].scope).toBe('big-group');
-    expect(breaches[0].overCeiling).toBe(true);
+    fs.writeFileSync(path.join(g, 'standing-instructions.md'), cleanContent(40_000));
+    fs.writeFileSync(path.join(g, 'CLAUDE.local.md'), cleanContent(20_000));
+    expect(checkGroupStandingPatterns(groupsRoot())).toEqual([]);
   });
 
   it('flags an ISO date in a group standing file', () => {
     const g = path.join(groupsRoot(), 'dated-group');
     fs.mkdirSync(g, { recursive: true });
     fs.writeFileSync(path.join(g, 'standing-instructions.md'), 'Fixed on 2026-08-31 during triage.\n');
-    const breaches = checkGroupStandingBytes(groupsRoot());
+    const breaches = checkGroupStandingPatterns(groupsRoot());
     expect(breaches).toHaveLength(1);
     expect(breaches[0].bannedHits[0].patterns).toContain('iso_date');
   });
@@ -441,7 +415,7 @@ describe('checkGroupStandingBytes', () => {
     const g = path.join(groupsRoot(), 'ref-group');
     fs.mkdirSync(g, { recursive: true });
     fs.writeFileSync(path.join(g, 'CLAUDE.local.md'), 'Root-caused in #123.\n');
-    const breaches = checkGroupStandingBytes(groupsRoot());
+    const breaches = checkGroupStandingPatterns(groupsRoot());
     expect(breaches[0].bannedHits[0].patterns).toContain('issue_or_pr_ref');
   });
 
@@ -449,7 +423,7 @@ describe('checkGroupStandingBytes', () => {
     const g = path.join(groupsRoot(), 'focus-group');
     fs.mkdirSync(g, { recursive: true });
     fs.writeFileSync(path.join(g, 'standing-instructions.md'), '## Current Focus\n\nShip it.\n');
-    const breaches = checkGroupStandingBytes(groupsRoot());
+    const breaches = checkGroupStandingPatterns(groupsRoot());
     expect(breaches[0].bannedHits[0].patterns).toContain('current_focus_header');
   });
 
@@ -460,7 +434,7 @@ describe('checkGroupStandingBytes', () => {
     fs.mkdirSync(dated, { recursive: true });
     fs.writeFileSync(path.join(clean, 'standing-instructions.md'), cleanContent(1000));
     fs.writeFileSync(path.join(dated, 'standing-instructions.md'), 'Fixed on 2026-08-31.\n');
-    const breaches = checkGroupStandingBytes(groupsRoot());
+    const breaches = checkGroupStandingPatterns(groupsRoot());
     expect(breaches.map((b) => b.scope)).toEqual(['dated-group']);
   });
 
@@ -474,7 +448,7 @@ describe('checkGroupStandingBytes', () => {
     fs.symlinkSync(path.join(source, 'standing-instructions.md'), path.join(sibling, 'standing-instructions.md'));
     fs.symlinkSync(path.join(source, 'CLAUDE.local.md'), path.join(sibling, 'CLAUDE.local.md'));
 
-    const breaches = checkGroupStandingBytes(groupsRoot());
+    const breaches = checkGroupStandingPatterns(groupsRoot());
     // One breach entry covering both sibling names, not two duplicate entries for the same underlying file.
     expect(breaches).toHaveLength(1);
     expect(breaches[0].scope).toBe('acme, acme-codex');
@@ -482,7 +456,7 @@ describe('checkGroupStandingBytes', () => {
   });
 
   it('returns empty when the groups root does not exist (e.g. a worktree without the groups checkout)', () => {
-    expect(checkGroupStandingBytes(path.join(TMP, 'does-not-exist'))).toEqual([]);
+    expect(checkGroupStandingPatterns(path.join(TMP, 'does-not-exist'))).toEqual([]);
   });
 
   // P2 regression: a normal clone shares only SOME standing files (a common
@@ -500,7 +474,7 @@ describe('checkGroupStandingBytes', () => {
     fs.writeFileSync(path.join(groupA, 'CLAUDE.local.md'), 'Root-caused in #123.\n'); // shared, real
     fs.symlinkSync(path.join(groupA, 'CLAUDE.local.md'), path.join(groupB, 'CLAUDE.local.md')); // shared, symlink
 
-    const breaches = checkGroupStandingBytes(groupsRoot());
+    const breaches = checkGroupStandingPatterns(groupsRoot());
     const patternBreaches = breaches.filter((b) => b.bannedHits.length > 0);
     expect(patternBreaches).toHaveLength(1); // not one per cluster
     expect(patternBreaches[0].scope).toBe('group-a, group-b');
@@ -508,25 +482,20 @@ describe('checkGroupStandingBytes', () => {
     expect(patternBreaches[0].bannedHits[0].patterns).toContain('issue_or_pr_ref');
   });
 
-  it('a full-cluster ceiling breach and a banned-pattern hit on the same shared file are two distinct breach entries, not merged or colliding', () => {
-    const source = path.join(groupsRoot(), 'dup-source');
-    const sibling = path.join(groupsRoot(), 'dup-sibling');
-    fs.mkdirSync(source, { recursive: true });
-    fs.mkdirSync(sibling, { recursive: true });
-    fs.writeFileSync(
-      path.join(source, 'standing-instructions.md'),
-      `${cleanContent(GROUP_STANDING_BYTES_CEILING + 500)}Fixed on 2026-08-31.\n`,
-    );
-    fs.symlinkSync(path.join(source, 'standing-instructions.md'), path.join(sibling, 'standing-instructions.md'));
+  it('a banned-pattern hit and an unscannable file in the same group are two distinct breach entries, not merged or colliding', () => {
+    const g = path.join(groupsRoot(), 'dup-group');
+    fs.mkdirSync(g, { recursive: true });
+    fs.writeFileSync(path.join(g, 'standing-instructions.md'), 'Fixed on 2026-08-31.\n');
+    execFileSync('mkfifo', [path.join(g, 'CLAUDE.local.md')]);
 
-    const breaches = checkGroupStandingBytes(groupsRoot());
+    const breaches = checkGroupStandingPatterns(groupsRoot());
     expect(breaches).toHaveLength(2);
-    const ceilingBreach = breaches.find((b) => b.overCeiling);
     const patternBreach = breaches.find((b) => b.bannedHits.length > 0);
-    expect(ceilingBreach?.scope).toBe('dup-sibling, dup-source');
-    expect(patternBreach?.scope).toBe('dup-sibling, dup-source');
+    const unscannableBreach = breaches.find((b) => b.unscannable.length > 0);
+    expect(patternBreach?.scope).toBe('dup-group');
+    expect(unscannableBreach?.scope).toBe('dup-group');
     // Same scope string on both — they must still carry a distinct kind so the issue-title dedup doesn't collapse them.
-    expect(instructionStackBreachKind(ceilingBreach!)).not.toBe(instructionStackBreachKind(patternBreach!));
+    expect(instructionStackBreachKind(patternBreach!)).not.toBe(instructionStackBreachKind(unscannableBreach!));
   });
 });
 
@@ -534,7 +503,7 @@ describe('checkGroupStandingBytes', () => {
 // trust boundary, not just a file to read. These lock in that a planted
 // symlink/FIFO/oversized file is skipped and reported as its own signal,
 // never read.
-describe('checkGroupStandingBytes safety (P1: symlink containment, non-regular files, size cap)', () => {
+describe('checkGroupStandingPatterns safety (P1: symlink containment, non-regular files, size cap)', () => {
   const TMP = uniqueTmpRoot('fleet-drift-safety-test');
   const groupsRoot = () => path.join(TMP, 'groups');
 
@@ -551,7 +520,7 @@ describe('checkGroupStandingBytes safety (P1: symlink containment, non-regular f
     fs.mkdirSync(g, { recursive: true });
     fs.symlinkSync(outside, path.join(g, 'CLAUDE.local.md'));
 
-    const breaches = checkGroupStandingBytes(groupsRoot());
+    const breaches = checkGroupStandingPatterns(groupsRoot());
     expect(breaches).toHaveLength(1);
     expect(breaches[0].scope).toBe('escape-group');
     expect(breaches[0].unscannable).toHaveLength(1);
@@ -566,7 +535,7 @@ describe('checkGroupStandingBytes safety (P1: symlink containment, non-regular f
     const fifoPath = path.join(g, 'CLAUDE.local.md');
     execFileSync('mkfifo', [fifoPath]);
 
-    const breaches = checkGroupStandingBytes(groupsRoot()); // must return promptly — a naive read would block forever
+    const breaches = checkGroupStandingPatterns(groupsRoot()); // must return promptly — a naive read would block forever
     expect(breaches).toHaveLength(1);
     expect(breaches[0].unscannable[0].reason).toBe('not a regular file');
   });
@@ -580,7 +549,7 @@ describe('checkGroupStandingBytes safety (P1: symlink containment, non-regular f
     fs.mkdirSync(g, { recursive: true });
     fs.symlinkSync(fifoPath, path.join(g, 'CLAUDE.local.md'));
 
-    const breaches = checkGroupStandingBytes(groupsRoot());
+    const breaches = checkGroupStandingPatterns(groupsRoot());
     expect(breaches).toHaveLength(1);
     expect(breaches[0].scope).toBe('fifo-symlink-group');
     expect(breaches[0].unscannable[0].reason).toBe('not a regular file');
@@ -594,7 +563,7 @@ describe('checkGroupStandingBytes safety (P1: symlink containment, non-regular f
     fs.writeFileSync(hugePath, '');
     fs.truncateSync(hugePath, 5_000_000);
 
-    const breaches = checkGroupStandingBytes(groupsRoot());
+    const breaches = checkGroupStandingPatterns(groupsRoot());
     expect(breaches).toHaveLength(1);
     expect(breaches[0].unscannable[0].reason).toMatch(/safety cap/);
   });
@@ -607,7 +576,14 @@ describe('checkGroupStandingBytes safety (P1: symlink containment, non-regular f
     fs.writeFileSync(path.join(source, 'CLAUDE.local.md'), cleanContent(300));
     fs.symlinkSync(path.join(source, 'CLAUDE.local.md'), path.join(sibling, 'CLAUDE.local.md'));
 
-    expect(checkGroupStandingBytes(groupsRoot())).toEqual([]); // clean, under ceiling, nothing unscannable
+    expect(checkGroupStandingPatterns(groupsRoot())).toEqual([]); // clean content, nothing unscannable
+
+    // Same layout, banned content: the target really is read through the symlink, not just stat'd.
+    fs.writeFileSync(path.join(source, 'CLAUDE.local.md'), 'Fixed on 2026-08-31.\n');
+    const breaches = checkGroupStandingPatterns(groupsRoot());
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].scope).toBe('legit-sibling, legit-source');
+    expect(breaches[0].bannedHits[0].patterns).toContain('iso_date');
   });
 });
 
@@ -620,59 +596,62 @@ describe('checkInstructionStack', () => {
   });
   afterEach(() => fs.rmSync(TMP, { recursive: true, force: true }));
 
-  it('flags containerBytes and groupStandingBytes independently — a breaching shared base does not force every group over its own ceiling', () => {
+  it('flags the shared base once — a hit in it is not re-reported against every group that inherits it', () => {
     const containerPath = path.join(TMP, 'CLAUDE.md');
-    fs.writeFileSync(containerPath, cleanContent(CONTAINER_BYTES_CEILING + 500));
+    fs.writeFileSync(containerPath, `Fixed on 2026-08-31.\n${cleanContent(2000)}`);
     const trunkPath = path.join(TMP, 'trunk-CLAUDE.md');
     fs.writeFileSync(trunkPath, cleanContent(5000));
 
     const groupsRoot = path.join(TMP, 'groups');
-    const g = path.join(groupsRoot, 'fine-group');
-    fs.mkdirSync(g, { recursive: true });
-    fs.writeFileSync(path.join(g, 'standing-instructions.md'), cleanContent(2000));
+    for (const name of ['group-one', 'group-two']) {
+      const g = path.join(groupsRoot, name);
+      fs.mkdirSync(g, { recursive: true });
+      fs.writeFileSync(path.join(g, 'standing-instructions.md'), cleanContent(2000));
+    }
 
     const breaches = checkInstructionStack(containerPath, groupsRoot, trunkPath);
     expect(breaches).toHaveLength(1);
-    expect(breaches[0].metric).toBe('containerBytes');
+    expect(breaches[0].metric).toBe('container');
   });
 
-  it('flags trunkDocBytes independently of containerBytes', () => {
+  it('flags trunkDoc independently of container', () => {
     const containerPath = path.join(TMP, 'CLAUDE.md');
     fs.writeFileSync(containerPath, cleanContent(5000));
     const trunkPath = path.join(TMP, 'trunk-CLAUDE.md');
-    fs.writeFileSync(trunkPath, cleanContent(TRUNK_DOC_BYTES_CEILING + 500));
+    fs.writeFileSync(trunkPath, `Tracked in XZO-4521.\n${cleanContent(5000)}`);
 
     const groupsRoot = path.join(TMP, 'groups');
     fs.mkdirSync(groupsRoot, { recursive: true });
 
     const breaches = checkInstructionStack(containerPath, groupsRoot, trunkPath);
     expect(breaches).toHaveLength(1);
-    expect(breaches[0].metric).toBe('trunkDocBytes');
+    expect(breaches[0].metric).toBe('trunkDoc');
   });
 
-  it('passes a post-prune-shaped tree: ~8KB base + 2-3KB personas does not self-breach', () => {
+  it('passes a large but timeless tree — no metric here treats size as a finding', () => {
     const containerPath = path.join(TMP, 'CLAUDE.md');
-    fs.writeFileSync(containerPath, cleanContent(8000));
+    fs.writeFileSync(containerPath, cleanContent(60_000));
     const trunkPath = path.join(TMP, 'trunk-CLAUDE.md');
-    fs.writeFileSync(trunkPath, cleanContent(12000));
+    fs.writeFileSync(trunkPath, cleanContent(60_000));
 
     const groupsRoot = path.join(TMP, 'groups');
     for (const [name, size] of [
-      ['group-one', 2000],
-      ['group-two', 3000],
-      ['group-three', 2500],
+      ['group-one', 30_000],
+      ['group-two', 40_000],
+      ['group-three', 50_000],
     ] as const) {
       const g = path.join(groupsRoot, name);
       fs.mkdirSync(g, { recursive: true });
       fs.writeFileSync(path.join(g, 'standing-instructions.md'), cleanContent(size));
-      fs.writeFileSync(path.join(g, 'CLAUDE.local.md'), cleanContent(100));
+      fs.writeFileSync(path.join(g, 'CLAUDE.local.md'), cleanContent(20_000));
+      fs.writeFileSync(path.join(g, 'CLAUDE.md'), cleanContent(60_000));
     }
 
     expect(checkInstructionStack(containerPath, groupsRoot, trunkPath)).toEqual([]);
   });
 });
 
-describe('checkEffectiveStackBytes', () => {
+describe('checkEffectiveStackSafety', () => {
   const TMP = uniqueTmpRoot('fleet-drift-effective-stack-test');
   const groupsRoot = () => path.join(TMP, 'groups');
 
@@ -686,88 +665,56 @@ describe('checkEffectiveStackBytes', () => {
     fs.writeFileSync(path.join(groupDir, 'container.json'), JSON.stringify({ provider }));
   }
 
-  it('flattens an @-import chain, producing a larger effective size than the top-level file alone', () => {
-    const g = path.join(groupsRoot(), 'chain-group');
+  // This walk exists to refuse unsafe files, not to judge size — a huge but readable chain is clean.
+  it('reports nothing for a readable composed chain, however large', () => {
+    const g = path.join(groupsRoot(), 'big-but-readable-group');
     fs.mkdirSync(g, { recursive: true });
-    // Top file is tiny — only breaches once the inlined fragment is counted, proving flattening happened.
-    fs.writeFileSync(path.join(g, 'fragment.md'), cleanContent(EFFECTIVE_STACK_BYTES_CEILING + 1000));
+    fs.writeFileSync(path.join(g, 'fragment.md'), cleanContent(60_000));
     fs.writeFileSync(path.join(g, 'CLAUDE.md'), '@./fragment.md\n');
+    fs.writeFileSync(path.join(g, 'CLAUDE.local.md'), cleanContent(60_000));
 
-    const breaches = checkEffectiveStackBytes(groupsRoot());
-    expect(breaches).toHaveLength(1);
-    expect(breaches[0].scope).toBe('chain-group');
-    expect(breaches[0].overCeiling).toBe(true);
+    expect(checkEffectiveStackSafety(groupsRoot())).toEqual([]);
   });
 
-  it('a codex/opencode group is measured from its on-disk AGENTS.md directly, not by flattening CLAUDE.md', () => {
-    const g = path.join(groupsRoot(), 'agents-group');
-    fs.mkdirSync(g, { recursive: true });
-    writeContainerJson(g, 'codex');
-    // CLAUDE.md alone is small — would NOT breach if it (wrongly) got measured instead of AGENTS.md.
-    fs.writeFileSync(path.join(g, 'CLAUDE.md'), cleanContent(2000));
-    fs.writeFileSync(path.join(g, 'AGENTS.md'), cleanContent(EFFECTIVE_STACK_BYTES_CEILING + 1000));
-
-    const breaches = checkEffectiveStackBytes(groupsRoot());
-    expect(breaches).toHaveLength(1);
-    expect(breaches[0].scope).toBe('agents-group');
-    expect(breaches[0].bytes).toBe(EFFECTIVE_STACK_BYTES_CEILING + 1000);
-  });
-
-  it('a ceiling breach carries the effectiveStackBytes metric and "ceiling" kind', () => {
-    const g = path.join(groupsRoot(), 'over-group');
-    fs.mkdirSync(g, { recursive: true });
-    writeContainerJson(g, 'opencode');
-    fs.writeFileSync(path.join(g, 'AGENTS.md'), cleanContent(EFFECTIVE_STACK_BYTES_CEILING + 1));
-
-    const breaches = checkEffectiveStackBytes(groupsRoot());
-    expect(breaches).toHaveLength(1);
-    expect(breaches[0].metric).toBe('effectiveStackBytes');
-    expect(instructionStackBreachKind(breaches[0])).toBe('ceiling');
-  });
-
-  it('does not banned-pattern-scan the flattened doc — size only', () => {
+  it('does not banned-pattern-scan the composed doc — those source files are scanned at their source', () => {
     const g = path.join(groupsRoot(), 'dated-agents-group');
     fs.mkdirSync(g, { recursive: true });
     writeContainerJson(g, 'codex');
-    // Banned content, but small — under ceiling, and must not itself trigger a breach.
     fs.writeFileSync(path.join(g, 'AGENTS.md'), `Fixed on 2026-08-31 (#123).\n${cleanContent(200)}`);
-    expect(checkEffectiveStackBytes(groupsRoot())).toEqual([]);
+
+    expect(checkEffectiveStackSafety(groupsRoot())).toEqual([]);
   });
 
-  it('provider-aware source selection: codex/opencode read AGENTS.md, claude/default flattens CLAUDE.md + CLAUDE.local.md', () => {
+  it('provider-aware source selection: codex/opencode walk AGENTS.md, claude/default walk CLAUDE.md + CLAUDE.local.md', () => {
     const claudeGroup = path.join(groupsRoot(), 'claude-group');
     const codexGroup = path.join(groupsRoot(), 'codex-group');
     fs.mkdirSync(claudeGroup, { recursive: true });
     fs.mkdirSync(codexGroup, { recursive: true });
 
-    // Identical file layout on both: AGENTS.md alone would NOT breach; CLAUDE.md + local WOULD.
+    // Identical layout on both: an unreadable AGENTS.md next to a fine CLAUDE.md.
+    // Only the provider whose harness actually reads AGENTS.md may report it.
     for (const g of [claudeGroup, codexGroup]) {
-      fs.writeFileSync(path.join(g, 'AGENTS.md'), cleanContent(1000));
+      execFileSync('mkfifo', [path.join(g, 'AGENTS.md')]);
       fs.writeFileSync(path.join(g, 'CLAUDE.md'), cleanContent(2000));
-      fs.writeFileSync(path.join(g, 'CLAUDE.local.md'), cleanContent(EFFECTIVE_STACK_BYTES_CEILING));
     }
     // claudeGroup: no container.json — defaults to claude. codexGroup: explicit codex.
     writeContainerJson(codexGroup, 'codex');
 
-    const breaches = checkEffectiveStackBytes(groupsRoot());
-    expect(breaches.map((b) => b.scope)).toEqual(['claude-group']);
+    const breaches = checkEffectiveStackSafety(groupsRoot());
+    expect(breaches.map((b) => b.scope)).toEqual(['codex-group']);
+    expect(breaches[0].unscannable[0].reason).toBe('not a regular file');
   });
 
-  it('fresh CLAUDE.local.md content beats a stale-but-under-ceiling AGENTS.md snapshot (the concrete miss from the finding)', () => {
-    const g = path.join(groupsRoot(), 'stale-agents-group');
+  it('an unscannable CLAUDE.local.md is reported for a claude/default-provider group (Claude Code discovers it independently of AGENTS.md)', () => {
+    const g = path.join(groupsRoot(), 'local-fifo-group');
     fs.mkdirSync(g, { recursive: true });
-    // AGENTS.md: a stale spawn-time snapshot, itself under ceiling — an AGENTS.md-preferring
-    // implementation would report this group clean and miss the breach entirely.
-    fs.writeFileSync(path.join(g, 'AGENTS.md'), cleanContent(20_000));
-    fs.writeFileSync(path.join(g, 'CLAUDE.md'), cleanContent(20_000));
-    // CLAUDE.local.md has been edited since that last spawn — bigger than what's baked into AGENTS.md.
-    fs.writeFileSync(path.join(g, 'CLAUDE.local.md'), cleanContent(7000));
-    // No container.json — defaults to claude, so this MUST flatten CLAUDE.md + add local, not read AGENTS.md.
+    fs.writeFileSync(path.join(g, 'CLAUDE.md'), cleanContent(2000));
+    execFileSync('mkfifo', [path.join(g, 'CLAUDE.local.md')]);
 
-    const breaches = checkEffectiveStackBytes(groupsRoot());
+    const breaches = checkEffectiveStackSafety(groupsRoot());
     expect(breaches).toHaveLength(1);
-    expect(breaches[0].scope).toBe('stale-agents-group');
-    expect(breaches[0].bytes).toBe(27_000);
+    expect(breaches[0].scope).toBe('local-fifo-group');
+    expect(breaches[0].unscannable[0].reason).toBe('not a regular file');
   });
 
   it('a FIFO behind a nested @-import does not hang the check and is reported unscannable', () => {
@@ -776,7 +723,7 @@ describe('checkEffectiveStackBytes', () => {
     execFileSync('mkfifo', [path.join(g, 'the-fifo')]);
     fs.writeFileSync(path.join(g, 'CLAUDE.md'), '@./the-fifo\n');
 
-    const breaches = checkEffectiveStackBytes(groupsRoot()); // must return promptly, not block on the FIFO
+    const breaches = checkEffectiveStackSafety(groupsRoot()); // must return promptly, not block on the FIFO
     expect(breaches).toHaveLength(1);
     expect(breaches[0].unscannable.length).toBeGreaterThan(0);
   });
@@ -789,7 +736,7 @@ describe('checkEffectiveStackBytes', () => {
     fs.truncateSync(hugePath, 5_000_000);
     fs.writeFileSync(path.join(g, 'CLAUDE.md'), '@./huge.md\n');
 
-    const breaches = checkEffectiveStackBytes(groupsRoot());
+    const breaches = checkEffectiveStackSafety(groupsRoot());
     expect(breaches).toHaveLength(1);
     expect(breaches[0].unscannable[0].reason).toMatch(/safety cap/);
   });
@@ -798,9 +745,9 @@ describe('checkEffectiveStackBytes', () => {
     const g = path.join(groupsRoot(), 'bad-config-group');
     fs.mkdirSync(g, { recursive: true });
     fs.writeFileSync(path.join(g, 'container.json'), '{ not valid json');
-    fs.writeFileSync(path.join(g, 'AGENTS.md'), cleanContent(500)); // would otherwise measure fine
+    fs.writeFileSync(path.join(g, 'AGENTS.md'), cleanContent(500)); // would otherwise walk fine
 
-    const breaches = checkEffectiveStackBytes(groupsRoot());
+    const breaches = checkEffectiveStackSafety(groupsRoot());
     expect(breaches).toHaveLength(1);
     expect(breaches[0].unscannable[0].reason).toMatch(/malformed container\.json/);
   });
@@ -810,9 +757,21 @@ describe('checkEffectiveStackBytes', () => {
     fs.mkdirSync(g, { recursive: true });
     execFileSync('mkfifo', [path.join(g, 'container.json')]);
 
-    const breaches = checkEffectiveStackBytes(groupsRoot());
+    const breaches = checkEffectiveStackSafety(groupsRoot());
     expect(breaches).toHaveLength(1);
     expect(breaches[0].unscannable[0].reason).toBe('not a regular file');
+  });
+
+  it('a finding carries the effectiveStack metric and "unscannable" kind', () => {
+    const g = path.join(groupsRoot(), 'kind-group');
+    fs.mkdirSync(g, { recursive: true });
+    writeContainerJson(g, 'opencode');
+    execFileSync('mkfifo', [path.join(g, 'AGENTS.md')]);
+
+    const breaches = checkEffectiveStackSafety(groupsRoot());
+    expect(breaches).toHaveLength(1);
+    expect(breaches[0].metric).toBe('effectiveStack');
+    expect(instructionStackBreachKind(breaches[0])).toBe('unscannable');
   });
 
   it('a stale/dangling @-import does not crash the check (flattenClaudeMd degrades to a comment marker, per its own documented behavior)', () => {
@@ -821,31 +780,17 @@ describe('checkEffectiveStackBytes', () => {
     // No AGENTS.md — forces the flatten fallback path; the referenced target is never created.
     fs.writeFileSync(path.join(g, 'CLAUDE.md'), '@./does-not-exist.md\n');
 
-    expect(() => checkEffectiveStackBytes(groupsRoot())).not.toThrow();
-    expect(checkEffectiveStackBytes(groupsRoot())).toEqual([]); // placeholder comment is tiny, well under ceiling
-  });
-
-  it('adds CLAUDE.local.md bytes on top of the flattened CLAUDE.md for a claude/default-provider group', () => {
-    const g = path.join(groupsRoot(), 'local-add-group');
-    fs.mkdirSync(g, { recursive: true });
-    fs.writeFileSync(path.join(g, 'CLAUDE.md'), cleanContent(2000));
-    fs.writeFileSync(path.join(g, 'CLAUDE.local.md'), cleanContent(5000));
-    // Neither file alone breaches; only their sum does — proves CLAUDE.local.md is added, not embedded/ignored.
-    expect(checkEffectiveStackBytes(groupsRoot())).toEqual([]);
-
-    fs.writeFileSync(path.join(g, 'CLAUDE.local.md'), cleanContent(EFFECTIVE_STACK_BYTES_CEILING));
-    const breaches = checkEffectiveStackBytes(groupsRoot());
-    expect(breaches).toHaveLength(1);
-    expect(breaches[0].bytes).toBe(2000 + EFFECTIVE_STACK_BYTES_CEILING);
+    expect(() => checkEffectiveStackSafety(groupsRoot())).not.toThrow();
+    expect(checkEffectiveStackSafety(groupsRoot())).toEqual([]); // a missing import is staleness, not an unsafe read
   });
 
   it('a group with no composed doc at all (never spawned) is silently skipped, not a breach', () => {
     const g = path.join(groupsRoot(), 'never-spawned-group');
     fs.mkdirSync(g, { recursive: true });
-    expect(checkEffectiveStackBytes(groupsRoot())).toEqual([]);
+    expect(checkEffectiveStackSafety(groupsRoot())).toEqual([]);
   });
 
-  it('checkInstructionStack includes effectiveStackBytes breaches alongside the other metrics', () => {
+  it('checkInstructionStack includes effectiveStack breaches alongside the other metrics', () => {
     const containerPath = path.join(TMP, 'container-CLAUDE.md');
     fs.writeFileSync(containerPath, cleanContent(2000));
     const trunkPath = path.join(TMP, 'trunk-CLAUDE.md');
@@ -853,9 +798,9 @@ describe('checkEffectiveStackBytes', () => {
     const g = path.join(groupsRoot(), 'combined-group');
     fs.mkdirSync(g, { recursive: true });
     writeContainerJson(g, 'codex');
-    fs.writeFileSync(path.join(g, 'AGENTS.md'), cleanContent(EFFECTIVE_STACK_BYTES_CEILING + 1));
+    execFileSync('mkfifo', [path.join(g, 'AGENTS.md')]);
 
     const breaches = checkInstructionStack(containerPath, groupsRoot(), trunkPath);
-    expect(breaches.some((b) => b.metric === 'effectiveStackBytes')).toBe(true);
+    expect(breaches.some((b) => b.metric === 'effectiveStack')).toBe(true);
   });
 });
