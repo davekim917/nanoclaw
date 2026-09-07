@@ -25,7 +25,7 @@
 # until upstream closes #484.
 #
 # Manual run:  bash scripts/check-onecli-gateway-fds.sh
-#              WARN_PCT=50 bash scripts/check-onecli-gateway-fds.sh   # tune
+#              RESTART_PCT=50 bash scripts/check-onecli-gateway-fds.sh  # tune
 #              DRY_RUN=1 bash scripts/check-onecli-gateway-fds.sh     # no restart
 
 set -euo pipefail
