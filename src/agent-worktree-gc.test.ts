@@ -25,7 +25,7 @@ afterEach(() => {
 });
 
 function row(over: Partial<WorktreeRow> = {}): WorktreeRow {
-  return { path: '/tmp/wt', head: 'a'.repeat(40), branch: 'topic', missing: false, ...over };
+  return { path: '/tmp/wt', head: 'a'.repeat(40), branch: 'topic', missing: false, locked: false, ...over };
 }
 
 describe('parseWorktreeList', () => {
@@ -50,6 +50,23 @@ describe('parseWorktreeList', () => {
     expect(rows.map((r) => r.path)).toEqual(['/repo', '/tmp/a', '/tmp/b']);
     expect(rows[1].branch).toBe('feat/a');
     expect(rows[2].branch).toBeNull();
+  });
+
+  it('reads the lock flag, bare or with a reason', () => {
+    const out = [
+      'worktree /a',
+      'HEAD ' + '1'.repeat(40),
+      'locked',
+      '',
+      'worktree /b',
+      'HEAD ' + '2'.repeat(40),
+      'locked claude session',
+      '',
+      'worktree /c',
+      'HEAD ' + '3'.repeat(40),
+    ].join('\n');
+    const rows = parseWorktreeList(out);
+    expect(rows.map((r) => r.locked)).toEqual([true, true, false]);
   });
 
   it('does not lose entries when blank-line separators are absent entirely', () => {
@@ -111,6 +128,21 @@ describe('hasTrackedChanges', () => {
   it('treats an empty status as clean', () => {
     expect(hasTrackedChanges('')).toBe(false);
   });
+
+  // A substring test would swallow these and let the worktree be deleted with
+  // the edit still in it. node_modules must match as a PATH COMPONENT.
+  it('does NOT ignore a tracked file whose name merely contains node_modules', () => {
+    expect(hasTrackedChanges(' M docs/node_modules-policy.md\n')).toBe(true);
+    expect(hasTrackedChanges('A  src/node_modules_shim.ts\n')).toBe(true);
+  });
+
+  it('still ignores a real node_modules path at any depth', () => {
+    expect(hasTrackedChanges('?? node_modules/\n?? container/agent-runner/node_modules\n')).toBe(false);
+  });
+
+  it('reads the destination of a rename, which is what would be lost', () => {
+    expect(hasTrackedChanges('R  node_modules/x -> src/real.ts\n')).toBe(true);
+  });
 });
 
 describe('assess', () => {
@@ -148,6 +180,14 @@ describe('assess', () => {
     const wt = tmp();
     expect(assess(row({ path: wt }), repo, { procRoot: noProc }).verdict).toBe('live-process');
   });
+
+  // Lock absence proves nothing, but lock PRESENCE is a deliberate
+  // do-not-remove and is honoured as one.
+  it('refuses a locked worktree even when nothing is running in it', () => {
+    const wt = tmp();
+    const a = assess(row({ path: wt, locked: true }), repo, { procRoot: tmp() });
+    expect(a.verdict).toBe('locked');
+  });
 });
 
 // The open-PR guard sits behind the merged/clean/idle checks, so on a real host
@@ -175,7 +215,7 @@ describe('assess — open-PR guard (real git)', () => {
 
   it('deletes a merged, clean, idle worktree when no PR is open', () => {
     const { repo, wt, head } = repoWithMergedWorktree();
-    const a = assess({ path: wt, head, branch: 'topic', missing: false }, repo, {
+    const a = assess({ path: wt, head, branch: 'topic', missing: false, locked: false }, repo, {
       mainRef: 'main',
       procRoot: tmp(), // empty /proc — readable, nothing running
       openPrBranches: new Set(),
@@ -185,13 +225,27 @@ describe('assess — open-PR guard (real git)', () => {
 
   it('SPARES that same worktree once its branch has an open PR', () => {
     const { repo, wt, head } = repoWithMergedWorktree();
-    const a = assess({ path: wt, head, branch: 'topic', missing: false }, repo, {
+    const a = assess({ path: wt, head, branch: 'topic', missing: false, locked: false }, repo, {
       mainRef: 'main',
       procRoot: tmp(),
       openPrBranches: new Set(['topic']),
     });
     expect(a.verdict).toBe('open-pr');
     expect(a.detail).toMatch(/topic/);
+  });
+
+  // Refused either way — but it must not CLAIM an open PR it never saw. That
+  // is the same unverified-success assertion this collector exists to prevent.
+  it('reports pr-unknown, not open-pr, when GitHub could not be reached', () => {
+    const { repo, wt, head } = repoWithMergedWorktree();
+    const a = assess({ path: wt, head, branch: 'topic', missing: false, locked: false }, repo, {
+      mainRef: 'main',
+      procRoot: tmp(),
+      openPrBranches: new Set(),
+      prStateUnknown: true,
+    });
+    expect(a.verdict).toBe('pr-unknown');
+    expect(a.detail).toMatch(/could not reach GitHub/);
   });
 
   it('refuses a worktree whose head is NOT an ancestor of main', () => {
@@ -201,7 +255,7 @@ describe('assess — open-PR guard (real git)', () => {
     g('add', 'g');
     g('commit', '-qm', 'ahead');
     const ahead = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: wt, encoding: 'utf-8' }).trim();
-    const a = assess({ path: wt, head: ahead, branch: 'topic', missing: false }, repo, {
+    const a = assess({ path: wt, head: ahead, branch: 'topic', missing: false, locked: false }, repo, {
       mainRef: 'main',
       procRoot: tmp(),
       openPrBranches: new Set(),

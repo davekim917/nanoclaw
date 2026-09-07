@@ -21,9 +21,11 @@
  * passed a merged-and-clean check and were on a removal list; removing them
  * would have killed working agents mid-task. Claude Code releases the lock when
  * a session exits the worktree, but that session's processes keep running with
- * their cwd inside the directory. So liveness is proven from /proc, and the
- * lock is ignored entirely — a locked worktree is still evaluated on the same
- * evidence as any other.
+ * their cwd inside the directory. So liveness is proven from /proc.
+ *
+ * The lock is therefore a ONE-WAY signal: its absence proves nothing, but its
+ * presence is a deliberate "do not remove" that this collector honours. Those
+ * are different claims and the measurement above only falsifies the first.
  *
  * ── Why /tmp is not treated as disposable ──
  *
@@ -43,7 +45,18 @@ const GC_APPLY_ENV = 'NANOCLAW_WORKTREE_GC';
 /** Codex owns its own worktree lifecycle; never touch it. */
 const OUT_OF_SCOPE = /\/\.codex\/worktrees\//;
 
-export type Verdict = 'eligible' | 'live-process' | 'unmerged' | 'dirty' | 'open-pr' | 'out-of-scope' | 'main';
+export type Verdict =
+  | 'eligible'
+  | 'live-process'
+  /** `git worktree lock` is set — a deliberate do-not-remove, honoured as one. */
+  | 'locked'
+  | 'unmerged'
+  | 'dirty'
+  | 'open-pr'
+  /** GitHub was unreachable, so PR state is unknown — refused, never asserted. */
+  | 'pr-unknown'
+  | 'out-of-scope'
+  | 'main';
 
 export interface WorktreeRow {
   path: string;
@@ -51,6 +64,8 @@ export interface WorktreeRow {
   branch: string | null;
   /** Directory is registered but gone — prunable registration, not a directory. */
   missing: boolean;
+  /** `git worktree lock` was set deliberately; honoured as a refusal. */
+  locked: boolean;
 }
 
 export interface Assessment {
@@ -80,7 +95,15 @@ export function parseWorktreeList(porcelain: string): WorktreeRow[] {
   const rows: WorktreeRow[] = [];
   let cur: Partial<WorktreeRow> | null = null;
   const flush = () => {
-    if (cur?.path) rows.push({ path: cur.path, head: cur.head ?? '', branch: cur.branch ?? null, missing: false });
+    if (cur?.path) {
+      rows.push({
+        path: cur.path,
+        head: cur.head ?? '',
+        branch: cur.branch ?? null,
+        missing: false,
+        locked: cur.locked ?? false,
+      });
+    }
     cur = null;
   };
   for (const line of porcelain.split('\n')) {
@@ -91,6 +114,9 @@ export function parseWorktreeList(porcelain: string): WorktreeRow[] {
       cur.head = line.slice('HEAD '.length);
     } else if (line.startsWith('branch ') && cur) {
       cur.branch = line.slice('branch '.length).replace(/^refs\/heads\//, '');
+    } else if ((line === 'locked' || line.startsWith('locked ')) && cur) {
+      // Porcelain emits a bare `locked` or `locked <reason>`.
+      cur.locked = true;
     }
   }
   flush();
@@ -101,7 +127,8 @@ export function parseWorktreeList(porcelain: string): WorktreeRow[] {
  * True when any process has its cwd inside `dir`.
  *
  * This is the liveness signal, replacing the DB-participant check that the
- * repo-store collector uses and the lock that cannot be trusted. Fails CLOSED:
+ * repo-store collector uses. The lock is a separate, one-way signal handled in
+ * `assess`; it cannot stand in for this one. Fails CLOSED:
  * if /proc cannot be read at all, every worktree reports live, because an
  * unreadable instrument must never read as "nothing is running".
  */
@@ -131,18 +158,36 @@ export function hasLiveProcess(dir: string, procRoot = '/proc'): boolean {
  * node_modules in these worktrees is a symlink into the live checkout, so it
  * shows as untracked in every one of them and would veto every candidate.
  * Removing the worktree drops the link, never the target.
+ *
+ * Matched as a PATH COMPONENT, not as a substring of the status line. A
+ * substring test silently ignores a real tracked file whose path merely
+ * contains the string — `docs/node_modules-policy.md` — and losing that edit
+ * is unrecoverable, because the next step is deleting the worktree.
  */
 export function hasTrackedChanges(status: string): boolean {
   return status
     .split('\n')
     .filter((l) => l.trim() !== '')
-    .some((l) => !l.includes('node_modules'));
+    .some((l) => {
+      // Porcelain v1: 2 status chars, a space, then the path. A rename shows
+      // `old -> new`; the destination is what would be lost.
+      const raw = l.slice(3);
+      const pathPart = raw.includes(' -> ') ? raw.slice(raw.indexOf(' -> ') + 4) : raw;
+      const segments = pathPart.replace(/^"|"$/g, '').split('/');
+      return !segments.includes('node_modules');
+    });
 }
 
 export function assess(
   row: WorktreeRow,
   repoRoot: string,
-  opts: { mainRef?: string; procRoot?: string; openPrBranches?: ReadonlySet<string> } = {},
+  opts: {
+    mainRef?: string;
+    procRoot?: string;
+    openPrBranches?: ReadonlySet<string>;
+    /** GitHub unreachable: refuse branch-carrying worktrees, and say why. */
+    prStateUnknown?: boolean;
+  } = {},
 ): Assessment {
   const mainRef = opts.mainRef ?? 'origin/main';
 
@@ -163,6 +208,12 @@ export function assess(
     return { row, verdict: 'live-process', detail: 'a process has its cwd inside this worktree' };
   }
 
+  // Absence of a lock proves nothing (see the header), but its presence is a
+  // deliberate "do not remove" and is honoured as one.
+  if (row.locked) {
+    return { row, verdict: 'locked', detail: 'git worktree lock is set — deliberate do-not-remove' };
+  }
+
   const status = git(row.path, ['status', '--porcelain']) ?? '';
   if (hasTrackedChanges(status)) {
     return { row, verdict: 'dirty', detail: 'uncommitted tracked changes' };
@@ -176,6 +227,9 @@ export function assess(
   // /tmp worktrees are the working pattern — created, worked, PR'd. A branch
   // with an open PR is live work even when its commits already reached main
   // (a PR can be open against a branch that fast-forwarded).
+  if (opts.prStateUnknown && row.branch) {
+    return { row, verdict: 'pr-unknown', detail: 'could not reach GitHub to check for an open PR' };
+  }
   if (row.branch && opts.openPrBranches?.has(row.branch)) {
     return { row, verdict: 'open-pr', detail: `branch ${row.branch} has an open PR` };
   }
@@ -217,10 +271,14 @@ export function listWorktrees(repoRoot: string): WorktreeRow[] {
 /**
  * Assess every worktree and, in apply mode, remove the eligible ones.
  *
- * The PR lookup fails CLOSED in a specific way: when GitHub is unreachable we
- * cannot tell an abandoned branch from one with review in flight, so every
- * branch-carrying worktree is treated as having an open PR. Losing a cleanup
- * pass is free; deleting a worktree whose PR is still open is not.
+ * The PR lookup fails CLOSED: when GitHub is unreachable we cannot tell an
+ * abandoned branch from one with review in flight, so every branch-carrying
+ * worktree is refused. Losing a cleanup pass is free; deleting a worktree whose
+ * PR is still open is not.
+ *
+ * It is refused as `pr-unknown`, never relabelled `open-pr`. Reporting a PR we
+ * never confirmed would be the same unverified-success claim this collector
+ * exists to avoid making about worktrees.
  */
 export function runAgentWorktreeGcOnce(
   repoRoot: string,
@@ -234,7 +292,8 @@ export function runAgentWorktreeGcOnce(
       mainRef: opts.mainRef,
       procRoot: opts.procRoot,
       // null (GitHub unreachable) => treat every branch as PR-bearing.
-      openPrBranches: prs ?? new Set(rows.map((r) => r.branch).filter((b): b is string => b !== null)),
+      openPrBranches: prs ?? new Set<string>(),
+      prStateUnknown: prs === null,
     }),
   );
 
