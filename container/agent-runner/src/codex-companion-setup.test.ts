@@ -138,7 +138,12 @@ describe('buildRuntimeConfig', () => {
     expect(config).toContain('approval_policy = "on-request"');
     expect(config).toContain('[features]');
     expect(config).toContain('hooks = true');
-    expect(config).toContain('[features.multi_agent_v2]');
+    expect(config).toContain('context_management = true');
+    expect(config).toContain('fast_mode = false');
+    expect(config).toContain('multi_agent = true');
+    expect(config).toContain('[agents]');
+    expect(config).not.toContain('multi_agent_v2');
+    expect(config).not.toContain('remote_control');
     expect(config).toContain('[projects."/workspace/agent"]');
     // Runtime MCP servers appended.
     expect(config).toContain('[mcp_servers.nanoclaw]');
