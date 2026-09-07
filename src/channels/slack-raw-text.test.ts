@@ -150,16 +150,17 @@ describe('extractSlackRawText', () => {
       expect(slackMentionOutsideCode(projected, BOT)).toBe(false);
     }
 
-    // Known limit, asserted so it is visible rather than silent: content
-    // carrying a run of THREE or more backticks cannot be protected, because
-    // slackMentionOutsideCode's `{3,}…`{3,} alternative lets any such run act
-    // as a closer. It is a property of that regex, not of this projection —
-    // the same body typed by hand leaks identically:
-    //   '```` ```<@UBOT> ship ````'  →  mention read as prose.
-    // Tracked as davekim917/nanoclaw#256; the fix belongs in slack-mentions.ts.
-    const unprotectable = extractSlackRawText(cellRaw([{ type: 'text', text: '```<@UBOT>', style: { code: true } }]))!;
-    expect(slackMentionOutsideCode(unprotectable, BOT)).toBe(true);
-    expect(slackMentionOutsideCode('```` ```<@UBOT> ship ````', BOT)).toBe(true);
+    // Content carrying a run of THREE or more backticks is protected too. This
+    // was the #256 leak: slackMentionOutsideCode once let ANY 3+ run close a
+    // fence, so the inner run below closed the outer one early and left the
+    // mention as prose. The scanner now requires a closer at least as long as
+    // the opener, so the 3-run cannot close a 4-backtick fence and the mention
+    // stays inside the code region — for the projection and for the same body
+    // typed by hand.
+    const longFence = extractSlackRawText(cellRaw([{ type: 'text', text: '```<@UBOT>', style: { code: true } }]))!;
+    expect(longFence).toBe('```` ```<@UBOT> ````');
+    expect(slackMentionOutsideCode(longFence, BOT)).toBe(false);
+    expect(slackMentionOutsideCode('```` ```<@UBOT> ship ````', BOT)).toBe(false);
 
     const preformatted = {
       attachments: [
