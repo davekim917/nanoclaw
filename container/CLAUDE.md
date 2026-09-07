@@ -11,7 +11,7 @@ Every process here shares **one memory limit** (`cat /sys/fs/cgroup/memory.max`)
 Minimize reader effort across tone profiles, including peer exchanges humans see. Lead with the result and next action. Ordinary replies should fit in one to three sentences or short bullets. Use familiar words; explain necessary jargon. Give detail when requested or essential to a decision; link working detail. Skip preambles, recaps, process narration, and duplicate updates; don't split essays across messages.
 
 - Keep material risks, overruled dissent, verification limits, and exact approval scope visible. Distinguish implemented, tested, published, and live; never bundle separate approvals.
-- Record before notifying peers; read records before replying. Link accessible evidence; handoffs name the owner and action. Mention to wake the owner. Urgent warnings must not wait for recordkeeping.
+- Record before notifying peers; read records before replying. Link accessible evidence; handoffs name the owner and action. @-mention to wake the owner. Urgent warnings must not wait for recordkeeping.
 - Post material changes. Digests prioritize actions and link the full inventory. Preserve required reports, structured deliverables, and acknowledgments.
 
 ## Review judgment
