@@ -37,9 +37,22 @@ cd "$NANOCLAW_DIR"
 CONTAINER="${ONECLI_CONTAINER:-onecli}"
 RESTART_PCT="${RESTART_PCT:-70}"   # restart at/above this % of the soft limit
 DRY_RUN="${DRY_RUN:-0}"
+RECOVER_WAIT_S="${RECOVER_WAIT_S:-60}"   # bound on waiting for the gateway to return
 CLI_SOCK="$NANOCLAW_DIR/data/cli.sock"
 
 fail() { echo "fd-watchdog: $1" >&2; exit 1; }
+
+# Validate the threshold HERE, not at the comparison. `[ "$PCT" -lt "70%" ]`
+# exits 2 with "integer expression expected", and because that comparison is an
+# `if` condition, `set -e` does not stop the script — a non-integer threshold
+# reads as "not below" and falls straight through to `docker restart`. On a
+# 2-minute timer a single typo in the unit's Environment= would restart the
+# gateway forever, which is a continuous credential outage caused by the thing
+# meant to prevent one. Refuse the value instead.
+case "$RESTART_PCT" in
+  ''|*[!0-9]*) fail "RESTART_PCT must be an integer 0-100, got '$RESTART_PCT'" ;;
+esac
+[ "$RESTART_PCT" -le 100 ] || fail "RESTART_PCT must be an integer 0-100, got '$RESTART_PCT'"
 
 docker inspect "$CONTAINER" >/dev/null 2>&1 || fail "container '$CONTAINER' not found"
 
@@ -98,17 +111,43 @@ fi
 
 echo "fd-watchdog: at/above ${RESTART_PCT}% — restarting '$CONTAINER' before rule resolution starts failing"
 docker restart "$CONTAINER" >/dev/null
-sleep 10
 
-NEW_PID="$(docker top "$CONTAINER" 2>/dev/null | awk '$8=="onecli-gateway"{print $2; exit}')" || NEW_PID=''
+# Wait for the gateway to actually come back, rather than sleeping a fixed
+# interval and assuming it did. A restart that leaves no gateway process is a
+# WORSE outage than the one being prevented, and reporting it as a success is
+# the same defect as letting a failed measurement read as an all-clear.
+RECOVERED=0
+for _ in $(seq 1 "$RECOVER_WAIT_S"); do
+  NEW_PID="$(docker top "$CONTAINER" 2>/dev/null | awk '$8=="onecli-gateway"{print $2; exit}')" || NEW_PID=''
+  if [ -n "$NEW_PID" ] && [ "$(docker inspect "$CONTAINER" --format '{{.State.Health.Status}}' 2>/dev/null || echo unknown)" = "healthy" ]; then
+    RECOVERED=1
+    break
+  fi
+  sleep 1
+done
+
 # `wc -l` exits 0 on a failed `ls`, so a `|| echo '?'` here would be dead code —
 # test for the pid instead.
-if [ -n "$NEW_PID" ] && NEW_FDS="$(ls "/proc/$NEW_PID/fd" 2>/dev/null | wc -l)"; then :; else NEW_FDS='?'; fi
-echo "fd-watchdog: restarted; fds now $NEW_FDS/$SOFT"
+if [ -n "${NEW_PID:-}" ] && NEW_FDS="$(ls "/proc/$NEW_PID/fd" 2>/dev/null | wc -l)"; then :; else NEW_FDS='?'; fi
+
+if [ "$RECOVERED" = "1" ]; then
+  echo "fd-watchdog: restarted and healthy; fds now $NEW_FDS/$SOFT"
+  OUTCOME="was restarted automatically and came back healthy (fds now ${NEW_FDS}/${SOFT})"
+else
+  echo "fd-watchdog: RESTARTED BUT NOT HEALTHY after ${RECOVER_WAIT_S}s — credentialed calls are still failing" >&2
+  OUTCOME="was restarted automatically but did NOT come back healthy within ${RECOVER_WAIT_S}s — credentialed calls are still failing and this needs a human"
+fi
 
 # Tell an owner. A silent auto-restart would hide how fast the leak is growing.
+# Select the owner's real user_id and send AS them. A synthetic `system:<name>`
+# sender is treated as an unknown user, and an owner DM under the `strict`
+# unknown-sender policy DROPS it — observed: `MESSAGE DROPPED — unknown sender
+# (strict policy) userId="system:onecli-fd-watchdog"` — while this script still
+# printed that the notification was delivered. That is the failure this whole
+# script exists to prevent, in its own alert path. `scripts/init-first-agent.ts`
+# sends as the resolved user for the same reason.
 ADMIN_DM_ROW="$(pnpm exec tsx scripts/q.ts "$NANOCLAW_DIR/data/v2.db" "
-  SELECT mg.platform_id, ud.channel_type
+  SELECT mg.platform_id, ud.channel_type, ur.user_id
     FROM user_roles ur
     JOIN user_dms ud ON ud.user_id = ur.user_id
     JOIN messaging_groups mg ON mg.id = ud.messaging_group_id
@@ -118,13 +157,14 @@ ADMIN_DM_ROW="$(pnpm exec tsx scripts/q.ts "$NANOCLAW_DIR/data/v2.db" "
 " 2>/dev/null | tail -1)"
 ADMIN_DM_PLATFORM_ID="$(echo "$ADMIN_DM_ROW" | cut -d'|' -f1)"
 ADMIN_DM_CHANNEL_TYPE="$(echo "$ADMIN_DM_ROW" | cut -d'|' -f2)"
+ADMIN_USER_ID="$(echo "$ADMIN_DM_ROW" | cut -d'|' -f3)"
 
-if [ -z "$ADMIN_DM_PLATFORM_ID" ] || [ ! -S "$CLI_SOCK" ]; then
-  echo "fd-watchdog: no admin DM or CLI socket; restart done, notification skipped"
-  exit 0
+if [ -z "$ADMIN_DM_PLATFORM_ID" ] || [ -z "$ADMIN_USER_ID" ] || [ ! -S "$CLI_SOCK" ]; then
+  echo "fd-watchdog: could not resolve an owner DM or the CLI socket — the gateway was handled but NOBODY WAS TOLD" >&2
+  exit 1
 fi
 
-NOTIFICATION="System notification (OneCLI fd watchdog): the gateway reached ${PCT}% of its ${SOFT}-fd limit (${STUCK} sockets held but unreclaimable) and was restarted automatically — credentialed calls would have started failing with \`resolution_failed\` shortly. Root cause is the upstream leak in onecli/onecli#484, still open; this watchdog is containment, not a fix."
+NOTIFICATION="System notification (OneCLI fd watchdog): the gateway reached ${PCT}% of its ${SOFT}-fd limit (${STUCK} sockets held but unreclaimable) and ${OUTCOME}. Root cause is the upstream leak in onecli/onecli#484, still open; this watchdog is containment, not a fix."
 
 # Pass values through the environment and read them with os.environ inside a
 # QUOTED heredoc, matching scripts/health-sentinel.sh:376-390. An unquoted
@@ -132,14 +172,14 @@ NOTIFICATION="System notification (OneCLI fd watchdog): the gateway reached ${PC
 # message template that introduces a quote or backslash would break the script
 # rather than the string. Same protocol, the version that cannot be broken by
 # editing the text.
-export NOTIFICATION ADMIN_DM_CHANNEL_TYPE ADMIN_DM_PLATFORM_ID CLI_SOCK
+export NOTIFICATION ADMIN_DM_CHANNEL_TYPE ADMIN_DM_PLATFORM_ID ADMIN_USER_ID CLI_SOCK
 python3 <<'EOF'
 import json, os, socket, time
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 sock.connect(os.environ["CLI_SOCK"])
 payload = json.dumps({
     "text": os.environ["NOTIFICATION"],
-    "senderId": "system:onecli-fd-watchdog",
+    "senderId": os.environ["ADMIN_USER_ID"],
     "sender": "OneCLI FD Watchdog",
     "to": {
         "channelType": os.environ["ADMIN_DM_CHANNEL_TYPE"],
