@@ -61,26 +61,28 @@ RELEASE_COUNT=$(echo "$DRYRUN_OUTPUT" | grep -oE "\([0-9]+ releases\)" | grep -o
 
 NOTIFICATION="System notification (monthly drift check): OneCLI gateway upgrade available — currently on $CURRENT_VER, latest is $LATEST_VER ($RELEASE_COUNT releases behind). Run \`bash $RUNBOOK\` when convenient — it prompts before swapping, backs up postgres first, and auto-rolls-back if the smoke test regresses against its pre-upgrade baseline. NOTE: this dry-run already pulled the new image; nothing is swapped until you run it."
 
-echo "drift-check: drift detected ($CURRENT_VER -> $LATEST_VER), notifying admin via CLI socket"
+echo "drift-check: drift detected ($CURRENT_VER -> $LATEST_VER), queueing an alert"
 
-# Inject as a CLI-channel inbound message routed to admin's Discord DM.
-# Protocol matches scripts/init-first-agent.ts:sendWelcomeViaCliSocket.
-python3 <<EOF
-import json, socket, sys, time
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-sock.connect("$CLI_SOCK")
-payload = json.dumps({
-    "text": """$NOTIFICATION""",
-    "senderId": "system:drift-check",
-    "sender": "OneCLI Drift Check",
-    "to": {
-        "channelType": "$ADMIN_DM_CHANNEL_TYPE",
-        "platformId": "$ADMIN_DM_PLATFORM_ID",
-        "threadId": "$ADMIN_DM_PLATFORM_ID",
-    },
-}) + "\n"
-sock.sendall(payload.encode("utf-8"))
-time.sleep(0.5)  # give router a beat to read before we close
-sock.close()
-print("drift-check: notification delivered to admin DM")
-EOF
+# Deliver over the outbox, not data/cli.sock. A `to:` payload on the socket
+# becomes an INBOUND event, so the router applies its unknown-sender gate:
+# `system:drift-check` is not a known user and the owner DM runs
+# `unknown_sender_policy = strict`, so the router DROPS it while `sendall()`
+# returns success. This script's zero delivered messages read like "there has
+# never been drift to report" and could not be told apart from "always
+# dropped". outbox-ship.sh POSTs to Slack every 60s with its own bot token and
+# needs no host process. See onecli/onecli#484 work and fork issue #538.
+OUTBOX="${DRIFT_CHECK_OUTBOX:-${UNIT_ALERT_OUTBOX:-}}"
+if [ -z "$OUTBOX" ]; then
+  echo "drift-check: DRIFT DETECTED but no outbox configured: $NOTIFICATION" >&2
+  exit 1
+fi
+mkdir -p "$OUTBOX"
+if [ ! -d "$OUTBOX" ] || [ ! -w "$OUTBOX" ]; then
+  echo "drift-check: DRIFT DETECTED but outbox unusable ($OUTBOX): $NOTIFICATION" >&2
+  exit 1
+fi
+OUT="$OUTBOX/$(date -u +%Y%m%dT%H%M%S)-onecli-drift.md"
+printf '*OneCLI gateway drift*\n_host: %s · %s UTC_\n\n%s\n' \
+  "$(hostname)" "$(date -u '+%Y-%m-%d %H:%M')" "$NOTIFICATION" > "$OUT"
+[ -s "$OUT" ] || { echo "drift-check: wrote an empty alert to $OUT" >&2; exit 1; }
+echo "drift-check: queued alert $OUT"
