@@ -34,7 +34,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NANOCLAW_DIR="${NANOCLAW_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 cd "$NANOCLAW_DIR"
 
-CONTAINER="${ONECLI_CONTAINER:-onecli}"
+# Resolve the gateway container the way src/config.ts:223 does — process env,
+# then .env, then the default. Inventing a second variable here would leave an
+# install that set the documented ONECLI_GATEWAY_CONTAINER silently monitoring
+# the wrong container, which is the failure this watchdog exists to catch.
+CONTAINER="${ONECLI_GATEWAY_CONTAINER:-}"
+if [ -z "$CONTAINER" ] && [ -f "$NANOCLAW_DIR/.env" ]; then
+  CONTAINER="$(sed -n 's/^[[:space:]]*ONECLI_GATEWAY_CONTAINER[[:space:]]*=[[:space:]]*//p' \
+    "$NANOCLAW_DIR/.env" | tail -1 | sed 's/^["'"'"']//; s/["'"'"']$//')"
+fi
+CONTAINER="${CONTAINER:-onecli}"
 RESTART_PCT="${RESTART_PCT:-70}"   # restart at/above this % of the soft limit
 DRY_RUN="${DRY_RUN:-0}"
 CLI_SOCK="$NANOCLAW_DIR/data/cli.sock"
@@ -45,16 +54,27 @@ docker inspect "$CONTAINER" >/dev/null 2>&1 || fail "container '$CONTAINER' not 
 
 # The gateway is a child of the container's entrypoint, not PID 1 — measure the
 # process that actually holds the sockets.
-GW_PID="$(docker top "$CONTAINER" 2>/dev/null | awk '/onecli-gateway/{print $2; exit}')"
-[ -n "$GW_PID" ] || fail "onecli-gateway process not running inside '$CONTAINER'"
+#
+# A zero/absent reading means the instrument failed (permissions, race, or a
+# gateway that never came back), NOT a healthy gateway. This is the one place
+# that decides a reading is trustworthy, so the post-restart check below gets
+# the same guarantee as the pre-restart one instead of its own weaker copy.
+# Prints "<pid> <fds>"; returns non-zero when anything is unreadable.
+read_gateway() {
+  local pid count
+  pid="$(docker top "$CONTAINER" 2>/dev/null | awk '/onecli-gateway/{print $2; exit}')"
+  [ -n "$pid" ] || return 1
+  count="$(ls "/proc/$pid/fd" 2>/dev/null | wc -l)"
+  [ "$count" -gt 0 ] 2>/dev/null || return 1
+  printf '%s %s\n' "$pid" "$count"
+}
 
-FDS="$(ls "/proc/$GW_PID/fd" 2>/dev/null | wc -l)"
+GW="$(read_gateway)" || fail "onecli-gateway not running in '$CONTAINER', or its fd count is unreadable (needs root)"
+GW_PID="${GW%% *}"
+FDS="${GW##* }"
+
 SOFT="$(awk '/Max open files/{print $4}' "/proc/$GW_PID/limits" 2>/dev/null)"
-
-# A zero/absent reading means the instrument failed (permissions, race), NOT a
-# healthy gateway. Never let a failed measurement read as an all-clear.
 [ -n "$SOFT" ] && [ "$SOFT" -gt 0 ] 2>/dev/null || fail "could not read fd soft limit for pid $GW_PID"
-[ "$FDS" -gt 0 ] 2>/dev/null || fail "could not read open fds for pid $GW_PID (got '$FDS')"
 
 PCT=$(( FDS * 100 / SOFT ))
 
@@ -76,11 +96,16 @@ fi
 
 echo "fd-watchdog: at/above ${RESTART_PCT}% — restarting '$CONTAINER' before rule resolution starts failing"
 docker restart "$CONTAINER" >/dev/null
-sleep 10
+SETTLE_SECONDS="${SETTLE_SECONDS:-10}"
+sleep "$SETTLE_SECONDS"
 
-NEW_PID="$(docker top "$CONTAINER" 2>/dev/null | awk '/onecli-gateway/{print $2; exit}')"
-NEW_FDS="$(ls "/proc/$NEW_PID/fd" 2>/dev/null | wc -l || echo '?')"
-echo "fd-watchdog: restarted; fds now $NEW_FDS/$SOFT"
+if NEW="$(read_gateway)"; then
+  RECOVERED=1
+  echo "fd-watchdog: restarted; fds now ${NEW##* }/$SOFT"
+else
+  RECOVERED=0
+  echo "fd-watchdog: RESTART DID NOT RECOVER — no readable gateway process after ${SETTLE_SECONDS}s" >&2
+fi
 
 # Tell an owner. A silent auto-restart would hide how fast the leak is growing.
 ADMIN_DM_ROW="$(pnpm exec tsx scripts/q.ts "$NANOCLAW_DIR/data/v2.db" "
@@ -96,11 +121,15 @@ ADMIN_DM_PLATFORM_ID="$(echo "$ADMIN_DM_ROW" | cut -d'|' -f1)"
 ADMIN_DM_CHANNEL_TYPE="$(echo "$ADMIN_DM_ROW" | cut -d'|' -f2)"
 
 if [ -z "$ADMIN_DM_PLATFORM_ID" ] || [ ! -S "$CLI_SOCK" ]; then
-  echo "fd-watchdog: no admin DM or CLI socket; restart done, notification skipped"
-  exit 0
+  echo "fd-watchdog: no admin DM or CLI socket; notification skipped" >&2
+  exit $(( RECOVERED == 1 ? 0 : 1 ))
 fi
 
-NOTIFICATION="System notification (OneCLI fd watchdog): the gateway reached ${PCT}% of its ${SOFT}-fd limit (${STUCK} sockets held but unreclaimable) and was restarted automatically — credentialed calls would have started failing with \`resolution_failed\` shortly. Root cause is the upstream leak in onecli/onecli#484, still open; this watchdog is containment, not a fix."
+if [ "$RECOVERED" = "1" ]; then
+  NOTIFICATION="System notification (OneCLI fd watchdog): the gateway reached ${PCT}% of its ${SOFT}-fd limit (${STUCK} sockets held but unreclaimable) and was restarted automatically — credentialed calls would have started failing with \`resolution_failed\` shortly. Root cause is the upstream leak in onecli/onecli#484, still open; this watchdog is containment, not a fix."
+else
+  NOTIFICATION="System notification (OneCLI fd watchdog): the gateway reached ${PCT}% of its ${SOFT}-fd limit and was restarted, but NO READABLE GATEWAY PROCESS came back after ${SETTLE_SECONDS}s. Containment FAILED — credentialed calls are probably failing with \`resolution_failed\` right now and this needs a human. Root cause is the upstream leak in onecli/onecli#484."
+fi
 
 python3 <<EOF
 import json, socket, time
@@ -121,3 +150,5 @@ time.sleep(0.5)
 sock.close()
 print("fd-watchdog: notification delivered to admin DM")
 EOF
+
+exit $(( RECOVERED == 1 ? 0 : 1 ))
