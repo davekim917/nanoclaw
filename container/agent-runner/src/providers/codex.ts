@@ -1041,12 +1041,37 @@ export class CodexProvider implements AgentProvider {
     }
     this.mcpServers = mcpServers;
 
+    // `providerConfig` describes the PRIMARY provider, so under a spawn-time
+    // provider fallback the runner deliberately empties it (see
+    // `parseRawConfig` in config.ts — codex's `reasoning_effort` key is a
+    // fatal boot error under claude's strict schema). The fallback's own
+    // declared model/effort travel on `options.model`/`options.effort`
+    // instead, so fold them in here or they are lost and the container runs
+    // codex's built-in defaults.
+    //
+    // Guarded by `=== undefined` so this is a strict no-op on the PRIMARY
+    // path: config.ts already copies the resolved codex model/effort INTO
+    // providerConfig there, and it draws them from the same chain that feeds
+    // `options.model`/`options.effort` — a declared providerConfig always
+    // wins. Values are validated first because the schema is strict and an
+    // out-of-vocabulary value (a claude model id from a mis-declared
+    // `providerFallback`) would throw at boot instead of degrading.
+    const rawSticky: Record<string, unknown> = { ...(options.providerConfig ?? {}) };
+    if (rawSticky.model === undefined && options.model !== undefined) {
+      if (CODEX_MODEL_RE.test(options.model)) rawSticky.model = options.model;
+      else console.error(`[codex-provider] Ignoring non-codex config model "${options.model}"`);
+    }
+    if (rawSticky.reasoning_effort === undefined && options.effort !== undefined) {
+      if (CODEX_EFFORT_VALUES.has(options.effort)) rawSticky.reasoning_effort = options.effort;
+      else console.error(`[codex-provider] Ignoring non-codex config effort "${options.effort}"`);
+    }
     // Defensive re-parse (R8): catches hand-edited container.json or self-mod
     // mutations on startup before they reach codex.
-    this.stickyConfig = codexConfigSchema.parse(options.providerConfig ?? {});
+    this.stickyConfig = codexConfigSchema.parse(rawSticky);
 
-    // Model precedence: stickyConfig (per-agent) > CODEX_MODEL env (host
-    // default) > built-in default.
+    // Model precedence: stickyConfig (per-agent providerConfig, or the
+    // declared provider fallback's model folded in above) > CODEX_MODEL env
+    // (host default) > built-in default.
     this.model = this.stickyConfig.model ?? (options.env?.CODEX_MODEL as string | undefined) ?? 'gpt-5.6-sol';
 
     // Fallback OAuth identities. Empty when CODEX_FALLBACK_HOMES is unset
