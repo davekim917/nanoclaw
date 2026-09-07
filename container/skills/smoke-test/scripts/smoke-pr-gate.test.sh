@@ -156,6 +156,29 @@ cat > "$STUB_BIN/mountpoint" <<'STUB'
 [ "${1:-}" = "-q" ] && [ "${2:-}" = "${SMOKE_GATE_SHARED_ROOT:-}" ]
 STUB
 chmod +x "$STUB_BIN/mountpoint"
+REAL_JQ="$(command -v jq)"
+export REAL_JQ
+cat > "$STUB_BIN/jq" <<'STUB'
+#!/usr/bin/env bash
+# Narrowly model the jq 1.6 behavior behind the live failure: the ledger
+# producer yields no bytes, then jq -e accepts the empty readback pipeline.
+# Host jq 1.7 exits 4 on empty input, so both halves are needed for this
+# regression to kill the old source outside the live container image.
+if [ -n "${STUB_LEDGER_JQ_EMPTY_FILE:-}" ] &&
+   printf '%s' "$*" | grep -qF 'targetSha:$target,freezeSha:$freeze,freezePr:$pr'; then
+  printf 'attempt\n' >> "$STUB_LEDGER_JQ_EMPTY_FILE"
+  exit 0
+fi
+if [ -n "${STUB_LEDGER_JQ_EMPTY_FILE:-}" ] &&
+   printf '%s' "$*" | grep -qF '.runId == $run and .finishedAt == $now'; then
+  STUB_JQ_INPUT="$(cat)"
+  if [ -z "$STUB_JQ_INPUT" ]; then exit 0; fi
+  printf '%s' "$STUB_JQ_INPUT" | "$REAL_JQ" "$@"
+  exit $?
+fi
+exec "$REAL_JQ" "$@"
+STUB
+chmod +x "$STUB_BIN/jq"
 export PATH="$STUB_BIN:$PATH"
 
 reset_stubs() {
@@ -166,6 +189,7 @@ reset_stubs() {
         STUB_HEALTHZ_CODE STUB_SERVICES STUB_BACKEND_DEPLOYS STUB_FRONTEND_DEPLOYS \
         STUB_COMPARE_FILES STUB_COMPARE_EXIT STUB_LOCK_PROBE STUB_LOCK_PROBE_FILE \
         STUB_STATE_PROBE STUB_STATE_PROBE_FILE STUB_SUSPEND_SLEEP STUB_REPO_VIEW_EXIT \
+        STUB_LEDGER_JQ_EMPTY_FILE \
         SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER \
         SMOKE_GATE_OWNER SMOKE_GATE_LEASE_TTL_SECONDS 2>/dev/null || true
 }
@@ -178,6 +202,11 @@ fresh_state() {
   reset_stubs
 }
 sha() { printf "$1%.0s" $(seq 40); }
+expire_lease() { # <lease-file>; no writer is live in these test fixtures
+  local lease_file="$1" tmp="${1}.expired"
+  jq -c '.expiresAt="2000-01-01T00:00:00Z"' "$lease_file" > "$tmp"
+  mv "$tmp" "$lease_file"
+}
 
 # --- 1. Misconfig: fail-closed wake, throttled on the immediate next poll --
 fresh_state
@@ -1119,9 +1148,9 @@ bash "$GATE" finish "$ILV_HEAD1" run-ilv-3 NO_GO | jq -e '
 # half — the lock succeeds (its file lives in a writable directory) and the
 # `>>` fails at the FILE level (ENOSPC, chattr +i, a bad mode). That left
 # handoff.written:true / reason:null with no ledger line at all: the develop
-# gate blind to a NO_GO whose hold DID go up. Same read-back idiom as the
-# publish/hold writes. Directory stays writable throughout — only the
-# ledger file is unwritable.
+# gate blind to a NO_GO whose hold DID go up. A narrowly stubbed ledger-object
+# jq returns success with no bytes and models jq 1.6 accepting the subsequent
+# empty readback, which deterministically exercises the live bug on jq 1.7 too.
 fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
@@ -1133,25 +1162,47 @@ APPFAIL_DIR="$STATE_DIR/dev-gate4"
 mkdir -p "$APPFAIL_DIR"
 APPFAIL_LEDGER="$APPFAIL_DIR/handoff-ledger.jsonl"
 : > "$APPFAIL_LEDGER"
-chmod 400 "$APPFAIL_LEDGER"
+export STUB_LEDGER_JQ_EMPTY_FILE="$APPFAIL_DIR/empty-jq-attempts"
 export SMOKE_GATE_PUBLISH_FILE="$APPFAIL_DIR/latest-verdict.json" \
   SMOKE_GATE_HOLD_FILE="$APPFAIL_DIR/develop-hold.json" \
   SMOKE_GATE_HANDOFF_LEDGER="$APPFAIL_LEDGER"
 bash "$GATE" claim run-appfail 98 "$APPFAIL_HEAD" >/dev/null
 APPFAIL_OUT="$(bash "$GATE" finish "$APPFAIL_HEAD" run-appfail NO_GO 2>/dev/null || true)"
-chmod 600 "$APPFAIL_LEDGER"   # restore before asserting, so a failure still cleans up
+unset STUB_LEDGER_JQ_EMPTY_FILE
 jq -e --arg target "$APPFAIL_TARGET" '
   .ok == false and .leaseReleased == false and
   (.error | test("handoff-ledger.jsonl"))
 ' <<<"$APPFAIL_OUT" >/dev/null || {
   echo "an unwritten ledger line was reported as a successful handoff, got: $APPFAIL_OUT" >&2; exit 1; }
 [ "$(wc -c < "$APPFAIL_LEDGER")" -eq 0 ]
+[ "$(wc -l < "$APPFAIL_DIR/empty-jq-attempts")" -eq 2 ]
 # The hold still went up — a ledger failure must never skip or undo it.
 jq -e --arg sha "$APPFAIL_TARGET" '.sha == $sha and .runId == "run-appfail"' "$APPFAIL_DIR/develop-hold.json" >/dev/null
 jq -e '.activeRunId == "run-appfail" and .completedSha == null' "$STATE_DIR/pr-98-state.json" >/dev/null
 [ -s "$SMOKE_GATE_LEASE_DIR/lease-run-appfail.json" ]
+
+# Exercise the reproduced filesystem failure too when permissions are
+# enforceable. Root can append to mode 0400, so it runs the deterministic
+# empty-output case above and skips only this permission-specific repetition.
+if [ "$(id -u)" -ne 0 ]; then
+  chmod 400 "$APPFAIL_LEDGER"
+  APPFAIL_MODE_OUT="$(bash "$GATE" finish "$APPFAIL_HEAD" run-appfail NO_GO 2>/dev/null || true)"
+  chmod 600 "$APPFAIL_LEDGER"
+  jq -e '
+    .ok == false and .leaseReleased == false and
+    (.error | test("handoff-ledger.jsonl"))
+  ' <<<"$APPFAIL_MODE_OUT" >/dev/null || {
+    echo "mode-0400 ledger append failure was reported as success, got: $APPFAIL_MODE_OUT" >&2; exit 1; }
+  [ "$(wc -c < "$APPFAIL_LEDGER")" -eq 0 ]
+  jq -e '.activeRunId == "run-appfail" and .completedSha == null' "$STATE_DIR/pr-98-state.json" >/dev/null
+  [ -s "$SMOKE_GATE_LEASE_DIR/lease-run-appfail.json" ]
+fi
+
+# Once storage is repaired, the same-run retry writes one receipt and only
+# then completes the slot and releases shared ownership.
 bash "$GATE" finish "$APPFAIL_HEAD" run-appfail NO_GO | jq -e '.ok == true and .leaseReleased == true' >/dev/null
 tail -1 "$APPFAIL_LEDGER" | jq -e '.runId == "run-appfail"' >/dev/null
+[ "$(wc -l < "$APPFAIL_LEDGER")" -eq 1 ]
 
 # --- 27. one shared PR cannot have two live run ids across private roots -----
 fresh_state
@@ -1192,9 +1243,9 @@ SMOKE_GATE_STATE_DIR="$RUN_STATE_A" SMOKE_GATE_LEASE_DIR="$PR_COMMON_LEASE" \
 # Expiry permits a successor owner for the same PR, but never reassigns a run
 # id to another PR and strands the original PR's authority pointer.
 EXPIRED_PR_LEASE="$TEST_SHARED_ROOT/expired-cross-pr/leases"
-SMOKE_GATE_STATE_DIR="$RUN_STATE_A" SMOKE_GATE_LEASE_DIR="$EXPIRED_PR_LEASE" SMOKE_GATE_LEASE_TTL_SECONDS=2 \
+SMOKE_GATE_STATE_DIR="$RUN_STATE_A" SMOKE_GATE_LEASE_DIR="$EXPIRED_PR_LEASE" SMOKE_GATE_LEASE_TTL_SECONDS=30 \
   bash "$GATE" claim run-expired-cross-pr 133 "$PR_BIND_SHA" owner-a | jq -e '.ok == true' >/dev/null
-sleep 3
+expire_lease "$EXPIRED_PR_LEASE/lease-run-expired-cross-pr.json"
 RUN_COLLISION="$(SMOKE_GATE_STATE_DIR="$RUN_STATE_B" SMOKE_GATE_LEASE_DIR="$EXPIRED_PR_LEASE" SMOKE_GATE_LEASE_TTL_SECONDS=30 \
   bash "$GATE" claim run-expired-cross-pr 134 "$PR_BIND_SHA" owner-b || true)"
 jq -e '.ok == false and .leasePr == 133 and .requestedPr == 134 and (.error | test("permanently bound"))' <<<"$RUN_COLLISION" >/dev/null
@@ -1210,7 +1261,7 @@ SMOKE_GATE_STATE_DIR="$RUN_STATE_A" SMOKE_GATE_LEASE_DIR="$EXPIRED_PR_LEASE" \
 # --- 28. stale owner A cannot act after B reclaims through another state root
 fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
-  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base SMOKE_GATE_LEASE_TTL_SECONDS=2
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base SMOKE_GATE_LEASE_TTL_SECONDS=30
 STALE_BASE="$STATE_DIR"
 STATE_A="$STALE_BASE/private-a" STATE_B="$STALE_BASE/private-b"
 mkdir -p "$STATE_A" "$STATE_B"
@@ -1223,7 +1274,7 @@ export SMOKE_GATE_PUBLISH_FILE="$STALE_BASE/latest-verdict.json" \
   SMOKE_GATE_HANDOFF_LEDGER="$STALE_BASE/handoff-ledger.jsonl"
 SMOKE_GATE_STATE_DIR="$STATE_A" SMOKE_GATE_LEASE_DIR="$COMMON_LEASE" \
   bash "$GATE" claim run-shared-owner 120 "$STALE_SHA" owner-a | jq -e '.ok == true' >/dev/null
-sleep 3
+expire_lease "$COMMON_LEASE/lease-run-shared-owner.json"
 SMOKE_GATE_STATE_DIR="$STATE_B" SMOKE_GATE_LEASE_DIR="$COMMON_LEASE" SMOKE_GATE_LEASE_TTL_SECONDS=30 \
   bash "$GATE" claim run-shared-owner 120 "$STALE_SHA" owner-b | jq -e '.ok == true' >/dev/null
 export SMOKE_GATE_LEASE_TTL_SECONDS=30
@@ -1245,11 +1296,11 @@ SMOKE_GATE_STATE_DIR="$STATE_B" SMOKE_GATE_LEASE_DIR="$COMMON_LEASE" \
 # --- 29. stale owner cannot adopt B's token from the same mutable state ------
 fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
-  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base SMOKE_GATE_LEASE_TTL_SECONDS=2
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base SMOKE_GATE_LEASE_TTL_SECONDS=30
 SAME_SHA="$(sha 6)"
 SAME_CLAIM="$(bash "$GATE" claim run-same-state 121 "$SAME_SHA" owner-a || true)"
 jq -e '.ok == true' <<<"$SAME_CLAIM" >/dev/null || { echo "initial same-state claim failed: $SAME_CLAIM" >&2; exit 1; }
-sleep 3
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-run-same-state.json"
 SMOKE_GATE_LEASE_TTL_SECONDS=30 bash "$GATE" claim run-same-state 121 "$SAME_SHA" owner-b | jq -e '.ok == true' >/dev/null
 export SMOKE_GATE_LEASE_TTL_SECONDS=30
 for verb in progress release; do
@@ -1272,10 +1323,10 @@ bash "$GATE" release run-same-state owner-b | jq -e '.ok == true and .leaseRelea
 # same-run claim using the original token, never reviving an expired lease.
 fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
-  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base SMOKE_GATE_LEASE_TTL_SECONDS=2
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base SMOKE_GATE_LEASE_TTL_SECONDS=30
 EXPIRED_SHA="$(sha b)"
 bash "$GATE" claim run-expired-owner 127 "$EXPIRED_SHA" owner-a | jq -e '.ok == true' >/dev/null
-sleep 3
+expire_lease "$SMOKE_GATE_LEASE_DIR/lease-run-expired-owner.json"
 for lease_verb in lease-renew lease-release; do
   OUT="$(bash "$GATE" "$lease_verb" run-expired-owner owner-a || true)"
   jq -e '.ok == false and (.error | test("expired")) and (.error | test("recover with claim"))' <<<"$OUT" >/dev/null
