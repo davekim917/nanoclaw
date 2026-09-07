@@ -181,16 +181,180 @@ num_env LEASE_TTL_SECONDS SMOKE_GATE_LEASE_TTL_SECONDS 900
 # separate gate processes over a campaign and all of them must count as the
 # same owner; two containers must not. $HOSTNAME is the container id.
 DEFAULT_OWNER="${SMOKE_GATE_OWNER:-${HOSTNAME:-unknown-host}}"
-lease_file()      { printf '%s/lease-%s.json' "$STATE_DIR" "$1"; }
-lease_lock_file() { printf '%s/lease-%s.lock' "$STATE_DIR" "$1"; }
+# Per-PR history stays deployment-local. Coordinator authority does not: every
+# coordinator must see the same lease files and locks through the workgroup
+# mount. SMOKE_GATE_SHARED_ROOT is a test seam; deployments leave it unset.
+SHARED_LEASE_ROOT="${SMOKE_GATE_SHARED_ROOT:-/workspace/workgroup}"
+LEASE_DIR="${SMOKE_GATE_LEASE_DIR:-$SHARED_LEASE_ROOT/qa-coordinator/leases}"
+LEASE_DIR_PREPARED=false
+LEASE_DIR_ERROR=""
+LIFECYCLE_FENCE_HELD=false
+FENCED_AUTHORITY_JSON=""
+
+new_owner_token() {
+  local nonce token
+  nonce="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)"
+  printf '%s' "$nonce" | grep -Eq '^[0-9a-f-]{36}$' || return 1
+  token="$(printf '%s:%s:%s' "$nonce" "$$" "$(date -u +%s%N)" | sha256sum | cut -d' ' -f1)"
+  [ "${#token}" -eq 64 ] || return 1
+  printf 'owner-%s' "$token"
+}
+
+lease_dir_prepare() {
+  local root ancestor ancestor_real dir probe
+  if [ "$LEASE_DIR_PREPARED" = true ]; then return 0; fi
+  if [ ! -d "$SHARED_LEASE_ROOT" ]; then
+    LEASE_DIR_ERROR="shared lease root $SHARED_LEASE_ROOT is missing"
+    return 1
+  fi
+  if ! command -v mountpoint >/dev/null 2>&1 || ! mountpoint -q "$SHARED_LEASE_ROOT"; then
+    LEASE_DIR_ERROR="shared lease root $SHARED_LEASE_ROOT is not a mounted filesystem"
+    return 1
+  fi
+  root="$(cd -P "$SHARED_LEASE_ROOT" 2>/dev/null && pwd -P)" || {
+    LEASE_DIR_ERROR="shared lease root $SHARED_LEASE_ROOT cannot be resolved"; return 1; }
+  case "$LEASE_DIR" in
+    "$SHARED_LEASE_ROOT"/*) ;;
+    *) LEASE_DIR_ERROR="configured lease directory $LEASE_DIR is outside $SHARED_LEASE_ROOT"; return 1 ;;
+  esac
+  ancestor="$LEASE_DIR"
+  while [ "$ancestor" != / ] && [ ! -e "$ancestor" ] && [ ! -L "$ancestor" ]; do
+    ancestor="$(dirname "$ancestor")"
+  done
+  ancestor_real="$(cd -P "$ancestor" 2>/dev/null && pwd -P)" || {
+    LEASE_DIR_ERROR="configured lease directory has no resolvable ancestor: $ancestor"; return 1; }
+  case "$ancestor_real" in
+    "$root"|"$root"/*) ;;
+    *) LEASE_DIR_ERROR="configured lease directory resolves through non-shared path $ancestor_real"; return 1 ;;
+  esac
+  if ! mkdir -p -- "$LEASE_DIR" 2>/dev/null; then
+    LEASE_DIR_ERROR="could not create shared lease directory $LEASE_DIR"
+    return 1
+  fi
+  dir="$(cd -P "$LEASE_DIR" 2>/dev/null && pwd -P)" || {
+    LEASE_DIR_ERROR="could not resolve shared lease directory $LEASE_DIR"; return 1; }
+  case "$dir" in
+    "$root"/*) ;;
+    *) LEASE_DIR_ERROR="configured lease directory resolves outside shared root: $dir"; return 1 ;;
+  esac
+  probe="$(mktemp "$dir/.lease-probe.XXXXXX" 2>/dev/null)" || {
+    LEASE_DIR_ERROR="shared lease directory is not writable: $dir"; return 1; }
+  if ! printf 'probe\n' > "$probe" 2>/dev/null || ! rm -f "$probe" 2>/dev/null; then
+    rm -f "$probe" 2>/dev/null || true
+    LEASE_DIR_ERROR="shared lease directory cannot complete an atomic write: $dir"
+    return 1
+  fi
+  LEASE_DIR="$dir"
+  LEASE_DIR_PREPARED=true
+}
+
+emit_lease_dir_error() {  # <runId> <command>
+  jq -cn --arg run "$1" --arg cmd "$2" --arg dir "$LEASE_DIR" --arg detail "$LEASE_DIR_ERROR" \
+    '{ok:false,error:("shared coordinator lease unavailable - " + $detail + "; refusing to continue unleased"),
+      runId:$run,command:$cmd,leaseDir:$dir}'
+}
+
+lease_file()      { printf '%s/lease-%s.json' "$LEASE_DIR" "$1"; }
+lease_lock_file() { printf '%s/lease-%s.lock' "$LEASE_DIR" "$1"; }
+lease_lifecycle_lock_file() { printf '%s/pr-%s-lifecycle.lock' "$LEASE_DIR" "$1"; }
+pr_authority_file() { printf '%s/pr-%s-authority.json' "$LEASE_DIR" "$1"; }
+
+read_pr_authority() {
+  local f; f="$(pr_authority_file "$1")"
+  if [ ! -e "$f" ]; then
+    printf 'null'
+  elif [ -s "$f" ] && jq -e --argjson pr "$1" '
+      type == "object" and .schemaVersion == 1 and .pr == $pr and
+      (.runId | type == "string" and length > 0) and
+      (.owner | type == "string" and length > 0) and
+      (.boundAt | type == "string" and length > 0)
+    ' "$f" >/dev/null 2>&1; then
+    jq -c '.' "$f"
+  else
+    jq -cn --arg path "$f" '{malformedAuthority:true,path:$path}'
+  fi
+}
+
+write_pr_authority() { # <pr> <json>
+  local tmp
+  tmp="$(mktemp "$LEASE_DIR/.pr-$1-authority.XXXXXX" 2>/dev/null)" || return 1
+  printf '%s\n' "$2" >"$tmp" 2>/dev/null &&
+    mv "$tmp" "$(pr_authority_file "$1")" 2>/dev/null && return 0
+  rm -f "$tmp" 2>/dev/null || true
+  return 1
+}
+
+pr_authority_status() { # <authority-json>: absent|malformed|expired|live
+  local authority="$1" run owner lease
+  [ "$authority" != null ] || { printf 'absent'; return; }
+  jq -e '.malformedAuthority != true' <<<"$authority" >/dev/null 2>&1 || { printf 'malformed'; return; }
+  run="$(jq -r '.runId' <<<"$authority")"; owner="$(jq -r '.owner' <<<"$authority")"
+  lease="$(read_lease "$run")"
+  [ "$(lease_is_malformed "$lease")" != true ] || { printf 'malformed'; return; }
+  [ "$lease" != null ] || { printf 'expired'; return; }
+  [ "$(jq -r '.owner // empty' <<<"$lease")" = "$owner" ] || { printf 'malformed'; return; }
+  if [ "$(lease_is_live "$lease")" = true ]; then printf 'live'; else printf 'expired'; fi
+}
+
+bind_pr_authority() { # <pr> <runId> <owner>
+  local next
+  next="$(jq -cn --argjson pr "$1" --arg run "$2" --arg owner "$3" --arg now "$(iso_now)" \
+    '{schemaVersion:1,pr:$pr,runId:$run,owner:$owner,boundAt:$now}')" || return 1
+  write_pr_authority "$1" "$next"
+}
+
+remove_pr_authority_fenced() { # <pr> <runId> <owner>
+  local authority
+  authority="$(read_pr_authority "$1")"
+  [ "$(jq -r '.runId // empty' <<<"$authority" 2>/dev/null)" = "$2" ] &&
+    [ "$(jq -r '.owner // empty' <<<"$authority" 2>/dev/null)" = "$3" ] || return 1
+  rm -f "$(pr_authority_file "$1")" 2>/dev/null && [ ! -e "$(pr_authority_file "$1")" ]
+}
+
+lease_lifecycle_begin() { # <pr> <runId> <command>
+  local pr="$1" run="$2" command="$3"
+  if ! lease_dir_prepare; then emit_lease_dir_error "$run" "$command"; return 1; fi
+  if ! exec 5>"$(lease_lifecycle_lock_file "$pr")"; then
+    jq -cn --argjson pr "$pr" --arg run "$run" --arg dir "$LEASE_DIR" --arg cmd "$command" \
+      '{ok:false,error:("could not open shared lifecycle lock under " + $dir + " - refusing to continue unleased"),pr:$pr,runId:$run,command:$cmd,leaseDir:$dir}'
+    return 1
+  fi
+  if ! flock -w "$LOCK_WAIT" 5; then
+    jq -cn --argjson pr "$pr" --arg run "$run" --arg cmd "$command" \
+      '{ok:false,retryable:true,error:"gate_lock_busy: another invocation held this PR lifecycle fence - RETRY this same command in ~10s.",pr:$pr,runId:$run,command:$cmd}'
+    exec 5>&-
+    return 1
+  fi
+  LIFECYCLE_FENCE_HELD=true
+}
+
+lease_lifecycle_end() {
+  if [ "$LIFECYCLE_FENCE_HELD" = true ]; then
+    flock -u 5 2>/dev/null || true
+    exec 5>&-
+    LIFECYCLE_FENCE_HELD=false
+  fi
+}
 
 read_lease() {
   local f; f="$(lease_file "$1")"
-  if [ -s "$f" ] && jq -e 'type == "object"' "$f" >/dev/null 2>&1; then
+  if [ ! -e "$f" ]; then
+    printf 'null'
+  elif [ -s "$f" ] && jq -e '
+      type == "object" and .schemaVersion == 1 and
+      (.owner | type == "string" and length > 0) and
+      (.claimedAt | type == "string" and length > 0) and
+      (.renewedAt | type == "string" and length > 0) and
+      (.expiresAt | type == "string" and length > 0)
+    ' "$f" >/dev/null 2>&1; then
     jq -c '.' "$f"
   else
-    printf 'null'
+    jq -cn --arg path "$f" '{malformedLease:true,path:$path}'
   fi
+}
+
+lease_is_malformed() {
+  jq -e '.malformedLease == true' <<<"${1:-null}" >/dev/null 2>&1 && printf 'true' || printf 'false'
 }
 
 lease_is_live() {  # <lease-json>
@@ -210,7 +374,7 @@ lease_expiry_from_now() {
 
 write_lease() {  # <runId> <json>
   local tmp
-  tmp="$(mktemp "$STATE_DIR/.lease-$1.XXXXXX" 2>/dev/null)" || return 1
+  tmp="$(mktemp "$LEASE_DIR/.lease-$1.XXXXXX" 2>/dev/null)" || return 1
   printf '%s\n' "$2" > "$tmp" 2>/dev/null &&
     mv "$tmp" "$(lease_file "$1")" 2>/dev/null && return 0
   rm -f "$tmp" 2>/dev/null
@@ -224,7 +388,15 @@ write_lease() {  # <runId> <json>
 # two claimants racing the same expiry cannot both believe they won.
 lease_acquire() {  # <runId> <owner> [quiet]
   local run="$1" owner="$2" quiet="${3:-}" cur prior_claimed now next back
-  exec 6>"$(lease_lock_file "$run")"
+  if ! lease_dir_prepare; then
+    [ -n "$quiet" ] || emit_lease_dir_error "$run" "lease-claim"
+    return 1
+  fi
+  if ! exec 6>"$(lease_lock_file "$run")"; then
+    [ -n "$quiet" ] || jq -cn --arg run "$run" --arg dir "$LEASE_DIR" \
+      '{ok:false,error:("could not open shared lease lock under " + $dir + " - refusing to run unleased"),runId:$run,leaseDir:$dir}'
+    return 1
+  fi
   if ! flock -w "$LOCK_WAIT" 6; then
     [ -n "$quiet" ] || jq -cn --arg run "$run" \
       '{ok:false,retryable:true,
@@ -234,6 +406,12 @@ lease_acquire() {  # <runId> <owner> [quiet]
     return 1
   fi
   cur="$(read_lease "$run")"
+  if [ "$(lease_is_malformed "$cur")" = true ]; then
+    [ -n "$quiet" ] || jq -cn --arg run "$run" --arg path "$(lease_file "$run")" \
+      '{ok:false,error:("shared coordinator lease is malformed at " + $path + " - refusing to overwrite or run unleased"),runId:$run,leaseFile:$path}'
+    flock -u 6; exec 6>&-
+    return 1
+  fi
   if [ "$(lease_is_live "$cur")" = true ] &&
      [ "$(jq -r '.owner // empty' <<<"$cur")" != "$owner" ]; then
     [ -n "$quiet" ] || jq -cn --arg run "$run" --arg owner "$owner" --argjson lease "$cur" \
@@ -255,9 +433,9 @@ lease_acquire() {  # <runId> <owner> [quiet]
     --arg claimed "${prior_claimed:-$now}" --arg exp "$(lease_expiry_from_now)" \
     '{schemaVersion:1,owner:$owner,claimedAt:$claimed,renewedAt:$now,expiresAt:$exp}')"
   if ! write_lease "$run" "$next"; then
-    [ -n "$quiet" ] || jq -cn --arg run "$run" --arg dir "$STATE_DIR" \
+    [ -n "$quiet" ] || jq -cn --arg run "$run" --arg dir "$LEASE_DIR" \
       '{ok:false,error:("could not write the lease file under " + $dir +
-                        " — refusing to run unleased. Fix the state dir and retry."),runId:$run}'
+                        " - refusing to run unleased. Fix the shared lease dir and retry."),runId:$run,leaseDir:$dir}'
     flock -u 6; exec 6>&-
     return 1
   fi
@@ -277,16 +455,72 @@ lease_acquire() {  # <runId> <owner> [quiet]
   return 0
 }
 
-# Unconditional drop, for `finish`/`release` only. Both have already proved the
-# caller owns the RUN SLOT (the not-the-active-run guard), which is the
-# stronger claim — re-checking the lease owner there would strand a lease
-# whenever a container was replaced mid-run.
-lease_drop() {  # <runId>
-  exec 6>"$(lease_lock_file "$1")"
-  flock -w "$LOCK_WAIT" 6 || true
-  rm -f "$(lease_file "$1")" 2>/dev/null || true
-  flock -u 6 2>/dev/null || true
-  exec 6>&-
+# A lifecycle command holds one shared PR fence and the run lease lock from
+# owner validation through its state/effect transition. Separate private state
+# roots therefore cannot race each other, and an expired owner cannot act after
+# a successor reclaims the lease.
+lease_fence_begin() {  # <pr> <runId> <owner> <command>
+  local pr="$1" run="$2" owner="$3" command="$4" lease live lease_owner authority
+  if [ "$LIFECYCLE_FENCE_HELD" != true ] && ! lease_lifecycle_begin "$pr" "$run" "$command"; then return 1; fi
+  if ! exec 6>"$(lease_lock_file "$run")"; then
+    jq -cn --argjson pr "$pr" --arg run "$run" --arg dir "$LEASE_DIR" --arg cmd "$command" \
+      '{ok:false,error:("could not open shared run lease lock under " + $dir + " - refusing to continue unleased"),pr:$pr,runId:$run,command:$cmd,leaseDir:$dir}'
+    lease_lifecycle_end
+    return 1
+  fi
+  if ! flock -w "$LOCK_WAIT" 6; then
+    jq -cn --argjson pr "$pr" --arg run "$run" --arg cmd "$command" \
+      '{ok:false,retryable:true,error:"gate_lock_busy: another invocation held this run lease lock - RETRY this same command in ~10s.",pr:$pr,runId:$run,command:$cmd}'
+    exec 6>&-; lease_lifecycle_end
+    return 1
+  fi
+  lease="$(read_lease "$run")"
+  if [ "$(lease_is_malformed "$lease")" = true ]; then
+    jq -cn --argjson pr "$pr" --arg run "$run" --arg cmd "$command" --arg path "$(lease_file "$run")" \
+      '{ok:false,error:("shared coordinator lease is malformed at " + $path + " - refusing lifecycle authority"),pr:$pr,runId:$run,command:$cmd,leaseFile:$path}'
+    flock -u 6; exec 6>&-; lease_lifecycle_end
+    return 1
+  fi
+  live="$(lease_is_live "$lease")"
+  lease_owner="$(jq -r '.owner // empty' <<<"$lease" 2>/dev/null)"
+  if [ "$live" != true ] || [ "$lease_owner" != "$owner" ]; then
+    jq -cn --argjson pr "$pr" --arg run "$run" --arg owner "$owner" --arg cmd "$command" \
+      --argjson lease "$lease" --argjson live "$live" \
+      '{ok:false,error:"live shared coordinator lease does not belong to this lifecycle owner - STOP this campaign; if this is the original owner after expiry, recover with claim using the same run id and owner token",pr:$pr,runId:$run,command:$cmd,requestedBy:$owner,held:$live,leaseOwner:($lease.owner // null),expiresAt:($lease.expiresAt // null)}'
+    flock -u 6; exec 6>&-; lease_lifecycle_end
+    return 1
+  fi
+  authority="$(read_pr_authority "$pr")"
+  if [ "$(jq -r '.runId // empty' <<<"$authority" 2>/dev/null)" != "$run" ] ||
+     [ "$(jq -r '.owner // empty' <<<"$authority" 2>/dev/null)" != "$owner" ] ||
+     [ "$(pr_authority_status "$authority")" != live ]; then
+    jq -cn --argjson pr "$pr" --arg run "$run" --arg owner "$owner" --arg cmd "$command" --argjson authority "$authority" \
+      '{ok:false,error:"shared PR authority belongs to another run or owner - STOP this campaign",pr:$pr,runId:$run,command:$cmd,requestedBy:$owner,authority:$authority}'
+    flock -u 6; exec 6>&-; lease_lifecycle_end
+    return 1
+  fi
+  FENCED_LEASE_JSON="$lease"
+  FENCED_AUTHORITY_JSON="$authority"
+  return 0
+}
+
+lease_fence_end() {
+  flock -u 6 2>/dev/null || true; exec 6>&-
+  lease_lifecycle_end
+  FENCED_AUTHORITY_JSON=""
+}
+
+lease_remove_fenced() {  # <runId>
+  if ! rm -f "$(lease_file "$1")" 2>/dev/null || [ -e "$(lease_file "$1")" ]; then
+    return 1
+  fi
+}
+
+lease_restore_fenced() {  # <runId> <lease-json>
+  local restored
+  restored="$(jq -c --arg now "$(iso_now)" --arg exp "$(lease_expiry_from_now)" \
+    '.renewedAt=$now | .expiresAt=$exp' <<<"$2")" || return 1
+  write_lease "$1" "$restored"
 }
 
 # --- Challenger disposition ------------------------------------------------
@@ -332,6 +566,7 @@ default_pr_state() {
     activeStartedAt: null,
     activeRunId: null,
     activeProgressAt: null,
+    activeLeaseOwner: null,
     completedSha: null,
     completedAt: null,
     completedRunId: null,
@@ -369,9 +604,12 @@ read_pr_state() {
 
 write_pr_state() {
   local n="$1" next="$2" tmp
-  tmp="$(mktemp "$STATE_DIR/.pr-$n-state.XXXXXX")"
-  printf '%s\n' "$next" > "$tmp"
-  mv "$tmp" "$(pr_state_file "$n")"
+  tmp="$(mktemp "$STATE_DIR/.pr-$n-state.XXXXXX" 2>/dev/null)" || return 1
+  if ! printf '%s\n' "$next" > "$tmp" 2>/dev/null ||
+     ! mv "$tmp" "$(pr_state_file "$n")" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
 }
 
 default_control() {
@@ -380,6 +618,8 @@ default_control() {
     fetchFailures: 0,
     lastFailureWakeAt: null,
     lastMisconfigWakeAt: null,
+    leaseFailureFingerprint: null,
+    leaseFailureWakeAt: null,
     preflightReason: null,
     preflightWakeAt: null,
     preflightFingerprint: null
@@ -399,6 +639,35 @@ write_control() {
   tmp="$(mktemp "$STATE_DIR/.control.XXXXXX")"
   printf '%s\n' "$next" > "$tmp"
   mv "$tmp" "$CONTROL_FILE"
+}
+
+emit_poll_lease_failure() { # <detail-json>
+  local detail="$1" fingerprint last now wake=false control
+  # A live owner is ordinary contention: the existing campaign remains the
+  # only authority and the watcher stays quiet. Lock contention is retryable
+  # on the next scheduled poll and is quiet for the same reason.
+  if jq -e '(.leaseOwner // null) != null or .retryable == true' <<<"$detail" >/dev/null 2>&1; then
+    jq -cn --argjson detail "$detail" \
+      '{ok:false,wakeAgent:false,data:{schemaVersion:1,trigger:"coordinator_lease_unavailable",detail:$detail}}'
+    return
+  fi
+  fingerprint="$(jq -r '.error // "unknown shared lease failure"' <<<"$detail" | sha256sum | cut -d' ' -f1)"
+  exec 4>"$CONTROL_LOCK"
+  if flock -w 5 4; then
+    control="$(read_control)"
+    last="$(epoch_or_zero "$(jq -r --arg fp "$fingerprint" 'if .leaseFailureFingerprint == $fp then .leaseFailureWakeAt // empty else empty end' <<<"$control")")"
+    now="$(date -u +%s)"
+    if [ "$(( now - last ))" -ge 21600 ]; then wake=true; fi
+    control="$(jq -c --arg fp "$fingerprint" --arg at "$(iso_now)" --argjson wake "$wake" \
+      '.leaseFailureFingerprint=$fp | if $wake then .leaseFailureWakeAt=$at else . end' <<<"$control")"
+    write_control "$control" || wake=true
+    flock -u 4
+  else
+    wake=true
+  fi
+  exec 4>&-
+  jq -cn --argjson wake "$wake" --argjson detail "$detail" \
+    '{ok:false,wakeAgent:$wake,data:{schemaVersion:1,trigger:"coordinator_lease_unavailable",detail:$detail}}'
 }
 
 # Same liveness rule as smoke-develop-gate.sh: a run is live while its newest
@@ -974,8 +1243,42 @@ if [ "$COMMAND" = "claim" ]; then
   # one filesystem view and both coordinators pass it. Take the durable lease
   # before writing the slot, and refuse the claim outright if it is held: an
   # unleased claim is exactly the duplicate coordinator this closes.
+  if ! lease_lifecycle_begin "$PR" "$RUN_ID" "$COMMAND"; then
+    exit 0
+  fi
+  PRIOR_AUTHORITY="$(read_pr_authority "$PR")"
+  AUTHORITY_STATUS="$(pr_authority_status "$PRIOR_AUTHORITY")"
+  if [ "$AUTHORITY_STATUS" = malformed ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg path "$(pr_authority_file "$PR")" \
+      '{ok:false,error:("shared PR authority is malformed at " + $path + " - refusing claim"),pr:$pr,runId:$run}'
+    lease_lifecycle_end
+    exit 0
+  fi
+  if [ "$AUTHORITY_STATUS" = live ] &&
+     { [ "$(jq -r '.runId' <<<"$PRIOR_AUTHORITY")" != "$RUN_ID" ] ||
+       [ "$(jq -r '.owner' <<<"$PRIOR_AUTHORITY")" != "$OWNER" ]; } &&
+     [ "$TAKEOVER" != true ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg owner "$OWNER" --argjson authority "$PRIOR_AUTHORITY" \
+      '{ok:false,error:"another live run owns this PR in the shared coordinator registry - refuse duplicate campaign unless an operator explicitly authorizes --takeover",pr:$pr,runId:$run,requestedBy:$owner,activeRunId:$authority.runId,leaseOwner:$authority.owner}'
+    lease_lifecycle_end
+    exit 0
+  fi
+  PRIOR_LEASE="$(read_lease "$RUN_ID")"
   if ! LEASE_RESULT="$(lease_acquire "$RUN_ID" "$OWNER")"; then
     printf '%s\n' "$LEASE_RESULT"
+    lease_lifecycle_end
+    exit 0
+  fi
+  if ! bind_pr_authority "$PR" "$RUN_ID" "$OWNER"; then
+    if [ "$(lease_is_live "$PRIOR_LEASE")" = true ]; then write_lease "$RUN_ID" "$PRIOR_LEASE" || true
+    else rm -f "$(lease_file "$RUN_ID")" 2>/dev/null || true; fi
+    lease_lifecycle_end
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" '{ok:false,error:"could not write shared PR authority - claim refused",pr:$pr,runId:$run}'
+    exit 1
+  fi
+  # Keep the shared PR lifecycle fence across acquisition and the private slot
+  # write, then also take the run lock to verify the owner we just installed.
+  if ! lease_fence_begin "$PR" "$RUN_ID" "$OWNER" "$COMMAND"; then
     exit 0
   fi
   NOW="$(iso_now)"
@@ -990,17 +1293,35 @@ if [ "$COMMAND" = "claim" ]; then
   # keeps its original deadline. Stamping a fresh one on every recovery
   # reclaim reset the clock hourly and made `challenger-timeout` unreachable
   # — pr1432 looped ~4h "stuck waiting on challenger" (2026-09-02).
-  STATE="$(jq -c --arg sha "$SHA" --arg now "$NOW" --arg run "$RUN_ID" --arg took "$TOOK_OVER" \
+  STATE="$(jq -c --arg sha "$SHA" --arg now "$NOW" --arg run "$RUN_ID" --arg owner "$OWNER" --arg took "$TOOK_OVER" \
     --arg deadline "$(challenger_deadline_from_now)" \
     '(if (.activeSha == $sha and (.challengerDeadline // "") != "" and .challengerDisposition == null)
       then .challengerDeadline else $deadline end) as $dl |
      .activeSha=$sha | .activeStartedAt=$now | .activeRunId=$run | .activeProgressAt=$now |
+     .activeLeaseOwner=$owner |
      .displacedRunId=(if $took == "" then null else $took end) |
      .displacedAt=(if $took == "" then null else $now end) |
      .challengerDeadline=$dl |
      .challengerDisposition=null | .challengerTimedOutAt=null |
      .finishIntent=null' <<<"$STATE")"
-  write_pr_state "$PR" "$STATE"
+  if ! write_pr_state "$PR" "$STATE"; then
+    CLEANUP=""
+    if [ "$(lease_is_live "$PRIOR_LEASE")" = true ]; then
+      write_lease "$RUN_ID" "$PRIOR_LEASE" || CLEANUP="; the preexisting shared lease also could not be restored"
+    else
+      lease_remove_fenced "$RUN_ID" || CLEANUP="; the just-acquired shared lease also could not be removed"
+    fi
+    if [ "$PRIOR_AUTHORITY" = null ]; then
+      rm -f "$(pr_authority_file "$PR")" 2>/dev/null || CLEANUP="$CLEANUP; the new shared PR authority could not be removed"
+    else
+      write_pr_authority "$PR" "$PRIOR_AUTHORITY" || CLEANUP="$CLEANUP; the prior shared PR authority could not be restored"
+    fi
+    lease_fence_end
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg owner "$OWNER" --arg cleanup "$CLEANUP" \
+      '{ok:false,error:("could not write the private PR slot - claim refused" + $cleanup),pr:$pr,runId:$run,owner:$owner}'
+    exit 1
+  fi
+  lease_fence_end
   jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg sha "$SHA" --arg took "$TOOK_OVER" \
     --argjson lease "$(jq -c '.lease' <<<"$LEASE_RESULT")" \
     --arg deadline "$(jq -r '.challengerDeadline' <<<"$STATE")" \
@@ -1025,8 +1346,18 @@ if [ "$COMMAND" = "lease-claim" ] || [ "$COMMAND" = "lease-renew" ] ||
     exit 2
   fi
 
+  if ! lease_dir_prepare; then
+    emit_lease_dir_error "$RUN_ID" "$COMMAND"
+    exit 1
+  fi
+
   if [ "$COMMAND" = "lease-status" ]; then
     LEASE="$(read_lease "$RUN_ID")"
+    if [ "$(lease_is_malformed "$LEASE")" = true ]; then
+      jq -cn --arg run "$RUN_ID" --arg path "$(lease_file "$RUN_ID")" \
+        '{ok:false,error:("shared coordinator lease is malformed at " + $path + " - refusing to report it available"),runId:$run,leaseFile:$path}'
+      exit 1
+    fi
     jq -cn --arg run "$RUN_ID" --argjson lease "$LEASE" --argjson live "$(lease_is_live "$LEASE")" \
       '{ok:true,runId:$run,held:$live,lease:$lease}'
     exit 0
@@ -1041,7 +1372,11 @@ if [ "$COMMAND" = "lease-claim" ] || [ "$COMMAND" = "lease-renew" ] ||
   # renewing would extend someone else's hold; a non-owner releasing would
   # hand the run to whoever asked next, which is the fault this file exists
   # to stop.
-  exec 6>"$(lease_lock_file "$RUN_ID")"
+  if ! exec 6>"$(lease_lock_file "$RUN_ID")"; then
+    jq -cn --arg run "$RUN_ID" --arg cmd "$COMMAND" --arg dir "$LEASE_DIR" \
+      '{ok:false,error:("could not open shared lease lock under " + $dir + " - refusing to continue unleased"),runId:$run,command:$cmd,leaseDir:$dir}'
+    exit 1
+  fi
   if ! flock -w "$LOCK_WAIT" 6; then
     jq -cn --arg run "$RUN_ID" --arg cmd "$COMMAND" \
       '{ok:false,retryable:true,
@@ -1050,6 +1385,12 @@ if [ "$COMMAND" = "lease-claim" ] || [ "$COMMAND" = "lease-renew" ] ||
     exit 0
   fi
   LEASE="$(read_lease "$RUN_ID")"
+  if [ "$(lease_is_malformed "$LEASE")" = true ]; then
+    jq -cn --arg run "$RUN_ID" --arg cmd "$COMMAND" --arg path "$(lease_file "$RUN_ID")" \
+      '{ok:false,error:("shared coordinator lease is malformed at " + $path + " - refusing to renew or release"),runId:$run,command:$cmd,leaseFile:$path}'
+    flock -u 6
+    exit 1
+  fi
   if [ "$LEASE" = null ]; then
     jq -cn --arg run "$RUN_ID" --arg cmd "$COMMAND" \
       '{ok:false,error:("no lease exists for this run — " +
@@ -1067,21 +1408,30 @@ if [ "$COMMAND" = "lease-claim" ] || [ "$COMMAND" = "lease-renew" ] ||
     flock -u 6
     exit 0
   fi
+  if [ "$(lease_is_live "$LEASE")" != true ]; then
+    jq -cn --arg run "$RUN_ID" --arg owner "$OWNER" --arg cmd "$COMMAND" --arg exp "$(jq -r '.expiresAt' <<<"$LEASE")" \
+      '{ok:false,error:("the coordinator lease expired at " + $exp + " - " + $cmd + " cannot revive or remove expired authority; recover with claim using the same run id and owner token"),runId:$run,requestedBy:$owner,expiresAt:$exp}'
+    flock -u 6
+    exit 0
+  fi
   if [ "$COMMAND" = "lease-release" ]; then
-    rm -f "$(lease_file "$RUN_ID")" 2>/dev/null
+    if ! lease_remove_fenced "$RUN_ID"; then
+      jq -cn --arg run "$RUN_ID" --arg owner "$OWNER" --arg dir "$LEASE_DIR" \
+        '{ok:false,error:("could not remove shared lease under " + $dir + " - refusing to report it released"),runId:$run,owner:$owner,leaseDir:$dir}'
+      flock -u 6
+      exit 1
+    fi
     jq -cn --arg run "$RUN_ID" --arg owner "$OWNER" '{ok:true,runId:$run,released:true,owner:$owner}'
     flock -u 6
     exit 0
   fi
-  # lease-renew. An EXPIRED lease is renewable by its own owner — expiry means
-  # "others may now take over", not "the owner has been evicted", and refusing
-  # here would push a still-healthy coordinator into a takeover race with
-  # itself.
+  # lease-renew only extends a live lease. Recovery after expiry goes through
+  # the same-run claim path so it is serialized against successor claims.
   NEXT="$(jq -c --arg now "$(iso_now)" --arg exp "$(lease_expiry_from_now)" \
     '.renewedAt=$now | .expiresAt=$exp' <<<"$LEASE")"
   if ! write_lease "$RUN_ID" "$NEXT"; then
-    jq -cn --arg run "$RUN_ID" --arg dir "$STATE_DIR" \
-      '{ok:false,error:("could not write the lease file under " + $dir + " — the lease will EXPIRE; fix the state dir and retry"),runId:$run}'
+    jq -cn --arg run "$RUN_ID" --arg dir "$LEASE_DIR" \
+      '{ok:false,error:("could not write the lease file under " + $dir + " - the lease will EXPIRE; fix the shared lease dir and retry"),runId:$run,leaseDir:$dir}'
     flock -u 6
     exit 1
   fi
@@ -1094,6 +1444,7 @@ fi
 # ---------------------------------------------------------------------------
 if [ "$COMMAND" = "progress" ]; then
   RUN_ID="${2:-}"
+  OWNER="${3:-$DEFAULT_OWNER}"
   PR="$(find_pr_for_run "$RUN_ID" || true)"
   if [ -z "$RUN_ID" ] || [ -z "${PR:-}" ]; then
     emit_not_active "$RUN_ID" "not the active run (reclaimed or finished) — stop this campaign"
@@ -1113,16 +1464,41 @@ if [ "$COMMAND" = "progress" ]; then
         activeRunId:(if $active == "" then null else $active end)}'
     exit 0
   fi
+  STORED_OWNER="$(jq -r '.activeLeaseOwner // empty' <<<"$STATE")"
+  if [ -z "$STORED_OWNER" ] || [ "$OWNER" != "$STORED_OWNER" ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg owner "$OWNER" --arg stored "$STORED_OWNER" \
+      '{ok:false,error:"caller owner does not match the owner recorded by claim - STOP this campaign",pr:$pr,runId:$run,requestedBy:$owner,claimedBy:(if $stored == "" then null else $stored end)}'
+    exit 0
+  fi
+  if ! lease_fence_begin "$PR" "$RUN_ID" "$OWNER" "$COMMAND"; then
+    exit 0
+  fi
   NOW="$(iso_now)"
+  RENEWED_LEASE="$(jq -c --arg now "$NOW" --arg exp "$(lease_expiry_from_now)" \
+    '.renewedAt=$now | .expiresAt=$exp' <<<"$FENCED_LEASE_JSON")"
+  if ! write_lease "$RUN_ID" "$RENEWED_LEASE"; then
+    lease_fence_end
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg dir "$LEASE_DIR" \
+      '{ok:false,error:("could not renew the live shared lease under " + $dir + " - progress not recorded; retry before the lease expires"),pr:$pr,runId:$run}'
+    exit 1
+  fi
   STATE="$(jq -c --arg now "$NOW" '.activeProgressAt=$now' <<<"$STATE")"
-  write_pr_state "$PR" "$STATE"
-  jq -cn --argjson pr "$PR" --arg run "$RUN_ID" '{ok:true,runId:$run,pr:$pr}'
+  if ! write_pr_state "$PR" "$STATE"; then
+    lease_fence_end
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" \
+      '{ok:false,error:"could not write progress state - progress not recorded",pr:$pr,runId:$run}'
+    exit 1
+  fi
+  lease_fence_end
+  jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --argjson lease "$RENEWED_LEASE" \
+    '{ok:true,runId:$run,pr:$pr,leaseRenewed:true,lease:$lease}'
   exit 0
 fi
 
 # ---------------------------------------------------------------------------
 if [ "$COMMAND" = "release" ]; then
   RUN_ID="${2:-}"
+  OWNER="${3:-$DEFAULT_OWNER}"
   PR="$(find_pr_for_run "$RUN_ID" || true)"
   if [ -z "$RUN_ID" ] || [ -z "${PR:-}" ]; then
     emit_not_active "$RUN_ID" "not the active run — nothing released"
@@ -1142,12 +1518,42 @@ if [ "$COMMAND" = "release" ]; then
         activeRunId:(if $active == "" then null else $active end)}'
     exit 0
   fi
+  STORED_OWNER="$(jq -r '.activeLeaseOwner // empty' <<<"$STATE")"
+  if [ -z "$STORED_OWNER" ] || [ "$OWNER" != "$STORED_OWNER" ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg owner "$OWNER" --arg stored "$STORED_OWNER" \
+      '{ok:false,error:"caller owner does not match the owner recorded by claim - nothing released",pr:$pr,runId:$run,requestedBy:$owner,claimedBy:(if $stored == "" then null else $stored end)}'
+    exit 0
+  fi
+  if ! lease_fence_begin "$PR" "$RUN_ID" "$OWNER" "$COMMAND"; then
+    exit 0
+  fi
   STATE="$(jq -c '.activeSha=null | .activeStartedAt=null | .activeRunId=null | .activeProgressAt=null |
-     .challengerDeadline=null | .finishIntent=null' <<<"$STATE")"
-  write_pr_state "$PR" "$STATE"
-  # The slot is gone, so the lease must go with it — otherwise the next
-  # coordinator on this run waits out a TTL for a campaign that already ended.
-  lease_drop "$RUN_ID"
+     .activeLeaseOwner=null | .challengerDeadline=null | .finishIntent=null' <<<"$STATE")"
+  # Remove the PR binding and run lease together under the shared locks. Any
+  # later failure restores both identities before releasing the fence.
+  if ! remove_pr_authority_fenced "$PR" "$RUN_ID" "$OWNER"; then
+    lease_fence_end
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" \
+      '{ok:false,error:"could not remove matching shared PR authority - nothing released",pr:$pr,runId:$run,leaseReleased:false}'
+    exit 1
+  fi
+  if ! lease_remove_fenced "$RUN_ID"; then
+    write_pr_authority "$PR" "$FENCED_AUTHORITY_JSON" || true
+    lease_fence_end
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg dir "$LEASE_DIR" \
+      '{ok:false,error:("could not remove the shared lease under " + $dir + " - nothing released"),pr:$pr,runId:$run,leaseReleased:false}'
+    exit 1
+  fi
+  if ! write_pr_state "$PR" "$STATE"; then
+    RESTORED=false
+    if lease_restore_fenced "$RUN_ID" "$FENCED_LEASE_JSON" &&
+       write_pr_authority "$PR" "$FENCED_AUTHORITY_JSON"; then RESTORED=true; fi
+    lease_fence_end
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --argjson restored "$RESTORED" \
+      '{ok:false,error:"could not write released PR state - release refused and lease restoration attempted",pr:$pr,runId:$run,leaseReleased:false,leaseRestored:$restored}'
+    exit 1
+  fi
+  lease_fence_end
   jq -cn --argjson pr "$PR" --arg run "$RUN_ID" '{ok:true,releasedRunId:$run,pr:$pr,leaseReleased:true}'
   exit 0
 fi
@@ -1157,6 +1563,7 @@ if [ "$COMMAND" = "finish" ]; then
   SHA="${2:-}"
   RUN_ID="${3:-}"
   VERDICT="${4:-}"
+  OWNER="${5:-$DEFAULT_OWNER}"
   if ! printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{40}$'; then
     jq -cn '{ok:false,error:"finish requires a 40-character SHA"}'
     exit 2
@@ -1211,23 +1618,9 @@ if [ "$COMMAND" = "finish" ]; then
       # flagged so no automated path treats this run as settled.
       RECON_PR="$(find_pr_for_any_run "$RUN_ID" || true)"
       RECON_RECORDED=false
-      if [ -n "${RECON_PR:-}" ]; then
-        exec 9>"$(pr_lock_file "$RECON_PR")"
-        if flock -w "$LOCK_WAIT" 9; then
-          STATE="$(read_pr_state "$RECON_PR")"
-          STATE="$(jq -c --arg now "$(iso_now)" --arg run "$RUN_ID" --arg path "$RUN_VERDICT_FILE" \
-            --arg attempted "$VERDICT" --arg sha "$SHA" \
-            --argjson recorded "$(if [ -n "$EXISTING_VERDICT" ]; then printf '%s' "$EXISTING_VERDICT"; else printf '"unparseable"'; fi)" \
-            '.gateStatus="reconciliation_required" |
-             .reconciliation={detectedAt:$now,runId:$run,verdictFile:$path,
-                              recorded:$recorded,
-                              attempted:{sha:$sha,verdict:$attempted}}' <<<"$STATE")"
-          write_pr_state "$RECON_PR" "$STATE"
-          RECON_RECORDED=true
-          flock -u 9
-        fi
-        exec 9>&-
-      fi
+      # This check runs before caller authority is established. The write-once
+      # run verdict is enough to refuse; mutating PR state here would let a
+      # displaced owner quarantine its successor's live campaign.
       jq -cn --arg run "$RUN_ID" --arg path "$RUN_VERDICT_FILE" --arg sha "$SHA" \
         --arg attempted "$VERDICT" --argjson recon "$RECON_RECORDED" \
         --argjson pr "$(if [ -n "${RECON_PR:-}" ]; then printf '%s' "$RECON_PR"; else printf 'null'; fi)" \
@@ -1311,6 +1704,20 @@ if [ "$COMMAND" = "finish" ]; then
     exit 2
   fi
 
+  STORED_OWNER="$(jq -r '.activeLeaseOwner // empty' <<<"$STATE")"
+  if [ -z "$STORED_OWNER" ] || [ "$OWNER" != "$STORED_OWNER" ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg owner "$OWNER" --arg stored "$STORED_OWNER" \
+      '{ok:false,error:"caller owner does not match the owner recorded by claim - no terminal effect attempted",pr:$pr,runId:$run,requestedBy:$owner,claimedBy:(if $stored == "" then null else $stored end)}'
+    exit 0
+  fi
+  # This shared fence remains held through every terminal effect and the final
+  # state transition. Expiry may pass while network work runs, but no successor
+  # can reclaim until this locked transition either completes or the process
+  # dies and leaves the lease available for forward recovery.
+  if ! lease_fence_begin "$PR" "$RUN_ID" "$OWNER" "$COMMAND"; then
+    exit 0
+  fi
+
   # TERMINAL BINDING — recoverable commit sequence, steps 2 and 3.
   #
   # 2. finishIntent first. It carries the ONE finishedAt this run will ever
@@ -1368,15 +1775,17 @@ if [ "$COMMAND" = "finish" ]; then
           '.gateStatus="reconciliation_required" |
            .reconciliation={detectedAt:$now,runId:$run,verdictFile:$path,
                             recorded:$recorded,attempted:{sha:$sha,verdict:$attempted}}' <<<"$STATE")"
-        write_pr_state "$PR" "$STATE"
+        RECON_RECORDED=false
+        if write_pr_state "$PR" "$STATE"; then RECON_RECORDED=true; fi
         jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg path "$RUN_VERDICT_FILE" \
           --arg sha "$SHA" --arg attempted "$VERDICT" \
+          --argjson recon "$RECON_RECORDED" \
           --argjson recorded "$(if [ -n "$EXISTING_VERDICT" ]; then printf '%s' "$EXISTING_VERDICT"; else printf '"unparseable"'; fi)" \
           '{ok:false,gateStatus:"reconciliation_required",
             error:("a DIFFERENT verdict was written for this run while this finish was running — STOP. Nothing was overwritten and no verdict was fabricated; " +
                    $path + " stays canonical. A human must reconcile which campaign owns this run."),
             pr:$pr,runId:$run,runVerdictFile:$path,
-            recordedVerdict:$recorded,attemptedVerdict:{sha:$sha,verdict:$attempted},stateFlagged:true}'
+            recordedVerdict:$recorded,attemptedVerdict:{sha:$sha,verdict:$attempted},stateFlagged:$recon}'
         exit 1
       fi
     fi
@@ -1398,9 +1807,10 @@ if [ "$COMMAND" = "finish" ]; then
   # the ledger append) a duplicate ledger line the develop gate's `tail -1`
   # never notices.
   #
-  # The lock, however, is dropped now: the state file is unmodified, so nothing
-  # is lost, and the network work below must not starve a concurrent verb.
-  flock -u 9
+  # Keep both the private PR lock and the shared lifecycle/lease locks through
+  # the terminal work. A concurrent claim must wait; allowing it to change the
+  # slot while suspend/publish/hold/ledger writes are in flight would let both
+  # coordinators create terminal effects.
 
   # Suspend the backend preview so a finished PR stops billing compute while
   # it waits for merge/close. Teardown itself is Render's job (auto-delete on
@@ -1448,6 +1858,7 @@ if [ "$COMMAND" = "finish" ]; then
   HANDOFF_REASON=""
   HANDOFF_TARGET_SHA=""
   HANDOFF_DIVERGENCE=""
+  TERMINAL_EFFECT_ERROR=""
   if [ -n "$PUBLISH_FILE" ] || [ -n "$HOLD_FILE" ]; then
     FREEZE_INFO="$(detect_freeze "$PR" "$SHA")"
     if [ "$(jq -r '.filesOk' <<<"$FREEZE_INFO")" != true ]; then
@@ -1524,7 +1935,7 @@ if [ "$COMMAND" = "finish" ]; then
         # ledger line landed anyway: a NO_GO whose promotion hold silently never
         # went up. Reporting is the whole remedy — the slot-clearing semantics
         # below are unchanged, exactly as for a ledger-append failure, so the
-        # verdict JSON carries the truth even though a re-finish is refused.
+        # the attempt is refused below with the slot and lease held for retry.
         HANDOFF_ARTIFACT_ERROR=""
         if [ -n "$PUBLISH_FILE" ]; then
           mkdir -p "$(dirname "$PUBLISH_FILE")" 2>/dev/null
@@ -1578,7 +1989,8 @@ if [ "$COMMAND" = "finish" ]; then
           esac
         fi
         if [ -n "$HANDOFF_ARTIFACT_ERROR" ]; then
-          HANDOFF_REASON="$HANDOFF_ARTIFACT_ERROR — the ledger line below still records this verdict, so the two are now out of step. Fix the artifact by hand; a re-finish will be REFUSED (the slot is cleared)."
+          HANDOFF_REASON="$HANDOFF_ARTIFACT_ERROR — the ledger line below may record this attempt, but finish remains retryable with the slot and lease held."
+          TERMINAL_EFFECT_ERROR="$HANDOFF_ARTIFACT_ERROR"
         else
           HANDOFF_WRITTEN=true
         fi
@@ -1633,64 +2045,35 @@ if [ "$COMMAND" = "finish" ]; then
             # finished", so `written` must reflect the WHOLE handoff, not
             # just the artifact files.
             HANDOFF_WRITTEN=false
-            # NOT "a later re-finish": this path still clears the slot below,
-            # so a second `finish` is refused as not-the-active-run. Naming a
-            # recovery the code forbids sends an operator down a dead end at
-            # the exact moment the develop gate is blind to this verdict.
+            # Keep the slot and lease held below so the same finish can retry;
+            # otherwise the develop gate remains blind with no automated
+            # recovery path.
             # Append rather than replace: an artifact failure above is the more
             # dangerous half (a hold that never went up) and must not be lost
             # behind the ledger's message.
             if [ -n "$HANDOFF_ARTIFACT_ERROR" ]; then
               HANDOFF_REASON="$HANDOFF_REASON ALSO: ledger line was not appended to $HANDOFF_LEDGER after retry — the develop gate cannot see this outcome either."
             else
-              HANDOFF_REASON="ledger line was not appended to $HANDOFF_LEDGER after retry — the develop gate cannot see this outcome. A re-finish will be REFUSED (the slot is cleared): append the ledger line by hand, or reconcile the gate state manually"
+              HANDOFF_REASON="ledger line was not appended to $HANDOFF_LEDGER after retry — the develop gate cannot see this outcome. The slot and lease remain held so this finish can be retried."
             fi
+            TERMINAL_EFFECT_ERROR="${TERMINAL_EFFECT_ERROR:+$TERMINAL_EFFECT_ERROR; }ledger line was not appended to $HANDOFF_LEDGER"
           fi
         fi
       fi
     fi
   fi
 
-  # Artifacts are durable — NOW record the verdict and release the slot. Up to
-  # this line a crash is fully recoverable: activeRunId is still this run, so a
-  # plain `finish` retry re-runs the (idempotent) work above and completes.
-  #
-  # Re-verify ownership under the lock before clearing. The window above is
-  # network-long, and a human `claim --takeover` inside it means the slot now
-  # belongs to a successor: clearing it here would be the very stomp the
-  # not-the-active-run guard exists to prevent. The artifacts already written
-  # stand (this run did finish, and they name its own runId), so say so rather
-  # than pretending nothing happened.
-  if ! flock -w "$LOCK_WAIT" 9; then
-    emit_lock_busy "$COMMAND" "$PR"
-    exit 0
+  if [ -n "$TERMINAL_EFFECT_ERROR" ]; then
+    lease_fence_end
+    flock -u 9 2>/dev/null || true
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg error "$TERMINAL_EFFECT_ERROR" \
+      '{ok:false,error:("terminal artifact write failed - slot and shared lease remain held for retry: " + $error),pr:$pr,runId:$run,leaseReleased:false}'
+    exit 1
   fi
-  STATE="$(read_pr_state "$PR")"
-  ACTIVE_RUN="$(jq -r '.activeRunId // empty' <<<"$STATE")"
-  if [ "$RUN_ID" != "$ACTIVE_RUN" ]; then
-    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg active "$ACTIVE_RUN" \
-      --argjson handoffWritten "$HANDOFF_WRITTEN" \
-      '{ok:false,error:"the slot changed hands while this finish was writing its artifacts — no verdict recorded, the successor'"'"'s slot left alone",
-        pr:$pr,runId:(if $run == "" then null else $run end),
-        activeRunId:(if $active == "" then null else $active end),
-        handoff:{written:$handoffWritten}}'
-    exit 0
-  fi
-  # Step 4: commit completed state as a RECEIPT of the verdict file, carrying
-  # its digest so the two can be checked against each other later. The intent
-  # is consumed here — it has done its job the moment verdict.json exists.
-  STATE="$(jq -c \
-    --arg sha "$SHA" --arg run "$RUN_ID" --arg verdict "$VERDICT" --arg now "$NOW" \
-    --arg digest "$VERDICT_DIGEST" \
-    '.completedSha=$sha | .completedAt=$now | .completedRunId=$run | .completedVerdict=$verdict |
-     .completedVerdictDigest=$digest | .finishIntent=null |
-     .activeSha=null | .activeStartedAt=null | .activeRunId=null | .activeProgressAt=null |
-     .challengerDeadline=null' <<<"$STATE")"
-  write_pr_state "$PR" "$STATE"
-  flock -u 9
-  # The run is terminal — no coordinator may hold it any longer.
-  lease_drop "$RUN_ID"
 
+  # Build and durably write the indexed PR receipt while both shared fences
+  # and the private PR lock are still held. Nothing after owner validation is
+  # allowed to escape the fence.
   VERDICT_JSON="$(jq -cn \
     --argjson pr "$PR" --arg sha "$SHA" --arg run "$RUN_ID" --arg verdict "$VERDICT" --arg now "$NOW" \
     --argjson attempted "$SUSPEND_ATTEMPTED" --argjson ok "$SUSPEND_OK" \
@@ -1706,11 +2089,58 @@ if [ "$COMMAND" = "finish" ]; then
                targetSha:(if $handoffTargetSha == "" then null else $handoffTargetSha end),
                reason:(if $handoffReason == "" then null else $handoffReason end),
                divergenceSnapshot:(if $divergence == "" then null else $divergence end)}}')"
-  VERDICT_TMP="$(mktemp "$STATE_DIR/.pr-$PR-verdict.XXXXXX")"
-  printf '%s\n' "$VERDICT_JSON" > "$VERDICT_TMP"
-  mv "$VERDICT_TMP" "$(pr_verdict_file "$PR")"
+  VERDICT_TMP="$(mktemp "$STATE_DIR/.pr-$PR-verdict.XXXXXX" 2>/dev/null)"
+  if [ -z "$VERDICT_TMP" ] || ! printf '%s\n' "$VERDICT_JSON" > "$VERDICT_TMP" 2>/dev/null ||
+     ! mv "$VERDICT_TMP" "$(pr_verdict_file "$PR")" 2>/dev/null ||
+     ! jq -e --arg run "$RUN_ID" --arg digest "$VERDICT_DIGEST" \
+       '.runId == $run and .verdictDigest == $digest' "$(pr_verdict_file "$PR")" >/dev/null 2>&1; then
+    rm -f "${VERDICT_TMP:-}" 2>/dev/null || true
+    lease_fence_end
+    flock -u 9 2>/dev/null || true
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" \
+      '{ok:false,error:"could not write the terminal PR verdict receipt - slot and shared lease remain held for retry",pr:$pr,runId:$run,leaseReleased:false}'
+    exit 1
+  fi
 
-  jq -cn --argjson verdict "$VERDICT_JSON" '{ok:true} + $verdict'
+  # Remove the matching PR binding and run lease before clearing the private
+  # slot. Failures restore both while the shared locks stay held.
+  if ! remove_pr_authority_fenced "$PR" "$RUN_ID" "$OWNER"; then
+    lease_fence_end
+    flock -u 9 2>/dev/null || true
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" \
+      '{ok:false,error:"could not remove matching shared PR authority - terminal state not committed",pr:$pr,runId:$run,leaseReleased:false}'
+    exit 1
+  fi
+  if ! lease_remove_fenced "$RUN_ID"; then
+    write_pr_authority "$PR" "$FENCED_AUTHORITY_JSON" || true
+    lease_fence_end
+    flock -u 9 2>/dev/null || true
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg dir "$LEASE_DIR" \
+      '{ok:false,error:("could not remove the shared lease under " + $dir + " - terminal state not committed"),pr:$pr,runId:$run,leaseReleased:false}'
+    exit 1
+  fi
+  STATE="$(jq -c \
+    --arg sha "$SHA" --arg run "$RUN_ID" --arg verdict "$VERDICT" --arg now "$NOW" \
+    --arg digest "$VERDICT_DIGEST" \
+    '.completedSha=$sha | .completedAt=$now | .completedRunId=$run | .completedVerdict=$verdict |
+     .completedVerdictDigest=$digest | .finishIntent=null |
+     .activeSha=null | .activeStartedAt=null | .activeRunId=null | .activeProgressAt=null |
+     .activeLeaseOwner=null | .challengerDeadline=null' <<<"$STATE")"
+  if ! write_pr_state "$PR" "$STATE"; then
+    RESTORED=false
+    if lease_restore_fenced "$RUN_ID" "$FENCED_LEASE_JSON" &&
+       write_pr_authority "$PR" "$FENCED_AUTHORITY_JSON"; then RESTORED=true; fi
+    lease_fence_end
+    flock -u 9 2>/dev/null || true
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --argjson restored "$RESTORED" \
+      '{ok:false,error:"could not commit terminal PR state - no success receipt returned and lease restoration attempted",pr:$pr,runId:$run,leaseReleased:false,leaseRestored:$restored}'
+    exit 1
+  fi
+
+  lease_fence_end
+  flock -u 9
+
+  jq -cn --argjson verdict "$VERDICT_JSON" '{ok:true,leaseReleased:true} + $verdict'
   exit 0
 fi
 
@@ -1722,6 +2152,7 @@ fi
 # unblocks a coordinator toward GO is worse than the stall it ends.
 if [ "$COMMAND" = "challenger-timeout" ]; then
   RUN_ID="${2:-}"
+  OWNER="${3:-$DEFAULT_OWNER}"
   if ! run_id_ok "$RUN_ID"; then
     jq -cn --arg run "$RUN_ID" \
       '{ok:false,error:"challenger-timeout requires a run id of 1-200 chars of [A-Za-z0-9._-]",runId:$run}'
@@ -1743,6 +2174,12 @@ if [ "$COMMAND" = "challenger-timeout" ]; then
       --arg active "$(jq -r '.activeRunId // empty' <<<"$STATE")" \
       '{ok:false,error:"not the active run — nothing to time out",
         pr:$pr,runId:$run,activeRunId:(if $active == "" then null else $active end)}'
+    exit 0
+  fi
+  STORED_OWNER="$(jq -r '.activeLeaseOwner // empty' <<<"$STATE")"
+  if [ -z "$STORED_OWNER" ] || [ "$OWNER" != "$STORED_OWNER" ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg owner "$OWNER" --arg stored "$STORED_OWNER" \
+      '{ok:false,error:"caller owner does not match the owner recorded by claim - challenger timeout refused",pr:$pr,runId:$run,requestedBy:$owner,claimedBy:(if $stored == "" then null else $stored end)}'
     exit 0
   fi
   DEADLINE="$(jq -r '.challengerDeadline // empty' <<<"$STATE")"
@@ -1785,9 +2222,18 @@ if [ "$COMMAND" = "challenger-timeout" ]; then
   fi
   NOW="$(iso_now)"
   SHA="$(jq -r '.activeSha // empty' <<<"$STATE")"
+  if ! lease_fence_begin "$PR" "$RUN_ID" "$OWNER" "$COMMAND"; then
+    exit 0
+  fi
   STATE="$(jq -c --arg now "$NOW" --arg deadline "$DEADLINE" \
     '.challengerDisposition="no-disposition" | .challengerTimedOutAt=$now' <<<"$STATE")"
-  write_pr_state "$PR" "$STATE"
+  if ! write_pr_state "$PR" "$STATE"; then
+    lease_fence_end
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" \
+      '{ok:false,error:"could not write challenger-timeout state - no terminal action attempted",pr:$pr,runId:$run}'
+    exit 1
+  fi
+  lease_fence_end
   # Drop the lock before the nested finish, which takes the same one.
   flock -u 9
   exec 9>&-
@@ -1803,7 +2249,7 @@ if [ "$COMMAND" = "challenger-timeout" ]; then
   # for a coordinator-authored verdict. BLOCKED is the only verdict this path
   # can produce, and BLOCKED leaves the promotion hold untouched — a campaign
   # that could not run asserts nothing about the build.
-  FINISH_OUT="$(bash "$0" finish "$SHA" "$RUN_ID" BLOCKED)"
+  FINISH_OUT="$(bash "$0" finish "$SHA" "$RUN_ID" BLOCKED "$OWNER")"
   FINISH_RC=$?
   jq -cn --argjson finish "$FINISH_OUT" --arg deadline "$DEADLINE" --arg at "$NOW" \
     --arg path "$DISPOSITION_FILE" \
@@ -2167,6 +2613,8 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
     if timeout "$PREFLIGHT_TIMEOUT" bash -c "$PREFLIGHT_CMD" >"$PREFLIGHT_OUT" 2>&1; then
       CONTROL="$(jq -c '.preflightReason=null | .preflightFingerprint=null | .preflightWakeAt=null' <<<"$CONTROL")"
       write_control "$CONTROL"
+      flock -u 8
+      exec 8>&-
     else
       PREFLIGHT_RC=$?
       PREFLIGHT_REASON="$(grep -v '^[[:space:]]*$' "$PREFLIGHT_OUT" 2>/dev/null | tail -1 | cut -c1-300)"
@@ -2253,31 +2701,74 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
       RUN_ID="${RUN_PREFIX}-pr${W_PR}-${HEAD_SHA:0:12}-$(date -u -d "@$RUN_STAMP_EPOCH" +%Y%m%dT%H%M%SZ)"
     done
   fi
+  OWNER_TOKEN="$(new_owner_token || true)"
+  if [ -z "$OWNER_TOKEN" ]; then
+    emit_poll_lease_failure '{"ok":false,"error":"could not generate a coordinator owner token"}'
+    exit 0
+  fi
+  LEASE_ERROR_FILE="$TMP_DIR/lease-error.json"
+  if ! lease_lifecycle_begin "$W_PR" "$RUN_ID" "poll" >"$LEASE_ERROR_FILE"; then
+    emit_poll_lease_failure "$(cat "$LEASE_ERROR_FILE")"
+    exit 0
+  fi
+  PRIOR_AUTHORITY="$(read_pr_authority "$W_PR")"
+  AUTHORITY_STATUS="$(pr_authority_status "$PRIOR_AUTHORITY")"
+  if [ "$AUTHORITY_STATUS" = malformed ]; then
+    lease_lifecycle_end
+    emit_poll_lease_failure "$(jq -cn --arg path "$(pr_authority_file "$W_PR")" '{ok:false,error:("shared PR authority is malformed at " + $path)}')"
+    exit 0
+  fi
+  if [ "$AUTHORITY_STATUS" = live ] &&
+     { [ "$(jq -r '.runId' <<<"$PRIOR_AUTHORITY")" != "$RUN_ID" ] ||
+       [ "$(jq -r '.owner' <<<"$PRIOR_AUTHORITY")" != "$OWNER_TOKEN" ]; }; then
+    lease_lifecycle_end
+    emit_poll_lease_failure "$(jq -cn --argjson authority "$PRIOR_AUTHORITY" '{ok:false,error:"another live coordinator owns this PR",leaseOwner:$authority.owner,activeRunId:$authority.runId}')"
+    exit 0
+  fi
+  if ! LEASE_RESULT="$(lease_acquire "$RUN_ID" "$OWNER_TOKEN")"; then
+    lease_lifecycle_end
+    emit_poll_lease_failure "$LEASE_RESULT"
+    exit 0
+  fi
+  if ! bind_pr_authority "$W_PR" "$RUN_ID" "$OWNER_TOKEN"; then
+    rm -f "$(lease_file "$RUN_ID")" 2>/dev/null || true
+    lease_lifecycle_end
+    emit_poll_lease_failure '{"ok":false,"error":"could not write shared PR authority"}'
+    exit 0
+  fi
+  if ! lease_fence_begin "$W_PR" "$RUN_ID" "$OWNER_TOKEN" "poll" >"$LEASE_ERROR_FILE"; then
+    emit_poll_lease_failure "$(cat "$LEASE_ERROR_FILE")"
+    exit 0
+  fi
   NOW="$(iso_now)"
   # Same-SHA recovery keeps the original challenger deadline (see `claim`).
-  STATE="$(jq -c --arg sha "$HEAD_SHA" --arg now "$NOW" --arg run "$RUN_ID" \
+  STATE="$(jq -c --arg sha "$HEAD_SHA" --arg now "$NOW" --arg run "$RUN_ID" --arg owner "$OWNER_TOKEN" \
     --arg deadline "$(challenger_deadline_from_now)" \
     '(if (.activeSha == $sha and (.challengerDeadline // "") != "" and .challengerDisposition == null)
       then .challengerDeadline else $deadline end) as $dl |
      .activeSha=$sha | .activeStartedAt=$now | .activeRunId=$run | .activeProgressAt=null |
+     .activeLeaseOwner=$owner |
      .challengerDeadline=$dl |
      .challengerDisposition=null | .challengerTimedOutAt=null | .finishIntent=null' <<<"$STATE")"
-  # Deliberately NO lease here. `poll` registers a RUN, not a coordinator — it
-  # runs as the token-free watcher, so a lease in its name would be owned by
-  # something that never renews it and would lock out the very coordinator this
-  # wake is about to summon. The run is left unleased, which means the FIRST
-  # coordinator to `lease-claim` it wins and a second one is refused — the
-  # protection this exists for, without the watcher's identity in the way.
-  write_pr_state "$W_PR" "$STATE"
+  if ! write_pr_state "$W_PR" "$STATE"; then
+    lease_remove_fenced "$RUN_ID" || true
+    if [ "$PRIOR_AUTHORITY" = null ]; then rm -f "$(pr_authority_file "$W_PR")" 2>/dev/null || true
+    else write_pr_authority "$W_PR" "$PRIOR_AUTHORITY" || true; fi
+    lease_fence_end
+    emit_poll_lease_failure '{"ok":false,"error":"could not persist the claimed coordinator slot"}'
+    exit 0
+  fi
+  lease_fence_end
 
   jq -cn \
     --arg repo "$REPO" --arg branch "$BRANCH" --argjson pr "$W_PR" --arg runId "$RUN_ID" \
+    --arg ownerToken "$OWNER_TOKEN" \
     --argjson facts "$FACTS" --argjson recovery "$RECOVERY" \
     --arg abandoned "$ABANDONED" \
     --argjson resumedRunId "$RESUMED_RUN_ID" \
     '{wakeAgent:true,data:({
       schemaVersion:1, trigger:"pr_build_settled",
-      repo:$repo, branch:$branch, pr:$pr, runId:$runId,
+      repo:$repo, branch:$branch, pr:$pr, runId:$runId, coordinatorOwnerToken:$ownerToken,
       resumedRunId:$resumedRunId,
       sourceSha:$facts.headSha,
       previewUrl:$facts.backendPreviewUrl,

@@ -10,7 +10,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATE="$SCRIPT_DIR/smoke-pr-gate.sh"
 
 STUB_BIN="$(mktemp -d)"
-cleanup() { rm -rf "$STATE_DIR" "$STUB_BIN"; }
+TEST_SHARED_ROOT="$(mktemp -d)"
+cleanup() { rm -rf "$STATE_DIR" "$STUB_BIN" "$TEST_SHARED_ROOT"; }
 trap cleanup EXIT
 
 cat > "$STUB_BIN/gh" <<'STUB'
@@ -61,6 +62,9 @@ case "$1" in
     esac ;;
   api)
     P="$2"
+    if printf '%s' "$P" | grep -qF '/actions/runs?'; then
+      printf '%s' "$STUB_RUN_LIST"; exit "$STUB_RUN_LIST_EXIT"
+    fi
     # Parent-sha lookup for freeze PRs: smoke-pr-gate.sh queries the plain
     # (non-git) commits endpoint with this --jq expression; check it before
     # any path-based branch so it matches regardless of the exact endpoint.
@@ -147,6 +151,11 @@ fi
 echo '{}'; exit 0
 STUB
 chmod +x "$STUB_BIN/gh" "$STUB_BIN/curl"
+cat > "$STUB_BIN/mountpoint" <<'STUB'
+#!/usr/bin/env bash
+[ "${1:-}" = "-q" ] && [ "${2:-}" = "${SMOKE_GATE_SHARED_ROOT:-}" ]
+STUB
+chmod +x "$STUB_BIN/mountpoint"
 export PATH="$STUB_BIN:$PATH"
 
 reset_stubs() {
@@ -157,12 +166,15 @@ reset_stubs() {
         STUB_HEALTHZ_CODE STUB_SERVICES STUB_BACKEND_DEPLOYS STUB_FRONTEND_DEPLOYS \
         STUB_COMPARE_FILES STUB_COMPARE_EXIT STUB_LOCK_PROBE STUB_LOCK_PROBE_FILE \
         STUB_STATE_PROBE STUB_STATE_PROBE_FILE STUB_SUSPEND_SLEEP STUB_REPO_VIEW_EXIT \
-        SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER 2>/dev/null || true
+        SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER \
+        SMOKE_GATE_OWNER SMOKE_GATE_LEASE_TTL_SECONDS 2>/dev/null || true
 }
 
 fresh_state() {
   STATE_DIR="$(mktemp -d)"
   export SMOKE_GATE_STATE_DIR="$STATE_DIR"
+  export SMOKE_GATE_SHARED_ROOT="$TEST_SHARED_ROOT"
+  export SMOKE_GATE_LEASE_DIR="$TEST_SHARED_ROOT/$(basename "$STATE_DIR")/leases"
   reset_stubs
 }
 sha() { printf "$1%.0s" $(seq 40); }
@@ -201,17 +213,22 @@ export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"con
 export STUB_SERVICES="[{\"id\":\"srv-backend-pr-42\",\"name\":\"XZO-DEV-BACKEND PR #42\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-42.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
 export STUB_HEALTHZ_CODE=200
-bash "$GATE" poll | jq -e --arg sha "$HEAD_SHA" '
+POLL_OUT="$(bash "$GATE" poll)"
+jq -e --arg sha "$HEAD_SHA" '
   .wakeAgent == true and .data.trigger == "pr_build_settled" and
   .data.pr == 42 and .data.sourceSha == $sha and
   .data.previewUrl == "https://xzo-dev-backend-pr-42.onrender.com" and
   .data.isFreezePr == false and .data.ciSha == $sha and
   .data.recovery == false and .data.abandonedActiveSha == null and
-  (.data.runId | test("^smoke-pr42-"))
-' >/dev/null
+  (.data.runId | test("^smoke-pr42-")) and
+  (.data.coordinatorOwnerToken | test("^owner-[0-9a-f]{64}$"))
+' <<<"$POLL_OUT" >/dev/null
+POLL_RUN="$(jq -r '.data.runId' <<<"$POLL_OUT")"
+POLL_OWNER="$(jq -r '.data.coordinatorOwnerToken' <<<"$POLL_OUT")"
 jq -e --arg sha "$HEAD_SHA" '
-  .activeSha == $sha and .activeRunId != null and .completedSha == null
+  .activeSha == $sha and .activeRunId != null and .activeLeaseOwner != null and .completedSha == null
 ' "$STATE_DIR/pr-42-state.json" >/dev/null
+jq -e --arg owner "$POLL_OWNER" '.owner == $owner' "$SMOKE_GATE_LEASE_DIR/lease-$POLL_RUN.json" >/dev/null
 # Same head, immediately after claiming: already active, no re-wake.
 bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_candidates"' >/dev/null
 
@@ -512,9 +529,10 @@ bash "$GATE" claim run-third 55 "$DUP_SHA" | jq -e '
   .ok == false and (.error | test("wait for it or ask its coordinator"))
 ' >/dev/null
 # A genuinely dead run (no stamp inside the liveness window) is still
-# reclaimed automatically — the recovery path this fix must not break.
+# reclaimable under its published run id — the recovery path this fix must not
+# break and the run-id continuity rule requires.
 export SMOKE_GATE_PROGRESS_STALE_SECONDS=0
-bash "$GATE" claim run-fourth 55 "$DUP_SHA" | jq -e '
+bash "$GATE" claim run-rival 55 "$DUP_SHA" | jq -e '
   .ok == true and .tookOverFrom == null
 ' >/dev/null
 unset SMOKE_GATE_PROGRESS_STALE_SECONDS
@@ -746,15 +764,21 @@ BAD_LEDGER="$BLOCKER/subdir/handoff-ledger.jsonl"
 export SMOKE_GATE_PUBLISH_FILE="$DEV_PUBLISH3" SMOKE_GATE_HOLD_FILE="$DEV_HOLD3" \
   SMOKE_GATE_HANDOFF_LEDGER="$BAD_LEDGER"
 
-bash "$GATE" finish "$LOCKFAIL_HEAD" run-lockfail NO_GO | jq -e --arg target "$LOCKFAIL_TARGET" '
-  .ok == true and .handoff.written == false and .handoff.targetSha == $target and
-  (.handoff.reason | test("retry"))
-' >/dev/null
+LOCKFAIL_OUT="$(bash "$GATE" finish "$LOCKFAIL_HEAD" run-lockfail NO_GO 2>/dev/null || true)"
+jq -e '
+  .ok == false and .leaseReleased == false and
+  (.error | test("terminal artifact write failed"))
+' <<<"$LOCKFAIL_OUT" >/dev/null
 # The hold/publish artifacts were still written correctly — only the
 # ledger's own append failed.
 jq -e --arg sha "$LOCKFAIL_TARGET" '.sha == $sha and .verdict == "NO_GO"' "$DEV_PUBLISH3" >/dev/null
 jq -e --arg sha "$LOCKFAIL_TARGET" '.sha == $sha and .verdict == "NO_GO"' "$DEV_HOLD3" >/dev/null
 [ ! -e "$BAD_LEDGER" ]
+jq -e '.activeRunId == "run-lockfail" and .completedSha == null' "$STATE_DIR/pr-70-state.json" >/dev/null
+[ -s "$SMOKE_GATE_LEASE_DIR/lease-run-lockfail.json" ]
+# The held slot and lease make the failure retryable once storage is repaired.
+export SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/dev-gate3/handoff-ledger.jsonl"
+bash "$GATE" finish "$LOCKFAIL_HEAD" run-lockfail NO_GO | jq -e '.ok == true and .leaseReleased == true' >/dev/null
 
 # --- 16. CI facts are filtered to the target SHA -------------------------
 # `gh run list --branch` returns the branch's recent runs, not one commit's,
@@ -816,14 +840,9 @@ export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"con
 bash "$GATE" poll >/dev/null
 jq -e '.factsStuckSha == null and .factsStuckAlertSha == null' "$STATE_DIR/pr-77-state.json" >/dev/null
 
-# --- 18. finish DROPS the PR lock before its network work -------------------
-# By the time the suspend POST runs, the verdict is already durable in the PR
-# state file and activeRunId is null. Everything after that point is network
-# (services list, suspend, detect_freeze's GitHub calls) or writes to OTHER
-# files, so holding the per-PR lock across it only starved concurrent gate
-# verbs — the PR-gate half of the starvation that made a coordinator's mandatory
-# `progress` stamp read as "you lost the slot". The curl stub probes the lock
-# from a separate process while the suspend call is in flight.
+# --- 18. finish holds its authority locks through terminal side effects ------
+# The state and shared lifecycle locks fence the network and artifact window,
+# so an expired predecessor cannot publish after a successor reclaims.
 fresh_state
 LOCKPROBE_SHA="$(sha 7)"
 bash "$GATE" claim run-lockprobe 88 "$LOCKPROBE_SHA" >/dev/null
@@ -834,11 +853,10 @@ export STUB_LOCK_PROBE_FILE="$STATE_DIR/pr-88-state.lock"
 bash "$GATE" finish "$LOCKPROBE_SHA" run-lockprobe GO | jq -e '
   .ok == true and .suspend.attempted == true and .suspend.ok == true
 ' >/dev/null
-if [ "$(cat "$STUB_LOCK_PROBE" 2>/dev/null)" != "free" ]; then
-  echo "expected finish to have released the PR state lock before the suspend POST, probe said: $(cat "$STUB_LOCK_PROBE" 2>/dev/null)" >&2
+if [ "$(cat "$STUB_LOCK_PROBE" 2>/dev/null)" != "held" ]; then
+  echo "expected finish to hold the PR state lock through the suspend POST, probe said: $(cat "$STUB_LOCK_PROBE" 2>/dev/null)" >&2
   exit 1
 fi
-# The verdict landed anyway — releasing the lock early loses nothing.
 jq -e --arg sha "$LOCKPROBE_SHA" '.completedSha == $sha and .activeRunId == null' \
   "$STATE_DIR/pr-88-state.json" >/dev/null
 
@@ -915,7 +933,7 @@ jq -e --arg t "$CRASH_TARGET" 'select(.targetSha == $t) | .runId == "run-crash"'
 jq -e --arg sha "$CRASH_HEAD" '.completedSha == $sha and .activeRunId == null' \
   "$STATE_DIR/pr-91-state.json" >/dev/null
 
-# --- 21. a takeover DURING the artifact window does not stomp the successor --
+# --- 21. a takeover cannot enter DURING the terminal artifact window --------
 fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
@@ -928,15 +946,16 @@ export STUB_SUSPEND_SLEEP=2
 bash "$GATE" finish "$TO_SHA" run-old GO > "$STATE_DIR/takeover-out.json" 2>/dev/null &
 FIN=$!
 sleep 0.5
-bash "$GATE" claim run-new 92 "$TO_SHA" --takeover >/dev/null
+TO_CLAIM="$(SMOKE_GATE_LOCK_WAIT_SECONDS=1 bash "$GATE" claim run-new 92 "$TO_SHA" --takeover || true)"
 wait "$FIN" || true
 unset STUB_SUSPEND_SLEEP
-jq -e '.ok == false and (.error | test("changed hands")) and .activeRunId == "run-new"' \
-  "$STATE_DIR/takeover-out.json" >/dev/null || {
-  echo "expected a finish that lost the slot mid-flight to refuse, got: $(cat "$STATE_DIR/takeover-out.json")" >&2
+jq -e '.ok == false and .retryable == true and (.error | test("gate_lock_busy"))' <<<"$TO_CLAIM" >/dev/null || {
+  echo "expected the concurrent takeover to wait outside the terminal fence, got: $TO_CLAIM" >&2
   exit 1; }
-jq -e '.activeRunId == "run-new" and .completedSha == null' "$STATE_DIR/pr-92-state.json" >/dev/null || {
-  echo "the late finish stomped the successor's slot" >&2; exit 1; }
+jq -e '.ok == true and .runId == "run-old"' "$STATE_DIR/takeover-out.json" >/dev/null
+jq -e '.activeRunId == null and .completedRunId == "run-old"' "$STATE_DIR/pr-92-state.json" >/dev/null
+# Once the terminal transition is complete, a new claim may proceed normally.
+bash "$GATE" claim run-new 92 "$TO_SHA" --takeover | jq -e '.ok == true and .runId == "run-new"' >/dev/null
 
 # --- 22. P1 regression: `finish` must refuse a SHA that is not the one this
 # run claimed. Live on 2026-08-25 (freeze PR #1211): the coordinator passed
@@ -1005,25 +1024,22 @@ bash "$GATE" claim run-div-b 94 "$DIV_SHA" >/dev/null
 DIV_OUT="$(bash "$GATE" finish "$DIV_SHA" run-div-b HUMAN_DECISION 2>/dev/null || true)"
 chmod 700 "$SHARED"   # restore before asserting, so a failure still cleans up
 jq -e '
-  .ok == true and .handoff.written == false and
-  (.handoff.reason | test("promotion is ungated"))
+  .ok == false and .leaseReleased == false and
+  (.error | test("promotion is ungated"))
 ' <<<"$DIV_OUT" >/dev/null || {
   echo "a failed hold raise was reported as a successful handoff, got: $DIV_OUT" >&2; exit 1; }
-# Hold and ledger are now genuinely out of step — the observable Dinesh sees.
+# The prior hold and newly appended ledger line are divergent, while the failed
+# owner keeps its slot and lease for an exact retry under the same fence.
 jq -e '.runId == "run-div-a"' "$SMOKE_GATE_HOLD_FILE" >/dev/null
 tail -1 "$SMOKE_GATE_HANDOFF_LEDGER" | jq -e '.runId == "run-div-b"' >/dev/null
-# The next finish overwrites the hold — but captures it first, permanently.
+jq -e '.activeRunId == "run-div-b" and .completedRunId == "run-div-a"' "$STATE_DIR/pr-94-state.json" >/dev/null
+[ -s "$SMOKE_GATE_LEASE_DIR/lease-run-div-b.json" ]
+REPAIRED="$(bash "$GATE" finish "$DIV_SHA" run-div-b HUMAN_DECISION)"
+jq -e '.ok == true and .leaseReleased == true and .handoff.divergenceSnapshot != null' <<<"$REPAIRED" >/dev/null
+jq -e '.runId == "run-div-b" and .verdict == "HUMAN_DECISION"' "$SMOKE_GATE_HOLD_FILE" >/dev/null
+# A later successful finish observes the repaired, in-step records.
 bash "$GATE" claim run-div-c 94 "$DIV_SHA" >/dev/null
-SNAP="$(bash "$GATE" finish "$DIV_SHA" run-div-c NO_GO | jq -r '.handoff.divergenceSnapshot // empty')"
-[ -n "$SNAP" ] && [ -s "$SNAP" ] || {
-  echo "the divergence was overwritten with no snapshot — the 4th occurrence is still un-diagnosable" >&2
-  exit 1; }
-jq -e '
-  .divergence == "hold names a different run than the ledger" and
-  .holdBeforeOverwrite.runId == "run-div-a" and
-  .newestHoldAffectingLedgerLine.runId == "run-div-b" and
-  .detectedBy.runId == "run-div-c"
-' "$SNAP" >/dev/null || { echo "snapshot did not preserve both sides: $(cat "$SNAP")" >&2; exit 1; }
+bash "$GATE" finish "$DIV_SHA" run-div-c NO_GO | jq -e '.handoff.divergenceSnapshot == null' >/dev/null
 # A BLOCKED verdict is NOT hold-affecting (it deliberately leaves the hold
 # alone), so it must never be read as a divergence on the next finish.
 bash "$GATE" claim run-div-d 94 "$DIV_SHA" >/dev/null
@@ -1122,16 +1138,191 @@ export SMOKE_GATE_PUBLISH_FILE="$APPFAIL_DIR/latest-verdict.json" \
   SMOKE_GATE_HOLD_FILE="$APPFAIL_DIR/develop-hold.json" \
   SMOKE_GATE_HANDOFF_LEDGER="$APPFAIL_LEDGER"
 bash "$GATE" claim run-appfail 98 "$APPFAIL_HEAD" >/dev/null
-APPFAIL_OUT="$(bash "$GATE" finish "$APPFAIL_HEAD" run-appfail NO_GO 2>/dev/null)"
+APPFAIL_OUT="$(bash "$GATE" finish "$APPFAIL_HEAD" run-appfail NO_GO 2>/dev/null || true)"
 chmod 600 "$APPFAIL_LEDGER"   # restore before asserting, so a failure still cleans up
 jq -e --arg target "$APPFAIL_TARGET" '
-  .ok == true and .handoff.written == false and .handoff.targetSha == $target and
-  (.handoff.reason | test("handoff-ledger.jsonl"))
+  .ok == false and .leaseReleased == false and
+  (.error | test("handoff-ledger.jsonl"))
 ' <<<"$APPFAIL_OUT" >/dev/null || {
   echo "an unwritten ledger line was reported as a successful handoff, got: $APPFAIL_OUT" >&2; exit 1; }
 [ "$(wc -c < "$APPFAIL_LEDGER")" -eq 0 ]
 # The hold still went up — a ledger failure must never skip or undo it.
 jq -e --arg sha "$APPFAIL_TARGET" '.sha == $sha and .runId == "run-appfail"' "$APPFAIL_DIR/develop-hold.json" >/dev/null
+jq -e '.activeRunId == "run-appfail" and .completedSha == null' "$STATE_DIR/pr-98-state.json" >/dev/null
+[ -s "$SMOKE_GATE_LEASE_DIR/lease-run-appfail.json" ]
+bash "$GATE" finish "$APPFAIL_HEAD" run-appfail NO_GO | jq -e '.ok == true and .leaseReleased == true' >/dev/null
+tail -1 "$APPFAIL_LEDGER" | jq -e '.runId == "run-appfail"' >/dev/null
+
+# --- 27. one shared PR cannot have two live run ids across private roots -----
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base SMOKE_GATE_LEASE_TTL_SECONDS=30
+PR_BASE="$STATE_DIR" PR_STATE_A="$PR_BASE/state-a" PR_STATE_B="$PR_BASE/state-b"
+mkdir -p "$PR_STATE_A" "$PR_STATE_B"
+PR_COMMON_LEASE="$TEST_SHARED_ROOT/same-pr-different-run/leases"
+PR_BIND_SHA="$(sha a)"
+SMOKE_GATE_STATE_DIR="$PR_STATE_A" SMOKE_GATE_LEASE_DIR="$PR_COMMON_LEASE" \
+  bash "$GATE" claim run-pr-a 119 "$PR_BIND_SHA" owner-a | jq -e '.ok == true' >/dev/null
+SECOND="$(SMOKE_GATE_STATE_DIR="$PR_STATE_B" SMOKE_GATE_LEASE_DIR="$PR_COMMON_LEASE" \
+  bash "$GATE" claim run-pr-b 119 "$PR_BIND_SHA" owner-b || true)"
+jq -e '.ok == false and .activeRunId == "run-pr-a" and (.error | test("shared coordinator registry"))' <<<"$SECOND" >/dev/null
+jq -e '.runId == "run-pr-a" and .owner == "owner-a"' "$PR_COMMON_LEASE/pr-119-authority.json" >/dev/null
+[ ! -e "$PR_COMMON_LEASE/lease-run-pr-b.json" ] && [ ! -e "$PR_STATE_B/pr-119-state.json" ]
+# The existing explicit operator takeover remains the only live replacement.
+SMOKE_GATE_STATE_DIR="$PR_STATE_B" SMOKE_GATE_LEASE_DIR="$PR_COMMON_LEASE" \
+  bash "$GATE" claim run-pr-b 119 "$PR_BIND_SHA" owner-b --takeover | jq -e '.ok == true' >/dev/null
+jq -e '.runId == "run-pr-b" and .owner == "owner-b"' "$PR_COMMON_LEASE/pr-119-authority.json" >/dev/null
+SMOKE_GATE_STATE_DIR="$PR_STATE_B" SMOKE_GATE_LEASE_DIR="$PR_COMMON_LEASE" \
+  bash "$GATE" release run-pr-b owner-b | jq -e '.ok == true' >/dev/null
+
+# --- 28. stale owner A cannot act after B reclaims through another state root
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base SMOKE_GATE_LEASE_TTL_SECONDS=1
+STALE_BASE="$STATE_DIR"
+STATE_A="$STALE_BASE/private-a" STATE_B="$STALE_BASE/private-b"
+mkdir -p "$STATE_A" "$STATE_B"
+COMMON_LEASE="$TEST_SHARED_ROOT/stale-separate/leases"
+STALE_SHA="$(sha 5)"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
+export STUB_PARENT_SHA="$(sha 4)"
+export SMOKE_GATE_PUBLISH_FILE="$STALE_BASE/latest-verdict.json" \
+  SMOKE_GATE_HOLD_FILE="$STALE_BASE/develop-hold.json" \
+  SMOKE_GATE_HANDOFF_LEDGER="$STALE_BASE/handoff-ledger.jsonl"
+SMOKE_GATE_STATE_DIR="$STATE_A" SMOKE_GATE_LEASE_DIR="$COMMON_LEASE" \
+  bash "$GATE" claim run-shared-owner 120 "$STALE_SHA" owner-a | jq -e '.ok == true' >/dev/null
+sleep 2
+SMOKE_GATE_STATE_DIR="$STATE_B" SMOKE_GATE_LEASE_DIR="$COMMON_LEASE" SMOKE_GATE_LEASE_TTL_SECONDS=30 \
+  bash "$GATE" claim run-shared-owner 120 "$STALE_SHA" owner-b | jq -e '.ok == true' >/dev/null
+export SMOKE_GATE_LEASE_TTL_SECONDS=30
+STALE_PROGRESS="$(SMOKE_GATE_STATE_DIR="$STATE_A" SMOKE_GATE_LEASE_DIR="$COMMON_LEASE" \
+  bash "$GATE" progress run-shared-owner owner-a || true)"
+jq -e '.ok == false and (.error | test("lease"))' <<<"$STALE_PROGRESS" >/dev/null
+STALE_RELEASE="$(SMOKE_GATE_STATE_DIR="$STATE_A" SMOKE_GATE_LEASE_DIR="$COMMON_LEASE" \
+  bash "$GATE" release run-shared-owner owner-a || true)"
+jq -e '.ok == false and (.error | test("lease"))' <<<"$STALE_RELEASE" >/dev/null
+STALE_FINISH="$(SMOKE_GATE_STATE_DIR="$STATE_A" SMOKE_GATE_LEASE_DIR="$COMMON_LEASE" \
+  bash "$GATE" finish "$STALE_SHA" run-shared-owner NO_GO owner-a || true)"
+jq -e '.ok == false and (.error | test("lease"))' <<<"$STALE_FINISH" >/dev/null
+jq -e '.owner == "owner-b"' "$COMMON_LEASE/lease-run-shared-owner.json" >/dev/null
+[ ! -e "$STATE_A/pr-120-verdict.json" ] && [ ! -e "$STATE_A/runs/run-shared-owner/verdict.json" ]
+[ ! -e "$SMOKE_GATE_PUBLISH_FILE" ] && [ ! -e "$SMOKE_GATE_HOLD_FILE" ] && [ ! -e "$SMOKE_GATE_HANDOFF_LEDGER" ]
+SMOKE_GATE_STATE_DIR="$STATE_B" SMOKE_GATE_LEASE_DIR="$COMMON_LEASE" \
+  bash "$GATE" release run-shared-owner owner-b | jq -e '.ok == true and .leaseReleased == true' >/dev/null
+
+# --- 29. stale owner cannot adopt B's token from the same mutable state ------
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base SMOKE_GATE_LEASE_TTL_SECONDS=1
+SAME_SHA="$(sha 6)"
+bash "$GATE" claim run-same-state 121 "$SAME_SHA" owner-a | jq -e '.ok == true' >/dev/null
+sleep 2
+SMOKE_GATE_LEASE_TTL_SECONDS=30 bash "$GATE" claim run-same-state 121 "$SAME_SHA" owner-b | jq -e '.ok == true' >/dev/null
+export SMOKE_GATE_LEASE_TTL_SECONDS=30
+for verb in progress release; do
+  OUT="$(SMOKE_GATE_OWNER=owner-a bash "$GATE" "$verb" run-same-state || true)"
+  jq -e '.ok == false and (.error | test("caller owner"))' <<<"$OUT" >/dev/null
+done
+OUT="$(SMOKE_GATE_OWNER=owner-a bash "$GATE" finish "$SAME_SHA" run-same-state NO_GO || true)"
+jq -e '.ok == false and (.error | test("caller owner"))' <<<"$OUT" >/dev/null
+jq -e '.owner == "owner-b"' "$SMOKE_GATE_LEASE_DIR/lease-run-same-state.json" >/dev/null
+[ ! -e "$STATE_DIR/pr-121-verdict.json" ] && [ ! -e "$STATE_DIR/runs/run-same-state/verdict.json" ]
+# The forwarded token works from a different execution identity and progress
+# renews the live lease instead of guessing authority from mutable PR state.
+BEFORE_EXP="$(jq -r '.expiresAt' "$SMOKE_GATE_LEASE_DIR/lease-run-same-state.json")"
+SMOKE_GATE_OWNER=unrelated bash "$GATE" progress run-same-state owner-b | jq -e '.ok == true and .leaseRenewed == true' >/dev/null
+AFTER_EXP="$(jq -r '.expiresAt' "$SMOKE_GATE_LEASE_DIR/lease-run-same-state.json")"
+[ "$(date -u -d "$AFTER_EXP" +%s)" -ge "$(date -u -d "$BEFORE_EXP" +%s)" ]
+bash "$GATE" release run-same-state owner-b | jq -e '.ok == true and .leaseReleased == true' >/dev/null
+
+# Expiry ends standalone renew/release authority. Recovery is the serialized
+# same-run claim using the original token, never reviving an expired lease.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base SMOKE_GATE_LEASE_TTL_SECONDS=1
+EXPIRED_SHA="$(sha b)"
+bash "$GATE" claim run-expired-owner 127 "$EXPIRED_SHA" owner-a | jq -e '.ok == true' >/dev/null
+sleep 2
+for lease_verb in lease-renew lease-release; do
+  OUT="$(bash "$GATE" "$lease_verb" run-expired-owner owner-a || true)"
+  jq -e '.ok == false and (.error | test("expired")) and (.error | test("recover with claim"))' <<<"$OUT" >/dev/null
+  [ -s "$SMOKE_GATE_LEASE_DIR/lease-run-expired-owner.json" ]
+done
+SMOKE_GATE_LEASE_TTL_SECONDS=30 bash "$GATE" claim run-expired-owner 127 "$EXPIRED_SHA" owner-a | jq -e '.ok == true' >/dev/null
+bash "$GATE" release run-expired-owner owner-a | jq -e '.ok == true' >/dev/null
+
+# --- 30. malformed and non-shared lease storage fail closed -----------------
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+BAD_SHA="$(sha 7)"
+mkdir -p "$SMOKE_GATE_LEASE_DIR"
+printf '{broken\n' > "$SMOKE_GATE_LEASE_DIR/lease-run-malformed.json"
+BAD="$(bash "$GATE" lease-status run-malformed 2>/dev/null || true)"
+jq -e '.ok == false and (.error | test("malformed"))' <<<"$BAD" >/dev/null
+BAD="$(bash "$GATE" claim run-malformed 122 "$BAD_SHA" owner-a 2>/dev/null || true)"
+jq -e '.ok == false and (.error | test("malformed"))' <<<"$BAD" >/dev/null
+grep -q '^{' "$SMOKE_GATE_LEASE_DIR/lease-run-malformed.json"
+MISSING_ROOT="$STATE_DIR/no-such-shared-root"
+BAD="$(SMOKE_GATE_SHARED_ROOT="$MISSING_ROOT" SMOKE_GATE_LEASE_DIR="$MISSING_ROOT/leases" \
+  bash "$GATE" claim run-missing 123 "$BAD_SHA" owner-a 2>/dev/null || true)"
+jq -e '.ok == false and (.error | test("missing"))' <<<"$BAD" >/dev/null
+ln -s "$STATE_DIR" "$TEST_SHARED_ROOT/private-alias"
+BAD="$(SMOKE_GATE_LEASE_DIR="$TEST_SHARED_ROOT/private-alias/leases" \
+  bash "$GATE" claim run-private-alias 124 "$BAD_SHA" owner-a 2>/dev/null || true)"
+jq -e '.ok == false and (.error | test("non-shared|outside shared"))' <<<"$BAD" >/dev/null
+[ ! -e "$STATE_DIR/pr-123-state.json" ] && [ ! -e "$STATE_DIR/pr-124-state.json" ]
+
+# A present binding whose referenced lease is corrupt or owner-inconsistent is
+# unknown authority, never an expired slot available for replacement.
+CORRUPT_A="$STATE_DIR/corrupt-a" CORRUPT_B="$STATE_DIR/corrupt-b"
+mkdir -p "$CORRUPT_A" "$CORRUPT_B"
+CORRUPT_LEASE="$TEST_SHARED_ROOT/corrupt-binding/leases"
+SMOKE_GATE_STATE_DIR="$CORRUPT_A" SMOKE_GATE_LEASE_DIR="$CORRUPT_LEASE" \
+  bash "$GATE" claim run-corrupt-a 128 "$BAD_SHA" owner-a | jq -e '.ok == true' >/dev/null
+printf '{broken\n' > "$CORRUPT_LEASE/lease-run-corrupt-a.json"
+BAD="$(SMOKE_GATE_STATE_DIR="$CORRUPT_B" SMOKE_GATE_LEASE_DIR="$CORRUPT_LEASE" \
+  bash "$GATE" claim run-corrupt-b 128 "$BAD_SHA" owner-b --takeover 2>/dev/null || true)"
+jq -e '.ok == false and (.error | test("malformed"))' <<<"$BAD" >/dev/null
+jq -e '.runId == "run-corrupt-a" and .owner == "owner-a"' "$CORRUPT_LEASE/pr-128-authority.json" >/dev/null
+[ ! -e "$CORRUPT_LEASE/lease-run-corrupt-b.json" ]
+
+# A failed same-owner re-claim restores the preexisting live lease rather than
+# deleting authority that another invocation still relies on.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+ROLL_SHA="$(sha 8)"
+bash "$GATE" claim run-rollback 125 "$ROLL_SHA" owner-a | jq -e '.ok == true' >/dev/null
+ROLL_BEFORE="$(cat "$SMOKE_GATE_LEASE_DIR/lease-run-rollback.json")"
+ROLL_AUTH_BEFORE="$(cat "$SMOKE_GATE_LEASE_DIR/pr-125-authority.json")"
+chmod 500 "$STATE_DIR"
+ROLL_OUT="$(bash "$GATE" claim run-rollback 125 "$ROLL_SHA" owner-a 2>/dev/null || true)"
+chmod 700 "$STATE_DIR"
+jq -e '.ok == false and (.error | test("private PR slot"))' <<<"$ROLL_OUT" >/dev/null
+[ "$(cat "$SMOKE_GATE_LEASE_DIR/lease-run-rollback.json")" = "$ROLL_BEFORE" ]
+[ "$(cat "$SMOKE_GATE_LEASE_DIR/pr-125-authority.json")" = "$ROLL_AUTH_BEFORE" ]
+bash "$GATE" release run-rollback owner-a | jq -e '.ok == true' >/dev/null
+
+# Poll lease I/O failures retain the poll envelope and use the existing
+# immediate-then-throttled alarm shape.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+POLL_FAIL_SHA="$(sha 9)"
+export STUB_PR_LIST="[{\"number\":126,\"headRefOid\":\"$POLL_FAIL_SHA\",\"headRefName\":\"feature/y\"}]"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$POLL_FAIL_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES='[{"id":"backend-pr-126","name":"backend PR #126","serviceDetails":{"parentServer":{"id":"srv-backend-base"},"url":"https://preview.invalid"}}]'
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$POLL_FAIL_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+POLL_MISSING="$STATE_DIR/missing-shared"
+for expected in true false; do
+  OUT="$(SMOKE_GATE_SHARED_ROOT="$POLL_MISSING" SMOKE_GATE_LEASE_DIR="$POLL_MISSING/leases" bash "$GATE" poll)"
+  jq -e --argjson expected "$expected" \
+    '.ok == false and .wakeAgent == $expected and .data.trigger == "coordinator_lease_unavailable"' <<<"$OUT" >/dev/null
+done
+
 # --- INVARIANT 3: num_env rejects the classes it was built to stop --------
 # Mirror of the develop suite's case-53 extension. "All digits" admitted three
 # shapes, each a distinct silent failure: a leading zero is octal (or fatal) in
