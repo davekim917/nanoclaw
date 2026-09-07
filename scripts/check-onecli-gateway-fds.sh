@@ -41,17 +41,27 @@ RECOVER_WAIT_S="${RECOVER_WAIT_S:-60}"   # bound on waiting for the gateway to r
 
 fail() { echo "fd-watchdog: $1" >&2; exit 1; }
 
-# Validate the threshold HERE, not at the comparison. `[ "$PCT" -lt "70%" ]`
-# exits 2 with "integer expression expected", and because that comparison is an
-# `if` condition, `set -e` does not stop the script — a non-integer threshold
-# reads as "not below" and falls straight through to `docker restart`. On a
-# 2-minute timer a single typo in the unit's Environment= would restart the
-# gateway forever, which is a continuous credential outage caused by the thing
-# meant to prevent one. Refuse the value instead.
-case "$RESTART_PCT" in
-  ''|*[!0-9]*) fail "RESTART_PCT must be an integer 0-100, got '$RESTART_PCT'" ;;
-esac
-[ "$RESTART_PCT" -le 100 ] || fail "RESTART_PCT must be an integer 0-100, got '$RESTART_PCT'"
+# Validate EVERY numeric knob here, before anything can act on one. A bad value
+# does not fail loudly on its own: `[ "$PCT" -lt "70%" ]` exits 2, and because
+# that comparison is an `if` condition `set -e` does not stop the script, so the
+# threshold reads as "not below" and falls through to `docker restart` — on a
+# 2-minute timer, one typo in the unit's Environment= is a permanent restart
+# loop. `seq 1 "$RECOVER_WAIT_S"` with a zero, negative or mistyped value yields
+# no iterations, so the recovery poll never runs and a healthy restart is
+# reported as a failed one. Same root cause, so one gate rather than a guard per
+# variable: the first version of this validated only RESTART_PCT and review
+# found the identical defect at RECOVER_WAIT_S one round later.
+require_int() {  # <name> <value> [max]
+  case "$2" in
+    ''|*[!0-9]*) fail "$1 must be a non-negative integer, got '$2'" ;;
+  esac
+  if [ -n "${3:-}" ] && [ "$2" -gt "$3" ]; then
+    fail "$1 must be <= $3, got '$2'"
+  fi
+}
+require_int RESTART_PCT "$RESTART_PCT" 100
+require_int RECOVER_WAIT_S "$RECOVER_WAIT_S"
+[ "$RECOVER_WAIT_S" -gt 0 ] || fail "RECOVER_WAIT_S must be > 0, got '$RECOVER_WAIT_S'"
 
 docker inspect "$CONTAINER" >/dev/null 2>&1 || fail "container '$CONTAINER' not found"
 
@@ -166,9 +176,17 @@ mkdir -p "$OUTBOX"
   exit 1
 }
 
+# The filename stamp stays UTC so files sort globally; the human-visible time
+# renders in the INSTALL timezone, like every other user-facing NanoClaw
+# output. A bare `date` is NOT that: this host's system zone is Etc/UTC while
+# the install runs TZ=America/New_York, set in the nanoclaw-v2 unit — so the
+# install zone has to be read from there, not inherited.
+INSTALL_TZ="${TZ:-$(systemctl show nanoclaw-v2 -p Environment --value 2>/dev/null | tr ' ' '\n' | sed -n 's/^TZ=//p' | head -1)}"
+INSTALL_TZ="${INSTALL_TZ:-UTC}"
+
 OUT="$OUTBOX/$(date -u +%Y%m%dT%H%M%S)-onecli-fd-watchdog.md"
 {
-  printf '*OneCLI gateway fd watchdog*\n_host: %s · %s UTC_\n\n' "$(hostname)" "$(date -u '+%Y-%m-%d %H:%M')"
+  printf '*OneCLI gateway fd watchdog*\n_host: %s · %s_\n\n' "$(hostname)" "$(TZ="$INSTALL_TZ" date '+%Y-%m-%d %H:%M %Z')"
   printf 'The gateway reached %s%% of its %s-fd limit (%s sockets held but unreclaimable) and %s.\n\n' \
     "$PCT" "$SOFT" "$STUCK" "$OUTCOME"
   printf 'Root cause is the upstream leak in onecli/onecli#484, still open. This watchdog is containment, not a fix.\n'
