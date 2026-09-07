@@ -180,83 +180,78 @@ else
   OUTCOME="was restarted automatically but did NOT come back healthy within ${RECOVER_WAIT_S}s — credentialed calls are still failing and this needs a human"
 fi
 
-# Tell a human, over a path that does not depend on what just broke.
+# Tell a human. DM by default, because these are host-ops alerts for one
+# operator and do not belong in a shared channel.
 #
-# NOT data/cli.sock. That socket is served BY nanoclaw-v2, and a `to:` payload
-# on it becomes an INBOUND event (src/channels/cli.ts) — it queues work for an
-# agent, which must then spawn a container and call its provider before anyone
-# sees anything. Every one of those steps needs the OneCLI gateway: the spawn
-# path refuses containers outright while the gateway is unreachable
-# (src/onecli-preflight.ts). So the agent path is undeliverable in exactly the
-# case this script exists to report, and it would print "delivered" anyway.
-# scripts/unit-failure-alert.sh already carries this conclusion in its header.
+# Sent AS THE OWNER's user id, not a synthetic `system:<name>` sender: the
+# router treats a synthetic sender as an unknown user, and an owner DM under
+# `unknown_sender_policy = strict` DROPS it while `sendall()` still returns
+# success. That silently muted host alerting for three days (fork #538).
 #
-# The outbox is shipped to Slack every 60s by outbox-ship.sh using its own bot
-# token and no host process, so it survives both nanoclaw-v2 and the gateway
-# being down. It also removes this script's dependency on the central DB and on
-# sender attribution entirely — there is no router gate to be dropped by.
-OUTBOX="${FD_WATCHDOG_OUTBOX:-${UNIT_ALERT_OUTBOX:-}}"
-if [ -z "$OUTBOX" ]; then
-  echo "fd-watchdog: FD_WATCHDOG_OUTBOX/UNIT_ALERT_OUTBOX unset — the gateway was handled but NOBODY WAS TOLD" >&2
-  exit 1
-fi
-# Do NOT mkdir the outbox. This runs as root, so creating a missing final
-# directory would leave it root-owned 0755: the install-user shipper could read
-# the queued alert but not rename it into sent/, so it would retry forever.
-if [ ! -d "$OUTBOX" ] || [ ! -w "$OUTBOX" ]; then
-  echo "fd-watchdog: outbox missing or unwritable ($OUTBOX) — NOBODY WAS TOLD" >&2
-  exit 1
+# The outbox stays available as an explicit fallback for the case cli.sock
+# cannot serve — it is written by nanoclaw-v2 itself — but it is OPT-IN via
+# FD_WATCHDOG_OUTBOX, because the workgroup outbox ships to a shared channel
+# and these alerts are not for one.
+NOTIFICATION="OneCLI gateway fd watchdog ($(TZ="$INSTALL_TZ" date '+%Y-%m-%d %H:%M %Z')): reached ${PCT}% of the ${SOFT}-fd limit (${STUCK} sockets held but unreclaimable) and ${OUTCOME}. Root cause is the upstream leak in onecli/onecli#484, still open; this watchdog is containment, not a fix."
+
+DELIVERED=0
+ADMIN_ROW="$(pnpm exec tsx scripts/q.ts "$NANOCLAW_DIR/data/v2.db" "
+  SELECT mg.platform_id, ud.channel_type, ur.user_id
+    FROM user_roles ur
+    JOIN user_dms ud ON ud.user_id = ur.user_id
+    JOIN messaging_groups mg ON mg.id = ud.messaging_group_id
+   WHERE ur.role = 'owner'
+   ORDER BY ud.resolved_at DESC
+   LIMIT 1
+" 2>/dev/null | tail -1)" || ADMIN_ROW=''
+DM_PLATFORM_ID="$(echo "$ADMIN_ROW" | cut -d'|' -f1)"
+DM_CHANNEL_TYPE="$(echo "$ADMIN_ROW" | cut -d'|' -f2)"
+DM_USER_ID="$(echo "$ADMIN_ROW" | cut -d'|' -f3)"
+CLI_SOCK="$NANOCLAW_DIR/data/cli.sock"
+
+if [ -n "$DM_PLATFORM_ID" ] && [ -n "$DM_USER_ID" ] && [ -S "$CLI_SOCK" ]; then
+  export NOTIFICATION DM_CHANNEL_TYPE DM_PLATFORM_ID DM_USER_ID CLI_SOCK
+  if python3 <<'PYEOF'
+import json, os, socket, sys, time
+try:
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(10)
+    sock.connect(os.environ["CLI_SOCK"])
+    sock.sendall((json.dumps({
+        "text": os.environ["NOTIFICATION"],
+        "senderId": os.environ["DM_USER_ID"],
+        "sender": "OneCLI FD Watchdog",
+        "to": {
+            "channelType": os.environ["DM_CHANNEL_TYPE"],
+            "platformId": os.environ["DM_PLATFORM_ID"],
+            "threadId": os.environ["DM_PLATFORM_ID"],
+        },
+    }) + "\n").encode("utf-8"))
+    time.sleep(0.5)
+    sock.close()
+except Exception as e:
+    print(f"dm send failed: {e}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+  then
+    DELIVERED=1
+    echo "fd-watchdog: alert sent to the owner DM"
+  fi
 fi
 
-# The filename stamp stays UTC so files sort globally; the human-visible time
-# renders in the INSTALL timezone, like every other user-facing NanoClaw
-# output. A bare `date` is NOT that: this host's system zone is Etc/UTC while
-# the install runs TZ=America/New_York, set in the nanoclaw-v2 unit — so the
-# install zone has to be read from there, not inherited.
-# The unit name is install-specific — src/install-slug.ts generates
-# nanoclaw-v2-<slug>, and setup can install it under `systemctl --user` — so
-# NANOCLAW_SERVICE_UNIT overrides it, and .env's TZ is tried before giving up.
-# Every branch is tolerant: this runs AFTER the restart, so an unknown timezone
-# must never cost the alert.
-INSTALL_TZ="${TZ:-}"
-if [ -z "$INSTALL_TZ" ]; then
-  INSTALL_TZ="$(systemctl show "${NANOCLAW_SERVICE_UNIT:-nanoclaw-v2}" -p Environment --value 2>/dev/null \
-    | tr ' ' '\n' | sed -n 's/^TZ=//p' | head -1)" || INSTALL_TZ=''
+if [ "$DELIVERED" = "0" ] && [ -n "${FD_WATCHDOG_OUTBOX:-}" ]; then
+  if [ -d "$FD_WATCHDOG_OUTBOX" ] && [ -w "$FD_WATCHDOG_OUTBOX" ]; then
+    RAND="$(od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+    OUT="$FD_WATCHDOG_OUTBOX/$(date -u +%Y%m%dT%H%M%S)-onecli-fd-watchdog.${RAND:-$$}.md"
+    umask 022
+    set -C
+    printf '*OneCLI gateway fd watchdog*\n\n%s\n' "$NOTIFICATION" > "$OUT" && DELIVERED=1
+    set +C
+    [ "$DELIVERED" = "1" ] && echo "fd-watchdog: alert queued $OUT"
+  fi
 fi
-[ -n "$INSTALL_TZ" ] || INSTALL_TZ="$(read_env_value TZ "$NANOCLAW_DIR/.env")"
-# Validate before use, and fall through rather than trusting the first
-# candidate: CLAUDE.md's timezone rule is fail-closed against the on-disk zone
-# database, so a fixed offset, retired alias or wrong-case name that `date`
-# would silently render as UTC must not be accepted as the install zone.
-tz_valid() { [ -n "${1:-}" ] && [ -f "/usr/share/zoneinfo/$1" ]; }
-tz_valid "$INSTALL_TZ" || INSTALL_TZ=""
-[ -n "$INSTALL_TZ" ] || INSTALL_TZ="UTC"
 
-# One atomic create-and-write. `set -C` makes `>` use O_CREAT|O_EXCL, which
-# REFUSES an existing path — a symlink included — rather than following it. That
-# closes the window a mktemp-then-reopen sequence leaves open, where an agent
-# sharing this directory could unlink the created file and drop a symlink at the
-# name before the redirect reopens it. The name also carries randomness so there
-# is nothing to pre-create, and `>` respects umask, so the shipper (running as
-# the install user) can read what root wrote — mktemp's 0600 could not be.
-RAND="$(od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
-OUT="$OUTBOX/$(date -u +%Y%m%dT%H%M%S)-onecli-fd-watchdog.${RAND:-$$}.md"
-umask 022
-set -C
-{
-  printf '*OneCLI gateway fd watchdog*\n_host: %s · %s_\n\n' "$(hostname)" "$(TZ="$INSTALL_TZ" date '+%Y-%m-%d %H:%M %Z')"
-  printf 'The gateway reached %s%% of its %s-fd limit (%s sockets held but unreclaimable) and %s.\n\n' \
-    "$PCT" "$SOFT" "$STUCK" "$OUTCOME"
-  printf 'Root cause is the upstream leak in onecli/onecli#484, still open. This watchdog is containment, not a fix.\n'
-} > "$OUT" || {
-  set +C
-  echo "fd-watchdog: could not create $OUT (pre-existing path?) — NOBODY WAS TOLD" >&2
+if [ "$DELIVERED" = "0" ]; then
+  echo "fd-watchdog: THE GATEWAY WAS HANDLED BUT NOBODY WAS TOLD — $NOTIFICATION" >&2
   exit 1
-}
-set +C
-
-[ -s "$OUT" ] || {
-  echo "fd-watchdog: wrote an empty alert to $OUT" >&2
-  exit 1
-}
-echo "fd-watchdog: queued alert $OUT"
+fi

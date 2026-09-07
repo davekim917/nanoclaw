@@ -89,7 +89,10 @@ esac
 # which is exactly how the real delivery failure went unnoticed for three days.
 OUTBOX="$ROOT/data/outbox"
 mkdir -p "$OUTBOX"
-export UNIT_ALERT_OUTBOX="$OUTBOX"
+# No cli.sock or central DB in the fixture, so the DM path cannot run here —
+# this exercises the outbox FALLBACK, which is the same "delivery succeeded ->
+# cooldown stamped" contract.
+export HEALTH_SENTINEL_OUTBOX="$OUTBOX"
 run_sentinel TEST_ALERT=1
 RC=$?
 [ "$RC" -eq 0 ] || bad "successful delivery should exit 0" "rc=$RC out=$OUT"
