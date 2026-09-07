@@ -167,6 +167,22 @@ describe('hasTrackedChanges', () => {
   it('reads the destination of a rename, which is what would be lost', () => {
     expect(hasTrackedChanges('R  node_modules/x -> src/real.ts\n')).toBe(true);
   });
+
+  // The exemption is for the untracked/ignored symlink, not for the name. A
+  // TRACKED change under a node_modules path is real work: `git mv tracked
+  // node_modules/x` must still block removal.
+  it('does NOT exempt a tracked or staged change under a node_modules path', () => {
+    expect(hasTrackedChanges('A  node_modules/kept.ts\n')).toBe(true);
+    expect(hasTrackedChanges(' M node_modules/kept.ts\n')).toBe(true);
+    expect(hasTrackedChanges('R  src/old.ts -> node_modules/new.ts\n')).toBe(true);
+    expect(hasTrackedChanges('D  node_modules/gone.ts\n')).toBe(true);
+  });
+
+  it('still exempts the untracked and ignored link itself', () => {
+    expect(hasTrackedChanges('?? node_modules\n')).toBe(false);
+    expect(hasTrackedChanges('!! node_modules/\n')).toBe(false);
+    expect(hasTrackedChanges('?? container/agent-runner/node_modules\n')).toBe(false);
+  });
 });
 
 describe('assess', () => {

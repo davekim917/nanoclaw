@@ -230,12 +230,21 @@ export function hasTrackedChanges(status: string): boolean {
     .split('\n')
     .filter((l) => l.trim() !== '')
     .some((l) => {
-      // Porcelain v1: 2 status chars, a space, then the path. A rename shows
-      // `old -> new`; the destination is what would be lost.
+      // Porcelain v1: two status columns, a space, then the path.
+      const xy = l.slice(0, 2);
       const raw = l.slice(3);
+      // A rename shows `old -> new`; the destination is what would be lost.
       const pathPart = raw.includes(' -> ') ? raw.slice(raw.indexOf(' -> ') + 4) : raw;
       const segments = pathPart.replace(/^"|"$/g, '').split('/');
-      return !segments.includes('node_modules');
+
+      // What makes the node_modules entry disposable is its STATUS, not its
+      // name: it is an untracked (`??`) or ignored (`!!`) symlink into the live
+      // checkout. Exempting by path alone also swallowed `A `, `R ` and ` M`
+      // entries under a node_modules path — `git mv tracked node_modules/x`
+      // would have been force-removed as if it were the link. Any tracked
+      // status is real work wherever it lives.
+      const isUntrackedOrIgnored = xy === '??' || xy === '!!';
+      return !(isUntrackedOrIgnored && segments.includes('node_modules'));
     });
 }
 
