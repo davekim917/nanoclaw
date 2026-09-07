@@ -71,6 +71,24 @@ describe('parseRawConfig provider fallback bridge', () => {
     expect(config.providerConfig).toEqual({});
   });
 
+  it('carries a Codex fallback declaration onto config.model/effort', () => {
+    // The codex direction of the same bridge. `providerConfig` is emptied
+    // (claude's sticky config is the wrong provider's), so these two fields
+    // are the ONLY carrier of the fallback's declared model/effort into the
+    // container — CodexProvider folds them into its sticky config.
+    clearEnv();
+    process.env.NANOCLAW_PROVIDER_OVERRIDE = 'codex';
+    const config = parseRawConfig({
+      provider: 'claude',
+      providerConfig: { model: 'claude-opus-5[1m]', effort: 'high' },
+      providerFallback: { provider: 'codex', model: 'gpt-5.5-pro', effort: 'xhigh' },
+    });
+    expect(config.provider).toBe('codex');
+    expect(config.providerConfig).toEqual({});
+    expect(config.model).toBe('gpt-5.5-pro');
+    expect(config.effort).toBe('xhigh');
+  });
+
   it('keeps the file settings when no override is in play', () => {
     clearEnv();
     const config = parseRawConfig({

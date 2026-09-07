@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'bun:test';
 
 import { createCodexConfigOverrides } from './codex-app-server.js';
-import { buildCodexSubagentLifecycleInstructions, CodexProvider, codexConfigSchema } from './codex.js';
+import {
+  buildCodexSubagentLifecycleInstructions,
+  CodexProvider,
+  codexConfigSchema,
+  resolveQueryEffort,
+  resolveQueryModel,
+} from './codex.js';
 import { getProviderConfigSchema, validateProviderConfig } from './provider-registry.js';
 
 // Importing the providers barrel triggers all `registerProvider*` calls so the
@@ -162,5 +168,75 @@ describe('CodexProvider sticky config + override propagation', () => {
   it('test_constructor_rejects_invalid_provider_config', () => {
     // R8: defensive re-parse must throw on hand-edited junk in container.json.
     expect(() => new CodexProvider({ providerConfig: { reasoning_effort: 'extreme' } })).toThrow();
+  });
+});
+
+describe('CodexProvider provider-fallback model/effort', () => {
+  type Sticky = { model?: string; reasoning_effort?: string };
+  const sticky = (p: CodexProvider): Sticky => (p as unknown as { stickyConfig: Sticky }).stickyConfig;
+
+  it('test_fallback_model_and_effort_applied_when_providerConfig_empty', () => {
+    // A claude group whose `providerFallback` declares codex spawns with an
+    // EMPTY providerConfig (config.ts drops the primary's sticky config) and
+    // the fallback's model/effort on options.model/options.effort. Without
+    // this the container ran gpt-5.6-sol at the schema-default `high`.
+    const p = new CodexProvider({ providerConfig: {}, model: 'gpt-5.5-pro', effort: 'xhigh' });
+    expect(sticky(p).model).toBe('gpt-5.5-pro');
+    expect(sticky(p).reasoning_effort).toBe('xhigh');
+    // Reach the actual app-server seam, not just the field. gen() computes
+    // `resolveQueryModel(input.model, this.model)` -> thread.start params and
+    // `createCodexConfigOverrides(resolveQueryEffort(input.effort, sticky))`
+    // -> spawnCodexAppServer. With no per-turn -m/-e (the normal case for a
+    // fallback spawn) both must carry the declared values through.
+    expect(resolveQueryModel(undefined, (p as unknown as { model: string }).model)).toBe('gpt-5.5-pro');
+    expect(createCodexConfigOverrides(resolveQueryEffort(undefined, sticky(p) as never))).toContain(
+      'model_reasoning_effort="xhigh"',
+    );
+  });
+
+  it('test_per_turn_flags_still_beat_the_fallback_declaration', () => {
+    // The fallback sets the session default, not a floor: an explicit -m/-e
+    // on the turn must still win at the same seam.
+    const p = new CodexProvider({ providerConfig: {}, model: 'gpt-5.5-pro', effort: 'xhigh' });
+    expect(resolveQueryModel('gpt-5.6-luna', (p as unknown as { model: string }).model)).toBe('gpt-5.6-luna');
+    expect(createCodexConfigOverrides(resolveQueryEffort('low', sticky(p) as never))).toContain(
+      'model_reasoning_effort="low"',
+    );
+  });
+
+  it('test_fallback_effort_only_leaves_model_on_its_default', () => {
+    const p = new CodexProvider({ providerConfig: {}, effort: 'low' });
+    expect(sticky(p).model).toBeUndefined();
+    expect(sticky(p).reasoning_effort).toBe('low');
+    expect((p as unknown as { model: string }).model).toBe('gpt-5.6-sol');
+  });
+
+  it('test_declared_providerConfig_still_wins_on_the_primary_path', () => {
+    // Primary codex groups must be untouched: config.ts has already resolved
+    // the channel/agent model+effort into providerConfig, and options carries
+    // the same chain. providerConfig is authoritative.
+    const p = new CodexProvider({
+      providerConfig: { model: 'gpt-5.5-pro', reasoning_effort: 'medium' },
+      model: 'gpt-5.4-mini',
+      effort: 'ultra',
+    });
+    expect(sticky(p).model).toBe('gpt-5.5-pro');
+    expect(sticky(p).reasoning_effort).toBe('medium');
+  });
+
+  it('test_non_codex_options_model_and_effort_are_ignored_not_fatal', () => {
+    // A mis-declared providerFallback (claude model id, claude-only effort)
+    // must degrade to codex's own defaults, never throw at boot — the schema
+    // is strict and a throw here is a crash loop, not a bad answer.
+    const p = new CodexProvider({ providerConfig: {}, model: 'claude-opus-5[1m]', effort: 'extreme' });
+    expect(sticky(p).model).toBeUndefined();
+    expect(sticky(p).reasoning_effort).toBe('high');
+    expect((p as unknown as { model: string }).model).toBe('gpt-5.6-sol');
+  });
+
+  it('test_no_options_model_or_effort_keeps_schema_defaults', () => {
+    const p = new CodexProvider({ providerConfig: {} });
+    expect(sticky(p).model).toBeUndefined();
+    expect(sticky(p).reasoning_effort).toBe('high');
   });
 });
