@@ -1793,6 +1793,24 @@ function claudeConfigDir(): string {
 }
 
 function writeMemorySessionHook(hook: MemorySessionHookRegistration): void {
+  // `claudeConfigDir()` falls back to $HOME/.claude when CLAUDE_CONFIG_DIR is
+  // unset, and containers rely on that fallback resolving to /home/node/.claude.
+  // Run this same code on the host — a test, a script, anything importing this
+  // module outside a container — and the fallback resolves to the developer's own
+  // ~/.claude instead, registering a SessionStart hook whose module does not exist
+  // there. Every host session then errors on startup. That has happened twice.
+  //
+  // The module the hook runs ships only in the container image, so its presence is
+  // a direct check of the invariant that actually matters: never register a hook
+  // pointing at a module that isn't there.
+  if (!fs.existsSync(hook.modulePath)) {
+    console.warn(
+      `[memory] refusing to register the session hook: ${hook.modulePath} does not exist. ` +
+        'This code is container-only; writing here would corrupt a host config.',
+    );
+    return;
+  }
+
   const configDir = claudeConfigDir();
   const settingsFile = path.join(configDir, 'settings.json');
   fs.mkdirSync(configDir, { recursive: true });
