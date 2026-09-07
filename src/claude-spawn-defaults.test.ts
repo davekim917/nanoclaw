@@ -7,7 +7,7 @@ import { claudeSpawnEnv, resolveClaudeSpawnDefaults } from './claude-spawn-defau
 import { DEFAULT_OPUS_MODEL } from './flag-parser.js';
 import type { ContainerConfig } from './container-config.js';
 
-type Cfg = Pick<ContainerConfig, 'model' | 'effort' | 'defaultModel' | 'defaultEffort'>;
+type Cfg = Pick<ContainerConfig, 'model' | 'effort' | 'defaultModel' | 'defaultEffort' | 'providerConfig'>;
 const cfg = (over: Partial<Cfg> = {}): Cfg => ({ ...over }) as Cfg;
 
 const pairs = (env: string[]): Record<string, string> => {
@@ -347,5 +347,76 @@ describe('family-default effort table stays in sync with the agent-runner', () =
     expect(body).toMatch(/claude-sonnet-'\)\)\s*return\s*'xhigh'/);
     expect(body).toMatch(/claude-fable-'\)\)\s*return\s*'medium'/);
     expect(body).toMatch(/claude-haiku-'\)\)\s*return\s*undefined/);
+  });
+});
+
+// Round-4 P2 (codex finding 3951298631). `providerConfig` reaches the provider
+// verbatim as its sticky config, and `providerConfig.model` OUTRANKS the env
+// alias this seam feeds (claude.ts: `input.model ?? this.stickyConfig.model ??
+// 'opus'`). So a family default DERIVED from the host's resolved model can
+// belong to a model that never runs.
+//
+// The fix suppresses the inference only. An explicitly configured effort is
+// still exported — passing through an operator's choice needs no knowledge of
+// which model wins, and dropping it would reintroduce the exact defect class
+// this PR exists to fix (a written, read-back-correct value that never reaches
+// the model). That negative case is the second test here and it is what
+// separates this from the naive "suppress whenever providerConfig.model is
+// set" version.
+describe('resolveClaudeSpawnDefaults — the host does not infer when it does not own the model', () => {
+  it('test_no_derivation_when_providerConfig_model_outranks_the_env_alias', () => {
+    // The reported case: pc.model=fable + model=sonnet. Deriving from sonnet
+    // would run Fable at xhigh instead of Fable's medium.
+    const r = resolveClaudeSpawnDefaults(
+      cfg({ model: 'sonnet', providerConfig: { model: 'claude-fable-5-1[1m]' } }),
+    );
+    expect(r.model).toBe('claude-sonnet-5');
+    expect(r.effort).toBeUndefined();
+    expect(claudeSpawnEnv(cfg({ model: 'sonnet', providerConfig: { model: 'claude-fable-5-1[1m]' } })).join(' ')).not.toContain(
+      'NANOCLAW_EFFORT_OVERRIDE',
+    );
+  });
+
+  it('test_a_configured_effort_is_STILL_exported_alongside_providerConfig_model', () => {
+    // THE GUARD. `NANOCLAW_EFFORT_OVERRIDE` is the operator's only carrier on
+    // the primary path — container.json's top-level `effort` reaches
+    // RunnerConfig.effort but is dropped at claude.ts's onFallback-gated fold,
+    // so suppressing the variable wholesale loses the operator's choice
+    // entirely. Verified live: with the env absent a pc.model=fable group runs
+    // Fable at `medium` (the family default) no matter what `--effort` was set
+    // to; with the env present it runs the configured value.
+    const c = cfg({ effort: 'xhigh', providerConfig: { model: 'claude-fable-5-1[1m]' } });
+    expect(resolveClaudeSpawnDefaults(c).effort).toBe('xhigh');
+    expect(pairs(claudeSpawnEnv(c)).NANOCLAW_EFFORT_OVERRIDE).toBe('xhigh');
+  });
+
+  it('test_a_channel_effort_is_STILL_exported_alongside_providerConfig_model', () => {
+    // Same rule one layer up: a per-channel wiring is an operator choice too.
+    const c = cfg({ providerConfig: { model: 'claude-fable-5-1[1m]' } });
+    expect(pairs(claudeSpawnEnv(c, { effort: 'low' })).NANOCLAW_EFFORT_OVERRIDE).toBe('low');
+  });
+
+  it('test_a_providerConfig_without_a_model_does_not_suppress_derivation', () => {
+    // Only `providerConfig.model` competes for the model choice. A
+    // providerConfig carrying anything else leaves the host owning it.
+    const r = resolveClaudeSpawnDefaults(cfg({ model: 'claude-fable-5-1[1m]', providerConfig: { effort: 'high' } }));
+    expect(r.effort).toBe('medium');
+  });
+
+  it('test_a_non_string_providerConfig_model_is_not_treated_as_a_model', () => {
+    // providerConfig is Record<string, unknown> — a hand-edited container.json
+    // can put anything there. Anything that is not a string cannot win the
+    // container's model choice, so it must not suppress derivation either.
+    const r = resolveClaudeSpawnDefaults(cfg({ model: 'claude-fable-5-1[1m]', providerConfig: { model: 42 } }));
+    expect(r.effort).toBe('medium');
+  });
+
+  it('test_the_unconfigured_fleet_baseline_is_still_untouched', () => {
+    expect(resolveClaudeSpawnDefaults(cfg({ providerConfig: { model: 'claude-fable-5-1[1m]' } }))).toEqual({
+      model: DEFAULT_OPUS_MODEL,
+      modelWasConfigured: false,
+      effort: undefined,
+      drops: [],
+    });
   });
 });

@@ -30,6 +30,16 @@ function defaultEffortForClaudeModel(model: string): string | undefined {
   return 'high';
 }
 
+/**
+ * The container.json fields the claude spawn branch reads. `providerConfig` is
+ * here for what it *prevents*, not what it contributes — see the derivation
+ * gate in resolveClaudeSpawnDefaults.
+ */
+export type ClaudeSpawnConfig = Pick<
+  ContainerConfig,
+  'model' | 'effort' | 'defaultModel' | 'defaultEffort' | 'providerConfig'
+>;
+
 /** What the claude spawn branch will put in the container's environment. */
 export interface ClaudeSpawnDefaults {
   /**
@@ -99,7 +109,7 @@ export interface ClaudeSpawnDefaults {
  *    passed through, never fatal.
  */
 export function resolveClaudeSpawnDefaults(
-  containerConfig: Pick<ContainerConfig, 'model' | 'effort' | 'defaultModel' | 'defaultEffort'>,
+  containerConfig: ClaudeSpawnConfig,
   channel: { model?: string | null; effort?: string | null } = {},
 ): ClaudeSpawnDefaults {
   const vocab = vocabFor('claude');
@@ -148,11 +158,40 @@ export function resolveClaudeSpawnDefaults(
     break;
   }
 
-  // Nothing configured an effort. Derive it ONLY when a layer chose the model:
-  // that is exactly the case where the container's alias-based derivation
-  // would be wrong. `undefined` here (haiku) stays undefined — the caller emits
+  // Nothing configured an effort. Deriving one is an INFERENCE about which
+  // model will run, and it is only safe when the host owns that choice.
+  //
+  // `providerConfig` is handed to the container verbatim and becomes the
+  // provider's sticky config, where `providerConfig.model` OUTRANKS the env
+  // alias this function feeds:
+  //
+  //     claude.ts:  input.model ?? this.stickyConfig.model ?? 'opus'
+  //
+  // So when it is set, a family default derived from OUR resolved model could
+  // belong to a model that never runs — the reviewer's case was
+  // `providerConfig.model=fable` + `model=sonnet` yielding Fable at Sonnet's
+  // `xhigh` instead of Fable's `medium`. The host declines to infer there and
+  // lets the container derive from the model it actually picked, which it
+  // already does correctly (`defaultEffortForModel`).
+  //
+  // This is NOT a copy of the container's precedence rule, and the difference
+  // matters: an explicitly CONFIGURED effort is still exported above, because
+  // passing through an operator's choice requires no knowledge of which model
+  // wins. Only the inference is suppressed. That keeps the host from owning a
+  // second copy of an ordering that can drift — and makes the drift failure
+  // safe by construction: if claude.ts ever let the env alias win, this would
+  // merely over-suppress and fall back to the container deriving from its own
+  // chosen model, which is always right. It can be too quiet; it cannot be
+  // wrong.
+  //
+  // `undefined` from the derivation (haiku) stays undefined — the caller emits
   // no variable rather than an empty one.
-  if (effort === undefined && modelWasConfigured) effort = defaultEffortForClaudeModel(model);
+  const stickyModel =
+    typeof containerConfig.providerConfig?.model === 'string' ? containerConfig.providerConfig.model : undefined;
+  const hostOwnsTheModelChoice = stickyModel === undefined;
+  if (effort === undefined && modelWasConfigured && hostOwnsTheModelChoice) {
+    effort = defaultEffortForClaudeModel(model);
+  }
 
   return { model, modelWasConfigured, effort, drops };
 }
@@ -182,7 +221,7 @@ export function resolveClaudeSpawnDefaults(
  * site so this stays a pure function and the log line carries session context.
  */
 export function claudeSpawnEnv(
-  containerConfig: Pick<ContainerConfig, 'model' | 'effort' | 'defaultModel' | 'defaultEffort'>,
+  containerConfig: ClaudeSpawnConfig,
   channel: { model?: string | null; effort?: string | null } = {},
   onDrop?: (message: string) => void,
 ): string[] {
