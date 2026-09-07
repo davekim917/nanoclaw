@@ -64,9 +64,13 @@ if [ -z "$OUTBOX" ]; then
   echo "drift-check: DRIFT DETECTED but no outbox configured: $NOTIFICATION" >&2
   exit 1
 fi
-mkdir -p "$OUTBOX"
+# Do NOT mkdir the outbox. This runs as root, so creating a missing final
+# directory would leave it root-owned 0755: the install-user shipper could
+# read the queued alert but not rename it into sent/, so a successful POST
+# would retry forever while this script had already stamped its cooldown.
+# An absent outbox is a provisioning error and must be loud, not papered over.
 if [ ! -d "$OUTBOX" ] || [ ! -w "$OUTBOX" ]; then
-  echo "drift-check: DRIFT DETECTED but outbox unusable ($OUTBOX): $NOTIFICATION" >&2
+  echo "drift-check: outbox missing or unwritable ($OUTBOX) — NOBODY WAS TOLD" >&2
   exit 1
 fi
 # Atomic O_EXCL create, same reasoning as health-sentinel.sh.

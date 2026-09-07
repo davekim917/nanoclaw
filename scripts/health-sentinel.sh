@@ -372,10 +372,13 @@ if [ -z "$OUTBOX" ]; then
   echo "$ALERT_LINES" >&2
   exit 1
 fi
-mkdir -p "$OUTBOX"
-# `mkdir -p` on a dangling compat symlink succeeds at creating nothing usable.
+# Do NOT mkdir the outbox. This runs as root, so creating a missing final
+# directory would leave it root-owned 0755: the install-user shipper could
+# read the queued alert but not rename it into sent/, so a successful POST
+# would retry forever while this script had already stamped its cooldown.
+# An absent outbox is a provisioning error and must be loud, not papered over.
 if [ ! -d "$OUTBOX" ] || [ ! -w "$OUTBOX" ]; then
-  echo "health-sentinel: BREACH but outbox unusable ($OUTBOX):" >&2
+  echo "health-sentinel: outbox missing or unwritable ($OUTBOX) — NOBODY WAS TOLD" >&2
   echo "$ALERT_LINES" >&2
   exit 1
 fi
