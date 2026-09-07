@@ -59,13 +59,24 @@ export const claudeConfigSchema = z.strictObject({
 
 /**
  * A claude model id the SDK can actually resolve: a concrete `claude-*` id
- * (with or without the `[1m]` context suffix) or one of the three family
- * aliases the ANTHROPIC_DEFAULT_<FAMILY>_MODEL envs resolve. Deliberately
- * narrow — this only guards operator-declared `providerFallback.model`
- * values, and anything outside this set is a mis-declaration (a codex or
- * opencode model id) that would 400 at the API on every turn.
+ * (with or without the `[1m]` context suffix) or one of the family aliases the
+ * ANTHROPIC_DEFAULT_<FAMILY>_MODEL envs resolve.
+ *
+ * MUST stay in sync with `VALID_MODEL_RE` in `src/flag-parser.ts` — the host
+ * is a separate Node package and nothing is importable across the boundary.
+ * `claude.fallbackConfig.test.ts` parses that regex out of the host source and
+ * fails on drift.
+ *
+ * A LOOSER shape here than the host's is not a harmless mismatch. This guards
+ * operator-declared `providerFallback.model`, and whatever survives is folded
+ * into `stickyConfig`, which outranks the safe `opus` alias in `query()`. An
+ * earlier `claude-[a-z0-9.-]+` accepted a claude-SHAPED typo like
+ * `claude-opus-bogus`, which the host vocabulary rejects: every fallback turn
+ * then targeted a nonexistent model instead of degrading to the family
+ * default. Per-family shapes, not a wildcard.
  */
-const CLAUDE_MODEL_RE = /^(?:opus|sonnet|haiku|claude-[a-z0-9.\-]+(?:\[[a-z0-9]+\])?)$/i;
+export const CLAUDE_MODEL_RE =
+  /^(?:opus|sonnet|haiku|default|claude-opus-\d+(?:-\d+)?(?:\[\dm\])?|claude-haiku-\d+-\d+(?:-\d+)?(?:\[\dm\])?|claude-sonnet-\d+(?:\[\dm\])?|claude-fable-\d+(?:-\d+)?(?:\[\dm\])?)$/i;
 
 /**
  * Resolve the sticky (session-default) model/effort for a ClaudeProvider.

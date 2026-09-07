@@ -1,4 +1,6 @@
 import { describe, it, expect, mock } from 'bun:test';
+import fs from 'fs';
+import path from 'path';
 
 // Mock the SDK before importing claude.ts so the options handed to sdkQuery
 // are observable — the resolved model/effort exist nowhere else at runtime.
@@ -31,7 +33,7 @@ mock.module('../worktree-autosave.js', () => ({
   autoCommitDirtyWorktrees: async () => ({ committed: [], failed: [] }),
 }));
 
-const { ClaudeProvider } = await import('./claude.js');
+const { ClaudeProvider, CLAUDE_MODEL_RE } = await import('./claude.js');
 const { MEMORY_SESSION_HOOK } = await import('../memory/session-hook.js');
 
 type Sticky = { model?: string; effort?: string };
@@ -238,5 +240,63 @@ describe('ClaudeProvider primary path is unchanged', () => {
     });
     expect(sticky(p).model).toBe('claude-opus-5[1m]');
     expect(sticky(p).effort).toBe('high');
+  });
+});
+
+// Round-5 P2 (codex 3951400180). The fold guards operator-declared
+// `providerFallback.model`, and whatever survives outranks the safe `opus`
+// alias in query(). A regex looser than the host's therefore does not fail
+// safe — it targets a nonexistent model on every fallback turn.
+describe('ClaudeProvider fallback model vocabulary', () => {
+  type Sticky = { model?: string; effort?: string };
+  const sticky = (p: InstanceType<typeof ClaudeProvider>): Sticky =>
+    (p as unknown as { stickyConfig: Sticky }).stickyConfig;
+
+  it('test_claude_shaped_typo_is_refused_not_promoted', () => {
+    const p = make({ providerConfig: {}, model: 'claude-opus-bogus', onFallback: true });
+    expect(sticky(p).model).toBeUndefined();
+    // ...and the turn degrades to the safe alias rather than a dead model id.
+    expect(run(p)?.model).toBe('opus');
+  });
+
+  it('test_every_real_family_shape_is_still_accepted', () => {
+    for (const model of [
+      'opus',
+      'sonnet',
+      'haiku',
+      'claude-opus-5[1m]',
+      'claude-opus-4-8[1m]',
+      'claude-sonnet-5',
+      'claude-haiku-4-5',
+      'claude-haiku-4-5-20251001',
+      'claude-fable-5-1[1m]',
+    ]) {
+      const p = make({ providerConfig: {}, model, onFallback: true });
+      expect([model, sticky(p).model]).toEqual([model, model]);
+    }
+  });
+
+  it('test_other_providers_ids_are_still_refused', () => {
+    for (const model of ['gpt-5.6-sol', 'opencode-go/kimi-k3', 'claude-', 'claude-opus-']) {
+      const p = make({ providerConfig: {}, model, onFallback: true });
+      expect([model, sticky(p).model]).toEqual([model, undefined]);
+    }
+  });
+
+  it('test_vocabulary_matches_the_host_flag_parser', () => {
+    // The regex is mirrored across the Node/Bun package boundary; nothing is
+    // importable either way, so pin the source text rather than trusting a
+    // comment. A looser container regex is the bug this test exists to catch.
+    const hostSrc = fs.readFileSync(path.resolve(import.meta.dir, '../../../../src/flag-parser.ts'), 'utf8');
+    // A comment block sits between the declaration and the literal, so anchor
+    // on the declaration and take the first regex literal after it.
+    const after = hostSrc.slice(hostSrc.indexOf('const VALID_MODEL_RE ='));
+    const start = after.indexOf('/^');
+    const end = after.indexOf('$/', start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const hostSource = after.slice(start + 1, end + 1);
+    expect(hostSource.startsWith('^(?:opus|sonnet|haiku|default|')).toBe(true);
+    expect(CLAUDE_MODEL_RE.source).toBe(hostSource);
   });
 });
