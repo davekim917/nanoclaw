@@ -557,11 +557,7 @@ describe('buildThreadList — grouping', () => {
     // thread. Later pages must not load sessions from the preceding pages.
     const page = async (offset: number) => {
       const pageSize = 2;
-      const { threads } = await buildThreadList(
-        makeCtx(),
-        { ...LIST_OPTS, limit: pageSize + 1, offset },
-        deps(),
-      );
+      const { threads } = await buildThreadList(makeCtx(), { ...LIST_OPTS, limit: pageSize + 1, offset }, deps());
       return {
         threads: threads.slice(0, pageSize),
         hasMore: threads.length > pageSize,

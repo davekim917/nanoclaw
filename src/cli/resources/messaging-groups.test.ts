@@ -315,8 +315,18 @@ describe('messaging-groups CLI notify', () => {
       const resolvedAt = '2026-01-01T00:00:00.000Z';
       const dms = [
         { id: 'mg-owner-older', channelType: primary, platformId: 'D-OWNER-OLDER', resolvedAt },
-        { id: 'mg-owner-newest', channelType: sibling, platformId: 'D-OWNER-NEWEST', resolvedAt: '2026-02-01T00:00:00.000Z' },
-        { id: 'mg-owner-foreign', channelType: foreign, platformId: 'D-OWNER-FOREIGN', resolvedAt: '2026-03-01T00:00:00.000Z' },
+        {
+          id: 'mg-owner-newest',
+          channelType: sibling,
+          platformId: 'D-OWNER-NEWEST',
+          resolvedAt: '2026-02-01T00:00:00.000Z',
+        },
+        {
+          id: 'mg-owner-foreign',
+          channelType: foreign,
+          platformId: 'D-OWNER-FOREIGN',
+          resolvedAt: '2026-03-01T00:00:00.000Z',
+        },
       ];
       for (const dm of dms) {
         const userId = `${dm.channelType}:U-OWNER`;
