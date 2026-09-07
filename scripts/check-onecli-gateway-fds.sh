@@ -34,7 +34,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NANOCLAW_DIR="${NANOCLAW_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 cd "$NANOCLAW_DIR"
 
-CONTAINER="${ONECLI_CONTAINER:-onecli}"
+# Same key the host uses (src/config.ts: ONECLI_GATEWAY_CONTAINER, default
+# "onecli"); ONECLI_CONTAINER stays accepted so existing drop-ins keep working.
+CONTAINER="${ONECLI_GATEWAY_CONTAINER:-${ONECLI_CONTAINER:-onecli}}"
 RESTART_PCT="${RESTART_PCT:-70}"   # restart at/above this % of the soft limit
 DRY_RUN="${DRY_RUN:-0}"
 RECOVER_WAIT_S="${RECOVER_WAIT_S:-60}"   # bound on waiting for the gateway to return
@@ -181,16 +183,46 @@ mkdir -p "$OUTBOX"
 # output. A bare `date` is NOT that: this host's system zone is Etc/UTC while
 # the install runs TZ=America/New_York, set in the nanoclaw-v2 unit — so the
 # install zone has to be read from there, not inherited.
-INSTALL_TZ="${TZ:-$(systemctl show nanoclaw-v2 -p Environment --value 2>/dev/null | tr ' ' '\n' | sed -n 's/^TZ=//p' | head -1)}"
+# The unit name is install-specific — src/install-slug.ts generates
+# nanoclaw-v2-<slug>, and setup can install it under `systemctl --user` — so
+# NANOCLAW_SERVICE_UNIT overrides it, and .env's TZ is tried before giving up.
+# Every branch is tolerant: this runs AFTER the restart, so an unknown timezone
+# must never cost the alert.
+INSTALL_TZ="${TZ:-}"
+if [ -z "$INSTALL_TZ" ]; then
+  INSTALL_TZ="$(systemctl show "${NANOCLAW_SERVICE_UNIT:-nanoclaw-v2}" -p Environment --value 2>/dev/null \
+    | tr ' ' '\n' | sed -n 's/^TZ=//p' | head -1)" || INSTALL_TZ=''
+fi
+if [ -z "$INSTALL_TZ" ] && [ -r "$NANOCLAW_DIR/.env" ]; then
+  INSTALL_TZ="$(sed -n 's/^[[:space:]]*TZ=//p' "$NANOCLAW_DIR/.env" | tail -1 | tr -d '"\r')" || INSTALL_TZ=''
+fi
 INSTALL_TZ="${INSTALL_TZ:-UTC}"
 
-OUT="$OUTBOX/$(date -u +%Y%m%dT%H%M%S)-onecli-fd-watchdog.md"
+# Exclusive create, not a bare `>`: the outbox can be a workgroup directory an
+# agent container may also write, and a predictable per-second filename could be
+# pre-created there as a symlink, which `>` would follow and truncate. mktemp
+# creates the file itself with O_EXCL and an unguessable suffix.
+# Write to an O_EXCL temp name, then rename into place with the .md suffix
+# outbox-ship.sh globs for. mktemp creates the file itself, so there is no
+# predictable path to pre-create as a symlink, and rename(2) replaces the
+# destination entry rather than writing through one. The random suffix is kept
+# in the final name so nothing about it is guessable ahead of the timer.
+TMP_OUT="$(mktemp "$OUTBOX/$(date -u +%Y%m%dT%H%M%S)-onecli-fd-watchdog.XXXXXX")" || {
+  echo "fd-watchdog: could not create an alert file in $OUTBOX — NOBODY WAS TOLD" >&2
+  exit 1
+}
+OUT="$TMP_OUT.md"
 {
   printf '*OneCLI gateway fd watchdog*\n_host: %s · %s_\n\n' "$(hostname)" "$(TZ="$INSTALL_TZ" date '+%Y-%m-%d %H:%M %Z')"
   printf 'The gateway reached %s%% of its %s-fd limit (%s sockets held but unreclaimable) and %s.\n\n' \
     "$PCT" "$SOFT" "$STUCK" "$OUTCOME"
   printf 'Root cause is the upstream leak in onecli/onecli#484, still open. This watchdog is containment, not a fix.\n'
-} > "$OUT"
+} > "$TMP_OUT"
+# mktemp creates 0600 and this timer runs as root, but outbox-ship.sh runs as
+# the install user — a mode it cannot read is an alert that never ships, which
+# is the same silent failure by a different route.
+chmod 0644 "$TMP_OUT"
+mv -f "$TMP_OUT" "$OUT"
 
 [ -s "$OUT" ] || {
   echo "fd-watchdog: wrote an empty alert to $OUT" >&2
