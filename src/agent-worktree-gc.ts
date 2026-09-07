@@ -55,6 +55,8 @@ export type Verdict =
   | 'open-pr'
   /** GitHub was unreachable, so PR state is unknown — refused, never asserted. */
   | 'pr-unknown'
+  /** A probe did not run (unreadable index, git failure) — refused, not assumed clean. */
+  | 'probe-failed'
   | 'out-of-scope'
   | 'main';
 
@@ -214,7 +216,13 @@ export function assess(
     return { row, verdict: 'locked', detail: 'git worktree lock is set — deliberate do-not-remove' };
   }
 
-  const status = git(row.path, ['status', '--porcelain']) ?? '';
+  // `?? ''` here would be a fail-OPEN: a corrupt or unreadable index makes
+  // git exit non-zero, and an empty status reads as a clean tree. The worktree
+  // would then be force-removed with uncommitted files still in it.
+  const status = git(row.path, ['status', '--porcelain']);
+  if (status === null) {
+    return { row, verdict: 'probe-failed', detail: 'git status failed — cleanliness could not be established' };
+  }
   if (hasTrackedChanges(status)) {
     return { row, verdict: 'dirty', detail: 'uncommitted tracked changes' };
   }
@@ -242,6 +250,8 @@ export interface GcReport {
   assessments: Assessment[];
   removed: string[];
   failed: { path: string; err: string }[];
+  /** Eligible in the survey, refused by the re-check taken just before deletion. */
+  skippedOnRecheck: { path: string; verdict: Verdict; detail: string }[];
   prunedRegistrations: number;
 }
 
@@ -287,18 +297,19 @@ export function runAgentWorktreeGcOnce(
   const mode = opts.mode ?? gcMode();
   const prs = openPrBranches(repoRoot);
   const rows = listWorktrees(repoRoot);
-  const assessments = rows.map((row) =>
-    assess(row, repoRoot, {
-      mainRef: opts.mainRef,
-      procRoot: opts.procRoot,
-      // null (GitHub unreachable) => treat every branch as PR-bearing.
-      openPrBranches: prs ?? new Set<string>(),
-      prStateUnknown: prs === null,
-    }),
-  );
+  // One options object, used for both the survey and the pre-delete re-check,
+  // so the two can never drift into judging by different criteria.
+  const assessOpts = {
+    mainRef: opts.mainRef,
+    procRoot: opts.procRoot,
+    openPrBranches: prs ?? new Set<string>(),
+    prStateUnknown: prs === null,
+  };
+  const assessments = rows.map((row) => assess(row, repoRoot, assessOpts));
 
   const removed: string[] = [];
   const failed: { path: string; err: string }[] = [];
+  const skippedOnRecheck: { path: string; verdict: Verdict; detail: string }[] = [];
   let prunedRegistrations = 0;
 
   if (mode === 'apply') {
@@ -308,16 +319,32 @@ export function runAgentWorktreeGcOnce(
         prunedRegistrations += 1;
         continue; // reclaimed by the single `worktree prune` below
       }
+
+      // Re-assess immediately before deleting. Every assessment above was made
+      // before any deletion began, so by now an agent may have entered this
+      // worktree or written to it — and the whole pass is the window. Acting on
+      // a stored verdict is acting on stale evidence; re-running the probes
+      // narrows the window to the gap between this check and the unlink.
+      const fresh = assess(a.row, repoRoot, assessOpts);
+      if (fresh.verdict !== 'eligible') {
+        skippedOnRecheck.push({ path: a.row.path, verdict: fresh.verdict, detail: fresh.detail });
+        continue;
+      }
+
       // --force overrides only the untracked-node_modules objection; the
-      // eligibility check above already proved there are no tracked edits.
+      // re-check above already proved there are no tracked edits.
       const out = git(repoRoot, ['worktree', 'remove', '--force', a.row.path]);
       if (out === null) failed.push({ path: a.row.path, err: 'git worktree remove failed' });
       else removed.push(a.row.path);
     }
-    if (prunedRegistrations > 0) git(repoRoot, ['worktree', 'prune']);
+    if (prunedRegistrations > 0 && git(repoRoot, ['worktree', 'prune']) === null) {
+      // Silently swallowing this would report registrations as reclaimed when
+      // they are all still there on the next run.
+      failed.push({ path: '(git worktree prune)', err: 'prune failed — orphaned registrations remain' });
+    }
   } else {
     prunedRegistrations = assessments.filter((a) => a.verdict === 'eligible' && a.row.missing).length;
   }
 
-  return { mode, assessments, removed, failed, prunedRegistrations };
+  return { mode, assessments, removed, failed, skippedOnRecheck, prunedRegistrations };
 }

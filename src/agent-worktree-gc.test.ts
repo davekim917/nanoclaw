@@ -11,6 +11,7 @@ import {
   hasLiveProcess,
   hasTrackedChanges,
   parseWorktreeList,
+  runAgentWorktreeGcOnce,
   type WorktreeRow,
 } from './agent-worktree-gc.js';
 
@@ -261,6 +262,74 @@ describe('assess — open-PR guard (real git)', () => {
       openPrBranches: new Set(),
     });
     expect(a.verdict).toBe('unmerged');
+  });
+});
+
+describe('failed probes and the pre-delete re-check', () => {
+  function realRepo(): { repo: string; wt: string; head: string } {
+    const repo = tmp();
+    const g = (...args: string[]) => execFileSync('git', args, { cwd: repo, stdio: 'ignore' });
+    g('init', '-q', '-b', 'main');
+    g('config', 'user.email', 't@t');
+    g('config', 'user.name', 't');
+    fs.writeFileSync(path.join(repo, 'f'), 'x');
+    g('add', 'f');
+    g('commit', '-qm', 'one');
+    const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf-8' }).trim();
+    const wt = path.join(tmp(), 'wt');
+    g('worktree', 'add', '-q', '--detach', wt, head);
+    return { repo, wt, head };
+  }
+
+  // `git status` failing used to become `?? ''`, which reads as a clean tree —
+  // a fail-OPEN that force-removes a worktree with uncommitted files in it.
+  it('refuses when the cleanliness probe cannot run, instead of assuming clean', () => {
+    const notARepo = tmp(); // exists, but git status will fail here
+    const a = assess({ path: notARepo, head: 'a'.repeat(40), branch: null, missing: false, locked: false }, tmp(), {
+      procRoot: tmp(),
+    });
+    expect(a.verdict).toBe('probe-failed');
+    expect(a.detail).toMatch(/could not be established/);
+  });
+
+  it('apply mode removes an eligible worktree and reports it', () => {
+    const { repo, wt } = realRepo();
+    const r = runAgentWorktreeGcOnce(repo, { mode: 'apply', mainRef: 'main', procRoot: tmp() });
+    expect(r.removed).toContain(wt);
+    expect(fs.existsSync(wt)).toBe(false);
+    expect(r.failed).toEqual([]);
+  });
+
+  it('apply mode does NOT remove a worktree with uncommitted tracked changes', () => {
+    const { repo, wt } = realRepo();
+    fs.writeFileSync(path.join(wt, 'f'), 'edited');
+    const r = runAgentWorktreeGcOnce(repo, { mode: 'apply', mainRef: 'main', procRoot: tmp() });
+    expect(r.removed).not.toContain(wt);
+    expect(fs.existsSync(wt)).toBe(true);
+  });
+
+  // In any environment without a reachable `gh` — CI, a fresh clone, an offline
+  // host — PR state is unknowable, so every BRANCH-carrying worktree is refused.
+  // Correct, and load-bearing: a GC pass in CI then deletes nothing rather than
+  // guessing. This test exists because it caught me writing the opposite
+  // expectation.
+  it('refuses a branch-carrying worktree when gh cannot be reached', () => {
+    const { repo } = realRepo();
+    const g = (...args: string[]) => execFileSync('git', args, { cwd: repo, stdio: 'ignore' });
+    const branched = path.join(tmp(), 'branched');
+    g('worktree', 'add', '-q', '-b', 'topic', branched, 'main');
+    const r = runAgentWorktreeGcOnce(repo, { mode: 'apply', mainRef: 'main', procRoot: tmp() });
+    const a = r.assessments.find((x) => x.row.path === branched);
+    expect(a?.verdict).toBe('pr-unknown');
+    expect(fs.existsSync(branched)).toBe(true);
+  });
+
+  it('dry-run removes nothing', () => {
+    const { repo, wt } = realRepo();
+    const r = runAgentWorktreeGcOnce(repo, { mode: 'dry-run', mainRef: 'main', procRoot: tmp() });
+    expect(r.removed).toEqual([]);
+    expect(fs.existsSync(wt)).toBe(true);
+    expect(r.assessments.some((a) => a.row.path === wt && a.verdict === 'eligible')).toBe(true);
   });
 });
 
