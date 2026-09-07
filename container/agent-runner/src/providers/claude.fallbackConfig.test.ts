@@ -137,6 +137,35 @@ describe('ClaudeProvider provider-fallback model/effort', () => {
     expect(opts?.effort).toBe('high');
   });
 
+  it('test_fallback_derives_family_effort_from_the_REAL_model_not_the_opus_alias', () => {
+    // Round-2 Q2. The alias-vs-resolved-model gap that bites the PRIMARY path
+    // (the container asks the SDK for the literal string `'opus'`, so
+    // defaultEffortForModel sees 'opus' and returns 'high' no matter what
+    // ANTHROPIC_DEFAULT_OPUS_MODEL points at) does NOT reach the fallback
+    // path: the fold puts the fallback's REAL model id into stickyConfig, so
+    // `rawModel` is that id and the family default is derived from it.
+    // A fallback declaring fable with no effort must therefore get medium.
+    const p = make({ providerConfig: {}, model: 'claude-fable-5-1[1m]', onFallback: true });
+    const opts = run(p);
+    expect(opts?.model).toBe('claude-fable-5-1[1m]');
+    expect(opts?.effort).toBe('medium');
+  });
+
+  it('test_fallback_haiku_declaration_gets_no_effort_at_all', () => {
+    // Haiku supports no effort at the API level; the family default is
+    // undefined and the clamp keeps it undefined.
+    const p = make({ providerConfig: {}, model: 'claude-haiku-4-5', onFallback: true });
+    const opts = run(p);
+    expect(opts?.model).toBe('claude-haiku-4-5');
+    expect(opts?.effort).toBeUndefined();
+  });
+
+  it('test_fallback_sonnet_declaration_gets_xhigh', () => {
+    const opts = run(make({ providerConfig: {}, model: 'claude-sonnet-5', onFallback: true }));
+    expect(opts?.model).toBe('claude-sonnet-5');
+    expect(opts?.effort).toBe('xhigh');
+  });
+
   it('test_no_fallback_values_keeps_an_empty_sticky_config', () => {
     const p = make({ providerConfig: {}, onFallback: true });
     expect(sticky(p)).toEqual({});

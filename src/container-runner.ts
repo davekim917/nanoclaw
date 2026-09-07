@@ -5839,7 +5839,13 @@ async function buildContainerArgs(
     // container.json actually configures one — absent means the claude
     // provider applies its per-model-family default.
     args.push(
-      ...claudeSpawnEnv(containerConfig, { model: activeChannelModel, effort: activeChannelEffort }),
+      ...claudeSpawnEnv(containerConfig, { model: activeChannelModel, effort: activeChannelEffort }, (message) =>
+        log.warn('Claude spawn default refused', {
+          sessionId,
+          agentGroup: agentGroup.name,
+          detail: message,
+        }),
+      ),
     );
   }
 

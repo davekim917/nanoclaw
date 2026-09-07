@@ -220,7 +220,7 @@ const CODEX_MODEL_ALIAS_MAP: Record<string, string> = {
  */
 const CODEX_VALID_MODEL_RE = /^gpt-[a-z0-9][a-z0-9.-]*$/;
 
-interface ProviderFlagVocab {
+export interface ProviderFlagVocab {
   resolveModel(raw: string): string;
   isValidModel(resolved: string): boolean;
   /** Appended to the unknown-model error so the user learns the right shape. */
@@ -315,7 +315,16 @@ const OPENCODE_VOCAB: ProviderFlagVocab = {
  * vocabulary (the safe pre-provider-aware default). OpenCode validates slug
  * SHAPE only (the live model list lives in-container; see list_models MCP).
  */
-function vocabFor(provider: string): ProviderFlagVocab {
+/**
+ * The flag vocabulary for a provider — model alias resolution, model/effort
+ * validity, and the per-model effort-support matrix.
+ *
+ * Exported so the spawn path can validate what it exports into a provider's
+ * container env against the SAME tables the chat `-m`/`-e` parser uses. Two
+ * parallel notions of "a valid claude model" is exactly how a codex model id
+ * carried across a `--provider` switch reaches the Anthropic API.
+ */
+export function vocabFor(provider: string): ProviderFlagVocab {
   if (provider === 'codex') return CODEX_VOCAB;
   if (provider === 'opencode') return OPENCODE_VOCAB;
   return CLAUDE_VOCAB;
