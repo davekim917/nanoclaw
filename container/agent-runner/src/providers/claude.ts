@@ -445,13 +445,6 @@ export const SDK_DISALLOWED_TOOLS = [
 // `disallowedTools` above for explicit blocks. v1 reached the same
 // conclusion (src/agent-runner/index.ts:1056-1077 comment).
 
-// MCP server names are sanitized by the SDK when forming tool prefixes:
-// any character outside [A-Za-z0-9_-] becomes '_'. Mirror that here so our
-// allowlist patterns match what the SDK actually exposes.
-function mcpAllowPattern(serverName: string): string {
-  return `mcp__${serverName.replace(/[^a-zA-Z0-9_-]/g, '_')}__*`;
-}
-
 interface SDKUserMessage {
   type: 'user';
   message: { role: 'user'; content: string };
