@@ -14,6 +14,24 @@
  * `.codex/worktrees/` is deliberately out of scope — Codex owns its own
  * lifecycle and this collector has no way to reason about it.
  *
+ * ── Why this REPORTS and does not delete ──
+ *
+ * It used to force-remove. Seven review rounds produced seventeen findings and
+ * every one was another way `--force` loses work: an unreadable index, a
+ * vanished HEAD that was a commit's only reference, a tracked file under a
+ * node_modules path, a session entering between the survey and the unlink.
+ * That is not a run of bad luck — proving a worktree safe to delete means
+ * reproducing the checks `git worktree remove` already performs, and each
+ * reproduction is a fresh way to be wrong.
+ *
+ * So the destructive half is gone. This classifies, and prints the commands.
+ * `git worktree remove` WITHOUT `--force` is the last gate, and it refuses a
+ * worktree with modifications or untracked files on its own — correctly, which
+ * is more than the code here managed in seven attempts.
+ *
+ * The scarce thing was never the deletion; it was knowing WHICH of a hundred
+ * worktrees are safe to touch. That is what this answers.
+ *
  * ── Why the lock is not consulted ──
  *
  * Measured 2026-09-07: `git worktree list --porcelain` reported ZERO locked
@@ -38,9 +56,6 @@
 import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
-
-/** Acting requires NANOCLAW_WORKTREE_GC=apply. A bare run never deletes. */
-const GC_APPLY_ENV = 'NANOCLAW_WORKTREE_GC';
 
 /** Codex owns its own worktree lifecycle; never touch it. */
 const OUT_OF_SCOPE = /\/\.codex\/worktrees\//;
@@ -365,20 +380,6 @@ function assessOrThrow(row: WorktreeRow, repoRoot: string, opts: Parameters<type
   return { row, verdict: 'eligible', detail: 'merged, clean, idle' };
 }
 
-export interface GcReport {
-  mode: 'dry-run' | 'apply';
-  assessments: Assessment[];
-  removed: string[];
-  failed: { path: string; err: string }[];
-  /** Eligible in the survey, refused by the re-check taken just before deletion. */
-  skippedOnRecheck: { path: string; verdict: Verdict; detail: string }[];
-  prunedRegistrations: number;
-}
-
-export function gcMode(env: NodeJS.ProcessEnv = process.env): 'dry-run' | 'apply' {
-  return env[GC_APPLY_ENV] === 'apply' ? 'apply' : 'dry-run';
-}
-
 const PR_LIST_LIMIT = 1000;
 
 /**
@@ -412,39 +413,29 @@ export function listWorktrees(repoRoot: string): WorktreeRow[] | null {
   return parseWorktreeList(porcelain).map((row) => ({ ...row, missing: !fs.existsSync(row.path) }));
 }
 
+export interface GcReport {
+  /** The primary checkout — where the reported commands should be run. */
+  mainWorktreePath: string;
+  assessments: Assessment[];
+  /** Worktrees whose directory is gone; their registrations are prunable. */
+  orphanedRegistrations: string[];
+}
+
 /**
- * Assess every worktree and, in apply mode, remove the eligible ones.
+ * Classify every registered worktree. Reports; never deletes.
  *
- * The PR lookup fails CLOSED: when GitHub is unreachable we cannot tell an
- * abandoned branch from one with review in flight, so every branch-carrying
- * worktree is refused. Losing a cleanup pass is free; deleting a worktree whose
- * PR is still open is not.
- *
- * It is refused as `pr-unknown`, never relabelled `open-pr`. Reporting a PR we
- * never confirmed would be the same unverified-success claim this collector
- * exists to avoid making about worktrees.
+ * Returns the inventory and the verdicts. Acting on them is the operator's
+ * step, and `git worktree remove` without `--force` performs the file-level safety
+ * check itself.
  */
 export function runAgentWorktreeGcOnce(
   repoRoot: string,
-  opts: { mode?: 'dry-run' | 'apply'; mainRef?: string; procRoot?: string } = {},
-): GcReport {
-  const mode = opts.mode ?? gcMode();
+  opts: { mainRef?: string; procRoot?: string } = {},
+): GcReport | null {
   const prs = openPrBranches(repoRoot);
   const rows = listWorktrees(repoRoot);
-  if (rows === null) {
-    // Reporting zero worktrees as a clean sweep would look identical to a
-    // successful run that found nothing to do.
-    return {
-      mode,
-      assessments: [],
-      removed: [],
-      failed: [{ path: '(git worktree list)', err: 'could not read the worktree inventory — nothing was assessed' }],
-      skippedOnRecheck: [],
-      prunedRegistrations: 0,
-    };
-  }
-  // One options object, used for both the survey and the pre-delete re-check,
-  // so the two can never drift into judging by different criteria.
+  if (rows === null) return null;
+
   const assessOpts = {
     mainRef: opts.mainRef,
     procRoot: opts.procRoot,
@@ -453,54 +444,9 @@ export function runAgentWorktreeGcOnce(
     mainWorktreePath: rows[0]?.path,
   };
   const assessments = rows.map((row) => assess(row, repoRoot, assessOpts));
+  const orphanedRegistrations = assessments
+    .filter((a) => a.verdict === 'eligible' && a.row.missing)
+    .map((a) => a.row.path);
 
-  const removed: string[] = [];
-  const failed: { path: string; err: string }[] = [];
-  const skippedOnRecheck: { path: string; verdict: Verdict; detail: string }[] = [];
-  let prunedRegistrations = 0;
-
-  if (mode === 'apply') {
-    for (const a of assessments) {
-      if (a.verdict !== 'eligible') continue;
-      if (a.row.missing) {
-        prunedRegistrations += 1;
-        continue; // reclaimed by the single `worktree prune` below
-      }
-
-      // Re-assess immediately before deleting. Every assessment above was made
-      // before any deletion began, so by now an agent may have entered this
-      // worktree or written to it — and the whole pass is the window. Acting on
-      // a stored verdict is acting on stale evidence; re-running the probes
-      // narrows the window to the gap between this check and the unlink.
-      // Re-read HEAD too. Trusting the surveyed value would validate a commit
-      // that may no longer be current: an agent can commit into this worktree
-      // between the survey and now, and the merged-into-main proof would then
-      // be about a commit that is no longer checked out.
-      const currentHead = gitTolerant(a.row.path, ['rev-parse', 'HEAD']);
-      if (currentHead === null) {
-        skippedOnRecheck.push({ path: a.row.path, verdict: 'probe-failed', detail: 'HEAD unreadable at removal time' });
-        continue;
-      }
-      const fresh = assess({ ...a.row, head: currentHead }, repoRoot, assessOpts);
-      if (fresh.verdict !== 'eligible') {
-        skippedOnRecheck.push({ path: a.row.path, verdict: fresh.verdict, detail: fresh.detail });
-        continue;
-      }
-
-      // --force overrides only the untracked-node_modules objection; the
-      // re-check above already proved there are no tracked edits.
-      const out = gitTolerant(repoRoot, ['worktree', 'remove', '--force', a.row.path]);
-      if (out === null) failed.push({ path: a.row.path, err: 'git worktree remove failed' });
-      else removed.push(a.row.path);
-    }
-    if (prunedRegistrations > 0 && gitTolerant(repoRoot, ['worktree', 'prune']) === null) {
-      // Silently swallowing this would report registrations as reclaimed when
-      // they are all still there on the next run.
-      failed.push({ path: '(git worktree prune)', err: 'prune failed — orphaned registrations remain' });
-    }
-  } else {
-    prunedRegistrations = assessments.filter((a) => a.verdict === 'eligible' && a.row.missing).length;
-  }
-
-  return { mode, assessments, removed, failed, skippedOnRecheck, prunedRegistrations };
+  return { mainWorktreePath: rows[0]?.path ?? repoRoot, assessments, orphanedRegistrations };
 }

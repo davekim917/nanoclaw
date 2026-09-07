@@ -7,7 +7,6 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   assess,
-  gcMode,
   hasLiveProcess,
   hasTrackedChanges,
   parseWorktreeList,
@@ -403,89 +402,38 @@ describe('failed probes and the pre-delete re-check', () => {
     expect(a.detail).toMatch(/could not be established/);
   });
 
-  it('apply mode removes an eligible worktree and reports it', () => {
+  it('classifies an eligible worktree and reports it, without touching it', () => {
     const { repo, wt } = realRepo();
-    const r = runAgentWorktreeGcOnce(repo, { mode: 'apply', mainRef: 'main', procRoot: tmp() });
-    expect(r.removed).toContain(wt);
-    expect(fs.existsSync(wt)).toBe(false);
-    expect(r.failed).toEqual([]);
+    const r = runAgentWorktreeGcOnce(repo, { mainRef: 'main', procRoot: tmp() });
+    expect(r).not.toBeNull();
+    expect(r!.assessments.some((a) => a.row.path === wt && a.verdict === 'eligible')).toBe(true);
+    // The whole point of dropping apply mode: the directory is still there.
+    expect(fs.existsSync(wt)).toBe(true);
   });
 
-  it('apply mode does NOT remove a worktree with uncommitted tracked changes', () => {
+  it('classifies a worktree with uncommitted changes as dirty', () => {
     const { repo, wt } = realRepo();
     fs.writeFileSync(path.join(wt, 'f'), 'edited');
-    const r = runAgentWorktreeGcOnce(repo, { mode: 'apply', mainRef: 'main', procRoot: tmp() });
-    expect(r.removed).not.toContain(wt);
+    const r = runAgentWorktreeGcOnce(repo, { mainRef: 'main', procRoot: tmp() });
+    expect(r!.assessments.find((a) => a.row.path === wt)?.verdict).toBe('dirty');
     expect(fs.existsSync(wt)).toBe(true);
   });
 
   // In any environment without a reachable `gh` — CI, a fresh clone, an offline
-  // host — PR state is unknowable, so every BRANCH-carrying worktree is refused.
-  // Correct, and load-bearing: a GC pass in CI then deletes nothing rather than
-  // guessing. This test exists because it caught me writing the opposite
-  // expectation.
+  // host — PR state is unknowable, so every BRANCH-carrying worktree is
+  // refused. Correct, and load-bearing: a run in CI recommends nothing rather
+  // than guessing.
   it('refuses a branch-carrying worktree when gh cannot be reached', () => {
     const { repo } = realRepo();
     const g = (...args: string[]) => execFileSync('git', args, { cwd: repo, stdio: 'ignore' });
     const branched = path.join(tmp(), 'branched');
     g('worktree', 'add', '-q', '-b', 'topic', branched, 'main');
-    const r = runAgentWorktreeGcOnce(repo, { mode: 'apply', mainRef: 'main', procRoot: tmp() });
-    const a = r.assessments.find((x) => x.row.path === branched);
-    expect(a?.verdict).toBe('pr-unknown');
+    const r = runAgentWorktreeGcOnce(repo, { mainRef: 'main', procRoot: tmp() });
+    expect(r!.assessments.find((x) => x.row.path === branched)?.verdict).toBe('pr-unknown');
     expect(fs.existsSync(branched)).toBe(true);
   });
 
-  // An ignored file can be a build directory (regenerable) or a local .env or
-  // stray patch (not). The proof does not try to tell them apart — measured on
-  // this host, only a handful of worktrees carry any, and one of them was a
-  // hand-written patch file, so the conservative reading is nearly free.
-  it('treats an ignored-but-present file as uncommitted work', () => {
-    const { repo, wt } = realRepo();
-    fs.writeFileSync(path.join(repo, '.gitignore'), 'secret.env\n');
-    execFileSync('git', ['add', '.gitignore'], { cwd: repo, stdio: 'ignore' });
-    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'ignore'], {
-      cwd: repo,
-      stdio: 'ignore',
-    });
-    fs.writeFileSync(path.join(wt, 'secret.env'), 'TOKEN=keepme');
-    const a = assess(
-      {
-        path: wt,
-        head: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: wt, encoding: 'utf-8' }).trim(),
-        branch: null,
-        missing: false,
-        locked: false,
-      },
-      repo,
-      { mainRef: 'main', procRoot: tmp(), openPrBranches: new Set() },
-    );
-    expect(a.verdict).toBe('dirty');
-  });
-
-  // Every git failure inside assess now funnels through one catch instead of a
-  // per-call-site null decision — that seam is what stopped this class from
-  // recurring a fifth time.
-  it('turns any git failure inside assess into probe-failed, not a default', () => {
-    const a = assess({ path: tmp(), head: 'a'.repeat(40), branch: null, missing: false, locked: false }, tmp(), {
-      procRoot: tmp(),
-    });
-    expect(a.verdict).toBe('probe-failed');
-  });
-
-  it('dry-run removes nothing', () => {
-    const { repo, wt } = realRepo();
-    const r = runAgentWorktreeGcOnce(repo, { mode: 'dry-run', mainRef: 'main', procRoot: tmp() });
-    expect(r.removed).toEqual([]);
-    expect(fs.existsSync(wt)).toBe(true);
-    expect(r.assessments.some((a) => a.row.path === wt && a.verdict === 'eligible')).toBe(true);
-  });
-});
-
-describe('gcMode', () => {
-  it('is dry-run unless explicitly set to apply', () => {
-    expect(gcMode({})).toBe('dry-run');
-    expect(gcMode({ NANOCLAW_WORKTREE_GC: 'true' })).toBe('dry-run');
-    expect(gcMode({ NANOCLAW_WORKTREE_GC: 'yes' })).toBe('dry-run');
-    expect(gcMode({ NANOCLAW_WORKTREE_GC: 'apply' })).toBe('apply');
+  it('reports a failed inventory as null rather than as an empty sweep', () => {
+    expect(runAgentWorktreeGcOnce(tmp(), { procRoot: tmp() })).toBeNull();
   });
 });
