@@ -71,10 +71,27 @@ CONTAINER="${ONECLI_GATEWAY_CONTAINER:-}"
 [ -n "$CONTAINER" ] || CONTAINER="$(read_env_value ONECLI_GATEWAY_CONTAINER "$NANOCLAW_DIR/.env")"
 CONTAINER="${CONTAINER:-onecli}"
 RESTART_PCT="${RESTART_PCT:-70}"   # restart at/above this % of the soft limit
+SETTLE_SECONDS="${SETTLE_SECONDS:-10}"  # how long to let the gateway come back
 DRY_RUN="${DRY_RUN:-0}"
 CLI_SOCK="$NANOCLAW_DIR/data/cli.sock"
+RECOVERED=0                        # set -u safety; only meaningful after a restart
 
 fail() { echo "fd-watchdog: $1" >&2; exit 1; }
+
+# Validate the numeric overrides HERE, before anything compares or sleeps on
+# them. A malformed value must not reach `[ ... -lt ... ]`: that returns status
+# 2, and because the comparison is an `if` condition `set -e` does not stop the
+# script — it falls through and restarts the gateway on every single tick.
+# Out-of-range is just as bad and silent: <=0 restarts every tick, >100 never
+# restarts and quietly disables containment altogether.
+require_int_in_range() { # <name> <value> <min> <max>
+  case "$2" in
+    ''|*[!0-9]*) fail "$1 must be an integer $3-$4 (got '$2')" ;;
+  esac
+  { [ "$2" -ge "$3" ] && [ "$2" -le "$4" ]; } || fail "$1 must be $3-$4 (got '$2')"
+}
+require_int_in_range RESTART_PCT "$RESTART_PCT" 1 100
+require_int_in_range SETTLE_SECONDS "$SETTLE_SECONDS" 1 300
 
 docker inspect "$CONTAINER" >/dev/null 2>&1 || fail "container '$CONTAINER' not found"
 
@@ -106,7 +123,11 @@ PCT=$(( FDS * 100 / SOFT ))
 
 # Leak signature, for the log: sockets the app holds but will never use again.
 NS_PID="$(docker inspect "$CONTAINER" --format '{{.State.Pid}}')"
-STUCK="$(nsenter -t "$NS_PID" -n ss -tan 2>/dev/null | awk '$1=="FIN-WAIT-2"||$1=="CLOSE-WAIT"' | wc -l || echo 0)"
+# `... | wc -l || echo 0` would capture BOTH the wc output and the fallback
+# under pipefail, yielding the two-line value "0\n0". Assign, then fall back.
+# nsenter needs root; a non-root run reports 0 rather than aborting, because
+# this figure is logged for humans and never decides the restart.
+STUCK="$(nsenter -t "$NS_PID" -n ss -tan 2>/dev/null | awk '$1=="FIN-WAIT-2"||$1=="CLOSE-WAIT"' | wc -l)" || STUCK=0
 
 echo "fd-watchdog: pid=$GW_PID fds=$FDS/$SOFT (${PCT}%) unreclaimable_sockets=$STUCK threshold=${RESTART_PCT}%"
 
@@ -122,7 +143,6 @@ fi
 
 echo "fd-watchdog: at/above ${RESTART_PCT}% — restarting '$CONTAINER' before rule resolution starts failing"
 docker restart "$CONTAINER" >/dev/null
-SETTLE_SECONDS="${SETTLE_SECONDS:-10}"
 sleep "$SETTLE_SECONDS"
 
 if NEW="$(read_gateway)"; then
@@ -142,7 +162,7 @@ ADMIN_DM_ROW="$(pnpm exec tsx scripts/q.ts "$NANOCLAW_DIR/data/v2.db" "
    WHERE ur.role = 'owner'
    ORDER BY ud.resolved_at DESC
    LIMIT 1
-" 2>/dev/null | tail -1)"
+" 2>/dev/null | tail -1)" || ADMIN_DM_ROW=""
 ADMIN_DM_PLATFORM_ID="$(echo "$ADMIN_DM_ROW" | cut -d'|' -f1)"
 ADMIN_DM_CHANNEL_TYPE="$(echo "$ADMIN_DM_ROW" | cut -d'|' -f2)"
 

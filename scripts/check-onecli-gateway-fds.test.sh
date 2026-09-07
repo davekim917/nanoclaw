@@ -83,5 +83,40 @@ check "equals in value"     "a=b=c"     "$(read_env_value K "$ENVF")"
 # --- a missing file is not an error, just unset ---
 check "missing file"        ""          "$(read_env_value K "$TMP/nope.env")"
 
+# --- Config validation (runs the real script) ---
+# A malformed override must be refused BEFORE the comparison that uses it:
+# `[ 5 -lt 70% ]` returns status 2, and because it is an `if` condition `set -e`
+# does not stop the script — it falls through and restarts the gateway on every
+# tick. Invalid config exits before touching docker, so these stay hermetic.
+expect_reject() { # <label> <VAR=value> <expected substring>
+  local out
+  if out="$(env "$2" DRY_RUN=1 bash "$TARGET" 2>&1)"; then
+    fail=$((fail + 1))
+    printf 'FAIL: %s — accepted, should have been refused\n' "$1" >&2
+    return
+  fi
+  case "$out" in
+    *"$3"*) pass=$((pass + 1)) ;;
+    *) fail=$((fail + 1))
+       printf 'FAIL: %s\n  wanted substring: [%s]\n  got: [%s]\n' "$1" "$3" "$out" >&2 ;;
+  esac
+}
+
+expect_reject "RESTART_PCT non-numeric"  RESTART_PCT=70%    "RESTART_PCT must be an integer 1-100"
+expect_reject "RESTART_PCT zero"         RESTART_PCT=0      "RESTART_PCT must be 1-100"
+expect_reject "RESTART_PCT over 100"     RESTART_PCT=101    "RESTART_PCT must be 1-100"
+# Empty is NOT invalid — `${RESTART_PCT:-70}` treats it as unset, matching
+# src/env.ts (`if (value)`: an empty value means not set). Assert the fallback
+# rather than a rejection, so nobody "fixes" this into an error later.
+out="$(env RESTART_PCT= DRY_RUN=1 bash "$TARGET" 2>&1 || true)"
+case "$out" in
+  *"RESTART_PCT must be"*)
+    fail=$((fail + 1)); printf 'FAIL: empty RESTART_PCT should fall back to the default, not be refused\n' >&2 ;;
+  *) pass=$((pass + 1)) ;;
+esac
+
+expect_reject "SETTLE_SECONDS bad"       SETTLE_SECONDS=abc "SETTLE_SECONDS must be an integer 1-300"
+expect_reject "SETTLE_SECONDS zero"      SETTLE_SECONDS=0   "SETTLE_SECONDS must be 1-300"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
