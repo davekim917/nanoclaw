@@ -372,7 +372,12 @@ function assessOrThrow(row: WorktreeRow, repoRoot: string, opts: Parameters<type
   // `data`, `dist`, `logs`, and one hand-written patch — so protecting them
   // costs almost nothing and saves exactly the file worth saving.
   // A failure here throws and is caught above; it can no longer read as clean.
-  const status = git(row.path, ['status', '--porcelain', '--ignored']);
+  // `-uall` matters: by default git collapses an untracked directory to a
+  // single entry, and with `--ignored` an untracked dir containing only
+  // ignored files can be summarised in a way that hides real untracked files
+  // underneath. Listing every path is the only version of this probe that
+  // cannot under-report.
+  const status = git(row.path, ['status', '--porcelain', '--ignored', '-uall']);
   if (hasTrackedChanges(status)) {
     return { row, verdict: 'dirty', detail: 'uncommitted tracked changes' };
   }

@@ -60,18 +60,29 @@ for (const v of ORDER) {
 const eligible = report.assessments.filter((a) => a.verdict === 'eligible' && !a.row.missing);
 const orphans = report.orphanedRegistrations;
 
+/** Single-quote for the shell; a path can contain spaces, and some here do. */
+function shq(p: string): string {
+  return `'${p.replace(/'/g, `'\\''`)}'`;
+}
+
 if (eligible.length > 0) {
   // Deliberately WITHOUT --force. git refuses a worktree carrying
   // modifications or untracked files, which is the last gate and the one that
   // has never been wrong. Anything git refuses here should be investigated,
   // not forced.
   console.log(`\nSafe to reclaim (${eligible.length}) — run from ${report.mainWorktreePath}:\n`);
-  for (const a of eligible) console.log(`  git worktree remove ${a.row.path}`);
+  for (const a of eligible) console.log(`  git worktree remove ${shq(a.row.path)}`);
 }
 
 if (orphans.length > 0) {
-  console.log(`\n${orphans.length} registration(s) whose directory is gone and whose HEAD is merged:\n`);
-  console.log('  git worktree prune');
+  // NOT `git worktree prune`. That is repository-wide: it drops EVERY stale
+  // registration, including ones this run refused because their HEAD is not
+  // merged and the registration may be a commit's only reference. Printing it
+  // would recommend an action broader than the evidence gathered — the exact
+  // overreach this tool exists to avoid. `remove` names one target.
+  console.log(`\nOrphaned registrations verified merged (${orphans.length}) — run from ${report.mainWorktreePath}:\n`);
+  for (const o of orphans) console.log(`  git worktree remove ${shq(o)}`);
+  console.log(`\n  (Do NOT use \`git worktree prune\`: it also drops stale registrations this run refused.)`);
 }
 
 if (eligible.length === 0 && orphans.length === 0) {
