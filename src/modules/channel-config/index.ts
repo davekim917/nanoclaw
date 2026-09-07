@@ -14,7 +14,7 @@
  * Precedence the mutation interacts with (most specific wins):
  *   1. Per-session flag in chat: -m / -m1 / -e / -e1
  *   2. Per-channel wiring: messaging_group_agents.default_model / _effort  ← this module
- *   3. Per-agent container.json: defaultModel / defaultEffort
+ *   3. Per-agent container.json: model / effort, then defaultModel / defaultEffort
  *   4. Install-wide DEFAULT_OPUS_MODEL / DEFAULT_EFFORT constants in
  *      container-runner.ts (single source of truth for "default")
  *

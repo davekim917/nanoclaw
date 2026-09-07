@@ -149,4 +149,33 @@ describe('parseRawConfig provider fallback bridge', () => {
     clearEnv();
     expect(parseRawConfig({}).provider).toBe('claude');
   });
+
+  it('marks a fallback spawn with onFallback so providers can gate on it', () => {
+    // The claude provider folds `model`/`effort` into its sticky config ONLY
+    // under this flag. On the primary path those two fields carry the group's
+    // OWN container.json values, which already reach the turn through the
+    // host's ANTHROPIC_DEFAULT_OPUS_MODEL / NANOCLAW_EFFORT_OVERRIDE spawn
+    // env — folding them in there would add a second, higher-precedence route
+    // and change behavior for every primary claude group.
+    process.env.NANOCLAW_PROVIDER_OVERRIDE = 'claude';
+    const fallback = parseRawConfig({
+      ...BASE,
+      providerFallback: { provider: 'claude', model: 'claude-fable-5-1[1m]', effort: 'medium' },
+    });
+    expect(fallback.onFallback).toBe(true);
+    expect(fallback.model).toBe('claude-fable-5-1[1m]');
+    expect(fallback.effort).toBe('medium');
+
+    clearEnv();
+    const primary = parseRawConfig({
+      provider: 'claude',
+      model: 'claude-fable-5-1[1m]',
+      effort: 'medium',
+      providerFallback: { provider: 'codex' },
+    });
+    expect(primary.onFallback).toBe(false);
+    // Still surfaced — the host env is what consumes them on the primary path.
+    expect(primary.model).toBe('claude-fable-5-1[1m]');
+    expect(primary.effort).toBe('medium');
+  });
 });

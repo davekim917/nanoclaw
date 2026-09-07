@@ -57,6 +57,56 @@ export const claudeConfigSchema = z.strictObject({
   effort: z.enum(CLAUDE_EFFORT_LEVELS).optional(),
 });
 
+/**
+ * A claude model id the SDK can actually resolve: a concrete `claude-*` id
+ * (with or without the `[1m]` context suffix) or one of the three family
+ * aliases the ANTHROPIC_DEFAULT_<FAMILY>_MODEL envs resolve. Deliberately
+ * narrow — this only guards operator-declared `providerFallback.model`
+ * values, and anything outside this set is a mis-declaration (a codex or
+ * opencode model id) that would 400 at the API on every turn.
+ */
+const CLAUDE_MODEL_RE = /^(?:opus|sonnet|haiku|claude-[a-z0-9.\-]+(?:\[[a-z0-9]+\])?)$/i;
+
+/**
+ * Resolve the sticky (session-default) model/effort for a ClaudeProvider.
+ *
+ * On the PRIMARY path this is exactly `options.providerConfig` — a strict
+ * no-op versus reading that object directly. `options.model`/`options.effort`
+ * are folded in ONLY under a provider fallback, where config.ts has emptied
+ * `providerConfig` (it describes the primary provider, and codex's
+ * `reasoning_effort` key is a fatal boot error under this strict schema) and
+ * those two fields are the only carrier of the fallback's own declaration.
+ *
+ * Why the gate is `onFallback` and not codex's `=== undefined` argument:
+ * config.ts copies the resolved codex model/effort INTO `providerConfig` for
+ * a primary codex spawn, so folding there can never introduce a new value.
+ * There is no claude equivalent of that copy — on a primary claude spawn
+ * `options.model`/`options.effort` carry container.json's own `model`/`effort`
+ * (or `providerConfig`'s), and container.json's values already reach the turn
+ * through the host's ANTHROPIC_DEFAULT_OPUS_MODEL / NANOCLAW_EFFORT_OVERRIDE
+ * spawn env. Folding them into stickyConfig as well would give them a second
+ * route at HIGHER precedence than that env, changing behavior for every
+ * primary claude group. So the fallback gate is what keeps the primary path
+ * byte-identical.
+ *
+ * Values are validated before folding: the schema is strict, and a
+ * mis-declared fallback must log and degrade to family defaults rather than
+ * throw at boot into a crash loop.
+ */
+function buildClaudeStickyConfig(options: ProviderOptions): Record<string, unknown> {
+  const raw: Record<string, unknown> = { ...(options.providerConfig ?? {}) };
+  if (!options.onFallback) return raw;
+  if (raw.model === undefined && options.model !== undefined) {
+    if (CLAUDE_MODEL_RE.test(options.model)) raw.model = options.model;
+    else log(`Ignoring non-claude providerFallback model "${options.model}"`);
+  }
+  if (raw.effort === undefined && options.effort !== undefined) {
+    if ((CLAUDE_EFFORT_LEVELS as readonly string[]).includes(options.effort)) raw.effort = options.effort;
+    else log(`Ignoring unsupported providerFallback effort "${options.effort}"`);
+  }
+  return raw;
+}
+
 function log(msg: string): void {
   console.error(`[claude-provider] ${msg}`);
 }
@@ -2048,8 +2098,6 @@ export class ClaudeProvider implements AgentProvider {
   private oauthRing: Array<{ name: string; value: string }> = [];
   private oauthRingPos = 0;
   private oauthRotationsThisCycle = 0;
-  private model?: string;
-  private effort?: string;
   private memorySessionHook?: MemorySessionHookRegistration;
 
   constructor(options: ProviderOptions = {}) {
@@ -2063,7 +2111,7 @@ export class ClaudeProvider implements AgentProvider {
     );
     this.additionalDirectories = options.additionalDirectories;
     this.env = filterSdkEnv({ ...(options.env ?? {}), CLAUDE_CODE_AUTO_COMPACT_WINDOW });
-    this.stickyConfig = claudeConfigSchema.parse(options.providerConfig ?? {});
+    this.stickyConfig = claudeConfigSchema.parse(buildClaudeStickyConfig(options));
     this.fallbackKeys = Object.entries(this.env)
       .filter(([k, v]) => ANTHROPIC_FALLBACK_RE.test(k) && typeof v === 'string' && v.length > 0)
       .sort(([a], [b]) => {
@@ -2106,8 +2154,6 @@ export class ClaudeProvider implements AgentProvider {
         this.oauthRing.push(entry);
       }
     }
-    this.model = options.model;
-    this.effort = options.effort;
   }
 
   registerMemorySessionHook(hook: MemorySessionHookRegistration): void {

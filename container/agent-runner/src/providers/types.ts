@@ -158,6 +158,19 @@ export interface ProviderOptions {
    * through to the underlying SDK. If omitted, the SDK default is used.
    */
   effort?: string;
+  /**
+   * True when the host routed this spawn onto the group's declared
+   * `providerFallback` rather than its primary provider (see
+   * `RunnerConfig.onFallback` in config.ts).
+   *
+   * A provider whose sticky config comes only from `providerConfig` — which
+   * config.ts empties under a fallback — needs this to know that `model` and
+   * `effort` above are the fallback's OWN declaration and may be folded into
+   * its sticky config. On the primary path those same fields carry the
+   * group's container.json values, which already have their own route, so
+   * folding them in unconditionally would silently change primary behavior.
+   */
+  onFallback?: boolean;
 }
 
 /**
