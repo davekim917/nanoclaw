@@ -2064,6 +2064,7 @@ if [ "$COMMAND" = "finish" ]; then
           # ledger is append-only audit; rewriting it to dedupe would cost more
           # than the duplicate does.
           for LEDGER_ATTEMPT in 1 2; do
+            LEDGER_LINE=""
             exec 7>"$HANDOFF_LEDGER.lock"
             if flock -w 5 7; then
               # verdictDigest ties this line to the run-level verdict.json it is
@@ -2071,20 +2072,23 @@ if [ "$COMMAND" = "finish" ]; then
               # is a fabrication, and one that disagrees with the file is the
               # reconciliation case. Appended, so older readers (the develop
               # gate's tail -1 + field reads) are unaffected.
-              jq -cn --arg target "$TARGET_SHA" --arg freeze "$SHA" --argjson pr "$PR" \
+              if jq -cn --arg target "$TARGET_SHA" --arg freeze "$SHA" --argjson pr "$PR" \
                 --arg run "$RUN_ID" --arg verdict "$VERDICT" --arg now "$NOW" \
                 --arg digest "$VERDICT_DIGEST" \
                 '{schemaVersion:1,targetSha:$target,freezeSha:$freeze,freezePr:$pr,
-                  runId:$run,verdict:$verdict,finishedAt:$now,verdictDigest:$digest}' >> "$HANDOFF_LEDGER"
+                  runId:$run,verdict:$verdict,finishedAt:$now,verdictDigest:$digest}' >> "$HANDOFF_LEDGER"; then
+                LEDGER_LINE="$(tail -1 "$HANDOFF_LEDGER" 2>/dev/null || true)"
+              fi
               # VERIFIED like the publish/hold writes above: taking the lock
               # says nothing about the append landing. A writable directory
               # with an unwritable ledger FILE (ENOSPC, chattr +i, a bad mode)
               # left `written:true, reason:null` with no line — the same
               # fail-open the artifact checks exist to close. Read back under
               # the lock, so no other holder's line can be mistaken for ours.
-              if tail -1 "$HANDOFF_LEDGER" 2>/dev/null |
-                jq -e --arg run "$RUN_ID" --arg now "$NOW" \
-                  '.runId == $run and .finishedAt == $now' >/dev/null 2>&1; then
+              if [ -n "$LEDGER_LINE" ] &&
+                jq -e --arg run "$RUN_ID" --arg now "$NOW" --arg digest "$VERDICT_DIGEST" \
+                  '.runId == $run and .finishedAt == $now and .verdictDigest == $digest' \
+                  <<<"$LEDGER_LINE" >/dev/null 2>&1; then
                 LEDGER_APPENDED=true
               fi
               flock -u 7
