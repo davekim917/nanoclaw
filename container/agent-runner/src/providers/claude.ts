@@ -2262,14 +2262,31 @@ export class ClaudeProvider implements AgentProvider {
     // Normalize bare opus → [1m] so the CLI's auto-compact window stays at 1M
     // regardless of auth path (see ensureOpus1mSuffix).
     //
-    // Final fallback is the `opus` ALIAS, never undefined: with model
-    // undefined the CLI uses its own built-in default — which for a pinned
-    // binary is whatever Opus was current at its release (2.1.156 → opus-4-7,
-    // observed live 2026-06-09), silently ignoring the configured
-    // ANTHROPIC_DEFAULT_OPUS_MODEL chain (channel default → container.json →
-    // DEFAULT_OPUS_MODEL). The bare alias forces resolution through that env
-    // var, making the documented precedence the real behavior.
-    const rawModel = input.model ?? this.stickyConfig.model ?? 'opus';
+    // Final fallback is the CONCRETE id the host already resolved for this
+    // spawn, read from ANTHROPIC_DEFAULT_OPUS_MODEL — the same value the CLI
+    // would substitute for the bare `opus` alias, so the model that runs is
+    // unchanged. Never undefined: with model undefined the CLI uses its own
+    // built-in default — whatever Opus was current at the pinned binary's
+    // release (2.1.156 → opus-4-7, observed live 2026-06-09) — silently
+    // ignoring the configured chain (channel default → container.json →
+    // DEFAULT_OPUS_MODEL). The bare alias remains the last resort for spawns
+    // that carry no env at all (unit tests, a host too old to set it).
+    //
+    // Reading the concrete id here rather than the alias is what makes the
+    // effort default below correct. `defaultEffortForModel` is the ONLY place
+    // a family default is chosen, and it sits at the point the model is
+    // finally picked — but with `rawModel` set to the literal string 'opus' it
+    // was answering for Opus no matter which model the alias resolved to. A
+    // group pinned to Sonnet got Opus's `high` instead of Sonnet's `xhigh`; a
+    // group pinned to Haiku, which supports no effort at all, got `high` on
+    // every turn. The host cannot fix that from its side: absence of
+    // NANOCLAW_EFFORT_OVERRIDE means "the container decides", and there is no
+    // env value that means "explicitly no effort".
+    //
+    // `stickyConfig.model` still wins over this, unchanged — a per-agent
+    // providerConfig is more specific than the group's default model.
+    const rawModel =
+      input.model ?? this.stickyConfig.model ?? process.env.ANTHROPIC_DEFAULT_OPUS_MODEL ?? 'opus';
     const model = rawModel ? ensureOpus1mSuffix(rawModel) : rawModel;
     // Effort precedence: -e flag (turn/sticky, arrives as input.effort) →
     // group container.json provider config → operator override env
