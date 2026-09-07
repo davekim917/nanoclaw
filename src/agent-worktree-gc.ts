@@ -248,6 +248,18 @@ export function hasTrackedChanges(status: string): boolean {
     });
 }
 
+/**
+ * Is `head` already contained in `mainRef`?
+ *
+ * `--is-ancestor` exits non-zero for "not an ancestor", which is an ANSWER and
+ * not a probe failure, so it is asked tolerantly. Both the missing-directory
+ * branch and the normal path go through here, so the two can never disagree
+ * about what "already merged" means.
+ */
+function isAncestorOf(repoRoot: string, head: string, mainRef: string): boolean {
+  return gitTolerant(repoRoot, ['merge-base', '--is-ancestor', head, mainRef]) !== null;
+}
+
 export function assess(
   row: WorktreeRow,
   repoRoot: string,
@@ -295,10 +307,21 @@ function assessOrThrow(row: WorktreeRow, repoRoot: string, opts: Parameters<type
     return { row, verdict: 'locked', detail: 'git worktree lock is set — deliberate do-not-remove' };
   }
 
-  // A registration whose directory is gone has nothing to protect and nothing
-  // to lose: no process can be inside it and no edits can survive in it.
+  // A registration whose directory is gone has no files left to protect — but
+  // it can still hold the only REFERENCE to a commit. For a detached worktree
+  // the administrative HEAD may be the sole thing keeping an unmerged commit
+  // reachable, and `git worktree prune` drops that entry, after which the
+  // commit is unreachable and gc-able. So the ancestor proof applies here too;
+  // only the file-level checks are skipped, because there are no files.
   if (row.missing) {
-    return { row, verdict: 'eligible', detail: 'registration orphaned — directory no longer exists' };
+    if (!isAncestorOf(repoRoot, row.head, mainRef)) {
+      return {
+        row,
+        verdict: 'unmerged',
+        detail: `directory gone, but HEAD ${row.head.slice(0, 8)} is not in ${mainRef} — its registration may be the only reference`,
+      };
+    }
+    return { row, verdict: 'eligible', detail: 'registration orphaned — directory gone and HEAD is merged' };
   }
 
   const liveness = hasLiveProcess(row.path, opts.procRoot);
@@ -324,9 +347,7 @@ function assessOrThrow(row: WorktreeRow, repoRoot: string, opts: Parameters<type
     return { row, verdict: 'dirty', detail: 'uncommitted tracked changes' };
   }
 
-  // `--is-ancestor` exits non-zero for "not an ancestor", which is an ANSWER,
-  // not a probe failure — so it is asked tolerantly and the null read as false.
-  const contained = gitTolerant(repoRoot, ['merge-base', '--is-ancestor', row.head, mainRef]) !== null;
+  const contained = isAncestorOf(repoRoot, row.head, mainRef);
   if (!contained) {
     return { row, verdict: 'unmerged', detail: `HEAD ${row.head.slice(0, 8)} is not an ancestor of ${mainRef}` };
   }

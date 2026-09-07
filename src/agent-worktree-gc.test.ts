@@ -199,17 +199,70 @@ describe('assess', () => {
   });
 
   // The /tmp population's real leak: the directory goes on reboot, the
-  // registration survives. Nothing can be lost by pruning it.
-  it('treats an orphaned registration as eligible without probing anything', () => {
+  // registration survives. No FILES can be lost by pruning it — but the
+  // registration can still be the only reference to a commit, so the ancestor
+  // proof is not skipped. With an unverifiable ancestry this refuses.
+  // (This assertion used to expect 'eligible'; that encoded the bug a round-5
+  // review caught, not the intended contract.)
+  it('does not prune an orphaned registration it cannot prove is merged', () => {
     const a = assess(row({ missing: true }), repo, { procRoot: noProc });
-    expect(a.verdict).toBe('eligible');
-    expect(a.detail).toMatch(/orphaned/);
+    expect(a.verdict).toBe('unmerged');
+    expect(a.detail).toMatch(/only reference/);
   });
 
   // A lock is a deliberate instruction and outranks the shortcut for a missing
   // directory — the operator still said not to touch this registration.
   it('honours a lock even on a worktree whose directory is gone', () => {
     expect(assess(row({ missing: true, locked: true }), repo, { procRoot: noProc }).verdict).toBe('locked');
+  });
+
+  // The registration of a vanished detached worktree can be the ONLY reference
+  // keeping an unmerged commit reachable; pruning it makes the commit gc-able.
+  it('refuses to prune a missing registration whose HEAD is not merged', () => {
+    const r = tmp();
+    const g = (...args: string[]) => execFileSync('git', args, { cwd: r, stdio: 'ignore' });
+    g('init', '-q', '-b', 'main');
+    g('config', 'user.email', 't@t');
+    g('config', 'user.name', 't');
+    fs.writeFileSync(path.join(r, 'f'), 'x');
+    g('add', 'f');
+    g('commit', '-qm', 'one');
+    const gone = path.join(tmp(), 'gone');
+    g('worktree', 'add', '-q', '--detach', gone, 'main');
+    fs.writeFileSync(path.join(gone, 'g'), 'y');
+    execFileSync('git', ['add', 'g'], { cwd: gone, stdio: 'ignore' });
+    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'orphan'], {
+      cwd: gone,
+      stdio: 'ignore',
+    });
+    const orphanHead = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: gone, encoding: 'utf-8' }).trim();
+    fs.rmSync(gone, { recursive: true, force: true }); // directory vanishes, registration survives
+
+    const a = assess({ path: gone, head: orphanHead, branch: null, missing: true, locked: false }, r, {
+      mainRef: 'main',
+      procRoot: tmp(),
+      openPrBranches: new Set(),
+    });
+    expect(a.verdict).toBe('unmerged');
+    expect(a.detail).toMatch(/only reference/);
+  });
+
+  it('still prunes a missing registration whose HEAD is merged', () => {
+    const r = tmp();
+    const g = (...args: string[]) => execFileSync('git', args, { cwd: r, stdio: 'ignore' });
+    g('init', '-q', '-b', 'main');
+    g('config', 'user.email', 't@t');
+    g('config', 'user.name', 't');
+    fs.writeFileSync(path.join(r, 'f'), 'x');
+    g('add', 'f');
+    g('commit', '-qm', 'one');
+    const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: r, encoding: 'utf-8' }).trim();
+    const a = assess({ path: '/gone/for/good', head, branch: null, missing: true, locked: false }, r, {
+      mainRef: 'main',
+      procRoot: tmp(),
+      openPrBranches: new Set(),
+    });
+    expect(a.verdict).toBe('eligible');
   });
 
   // Idle was never established, so it must not be treated as established.
