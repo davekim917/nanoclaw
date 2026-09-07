@@ -134,24 +134,52 @@ export function parseWorktreeList(porcelain: string): WorktreeRow[] {
  * if /proc cannot be read at all, every worktree reports live, because an
  * unreadable instrument must never read as "nothing is running".
  */
-export function hasLiveProcess(dir: string, procRoot = '/proc'): boolean {
+export interface LivenessProbe {
+  /** A process was positively observed with its cwd inside the directory. */
+  live: boolean;
+  /**
+   * PIDs whose cwd could not be read. NOT the same as "exited": hidepid, a
+   * different UID, or a non-dumpable process all land here, and any of them
+   * could be sitting in this worktree. Non-zero means the probe is INCOMPLETE
+   * and idleness was not established.
+   */
+  uninspectable: number;
+}
+
+/**
+ * Look for a process whose cwd is inside `dir`.
+ *
+ * Measured on this host as a non-root user: 306 of 5242 PIDs have an
+ * unreadable cwd, nearly all root-owned daemons. So a non-root run can never
+ * prove a worktree idle, and `assess` refuses on `uninspectable > 0` rather
+ * than guessing. That makes the collector effectively root-only, which matches
+ * how it is meant to run (unattended, from a systemd timer) and matches the
+ * sibling fd-watchdog, which needs root for the same reason.
+ */
+export function hasLiveProcess(dir: string, procRoot = '/proc'): LivenessProbe {
   let pids: string[];
   try {
     pids = fs.readdirSync(procRoot).filter((p) => /^\d+$/.test(p));
   } catch {
-    return true;
+    // Cannot enumerate at all: maximally uninformative, so maximally cautious.
+    return { live: true, uninspectable: Number.POSITIVE_INFINITY };
   }
   const prefix = dir.endsWith('/') ? dir : `${dir}/`;
+  let uninspectable = 0;
   for (const pid of pids) {
     let cwd: string;
     try {
       cwd = fs.readlinkSync(path.join(procRoot, pid, 'cwd'));
-    } catch {
-      continue; // process exited, or not ours to read — neither is evidence of use
+    } catch (err) {
+      // ENOENT means the process exited between readdir and readlink — that is
+      // genuinely not evidence of use. Anything else (EACCES, EPERM) means we
+      // were not allowed to look, which is a hole, not an absence.
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') uninspectable += 1;
+      continue;
     }
-    if (cwd === dir || cwd.startsWith(prefix)) return true;
+    if (cwd === dir || cwd.startsWith(prefix)) return { live: true, uninspectable };
   }
-  return false;
+  return { live: false, uninspectable };
 }
 
 /**
@@ -189,15 +217,31 @@ export function assess(
     openPrBranches?: ReadonlySet<string>;
     /** GitHub unreachable: refuse branch-carrying worktrees, and say why. */
     prStateUnknown?: boolean;
+    /** Git's primary worktree, i.e. the first `worktree list` entry. */
+    mainWorktreePath?: string;
   } = {},
 ): Assessment {
   const mainRef = opts.mainRef ?? 'origin/main';
 
-  if (path.resolve(row.path) === path.resolve(repoRoot)) {
+  // The primary worktree is whichever git lists FIRST, not whichever directory
+  // this script happens to run from. Comparing against repoRoot misclassifies
+  // the real checkout as an ordinary worktree whenever the collector is invoked
+  // from inside one — which is exactly how it gets developed and tested.
+  if (opts.mainWorktreePath && path.resolve(row.path) === path.resolve(opts.mainWorktreePath)) {
+    return { row, verdict: 'main', detail: 'the primary checkout' };
+  }
+  if (!opts.mainWorktreePath && path.resolve(row.path) === path.resolve(repoRoot)) {
     return { row, verdict: 'main', detail: 'the primary checkout' };
   }
   if (OUT_OF_SCOPE.test(row.path)) {
     return { row, verdict: 'out-of-scope', detail: 'codex-owned worktree' };
+  }
+
+  // Checked before `missing`: a lock is a deliberate "do not remove" and an
+  // operator who set one on a worktree whose directory has since gone still
+  // said not to touch the registration.
+  if (row.locked) {
+    return { row, verdict: 'locked', detail: 'git worktree lock is set — deliberate do-not-remove' };
   }
 
   // A registration whose directory is gone has nothing to protect and nothing
@@ -206,14 +250,16 @@ export function assess(
     return { row, verdict: 'eligible', detail: 'registration orphaned — directory no longer exists' };
   }
 
-  if (hasLiveProcess(row.path, opts.procRoot)) {
+  const liveness = hasLiveProcess(row.path, opts.procRoot);
+  if (liveness.live) {
     return { row, verdict: 'live-process', detail: 'a process has its cwd inside this worktree' };
   }
-
-  // Absence of a lock proves nothing (see the header), but its presence is a
-  // deliberate "do not remove" and is honoured as one.
-  if (row.locked) {
-    return { row, verdict: 'locked', detail: 'git worktree lock is set — deliberate do-not-remove' };
+  if (liveness.uninspectable > 0) {
+    return {
+      row,
+      verdict: 'probe-failed',
+      detail: `${liveness.uninspectable} process(es) could not be inspected — idleness not established (run as root)`,
+    };
   }
 
   // `?? ''` here would be a fail-OPEN: a corrupt or unreadable index makes
@@ -259,22 +305,36 @@ export function gcMode(env: NodeJS.ProcessEnv = process.env): 'dry-run' | 'apply
   return env[GC_APPLY_ENV] === 'apply' ? 'apply' : 'dry-run';
 }
 
-/** Branches with an open PR, or null when GitHub cannot be reached. */
+const PR_LIST_LIMIT = 1000;
+
+/**
+ * Branches with an open PR, or null when the listing cannot be TRUSTED.
+ *
+ * Null covers two cases that must not be distinguished by the caller: GitHub
+ * was unreachable, and the listing came back exactly at the limit, meaning it
+ * may have been truncated and a branch with an open PR could be missing from
+ * it. A partial list read as complete would delete a worktree whose review is
+ * still in flight.
+ */
 export function openPrBranches(repoRoot: string): Set<string> | null {
   try {
-    const out = execFileSync('gh', ['pr', 'list', '--state', 'open', '--limit', '200', '--json', 'headRefName'], {
-      cwd: repoRoot,
-      encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    return new Set((JSON.parse(out) as { headRefName: string }[]).map((r) => r.headRefName));
+    const out = execFileSync(
+      'gh',
+      ['pr', 'list', '--state', 'open', '--limit', String(PR_LIST_LIMIT), '--json', 'headRefName'],
+      { cwd: repoRoot, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] },
+    );
+    const rows = JSON.parse(out) as { headRefName: string }[];
+    if (rows.length >= PR_LIST_LIMIT) return null; // possibly truncated — untrustworthy
+    return new Set(rows.map((r) => r.headRefName));
   } catch {
     return null;
   }
 }
 
-export function listWorktrees(repoRoot: string): WorktreeRow[] {
-  const porcelain = git(repoRoot, ['worktree', 'list', '--porcelain']) ?? '';
+/** Null when the inventory could not be taken — NOT an empty inventory. */
+export function listWorktrees(repoRoot: string): WorktreeRow[] | null {
+  const porcelain = git(repoRoot, ['worktree', 'list', '--porcelain']);
+  if (porcelain === null) return null;
   return parseWorktreeList(porcelain).map((row) => ({ ...row, missing: !fs.existsSync(row.path) }));
 }
 
@@ -297,6 +357,18 @@ export function runAgentWorktreeGcOnce(
   const mode = opts.mode ?? gcMode();
   const prs = openPrBranches(repoRoot);
   const rows = listWorktrees(repoRoot);
+  if (rows === null) {
+    // Reporting zero worktrees as a clean sweep would look identical to a
+    // successful run that found nothing to do.
+    return {
+      mode,
+      assessments: [],
+      removed: [],
+      failed: [{ path: '(git worktree list)', err: 'could not read the worktree inventory — nothing was assessed' }],
+      skippedOnRecheck: [],
+      prunedRegistrations: 0,
+    };
+  }
   // One options object, used for both the survey and the pre-delete re-check,
   // so the two can never drift into judging by different criteria.
   const assessOpts = {
@@ -304,6 +376,7 @@ export function runAgentWorktreeGcOnce(
     procRoot: opts.procRoot,
     openPrBranches: prs ?? new Set<string>(),
     prStateUnknown: prs === null,
+    mainWorktreePath: rows[0]?.path,
   };
   const assessments = rows.map((row) => assess(row, repoRoot, assessOpts));
 

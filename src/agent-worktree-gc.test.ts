@@ -82,7 +82,7 @@ describe('hasLiveProcess', () => {
     const wt = tmp();
     fs.mkdirSync(path.join(proc, '4242'));
     fs.symlinkSync(path.join(wt, 'src'), path.join(proc, '4242', 'cwd'));
-    expect(hasLiveProcess(wt, proc)).toBe(true);
+    expect(hasLiveProcess(wt, proc)).toEqual({ live: true, uninspectable: 0 });
   });
 
   it('reports idle when no cwd is inside', () => {
@@ -90,7 +90,7 @@ describe('hasLiveProcess', () => {
     const wt = tmp();
     fs.mkdirSync(path.join(proc, '4242'));
     fs.symlinkSync('/somewhere/else', path.join(proc, '4242', 'cwd'));
-    expect(hasLiveProcess(wt, proc)).toBe(false);
+    expect(hasLiveProcess(wt, proc)).toEqual({ live: false, uninspectable: 0 });
   });
 
   it('does not match a sibling directory sharing a name prefix', () => {
@@ -102,14 +102,37 @@ describe('hasLiveProcess', () => {
     const proc = tmp();
     fs.mkdirSync(path.join(proc, '1'));
     fs.symlinkSync(sibling, path.join(proc, '1', 'cwd'));
-    expect(hasLiveProcess(wt, proc)).toBe(false);
+    expect(hasLiveProcess(wt, proc).live).toBe(false);
   });
 
   // The instrument must never read as "nothing is running" when it simply
   // could not look. A false idle here deletes a worktree out from under a
   // working agent.
   it('FAILS CLOSED — an unreadable /proc reports live, not idle', () => {
-    expect(hasLiveProcess('/tmp/anything', '/definitely/not/a/proc')).toBe(true);
+    const r = hasLiveProcess('/tmp/anything', '/definitely/not/a/proc');
+    expect(r.live).toBe(true);
+    expect(r.uninspectable).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  // A PID that vanished between readdir and readlink genuinely is not using
+  // the worktree; a PID we were not ALLOWED to read is a hole. Only the second
+  // counts as uninspectable.
+  it('counts an exited PID as absence, not as a hole', () => {
+    const proc = tmp();
+    fs.mkdirSync(path.join(proc, '777')); // no cwd link at all => ENOENT
+    expect(hasLiveProcess(tmp(), proc)).toEqual({ live: false, uninspectable: 0 });
+  });
+
+  it('counts an unreadable cwd as a hole, not as absence', () => {
+    const proc = tmp();
+    const hidden = path.join(proc, '888');
+    fs.mkdirSync(hidden);
+    fs.symlinkSync('/somewhere', path.join(hidden, 'cwd'));
+    fs.chmodSync(hidden, 0o000); // EACCES on readlink
+    const r = hasLiveProcess(tmp(), proc);
+    fs.chmodSync(hidden, 0o755); // restore so cleanup can remove it
+    expect(r.live).toBe(false);
+    expect(r.uninspectable).toBe(1);
   });
 });
 
@@ -165,6 +188,25 @@ describe('assess', () => {
     const a = assess(row({ missing: true }), repo, { procRoot: noProc });
     expect(a.verdict).toBe('eligible');
     expect(a.detail).toMatch(/orphaned/);
+  });
+
+  // A lock is a deliberate instruction and outranks the shortcut for a missing
+  // directory — the operator still said not to touch this registration.
+  it('honours a lock even on a worktree whose directory is gone', () => {
+    expect(assess(row({ missing: true, locked: true }), repo, { procRoot: noProc }).verdict).toBe('locked');
+  });
+
+  // Idle was never established, so it must not be treated as established.
+  it('refuses when some processes could not be inspected', () => {
+    const proc = tmp();
+    const hidden = path.join(proc, '999');
+    fs.mkdirSync(hidden);
+    fs.symlinkSync('/elsewhere', path.join(hidden, 'cwd'));
+    fs.chmodSync(hidden, 0o000);
+    const a = assess(row({ path: tmp() }), repo, { procRoot: proc });
+    fs.chmodSync(hidden, 0o755);
+    expect(a.verdict).toBe('probe-failed');
+    expect(a.detail).toMatch(/could not be inspected/);
   });
 
   it('refuses a worktree with a live process, ahead of every other check', () => {

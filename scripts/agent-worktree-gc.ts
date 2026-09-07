@@ -24,11 +24,28 @@ import { runAgentWorktreeGcOnce, type Verdict } from '../src/agent-worktree-gc.j
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const report = runAgentWorktreeGcOnce(repoRoot);
 
-const ORDER: Verdict[] = ['eligible', 'live-process', 'open-pr', 'unmerged', 'dirty', 'out-of-scope', 'main'];
+// Every verdict must appear here. A missing one is silently dropped from the
+// summary, which is how a run reporting 19 of 102 worktrees looked plausible.
+const ORDER: Verdict[] = [
+  'eligible',
+  'live-process',
+  'probe-failed',
+  'locked',
+  'open-pr',
+  'pr-unknown',
+  'unmerged',
+  'dirty',
+  'out-of-scope',
+  'main',
+];
 const counts = new Map<Verdict, number>();
 for (const a of report.assessments) counts.set(a.verdict, (counts.get(a.verdict) ?? 0) + 1);
 
 console.log(`agent-worktree-gc: ${report.mode} — ${report.assessments.length} worktrees registered\n`);
+const listed = ORDER.reduce((n, v) => n + (counts.get(v) ?? 0), 0);
+if (listed !== report.assessments.length) {
+  console.log(`  WARNING: summary lists ${listed} of ${report.assessments.length} — a verdict is missing from ORDER\n`);
+}
 for (const v of ORDER) {
   const n = counts.get(v) ?? 0;
   if (n > 0) console.log(`  ${String(n).padStart(3)}  ${v}`);
@@ -50,7 +67,10 @@ if (spared.length > 0) {
 }
 
 if (report.mode === 'apply') {
-  console.log(`\nremoved=${report.removed.length} pruned_registrations=${report.prunedRegistrations} failed=${report.failed.length}`);
+  console.log(
+    `\nremoved=${report.removed.length} pruned_registrations=${report.prunedRegistrations} skipped_on_recheck=${report.skippedOnRecheck.length} failed=${report.failed.length}`,
+  );
+  for (const sk of report.skippedOnRecheck) console.log(`  SKIPPED (became ${sk.verdict}) ${sk.path}`);
   for (const f of report.failed) console.log(`  FAILED ${f.path}: ${f.err}`);
 } else if (eligible.length > 0) {
   console.log(`\nDry run. Set NANOCLAW_WORKTREE_GC=apply to act.`);
