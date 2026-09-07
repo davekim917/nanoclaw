@@ -55,6 +55,22 @@ describe('checkCeilings', () => {
     expect(failures.map((f) => f.kind)).toEqual(['stale-allowance']);
   });
 
+  // The ratchet has to bite on PARTIAL reductions too, not just once a file is
+  // fully under its ceiling — otherwise a file trimmed from ceiling+500 to
+  // ceiling+100 keeps a 500 B allowance and can silently regrow by 400 B.
+  it('fails when a file shrinks but stays above its ceiling with a now-oversized allowance', () => {
+    write(TRUNK_DOC_BYTES_CEILING + 100);
+    const failures = checkCeilings(root, TARGETS, { 'CLAUDE.md': 500 });
+    expect(failures.map((f) => f.kind)).toEqual(['stale-allowance']);
+    expect(failures[0]?.message).toContain('needs 100 B of allowance');
+    expect(failures[0]?.message).toContain('400 B of reclaimed headroom');
+  });
+
+  it('passes when an above-ceiling file has exactly the allowance it needs', () => {
+    write(TRUNK_DOC_BYTES_CEILING + 100);
+    expect(checkCeilings(root, TARGETS, { 'CLAUDE.md': 100 })).toEqual([]);
+  });
+
   it('passes once the stale allowance is zeroed', () => {
     write(TRUNK_DOC_BYTES_CEILING - 100);
     expect(checkCeilings(root, TARGETS, { 'CLAUDE.md': 0 })).toEqual([]);

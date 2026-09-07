@@ -10,10 +10,11 @@
  *
  * So this is the same check, wired where it can say no. It fails the build when
  * a standing-instruction file exceeds its ceiling plus the allowance recorded in
- * `instruction-ceilings.json` — and it also fails when a recorded allowance is
- * larger than the file needs, so headroom given up can never be silently
- * re-taken. That second rule is the ratchet: growth costs a visible, reviewable
- * edit to a tracked file instead of passing unnoticed.
+ * `instruction-ceilings.json` — and it also fails whenever a recorded allowance
+ * is larger than the file currently needs, on every reduction rather than only
+ * once the file is back under its ceiling. That second rule is the ratchet:
+ * headroom given up can never be silently re-taken, and growth costs a visible,
+ * reviewable edit to a tracked file instead of passing unnoticed.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -65,6 +66,8 @@ export function checkCeilings(root: string, targets: Target[], allowances: Recor
     const bytes = Buffer.byteLength(content, 'utf-8');
     const allowance = allowances[file] ?? 0;
     const budget = ceiling + allowance;
+    /** Allowance this file actually needs right now. The recorded one may not exceed it. */
+    const required = Math.max(0, bytes - ceiling);
 
     if (bytes > budget) {
       const over = bytes - budget;
@@ -77,14 +80,19 @@ export function checkCeilings(root: string, targets: Target[], allowances: Recor
           `    Cut ${over} B of derivable content, or raise "${file}" in ${ALLOWANCE_FILE} ` +
           `to ${bytes - ceiling} and say why in the PR body.`,
       });
-    } else if (allowance > 0 && bytes <= ceiling) {
+    } else if (allowance > required) {
+      // Ratchet on EVERY reduction, not only once the file is back under its
+      // ceiling. A file that shrinks from 18,117 B to 16,884 B while keeping a
+      // 1,733 B allowance could otherwise regrow by 1,233 B and still pass,
+      // which is the exact re-inflation this gate exists to stop.
       failures.push({
         file,
         kind: 'stale-allowance',
         message:
-          `${file} is ${bytes} B — back under its ${ceiling} B ceiling, but ` +
-          `${ALLOWANCE_FILE} still grants it ${allowance} B of allowance.\n` +
-          `    Set "${file}" to 0 in ${ALLOWANCE_FILE} so the headroom cannot be silently re-taken.`,
+          `${file} is ${bytes} B and needs ${required} B of allowance, but ` +
+          `${ALLOWANCE_FILE} still grants it ${allowance} B — ` +
+          `${allowance - required} B of reclaimed headroom it could silently re-take.\n` +
+          `    Set "${file}" to ${required} in ${ALLOWANCE_FILE} to lock the reduction in.`,
       });
     }
 
