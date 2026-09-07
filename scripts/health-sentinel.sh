@@ -33,7 +33,6 @@ NANOCLAW_DIR="${NANOCLAW_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 cd "$NANOCLAW_DIR"
 
 STATE_FILE="$NANOCLAW_DIR/data/health-sentinel-state.json"
-CLI_SOCK="$NANOCLAW_DIR/data/cli.sock"
 LOG="$NANOCLAW_DIR/logs/nanoclaw.log"
 ERRLOG="$NANOCLAW_DIR/logs/nanoclaw.error.log"
 
@@ -348,49 +347,71 @@ if [ -z "$ALERT_LINES" ]; then
   exit 0
 fi
 
-# ── resolve owner DM and send (same protocol as check-onecli-drift.sh) ──────
-# `|| true`: under `set -e` a failing lookup killed the script HERE, before the
-# "cannot resolve owner DM" branch below could print the breach lines to stderr.
-# An undeliverable alert must still be loud somewhere. (Observed 2026-08-25.)
-ADMIN_DM_ROW="$(node_modules/.bin/tsx scripts/q.ts "$NANOCLAW_DIR/data/v2.db" "
-  SELECT mg.platform_id, ud.channel_type
-    FROM user_roles ur
-    JOIN user_dms ud ON ud.user_id = ur.user_id
-    JOIN messaging_groups mg ON mg.id = ud.messaging_group_id
-   WHERE ur.role = 'owner'
-   ORDER BY ud.resolved_at DESC
-   LIMIT 1
-")" || true
-IFS='|' read -r ADMIN_DM_PLATFORM_ID ADMIN_DM_CHANNEL_TYPE <<< "$ADMIN_DM_ROW"
-if [ -z "${ADMIN_DM_PLATFORM_ID:-}" ] || [ -z "${ADMIN_DM_CHANNEL_TYPE:-}" ]; then
-  echo "health-sentinel: BREACH but cannot resolve owner DM:" >&2
+# ── deliver the alert over the outbox ───────────────────────────────────────
+# NOT data/cli.sock. The comment above already says why the cooldown must not be
+# stamped before delivery: that socket is served BY nanoclaw-v2, so the alert is
+# undeliverable exactly when it fires. The same reasoning condemns the socket as
+# the delivery path, which the previous version kept.
+#
+# It is worse than "undeliverable when the host is down". A `to:` payload on
+# cli.sock becomes an INBOUND event, so the router applies its unknown-sender
+# gate: `senderId: "system:health-sentinel"` is not a known user, and the owner
+# DM runs `unknown_sender_policy = strict`, so the router DROPS it —
+# `MESSAGE DROPPED — unknown sender (strict policy) userId="system:health-sentinel"`.
+# `sock.sendall()` returned successfully every time, the cooldown was stamped on
+# that false receipt, and this sentinel went silent for 6h per vital. Last
+# alert that actually reached anyone: 2026-09-04.
+#
+# outbox-ship.sh POSTs the outbox to Slack every 60s with its own bot token and
+# no host process, so it survives nanoclaw-v2 being down — which is the state
+# this sentinel exists to report. A written, non-empty file is a receipt that
+# can be verified locally, which is what makes stamp_alert_cooldown honest.
+OUTBOX="${HEALTH_SENTINEL_OUTBOX:-${UNIT_ALERT_OUTBOX:-}}"
+if [ -z "$OUTBOX" ]; then
+  echo "health-sentinel: BREACH but no outbox configured (HEALTH_SENTINEL_OUTBOX/UNIT_ALERT_OUTBOX):" >&2
+  echo "$ALERT_LINES" >&2
+  exit 1
+fi
+# Do NOT mkdir the outbox. This runs as root, so creating a missing final
+# directory would leave it root-owned 0755: the install-user shipper could
+# read the queued alert but not rename it into sent/, so a successful POST
+# would retry forever while this script had already stamped its cooldown.
+# An absent outbox is a provisioning error and must be loud, not papered over.
+if [ ! -d "$OUTBOX" ] || [ ! -w "$OUTBOX" ]; then
+  echo "health-sentinel: outbox missing or unwritable ($OUTBOX) — NOBODY WAS TOLD" >&2
   echo "$ALERT_LINES" >&2
   exit 1
 fi
 
-NOTIFICATION="⚠️ Host health alert ($(date '+%H:%M %Z')):
-$ALERT_LINES
+# One atomic create-and-write. `set -C` makes `>` use O_CREAT|O_EXCL, which
+# REFUSES an existing path — a symlink included — rather than following it,
+# closing the window a mktemp-then-reopen sequence leaves open where an agent
+# sharing this outbox could swap the name between create and write. The random
+# component means there is nothing to pre-create, and `>` respects umask so
+# outbox-ship.sh (running as the install user) can read what root wrote.
+RAND="$(od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+ALERT_OUT="$OUTBOX/$(date -u +%Y%m%dT%H%M%S)-health-sentinel.${RAND:-$$}.md"
+umask 022
+set -C
+{
+  printf '*Host health alert*\n_host: %s · %s UTC_\n\n' "$(hostname)" "$(date -u '+%Y-%m-%d %H:%M')"
+  printf '%s\n\n' "$ALERT_LINES"
+  printf 'Triage: `logs/nanoclaw.error.log` first, then `pnpm exec tsx scripts/host-health.ts`.\n'
+} > "$ALERT_OUT" || {
+  set +C
+  echo "health-sentinel: BREACH but could not create $ALERT_OUT:" >&2
+  echo "$ALERT_LINES" >&2
+  exit 1
+}
+set +C
 
-Triage: logs/nanoclaw.error.log first, then \`pnpm exec tsx scripts/host-health.ts\`. Recovery-storm playbook: memory project_recovery_storm_architecture_fix."
-
-export NOTIFICATION ADMIN_DM_CHANNEL_TYPE ADMIN_DM_PLATFORM_ID CLI_SOCK
-python3 <<'EOF'
-import json, os, socket, time
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-sock.connect(os.environ["CLI_SOCK"])
-payload = json.dumps({
-    "text": os.environ["NOTIFICATION"],
-    "senderId": "system:health-sentinel",
-    "sender": "Host Health Sentinel",
-    "to": {
-        "channelType": os.environ["ADMIN_DM_CHANNEL_TYPE"],
-        "platformId": os.environ["ADMIN_DM_PLATFORM_ID"],
-        "threadId": os.environ["ADMIN_DM_PLATFORM_ID"],
-    },
-}) + "\n"
-sock.sendall(payload.encode("utf-8"))
-time.sleep(0.5)
-sock.close()
-print("health-sentinel: alert delivered to owner DM")
-EOF
+# Only a written, non-empty file counts as delivery. Anything else must stay
+# loud and must NOT stamp the cooldown, or one silent failure mutes this vital
+# for six hours.
+if [ ! -s "$ALERT_OUT" ]; then
+  echo "health-sentinel: BREACH but wrote an empty alert to $ALERT_OUT:" >&2
+  echo "$ALERT_LINES" >&2
+  exit 1
+fi
+echo "health-sentinel: alert queued $ALERT_OUT"
 stamp_alert_cooldown

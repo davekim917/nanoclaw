@@ -65,7 +65,6 @@ ok() { printf 'PASS  %s\n' "$1"; }
 bad() { printf 'FAIL  %s\n     %s\n' "$1" "$2"; FAILED=1; }
 
 # ── 1. delivery fails (no socket) → cooldown NOT burned, offsets DO advance ──
-rm -f "$ROOT/data/cli.sock"
 run_sentinel TEST_ALERT=1
 RC=$?
 [ "$RC" -ne 0 ] || bad "failed delivery must exit non-zero" "rc=$RC out=$OUT"
@@ -82,22 +81,24 @@ case "$OUT" in
 esac
 
 # ── 2. delivery succeeds → cooldown stamped ─────────────────────────────────
-python3 - "$ROOT/data/cli.sock" <<'EOS' &
-import os, socket, sys
-p = sys.argv[1]
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.bind(p); s.listen(1)
-s.settimeout(30)
-try:
-    c, _ = s.accept(); c.recv(65536); c.close()
-except Exception: pass
-s.close(); os.unlink(p)
-EOS
-SRV=$!
-for _ in $(seq 50); do [ -S "$ROOT/data/cli.sock" ] && break; sleep 0.1; done
+# Delivery is a written file in the outbox, not a socket connect: outbox-ship.sh
+# POSTs it to Slack with its own token and no host process, which is the only
+# path that survives nanoclaw-v2 being down. Asserting on the queued file is
+# also what makes this check honest — the old socket fixture accepted a connect
+# and proved nothing about whether the router would have dropped the payload,
+# which is exactly how the real delivery failure went unnoticed for three days.
+OUTBOX="$ROOT/data/outbox"
+mkdir -p "$OUTBOX"
+export UNIT_ALERT_OUTBOX="$OUTBOX"
 run_sentinel TEST_ALERT=1
 RC=$?
-wait $SRV 2>/dev/null
 [ "$RC" -eq 0 ] || bad "successful delivery should exit 0" "rc=$RC out=$OUT"
+QUEUED=$(ls "$OUTBOX"/*health-sentinel*.md 2>/dev/null | wc -l)
+[ "$QUEUED" -gt 0 ] && ok "successful delivery queued an alert file" \
+  || bad "successful delivery queued nothing into the outbox" "$OUT"
+[ -s "$(ls -t "$OUTBOX"/*health-sentinel*.md 2>/dev/null | head -1)" ] \
+  && ok "queued alert is non-empty" \
+  || bad "queued alert was empty" "$OUT"
 [ -n "$(last_alert test)" ] && ok "successful delivery stamped last_alert.test" \
   || bad "successful delivery did not stamp the cooldown" "$OUT"
 [ "$(state log_off)" -gt 0 ] && ok "offsets advanced on the success path" \
@@ -106,33 +107,18 @@ wait $SRV 2>/dev/null
 # ── 3. WATCHED_TIMERS fails closed ──────────────────────────────────────────
 # Live socket sink for this section: the breach text only exists in the DM
 # payload, so asserting on stdout alone would pass on a connect failure.
-SENT="$ROOT/data/sent.log"
-: > "$SENT"
-python3 - "$ROOT/data/cli.sock" "$SENT" <<'EOS' &
-import os, socket, sys
-p, out = sys.argv[1], sys.argv[2]
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.bind(p); s.listen(8)
-s.settimeout(60)
-try:
-    while True:
-        c, _ = s.accept()
-        with open(out, "ab") as f: f.write(c.recv(65536))
-        c.close()
-except Exception: pass
-s.close()
-EOS
-SINK=$!
-trap 'kill $SINK 2>/dev/null; rm -rf "$ROOT"' EXIT
-for _ in $(seq 50); do [ -S "$ROOT/data/cli.sock" ] && break; sleep 0.1; done
+trap 'rm -rf "$ROOT"' EXIT
 
 breaches_on() { # label, env...
   local label="$1"; shift
   rm -f "$ROOT/data/health-sentinel-state.json"
-  : > "$SENT"
+  rm -f "$OUTBOX"/*health-sentinel*.md 2>/dev/null || true
   run_sentinel "$@" WATCHED_TIMERS="probe.timer:300"
   case "$OUT" in *"all vitals OK"*) bad "$label read as healthy" "$OUT"; return ;; esac
-  if grep -q 'probe.timer' "$SENT"; then ok "$label breached"
-  else bad "$label sent no probe.timer breach" "out=$OUT sent=$(cat "$SENT")"; fi
+  # The breach text lives only in the queued alert, so asserting on stdout alone
+  # would pass even if nothing was written.
+  if grep -qh 'probe.timer' "$OUTBOX"/*health-sentinel*.md 2>/dev/null; then ok "$label breached"
+  else bad "$label queued no probe.timer breach" "out=$OUT queued=$(ls "$OUTBOX" 2>/dev/null)"; fi
 }
 breaches_on "empty LastTriggerUSec"       STUB_LASTTRIGGER=""
 breaches_on "unparseable LastTriggerUSec" STUB_LASTTRIGGER="n/a"
@@ -204,7 +190,6 @@ case "$(cat "$ROOT/data/health-sentinel-state.json")" in
 esac
 rm -f "$ROOT/bin/ncl"
 
-kill $SINK 2>/dev/null
 
 [ "$FAILED" -eq 0 ] && echo "health-sentinel-selfcheck: all checks passed" || echo "health-sentinel-selfcheck: FAILURES"
 exit "$FAILED"

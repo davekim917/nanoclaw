@@ -13,22 +13,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NANOCLAW_DIR="${NANOCLAW_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 cd "$NANOCLAW_DIR"
 
-CLI_SOCK="$NANOCLAW_DIR/data/cli.sock"
-ADMIN_DM_ROW="$(pnpm exec tsx scripts/q.ts "$NANOCLAW_DIR/data/v2.db" "
-  SELECT mg.platform_id, ud.channel_type
-    FROM user_roles ur
-    JOIN user_dms ud ON ud.user_id = ur.user_id
-    JOIN messaging_groups mg ON mg.id = ud.messaging_group_id
-   WHERE ur.role = 'owner'
-   ORDER BY ud.resolved_at DESC
-   LIMIT 1
-")"
-IFS='|' read -r ADMIN_DM_PLATFORM_ID ADMIN_DM_CHANNEL_TYPE <<< "$ADMIN_DM_ROW"
-
-if [ -z "${ADMIN_DM_PLATFORM_ID:-}" ] || [ -z "${ADMIN_DM_CHANNEL_TYPE:-}" ]; then
-  echo "drift-check: cannot resolve an owner DM from user_roles + user_dms" >&2
-  exit 1
-fi
+# No owner-DM lookup and no CLI socket: delivery is the outbox. The old lookup
+# gated the whole run, so a transient central-DB failure — or an install with
+# no resolved owner DM — silently suppressed drift reports even when a
+# perfectly good outbox was configured.
 
 # The runbook lives in the private operator repo, not here: it names this
 # install's agent groups, vault entries, and private repos, so it cannot satisfy
@@ -61,26 +49,41 @@ RELEASE_COUNT=$(echo "$DRYRUN_OUTPUT" | grep -oE "\([0-9]+ releases\)" | grep -o
 
 NOTIFICATION="System notification (monthly drift check): OneCLI gateway upgrade available — currently on $CURRENT_VER, latest is $LATEST_VER ($RELEASE_COUNT releases behind). Run \`bash $RUNBOOK\` when convenient — it prompts before swapping, backs up postgres first, and auto-rolls-back if the smoke test regresses against its pre-upgrade baseline. NOTE: this dry-run already pulled the new image; nothing is swapped until you run it."
 
-echo "drift-check: drift detected ($CURRENT_VER -> $LATEST_VER), notifying admin via CLI socket"
+echo "drift-check: drift detected ($CURRENT_VER -> $LATEST_VER), queueing an alert"
 
-# Inject as a CLI-channel inbound message routed to admin's Discord DM.
-# Protocol matches scripts/init-first-agent.ts:sendWelcomeViaCliSocket.
-python3 <<EOF
-import json, socket, sys, time
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-sock.connect("$CLI_SOCK")
-payload = json.dumps({
-    "text": """$NOTIFICATION""",
-    "senderId": "system:drift-check",
-    "sender": "OneCLI Drift Check",
-    "to": {
-        "channelType": "$ADMIN_DM_CHANNEL_TYPE",
-        "platformId": "$ADMIN_DM_PLATFORM_ID",
-        "threadId": "$ADMIN_DM_PLATFORM_ID",
-    },
-}) + "\n"
-sock.sendall(payload.encode("utf-8"))
-time.sleep(0.5)  # give router a beat to read before we close
-sock.close()
-print("drift-check: notification delivered to admin DM")
-EOF
+# Deliver over the outbox, not data/cli.sock. A `to:` payload on the socket
+# becomes an INBOUND event, so the router applies its unknown-sender gate:
+# `system:drift-check` is not a known user and the owner DM runs
+# `unknown_sender_policy = strict`, so the router DROPS it while `sendall()`
+# returns success. This script's zero delivered messages read like "there has
+# never been drift to report" and could not be told apart from "always
+# dropped". outbox-ship.sh POSTs to Slack every 60s with its own bot token and
+# needs no host process. See onecli/onecli#484 work and fork issue #538.
+OUTBOX="${DRIFT_CHECK_OUTBOX:-${UNIT_ALERT_OUTBOX:-}}"
+if [ -z "$OUTBOX" ]; then
+  echo "drift-check: DRIFT DETECTED but no outbox configured: $NOTIFICATION" >&2
+  exit 1
+fi
+# Do NOT mkdir the outbox. This runs as root, so creating a missing final
+# directory would leave it root-owned 0755: the install-user shipper could
+# read the queued alert but not rename it into sent/, so a successful POST
+# would retry forever while this script had already stamped its cooldown.
+# An absent outbox is a provisioning error and must be loud, not papered over.
+if [ ! -d "$OUTBOX" ] || [ ! -w "$OUTBOX" ]; then
+  echo "drift-check: outbox missing or unwritable ($OUTBOX) — NOBODY WAS TOLD" >&2
+  exit 1
+fi
+# Atomic O_EXCL create, same reasoning as health-sentinel.sh.
+RAND="$(od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+OUT="$OUTBOX/$(date -u +%Y%m%dT%H%M%S)-onecli-drift.${RAND:-$$}.md"
+umask 022
+set -C
+printf '*OneCLI gateway drift*\n_host: %s · %s UTC_\n\n%s\n' \
+  "$(hostname)" "$(date -u '+%Y-%m-%d %H:%M')" "$NOTIFICATION" > "$OUT" || {
+  set +C
+  echo "drift-check: DRIFT DETECTED but could not create $OUT: $NOTIFICATION" >&2
+  exit 1
+}
+set +C
+[ -s "$OUT" ] || { echo "drift-check: wrote an empty alert to $OUT" >&2; exit 1; }
+echo "drift-check: queued alert $OUT"
