@@ -78,6 +78,7 @@ const calls = vi.hoisted(() => ({
   kills: [] as Array<{ sessionId: string; reason: string }>,
   archives: [] as string[],
   updates: [] as Array<{ id: string; patch: Record<string, unknown> }>,
+  wakes: [] as string[],
   hostScripts: [] as unknown[][],
   admissions: [] as unknown[][],
   recurrences: [] as unknown[][],
@@ -107,7 +108,10 @@ vi.mock('../../container-runner.js', async (importOriginal) => {
     hasContainerEverRun: () => false,
     getActiveContainerSessionIds: () => [],
     getContainerSpawnedAt: () => 0,
-    wakeContainer: async () => true,
+    wakeContainer: async (session: { id: string }) => {
+      calls.wakes.push(session.id);
+      return true;
+    },
     killContainer: (sessionId: string, reason: string, onExit?: () => void) => {
       calls.order.push('kill');
       calls.kills.push({ sessionId, reason });
@@ -252,6 +256,8 @@ import { openInboundDb } from '../mailbox/openers.js';
 import { ensureSchema } from '../mailbox/schema.js';
 import { SWEEP_DUTY_INVENTORY, _listSweepRegistrationsForTesting } from '../../host-sweep.js';
 import { composeNanoclawSession } from '../mailbox/index.js';
+import { admitDueRow } from '../mailbox/ops/admission.js';
+import { insertDeferredMessageWithContextIfNew } from '../mailbox/ops/ingress.js';
 import { insertTaskRow } from '../scheduling/db.js';
 import { scriptBackoffMinutes } from '../scheduling/recurrence.js';
 import { log } from '../../log.js';
@@ -262,6 +268,7 @@ import './index.js';
 // PR 14 integration: the session:tail chain case also pins S17, which moved
 // to the per-session-core family (S2-PR9).
 import '../sweep-session-core/index.js';
+import '../sweep-continuation/index.js';
 
 // ─── fixtures ────────────────────────────────────────────────────────────────
 
@@ -429,6 +436,7 @@ beforeEach(async () => {
   calls.kills = [];
   calls.archives = [];
   calls.updates = [];
+  calls.wakes = [];
   calls.hostScripts = [];
   calls.admissions = [];
   calls.recurrences = [];
@@ -749,6 +757,185 @@ describe('S2-PR11 scheduling + thread-close', () => {
     expect(calls.updates).toEqual([]);
   });
 
+  it('the registered spent-task GC duty keeps an idle task session with a future deferred wait', async () => {
+    const db = freshInbound();
+    const mailbox = sessionFor(db);
+    const session = fakeSession({ id: 'sess-wait-future', thread_id: TASK_THREAD });
+    const processAfter = new Date(Date.now() + 60_000).toISOString();
+    expect(
+      insertDeferredMessageWithContextIfNew(db, {
+        id: 'wait-future',
+        kind: 'chat',
+        timestamp: new Date().toISOString(),
+        platformId: null,
+        channelType: null,
+        threadId: null,
+        content: JSON.stringify({ text: 'resume later' }),
+        processAfter,
+        recurrence: null,
+      }),
+    ).toBe(true);
+
+    await duty(SWEEP_DUTY_INVENTORY.S19).run(makeCtx({ session, mailbox }));
+
+    expect(calls.updates, 'the GC closed the session holding an inert wait').toEqual([]);
+    expect(
+      db.prepare("SELECT trigger FROM messages_in WHERE id = 'wait-future'").get(),
+      'the wait stays inert until due admission',
+    ).toEqual({ trigger: 0 });
+    expect(getRawDb().prepare("SELECT status FROM sessions WHERE id = 'sess-wait-future'").get()).toEqual({
+      status: 'active',
+    });
+  });
+
+  it('admits a due deferred wait, keeps its task session active, and wakes that same session', async () => {
+    const db = freshInbound();
+    const mailbox = sessionFor(db);
+    const session = fakeSession({ id: 'sess-wait-due', thread_id: TASK_THREAD });
+    const processAfter = new Date(Date.now() - 1_000).toISOString();
+    expect(
+      insertDeferredMessageWithContextIfNew(db, {
+        id: 'wait-due',
+        kind: 'chat',
+        timestamp: new Date().toISOString(),
+        platformId: null,
+        channelType: null,
+        threadId: null,
+        content: JSON.stringify({ text: 'resume now' }),
+        processAfter,
+        recurrence: null,
+      }),
+    ).toBe(true);
+    expect(
+      admitDueRow(
+        db,
+        {
+          id: 'recall-wait-due',
+          kind: 'system',
+          timestamp: new Date().toISOString(),
+          platformId: null,
+          channelType: null,
+          threadId: null,
+          content: JSON.stringify({ subtype: 'recall_context' }),
+          processAfter,
+          recurrence: null,
+          trigger: 0,
+          sourceSessionId: null,
+          onWake: 0,
+        },
+        'wait-due',
+      ),
+    ).toBe(true);
+
+    const ctx = makeCtx({ session, mailbox });
+    await duty(SWEEP_DUTY_INVENTORY.S5).run(ctx);
+    expect(ctx.plan.dueCount).toBe(1);
+    await duty(SWEEP_DUTY_INVENTORY.S19).run(ctx);
+    await duty(SWEEP_DUTY_INVENTORY.S9b).run(ctx);
+
+    expect(calls.updates, 'the GC closed the session before its due wake could respawn').toEqual([]);
+    expect(calls.wakes).toEqual(['sess-wait-due']);
+    expect(getRawDb().prepare("SELECT status FROM sessions WHERE id = 'sess-wait-due'").get()).toEqual({
+      status: 'active',
+    });
+  });
+
+  it('the registered spent-task GC duty keeps an authorized unfinished continuation', async () => {
+    const db = freshInbound();
+    const session = fakeSession({ id: 'sess-continuation', thread_id: TASK_THREAD });
+    const mailbox = sessionFor(db);
+    vi.spyOn(mailbox, 'readWorkContinuation').mockReturnValue({
+      id: 'continuation-1',
+      task: 'finish the bounded work',
+      phase: 'queued',
+      chain: 0,
+      resume_attempts: 0,
+      recovery_episode: 0,
+    });
+
+    await duty(SWEEP_DUTY_INVENTORY.S19).run(makeCtx({ session, mailbox }));
+
+    expect(calls.updates).toEqual([]);
+  });
+
+  it('the registered spent-task GC duty rechecks for a continuation that lands during the intent check', async () => {
+    const db = freshInbound();
+    const session = fakeSession({ id: 'sess-continuation-raced', thread_id: TASK_THREAD });
+    const mailbox = sessionFor(db);
+    const continuation = {
+      id: 'continuation-raced',
+      task: 'finish after the interrupted turn',
+      phase: 'queued' as const,
+      chain: 0,
+      resume_attempts: 0,
+      recovery_episode: 0,
+    };
+    let continuationLanded = false;
+    vi.spyOn(mailbox, 'readWorkContinuation').mockImplementation(() => (continuationLanded ? continuation : null));
+    calls.intentHook = () => {
+      continuationLanded = true;
+    };
+
+    await duty(SWEEP_DUTY_INVENTORY.S19).run(makeCtx({ session, mailbox }));
+
+    expect(mailbox.readWorkContinuation(), 'the hook made a continuation readable').toEqual(continuation);
+    expect(calls.updates, 'the GC closed a session with continuation work that landed during its intent check').toEqual(
+      [],
+    );
+    expect(getRawDb().prepare("SELECT status FROM sessions WHERE id = 'sess-continuation-raced'").get()).toEqual({
+      status: 'active',
+    });
+  });
+
+  it('the registered spent-task GC duty closes a session after its paired wait is consumed', async () => {
+    const db = freshInbound();
+    const session = fakeSession({ id: 'sess-wait-consumed', thread_id: TASK_THREAD });
+    expect(
+      insertDeferredMessageWithContextIfNew(db, {
+        id: 'wait-consumed',
+        kind: 'chat',
+        timestamp: new Date().toISOString(),
+        platformId: null,
+        channelType: null,
+        threadId: null,
+        content: JSON.stringify({ text: 'already resumed' }),
+        processAfter: new Date(Date.now() + 60_000).toISOString(),
+        recurrence: null,
+      }),
+    ).toBe(true);
+    db.prepare("UPDATE messages_in SET status = 'completed' WHERE id = 'wait-consumed'").run();
+
+    await duty(SWEEP_DUTY_INVENTORY.S19).run(makeCtx({ session, mailbox: sessionFor(db) }));
+
+    expect(calls.updates).toEqual([{ id: 'sess-wait-consumed', patch: { status: 'closed' } }]);
+  });
+
+  it('the registered spent-task GC duty closes a completed task session with only historical context left', async () => {
+    const db = freshInbound();
+    const session = fakeSession({ id: 'sess-spent', thread_id: TASK_THREAD });
+    db.prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, content, trigger)
+       VALUES ('finished-turn', 2, 'chat', ?, 'completed', '{}', 1),
+              ('recall-finished-turn', 4, 'system', ?, 'pending', '{}', 0),
+              ('expired-turn', 6, 'chat', ?, 'expired', '{}', 0),
+              ('recall-expired-turn', 8, 'system', ?, 'pending', '{}', 0),
+              ('inert-context', 10, 'chat', ?, 'pending', '{}', 0)`,
+    ).run(
+      new Date().toISOString(),
+      new Date().toISOString(),
+      new Date().toISOString(),
+      new Date().toISOString(),
+      new Date().toISOString(),
+    );
+
+    await duty(SWEEP_DUTY_INVENTORY.S19).run(makeCtx({ session, mailbox: sessionFor(db) }));
+
+    expect(calls.updates).toEqual([{ id: 'sess-spent', patch: { status: 'closed' } }]);
+    expect(getRawDb().prepare("SELECT status FROM sessions WHERE id = 'sess-spent'").get()).toEqual({
+      status: 'closed',
+    });
+  });
+
   // ── Codex final, CRITICAL ─────────────────────────────────────────────────
   //
   // A move in flight is indistinguishable from a spent session by the cheap
@@ -828,6 +1015,34 @@ describe('S2-PR11 scheduling + thread-close', () => {
     });
   });
 
+  it('the registered spent-task GC duty rechecks for a deferred wait that lands during the intent check', async () => {
+    const db = freshInbound();
+    const session = fakeSession({ id: 'sess-wait-raced', thread_id: TASK_THREAD });
+    const mailbox = sessionFor(db);
+    const ctx = makeCtx({ session, mailbox });
+    calls.intentHook = () => {
+      insertDeferredMessageWithContextIfNew(db, {
+        id: 'wait-raced',
+        kind: 'chat',
+        timestamp: new Date().toISOString(),
+        platformId: null,
+        channelType: null,
+        threadId: null,
+        content: JSON.stringify({ text: 'resume later' }),
+        processAfter: new Date(Date.now() + 60_000).toISOString(),
+        recurrence: null,
+      });
+    };
+
+    await duty(SWEEP_DUTY_INVENTORY.S19).run(ctx);
+
+    expect(mailbox.hasPendingRecallPairedTrigger(), 'the hook inserted a paired deferred wait').toBe(true);
+    expect(calls.updates, 'the GC closed a session with a wait that landed during its intent check').toEqual([]);
+    expect(getRawDb().prepare("SELECT status FROM sessions WHERE id = 'sess-wait-raced'").get()).toEqual({
+      status: 'active',
+    });
+  });
+
   it('the registered spent-task GC duty keeps a session whose container is still running', async () => {
     calls.running = true;
     const db = freshInbound();
@@ -866,20 +1081,25 @@ describe('S2-PR11 scheduling + thread-close', () => {
 
   describe('shouldCloseTaskSession', () => {
     it('closes a spent per-task session (no live tasks, no container)', () => {
-      expect(shouldCloseTaskSession('system:tasks:task-1', false, 0)).toBe(true);
+      expect(shouldCloseTaskSession('system:tasks:task-1', false, 0, false, false)).toBe(true);
     });
 
     it('keeps it while a task is still live (recurring re-armed, or pending/paused)', () => {
-      expect(shouldCloseTaskSession('system:tasks:task-1', false, 1)).toBe(false);
+      expect(shouldCloseTaskSession('system:tasks:task-1', false, 1, false, false)).toBe(false);
     });
 
     it('keeps it while its container is running (mid-fire)', () => {
-      expect(shouldCloseTaskSession('system:tasks:task-1', true, 0)).toBe(false);
+      expect(shouldCloseTaskSession('system:tasks:task-1', true, 0, false, false)).toBe(false);
+    });
+
+    it('keeps it while a paired wait or continuation remains', () => {
+      expect(shouldCloseTaskSession('system:tasks:task-1', false, 0, true, false)).toBe(false);
+      expect(shouldCloseTaskSession('system:tasks:task-1', false, 0, false, true)).toBe(false);
     });
 
     it('never touches non-task sessions', () => {
-      expect(shouldCloseTaskSession('telegram:12345', false, 0)).toBe(false);
-      expect(shouldCloseTaskSession(null, false, 0)).toBe(false);
+      expect(shouldCloseTaskSession('telegram:12345', false, 0, false, false)).toBe(false);
+      expect(shouldCloseTaskSession(null, false, 0, false, false)).toBe(false);
     });
   });
 

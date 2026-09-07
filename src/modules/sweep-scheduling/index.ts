@@ -9,10 +9,11 @@
  *   S18 `recurrence-fanout`     session:tail 20
  *   S19 `spent-task-session-gc` session:tail 30   (strictly after S18 — constraint 13)
  *
- * Bodies below are moved from `src/host-sweep.ts` UNCHANGED (same statements,
- * log strings, thresholds, helper calls). Nothing here kills or wakes, so
- * every body runs inside the window the driver already opened and holds no
- * second session on the same key (constraint 18, invariant I-3):
+ * The duties preserve the host sweep's ordering and session-window ownership.
+ * S19 additionally preserves recall-paired waits and durable continuations;
+ * it does not add a wake path. Nothing here kills or wakes, so every body runs
+ * inside the window the driver already opened and holds no second session on
+ * the same key (constraint 18, invariant I-3):
  * `runHostGatedTaskScripts` and `handleRecurrence` take the sweep's OWN
  * session as their first parameter (mailbox seam PR 4) rather than opening
  * one of their own.
@@ -32,13 +33,21 @@ import { admitDueTaskContexts } from '../../session-manager.js';
 import type { NanoclawMailboxSession } from '../mailbox/index.js';
 import { runHostGatedTaskScripts } from '../scheduling/host-script.js';
 
-/** A per-task session with no live tasks and no running container is spent → close it. */
+/** A per-task session with no live work and no running container is spent → close it. */
 export function shouldCloseTaskSession(
   threadId: string | null,
   containerRunning: boolean,
   liveTaskCount: number,
+  hasPendingRecallPairedTrigger: boolean,
+  hasWorkContinuation: boolean,
 ): boolean {
-  return isTaskThread(threadId) && !containerRunning && liveTaskCount === 0;
+  return (
+    isTaskThread(threadId) &&
+    !containerRunning &&
+    liveTaskCount === 0 &&
+    !hasPendingRecallPairedTrigger &&
+    !hasWorkContinuation
+  );
 }
 
 async function prepareDueWake(
@@ -128,17 +137,30 @@ export function registerSchedulingSweepDuties(): void {
     name: id.S19,
     phase: 'session:tail',
     order: 30,
-    // 9. GC spent task sessions. An isolated per-task session with no live task
-    // rows left (one-shot fired, or all cancelled/deleted) and no container
-    // running is dead — close it so it stops being swept and listed. Runs after
-    // recurrence so a just-fired recurring series has already re-armed its next
-    // pending row and is never collected. The per-task log file in the workspace
-    // is the durable history and survives the close.
+    // 9. GC spent task sessions. A task session is spent only after its live
+    // task rows, recall-paired waits, and durable continuation are all gone and
+    // no container is running. A future `wait` is inert (trigger=0) until due,
+    // but it still needs this same active session for admission and respawn.
+    // Runs after recurrence so a just-fired recurring series has already
+    // re-armed its next pending row and is never collected. The per-task log
+    // file in the workspace is the durable history and survives the close.
     run: async (ctx) => {
       const { session, mailbox } = asSessionContext(ctx);
       if (isTaskThread(session.thread_id)) {
         const liveTasks = mailbox!.countLiveTasks();
-        if (!shouldCloseTaskSession(session.thread_id, isContainerRunning(session.id), liveTasks)) return;
+        const hasPendingWait = mailbox!.hasPendingRecallPairedTrigger();
+        const hasWorkContinuation = mailbox!.readWorkContinuation() !== null;
+        if (
+          !shouldCloseTaskSession(
+            session.thread_id,
+            isContainerRunning(session.id),
+            liveTasks,
+            hasPendingWait,
+            hasWorkContinuation,
+          )
+        ) {
+          return;
+        }
         // A move in flight looks EXACTLY like a spent session: it cancels the
         // source series before inserting into the target, so between those two
         // steps the source holds zero live rows and no container. Closing it
@@ -158,18 +180,17 @@ export function registerSchedulingSweepDuties(): void {
           });
           return;
         }
-        // Revalidate on the mailbox AFTER the only await on this path. The
-        // count above was taken before that suspension, and a `scheduleTask()`
-        // that raced the intent check has passed its own active-session
-        // recheck and inserted its row by now — closing here would strand a
-        // live task in a session no sweep visits again. No await may sit
-        // between this recount and the UPDATE: the sqlite driver runs the
-        // statement synchronously (`access()` yields only while a central
-        // transaction is active — that residual belongs to PR 6, see #452),
-        // so the decision and the close share one turn again, as they did
-        // when the intent check was a raw synchronous read.
-        if (mailbox!.countLiveTasks() > 0) {
-          log.info('Kept a spent task session open — a task arrived during the intent check', {
+        // Revalidate on the mailbox AFTER the only await on this path. A task,
+        // paired wait, or continuation can land while the intent check yields;
+        // closing it would strand work in a session no sweep visits again. No
+        // await may sit between these reads and the UPDATE: the SQLite reads
+        // run synchronously, so the decision and close share one turn.
+        const workArrived =
+          mailbox!.countLiveTasks() > 0 ||
+          mailbox!.hasPendingRecallPairedTrigger() ||
+          mailbox!.readWorkContinuation() !== null;
+        if (workArrived) {
+          log.info('Kept a spent task session open — work arrived during the intent check', {
             sessionId: session.id,
             threadId: session.thread_id,
           });

@@ -18,7 +18,7 @@ import os from 'os';
 import path from 'path';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 
-import { deferForFreshContextRetry } from './ops/admission.js';
+import { deferForFreshContextRetry, hasPendingRecallPairedTrigger } from './ops/admission.js';
 import {
   openInboundDb,
   openOutboundDb,
@@ -143,6 +143,56 @@ describe('insertDeferredMessageWithContextIfNew', () => {
     expect(rows.map((row) => row.on_wake)).toEqual([1, 1]);
     expect(rows[0].process_after).toBe(message.processAfter);
     expect(JSON.parse(rows[0].content)).toEqual({ subtype: 'recall_context', deferred: true });
+    db.close();
+  });
+});
+
+describe('hasPendingRecallPairedTrigger', () => {
+  function insertRow(
+    db: Database.Database,
+    values: { id: string; kind: string; status: string; trigger: 0 | 1; processAfter?: string | null },
+  ): void {
+    const seq = (db.prepare('SELECT COALESCE(MAX(seq), 0) AS max FROM messages_in').get() as { max: number }).max + 2;
+    db.prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, content, trigger, process_after)
+       VALUES (@id, @seq, @kind, @timestamp, @status, '{}', @trigger, @processAfter)`,
+    ).run({ ...values, seq, timestamp: new Date().toISOString(), processAfter: values.processAfter ?? null });
+  }
+
+  it('retains both an inert future wait and its admitted due turn', () => {
+    const db = new Database(':memory:');
+    db.exec(INBOUND_SCHEMA);
+    const future = new Date(Date.now() + 60_000).toISOString();
+    insertDeferredMessageWithContextIfNew(db, {
+      id: 'wait-future',
+      kind: 'chat',
+      timestamp: new Date().toISOString(),
+      platformId: null,
+      channelType: null,
+      threadId: null,
+      content: '{}',
+      processAfter: future,
+      recurrence: null,
+    });
+
+    expect(hasPendingRecallPairedTrigger(db)).toBe(true);
+    db.prepare("UPDATE messages_in SET trigger = 1, process_after = ? WHERE id = 'wait-future'").run(
+      new Date(Date.now() - 1_000).toISOString(),
+    );
+    expect(hasPendingRecallPairedTrigger(db)).toBe(true);
+    db.close();
+  });
+
+  it('ignores historical recall context and unrelated inert rows', () => {
+    const db = new Database(':memory:');
+    db.exec(INBOUND_SCHEMA);
+    insertRow(db, { id: 'finished', kind: 'chat', status: 'completed', trigger: 1 });
+    insertRow(db, { id: 'recall-finished', kind: 'system', status: 'pending', trigger: 0 });
+    insertRow(db, { id: 'expired', kind: 'chat', status: 'expired', trigger: 0 });
+    insertRow(db, { id: 'recall-expired', kind: 'system', status: 'pending', trigger: 0 });
+    insertRow(db, { id: 'inert-context', kind: 'chat', status: 'pending', trigger: 0 });
+
+    expect(hasPendingRecallPairedTrigger(db)).toBe(false);
     db.close();
   });
 });
