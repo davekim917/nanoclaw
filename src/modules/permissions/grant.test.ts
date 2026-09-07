@@ -26,12 +26,12 @@ vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
   return {
     ...actual,
-    DATA_DIR: '/tmp/nanoclaw-test-permissions-grant',
-    GROUPS_DIR: '/tmp/nanoclaw-test-permissions-grant/groups',
+    DATA_DIR: TEST_DIR,
+    GROUPS_DIR: `${TEST_DIR}/groups`,
   };
 });
 
-const TEST_DIR = '/tmp/nanoclaw-test-permissions-grant';
+const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-permissions-grant') }));
 
 const notifyCalls: Array<{ sessionId: string; text: string }> = [];
 // Lets a case run arbitrary work immediately BEFORE the handler's apply block

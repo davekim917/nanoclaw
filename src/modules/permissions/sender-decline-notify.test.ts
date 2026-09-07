@@ -83,10 +83,10 @@ vi.mock('./user-dm.js', async (importOriginal) => ({
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-decline-notify' };
+  return { ...actual, DATA_DIR: TEST_DIR };
 });
 
-const TEST_DIR = '/tmp/nanoclaw-test-decline-notify';
+const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-decline-notify') }));
 
 function now() {
   return new Date().toISOString();
