@@ -57,6 +57,7 @@ export const claudeConfigSchema = z.strictObject({
   effort: z.enum(CLAUDE_EFFORT_LEVELS).optional(),
 });
 
+
 function log(msg: string): void {
   console.error(`[claude-provider] ${msg}`);
 }
@@ -2048,8 +2049,6 @@ export class ClaudeProvider implements AgentProvider {
   private oauthRing: Array<{ name: string; value: string }> = [];
   private oauthRingPos = 0;
   private oauthRotationsThisCycle = 0;
-  private model?: string;
-  private effort?: string;
   private memorySessionHook?: MemorySessionHookRegistration;
 
   constructor(options: ProviderOptions = {}) {
@@ -2106,8 +2105,6 @@ export class ClaudeProvider implements AgentProvider {
         this.oauthRing.push(entry);
       }
     }
-    this.model = options.model;
-    this.effort = options.effort;
   }
 
   registerMemorySessionHook(hook: MemorySessionHookRegistration): void {

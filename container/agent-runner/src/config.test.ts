@@ -149,4 +149,34 @@ describe('parseRawConfig provider fallback bridge', () => {
     clearEnv();
     expect(parseRawConfig({}).provider).toBe('claude');
   });
+
+  it('surfaces a claude fallback declaration on model/effort for the spawn env', () => {
+    // These two fields are how a fallback declaration leaves parseRawConfig.
+    // They used to be folded into ClaudeProvider's sticky config by a
+    // container-side guard with its own copy of the host model vocabulary;
+    // that guard is gone (it drew three findings in three rounds), because the
+    // host already resolves and validates the declaration into
+    // ANTHROPIC_DEFAULT_OPUS_MODEL, which the provider reads directly.
+    process.env.NANOCLAW_PROVIDER_OVERRIDE = 'claude';
+    const fallback = parseRawConfig({
+      ...BASE,
+      providerFallback: { provider: 'claude', model: 'claude-fable-5-1[1m]', effort: 'medium' },
+    });
+    expect(fallback.model).toBe('claude-fable-5-1[1m]');
+    expect(fallback.effort).toBe('medium');
+    // The primary's sticky config is dropped: it is the wrong provider's, and
+    // codex's `reasoning_effort` key is a fatal boot error under claude's
+    // strict schema.
+    expect(fallback.providerConfig).toEqual({});
+
+    clearEnv();
+    const primary = parseRawConfig({
+      provider: 'claude',
+      model: 'claude-fable-5-1[1m]',
+      effort: 'medium',
+      providerFallback: { provider: 'codex' },
+    });
+    expect(primary.model).toBe('claude-fable-5-1[1m]');
+    expect(primary.effort).toBe('medium');
+  });
 });

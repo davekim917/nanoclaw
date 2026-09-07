@@ -76,9 +76,9 @@ import {
   replaceUntrustedFile,
 } from './fs-safety.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
-// resolveEffectiveModel applies the family-default map, MODEL_ALIAS_MAP and
-// ensureOpus1mSuffix — see its use below.
-import { resolveEffectiveModel, DEFAULT_OPUS_MODEL, DEFAULT_SONNET_MODEL, DEFAULT_HAIKU_MODEL } from './flag-parser.js';
+// Owns the claude branch's model/effort resolution AND the `-e` strings it
+// emits, so both are reachable from a unit test — buildContainerArgs is not.
+import { claudeSpawnEnv } from './claude-spawn-defaults.js';
 import { readEnvFileMatching } from './env.js';
 import { resolveGitHubToken as resolveGitHubTokenForContainer } from './github-token.js';
 export { resolveGitHubToken } from './github-token.js';
@@ -5786,8 +5786,9 @@ async function buildContainerArgs(
   //      the agent-runner's flag parser, not here.
   //   2. Per-channel wiring (messaging_group_agents.default_model/effort)
   //      — passed via channelDefaults when session has a messaging_group.
-  //   3. Per-agent container.json (defaultModel / defaultEffort) —
-  //      applies to every channel wired to this agent unless (2) overrides.
+  //   3. Per-agent container.json — `model`/`effort` (written by `ncl groups
+  //      config update`) then the hand-authored `defaultModel`/`defaultEffort`
+  //      — applies to every channel wired to this agent unless (2) overrides.
   //   4. The DEFAULT_* constants above.
   //
   // ANTHROPIC_DEFAULT_<FAMILY>_MODEL is the SDK's alias resolver
@@ -5824,25 +5825,28 @@ async function buildContainerArgs(
     if (codexModel) args.push('-e', `NANOCLAW_CODEX_MODEL_OVERRIDE=${codexModel}`);
     if (codexEffort) args.push('-e', `NANOCLAW_CODEX_EFFORT_OVERRIDE=${codexEffort}`);
   } else {
-    // resolveEffectiveModel maps family aliases first (so `opus` keeps
-    // tracking DEFAULT_OPUS_MODEL rather than freezing), then pinned short
-    // aliases (`opus5`, `opus48`, `sonnet5`, `fable`), then applies
-    // ensureOpus1mSuffix to bare ids. The chat ack calls the same function, so
+    // claudeSpawnEnv applies resolveEffectiveModel: family aliases first (so
+    // `opus` keeps tracking DEFAULT_OPUS_MODEL rather than freezing), then
+    // pinned short aliases (`opus5`, `opus48`, `sonnet5`, `fable`), then
+    // ensureOpus1mSuffix on bare ids. The chat ack calls the same function, so
     // the confirmation the user sees is exactly what lands in
-    // ANTHROPIC_DEFAULT_OPUS_MODEL here.
-    const rawDefaultModel = activeChannelModel ?? containerConfig.defaultModel ?? DEFAULT_OPUS_MODEL;
-    const defaultOpusModel = resolveEffectiveModel(rawDefaultModel);
-    args.push('-e', `ANTHROPIC_DEFAULT_OPUS_MODEL=${defaultOpusModel}`);
-    args.push('-e', `ANTHROPIC_DEFAULT_SONNET_MODEL=${DEFAULT_SONNET_MODEL}`);
-    args.push('-e', `ANTHROPIC_DEFAULT_HAIKU_MODEL=${DEFAULT_HAIKU_MODEL}`);
-
-    // NANOCLAW_EFFORT_OVERRIDE is an OPERATOR override (per-channel wiring or
-    // per-group container.json) — injected only when one is actually set.
-    // When absent, the claude provider applies per-model-family defaults.
-    const defaultEffort = activeChannelEffort ?? containerConfig.defaultEffort;
-    if (defaultEffort) {
-      args.push('-e', `NANOCLAW_EFFORT_OVERRIDE=${defaultEffort}`);
-    }
+    // ANTHROPIC_DEFAULT_OPUS_MODEL.
+    // Both the resolution and the `-e` strings themselves live in
+    // claude-spawn-defaults.ts so they can be executed by a test;
+    // buildContainerArgs cannot (live `onecli` shell calls). Emits the three
+    // ANTHROPIC_DEFAULT_<FAMILY>_MODEL aliases always, and
+    // NANOCLAW_EFFORT_OVERRIDE only when a channel wiring or the group's
+    // container.json actually configures one — absent means the claude
+    // provider applies its per-model-family default.
+    args.push(
+      ...claudeSpawnEnv(containerConfig, { model: activeChannelModel, effort: activeChannelEffort }, (message) =>
+        log.warn('Claude spawn default refused', {
+          sessionId,
+          agentGroup: agentGroup.name,
+          detail: message,
+        }),
+      ),
+    );
   }
 
   // Provider fallback bridge. The container reads its provider and model from
