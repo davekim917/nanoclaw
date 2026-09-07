@@ -38,7 +38,6 @@ CONTAINER="${ONECLI_CONTAINER:-onecli}"
 RESTART_PCT="${RESTART_PCT:-70}"   # restart at/above this % of the soft limit
 DRY_RUN="${DRY_RUN:-0}"
 RECOVER_WAIT_S="${RECOVER_WAIT_S:-60}"   # bound on waiting for the gateway to return
-CLI_SOCK="$NANOCLAW_DIR/data/cli.sock"
 
 fail() { echo "fd-watchdog: $1" >&2; exit 1; }
 
@@ -138,57 +137,45 @@ else
   OUTCOME="was restarted automatically but did NOT come back healthy within ${RECOVER_WAIT_S}s — credentialed calls are still failing and this needs a human"
 fi
 
-# Tell an owner. A silent auto-restart would hide how fast the leak is growing.
-# Select the owner's real user_id and send AS them. A synthetic `system:<name>`
-# sender is treated as an unknown user, and an owner DM under the `strict`
-# unknown-sender policy DROPS it — observed: `MESSAGE DROPPED — unknown sender
-# (strict policy) userId="system:onecli-fd-watchdog"` — while this script still
-# printed that the notification was delivered. That is the failure this whole
-# script exists to prevent, in its own alert path. `scripts/init-first-agent.ts`
-# sends as the resolved user for the same reason.
-ADMIN_DM_ROW="$(pnpm exec tsx scripts/q.ts "$NANOCLAW_DIR/data/v2.db" "
-  SELECT mg.platform_id, ud.channel_type, ur.user_id
-    FROM user_roles ur
-    JOIN user_dms ud ON ud.user_id = ur.user_id
-    JOIN messaging_groups mg ON mg.id = ud.messaging_group_id
-   WHERE ur.role = 'owner'
-   ORDER BY ud.resolved_at DESC
-   LIMIT 1
-" 2>/dev/null | tail -1)"
-ADMIN_DM_PLATFORM_ID="$(echo "$ADMIN_DM_ROW" | cut -d'|' -f1)"
-ADMIN_DM_CHANNEL_TYPE="$(echo "$ADMIN_DM_ROW" | cut -d'|' -f2)"
-ADMIN_USER_ID="$(echo "$ADMIN_DM_ROW" | cut -d'|' -f3)"
-
-if [ -z "$ADMIN_DM_PLATFORM_ID" ] || [ -z "$ADMIN_USER_ID" ] || [ ! -S "$CLI_SOCK" ]; then
-  echo "fd-watchdog: could not resolve an owner DM or the CLI socket — the gateway was handled but NOBODY WAS TOLD" >&2
+# Tell a human, over a path that does not depend on what just broke.
+#
+# NOT data/cli.sock. That socket is served BY nanoclaw-v2, and a `to:` payload
+# on it becomes an INBOUND event (src/channels/cli.ts) — it queues work for an
+# agent, which must then spawn a container and call its provider before anyone
+# sees anything. Every one of those steps needs the OneCLI gateway: the spawn
+# path refuses containers outright while the gateway is unreachable
+# (src/onecli-preflight.ts). So the agent path is undeliverable in exactly the
+# case this script exists to report, and it would print "delivered" anyway.
+# scripts/unit-failure-alert.sh already carries this conclusion in its header.
+#
+# The outbox is shipped to Slack every 60s by outbox-ship.sh using its own bot
+# token and no host process, so it survives both nanoclaw-v2 and the gateway
+# being down. It also removes this script's dependency on the central DB and on
+# sender attribution entirely — there is no router gate to be dropped by.
+OUTBOX="${FD_WATCHDOG_OUTBOX:-${UNIT_ALERT_OUTBOX:-}}"
+if [ -z "$OUTBOX" ]; then
+  echo "fd-watchdog: FD_WATCHDOG_OUTBOX/UNIT_ALERT_OUTBOX unset — the gateway was handled but NOBODY WAS TOLD" >&2
   exit 1
 fi
+mkdir -p "$OUTBOX"
+# `mkdir -p` on a dangling compat symlink succeeds at creating nothing usable,
+# so verify afterwards — an alert written into the void is this script's own
+# failure mode.
+[ -d "$OUTBOX" ] && [ -w "$OUTBOX" ] || {
+  echo "fd-watchdog: outbox unusable: $OUTBOX — the gateway was handled but NOBODY WAS TOLD" >&2
+  exit 1
+}
 
-NOTIFICATION="System notification (OneCLI fd watchdog): the gateway reached ${PCT}% of its ${SOFT}-fd limit (${STUCK} sockets held but unreclaimable) and ${OUTCOME}. Root cause is the upstream leak in onecli/onecli#484, still open; this watchdog is containment, not a fix."
+OUT="$OUTBOX/$(date -u +%Y%m%dT%H%M%S)-onecli-fd-watchdog.md"
+{
+  printf '*OneCLI gateway fd watchdog*\n_host: %s · %s UTC_\n\n' "$(hostname)" "$(date -u '+%Y-%m-%d %H:%M')"
+  printf 'The gateway reached %s%% of its %s-fd limit (%s sockets held but unreclaimable) and %s.\n\n' \
+    "$PCT" "$SOFT" "$STUCK" "$OUTCOME"
+  printf 'Root cause is the upstream leak in onecli/onecli#484, still open. This watchdog is containment, not a fix.\n'
+} > "$OUT"
 
-# Pass values through the environment and read them with os.environ inside a
-# QUOTED heredoc, matching scripts/health-sentinel.sh:376-390. An unquoted
-# heredoc substitutes them into Python source text, so a future edit to the
-# message template that introduces a quote or backslash would break the script
-# rather than the string. Same protocol, the version that cannot be broken by
-# editing the text.
-export NOTIFICATION ADMIN_DM_CHANNEL_TYPE ADMIN_DM_PLATFORM_ID ADMIN_USER_ID CLI_SOCK
-python3 <<'EOF'
-import json, os, socket, time
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-sock.connect(os.environ["CLI_SOCK"])
-payload = json.dumps({
-    "text": os.environ["NOTIFICATION"],
-    "senderId": os.environ["ADMIN_USER_ID"],
-    "sender": "OneCLI FD Watchdog",
-    "to": {
-        "channelType": os.environ["ADMIN_DM_CHANNEL_TYPE"],
-        "platformId": os.environ["ADMIN_DM_PLATFORM_ID"],
-        "threadId": os.environ["ADMIN_DM_PLATFORM_ID"],
-    },
-}) + "\n"
-sock.sendall(payload.encode("utf-8"))
-time.sleep(0.5)
-sock.close()
-print("fd-watchdog: notification delivered to admin DM")
-EOF
+[ -s "$OUT" ] || {
+  echo "fd-watchdog: wrote an empty alert to $OUT" >&2
+  exit 1
+}
+echo "fd-watchdog: queued alert $OUT"
