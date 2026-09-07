@@ -93,7 +93,7 @@ Four types — channel/provider installers, utility skills that ship code, instr
 
 ## Contributing & PR Hygiene
 
-Before a PR, a skill, or any contribution, you MUST read [CONTRIBUTING.md](CONTRIBUTING.md) (change types, skill guidelines, `SKILL.md` format, pre-submission checklist). Before a PR: run `git diff upstream/main --stat HEAD` and `git log upstream/main..HEAD --oneline`, show the output, wait for approval. Installation-specific files (group files, `.claude/settings.json`, local configs) should not be included.
+Before a PR, a skill, or any contribution, you MUST read [CONTRIBUTING.md](CONTRIBUTING.md) (change types, skill guidelines, `SKILL.md` format, pre-submission checklist). Before a PR **to upstream** (`nanocoai/nanoclaw`): run `git diff upstream/main --stat HEAD` and `git log upstream/main..HEAD --oneline`, show the output, wait for approval — that diff is what upstream would receive. Fork-internal PRs don't need it; the ratchet already reports divergence. Installation-specific files (group files, `.claude/settings.json`, local configs) should not be included.
 
 Any change to an upstream-owned file must regenerate `src/upstream-ratchet.json` (`pnpm run ratchet:report -- --write`); growth needs `--accept` and a reason in the PR body.
 
@@ -184,7 +184,7 @@ Full gotcha list (`bun:test` vs vitest, pinned global CLIs, Dockerfile entrypoin
 
 - **`container/agent-runner/` is not a pnpm workspace.** `bun install` there, commit `bun.lock` — `pnpm install` corrupts it. SDK/MCP bumps (`@anthropic-ai/claude-agent-sdk`, `@modelcontextprotocol/sdk`) go through the shared audit/apply flow; never `bun update` blindly.
 - **Named SQL params need the prefix in JS keys too.** `bun:sqlite` doesn't auto-strip `$`/`@`/`:` the way `better-sqlite3` does on the host — use `$name` in both SQL and `.run({ $id: msg.id })`. Positional `?` works normally.
-- **Session-DB pragmas**: `journal_mode=DELETE` (`container/agent-runner/src/db/connection.ts`) is load-bearing for cross-mount visibility — read the comment block there first.
+- **Session-DB pragmas**: `journal_mode=DELETE` (`container/agent-runner/src/mailbox/sqlite/connection.ts`) is load-bearing for cross-mount visibility — read the comment block there first.
 
 ## CJK font support
 
