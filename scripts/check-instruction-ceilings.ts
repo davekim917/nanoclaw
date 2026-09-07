@@ -25,11 +25,6 @@ import { CONTAINER_BYTES_CEILING, TRUNK_DOC_BYTES_CEILING, scanBannedPatterns } 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ALLOWANCE_FILE = 'instruction-ceilings.json';
 
-interface Allowances {
-  /** Bytes of temporary headroom above the ceiling, per repo-relative path. Target: every value 0. */
-  allowances: Record<string, number>;
-}
-
 interface Target {
   file: string;
   ceiling: number;
@@ -42,11 +37,42 @@ const TARGETS: Target[] = [
   { file: 'container/CLAUDE.md', ceiling: CONTAINER_BYTES_CEILING, scanPatterns: true },
 ];
 
-function readAllowances(): Allowances {
+/**
+ * Validates the allowance policy, failing closed on anything malformed.
+ *
+ * A bad value here silently disables the gate rather than tripping it: a string
+ * allowance makes `ceiling + allowance` concatenate, and an object makes it NaN,
+ * so every comparison evaluates false and an arbitrarily oversized file passes.
+ * Policy input that cannot be trusted must stop the build, not wave it through.
+ *
+ * @throws if the document, the `allowances` map, or any value is the wrong shape.
+ */
+export function parseAllowances(raw: unknown): Record<string, number> {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error(`${ALLOWANCE_FILE}: expected a JSON object at the top level.`);
+  }
+  const map = (raw as Record<string, unknown>).allowances;
+  if (map === undefined) return {};
+  if (map === null || typeof map !== 'object' || Array.isArray(map)) {
+    throw new Error(`${ALLOWANCE_FILE}: "allowances" must be an object mapping paths to byte counts.`);
+  }
+
+  const out: Record<string, number> = {};
+  for (const [file, value] of Object.entries(map as Record<string, unknown>)) {
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+      throw new Error(
+        `${ALLOWANCE_FILE}: allowance for "${file}" must be a non-negative integer, got ${JSON.stringify(value)}.`,
+      );
+    }
+    out[file] = value;
+  }
+  return out;
+}
+
+function readAllowances(): Record<string, number> {
   const p = path.join(repoRoot, ALLOWANCE_FILE);
-  if (!fs.existsSync(p)) return { allowances: {} };
-  const parsed = JSON.parse(fs.readFileSync(p, 'utf-8')) as Partial<Allowances>;
-  return { allowances: parsed.allowances ?? {} };
+  if (!fs.existsSync(p)) return {};
+  return parseAllowances(JSON.parse(fs.readFileSync(p, 'utf-8')));
 }
 
 export interface CeilingFailure {
@@ -115,7 +141,18 @@ export function checkCeilings(root: string, targets: Target[], allowances: Recor
 }
 
 function main(): void {
-  const { allowances } = readAllowances();
+  let allowances: Record<string, number>;
+  try {
+    allowances = readAllowances();
+  } catch (err) {
+    console.error(
+      `Instruction-surface ceiling check could not read its policy:\n\n  \u2718 ${(err as Error).message}\n`,
+    );
+    console.error('Refusing to pass with an unreadable allowance file — a malformed value disables the gate silently.');
+    process.exitCode = 1;
+    return;
+  }
+
   const failures = checkCeilings(repoRoot, TARGETS, allowances);
 
   if (failures.length === 0) {
