@@ -293,6 +293,7 @@ pr_authority_status() { # <authority-json>: absent|malformed|expired|live
   [ "$(lease_is_malformed "$lease")" != true ] || { printf 'malformed'; return; }
   [ "$lease" != null ] || { printf 'expired'; return; }
   [ "$(jq -r '.owner // empty' <<<"$lease")" = "$owner" ] || { printf 'malformed'; return; }
+  [ "$(jq -r '.pr // 0' <<<"$lease")" = "$(jq -r '.pr' <<<"$authority")" ] || { printf 'malformed'; return; }
   if [ "$(lease_is_live "$lease")" = true ]; then printf 'live'; else printf 'expired'; fi
 }
 
@@ -337,17 +338,26 @@ lease_lifecycle_end() {
 }
 
 read_lease() {
-  local f; f="$(lease_file "$1")"
+  local f lease stamp field; f="$(lease_file "$1")"
   if [ ! -e "$f" ]; then
     printf 'null'
   elif [ -s "$f" ] && jq -e '
       type == "object" and .schemaVersion == 1 and
+      (.pr | type == "number" and . >= 1 and . == floor) and
       (.owner | type == "string" and length > 0) and
-      (.claimedAt | type == "string" and length > 0) and
-      (.renewedAt | type == "string" and length > 0) and
-      (.expiresAt | type == "string" and length > 0)
+      (.claimedAt | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+      (.renewedAt | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+      (.expiresAt | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
     ' "$f" >/dev/null 2>&1; then
-    jq -c '.' "$f"
+    lease="$(jq -c '.' "$f")"
+    for field in claimedAt renewedAt expiresAt; do
+      stamp="$(jq -r --arg field "$field" '.[$field]' <<<"$lease")"
+      if [ "$(date -u -d "$stamp" +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)" != "$stamp" ]; then
+        jq -cn --arg path "$f" '{malformedLease:true,path:$path}'
+        return
+      fi
+    done
+    printf '%s' "$lease"
   else
     jq -cn --arg path "$f" '{malformedLease:true,path:$path}'
   fi
@@ -386,8 +396,8 @@ write_lease() {  # <runId> <json>
 # a live lease with a different owner always refuses, which is the whole point.
 # The claimant re-reads after writing and verifies it still holds the lease, so
 # two claimants racing the same expiry cannot both believe they won.
-lease_acquire() {  # <runId> <owner> [quiet]
-  local run="$1" owner="$2" quiet="${3:-}" cur prior_claimed now next back
+lease_acquire() {  # <runId> <owner> <pr> [quiet]
+  local run="$1" owner="$2" pr="$3" quiet="${4:-}" cur prior_claimed now next back
   if ! lease_dir_prepare; then
     [ -n "$quiet" ] || emit_lease_dir_error "$run" "lease-claim"
     return 1
@@ -412,14 +422,28 @@ lease_acquire() {  # <runId> <owner> [quiet]
     flock -u 6; exec 6>&-
     return 1
   fi
+  # A run id names one PR for its entire on-disk lifetime. Letting an expired
+  # lease move to another PR would strand the original PR authority pointer as
+  # permanently malformed, and could make one campaign's release affect the
+  # other. Recovery may replace the owner after expiry, but never the PR.
+  if [ "$cur" != null ] && [ "$(jq -r '.pr // 0' <<<"$cur")" != "$pr" ]; then
+    [ -n "$quiet" ] || jq -cn --arg run "$run" --arg owner "$owner" --argjson pr "$pr" --argjson lease "$cur" \
+      '{ok:false,
+        error:("this run id is permanently bound to PR " + ($lease.pr|tostring) +
+               " and cannot be reused for PR " + ($pr|tostring)),
+        runId:$run,requestedBy:$owner,requestedPr:$pr,
+        leasePr:$lease.pr,leaseOwner:$lease.owner,claimedAt:$lease.claimedAt,expiresAt:$lease.expiresAt}'
+    flock -u 6; exec 6>&-
+    return 1
+  fi
   if [ "$(lease_is_live "$cur")" = true ] &&
      [ "$(jq -r '.owner // empty' <<<"$cur")" != "$owner" ]; then
-    [ -n "$quiet" ] || jq -cn --arg run "$run" --arg owner "$owner" --argjson lease "$cur" \
+    [ -n "$quiet" ] || jq -cn --arg run "$run" --arg owner "$owner" --argjson pr "$pr" --argjson lease "$cur" \
       '{ok:false,
-        error:("another coordinator container already holds this run — STOP: do not start or continue this campaign. Its lease is held by " +
-               $lease.owner + " until " + $lease.expiresAt + ". Take over only after it expires, or have that owner release it."),
-        runId:$run,requestedBy:$owner,
-        leaseOwner:$lease.owner,claimedAt:$lease.claimedAt,expiresAt:$lease.expiresAt}'
+        error:("this run id is already held for PR " + ($lease.pr|tostring) + " by " + $lease.owner +
+               " until " + $lease.expiresAt + " — STOP; another coordinator owns this campaign"),
+        runId:$run,requestedBy:$owner,requestedPr:$pr,
+        leasePr:$lease.pr,leaseOwner:$lease.owner,claimedAt:$lease.claimedAt,expiresAt:$lease.expiresAt}'
     flock -u 6; exec 6>&-
     return 1
   fi
@@ -429,9 +453,9 @@ lease_acquire() {  # <runId> <owner> [quiet]
   [ "$(jq -r '.owner // empty' <<<"$cur")" = "$owner" ] &&
     prior_claimed="$(jq -r '.claimedAt // empty' <<<"$cur")"
   now="$(iso_now)"
-  next="$(jq -cn --arg owner "$owner" --arg now "$now" \
+  next="$(jq -cn --arg owner "$owner" --argjson pr "$pr" --arg now "$now" \
     --arg claimed "${prior_claimed:-$now}" --arg exp "$(lease_expiry_from_now)" \
-    '{schemaVersion:1,owner:$owner,claimedAt:$claimed,renewedAt:$now,expiresAt:$exp}')"
+    '{schemaVersion:1,pr:$pr,owner:$owner,claimedAt:$claimed,renewedAt:$now,expiresAt:$exp}')"
   if ! write_lease "$run" "$next"; then
     [ -n "$quiet" ] || jq -cn --arg run "$run" --arg dir "$LEASE_DIR" \
       '{ok:false,error:("could not write the lease file under " + $dir +
@@ -442,6 +466,7 @@ lease_acquire() {  # <runId> <owner> [quiet]
   # Verify we hold what we just wrote before telling the caller it may proceed.
   back="$(read_lease "$run")"
   if [ "$(jq -r '.owner // empty' <<<"$back")" != "$owner" ] ||
+     [ "$(jq -r '.pr // 0' <<<"$back")" != "$pr" ] ||
      [ "$(lease_is_live "$back")" != true ]; then
     [ -n "$quiet" ] || jq -cn --arg run "$run" --arg owner "$owner" --argjson lease "$back" \
       '{ok:false,error:"lease write did not stick (raced by another claimant) — do NOT proceed; retry",
@@ -483,7 +508,8 @@ lease_fence_begin() {  # <pr> <runId> <owner> <command>
   fi
   live="$(lease_is_live "$lease")"
   lease_owner="$(jq -r '.owner // empty' <<<"$lease" 2>/dev/null)"
-  if [ "$live" != true ] || [ "$lease_owner" != "$owner" ]; then
+  if [ "$live" != true ] || [ "$lease_owner" != "$owner" ] ||
+     [ "$(jq -r '.pr // 0' <<<"$lease" 2>/dev/null)" != "$pr" ]; then
     jq -cn --argjson pr "$pr" --arg run "$run" --arg owner "$owner" --arg cmd "$command" \
       --argjson lease "$lease" --argjson live "$live" \
       '{ok:false,error:"live shared coordinator lease does not belong to this lifecycle owner - STOP this campaign; if this is the original owner after expiry, recover with claim using the same run id and owner token",pr:$pr,runId:$run,command:$cmd,requestedBy:$owner,held:$live,leaseOwner:($lease.owner // null),expiresAt:($lease.expiresAt // null)}'
@@ -521,6 +547,25 @@ lease_restore_fenced() {  # <runId> <lease-json>
   restored="$(jq -c --arg now "$(iso_now)" --arg exp "$(lease_expiry_from_now)" \
     '.renewedAt=$now | .expiresAt=$exp' <<<"$2")" || return 1
   write_lease "$1" "$restored"
+}
+
+rollback_poll_ownership() { # <pr> <runId> <owner> <prior-lease> <prior-authority> <acquired-lease> <acquired-authority>
+  local pr="$1" run="$2" owner="$3" prior_lease="$4" prior_authority="$5"
+  local acquired_lease="$6" acquired_authority="$7" current current_authority
+  lease_lifecycle_begin "$pr" "$run" "poll-rollback" >/dev/null 2>&1 || return 1
+  exec 6>"$(lease_lock_file "$run")" || { lease_lifecycle_end; return 1; }
+  flock -w "$LOCK_WAIT" 6 || { exec 6>&-; lease_lifecycle_end; return 1; }
+  current="$(read_lease "$run")"; current_authority="$(read_pr_authority "$pr")"
+  # A successor that changed either identity wins. Never roll it back.
+  if [ "$current" != "$acquired_lease" ] || [ "$current_authority" != "$acquired_authority" ]; then
+    flock -u 6; exec 6>&-; lease_lifecycle_end
+    return 0
+  fi
+  if [ "$prior_lease" = null ]; then rm -f "$(lease_file "$run")" 2>/dev/null
+  else write_lease "$run" "$prior_lease"; fi || { flock -u 6; exec 6>&-; lease_lifecycle_end; return 1; }
+  if [ "$prior_authority" = null ]; then rm -f "$(pr_authority_file "$pr")" 2>/dev/null
+  else write_pr_authority "$pr" "$prior_authority"; fi || { flock -u 6; exec 6>&-; lease_lifecycle_end; return 1; }
+  flock -u 6; exec 6>&-; lease_lifecycle_end
 }
 
 # --- Challenger disposition ------------------------------------------------
@@ -1084,7 +1129,7 @@ COMMAND="${1:-poll}"
 # ---------------------------------------------------------------------------
 if [ "$COMMAND" = "check" ]; then
   PR="${2:-}"
-  if ! printf '%s' "$PR" | grep -Eq '^[0-9]+$'; then
+  if ! printf '%s' "$PR" | grep -Eq '^[1-9][0-9]*$'; then
     jq -cn '{ok:false,error:"check requires a PR number"}'
     exit 2
   fi
@@ -1146,7 +1191,7 @@ if [ "$COMMAND" = "claim" ]; then
       '{ok:false,error:"run id must be 1-200 chars of [A-Za-z0-9._-] — it names files under the state dir",runId:$run}'
     exit 2
   fi
-  if ! printf '%s' "$PR" | grep -Eq '^[0-9]+$'; then
+  if ! printf '%s' "$PR" | grep -Eq '^[1-9][0-9]*$'; then
     jq -cn '{ok:false,error:"claim requires a PR number"}'
     exit 2
   fi
@@ -1264,7 +1309,7 @@ if [ "$COMMAND" = "claim" ]; then
     exit 0
   fi
   PRIOR_LEASE="$(read_lease "$RUN_ID")"
-  if ! LEASE_RESULT="$(lease_acquire "$RUN_ID" "$OWNER")"; then
+  if ! LEASE_RESULT="$(lease_acquire "$RUN_ID" "$OWNER" "$PR")"; then
     printf '%s\n' "$LEASE_RESULT"
     lease_lifecycle_end
     exit 0
@@ -1364,7 +1409,19 @@ if [ "$COMMAND" = "lease-claim" ] || [ "$COMMAND" = "lease-renew" ] ||
   fi
 
   if [ "$COMMAND" = "lease-claim" ]; then
-    lease_acquire "$RUN_ID" "$OWNER"
+    LEASE_PR="${4:-}"
+    if ! printf '%s' "$LEASE_PR" | grep -Eq '^[1-9][0-9]*$'; then
+      EXISTING_LEASE="$(read_lease "$RUN_ID")"
+      if [ "$(lease_is_malformed "$EXISTING_LEASE")" != true ] && [ "$EXISTING_LEASE" != null ] &&
+         [ "$(jq -r '.owner // empty' <<<"$EXISTING_LEASE")" = "$OWNER" ]; then
+        LEASE_PR="$(jq -r '.pr' <<<"$EXISTING_LEASE")"
+      else
+        jq -cn --arg run "$RUN_ID" \
+          '{ok:false,error:"lease-claim requires the PR number for a new shared run id; use lease-claim <run-id> <owner-token> <pr>",runId:$run}'
+        exit 2
+      fi
+    fi
+    lease_acquire "$RUN_ID" "$OWNER" "$LEASE_PR"
     exit 0
   fi
 
@@ -2725,19 +2782,46 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
     emit_poll_lease_failure "$(jq -cn --argjson authority "$PRIOR_AUTHORITY" '{ok:false,error:"another live coordinator owns this PR",leaseOwner:$authority.owner,activeRunId:$authority.runId}')"
     exit 0
   fi
-  if ! LEASE_RESULT="$(lease_acquire "$RUN_ID" "$OWNER_TOKEN")"; then
+  PRIOR_LEASE="$(read_lease "$RUN_ID")"
+  if ! LEASE_RESULT="$(lease_acquire "$RUN_ID" "$OWNER_TOKEN" "$W_PR")"; then
     lease_lifecycle_end
     emit_poll_lease_failure "$LEASE_RESULT"
     exit 0
   fi
   if ! bind_pr_authority "$W_PR" "$RUN_ID" "$OWNER_TOKEN"; then
-    rm -f "$(lease_file "$RUN_ID")" 2>/dev/null || true
+    ACQUIRED_LEASE="$(jq -c '.lease' <<<"$LEASE_RESULT")"
+    FAILED_AUTHORITY="$(read_pr_authority "$W_PR")"
     lease_lifecycle_end
-    emit_poll_lease_failure '{"ok":false,"error":"could not write shared PR authority"}'
+    BIND_FAILURE='{"ok":false,"error":"could not write shared PR authority"}'
+    if rollback_poll_ownership "$W_PR" "$RUN_ID" "$OWNER_TOKEN" "$PRIOR_LEASE" "$PRIOR_AUTHORITY" "$ACQUIRED_LEASE" "$FAILED_AUTHORITY"; then
+      emit_poll_lease_failure "$BIND_FAILURE"
+    else
+      emit_poll_lease_failure "$(jq -c --arg owner "$OWNER_TOKEN" \
+        '.retryable=false | .error=(.error + "; automatic ownership rollback failed") | .coordinatorOwnerToken=$owner' <<<"$BIND_FAILURE")"
+    fi
     exit 0
   fi
+  ACQUIRED_LEASE="$(jq -c '.lease' <<<"$LEASE_RESULT")"
+  ACQUIRED_AUTHORITY="$(read_pr_authority "$W_PR")"
+  # Deterministic regression seam for the narrow post-bind/pre-fence window.
+  # Production wrappers never set it.
+  if [ -n "${SMOKE_GATE_SHARED_ROOT+x}" ] && [ "$SMOKE_GATE_SHARED_ROOT" != /workspace/workgroup ] &&
+     printf '%s' "${SMOKE_GATE_TEST_HOLD_RUN_LOCK_AFTER_BIND_SECONDS:-}" | grep -Eq '^[0-9]+([.][0-9]+)?$'; then
+    TEST_LOCK_READY="$TMP_DIR/test-run-lock-ready"
+    ( flock -x 7
+      : >"$TEST_LOCK_READY"
+      sleep "$SMOKE_GATE_TEST_HOLD_RUN_LOCK_AFTER_BIND_SECONDS"
+    ) 7>"$(lease_lock_file "$RUN_ID")" &
+    for _wait in $(seq 1 100); do [ -e "$TEST_LOCK_READY" ] && break; sleep 0.01; done
+  fi
   if ! lease_fence_begin "$W_PR" "$RUN_ID" "$OWNER_TOKEN" "poll" >"$LEASE_ERROR_FILE"; then
-    emit_poll_lease_failure "$(cat "$LEASE_ERROR_FILE")"
+    LEASE_FAILURE="$(cat "$LEASE_ERROR_FILE")"
+    if rollback_poll_ownership "$W_PR" "$RUN_ID" "$OWNER_TOKEN" "$PRIOR_LEASE" "$PRIOR_AUTHORITY" "$ACQUIRED_LEASE" "$ACQUIRED_AUTHORITY"; then
+      emit_poll_lease_failure "$LEASE_FAILURE"
+    else
+      emit_poll_lease_failure "$(jq -c --arg owner "$OWNER_TOKEN" \
+        '.retryable=false | .error=(.error + "; automatic ownership rollback failed") | .coordinatorOwnerToken=$owner' <<<"$LEASE_FAILURE")"
+    fi
     exit 0
   fi
   NOW="$(iso_now)"
@@ -2751,11 +2835,14 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
      .challengerDeadline=$dl |
      .challengerDisposition=null | .challengerTimedOutAt=null | .finishIntent=null' <<<"$STATE")"
   if ! write_pr_state "$W_PR" "$STATE"; then
-    lease_remove_fenced "$RUN_ID" || true
-    if [ "$PRIOR_AUTHORITY" = null ]; then rm -f "$(pr_authority_file "$W_PR")" 2>/dev/null || true
-    else write_pr_authority "$W_PR" "$PRIOR_AUTHORITY" || true; fi
     lease_fence_end
-    emit_poll_lease_failure '{"ok":false,"error":"could not persist the claimed coordinator slot"}'
+    SLOT_FAILURE='{"ok":false,"error":"could not persist the claimed coordinator slot"}'
+    if rollback_poll_ownership "$W_PR" "$RUN_ID" "$OWNER_TOKEN" "$PRIOR_LEASE" "$PRIOR_AUTHORITY" "$ACQUIRED_LEASE" "$ACQUIRED_AUTHORITY"; then
+      emit_poll_lease_failure "$SLOT_FAILURE"
+    else
+      emit_poll_lease_failure "$(jq -c --arg owner "$OWNER_TOKEN" \
+        '.retryable=false | .error=(.error + "; automatic ownership rollback failed") | .coordinatorOwnerToken=$owner' <<<"$SLOT_FAILURE")"
+    fi
     exit 0
   fi
   lease_fence_end

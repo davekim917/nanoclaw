@@ -34,7 +34,7 @@ gate_owns() {
   expires="$(date -u -d '@'$(( $(date -u +%s) + 3600 )) +'%Y-%m-%dT%H:%M:%SZ')"
   printf '{"schemaVersion":1,"pr":5,"activeRunId":"%s","activeSha":"%s","activeLeaseOwner":"%s"}\n' \
     "$run" "$active_sha" "$owner" > "$GATE_STATE/pr-5-state.json"
-  printf '{"schemaVersion":1,"owner":"%s","claimedAt":"%s","renewedAt":"%s","expiresAt":"%s"}\n' \
+  printf '{"schemaVersion":1,"pr":5,"owner":"%s","claimedAt":"%s","renewedAt":"%s","expiresAt":"%s"}\n' \
     "$owner" "$now" "$now" "$expires" > "$SMOKE_GATE_LEASE_DIR/lease-$run.json"
   printf '{"schemaVersion":1,"pr":5,"runId":"%s","owner":"%s","boundAt":"%s"}\n' \
     "$run" "$owner" "$now" > "$SMOKE_GATE_LEASE_DIR/pr-5-authority.json"
@@ -76,6 +76,15 @@ SMOKE_CONTRACT_EXTRA="{\"sourceSha\":\"$OTHER_SHA\",\"requiredLaneMarkers\":[]}"
   scaffold contract "$FIXTURE_DIR" "$SHA" B1:browser S1:source --regenerate >/dev/null
 jq -e --arg sha "$SHA" '.sourceSha == $sha and (.requiredLaneMarkers | length == 2)' \
   "$FIXTURE_DIR/completion-contract.json" >/dev/null
+
+# Valid JSON with an invalid UTC timestamp is not a usable shared lease.
+jq '.expiresAt="not-a-timestamp"' "$SMOKE_GATE_LEASE_DIR/lease-$(basename "$FIXTURE_DIR").json" \
+  > "$SMOKE_GATE_LEASE_DIR/.bad-time"
+mv "$SMOKE_GATE_LEASE_DIR/.bad-time" "$SMOKE_GATE_LEASE_DIR/lease-$(basename "$FIXTURE_DIR").json"
+OUT="$(scaffold marker "$FIXTURE_DIR" B1 fail bad-time 2>&1 || true)"
+jq -e '.ok == false and (.error | test("missing or malformed|invalid UTC timestamp"))' <<<"$OUT" >/dev/null
+[ ! -e "$FIXTURE_DIR/markers/B1.json" ]
+gate_owns "$(basename "$FIXTURE_DIR")"
 
 if barrier "$FIXTURE_DIR" lanes >/dev/null 2>&1; then
   echo "expected missing markers to block the lanes phase" >&2

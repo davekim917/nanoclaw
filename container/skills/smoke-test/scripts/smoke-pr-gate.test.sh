@@ -1175,10 +1175,42 @@ jq -e '.runId == "run-pr-b" and .owner == "owner-b"' "$PR_COMMON_LEASE/pr-119-au
 SMOKE_GATE_STATE_DIR="$PR_STATE_B" SMOKE_GATE_LEASE_DIR="$PR_COMMON_LEASE" \
   bash "$GATE" release run-pr-b owner-b | jq -e '.ok == true' >/dev/null
 
+# A run id is shared authority too: the same token cannot bind one live run id
+# to different PRs merely because their private state roots cannot see each other.
+RUN_STATE_A="$PR_BASE/run-state-a" RUN_STATE_B="$PR_BASE/run-state-b"
+mkdir -p "$RUN_STATE_A" "$RUN_STATE_B"
+SMOKE_GATE_STATE_DIR="$RUN_STATE_A" SMOKE_GATE_LEASE_DIR="$PR_COMMON_LEASE" \
+  bash "$GATE" claim run-cross-pr 130 "$PR_BIND_SHA" shared-owner | jq -e '.ok == true' >/dev/null
+RUN_COLLISION="$(SMOKE_GATE_STATE_DIR="$RUN_STATE_B" SMOKE_GATE_LEASE_DIR="$PR_COMMON_LEASE" \
+  bash "$GATE" claim run-cross-pr 131 "$PR_BIND_SHA" shared-owner || true)"
+jq -e '.ok == false and .leasePr == 130 and .requestedPr == 131 and (.error | test("permanently bound"))' <<<"$RUN_COLLISION" >/dev/null
+jq -e '.pr == 130 and .owner == "shared-owner"' "$PR_COMMON_LEASE/lease-run-cross-pr.json" >/dev/null
+[ ! -e "$PR_COMMON_LEASE/pr-131-authority.json" ] && [ ! -e "$RUN_STATE_B/pr-131-state.json" ]
+SMOKE_GATE_STATE_DIR="$RUN_STATE_A" SMOKE_GATE_LEASE_DIR="$PR_COMMON_LEASE" \
+  bash "$GATE" release run-cross-pr shared-owner | jq -e '.ok == true' >/dev/null
+
+# Expiry permits a successor owner for the same PR, but never reassigns a run
+# id to another PR and strands the original PR's authority pointer.
+EXPIRED_PR_LEASE="$TEST_SHARED_ROOT/expired-cross-pr/leases"
+SMOKE_GATE_STATE_DIR="$RUN_STATE_A" SMOKE_GATE_LEASE_DIR="$EXPIRED_PR_LEASE" SMOKE_GATE_LEASE_TTL_SECONDS=2 \
+  bash "$GATE" claim run-expired-cross-pr 133 "$PR_BIND_SHA" owner-a | jq -e '.ok == true' >/dev/null
+sleep 3
+RUN_COLLISION="$(SMOKE_GATE_STATE_DIR="$RUN_STATE_B" SMOKE_GATE_LEASE_DIR="$EXPIRED_PR_LEASE" SMOKE_GATE_LEASE_TTL_SECONDS=30 \
+  bash "$GATE" claim run-expired-cross-pr 134 "$PR_BIND_SHA" owner-b || true)"
+jq -e '.ok == false and .leasePr == 133 and .requestedPr == 134 and (.error | test("permanently bound"))' <<<"$RUN_COLLISION" >/dev/null
+jq -e '.pr == 133 and .runId == "run-expired-cross-pr" and .owner == "owner-a"' \
+  "$EXPIRED_PR_LEASE/pr-133-authority.json" >/dev/null
+[ ! -e "$EXPIRED_PR_LEASE/pr-134-authority.json" ] && [ ! -e "$RUN_STATE_B/pr-134-state.json" ]
+# Same-PR recovery under a successor is still allowed after expiry.
+SMOKE_GATE_STATE_DIR="$RUN_STATE_A" SMOKE_GATE_LEASE_DIR="$EXPIRED_PR_LEASE" SMOKE_GATE_LEASE_TTL_SECONDS=30 \
+  bash "$GATE" claim run-expired-cross-pr 133 "$PR_BIND_SHA" owner-b | jq -e '.ok == true and .lease.pr == 133 and .lease.owner == "owner-b"' >/dev/null
+SMOKE_GATE_STATE_DIR="$RUN_STATE_A" SMOKE_GATE_LEASE_DIR="$EXPIRED_PR_LEASE" \
+  bash "$GATE" release run-expired-cross-pr owner-b | jq -e '.ok == true' >/dev/null
+
 # --- 28. stale owner A cannot act after B reclaims through another state root
 fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
-  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base SMOKE_GATE_LEASE_TTL_SECONDS=1
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base SMOKE_GATE_LEASE_TTL_SECONDS=2
 STALE_BASE="$STATE_DIR"
 STATE_A="$STALE_BASE/private-a" STATE_B="$STALE_BASE/private-b"
 mkdir -p "$STATE_A" "$STATE_B"
@@ -1191,7 +1223,7 @@ export SMOKE_GATE_PUBLISH_FILE="$STALE_BASE/latest-verdict.json" \
   SMOKE_GATE_HANDOFF_LEDGER="$STALE_BASE/handoff-ledger.jsonl"
 SMOKE_GATE_STATE_DIR="$STATE_A" SMOKE_GATE_LEASE_DIR="$COMMON_LEASE" \
   bash "$GATE" claim run-shared-owner 120 "$STALE_SHA" owner-a | jq -e '.ok == true' >/dev/null
-sleep 2
+sleep 3
 SMOKE_GATE_STATE_DIR="$STATE_B" SMOKE_GATE_LEASE_DIR="$COMMON_LEASE" SMOKE_GATE_LEASE_TTL_SECONDS=30 \
   bash "$GATE" claim run-shared-owner 120 "$STALE_SHA" owner-b | jq -e '.ok == true' >/dev/null
 export SMOKE_GATE_LEASE_TTL_SECONDS=30
@@ -1213,10 +1245,11 @@ SMOKE_GATE_STATE_DIR="$STATE_B" SMOKE_GATE_LEASE_DIR="$COMMON_LEASE" \
 # --- 29. stale owner cannot adopt B's token from the same mutable state ------
 fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
-  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base SMOKE_GATE_LEASE_TTL_SECONDS=1
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base SMOKE_GATE_LEASE_TTL_SECONDS=2
 SAME_SHA="$(sha 6)"
-bash "$GATE" claim run-same-state 121 "$SAME_SHA" owner-a | jq -e '.ok == true' >/dev/null
-sleep 2
+SAME_CLAIM="$(bash "$GATE" claim run-same-state 121 "$SAME_SHA" owner-a || true)"
+jq -e '.ok == true' <<<"$SAME_CLAIM" >/dev/null || { echo "initial same-state claim failed: $SAME_CLAIM" >&2; exit 1; }
+sleep 3
 SMOKE_GATE_LEASE_TTL_SECONDS=30 bash "$GATE" claim run-same-state 121 "$SAME_SHA" owner-b | jq -e '.ok == true' >/dev/null
 export SMOKE_GATE_LEASE_TTL_SECONDS=30
 for verb in progress release; do
@@ -1239,17 +1272,33 @@ bash "$GATE" release run-same-state owner-b | jq -e '.ok == true and .leaseRelea
 # same-run claim using the original token, never reviving an expired lease.
 fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
-  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base SMOKE_GATE_LEASE_TTL_SECONDS=1
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base SMOKE_GATE_LEASE_TTL_SECONDS=2
 EXPIRED_SHA="$(sha b)"
 bash "$GATE" claim run-expired-owner 127 "$EXPIRED_SHA" owner-a | jq -e '.ok == true' >/dev/null
-sleep 2
+sleep 3
 for lease_verb in lease-renew lease-release; do
   OUT="$(bash "$GATE" "$lease_verb" run-expired-owner owner-a || true)"
   jq -e '.ok == false and (.error | test("expired")) and (.error | test("recover with claim"))' <<<"$OUT" >/dev/null
   [ -s "$SMOKE_GATE_LEASE_DIR/lease-run-expired-owner.json" ]
 done
 SMOKE_GATE_LEASE_TTL_SECONDS=30 bash "$GATE" claim run-expired-owner 127 "$EXPIRED_SHA" owner-a | jq -e '.ok == true' >/dev/null
+jq -e '.pr == 127 and .runId == "run-expired-owner" and .owner == "owner-a"' "$SMOKE_GATE_LEASE_DIR/pr-127-authority.json" >/dev/null
 bash "$GATE" release run-expired-owner owner-a | jq -e '.ok == true' >/dev/null
+
+# Standalone lease-claim requires a PR for a new run id, while a same-owner
+# renewal may infer and preserve the PR already bound into a valid live lease.
+OUT="$(bash "$GATE" lease-claim run-standalone-new owner-a || true)"
+jq -e '.ok == false and (.error | test("requires the PR number"))' <<<"$OUT" >/dev/null
+for bad_pr in 0 007; do
+  OUT="$(bash "$GATE" claim "run-bad-pr-$bad_pr" "$bad_pr" "$EXPIRED_SHA" owner-a || true)"
+  jq -e '.ok == false and (.error | test("requires a PR number"))' <<<"$OUT" >/dev/null
+  [ ! -e "$SMOKE_GATE_LEASE_DIR/lease-run-bad-pr-$bad_pr.json" ]
+done
+bash "$GATE" claim run-standalone-bound 132 "$EXPIRED_SHA" owner-a | jq -e '.ok == true' >/dev/null
+STANDALONE_AUTH="$(cat "$SMOKE_GATE_LEASE_DIR/pr-132-authority.json")"
+bash "$GATE" lease-claim run-standalone-bound owner-a | jq -e '.ok == true and .lease.pr == 132' >/dev/null
+[ "$(cat "$SMOKE_GATE_LEASE_DIR/pr-132-authority.json")" = "$STANDALONE_AUTH" ]
+bash "$GATE" release run-standalone-bound owner-a | jq -e '.ok == true' >/dev/null
 
 # --- 30. malformed and non-shared lease storage fail closed -----------------
 fresh_state
@@ -1263,6 +1312,16 @@ jq -e '.ok == false and (.error | test("malformed"))' <<<"$BAD" >/dev/null
 BAD="$(bash "$GATE" claim run-malformed 122 "$BAD_SHA" owner-a 2>/dev/null || true)"
 jq -e '.ok == false and (.error | test("malformed"))' <<<"$BAD" >/dev/null
 grep -q '^{' "$SMOKE_GATE_LEASE_DIR/lease-run-malformed.json"
+# Syntactically valid JSON with an unparsable UTC timestamp is malformed too;
+# it may not be treated as an expired lease available for overwrite.
+printf '{"schemaVersion":1,"pr":122,"owner":"owner-a","claimedAt":"2026-09-07T00:00:00Z","renewedAt":"2026-09-07T00:00:00Z","expiresAt":"not-a-timestamp"}\n' \
+  > "$SMOKE_GATE_LEASE_DIR/lease-run-bad-time.json"
+BAD_TIME_BEFORE="$(cat "$SMOKE_GATE_LEASE_DIR/lease-run-bad-time.json")"
+BAD="$(bash "$GATE" lease-status run-bad-time 2>/dev/null || true)"
+jq -e '.ok == false and (.error | test("malformed"))' <<<"$BAD" >/dev/null
+BAD="$(bash "$GATE" claim run-bad-time 122 "$BAD_SHA" owner-b 2>/dev/null || true)"
+jq -e '.ok == false and (.error | test("malformed"))' <<<"$BAD" >/dev/null
+[ "$(cat "$SMOKE_GATE_LEASE_DIR/lease-run-bad-time.json")" = "$BAD_TIME_BEFORE" ]
 MISSING_ROOT="$STATE_DIR/no-such-shared-root"
 BAD="$(SMOKE_GATE_SHARED_ROOT="$MISSING_ROOT" SMOKE_GATE_LEASE_DIR="$MISSING_ROOT/leases" \
   bash "$GATE" claim run-missing 123 "$BAD_SHA" owner-a 2>/dev/null || true)"
@@ -1322,6 +1381,21 @@ for expected in true false; do
   jq -e --argjson expected "$expected" \
     '.ok == false and .wakeAgent == $expected and .data.trigger == "coordinator_lease_unavailable"' <<<"$OUT" >/dev/null
 done
+# Force the post-bind fence to miss once. Poll must restore the pre-claim
+# absence instead of leaving a live owner token that no wake ever delivered.
+ROLLBACK_POLL="$(SMOKE_GATE_LOCK_WAIT_SECONDS=1 \
+  SMOKE_GATE_TEST_HOLD_RUN_LOCK_AFTER_BIND_SECONDS=1.5 bash "$GATE" poll)"
+jq -e '.wakeAgent == false and .data.trigger == "coordinator_lease_unavailable"' <<<"$ROLLBACK_POLL" >/dev/null
+[ ! -e "$SMOKE_GATE_LEASE_DIR/pr-126-authority.json" ]
+[ "$(find "$SMOKE_GATE_LEASE_DIR" -maxdepth 1 -name 'lease-smoke-pr126-*.json' -type f | wc -l)" -eq 0 ]
+# Readiness/debounce history may already exist, but no coordinator slot may.
+jq -e '.activeRunId == null and .activeLeaseOwner == null' "$STATE_DIR/pr-126-state.json" >/dev/null
+# With the transient lock gone, the next poll claims and delivers its token.
+NEXT_POLL="$(bash "$GATE" poll || true)"
+jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled" and (.data.coordinatorOwnerToken | length > 0)' <<<"$NEXT_POLL" >/dev/null || {
+  echo "poll after ownership rollback did not reacquire: $NEXT_POLL" >&2
+  exit 1
+}
 
 # --- INVARIANT 3: num_env rejects the classes it was built to stop --------
 # Mirror of the develop suite's case-53 extension. "All digits" admitted three

@@ -44,6 +44,13 @@ explicit takeover restrictions and independent review requirements intact.
   acquired token must be carried explicitly through that authorized handoff.
 - Missing, private-aliased or unwritable authority and lock/write failures
   cannot produce successful lease or terminal receipts.
+- A poll failure after acquiring ownership rolls back only its exact acquisition;
+  a successor is preserved, and rollback failure produces an attributable repair
+  receipt instead of a silent orphan.
+- All lease timestamps must be canonical, parseable UTC instants. Malformed
+  timestamps never become expired leases eligible for automatic replacement.
+- A shared run lease names its PR; identical caller tokens cannot bind the same
+  live run to different PRs. Standalone renewal preserves that association.
 - Existing gate lifecycle cases pass with explicit isolated shared lease roots;
   no test writes real workgroup lease state or invokes production effects.
 - Actual installed wrapper routes to the reviewed helper and shared lease root.

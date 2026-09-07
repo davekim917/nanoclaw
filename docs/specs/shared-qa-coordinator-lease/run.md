@@ -51,3 +51,39 @@ through separately instantiated mounted execution contexts.
 A fresh campaign must then collect attributable evidence and independent
 challenger verification. Historical evidence and existing promotion holds
 remain preserved. No campaign is certified by these implementation tests.
+
+## PR review corrections
+
+All three inline review findings received code corrections: poll acquisition
+rollback compares exact ownership snapshots under the shared locks; gate and
+scaffold validate canonical, parseable UTC lease timestamps; and a run lease
+keeps its PR binding even after expiry. New standalone claims require a
+positive canonical PR number. Existing same-owner renewal preserves its PR.
+All poll rollback failure paths retain the original owner token in a repair
+receipt; test-only lock injection refuses the default workgroup mount.
+
+A second other-family review used the configured Opus/high fallback through
+`claude -p --model 'claude-opus-5[1m]' --effort high --safe-mode
+--no-session-persistence --permission-mode plan --tools '' --strict-mcp-config
+--output-format json --json-schema <review-schema>`, foreground timeout 3600s.
+Both correction reviews completed with valid structured output. The first
+raised one migration MUST-FIX: rejected against deployment evidence because
+this PR has never been installed, the deployed helper stores private leases,
+and the new shared directories do not exist. Other grounded corrections were
+accepted in one batch.
+
+The final raw verdict was `degraded` with only SHOULD-FIX findings. Lead
+adjudication: the claimed missing rollback token contradicts the explicit
+`coordinatorOwnerToken` error receipt; no successful filesystem operation that
+silently lost its effect was reproduced. Additional fault-injection coverage
+and more explicit run-ID refusal wording are non-blocking recommendations.
+This records the reviewer output without turning its optional findings into
+new human-approval gates. Focused test results and final lead disposition are
+recorded at publication.
+
+Final correction validation: gate, scaffold and evidence-barrier suites passed;
+shell syntax and diff whitespace passed; fresh host typecheck and full
+host/scripts ESLint passed. The one-second expiry fixture was widened to two
+seconds with a three-second expiry wait after it correctly expired during
+setup; no production behavior was changed for that fixture. Lead review is
+clear: no unresolved material finding remains in the correction batch.

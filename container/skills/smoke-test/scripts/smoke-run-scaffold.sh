@@ -61,6 +61,12 @@ die() { jq -cn --arg e "$1" '{ok:false,error:$e}'; exit 2; }
 
 iso_now() { date -u +'%Y-%m-%dT%H:%M:%SZ'; }
 
+valid_utc_timestamp() {
+  local value="$1"
+  printf '%s' "$value" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' &&
+    [ "$(date -u -d "$value" +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)" = "$value" ]
+}
+
 # The contract and the lane markers are COORDINATOR-owned slots, and until now
 # nothing here had any notion of WHO was writing: a challenger-side worker on
 # the right sourceSha, writing a lane the contract had declared, passed every
@@ -157,12 +163,18 @@ begin_active_run_fence() {  # <artifact description>
   FENCED_ACTIVE_SHA="$(jq -r '.activeSha // empty' <<<"$state")"
   FENCED_OWNER="$DEFAULT_OWNER"
   lease="$(jq -c 'select(type == "object" and .schemaVersion == 1 and
+    (.pr|type == "number" and . >= 1 and . == floor) and
     (.owner|type == "string" and length > 0) and
     (.claimedAt|type == "string" and length > 0) and
     (.renewedAt|type == "string" and length > 0) and
     (.expiresAt|type == "string" and length > 0))' \
     "$LEASE_DIR/lease-$run_id.json" 2>/dev/null)" || die "shared coordinator lease is missing or malformed — refusing $description"
   [ "$(jq -r '.owner' <<<"$lease")" = "$DEFAULT_OWNER" ] || die "shared coordinator lease belongs to another owner — STOP this campaign"
+  [ "$(jq -r '.pr' <<<"$lease")" = "$pr" ] || die "shared coordinator lease belongs to another PR — STOP this campaign"
+  for timestamp_field in claimedAt renewedAt expiresAt; do
+    valid_utc_timestamp "$(jq -r --arg field "$timestamp_field" '.[$field]' <<<"$lease")" ||
+      die "shared coordinator lease has an invalid UTC timestamp — refusing $description"
+  done
   expires_epoch="$(date -u -d "$(jq -r '.expiresAt' <<<"$lease")" +%s 2>/dev/null || printf 0)"
   [ "$(date -u +%s)" -lt "$expires_epoch" ] || die "shared coordinator lease expired — STOP this campaign"
   authority="$(jq -c --argjson pr "$pr" '

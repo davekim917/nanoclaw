@@ -1563,7 +1563,9 @@ locks across preview suspension, run/PR verdict receipts, promotion hold,
 publish record, ledger append, lease removal, and the terminal state commit;
 an expired predecessor therefore cannot publish after a successor reclaims.
 One shared per-PR binding points to the current run and owner while the run
-lease remains the only TTL authority. This prevents two private state roots
+lease remains the only TTL authority. The lease also binds that run id to its
+PR, so the same owner token cannot reuse one live run id on a different PR.
+This prevents two private state roots
 from opening different live run IDs for the same PR; only an explicitly
 authorized `--takeover` may replace a live different-run binding.
 
@@ -1583,6 +1585,9 @@ different token may reclaim only after expiry; it must then regenerate the
 completion contract before writing markers. `lease-renew` and `lease-release`
 never revive or remove an expired lease. Explicit operator `--takeover`
 restrictions remain the only way to replace a still-active different run.
+The low-level compatibility verb is `lease-claim <run-id> <owner-token> <pr>`
+for a new lease. A same-owner renewal of an existing valid lease may omit the
+PR; it is inferred from the immutable lease binding and never changed.
 
 `claim` also refuses a *new* run id on a PR whose current run is still
 stamping `progress` — same PR and same frozen SHA included, which is precisely
