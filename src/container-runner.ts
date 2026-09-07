@@ -125,6 +125,13 @@ import {
   WORKGROUP_MEMORY_CONTAINER_PATH,
 } from './modules/workgroup/shared-dirs.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
+import {
+  assertWorkgroupReadAccessMountStable,
+  isDuplicateWorkgroupReadAccessMount,
+  isWorkgroupReadAccessNamespace,
+  resolveWorkgroupReadAccess,
+  workgroupReadAccessInstructions,
+} from './workgroup-read-access.js';
 import YAML from 'yaml';
 
 import { extractToolScopes, filterConfigSections, isToolEnabled } from './scoped-env.js';
@@ -4233,6 +4240,23 @@ export async function buildMounts(
   resolvedWgId?: string,
 ): Promise<VolumeMount[]> {
   const projectRoot = process.cwd();
+  // This value was reconciled under the spawn lock. It is the authority for
+  // both cross-workgroup policy and the ordinary workgroup mounts below.
+  const wgKey = resolvedWgId ?? agentGroup.workgroup_id ?? agentGroup.folder;
+  const workgroupReadAccessStartedAt = Date.now();
+  const workgroupReadAccess = await resolveWorkgroupReadAccess(wgKey);
+  // The policy chooses *which* registered roots may be offered. The existing
+  // operator allowlist remains the final host-path gate, including its blocked
+  // patterns and realpath checks. A policy grant can therefore never bypass it.
+  const validatedWorkgroupReadAccess = workgroupReadAccess
+    ? validateAdditionalMounts(workgroupReadAccess.requests, `${agentGroup.name} (workgroup read access)`).map(
+        (mount) => ({
+          ...mount,
+          workgroupReadAccess: true as const,
+        }),
+      )
+    : [];
+  logSpawnStage('workgroup-read-access', workgroupReadAccessStartedAt);
 
   // Default agent surfaces (composed project doc, skill links, provider state
   // dir) apply unless the provider's registration declares it provides its
@@ -4266,11 +4290,18 @@ export async function buildMounts(
     // Compose CLAUDE.md fresh every spawn from the shared base, enabled skill
     // fragments, and MCP server instructions. See `claude-md-compose.ts`.
     const claudeMdStartedAt = Date.now();
-    await composeGroupClaudeMd(agentGroup, provider);
+    await composeGroupClaudeMd(agentGroup, provider, {
+      workgroupId: wgKey,
+      workgroupReadAccessInstructions: workgroupReadAccessInstructions(
+        workgroupReadAccess,
+        validatedWorkgroupReadAccess,
+      ),
+    });
     logSpawnStage('claude-md-compose', claudeMdStartedAt);
   }
 
   const mounts: VolumeMount[] = [];
+  mounts.push(...validatedWorkgroupReadAccess);
   const sessDir = sessionDir(agentGroup.id, session.id);
   const groupDir = path.resolve(GROUPS_DIR, agentGroup.folder);
 
@@ -4314,7 +4345,6 @@ export async function buildMounts(
   // worktree and tombstone trees. Timed as one stage because it is one
   // contiguous run of sync fs calls with no natural seam.
   const workgroupMountsStartedAt = Date.now();
-  const wgKey = resolvedWgId ?? agentGroup.workgroup_id ?? agentGroup.folder;
   const repositoryWorkUnit = await resolveSessionRepositoryWorkUnit(session, wgKey);
   const worktrees = topicWorktreesDir(repositoryWorkUnit);
   fs.mkdirSync(worktrees, { recursive: true });
@@ -4692,7 +4722,23 @@ export async function buildMounts(
     const mountAllowlistStartedAt = Date.now();
     const validated = validateAdditionalMounts(containerConfig.additionalMounts, agentGroup.name);
     logSpawnStage('mount-allowlist', mountAllowlistStartedAt);
-    mounts.push(...validated);
+    for (const mount of validated) {
+      if (!workgroupReadAccess || !isWorkgroupReadAccessNamespace(mount.containerPath)) {
+        mounts.push(mount);
+        continue;
+      }
+      if (isDuplicateWorkgroupReadAccessMount(mount, validatedWorkgroupReadAccess)) {
+        log.info('Deduplicated legacy workgroup read-access mount', {
+          group: agentGroup.id,
+          hostPath: mount.hostPath,
+          containerPath: mount.containerPath,
+        });
+        continue;
+      }
+      throw new Error(
+        `Additional mount ${mount.containerPath} collides with the host-owned ${'/workspace/extra/work'} namespace; declare the workgroup grant in ${path.join(DATA_DIR, 'workgroup-read-access.json')}`,
+      );
+    }
   }
 
   // Plugin mounts: every subdir of ~/plugins is mounted RO at
@@ -6608,6 +6654,7 @@ async function buildContainerArgs(
         );
       }
     }
+    if (mount.workgroupReadAccess) assertWorkgroupReadAccessMountStable(mount);
     if (mount.readonly) {
       args.push(...readonlyMountArgs(mount.hostPath, mount.containerPath));
     } else {

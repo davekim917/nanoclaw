@@ -61,6 +61,14 @@ For an agent group whose own folder is `<x>` (e.g., `example-labs`), the workgro
 
 A `CHECK` constraint on `workgroups.id` rejects values matching the opaque `agent_groups.id` shape (`ag-<ts>-<rand>`) — this prevents future code from accidentally conflating the two ID namespaces.
 
+## Cross-workgroup read grants
+
+Workgroups remain isolated unless the host operator declares a bounded,
+read-only cross-workgroup policy. The grant is workgroup-scoped, so every
+provider sibling receives the same access at its next spawn. See
+[Cross-workgroup read access](workgroup-read-access.md) for the policy schema,
+mounted paths, activation, and rollback.
+
 ---
 
 ## Declaration model
