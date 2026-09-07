@@ -272,7 +272,22 @@ export function hasTrackedChanges(status: string): boolean {
  * about what "already merged" means.
  */
 function isAncestorOf(repoRoot: string, head: string, mainRef: string): boolean {
-  return gitTolerant(repoRoot, ['merge-base', '--is-ancestor', head, mainRef]) !== null;
+  try {
+    execFileSync('git', ['merge-base', '--is-ancestor', head, mainRef], {
+      cwd: repoRoot,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return true;
+  } catch (err) {
+    // Exit 1 is the ANSWER "not an ancestor". Anything else — an unknown
+    // object, a corrupt repo, git missing — is a failed probe, and reporting
+    // that as `unmerged` would put a confident wrong label on it. Both refuse,
+    // so nothing unsafe follows either way; the difference is whether the
+    // report tells the truth about why.
+    if ((err as { status?: number }).status === 1) return false;
+    throw new ProbeError(['merge-base', '--is-ancestor', head, mainRef]);
+  }
 }
 
 export function assess(

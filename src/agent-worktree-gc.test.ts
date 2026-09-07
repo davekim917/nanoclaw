@@ -204,9 +204,13 @@ describe('assess', () => {
   // (This assertion used to expect 'eligible'; that encoded the bug a round-5
   // review caught, not the intended contract.)
   it('does not prune an orphaned registration it cannot prove is merged', () => {
+    // `repo` here is a path with no git repository, so the ancestry probe does
+    // not answer "not an ancestor" — it fails outright, which is now reported
+    // as such rather than mislabelled `unmerged`. Either way it refuses; the
+    // real-git case asserting `unmerged` with the "only reference" detail is
+    // covered below.
     const a = assess(row({ missing: true }), repo, { procRoot: noProc });
-    expect(a.verdict).toBe('unmerged');
-    expect(a.detail).toMatch(/only reference/);
+    expect(a.verdict).toBe('probe-failed');
   });
 
   // A lock is a deliberate instruction and outranks the shortcut for a missing
@@ -244,6 +248,27 @@ describe('assess', () => {
     });
     expect(a.verdict).toBe('unmerged');
     expect(a.detail).toMatch(/only reference/);
+  });
+
+  // "not an ancestor" and "the probe broke" both refuse, so nothing unsafe
+  // follows either way — but labelling a broken probe `unmerged` is a
+  // confident wrong answer, and the report's labels are now the product.
+  it('labels a broken ancestry probe probe-failed, not unmerged', () => {
+    const r = tmp();
+    const g = (...args: string[]) => execFileSync('git', args, { cwd: r, stdio: 'ignore' });
+    g('init', '-q', '-b', 'main');
+    g('config', 'user.email', 't@t');
+    g('config', 'user.name', 't');
+    fs.writeFileSync(path.join(r, 'f'), 'x');
+    g('add', 'f');
+    g('commit', '-qm', 'one');
+    // A head git has never heard of: not "not an ancestor", but unresolvable.
+    const a = assess({ path: '/gone', head: 'f'.repeat(40), branch: null, missing: true, locked: false }, r, {
+      mainRef: 'main',
+      procRoot: tmp(),
+      openPrBranches: new Set(),
+    });
+    expect(a.verdict).toBe('probe-failed');
   });
 
   it('still prunes a missing registration whose HEAD is merged', () => {
