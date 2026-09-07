@@ -43,13 +43,29 @@ fail() { echo "fd-watchdog: $1" >&2; exit 1; }
 
 docker inspect "$CONTAINER" >/dev/null 2>&1 || fail "container '$CONTAINER' not found"
 
+# EVERY measurement below is captured with `if ! VAR=$(...)`, never as a bare
+# `VAR=$(...)` assignment. Under `set -e` a bare assignment is not a tested
+# context: a nonzero exit from the command (or, under pipefail, from any stage)
+# kills the script AT THAT LINE, before the `|| fail` guard on the next line can
+# run. The guards then read as protection while being dead code on exactly the
+# paths they were written for — a failed measurement exiting silently instead of
+# saying why, which is the failure this script exists to prevent.
+
 # The gateway is a child of the container's entrypoint, not PID 1 — measure the
-# process that actually holds the sockets.
-GW_PID="$(docker top "$CONTAINER" 2>/dev/null | awk '/onecli-gateway/{print $2; exit}')"
+# process that actually holds the sockets. Match the command field rather than
+# the whole row, so a wrapper whose args merely mention the binary cannot be
+# selected instead.
+if ! GW_PID="$(docker top "$CONTAINER" 2>/dev/null | awk '$8=="onecli-gateway"{print $2; exit}')"; then
+  fail "could not list processes in '$CONTAINER' (container stopped or restarting?)"
+fi
 [ -n "$GW_PID" ] || fail "onecli-gateway process not running inside '$CONTAINER'"
 
-FDS="$(ls "/proc/$GW_PID/fd" 2>/dev/null | wc -l)"
-SOFT="$(awk '/Max open files/{print $4}' "/proc/$GW_PID/limits" 2>/dev/null)"
+if ! FDS="$(ls "/proc/$GW_PID/fd" 2>/dev/null | wc -l)"; then
+  fail "could not read open fds for pid $GW_PID (process gone?)"
+fi
+if ! SOFT="$(awk '/Max open files/{print $4}' "/proc/$GW_PID/limits" 2>/dev/null)"; then
+  fail "could not read limits for pid $GW_PID (process gone since it was found?)"
+fi
 
 # A zero/absent reading means the instrument failed (permissions, race), NOT a
 # healthy gateway. Never let a failed measurement read as an all-clear.
@@ -59,8 +75,14 @@ SOFT="$(awk '/Max open files/{print $4}' "/proc/$GW_PID/limits" 2>/dev/null)"
 PCT=$(( FDS * 100 / SOFT ))
 
 # Leak signature, for the log: sockets the app holds but will never use again.
-NS_PID="$(docker inspect "$CONTAINER" --format '{{.State.Pid}}')"
-STUCK="$(nsenter -t "$NS_PID" -n ss -tan 2>/dev/null | awk '$1=="FIN-WAIT-2"||$1=="CLOSE-WAIT"' | wc -l || echo 0)"
+# Reported as '?' rather than 0 when it cannot be measured — a failed count and
+# a genuine zero must not print the same thing, for the same reason as above.
+if ! NS_PID="$(docker inspect "$CONTAINER" --format '{{.State.Pid}}' 2>/dev/null)"; then
+  fail "could not read the container pid for '$CONTAINER'"
+fi
+if ! STUCK="$(nsenter -t "$NS_PID" -n ss -tan 2>/dev/null | awk '$1=="FIN-WAIT-2"||$1=="CLOSE-WAIT"' | wc -l)"; then
+  STUCK='?'
+fi
 
 echo "fd-watchdog: pid=$GW_PID fds=$FDS/$SOFT (${PCT}%) unreclaimable_sockets=$STUCK threshold=${RESTART_PCT}%"
 
@@ -78,8 +100,10 @@ echo "fd-watchdog: at/above ${RESTART_PCT}% — restarting '$CONTAINER' before r
 docker restart "$CONTAINER" >/dev/null
 sleep 10
 
-NEW_PID="$(docker top "$CONTAINER" 2>/dev/null | awk '/onecli-gateway/{print $2; exit}')"
-NEW_FDS="$(ls "/proc/$NEW_PID/fd" 2>/dev/null | wc -l || echo '?')"
+NEW_PID="$(docker top "$CONTAINER" 2>/dev/null | awk '$8=="onecli-gateway"{print $2; exit}')" || NEW_PID=''
+# `wc -l` exits 0 on a failed `ls`, so a `|| echo '?'` here would be dead code —
+# test for the pid instead.
+if [ -n "$NEW_PID" ] && NEW_FDS="$(ls "/proc/$NEW_PID/fd" 2>/dev/null | wc -l)"; then :; else NEW_FDS='?'; fi
 echo "fd-watchdog: restarted; fds now $NEW_FDS/$SOFT"
 
 # Tell an owner. A silent auto-restart would hide how fast the leak is growing.
@@ -102,18 +126,25 @@ fi
 
 NOTIFICATION="System notification (OneCLI fd watchdog): the gateway reached ${PCT}% of its ${SOFT}-fd limit (${STUCK} sockets held but unreclaimable) and was restarted automatically — credentialed calls would have started failing with \`resolution_failed\` shortly. Root cause is the upstream leak in onecli/onecli#484, still open; this watchdog is containment, not a fix."
 
-python3 <<EOF
-import json, socket, time
+# Pass values through the environment and read them with os.environ inside a
+# QUOTED heredoc, matching scripts/health-sentinel.sh:376-390. An unquoted
+# heredoc substitutes them into Python source text, so a future edit to the
+# message template that introduces a quote or backslash would break the script
+# rather than the string. Same protocol, the version that cannot be broken by
+# editing the text.
+export NOTIFICATION ADMIN_DM_CHANNEL_TYPE ADMIN_DM_PLATFORM_ID CLI_SOCK
+python3 <<'EOF'
+import json, os, socket, time
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-sock.connect("$CLI_SOCK")
+sock.connect(os.environ["CLI_SOCK"])
 payload = json.dumps({
-    "text": """$NOTIFICATION""",
+    "text": os.environ["NOTIFICATION"],
     "senderId": "system:onecli-fd-watchdog",
     "sender": "OneCLI FD Watchdog",
     "to": {
-        "channelType": "$ADMIN_DM_CHANNEL_TYPE",
-        "platformId": "$ADMIN_DM_PLATFORM_ID",
-        "threadId": "$ADMIN_DM_PLATFORM_ID",
+        "channelType": os.environ["ADMIN_DM_CHANNEL_TYPE"],
+        "platformId": os.environ["ADMIN_DM_PLATFORM_ID"],
+        "threadId": os.environ["ADMIN_DM_PLATFORM_ID"],
     },
 }) + "\n"
 sock.sendall(payload.encode("utf-8"))
