@@ -1,3 +1,15 @@
+# ⚠️ STOP — READ THIS FIRST IF YOU ARE CLAUDE ⚠️
+
+**A `git pull`/`merge` from upstream that produces conflicts or a large diff touching this file → HALT.** NanoClaw v2 is a ground-up rewrite with breaking changes throughout; it cannot be merged into a v1 install by hand. Resolving conflicts or running builds corrupts the install.
+
+1. `git merge --abort` (or `git reset --hard ORIG_HEAD` if the merge already completed).
+2. Tell the user, verbatim: *"This is the v2 rewrite — it can't be merged into your existing install. Exit Claude Code (or open a separate terminal) and run `bash migrate-v2.sh` from the shell."*
+3. Wait for confirmation. Don't run the migration script yourself — it needs an interactive terminal, not Claude Code.
+
+Fresh install (`git clone`, no conflicts) → ignore this banner, continue below.
+
+---
+
 # NanoClaw
 
 Personal AI assistant. See [README.md](README.md) for philosophy and setup. Architecture lives in `docs/`.
