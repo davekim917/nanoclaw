@@ -33,20 +33,6 @@ export interface RunnerConfig {
    * surfacing a dead-end error to the user.
    */
   providerFallback?: { provider: string; model?: string; effort?: string };
-
-  /**
-   * True when the host routed this spawn onto the declared provider fallback
-   * (NANOCLAW_PROVIDER_OVERRIDE names a provider other than container.json's).
-   *
-   * Load-bearing for providers whose sticky config is dropped on a fallback:
-   * `providerConfig` is emptied below because it describes the PRIMARY
-   * provider, so `model`/`effort` are the only carrier of the fallback's own
-   * declaration. A provider may fold them into its sticky config ONLY when
-   * this flag is set — on the primary path those same two fields carry the
-   * group's own container.json values, and folding them in there would give
-   * them a second, higher-precedence route than the host's spawn env.
-   */
-  onFallback: boolean;
 }
 
 const DEFAULT_MAX_MESSAGES = 10;
@@ -144,7 +130,6 @@ export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
       (onFallback ? undefined : configuredProviderEffort || configuredEffort) ||
       undefined,
     providerFallback: declaredFallback || undefined,
-    onFallback,
   };
 }
 

@@ -317,7 +317,6 @@ async function main(): Promise<void> {
     providerConfig: config.providerConfig,
     model: config.model,
     effort: config.effort,
-    onFallback: config.onFallback,
   });
   provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
 

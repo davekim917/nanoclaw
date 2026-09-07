@@ -57,69 +57,6 @@ export const claudeConfigSchema = z.strictObject({
   effort: z.enum(CLAUDE_EFFORT_LEVELS).optional(),
 });
 
-/**
- * A claude model id the SDK can actually resolve: a concrete `claude-*` id
- * (with or without the `[1m]` context suffix) or one of the family aliases the
- * ANTHROPIC_DEFAULT_<FAMILY>_MODEL envs resolve.
- *
- * MUST stay in sync with `VALID_MODEL_RE` in `src/flag-parser.ts` — the host
- * is a separate Node package and nothing is importable across the boundary.
- * `claude.fallbackConfig.test.ts` parses that regex out of the host source and
- * fails on drift, comparing FLAGS as well as source: an `/i` here while the
- * host stays case-sensitive is a real divergence, not a formatting one.
- * `CLAUDE-OPUS-5[1M]` would then be refused by the host vocabulary and
- * accepted into stickyConfig here, forwarded verbatim as the API model.
- *
- * A LOOSER shape here than the host's is not a harmless mismatch. This guards
- * operator-declared `providerFallback.model`, and whatever survives is folded
- * into `stickyConfig`, which outranks the safe `opus` alias in `query()`. An
- * earlier `claude-[a-z0-9.-]+` accepted a claude-SHAPED typo like
- * `claude-opus-bogus`, which the host vocabulary rejects: every fallback turn
- * then targeted a nonexistent model instead of degrading to the family
- * default. Per-family shapes, not a wildcard.
- */
-export const CLAUDE_MODEL_RE =
-  /^(?:opus|sonnet|haiku|default|claude-opus-\d+(?:-\d+)?(?:\[\dm\])?|claude-haiku-\d+-\d+(?:-\d+)?(?:\[\dm\])?|claude-sonnet-\d+(?:\[\dm\])?|claude-fable-\d+(?:-\d+)?(?:\[\dm\])?)$/;
-
-/**
- * Resolve the sticky (session-default) model/effort for a ClaudeProvider.
- *
- * On the PRIMARY path this is exactly `options.providerConfig` — a strict
- * no-op versus reading that object directly. `options.model`/`options.effort`
- * are folded in ONLY under a provider fallback, where config.ts has emptied
- * `providerConfig` (it describes the primary provider, and codex's
- * `reasoning_effort` key is a fatal boot error under this strict schema) and
- * those two fields are the only carrier of the fallback's own declaration.
- *
- * Why the gate is `onFallback` and not codex's `=== undefined` argument:
- * config.ts copies the resolved codex model/effort INTO `providerConfig` for
- * a primary codex spawn, so folding there can never introduce a new value.
- * There is no claude equivalent of that copy — on a primary claude spawn
- * `options.model`/`options.effort` carry container.json's own `model`/`effort`
- * (or `providerConfig`'s), and container.json's values already reach the turn
- * through the host's ANTHROPIC_DEFAULT_OPUS_MODEL / NANOCLAW_EFFORT_OVERRIDE
- * spawn env. Folding them into stickyConfig as well would give them a second
- * route at HIGHER precedence than that env, changing behavior for every
- * primary claude group. So the fallback gate is what keeps the primary path
- * byte-identical.
- *
- * Values are validated before folding: the schema is strict, and a
- * mis-declared fallback must log and degrade to family defaults rather than
- * throw at boot into a crash loop.
- */
-function buildClaudeStickyConfig(options: ProviderOptions): Record<string, unknown> {
-  const raw: Record<string, unknown> = { ...(options.providerConfig ?? {}) };
-  if (!options.onFallback) return raw;
-  if (raw.model === undefined && options.model !== undefined) {
-    if (CLAUDE_MODEL_RE.test(options.model)) raw.model = options.model;
-    else log(`Ignoring non-claude providerFallback model "${options.model}"`);
-  }
-  if (raw.effort === undefined && options.effort !== undefined) {
-    if ((CLAUDE_EFFORT_LEVELS as readonly string[]).includes(options.effort)) raw.effort = options.effort;
-    else log(`Ignoring unsupported providerFallback effort "${options.effort}"`);
-  }
-  return raw;
-}
 
 function log(msg: string): void {
   console.error(`[claude-provider] ${msg}`);
@@ -2125,7 +2062,7 @@ export class ClaudeProvider implements AgentProvider {
     );
     this.additionalDirectories = options.additionalDirectories;
     this.env = filterSdkEnv({ ...(options.env ?? {}), CLAUDE_CODE_AUTO_COMPACT_WINDOW });
-    this.stickyConfig = claudeConfigSchema.parse(buildClaudeStickyConfig(options));
+    this.stickyConfig = claudeConfigSchema.parse(options.providerConfig ?? {});
     this.fallbackKeys = Object.entries(this.env)
       .filter(([k, v]) => ANTHROPIC_FALLBACK_RE.test(k) && typeof v === 'string' && v.length > 0)
       .sort(([a], [b]) => {
