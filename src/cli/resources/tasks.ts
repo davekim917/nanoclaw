@@ -113,11 +113,39 @@ async function ownSession(sessionId: string, ctx: CallerContext): Promise<Scoped
   return { id: session.id, agent_group_id: session.agent_group_id };
 }
 
+/**
+ * The one place every `ncl tasks` verb resolves its targets, so the scope
+ * invariant lives here rather than in each of the eight callers.
+ *
+ * `--session` names a session by id and `--group` names the scope the operator
+ * believes they are inside; a session id that is not in that scope means the
+ * two disagree, and the command is not the one that was typed. Answering it
+ * with the session's real group — `--group A --session <a session of B>` —
+ * runs the verb against B: destructively for `cancel --all` and `delete`, as a
+ * read leak for `list`/`get`. Rejecting is the only reading that cannot be
+ * wrong, since either flag alone already expresses whichever one was meant.
+ *
+ * Agent callers never reach this check: `groupArg` pins them to their own
+ * group, so `ownSession` above has already answered "session not found" for
+ * anything outside it — deliberately refusing to confirm the id exists
+ * elsewhere. Naming both groups here is a host-caller affordance, and the host
+ * caller is unrestricted by construction, so it reveals nothing it could not
+ * already read.
+ */
 async function selectedSessions(args: Record<string, unknown>, ctx: CallerContext): Promise<ScopedSession[]> {
   const sessionId = str(args.session);
-  if (sessionId) return [await ownSession(sessionId, ctx)];
-
   const group = groupArg(args, ctx);
+  if (sessionId) {
+    const session = await ownSession(sessionId, ctx);
+    if (group && session.agent_group_id !== group) {
+      throw new Error(
+        `session ${sessionId} belongs to agent group ${session.agent_group_id}, not ${group}: ` +
+          'pass --session on its own to target that session, or --group on its own to target this group',
+      );
+    }
+    return [session];
+  }
+
   if (group) {
     // One session per live task series — the loops below already fan out across them.
     return (await findTaskSessions(group)).map((s) => ({ id: s.id, agent_group_id: s.agent_group_id }));
