@@ -1,6 +1,6 @@
 ---
 name: enable-agent-plugins
-description: Enable a ~/plugins/<name> plugin across all three container agent providers (Claude, Codex, OpenCode) with parity. Use after cloning a plugin repo into ~/plugins/ when you want its skills/commands — and, for "mode" plugins like ponytail, its always-on ruleset — available to every agent group. Default is all groups, with per-group opt-out.
+description: Enable a ~/plugins/<name> plugin across all three container agent providers (Claude, Codex, OpenCode) with parity. Use after cloning a plugin repo into ~/plugins/ when you want its skills/commands — and, for "mode" plugins that inject a standing ruleset, its always-on file — available to every agent group. Default is all groups, with per-group opt-out.
 ---
 
 # Enable Agent Plugins
@@ -32,8 +32,8 @@ Each provider reaches the plugin by its own path, all rooted at the `~/plugins` 
 | Plugin provides | Claude group | Codex group | OpenCode group |
 |---|---|---|---|
 | **Skills / commands** (`skills/<n>/SKILL.md`) | `.claude-plugin/plugin.json` + mount (`CLAUDE_PLUGINS_ROOT`) | native registration at spawn from the mount, needs `.codex-plugin/plugin.json` + `.agents/plugins/marketplace.json` | mirror → `~/.config/opencode/skill/` (no plugin loader) |
-| **Always-on ruleset** (e.g. ponytail) | plugin SessionStart hook (auto) | `~/plugins/<n>/.nanoclaw-always-on.md` → `AGENTS.md`/`CLAUDE.md` | same |
-| **Opt-out** | `excludePlugins` (drops mount) | `excludePlugins` (drops mount) + skip the ruleset | same |
+| **Always-on ruleset** (e.g. impeccable) | plugin SessionStart hook (auto) | `~/plugins/<n>/.nanoclaw-always-on.md` → `AGENTS.md`/`CLAUDE.md` | same |
+| **Opt-out** | `excludePlugins` (drops mount) | `excludePlugins` (drops mount) + skip the ruleset | `excludePlugins` skips the **ruleset only** — skills stay. The mirror is synced globally, not per group |
 
 So the only artifacts ever worth generating are: **(1)** the manifests a repo ships
 none of, and **(2)** a condensed always-on ruleset for "mode" plugins. A skills-only
@@ -47,7 +47,17 @@ next spawn, and the enabler run is just a verification pass.
    move/clone it there first: `git clone <url> ~/plugins/<name>`.
 
 2. **Run the deterministic enabler** (generates the Claude/Codex manifests if missing,
-   mirrors skills to OpenCode, and classifies the plugin):
+   re-syncs OpenCode skills, and classifies the plugin):
+
+   > **The OpenCode step is a FULL re-sync of every plugin, not a mirror of the one
+   > you named, and it has a delete pass.** Any skill directory carrying
+   > `.nanoclaw-managed` whose source plugin no longer exists under `~/plugins` is
+   > removed and does not come back — there is nothing left to re-sync it from.
+   > Before running, list what would go:
+   > `ls ~/.local/share/opencode-*/skill ~/.config/opencode/skill` and check every
+   > entry still has a live `~/plugins/<name>`. Copy anything orphaned aside first.
+   > Scoped mirrors (`~/.local/share/opencode-<group>/`) exist only for groups with
+   > their own `auth.json`; the rest share the global dir.
 
    ```bash
    pnpm exec tsx scripts/enable-agent-plugin.ts <name> --report-json
@@ -68,9 +78,10 @@ next spawn, and the enabler run is just a verification pass.
    - **Keep it tight, but NEVER condense away the plugin's own carve-outs.** If a rule
      has an exception or scope limit in the source ("only unrequested prose", "unless
      the user asks", "except at trust boundaries"), the condensed version MUST carry
-     it. Dropping ponytail's requested-explanation carve-out once turned its output cap
-     into an absolute that contradicted the Completion Protocol in the same AGENTS.md —
-     an exception IS the rule's scope, not optional detail.
+     it. A ruleset once lost its requested-explanation carve-out in transcription,
+     which turned an output cap into an absolute that contradicted the Completion
+     Protocol in the same AGENTS.md — an exception IS the rule's scope, not optional
+     detail.
    - Size is not a constraint worth distorting rules for: container Codex spawns set
      `project_doc_max_bytes=262144` (codex-app-server.ts), and nothing evicts sections
      anymore. Condense for signal, not for bytes.
@@ -83,9 +94,24 @@ next spawn, and the enabler run is just a verification pass.
    pnpm exec tsx scripts/enable-agent-plugin.ts <name>
    ```
 
-5. **Opt-out (default is all groups).** If the user wants specific groups excluded,
+5. **Per-provider opt-out (`--deny` / `--allow`).** Separate from group exclusion:
+   these mutate `~/plugins/<name>/.nanoclaw-plugin.json` (`{ "denySiblings": [...] }`),
+   read by `readPluginDenySiblings` and applied inside `discoverPortableSkills`, so a
+   plugin can be withheld from one provider while staying on the others. Use when a
+   plugin is right for Claude but wrong for Codex/OpenCode, rather than excluding
+   whole groups:
+
+   ```bash
+   pnpm exec tsx scripts/enable-agent-plugin.ts <name> --deny opencode
+   pnpm exec tsx scripts/enable-agent-plugin.ts <name> --allow opencode
+   ```
+
+6. **Group opt-out (default is all groups).** If the user wants specific groups excluded,
    re-run with `--exclude` — this writes `excludePlugins` into each group's
-   `container.json`, which drops the Claude mount AND skips the Codex/OpenCode ruleset:
+   `container.json`, which drops the Claude mount and skips the Codex/OpenCode
+   ruleset. It does **not** remove the plugin's skills from an OpenCode group:
+   `syncOpenCodePluginSkills()` takes no group argument and never reads
+   `excludePlugins`, so the XDG skill mirror is unaffected:
 
    ```bash
    pnpm exec tsx scripts/enable-agent-plugin.ts <name> --exclude <folder1>,<folder2>
@@ -94,7 +120,7 @@ next spawn, and the enabler run is just a verification pass.
    Note opt-out is per **group folder** (e.g. `main`, `main-codex`, `main-opencode` are
    three separate groups). To opt a workgroup out entirely, exclude all its siblings.
 
-6. **Build + restart.** The composer is host `src/`, so it needs a build, and running
+7. **Build + restart.** The composer is host `src/`, so it needs a build, and running
    containers only pick up new mounts/instructions on respawn:
 
    ```bash
@@ -111,7 +137,7 @@ After respawn:
   SessionStart hook fires if it has one.
 - **Codex** groups: the container registered the plugin itself at spawn — skills appear
   namespaced `<plugin>:<skill>`. Predict it without a container:
-  `bun run -e "import {planCodexPluginRegistration} from './container/agent-runner/src/codex-companion-setup.ts'; console.log(planCodexPluginRegistration('/home/ubuntu/plugins').filter(p=>p.name==='<name>'))"`
+  `bun -e "import {planCodexPluginRegistration} from './container/agent-runner/src/codex-companion-setup.ts'; console.log(planCodexPluginRegistration('/home/ubuntu/plugins').filter(p=>p.name==='<name>'))"`
   → expect `action: "register"`.
 - **OpenCode** groups: the skills appear as commands (mirrored in step 2).
 - For mode plugins, the condensed ruleset is in `groups/<folder>/AGENTS.md` — spot-check
