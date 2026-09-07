@@ -8,37 +8,14 @@ import {
 import type { ContainerConfig } from './container-config.js';
 
 /**
- * Per-model-family default effort, keyed on a RESOLVED concrete model id.
+ * The container.json fields the claude spawn branch reads.
  *
- * MUST stay in sync with `defaultEffortForModel` in
- * `container/agent-runner/src/providers/claude.ts` — the agent-runner is a
- * separate Bun package and nothing is importable across the boundary.
- * `claude-spawn-defaults.test.ts` parses that function out of the container
- * source and fails on drift, so this is a checked mirror rather than a
- * comment-only contract.
- *
- * `undefined` means the family has NO effort control at the API level (haiku),
- * which is different from "not configured": the caller emits no
- * NANOCLAW_EFFORT_OVERRIDE for it rather than emitting an empty value.
+ * `providerConfig` is deliberately NOT here. It was, briefly, so the seam
+ * could notice that `providerConfig.model` outranks the env it feeds and
+ * decline to derive an effort — but with every model-dependent decision now
+ * living where the model is chosen, the host has no reason to know it exists.
  */
-function defaultEffortForClaudeModel(model: string): string | undefined {
-  const m = model.toLowerCase();
-  if (m === 'opus' || m.startsWith('claude-opus-')) return 'high';
-  if (m === 'sonnet' || m.startsWith('claude-sonnet-')) return 'xhigh';
-  if (m.startsWith('claude-fable-')) return 'medium';
-  if (m === 'haiku' || m.startsWith('claude-haiku-')) return undefined;
-  return 'high';
-}
-
-/**
- * The container.json fields the claude spawn branch reads. `providerConfig` is
- * here for what it *prevents*, not what it contributes — see the derivation
- * gate in resolveClaudeSpawnDefaults.
- */
-export type ClaudeSpawnConfig = Pick<
-  ContainerConfig,
-  'model' | 'effort' | 'defaultModel' | 'defaultEffort' | 'providerConfig'
->;
+export type ClaudeSpawnConfig = Pick<ContainerConfig, 'model' | 'effort' | 'defaultModel' | 'defaultEffort'>;
 
 /** What the claude spawn branch will put in the container's environment. */
 export interface ClaudeSpawnDefaults {
@@ -48,12 +25,10 @@ export interface ClaudeSpawnDefaults {
    */
   model: string;
   /**
-   * True when a layer actually chose `model`, false when it fell through to
-   * the install-wide DEFAULT_OPUS_MODEL floor. Load-bearing — see the effort
-   * derivation in resolveClaudeSpawnDefaults.
+   * The operator's explicitly configured effort, or undefined to emit no
+   * NANOCLAW_EFFORT_OVERRIDE at all. Never a value this seam inferred — see
+   * the class comment.
    */
-  modelWasConfigured: boolean;
-  /** Final effort, or undefined to emit no NANOCLAW_EFFORT_OVERRIDE at all. */
   effort: string | undefined;
   /** One message per value refused, for the caller to log. */
   drops: string[];
@@ -78,36 +53,39 @@ export interface ClaudeSpawnDefaults {
  * The codex branch never had that bug; opencode reads `container_configs.effort`
  * straight from the DB (`src/providers/opencode.ts`).
  *
- * ## Why validation lives HERE and not at the call site
+ * ## What this seam may and may not decide
  *
- * Two invariants, one seam, because they are the same invariant:
+ * > The host makes NO inference about which model runs. It exports what the
+ * > operator set; every model-dependent decision belongs where the model is
+ * > chosen.
  *
- * 1. **Effort is derived from the RESOLVED model, never from the alias.** The
- *    container asks the SDK for the literal string `'opus'` on purpose — the
- *    bare alias is what forces resolution through ANTHROPIC_DEFAULT_OPUS_MODEL
- *    instead of the CLI's frozen built-in default (`claude.ts`, `rawModel`).
- *    So when nothing upstream picks an effort, the container computes
- *    `defaultEffortForModel('opus')` = `high` — correct only while the
- *    resolved model IS opus. Pin the model to Sonnet and it silently runs at
- *    `high` instead of Sonnet's `xhigh`; pin it to Haiku, which supports no
- *    effort at all, and every turn carries one. Only the host knows the
- *    resolved id, so only the host can derive the right default: when a layer
- *    chose the model, this function derives and the caller emits. When the
- *    model falls through to DEFAULT_OPUS_MODEL, the alias and the resolved id
- *    are the same family and the container's own derivation is provably
- *    identical, so nothing is emitted and the fleet baseline is unchanged.
+ * Six review rounds converged on that line, each one moving a host-side
+ * inference closer to correct instead of removing it: derive from the resolved
+ * id rather than the `opus` alias; do not derive when `providerConfig.model`
+ * outranks us; do not validate an effort against a model that lost. Every
+ * version was wrong in the same way, because the host cannot see the model the
+ * container will pick — `providerConfig.model` is parsed container-side and
+ * beats the env this seam feeds. So the inferences are gone:
  *
- * 2. **A value carried across a provider switch is not Claude vocabulary.**
- *    `ncl groups config update --provider claude` alone leaves the previous
- *    provider's `model`/`effort` in place, so the chains above can offer
- *    `gpt-5.6-sol` / `ultra`. NANOCLAW_EFFORT_OVERRIDE bypasses
- *    `claudeConfigSchema` entirely (it is read raw from `process.env` at query
- *    time), so nothing downstream would reject `ultra`. Each candidate is
- *    validated against the SAME tables the chat `-m`/`-e` parser uses
- *    (`vocabFor('claude')`), including the per-model effort-support matrix,
- *    and an invalid one is DROPPED so the next layer gets its turn — never
- *    passed through, never fatal.
- */
+ *   - **No family-default derivation.** `defaultEffortForModel` in
+ *     `container/agent-runner/src/providers/claude.ts` is the only place a
+ *     family default is chosen, and since the container reads the concrete
+ *     resolved id it gets the right argument on every path — including Haiku,
+ *     which yields `undefined` and therefore no effort at all, something no
+ *     host-side value could express.
+ *   - **No per-model effort clamp.** `clampEffortForModel`, next to it, is the
+ *     model-aware authority and clamps against the model actually picked.
+ *
+ * What remains is vocabulary only, and it needs no knowledge of which model
+ * wins: refuse a value that is not Claude's at all. That matters because
+ * `ncl groups config update --provider claude` leaves the previous provider's
+ * `model`/`effort` in place, and NANOCLAW_EFFORT_OVERRIDE bypasses
+ * `claudeConfigSchema` entirely (it is read raw from `process.env` at query
+ * time), so a codex `ultra` or a `gpt-*` id would otherwise reach the API
+ * unchallenged. Candidates are checked against the SAME tables the chat
+ * `-m`/`-e` parser uses (`vocabFor('claude')`), and an invalid one is DROPPED
+ * so the next layer gets its turn — never passed through, never fatal.
+  */
 export function resolveClaudeSpawnDefaults(
   containerConfig: ClaudeSpawnConfig,
   channel: { model?: string | null; effort?: string | null } = {},
@@ -121,7 +99,6 @@ export function resolveClaudeSpawnDefaults(
     ['container.json defaultModel', containerConfig.defaultModel],
   ];
   let model = DEFAULT_OPUS_MODEL;
-  let modelWasConfigured = false;
   for (const [layer, raw] of modelLayers) {
     if (!raw) continue;
     const resolved = resolveEffectiveModel(raw);
@@ -130,7 +107,6 @@ export function resolveClaudeSpawnDefaults(
       continue;
     }
     model = resolved;
-    modelWasConfigured = true;
     break;
   }
 
@@ -147,53 +123,11 @@ export function resolveClaudeSpawnDefaults(
       drops.push(`effort "${raw}" from ${layer} is not a Claude effort level — ignored`);
       continue;
     }
-    // The per-model matrix is the same one `-e` is validated against. An
-    // unsupported pairing (any effort on haiku) would 400 at the API.
-    const support = vocab.effortSupportFor(model);
-    if (support && !support.has(candidate as never)) {
-      drops.push(`effort "${candidate}" from ${layer} is not supported by ${model} — ignored`);
-      continue;
-    }
     effort = candidate;
     break;
   }
 
-  // Nothing configured an effort. Deriving one is an INFERENCE about which
-  // model will run, and it is only safe when the host owns that choice.
-  //
-  // `providerConfig` is handed to the container verbatim and becomes the
-  // provider's sticky config, where `providerConfig.model` OUTRANKS the env
-  // alias this function feeds:
-  //
-  //     claude.ts:  input.model ?? this.stickyConfig.model ?? 'opus'
-  //
-  // So when it is set, a family default derived from OUR resolved model could
-  // belong to a model that never runs — the reviewer's case was
-  // `providerConfig.model=fable` + `model=sonnet` yielding Fable at Sonnet's
-  // `xhigh` instead of Fable's `medium`. The host declines to infer there and
-  // lets the container derive from the model it actually picked, which it
-  // already does correctly (`defaultEffortForModel`).
-  //
-  // This is NOT a copy of the container's precedence rule, and the difference
-  // matters: an explicitly CONFIGURED effort is still exported above, because
-  // passing through an operator's choice requires no knowledge of which model
-  // wins. Only the inference is suppressed. That keeps the host from owning a
-  // second copy of an ordering that can drift — and makes the drift failure
-  // safe by construction: if claude.ts ever let the env alias win, this would
-  // merely over-suppress and fall back to the container deriving from its own
-  // chosen model, which is always right. It can be too quiet; it cannot be
-  // wrong.
-  //
-  // `undefined` from the derivation (haiku) stays undefined — the caller emits
-  // no variable rather than an empty one.
-  const stickyModel =
-    typeof containerConfig.providerConfig?.model === 'string' ? containerConfig.providerConfig.model : undefined;
-  const hostOwnsTheModelChoice = stickyModel === undefined;
-  if (effort === undefined && modelWasConfigured && hostOwnsTheModelChoice) {
-    effort = defaultEffortForClaudeModel(model);
-  }
-
-  return { model, modelWasConfigured, effort, drops };
+  return { model, effort, drops };
 }
 
 /**

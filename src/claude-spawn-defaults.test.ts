@@ -1,5 +1,3 @@
-import fs from 'fs';
-import path from 'path';
 
 import { describe, expect, it } from 'vitest';
 
@@ -34,7 +32,6 @@ describe('resolveClaudeSpawnDefaults — layer precedence', () => {
   it('test_claude_model_reads_container_json_model', () => {
     const r = resolveClaudeSpawnDefaults(cfg({ model: 'claude-fable-5-1[1m]' }));
     expect(r.model).toBe('claude-fable-5-1[1m]');
-    expect(r.modelWasConfigured).toBe(true);
   });
 
   it('test_ncl_config_update_pair_survives_end_to_end', () => {
@@ -82,12 +79,7 @@ describe('resolveClaudeSpawnDefaults — layer precedence', () => {
     // own alias derivation is provably right, so no effort is emitted and the
     // spawn env is byte-identical to before this seam existed.
     const r = resolveClaudeSpawnDefaults(cfg());
-    expect(r).toEqual({
-      model: DEFAULT_OPUS_MODEL,
-      modelWasConfigured: false,
-      effort: undefined,
-      drops: [],
-    });
+    expect(r).toEqual({ model: DEFAULT_OPUS_MODEL, effort: undefined, drops: [] });
   });
 
   it('test_chain_matches_the_codex_branch', () => {
@@ -107,100 +99,6 @@ describe('resolveClaudeSpawnDefaults — layer precedence', () => {
   });
 });
 
-// Round-2 P1s (codex findings 3950892215 + 3951002620). One invariant:
-// anything exported into the claude spawn env is validated against the Claude
-// vocabulary, and effort is derived from the RESOLVED model, never from the
-// `'opus'` alias the container asks the SDK for, and never from a value
-// carried across a `--provider` switch.
-describe('resolveClaudeSpawnDefaults — effort derives from the RESOLVED model', () => {
-  it('test_fable_model_without_effort_gets_medium_not_the_opus_default', () => {
-    // The container computes defaultEffortForModel('opus') = 'high' because
-    // that is the literal string it hands the SDK. Only the host knows the
-    // model actually resolved to Fable, whose family default is 'medium'.
-    const r = resolveClaudeSpawnDefaults(cfg({ model: 'claude-fable-5-1[1m]' }));
-    expect(r.effort).toBe('medium');
-    expect(pairs(claudeSpawnEnv(cfg({ model: 'claude-fable-5-1[1m]' }))).NANOCLAW_EFFORT_OVERRIDE).toBe('medium');
-  });
-
-  it('test_sonnet_model_without_effort_gets_xhigh_not_the_opus_default', () => {
-    // The live case: a Discord wiring in this install pins
-    // default_model=sonnet with no default_effort. Before this change those
-    // turns ran at `high`.
-    const r = resolveClaudeSpawnDefaults(cfg(), { model: 'sonnet' });
-    expect(r.model).toBe('claude-sonnet-5');
-    expect(r.effort).toBe('xhigh');
-  });
-
-  it('test_haiku_model_without_effort_emits_no_effort_variable', () => {
-    // Haiku has NO effort control at the API level. Emitting the opus family
-    // default at it is an error on every turn, not a wrong depth.
-    const r = resolveClaudeSpawnDefaults(cfg({ model: 'claude-haiku-4-5' }));
-    expect(r.effort).toBeUndefined();
-    const env = claudeSpawnEnv(cfg({ model: 'claude-haiku-4-5' }));
-    expect(env.join(' ')).not.toContain('NANOCLAW_EFFORT_OVERRIDE');
-  });
-
-  it('test_bare_haiku_alias_survives_validation_and_still_runs_haiku', () => {
-    // Round-3 P1 (codex 3951216934). `resolveEffectiveModel('haiku')` yields
-    // DEFAULT_HAIKU_MODEL, the DATED id `claude-haiku-4-5-20251001`, which the
-    // vocabulary's own regex used to reject — so validating the resolved form
-    // dropped the group's choice and silently ran Opus instead of Haiku.
-    const r = resolveClaudeSpawnDefaults(cfg({ model: 'haiku' }));
-    expect(r.model).toBe('claude-haiku-4-5-20251001');
-    expect(r.modelWasConfigured).toBe(true);
-    expect(r.drops).toEqual([]);
-    expect(r.effort).toBeUndefined();
-    expect(pairs(claudeSpawnEnv(cfg({ model: 'haiku' }))).ANTHROPIC_DEFAULT_OPUS_MODEL).toBe(
-      'claude-haiku-4-5-20251001',
-    );
-  });
-
-  it('test_the_dated_haiku_id_is_in_the_effort_support_matrix', () => {
-    // A matrix MISS returns undefined, which the clamp reads as "no matrix,
-    // do not clamp" — the opposite of Haiku's empty set. Keying the dated id
-    // is what makes an explicit effort on the bare alias get refused.
-    const r = resolveClaudeSpawnDefaults(cfg({ model: 'haiku', effort: 'high' }));
-    expect(r.effort).toBeUndefined();
-    expect(r.drops.join(' ')).toContain('not supported by claude-haiku-4-5-20251001');
-  });
-
-  it('test_every_family_alias_survives_validation', () => {
-    // The regression class, closed across the whole alias set rather than at
-    // the one id that was reported.
-    for (const [alias, want] of [
-      ['opus', 'claude-opus-5[1m]'],
-      ['sonnet', 'claude-sonnet-5'],
-      ['haiku', 'claude-haiku-4-5-20251001'],
-      ['fable', 'claude-fable-5-1[1m]'],
-      ['opus5', 'claude-opus-5[1m]'],
-    ] as const) {
-      const r = resolveClaudeSpawnDefaults(cfg({ model: alias }));
-      expect([alias, r.model, r.drops]).toEqual([alias, want, []]);
-    }
-  });
-
-  it('test_effort_unsupported_by_the_resolved_model_is_dropped', () => {
-    // An explicit effort on haiku is refused by the same per-model matrix the
-    // chat `-e` parser uses, and falls through to the family default (none).
-    const r = resolveClaudeSpawnDefaults(cfg({ model: 'claude-haiku-4-5', effort: 'high' }));
-    expect(r.effort).toBeUndefined();
-    expect(r.drops.join(' ')).toContain('not supported by');
-  });
-
-  it('test_opus_model_still_gets_high_so_the_common_case_is_unchanged', () => {
-    expect(resolveClaudeSpawnDefaults(cfg({ model: 'claude-opus-5[1m]' })).effort).toBe('high');
-  });
-
-  it('test_no_effort_is_derived_when_the_model_was_not_configured', () => {
-    // The floor case must stay silent: the alias 'opus' and DEFAULT_OPUS_MODEL
-    // are the same family, so the container's derivation is already correct
-    // and emitting a variable here would change the mechanism for 23 groups.
-    const r = resolveClaudeSpawnDefaults(cfg());
-    expect(r.effort).toBeUndefined();
-    expect(r.model).toBe(DEFAULT_OPUS_MODEL);
-  });
-});
-
 describe('resolveClaudeSpawnDefaults — foreign vocabulary is dropped, never exported', () => {
   it('test_carried_codex_model_and_effort_are_both_dropped', () => {
     // `ncl groups config update --provider claude` alone keeps the previous
@@ -211,7 +109,6 @@ describe('resolveClaudeSpawnDefaults — foreign vocabulary is dropped, never ex
     // downstream would have rejected these.
     const r = resolveClaudeSpawnDefaults(cfg({ model: 'gpt-6-astra', effort: 'ultra' }));
     expect(r.model).toBe(DEFAULT_OPUS_MODEL);
-    expect(r.modelWasConfigured).toBe(false);
     expect(r.effort).toBeUndefined();
     expect(r.drops).toHaveLength(2);
     expect(r.drops[0]).toContain('gpt-6-astra');
@@ -229,12 +126,16 @@ describe('resolveClaudeSpawnDefaults — foreign vocabulary is dropped, never ex
   });
 
   it('test_a_dropped_layer_yields_to_the_next_one', () => {
-    // Dropping is not fatal and does not skip the rest of the chain.
-    const r = resolveClaudeSpawnDefaults(cfg({ model: 'gpt-6-astra', defaultModel: 'claude-sonnet-5' }), {
-      effort: 'ultra',
-    });
+    // Dropping is not fatal and does not skip the rest of the chain: the bad
+    // model falls through to defaultModel, and the bad effort falls through to
+    // the next effort layer — here there is none, so nothing is exported and
+    // the container applies its own family default for claude-sonnet-5.
+    const r = resolveClaudeSpawnDefaults(
+      cfg({ model: 'gpt-6-astra', defaultModel: 'claude-sonnet-5', defaultEffort: 'max' }),
+      { effort: 'ultra' },
+    );
     expect(r.model).toBe('claude-sonnet-5');
-    expect(r.effort).toBe('xhigh');
+    expect(r.effort).toBe('max');
     expect(r.drops).toHaveLength(2);
   });
 
@@ -309,114 +210,8 @@ describe('claudeSpawnEnv', () => {
   it('claude_spawn_env_resolves_a_bare_family_alias', () => {
     const env = pairs(claudeSpawnEnv(cfg({ defaultModel: 'sonnet' })));
     expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-sonnet-5');
-    // ...and the derived effort follows the RESOLVED id, not the alias.
-    expect(env.NANOCLAW_EFFORT_OVERRIDE).toBe('xhigh');
-  });
-});
-
-// The host mirror of the agent-runner's family-default table is a real
-// duplication across a package boundary (Node host / Bun container, nothing
-// importable either way). Pin it to the container source so a change on one
-// side cannot silently diverge.
-describe('family-default effort table stays in sync with the agent-runner', () => {
-  it('test_host_family_defaults_match_container_defaultEffortForModel', () => {
-    const containerSrc = fs.readFileSync(
-      path.resolve(__dirname, '../container/agent-runner/src/providers/claude.ts'),
-      'utf8',
-    );
-    const body = containerSrc.slice(
-      containerSrc.indexOf('function defaultEffortForModel('),
-      containerSrc.indexOf('function clampEffortForModel('),
-    );
-    expect(body).toContain('function defaultEffortForModel(');
-    // One representative resolved id per family; the host derives the same
-    // value the container would for the SAME string.
-    const expectations: Array<[string, string | undefined]> = [
-      ['claude-opus-5[1m]', 'high'],
-      ['claude-sonnet-5', 'xhigh'],
-      ['claude-fable-5-1[1m]', 'medium'],
-      ['claude-haiku-4-5', undefined],
-    ];
-    for (const [model, want] of expectations) {
-      // Host side, through the public seam: a configured model with no
-      // configured effort surfaces exactly the family default.
-      expect(resolveClaudeSpawnDefaults(cfg({ model })).effort).toBe(want as string);
-    }
-    // Container side, from its source: the four branches still return these.
-    expect(body).toMatch(/claude-opus-'\)\)\s*return\s*'high'/);
-    expect(body).toMatch(/claude-sonnet-'\)\)\s*return\s*'xhigh'/);
-    expect(body).toMatch(/claude-fable-'\)\)\s*return\s*'medium'/);
-    expect(body).toMatch(/claude-haiku-'\)\)\s*return\s*undefined/);
-  });
-});
-
-// Round-4 P2 (codex finding 3951298631). `providerConfig` reaches the provider
-// verbatim as its sticky config, and `providerConfig.model` OUTRANKS the env
-// alias this seam feeds (claude.ts: `input.model ?? this.stickyConfig.model ??
-// 'opus'`). So a family default DERIVED from the host's resolved model can
-// belong to a model that never runs.
-//
-// The fix suppresses the inference only. An explicitly configured effort is
-// still exported — passing through an operator's choice needs no knowledge of
-// which model wins, and dropping it would reintroduce the exact defect class
-// this PR exists to fix (a written, read-back-correct value that never reaches
-// the model). That negative case is the second test here and it is what
-// separates this from the naive "suppress whenever providerConfig.model is
-// set" version.
-describe('resolveClaudeSpawnDefaults — the host does not infer when it does not own the model', () => {
-  it('test_no_derivation_when_providerConfig_model_outranks_the_env_alias', () => {
-    // The reported case: pc.model=fable + model=sonnet. Deriving from sonnet
-    // would run Fable at xhigh instead of Fable's medium.
-    const r = resolveClaudeSpawnDefaults(
-      cfg({ model: 'sonnet', providerConfig: { model: 'claude-fable-5-1[1m]' } }),
-    );
-    expect(r.model).toBe('claude-sonnet-5');
-    expect(r.effort).toBeUndefined();
-    expect(claudeSpawnEnv(cfg({ model: 'sonnet', providerConfig: { model: 'claude-fable-5-1[1m]' } })).join(' ')).not.toContain(
-      'NANOCLAW_EFFORT_OVERRIDE',
-    );
-  });
-
-  it('test_a_configured_effort_is_STILL_exported_alongside_providerConfig_model', () => {
-    // THE GUARD. `NANOCLAW_EFFORT_OVERRIDE` is the operator's only carrier on
-    // the primary path — container.json's top-level `effort` reaches
-    // RunnerConfig.effort but is dropped at claude.ts's onFallback-gated fold,
-    // so suppressing the variable wholesale loses the operator's choice
-    // entirely. Verified live: with the env absent a pc.model=fable group runs
-    // Fable at `medium` (the family default) no matter what `--effort` was set
-    // to; with the env present it runs the configured value.
-    const c = cfg({ effort: 'xhigh', providerConfig: { model: 'claude-fable-5-1[1m]' } });
-    expect(resolveClaudeSpawnDefaults(c).effort).toBe('xhigh');
-    expect(pairs(claudeSpawnEnv(c)).NANOCLAW_EFFORT_OVERRIDE).toBe('xhigh');
-  });
-
-  it('test_a_channel_effort_is_STILL_exported_alongside_providerConfig_model', () => {
-    // Same rule one layer up: a per-channel wiring is an operator choice too.
-    const c = cfg({ providerConfig: { model: 'claude-fable-5-1[1m]' } });
-    expect(pairs(claudeSpawnEnv(c, { effort: 'low' })).NANOCLAW_EFFORT_OVERRIDE).toBe('low');
-  });
-
-  it('test_a_providerConfig_without_a_model_does_not_suppress_derivation', () => {
-    // Only `providerConfig.model` competes for the model choice. A
-    // providerConfig carrying anything else leaves the host owning it.
-    const r = resolveClaudeSpawnDefaults(cfg({ model: 'claude-fable-5-1[1m]', providerConfig: { effort: 'high' } }));
-    expect(r.effort).toBe('medium');
-  });
-
-  it('test_a_non_string_providerConfig_model_is_not_treated_as_a_model', () => {
-    // providerConfig is Record<string, unknown> — a hand-edited container.json
-    // can put anything there. Anything that is not a string cannot win the
-    // container's model choice, so it must not suppress derivation either.
-    const r = resolveClaudeSpawnDefaults(cfg({ model: 'claude-fable-5-1[1m]', providerConfig: { model: 42 } }));
-    expect(r.effort).toBe('medium');
-  });
-
-  it('test_the_unconfigured_fleet_baseline_is_still_untouched', () => {
-    expect(resolveClaudeSpawnDefaults(cfg({ providerConfig: { model: 'claude-fable-5-1[1m]' } }))).toEqual({
-      model: DEFAULT_OPUS_MODEL,
-      modelWasConfigured: false,
-      effort: undefined,
-      drops: [],
-    });
+    // ...and no effort is invented for it. The container derives Sonnet's
+    // xhigh from this very id (agent-runner defaultEffortForModel).
+    expect(env.NANOCLAW_EFFORT_OVERRIDE).toBeUndefined();
   });
 });
