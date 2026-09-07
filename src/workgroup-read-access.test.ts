@@ -13,7 +13,7 @@ vi.mock('./config.js', async (importOriginal) => ({
   DATA_DIR,
 }));
 
-import { closeDb, getRawDb, initTestDb, runMigrations } from './db/index.js';
+import { closeDb, getDb, initMigratedTestDb } from './db/index.js';
 import {
   WORKGROUP_READ_ACCESS_POLICY_PATH,
   assertWorkgroupReadAccessMountStable,
@@ -23,10 +23,12 @@ import {
   workgroupReadAccessInstructions,
 } from './workgroup-read-access.js';
 
-function registerWorkgroup(id: string): void {
-  getRawDb()
-    .prepare(`INSERT INTO workgroups (id, onecli_secrets, created_at) VALUES (?, '[]', ?)`)
-    .run(id, new Date().toISOString());
+async function registerWorkgroup(id: string): Promise<void> {
+  await getDb().run(
+    `INSERT INTO workgroups (id, onecli_secrets, created_at) VALUES (?, '[]', ?)`,
+    id,
+    new Date().toISOString(),
+  );
 }
 
 function writePolicy(policy: unknown): void {
@@ -41,8 +43,7 @@ function mkdir(relative: string): void {
 beforeEach(async () => {
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
-  await initTestDb();
-  runMigrations(getRawDb());
+  await initMigratedTestDb();
 });
 
 afterEach(async () => {
@@ -52,14 +53,14 @@ afterEach(async () => {
 
 describe('workgroup read-access policy', () => {
   it('defaults to no grant when the host policy file is absent', async () => {
-    registerWorkgroup('recipient');
+    await registerWorkgroup('recipient');
     await expect(resolveWorkgroupReadAccess('recipient')).resolves.toBeNull();
   });
 
   it('mounts only the explicit all-mode source and includes its fixed project roots read-only', async () => {
-    registerWorkgroup('recipient');
-    registerWorkgroup('source');
-    registerWorkgroup('unrelated');
+    await registerWorkgroup('recipient');
+    await registerWorkgroup('source');
+    await registerWorkgroup('unrelated');
     mkdir('workgroups/source/memory');
     mkdir('workgroups/source/conversations');
     mkdir('repositories/source');
@@ -100,8 +101,8 @@ describe('workgroup read-access policy', () => {
   });
 
   it('archives mode exposes only real memory and conversations directories', async () => {
-    registerWorkgroup('recipient');
-    registerWorkgroup('source');
+    await registerWorkgroup('recipient');
+    await registerWorkgroup('source');
     mkdir('workgroups/source/memory');
     mkdir('workgroups/source/conversations');
     mkdir('repositories/source');
@@ -124,8 +125,8 @@ describe('workgroup read-access policy', () => {
   });
 
   it('fails closed for malformed policy, unknown source IDs, unsafe registered IDs, and source-root symlinks', async () => {
-    registerWorkgroup('recipient');
-    registerWorkgroup('source');
+    await registerWorkgroup('recipient');
+    await registerWorkgroup('source');
 
     writePolicy({ version: 1, recipients: { recipient: { mode: 'all', sources: ['missing'] } } });
     await expect(resolveWorkgroupReadAccess('recipient')).rejects.toThrow(
@@ -135,13 +136,13 @@ describe('workgroup read-access policy', () => {
     writePolicy({ version: 1, recipients: { recipient: { mode: 'all', sources: ['source'], typo: true } } });
     await expect(resolveWorkgroupReadAccess('recipient')).rejects.toThrow('may contain only mode and sources');
 
-    registerWorkgroup('unsafe/path');
+    await registerWorkgroup('unsafe/path');
     writePolicy({ version: 1, recipients: { recipient: { mode: 'all', sources: '*' } } });
     await expect(resolveWorkgroupReadAccess('recipient')).rejects.toThrow(
       'registered workgroup ID must be a lowercase workgroup slug',
     );
 
-    getRawDb().prepare('DELETE FROM workgroups WHERE id = ?').run('unsafe/path');
+    await getDb().run('DELETE FROM workgroups WHERE id = ?', 'unsafe/path');
     mkdir('outside');
     mkdir('workgroups');
     fs.symlinkSync(path.join(DATA_DIR, 'outside'), path.join(DATA_DIR, 'workgroups/source'));
