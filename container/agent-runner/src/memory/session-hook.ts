@@ -7,12 +7,19 @@ export type MemorySessionStartSource = MemorySessionHookSource | 'resume';
 
 export interface MemorySessionHookRegistration {
   readonly command: string;
+  /**
+   * The module `command` runs. It exists only inside the agent container, so its
+   * presence is what tells us we are writing container settings and not a
+   * developer's host config — see the guard in `writeMemorySessionHook`.
+   */
+  readonly modulePath: string;
   readonly legacyCommands: readonly string[];
   readonly sources: readonly MemorySessionHookSource[];
 }
 
 export const MEMORY_SESSION_HOOK: MemorySessionHookRegistration = {
   command: 'bun /app/src/memory/hook.ts',
+  modulePath: '/app/src/memory/hook.ts',
   legacyCommands: ['bun /app/src/memory-hook.ts'],
   sources: MEMORY_CONTEXT_SOURCES,
 };
