@@ -91,10 +91,9 @@ describe('startChannelAdapter', () => {
     const adapter = createFakeAdapter('slack', 'slack-hot');
     registry.registerChannelAdapter('slack-hot', { factory: () => adapter });
 
-    await expect(Promise.all([registry.startChannelAdapter('slack-hot'), registry.startChannelAdapter('slack-hot')])).resolves.toEqual([
-      'started',
-      'started',
-    ]);
+    await expect(
+      Promise.all([registry.startChannelAdapter('slack-hot'), registry.startChannelAdapter('slack-hot')]),
+    ).resolves.toEqual(['started', 'started']);
     await expect(registry.startChannelAdapter('slack-hot')).resolves.toBe('already-active');
     expect(adapter.setupConfigs).toHaveLength(1);
   });
@@ -135,7 +134,10 @@ describe('startChannelAdapter', () => {
     releaseSetup();
 
     const results = await Promise.allSettled([firstStart, secondStart, thirdStart]);
-    expect(results[0]).toMatchObject({ status: 'rejected', reason: expect.objectContaining({ message: expect.stringContaining('first attempt failed') }) });
+    expect(results[0]).toMatchObject({
+      status: 'rejected',
+      reason: expect.objectContaining({ message: expect.stringContaining('first attempt failed') }),
+    });
     expect(results.slice(1)).toEqual([
       { status: 'fulfilled', value: 'started' },
       { status: 'fulfilled', value: 'already-active' },

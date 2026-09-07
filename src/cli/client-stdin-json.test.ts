@@ -33,11 +33,12 @@ function childEnv(): NodeJS.ProcessEnv {
 }
 
 function runClient(input: string | Uint8Array) {
-  return spawnSync(
-    process.execPath,
-    ['--import', 'tsx', 'src/cli/client.ts', 'groups', 'list', '--stdin-json'],
-    { cwd: process.cwd(), encoding: 'utf8', env: childEnv(), input },
-  );
+  return spawnSync(process.execPath, ['--import', 'tsx', 'src/cli/client.ts', 'groups', 'list', '--stdin-json'], {
+    cwd: process.cwd(),
+    encoding: 'utf8',
+    env: childEnv(),
+    input,
+  });
 }
 
 afterEach(() => vi.restoreAllMocks());
@@ -87,5 +88,4 @@ describe('host CLI --stdin-json entry point', () => {
       expect(result.stderr).toBe(`ncl: --stdin-json key "${key}" is not allowed\n`);
     },
   );
-
 });

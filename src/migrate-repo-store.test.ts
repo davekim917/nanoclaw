@@ -515,28 +515,32 @@ describe('lossless server-wide repository migration', () => {
     expect(git(manifest.captures[0].destinationPath!, ['ls-files', '--stage', 'intent.txt'])).toBe(beforeIntentEntry);
   });
 
-  it('preserves an unmerged conflict index and keeps every staged blob reachable', async () => {
-    const f = fixture({ repo: 'conflicted' });
-    git(f.legacy, ['switch', '-q', '-c', 'conflict-theirs']);
-    fs.writeFileSync(path.join(f.legacy, 'base.txt'), 'theirs\n');
-    git(f.legacy, ['add', 'base.txt']);
-    git(f.legacy, ['commit', '-q', '-m', 'theirs']);
-    git(f.legacy, ['switch', '-q', 'shared-feature']);
-    fs.writeFileSync(path.join(f.legacy, 'base.txt'), 'ours\n');
-    git(f.legacy, ['add', 'base.txt']);
-    git(f.legacy, ['commit', '-q', '-m', 'ours']);
-    expect(() => git(f.legacy, ['merge', 'conflict-theirs'])).toThrow();
-    const before = captureCheckout(candidate(f.legacy, f.repo));
-    expect(Buffer.from(before.indexEntriesZBase64, 'base64').toString('utf8')).toContain(' 2\tbase.txt');
+  it(
+    'preserves an unmerged conflict index and keeps every staged blob reachable',
+    async () => {
+      const f = fixture({ repo: 'conflicted' });
+      git(f.legacy, ['switch', '-q', '-c', 'conflict-theirs']);
+      fs.writeFileSync(path.join(f.legacy, 'base.txt'), 'theirs\n');
+      git(f.legacy, ['add', 'base.txt']);
+      git(f.legacy, ['commit', '-q', '-m', 'theirs']);
+      git(f.legacy, ['switch', '-q', 'shared-feature']);
+      fs.writeFileSync(path.join(f.legacy, 'base.txt'), 'ours\n');
+      git(f.legacy, ['add', 'base.txt']);
+      git(f.legacy, ['commit', '-q', '-m', 'ours']);
+      expect(() => git(f.legacy, ['merge', 'conflict-theirs'])).toThrow();
+      const before = captureCheckout(candidate(f.legacy, f.repo));
+      expect(Buffer.from(before.indexEntriesZBase64, 'base64').toString('utf8')).toContain(' 2\tbase.txt');
 
-    const manifest = manifestFor([candidate(f.legacy, f.repo)], f.remote, f.repo);
-    await executeRepositoryMigration(manifest, { assertQuiescent: () => undefined });
-    auditRepositoryMigration(manifest);
-    const after = captureCheckout(candidate(manifest.captures[0].destinationPath!, f.repo));
-    expect(after.indexBytesBase64).toBe(before.indexBytesBase64);
-    expect(after.indexEntriesZBase64).toBe(before.indexEntriesZBase64);
-    expect(after.statusZBase64).toBe(before.statusZBase64);
-  }, GIT_HEAVY_TEST_TIMEOUT_MS);
+      const manifest = manifestFor([candidate(f.legacy, f.repo)], f.remote, f.repo);
+      await executeRepositoryMigration(manifest, { assertQuiescent: () => undefined });
+      auditRepositoryMigration(manifest);
+      const after = captureCheckout(candidate(manifest.captures[0].destinationPath!, f.repo));
+      expect(after.indexBytesBase64).toBe(before.indexBytesBase64);
+      expect(after.indexEntriesZBase64).toBe(before.indexEntriesZBase64);
+      expect(after.statusZBase64).toBe(before.statusZBase64);
+    },
+    GIT_HEAVY_TEST_TIMEOUT_MS,
+  );
 
   it('neutralizes included dotted-name filter drivers before legacy Git status runs', () => {
     const f = fixture({ repo: 'filtered' });
@@ -802,114 +806,122 @@ describe('lossless server-wide repository migration', () => {
     expect(context.branchStatesByCommonSet.size).toBe(1);
   });
 
-  it('restores a hash-bound reviewed visible state while retaining the already-broken pointer exactly', async () => {
-    const f = fixture({ repo: 'reviewed-missing-admin' });
-    const orphan = path.join(root, 'legacy', 'reviewed-orphan');
-    git(f.legacy, ['worktree', 'add', '-q', '-b', 'feat/reviewed-orphan', orphan, 'HEAD']);
-    fs.writeFileSync(path.join(orphan, 'unstaged.txt'), 'reviewed ongoing edit\n');
-    fs.writeFileSync(path.join(orphan, 'untracked-recovery.txt'), 'must survive\n');
-    const admin = git(orphan, ['rev-parse', '--path-format=absolute', '--git-dir']);
-    fs.rmSync(admin, { recursive: true, force: true });
-    const pointer = 'gitdir: /workspace/workgroup/reviewed-missing-admin/.git/worktrees/reviewed-orphan\n';
-    fs.writeFileSync(path.join(orphan, '.git'), pointer);
-    fs.chmodSync(path.join(orphan, '.git'), 0o640);
-    const orphanCandidate = {
-      ...candidate(orphan, f.repo, 'thread-reviewed-orphan'),
-      candidateCommonGitDirs: [path.join(f.legacy, '.git')],
-    };
-    const diagnostic = captureCheckout(orphanCandidate);
-    expect(diagnostic.head).not.toBeNull();
-    expect(diagnostic.branch).toBe('feat/reviewed-orphan');
-    expect(diagnostic.gitPointer).toBeDefined();
-    const decision: ReviewedCheckoutRecoveryDecision = {
-      checkoutPath: orphan,
-      workgroupId: 'wg-a',
-      repo: f.repo,
-      action: 'restore-visible-state',
-      selection: 'synthesized-visible-state',
-      selectedCommonGitDir: diagnostic.commonGitDir,
-      selectedHead: diagnostic.head!,
-      selectedBranch: diagnostic.branch!,
-      gitPointerSha256: diagnostic.gitPointer!.sha256,
-      visibleStateSha256: missingAdminVisibleStateSha256(diagnostic),
-    };
-    expect(
-      createReviewedMissingAdminRecoveryProposal({
-        candidate: orphanCandidate,
+  it(
+    'restores a hash-bound reviewed visible state while retaining the already-broken pointer exactly',
+    async () => {
+      const f = fixture({ repo: 'reviewed-missing-admin' });
+      const orphan = path.join(root, 'legacy', 'reviewed-orphan');
+      git(f.legacy, ['worktree', 'add', '-q', '-b', 'feat/reviewed-orphan', orphan, 'HEAD']);
+      fs.writeFileSync(path.join(orphan, 'unstaged.txt'), 'reviewed ongoing edit\n');
+      fs.writeFileSync(path.join(orphan, 'untracked-recovery.txt'), 'must survive\n');
+      const admin = git(orphan, ['rev-parse', '--path-format=absolute', '--git-dir']);
+      fs.rmSync(admin, { recursive: true, force: true });
+      const pointer = 'gitdir: /workspace/workgroup/reviewed-missing-admin/.git/worktrees/reviewed-orphan\n';
+      fs.writeFileSync(path.join(orphan, '.git'), pointer);
+      fs.chmodSync(path.join(orphan, '.git'), 0o640);
+      const orphanCandidate = {
+        ...candidate(orphan, f.repo, 'thread-reviewed-orphan'),
+        candidateCommonGitDirs: [path.join(f.legacy, '.git')],
+      };
+      const diagnostic = captureCheckout(orphanCandidate);
+      expect(diagnostic.head).not.toBeNull();
+      expect(diagnostic.branch).toBe('feat/reviewed-orphan');
+      expect(diagnostic.gitPointer).toBeDefined();
+      const decision: ReviewedCheckoutRecoveryDecision = {
+        checkoutPath: orphan,
+        workgroupId: 'wg-a',
+        repo: f.repo,
+        action: 'restore-visible-state',
+        selection: 'synthesized-visible-state',
         selectedCommonGitDir: diagnostic.commonGitDir,
         selectedHead: diagnostic.head!,
         selectedBranch: diagnostic.branch!,
+        gitPointerSha256: diagnostic.gitPointer!.sha256,
+        visibleStateSha256: missingAdminVisibleStateSha256(diagnostic),
+      };
+      expect(
+        createReviewedMissingAdminRecoveryProposal({
+          candidate: orphanCandidate,
+          selectedCommonGitDir: diagnostic.commonGitDir,
+          selectedHead: diagnostic.head!,
+          selectedBranch: diagnostic.branch!,
+          action: 'restore-visible-state',
+        }),
+      ).toEqual(decision);
+      expect(() =>
+        manifestFor([candidate(f.legacy, f.repo), orphanCandidate], f.remote, f.repo, undefined, [
+          { ...decision, visibleStateSha256: '0'.repeat(64) },
+        ]),
+      ).toThrow(/visible state is stale/);
+
+      const manifest = manifestFor([candidate(f.legacy, f.repo), orphanCandidate], f.remote, f.repo, undefined, [
+        decision,
+      ]);
+      const recovered = manifest.captures.find((capture) => capture.checkoutPath === orphan)!;
+      expect(recovered.reviewedRecovery).toMatchObject({
         action: 'restore-visible-state',
-      }),
-    ).toEqual(decision);
-    expect(() =>
-      manifestFor([candidate(f.legacy, f.repo), orphanCandidate], f.remote, f.repo, undefined, [
-        { ...decision, visibleStateSha256: '0'.repeat(64) },
-      ]),
-    ).toThrow(/visible state is stale/);
+        selection: 'synthesized-visible-state',
+      });
+      expect(recovered.indexBytesBase64).not.toBeNull();
+      await executeRepositoryMigration(manifest, { assertQuiescent: () => undefined });
+      auditRepositoryMigration(manifest);
+      expect(fs.readFileSync(path.join(recovered.destinationPath!, 'unstaged.txt'), 'utf8')).toBe(
+        'reviewed ongoing edit\n',
+      );
+      expect(fs.readFileSync(path.join(recovered.destinationPath!, 'untracked-recovery.txt'), 'utf8')).toBe(
+        'must survive\n',
+      );
+      expect(fs.readFileSync(path.join(recovered.renamedOldPath!, '.git'), 'utf8')).toBe(pointer);
+      expect(fs.lstatSync(path.join(recovered.renamedOldPath!, '.git')).mode & 0o7777).toBe(0o640);
+    },
+    GIT_HEAVY_TEST_TIMEOUT_MS,
+  );
 
-    const manifest = manifestFor([candidate(f.legacy, f.repo), orphanCandidate], f.remote, f.repo, undefined, [
-      decision,
-    ]);
-    const recovered = manifest.captures.find((capture) => capture.checkoutPath === orphan)!;
-    expect(recovered.reviewedRecovery).toMatchObject({
-      action: 'restore-visible-state',
-      selection: 'synthesized-visible-state',
-    });
-    expect(recovered.indexBytesBase64).not.toBeNull();
-    await executeRepositoryMigration(manifest, { assertQuiescent: () => undefined });
-    auditRepositoryMigration(manifest);
-    expect(fs.readFileSync(path.join(recovered.destinationPath!, 'unstaged.txt'), 'utf8')).toBe(
-      'reviewed ongoing edit\n',
-    );
-    expect(fs.readFileSync(path.join(recovered.destinationPath!, 'untracked-recovery.txt'), 'utf8')).toBe(
-      'must survive\n',
-    );
-    expect(fs.readFileSync(path.join(recovered.renamedOldPath!, '.git'), 'utf8')).toBe(pointer);
-    expect(fs.lstatSync(path.join(recovered.renamedOldPath!, '.git')).mode & 0o7777).toBe(0o640);
-  }, GIT_HEAVY_TEST_TIMEOUT_MS);
-
-  it('selects one exact surviving Git admin and raw index when collided metadata is ambiguous', async () => {
-    const f = fixture({ repo: 'reviewed-ambiguous-admin' });
-    const collided = path.join(root, 'legacy', 'ambiguous-checkout');
-    git(f.legacy, ['worktree', 'add', '-q', '-b', 'feat/exact-admin', collided, 'HEAD']);
-    fs.writeFileSync(path.join(collided, 'exact-admin.txt'), 'ongoing exact index state\n');
-    git(collided, ['add', 'exact-admin.txt']);
-    const selectedGitDir = git(collided, ['rev-parse', '--path-format=absolute', '--git-dir']);
-    const commonGitDir = git(collided, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
-    const duplicateAdmin = path.join(commonGitDir, 'worktrees', 'ambiguous-duplicate');
-    fs.cpSync(selectedGitDir, duplicateAdmin, { recursive: true, dereference: false });
-    fs.writeFileSync(path.join(duplicateAdmin, 'gitdir'), `${path.join(collided, '.git')}\n`);
-    const collidedCandidate: LegacyCheckoutCandidate = {
-      ...candidate(collided, f.repo, 'thread-exact-admin'),
-      candidateCommonGitDirs: [commonGitDir],
-    };
-    expect(() => captureCheckout(collidedCandidate)).toThrow(/ambiguous Git admin directories/);
-    const decision = createReviewedExactGitAdminRecoveryProposal({
-      candidate: collidedCandidate,
-      selectedGitDir,
-      action: 'restore-visible-state',
-    });
-    expect(decision).toMatchObject({
-      selection: 'exact-git-admin',
-      selectedGitDir,
-      selectedCommonGitDir: commonGitDir,
-      selectedBranch: 'feat/exact-admin',
-      action: 'restore-visible-state',
-    });
-    expect(decision.selectedIndexSha256).toMatch(/^[a-f0-9]{64}$/);
-    const manifest = manifestFor([candidate(f.legacy, f.repo), collidedCandidate], f.remote, f.repo, undefined, [
-      decision,
-    ]);
-    const captured = manifest.captures.find((entry) => entry.checkoutPath === collided)!;
-    expect(captured.gitDir).toBe(selectedGitDir);
-    expect(captured.indexSha256).toBe(decision.selectedIndexSha256);
-    await executeRepositoryMigration(manifest, { assertQuiescent: () => undefined });
-    auditRepositoryMigration(manifest);
-    expect(fs.readFileSync(path.join(captured.destinationPath!, 'exact-admin.txt'), 'utf8')).toBe(
-      'ongoing exact index state\n',
-    );
-  }, GIT_HEAVY_TEST_TIMEOUT_MS);
+  it(
+    'selects one exact surviving Git admin and raw index when collided metadata is ambiguous',
+    async () => {
+      const f = fixture({ repo: 'reviewed-ambiguous-admin' });
+      const collided = path.join(root, 'legacy', 'ambiguous-checkout');
+      git(f.legacy, ['worktree', 'add', '-q', '-b', 'feat/exact-admin', collided, 'HEAD']);
+      fs.writeFileSync(path.join(collided, 'exact-admin.txt'), 'ongoing exact index state\n');
+      git(collided, ['add', 'exact-admin.txt']);
+      const selectedGitDir = git(collided, ['rev-parse', '--path-format=absolute', '--git-dir']);
+      const commonGitDir = git(collided, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
+      const duplicateAdmin = path.join(commonGitDir, 'worktrees', 'ambiguous-duplicate');
+      fs.cpSync(selectedGitDir, duplicateAdmin, { recursive: true, dereference: false });
+      fs.writeFileSync(path.join(duplicateAdmin, 'gitdir'), `${path.join(collided, '.git')}\n`);
+      const collidedCandidate: LegacyCheckoutCandidate = {
+        ...candidate(collided, f.repo, 'thread-exact-admin'),
+        candidateCommonGitDirs: [commonGitDir],
+      };
+      expect(() => captureCheckout(collidedCandidate)).toThrow(/ambiguous Git admin directories/);
+      const decision = createReviewedExactGitAdminRecoveryProposal({
+        candidate: collidedCandidate,
+        selectedGitDir,
+        action: 'restore-visible-state',
+      });
+      expect(decision).toMatchObject({
+        selection: 'exact-git-admin',
+        selectedGitDir,
+        selectedCommonGitDir: commonGitDir,
+        selectedBranch: 'feat/exact-admin',
+        action: 'restore-visible-state',
+      });
+      expect(decision.selectedIndexSha256).toMatch(/^[a-f0-9]{64}$/);
+      const manifest = manifestFor([candidate(f.legacy, f.repo), collidedCandidate], f.remote, f.repo, undefined, [
+        decision,
+      ]);
+      const captured = manifest.captures.find((entry) => entry.checkoutPath === collided)!;
+      expect(captured.gitDir).toBe(selectedGitDir);
+      expect(captured.indexSha256).toBe(decision.selectedIndexSha256);
+      await executeRepositoryMigration(manifest, { assertQuiescent: () => undefined });
+      auditRepositoryMigration(manifest);
+      expect(fs.readFileSync(path.join(captured.destinationPath!, 'exact-admin.txt'), 'utf8')).toBe(
+        'ongoing exact index state\n',
+      );
+    },
+    GIT_HEAVY_TEST_TIMEOUT_MS,
+  );
 
   it('recovers a missing original admin from one exact hash-bound external Git-admin seed', async () => {
     const f = fixture({ repo: 'external-exact-admin' });
@@ -1273,24 +1285,30 @@ describe('lossless server-wide repository migration', () => {
     expect(fs.readFileSync(path.join(legacy, 'untracked.md'), 'utf8')).toBe('historical untracked work\n');
   });
 
-  it('preserves an unborn branch with an empty index and untracked files', async () => {
-    const f = fixture();
-    const unborn = path.join(root, 'legacy', 'unborn');
-    fs.mkdirSync(unborn, { recursive: true });
-    git(unborn, ['init', '-q', '-b', 'unborn-work']);
-    git(unborn, ['remote', 'add', 'origin', f.remote]);
-    fs.writeFileSync(path.join(unborn, 'untracked-only.txt'), 'must survive\n');
-    const unbornCandidate = candidate(unborn, f.repo, 'thread-unborn');
-    const before = captureCheckout(unbornCandidate);
-    expect(before.head).toBeNull();
-    expect(Buffer.from(before.statusZBase64, 'base64').length).toBeGreaterThan(0);
-    const manifest = manifestFor([candidate(f.legacy), unbornCandidate], f.remote);
-    await executeRepositoryMigration(manifest, { assertQuiescent: () => undefined });
-    auditRepositoryMigration(manifest);
-    const migrated = manifest.captures.find((capture) => capture.workUnit.key.includes('thread-unborn'))!;
-    expect(migrated.head).toBeNull();
-    expect(fs.readFileSync(path.join(migrated.destinationPath!, 'untracked-only.txt'), 'utf8')).toBe('must survive\n');
-  }, GIT_HEAVY_TEST_TIMEOUT_MS);
+  it(
+    'preserves an unborn branch with an empty index and untracked files',
+    async () => {
+      const f = fixture();
+      const unborn = path.join(root, 'legacy', 'unborn');
+      fs.mkdirSync(unborn, { recursive: true });
+      git(unborn, ['init', '-q', '-b', 'unborn-work']);
+      git(unborn, ['remote', 'add', 'origin', f.remote]);
+      fs.writeFileSync(path.join(unborn, 'untracked-only.txt'), 'must survive\n');
+      const unbornCandidate = candidate(unborn, f.repo, 'thread-unborn');
+      const before = captureCheckout(unbornCandidate);
+      expect(before.head).toBeNull();
+      expect(Buffer.from(before.statusZBase64, 'base64').length).toBeGreaterThan(0);
+      const manifest = manifestFor([candidate(f.legacy), unbornCandidate], f.remote);
+      await executeRepositoryMigration(manifest, { assertQuiescent: () => undefined });
+      auditRepositoryMigration(manifest);
+      const migrated = manifest.captures.find((capture) => capture.workUnit.key.includes('thread-unborn'))!;
+      expect(migrated.head).toBeNull();
+      expect(fs.readFileSync(path.join(migrated.destinationPath!, 'untracked-only.txt'), 'utf8')).toBe(
+        'must survive\n',
+      );
+    },
+    GIT_HEAVY_TEST_TIMEOUT_MS,
+  );
 
   it('imports mirror-only refs and retires the bare mirror without deleting it', async () => {
     const f = fixture();

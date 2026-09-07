@@ -43,7 +43,6 @@ export async function main(
   argv = process.argv.slice(2),
   stdin: StdinJsonStream & { isTTY?: boolean } = process.stdin,
 ): Promise<void> {
-
   if (argv.length === 0 || argv[0] === '--help' || argv[0] === '-h') {
     printUsage();
     process.exit(0);

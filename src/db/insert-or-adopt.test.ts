@@ -76,7 +76,9 @@ describe('insertOrAdopt', () => {
     it('two overlapping inserts for the same id: one creates, one adopts', async () => {
       const reload = () => getDb().get<{ id: string; val: string }>('SELECT id, val FROM pk_race WHERE id = ?', 'r1');
       const insertRow = (row: { id: string; val: string }) =>
-        getDb().run('INSERT INTO pk_race (id, val) VALUES (?, ?)', row.id, row.val).then(() => undefined);
+        getDb()
+          .run('INSERT INTO pk_race (id, val) VALUES (?, ?)', row.id, row.val)
+          .then(() => undefined);
 
       // The first insert lands normally.
       const first = await insertOrAdopt({ id: 'r1', val: 'from-first' }, insertRow, reload);
