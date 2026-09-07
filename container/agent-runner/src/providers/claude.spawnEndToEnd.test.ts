@@ -8,11 +8,11 @@ mock.module('@anthropic-ai/claude-agent-sdk', () => ({
     return g;
   },
 }));
-const rcs = await import('/tmp/claude-1001/-home-ubuntu-nanoclaw-v2/14172d0b-28aa-44fa-a836-4a0936483a6e/scratchpad/wt-effort/container/agent-runner/src/db/container-state.js');
-mock.module('/tmp/claude-1001/-home-ubuntu-nanoclaw-v2/14172d0b-28aa-44fa-a836-4a0936483a6e/scratchpad/wt-effort/container/agent-runner/src/db/container-state.js', () => ({ ...rcs, clearContainerToolInFlight: () => {}, setContainerToolInFlight: () => {} }));
-const { claudeSpawnEnv } = await import('/tmp/claude-1001/-home-ubuntu-nanoclaw-v2/14172d0b-28aa-44fa-a836-4a0936483a6e/scratchpad/wt-effort/src/claude-spawn-defaults.ts');
-const { MEMORY_SESSION_HOOK } = await import('/tmp/claude-1001/-home-ubuntu-nanoclaw-v2/14172d0b-28aa-44fa-a836-4a0936483a6e/scratchpad/wt-effort/container/agent-runner/src/memory/session-hook.js');
-const { ClaudeProvider } = await import('/tmp/claude-1001/-home-ubuntu-nanoclaw-v2/14172d0b-28aa-44fa-a836-4a0936483a6e/scratchpad/wt-effort/container/agent-runner/src/providers/claude.js');
+const rcs = await import('../db/container-state.js');
+mock.module('../db/container-state.js', () => ({ ...rcs, clearContainerToolInFlight: () => {}, setContainerToolInFlight: () => {} }));
+const { claudeSpawnEnv } = await import('../../../../src/claude-spawn-defaults.ts');
+const { MEMORY_SESSION_HOOK } = await import('../memory/session-hook.js');
+const { ClaudeProvider } = await import('./claude.js');
 
 /**
  * Host seam -> real spawn env -> real provider. No step reasoned about.
