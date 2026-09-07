@@ -20,6 +20,24 @@ OpenAI's, not ours. The bot reporting a nit outside this policy is expected,
 not a violation — this policy governs how such findings are triaged, not
 what the bot says.
 
+## Review availability
+
+A valid review is evidence; a silent or unavailable provider is not. When the
+authenticated GitHub Codex connector reports its code-review usage limit for
+the current head, or its bounded foreground wait expires, immediately use an
+already accepted independent review route. Do not wait for a human quota reset
+or seek new permission just to select that route.
+
+The substitute reviewer starts in a fresh context and receives the final SHA,
+complete diff, relevant files, this policy, and every existing finding. Prefer
+another capable agent or provider. Implementation reasoning cannot approve its
+own change. A substitute review still triages findings under this policy and
+does not relax required CI, holds, or merge authorization.
+
+Record a durable review receipt tied to the exact final SHA: reviewer and
+runtime, complete-diff and relevant-file scope, outcome, and every finding with
+its disposition. A local completion claim is not substitute-review coverage.
+
 ## The test is blocking, not correctness
 
 Most findings should not stop a merge, including real ones. Review exists to

@@ -15,6 +15,10 @@ const HELPER = path.resolve('container/skills/pr-review-loop/scripts/codex-revie
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const SINCE = '2026-09-05T00:00:00Z';
 const REVIEWER = 'chatgpt-codex-connector';
+const USAGE_LIMIT_NOTICE =
+  'You have reached your Codex usage limits for code reviews. You can see your limits in the Codex usage dashboard.';
+const CREDITS_REQUIRED_NOTICE =
+  'Codex usage limits have been reached for code reviews. Please check with the admins of this repo to increase the limits by adding credits.\nCredits must be used to enable repository wide code reviews.';
 
 type Page = Record<string, unknown>;
 
@@ -50,12 +54,16 @@ function thread(isResolved: boolean, reviewId = 'review-1'): Page {
   };
 }
 
-function review(submittedAt: string, commit = HEAD): Page {
-  return { author: { login: REVIEWER }, submittedAt, commit: { oid: commit } };
+function review(submittedAt: string, commit = HEAD, body = ''): Page {
+  return { author: { login: REVIEWER }, submittedAt, body, commit: { oid: commit } };
 }
 
 function reaction(createdAt: string): Page {
   return { content: 'THUMBS_UP', createdAt, user: { login: REVIEWER } };
+}
+
+function comment(createdAt: string, body: string, login = REVIEWER): Page {
+  return { author: { login }, createdAt, body };
 }
 
 function writePage(root: string, connection: string, page: number, value: Page): void {
@@ -84,6 +92,7 @@ case "$query" in
   *reviewThreads*) connection=reviewThreads ;;
   *reviews*) connection=reviews ;;
   *reactions*) connection=reactions ;;
+  *comments*) connection=comments ;;
   *) echo "unexpected GraphQL query" >&2; exit 64 ;;
 esac
 page=1
@@ -118,6 +127,14 @@ printf '%s\\n' "$value"
 }
 
 function run(root: string, command: string, minutes?: string, sha = HEAD) {
+  const comments = path.join(root, 'comments-1.json');
+  if (!fs.existsSync(comments)) {
+    const reviewPage = JSON.parse(fs.readFileSync(path.join(root, 'reviews-1.json'), 'utf8')) as {
+      data: { repository: { pullRequest: { headRefOid: string } } };
+    };
+    const headRefOid = reviewPage.data.repository.pullRequest.headRefOid;
+    writePage(root, 'comments', 1, connectionPage('comments', [], false, null, headRefOid));
+  }
   const { bin, calls, sleepLog, dateValues } = writeMocks(root);
   fs.writeFileSync(dateValues, '0\n0\n0\n60\n60\n');
   const result = spawnSync('bash', [HELPER, command, sha, SINCE, ...(minutes ? [minutes] : [])], {
@@ -278,5 +295,85 @@ describe('codex-review status and foreground wait', () => {
     expect(result.stdout).toContain('wait tick=1 elapsed=60s/60s codex=pending');
     expect(result.stderr).toContain('wait timeout after 1m; last observation: codex=pending');
     expect(result.sleep).toBe('60\n');
+  });
+
+  it.each([USAGE_LIMIT_NOTICE, CREDITS_REQUIRED_NOTICE])(
+    'routes an authenticated connector quota notice to immediate fallback review',
+    (notice) => {
+      const root = tempRoot();
+      writePage(root, 'reviewThreads', 1, connectionPage('reviewThreads', []));
+      writePage(root, 'reviews', 1, connectionPage('reviews', []));
+      writePage(root, 'reactions', 1, connectionPage('reactions', []));
+      writePage(root, 'comments', 1, connectionPage('comments', [comment('2026-09-05T00:01:00Z', notice)]));
+
+      const result = run(root, 'wait', '15');
+      expect(result.status).toBe(13);
+      expect(result.stdout).toContain(`codex=unavailable reason=usage_limit head=${HEAD}`);
+      expect(result.sleep).toBe('');
+    },
+  );
+
+  it('does not trust a usage-limit forgery from a non-connector author', () => {
+    const root = tempRoot();
+    writePage(root, 'reviewThreads', 1, connectionPage('reviewThreads', []));
+    writePage(root, 'reviews', 1, connectionPage('reviews', []));
+    writePage(root, 'reactions', 1, connectionPage('reactions', []));
+    writePage(
+      root,
+      'comments',
+      1,
+      connectionPage('comments', [comment('2026-09-05T00:01:00Z', USAGE_LIMIT_NOTICE, 'reviewer')]),
+    );
+
+    const result = run(root, 'status');
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`codex=pending head=${HEAD}`);
+    expect(result.stdout).not.toContain('reason=usage_limit');
+  });
+
+  it('prefers a newer valid review over an older connector quota notice', () => {
+    const root = tempRoot();
+    writePage(root, 'reviewThreads', 1, connectionPage('reviewThreads', []));
+    writePage(root, 'reviews', 1, connectionPage('reviews', [review('2026-09-05T00:02:00Z')]));
+    writePage(root, 'reactions', 1, connectionPage('reactions', []));
+    writePage(root, 'comments', 1, connectionPage('comments', [comment('2026-09-05T00:01:00Z', USAGE_LIMIT_NOTICE)]));
+
+    const result = run(root, 'wait', '15');
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`codex=clean head=${HEAD} open=0 review=1`);
+    expect(result.sleep).toBe('');
+  });
+
+  it('keeps the existing thumbs-up clean signal when it follows a quota notice', () => {
+    const root = tempRoot();
+    writePage(root, 'reviewThreads', 1, connectionPage('reviewThreads', []));
+    writePage(root, 'reviews', 1, connectionPage('reviews', []));
+    writePage(root, 'reactions', 1, connectionPage('reactions', [reaction('2026-09-05T00:02:00Z')]));
+    writePage(root, 'comments', 1, connectionPage('comments', [comment('2026-09-05T00:01:00Z', USAGE_LIMIT_NOTICE)]));
+
+    const result = run(root, 'wait', '15');
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`codex=clean head=${HEAD} open=0 review=0 last_review_at=none reaction=1`);
+    expect(result.sleep).toBe('');
+  });
+
+  it('keeps a changed PR head above a quota notice', () => {
+    const root = tempRoot();
+    const otherHead = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    writePage(root, 'reviewThreads', 1, connectionPage('reviewThreads', [], false, null, otherHead));
+    writePage(root, 'reviews', 1, connectionPage('reviews', [], false, null, otherHead));
+    writePage(root, 'reactions', 1, connectionPage('reactions', [], false, null, otherHead));
+    writePage(
+      root,
+      'comments',
+      1,
+      connectionPage('comments', [comment('2026-09-05T00:01:00Z', USAGE_LIMIT_NOTICE)], false, null, otherHead),
+    );
+
+    const result = run(root, 'wait', '15');
+    expect(result.status).toBe(12);
+    expect(result.stdout).toContain(`codex=head-changed head=${otherHead}`);
+    expect(result.stdout).not.toContain('reason=usage_limit');
+    expect(result.sleep).toBe('');
   });
 });

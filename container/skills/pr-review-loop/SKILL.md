@@ -9,7 +9,7 @@ Codex (`chatgpt-codex-connector[bot]`) reviews a PR when it opens, and afterward
 
 **The whole skill is one rule: a round is a batch.** Collect every unresolved comment, decide on all of them, fix all the accepted ones in one commit, push once. Never push a commit for a single comment.
 
-**Then stop, and do not ask for a re-review.** The reviewer decides whether your commit warrants another look, and silence is an answer — it means the change did not need one. A `@codex review` comment overrides that judgment and manufactures a round nobody wanted. On 2026-08-09 one deployment drove a 213-line PR to four requested rounds in two and a half hours, then blocked its own merge on the count; four PRs sat frozen with CI green, one with every thread already resolved. If a repo genuinely has no automatic reviewer, that is a deployment fact its instructions should state — it is not a reason to start pinging.
+**Then stop, and do not ask for a re-review.** The reviewer decides whether your commit warrants another look; a bounded observation supplies the result or routes an unavailable reviewer under [Review availability](../../../docs/review-policy.md#review-availability) (in a container: `/workspace/project/docs/review-policy.md#review-availability`). A `@codex review` comment overrides that judgment and manufactures a round nobody wanted. On 2026-08-09 one deployment drove a 213-line PR to four requested rounds in two and a half hours, then blocked its own merge on the count; four PRs sat frozen with CI green, one with every thread already resolved. If a repo genuinely has no automatic reviewer, that is a deployment fact its instructions should state — it is not a reason to start pinging.
 
 ## When to enter, and at what round
 
@@ -163,7 +163,7 @@ codex-review.sh gate [--committed-only]   # the reframe gate — exit 3 when a c
 codex-review.sh push [git push args…]     # gate, then push — the loop's only push path
 codex-review.sh reply <comment_id> <text> # reply on that thread
 codex-review.sh resolve <thread_id>       # mark it resolved
-codex-review.sh status <sha> <since_iso>  # one GraphQL observation, including last review/reaction timestamps
+codex-review.sh status <sha> <since_iso>  # one GraphQL observation, including connector availability
 codex-review.sh wait <sha> <since_iso> [minutes]
                                          # foreground 60s GraphQL poll; default $CODEX_REVIEW_WAIT_MINUTES or 15
 ```
@@ -172,7 +172,7 @@ Three details it encodes, each of which has cost real debugging time — keep th
 
 - `open` and `status` print the PR's total round count (distinct findings-bearing Codex reviews) and a STOP banner at 4+. The banner is the round-4+ diagnosis path above made deterministic: per-file churn detection missed a 16-round PR whose findings hopped between files, so the tripwire fires on total rounds regardless of where the findings land. Acknowledge it by diagnosing, never by pushing.
 - The reviewer is `chatgpt-codex-connector` in GraphQL. Match case-insensitively on a prefix, never `==` against one spelling.
-- `status` and `wait` page through GraphQL `reviewThreads`, reviews, and reactions separately. They verify the current PR head still starts with the supplied SHA, count unresolved Codex threads from every round, ignore stale reviews and 👍 reactions, and print the last review/reaction timestamp even while still pending.
+- `status` and `wait` page through GraphQL `reviewThreads`, reviews, top-level comments, and reactions separately. They verify the current PR head still starts with the supplied SHA, count unresolved Codex threads from every round, ignore stale reviews and 👍 reactions, and treat an authenticated connector usage-limit notice for this head as unavailable unless a later valid review supersedes it.
 - Codex signals a clean review two ways: a review with no unresolved threads, **or** just a 👍 reaction on the PR. An `eyes` reaction means the review is still running — not a result.
 
 ## Step 1 — Collect the full open set
@@ -317,17 +317,18 @@ verified. The exits are deliberate:
   recapture the head SHA and timestamp only after reconciling that change.
 - `1` — the GraphQL request, pagination, or observation validation failed.
   Stop: it is no verdict and must never read as clean.
-- `11` after the bound — **not approval**. Do not merge or ping Codex. Run one
-  available independent review of exactly `$SHA`, supplying
-  `docs/review-policy.md`; triage and work any findings through steps 1–4.
-  After a clean fallback review and the required gates, merge only within the
-  user's existing authorization; ask if no such authorization exists.
+- `13` with `codex=unavailable reason=usage_limit` — **not approval**. Do not
+  wait for quota or ping Codex. Take the immediate fresh-context independent
+  review route in [Review availability](../../../docs/review-policy.md#review-availability)
+  (container path: `/workspace/project/docs/review-policy.md#review-availability`).
+- `11` after the bound — **not approval**. Take that same fresh-context
+  independent review route; do not merge or ping Codex.
 
 `codex=findings` → back to step 1, increment the round.
 
 **`codex=pending` is not a permanent state to sit in.** It is bounded by the
-foreground poll, and its 15-minute timeout routes to independent review rather
-than treating silence as a clean result.
+foreground poll; a timeout or explicit unavailable result routes to independent
+review rather than treating silence as a clean result.
 
 ## Step 6 — Merge with authorization
 
