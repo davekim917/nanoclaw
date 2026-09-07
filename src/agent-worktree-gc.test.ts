@@ -366,6 +366,43 @@ describe('failed probes and the pre-delete re-check', () => {
     expect(fs.existsSync(branched)).toBe(true);
   });
 
+  // An ignored file can be a build directory (regenerable) or a local .env or
+  // stray patch (not). The proof does not try to tell them apart — measured on
+  // this host, only a handful of worktrees carry any, and one of them was a
+  // hand-written patch file, so the conservative reading is nearly free.
+  it('treats an ignored-but-present file as uncommitted work', () => {
+    const { repo, wt } = realRepo();
+    fs.writeFileSync(path.join(repo, '.gitignore'), 'secret.env\n');
+    execFileSync('git', ['add', '.gitignore'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'ignore'], {
+      cwd: repo,
+      stdio: 'ignore',
+    });
+    fs.writeFileSync(path.join(wt, 'secret.env'), 'TOKEN=keepme');
+    const a = assess(
+      {
+        path: wt,
+        head: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: wt, encoding: 'utf-8' }).trim(),
+        branch: null,
+        missing: false,
+        locked: false,
+      },
+      repo,
+      { mainRef: 'main', procRoot: tmp(), openPrBranches: new Set() },
+    );
+    expect(a.verdict).toBe('dirty');
+  });
+
+  // Every git failure inside assess now funnels through one catch instead of a
+  // per-call-site null decision — that seam is what stopped this class from
+  // recurring a fifth time.
+  it('turns any git failure inside assess into probe-failed, not a default', () => {
+    const a = assess({ path: tmp(), head: 'a'.repeat(40), branch: null, missing: false, locked: false }, tmp(), {
+      procRoot: tmp(),
+    });
+    expect(a.verdict).toBe('probe-failed');
+  });
+
   it('dry-run removes nothing', () => {
     const { repo, wt } = realRepo();
     const r = runAgentWorktreeGcOnce(repo, { mode: 'dry-run', mainRef: 'main', procRoot: tmp() });

@@ -77,9 +77,40 @@ export interface Assessment {
   detail: string;
 }
 
-function git(repoRoot: string, args: string[]): string | null {
+/** A git invocation that failed. Caught in exactly one place, in `assess`. */
+export class ProbeError extends Error {
+  constructor(readonly args: string[]) {
+    super(`git ${args.join(' ')} failed`);
+    this.name = 'ProbeError';
+  }
+}
+
+/**
+ * Run git, or THROW.
+ *
+ * This is the seam. It used to return `string | null`, and every call site
+ * independently decided what null meant — four of them decided wrong, in four
+ * separate review rounds, each time by letting a default stand in for a result
+ * that was never obtained (`?? ''` twice, a swallowed prune failure, a capped
+ * listing). Returning a value that can be quietly defaulted is what made that
+ * class of bug writable, so it no longer returns one.
+ *
+ * `assess` catches ProbeError once and turns it into `probe-failed`. Callers
+ * outside `assess` that genuinely tolerate failure use `gitTolerant`, and there
+ * are two of them, both of which report the failure rather than absorb it.
+ */
+function git(repoRoot: string, args: string[]): string {
   try {
     return execFileSync('git', args, { cwd: repoRoot, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  } catch {
+    throw new ProbeError(args);
+  }
+}
+
+/** For the two callers outside `assess`; null MUST be reported, never defaulted. */
+function gitTolerant(repoRoot: string, args: string[]): string | null {
+  try {
+    return git(repoRoot, args);
   } catch {
     return null;
   }
@@ -221,6 +252,17 @@ export function assess(
     mainWorktreePath?: string;
   } = {},
 ): Assessment {
+  try {
+    return assessOrThrow(row, repoRoot, opts);
+  } catch (err) {
+    if (err instanceof ProbeError) {
+      return { row, verdict: 'probe-failed', detail: `${err.message} — eligibility could not be established` };
+    }
+    throw err;
+  }
+}
+
+function assessOrThrow(row: WorktreeRow, repoRoot: string, opts: Parameters<typeof assess>[2] = {}): Assessment {
   const mainRef = opts.mainRef ?? 'origin/main';
 
   // The primary worktree is whichever git lists FIRST, not whichever directory
@@ -262,18 +304,20 @@ export function assess(
     };
   }
 
-  // `?? ''` here would be a fail-OPEN: a corrupt or unreadable index makes
-  // git exit non-zero, and an empty status reads as a clean tree. The worktree
-  // would then be force-removed with uncommitted files still in it.
-  const status = git(row.path, ['status', '--porcelain']);
-  if (status === null) {
-    return { row, verdict: 'probe-failed', detail: 'git status failed — cleanliness could not be established' };
-  }
+  // `--ignored` is part of the proof: a build directory is regenerable, but a
+  // local `.env` or a stray patch file is not, and both are ignored. Measured
+  // on this host, only 18 worktrees carry non-node_modules ignored files —
+  // `data`, `dist`, `logs`, and one hand-written patch — so protecting them
+  // costs almost nothing and saves exactly the file worth saving.
+  // A failure here throws and is caught above; it can no longer read as clean.
+  const status = git(row.path, ['status', '--porcelain', '--ignored']);
   if (hasTrackedChanges(status)) {
     return { row, verdict: 'dirty', detail: 'uncommitted tracked changes' };
   }
 
-  const contained = git(repoRoot, ['merge-base', '--is-ancestor', row.head, mainRef]) !== null;
+  // `--is-ancestor` exits non-zero for "not an ancestor", which is an ANSWER,
+  // not a probe failure — so it is asked tolerantly and the null read as false.
+  const contained = gitTolerant(repoRoot, ['merge-base', '--is-ancestor', row.head, mainRef]) !== null;
   if (!contained) {
     return { row, verdict: 'unmerged', detail: `HEAD ${row.head.slice(0, 8)} is not an ancestor of ${mainRef}` };
   }
@@ -333,7 +377,7 @@ export function openPrBranches(repoRoot: string): Set<string> | null {
 
 /** Null when the inventory could not be taken — NOT an empty inventory. */
 export function listWorktrees(repoRoot: string): WorktreeRow[] | null {
-  const porcelain = git(repoRoot, ['worktree', 'list', '--porcelain']);
+  const porcelain = gitTolerant(repoRoot, ['worktree', 'list', '--porcelain']);
   if (porcelain === null) return null;
   return parseWorktreeList(porcelain).map((row) => ({ ...row, missing: !fs.existsSync(row.path) }));
 }
@@ -398,7 +442,16 @@ export function runAgentWorktreeGcOnce(
       // worktree or written to it — and the whole pass is the window. Acting on
       // a stored verdict is acting on stale evidence; re-running the probes
       // narrows the window to the gap between this check and the unlink.
-      const fresh = assess(a.row, repoRoot, assessOpts);
+      // Re-read HEAD too. Trusting the surveyed value would validate a commit
+      // that may no longer be current: an agent can commit into this worktree
+      // between the survey and now, and the merged-into-main proof would then
+      // be about a commit that is no longer checked out.
+      const currentHead = gitTolerant(a.row.path, ['rev-parse', 'HEAD']);
+      if (currentHead === null) {
+        skippedOnRecheck.push({ path: a.row.path, verdict: 'probe-failed', detail: 'HEAD unreadable at removal time' });
+        continue;
+      }
+      const fresh = assess({ ...a.row, head: currentHead }, repoRoot, assessOpts);
       if (fresh.verdict !== 'eligible') {
         skippedOnRecheck.push({ path: a.row.path, verdict: fresh.verdict, detail: fresh.detail });
         continue;
@@ -406,11 +459,11 @@ export function runAgentWorktreeGcOnce(
 
       // --force overrides only the untracked-node_modules objection; the
       // re-check above already proved there are no tracked edits.
-      const out = git(repoRoot, ['worktree', 'remove', '--force', a.row.path]);
+      const out = gitTolerant(repoRoot, ['worktree', 'remove', '--force', a.row.path]);
       if (out === null) failed.push({ path: a.row.path, err: 'git worktree remove failed' });
       else removed.push(a.row.path);
     }
-    if (prunedRegistrations > 0 && git(repoRoot, ['worktree', 'prune']) === null) {
+    if (prunedRegistrations > 0 && gitTolerant(repoRoot, ['worktree', 'prune']) === null) {
       // Silently swallowing this would report registrations as reclaimed when
       // they are all still there on the next run.
       failed.push({ path: '(git worktree prune)', err: 'prune failed — orphaned registrations remain' });
