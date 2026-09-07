@@ -575,7 +575,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
         mailbox: {
           countLiveTasks: () => 0,
           hasPendingRecallPairedTrigger: () => false,
-          readWorkContinuation: () => null,
+          readContinuationPresence: () => null,
         },
         plan: { workContinuation: null },
       } as never);
