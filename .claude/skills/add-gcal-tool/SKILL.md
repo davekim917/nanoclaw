@@ -120,7 +120,7 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "@cocal/google-calendar-mcp@${CALENDAR_MCP_VERSION}"
 ```
 
-`container/agent-runner/src/providers/claude.ts` derives the allow-pattern dynamically from each group's `mcpServers` map (`Object.keys(this.mcpServers).map(mcpAllowPattern)`), so registering `calendar` in Phase 3 automatically allows `mcp__calendar__*`.
+`container/agent-runner/src/providers/claude.ts` sets no explicit `allowedTools` list on its SDK query — only `disallowedTools: SDK_DISALLOWED_TOOLS` — so the tool surface is open by default and registering `calendar` in Phase 3 alone exposes `mcp__calendar__*`, no allow-pattern needed.
 
 ### Install the dependency-guard test
 

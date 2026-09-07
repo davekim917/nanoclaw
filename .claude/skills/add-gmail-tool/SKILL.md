@@ -103,7 +103,7 @@ echo "ALREADY APPLIED — skip to Phase 3"
 
 ### Copy the skill's tests into the container tree
 
-Both integration points this skill relies on live in the container (Bun) tree — the Dockerfile package install and the dynamic allow-pattern derivation in `claude.ts` — so the guards go there. `cp` overwrites, so re-running is safe.
+Both integration points this skill relies on live in the container (Bun) tree — the Dockerfile package install and the open-by-default MCP tool surface in `claude.ts` — so the guards go there. `cp` overwrites, so re-running is safe.
 
 ```bash
 S=.claude/skills/add-gmail-tool
@@ -112,7 +112,7 @@ cp $S/tests/gmail-allow-pattern.test.ts container/agent-runner/src/providers/gma
 ```
 
 - `gmail-dockerfile.test.ts` asserts the `GMAIL_MCP_VERSION` ARG and the pinned `pnpm install -g` line are present — the `gmail-mcp` binary is a Dockerfile-installed CLI, not importable or typed, so this structural guard is what goes red if the install is dropped.
-- `gmail-allow-pattern.test.ts` asserts `claude.ts` still spreads `Object.keys(this.mcpServers).map(mcpAllowPattern)` into `allowedTools` — the derivation that makes registering `gmail` (Phase 3) enough to expose `mcp__gmail__*`.
+- `gmail-allow-pattern.test.ts` asserts `claude.ts` still sets no explicit `allowedTools` list (only `disallowedTools: SDK_DISALLOWED_TOOLS`) on its SDK query — the design that makes registering `gmail` (Phase 3) enough to expose `mcp__gmail__*` without any allow-pattern to derive.
 
 ### Add MCP server to Dockerfile
 
@@ -144,7 +144,7 @@ Pinned version matters — the latest-stable policy still requires a fixed ARG v
 
 **Why the `zod-to-json-schema` pin:** `@gongrzhe/server-gmail-autoauth-mcp@1.1.11` has loose deps (`zod-to-json-schema: ^3.22.1`, `zod: ^3.22.4`). pnpm resolves `zod-to-json-schema` to the latest 3.25.x, which imports `zod/v3` — a subpath that only exists in `zod>=3.25`. But `zod` resolves to `3.24.x` (highest satisfying `^3.22.4` without breaking peer ranges). Result: `ERR_PACKAGE_PATH_NOT_EXPORTED` at import time. Pinning `zod-to-json-schema` to a pre-v3-subpath version avoids it. Re-check if you bump `GMAIL_MCP_VERSION`.
 
-The Gmail allow-pattern is derived automatically. `container/agent-runner/src/providers/claude.ts` builds `allowedTools` from each group's `mcpServers` map (`Object.keys(this.mcpServers).map(mcpAllowPattern)`), so registering `gmail` in Phase 3 exposes `mcp__gmail__*` to the agent.
+Gmail tools are exposed automatically, no allow-pattern needed. `container/agent-runner/src/providers/claude.ts` sets no explicit `allowedTools` list on its SDK query — only `disallowedTools: SDK_DISALLOWED_TOOLS` — so the tool surface is open by default and registering `gmail` in Phase 3 alone exposes `mcp__gmail__*` to the agent.
 
 ### Rebuild the container image
 
