@@ -143,6 +143,40 @@ describe('storage activity leases', () => {
     }
   });
 
+  // container-runner leases topicWorktreesDir() on EVERY spawn, so a topic
+  // root missing from the reset keeps its markers across host restarts
+  // forever, and tryRunWithStorageCleanupClaim then refuses every cleanup on
+  // that topic because its marker directory is non-empty. On the production
+  // install that was 168 topics holding markers from 118 distinct host pids,
+  // 117 of them dead, oldest 2026-08-26.
+  it('resets stale activity markers and claims under topic worktrees', () => {
+    const dataDir = tempRoot();
+    const topic = path.join(dataDir, 'v2-topics', 'wg-example', 'thread-abc', 'worktrees');
+    fs.mkdirSync(path.join(topic, '.nanoclaw-storage-active'), { recursive: true });
+    fs.writeFileSync(path.join(topic, '.nanoclaw-storage-active', 'sess-x-4242-uuid'), '4242\n');
+    fs.writeFileSync(path.join(topic, '.nanoclaw-storage-cleanup'), '{"pid":4242}');
+
+    expect(activeMarkers(topic)).toHaveLength(1);
+
+    clearStorageCleanupClaims(dataDir);
+    expect(fs.existsSync(path.join(topic, '.nanoclaw-storage-cleanup'))).toBe(false);
+    // A claim sweep must never disturb a live lease, only the claim.
+    expect(activeMarkers(topic)).toHaveLength(1);
+
+    resetStorageActivityState(dataDir);
+    expect(activeMarkers(topic)).toHaveLength(0);
+    expect(fs.existsSync(path.join(topic, '.nanoclaw-storage-active'))).toBe(false);
+  });
+
+  it('leaves a topic directory that has no worktrees root alone', () => {
+    const dataDir = tempRoot();
+    const bare = path.join(dataDir, 'v2-topics', 'wg-example', 'conversation-none');
+    fs.mkdirSync(bare, { recursive: true });
+    // No worktrees/ under it: nothing to enumerate, and no throw.
+    expect(() => resetStorageActivityState(dataDir)).not.toThrow();
+    expect(fs.existsSync(bare)).toBe(true);
+  });
+
   // Inbound message writes now take a lease on sessionDir() and wait for any
   // claim there with no timeout, so a session root this sweep misses is a
   // session whose stale claim is never cleared and whose messages never land.

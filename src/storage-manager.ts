@@ -34,7 +34,7 @@ import { CONTAINER_CONFIGS_ALL_SQL } from './db/container-configs.js';
 import type { ContainerConfigRow } from './types.js';
 import { log } from './log.js';
 import { resolveRepositoryWorkUnit } from './repository-workspaces.js';
-import { tryRunWithStorageCleanupClaim } from './storage-activity.js';
+import { STORAGE_INTERNAL_ENTRY_NAMES, tryRunWithStorageCleanupClaim } from './storage-activity.js';
 // The session-directory LAYOUT, not the data: this file's reclaim probes open
 // their own read-only handles, so all they need from the seam is where a
 // session's two files live.
@@ -2131,6 +2131,54 @@ function pathsOverlap(a: string, b: string): boolean {
   return isPathInside(left, right) || isPathInside(right, left);
 }
 
+/**
+ * The `worktrees/` reading of a topic's idle clock, with this module's own
+ * footprint removed.
+ *
+ * A directory's mtime moves when an ENTRY is added or removed under it, so
+ * `worktrees/` mtime is written by two things that are not activity at all:
+ * the spawn path's `.nanoclaw-storage-active` lease (created and removed on
+ * every container spawn) and this file's own `.nanoclaw-storage-cleanup`
+ * claim (created and removed inside `root` by every applied action). Reading
+ * the directory's own mtime therefore reads "a container was spawned for this
+ * topic recently, or we swept it recently", and on the production install that
+ * held 47 of 53 candidate trees permanently fresh — the clock was pinned just
+ * under the gate by the fleet's own spawn cadence.
+ *
+ * The children are the honest reading: a checkout directory's mtime moves when
+ * the checkout itself changes, and neither writer above touches one. The
+ * directory's own mtime remains the fallback for an EMPTY `worktrees/`, where
+ * there is nothing else to read and the creation time is the only signal there
+ * has ever been.
+ *
+ * This is only the file-side term. The caller still takes `max()` with the
+ * central DB's `last_active` for the topic's sessions, which is the real
+ * activity signal and is unaffected by any of this.
+ */
+function worktreeContentMtimeMs(worktreeRoot: string, ownMtimeMs: number): number {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(worktreeRoot, { withFileTypes: true });
+  } catch {
+    // Unreadable after the lstat that got us here: fall back rather than
+    // inventing freshness or staleness from a failed syscall.
+    return ownMtimeMs;
+  }
+
+  let newest = 0;
+  for (const entry of entries) {
+    if (STORAGE_INTERNAL_ENTRY_NAMES.includes(entry.name)) continue;
+    try {
+      const mtime = fs.lstatSync(path.join(worktreeRoot, entry.name)).mtimeMs;
+      if (mtime > newest) newest = mtime;
+    } catch {
+      // Removed under us mid-walk; it contributes nothing either way.
+    }
+  }
+  // No non-internal children at all — an empty or lease-only `worktrees/`.
+  return newest === 0 ? ownMtimeMs : newest;
+}
+
 /** Why a candidate was refused. Every value is a reason to KEEP the tree. */
 type SweepRefusal =
   | 'worktrees-unreadable'
@@ -2177,7 +2225,7 @@ function sweepEligibility(args: {
   const workgroupId = path.basename(path.dirname(args.topicDir));
   const lastActivity = Math.max(
     args.sessionActivity.get(`${workgroupId}/${path.basename(args.topicDir)}`) ?? 0,
-    worktreeStat.mtimeMs,
+    worktreeContentMtimeMs(worktreeRoot, worktreeStat.mtimeMs),
   );
   if (args.now - lastActivity < args.idleMs) return 'recently-active';
 
@@ -2223,17 +2271,26 @@ function topicIsUnmounted(topicDir: string, lookup: () => string[] | null): bool
  * comment at its declaration.
  *
  * IDLE SIGNAL — `max(sessions.last_active for the topic's participants,
- * mtime of <topic>/worktrees)`. Deliberately NOT:
+ * newest mtime among <topic>/worktrees CHILDREN, excluding this system's own
+ * lease and claim entries)`. Deliberately NOT:
  *   - the regenerable tree's own mtime. It moves on install, not on use, so a
  *     tree installed in June and read every day since still dates to June. It
  *     measures the last `npm ci`, not activity.
  *   - the topic dir's own mtime. Any bulk metadata touch on the parent bumps
  *     every topic at once (#203: 360 topic dirs sharing a 2-second window),
  *     which here would make the whole fleet look fresh and silently disable
- *     the sweep. `worktrees/` is the deeper real signal for the same reason
- *     the topic GC reads it: it is the bind-mount source, and the
- *     `.nanoclaw-storage-active` lease dirs are created and removed directly
- *     under it on every container spawn.
+ *     the sweep.
+ *   - `worktrees/`'s OWN mtime, which is what this used to read. A directory
+ *     mtime moves when an entry is added or removed under it, and the two
+ *     things that add and remove entries there are both ours: the spawn path's
+ *     `.nanoclaw-storage-active` lease, and this file's own
+ *     `.nanoclaw-storage-cleanup` claim. So the reading was our own footprint,
+ *     and it was pinned just under the gate by the fleet's spawn cadence — on
+ *     the production install, 47 of 53 candidate trees (27.0 GB of 29.7 GB)
+ *     refused as `recently-active` with 20 of 31 topics sitting between 24 and
+ *     44 hours against a 48-hour gate, and eleven of them sharing one
+ *     identical timestamp from a single spawn burst. `worktreeContentMtimeMs`
+ *     reads the children instead, which neither writer touches.
  * `last_active` covers the converse hole — turns that touch no file under
  * `worktrees/` at all. The MAX is taken so that a fresh reading on ANY signal
  * preserves the tree; every signal must be stale before anything is swept.

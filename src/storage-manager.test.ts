@@ -44,6 +44,7 @@ import {
   type DockerImageInventory,
   type StorageReport,
 } from './storage-manager.js';
+import { acquireStorageActivityLease, tryRunWithStorageCleanupClaim } from './storage-activity.js';
 import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, CONTAINER_INSTALL_LABEL } from './config.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { resolveRepositoryWorkUnit } from './repository-workspaces.js';
@@ -2441,9 +2442,30 @@ describe('storage-manager regenerable tree sweep', () => {
     if (options.lockfile !== false) {
       fs.writeFileSync(path.join(repoDir, 'package-lock.json'), '{"lockfileVersion":3}');
     }
-    const stamp = (now - (options.idleDays ?? 10) * DAY_MS) / 1000;
-    fs.utimesSync(path.join(topicDir, 'worktrees'), stamp, stamp);
+    ageTopic(topicDir, options.idleDays ?? 10);
     return { topicDir, repoDir };
+  }
+
+  /**
+   * Back-date a topic so the sweep reads it as idle.
+   *
+   * The CHECKOUT carries the age, not just its parent. `worktrees/`'s own
+   * mtime is written by the spawn lease and by the sweep's own cleanup claim,
+   * so it is no longer the signal (see `worktreeContentMtimeMs`); stamping
+   * only the parent made a fixture "idle" in a way production never is, which
+   * is exactly how the pollution bug hid here.
+   *
+   * Call this LAST. Creating anything inside a checkout bumps that checkout's
+   * mtime back to now, so a test that adds a `.turbo` or a lockfile after
+   * `makeTopic` has to re-age the topic before sweeping.
+   */
+  function ageTopic(topicDir: string, idleDays = 10): void {
+    const stamp = (now - idleDays * DAY_MS) / 1000;
+    const worktreeRoot = path.join(topicDir, 'worktrees');
+    for (const entry of fs.readdirSync(worktreeRoot)) {
+      fs.utimesSync(path.join(worktreeRoot, entry), stamp, stamp);
+    }
+    fs.utimesSync(worktreeRoot, stamp, stamp);
   }
 
   function sweep(
@@ -2486,6 +2508,89 @@ describe('storage-manager regenerable tree sweep', () => {
     expect(fs.existsSync(path.join(repoDir, 'node_modules'))).toBe(false);
     expect(fs.readFileSync(path.join(repoDir, 'src', 'app.ts'), 'utf8')).toBe('the actual work');
     expect(fs.existsSync(path.join(repoDir, 'package.json'))).toBe(true);
+  });
+
+  /**
+   * THE REGRESSION THIS FILE MISSED FOR THE LIFE OF THE SWEEP.
+   *
+   * `makeTopic` back-dates `<topic>/worktrees` with utimesSync, so every other
+   * fixture hand-writes the exact directory production writes to and no test
+   * ever ran the real lease. In production the spawn path takes a lease on
+   * that directory on EVERY container start, and creating plus removing
+   * `.nanoclaw-storage-active` under it bumps its mtime — which was the idle
+   * signal. The clock was therefore reset by the fleet's own spawn cadence and
+   * 47 of 53 candidate trees refused as `recently-active` forever.
+   *
+   * Both writers are exercised here because both are ours and both bump the
+   * same directory: the spawn lease, and this module's own cleanup claim. The
+   * claim is taken on every action ATTEMPT, including attempts that go on to
+   * be skipped, so it must not move the signal either.
+   */
+  it('keeps the idle signal stable across a spawn lease acquire and release', async () => {
+    const { topicDir, repoDir } = makeTopic('thread-cccccccccccccccccccccccccccccccc');
+    const worktreeRoot = path.join(topicDir, 'worktrees');
+    const before = fs.lstatSync(worktreeRoot).mtimeMs;
+
+    const lease = await acquireStorageActivityLease(worktreeRoot, 'sess-spawn');
+    await lease.release();
+
+    // The directory's own mtime DID move — that is the mechanism, not a bug to
+    // hide. What must not move is the signal the sweep reads.
+    expect(fs.lstatSync(worktreeRoot).mtimeMs).toBeGreaterThan(before);
+
+    const report = sweep();
+    expect(report.actions).toEqual([
+      expect.objectContaining({ kind: 'sweep-regenerable-tree', path: path.join(repoDir, 'node_modules') }),
+    ]);
+    expect(report.skipped.freshTopics).toBe(0);
+  });
+
+  it('keeps the idle signal stable across a cleanup claim create and remove', () => {
+    const { topicDir, repoDir } = makeTopic('thread-dddddddddddddddddddddddddddddddd');
+    const worktreeRoot = path.join(topicDir, 'worktrees');
+
+    // Exactly what an action attempt does to `root`, with no deletion.
+    expect(tryRunWithStorageCleanupClaim(worktreeRoot, () => {})).toBe(true);
+
+    const report = sweep();
+    expect(report.actions).toEqual([
+      expect.objectContaining({ kind: 'sweep-regenerable-tree', path: path.join(repoDir, 'node_modules') }),
+    ]);
+    expect(report.skipped.freshTopics).toBe(0);
+  });
+
+  it('tolerates a worktrees root with no checkouts in it', () => {
+    // The `ownMtimeMs` fallback is defensive only: a root with no
+    // non-internal children has no regenerable targets under it either, so
+    // the branch cannot change any sweep outcome. This pins that it runs
+    // without throwing rather than claiming an eligibility result it cannot
+    // produce.
+    const worktreeRoot = path.join(topicsRoot, 'wg-acme', 'thread-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', 'worktrees');
+    fs.mkdirSync(worktreeRoot, { recursive: true });
+
+    const report = sweep();
+    expect(report.actions).toEqual([]);
+  });
+
+  it('does not read a still-held lease directory as fresh content', async () => {
+    const { topicDir, repoDir } = makeTopic('thread-ffffffffffffffffffffffffffffffff');
+    const worktreeRoot = path.join(topicDir, 'worktrees');
+    // The lease directory is present and NOT yet released, so it is the
+    // newest thing in `worktrees/` by a wide margin. Excluded from the
+    // reading, the aged checkout beside it still decides, and the topic stays
+    // sweepable. (A held lease still blocks the DELETE, via the cleanup
+    // claim's marker count — that is a separate gate, covered in
+    // storage-activity.test.ts.)
+    const lease = await acquireStorageActivityLease(worktreeRoot, 'sess-held');
+    try {
+      const report = sweep({ mode: 'dry-run' });
+      expect(report.actions).toEqual([
+        expect.objectContaining({ kind: 'sweep-regenerable-tree', path: path.join(repoDir, 'node_modules') }),
+      ]);
+      expect(report.skipped.freshTopics).toBe(0);
+    } finally {
+      await lease.release();
+    }
   });
 
   it('skips a topic a running container bind-mounts', () => {
@@ -2586,11 +2691,12 @@ describe('storage-manager regenerable tree sweep', () => {
   const NEVER_SWEPT = ['dist', 'build', '.next', 'coverage', '.cache'];
 
   it('never sweeps build output directories, only dependency-install output', () => {
-    const { repoDir } = makeTopic('thread-22222222222222222222222222222222');
+    const { topicDir, repoDir } = makeTopic('thread-22222222222222222222222222222222');
     for (const name of NEVER_SWEPT) {
       fs.mkdirSync(path.join(repoDir, name), { recursive: true });
       fs.writeFileSync(path.join(repoDir, name, 'output.js'), `tracked ${name} output`);
     }
+    ageTopic(topicDir);
 
     const report = sweep();
 
@@ -2601,7 +2707,7 @@ describe('storage-manager regenerable tree sweep', () => {
   });
 
   it('never sweeps a virtualenv, which is not reconstructible without a lockfile', () => {
-    const { repoDir } = makeTopic('thread-33333333333333333333333333333333');
+    const { topicDir, repoDir } = makeTopic('thread-33333333333333333333333333333333');
     // A venv grown by ad-hoc `pip install` with nothing committed is unique
     // state, and no cheap check distinguishes it from a lockfile-pinned one.
     // __pycache__ is swept beside it: PEP 3147 bytecode is not importable
@@ -2612,6 +2718,7 @@ describe('storage-manager regenerable tree sweep', () => {
     }
     fs.mkdirSync(path.join(repoDir, 'src', '__pycache__'), { recursive: true });
     fs.writeFileSync(path.join(repoDir, 'src', '__pycache__', 'app.cpython-312.pyc'), 'bytecode');
+    ageTopic(topicDir);
 
     const report = sweep();
 
@@ -2641,10 +2748,11 @@ describe('storage-manager regenerable tree sweep', () => {
   it.each(['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock'])(
     'accepts %s as the recorded manifest',
     (manifest) => {
-      const { repoDir } = makeTopic(`thread-5555555555555555555555555555555${manifest.length % 10}`, {
+      const { topicDir, repoDir } = makeTopic(`thread-5555555555555555555555555555555${manifest.length % 10}`, {
         lockfile: false,
       });
       fs.writeFileSync(path.join(repoDir, manifest), 'pinned');
+      ageTopic(topicDir);
 
       const report = sweep();
 
@@ -2654,7 +2762,7 @@ describe('storage-manager regenerable tree sweep', () => {
   );
 
   it('gates only node_modules on a manifest — the other names carry their own reproducer', () => {
-    const { repoDir } = makeTopic('thread-66666666666666666666666666666666', { lockfile: false });
+    const { topicDir, repoDir } = makeTopic('thread-66666666666666666666666666666666', { lockfile: false });
     // No lockfile anywhere, so node_modules is refused. .turbo is keyed by a
     // hash of its inputs and __pycache__ is not importable without its .py, so
     // neither needs an external file to prove it reconstructible.
@@ -2662,6 +2770,7 @@ describe('storage-manager regenerable tree sweep', () => {
     fs.writeFileSync(path.join(repoDir, '.turbo', 'run.log'), 'task cache');
     fs.mkdirSync(path.join(repoDir, 'src', '__pycache__'), { recursive: true });
     fs.writeFileSync(path.join(repoDir, 'src', '__pycache__', 'app.cpython-312.pyc'), 'bytecode');
+    ageTopic(topicDir);
 
     const report = sweep();
 
@@ -2754,9 +2863,10 @@ describe('storage-manager regenerable tree sweep', () => {
     // and the cleanup claim bumps worktrees/ — any apply-time guard that read
     // those would refuse everything after the first deletion, and the sweep
     // would silently reclaim one tree per topic forever.
-    const { repoDir } = makeTopic('thread-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc');
+    const { topicDir, repoDir } = makeTopic('thread-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc');
     fs.mkdirSync(path.join(repoDir, '.turbo'), { recursive: true });
     fs.writeFileSync(path.join(repoDir, '.turbo', 'run.log'), 'task cache');
+    ageTopic(topicDir);
 
     const report = sweep();
 
