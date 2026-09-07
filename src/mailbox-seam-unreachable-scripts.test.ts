@@ -738,7 +738,7 @@ describe('storage-manager.ts / storage-activity.ts contain no literal seam call'
       'src/modules/mailbox/index.ts': ['sessionMailboxPath'],
       'src/repository-workspaces.ts': ['resolveRepositoryWorkUnit'],
       'src/session-manager.ts': ['sessionContextPathFor', 'sessionsBaseDir', 'threadsBaseDir', 'threadWorktreeDir'],
-      'src/storage-activity.ts': ['tryRunWithStorageCleanupClaim'],
+      'src/storage-activity.ts': ['STORAGE_INTERNAL_ENTRY_NAMES', 'tryRunWithStorageCleanupClaim'],
       // `import type { ContainerConfigRow }` — a whole-clause type-only
       // import, erased at compile time. discoverRelativeModules still
       // records the module-graph edge (it doesn't distinguish type-only

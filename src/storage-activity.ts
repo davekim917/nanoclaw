@@ -7,6 +7,22 @@ import { log } from './log.js';
 
 const ACTIVE_DIR = '.nanoclaw-storage-active';
 const CLEANUP_CLAIM = '.nanoclaw-storage-cleanup';
+
+/**
+ * The two entry names this module creates and removes inside a resource root.
+ *
+ * Exported because an idle signal that reads a resource root's own mtime is
+ * reading THIS MODULE'S footprint: creating or removing a directory entry
+ * bumps the parent's mtime, so a lease acquire/release pair and a cleanup
+ * claim create/remove pair each move it. Any reader that ages a root must
+ * exclude these names, and it must get them from here rather than restating
+ * the literals, so the exclusion cannot drift away from the writer.
+ *
+ * See `sweepEligibility` in storage-manager.ts, which is the reader this was
+ * extracted for.
+ */
+export const STORAGE_INTERNAL_ENTRY_NAMES: readonly string[] = [ACTIVE_DIR, CLEANUP_CLAIM];
+
 const CLAIM_WAIT_MS = 25;
 // A stale claim is cleared only by the next host start, and inbound message
 // writes wait on this loop. Waiting is right — it is what keeps the message —
@@ -491,6 +507,27 @@ function resourceRoots(dataDir: string = DATA_DIR): string[] {
     for (const thread of subdirectories(topLevelPath)) {
       const nestedWorktrees = path.join(topLevelPath, thread.name, 'worktrees');
       if (realDirectory(nestedWorktrees)) roots.add(nestedWorktrees);
+    }
+  }
+
+  // Topic worktrees: v2-topics/<workgroup>/<kind>-<id>/worktrees, exactly the
+  // path container-runner.ts leases on every spawn via topicWorktreesDir().
+  //
+  // Omitting them is why 168 topics on the production install were holding
+  // marker files from 118 distinct host pids, only one of which was still
+  // alive, with the oldest dating to 2026-08-26. A marker is released by its
+  // holder; an ungracefully stopped host never releases, and the startup reset
+  // is the ONLY thing that clears the leftovers. A root missing from this list
+  // therefore keeps its markers forever, and
+  // `tryRunWithStorageCleanupClaim` refuses every cleanup on a root whose
+  // marker directory is non-empty — so the topic's regenerable trees can never
+  // be swept again.
+  const topicsRoot = path.join(dataDir, 'v2-topics');
+  for (const workgroup of subdirectories(topicsRoot)) {
+    const workgroupPath = path.join(topicsRoot, workgroup.name);
+    for (const topic of subdirectories(workgroupPath)) {
+      const worktrees = path.join(workgroupPath, topic.name, 'worktrees');
+      if (realDirectory(worktrees)) roots.add(worktrees);
     }
   }
   return [...roots];
