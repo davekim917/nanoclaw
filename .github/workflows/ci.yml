@@ -33,9 +33,6 @@ jobs:
       - name: Public repository boundary
         run: pnpm run check:public-boundary -- --portable
 
-      - name: Instruction-surface ceilings
-        run: pnpm run check:instruction-ceilings
-
       # Seam 3 — neither pre-push locally (bypassed with --no-verify, or a
       # push from a checkout without husky's git hooks wired) nor the
       # `prebuild` guard (only reached by `pnpm run build`, which CI never

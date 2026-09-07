@@ -1,19 +1,15 @@
 /**
- * Byte ceilings and the banned-pattern scan for the always-on instruction surface
+ * Banned-pattern scan for the always-on instruction surface
  * (docs/specs/instruction-stack-prune/plan.md).
  *
- * Split out of `fleet-drift.ts` so the CI gate in `check-instruction-ceilings.ts`
- * can enforce these without importing the fleet-drift module, which pulls in
- * `better-sqlite3` at load. Comparing two byte counts must not need a DB driver.
- * `fleet-drift.ts` re-exports everything here, so its existing callers are unchanged.
+ * Kept out of `fleet-drift.ts` so the scan can be imported and reasoned about
+ * on its own, without loading that module (and `better-sqlite3` with it).
+ * `fleet-drift.ts` re-exports it, so its existing callers are unchanged.
+ *
+ * There are deliberately no byte ceilings here: truncating a standing file to
+ * hit an arbitrary number is not a quality bar. What a file must never carry is
+ * point-in-time content, which is what this scan is for.
  */
-
-/** container/CLAUDE.md alone (shared base, not persona/fragments). */
-export const CONTAINER_BYTES_CEILING = 10_240;
-/** Repo-root CLAUDE.md alone — loads into every host session and any container agent working on the nanoclaw repo itself. */
-export const TRUNK_DOC_BYTES_CEILING = 16_384;
-/** Per group: its standing-instructions/persona file(s) + CLAUDE.local.md. */
-export const GROUP_STANDING_BYTES_CEILING = 8_192;
 
 const BANNED_PATTERNS: Array<{ name: string; re: RegExp }> = [
   { name: 'iso_date', re: /\b20\d{2}-\d{2}-\d{2}\b/ },
