@@ -34,9 +34,25 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NANOCLAW_DIR="${NANOCLAW_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 cd "$NANOCLAW_DIR"
 
-# Same key the host uses (src/config.ts: ONECLI_GATEWAY_CONTAINER, default
-# "onecli"); ONECLI_CONTAINER stays accepted so existing drop-ins keep working.
-CONTAINER="${ONECLI_GATEWAY_CONTAINER:-${ONECLI_CONTAINER:-onecli}}"
+
+# Read a key from NanoClaw's .env the way src/env.ts does: trim, then strip one
+# matching pair of single OR double quotes. The host honours .env for these
+# settings, so a shell expansion that only sees exported variables silently
+# disagrees with the host about which container and which timezone are in use.
+env_get() {  # <key>
+  [ -r "$NANOCLAW_DIR/.env" ] || return 0
+  sed -n "s/^[[:space:]]*$1=//p" "$NANOCLAW_DIR/.env" | tail -1 | tr -d '\r' | awk '
+    { gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+      if (length($0) >= 2 && ((substr($0,1,1)=="\"" && substr($0,length($0),1)=="\"") || (substr($0,1,1)=="'"'"'" && substr($0,length($0),1)=="'"'"'"))) 
+        $0 = substr($0, 2, length($0)-2)
+      print }'
+}
+
+# Same key and the same sources the host uses (src/config.ts reads process env
+# THEN .env); ONECLI_CONTAINER stays accepted so existing drop-ins keep working.
+CONTAINER="${ONECLI_GATEWAY_CONTAINER:-${ONECLI_CONTAINER:-}}"
+[ -n "$CONTAINER" ] || CONTAINER="$(env_get ONECLI_GATEWAY_CONTAINER)"
+CONTAINER="${CONTAINER:-onecli}"
 RESTART_PCT="${RESTART_PCT:-70}"   # restart at/above this % of the soft limit
 DRY_RUN="${DRY_RUN:-0}"
 RECOVER_WAIT_S="${RECOVER_WAIT_S:-60}"   # bound on waiting for the gateway to return
@@ -193,36 +209,31 @@ if [ -z "$INSTALL_TZ" ]; then
   INSTALL_TZ="$(systemctl show "${NANOCLAW_SERVICE_UNIT:-nanoclaw-v2}" -p Environment --value 2>/dev/null \
     | tr ' ' '\n' | sed -n 's/^TZ=//p' | head -1)" || INSTALL_TZ=''
 fi
-if [ -z "$INSTALL_TZ" ] && [ -r "$NANOCLAW_DIR/.env" ]; then
-  INSTALL_TZ="$(sed -n 's/^[[:space:]]*TZ=//p' "$NANOCLAW_DIR/.env" | tail -1 | tr -d '"\r')" || INSTALL_TZ=''
-fi
+[ -n "$INSTALL_TZ" ] || INSTALL_TZ="$(env_get TZ)"
 INSTALL_TZ="${INSTALL_TZ:-UTC}"
 
-# Exclusive create, not a bare `>`: the outbox can be a workgroup directory an
-# agent container may also write, and a predictable per-second filename could be
-# pre-created there as a symlink, which `>` would follow and truncate. mktemp
-# creates the file itself with O_EXCL and an unguessable suffix.
-# Write to an O_EXCL temp name, then rename into place with the .md suffix
-# outbox-ship.sh globs for. mktemp creates the file itself, so there is no
-# predictable path to pre-create as a symlink, and rename(2) replaces the
-# destination entry rather than writing through one. The random suffix is kept
-# in the final name so nothing about it is guessable ahead of the timer.
-TMP_OUT="$(mktemp "$OUTBOX/$(date -u +%Y%m%dT%H%M%S)-onecli-fd-watchdog.XXXXXX")" || {
-  echo "fd-watchdog: could not create an alert file in $OUTBOX — NOBODY WAS TOLD" >&2
-  exit 1
-}
-OUT="$TMP_OUT.md"
+# One atomic create-and-write. `set -C` makes `>` use O_CREAT|O_EXCL, which
+# REFUSES an existing path — a symlink included — rather than following it. That
+# closes the window a mktemp-then-reopen sequence leaves open, where an agent
+# sharing this directory could unlink the created file and drop a symlink at the
+# name before the redirect reopens it. The name also carries randomness so there
+# is nothing to pre-create, and `>` respects umask, so the shipper (running as
+# the install user) can read what root wrote — mktemp's 0600 could not be.
+RAND="$(od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+OUT="$OUTBOX/$(date -u +%Y%m%dT%H%M%S)-onecli-fd-watchdog.${RAND:-$$}.md"
+umask 022
+set -C
 {
   printf '*OneCLI gateway fd watchdog*\n_host: %s · %s_\n\n' "$(hostname)" "$(TZ="$INSTALL_TZ" date '+%Y-%m-%d %H:%M %Z')"
   printf 'The gateway reached %s%% of its %s-fd limit (%s sockets held but unreclaimable) and %s.\n\n' \
     "$PCT" "$SOFT" "$STUCK" "$OUTCOME"
   printf 'Root cause is the upstream leak in onecli/onecli#484, still open. This watchdog is containment, not a fix.\n'
-} > "$TMP_OUT"
-# mktemp creates 0600 and this timer runs as root, but outbox-ship.sh runs as
-# the install user — a mode it cannot read is an alert that never ships, which
-# is the same silent failure by a different route.
-chmod 0644 "$TMP_OUT"
-mv -f "$TMP_OUT" "$OUT"
+} > "$OUT" || {
+  set +C
+  echo "fd-watchdog: could not create $OUT (pre-existing path?) — NOBODY WAS TOLD" >&2
+  exit 1
+}
+set +C
 
 [ -s "$OUT" ] || {
   echo "fd-watchdog: wrote an empty alert to $OUT" >&2
