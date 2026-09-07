@@ -153,21 +153,24 @@ describe('scripts/notify-owner.ts', () => {
     // not cd'd would otherwise read a different install's DB and .env and exit
     // 2 ("no owner DM") exactly when an alert matters. The defaults must come
     // from the module's own location instead.
+    const installRoot = path.resolve(__dirname, '..');
+    const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'notify-owner-cwd-'));
     const cwd = process.cwd();
     try {
-      process.chdir(os.tmpdir());
-      const { default: notifyOwnerModule } = await import('./notify-owner.js').then((m) => ({ default: m }));
-      // No dbPath/rootDir: the defaults must still point at this checkout,
-      // whose real data/v2.db either exists (-> not a path error) or does not
-      // (-> a message naming THIS repo's path, never the cwd we chdir'd to).
-      const result = await notifyOwnerModule.notifyOwner({ title: 'T', body: 'B' });
-      expect(result.code).not.toBe(0); // no real token is configured under test
-      if (result.message.includes('data/v2.db')) {
-        expect(result.message).toContain(path.resolve(__dirname, '..'));
-        expect(result.message).not.toContain(os.tmpdir());
-      }
+      process.chdir(elsewhere);
+      const { notifyOwner: fresh } = await import('./notify-owner.js');
+      // No dbPath/rootDir. The defaults must name THIS checkout's central DB,
+      // never the directory we happen to be standing in. Asserting against
+      // `elsewhere` rather than os.tmpdir() matters because the checkout
+      // itself can live under /tmp (gate worktrees do), which made the
+      // cruder assertion fail for the wrong reason.
+      const result = await fresh({ title: 'T', body: 'B' });
+      expect(result.code).toBe(2); // no owner row / no DB under test
+      expect(result.message).toContain(path.join(installRoot, 'data', 'v2.db'));
+      expect(result.message).not.toContain(elsewhere);
     } finally {
       process.chdir(cwd);
+      fs.rmSync(elsewhere, { recursive: true, force: true });
     }
   });
 });
