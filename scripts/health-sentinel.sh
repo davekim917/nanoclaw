@@ -284,12 +284,14 @@ fi
 # `log_off`/`err_off`/`restarts` are a window CURSOR: persist them on every run
 # or the next run re-scans the same bytes and re-alerts forever.
 #
-# `last_alert` is a RECEIPT of a DM that actually went out, so it is stamped
-# only after the socket send returns (bottom of this file). Stamping it here
-# burned the 6h cooldown on undelivered alerts — worst precisely when it
-# matters, because cli.sock is served BY nanoclaw-v2 itself: the
-# `service|nanoclaw-v2 is <state>` breach is undeliverable exactly when it
-# fires, and the old code then sat silent for 6h having "already alerted".
+# `last_alert` is a RECEIPT of a delivery that actually happened (DM or
+# outbox), so it is stamped only after notify-owner.ts (or the outbox write)
+# resolves (bottom of this file), never before. Stamping it here burned the 6h
+# cooldown on undelivered alerts — worst precisely when it matters: this
+# sentinel's own `service|nanoclaw-v2 is <state>` breach fires exactly when
+# nanoclaw-v2 (and anything depending on it, like the old cli.sock delivery
+# path) may be unreachable, and the old code then sat silent for 6h having
+# "already alerted".
 export STATE_FILE LOG_SIZE ERR_SIZE RESTARTS
 ALERT_FILE=$(mktemp)
 trap 'rm -f "$ALERT_FILE"' EXIT
@@ -348,63 +350,30 @@ if [ -z "$ALERT_LINES" ]; then
 fi
 
 # ── deliver the alert ───────────────────────────────────────────────────────
-# DM by default: these are host-ops alerts for one operator and do not belong in
-# a shared channel. Sent AS THE OWNER's user id, never a synthetic
-# `system:<name>` sender — the router treats that as an unknown user and an
-# owner DM under `unknown_sender_policy = strict` DROPS it while `sendall()`
-# returns success, which is what muted this sentinel for three days (#538).
+# scripts/notify-owner.ts, NOT data/cli.sock. That socket is served BY
+# nanoclaw-v2 and is only the CLI *channel adapter* (src/channels/cli.ts): a
+# `to:` payload becomes an INBOUND event and queues work for an agent, which
+# must then spawn a container and compose a reply before anyone sees anything
+# — and this sentinel's own `service|nanoclaw-v2 is <state>` breach is
+# undeliverable exactly when it fires, since nanoclaw-v2 serves that socket.
+# There is also no ack frame on that path, so a successful `sendall()` proved
+# nothing was delivered — that muted this sentinel for three days once
+# already (#538). notify-owner.ts posts to Slack directly and only reports
+# success on a verified `ok: true` response.
 #
-# The outbox remains as an OPT-IN fallback (HEALTH_SENTINEL_OUTBOX) for the case
-# cli.sock cannot serve, since it is nanoclaw-v2 that serves it. It is opt-in
-# because the workgroup outbox ships to a shared channel.
-NOTIFICATION="Host health alert ($(date '+%Y-%m-%d %H:%M %Z')):
-$ALERT_LINES
+# DM by default: these are host-ops alerts for one operator and do not belong
+# in a shared channel. The outbox remains as an OPT-IN fallback
+# (HEALTH_SENTINEL_OUTBOX) for the case notify-owner.ts cannot deliver — it is
+# opt-in because the workgroup outbox ships to a shared channel.
+TITLE="Host health alert"
+NOTIFICATION="$ALERT_LINES
 
 Triage: logs/nanoclaw.error.log first, then \`pnpm exec tsx scripts/host-health.ts\`."
 
 DELIVERED=0
-ADMIN_ROW="$(node_modules/.bin/tsx scripts/q.ts "$NANOCLAW_DIR/data/v2.db" "
-  SELECT mg.platform_id, ud.channel_type, ur.user_id
-    FROM user_roles ur
-    JOIN user_dms ud ON ud.user_id = ur.user_id
-    JOIN messaging_groups mg ON mg.id = ud.messaging_group_id
-   WHERE ur.role = 'owner'
-   ORDER BY ud.resolved_at DESC
-   LIMIT 1
-" 2>/dev/null | tail -1)" || ADMIN_ROW=''
-DM_PLATFORM_ID="$(echo "$ADMIN_ROW" | cut -d'|' -f1)"
-DM_CHANNEL_TYPE="$(echo "$ADMIN_ROW" | cut -d'|' -f2)"
-DM_USER_ID="$(echo "$ADMIN_ROW" | cut -d'|' -f3)"
-CLI_SOCK="$NANOCLAW_DIR/data/cli.sock"
-
-if [ -n "$DM_PLATFORM_ID" ] && [ -n "$DM_USER_ID" ] && [ -S "$CLI_SOCK" ]; then
-  export NOTIFICATION DM_CHANNEL_TYPE DM_PLATFORM_ID DM_USER_ID CLI_SOCK
-  if python3 <<'PYEOF'
-import json, os, socket, sys, time
-try:
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(10)
-    sock.connect(os.environ["CLI_SOCK"])
-    sock.sendall((json.dumps({
-        "text": os.environ["NOTIFICATION"],
-        "senderId": os.environ["DM_USER_ID"],
-        "sender": "Host Health Sentinel",
-        "to": {
-            "channelType": os.environ["DM_CHANNEL_TYPE"],
-            "platformId": os.environ["DM_PLATFORM_ID"],
-            "threadId": os.environ["DM_PLATFORM_ID"],
-        },
-    }) + "\n").encode("utf-8"))
-    time.sleep(0.5)
-    sock.close()
-except Exception as e:
-    print(f"dm send failed: {e}", file=sys.stderr)
-    sys.exit(1)
-PYEOF
-  then
-    DELIVERED=1
-    echo "health-sentinel: alert sent to the owner DM"
-  fi
+if node_modules/.bin/tsx scripts/notify-owner.ts --title "$TITLE" --body "$NOTIFICATION"; then
+  DELIVERED=1
+  echo "health-sentinel: alert sent to the owner DM"
 fi
 
 OUTBOX="${HEALTH_SENTINEL_OUTBOX:-}"
@@ -413,7 +382,8 @@ if [ "$DELIVERED" = "0" ] && [ -n "$OUTBOX" ] && [ -d "$OUTBOX" ] && [ -w "$OUTB
   ALERT_OUT="$OUTBOX/$(date -u +%Y%m%dT%H%M%S)-health-sentinel.${RAND:-$$}.md"
   umask 022
   set -C
-  printf '*Host health alert*\n\n%s\n' "$NOTIFICATION" > "$ALERT_OUT" && DELIVERED=1
+  printf '*%s*\n\nThe owner DM could not be delivered; queuing to the shared outbox instead.\n\n%s\n' \
+    "$TITLE" "$NOTIFICATION" > "$ALERT_OUT" && DELIVERED=1
   set +C
   [ "$DELIVERED" = "1" ] && echo "health-sentinel: alert queued $ALERT_OUT"
 fi

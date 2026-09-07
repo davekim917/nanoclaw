@@ -22,12 +22,22 @@ FAILED=0
 mkdir -p "$ROOT/data" "$ROOT/logs" "$ROOT/node_modules/.bin" "$ROOT/bin" "$ROOT/scripts"
 printf 'line\n%.0s' {1..50} > "$ROOT/logs/nanoclaw.log"
 : > "$ROOT/logs/nanoclaw.error.log"
-: > "$ROOT/scripts/q.ts"
+: > "$ROOT/scripts/notify-owner.ts"
 
-# tsx stub: the owner-DM lookup. Real script calls node_modules/.bin/tsx.
+# tsx stub: real script calls `node_modules/.bin/tsx scripts/notify-owner.ts
+# --title ... --body ...` to deliver the owner DM. This fixture has no real
+# data/v2.db and no Slack token, so the real notify-owner.ts would fail to
+# even resolve an owner row — this stub mirrors exactly that outcome (exit 2,
+# "cannot even try") without needing a real DB. Every case below therefore
+# exercises the outbox FALLBACK, which is real, unstubbed code — asserting on
+# the queued file is what makes this check honest, unlike the old cli.sock
+# fixture, which accepted a connect and proved nothing about whether the
+# router would have dropped the payload (exactly how the real delivery
+# failure went unnoticed for three days).
 cat > "$ROOT/node_modules/.bin/tsx" <<'EOS'
 #!/bin/bash
-echo "UOWNER|slack"
+echo "notify-owner-stub: no fixture DB/token configured — cannot deliver" >&2
+exit 2
 EOS
 chmod +x "$ROOT/node_modules/.bin/tsx"
 
@@ -64,7 +74,7 @@ print(s.get('last_alert',{}).get(sys.argv[2],''))" "$ROOT/data/health-sentinel-s
 ok() { printf 'PASS  %s\n' "$1"; }
 bad() { printf 'FAIL  %s\n     %s\n' "$1" "$2"; FAILED=1; }
 
-# ── 1. delivery fails (no socket) → cooldown NOT burned, offsets DO advance ──
+# ── 1. delivery fails (no owner DB/token) → cooldown NOT burned, offsets advance ──
 run_sentinel TEST_ALERT=1
 RC=$?
 [ "$RC" -ne 0 ] || bad "failed delivery must exit non-zero" "rc=$RC out=$OUT"
@@ -81,17 +91,13 @@ case "$OUT" in
 esac
 
 # ── 2. delivery succeeds → cooldown stamped ─────────────────────────────────
-# Delivery is a written file in the outbox, not a socket connect: outbox-ship.sh
+# Delivery is a written file in the outbox, not a stubbed DM: outbox-ship.sh
 # POSTs it to Slack with its own token and no host process, which is the only
-# path that survives nanoclaw-v2 being down. Asserting on the queued file is
-# also what makes this check honest — the old socket fixture accepted a connect
-# and proved nothing about whether the router would have dropped the payload,
-# which is exactly how the real delivery failure went unnoticed for three days.
+# path that survives nanoclaw-v2 being down. The notify-owner.ts stub always
+# fails here (no fixture DB/token), so this exercises the outbox FALLBACK —
+# the same "delivery succeeded -> cooldown stamped" contract.
 OUTBOX="$ROOT/data/outbox"
 mkdir -p "$OUTBOX"
-# No cli.sock or central DB in the fixture, so the DM path cannot run here —
-# this exercises the outbox FALLBACK, which is the same "delivery succeeded ->
-# cooldown stamped" contract.
 export HEALTH_SENTINEL_OUTBOX="$OUTBOX"
 run_sentinel TEST_ALERT=1
 RC=$?
@@ -108,8 +114,9 @@ QUEUED=$(ls "$OUTBOX"/*health-sentinel*.md 2>/dev/null | wc -l)
   || bad "offsets did not advance" "log_off=$(state log_off)"
 
 # ── 3. WATCHED_TIMERS fails closed ──────────────────────────────────────────
-# Live socket sink for this section: the breach text only exists in the DM
-# payload, so asserting on stdout alone would pass on a connect failure.
+# notify-owner.ts always fails in this fixture (see the stub above), so every
+# breach here lands in the outbox — the breach text only exists in the queued
+# file, so asserting on stdout alone would pass even when nothing breached.
 trap 'rm -rf "$ROOT"' EXIT
 
 breaches_on() { # label, env...
