@@ -46,17 +46,22 @@ cd "$NANOCLAW_DIR"
 # Args: <key> <env-file>
 read_env_value() {
   [ -r "${2:-}" ] || return 0
-  sed -n "s/^[[:space:]]*$1[[:space:]]*=//p" "$2" | tail -1 | tr -d '\r' | awk '
+  sed -n "s/^[[:space:]]*$1[[:space:]]*=//p" "$2" | tr -d '\r' | awk '
     { gsub(/^[[:space:]]+|[[:space:]]+$/, "")
       if (length($0) >= 2 && ((substr($0,1,1)=="\"" && substr($0,length($0),1)=="\"") || (substr($0,1,1)=="'"'"'" && substr($0,length($0),1)=="'"'"'")))
         $0 = substr($0, 2, length($0)-2)
-      print }'
+      if (length($0) > 0) last = $0 }
+    END { if (length(last) > 0) print last }'
 }
 
-# Same key and the same sources the host uses (src/config.ts reads process env
-# THEN .env); ONECLI_CONTAINER stays accepted so existing drop-ins keep working.
-CONTAINER="${ONECLI_GATEWAY_CONTAINER:-${ONECLI_CONTAINER:-}}"
+# Resolution order mirrors the host: the CANONICAL key from process env, then
+# the canonical key from .env, and only then the legacy alias. The host reads
+# ONECLI_GATEWAY_CONTAINER alone (src/config.ts), so letting an exported legacy
+# alias win over a canonical .env setting would point the watchdog at a
+# different container than the one the host actually runs.
+CONTAINER="${ONECLI_GATEWAY_CONTAINER:-}"
 [ -n "$CONTAINER" ] || CONTAINER="$(read_env_value ONECLI_GATEWAY_CONTAINER "$NANOCLAW_DIR/.env")"
+[ -n "$CONTAINER" ] || CONTAINER="${ONECLI_CONTAINER:-}"
 CONTAINER="${CONTAINER:-onecli}"
 RESTART_PCT="${RESTART_PCT:-70}"   # restart at/above this % of the soft limit
 DRY_RUN="${DRY_RUN:-0}"
@@ -195,14 +200,13 @@ if [ -z "$OUTBOX" ]; then
   echo "fd-watchdog: FD_WATCHDOG_OUTBOX/UNIT_ALERT_OUTBOX unset — the gateway was handled but NOBODY WAS TOLD" >&2
   exit 1
 fi
-mkdir -p "$OUTBOX"
-# `mkdir -p` on a dangling compat symlink succeeds at creating nothing usable,
-# so verify afterwards — an alert written into the void is this script's own
-# failure mode.
-[ -d "$OUTBOX" ] && [ -w "$OUTBOX" ] || {
-  echo "fd-watchdog: outbox unusable: $OUTBOX — the gateway was handled but NOBODY WAS TOLD" >&2
+# Do NOT mkdir the outbox. This runs as root, so creating a missing final
+# directory would leave it root-owned 0755: the install-user shipper could read
+# the queued alert but not rename it into sent/, so it would retry forever.
+if [ ! -d "$OUTBOX" ] || [ ! -w "$OUTBOX" ]; then
+  echo "fd-watchdog: outbox missing or unwritable ($OUTBOX) — NOBODY WAS TOLD" >&2
   exit 1
-}
+fi
 
 # The filename stamp stays UTC so files sort globally; the human-visible time
 # renders in the INSTALL timezone, like every other user-facing NanoClaw
@@ -220,7 +224,13 @@ if [ -z "$INSTALL_TZ" ]; then
     | tr ' ' '\n' | sed -n 's/^TZ=//p' | head -1)" || INSTALL_TZ=''
 fi
 [ -n "$INSTALL_TZ" ] || INSTALL_TZ="$(read_env_value TZ "$NANOCLAW_DIR/.env")"
-INSTALL_TZ="${INSTALL_TZ:-UTC}"
+# Validate before use, and fall through rather than trusting the first
+# candidate: CLAUDE.md's timezone rule is fail-closed against the on-disk zone
+# database, so a fixed offset, retired alias or wrong-case name that `date`
+# would silently render as UTC must not be accepted as the install zone.
+tz_valid() { [ -n "${1:-}" ] && [ -f "/usr/share/zoneinfo/$1" ]; }
+tz_valid "$INSTALL_TZ" || INSTALL_TZ=""
+[ -n "$INSTALL_TZ" ] || INSTALL_TZ="UTC"
 
 # One atomic create-and-write. `set -C` makes `>` use O_CREAT|O_EXCL, which
 # REFUSES an existing path — a symlink included — rather than following it. That
