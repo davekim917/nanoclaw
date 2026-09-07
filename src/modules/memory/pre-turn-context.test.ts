@@ -53,7 +53,6 @@ import {
   boundedCapabilities,
   buildPreTurnContext,
   enforceFinalBound,
-  evaluateRecallCorpus,
   parsePreferenceFrontmatter,
   PRE_TURN_BOUNDS,
   tokenizeForRecall,
@@ -61,8 +60,8 @@ import {
   type ConversationEvidenceExcerpt,
   type MemoryEvidenceExcerpt,
   type PreTurnContext,
-  type RecallCorpus,
 } from './pre-turn-context.js';
+import { evaluateRecallCorpus, type RecallCorpus } from './recall-corpus-eval.js';
 import { withCentralSync } from '../../db/central-lease.js';
 import { resolveSessionServicesCentral, type SessionServicesCentral } from '../../capabilities.js';
 import { closeDb, getRawDb, initTestDb, runMigrations } from '../../db/index.js';
