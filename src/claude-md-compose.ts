@@ -52,6 +52,13 @@ const MCP_TOOLS_HOST_SUBPATH = path.join('container', 'agent-runner', 'src', 'mc
 const COMPOSED_HEADER =
   '<!-- Composed at spawn - do not edit. Standing instructions: standing-instructions.md. Memory: memory/. -->';
 
+export interface ComposeGroupClaudeMdOptions {
+  /** Spawn-resolved ID; do not re-derive a workgroup after reconciliation. */
+  workgroupId?: string;
+  /** Host-generated from the same policy and mounts as this spawn. */
+  workgroupReadAccessInstructions?: string | null;
+}
+
 /**
  * Regenerate `groups/<folder>/CLAUDE.md` from the shared base, built-in
  * module fragments, and MCP server fragments declared in `container.json`.
@@ -89,7 +96,11 @@ async function personaSymlinkRoots(group: AgentGroup, groupDir: string): Promise
   }
 }
 
-export async function composeGroupClaudeMd(group: AgentGroup, provider: string): Promise<void> {
+export async function composeGroupClaudeMd(
+  group: AgentGroup,
+  provider: string,
+  options: ComposeGroupClaudeMdOptions = {},
+): Promise<void> {
   const groupDir = path.resolve(GROUPS_DIR, group.folder);
   if (!fs.existsSync(groupDir)) {
     fs.mkdirSync(groupDir, { recursive: true });
@@ -110,6 +121,12 @@ export async function composeGroupClaudeMd(group: AgentGroup, provider: string):
     ? validateMcpServers(JSON.parse(configRow.mcp_servers) as Record<string, McpServerConfig>)
     : {};
   const desired = new Map<string, string>();
+
+  if (options.workgroupReadAccessInstructions) {
+    if (!options.workgroupId)
+      throw new Error('workgroup read-access instructions require a spawn-resolved workgroup ID');
+    desired.set('host-workgroup-read-access.md', options.workgroupReadAccessInstructions);
+  }
 
   // Built-in module fragments — every MCP/CLI module that ships a
   // sibling `<name>.instructions.md`. These describe how the agent should

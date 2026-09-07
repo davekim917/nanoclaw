@@ -12,6 +12,7 @@ vi.mock('./config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./config.js')>()),
   DATA_DIR: `${TEST_ROOT}/data`,
   GROUPS_DIR: `${TEST_ROOT}/groups`,
+  MOUNT_ALLOWLIST_PATH: `${TEST_ROOT}/mount-allowlist.json`,
   WORKGROUP_SHARED_FS: false,
 }));
 
@@ -90,6 +91,17 @@ function assignWorkgroup(ag: AgentGroup, workgroupId: string): void {
 
 function containerConfig(): ContainerConfig {
   return { mcpServers: {}, packages: { apt: [], npm: [] }, additionalMounts: [], skills: [] };
+}
+
+function writeWorkgroupReadAccessPolicy(
+  recipients: Record<string, { mode: 'all' | 'archives'; sources: '*' | string[] }>,
+): void {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(path.join(DATA_DIR, 'workgroup-read-access.json'), JSON.stringify({ version: 1, recipients }));
+  fs.writeFileSync(
+    path.join(TEST_ROOT, 'mount-allowlist.json'),
+    JSON.stringify({ allowedRoots: [{ path: DATA_DIR, allowReadWrite: false }], blockedPatterns: [] }),
+  );
 }
 
 async function providerContribution(
@@ -413,6 +425,72 @@ describe('initGroupFilesystem legacy seed isolation', async () => {
 });
 
 describe('buildMounts agent surfaces', async () => {
+  it('applies one workgroup policy to every provider sibling through the real additional-mount allowlist', async () => {
+    const recipient = group('ag-read-main', 'read-main');
+    const sibling = group('ag-read-codex', 'read-codex');
+    const source = group('ag-read-source', 'read-source');
+    const unrelated = group('ag-read-unrelated', 'read-unrelated');
+    for (const ag of [recipient, sibling, source, unrelated]) await createAgentGroup(ag);
+    assignWorkgroup(recipient, 'recipient');
+    assignWorkgroup(sibling, 'recipient');
+    assignWorkgroup(source, 'source');
+    assignWorkgroup(unrelated, 'unrelated');
+    for (const ag of [recipient, sibling, source, unrelated]) await ensureContainerConfig(ag.id);
+    for (const ag of [recipient, sibling, source, unrelated]) initGroupFilesystem(ag, {});
+
+    for (const relative of [
+      'workgroups/source/memory',
+      'workgroups/source/conversations',
+      'repositories/source',
+      'v2-topics/source',
+      'v2-threads/wg-source',
+      'workgroups/unrelated/memory',
+    ]) {
+      fs.mkdirSync(path.join(DATA_DIR, relative), { recursive: true });
+    }
+    writeWorkgroupReadAccessPolicy({ recipient: { mode: 'all', sources: ['source'] } });
+
+    const expectedPaths = [
+      '/workspace/extra/work/source/files',
+      '/workspace/extra/work/source/memory',
+      '/workspace/extra/work/source/conversations',
+      '/workspace/extra/work/source/repositories',
+      '/workspace/extra/work/source/topics',
+      '/workspace/extra/work/source/legacy-threads',
+    ];
+    for (const [provider, ag] of [
+      ['claude', recipient],
+      ['codex', sibling],
+      ['opencode', sibling],
+    ] as const) {
+      const mounts = await buildMounts(
+        ag,
+        session(`s-read-${provider}`, ag.id),
+        containerConfig(),
+        provider,
+        {},
+        'recipient',
+      );
+      const granted = mounts.filter((mount) => mount.workgroupReadAccess);
+      expect(granted.map((mount) => mount.containerPath).sort()).toEqual([...expectedPaths].sort());
+      expect(granted.every((mount) => mount.readonly)).toBe(true);
+      expect(granted.every((mount) => mount.hostPath.startsWith(DATA_DIR))).toBe(true);
+      expect(fs.readFileSync(path.join(GROUPS_DIR, ag.folder, 'AGENTS.md'), 'utf8')).toContain(
+        '/workspace/extra/work/source/files',
+      );
+    }
+
+    const denied = await buildMounts(
+      unrelated,
+      session('s-read-denied', unrelated.id),
+      containerConfig(),
+      'claude',
+      {},
+      'unrelated',
+    );
+    expect(denied.some((mount) => mount.workgroupReadAccess)).toBe(false);
+  });
+
   it('canonical-working-tree-is-not-container-accessible', async () => {
     const workgroupId = 'wg-repositories';
     const ag = group('ag-repositories', 'repositories-agent');

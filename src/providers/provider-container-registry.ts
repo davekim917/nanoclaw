@@ -27,6 +27,12 @@ export interface VolumeMount {
    * and container start — codex phase-A review P1).
    */
   overlayAllowedRoots?: string[];
+  /**
+   * Host-owned workgroup policy mount. Revalidated immediately before Docker
+   * receives the pathname, because source archives can be mutable while a
+   * spawn is assembling its other mounts.
+   */
+  workgroupReadAccess?: true;
 }
 
 export interface ProviderContainerContext {
