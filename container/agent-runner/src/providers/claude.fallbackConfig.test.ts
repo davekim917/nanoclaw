@@ -276,6 +276,16 @@ describe('ClaudeProvider fallback model vocabulary', () => {
     }
   });
 
+  it('test_uppercase_variants_are_refused_exactly_as_the_host_refuses_them', () => {
+    // The mirror was case-INSENSITIVE while the host is not, so these were
+    // accepted here and rejected there — forwarded verbatim as the API model
+    // instead of degrading to the safe alias.
+    for (const model of ['CLAUDE-OPUS-5[1M]', 'Claude-Opus-5[1m]', 'OPUS', 'Sonnet']) {
+      const p = make({ providerConfig: {}, model, onFallback: true });
+      expect([model, sticky(p).model]).toEqual([model, undefined]);
+    }
+  });
+
   it('test_other_providers_ids_are_still_refused', () => {
     for (const model of ['gpt-5.6-sol', 'opencode-go/kimi-k3', 'claude-', 'claude-opus-']) {
       const p = make({ providerConfig: {}, model, onFallback: true });
@@ -298,5 +308,11 @@ describe('ClaudeProvider fallback model vocabulary', () => {
     const hostSource = after.slice(start + 1, end + 1);
     expect(hostSource.startsWith('^(?:opus|sonnet|haiku|default|')).toBe(true);
     expect(CLAUDE_MODEL_RE.source).toBe(hostSource);
+    // Flags too. Comparing only `.source` let an `/i` here diverge from the
+    // host's case-sensitive regex unnoticed, which is how `CLAUDE-OPUS-5[1M]`
+    // reached stickyConfig while the host vocabulary refused it.
+    const hostFlags = after.slice(end + 2, after.indexOf(';', end));
+    expect(CLAUDE_MODEL_RE.flags).toBe(hostFlags);
+    expect(CLAUDE_MODEL_RE.flags).toBe('');
   });
 });

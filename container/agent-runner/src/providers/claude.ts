@@ -65,7 +65,10 @@ export const claudeConfigSchema = z.strictObject({
  * MUST stay in sync with `VALID_MODEL_RE` in `src/flag-parser.ts` — the host
  * is a separate Node package and nothing is importable across the boundary.
  * `claude.fallbackConfig.test.ts` parses that regex out of the host source and
- * fails on drift.
+ * fails on drift, comparing FLAGS as well as source: an `/i` here while the
+ * host stays case-sensitive is a real divergence, not a formatting one.
+ * `CLAUDE-OPUS-5[1M]` would then be refused by the host vocabulary and
+ * accepted into stickyConfig here, forwarded verbatim as the API model.
  *
  * A LOOSER shape here than the host's is not a harmless mismatch. This guards
  * operator-declared `providerFallback.model`, and whatever survives is folded
@@ -76,7 +79,7 @@ export const claudeConfigSchema = z.strictObject({
  * default. Per-family shapes, not a wildcard.
  */
 export const CLAUDE_MODEL_RE =
-  /^(?:opus|sonnet|haiku|default|claude-opus-\d+(?:-\d+)?(?:\[\dm\])?|claude-haiku-\d+-\d+(?:-\d+)?(?:\[\dm\])?|claude-sonnet-\d+(?:\[\dm\])?|claude-fable-\d+(?:-\d+)?(?:\[\dm\])?)$/i;
+  /^(?:opus|sonnet|haiku|default|claude-opus-\d+(?:-\d+)?(?:\[\dm\])?|claude-haiku-\d+-\d+(?:-\d+)?(?:\[\dm\])?|claude-sonnet-\d+(?:\[\dm\])?|claude-fable-\d+(?:-\d+)?(?:\[\dm\])?)$/;
 
 /**
  * Resolve the sticky (session-default) model/effort for a ClaudeProvider.
