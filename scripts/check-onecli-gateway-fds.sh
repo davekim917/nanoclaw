@@ -38,11 +38,37 @@ cd "$NANOCLAW_DIR"
 # then .env, then the default. Inventing a second variable here would leave an
 # install that set the documented ONECLI_GATEWAY_CONTAINER silently monitoring
 # the wrong container, which is the failure this watchdog exists to catch.
+# Mirror of src/env.ts:24-36 (readEnvValue) — trim the line, split on the first
+# `=`, trim the value, then unquote; an empty value means unset and the last
+# assignment wins. Mirrored rather than shelling out to the real parser on
+# purpose: this resolution runs on EVERY timer tick, and nested `pnpm exec tsx`
+# costs ~80s of CPU. The script pays that once on the restart path, which is
+# rare; paying it per tick would starve the host this watchdog protects.
+# Parity is asserted against the src/env-file.test.ts vectors by
+# scripts/check-onecli-gateway-fds.test.sh.
+read_env_value() {
+  [ -f "$2" ] || return 0
+  awk -v key="$1" '
+    {
+      line = $0
+      sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line)
+      if (line == "" || line ~ /^#/) next
+      eq = index(line, "="); if (eq == 0) next
+      k = substr(line, 1, eq - 1); sub(/[[:space:]]+$/, "", k)
+      if (k != key) next
+      v = substr(line, eq + 1)
+      sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v)
+      q = substr(v, 1, 1)
+      if (length(v) >= 2 && (q == "\"" || q == "'"'"'") && substr(v, length(v), 1) == q)
+        v = substr(v, 2, length(v) - 2)
+      if (v != "") out = v
+    }
+    END { if (out != "") print out }
+  ' "$2"
+}
+
 CONTAINER="${ONECLI_GATEWAY_CONTAINER:-}"
-if [ -z "$CONTAINER" ] && [ -f "$NANOCLAW_DIR/.env" ]; then
-  CONTAINER="$(sed -n 's/^[[:space:]]*ONECLI_GATEWAY_CONTAINER[[:space:]]*=[[:space:]]*//p' \
-    "$NANOCLAW_DIR/.env" | tail -1 | sed 's/^["'"'"']//; s/["'"'"']$//')"
-fi
+[ -n "$CONTAINER" ] || CONTAINER="$(read_env_value ONECLI_GATEWAY_CONTAINER "$NANOCLAW_DIR/.env")"
 CONTAINER="${CONTAINER:-onecli}"
 RESTART_PCT="${RESTART_PCT:-70}"   # restart at/above this % of the soft limit
 DRY_RUN="${DRY_RUN:-0}"
