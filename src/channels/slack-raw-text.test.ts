@@ -150,10 +150,16 @@ describe('extractSlackRawText', () => {
       expect(slackMentionOutsideCode(projected, BOT)).toBe(false);
     }
 
-    // A fenced run closes only on an equal-or-longer run, so an inner
-    // three-backtick sequence cannot leak from a four-backtick fence.
-    const protectedFence = extractSlackRawText(cellRaw([{ type: 'text', text: '```<@UBOT>', style: { code: true } }]))!;
-    expect(slackMentionOutsideCode(protectedFence, BOT)).toBe(false);
+    // Content carrying a run of THREE or more backticks is protected too. This
+    // was the #256 leak: slackMentionOutsideCode once let ANY 3+ run close a
+    // fence, so the inner run below closed the outer one early and left the
+    // mention as prose. The scanner now requires a closer at least as long as
+    // the opener, so the 3-run cannot close a 4-backtick fence and the mention
+    // stays inside the code region — for the projection and for the same body
+    // typed by hand.
+    const longFence = extractSlackRawText(cellRaw([{ type: 'text', text: '```<@UBOT>', style: { code: true } }]))!;
+    expect(longFence).toBe('```` ```<@UBOT> ````');
+    expect(slackMentionOutsideCode(longFence, BOT)).toBe(false);
     expect(slackMentionOutsideCode('```` ```<@UBOT> ship ````', BOT)).toBe(false);
 
     const preformatted = {

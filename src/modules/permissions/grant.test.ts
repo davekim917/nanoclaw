@@ -22,16 +22,22 @@ import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 // deriveCallerId now opens the session's real mailbox instead of taking a
 // handle from the delivery loop (plan §4.5b), so these tests run against a
 // real temp session mailbox rather than an in-memory stand-in.
+const { TEST_DIR, GROUPS_DIR } = vi.hoisted(() => {
+  // path.join isn't usable here: vitest's import-hoisting transform turns
+  // `path` into a lazily-initialized binding, and vi.hoisted() runs before
+  // that initialization, so referencing it throws a TDZ ReferenceError.
+  const DATA_DIR = uniqueTmpRoot('test-permissions-grant');
+  return { TEST_DIR: DATA_DIR, GROUPS_DIR: `${DATA_DIR}/groups` };
+});
+
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
   return {
     ...actual,
     DATA_DIR: TEST_DIR,
-    GROUPS_DIR: `${TEST_DIR}/groups`,
+    GROUPS_DIR,
   };
 });
-
-const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-permissions-grant') }));
 
 const notifyCalls: Array<{ sessionId: string; text: string }> = [];
 // Lets a case run arbitrary work immediately BEFORE the handler's apply block
