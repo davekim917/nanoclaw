@@ -93,10 +93,10 @@ export UNIT_ALERT_OUTBOX="$OUTBOX"
 run_sentinel TEST_ALERT=1
 RC=$?
 [ "$RC" -eq 0 ] || bad "successful delivery should exit 0" "rc=$RC out=$OUT"
-QUEUED=$(ls "$OUTBOX"/*health-sentinel.md 2>/dev/null | wc -l)
+QUEUED=$(ls "$OUTBOX"/*health-sentinel*.md 2>/dev/null | wc -l)
 [ "$QUEUED" -gt 0 ] && ok "successful delivery queued an alert file" \
   || bad "successful delivery queued nothing into the outbox" "$OUT"
-[ -s "$(ls -t "$OUTBOX"/*health-sentinel.md 2>/dev/null | head -1)" ] \
+[ -s "$(ls -t "$OUTBOX"/*health-sentinel*.md 2>/dev/null | head -1)" ] \
   && ok "queued alert is non-empty" \
   || bad "queued alert was empty" "$OUT"
 [ -n "$(last_alert test)" ] && ok "successful delivery stamped last_alert.test" \
@@ -112,12 +112,12 @@ trap 'rm -rf "$ROOT"' EXIT
 breaches_on() { # label, env...
   local label="$1"; shift
   rm -f "$ROOT/data/health-sentinel-state.json"
-  rm -f "$OUTBOX"/*health-sentinel.md 2>/dev/null || true
+  rm -f "$OUTBOX"/*health-sentinel*.md 2>/dev/null || true
   run_sentinel "$@" WATCHED_TIMERS="probe.timer:300"
   case "$OUT" in *"all vitals OK"*) bad "$label read as healthy" "$OUT"; return ;; esac
   # The breach text lives only in the queued alert, so asserting on stdout alone
   # would pass even if nothing was written.
-  if grep -qh 'probe.timer' "$OUTBOX"/*health-sentinel.md 2>/dev/null; then ok "$label breached"
+  if grep -qh 'probe.timer' "$OUTBOX"/*health-sentinel*.md 2>/dev/null; then ok "$label breached"
   else bad "$label queued no probe.timer breach" "out=$OUT queued=$(ls "$OUTBOX" 2>/dev/null)"; fi
 }
 breaches_on "empty LastTriggerUSec"       STUB_LASTTRIGGER=""

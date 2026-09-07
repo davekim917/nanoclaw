@@ -380,12 +380,26 @@ if [ ! -d "$OUTBOX" ] || [ ! -w "$OUTBOX" ]; then
   exit 1
 fi
 
-ALERT_OUT="$OUTBOX/$(date -u +%Y%m%dT%H%M%S)-health-sentinel.md"
+# O_EXCL temp then rename: the outbox can be a workgroup directory an agent
+# container may also write, so a predictable per-second filename could be
+# pre-created there as a symlink that a bare `>` would follow and truncate.
+# mktemp creates the file itself; rename(2) replaces the destination entry
+# rather than writing through one. The .md suffix is what outbox-ship.sh globs.
+ALERT_TMP="$(mktemp "$OUTBOX/$(date -u +%Y%m%dT%H%M%S)-health-sentinel.XXXXXX")" || {
+  echo "health-sentinel: BREACH but could not create an alert file in $OUTBOX:" >&2
+  echo "$ALERT_LINES" >&2
+  exit 1
+}
+ALERT_OUT="$ALERT_TMP.md"
 {
   printf '*Host health alert*\n_host: %s · %s UTC_\n\n' "$(hostname)" "$(date -u '+%Y-%m-%d %H:%M')"
   printf '%s\n\n' "$ALERT_LINES"
   printf 'Triage: `logs/nanoclaw.error.log` first, then `pnpm exec tsx scripts/host-health.ts`.\n'
-} > "$ALERT_OUT"
+} > "$ALERT_TMP"
+# mktemp creates 0600; outbox-ship.sh runs as the install user, and a mode it
+# cannot read is an alert that never ships.
+chmod 0644 "$ALERT_TMP"
+mv -f "$ALERT_TMP" "$ALERT_OUT"
 
 # Only a written, non-empty file counts as delivery. Anything else must stay
 # loud and must NOT stamp the cooldown, or one silent failure mutes this vital

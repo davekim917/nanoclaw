@@ -81,8 +81,16 @@ if [ ! -d "$OUTBOX" ] || [ ! -w "$OUTBOX" ]; then
   echo "drift-check: DRIFT DETECTED but outbox unusable ($OUTBOX): $NOTIFICATION" >&2
   exit 1
 fi
-OUT="$OUTBOX/$(date -u +%Y%m%dT%H%M%S)-onecli-drift.md"
+# O_EXCL temp then rename, same reasoning as health-sentinel.sh: a predictable
+# name in an agent-writable outbox could be pre-created as a symlink.
+TMP_OUT="$(mktemp "$OUTBOX/$(date -u +%Y%m%dT%H%M%S)-onecli-drift.XXXXXX")" || {
+  echo "drift-check: DRIFT DETECTED but could not create an alert file: $NOTIFICATION" >&2
+  exit 1
+}
+OUT="$TMP_OUT.md"
 printf '*OneCLI gateway drift*\n_host: %s · %s UTC_\n\n%s\n' \
-  "$(hostname)" "$(date -u '+%Y-%m-%d %H:%M')" "$NOTIFICATION" > "$OUT"
+  "$(hostname)" "$(date -u '+%Y-%m-%d %H:%M')" "$NOTIFICATION" > "$TMP_OUT"
+chmod 0644 "$TMP_OUT"
+mv -f "$TMP_OUT" "$OUT"
 [ -s "$OUT" ] || { echo "drift-check: wrote an empty alert to $OUT" >&2; exit 1; }
 echo "drift-check: queued alert $OUT"
