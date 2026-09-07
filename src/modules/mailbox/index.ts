@@ -85,6 +85,7 @@ import {
   admitPendingUpgradeRow,
   deferForFreshContextRetry,
   demoteUnpairedLegacyTasks,
+  hasPendingRecallPairedTrigger,
   listDueAdmissionRows,
   listUnpairedPendingUpgradeRows,
   reconcileSurvivorWakeRows,
@@ -501,6 +502,8 @@ export interface NanoclawMailboxSession extends MailboxSession {
   // --- host-owned due admission -------------------------------------------
   /** The recall POLICY stays with session-manager; these commit its decision. */
   demoteUnpairedLegacyTasks(): void;
+  /** A pending primary row still has the recall partner required for admission. */
+  hasPendingRecallPairedTrigger(): boolean;
   listDueAdmissionRows(): DueAdmissionRow[];
   admitDueRow(recall: MessageInsert, taskId: string): boolean;
   listUnpairedPendingUpgradeRows(): PendingUpgradeRow[];
@@ -1119,6 +1122,7 @@ function forkOps(
     getCreatedTaskRow: (id) => getCreatedTaskRow(inbound, id),
 
     demoteUnpairedLegacyTasks: () => demoteUnpairedLegacyTasks(inbound),
+    hasPendingRecallPairedTrigger: () => hasPendingRecallPairedTrigger(inbound),
     listDueAdmissionRows: () => listDueAdmissionRows(inbound),
     admitDueRow: (recall, taskId) => admitDueRow(inbound, recall, taskId),
     listUnpairedPendingUpgradeRows: () => listUnpairedPendingUpgradeRows(inbound),

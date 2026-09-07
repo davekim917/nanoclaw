@@ -571,8 +571,13 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       await s19.run({
         session: { id: 'sess-gc', agent_group_id: 'src-ag', thread_id: thread },
         agentGroupId: 'src-ag',
-        // S19 asks the mailbox one question.
-        mailbox: { countLiveTasks: () => 0 },
+        // The source has neither resumable mailbox work nor an armed wait.
+        mailbox: {
+          countLiveTasks: () => 0,
+          hasPendingRecallPairedTrigger: () => false,
+          readWorkContinuation: () => null,
+        },
+        plan: { workContinuation: null },
       } as never);
 
       expect(

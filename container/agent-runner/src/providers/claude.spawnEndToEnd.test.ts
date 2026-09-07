@@ -81,7 +81,7 @@ describe('END-TO-END after the deletion', () => {
 
   it('the ncl-configured pair still lands', () => {
     const r = spawn({ model: 'claude-fable-5-1[1m]', effort: 'medium' });
-    console.log('  admiral shape -> model=', r.model, ' effort=', r.effort);
+    console.log('  configured pair -> model=', r.model, ' effort=', r.effort);
     expect(r.model).toBe('claude-fable-5-1[1m]');
     expect(r.effort).toBe('medium');
   });

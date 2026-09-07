@@ -101,6 +101,33 @@ const DUE_PREDICATE = `status = 'pending'
             )
           )`;
 
+/**
+ * A pending turn with the recall partner that makes it eligible for host-side
+ * admission. Both a future deferred wait (trigger=0) and an already admitted
+ * due turn (trigger=1) match. A recall marker by itself does not: it is
+ * historical context once its trigger has completed, failed, or expired.
+ */
+export function hasPendingRecallPairedTrigger(db: Database.Database): boolean {
+  return (
+    db
+      .prepare(
+        `SELECT 1
+           FROM messages_in AS pending_turn
+          WHERE pending_turn.status = 'pending'
+            AND pending_turn.kind != 'system'
+            AND EXISTS (
+              SELECT 1
+                FROM messages_in AS recall
+               WHERE recall.id = 'recall-' || pending_turn.id
+                 AND recall.kind = 'system'
+                 AND recall.status = 'pending'
+            )
+          LIMIT 1`,
+      )
+      .get() !== undefined
+  );
+}
+
 /** Every inert row that is due for admission, in seq order. */
 export function listDueAdmissionRows(db: Database.Database): DueAdmissionRow[] {
   return db
