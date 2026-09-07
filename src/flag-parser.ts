@@ -116,7 +116,13 @@ export function resolveEffectiveModel(raw: string): string {
 }
 
 const VALID_MODEL_RE =
-  /^(?:opus|sonnet|haiku|default|claude-opus-\d+(?:-\d+)?(?:\[\dm\])?|claude-haiku-\d+-\d+(?:\[\dm\])?|claude-sonnet-\d+(?:\[\dm\])?|claude-fable-\d+(?:-\d+)?(?:\[\dm\])?)$/;
+  // The haiku branch carries an OPTIONAL trailing date segment: Anthropic
+  // ships haiku ids dated (`claude-haiku-4-5-20251001`) and DEFAULT_HAIKU_MODEL
+  // above IS that dated form. Without it this regex rejected the fork's own
+  // constant — so `-m haiku`, which resolveEffectiveModel maps to that id,
+  // failed validation and fell through to the opus default at the spawn seam,
+  // silently running Opus for a group that asked for Haiku.
+  /^(?:opus|sonnet|haiku|default|claude-opus-\d+(?:-\d+)?(?:\[\dm\])?|claude-haiku-\d+-\d+(?:-\d+)?(?:\[\dm\])?|claude-sonnet-\d+(?:\[\dm\])?|claude-fable-\d+(?:-\d+)?(?:\[\dm\])?)$/;
 
 /**
  * Opus is only supported in its 1M-context form in this fork. Auto-append
@@ -156,6 +162,12 @@ const MODEL_EFFORT_SUPPORT: Record<string, ReadonlySet<EffortLevel>> = {
   // Haiku: no effort control at the API level (effort is a no-op for this family).
   haiku: new Set(),
   'claude-haiku-4-5': new Set(),
+  // The DATED id `haiku` resolves to (DEFAULT_HAIKU_MODEL). Keyed explicitly:
+  // a lookup miss returns undefined, which callers read as "no matrix for this
+  // model, do not clamp" — the opposite of Haiku's actual empty set, and the
+  // difference between refusing an effort and sending one to a model that has
+  // no effort control at all.
+  'claude-haiku-4-5-20251001': new Set(),
   // Bare `sonnet` resolves to Sonnet 5 (DEFAULT_SONNET_MODEL) — full surface
   // incl. xhigh. (Sonnet 4.x is not used in this fork.)
   sonnet: new Set(['low', 'medium', 'high', 'xhigh', 'max']),

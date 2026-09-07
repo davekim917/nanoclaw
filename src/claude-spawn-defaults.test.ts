@@ -140,6 +140,45 @@ describe('resolveClaudeSpawnDefaults — effort derives from the RESOLVED model'
     expect(env.join(' ')).not.toContain('NANOCLAW_EFFORT_OVERRIDE');
   });
 
+  it('test_bare_haiku_alias_survives_validation_and_still_runs_haiku', () => {
+    // Round-3 P1 (codex 3951216934). `resolveEffectiveModel('haiku')` yields
+    // DEFAULT_HAIKU_MODEL, the DATED id `claude-haiku-4-5-20251001`, which the
+    // vocabulary's own regex used to reject — so validating the resolved form
+    // dropped the group's choice and silently ran Opus instead of Haiku.
+    const r = resolveClaudeSpawnDefaults(cfg({ model: 'haiku' }));
+    expect(r.model).toBe('claude-haiku-4-5-20251001');
+    expect(r.modelWasConfigured).toBe(true);
+    expect(r.drops).toEqual([]);
+    expect(r.effort).toBeUndefined();
+    expect(pairs(claudeSpawnEnv(cfg({ model: 'haiku' }))).ANTHROPIC_DEFAULT_OPUS_MODEL).toBe(
+      'claude-haiku-4-5-20251001',
+    );
+  });
+
+  it('test_the_dated_haiku_id_is_in_the_effort_support_matrix', () => {
+    // A matrix MISS returns undefined, which the clamp reads as "no matrix,
+    // do not clamp" — the opposite of Haiku's empty set. Keying the dated id
+    // is what makes an explicit effort on the bare alias get refused.
+    const r = resolveClaudeSpawnDefaults(cfg({ model: 'haiku', effort: 'high' }));
+    expect(r.effort).toBeUndefined();
+    expect(r.drops.join(' ')).toContain('not supported by claude-haiku-4-5-20251001');
+  });
+
+  it('test_every_family_alias_survives_validation', () => {
+    // The regression class, closed across the whole alias set rather than at
+    // the one id that was reported.
+    for (const [alias, want] of [
+      ['opus', 'claude-opus-5[1m]'],
+      ['sonnet', 'claude-sonnet-5'],
+      ['haiku', 'claude-haiku-4-5-20251001'],
+      ['fable', 'claude-fable-5-1[1m]'],
+      ['opus5', 'claude-opus-5[1m]'],
+    ] as const) {
+      const r = resolveClaudeSpawnDefaults(cfg({ model: alias }));
+      expect([alias, r.model, r.drops]).toEqual([alias, want, []]);
+    }
+  });
+
   it('test_effort_unsupported_by_the_resolved_model_is_dropped', () => {
     // An explicit effort on haiku is refused by the same per-model matrix the
     // chat `-e` parser uses, and falls through to the family default (none).
