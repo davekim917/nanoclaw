@@ -341,7 +341,7 @@ export interface AgentQuery {
    * passes `model: undefined` meaning "the group default" and cannot resolve
    * that itself — `stickyConfig.model` (a group's `providerConfig.model`)
    * outranks `ANTHROPIC_DEFAULT_OPUS_MODEL` and is invisible outside the
-   * provider. `illysium-argus` sets exactly that and has a live unpinned
+   * provider. A group on this install sets exactly that and has a live unpinned
    * series, so a caller-side guess would mis-attribute a real production task.
    *
    * Reading it from the query covers every path by construction: creation
