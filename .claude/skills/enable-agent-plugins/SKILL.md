@@ -243,12 +243,37 @@ After respawn:
    # whose sub-plugins are named "<repo>/<entry>" with the directory in repoName
    bun -e "import {planCodexPluginRegistration as plan} from './src/codex-companion-setup.ts'; \
      const n='<name>'; \
-     console.log(plan('/home/ubuntu/plugins').filter(x=>x.name===n||x.repoName===n).map(x=>x.name+' -> '+x.action).join('\n'))"
+     console.log(plan('/home/ubuntu/plugins').filter(x=>x.name===n||x.repoName===n) \
+       .map(x=>x.name+' -> '+x.action+(x.reason?' ('+x.reason+')':'')).join('\n'))"
    ```
 
-   Every row for the plugin should read `-> register`. Filter on `repoName` as well as
-   `name`: a marketplace monorepo's sub-plugins are labelled `<repo>/<entry>`, so
-   matching `name` alone returns `[]` even when registration is planned correctly.
+   Filter on `repoName` as well as `name`: a marketplace monorepo's sub-plugins are
+   labelled `<repo>/<entry>`, so matching `name` alone returns `[]` even when
+   registration is planned correctly. **Always print `reason`** — it is what separates a
+   deliberate opt-out from a real failure, and the expectation depends on which
+   withholding you applied in step 5:
+
+   | You did | Expect | Meaning |
+   |---|---|---|
+   | nothing | `-> register` | delivered to every Codex group |
+   | `--deny codex` | `-> skip (denied-for-codex)` | **success** — `planCodexPluginRegistration` reads the marker at `codex-companion-setup.ts:634-636` |
+   | `--exclude <group>` | `-> register` | expected, and this command cannot confirm the exclusion — see below |
+
+   Any other `skip` is a genuine failure and the reason names it: `no-marketplace-manifest`
+   or `no-codex-plugin-manifest` (step 2 did not produce manifests), `not-a-directory`,
+   or `in-tree-shadowed` (deliberate, for plugins whose capability ships in-tree).
+
+   The plan reads the **host** `~/plugins` root, so a per-group `--exclude` never appears
+   in it — that exclusion is applied when the container mount is built, per group. Verify
+   that one against the group's own config instead:
+
+   ```bash
+   node -e "const c=JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')); \
+     console.log(c.excludePlugins ?? [])" groups/<folder>/container.json
+   ```
+
+   (Read the JSON rather than grepping it — `container.json` is pretty-printed, so the
+   array spans lines and a line-based `grep` for the key returns nothing useful.)
 - **OpenCode** groups: the skills appear as commands (mirrored in step 2).
 - For mode plugins, the condensed ruleset is in `groups/<folder>/AGENTS.md` — spot-check
   one Codex group: `grep -c "<a distinctive ruleset phrase>" groups/<name>-codex/AGENTS.md`.
