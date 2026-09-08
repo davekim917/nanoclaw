@@ -26,9 +26,14 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 // reports `probe-failed`, and the run is a confusing no-op. Say so once, up
 // front, instead of leaving the reader to decode a hundred identical lines.
 if (typeof process.getuid === 'function' && process.getuid() !== 0) {
-  console.log('agent-worktree-gc: not running as root — re-run as `sudo pnpm worktrees`.');
-  console.log('  Without root, another user\'s /proc/<pid>/cwd is unreadable and every');
-  console.log('  worktree reports `probe-failed` because idleness cannot be proven.\n');
+  // Exit, do not carry on. Printing the hint and then running anyway still
+  // emits a probe-failed row per worktree, which IS the confusing no-op this
+  // message exists to replace — the reader would have to scroll a hundred
+  // identical lines past the one line that mattered.
+  console.error('agent-worktree-gc: not running as root — re-run as `sudo pnpm worktrees`.');
+  console.error("  Without root, another user's /proc/<pid>/cwd is unreadable, so every");
+  console.error('  worktree would report `probe-failed` and nothing could be classified.');
+  process.exit(1);
 }
 
 const report = runAgentWorktreeGcOnce(repoRoot);

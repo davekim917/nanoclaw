@@ -213,6 +213,27 @@ describe('assess', () => {
     );
   });
 
+  // The hook builds it with `mktemp -d "${TMPDIR:-/tmp}/nanoclaw-pre-push.XXXXXX"`,
+  // so a push run with TMPDIR set lands nowhere near /tmp. Matching a `/tmp`
+  // prefix would have missed exactly the in-flight snapshot this excludes.
+  it.each([
+    '/var/tmp/nanoclaw-pre-push.Ab12Cd/tree',
+    '/run/user/1001/nanoclaw-pre-push.zzzzzz/tree',
+    '/home/ubuntu/scratch/nanoclaw-pre-push.q1w2e3/tree',
+    '/tmp/nanoclaw-pre-push.v7E5RQ/tree',
+  ])('excludes a pre-push snapshot wherever TMPDIR put it: %s', (p) => {
+    expect(assess(row({ path: p }), repo, { procRoot: noProc }).verdict).toBe('out-of-scope');
+  });
+
+  // The literal dot is what separates the snapshot from a lookalike; without
+  // it the pattern would swallow unrelated worktrees.
+  it.each(['/tmp/nanoclaw-pre-pushing/tree', '/tmp/my-nanoclaw-pre-push-notes', '/tmp/nanoclaw-pre-push'])(
+    'does not exclude a lookalike path: %s',
+    (p) => {
+      expect(assess(row({ path: p }), repo, { procRoot: noProc }).verdict).not.toBe('out-of-scope');
+    },
+  );
+
   // The /tmp population's real leak: the directory goes on reboot, the
   // registration survives. No FILES can be lost by pruning it — but the
   // registration can still be the only reference to a commit, so the ancestor
