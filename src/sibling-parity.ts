@@ -37,6 +37,8 @@ export const SIBLING_BOUND_FIELDS: ReadonlySet<string> = new Set([
   'assistantName',
   'agentGroupId',
   'credentialFolder',
+  // Attribution is an explicit per-agent opt-in; a sibling must never inherit it.
+  'gitIdentity',
   // Provider-bound (the reason siblings exist)
   'provider',
   'codexHostAuth',

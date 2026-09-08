@@ -228,6 +228,10 @@ remove `also_allowed_in` because those exact messaging-group IDs belong to the
 source adapter and must never be copied to a sibling. The sibling-bound set and
 semantic comparison live in `src/sibling-parity.ts`.
 
+Git attribution is also an explicit per-agent opt-in: remove `gitIdentity`.
+Never infer or copy it from the source; set it only when an operator chooses a
+separate identity for the new sibling.
+
 This is also the MCP parity step. Do not rewrite `mcpServers` while cloning:
 the runtime now supports the native matrix across all three providers
 (stdio -> stdio, `type: "http"` -> native Streamable HTTP, `type: "sse"` ->
@@ -239,7 +243,7 @@ HTTP.
 ```bash
 # Preserve shared capabilities and resource baseline; replace sibling identity/provider state.
 jq --arg folder "${SIBLING_FOLDER}" --arg src "${SOURCE_FOLDER}" '
-  del(.groupName, .assistantName, .agentGroupId, .credentialFolder, .provider,
+  del(.groupName, .assistantName, .agentGroupId, .credentialFolder, .gitIdentity, .provider,
       .codexHostAuth, .codexAuthFallbacks, .model, .effort, .imageTag,
       .defaultModel, .defaultEffort, .maxMessagesPerPrompt, .memory, .dailySummary)
   | if (.slack_user_token | type) == "object" then
@@ -256,7 +260,7 @@ jq --arg folder "${SIBLING_FOLDER}" --arg src "${SOURCE_FOLDER}" '
   mv /tmp/cj-sibling.json groups/${SIBLING_FOLDER}/container.json
 
 # Verify parity — only sibling-bound fields may differ (clean by construction).
-DEL='del(.groupName,.assistantName,.agentGroupId,.credentialFolder,.provider,.codexHostAuth,.codexAuthFallbacks,.model,.effort,.imageTag,.defaultModel,.defaultEffort,.maxMessagesPerPrompt,.resources,.memory,.dailySummary,.workgroup_id) | if (.slack_user_token | type) == "object" then .slack_user_token |= del(.also_allowed_in) else . end'
+DEL='del(.groupName,.assistantName,.agentGroupId,.credentialFolder,.gitIdentity,.provider,.codexHostAuth,.codexAuthFallbacks,.model,.effort,.imageTag,.defaultModel,.defaultEffort,.maxMessagesPerPrompt,.resources,.memory,.dailySummary,.workgroup_id) | if (.slack_user_token | type) == "object" then .slack_user_token |= del(.also_allowed_in) else . end'
 diff <(jq -S "$DEL" groups/${SOURCE_FOLDER}/container.json) \
      <(jq -S "$DEL" groups/${SIBLING_FOLDER}/container.json) && echo "  ✅ parity clean" || true
 ```
@@ -537,7 +541,7 @@ SOURCE_FOLDER=${SOURCE_FOLDER}
 bash <(cat <<'AUDIT'
 SF="$1"; SR="$2"
 echo "=== container.json capability diff (identity/provider/runtime fields may differ) ==="
-PARITY_FILTER='del(.groupName,.assistantName,.agentGroupId,.credentialFolder,.provider,.codexHostAuth,.codexAuthFallbacks,.model,.effort,.imageTag,.defaultModel,.defaultEffort,.maxMessagesPerPrompt,.resources,.memory,.dailySummary) | if (.slack_user_token | type) == "object" then .slack_user_token |= del(.also_allowed_in) else . end'
+PARITY_FILTER='del(.groupName,.assistantName,.agentGroupId,.credentialFolder,.gitIdentity,.provider,.codexHostAuth,.codexAuthFallbacks,.model,.effort,.imageTag,.defaultModel,.defaultEffort,.maxMessagesPerPrompt,.resources,.memory,.dailySummary) | if (.slack_user_token | type) == "object" then .slack_user_token |= del(.also_allowed_in) else . end'
 diff <(jq -S "$PARITY_FILTER" groups/${SF}/container.json) \
      <(jq -S "$PARITY_FILTER" groups/${SR}/container.json) \
   && echo "  ✅ structural parity"

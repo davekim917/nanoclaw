@@ -24,6 +24,14 @@ describe('clone provider skills parity guidance', () => {
     }
   });
 
+  it('removes per-agent Git identity from clone copy and both parity filters', () => {
+    for (const name of ['clone-as-codex', 'clone-as-opencode']) {
+      const skill = readSkill(name);
+      expect(skill).toMatch(/del\([\s\S]*?\.credentialFolder,\s*\.gitIdentity,\s*\.provider,[\s\S]*?\.dailySummary\)/);
+      expect(skill.match(/\.credentialFolder,\.gitIdentity,\.provider/g)).toHaveLength(2);
+    }
+  });
+
   it('carries the same requirements in the provider template for future runtimes', () => {
     const skill = readSkill('clone-as-provider-template');
     expect(skill).toContain('preserve NanoClaw capability parity');
@@ -33,6 +41,7 @@ describe('clone provider skills parity guidance', () => {
     expect(skill).toContain('Resource budgets are operator-tunable');
     expect(skill).toContain('slack_user_token.enabled');
     expect(skill).toContain('also_allowed_in');
+    expect(skill).toContain('`gitIdentity`');
   });
 
   it('keeps retired Mnemon and GitNexus surfaces out of future provider installs', () => {

@@ -36,6 +36,10 @@ change.
   control-character predicate rejected C0 and DEL but admitted C1 (`U+0080`
   through `U+009F`) despite the contract. The accepted correction rejects that
   whole range and adds C1 name and email regression cases.
+- Automatic Codex review round 2 found a valid sibling-cloning gap:
+  `gitIdentity` was neither sibling-bound nor removed by the Codex/OpenCode
+  clone copy and parity filters. The accepted correction makes attribution
+  opt-in per sibling and documents the same rule for future provider clones.
 
 ## Post-review correction
 
@@ -81,6 +85,8 @@ the contract in `plan.md`:
 - Post-GitHub-round upstream-ratchet report — passed with the explicitly
   accepted `src/container-config.test.ts` growth from 842 to 844 divergent
   lines, solely for the two C1 regression cases.
+- Post-round-2 sibling parity and clone-filter tests — passed, 12 tests;
+  the focused host suite passed 205 tests across four files.
 
 ## Incoming main integration
 
