@@ -57,8 +57,40 @@ import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
-/** Codex owns its own worktree lifecycle; never touch it. */
-const OUT_OF_SCOPE = /\/\.codex\/worktrees\//;
+/**
+ * Worktrees this collector never reasons about.
+ *
+ * `.codex/worktrees/` — Codex owns its own lifecycle.
+ *
+ * Any `nanoclaw-pre-push.XXXXXX` directory — snapshots created by
+ * `.husky/pre-push`, which
+ * lints a pushed SHA against a throwaway checkout and removes it afterwards.
+ * They are excluded rather than probed because the liveness signal sees them
+ * only INTERMITTENTLY, which is worse than not at all — you cannot reason
+ * about a probe that is right sometimes. The hook's lint and typecheck phases
+ * do run with cwd inside the snapshot (`.husky/pre-push:156,158,165,167` each
+ * `cd "$snapshot_root"`), so the probe catches those. Every other phase does
+ * not: creating the worktree, symlinking node_modules, the boundary check
+ * (which passes `--root` rather than cd'ing), cleanup, and the final
+ * `worktree remove`. A snapshot observed during one of those windows looks
+ * idle while its push is very much in flight — which is exactly what produced
+ * the false "safe to reclaim" on the first real run (#570).
+ *
+ * Detecting the owning push instead would work, but the trade does not pay:
+ * measured 6 snapshots at 39 MB each, 234 MB total, against the ~10.5 GB this
+ * collector exists for. That is roughly 2% of the target in exchange for a
+ * race in a tool whose entire design premise is to refuse when unsure. The
+ * hook cleans these up itself; a crashed hook leaving 39 MB behind is a
+ * smaller problem than deleting a live one.
+ *
+ * Matched on the directory NAME rather than a `/tmp` prefix: the hook creates
+ * it with `mktemp -d "${TMPDIR:-/tmp}/nanoclaw-pre-push.XXXXXX"`
+ * (`.husky/pre-push:111`), so a push run with TMPDIR set puts it under
+ * `/var/tmp` or a private runtime dir and a `/tmp`-anchored pattern would miss
+ * it entirely. The literal dot is load-bearing — it is what keeps a lookalike
+ * like `nanoclaw-prepush-notahook` out.
+ */
+const OUT_OF_SCOPE = /\/\.codex\/worktrees\/|(?:^|\/)nanoclaw-pre-push\.[^/]*(?:\/|$)/;
 
 export type Verdict =
   | 'eligible'
@@ -327,7 +359,10 @@ function assessOrThrow(row: WorktreeRow, repoRoot: string, opts: Parameters<type
     return { row, verdict: 'main', detail: 'the primary checkout' };
   }
   if (OUT_OF_SCOPE.test(row.path)) {
-    return { row, verdict: 'out-of-scope', detail: 'codex-owned worktree' };
+    const why = /(?:^|\/)nanoclaw-pre-push\.[^/]*(?:\/|$)/.test(row.path)
+      ? 'pre-push snapshot — owned by .husky/pre-push, which cleans up after itself'
+      : 'codex-owned worktree';
+    return { row, verdict: 'out-of-scope', detail: why };
   }
 
   // Checked before `missing`: a lock is a deliberate "do not remove" and an

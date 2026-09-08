@@ -31,6 +31,14 @@ const SCANNED_FLAT_DIRS = ['container'];
 const FIXED_PATH_EXEMPT: Record<string, string> = {
   'src/cli/transport-errors.test.ts': 'formats a socket-path error message; the path is never opened or created',
   'src/fixture-roots.test.ts': 'this guard',
+  // An out-of-scope path returns before any filesystem call at all. The
+  // lookalike paths do reach the liveness probe, but it reads the injected
+  // procRoot (a deliberately nonexistent dir) and fails fast there, so
+  // row.path itself is still never opened. Nothing is created or written. The
+  // literals have to be recognisable pre-push snapshot paths to test the
+  // exclusion at all — uniqueTmpRoot() would produce a name the pattern is
+  // specifically designed not to match.
+  'src/agent-worktree-gc.test.ts': 'inert path strings fed to a pure classifier; never opened or created',
   // These three are ported upstream files (docs/specs/upstream-mailbox-seam/plan.md
   // §4.6.1) and must stay byte-for-byte identical to nanocoai/nanoclaw — drift is
   // caught by src/mailbox-seam-upstream.test.ts against UPSTREAM-MANIFEST.json.
