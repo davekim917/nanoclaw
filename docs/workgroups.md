@@ -181,6 +181,38 @@ storage through audit and rollback retention.
 
 ---
 
+## Per-agent Git identity
+
+An agent group may declare its Git author and committer identity in that
+agent's `groups/<agent-folder>/container.json`:
+
+```json
+{
+  "gitIdentity": {
+    "name": "Example Build Agent",
+    "email": "example-build-agent@example.invalid"
+  }
+}
+```
+
+`name` and `email` are an all-or-nothing pair. The host supplies both author
+and committer variables on that agent's next spawn, so ordinary Git commands
+and the built-in `git_commit` MCP tool record the same identity. Omit the field
+to preserve the existing `credentialFolder`-scoped Git variables, including
+their behavior through the built-in MCP tool.
+
+This is agent-scoped rather than workgroup-scoped. To enable it only for one
+workgroup, add the field only to the intended agents' files; every other
+workgroup keeps its current identity behavior. Git signing is separate and is
+not configured by this field.
+
+The host snapshots runner source at boot, and a container receives its Git
+environment at spawn. After adding support or changing this field, restart the
+host to refresh the runner snapshot, then recycle the affected containers or
+allow fresh spawns; a host restart can preserve running containers.
+
+---
+
 ## OneCLI secret inheritance
 
 Workgroup-level `onecli_secrets` (stored as a JSON array on the `workgroups` row) are inherited by every member at spawn time. The host computes the spawn-time secret set as a **union** (additive, no subtract):

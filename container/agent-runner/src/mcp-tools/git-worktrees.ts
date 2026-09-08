@@ -68,6 +68,10 @@ function validateSegment(value: string, label: string): string | null {
 function runGitAt(cwd: string, args: string[], timeoutMs = 120_000): string {
   return execFileSync('git', args, {
     cwd,
+    // Pass the caller's current environment explicitly. Git identity is
+    // per-agent and can vary between calls, so each subprocess receives the
+    // values present for this invocation.
+    env: process.env,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout: timeoutMs,

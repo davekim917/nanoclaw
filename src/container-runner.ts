@@ -42,6 +42,7 @@ import {
   writeContainerConfig,
   resolveContainerSecurity,
   type ContainerConfig,
+  type GitIdentity,
   type McpServerConfig,
   type SecurityConfig,
 } from './container-config.js';
@@ -187,6 +188,17 @@ export function serializeMcpServersEnv(servers: Record<string, unknown>): string
   const validated = validateMcpServers(servers as Record<string, McpServerConfig>);
   if (Object.keys(validated).length === 0) return null;
   return `NANOCLAW_MCP_SERVERS=${JSON.stringify(validated)}`;
+}
+
+/** Docker environment for an agent's explicit Git identity. */
+export function gitIdentityEnv(identity?: GitIdentity): Record<string, string> {
+  if (!identity) return {};
+  return {
+    GIT_AUTHOR_NAME: identity.name,
+    GIT_AUTHOR_EMAIL: identity.email,
+    GIT_COMMITTER_NAME: identity.name,
+    GIT_COMMITTER_EMAIL: identity.email,
+  };
 }
 
 // timeout 30s (SDK default is 5s): createAgent/applyContainerConfig run at
@@ -4101,6 +4113,26 @@ const SCOPED_CREDENTIAL_VARS = [
   'GIT_COMMITTER_EMAIL',
 ];
 
+/**
+ * Resolve the scoped credentials emitted into a container at spawn. An
+ * explicit gitIdentity is deliberately narrower than credentialFolder: it
+ * replaces only Git attribution while every other credential keeps its
+ * existing lookup order.
+ */
+export function resolveScopedCredentialEnv(
+  containerConfig: Pick<ContainerConfig, 'gitIdentity'>,
+  credentialFolder: string,
+  resolve: (base: string, folder: string) => string | undefined = resolveScopedEnv,
+): Record<string, string> {
+  const configuredGitEnv = gitIdentityEnv(containerConfig.gitIdentity);
+  const resolved: Record<string, string> = {};
+  for (const base of SCOPED_CREDENTIAL_VARS) {
+    const value = configuredGitEnv[base] ?? resolve(base, credentialFolder);
+    if (value) resolved[base] = value;
+  }
+  return resolved;
+}
+
 // Canonical definition moved to db/container-configs.ts so light consumers
 // (router flag parsing) don't import this module, which most of the test
 // suite factory-mocks. Re-exported here for existing import sites.
@@ -6236,9 +6268,10 @@ async function buildContainerArgs(
   args.push('-e', 'DESIGN_ARTIFACT_LOOP_ROOT=/workspace/agent/design-artifact-loop');
 
   // Scoped credential env vars: each base resolves via
-  // `<BASE>_<FOLDER_UPPER>` → `<BASE>` and is injected if found.
-  for (const base of SCOPED_CREDENTIAL_VARS) {
-    const v = resolveScopedEnv(base, credentialFolder);
+  // `<BASE>_<FOLDER_UPPER>` → `<BASE>` and is injected if found. An explicit
+  // agent Git identity intentionally wins only for Git's four attribution
+  // variables; every other scoped credential keeps its established lookup.
+  for (const [base, v] of Object.entries(resolveScopedCredentialEnv(containerConfig, credentialFolder))) {
     if (v) args.push('-e', `${base}=${v}`);
   }
 

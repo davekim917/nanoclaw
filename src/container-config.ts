@@ -576,6 +576,54 @@ export function resolveContainerSecurity(security?: SecurityConfig): Required<Se
   };
 }
 
+/**
+ * Explicit Git author and committer identity for one agent group. This is
+ * intentionally separate from credentialFolder: siblings may share credentials
+ * while retaining attribution that identifies the individual agent.
+ */
+export interface GitIdentity {
+  name: string;
+  email: string;
+}
+
+const GIT_IDENTITY_UNSAFE_NAME_RE = /[<>]/;
+const GIT_IDENTITY_EMAIL_RE = /^[^\s<>@]+@[^\s<>@]+$/;
+
+function hasGitIdentityControlCharacter(value: string): boolean {
+  return [...value].some((character) => {
+    const code = character.charCodeAt(0);
+    return code <= 0x1f || code === 0x7f;
+  });
+}
+
+/**
+ * Validate the all-or-nothing per-agent Git identity declaration. Git will
+ * otherwise silently fall back to a repository or inherited identity, which
+ * defeats the point of explicitly configuring attribution for an agent.
+ */
+export function validateGitIdentity(value: unknown): GitIdentity | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('gitIdentity must be an object with non-empty name and email strings');
+  }
+  const { name, email } = value as Record<string, unknown>;
+  if (
+    typeof name !== 'string' ||
+    !name.trim() ||
+    typeof email !== 'string' ||
+    !email.trim() ||
+    GIT_IDENTITY_UNSAFE_NAME_RE.test(name) ||
+    hasGitIdentityControlCharacter(name) ||
+    hasGitIdentityControlCharacter(email) ||
+    !GIT_IDENTITY_EMAIL_RE.test(email)
+  ) {
+    throw new Error(
+      'gitIdentity must set a non-empty name without angle brackets or control characters and an email with one non-empty local and domain part',
+    );
+  }
+  return { name, email };
+}
+
 /** Shape of the materialized `container.json` file read by the container runner. */
 export interface ContainerConfig {
   mcpServers: Record<string, McpServerConfig>;
@@ -736,6 +784,13 @@ export interface ContainerConfig {
    * mount, and log fields; those stay on `agent_groups.folder`.
    */
   credentialFolder?: string;
+
+  /**
+   * Optional author and committer identity for Git commands in this agent's
+   * container. Omit it to retain the established credentialFolder-scoped Git
+   * environment resolution.
+   */
+  gitIdentity?: GitIdentity;
 
   /**
    * Parse-only legacy compatibility data. Retained so old container.json files
@@ -1101,6 +1156,7 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
     wixHostAuth: raw.wixHostAuth,
     codexAuthFallbacks: raw.codexAuthFallbacks,
     credentialFolder: raw.credentialFolder,
+    gitIdentity: validateGitIdentity(raw.gitIdentity),
     excludeMcpServers: raw.excludeMcpServers,
     gitnexusInjectAgentsMd: raw.gitnexusInjectAgentsMd,
     defaultModel: raw.defaultModel,
@@ -1125,6 +1181,7 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
 export function writeContainerConfig(folder: string, config: ContainerConfig): void {
   validateMcpServers(config.mcpServers ?? {});
   validateContainerResources(config.resources);
+  validateGitIdentity(config.gitIdentity);
   const p = configPath(folder);
   const dir = path.dirname(p);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
