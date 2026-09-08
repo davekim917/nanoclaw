@@ -94,8 +94,14 @@ next spawn, and the enabler run is just a verification pass.
    > done
    > ```
    >
-   > Fix it by deleting the orphaned `skill/` dir so the group falls back to the
-   > global mirror, or by restoring the group's `auth.json` so it is synced again.
+   > Prefer restoring the group's `auth.json` — the dir becomes a sync target again and
+   > nothing is lost. Do **not** just delete the `skill/` dir: it can also hold skills
+   > installed by hand or natively, which `syncSkillSymlinks` deliberately keeps
+   > (`fs.rmSync` runs only behind an `isManagedMirror(entryPath)` gate,
+   > `src/plugin-skill-discovery.ts:465`, and its comment says "Anything else is
+   > preserved"). If you do want the global fallback, move the dir aside and migrate
+   > the non-managed entries — the managed ones are the mirror dirs whose children are
+   > all symlinks.
 
    **`--report-json` is not a probe — it writes.** It only changes the OUTPUT
    FORMAT. Every mutation in `main()` is gated on `dryRun` alone: manifest
@@ -201,6 +207,12 @@ next spawn, and the enabler run is just a verification pass.
    entry not in it. So enabling **any** remaining plugin runs the same reconciliation
    and drops the orphan. Only a plugins root with nothing left to enable has no route.
 
+   One target it cannot reach: a scoped mirror whose `auth.json` is gone.
+   `discoverOpenCodeXdgTargets` skips those siblings (`src/opencode-sync.ts:194-195`),
+   so reconciliation visits the global dir and the still-authenticated scoped ones only.
+   An orphan sitting in a stale scoped dir survives every reconcile — repair it with the
+   stale-mirror steps in step 1's preflight, not by enabling another plugin.
+
    To reverse a denial — a separate operation, not the next step above:
 
    ```bash
@@ -233,9 +245,15 @@ next spawn, and the enabler run is just a verification pass.
 
 ## Verify
 
-After respawn:
-- **Claude** groups: the plugin loads via the mount (confirm the manifest exists). Its
-  SessionStart hook fires if it has one.
+After respawn. **Every expectation below depends on which withholding you applied in
+step 5** — with an opt-out in force, absence is the success case, and an agent that
+treats it as a fault will undo the opt-out trying to repair it.
+
+- **Claude** groups: with no opt-out, the plugin loads via the mount (confirm the
+  manifest exists) and its SessionStart hook fires if it has one. If the group is named
+  in `--exclude`, the mount is dropped and absence is correct. `--deny claude` is not a
+  verification path here: it only prevents a manifest being generated, so on a plugin
+  that already has one the plugin still loads (see the trap in step 5).
 - **Codex** groups: the container registered the plugin itself at spawn — skills appear
   namespaced `<plugin>:<skill>`. Predict it without a container:
   ```bash
@@ -259,9 +277,13 @@ After respawn:
    | `--deny codex` | `-> skip (denied-for-codex)` | **success** — `planCodexPluginRegistration` reads the marker at `codex-companion-setup.ts:634-636` |
    | `--exclude <group>` | `-> register` | expected, and this command cannot confirm the exclusion — see below |
 
-   Any other `skip` is a genuine failure and the reason names it: `no-marketplace-manifest`
-   or `no-codex-plugin-manifest` (step 2 did not produce manifests), `not-a-directory`,
-   or `in-tree-shadowed` (deliberate, for plugins whose capability ships in-tree).
+   For any other `skip`, the reason says whether it is a fault:
+
+   | Reason | Verdict |
+   |---|---|
+   | `in-tree-shadowed` | **expected.** The capability ships in-tree; mounting the plugin would duplicate it. Do not "fix" this by adding a plugin or MCP server. |
+   | `no-marketplace-manifest`, `no-codex-plugin-manifest` | failure — step 2 did not produce manifests |
+   | `not-a-directory` | failure — the plugin is missing from `~/plugins` |
 
    The plan reads the **host** `~/plugins` root, so a per-group `--exclude` never appears
    in it — that exclusion is applied when the container mount is built, per group. Verify
@@ -274,7 +296,10 @@ After respawn:
 
    (Read the JSON rather than grepping it — `container.json` is pretty-printed, so the
    array spans lines and a line-based `grep` for the key returns nothing useful.)
-- **OpenCode** groups: the skills appear as commands (mirrored in step 2).
+- **OpenCode** groups: branch on step 5 the same way. With no opt-out, the skills appear
+  as commands (mirrored in step 2). After `--deny opencode` the mirror is pruned, so the
+  commands being **absent is the success case** — do not undo the denial to "fix" it,
+  and note that any always-on ruleset stays, since `--deny` never withholds one.
 - For mode plugins, the condensed ruleset is in `groups/<folder>/AGENTS.md` — spot-check
   one Codex group: `grep -c "<a distinctive ruleset phrase>" groups/<name>-codex/AGENTS.md`.
 
