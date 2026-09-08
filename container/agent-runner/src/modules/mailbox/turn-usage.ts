@@ -44,6 +44,20 @@ export interface TurnUsageRow {
   cache_read_tokens: number | null;
   cache_write_tokens: number | null;
   cost_usd: number | null;
+  /**
+   * Reasoning effort, EFFECTIVE (post-clamp) and as REQUESTED (pre-clamp).
+   * Unlike every other column these are request parameters, not billed
+   * measurements — the provider stamps them onto the usage entry it emits
+   * (providers/turn-effort.ts), and a row whose model the effort was not
+   * resolved for keeps NULL rather than borrowing the turn's value.
+   *
+   * CUTOFF: the columns landed 2026-09-07 and no backfill is possible — the
+   * data never existed. Every row written before then is NULL, which means
+   * "not recorded", not "ran at no effort". Do not read pre-cutoff NULLs as a
+   * measurement of anything.
+   */
+  effort: string | null;
+  effort_requested: string | null;
 }
 
 /**
@@ -276,8 +290,8 @@ export function recordTurnUsage(
     // bun:sqlite does not).
     getOutboundDb()
       .prepare(
-        `INSERT INTO turn_usage (ts, provider, model, turn_id, steps, duration_ms, trigger, rate_limit_type, rate_limit_utilization, rate_limit_resets_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
-         VALUES ($ts, $provider, $model, $turn_id, $steps, $duration_ms, $trigger, $rate_limit_type, $rate_limit_utilization, $rate_limit_resets_at, $input_tokens, $output_tokens, $cache_read_tokens, $cache_write_tokens, $cost_usd)`,
+        `INSERT INTO turn_usage (ts, provider, model, turn_id, steps, duration_ms, trigger, rate_limit_type, rate_limit_utilization, rate_limit_resets_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, effort, effort_requested)
+         VALUES ($ts, $provider, $model, $turn_id, $steps, $duration_ms, $trigger, $rate_limit_type, $rate_limit_utilization, $rate_limit_resets_at, $input_tokens, $output_tokens, $cache_read_tokens, $cache_write_tokens, $cost_usd, $effort, $effort_requested)`,
       )
       .run({
         $ts: new Date().toISOString(),
@@ -295,6 +309,13 @@ export function recordTurnUsage(
         $cache_read_tokens: effectiveUsage.cacheReadTokens ?? null,
         $cache_write_tokens: effectiveUsage.cacheWriteTokens ?? null,
         $cost_usd: effectiveUsage.costUsd ?? null,
+        // Per-ROW, not per-turn: the provider already decided which of a
+        // multi-model turn's entries may claim this value and left the rest
+        // NULL (providers/turn-effort.ts). Read off the untouched `usage`
+        // rather than `effectiveUsage` — effort is not a counter, so the
+        // delta transform has no business anywhere near it.
+        $effort: usage.effort ?? null,
+        $effort_requested: usage.effortRequested ?? null,
       });
   } catch (err) {
     console.error(`[turn-usage] Failed to record turn usage: ${err instanceof Error ? err.message : String(err)}`);

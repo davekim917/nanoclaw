@@ -351,6 +351,19 @@ export interface TurnUsageInfo {
   cacheReadTokens?: number | null;
   cacheWriteTokens?: number | null;
   costUsd?: number | null;
+  /**
+   * Reasoning effort this entry ran at, EFFECTIVE (post-clamp) — the value
+   * actually sent to the provider, `null` when it deliberately sent none
+   * (Haiku) or when the entry is a model the effort was not resolved for
+   * (a subagent on a multi-model turn). Unlike every field above it is a
+   * REQUEST parameter, not something the API bills back, so it is stamped on
+   * by `attachTurnEffort` rather than read out of a usage report — see
+   * providers/turn-effort.ts for the attribution rule and why NULL here means
+   * "not attributable" rather than "no effort".
+   */
+  effort?: string | null;
+  /** Pre-clamp result of the effort resolution chain. See `effort`. */
+  effortRequested?: string | null;
 }
 
 export type ProviderEvent =

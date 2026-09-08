@@ -85,6 +85,7 @@ import { migration072 } from './072-observatory-signal.js';
 import { migration073 } from './073-observatory-signal-workgroup-cascade.js';
 import { migration074 } from './074-pending-channel-approvals-cascade.js';
 import { migration075 } from './075-task-run-outcomes.js';
+import { migration076 } from './076-turn-usage-effort.js';
 // Upstream's 014/015 — file numbers clash with local but uniqueness is by `name`.
 // Aliased to avoid JS identifier collisions with the local 014/015 above.
 import { migration014 as containerConfigs } from './014-container-configs.js';
@@ -234,6 +235,9 @@ export const migrations: Migration[] = [
   // to normalize, so its position relative to 053 is irrelevant.
   migration074,
   migration075,
+  // Additive ALTER on turn_usage (created by 059). No ordering constraint
+  // beyond that — nothing below recreates the table.
+  migration076,
   // Last on purpose: normalizes whatever naive timestamps every migration
   // above has left behind (016's messaging_groups recreate copies created_at
   // through as-is).
