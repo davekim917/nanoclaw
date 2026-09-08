@@ -95,6 +95,8 @@ Four types — channel/provider installers, utility skills that ship code, instr
 
 Before a PR, a skill, or any contribution, you MUST read [CONTRIBUTING.md](CONTRIBUTING.md) (change types, skill guidelines, `SKILL.md` format, pre-submission checklist). Before a PR **to upstream** (`nanocoai/nanoclaw`): run `git diff upstream/main --stat HEAD` and `git log upstream/main..HEAD --oneline`, show the output, wait for approval — that diff is what upstream would receive. Fork-internal PRs don't need it; the ratchet already reports divergence. Installation-specific files (group files, `.claude/settings.json`, local configs) should not be included.
 
+**Cite the line when you assert another module's behaviour.** A comment or a branch that rests on how some other module behaves — what a predicate returns for a missing file, whether a subclass overrides a method, what an existence check keys on — must name the `file:line` you read. An uncited behavioural claim is a guess wearing a fact's clothes, and it does not fail loudly: it produces code that looks right, a comment that explains it confidently, and a test oracle that paraphrases the same wrong belief and passes. PR #583 spent four review rounds on one such premise (`dbHasRows` short-circuits an absent path to `false` on its first line; it was believed to answer `null`). Two cheap habits prevent it — read the whole declaration, since guard clauses live on the first lines, and `grep override` before asserting what a method does.
+
 Any change to an upstream-owned file must regenerate `src/upstream-ratchet.json` (`pnpm run ratchet:report -- --write`); growth needs `--accept` and a reason in the PR body.
 
 ## Development
