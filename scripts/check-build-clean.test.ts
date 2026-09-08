@@ -10,6 +10,7 @@ import {
   fingerprintDirt,
   isIgnorableDirtPath,
   partitionDirt,
+  isStrayBuildArtifactPath,
   pathsForLines,
   runCheckBuildClean,
 } from './check-build-clean.js';
@@ -697,4 +698,37 @@ describe('scripts/check-build-clean.ts and scripts/write-build-info.ts', () => {
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
     expect(fs.readFileSync(path.join(dir, 'dist', '.build-start-sha'), 'utf8').trim()).toBe(headSha());
   }, 60_000);
+});
+
+describe('isStrayBuildArtifactPath', () => {
+  it('flags a hand-rolled timestamped dist snapshot', () => {
+    expect(isStrayBuildArtifactPath('dist.pre-spent-wait-20260907T194650Z/')).toBe(true);
+    expect(isStrayBuildArtifactPath('dist.pre-spent-wait-20260907T194650Z')).toBe(true);
+  });
+
+  it('flags a node_modules snapshot too', () => {
+    expect(isStrayBuildArtifactPath('node_modules.backup-20260907/')).toBe(true);
+  });
+
+  it('flags the sanctioned names if they ever reach git status', () => {
+    // They are gitignored, so they normally never appear — but if a rule is
+    // dropped, naming them is still the right remedy.
+    expect(isStrayBuildArtifactPath('dist.pre-deploy/')).toBe(true);
+    expect(isStrayBuildArtifactPath('node_modules.failed/')).toBe(true);
+  });
+
+  it('does not flag dist/ or node_modules/ themselves', () => {
+    expect(isStrayBuildArtifactPath('dist/')).toBe(false);
+    expect(isStrayBuildArtifactPath('node_modules/')).toBe(false);
+  });
+
+  it('does not flag a nested path that merely starts with the prefix', () => {
+    expect(isStrayBuildArtifactPath('src/dist.helpers.ts')).toBe(false);
+    expect(isStrayBuildArtifactPath('dist.pre-deploy/index.js')).toBe(false);
+  });
+
+  it('does not flag unrelated root paths', () => {
+    expect(isStrayBuildArtifactPath('src/config.ts')).toBe(false);
+    expect(isStrayBuildArtifactPath('distribution/thing.ts')).toBe(false);
+  });
 });

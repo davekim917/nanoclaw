@@ -74,6 +74,32 @@ function pathsForLine(line: string): string[] {
   return [stripQuotes(rest.slice(0, arrow)), stripQuotes(rest.slice(arrow + 4))];
 }
 
+/**
+ * A stray build-artifact directory left beside `dist/` by a hand-run deploy.
+ *
+ * `scripts/deploy.sh` snapshots the live build for rollback as `dist.pre-deploy/`
+ * and `node_modules.pre-deploy/` (plus the `.failed/` pair), and all four are
+ * gitignored — so a sanctioned snapshot never reaches `git status` at all.
+ * Anything of that shape that DOES reach it was therefore created by hand, and
+ * because those names are timestamped they can never be matched by a gitignore
+ * rule either.
+ *
+ * This is worth naming separately because the generic "commit or stash" remedy
+ * is wrong for it and `BUILD_ALLOW_DIRTY=1` is actively dangerous: on
+ * 2026-09-07 a hand-rolled `dist.pre-<label>-<timestamp>/` blocked every build
+ * on the host for four hours across three sessions, while two restarts ran and
+ * silently left the service on stale compiled code. The refusal was correct;
+ * nobody could tell from it what to do.
+ */
+export function isStrayBuildArtifactPath(filePath: string): boolean {
+  const [head, ...rest] = filePath.split('/');
+  // Root-level only: `src/dist.foo` is somebody's source file, not a snapshot.
+  if (head === undefined) return false;
+  if (rest.length > 1) return false;
+  if (rest.length === 1 && rest[0] !== '') return false; // a file *inside* it, not the dir
+  return /^(?:dist|node_modules)\./.test(head);
+}
+
 export interface DirtPartition {
   /** Porcelain lines that block the build. */
   blocking: string[];
@@ -370,6 +396,18 @@ export function runCheckBuildClean(options: CheckBuildCleanOptions = {}): number
         log.error('these uncommitted changes into dist/, which a restart could then run.\n');
         log.error('Dirty paths (git status --porcelain):');
         for (const f of blocking) log.error(`  ${f}`);
+
+        const strays = pathsForLines(blocking).filter(isStrayBuildArtifactPath);
+        if (strays.length > 0) {
+          log.error('\nStray build snapshots (left by a hand-run deploy, NOT by scripts/deploy.sh):');
+          for (const f of strays) log.error(`  ${f}`);
+          log.error('\nDo not commit, stash, or BUILD_ALLOW_DIRTY these — move them out of the repo');
+          log.error('or delete them. scripts/deploy.sh snapshots rollback state as dist.pre-deploy/');
+          log.error('and node_modules.pre-deploy/, which are gitignored and hardlinked; prefer it over');
+          log.error('a hand-run pull/build/restart so no snapshot lands here in the first place.');
+          return 1;
+        }
+
         log.error('\nTo proceed, either:');
         log.error('  1. Commit or stash the changes above, then rebuild.');
         log.error('  2. Set BUILD_ALLOW_DIRTY=1 to build anyway (prints a warning, stamps dirty:true).');
