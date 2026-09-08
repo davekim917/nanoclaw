@@ -517,7 +517,6 @@ describe('drainClosedSessionPendingBacklog — the window advances', () => {
     expect(result.visited).toBe(1);
     expect(result.claimsCleared).toBe(1);
     expect(result.continuationsCleared).toBe(1);
-    expect(result.inboundOnlySkipped).toBe(0);
     expect(outboundState('sess-outbound-only')).toEqual({ claims: 0, continuations: 0 });
   });
 
@@ -552,10 +551,13 @@ describe('drainClosedSessionPendingBacklog — the window advances', () => {
     expect(outboundState('sess-outbound-only')).toEqual({ claims: 1, continuations: 1 });
   });
 
-  it('reports an inbound-only session instead of silently releasing nothing', async () => {
-    // The mirror cohort. No inbound-keyed funnel exists, so the honest answer
-    // is a count and a warning — not a mailbox-session call that answers
-    // `undefined` while the drain reports success.
+  it('releases an inbound-only session through the mailbox funnel', async () => {
+    // `NanoclawAgentMailbox.exists()` keys on inbound.db alone and degrades
+    // missing-outbound reads to empty, so this cohort needs no special case.
+    // An earlier revision asserted the opposite — a skip and a counter — on
+    // the belief that no inbound-keyed funnel existed and that releasing the
+    // rows would not unpin the session anyway. Both were false, so this
+    // assertion is inverted rather than adjusted.
     prepareSession('sess-inbound-only');
     seedInbound('sess-inbound-only', [{ id: 'stranded' }]);
     fs.rmSync(path.join(sessionDir('sess-inbound-only'), 'outbound.db'), { force: true });
@@ -564,8 +566,7 @@ describe('drainClosedSessionPendingBacklog — the window advances', () => {
     const result = await drainClosedSessionPendingBacklog(SESSIONS_ROOT);
 
     expect(result.visited).toBe(1);
-    expect(result.inboundOnlySkipped).toBe(1);
-    expect(result.expired).toBe(0);
+    expect(result.expired).toBe(1);
   });
 
   it('skips closed sessions whose directory reclaim already removed', async () => {
@@ -604,7 +605,6 @@ describe('drainClosedSessionPendingBacklog — the window advances', () => {
         claimsCleared: 0,
         continuationsCleared: 0,
         deferred: 0,
-        inboundOnlySkipped: 0,
         cursor: null,
       });
     } finally {

@@ -288,7 +288,6 @@ export interface ClosedSessionDrainResult {
    * missing file already makes `sessionHasOpenWork` fail closed, so releasing
    * them would not unpin them either.
    */
-  inboundOnlySkipped: number;
   /** Where the next run will resume, or null when this run completed a lap. */
   cursor: string | null;
 }
@@ -331,7 +330,6 @@ export async function drainClosedSessionPendingBacklog(
     claimsCleared: 0,
     continuationsCleared: 0,
     deferred: 0,
-    inboundOnlySkipped: 0,
     cursor: null,
   };
 
@@ -377,30 +375,27 @@ export async function drainClosedSessionPendingBacklog(
     result.visited += 1;
     lastOpened = row.id;
     try {
-      // Route to the funnel whose existence check matches the files this
-      // release will touch. `SqliteAgentMailbox.exists` is `inbound.db &&
-      // outbound.db`, so the mailbox session serves ONLY the both-present case
-      // — handing it a half-present session spends a slot of the budget,
-      // answers `undefined`, and releases nothing.
+      // Two cohorts, not three. `NanoclawAgentMailbox.exists()` is overridden
+      // to key on `inbound.db` ALONE (src/modules/mailbox/index.ts), and
+      // `session()` degrades every outbound read to empty when that side is
+      // absent — the doc there calls inbound-only the normal never-woken
+      // shape. So the mailbox funnel serves every session that still has
+      // inbound.db, outbound present or not, and only the inbound-absent case
+      // needs the outbound-keyed funnel.
       //
-      // Inbound-only has no funnel and is counted rather than pretended: the
-      // seam has no inbound-keyed opener, and releasing that cohort would not
-      // unpin it anyway (see `releaseOutboundOnlyClosedSession` — a missing
-      // file makes `sessionHasOpenWork` answer `null`, which is fail-closed).
-      let released: ClosedSessionRelease | undefined;
-      if (hasInbound && hasOutbound) {
-        released = await withExistingMailboxSession(row.agent_group_id, row.id, (mailbox) =>
-          expireClosedSessionWork(mailbox, row, 'closed-session-backlog'),
-        );
-      } else if (hasOutbound) {
-        released = await releaseOutboundOnlyClosedSession(row.agent_group_id, row, 'closed-session-backlog');
-      } else {
-        result.inboundOnlySkipped += 1;
-        log.warn('Closed session has inbound.db but no outbound.db — no funnel is keyed to release it', {
-          sessionId: row.id,
-          agentGroupId: row.agent_group_id,
-        });
-      }
+      // This replaced a branch per file-existence cohort. That shape drew a
+      // finding a round for three rounds because each branch encoded a belief
+      // about the seam rather than asking it: that `exists()` was
+      // `inbound && outbound`, and that a missing file made `dbHasRows`
+      // answer `null` and fail closed. Both were false — `dbHasRows`
+      // short-circuits a missing path to `false` (storage-manager.ts) — so
+      // inbound-only sessions are pinned by their rows and releasing them
+      // does unpin them.
+      const released = hasInbound
+        ? await withExistingMailboxSession(row.agent_group_id, row.id, (mailbox) =>
+            expireClosedSessionWork(mailbox, row, 'closed-session-backlog'),
+          )
+        : await releaseOutboundOnlyClosedSession(row.agent_group_id, row, 'closed-session-backlog');
       if (released) {
         result.expired += released.expired;
         result.claimsCleared += released.claimsCleared;
