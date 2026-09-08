@@ -327,6 +327,14 @@ export interface SessionTurnUsageRow {
   rate_limit_utilization?: number | null;
   rate_limit_resets_at?: string | null;
   turn_id?: string | null;
+  /**
+   * Reasoning effort — effective (post-clamp) and as requested (pre-clamp).
+   * Optional like every other post-original column: a container older than
+   * 2026-09-07 has no such column, so the key is simply absent. Absent or
+   * NULL means "not recorded / not attributable", never "ran at no effort".
+   */
+  effort?: string | null;
+  effort_requested?: string | null;
 }
 
 /**

@@ -18,6 +18,7 @@ import { recordRateLimitSamples, type AccountIdentity, type RateLimitSample } fr
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { TIMEZONE, formatLocalStamp } from '../timezone.js';
 import { shimCwd } from './cwd-shim.js';
+import { attachTurnEffort } from './turn-effort.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
 import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
 import {
@@ -1941,6 +1942,58 @@ function ensureOpus1mSuffix(model: string): string {
 }
 
 /**
+ * The env var the CLI expands each bare family alias through — the SAME table
+ * the send path below uses when it pins a concrete id into `perQueryEnv`.
+ *
+ * The host resolves every alias once at spawn and injects the answers here
+ * (`claudeSpawnEnv` in src/claude-spawn-defaults.ts, forwarded by
+ * src/group-init.ts), so reading these is reading the host's own resolution
+ * rather than mirroring its vocabulary. That matters: src/flag-parser.ts owns
+ * the alias table and is NOT importable from this Bun package, so a second
+ * copy here would be free to drift.
+ */
+const FAMILY_ALIAS_ENV: Record<string, string> = {
+  opus: 'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  sonnet: 'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  haiku: 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+};
+
+/**
+ * The concrete model id a bare alias will actually run as — what `modelUsage`
+ * will be keyed by, and therefore the only form that can be compared against
+ * it.
+ *
+ * Attribution bug this fixes: the model we hand the SDK is often a BARE ALIAS
+ * (`sonnet` from an unpinned scheduled-task wake in poll-loop.ts, or from a
+ * live `-m sonnet`), while `modelUsage` comes back keyed by the canonical id
+ * the CLI expanded it to (`claude-sonnet-5`). An exact comparison between the
+ * two matched nothing, so every row of a multi-model turn recorded NULL effort
+ * even though the turn demonstrably ran at one — a NULL that reads as "effort
+ * was never configured" for a turn where it was configured AND applied, which
+ * is the exact failure this column exists to prevent.
+ *
+ * Resolving through the CLI's own alias env is what keeps both sides in the
+ * same vocabulary. `ensureOpus1mSuffix` is reapplied because the comparison
+ * target carries the suffix (live: 2,924 rows keyed `claude-opus-5[1m]`); it
+ * is idempotent, so a host that already injected the suffixed id is unchanged.
+ *
+ * An alias with no env answer (unit tests, a host too old, the `default`
+ * alias, which no family env resolves) is returned unchanged: it will simply
+ * fail to match and the row stays NULL. That under-claims, which is the
+ * intended direction — never a guess.
+ */
+function canonicalUsageModel(
+  model: string | undefined,
+  env: Record<string, string | undefined>,
+): string | undefined {
+  if (!model) return model;
+  const key = FAMILY_ALIAS_ENV[model.toLowerCase()];
+  if (!key) return model; // already a concrete id
+  const resolved = env[key];
+  return resolved ? ensureOpus1mSuffix(resolved) : model;
+}
+
+/**
  * Per-model-family default effort, applied only when nothing upstream chose
  * one (-e flag, group provider config, operator NANOCLAW_EFFORT_OVERRIDE).
  *
@@ -2342,9 +2395,8 @@ export class ClaudeProvider implements AgentProvider {
       // Guard: a bare alias here would create an alias→alias loop in the SDK.
       if (!/^(opus|sonnet|haiku|default)$/i.test(model)) {
         const family = /^claude-(opus|sonnet|haiku)-/i.exec(model)?.[1]?.toLowerCase();
-        if (family === 'opus') perQueryEnv.ANTHROPIC_DEFAULT_OPUS_MODEL = model;
-        if (family === 'sonnet') perQueryEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = model;
-        if (family === 'haiku') perQueryEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = model;
+        const aliasEnvKey = family ? FAMILY_ALIAS_ENV[family] : undefined;
+        if (aliasEnvKey) perQueryEnv[aliasEnvKey] = model;
       }
     }
 
@@ -2593,11 +2645,30 @@ export class ClaudeProvider implements AgentProvider {
             // to the user's channel as the agent's reply.
             throw new Error(`transient_overload: ${text}`);
           }
+          const effortHeldAllTurn = effortTransitionsThisTurn === 0;
+          // Cleared BEFORE the yield, not after. The generator suspends at the
+          // yield below and poll-loop does its applySettings/push during that
+          // suspension, so a reset placed after it would wipe transitions that
+          // belong to the NEXT turn — the same erasure, one frame later.
+          effortTransitionsThisTurn = 0;
           yield {
             type: 'result',
             text,
             isError: m.is_error === true,
-            usage: extractUsage(m),
+            // Effort is a request parameter — no API bills it back, so it is
+            // stamped on here rather than read out of `modelUsage`. On a
+            // multi-model turn only the entry for `activeModel` gets it; the
+            // subagent entries stay NULL because we never set their effort.
+            // See providers/turn-effort.ts.
+            usage: attachTurnEffort(extractUsage(m), {
+              model: activeUsageModel,
+              // Unequal = the effort moved mid-turn, so no single value
+              // describes this aggregate. NULL both halves: `requested` is
+              // just as ambiguous as `effective` once the turn straddles a
+              // change, and a half-labelled row invites the same wrong read.
+              effective: effortHeldAllTurn ? activeEffort : null,
+              requested: effortHeldAllTurn ? activeRequestedEffort : null,
+            }),
             steps: typeof m.num_turns === 'number' ? m.num_turns : null,
             rateLimit: lastRateLimitInfo
               ? {
@@ -2739,6 +2810,75 @@ export class ClaudeProvider implements AgentProvider {
     // applySettings so a later effort-only change clamps against the
     // model actually in effect, not the one the query started with.
     let activeModel = model;
+    // Same idea for effort, and for the same reason turn_usage needs it: a
+    // mid-stream `-e` lands through applySettings, so the value resolved at
+    // query() time stops describing the turns that follow it. `translateEvents`
+    // reads these when it stamps a `result` event's usage — see
+    // providers/turn-effort.ts. `activeRequestedEffort` is the PRE-clamp value,
+    // which is what makes a Haiku turn ("high was configured, none was sent")
+    // distinguishable from one that was never configured at all.
+    let activeEffort = effort;
+    let activeRequestedEffort = requestedEffort;
+    // Effort in force when the CURRENT turn began, and whether a new turn is
+    // about to start.
+    //
+    // A follow-up that arrives while a turn is still executing does NOT open a
+    // new query: poll-loop.ts calls applySettings and then pushes it into the
+    // same stream (see its `liveSettingsChanged` branch), and the SDK merges
+    // both inputs into one eventual `result`. That result's usage therefore
+    // covers work done under the OLD effort and the new one — or, if the
+    // control request raced completion, entirely under the old one. Stamping
+    // the aggregate with whichever value happened to be current at `result`
+    // reports tokens under an effort they did not all run at, and
+    // `usage summary --by effort` would carry that straight through.
+    //
+    // Snapshot-and-compare instead: equal at `result` means one setting
+    // covered the whole turn, unequal means the turn is not attributable and
+    // records NULL. Same discipline as the model side — never a
+    // plausible-looking wrong value.
+    //
+    // Re-snapshotted at the first message of the NEXT turn rather than at
+    // `result`, because settings also change BETWEEN turns (the ordinary
+    // path: no turn in flight, applySettings, then push). Snapshotting at
+    // `result` would capture the pre-change value and wrongly mark that next,
+    // entirely-clean turn as mixed.
+    // How many times the effort actually MOVED during the current turn.
+    //
+    // Endpoint comparison is not enough: a turn admitting two follow-ups can
+    // go high -> low -> high and land back where it started, and comparing
+    // only the ends calls that constant while part of the turn ran at `low`.
+    // Counting transitions is indifferent to where the value lands, so any
+    // movement at all makes the turn unattributable.
+    //
+    // Delimited by the SDK's own `result` events and NOTHING else. Cleared
+    // where a turn demonstrably ends (see the `result` branch), never by an
+    // external signal.
+    //
+    // Two earlier shapes put the reset on the input side and both were wrong,
+    // in opposite directions. The first SDK message leaves a gap: once a
+    // prompt is pushed the CLI may already have issued the request under the
+    // old effort while no message has been emitted yet. The push itself is
+    // worse, because it is not a boundary at all — poll-loop pushes a
+    // follow-up INTO a running turn and the SDK merges it into that turn's
+    // single `result`, so resetting there erased exactly the mid-turn
+    // transitions this counter exists to catch. Whether a push starts a turn
+    // or merges into one is not knowable at push time, by the provider or by
+    // anyone else, so the input side cannot answer this question and is no
+    // longer asked to.
+    //
+    // The cost is deliberate: a change made BETWEEN turns also counts, so that
+    // turn records NULL even though it arguably ran wholly under the new
+    // value. That is the invariant holding — never emit a non-NULL effort you
+    // cannot PROVE governed the whole turn — and the timing of a between-turns
+    // change relative to the CLI picking up the prompt is precisely what
+    // cannot be proven from here. NULL means "not attributable"; declining to
+    // answer is always safe, and a confidently wrong value never is.
+    let effortTransitionsThisTurn = 0;
+    // The canonical id `modelUsage` will be keyed by. Tracked SEPARATELY from
+    // activeModel rather than replacing it: activeModel must stay in the form
+    // the SDK expects for setModel/clampEffortForModel, while attribution can
+    // only compare canonical ids. See canonicalUsageModel.
+    let activeUsageModel = canonicalUsageModel(model, perQueryEnv);
 
     return {
       push: (msg) => stream.push(msg),
@@ -2758,6 +2898,9 @@ export class ClaudeProvider implements AgentProvider {
         if (newModel && newModel !== activeModel) {
           await sdkResult.setModel(newModel);
           activeModel = newModel;
+          // A live `-m sonnet` lands here as a bare alias too, so the
+          // attribution target has to be re-resolved alongside it.
+          activeUsageModel = canonicalUsageModel(newModel, perQueryEnv);
         }
         const requested =
           s.effort ??
@@ -2776,6 +2919,16 @@ export class ClaudeProvider implements AgentProvider {
         };
         if (s.ultracode !== undefined) settings.ultracode = s.ultracode;
         await sdkResult.applyFlagSettings(settings);
+        // Only AFTER the control request lands — the 'max' throw above and any
+        // SDK failure must leave the trackers describing what is really in
+        // effect, or turn_usage would record an effort the API never saw.
+        //
+        // Counted only when the value actually MOVES: poll-loop calls this for
+        // a model-only change too, and one that resolves to the same effort
+        // introduces no ambiguity to account for.
+        if (clamped !== activeEffort || requested !== activeRequestedEffort) effortTransitionsThisTurn++;
+        activeEffort = clamped;
+        activeRequestedEffort = requested;
         log(
           `applySettings (live): model=${activeModel ?? '(unchanged)'} effort=${clamped ?? '(none)'}` +
             `${s.ultracode !== undefined ? ` ultracode=${s.ultracode}` : ''}`,
