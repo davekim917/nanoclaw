@@ -31,9 +31,10 @@ const SCANNED_FLAT_DIRS = ['container'];
 const FIXED_PATH_EXEMPT: Record<string, string> = {
   'src/cli/transport-errors.test.ts': 'formats a socket-path error message; the path is never opened or created',
   'src/fixture-roots.test.ts': 'this guard',
-  // Classification is a pure predicate: an out-of-scope path returns before any
-  // filesystem call, and the lookalike paths stop at the liveness probe without
-  // touching the worktree path. Nothing is created, opened, or written. The
+  // An out-of-scope path returns before any filesystem call at all. The
+  // lookalike paths do reach the liveness probe, but it reads the injected
+  // procRoot (a deliberately nonexistent dir) and fails fast there, so
+  // row.path itself is still never opened. Nothing is created or written. The
   // literals have to be recognisable pre-push snapshot paths to test the
   // exclusion at all — uniqueTmpRoot() would produce a name the pattern is
   // specifically designed not to match.

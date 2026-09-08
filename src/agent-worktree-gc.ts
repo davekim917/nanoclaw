@@ -65,11 +65,16 @@ import path from 'path';
  * Any `nanoclaw-pre-push.XXXXXX` directory — snapshots created by
  * `.husky/pre-push`, which
  * lints a pushed SHA against a throwaway checkout and removes it afterwards.
- * They are excluded rather than probed because the liveness signal cannot see
- * them: the hook creates the snapshot and then runs lint from a DIFFERENT
- * working directory, so no process has its cwd inside one even while it is
- * being actively used. That produced a false "safe to reclaim" on the first
- * real run (#570), on a snapshot whose push was in flight.
+ * They are excluded rather than probed because the liveness signal sees them
+ * only INTERMITTENTLY, which is worse than not at all — you cannot reason
+ * about a probe that is right sometimes. The hook's lint and typecheck phases
+ * do run with cwd inside the snapshot (`.husky/pre-push:156,158,165,167` each
+ * `cd "$snapshot_root"`), so the probe catches those. Every other phase does
+ * not: creating the worktree, symlinking node_modules, the boundary check
+ * (which passes `--root` rather than cd'ing), cleanup, and the final
+ * `worktree remove`. A snapshot observed during one of those windows looks
+ * idle while its push is very much in flight — which is exactly what produced
+ * the false "safe to reclaim" on the first real run (#570).
  *
  * Detecting the owning push instead would work, but the trade does not pay:
  * measured 6 snapshots at 39 MB each, 234 MB total, against the ~10.5 GB this
