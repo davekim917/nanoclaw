@@ -15,8 +15,11 @@ import { enforceHermeticity } from '../src/test-hermeticity.js';
 import {
   MAX_ALERT_LINES,
   cleanCheckerOutput,
+  cleanupSnapshot,
   decideAlert,
   describeDelivery,
+  reportCleanup,
+  reportOutcome,
   reportScan,
   trimDetail,
   type Alert,
@@ -146,6 +149,131 @@ describe('reportScan', () => {
     const r = recorder(2);
     await expect(reportScan({ code: 1, detail: FINDING }, 'abc1234', r)).resolves.toBe(1);
     expect(r.errors[0]).toContain('could not be attempted');
+  });
+});
+
+describe('cleanupSnapshot', () => {
+  function ops(failures: { worktree?: boolean; directory?: boolean } = {}) {
+    const calls: string[] = [];
+    return {
+      calls,
+      removeWorktree: () => {
+        calls.push('worktree');
+        if (failures.worktree) throw new Error('device busy');
+      },
+      removeDirectory: () => {
+        calls.push('directory');
+        if (failures.directory) throw new Error('permission denied');
+      },
+    };
+  }
+
+  it('reports nothing when both steps succeed', () => {
+    const o = ops();
+    expect(cleanupSnapshot('/tmp/parent', '/tmp/parent/tree', o)).toBeNull();
+    expect(o.calls).toEqual(['worktree', 'directory']);
+  });
+
+  it('still removes the directory when the worktree removal failed', () => {
+    // Attempt everything, then report. Bailing on the first failure would trade
+    // a stale registration for a stale registration AND a leaked directory.
+    const o = ops({ worktree: true });
+    const failure = cleanupSnapshot('/tmp/parent', '/tmp/parent/tree', o);
+    expect(o.calls).toEqual(['worktree', 'directory']);
+    expect(failure).toContain('could not remove the snapshot worktree');
+    expect(failure).toContain('device busy');
+  });
+
+  it('reports a directory removal failure on its own', () => {
+    const failure = cleanupSnapshot('/tmp/parent', '/tmp/parent/tree', ops({ directory: true }));
+    expect(failure).toContain('could not remove the snapshot directory');
+    expect(failure).toContain('permission denied');
+  });
+
+  it('reports both failures rather than only the first', () => {
+    const failure = cleanupSnapshot('/tmp/parent', '/tmp/parent/tree', ops({ worktree: true, directory: true }));
+    expect(failure).toContain('device busy');
+    expect(failure).toContain('permission denied');
+  });
+});
+
+describe('reportCleanup', () => {
+  const CLEANUP_FAIL = 'could not remove the snapshot worktree /tmp/x/tree: device busy';
+
+  it('is invisible when cleanup succeeded', () => {
+    const r = recorder(0);
+    expect(reportCleanup(null, 0, r)).toBe(0);
+    expect(r.errors).toEqual([]);
+  });
+
+  it('fails the run when cleanup failed, even though the scan itself passed', () => {
+    // The defect: `worktree remove` fails, the error is logged and swallowed,
+    // the job exits 0 and OnFailure never fires — while the directory is gone
+    // and the registration is left in the shared git metadata of a live
+    // checkout. Daily. A cleanup failure that reports success is the same
+    // defect as a hook that never runs.
+    const r = recorder(0);
+    expect(reportCleanup(CLEANUP_FAIL, 0, r)).toBe(1);
+    expect(r.errors).toHaveLength(1);
+    expect(r.errors[0]).toContain('device busy');
+    expect(r.errors[0]).toContain('git worktree prune');
+  });
+
+  it('does not mask a scan failure that already stood', () => {
+    const r = recorder(0);
+    expect(reportCleanup(null, 1, r)).toBe(1);
+    expect(reportCleanup(CLEANUP_FAIL, 1, r)).toBe(1);
+  });
+
+  it('reports both when the scan found something AND cleanup failed', async () => {
+    // Neither result may hide the other: the owner still gets the finding, the
+    // journal still gets the cleanup failure, and the unit still fails.
+    const r = recorder(1); // delivery also fails, the worst case
+    const scanExit = await reportScan({ code: 1, detail: FINDING }, 'abc1234', r);
+    expect(reportCleanup(CLEANUP_FAIL, scanExit, r)).toBe(1);
+
+    const journal = r.errors.join('\n');
+    expect(journal).toContain('src/example.ts:12 identifier');
+    expect(journal).toContain('device busy');
+  });
+
+  it('still delivers the finding when cleanup fails after a successful send', async () => {
+    const r = recorder(0);
+    const scanExit = await reportScan({ code: 1, detail: FINDING }, 'abc1234', r);
+    expect(scanExit).toBe(0);
+    expect(r.alerts).toHaveLength(1);
+    // The alert went out; the run still fails so the operator hears about the
+    // leaked registration too.
+    expect(reportCleanup(CLEANUP_FAIL, scanExit, r)).toBe(1);
+  });
+});
+
+describe('reportOutcome', () => {
+  const CLEANUP_FAIL = 'could not remove the snapshot worktree /tmp/x/tree: device busy';
+
+  it('is what main() calls, so removing either half cannot pass unnoticed', async () => {
+    const r = recorder(0);
+    await expect(reportOutcome({ code: 0, detail: '' }, 'abc1234', null, r)).resolves.toBe(0);
+    expect(r.errors).toEqual([]);
+  });
+
+  it('reports the finding BEFORE the cleanup failure, and fails the run', async () => {
+    // Order is the guarantee: a cleanup failure must never stop a finding
+    // reaching the owner, so the alert goes out first and only then does the
+    // cleanup problem raise the exit code.
+    const r = recorder(0);
+    await expect(reportOutcome({ code: 1, detail: FINDING }, 'abc1234', CLEANUP_FAIL, r)).resolves.toBe(1);
+    expect(r.alerts).toHaveLength(1);
+    expect(r.errors).toHaveLength(1);
+    expect(r.errors[0]).toContain('git worktree prune');
+  });
+
+  it('fails a clean scan whose snapshot could not be cleaned up', async () => {
+    const r = recorder(0);
+    await expect(reportOutcome({ code: 0, detail: '' }, 'abc1234', CLEANUP_FAIL, r)).resolves.toBe(1);
+    expect(r.alerts).toEqual([]);
+    expect(r.logs[0]).toContain('clean');
+    expect(r.errors[0]).toContain('device busy');
   });
 });
 

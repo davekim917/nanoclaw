@@ -220,8 +220,94 @@ function scanSnapshot(snapshot: string): BoundaryScan {
   return { code: result.status ?? 2, detail: cleanCheckerOutput(result.stderr ?? '') };
 }
 
+export interface SnapshotRun<T> {
+  value: T;
+  /** Why cleanup did not fully succeed, or `null`. Never thrown away — see `reportCleanup`. */
+  cleanupError: string | null;
+}
+
+/**
+ * The two cleanup steps, injected so `cleanupSnapshot` is testable without git
+ * or a filesystem. Without this seam, a rewrite that silently swallows a
+ * `worktree remove` failure passes every test — verified by mutation, which is
+ * the whole failure mode this file is guarding against.
+ */
+export interface CleanupOps {
+  removeWorktree(snapshot: string): void;
+  removeDirectory(parent: string): void;
+}
+
+const REAL_CLEANUP: CleanupOps = {
+  removeWorktree: (snapshot) => git(['worktree', 'remove', '--force', snapshot]),
+  removeDirectory: (parent) => fs.rmSync(parent, { recursive: true, force: true }),
+};
+
+/**
+ * Attempt EVERY cleanup step, then report. Removing the worktree and removing
+ * the temp directory are independent, so a failure in the first must not skip
+ * the second — that would trade a stale registration for a stale registration
+ * AND a leaked directory.
+ */
+export function cleanupSnapshot(parent: string, snapshot: string, ops: CleanupOps = REAL_CLEANUP): string | null {
+  const failures: string[] = [];
+  try {
+    ops.removeWorktree(snapshot);
+    // eslint-disable-next-line no-catch-all/no-catch-all
+  } catch (err) {
+    failures.push(`could not remove the snapshot worktree ${snapshot}: ${message(err)}`);
+  }
+  try {
+    ops.removeDirectory(parent);
+    // eslint-disable-next-line no-catch-all/no-catch-all
+  } catch (err) {
+    failures.push(`could not remove the snapshot directory ${parent}: ${message(err)}`);
+  }
+  return failures.length > 0 ? failures.join('; ') : null;
+}
+
+/**
+ * Turn a cleanup failure into a non-zero exit, without letting it mask — or be
+ * masked by — the scan's own verdict.
+ *
+ * The failure this closes: `git worktree remove` fails, the error is logged and
+ * swallowed, the scan result returns normally and the job exits 0. The unit's
+ * `OnFailure` never fires, while the directory has been deleted and the
+ * registration is left behind in the SHARED git metadata of a live checkout
+ * that already carries 23 worktrees. Repeat daily. A cleanup failure that
+ * reports success is the same defect as a hook that never runs.
+ *
+ * Callers report the scan FIRST, so a finding still reaches the owner even when
+ * cleanup then fails; this only ever raises the exit code, never lowers it.
+ */
+export function reportCleanup(cleanupError: string | null, scanExit: number, reporter: Reporter): number {
+  if (cleanupError === null) return scanExit;
+  reporter.logError(
+    `remote-boundary: ${cleanupError}. A stale worktree registration may be left in the shared git metadata — ` +
+      'run `git worktree prune` in the install root.',
+  );
+  return scanExit === 0 ? 1 : scanExit;
+}
+
+/**
+ * The whole reporting decision for one run: scan verdict first, then cleanup.
+ *
+ * Exported and used by `main` rather than inlined there, so the ORDER and the
+ * fact that both are reported are pinned by a test. Inlined, deleting the
+ * `reportCleanup` call would leave every test green — which is the failure mode
+ * this function exists to prevent, one level up.
+ */
+export async function reportOutcome(
+  scan: BoundaryScan,
+  commit: string,
+  cleanupError: string | null,
+  reporter: Reporter,
+): Promise<number> {
+  const scanExit = await reportScan(scan, commit, reporter);
+  return reportCleanup(cleanupError, scanExit, reporter);
+}
+
 /** Materialize `commit` in a throwaway detached worktree and hand it to `body`. */
-function withSnapshot<T>(commit: string, body: (snapshot: string) => T): T {
+function withSnapshot<T>(commit: string, body: (snapshot: string) => T): SnapshotRun<T> {
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-remote-boundary-'));
   const snapshot = path.join(parent, 'tree');
   // `-c core.hooksPath=/dev/null`, matching `.husky/pre-push`'s
@@ -237,19 +323,19 @@ function withSnapshot<T>(commit: string, body: (snapshot: string) => T): T {
   // It becomes load-bearing the day someone adds `.husky/post-checkout`, which
   // is exactly when nobody would think to look here.
   git(['-c', 'core.hooksPath=/dev/null', 'worktree', 'add', '--detach', '--quiet', snapshot, commit]);
+  let value: T;
   try {
-    return body(snapshot);
-  } finally {
-    try {
-      git(['worktree', 'remove', '--force', snapshot]);
-      // eslint-disable-next-line no-catch-all/no-catch-all
-    } catch (err) {
-      // Leaving a registered worktree behind would make every later
-      // `git worktree` call noisier, so say so rather than swallowing it.
-      console.error(`remote-boundary: could not remove the snapshot worktree: ${message(err)}`);
-    }
-    fs.rmSync(parent, { recursive: true, force: true });
+    value = body(snapshot);
+    // eslint-disable-next-line no-catch-all/no-catch-all
+  } catch (err) {
+    // The scan itself failed. Still clean up, then let the original failure
+    // stand — main() already exits non-zero on it, so there is no structured
+    // return left to carry a cleanup error and it is logged here instead.
+    const cleanupError = cleanupSnapshot(parent, snapshot);
+    if (cleanupError !== null) console.error(`remote-boundary: ${cleanupError}`);
+    throw err;
   }
+  return { value, cleanupError: cleanupSnapshot(parent, snapshot) };
 }
 
 function message(err: unknown): string {
@@ -259,10 +345,11 @@ function message(err: unknown): string {
 async function main(): Promise<number> {
   let scan: BoundaryScan;
   let commit: string;
+  let cleanupError: string | null;
   try {
     git(['fetch', '--quiet', 'origin', 'main']);
     commit = git(['rev-parse', '--short', REF]);
-    scan = withSnapshot(commit, scanSnapshot);
+    ({ value: scan, cleanupError } = withSnapshot(commit, scanSnapshot));
     // eslint-disable-next-line no-catch-all/no-catch-all
   } catch (err) {
     // Nothing was scanned, so there is no redacted checker output to send and
@@ -271,7 +358,7 @@ async function main(): Promise<number> {
     return 1;
   }
 
-  return reportScan(scan, commit, {
+  const reporter: Reporter = {
     // `notifyOwner` posts to Slack directly and reports success only on a
     // verified `ok: true`; `src/notify-owner.ts`'s header records why the CLI
     // socket is not a delivery path. Called in process rather than through
@@ -285,7 +372,9 @@ async function main(): Promise<number> {
     },
     log: (line) => console.log(line),
     logError: (line) => console.error(line),
-  });
+  };
+
+  return reportOutcome(scan, commit, cleanupError, reporter);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
