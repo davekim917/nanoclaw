@@ -173,4 +173,39 @@ describe('scripts/notify-owner.ts', () => {
       fs.rmSync(elsewhere, { recursive: true, force: true });
     }
   });
+
+  it('(g) falls through an unusable newest DM to an older one it can reach', async () => {
+    // createDb stamps resolved_at by index, so the LAST entry is the newest.
+    // Newest is a platform this script cannot post to; the older Slack row
+    // has a token and must carry the alert instead of the run giving up.
+    createDb([
+      { channelType: CHANNEL_TYPE, platformId: 'slack:DTEST00002' },
+      { channelType: 'discord-notifyownertest', platformId: 'discord:@me:1234567890123456789' },
+    ]);
+    fs.writeFileSync(path.join(rootDir, '.env'), `${TOKEN_KEY}=${FAKE_TOKEN}\n`);
+
+    const result = await notifyOwner({ title: 'Title', body: 'Body', dbPath, rootDir, timezone: 'UTC' });
+    expect(result.code).toBe(0);
+    expect(posts).toHaveLength(1);
+    expect(posts[0]!.channel).toBe('DTEST00002');
+  });
+
+  it('(h) takes the timezone from the install root .env, not the ambient default', async () => {
+    createDb([{ channelType: CHANNEL_TYPE, platformId: 'slack:DTEST00001' }]);
+    fs.writeFileSync(path.join(rootDir, '.env'), `${TOKEN_KEY}=${FAKE_TOKEN}\nTZ=America/New_York\n`);
+    vi.stubEnv('TZ', ''); // process.env.TZ wins when set; empty forces the .env lookup
+
+    const now = new Date('2026-01-15T20:30:00Z');
+    const nyStamp = formatLocalStamp(now, 'America/New_York');
+    const utcStamp = formatLocalStamp(now, 'UTC');
+    expect(nyStamp).not.toBe(utcStamp);
+
+    // No `timezone` option: the resolver must find TZ in rootDir/.env. Before
+    // this, TIMEZONE came from src/config.ts, which reads ${process.cwd()}/.env
+    // at import time — so a run from outside the checkout stamped UTC.
+    const result = await notifyOwner({ title: 'Title', body: 'Body', dbPath, rootDir, now });
+    expect(result.code).toBe(0);
+    expect(posts[0]!.text).toContain(nyStamp);
+    expect(posts[0]!.text).not.toContain(utcStamp);
+  });
 });

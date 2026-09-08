@@ -58,8 +58,15 @@ chmod +x "$ROOT/bin/systemctl"
 
 # `env` and not a bare assignment prefix: "$@" expands after the shell has
 # already decided what the command word is.
+# LOAD15_MAX is pinned out of reach because this harness stubs systemctl, tsx
+# and ncl but CANNOT stub /proc/loadavg — the sentinel's load vital reads the
+# real host. On a loaded box (15-min load >= 2*nproc) that vital breaches on
+# every invocation, so the three cases that assert "all vitals OK" failed for
+# a reason that has nothing to do with what they test. A caller that wants to
+# exercise the load vital itself can still pass its own LOAD15_MAX in "$@",
+# which lands after this and wins.
 run_sentinel() { # -> exit code; stdout+stderr in $OUT
-  OUT="$(env PATH="$ROOT/bin:$PATH" NANOCLAW_DIR="$ROOT" "$@" bash "$SENTINEL" 2>&1)"
+  OUT="$(env PATH="$ROOT/bin:$PATH" NANOCLAW_DIR="$ROOT" LOAD15_MAX=999999 "$@" bash "$SENTINEL" 2>&1)"
 }
 state() { python3 -c "
 import json,sys
