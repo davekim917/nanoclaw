@@ -182,9 +182,11 @@ describe('ClaudeProvider credential slot persists across a simulated respawn', (
     first.rotateApiKey(); // → three
     expect(getCredentialSlot('claude')).toBe('CLAUDE_CODE_OAUTH_TOKEN_3');
 
-    // Simulate a respawn: a brand-new instance, same env, reads the
-    // persisted slot in its constructor instead of starting at the primary.
+    // Simulate a respawn: a brand-new instance, same env. The constructor
+    // deliberately does not touch session state; the runner entrypoint
+    // calls the restore once the mailbox is up, so the test does the same.
     const second = new ClaudeProvider({ env: oauthEnv });
+    second.restorePersistedCredentialSlot();
     expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('three');
     // The restored ring position is what the next rotation advances from —
     // wrapping past "three" lands back on the primary, exactly as it would
@@ -201,6 +203,7 @@ describe('ClaudeProvider credential slot persists across a simulated respawn', (
   it('an unknown persisted slot (env changed since it was written) is ignored, staying on the primary', () => {
     setCredentialSlot('claude', 'CLAUDE_CODE_OAUTH_TOKEN_9');
     const p = new ClaudeProvider({ env: oauthEnv });
+    p.restorePersistedCredentialSlot();
     // Restore found nothing usable, so the ring stays at its default
     // (primary) — proven the same way as the "no persisted slot" case.
     p.resetRotationCycle();
@@ -214,6 +217,7 @@ describe('ClaudeProvider credential slot persists across a simulated respawn', (
 
   it('no persisted slot leaves a fresh instance on the primary', () => {
     const p = new ClaudeProvider({ env: oauthEnv });
+    p.restorePersistedCredentialSlot();
     expect(getCredentialSlot('claude')).toBeUndefined();
     // Restore is a no-op with nothing persisted, so the ring position stays
     // at its default (primary) — proven by the first rotation landing on

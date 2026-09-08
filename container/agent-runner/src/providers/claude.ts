@@ -2166,7 +2166,6 @@ export class ClaudeProvider implements AgentProvider {
         this.oauthRing.push(entry);
       }
     }
-    this.restorePersistedCredentialSlot();
   }
 
   /**
@@ -2176,22 +2175,34 @@ export class ClaudeProvider implements AgentProvider {
    * Position only, never the token value — the value already lives in
    * `oauthRing` from env.
    *
+   * NOT called from the constructor, and not from `query()` either: it reads
+   * session state, and `getCredentialSlot` opens the outbound session DB
+   * directly (`mailbox/sqlite/connection.ts:76-89` — it does not go through
+   * the mailbox registry, so "no mailbox registered" is not a guard). A
+   * constructor that touched the DB would make every unit test that builds
+   * a provider create a session DB at the production path. The runner
+   * entrypoint calls this exactly once, after the mailbox has started
+   * (`index.ts:97`) and the provider is built (`index.ts:308`); tests call it
+   * explicitly when they want the restore.
+   *
    * OAuth ring ONLY — see the comment below where the `ANTHROPIC_API_KEY_N`
    * lookup used to be for why the forward-only fallback pool is deliberately
    * excluded: only the circular ring's wrap guarantees every slot stays
    * reachable after a restore, so only it is safe to persist across a
    * respawn.
    *
-   * Best-effort: no persisted slot (fresh install, first-ever rotation) and
-   * no registered mailbox (unit tests constructing the provider directly)
-   * both fall through to the default primary silently.
+   * Best-effort: no persisted slot (fresh install, first-ever rotation)
+   * falls through to the default primary silently, and a session-DB read
+   * failure is logged and ignored — a respawn must never fail to boot over a
+   * position hint it can re-derive by rotating.
    */
-  private restorePersistedCredentialSlot(): void {
+  restorePersistedCredentialSlot(): void {
     let persisted: string | undefined;
     try {
       persisted = getCredentialSlot('claude');
-    } catch {
-      return; // no mailbox registered (e.g. a unit test) — nothing to restore
+    } catch (err) {
+      log(`Could not read persisted credential slot: ${err instanceof Error ? err.message : String(err)}`);
+      return;
     }
     if (!persisted) return;
 

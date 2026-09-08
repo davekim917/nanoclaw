@@ -115,6 +115,16 @@ export interface AgentProvider {
   resetRotationCycle?(): void;
 
   /**
+   * Restore the credential slot persisted by a previous instance of this
+   * session's container (circular OAuth ring only — see
+   * `ClaudeProvider.restorePersistedCredentialSlot`). Reads session state, so
+   * the runner entrypoint calls it once after the mailbox has started
+   * (`index.ts:97`) and the provider is built (`index.ts:308`); providers
+   * must not call it from their constructor or from `query()`.
+   */
+  restorePersistedCredentialSlot?(): void;
+
+  /**
    * Optional pre-resume maintenance. Given the stored continuation token,
    * decide whether its backing transcript has grown too large or too old to
    * resume cheaply. Return a non-null reason string to tell the caller to drop
