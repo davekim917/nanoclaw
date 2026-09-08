@@ -100,8 +100,18 @@ next spawn, and the enabler run is just a verification pass.
    > (`fs.rmSync` runs only behind an `isManagedMirror(entryPath)` gate,
    > `src/plugin-skill-discovery.ts:465`, and its comment says "Anything else is
    > preserved"). If you do want the global fallback, move the dir aside and migrate
-   > the non-managed entries — the managed ones are the mirror dirs whose children are
-   > all symlinks.
+   > the non-managed entries. Identify them by the marker, not by their contents:
+   > `isManagedMirror` returns `entries.includes('.nanoclaw-managed')`
+   > (`src/plugin-skill-discovery.ts:545`), and an empty dir also counts as managed.
+   > A managed mirror holds real files — `SKILL.md` is copied, not linked, because
+   > Codex auto-discovery skips symlinked `SKILL.md` — so "all children are symlinks"
+   > is not the test and would misclassify in both directions:
+   >
+   > ```bash
+   > for d in ~/.local/share/opencode-<group>/skill/*/; do
+   >   [ -e "$d/.nanoclaw-managed" ] || echo "KEEP (not managed): $d"
+   > done
+   > ```
 
    **`--report-json` is not a probe — it writes.** It only changes the OUTPUT
    FORMAT. Every mutation in `main()` is gated on `dryRun` alone: manifest
@@ -305,7 +315,10 @@ treats it as a fault will undo the opt-out trying to repair it.
   stays, since `--deny` never withholds one. After `--exclude` it is the mirror image:
   the commands remain (they come from the XDG mirror, which the mount never touched) and
   the **ruleset** is gone, because `composeGroupClaudeMd` skips an excluded plugin
-  (`if (excluded.has(name)) continue;`, `src/claude-md-compose.ts:177`).
+  (`if (excluded.has(name)) continue;`, `src/claude-md-compose.ts:177`). The two are not
+  alternatives: `--deny` and `--exclude` parse independently in the same invocation and
+  the sync and composition paths honour them separately, so applying both to one group
+  withholds both halves and the correct expectation is that nothing appears.
 - For mode plugins, the condensed ruleset is in `groups/<folder>/AGENTS.md` — spot-check
   a group **not** named in `--exclude`: `grep -c "<a distinctive ruleset phrase>"
   groups/<name>-codex/AGENTS.md`. On an excluded group the count is correctly `0` on
