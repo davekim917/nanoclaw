@@ -284,12 +284,14 @@ fi
 # `log_off`/`err_off`/`restarts` are a window CURSOR: persist them on every run
 # or the next run re-scans the same bytes and re-alerts forever.
 #
-# `last_alert` is a RECEIPT of a DM that actually went out, so it is stamped
-# only after the socket send returns (bottom of this file). Stamping it here
-# burned the 6h cooldown on undelivered alerts — worst precisely when it
-# matters, because cli.sock is served BY nanoclaw-v2 itself: the
-# `service|nanoclaw-v2 is <state>` breach is undeliverable exactly when it
-# fires, and the old code then sat silent for 6h having "already alerted".
+# `last_alert` is a RECEIPT of a delivery that actually happened (DM or
+# outbox), so it is stamped only after notify-owner.ts (or the outbox write)
+# resolves (bottom of this file), never before. Stamping it here burned the 6h
+# cooldown on undelivered alerts — worst precisely when it matters: this
+# sentinel's own `service|nanoclaw-v2 is <state>` breach fires exactly when
+# nanoclaw-v2 (and anything depending on it, like the old cli.sock delivery
+# path) may be unreachable, and the old code then sat silent for 6h having
+# "already alerted".
 export STATE_FILE LOG_SIZE ERR_SIZE RESTARTS
 ALERT_FILE=$(mktemp)
 trap 'rm -f "$ALERT_FILE"' EXIT
@@ -347,71 +349,49 @@ if [ -z "$ALERT_LINES" ]; then
   exit 0
 fi
 
-# ── deliver the alert over the outbox ───────────────────────────────────────
-# NOT data/cli.sock. The comment above already says why the cooldown must not be
-# stamped before delivery: that socket is served BY nanoclaw-v2, so the alert is
-# undeliverable exactly when it fires. The same reasoning condemns the socket as
-# the delivery path, which the previous version kept.
+# ── deliver the alert ───────────────────────────────────────────────────────
+# scripts/notify-owner.ts, NOT data/cli.sock. That socket is served BY
+# nanoclaw-v2 and is only the CLI *channel adapter* (src/channels/cli.ts): a
+# `to:` payload becomes an INBOUND event and queues work for an agent, which
+# must then spawn a container and compose a reply before anyone sees anything
+# — and this sentinel's own `service|nanoclaw-v2 is <state>` breach is
+# undeliverable exactly when it fires, since nanoclaw-v2 serves that socket.
+# There is also no ack frame on that path, so a successful `sendall()` proved
+# nothing was delivered — that muted this sentinel for three days once
+# already (#538). notify-owner.ts posts to Slack directly and only reports
+# success on a verified `ok: true` response.
 #
-# It is worse than "undeliverable when the host is down". A `to:` payload on
-# cli.sock becomes an INBOUND event, so the router applies its unknown-sender
-# gate: `senderId: "system:health-sentinel"` is not a known user, and the owner
-# DM runs `unknown_sender_policy = strict`, so the router DROPS it —
-# `MESSAGE DROPPED — unknown sender (strict policy) userId="system:health-sentinel"`.
-# `sock.sendall()` returned successfully every time, the cooldown was stamped on
-# that false receipt, and this sentinel went silent for 6h per vital. Last
-# alert that actually reached anyone: 2026-09-04.
-#
-# outbox-ship.sh POSTs the outbox to Slack every 60s with its own bot token and
-# no host process, so it survives nanoclaw-v2 being down — which is the state
-# this sentinel exists to report. A written, non-empty file is a receipt that
-# can be verified locally, which is what makes stamp_alert_cooldown honest.
-OUTBOX="${HEALTH_SENTINEL_OUTBOX:-${UNIT_ALERT_OUTBOX:-}}"
-if [ -z "$OUTBOX" ]; then
-  echo "health-sentinel: BREACH but no outbox configured (HEALTH_SENTINEL_OUTBOX/UNIT_ALERT_OUTBOX):" >&2
-  echo "$ALERT_LINES" >&2
-  exit 1
-fi
-# Do NOT mkdir the outbox. This runs as root, so creating a missing final
-# directory would leave it root-owned 0755: the install-user shipper could
-# read the queued alert but not rename it into sent/, so a successful POST
-# would retry forever while this script had already stamped its cooldown.
-# An absent outbox is a provisioning error and must be loud, not papered over.
-if [ ! -d "$OUTBOX" ] || [ ! -w "$OUTBOX" ]; then
-  echo "health-sentinel: outbox missing or unwritable ($OUTBOX) — NOBODY WAS TOLD" >&2
-  echo "$ALERT_LINES" >&2
-  exit 1
+# DM by default: these are host-ops alerts for one operator and do not belong
+# in a shared channel. The outbox remains as an OPT-IN fallback
+# (HEALTH_SENTINEL_OUTBOX) for the case notify-owner.ts cannot deliver — it is
+# opt-in because the workgroup outbox ships to a shared channel.
+TITLE="Host health alert"
+NOTIFICATION="$ALERT_LINES
+
+Triage: logs/nanoclaw.error.log first, then \`pnpm exec tsx scripts/host-health.ts\`."
+
+DELIVERED=0
+if node_modules/.bin/tsx scripts/notify-owner.ts --title "$TITLE" --body "$NOTIFICATION"; then
+  DELIVERED=1
+  echo "health-sentinel: alert sent to the owner DM"
 fi
 
-# One atomic create-and-write. `set -C` makes `>` use O_CREAT|O_EXCL, which
-# REFUSES an existing path — a symlink included — rather than following it,
-# closing the window a mktemp-then-reopen sequence leaves open where an agent
-# sharing this outbox could swap the name between create and write. The random
-# component means there is nothing to pre-create, and `>` respects umask so
-# outbox-ship.sh (running as the install user) can read what root wrote.
-RAND="$(od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
-ALERT_OUT="$OUTBOX/$(date -u +%Y%m%dT%H%M%S)-health-sentinel.${RAND:-$$}.md"
-umask 022
-set -C
-{
-  printf '*Host health alert*\n_host: %s · %s UTC_\n\n' "$(hostname)" "$(date -u '+%Y-%m-%d %H:%M')"
-  printf '%s\n\n' "$ALERT_LINES"
-  printf 'Triage: `logs/nanoclaw.error.log` first, then `pnpm exec tsx scripts/host-health.ts`.\n'
-} > "$ALERT_OUT" || {
+OUTBOX="${HEALTH_SENTINEL_OUTBOX:-}"
+if [ "$DELIVERED" = "0" ] && [ -n "$OUTBOX" ] && [ -d "$OUTBOX" ] && [ -w "$OUTBOX" ]; then
+  RAND="$(od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+  ALERT_OUT="$OUTBOX/$(date -u +%Y%m%dT%H%M%S)-health-sentinel.${RAND:-$$}.md"
+  umask 022
+  set -C
+  printf '*%s*\n\nThe owner DM could not be delivered; queuing to the shared outbox instead.\n\n%s\n' \
+    "$TITLE" "$NOTIFICATION" > "$ALERT_OUT" && DELIVERED=1
   set +C
-  echo "health-sentinel: BREACH but could not create $ALERT_OUT:" >&2
-  echo "$ALERT_LINES" >&2
-  exit 1
-}
-set +C
+  [ "$DELIVERED" = "1" ] && echo "health-sentinel: alert queued $ALERT_OUT"
+fi
 
-# Only a written, non-empty file counts as delivery. Anything else must stay
-# loud and must NOT stamp the cooldown, or one silent failure mutes this vital
-# for six hours.
-if [ ! -s "$ALERT_OUT" ]; then
-  echo "health-sentinel: BREACH but wrote an empty alert to $ALERT_OUT:" >&2
+# Anything short of a delivery stays loud AND must not stamp the cooldown.
+if [ "$DELIVERED" = "0" ]; then
+  echo "health-sentinel: BREACH BUT NOBODY WAS TOLD:" >&2
   echo "$ALERT_LINES" >&2
   exit 1
 fi
-echo "health-sentinel: alert queued $ALERT_OUT"
 stamp_alert_cooldown
