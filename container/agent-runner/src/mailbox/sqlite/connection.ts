@@ -73,8 +73,23 @@ export function getInboundDb(): Database {
 }
 
 /** Outbound DB — container owns this file (sole writer). */
+/**
+ * Under a test runner (bun sets NODE_ENV=test) a test that never called
+ * initTestSessionDb() must not silently create the production-path session
+ * DB. Every session_state / telemetry writer funnels through getOutboundDb,
+ * so this is the one place the invariant "tests never touch
+ * /workspace/outbound.db" is enforced, rather than re-discovered at each
+ * caller (credential-slot persistence was found this way twice).
+ */
+export function refuseProductionSessionDbUnderTest(path: string): void {
+  if (!_testMode && process.env.NODE_ENV === 'test') {
+    throw new Error(`refusing to open ${path} under a test runner — call initTestSessionDb() first`);
+  }
+}
+
 export function getOutboundDb(): Database {
   if (!_outbound) {
+    refuseProductionSessionDbUnderTest(DEFAULT_OUTBOUND_PATH);
     _outbound = new Database(DEFAULT_OUTBOUND_PATH);
     _outbound.exec('PRAGMA journal_mode = DELETE');
     _outbound.exec('PRAGMA busy_timeout = 5000');

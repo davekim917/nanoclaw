@@ -1116,7 +1116,7 @@ export class CodexProvider implements AgentProvider {
    * unpersisted respawn today resets to the primary and gives the whole
    * pool another chance. `fallbackHomes` is therefore deliberately NOT
    * persisted to session_state — see `ClaudeProvider.rotateApiKey`'s
-   * `ANTHROPIC_API_KEY_N` branch (providers/claude.ts:2297) for the same reasoning on the other
+   * `ANTHROPIC_API_KEY_N` branch (providers/claude.ts:2308) for the same reasoning on the other
    * forward-only pool this fleet has.
    *
    * Exported as a method so the gen() body and unit tests can both drive it.

@@ -122,7 +122,7 @@ export function transientOverloadDelayMs(n: number, rand: number = Math.random()
  * the original prompt intact after provenance that distinguishes this retry
  * from a new delivery without claiming the interrupted attempt had no effects.
  *
- * `rotation` is the result of the `rotateApiKey()` call (providers/claude.ts:2297)
+ * `rotation` is the result of the `rotateApiKey()` call (providers/claude.ts:2308)
  * that triggered this retry. When it reports `rotated: true` with a position/ringSize, a second
  * block tells the agent explicitly that its credential was swapped and any
  * "rate limited" narrative still sitting in its resumed transcript is stale
@@ -797,7 +797,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       log(`Query error: ${errMsg}`);
       // The failed query's CLI child may still be running (an in-body throw
       // unwinds the generator without necessarily tearing the subprocess
-      // down — see queryAbortController at providers/claude.ts:2506-2515). Every recovery branch
+      // down — see queryAbortController at providers/claude.ts:2517-2526). Every recovery branch
       // below starts a FRESH query on the same or a rotated credential, so
       // abort the old one first: left alone, it can keep running on an
       // exhausted/wedged credential and burn another failure minutes after
@@ -932,8 +932,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           }
           touchHeartbeat();
           if (!repositoryRecoveryAllowed()) break;
+          let retryQuery: AgentQuery | undefined;
           try {
-            const retryQuery = config.provider.query({
+            retryQuery = config.provider.query({
               prompt,
               attachments: batchAttachments,
               continuation,
@@ -965,6 +966,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             }
             recovered = true;
           } catch (retryErr) {
+            // Tear this attempt's CLI child down before falling through — an
+            // abandoned retry query leaks its subprocess the same way the original
+            // did (see the abort() at the top of the outer catch).
+            retryQuery?.abort();
             // Still stalled → back off and try again. Any other error → stop
             // and let the original idle error fall through to the clean message.
             if (retryErr instanceof ProviderEventError && retryErr.classification === 'idle_timeout') {
@@ -1077,6 +1082,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         continuation = undefined;
         resetProviderContext(config.providerName);
         freshContextBootstrapRequired = true;
+        let retryQuery: AgentQuery | undefined;
         try {
           const recap = buildSessionRecap();
           const retryPrompt = ensureFreshContextBootstrap(
@@ -1086,7 +1092,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
               prompt,
           );
           freshContextBootstrapRequired = false;
-          const retryQuery = config.provider.query({
+          retryQuery = config.provider.query({
             prompt: retryPrompt,
             attachments: batchAttachments,
             continuation: undefined,
@@ -1118,6 +1124,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           }
           recovered = true;
         } catch (retryErr) {
+          // Tear this attempt's CLI child down before falling through — an
+          // abandoned retry query leaks its subprocess the same way the original
+          // did (see the abort() at the top of the outer catch).
+          retryQuery?.abort();
           const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
           log(`Retry after context-too-long also failed: ${retryMsg}`);
           // The failed retry's `init` event may have re-persisted a
@@ -1136,6 +1146,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         continuation = undefined;
         resetProviderContext(config.providerName);
         freshContextBootstrapRequired = true;
+        let retryQuery: AgentQuery | undefined;
         try {
           const recap = buildSessionRecap();
           const retryPrompt = ensureFreshContextBootstrap(
@@ -1145,7 +1156,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
               prompt,
           );
           freshContextBootstrapRequired = false;
-          const retryQuery = config.provider.query({
+          retryQuery = config.provider.query({
             prompt: retryPrompt,
             attachments: batchAttachments,
             continuation: undefined,
@@ -1177,6 +1188,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           }
           recovered = true;
         } catch (retryErr) {
+          // Tear this attempt's CLI child down before falling through — an
+          // abandoned retry query leaks its subprocess the same way the original
+          // did (see the abort() at the top of the outer catch).
+          retryQuery?.abort();
           const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
           log(`Retry after stale-session recovery also failed: ${retryMsg}`);
           // The failed retry's `init` event may have re-persisted a
@@ -1198,6 +1213,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         continuation = undefined;
         resetProviderContext(config.providerName);
         freshContextBootstrapRequired = true;
+        let retryQuery: AgentQuery | undefined;
         try {
           const recap = buildSessionRecap();
           const retryPrompt = ensureFreshContextBootstrap(
@@ -1207,7 +1223,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
               prompt,
           );
           freshContextBootstrapRequired = false;
-          const retryQuery = config.provider.query({
+          retryQuery = config.provider.query({
             prompt: retryPrompt,
             attachments: batchAttachments,
             continuation: undefined,
@@ -1239,6 +1255,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           }
           recovered = true;
         } catch (retryErr) {
+          // Tear this attempt's CLI child down before falling through — an
+          // abandoned retry query leaks its subprocess the same way the original
+          // did (see the abort() at the top of the outer catch).
+          retryQuery?.abort();
           const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
           log(`Retry after provider system_error also failed: ${retryMsg}`);
           continuation = undefined;

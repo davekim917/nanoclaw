@@ -9,6 +9,12 @@ import { initTestSessionDb } from '../modules/mailbox/testing.js';
 // give up only after a full cycle, and reset that budget per turn.
 describe('ClaudeProvider OAuth circular rotation', () => {
   const saved = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  // rotateApiKey persists the slot name to session state, which opens the
+  // outbound session DB — every rotating test needs the in-memory one so no
+  // test ever touches the production path.
+  beforeEach(() => {
+    initTestSessionDb();
+  });
   afterEach(() => {
     if (saved === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
     else process.env.CLAUDE_CODE_OAUTH_TOKEN = saved;

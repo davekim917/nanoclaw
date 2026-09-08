@@ -97,8 +97,8 @@ export interface AgentProvider {
    * (primary is 1), and `ringSize` the ring's total length. Poll-loop passes
    * these through to the replayed turn so the agent knows it is running on a
    * different credential than the one that just failed — the rotation catch
-   * calls this at poll-loop.ts:1005 and poll-loop.ts:1054 and hands the result
-   * to `formatCredentialRetryPrompt` at poll-loop.ts:1012. Omitted (along
+   * calls this at poll-loop.ts:1010 and poll-loop.ts:1059 and hands the result
+   * to `formatCredentialRetryPrompt` at poll-loop.ts:1017. Omitted (along
    * with `rotated: false`) when no rotation happened.
    */
   rotateApiKey?(): { rotated: boolean; slot?: string; position?: number; ringSize?: number };
