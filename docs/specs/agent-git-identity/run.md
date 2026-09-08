@@ -90,6 +90,11 @@ the contract in `plan.md`:
 
 ## Incoming main integration
 
+- CI on reviewed commit `2a974b0` passed 7,486 other host tests and failed
+  only because the inherited ratchet manifest still recorded the pre-#579
+  `poll-loop.test.ts` receipt. Merging `origin/main` commit `13bfd184b`
+  resolves that stale-manifest mismatch; the regenerated receipt accepts only
+  that incoming test's +83-line divergence.
 - Merge validation against incoming `origin/main` commit `c1edef384` had one
   generated-file conflict: `src/upstream-ratchet.json`. It was reset to the
   incoming baseline and regenerated; the Git identity's four known host paths

@@ -2845,19 +2845,110 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     });
   });
 
-  it('keys each turn by its admitted occurrence so retries coalesce but fires do not', () => {
-    // The key is what separates "the same fire, attempted twice" from "two
-    // fires". Retries re-enter with the same batch ids; a later occurrence
-    // arrives with its own.
-    const merged = new Map<string, unknown>();
-    const attemptOne = [{ key: 'occ-1', outcome: { text: 'failed', isError: true } }];
-    const attemptOneRetry = [{ key: 'occ-1', outcome: { text: 'failed again', isError: true } }];
-    const laterFire = [{ key: 'occ-2', outcome: { text: 'also failed', isError: true } }];
-    for (const turns of [attemptOne, attemptOneRetry, laterFire]) {
-      for (const t of turns) merged.set(t.key, t.outcome);
+  it('coalesces an outer-loop RETRY of one fire into a single record', async () => {
+    // The reframe must not turn one retried fire into several outcome rows —
+    // that would trip escalation early on a task that only needed a retry.
+    // Coalescing is by turn KEY, and the outer loop re-invokes processQuery
+    // with the same admitted batch, so both attempts report the same key.
+    // Uses real processQuery output rather than hand-built records, so the
+    // keying itself is under test and not just the Map.
+    async function attempt(text: string, isError: boolean) {
+      async function* events() {
+        yield { type: 'init' as const, continuation: 'c1' };
+        yield { type: 'result' as const, text, isError };
+      }
+      const query: AgentQuery = { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+      return processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
+        model: 'gpt-6-astra',
+      });
     }
+
+    const first = await attempt('attempt one failed', true);
+    const retry = await attempt('retry succeeded', false);
+
+    // Same fire, so the same key from both attempts.
+    expect(first.taskTurns![0]!.key).toBe('occ-1');
+    expect(retry.taskTurns![0]!.key).toBe('occ-1');
+
+    // What the caller does: later attempts overwrite earlier ones by key.
+    const merged = new Map<string, unknown>();
+    for (const t of [...first.taskTurns!, ...retry.taskTurns!]) if (t.outcome) merged.set(t.key, t.outcome);
+
+    expect(merged.size).toBe(1);
+    expect(merged.get('occ-1')).toEqual({ text: 'retry succeeded', isError: false, model: 'gpt-6-astra' });
+  });
+
+  // THE case this PR is named for: a later occurrence admitted into an
+  // ALREADY-RUNNING stream. Two independent `processQuery` calls only prove
+  // that different `initialBatchIds` yield different keys — they never touch
+  // the follow-up admission path, so they stay green even if its
+  // `taskTurns.push` is deleted. That path is exactly where #561's last P1
+  // lived: the second fire was dropped and a failing series never crossed the
+  // escalation threshold.
+  //
+  // Verified red-first by removing that push on merged main: this case fails
+  // with `['occ-1']` where `['occ-1','occ-2']` is required, while the two
+  // separate-stream cases below stay green — which is the whole point.
+  it('admits a later occurrence into the RUNNING stream and gives it its own turn', async () => {
+    // Pending before the query opens, but NOT in the initial batch — so the
+    // only way it can be seen is the in-stream follow-up poll.
+    insertMessage('occ-2', 'task', { prompt: 'second fire of the same series' });
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      yield { type: 'result', text: 'first fire failed', isError: true };
+      // Outlast ACTIVE_POLL_INTERVAL_MS (500ms) so the follow-up poll runs and
+      // admits occ-2 into this same stream.
+      await Bun.sleep(1600);
+      yield { type: 'result', text: 'second fire failed', isError: true };
+    }
+    const pushed: string[] = [];
+    const query: AgentQuery = {
+      push: (m: string) => pushed.push(m),
+      end: () => {},
+      abort: () => {},
+      // Live-controls provider. Without this the poll ENDS the stream to reopen
+      // on the resolved settings instead of pushing into it, and the follow-up
+      // admission path — the one under test — is never reached.
+      applySettings: async () => {},
+      events: events(),
+    };
+
+    // Settings must match what the follow-up batch resolves to, or the poll
+    // treats it as a mid-turn settings change. `ultracode` resolves to `false`,
+    // not `undefined`, so an empty object counts as changed.
+    const result = await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
+      ultracode: false,
+    });
+
+    // The follow-up really was admitted into the live stream.
+    expect(pushed.join('\n')).toContain('second fire of the same series');
+    // ...and it got its OWN turn, rather than coalescing into occ-1's.
+    expect(result.taskTurns!.map((t) => t.key)).toEqual(['occ-1', 'occ-2']);
+    expect(result.taskTurns![0]!.outcome?.text).toBe('first fire failed');
+    expect(result.taskTurns![1]!.outcome?.text).toBe('second fire failed');
+  }, 15_000);
+
+  it('keeps two separate fires apart even though they share a series', async () => {
+    async function fire(occurrenceId: string) {
+      async function* events() {
+        yield { type: 'init' as const, continuation: 'c1' };
+        yield { type: 'result' as const, text: `${occurrenceId} failed`, isError: true };
+      }
+      const query: AgentQuery = { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+      return processQuery(query, TASK_ROUTING, [occurrenceId], 'claude', undefined, 'p', undefined, {
+        model: 'gpt-6-astra',
+      });
+    }
+
+    const a = await fire('occ-1');
+    const b = await fire('occ-2');
+    const merged = new Map<string, unknown>();
+    for (const t of [...a.taskTurns!, ...b.taskTurns!]) if (t.outcome) merged.set(t.key, t.outcome);
+
+    // Distinct occurrences must NOT coalesce — that is the under-count this
+    // whole feature is trying to avoid.
     expect([...merged.keys()]).toEqual(['occ-1', 'occ-2']);
-    expect(merged.get('occ-1')).toEqual({ text: 'failed again', isError: true });
   });
 
   it('an attempt REPORTS its outcome and writes no row itself', async () => {

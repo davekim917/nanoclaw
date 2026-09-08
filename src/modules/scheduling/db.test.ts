@@ -19,6 +19,7 @@ vi.mock('../../config.js', async (importOriginal) => ({
 }));
 
 import { openInboundDb } from '../mailbox/openers.js';
+import { getCliTaskRow, listCliTaskSeries } from '../mailbox/ops/tasks.js';
 import { ensureSchema } from '../mailbox/schema.js';
 import {
   insertTaskRow,
@@ -1222,5 +1223,76 @@ describe('task ops on the mailbox session', () => {
       expect(() => fork(mailbox).armNextRecurrence('task-2', source, 'task-1', null)).toThrow();
     });
     expect(inboundRows().find((r) => r.id === 'task-2')).toMatchObject({ recurrence: '0 9 * * *' });
+  });
+});
+
+describe('a run-now row does not shadow its series', () => {
+  // `ncl tasks run` inserts a SECOND live row for the same series with
+  // recurrence NULL, so that handleRecurrence cannot re-arm it into a phantom
+  // series. Both rows are pending, so the read side has to break the tie on
+  // something other than recency or it hands back the run row — which made
+  // `tasks get` / `tasks list` report a live recurring series as `once` with a
+  // null recurrence. Nothing was ever damaged on disk; it only read that way,
+  // which is worse than a plain bug because it invites a destructive repair.
+  function addRunNowRow(db: ReturnType<typeof openInboundDb>, seriesId: string) {
+    insertTaskRow(db, {
+      id: `${seriesId}-run-abcd`,
+      seriesId,
+      processAfter: new Date().toISOString(),
+      recurrence: null,
+      content: JSON.stringify({ prompt: 'noop' }),
+    });
+  }
+
+  it('getCliTaskRow returns the scheduled row, not the run-now row', () => {
+    const db = freshDb();
+    insertBasicTask(db, 'series-a', '0 3 1 1 *');
+    addRunNowRow(db, 'series-a');
+
+    const row = getCliTaskRow(db, 'series-a');
+    expect(row?.recurrence).toBe('0 3 1 1 *');
+    expect(row?.row_id).toBe('series-a');
+    db.close();
+  });
+
+  it('listCliTaskSeries lists the schedule, not the run-now row', () => {
+    const db = freshDb();
+    insertBasicTask(db, 'series-b', '0 3 1 1 *');
+    addRunNowRow(db, 'series-b');
+
+    const listed = listCliTaskSeries(db).filter((r) => r.series_id === 'series-b');
+    expect(listed).toHaveLength(1);
+    expect(listed[0].recurrence).toBe('0 3 1 1 *');
+    db.close();
+  });
+
+  it('still finds the schedule after a re-arm gave it a new row id', () => {
+    // insertRecurrence arms each occurrence under a NEW id while carrying the
+    // recurrence forward, so `id === series_id` is NOT a usable stand-in for
+    // "the series row" once a series has fired even once.
+    const db = freshDb();
+    insertBasicTask(db, 'series-c', '0 3 1 1 *');
+    const original = db
+      .prepare('SELECT * FROM messages_in WHERE id = ?')
+      .get('series-c') as unknown as RecurringMessage;
+    insertRecurrence(db, original, 'series-c-next', new Date(Date.now() + 86_400_000).toISOString());
+    db.prepare("UPDATE messages_in SET status = 'completed' WHERE id = 'series-c'").run();
+    addRunNowRow(db, 'series-c');
+
+    const row = getCliTaskRow(db, 'series-c');
+    expect(row?.recurrence).toBe('0 3 1 1 *');
+    expect(row?.row_id).toBe('series-c-next');
+    db.close();
+  });
+
+  it('leaves one-shot resolution alone — newest live row still wins', () => {
+    const db = freshDb();
+    insertBasicTask(db, 'series-d', null);
+    addRunNowRow(db, 'series-d');
+
+    const row = getCliTaskRow(db, 'series-d');
+    expect(row?.recurrence).toBeNull();
+    expect(row?.row_id).toBe('series-d-run-abcd');
+    db.close();
   });
 });
