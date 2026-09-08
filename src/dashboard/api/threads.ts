@@ -28,7 +28,7 @@
  */
 import { getDb } from '../../db/connection.js';
 import { getContainerConfig, resolveProviderName } from '../../db/container-configs.js';
-import { TASKS_SYSTEM_THREAD_ID } from '../../db/sessions.js';
+import { TASKS_SYSTEM_THREAD_ID, isTaskThread } from '../../db/sessions.js';
 import { readSessionOutbound, type ContainerState } from '../../modules/mailbox/index.js';
 import { getActiveContainerSessionIds, resolveAssistantName } from '../../container-runner.js';
 import { readContainerConfig } from '../../container-config.js';
@@ -542,15 +542,20 @@ export interface ThreadDoneProposal {
 
 /**
  * §5/CLAUDE.md: `ncl tasks` fires in an isolated session whose thread_id is
- * `TASKS_SYSTEM_THREAD_ID` (the legacy shared session) or
  * `${TASKS_SYSTEM_THREAD_ID}:<seriesId>` (`resolveTaskSession`, one session per
  * recurring series). Exported so the row-level pill and its test share one
  * definition of "this is a scheduled task" with the channel-key parser, which
  * already treats the same prefix as `system:tasks` (`threadChannelKey`'s
  * `EXTRA_SEGMENT_PLATFORMS` fallback — this is NOT a second, competing rule).
+ *
+ * Delegates rather than restating the rule. It used to be a verbatim copy of
+ * `isTaskThread` (`src/db/sessions.ts:157`), which is the shape that
+ * drifts: two copies agree until one is edited. Kept as a named export because
+ * the pill, the filter and their tests read better for it, but there is now
+ * exactly one definition.
  */
 export function isScheduledTaskThread(threadId: string): boolean {
-  return threadId === TASKS_SYSTEM_THREAD_ID || threadId.startsWith(`${TASKS_SYSTEM_THREAD_ID}:`);
+  return isTaskThread(threadId);
 }
 
 /** Anything that leaves this module as a timestamp goes out as ISO-8601 UTC. */
@@ -801,6 +806,13 @@ export async function readChannelDirectory(): Promise<ChannelDirectory> {
   // which read as a peer of real channels; naming it here, through the same
   // `names` map every other channel resolves through, is the honest label the
   // operator asked for once anchored tasks stopped needing this bucket at all.
+  //
+  // NOT dead with the legacy shared SESSION gone. This key is a CHANNEL key,
+  // not a thread id: `threadChannelKey` takes two segments for the `system`
+  // platform (`EXTRA_SEGMENT_PLATFORMS` only widens Discord), so every live
+  // per-series thread `system:tasks:<seriesId>` still collapses to exactly
+  // `system:tasks` here. Removing this mapping would regress the label to the
+  // bare `tasks` for currently-running tasks.
   if (!names.has(TASKS_SYSTEM_THREAD_ID)) names.set(TASKS_SYSTEM_THREAD_ID, 'Unrouted tasks');
 
   return { known, names, byId, dmDedupeKey };

@@ -10,8 +10,7 @@ import {
   findTaskSessions,
   getActiveSessions,
   getSession,
-  isTaskThread,
-  TASKS_SYSTEM_THREAD_ID,
+  taskSeriesId,
   withQuietInvalidationSync,
 } from '../../db/sessions.js';
 import { withCentralSync } from '../../db/central-lease.js';
@@ -432,8 +431,14 @@ async function appendTaskLog(
   let group = groupArg(args, ctx);
   if (!series && ctx.caller === 'agent' && ctx.sessionId) {
     const sess = await getSession(ctx.sessionId);
-    if (sess && sess.thread_id && isTaskThread(sess.thread_id)) {
-      series = sess.thread_id.slice(`${TASKS_SYSTEM_THREAD_ID}:`.length);
+    // `taskSeriesId` (`src/db/sessions.ts:182`) returns null for the bare
+    // `system:tasks` an upgraded install may still hold; the old slice returned
+    // `''` there, which fell through to the `--id is required` error below only
+    // by accident of being falsy. Being explicit keeps that behaviour when the
+    // shape changes.
+    const derived = taskSeriesId(sess?.thread_id ?? null);
+    if (sess && derived !== null) {
+      series = derived;
       group ??= sess.agent_group_id;
     }
   }

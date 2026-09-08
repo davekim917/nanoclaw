@@ -13,6 +13,7 @@ import {
   getSessionsActiveSince,
   createPendingQuestion,
   isTaskThread,
+  taskSeriesId,
   TASKS_SYSTEM_THREAD_ID,
 } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -1023,8 +1024,26 @@ async function deliverMessage(
   // the only delivery path from a task session). Append to the series log,
   // never deliver. The caller marks it delivered so it isn't retried.
   if (msg.kind === 'task_log') {
-    if (session.messaging_group_id === null && isTaskThread(session.thread_id) && session.thread_id) {
-      const series = session.thread_id.slice(`${TASKS_SYSTEM_THREAD_ID}:`.length);
+    // `taskSeriesId` (`src/db/sessions.ts:182`) rather than a raw slice: the bare `system:tasks` a
+    // pre-migration install may still hold is 12 characters, and slicing 13 off
+    // it yielded an EMPTY series id.
+    //
+    // Where that landed is worth being exact about, because the two writes
+    // below are protected differently. `appendRunLog` was never at risk: its
+    // charset guard (`/^[a-z0-9-]+$/`, `src/modules/scheduling/run-log.ts:24`)
+    // requires at least one character, so `''` threw before any filesystem
+    // write and the `catch` below turned it into a warning. Execution then
+    // continued to `recordTaskRunOutcome`
+    // (`src/db/task-run-outcomes.ts:47-61`), which is an unguarded
+    // `INSERT OR IGNORE` — so the malformed series id reached the central
+    // ledger that T24 reads to decide escalations
+    // (`src/modules/sweep-task-escalation/index.ts:170-172`). The file was
+    // safe; the ledger was not.
+    //
+    // A session naming no series has no run log to append to and no series to
+    // record against, so say so and drop the row rather than inventing one.
+    const series = taskSeriesId(session.thread_id);
+    if (session.messaging_group_id === null && series !== null) {
       const text = typeof content.text === 'string' ? content.text : '';
       try {
         await appendRunLog(session.agent_group_id, series, text);
@@ -1060,6 +1079,12 @@ async function deliverMessage(
           log.warn('Failed to record task run outcome', { id: msg.id, sessionId: session.id, err });
         }
       }
+    } else if (session.messaging_group_id === null && isTaskThread(session.thread_id)) {
+      log.warn('task_log row from a task session that names no series — ignoring', {
+        id: msg.id,
+        sessionId: session.id,
+        threadId: session.thread_id,
+      });
     } else {
       log.warn('task_log row outside a task session — ignoring', { id: msg.id, sessionId: session.id });
     }
