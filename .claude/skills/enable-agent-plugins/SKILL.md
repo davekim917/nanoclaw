@@ -140,7 +140,9 @@ next spawn, and the enabler run is just a verification pass.
    - Size is not a constraint worth distorting rules for: container Codex spawns set
      `project_doc_max_bytes=262144` (codex-app-server.ts), and nothing evicts sections
      anymore. Condense for signal, not for bytes.
-   - This file is what `composeGroupClaudeMd` folds into every non-Claude group.
+   - This file is what `composeGroupClaudeMd` folds into each non-Claude group that has
+     not excluded the plugin (`src/claude-md-compose.ts:167,177`). Claude groups get the
+     ruleset through the plugin mount instead, not through this path.
 
 4. **Re-run the enabler** so it re-checks the now-present ruleset file (drop
    `--report-json` for the human summary; both forms write either way):
@@ -157,7 +159,7 @@ next spawn, and the enabler run is just a verification pass.
    | Mechanism | Claude | Codex | OpenCode |
    |---|---|---|---|
    | `excludePlugins` (per group, via `--exclude`) | drops the mount | drops **both** | drops the ruleset, **keeps the skills** |
-   | `--deny <provider>` (per plugin, all groups) | only before a manifest exists | drops the skills | drops the skills, **keeps the ruleset** |
+   | `--deny <provider>` (per plugin, all groups) | only before a manifest exists | drops the skills, **keeps the ruleset** | drops the skills, **keeps the ruleset** |
    | remove from `~/plugins` | effective | effective | **does not remove already-synced skills** |
 
    `excludePlugins` is the only per-group control, and it is not uniform. The plugin
