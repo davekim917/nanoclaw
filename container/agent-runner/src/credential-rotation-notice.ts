@@ -28,6 +28,16 @@
  * generically and only asserts what is true on every path: the previous
  * credential failed, this attempt runs on a different one, and any limit text
  * in the history describes the previous credential.
+ *
+ * Same rule for the subagent sentence. Subagents die with the provider
+ * process on both paths — Claude's abort tears the CLI down via
+ * `queryAbortController` (providers/claude.ts:2506-2515) and Codex kills the
+ * app-server (`killCodexAppServer`, providers/codex-app-server.ts:257-263) —
+ * but neither path signals a process group or verifies descendants, so a
+ * backgrounded shell command may outlive the attempt. The notice therefore
+ * does NOT claim those were terminated; it tells the agent to check before
+ * repeating side-effecting work. Every sentence here must stay at the level
+ * the weakest path guarantees.
  */
 
 export interface CredentialRotationInfo {
@@ -50,9 +60,10 @@ export function formatCredentialRotationNotice(info: CredentialRotationInfo): st
     `The runner rotated to a different credential (slot ${info.position} of ${info.ringSize}) and this attempt is running on it.\n` +
     'Any "You\'ve hit your … limit · resets …" text in your conversation history describes the PREVIOUS credential ' +
     'and does not apply to this attempt: do not pause, schedule a wake, or wait for a reset because of it.\n' +
-    'Any background subagents (Agent tool with run_in_background, or backgrounded shell commands) launched before ' +
-    'the interruption were terminated with the previous attempt. Their partial work on disk survives; they are not ' +
-    'running. Inspect what landed, then re-dispatch whatever is still needed.\n' +
+    'Subagents launched by the previous attempt (Agent tool, including run_in_background) died with it; their ' +
+    'partial work on disk survives. Backgrounded shell commands are different: the runner does not verify whether ' +
+    'they survived, so check (process list, output files) before re-running anything with side effects. ' +
+    'Inspect what landed, then re-dispatch only what is still needed.\n' +
     '</runner-credential-rotation>'
   );
 }
