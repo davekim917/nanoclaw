@@ -1740,6 +1740,156 @@ describe('tasks CLI resource', () => {
       expect(auditRows(seriesB).map((r) => r.action)).toEqual(['create', 'cancel']);
     });
   });
+  /**
+   * `--session` names a session by id; `--group` names the scope the operator
+   * believes they are working inside. Nothing used to check that the first is
+   * inside the second, so `--group A --session <a session of B>` silently
+   * operated on B — `cancel --all` and `delete` destructively, `list`/`get` as
+   * a read leak. The guard lives in `selectedSessions`, the one place every
+   * verb resolves its targets through, so all eight get it from one check.
+   *
+   * Agent callers were never exposed: `groupArg` pins them to their own group
+   * and `ownSession` answers "session not found" for anything outside it,
+   * deliberately refusing to confirm the id exists elsewhere. That path is
+   * unchanged — these cases are the host caller's.
+   */
+  describe('--session must belong to --group', () => {
+    /** A live task series in ag-2, plus the isolated session that holds it. */
+    async function taskInOtherGroup(): Promise<{ sessionId: string; seriesId: string }> {
+      const created = await dispatch(
+        {
+          id: 'xg-seed',
+          command: 'tasks-create',
+          args: { prompt: 'ag-2 work', recurrence: '0 9 * * *', process_after: '2999-01-15T09:00:00Z' },
+        },
+        agentCtx('ag-2', 'chat-2'),
+      );
+      expect(created.ok).toBe(true);
+      if (!created.ok) throw new Error('fixture failed');
+      const { session_id, series_id } = created.data as { session_id: string; series_id: string };
+      return { sessionId: session_id, seriesId: series_id };
+    }
+
+    /** The series' live rows, read back through the session that owns them. */
+    async function liveSeries(sessionId: string): Promise<string[]> {
+      const list = await dispatch(
+        { id: 'xg-read', command: 'tasks-list', args: { session: sessionId } },
+        {
+          caller: 'host',
+        },
+      );
+      expect(list.ok).toBe(true);
+      if (!list.ok) return [];
+      return (list.data as Array<{ series_id: string }>).map((t) => t.series_id);
+    }
+
+    it('cancel --all refuses a cross-group session, and the other group keeps its series', async () => {
+      const { sessionId, seriesId } = await taskInOtherGroup();
+
+      const resp = await dispatch(
+        { id: 'xg-cancel', command: 'tasks-cancel', args: { group: 'ag-1', session: sessionId, all: true } },
+        { caller: 'host' },
+      );
+
+      expect(resp.ok).toBe(false);
+      if (!resp.ok) {
+        expect(resp.error.message).toContain('ag-2'); // the group that owns the session
+        expect(resp.error.message).toContain('ag-1'); // the scope the operator asked for
+      }
+      // The point of the guard: ag-2's series is still there.
+      expect(await liveSeries(sessionId)).toContain(seriesId);
+    });
+
+    it('delete refuses a cross-group session, and the other group keeps its series', async () => {
+      const { sessionId, seriesId } = await taskInOtherGroup();
+
+      const resp = await dispatch(
+        { id: 'xg-del', command: 'tasks-delete', args: { group: 'ag-1', session: sessionId, id: seriesId } },
+        { caller: 'host' },
+      );
+
+      expect(resp.ok).toBe(false);
+      if (!resp.ok) {
+        expect(resp.error.message).toContain('ag-2');
+        expect(resp.error.message).toContain('ag-1');
+      }
+      expect(await liveSeries(sessionId)).toContain(seriesId);
+    });
+
+    it('list refuses a cross-group session instead of returning its rows', async () => {
+      const { sessionId, seriesId } = await taskInOtherGroup();
+
+      const resp = await dispatch(
+        { id: 'xg-list', command: 'tasks-list', args: { group: 'ag-1', session: sessionId } },
+        { caller: 'host' },
+      );
+
+      expect(resp.ok).toBe(false);
+      if (!resp.ok) {
+        expect(resp.error.message).toContain('ag-2');
+        expect(resp.error.message).toContain('ag-1');
+      }
+      // And nothing of ag-2's leaked into the response.
+      expect(JSON.stringify(resp)).not.toContain(seriesId);
+    });
+
+    it('the same-group --session case is unchanged — read and mutate both still work', async () => {
+      const { sessionId, seriesId } = await taskInOtherGroup();
+
+      const list = await dispatch(
+        { id: 'sg-list', command: 'tasks-list', args: { group: 'ag-2', session: sessionId } },
+        { caller: 'host' },
+      );
+      expect(list.ok).toBe(true);
+      if (list.ok) {
+        expect((list.data as Array<{ series_id: string }>).map((t) => t.series_id)).toContain(seriesId);
+      }
+
+      const paused = await dispatch(
+        { id: 'sg-pause', command: 'tasks-pause', args: { group: 'ag-2', session: sessionId, id: seriesId } },
+        { caller: 'host' },
+      );
+      expect(paused.ok).toBe(true);
+      if (paused.ok) expect((paused.data as { touched: number }).touched).toBe(1);
+    });
+
+    it('the no---session case is unchanged — a group scope still fans out, an unscoped call still spans groups', async () => {
+      const { seriesId } = await taskInOtherGroup();
+
+      const scoped = await dispatch(
+        { id: 'ns-list', command: 'tasks-list', args: { group: 'ag-2' } },
+        {
+          caller: 'host',
+        },
+      );
+      expect(scoped.ok).toBe(true);
+      if (scoped.ok) {
+        expect((scoped.data as Array<{ series_id: string }>).map((t) => t.series_id)).toContain(seriesId);
+      }
+
+      // No --group and no --session: the host-wide fan-out, still unfiltered.
+      const unscoped = await dispatch({ id: 'ns-all', command: 'tasks-list', args: {} }, { caller: 'host' });
+      expect(unscoped.ok).toBe(true);
+      if (unscoped.ok) {
+        expect((unscoped.data as Array<{ series_id: string }>).map((t) => t.series_id)).toContain(seriesId);
+      }
+    });
+
+    it('an agent caller still gets the existence-oracle-safe "not found", not the new message', async () => {
+      const { sessionId } = await taskInOtherGroup();
+
+      const resp = await dispatch(
+        { id: 'xg-agent', command: 'tasks-list', args: { session: sessionId } },
+        agentCtx('ag-1', 'chat-1'),
+      );
+
+      expect(resp.ok).toBe(false);
+      if (!resp.ok) {
+        expect(resp.error.message).toContain('session not found');
+        expect(resp.error.message).not.toContain('ag-2'); // never confirms which group holds it
+      }
+    });
+  });
 });
 
 describe('formatTasksTable', () => {
