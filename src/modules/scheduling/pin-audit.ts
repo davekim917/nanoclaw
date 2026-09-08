@@ -101,12 +101,62 @@ export async function auditTaskPins(agentGroupId: string, targetProvider: string
 }
 
 /**
+ * The remedy line an operator can actually run.
+ *
+ * Two things this must not get wrong, both found in review:
+ *
+ * 1. The axis has to match the strand. Handing a `--from-model` command to an
+ *    operator whose EFFORT pin is the invalid one sends them to a repin that
+ *    matches nothing, and the switch refuses again for the same reason.
+ * 2. `--dry-run` previews and writes nothing, so a command that always carries
+ *    it can never clear the refusal. Show the preview AND the applying command,
+ *    and say which is which.
+ *
+ * Values are the stored pins printed verbatim, so `--from-*` is copy-pasteable
+ * rather than something to go and look up.
+ */
+function remedyCommands(
+  stranded: StrandedPin[],
+  agentGroupId: string,
+  toProvider: string,
+  // Only needed BEFORE the switch, to validate against a provider the group
+  // does not have yet. After the switch it is redundant, and printing it
+  // anyway would contradict the surrounding text.
+  includeTargetProvider: boolean,
+): string {
+  const base =
+    `ncl tasks repin --group ${agentGroupId}` + (includeTargetProvider ? ` --target-provider ${toProvider}` : '');
+  // One remedy per distinct (axis, stored value): several series sharing a pin
+  // are cleared by a single repin, and listing it once says so.
+  const byAxis = new Map<string, string>();
+  for (const p of stranded) {
+    // `reason` names the axis the vocabulary rejected. A pin can strand on
+    // either axis, or on both, and each needs its own from/to pair.
+    const modelBad = p.model != null && /model/i.test(p.reason);
+    const effortBad = p.effort != null && /effort/i.test(p.reason);
+    // Neither matched: fall back to whichever axis is actually set, preferring
+    // model. Better an imperfect suggestion than none.
+    const axes: Array<'model' | 'effort'> =
+      modelBad || effortBad
+        ? [...(modelBad ? (['model'] as const) : []), ...(effortBad ? (['effort'] as const) : [])]
+        : p.model != null
+          ? ['model']
+          : p.effort != null
+            ? ['effort']
+            : [];
+    for (const axis of axes) {
+      const value = axis === 'model' ? p.model : p.effort;
+      if (value == null) continue;
+      byAxis.set(`${axis}:${value}`, `  ${base} \\\n    --from-${axis} ${value} --to-${axis} <new-${axis}>`);
+    }
+  }
+  if (byAxis.size === 0) return `  ${base} --from-model <old> --to-model <new>`;
+  return [...byAxis.values()].join('\n');
+}
+
+/**
  * The refusal an operator reads. Names every stranded series, its literal pin,
  * the vocabulary's own reason, and the exact command that clears it.
- *
- * Self-contained on purpose: the stored pin is printed verbatim, so the
- * `--from-model` / `--from-effort` the remedy needs can be read straight off
- * this message without a second lookup.
  */
 export function formatStrandedPins(
   stranded: StrandedPin[],
@@ -117,6 +167,7 @@ export function formatStrandedPins(
   const lines = stranded.map(
     (p) => `  ${p.seriesId} [${p.status}]  model=${p.model ?? '-'}  effort=${p.effort ?? '-'}\n` + `      ${p.reason}`,
   );
+  const remedy = remedyCommands(stranded, agentGroupId, toProvider, true);
   return (
     `Refusing to switch ${agentGroupId} from provider "${fromProvider}" to "${toProvider}": ` +
     `${stranded.length} armed task pin${stranded.length === 1 ? '' : 's'} would be invalid under "${toProvider}", ` +
@@ -124,9 +175,40 @@ export function formatStrandedPins(
     `${lines.join('\n')}\n\n` +
     `Pins are never rewritten for you — a pin that changes by itself is not a pin.\n` +
     `Re-pin them first (--target-provider validates against the NEW provider, so this works\n` +
-    `BEFORE the switch), then re-run this command:\n` +
-    `  ncl tasks repin --group ${agentGroupId} --target-provider ${toProvider} \\\n` +
-    `    --from-model <old> --to-model <new> --dry-run\n` +
+    `BEFORE the switch), then re-run this command.\n\n` +
+    `Preview (writes nothing) — append --dry-run to any of these:\n` +
+    `${remedy}\n\n` +
+    `Run the same command WITHOUT --dry-run to apply, then re-run the provider switch.\n` +
     `A series whose pin is no longer wanted can be cancelled instead: ncl tasks cancel --id <series>`
+  );
+}
+
+/**
+ * The post-write warning. A pin created between the pre-flight audit and the
+ * provider write is stranded, but the switch has ALREADY LANDED — so this must
+ * not reuse the refusal text above, which says the opposite and would send the
+ * operator looking for a switch to retry that already happened.
+ */
+export function formatLateStrandedPins(
+  stranded: StrandedPin[],
+  agentGroupId: string,
+  fromProvider: string,
+  toProvider: string,
+): string {
+  const lines = stranded.map(
+    (p) => `  ${p.seriesId} [${p.status}]  model=${p.model ?? '-'}  effort=${p.effort ?? '-'}\n` + `      ${p.reason}`,
+  );
+  const remedy = remedyCommands(stranded, agentGroupId, toProvider, false);
+  return (
+    `The provider switch for ${agentGroupId} ("${fromProvider}" -> "${toProvider}") HAS BEEN APPLIED, ` +
+    `but ${stranded.length} task pin${stranded.length === 1 ? ' was' : 's were'} written between the ` +
+    `pre-flight audit and the write, and ${stranded.length === 1 ? 'it is' : 'they are'} now stranded ` +
+    `under "${toProvider}". Every fire of ${stranded.length === 1 ? 'this series' : 'these series'} will fail ` +
+    `until the pin is changed. Do NOT re-run the switch — it already succeeded.\n\n` +
+    `${lines.join('\n')}\n\n` +
+    `Fix forward (the group is already on "${toProvider}", so --target-provider is not needed):\n` +
+    `${remedy}\n\n` +
+    `Run with --dry-run first to preview. A series whose pin is no longer wanted can be ` +
+    `cancelled instead: ncl tasks cancel --id <series>`
   );
 }

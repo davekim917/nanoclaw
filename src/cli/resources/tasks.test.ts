@@ -45,7 +45,7 @@ import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from '
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
 import { resolveGroupProvider } from '../../container-config.js';
-import { auditTaskPins } from '../../modules/scheduling/pin-audit.js';
+import { auditTaskPins, formatStrandedPins, formatLateStrandedPins } from '../../modules/scheduling/pin-audit.js';
 import { validateTaskPin } from '../../modules/scheduling/task-flags.js';
 import { createSession, findSessionByAgentGroup, getSessionsByAgentGroup, taskThreadId } from '../../db/sessions.js';
 import { countDueMessages } from '../../modules/mailbox/ops/sweep.js';
@@ -2526,6 +2526,67 @@ describe('groups config update --provider refuses on stranded task pins', () => 
     await makeNoProviderKeyGroup('ag-sticky');
     await updateContainerConfigScalars('ag-sticky', { provider: 'claude' });
     expect(await resolveGroupProvider('ag-sticky', 'codex')).toBe('codex');
+  });
+
+  it('the remedy command is runnable and matches the axis that actually stranded', async () => {
+    // Two defects in one message, both found in review:
+    //  - it always carried --dry-run, so an operator following it verbatim
+    //    previewed, changed nothing, and hit the identical refusal again;
+    //  - an EFFORT-only strand was handed a --from-model command, which
+    //    matches nothing.
+    await makePinGroup('ag-effort-only', 'codex');
+    // Valid model under both, effort valid only under codex.
+    await makePinnedTask('ag-effort-only', 'effort-strand', { model: 'gpt-6-astra', effort: 'ultra' });
+
+    const r = await configUpdate({ id: 'ag-effort-only', provider: 'claude' });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    const msg = r.error.message;
+
+    // The applying command must be present, i.e. a repin line that is not
+    // itself a preview. Pre-fix EVERY suggested command ended in --dry-run.
+    const commandLines = msg.split('\n').filter((l) => l.includes('ncl tasks repin'));
+    expect(commandLines.length).toBeGreaterThan(0);
+    expect(commandLines.some((l) => l.includes('--dry-run'))).toBe(false);
+    expect(msg).toContain('WITHOUT --dry-run to apply');
+
+    // The effort axis stranded, so the effort axis is what the remedy offers.
+    expect(msg).toContain('--from-effort ultra');
+  });
+
+  it('a post-switch strand says the switch LANDED, never that it was refused', async () => {
+    // The post-write re-audit reused the refusal text, which says the switch
+    // is being refused — but by then it has already been applied to both the
+    // DB row and the authoritative container.json. An operator reading it
+    // would go looking for a switch to retry that already happened.
+    const stranded = [
+      {
+        seriesId: 'series-late',
+        sessionId: 'sess-late',
+        status: 'pending',
+        model: 'sonnet',
+        effort: null,
+        reason: 'model not valid',
+      },
+    ];
+    const late = formatLateStrandedPins(stranded, 'ag-late', 'claude', 'codex');
+
+    expect(late).toContain('HAS BEEN APPLIED');
+    expect(late).toContain('Do NOT re-run the switch');
+    expect(late).not.toContain('Refusing to switch');
+    // The group is already on the new provider, so the COMMAND must not tell
+    // the operator to validate against a provider it already has. Checked on
+    // the command lines, not the whole message — the prose mentions the flag
+    // by name to explain its absence.
+    const lateCommands = late.split('\n').filter((l) => l.includes('ncl tasks repin'));
+    expect(lateCommands.length).toBeGreaterThan(0);
+    expect(lateCommands.some((l) => l.includes('--target-provider'))).toBe(false);
+    expect(late).toContain('--from-model sonnet');
+
+    // ...and the pre-switch text still says the opposite, deliberately.
+    const refusal = formatStrandedPins(stranded, 'ag-late', 'claude', 'codex');
+    expect(refusal).toContain('Refusing to switch');
+    expect(refusal).toContain('--target-provider codex');
   });
 
   it('re-stating the SAME provider is not a migration and is never refused', async () => {

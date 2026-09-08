@@ -32,7 +32,7 @@ import {
   updateContainerConfigJson,
 } from '../../db/container-configs.js';
 import { getDeniedModel } from '../../db/denied-models.js';
-import { auditTaskPins, formatStrandedPins } from '../../modules/scheduling/pin-audit.js';
+import { auditTaskPins, formatStrandedPins, formatLateStrandedPins } from '../../modules/scheduling/pin-audit.js';
 import { assertValidGroupFolder, groupFolderExistsOnDisk } from '../../group-folder.js';
 import { log } from '../../log.js';
 import { canonicalizeIanaTimezone, timezoneRejectionReason } from '../../timezone.js';
@@ -693,7 +693,9 @@ registerResource({
             return {
               ...presentConfig(updatedLate, group.folder),
               stranded_after_switch: late,
-              warning: formatStrandedPins(late, id, fromProviderForReport!, auditedProvider),
+              // NOT formatStrandedPins: that text says the switch is being
+              // refused, and by here it has already landed.
+              warning: formatLateStrandedPins(late, id, fromProviderForReport!, auditedProvider),
             };
           }
         }
