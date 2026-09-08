@@ -79,7 +79,23 @@ next spawn, and the enabler run is just a verification pass.
    > source still exists; it cannot resurrect an orphan. (Entries that happen to hold
    > real files rather than links do survive, so run it regardless.)
    > Scoped mirrors (`~/.local/share/opencode-<group>/`) exist only for groups with
-   > their own `auth.json`; the rest share the global dir.
+   > their own `auth.json`; the rest share the global dir. Watch the case where a
+   > group HAD scoped auth and `auth.json` was later removed: the sync stops targeting
+   > the dir (`discoverOpenCodeXdgTargets` skips a sibling with no `auth.json`,
+   > `src/opencode-sync.ts:194-195`) while the container still prefers it, because
+   > `resolveOpenCodeSourcePaths` picks the scoped `skill/` dir purely on existence
+   > (`src/providers/opencode.ts:148`). That group then serves a frozen mirror
+   > forever — neither updated nor sharing the global one. Check for it before
+   > trusting a sync result:
+   >
+   > ```bash
+   > for d in ~/.local/share/opencode-*/; do
+   >   [ -d "$d/skill" ] && [ ! -f "$d/auth.json" ] && echo "STALE: $d"
+   > done
+   > ```
+   >
+   > Fix it by deleting the orphaned `skill/` dir so the group falls back to the
+   > global mirror, or by restoring the group's `auth.json` so it is synced again.
 
    **`--report-json` is not a probe — it writes.** It only changes the OUTPUT
    FORMAT. Every mutation in `main()` is gated on `dryRun` alone: manifest
@@ -134,9 +150,18 @@ next spawn, and the enabler run is just a verification pass.
 
    | Mechanism | Claude | Codex | OpenCode |
    |---|---|---|---|
-   | `excludePlugins` (per group, via `--exclude`) | drops the mount | drops the ruleset | drops the ruleset, **keeps the skills** |
+   | `excludePlugins` (per group, via `--exclude`) | drops the mount | drops **both** | drops the ruleset, **keeps the skills** |
    | `--deny <provider>` (per plugin, all groups) | only before a manifest exists | drops the skills | drops the skills, **keeps the ruleset** |
    | remove from `~/plugins` | effective | effective | **does not remove already-synced skills** |
+
+   `excludePlugins` is the only per-group control, and it is not uniform. The plugin
+   mount in `src/container-runner.ts:4753-4767` has no provider conditional, so an
+   excluded plugin is absent from `/workspace/plugins` for every provider — which is
+   why Codex loses its skills too: `planCodexPluginRegistration` reads that mount, and
+   the entry simply never appears (`container/agent-runner/src/codex-companion-setup.ts`
+   says so in its own comment). OpenCode is the exception because its skills come from
+   the XDG mirror, not the mount. **So for a Codex group, prefer `--exclude` over the
+   provider-wide `--deny codex`** — it already withholds both halves, for that group only.
 
    The three traps, each with the code that causes it:
 
@@ -163,16 +188,28 @@ next spawn, and the enabler run is just a verification pass.
      copied into new sessions by `src/providers/opencode.ts`. Deleting the mirror by
      hand is undone by the next sync while the source still exists.
 
-   So to withhold from OpenCode: run `--deny opencode` **while the plugin is still
-   present**, and only then remove it from `~/plugins` if you want it gone entirely.
-   Reversing that order strands the mirror with no supported way to clean it up. Note
-   `--deny` is provider-wide — every OpenCode group loses the skills, not just one;
-   per-group would need a filter in `syncOpenCodePluginSkills()`.
+   So to withhold from OpenCode, deny **while the plugin is still present**, then
+   remove it from `~/plugins` if you want it gone entirely:
 
    ```bash
    pnpm exec tsx scripts/enable-agent-plugin.ts <name> --deny opencode
+   ```
+
+   Already deleted the source first? The mirror is stale but not stranded.
+   `syncOpenCodePluginSkills()` takes no arguments (`src/opencode-sync.ts:242`): it
+   rebuilds the desired set from the whole `~/plugins` root and prunes every managed
+   entry not in it. So enabling **any** remaining plugin runs the same reconciliation
+   and drops the orphan. Only a plugins root with nothing left to enable has no route.
+
+   To reverse a denial — a separate operation, not the next step above:
+
+   ```bash
    pnpm exec tsx scripts/enable-agent-plugin.ts <name> --allow opencode
    ```
+
+   Note `--deny` is provider-wide: every OpenCode group loses the skills, not just one.
+   Per-group would need a filter in `syncOpenCodePluginSkills()`; for a single group,
+   there is no OpenCode equivalent of the Codex `--exclude` result.
 
 6. **Group opt-out (default is all groups).** `--exclude` writes `excludePlugins` into
    each named group's `container.json`. Opt-out is per **group folder** — `main`,
