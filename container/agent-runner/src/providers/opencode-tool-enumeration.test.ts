@@ -10,7 +10,7 @@ import type { McpServerConfig } from './types.js';
 
 /**
  * OpenCode's built-in tool inventory, captured from the LIVE binary at the
- * version the container actually pins — **opencode@1.18.23** (container/Dockerfile
+ * version the container actually pins — **opencode@1.18.29** (container/Dockerfile
  * `ARG OPENCODE_VERSION`) — NOT from memory or the SDK types (which model the
  * tool set as a dynamic `[key: string]: boolean` map, so they don't enumerate
  * names). Keep OPENCODE_CAPTURED_VERSION below in lock-step with that ARG.
@@ -23,7 +23,9 @@ import type { McpServerConfig } from './types.js';
  *      (it adds `websearch` + `apply_patch` over the per-agent `tools` dict).
  *
  * Re-derive with: `npx opencode-ai@<pinned> serve --port 0` + `curl --noproxy '*' $URL/experimental/tool/ids`.
- * (Verified 2026-08-27: the 1.18.23 list is identical to the 1.17.18 capture —
+ * (Verified 2026-09-08: the 1.18.29 list is identical to the 1.18.23 capture —
+ * `debug agent build|general|plan` and `/experimental/tool/ids` returned the
+ * same built-in names. Verified 2026-08-27: the 1.18.23 list is identical to the 1.17.18 capture —
  * re-derived by running `opencode-ai@1.18.23 serve` and curling the endpoint
  * above; the returned array matched byte for byte, so no built-in was added or
  * renamed across that bump. Verified 2026-07-13: 1.17.18 was likewise identical
@@ -42,7 +44,7 @@ import type { McpServerConfig } from './types.js';
  */
 // Lock-step with container/Dockerfile `ARG OPENCODE_VERSION`. Bump BOTH together
 // and re-derive OPENCODE_BUILTIN_TOOLS from the new binary (see above).
-const OPENCODE_CAPTURED_VERSION = '1.18.23';
+const OPENCODE_CAPTURED_VERSION = '1.18.29';
 const OPENCODE_BUILTIN_TOOLS = [
   'invalid',
   'question',
