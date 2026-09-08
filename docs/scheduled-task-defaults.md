@@ -6,9 +6,11 @@ Until this release, a scheduled-task fire on a **Claude** group with no `--model
 
 One deliberate difference from chat: a **pure** task wake that OPENS a query does not inherit a per-session sticky model or effort. If a human typed `-m opus` in that thread, chat keeps using Opus and the unpinned task still fires on the group default. A batch that mixes real chat with a task is a human conversation the task rode along with, and keeps the sticky — only a task-only wake is suppressed.
 
-> **Known limitation — a task that joins a turn already in progress still inherits it.** Suppression applies when a task wake _opens_ a query. A scheduled row that comes due while a query is already streaming is admitted into that running turn and runs on its model and effort, unchanged from before this release. So a task can still fire on an interactive sticky — just not when it starts the turn itself.
+> **Known limitation — a task that joins a turn already in progress still inherits it.** Suppression applies when a task wake _opens_ a query. A fire that comes due while a query in that series' own session is already streaming is admitted into that running turn and runs on its model and effort, unchanged from before this release. So a task can still fire on an interactive sticky — just not when it starts the turn itself.
+
+> **How narrow this is:** scheduled tasks do not arrive in conversations. Every series runs in its own session (`resolveTaskSession` keys it by series id), so this is reachable only inside a task's own thread — someone replies there, that opens an interactive turn, and the next fire of that same series joins it.
 >
-> This is deliberate rather than overlooked. Deciding correctly requires knowing whether the turn being joined is idle or is a human's in-flight answer, and the admitted batch is a fragment of that turn: it can say "this is a task wake" but not "nobody is waiting on this". An earlier attempt to suppress there retargeted live human turns off their own model mid-answer — the inverse of the problem this release fixes. Tracked in [#585](https://github.com/davekim917/nanoclaw/issues/585).
+> This is deliberate rather than overlooked. Deciding correctly requires knowing whether the turn being joined is idle or is a human's in-flight answer, and the admitted batch is a fragment of that turn: it can say "this is a task wake" but not "nobody is waiting on this". An earlier attempt to suppress there retargeted a running turn off its own model mid-answer — the inverse of the problem this release fixes. Tracked in [#585](https://github.com/davekim917/nanoclaw/issues/585).
 
 **Two changes with two different scopes — this matters for what you need to inventory:**
 
