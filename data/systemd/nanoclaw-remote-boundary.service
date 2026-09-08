@@ -1,8 +1,8 @@
 [Unit]
-Description=NanoClaw daily public-boundary scan of the remote
+Description=NanoClaw daily public-boundary scan of the origin/main tree
 # Fetches origin/main, materializes it in a throwaway detached worktree, and
-# runs scripts/check-public-boundary.ts over the WHOLE tree against the live
-# install registry (data/v2.db). That is coverage CI structurally cannot have:
+# runs scripts/check-public-boundary.ts over that tree against the live install
+# registry (data/v2.db). That is coverage CI structurally cannot have:
 # .github/workflows/ci.yml runs the checker with --portable because a GitHub
 # runner has no registry, and giving CI the registry would publish it.
 #
@@ -12,14 +12,33 @@ Description=NanoClaw daily public-boundary scan of the remote
 # src/notify-owner.ts, sending only the checker's already-redacted output
 # (file:line and category, never a matched value).
 #
+# SCOPE — read this before trusting it. This covers the origin/main TREE and
+# nothing else. It does NOT see: content on an unmerged topic branch, anything
+# in a commit MESSAGE, or content that reached the remote and was later deleted
+# from main. Widening it to every remotely reachable object is tracked in issue
+# #592; the header of scripts/check-remote-boundary.ts carries the detail.
+#
 # Reference copy — tracked, not installed. The deployer installs and enables it.
+#
+# OnFailure belongs to [Unit], not [Service]: systemd ignores it in [Service]
+# with only an "Unknown key name" line in the journal, so the alert silently
+# never fires. That is not hypothetical — the installed
+# nanoclaw-fleet-drift.service has been in exactly that state.
+OnFailure=nanoclaw-unit-alert@%n.service
 After=network.target
 
 [Service]
 Type=oneshot
 User=ubuntu
 WorkingDirectory=/home/ubuntu/nanoclaw-v2
+# HOME and PATH the same way data/systemd/nanoclaw-v2.service:22-23 sets them.
+# systemd's default PATH is /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:
+# /sbin:/bin, which has no ~/.local/bin — so on an install whose pnpm lives
+# there (a nodeenv or corepack-in-home layout) scanSnapshot's `pnpm` lookup
+# fails and every run drops straight into OnFailure. HOME matters for the same
+# reason: package managers resolve their own state relative to it.
+Environment=HOME=/home/ubuntu
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/ubuntu/.local/bin
 ExecStart=/home/ubuntu/nanoclaw-v2/node_modules/.bin/tsx scripts/check-remote-boundary.ts
 IOSchedulingClass=idle
 Nice=10
-OnFailure=nanoclaw-unit-alert@%n.service

@@ -158,8 +158,20 @@ describe('describeDelivery', () => {
 });
 
 describe('systemd units', () => {
-  const unit = fs.readFileSync(path.join(repoRoot, 'data', 'systemd', 'nanoclaw-remote-boundary.service'), 'utf8');
-  const timer = fs.readFileSync(path.join(repoRoot, 'data', 'systemd', 'nanoclaw-remote-boundary.timer'), 'utf8');
+  const systemdDir = path.join(repoRoot, 'data', 'systemd');
+  const unit = fs.readFileSync(path.join(systemdDir, 'nanoclaw-remote-boundary.service'), 'utf8');
+  const timer = fs.readFileSync(path.join(systemdDir, 'nanoclaw-remote-boundary.timer'), 'utf8');
+
+  /** Which `[Section]` each `Key=` line sits under. Comments and blanks ignored. */
+  function sectionOf(text: string, key: string): string | null {
+    let section: string | null = null;
+    for (const line of text.split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('[') && trimmed.endsWith(']')) section = trimmed.slice(1, -1);
+      else if (trimmed.startsWith(`${key}=`)) return section;
+    }
+    return null;
+  }
 
   it('runs the script this test covers, on the fleet-drift service shape', () => {
     expect(unit).toContain('ExecStart=/home/ubuntu/nanoclaw-v2/node_modules/.bin/tsx scripts/check-remote-boundary.ts');
@@ -167,8 +179,32 @@ describe('systemd units', () => {
     expect(unit).toContain('User=ubuntu');
     expect(unit).toContain('WorkingDirectory=/home/ubuntu/nanoclaw-v2');
     expect(unit).toContain('IOSchedulingClass=idle');
-    // A failed run means nobody was told; that must reach the operator anyway.
-    expect(unit).toContain('OnFailure=nanoclaw-unit-alert@%n.service');
+  });
+
+  // Asserting the SECTION, not just the line. `OnFailure=` is a [Unit]
+  // directive; in [Service] systemd ignores it and says so only once at load
+  // ("Unknown key name 'OnFailure' in section 'Service', ignoring"), so the
+  // handler silently never fires. A `toContain('OnFailure=…')` check passes on
+  // the broken file — which is how the installed nanoclaw-fleet-drift.service
+  // sat with `systemctl show -p OnFailure` reporting empty.
+  it.each(['nanoclaw-remote-boundary.service', 'nanoclaw-fleet-drift.service'])(
+    'declares OnFailure in [Unit] so the alert actually fires: %s',
+    (name) => {
+      const text = fs.readFileSync(path.join(systemdDir, name), 'utf8');
+      expect(text).toContain('OnFailure=nanoclaw-unit-alert@%n.service');
+      expect(sectionOf(text, 'OnFailure')).toBe('Unit');
+    },
+  );
+
+  // systemd's default PATH carries no ~/.local/bin, so an install whose pnpm
+  // lives there would fail `scanSnapshot`'s lookup on every run. Same approach
+  // as data/systemd/nanoclaw-v2.service:22-23.
+  it('gives the run a HOME and a PATH that can find the package manager', () => {
+    expect(unit).toContain('Environment=HOME=/home/ubuntu');
+    const pathLine = unit.split('\n').find((line) => line.startsWith('Environment=PATH='));
+    expect(pathLine).toBeDefined();
+    expect(pathLine).toContain('/home/ubuntu/.local/bin');
+    expect(sectionOf(unit, 'Environment')).toBe('Service');
   });
 
   it('fires daily and catches up after downtime', () => {

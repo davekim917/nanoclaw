@@ -4,6 +4,15 @@ Description=NanoClaw fleet-drift daily control-band health check
 # data/fleet-drift/metrics.ndjson, and files a GitHub issue per breached
 # metric (median + 3xMAD band, or a fixed rule for paused/failed-streak
 # series). No LLM calls — pure deterministic arithmetic over collected data.
+#
+# OnFailure belongs to [Unit], not [Service]. It sat in [Service] here, where
+# systemd ignores it and says so only once, at load, in the journal:
+#   /etc/systemd/system/nanoclaw-fleet-drift.service:16:
+#     Unknown key name 'OnFailure' in section 'Service', ignoring.
+# `systemctl show nanoclaw-fleet-drift.service -p OnFailure` reported an empty
+# value while nanoclaw-health-sentinel.service, which has it in [Unit],
+# reported the real handler. So this unit's failures have been alerting nobody.
+OnFailure=nanoclaw-unit-alert@%n.service
 After=network.target
 
 [Service]
@@ -13,4 +22,3 @@ WorkingDirectory=/home/ubuntu/nanoclaw-v2
 ExecStart=/home/ubuntu/nanoclaw-v2/node_modules/.bin/tsx scripts/fleet-drift.ts
 IOSchedulingClass=idle
 Nice=10
-OnFailure=nanoclaw-unit-alert@%n.service

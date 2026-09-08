@@ -20,8 +20,29 @@
  * very thing the registry exists to keep private.
  *
  * So this runs on the host, daily, against the LIVE install registry, over the
- * whole tree of `origin/main` — the one place that can answer "is anything
- * private sitting on the remote right now?"
+ * tree of `origin/main`.
+ *
+ * WHAT THIS DOES NOT COVER — do not read it as "is anything private on the
+ * remote right now?"
+ * ------------------------------------------------------------------------
+ * It answers the narrower question "is anything private in the `origin/main`
+ * TREE right now?". Three things reach the remote and are never scanned here:
+ *
+ *   1. Unmerged topic branches — anything pushed to a ref that has not merged.
+ *   2. Commit MESSAGES — this scans trees only. `.husky/commit-msg` gates them
+ *      locally, but that hook is skippable and does not resolve inside a
+ *      container, which is the bypass path this job exists to backstop.
+ *   3. Content deleted from main — present in remote history, absent from the
+ *      current tip's tree.
+ *
+ * That is a documented hole, not an oversight: `git ls-remote --heads origin`
+ * is 300 branches and one whole-tree `--index` scan measures 27.8s on this
+ * host, so scanning every head naively is ~2.3 hours per run. Closing it needs
+ * a scanned-tip cursor, per-commit message scanning and changed-path scanning
+ * — a design, not a patch. Tracked in issue #592.
+ *
+ * A backstop that overstates its own coverage is worse than one with a hole
+ * someone can see, so keep this paragraph honest if the scope changes.
  *
  * WHAT IS TRANSMITTED
  * -------------------
@@ -132,7 +153,9 @@ export function decideAlert(scan: BoundaryScan, commit: string): Alert | null {
       : `The public-boundary scan of ${at} could not run (exit ${scan.code}) — the remote is currently UNCHECKED.`;
   const detail = trimDetail(scan.detail) || '(the checker produced no output)';
   return {
-    title: 'Public boundary scan of the remote',
+    // Names the surface, not "the remote": this scans one tree (see the scope
+    // note in the header), and the alert should not imply more than it checked.
+    title: `Public boundary scan of the ${REF_LABEL} tree`,
     // The checker prints file:line and a category, never the matched value.
     body: `${headline}\n\nRedacted checker output:\n${detail}\n\nTriage: pnpm run check:public-boundary -- --index on a checkout of ${REF_LABEL}.`,
   };
@@ -201,10 +224,18 @@ function scanSnapshot(snapshot: string): BoundaryScan {
 function withSnapshot<T>(commit: string, body: (snapshot: string) => T): T {
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-remote-boundary-'));
   const snapshot = path.join(parent, 'tree');
-  // `-c core.hooksPath=/dev/null` for the same reason `.husky/pre-push`'s
-  // `snapshot_commit` uses it: creating a worktree runs `post-checkout`, and now
-  // that `core.hooksPath` is an absolute host path (scripts/pin-git-hooks-path.sh)
-  // it resolves here, so a hook could otherwise run against a scratch tree.
+  // `-c core.hooksPath=/dev/null`, matching `.husky/pre-push`'s
+  // `snapshot_commit`. `worktree add` fires `post-checkout`, and now that
+  // `core.hooksPath` is an absolute host path (scripts/pin-git-hooks-path.sh)
+  // that shim RESOLVES here, where it previously did not.
+  //
+  // Defensive today, not load-bearing: the shim exits before doing anything
+  // unless a matching hook file exists — `.husky/_/h:6` is
+  // `[ ! -f "$s" ] && exit 0` against `s=$(dirname "$(dirname "$0")")/$n`
+  // (`.husky/_/h:4`) — and `.husky/` carries only `commit-msg`, `pre-commit`
+  // and `pre-push`. So no `post-checkout` runs against a scratch tree today.
+  // It becomes load-bearing the day someone adds `.husky/post-checkout`, which
+  // is exactly when nobody would think to look here.
   git(['-c', 'core.hooksPath=/dev/null', 'worktree', 'add', '--detach', '--quiet', snapshot, commit]);
   try {
     return body(snapshot);
