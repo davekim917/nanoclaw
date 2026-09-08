@@ -86,7 +86,7 @@ declaration exists, insert it after `ARG CODEX_VERSION=...`. Never append a
 second declaration:
 
 ```dockerfile
-ARG OPENCODE_VERSION=1.18.23
+ARG OPENCODE_VERSION=1.18.29
 ```
 
 > **Pin to an exact version** — keep host CLI, container CLI, and SDK locked to the same release. `latest` works but caves to upstream cadence; bump deliberately when there's a reason.
