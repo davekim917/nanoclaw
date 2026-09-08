@@ -41,6 +41,7 @@ import {
   getStorageReport,
   pruneIdleSessionArtifacts,
   readReclaimJournal,
+  resolveStorageAdmissionPolicy,
   type DockerImageInventory,
   type StorageReport,
 } from './storage-manager.js';
@@ -55,6 +56,51 @@ import { sessionContextPathFor } from './session-manager.js';
 // intercepts the `node:`-prefixed specifier too, so a plain import would just
 // hand back the mock and recurse — importActual is the only way out.
 const { execFileSync: realExecFileSync } = await vi.importActual<typeof import('child_process')>('child_process');
+
+function dockerLabels(row: Record<string, unknown>): Record<string, string> {
+  const config = row.Config;
+  if (!config || typeof config !== 'object') return {};
+  const labels = (config as { Labels?: unknown }).Labels;
+  if (!labels || typeof labels !== 'object' || Array.isArray(labels)) return {};
+  return Object.fromEntries(
+    Object.entries(labels).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
+  );
+}
+
+function compactContainerInspect(rows: Array<Record<string, unknown>>): string {
+  const installLabelKey = CONTAINER_INSTALL_LABEL.split('=', 1)[0]!;
+  return rows
+    .map((row) => {
+      const state = row.State as { Running?: unknown } | undefined;
+      return [
+        JSON.stringify(row.Id ?? null),
+        JSON.stringify(row.Image ?? null),
+        JSON.stringify(state?.Running === true),
+        JSON.stringify(dockerLabels(row)[installLabelKey] ?? null),
+      ].join('\t');
+    })
+    .join('\n');
+}
+
+function compactImageInspect(rows: Array<Record<string, unknown>>): string {
+  return rows
+    .map((row) => {
+      return [
+        JSON.stringify(row.Id ?? null),
+        JSON.stringify(row.RepoTags ?? null),
+        JSON.stringify(row.RepoDigests ?? null),
+        JSON.stringify(row.Created ?? null),
+        JSON.stringify(row.Size ?? null),
+        JSON.stringify(dockerLabels(row)),
+      ].join('\t');
+    })
+    .join('\n');
+}
+
+function inspectIds(args: string[]): string[] {
+  const formatIndex = args.indexOf('--format');
+  return args.slice(formatIndex === -1 ? 2 : formatIndex + 2);
+}
 
 // ── Shared session-reclaim fixtures ──────────────────────────────────────────
 
@@ -1408,6 +1454,27 @@ describe('storage-manager thread worktree archive-then-reclaim', () => {
   });
 });
 
+describe('storage admission policy', () => {
+  it('shares a validated nondefault 93% refusal threshold with host status callers', () => {
+    expect(
+      resolveStorageAdmissionPolicy({
+        NANOCLAW_STORAGE_CLEANUP_THRESHOLD_PCT: '85',
+        NANOCLAW_STORAGE_ADMISSION_REFUSE_PCT: '93',
+      }),
+    ).toEqual({ enabled: true, cleanupThresholdPct: 85, admissionRefusePct: 93 });
+  });
+
+  it('keeps the refusal threshold at or above cleanup and preserves the disabled gate state', () => {
+    expect(
+      resolveStorageAdmissionPolicy({
+        NANOCLAW_STORAGE_MANAGER_ENABLED: '0',
+        NANOCLAW_STORAGE_CLEANUP_THRESHOLD_PCT: '95',
+        NANOCLAW_STORAGE_ADMISSION_REFUSE_PCT: '93',
+      }),
+    ).toEqual({ enabled: false, cleanupThresholdPct: 95, admissionRefusePct: 95 });
+  });
+});
+
 describe('storage-manager Docker cleanup', () => {
   const now = Date.parse('2026-07-19T00:00:00.000Z');
   let images: Array<Record<string, unknown>>;
@@ -1488,15 +1555,15 @@ describe('storage-manager Docker cleanup', () => {
         return containers.map((container) => container.Id).join('\n');
       }
       if (cmd === CONTAINER_RUNTIME_BIN && args[0] === 'container' && args[1] === 'inspect') {
-        const ids = args.slice(2);
-        return JSON.stringify(containers.filter((container) => ids.includes(String(container.Id))));
+        const rows = containers.filter((container) => inspectIds(args).includes(String(container.Id)));
+        return args.includes('--format') ? compactContainerInspect(rows) : JSON.stringify(rows);
       }
       if (cmd === CONTAINER_RUNTIME_BIN && args[0] === 'image' && args[1] === 'ls') {
         return images.map((image) => image.Id).join('\n');
       }
       if (cmd === CONTAINER_RUNTIME_BIN && args[0] === 'image' && args[1] === 'inspect') {
-        const ids = args.slice(2);
-        return JSON.stringify(images.filter((image) => ids.includes(String(image.Id))));
+        const rows = images.filter((image) => inspectIds(args).includes(String(image.Id)));
+        return args.includes('--format') ? compactImageInspect(rows) : JSON.stringify(rows);
       }
       if (cmd === CONTAINER_RUNTIME_BIN && args[0] === 'builder' && args[1] === 'prune' && args[2] === '--help') {
         return '      --min-free-space bytes   minimum free space\n';
@@ -1530,6 +1597,198 @@ describe('storage-manager Docker cleanup', () => {
     expect(report.pressure).toMatchObject({ level: 'critical', cleanupTargetPct: 82, targetReached: false });
   });
 
+  it("keeps cleanup inventory below Node's 1MiB child-process output limit by projecting away irrelevant inspect data", () => {
+    const originalImplementation = mockExecFileSync.getMockImplementation()!;
+    const oversizedFullContainerInspect = JSON.stringify(
+      containers.map((container) => ({
+        ...container,
+        Mounts: [{ Source: 'x'.repeat(1_100_000) }],
+        Config: { ...(container.Config as Record<string, unknown>), Env: ['UNUSED='.concat('y'.repeat(1_100_000))] },
+      })),
+    );
+    const oversizedFullImageInspect = JSON.stringify(
+      images.map((image) => ({
+        ...image,
+        RootFS: { Layers: ['sha256:'.concat('z'.repeat(1_100_000))] },
+        Config: { ...(image.Config as Record<string, unknown>), Env: ['UNUSED='.concat('y'.repeat(1_100_000))] },
+      })),
+    );
+    expect(Buffer.byteLength(oversizedFullContainerInspect)).toBeGreaterThan(1024 * 1024);
+    expect(Buffer.byteLength(oversizedFullImageInspect)).toBeGreaterThan(1024 * 1024);
+
+    mockExecFileSync.mockImplementation((cmd: string, args: string[]) => {
+      if (
+        cmd === CONTAINER_RUNTIME_BIN &&
+        args[0] === 'container' &&
+        args[1] === 'inspect' &&
+        !args.includes('--format')
+      ) {
+        throw new Error('ENOBUFS: full container inspect emitted the 1.1MiB irrelevant Mounts/Env fixture');
+      }
+      if (cmd === CONTAINER_RUNTIME_BIN && args[0] === 'image' && args[1] === 'inspect' && !args.includes('--format')) {
+        throw new Error('ENOBUFS: full image inspect emitted the 1.1MiB irrelevant RootFS/Env fixture');
+      }
+      return originalImplementation(cmd, args);
+    });
+
+    const report = getStorageReport({
+      mode: 'dry-run',
+      now,
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
+      policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
+    });
+
+    expect(report.actions.map((action) => action.dockerArgs)).toContainEqual(['container', 'rm', 'own-stopped']);
+    expect(report.actions.map((action) => action.dockerArgs)).toContainEqual(['image', 'rm', 'sha256:expired']);
+    expect(report.images.dispositions.find((image) => image.id === 'sha256:canonical')).toMatchObject({
+      disposition: 'protected',
+      protectionReason: 'canonical-image',
+    });
+  });
+
+  it('fails closed and logs when a projected Docker container record omits its image reference', () => {
+    const originalImplementation = mockExecFileSync.getMockImplementation()!;
+    mockExecFileSync.mockImplementation((cmd: string, args: string[]) => {
+      if (
+        cmd === CONTAINER_RUNTIME_BIN &&
+        args[0] === 'container' &&
+        args[1] === 'inspect' &&
+        args.includes('--format')
+      ) {
+        return compactContainerInspect(containers.map((container) => ({ ...container, Image: null })));
+      }
+      return originalImplementation(cmd, args);
+    });
+
+    const report = getStorageReport({
+      mode: 'apply',
+      now,
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
+      policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
+    });
+
+    expect(report.actions).toEqual([]);
+    expect(report.warnings).toContain(
+      'docker inventory failed: docker container inspect returned an invalid projected record',
+    );
+    expect(log.warn).toHaveBeenCalledWith(
+      'storage-manager: docker cleanup collection failed; cleanup skipped',
+      expect.objectContaining({ stage: 'inventory', err: expect.any(Error) }),
+    );
+  });
+
+  it('fails closed when a projected Docker inventory duplicates an id instead of returning the requested records', () => {
+    const originalImplementation = mockExecFileSync.getMockImplementation()!;
+    mockExecFileSync.mockImplementation((cmd: string, args: string[]) => {
+      if (
+        cmd === CONTAINER_RUNTIME_BIN &&
+        args[0] === 'container' &&
+        args[1] === 'inspect' &&
+        args.includes('--format')
+      ) {
+        return compactContainerInspect([containers[0]!, containers[0]!, containers[0]!]);
+      }
+      return originalImplementation(cmd, args);
+    });
+
+    const report = getStorageReport({
+      mode: 'dry-run',
+      now,
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
+      policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
+    });
+
+    expect(report.actions).toEqual([]);
+    expect(report.warnings).toContain(
+      'docker inventory failed: docker container inspect returned inconsistent projected records',
+    );
+  });
+
+  it.each(['Labels', 'Created'] as const)(
+    'handles omitted image %s metadata without disabling Docker cleanup',
+    (field) => {
+      const imageWithoutOptionalField: Record<string, unknown> = {
+        Id: 'sha256:label-free',
+        RepoTags: [`${CONTAINER_IMAGE_BASE}:label-free`],
+        Created: '2026-07-01T00:00:00.000Z',
+        Size: 700,
+        Config: { Labels: {} },
+      };
+      if (field === 'Labels') delete (imageWithoutOptionalField.Config as Record<string, unknown>).Labels;
+      else delete imageWithoutOptionalField.Created;
+      images.push(imageWithoutOptionalField);
+      const originalImplementation = mockExecFileSync.getMockImplementation()!;
+      mockExecFileSync.mockImplementation((cmd: string, args: string[]) => {
+        if (cmd === CONTAINER_RUNTIME_BIN && args[0] === 'image' && args[1] === 'inspect') {
+          const formatIndex = args.indexOf('--format');
+          const format = formatIndex < 0 ? '' : args[formatIndex + 1]!;
+          // Docker templates reject dotted access to missing optional map keys.
+          const dottedField = field === 'Labels' ? '.Config.Labels' : '.Created';
+          if (inspectIds(args).includes('sha256:label-free') && format.includes(dottedField)) {
+            throw new Error(`template parsing error: map has no entry for key "${field}"`);
+          }
+        }
+        return originalImplementation(cmd, args);
+      });
+
+      const report = getStorageReport({
+        mode: 'dry-run',
+        now,
+        sessionsRoot: MISSING_SESSIONS_ROOT,
+        threadsRoot: MISSING_THREADS_ROOT,
+        policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
+      });
+
+      expect(report.images.dispositions.find((image) => image.id === 'sha256:label-free')).toMatchObject({
+        disposition: field === 'Labels' ? 'eligible' : 'protected',
+        protectionReason: field === 'Labels' ? 'expired-unreferenced' : 'invalid-retention-metadata',
+      });
+      expect(report.actions.map((action) => action.dockerArgs)).toContainEqual(['image', 'rm', 'sha256:expired']);
+      expect(report.warnings.some((warning) => warning.startsWith('docker inventory failed:'))).toBe(false);
+    },
+  );
+
+  it('preserves absent versus explicitly empty image retention labels in the compact projection', () => {
+    containers = [];
+    images = [
+      {
+        Id: 'sha256:legacy-expired',
+        RepoTags: [`${CONTAINER_IMAGE_BASE}:legacy-expired`],
+        Created: '2026-07-01T00:00:00.000Z',
+        Size: 700,
+        Config: { Labels: { 'nanoclaw.commit': 'legacy' } },
+      },
+    ];
+
+    const absentMetadata = getStorageReport({
+      mode: 'dry-run',
+      now,
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
+      policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
+    });
+    expect(absentMetadata.images.dispositions[0]).toMatchObject({
+      disposition: 'eligible',
+      protectionReason: 'expired-unreferenced',
+    });
+
+    (images[0]!.Config as { Labels: Record<string, string> }).Labels['nanoclaw.retention.hours'] = '';
+    const emptyMetadata = getStorageReport({
+      mode: 'dry-run',
+      now,
+      sessionsRoot: MISSING_SESSIONS_ROOT,
+      threadsRoot: MISSING_THREADS_ROOT,
+      policy: { filesystemPath: process.cwd(), cleanupThresholdPct: 85 },
+    });
+    expect(emptyMetadata.images.dispositions[0]).toMatchObject({
+      disposition: 'protected',
+      protectionReason: 'invalid-retention-metadata',
+    });
+  });
+
   it('caps BuildKit cache even when Docker filesystem usage is below cleanup threshold', () => {
     usagePct = 60;
 
@@ -1548,19 +1807,24 @@ describe('storage-manager Docker cleanup', () => {
 
   it('revalidates an image immediately before removal and skips a newly referenced image', () => {
     let containerInventoryReads = 0;
+    const newRunningContainer = {
+      Id: 'new-container',
+      Image: 'sha256:expired',
+      State: { Running: true },
+      Config: { Labels: {} },
+    };
     const originalImplementation = mockExecFileSync.getMockImplementation()!;
     mockExecFileSync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === CONTAINER_RUNTIME_BIN && args[0] === 'container' && args[1] === 'ls' && containerInventoryReads > 0) {
+        return [...containers, newRunningContainer].map((container) => container.Id).join('\n');
+      }
       if (cmd === CONTAINER_RUNTIME_BIN && args[0] === 'container' && args[1] === 'inspect') {
         containerInventoryReads += 1;
         if (containerInventoryReads >= 2) {
-          return JSON.stringify([
-            {
-              Id: 'new-container',
-              Image: 'sha256:expired',
-              State: { Running: true },
-              Config: { Labels: {} },
-            },
-          ]);
+          const rows = [...containers, newRunningContainer].filter((container) =>
+            inspectIds(args).includes(String(container.Id)),
+          );
+          return args.includes('--format') ? compactContainerInspect(rows) : JSON.stringify(rows);
         }
       }
       return originalImplementation(cmd, args);
@@ -1580,6 +1844,13 @@ describe('storage-manager Docker cleanup', () => {
       expect.anything(),
     );
     expect(report.actions.find((action) => action.id.includes('sha256:expired'))?.status).toBe('skipped');
+    expect(report.warnings).not.toContain(
+      'docker inventory failed: docker container inspect returned inconsistent projected records',
+    );
+    expect(log.warn).not.toHaveBeenCalledWith(
+      'storage-manager: docker image revalidation failed; removal skipped',
+      expect.anything(),
+    );
   });
 
   it('bypasses the long cadence under critical pressure but honors the emergency retry guard', () => {
@@ -1723,11 +1994,12 @@ describe('storage-manager Docker cleanup', () => {
         cmd === CONTAINER_RUNTIME_BIN &&
         args[0] === 'container' &&
         args[1] === 'inspect' &&
-        args.length === 3 &&
-        args[2] === 'own-stopped'
+        inspectIds(args).length === 1 &&
+        inspectIds(args)[0] === 'own-stopped'
       ) {
         targetInspectReads += 1;
-        return JSON.stringify([{ ...containers[0], State: { Running: true } }]);
+        const rows = [{ ...containers[0], State: { Running: true } }];
+        return args.includes('--format') ? compactContainerInspect(rows) : JSON.stringify(rows);
       }
       return originalImplementation(cmd, args);
     });

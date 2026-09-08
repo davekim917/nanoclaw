@@ -62,6 +62,17 @@ const DEFAULT_CLEANUP_TARGET_MARGIN_PCT = 3;
 const DEFAULT_EMERGENCY_RETRY_SECONDS = 60;
 const DEFAULT_IMAGE_RETENTION_HOURS = 168;
 const DEFAULT_LEGACY_IMAGE_GRACE_HOURS = 168;
+/**
+ * The only environment inputs that decide whether new containers are refused
+ * for storage pressure. Exported for host scripts that must report the same
+ * validated policy without re-implementing its clamping rules.
+ */
+export const STORAGE_ADMISSION_POLICY_ENV_KEYS = [
+  'NANOCLAW_STORAGE_MANAGER_ENABLED',
+  'NANOCLAW_STORAGE_CLEANUP_THRESHOLD_PCT',
+  'NANOCLAW_DOCKER_PRUNE_THRESHOLD_PCT',
+  'NANOCLAW_STORAGE_ADMISSION_REFUSE_PCT',
+] as const;
 // Archive-then-reclaim: a thread worktree dir idle this long is tarred
 // (minus regenerable dirs) into data/thread-rescues/ and then removed.
 // Owner-approved policy 2026-08-05; 47GB of never-reclaimed checkouts
@@ -492,21 +503,40 @@ function parseNonNegativeNumber(value: string | undefined, fallback: number): nu
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
-export function resolveStoragePolicy(overrides: Partial<StoragePolicy> = {}): StoragePolicy {
-  const cleanupThreshold = Math.min(
+export interface StorageAdmissionPolicy {
+  enabled: boolean;
+  cleanupThresholdPct: number;
+  admissionRefusePct: number;
+}
+
+/** Resolve the storage-admission knobs shared by the spawn gate and host alerts. */
+export function resolveStorageAdmissionPolicy(
+  env: Record<string, string | undefined> = process.env,
+): StorageAdmissionPolicy {
+  const cleanupThresholdPct = Math.min(
     99,
     parsePositiveInt(
-      process.env.NANOCLAW_STORAGE_CLEANUP_THRESHOLD_PCT ?? process.env.NANOCLAW_DOCKER_PRUNE_THRESHOLD_PCT,
+      env.NANOCLAW_STORAGE_CLEANUP_THRESHOLD_PCT ?? env.NANOCLAW_DOCKER_PRUNE_THRESHOLD_PCT,
       DEFAULT_CLEANUP_THRESHOLD_PCT,
     ),
   );
-  const admissionRefuse = Math.min(
-    99,
-    Math.max(
-      cleanupThreshold,
-      parsePositiveInt(process.env.NANOCLAW_STORAGE_ADMISSION_REFUSE_PCT, DEFAULT_ADMISSION_REFUSE_PCT),
+  return {
+    enabled: env.NANOCLAW_STORAGE_MANAGER_ENABLED !== '0',
+    cleanupThresholdPct,
+    admissionRefusePct: Math.min(
+      99,
+      Math.max(
+        cleanupThresholdPct,
+        parsePositiveInt(env.NANOCLAW_STORAGE_ADMISSION_REFUSE_PCT, DEFAULT_ADMISSION_REFUSE_PCT),
+      ),
     ),
-  );
+  };
+}
+
+export function resolveStoragePolicy(overrides: Partial<StoragePolicy> = {}): StoragePolicy {
+  const admissionPolicy = resolveStorageAdmissionPolicy();
+  const cleanupThreshold = admissionPolicy.cleanupThresholdPct;
+  const admissionRefuse = admissionPolicy.admissionRefusePct;
   const idleHours = parsePositiveNumber(process.env.SESSION_ARTIFACT_IDLE_HOURS, DEFAULT_IDLE_HOURS);
   const scanHours = parsePositiveNumber(process.env.NANOCLAW_STORAGE_SCAN_INTERVAL_HOURS, DEFAULT_SCAN_INTERVAL_HOURS);
   const dockerPruneHours = parsePositiveNumber(
@@ -541,7 +571,7 @@ export function resolveStoragePolicy(overrides: Partial<StoragePolicy> = {}): St
   const rescueRetentionDays = parseSessionKnob('NANOCLAW_RESCUE_RETENTION_DAYS', DEFAULT_RESCUE_RETENTION_DAYS, 0);
 
   const policy: StoragePolicy = {
-    enabled: process.env.NANOCLAW_STORAGE_MANAGER_ENABLED !== '0',
+    enabled: admissionPolicy.enabled,
     filesystemPath: DATA_DIR,
     cleanupThresholdPct: cleanupThreshold,
     admissionRefusePct: admissionRefuse,
@@ -2527,11 +2557,15 @@ interface DockerInventory {
   images: DockerImageInventory[];
 }
 
+const DOCKER_INSPECT_BATCH_SIZE = 100;
+const DOCKER_INSPECT_MAX_BUFFER_BYTES = 1024 * 1024;
+
 function dockerOutput(args: string[], timeout = 30_000): string {
   return execFileSync(CONTAINER_RUNTIME_BIN, args, {
     encoding: 'utf-8',
     stdio: ['pipe', 'pipe', 'pipe'],
     timeout,
+    maxBuffer: DOCKER_INSPECT_MAX_BUFFER_BYTES,
   });
 }
 
@@ -2542,46 +2576,145 @@ function nonEmptyLines(output: string): string[] {
     .filter(Boolean);
 }
 
+function dockerJsonFormat(expressions: string[]): string {
+  return expressions.map((expression) => `{{json ${expression}}}`).join('\t');
+}
+
+function parseDockerProjection(output: string, fields: number, subject: string): unknown[][] {
+  return nonEmptyLines(output).map((line) => {
+    const values = line.split('\t');
+    if (values.length !== fields) {
+      throw new Error(`docker ${subject} inspect returned a malformed projected record`);
+    }
+    try {
+      return values.map((value) => JSON.parse(value) as unknown);
+    } catch (err) {
+      throw new Error(`docker ${subject} inspect returned an invalid projected record`, { cause: err });
+    }
+  });
+}
+
+function inspectBatches(ids: string[]): string[][] {
+  const batches: string[][] = [];
+  for (let index = 0; index < ids.length; index += DOCKER_INSPECT_BATCH_SIZE) {
+    batches.push(ids.slice(index, index + DOCKER_INSPECT_BATCH_SIZE));
+  }
+  return batches;
+}
+
+function projectedString(value: unknown, subject: string): string {
+  if (typeof value !== 'string') throw new Error(`docker ${subject} inspect returned an invalid projected record`);
+  return value;
+}
+
+function projectedStringArray(value: unknown, subject: string): string[] {
+  if (value === null) return [];
+  if (!Array.isArray(value) || !value.every((item) => typeof item === 'string')) {
+    throw new Error(`docker ${subject} inspect returned an invalid projected record`);
+  }
+  return value;
+}
+
+function projectedLabels(values: unknown[], keys: readonly string[], subject: string): Record<string, string> {
+  const labels: Record<string, string> = {};
+  for (let index = 0; index < keys.length; index += 1) {
+    const value = values[index];
+    if (value === null) continue;
+    labels[keys[index]!] = projectedString(value, subject);
+  }
+  return labels;
+}
+
+function projectedLabelMap(value: unknown, subject: string): Record<string, string> {
+  if (value === null) return {};
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`docker ${subject} inspect returned an invalid projected record`);
+  }
+  const labels: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    labels[key] = projectedString(entry, subject);
+  }
+  return labels;
+}
+
 function inspectDockerContainers(ids?: string[]): DockerContainerInventory[] {
   const selectedIds = [...new Set(ids ?? nonEmptyLines(dockerOutput(['container', 'ls', '-a', '-q', '--no-trunc'])))];
   if (selectedIds.length === 0) return [];
-  const rows = JSON.parse(dockerOutput(['container', 'inspect', ...selectedIds])) as Array<{
-    Id?: string;
-    Image?: string;
-    State?: { Running?: boolean };
-    Config?: { Labels?: Record<string, string> | null };
-  }>;
-  return rows
-    .filter((row): row is typeof row & { Id: string } => typeof row.Id === 'string' && row.Id.length > 0)
-    .map((row) => ({
-      id: row.Id,
-      imageId: row.Image ?? '',
-      running: row.State?.Running === true,
-      labels: row.Config?.Labels ?? {},
-    }));
+  const installLabel = installLabelParts();
+  const format = dockerJsonFormat(['.Id', '.Image', '.State.Running', `(index .Config.Labels "${installLabel.key}")`]);
+  return inspectBatches(selectedIds).flatMap((batch) => {
+    const rows = parseDockerProjection(
+      dockerOutput(['container', 'inspect', '--format', format, ...batch]),
+      4,
+      'container',
+    );
+    if (rows.length !== batch.length) throw new Error('docker container inspect omitted a projected record');
+    const containers = rows.map(([id, imageId, running, label]) => {
+      if (
+        typeof id !== 'string' ||
+        id.length === 0 ||
+        typeof imageId !== 'string' ||
+        imageId.length === 0 ||
+        typeof running !== 'boolean'
+      ) {
+        throw new Error('docker container inspect returned an invalid projected record');
+      }
+      return {
+        id,
+        imageId,
+        running,
+        labels: projectedLabels([label], [installLabel.key], 'container'),
+      };
+    });
+    const returnedIds = new Set(containers.map((container) => container.id));
+    if (returnedIds.size !== batch.length || batch.some((id) => !returnedIds.has(id))) {
+      throw new Error('docker container inspect returned inconsistent projected records');
+    }
+    return containers;
+  });
 }
 
 function inspectDockerImages(ids?: string[]): DockerImageInventory[] {
   const selectedIds = [...new Set(ids ?? nonEmptyLines(dockerOutput(['image', 'ls', '-a', '-q', '--no-trunc'])))];
   if (selectedIds.length === 0) return [];
-  const rows = JSON.parse(dockerOutput(['image', 'inspect', ...selectedIds])) as Array<{
-    Id?: string;
-    RepoTags?: string[] | null;
-    RepoDigests?: string[] | null;
-    Created?: string;
-    Size?: number;
-    Config?: { Labels?: Record<string, string> | null };
-  }>;
-  return rows
-    .filter((row): row is typeof row & { Id: string } => typeof row.Id === 'string' && row.Id.length > 0)
-    .map((row) => ({
-      id: row.Id,
-      repoTags: Array.isArray(row.RepoTags) ? row.RepoTags : [],
-      repoDigests: Array.isArray(row.RepoDigests) ? row.RepoDigests : [],
-      createdAt: row.Created ?? '',
-      sizeBytes: Number.isFinite(row.Size) ? Math.max(0, Number(row.Size)) : 0,
-      labels: row.Config?.Labels ?? {},
-    }));
+  const format = dockerJsonFormat([
+    '.Id',
+    '.RepoTags',
+    '.RepoDigests',
+    // Docker's InspectResponse omits Created when the image has no timestamp.
+    '(index . "Created")',
+    '.Size',
+    // A per-key `index` renders both absent and explicitly empty labels as
+    // `""` in Docker's Go template. The whole map preserves that distinction:
+    // absent retention metadata takes the legacy grace path; an empty value
+    // remains invalid and protected. Batching still omits RootFS and Config.Env.
+    // Some OCI configs omit Labels entirely; Docker rejects dotted access to
+    // a missing map key, while index returns null and preserves an empty map.
+    '(index .Config "Labels")',
+  ]);
+  return inspectBatches(selectedIds).flatMap((batch) => {
+    const rows = parseDockerProjection(dockerOutput(['image', 'inspect', '--format', format, ...batch]), 6, 'image');
+    if (rows.length !== batch.length) throw new Error('docker image inspect omitted a projected record');
+    const images = rows.map((row) => {
+      const [id, repoTags, repoDigests, createdAt, sizeBytes, labels] = row;
+      if (typeof id !== 'string' || id.length === 0 || (createdAt !== null && typeof createdAt !== 'string')) {
+        throw new Error('docker image inspect returned an invalid projected record');
+      }
+      return {
+        id,
+        repoTags: projectedStringArray(repoTags, 'image'),
+        repoDigests: projectedStringArray(repoDigests, 'image'),
+        createdAt: createdAt ?? '',
+        sizeBytes: typeof sizeBytes === 'number' && Number.isFinite(sizeBytes) ? Math.max(0, sizeBytes) : 0,
+        labels: projectedLabelMap(labels, 'image'),
+      };
+    });
+    const returnedIds = new Set(images.map((image) => image.id));
+    if (returnedIds.size !== batch.length || batch.some((id) => !returnedIds.has(id))) {
+      throw new Error('docker image inspect returned inconsistent projected records');
+    }
+    return images;
+  });
 }
 
 function readDockerInventory(): DockerInventory {
@@ -2662,12 +2795,17 @@ function collectDockerActions(
     dockerRoot = dockerRootDir();
   } catch (err) {
     warnings.push(`docker info failed: ${err instanceof Error ? err.message : String(err)}`);
+    log.warn('storage-manager: docker cleanup collection failed; cleanup skipped', { stage: 'info', err });
     return { actions: [], images: [] };
   }
 
   const dockerUsage = getFilesystemUsage(dockerRoot);
   if (!dockerUsage) {
     warnings.push(`df failed for Docker root ${dockerRoot}`);
+    log.warn('storage-manager: docker cleanup collection failed; cleanup skipped', {
+      stage: 'filesystem-usage',
+      dockerRoot,
+    });
     return { actions: [], images: [] };
   }
 
@@ -2690,6 +2828,7 @@ function collectDockerActions(
     inventory = readDockerInventory();
   } catch (err) {
     warnings.push(`docker inventory failed: ${err instanceof Error ? err.message : String(err)}`);
+    log.warn('storage-manager: docker cleanup collection failed; cleanup skipped', { stage: 'inventory', err });
     return { actions: [], images: [] };
   }
   const imageDispositions = classifyDockerInventory(inventory, policy, now);
@@ -2699,6 +2838,7 @@ function collectDockerActions(
     estimates = dockerReclaimableBytes();
   } catch (err) {
     warnings.push(`docker system df failed: ${err instanceof Error ? err.message : String(err)}`);
+    log.warn('storage-manager: docker reclaim estimate failed; cleanup estimates unavailable', { err });
   }
 
   const actions: StorageAction[] = [];
@@ -2720,7 +2860,11 @@ function collectDockerActions(
             let current: DockerContainerInventory[];
             try {
               current = inspectDockerContainers([container.id]);
-            } catch {
+            } catch (err) {
+              log.warn('storage-manager: docker container revalidation failed; removal skipped', {
+                containerId: container.id,
+                err,
+              });
               return false;
             }
             const target = current[0];
@@ -2796,7 +2940,11 @@ function collectDockerActions(
             let currentInventory: DockerInventory;
             try {
               currentInventory = readDockerInventory();
-            } catch {
+            } catch (err) {
+              log.warn('storage-manager: docker image revalidation failed; removal skipped', {
+                imageId: image.id,
+                err,
+              });
               return false;
             }
             const current = classifyDockerInventory(currentInventory, policy, Date.now()).find(
