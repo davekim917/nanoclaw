@@ -12,6 +12,7 @@ import {
   type AdditionalMountConfig,
   type McpServerConfig,
   updateContainerConfig,
+  resolveGroupProvider,
 } from '../../container-config.js';
 import { resolveContainerResources, type ContainerResources } from '../../container-resources.js';
 import { buildAgentGroupImage, killContainer } from '../../container-runner.js';
@@ -26,10 +27,12 @@ import { writeSessionMessage } from '../../session-manager.js';
 import {
   ensureContainerConfig,
   getContainerConfig,
+  resolveProviderName,
   updateContainerConfigScalars,
   updateContainerConfigJson,
 } from '../../db/container-configs.js';
 import { getDeniedModel } from '../../db/denied-models.js';
+import { auditTaskPins, formatStrandedPins, formatLateStrandedPins } from '../../modules/scheduling/pin-audit.js';
 import { assertValidGroupFolder, groupFolderExistsOnDisk } from '../../group-folder.js';
 import { log } from '../../log.js';
 import { canonicalizeIanaTimezone, timezoneRejectionReason } from '../../timezone.js';
@@ -488,7 +491,9 @@ registerResource({
         'Update container config fields. Changes are saved but do NOT take effect until you run `ncl groups restart`. ' +
         'Use --id <group-id> and scalar flags, or resource flags: --memory-request-mb, --memory-limit-mb, ' +
         '--memory-swap-limit-mb, --cpus, --cpu-shares, --pids-limit. ' +
-        '--timezone takes an IANA id like "Europe/Lisbon" ("" clears back to the install default). Tasks created or edited afterwards use the new zone; an already-armed occurrence keeps its absolute fire time and the series moves onto the new grid at its next re-arm. The container clock follows after a restart.',
+        '--timezone takes an IANA id like "Europe/Lisbon" ("" clears back to the install default). Tasks created or edited afterwards use the new zone; an already-armed occurrence keeps its absolute fire time and the series moves onto the new grid at its next re-arm. The container clock follows after a restart. ' +
+        '--provider REFUSES the switch when any armed scheduled-task pin would be invalid under the new provider (model/effort vocabularies do not nest: claude has ultracode, codex has ultra, opencode has neither and no xhigh). ' +
+        'Task pins are never rewritten for you and there is no --force: clear the refusal with `ncl tasks repin --target-provider <new>`, which validates against the provider you are moving TO and therefore works before the switch.',
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
@@ -567,6 +572,47 @@ registerResource({
           }
         }
 
+        // Provider-migration pin audit (2026-09-07 incident). Pins are validated
+        // at CREATE time against the then-current provider and never
+        // re-validated at fire time, so a bare `--provider` switch strands
+        // every pin the new vocabulary rejects and the only symptom is a
+        // per-fire provider error nobody is watching for. REFUSE rather than
+        // warn: this verb already runs behind an approval gate, so a refusal is
+        // read and acted on, while a warning printed into a scrollback is
+        // precisely what produced a 14-hour outage. The audit never rewrites a
+        // pin — that is the operator's call, via `ncl tasks repin`, whose
+        // --target-provider makes the remedy reachable BEFORE the switch and is
+        // therefore what makes refusing safe rather than a wedge.
+        //
+        // Runs before any write, so a refusal leaves both stores untouched.
+        // Recorded so the post-write re-audit below knows a switch happened.
+        let auditedProvider: string | undefined;
+        let fromProviderForReport: string | undefined;
+        if (updates.provider !== undefined) {
+          // `resolveGroupProvider` is THE resolver (container-config.ts): the
+          // authoritative `container.json`, projection only as fallback. Read
+          // the projection here instead and a group whose row already says
+          // `claude` while its file still says `codex` skips the audit — and
+          // this handler then writes the file, performing the real switch with
+          // every gpt-* pin carried in unexamined.
+          const fromProvider = await resolveGroupProvider(id);
+          const toProvider = resolveProviderName(null, updates.provider);
+          if (fromProvider !== toProvider) {
+            auditedProvider = toProvider;
+            fromProviderForReport = fromProvider;
+            const stranded = await auditTaskPins(id, toProvider);
+            if (stranded.length > 0) {
+              log.warn('Refused provider switch: armed task pins would be invalid', {
+                agentGroupId: id,
+                fromProvider,
+                toProvider,
+                stranded: stranded.map((p) => ({ seriesId: p.seriesId, model: p.model, effort: p.effort })),
+              });
+              throw new Error(formatStrandedPins(stranded, id, fromProvider, toProvider));
+            }
+          }
+        }
+
         if (Object.keys(updates).length > 0) await updateContainerConfigScalars(id, updates);
 
         // Mirror the runtime-selecting scalars into container.json. The DB row
@@ -613,6 +659,45 @@ registerResource({
             resolveContainerResources(resources);
             config.resources = resources;
           });
+        }
+
+        // ── THE CHECK-TO-WRITE WINDOW, narrowed and made loud ──
+        //
+        // The audit above runs before the writes below, and the socket server
+        // handles each connection independently, so a `tasks create`/`update`
+        // (or a recurrence re-arm) can land an old-provider-valid pin in
+        // between — stranded by a switch whose audit had already passed.
+        //
+        // This is NOT closed by a lock here, deliberately. Task pin writes take
+        // the central lease via `withCentralSync`, and `assertLeaseNotHeld`
+        // forbids nesting, so serializing this handler against them means
+        // restructuring how `config update` acquires the lease across its
+        // several writes. That is a transactional change to a path that also
+        // writes container.json and resource limits, and doing it inside a
+        // change about pin semantics is how a fix becomes the next incident.
+        //
+        // What IS fixed is the outcome that actually hurt: silence. A pin that
+        // slips through the window is now REPORTED — the same information the
+        // refusal would have carried, after the fact instead of before it. The
+        // operator learns immediately rather than at a failed fire, and
+        // scheduled-task failure escalation is the backstop underneath.
+        if (auditedProvider !== undefined) {
+          const late = await auditTaskPins(id, auditedProvider);
+          if (late.length > 0) {
+            log.warn('Task pins were stranded by a provider switch after its audit passed', {
+              agentGroupId: id,
+              toProvider: auditedProvider,
+              stranded: late.map((p) => ({ seriesId: p.seriesId, model: p.model, effort: p.effort })),
+            });
+            const updatedLate = (await getContainerConfig(id))!;
+            return {
+              ...presentConfig(updatedLate, group.folder),
+              stranded_after_switch: late,
+              // NOT formatStrandedPins: that text says the switch is being
+              // refused, and by here it has already landed.
+              warning: formatLateStrandedPins(late, id, fromProviderForReport!, auditedProvider),
+            };
+          }
         }
 
         const updated = (await getContainerConfig(id))!;
