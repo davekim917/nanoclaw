@@ -7,6 +7,7 @@ import { evaluateAdmission, registerAdmissionGate } from './admission-gate.js';
 import { _resetConfig, loadConfig } from './config.js';
 import { clearStaleProcessingAcks, setContainerToolInFlight } from './db/container-state.js';
 import { setContinuation } from './db/session-state.js';
+import { setStickyModel } from './modules/mailbox/session-state.js';
 import { getInboundDb, getOutboundDb } from './mailbox/sqlite/connection.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { closeSessionDb, initTestSessionDb } from './modules/mailbox/testing.js';
@@ -279,7 +280,9 @@ describe('repository mount poll and tool admission barrier', () => {
       expect(queryInputs[1].prompt).toContain('has not recorded a completed result');
       expect(queryInputs[1].prompt).toContain('inspect durable effects already produced');
       expect(queryInputs[1].prompt.endsWith(queryInputs[0].prompt)).toBe(true);
-      expect(getOutboundDb().prepare("SELECT COUNT(*) AS count FROM messages_out WHERE kind = 'task_log'").get()).toEqual({
+      expect(
+        getOutboundDb().prepare("SELECT COUNT(*) AS count FROM messages_out WHERE kind = 'task_log'").get(),
+      ).toEqual({
         count: 1,
       });
     } finally {
@@ -2927,6 +2930,55 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     expect(result.taskTurns!.map((t) => t.key)).toEqual(['occ-1', 'occ-2']);
     expect(result.taskTurns![0]!.outcome?.text).toBe('first fire failed');
     expect(result.taskTurns![1]!.outcome?.text).toBe('second fire failed');
+  }, 15_000);
+
+  it('a later occurrence joining a live stream does NOT drag it onto the interactive sticky', async () => {
+    // The reconciliation gap between the scheduled-task-default removal and
+    // #561. Suppression is decided once, when the query opens. But the
+    // follow-up path recomputes settings for newly admitted rows and compares
+    // them to the query's snapshot — so if that recompute uses the RAW flag
+    // batch, a task occurrence admitted into a running stream resolves to the
+    // interactive sticky, reads as a mid-turn settings change, and
+    // applySettings moves the live task turn onto the human's model.
+    //
+    // Which is the same defect the suppression exists to prevent, reached
+    // through the one door that stays open after the query has started.
+    setStickyModel('claude-opus-5[1m]');
+    insertMessage('occ-2', 'task', { prompt: 'second fire of the same series' });
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      yield { type: 'result', text: 'first fire failed', isError: true };
+      await Bun.sleep(1600);
+      yield { type: 'result', text: 'second fire failed', isError: true };
+    }
+    const applied: Array<Record<string, unknown>> = [];
+    let ended = false;
+    const query: AgentQuery = {
+      push: () => {},
+      end: () => {
+        ended = true;
+      },
+      abort: () => {},
+      applySettings: async (sIn: Record<string, unknown>) => {
+        applied.push(sIn);
+      },
+      events: events(),
+    };
+
+    // The suppressed snapshot: a pure task wake with no pin sends no per-turn
+    // model, which is what lets the group default apply.
+    const result = await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
+      ultracode: false,
+    });
+
+    // Pre-fix: applied === [{ model: 'claude-opus-5[1m]', ... }]. The task turn
+    // would have finished on the model a human picked in chat.
+    expect(applied).toEqual([]);
+    expect(ended).toBe(false);
+    // ...and #561's per-turn accounting is untouched by the suppression: the
+    // joining occurrence still gets its own outcome slot.
+    expect(result.taskTurns!.map((t) => t.key)).toEqual(['occ-1', 'occ-2']);
   }, 15_000);
 
   it('keeps two separate fires apart even though they share a series', async () => {

@@ -23,9 +23,11 @@ To inspect pins before attempting a switch, `ncl tasks list` shows a `PIN` colum
 ```bash
 ncl tasks list --group <group-id>
 ncl tasks list --group <group-id> --json | jq -r '
-  .[] | select(.model_pin != null or .effort_pin != null)
+  .data[] | select(.model_pin != null or .effort_pin != null)
       | [.series_id, .model_pin, .effort_pin] | @tsv'
 ```
+
+(`--json` returns the CLI's response envelope — `{ok, id, data, human}` — so the rows are under `.data`, not at the top level.)
 
 Note `container.json` is the authority for which provider a group actually runs; the `container_configs` DB row is a projection that can lag. The audit reads the file, as does the spawn path.
 

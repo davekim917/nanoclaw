@@ -660,24 +660,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     }
 
     applyChatBudget(keep);
-    const flagBatch = applyFlagBatch(keep, routing, config.providerName);
-    let effectiveModel = flagBatch.model;
-    let effectiveEffort = flagBatch.effort;
+    const flagBatch = effectiveTurnSettings(keep, routing, config.providerName);
+    const effectiveModel = flagBatch.model;
+    const effectiveEffort = flagBatch.effort;
     const effectiveUltracode = flagBatch.ultracode;
     const effectiveFast = flagBatch.fast;
-
-    // Scheduled-task default (Claude only): an unpinned scheduled-task fire
-    // runs on Sonnet at xhigh effort, independent of any interactive sticky
-    // model — the task's OWN -m/-e (its stored flagIntent) is the only thing
-    // that overrides it. Interactive chat keeps its Opus default. Codex and
-    // opencode manage their own task defaults (gpt-5.6-sol/high, model-native).
-    if (config.providerName === 'claude') {
-      const task = taskWakeIntent(keep);
-      if (task.isPureTaskWake) {
-        if (!task.turnModel) effectiveModel = 'sonnet';
-        if (!task.turnEffort) effectiveEffort = 'xhigh';
-      }
-    }
 
     // Format messages: passthrough commands get raw text (only if the
     // provider natively handles slash commands), others get XML.
@@ -1804,7 +1791,14 @@ export async function processQuery(
         // provider without live controls (opencode/codex) ends the stream so the
         // outer loop reopens on the new model, leaving these rows pending; one
         // with live controls (claude) applies it in place, same stream.
-        const fb = applyFlagBatch(keep, extractRouting(keep), providerName);
+        // effectiveTurnSettings, NOT applyFlagBatch: a task occurrence admitted
+        // into a LIVE query is still a task fire and must not drag the running
+        // turn onto an interactive sticky. Using the raw batch here would make
+        // fb.model the sticky, differ from the suppressed querySettings.model,
+        // and applySettings the stream onto it — undoing the suppression for
+        // exactly the case #561 added slots for (a later occurrence joining an
+        // active stream is a SEPARATE fire).
+        const fb = effectiveTurnSettings(keep, extractRouting(keep), providerName);
         const liveSettingsChanged =
           fb.model !== querySettings.model ||
           fb.effort !== querySettings.effort ||
@@ -2950,11 +2944,77 @@ export function applyFlagBatch(
   return { model, effort, ultracode, fast };
 }
 
+/**
+ * The per-turn model/effort a batch should actually run on.
+ *
+ * A scheduled task has NO default of its own — but it must not inherit an
+ * INTERACTIVE one either, and those are two different statements.
+ *
+ * `applyFlagBatch` resolves `turnModel ?? getStickyModel()`, and the sticky
+ * lives in `session_state`: the session's own durable DB, so it survives turns
+ * and container restarts for the life of the session. Chat and task messages
+ * share a session (which is exactly why `isPureTaskWake` has to ask whether a
+ * batch is task-only), so without this an unpinned nightly task fires on
+ * whatever `-m` a human last typed in that thread. That is the bug the
+ * 2026-07-02 `sonnet`/`xhigh` block was written to fix; the block was right
+ * about the disease and wrong about the cure, substituting a hardcoded default
+ * the group's own config could neither see nor override. In July it had no
+ * alternative — container.json's model did not reach the container.
+ *
+ * So: SUPPRESS the sticky rather than replace it. `undefined` is not "no
+ * model", it is "no per-TURN override", which lets the group's configured
+ * model apply exactly as it does for interactive chat — the host exports it as
+ * ANTHROPIC_DEFAULT_OPUS_MODEL at spawn (`claudeSpawnEnv`) and the provider
+ * reads it at
+ * `input.model ?? stickyConfig.model ?? process.env.ANTHROPIC_DEFAULT_OPUS_MODEL`.
+ *
+ * Deliberately NOT gated on `providerName === 'claude'`: the sticky is
+ * provider-neutral, so a codex or opencode task inherits an interactive `-m`
+ * the same way. Only the SUPPRESSION is shared — each provider still resolves
+ * its own default from its own config, and codex's `stickyFast` passes through
+ * untouched.
+ *
+ * MUST be called everywhere a batch's settings are computed, not just at query
+ * creation: the live-query follow-up path recomputes settings for newly
+ * admitted rows and would otherwise `applySettings` a running task turn onto
+ * the sticky. `applyFlagBatch` also PERSISTS flag stickies, so this wraps it
+ * rather than skipping it — the side effect must still happen for a task batch
+ * that carries an explicit flag row.
+ */
+function effectiveTurnSettings(
+  messages: MessageInRow[],
+  routing: RoutingContext,
+  providerName: string,
+): { model?: string; effort?: string; ultracode?: boolean; fast: boolean } {
+  const flagBatch = applyFlagBatch(messages, routing, providerName);
+  const task = taskWakeIntent(messages);
+  if (!task.isPureTaskWake) return flagBatch;
+  return {
+    model: task.turnModel,
+    effort: task.turnEffort,
+    // A task pin cannot express ultracode — `validateTaskPin` refuses it,
+    // because only the effort half would survive storage — so on a pure task
+    // wake a sticky ultracode is inheritance with nothing on the task's side
+    // that could have asked for it.
+    ultracode: false,
+    fast: flagBatch.fast,
+  };
+}
+
 // A scheduled-task wake is a batch driven purely by kind='task' rows with no
 // interactive chat riding along. Returns the task's own per-fire model/effort
-// (its stored flagIntent) so the caller can apply the scheduled-task default
-// only when the task itself didn't pin one — and skip the default entirely for
+// (its stored flagIntent) so the caller can suppress the interactive sticky
+// only when the task itself didn't pin one — and skip suppression entirely for
 // a mixed chat+task turn (don't downgrade a chat turn a task coincided with).
+//
+// This asks a DIFFERENT question from the task-turn outcome keying in
+// `processQuery`, which reads admitted task-row ids to decide how many outcome
+// records a turn produces. That is per admitted TURN and counts fires; this is
+// per BATCH and picks a model. Both phrase themselves as "the task rows in
+// this batch" and they must not be collapsed: a batch can carry more than one
+// admitted turn, so one batch-level model decision can span several outcome
+// slots, and that is correct — the model is fixed when the query opens, while
+// each joining occurrence still gets its own slot.
 function taskWakeIntent(messages: MessageInRow[]): {
   isPureTaskWake: boolean;
   turnModel?: string;
