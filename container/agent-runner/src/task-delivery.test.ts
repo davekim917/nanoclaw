@@ -11,7 +11,13 @@ import { closeSessionDb, initTestSessionDb } from './modules/mailbox/testing.js'
 import { getUndeliveredMessages, writeMessageOut } from './db/messages-out.js';
 import { getTaskSeriesId } from './db/session-routing.js';
 import { sendFile, sendMessage } from './mcp-tools/core.js';
-import { autoAppendTaskLog, buildTaskBlockNudge, dispatchResultText, shouldNudgeTaskBlocks } from './poll-loop.js';
+import {
+  autoAppendTaskLog,
+  buildTaskBlockNudge,
+  dispatchResultText,
+  resolveFireOutcome,
+  shouldNudgeTaskBlocks,
+} from './poll-loop.js';
 import type { RoutingContext } from './formatter.js';
 
 function seedSessionRouting(channelType: string | null, platformId: string | null, threadId: string | null): void {
@@ -211,6 +217,83 @@ describe('automatic task run summary', () => {
     expect(line).toContain('Digest done.');
   });
 
+  // ── the 2026-09-07 incident: the provider's error verdict was thrown away ──
+  //
+  // `processQuery` acts on `event.isError` only when `!routing.taskRun`, so a
+  // task run that errored was recorded exactly like one that succeeded. A
+  // series pinned to `gpt-6-astra` after its group moved to claude failed 21
+  // times in 14 hours with every occurrence reading `completed`. These three
+  // cases are what make the host's run-outcome ledger able to tell the two
+  // apart at all.
+  it('marks the summary as the automatic one so a mid-run note cannot move a streak', async () => {
+    await autoAppendTaskLog('Checked the feeds.');
+    const row = getOutboundDb().prepare("SELECT content FROM messages_out WHERE kind = 'task_log'").get() as {
+      content: string;
+    };
+    const content = JSON.parse(row.content);
+    expect(content.auto).toBe(true);
+    expect(content.isError).toBeUndefined();
+  });
+
+  it("carries the provider's error verdict and the model that ran", async () => {
+    await autoAppendTaskLog(
+      "Prompt is too long · automatic compaction failed: There's an issue with the selected model (gpt-6-astra).",
+      true,
+      'gpt-6-astra',
+    );
+    const row = getOutboundDb().prepare("SELECT content FROM messages_out WHERE kind = 'task_log'").get() as {
+      content: string;
+    };
+    const content = JSON.parse(row.content);
+    expect(content.isError).toBe(true);
+    expect(content.model).toBe('gpt-6-astra');
+    expect(content.text).toContain('issue with the selected model');
+  });
+
+  it('still records an errored turn that returned no text at all', async () => {
+    // A silent failure is exactly the case where the run log leaves nothing
+    // behind, so it is the one that must not be skipped.
+    await autoAppendTaskLog('   ', true, 'gpt-6-astra');
+    const rows = getOutboundDb().prepare("SELECT content FROM messages_out WHERE kind = 'task_log'").all() as {
+      content: string;
+    }[];
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0].content).isError).toBe(true);
+  });
+
+  // Codex round 1, P1: the outcome write used to sit inside `if (event.text)`,
+  // and `ProviderEvent.text` is `string | null`. A blank SUCCESS therefore
+  // recorded nothing — so it could not reset a stale failure streak, and the
+  // series stayed "failing" across a recovery.
+  it('records a blank SUCCESSFUL turn, which is what resets a stale streak', async () => {
+    await autoAppendTaskLog('   ');
+    const rows = getOutboundDb().prepare("SELECT content FROM messages_out WHERE kind = 'task_log'").all() as {
+      content: string;
+    }[];
+    expect(rows).toHaveLength(1);
+    const content = JSON.parse(rows[0].content);
+    expect(content.auto).toBe(true);
+    expect(content.isError).toBeUndefined();
+    expect(content.text).toBe('(run produced no output)');
+  });
+
+  // The exact shape that produced 21 dead fires: a provider-level model
+  // rejection. It reaches the runner as a terminal error, not as result text.
+  it('records a provider model rejection as a failed fire', async () => {
+    await autoAppendTaskLog(
+      "Error: There's an issue with the selected model (gpt-6-astra). It may not exist or you may not have access to it.",
+      true,
+      'gpt-6-astra',
+    );
+    const row = getOutboundDb().prepare("SELECT content FROM messages_out WHERE kind = 'task_log'").get() as {
+      content: string;
+    };
+    const content = JSON.parse(row.content);
+    expect(content.isError).toBe(true);
+    expect(content.model).toBe('gpt-6-astra');
+    expect(content.text).toContain('issue with the selected model');
+  });
+
   it('is additive to an explicit append-log request', async () => {
     await writeMessageOut({
       id: 'cli-progress',
@@ -226,5 +309,86 @@ describe('automatic task run summary', () => {
     await autoAppendTaskLog('final summary');
 
     expect(getOutboundDb().prepare("SELECT 1 FROM messages_out WHERE kind = 'task_log'").all()).toHaveLength(1);
+  });
+});
+
+/**
+ * Codex round 3, P1 — a deferred batch is not a fire that ended.
+ *
+ * Both the repository-barrier and provider-fallback paths leave or release the
+ * claim so the SAME occurrence runs again. Recording here as well gives one
+ * fire two rows, and with the threshold at three that pages a human after two
+ * occurrences of a task that was only postponed.
+ */
+describe('which fires record an outcome', () => {
+  const reported = { text: 'watched, nothing new', isError: false, model: 'claude-fable-5-1' };
+
+  it('records a normal terminal fire', () => {
+    expect(
+      resolveFireOutcome({
+        taskRun: true,
+        deferredForRepositoryBarrier: false,
+        deferredToFallback: false,
+        reported,
+      }),
+    ).toEqual(reported);
+  });
+
+  it('records nothing when the batch was deferred to a provider fallback', () => {
+    expect(
+      resolveFireOutcome({
+        taskRun: true,
+        deferredForRepositoryBarrier: false,
+        deferredToFallback: true,
+        reported,
+      }),
+    ).toBeUndefined();
+  });
+
+  it('records nothing when a repository barrier interrupted the batch', () => {
+    expect(
+      resolveFireOutcome({
+        taskRun: true,
+        deferredForRepositoryBarrier: true,
+        deferredToFallback: false,
+        errorMessage: 'barrier',
+        model: 'gpt-6-astra',
+      }),
+    ).toBeUndefined();
+  });
+
+  it('synthesises a failure only when every attempt threw', () => {
+    expect(
+      resolveFireOutcome({
+        taskRun: true,
+        deferredForRepositoryBarrier: false,
+        deferredToFallback: false,
+        errorMessage: 'provider exploded',
+        model: 'gpt-6-astra',
+      }),
+    ).toEqual({ text: 'Error: provider exploded', isError: true, model: 'gpt-6-astra' });
+  });
+
+  it('prefers a real terminal result over a synthesised failure', () => {
+    expect(
+      resolveFireOutcome({
+        taskRun: true,
+        deferredForRepositoryBarrier: false,
+        deferredToFallback: false,
+        reported,
+        errorMessage: 'ignored',
+      }),
+    ).toEqual(reported);
+  });
+
+  it('records nothing for a non-task turn', () => {
+    expect(
+      resolveFireOutcome({
+        taskRun: false,
+        deferredForRepositoryBarrier: false,
+        deferredToFallback: false,
+        reported,
+      }),
+    ).toBeUndefined();
   });
 });

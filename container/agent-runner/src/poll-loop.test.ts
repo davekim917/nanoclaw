@@ -2777,3 +2777,160 @@ describe('durable continuation wiring', () => {
     expect(cancelWorkContinuation()).toBe(false);
   });
 });
+
+/**
+ * Codex round 1, P1 — the routing-level half.
+ *
+ * A non-retryable provider `error` event ENDS the turn by throwing, so it never
+ * reaches the `result` block where a task run's outcome is recorded. Codex
+ * terminal failures arrive in exactly that shape, so before this every one of
+ * them left NO `task_log` row and therefore no outcome row: a repeatedly
+ * failing series could never reach the escalation threshold, and the ledger
+ * would say nothing happened.
+ *
+ * Asserted at the `processQuery` seam rather than on the helper, because the
+ * defect was in which code path reaches the helper, not in the helper.
+ */
+describe('terminal task outcomes reach the run-outcome ledger', () => {
+  const TASK_ROUTING = {
+    platformId: 'ag-1',
+    channelType: 'agent',
+    threadId: 'system:tasks:pr-watch-a1b2',
+    inReplyTo: 'run-1',
+    taskRun: true,
+  };
+
+  function taskLogRows(): Array<Record<string, unknown>> {
+    return (
+      getOutboundDb().prepare("SELECT content FROM messages_out WHERE kind = 'task_log'").all() as {
+        content: string;
+      }[]
+    ).map((r) => JSON.parse(r.content) as Record<string, unknown>);
+  }
+
+  // Codex round 2, P1. `processQuery` is ONE ATTEMPT, not one fire: the outer
+  // loop re-invokes it for in-turn recovery. These pin the reporting contract
+  // at that seam — an attempt REPORTS its terminal result and writes nothing,
+  // so the caller can collapse however many attempts into a single row.
+  // Codex round 4, P1 — THE REFRAME.
+  //
+  // A recurring task that fires again before its long-lived stream is reaped is
+  // admitted into the SAME `processQuery` call. The old design held one
+  // `taskOutcome` slot behind a `!taskOutcome` guard, so the second fire was
+  // dropped entirely and a frequently failing series could sit below the
+  // escalation threshold indefinitely — the exact outcome this PR exists to
+  // prevent. One slot, N admitted turns.
+  //
+  // Invariant now: one admitted task turn produces exactly one outcome record.
+  it('reports one outcome per admitted task turn, not one per stream', async () => {
+    async function* events() {
+      yield { type: 'init' as const, continuation: 'c1' };
+      yield { type: 'result' as const, text: 'fire one failed', isError: true };
+      yield { type: 'result' as const, text: 'fire two failed', isError: true };
+    }
+    const query: AgentQuery = { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+
+    const result = await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
+      model: 'gpt-6-astra',
+    });
+
+    // Only one turn was admitted, so the second result is an in-stream retry of
+    // it and coalesces — coalescing is scoped to retries OF a turn.
+    expect(result.taskTurns).toHaveLength(1);
+    expect(result.taskTurns![0]!.key).toBe('occ-1');
+    expect(result.taskTurns![0]!.outcome).toEqual({
+      text: 'fire one failed',
+      isError: true,
+      model: 'gpt-6-astra',
+    });
+  });
+
+  it('keys each turn by its admitted occurrence so retries coalesce but fires do not', () => {
+    // The key is what separates "the same fire, attempted twice" from "two
+    // fires". Retries re-enter with the same batch ids; a later occurrence
+    // arrives with its own.
+    const merged = new Map<string, unknown>();
+    const attemptOne = [{ key: 'occ-1', outcome: { text: 'failed', isError: true } }];
+    const attemptOneRetry = [{ key: 'occ-1', outcome: { text: 'failed again', isError: true } }];
+    const laterFire = [{ key: 'occ-2', outcome: { text: 'also failed', isError: true } }];
+    for (const turns of [attemptOne, attemptOneRetry, laterFire]) {
+      for (const t of turns) merged.set(t.key, t.outcome);
+    }
+    expect([...merged.keys()]).toEqual(['occ-1', 'occ-2']);
+    expect(merged.get('occ-1')).toEqual({ text: 'failed again', isError: true });
+  });
+
+  it('an attempt REPORTS its outcome and writes no row itself', async () => {
+    async function* events() {
+      yield { type: 'init' as const, continuation: 'c1' };
+      yield { type: 'result' as const, text: 'watched, nothing new' };
+    }
+    const query: AgentQuery = { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+
+    const result = await processQuery(query, TASK_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {
+      model: 'claude-fable-5-1',
+    });
+
+    expect(result.taskTurns).toHaveLength(1);
+    expect(result.taskTurns![0]!.outcome).toEqual({
+      text: 'watched, nothing new',
+      isError: false,
+      model: 'claude-fable-5-1',
+    });
+    // The write belongs to the fire, not the attempt.
+    expect(taskLogRows()).toHaveLength(0);
+  });
+
+  it('reports no outcome when the attempt throws, so the caller can retry it', async () => {
+    async function* events() {
+      yield { type: 'init' as const, continuation: 'c1' };
+      yield { type: 'error' as const, message: 'codex_system_error', retryable: false };
+    }
+    const query: AgentQuery = { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+
+    await expect(
+      processQuery(query, TASK_ROUTING, ['m1'], 'codex', undefined, 'prompt', undefined, { model: 'gpt-6-astra' }),
+    ).rejects.toThrow();
+    // Nothing written: a recovery attempt may still make this fire succeed.
+    expect(taskLogRows()).toHaveLength(0);
+  });
+
+  it('records a non-retryable provider error as a failed fire', async () => {
+    async function* events() {
+      yield { type: 'init' as const, continuation: 'c1' };
+      yield {
+        type: 'error' as const,
+        message: "There's an issue with the selected model (gpt-6-astra).",
+        retryable: false,
+        classification: 'system_error',
+      };
+    }
+    const query: AgentQuery = { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+
+    // Round 1 asserted a row here. Round 2 moved the write to the fire level,
+    // so the attempt must throw WITHOUT writing — the outer loop may recover.
+    // The failure is still recorded, by the fire-level `finally`; see
+    // `synthesises a failure when every attempt threw` below.
+    await expect(
+      processQuery(query, TASK_ROUTING, ['m1'], 'codex', undefined, 'prompt', undefined, { model: 'gpt-6-astra' }),
+    ).rejects.toThrow(/issue with the selected model/);
+    expect(taskLogRows()).toHaveLength(0);
+  });
+
+  it('records a terminal result that carried no text', async () => {
+    async function* events() {
+      yield { type: 'init' as const, continuation: 'c1' };
+      yield { type: 'result' as const, text: null };
+    }
+    const query: AgentQuery = { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+
+    const result = await processQuery(query, TASK_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {
+      model: 'claude-fable-5-1',
+    });
+
+    // Still observed — a blank success is what resets a stale streak — but
+    // reported rather than written.
+    expect(result.taskTurns![0]!.outcome).toEqual({ text: '', isError: false, model: 'claude-fable-5-1' });
+    expect(taskLogRows()).toHaveLength(0);
+  });
+});
