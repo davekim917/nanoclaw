@@ -154,6 +154,36 @@ function seedContinuation(sessionId: string, key: 'work_continuation' | 'pending
   }
 }
 
+/**
+ * The outbound-only cohort: a closed session whose `inbound.db` is gone while
+ * `outbound.db` survives. `SqliteAgentMailbox.exists` is `inbound && outbound`,
+ * so the mailbox-session funnel cannot see one of these at all.
+ */
+function dropInbound(sessionId: string): void {
+  for (const suffix of ['', '-journal', '-wal', '-shm']) {
+    fs.rmSync(path.join(sessionDir(sessionId), `inbound.db${suffix}`), { force: true });
+  }
+}
+
+/** What outbound.db still holds, read directly rather than through the seam. */
+function outboundState(sessionId: string): { claims: number; continuations: number } {
+  const db = new Database(path.join(sessionDir(sessionId), 'outbound.db'), { readonly: true });
+  try {
+    return {
+      claims: (
+        db.prepare("SELECT COUNT(*) AS n FROM processing_ack WHERE status = 'processing'").get() as { n: number }
+      ).n,
+      continuations: (
+        db
+          .prepare("SELECT COUNT(*) AS n FROM session_state WHERE key IN ('work_continuation', 'pending_next')")
+          .get() as { n: number }
+      ).n,
+    };
+  } finally {
+    db.close();
+  }
+}
+
 function inboundStatuses(sessionId: string): Record<string, string> {
   const db = new Database(path.join(sessionDir(sessionId), 'inbound.db'), { readonly: true });
   try {
@@ -175,9 +205,17 @@ function inboundStatuses(sessionId: string): Record<string, string> {
  * only the first one is the exact defect these cases exist to catch. The real
  * function cannot be imported here — it resolves paths from its own DATA_DIR
  * view and opens its own read-only handles — so the predicate is reproduced.
+ *
+ * A MISSING file reads as pinned, which is faithful rather than convenient:
+ * `dbHasRows` opens `fileMustExist: true`, catches, and answers `null`, and
+ * `sessionHasOpenWork` returns that `null` to callers who treat it exactly like
+ * `true`. So a half-present session is pinned by the absent file whatever its
+ * rows say — the fact the outbound-only cases below assert.
  */
 function pinned(sessionId: string): boolean {
-  const inbound = new Database(path.join(sessionDir(sessionId), 'inbound.db'), { readonly: true });
+  const inPath = path.join(sessionDir(sessionId), 'inbound.db');
+  if (!fs.existsSync(inPath)) return true;
+  const inbound = new Database(inPath, { readonly: true });
   try {
     if (inbound.prepare("SELECT 1 AS found FROM messages_in WHERE status IN ('processing', 'pending') LIMIT 1").get()) {
       return true;
@@ -187,7 +225,7 @@ function pinned(sessionId: string): boolean {
   }
 
   const outPath = path.join(sessionDir(sessionId), 'outbound.db');
-  if (!fs.existsSync(outPath)) return false;
+  if (!fs.existsSync(outPath)) return true;
   const outbound = new Database(outPath, { readonly: true });
   try {
     if (outbound.prepare("SELECT 1 AS found FROM processing_ack WHERE status = 'processing' LIMIT 1").get()) {
@@ -462,6 +500,74 @@ describe('drainClosedSessionPendingBacklog — the window advances', () => {
     expect(pinned('sess-active')).toBe(true);
   });
 
+  it('releases a closed session that kept outbound.db and lost inbound.db', async () => {
+    // The cohort the mailbox-session funnel cannot see: `exists` is
+    // `inbound && outbound`, so gating or routing on inbound alone skips this
+    // session on every boot forever. Empty on this host today; this test is
+    // the only thing that will ever exercise the path.
+    prepareSession('sess-outbound-only');
+    seedProcessingClaim('sess-outbound-only', 'm-claimed');
+    seedContinuation('sess-outbound-only', 'work_continuation', 'never resumable');
+    dropInbound('sess-outbound-only');
+    expect(outboundState('sess-outbound-only')).toEqual({ claims: 1, continuations: 1 });
+    sessionRows.value = [{ id: 'sess-outbound-only', agent_group_id: AGENT_GROUP_ID }];
+
+    const result = await drainClosedSessionPendingBacklog(SESSIONS_ROOT);
+
+    expect(result.visited).toBe(1);
+    expect(result.claimsCleared).toBe(1);
+    expect(result.continuationsCleared).toBe(1);
+    expect(result.inboundOnlySkipped).toBe(0);
+    expect(outboundState('sess-outbound-only')).toEqual({ claims: 0, continuations: 0 });
+  });
+
+  it('an outbound-only session stays pinned after release — the missing file is the pin', async () => {
+    // Stated as a test rather than a comment so the limitation cannot quietly
+    // stop being true: `sessionHasOpenWork` reads inbound.db first, and a file
+    // that is not there answers `null`, which every caller treats as pinned.
+    // Releasing the state is still correct; it just does not unpin the dir.
+    prepareSession('sess-outbound-only');
+    seedProcessingClaim('sess-outbound-only', 'm-claimed');
+    dropInbound('sess-outbound-only');
+    sessionRows.value = [{ id: 'sess-outbound-only', agent_group_id: AGENT_GROUP_ID }];
+
+    await drainClosedSessionPendingBacklog(SESSIONS_ROOT);
+
+    expect(outboundState('sess-outbound-only').claims).toBe(0);
+    expect(pinned('sess-outbound-only')).toBe(true);
+  });
+
+  it('leaves an outbound-only session alone when a container owns it', async () => {
+    prepareSession('sess-outbound-only');
+    seedProcessingClaim('sess-outbound-only', 'm-claimed');
+    seedContinuation('sess-outbound-only', 'work_continuation', 'still owed');
+    dropInbound('sess-outbound-only');
+    sessionRows.value = [{ id: 'sess-outbound-only', agent_group_id: AGENT_GROUP_ID }];
+    ownsOutbound.value = true;
+
+    const result = await drainClosedSessionPendingBacklog(SESSIONS_ROOT);
+
+    expect(result.visited).toBe(1);
+    expect(result.claimsCleared).toBe(0);
+    expect(outboundState('sess-outbound-only')).toEqual({ claims: 1, continuations: 1 });
+  });
+
+  it('reports an inbound-only session instead of silently releasing nothing', async () => {
+    // The mirror cohort. No inbound-keyed funnel exists, so the honest answer
+    // is a count and a warning — not a mailbox-session call that answers
+    // `undefined` while the drain reports success.
+    prepareSession('sess-inbound-only');
+    seedInbound('sess-inbound-only', [{ id: 'stranded' }]);
+    fs.rmSync(path.join(sessionDir('sess-inbound-only'), 'outbound.db'), { force: true });
+    sessionRows.value = [{ id: 'sess-inbound-only', agent_group_id: AGENT_GROUP_ID }];
+
+    const result = await drainClosedSessionPendingBacklog(SESSIONS_ROOT);
+
+    expect(result.visited).toBe(1);
+    expect(result.inboundOnlySkipped).toBe(1);
+    expect(result.expired).toBe(0);
+  });
+
   it('skips closed sessions whose directory reclaim already removed', async () => {
     prepareSession('sess-still-there');
     seedInbound('sess-still-there', [{ id: 'stranded' }]);
@@ -498,6 +604,7 @@ describe('drainClosedSessionPendingBacklog — the window advances', () => {
         claimsCleared: 0,
         continuationsCleared: 0,
         deferred: 0,
+        inboundOnlySkipped: 0,
         cursor: null,
       });
     } finally {

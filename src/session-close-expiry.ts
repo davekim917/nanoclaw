@@ -46,8 +46,10 @@ import path from 'node:path';
 
 import { DATA_DIR } from './config.js';
 import { getDb } from './db/connection.js';
+import { containerOwnsOutbound } from './container-runner.js';
 import { writeOutboundWhenStopped } from './host-sweep.js';
 import { log } from './log.js';
+import { withExistingNanoclawOutbound, type NanoclawOutboundSession } from './modules/mailbox/index.js';
 import type { NanoclawMailboxSession } from './modules/mailbox/index.js';
 import { sessionsBaseDir, withExistingMailboxSession } from './session-manager.js';
 import type { Session } from './types.js';
@@ -111,6 +113,89 @@ export interface ClosedSessionRelease {
  * transaction and returns what it held, so the drop is reported rather than
  * silent.
  */
+/**
+ * `writeOutboundWhenStopped`, for a session reached through the OUTBOUND-keyed
+ * funnel instead of the mailbox session.
+ *
+ * The two guards in `host-sweep.ts` both go through the mailbox session, whose
+ * existence check is `inbound.db && outbound.db`
+ * (`SqliteAgentMailbox.exists`) — so neither can reach a session that kept
+ * outbound.db and lost inbound.db. This is the same guarantee on
+ * `withExistingNanoclawOutbound`: `containerOwnsOutbound` runs INSIDE the
+ * funnel, synchronously, immediately before the mutation. The funnel demands a
+ * synchronous action, so no await can be introduced into that gap.
+ *
+ * Deliberately here and not beside its two siblings in `host-sweep.ts`.
+ * `host-sweep.ts` is upstream-owned, its export surface is a curated allowlist,
+ * and its line ceiling is set to zero headroom on purpose
+ * (`src/host-sweep-registry.test.ts`) — growing all three for a helper with one
+ * fork-owned caller and no relationship to the sweep driver buys nothing. The
+ * siblings live there because the sweep families share them across a kill;
+ * this one is not shared.
+ *
+ * Resolves `undefined` when there is no `outbound.db` OR a container owns it —
+ * both are "did not run", never a failure.
+ */
+async function writeOutboundOnlyWhenStopped<T>(
+  agentGroupId: string,
+  session: Session,
+  action: (outbound: NanoclawOutboundSession) => T,
+): Promise<T | undefined> {
+  return withExistingNanoclawOutbound<T | undefined>(agentGroupId, session.id, (outbound) => {
+    if (containerOwnsOutbound(session.id)) {
+      log.debug('Skipped a host outbound write — a container owns this session', { sessionId: session.id });
+      return undefined;
+    }
+    return action(outbound);
+  });
+}
+
+/**
+ * Release a closed session that still holds `outbound.db` but has lost
+ * `inbound.db`.
+ *
+ * Keyed on OUTBOUND, because `SqliteAgentMailbox.exists` is
+ * `inbound.db && outbound.db`: the mailbox-session funnel answers `undefined`
+ * for this cohort, so routing it through `expireClosedSessionWork` would spend
+ * a slot of the drain's budget, report success, and release nothing. That is
+ * the seam's own rule — the existence question a read asks is keyed to the file
+ * the read actually touches (`src/modules/mailbox/index.ts`) — and four earlier
+ * findings in this series were instances of getting it wrong.
+ *
+ * `writeOutboundOnlyWhenStopped` carries the same ownership guarantee as the
+ * two-sided path: `containerOwnsOutbound` inside the funnel, synchronously,
+ * immediately before the mutation.
+ *
+ * ## What this does and does not buy
+ *
+ * It genuinely releases the state. It does NOT, on its own, unpin the
+ * directory for reclaim: `sessionHasOpenWork` reads inbound.db FIRST, and
+ * `dbHasRows` answers `null` for a file that is not there, which every caller
+ * treats as "could not tell" and therefore as pinned. A half-present session is
+ * pinned by its missing file, not by its rows. Fixing that is a separate
+ * question about the `null` fail-closed and is deliberately not attempted here.
+ */
+export async function releaseOutboundOnlyClosedSession(
+  agentGroupId: string,
+  session: Session,
+  reason: 'spent-task-session-gc' | 'closed-session-backlog',
+): Promise<ClosedSessionRelease | undefined> {
+  const released = await writeOutboundOnlyWhenStopped(agentGroupId, session, (outbound) => ({
+    expired: 0,
+    claimsCleared: outbound.deleteOrphanProcessingClaims(),
+    continuationCleared: outbound.clearWorkContinuation() !== null,
+  }));
+  if (released && (released.claimsCleared > 0 || released.continuationCleared)) {
+    log.info('Released outbound work a closed session can never consume', {
+      sessionId: session.id,
+      claimsCleared: released.claimsCleared,
+      continuationCleared: released.continuationCleared,
+      reason,
+    });
+  }
+  return released;
+}
+
 export function expireClosedSessionWork(
   mailbox: NanoclawMailboxSession,
   session: Session,
@@ -197,6 +282,13 @@ export interface ClosedSessionDrainResult {
   continuationsCleared: number;
   /** Sessions with a surviving directory that the cap pushed to a later run. */
   deferred: number;
+  /**
+   * Sessions holding `inbound.db` with no `outbound.db`. The seam has no
+   * inbound-keyed funnel, so these are reported rather than released — and a
+   * missing file already makes `sessionHasOpenWork` fail closed, so releasing
+   * them would not unpin them either.
+   */
+  inboundOnlySkipped: number;
   /** Where the next run will resume, or null when this run completed a lap. */
   cursor: string | null;
 }
@@ -239,6 +331,7 @@ export async function drainClosedSessionPendingBacklog(
     claimsCleared: 0,
     continuationsCleared: 0,
     deferred: 0,
+    inboundOnlySkipped: 0,
     cursor: null,
   };
 
@@ -261,9 +354,21 @@ export async function drainClosedSessionPendingBacklog(
   let cappedOut = false;
 
   for (const row of ordered) {
-    // Cheap gate first: a reclaimed session has no directory left, and that is
-    // the overwhelming majority of the closed rows.
-    if (!fs.existsSync(path.join(sessionsRoot, row.agent_group_id, row.id, 'inbound.db'))) continue;
+    // Cheap gate first: a fully reclaimed session has no directory left, and
+    // that is the overwhelming majority of the closed rows.
+    //
+    // Both sides are checked, not just inbound. `sessionHasOpenWork` pins a
+    // session on outbound `processing_ack` or `session_state` even when it
+    // finds no inbound work, so a session that has lost `inbound.db` while
+    // keeping `outbound.db` still needs releasing — and gating on inbound
+    // alone would skip it on every boot forever. That is the seam's own rule
+    // (`src/modules/mailbox/index.ts`): the existence question a read asks is
+    // keyed to the file the read actually touches. Four earlier findings in
+    // this series were instances of getting it wrong; this was the fifth.
+    const sessionDir = path.join(sessionsRoot, row.agent_group_id, row.id);
+    const hasInbound = fs.existsSync(path.join(sessionDir, 'inbound.db'));
+    const hasOutbound = fs.existsSync(path.join(sessionDir, 'outbound.db'));
+    if (!hasInbound && !hasOutbound) continue;
     if (result.visited >= limit) {
       result.deferred += 1;
       cappedOut = true;
@@ -272,9 +377,30 @@ export async function drainClosedSessionPendingBacklog(
     result.visited += 1;
     lastOpened = row.id;
     try {
-      const released = await withExistingMailboxSession(row.agent_group_id, row.id, (mailbox) =>
-        expireClosedSessionWork(mailbox, row, 'closed-session-backlog'),
-      );
+      // Route to the funnel whose existence check matches the files this
+      // release will touch. `SqliteAgentMailbox.exists` is `inbound.db &&
+      // outbound.db`, so the mailbox session serves ONLY the both-present case
+      // — handing it a half-present session spends a slot of the budget,
+      // answers `undefined`, and releases nothing.
+      //
+      // Inbound-only has no funnel and is counted rather than pretended: the
+      // seam has no inbound-keyed opener, and releasing that cohort would not
+      // unpin it anyway (see `releaseOutboundOnlyClosedSession` — a missing
+      // file makes `sessionHasOpenWork` answer `null`, which is fail-closed).
+      let released: ClosedSessionRelease | undefined;
+      if (hasInbound && hasOutbound) {
+        released = await withExistingMailboxSession(row.agent_group_id, row.id, (mailbox) =>
+          expireClosedSessionWork(mailbox, row, 'closed-session-backlog'),
+        );
+      } else if (hasOutbound) {
+        released = await releaseOutboundOnlyClosedSession(row.agent_group_id, row, 'closed-session-backlog');
+      } else {
+        result.inboundOnlySkipped += 1;
+        log.warn('Closed session has inbound.db but no outbound.db — no funnel is keyed to release it', {
+          sessionId: row.id,
+          agentGroupId: row.agent_group_id,
+        });
+      }
       if (released) {
         result.expired += released.expired;
         result.claimsCleared += released.claimsCleared;

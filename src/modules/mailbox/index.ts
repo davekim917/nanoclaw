@@ -12,7 +12,10 @@ import type Database from 'better-sqlite3';
 
 import { sessionMailboxPath } from '../../mailbox/sqlite/paths.js';
 import { SqliteAgentMailbox, wrapSqliteInbound, wrapSqliteOutbound } from '../../mailbox/sqlite/index.js';
-import { migrateMessagesInTable as upstreamMigrateMessagesInTable } from '../../mailbox/sqlite/session-db.js';
+import {
+  deleteOrphanProcessingClaims,
+  migrateMessagesInTable as upstreamMigrateMessagesInTable,
+} from '../../mailbox/sqlite/session-db.js';
 import { parseIsoTimestamp } from '../../mailbox/model.js';
 import type {
   ContainerState as UpstreamContainerState,
@@ -598,11 +601,16 @@ export type NanoclawOutboundRead = Pick<
 /**
  * The reads plus the outbound WRITES the host performs.
  *
- * Two, and they are the reason this type is not simply `NanoclawOutboundRead`:
+ * Three, and they are the reason this type is not simply `NanoclawOutboundRead`:
  *
  *  - `clearWorkContinuation` — the thread-close force-clear, a host write to a
  *    container-owned key, valid only with the container confirmed stopped (see
  *    the policy around it in `dashboard/thread-close.ts`).
+ *  - `deleteOrphanProcessingClaims` — the same shape and the same policy: the
+ *    sweep's orphan-claim clear after a container death, and the closed-session
+ *    release (#520), which has to reach it on a session whose `inbound.db` is
+ *    gone. Upstream binds this op too, so this exposes an existing op on the
+ *    outbound-keyed surface rather than adding one.
  *  - `writeOutboundDirect` — the router's two notices (a command-gate denial,
  *    a flag confirmation), which append an id-unique row rather than mutating
  *    container-owned state. Outbound-keyed because they read nothing from
@@ -610,7 +618,7 @@ export type NanoclawOutboundRead = Pick<
  *    session whose inbound.db had been reclaimed.
  */
 export type NanoclawOutboundSession = NanoclawOutboundRead &
-  Pick<NanoclawMailboxSession, 'clearWorkContinuation' | 'writeOutboundDirect'>;
+  Pick<NanoclawMailboxSession, 'clearWorkContinuation' | 'deleteOrphanProcessingClaims' | 'writeOutboundDirect'>;
 
 export type NanoclawMailboxAction<T> = (mailbox: NanoclawMailboxSession) => T | Promise<T>;
 
@@ -827,6 +835,13 @@ export function composeOutboundOps(
     readDoneProposal: () => readOutbound(null, readDoneProposal),
     readContinuationPresence: () => readOutbound(null, readContinuationPresence),
     clearWorkContinuation: () => (outboundPresent ? clearWorkContinuation(writableOutbound()) : null),
+    // Rebinds upstream's op (`wrapSqliteOutbound` provides one too, and this
+    // spread wins) for the single reason the three above were rewritten:
+    // upstream's takes `writable()` unconditionally, so on a session with no
+    // outbound.db it would author the container-owned file the host must never
+    // create (I-10). "No claims to delete" is a true answer for a session that
+    // never ran, exactly as "nothing to clear" is for the continuation.
+    deleteOrphanProcessingClaims: () => (outboundPresent ? deleteOrphanProcessingClaims(writableOutbound()) : 0),
     // The direct notice deliberately does NOT degrade, which is the write rule
     // rather than an exception to it: `openOutboundDbWritable` refuses a
     // missing file instead of creating one, so a never-woken session raises
