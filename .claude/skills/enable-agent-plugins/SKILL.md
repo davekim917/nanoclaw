@@ -296,12 +296,19 @@ treats it as a fault will undo the opt-out trying to repair it.
 
    (Read the JSON rather than grepping it — `container.json` is pretty-printed, so the
    array spans lines and a line-based `grep` for the key returns nothing useful.)
-- **OpenCode** groups: branch on step 5 the same way. With no opt-out, the skills appear
-  as commands (mirrored in step 2). After `--deny opencode` the mirror is pruned, so the
-  commands being **absent is the success case** — do not undo the denial to "fix" it,
-  and note that any always-on ruleset stays, since `--deny` never withholds one.
+- **OpenCode** groups: branch on step 5 the same way, and note the two opt-outs land on
+  opposite halves. With no opt-out, the skills appear as commands (mirrored in step 2).
+  After `--deny opencode` the mirror is pruned, so the commands being **absent is the
+  success case** — do not undo the denial to "fix" it — while any always-on ruleset
+  stays, since `--deny` never withholds one. After `--exclude` it is the mirror image:
+  the commands remain (they come from the XDG mirror, which the mount never touched) and
+  the **ruleset** is gone, because `composeGroupClaudeMd` skips an excluded plugin
+  (`if (excluded.has(name)) continue;`, `src/claude-md-compose.ts:177`).
 - For mode plugins, the condensed ruleset is in `groups/<folder>/AGENTS.md` — spot-check
-  one Codex group: `grep -c "<a distinctive ruleset phrase>" groups/<name>-codex/AGENTS.md`.
+  a group **not** named in `--exclude`: `grep -c "<a distinctive ruleset phrase>"
+  groups/<name>-codex/AGENTS.md`. On an excluded group the count is correctly `0` on
+  every non-Claude provider, so picking one to spot-check would report the exclusion as
+  a failure.
 
 ## Notes
 
