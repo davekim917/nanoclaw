@@ -206,45 +206,49 @@ function inboundStatuses(sessionId: string): Record<string, string> {
  * function cannot be imported here — it resolves paths from its own DATA_DIR
  * view and opens its own read-only handles — so the predicate is reproduced.
  *
- * A MISSING file reads as pinned, which is faithful rather than convenient:
- * `dbHasRows` opens `fileMustExist: true`, catches, and answers `null`, and
- * `sessionHasOpenWork` returns that `null` to callers who treat it exactly like
- * `true`. So a half-present session is pinned by the absent file whatever its
- * rows say — the fact the outbound-only cases below assert.
+ * A MISSING file reads as EMPTY, matching `dbHasRows`, which short-circuits an
+ * absent path to `false` on its first line before it opens anything
+ * (`src/storage-manager.ts`). An earlier revision of this helper returned
+ * `true` there, on the belief that `dbHasRows` opened with
+ * `fileMustExist: true`, caught, and answered `null` — it never reaches that
+ * open. That made the outbound-only cases below pass against an oracle the
+ * production predicate does not implement, asserting a pin that cannot occur
+ * and proving nothing about whether the cohort becomes reclaimable.
  */
-function pinned(sessionId: string): boolean {
-  const inPath = path.join(sessionDir(sessionId), 'inbound.db');
-  if (!fs.existsSync(inPath)) return true;
-  const inbound = new Database(inPath, { readonly: true });
+/**
+ * `dbHasRows` (src/storage-manager.ts): an absent path is `false`, decided on
+ * the first line before anything is opened. NOT `null`, and NOT pinned.
+ */
+function hasRows(dbPath: string, sql: string): boolean {
+  if (!fs.existsSync(dbPath)) return false;
+  const db = new Database(dbPath, { readonly: true });
   try {
-    if (inbound.prepare("SELECT 1 AS found FROM messages_in WHERE status IN ('processing', 'pending') LIMIT 1").get()) {
-      return true;
-    }
+    return db.prepare(sql).get() !== undefined;
   } finally {
-    inbound.close();
+    db.close();
   }
+}
 
-  const outPath = path.join(sessionDir(sessionId), 'outbound.db');
-  if (!fs.existsSync(outPath)) return true;
-  const outbound = new Database(outPath, { readonly: true });
-  try {
-    if (outbound.prepare("SELECT 1 AS found FROM processing_ack WHERE status = 'processing' LIMIT 1").get()) {
-      return true;
-    }
-    return (
-      outbound
-        .prepare(
-          `SELECT 1 AS found FROM session_state
-            WHERE key IN ('work_continuation', 'pending_next')
-              AND value IS NOT NULL
-              AND trim(value) NOT IN ('', 'null')
-            LIMIT 1`,
-        )
-        .get() !== undefined
-    );
-  } finally {
-    outbound.close();
-  }
+function pinned(sessionId: string): boolean {
+  const dir = sessionDir(sessionId);
+  // Transcribes `sessionHasOpenWork` in its own order: inbound rows, then the
+  // outbound claim, then the continuation. Any one pins. A `false` from the
+  // inbound side FALLS THROUGH to outbound — it does not return, which is the
+  // error an earlier revision of this helper made in both directions: first
+  // treating an absent file as pinned, then short-circuiting the whole
+  // predicate on it.
+  if (hasRows(path.join(dir, 'inbound.db'), "SELECT 1 FROM messages_in WHERE status IN ('processing', 'pending') LIMIT 1"))
+    return true;
+  const outPath = path.join(dir, 'outbound.db');
+  if (hasRows(outPath, "SELECT 1 FROM processing_ack WHERE status = 'processing' LIMIT 1")) return true;
+  return hasRows(
+    outPath,
+    `SELECT 1 FROM session_state
+       WHERE key IN ('work_continuation', 'pending_next')
+         AND value IS NOT NULL
+         AND trim(value) NOT IN ('', 'null')
+       LIMIT 1`,
+  );
 }
 
 beforeEach(() => {
@@ -520,20 +524,24 @@ describe('drainClosedSessionPendingBacklog — the window advances', () => {
     expect(outboundState('sess-outbound-only')).toEqual({ claims: 0, continuations: 0 });
   });
 
-  it('an outbound-only session stays pinned after release — the missing file is the pin', async () => {
-    // Stated as a test rather than a comment so the limitation cannot quietly
-    // stop being true: `sessionHasOpenWork` reads inbound.db first, and a file
-    // that is not there answers `null`, which every caller treats as pinned.
-    // Releasing the state is still correct; it just does not unpin the dir.
+  it('an outbound-only session becomes reclaimable once its claim is released', async () => {
+    // This is the point of the whole change, and an earlier revision asserted
+    // the opposite — that the missing inbound.db kept the session pinned — on
+    // the belief that `dbHasRows` answers `null` for an absent path. It
+    // short-circuits to `false`, so the claim IS the only pin and clearing it
+    // is what makes the directory reclaimable. That assertion passed only
+    // because the `pinned()` oracle above carried the same false belief.
     prepareSession('sess-outbound-only');
     seedProcessingClaim('sess-outbound-only', 'm-claimed');
     dropInbound('sess-outbound-only');
     sessionRows.value = [{ id: 'sess-outbound-only', agent_group_id: AGENT_GROUP_ID }];
 
+    expect(pinned('sess-outbound-only')).toBe(true); // pinned by the claim, before
+
     await drainClosedSessionPendingBacklog(SESSIONS_ROOT);
 
     expect(outboundState('sess-outbound-only').claims).toBe(0);
-    expect(pinned('sess-outbound-only')).toBe(true);
+    expect(pinned('sess-outbound-only')).toBe(false); // and released, after
   });
 
   it('leaves an outbound-only session alone when a container owns it', async () => {
