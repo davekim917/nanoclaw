@@ -723,6 +723,11 @@ export const SWEEP_DUTY_INVENTORY: Readonly<Record<string, string>> = {
   T21: 'claims-self-heal',
   T22: 'orphaned-repo-fence-release',
   T23: 'cli-request-execution-prune',
+  // Fork addition (2026-09-07): a recurring task whose agent turn keeps erroring
+  // used to fail forever in silence — every occurrence row read `completed`, so
+  // the recurrence streak in `recurrence.ts` never engaged. Body in
+  // `src/modules/sweep-task-escalation/index.ts`.
+  T24: 'task-failure-escalation',
   // Fork addition, not part of the upstream seam-2 port: by-reference GitHub
   // credential delivery (src/github-token-file.ts). Kept in this inventory
   // so the registration drift guard in host-sweep-registry.test.ts stays an

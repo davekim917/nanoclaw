@@ -381,6 +381,9 @@ import { _resetPostKillForTesting, _settlePostKillForTesting } from './modules/s
 // without it R-7's inventory is four registrations short and R-10's W2 branch
 // has nothing to make a session due.
 import './modules/sweep-scheduling/index.js';
+// Registers T24 (task-failure-escalation) as its own duty source at import
+// time; without this line R-7's inventory is one registration short.
+import './modules/sweep-task-escalation/index.js';
 import { log } from './log.js';
 // Family module side-effect import (S2-PR7): registers T11
 // (scheduled-move-recovery) and T12 (audit-body-prune) as a duty source, so
@@ -1150,10 +1153,13 @@ describe('sweep duty registry (S2-PR2)', () => {
    * work (issue #273's at-most-once ncl ledger). Both are tracked in
    * `coordination-orphans` (tick:housekeeping, 130) is the third, from seam 4
    * series A' (issue #430): the coordination tables gained writers and a write
-   * that lands after session teardown leaves an orphan row behind. All three
-   * are tracked in SWEEP_DUTY_INVENTORY (as FORK1, T23 and FORK2) alongside
-   * the 38 seam-2-ported duties, so the set below stays an exact accounting of
-   * every registered duty — ported or not.
+   * that lands after session teardown leaves an orphan row behind.
+   * `task-failure-escalation` (tick:housekeeping, 135) is the fourth
+   * (2026-09-07): a recurring task whose agent turn keeps erroring reached
+   * nobody, because every failing occurrence was still recorded `completed`.
+   * All four are tracked in SWEEP_DUTY_INVENTORY (as FORK1, T23, FORK2 and
+   * T24) alongside the 38 seam-2-ported duties, so the set below stays an
+   * exact accounting of every registered duty — ported or not.
    */
   const EXPECTED_REGISTRATIONS: Array<[string, string, string, number]> = [
     ['duty', 'egress-network-reheal', 'tick:pre-session', 10],
@@ -1194,6 +1200,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     ['duty', 'claims-self-heal', 'tick:housekeeping', 110],
     ['duty', 'dashboard-token-prune', 'tick:housekeeping', 120],
     ['duty', 'coordination-orphans', 'tick:housekeeping', 130],
+    ['duty', 'task-failure-escalation', 'tick:housekeeping', 135],
     ['sla-observation-hook', 'container-oom-notice', 'sla-observation-hook', 10],
     ['kill-follow-up', 'kill-ceiling-notice', 'kill-follow-up', 10],
     ['kill-follow-up', 'orphan-claim-reset', 'kill-follow-up', 20],
@@ -1221,15 +1228,16 @@ describe('sweep duty registry (S2-PR2)', () => {
     // Surface, name, phase AND order, in run order — a swap anywhere fails.
     expect(actual).toEqual(EXPECTED_REGISTRATIONS);
 
-    // 42 registrations: the 39 from the seam-2 port (38 unique names, one
-    // registered twice — see below) plus three fork additions,
-    // github-token-file-refresh, cli-request-execution-prune and
-    // coordination-orphans (seam 4 series A', issue #430).
-    expect(actual).toHaveLength(42);
+    // 43 registrations: the 39 from the seam-2 port (38 unique names, one
+    // registered twice — see below) plus four fork additions,
+    // github-token-file-refresh, cli-request-execution-prune,
+    // coordination-orphans (seam 4 series A', issue #430) and
+    // task-failure-escalation.
+    expect(actual).toHaveLength(43);
     const names = new Set(actual.map((r) => r[1]));
-    expect(names.size).toBe(41);
+    expect(names.size).toBe(42);
     expect(names).toEqual(new Set(Object.values(SWEEP_DUTY_INVENTORY)));
-    expect(Object.keys(SWEEP_DUTY_INVENTORY)).toHaveLength(41);
+    expect(Object.keys(SWEEP_DUTY_INVENTORY)).toHaveLength(42);
     // The one duty registered twice is the orphan-claim reset: once in the tail
     // window, once as the post-kill follow-up (rev-3 grounding §2, S17).
     expect(actual.filter((r) => r[1] === SWEEP_DUTY_INVENTORY.S17)).toHaveLength(2);
@@ -1505,7 +1513,15 @@ describe('sweep duty registry (S2-PR2)', () => {
     // that has since been replaced. No duty body moves here — the three
     // structural assertions above are unchanged — and 1,456 leaves the same
     // tight 4-line headroom the 1,450 ceiling had.
-    expect(source.split('\n').length).toBeLessThanOrEqual(1460);
+    //
+    // **Raised 1,460 → 1,462 by T24 (task-failure-escalation).** Measured to
+    // the line and deliberately leaving ZERO headroom: the whole addition is
+    // one `SWEEP_DUTY_INVENTORY` entry plus the four-line provenance comment
+    // every fork duty in that inventory carries (FORK1, FORK2, T23), against
+    // two lines this file's own count had spare. The duty BODY is in
+    // `src/modules/sweep-task-escalation/index.ts`, which is the property the
+    // three structural assertions above pin and the reason this number exists.
+    expect(source.split('\n').length).toBeLessThanOrEqual(1462);
     expect(h.spawns).toEqual([]);
   });
 
@@ -1612,21 +1628,22 @@ describe('sweep duty registry (S2-PR2)', () => {
     ];
 
     expect(actual).toEqual(EXPECTED_REGISTRATIONS);
-    // 42 registrations over 41 names. The seam-2 port is 38 duties in 39
+    // 43 registrations over 42 names. The seam-2 port is 38 duties in 39
     // registrations — S17 is the only one registered twice, once as a
-    // session:health duty and once as the post-kill follow-up — plus the three
+    // session:health duty and once as the post-kill follow-up — plus the four
     // fork duties the upstream seam does not have: T23
     // `cli-request-execution-prune` (#285), FORK1
     // `github-token-file-refresh` (#247) and FORK2 `coordination-orphans`
-    // (#430), all three from `sweep-central`. The numbers here said 39/38/38
-    // from before those landed; the tuple comparison above was already right,
-    // which is why it never failed.
-    expect(actual).toHaveLength(42);
+    // (#430), all three from `sweep-central`, and T24
+    // `task-failure-escalation` from `sweep-task-escalation`. The numbers here
+    // said 39/38/38 from before those landed; the tuple comparison above was
+    // already right, which is why it never failed.
+    expect(actual).toHaveLength(43);
     const names = new Set(actual.map((r) => r[1]));
-    expect(names.size).toBe(41);
+    expect(names.size).toBe(42);
     // The inventory comes from the same fresh instance, not this file's binding.
     expect(names).toEqual(new Set(Object.values(hs.SWEEP_DUTY_INVENTORY)));
-    expect(Object.keys(hs.SWEEP_DUTY_INVENTORY)).toHaveLength(41);
+    expect(Object.keys(hs.SWEEP_DUTY_INVENTORY)).toHaveLength(42);
     expect(actual.filter((r) => r[1] === hs.SWEEP_DUTY_INVENTORY.S17)).toHaveLength(2);
     expect(h.spawns).toEqual([]);
   });

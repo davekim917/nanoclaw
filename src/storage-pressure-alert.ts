@@ -1,7 +1,5 @@
-import { getDb } from './db/connection.js';
-import { getDeliveryAdapter } from './delivery.js';
 import { log } from './log.js';
-import { ensureUserDm } from './modules/permissions/user-dm.js';
+import { notifyOperators } from './operator-alert.js';
 import type { StorageReport } from './storage-manager.js';
 
 const ALERT_REPEAT_MS = 6 * 60 * 60 * 1000;
@@ -57,52 +55,10 @@ export async function handleStoragePressureAlert(report: StorageReport, now = Da
   pressureEpisodeActive = true;
   if (!repeatDue) return;
 
-  const adapter = getDeliveryAdapter();
-  if (!adapter) {
-    log.warn('storage-manager: cannot deliver pressure alert; delivery adapter unavailable');
-    return;
-  }
-
-  let recipients: Array<{ user_id: string }>;
-  try {
-    recipients = await getDb().all<{ user_id: string }>(
-      `SELECT user_id, MIN(CASE role WHEN 'owner' THEN 0 ELSE 1 END) AS priority
-           FROM user_roles
-          WHERE role = 'owner'
-             OR (role = 'admin' AND agent_group_id IS NULL)
-          GROUP BY user_id
-          ORDER BY priority, user_id`,
-    );
-  } catch (err) {
-    log.warn('storage-manager: cannot resolve pressure alert recipients', { err });
-    return;
-  }
-
-  const text = alertText(report);
-  let delivered = 0;
-  // One alert through ONE bot. The owner typically holds a distinct user_id
-  // per platform instance, so delivering to every owner/admin row fanned the
-  // SAME text out through every wired bot (observed live: one pressure
-  // episode -> a DM from every agent). Recipients are ordered owner-first;
-  // later rows are failover only.
-  for (const recipient of recipients) {
-    try {
-      const dm = await ensureUserDm(recipient.user_id);
-      if (!dm) {
-        log.warn('storage-manager: pressure alert administrator is unreachable', { userId: recipient.user_id });
-        continue;
-      }
-      await adapter.deliver(dm.channel_type, dm.platform_id, null, 'chat', JSON.stringify({ text }));
-      delivered += 1;
-      break;
-    } catch (err) {
-      log.warn('storage-manager: pressure alert delivery failed', { userId: recipient.user_id, err });
-    }
-  }
-  if (delivered > 0) lastAlertMs = now;
-  if (recipients.length === 0) {
-    log.warn('storage-manager: no owner or global administrator available for pressure alert');
-  }
+  // Recipient resolution, owner-first ordering and the one-bot rule live in
+  // `operator-alert.ts` — the same seam the scheduled-task failure escalation
+  // uses, so a change to how the host reaches a human happens in one place.
+  if (await notifyOperators(alertText(report), { source: 'storage-manager' })) lastAlertMs = now;
 }
 
 export function _resetStoragePressureAlertForTesting(): void {
