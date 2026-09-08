@@ -30,6 +30,7 @@ import {
 } from '../../host-sweep.js';
 import { log } from '../../log.js';
 import { admitDueTaskContexts } from '../../session-manager.js';
+import { expireClosedSessionWork } from '../../session-close-expiry.js';
 import type { NanoclawMailboxSession } from '../mailbox/index.js';
 import { runHostGatedTaskScripts } from '../scheduling/host-script.js';
 
@@ -197,6 +198,22 @@ export function registerSchedulingSweepDuties(): void {
           return;
         }
         await updateSession(session.id, { status: 'closed' });
+        // The ONLY active->closed transition on the host, and therefore the
+        // whole of #520's leak: `expireStalePending` runs as duty S3 inside a
+        // loop over ACTIVE sessions, so anything still `pending` here is out
+        // of its reach the moment the row above flips, and pins the session
+        // directory against reclaim forever via `sessionHasOpenWork`.
+        //
+        // Ordered AFTER the close, not before: the close is what makes the
+        // expiry correct, so a failed `updateSession` must leave the rows
+        // live. A crash in the gap is repaired by
+        // `drainClosedSessionPendingBacklog` at the next boot. Nothing can
+        // insert into this inbound in the gap — `findSessionForAgent` matches
+        // active rows only. Uses the sweep's OWN session, never a second one
+        // on the same key (constraint 18, invariant I-3). The outbound half of
+        // the release carries its own stopped-container check inside the
+        // helper — see `expireClosedSessionWork`.
+        expireClosedSessionWork(mailbox!, session, 'spent-task-session-gc');
         log.info('Closed spent task session', { sessionId: session.id, threadId: session.thread_id });
       }
     },
