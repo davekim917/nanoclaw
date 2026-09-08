@@ -41,6 +41,23 @@ class RecordingProvider extends MockProvider {
   }
 }
 
+/**
+ * A provider that RESOLVES an absent model the way the real one does, and
+ * exposes the result as `resolvedModel`.
+ *
+ * `GROUP_DEFAULT` stands in for whatever the group's configuration resolves
+ * to — `stickyConfig.model ?? ANTHROPIC_DEFAULT_OPUS_MODEL` inside the real
+ * provider. The poll loop cannot compute that, which is the whole reason it
+ * has to read the value back rather than record what it asked for.
+ */
+const GROUP_DEFAULT = 'claude-sonnet-5';
+class ResolvingProvider extends MockProvider {
+  query(input: QueryInput): AgentQuery {
+    const q = super.query(input);
+    return { ...q, resolvedModel: input.model ?? GROUP_DEFAULT };
+  }
+}
+
 beforeEach(() => {
   initTestSessionDb();
   getInboundDb()
@@ -244,5 +261,48 @@ describe('a pure task wake does not inherit the interactive sticky', () => {
 
     expect(getStickyModel()).toBe('claude-opus-5[1m]');
     expect(provider.inputs[1].model).toBe('claude-opus-5[1m]');
+  });
+});
+
+describe('the run-outcome ledger records the model that actually ran', () => {
+  it("an unpinned task's OPENING fire records the resolved model, not NULL", async () => {
+    // Round-3 finding. The live-stream path learned its resolved model in
+    // round 2, but the OPENING turn never calls applySettings — so nothing
+    // resolved the value there and `modelInForce` stayed the `undefined` the
+    // loop had requested. `autoAppendTaskLog` then omits the key entirely
+    // (`...(model ? { model } : {})`), so the fire lands in the ledger with no
+    // model at all.
+    //
+    // That is the blind spot #549 and #561 were built to close, reopened for
+    // exactly the unpinned series this change moves onto the group default.
+    // Asserted on the ledger row, not on the in-memory outcome.
+    insertTask('t-ledger', { prompt: 'nightly digest' });
+    const provider = new ResolvingProvider({}, () => '<message to="discord-test">done</message>');
+
+    await runUntilQueried(provider as unknown as RecordingProvider);
+
+    const taskLogs = getUndeliveredMessages()
+      .filter((m) => m.kind === 'task_log')
+      .map((m) => JSON.parse(m.content) as { text: string; model?: string });
+
+    expect(taskLogs.length).toBeGreaterThan(0);
+    // Pre-fix: undefined — the key is absent from the row.
+    expect(taskLogs[0]!.model).toBe(GROUP_DEFAULT);
+  });
+
+  it('a task pin is still what gets recorded when there is one', async () => {
+    // The resolver must not overwrite a real per-turn model with the default.
+    insertTask('t-ledger-pinned', {
+      prompt: 'weekly build',
+      flagIntent: { turnModel: 'claude-fable-5-1[1m]' },
+    });
+    const provider = new ResolvingProvider({}, () => '<message to="discord-test">done</message>');
+
+    await runUntilQueried(provider as unknown as RecordingProvider);
+
+    const taskLogs = getUndeliveredMessages()
+      .filter((m) => m.kind === 'task_log')
+      .map((m) => JSON.parse(m.content) as { model?: string });
+    expect(taskLogs[0]!.model).toBe('claude-fable-5-1[1m]');
   });
 });

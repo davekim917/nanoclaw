@@ -1559,7 +1559,12 @@ export async function processQuery(
   // snapshot goes stale mid-turn. An escalation that named the snapshot would
   // diagnose the OLD pin as the failing model, which is the one fact the alert
   // exists to get right (Codex round 2).
-  let modelInForce = querySettings.model;
+  // Attribution reads the PROVIDER's resolved model, never what was requested.
+  // `querySettings.model` is undefined for an unpinned pure task fire — that
+  // absence means "the group default", and only the provider can say what it
+  // resolved to. Recording the request wrote NULL to task_run_outcomes for
+  // exactly the fires this change reroutes.
+  let modelInForce = query.resolvedModel ?? querySettings.model;
   /**
    * What the live stream is ACTUALLY set to. `querySettings` is the immutable
    * creation snapshot, so once a live settings change lands it stops
@@ -1831,16 +1836,10 @@ export async function processQuery(
             return;
           }
           try {
-            const applied = await query.applySettings({
-              model: fb.model,
-              effort: fb.effort,
-              ultracode: fb.ultracode,
-            });
-            // Applied in place, same stream. Attribute to what the provider
-            // says it RESOLVED to, not to what we asked for: `fb.model` is
-            // undefined for a suppressed task fire, and recording that would
-            // lose the model on exactly the turns this change reroutes.
-            modelInForce = applied?.model ?? fb.model;
+            await query.applySettings({ model: fb.model, effort: fb.effort, ultracode: fb.ultracode });
+            // Same read as at creation — one source, so a retarget and an open
+            // cannot disagree about what ran.
+            modelInForce = query.resolvedModel ?? fb.model;
             // The stream has moved; the comparison baseline moves with it, or
             // the next batch is measured against a snapshot that no longer
             // describes anything.

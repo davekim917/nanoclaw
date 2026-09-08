@@ -331,11 +331,30 @@ export interface AgentQuery {
    * can't be expressed live (e.g. the effortLevel control has no 'max') so
    * the caller can use the same fallback.
    */
-  applySettings?(settings: {
-    model?: string;
-    effort?: string;
-    ultracode?: boolean;
-  }): Promise<{ model?: string } | void>;
+  applySettings?(settings: { model?: string; effort?: string; ultracode?: boolean }): Promise<void>;
+
+  /**
+   * The model this query is ACTUALLY running, resolved by the provider.
+   *
+   * THE single source for usage attribution, and the reason it lives on the
+   * query rather than being returned from the calls that change it: a caller
+   * passes `model: undefined` meaning "the group default" and cannot resolve
+   * that itself — `stickyConfig.model` (a group's `providerConfig.model`)
+   * outranks `ANTHROPIC_DEFAULT_OPUS_MODEL` and is invisible outside the
+   * provider. `illysium-argus` sets exactly that and has a live unpinned
+   * series, so a caller-side guess would mis-attribute a real production task.
+   *
+   * Reading it from the query covers every path by construction: creation
+   * sets it, `applySettings` updates it, and a NEW path cannot forget to
+   * report because there is nothing to report — the caller reads. Recording
+   * absence instead is what put a NULL model on unpinned fires in
+   * `task_run_outcomes`, the "can't tell what actually ran" hole #549 and
+   * #561 exist to close.
+   *
+   * Optional only so a provider without per-query model selection can omit
+   * it; callers fall back to what they requested.
+   */
+  readonly resolvedModel?: string;
 }
 
 /**

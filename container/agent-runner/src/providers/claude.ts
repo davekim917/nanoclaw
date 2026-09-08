@@ -2879,6 +2879,12 @@ export class ClaudeProvider implements AgentProvider {
       push: (msg) => stream.push(msg),
       end: () => stream.end(),
       events: translateEvents(),
+      // Live view of `activeModel`, which is the resolved creation model and
+      // is reassigned by applySettings. A getter rather than a snapshot so
+      // creation and mid-stream retarget cannot report different things.
+      get resolvedModel() {
+        return activeModel;
+      },
       abort: () => {
         aborted = true;
         stream.end();
@@ -2939,12 +2945,6 @@ export class ClaudeProvider implements AgentProvider {
           `applySettings (live): model=${activeModel} effort=${clamped ?? '(none)'}` +
             `${s.ultracode !== undefined ? ` ultracode=${s.ultracode}` : ''}`,
         );
-        // Report what the stream is ACTUALLY on. The caller cannot derive it:
-        // it passed `undefined` meaning "the default" and only this provider
-        // knows what that resolves to. Without this the turn-usage ledger
-        // recorded the model as unknown for exactly the suppressed task fires
-        // this change exists to route correctly.
-        return { model: activeModel };
       },
     };
   }

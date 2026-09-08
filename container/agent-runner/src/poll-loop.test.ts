@@ -3003,14 +3003,20 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     // group default (what the host exported as ANTHROPIC_DEFAULT_OPUS_MODEL),
     // and the resolved value is reported back so usage can be attributed.
     const setTo: Array<string | undefined> = [];
+    // Stands in for the provider: absence resolves to the group default, and
+    // the resolved value is exposed as `resolvedModel` — the single source the
+    // caller reads, at creation and after every retarget alike.
+    let resolved = 'claude-opus-5[1m]';
     const query: AgentQuery = {
       push: () => {},
       end: () => {},
       abort: () => {},
       applySettings: async (sIn) => {
-        const resolved = sIn.model ?? 'claude-sonnet-5';
+        resolved = sIn.model ?? 'claude-sonnet-5';
         setTo.push(resolved);
-        return { model: resolved };
+      },
+      get resolvedModel() {
+        return resolved;
       },
       events: events(),
     };
@@ -3063,7 +3069,6 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
       abort: () => {},
       applySettings: async (sIn) => {
         efforts.push(sIn.effort);
-        return { model: sIn.model ?? 'claude-sonnet-5' };
       },
       events: events(),
     };
