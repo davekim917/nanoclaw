@@ -11,7 +11,16 @@ import { pathToFileURL } from 'url';
 import { activateAgentRunnerSource, pruneAgentRunnerSnapshots } from './agent-runner-source.js';
 import { backfillContainerConfigs } from './backfill-container-configs.js';
 import { markDeployBootHealthy } from './deploy-crash-guard.js';
-import { formatBuildInfoLog, readBuildInfo } from './build-info.js';
+import {
+  changedPathsBetween,
+  commitCountBetween,
+  describeBuildDrift,
+  formatBuildInfoLog,
+  isMaterialDrift,
+  isMaterialPath,
+  readBuildInfo,
+  readCheckoutHead,
+} from './build-info.js';
 import { DATA_DIR, HOST_LEASE_TTL_MS, REPO_ROOT } from './config.js';
 import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
@@ -28,6 +37,7 @@ import {
 import type { ChannelNameSource, MessagingGroupUpdates } from './db/messaging-groups.js';
 import { ensureContainerRuntimeRunning } from './container-runtime.js';
 import { warnActiveContainersOfShutdown, warnMarkedRunningSessionsOfStartup } from './host-restart-warn.js';
+import { notifyOwner } from './notify-owner.js';
 import { requestWake } from './request-wake.js';
 import { getActiveSessions, resetPhantomContainerStatus } from './db/sessions.js';
 import { resetProcessingChannelIngress } from './db/channel-ingress-receipts.js';
@@ -81,6 +91,118 @@ import { getResponseHandlers, getShutdownCallbacks, type ResponsePayload } from 
 // Aborted as the first shutdown action so `HostStartContext.signal` carries real
 // semantics for any module that registers a start callback.
 export const hostAbortController = new AbortController();
+
+/**
+ * Dedupe marker for the boot-time build-drift alert (see the drift check in
+ * `main()`, below). Mirrors the small-JSON-state-file idiom already used for
+ * boot-time markers (`daily-summary.ts`'s STATE_PATH, `deploy-crash-guard.ts`'s
+ * attempts/manifest files): a marker under `data/` (gitignored), read/write
+ * wrapped so a corrupt or unwritable file degrades to "alert again" rather
+ * than blocking boot. Holds just the last-alerted (buildSha, headSha) pair —
+ * nothing else is needed to decide "have we already told the owner about
+ * this exact drift".
+ */
+interface BuildDriftAlertState {
+  buildSha: string;
+  headSha: string;
+}
+
+const BUILD_DRIFT_ALERT_STATE_PATH = path.join(DATA_DIR, 'build-drift-alert.json');
+
+/** Never throws — a corrupt or missing marker reads as "no prior alert". */
+function readBuildDriftAlertState(): BuildDriftAlertState | null {
+  try {
+    return JSON.parse(fs.readFileSync(BUILD_DRIFT_ALERT_STATE_PATH, 'utf8')) as BuildDriftAlertState;
+  } catch {
+    return null;
+  }
+}
+
+/** Best-effort; never throws. A failed write just means the next boot re-alerts. */
+function writeBuildDriftAlertState(state: BuildDriftAlertState): void {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(BUILD_DRIFT_ALERT_STATE_PATH, JSON.stringify(state, null, 2) + '\n');
+  } catch (err) {
+    log.warn('build-drift: could not write dedupe marker (may re-alert next boot)', { err: String(err) });
+  }
+}
+
+/**
+ * Boot-time build-drift check: does the running build match the checkout?
+ * Never throws and never blocks boot — a stale build is wrong, not unsafe,
+ * and a refusal here would take the fleet down for it. See describeBuildDrift
+ * (build-info.ts) for what "drift" means and why it matters more than plain
+ * staleness (agent-runner source activates on a restart; host src/ does not).
+ *
+ * Dedupe: a crash-looping host would otherwise DM the owner every boot for
+ * the same stale build, so the owner is only messaged again once the
+ * (buildSha, headSha) pair actually changes from the last recorded alert.
+ * The WARN log line, by contrast, is unconditional on every drifted boot —
+ * it costs nothing and belongs in the logs every time.
+ */
+async function checkBuildDrift(buildInfo: ReturnType<typeof readBuildInfo>): Promise<void> {
+  try {
+    const headSha = readCheckoutHead(REPO_ROOT);
+    const drift = describeBuildDrift(buildInfo, headSha);
+    if (!drift) return;
+
+    // The WARN is unconditional: the mismatch is true and the log is cheap.
+    log.warn(drift.msg, drift.data);
+
+    const buildSha = buildInfo!.sha;
+    const head = headSha!;
+
+    // The DM is not. This checkout is pulled through the day without a rebuild
+    // always following, so a sha mismatch is the normal state — DMing on every
+    // one would fire on nearly every boot, and an alert that noisy gets muted.
+    // A null diff means git could not tell us; treat that as material and
+    // alert, because an unreadable diff is not evidence of safety.
+    const changed = changedPathsBetween(REPO_ROOT, buildSha, head);
+    if (changed !== null && !isMaterialDrift(changed)) {
+      log.info('build-drift: stale build, but nothing compiled into dist/ differs — not alerting', {
+        buildSha,
+        headSha: head,
+        changedFiles: changed.length,
+      });
+      return;
+    }
+    const materialPaths = (changed ?? []).filter(isMaterialPath);
+    const commitCount = changed === null ? null : commitCountBetween(REPO_ROOT, buildSha, head);
+
+    const prior = readBuildDriftAlertState();
+    if (prior && prior.buildSha === buildSha && prior.headSha === head) return; // already alerted this pair
+
+    const result = await notifyOwner({
+      title: 'Host is running a stale build',
+      body:
+        `The running host is executing build ${buildInfo!.shortSha} (${buildSha}), an older build than the ` +
+        `checkout's current HEAD ${head.slice(0, 7)} (${head}).\n\n` +
+        (changed === null
+          ? 'Could not diff the two commits (the built sha may have been rebased away, or git failed) — alerting ' +
+            'out of caution, since an unreadable diff is not evidence the drift is harmless.\n\n'
+          : `${commitCount !== null ? `${commitCount} commit(s)` : 'an unknown number of commits'} of drift, ` +
+            `including ${materialPaths.length} compiled file(s) that differ: ` +
+            `${materialPaths.slice(0, 3).join(', ')}${materialPaths.length > 3 ? ', …' : ''}.\n\n`) +
+        'A restart alone will not fix this — restart does not rebuild. Run the build and restart — e.g. ' +
+        '`scripts/deploy.sh`, or pull + `pnpm run build` + a host restart.\n\n' +
+        'Note: a plain restart DOES re-snapshot agent-runner source from the working tree while host src/ does ' +
+        'not — so although the two halves are consistent right now, the NEXT restart risks splitting them: newer ' +
+        'agent-runner code running against this older host build.',
+    });
+    if (result.code === 0) {
+      // Only a verified delivery is recorded. Stamping the marker before the
+      // send would remember a FAILED alert as sent and never retry it — the
+      // same false-receipt defect that muted host alerting for three days
+      // (fork #538, PR #556).
+      writeBuildDriftAlertState({ buildSha, headSha: head });
+    } else {
+      log.warn('build-drift: could not DM the owner', { code: result.code, message: result.message });
+    }
+  } catch (err) {
+    log.warn('build-drift: check failed, continuing boot', { err: err instanceof Error ? err.message : String(err) });
+  }
+}
 
 async function dispatchResponse(payload: ResponsePayload): Promise<void> {
   for (const handler of getResponseHandlers()) {
@@ -459,6 +581,18 @@ export async function main(): Promise<void> {
 
   // 0. Circuit breaker — backoff on rapid restarts
   await enforceStartupBackoff();
+
+  // Does the running build match the checkout? WARNs and DMs the owner on
+  // drift; never blocks boot (see checkBuildDrift's own doc comment).
+  //
+  // Deliberately below both gates above, not beside the provenance log it
+  // reads. It sends an outbound DM and writes a shared dedupe marker, which
+  // is exactly the "startup work that can mutate shared state" the ownership
+  // claim exists to fence: two hosts racing to start would otherwise both
+  // alert and both write the marker before one of them is rejected. Running
+  // after the circuit breaker also means a crash-looping host is throttled
+  // before it can message anyone.
+  await checkBuildDrift(buildInfo);
 
   // 0a. Load .env into process.env (for secrets not injected by the shell,
   //     like ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY which determine whether

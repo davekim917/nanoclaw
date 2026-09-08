@@ -15,8 +15,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const posts: { token: string; channel: string; text: string }[] = [];
 let slackBehavior: 'ok' | 'ok-false' | 'network-error' = 'ok';
 
-vi.mock('../src/channels/slack-lib.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../src/channels/slack-lib.js')>();
+vi.mock('./channels/slack-lib.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./channels/slack-lib.js')>();
   return {
     ...actual,
     slackPostMessage: vi.fn(async (token: string, channel: string, text: string) => {
@@ -32,7 +32,7 @@ vi.mock('../src/channels/slack-lib.js', async (importOriginal) => {
 });
 
 import { notifyOwner } from './notify-owner.js';
-import { formatLocalStamp } from '../src/timezone.js';
+import { formatLocalStamp } from './timezone.js';
 
 // A slug that cannot collide with a real bot token in any environment this
 // suite runs in — botTokenKeyForChannelType derives SLACK_BOT_TOKEN_<SUFFIX>
@@ -41,7 +41,7 @@ const CHANNEL_TYPE = 'slack-notifyownertest';
 const TOKEN_KEY = 'SLACK_BOT_TOKEN_NOTIFYOWNERTEST';
 const FAKE_TOKEN = 'xoxb-test-fake-token-do-not-use';
 
-describe('scripts/notify-owner.ts', () => {
+describe('src/notify-owner.ts', () => {
   let rootDir: string;
   let dataDir: string;
   let dbPath: string;
