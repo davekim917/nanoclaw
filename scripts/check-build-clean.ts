@@ -75,29 +75,46 @@ function pathsForLine(line: string): string[] {
 }
 
 /**
- * A stray build-artifact directory left beside `dist/` by a hand-run deploy.
+ * Stray build-artifact directories left beside `dist/` by a hand-run deploy.
  *
  * `scripts/deploy.sh` snapshots the live build for rollback as `dist.pre-deploy/`
  * and `node_modules.pre-deploy/` (plus the `.failed/` pair), and all four are
  * gitignored — so a sanctioned snapshot never reaches `git status` at all.
- * Anything of that shape that DOES reach it was therefore created by hand, and
- * because those names are timestamped they can never be matched by a gitignore
- * rule either.
+ * Anything of that shape that DOES reach it was created by hand, and because
+ * those names are timestamped they can never be matched by a gitignore rule
+ * either.
  *
- * This is worth naming separately because the generic "commit or stash" remedy
- * is wrong for it and `BUILD_ALLOW_DIRTY=1` is actively dangerous: on
- * 2026-09-07 a hand-rolled `dist.pre-<label>-<timestamp>/` blocked every build
- * on the host for four hours across three sessions, while two restarts ran and
- * silently left the service on stale compiled code. The refusal was correct;
- * nobody could tell from it what to do.
+ * Worth naming separately because the generic "commit or stash" remedy is wrong
+ * for it and `BUILD_ALLOW_DIRTY=1` is actively dangerous: on 2026-09-07 a
+ * hand-rolled `dist.pre-<label>-<timestamp>/` blocked every build on the host
+ * for four hours across three sessions, while two restarts ran and silently left
+ * the service on stale compiled code. The refusal was correct; nobody could tell
+ * from it what to do.
+ *
+ * Classification is grounded in the filesystem rather than the path string,
+ * because the string alone cannot decide it in either direction:
+ *
+ * - Under `status.showUntrackedFiles=all` git expands an untracked directory
+ *   into per-file entries (`?? dist.pre-label/index.js`), so there is no
+ *   trailing-slash directory entry to match. Taking the first path segment
+ *   collapses those back to the one directory worth naming.
+ * - A regular root file such as `dist.config.ts` has the same shape as a
+ *   snapshot in porcelain output. Telling an operator to delete their source
+ *   file would be worse advice than the generic message this replaces, so a
+ *   real `isDirectory` check is the thing that separates them.
+ *
+ * Returns the deduped, sorted directory names — not the paths that led to them.
  */
-export function isStrayBuildArtifactPath(filePath: string): boolean {
-  const [head, ...rest] = filePath.split('/');
-  // Root-level only: `src/dist.foo` is somebody's source file, not a snapshot.
-  if (head === undefined) return false;
-  if (rest.length > 1) return false;
-  if (rest.length === 1 && rest[0] !== '') return false; // a file *inside* it, not the dir
-  return /^(?:dist|node_modules)\./.test(head);
+export function strayBuildArtifactDirs(paths: string[], isDirectory: (relPath: string) => boolean): string[] {
+  const dirs = new Set<string>();
+  for (const p of paths) {
+    const head = p.split('/').filter((seg) => seg !== '')[0];
+    if (head === undefined) continue;
+    if (!/^(?:dist|node_modules)\./.test(head)) continue;
+    if (!isDirectory(head)) continue;
+    dirs.add(head);
+  }
+  return [...dirs].sort();
 }
 
 export interface DirtPartition {
@@ -397,7 +414,13 @@ export function runCheckBuildClean(options: CheckBuildCleanOptions = {}): number
         log.error('Dirty paths (git status --porcelain):');
         for (const f of blocking) log.error(`  ${f}`);
 
-        const strays = pathsForLines(blocking).filter(isStrayBuildArtifactPath);
+        const strays = strayBuildArtifactDirs(pathsForLines(blocking), (rel) => {
+          try {
+            return fs.statSync(path.join(REPO_ROOT, rel)).isDirectory();
+          } catch {
+            return false; // vanished between status and here — not our business
+          }
+        });
         if (strays.length > 0) {
           log.error('\nStray build snapshots (left by a hand-run deploy, NOT by scripts/deploy.sh):');
           for (const f of strays) log.error(`  ${f}`);
