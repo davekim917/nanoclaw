@@ -53,9 +53,20 @@ next spawn, and the enabler run is just a verification pass.
    > you named, and it has a delete pass.** Any skill directory carrying
    > `.nanoclaw-managed` whose source plugin no longer exists under `~/plugins` is
    > removed and does not come back — there is nothing left to re-sync it from.
-   > Before running, list what would go:
-   > `ls ~/.local/share/opencode-*/skill ~/.config/opencode/skill` and check every
-   > entry still has a live `~/plugins/<name>`. Copy anything orphaned aside first.
+   > **You cannot tell from the mirror which entries would go.** A mirrored skill
+   > directory carries only a copied `SKILL.md` and a constant `.nanoclaw-managed`
+   > marker — no source path — so listing it identifies neither the supplying plugin
+   > nor the orphans. Preserve every managed entry instead:
+   >
+   > ```bash
+   > for d in ~/.local/share/opencode-*/skill ~/.config/opencode/skill; do
+   >   [ -d "$d" ] && cp -a "$d" "$d.pre-sync-$(date +%Y%m%dT%H%M%S)"
+   > done
+   > ```
+   >
+   > Then diff after the run to see what the sync removed, and restore anything you
+   > still want by re-cloning its plugin into `~/plugins` — a copy-back alone will be
+   > pruned again on the next sync.
    > Scoped mirrors (`~/.local/share/opencode-<group>/`) exist only for groups with
    > their own `auth.json`; the rest share the global dir.
 
@@ -94,12 +105,24 @@ next spawn, and the enabler run is just a verification pass.
    pnpm exec tsx scripts/enable-agent-plugin.ts <name>
    ```
 
-5. **Per-provider opt-out (`--deny` / `--allow`).** Separate from group exclusion:
-   these mutate `~/plugins/<name>/.nanoclaw-plugin.json` (`{ "denySiblings": [...] }`),
-   read by `readPluginDenySiblings` and applied inside `discoverPortableSkills`, so a
-   plugin can be withheld from one provider while staying on the others. Use when a
-   plugin is right for Claude but wrong for Codex/OpenCode, rather than excluding
-   whole groups:
+5. **Per-provider SKILLS denial (`--deny` / `--allow`).** These mutate
+   `~/plugins/<name>/.nanoclaw-plugin.json` (`{ "denySiblings": [...] }`), read by
+   `readPluginDenySiblings` inside `discoverPortableSkills`. Two limits make this
+   narrower than "per-provider opt-out", and both bite silently:
+
+   - **It withholds SKILLS ONLY, never an always-on ruleset.** `composeGroupClaudeMd`
+     consults the group's `excludePlugins` and nothing else (`src/claude-md-compose.ts:167`)
+     — it does not read `denySiblings`. A denied mode plugin keeps injecting its
+     behavioural rules into that provider after restart. To withhold the ruleset too,
+     use `excludePlugins`.
+   - **`--deny claude` does nothing.** The Claude mount assembly checks only
+     `containerConfig.excludePlugins` (`src/container-runner.ts:4753-4767`) and never
+     reads the marker, so the plugin stays mounted and auto-loads via
+     `CLAUDE_PLUGINS_ROOT` — the more so after step 2 generated its Claude manifest.
+     Use `excludePlugins` for Claude.
+
+   So reach for it only to keep a plugin's skills off Codex/OpenCode while leaving
+   Claude alone:
 
    ```bash
    pnpm exec tsx scripts/enable-agent-plugin.ts <name> --deny opencode
