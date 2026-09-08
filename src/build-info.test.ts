@@ -11,6 +11,7 @@ import {
   describeBuildDrift,
   formatBuildInfoLog,
   isMaterialDrift,
+  isMaterialPath,
   readBuildInfo,
   readCheckoutHead,
 } from './build-info.js';
@@ -211,5 +212,32 @@ describe('changedPathsBetween / commitCountBetween', () => {
 
   it('commitCountBetween returns null (never throws) for an unreachable sha', () => {
     expect(commitCountBetween(repoRoot, 'f'.repeat(40), 'HEAD')).toBeNull();
+  });
+});
+
+describe('isMaterialPath — generated runtime artifacts', () => {
+  it('treats dashboard sources as material (they build dist/dashboard-spa, served by static.ts)', () => {
+    expect(isMaterialPath('dashboard/src/App.tsx')).toBe(true);
+    expect(isMaterialDrift(['docs/x.md', 'dashboard/src/App.tsx'])).toBe(true);
+  });
+
+  it('treats dependency manifests as material (they need the install+build flow)', () => {
+    expect(isMaterialPath('package.json')).toBe(true);
+    expect(isMaterialPath('pnpm-lock.yaml')).toBe(true);
+  });
+
+  it('excludes test files wherever they live, including .tsx', () => {
+    expect(isMaterialPath('src/foo.test.ts')).toBe(false);
+    expect(isMaterialPath('dashboard/src/App.test.tsx')).toBe(false);
+  });
+
+  it('still excludes the non-build trees', () => {
+    expect(isMaterialPath('docs/plan.md')).toBe(false);
+    expect(isMaterialPath('scripts/deploy.sh')).toBe(false);
+    expect(isMaterialPath('container/agent-runner/src/providers/codex.ts')).toBe(false);
+  });
+
+  it('does not treat a nested package.json as a root manifest', () => {
+    expect(isMaterialPath('container/agent-runner/package.json')).toBe(false);
   });
 });

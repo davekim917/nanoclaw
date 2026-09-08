@@ -17,6 +17,7 @@ import {
   describeBuildDrift,
   formatBuildInfoLog,
   isMaterialDrift,
+  isMaterialPath,
   readBuildInfo,
   readCheckoutHead,
 } from './build-info.js';
@@ -166,7 +167,7 @@ async function checkBuildDrift(buildInfo: ReturnType<typeof readBuildInfo>): Pro
       });
       return;
     }
-    const materialPaths = (changed ?? []).filter((p) => p.startsWith('src/') && !p.endsWith('.test.ts'));
+    const materialPaths = (changed ?? []).filter(isMaterialPath);
     const commitCount = changed === null ? null : commitCountBetween(REPO_ROOT, buildSha, head);
 
     const prior = readBuildDriftAlertState();
@@ -573,10 +574,6 @@ export async function main(): Promise<void> {
     log.warn('dist/BUILD_INFO.json missing — cannot report build provenance (older dist, or a dev run)');
   }
 
-  // Does the running build match the checkout? WARNs and DMs the owner on
-  // drift; never blocks boot (see checkBuildDrift's own doc comment).
-  await checkBuildDrift(buildInfo);
-
   // 0. Claim exclusive host ownership before any startup work that can
   // mutate shared state. The socket binds early but remains not-ready until
   // every existing boot gate has completed below.
@@ -584,6 +581,18 @@ export async function main(): Promise<void> {
 
   // 0. Circuit breaker — backoff on rapid restarts
   await enforceStartupBackoff();
+
+  // Does the running build match the checkout? WARNs and DMs the owner on
+  // drift; never blocks boot (see checkBuildDrift's own doc comment).
+  //
+  // Deliberately below both gates above, not beside the provenance log it
+  // reads. It sends an outbound DM and writes a shared dedupe marker, which
+  // is exactly the "startup work that can mutate shared state" the ownership
+  // claim exists to fence: two hosts racing to start would otherwise both
+  // alert and both write the marker before one of them is rejected. Running
+  // after the circuit breaker also means a crash-looping host is throttled
+  // before it can message anyone.
+  await checkBuildDrift(buildInfo);
 
   // 0a. Load .env into process.env (for secrets not injected by the shell,
   //     like ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY which determine whether

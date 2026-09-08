@@ -120,7 +120,30 @@ export function describeBuildDrift(
  *   behaviour.
  */
 export function isMaterialDrift(changedPaths: string[]): boolean {
-  return changedPaths.some((p) => p.startsWith('src/') && !p.endsWith('.test.ts'));
+  return changedPaths.some(isMaterialPath);
+}
+
+/** Test files: compiled, but nothing reachable from the host entrypoint imports them. */
+const TEST_FILE_RE = /\.test\.[cm]?[jt]sx?$/;
+
+/**
+ * Whether ONE changed path can change what a rebuild would deploy.
+ *
+ * Exported so the alert body and the gate cannot drift apart: the call site
+ * filters with this same predicate instead of restating the rule.
+ *
+ * The top-level build is `tsc && pnpm run build:spa`, so it produces two
+ * runtime artifacts rather than one. The compiled host output covers the src
+ * tree; the second is the dashboard SPA, built from its own Vite project and
+ * served directly by `src/dashboard/static.ts`, so a dashboard-only change is
+ * user-facing and would otherwise have read as harmless here. Dependency
+ * manifests count for the same reason: they need the deploy install-and-build
+ * flow before they are live.
+ */
+export function isMaterialPath(changedPath: string): boolean {
+  if (changedPath === 'package.json' || changedPath === 'pnpm-lock.yaml') return true;
+  if (TEST_FILE_RE.test(changedPath)) return false;
+  return changedPath.startsWith('src/') || changedPath.startsWith('dashboard/');
 }
 
 /**
