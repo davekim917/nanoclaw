@@ -31,7 +31,8 @@
  *
  * Same rule for the subagent sentence. Subagents die with the provider
  * process on both paths — Claude's abort tears the CLI down via
- * `queryAbortController` (providers/claude.ts:2517-2526) and Codex kills the
+ * `queryAbortController` (created and passed at providers/claude.ts:2517-2526,
+ * fired by the query's `abort()` at providers/claude.ts:2999-3007) and Codex kills the
  * app-server (`killCodexAppServer`, providers/codex-app-server.ts:257-263) —
  * but neither path signals a process group or verifies descendants, so a
  * backgrounded shell command may outlive the attempt. The notice therefore

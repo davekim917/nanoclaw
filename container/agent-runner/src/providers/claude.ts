@@ -2291,8 +2291,12 @@ export class ClaudeProvider implements AgentProvider {
    * request. Same shape as `/login`-mid-session in interactive Claude Code.
    *
    * Position persists for the container lifetime — once slot N fires a
-   * retryable error, slot N+1 stays active for all subsequent queries.
-   * Restarting the container is the only reset.
+   * retryable error, slot N+1 stays active for all subsequent queries. On
+   * the circular OAuth ring it also survives a container respawn: the slot
+   * NAME is persisted to session state here and restored by the runner
+   * entrypoint (`restorePersistedCredentialSlot`). The forward-only
+   * `ANTHROPIC_API_KEY_N` pool is different: nothing is persisted, and a
+   * respawn is its only reset — see the comment in that branch below.
    *
    * Process-wide propagation: rotations are mirrored to `process.env` so
    * other in-process consumers that issue direct Anthropic calls — the
