@@ -57,6 +57,7 @@ import { startHostModules, stopHostModules } from './host-lifecycle.js';
 import { runOnecliBootPreflight } from './onecli-preflight.js';
 import { resetStorageActivityState } from './storage-activity.js';
 import { finishInterruptedSessionArchivals } from './storage-manager.js';
+import { drainClosedSessionPendingBacklog } from './session-close-expiry.js';
 // Side-effect only: each registers its onHostStart/onHostShutdown timer with
 // src/host-lifecycle.ts at import time. See "7–10b" in startNanoClaw below.
 import './worktree-cleanup.js';
@@ -814,6 +815,16 @@ export async function main(): Promise<void> {
     await finishInterruptedSessionArchivals();
   } catch (err) {
     log.error('Interrupted session archival recovery failed', { err });
+  }
+
+  // 2-ter. Drain the pending rows left in sessions closed before S19 learned
+  // to expire them (#520). Bounded and self-draining — a session whose rows
+  // are expired stops pinning `sessionHasOpenWork`, reclaim removes its
+  // directory, and the next boot skips it on a statSync. Non-fatal.
+  try {
+    await drainClosedSessionPendingBacklog();
+  } catch (err) {
+    log.error('Closed-session pending backlog drain failed', { err });
   }
 
   // 2a. Surface agent-runner deps drift at boot, not when an agent silently

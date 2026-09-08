@@ -37,7 +37,7 @@ import {
   sessionInboundHasMessage,
   upsertSessionRouting,
 } from './ops/ingress.js';
-import { expireStalePending, getDueWakePriority, syncProcessingAcks } from './ops/sweep.js';
+import { expireClosedSessionPending, expireStalePending, getDueWakePriority, syncProcessingAcks } from './ops/sweep.js';
 import { INBOUND_SCHEMA } from '../../db/schema.js';
 import { DATA_DIR } from '../../config.js';
 
@@ -1123,6 +1123,151 @@ describe('expireStalePending', () => {
 
       expect(expireStalePending(db, 24 * 60 * 60 * 1000)).toBe(1);
       expect(expireStalePending(db, 24 * 60 * 60 * 1000)).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// expireClosedSessionPending (#520)
+// ---------------------------------------------------------------------------
+
+describe('expireClosedSessionPending', () => {
+  function makeInboundDb(): Database.Database {
+    const db = new Database(':memory:');
+    db.pragma('journal_mode = DELETE');
+    db.exec(INBOUND_SCHEMA);
+    return db;
+  }
+
+  function insertRow(
+    db: Database.Database,
+    args: {
+      id: string;
+      timestamp?: string;
+      status?: string;
+      processAfter?: string | null;
+      recurrence?: string | null;
+      kind?: string;
+    },
+  ): void {
+    const seq = (db.prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM messages_in').get() as { m: number }).m + 2;
+    db.prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, content, process_after, recurrence, series_id, trigger)
+       VALUES (@id, @seq, @kind, @timestamp, @status, '{}', @processAfter, @recurrence, @id, 1)`,
+    ).run({
+      id: args.id,
+      seq,
+      kind: args.kind ?? 'chat',
+      timestamp: args.timestamp ?? new Date().toISOString(),
+      status: args.status ?? 'pending',
+      processAfter: args.processAfter ?? null,
+      recurrence: args.recurrence ?? null,
+    });
+  }
+
+  const statuses = (db: Database.Database): Record<string, string> =>
+    Object.fromEntries(
+      (db.prepare('SELECT id, status FROM messages_in').all() as Array<{ id: string; status: string }>).map((r) => [
+        r.id,
+        r.status,
+      ]),
+    );
+
+  it('expires pending and processing rows regardless of age', () => {
+    const db = makeInboundDb();
+    try {
+      insertRow(db, { id: 'fresh', timestamp: new Date().toISOString() });
+      insertRow(db, { id: 'ancient', timestamp: new Date(Date.now() - 43 * 24 * 60 * 60 * 1000).toISOString() });
+      insertRow(db, { id: 'claimed', status: 'processing' });
+
+      expect(expireClosedSessionPending(db)).toBe(3);
+      expect(statuses(db)).toEqual({ fresh: 'expired', ancient: 'expired', claimed: 'expired' });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('expires a FUTURE-dated row — the age cutoff that protects a live session does not apply here', () => {
+    const db = makeInboundDb();
+    try {
+      insertRow(db, {
+        id: 'monthly-slot',
+        processAfter: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+      });
+
+      // expireStalePending deliberately cannot see this row at any cutoff.
+      expect(expireStalePending(db, 24 * 60 * 60 * 1000)).toBe(0);
+      expect(expireClosedSessionPending(db)).toBe(1);
+      expect(statuses(db)).toEqual({ 'monthly-slot': 'expired' });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('expires a RECURRING row — the series cannot fire or advance in a closed session', () => {
+    const db = makeInboundDb();
+    try {
+      insertRow(db, {
+        id: 'wiki-synth',
+        kind: 'task',
+        recurrence: '0 9 * * *',
+        processAfter: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+      });
+
+      // The guard that protects this exact row while its session is ALIVE.
+      expect(expireStalePending(db, 24 * 60 * 60 * 1000)).toBe(0);
+      expect(expireClosedSessionPending(db)).toBe(1);
+      expect(statuses(db)).toEqual({ 'wiki-synth': 'expired' });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('expires a repo-fenced row — nothing left in this session can release the fence', () => {
+    const db = makeInboundDb();
+    try {
+      insertRow(db, { id: 'fenced' });
+      // `repo_fence_epoch` arrives with migrateMessagesInTable, which the op
+      // runs itself; seed it after one call, then put the row back to pending.
+      // Tagged, inert and carrying its original trigger — the shape the fence
+      // guard triggers enforce.
+      expireClosedSessionPending(db);
+      db.prepare(
+        `UPDATE messages_in
+            SET status = 'pending',
+                repo_fence_epoch = '2026-09-01T00:00:00.000Z',
+                repo_fence_original_trigger = 1,
+                trigger = 0`,
+      ).run();
+
+      expect(expireStalePending(db, 0)).toBe(0);
+      expect(expireClosedSessionPending(db)).toBe(1);
+      expect(statuses(db)).toEqual({ fenced: 'expired' });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('leaves already-resolved rows alone and is idempotent', () => {
+    const db = makeInboundDb();
+    try {
+      insertRow(db, { id: 'done', status: 'completed' });
+      insertRow(db, { id: 'dead', status: 'failed' });
+      insertRow(db, { id: 'gone', status: 'cancelled' });
+      insertRow(db, { id: 'held', status: 'paused' });
+      insertRow(db, { id: 'live' });
+
+      expect(expireClosedSessionPending(db)).toBe(1);
+      expect(expireClosedSessionPending(db)).toBe(0);
+      expect(statuses(db)).toEqual({
+        done: 'completed',
+        dead: 'failed',
+        gone: 'cancelled',
+        held: 'paused',
+        live: 'expired',
+      });
     } finally {
       db.close();
     }

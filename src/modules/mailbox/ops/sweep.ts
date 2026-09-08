@@ -124,6 +124,51 @@ export function expireStalePending(db: Database.Database, maxAgeMs: number): num
   return result.changes;
 }
 
+/**
+ * Mark every row that still pins a TERMINALLY CLOSED session as 'expired'.
+ *
+ * `closed` is terminal for a session row: the only transition back to 'active'
+ * is from 'archiving' (`releaseArchivingRow`), never from 'closed', and
+ * `findSessionForAgent` matches active rows only — the next inbound for the
+ * same thread creates a FRESH session. So nothing left in a closed session's
+ * inbound can ever be consumed.
+ *
+ * The status set is exactly the one `sessionHasOpenWork` (src/storage-manager.ts)
+ * counts, `('processing', 'pending')`, because that predicate is what these
+ * rows pin: while any of them survives, reclaim refuses to archive the
+ * directory and the session dir is stranded forever (#520 — 53 such sessions,
+ * the oldest holding rows 43 days old).
+ *
+ * Unlike `expireStalePending` above this takes NO age cutoff and applies NO
+ * recurrence or fence guard, and each omission is deliberate:
+ *
+ *  - Age is the wrong discriminator. The question is not "has this waited long
+ *    enough" but "can this ever run", and for a closed session the answer is
+ *    no at any age.
+ *  - The recurrence guard exists because reaping a DUE recurring row skips a
+ *    fire and used to strand the whole series (wiki-synth, 2026-05-10). What
+ *    makes that guard work is `handleRecurrence` re-firing the row on a later
+ *    sweep — and that is duty S18 inside the per-session loop, which iterates
+ *    ACTIVE sessions only. In a closed session the guard protects nothing: the
+ *    series cannot fire and cannot be advanced, so keeping the row 'pending'
+ *    preserves no schedule, it only pins the directory. A live series also
+ *    cannot reach the close in the first place — `countLiveTasks` counts
+ *    pending/paused task rows and S19 refuses to close while it is non-zero —
+ *    so a recurring row here is already an anomaly, not a working schedule.
+ *  - A `repo_fence_epoch` row waits for an ingress fence release that only a
+ *    running container in this session can produce; there will not be one.
+ *  - `processing` is included for the same reason: the claiming container is
+ *    gone, and the duties that clear orphaned claims (S4, S17) also only ever
+ *    see active sessions, so nothing will ever ack it.
+ *
+ * Returns the number of rows expired this call.
+ */
+export function expireClosedSessionPending(db: Database.Database): number {
+  migrateMessagesInTable(db);
+  return db.prepare("UPDATE messages_in SET status = 'expired' WHERE status IN ('pending', 'processing')").run()
+    .changes;
+}
+
 export function markMessageFailed(db: Database.Database, messageId: string): void {
   db.prepare("UPDATE messages_in SET status = 'failed' WHERE id = ?").run(messageId);
 }

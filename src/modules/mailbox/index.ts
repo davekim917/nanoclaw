@@ -138,6 +138,7 @@ import {
 } from './ops/session-state.js';
 import {
   countDueMessages,
+  expireClosedSessionPending,
   expireStalePending,
   getContainerState,
   getDueWakePriority,
@@ -405,6 +406,12 @@ export interface NanoclawMailboxSession extends MailboxSession {
   // --- fork-only sweep ----------------------------------------------------
   getNextFutureProcessAfter(): string | null;
   expireStalePending(maxAgeMs: number): number;
+  /**
+   * Expire everything a TERMINALLY CLOSED session still holds — no age cutoff,
+   * no recurrence guard. Only ever correct once the session row is (or is
+   * about to be) `closed`; see the op for why each guard is dropped.
+   */
+  expireClosedSessionPending(): number;
   getDueWakePriority(): 'interactive' | 'scheduled';
   /** Fused: reads outbound processing_ack and writes inbound statuses in one action. */
   syncProcessingAcks(): void;
@@ -1095,6 +1102,7 @@ function forkOps(
 
     getNextFutureProcessAfter: () => getNextFutureProcessAfter(inbound),
     expireStalePending: (maxAgeMs) => expireStalePending(inbound, maxAgeMs),
+    expireClosedSessionPending: () => expireClosedSessionPending(inbound),
     getDueWakePriority: () => getDueWakePriority(inbound),
     syncProcessingAcks: () => readOutbound(undefined, (outbound) => syncProcessingAcks(inbound, outbound)),
     // A never-woken session has no turn usage: empty is the honest answer here,
