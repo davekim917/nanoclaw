@@ -32,12 +32,19 @@ change.
   MCP configuration in all-group readers. This change keeps the established
   validation behavior; isolating those readers is separate future work if the
   condition occurs.
+- GitHub automatic-review round 1 found a valid P2: the original
+  control-character predicate rejected C0 and DEL but admitted C1 (`U+0080`
+  through `U+009F`) despite the contract. The accepted correction rejects that
+  whole range and adds C1 name and email regression cases.
 
 ## Post-review correction
 
 - Removed the unused host-side `GIT_IDENTITY_ENV_KEYS` export.
 - Reworded the `runGitAt` environment comment to accurately describe the
   explicit per-call environment, including identity variation between calls.
+- Expanded Git identity control-character validation from C0 plus DEL to C0
+  through C1 plus DEL (`U+0000`–`U+001F` and `U+007F`–`U+009F`). The new C1
+  cases failed before the predicate change and pass after it.
 - Assessed a direct Docker-argument test. `buildContainerArgs` remains private
   and makes live OneCLI shell calls; the existing hermetic test setup has no
   Docker-argument harness for it. No production export or broad test refactor
@@ -62,8 +69,8 @@ the contract in `plan.md`:
 - Agent-runner TypeScript check — passed.
 - Upstream-ratchet report — passed with no unrecorded divergence change.
 - Public-boundary and whitespace checks — passed.
-- Post-review host focused tests (`src/container-config.test.ts` and
-  `src/container-runner.test.ts`) — passed, 191 tests; host TypeScript check
+- Post-GitHub-round host focused tests (`src/container-config.test.ts` and
+  `src/container-runner.test.ts`) — passed, 193 tests; host TypeScript check
   passed.
 - Post-review runner focused tests (`src/nanoclaw-mcp-env.test.ts` and
   `src/mcp-tools/git-worktrees.test.ts`) — passed, 31 tests; agent-runner
@@ -71,6 +78,9 @@ the contract in `plan.md`:
 - Post-review upstream-ratchet report — passed. The expected host source
   cleanup reduced `src/container-runner.ts` from 7,512 to 7,501 divergent
   lines; overall divergence changed by -11 lines.
+- Post-GitHub-round upstream-ratchet report — passed with the explicitly
+  accepted `src/container-config.test.ts` growth from 842 to 844 divergent
+  lines, solely for the two C1 regression cases.
 
 Raw output for the fresh checks is retained outside the repository with the
 shipping evidence.

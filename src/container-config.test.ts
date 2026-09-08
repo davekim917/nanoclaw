@@ -144,11 +144,13 @@ describe('gitIdentity config', () => {
     { email: 'fixture-agent@example.invalid' },
     { name: '', email: 'fixture-agent@example.invalid' },
     { name: 'Fixture <Agent>', email: 'fixture-agent@example.invalid' },
+    { name: `Fixture ${String.fromCodePoint(0x9b)} Agent`, email: 'fixture-agent@example.invalid' },
     { name: 'Fixture\nAgent', email: 'fixture-agent@example.invalid' },
     { name: 'Fixture Agent', email: 'not-an-email' },
     { name: 'Fixture Agent', email: '@example.invalid' },
     { name: 'Fixture Agent', email: 'fixture-agent@' },
     { name: 'Fixture Agent', email: 'fixture@agent@example.invalid' },
+    { name: 'Fixture Agent', email: `fixture${String.fromCodePoint(0x85)}agent@example.invalid` },
     { name: 'Fixture Agent', email: 'fixture\u0001agent@example.invalid' },
   ])('rejects malformed all-or-nothing identity declarations: %j', (gitIdentity) => {
     writeGroupConfig('test-git-identity-invalid', { ...baseConfig, gitIdentity });

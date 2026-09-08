@@ -61,8 +61,9 @@ The focused tests assert the contract directly:
   normalized `{ name, email }` object; `leaves the established scoped-credential
   behavior available when absent` expects `undefined`; the parameterized
   `rejects malformed all-or-nothing identity declarations` case expects a
-  read-time `gitIdentity` error; and `validates direct writes as well as
-  hand-edited config files` expects the direct writer to reject an empty email.
+  read-time `gitIdentity` error, including C1 `U+009B` in a name and `U+0085`
+  in an email; and `validates direct writes as well as hand-edited config
+  files` expects the direct writer to reject an empty email.
 - `gitIdentityEnv` in `src/container-runner.test.ts`:
   `projects one configured agent to all Git author and committer variables`
   expects all four exact values; `adds nothing when an agent has not opted in`
