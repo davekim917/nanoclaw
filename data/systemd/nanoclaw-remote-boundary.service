@@ -1,0 +1,25 @@
+[Unit]
+Description=NanoClaw daily public-boundary scan of the remote
+# Fetches origin/main, materializes it in a throwaway detached worktree, and
+# runs scripts/check-public-boundary.ts over the WHOLE tree against the live
+# install registry (data/v2.db). That is coverage CI structurally cannot have:
+# .github/workflows/ci.yml runs the checker with --portable because a GitHub
+# runner has no registry, and giving CI the registry would publish it.
+#
+# The .husky hooks only ever see one push's objects, are skippable with
+# --no-verify, and are unresolvable inside agent containers by design — so this
+# is the detection half. Silent when clean; DMs the owner on a finding via
+# src/notify-owner.ts, sending only the checker's already-redacted output
+# (file:line and category, never a matched value).
+#
+# Reference copy — tracked, not installed. The deployer installs and enables it.
+After=network.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/nanoclaw-v2
+ExecStart=/home/ubuntu/nanoclaw-v2/node_modules/.bin/tsx scripts/check-remote-boundary.ts
+IOSchedulingClass=idle
+Nice=10
+OnFailure=nanoclaw-unit-alert@%n.service
