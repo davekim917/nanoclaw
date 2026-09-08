@@ -32,7 +32,6 @@ commit_message=''
 worktree_node_modules_link=''
 snapshot_parent=''
 snapshot_root=''
-snapshot_node_modules_link=''
 
 remove_file() {
   if [ -n "$1" ] && [ -e "$1" ] && ! rm -f "$1"; then
@@ -44,9 +43,6 @@ cleanup() {
   status=$?
   trap - EXIT HUP INT TERM
   if [ -n "$snapshot_root" ] && [ -d "$snapshot_root" ]; then
-    if [ "$snapshot_node_modules_link" = 1 ] && [ -L "$snapshot_root/node_modules" ] && ! rm "$snapshot_root/node_modules"; then
-      echo "pre-push: failed to remove temporary node_modules link" >&2
-    fi
     if ! git -C "$worktree_root" worktree remove "$snapshot_root"; then
       echo "pre-push: failed to remove temporary snapshot" >&2
     fi
@@ -135,40 +131,49 @@ scan_tag() {
   snapshot_parent=''
 }
 
+# This hook carries ONLY the check CI cannot run.
+#
+# It used to also run eslint and both tsc invocations against every pushed
+# commit's snapshot. Those are pure duplication of CI — .github/workflows/ci.yml
+# runs `pnpm run lint` (:44), `tsc --noEmit` (:47) and
+# `tsc -p tsconfig.scripts.json --noEmit` (:50) on every PR — and they were by
+# far the expensive half: measured on this host at load 1.15, eslint 68.1s and
+# tsc 23.4s against the boundary check's 27.8s, and `objects_for_ref` pays that
+# per PUSHED COMMIT, so a five-commit branch cost ~10 minutes.
+#
+# That was survivable while this hook only ever ran for a deployer pushing from
+# the main checkout. It is not survivable now that it runs for every agent
+# worktree push (scripts/pin-git-hooks-path.sh), on a shared box where CPU
+# starvation is a recurring failure and where push latency in the tens of
+# minutes trips agent-side timeouts and provokes retries.
+#
+# The public-boundary check stays, because CI structurally cannot do it: the CI
+# step runs `--portable` (ci.yml:34), structural patterns only, since a runner
+# has no `data/v2.db` and shipping it the identifier registry would publish the
+# thing the registry protects. It stays PER COMMIT for the same reason the loop
+# exists — an identifier in an intermediate commit's tree is published to the
+# remote just as surely as one in the tip — and it now runs niced, so a push
+# yields to the fleet rather than competing with it.
 snapshot_commit() {
   snapshot_parent=$(mktemp -d "${TMPDIR:-/tmp}/nanoclaw-pre-push.XXXXXX")
   snapshot_root="$snapshot_parent/tree"
   git -C "$worktree_root" -c core.hooksPath=/dev/null worktree add --detach --quiet "$snapshot_root" "$1" </dev/null
-  if [ -e "$snapshot_root/node_modules" ] || [ -L "$snapshot_root/node_modules" ]; then
-    echo "pre-push: snapshot unexpectedly contains node_modules" >&2
-    exit 1
-  fi
-  ln -s "$repo_root/node_modules" "$snapshot_root/node_modules"
-  snapshot_node_modules_link=1
 
   commit_message="$snapshot_parent/COMMIT_EDITMSG"
   git -C "$worktree_root" show --no-patch --format=%B "$1" > "$commit_message"
   scan_message "$snapshot_root" "$commit_message"
   remove_file "$commit_message"
   commit_message=''
-  (cd "$repo_root" && pnpm run check:public-boundary -- --root "$snapshot_root" --index --allowlist "$allowlist_path") </dev/null
+  # The snapshot needs no node_modules of its own: this runs from $repo_root and
+  # reads the snapshot only through `git ls-files`/`git show` on its index.
+  # Leaving the tree free of untracked files is also what lets the plain
+  # `worktree remove` below succeed without --force.
   if command -v ionice >/dev/null 2>&1; then
-    (cd "$snapshot_root" && ionice -c3 nice -n 10 node_modules/.bin/eslint --quiet src/ scripts/ setup/) </dev/null
+    (cd "$repo_root" && ionice -c3 nice -n 10 pnpm run check:public-boundary -- --root "$snapshot_root" --index --allowlist "$allowlist_path") </dev/null
   else
-    (cd "$snapshot_root" && nice -n 10 node_modules/.bin/eslint --quiet src/ scripts/ setup/) </dev/null
+    (cd "$repo_root" && nice -n 10 pnpm run check:public-boundary -- --root "$snapshot_root" --index --allowlist "$allowlist_path") </dev/null
   fi
 
-  # Include setup and scripts in the same typecheck command used by CI/builds
-  # (pnpm run typecheck), gated against this pushed commit's own snapshot
-  # rather than the live worktree, same as the boundary and lint checks above.
-  if command -v ionice >/dev/null 2>&1; then
-    (cd "$snapshot_root" && ionice -c3 nice -n 10 node_modules/.bin/tsc --noEmit && ionice -c3 nice -n 10 node_modules/.bin/tsc -p tsconfig.scripts.json) </dev/null
-  else
-    (cd "$snapshot_root" && nice -n 10 node_modules/.bin/tsc --noEmit && nice -n 10 node_modules/.bin/tsc -p tsconfig.scripts.json) </dev/null
-  fi
-
-  rm "$snapshot_root/node_modules"
-  snapshot_node_modules_link=''
   git -C "$worktree_root" worktree remove "$snapshot_root"
   rmdir "$snapshot_parent"
   snapshot_parent=''

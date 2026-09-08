@@ -160,6 +160,28 @@ describe('pin-git-hooks-path.sh', () => {
     expect(git(main, ['config', '--get', 'core.hooksPath'])).toBe(absolute);
   });
 
+  it('writes the SHARED config even with extensions.worktreeConfig enabled', () => {
+    // This repository has `extensions.worktreeConfig = true`. That matters,
+    // because it is what makes per-worktree overrides possible at all — and if
+    // the pin landed in one, a single `pnpm install` would fix one worktree
+    // instead of all of them. It does not: `git config` writes the shared
+    // `.git/config` unless given `--worktree`, and only `core.bare` and
+    // `core.worktree` are per-worktree implicitly. Pinned here so nobody has to
+    // re-derive it from the git docs.
+    const { main } = fixture();
+    git(main, ['config', 'extensions.worktreeConfig', 'true']);
+    const linked = path.join(tempRoot('hooks-path-wtcfg'), 'wt');
+    git(main, ['worktree', 'add', '--quiet', '-b', 'wtcfg', linked]);
+
+    expect(spawnSync('sh', [script], { cwd: linked, encoding: 'utf8' }).status).toBe(0);
+
+    const origin = git(linked, ['config', '--show-origin', '--get', 'core.hooksPath']);
+    expect(origin).toContain(path.join(main, '.git', 'config'));
+    expect(origin).not.toContain('config.worktree');
+    // The value one install pinned is what every other worktree reads.
+    expect(git(main, ['config', '--get', 'core.hooksPath'])).toBe(path.join(main, '.husky', '_'));
+  });
+
   it('exits 0 and configures nothing outside a git repository', () => {
     const plain = tempRoot('hooks-path-nogit');
     const result = spawnSync('sh', [script], { cwd: plain, encoding: 'utf8' });
