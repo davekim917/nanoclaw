@@ -237,7 +237,9 @@ function pinned(sessionId: string): boolean {
   // error an earlier revision of this helper made in both directions: first
   // treating an absent file as pinned, then short-circuiting the whole
   // predicate on it.
-  if (hasRows(path.join(dir, 'inbound.db'), "SELECT 1 FROM messages_in WHERE status IN ('processing', 'pending') LIMIT 1"))
+  if (
+    hasRows(path.join(dir, 'inbound.db'), "SELECT 1 FROM messages_in WHERE status IN ('processing', 'pending') LIMIT 1")
+  )
     return true;
   const outPath = path.join(dir, 'outbound.db');
   if (hasRows(outPath, "SELECT 1 FROM processing_ack WHERE status = 'processing' LIMIT 1")) return true;
