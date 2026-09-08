@@ -132,6 +132,8 @@ import type Database from 'better-sqlite3';
 import {
   DATAFOLD_MCP_SERVER,
   dockerResourceLimitArgs,
+  gitIdentityEnv,
+  resolveScopedCredentialEnv,
   securityArgs,
   resolveMemoryAdmissionBudgetMb,
   serializeMcpServersEnv,
@@ -190,6 +192,62 @@ describe('resolveProviderName', () => {
   it('treats empty string as unset (falls through)', () => {
     expect(resolveProviderName('', 'opencode')).toBe('opencode');
     expect(resolveProviderName(null, '')).toBe('claude');
+  });
+});
+
+describe('gitIdentityEnv', () => {
+  it('projects one configured agent to all Git author and committer variables', () => {
+    expect(gitIdentityEnv({ name: 'Fixture Agent', email: 'fixture-agent@example.invalid' })).toEqual({
+      GIT_AUTHOR_NAME: 'Fixture Agent',
+      GIT_AUTHOR_EMAIL: 'fixture-agent@example.invalid',
+      GIT_COMMITTER_NAME: 'Fixture Agent',
+      GIT_COMMITTER_EMAIL: 'fixture-agent@example.invalid',
+    });
+  });
+
+  it('adds nothing when an agent has not opted in', () => {
+    expect(gitIdentityEnv()).toEqual({});
+  });
+
+  it('overrides only Git attribution instead of the credentialFolder-scoped human identity', () => {
+    const inherited = {
+      GIT_AUTHOR_NAME: 'Fixture Human',
+      GIT_AUTHOR_EMAIL: 'fixture-human@example.invalid',
+      GIT_COMMITTER_NAME: 'Fixture Human',
+      GIT_COMMITTER_EMAIL: 'fixture-human@example.invalid',
+    };
+    const lookup = vi.fn((base: string) => inherited[base as keyof typeof inherited]);
+
+    expect(
+      resolveScopedCredentialEnv(
+        { gitIdentity: { name: 'Fixture Agent', email: 'fixture-agent@example.invalid' } },
+        'fixture-human',
+        lookup,
+      ),
+    ).toMatchObject({
+      GIT_AUTHOR_NAME: 'Fixture Agent',
+      GIT_AUTHOR_EMAIL: 'fixture-agent@example.invalid',
+      GIT_COMMITTER_NAME: 'Fixture Agent',
+      GIT_COMMITTER_EMAIL: 'fixture-agent@example.invalid',
+    });
+    for (const key of Object.keys(inherited)) {
+      expect(lookup).not.toHaveBeenCalledWith(key, 'fixture-human');
+    }
+  });
+
+  it('retains the credentialFolder-scoped human identity without opt-in', () => {
+    const inherited = {
+      GIT_AUTHOR_NAME: 'Fixture Human',
+      GIT_AUTHOR_EMAIL: 'fixture-human@example.invalid',
+      GIT_COMMITTER_NAME: 'Fixture Human',
+      GIT_COMMITTER_EMAIL: 'fixture-human@example.invalid',
+    };
+    const lookup = vi.fn((base: string) => inherited[base as keyof typeof inherited]);
+
+    expect(resolveScopedCredentialEnv({}, 'fixture-human', lookup)).toMatchObject(inherited);
+    for (const key of Object.keys(inherited)) {
+      expect(lookup).toHaveBeenCalledWith(key, 'fixture-human');
+    }
   });
 });
 

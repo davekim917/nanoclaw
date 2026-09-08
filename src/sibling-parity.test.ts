@@ -18,6 +18,19 @@ describe('sibling capability parity', () => {
     ).toEqual([]);
   });
 
+  it.each([
+    ['omit the source identity', {}],
+    ['set a distinct identity', { gitIdentity: { name: 'Fixture Sibling', email: 'fixture-sibling@example.invalid' } }],
+  ])('allows a sibling to %s', (_case, sibling) => {
+    expect(isSiblingBoundField('gitIdentity')).toBe(true);
+    expect(
+      findSiblingParityDrifts(
+        { gitIdentity: { name: 'Fixture Source', email: 'fixture-source@example.invalid' } },
+        sibling,
+      ),
+    ).toEqual([]);
+  });
+
   it('compares the Slack capability but not adapter-specific allowlist IDs', () => {
     expect(
       findSiblingParityDrifts(

@@ -111,6 +111,62 @@ describe('workgroup and capability config', () => {
   });
 });
 
+describe('gitIdentity config', () => {
+  const baseConfig = {
+    mcpServers: {},
+    packages: { apt: [], npm: [] },
+    additionalMounts: [],
+    skills: 'all' as const,
+  };
+
+  it('round-trips an explicit per-agent author and committer identity', () => {
+    writeContainerConfig('test-git-identity', {
+      ...baseConfig,
+      gitIdentity: { name: 'Fixture Agent', email: 'fixture-agent@example.invalid' },
+    });
+
+    expect(readContainerConfig('test-git-identity').gitIdentity).toEqual({
+      name: 'Fixture Agent',
+      email: 'fixture-agent@example.invalid',
+    });
+  });
+
+  it('leaves the established scoped-credential behavior available when absent', () => {
+    writeContainerConfig('test-git-identity-absent', baseConfig);
+    expect(readContainerConfig('test-git-identity-absent').gitIdentity).toBeUndefined();
+  });
+
+  it.each([
+    null,
+    'fixture',
+    {},
+    { name: 'Fixture Agent' },
+    { email: 'fixture-agent@example.invalid' },
+    { name: '', email: 'fixture-agent@example.invalid' },
+    { name: 'Fixture <Agent>', email: 'fixture-agent@example.invalid' },
+    { name: `Fixture ${String.fromCodePoint(0x9b)} Agent`, email: 'fixture-agent@example.invalid' },
+    { name: 'Fixture\nAgent', email: 'fixture-agent@example.invalid' },
+    { name: 'Fixture Agent', email: 'not-an-email' },
+    { name: 'Fixture Agent', email: '@example.invalid' },
+    { name: 'Fixture Agent', email: 'fixture-agent@' },
+    { name: 'Fixture Agent', email: 'fixture@agent@example.invalid' },
+    { name: 'Fixture Agent', email: `fixture${String.fromCodePoint(0x85)}agent@example.invalid` },
+    { name: 'Fixture Agent', email: 'fixture\u0001agent@example.invalid' },
+  ])('rejects malformed all-or-nothing identity declarations: %j', (gitIdentity) => {
+    writeGroupConfig('test-git-identity-invalid', { ...baseConfig, gitIdentity });
+    expect(() => readContainerConfig('test-git-identity-invalid')).toThrow(/gitIdentity/);
+  });
+
+  it('validates direct writes as well as hand-edited config files', () => {
+    expect(() =>
+      writeContainerConfig('test-git-identity-invalid-write', {
+        ...baseConfig,
+        gitIdentity: { name: 'Fixture Agent', email: '' },
+      }),
+    ).toThrow(/gitIdentity/);
+  });
+});
+
 describe('readContainerConfigStrict', () => {
   it('returns the same normalized snapshot for a valid regular file', () => {
     writeGroupConfig('test-strict-valid', { workgroup_id: 'workgroup-a' });
