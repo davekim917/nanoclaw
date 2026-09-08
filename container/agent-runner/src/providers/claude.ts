@@ -2895,19 +2895,26 @@ export class ClaudeProvider implements AgentProvider {
       // explicit -e lands on the new model's family default (e.g. -m fable
       // mid-turn → fable@medium, not fable@inherited-xhigh).
       applySettings: async (s) => {
-        // `s.model === undefined` means "no per-TURN override", exactly as it
-        // does at query creation — NOT "leave the stream unchanged". Those two
-        // readings are the same word meaning opposite things at two seams, and
-        // treating absence as "unchanged" here left a suppressed task turn
-        // running on whatever model the stream already had (the interactive
-        // sticky), while reporting the model as unknown.
+        // `s.model === undefined` means LEAVE THE LIVE MODEL UNCHANGED, and
+        // that is not an inconsistency with query creation — it is what every
+        // caller on this path means. A flagless message arriving mid-turn
+        // resolves to `undefined` from `applyFlagBatch` simply because nobody
+        // asked for a model; a turn opened with a one-shot `-m1` override
+        // would then be dragged off it mid-answer.
         //
-        // So resolve the SAME chain query() uses at line ~2350 — which is also
-        // what the effort branch immediately below has always done with its
-        // own absence. Model was the odd one out, not the rule.
-        const rawNewModel = s.model ?? this.stickyConfig.model ?? process.env.ANTHROPIC_DEFAULT_OPUS_MODEL ?? 'opus';
-        const newModel = ensureOpus1mSuffix(rawNewModel);
-        if (newModel !== activeModel) {
+        // This was briefly "resolve absence to the group default", to serve a
+        // scheduled-task suppression on this path. That caller has since been
+        // reverted (see the follow-up issue in CHANGELOG) and the reading went
+        // with it. The rule worth keeping: a future attempt to retarget a live
+        // model must not do it by REINTERPRETING `undefined`, because this
+        // seam is shared with ordinary chat, which legitimately means
+        // "unchanged" by it. Pass the model you want explicitly instead.
+        //
+        // (The effort branch below does resolve its own absence. That is not
+        // the same case: effort has no "leave alone" caller here — it is
+        // recomputed for the model in force on every call.)
+        const newModel = s.model ? ensureOpus1mSuffix(s.model) : undefined;
+        if (newModel && newModel !== activeModel) {
           await sdkResult.setModel(newModel);
           activeModel = newModel;
           // A live `-m sonnet` lands here as a bare alias too, so the
