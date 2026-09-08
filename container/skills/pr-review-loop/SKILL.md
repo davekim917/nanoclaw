@@ -87,45 +87,11 @@ The recurrence is the diagnosis. A finding on a fix means the fix was incomplete
 
 1. **Say it out loud.** Tell the user you're in a churn cycle, name the file(s), and give the round count. This is a visible stop, not a silent retry.
 2. **Reconstruct the chain.** For each finding on the churning file, in order, write one line: what the reviewer asked for, and what your fix did. You now have the whole cycle on one screen — which you never see while working comment to comment.
-### Two things produce churn, and they want opposite fixes
-
-Before step 3, decide which one you are in. Getting this backwards sends you
-looking for somewhere to ADD a guard when the fix is to delete code.
-
-- **A missing invariant.** Your design does not hold a property, so the reviewer
-  finds it at one more call site each round: "also here", "and here". The
-  findings name places. Fix: one guard at the shared seam (steps 3-5 below).
-- **A false premise.** Your code branches on a belief about another module's
-  behaviour, and the belief is wrong, so every branch built on it is wrong. The
-  findings correct your *stated reasoning*, not your coverage. Fix: read that
-  module and DELETE the branches that guessed. There is nothing to enforce.
-
-**The tell is the wording.** "The stated reason is incorrect", "this is
-documented at x:NN", "the predicate does the opposite" — a review correcting a
-FACT about the codebase rather than a design choice. That is not a normal
-finding, and it fires long before the 3-round detector will.
-
-**When you see it, do not patch the site it names.** Grep every other place that
-premise is load-bearing: the other branches, the comments justifying them, your
-commit messages, the review replies you already published, and above all the
-TEST ORACLE. A helper that paraphrases a production predicate will carry the
-same false belief and then pass against it, so the suite confirms the bug
-instead of catching it.
-
-Observed on #583 (2026-09-08): four rounds, one premise — that an absent
-mailbox file makes `dbHasRows` answer `null` and pin the session, when it
-short-circuits to `false` on its first line. It produced two production
-branches, two commit messages, a published review reply, and finally the test
-oracle. Rounds 3 and 4 were the same belief in different files. Acting on the
-round-3 wording would have ended it one round earlier.
-
-Two mechanical reading errors produced every wrong claim there, and both are
-cheap to avoid: reading a function from an offset INSIDE it and reasoning about
-the whole from the fragment (guard clauses and short-circuits live on the first
-lines), and reading a method on a base class without checking whether a subclass
-overrides it (`grep override`).
-
-3. **Name the one invariant.** Read that chain and ask what property all of the findings are circling: an ordering guarantee, a lifetime, a null/empty case, a contract between two layers. Churn happens when a design doesn't hold an invariant and each patch enforces it at one more call site. If every finding restates the same property in different words, that property is your root cause.
+3. **Name the one invariant.** *(Missing-invariant case only. If Step 2's premise
+   check fired, you are in the other case — you have already grepped the premise
+   and deleted the branches, so skip to step 6's decision or return to Step 1 as a
+   normal batched round. Steps 3-5 add a guard, which is the wrong move there.)*
+   Read that chain and ask what property all of the findings are circling: an ordering guarantee, a lifetime, a null/empty case, a contract between two layers. Churn happens when a design doesn't hold an invariant and each patch enforces it at one more call site. If every finding restates the same property in different words, that property is your root cause.
 4. **Find the seam.** Ask where that invariant *should* be enforced — usually one layer below where you've been patching. Grep every caller of the function you keep touching. A single guard at the shared seam is both the correct fix and the smaller diff; a guard per caller is what churn actually looks like in a diff.
 5. **Reset and re-implement once.** Drop the accumulated patch pile on that seam and write the real fix in one commit. Reverting your own patches is not lost work — those commits are the map that found the seam.
 6. **If you cannot name one invariant**, the change is under-specified. Hand it back to the user with the chain from step 2 and say what decision you need. Don't keep patching to avoid the conversation.
@@ -224,6 +190,47 @@ This is every **unresolved** thread, not just the newest review. Threads you rep
 `outdated` means the line moved since the comment was written. The finding may still be live — read the current code before dismissing it on that flag.
 
 ## Step 2 — Triage every item before touching code
+
+### First, check the premise — every round, before the verdicts
+
+Two different things generate repeat findings, and they want opposite fixes.
+Check for the second one here, on EVERY round, because its tell arrives long
+before the 3-round churn detector can fire and acting on it early is the whole
+saving.
+
+- **A missing invariant.** Your design does not hold a property, so the reviewer
+  finds it at one more call site each round: "also here", "and here". The
+  findings name places. Fix: one guard at the shared seam (steps 3-5 below).
+- **A false premise.** Your code branches on a belief about another module's
+  behaviour, and the belief is wrong, so every branch built on it is wrong. The
+  findings correct your *stated reasoning*, not your coverage. Fix: read that
+  module and DELETE the branches that guessed. There is nothing to enforce.
+
+**The tell is the wording.** "The stated reason is incorrect", "this is
+documented at x:NN", "the predicate does the opposite" — a review correcting a
+FACT about the codebase rather than a design choice. That is not a normal
+finding, and it fires long before the 3-round detector will.
+
+**When you see it, do not patch the site it names.** Grep every other place that
+premise is load-bearing: the other branches, the comments justifying them, your
+commit messages, the review replies you already published, and above all the
+TEST ORACLE. A helper that paraphrases a production predicate will carry the
+same false belief and then pass against it, so the suite confirms the bug
+instead of catching it.
+
+Observed on #583 (2026-09-08): four rounds, one premise — that an absent
+mailbox file makes `dbHasRows` answer `null` and pin the session, when
+`src/storage-manager.ts:777` short-circuits an absent path to `false` before it
+opens anything. It produced two production
+branches, two commit messages, a published review reply, and finally the test
+oracle. Rounds 3 and 4 were the same belief in different files. Acting on the
+round-3 wording would have ended it one round earlier.
+
+Two mechanical reading errors produced every wrong claim there, and both are
+cheap to avoid: reading a function from an offset INSIDE it and reasoning about
+the whole from the fragment (guard clauses and short-circuits live on the first
+lines), and reading a method on a base class without checking whether a subclass
+overrides it (`grep override`).
 
 Build one table covering the whole open set, then work it. Two verdicts:
 
