@@ -210,8 +210,10 @@ export function registerSchedulingSweepDuties(): void {
         // `drainClosedSessionPendingBacklog` at the next boot. Nothing can
         // insert into this inbound in the gap — `findSessionForAgent` matches
         // active rows only. Uses the sweep's OWN session, never a second one
-        // on the same key (constraint 18, invariant I-3).
-        expireClosedSessionWork(mailbox!, session.id, 'spent-task-session-gc');
+        // on the same key (constraint 18, invariant I-3). The outbound half of
+        // the release carries its own stopped-container check inside the
+        // helper — see `expireClosedSessionWork`.
+        expireClosedSessionWork(mailbox!, session, 'spent-task-session-gc');
         log.info('Closed spent task session', { sessionId: session.id, threadId: session.thread_id });
       }
     },
