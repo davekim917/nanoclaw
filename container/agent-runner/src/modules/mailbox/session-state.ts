@@ -29,15 +29,21 @@ function credentialSlotKey(providerName: string): string {
 }
 
 /**
- * The active credential ring/fallback slot, persisted so it survives a
- * container respawn. Rotation position otherwise lives only in provider
- * instance state (`oauthRingPos`, `nextFallback`) and resets to the primary
- * on every fresh container — a fleet that respawns constantly then burns a
- * rejected turn and a replay on every spawn before landing back on the
- * credential that's actually healthy. Claude stores the env var NAME (e.g.
- * `CLAUDE_CODE_OAUTH_TOKEN_2`); Codex stores the fallback CODEX_HOME path.
- * Never the credential VALUE — this is a pointer into config the provider
- * already holds, not a secret.
+ * The active OAuth ring slot, persisted so it survives a container respawn.
+ * Rotation position otherwise lives only in provider instance state
+ * (`oauthRingPos`) and resets to the primary on every fresh container — a
+ * fleet that respawns constantly then burns a rejected turn and a replay on
+ * every spawn before landing back on the credential that's actually healthy.
+ *
+ * Claude's circular `CLAUDE_CODE_OAUTH_TOKEN` ring is the ONLY writer: it
+ * stores the env var NAME (e.g. `CLAUDE_CODE_OAUTH_TOKEN_2`), never the
+ * credential VALUE — a pointer into config the provider already holds, not a
+ * secret. Forward-only pools deliberately do not use this key: Claude's
+ * `ANTHROPIC_API_KEY_N` fallbacks (providers/claude.ts, the comment in
+ * `restorePersistedCredentialSlot`) and Codex's `fallbackHomes` cursor
+ * (providers/codex.ts:1107-1120, `nextFallback` is process-local) both rely
+ * on a respawn as their reset, and a persisted cursor that never wraps would
+ * turn a recoverable dead end into a permanent one.
  */
 export function getCredentialSlot(providerName: string): string | undefined {
   return getValue(credentialSlotKey(providerName));
