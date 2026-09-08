@@ -151,18 +151,23 @@ next spawn, and the enabler run is just a verification pass.
      the mount assembly reads only `containerConfig.excludePlugins`
      (`src/container-runner.ts:4753-4767`) and the plugin auto-loads regardless. Use
      `excludePlugins` for Claude on an already-enabled plugin.
-   - **An already-synced OpenCode skill cannot be removed by any documented step.**
-     The mirrored `SKILL.md` is a real copied file, not a link (verified: 30 KB
-     regular file), so it survives its source disappearing and is copied into new
-     sessions by `src/providers/opencode.ts`. The cleanup pass that would prune it
-     runs only inside `syncOpenCodePluginSkills()`, reachable only through this
-     enabler — and the enabler refuses an absent plugin (`error: not a directory`).
-     Deleting the directory by hand is undone by the next sync while the source
-     still exists.
+   - **Order matters when removing from OpenCode: deny first, delete second.**
+     `--deny opencode` DOES prune an already-synced mirror, because
+     `resolveDenySiblings()` writes the marker before `syncOpenCodePluginSkills()`
+     runs (`scripts/enable-agent-plugin.ts:478,524`); discovery then omits the
+     skills and the cleanup pass `rmSync`s every managed entry no longer desired.
+     But that path exists only while the plugin is still in `~/plugins`. Delete the
+     source first and it is unreachable — the enabler refuses an absent plugin
+     (`error: not a directory`), and the mirrored `SKILL.md` is a real copied file
+     (verified: 30 KB regular file, not a link), so it survives and keeps being
+     copied into new sessions by `src/providers/opencode.ts`. Deleting the mirror by
+     hand is undone by the next sync while the source still exists.
 
-   So: to keep a plugin off OpenCode, decide **before** the first enable. Afterwards
-   the honest answer is that no supported step removes it, and closing that gap needs
-   a per-group filter in `syncOpenCodePluginSkills()`.
+   So to withhold from OpenCode: run `--deny opencode` **while the plugin is still
+   present**, and only then remove it from `~/plugins` if you want it gone entirely.
+   Reversing that order strands the mirror with no supported way to clean it up. Note
+   `--deny` is provider-wide — every OpenCode group loses the skills, not just one;
+   per-group would need a filter in `syncOpenCodePluginSkills()`.
 
    ```bash
    pnpm exec tsx scripts/enable-agent-plugin.ts <name> --deny opencode
