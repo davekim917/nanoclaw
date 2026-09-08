@@ -189,8 +189,8 @@ export async function rollupSessionUsage(
       // a detail ledger, not an additive aggregate with an identity element).
       await db.run(
         `INSERT INTO turn_usage
-           (ts, session_id, agent_group_id, provider, model, turn_id, steps, duration_ms, trigger, rate_limit_type, rate_limit_utilization, rate_limit_resets_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
-         VALUES (@ts, @session_id, @agent_group_id, @provider, @model, @turn_id, @steps, @duration_ms, @trigger, @rate_limit_type, @rate_limit_utilization, @rate_limit_resets_at, @input_tokens, @output_tokens, @cache_read_tokens, @cache_write_tokens, @cost_usd)`,
+           (ts, session_id, agent_group_id, provider, model, turn_id, steps, duration_ms, trigger, rate_limit_type, rate_limit_utilization, rate_limit_resets_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, effort, effort_requested)
+         VALUES (@ts, @session_id, @agent_group_id, @provider, @model, @turn_id, @steps, @duration_ms, @trigger, @rate_limit_type, @rate_limit_utilization, @rate_limit_resets_at, @input_tokens, @output_tokens, @cache_read_tokens, @cache_write_tokens, @cost_usd, @effort, @effort_requested)`,
         {
           ts: row.ts,
           session_id: sessionId,
@@ -212,6 +212,11 @@ export async function rollupSessionUsage(
           cache_read_tokens: row.cache_read_tokens ?? null,
           cache_write_tokens: row.cache_write_tokens ?? null,
           cost_usd: row.cost_usd ?? null,
+          // The whole point of the column is that it survives THIS hop: a
+          // value that lands in the session DB and is dropped at the mirror
+          // is worse than no column, because it reads as measured.
+          effort: row.effort ?? null,
+          effort_requested: row.effort_requested ?? null,
         },
       );
     }
@@ -262,6 +267,13 @@ const USAGE_DIMENSIONS = {
   model: "COALESCE(model, '')",
   day: 'substr(ts, 1, 10)',
   session: 'session_id',
+  // `ncl usage summary --by group,model,effort` is the query that proves a
+  // group's configured effort reached its container. NULL buckets as '' the
+  // same way model does — and here '' has two meanings that must not be
+  // confused: a row predating migration 075 (no data ever existed) and a row
+  // the attribution rule left unattributable (a subagent model on a
+  // multi-model turn). Neither is "ran at no effort".
+  effort: "COALESCE(effort, '')",
 } as const;
 
 export type UsageDimension = keyof typeof USAGE_DIMENSIONS;

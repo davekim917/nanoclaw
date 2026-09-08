@@ -82,5 +82,16 @@ the contract in `plan.md`:
   accepted `src/container-config.test.ts` growth from 842 to 844 divergent
   lines, solely for the two C1 regression cases.
 
+## Incoming main integration
+
+- Merge validation against incoming `origin/main` commit `c1edef384` had one
+  generated-file conflict: `src/upstream-ratchet.json`. It was reset to the
+  incoming baseline and regenerated; the Git identity's four known host paths
+  were the only accepted growth. The incoming provider resolver in
+  `src/container-config.ts` auto-merged in separate hunks.
+- On the pending merge tree, host focus passed 193 tests (75 migrations) and
+  runner focus passed 31 tests; host and runner typechecks, source formatting,
+  and the public-boundary check passed.
+
 Raw output for the fresh checks is retained outside the repository with the
 shipping evidence.

@@ -34,3 +34,35 @@ export function parseTaskContent(raw: string): TaskContent {
     return { prompt: raw, script: null, scriptHost: false, threadAnchor: true, originSessionId: null };
   }
 }
+
+/** The per-fire model/effort pin stored on a task, as written by `flagIntent`. */
+export interface TaskPin {
+  model: string | null;
+  effort: string | null;
+}
+
+/**
+ * Read a task's per-fire pin out of the content envelope.
+ *
+ * Deliberately separate from {@link parseTaskContent}: the envelope parser
+ * claims no totality over the blob (see its note on `muteChat`), and the pin
+ * is read by callers — the CLI's task output and the provider-migration
+ * audit — that don't want the rest of it. Values come back EXACTLY as stored,
+ * never alias-resolved: a pin is the operator's literal choice, and the
+ * difference between the family alias `opus` (tracks the install default) and
+ * the frozen id `claude-opus-5[1m]` is the whole point of having written one
+ * rather than the other.
+ */
+export function parseTaskPin(raw: string): TaskPin {
+  try {
+    const parsed = JSON.parse(raw) as { flagIntent?: { turnModel?: unknown; turnEffort?: unknown } };
+    const fi = parsed.flagIntent;
+    return {
+      model: typeof fi?.turnModel === 'string' && fi.turnModel !== '' ? fi.turnModel : null,
+      effort: typeof fi?.turnEffort === 'string' && fi.turnEffort !== '' ? fi.turnEffort : null,
+    };
+  } catch {
+    // LEGACY-COMPAT(v1-tasks): plain-string content carries no pin.
+    return { model: null, effort: null };
+  }
+}

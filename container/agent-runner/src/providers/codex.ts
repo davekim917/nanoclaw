@@ -44,6 +44,7 @@ import {
   writeCodexMcpConfigToml,
 } from './codex-app-server.js';
 import { CodexTurnLiveness, isCodexTerminalTurnItem, normalizeCodexThreadStatus } from './codex-liveness.js';
+import { attachTurnEffort } from './turn-effort.js';
 
 /**
  * Health watchdog for a single turn. Guards against codex-app-server wedging
@@ -1171,6 +1172,19 @@ export class CodexProvider implements AgentProvider {
     const effectiveModel = resolveQueryModel(input.model, this.model);
     const effectiveConfig = resolveQueryEffort(input.effort, this.stickyConfig);
     const effectiveFast = input.fast === true;
+    // What this query's turns actually run at, for the turn_usage ledger.
+    // `reasoning_effort` is what reaches the app-server as
+    // `-c model_reasoning_effort`; the requested value is the raw `-e` before
+    // resolveQueryEffort validated it, so a `-e` outside Codex's vocabulary
+    // (silently ignored, staying on the sticky default) is visible as a
+    // divergence rather than looking like it took effect. Codex reports one
+    // usage entry per turn, so there is no per-model attribution to make —
+    // see providers/turn-effort.ts.
+    const turnEffort = {
+      model: effectiveModel,
+      effective: effectiveConfig.reasoning_effort,
+      requested: input.effort ?? this.stickyConfig.reasoning_effort,
+    };
 
     async function* gen(): AsyncGenerator<ProviderEvent> {
       // One app-server per query invocation. The poll-loop keeps a single
@@ -1512,7 +1526,11 @@ export class CodexProvider implements AgentProvider {
                 yield ev;
                 return;
               }
-              yield ev;
+              // Stamp the effort this query is running at onto the turn's
+              // usage. Done here rather than in runOneTurn because this is
+              // where the resolved config lives; runOneTurn only ever sees a
+              // model string.
+              yield ev.type === 'result' ? { ...ev, usage: attachTurnEffort(ev.usage, turnEffort) } : ev;
             }
           }
         }

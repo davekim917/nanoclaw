@@ -22,6 +22,7 @@ import type {
   TurnUsageInfo,
 } from './types.js';
 import { mcpServersToOpenCodeConfig } from './mcp-to-opencode.js';
+import { attachTurnEffort } from './turn-effort.js';
 import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
 import { shouldPostInfraWarning } from '../modules/mailbox/index.js';
 import { MANAGED_GIT_OPENCODE_PLUGIN_PATH } from '../managed-git-guard.js';
@@ -1283,6 +1284,19 @@ export class OpenCodeProvider implements AgentProvider {
     // which model it's actually on.
     const turn: OpenCodeTurnOverrides = { model: input.model, effort: input.effort };
     const effectiveModel = input.model ?? process.env.OPENCODE_MODEL;
+    // What this query's turns actually run at, for the turn_usage ledger.
+    // `clampOpenCodeEffort` is the value that reaches the server config (null
+    // when it deliberately registers nothing); the raw string is what the
+    // resolution chain produced, so an `xhigh`->`high` remap or an
+    // unrecognized level is visible as a divergence instead of vanishing.
+    // OpenCode reports one summed usage entry per turn, so there is no
+    // per-model attribution to make — see providers/turn-effort.ts.
+    const rawTurnEffort = turn.effort ?? process.env.OPENCODE_EFFORT;
+    const turnEffort = {
+      model: effectiveModel,
+      effective: clampOpenCodeEffort(rawTurnEffort),
+      requested: rawTurnEffort,
+    };
     const promptModel = effectiveModel ? splitModelSlug(effectiveModel) : null;
 
     // OpenCode has no session-start hook API. Its native prompt lifecycle
@@ -1676,7 +1690,7 @@ export class OpenCodeProvider implements AgentProvider {
           type: 'result',
           text: resultText,
           steps: outcome.stepCount > 0 ? outcome.stepCount : null,
-          usage: outcome.usage,
+          usage: attachTurnEffort(outcome.usage, turnEffort),
         };
       }
     }

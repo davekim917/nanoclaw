@@ -132,6 +132,71 @@ describe('turn_usage — insert helper', () => {
     expect(sum('cost_usd')).toBeCloseTo(0.8, 10);
   });
 
+  it('records the effective and requested effort the provider stamped on the usage entry', () => {
+    recordTurnUsage('claude', {
+      model: 'claude-opus-5[1m]',
+      inputTokens: 100,
+      effort: 'high',
+      effortRequested: 'high',
+    });
+
+    const [row] = getTurnUsageRows();
+    expect(row).toMatchObject({ model: 'claude-opus-5[1m]', effort: 'high', effort_requested: 'high' });
+  });
+
+  it('keeps a clamped-away effort distinguishable from an unconfigured one', () => {
+    // Haiku supports no effort: the group's `high` reached the container and
+    // was dropped at the model. `effort IS NULL AND effort_requested = 'high'`
+    // is that finding; two NULLs would be indistinguishable from a group whose
+    // effort config never arrived at all — the bug this column exists for.
+    recordTurnUsage('claude', {
+      model: 'claude-haiku-4-5-20251001',
+      inputTokens: 5,
+      effort: null,
+      effortRequested: 'high',
+    });
+
+    const [row] = getTurnUsageRows();
+    expect(row.effort).toBeNull();
+    expect(row.effort_requested).toBe('high');
+  });
+
+  it('writes NULL effort for a provider that stamped none (rows predating the column)', () => {
+    recordTurnUsage('claude', { model: 'claude-opus-5[1m]', inputTokens: 100 });
+
+    const [row] = getTurnUsageRows();
+    expect(row.effort).toBeNull();
+    expect(row.effort_requested).toBeNull();
+  });
+
+  it('attributes a multi-model turn`s effort per row, not smeared across every model', () => {
+    // Mirrors poll-loop dispatching a TurnUsageInfo[] after the provider ran
+    // it through attachTurnEffort: the parent model carries the effort, the
+    // subagent models carry NULL because we never set theirs.
+    const turnId = 'turn-multi-effort';
+    for (const usage of [
+      { model: 'claude-opus-5[1m]', inputTokens: 100, effort: 'high', effortRequested: 'high' },
+      { model: 'claude-sonnet-5', inputTokens: 50, effort: null, effortRequested: null },
+    ]) {
+      recordTurnUsage('claude', usage, {
+        turnId,
+        steps: 3,
+        durationMs: 1000,
+        trigger: 'message',
+        rateLimitType: null,
+        rateLimitUtilization: null,
+        rateLimitResetsAt: null,
+      });
+    }
+
+    const rows = getTurnUsageRows();
+    expect(rows.map((r) => [r.model, r.effort])).toEqual([
+      ['claude-opus-5[1m]', 'high'],
+      ['claude-sonnet-5', null],
+    ]);
+    expect(new Set(rows.map((r) => r.turn_id))).toEqual(new Set([turnId]));
+  });
+
   it('writes the rate-limit meta fields when given, NULL when omitted (default TurnMeta)', () => {
     recordTurnUsage(
       'claude',
@@ -408,6 +473,63 @@ describe('turn_usage — table creation (real files, not the in-memory test mode
       });
     const row = reopened.prepare('SELECT provider FROM turn_usage').get() as { provider: string };
     expect(row.provider).toBe('claude');
+    reopened.close();
+  });
+
+  it('ALTERs effort/effort_requested onto an outbound.db that already has every other turn_usage column', () => {
+    const dbPath = tempDbPath();
+    // The realistic upgrade case: ~139 live session DBs for one group alone
+    // are at exactly this shape. The ALTER must run once and then be a no-op
+    // on every subsequent connect — `ALTER TABLE ... ADD COLUMN` throws on an
+    // existing column, so an unguarded one would crash-loop every session.
+    const seed = new Database(dbPath);
+    seed.run(`
+      CREATE TABLE turn_usage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        model TEXT,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        cache_read_tokens INTEGER,
+        cache_write_tokens INTEGER,
+        cost_usd REAL,
+        steps INTEGER,
+        duration_ms INTEGER,
+        trigger TEXT,
+        rate_limit_type TEXT,
+        rate_limit_utilization REAL,
+        rate_limit_resets_at TEXT,
+        turn_id TEXT
+      )
+    `);
+    seed.run(
+      `INSERT INTO turn_usage (ts, provider, model, input_tokens) VALUES ('2026-08-01T00:00:00.000Z', 'claude', 'claude-opus-5[1m]', 42)`,
+    );
+    seed.close();
+
+    const reopened = new Database(dbPath);
+    ensureNanoclawOutboundSchema(reopened);
+    // Idempotent: this is what every later connect does to an already-migrated
+    // file, and it must not throw.
+    expect(() => ensureNanoclawOutboundSchema(reopened)).not.toThrow();
+
+    const colsAfter = new Set(
+      (reopened.prepare("PRAGMA table_info('turn_usage')").all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    expect(colsAfter.has('effort')).toBe(true);
+    expect(colsAfter.has('effort_requested')).toBe(true);
+
+    // The pre-existing row stays NULL — no backfill is possible, and a NULL
+    // must not be read as "this turn ran at no effort".
+    const row = reopened.prepare('SELECT input_tokens, effort, effort_requested FROM turn_usage').get() as {
+      input_tokens: number;
+      effort: string | null;
+      effort_requested: string | null;
+    };
+    expect(row.input_tokens).toBe(42);
+    expect(row.effort).toBeNull();
+    expect(row.effort_requested).toBeNull();
     reopened.close();
   });
 

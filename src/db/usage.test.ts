@@ -211,6 +211,14 @@ function makeOutboundDbWithTurnMeta(): Database.Database {
   return db;
 }
 
+/** The current container shape — turn meta plus the effort columns. */
+function makeOutboundDbWithEffort(): Database.Database {
+  const db = makeOutboundDbWithTurnMeta();
+  db.exec('ALTER TABLE turn_usage ADD COLUMN effort TEXT');
+  db.exec('ALTER TABLE turn_usage ADD COLUMN effort_requested TEXT');
+  return db;
+}
+
 describe('rollupSessionUsage — central turn_usage mirror', () => {
   beforeEach(async () => {
     await initTestDb();
@@ -308,6 +316,37 @@ describe('rollupSessionUsage — central turn_usage mirror', () => {
     expect(centralRows[0].rate_limit_utilization).toBeNull();
     expect(centralRows[0].rate_limit_resets_at).toBeNull();
     expect(centralRows[0].turn_id).toBeNull();
+    expect(centralRows[0].effort).toBeNull();
+    expect(centralRows[0].effort_requested).toBeNull();
+  });
+
+  it('carries effort/effort_requested across the mirror instead of dropping them at the hop', async () => {
+    // A column that lands in the session DB and is lost here is WORSE than no
+    // column, because the central ledger is what operators read — a missing
+    // value there reads as "measured, and there was no effort".
+    const outDb = makeOutboundDbWithEffort();
+    outDb
+      .prepare(
+        `INSERT INTO turn_usage (ts, provider, model, turn_id, effort, effort_requested) VALUES
+           ('2026-08-10T01:00:00.000Z', 'claude', 'claude-opus-5[1m]', 'shared', 'high', 'high'),
+           ('2026-08-10T01:00:00.000Z', 'claude', 'claude-sonnet-5', 'shared', NULL, NULL),
+           ('2026-08-10T01:01:00.000Z', 'claude', 'claude-haiku-4-5-20251001', 'haiku-turn', NULL, 'high')`,
+      )
+      .run();
+
+    expect(await rollup(outDb)).toBe(3);
+
+    const rows = getRawDb()
+      .prepare('SELECT model, effort, effort_requested FROM turn_usage ORDER BY id ASC')
+      .all() as Array<{ model: string; effort: string | null; effort_requested: string | null }>;
+    expect(rows.map((r) => [r.model, r.effort, r.effort_requested])).toEqual([
+      ['claude-opus-5[1m]', 'high', 'high'],
+      // Subagent row on a multi-model turn: not attributable, not "no effort".
+      ['claude-sonnet-5', null, null],
+      // Clamped away by the model, but the configured value still reached the
+      // container — the pair is what tells those two apart.
+      ['claude-haiku-4-5-20251001', null, 'high'],
+    ]);
   });
 
   it('derives session_id from sessionDirKey (<agent-group>/<session>)', async () => {
@@ -411,6 +450,7 @@ describe('summarizeTurnUsage', () => {
     provider?: string;
     model?: string | null;
     turnId?: string | null;
+    effort?: string | null;
     input?: number;
     output?: number;
     cacheRead?: number;
@@ -419,8 +459,8 @@ describe('summarizeTurnUsage', () => {
   }): void {
     getRawDb()
       .prepare(
-        `INSERT INTO turn_usage (ts, session_id, agent_group_id, provider, model, turn_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
-         VALUES (@ts, @session, @group, @provider, @model, @turn_id, @input, @output, @cache_read, @cache_write, @cost)`,
+        `INSERT INTO turn_usage (ts, session_id, agent_group_id, provider, model, turn_id, effort, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
+         VALUES (@ts, @session, @group, @provider, @model, @turn_id, @effort, @input, @output, @cache_read, @cache_write, @cost)`,
       )
       .run({
         ts: row.ts ?? '2026-08-24T12:00:00.000Z',
@@ -429,6 +469,7 @@ describe('summarizeTurnUsage', () => {
         provider: row.provider ?? 'claude',
         model: row.model === undefined ? 'claude-opus-5' : row.model,
         turn_id: row.turnId === undefined ? 't-1' : row.turnId,
+        effort: row.effort ?? null,
         input: row.input ?? 0,
         output: row.output ?? 0,
         cache_read: row.cacheRead ?? 0,
@@ -436,6 +477,25 @@ describe('summarizeTurnUsage', () => {
         cost: row.cost ?? 0,
       });
   }
+
+  it('buckets by effort — the query that proves a group`s configured effort reached its container', async () => {
+    central({ turnId: 't-1', model: 'claude-opus-5[1m]', effort: 'high', cacheRead: 300 });
+    central({ turnId: 't-2', model: 'claude-opus-5[1m]', effort: 'high', cacheRead: 200 });
+    // Same group and model, a different effort — invisible before this column.
+    central({ turnId: 't-3', model: 'claude-opus-5[1m]', effort: 'xhigh', cacheRead: 100 });
+    // A pre-cutoff row: no effort was ever recorded. Buckets as '' alongside
+    // the not-attributable ones, and is NOT a measurement of "no effort".
+    central({ turnId: 't-4', model: 'claude-opus-5[1m]', effort: null, cacheRead: 50 });
+
+    const rows = await summarizeTurnUsage({ dimensions: ['model', 'effort'] });
+    const buckets = rows.filter((r) => r.model !== 'TOTAL').map((r) => [r.effort, r.turns]);
+    expect(buckets).toEqual([
+      ['high', 2],
+      ['xhigh', 1],
+      ['', 1],
+    ]);
+    expect(rows.at(-1)!.turns).toBe(4);
+  });
 
   it('counts distinct turns, not rows — a multi-model turn is one turn', async () => {
     central({ turnId: 't-1', model: 'claude-opus-5' });

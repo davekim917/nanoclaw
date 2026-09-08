@@ -244,6 +244,21 @@ export function ensureNanoclawOutboundSchema(outbound: Database): void {
     // loop), so COUNT(DISTINCT turn_id) is the honest turn count instead of
     // usage_daily's row-count-based `turns` (which over-counts a split turn).
     ['turn_id', 'TEXT'],
+    // effort/effort_requested: added after the columns above. Every other
+    // column here is a MEASUREMENT (what the API billed); effort is a REQUEST
+    // parameter no provider bills back, so it is stamped on at the provider
+    // (see providers/turn-effort.ts). `effort` is post-clamp — what actually
+    // ran; `effort_requested` is the pre-clamp resolution result, which is
+    // what tells "Haiku dropped a configured high" apart from "nothing was
+    // ever configured".
+    //
+    // NO BACKFILL IS POSSIBLE and none was attempted: the value never existed
+    // for turns written before 2026-09-07, so every row older than the
+    // container that first wrote these columns is NULL. A NULL here means
+    // "not recorded / not attributable", NEVER "ran at no effort" — see the
+    // same cutoff note on migration 076 and in turn-usage.ts.
+    ['effort', 'TEXT'],
+    ['effort_requested', 'TEXT'],
   ] as const) {
     if (!turnUsageCols.has(name)) outbound.exec(`ALTER TABLE turn_usage ADD COLUMN ${name} ${type}`);
   }

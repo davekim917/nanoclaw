@@ -44,6 +44,9 @@ const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-cli-tasks
 import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from '../../db/index.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
+import { resolveGroupProvider } from '../../container-config.js';
+import { auditTaskPins, formatStrandedPins, formatLateStrandedPins } from '../../modules/scheduling/pin-audit.js';
+import { validateTaskPin } from '../../modules/scheduling/task-flags.js';
 import { createSession, findSessionByAgentGroup, getSessionsByAgentGroup, taskThreadId } from '../../db/sessions.js';
 import { countDueMessages } from '../../modules/mailbox/ops/sweep.js';
 import { initSessionFolder } from '../../session-manager.js';
@@ -53,6 +56,7 @@ import { parseArgv } from '../parse-argv.js';
 import { formatTasksTable } from '../format-tasks.js';
 import type { CallerContext } from '../frame.js';
 import './tasks.js';
+import './groups.js'; // registers groups-config-update for the provider-migration tests
 import '../commands/index.js'; // registers tasks-help for the help-topic test
 
 function now(): string {
@@ -2121,13 +2125,27 @@ describe('formatTasksTable', () => {
 
   it('renders an aligned table with run history', () => {
     const lines = formatTasksTable(rows, now).split('\n');
-    expect(lines[0]).toMatch(/SERIES\s+SCHEDULE\s+RUNS\s+FAILED\s+LAST RUN\s+NEXT RUN\s+STATUS\s+AGE\s+PROMPT/);
+    expect(lines[0]).toMatch(/SERIES\s+SCHEDULE\s+RUNS\s+FAILED\s+LAST RUN\s+NEXT RUN\s+STATUS\s+PIN\s+AGE\s+PROMPT/);
     expect(lines[1]).toContain('1h'); // AGE column — created 1h ago
     expect(lines[1]).toContain('task-5bbe082a-6298-4699'); // FULL series id — copy-pasteable into `tasks get --id`
     expect(lines[1]).toContain('* * * * *');
     expect(lines[1]).toContain('1m ago'); // 09:04:30 vs 09:05:30
     expect(lines[1]).toContain('in 30s'); // 09:06:00 vs 09:05:30
     expect(lines[1]).toContain('…'); // prompt truncated
+  });
+
+  it('renders the per-fire PIN, and a dash when there is none', () => {
+    // The point of the column: `ncl tasks list` prints the HUMAN view unless
+    // --json is passed, so a pin only in the structured response is a pin the
+    // operator still cannot see.
+    const line = (r: Parameters<typeof formatTasksTable>[0][number]) => formatTasksTable([r], now).split('\n')[1];
+    expect(line({ series_id: 'a', model_pin: 'claude-sonnet-5', effort_pin: 'xhigh' })).toContain(
+      'claude-sonnet-5@xhigh',
+    );
+    expect(line({ series_id: 'b', model_pin: 'sonnet', effort_pin: null })).toContain('sonnet');
+    expect(line({ series_id: 'c', model_pin: null, effort_pin: 'high' })).toContain('@high');
+    // Unpinned renders as '-', not as an empty cell that reads like a bug.
+    expect(line({ series_id: 'd', model_pin: null, effort_pin: null })).toMatch(/\s-\s/);
   });
 
   it('handles a never-fired series and an empty list', () => {
@@ -2170,5 +2188,953 @@ describe('deep verb help (ncl tasks help create)', () => {
     await import('../commands/index.js');
     const resp = await dispatch({ id: 'h2', command: 'tasks-help-frobnicate', args: {} }, { caller: 'host' });
     expect(resp.ok).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Provider-migration pin semantics (2026-09-07 incident).
+//
+// These live HERE rather than in their own file on purpose: the fixture below
+// reaches the transitional synchronous central-DB handle (`getRawDb`) to run
+// migrations, and `src/db/raw-db-ratchet.test.ts` pins that referrer set as
+// only-ever-shrinking. A new test file would have widened it. This file is
+// already pinned and already carries the exact task fixture these need.
+//
+// A pin is validated ONCE, at create/update time, against the group's provider
+// as it stood then; nothing re-validates it at fire time. A codex->claude
+// switch therefore left a half-hourly series pinned to a codex model, and it
+// failed 21 consecutive fires over 14 hours before anyone noticed. The fix is
+// to WARN LOUDLY and proceed (repeated task failure is escalated on its own
+// now, and refusing would block legitimate migrations behind a flag nobody
+// asked for), plus a bulk re-pin command that can validate against the
+// provider a group is moving TO.
+// ---------------------------------------------------------------------------
+/** A group with a container config, a real group folder, and a provider set. */
+async function makePinGroup(id: string, provider: string | null): Promise<void> {
+  await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: now() });
+  await ensureContainerConfig(id);
+  if (provider) await updateContainerConfigScalars(id, { provider });
+  const dir = `${TEST_DIR}/groups/${id}`;
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    `${dir}/container.json`,
+    JSON.stringify(
+      { mcpServers: {}, packages: { apt: [], npm: [] }, additionalMounts: [], skills: 'all', provider },
+      null,
+      2,
+    ) + '\n',
+  );
+}
+
+/** A group whose container.json omits `provider` entirely — not `null`, absent. */
+async function makeNoProviderKeyGroup(id: string): Promise<void> {
+  await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: now() });
+  await ensureContainerConfig(id);
+  const dir = `${TEST_DIR}/groups/${id}`;
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    `${dir}/container.json`,
+    JSON.stringify({ mcpServers: {}, packages: { apt: [], npm: [] }, additionalMounts: [], skills: 'all' }, null, 2) +
+      '\n',
+  );
+}
+
+async function makePinnedTask(
+  group: string,
+  name: string,
+  pin: { model?: string; effort?: string },
+): Promise<{ series_id: string; session_id: string }> {
+  const r = await dispatch(
+    {
+      id: `create-${name}`,
+      command: 'tasks-create',
+      args: { group, name, prompt: 'x', process_after: '2999-01-01T00:00:00Z', ...pin },
+    },
+    { caller: 'host' },
+  );
+  expect(r.ok).toBe(true);
+  if (!r.ok) throw new Error(r.error.message);
+  return r.data as { series_id: string; session_id: string };
+}
+
+function storedTaskPin(group: string, sessionId: string, seriesId: string): unknown {
+  const db = new Database(inboundDbPath(group, sessionId), { readonly: true });
+  const row = db.prepare("SELECT content FROM messages_in WHERE kind = 'task' AND id = ?").get(seriesId) as {
+    content: string;
+  };
+  db.close();
+  return (JSON.parse(row.content) as { flagIntent?: unknown }).flagIntent;
+}
+
+async function configUpdate(args: Record<string, unknown>) {
+  return dispatch({ id: `cfg-${Math.random()}`, command: 'groups-config-update', args }, { caller: 'host' });
+}
+
+async function repin(args: Record<string, unknown>) {
+  return dispatch({ id: `repin-${Math.random()}`, command: 'tasks-repin', args }, { caller: 'host' });
+}
+
+describe('provider vocabularies do not nest', () => {
+  // The premise the audit rests on. Verified against the live parser: an effort
+  // level valid on one provider is a hard error on another, in BOTH directions
+  // — so a migration cannot be waved through on "the new provider is a superset".
+  const cases: Array<[string, string, boolean]> = [
+    // NOTE `ultracode` is absent here on purpose: it is valid CHAT vocabulary
+    // on claude but is not a valid task PIN on any provider (see the dedicated
+    // case below). Pin validity is strictly narrower than chat validity, and
+    // listing it as `true` here would assert the opposite.
+    ['claude', 'ultra', false],
+    ['claude', 'xhigh', true],
+    ['codex', 'ultra', true],
+    ['codex', 'ultracode', false],
+    ['codex', 'xhigh', true],
+    ['opencode', 'xhigh', false],
+    ['opencode', 'ultra', false],
+    ['opencode', 'ultracode', false],
+    ['opencode', 'high', true],
+  ];
+  it.each(cases)('effort %s on %s valid=%s', (provider, effort, valid) => {
+    expect(validateTaskPin({ effort }, provider).error === undefined).toBe(valid);
+  });
+
+  it('pin validity is NARROWER than chat validity: ultracode is claude chat, never a pin', () => {
+    // `-e ultracode` is accepted in chat on a claude group. As a PIN it is
+    // refused on every provider, because the parser splits it into
+    // `turnEffort: 'xhigh'` plus a separate flag and only the effort is stored
+    // — so accepting it would persist something other than what was asked for.
+    for (const provider of ['claude', 'codex', 'opencode']) {
+      expect(validateTaskPin({ effort: 'ultracode' }, provider).error).toBeDefined();
+    }
+    expect(validateTaskPin({ effort: 'xhigh' }, 'claude').error).toBeUndefined();
+  });
+
+  it('a codex model id is not a claude model id, and vice versa', () => {
+    expect(validateTaskPin({ model: 'gpt-6-astra' }, 'claude').error).toContain('unknown model');
+    expect(validateTaskPin({ model: 'claude-sonnet-5' }, 'codex').error).toContain('unknown model');
+    expect(validateTaskPin({ model: 'claude-sonnet-5' }, 'opencode').error).toContain('unknown model');
+  });
+});
+
+describe('groups config update --provider refuses on stranded task pins', () => {
+  beforeEach(async () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    await initTestDb();
+    runMigrations(getRawDb());
+  });
+
+  afterEach(async () => {
+    await closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it('REFUSES a codex→claude switch that would strand a gpt-* model pin (the 2026-09-07 incident)', async () => {
+    await makePinGroup('ag-codex', 'codex');
+    const task = await makePinnedTask('ag-codex', 'pr-watch', { model: 'gpt-6-astra', effort: 'high' });
+
+    const r = await configUpdate({ id: 'ag-codex', provider: 'claude' });
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    // Actionable on its own: the series, its literal pin, the reason, and the
+    // exact remedy — the --from-model the fix needs is readable right here.
+    expect(r.error.message).toContain('Refusing to switch ag-codex');
+    expect(r.error.message).toContain(task.series_id);
+    expect(r.error.message).toContain('gpt-6-astra');
+    expect(r.error.message).toContain('unknown model');
+    expect(r.error.message).toContain('ncl tasks repin');
+    expect(r.error.message).toContain('--target-provider claude');
+
+    // Nothing was written — not the DB row, not container.json.
+    const row = getRawDb()
+      .prepare('SELECT provider FROM container_configs WHERE agent_group_id = ?')
+      .get('ag-codex') as { provider: string | null };
+    expect(row.provider).toBe('codex');
+    expect(JSON.parse(fs.readFileSync(`${TEST_DIR}/groups/ag-codex/container.json`, 'utf8')).provider).toBe('codex');
+  });
+
+  it('REFUSES on an effort-only stranding (claude xhigh → opencode, the next instance of this class)', async () => {
+    await makePinGroup('ag-claude', 'claude');
+    await makePinnedTask('ag-claude', 'smoke', { effort: 'xhigh' });
+
+    const r = await configUpdate({ id: 'ag-claude', provider: 'opencode' });
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.error.message).toContain('unknown effort level: xhigh');
+    expect(r.error.message).toContain('expected low|medium|high|max');
+  });
+
+  it('allows the switch when every armed pin is valid under the new provider', async () => {
+    await makePinGroup('ag-ok', 'claude');
+    // xhigh is valid on codex too; a paused series is audited the same as pending.
+    await makePinnedTask('ag-ok', 'ok-1', { effort: 'xhigh' });
+    const paused = await makePinnedTask('ag-ok', 'ok-2', { effort: 'high' });
+    await dispatch(
+      { id: 'pause', command: 'tasks-pause', args: { id: paused.series_id, group: 'ag-ok' } },
+      { caller: 'host' },
+    );
+
+    expect((await configUpdate({ id: 'ag-ok', provider: 'codex' })).ok).toBe(true);
+  });
+
+  it('audits PAUSED series too — a paused task resumes into the same broken fire', async () => {
+    await makePinGroup('ag-paused', 'codex');
+    const task = await makePinnedTask('ag-paused', 'sleeper', { model: 'gpt-6-astra' });
+    await dispatch(
+      { id: 'pause2', command: 'tasks-pause', args: { id: task.series_id, group: 'ag-paused' } },
+      { caller: 'host' },
+    );
+
+    const stranded = await auditTaskPins('ag-paused', 'claude');
+    expect(stranded).toHaveLength(1);
+    expect(stranded[0]).toMatchObject({ seriesId: task.series_id, status: 'paused', model: 'gpt-6-astra' });
+
+    expect((await configUpdate({ id: 'ag-paused', provider: 'claude' })).ok).toBe(false);
+  });
+
+  it('unpinned tasks never strand — they have nothing to strand', async () => {
+    await makePinGroup('ag-bare', 'codex');
+    await makePinnedTask('ag-bare', 'bare', {});
+    expect(await auditTaskPins('ag-bare', 'claude')).toEqual([]);
+    expect((await configUpdate({ id: 'ag-bare', provider: 'claude' })).ok).toBe(true);
+  });
+
+  it('leaves the pin BYTE-IDENTICAL — refusing never rewrites what it refuses over', async () => {
+    await makePinGroup('ag-keep', 'codex');
+    const task = await makePinnedTask('ag-keep', 'kept', { model: 'gpt-6-astra', effort: 'high' });
+
+    expect((await configUpdate({ id: 'ag-keep', provider: 'claude' })).ok).toBe(false);
+
+    expect(storedTaskPin('ag-keep', task.session_id, task.series_id)).toEqual({
+      turnModel: 'gpt-6-astra',
+      turnEffort: 'high',
+    });
+  });
+
+  it('has NO --force: a suppression-shaped flag does not get past the refusal', async () => {
+    await makePinGroup('ag-noflag', 'codex');
+    await makePinnedTask('ag-noflag', 'pinned', { model: 'gpt-6-astra' });
+    const r = await configUpdate({
+      id: 'ag-noflag',
+      provider: 'claude',
+      force: true,
+      'dangerously-strand-invalid-task-pins': true,
+    });
+    expect(r.ok).toBe(false);
+  });
+
+  it('a non-provider config update is never gated on the audit', async () => {
+    await makePinGroup('ag-other', 'codex');
+    await makePinnedTask('ag-other', 'pinned', { model: 'gpt-6-astra' });
+    expect((await configUpdate({ id: 'ag-other', assistant_name: 'Renamed' })).ok).toBe(true);
+  });
+
+  it('audits against container.json, not the DB projection, when the two disagree', async () => {
+    // `container.json` is authoritative — the spawn path and the runner read
+    // it; `container_configs` is a read-side projection that can lag. Deciding
+    // "is this a migration?" from the projection meant a group whose ROW
+    // already said claude while the FILE still said codex skipped the audit,
+    // and then this handler wrote the file — performing the real switch with
+    // every gpt-* pin carried into Claude unexamined.
+    await makePinGroup('ag-drift', 'codex');
+    const task = await makePinnedTask('ag-drift', 'drifted', { model: 'gpt-6-astra' });
+
+    // Desync exactly as an older DB-only edit would: row says claude, file codex.
+    await updateContainerConfigScalars('ag-drift', { provider: 'claude' });
+    expect(JSON.parse(fs.readFileSync(`${TEST_DIR}/groups/ag-drift/container.json`, 'utf8')).provider).toBe('codex');
+
+    const r = await configUpdate({ id: 'ag-drift', provider: 'claude' });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.error.message).toContain(task.series_id);
+    expect(r.error.message).toContain('gpt-6-astra');
+    // The authoritative file is untouched by the refusal.
+    expect(JSON.parse(fs.readFileSync(`${TEST_DIR}/groups/ag-drift/container.json`, 'utf8')).provider).toBe('codex');
+  });
+
+  it('resolves the provider through ONE seam — repin and the audit cannot disagree', async () => {
+    // The same invariant was found unfixed at three call sites across two
+    // review rounds (the audit, repin's matching, and create/update pin
+    // validation). It now lives in `resolveGroupProvider`; this asserts the
+    // consequence rather than the implementation — with the row and the file
+    // disagreeing, BOTH the audit and repin must answer with the file.
+    await makePinGroup('ag-seam', 'codex');
+    const t = await makePinnedTask('ag-seam', 'seamed', { model: 'gpt-6-astra' });
+    await updateContainerConfigScalars('ag-seam', { provider: 'claude' }); // projection lies
+
+    // repin matches in the FILE's vocabulary (codex), not the row's (claude)
+    const r = await repin({ group: 'ag-seam', from_model: 'astra', to_model: 'gpt-5.6-sol', match_resolved: true });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect((r.data as { applied: number }).applied).toBe(1);
+    expect(storedTaskPin('ag-seam', t.session_id, t.series_id)).toEqual({ turnModel: 'gpt-5.6-sol' });
+
+    // ...and the audit reads the same file, so the switch is still a migration
+    expect((await configUpdate({ id: 'ag-seam', provider: 'claude' })).ok).toBe(false);
+  });
+
+  it('an ABSENT provider key resolves to claude — the spawn default, not the projection', async () => {
+    // The resolver must agree with what actually BOOTS, including where the
+    // spawn path's answer comes from a default rather than a stored value.
+    // `container-runner.ts` calls resolveProviderName(session, file.provider)
+    // on the bind-mounted file; a missing key therefore runs Claude. Consulting
+    // the row for the absent case makes this switch read as a no-op:
+    // fromProvider would be the row's `codex`, equal to the requested `codex`,
+    // so the audit is SKIPPED and `codex` is written into the authoritative
+    // file — stranding the claude pin below in the exact migration this
+    // resolver exists to make safe. Pre-fix this returns ok:true.
+    await makeNoProviderKeyGroup('ag-nokey');
+    const task = await makePinnedTask('ag-nokey', 'unkeyed', { model: 'sonnet' });
+    // The projection goes stale AFTER the pin exists — a DB-only provider edit,
+    // a restore, an older code path. The file still has no provider key.
+    await updateContainerConfigScalars('ag-nokey', { provider: 'codex' });
+
+    // Assert the CONSEQUENCE first: pre-fix this is ok:true, the audit never
+    // runs, and the file is rewritten to codex under the pin below.
+    const r = await configUpdate({ id: 'ag-nokey', provider: 'codex' });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.error.message).toContain(task.series_id);
+    // ...and the authoritative file still has no provider key, so the group
+    // keeps booting Claude rather than being silently migrated.
+    expect(JSON.parse(fs.readFileSync(`${TEST_DIR}/groups/ag-nokey/container.json`, 'utf8')).provider).toBeUndefined();
+    expect(await resolveGroupProvider('ag-nokey')).toBe('claude');
+  });
+
+  it('an absent container.json resolves to claude, and never to the projection', async () => {
+    // readContainerConfig returns an empty config for a missing/malformed file
+    // rather than throwing, so this lands on the same default the spawn path
+    // would use. The row is not a fallback for it.
+    await createAgentGroup({
+      id: 'ag-nofile',
+      name: 'ag-nofile',
+      folder: 'ag-nofile',
+      agent_provider: null,
+      created_at: now(),
+    });
+    await ensureContainerConfig('ag-nofile');
+    await updateContainerConfigScalars('ag-nofile', { provider: 'opencode' });
+    expect(fs.existsSync(`${TEST_DIR}/groups/ag-nofile/container.json`)).toBe(false);
+
+    expect(await resolveGroupProvider('ag-nofile')).toBe('claude');
+  });
+
+  it('a session-level provider still outranks both stores', async () => {
+    // The absent-key fix removes the ROW as a fallback; it must not disturb
+    // the per-session sticky override, which is a real running-provider signal.
+    await makeNoProviderKeyGroup('ag-sticky');
+    await updateContainerConfigScalars('ag-sticky', { provider: 'claude' });
+    expect(await resolveGroupProvider('ag-sticky', 'codex')).toBe('codex');
+  });
+
+  it('the remedy command is runnable and matches the axis that actually stranded', async () => {
+    // Two defects in one message, both found in review:
+    //  - it always carried --dry-run, so an operator following it verbatim
+    //    previewed, changed nothing, and hit the identical refusal again;
+    //  - an EFFORT-only strand was handed a --from-model command, which
+    //    matches nothing.
+    await makePinGroup('ag-effort-only', 'codex');
+    // Valid model under both, effort valid only under codex.
+    await makePinnedTask('ag-effort-only', 'effort-strand', { model: 'gpt-6-astra', effort: 'ultra' });
+
+    const r = await configUpdate({ id: 'ag-effort-only', provider: 'claude' });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    const msg = r.error.message;
+
+    // The applying command must be present, i.e. a repin line that is not
+    // itself a preview. Pre-fix EVERY suggested command ended in --dry-run.
+    const commandLines = msg.split('\n').filter((l) => l.includes('ncl tasks repin'));
+    expect(commandLines.length).toBeGreaterThan(0);
+    expect(commandLines.some((l) => l.includes('--dry-run'))).toBe(false);
+    expect(msg).toContain('WITHOUT --dry-run to apply');
+
+    // The effort axis stranded, so the effort axis is what the remedy offers.
+    expect(msg).toContain('--from-effort ultra');
+  });
+
+  it('a post-switch strand says the switch LANDED, never that it was refused', async () => {
+    // The post-write re-audit reused the refusal text, which says the switch
+    // is being refused — but by then it has already been applied to both the
+    // DB row and the authoritative container.json. An operator reading it
+    // would go looking for a switch to retry that already happened.
+    const stranded = [
+      {
+        seriesId: 'series-late',
+        sessionId: 'sess-late',
+        status: 'pending',
+        model: 'sonnet',
+        effort: null,
+        reason: 'model not valid',
+      },
+    ];
+    const late = formatLateStrandedPins(stranded, 'ag-late', 'claude', 'codex');
+
+    expect(late).toContain('HAS BEEN APPLIED');
+    expect(late).toContain('Do NOT re-run the switch');
+    expect(late).not.toContain('Refusing to switch');
+    // The group is already on the new provider, so the COMMAND must not tell
+    // the operator to validate against a provider it already has. Checked on
+    // the command lines, not the whole message — the prose mentions the flag
+    // by name to explain its absence.
+    const lateCommands = late.split('\n').filter((l) => l.includes('ncl tasks repin'));
+    expect(lateCommands.length).toBeGreaterThan(0);
+    expect(lateCommands.some((l) => l.includes('--target-provider'))).toBe(false);
+    expect(late).toContain('--from-model sonnet');
+
+    // ...and the pre-switch text still says the opposite, deliberately.
+    const refusal = formatStrandedPins(stranded, 'ag-late', 'claude', 'codex');
+    expect(refusal).toContain('Refusing to switch');
+    expect(refusal).toContain('--target-provider codex');
+  });
+
+  it('re-stating the SAME provider is not a migration and is never refused', async () => {
+    await makePinGroup('ag-same', 'codex');
+    await makePinnedTask('ag-same', 'pinned', { model: 'gpt-6-astra' });
+    expect((await configUpdate({ id: 'ag-same', provider: 'codex' })).ok).toBe(true);
+  });
+
+  it('KNOWN GAP, deliberate: a retired model id passes the vocabulary check', () => {
+    // `VALID_MODEL_RE` is a SHAPE check, so any well-formed claude-opus-<n>-<n>
+    // validates. A pin written today to a retired id is legal at creation and
+    // unrunnable at fire time — the same class as a wrong-provider pin, reached
+    // by retirement instead of migration. NOT fixed here: a membership set
+    // would be a second copy of a vocabulary that lives in one place, and the
+    // last tightening of this regex rejected the fork's own DEFAULT_HAIKU_MODEL
+    // and silently fell through to the Opus default at the spawn seam.
+    // Scheduled-task failure escalation covers the fire-time symptom; `ncl
+    // tasks repin` is the remediation when a model actually retires. This test
+    // exists so the gap stays a recorded decision, not a rediscovery.
+    expect(validateTaskPin({ model: 'claude-opus-4-7' }, 'claude').error).toBeUndefined();
+    expect(validateTaskPin({ model: 'claude-opus-9-3' }, 'claude').error).toBeUndefined();
+  });
+});
+
+describe('ncl tasks repin', () => {
+  beforeEach(async () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    await initTestDb();
+    runMigrations(getRawDb());
+    await makePinGroup('ag-1', 'claude');
+  });
+
+  afterEach(async () => {
+    await closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it('--dry-run reports the change and writes nothing', async () => {
+    const t = await makePinnedTask('ag-1', 'bump', { model: 'claude-sonnet-5', effort: 'xhigh' });
+
+    const r = await repin({
+      group: 'ag-1',
+      from_model: 'claude-sonnet-5',
+      to_model: 'claude-opus-5[1m]',
+      dry_run: true,
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const data = r.data as { matched: number; applied: number; changes: Array<Record<string, unknown>> };
+    expect(data.matched).toBe(1);
+    expect(data.applied).toBe(0);
+    expect(data.changes[0]).toMatchObject({
+      series_id: t.series_id,
+      from: { model: 'claude-sonnet-5', effort: 'xhigh' },
+      to: { model: 'claude-opus-5[1m]', effort: 'xhigh' },
+    });
+
+    expect(storedTaskPin('ag-1', t.session_id, t.series_id)).toEqual({
+      turnModel: 'claude-sonnet-5',
+      turnEffort: 'xhigh',
+    });
+  });
+
+  it('retargets a model pin in bulk and leaves the effort pin alone', async () => {
+    const a = await makePinnedTask('ag-1', 'a', { model: 'claude-sonnet-5', effort: 'xhigh' });
+    const b = await makePinnedTask('ag-1', 'b', { model: 'claude-sonnet-5' });
+    const untouched = await makePinnedTask('ag-1', 'c', { model: 'claude-fable-5-1[1m]', effort: 'medium' });
+
+    const r = await repin({ group: 'ag-1', from_model: 'claude-sonnet-5', to_model: 'claude-opus-5[1m]' });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect((r.data as { applied: number }).applied).toBe(2);
+
+    expect(storedTaskPin('ag-1', a.session_id, a.series_id)).toEqual({
+      turnModel: 'claude-opus-5[1m]',
+      turnEffort: 'xhigh',
+    });
+    expect(storedTaskPin('ag-1', b.session_id, b.series_id)).toEqual({ turnModel: 'claude-opus-5[1m]' });
+    expect(storedTaskPin('ag-1', untouched.session_id, untouched.series_id)).toEqual({
+      turnModel: 'claude-fable-5-1[1m]',
+      turnEffort: 'medium',
+    });
+  });
+
+  it('bulk-changes EFFORT the same way — the invalidation class is symmetric', async () => {
+    const t = await makePinnedTask('ag-1', 'eff', { model: 'claude-opus-5[1m]', effort: 'xhigh' });
+    const r = await repin({ group: 'ag-1', from_effort: 'xhigh', to_effort: 'high' });
+    expect(r.ok).toBe(true);
+    expect(storedTaskPin('ag-1', t.session_id, t.series_id)).toEqual({
+      turnModel: 'claude-opus-5[1m]',
+      turnEffort: 'high',
+    });
+  });
+
+  it('refuses the WHOLE run when any target is invalid — never half-applies', async () => {
+    const a = await makePinnedTask('ag-1', 'a', { model: 'claude-sonnet-5' });
+    const b = await makePinnedTask('ag-1', 'b', { model: 'claude-sonnet-5' });
+
+    const r = await repin({ group: 'ag-1', from_model: 'claude-sonnet-5', to_model: 'gpt-6-astra' });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.error.message).toContain('refusing to re-pin');
+    expect(r.error.message).toContain('unknown model: gpt-6-astra');
+
+    for (const t of [a, b]) {
+      expect(storedTaskPin('ag-1', t.session_id, t.series_id)).toEqual({ turnModel: 'claude-sonnet-5' });
+    }
+  });
+
+  it('--target-provider is what makes re-pinning AHEAD of a migration possible', async () => {
+    await makePinGroup('ag-codex', 'codex');
+    const t = await makePinnedTask('ag-codex', 'pr-watch', { model: 'gpt-6-astra', effort: 'high' });
+
+    // Without it the group is still codex, so the correct new value is rejected.
+    const blocked = await repin({ group: 'ag-codex', from_model: 'gpt-6-astra', to_model: 'claude-sonnet-5' });
+    expect(blocked.ok).toBe(false);
+
+    const ahead = await repin({
+      group: 'ag-codex',
+      target_provider: 'claude',
+      from_model: 'gpt-6-astra',
+      to_model: 'claude-sonnet-5',
+    });
+    expect(ahead.ok).toBe(true);
+    expect(storedTaskPin('ag-codex', t.session_id, t.series_id)).toEqual({
+      turnModel: 'claude-sonnet-5',
+      turnEffort: 'high',
+    });
+
+    // ...and the migration the audit refused now goes through.
+    expect((await configUpdate({ id: 'ag-codex', provider: 'claude' })).ok).toBe(true);
+  });
+
+  it('matches LITERALLY by default and reports the near-miss instead of silently looking exhaustive', async () => {
+    const alias = await makePinnedTask('ag-1', 'alias', { model: 'sonnet' });
+    const frozen = await makePinnedTask('ag-1', 'frozen', { model: 'claude-sonnet-5' });
+
+    const literal = await repin({
+      group: 'ag-1',
+      from_model: 'claude-sonnet-5',
+      to_model: 'claude-opus-5[1m]',
+      dry_run: true,
+    });
+    expect(literal.ok).toBe(true);
+    if (!literal.ok) return;
+    const data = literal.data as {
+      matched: number;
+      near_misses: Array<{ series_id: string; model: string | null }>;
+    };
+    expect(data.matched).toBe(1);
+    // `sonnet` resolves to claude-sonnet-5 but is a DIFFERENT pin: it tracks
+    // the install default across future bumps. Rewriting it would freeze it.
+    expect(data.near_misses).toEqual([expect.objectContaining({ series_id: alias.series_id, model: 'sonnet' })]);
+    expect(frozen.series_id).toBeTruthy();
+
+    const unified = await repin({
+      group: 'ag-1',
+      from_model: 'claude-sonnet-5',
+      to_model: 'claude-opus-5[1m]',
+      match_resolved: true,
+      dry_run: true,
+    });
+    expect(unified.ok).toBe(true);
+    if (!unified.ok) return;
+    expect((unified.data as { matched: number }).matched).toBe(2);
+  });
+
+  it('requires a --from- for every --to-, and a scope', async () => {
+    // Asserting the MESSAGE, not just !ok: "no such command" is also !ok, and
+    // a test that cannot tell those apart proves nothing about this verb.
+    const noFrom = await repin({ group: 'ag-1', to_model: 'claude-opus-5[1m]' });
+    expect(noFrom.ok).toBe(false);
+    if (!noFrom.ok) expect(noFrom.error.message).toContain('--to-model requires --from-model');
+
+    const noTo = await repin({ group: 'ag-1', from_model: 'claude-sonnet-5' });
+    expect(noTo.ok).toBe(false);
+    if (!noTo.ok) expect(noTo.error.message).toContain('nothing to set');
+
+    const noScope = await repin({ from_model: 'claude-sonnet-5', to_model: 'claude-opus-5[1m]' });
+    expect(noScope.ok).toBe(false);
+    if (!noScope.ok) expect(noScope.error.message).toContain('a scope is required');
+  });
+
+  it('--all spans groups and validates each against ITS OWN provider', async () => {
+    await makePinGroup('ag-codex', 'codex');
+    const claudeTask = await makePinnedTask('ag-1', 'c', { effort: 'xhigh' });
+    const codexTask = await makePinnedTask('ag-codex', 'x', { effort: 'xhigh' });
+
+    // `ultracode` is claude-only, so a fleet-wide run must refuse on the codex
+    // group rather than validating everything against one representative.
+    const mixed = await repin({ all: true, from_effort: 'xhigh', to_effort: 'ultracode' });
+    expect(mixed.ok).toBe(false);
+    if (!mixed.ok) expect(mixed.error.message).toContain('ultracode is Claude-only');
+
+    // `high` is valid on both, so the same run applies everywhere.
+    const ok = await repin({ all: true, from_effort: 'xhigh', to_effort: 'high' });
+    expect(ok.ok).toBe(true);
+    if (!ok.ok) return;
+    expect((ok.data as { applied: number }).applied).toBe(2);
+    expect(storedTaskPin('ag-1', claudeTask.session_id, claudeTask.series_id)).toEqual({ turnEffort: 'high' });
+    expect(storedTaskPin('ag-codex', codexTask.session_id, codexTask.series_id)).toEqual({ turnEffort: 'high' });
+  });
+
+  it('exposes the pin in tasks list — in the HUMAN view, not only in --json', async () => {
+    const t = await makePinnedTask('ag-1', 'visible', { model: 'claude-sonnet-5', effort: 'xhigh' });
+    const listed = await dispatch({ id: 'ls', command: 'tasks-list', args: { group: 'ag-1' } }, { caller: 'host' });
+    expect(listed.ok).toBe(true);
+    if (!listed.ok) return;
+
+    // Machine contract.
+    const rows = listed.data as Array<{ series_id: string; model_pin: string | null; effort_pin: string | null }>;
+    expect(rows.find((r) => r.series_id === t.series_id)).toMatchObject({
+      model_pin: 'claude-sonnet-5',
+      effort_pin: 'xhigh',
+    });
+
+    // And what an operator running `ncl tasks list` actually sees. The client
+    // prints `human` verbatim when present, so a pin absent from the table is
+    // a pin the audit tells you to fix and gives you no way to read.
+    expect(listed.human).toBeDefined();
+    expect(listed.human).toContain('PIN');
+    expect(listed.human).toContain('claude-sonnet-5@xhigh');
+  });
+
+  it('persists the RESOLVED model, not the alias the operator typed', async () => {
+    // `astra` is accepted only BECAUSE it resolves to `gpt-6-astra`. Storing
+    // the raw alias persists a value the validator never approved, and
+    // codex.ts::resolveQueryModel accepts only `gpt-*` — it would silently fall
+    // back to the configured model on every fire, forever, with no error.
+    await makePinGroup('ag-cx', 'codex');
+    const t = await makePinnedTask('ag-cx', 'alias', { model: 'gpt-5.6-sol' });
+
+    const r = await repin({ group: 'ag-cx', from_model: 'gpt-5.6-sol', to_model: 'astra' });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(storedTaskPin('ag-cx', t.session_id, t.series_id)).toEqual({ turnModel: 'gpt-6-astra' });
+    // The dry-run/report view must show the stored value too, not the alias.
+    expect((r.data as { changes: Array<{ to: { model: string } }> }).changes[0].to.model).toBe('gpt-6-astra');
+  });
+
+  it('validates the MERGED pin, not just the half being written', async () => {
+    // updateTask MERGES flagIntent. A codex task at {gpt-6-astra, ultra}
+    // repinned to a Claude model would store {claude-…, ultra} — still invalid
+    // for Claude, so the provider migration this command exists to unblock
+    // stays blocked while the repin reports success.
+    await makePinGroup('ag-mix', 'codex');
+    const t = await makePinnedTask('ag-mix', 'mixed', { model: 'gpt-6-astra', effort: 'ultra' });
+
+    const modelOnly = await repin({
+      group: 'ag-mix',
+      target_provider: 'claude',
+      from_model: 'gpt-6-astra',
+      to_model: 'claude-sonnet-5',
+    });
+    expect(modelOnly.ok).toBe(false);
+    if (modelOnly.ok) return;
+    expect(modelOnly.error.message).toContain('unknown effort level: ultra');
+    // ...and nothing was written, so the series is not left half-migrated.
+    expect(storedTaskPin('ag-mix', t.session_id, t.series_id)).toEqual({
+      turnModel: 'gpt-6-astra',
+      turnEffort: 'ultra',
+    });
+
+    // Moving BOTH axes is accepted, and that is what actually clears the
+    // provider switch.
+    const both = await repin({
+      group: 'ag-mix',
+      target_provider: 'claude',
+      from_model: 'gpt-6-astra',
+      to_model: 'claude-sonnet-5',
+      from_effort: 'ultra',
+      to_effort: 'xhigh',
+    });
+    expect(both.ok).toBe(true);
+    expect(storedTaskPin('ag-mix', t.session_id, t.series_id)).toEqual({
+      turnModel: 'claude-sonnet-5',
+      turnEffort: 'xhigh',
+    });
+    expect((await configUpdate({ id: 'ag-mix', provider: 'claude' })).ok).toBe(true);
+  });
+
+  it('matches --from-effort case-insensitively without --match-resolved', async () => {
+    // Effort has no alias layer: `XHIGH` IS `xhigh`, so matching it is
+    // normalization, not the semantic widening --match-resolved gates. The
+    // registry documents a case-insensitive compare; before this, `--from-effort
+    // XHIGH` reported zero changes unless an unrelated model flag was added.
+    const t = await makePinnedTask('ag-1', 'case', { effort: 'xhigh' });
+    const r = await repin({ group: 'ag-1', from_effort: 'XHIGH', to_effort: 'high' });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect((r.data as { applied: number }).applied).toBe(1);
+    expect(storedTaskPin('ag-1', t.session_id, t.series_id)).toEqual({ turnEffort: 'high' });
+  });
+
+  it('model matching stays case-SENSITIVE — an id is not an effort level', async () => {
+    await makePinnedTask('ag-1', 'model-case', { model: 'claude-sonnet-5' });
+    const r = await repin({
+      group: 'ag-1',
+      from_model: 'CLAUDE-SONNET-5',
+      to_model: 'claude-opus-5[1m]',
+      dry_run: true,
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect((r.data as { matched: number }).matched).toBe(0);
+  });
+
+  it('INHERITS the cross-group --session refusal from selectedSessions (#567)', async () => {
+    // `repin` carries no guard of its own for this: the invariant lives in
+    // `selectedSessions`, which every verb in this file calls, and a second
+    // copy here is how the two would drift. This test is the proof that the
+    // inheritance actually holds for the fleet-wide bulk path, not an
+    // assumption that calling the helper is enough.
+    await makePinGroup('ag-other-grp', 'claude');
+    const mine = await makePinnedTask('ag-1', 'mine', { effort: 'high' });
+    const theirs = await makePinnedTask('ag-other-grp', 'theirs', { effort: 'high' });
+
+    const r = await repin({ group: 'ag-1', session: theirs.session_id, from_effort: 'high', to_effort: 'xhigh' });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.error.message).toContain('belongs to agent group');
+
+    // Neither group's pin moved.
+    expect(storedTaskPin('ag-other-grp', theirs.session_id, theirs.series_id)).toEqual({ turnEffort: 'high' });
+    expect(storedTaskPin('ag-1', mine.session_id, mine.series_id)).toEqual({ turnEffort: 'high' });
+  });
+
+  it('the durable audit row records the MERGED pin, not a cleared axis', async () => {
+    // updateTask merges, so an untouched axis survives. Recording it as null
+    // says the pin was cleared — a wrong audit row is worse than none when
+    // someone is reconstructing an incident.
+    const t = await makePinnedTask('ag-1', 'audited', { model: 'claude-sonnet-5', effort: 'xhigh' });
+    expect((await repin({ group: 'ag-1', from_model: 'claude-sonnet-5', to_model: 'claude-opus-5[1m]' })).ok).toBe(
+      true,
+    );
+
+    const row = getRawDb()
+      .prepare("SELECT detail_json FROM scheduled_audit WHERE series_id = ? AND action = 'update' ORDER BY id DESC")
+      .get(t.series_id) as { detail_json: string };
+    const detail = JSON.parse(row.detail_json) as { repin: { to: { model: string; effort: string } } };
+    expect(detail.repin.to).toEqual({ model: 'claude-opus-5[1m]', effort: 'xhigh' });
+  });
+
+  describe('contradictory inputs are refused, never silently reconciled', () => {
+    // One class, three instances. Silently picking a winner is indefensible
+    // because both readings are plausible to the caller, so whichever the code
+    // drops was — half the time — the one that was meant, and the command
+    // reports success either way.
+
+    it('--target-provider requires --group: fleet-wide it would strand pins it was built to fix', async () => {
+      await makePinGroup('ag-cx2', 'codex');
+      const codexTask = await makePinnedTask('ag-cx2', 'cx', { model: 'gpt-6-astra' });
+      // ag-1 is a claude group, so its pin must be claude vocabulary — `create`
+      // rejects a codex id here, which is the create-time half already working.
+      const claudeTask = await makePinnedTask('ag-1', 'cl', { model: 'claude-sonnet-5' });
+
+      const r = await repin({
+        all: true,
+        target_provider: 'claude',
+        from_model: 'gpt-6-astra',
+        to_model: 'claude-sonnet-5',
+      });
+      expect(r.ok).toBe(false);
+      if (r.ok) return;
+      expect(r.error.message).toContain('--target-provider requires --group');
+
+      // Without the guard this wrote a Claude model id onto a CODEX group's
+      // series and reported success — the stranded-pin condition this PR exists
+      // to prevent, manufactured by the remediation tool.
+      expect(storedTaskPin('ag-cx2', codexTask.session_id, codexTask.series_id)).toEqual({
+        turnModel: 'gpt-6-astra',
+      });
+      expect(storedTaskPin('ag-1', claudeTask.session_id, claudeTask.series_id)).toEqual({
+        turnModel: 'claude-sonnet-5',
+      });
+    });
+
+    it('--all and --session are refused together — the session used to silently win', async () => {
+      const r = await repin({ all: true, session: 'sess-anything', from_effort: 'high', to_effort: 'xhigh' });
+      expect(r.ok).toBe(false);
+      if (r.ok) return;
+      expect(r.error.message).toContain('contradictory scopes');
+      expect(r.error.message).toContain('--session alone is already a complete scope');
+    });
+
+    it('--session alone IS a complete scope — the refusal message promises that', async () => {
+      // Self-caught: the `--all`/`--session` refusal I added tells the operator
+      // "--session alone is already a complete scope", while the scope check
+      // above it rejected exactly that. An error message that instructs you to
+      // do something the code forbids is worse than no message.
+      const t = await makePinnedTask('ag-1', 'sess-scope', { effort: 'high' });
+      const r = await repin({ session: t.session_id, from_effort: 'high', to_effort: 'xhigh' });
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      expect((r.data as { applied: number }).applied).toBe(1);
+      expect(storedTaskPin('ag-1', t.session_id, t.series_id)).toEqual({ turnEffort: 'xhigh' });
+    });
+
+    it('an EMPTY flag does not read as absent — the guard defeated by its own presence test', async () => {
+      // `str('')` is undefined, so `--group ""` used to read as "no group" and
+      // skip the contradiction guard entirely, silently widening a scoped repin
+      // to FLEET-WIDE. Same for `--all --session ""`. Fails open, which is the
+      // dangerous direction.
+      const empties: Array<Record<string, unknown>> = [
+        { group: '', all: true, from_effort: 'high', to_effort: 'xhigh' },
+        { all: true, session: '', from_effort: 'high', to_effort: 'xhigh' },
+      ];
+      for (const args of empties) {
+        const r = await repin(args);
+        expect(r.ok).toBe(false);
+        if (!r.ok) expect(r.error.message).toContain('without a usable value');
+      }
+
+      // `--target-provider ""` never reaches the handler: the registry's own
+      // enum validation rejects it first, with a better message than mine.
+      // Asserted rather than assumed, so a later change that drops the enum
+      // does not silently reopen the empty-flag hole on this flag too.
+      const emptyProvider = await repin({
+        group: 'ag-1',
+        target_provider: '',
+        from_effort: 'high',
+        to_effort: 'xhigh',
+      });
+      expect(emptyProvider.ok).toBe(false);
+      if (!emptyProvider.ok) expect(emptyProvider.error.message).toContain('--target-provider must be one of');
+    });
+
+    it('--group and --all are refused together rather than one silently winning', async () => {
+      const r = await repin({ group: 'ag-1', all: true, from_effort: 'high', to_effort: 'xhigh' });
+      expect(r.ok).toBe(false);
+      if (r.ok) return;
+      expect(r.error.message).toContain('contradictory scopes');
+    });
+  });
+
+  it('rejects a pin whose axis the parser DROPS rather than errors on', async () => {
+    // `-m1 haiku -e1 xhigh` is a WARNING in chat, not an error: the parser
+    // applies the model, skips the effort, and the human reads "skipped
+    // effort" on screen. A pin has no such reader — it fires unattended for
+    // weeks — so "accepted, minus a piece you asked for" is indistinguishable
+    // from "accepted" at every later read.
+    expect(validateTaskPin({ model: 'haiku', effort: 'xhigh' }, 'claude').error).toContain('dropped by validation');
+    expect(validateTaskPin({ model: 'sonnet', effort: 'xhigh' }, 'claude').error).toBeUndefined();
+
+    // And repin must not store the raw request when validation returned
+    // something else — that is the round-1 defect reappearing in the fallback.
+    const t = await makePinnedTask('ag-1', 'dropaxis', { model: 'claude-sonnet-5', effort: 'xhigh' });
+    const r = await repin({
+      group: 'ag-1',
+      from_model: 'claude-sonnet-5',
+      to_model: 'haiku',
+      from_effort: 'xhigh',
+      to_effort: 'xhigh',
+    });
+    expect(r.ok).toBe(false);
+    expect(storedTaskPin('ag-1', t.session_id, t.series_id)).toEqual({
+      turnModel: 'claude-sonnet-5',
+      turnEffort: 'xhigh',
+    });
+  });
+
+  it("--match-resolved resolves aliases in the TARGET GROUP's vocabulary, not always claude's", async () => {
+    // `resolveEffectiveModel` only expands claude family aliases, so a codex
+    // group storing `gpt-6-astra` was unreachable via its own alias `astra`.
+    await makePinGroup('ag-cxr', 'codex');
+    const t = await makePinnedTask('ag-cxr', 'astra-pin', { model: 'gpt-6-astra' });
+
+    const r = await repin({
+      group: 'ag-cxr',
+      from_model: 'astra',
+      to_model: 'gpt-5.6-sol',
+      match_resolved: true,
+      dry_run: true,
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const data = r.data as { matched: number; changes: Array<{ series_id: string }> };
+    expect(data.matched).toBe(1);
+    expect(data.changes[0].series_id).toBe(t.series_id);
+  });
+
+  it('rejects ultracode as a pin instead of silently storing plain xhigh', async () => {
+    // The parser represents `ultracode` as turnEffort:'xhigh' PLUS a separate
+    // turnUltracode flag; the stored pin carries only the effort. Accepting it
+    // would report success and persist `xhigh`, losing what was asked for.
+    expect(validateTaskPin({ effort: 'ultracode' }, 'claude').error).toContain('cannot be a task pin');
+    expect(validateTaskPin({ effort: 'xhigh' }, 'claude').error).toBeUndefined();
+
+    const t = await makePinnedTask('ag-1', 'uc', { effort: 'high' });
+    const r = await repin({ group: 'ag-1', from_effort: 'high', to_effort: 'ultracode' });
+    expect(r.ok).toBe(false);
+    expect(storedTaskPin('ag-1', t.session_id, t.series_id)).toEqual({ turnEffort: 'high' });
+  });
+
+  it('matches source pins in the CURRENT vocabulary while validating against the TARGET', async () => {
+    // The two questions are different: matching asks what vocabulary the stored
+    // pin was WRITTEN in (always the group's current provider), validation asks
+    // whether the new value will RUN (the target, when migrating). Resolving
+    // `astra` with claude's tables because the group is moving to claude finds
+    // nothing — the stored value is `gpt-6-astra` in codex's.
+    await makePinGroup('ag-mig', 'codex');
+    const t = await makePinnedTask('ag-mig', 'mig', { model: 'gpt-6-astra' });
+
+    const r = await repin({
+      group: 'ag-mig',
+      target_provider: 'claude',
+      from_model: 'astra',
+      to_model: 'claude-sonnet-5',
+      match_resolved: true,
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect((r.data as { applied: number }).applied).toBe(1);
+    expect(storedTaskPin('ag-mig', t.session_id, t.series_id)).toEqual({ turnModel: 'claude-sonnet-5' });
+    // ...and that is what clears the migration the audit refuses.
+    expect((await configUpdate({ id: 'ag-mig', provider: 'claude' })).ok).toBe(true);
+  });
+
+  it('reports partial completion rather than claiming the write phase is atomic', async () => {
+    // Validation is all-or-nothing; the WRITE cannot be — each series lives in
+    // its own session database, so there is no transaction spanning them and no
+    // honest rollback. The command must therefore say exactly what landed.
+    const a = await makePinnedTask('ag-1', 'p1', { effort: 'high' });
+    const b = await makePinnedTask('ag-1', 'p2', { effort: 'high' });
+    const r = await repin({ group: 'ag-1', from_effort: 'high', to_effort: 'xhigh' });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const data = r.data as { applied: number; failed: unknown[] };
+    expect(data.applied).toBe(2);
+    // `failed` is always present, so a caller reading it cannot mistake
+    // "partial" for "complete" just because nothing failed this time.
+    expect(data.failed).toEqual([]);
+    for (const t of [a, b]) {
+      expect(storedTaskPin('ag-1', t.session_id, t.series_id)).toEqual({ turnEffort: 'xhigh' });
+    }
+  });
+
+  it('an effort-only repin leaves the model pin literally untouched', async () => {
+    // The merged-validation fix must not become a merged-REWRITE: resolving the
+    // untouched axis would turn the family alias `sonnet` (tracks the install
+    // default) into a frozen id nobody asked to freeze.
+    const t = await makePinnedTask('ag-1', 'alias-keep', { model: 'sonnet', effort: 'high' });
+    const r = await repin({ group: 'ag-1', from_effort: 'high', to_effort: 'xhigh' });
+    expect(r.ok).toBe(true);
+    expect(storedTaskPin('ag-1', t.session_id, t.series_id)).toEqual({
+      turnModel: 'sonnet',
+      turnEffort: 'xhigh',
+    });
   });
 });

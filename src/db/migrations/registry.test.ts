@@ -127,6 +127,7 @@ describe('central migration registry', () => {
       'observatory-signal-workgroup-cascade',
       'pending-channel-approvals-cascade',
       'task-run-outcomes',
+      'turn-usage-effort',
     ]);
     const liveSchema = schemaObjects(live);
     // Canary: two empty snapshots compare equal, so assert the query actually
