@@ -141,7 +141,14 @@ next spawn, and the enabler run is just a verification pass.
    ```
 
    Note opt-out is per **group folder** (e.g. `main`, `main-codex`, `main-opencode` are
-   three separate groups). To opt a workgroup out entirely, exclude all its siblings.
+   three separate groups), so excluding a workgroup means naming every sibling.
+
+   **Complete opt-out is not achievable for an OpenCode sibling.** Excluding it drops
+   the ruleset, but the skill mirror is synced globally with no per-group filter, so
+   that agent keeps the plugin's commands. Nothing later in this skill removes them.
+   If the plugin must not reach an OpenCode group at all, the only durable answer today
+   is to keep it out of `~/plugins` entirely — deleting the mirrored directory by hand
+   is undone by the next sync.
 
 7. **Build + restart.** The composer is host `src/`, so it needs a build, and running
    containers only pick up new mounts/instructions on respawn:
@@ -170,6 +177,8 @@ After respawn:
 
 - **Skills-only plugins** (no SessionStart hook): steps 3–4 don't apply. They're live on
   all three on the next spawn; a build+restart is only needed if a manifest was generated.
+  Note the reverse is not symmetric: reaching all three is automatic, but WITHHOLDING from
+  OpenCode is not — see the opt-out limits in step 6.
 - Generated manifests (`.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`,
   `.agents/plugins/marketplace.json`) are written into the plugin's own repo (it's your
   clone). Commit them there if you want them to survive a re-clone.
