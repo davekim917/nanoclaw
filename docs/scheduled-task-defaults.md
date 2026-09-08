@@ -28,7 +28,7 @@ A task's own pin still wins over everything, unchanged — which is what makes t
 Verified by reading `container.json` for every group and cross-referencing live series (not inferred):
 
 - 15 non-Claude groups exist (8 Codex, 7 OpenCode).
-- Exactly **one** of them has a live recurring series: `illysium-codex` → `lab-weekly-build-ollie-o-839c`.
+- Exactly **one** of them has a live recurring series.
 - That series is **pinned** to `gpt-6-astra`/`high`, and a pin wins under the new code exactly as it did under the old.
 
 **So zero non-Claude series change behaviour here today.** That is a fact about the current fleet, not a property of the change. Re-check it if you add an unpinned Codex or OpenCode scheduled task — such a task _would_ be affected, and nothing warns you.
