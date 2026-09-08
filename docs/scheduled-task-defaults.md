@@ -1,6 +1,8 @@
 # Migration: scheduled tasks lose their Claude-only model/effort default
 
-Until this release, a scheduled-task fire on a **Claude** group with no `--model`/`--effort` pin of its own was forced onto `sonnet` at `xhigh` effort, regardless of what that group was configured to run. That branch is deleted. An unpinned scheduled task now resolves exactly like interactive chat: the group's configured model and effort, else the provider's per-family default.
+Until this release, a scheduled-task fire on a **Claude** group with no `--model`/`--effort` pin of its own was forced onto `sonnet` at `xhigh` effort, regardless of what that group was configured to run. That branch is deleted. An unpinned scheduled task now resolves to the group's configured model and effort, else the provider's per-family default — the same place interactive chat starts from.
+
+One deliberate difference from chat: a **pure** task wake does not inherit a per-session sticky model or effort. If a human typed `-m opus` in that thread, chat keeps using Opus and the unpinned task still fires on the group default. A batch that mixes real chat with a task is a human conversation the task rode along with, and keeps the sticky — only a task-only wake is suppressed.
 
 Codex and OpenCode groups were never in that branch and are unaffected. A task's own pin still wins over everything, unchanged.
 
@@ -36,6 +38,8 @@ The old default was wrong in three separate ways, and they compound:
 - **It was invisible.** Nothing in `ncl tasks get` or the task's own definition said `sonnet`/`xhigh`. The value was applied deep in the runner's poll loop, so the only way to discover it was to read the source.
 - **It contradicted the group's own configuration.** An operator who set a group to Opus got Opus in chat and Sonnet on a schedule, with no indication the two differed.
 - **It was Claude-only.** The same unpinned task on a Codex group already resolved to the group default. One provider silently behaved differently from the others.
+
+It was also, in one respect, right: it existed to stop scheduled fires from riding an interactive sticky model. That protection is kept — a pure task wake ignores the session sticky — but it is now implemented by _suppressing_ the sticky rather than by substituting a hardcoded `sonnet`/`xhigh` the group's own config could neither see nor override.
 
 A scheduled task is a way to _run_ an agent, not a different agent. It should not have its own model policy. The pin exists for the case where a specific task genuinely needs a specific model — and a pin, unlike the deleted default, is visible in `ncl tasks list`.
 

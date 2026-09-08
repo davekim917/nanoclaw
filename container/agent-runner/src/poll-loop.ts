@@ -661,19 +661,42 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     applyChatBudget(keep);
     const flagBatch = applyFlagBatch(keep, routing, config.providerName);
-    const effectiveModel = flagBatch.model;
-    const effectiveEffort = flagBatch.effort;
-    const effectiveUltracode = flagBatch.ultracode;
+    // A scheduled task has NO default of its own — but it must not inherit an
+    // INTERACTIVE one either, and those are two different statements.
+    //
+    // `applyFlagBatch` resolves `turnModel ?? getStickyModel()`, and the sticky
+    // lives in `session_state` — the session's own durable DB, so it survives
+    // turns and container restarts for the life of the session. Chat and task
+    // messages share a session (that is the whole reason this predicate asks
+    // whether the batch is PURE), so without this branch a nightly unpinned
+    // task fires on whatever `-m` a human last typed in that thread. That is
+    // the bug the 2026-07-02 sonnet/xhigh block was written to fix; the block
+    // was correct about the disease and wrong about the cure, because it
+    // substituted a hardcoded default the group's own config could not see or
+    // override. (In July it had no alternative — container.json's model did
+    // not yet reach the container.)
+    //
+    // So: suppress the sticky rather than replace it. `undefined` is not
+    // "no model", it is "no per-TURN override", which lets the group's
+    // configured model apply exactly as it does for interactive chat — the
+    // host exports it as ANTHROPIC_DEFAULT_OPUS_MODEL at spawn
+    // (`claudeSpawnEnv`) and the provider reads it at
+    // `input.model ?? stickyConfig.model ?? process.env.ANTHROPIC_DEFAULT_OPUS_MODEL`.
+    //
+    // Deliberately NOT gated on `providerName === 'claude'`: the sticky is
+    // provider-neutral, so a codex or opencode task inherits an interactive
+    // `-m` the same way. Only the model/effort/ultracode SUPPRESSION is shared
+    // — each provider still resolves its own default from its own config, and
+    // codex's `stickyFast` is untouched below.
+    const task = taskWakeIntent(keep);
+    const effectiveModel = task.isPureTaskWake ? task.turnModel : flagBatch.model;
+    const effectiveEffort = task.isPureTaskWake ? task.turnEffort : flagBatch.effort;
+    // A task pin cannot express ultracode — `validateTaskPin` refuses it,
+    // because only the effort half would survive storage — so on a pure task
+    // wake a sticky ultracode is inheritance with nothing on the task's side
+    // that could have asked for it.
+    const effectiveUltracode = task.isPureTaskWake ? false : flagBatch.ultracode;
     const effectiveFast = flagBatch.fast;
-
-    // NOTE: a scheduled task has NO default of its own. An unpinned task wake
-    // resolves exactly like interactive chat — the group's configured model and
-    // effort, or the provider's own default when the group sets none. Until
-    // 2026-09-07 a Claude-only branch here forced an unpinned pure task wake
-    // onto sonnet/xhigh, which meant "scheduled" silently implied "cheaper and
-    // differently tuned than the same agent answering in chat". Its own pin
-    // (`flagIntent`, applied by applyFlagBatch above) is the only thing that
-    // moves a task off the group default, and that is deliberate.
 
     // Format messages: passthrough commands get raw text (only if the
     // provider natively handles slash commands), others get XML.
@@ -2723,4 +2746,42 @@ export function applyFlagBatch(
   const fast = providerName === 'codex' ? (intent?.turnFast ?? getStickyFast() ?? false) : false;
 
   return { model, effort, ultracode, fast };
+}
+
+/**
+ * Is this batch a PURE task wake, and what did the task itself pin?
+ *
+ * `hasTask && !hasChat` is the load-bearing part. A batch carrying real chat
+ * alongside the task is a human conversation the task rode along with, and
+ * downgrading that turn off the human's chosen model would be the mirror of
+ * the bug this guards — so a mixed batch keeps the interactive sticky.
+ *
+ * Only `turnModel`/`turnEffort` are read: those are the two axes a task pin
+ * can carry (see `validateTaskPin` on the host, which refuses anything else
+ * precisely because only those two survive storage).
+ */
+function taskWakeIntent(messages: MessageInRow[]): {
+  isPureTaskWake: boolean;
+  turnModel?: string;
+  turnEffort?: string;
+} {
+  let hasTask = false;
+  let hasChat = false;
+  let turnModel: string | undefined;
+  let turnEffort: string | undefined;
+  for (const m of messages) {
+    if (m.kind === 'task') {
+      hasTask = true;
+      try {
+        const fi = (JSON.parse(m.content) as { flagIntent?: FlagIntent }).flagIntent;
+        if (fi?.turnModel) turnModel = fi.turnModel;
+        if (fi?.turnEffort) turnEffort = fi.turnEffort;
+      } catch {
+        // malformed content row — treat as unpinned
+      }
+    } else if (m.kind === 'chat' || m.kind === 'chat-sdk') {
+      hasChat = true;
+    }
+  }
+  return { isPureTaskWake: hasTask && !hasChat, turnModel, turnEffort };
 }
