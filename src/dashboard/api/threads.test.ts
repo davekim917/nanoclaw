@@ -757,9 +757,13 @@ describe('buildThreadList — synthetic session channel recovery (§3.2 gap, DEF
     expect(threads[0]!.channel_name).toBe('general');
   });
 
-  it('isScheduledTaskThread: matches the legacy shared session and every per-series session, nothing else', () => {
-    expect(isScheduledTaskThread('system:tasks')).toBe(true);
+  it('isScheduledTaskThread: matches per-series sessions and a legacy shared one, nothing else', () => {
     expect(isScheduledTaskThread('system:tasks:example-task-0001')).toBe(true);
+    // The bare form is no longer created, but an upgraded install can still
+    // HOLD one and it is genuinely a task thread. Deriving a series id from it
+    // is the part that must be handled — see `taskSeriesId`
+    // (`src/db/sessions.ts:182`).
+    expect(isScheduledTaskThread('system:tasks')).toBe(true);
     // No colon after the prefix — a channel that merely starts with the same
     // letters must never match.
     expect(isScheduledTaskThread('system:tasksxyz')).toBe(false);

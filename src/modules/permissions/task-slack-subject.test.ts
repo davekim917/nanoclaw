@@ -149,7 +149,7 @@ describe('resolveSlackSafetyMessagingGroupId', () => {
     expect(await resolveSlackSafetyMessagingGroupId(s)).toBe('mg-dm');
   });
 
-  it('fail-closes on the legacy shared task session (many series, no single subject)', async () => {
+  it('fail-closes on a bare system:tasks thread, which no longer names one series', async () => {
     const s = await makeSession('sess-legacy', TASKS_SYSTEM_THREAD_ID);
     addTaskRow('sess-legacy', 'discord', DM_PLATFORM);
     expect(await resolveSlackSafetyMessagingGroupId(s)).toBeNull();

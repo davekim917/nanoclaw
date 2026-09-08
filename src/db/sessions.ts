@@ -138,12 +138,66 @@ export function taskThreadId(seriesId: string): string {
   return `${TASKS_SYSTEM_THREAD_ID}:${seriesId}`;
 }
 
-/** True for any task session thread — a per-series one or the legacy shared one. */
+/**
+ * True for any task session thread — a per-series one, or the bare
+ * `system:tasks` a pre-migration install may still hold.
+ *
+ * Deliberately accepts both. Nothing CREATES the bare form any more:
+ * `resolveTaskSession` (`src/session-manager.ts:427`) is its only creator and
+ * always goes through `taskThreadId()` below, which appends `:`
+ * unconditionally; and `thread_id` is written only by `createSession`, since
+ * `updateSession`'s signature covers only status/container_status/last_active/
+ * agent_provider. But an install upgraded from the shared-session era can still
+ * HOLD one, and it is genuinely a task thread — so narrowing this predicate
+ * would answer the question wrongly.
+ *
+ * Callers deriving a series id from the thread must use `taskSeriesId()` below,
+ * which returns null for the bare form rather than an empty string.
+ */
 export function isTaskThread(threadId: string | null): boolean {
   return threadId === TASKS_SYSTEM_THREAD_ID || (threadId?.startsWith(`${TASKS_SYSTEM_THREAD_ID}:`) ?? false);
 }
 
-/** All active task sessions for a group — one per live series, plus any legacy shared one. */
+/**
+ * The series a task session names, or null when it names none.
+ *
+ * The safe replacement for `threadId.slice(`${TASKS_SYSTEM_THREAD_ID}:`.length)`,
+ * which both `src/delivery.ts:1045` and `src/cli/resources/tasks.ts:439` used
+ * behind an `isTaskThread` guard. That slice takes 13 characters off the
+ * 12-character bare form, so a legacy session produced an EMPTY series id.
+ *
+ * That value did NOT reach the run-log file: `appendRunLog`'s charset guard
+ * (`/^[a-z0-9-]+$/`, `src/modules/scheduling/run-log.ts:24`) requires at least
+ * one character, so `''` threw before any write. It DID reach
+ * `recordTaskRunOutcome` (`src/db/task-run-outcomes.ts:47-61`), an unguarded
+ * `INSERT OR IGNORE`, putting a malformed series id into the central ledger T24
+ * reads to decide escalations
+ * (`src/modules/sweep-task-escalation/index.ts:170-172`). Two writes on one
+ * path, defended unequally — which is why the fix belongs here, at the
+ * derivation, rather than in either writer.
+ *
+ * Returning null makes the caller decide what to do about a session that names
+ * no series, instead of silently inventing one.
+ */
+export function taskSeriesId(threadId: string | null): string | null {
+  const prefix = `${TASKS_SYSTEM_THREAD_ID}:`;
+  if (!threadId?.startsWith(prefix)) return null;
+  return threadId.slice(prefix.length) || null;
+}
+
+/**
+ * All active task sessions for a group — one per live series, plus a bare
+ * `system:tasks` session if this install still holds one.
+ *
+ * The legacy disjunct stays on purpose. Nothing creates that shape any more,
+ * but an upgraded install can still hold an ACTIVE one, and this query is how
+ * every consumer enumerates task sessions: the `ncl tasks` resource
+ * (`src/cli/resources/tasks.ts:182` for a single group, `:997` fanning out over
+ * all of them) and the pin audit (`src/modules/scheduling/pin-audit.ts:77`).
+ * Narrowing it to the prefix would make a live scheduled task invisible to the
+ * CLI — including `cancel`, leaving a task running that nobody can stop.
+ * Reachability for an operator is not the compatibility worth deleting.
+ */
 export async function findTaskSessions(agentGroupId: string): Promise<Session[]> {
   return getDb().all<Session>(
     `SELECT * FROM sessions
