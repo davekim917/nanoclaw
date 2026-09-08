@@ -133,11 +133,16 @@ describe('codex provider container-config: agents/ mount', () => {
       // Load-bearing container settings are present.
       expect(written).toContain('sandbox_mode = "workspace-write"');
       expect(written).toContain('approval_policy = "on-request"');
+      expect(written).toContain('model_context_window = 400000');
+      expect(written).toContain('model_auto_compact_token_limit = 360000');
+      expect(written.indexOf('model_context_window = 400000')).toBeLessThan(written.indexOf('[features]'));
+      expect(written.indexOf('model_auto_compact_token_limit = 360000')).toBeLessThan(written.indexOf('[features]'));
       expect(written).toContain('[features]');
       expect(written).toContain('context_management = true');
       expect(written).toContain('fast_mode = false');
       expect(written).toContain('multi_agent = true');
       expect(written).toContain('[agents]');
+      expect(written).toContain('max_concurrent_threads_per_session = 15');
       expect(written).not.toContain('multi_agent_v2');
       expect(written).not.toContain('remote_control');
       expect(written).toContain('[projects."/workspace/agent"]');

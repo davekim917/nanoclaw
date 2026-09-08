@@ -64,6 +64,8 @@ export function buildContainerCodexConfig(): string {
     'sandbox_mode = "workspace-write"',
     'approval_policy = "on-request"',
     'approvals_reviewer = "auto_review"',
+    'model_context_window = 400000',
+    'model_auto_compact_token_limit = 360000',
     '',
     '[features]',
     'context_management = true',
@@ -74,7 +76,7 @@ export function buildContainerCodexConfig(): string {
     'multi_agent = true',
     '',
     '[agents]',
-    'max_concurrent_threads_per_session = 9',
+    'max_concurrent_threads_per_session = 15',
     '',
     ...CONTAINER_TRUSTED_PROJECTS.flatMap((proj) => [`[projects."${proj}"]`, 'trust_level = "trusted"', '']),
   ].join('\n');

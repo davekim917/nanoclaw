@@ -21,7 +21,7 @@ describe('codexConfigSchema', () => {
     expect(parsed).toEqual({
       model: 'gpt-5.5',
       reasoning_effort: 'high',
-      max_concurrent_threads_per_session: 7,
+      max_concurrent_threads_per_session: 15,
     });
   });
 
@@ -64,19 +64,19 @@ describe('codexConfigSchema', () => {
     // ladder (xhigh|max|ultra) is still accepted when operators opt in via
     // container.json.
     const parsed = codexConfigSchema.parse({});
-    expect(parsed).toEqual({ reasoning_effort: 'low', max_concurrent_threads_per_session: 7 });
+    expect(parsed).toEqual({ reasoning_effort: 'low', max_concurrent_threads_per_session: 15 });
   });
 
   it('test_codexConfigSchema_explicit_low_overrides_default', () => {
     const parsed = codexConfigSchema.parse({ reasoning_effort: 'low' });
-    expect(parsed).toEqual({ reasoning_effort: 'low', max_concurrent_threads_per_session: 7 });
+    expect(parsed).toEqual({ reasoning_effort: 'low', max_concurrent_threads_per_session: 15 });
   });
 
   it('test_codexConfigSchema_registered_after_barrel_import', () => {
     const schema = getProviderConfigSchema('codex');
     expect(schema).toBeDefined();
     const parsed = schema!.parse({ reasoning_effort: 'medium' });
-    expect(parsed).toEqual({ reasoning_effort: 'medium', max_concurrent_threads_per_session: 7 });
+    expect(parsed).toEqual({ reasoning_effort: 'medium', max_concurrent_threads_per_session: 15 });
   });
 
   it('test_validateProviderConfig_codex_rejects_invalid_effort', () => {
@@ -96,8 +96,10 @@ describe('codexConfigSchema', () => {
 
 describe('Codex subagent lifecycle instructions', () => {
   it('states both the enforced worker budget and mandatory close behavior', () => {
-    const instructions = buildCodexSubagentLifecycleInstructions(7);
-    expect(instructions).toContain('up to 7 concurrent subagents, excluding the primary thread');
+    const maxConcurrentThreadsPerSession = codexConfigSchema.parse({}).max_concurrent_threads_per_session;
+    expect(maxConcurrentThreadsPerSession).toBe(15);
+    const instructions = buildCodexSubagentLifecycleInstructions(maxConcurrentThreadsPerSession);
+    expect(instructions).toContain('up to 15 concurrent subagents, excluding the primary thread');
     expect(instructions).toContain('call `close_agent`');
     expect(instructions).toContain('Waiting for completion is not cleanup');
     expect(instructions).toContain('including failure and cancellation paths');

@@ -713,6 +713,10 @@ export function createCodexConfigOverrides(
     // the largest current doc. Keep src/codex-project-doc-cap.ts's warn
     // threshold numerically in sync with this value.
     'project_doc_max_bytes=262144',
+    // Preserve the container context limits if a rotated OAuth fallback home
+    // has not retained its generated config.toml.
+    'model_context_window=400000',
+    'model_auto_compact_token_limit=360000',
     'features.fast_mode=false',
     // Bound native collaboration at the app-server boundary. Each Codex
     // subagent owns a full MCP subprocess tree, so an inherited host setting
@@ -745,9 +749,7 @@ export function createCodexConfigOverrides(
   return overrides;
 }
 
-// The native cap counts spawned agents, excluding the primary thread.
-// Seven workers keep the default above the deep-security workflow minimum and
-// comfortably inside the install-wide 1024 PID ceiling for the MCP-heavy
-// production groups observed during the July 2026 incident. Operators can
-// override this per group through providerConfig when a workload warrants it.
-export const DEFAULT_CODEX_MAX_CONCURRENT_THREADS_PER_SESSION = 7;
+// The native cap counts spawned agents, excluding the primary thread. Fifteen
+// is the install default; operators can override it per group through
+// providerConfig when a workload warrants it.
+export const DEFAULT_CODEX_MAX_CONCURRENT_THREADS_PER_SESSION = 15;
