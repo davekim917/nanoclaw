@@ -57,8 +57,27 @@ import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
-/** Codex owns its own worktree lifecycle; never touch it. */
-const OUT_OF_SCOPE = /\/\.codex\/worktrees\//;
+/**
+ * Worktrees this collector never reasons about.
+ *
+ * `.codex/worktrees/` — Codex owns its own lifecycle.
+ *
+ * `/tmp/nanoclaw-pre-push.*` — snapshots created by `.husky/pre-push`, which
+ * lints a pushed SHA against a throwaway checkout and removes it afterwards.
+ * They are excluded rather than probed because the liveness signal cannot see
+ * them: the hook creates the snapshot and then runs lint from a DIFFERENT
+ * working directory, so no process has its cwd inside one even while it is
+ * being actively used. That produced a false "safe to reclaim" on the first
+ * real run (#570), on a snapshot whose push was in flight.
+ *
+ * Detecting the owning push instead would work, but the trade does not pay:
+ * measured 6 snapshots at 39 MB each, 234 MB total, against the ~10.5 GB this
+ * collector exists for. That is roughly 2% of the target in exchange for a
+ * race in a tool whose entire design premise is to refuse when unsure. The
+ * hook cleans these up itself; a crashed hook leaving 39 MB behind is a
+ * smaller problem than deleting a live one.
+ */
+const OUT_OF_SCOPE = /\/\.codex\/worktrees\/|^\/tmp\/nanoclaw-pre-push\./;
 
 export type Verdict =
   | 'eligible'
@@ -327,7 +346,10 @@ function assessOrThrow(row: WorktreeRow, repoRoot: string, opts: Parameters<type
     return { row, verdict: 'main', detail: 'the primary checkout' };
   }
   if (OUT_OF_SCOPE.test(row.path)) {
-    return { row, verdict: 'out-of-scope', detail: 'codex-owned worktree' };
+    const why = row.path.startsWith('/tmp/nanoclaw-pre-push.')
+      ? 'pre-push snapshot — owned by .husky/pre-push, which cleans up after itself'
+      : 'codex-owned worktree';
+    return { row, verdict: 'out-of-scope', detail: why };
   }
 
   // Checked before `missing`: a lock is a deliberate "do not remove" and an

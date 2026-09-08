@@ -23,6 +23,7 @@
     "setup": "tsx setup/index.ts",
     "setup:auto": "tsx setup/auto.ts",
     "ncl": "tsx src/cli/client.ts",
+    "worktrees": "tsx scripts/agent-worktree-gc.ts",
     "chat": "tsx scripts/chat.ts",
     "lint": "eslint src/ scripts/ setup/",
     "lint:fix": "eslint src/ scripts/ setup/ --fix",

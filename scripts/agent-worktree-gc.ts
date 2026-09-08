@@ -6,7 +6,7 @@
  * safe ones. It does NOT delete anything, by design — see the header of
  * src/agent-worktree-gc.ts for why the destructive mode was removed.
  *
- *   pnpm exec tsx scripts/agent-worktree-gc.ts
+ *   sudo pnpm worktrees
  *
  * Run it as root. Reading another user's /proc/<pid>/cwd needs it, and without
  * it every worktree reports `probe-failed` because idleness cannot be proven.
@@ -22,6 +22,15 @@ import { fileURLToPath } from 'url';
 import { runAgentWorktreeGcOnce, type Verdict } from '../src/agent-worktree-gc.js';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+// Without root, /proc/<pid>/cwd for other users is unreadable, every worktree
+// reports `probe-failed`, and the run is a confusing no-op. Say so once, up
+// front, instead of leaving the reader to decode a hundred identical lines.
+if (typeof process.getuid === 'function' && process.getuid() !== 0) {
+  console.log('agent-worktree-gc: not running as root — re-run as `sudo pnpm worktrees`.');
+  console.log('  Without root, another user\'s /proc/<pid>/cwd is unreadable and every');
+  console.log('  worktree reports `probe-failed` because idleness cannot be proven.\n');
+}
+
 const report = runAgentWorktreeGcOnce(repoRoot);
 
 if (report === null) {
