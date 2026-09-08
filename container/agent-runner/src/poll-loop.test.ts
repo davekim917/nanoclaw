@@ -7,7 +7,7 @@ import { evaluateAdmission, registerAdmissionGate } from './admission-gate.js';
 import { _resetConfig, loadConfig } from './config.js';
 import { clearStaleProcessingAcks, setContainerToolInFlight } from './db/container-state.js';
 import { setContinuation } from './db/session-state.js';
-import { setStickyModel } from './modules/mailbox/session-state.js';
+import { setStickyModel, setStickyEffort } from './modules/mailbox/session-state.js';
 import { getInboundDb, getOutboundDb } from './mailbox/sqlite/connection.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { closeSessionDb, initTestSessionDb } from './modules/mailbox/testing.js';
@@ -2932,110 +2932,6 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     expect(result.taskTurns![1]!.outcome?.text).toBe('second fire failed');
   }, 15_000);
 
-  it('a later occurrence joining a live stream does NOT drag it onto the interactive sticky', async () => {
-    // The reconciliation gap between the scheduled-task-default removal and
-    // #561. Suppression is decided once, when the query opens. But the
-    // follow-up path recomputes settings for newly admitted rows and compares
-    // them to the query's snapshot — so if that recompute uses the RAW flag
-    // batch, a task occurrence admitted into a running stream resolves to the
-    // interactive sticky, reads as a mid-turn settings change, and
-    // applySettings moves the live task turn onto the human's model.
-    //
-    // Which is the same defect the suppression exists to prevent, reached
-    // through the one door that stays open after the query has started.
-    setStickyModel('claude-opus-5[1m]');
-    insertMessage('occ-2', 'task', { prompt: 'second fire of the same series' });
-
-    async function* events(): AsyncGenerator<ProviderEvent> {
-      yield { type: 'init', continuation: 'c1' };
-      yield { type: 'result', text: 'first fire failed', isError: true };
-      await Bun.sleep(1600);
-      yield { type: 'result', text: 'second fire failed', isError: true };
-    }
-    const applied: Array<Record<string, unknown>> = [];
-    let ended = false;
-    const query: AgentQuery = {
-      push: () => {},
-      end: () => {
-        ended = true;
-      },
-      abort: () => {},
-      applySettings: async (sIn: Record<string, unknown>) => {
-        applied.push(sIn);
-      },
-      events: events(),
-    };
-
-    // The suppressed snapshot: a pure task wake with no pin sends no per-turn
-    // model, which is what lets the group default apply.
-    const result = await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
-      ultracode: false,
-    });
-
-    // Pre-fix: applied === [{ model: 'claude-opus-5[1m]', ... }]. The task turn
-    // would have finished on the model a human picked in chat.
-    expect(applied).toEqual([]);
-    expect(ended).toBe(false);
-    // ...and #561's per-turn accounting is untouched by the suppression: the
-    // joining occurrence still gets its own outcome slot.
-    expect(result.taskTurns!.map((t) => t.key)).toEqual(['occ-1', 'occ-2']);
-  }, 15_000);
-
-  it('an occurrence joining a live stream is MOVED onto the group default, not just left alone', async () => {
-    // Round-2 P1. Suppressing the sticky by sending `model: undefined` is only
-    // half the job: `undefined` means "fall through to the group default" at
-    // query creation, but "leave the stream unchanged" on a live stream. Under
-    // the second reading the suppressed task fire kept running on the human's
-    // model and the ledger recorded the model as unknown — wrong behaviour
-    // plus wrong telemetry.
-    //
-    // Asserted on what the stream was actually SET to, not on what was passed.
-    setStickyModel('claude-opus-5[1m]');
-    insertMessage('occ-2', 'task', { prompt: 'second fire of the same series' });
-
-    async function* events(): AsyncGenerator<ProviderEvent> {
-      yield { type: 'init', continuation: 'c1' };
-      yield { type: 'result', text: 'first fire failed', isError: true };
-      await Bun.sleep(1600);
-      yield { type: 'result', text: 'second fire failed', isError: true };
-    }
-    // Stands in for the provider's own resolution: absence resolves to the
-    // group default (what the host exported as ANTHROPIC_DEFAULT_OPUS_MODEL),
-    // and the resolved value is reported back so usage can be attributed.
-    const setTo: Array<string | undefined> = [];
-    // Stands in for the provider: absence resolves to the group default, and
-    // the resolved value is exposed as `resolvedModel` — the single source the
-    // caller reads, at creation and after every retarget alike.
-    let resolved = 'claude-opus-5[1m]';
-    const query: AgentQuery = {
-      push: () => {},
-      end: () => {},
-      abort: () => {},
-      applySettings: async (sIn) => {
-        resolved = sIn.model ?? 'claude-sonnet-5';
-        setTo.push(resolved);
-      },
-      get resolvedModel() {
-        return resolved;
-      },
-      events: events(),
-    };
-
-    const result = await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
-      model: 'claude-opus-5[1m]',
-      ultracode: false,
-    });
-
-    // The suppressed fire moved the stream OFF the sticky and onto the group
-    // default. Pre-fix `applySettings` was called with undefined and the
-    // provider's guard skipped setModel, leaving it on opus.
-    expect(setTo).toEqual(['claude-sonnet-5']);
-    // ...and the outcome is attributed to what actually ran, not to the
-    // `undefined` that was requested.
-    expect(result.taskTurns!.map((t) => t.key)).toEqual(['occ-1', 'occ-2']);
-    expect(result.taskTurns![1]!.outcome?.model).toBe('claude-sonnet-5');
-  }, 15_000);
-
   it('a batch after a live change is compared against the LIVE settings, not the creation snapshot', async () => {
     // Round-2 P2, the same seam from the other side. `querySettings` is the
     // immutable creation snapshot, so once a live change lands it no longer
@@ -3082,6 +2978,58 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     // snapshot, so the comparison said "unchanged" and the stream was left on
     // medium, silently running occ-3 at the previous fire's effort.
     expect(efforts).toEqual(['medium', 'xhigh']);
+  }, 15_000);
+
+  it('a task admitted mid-turn does NOT retarget the running stream', async () => {
+    // Round-5 P1, and the regression guard for this whole class.
+    //
+    // `keep` on the follow-up path is the newly-admitted SUB-BATCH, not the
+    // turn. A scheduled row becoming due while an interactive query is still
+    // streaming makes it a lone task row — so a task-wake predicate reads
+    // true, and suppressing on it retargets a turn that may be a HUMAN's,
+    // mid-answer, off their own model and effort.
+    //
+    // That is the exact inverse of the bug this PR set out to fix: we began
+    // with "tasks must not inherit chat settings" and briefly shipped "tasks
+    // steal chat settings". Scheduled-task suppression therefore applies only
+    // where a task wake OPENS a query; a task joining a running turn inherits
+    // that turn's settings, which is also the pre-existing behaviour.
+    setStickyModel('claude-opus-5[1m]');
+    setStickyEffort('xhigh');
+    insertMessage('occ-2', 'task', { prompt: 'a scheduled fire that came due mid-answer' });
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      yield { type: 'result', text: 'partial', isError: false };
+      await Bun.sleep(1600);
+      yield { type: 'result', text: 'done', isError: false };
+    }
+    const applied: Array<Record<string, unknown>> = [];
+    let ended = false;
+    const query: AgentQuery = {
+      push: () => {},
+      end: () => {
+        ended = true;
+      },
+      abort: () => {},
+      applySettings: async (sIn) => {
+        applied.push(sIn);
+      },
+      resolvedModel: 'claude-opus-5[1m]',
+      events: events(),
+    };
+
+    // The query was opened for a human turn on their sticky model/effort.
+    await processQuery(query, TASK_ROUTING, ['m1'], 'claude', undefined, 'p', undefined, {
+      model: 'claude-opus-5[1m]',
+      effort: 'xhigh',
+      ultracode: false,
+    });
+
+    // On 6dd936b9a: applied === [{ model: undefined, effort: undefined, … }],
+    // i.e. the human's live turn was dragged onto the group default.
+    expect(applied).toEqual([]);
+    expect(ended).toBe(false);
   }, 15_000);
 
   it('keeps two separate fires apart even though they share a series', async () => {

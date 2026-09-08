@@ -1808,14 +1808,27 @@ export async function processQuery(
         // provider without live controls (opencode/codex) ends the stream so the
         // outer loop reopens on the new model, leaving these rows pending; one
         // with live controls (claude) applies it in place, same stream.
-        // effectiveTurnSettings, NOT applyFlagBatch: a task occurrence admitted
-        // into a LIVE query is still a task fire and must not drag the running
-        // turn onto an interactive sticky. Using the raw batch here would make
-        // fb.model the sticky, differ from the suppressed live model,
-        // and applySettings the stream onto it — undoing the suppression for
-        // exactly the case #561 added slots for (a later occurrence joining an
-        // active stream is a SEPARATE fire).
-        const fb = effectiveTurnSettings(keep, extractRouting(keep), providerName);
+        // applyFlagBatch, NOT effectiveTurnSettings — deliberately, and this is
+        // the one place scheduled-task suppression does NOT apply.
+        //
+        // `keep` here is the newly-admitted SUB-BATCH, not the turn. A task row
+        // becoming due while an interactive query is still streaming makes
+        // `keep` a lone task row, so `isPureTaskWake` is true — but the turn it
+        // would retarget may be a human's, mid-answer. Suppressing here moved
+        // someone's in-progress work off their own model and effort: the exact
+        // inverse of the bug this file's suppression exists to prevent.
+        //
+        // `isPureTaskWake` is not the wrong IDEA here, it is the wrong
+        // QUESTION. It answers "is this batch a task wake"; deciding whether to
+        // retarget a running turn needs to know whether that TURN is idle, and
+        // a fragment of a turn cannot say. Doing it properly needs turn-level
+        // state, which is new machinery on a seam that has already failed
+        // twice — see the follow-up issue linked from CHANGELOG.
+        //
+        // So the pre-existing behaviour stands: a task occurrence joining a
+        // running stream inherits that stream's settings. Documented as a known
+        // limitation rather than left for someone to rediscover.
+        const fb = applyFlagBatch(keep, extractRouting(keep), providerName);
         const liveSettingsChanged =
           fb.model !== liveSettings.model ||
           fb.effort !== liveSettings.effort ||
@@ -2995,12 +3008,14 @@ export function applyFlagBatch(
  * its own default from its own config, and codex's `stickyFast` passes through
  * untouched.
  *
- * MUST be called everywhere a batch's settings are computed, not just at query
- * creation: the live-query follow-up path recomputes settings for newly
- * admitted rows and would otherwise `applySettings` a running task turn onto
- * the sticky. `applyFlagBatch` also PERSISTS flag stickies, so this wraps it
- * rather than skipping it — the side effect must still happen for a task batch
- * that carries an explicit flag row.
+ * Called ONLY where a batch OPENS a query. The live-query follow-up path
+ * deliberately uses `applyFlagBatch` instead: there, the batch is a fragment
+ * of a turn that may belong to a human, and suppressing on it retargeted
+ * someone's in-progress answer. See the comment at that call site.
+ *
+ * `applyFlagBatch` also PERSISTS flag stickies, so this wraps it rather than
+ * skipping it — the side effect must still happen for a task batch that
+ * carries an explicit flag row.
  */
 function effectiveTurnSettings(
   messages: MessageInRow[],
