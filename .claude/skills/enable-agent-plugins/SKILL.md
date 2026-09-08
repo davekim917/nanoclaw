@@ -73,11 +73,21 @@ next spawn, and the enabler run is just a verification pass.
    > still want by re-cloning its plugin into `~/plugins` — a copy-back alone is
    > pruned again on the next sync.
    >
-   > One honest limit: if a source plugin is ALREADY gone, its mirror entries are
-   > dangling links and there is nothing left to copy — `cp -aL` fails on them and the
-   > content is unrecoverable from the mirror. This backup protects you while the
-   > source still exists; it cannot resurrect an orphan. (Entries that happen to hold
-   > real files rather than links do survive, so run it regardless.)
+   > One limit, and it is narrower than "unrecoverable": if a source plugin is ALREADY
+   > gone, its mirror's linked children are dangling and `cp -aL` exits non-zero on
+   > them — but it still copies every regular file it reaches, and a managed mirror
+   > always stores `SKILL.md` and `.nanoclaw-managed` as real files. So the skill's
+   > instructions survive; only the linked attachments (`scripts/`, `reference/`, …)
+   > are lost. Measured on an orphan with one dangling child:
+   >
+   > ```
+   > cp: cannot stat '.../demo/scripts': No such file or directory   # exit 1
+   > BACKUP/demo/SKILL.md            <- intact
+   > BACKUP/demo/.nanoclaw-managed   <- intact
+   > ```
+   >
+   > **Run it regardless and keep the result even though `cp` reports failure** — the
+   > next sync deletes the original, and this is the last copy of the instructions.
    > Scoped mirrors (`~/.local/share/opencode-<group>/`) exist only for groups with
    > their own `auth.json`; the rest share the global dir. Watch the case where a
    > group HAD scoped auth and `auth.json` was later removed: the sync stops targeting
@@ -98,8 +108,11 @@ next spawn, and the enabler run is just a verification pass.
    > nothing is lost. Do **not** just delete the `skill/` dir: it can also hold skills
    > installed by hand or natively, which `syncSkillSymlinks` deliberately keeps
    > (`fs.rmSync` runs only behind an `isManagedMirror(entryPath)` gate,
-   > `src/plugin-skill-discovery.ts:465`, and its comment says "Anything else is
-   > preserved"). If you do want the global fallback, move the dir aside and migrate
+   > `src/plugin-skill-discovery.ts:465`). That protection covers **directories only**:
+   > an undesired top-level *symlink* is `unlinkSync`ed unconditionally, before the
+   > managed check is ever reached (`:459-463`), so a skill you installed as a symlink
+   > is removed by any full re-sync. Materialize such a skill as a real directory, or
+   > keep it outside the mirror, before syncing. If you do want the global fallback, move the dir aside and migrate
    > the non-managed entries. Identify them by the marker, not by their contents:
    > `isManagedMirror` returns `entries.includes('.nanoclaw-managed')`
    > (`src/plugin-skill-discovery.ts:545`), and an empty dir also counts as managed.
