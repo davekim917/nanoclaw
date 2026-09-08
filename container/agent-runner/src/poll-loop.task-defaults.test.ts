@@ -306,3 +306,39 @@ describe('the run-outcome ledger records the model that actually ran', () => {
     expect(taskLogs[0]!.model).toBe('claude-fable-5-1[1m]');
   });
 });
+
+describe('two differently-pinned tasks in one batch', () => {
+  it('runs under the FIRST pin, and never mixes axes across tasks', async () => {
+    // Round-4 finding, and a regression this PR introduced. `applyFlagBatch`
+    // takes the first flagIntent and breaks — one intent object, so model and
+    // effort always come from the SAME task. `taskWakeIntent` scanned the
+    // whole batch and kept the last nonempty value of each axis
+    // INDEPENDENTLY, which is wrong twice: the batch ran under the later
+    // task's pin, and it could pair a model from one task with an effort from
+    // another — a combination no one configured and neither task validated.
+    insertTask('t-first', { prompt: 'first', flagIntent: { turnModel: 'claude-fable-5-1[1m]' } });
+    insertTask('t-second', { prompt: 'second', flagIntent: { turnEffort: 'xhigh' } });
+
+    const provider = new RecordingProvider({}, () => '<message to="discord-test">done</message>');
+    await runUntilQueried(provider);
+
+    expect(provider.inputs.length).toBeGreaterThan(0);
+    // First pin governs, whole.
+    expect(provider.inputs[0].model).toBe('claude-fable-5-1[1m]');
+    // Pre-fix: 'xhigh', taken from the SECOND task and paired with the first
+    // task's model. The first task pinned no effort, so there is none.
+    expect(provider.inputs[0].effort).toBeUndefined();
+  });
+
+  it('the later task does not override the earlier one', async () => {
+    insertTask('t-a', { prompt: 'a', flagIntent: { turnModel: 'claude-fable-5-1[1m]', turnEffort: 'medium' } });
+    insertTask('t-b', { prompt: 'b', flagIntent: { turnModel: 'claude-sonnet-5', turnEffort: 'xhigh' } });
+
+    const provider = new RecordingProvider({}, () => '<message to="discord-test">done</message>');
+    await runUntilQueried(provider);
+
+    // Pre-fix: sonnet-5 / xhigh — the last pin silently won.
+    expect(provider.inputs[0].model).toBe('claude-fable-5-1[1m]');
+    expect(provider.inputs[0].effort).toBe('medium');
+  });
+});

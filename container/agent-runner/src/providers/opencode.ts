@@ -1225,6 +1225,13 @@ export interface OpenCodeRuntimeDeps {
   ): Promise<OpenCodeRuntimeHandle>;
 }
 
+/**
+ * Reported when neither the turn nor OPENCODE_MODEL names a model and the
+ * server picks one we are never told. A named unknown, not an absence — see
+ * `AgentQuery.resolvedModel`.
+ */
+export const OPENCODE_NATIVE_DEFAULT_MODEL = 'opencode:server-default';
+
 export class OpenCodeProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
 
@@ -1696,6 +1703,12 @@ export class OpenCodeProvider implements AgentProvider {
     }
 
     return {
+      // OpenCode picks the model server-side when neither the turn nor
+      // OPENCODE_MODEL names one, and the client is never told which. That is
+      // a real known-unknown, so it is reported as one rather than as absence
+      // — the ledger must be able to say "ran on opencode's own default" and
+      // have that mean something different from "nobody recorded a model".
+      resolvedModel: effectiveModel ?? OPENCODE_NATIVE_DEFAULT_MODEL,
       push: (message: string, attachments?: PromptAttachment[]) => {
         pending.push({
           text: wrapPromptWithContext(message, systemInstructions, effectiveModel),

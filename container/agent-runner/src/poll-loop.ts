@@ -3043,21 +3043,30 @@ function taskWakeIntent(messages: MessageInRow[]): {
 } {
   let hasTask = false;
   let hasChat = false;
-  let turnModel: string | undefined;
-  let turnEffort: string | undefined;
+  // The FIRST task carrying a pin wins, and its axes are taken TOGETHER —
+  // matching `applyFlagBatch`, which takes the first intent and `break`s.
+  //
+  // Reading the last value of each axis independently (as this did) is wrong
+  // twice over when a batch carries two differently-pinned tasks: the batch
+  // runs under the later task's pin rather than the one that opened it, and
+  // model and effort can come from DIFFERENT tasks — synthesising a pair no
+  // one configured and which neither task would have validated. Two rules for
+  // "which intent governs this batch" is one rule too many.
+  let pin: FlagIntent | undefined;
   for (const m of messages) {
     if (m.kind === 'task') {
       hasTask = true;
-      try {
-        const fi = (JSON.parse(m.content) as { flagIntent?: FlagIntent }).flagIntent;
-        if (fi?.turnModel) turnModel = fi.turnModel;
-        if (fi?.turnEffort) turnEffort = fi.turnEffort;
-      } catch {
-        // malformed content row — treat as unpinned
+      if (!pin) {
+        try {
+          const fi = (JSON.parse(m.content) as { flagIntent?: FlagIntent }).flagIntent;
+          if (fi) pin = fi;
+        } catch {
+          // malformed content row — treat as unpinned
+        }
       }
     } else if (m.kind === 'chat' || m.kind === 'chat-sdk') {
       hasChat = true;
     }
   }
-  return { isPureTaskWake: hasTask && !hasChat, turnModel, turnEffort };
+  return { isPureTaskWake: hasTask && !hasChat, turnModel: pin?.turnModel, turnEffort: pin?.turnEffort };
 }

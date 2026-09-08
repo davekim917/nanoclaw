@@ -6,6 +6,9 @@ import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryIn
  * Mock provider for testing. Returns canned responses.
  * Supports push() — queued messages produce additional results.
  */
+/** What MockProvider reports when a turn pins no model. */
+export const MOCK_RESOLVED_MODEL = 'mock:group-default';
+
 export class MockProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
 
@@ -60,6 +63,9 @@ export class MockProvider implements AgentProvider {
     };
 
     return {
+      // Mocks must name a model too: a mock that silently reports nothing is
+      // how a test can pass while the ledger records NULL in production.
+      resolvedModel: input.model ?? MOCK_RESOLVED_MODEL,
       push(message: string) {
         pending.push(message);
         waiting?.();

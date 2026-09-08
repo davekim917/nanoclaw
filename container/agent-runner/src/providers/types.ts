@@ -351,10 +351,19 @@ export interface AgentQuery {
    * `task_run_outcomes`, the "can't tell what actually ran" hole #549 and
    * #561 exist to close.
    *
-   * Optional only so a provider without per-query model selection can omit
-   * it; callers fall back to what they requested.
+   * REQUIRED, deliberately. It was optional for one release and the two
+   * providers that did not implement it were simply forgotten — three review
+   * rounds each closed this hole at one more site (the live path, the initial
+   * path, then codex and opencode) because "optional" and "forgettable" are
+   * the same thing in a structural type. Required is what makes a fourth site
+   * impossible rather than merely unlikely.
+   *
+   * A provider that genuinely cannot name an effective model must return an
+   * explicit known-unknown marker, never `undefined` or `''`: the ledger
+   * distinguishing "ran on something we can't name" from "we didn't look" is
+   * the entire point, and silence reads as the latter.
    */
-  readonly resolvedModel?: string;
+  readonly resolvedModel: string;
 }
 
 /**
