@@ -81,13 +81,20 @@ After the switch, scheduled fires for that group should appear under the new pro
 
 ## 5. Rollback
 
-To go back, reverse both steps in the opposite order — switch the provider back first, then re-pin:
+Rollback is the same two steps as the migration, in the same order: **re-pin first, then switch.** The refusal protects the switch in both directions, so going back with the provider update first would simply be refused — the tasks are now carrying destination-provider pins that are invalid under the old provider.
 
 ```bash
+# 1. Re-pin back, validating against the provider you are returning TO.
+ncl tasks repin --group <group-id> --target-provider <old-provider> \
+  --from-model claude-sonnet-5 --to-model gpt-6-astra --dry-run
+
+ncl tasks repin --group <group-id> --target-provider <old-provider> \
+  --from-model claude-sonnet-5 --to-model gpt-6-astra
+
+# 2. Then switch back.
 ncl groups config update --id <group-id> --provider <old-provider>
-ncl tasks repin --group <group-id> --from-model claude-sonnet-5 --to-model gpt-6-astra
 ```
 
-The provider switch back will itself refuse if the now-Claude pins would strand under the old provider, which is the same protection working in the other direction; `--target-provider <old-provider>` on the repin lets you clear them first.
+There is no "reverse order" version of this. `repin --target-provider` exists precisely so the pins can be made valid for a provider the group does not have yet, which is what makes both the migration and its rollback executable at all.
 
 **Known limitation — a pin cannot be cleared.** `--model`/`--effort` are _merged_ into the stored pin rather than replacing it, and an empty flag reads as absent, so there is no `--model ""` that returns a series to unpinned. Rollback can change a pin to a different value but cannot remove it. If you need a series genuinely unpinned, cancel and recreate it without `--model`/`--effort` — which changes the series id, so update anything referencing it.
