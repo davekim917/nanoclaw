@@ -7,6 +7,7 @@ import { evaluateAdmission, registerAdmissionGate } from './admission-gate.js';
 import { _resetConfig, loadConfig } from './config.js';
 import { clearStaleProcessingAcks, setContainerToolInFlight } from './db/container-state.js';
 import { setContinuation } from './db/session-state.js';
+import { setStickyModel, setStickyEffort } from './modules/mailbox/session-state.js';
 import { getInboundDb, getOutboundDb } from './mailbox/sqlite/connection.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { closeSessionDb, initTestSessionDb } from './modules/mailbox/testing.js';
@@ -279,7 +280,9 @@ describe('repository mount poll and tool admission barrier', () => {
       expect(queryInputs[1].prompt).toContain('has not recorded a completed result');
       expect(queryInputs[1].prompt).toContain('inspect durable effects already produced');
       expect(queryInputs[1].prompt.endsWith(queryInputs[0].prompt)).toBe(true);
-      expect(getOutboundDb().prepare("SELECT COUNT(*) AS count FROM messages_out WHERE kind = 'task_log'").get()).toEqual({
+      expect(
+        getOutboundDb().prepare("SELECT COUNT(*) AS count FROM messages_out WHERE kind = 'task_log'").get(),
+      ).toEqual({
         count: 1,
       });
     } finally {
@@ -2927,6 +2930,106 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     expect(result.taskTurns!.map((t) => t.key)).toEqual(['occ-1', 'occ-2']);
     expect(result.taskTurns![0]!.outcome?.text).toBe('first fire failed');
     expect(result.taskTurns![1]!.outcome?.text).toBe('second fire failed');
+  }, 15_000);
+
+  it('a batch after a live change is compared against the LIVE settings, not the creation snapshot', async () => {
+    // Round-2 P2, the same seam from the other side. `querySettings` is the
+    // immutable creation snapshot, so once a live change lands it no longer
+    // describes the stream. A later batch whose settings happen to equal that
+    // stale snapshot then reads as "unchanged", applySettings is skipped, and
+    // the turn silently keeps the PREVIOUS batch's settings.
+    //
+    // Here the query is created at xhigh, a task fire moves it to medium live,
+    // and a second batch wants xhigh again — equal to the creation snapshot,
+    // different from the stream. It must be applied.
+    insertMessage('occ-2', 'task', { prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      yield { type: 'result', text: 'first fire', isError: true };
+      // occ-2 is admitted during this window and moves the LIVE stream to
+      // medium. The creation snapshot still says xhigh.
+      await Bun.sleep(1600);
+      // Staged from inside the stream so it lands in a SECOND follow-up batch
+      // rather than being merged into occ-2's. It wants xhigh again — equal to
+      // the stale creation snapshot, different from the live stream.
+      insertMessage('occ-3', 'task', { prompt: 'third fire', flagIntent: { turnEffort: 'xhigh' } });
+      yield { type: 'result', text: 'second fire', isError: true };
+      await Bun.sleep(1600);
+      yield { type: 'result', text: 'third fire', isError: true };
+    }
+    const efforts: Array<string | undefined> = [];
+    const query: AgentQuery = {
+      push: () => {},
+      end: () => {},
+      abort: () => {},
+      applySettings: async (sIn) => {
+        efforts.push(sIn.effort);
+      },
+      events: events(),
+    };
+
+    await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
+      effort: 'xhigh',
+      ultracode: false,
+    });
+
+    // Pre-fix: ['medium'] — occ-3's xhigh equalled the stale CREATION
+    // snapshot, so the comparison said "unchanged" and the stream was left on
+    // medium, silently running occ-3 at the previous fire's effort.
+    expect(efforts).toEqual(['medium', 'xhigh']);
+  }, 15_000);
+
+  it('a task admitted mid-turn does NOT retarget the running stream', async () => {
+    // Round-5 P1, and the regression guard for this whole class.
+    //
+    // `keep` on the follow-up path is the newly-admitted SUB-BATCH, not the
+    // turn. A scheduled row becoming due while an interactive query is still
+    // streaming makes it a lone task row — so a task-wake predicate reads
+    // true, and suppressing on it retargets a turn that may be a HUMAN's,
+    // mid-answer, off their own model and effort.
+    //
+    // That is the exact inverse of the bug this PR set out to fix: we began
+    // with "tasks must not inherit chat settings" and briefly shipped "tasks
+    // steal chat settings". Scheduled-task suppression therefore applies only
+    // where a task wake OPENS a query; a task joining a running turn inherits
+    // that turn's settings, which is also the pre-existing behaviour.
+    setStickyModel('claude-opus-5[1m]');
+    setStickyEffort('xhigh');
+    insertMessage('occ-2', 'task', { prompt: 'a scheduled fire that came due mid-answer' });
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      yield { type: 'result', text: 'partial', isError: false };
+      await Bun.sleep(1600);
+      yield { type: 'result', text: 'done', isError: false };
+    }
+    const applied: Array<Record<string, unknown>> = [];
+    let ended = false;
+    const query: AgentQuery = {
+      push: () => {},
+      end: () => {
+        ended = true;
+      },
+      abort: () => {},
+      applySettings: async (sIn) => {
+        applied.push(sIn);
+      },
+      resolvedModel: 'claude-opus-5[1m]',
+      events: events(),
+    };
+
+    // The query was opened for a human turn on their sticky model/effort.
+    await processQuery(query, TASK_ROUTING, ['m1'], 'claude', undefined, 'p', undefined, {
+      model: 'claude-opus-5[1m]',
+      effort: 'xhigh',
+      ultracode: false,
+    });
+
+    // On 6dd936b9a: applied === [{ model: undefined, effort: undefined, … }],
+    // i.e. the human's live turn was dragged onto the group default.
+    expect(applied).toEqual([]);
+    expect(ended).toBe(false);
   }, 15_000);
 
   it('keeps two separate fires apart even though they share a series', async () => {

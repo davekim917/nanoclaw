@@ -148,3 +148,48 @@ describe('every other precedence layer is untouched', () => {
     expect(o?.effort).toBeUndefined();
   });
 });
+
+/**
+ * The other half of removing the scheduled-task literal.
+ *
+ * The poll loop now hands a pure task wake `model: undefined` rather than the
+ * literal `'sonnet'`. `undefined` is only the right answer if it actually
+ * lands on the GROUP's configured model — so this asserts the far end of that
+ * chain, where the poll-loop tests can only assert the near end (that no
+ * per-turn override was sent).
+ *
+ * The chain: the host resolves the group's model and exports it as
+ * ANTHROPIC_DEFAULT_OPUS_MODEL at spawn (`claudeSpawnEnv`), and this provider
+ * reads `input.model ?? stickyConfig.model ?? that env var`. Note the
+ * constructor never reads `options.model`, so the env var is the ONLY route by
+ * which container.json's model reaches a query.
+ */
+describe('an unpinned scheduled task lands on the group default, not a literal', () => {
+  it('test_unpinned_task_uses_the_groups_configured_model', () => {
+    // A group whose container.json sets sonnet. Pre-removal an unpinned task
+    // ran the literal 'sonnet' regardless; now it runs what the group set,
+    // and picks up sonnet's own family default effort rather than 'xhigh'
+    // being forced alongside it.
+    const o = turn({}, { alias: 'claude-sonnet-5' }, { model: undefined, effort: undefined });
+    expect(o?.model).toBe('claude-sonnet-5');
+    expect(o?.effort).toBe('xhigh');
+  });
+
+  it('test_unpinned_task_on_an_unconfigured_group_is_opus_at_high', () => {
+    // The 7 Claude groups with no `model` in container.json. This is the
+    // repricing: those groups' unpinned scheduled tasks move here on deploy.
+    // Asserted so the cost claim in the PR body is a measured behaviour and
+    // not a prediction.
+    const o = turn({}, { alias: 'claude-opus-5[1m]' }, { model: undefined, effort: undefined });
+    expect(o?.model).toBe('claude-opus-5[1m]');
+    expect(o?.effort).toBe('high');
+  });
+
+  it('test_a_task_pin_still_overrides_the_group_default', () => {
+    // The pinned recap/digest jobs. Their stored flagIntent reaches the
+    // provider as a per-turn model, which still wins over the group's.
+    const o = turn({}, { alias: 'claude-opus-5[1m]' }, { model: 'claude-sonnet-5', effort: 'xhigh' });
+    expect(o?.model).toBe('claude-sonnet-5');
+    expect(o?.effort).toBe('xhigh');
+  });
+});

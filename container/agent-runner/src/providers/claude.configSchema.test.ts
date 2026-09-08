@@ -431,6 +431,26 @@ describe('live applySettings (-m/-e on an active query — same conversation, no
     expect(capturedFlagSettings).toEqual([{ effortLevel: 'medium' }]);
   });
 
+  it('test_applySettings_absent_model_leaves_a_one_turn_override_alone', async () => {
+    // `undefined` on this path means LEAVE THE LIVE MODEL UNCHANGED, and the
+    // callers that mean it are ordinary chat: a flagless message arriving
+    // mid-turn resolves to `undefined` from applyFlagBatch simply because
+    // nobody asked for a model.
+    //
+    // A query opened with a one-shot `-m1` override is the case that exposes
+    // it. Briefly this resolved absence to the group default — to serve a
+    // scheduled-task suppression whose caller has since been reverted — which
+    // dragged a still-running answer off the model the user picked for it.
+    //
+    // Note the existing effort-only test above does NOT catch this: there the
+    // query was opened at the group default, so the resolved value equalled
+    // activeModel and the guard skipped anyway. The override is what makes
+    // the two differ.
+    const q = start({ model: 'claude-fable-5-1[1m]' });
+    await q.applySettings!({ model: undefined, effort: undefined, ultracode: undefined });
+    expect(capturedSetModel).toEqual([]);
+  });
+
   it('test_applySettings_xhigh_on_sonnet5_live: Sonnet 5 + xhigh passes through live (no clamp)', async () => {
     const q = start();
     await q.applySettings!({ model: 'claude-sonnet-5', effort: 'xhigh' });

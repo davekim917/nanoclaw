@@ -317,6 +317,14 @@ export interface AgentQuery {
    * Apply -m/-e flag changes to the LIVE query — same conversation, same
    * stream, no teardown (claude: SDK setModel + applyFlagSettings control
    * requests, mirroring interactive Claude Code's /model). Optional:
+   * An omitted `model` means "no per-TURN override" — the same thing it means
+   * at query creation — and the implementation must RESOLVE it to the value a
+   * fresh query would have used, not leave the stream on whatever it had.
+   * Absence meaning "unchanged" here while meaning "fall through to the default"
+   * at creation is how a suppressed turn keeps running on a stale model.
+   * Returning the resolved model lets the caller attribute usage to what
+   * actually ran; a provider that cannot report it may still return void.
+   *
    * providers without in-flight controls (codex/opencode are sticky-only)
    * omit it and the poll-loop falls back to ending the stream so the next
    * query picks the flags up. MUST throw when the requested combination
@@ -324,6 +332,38 @@ export interface AgentQuery {
    * the caller can use the same fallback.
    */
   applySettings?(settings: { model?: string; effort?: string; ultracode?: boolean }): Promise<void>;
+
+  /**
+   * The model this query is ACTUALLY running, resolved by the provider.
+   *
+   * THE single source for usage attribution, and the reason it lives on the
+   * query rather than being returned from the calls that change it: a caller
+   * passes `model: undefined` meaning "the group default" and cannot resolve
+   * that itself — `stickyConfig.model` (a group's `providerConfig.model`)
+   * outranks `ANTHROPIC_DEFAULT_OPUS_MODEL` and is invisible outside the
+   * provider. `illysium-argus` sets exactly that and has a live unpinned
+   * series, so a caller-side guess would mis-attribute a real production task.
+   *
+   * Reading it from the query covers every path by construction: creation
+   * sets it, `applySettings` updates it, and a NEW path cannot forget to
+   * report because there is nothing to report — the caller reads. Recording
+   * absence instead is what put a NULL model on unpinned fires in
+   * `task_run_outcomes`, the "can't tell what actually ran" hole #549 and
+   * #561 exist to close.
+   *
+   * REQUIRED, deliberately. It was optional for one release and the two
+   * providers that did not implement it were simply forgotten — three review
+   * rounds each closed this hole at one more site (the live path, the initial
+   * path, then codex and opencode) because "optional" and "forgettable" are
+   * the same thing in a structural type. Required is what makes a fourth site
+   * impossible rather than merely unlikely.
+   *
+   * A provider that genuinely cannot name an effective model must return an
+   * explicit known-unknown marker, never `undefined` or `''`: the ledger
+   * distinguishing "ran on something we can't name" from "we didn't look" is
+   * the entire point, and silence reads as the latter.
+   */
+  readonly resolvedModel: string;
 }
 
 /**

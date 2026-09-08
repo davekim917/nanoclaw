@@ -1543,6 +1543,10 @@ export class CodexProvider implements AgentProvider {
     }
 
     return {
+      // What this query actually runs, already resolved above. Codex always
+      // names a model (`stickyConfig.model ?? CODEX_MODEL ?? gpt-6-astra`), so
+      // there is no unknown case here.
+      resolvedModel: effectiveModel,
       push: (message: string) => {
         // If a turn is in flight, steer it instead of queueing — the agent's
         // response can then reference the late-arriving content. Falls back

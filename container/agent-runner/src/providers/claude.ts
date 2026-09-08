@@ -58,7 +58,6 @@ export const claudeConfigSchema = z.strictObject({
   effort: z.enum(CLAUDE_EFFORT_LEVELS).optional(),
 });
 
-
 function log(msg: string): void {
   console.error(`[claude-provider] ${msg}`);
 }
@@ -1982,10 +1981,7 @@ const FAMILY_ALIAS_ENV: Record<string, string> = {
  * fail to match and the row stays NULL. That under-claims, which is the
  * intended direction — never a guess.
  */
-function canonicalUsageModel(
-  model: string | undefined,
-  env: Record<string, string | undefined>,
-): string | undefined {
+function canonicalUsageModel(model: string | undefined, env: Record<string, string | undefined>): string | undefined {
   if (!model) return model;
   const key = FAMILY_ALIAS_ENV[model.toLowerCase()];
   if (!key) return model; // already a concrete id
@@ -2346,8 +2342,7 @@ export class ClaudeProvider implements AgentProvider {
     //
     // `stickyConfig.model` still wins over this, unchanged — a per-agent
     // providerConfig is more specific than the group's default model.
-    const rawModel =
-      input.model ?? this.stickyConfig.model ?? process.env.ANTHROPIC_DEFAULT_OPUS_MODEL ?? 'opus';
+    const rawModel = input.model ?? this.stickyConfig.model ?? process.env.ANTHROPIC_DEFAULT_OPUS_MODEL ?? 'opus';
     const model = rawModel ? ensureOpus1mSuffix(rawModel) : rawModel;
     // Effort precedence: -e flag (turn/sticky, arrives as input.effort) →
     // group container.json provider config → operator override env
@@ -2884,6 +2879,12 @@ export class ClaudeProvider implements AgentProvider {
       push: (msg) => stream.push(msg),
       end: () => stream.end(),
       events: translateEvents(),
+      // Live view of `activeModel`, which is the resolved creation model and
+      // is reassigned by applySettings. A getter rather than a snapshot so
+      // creation and mid-stream retarget cannot report different things.
+      get resolvedModel() {
+        return activeModel;
+      },
       abort: () => {
         aborted = true;
         stream.end();
@@ -2894,6 +2895,24 @@ export class ClaudeProvider implements AgentProvider {
       // explicit -e lands on the new model's family default (e.g. -m fable
       // mid-turn → fable@medium, not fable@inherited-xhigh).
       applySettings: async (s) => {
+        // `s.model === undefined` means LEAVE THE LIVE MODEL UNCHANGED, and
+        // that is not an inconsistency with query creation — it is what every
+        // caller on this path means. A flagless message arriving mid-turn
+        // resolves to `undefined` from `applyFlagBatch` simply because nobody
+        // asked for a model; a turn opened with a one-shot `-m1` override
+        // would then be dragged off it mid-answer.
+        //
+        // This was briefly "resolve absence to the group default", to serve a
+        // scheduled-task suppression on this path. That caller has since been
+        // reverted (see the follow-up issue in CHANGELOG) and the reading went
+        // with it. The rule worth keeping: a future attempt to retarget a live
+        // model must not do it by REINTERPRETING `undefined`, because this
+        // seam is shared with ordinary chat, which legitimately means
+        // "unchanged" by it. Pass the model you want explicitly instead.
+        //
+        // (The effort branch below does resolve its own absence. That is not
+        // the same case: effort has no "leave alone" caller here — it is
+        // recomputed for the model in force on every call.)
         const newModel = s.model ? ensureOpus1mSuffix(s.model) : undefined;
         if (newModel && newModel !== activeModel) {
           await sdkResult.setModel(newModel);
@@ -2930,7 +2949,7 @@ export class ClaudeProvider implements AgentProvider {
         activeEffort = clamped;
         activeRequestedEffort = requested;
         log(
-          `applySettings (live): model=${activeModel ?? '(unchanged)'} effort=${clamped ?? '(none)'}` +
+          `applySettings (live): model=${activeModel} effort=${clamped ?? '(none)'}` +
             `${s.ultracode !== undefined ? ` ultracode=${s.ultracode}` : ''}`,
         );
       },
