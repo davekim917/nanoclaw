@@ -39,7 +39,7 @@ function credentialSlotKey(providerName: string): string {
  * stores the env var NAME (e.g. `CLAUDE_CODE_OAUTH_TOKEN_2`), never the
  * credential VALUE — a pointer into config the provider already holds, not a
  * secret. Forward-only pools deliberately do not use this key: Claude's
- * `ANTHROPIC_API_KEY_N` fallbacks (providers/claude.ts, the comment in
+ * `ANTHROPIC_API_KEY_N` fallbacks (providers/claude.ts:2189, the comment in
  * `restorePersistedCredentialSlot`) and Codex's `fallbackHomes` cursor
  * (providers/codex.ts:1107-1120, `nextFallback` is process-local) both rely
  * on a respawn as their reset, and a persisted cursor that never wraps would

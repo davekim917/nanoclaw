@@ -769,7 +769,7 @@ lines.on('line', (line) => {
     expect(secondPromptText).toContain('Continue the same user request from the persisted thread state');
     expect(secondPromptText).toContain('<runner-credential-rotation>');
     expect(secondPromptText).toContain('slot 2 of 2');
-    expect(secondPromptText).toContain('NOT rate-limited now');
+    expect(secondPromptText).toContain('does not apply to this attempt');
     expect(secondPromptText).not.toContain('perform the original task once');
 
     // Live rotation still takes effect immediately (this is NOT persistence

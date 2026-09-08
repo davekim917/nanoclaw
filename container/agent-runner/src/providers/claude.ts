@@ -2991,7 +2991,7 @@ export class ClaudeProvider implements AgentProvider {
         // Idempotent: AbortController#abort() on an already-aborted
         // controller is a documented no-op, so a caller that ends up
         // calling abort() more than once for the same query (e.g. both the
-        // poll-loop's error-path abort and a config.signal listener firing)
+        // poll-loop's error-path abort at poll-loop.ts:808 and a config.signal listener firing)
         // never double-tears-down.
         queryAbortController.abort();
       },

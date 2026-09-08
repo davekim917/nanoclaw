@@ -122,8 +122,8 @@ export function transientOverloadDelayMs(n: number, rand: number = Math.random()
  * the original prompt intact after provenance that distinguishes this retry
  * from a new delivery without claiming the interrupted attempt had no effects.
  *
- * `rotation` is the result of the `rotateApiKey()` call that triggered this
- * retry. When it reports `rotated: true` with a position/ringSize, a second
+ * `rotation` is the result of the `rotateApiKey()` call (providers/claude.ts:2297)
+ * that triggered this retry. When it reports `rotated: true` with a position/ringSize, a second
  * block tells the agent explicitly that its credential was swapped and any
  * "rate limited" narrative still sitting in its resumed transcript is stale
  * — see `formatCredentialRotationNotice`. Only this one call site (the
@@ -797,7 +797,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       log(`Query error: ${errMsg}`);
       // The failed query's CLI child may still be running (an in-body throw
       // unwinds the generator without necessarily tearing the subprocess
-      // down — see claude.ts's queryAbortController). Every recovery branch
+      // down — see queryAbortController at providers/claude.ts:2506-2515). Every recovery branch
       // below starts a FRESH query on the same or a rotated credential, so
       // abort the old one first: left alone, it can keep running on an
       // exhausted/wedged credential and burn another failure minutes after

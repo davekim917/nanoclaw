@@ -18,6 +18,16 @@
  * resumed agent reads its own stale transcript, concludes it is still
  * rate-limited, and schedules a wake for the reset time instead of
  * continuing on the credential that is now serving it fine.
+ *
+ * The wording is deliberately NOT "you hit a usage limit": poll-loop rotates
+ * on every error `ClaudeProvider.isRetryable` accepts (providers/claude.ts:2253-2261
+ * — 429/rate limit, overloaded, upstream_error, quota) except the ones
+ * `isTransientOverload` recognises first (poll-loop.ts:836, poll-loop.ts:1003-1006),
+ * so the failure that triggered the swap may have been an upstream error
+ * rather than a limit. The notice therefore names the failure class
+ * generically and only asserts what is true on every path: the previous
+ * credential failed, this attempt runs on a different one, and any limit text
+ * in the history describes the previous credential.
  */
 
 export interface CredentialRotationInfo {
@@ -35,10 +45,11 @@ export interface CredentialRotationInfo {
 export function formatCredentialRotationNotice(info: CredentialRotationInfo): string {
   return (
     '<runner-credential-rotation>\n' +
-    'The previous attempt at this batch was interrupted because the credential it ran on hit a usage limit. ' +
+    'The previous attempt at this batch was interrupted by an upstream failure on the credential it was running on ' +
+    '(a usage limit, or a retryable API error such as an overload or upstream error). ' +
     `The runner rotated to a different credential (slot ${info.position} of ${info.ringSize}) and this attempt is running on it.\n` +
-    'You are NOT rate-limited now. Any "You\'ve hit your … limit · resets …" text in your conversation history is ' +
-    'stale and does not apply to this attempt: do not pause, schedule a wake, or wait for a reset because of it.\n' +
+    'Any "You\'ve hit your … limit · resets …" text in your conversation history describes the PREVIOUS credential ' +
+    'and does not apply to this attempt: do not pause, schedule a wake, or wait for a reset because of it.\n' +
     'Any background subagents (Agent tool with run_in_background, or backgrounded shell commands) launched before ' +
     'the interruption were terminated with the previous attempt. Their partial work on disk survives; they are not ' +
     'running. Inspect what landed, then re-dispatch whatever is still needed.\n' +
