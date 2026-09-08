@@ -74,6 +74,49 @@ function pathsForLine(line: string): string[] {
   return [stripQuotes(rest.slice(0, arrow)), stripQuotes(rest.slice(arrow + 4))];
 }
 
+/**
+ * Stray build-artifact directories left beside `dist/` by a hand-run deploy.
+ *
+ * `scripts/deploy.sh` snapshots the live build for rollback as `dist.pre-deploy/`
+ * and `node_modules.pre-deploy/` (plus the `.failed/` pair), and all four are
+ * gitignored — so a sanctioned snapshot never reaches `git status` at all.
+ * Anything of that shape that DOES reach it was created by hand, and because
+ * those names are timestamped they can never be matched by a gitignore rule
+ * either.
+ *
+ * Worth naming separately because the generic "commit or stash" remedy is wrong
+ * for it and `BUILD_ALLOW_DIRTY=1` is actively dangerous: on 2026-09-07 a
+ * hand-rolled `dist.pre-<label>-<timestamp>/` blocked every build on the host
+ * for four hours across three sessions, while two restarts ran and silently left
+ * the service on stale compiled code. The refusal was correct; nobody could tell
+ * from it what to do.
+ *
+ * Classification is grounded in the filesystem rather than the path string,
+ * because the string alone cannot decide it in either direction:
+ *
+ * - Under `status.showUntrackedFiles=all` git expands an untracked directory
+ *   into per-file entries (`?? dist.pre-label/index.js`), so there is no
+ *   trailing-slash directory entry to match. Taking the first path segment
+ *   collapses those back to the one directory worth naming.
+ * - A regular root file such as `dist.config.ts` has the same shape as a
+ *   snapshot in porcelain output. Telling an operator to delete their source
+ *   file would be worse advice than the generic message this replaces, so a
+ *   real `isDirectory` check is the thing that separates them.
+ *
+ * Returns the deduped, sorted directory names — not the paths that led to them.
+ */
+export function strayBuildArtifactDirs(paths: string[], isDirectory: (relPath: string) => boolean): string[] {
+  const dirs = new Set<string>();
+  for (const p of paths) {
+    const head = p.split('/').filter((seg) => seg !== '')[0];
+    if (head === undefined) continue;
+    if (!/^(?:dist|node_modules)\./.test(head)) continue;
+    if (!isDirectory(head)) continue;
+    dirs.add(head);
+  }
+  return [...dirs].sort();
+}
+
 export interface DirtPartition {
   /** Porcelain lines that block the build. */
   blocking: string[];
@@ -370,6 +413,24 @@ export function runCheckBuildClean(options: CheckBuildCleanOptions = {}): number
         log.error('these uncommitted changes into dist/, which a restart could then run.\n');
         log.error('Dirty paths (git status --porcelain):');
         for (const f of blocking) log.error(`  ${f}`);
+
+        const strays = strayBuildArtifactDirs(pathsForLines(blocking), (rel) => {
+          try {
+            return fs.statSync(path.join(REPO_ROOT, rel)).isDirectory();
+          } catch {
+            return false; // vanished between status and here — not our business
+          }
+        });
+        if (strays.length > 0) {
+          log.error('\nStray build snapshots (left by a hand-run deploy, NOT by scripts/deploy.sh):');
+          for (const f of strays) log.error(`  ${f}`);
+          log.error('\nDo not commit, stash, or BUILD_ALLOW_DIRTY these — move them out of the repo');
+          log.error('or delete them. scripts/deploy.sh snapshots rollback state as dist.pre-deploy/');
+          log.error('and node_modules.pre-deploy/, which are gitignored and hardlinked; prefer it over');
+          log.error('a hand-run pull/build/restart so no snapshot lands here in the first place.');
+          return 1;
+        }
+
         log.error('\nTo proceed, either:');
         log.error('  1. Commit or stash the changes above, then rebuild.');
         log.error('  2. Set BUILD_ALLOW_DIRTY=1 to build anyway (prints a warning, stamps dirty:true).');

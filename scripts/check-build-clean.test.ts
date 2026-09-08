@@ -10,6 +10,7 @@ import {
   fingerprintDirt,
   isIgnorableDirtPath,
   partitionDirt,
+  strayBuildArtifactDirs,
   pathsForLines,
   runCheckBuildClean,
 } from './check-build-clean.js';
@@ -697,4 +698,66 @@ describe('scripts/check-build-clean.ts and scripts/write-build-info.ts', () => {
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
     expect(fs.readFileSync(path.join(dir, 'dist', '.build-start-sha'), 'utf8').trim()).toBe(headSha());
   }, 60_000);
+});
+
+describe('strayBuildArtifactDirs', () => {
+  /** Stand-in for the real fs probe: these names are directories, nothing else is. */
+  const dirs = (...names: string[]) => (rel: string) => names.includes(rel);
+
+  it('flags a hand-rolled timestamped dist snapshot', () => {
+    const d = 'dist.pre-spent-wait-20260907T194650Z';
+    expect(strayBuildArtifactDirs([`${d}/`], dirs(d))).toEqual([d]);
+    expect(strayBuildArtifactDirs([d], dirs(d))).toEqual([d]);
+  });
+
+  it('collapses per-file entries from status.showUntrackedFiles=all to the directory', () => {
+    // Git expands an untracked dir into its files under that setting, so there
+    // is no trailing-slash entry to match on.
+    const d = 'dist.pre-label';
+    const paths = [`${d}/index.js`, `${d}/BUILD_INFO.json`, `${d}/nested/deep.js`];
+    expect(strayBuildArtifactDirs(paths, dirs(d))).toEqual([d]);
+  });
+
+  it('does NOT flag a regular root file that merely shares the prefix', () => {
+    // `dist.config.ts` is somebody's source. Telling them to delete it would be
+    // worse advice than the generic message this replaces.
+    expect(strayBuildArtifactDirs(['dist.config.ts'], dirs())).toEqual([]);
+    expect(strayBuildArtifactDirs(['node_modules.lock'], dirs())).toEqual([]);
+  });
+
+  it('flags a node_modules snapshot too', () => {
+    const d = 'node_modules.backup-20260907';
+    expect(strayBuildArtifactDirs([`${d}/`], dirs(d))).toEqual([d]);
+  });
+
+  it('flags the sanctioned names if they ever reach git status', () => {
+    // They are gitignored, so they normally never appear — but if a rule is
+    // dropped, naming them is still the right remedy.
+    expect(strayBuildArtifactDirs(['dist.pre-deploy/', 'node_modules.failed/'], dirs('dist.pre-deploy', 'node_modules.failed'))).toEqual([
+      'dist.pre-deploy',
+      'node_modules.failed',
+    ]);
+  });
+
+  it('does not flag dist/ or node_modules/ themselves', () => {
+    expect(strayBuildArtifactDirs(['dist/', 'node_modules/'], dirs('dist', 'node_modules'))).toEqual([]);
+  });
+
+  it('does not flag a path nested under an unrelated root', () => {
+    expect(strayBuildArtifactDirs(['src/dist.helpers.ts'], dirs('src'))).toEqual([]);
+    expect(strayBuildArtifactDirs(['distribution/thing.ts'], dirs('distribution'))).toEqual([]);
+  });
+
+  it('dedupes and sorts across mixed entries', () => {
+    const paths = ['node_modules.old/', 'dist.b/x.js', 'dist.a/', 'dist.b/y.js', 'src/config.ts'];
+    expect(strayBuildArtifactDirs(paths, dirs('node_modules.old', 'dist.a', 'dist.b', 'src'))).toEqual([
+      'dist.a',
+      'dist.b',
+      'node_modules.old',
+    ]);
+  });
+
+  it('returns nothing for an empty list', () => {
+    expect(strayBuildArtifactDirs([], dirs())).toEqual([]);
+  });
 });
