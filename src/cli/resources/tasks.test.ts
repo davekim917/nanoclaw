@@ -49,6 +49,7 @@ import { countDueMessages } from '../../modules/mailbox/ops/sweep.js';
 import { initSessionFolder } from '../../session-manager.js';
 import { inboundDbPath } from '../../mailbox/sqlite/paths.js';
 import { dispatch } from '../dispatch.js';
+import { parseArgv } from '../parse-argv.js';
 import { formatTasksTable } from '../format-tasks.js';
 import type { CallerContext } from '../frame.js';
 import './tasks.js';
@@ -1753,6 +1754,215 @@ describe('tasks CLI resource', () => {
    * deliberately refusing to confirm the id exists elsewhere. That path is
    * unchanged — these cases are the host caller's.
    */
+  /**
+   * The same class as the scope guard above, on the other axis: `--id` names
+   * one series, `--all` names every live one in scope, and `cancelTaskCommand`
+   * branched on `--all` without ever reading `--id`. The kill switch won
+   * silently, so `cancel --id <one series> --all` destroyed the whole group's
+   * tasks while the operator had named exactly one.
+   */
+  /** Two live series in ag-1, so a kill switch has something to over-cancel. */
+  async function twoSeries(): Promise<string[]> {
+    const ids: string[] = [];
+    for (const name of ['alpha', 'beta']) {
+      const r = await dispatch(
+        {
+          id: `ka-${name}`,
+          command: 'tasks-create',
+          args: { prompt: name, name, process_after: '2999-01-15T09:00:00Z' },
+        },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(r.ok).toBe(true);
+      if (r.ok) ids.push((r.data as { series_id: string }).series_id);
+    }
+    return ids;
+  }
+
+  async function liveInGroup(): Promise<string[]> {
+    const list = await dispatch({ id: 'ka-list', command: 'tasks-list', args: {} }, agentCtx('ag-1', 'chat-1'));
+    expect(list.ok).toBe(true);
+    if (!list.ok) return [];
+    // Fan-out across per-series sessions has no defined order; every caller
+    // here asserts membership, so sort once at the seam.
+    return (list.data as Array<{ series_id: string }>).map((t) => t.series_id).sort();
+  }
+
+  /**
+   * The class one level down: a guard the caller believes is protecting them,
+   * skipped by a value the caller cannot see. `--id "$TASK_ID"` with an unset
+   * variable reaches the handler as `id: ''`, and a presence test written on
+   * `str()` reads that as absent — so every scope guard in this file used to
+   * fail open on the shell shape that makes the mistake likely, silently and
+   * on every run of the script.
+   *
+   * These go through `parseArgv` rather than hand-built args objects: the
+   * empty string is produced by the argv path (parse-argv.ts:29), and a test
+   * that constructs `{ id: '' }` directly can pass while the CLI still fails.
+   */
+  describe('a supplied-but-empty flag is refused, never read as absent', () => {
+    /** Exactly what the shell hands the dispatcher. */
+    function shell(argv: string[]): Record<string, unknown> {
+      return parseArgv(argv).args;
+    }
+
+    it('parseArgv really does preserve an empty flag value (the premise)', () => {
+      expect(shell(['tasks', 'cancel', '--id', '', '--all'])).toEqual({ id: '', all: true });
+      // A bare flag before the next one becomes `true`, which validateArgs
+      // rejects on its own — so the empty string is the shape that reaches a guard.
+      expect(shell(['tasks', 'cancel', '--session', '--all'])).toEqual({ session: true, all: true });
+    });
+
+    it('cancel --id "" --all is refused instead of cancelling everything', async () => {
+      const [alpha, beta] = await twoSeries();
+
+      const resp = await dispatch(
+        { id: 'ef-id', command: 'tasks-cancel', args: shell(['tasks', 'cancel', '--id', '', '--all']) },
+        agentCtx('ag-1', 'chat-1'),
+      );
+
+      expect(resp.ok).toBe(false);
+      if (!resp.ok) expect(resp.error.message).toContain('--id');
+      expect(await liveInGroup()).toEqual([alpha, beta].sort()); // nothing cancelled
+    });
+
+    // Not a hole, and marked so the boundary is not rediscovered: a value-less
+    // `--id` parses to `true`, and validateArgs rejects that before any handler
+    // runs. The empty string is the shape that survives validation, because
+    // `''` is a valid string — which is why it is the only one guarded above.
+    it('a bare --id is already refused one layer up, by argument validation', async () => {
+      const [alpha, beta] = await twoSeries();
+
+      const resp = await dispatch(
+        { id: 'ef-bare', command: 'tasks-cancel', args: shell(['tasks', 'cancel', '--id', '--all']) },
+        agentCtx('ag-1', 'chat-1'),
+      );
+
+      expect(resp.ok).toBe(false);
+      if (!resp.ok) expect(resp.error.message).toContain('requires a value');
+      expect(await liveInGroup()).toEqual([alpha, beta].sort());
+    });
+
+    it('--session "" does not silently widen one session to the whole group', async () => {
+      const [alpha, beta] = await twoSeries();
+
+      const resp = await dispatch(
+        {
+          id: 'ef-sess',
+          command: 'tasks-cancel',
+          args: shell(['tasks', 'cancel', '--group', 'ag-1', '--session', '', '--all']),
+        },
+        { caller: 'host' },
+      );
+
+      expect(resp.ok).toBe(false);
+      if (!resp.ok) expect(resp.error.message).toContain('--session');
+      expect(await liveInGroup()).toEqual([alpha, beta].sort());
+    });
+
+    it('--group "" does not fall through to the unscoped host-wide fan-out', async () => {
+      // The severe one: an empty --group defeated #567's cross-group guard by
+      // making `groupArg` return undefined, so the command cancelled tasks in
+      // groups the operator never named.
+      const [alpha, beta] = await twoSeries();
+      const seeded = await dispatch(
+        { id: 'ef-ag2', command: 'tasks-create', args: { prompt: 'ag-2 work', process_after: '2999-01-15T09:00:00Z' } },
+        agentCtx('ag-2', 'chat-2'),
+      );
+      expect(seeded.ok).toBe(true);
+      if (!seeded.ok) return;
+      const otherGroupSeries = (seeded.data as { series_id: string }).series_id;
+
+      const resp = await dispatch(
+        { id: 'ef-grp', command: 'tasks-cancel', args: shell(['tasks', 'cancel', '--group', '', '--all']) },
+        { caller: 'host' },
+      );
+
+      expect(resp.ok).toBe(false);
+      if (!resp.ok) expect(resp.error.message).toContain('--group');
+      expect(await liveInGroup()).toEqual([alpha, beta].sort());
+
+      // And the group that was never named still has its task.
+      const other = await dispatch({ id: 'ef-l2', command: 'tasks-list', args: {} }, agentCtx('ag-2', 'chat-2'));
+      expect(other.ok).toBe(true);
+      if (other.ok) {
+        expect((other.data as Array<{ series_id: string }>).map((t) => t.series_id)).toContain(otherGroupSeries);
+      }
+    });
+
+    it('an omitted flag is still absent — the host-wide fan-out is unchanged', async () => {
+      // The regression that matters: refusing empty must not turn "not passed"
+      // into an error. `cancel --all` with no scope is still the kill switch.
+      const [alpha, beta] = await twoSeries();
+
+      const resp = await dispatch(
+        { id: 'ef-omit', command: 'tasks-cancel', args: shell(['tasks', 'cancel', '--all']) },
+        { caller: 'host' },
+      );
+
+      expect(resp.ok).toBe(true);
+      if (resp.ok) expect((resp.data as { cancelled: number }).cancelled).toBe(2);
+      expect(await liveInGroup()).toEqual([]);
+      expect([alpha, beta]).toHaveLength(2);
+    });
+
+    it('a populated flag is still read normally — list --group still scopes', async () => {
+      const [alpha, beta] = await twoSeries();
+
+      const resp = await dispatch(
+        { id: 'ef-ok', command: 'tasks-list', args: shell(['tasks', 'list', '--group', 'ag-1']) },
+        { caller: 'host' },
+      );
+
+      expect(resp.ok).toBe(true);
+      if (resp.ok) {
+        expect((resp.data as Array<{ series_id: string }>).map((t) => t.series_id).sort()).toEqual(
+          [alpha, beta].sort(),
+        );
+      }
+    });
+  });
+
+  describe('cancel --all and --id cannot both be given', () => {
+    it('refuses the contradiction and cancels nothing', async () => {
+      const [alpha, beta] = await twoSeries();
+
+      const resp = await dispatch(
+        { id: 'ka-both', command: 'tasks-cancel', args: { all: true, id: alpha } },
+        agentCtx('ag-1', 'chat-1'),
+      );
+
+      expect(resp.ok).toBe(false);
+      if (!resp.ok) {
+        expect(resp.error.message).toContain(alpha); // the series that was named
+        expect(resp.error.message).toContain('--all'); // the flag that contradicted it
+      }
+      // Nothing destroyed: the named series AND the bystander both survive.
+      const live = await liveInGroup();
+      expect(live).toContain(alpha);
+      expect(live).toContain(beta);
+    });
+
+    it('--all on its own is still the kill switch, and --id on its own still cancels one', async () => {
+      const [alpha, beta] = await twoSeries();
+
+      const one = await dispatch(
+        { id: 'ka-one', command: 'tasks-cancel', args: { id: alpha } },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(one.ok).toBe(true);
+      expect(await liveInGroup()).toEqual([beta]);
+
+      const all = await dispatch(
+        { id: 'ka-all', command: 'tasks-cancel', args: { all: true } },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(all.ok).toBe(true);
+      if (all.ok) expect((all.data as { cancelled: number }).cancelled).toBe(1);
+      expect(await liveInGroup()).toEqual([]);
+    });
+  });
+
   describe('--session must belong to --group', () => {
     /** A live task series in ag-2, plus the isolated session that holds it. */
     async function taskInOtherGroup(): Promise<{ sessionId: string; seriesId: string }> {

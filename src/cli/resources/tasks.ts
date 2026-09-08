@@ -56,6 +56,36 @@ function str(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
+/**
+ * Read a flag the caller SUPPLIED, refusing a value that is not usable.
+ *
+ * `str()` collapses "absent" and "supplied but empty" into `undefined`. That
+ * is the right answer when reading an optional value and the wrong one for the
+ * scope guards below, which branch on presence: `--session "$SESS"` with an
+ * unset variable arrives as `session: ''` (parse-argv.ts:29 keeps it), and a
+ * presence test built on `str()` reads that as absent and skips — failing open
+ * on exactly the input that makes the mistake likely, and doing it to a script
+ * silently, every run. That is this file's own class one level down: the guard
+ * drops an input the caller cannot see.
+ *
+ * The empty string is the shape that gets here, because `''` is a valid string
+ * and passes argument validation. The value-less `--session` shape does not:
+ * it parses to `true` and `validateArgs` already rejects it with "--session
+ * requires a value" (crud.ts:523). The non-string branch below is therefore
+ * defence in depth for callers that bypass validation, not a live hole.
+ *
+ * No flag guarded here has an empty string as a meaningful value, so refusing
+ * one rejects nothing legitimate.
+ */
+function suppliedFlag(args: Record<string, unknown>, key: string, cliName: string): string | undefined {
+  if (args[key] === undefined) return undefined;
+  const value = str(args[key]);
+  if (value === undefined) {
+    throw new Error(`${cliName} was supplied without a usable value: give it one, or omit ${cliName} entirely`);
+  }
+  return value;
+}
+
 function bool(value: unknown): boolean {
   return value === true || value === 'true' || value === '1';
 }
@@ -101,7 +131,7 @@ function statusFilter(args: Record<string, unknown>): TaskStatus | undefined {
 
 function groupArg(args: Record<string, unknown>, ctx: CallerContext): string | undefined {
   if (ctx.caller === 'agent') return ctx.agentGroupId;
-  return str(args.group) ?? str(args.agent_group_id);
+  return suppliedFlag(args, 'group', '--group') ?? suppliedFlag(args, 'agent_group_id', '--agent-group-id');
 }
 
 async function ownSession(sessionId: string, ctx: CallerContext): Promise<ScopedSession> {
@@ -133,7 +163,7 @@ async function ownSession(sessionId: string, ctx: CallerContext): Promise<Scoped
  * already read.
  */
 async function selectedSessions(args: Record<string, unknown>, ctx: CallerContext): Promise<ScopedSession[]> {
-  const sessionId = str(args.session);
+  const sessionId = suppliedFlag(args, 'session', '--session');
   const group = groupArg(args, ctx);
   if (sessionId) {
     const session = await ownSession(sessionId, ctx);
@@ -735,6 +765,20 @@ async function updateTaskCommand(args: Record<string, unknown>, ctx: CallerConte
 async function cancelTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
   if (!bool(args.all)) {
     return mutateTask(args, ctx, 'cancel', (mailbox, id) => mailbox.cancelTask(id));
+  }
+
+  // The same contradiction as --group/--session above, on the other axis:
+  // `--id` names one series and `--all` names every live one in scope, and the
+  // kill switch used to win silently by never reading `--id` at all. So
+  // `cancel --id nightly-digest --all` cancelled the whole group's tasks while
+  // the operator had named exactly one. The flag's own help already says "omit
+  // with --all" — this enforces what it documents instead of assuming it.
+  const named = suppliedFlag(args, 'id', '--id');
+  if (named) {
+    throw new Error(
+      `--all cancels every live task in scope, but --id ${named} names one: ` +
+        'pass --id on its own to cancel that series, or --all on its own to cancel them all',
+    );
   }
 
   let touched = 0;
