@@ -737,6 +737,20 @@ async function cancelTaskCommand(args: Record<string, unknown>, ctx: CallerConte
     return mutateTask(args, ctx, 'cancel', (mailbox, id) => mailbox.cancelTask(id));
   }
 
+  // The same contradiction as --group/--session above, on the other axis:
+  // `--id` names one series and `--all` names every live one in scope, and the
+  // kill switch used to win silently by never reading `--id` at all. So
+  // `cancel --id nightly-digest --all` cancelled the whole group's tasks while
+  // the operator had named exactly one. The flag's own help already says "omit
+  // with --all" — this enforces what it documents instead of assuming it.
+  const named = str(args.id);
+  if (named) {
+    throw new Error(
+      `--all cancels every live task in scope, but --id ${named} names one: ` +
+        'pass --id on its own to cancel that series, or --all on its own to cancel them all',
+    );
+  }
+
   let touched = 0;
   for (const session of await selectedSessions(args, ctx)) {
     const result = await withInbound(session, (mailbox) =>

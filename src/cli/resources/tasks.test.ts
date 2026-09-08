@@ -1753,6 +1753,78 @@ describe('tasks CLI resource', () => {
    * deliberately refusing to confirm the id exists elsewhere. That path is
    * unchanged — these cases are the host caller's.
    */
+  /**
+   * The same class as the scope guard above, on the other axis: `--id` names
+   * one series, `--all` names every live one in scope, and `cancelTaskCommand`
+   * branched on `--all` without ever reading `--id`. The kill switch won
+   * silently, so `cancel --id <one series> --all` destroyed the whole group's
+   * tasks while the operator had named exactly one.
+   */
+  describe('cancel --all and --id cannot both be given', () => {
+    /** Two live series in ag-1, so a kill switch has something to over-cancel. */
+    async function twoSeries(): Promise<string[]> {
+      const ids: string[] = [];
+      for (const name of ['alpha', 'beta']) {
+        const r = await dispatch(
+          {
+            id: `ka-${name}`,
+            command: 'tasks-create',
+            args: { prompt: name, name, process_after: '2999-01-15T09:00:00Z' },
+          },
+          agentCtx('ag-1', 'chat-1'),
+        );
+        expect(r.ok).toBe(true);
+        if (r.ok) ids.push((r.data as { series_id: string }).series_id);
+      }
+      return ids;
+    }
+
+    async function liveInGroup(): Promise<string[]> {
+      const list = await dispatch({ id: 'ka-list', command: 'tasks-list', args: {} }, agentCtx('ag-1', 'chat-1'));
+      expect(list.ok).toBe(true);
+      if (!list.ok) return [];
+      return (list.data as Array<{ series_id: string }>).map((t) => t.series_id);
+    }
+
+    it('refuses the contradiction and cancels nothing', async () => {
+      const [alpha, beta] = await twoSeries();
+
+      const resp = await dispatch(
+        { id: 'ka-both', command: 'tasks-cancel', args: { all: true, id: alpha } },
+        agentCtx('ag-1', 'chat-1'),
+      );
+
+      expect(resp.ok).toBe(false);
+      if (!resp.ok) {
+        expect(resp.error.message).toContain(alpha); // the series that was named
+        expect(resp.error.message).toContain('--all'); // the flag that contradicted it
+      }
+      // Nothing destroyed: the named series AND the bystander both survive.
+      const live = await liveInGroup();
+      expect(live).toContain(alpha);
+      expect(live).toContain(beta);
+    });
+
+    it('--all on its own is still the kill switch, and --id on its own still cancels one', async () => {
+      const [alpha, beta] = await twoSeries();
+
+      const one = await dispatch(
+        { id: 'ka-one', command: 'tasks-cancel', args: { id: alpha } },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(one.ok).toBe(true);
+      expect(await liveInGroup()).toEqual([beta]);
+
+      const all = await dispatch(
+        { id: 'ka-all', command: 'tasks-cancel', args: { all: true } },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(all.ok).toBe(true);
+      if (all.ok) expect((all.data as { cancelled: number }).cancelled).toBe(1);
+      expect(await liveInGroup()).toEqual([]);
+    });
+  });
+
   describe('--session must belong to --group', () => {
     /** A live task series in ag-2, plus the isolated session that holds it. */
     async function taskInOtherGroup(): Promise<{ sessionId: string; seriesId: string }> {
