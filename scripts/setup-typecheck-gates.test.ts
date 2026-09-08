@@ -48,9 +48,22 @@ function fixture(valid: boolean): string {
       *) printf '[{"messages":[{"message":"setup missing from lint gate"}]}]\\n'; exit 1 ;;
     esac`,
   );
+  // The boundary checker itself is covered exhaustively by
+  // scripts/check-public-boundary.test.ts; what this fixture pins is that the
+  // GATE runs it and honours its exit code. So the stub records how it was
+  // called and fails on demand, rather than re-testing the checker.
   executable(
     path.join(root, 'bin/pnpm'),
-    `if [ "$1" = run ] && [ "$2" = check:public-boundary ]; then exit 0; fi\nexec /usr/bin/env PATH=${quote(process.env.PATH ?? '')} pnpm "$@"`,
+    `if [ "$1" = run ] && [ "$2" = check:public-boundary ]; then
+      [ -z "\${FIXTURE_BOUNDARY_LOG:-}" ] || printf '%s\\n' "$*" >> "$FIXTURE_BOUNDARY_LOG"
+      if [ "\${FIXTURE_BOUNDARY_FAIL:-}" = 1 ]; then
+        echo 'src/index.ts:1 private-identifier' >&2
+        echo 'public boundary check failed with 1 redacted finding(s) (index)' >&2
+        exit 1
+      fi
+      exit 0
+    fi
+exec /usr/bin/env PATH=${quote(process.env.PATH ?? '')} pnpm "$@"`,
   );
   // Keep these fixtures offline: all Git calls are deterministic reads of
   // synthetic metadata, while the typecheck itself uses the real compiler.
@@ -68,7 +81,37 @@ function fixture(valid: boolean): string {
 }
 
 // Each fixture launches two throttled compiler processes on the shared host.
-describe('setup typecheck enforcement', () => {
+//
+// WHY THE PUSH GATE NO LONGER TYPECHECKS
+// --------------------------------------
+// This file was added (5cb76b776) to pin the typecheck step inside the
+// pre-push snapshot gate. That step is gone, deliberately, and the cases below
+// were rewritten to pin the contract that replaced it rather than relaxed to
+// keep passing.
+//
+// `.husky/pre-push` runs per PUSHED COMMIT — `objects_for_ref` loops over every
+// commit in the push. Measured on this host at load 1.15: eslint 68.1s, tsc
+// 23.4s, boundary check 27.8s. That was affordable while the hook only ever ran
+// for a deployer pushing from the main checkout; it is not, now that
+// `scripts/pin-git-hooks-path.sh` makes hooks resolve from every agent worktree.
+//
+// The protection is not lost, only moved earlier-to-later:
+//   - CI runs `pnpm run lint`, `tsc --noEmit` and
+//     `tsc -p tsconfig.scripts.json --noEmit` on every PR
+//     (.github/workflows/ci.yml:44, :47, :50).
+//   - `scripts/check-build-clean.ts` still rejects the same setup type error,
+//     so a bad type cannot reach a build or a deploy. The 'build' cases below
+//     are that evidence and are unchanged.
+// What changed is only WHEN a type error is caught: at CI and build time rather
+// than at push time.
+//
+// The boundary check stays in the hook because CI structurally cannot run it:
+// the CI step is `--portable` (ci.yml:34), structural patterns only, since a
+// runner has no `data/v2.db` and shipping it the identifier registry would
+// publish what the registry protects. So the push gate keeps a case of its own
+// here — deleting one outright would leave the hook with nothing pinning it,
+// which is how a gate quietly disappears.
+describe('setup typecheck and push-gate boundary enforcement', () => {
   it('typechecks authentication steps without optional channel packages installed', () => {
     const root = fixture(true);
     const config = JSON.parse(fs.readFileSync(path.join(root, 'tsconfig.json'), 'utf8'));
@@ -86,18 +129,45 @@ describe('setup typecheck enforcement', () => {
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
   }, 60_000);
 
-  it.each(['build', 'push'] as const)(
-    'rejects setup type errors at the %s gate',
-    (gate) => {
-      const root = fixture(false);
-      const result = runGate(root, gate);
-      expect(result.status, result.stderr).toBeGreaterThan(0);
-      expect(result.stdout).toContain('setup/index.ts');
-      expect(result.stdout).toContain('TS2322');
-      expect(fs.existsSync(path.join(root, 'dist/.build-start-sha'))).toBe(false);
-    },
-    60_000,
-  );
+  it('rejects setup type errors at the build gate', () => {
+    const root = fixture(false);
+    const result = runGate(root, 'build');
+    expect(result.status, result.stderr).toBeGreaterThan(0);
+    expect(result.stdout).toContain('setup/index.ts');
+    expect(result.stdout).toContain('TS2322');
+    expect(fs.existsSync(path.join(root, 'dist/.build-start-sha'))).toBe(false);
+  }, 60_000);
+
+  it('rejects a public-boundary violation at the push gate', () => {
+    const root = fixture(true);
+    const result = runGate(root, 'push', { boundaryFails: true });
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBeGreaterThan(0);
+    // The hook must surface the checker's own redacted output, not swallow it.
+    expect(result.stderr).toContain('private-identifier');
+  }, 60_000);
+
+  it('gates the pushed commit’s snapshot index, not the live working tree', () => {
+    // The failure this pins is real history: `.husky/pre-commit` once
+    // defaulted the checker to `process.cwd()` after cd-ing to the main
+    // checkout, so every commit made from a worktree scanned main's index —
+    // entirely different content — and printed "passed" about work it never
+    // saw. A gate pointed at the wrong tree reports success just as loudly as
+    // one pointed at the right one.
+    const root = fixture(true);
+    const log = path.join(root, 'boundary-calls.log');
+    const result = runGate(root, 'push', { boundaryLog: log });
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+
+    const calls = fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain('--index');
+    const scanned = /--root (\S+)/.exec(calls[0])?.[1];
+    expect(scanned).toBeDefined();
+    // A throwaway snapshot, not the checkout the push was issued from.
+    expect(scanned).not.toBe(root);
+    expect(scanned).toMatch(/nanoclaw-pre-push\.[^/]+\/tree$/);
+    expect(fs.existsSync(scanned!)).toBe(false);
+  }, 60_000);
 
   it.each(['build', 'push'] as const)(
     'accepts valid setup code at the %s gate',
@@ -110,8 +180,17 @@ describe('setup typecheck enforcement', () => {
   );
 });
 
-function runGate(root: string, gate: 'build' | 'push') {
-  const env = { ...process.env, PATH: `${path.join(root, 'bin')}:${process.env.PATH ?? ''}` };
+function runGate(
+  root: string,
+  gate: 'build' | 'push',
+  options: { boundaryFails?: boolean; boundaryLog?: string } = {},
+) {
+  const env = {
+    ...process.env,
+    PATH: `${path.join(root, 'bin')}:${process.env.PATH ?? ''}`,
+    ...(options.boundaryFails ? { FIXTURE_BOUNDARY_FAIL: '1' } : {}),
+    ...(options.boundaryLog ? { FIXTURE_BOUNDARY_LOG: options.boundaryLog } : {}),
+  };
   if (gate === 'build') {
     return spawnSync(path.join(repoRoot, 'node_modules/.bin/tsx'), [path.join(root, 'scripts/check-build-clean.mts')], {
       cwd: root,

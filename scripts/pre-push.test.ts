@@ -36,10 +36,9 @@ function linkSystemCommand(bin: string, command: string): void {
 function commit(root: string, value: string, message = value): string {
   fs.mkdirSync(path.join(root, 'src'), { recursive: true });
   fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
-  fs.writeFileSync(path.join(root, 'eslint.config.js'), 'export default [];\n');
   fs.writeFileSync(path.join(root, 'src', 'gate.ts'), `${value}\n`);
   fs.writeFileSync(path.join(root, 'scripts', 'gate.ts'), `${value}\n`);
-  runGit(root, ['add', 'eslint.config.js', '.public-boundary-allowlist.json', 'src/gate.ts', 'scripts/gate.ts']);
+  runGit(root, ['add', '.public-boundary-allowlist.json', 'src/gate.ts', 'scripts/gate.ts']);
   runGit(root, ['commit', '-m', message, '--quiet']);
   return runGit(root, ['rev-parse', 'HEAD']);
 }
@@ -105,26 +104,10 @@ fi
 exec "$HOOK_REAL_GIT" "$@"
 `,
   );
-  writeExecutable(
-    path.join(modules, 'eslint'),
-    `#!/bin/sh
-test -f eslint.config.js || exit 1
-IFS= read -r consumed || true
-printf 'lint|%s|%s|%s\\n' "$PWD" "$(cat src/gate.ts)" "$consumed" >> "$HOOK_LOG"
-[ "\${HOOK_FAIL:-}" != "lint:$(cat src/gate.ts)" ] || exit 1
-`,
-  );
-  writeExecutable(
-    path.join(modules, 'tsc'),
-    `#!/bin/sh
-# The hook runs this twice per snapshot (--noEmit, then -p tsconfig.scripts.json);
-# only the first call is logged, so the count matches the other single-shot gates.
-[ "$1" = "--noEmit" ] || exit 0
-IFS= read -r consumed || true
-printf 'typecheck|%s|%s|%s\\n' "$PWD" "$(cat src/gate.ts)" "$consumed" >> "$HOOK_LOG"
-[ "\${HOOK_FAIL:-}" != "typecheck:$(cat src/gate.ts)" ] || exit 1
-`,
-  );
+  // No eslint or tsc fake: the hook no longer runs either. CI owns lint and
+  // typecheck (.github/workflows/ci.yml:44, :47, :50); this hook carries only
+  // the public-boundary check, which CI cannot run against the identifier
+  // registry.
   const hooks = path.join(root, 'hooks');
   fs.mkdirSync(hooks);
   writeExecutable(path.join(hooks, 'post-checkout'), '#!/bin/sh\ntouch "$HOOK_POST_CHECKOUT"\n');
@@ -220,11 +203,13 @@ describe('.husky/pre-push', () => {
     );
 
     expect(result.status).toBe(0);
-    expect(records(f.log)).toHaveLength(8);
+    // Two gates per pushed commit — the commit-message scan and the boundary
+    // check — across the two non-deletion refs.
+    expect(records(f.log)).toHaveLength(4);
     expect(records(f.log).join('\n')).toContain('first-pushed');
     expect(records(f.log).join('\n')).toContain('second-pushed');
     expect(records(f.log).join('\n')).not.toContain('dirty-worktree');
-    const snapshotRecords = records(f.log).filter((record) => /^(boundary|lint|typecheck)\|/.test(record));
+    const snapshotRecords = records(f.log).filter((record) => /^boundary\|/.test(record));
     expect(snapshotRecords.every((record) => record.endsWith('|'))).toBe(true);
     for (const record of snapshotRecords) {
       const snapshot = record.split('|')[1];
@@ -234,21 +219,21 @@ describe('.husky/pre-push', () => {
     expect(fs.existsSync(path.join(f.root, 'post-checkout-ran'))).toBe(false);
   });
 
-  it.each(['boundary', 'lint', 'typecheck'] as const)('rejects a non-HEAD snapshot when %s finds a violation', (gate) => {
+  it('rejects a non-HEAD snapshot when the boundary check finds a violation', () => {
     const f = fixture();
     const rejected = commit(f.root, 'rejected-push');
     runGit(f.root, ['branch', 'rejected-push', rejected]);
     commit(f.root, 'clean-head');
     fs.writeFileSync(path.join(f.root, 'src', 'gate.ts'), 'dirty-clean\n');
     const result = push(f, `refs/heads/rejected-push ${rejected} refs/heads/rejected-push ${zeroSha}\n`, {
-      fail: `${gate}:rejected-push`,
+      fail: 'boundary:rejected-push',
     });
 
     expect(result.status).toBe(1);
     expect(records(f.log).join('\n')).toContain('rejected-push');
     expect(records(f.log).join('\n')).not.toContain('clean-head');
     expect(records(f.log).join('\n')).not.toContain('dirty-clean');
-    expect(records(f.log)).toHaveLength(gate === 'boundary' ? 2 : gate === 'lint' ? 3 : 4);
+    expect(records(f.log)).toHaveLength(2);
     const snapshot = records(f.log)
       .find((record) => record.startsWith('boundary|'))
       ?.split('|')[1];
@@ -290,7 +275,11 @@ describe('.husky/pre-push', () => {
     );
 
     expect(result.status).toBe(0);
-    expect(records(f.log).filter((record) => record.includes('shared-push'))).toHaveLength(3);
+    // The same commit is reachable from both pushed refs; `seen_objects` must
+    // make the snapshot gate run over it exactly once, not once per ref.
+    expect(
+      records(f.log).filter((record) => record.startsWith('boundary|') && record.includes('shared-push')),
+    ).toHaveLength(1);
   });
 
   it('gates local-only history on a new ref against live advertised tips', () => {
@@ -646,39 +635,32 @@ describe('.husky/pre-push', () => {
     expect(fs.existsSync(path.join(linkedRoot, 'node_modules'))).toBe(false);
   });
 
-  it('runs eslint through nice when ionice is unavailable', () => {
+  it('runs the boundary check through nice when ionice is unavailable', () => {
     const f = fixture();
     const pushed = commit(f.root, 'no-ionice');
     const result = push(f, `refs/heads/new ${pushed} refs/heads/new ${zeroSha}\n`, { withoutIonice: true });
 
     expect(result.status).toBe(0);
     expect(records(f.log)).toContain('nice');
-    expect(records(f.log).join('\n')).toContain('lint');
+    expect(records(f.log).join('\n')).toContain('boundary');
   });
 
-  it('cleans up a snapshot that already tracks node_modules without unlinking it', () => {
-    const main = fixture();
-    const base = commit(main.root, 'base');
-    const linkedRoot = tempRoot();
-    runGit(main.root, ['-c', 'core.hooksPath=/dev/null', 'worktree', 'add', '--detach', '--quiet', linkedRoot, base]);
-    linkedWorktrees.push({ main: main.root, root: linkedRoot });
-    fs.symlinkSync('tracked-dependency', path.join(linkedRoot, 'node_modules'));
-    runGit(linkedRoot, ['add', 'node_modules']);
-    runGit(linkedRoot, ['commit', '-m', 'track node modules', '--quiet']);
-    const sha = runGit(linkedRoot, ['rev-parse', 'HEAD']);
-    const hook = path.join(linkedRoot, '.husky', 'pre-push');
-    fs.mkdirSync(path.dirname(hook), { recursive: true });
-    fs.copyFileSync(new URL('../.husky/pre-push', import.meta.url), hook);
+  it('leaves the snapshot free of untracked files so a plain worktree remove succeeds', () => {
+    // The hook used to symlink the main checkout's node_modules into every
+    // snapshot for eslint and tsc, and had to unlink it again before
+    // `worktree remove` (which refuses an untracked file without --force).
+    // With those gates gone nothing in the snapshot needs node_modules, so the
+    // symlink, its fail-closed guard and the extra cleanup step are all gone.
+    const f = fixture();
+    const pushed = commit(f.root, 'no-node-modules');
+    const result = push(f, `refs/heads/new ${pushed} refs/heads/new ${zeroSha}\n`);
 
-    const result = push(
-      { ...main, root: linkedRoot, hook, log: path.join(linkedRoot, 'hook.log') },
-      `refs/heads/current ${sha} refs/heads/current ${zeroSha}\n`,
-    );
-
-    expect(result.status).toBe(1);
-    expect(result.stderr).toContain('snapshot unexpectedly contains node_modules');
-    expect(fs.lstatSync(path.join(linkedRoot, 'node_modules')).isSymbolicLink()).toBe(true);
-    expect(runGit(main.root, ['worktree', 'list', '--porcelain'])).not.toContain('nanoclaw-pre-push');
-    expect(fs.readdirSync(linkedRoot).some((name) => name.startsWith('nanoclaw-pre-push.'))).toBe(false);
+    expect(result.status).toBe(0);
+    const snapshot = records(f.log)
+      .find((record) => record.startsWith('boundary|'))!
+      .split('|')[1];
+    expect(fs.existsSync(snapshot)).toBe(false);
+    expect(runGit(f.root, ['worktree', 'list', '--porcelain'])).not.toContain(snapshot);
+    expect(fs.readdirSync(f.root).some((name) => name.startsWith('nanoclaw-pre-push.'))).toBe(false);
   });
 });

@@ -63,18 +63,24 @@ import path from 'path';
  * `.codex/worktrees/` — Codex owns its own lifecycle.
  *
  * Any `nanoclaw-pre-push.XXXXXX` directory — snapshots created by
- * `.husky/pre-push`, which
- * lints a pushed SHA against a throwaway checkout and removes it afterwards.
- * They are excluded rather than probed because the liveness signal sees them
- * only INTERMITTENTLY, which is worse than not at all — you cannot reason
- * about a probe that is right sometimes. The hook's lint and typecheck phases
- * do run with cwd inside the snapshot (`.husky/pre-push:156,158,165,167` each
- * `cd "$snapshot_root"`), so the probe catches those. Every other phase does
- * not: creating the worktree, symlinking node_modules, the boundary check
- * (which passes `--root` rather than cd'ing), cleanup, and the final
- * `worktree remove`. A snapshot observed during one of those windows looks
- * idle while its push is very much in flight — which is exactly what produced
- * the false "safe to reclaim" on the first real run (#570).
+ * `.husky/pre-push`, which scans a pushed SHA against a throwaway checkout and
+ * removes it afterwards.
+ * They are excluded rather than probed because the liveness signal can NEVER
+ * see them in use. No phase of the hook runs with its cwd inside the snapshot:
+ * `worktree add`, the commit-message scan and the final `worktree remove` all
+ * use `git -C "$worktree_root"` or an absolute path, and the boundary check
+ * passes `--root` while running with cwd `$repo_root`
+ * (`.husky/pre-push:172,174`). So a snapshot ALWAYS looks idle while its push
+ * is very much in flight — which is exactly what produced the false "safe to
+ * reclaim" on the first real run (#570).
+ *
+ * It used to be worse than that rather than simply absent: the hook's lint and
+ * typecheck phases did `cd "$snapshot_root"`, so the probe was right
+ * INTERMITTENTLY — and you cannot reason about a probe that is right
+ * sometimes. Those phases moved to CI (see the header comment above
+ * `snapshot_commit`), which removes the intermittency but not the reason to
+ * exclude: never-visible and sometimes-visible both mean the probe cannot
+ * authorize a delete here.
  *
  * Detecting the owning push instead would work, but the trade does not pay:
  * measured 6 snapshots at 39 MB each, 234 MB total, against the ~10.5 GB this
@@ -85,7 +91,7 @@ import path from 'path';
  *
  * Matched on the directory NAME rather than a `/tmp` prefix: the hook creates
  * it with `mktemp -d "${TMPDIR:-/tmp}/nanoclaw-pre-push.XXXXXX"`
- * (`.husky/pre-push:111`), so a push run with TMPDIR set puts it under
+ * (`.husky/pre-push:107,158`), so a push run with TMPDIR set puts it under
  * `/var/tmp` or a private runtime dir and a `/tmp`-anchored pattern would miss
  * it entirely. The literal dot is load-bearing — it is what keeps a lookalike
  * like `nanoclaw-prepush-notahook` out.
