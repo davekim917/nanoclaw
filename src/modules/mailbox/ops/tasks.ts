@@ -797,14 +797,27 @@ export interface CliTaskRow {
  */
 export function listCliTaskSeries(db: Database.Database, status?: 'pending' | 'paused'): CliTaskRow[] {
   const statusSql = status ? 'status = ?' : "status IN ('pending', 'paused')";
+  // One row per series, chosen the same way getCliTaskRow chooses: the row that
+  // carries the schedule wins over a transient `ncl tasks run` row, which shares
+  // the series_id but has a NULL recurrence. The previous GROUP BY + MAX(seq)
+  // relied on SQLite's bare-column rule and therefore returned whichever row was
+  // newest — the run row — listing a recurring series as `once` and due now.
   return db
     .prepare(
-      `SELECT id AS row_id, series_id, status, process_after, recurrence, content, timestamp, tries,
-              platform_id, channel_type, thread_id, MAX(seq) AS seq
-         FROM messages_in
-        WHERE kind = 'task'
-          AND ${statusSql}
-        GROUP BY series_id
+      `SELECT row_id, series_id, status, process_after, recurrence, content, timestamp, tries,
+              platform_id, channel_type, thread_id, seq
+         FROM (
+           SELECT id AS row_id, series_id, status, process_after, recurrence, content, timestamp, tries,
+                  platform_id, channel_type, thread_id, seq,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY series_id
+                    ORDER BY CASE WHEN recurrence IS NOT NULL THEN 0 ELSE 1 END, seq DESC
+                  ) AS rn
+             FROM messages_in
+            WHERE kind = 'task'
+              AND ${statusSql}
+         )
+        WHERE rn = 1
         ORDER BY datetime(process_after) ASC, seq ASC`,
     )
     .all(...(status ? [status] : [])) as CliTaskRow[];
@@ -815,7 +828,22 @@ export function listCliTaskSeries(db: Database.Database, status?: 'pending' | 'p
  *
  * The ORDER BY is the whole point: an agent remembers the id it created, which
  * after the first fire names a `completed` row while the series' live next
- * occurrence carries a different row id. Live first, then newest.
+ * occurrence carries a different row id. Live first, then the row that carries
+ * the schedule, then newest.
+ *
+ * That middle term exists because `ncl tasks run` inserts a SECOND live row for
+ * the same series with `recurrence = NULL` (deliberately — see runTaskCommand:
+ * a run-now row must not be re-armed into a phantom series). Both rows are
+ * `pending`, so they tied on the status term and `seq DESC` handed back the
+ * newer run row — making `tasks get`/`tasks list` report a recurring series as
+ * `recurrence: null` / schedule `once`. The series was never damaged, but it
+ * read exactly like data loss, which invites a destructive "repair".
+ *
+ * Preferring `recurrence IS NOT NULL` and not `id = series_id` is deliberate:
+ * `insertRecurrence` re-arms each occurrence under a NEW row id while carrying
+ * the recurrence forward, so after the first fire the live series row's id no
+ * longer equals its series_id. One-shots keep their old behaviour — every row
+ * has a NULL recurrence, so the tie falls through to `seq DESC` as before.
  */
 export function getCliTaskRow(db: Database.Database, id: string): CliTaskRow | undefined {
   return db
@@ -825,7 +853,9 @@ export function getCliTaskRow(db: Database.Database, id: string): CliTaskRow | u
          FROM messages_in
         WHERE kind = 'task'
           AND (id = ? OR series_id = ?)
-        ORDER BY CASE WHEN status IN ('pending', 'paused') THEN 0 ELSE 1 END, seq DESC
+        ORDER BY CASE WHEN status IN ('pending', 'paused') THEN 0 ELSE 1 END,
+                 CASE WHEN recurrence IS NOT NULL THEN 0 ELSE 1 END,
+                 seq DESC
         LIMIT 1`,
     )
     .get(id, id) as CliTaskRow | undefined;
