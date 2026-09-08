@@ -90,8 +90,18 @@ export interface AgentProvider {
    *
    * Poll-loop pairs this with `isRetryable` to auto-recover from upstream
    * flakiness without dead-turning the user.
+   *
+   * `slot`/`position`/`ringSize` are populated whenever `rotated` is true —
+   * `slot` is the env var name of the credential now active (e.g.
+   * `CLAUDE_CODE_OAUTH_TOKEN_2`), `position` its 1-based place in the ring
+   * (primary is 1), and `ringSize` the ring's total length. Poll-loop passes
+   * these through to the replayed turn so the agent knows it is running on a
+   * different credential than the one that just failed — the rotation catch
+   * calls this at poll-loop.ts:1010 and poll-loop.ts:1059 and hands the result
+   * to `formatCredentialRetryPrompt` at poll-loop.ts:1017. Omitted (along
+   * with `rotated: false`) when no rotation happened.
    */
-  rotateApiKey?(): { rotated: boolean };
+  rotateApiKey?(): { rotated: boolean; slot?: string; position?: number; ringSize?: number };
 
   /**
    * Reset the per-turn rotation cycle budget. Rotation is circular — on a
@@ -103,6 +113,16 @@ export interface AgentProvider {
    * can be retried. Poll-loop calls this once at the start of every turn.
    */
   resetRotationCycle?(): void;
+
+  /**
+   * Restore the credential slot persisted by a previous instance of this
+   * session's container (circular OAuth ring only — see
+   * `ClaudeProvider.restorePersistedCredentialSlot`). Reads session state, so
+   * the runner entrypoint calls it once after the mailbox has started
+   * (`index.ts:97`) and the provider is built (`index.ts:308`); providers
+   * must not call it from their constructor or from `query()`.
+   */
+  restorePersistedCredentialSlot?(): void;
 
   /**
    * Optional pre-resume maintenance. Given the stored continuation token,

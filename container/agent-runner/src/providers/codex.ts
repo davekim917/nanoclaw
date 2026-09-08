@@ -21,6 +21,7 @@ import { z } from 'zod';
 import { memoryContextForSessionStart, type MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/container-state.js';
 import { setProviderHealthState, type ProviderHealthState } from '../modules/mailbox/index.js';
+import { formatCredentialRotationNotice } from '../credential-rotation-notice.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 import {
@@ -1106,7 +1107,17 @@ export class CodexProvider implements AgentProvider {
   /**
    * Advance the rotation cursor and return the next fallback CODEX_HOME, or
    * null when slots are exhausted. Position persists for the provider's
-   * lifetime (matches the Claude provider's `rotateApiKey` contract).
+   * lifetime but NOT across a container respawn — `nextFallback` is
+   * forward-only (never wraps, unlike `ClaudeProvider`'s circular OAuth
+   * ring), so a respawn is this pool's only reset. Restoring a persisted
+   * cursor onto a forward-only pool can only ever advance it, never reopen
+   * it: if the last fallback also fails, a restored cursor would sit past
+   * the end and the primary would never become eligible again, whereas an
+   * unpersisted respawn today resets to the primary and gives the whole
+   * pool another chance. `fallbackHomes` is therefore deliberately NOT
+   * persisted to session_state — see `ClaudeProvider.rotateApiKey`'s
+   * `ANTHROPIC_API_KEY_N` branch (providers/claude.ts:2308) for the same reasoning on the other
+   * forward-only pool this fleet has.
    *
    * Exported as a method so the gen() body and unit tests can both drive it.
    */
@@ -1511,7 +1522,22 @@ export class CodexProvider implements AgentProvider {
                       originalText: text,
                       initYielded,
                     });
-                    attemptText = transition.attemptText;
+                    // Credential rotation, specifically — unlike the
+                    // control-plane-recovery and primary-auth-refresh
+                    // branches above, this is the one where the PRIOR
+                    // credential actually hit its usage limit. Tell the
+                    // resumed/restarted thread explicitly so it doesn't read
+                    // its own prior turn's "rate limited" narrative (if any
+                    // survived into `attemptText`) as still describing this
+                    // attempt. Position is 1-based (primary = 1);
+                    // `self.nextFallback` was already advanced by
+                    // `rotateCodexHome()` above, so it equals that position.
+                    attemptText =
+                      `${transition.attemptText}\n\n` +
+                      formatCredentialRotationNotice({
+                        position: self.nextFallback + 1,
+                        ringSize: self.fallbackHomes.length + 1,
+                      });
                     initYielded = transition.initYielded;
                     if (transition.resetThreadDedupe) {
                       resetCodexTurnAccumulatorThread(turnAccum);

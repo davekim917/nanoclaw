@@ -15,6 +15,7 @@ import {
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/container-state.js';
 import { recordRateLimitSamples, type AccountIdentity, type RateLimitSample } from '../modules/mailbox/index.js';
+import { getCredentialSlot, setCredentialSlot } from '../modules/mailbox/session-state.js';
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { TIMEZONE, formatLocalStamp } from '../timezone.js';
 import { shimCwd } from './cwd-shim.js';
@@ -2167,6 +2168,84 @@ export class ClaudeProvider implements AgentProvider {
     }
   }
 
+  /**
+   * Restore the credential slot a previous instance of this container last
+   * rotated onto, so a respawn doesn't burn a rejected turn on the primary
+   * before replaying its way back to the credential that's actually healthy.
+   * Position only, never the token value — the value already lives in
+   * `oauthRing` from env.
+   *
+   * NOT called from the constructor, and not from `query()` either: it reads
+   * session state, and `getCredentialSlot` opens the outbound session DB
+   * directly (`mailbox/sqlite/connection.ts:76-89` — it does not go through
+   * the mailbox registry, so "no mailbox registered" is not a guard). A
+   * constructor that touched the DB would make every unit test that builds
+   * a provider create a session DB at the production path. The runner
+   * entrypoint calls this exactly once, after the mailbox has started
+   * (`index.ts:97`) and the provider is built (`index.ts:308`); tests call it
+   * explicitly when they want the restore.
+   *
+   * OAuth ring ONLY — see the comment below where the `ANTHROPIC_API_KEY_N`
+   * lookup used to be for why the forward-only fallback pool is deliberately
+   * excluded: only the circular ring's wrap guarantees every slot stays
+   * reachable after a restore, so only it is safe to persist across a
+   * respawn.
+   *
+   * Best-effort: no persisted slot (fresh install, first-ever rotation)
+   * falls through to the default primary silently, and a session-DB read
+   * failure is logged and ignored — a respawn must never fail to boot over a
+   * position hint it can re-derive by rotating.
+   */
+  restorePersistedCredentialSlot(): void {
+    let persisted: string | undefined;
+    try {
+      persisted = getCredentialSlot('claude');
+    } catch (err) {
+      log(`Could not read persisted credential slot: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    if (!persisted) return;
+
+    const ringIndex = this.oauthRing.findIndex((entry) => entry.name === persisted);
+    if (ringIndex !== -1) {
+      this.oauthRingPos = ringIndex;
+      const active = this.oauthRing[ringIndex];
+      this.env.CLAUDE_CODE_OAUTH_TOKEN = active.value;
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = active.value;
+      log(
+        `Resumed credential slot ${active.name} (ring ${ringIndex + 1}/${this.oauthRing.length}) from session state`,
+      );
+      return;
+    }
+
+    // Deliberately no ANTHROPIC_API_KEY_N fallback branch here: `fallbackKeys`
+    // is forward-only/exhaust-once (`nextFallback` never wraps — see
+    // `rotateApiKey` below), unlike the circular OAuth ring above. Restoring a
+    // persisted position onto a forward-only pool can only ever advance the
+    // cursor, never reopen it — so a respawn after the LAST fallback also
+    // failed would restore straight past the end and the primary would never
+    // become eligible again, whereas an unpersisted respawn today resets to
+    // the primary and gives the whole pool another chance. A container
+    // respawn is that pool's only reset by design; persisting across it would
+    // turn a recoverable dead end into a permanent one. `persistCredentialSlot`
+    // is therefore never called from the API-key branch of `rotateApiKey`
+    // either — see that method.
+
+    // Named a slot that's no longer present (env changed since the value was
+    // written) — ignore and stay on the primary. Log once so a stale slot
+    // never rotting silently is at least visible.
+    log(`Persisted credential slot "${persisted}" is not in the current pool — ignoring, staying on primary`);
+  }
+
+  /** Best-effort persist; never throws — a respawn just re-derives via rotation. */
+  private persistCredentialSlot(slotName: string): void {
+    try {
+      setCredentialSlot('claude', slotName);
+    } catch (err) {
+      log(`Failed to persist credential slot: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   registerMemorySessionHook(hook: MemorySessionHookRegistration): void {
     writeMemorySessionHook(hook);
     this.memorySessionHook = hook;
@@ -2212,8 +2291,12 @@ export class ClaudeProvider implements AgentProvider {
    * request. Same shape as `/login`-mid-session in interactive Claude Code.
    *
    * Position persists for the container lifetime — once slot N fires a
-   * retryable error, slot N+1 stays active for all subsequent queries.
-   * Restarting the container is the only reset.
+   * retryable error, slot N+1 stays active for all subsequent queries. On
+   * the circular OAuth ring it also survives a container respawn: the slot
+   * NAME is persisted to session state here and restored by the runner
+   * entrypoint (`restorePersistedCredentialSlot`). The forward-only
+   * `ANTHROPIC_API_KEY_N` pool is different: nothing is persisted, and a
+   * respawn is its only reset — see the comment in that branch below.
    *
    * Process-wide propagation: rotations are mirrored to `process.env` so
    * other in-process consumers that issue direct Anthropic calls — the
@@ -2226,7 +2309,7 @@ export class ClaudeProvider implements AgentProvider {
    * and re-injects the real token values, so direct callers bypass the
    * OneCLI proxy and use process.env directly.
    */
-  rotateApiKey(): { rotated: boolean } {
+  rotateApiKey(): { rotated: boolean; slot?: string; position?: number; ringSize?: number } {
     const usingOauth = !this.env.ANTHROPIC_API_KEY && Boolean(this.env.CLAUDE_CODE_OAUTH_TOKEN);
     if (usingOauth) {
       // Circular: advance around the ring (wrapping past the last fallback
@@ -2246,7 +2329,8 @@ export class ClaudeProvider implements AgentProvider {
         `Rotated CLAUDE_CODE_OAUTH_TOKEN → ${next.name} ` +
           `(ring ${this.oauthRingPos + 1}/${this.oauthRing.length}, cycle ${this.oauthRotationsThisCycle}/${this.oauthRing.length - 1})`,
       );
-      return { rotated: true };
+      this.persistCredentialSlot(next.name);
+      return { rotated: true, slot: next.name, position: this.oauthRingPos + 1, ringSize: this.oauthRing.length };
     }
     if (this.nextFallback >= this.fallbackKeys.length) return { rotated: false };
     const next = this.fallbackKeys[this.nextFallback++];
@@ -2258,7 +2342,10 @@ export class ClaudeProvider implements AgentProvider {
     this.env.ANTHROPIC_API_KEY = next.value;
     process.env.ANTHROPIC_API_KEY = next.value;
     log(`Rotated ANTHROPIC_API_KEY → ${next.name} (${this.nextFallback}/${this.fallbackKeys.length})`);
-    return { rotated: true };
+    // No persistCredentialSlot() here — see the comment on the ANTHROPIC_API_KEY_N
+    // branch in restorePersistedCredentialSlot for why this forward-only pool
+    // deliberately does not persist across a respawn.
+    return { rotated: true, slot: next.name, position: this.nextFallback + 1, ringSize: this.fallbackKeys.length + 1 };
   }
 
   /**
@@ -2421,6 +2508,18 @@ export class ClaudeProvider implements AgentProvider {
     // rotation/retry catch exactly like the result-branch throws below.
     let subagentQuotaError: string | null = null;
 
+    // Owns the CLI subprocess's lifetime. Without this, `abort()` below only
+    // set a flag and ended the input stream — the SDK's own graceful-close
+    // path runs on stdin EOF, but nothing forced it, so an abandoned query
+    // (e.g. one interrupted by a credential rotation) could keep its CLI
+    // child running on the exhausted credential and burn another 429 minutes
+    // after the replay was already healthy on a different one. Passing this
+    // as `options.abortController` gives the SDK an immediate, unambiguous
+    // signal to tear the process down (stdin EOF → short grace window →
+    // kill) instead of relying on the async generator being abandoned by its
+    // consumer, which the SDK's own cleanup does not reliably observe.
+    const queryAbortController = new AbortController();
+
     const sdkResult = sdkQuery({
       prompt: stream,
       options: {
@@ -2428,6 +2527,7 @@ export class ClaudeProvider implements AgentProvider {
         additionalDirectories: this.additionalDirectories,
         resume: input.continuation,
         model: model,
+        abortController: queryAbortController,
         ...(effort ? { effort: effort as EffortLevel } : {}),
         // `display: 'summarized'` makes thinking text visible in content
         // blocks; default is empty-text + signature only.
@@ -2574,6 +2674,17 @@ export class ClaudeProvider implements AgentProvider {
         }
       }
 
+      // An intentional abort() tears the CLI subprocess down via
+      // queryAbortController, and the SDK surfaces that teardown as a thrown
+      // "aborted"-classified error out of the async iterator itself — not
+      // as a message the loop body ever sees, so the `if (aborted) return;`
+      // guard inside the loop can't catch it. The try/catch below swallows
+      // ONLY that case (checked via the `aborted` flag, not the error's
+      // shape, so it can't misclassify a real SDK error as an intentional
+      // teardown); every other error — including every deliberate throw
+      // inside the loop below, all of which fire before `aborted` is ever
+      // set — still propagates unchanged.
+      try {
       for await (const message of sdkResult) {
         if (aborted) return;
         // A subagent hit the credential slot's quota (PostToolUse hook).
@@ -2791,6 +2902,10 @@ export class ClaudeProvider implements AgentProvider {
           }
         }
       }
+      } catch (err) {
+        if (aborted) return;
+        throw err;
+      }
       // Second gate, and the load-bearing one: `interrupt()` may end the
       // stream without emitting a further message, in which case the
       // top-of-loop check above never runs again and the turn would complete
@@ -2888,6 +3003,12 @@ export class ClaudeProvider implements AgentProvider {
       abort: () => {
         aborted = true;
         stream.end();
+        // Idempotent: AbortController#abort() on an already-aborted
+        // controller is a documented no-op, so a caller that ends up
+        // calling abort() more than once for the same query (e.g. both the
+        // poll-loop's error-path abort at poll-loop.ts:808 and a config.signal listener firing)
+        // never double-tears-down.
+        queryAbortController.abort();
       },
       // In-flight -m/-e: same conversation, same stream — the SDK control
       // requests mirror interactive Claude Code's /model. Re-runs the same

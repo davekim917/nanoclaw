@@ -623,3 +623,158 @@ describe('codex usage stays container-respawn safe', () => {
     expect(codeOnly).not.toMatch(/tokenUsage\??\.total/);
   });
 });
+
+// Deliverable A (Codex side): a credential-exhaustion turn rotates to the
+// fallback CODEX_HOME and tells the resumed thread explicitly that its
+// credential was swapped (mirrors claude.ts's poll-loop rotation notice, via
+// the shared `formatCredentialRotationNotice` helper — codex.ts:1535-1540
+// appends it to whatever `resolveCodexRestartTransition` (called at
+// codex.ts:1519) produces for the resumed/restarted thread). No persistence
+// here: `fallbackHomes` is a
+// forward-only pool (see the doc comment on `CodexProvider.rotateCodexHome`
+// in codex.ts) and a container respawn is deliberately its only reset.
+describe('CodexProvider OAuth-rotation notice', () => {
+  it('rotates on UsageLimitExceeded and tells the resumed thread it was rotated', async () => {
+    const binDir = path.join(tmpDir, 'bin');
+    const codexHome = path.join(tmpDir, 'codex-home');
+    const fallbackHome = path.join(tmpDir, 'codex-fallback');
+    const statePath = path.join(tmpDir, 'spawn-count');
+    const logPath = path.join(tmpDir, 'requests.jsonl');
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.mkdirSync(codexHome, { recursive: true });
+
+    // Instance 1 fails its turn with a structured UsageLimitExceeded — the
+    // exact shape `classifyCodexError` maps to classification 'quota',
+    // which `isCodexOAuthRotationEligible` treats as rotation-eligible.
+    // Instance 2 (spawned on the fallback CODEX_HOME) completes normally.
+    fs.writeFileSync(
+      path.join(binDir, 'codex'),
+      `#!/usr/bin/env bun
+import fs from 'fs';
+import readline from 'readline';
+
+const statePath = process.env.FAKE_CODEX_STATE;
+const logPath = process.env.FAKE_CODEX_LOG;
+const previous = fs.existsSync(statePath) ? Number(fs.readFileSync(statePath, 'utf8')) : 0;
+const instance = previous + 1;
+fs.writeFileSync(statePath, String(instance));
+
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+const log = (value) => fs.appendFileSync(logPath, JSON.stringify({ instance, ...value }) + '\\n');
+const lines = readline.createInterface({ input: process.stdin });
+lines.on('line', (line) => {
+  const request = JSON.parse(line);
+  log({ method: request.method, params: request.params });
+  if (request.method === 'initialize') {
+    send({ id: request.id, result: { userAgent: 'fake-codex' } });
+    return;
+  }
+  if (request.method === 'thread/start' || request.method === 'thread/resume') {
+    send({ id: request.id, result: { thread: { id: 'thread-1', status: { type: 'idle' } } } });
+    return;
+  }
+  if (request.method === 'turn/start') {
+    const turnId = 'turn-' + instance;
+    send({ id: request.id, result: { turn: { id: turnId } } });
+    send({
+      method: 'turn/started',
+      params: { threadId: 'thread-1', turn: { id: turnId, status: 'inProgress', items: [] } },
+    });
+    setTimeout(() => {
+      if (instance === 1) {
+        send({
+          method: 'turn/completed',
+          params: {
+            threadId: 'thread-1',
+            turn: {
+              id: turnId,
+              status: 'failed',
+              items: [],
+              error: { message: 'usage limit reached', codexErrorInfo: { type: 'UsageLimitExceeded' } },
+            },
+          },
+        });
+      } else {
+        send({
+          method: 'item/agentMessage/delta',
+          params: { threadId: 'thread-1', turnId, delta: 'recovered result' },
+        });
+        send({
+          method: 'turn/completed',
+          params: { threadId: 'thread-1', turn: { id: turnId, status: 'completed', items: [] } },
+        });
+      }
+    }, 5);
+    return;
+  }
+  if (request.method === 'thread/read') {
+    send({ id: request.id, result: { thread: { status: { type: 'active' } } } });
+    return;
+  }
+  if (request.method === 'thread/list') {
+    send({ id: request.id, result: { data: [] } });
+    return;
+  }
+  if (request.method === 'turn/interrupt') {
+    send({ id: request.id, result: {} });
+  }
+});
+`,
+      { mode: 0o755 },
+    );
+
+    process.env.PATH = `${binDir}:${process.env.PATH ?? ''}`;
+    process.env.CODEX_HOME = codexHome;
+    process.env.CODEX_FALLBACK_HOMES = fallbackHome;
+    process.env.FAKE_CODEX_STATE = statePath;
+    process.env.FAKE_CODEX_LOG = logPath;
+    process.env.CODEX_HEALTH_PROBE_QUIET_MS = '60000';
+    process.env.CODEX_HEALTH_PROBE_INTERVAL_MS = '1000';
+    process.env.CODEX_HEALTH_PROBE_TIMEOUT_MS = '1000';
+
+    const provider = new CodexProvider({ providerConfig: { reasoning_effort: 'ultra' } });
+    provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
+    const query = provider.query({ prompt: 'perform the original task once', cwd: tmpDir });
+    const events: Array<{ type: string; text?: string | null; message?: string }> = [];
+    for await (const event of query.events) {
+      events.push(event);
+      if (event.type === 'result') query.end();
+    }
+
+    expect(fs.readFileSync(statePath, 'utf8')).toBe('2');
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    expect(events.some((event) => event.type === 'progress' && event.message?.includes('Codex OAuth rotating'))).toBe(
+      true,
+    );
+    expect(events.find((event) => event.type === 'result')).toMatchObject({
+      type: 'result',
+      text: 'recovered result',
+    });
+
+    const requests = fs
+      .readFileSync(logPath, 'utf8')
+      .trim()
+      .split('\n')
+      .map(
+        (line) =>
+          JSON.parse(line) as { instance: number; method: string; params?: { input?: Array<{ text?: string }> } },
+      );
+    const starts = requests.filter((request) => request.method === 'turn/start');
+    expect(starts).toHaveLength(2);
+    expect(starts[0]?.params?.input?.[0]?.text).toBe('perform the original task once');
+    // Rotation is eligible on a resumed thread here (thread/resume succeeds),
+    // so the resumed prompt is the short recovery nudge — NOT the original
+    // request — plus the rotation notice appended after it.
+    const secondPromptText = starts[1]?.params?.input?.[0]?.text ?? '';
+    expect(secondPromptText).toContain('Continue the same user request from the persisted thread state');
+    expect(secondPromptText).toContain('<runner-credential-rotation>');
+    expect(secondPromptText).toContain('slot 2 of 2');
+    expect(secondPromptText).toContain('does not apply to this attempt');
+    expect(secondPromptText).not.toContain('perform the original task once');
+
+    // Live rotation still takes effect immediately (this is NOT persistence
+    // — the same process's CODEX_HOME env just reflects the in-memory
+    // rotation the running turn performed).
+    expect(process.env.CODEX_HOME).toBe(fallbackHome);
+  }, 5_000);
+});
