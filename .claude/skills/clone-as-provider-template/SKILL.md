@@ -25,7 +25,8 @@ architecture block:
 - Preserve capability grants such as `slack_user_token.enabled`, but remove
   identity-scoped values such as `also_allowed_in` messaging-group IDs. Those
   IDs belong to the source adapter and must be configured for the sibling's
-  own wiring.
+  own wiring. Remove `gitIdentity` too: Git attribution is an explicit
+  per-agent opt-in, never a value to infer or inherit while cloning.
 - MCP transport mapping is native-first: stdio remains local/stdio, Streamable
   HTTP remains native remote/http, and deprecated SSE is rejected instead of
   silently bridged. A `remote-mcp-bridge` entry is an exception that needs an

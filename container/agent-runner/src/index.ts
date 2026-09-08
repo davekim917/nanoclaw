@@ -30,6 +30,7 @@ import { buildSystemPromptAddendum } from './destinations.js';
 import { getTaskSeriesId } from './db/session-routing.js';
 import { ensureMemoryScaffold } from './memory/scaffold.js';
 import { MEMORY_SESSION_HOOK } from './memory/session-hook.js';
+import { builtInNanoclawMcpEnv } from './nanoclaw-mcp-env.js';
 import { resolvePluginServer } from './plugin-mcp.js';
 // Module barrel — loads registration modules, including the singular mailbox slot.
 import './modules/index.js';
@@ -42,11 +43,7 @@ import type { McpServerConfig } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
 import { readToneProfile } from './tone-profiles.js';
 import { readChannelInstructions, isSafeInstructionsProfileName } from './channel-instructions.js';
-import {
-  setupCodexPrimaryRuntime,
-  setupCodexRuntime,
-  syncAgentSkillsMirror,
-} from './codex-companion-setup.js';
+import { setupCodexPrimaryRuntime, setupCodexRuntime, syncAgentSkillsMirror } from './codex-companion-setup.js';
 import { activateGcpServiceAccount } from './gcp-auth-setup.js';
 import { startResourceTelemetry } from './resource-telemetry.js';
 import { CLAUDE_REVIEW_SOCKET_ENV } from './cli/claude-review-contract.js';
@@ -143,7 +140,9 @@ async function main(): Promise<void> {
       toneBlock = `## Default Tone: ${toneName}\n\nApply this voice to every response in this session — chat replies AND any content you draft (emails, documents, messages). Per-response overrides from the user ("use X tone") take precedence.\n\n${toneContent}`;
       log(`Loaded default tone profile: ${toneName}`);
     } else {
-      log(`NANOCLAW_DEFAULT_TONE=${toneName} but no such profile in group or shared tone-profiles — skipping injection`);
+      log(
+        `NANOCLAW_DEFAULT_TONE=${toneName} but no such profile in group or shared tone-profiles — skipping injection`,
+      );
     }
   }
 
@@ -153,7 +152,7 @@ async function main(): Promise<void> {
   const capabilityNote = [
     '## Capability Awareness',
     '',
-    "Before saying a service is unavailable, verify it with `mcp__nanoclaw__get_capabilities` using `section: \"session\"`. Absence of a dedicated MCP tool is not proof of no access; follow the live snapshot's activation instructions.",
+    'Before saying a service is unavailable, verify it with `mcp__nanoclaw__get_capabilities` using `section: "session"`. Absence of a dedicated MCP tool is not proof of no access; follow the live snapshot\'s activation instructions.',
   ].join('\n');
 
   // Always-on per-channel operating rules. Host resolves
@@ -217,10 +216,7 @@ async function main(): Promise<void> {
   // [mcp_servers.nanoclaw.env] and opencode's environment map); providers
   // that inherit full env merge the same values harmlessly. Unset or
   // empty vars are omitted so "absent" semantics stay intact.
-  const nanoclawEnv: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (key.startsWith('NANOCLAW_') && value) nanoclawEnv[key] = value;
-  }
+  const nanoclawEnv = builtInNanoclawMcpEnv();
 
   // Build MCP servers config: nanoclaw built-in + any from container.json
   // or host-injected NANOCLAW_MCP_SERVERS. Host may inject stdio or http

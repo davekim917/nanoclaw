@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { execFileSync } from 'child_process';
+import { randomBytes } from 'crypto';
 import {
   chmodSync,
   existsSync,
@@ -16,6 +17,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 
 import { cloneRepoTool, createWorktreeTool, gitCommitTool, gitPushTool } from './git-worktrees';
+import { builtInNanoclawMcpEnv } from '../nanoclaw-mcp-env.js';
 import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
 describe('topic-linked worktree topology', () => {
   let root: string;
@@ -32,6 +34,10 @@ describe('topic-linked worktree topology', () => {
     'NANOCLAW_REPOSITORY_ALLOW_LOCAL_ORIGIN',
     'NANOCLAW_REPOSITORY_ACTION_TRANSPORT',
     'NANOCLAW_REVIEW_CHURN_GATE_SCRIPT',
+    'GIT_AUTHOR_NAME',
+    'GIT_AUTHOR_EMAIL',
+    'GIT_COMMITTER_NAME',
+    'GIT_COMMITTER_EMAIL',
   ] as const;
   let savedEnv: Record<string, string | undefined>;
 
@@ -39,6 +45,46 @@ describe('topic-linked worktree topology', () => {
     execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd, stdio: 'pipe' })
       .toString()
       .trim();
+
+  const plainGit = (cwd: string, args: string[]) =>
+    execFileSync('git', args, {
+      cwd,
+      env: process.env,
+      stdio: 'pipe',
+    })
+      .toString()
+      .trim();
+
+  function fixtureGitIdentity(role: string): { name: string; email: string } {
+    const suffix = randomBytes(6).toString('hex');
+    const localPart = role.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+    return {
+      name: `Fixture ${role} ${suffix}`,
+      email: `fixture-${localPart}-${suffix}@example.invalid`,
+    };
+  }
+
+  function setGitIdentity(identity: { name: string; email: string }): void {
+    const forwarded = builtInNanoclawMcpEnv({
+      GIT_AUTHOR_NAME: identity.name,
+      GIT_AUTHOR_EMAIL: identity.email,
+      GIT_COMMITTER_NAME: identity.name,
+      GIT_COMMITTER_EMAIL: identity.email,
+    });
+    for (const key of ['GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL'] as const) {
+      process.env[key] = forwarded[key]!;
+    }
+  }
+
+  function commitIdentity(cwd: string): { name: string; email: string; committerName: string; committerEmail: string } {
+    const [name, email, committerName, committerEmail] = git(cwd, [
+      'show',
+      '-s',
+      '--format=%an%n%ae%n%cn%n%ce',
+      'HEAD',
+    ]).split('\n');
+    return { name, email, committerName, committerEmail };
+  }
 
   function seedCanonical(): void {
     const seed = join(root, 'seed');
@@ -372,6 +418,40 @@ describe('topic-linked worktree topology', () => {
     expect((await gitPushTool.handler({ repo: 'proj' })).isError).toBeFalsy();
     const branch = git(worktree, ['branch', '--show-current']);
     expect(git(remote, ['show-ref', '--verify', `refs/heads/${branch}`])).toContain(branch);
+  });
+
+  test('configured agents retain distinct identities for plain Git and the managed git_commit tool', async () => {
+    const plainIdentity = fixtureGitIdentity('Plain Agent');
+    setGitIdentity(plainIdentity);
+    expect((await createWorktreeTool.handler({ repo: 'proj', branch: 'plain-identity' })).isError).toBeFalsy();
+    const plainWorktree = join(firstTopic, 'proj');
+    writeFileSync(join(plainWorktree, 'plain.txt'), 'plain git commit\n');
+    plainGit(plainWorktree, ['add', '-A']);
+    plainGit(plainWorktree, ['commit', '--no-verify', '-m', 'plain identity']);
+
+    const managedIdentity = fixtureGitIdentity('Managed Agent');
+    setGitIdentity(managedIdentity);
+    const managedTopic = useTopic('topic-managed-identity', 'thread:slack:C1:identity');
+    expect((await createWorktreeTool.handler({ repo: 'proj', branch: 'managed-identity' })).isError).toBeFalsy();
+    const managedWorktree = join(managedTopic, 'proj');
+    writeFileSync(join(managedWorktree, 'managed.txt'), 'managed git commit\n');
+    expect((await gitCommitTool.handler({ repo: 'proj', message: 'managed identity' })).isError).toBeFalsy();
+
+    expect(commitIdentity(plainWorktree)).toEqual({
+      name: plainIdentity.name,
+      email: plainIdentity.email,
+      committerName: plainIdentity.name,
+      committerEmail: plainIdentity.email,
+    });
+    expect(commitIdentity(managedWorktree)).toEqual({
+      name: managedIdentity.name,
+      email: managedIdentity.email,
+      committerName: managedIdentity.name,
+      committerEmail: managedIdentity.email,
+    });
+    expect(git(plainWorktree, ['rev-parse', '--git-common-dir'])).toBe(
+      git(managedWorktree, ['rev-parse', '--git-common-dir']),
+    );
   });
 
   test('push-is-refused-while-the-review-churn-gate-holds', async () => {
