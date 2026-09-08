@@ -81,7 +81,18 @@ next spawn, and the enabler run is just a verification pass.
    > Scoped mirrors (`~/.local/share/opencode-<group>/`) exist only for groups with
    > their own `auth.json`; the rest share the global dir.
 
+   **`--report-json` is not a probe — it writes.** It only changes the OUTPUT
+   FORMAT. Every mutation in `main()` is gated on `dryRun` alone: manifest
+   generation, `resolveDenySiblings`, `applyOptOut`, and — the dangerous one —
+   `syncOpenCodePluginSkills()` at `if (!dryRun)`. Running it "just to see the
+   classification" performs the full OpenCode sync, delete pass included. Pair it
+   with `--dry-run` to inspect safely, then re-run without:
+
    ```bash
+   # safe: classify only, writes nothing
+   pnpm exec tsx scripts/enable-agent-plugin.ts <name> --dry-run --report-json
+
+   # commits the change (manifests + OpenCode sync)
    pnpm exec tsx scripts/enable-agent-plugin.ts <name> --report-json
    ```
 
@@ -109,8 +120,8 @@ next spawn, and the enabler run is just a verification pass.
      anymore. Condense for signal, not for bytes.
    - This file is what `composeGroupClaudeMd` folds into every non-Claude group.
 
-4. **Re-run the enabler** so it re-checks the now-present ruleset file (no `--report-json`
-   this time, to see the human summary):
+4. **Re-run the enabler** so it re-checks the now-present ruleset file (drop
+   `--report-json` for the human summary; both forms write either way):
 
    ```bash
    pnpm exec tsx scripts/enable-agent-plugin.ts <name>
