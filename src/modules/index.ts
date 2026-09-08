@@ -100,3 +100,7 @@ import './sweep-continuation/index.js';
 // Sweep duty family: scheduling + thread-close (S2-PR11) — thread-close-advance,
 // due-wake-admission, recurrence-fanout, spent-task-session-gc.
 import './sweep-scheduling/index.js';
+
+// Sweep duty family: scheduled-task failure escalation (T24) — a series whose
+// agent turn keeps erroring reaches a human instead of dying silently.
+import './sweep-task-escalation/index.js';

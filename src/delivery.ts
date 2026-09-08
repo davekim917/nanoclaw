@@ -29,6 +29,7 @@ import {
   deleteTaskThreadAnchor,
   anchorRotationKey,
 } from './db/task-thread-anchors.js';
+import { recordTaskRunOutcome } from './db/task-run-outcomes.js';
 import { getMessagingGroup, getMessagingGroupByPlatform } from './db/messaging-groups.js';
 import { runGuarded, type DeliveryGuardSpec, type GuardedDeliveryHandler } from './delivery-guard.js';
 import { isUnguarded, unguarded, type Unguarded } from './guard/index.js';
@@ -1024,10 +1025,40 @@ async function deliverMessage(
   if (msg.kind === 'task_log') {
     if (session.messaging_group_id === null && isTaskThread(session.thread_id) && session.thread_id) {
       const series = session.thread_id.slice(`${TASKS_SYSTEM_THREAD_ID}:`.length);
+      const text = typeof content.text === 'string' ? content.text : '';
       try {
-        await appendRunLog(session.agent_group_id, series, typeof content.text === 'string' ? content.text : '');
+        await appendRunLog(session.agent_group_id, series, text);
       } catch (err) {
         log.warn('Failed to append task run log', { id: msg.id, sessionId: session.id, err });
+      }
+      // The run log is a markdown file nothing queries. Mirror the same event
+      // into the central run-outcome ledger, which the escalation sweep reads
+      // and which outlives S19's close of the spent task session (migration
+      // 075). Only the runner's END-OF-RUN summary carries `auto: true`; a
+      // mid-run `ncl tasks append-log` note is not a fire and must never move
+      // a streak.
+      //
+      // Best-effort and separately caught: a task run's log line reaching the
+      // series file must not depend on the ledger write, nor the reverse.
+      if (content.auto === true) {
+        try {
+          await recordTaskRunOutcome({
+            agentGroupId: session.agent_group_id,
+            sessionId: session.id,
+            seriesId: series,
+            outboundId: msg.id,
+            outcome: content.isError === true ? 'failed' : 'ok',
+            model: typeof content.model === 'string' ? content.model : null,
+            // Scrubbed HERE, not at read time: this row is durable and the
+            // text is agent output. `scrubSecrets` runs on the outbound
+            // delivery path below, never inside the adapter, so a value
+            // recorded raw would sit in the central DB — and then ride into an
+            // operator DM — having passed no scrubber at all.
+            detail: scrubSecrets(text).slice(0, 500) || null,
+          });
+        } catch (err) {
+          log.warn('Failed to record task run outcome', { id: msg.id, sessionId: session.id, err });
+        }
       }
     } else {
       log.warn('task_log row outside a task session — ignoring', { id: msg.id, sessionId: session.id });

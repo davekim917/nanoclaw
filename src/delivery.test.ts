@@ -1166,6 +1166,89 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
     db.close();
   }
 
+  // ── the 2026-09-07 escalation ledger (migration 075) ──────────────────────
+  //
+  // A failing fire used to leave the run log (a markdown file nothing queries)
+  // and an occurrence row reading `completed`. `task_run_outcomes` is the
+  // queryable half; delivery is where the runner's verdict becomes a row.
+  function insertTaskLog(
+    agentGroupId: string,
+    sessionId: string,
+    msgId: string,
+    content: Record<string, unknown>,
+  ): void {
+    const db = new Database(outboundDbPath(agentGroupId, sessionId));
+    db.prepare(
+      `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, in_reply_to, content)
+       VALUES (?, ?, 'task_log', NULL, NULL, NULL, NULL, ?)`,
+    ).run(msgId, now(), JSON.stringify(content));
+    db.close();
+  }
+
+  async function outcomeRows(): Promise<Array<{ outcome: string; model: string | null; detail: string | null }>> {
+    return getRawDb().prepare('SELECT outcome, model, detail FROM task_run_outcomes ORDER BY id').all() as Array<{
+      outcome: string;
+      model: string | null;
+      detail: string | null;
+    }>;
+  }
+
+  it('records an errored task run as a failure, with the model that ran', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveTaskSession('ag-1', 'series-1');
+    insertTaskLog('ag-1', session.id, 'log-1', {
+      text: "There's an issue with the selected model (gpt-6-astra).",
+      auto: true,
+      isError: true,
+      model: 'gpt-6-astra',
+    });
+    setDeliveryAdapter({
+      async deliver() {
+        return 'plat-1';
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(await outcomeRows()).toEqual([
+      {
+        outcome: 'failed',
+        model: 'gpt-6-astra',
+        detail: "There's an issue with the selected model (gpt-6-astra).",
+      },
+    ]);
+  });
+
+  it('records a clean task run as a success', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveTaskSession('ag-1', 'series-1');
+    insertTaskLog('ag-1', session.id, 'log-1', { text: 'no PR state changes', auto: true, model: 'claude-fable-5-1' });
+    setDeliveryAdapter({
+      async deliver() {
+        return 'plat-1';
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect((await outcomeRows()).map((r) => r.outcome)).toEqual(['ok']);
+  });
+
+  it('ignores a mid-run append-log note — only the end-of-run summary is a fire', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveTaskSession('ag-1', 'series-1');
+    insertTaskLog('ag-1', session.id, 'log-1', { text: 'one feed returned 403; continuing' });
+    setDeliveryAdapter({
+      async deliver() {
+        return 'plat-1';
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(await outcomeRows()).toEqual([]);
+  });
+
   it('first post: no anchor yet — posts at root and stores the anchor', async () => {
     await seedAgentAndChannel();
     grantChannelDestination('ag-1', 'mg-1');
