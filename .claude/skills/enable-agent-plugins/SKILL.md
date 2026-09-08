@@ -141,7 +141,7 @@ next spawn, and the enabler run is just a verification pass.
    The three traps, each with the code that causes it:
 
    - **`--deny` never withholds an always-on ruleset.** `composeGroupClaudeMd` reads
-     the group's `excludePlugins` and nothing else (`src/claude-md-compose.ts:167`);
+     the group's `excludePlugins` and nothing else (`src/claude-md-compose.ts:168`);
      it does not consult `denySiblings`. A denied mode plugin keeps injecting its
      rules after restart.
    - **`--deny claude` works only on a plugin that has no Claude manifest yet.**
@@ -209,9 +209,9 @@ After respawn:
      console.log(plan('/home/ubuntu/plugins').filter(x=>x.name===n||x.repoName===n).map(x=>x.name+' -> '+x.action).join('\n'))"
    ```
 
-   Filtering on `name` alone returns `[]` for a monorepo even when registration is
-   planned correctly
-  → expect `action: "register"`.
+   Every row for the plugin should read `-> register`. Filter on `repoName` as well as
+   `name`: a marketplace monorepo's sub-plugins are labelled `<repo>/<entry>`, so
+   matching `name` alone returns `[]` even when registration is planned correctly.
 - **OpenCode** groups: the skills appear as commands (mirrored in step 2).
 - For mode plugins, the condensed ruleset is in `groups/<folder>/AGENTS.md` — spot-check
   one Codex group: `grep -c "<a distinctive ruleset phrase>" groups/<name>-codex/AGENTS.md`.
