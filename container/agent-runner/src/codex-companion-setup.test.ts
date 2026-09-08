@@ -136,12 +136,17 @@ describe('buildRuntimeConfig', () => {
     // Generated container base, load-bearing settings present.
     expect(config).toContain('sandbox_mode = "workspace-write"');
     expect(config).toContain('approval_policy = "on-request"');
+    expect(config).toContain('model_context_window = 400000');
+    expect(config).toContain('model_auto_compact_token_limit = 360000');
+    expect(config.indexOf('model_context_window = 400000')).toBeLessThan(config.indexOf('[features]'));
+    expect(config.indexOf('model_auto_compact_token_limit = 360000')).toBeLessThan(config.indexOf('[features]'));
     expect(config).toContain('[features]');
     expect(config).toContain('hooks = true');
     expect(config).toContain('context_management = true');
     expect(config).toContain('fast_mode = false');
     expect(config).toContain('multi_agent = true');
     expect(config).toContain('[agents]');
+    expect(config).toContain('max_concurrent_threads_per_session = 15');
     expect(config).not.toContain('multi_agent_v2');
     expect(config).not.toContain('remote_control');
     expect(config).toContain('[projects."/workspace/agent"]');

@@ -231,10 +231,16 @@ describe('createCodexConfigOverrides', () => {
     expect(createCodexConfigOverrides(undefined, true)).toContain('project_doc_max_bytes=262144');
   });
 
-  it('bounds native subagent concurrency with a safe fleet default', () => {
+  it('keeps context limits on CLI overrides through fallback-home rotation', () => {
+    const overrides = createCodexConfigOverrides();
+    expect(overrides).toContain('model_context_window=400000');
+    expect(overrides).toContain('model_auto_compact_token_limit=360000');
+  });
+
+  it('uses the configured native subagent concurrency default', () => {
     const overrides = createCodexConfigOverrides();
     expect(overrides).toContain('features.multi_agent=true');
-    expect(overrides).toContain('agents.max_concurrent_threads_per_session=7');
+    expect(overrides).toContain('agents.max_concurrent_threads_per_session=15');
   });
 
   it('honors the validated per-group native subagent concurrency override', () => {

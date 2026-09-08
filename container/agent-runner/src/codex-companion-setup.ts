@@ -90,6 +90,8 @@ const CONTAINER_CODEX_CONFIG_BASE = [
   'sandbox_mode = "workspace-write"',
   'approval_policy = "on-request"',
   'approvals_reviewer = "auto_review"',
+  'model_context_window = 400000',
+  'model_auto_compact_token_limit = 360000',
   '',
   '[features]',
   'context_management = true',
@@ -100,7 +102,7 @@ const CONTAINER_CODEX_CONFIG_BASE = [
   'multi_agent = true',
   '',
   '[agents]',
-  'max_concurrent_threads_per_session = 9',
+  'max_concurrent_threads_per_session = 15',
   '',
   ...['/workspace/agent', '/workspace/workgroup', '/workspace/worktrees', '/tmp'].flatMap((proj) => [
     `[projects."${proj}"]`,
