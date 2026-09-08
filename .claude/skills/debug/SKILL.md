@@ -231,7 +231,6 @@ query({
   prompt: input.prompt,
   options: {
     cwd: input.cwd,                 // /workspace/agent
-    allowedTools: [...TOOL_ALLOWLIST, ...mcpAllowPatterns],
     disallowedTools: SDK_DISALLOWED_TOOLS,
     permissionMode: 'bypassPermissions',
     settingSources: ['project', 'user', 'local'],
@@ -240,7 +239,7 @@ query({
 })
 ```
 
-Each registered MCP server's allow pattern is derived from the `mcpServers` map, so registering a server already exposes its tools.
+No explicit `allowedTools` list is set — only `disallowedTools` narrows the surface, by name. So the tool surface is open by default: registering a server in `mcpServers` already exposes its tools, no allow-pattern needed.
 
 ## Rebuilding After Changes
 

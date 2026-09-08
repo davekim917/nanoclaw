@@ -173,10 +173,12 @@ Each non-sdk variant also accepts `tools?: McpServerToolPolicy[]`,
 `alwaysLoad?: boolean` (skip tool-search deferral — include all of this server's
 tools in the turn-1 prompt).
 
-nanoclaw derives MCP allow patterns from the `mcpServers` map. Server names are
-sanitized by the SDK when forming tool prefixes: any char outside `[A-Za-z0-9_-]`
-becomes `_`, so the allowlist must mirror that (nanoclaw's `mcpAllowPattern`
-does).
+Server names are sanitized by the SDK when forming tool prefixes
+(`mcp__<name>__<tool>`): any char outside `[A-Za-z0-9_-]` becomes `_`. nanoclaw
+doesn't build an allow pattern from this — no explicit `allowedTools` list is
+set (`container/agent-runner/src/providers/claude.ts`), so `disallowedTools`
+alone gates the tool surface and every registered MCP server's tools are open
+by default.
 
 ### SdkBeta
 

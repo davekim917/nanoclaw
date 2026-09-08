@@ -141,10 +141,12 @@ export function isCredentialQueryKey(key: string): boolean {
 
 /**
  * Server names and env keys end up in provider config writers that emit
- * formats with structural syntax (the codex writer emits TOML table headers;
- * `mcpAllowPattern` in the Claude provider collapses non-[A-Za-z0-9_-] to
- * `_`, so unvalidated names can collide). Allowlist the charset at every
- * entry point so no downstream writer has to defend. Mirrored in
+ * formats with structural syntax: the codex writer emits TOML table
+ * headers, and the Claude SDK collapses any character outside
+ * [A-Za-z0-9_-] to `_` when forming MCP tool call prefixes
+ * (`mcp__<name>__<tool>`) for permission matching — so unvalidated names
+ * can collide. Allowlist the charset at every entry point so no downstream
+ * writer has to defend. Mirrored in
  * `container/agent-runner/src/mcp-tools/self-mod.ts`; keep the two in sync.
  */
 const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;

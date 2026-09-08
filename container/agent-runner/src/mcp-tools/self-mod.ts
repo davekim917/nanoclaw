@@ -119,9 +119,10 @@ function isCredentialQueryKey(key: string): boolean {
 
 /**
  * Names and env keys reach provider config writers with structural syntax —
- * the codex writer emits TOML table headers, and `mcpAllowPattern` in the
- * Claude provider collapses non-[A-Za-z0-9_-] to `_`, so unvalidated names
- * can collide. Hence a charset allowlist at every entry point.
+ * the codex writer emits TOML table headers, and the Claude SDK collapses
+ * any character outside [A-Za-z0-9_-] to `_` when forming MCP tool call
+ * prefixes, so unvalidated names can collide. Hence a charset allowlist at
+ * every entry point.
  */
 const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
 /**

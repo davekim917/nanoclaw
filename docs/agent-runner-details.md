@@ -147,10 +147,11 @@ class ClaudeProvider implements AgentProvider {
         systemPrompt: input.systemContext?.instructions
           ? { type: 'preset', preset: 'claude_code', append: input.systemContext.instructions }
           : undefined,
-        // Base tools plus one `mcp__<server>__*` pattern per registered MCP
-        // server — without the explicit MCP patterns the SDK's allowedTools
-        // filter silently drops every MCP namespace.
-        allowedTools: [...TOOL_ALLOWLIST, ...Object.keys(this.mcpServers).map(mcpAllowPattern)],
+        // No explicit `allowedTools` list — `allowedTools` is an auto-allow
+        // list, not an include-filter, and this query already runs under
+        // `bypassPermissions`, so every tool the SDK surfaces (including
+        // any registered MCP server's tools) is open by default.
+        // `disallowedTools` is the only thing that narrows the surface.
         disallowedTools: SDK_DISALLOWED_TOOLS,
         env: this.env,
         model: this.model,
@@ -199,7 +200,7 @@ SDK message (so the idle timer stays honest) and maps recognized messages to `Pr
 
 - `MessageStream` for async iterable input (push-based follow-ups)
 - Resume via the SDK `resume` option keyed on the stored `continuation` (the SDK session ID) — no separate resume-at cursor
-- `TOOL_ALLOWLIST` (Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch, Task, Skill, …) extended at the call site with a `mcp__<server>__*` pattern per registered MCP server; `SDK_DISALLOWED_TOOLS` blocks SDK builtins that collide with NanoClaw's own scheduling/interaction model (CronCreate/Delete/List, ScheduleWakeup, AskUserQuestion, Enter/ExitPlanMode, Enter/ExitWorktree)
+- No explicit `allowedTools` list — enumerating one only risks silently dropping a new SDK built-in the next time the CLI adds one, and the query already runs under `bypassPermissions`, so every tool the SDK surfaces (including any registered MCP server's tools) is open by default; `SDK_DISALLOWED_TOOLS` blocks SDK builtins that collide with NanoClaw's own scheduling/interaction model (CronCreate/Delete/List, ScheduleWakeup, AskUserQuestion, Enter/ExitPlanMode, Enter/ExitWorktree)
 - **PreToolUse hook** records the current tool + its declared timeout to `container_state` (so the host sweep widens its stuck tolerance while a long Bash runs) and, as defense-in-depth, blocks any `SDK_DISALLOWED_TOOLS` call that slips through. It does **not** sanitize bash env vars — there is no such hook.
 - **PostToolUse / PostToolUseFailure** hooks clear the in-flight tool
 - **Resource telemetry** samples cgroup v2 `memory.current`, `memory.peak`, `memory.max`, and `memory.events` every 15 seconds into `container_state`; the host sweep logs increases in `oom_kill`
