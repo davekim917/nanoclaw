@@ -21,6 +21,8 @@ import { z } from 'zod';
 import { memoryContextForSessionStart, type MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/container-state.js';
 import { setProviderHealthState, type ProviderHealthState } from '../modules/mailbox/index.js';
+import { getCredentialSlot, setCredentialSlot } from '../modules/mailbox/session-state.js';
+import { formatCredentialRotationNotice } from '../credential-rotation-notice.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 import {
@@ -1101,6 +1103,7 @@ export class CodexProvider implements AgentProvider {
         `[codex-provider] Loaded ${this.fallbackHomes.length} Codex OAuth fallback(s): ${this.fallbackHomes.join(', ')}`,
       );
     }
+    this.restorePersistedCodexHome();
   }
 
   /**
@@ -1113,6 +1116,56 @@ export class CodexProvider implements AgentProvider {
   rotateCodexHome(): string | null {
     if (this.nextFallback >= this.fallbackHomes.length) return null;
     return this.fallbackHomes[this.nextFallback++];
+  }
+
+  /**
+   * Restore the fallback CODEX_HOME a previous instance of this container
+   * last rotated onto (see `persistActiveCodexHome`), so a respawn resumes
+   * on the identity that was already known-healthy instead of re-trying the
+   * primary — matches `ClaudeProvider.restorePersistedCredentialSlot`.
+   *
+   * Stores the PATH, not an index: the fallback list is env-derived and
+   * could in principle change between respawns, and a path lookup degrades
+   * to "not found, ignore" instead of silently landing on the wrong slot.
+   *
+   * Sets `process.env.CODEX_HOME` directly (mirroring the live rotation
+   * path at the OAuth-rotation call site above) — `query()`'s
+   * `currentCodexHome` reads `process.env.CODEX_HOME ?? primaryCodexHome`
+   * at the start of every turn, so this takes effect on the first query
+   * with no other wiring needed.
+   */
+  private restorePersistedCodexHome(): void {
+    let persisted: string | undefined;
+    try {
+      persisted = getCredentialSlot('codex');
+    } catch {
+      return; // no mailbox registered (e.g. a unit test) — nothing to restore
+    }
+    if (!persisted) return;
+
+    const index = this.fallbackHomes.indexOf(persisted);
+    if (index === -1) {
+      // Named a fallback that's no longer in the current list (env changed
+      // since it was written) — ignore and stay on the primary.
+      console.error(`[codex-provider] Persisted CODEX_HOME "${persisted}" is not in the current pool — ignoring`);
+      return;
+    }
+    this.nextFallback = index + 1;
+    process.env.CODEX_HOME = persisted;
+    console.error(
+      `[codex-provider] Resumed CODEX_HOME fallback ${index + 1}/${this.fallbackHomes.length + 1} from session state`,
+    );
+  }
+
+  /** Best-effort persist; never throws — a respawn just re-derives via rotation. */
+  private persistActiveCodexHome(codexHome: string): void {
+    try {
+      setCredentialSlot('codex', codexHome);
+    } catch (err) {
+      console.error(
+        `[codex-provider] Failed to persist CODEX_HOME: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   registerMemorySessionHook(hook: MemorySessionHookRegistration): void {
@@ -1480,6 +1533,12 @@ export class CodexProvider implements AgentProvider {
                     killCodexAppServer(server);
                     process.env.CODEX_HOME = nextHome;
                     currentCodexHome = nextHome;
+                    // Persist the fallback path (not the value of anything
+                    // secret) so a container respawn restores onto it
+                    // instead of burning a rejected turn on the primary
+                    // first — see `restorePersistedCodexHome`, invoked from
+                    // the constructor.
+                    self.persistActiveCodexHome(nextHome);
 
                     // config.toml / hooks.json / agents/ all live under CODEX_HOME,
                     // so the new dir needs all three. The writers honor CODEX_HOME
@@ -1511,7 +1570,22 @@ export class CodexProvider implements AgentProvider {
                       originalText: text,
                       initYielded,
                     });
-                    attemptText = transition.attemptText;
+                    // Credential rotation, specifically — unlike the
+                    // control-plane-recovery and primary-auth-refresh
+                    // branches above, this is the one where the PRIOR
+                    // credential actually hit its usage limit. Tell the
+                    // resumed/restarted thread explicitly so it doesn't read
+                    // its own prior turn's "rate limited" narrative (if any
+                    // survived into `attemptText`) as still describing this
+                    // attempt. Position is 1-based (primary = 1);
+                    // `self.nextFallback` was already advanced by
+                    // `rotateCodexHome()` above, so it equals that position.
+                    attemptText =
+                      `${transition.attemptText}\n\n` +
+                      formatCredentialRotationNotice({
+                        position: self.nextFallback + 1,
+                        ringSize: self.fallbackHomes.length + 1,
+                      });
                     initYielded = transition.initYielded;
                     if (transition.resetThreadDedupe) {
                       resetCodexTurnAccumulatorThread(turnAccum);

@@ -58,6 +58,7 @@ import {
   type TurnTrigger,
 } from './modules/mailbox/index.js';
 import { clearBatchAnchors, getBatchAnchor, setCurrentBatchAnchors } from './current-batch.js';
+import { formatCredentialRotationNotice } from './credential-rotation-notice.js';
 import {
   formatMessages,
   extractAttachments,
@@ -120,10 +121,28 @@ export function transientOverloadDelayMs(n: number, rand: number = Math.random()
  * second time even though the inbound rows remain one unfinished batch. Keep
  * the original prompt intact after provenance that distinguishes this retry
  * from a new delivery without claiming the interrupted attempt had no effects.
+ *
+ * `rotation` is the result of the `rotateApiKey()` call that triggered this
+ * retry. When it reports `rotated: true` with a position/ringSize, a second
+ * block tells the agent explicitly that its credential was swapped and any
+ * "rate limited" narrative still sitting in its resumed transcript is stale
+ * — see `formatCredentialRotationNotice`. Only this one call site (the
+ * rotation retry) ever passes a rotation result; every other in-turn retry
+ * (transient overload, stale session, context-too-long, …) keeps calling
+ * `provider.query()` directly with the plain prompt, so the block never
+ * appears for a retry that isn't actually a credential swap.
  */
-function formatCredentialRetryPrompt(prompt: string, batch: MessageInRow[]): string {
+function formatCredentialRetryPrompt(
+  prompt: string,
+  batch: MessageInRow[],
+  rotation?: { rotated: boolean; position?: number; ringSize?: number },
+): string {
   const task = batch.find((message) => message.kind === 'task');
   const occurrence = task ? ` Task occurrence ID: ${JSON.stringify(task.id)}.` : '';
+  const rotationNotice =
+    rotation?.rotated && rotation.position !== undefined && rotation.ringSize !== undefined
+      ? `${formatCredentialRotationNotice({ position: rotation.position, ringSize: rotation.ringSize })}\n\n`
+      : '';
   return (
     '<runner-retry-provenance>\n' +
     'A retryable upstream failure interrupted an earlier attempt for this same inbound batch.' +
@@ -131,6 +150,7 @@ function formatCredentialRetryPrompt(prompt: string, batch: MessageInRow[]): str
     'Treat the repeated payload below as retry context, not a new delivery. ' +
     'Before repeating side effects, inspect durable effects already produced, then continue the unfinished work.\n' +
     '</runner-retry-provenance>\n\n' +
+    rotationNotice +
     prompt
   );
 }
@@ -775,6 +795,17 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       log(`Query error: ${errMsg}`);
+      // The failed query's CLI child may still be running (an in-body throw
+      // unwinds the generator without necessarily tearing the subprocess
+      // down — see claude.ts's queryAbortController). Every recovery branch
+      // below starts a FRESH query on the same or a rotated credential, so
+      // abort the old one first: left alone, it can keep running on an
+      // exhausted/wedged credential and burn another failure minutes after
+      // the replay is already healthy (observed 2026-09-08: a rotated retry
+      // succeeded while the abandoned original hit a second 429 three
+      // minutes later). Idempotent — a provider whose abort() already ran
+      // (e.g. via config.signal) treats a second call as a no-op.
+      query.abort();
       const pausedWork = getWorkContinuation();
       if (pausedWork?.phase === 'queued') idleSuppressedContinuationIds.add(pausedWork.id);
 
@@ -818,8 +849,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           }
           touchHeartbeat();
           if (!repositoryRecoveryAllowed()) break;
+          let retryQuery: AgentQuery | undefined;
           try {
-            const retryQuery = config.provider.query({
+            retryQuery = config.provider.query({
               prompt,
               attachments: batchAttachments,
               continuation,
@@ -859,6 +891,13 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             // rotate this turn — but the next user message starts a fresh turn
             // that hits the normal rotation path, so it self-heals; not worth
             // threading retryErr through every downstream recovery branch.
+            //
+            // Either way this retryQuery's CLI child needs tearing down before
+            // the next attempt (or before falling through to another recovery
+            // branch) fires a new one — see the abort() call at the top of
+            // this catch block for why an abandoned query can't be trusted to
+            // clean up its own subprocess.
+            retryQuery?.abort();
             if (config.provider.isTransientOverload?.(retryErr)) continue;
             log(
               `Retry during transient overload hit a non-transient error: ` +
@@ -968,9 +1007,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       while (rotation?.rotated && !recovered) {
         log(`Upstream transient error — rotated credential, retrying same batch in-turn with provenance`);
         if (!repositoryRecoveryAllowed()) break;
+        let retryQuery: AgentQuery | undefined;
         try {
-          const retryPrompt = formatCredentialRetryPrompt(prompt, keep);
-          const retryQuery = config.provider.query({
+          const retryPrompt = formatCredentialRetryPrompt(prompt, keep, rotation);
+          retryQuery = config.provider.query({
             prompt: retryPrompt,
             attachments: batchAttachments,
             continuation,
@@ -1004,6 +1044,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         } catch (retryErr) {
           const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
           log(`Retry after credential rotation also failed: ${retryMsg}`);
+          // Tear this attempt's CLI child down before the next rotated
+          // attempt (or the fall-through past this loop) starts a new one —
+          // same reasoning as the abort() at the top of the outer catch.
+          retryQuery?.abort();
           // Still retryable? Advance to the next credential in the ring and
           // retry again; rotateApiKey returns rotated:false when the cycle is
           // spent, ending the loop.

@@ -24,6 +24,29 @@ function memoryContextEpochKey(providerName: string): string {
   return `memory_context_epoch:${providerName.toLowerCase()}`;
 }
 
+function credentialSlotKey(providerName: string): string {
+  return `credential_slot:${providerName.toLowerCase()}`;
+}
+
+/**
+ * The active credential ring/fallback slot, persisted so it survives a
+ * container respawn. Rotation position otherwise lives only in provider
+ * instance state (`oauthRingPos`, `nextFallback`) and resets to the primary
+ * on every fresh container — a fleet that respawns constantly then burns a
+ * rejected turn and a replay on every spawn before landing back on the
+ * credential that's actually healthy. Claude stores the env var NAME (e.g.
+ * `CLAUDE_CODE_OAUTH_TOKEN_2`); Codex stores the fallback CODEX_HOME path.
+ * Never the credential VALUE — this is a pointer into config the provider
+ * already holds, not a secret.
+ */
+export function getCredentialSlot(providerName: string): string | undefined {
+  return getValue(credentialSlotKey(providerName));
+}
+
+export function setCredentialSlot(providerName: string, slot: string): void {
+  setValue(credentialSlotKey(providerName), slot);
+}
+
 function getValue(key: string): string | undefined {
   return sqliteGetState(key)?.value;
 }

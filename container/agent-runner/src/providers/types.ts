@@ -90,8 +90,17 @@ export interface AgentProvider {
    *
    * Poll-loop pairs this with `isRetryable` to auto-recover from upstream
    * flakiness without dead-turning the user.
+   *
+   * `slot`/`position`/`ringSize` are populated whenever `rotated` is true —
+   * `slot` is the env var name of the credential now active (e.g.
+   * `CLAUDE_CODE_OAUTH_TOKEN_2`), `position` its 1-based place in the ring
+   * (primary is 1), and `ringSize` the ring's total length. Poll-loop passes
+   * these through to the replayed turn so the agent knows it is running on a
+   * healthy credential rather than the one that just hit its usage limit —
+   * see `formatCredentialRetryPrompt`. Omitted (along with `rotated: false`)
+   * when no rotation happened.
    */
-  rotateApiKey?(): { rotated: boolean };
+  rotateApiKey?(): { rotated: boolean; slot?: string; position?: number; ringSize?: number };
 
   /**
    * Reset the per-turn rotation cycle budget. Rotation is circular — on a
