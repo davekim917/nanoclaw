@@ -1012,8 +1012,7 @@ export async function resolveGroupTimezone(agentGroupId: string, fallback: strin
 
 /**
  * Effective agent provider for a group: the AUTHORITATIVE `container.json`,
- * falling back to the `container_configs` projection only when the file
- * carries none.
+ * and NEVER from the `container_configs` projection.
  *
  * THE resolver — every caller that needs to know which provider a group
  * actually runs goes through here, for the same reason `resolveGroupTimezone`
@@ -1029,6 +1028,19 @@ export async function resolveGroupTimezone(agentGroupId: string, fallback: strin
  * repin resolves aliases and validates replacements in the wrong vocabulary.
  * Both of those were found as separate defects at separate call sites before
  * this resolver existed, which is the argument for it.
+ *
+ * An ABSENT `provider` key resolves to `claude`, not to the projection.
+ * That is not a preference — it is what actually boots: the spawn path calls
+ * `resolveProviderName(session.agent_provider, containerConfig.provider)` on
+ * the file it bind-mounts (`container-runner.ts`), and `resolveProviderName`
+ * defaults a missing value to `claude`. Consulting the row for the absent
+ * case reintroduces the whole bug one level down: a group with no `provider`
+ * key and a stale `codex` row runs Claude, but this resolver would answer
+ * `codex`, so `config update --provider codex` reads as a no-op, skips the
+ * pin audit entirely, and then writes `codex` into the authoritative file —
+ * stranding every Claude pin in exactly the migration this resolver exists
+ * to make safe. The resolver must agree with the spawn path even where the
+ * spawn path's answer comes from a default rather than from a stored value.
  */
 export async function resolveGroupProvider(agentGroupId: string, sessionProvider?: string | null): Promise<string> {
   // Takes the group id ALONE and finds the folder itself. An earlier shape
@@ -1040,9 +1052,9 @@ export async function resolveGroupProvider(agentGroupId: string, sessionProvider
   // `sessionProvider` is the per-session sticky override the MCP scheduling
   // path carries; it outranks both stores when set, unchanged from before.
   const folder = (await getAgentGroup(agentGroupId))?.folder;
-  const fileProvider = folder ? readContainerConfig(folder)?.provider : undefined;
-  const rowProvider = (await getContainerConfig(agentGroupId))?.provider;
-  return resolveProviderName(sessionProvider ?? null, fileProvider ?? rowProvider);
+  const fileProvider = folder ? readContainerConfig(folder).provider : undefined;
+  // Deliberately the same two arguments the spawn path passes, and no third.
+  return resolveProviderName(sessionProvider ?? null, fileProvider);
 }
 
 /** Build a `ContainerConfig` from a DB row + agent group identity. */

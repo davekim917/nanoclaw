@@ -44,6 +44,7 @@ const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-cli-tasks
 import { initTestDb, closeDb, runMigrations, createAgentGroup, getRawDb } from '../../db/index.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
+import { resolveGroupProvider } from '../../container-config.js';
 import { auditTaskPins } from '../../modules/scheduling/pin-audit.js';
 import { validateTaskPin } from '../../modules/scheduling/task-flags.js';
 import { createSession, findSessionByAgentGroup, getSessionsByAgentGroup, taskThreadId } from '../../db/sessions.js';
@@ -2225,6 +2226,19 @@ async function makePinGroup(id: string, provider: string | null): Promise<void> 
   );
 }
 
+/** A group whose container.json omits `provider` entirely — not `null`, absent. */
+async function makeNoProviderKeyGroup(id: string): Promise<void> {
+  await createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: now() });
+  await ensureContainerConfig(id);
+  const dir = `${TEST_DIR}/groups/${id}`;
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    `${dir}/container.json`,
+    JSON.stringify({ mcpServers: {}, packages: { apt: [], npm: [] }, additionalMounts: [], skills: 'all' }, null, 2) +
+      '\n',
+  );
+}
+
 async function makePinnedTask(
   group: string,
   name: string,
@@ -2458,6 +2472,60 @@ describe('groups config update --provider refuses on stranded task pins', () => 
 
     // ...and the audit reads the same file, so the switch is still a migration
     expect((await configUpdate({ id: 'ag-seam', provider: 'claude' })).ok).toBe(false);
+  });
+
+  it('an ABSENT provider key resolves to claude — the spawn default, not the projection', async () => {
+    // The resolver must agree with what actually BOOTS, including where the
+    // spawn path's answer comes from a default rather than a stored value.
+    // `container-runner.ts` calls resolveProviderName(session, file.provider)
+    // on the bind-mounted file; a missing key therefore runs Claude. Consulting
+    // the row for the absent case makes this switch read as a no-op:
+    // fromProvider would be the row's `codex`, equal to the requested `codex`,
+    // so the audit is SKIPPED and `codex` is written into the authoritative
+    // file — stranding the claude pin below in the exact migration this
+    // resolver exists to make safe. Pre-fix this returns ok:true.
+    await makeNoProviderKeyGroup('ag-nokey');
+    const task = await makePinnedTask('ag-nokey', 'unkeyed', { model: 'sonnet' });
+    // The projection goes stale AFTER the pin exists — a DB-only provider edit,
+    // a restore, an older code path. The file still has no provider key.
+    await updateContainerConfigScalars('ag-nokey', { provider: 'codex' });
+
+    // Assert the CONSEQUENCE first: pre-fix this is ok:true, the audit never
+    // runs, and the file is rewritten to codex under the pin below.
+    const r = await configUpdate({ id: 'ag-nokey', provider: 'codex' });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.error.message).toContain(task.series_id);
+    // ...and the authoritative file still has no provider key, so the group
+    // keeps booting Claude rather than being silently migrated.
+    expect(JSON.parse(fs.readFileSync(`${TEST_DIR}/groups/ag-nokey/container.json`, 'utf8')).provider).toBeUndefined();
+    expect(await resolveGroupProvider('ag-nokey')).toBe('claude');
+  });
+
+  it('an absent container.json resolves to claude, and never to the projection', async () => {
+    // readContainerConfig returns an empty config for a missing/malformed file
+    // rather than throwing, so this lands on the same default the spawn path
+    // would use. The row is not a fallback for it.
+    await createAgentGroup({
+      id: 'ag-nofile',
+      name: 'ag-nofile',
+      folder: 'ag-nofile',
+      agent_provider: null,
+      created_at: now(),
+    });
+    await ensureContainerConfig('ag-nofile');
+    await updateContainerConfigScalars('ag-nofile', { provider: 'opencode' });
+    expect(fs.existsSync(`${TEST_DIR}/groups/ag-nofile/container.json`)).toBe(false);
+
+    expect(await resolveGroupProvider('ag-nofile')).toBe('claude');
+  });
+
+  it('a session-level provider still outranks both stores', async () => {
+    // The absent-key fix removes the ROW as a fallback; it must not disturb
+    // the per-session sticky override, which is a real running-provider signal.
+    await makeNoProviderKeyGroup('ag-sticky');
+    await updateContainerConfigScalars('ag-sticky', { provider: 'claude' });
+    expect(await resolveGroupProvider('ag-sticky', 'codex')).toBe('codex');
   });
 
   it('re-stating the SAME provider is not a migration and is never refused', async () => {
