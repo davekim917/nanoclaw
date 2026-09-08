@@ -120,6 +120,38 @@ describe('ClaudeProvider ANTHROPIC_API_KEY fallback rotation reports slot/positi
     // Forward-only: no more fallbacks left.
     expect(p.rotateApiKey()).toEqual({ rotated: false });
   });
+
+  // Regression guard for the forward-only-pool review finding: persisting a
+  // cursor on a pool that never wraps can only ever advance it, so if the
+  // LAST fallback also fails, a restored cursor after a respawn would sit
+  // past the end and the primary would never become eligible again. An
+  // unpersisted respawn resets to the primary instead, giving the whole pool
+  // another chance — that reset IS the recovery mechanism for this pool, so
+  // rotateApiKey's ANTHROPIC_API_KEY_N branch must never write to
+  // session_state.
+  it('does NOT persist the fallback — a respawn resets to the primary, not the exhausted end of the pool', () => {
+    initTestSessionDb();
+    const env = {
+      ANTHROPIC_API_KEY: 'primary-key',
+      ANTHROPIC_API_KEY_2: 'fallback-two',
+    };
+    const p = new ClaudeProvider({ env });
+    p.rotateApiKey(); // → fallback-two (the last slot in this pool)
+    expect(getCredentialSlot('claude')).toBeUndefined();
+
+    // A "respawn" is just a fresh instance over the same declared env — its
+    // own `nextFallback` starts at 0 regardless of what the prior instance
+    // did, since nothing was persisted for it to restore. Proven by its
+    // first rotation landing on slot 2 (fresh start), not `rotated: false`
+    // (which is what an already-exhausted-and-restored cursor would report).
+    const respawned = new ClaudeProvider({ env });
+    expect(respawned.rotateApiKey()).toEqual({
+      rotated: true,
+      slot: 'ANTHROPIC_API_KEY_2',
+      position: 2,
+      ringSize: 2,
+    });
+  });
 });
 
 // Deliverable C: the active ring/fallback slot survives a container respawn

@@ -1,10 +1,14 @@
 /**
  * Shared wording for telling a replayed turn that its credential was
  * rotated out from under it. Single-sourced because two providers hit this:
- * `claude.ts` rotates through `poll-loop.ts`'s in-turn retry (the retry
- * prompt is built there — see `formatCredentialRetryPrompt`), and
- * `codex.ts` rotates CODEX_HOME identities inline inside its own `query()`
- * generator and re-prompts the resumed thread itself.
+ * `claude.ts` rotates via `ClaudeProvider.rotateApiKey`
+ * (providers/claude.ts:2297), and `poll-loop.ts`'s in-turn retry builds the
+ * replay prompt with this notice in `formatCredentialRetryPrompt`
+ * (poll-loop.ts:135). `codex.ts` rotates CODEX_HOME identities inline inside
+ * its own `query()` generator — the rotation call is
+ * `self.rotateCodexHome()` (providers/codex.ts:1455) — and appends this
+ * notice itself to whatever prompt `resolveCodexRestartTransition` produces
+ * for the resumed/restarted thread (providers/codex.ts:1537).
  *
  * Why this exists at all: a rotation replays the SAME conversation history
  * on a healthy credential, but the agent's own prior turn is still sitting

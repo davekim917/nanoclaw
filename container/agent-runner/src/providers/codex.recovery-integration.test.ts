@@ -4,7 +4,6 @@ import os from 'os';
 import path from 'path';
 
 import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
-import { getCredentialSlot, setCredentialSlot } from '../modules/mailbox/session-state.js';
 import { MEMORY_SESSION_HOOK } from '../memory/session-hook.js';
 import { CodexProvider } from './codex.js';
 
@@ -625,13 +624,17 @@ describe('codex usage stays container-respawn safe', () => {
   });
 });
 
-// Deliverable A (Codex side) + C: a credential-exhaustion turn rotates to the
-// fallback CODEX_HOME, tells the resumed thread explicitly that its
+// Deliverable A (Codex side): a credential-exhaustion turn rotates to the
+// fallback CODEX_HOME and tells the resumed thread explicitly that its
 // credential was swapped (mirrors claude.ts's poll-loop rotation notice, via
-// the shared `formatCredentialRotationNotice` helper), and persists the
-// active fallback so a respawn doesn't retry the primary first.
-describe('CodexProvider OAuth-rotation notice + persistence', () => {
-  it('rotates on UsageLimitExceeded, tells the resumed thread it was rotated, and persists the fallback', async () => {
+// the shared `formatCredentialRotationNotice` helper — codex.ts:1535-1540
+// appends it to whatever `resolveCodexRestartTransition` (called at
+// codex.ts:1519) produces for the resumed/restarted thread). No persistence
+// here: `fallbackHomes` is a
+// forward-only pool (see the doc comment on `CodexProvider.rotateCodexHome`
+// in codex.ts) and a container respawn is deliberately its only reset.
+describe('CodexProvider OAuth-rotation notice', () => {
+  it('rotates on UsageLimitExceeded and tells the resumed thread it was rotated', async () => {
     const binDir = path.join(tmpDir, 'bin');
     const codexHome = path.join(tmpDir, 'codex-home');
     const fallbackHome = path.join(tmpDir, 'codex-fallback');
@@ -769,42 +772,9 @@ lines.on('line', (line) => {
     expect(secondPromptText).toContain('NOT rate-limited now');
     expect(secondPromptText).not.toContain('perform the original task once');
 
-    // Deliverable C: the fallback that was rotated onto is persisted (as the
-    // path, never a secret), and CODEX_HOME reflects it live.
-    expect(getCredentialSlot('codex')).toBe(fallbackHome);
+    // Live rotation still takes effect immediately (this is NOT persistence
+    // — the same process's CODEX_HOME env just reflects the in-memory
+    // rotation the running turn performed).
     expect(process.env.CODEX_HOME).toBe(fallbackHome);
   }, 5_000);
-
-  it('a fresh instance restores CODEX_HOME onto the persisted fallback instead of retrying the primary', () => {
-    const codexHome = path.join(tmpDir, 'codex-home');
-    const fallbackHome = path.join(tmpDir, 'codex-fallback');
-    process.env.CODEX_HOME = codexHome;
-    process.env.CODEX_FALLBACK_HOMES = fallbackHome;
-
-    const provider = new CodexProvider() as unknown as { nextFallback: number; fallbackHomes: readonly string[] };
-    expect(provider.nextFallback).toBe(0);
-    expect(getCredentialSlot('codex')).toBeUndefined();
-    expect(process.env.CODEX_HOME).toBe(codexHome);
-
-    // Simulate a rotation having already happened (as the previous test
-    // exercises end to end), then a respawn: a brand-new instance in the
-    // SAME env should pick up the persisted fallback instead of starting on
-    // the primary.
-    setCredentialSlot('codex', fallbackHome);
-    delete process.env.CODEX_HOME; // simulate a respawn with no live override yet
-    const restored = new CodexProvider() as unknown as { nextFallback: number };
-    expect(process.env.CODEX_HOME).toBe(fallbackHome);
-    expect(restored.nextFallback).toBe(1);
-  });
-
-  it('ignores a persisted fallback that is no longer in the current CODEX_FALLBACK_HOMES list', () => {
-    const codexHome = path.join(tmpDir, 'codex-home');
-    process.env.CODEX_HOME = codexHome;
-    process.env.CODEX_FALLBACK_HOMES = path.join(tmpDir, 'codex-fallback-current');
-    setCredentialSlot('codex', path.join(tmpDir, 'codex-fallback-stale'));
-
-    const provider = new CodexProvider() as unknown as { nextFallback: number };
-    expect(process.env.CODEX_HOME).toBe(codexHome);
-    expect(provider.nextFallback).toBe(0);
-  });
 });

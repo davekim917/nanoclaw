@@ -2174,7 +2174,13 @@ export class ClaudeProvider implements AgentProvider {
    * rotated onto, so a respawn doesn't burn a rejected turn on the primary
    * before replaying its way back to the credential that's actually healthy.
    * Position only, never the token value — the value already lives in
-   * `oauthRing`/`fallbackKeys` from env.
+   * `oauthRing` from env.
+   *
+   * OAuth ring ONLY — see the comment below where the `ANTHROPIC_API_KEY_N`
+   * lookup used to be for why the forward-only fallback pool is deliberately
+   * excluded: only the circular ring's wrap guarantees every slot stays
+   * reachable after a restore, so only it is safe to persist across a
+   * respawn.
    *
    * Best-effort: no persisted slot (fresh install, first-ever rotation) and
    * no registered mailbox (unit tests constructing the provider directly)
@@ -2201,17 +2207,18 @@ export class ClaudeProvider implements AgentProvider {
       return;
     }
 
-    const fallbackIndex = this.fallbackKeys.findIndex((entry) => entry.name === persisted);
-    if (fallbackIndex !== -1) {
-      const active = this.fallbackKeys[fallbackIndex];
-      this.nextFallback = fallbackIndex + 1;
-      this.env.ANTHROPIC_API_KEY = active.value;
-      process.env.ANTHROPIC_API_KEY = active.value;
-      log(
-        `Resumed credential slot ${active.name} (${fallbackIndex + 1}/${this.fallbackKeys.length + 1}) from session state`,
-      );
-      return;
-    }
+    // Deliberately no ANTHROPIC_API_KEY_N fallback branch here: `fallbackKeys`
+    // is forward-only/exhaust-once (`nextFallback` never wraps — see
+    // `rotateApiKey` below), unlike the circular OAuth ring above. Restoring a
+    // persisted position onto a forward-only pool can only ever advance the
+    // cursor, never reopen it — so a respawn after the LAST fallback also
+    // failed would restore straight past the end and the primary would never
+    // become eligible again, whereas an unpersisted respawn today resets to
+    // the primary and gives the whole pool another chance. A container
+    // respawn is that pool's only reset by design; persisting across it would
+    // turn a recoverable dead end into a permanent one. `persistCredentialSlot`
+    // is therefore never called from the API-key branch of `rotateApiKey`
+    // either — see that method.
 
     // Named a slot that's no longer present (env changed since the value was
     // written) — ignore and stay on the primary. Log once so a stale slot
@@ -2320,7 +2327,9 @@ export class ClaudeProvider implements AgentProvider {
     this.env.ANTHROPIC_API_KEY = next.value;
     process.env.ANTHROPIC_API_KEY = next.value;
     log(`Rotated ANTHROPIC_API_KEY → ${next.name} (${this.nextFallback}/${this.fallbackKeys.length})`);
-    this.persistCredentialSlot(next.name);
+    // No persistCredentialSlot() here — see the comment on the ANTHROPIC_API_KEY_N
+    // branch in restorePersistedCredentialSlot for why this forward-only pool
+    // deliberately does not persist across a respawn.
     return { rotated: true, slot: next.name, position: this.nextFallback + 1, ringSize: this.fallbackKeys.length + 1 };
   }
 
