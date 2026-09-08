@@ -12,6 +12,7 @@ import {
   type AdditionalMountConfig,
   type McpServerConfig,
   updateContainerConfig,
+  resolveGroupProvider,
 } from '../../container-config.js';
 import { resolveContainerResources, type ContainerResources } from '../../container-resources.js';
 import { buildAgentGroupImage, killContainer } from '../../container-runner.js';
@@ -584,22 +585,21 @@ registerResource({
         // therefore what makes refusing safe rather than a wedge.
         //
         // Runs before any write, so a refusal leaves both stores untouched.
+        // Recorded so the post-write re-audit below knows a switch happened.
+        let auditedProvider: string | undefined;
+        let fromProviderForReport: string | undefined;
         if (updates.provider !== undefined) {
-          // The provider this group ACTUALLY runs is `container.json` — the
-          // spawn path and the in-container runner read the file; the
-          // `container_configs` row is a read-side projection that can lag it
-          // (a DB-only edit, a restore, an older code path). Deciding "is this
-          // a migration?" from the projection means a group whose row already
-          // says `claude` while the file still says `codex` skips the audit
-          // entirely — and then this handler writes the file, performing the
-          // real runtime switch with every gpt-* pin carried into Claude
-          // unexamined. The audit exists to tell an operator the truth before a
-          // switch; reading a non-authoritative source makes it answer for a
-          // group that isn't the one being changed.
-          const fileProvider = readContainerConfig(group.folder)?.provider;
-          const fromProvider = resolveProviderName(null, fileProvider ?? row.provider);
+          // `resolveGroupProvider` is THE resolver (container-config.ts): the
+          // authoritative `container.json`, projection only as fallback. Read
+          // the projection here instead and a group whose row already says
+          // `claude` while its file still says `codex` skips the audit — and
+          // this handler then writes the file, performing the real switch with
+          // every gpt-* pin carried in unexamined.
+          const fromProvider = await resolveGroupProvider(id);
           const toProvider = resolveProviderName(null, updates.provider);
           if (fromProvider !== toProvider) {
+            auditedProvider = toProvider;
+            fromProviderForReport = fromProvider;
             const stranded = await auditTaskPins(id, toProvider);
             if (stranded.length > 0) {
               log.warn('Refused provider switch: armed task pins would be invalid', {
@@ -659,6 +659,43 @@ registerResource({
             resolveContainerResources(resources);
             config.resources = resources;
           });
+        }
+
+        // ── THE CHECK-TO-WRITE WINDOW, narrowed and made loud ──
+        //
+        // The audit above runs before the writes below, and the socket server
+        // handles each connection independently, so a `tasks create`/`update`
+        // (or a recurrence re-arm) can land an old-provider-valid pin in
+        // between — stranded by a switch whose audit had already passed.
+        //
+        // This is NOT closed by a lock here, deliberately. Task pin writes take
+        // the central lease via `withCentralSync`, and `assertLeaseNotHeld`
+        // forbids nesting, so serializing this handler against them means
+        // restructuring how `config update` acquires the lease across its
+        // several writes. That is a transactional change to a path that also
+        // writes container.json and resource limits, and doing it inside a
+        // change about pin semantics is how a fix becomes the next incident.
+        //
+        // What IS fixed is the outcome that actually hurt: silence. A pin that
+        // slips through the window is now REPORTED — the same information the
+        // refusal would have carried, after the fact instead of before it. The
+        // operator learns immediately rather than at a failed fire, and
+        // scheduled-task failure escalation is the backstop underneath.
+        if (auditedProvider !== undefined) {
+          const late = await auditTaskPins(id, auditedProvider);
+          if (late.length > 0) {
+            log.warn('Task pins were stranded by a provider switch after its audit passed', {
+              agentGroupId: id,
+              toProvider: auditedProvider,
+              stranded: late.map((p) => ({ seriesId: p.seriesId, model: p.model, effort: p.effort })),
+            });
+            const updatedLate = (await getContainerConfig(id))!;
+            return {
+              ...presentConfig(updatedLate, group.folder),
+              stranded_after_switch: late,
+              warning: formatStrandedPins(late, id, fromProviderForReport!, auditedProvider),
+            };
+          }
         }
 
         const updated = (await getContainerConfig(id))!;

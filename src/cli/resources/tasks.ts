@@ -3,9 +3,8 @@ import fs from 'fs';
 import { CronExpressionParser } from 'cron-parser';
 
 import { GROUPS_DIR, TIMEZONE } from '../../config.js';
-import { resolveGroupTimezone } from '../../container-config.js';
+import { resolveGroupProvider, resolveGroupTimezone } from '../../container-config.js';
 import { getAgentGroup, getAllAgentGroups } from '../../db/agent-groups.js';
-import { getContainerConfig, resolveProviderName } from '../../db/container-configs.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import {
   findTaskSessions,
@@ -30,6 +29,7 @@ import { parseTaskContent, parseTaskPin } from '../../modules/scheduling/task-co
 import { writeAudit } from '../../dashboard/api/scheduled-shared.js';
 import { resolveTaskSession, withExistingMailboxSession } from '../../session-manager.js';
 import { resolveEffectiveModel, vocabFor } from '../../flag-parser.js';
+import { log } from '../../log.js';
 import { registerResource } from '../crud.js';
 import { appendRunLog } from '../../modules/scheduling/run-log.js';
 import { formatTasksTable } from '../format-tasks.js';
@@ -1085,7 +1085,11 @@ async function repinTasks(args: Record<string, unknown>, ctx: CallerContext) {
   const currentProviderFor = async (agentGroupId: string): Promise<string> => {
     const cached = providerCache.get(agentGroupId);
     if (cached) return cached;
-    const resolved = resolveProviderName(null, (await getContainerConfig(agentGroupId))?.provider);
+    // Through the seam, not `getContainerConfig` directly: the projection can
+    // lag the authoritative file, and reading it here resolved aliases and
+    // validated replacements in the WRONG vocabulary — the same wrong-answer
+    // the migration audit had at its own call site.
+    const resolved = await resolveGroupProvider(agentGroupId);
     providerCache.set(agentGroupId, resolved);
     return resolved;
   };
@@ -1212,47 +1216,76 @@ async function repinTasks(args: Record<string, unknown>, ctx: CallerContext) {
 
   if (dryRun) return report(0);
 
+  // ── WHAT IS AND IS NOT ATOMIC HERE ──
+  //
+  // VALIDATION is all-or-nothing: every match is checked before the first write
+  // and one invalid target aborts the run, so a bad `--to-model` never lands
+  // half a fleet. That is the guarantee this command makes and keeps.
+  //
+  // The WRITE phase cannot be, and pretending otherwise is the more dangerous
+  // error. Each series lives in its OWN session database — that is the
+  // architecture, not an oversight — so there is no transaction spanning them
+  // and no honest rollback: undoing an applied repin is itself a write that can
+  // fail. A mid-loop failure therefore leaves earlier series repinned.
+  //
+  // So the loop does not abort on a failed candidate. It records the failure,
+  // continues, and REPORTS exactly which series moved and which did not.
+  // Aborting would produce the same partial state while returning only an
+  // error — the operator would know something broke but not what landed, which
+  // is the worst of both.
   let applied = 0;
+  const failed: Array<{ session_id: string; series_id: string; reason: string }> = [];
   for (const candidate of applicable) {
     const flagIntent: TaskUpdate['flagIntent'] = {};
     if (candidate.write.model) flagIntent.turnModel = candidate.write.model;
     if (candidate.write.effort) flagIntent.turnEffort = candidate.write.effort;
-    const n =
-      (await withInbound(candidate.session, (mailbox) =>
-        withCentralSync(() => {
-          // Same probe as every other mutating verb here (see the seam note):
-          // no row for this series in this session means no write and no
-          // invalidation is owed.
-          if (!mailbox.getCliTaskRow(candidate.seriesId)) return 0;
-          return withQuietInvalidationSync(candidate.session.id, () =>
-            mailbox.updateTask(candidate.seriesId, { flagIntent }),
-          );
-        }, 'ncl tasks repin'),
-      )) ?? 0;
-    if (n > 0) {
-      await writeAudit({
-        actor: actorFor(ctx),
-        action: 'update',
-        agentGroupId: candidate.session.agent_group_id,
-        sessionId: candidate.session.id,
-        seriesId: candidate.seriesId,
-        detail: {
-          repin: {
-            from: { model: candidate.current.model, effort: candidate.current.effort },
-            // `updateTask` MERGES, so an axis this run did not touch survives.
-            // Recording it as null would say the pin was cleared — a durable
-            // audit row that is wrong is worse than no row during an incident.
-            to: {
-              model: candidate.write.model ?? candidate.current.model,
-              effort: candidate.write.effort ?? candidate.current.effort,
+    try {
+      const n =
+        (await withInbound(candidate.session, (mailbox) =>
+          withCentralSync(() => {
+            // Same probe as every other mutating verb here (see the seam note):
+            // no row for this series in this session means no write and no
+            // invalidation is owed.
+            if (!mailbox.getCliTaskRow(candidate.seriesId)) return 0;
+            return withQuietInvalidationSync(candidate.session.id, () =>
+              mailbox.updateTask(candidate.seriesId, { flagIntent }),
+            );
+          }, 'ncl tasks repin'),
+        )) ?? 0;
+      if (n > 0) {
+        await writeAudit({
+          actor: actorFor(ctx),
+          action: 'update',
+          agentGroupId: candidate.session.agent_group_id,
+          sessionId: candidate.session.id,
+          seriesId: candidate.seriesId,
+          detail: {
+            repin: {
+              from: { model: candidate.current.model, effort: candidate.current.effort },
+              // `updateTask` MERGES, so an axis this run did not touch survives.
+              // Recording it as null would say the pin was cleared — a durable
+              // audit row that is wrong is worse than no row during an incident.
+              to: {
+                model: candidate.write.model ?? candidate.current.model,
+                effort: candidate.write.effort ?? candidate.current.effort,
+              },
             },
           },
-        },
+        });
+        applied += 1;
+      }
+    } catch (e) {
+      failed.push({
+        session_id: candidate.session.id,
+        series_id: candidate.seriesId,
+        reason: e instanceof Error ? e.message : String(e),
       });
-      applied += 1;
     }
   }
-  return report(applied);
+  if (failed.length > 0) {
+    log.warn('Bulk repin partially applied', { applied, failed: failed.length, failures: failed });
+  }
+  return { ...report(applied), failed };
 }
 
 registerResource({

@@ -2439,6 +2439,27 @@ describe('groups config update --provider refuses on stranded task pins', () => 
     expect(JSON.parse(fs.readFileSync(`${TEST_DIR}/groups/ag-drift/container.json`, 'utf8')).provider).toBe('codex');
   });
 
+  it('resolves the provider through ONE seam — repin and the audit cannot disagree', async () => {
+    // The same invariant was found unfixed at three call sites across two
+    // review rounds (the audit, repin's matching, and create/update pin
+    // validation). It now lives in `resolveGroupProvider`; this asserts the
+    // consequence rather than the implementation — with the row and the file
+    // disagreeing, BOTH the audit and repin must answer with the file.
+    await makePinGroup('ag-seam', 'codex');
+    const t = await makePinnedTask('ag-seam', 'seamed', { model: 'gpt-6-astra' });
+    await updateContainerConfigScalars('ag-seam', { provider: 'claude' }); // projection lies
+
+    // repin matches in the FILE's vocabulary (codex), not the row's (claude)
+    const r = await repin({ group: 'ag-seam', from_model: 'astra', to_model: 'gpt-5.6-sol', match_resolved: true });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect((r.data as { applied: number }).applied).toBe(1);
+    expect(storedTaskPin('ag-seam', t.session_id, t.series_id)).toEqual({ turnModel: 'gpt-5.6-sol' });
+
+    // ...and the audit reads the same file, so the switch is still a migration
+    expect((await configUpdate({ id: 'ag-seam', provider: 'claude' })).ok).toBe(false);
+  });
+
   it('re-stating the SAME provider is not a migration and is never refused', async () => {
     await makePinGroup('ag-same', 'codex');
     await makePinnedTask('ag-same', 'pinned', { model: 'gpt-6-astra' });
@@ -2954,6 +2975,25 @@ describe('ncl tasks repin', () => {
     expect(storedTaskPin('ag-mig', t.session_id, t.series_id)).toEqual({ turnModel: 'claude-sonnet-5' });
     // ...and that is what clears the migration the audit refuses.
     expect((await configUpdate({ id: 'ag-mig', provider: 'claude' })).ok).toBe(true);
+  });
+
+  it('reports partial completion rather than claiming the write phase is atomic', async () => {
+    // Validation is all-or-nothing; the WRITE cannot be — each series lives in
+    // its own session database, so there is no transaction spanning them and no
+    // honest rollback. The command must therefore say exactly what landed.
+    const a = await makePinnedTask('ag-1', 'p1', { effort: 'high' });
+    const b = await makePinnedTask('ag-1', 'p2', { effort: 'high' });
+    const r = await repin({ group: 'ag-1', from_effort: 'high', to_effort: 'xhigh' });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const data = r.data as { applied: number; failed: unknown[] };
+    expect(data.applied).toBe(2);
+    // `failed` is always present, so a caller reading it cannot mistake
+    // "partial" for "complete" just because nothing failed this time.
+    expect(data.failed).toEqual([]);
+    for (const t of [a, b]) {
+      expect(storedTaskPin('ag-1', t.session_id, t.series_id)).toEqual({ turnEffort: 'xhigh' });
+    }
   });
 
   it('an effort-only repin leaves the model pin literally untouched', async () => {

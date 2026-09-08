@@ -21,7 +21,8 @@ import path from 'path';
 
 import { GROUPS_DIR, TIMEZONE } from './config.js';
 import { validateContainerResources, type ContainerResources } from './container-resources.js';
-import { getContainerConfig } from './db/container-configs.js';
+import { getAgentGroup } from './db/agent-groups.js';
+import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
 import { log } from './log.js';
 import { TOKEN_SHAPE_PATTERNS } from './secret-scrubber.js';
 import { isIanaTimezone } from './timezone.js';
@@ -1007,6 +1008,41 @@ export function effectiveTimezone(override: string | null | undefined, fallback:
  */
 export async function resolveGroupTimezone(agentGroupId: string, fallback: string = TIMEZONE): Promise<string> {
   return effectiveTimezone((await getContainerConfig(agentGroupId))?.timezone, fallback);
+}
+
+/**
+ * Effective agent provider for a group: the AUTHORITATIVE `container.json`,
+ * falling back to the `container_configs` projection only when the file
+ * carries none.
+ *
+ * THE resolver — every caller that needs to know which provider a group
+ * actually runs goes through here, for the same reason `resolveGroupTimezone`
+ * above exists: the answer must be derived in one place or the copies drift.
+ * The file is what the spawn path bind-mounts and what the in-container runner
+ * reads; the DB row is a read-side projection for flag vocabulary and image
+ * builds, and it CAN lag — a DB-only edit, a restore, an older code path.
+ *
+ * Reading the projection instead is not a style question, it is a
+ * wrong-answer: a group whose row says `claude` while its file still says
+ * `codex` is running codex, so a provider-migration audit consulting the row
+ * reports "nothing stranded" for a group that has stranded pins, and a bulk
+ * repin resolves aliases and validates replacements in the wrong vocabulary.
+ * Both of those were found as separate defects at separate call sites before
+ * this resolver existed, which is the argument for it.
+ */
+export async function resolveGroupProvider(agentGroupId: string, sessionProvider?: string | null): Promise<string> {
+  // Takes the group id ALONE and finds the folder itself. An earlier shape
+  // required callers to pass the folder, which is how a resolver acquires a
+  // second way to be called wrong — a caller with no folder in hand quietly
+  // passes `undefined` and silently gets the projection back, i.e. exactly the
+  // bug this exists to prevent, reintroduced by its own signature.
+  //
+  // `sessionProvider` is the per-session sticky override the MCP scheduling
+  // path carries; it outranks both stores when set, unchanged from before.
+  const folder = (await getAgentGroup(agentGroupId))?.folder;
+  const fileProvider = folder ? readContainerConfig(folder)?.provider : undefined;
+  const rowProvider = (await getContainerConfig(agentGroupId))?.provider;
+  return resolveProviderName(sessionProvider ?? null, fileProvider ?? rowProvider);
 }
 
 /** Build a `ContainerConfig` from a DB row + agent group identity. */

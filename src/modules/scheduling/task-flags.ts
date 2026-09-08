@@ -5,7 +5,7 @@
  * same provider vocabulary without depending on actions.ts, which is slated
  * for deletion once the MCP scheduling surface retires.
  */
-import { getContainerConfig, resolveProviderName } from '../../db/container-configs.js';
+import { resolveGroupProvider } from '../../container-config.js';
 import { parseMessageFlags, type FlagIntent } from '../../flag-parser.js';
 
 /** Per-fire model/effort a scheduled task carries; mirrors the chat FlagIntent. */
@@ -108,8 +108,11 @@ export async function resolveTaskFlagIntent(
   const effort = typeof content.effort === 'string' ? content.effort.trim() : '';
   if (!model && !effort) return {};
 
+  // Through the seam, so create/update validate a pin against the provider the
+  // group ACTUALLY runs. This was the third site reading the lagging
+  // projection: two were found as separate review findings at separate call
+  // sites, which is the whole argument for there being one resolver.
   const provider =
-    target.overrideProvider ??
-    resolveProviderName(target.agent_provider ?? null, (await getContainerConfig(target.agent_group_id))?.provider);
+    target.overrideProvider ?? (await resolveGroupProvider(target.agent_group_id, target.agent_provider));
   return validateTaskPin({ model, effort }, provider);
 }
