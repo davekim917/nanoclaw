@@ -58,7 +58,6 @@ export const claudeConfigSchema = z.strictObject({
   effort: z.enum(CLAUDE_EFFORT_LEVELS).optional(),
 });
 
-
 function log(msg: string): void {
   console.error(`[claude-provider] ${msg}`);
 }
@@ -1982,10 +1981,7 @@ const FAMILY_ALIAS_ENV: Record<string, string> = {
  * fail to match and the row stays NULL. That under-claims, which is the
  * intended direction — never a guess.
  */
-function canonicalUsageModel(
-  model: string | undefined,
-  env: Record<string, string | undefined>,
-): string | undefined {
+function canonicalUsageModel(model: string | undefined, env: Record<string, string | undefined>): string | undefined {
   if (!model) return model;
   const key = FAMILY_ALIAS_ENV[model.toLowerCase()];
   if (!key) return model; // already a concrete id
@@ -2346,8 +2342,7 @@ export class ClaudeProvider implements AgentProvider {
     //
     // `stickyConfig.model` still wins over this, unchanged — a per-agent
     // providerConfig is more specific than the group's default model.
-    const rawModel =
-      input.model ?? this.stickyConfig.model ?? process.env.ANTHROPIC_DEFAULT_OPUS_MODEL ?? 'opus';
+    const rawModel = input.model ?? this.stickyConfig.model ?? process.env.ANTHROPIC_DEFAULT_OPUS_MODEL ?? 'opus';
     const model = rawModel ? ensureOpus1mSuffix(rawModel) : rawModel;
     // Effort precedence: -e flag (turn/sticky, arrives as input.effort) →
     // group container.json provider config → operator override env
@@ -2894,8 +2889,19 @@ export class ClaudeProvider implements AgentProvider {
       // explicit -e lands on the new model's family default (e.g. -m fable
       // mid-turn → fable@medium, not fable@inherited-xhigh).
       applySettings: async (s) => {
-        const newModel = s.model ? ensureOpus1mSuffix(s.model) : undefined;
-        if (newModel && newModel !== activeModel) {
+        // `s.model === undefined` means "no per-TURN override", exactly as it
+        // does at query creation — NOT "leave the stream unchanged". Those two
+        // readings are the same word meaning opposite things at two seams, and
+        // treating absence as "unchanged" here left a suppressed task turn
+        // running on whatever model the stream already had (the interactive
+        // sticky), while reporting the model as unknown.
+        //
+        // So resolve the SAME chain query() uses at line ~2350 — which is also
+        // what the effort branch immediately below has always done with its
+        // own absence. Model was the odd one out, not the rule.
+        const rawNewModel = s.model ?? this.stickyConfig.model ?? process.env.ANTHROPIC_DEFAULT_OPUS_MODEL ?? 'opus';
+        const newModel = ensureOpus1mSuffix(rawNewModel);
+        if (newModel !== activeModel) {
           await sdkResult.setModel(newModel);
           activeModel = newModel;
           // A live `-m sonnet` lands here as a bare alias too, so the
@@ -2930,9 +2936,15 @@ export class ClaudeProvider implements AgentProvider {
         activeEffort = clamped;
         activeRequestedEffort = requested;
         log(
-          `applySettings (live): model=${activeModel ?? '(unchanged)'} effort=${clamped ?? '(none)'}` +
+          `applySettings (live): model=${activeModel} effort=${clamped ?? '(none)'}` +
             `${s.ultracode !== undefined ? ` ultracode=${s.ultracode}` : ''}`,
         );
+        // Report what the stream is ACTUALLY on. The caller cannot derive it:
+        // it passed `undefined` meaning "the default" and only this provider
+        // knows what that resolves to. Without this the turn-usage ledger
+        // recorded the model as unknown for exactly the suppressed task fires
+        // this change exists to route correctly.
+        return { model: activeModel };
       },
     };
   }

@@ -2981,6 +2981,104 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     expect(result.taskTurns!.map((t) => t.key)).toEqual(['occ-1', 'occ-2']);
   }, 15_000);
 
+  it('an occurrence joining a live stream is MOVED onto the group default, not just left alone', async () => {
+    // Round-2 P1. Suppressing the sticky by sending `model: undefined` is only
+    // half the job: `undefined` means "fall through to the group default" at
+    // query creation, but "leave the stream unchanged" on a live stream. Under
+    // the second reading the suppressed task fire kept running on the human's
+    // model and the ledger recorded the model as unknown — wrong behaviour
+    // plus wrong telemetry.
+    //
+    // Asserted on what the stream was actually SET to, not on what was passed.
+    setStickyModel('claude-opus-5[1m]');
+    insertMessage('occ-2', 'task', { prompt: 'second fire of the same series' });
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      yield { type: 'result', text: 'first fire failed', isError: true };
+      await Bun.sleep(1600);
+      yield { type: 'result', text: 'second fire failed', isError: true };
+    }
+    // Stands in for the provider's own resolution: absence resolves to the
+    // group default (what the host exported as ANTHROPIC_DEFAULT_OPUS_MODEL),
+    // and the resolved value is reported back so usage can be attributed.
+    const setTo: Array<string | undefined> = [];
+    const query: AgentQuery = {
+      push: () => {},
+      end: () => {},
+      abort: () => {},
+      applySettings: async (sIn) => {
+        const resolved = sIn.model ?? 'claude-sonnet-5';
+        setTo.push(resolved);
+        return { model: resolved };
+      },
+      events: events(),
+    };
+
+    const result = await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
+      model: 'claude-opus-5[1m]',
+      ultracode: false,
+    });
+
+    // The suppressed fire moved the stream OFF the sticky and onto the group
+    // default. Pre-fix `applySettings` was called with undefined and the
+    // provider's guard skipped setModel, leaving it on opus.
+    expect(setTo).toEqual(['claude-sonnet-5']);
+    // ...and the outcome is attributed to what actually ran, not to the
+    // `undefined` that was requested.
+    expect(result.taskTurns!.map((t) => t.key)).toEqual(['occ-1', 'occ-2']);
+    expect(result.taskTurns![1]!.outcome?.model).toBe('claude-sonnet-5');
+  }, 15_000);
+
+  it('a batch after a live change is compared against the LIVE settings, not the creation snapshot', async () => {
+    // Round-2 P2, the same seam from the other side. `querySettings` is the
+    // immutable creation snapshot, so once a live change lands it no longer
+    // describes the stream. A later batch whose settings happen to equal that
+    // stale snapshot then reads as "unchanged", applySettings is skipped, and
+    // the turn silently keeps the PREVIOUS batch's settings.
+    //
+    // Here the query is created at xhigh, a task fire moves it to medium live,
+    // and a second batch wants xhigh again — equal to the creation snapshot,
+    // different from the stream. It must be applied.
+    insertMessage('occ-2', 'task', { prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      yield { type: 'result', text: 'first fire', isError: true };
+      // occ-2 is admitted during this window and moves the LIVE stream to
+      // medium. The creation snapshot still says xhigh.
+      await Bun.sleep(1600);
+      // Staged from inside the stream so it lands in a SECOND follow-up batch
+      // rather than being merged into occ-2's. It wants xhigh again — equal to
+      // the stale creation snapshot, different from the live stream.
+      insertMessage('occ-3', 'task', { prompt: 'third fire', flagIntent: { turnEffort: 'xhigh' } });
+      yield { type: 'result', text: 'second fire', isError: true };
+      await Bun.sleep(1600);
+      yield { type: 'result', text: 'third fire', isError: true };
+    }
+    const efforts: Array<string | undefined> = [];
+    const query: AgentQuery = {
+      push: () => {},
+      end: () => {},
+      abort: () => {},
+      applySettings: async (sIn) => {
+        efforts.push(sIn.effort);
+        return { model: sIn.model ?? 'claude-sonnet-5' };
+      },
+      events: events(),
+    };
+
+    await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
+      effort: 'xhigh',
+      ultracode: false,
+    });
+
+    // Pre-fix: ['medium'] — occ-3's xhigh equalled the stale CREATION
+    // snapshot, so the comparison said "unchanged" and the stream was left on
+    // medium, silently running occ-3 at the previous fire's effort.
+    expect(efforts).toEqual(['medium', 'xhigh']);
+  }, 15_000);
+
   it('keeps two separate fires apart even though they share a series', async () => {
     async function fire(occurrenceId: string) {
       async function* events() {

@@ -1561,6 +1561,18 @@ export async function processQuery(
   // exists to get right (Codex round 2).
   let modelInForce = querySettings.model;
   /**
+   * What the live stream is ACTUALLY set to. `querySettings` is the immutable
+   * creation snapshot, so once a live settings change lands it stops
+   * describing the stream — and comparing the next batch against it makes a
+   * genuine change look like no change. Concretely: a task fire applies its
+   * settings live, then chat arrives whose sticky values happen to equal the
+   * stale creation snapshot, the comparison says "unchanged", applySettings is
+   * skipped, and the human's turn silently inherits the TASK's effort and
+   * ultracode. That is this PR's own bug pointed the other way, so the
+   * baseline has to move with the stream.
+   */
+  let liveSettings: { model?: string; effort?: string; ultracode?: boolean; fast?: boolean } = { ...querySettings };
+  /**
    * One slot per ADMITTED TASK TURN, in admission order — the invariant this
    * whole path exists to hold: *one admitted task turn produces exactly one
    * outcome record*.
@@ -1794,24 +1806,24 @@ export async function processQuery(
         // effectiveTurnSettings, NOT applyFlagBatch: a task occurrence admitted
         // into a LIVE query is still a task fire and must not drag the running
         // turn onto an interactive sticky. Using the raw batch here would make
-        // fb.model the sticky, differ from the suppressed querySettings.model,
+        // fb.model the sticky, differ from the suppressed live model,
         // and applySettings the stream onto it — undoing the suppression for
         // exactly the case #561 added slots for (a later occurrence joining an
         // active stream is a SEPARATE fire).
         const fb = effectiveTurnSettings(keep, extractRouting(keep), providerName);
         const liveSettingsChanged =
-          fb.model !== querySettings.model ||
-          fb.effort !== querySettings.effort ||
-          fb.ultracode !== querySettings.ultracode;
-        const fastChanged = fb.fast !== (querySettings.fast ?? false);
+          fb.model !== liveSettings.model ||
+          fb.effort !== liveSettings.effort ||
+          fb.ultracode !== liveSettings.ultracode;
+        const fastChanged = fb.fast !== (liveSettings.fast ?? false);
         if (liveSettingsChanged || fastChanged) {
           // Codex fast mode is selected when its app-server starts. Even if a
           // provider supports live model/effort controls, a tier change must
           // end this query so the outer loop can respawn with new overrides.
           if (fastChanged || !query.applySettings) {
             log(
-              `Query settings changed (${querySettings.model ?? 'default'} → ${fb.model ?? 'default'}, ` +
-                `fast=${querySettings.fast ? 'on' : 'off'} → ${fb.fast ? 'on' : 'off'}) — ` +
+              `Query settings changed (${liveSettings.model ?? 'default'} → ${fb.model ?? 'default'}, ` +
+                `fast=${liveSettings.fast ? 'on' : 'off'} → ${fb.fast ? 'on' : 'off'}) — ` +
                 'ending stream; next query honors it',
             );
             endedForCommand = true;
@@ -1819,10 +1831,20 @@ export async function processQuery(
             return;
           }
           try {
-            await query.applySettings({ model: fb.model, effort: fb.effort, ultracode: fb.ultracode });
-            // Applied in place, same stream: from here the turn really is
-            // running on fb.model, so the outcome must say so.
-            modelInForce = fb.model;
+            const applied = await query.applySettings({
+              model: fb.model,
+              effort: fb.effort,
+              ultracode: fb.ultracode,
+            });
+            // Applied in place, same stream. Attribute to what the provider
+            // says it RESOLVED to, not to what we asked for: `fb.model` is
+            // undefined for a suppressed task fire, and recording that would
+            // lose the model on exactly the turns this change reroutes.
+            modelInForce = applied?.model ?? fb.model;
+            // The stream has moved; the comparison baseline moves with it, or
+            // the next batch is measured against a snapshot that no longer
+            // describes anything.
+            liveSettings = { model: fb.model, effort: fb.effort, ultracode: fb.ultracode, fast: fb.fast };
           } catch (err) {
             log(
               `Live applySettings failed (${err instanceof Error ? err.message : String(err)}) — ` +

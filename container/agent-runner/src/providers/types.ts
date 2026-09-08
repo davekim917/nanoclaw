@@ -317,13 +317,25 @@ export interface AgentQuery {
    * Apply -m/-e flag changes to the LIVE query — same conversation, same
    * stream, no teardown (claude: SDK setModel + applyFlagSettings control
    * requests, mirroring interactive Claude Code's /model). Optional:
+   * An omitted `model` means "no per-TURN override" — the same thing it means
+   * at query creation — and the implementation must RESOLVE it to the value a
+   * fresh query would have used, not leave the stream on whatever it had.
+   * Absence meaning "unchanged" here while meaning "fall through to the default"
+   * at creation is how a suppressed turn keeps running on a stale model.
+   * Returning the resolved model lets the caller attribute usage to what
+   * actually ran; a provider that cannot report it may still return void.
+   *
    * providers without in-flight controls (codex/opencode are sticky-only)
    * omit it and the poll-loop falls back to ending the stream so the next
    * query picks the flags up. MUST throw when the requested combination
    * can't be expressed live (e.g. the effortLevel control has no 'max') so
    * the caller can use the same fallback.
    */
-  applySettings?(settings: { model?: string; effort?: string; ultracode?: boolean }): Promise<void>;
+  applySettings?(settings: {
+    model?: string;
+    effort?: string;
+    ultracode?: boolean;
+  }): Promise<{ model?: string } | void>;
 }
 
 /**
