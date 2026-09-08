@@ -36,6 +36,11 @@ printf 'line\n%.0s' {1..50} > "$ROOT/logs/nanoclaw.log"
 # failure went unnoticed for three days).
 cat > "$ROOT/node_modules/.bin/tsx" <<'EOS'
 #!/bin/bash
+case "$1" in
+  *print-storage-admission-policy.ts)
+    echo "${STUB_STORAGE_ADMISSION_POLICY:-enabled 90}"
+    exit 0 ;;
+esac
 echo "notify-owner-stub: no fixture DB/token configured — cannot deliver" >&2
 exit 2
 EOS
@@ -119,6 +124,23 @@ QUEUED=$(ls "$OUTBOX"/*health-sentinel*.md 2>/dev/null | wc -l)
   || bad "successful delivery did not stamp the cooldown" "$OUT"
 [ "$(state log_off)" -gt 0 ] && ok "offsets advanced on the success path" \
   || bad "offsets did not advance" "log_off=$(state log_off)"
+
+# ── storage-admission policy ─────────────────────────────────────────────────
+# The sentinel is a separate process, so it asks the shared TypeScript resolver
+# instead of silently hardcoding 90 when `.env` says 93. This stub keeps the
+# sentinel check hermetic; storage-manager.test.ts covers resolver validation.
+disk_alert_contains() { # policy expected-text
+  rm -f "$ROOT/data/health-sentinel-state.json"
+  rm -f "$OUTBOX"/*health-sentinel*.md 2>/dev/null || true
+  run_sentinel DISK_MAX_PCT=0 STUB_STORAGE_ADMISSION_POLICY="$1"
+  local alert
+  alert=$(ls -t "$OUTBOX"/*health-sentinel*.md 2>/dev/null | head -1)
+  if [ -n "$alert" ] && grep -q "$2" "$alert"; then ok "disk alert $2"
+  else bad "disk alert did not report $2" "out=$OUT alert=${alert:-<none>}"; fi
+}
+disk_alert_contains "enabled 93" "container admission refusal at 93%"
+disk_alert_contains "disabled 93" "storage-manager admission is disabled"
+disk_alert_contains "unreadable" "configured container-admission threshold unavailable"
 
 # ── 3. WATCHED_TIMERS fails closed ──────────────────────────────────────────
 # notify-owner.ts always fails in this fixture (see the stub above), so every

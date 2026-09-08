@@ -10,7 +10,7 @@
 #   3. stalls      — event-loop stalls in the window (storm precursor)
 #   4. recovery    — channel recovery passes in the window (storm signature)
 #   5. sweep       — any sweep tick over 120s (control-plane saturation)
-#   6. disk        — data filesystem >= 90% (admission refusal imminent)
+#   6. disk        — data filesystem >= 90% (admission pressure approaching)
 #   7. crashloop   — a session whose container repeatedly exits non-zero
 #   8. qaseats     — QA seat-health artifact missing or stale (the smoke
 #                    gates fail OPEN on it, so nothing else would say so)
@@ -118,7 +118,16 @@ fi
 
 DISK_PCT=$(df --output=pcent "$NANOCLAW_DIR/data" 2>/dev/null | tail -1 | tr -dc '0-9')
 if [ -n "$DISK_PCT" ] && [ "$DISK_PCT" -ge "$DISK_MAX_PCT" ]; then
-  BREACHES+=("disk|data filesystem at ${DISK_PCT}% (>= ${DISK_MAX_PCT}% — container admission refusal at 90%)")
+  ADMISSION_POLICY=$("$NANOCLAW_DIR/node_modules/.bin/tsx" "$NANOCLAW_DIR/scripts/print-storage-admission-policy.ts" 2>/dev/null || true)
+  case "$ADMISSION_POLICY" in
+    enabled\ [0-9]|enabled\ [1-9][0-9])
+      ADMISSION_DETAIL="container admission refusal at ${ADMISSION_POLICY#enabled }%" ;;
+    disabled\ [0-9]|disabled\ [1-9][0-9])
+      ADMISSION_DETAIL="storage-manager admission is disabled" ;;
+    *)
+      ADMISSION_DETAIL="configured container-admission threshold unavailable" ;;
+  esac
+  BREACHES+=("disk|data filesystem at ${DISK_PCT}% (>= ${DISK_MAX_PCT}% — $ADMISSION_DETAIL)")
 fi
 
 # QA seat health. Where configured, the smoke gates read a seat-health artifact
