@@ -60,13 +60,24 @@ next spawn, and the enabler run is just a verification pass.
    >
    > ```bash
    > for d in ~/.local/share/opencode-*/skill ~/.config/opencode/skill; do
-   >   [ -d "$d" ] && cp -a "$d" "$d.pre-sync-$(date +%Y%m%dT%H%M%S)"
+   >   [ -d "$d" ] && cp -aL "$d" "$d.pre-sync-$(date +%Y%m%dT%H%M%S)"
    > done
    > ```
    >
+   > **`-L` is load-bearing.** `syncSkillSymlinks` fills each mirrored skill with
+   > per-child symlinks into `~/plugins/<name>/…`, and `cp -a` implies `-d`
+   > (`--no-dereference`), so it archives the links rather than their contents. On a
+   > live mirror that is 11 symlinks and 2 real files versus 310 real files with `-L`.
+   >
    > Then diff after the run to see what the sync removed, and restore anything you
-   > still want by re-cloning its plugin into `~/plugins` — a copy-back alone will be
+   > still want by re-cloning its plugin into `~/plugins` — a copy-back alone is
    > pruned again on the next sync.
+   >
+   > One honest limit: if a source plugin is ALREADY gone, its mirror entries are
+   > dangling links and there is nothing left to copy — `cp -aL` fails on them and the
+   > content is unrecoverable from the mirror. This backup protects you while the
+   > source still exists; it cannot resurrect an orphan. (Entries that happen to hold
+   > real files rather than links do survive, so run it regardless.)
    > Scoped mirrors (`~/.local/share/opencode-<group>/`) exist only for groups with
    > their own `auth.json`; the rest share the global dir.
 
@@ -143,12 +154,22 @@ next spawn, and the enabler run is just a verification pass.
    Note opt-out is per **group folder** (e.g. `main`, `main-codex`, `main-opencode` are
    three separate groups), so excluding a workgroup means naming every sibling.
 
-   **Complete opt-out is not achievable for an OpenCode sibling.** Excluding it drops
+   **Per-group opt-out is not achievable for an OpenCode sibling.** Excluding it drops
    the ruleset, but the skill mirror is synced globally with no per-group filter, so
-   that agent keeps the plugin's commands. Nothing later in this skill removes them.
-   If the plugin must not reach an OpenCode group at all, the only durable answer today
-   is to keep it out of `~/plugins` entirely — deleting the mirrored directory by hand
-   is undone by the next sync.
+   that agent keeps the plugin's commands, and nothing later in this skill removes
+   them. Deleting the mirrored directory by hand is undone by the next sync.
+
+   Two durable options, neither per-group:
+
+   - **Withhold from OpenCode everywhere, keep Claude and Codex.** Combine
+     `--deny opencode` (drops the skills from OpenCode discovery) with
+     `excludePlugins` on the affected groups (drops the ruleset). The tradeoff is that
+     `--deny` is provider-wide: EVERY OpenCode group loses the skills, not just the
+     ones you excluded.
+   - **Withhold everywhere.** Keep the plugin out of `~/plugins`.
+
+   If you need it gone from one OpenCode group but present on another, that is not
+   supported today — it needs a per-group filter in `syncOpenCodePluginSkills()`.
 
 7. **Build + restart.** The composer is host `src/`, so it needs a build, and running
    containers only pick up new mounts/instructions on respawn:
