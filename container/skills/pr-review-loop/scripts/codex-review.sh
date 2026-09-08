@@ -10,7 +10,7 @@
 #   codex-review.sh push [git push args…]     # gate, then push — the loop's only push path
 #   codex-review.sh reply <comment_id> <text> # reply on that thread
 #   codex-review.sh resolve <thread_id>       # mark the thread resolved
-#   codex-review.sh status <sha> <since_iso>  # codex=<pending|clean|findings|head-changed> head=<sha> open=<n> review=<n> last_review_at=<iso|none> reaction=<n> last_thumbs_up_at=<iso|none> rounds=<n>
+#   codex-review.sh status <sha> <since_iso>  # codex=<pending|clean|findings|unavailable|head-changed> head=<sha> open=<n> review=<n> last_review_at=<iso|none> reaction=<n> last_thumbs_up_at=<iso|none> rounds=<n>
 #   codex-review.sh wait <sha> <since_iso> [minutes]
 #                                             # foreground GraphQL poll, default $CODEX_REVIEW_WAIT_MINUTES or 15
 #                                             # open/status print a STOP banner at rounds>=4 — diagnose, do not push
@@ -29,6 +29,12 @@
 # case-insensitive prefix or regex, never equality against one spelling.
 # Likewise `commit_id` comes back as a full 40-char SHA — matched with
 # startswith so a short SHA still matches.
+#
+# The connector posts its capacity failure as an ordinary top-level PR comment,
+# not as a finding. Match its stable, code-review-specific sentence at the
+# start of a line. A generic "usage limit" matcher would let a real review that
+# quotes code or documentation manufacture an unavailable verdict.
+CODEX_REVIEW_USAGE_LIMIT_RE='(^|\n)\s*(?:you\s+have\s+reached\s+your\s+codex\s+usage\s+limits?\s+for\s+code\s+reviews?|codex\s+usage\s+limits?\s+have\s+been\s+reached\s+for\s+code\s+reviews?)\b'
 set -euo pipefail
 
 REPO="${REPO:-$(gh repo view --json nameWithOwner -q .nameWithOwner)}"
@@ -147,7 +153,19 @@ reviews_page() {
     query($owner:String!,$name:String!,$pr:Int!,$after:String){
       repository(owner:$owner,name:$name){ pullRequest(number:$pr){
         headRefOid reviews(first:100,after:$after){ pageInfo{hasNextPage endCursor} nodes{
-          author{login} submittedAt commit{oid}
+          author{login} submittedAt body commit{oid}
+        } }
+      } }
+    }' \
+    -F owner="$OWNER" -F name="$NAME" -F pr="$PR" -F after="$1"
+}
+
+comments_page() {
+  gh api graphql -f query='
+    query($owner:String!,$name:String!,$pr:Int!,$after:String){
+      repository(owner:$owner,name:$name){ pullRequest(number:$pr){
+        headRefOid comments(first:100,after:$after){ pageInfo{hasNextPage endCursor} nodes{
+          author{login} createdAt body
         } }
       } }
     }' \
@@ -204,16 +222,17 @@ paginate_connection() {
 # Unresolved Codex threads intentionally have no date filter: an older thread
 # remains open work until it is replied to and resolved.
 status_observation() {
-  local sha="$1" since="$2" thread_pages review_pages reaction_pages
-  local observed_heads head_count head_changed head_oid open_count review_matches review_count last_review_at reaction_matches reaction_count last_thumbs_up_at rounds codex
+  local sha="$1" since="$2" thread_pages review_pages comment_pages reaction_pages
+  local observed_heads head_count head_changed head_oid open_count review_matches review_count last_review_at last_valid_review_at last_valid_verdict_at quota_matches quota_count last_usage_limit_at reaction_matches reaction_count last_thumbs_up_at rounds codex
 
   # Read verdict evidence before threads: a review submitted between these
   # requests must have its findings included before we can declare it clean.
   review_pages=$(paginate_connection reviews reviews_page) || return 1
   reaction_pages=$(paginate_connection reactions reactions_page) || return 1
+  comment_pages=$(paginate_connection comments comments_page) || return 1
   thread_pages=$(paginate_connection reviewThreads review_threads_page) || return 1
 
-  observed_heads=$(printf '%s\n%s\n%s\n' "$thread_pages" "$review_pages" "$reaction_pages" | jq -ers '
+  observed_heads=$(printf '%s\n%s\n%s\n%s\n' "$thread_pages" "$review_pages" "$comment_pages" "$reaction_pages" | jq -ers '
     [ .[] | .data.repository.pullRequest.headRefOid ] | unique') || return 1
   head_count=$(printf '%s' "$observed_heads" | jq -er 'length') || return 1
   if [ "$head_count" -eq 0 ]; then
@@ -238,13 +257,15 @@ status_observation() {
       | select((.comments.nodes[0].author.login // "") | ascii_downcase | startswith("chatgpt-codex-connector"))
       | .comments.nodes[0].pullRequestReview.id // empty
     ] | unique | length') || return 1
-  review_matches=$(printf '%s\n' "$review_pages" | jq -cs --arg sha "$head_oid" --arg since "$since" '
+  review_matches=$(printf '%s\n' "$review_pages" | jq -cs --arg sha "$head_oid" --arg since "$since" --arg usageLimitRe "$CODEX_REVIEW_USAGE_LIMIT_RE" '
     [ .[] | .data.repository.pullRequest.reviews.nodes[]
       | select((.author.login // "") | ascii_downcase | startswith("chatgpt-codex-connector"))
       | select((.commit.oid // "") | startswith($sha))
       | select(.submittedAt != null and .submittedAt > $since)
+      | select((.body // "") | test($usageLimitRe; "i") | not)
     ]') || return 1
   review_count=$(printf '%s' "$review_matches" | jq -er 'length') || return 1
+  last_valid_review_at=$(printf '%s' "$review_matches" | jq -er '([.[].submittedAt] | max) // "none"') || return 1
   last_review_at=$(printf '%s\n' "$review_pages" | jq -ers '
     ([ .[] | .data.repository.pullRequest.reviews.nodes[]
        | select((.author.login // "") | ascii_downcase | startswith("chatgpt-codex-connector"))
@@ -263,18 +284,44 @@ status_observation() {
        | select(.content == "THUMBS_UP")
        | .createdAt
      ] | max) // "none"') || return 1
+  last_valid_verdict_at="$last_valid_review_at"
+  if [ "$last_thumbs_up_at" != "none" ] && { [ "$last_valid_verdict_at" = "none" ] || [[ "$last_thumbs_up_at" > "$last_valid_verdict_at" ]]; }; then
+    last_valid_verdict_at="$last_thumbs_up_at"
+  fi
+  quota_matches=$(printf '%s\n%s\n' "$review_pages" "$comment_pages" | jq -cs --arg sha "$head_oid" --arg since "$since" --arg usageLimitRe "$CODEX_REVIEW_USAGE_LIMIT_RE" '
+    [ .[] | .data.repository.pullRequest as $pr
+      | ($pr.reviews.nodes[]?
+          | select((.author.login // "") | ascii_downcase | startswith("chatgpt-codex-connector"))
+          | select((.commit.oid // "") | startswith($sha))
+          | select(.submittedAt != null and .submittedAt > $since)
+          | select((.body // "") | test($usageLimitRe; "i"))
+          | { at: .submittedAt })
+      , ($pr.comments.nodes[]?
+          | select((.author.login // "") | ascii_downcase | startswith("chatgpt-codex-connector"))
+          | select(.createdAt != null and .createdAt > $since)
+          | select((.body // "") | test($usageLimitRe; "i"))
+          | { at: .createdAt })
+    ]') || return 1
+  quota_count=$(printf '%s' "$quota_matches" | jq -er 'length') || return 1
+  last_usage_limit_at=$(printf '%s' "$quota_matches" | jq -er '([.[].at] | max) // "none"') || return 1
 
   if [ "$head_changed" -eq 1 ]; then
     codex=head-changed
   elif [ "$open_count" -gt 0 ]; then
     codex=findings
+  elif [ "$quota_count" -gt 0 ] && { [ "$last_valid_verdict_at" = "none" ] || [[ "$last_usage_limit_at" > "$last_valid_verdict_at" ]]; }; then
+    codex=unavailable
   elif [ "$review_count" -gt 0 ] || [ "$reaction_count" -gt 0 ]; then
     codex=clean
   else
     codex=pending
   fi
   rounds_banner "$rounds"
-  echo "codex=$codex head=$head_oid open=$open_count review=$review_count last_review_at=$last_review_at reaction=$reaction_count last_thumbs_up_at=$last_thumbs_up_at rounds=$rounds"
+  if [ "$codex" = unavailable ]; then
+    echo "codex=$codex reason=usage_limit head=$head_oid open=$open_count review=$review_count last_review_at=$last_review_at reaction=$reaction_count last_thumbs_up_at=$last_thumbs_up_at rounds=$rounds"
+  else
+    echo "codex=$codex head=$head_oid open=$open_count review=$review_count last_review_at=$last_review_at reaction=$reaction_count last_thumbs_up_at=$last_thumbs_up_at rounds=$rounds"
+  fi
 }
 
 # Distinct Codex reviews that produced findings — the PR's round count.
@@ -629,6 +676,7 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait}" 
         codex=findings*) exit 10 ;;
         codex=clean*) exit 0 ;;
         codex=head-changed*) exit 12 ;;
+        codex=unavailable\ reason=usage_limit*) exit 13 ;;
       esac
       now_seconds=$(date +%s) || exit 1
       if [ "$now_seconds" -ge "$deadline_seconds" ]; then
