@@ -1,4 +1,4 @@
-# Migration: scheduled tasks lose their Claude-only model/effort default
+# Migration: scheduled tasks use the group default, and stop inheriting chat stickies
 
 > **Sequence:** pins first, then deploy. See §3 — this is the opposite of a fix-it-afterwards migration, because pins are data and the removal is code.
 
@@ -6,7 +6,26 @@ Until this release, a scheduled-task fire on a **Claude** group with no `--model
 
 One deliberate difference from chat: a **pure** task wake does not inherit a per-session sticky model or effort. If a human typed `-m opus` in that thread, chat keeps using Opus and the unpinned task still fires on the group default. A batch that mixes real chat with a task is a human conversation the task rode along with, and keeps the sticky — only a task-only wake is suppressed.
 
-Codex and OpenCode groups were never in that branch and are unaffected. A task's own pin still wins over everything, unchanged.
+**Two changes with two different scopes — this matters for what you need to inventory:**
+
+| change                                                        | applies to                                                      |
+| ------------------------------------------------------------- | --------------------------------------------------------------- |
+| removing the hardcoded `sonnet`/`xhigh` default               | **Claude groups only** — no other provider ever had that branch |
+| no longer inheriting a per-session sticky on a pure task wake | **all three providers** — Claude, Codex, and OpenCode           |
+
+The sticky suppression is deliberately provider-neutral: `getStickyModel` is not Claude-specific, so an unpinned Codex or OpenCode task inherited an interactive `-m` exactly the same way and now does not. **Inventory every group, not just your Claude ones.**
+
+A task's own pin still wins over everything, unchanged — which is what makes the practical impact small for most installs (see the measured state below).
+
+### Measured state on this install, 2026-09-08
+
+Verified by reading `container.json` for every group and cross-referencing live series (not inferred):
+
+- 15 non-Claude groups exist (8 Codex, 7 OpenCode).
+- Exactly **one** of them has a live recurring series: `illysium-codex` → `lab-weekly-build-ollie-o-839c`.
+- That series is **pinned** to `gpt-6-astra`/`high`, and a pin wins under the new code exactly as it did under the old.
+
+**So zero non-Claude series change behaviour here today.** That is a fact about the current fleet, not a property of the change. Re-check it if you add an unpinned Codex or OpenCode scheduled task — such a task _would_ be affected, and nothing warns you.
 
 This doc is the migration path for that change, written to be handed to a coding agent verbatim: detect → why → fix → verify → rollback.
 
@@ -29,9 +48,24 @@ ncl tasks list --json | jq -r '
       | [.agent_group_id, .series_id, .prompt] | @tsv'
 ```
 
-Only rows whose group runs **Claude** are affected. Check a group's provider with `ncl groups config get --id <group-id>` — and note that `container.json` is the authority for what actually boots, not the `container_configs` projection.
+That inventory covers **every** provider, which is what you want: the sticky-inheritance half of this change applies to all three. To see which provider each affected group runs — the Claude ones additionally lose the `sonnet`/`xhigh` default — join against the group config:
 
-**Do not rely on a count from someone else's install.** On the reference install this was 31 of 46 armed series at the time of writing, but the number drifts as tasks are created and cancelled. The stable shape is: _every unpinned series on a Claude group moves to that group's default._
+```bash
+ncl tasks list --json | jq -r '
+  .data[] | select(.model_pin == null and .effort_pin == null)
+      | [.agent_group_id, .series_id] | @tsv' \
+| while IFS=$'\t' read -r g s; do
+    p=$(ncl groups config get --id "$g" --json | jq -r '.data.provider // "claude"')
+    printf '%s\t%s\t%s\n' "$p" "$g" "$s"
+  done | sort
+```
+
+`ncl groups list --json` does **not** carry the provider, which is why this joins through `groups config get` per group. Note `container.json` is the authority for what actually boots, not the `container_configs` projection.
+
+**Do not rely on a count from someone else's install.** The numbers drift as tasks are created and cancelled. The stable shapes are:
+
+- _Every unpinned series on a **Claude** group moves to that group's configured default._
+- _Every unpinned series on **any** provider stops inheriting a per-session sticky model/effort._
 
 ## 2. Why
 
@@ -40,6 +74,8 @@ The old default was wrong in three separate ways, and they compound:
 - **It was invisible.** Nothing in `ncl tasks get` or the task's own definition said `sonnet`/`xhigh`. The value was applied deep in the runner's poll loop, so the only way to discover it was to read the source.
 - **It contradicted the group's own configuration.** An operator who set a group to Opus got Opus in chat and Sonnet on a schedule, with no indication the two differed.
 - **It was Claude-only.** The same unpinned task on a Codex group already resolved to the group default. One provider silently behaved differently from the others.
+
+  (This bullet is about the removed _default_ only. The sticky-inheritance half was never Claude-specific — Codex and OpenCode task wakes inherited an interactive `-m` too, and stop doing so with this change. See the scope table at the top.)
 
 It was also, in one respect, right: it existed to stop scheduled fires from riding an interactive sticky model. That protection is kept — a pure task wake ignores the session sticky — but it is now implemented by _suppressing_ the sticky rather than by substituting a hardcoded `sonnet`/`xhigh` the group's own config could neither see nor override.
 
