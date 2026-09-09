@@ -361,6 +361,33 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
         "@openai/codex@${CODEX_VERSION}" \
         "opencode-ai@${OPENCODE_VERSION}"
 
+# gws ships one prebuilt release binary per target triple, and its postinstall
+# picks *-unknown-linux-gnu on any glibc host. Upstream links that artifact
+# against glibc 2.39, but this image is node:22-slim (Debian 12, glibc 2.36),
+# so the installed binary aborts at exec and every agent loses Google Workspace:
+#   gws: /lib/*/libc.so.6: version `GLIBC_2.39' not found
+# The musl artifact of the SAME pinned version is statically linked and runs
+# here unchanged. Swap it in, verifying upstream's published SHA256 exactly as
+# the package's own install.js does, so the integrity model is unchanged.
+# Drop this step once the base image ships glibc >= 2.39.
+RUN set -eux; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) gws_triple=x86_64-unknown-linux-musl ;; \
+      arm64) gws_triple=aarch64-unknown-linux-musl ;; \
+      *) echo "gws: unsupported architecture" >&2; exit 1 ;; \
+    esac; \
+    gws_bin="$(find /pnpm -type f -path '*/@googleworkspace/cli/bin/gws' -print -quit)"; \
+    test -n "$gws_bin"; \
+    gws_url="https://github.com/googleworkspace/cli/releases/download/v${GWS_VERSION}/google-workspace-cli-${gws_triple}.tar.gz"; \
+    tmp="$(mktemp -d)"; \
+    curl -fsSL "$gws_url" -o "$tmp/gws.tar.gz"; \
+    curl -fsSL "$gws_url.sha256" -o "$tmp/gws.tar.gz.sha256"; \
+    echo "$(awk '{print $1}' "$tmp/gws.tar.gz.sha256")  $tmp/gws.tar.gz" | sha256sum -c -; \
+    tar xzf "$tmp/gws.tar.gz" -C "$tmp"; \
+    install -m 0755 "$tmp/gws" "$gws_bin"; \
+    rm -rf "$tmp"; \
+    "$gws_bin" --version
+
 # ---- Remotion video runtime --------------------------------------------------
 # Shared runtime for programmatic video, available to EVERY agent group at
 # /opt/remotion — deliberately not a per-group folder, because a video toolchain
