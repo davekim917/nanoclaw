@@ -386,8 +386,7 @@ export function materializeRawImageGeneration(
 // uses low | medium | high | xhigh | max | ultra. Ultra is a real Codex effort
 // value that adds proactive task delegation, not Claude's `ultracode` flag.
 //
-// Default is `low` for the production model (gpt-6-astra, trial 2026-09-07);
-// see the note at this.model. Operators can dial
+// Default is `high` for the production model (gpt-5.6-sol); operators can dial
 // down or up per-agent via container.json when cost/latency dictate ("high"
 // covers the deeper of the standard tiers without the proactive-delegation
 // extras of xhigh/max/ultra). Changed from xhigh → high per operator decision
@@ -399,7 +398,7 @@ export function materializeRawImageGeneration(
 // exposed by Codex's `thread/start` shape.
 export const codexConfigSchema = z.strictObject({
   model: z.string().min(1).optional(),
-  reasoning_effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']).optional().default('low'),
+  reasoning_effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']).optional().default('high'),
   max_concurrent_threads_per_session: z
     .number()
     .int()
@@ -1075,13 +1074,9 @@ export class CodexProvider implements AgentProvider {
     // Model precedence: stickyConfig (per-agent providerConfig, or the
     // declared provider fallback's model folded in above) > CODEX_MODEL env
     // (host default) > built-in default.
-    // TRIAL 2026-09-07 (one week, operator-requested): default is gpt-6-astra
-    // at `low`. The vendor's claim is that Astra on low matches Sol on high in
-    // output while costing roughly half per task on token efficiency. This
-    // install is rate-limit-bound rather than dollar-bound, so the number that
-    // decides it is limit consumption, not price. Revert = restore
-    // 'gpt-5.6-sol' here and 'high' in codexConfigSchema below.
-    this.model = this.stickyConfig.model ?? (options.env?.CODEX_MODEL as string | undefined) ?? 'gpt-6-astra';
+    // The gpt-6-astra/`low` trial (c58597034, 2026-09-07) was ended early by the
+    // operator on 2026-09-09; the default is back to gpt-5.6-sol at `high`.
+    this.model = this.stickyConfig.model ?? (options.env?.CODEX_MODEL as string | undefined) ?? 'gpt-5.6-sol';
 
     // Fallback OAuth identities. Empty when CODEX_FALLBACK_HOMES is unset
     // (the host didn't mount any fallbacks). Read from process.env rather
@@ -1570,7 +1565,7 @@ export class CodexProvider implements AgentProvider {
 
     return {
       // What this query actually runs, already resolved above. Codex always
-      // names a model (`stickyConfig.model ?? CODEX_MODEL ?? gpt-6-astra`), so
+      // names a model (`stickyConfig.model ?? CODEX_MODEL ?? gpt-5.6-sol`), so
       // there is no unknown case here.
       resolvedModel: effectiveModel,
       push: (message: string) => {

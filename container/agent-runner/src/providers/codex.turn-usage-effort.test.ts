@@ -142,10 +142,10 @@ describe('codex turn effort -> turn_usage row', () => {
   it('records the schema default when nothing was configured', async () => {
     // Derived, not hardcoded. The contract under test is "an unconfigured run
     // records the provider's own default", and that default is an operator
-    // dial: it has been xhigh, then high, and is currently `low` under a
-    // one-week gpt-6-astra trial (c58597034). A literal here would make this
-    // test a change-detector for that dial and it would go red when the trial
-    // ends — which is not a fact about this plumbing.
+    // dial: it has been xhigh, then high, then `low` under the gpt-6-astra
+    // trial (c58597034), and is back to `high` now that the trial has ended. A
+    // literal here would make this test a change-detector for that dial —
+    // which is not a fact about this plumbing.
     const schemaDefault = codexConfigSchema.parse({}).reasoning_effort;
     const row = await runTurnAndRecord();
     expect(row.effort).toBe(schemaDefault);
