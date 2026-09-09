@@ -16,12 +16,12 @@ import { OPENCODE_NATIVE_DEFAULT_MODEL } from './opencode.js';
 
 describe('non-Claude providers name the model they resolved', () => {
   it('codex falls back to its own configured model, never to absence', () => {
-    // codex's chain is stickyConfig.model ?? CODEX_MODEL ?? 'gpt-6-astra', and
+    // codex's chain is stickyConfig.model ?? CODEX_MODEL ?? 'gpt-5.6-sol', and
     // resolveQueryModel is the function the query path uses to apply it.
-    expect(resolveQueryModel(undefined, 'gpt-6-astra')).toBe('gpt-6-astra');
-    expect(resolveQueryModel('gpt-5.6-sol', 'gpt-6-astra')).toBe('gpt-5.6-sol');
+    expect(resolveQueryModel(undefined, 'gpt-5.6-sol')).toBe('gpt-5.6-sol');
+    expect(resolveQueryModel('gpt-6-astra', 'gpt-5.6-sol')).toBe('gpt-6-astra');
     // A non-codex model is refused and the fallback still NAMES something.
-    expect(resolveQueryModel('claude-sonnet-5', 'gpt-6-astra')).toBe('gpt-6-astra');
+    expect(resolveQueryModel('claude-sonnet-5', 'gpt-5.6-sol')).toBe('gpt-5.6-sol');
   });
 
   it('opencode reports a named known-unknown rather than absence', () => {
