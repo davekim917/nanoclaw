@@ -47,5 +47,8 @@ risk:high:
     - 'pnpm-workspace.yaml'
     # Deploy and rollback (src/deploy-crash-guard.ts is covered by *guard*)
     - 'scripts/deploy.sh'
-    # The gate itself: CI workflows and this file
+    # The gates themselves: CI workflows, this file, and the pre-push hook plus the
+    # checker it runs (the only place the strict identifier check runs)
     - '.github/**'
+    - '.husky/**'
+    - 'scripts/check-public-boundary.ts'
