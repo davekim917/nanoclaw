@@ -1,6 +1,8 @@
 /**
  * Host-side npm dependency cache: one sealed, read-only copy of `node_modules`
- * per lockfile per workgroup, hardlinked into each workspace (a "farm").
+ * per lockfile per workgroup, hardlinked into each workspace (a "farm"). The
+ * one file never shared is the hidden lockfile, which npm rewrites on every
+ * run: each tree holds its own copy.
  *
  * Normative spec: docs/specs/repository-branch-clones/plan.md §5.7. This module
  * is the ONE owner of verify, adopt, convert, link, seal and recovery (§3
@@ -47,6 +49,7 @@ const HIDDEN_LOCKFILE = '.package-lock.json';
 /** Root dot entries that ARE shared; every other root dot entry is workspace-private. */
 const SHARED_ROOT_DOT_NAMES = new Set(['.bin', HIDDEN_LOCKFILE]);
 const SEALED_FILE = 'SEALED';
+const CONTENT_CHUNK_BYTES = 1024 * 1024;
 const ENTRY_TMP_SUFFIX = '.tmp';
 const KEY_PATTERN = /^[0-9a-f]{64}$/;
 const QUARANTINED_PATTERN = /^([0-9a-f]{64})\.quarantined-(\d+)$/;
@@ -282,6 +285,44 @@ export function inventoryOf(nodeModulesDir: string): Inventory | null {
   return inventoryFromWalk(walk);
 }
 
+function fileSha256(file: string): string {
+  const hash = createHash('sha256');
+  const chunk = Buffer.allocUnsafe(CONTENT_CHUNK_BYTES);
+  const fd = fs.openSync(file, 'r');
+  try {
+    for (;;) {
+      const read = fs.readSync(fd, chunk, 0, chunk.length, null);
+      if (read === 0) break;
+      hash.update(chunk.subarray(0, read));
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return hash.digest('hex');
+}
+
+/**
+ * The content manifest's sha256: per inventory item, in inventory order, the
+ * sha256 of a regular file's bytes (streamed in 1 MiB chunks) or of a
+ * symlink's target, plus its exec bits. The inventory proves the same paths,
+ * types and sizes; this proves the same content, which is what makes deleting
+ * a private tree in favour of the entry lossless. Reads every byte, so only
+ * adopt and convert compute it — never verify or GC. `null` when unreadable.
+ */
+function contentManifestSha256(root: string, walk: TreeWalk): string | null {
+  const manifest = createHash('sha256');
+  try {
+    for (const file of walk.files) {
+      const full = path.join(root, file.rel);
+      const content = file.type === 'f' ? fileSha256(full) : sha256(fs.readlinkSync(full));
+      manifest.update(`${file.rel}\0${file.type}\0${content}\0${(file.stat.mode & 0o111).toString(8)}\n`);
+    }
+  } catch {
+    return null;
+  }
+  return manifest.digest('hex');
+}
+
 function firstInventoryDifference(expected: InventoryItem[], actual: InventoryItem[]): string {
   const length = Math.max(expected.length, actual.length);
   for (let i = 0; i < length; i++) {
@@ -400,6 +441,20 @@ export interface SealedRecord {
   lastLinkedAt: string;
   inventorySha256: string;
   inventory: InventoryItem[];
+  /** `contentManifestSha256` of the sealed tree; convert requires a private tree to match it. */
+  contentSha256: string;
+}
+
+/** What convert compares a private tree against. */
+export interface EntryIdentity {
+  inventory: InventoryItem[];
+  inventorySha256: string;
+  contentSha256: string;
+}
+
+/** What a report pass would have sealed, so later same-key trees report their convert. */
+export interface WouldSealEntry extends EntryIdentity {
+  source: string;
 }
 
 export type VerifyResult =
@@ -415,6 +470,7 @@ function readSealed(entryDir: string): SealedRecord | null {
     typeof raw.sealedAt !== 'string' ||
     typeof raw.lastLinkedAt !== 'string' ||
     typeof raw.inventorySha256 !== 'string' ||
+    typeof raw.contentSha256 !== 'string' ||
     !Array.isArray(raw.inventory)
   ) {
     return null;
@@ -509,6 +565,8 @@ export interface DependencyCachePass {
   /** Farm decisions verify each entry at most once per pass; link, convert and GC re-verify. */
   readonly verified: Map<string, VerifyResult>;
   readonly quarantinedThisPass: Set<string>;
+  /** Report passes only: entries this pass would have sealed, by entry dir. */
+  readonly wouldSeal: Map<string, WouldSealEntry>;
   /** Adopts plus converts started this pass, against DEPENDENCY_CACHE_MAX_MUTATIONS_PER_PASS. */
   mutations: number;
 }
@@ -556,6 +614,7 @@ export function startDependencyCachePass(options: {
     decisions: [],
     verified: new Map(),
     quarantinedThisPass: new Set(),
+    wouldSeal: new Map(),
     mutations: 0,
   };
 }
@@ -663,14 +722,50 @@ function warnNoEntry(pass: DependencyCachePass, workgroupId: string, key: string
   });
 }
 
-/** "Already a farm": the hidden lockfile — the one file every complete tree has — is the entry's inode. */
-function sharesHiddenLockfile(nodeModulesDir: string, entryDir: string): boolean {
-  const mine = lstatOrNull(path.join(nodeModulesDir, HIDDEN_LOCKFILE));
-  const theirs = lstatOrNull(path.join(entryDir, NODE_MODULES, HIDDEN_LOCKFILE));
+/**
+ * The file farm detection samples: the first regular file in the entry's
+ * inventory other than the hidden lockfile, which every tree holds as its own
+ * copy. With no readable SEALED (a quarantined entry can lack one), the first
+ * such file a short walk finds.
+ */
+function sampleSharedFile(entryDir: string, sealed: SealedRecord | null): string | null {
+  const record = sealed ?? readSealed(entryDir);
+  if (record) return record.inventory.find(([rel, type]) => type === 'f' && rel !== HIDDEN_LOCKFILE)?.[0] ?? null;
+  const root = path.join(entryDir, NODE_MODULES);
+  const stack = [''];
+  while (stack.length > 0) {
+    const rel = stack.pop()!;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(path.join(root, rel), { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const childRel = rel ? `${rel}/${entry.name}` : entry.name;
+      if (entry.isFile() && childRel !== HIDDEN_LOCKFILE) return childRel;
+      if (entry.isDirectory()) stack.push(childRel);
+    }
+  }
+  return null;
+}
+
+/** "Already a farm": the sampled file is the entry's own inode. */
+function sharesEntryInodes(nodeModulesDir: string, entryDir: string, sealed: SealedRecord | null): boolean {
+  const rel = sampleSharedFile(entryDir, sealed);
+  if (!rel) return false;
+  const mine = lstatOrNull(path.join(nodeModulesDir, rel));
+  const theirs = lstatOrNull(path.join(entryDir, NODE_MODULES, rel));
   return Boolean(mine && theirs && mine.isFile() && mine.dev === theirs.dev && mine.ino === theirs.ino);
 }
 
-function hasTempNames(pkgDir: string): boolean {
+/**
+ * True while a package dir holds a convert/link temp name. An operation is
+ * pending there: `.node_modules.nanoclaw-old` can hold private bytes, and the
+ * `node_modules` beside it can hold private entries already moved out of it.
+ * The regenerable sweep never deletes that `node_modules`, in any flag mode.
+ */
+export function hasPendingConversion(pkgDir: string): boolean {
   return DEPENDENCY_CACHE_TEMP_NAMES.some((name) => lstatOrNull(path.join(pkgDir, name)) !== null);
 }
 
@@ -707,11 +802,16 @@ function withPackageDirTimesPreserved<T>(pkgDir: string, fn: () => T): T {
 }
 
 /**
- * `cp -al` semantics: recreate the directory structure, hardlink every regular
- * file, recreate every symlink as a symlink (never followed), and skip private
- * root dot entries. `dst` must not exist. On any failure the partial `dst` —
- * links and our own dirs only — is removed and the error rethrown, so EPERM or
- * EXDEV leaves the source exactly as it was.
+ * `cp -al` semantics with one exception: recreate the directory structure,
+ * hardlink every regular file, recreate every symlink as a symlink (never
+ * followed), and skip private root dot entries. The root hidden lockfile is
+ * COPIED instead (owner-writable, mtime preserved): npm rewrites it on every
+ * run (@npmcli/arborist lib/arborist/reify.js:254 → lib/shrinkwrap.js:1164),
+ * so a shared read-only inode would be unlinked by the next run and a shared
+ * writable one would carry one workspace's edit into every other. `dst` must
+ * not exist. On any failure the partial `dst` — links, that copy and our own
+ * dirs only — is removed and the error rethrown, so EPERM or EXDEV leaves the
+ * source exactly as it was.
  */
 function linkTree(src: string, dst: string): void {
   fs.mkdirSync(dst);
@@ -727,6 +827,11 @@ function linkTree(src: string, dst: string): void {
         if (st.isDirectory()) {
           fs.mkdirSync(target, { mode: (st.mode & 0o7777) | 0o700 });
           stack.push([source, target, false]);
+        } else if (st.isFile() && atRoot && name === HIDDEN_LOCKFILE) {
+          fs.copyFileSync(source, target, fs.constants.COPYFILE_EXCL);
+          fs.chmodSync(target, (st.mode & 0o7777) | 0o200);
+          // Completeness rule (3) compares file mtimes with this one.
+          fs.utimesSync(target, st.atimeMs / 1000, st.mtimeMs / 1000);
         } else if (st.isFile()) {
           fs.linkSync(source, target);
         } else if (st.isSymbolicLink()) {
@@ -853,37 +958,48 @@ function preparePackage(
 }
 
 /**
- * Claim one of the pass's adopt/convert slots. Past the cap the tree is
- * deferred: left exactly as it is, and the existing sweep rule applies to it.
- * A report pass counts its decisions the same way, so it predicts apply.
+ * True once the pass has used its adopt/convert slots: the tree is deferred,
+ * left exactly as it is, and the existing sweep rule applies to it. A caller
+ * that goes on to mutate takes its slot with `pass.mutations += 1`. A report
+ * pass counts its decisions the same way, so it predicts apply.
  */
-function takeMutation(pass: DependencyCachePass, pkg: PreparedPackage): boolean {
-  if (pass.mutations >= DEPENDENCY_CACHE_MAX_MUTATIONS_PER_PASS) {
-    pass.counters.deferred += 1;
-    decide(pass, 'deferred', pkg.pkgDir, {
-      key: pkg.key,
-      detail: `per-pass cap of ${DEPENDENCY_CACHE_MAX_MUTATIONS_PER_PASS} reached`,
-    });
-    return false;
-  }
-  pass.mutations += 1;
+function deferIfCapped(pass: DependencyCachePass, pkg: PreparedPackage): boolean {
+  if (pass.mutations < DEPENDENCY_CACHE_MAX_MUTATIONS_PER_PASS) return false;
+  pass.counters.deferred += 1;
+  decide(pass, 'deferred', pkg.pkgDir, {
+    key: pkg.key,
+    detail: `per-pass cap of ${DEPENDENCY_CACHE_MAX_MUTATIONS_PER_PASS} reached`,
+  });
   return true;
 }
 
 /**
  * Adopt (§5.7.4): link the tree into `<key>.tmp/node_modules` (private dot
- * entries skipped), `chmod a-w` every regular file, write SEALED, rename to
- * `<key>`. The source keeps every byte; its files become the entry's inodes,
- * so it is the entry's first farm.
+ * entries skipped, the hidden lockfile copied), `chmod a-w` every regular
+ * file, write SEALED with the inventory and content manifest, rename to
+ * `<key>`. The source keeps every byte and its own writable hidden lockfile;
+ * its other files become the entry's inodes, so it is the entry's first farm.
+ * A report pass records what it would seal, so a later tree with the same key
+ * reports the convert it would get rather than a second adopt.
  */
 function adopt(
   pass: DependencyCachePass,
   pkg: PreparedPackage,
   completeness: { walk: TreeWalk; inventory: Inventory },
 ): PackageOutcome {
-  if (!takeMutation(pass, pkg)) return 'deferred';
+  if (deferIfCapped(pass, pkg)) return 'deferred';
+  pass.mutations += 1;
   decide(pass, 'adopt', pkg.pkgDir, { key: pkg.key });
   if (pass.mode === 'report') {
+    const contentSha256 = contentManifestSha256(pkg.nodeModulesDir, completeness.walk);
+    if (contentSha256) {
+      pass.wouldSeal.set(pkg.entryDir, {
+        source: pkg.pkgDir,
+        inventory: completeness.inventory.items,
+        inventorySha256: completeness.inventory.sha256,
+        contentSha256,
+      });
+    }
     pass.counters.adopted += 1;
     return 'adopted';
   }
@@ -921,6 +1037,9 @@ function adopt(
     if (!linked || inventory?.sha256 !== completeness.inventory.sha256) {
       throw new Error('tree changed between the completeness check and the link');
     }
+    // The one read of every byte: what convert will require of a private tree.
+    const contentSha256 = contentManifestSha256(tmpNm, linked);
+    if (!contentSha256) throw new Error('entry content unreadable');
     for (const file of linked.files) {
       if (file.type === 'f') fs.chmodSync(path.join(tmpNm, file.rel), file.stat.mode & 0o7555);
     }
@@ -934,6 +1053,7 @@ function adopt(
       lastLinkedAt: sealedAt,
       inventorySha256: inventory.sha256,
       inventory: inventory.items,
+      contentSha256,
     };
     fs.writeFileSync(path.join(tmpDir, SEALED_FILE), JSON.stringify(sealed));
     fs.chmodSync(path.join(tmpDir, SEALED_FILE), 0o444);
@@ -949,38 +1069,52 @@ function adopt(
   return 'adopted';
 }
 
+function convertMismatch(pass: DependencyCachePass, pkg: PreparedPackage, firstDifference: string): PackageOutcome {
+  pass.counters.convertMismatch += 1;
+  decide(pass, 'convert-mismatch', pkg.pkgDir, { key: pkg.key, detail: firstDifference });
+  log.warn('dependency-cache: convert mismatch', {
+    mode: pass.mode,
+    path: pkg.pkgDir,
+    key: pkg.key,
+    firstDifference,
+  });
+  return 'convert-mismatch';
+}
+
 /**
  * Convert (§5.7.4, M3), after the entry was verified and the private tree
- * proven complete. Order is load-bearing: `.new` only ever holds farm links,
- * and private bytes move only after `.new` is in place, so every interruption
- * point is finished or reversed by `recoverPackageDir`.
+ * proven complete. Convert deletes the private bytes, so it requires the tree
+ * to equal the entry in inventory AND content; anything else keeps it private.
+ * Order is load-bearing: `.new` only ever holds farm links, and private bytes
+ * move only after `.new` is in place, so every interruption point is finished
+ * or reversed by `recoverPackageDir`. `sealed` is null only for a report
+ * pass's would-be entry, which never reaches the mutating half.
  */
 function convertVerified(
   pass: DependencyCachePass,
   pkg: PreparedPackage,
-  sealed: SealedRecord,
-  inventory: Inventory,
+  identity: EntryIdentity,
+  sealed: SealedRecord | null,
+  completeness: { walk: TreeWalk; inventory: Inventory },
   hooks: ConvertHooks = {},
 ): PackageOutcome {
-  if (inventory.sha256 !== sealed.inventorySha256) {
-    const firstDifference = firstInventoryDifference(sealed.inventory, inventory.items);
-    pass.counters.convertMismatch += 1;
-    decide(pass, 'convert-mismatch', pkg.pkgDir, { key: pkg.key, detail: firstDifference });
-    log.warn('dependency-cache: convert mismatch', {
-      mode: pass.mode,
-      path: pkg.pkgDir,
-      key: pkg.key,
-      firstDifference,
-    });
-    return 'convert-mismatch';
+  const { inventory } = completeness;
+  if (inventory.sha256 !== identity.inventorySha256) {
+    return convertMismatch(pass, pkg, firstInventoryDifference(identity.inventory, inventory.items));
   }
-  if (!takeMutation(pass, pkg)) return 'deferred';
+  if (pass.mode === 'apply' && !sealed) return 'failed';
+  // Checked before the content read, so a deferred tree costs no I/O.
+  if (deferIfCapped(pass, pkg)) return 'deferred';
+  if (contentManifestSha256(pkg.nodeModulesDir, completeness.walk) !== identity.contentSha256) {
+    return convertMismatch(pass, pkg, 'content differs (file bytes, symlink target or exec bits)');
+  }
+  pass.mutations += 1;
   decide(pass, 'convert', pkg.pkgDir, { key: pkg.key, estimatedBytes: convertReclaimBytes(pass, pkg.nodeModulesDir) });
-  if (pass.mode === 'report') {
+  if (pass.mode === 'report' || !sealed) {
     pass.counters.converted += 1;
     return 'converted';
   }
-  if (hasTempNames(pkg.pkgDir)) {
+  if (hasPendingConversion(pkg.pkgDir)) {
     log.warn('dependency-cache: convert skipped, an interrupted operation is still pending', { path: pkg.pkgDir });
     return 'failed';
   }
@@ -1043,36 +1177,43 @@ export function convertPackageDir(
     quarantineEntry(pass, pkg.entryDir, verified);
     return 'quarantined';
   }
-  if (sharesHiddenLockfile(pkg.nodeModulesDir, pkg.entryDir)) return 'farm';
+  if (sharesEntryInodes(pkg.nodeModulesDir, pkg.entryDir, verified.sealed)) return 'farm';
   const completeness = checkCompleteness(pkgDir);
   if (!completeness.complete) {
     decide(pass, 'incomplete', pkgDir, { key: pkg.key, detail: completeness.reason });
     return 'incomplete';
   }
-  return convertVerified(pass, pkg, verified.sealed, completeness.inventory, hooks);
+  return convertVerified(pass, pkg, verified.sealed, verified.sealed, completeness, hooks);
 }
 
 /**
  * The sweep's per-package decision: an eligible tree that is not already a
  * farm is converted when its key has a verified entry, and adopted when it has
  * none. A tree sharing inodes with a quarantined entry is left private (the
- * existing 2-day rule then applies to it); it is never re-sealed.
+ * existing 2-day rule then applies to it); it is never re-sealed. In a report
+ * pass, an entry the pass would have sealed counts as existing, so a cold
+ * cache reports one adopt and a convert (with its bytes) for the rest.
  */
 export function processPackageDir(pass: DependencyCachePass, workgroupId: string, pkgDir: string): PackageOutcome {
   const pkg = preparePackage(pass, workgroupId, pkgDir);
   if (typeof pkg === 'string') return pkg;
   if (!isRealDir(pkg.nodeModulesDir)) return 'no-tree';
-  if (hasTempNames(pkgDir)) return 'failed';
+  if (hasPendingConversion(pkgDir)) return 'failed';
 
-  if (isRealDir(pkg.entryDir)) {
+  const entryExists = isRealDir(pkg.entryDir);
+  const wouldBe = entryExists ? undefined : pass.wouldSeal.get(pkg.entryDir);
+  if (entryExists) {
     const verified = verifyOnce(pass, pkg.entryDir);
     if (!verified.ok) {
       quarantineEntry(pass, pkg.entryDir, verified);
       return 'quarantined';
     }
-    if (sharesHiddenLockfile(pkg.nodeModulesDir, pkg.entryDir)) return 'farm';
+    if (sharesEntryInodes(pkg.nodeModulesDir, pkg.entryDir, verified.sealed)) return 'farm';
+  } else if (wouldBe?.source === pkgDir) {
+    // The would-be entry's source: adopt would have made it the first farm.
+    return 'farm';
   } else if (
-    quarantinedDirsFor(pass, workgroupId, pkg.key).some((dir) => sharesHiddenLockfile(pkg.nodeModulesDir, dir))
+    quarantinedDirsFor(pass, workgroupId, pkg.key).some((dir) => sharesEntryInodes(pkg.nodeModulesDir, dir, null))
   ) {
     return 'quarantined';
   }
@@ -1082,14 +1223,19 @@ export function processPackageDir(pass: DependencyCachePass, workgroupId: string
     decide(pass, 'incomplete', pkgDir, { key: pkg.key, detail: completeness.reason });
     return 'incomplete';
   }
-  if (isRealDir(pkg.entryDir)) {
+  if (!completeness.inventory.items.some(([rel, type]) => type === 'f' && rel !== HIDDEN_LOCKFILE)) {
+    // Nothing a farm could share: every tree keeps its own hidden lockfile.
+    return 'ineligible';
+  }
+  if (entryExists) {
     const verified = verifyFresh(pass, pkg.entryDir);
     if (!verified.ok) {
       quarantineEntry(pass, pkg.entryDir, verified);
       return 'quarantined';
     }
-    return convertVerified(pass, pkg, verified.sealed, completeness.inventory);
+    return convertVerified(pass, pkg, verified.sealed, verified.sealed, completeness);
   }
+  if (wouldBe) return convertVerified(pass, pkg, wouldBe, null, completeness);
   return adopt(pass, pkg, completeness);
 }
 
@@ -1101,7 +1247,7 @@ export function linkPackageDir(pass: DependencyCachePass, workgroupId: string, p
   const pkg = preparePackage(pass, workgroupId, pkgDir);
   if (typeof pkg === 'string') return pkg;
   if (lstatOrNull(pkg.nodeModulesDir)) return 'exists';
-  if (hasTempNames(pkgDir)) {
+  if (hasPendingConversion(pkgDir)) {
     log.warn('dependency-cache: link skipped, an interrupted operation is still pending', { path: pkgDir });
     return 'failed';
   }
@@ -1232,7 +1378,8 @@ export function recoverPackageDir(pass: DependencyCachePass, workgroupId: string
 export function isFarmPackageDir(pass: DependencyCachePass, workgroupId: string, pkgDir: string): boolean {
   const pkg = preparePackage(pass, workgroupId, pkgDir);
   if (typeof pkg === 'string' || !isRealDir(pkg.entryDir)) return false;
-  return verifyOnce(pass, pkg.entryDir).ok && sharesHiddenLockfile(pkg.nodeModulesDir, pkg.entryDir);
+  const verified = verifyOnce(pass, pkg.entryDir);
+  return verified.ok && sharesEntryInodes(pkg.nodeModulesDir, pkg.entryDir, verified.sealed);
 }
 
 function deleteCacheDir(pass: DependencyCachePass, dir: string, detail: string): void {

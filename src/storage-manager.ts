@@ -27,6 +27,7 @@ import {
   DEPENDENCY_CACHE_DIRNAME,
   DEPENDENCY_CACHE_TEMP_NAMES,
   finishDependencyCachePass,
+  hasPendingConversion,
   isEligiblePackageDir,
   isFarmPackageDir,
   processPackageDir,
@@ -2463,6 +2464,11 @@ function collectTopicRegenerableActions(args: {
         // nothing another workspace still holds, and deleting it only loses
         // the dedupe. A farm of a quarantined entry is not in this set.
         if (keptByCache.has(target)) continue;
+        // A package dir mid-conversion (recovery blocked, failed, or not run
+        // in this flag mode) can hold private entries in the node_modules
+        // beside its temp name. Never collected, in any flag mode; the apply
+        // path re-checks under the claim.
+        if (hasPendingConversion(path.dirname(target))) continue;
         const refusal = sweepEligibility({
           now: args.now,
           idleMs: args.policy.regenerableSweepMs,
@@ -2496,8 +2502,11 @@ function collectTopicRegenerableActions(args: {
             // claim, so it composes with the claim's own lease check to cover
             // both NanoClaw and external containers. Everything else the scan
             // decided is held by the recorded-reproducer gate: losing those
-            // races costs a reinstall, not work.
-            canApply: () => topicIsUnmounted(topicDir, args.runningMounts),
+            // races costs a reinstall, not work. A conversion that became
+            // pending since collection is the other exception: that can be
+            // private work, so it is re-proven here too.
+            canApply: () =>
+              topicIsUnmounted(topicDir, args.runningMounts) && !hasPendingConversion(path.dirname(target)),
             safety:
               'Dependency-install tree under an idle topic worktree with a recorded manifest beside it, re-proven unmounted by the container runtime immediately before deletion.',
           }),

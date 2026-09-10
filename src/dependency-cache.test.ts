@@ -318,7 +318,15 @@ function expectFarmOf(pkgDir: string, entryDir: string): void {
   const files = regularFiles(nm);
   expect(files).toEqual(regularFiles(entryNm));
   for (const rel of files) {
-    expect(fs.lstatSync(path.join(nm, rel)).ino, rel).toBe(fs.lstatSync(path.join(entryNm, rel)).ino);
+    const mine = fs.lstatSync(path.join(nm, rel));
+    const theirs = fs.lstatSync(path.join(entryNm, rel));
+    if (rel === '.package-lock.json') {
+      // Every tree owns its hidden lockfile, because npm rewrites it.
+      expect(mine.ino, rel).not.toBe(theirs.ino);
+      expect(fs.readFileSync(path.join(nm, rel), 'utf8')).toBe(fs.readFileSync(path.join(entryNm, rel), 'utf8'));
+    } else {
+      expect(mine.ino, rel).toBe(theirs.ino);
+    }
   }
 }
 
@@ -377,17 +385,29 @@ describe('dependency cache', () => {
     expect(regularFiles(entryNm)).toEqual(files);
     for (const rel of files) {
       const entryStat = fs.lstatSync(path.join(entryNm, rel));
-      expect(entryStat.ino, rel).toBe(fs.lstatSync(path.join(srcNm, rel)).ino);
+      const srcStat = fs.lstatSync(path.join(srcNm, rel));
       expect(entryStat.mode & 0o222, rel).toBe(0);
+      if (rel === '.package-lock.json') {
+        // Copied, not linked: the source keeps its own writable hidden lockfile,
+        // and the entry's copy keeps its mtime for completeness rule (3).
+        expect(entryStat.ino).not.toBe(srcStat.ino);
+        expect(srcStat.mode & 0o200).toBe(0o200);
+        expect(fs.readFileSync(path.join(entryNm, rel), 'utf8')).toBe(fs.readFileSync(path.join(srcNm, rel), 'utf8'));
+        expect(Math.abs(entryStat.mtimeMs - srcStat.mtimeMs)).toBeLessThan(1);
+      } else {
+        expect(entryStat.ino, rel).toBe(srcStat.ino);
+      }
     }
     expect(fs.lstatSync(path.join(entryNm, '.bin', 'left-pad')).isSymbolicLink()).toBe(true);
 
     const sealed = JSON.parse(fs.readFileSync(path.join(entry, 'SEALED'), 'utf8')) as {
       inventory: unknown;
       inventorySha256: string;
+      contentSha256: string;
       source: string;
       sealedAt: string;
     };
+    expect(sealed.contentSha256).toMatch(/^[0-9a-f]{64}$/);
     const inventory = inventoryOf(srcNm)!;
     expect(sealed.inventory).toEqual(inventory.items);
     expect(sealed.inventorySha256).toBe(inventory.sha256);
@@ -866,6 +886,63 @@ describe('dependency cache', () => {
     }
   });
 
+  it('conversion keeps a private tree whose file contents or symlink targets differ at equal size', () => {
+    const src = makeProject(path.join(tmpRoot, 'topic-a', 'repo'));
+    const pass = startPass();
+    expect(processPackageDir(pass, 'wg-a', src)).toBe('adopted');
+
+    // Same size, different bytes.
+    const bytes = makeProject(path.join(tmpRoot, 'topic-b', 'repo'));
+    const edited = path.join(bytes, 'node_modules', 'left-pad', 'index.js');
+    fs.writeFileSync(edited, 'X'.repeat(fs.statSync(edited).size));
+    fs.utimesSync(edited, FILE_STAMP_S, FILE_STAMP_S);
+    // Same-length symlink target, pointing somewhere else.
+    const link = makeProject(path.join(tmpRoot, 'topic-c', 'repo'));
+    const bin = path.join(link, 'node_modules', '.bin', 'left-pad');
+    const original = fs.readlinkSync(bin);
+    const moved = original.replace('index.js', 'indey.js');
+    expect(moved).toHaveLength(original.length);
+    fs.unlinkSync(bin);
+    fs.symlinkSync(moved, bin);
+    // Same bytes, different exec bits.
+    const exec = makeProject(path.join(tmpRoot, 'topic-d', 'repo'));
+    fs.chmodSync(path.join(exec, 'node_modules', 'nest', 'index.js'), 0o755);
+
+    for (const dir of [bytes, link, exec]) {
+      const before = snapshotTree(path.join(dir, 'node_modules'));
+      expect(convertPackageDir(pass, 'wg-a', dir), dir).toBe('convert-mismatch');
+      expect(snapshotTree(path.join(dir, 'node_modules')), dir).toEqual(before);
+      expect(tempNamesUnder(dir), dir).toEqual([]);
+    }
+    expect(pass.counters.convertMismatch).toBe(3);
+    expect(pass.counters.converted).toBe(0);
+  });
+
+  it('an npm-style rewrite of the hidden lockfile keeps a farm a farm and leaves the entry untouched', () => {
+    const src = makeProject(path.join(tmpRoot, 'topic-a', 'repo'));
+    const farm = makeProject(path.join(tmpRoot, 'topic-b', 'repo'));
+    const pass = startPass();
+    expect(processPackageDir(pass, 'wg-a', src)).toBe('adopted');
+    expect(processPackageDir(pass, 'wg-a', farm)).toBe('converted');
+    const entryHidden = path.join(cacheRoot, 'wg-a', keyOf(src), 'node_modules', '.package-lock.json');
+    const entryIno = fs.lstatSync(entryHidden).ino;
+    const entryBytes = fs.readFileSync(entryHidden, 'utf8');
+    const farmHidden = path.join(farm, 'node_modules', '.package-lock.json');
+
+    // The farm owns its copy, so an in-place write works; npm also replaces it.
+    fs.appendFileSync(farmHidden, '\n');
+    fs.unlinkSync(farmHidden);
+    fs.writeFileSync(farmHidden, JSON.stringify({ name: 'app', version: '1.0.0', lockfileVersion: 3, packages: {} }));
+    // The adopt source kept its own writable copy too.
+    fs.appendFileSync(path.join(src, 'node_modules', '.package-lock.json'), '\n');
+
+    expect(processPackageDir(startPass(), 'wg-a', farm)).toBe('farm');
+    expect(processPackageDir(startPass(), 'wg-a', src)).toBe('farm');
+    expect(fs.lstatSync(entryHidden).ino).toBe(entryIno);
+    expect(fs.readFileSync(entryHidden, 'utf8')).toBe(entryBytes);
+    expect(verifyEntry(path.dirname(path.dirname(entryHidden))).ok).toBe(true);
+  });
+
   it('reads NODE_VERSION from the agent image once per process and fails closed without it', () => {
     mockExecFileSync.mockImplementation(() => 'PATH=/usr/local/bin\nNODE_VERSION=22.23.2\nYARN_VERSION=1.22.22\n');
     expect(agentImageFingerprint('agent:latest')).toBe(envFingerprint('22.23.2'));
@@ -970,6 +1047,33 @@ describe('dependency cache inside the regenerable sweep', () => {
     fs.utimesSync(worktreeRoot, stamp, stamp);
     return repoDir;
   }
+
+  it('a cold-cache report predicts one adopt and converts the rest with estimated bytes', () => {
+    process.env.NANOCLAW_DEPENDENCY_CACHE = 'report';
+    // Fresh topics: flag `report` keeps today's 2-day delete, and these are inside its window.
+    makeTopic('thread-77777777777777777777777777777777', (repo) => makeProject(repo), 0);
+    makeTopic('thread-88888888888888888888888888888888', (repo) => makeProject(repo), 0);
+    const before = snapshotTree(topicsRoot);
+
+    const report = getStorageReport({
+      mode: 'apply',
+      now: Date.now(),
+      sessionsRoot,
+      threadsRoot: path.join(dataRoot, 'no-threads'),
+      topicsRoot,
+      runningContainerMounts: () => [],
+      includeDocker: false,
+      policy: { filesystemPath: tmpRoot },
+    });
+
+    expect(report.dependencyCache?.mode).toBe('report');
+    expect(report.dependencyCache?.counters).toEqual(expect.objectContaining({ adopted: 1, converted: 1 }));
+    const decisions = report.dependencyCache?.decisions ?? [];
+    expect(decisions.map((decision) => decision.op).sort()).toEqual(['adopt', 'convert']);
+    expect(decisions.find((decision) => decision.op === 'convert')?.estimatedBytes).toBeGreaterThan(0);
+    expect(snapshotTree(topicsRoot)).toEqual(before);
+    expect(fs.existsSync(path.join(dataRoot, 'dependency-cache'))).toBe(false);
+  });
 
   it('off still recovers interrupted conversions and garbage-collects unlinked entries', () => {
     // Unset IS `off`, the production default.

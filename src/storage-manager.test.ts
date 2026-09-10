@@ -47,7 +47,7 @@ import {
   type StorageReport,
 } from './storage-manager.js';
 import { acquireStorageActivityLease, tryRunWithStorageCleanupClaim } from './storage-activity.js';
-import { _resetDependencyCacheForTesting, dependencyKey, envFingerprint } from './dependency-cache.js';
+import { _resetDependencyCacheForTesting, dependencyKey, envFingerprint, FARM_OLD_NAME } from './dependency-cache.js';
 import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, CONTAINER_INSTALL_LABEL } from './config.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { resolveRepositoryWorkUnit } from './repository-workspaces.js';
@@ -3190,13 +3190,13 @@ describe('storage-manager regenerable tree sweep', () => {
    * only shape the dependency cache will share. `makeTopic`'s tree is eligible
    * but incomplete, so it could never prove anything about adopt or convert.
    */
-  function makeNpmTopic(name: string): { topicDir: string; repoDir: string } {
+  function makeNpmTopic(name: string, leftPadVersion = '1.3.0'): { topicDir: string; repoDir: string } {
     const topicDir = path.join(topicsRoot, 'wg-acme', name);
     const repoDir = path.join(topicDir, 'worktrees', 'XZO-BACKEND');
     const packages: Record<string, { version: string; resolved: string; integrity: string }> = {
       'node_modules/left-pad': {
-        version: '1.3.0',
-        resolved: 'https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz',
+        version: leftPadVersion,
+        resolved: `https://registry.npmjs.org/left-pad/-/left-pad-${leftPadVersion}.tgz`,
         integrity: 'sha512-left',
       },
       'node_modules/@scope/util': {
@@ -3301,6 +3301,25 @@ describe('storage-manager regenerable tree sweep', () => {
       expect.objectContaining({ adopted: 1, converted: 0, privateInMountedTopics: 1 }),
     );
     expect(report?.dependencyCache?.counters.privateInMountedTopicsBytes).toBeGreaterThan(0);
+
+    // Clean when the pass scans, mounted by the time the claim is held: only
+    // the runtime re-check under the claim can see it.
+    fs.rmSync(path.join(topicsRoot, 'wg-acme'), { recursive: true, force: true });
+    const lateMounted = makeNpmTopic('thread-a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5', '1.3.1');
+    const lateControl = makeNpmTopic('thread-a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6', '1.3.1');
+    const lateBefore = treeState(lateMounted.repoDir);
+    const lateWorktrees = path.join(lateMounted.topicDir, 'worktrees');
+    let lookups = 0;
+
+    const lateReport = sweep({ mounts: () => (lookups++ === 0 ? [] : [lateWorktrees]) });
+
+    expect(treeState(lateMounted.repoDir)).toEqual(lateBefore);
+    const lateKey = dependencyKey(lateControl.repoDir, envFingerprint('22.23.2'))!.key;
+    const lateEntryNm = path.join(dataRoot, 'dependency-cache', 'wg-acme', lateKey, 'node_modules');
+    expect(fs.lstatSync(path.join(lateEntryNm, 'left-pad', 'index.js')).ino).toBe(
+      fs.lstatSync(path.join(lateControl.repoDir, 'node_modules', 'left-pad', 'index.js')).ino,
+    );
+    expect(lateReport.dependencyCache?.counters).toEqual(expect.objectContaining({ adopted: 1, converted: 0 }));
   });
 
   it('exempts a farm from the 2-day delete and sweeps the farm of a quarantined entry', () => {
@@ -3331,6 +3350,57 @@ describe('storage-manager regenerable tree sweep', () => {
     ]);
     expect(fs.existsSync(path.join(repoDir, 'node_modules'))).toBe(false);
     expect(fs.readFileSync(path.join(repoDir, 'src', 'app.ts'), 'utf8')).toBe('the actual work');
+  });
+
+  it('the 2-day delete never removes node_modules beside a pending conversion, in any flag mode', () => {
+    for (const [index, flag] of (['apply', 'off', 'report'] as const).entries()) {
+      enableDependencyCache();
+      process.env[cacheFlag] = flag;
+      const { topicDir, repoDir } = makeNpmTopic(`thread-${'c'.repeat(31)}${index}`);
+      const nm = path.join(repoDir, 'node_modules');
+      const oldDir = path.join(repoDir, FARM_OLD_NAME);
+      // A convert stopped mid-step 4: `.old` still holds a private entry, the
+      // node_modules beside it already holds one moved out of it, and recovery
+      // is blocked because the names collide.
+      fs.mkdirSync(path.join(oldDir, '.vite'), { recursive: true });
+      fs.writeFileSync(path.join(oldDir, '.vite', 'sentinel'), `old-private-${flag}`);
+      fs.mkdirSync(path.join(nm, '.vite'), { recursive: true });
+      fs.writeFileSync(path.join(nm, '.vite', 'moved'), `moved-private-${flag}`);
+      ageTopic(topicDir);
+
+      const report = sweep();
+
+      expect(fs.readFileSync(path.join(oldDir, '.vite', 'sentinel'), 'utf8'), flag).toBe(`old-private-${flag}`);
+      expect(fs.readFileSync(path.join(nm, '.vite', 'moved'), 'utf8'), flag).toBe(`moved-private-${flag}`);
+      expect(fs.existsSync(path.join(nm, 'left-pad', 'index.js')), flag).toBe(true);
+      expect(
+        report.actions.filter((action) => action.path === nm),
+        flag,
+      ).toEqual([]);
+    }
+    expect(log.warn).toHaveBeenCalledWith(
+      'dependency-cache: private entry name already in node_modules, keeping the old tree',
+      expect.objectContaining({ name: '.vite' }),
+    );
+
+    // The apply-time re-check: a conversion that becomes pending only after
+    // the scan collected the delete.
+    fs.rmSync(path.join(topicsRoot, 'wg-acme'), { recursive: true, force: true });
+    process.env[cacheFlag] = 'off';
+    const { repoDir: lateRepo } = makeNpmTopic(`thread-${'d'.repeat(32)}`);
+    let lookups = 0;
+
+    const late = sweep({
+      mounts: () => {
+        if (lookups++ === 1) fs.mkdirSync(path.join(lateRepo, FARM_OLD_NAME));
+        return [];
+      },
+    });
+
+    expect(late.actions.filter((action) => action.path === path.join(lateRepo, 'node_modules'))).toEqual([
+      expect.objectContaining({ status: 'skipped' }),
+    ]);
+    expect(fs.existsSync(path.join(lateRepo, 'node_modules', 'left-pad', 'index.js'))).toBe(true);
   });
 
   it('reclaimable bytes exclude files hardlinked elsewhere', () => {
