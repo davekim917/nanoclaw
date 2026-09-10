@@ -36,6 +36,7 @@ import {
   agentImageFingerprint,
   collectCacheGarbage,
   convertPackageDir,
+  DEPENDENCY_CACHE_MAX_MUTATIONS_PER_PASS,
   dependencyKey,
   envFingerprint,
   FARM_NEW_NAME,
@@ -131,7 +132,14 @@ function lockEntries(pkgs: PkgSpec[]): Record<string, { version: string; resolve
 
 function writeManifests(
   pkgDir: string,
-  options: { pkgs?: PkgSpec[]; lockfileVersion?: number; pkgJson?: Record<string, unknown>; npmrc?: string } = {},
+  options: {
+    pkgs?: PkgSpec[];
+    lockfileVersion?: number;
+    pkgJson?: Record<string, unknown>;
+    npmrc?: string;
+    /** package-lock entries that are NOT installed (so absent from the hidden lockfile). */
+    extraLock?: Record<string, Record<string, unknown>>;
+  } = {},
 ): void {
   const pkgs = options.pkgs ?? PKGS;
   fs.mkdirSync(pkgDir, { recursive: true });
@@ -145,7 +153,7 @@ function writeManifests(
     version: '1.0.0',
     lockfileVersion: options.lockfileVersion ?? 3,
     requires: true,
-    packages: { '': { name: 'app', version: '1.0.0', dependencies }, ...lockEntries(pkgs) },
+    packages: { '': { name: 'app', version: '1.0.0', dependencies }, ...lockEntries(pkgs), ...options.extraLock },
   };
   fs.writeFileSync(path.join(pkgDir, 'package-lock.json'), JSON.stringify(lock, null, 2) + '\n');
   if (options.npmrc !== undefined) fs.writeFileSync(path.join(pkgDir, '.npmrc'), options.npmrc);
@@ -191,10 +199,44 @@ function installTree(pkgDir: string, options: { pkgs?: PkgSpec[]; privateDirs?: 
   }
 }
 
-function makeProject(pkgDir: string, options: { pkgs?: PkgSpec[]; privateDirs?: boolean } = {}): string {
-  writeManifests(pkgDir, { pkgs: options.pkgs });
+function makeProject(
+  pkgDir: string,
+  options: { pkgs?: PkgSpec[]; privateDirs?: boolean; extraLock?: Record<string, Record<string, unknown>> } = {},
+): string {
+  writeManifests(pkgDir, { pkgs: options.pkgs, extraLock: options.extraLock });
   installTree(pkgDir, options);
   return pkgDir;
+}
+
+/** An optional package-lock entry with the given os/cpu/libc constraints. */
+function optionalEntry(constraints: Record<string, string[]>): Record<string, unknown> {
+  return {
+    version: '0.25.0',
+    resolved: 'https://registry.npmjs.org/optional-native/-/optional-native-0.25.0.tgz',
+    integrity: 'sha512-optional',
+    optional: true,
+    ...constraints,
+  };
+}
+
+/** Make an entry look sealed `sealedDaysAgo` days ago, with every file older still. */
+function backdateEntry(entryDir: string, sealedDaysAgo: number): void {
+  const sealedAtMs = Date.now() - sealedDaysAgo * DAY_MS;
+  const fileStamp = (sealedAtMs - DAY_MS) / 1000;
+  const walk = (dir: string): void => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.isSymbolicLink()) fs.lutimesSync(full, fileStamp, fileStamp);
+      else fs.utimesSync(full, fileStamp, fileStamp);
+    }
+  };
+  walk(path.join(entryDir, 'node_modules'));
+  const sealedPath = path.join(entryDir, 'SEALED');
+  const sealed = JSON.parse(fs.readFileSync(sealedPath, 'utf8')) as Record<string, unknown>;
+  const iso = new Date(sealedAtMs).toISOString();
+  fs.unlinkSync(sealedPath);
+  fs.writeFileSync(sealedPath, JSON.stringify({ ...sealed, sealedAt: iso, lastLinkedAt: iso }));
 }
 
 function isPrivateRootName(rel: string): boolean {
@@ -387,10 +429,23 @@ describe('dependency cache', () => {
     delete partial.packages['node_modules/nest'];
     fs.writeFileSync(omittedPath, JSON.stringify(partial, null, 2) + '\n');
 
+    // A package-lock entry that is NOT optional and never reached the hidden
+    // lockfile: npm had to install it, so the tree is short of it.
+    const nonOptionalAbsent = makeProject(path.join(tmpRoot, 'non-optional-absent'), {
+      extraLock: {
+        'node_modules/required-dep': {
+          version: '2.0.0',
+          resolved: 'https://registry.npmjs.org/required-dep/-/required-dep-2.0.0.tgz',
+          integrity: 'sha512-required',
+        },
+      },
+    });
+
     const pass = startPass();
     expect(processPackageDir(pass, 'wg-a', missing)).toBe('incomplete');
     expect(processPackageDir(pass, 'wg-a', differs)).toBe('incomplete');
     expect(processPackageDir(pass, 'wg-a', omitted)).toBe('incomplete');
+    expect(processPackageDir(pass, 'wg-a', nonOptionalAbsent)).toBe('incomplete');
     expect(cacheEntries('wg-a')).toEqual([]);
     expect(pass.counters.adopted).toBe(0);
   });
@@ -530,6 +585,8 @@ describe('dependency cache', () => {
         return { rel, ino: fs.lstatSync(full).ino, bytes: fs.readFileSync(full, 'utf8') };
       });
 
+      const originalInodes = inodes(path.join(target, 'node_modules'));
+
       const crashed = convertPackageDir(startPass(), wg, target, {
         onStep: (step) => {
           if (step === crashPoint) throw new Error(`simulated crash after ${step}`);
@@ -548,9 +605,17 @@ describe('dependency cache', () => {
         expect(fs.readFileSync(full, 'utf8'), `${crashPoint} ${rel}`).toBe(bytes);
       }
 
-      // Recovery either finished the conversion or reversed it; the same pass
-      // then converts a reversed tree, so both paths end as a farm.
-      expect(['farm', 'converted']).toContain(processPackageDir(recoveryPass, wg, target));
+      const reversed = crashPoint === 'link-new' || crashPoint === 'rename-old';
+      if (reversed) {
+        // A crash at steps 1-2: recovery restores the original private tree.
+        expect(inodes(path.join(target, 'node_modules')), crashPoint).toEqual(originalInodes);
+      } else {
+        // A crash at step 3 or mid-step 4: recovery completes the move.
+        expectFarmOf(target, entry);
+      }
+
+      // The same pass's conversion then ends with a farm either way.
+      expect(processPackageDir(recoveryPass, wg, target), crashPoint).toBe(reversed ? 'converted' : 'farm');
       expectFarmOf(target, entry);
       expect(tempNamesUnder(target), crashPoint).toEqual([]);
       for (const { rel, ino, bytes } of sentinels) {
@@ -752,6 +817,55 @@ describe('dependency cache', () => {
     expect(Math.abs(fs.statSync(target).mtimeMs - idleSince)).toBeLessThan(1);
   });
 
+  it('accepts a tree whose only absent packages are optional', () => {
+    // One the platform allows and one it excludes: Phase 1 does not ask why an
+    // optional is absent, because convert only ever merges identical installs.
+    const src = makeProject(path.join(tmpRoot, 'topic-a', 'repo'), {
+      extraLock: {
+        'node_modules/@esbuild/linux-x64': optionalEntry({ os: ['linux'], cpu: ['x64'] }),
+        'node_modules/@esbuild/aix-ppc64': optionalEntry({ os: ['aix'], cpu: ['ppc64'] }),
+      },
+    });
+    const pass = startPass();
+
+    expect(processPackageDir(pass, 'wg-a', src)).toBe('adopted');
+
+    expect(cacheEntries('wg-a')).toEqual([keyOf(src)]);
+    expect(pass.counters.adopted).toBe(1);
+  });
+
+  it('a pass mutates at most the per-pass cap and defers the rest', () => {
+    expect(DEPENDENCY_CACHE_MAX_MUTATIONS_PER_PASS).toBe(5);
+    const trees = Array.from({ length: 7 }, (_, i) => makeProject(path.join(tmpRoot, `topic-${i}`, 'repo')));
+    const first = startPass();
+
+    const firstOutcomes = trees.map((dir) => processPackageDir(first, 'wg-a', dir));
+
+    expect(firstOutcomes).toEqual([
+      'adopted',
+      'converted',
+      'converted',
+      'converted',
+      'converted',
+      'deferred',
+      'deferred',
+    ]);
+    expect(first.counters).toEqual(expect.objectContaining({ adopted: 1, converted: 4, deferred: 2 }));
+    const deferredBefore = trees.slice(5).map((dir) => inodes(path.join(dir, 'node_modules')));
+    const second = startPass();
+
+    const secondOutcomes = trees.map((dir) => processPackageDir(second, 'wg-a', dir));
+
+    expect(secondOutcomes).toEqual(['farm', 'farm', 'farm', 'farm', 'farm', 'converted', 'converted']);
+    expect(second.counters).toEqual(expect.objectContaining({ adopted: 0, converted: 2, deferred: 0 }));
+    const entry = path.join(cacheRoot, 'wg-a', keyOf(trees[0]!));
+    for (const dir of trees) expectFarmOf(dir, entry);
+    // The deferred trees were untouched by the first pass (their inodes moved only in the second).
+    for (const [i, before] of deferredBefore.entries()) {
+      expect(inodes(path.join(trees[5 + i]!, 'node_modules'))).not.toEqual(before);
+    }
+  });
+
   it('reads NODE_VERSION from the agent image once per process and fails closed without it', () => {
     mockExecFileSync.mockImplementation(() => 'PATH=/usr/local/bin\nNODE_VERSION=22.23.2\nYARN_VERSION=1.22.22\n');
     expect(agentImageFingerprint('agent:latest')).toBe(envFingerprint('22.23.2'));
@@ -768,19 +882,35 @@ describe('dependency cache', () => {
       throw new Error('No such image');
     });
     expect(agentImageFingerprint('agent:latest')).toBeNull();
-    expect(
-      startDependencyCachePass({
-        mode: 'apply',
-        cacheRoot,
-        now: Date.now(),
-        reclaimableBytes: dirSizeBytes,
-        fingerprint: () => agentImageFingerprint('agent:latest'),
-      }),
-    ).toBeNull();
+    const pass = startDependencyCachePass({
+      mode: 'apply',
+      cacheRoot,
+      now: Date.now(),
+      reclaimableBytes: dirSizeBytes,
+      fingerprint: () => agentImageFingerprint('agent:latest'),
+    });
+
+    // No key, so nothing is adopted, converted or linked...
+    const tree = makeProject(path.join(tmpRoot, 'no-fingerprint', 'repo'));
+    expect(processPackageDir(pass, 'wg-a', tree)).toBe('unkeyable');
+    expect(cacheEntries('wg-a')).toEqual([]);
     expect(log.warn).toHaveBeenCalledWith(
-      'dependency-cache: environment fingerprint unavailable, skipping cache operations this pass',
+      'dependency-cache: environment fingerprint unavailable, skipping adopt, convert and link this pass',
       expect.anything(),
     );
+    // ...but an interrupted convert's `.old` needs no key to be restored...
+    const interrupted = makeProject(path.join(tmpRoot, 'no-fingerprint-old', 'repo'));
+    fs.renameSync(path.join(interrupted, 'node_modules'), path.join(interrupted, FARM_OLD_NAME));
+    expect(recoverPackageDir(pass, 'wg-a', interrupted)).toBe('recovered');
+    expect(fs.existsSync(path.join(interrupted, 'node_modules', 'left-pad', 'index.js'))).toBe(true);
+    // ...while `.new` alone is judged against the verified entry, so it waits.
+    const linking = path.join(tmpRoot, 'no-fingerprint-new', 'repo');
+    writeManifests(linking);
+    fs.mkdirSync(path.join(linking, FARM_NEW_NAME));
+    expect(recoverPackageDir(pass, 'wg-a', linking)).toBe('blocked');
+    expect(fs.existsSync(path.join(linking, FARM_NEW_NAME))).toBe(true);
+    expect(fs.existsSync(path.join(linking, 'node_modules'))).toBe(false);
+    expect(finishDependencyCachePass(pass).fingerprintAvailable).toBe(false);
 
     mockExecFileSync.mockImplementation(() => 'PATH=/usr/local/bin\n');
     expect(agentImageFingerprint('agent:latest')).toBeNull();
@@ -829,17 +959,64 @@ describe('dependency cache inside the regenerable sweep', () => {
     else process.env.NANOCLAW_DEPENDENCY_CACHE = savedFlag;
   });
 
-  function makeTopic(name: string, build: (repoDir: string) => void): string {
+  function makeTopic(name: string, build: (repoDir: string) => void, idleDays = 10): string {
     const topicDir = path.join(topicsRoot, 'wg-acme', name);
     const repoDir = path.join(topicDir, 'worktrees', 'REPO');
     fs.mkdirSync(repoDir, { recursive: true });
     build(repoDir);
-    const stamp = (Date.now() - 10 * DAY_MS) / 1000;
+    const stamp = (Date.now() - idleDays * DAY_MS) / 1000;
     const worktreeRoot = path.join(topicDir, 'worktrees');
     for (const entry of fs.readdirSync(worktreeRoot)) fs.utimesSync(path.join(worktreeRoot, entry), stamp, stamp);
     fs.utimesSync(worktreeRoot, stamp, stamp);
     return repoDir;
   }
+
+  it('off still recovers interrupted conversions and garbage-collects unlinked entries', () => {
+    // Unset IS `off`, the production default.
+    delete process.env.NANOCLAW_DEPENDENCY_CACHE;
+    let interruptedInodes = new Map<string, number>();
+    const interrupted = makeTopic('thread-55555555555555555555555555555555', (repo) => {
+      makeProject(repo, { privateDirs: true });
+      interruptedInodes = inodes(path.join(repo, 'node_modules'), { includePrivate: true });
+      // A convert that crashed after step 2 in an `apply` pass, then a rollback to `off`.
+      fs.renameSync(path.join(repo, 'node_modules'), path.join(repo, FARM_OLD_NAME));
+    });
+    const outside = makeProject(path.join(tmpRoot, 'outside', 'repo'));
+    expect(processPackageDir(startPass(), 'wg-acme', outside)).toBe('adopted');
+    const agedEntry = path.join(cacheRoot, 'wg-acme', keyOf(outside));
+    fs.rmSync(path.join(outside, 'node_modules'), { recursive: true });
+    backdateEntry(agedEntry, 20);
+    // Same lockfile as the aged entry, and fresh, so only the cache could touch it.
+    const keptPrivate = makeTopic('thread-66666666666666666666666666666666', (repo) => makeProject(repo), 0);
+    const privateBefore = snapshotTree(path.join(keptPrivate, 'node_modules'));
+
+    const report = getStorageReport({
+      mode: 'apply',
+      now: Date.now(),
+      sessionsRoot,
+      threadsRoot: path.join(dataRoot, 'no-threads'),
+      topicsRoot,
+      runningContainerMounts: () => [],
+      includeDocker: false,
+      policy: { filesystemPath: tmpRoot },
+    });
+
+    expect(report.policy.dependencyCacheMode).toBe('off');
+    expect(inodes(path.join(interrupted, 'node_modules'), { includePrivate: true })).toEqual(interruptedInodes);
+    expect(tempNamesUnder(interrupted)).toEqual([]);
+    expect(fs.existsSync(agedEntry)).toBe(false);
+    expect(cacheEntries('wg-acme')).toEqual([]);
+    expect(snapshotTree(path.join(keptPrivate, 'node_modules'))).toEqual(privateBefore);
+    expect(report.dependencyCache?.counters).toEqual(
+      expect.objectContaining({ recovered: 1, gcDeleted: 1, adopted: 0, converted: 0, privateInMountedTopics: 0 }),
+    );
+    // Neither recovering `.old` nor GC needs a key, so `off` never inspects the image.
+    expect(
+      mockExecFileSync.mock.calls.some(
+        ([cmd, args]) => cmd === CONTAINER_RUNTIME_BIN && (args as string[])[0] === 'image',
+      ),
+    ).toBe(false);
+  });
 
   it('npm-workspaces, pnpm, and lockfile-less projects are left to the existing sweep rule', () => {
     const workspaces = makeTopic('thread-11111111111111111111111111111111', (repo) => {

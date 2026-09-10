@@ -57,6 +57,13 @@ const QUARANTINE_GC_AGE_MS = 7 * DAY_MS;
 // Rewriting SEALED (which carries the whole inventory) on every link of a busy
 // key would be pure write amplification.
 const LAST_LINKED_REFRESH_MS = 60 * 60 * 1000;
+/**
+ * Adopts plus converts per pass. Each one is a full entry verify and a
+ * hardlink copy of a tree that can hold 56k files (§4.6), on the host that
+ * serves the fleet; the rest wait for the next hourly pass. Recovery,
+ * verification and GC are not capped.
+ */
+export const DEPENDENCY_CACHE_MAX_MUTATIONS_PER_PASS = 5;
 
 // ── Environment fingerprint ─────────────────────────────────────────────────
 
@@ -311,14 +318,21 @@ function isContainedPackageKey(key: string): boolean {
 }
 
 /**
- * A tree is complete when (1) its hidden lockfile's `packages`, minus the root
- * entry, match package-lock.json's by {version, resolved, integrity}; (2) every
- * package path in that map is a real directory whose package.json name and
- * version match; and (3) no regular file is newer than the hidden lockfile.
+ * A tree is complete when:
+ *   (1) every hidden-lockfile package entry (the root excluded) is in
+ *       package-lock.json with equal {version, resolved, integrity}, and every
+ *       package-lock entry ABSENT from the hidden lockfile is `optional: true`;
+ *   (2) every hidden-lockfile package path is a real directory whose
+ *       package.json name and version match; and
+ *   (3) no regular file is newer than the hidden lockfile.
  *
- * (1) is a set equality, as specified: a package-lock entry the hidden
- * lockfile does not carry — npm omits optional packages skipped for this
- * platform — makes the tree incomplete. That is fail-closed.
+ * (1) deliberately does not ask WHY an optional package is absent (skipped for
+ * this platform, skipped with its dependent, or failed to install). Phase 1
+ * never changes a workspace's file set: adopt shares the source tree's own
+ * inodes, and convert requires inventory equality with the entry, so only
+ * identical installs merge and no working tree is replaced by a degraded one.
+ * A platform-aware rule belongs to linking into a workspace that never
+ * installed (plan Phase 2).
  */
 export function checkCompleteness(pkgDir: string): Completeness {
   const nm = path.join(pkgDir, NODE_MODULES);
@@ -336,12 +350,16 @@ export function checkCompleteness(pkgDir: string): Completeness {
   const lockKeys = Object.keys(lockPackages)
     .filter((key) => key !== '')
     .sort();
-  if (hiddenKeys.length !== lockKeys.length || hiddenKeys.some((key, i) => key !== lockKeys[i])) {
-    const missing = lockKeys.find((key) => !(key in hiddenPackages));
-    const extra = hiddenKeys.find((key) => !(key in lockPackages));
-    return incomplete(`hidden lockfile package set differs: ${missing ?? extra ?? 'unknown'}`);
+  const has = (packages: JsonObject, key: string): boolean => Object.prototype.hasOwnProperty.call(packages, key);
+  for (const key of lockKeys) {
+    if (has(hiddenPackages, key)) continue;
+    const locked = lockPackages[key];
+    if (!isJsonObject(locked) || locked.optional !== true) {
+      return incomplete(`non-optional package-lock entry absent from the hidden lockfile: ${key}`);
+    }
   }
   for (const key of hiddenKeys) {
+    if (!has(lockPackages, key)) return incomplete(`hidden lockfile package absent from package-lock.json: ${key}`);
     const hidden = hiddenPackages[key];
     const locked = lockPackages[key];
     if (!isJsonObject(hidden) || !isJsonObject(locked)) return incomplete(`unreadable package entry: ${key}`);
@@ -448,6 +466,8 @@ export interface DependencyCacheCounters {
   linked: number;
   quarantined: number;
   gcDeleted: number;
+  /** Eligible trees left for a later pass by DEPENDENCY_CACHE_MAX_MUTATIONS_PER_PASS. */
+  deferred: number;
   /** Eligible, non-farm trees seen in topics a running container mounts. */
   privateInMountedTopics: number;
   privateInMountedTopicsBytes: number;
@@ -466,6 +486,8 @@ export interface DependencyCacheReport {
   mode: 'report' | 'apply';
   counters: DependencyCacheCounters;
   decisions: DependencyCacheDecision[];
+  /** `false`: a key was needed and the agent image could not be inspected. `null`: no key was needed. */
+  fingerprintAvailable: boolean | null;
 }
 
 export interface DependencyCachePass {
@@ -473,7 +495,13 @@ export interface DependencyCachePass {
   readonly cacheRoot: string;
   /** Pass clock for GC ages. Seals use the wall clock: they are compared with file mtimes. */
   readonly now: number;
-  readonly fingerprint: string;
+  /**
+   * The environment fingerprint, resolved on first use so a pass that only
+   * recovers or collects garbage never inspects the image. `null` means this
+   * pass cannot compute a key: adopt, convert and link are skipped.
+   */
+  readonly fingerprint: () => string | null;
+  readonly fingerprintState: { resolved: boolean; value: string | null };
   readonly counters: DependencyCacheCounters;
   readonly decisions: DependencyCacheDecision[];
   /** Reclaimable bytes of a dir — `dirSizeBytes`, the §5.8 primitive, injected to avoid an import cycle. */
@@ -481,6 +509,8 @@ export interface DependencyCachePass {
   /** Farm decisions verify each entry at most once per pass; link, convert and GC re-verify. */
   readonly verified: Map<string, VerifyResult>;
   readonly quarantinedThisPass: Set<string>;
+  /** Adopts plus converts started this pass, against DEPENDENCY_CACHE_MAX_MUTATIONS_PER_PASS. */
+  mutations: number;
 }
 
 export function startDependencyCachePass(options: {
@@ -489,19 +519,27 @@ export function startDependencyCachePass(options: {
   now: number;
   reclaimableBytes: (dir: string) => number;
   fingerprint?: () => string | null;
-}): DependencyCachePass | null {
-  const fingerprint = (options.fingerprint ?? (() => agentImageFingerprint()))();
-  if (!fingerprint) {
-    log.warn('dependency-cache: environment fingerprint unavailable, skipping cache operations this pass', {
-      cacheRoot: options.cacheRoot,
-    });
-    return null;
-  }
+}): DependencyCachePass {
+  const source = options.fingerprint ?? (() => agentImageFingerprint());
+  const fingerprintState: { resolved: boolean; value: string | null } = { resolved: false, value: null };
+  const fingerprint = (): string | null => {
+    if (!fingerprintState.resolved) {
+      fingerprintState.resolved = true;
+      fingerprintState.value = source();
+      if (!fingerprintState.value) {
+        log.warn('dependency-cache: environment fingerprint unavailable, skipping adopt, convert and link this pass', {
+          cacheRoot: options.cacheRoot,
+        });
+      }
+    }
+    return fingerprintState.value;
+  };
   return {
     mode: options.mode,
     cacheRoot: options.cacheRoot,
     now: options.now,
     fingerprint,
+    fingerprintState,
     reclaimableBytes: options.reclaimableBytes,
     counters: {
       recovered: 0,
@@ -511,18 +549,26 @@ export function startDependencyCachePass(options: {
       linked: 0,
       quarantined: 0,
       gcDeleted: 0,
+      deferred: 0,
       privateInMountedTopics: 0,
       privateInMountedTopicsBytes: 0,
     },
     decisions: [],
     verified: new Map(),
     quarantinedThisPass: new Set(),
+    mutations: 0,
   };
 }
 
 export function finishDependencyCachePass(pass: DependencyCachePass): DependencyCacheReport {
-  log.info('dependency-cache: pass complete', { mode: pass.mode, ...pass.counters, decisions: pass.decisions.length });
-  return { mode: pass.mode, counters: { ...pass.counters }, decisions: [...pass.decisions] };
+  const fingerprintAvailable = pass.fingerprintState.resolved ? pass.fingerprintState.value !== null : null;
+  log.info('dependency-cache: pass complete', {
+    mode: pass.mode,
+    ...pass.counters,
+    decisions: pass.decisions.length,
+    fingerprintAvailable,
+  });
+  return { mode: pass.mode, counters: { ...pass.counters }, decisions: [...pass.decisions], fingerprintAvailable };
 }
 
 function decide(
@@ -765,6 +811,7 @@ export type PackageOutcome =
   | 'convert-mismatch'
   | 'quarantined'
   | 'no-entry'
+  | 'deferred'
   | 'failed';
 
 export type LinkOutcome = 'linked' | 'exists' | 'ineligible' | 'unkeyable' | 'no-entry' | 'quarantined' | 'failed';
@@ -792,7 +839,9 @@ function preparePackage(
   pkgDir: string,
 ): PreparedPackage | 'ineligible' | 'unkeyable' {
   if (!isEligiblePackageDir(pkgDir)) return 'ineligible';
-  const keyed = dependencyKey(pkgDir, pass.fingerprint);
+  const fingerprint = pass.fingerprint();
+  if (!fingerprint) return 'unkeyable';
+  const keyed = dependencyKey(pkgDir, fingerprint);
   if (!keyed) return 'unkeyable';
   return {
     pkgDir,
@@ -801,6 +850,24 @@ function preparePackage(
     inputs: keyed.inputs,
     entryDir: path.join(workgroupDir(pass, workgroupId), keyed.key),
   };
+}
+
+/**
+ * Claim one of the pass's adopt/convert slots. Past the cap the tree is
+ * deferred: left exactly as it is, and the existing sweep rule applies to it.
+ * A report pass counts its decisions the same way, so it predicts apply.
+ */
+function takeMutation(pass: DependencyCachePass, pkg: PreparedPackage): boolean {
+  if (pass.mutations >= DEPENDENCY_CACHE_MAX_MUTATIONS_PER_PASS) {
+    pass.counters.deferred += 1;
+    decide(pass, 'deferred', pkg.pkgDir, {
+      key: pkg.key,
+      detail: `per-pass cap of ${DEPENDENCY_CACHE_MAX_MUTATIONS_PER_PASS} reached`,
+    });
+    return false;
+  }
+  pass.mutations += 1;
+  return true;
 }
 
 /**
@@ -814,6 +881,7 @@ function adopt(
   pkg: PreparedPackage,
   completeness: { walk: TreeWalk; inventory: Inventory },
 ): PackageOutcome {
+  if (!takeMutation(pass, pkg)) return 'deferred';
   decide(pass, 'adopt', pkg.pkgDir, { key: pkg.key });
   if (pass.mode === 'report') {
     pass.counters.adopted += 1;
@@ -906,6 +974,7 @@ function convertVerified(
     });
     return 'convert-mismatch';
   }
+  if (!takeMutation(pass, pkg)) return 'deferred';
   decide(pass, 'convert', pkg.pkgDir, { key: pkg.key, estimatedBytes: convertReclaimBytes(pass, pkg.nodeModulesDir) });
   if (pass.mode === 'report') {
     pass.counters.converted += 1;
@@ -1101,6 +1170,8 @@ function plannedRecoveryStep(hasNm: boolean, hasOld: boolean, hasNew: boolean): 
  *   - `.new` and `node_modules` present: delete `.new` (farm links only);
  *   - `.new` alone: rename it into place when it is a complete farm of the
  *     verified entry, else delete it (an interrupted link had no tree before).
+ *     Judging that needs the key, so with no environment fingerprint this one
+ *     case waits, with a WARN, for a pass that has one.
  */
 export function recoverPackageDir(pass: DependencyCachePass, workgroupId: string, pkgDir: string): RecoveryOutcome {
   const nm = path.join(pkgDir, NODE_MODULES);
@@ -1130,6 +1201,11 @@ export function recoverPackageDir(pass: DependencyCachePass, workgroupId: string
           fs.rmSync(oldDir, { recursive: true, force: true });
         } else if (hasNm && hasNew) {
           fs.rmSync(newDir, { recursive: true, force: true });
+        } else if (pass.fingerprint() === null) {
+          log.warn('dependency-cache: interrupted link left for a pass with an environment fingerprint', {
+            path: pkgDir,
+          });
+          return 'blocked';
         } else if (newDirIsCompleteFarm(pass, workgroupId, pkgDir)) {
           fs.renameSync(newDir, nm);
         } else {

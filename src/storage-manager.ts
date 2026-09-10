@@ -2507,14 +2507,21 @@ function collectTopicRegenerableActions(args: {
   }
   if (cache) {
     collectCacheGarbage(cache.pass);
-    args.dependencyCacheOut.report = finishDependencyCachePass(cache.pass);
+    // An `off` pass with nothing to clean stays as silent as `off` always was.
+    if (!cache.cleanupOnly || cache.pass.decisions.length > 0) {
+      const report = finishDependencyCachePass(cache.pass);
+      args.dependencyCacheOut.report = report;
+      if (report.fingerprintAvailable === false) {
+        args.warnings.push('dependency cache: agent image fingerprint unavailable, adopt/convert/link skipped');
+      }
+    }
   }
   return actions;
 }
 
 interface TopicDependencyCache {
   pass: DependencyCachePass;
-  /** Recover/adopt/convert really run: flag `apply` AND an applying storage pass. */
+  /** Operations really run: an applying storage pass with the flag at `apply` or `off`. */
   mutate: boolean;
   /**
    * Flag `apply`: farms, and trees this pass adopts or converts, skip the
@@ -2522,6 +2529,12 @@ interface TopicDependencyCache {
    * pass. Flag `report` keeps today's delete behavior and only logs.
    */
   exemptFarms: boolean;
+  /**
+   * Flag `off`, applying pass: recovery and cache GC only, so a rollback to
+   * `off` never strands an interrupted conversion and entries still age out
+   * (plan §5.7.8). No adopt, convert, link, farm exemption or counting.
+   */
+  cleanupOnly: boolean;
 }
 
 function startTopicDependencyCache(args: {
@@ -2532,8 +2545,11 @@ function startTopicDependencyCache(args: {
   warnings: string[];
 }): TopicDependencyCache | null {
   const flag = args.policy.dependencyCacheMode ?? 'off';
-  if (flag === 'off') return null;
-  const mutate = flag === 'apply' && args.mode === 'apply';
+  if (flag === 'off' && args.mode !== 'apply') return null;
+  const mutate = args.mode === 'apply' && flag !== 'report';
+  // The fingerprint is resolved lazily: an `off` pass, or one with nothing
+  // eligible, never inspects the agent image. Without one, the pass cannot key
+  // anything, so it recovers and collects garbage and skips adopt/convert/link.
   const pass = startDependencyCachePass({
     mode: mutate ? 'apply' : 'report',
     // A sibling of v2-topics, so every link stays on one filesystem and mount.
@@ -2541,13 +2557,7 @@ function startTopicDependencyCache(args: {
     now: args.now,
     reclaimableBytes: dirSizeBytes,
   });
-  if (!pass) {
-    // Fail closed for the cache only: no key can be computed, so nothing is
-    // shared or classified as a farm, and the sweep behaves as with `off`.
-    args.warnings.push('dependency cache skipped: agent image fingerprint unavailable');
-    return null;
-  }
-  return { pass, mutate, exemptFarms: flag === 'apply' };
+  return { pass, mutate, exemptFarms: flag === 'apply', cleanupOnly: flag === 'off' };
 }
 
 const KEPT_BY_CACHE: ReadonlySet<PackageOutcome> = new Set<PackageOutcome>(['farm', 'adopted', 'converted']);
@@ -2559,7 +2569,8 @@ const KEPT_BY_CACHE: ReadonlySet<PackageOutcome> = new Set<PackageOutcome>(['far
  * container mount, and only inside the topic's storage cleanup claim, with the
  * runtime mount lookup re-run under the claim exactly as `canApply` does in
  * `createDeleteArtifactAction` (the claim covers our spawn path's markers, the
- * lookup covers containers that plant none).
+ * lookup covers containers that plant none). A cleanup-only (`off`) pass
+ * runs the recovery half and nothing else.
  *
  * Returns the targets the 2-day delete must skip.
  */
@@ -2575,9 +2586,11 @@ function runTopicDependencyCache(args: {
 }): Set<string> {
   const kept = new Set<string>();
   const { pass } = args.cache;
-  const npmTargets = args.targets.filter(
-    (target) => path.basename(target) === 'node_modules' && isEligiblePackageDir(path.dirname(target)),
-  );
+  const npmTargets = args.cache.cleanupOnly
+    ? []
+    : args.targets.filter(
+        (target) => path.basename(target) === 'node_modules' && isEligiblePackageDir(path.dirname(target)),
+      );
   if (npmTargets.length === 0 && args.recoveryDirs.length === 0) return kept;
   if (!isRealDirectory(args.worktreeRoot)) return kept;
 
