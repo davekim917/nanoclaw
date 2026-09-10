@@ -3302,6 +3302,52 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     expect(ended).toBe(false);
   });
 
+  it('does not admit a follow-up into a task stream that ended while the poll tick was awaiting', async () => {
+    // The follow-up poll can be suspended at a real await (a pre-task script,
+    // or here a live applySettings) when the main loop ends the stream after
+    // the first fire's result. Resuming, it must not claim and push into the
+    // closing stream: the push would be swallowed, the row marked completed,
+    // and the fire lost with no outcome. Left pending, the outer loop claims
+    // it in a fresh query.
+    insertMessage('occ-2', 'task', { prompt: 'second fire', flagIntent: { turnEffort: 'medium' } });
+
+    let release!: () => void;
+    const closed = new Promise<void>((resolve) => (release = resolve));
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      // Let the follow-up poll pick up occ-2 and suspend in the slow
+      // applySettings below before occ-1 answers.
+      await Bun.sleep(900);
+      yield { type: 'result', text: 'first fire' };
+      // Like a real CLI winding down after its input closes: `done` stays
+      // false for a while after end().
+      await closed;
+    }
+    const pushed: string[] = [];
+    const query: AgentQuery = {
+      push: (m: string) => pushed.push(m),
+      end: () => {
+        setTimeout(release, 2_500);
+      },
+      abort: () => release(),
+      applySettings: async () => {
+        await Bun.sleep(1_500);
+      },
+      events: events(),
+    };
+
+    const result = await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
+      effort: 'xhigh',
+      ultracode: false,
+    });
+
+    expect(result.taskTurns!.map((t) => t.key)).toEqual(['occ-1']);
+    expect(pushed.join('\n')).not.toContain('second fire');
+    expect(getInboundDb().prepare('SELECT status FROM messages_in WHERE id = ?').get('occ-2')).toEqual({
+      status: 'pending',
+    });
+  }, 15_000);
+
   it('keeps two separate fires apart even though they share a series', async () => {
     async function fire(occurrenceId: string) {
       async function* events() {

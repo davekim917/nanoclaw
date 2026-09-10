@@ -1854,8 +1854,13 @@ export async function processQuery(
         }
 
         // Re-check done — the outer query may have finished while the script
-        // was awaited. Pushing into a closed stream is wasted work.
-        if (done) {
+        // was awaited. Pushing into a closed stream is wasted work. So is
+        // pushing into one that is ENDING: the main loop ends a task stream
+        // once its fire is answered, and `done` stays false until the provider
+        // winds down, so a push landing in that gap is swallowed and its row
+        // marked completed with no fire behind it. Left pending instead, the
+        // outer loop claims it in a fresh query.
+        if (done || endedForCommand) {
           if (skipped.length > 0) markScriptSkipped(skipped);
           return;
         }
@@ -1931,8 +1936,9 @@ export async function processQuery(
             return;
           }
           // The await above widens the done-race window — re-check before
-          // claiming so rows aren't marked processing against a dead stream.
-          if (done) return;
+          // claiming so rows aren't marked processing against a dead stream,
+          // or against one the main loop has begun ending (see above).
+          if (done || endedForCommand) return;
         }
 
         const keptIds = keep.map((m) => m.id);
