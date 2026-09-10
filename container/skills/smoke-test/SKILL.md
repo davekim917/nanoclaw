@@ -1108,6 +1108,11 @@ screenshots:
 - Fixes: <PRs and deployed SHAs, or none>
 - Untested: <explicit list, or "nothing in scope">
 - Challenge: <challenger chat language> — <one clause of substance>
+- Full run record: <durable link — publish `run-record.md` where this
+  channel's readers can click it (a PR comment, an issue, a dashboard; the
+  deployment's standing instructions name which) and link it here. Never
+  paste the record inline: the post carries the verdict, the link carries
+  the detail.>
 **Recommendation: <chat language> — <one sentence why>**
 ```
 
