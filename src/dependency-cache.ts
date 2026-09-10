@@ -61,10 +61,11 @@ const QUARANTINE_GC_AGE_MS = 7 * DAY_MS;
 // key would be pure write amplification.
 const LAST_LINKED_REFRESH_MS = 60 * 60 * 1000;
 /**
- * Adopts plus converts per pass. Each one is a full entry verify and a
- * hardlink copy of a tree that can hold 56k files (§4.6), on the host that
- * serves the fleet; the rest wait for the next hourly pass. Recovery,
- * verification and GC are not capped.
+ * Adopts plus convert attempts per pass — every whole-tree content read takes
+ * one of these slots, mismatch or not, so the cap bounds a pass's I/O as well
+ * as its mutations. Each can mean reading and hardlinking a tree of 56k files
+ * (§4.6) on the host that serves the fleet; the rest wait for the next hourly
+ * pass. Recovery, verification and GC are not capped.
  */
 export const DEPENDENCY_CACHE_MAX_MUTATIONS_PER_PASS = 5;
 
@@ -110,8 +111,49 @@ export function agentImageFingerprint(image: string = CONTAINER_IMAGE): string |
   return fingerprint;
 }
 
+/**
+ * Content-mismatch verdicts, by package dir, so a tree whose inventory matches
+ * its entry but whose bytes do not is read once, not every hourly pass. A
+ * verdict holds while the tree's inventory, its hidden lockfile's mtime (npm
+ * rewrites that file on every run) and the entry's content manifest are all
+ * unchanged. A stale verdict can only keep a tree private, never delete it.
+ *
+ * Module memory, not a file: the sweep runs in ONE persistent storage worker
+ * that serves every pass (storage-maintenance-worker.ts:69 "Owns one
+ * persistent worker", reused by `ensureWorker` at :136, one module-level
+ * instance at :171), so this map outlives passes. A host restart or worker
+ * crash forgets it, which costs one capped re-read per tree.
+ */
+interface ConvertMismatchVerdict {
+  inventorySha256: string;
+  hiddenLockfileMtimeMs: number;
+  entryContentSha256: string;
+}
+
+const convertMismatchMemo = new Map<string, ConvertMismatchVerdict>();
+
+/** Bounds the memo: a verdict for a package dir that no longer exists is dropped each pass. */
+function pruneConvertMismatchMemo(): void {
+  for (const pkgDir of convertMismatchMemo.keys()) {
+    if (!fs.existsSync(pkgDir)) convertMismatchMemo.delete(pkgDir);
+  }
+}
+
+function sameVerdict(a: ConvertMismatchVerdict, b: ConvertMismatchVerdict): boolean {
+  return (
+    a.inventorySha256 === b.inventorySha256 &&
+    a.hiddenLockfileMtimeMs === b.hiddenLockfileMtimeMs &&
+    a.entryContentSha256 === b.entryContentSha256
+  );
+}
+
 export function _resetDependencyCacheForTesting(): void {
   fingerprintByImage.clear();
+  convertMismatchMemo.clear();
+}
+
+export function _convertMismatchMemoSizeForTesting(): number {
+  return convertMismatchMemo.size;
 }
 
 // ── Eligibility and key ─────────────────────────────────────────────────────
@@ -524,6 +566,8 @@ export interface DependencyCacheCounters {
   gcDeleted: number;
   /** Eligible trees left for a later pass by DEPENDENCY_CACHE_MAX_MUTATIONS_PER_PASS. */
   deferred: number;
+  /** Whole-tree content reads (adopt, report-mode adopt, convert attempts); each took a cap slot. */
+  contentReads: number;
   /** Eligible, non-farm trees seen in topics a running container mounts. */
   privateInMountedTopics: number;
   privateInMountedTopicsBytes: number;
@@ -567,7 +611,7 @@ export interface DependencyCachePass {
   readonly quarantinedThisPass: Set<string>;
   /** Report passes only: entries this pass would have sealed, by entry dir. */
   readonly wouldSeal: Map<string, WouldSealEntry>;
-  /** Adopts plus converts started this pass, against DEPENDENCY_CACHE_MAX_MUTATIONS_PER_PASS. */
+  /** Adopts plus convert attempts (content reads) this pass, against DEPENDENCY_CACHE_MAX_MUTATIONS_PER_PASS. */
   mutations: number;
 }
 
@@ -578,6 +622,7 @@ export function startDependencyCachePass(options: {
   reclaimableBytes: (dir: string) => number;
   fingerprint?: () => string | null;
 }): DependencyCachePass {
+  pruneConvertMismatchMemo();
   const source = options.fingerprint ?? (() => agentImageFingerprint());
   const fingerprintState: { resolved: boolean; value: string | null } = { resolved: false, value: null };
   const fingerprint = (): string | null => {
@@ -608,6 +653,7 @@ export function startDependencyCachePass(options: {
       quarantined: 0,
       gcDeleted: 0,
       deferred: 0,
+      contentReads: 0,
       privateInMountedTopics: 0,
       privateInMountedTopicsBytes: 0,
     },
@@ -991,6 +1037,7 @@ function adopt(
   pass.mutations += 1;
   decide(pass, 'adopt', pkg.pkgDir, { key: pkg.key });
   if (pass.mode === 'report') {
+    pass.counters.contentReads += 1;
     const contentSha256 = contentManifestSha256(pkg.nodeModulesDir, completeness.walk);
     if (contentSha256) {
       pass.wouldSeal.set(pkg.entryDir, {
@@ -1038,6 +1085,7 @@ function adopt(
       throw new Error('tree changed between the completeness check and the link');
     }
     // The one read of every byte: what convert will require of a private tree.
+    pass.counters.contentReads += 1;
     const contentSha256 = contentManifestSha256(tmpNm, linked);
     if (!contentSha256) throw new Error('entry content unreadable');
     for (const file of linked.files) {
@@ -1103,12 +1151,32 @@ function convertVerified(
     return convertMismatch(pass, pkg, firstInventoryDifference(identity.inventory, inventory.items));
   }
   if (pass.mode === 'apply' && !sealed) return 'failed';
-  // Checked before the content read, so a deferred tree costs no I/O.
+  const verdict: ConvertMismatchVerdict = {
+    inventorySha256: inventory.sha256,
+    hiddenLockfileMtimeMs: completeness.walk.files.find((file) => file.rel === HIDDEN_LOCKFILE)?.stat.mtimeMs ?? -1,
+    entryContentSha256: identity.contentSha256,
+  };
+  const known = convertMismatchMemo.get(pkg.pkgDir);
+  if (known && sameVerdict(known, verdict)) {
+    // Failed the content check before, and nothing it depends on has changed:
+    // no read and no slot.
+    pass.counters.convertMismatch += 1;
+    decide(pass, 'convert-mismatch', pkg.pkgDir, {
+      key: pkg.key,
+      detail: 'memoized: content differed on an earlier pass and the tree is unchanged',
+    });
+    return 'convert-mismatch';
+  }
+  // The slot is taken before the read, so a mismatch uses one too and the cap
+  // bounds the pass's reads; a deferred tree costs no I/O.
   if (deferIfCapped(pass, pkg)) return 'deferred';
+  pass.mutations += 1;
+  pass.counters.contentReads += 1;
   if (contentManifestSha256(pkg.nodeModulesDir, completeness.walk) !== identity.contentSha256) {
+    convertMismatchMemo.set(pkg.pkgDir, verdict);
     return convertMismatch(pass, pkg, 'content differs (file bytes, symlink target or exec bits)');
   }
-  pass.mutations += 1;
+  convertMismatchMemo.delete(pkg.pkgDir);
   decide(pass, 'convert', pkg.pkgDir, { key: pkg.key, estimatedBytes: convertReclaimBytes(pass, pkg.nodeModulesDir) });
   if (pass.mode === 'report' || !sealed) {
     pass.counters.converted += 1;

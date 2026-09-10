@@ -32,6 +32,7 @@ vi.mock('./log.js', () => ({
 }));
 
 import {
+  _convertMismatchMemoSizeForTesting,
   _resetDependencyCacheForTesting,
   agentImageFingerprint,
   collectCacheGarbage,
@@ -941,6 +942,50 @@ describe('dependency cache', () => {
     expect(fs.lstatSync(entryHidden).ino).toBe(entryIno);
     expect(fs.readFileSync(entryHidden, 'utf8')).toBe(entryBytes);
     expect(verifyEntry(path.dirname(path.dirname(entryHidden))).ok).toBe(true);
+  });
+
+  it('content reads count against the per-pass cap and an unchanged mismatched tree is not re-read', () => {
+    const src = makeProject(path.join(tmpRoot, 'source', 'repo'));
+    expect(processPackageDir(startPass(), 'wg-a', src)).toBe('adopted');
+    // Inventory equal to the entry's, bytes not: the most expensive tree to reject.
+    const trees = Array.from({ length: 7 }, (_, i) => {
+      const dir = makeProject(path.join(tmpRoot, `topic-${i}`, 'repo'));
+      const file = path.join(dir, 'node_modules', 'left-pad', 'index.js');
+      fs.writeFileSync(file, String(i).repeat(fs.statSync(file).size));
+      fs.utimesSync(file, FILE_STAMP_S, FILE_STAMP_S);
+      return dir;
+    });
+    const runPass = (): DependencyCachePass => {
+      const pass = startPass();
+      for (const dir of trees) processPackageDir(pass, 'wg-a', dir);
+      return pass;
+    };
+    const readPaths = (pass: DependencyCachePass): string[] =>
+      pass.decisions
+        .filter((decision) => decision.op === 'convert-mismatch' && !decision.detail?.startsWith('memoized'))
+        .map((decision) => decision.path);
+
+    const first = runPass();
+    expect(first.counters).toEqual(expect.objectContaining({ contentReads: 5, deferred: 2, convertMismatch: 5 }));
+    const second = runPass();
+    expect(second.counters).toEqual(expect.objectContaining({ contentReads: 2, deferred: 0, convertMismatch: 7 }));
+    expect(readPaths(second)).toEqual(trees.slice(5));
+    const third = runPass();
+    expect(third.counters).toEqual(expect.objectContaining({ contentReads: 0, deferred: 0, convertMismatch: 7 }));
+
+    // npm ran in one tree (its hidden lockfile moved): only that verdict is re-read.
+    const hidden = path.join(trees[3]!, 'node_modules', '.package-lock.json');
+    fs.utimesSync(hidden, FILE_STAMP_S + 60, FILE_STAMP_S + 60);
+    const fourth = runPass();
+    expect(fourth.counters).toEqual(expect.objectContaining({ contentReads: 1, deferred: 0, convertMismatch: 7 }));
+    expect(readPaths(fourth)).toEqual([trees[3]]);
+
+    // Nothing was converted, and the memo forgets a package dir that is gone.
+    for (const dir of trees) expect(tempNamesUnder(dir)).toEqual([]);
+    expect(_convertMismatchMemoSizeForTesting()).toBe(7);
+    fs.rmSync(path.dirname(trees[6]!), { recursive: true });
+    startPass();
+    expect(_convertMismatchMemoSizeForTesting()).toBe(6);
   });
 
   it('reads NODE_VERSION from the agent image once per process and fails closed without it', () => {
