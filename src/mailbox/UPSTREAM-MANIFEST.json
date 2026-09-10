@@ -11,7 +11,6 @@
     "container/agent-runner/src/mailbox/index.ts": "d8568702a9b5a287f75a4dd9821deccba44c14b534f92a669ba313ba9c59dde3",
     "container/agent-runner/src/mailbox/model.generated.ts": "f23a848fd794001aec5d10fe05f699b20cf93f2e756f23a498c1654441be159e",
     "container/agent-runner/src/mailbox/registry.test.ts": "ddb6ae7549d2c9a113c11c888af7c14c58fd8be547e36a14862b5f2b97578335",
-    "container/agent-runner/src/mailbox/sqlite/connection.ts": "31c899bf05fa4eaf67bd96e39715c589c6420f132f5a4b06ecd3f067a37cbc17",
     "container/agent-runner/src/mailbox/sqlite/index.ts": "fff275870f80edfd069ad44ec509df81d5d9e8f10bd56bdfc0a3a3dcfb07561d",
     "container/agent-runner/src/mailbox/sqlite/operations.ts": "1897b356ce62692b993a019ef807b240c7b5dc4182452d496093815f8f5bdc17",
     "container/agent-runner/src/mailbox/sqlite/sqlite.test.ts": "61e226aa8ed73b14269536cfedbc712a339c5d6d58358fed2a6fb908723b0d5b",

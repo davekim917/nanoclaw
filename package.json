@@ -28,6 +28,8 @@
     "lint": "eslint src/ scripts/ setup/",
     "lint:fix": "eslint src/ scripts/ setup/ --fix",
     "test": "vitest run",
+    "test:correctness": "VITEST_LANE=correctness vitest run",
+    "test:drift": "VITEST_LANE=drift vitest run",
     "test:watch": "vitest",
     "check:public-boundary": "tsx scripts/check-public-boundary.ts",
     "ratchet:report": "tsx scripts/upstream-ratchet-report.ts",
