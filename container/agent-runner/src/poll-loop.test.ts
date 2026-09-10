@@ -2262,6 +2262,53 @@ describe('processQuery provider_executing', () => {
     expect(observed.afterQueuedTurnEnds).toBe(0);
     expect(providerExecuting()).toBe(0);
   });
+
+  // Fleet incident 2026-09-10: a resumed task's first turn answered empty
+  // ("Result: (empty)"), and the SDK — not the runner — started a second
+  // turn on its own inside the same still-open stream to do the real work.
+  // claude.ts implements no `hasQueuedWork`, so the empty `result` already
+  // lowered the flag, and nothing pushed to raise it again: the task reaper
+  // killed the container mid-work on the next sweep tick, and it kept
+  // happening because each kill orphaned more background work. `init` fires
+  // at the start of EVERY turn — including one the SDK starts unprompted —
+  // so raising the flag there, not just on push, is what keeps a resumed
+  // container alive through the real turn.
+  it('raises again on an SDK-started turn after an empty result, with no push involved', async () => {
+    const observed: Record<string, number> = {};
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-resume' };
+      // The empty first turn of a resume: no text, so dispatch/nudge never
+      // runs and nothing is pushed — this is exactly what lowers the flag.
+      yield { type: 'result', text: null };
+      observed.afterEmptyResult = providerExecuting();
+      // The SDK starts the real turn on its own — not a pushToQuery call.
+      yield { type: 'init', continuation: 'sess-resume' };
+      observed.afterSecondInit = providerExecuting();
+      yield { type: 'progress', message: 'working' };
+      yield { type: 'result', text: '<internal>done</internal>' };
+      observed.afterFinalResult = providerExecuting();
+    }
+    const query: AgentQuery = { push: () => {}, end: () => {}, events: events(), abort: () => {} };
+
+    await processQuery(query, ERR_ROUTING, ['m-resume'], 'claude', undefined, 'prompt', undefined, {});
+
+    expect(observed.afterEmptyResult).toBe(0);
+    expect(observed.afterSecondInit).toBe(1);
+    expect(observed.afterFinalResult).toBe(0);
+    expect(providerExecuting()).toBe(0);
+  });
+
+  it('stays clear when a turn ends and the stream produces nothing further', async () => {
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-quiet' };
+      yield { type: 'result', text: '<internal>done</internal>' };
+    }
+    const query: AgentQuery = { push: () => {}, end: () => {}, events: events(), abort: () => {} };
+
+    await processQuery(query, ERR_ROUTING, ['m-quiet'], 'claude', undefined, 'prompt', undefined, {});
+
+    expect(providerExecuting()).toBe(0);
+  });
 });
 
 it('re-bootstraps bounded canon and capabilities immediately after provider compaction', async () => {

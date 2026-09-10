@@ -2118,6 +2118,14 @@ export async function processQuery(
         // effectively orphaned and the next message started a blank
         // Claude session with no prior context.
         setContinuation(providerName, event.continuation);
+        // The SDK emits `init` at the start of EVERY turn, including one it
+        // starts on its own inside an already-open stream (e.g. a resume
+        // whose first turn answers empty, then genuinely does the work on a
+        // second turn nobody pushed). That second turn is not a `pushToQuery`
+        // call — `hasQueuedWork` is unimplemented on claude.ts, so the prior
+        // empty `result` already lowered the flag — so without this, the
+        // task reaper sees it as idle and kills it mid-work on the next tick.
+        setProviderTurnExecuting(true);
       } else if (event.type === 'result') {
         sawResult = true; // the SDK produced output → any prior api_retry recovered
         // The provider is between turns as of right now. Set before the
