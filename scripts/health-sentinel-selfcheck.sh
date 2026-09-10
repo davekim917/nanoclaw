@@ -68,6 +68,7 @@ cat > "$ROOT/bin/systemctl" <<'EOS'
 case "$*" in
   "is-active nanoclaw-v2") echo active ;;
   "show nanoclaw-v2 -p NRestarts --value") echo 0 ;;
+  "show nanoclaw-v2 -p ActiveEnterTimestamp --value") echo "${STUB_SVC_START:-}" ;;
   *"-p LoadState --value") echo "${STUB_LOADSTATE:-loaded}" ;;
   *"-p LastTriggerUSec --value") echo "${STUB_LASTTRIGGER:-}" ;;
   is-active*) echo "${STUB_ACTIVE:-active}" ;;
@@ -299,6 +300,70 @@ case "$OUT" in
 esac
 rm -f "$ROOT/bin/ncl"
 
+# ── deploy-lag and deploy-restart ───────────────────────────────────────────
+# The fixture becomes a git repo so the vital has something to measure. There
+# is no remote: origin/main is set with update-ref, and the vital's fetch fails
+# and falls back to that ref — the path a host takes when GitHub is down.
+# Committer dates are explicit because the vital times the wait from them.
+# Every case before this one ran with no repo, so the vital skipped cleanly.
+git -C "$ROOT" init -q -b main
+git -C "$ROOT" config user.email selfcheck@localhost
+git -C "$ROOT" config user.name selfcheck
+commit_at() { # <path> <age, e.g. '5 hours ago'> -> sha
+  mkdir -p "$ROOT/$(dirname "$1")"
+  echo "$RANDOM" >> "$ROOT/$1"
+  git -C "$ROOT" add "$1"
+  GIT_COMMITTER_DATE="$(date -d "$2" -R)" GIT_AUTHOR_DATE="$(date -d "$2" -R)" \
+    git -C "$ROOT" commit -q -m "$1"
+  git -C "$ROOT" rev-parse HEAD
+}
+build_info() { # <sha> <builtAt age>
+  mkdir -p "$ROOT/dist"
+  printf '{"sha":"%s","shortSha":"%s","builtAt":"%s"}\n' "$1" "${1:0:9}" \
+    "$(date -u -d "$2" +%Y-%m-%dT%H:%M:%S.000Z)" > "$ROOT/dist/BUILD_INFO.json"
+}
+has_key() { case "$(cat "$ROOT/data/health-sentinel-state.json" 2>/dev/null)" in *"\"$1\""*) return 0 ;; esac; return 1; }
+fresh() { rm -f "$ROOT/data/health-sentinel-state.json" "$OUTBOX"/*health-sentinel*.md 2>/dev/null || true; }
+
+BASE=$(commit_at src/a.ts '10 hours ago')
+build_info "$BASE" '10 hours ago'
+DOCS=$(commit_at docs/notes.md '5 hours ago')
+git -C "$ROOT" update-ref refs/remotes/origin/main "$DOCS"
+fresh; run_sentinel
+case "$OUT" in
+  *"all vitals OK"*) ok "a docs-only merge past the bound stays quiet" ;;
+  *) bad "a docs-only merge breached deploy-lag" "$OUT" ;;
+esac
+
+RUNTIME=$(commit_at src/b.ts '4 hours ago')
+git -C "$ROOT" update-ref refs/remotes/origin/main "$RUNTIME"
+fresh; run_sentinel
+has_key deploy-lag && ok "a runtime merge past the bound breached deploy-lag" \
+  || bad "a 4h-old runtime merge did not breach" "$OUT"
+# The count must skip the docs merge in front of it.
+if grep -qh '^- 1 merge(s) on origin/main change what this host runs' "$OUTBOX"/*health-sentinel*.md 2>/dev/null; then
+  ok "deploy-lag counts only the runtime merge"
+else
+  bad "deploy-lag miscounted merges" "$(cat "$OUTBOX"/*health-sentinel*.md 2>/dev/null)"
+fi
+
+# dist/ rebuilt 4h ago onto a service that has run for 5h: built, never restarted.
+build_info "$RUNTIME" '4 hours ago'
+YOUNG=$(commit_at src/c.ts '10 minutes ago')
+git -C "$ROOT" update-ref refs/remotes/origin/main "$YOUNG"
+fresh; run_sentinel STUB_SVC_START="$(date -d '5 hours ago')"
+has_key deploy-restart && ok "a build the service never restarted onto breached" \
+  || bad "built-not-restarted did not breach" "$OUT"
+# Must not always-fire: the 10-minute-old runtime merge is inside the bound.
+has_key deploy-lag && bad "a 10-minute-old runtime merge breached deploy-lag" "$OUT" \
+  || ok "a runtime merge inside the bound stays quiet"
+
+# Restarted after the build: the running process is the built one.
+fresh; run_sentinel STUB_SVC_START="$(date -d '3 hours ago')"
+case "$OUT" in
+  *"all vitals OK"*) ok "a service restarted after its build stays quiet" ;;
+  *) bad "a service restarted onto its build still breached" "$OUT" ;;
+esac
 
 [ "$FAILED" -eq 0 ] && echo "health-sentinel-selfcheck: all checks passed" || echo "health-sentinel-selfcheck: FAILURES"
 exit "$FAILED"
