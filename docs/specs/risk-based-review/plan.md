@@ -201,9 +201,11 @@ unreviewed PRs exceeds that of reviewed PRs over 30 days, the exempt path list s
 
 - [x] Audit: CI gates, review churn, observability (2026-09-10)
 - [ ] Tier 0.1–0.4 — in progress on `chore/risk-based-review`
-- [ ] Tier 0.5 — blocked on an operator-run `sudo`. Two independent items: narrow the
-      09-09 `zz-no-dispatch.conf` from the alert *template* to the three instances
-      health-sentinel already covers, and add the missing `OnFailure` drop-in to
-      `nanoclaw-spawn-gate-sentinel.service` — that unit has never carried the
-      directive its own script claims it does.
+- [x] Tier 0.5 — done 2026-09-10. The 09-09 `zz-no-dispatch.conf` moved off the alert
+      *template* onto the three instances health-sentinel already covers
+      (`nanoclaw-v2`, `nanoclaw-workgroups-drive`, `onecli-drift-check`), so the other
+      five escalate again; `nanoclaw-spawn-gate-sentinel.service` gained the `OnFailure`
+      drop-in its own script had always claimed it carried. Verified per instance via
+      `systemctl show … -p ExecStart`, and the alert script live-fired into a scratch
+      outbox.
 - [ ] Tier 1 · Tier 2 · Tier 3 · Tier 4 — not started
