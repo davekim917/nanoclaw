@@ -2314,6 +2314,31 @@ export async function processQuery(
         // again and the published bit stays 1; if it did not, this is where
         // the container becomes reapable.
         closeResultScope();
+        // A task fire has no conversation to continue. Once every admitted
+        // turn is answered and this result pushed nothing, end the stream so
+        // processQuery returns and the outer loop's `finally` records the
+        // fire's outcome. Left open, a Claude stream outlives its result
+        // (claude.ts ends only on end()/abort), the host reaps the idle
+        // container, and the outcome dies unflushed: that is how the
+        // run-outcome ledger held one row across twelve thousand task runs
+        // (incident 2026-09-10). Skipped whenever more work could still use
+        // this stream: a pushed nudge (turnIdle is false), work the provider
+        // has queued, or a durable continuation the host keeps the container
+        // alive for. `endedForCommand` stops the poll tick from claiming a
+        // follow-up into the closing stream, as every deliberate end does.
+        if (
+          routing.taskRun &&
+          turnIdle &&
+          !done &&
+          !endedForCommand &&
+          taskTurns.length > 0 &&
+          taskTurns.every((t) => t.outcome) &&
+          !query.hasQueuedWork?.() &&
+          !getWorkContinuation()
+        ) {
+          endedForCommand = true;
+          query.end();
+        }
       } else if (event.type === 'compacted') {
         advanceMemoryContextEpoch(providerName);
         // The SDK auto-compacted the conversation. After compaction the

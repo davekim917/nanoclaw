@@ -291,6 +291,107 @@ describe('repository mount poll and tool admission barrier', () => {
     }
   }, 5_000);
 
+  // Incident 2026-09-10: the Claude provider's
+  // events generator stays open after `result` until end()/abort
+  // (providers/claude.ts), so a task fire whose stream nobody ends never
+  // returns from processQuery, its outcome is never flushed, and the host's
+  // idle reaper kills the container first. The fakes above close their own
+  // generators after `result`, which is what hid this: in production, 12,523
+  // task runs had produced one run-outcome row.
+  function openAfterResultProvider(opts: { failFirst?: Error } = {}) {
+    let queryCalls = 0;
+    const ended: boolean[] = [];
+    const provider = {
+      supportsNativeSlashCommands: false,
+      registerMemorySessionHook: () => {},
+      isSessionInvalid: () => false,
+      isRetryable: () => true,
+      rotateApiKey: () => ({ rotated: true }),
+      query: () => {
+        queryCalls += 1;
+        const attempt = queryCalls;
+        let release!: () => void;
+        const closed = new Promise<void>((resolve) => (release = resolve));
+        async function* events(): AsyncGenerator<ProviderEvent> {
+          yield { type: 'init', continuation: 'open-stream-session' };
+          if (opts.failFirst && attempt === 1) throw opts.failFirst;
+          yield { type: 'result', text: `Finished attempt ${attempt}.` };
+          await closed; // like claude.ts: the stream outlives its result
+        }
+        return {
+          push: () => {},
+          end: () => {
+            ended[attempt - 1] = true;
+            release();
+          },
+          abort: () => release(),
+          events: events(),
+        };
+      },
+    };
+    return { provider, ended, calls: () => queryCalls };
+  }
+
+  const taskLogRowsNow = (): Array<{ text?: string }> =>
+    (
+      getOutboundDb().prepare("SELECT content FROM messages_out WHERE kind = 'task_log'").all() as {
+        content: string;
+      }[]
+    ).map((r) => JSON.parse(r.content) as { text?: string });
+
+  async function waitForTaskLog(): Promise<void> {
+    const deadline = Date.now() + 3_000;
+    while (taskLogRowsNow().length === 0) {
+      if (Date.now() >= deadline) throw new Error('no task_log row: the fire outcome was never flushed');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+
+  it('records a task fire outcome while the provider stream stays open after its result', async () => {
+    insertMessage('task-open-stream', 'task', { prompt: 'Summarise the release queue once.' });
+    const fake = openAfterResultProvider();
+    const abort = new AbortController();
+    const loop = runPollLoop({
+      provider: fake.provider as never,
+      providerName: 'claude',
+      cwd: '/tmp',
+      signal: abort.signal,
+      autosaveWorktrees: async () => ({ committed: [], failed: [], skipped: [] }),
+    });
+    try {
+      await waitForTaskLog();
+      expect(taskLogRowsNow().map((r) => r.text)).toEqual(['Finished attempt 1.']);
+    } finally {
+      abort.abort();
+      await loop;
+    }
+  }, 5_000);
+
+  it('records one outcome for a fire rescued by credential rotation while the retry stream stays open', async () => {
+    insertMessage('task-open-stream-rotated', 'task', { prompt: 'Summarise the release queue once.' });
+    const fake = openAfterResultProvider({
+      failFirst: new Error("subscription_quota_exhausted: You've hit your weekly limit"),
+    });
+    const abort = new AbortController();
+    const loop = runPollLoop({
+      provider: fake.provider as never,
+      providerName: 'claude',
+      cwd: '/tmp',
+      signal: abort.signal,
+      autosaveWorktrees: async () => ({ committed: [], failed: [], skipped: [] }),
+    });
+    try {
+      await waitForTaskLog();
+      expect(fake.calls()).toBe(2);
+      expect(taskLogRowsNow().map((r) => r.text)).toEqual(['Finished attempt 2.']);
+      // The stream the runner actually ran is the one it must release.
+      expect(fake.ended[1]).toBe(true);
+    } finally {
+      abort.abort();
+      await loop;
+    }
+  }, 5_000);
+
   // R-8 (plan §8): the outer loop consults the admission seam, not the fence
   // directly. A registered gate that holds must stop dispatch entirely — no
   // claim, no provider call — and releasing it must let the same pending row
@@ -3026,10 +3127,14 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
 
     async function* events(): AsyncGenerator<ProviderEvent> {
       yield { type: 'init', continuation: 'c1' };
-      yield { type: 'result', text: 'first fire failed', isError: true };
       // Outlast ACTIVE_POLL_INTERVAL_MS (500ms) so the follow-up poll runs and
-      // admits occ-2 into this same stream.
+      // admits occ-2 into this same stream while occ-1's turn is still open. A
+      // task stream now ends once every admitted turn is answered, so the
+      // fire's outcome is flushed before the host reaps the container. A later
+      // occurrence therefore joins a running stream only mid-turn; one that
+      // arrives after the stream ends is claimed by the outer loop instead.
       await Bun.sleep(1600);
+      yield { type: 'result', text: 'first fire failed', isError: true };
       yield { type: 'result', text: 'second fire failed', isError: true };
     }
     const pushed: string[] = [];
@@ -3073,16 +3178,18 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
 
     async function* events(): AsyncGenerator<ProviderEvent> {
       yield { type: 'init', continuation: 'c1' };
-      yield { type: 'result', text: 'first fire', isError: true };
-      // occ-2 is admitted during this window and moves the LIVE stream to
+      // occ-2 is admitted during this window, mid-turn (a task stream now ends
+      // once every admitted turn is answered), and moves the LIVE stream to
       // medium. The creation snapshot still says xhigh.
       await Bun.sleep(1600);
+      yield { type: 'result', text: 'first fire', isError: true };
       // Staged from inside the stream so it lands in a SECOND follow-up batch
       // rather than being merged into occ-2's. It wants xhigh again — equal to
-      // the stale creation snapshot, different from the live stream.
+      // the stale creation snapshot, different from the live stream. occ-2's
+      // turn is still open, so the stream stays up to admit it.
       insertMessage('occ-3', 'task', { prompt: 'third fire', flagIntent: { turnEffort: 'xhigh' } });
-      yield { type: 'result', text: 'second fire', isError: true };
       await Bun.sleep(1600);
+      yield { type: 'result', text: 'second fire', isError: true };
       yield { type: 'result', text: 'third fire', isError: true };
     }
     const efforts: Array<string | undefined> = [];
@@ -3125,10 +3232,13 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     setStickyEffort('xhigh');
     insertMessage('occ-2', 'task', { prompt: 'a scheduled fire that came due mid-answer' });
 
+    let endedBeforeDone = false;
     async function* events(): AsyncGenerator<ProviderEvent> {
       yield { type: 'init', continuation: 'c1' };
-      yield { type: 'result', text: 'partial', isError: false };
+      // occ-2 comes due and is admitted mid-answer, while m1's turn is open.
       await Bun.sleep(1600);
+      yield { type: 'result', text: 'partial', isError: false };
+      endedBeforeDone = ended;
       yield { type: 'result', text: 'done', isError: false };
     }
     const applied: Array<Record<string, unknown>> = [];
@@ -3156,8 +3266,41 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     // On 6dd936b9a: applied === [{ model: undefined, effort: undefined, … }],
     // i.e. the human's live turn was dragged onto the group default.
     expect(applied).toEqual([]);
-    expect(ended).toBe(false);
+    // No retarget: the stream was never ended mid-turn to reopen on other
+    // settings. It is ended once, after every admitted turn is answered, so
+    // the fire's outcome is flushed.
+    expect(endedBeforeDone).toBe(false);
+    expect(ended).toBe(true);
   }, 15_000);
+
+  it('keeps a task stream open while a durable continuation is owed', async () => {
+    // Running under another runner, so it is neither launched into this stream
+    // (nothing is pushed, turnIdle stays true) nor finished: the one condition
+    // left standing between a fire's result and ending the stream is the
+    // continuation record itself. The host keeps the container alive for it
+    // (sweep-idle-reap), so the stream must stay available too.
+    const queued = queueWorkContinuation('finish the follow-up after this fire');
+    if (!queued.accepted) throw new Error('expected continuation');
+    markWorkContinuationRunning(queued.continuation.id, 'another-runner');
+    let ended = false;
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      yield { type: 'result', text: 'fire done' };
+    }
+    const query: AgentQuery = {
+      push: () => {},
+      end: () => {
+        ended = true;
+      },
+      abort: () => {},
+      events: events(),
+    };
+
+    const result = await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {});
+
+    expect(result.taskTurns![0]!.outcome?.text).toBe('fire done');
+    expect(ended).toBe(false);
+  });
 
   it('keeps two separate fires apart even though they share a series', async () => {
     async function fire(occurrenceId: string) {
