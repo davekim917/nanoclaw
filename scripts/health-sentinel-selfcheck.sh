@@ -23,6 +23,12 @@ mkdir -p "$ROOT/data" "$ROOT/logs" "$ROOT/node_modules/.bin" "$ROOT/bin" "$ROOT/
 printf 'line\n%.0s' {1..50} > "$ROOT/logs/nanoclaw.log"
 : > "$ROOT/logs/nanoclaw.error.log"
 : > "$ROOT/scripts/notify-owner.ts"
+# The archived-series vital (#602) only queries `data/v2.db` when the file
+# exists — a real "not provisioned yet" host skips it rather than erroring.
+# This fixture's tsx stub never actually reads the file's content (it answers
+# from STUB_ARCHIVED_SESSION_IDS), so an empty placeholder is enough to clear
+# that existence gate.
+: > "$ROOT/data/v2.db"
 
 # tsx stub: real script calls `node_modules/.bin/tsx scripts/notify-owner.ts
 # --title ... --body ...` to deliver the owner DM. This fixture has no real
@@ -39,6 +45,15 @@ cat > "$ROOT/node_modules/.bin/tsx" <<'EOS'
 case "$1" in
   *print-storage-admission-policy.ts)
     echo "${STUB_STORAGE_ADMISSION_POLICY:-enabled 90}"
+    exit 0 ;;
+  *q.ts)
+    # Real script calls `q.ts <db-path> "SELECT id FROM sessions WHERE
+    # archived_at IS NOT NULL"` for the archived-series vital (#602). No real
+    # data/v2.db exists in this fixture, so this stub answers the query
+    # directly from an env var instead — one id per line, matching q.ts's real
+    # "list" output format (sqlite3-CLI-compatible, pipe-separated for
+    # multi-column rows; this query is single-column so it's just the ids).
+    printf '%s\n' ${STUB_ARCHIVED_SESSION_IDS:-}
     exit 0 ;;
 esac
 echo "notify-owner-stub: no fixture DB/token configured — cannot deliver" >&2
@@ -226,6 +241,61 @@ run_sentinel
 case "$(cat "$ROOT/data/health-sentinel-state.json")" in
   *'"paused-series"'*) ok "an unparseable task listing breached (fail-closed)" ;;
   *) bad "unparseable JSON read as healthy" "$OUT" ;;
+esac
+
+# ── archived-series vital (#602) ────────────────────────────────────────────
+# `threads.close` archives a session but leaves any bound task series
+# pending/paused; the sweep no longer retries or warns per-tick (that was
+# #602's own problem), so this vital is the only thing that reports the
+# strand at all.
+rm -f "$ROOT/data/health-sentinel-state.json"
+rm -f "$OUTBOX"/*health-sentinel*.md 2>/dev/null || true
+stub_ncl "echo '{\"data\":[{\"series_id\":\"ghost-y\",\"status\":\"pending\",\"session_id\":\"sess-archived\"}]}'"
+run_sentinel STUB_ARCHIVED_SESSION_IDS=sess-archived
+case "$(cat "$ROOT/data/health-sentinel-state.json")" in
+  *'"archived-series-ghost-y"'*) ok "a pending series bound to an archived session breached" ;;
+  *) bad "a pending series on an archived session did not breach" "$OUT" ;;
+esac
+# The remedy must be cancel-only. `ncl tasks pause` does not clear this
+# breach (a paused series is exactly as stranded), so offering it sends the
+# operator straight back into the same alert next cooldown.
+ARCHIVED_ALERT=$(ls -t "$OUTBOX"/*health-sentinel*.md 2>/dev/null | head -1)
+if [ -n "$ARCHIVED_ALERT" ] && grep -q 'ncl tasks cancel --id ghost-y' "$ARCHIVED_ALERT"; then
+  ok "archived-series remedy names ncl tasks cancel"
+else
+  bad "archived-series remedy did not name ncl tasks cancel" "alert=${ARCHIVED_ALERT:-<none>}"
+fi
+if [ -n "$ARCHIVED_ALERT" ] && grep -q 'ncl tasks pause' "$ARCHIVED_ALERT"; then
+  bad "archived-series remedy still suggests ncl tasks pause" "alert=$ARCHIVED_ALERT"
+else
+  ok "archived-series remedy does not suggest ncl tasks pause"
+fi
+
+# The strand shape #601 leaves behind (still pending/paused) must breach
+# regardless of which of the two live statuses it is.
+rm -f "$ROOT/data/health-sentinel-state.json"
+stub_ncl "echo '{\"data\":[{\"series_id\":\"ghost-z\",\"status\":\"paused\",\"session_id\":\"sess-archived\"}]}'"
+run_sentinel STUB_ARCHIVED_SESSION_IDS=sess-archived
+case "$(cat "$ROOT/data/health-sentinel-state.json")" in
+  *'"archived-series-ghost-z"'*) ok "a paused series bound to an archived session breached" ;;
+  *) bad "a paused series on an archived session did not breach" "$OUT" ;;
+esac
+# Reported ONCE, as the archived-session strand — not also as an ordinary
+# paused-series breach, whose remedy (`ncl tasks resume`) cannot fix this: the
+# session it would resume onto is gone.
+case "$(cat "$ROOT/data/health-sentinel-state.json")" in
+  *'"paused-ghost-z"'*) bad "a paused+archived series ALSO breached as an ordinary pause" "$OUT" ;;
+  *) ok "a paused+archived series is not double-reported" ;;
+esac
+
+# A live series whose session is NOT archived must not breach this vital —
+# same fixture shape, no id in the archived set.
+rm -f "$ROOT/data/health-sentinel-state.json"
+stub_ncl "echo '{\"data\":[{\"series_id\":\"ghost-live\",\"status\":\"pending\",\"session_id\":\"sess-live\"}]}'"
+run_sentinel STUB_ARCHIVED_SESSION_IDS=sess-archived
+case "$OUT" in
+  *"all vitals OK"*) ok "a live series on a non-archived session stays quiet" ;;
+  *) bad "a live series on a live session breached" "$OUT" ;;
 esac
 rm -f "$ROOT/bin/ncl"
 

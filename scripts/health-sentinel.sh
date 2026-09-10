@@ -229,8 +229,21 @@ done
 # agent-initiated one, a migration artifact -- is silent. Observed live: a daily
 # briefing sat paused 12 days and nobody was told.
 #
+# Same section also reports a LIVE series bound to an ARCHIVED session (#602).
+# `threads.close` archives a session (`archiveSessionById`) but leaves any task
+# series pointed at it `pending`/`paused` -- `unwakeableReason` then refuses
+# every fire with "session is archived" and nothing ever reopens it
+# (`unarchiveSessionById` has no callers). The sweep deliberately no longer
+# retries or warns about this per-tick (that was #602's own 1,893-warnings-in-
+# two-days problem) -- so this vital is the ONLY thing that reports it at all.
+#
 # `ncl tasks list` is the only view of series state: scheduled tasks live in the
-# per-session inbound DBs, not v2.db, so there is nothing to query directly.
+# per-session inbound DBs, not v2.db, so there is nothing to query directly for
+# the paused-age check. Session archival state is the opposite -- it lives ONLY
+# in v2.db (`sessions.archived_at`), not in a session's own inbound.db -- so the
+# archived-series check queries it directly, through `scripts/q.ts` (the
+# sqlite3-CLI replacement the project standardizes on: setup never installs or
+# probes for that binary, setup/verify.ts:5) rather than the sqlite3 CLI.
 # ~3s, so this stays out of the tighter vitals above.
 #
 # Opt-out, not opt-in: the whole point is catching a pause nobody declared, so a
@@ -238,12 +251,25 @@ done
 # space-separated list of deliberately-retired series ids.
 PAUSED_SERIES_MAX_AGE_S="${PAUSED_SERIES_MAX_AGE_S:-172800}"
 PAUSED_SERIES_IGNORE="${PAUSED_SERIES_IGNORE:-}"
+CENTRAL_DB="$NANOCLAW_DIR/data/v2.db"
 if [ -x "$NANOCLAW_DIR/bin/ncl" ]; then
   PAUSED_JSON=$("$NANOCLAW_DIR/bin/ncl" tasks list --json 2>/dev/null || echo '')
+  # Every session id ever archived. Read once, up front, and cross-referenced
+  # below against the (usually far smaller) set of session ids backing a LIVE
+  # series -- cheaper than a query per series, and simpler than threading a
+  # dynamic IN (...) list through from the JSON above. Failure here (missing
+  # DB, unreadable) degrades the archived-series half of this vital to "found
+  # none" rather than failing the whole check closed -- the paused-age half
+  # above already covers the "cannot look at all" case via PAUSED_JSON.
+  ARCHIVED_IDS=""
+  if [ -f "$CENTRAL_DB" ] && [ -x node_modules/.bin/tsx ]; then
+    ARCHIVED_IDS=$(node_modules/.bin/tsx scripts/q.ts "$CENTRAL_DB" \
+      "SELECT id FROM sessions WHERE archived_at IS NOT NULL" 2>/dev/null | tr '\n' ' ' || echo '')
+  fi
   # Fail closed. An unreachable or unparseable listing is "cannot look", which
   # this vital must never report as "nothing wrong" -- that is the exact shape
   # it exists to close.
-  PAUSED_OUT=$(NCL_JSON="$PAUSED_JSON" IGNORE="$PAUSED_SERIES_IGNORE" \
+  PAUSED_OUT=$(NCL_JSON="$PAUSED_JSON" IGNORE="$PAUSED_SERIES_IGNORE" ARCHIVED_IDS="$ARCHIVED_IDS" \
     MAXAGE="$PAUSED_SERIES_MAX_AGE_S" NOW_EPOCH="$NOW" python3 - <<'PYEOF' 2>/dev/null || echo 'ERROR|task listing could not be parsed'
 import json, os, sys
 raw = os.environ.get("NCL_JSON", "")
@@ -256,29 +282,46 @@ except Exception as e:
     print(f"ERROR|`ncl tasks list` returned unparseable JSON ({type(e).__name__}) — series state is unreadable")
     sys.exit(0)
 ignore = set(os.environ.get("IGNORE", "").split())
+archived = set(os.environ.get("ARCHIVED_IDS", "").split())
 now, maxage = int(os.environ["NOW_EPOCH"]), int(os.environ["MAXAGE"])
 import datetime
 for r in rows:
-    if r.get("status") != "paused" or r.get("series_id") in ignore:
+    series_id = r.get("series_id")
+    if series_id in ignore:
+        continue
+    # Archived-session strand (#602) takes priority over the paused-age check
+    # below: a series in this state will never fire again no matter how long
+    # it waits, and `ncl tasks resume` — the paused-age finding's own remedy —
+    # cannot fix it, because the session it would resume onto is gone. This
+    # check ignores `status` on purpose (pending AND paused both breach): a
+    # paused series bound to an archived session is exactly as stranded as a
+    # pending one, and pausing an already-pending one does not clear this
+    # breach either. Only `ncl tasks cancel` (to end the series) is an honest
+    # fix here — see the ARCHIVED message below for why `pause` is not offered.
+    if r.get("session_id") in archived:
+        print(f"ARCHIVED|{series_id}|{r.get('status')}|{r.get('session_id')}")
+        continue
+    if r.get("status") != "paused":
         continue
     last = r.get("last_run")
     if not last:
-        print(f"PAUSED|{r.get('series_id')}|and has never run")
+        print(f"PAUSED|{series_id}|and has never run")
         continue
     try:
         age = now - int(datetime.datetime.fromisoformat(last.replace("Z", "+00:00")).timestamp())
     except Exception:
-        print(f"PAUSED|{r.get('series_id')}|with an unparseable last_run '{last}'")
+        print(f"PAUSED|{series_id}|with an unparseable last_run '{last}'")
         continue
     if age >= maxage:
-        print(f"PAUSED|{r.get('series_id')}|for {age // 86400}d")
+        print(f"PAUSED|{series_id}|for {age // 86400}d")
 PYEOF
 )
-  while IFS='|' read -r kind a b; do
+  while IFS='|' read -r kind a b c; do
     [ -n "$kind" ] || continue
     case "$kind" in
-      ERROR)  BREACHES+=("paused-series|$a") ;;
-      PAUSED) BREACHES+=("paused-$a|scheduled series '$a' has been paused $b and nothing else reports that — it is not going to run again until somebody resumes it (\`ncl tasks resume $a\`) or retires it") ;;
+      ERROR)    BREACHES+=("paused-series|$a") ;;
+      PAUSED)   BREACHES+=("paused-$a|scheduled series '$a' has been paused $b and nothing else reports that — it is not going to run again until somebody resumes it (\`ncl tasks resume $a\`) or retires it") ;;
+      ARCHIVED) BREACHES+=("archived-series-$a|scheduled series '$a' is $b but its session ($c) is archived — every fire is silently refused (\"session is archived\") and nothing ever reopens the session; pausing it does not help, a paused series is still stranded the same way — cancel it (\`ncl tasks cancel --id $a\`), and if the work should keep running, recreate it with \`ncl tasks create\` (same prompt, recurrence and pins) after cancelling") ;;
     esac
   done <<< "$PAUSED_OUT"
 fi

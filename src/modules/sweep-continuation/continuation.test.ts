@@ -1210,6 +1210,100 @@ describe('S2-PR13 — continuation and ceiling accountability, through the regis
     expect(resumed.resume_attempts).toBe(1);
   });
 
+  // ── #602 ───────────────────────────────────────────────────────────────────
+  //
+  // `unwakeableReason` already refuses an archived session inside
+  // `wakeContainer` ('session is archived', container-runner.ts:694) — but
+  // that refusal came back as the same `false` a transient spawn failure
+  // returns, which by design leaves the due row pending for the next tick.
+  // Nothing ever unarchives a session (`unarchiveSessionById` has no
+  // callers), so the row was retried and refused every tick forever, logging
+  // 'Waking container for due messages' each time with no backoff. The fix is
+  // admission, not the eventual refusal: `session.archived_at` gates the same
+  // `if` `isContainerRunning` already gates, in `src/modules/sweep-continuation/index.ts`.
+  it('#602: an archived session with a due row takes no wake and logs nothing — no retry-forever', async () => {
+    const s9b = duty(SWEEP_DUTY_INVENTORY.S9b);
+    const { mailbox } = makeSessionDbs();
+    const archived: Session = { ...fakeSession(), archived_at: new Date().toISOString() };
+    const plan = emptyPlan({ dueCount: 1, wakePriority: 'scheduled' });
+
+    const info = vi.spyOn(log, 'info').mockImplementation(() => undefined);
+    await s9b.run(sessionCtx(mailbox, plan, { session: archived }));
+    await _settleDetachedWakesForTesting();
+
+    expect(mockWakeContainer).not.toHaveBeenCalled();
+    expect(info.mock.calls.find((c) => c[0] === 'Waking container for due messages')).toBeUndefined();
+    info.mockRestore();
+  });
+
+  it('#602: a live session with the very same due row still wakes — the gate is archived_at only', async () => {
+    const s9b = duty(SWEEP_DUTY_INVENTORY.S9b);
+    const { mailbox } = makeSessionDbs();
+    const live: Session = { ...fakeSession(), archived_at: null };
+    const plan = emptyPlan({ dueCount: 1, wakePriority: 'scheduled' });
+
+    await s9b.run(sessionCtx(mailbox, plan, { session: live }));
+    await _settleDetachedWakesForTesting();
+
+    expect(mockWakeContainer).toHaveBeenCalledTimes(1);
+  });
+
+  it('#602: a transient spawn failure on a live (non-archived) session still retries next tick', async () => {
+    // The acceptance bullet this guards: skipping archived sessions must not
+    // widen into skipping ordinary refusals. `wakeContainer` resolving false
+    // here is the OneCLI-down/etc. case, not an archived one, and the row
+    // must remain retryable — this duty makes no state change on a refused
+    // wake (see F-13.1's attempt-restore case for the one exception, which is
+    // continuation-specific and unrelated to this gate).
+    mockWakeContainer.mockResolvedValue(false);
+    const s9b = duty(SWEEP_DUTY_INVENTORY.S9b);
+    const { mailbox } = makeSessionDbs();
+    const live: Session = { ...fakeSession(), archived_at: null };
+    const plan = emptyPlan({ dueCount: 1, wakePriority: 'scheduled' });
+
+    const info = vi.spyOn(log, 'info').mockImplementation(() => undefined);
+    await s9b.run(sessionCtx(mailbox, plan, { session: live }));
+    await _settleDetachedWakesForTesting();
+
+    expect(mockWakeContainer).toHaveBeenCalledTimes(1);
+    expect(info.mock.calls.find((c) => c[0] === 'Waking container for due messages')).toBeDefined();
+    info.mockRestore();
+  });
+
+  it('#602: an archived session with a stopped continuation consumes no attempt and takes no wake', async () => {
+    // Review finding: the archived gate originally sat AFTER
+    // incrementStoppedContinuationAttempt, so an archived session with a
+    // resumable continuation still spent an attempt every tick even though
+    // the wake it was spent for could never happen — and the restore that
+    // would undo a refused wake hangs off the wakeInFlight promise from the
+    // (skipped) requestWake call, so it never ran either. The gate is now the
+    // FIRST thing this duty does after the #359 spawn-in-flight check, mirroring
+    // that check's own early-return shape, so an archived session consumes
+    // nothing: no attempt increment, no wake, no log line.
+    const s9a = duty(SWEEP_DUTY_INVENTORY.S9a);
+    const s9b = duty(SWEEP_DUTY_INVENTORY.S9b);
+    const { outDb, mailbox } = makeSessionDbs();
+    saveContinuation(outDb, CONTINUATION);
+    mockGetContainerSpawnedAt.mockReturnValue(Date.now() - CONTINUATION_WAKE_MIN_INTERVAL_MS - 1);
+    const plan = emptyPlan({ workContinuation: readWorkContinuation(outDb) });
+    await s9a.run(sessionCtx(mailbox, plan));
+    // Eligible on a LIVE session — proves the fixture would actually be
+    // resumed if the archived gate were missing or misplaced.
+    expect(plan.continuationWakeEligible).toBe(true);
+
+    const archived: Session = { ...fakeSession(), archived_at: new Date().toISOString() };
+    const info = vi.spyOn(log, 'info').mockImplementation(() => undefined);
+    await s9b.run(sessionCtx(mailbox, plan, { session: archived }));
+    await _settleDetachedWakesForTesting();
+
+    expect(mockWakeContainer).not.toHaveBeenCalled();
+    expect(info.mock.calls.find((c) => c[0] === 'Waking container for due messages')).toBeUndefined();
+    // The attempt count is byte-identical to what saveContinuation wrote —
+    // incrementStoppedContinuationAttempt never ran.
+    expect(readWorkContinuation(outDb)?.resume_attempts).toBe(CONTINUATION.resume_attempts);
+    info.mockRestore();
+  });
+
   // ── F-13.3 ─────────────────────────────────────────────────────────────────
   it('ceiling-kill accountability queues at most WORK_CONTINUATION_RESUME_MAX_ATTEMPTS wakes', async () => {
     const s10 = killFollowUp(SWEEP_DUTY_INVENTORY.S10);
