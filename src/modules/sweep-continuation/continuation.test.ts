@@ -1270,6 +1270,40 @@ describe('S2-PR13 — continuation and ceiling accountability, through the regis
     info.mockRestore();
   });
 
+  it('#602: an archived session with a stopped continuation consumes no attempt and takes no wake', async () => {
+    // Review finding: the archived gate originally sat AFTER
+    // incrementStoppedContinuationAttempt, so an archived session with a
+    // resumable continuation still spent an attempt every tick even though
+    // the wake it was spent for could never happen — and the restore that
+    // would undo a refused wake hangs off the wakeInFlight promise from the
+    // (skipped) requestWake call, so it never ran either. The gate is now the
+    // FIRST thing this duty does after the #359 spawn-in-flight check, mirroring
+    // that check's own early-return shape, so an archived session consumes
+    // nothing: no attempt increment, no wake, no log line.
+    const s9a = duty(SWEEP_DUTY_INVENTORY.S9a);
+    const s9b = duty(SWEEP_DUTY_INVENTORY.S9b);
+    const { outDb, mailbox } = makeSessionDbs();
+    saveContinuation(outDb, CONTINUATION);
+    mockGetContainerSpawnedAt.mockReturnValue(Date.now() - CONTINUATION_WAKE_MIN_INTERVAL_MS - 1);
+    const plan = emptyPlan({ workContinuation: readWorkContinuation(outDb) });
+    await s9a.run(sessionCtx(mailbox, plan));
+    // Eligible on a LIVE session — proves the fixture would actually be
+    // resumed if the archived gate were missing or misplaced.
+    expect(plan.continuationWakeEligible).toBe(true);
+
+    const archived: Session = { ...fakeSession(), archived_at: new Date().toISOString() };
+    const info = vi.spyOn(log, 'info').mockImplementation(() => undefined);
+    await s9b.run(sessionCtx(mailbox, plan, { session: archived }));
+    await _settleDetachedWakesForTesting();
+
+    expect(mockWakeContainer).not.toHaveBeenCalled();
+    expect(info.mock.calls.find((c) => c[0] === 'Waking container for due messages')).toBeUndefined();
+    // The attempt count is byte-identical to what saveContinuation wrote —
+    // incrementStoppedContinuationAttempt never ran.
+    expect(readWorkContinuation(outDb)?.resume_attempts).toBe(CONTINUATION.resume_attempts);
+    info.mockRestore();
+  });
+
   // ── F-13.3 ─────────────────────────────────────────────────────────────────
   it('ceiling-kill accountability queues at most WORK_CONTINUATION_RESUME_MAX_ATTEMPTS wakes', async () => {
     const s10 = killFollowUp(SWEEP_DUTY_INVENTORY.S10);

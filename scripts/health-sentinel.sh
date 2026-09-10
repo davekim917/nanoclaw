@@ -292,8 +292,12 @@ for r in rows:
     # Archived-session strand (#602) takes priority over the paused-age check
     # below: a series in this state will never fire again no matter how long
     # it waits, and `ncl tasks resume` — the paused-age finding's own remedy —
-    # cannot fix it, because the session it would resume onto is gone. Only
-    # `ncl tasks cancel`/`pause` (to end the series) is an honest fix here.
+    # cannot fix it, because the session it would resume onto is gone. This
+    # check ignores `status` on purpose (pending AND paused both breach): a
+    # paused series bound to an archived session is exactly as stranded as a
+    # pending one, and pausing an already-pending one does not clear this
+    # breach either. Only `ncl tasks cancel` (to end the series) is an honest
+    # fix here — see the ARCHIVED message below for why `pause` is not offered.
     if r.get("session_id") in archived:
         print(f"ARCHIVED|{series_id}|{r.get('status')}|{r.get('session_id')}")
         continue
@@ -317,7 +321,7 @@ PYEOF
     case "$kind" in
       ERROR)    BREACHES+=("paused-series|$a") ;;
       PAUSED)   BREACHES+=("paused-$a|scheduled series '$a' has been paused $b and nothing else reports that — it is not going to run again until somebody resumes it (\`ncl tasks resume $a\`) or retires it") ;;
-      ARCHIVED) BREACHES+=("archived-series-$a|scheduled series '$a' is $b but its session ($c) is archived — every fire is silently refused (\"session is archived\") and nothing ever reopens the session; it is not going to run again until somebody ends the series (\`ncl tasks cancel --id $a\` or \`ncl tasks pause --id $a\`)") ;;
+      ARCHIVED) BREACHES+=("archived-series-$a|scheduled series '$a' is $b but its session ($c) is archived — every fire is silently refused (\"session is archived\") and nothing ever reopens the session; pausing it does not help, a paused series is still stranded the same way — cancel it (\`ncl tasks cancel --id $a\`), and if the work should keep running, recreate it with \`ncl tasks create\` (same prompt, recurrence and pins) after cancelling") ;;
     esac
   done <<< "$PAUSED_OUT"
 fi

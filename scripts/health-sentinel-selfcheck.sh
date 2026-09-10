@@ -249,12 +249,27 @@ esac
 # #602's own problem), so this vital is the only thing that reports the
 # strand at all.
 rm -f "$ROOT/data/health-sentinel-state.json"
+rm -f "$OUTBOX"/*health-sentinel*.md 2>/dev/null || true
 stub_ncl "echo '{\"data\":[{\"series_id\":\"ghost-y\",\"status\":\"pending\",\"session_id\":\"sess-archived\"}]}'"
 run_sentinel STUB_ARCHIVED_SESSION_IDS=sess-archived
 case "$(cat "$ROOT/data/health-sentinel-state.json")" in
   *'"archived-series-ghost-y"'*) ok "a pending series bound to an archived session breached" ;;
   *) bad "a pending series on an archived session did not breach" "$OUT" ;;
 esac
+# The remedy must be cancel-only. `ncl tasks pause` does not clear this
+# breach (a paused series is exactly as stranded), so offering it sends the
+# operator straight back into the same alert next cooldown.
+ARCHIVED_ALERT=$(ls -t "$OUTBOX"/*health-sentinel*.md 2>/dev/null | head -1)
+if [ -n "$ARCHIVED_ALERT" ] && grep -q 'ncl tasks cancel --id ghost-y' "$ARCHIVED_ALERT"; then
+  ok "archived-series remedy names ncl tasks cancel"
+else
+  bad "archived-series remedy did not name ncl tasks cancel" "alert=${ARCHIVED_ALERT:-<none>}"
+fi
+if [ -n "$ARCHIVED_ALERT" ] && grep -q 'ncl tasks pause' "$ARCHIVED_ALERT"; then
+  bad "archived-series remedy still suggests ncl tasks pause" "alert=$ARCHIVED_ALERT"
+else
+  ok "archived-series remedy does not suggest ncl tasks pause"
+fi
 
 # The strand shape #601 leaves behind (still pending/paused) must breach
 # regardless of which of the two live statuses it is.

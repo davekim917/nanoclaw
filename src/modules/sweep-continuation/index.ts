@@ -631,6 +631,33 @@ export function registerContinuationSweepDuties(): void {
         c.reportWoke(true);
         return;
       }
+      // `session.archived_at` gates admission alongside the checks above, and
+      // BEFORE the continuation-attempt increment below — not folded into the
+      // `if` a few lines down. `unwakeableReason` already refuses an archived
+      // session with "session is archived" (`container-runner.ts:694`) — but
+      // that refusal comes back as the same `false` a transient spawn failure
+      // returns, which by design leaves the due row pending for the next tick
+      // (see the comment on `wakeContainer never throws` below). An archived
+      // session can never take a wake (nothing ever clears `archived_at` —
+      // `unarchiveSessionById` has no callers), so without this gate the row
+      // is retried and refused every tick, forever, logging this duty's INFO
+      // line each time with no backoff and no terminal state. Early return,
+      // mirroring the `detachedWakes`/`isContainerSpawning` shape above,
+      // rather than an extra clause on the `if` below: `plan.continuationWakeEligible`
+      // being true would otherwise still reach `incrementStoppedContinuationAttempt`
+      // and consume an attempt EVERY tick for a wake that can never happen —
+      // the attempt is spent, but the restore that undoes a refused wake hangs
+      // off the `wakeInFlight` promise from the `requestWake` call below, which
+      // an archived session never reaches. No `reportWoke` call: nothing
+      // started, so `justWoke` stays at its default `false`, exactly like the
+      // "nothing due" case this duty already falls through with no wake.
+      // `scripts/health-sentinel.sh` is what reports the stranded row to the
+      // operator instead, once per cooldown rather than once per tick. Reads
+      // the tick's own session snapshot rather than a fresh row — the same
+      // staleness this duty's `status` check already tolerates a few lines
+      // below, and `archived_at` only ever transitions unset → set, so a stale
+      // read can under-skip (retried next tick) but never over-skip.
+      if (session.archived_at != null) return;
       // Both of these open a mailbox of their own, so both go through the
       // window — an unopenable mailbox here is 'Host sweep mailbox unopenable'
       // with window 'session:wake', not the helper's legacy warning, and it
@@ -644,24 +671,7 @@ export function registerContinuationSweepDuties(): void {
       // session context and the tick moves on, so the detached continuation
       // must not read it later.
       const continuationForRestore = plan.workContinuation;
-      // `session.archived_at` gates admission alongside `isContainerRunning`,
-      // not just inside `wakeContainer`. `unwakeableReason` already refuses an
-      // archived session with "session is archived" (`container-runner.ts:694`)
-      // — but that refusal comes back as the same `false` a transient spawn
-      // failure returns, which by design leaves the due row pending for the
-      // next tick (see the comment on `wakeContainer never throws` below). An
-      // archived session can never take a wake (nothing ever clears
-      // `archived_at` — `unarchiveSessionById` has no callers), so without this
-      // gate the row is retried and refused every tick, forever, logging this
-      // INFO line each time with no backoff and no terminal state. Skipping
-      // admission here means neither the log nor the wake attempt happens;
-      // `scripts/health-sentinel.sh` is what reports the stranded row to the
-      // operator instead, once per cooldown rather than once per tick. Reads
-      // the tick's own session snapshot rather than a fresh row — the same
-      // staleness this duty's `status` check already tolerates a few lines
-      // below, and `archived_at` only ever transitions unset → set, so a stale
-      // read can under-skip (retried next tick) but never over-skip.
-      if ((plan.dueCount > 0 || continuationWake) && !isContainerRunning(session.id) && session.archived_at == null) {
+      if ((plan.dueCount > 0 || continuationWake) && !isContainerRunning(session.id)) {
         log.info('Waking container for due messages', {
           sessionId: session.id,
           count: plan.dueCount,
