@@ -92,7 +92,20 @@ exec "$HOOK_REAL_TSX" "$script" "$@"
     path.join(bin, 'git'),
     `#!/bin/sh
 if [ "$1" = -C ] && [ "$3" = ls-remote ]; then shift 2; fi
+if [ "$1" = ls-remote ] && [ "$2" = --get-url ]; then
+  # Default: echo the URL back unchanged (no fetch-side rewrite in play).
+  # HOOK_GET_URL overrides it to simulate insteadOf resolving elsewhere.
+  printf '%s\\n' "\${HOOK_GET_URL:-$3}"
+  exit 0
+fi
 if [ "$1" = ls-remote ]; then
+  if [ "\${HOOK_LS_REMOTE_FAIL_AFTER_OUTPUT:-}" = 1 ]; then
+    # Simulates a real ls-remote that prints partial refs and THEN fails —
+    # the hook must not trust anything written to the redirected file once
+    # the command's own exit status says it failed.
+    printf '%s' "\${HOOK_REMOTE_REFS:-}"
+    exit 1
+  fi
   [ "\${HOOK_LS_REMOTE_FAIL:-}" != 1 ] || exit 1
   case "\${HOOK_REQUIRE_CONFIG:-}" in
     count) [ "\${GIT_CONFIG_COUNT:-}" = 1 ] || exit 1 ;;
@@ -122,6 +135,8 @@ function push(
     fail?: string;
     remoteRefs?: string;
     remoteFailure?: boolean;
+    lsRemoteFailAfterOutput?: boolean;
+    getUrl?: string;
     sourceGitEnv?: boolean;
     commandScopedConfig?: 'count' | 'parameters';
     withoutIonice?: boolean;
@@ -154,6 +169,8 @@ exec "$@"
       HOOK_FAIL: options.fail ?? '',
       HOOK_REMOTE_REFS: options.remoteRefs ?? '',
       HOOK_LS_REMOTE_FAIL: options.remoteFailure ? '1' : '',
+      HOOK_LS_REMOTE_FAIL_AFTER_OUTPUT: options.lsRemoteFailAfterOutput ? '1' : '',
+      HOOK_GET_URL: options.getUrl ?? '',
       HOOK_REQUIRE_CONFIG: options.commandScopedConfig ?? '',
       HOOK_REAL_GIT: realGit,
       HOOK_REAL_TSX: realTsx,
@@ -312,6 +329,127 @@ describe('.husky/pre-push', () => {
     expect(result.status).toBe(1);
     expect(records(f.log).join('\n')).toContain('missing-baseline-push');
     expect(records(f.log).join('\n')).not.toContain('remote-base');
+  });
+
+  it('excludes a commit already reachable via a known remote tip, even for an existing ref whose own remote_sha predates it', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    // Already published to origin via `main` (advertised below), but NOT an
+    // ancestor of this ref's own remote_sha — exactly what a branch merging
+    // (or rebasing onto) a newer main looks like.
+    const publishedViaMain = commit(f.root, 'already-on-main');
+    const pushed = commit(f.root, 'new-on-branch');
+    const result = push(f, `refs/heads/current ${pushed} refs/heads/current ${base}\n`, {
+      fail: 'boundary:already-on-main',
+      remoteRefs: `${publishedViaMain}\trefs/heads/main\n`,
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(records(f.log).join('\n')).toContain('new-on-branch');
+    expect(records(f.log).join('\n')).not.toContain('already-on-main');
+  });
+
+  it('still scans a genuinely new commit on that same existing-ref push', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const publishedViaMain = commit(f.root, 'clean-on-main');
+    const pushed = commit(f.root, 'flagged-new-work');
+    const result = push(f, `refs/heads/current ${pushed} refs/heads/current ${base}\n`, {
+      fail: 'boundary:flagged-new-work',
+      remoteRefs: `${publishedViaMain}\trefs/heads/main\n`,
+    });
+
+    expect(result.status).toBe(1);
+    expect(records(f.log).join('\n')).toContain('flagged-new-work');
+  });
+
+  it('falls back to the old remote_sha..local_sha range, and still scans it, when ls-remote fails on an existing-ref push', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const pushed = commit(f.root, 'flagged-in-fallback-range');
+    const result = push(f, `refs/heads/current ${pushed} refs/heads/current ${base}\n`, {
+      fail: 'boundary:flagged-in-fallback-range',
+      remoteFailure: true,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('falling back to each ref');
+    expect(records(f.log).join('\n')).toContain('flagged-in-fallback-range');
+  });
+
+  it('leaves a new-ref push unaffected by the always-on ls-remote lookup', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const pushed = commit(f.root, 'new-ref-push');
+    const result = push(f, `refs/heads/new ${pushed} refs/heads/new ${zeroSha}\n`, {
+      fail: 'boundary:new-ref-push',
+      remoteRefs: `${base}\trefs/heads/main\n`,
+    });
+
+    expect(result.status).toBe(1);
+    expect(records(f.log).join('\n')).toContain('new-ref-push');
+    expect(records(f.log).join('\n')).not.toContain('remote-base');
+  });
+
+  it('refuses to trust ls-remote once fetch-side URL rewriting is detected, for an existing ref', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    // If the hook trusted a rewritten (mirror) ls-remote, this tip would be
+    // reported as already known and would wrongly exclude the flagged
+    // commit below — exactly the false negative a mirror-vs-push-target
+    // mismatch produces against a real remote.
+    const wouldBeTrustedTip = commit(f.root, 'already-on-main');
+    const pushed = commit(f.root, 'new-on-branch');
+    const result = push(f, `refs/heads/current ${pushed} refs/heads/current ${base}\n`, {
+      fail: 'boundary:already-on-main',
+      remoteRefs: `${wouldBeTrustedTip}\trefs/heads/main\n`,
+      getUrl: 'https://internal-mirror.invalid/nanoclaw.git',
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('fetch-side URL rewriting');
+    expect(records(f.log).join('\n')).toContain('already-on-main');
+  });
+
+  it('refuses to trust ls-remote once fetch-side URL rewriting is detected, for a new ref', () => {
+    const f = fixture();
+    const pushed = commit(f.root, 'new-ref-under-rewrite');
+    const result = push(f, `refs/heads/new ${pushed} refs/heads/new ${zeroSha}\n`, {
+      getUrl: 'https://internal-mirror.invalid/nanoclaw.git',
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('fetch-side URL rewriting');
+  });
+
+  it('never trusts stdout from a failed ls-remote, even when it printed refs before failing', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    // If this printed-then-failed tip were trusted, it would wrongly exclude
+    // the flagged commit below (it IS the flagged commit's own SHA).
+    const pushed = commit(f.root, 'flagged-despite-printed-tip');
+    const result = push(f, `refs/heads/current ${pushed} refs/heads/current ${base}\n`, {
+      fail: 'boundary:flagged-despite-printed-tip',
+      remoteRefs: `${pushed}\trefs/heads/main\n`,
+      lsRemoteFailAfterOutput: true,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('falling back to each ref');
+    expect(records(f.log).join('\n')).toContain('flagged-despite-printed-tip');
+  });
+
+  it('fails closed for an existing ref whose remote_sha is unknown locally when ls-remote fails', () => {
+    const f = fixture();
+    const pushed = commit(f.root, 'unknown-baseline-push');
+    const missingRemote = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const result = push(f, `refs/heads/current ${pushed} refs/heads/current ${missingRemote}\n`, {
+      remoteFailure: true,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('failed to list advertised refs');
+    expect(fs.existsSync(f.log)).toBe(false);
   });
 
   it('fails closed when live advertised refs cannot be listed', () => {

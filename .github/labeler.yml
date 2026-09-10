@@ -47,5 +47,11 @@ risk:high:
     - 'pnpm-workspace.yaml'
     # Deploy and rollback (src/deploy-crash-guard.ts is covered by *guard*)
     - 'scripts/deploy.sh'
-    # The gate itself: CI workflows and this file
+    # The gates themselves: CI workflows, this file, the git hooks, and the public-boundary
+    # checkers and allowlist. CI runs only the portable boundary mode, so the strict
+    # identifier check runs only in the hooks and the daily remote scan.
     - '.github/**'
+    - '.husky/**'
+    - 'scripts/check-public-boundary.ts'
+    - 'scripts/check-remote-boundary.ts'
+    - '.public-boundary-allowlist.json'
