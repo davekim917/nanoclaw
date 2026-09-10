@@ -1,6 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { randomUUID } from 'node:crypto';
 
 import { z } from 'zod';
 import {
@@ -451,6 +452,7 @@ interface SDKUserMessage {
   message: { role: 'user'; content: string };
   parent_tool_use_id: null;
   session_id: string;
+  uuid: ReturnType<typeof randomUUID>;
 }
 
 /**
@@ -460,13 +462,25 @@ class MessageStream {
   private queue: SDKUserMessage[] = [];
   private waiting: (() => void) | null = null;
   private done = false;
+  /**
+   * Every uuid this stream stamped on a prompt. The CLI echoes a consumed
+   * prompt's uuid on the result of the turn that answered it
+   * (`user_message_uuid`/`user_message_uuids` on SDKResultSuccess and
+   * SDKResultError in sdk.d.ts) and echoes none on a turn it started itself.
+   * Matching against this set, rather than accepting any echoed id, ignores
+   * ids the CLI mints for its own queued work.
+   */
+  readonly stamped = new Set<string>();
 
   push(text: string): void {
+    const uuid = randomUUID();
+    this.stamped.add(uuid);
     this.queue.push({
       type: 'user',
       message: { role: 'user', content: text },
       parent_tool_use_id: null,
       session_id: '',
+      uuid,
     });
     this.waiting?.();
   }
@@ -2708,6 +2722,8 @@ export class ClaudeProvider implements AgentProvider {
             result?: string;
             is_error?: boolean;
             errors?: string[];
+            user_message_uuid?: string;
+            user_message_uuids?: string[];
             usage?: {
               input_tokens?: number | null;
               output_tokens?: number | null;
@@ -2761,6 +2777,11 @@ export class ClaudeProvider implements AgentProvider {
             type: 'result',
             text,
             isError: m.is_error === true,
+            // Whether this turn consumed a prompt this stream pushed. See
+            // MessageStream.stamped.
+            prompted: [...(m.user_message_uuids ?? []), ...(m.user_message_uuid ? [m.user_message_uuid] : [])].some(
+              (id) => stream.stamped.has(id),
+            ),
             // Effort is a request parameter — no API bills it back, so it is
             // stamped on here rather than read out of `modelUsage`. On a
             // multi-model turn only the entry for `activeModel` gets it; the

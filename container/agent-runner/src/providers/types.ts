@@ -459,6 +459,15 @@ export type ProviderEvent =
       type: 'result';
       text: string | null;
       isError?: boolean;
+      /**
+       * Whether this turn consumed a prompt the runner pushed. `false` only
+       * when the provider can tell it did not: a turn the CLI started itself,
+       * such as its synthetic "Continue from where you left off." turn on
+       * resuming an interrupted session, or one a background-task notification
+       * started. Undefined when the provider cannot tell, which poll-loop treats
+       * as prompted.
+       */
+      prompted?: boolean;
       usage?: TurnUsageInfo | TurnUsageInfo[];
       steps?: number | null;
       rateLimit?: { type: string | null; utilization: number | null; resetsAt: string | null } | null;

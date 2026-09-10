@@ -755,7 +755,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // fire that recovered push a series to the alert threshold, and a recovery
     // whose retries were all exhausted would otherwise write none at all
     // (that path throws past every result branch). Later attempts overwrite
-    // earlier ones, so the value here is always the fire's FINAL result.
+    // earlier ones in this map, but the record itself is written once, when the
+    // first outcome is reported (`writeFireOutcome` below).
     //
     // INVARIANT: one admitted task turn produces exactly one outcome record.
     //
@@ -768,6 +769,33 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       for (const turn of turns ?? []) {
         if (turn.outcome) fireOutcomes.set(turn.key, turn.outcome);
       }
+    };
+    // Written when the turn reports it, not when the fire ends. A task stream
+    // is never ended, so the fire "ends" only when the host reaps its
+    // container, and nothing can be written after that. The `finally` writes
+    // only what this never did: a synthesised failure, or a write that failed
+    // here. Once per fire key, so a retry of the same batch cannot add a
+    // second record.
+    const writtenFireKeys = new Set<string>();
+    const writeFireOutcome = async (key: string, outcome: FireOutcome): Promise<void> => {
+      if (writtenFireKeys.has(key)) return;
+      try {
+        await autoAppendTaskLog(outcome.text, outcome.isError, outcome.model);
+        writtenFireKeys.add(key);
+      } catch (logErr) {
+        log(`Could not record task run outcome: ${logErr instanceof Error ? logErr.message : String(logErr)}`);
+      }
+    };
+    const reportTaskOutcome = async (key: string, reported: FireOutcome): Promise<void> => {
+      fireOutcomes.set(key, reported);
+      const outcome = resolveFireOutcome({
+        taskRun: routing.taskRun === true,
+        deferredForRepositoryBarrier,
+        deferredToFallback,
+        reported,
+        model: effectiveModel,
+      });
+      if (outcome) await writeFireOutcome(key, outcome);
     };
     /** Set when every attempt threw, so the `finally` can synthesise a failure. */
     let fireErrorMessage: string | undefined;
@@ -786,6 +814,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         undefined,
         suppressContinuationUntilRealInbound,
         trigger,
+        reportTaskOutcome,
       );
       mergeTaskTurns(result.taskTurns);
       if (result.continuation && result.continuation !== continuation) {
@@ -875,6 +904,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
               undefined,
               suppressContinuationUntilRealInbound,
               trigger,
+              reportTaskOutcome,
             );
             mergeTaskTurns(retryResult.taskTurns);
             if (retryResult.continuation && retryResult.continuation !== continuation) {
@@ -958,6 +988,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
               undefined,
               suppressContinuationUntilRealInbound,
               trigger,
+              reportTaskOutcome,
             );
             mergeTaskTurns(retryResult.taskTurns);
             if (retryResult.continuation && retryResult.continuation !== continuation) {
@@ -1039,6 +1070,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             undefined,
             suppressContinuationUntilRealInbound,
             trigger,
+            reportTaskOutcome,
           );
           mergeTaskTurns(retryResult.taskTurns);
           if (retryResult.continuation && retryResult.continuation !== continuation) {
@@ -1116,6 +1148,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             undefined,
             suppressContinuationUntilRealInbound,
             trigger,
+            reportTaskOutcome,
           );
           mergeTaskTurns(retryResult.taskTurns);
           if (retryResult.continuation) {
@@ -1180,6 +1213,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             undefined,
             suppressContinuationUntilRealInbound,
             trigger,
+            reportTaskOutcome,
           );
           mergeTaskTurns(retryResult.taskTurns);
           if (retryResult.continuation) {
@@ -1247,6 +1281,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             undefined,
             suppressContinuationUntilRealInbound,
             trigger,
+            reportTaskOutcome,
           );
           mergeTaskTurns(retryResult.taskTurns);
           if (retryResult.continuation) {
@@ -1339,14 +1374,16 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // here and not there.
       //
       // Best-effort; a bookkeeping write must never mask the turn's own error.
-      // Flush ONE record per admitted task turn, in admission order. A turn
+      // Flush ONE record per admitted task turn, in admission order, skipping
+      // any written when its turn reported it (`writeFireOutcome`). A turn
       // with no outcome and no error to synthesise from records nothing; a
       // deferred batch records nothing at all, because the same occurrence runs
       // again and that re-run records its own.
       {
         const flush: Array<[string, FireOutcome | undefined]> =
           fireOutcomes.size > 0 ? [...fireOutcomes.entries()] : [[initialTurnKey, undefined]];
-        for (const [, reported] of flush) {
+        for (const [key, reported] of flush) {
+          if (writtenFireKeys.has(key)) continue;
           const outcome = resolveFireOutcome({
             taskRun: routing.taskRun === true,
             deferredForRepositoryBarrier,
@@ -1356,11 +1393,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             model: effectiveModel,
           });
           if (!outcome) continue;
-          try {
-            await autoAppendTaskLog(outcome.text, outcome.isError, outcome.model);
-          } catch (logErr) {
-            log(`Could not record task run outcome: ${logErr instanceof Error ? logErr.message : String(logErr)}`);
-          }
+          await writeFireOutcome(key, outcome);
         }
       }
       if (abortActiveQuery) config.signal?.removeEventListener('abort', abortActiveQuery);
@@ -1605,6 +1638,12 @@ export async function processQuery(
   // changes cause partway through is rare enough that merging it into the
   // call's original trigger beats fabricating a per-event reclassification.
   trigger: TurnTrigger = 'unknown',
+  // Called as soon as a task turn's outcome is known, so the caller records it
+  // then rather than when this call returns. A Claude stream stays open after
+  // its result (claude.ts ends it only on end()/abort) and a task stream is
+  // never ended, so this call can outlive its container: the host reaps it
+  // first, and an outcome held for the return is never written.
+  onTaskOutcome?: (key: string, outcome: FireOutcome) => Promise<void>,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
@@ -1646,9 +1685,10 @@ export async function processQuery(
    * whole path exists to hold: *one admitted task turn produces exactly one
    * outcome record*.
    *
-   * Reported up rather than written here, because one `processQuery` call is
-   * one ATTEMPT, not one fire — the outer loop re-invokes it for in-turn
-   * recovery, so only the caller knows which attempt was final.
+   * Reported up rather than written here, through `onTaskOutcome` as each turn
+   * is answered and again in the return value, because one `processQuery`
+   * call is one ATTEMPT, not one fire: the outer loop re-invokes it for in-turn
+   * recovery, so only the caller can keep a fire's record to exactly one.
    */
   const taskTurns: TaskTurnRecord[] = [];
   if (routing.taskRun && initialBatchIds.length > 0) {
@@ -1661,9 +1701,11 @@ export async function processQuery(
    * the turn that just closed, and is deliberately dropped: coalescing is
    * scoped to retries OF a turn, never across turns.
    */
-  const recordTaskTurn = (outcome: FireOutcome): void => {
+  const recordTaskTurn = async (outcome: FireOutcome): Promise<void> => {
     const open = taskTurns.find((t) => !t.outcome);
-    if (open) open.outcome = outcome;
+    if (!open) return;
+    open.outcome = outcome;
+    await onTaskOutcome?.(open.key, outcome);
   };
   // Prompt queue for the exchange hook — each result event consumes the
   // oldest unanswered prompt, except a wrapping-retry result, which answers
@@ -2146,6 +2188,16 @@ export async function processQuery(
         setProviderTurnExecuting(true);
       } else if (event.type === 'result') {
         sawResult = true; // the SDK produced output → any prior api_retry recovered
+        // A turn that consumed none of the runner's prompts never answers a
+        // task fire: the CLI's synthetic "Continue from where you left off."
+        // turn on resuming an interrupted session, or a turn a background-task
+        // notification started. Recorded, it would take the fire's one outcome
+        // slot and drop the real turn's result (#606). Only a provider that can
+        // tell says `false`; undefined keeps every result eligible.
+        const answersRunnerPrompt = event.prompted !== false;
+        if (routing.taskRun && !answersRunnerPrompt) {
+          log('Result answered no runner prompt (a turn the CLI started itself); not recorded as the task outcome');
+        }
         // The provider is between turns as of right now. Set before the
         // handling below, so any push it makes (nudge, continuation launch)
         // clears the flag again and leaves it truthful on exit.
@@ -2252,8 +2304,8 @@ export async function processQuery(
           }
           const { sent, hasUnwrapped, taskBlocks } = await dispatchResultText(event.text, routing);
           const willRetryTaskBlocks = shouldNudgeTaskBlocks(routing.taskRun, taskBlocks, taskBlockNudged);
-          if (routing.taskRun && !taskBlockNudged)
-            recordTaskTurn({ text: event.text, isError: event.isError === true, model: modelInForce });
+          if (routing.taskRun && !taskBlockNudged && answersRunnerPrompt)
+            await recordTaskTurn({ text: event.text, isError: event.isError === true, model: modelInForce });
           if ((event.isError === true || aupRefusal) && !routing.taskRun) {
             // Non-retryable error turn (e.g. a 403 billing_error) with no
             // <message> envelope: deliver the notice instead of dropping it as
@@ -2305,8 +2357,8 @@ export async function processQuery(
           // recording it is what lets a recovered run RESET a stale failure
           // streak — skipping it would leave the streak frozen at its last
           // failing value across a recovery.
-          if (routing.taskRun && !taskBlockNudged) {
-            recordTaskTurn({ text: '', isError: event.isError === true, model: modelInForce });
+          if (routing.taskRun && !taskBlockNudged && answersRunnerPrompt) {
+            await recordTaskTurn({ text: '', isError: event.isError === true, model: modelInForce });
           }
           pauseAnsweredPrompt();
         }

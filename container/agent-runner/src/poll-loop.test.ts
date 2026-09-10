@@ -291,6 +291,149 @@ describe('repository mount poll and tool admission barrier', () => {
     }
   }, 5_000);
 
+  // A Claude stream outlives its result (claude.ts ends it only on
+  // end()/abort), and a task stream is never ended: ending one closes the CLI's
+  // stdin while it may still run a queued turn, and every hook callback on that
+  // turn then fails open. So a task fire's outcome is written when its turn
+  // reports it. Held for processQuery's return, it died with the container the
+  // host reaped first: 12,523 task runs had produced one run-outcome row
+  // (2026-09-10). The fakes above close their own generators after `result`,
+  // which is what hid this.
+  function openAfterResultProvider(
+    opts: { failFirst?: Error; turns?: Array<{ text: string | null; prompted?: boolean }> } = {},
+  ) {
+    let queryCalls = 0;
+    const endedAttempts: number[] = [];
+    const releases: Array<() => void> = [];
+    const provider = {
+      supportsNativeSlashCommands: false,
+      registerMemorySessionHook: () => {},
+      isSessionInvalid: () => false,
+      isRetryable: () => true,
+      rotateApiKey: () => ({ rotated: true }),
+      query: () => {
+        queryCalls += 1;
+        const attempt = queryCalls;
+        let release!: () => void;
+        const closed = new Promise<void>((resolve) => (release = resolve));
+        releases.push(release);
+        async function* events(): AsyncGenerator<ProviderEvent> {
+          yield { type: 'init', continuation: 'open-stream-session' };
+          if (opts.failFirst && attempt === 1) throw opts.failFirst;
+          const turns = opts.turns ?? [{ text: `Finished attempt ${attempt}.` }];
+          for (const [i, turn] of turns.entries()) {
+            if (i > 0) yield { type: 'init', continuation: 'open-stream-session' };
+            yield {
+              type: 'result',
+              text: turn.text,
+              ...(turn.prompted === undefined ? {} : { prompted: turn.prompted }),
+            };
+          }
+          await closed; // like claude.ts: the stream outlives its result
+        }
+        return {
+          push: () => {},
+          end: () => {
+            endedAttempts.push(attempt);
+            release();
+          },
+          abort: () => release(),
+          events: events(),
+        };
+      },
+    };
+    // The loop's abort listener is bound to the first query, not to a
+    // credential-rotation retry, so aborting the loop leaves a retry stream
+    // open. Tests release every stream they opened so no loop outlives them.
+    return { provider, endedAttempts, calls: () => queryCalls, releaseAll: () => releases.forEach((r) => r()) };
+  }
+
+  const taskLogRowsNow = (): Array<{ text?: string }> =>
+    (
+      getOutboundDb().prepare("SELECT content FROM messages_out WHERE kind = 'task_log'").all() as {
+        content: string;
+      }[]
+    ).map((r) => JSON.parse(r.content) as { text?: string });
+
+  async function waitForTaskLog(): Promise<void> {
+    const deadline = Date.now() + 3_000;
+    while (taskLogRowsNow().length === 0) {
+      if (Date.now() >= deadline) throw new Error('no task_log row: the fire outcome was never written');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+
+  function startOpenStreamLoop(fake: ReturnType<typeof openAfterResultProvider>) {
+    const abort = new AbortController();
+    const loop = runPollLoop({
+      provider: fake.provider as never,
+      providerName: 'claude',
+      cwd: '/tmp',
+      signal: abort.signal,
+      autosaveWorktrees: async () => ({ committed: [], failed: [], skipped: [] }),
+    });
+    return {
+      stop: async () => {
+        abort.abort();
+        fake.releaseAll();
+        await loop;
+      },
+    };
+  }
+
+  it('records a task fire outcome while the provider stream stays open after its result', async () => {
+    insertMessage('task-open-stream', 'task', { prompt: 'Summarise the release queue once.' });
+    const fake = openAfterResultProvider();
+    const run = startOpenStreamLoop(fake);
+    try {
+      await waitForTaskLog();
+      // Written without ending the stream: it may still run a turn.
+      expect(fake.endedAttempts).toEqual([]);
+    } finally {
+      await run.stop();
+    }
+    // Checked after the loop's own `finally` ran: still exactly one record.
+    expect(taskLogRowsNow().map((r) => r.text)).toEqual(['Finished attempt 1.']);
+  }, 5_000);
+
+  it('records one outcome for a fire rescued by credential rotation while the retry stream stays open', async () => {
+    insertMessage('task-open-stream-rotated', 'task', { prompt: 'Summarise the release queue once.' });
+    const fake = openAfterResultProvider({
+      failFirst: new Error("subscription_quota_exhausted: You've hit your weekly limit"),
+    });
+    const run = startOpenStreamLoop(fake);
+    try {
+      await waitForTaskLog();
+      expect(fake.calls()).toBe(2);
+      // The stream that ran the fire is never ended.
+      expect(fake.endedAttempts).not.toContain(2);
+    } finally {
+      await run.stop();
+    }
+    expect(taskLogRowsNow().map((r) => r.text)).toEqual(['Finished attempt 2.']);
+  }, 5_000);
+
+  it("records the task's turn, not the CLI's synthetic resume turn that answers first", async () => {
+    // Resuming an interrupted session, the CLI first answers its own "Continue
+    // from where you left off." turn, then runs the queued task prompt as a
+    // second turn. Only the second consumed a runner prompt (#606).
+    insertMessage('task-resumed', 'task', { prompt: 'Summarise the release queue once.' });
+    const fake = openAfterResultProvider({
+      turns: [
+        { text: null, prompted: false },
+        { text: 'Queue summarised.', prompted: true },
+      ],
+    });
+    const run = startOpenStreamLoop(fake);
+    try {
+      await waitForTaskLog();
+      expect(fake.endedAttempts).toEqual([]);
+    } finally {
+      await run.stop();
+    }
+    expect(taskLogRowsNow().map((r) => r.text)).toEqual(['Queue summarised.']);
+  }, 5_000);
+
   // R-8 (plan §8): the outer loop consults the admission seam, not the fence
   // directly. A registered gate that holds must stop dispatch entirely — no
   // claim, no provider call — and releasing it must let the same pending row
