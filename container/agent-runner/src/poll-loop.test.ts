@@ -300,7 +300,7 @@ describe('repository mount poll and tool admission barrier', () => {
   // (2026-09-10). The fakes above close their own generators after `result`,
   // which is what hid this.
   function openAfterResultProvider(
-    opts: { failFirst?: Error; turns?: Array<{ text: string | null; prompted?: boolean }> } = {},
+    opts: { failFirst?: Error; turns?: Array<{ text: string | null; answered?: string[] }>; settle?: string[] } = {},
   ) {
     let queryCalls = 0;
     const endedAttempts: number[] = [];
@@ -326,13 +326,19 @@ describe('repository mount poll and tool admission barrier', () => {
             yield {
               type: 'result',
               text: turn.text,
-              ...(turn.prompted === undefined ? {} : { prompted: turn.prompted }),
+              ...(turn.answered === undefined ? {} : { answeredPrompts: turn.answered }),
             };
           }
+          if (opts.settle) yield { type: 'settled', unansweredPrompts: opts.settle };
           await closed; // like claude.ts: the stream outlives its result
         }
+        // A fake that tracks prompt ids, like claude.ts, when the test gives
+        // its results ids.
+        const tracksIds = opts.turns?.some((t) => t.answered !== undefined) ?? false;
+        let pushes = 0;
         return {
-          push: () => {},
+          push: () => (tracksIds ? `p-push-${++pushes}` : undefined),
+          ...(tracksIds ? { initialPromptId: 'p-initial' } : {}),
           end: () => {
             endedAttempts.push(attempt);
             release();
@@ -420,8 +426,8 @@ describe('repository mount poll and tool admission barrier', () => {
     insertMessage('task-resumed', 'task', { prompt: 'Summarise the release queue once.' });
     const fake = openAfterResultProvider({
       turns: [
-        { text: null, prompted: false },
-        { text: 'Queue summarised.', prompted: true },
+        { text: null, answered: [] },
+        { text: 'Queue summarised.', answered: ['p-initial'] },
       ],
     });
     const run = startOpenStreamLoop(fake);
@@ -432,6 +438,26 @@ describe('repository mount poll and tool admission barrier', () => {
       await run.stop();
     }
     expect(taskLogRowsNow().map((r) => r.text)).toEqual(['Queue summarised.']);
+  }, 5_000);
+
+  it('records an outcome whose echo was dropped once the provider settles it at idle', async () => {
+    // The turn that consumed the task prompt carried no echo (the SDK lists
+    // when: a batch led by a meta prompt, a zeroed result). The provider
+    // settles the prompt at the CLI's idle, and that turn's result is the
+    // fire's outcome.
+    insertMessage('task-no-echo', 'task', { prompt: 'Summarise the release queue once.' });
+    const fake = openAfterResultProvider({
+      turns: [{ text: 'Answered without an echo.', answered: [] }],
+      settle: ['p-initial'],
+    });
+    const run = startOpenStreamLoop(fake);
+    try {
+      await waitForTaskLog();
+      expect(fake.endedAttempts).toEqual([]);
+    } finally {
+      await run.stop();
+    }
+    expect(taskLogRowsNow().map((r) => r.text)).toEqual(['Answered without an echo.']);
   }, 5_000);
 
   // R-8 (plan §8): the outer loop consults the admission seam, not the fence
@@ -2441,6 +2467,62 @@ describe('processQuery provider_executing', () => {
     expect(providerExecuting()).toBe(0);
   });
 
+  // #617: the CLI can answer a turn it started itself while the task prompt
+  // is still queued behind it. The provider says so (hasQueuedWork), and the
+  // level stays up across that gap instead of dropping until the next `init`.
+  it('holds the level across a turn the CLI starts while the task prompt is still queued', async () => {
+    const observed: Record<string, number> = {};
+    let queued = true;
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-queued' };
+      yield { type: 'result', text: null, answeredPrompts: [] };
+      observed.afterUnprompted = providerExecuting();
+      yield { type: 'init', continuation: 'sess-queued' };
+      queued = false; // the task prompt's own turn answers it
+      yield { type: 'result', text: '<internal>done</internal>', answeredPrompts: ['p-initial'] };
+      observed.afterAnswer = providerExecuting();
+    }
+    const query: AgentQuery = {
+      push: () => {},
+      initialPromptId: 'p-initial',
+      hasQueuedWork: () => queued,
+      end: () => {},
+      events: events(),
+      abort: () => {},
+    };
+
+    await processQuery(query, ERR_ROUTING, ['m-queued'], 'claude', undefined, 'prompt', undefined, {});
+
+    expect(observed.afterUnprompted).toBe(1);
+    expect(observed.afterAnswer).toBe(0);
+  });
+
+  it('lowers the level when the provider settles the queued prompt at idle', async () => {
+    const observed: Record<string, number> = {};
+    let queued = true;
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-settle' };
+      yield { type: 'result', text: null, answeredPrompts: [] };
+      observed.afterUnprompted = providerExecuting();
+      queued = false; // idle: the prompt was consumed with no echo
+      yield { type: 'settled', unansweredPrompts: ['p-initial'] };
+      observed.afterSettled = providerExecuting();
+    }
+    const query: AgentQuery = {
+      push: () => {},
+      initialPromptId: 'p-initial',
+      hasQueuedWork: () => queued,
+      end: () => {},
+      events: events(),
+      abort: () => {},
+    };
+
+    await processQuery(query, ERR_ROUTING, ['m-settle'], 'claude', undefined, 'prompt', undefined, {});
+
+    expect(observed.afterUnprompted).toBe(1);
+    expect(observed.afterSettled).toBe(0);
+  });
+
   // Baseline / negative control for the two SDK-started-turn cases above —
   // passes with or without the `init` fix (there is no second turn to miss),
   // so it proves the fix didn't just start pinning the flag unconditionally.
@@ -3042,6 +3124,42 @@ describe('durable continuation wiring', () => {
       // never merged into the still-running turn.
       expect(continuationPushes[0]!.before).toBe(false);
     }, 30_000);
+
+    // #617: the same merge from the other side. A turn the CLI started itself
+    // has answered, but the task prompt is still queued behind it, so the
+    // provider reports queued work and the launch must wait.
+    it('does not launch a continuation while the provider reports queued work', async () => {
+      const queuedContinuation = queueWorkContinuation('resume after queued prompt');
+      if (!queuedContinuation.accepted) throw new Error('expected continuation');
+      const pushes: Array<{ m: string; whileQueued: boolean }> = [];
+      let queued = true;
+
+      async function* events(): AsyncGenerator<ProviderEvent> {
+        yield { type: 'init', continuation: 'sess-queued' };
+        // Unprompted: the provider still holds the task prompt.
+        yield { type: 'result', text: null, answeredPrompts: [] };
+        await Bun.sleep(1600); // ≥3 poll ticks
+        queued = false;
+        yield { type: 'init', continuation: 'sess-queued' };
+        yield { type: 'result', text: '<internal>done</internal>', answeredPrompts: ['p-initial'] };
+      }
+      const query: AgentQuery = {
+        push: (m) => {
+          pushes.push({ m, whileQueued: queued });
+        },
+        initialPromptId: 'p-initial',
+        hasQueuedWork: () => queued,
+        end: () => {},
+        abort: () => {},
+        events: events(),
+      };
+
+      await processQuery(query, ERR_ROUTING, ['m-queued'], 'claude', undefined, 'prompt', undefined, {}, 'runner-a');
+
+      const launches = pushes.filter((p) => p.m.includes('resume after queued prompt'));
+      expect(launches).toHaveLength(1);
+      expect(launches[0]!.whileQueued).toBe(false);
+    }, 30_000);
   });
 
   it('explicit cancellation is idempotent', () => {
@@ -3201,6 +3319,69 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     expect(result.taskTurns![0]!.outcome?.text).toBe('first fire failed');
     expect(result.taskTurns![1]!.outcome?.text).toBe('second fire failed');
   }, 15_000);
+
+  // #617: with prompt ids, one result that answered two admitted fires (the
+  // CLI folded the second into the running turn) records BOTH, instead of
+  // leaving the later fire with no outcome.
+  it('records every fire one merged result answers', async () => {
+    insertMessage('occ-2', 'task', { prompt: 'second fire of the same series' });
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      // occ-2 is admitted during this window and folded into the running turn.
+      await Bun.sleep(1600);
+      yield { type: 'result', text: 'Both fires handled.', answeredPrompts: ['p-initial', 'p-push-1'] };
+    }
+    let pushes = 0;
+    const query: AgentQuery = {
+      push: () => `p-push-${++pushes}`,
+      initialPromptId: 'p-initial',
+      end: () => {},
+      abort: () => {},
+      applySettings: async () => {},
+      events: events(),
+    };
+
+    const result = await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {
+      ultracode: false,
+    });
+
+    expect(result.taskTurns!.map((t) => [t.key, t.outcome?.text])).toEqual([
+      ['occ-1', 'Both fires handled.'],
+      ['occ-2', 'Both fires handled.'],
+    ]);
+  }, 15_000);
+
+  // #617: a task-block nudge from a turn the CLI started itself used to set
+  // `taskBlockNudged`, which then kept the fire's real result out. With prompt
+  // ids the real result matches the fire's prompt, and the nudge's own answer
+  // matches none.
+  it('does not let a nudge from a CLI-started turn keep the real result out', async () => {
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      // Unprompted, and ending in an undelivered block: this draws the nudge.
+      yield { type: 'result', text: '<message to="someone">stray</message>', answeredPrompts: [] };
+      yield { type: 'init', continuation: 'c1' };
+      yield { type: 'result', text: 'Real answer.', answeredPrompts: ['p-initial'] };
+      yield { type: 'result', text: 'Nothing left to send.', answeredPrompts: ['p-push-1'] };
+    }
+    const pushed: string[] = [];
+    const query: AgentQuery = {
+      push: (m: string) => {
+        pushed.push(m);
+        return `p-push-${pushed.length}`;
+      },
+      initialPromptId: 'p-initial',
+      end: () => {},
+      abort: () => {},
+      events: events(),
+    };
+
+    const result = await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {});
+
+    expect(pushed.some((m) => m.includes('was not delivered'))).toBe(true);
+    expect(result.taskTurns!.map((t) => t.outcome?.text)).toEqual(['Real answer.']);
+  });
 
   it('a batch after a live change is compared against the LIVE settings, not the creation snapshot', async () => {
     // Round-2 P2, the same seam from the other side. `querySettings` is the
