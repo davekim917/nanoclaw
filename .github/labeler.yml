@@ -1,0 +1,51 @@
+# Risk-based review scope — the single source of truth for which PRs get Codex review.
+#
+# A PR that changes ANY path below is labeled `risk:high` by
+# .github/workflows/risk-label.yml, and only `risk:high` PRs are reviewed. Everything
+# else merges on green CI. Rationale, audit data and rollback condition:
+# docs/specs/risk-based-review/plan.md.
+#
+# Rule for adding a path: a mistake there is privileged, irreversible, or silently
+# breaks every session — AND no deterministic gate already covers it. Upstream-owned
+# files are deliberately absent: the upstream ratchet already gates them in CI.
+#
+# Replayed against PRs #510–#595 on 2026-09-10: 18 of 60 (30%) would be reviewed.
+# `sync-labels: true` removes the label when a later push stops touching these paths.
+# To request review on a PR this file does not select, add `review:requested` by hand —
+# never `risk:high`, which is machine-owned and would be removed on the next sync.
+
+risk:high:
+- changed-files:
+  - any-glob-to-any-file:
+    # Privileged-action decision seams (host + container) — named *guard* by convention
+    - 'src/**/*guard*.ts'
+    - 'container/agent-runner/src/**/*guard*.ts'
+    - 'src/guard/**'
+    # The message path, both ends
+    - 'src/router.ts'
+    - 'src/delivery.ts'
+    # Everything on a timer — the sweep plus the modules it was decomposed into
+    - 'src/host-sweep.ts'
+    - 'src/modules/sweep-scheduling/**'
+    # Session DBs: the sole host<->container IO surface
+    - 'src/modules/mailbox/**'
+    - 'src/mailbox/sqlite/**'
+    - 'container/agent-runner/src/mailbox/sqlite/**'
+    - 'container/agent-runner/src/db/**'
+    - 'container/agent-runner/src/poll-loop.ts'
+    # Agents editing their own container config
+    - 'src/modules/self-mod/**'
+    # Credential, identity and privilege scoping (onecliSecrets, cli_scope, mounts)
+    - 'src/onecli-secrets.ts'
+    - 'src/container-config.ts'
+    - 'src/container-runner.ts'
+    - 'src/cli/dispatch.ts'
+    - 'src/cli/registry.ts'
+    # Irreversible against a live DB
+    - 'src/db/migrations/**'
+    # Supply chain: pnpm allowBuilds lives here
+    - 'pnpm-workspace.yaml'
+    # Deploy and rollback (src/deploy-crash-guard.ts is covered by *guard*)
+    - 'scripts/deploy.sh'
+    # The gate itself: CI workflows and this file
+    - '.github/**'
