@@ -56,7 +56,7 @@ export const UPSTREAM_FILES: readonly string[] = [
   'container/agent-runner/src/mailbox/index.ts',
   'container/agent-runner/src/mailbox/model.generated.ts',
   'container/agent-runner/src/mailbox/registry.test.ts',
-  'container/agent-runner/src/mailbox/sqlite/connection.ts',
+  // 'container/agent-runner/src/mailbox/sqlite/connection.ts' — FORK DIVERGED, see FORK_DIVERGED_UPSTREAM_FILES.
   'container/agent-runner/src/mailbox/sqlite/index.ts',
   'container/agent-runner/src/mailbox/sqlite/operations.ts',
   'container/agent-runner/src/mailbox/sqlite/sqlite.test.ts',
@@ -129,9 +129,15 @@ export const UNPORTABLE_UPSTREAM_FILES: ReadonlyArray<{
  * ("give a task occurrence its own scheduled_for") to add the fork-only
  * `scheduled_for` column so a retry backoff can't rewrite a task
  * occurrence's original slot. See docs/specs/upstream-mailbox-seam/plan.md.
+ *
+ * container/agent-runner/src/mailbox/sqlite/connection.ts: diverged in e4cefa3c8
+ * (#588) to add refuseProductionSessionDbUnderTest() and its call from
+ * getOutboundDb, so a test that skipped initTestSessionDb() can no longer
+ * silently create the production-path session DB.
  */
 export const FORK_DIVERGED_UPSTREAM_FILES: readonly string[] = [
   'container/agent-runner/src/db/messages-in.ts',
+  'container/agent-runner/src/mailbox/sqlite/connection.ts',
 ] as const;
 
 export interface MailboxSeamManifest {

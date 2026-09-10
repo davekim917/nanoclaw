@@ -6,8 +6,16 @@ on:
   push:
     branches: [main]
 
+# Two jobs, run in parallel, both blocking. The split is purely about
+# legibility: `correctness` red means the code is broken, `bookkeeping` red
+# means a committed manifest is stale and needs regenerating. When both lived in
+# one job they showed up as the same failing step, so a stale-manifest failure
+# read like a real regression and a real regression could hide behind an
+# already-red run — three consecutive pushes landed on a red main on
+# 2026-09-08/09 that way. Neither job gets continue-on-error; the point is
+# telling the two kinds of red apart, not tolerating either.
 jobs:
-  ci:
+  correctness:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,9 +38,6 @@ jobs:
       - name: Format check
         run: pnpm run format:check
 
-      - name: Public repository boundary
-        run: pnpm run check:public-boundary -- --portable
-
       # Seam 3 — neither pre-push locally (bypassed with --no-verify, or a
       # push from a checkout without husky's git hooks wired) nor the
       # `prebuild` guard (only reached by `pnpm run build`, which CI never
@@ -52,23 +57,12 @@ jobs:
       - name: Typecheck container
         run: pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
 
+      # Everything except the three drift tests, which belong to `bookkeeping`.
+      # See DRIFT_TESTS in vitest.config.ts.
       - name: Host tests
         run: pnpm exec vitest run
-
-      # The host suite can only prove src/upstream-ratchet.json is CURRENT — it
-      # has no git and this clone carries no upstream objects. Recomputing the
-      # diff numbers needs the pinned commit, so fetch exactly that one object
-      # (GitHub serves a by-sha fetch; --depth=1 keeps it to a single commit,
-      # under a second) and let the report arbitrate. Without this step the
-      # manifest's numbers are self-reported: a PR could regenerate it with
-      # --accept-all and nothing would ever recheck the arithmetic.
-      # Exit 1 = a diff grew or became newly divergent. Exit 2 = the fetch did
-      # not land, which is an infrastructure failure, not a ratchet failure.
-      - name: Upstream divergence ratchet
-        run: |
-          git fetch --depth=1 https://github.com/nanocoai/nanoclaw.git \
-            "$(node -p "require('./src/upstream-ratchet.json').upstream")"
-          pnpm run ratchet:report
+        env:
+          VITEST_LANE: correctness
 
       - name: Container tests
         working-directory: container/agent-runner
@@ -91,3 +85,44 @@ jobs:
         # natural home for it, but that file is a byte-for-byte upstream port
         # pinned by src/mailbox-seam-upstream.test.ts.
         run: bun run test
+
+  bookkeeping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      # No Bun here on purpose: every step in this job is Node-only, and
+      # installing it would let a bun.lock or Bun-pin change red the
+      # BOOKKEEPING job for a reason that has nothing to do with bookkeeping.
+      # Keeping each job's red meaningful is the whole point of the split.
+      - run: pnpm install --frozen-lockfile
+
+      - name: Public repository boundary
+        run: pnpm run check:public-boundary -- --portable
+
+      # The host suite can only prove src/upstream-ratchet.json is CURRENT — it
+      # has no git and this clone carries no upstream objects. Recomputing the
+      # diff numbers needs the pinned commit, so fetch exactly that one object
+      # (GitHub serves a by-sha fetch; --depth=1 keeps it to a single commit,
+      # under a second) and let the report arbitrate. Without this step the
+      # manifest's numbers are self-reported: a PR could regenerate it with
+      # --accept-all and nothing would ever recheck the arithmetic.
+      # Exit 1 = a diff grew or became newly divergent. Exit 2 = the fetch did
+      # not land, which is an infrastructure failure, not a ratchet failure.
+      - name: Upstream divergence ratchet
+        run: |
+          git fetch --depth=1 https://github.com/nanocoai/nanoclaw.git \
+            "$(node -p "require('./src/upstream-ratchet.json').upstream")"
+          pnpm run ratchet:report
+
+      # The three manifest-freshness tests. Red here means "regenerate and
+      # commit an artifact", never "the code is broken". See DRIFT_TESTS in
+      # vitest.config.ts.
+      - name: Drift tests
+        run: pnpm exec vitest run
+        env:
+          VITEST_LANE: drift
