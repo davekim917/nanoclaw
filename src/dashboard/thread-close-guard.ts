@@ -30,9 +30,13 @@
  *     reopens it, because `unarchiveSessionById` has no callers. A silent
  *     cascade-cancel was considered and rejected — closing a thread must not
  *     quietly end scheduled work — so this is a hard refusal, not a third
- *     confirmation: the operator must explicitly end the series first
- *     (`ncl tasks cancel --id <series>` or `ncl tasks pause --id <series>`)
- *     before the thread can close.
+ *     confirmation: the operator must explicitly cancel the series first
+ *     (`ncl tasks cancel --id <series>`) before the thread can close. NOT
+ *     `ncl tasks pause` — pause still counts as live (this rule's own
+ *     "pending OR paused"), so a paused series denies the close exactly like
+ *     a pending one; pausing it first buys nothing. If the work should keep
+ *     running, the fix is to recreate it with `ncl tasks create` (same
+ *     prompt, recurrence, pins) after the close, then cancel this one.
  *  3. The confirmation count. An agent-proposed close needs ONE confirmation:
  *     the agent already vouched that it is finished, and the operator is
  *     agreeing. A close with no proposal needs TWO, because it overrides an
@@ -115,8 +119,10 @@ export const threadsClose = defineGuardedAction({
       const plural = liveTaskSeriesIds.length > 1;
       return DENY(
         `a session behind this thread backs ${plural ? 'live task series' : 'a live task series'} ` +
-          `(${liveTaskSeriesIds.join(', ')}) — run \`ncl tasks cancel --id <series>\` or ` +
-          `\`ncl tasks pause --id <series>\` to end ${plural ? 'them' : 'it'} before closing this thread`,
+          `(${liveTaskSeriesIds.join(', ')}) — run \`ncl tasks cancel --id <series>\` to end ` +
+          `${plural ? 'them' : 'it'} before closing this thread (pausing does not help: a paused series is ` +
+          `still live and will deny the close the same way; to keep the work running, recreate it with ` +
+          `\`ncl tasks create\` after closing, then cancel this one)`,
       );
     }
 

@@ -276,7 +276,11 @@ describe('threads.close guard', () => {
     expect(denial.effect).toBe('deny');
     expect(denial.reason).toContain('weekly-smoke-sweep');
     expect(denial.reason).toContain('ncl tasks cancel --id <series>');
-    expect(denial.reason).toContain('ncl tasks pause --id <series>');
+    // NOT pause: a paused series is still `liveTaskSeriesIds`-live (this same
+    // guard denies it identically), so telling the operator to pause would
+    // send them straight back into the same denial. Only cancel — or
+    // recreating the series after the close — actually clears it.
+    expect(denial.reason).not.toContain('ncl tasks pause');
   });
 
   it('names every series when more than one live series is behind the thread', async () => {
@@ -826,27 +830,53 @@ describe('requestThreadClose — live task series (#601)', () => {
     db.close();
   }
 
-  it('denies closing the thread while its series is pending, and reserves nothing', async () => {
+  it('denies closing the thread while its series is pending, naming the series to the admin caller', async () => {
     materializeTaskSession('s-task-live');
     seedTaskRow('s-task-live', 'pending');
 
     const res = await requestThreadClose(THREAD_TASK, { confirmations: 2 }, ctxFor('admin'));
 
-    // Same collapse-to-404 every non-confirmation guard deny takes on this
-    // surface (see 'refuses a caller with no admin privilege…' above) — the
-    // acceptance bullet's "the denial names the series" is the guard's own
-    // DENY reason, asserted directly against `decide` above; this asserts the
-    // close itself never proceeds.
-    expect(res.status).toBe(404);
+    // Disclosed, not the generic 404 collapse: the caller is already an admin
+    // of a group on this thread (that's what `hasAdminPrivilege` establishes
+    // in `decideClosure`), so it can already see the thread exists — naming
+    // the series here discloses nothing the 404 collapse (used for every OTHER
+    // refusal — no admin privilege, no sessions) exists to protect.
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({
+      error: 'live_task_series',
+      thread_id: THREAD_TASK,
+      series_ids: ['weekly-smoke-sweep'],
+    });
+    expect(res.body.reason).toContain('weekly-smoke-sweep');
+    expect(res.body.reason).toContain('ncl tasks cancel --id <series>');
+    // The wrong remedy must never surface: pausing a pending series does not
+    // clear this refusal — a paused series is still live — so telling the
+    // operator to pause would send them straight back into the same denial.
+    expect(res.body.reason).not.toContain('ncl tasks pause');
     expect(getRawDb().prepare('SELECT 1 FROM thread_closures WHERE thread_id = ?').get(THREAD_TASK)).toBeUndefined();
   });
 
-  it('denies while the series is only paused — paused is still live', async () => {
+  it('denies while the series is only paused — paused is still live, same disclosed 409', async () => {
     materializeTaskSession('s-task-paused');
     seedTaskRow('s-task-paused', 'paused');
 
     const res = await requestThreadClose(THREAD_TASK, { confirmations: 2 }, ctxFor('admin'));
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({ error: 'live_task_series', series_ids: ['weekly-smoke-sweep'] });
+    expect(res.body.reason).not.toContain('ncl tasks pause');
+  });
+
+  it('a caller with no admin privilege on the thread gets the ordinary 404 — the series is never disclosed to them', async () => {
+    materializeTaskSession('s-task-nonadmin');
+    seedTaskRow('s-task-nonadmin', 'pending');
+
+    // 'nobody' (seeded with no user_roles row at all) is visible on every
+    // thread under this suite's default ctxFor (no_filter: true) but holds no
+    // admin privilege anywhere — exactly the caller the disclosure must stay
+    // closed for.
+    const res = await requestThreadClose(THREAD_TASK, { confirmations: 2 }, ctxFor('nobody'));
     expect(res.status).toBe(404);
+    expect(res.body).toEqual({ error: 'thread_not_found' });
   });
 
   it('succeeds once the series is cancelled first', async () => {
