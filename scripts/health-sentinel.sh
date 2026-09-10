@@ -16,8 +16,9 @@
 #                    gates fail OPEN on it, so nothing else would say so)
 #   9. timers      — a watched sibling timer stopped firing (opt-in via
 #                    WATCHED_TIMERS; systemd cannot see this for a oneshot)
-#  10. deploy-lag  — work merged to origin/main that the host is not running
-#                    (default 3h; DEPLOY_LAG_MAX_S=0 turns it off)
+#  10. deploy-lag  — runtime changes merged to origin/main that the host is not
+#                    running, or a build it never restarted onto (default 3h;
+#                    DEPLOY_LAG_MAX_S=0 turns it off)
 #
 # Log windows are measured by BYTE OFFSET deltas stored in the state file —
 # never by log timestamps (the log has multiple writers stamping different
@@ -344,16 +345,40 @@ if [ "$DEPLOY_LAG_MAX_S" -gt 0 ] && git rev-parse -q --verify origin/main >/dev/
   timeout 30 git fetch --quiet origin main 2>/dev/null || true
   DEPLOYED=$(jq -r '.sha // empty' "$NANOCLAW_DIR/dist/BUILD_INFO.json" 2>/dev/null || true)
   git cat-file -e "${DEPLOYED:-none}^{commit}" 2>/dev/null || DEPLOYED=$(git rev-parse HEAD)
-  BEHIND=$(git rev-list --count "$DEPLOYED"..origin/main 2>/dev/null || echo 0)
+  # Only merges that change something this host runs are counted. Docs, root
+  # markdown, CI config, tests and the reference unit copies in data/systemd/
+  # never execute here, and alerting on them would teach the owner to ignore
+  # this vital. Deliberately wider than isMaterialPath() (src/build-info.ts:143),
+  # which answers a narrower question — can a REBUILD change the host — and so
+  # leaves out the runner (container/**) and scripts/, both of which go live
+  # here only through a pull and a restart. Skill markdown under container/
+  # stays in: agents load it.
+  RUNTIME_PATHS=(. ':(exclude)docs' ':(exclude,glob)*.md' ':(exclude).github' ':(exclude)data/systemd' ':(exclude,glob)**/*.test.*')
+  BEHIND=$(git rev-list --count --first-parent "$DEPLOYED"..origin/main -- "${RUNTIME_PATHS[@]}" 2>/dev/null || echo 0)
   if [ "$BEHIND" -gt 0 ]; then
-    FIRST_MERGE=$( (git log --first-parent --format=%ct "$DEPLOYED"..origin/main 2>/dev/null | tail -1) || true)
+    FIRST_MERGE=$( (git log --first-parent --format=%ct "$DEPLOYED"..origin/main -- "${RUNTIME_PATHS[@]}" 2>/dev/null | tail -1) || true)
     LAG=$((NOW - ${FIRST_MERGE:-$NOW}))
     if [ "$LAG" -ge "$DEPLOY_LAG_MAX_S" ]; then
       NOTES=""
       [ "$(git rev-parse HEAD)" != "$DEPLOYED" ] && NOTES=" The checkout was pulled to $(git rev-parse --short HEAD) but never built — a pull deploys nothing."
       TRACKED_DIRTY=$(git status --porcelain --untracked-files=no 2>/dev/null | wc -l)
       [ "$TRACKED_DIRTY" -gt 0 ] && NOTES="$NOTES The live checkout has $TRACKED_DIRTY uncommitted tracked file(s), and deploy.sh refuses until they are committed."
-      BREACHES+=("deploy-lag|$BEHIND merged commit(s) on origin/main are not deployed; the oldest merge has waited $((LAG / 3600))h and the host runs $(git rev-parse --short "$DEPLOYED"). Deploy with scripts/deploy.sh (it snapshots for rollback).$NOTES")
+      BREACHES+=("deploy-lag|$BEHIND merge(s) on origin/main change what this host runs and are not deployed; the oldest merge has waited $((LAG / 3600))h and the host runs $(git rev-parse --short "$DEPLOYED"). Deploy with scripts/deploy.sh (it snapshots for rollback).$NOTES")
+    fi
+  fi
+  # A build the service never restarted onto: dist/ moved but the running
+  # process predates it, so the host runs an older build than BUILD_INFO says
+  # and a crash-restart would switch builds unattended (seen 2026-09-10: dist/
+  # rebuilt at 22:00Z, service up since 15:08Z). `date -d ""` is midnight today,
+  # so an empty or unparseable stamp is rejected rather than compared.
+  BUILT_AT=$(jq -r '.builtAt // empty' "$NANOCLAW_DIR/dist/BUILD_INFO.json" 2>/dev/null || true)
+  SVC_START=$(systemctl show nanoclaw-v2 -p ActiveEnterTimestamp --value 2>/dev/null || true)
+  if [ -n "$BUILT_AT" ] && [ -n "$SVC_START" ]; then
+    BUILT_EPOCH=$(date -d "$BUILT_AT" +%s 2>/dev/null || echo 0)
+    SVC_EPOCH=$(date -d "$SVC_START" +%s 2>/dev/null || echo 0)
+    if [ "$BUILT_EPOCH" -gt 0 ] && [ "$SVC_EPOCH" -gt 0 ] &&
+       [ "$BUILT_EPOCH" -gt $((SVC_EPOCH + 120)) ] && [ $((NOW - BUILT_EPOCH)) -ge "$DEPLOY_LAG_MAX_S" ]; then
+      BREACHES+=("deploy-restart|dist/ was rebuilt to $(git rev-parse --short "$DEPLOYED") at $BUILT_AT, but nanoclaw-v2 has run since $SVC_START — the host still runs the older build, and a crash-restart would switch builds unattended. Finish the deploy with scripts/deploy.sh.")
     fi
   fi
 fi
