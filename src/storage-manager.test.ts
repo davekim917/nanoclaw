@@ -37,6 +37,7 @@ import {
   _resetStorageManagerThrottleForTesting,
   assertStorageAdmission,
   classifyDockerImage,
+  dirSizeBytes,
   finishInterruptedSessionArchivals,
   getStorageReport,
   pruneIdleSessionArtifacts,
@@ -46,6 +47,7 @@ import {
   type StorageReport,
 } from './storage-manager.js';
 import { acquireStorageActivityLease, tryRunWithStorageCleanupClaim } from './storage-activity.js';
+import { _resetDependencyCacheForTesting, dependencyKey, envFingerprint } from './dependency-cache.js';
 import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, CONTAINER_INSTALL_LABEL } from './config.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { resolveRepositoryWorkUnit } from './repository-workspaces.js';
@@ -2657,12 +2659,17 @@ describe('storage-manager regenerable tree sweep', () => {
   let sessionsRoot: string;
   const knob = 'NANOCLAW_REGENERABLE_SWEEP_DAYS';
   let savedKnob: string | undefined;
+  const cacheFlag = 'NANOCLAW_DEPENDENCY_CACHE';
+  let savedCacheFlag: string | undefined;
 
   beforeEach(() => {
     vi.clearAllMocks();
     _resetStorageManagerThrottleForTesting();
+    _resetDependencyCacheForTesting();
     savedKnob = process.env[knob];
     delete process.env[knob];
+    savedCacheFlag = process.env[cacheFlag];
+    delete process.env[cacheFlag];
     tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'storage-sweep-'));
     dataRoot = path.join(tmpRoot, 'data');
     topicsRoot = path.join(dataRoot, 'v2-topics');
@@ -2690,6 +2697,8 @@ describe('storage-manager regenerable tree sweep', () => {
     closeCentralDb();
     if (savedKnob === undefined) delete process.env[knob];
     else process.env[knob] = savedKnob;
+    if (savedCacheFlag === undefined) delete process.env[cacheFlag];
+    else process.env[cacheFlag] = savedCacheFlag;
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   });
 
@@ -3157,5 +3166,185 @@ describe('storage-manager regenerable tree sweep', () => {
     expect(report.actions).toEqual([]);
     expect(report.skipped.freshTopics).toBe(1);
     expect(fs.existsSync(path.join(repoDir, 'node_modules'))).toBe(true);
+  });
+
+  // ── Dependency cache (docs/specs/repository-branch-clones/plan.md §5.7) ──
+
+  /** Answers the agent image inspect the dependency-cache fingerprint needs. */
+  function enableDependencyCache(): void {
+    process.env[cacheFlag] = 'apply';
+    mockExecFileSync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'df') {
+        return 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 1000 500 500 50% /\n';
+      }
+      if (cmd === CONTAINER_RUNTIME_BIN && args[0] === 'image' && args[1] === 'inspect') {
+        return 'PATH=/usr/local/bin\nNODE_VERSION=22.23.2\n';
+      }
+      throw new Error(`unexpected command ${cmd}`);
+    });
+  }
+
+  /**
+   * A topic whose checkout holds a COMPLETE npm install — declared package
+   * dirs, a `.bin` symlink, and the hidden lockfile written last — which is the
+   * only shape the dependency cache will share. `makeTopic`'s tree is eligible
+   * but incomplete, so it could never prove anything about adopt or convert.
+   */
+  function makeNpmTopic(name: string): { topicDir: string; repoDir: string } {
+    const topicDir = path.join(topicsRoot, 'wg-acme', name);
+    const repoDir = path.join(topicDir, 'worktrees', 'XZO-BACKEND');
+    const packages: Record<string, { version: string; resolved: string; integrity: string }> = {
+      'node_modules/left-pad': {
+        version: '1.3.0',
+        resolved: 'https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz',
+        integrity: 'sha512-left',
+      },
+      'node_modules/@scope/util': {
+        version: '2.0.1',
+        resolved: 'https://registry.npmjs.org/@scope/util/-/util-2.0.1.tgz',
+        integrity: 'sha512-util',
+      },
+    };
+    fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'src', 'app.ts'), 'the actual work');
+    fs.writeFileSync(
+      path.join(repoDir, 'package.json'),
+      JSON.stringify({
+        name: 'app',
+        version: '1.0.0',
+        dependencies: { 'left-pad': '^1.3.0', '@scope/util': '^2.0.1' },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(repoDir, 'package-lock.json'),
+      JSON.stringify({
+        name: 'app',
+        version: '1.0.0',
+        lockfileVersion: 3,
+        requires: true,
+        packages: { '': { name: 'app', version: '1.0.0' }, ...packages },
+      }),
+    );
+    const old = (Date.now() - 60 * 60 * 1000) / 1000;
+    for (const [key, entry] of Object.entries(packages)) {
+      const dir = path.join(repoDir, key);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, 'package.json'),
+        JSON.stringify({ name: key.slice('node_modules/'.length), version: entry.version }),
+      );
+      fs.writeFileSync(path.join(dir, 'index.js'), `module.exports = '${key}';\n`);
+      fs.utimesSync(path.join(dir, 'package.json'), old, old);
+      fs.utimesSync(path.join(dir, 'index.js'), old, old);
+    }
+    fs.mkdirSync(path.join(repoDir, 'node_modules', '.bin'));
+    fs.symlinkSync('../left-pad/index.js', path.join(repoDir, 'node_modules', '.bin', 'left-pad'));
+    const hidden = path.join(repoDir, 'node_modules', '.package-lock.json');
+    fs.writeFileSync(
+      hidden,
+      JSON.stringify({ name: 'app', version: '1.0.0', lockfileVersion: 3, requires: true, packages }),
+    );
+    fs.utimesSync(hidden, old + 30, old + 30);
+    ageTopic(topicDir);
+    return { topicDir, repoDir };
+  }
+
+  /** Inode, mode and bytes of everything under `root`. */
+  function treeState(root: string): Record<string, string> {
+    const out: Record<string, string> = {};
+    const walk = (dir: string, rel: string): void => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        const childRel = rel ? `${rel}/${entry.name}` : entry.name;
+        const st = fs.lstatSync(full);
+        if (st.isSymbolicLink()) out[childRel] = `l:${fs.readlinkSync(full)}`;
+        else if (st.isDirectory()) {
+          out[childRel] = `d:${st.ino}:${st.mode}`;
+          walk(full, childRel);
+        } else out[childRel] = `f:${st.ino}:${st.mode}:${fs.readFileSync(full, 'utf8')}`;
+      }
+    };
+    walk(root, '');
+    return out;
+  }
+
+  it('never adopts or converts under a live container mount or held storage claim', async () => {
+    enableDependencyCache();
+    const mounted = makeNpmTopic('thread-a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1');
+    const leased = makeNpmTopic('thread-a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2');
+    const claimed = makeNpmTopic('thread-a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3');
+    // The control proves the pass was live: the same lockfile, unguarded.
+    const control = makeNpmTopic('thread-a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4');
+    const guarded = { mounted, leased, claimed };
+    const before = Object.fromEntries(Object.entries(guarded).map(([name, topic]) => [name, treeState(topic.repoDir)]));
+
+    let report: StorageReport | undefined;
+    const lease = await acquireStorageActivityLease(path.join(leased.topicDir, 'worktrees'), 'sess-spawning');
+    try {
+      const held = tryRunWithStorageCleanupClaim(path.join(claimed.topicDir, 'worktrees'), () => {
+        report = sweep({ mounts: [path.join(mounted.topicDir, 'worktrees')] });
+      });
+      expect(held).toBe(true);
+    } finally {
+      await lease.release();
+    }
+
+    for (const [name, topic] of Object.entries(guarded)) {
+      expect(treeState(topic.repoDir), name).toEqual(before[name]);
+    }
+    const key = dependencyKey(control.repoDir, envFingerprint('22.23.2'))!.key;
+    const entryNm = path.join(dataRoot, 'dependency-cache', 'wg-acme', key, 'node_modules');
+    expect(fs.lstatSync(path.join(entryNm, 'left-pad', 'index.js')).ino).toBe(
+      fs.lstatSync(path.join(control.repoDir, 'node_modules', 'left-pad', 'index.js')).ino,
+    );
+    expect(report?.dependencyCache?.counters).toEqual(
+      expect.objectContaining({ adopted: 1, converted: 0, privateInMountedTopics: 1 }),
+    );
+    expect(report?.dependencyCache?.counters.privateInMountedTopicsBytes).toBeGreaterThan(0);
+  });
+
+  it('exempts a farm from the 2-day delete and sweeps the farm of a quarantined entry', () => {
+    enableDependencyCache();
+    const { repoDir } = makeNpmTopic('thread-b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1');
+
+    const first = sweep();
+
+    expect(first.dependencyCache?.counters.adopted).toBe(1);
+    expect(first.actions).toEqual([]);
+    expect(fs.readFileSync(path.join(repoDir, 'node_modules', 'left-pad', 'index.js'), 'utf8')).toContain('left-pad');
+
+    const key = dependencyKey(repoDir, envFingerprint('22.23.2'))!.key;
+    fs.unlinkSync(
+      path.join(dataRoot, 'dependency-cache', 'wg-acme', key, 'node_modules', '@scope', 'util', 'index.js'),
+    );
+    _resetStorageManagerThrottleForTesting();
+
+    const second = sweep();
+
+    expect(second.dependencyCache?.counters.quarantined).toBe(1);
+    expect(second.actions).toEqual([
+      expect.objectContaining({
+        kind: 'sweep-regenerable-tree',
+        path: path.join(repoDir, 'node_modules'),
+        status: 'applied',
+      }),
+    ]);
+    expect(fs.existsSync(path.join(repoDir, 'node_modules'))).toBe(false);
+    expect(fs.readFileSync(path.join(repoDir, 'src', 'app.ts'), 'utf8')).toBe('the actual work');
+  });
+
+  it('reclaimable bytes exclude files hardlinked elsewhere', () => {
+    const farm = path.join(tmpRoot, 'farm', 'pkg');
+    fs.mkdirSync(farm, { recursive: true });
+    const sharedElsewhere = path.join(tmpRoot, 'entry-shared.js');
+    fs.writeFileSync(sharedElsewhere, 'x'.repeat(1000));
+    fs.linkSync(sharedElsewhere, path.join(farm, 'shared.js'));
+    fs.writeFileSync(path.join(farm, 'private.js'), 'y'.repeat(300));
+    fs.symlinkSync('shared.js', path.join(farm, 'alias.js'));
+
+    expect(dirSizeBytes(path.join(tmpRoot, 'farm'))).toBe(300);
+
+    fs.unlinkSync(sharedElsewhere);
+    expect(dirSizeBytes(path.join(tmpRoot, 'farm'))).toBe(1300);
   });
 });
