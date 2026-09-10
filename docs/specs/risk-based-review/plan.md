@@ -200,7 +200,11 @@ unreviewed PRs exceeds that of reviewed PRs over 30 days, the exempt path list s
 ## Status
 
 - [x] Audit: CI gates, review churn, observability (2026-09-10)
-- [ ] Tier 0.1–0.4 — in progress on `chore/risk-based-review`
+- [x] Tier 0.1–0.4 — done 2026-09-10 in #598:
+      `mailbox/sqlite/connection.ts` is fork-diverged, and the manifest is still pinned at
+      `5c3082a1` with 29 files. The `container/Dockerfile` growth is accepted. `VITEST_LANE`
+      splits the suite into correctness and drift lanes, and `ci.yml` runs them as parallel
+      `correctness` and `bookkeeping` jobs. Both are blocking.
 - [x] Tier 0.5 — done 2026-09-10. The 09-09 `zz-no-dispatch.conf` moved off the alert
       *template* onto the three instances health-sentinel already covers
       (`nanoclaw-v2`, `nanoclaw-workgroups-drive`, `onecli-drift-check`), so the other
@@ -208,4 +212,23 @@ unreviewed PRs exceeds that of reviewed PRs over 30 days, the exempt path list s
       drop-in its own script had always claimed it carried. Verified per instance via
       `systemctl show … -p ExecStart`, and the alert script live-fired into a scratch
       outbox.
-- [ ] Tier 1 · Tier 2 · Tier 3 · Tier 4 — not started
+- [x] Tier 1 — live 2026-09-10.
+      - **Risk list.** The path list lives in `.github/labeler.yml`, the single source of
+        truth that supersedes the table above, and `risk-label.yml` applies `risk:high`
+        (#609). The git hooks, the boundary checkers and the allowlist joined in #611.
+      - **Review.** It is requested only for `risk:high` or `review:requested` PRs, with a
+        round cap of 3. `codex-review.sh merge-check` allows a merge only at the exact head
+        with CI green and a matching review (#605). Codex auto-review is off for this
+        repository. Merge authority is a standing operator instruction held outside the
+        repository (pr-review-loop Step 6).
+      - **Direct pushes.** The pre-push hook refuses direct pushes to `main` (#615).
+      - **#566.** The breaker is diagnosed. `codex-review.sh gate` derives seams from
+        imports, so a finding class whose sites are Markdown or YAML is never gated. Tier 1
+        routes around it, because docs-only PRs are not reviewed at all.
+- [ ] Measurement — partly in place. Each PR carries its review label (`risk:high`), but
+      the follow-up linkage is not: no agent writes a `Fixes-PR:` trailer. At the 30-day
+      check (around 2026-10-10), same-subsystem follow-ups will be computed from git
+      history instead, as a later `fix` PR within 14 days that touches the same files. That
+      method needs nothing from agents, and its bias falls equally on reviewed and
+      unreviewed PRs, which is what the rollback condition compares.
+- [ ] Tier 2 · Tier 3 · Tier 4 — not started
