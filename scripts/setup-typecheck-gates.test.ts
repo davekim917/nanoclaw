@@ -257,6 +257,6 @@ exec ${quote(realGit)} "$@"`,
     cwd: root,
     env,
     encoding: 'utf8',
-    input: `refs/heads/main ${headSha} refs/heads/main ${zeroSha}\n`,
+    input: `refs/heads/main ${headSha} refs/heads/feature ${zeroSha}\n`,
   });
 }

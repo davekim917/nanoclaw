@@ -70,6 +70,18 @@ refs_file=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-refs.XXXXXX")
 seen_objects=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-seen.XXXXXX")
 cat > "$refs_file"
 
+# The fork's main changes only through merged pull requests. A direct push
+# skips CI and review, and nothing server-side refuses one on this repository,
+# so refuse any update or deletion of a remote main here, before any other
+# work. For an emergency, NANOCLAW_ALLOW_MAIN_PUSH=1 lets the push through and
+# the boundary scan below still runs; --no-verify would skip that scan too.
+while read -r local_ref local_sha remote_ref remote_sha; do
+  if [ "$remote_ref" = refs/heads/main ] && [ "${NANOCLAW_ALLOW_MAIN_PUSH:-}" != 1 ]; then
+    echo "pre-push: refusing to push to main on $remote_name. main takes changes through pull requests only: push a branch and open a PR. For an emergency, rerun with NANOCLAW_ALLOW_MAIN_PUSH=1 (the boundary scan still runs)." >&2
+    exit 1
+  fi
+done < "$refs_file"
+
 needs_remote_tips=''
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ "$local_sha" = "$zero_sha" ] && continue

@@ -141,6 +141,7 @@ function push(
     commandScopedConfig?: 'count' | 'parameters';
     withoutIonice?: boolean;
     realTreeCheck?: boolean;
+    allowMainPush?: boolean;
   } = {},
 ) {
   if (options.withoutIonice) {
@@ -176,6 +177,7 @@ exec "$@"
       HOOK_REAL_TSX: realTsx,
       HOOK_REAL_CHECKER: fileURLToPath(new URL('./check-public-boundary.ts', import.meta.url)),
       HOOK_CHECK_TREE: options.realTreeCheck ? '1' : '',
+      NANOCLAW_ALLOW_MAIN_PUSH: options.allowMainPush ? '1' : '',
       ...(options.sourceGitEnv ? { GIT_DIR: path.join(f.root, '.git'), GIT_WORK_TREE: f.root } : {}),
       ...(options.commandScopedConfig === 'count'
         ? { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'user.name', GIT_CONFIG_VALUE_0: 'Hook Test' }
@@ -203,6 +205,55 @@ afterEach(() => {
 });
 
 describe('.husky/pre-push', () => {
+  it('refuses a push to main before scanning anything', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const pushed = commit(f.root, 'direct-to-main');
+    const result = push(f, `refs/heads/main ${pushed} refs/heads/main ${base}\n`, {
+      remoteRefs: `${base}\trefs/heads/main\n`,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('refusing to push to main');
+    expect(fs.existsSync(f.log)).toBe(false);
+  });
+
+  it('refuses deleting main', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const result = push(f, `(delete) ${zeroSha} refs/heads/main ${base}\n`);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('refusing to push to main');
+  });
+
+  it('lets an emergency main push through with NANOCLAW_ALLOW_MAIN_PUSH=1, and still scans it', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const pushed = commit(f.root, 'emergency-fix');
+    const result = push(f, `refs/heads/main ${pushed} refs/heads/main ${base}\n`, {
+      allowMainPush: true,
+      fail: 'boundary:emergency-fix',
+      remoteRefs: `${base}\trefs/heads/main\n`,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).not.toContain('refusing to push to main');
+    expect(records(f.log).join('\n')).toContain('emergency-fix');
+  });
+
+  it('does not refuse a local main pushed to another branch name', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const pushed = commit(f.root, 'main-to-branch');
+    const result = push(f, `refs/heads/main ${pushed} refs/heads/feature ${zeroSha}\n`, {
+      remoteRefs: `${base}\trefs/heads/main\n`,
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(records(f.log).join('\n')).toContain('main-to-branch');
+  });
+
   it('gates every pushed SHA, not dirty files, and skips deletions', () => {
     const f = fixture();
     const first = commit(f.root, 'first-pushed');
