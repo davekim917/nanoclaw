@@ -2,7 +2,7 @@
 
 > Started 2026-09-10. Replaces blanket Codex auto-review on every PR with a path-selected
 > review scope sitting on top of deterministic gates that are actually trusted.
-> Prompted by [Duckbill's "we ditched code review" thread](https://x.com/mikejulian/status/2096450476170694785),
+> Prompted by Duckbill's "we ditched code review" thread (Mike Julian, @mikejulian on X, 2026-09-06),
 > but deliberately NOT a copy of it — see [Non-goals](#non-goals).
 
 ## The problem, stated precisely
