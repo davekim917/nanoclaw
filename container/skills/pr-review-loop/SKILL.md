@@ -11,6 +11,8 @@ Codex (`chatgpt-codex-connector[bot]`) reviews a PR when it opens, and afterward
 
 **Then stop, and do not ask for a re-review.** The reviewer decides whether your commit warrants another look; a bounded observation supplies the result or routes an unavailable reviewer under [Review availability](../../../docs/review-policy.md#review-availability) (in a container: `/workspace/project/docs/review-policy.md#review-availability`). A `@codex review` comment overrides that judgment and manufactures a round nobody wanted. On 2026-08-09 one deployment drove a 213-line PR to four requested rounds in two and a half hours, then blocked its own merge on the count; four PRs sat frozen with CI green, one with every thread already resolved. If a repo genuinely has no automatic reviewer, that is a deployment fact its instructions should state — it is not a reason to start pinging.
 
+**Risk-scoped repos are the exception** — see [Risk-scoped repos](#risk-scoped-repos). Automatic review is off there, and `codex-review.sh request` is the only way a round starts; `codex-review.sh scope` tells you which kind of repo you are in.
+
 ## When to enter, and at what round
 
 **Entering is not optional and not only for assigned work.** A review landing on
@@ -170,6 +172,11 @@ codex-review.sh resolve <thread_id>       # mark it resolved
 codex-review.sh status <sha> <since_iso>  # one GraphQL observation, including connector availability
 codex-review.sh wait <sha> <since_iso> [minutes]
                                          # foreground 60s GraphQL poll; default $CODEX_REVIEW_WAIT_MINUTES or 15
+codex-review.sh scope                     # risk-scoped repos: review|skip for the current head (legacy: auto)
+codex-review.sh request                   # risk-scoped repos: the only way to ask for a round
+codex-review.sh merge-check [--head <sha>] # exit 0 only when merging exactly that head is allowed
+codex-review.sh receipt --head <sha> --outcome approve|changes --reviewer "<model + runtime>" --body-file <file>
+                                         # post a substitute review's receipt for exactly that head
 ```
 
 Three details it encodes, each of which has cost real debugging time — keep them if you ever hand-roll the API calls:
@@ -389,6 +396,28 @@ gh pr merge "$PR" --repo "$REPO" --squash --delete-branch
 Squash is the default. Use `--merge` when the PR's topology matters — an upstream-sync PR whose second parent must survive; squashing one drops the merge base and makes the fork report "behind" forever.
 
 Then run whatever post-PR bookkeeping your environment expects — e.g. `add_ship_log`, plus `update_backlog_item` if the PR closes a backlog entry.
+
+## Risk-scoped repos
+
+A repo is **risk-scoped** when `.github/labeler.yml` on the PR's base branch defines a top-level `risk:high` key. Automatic review is off there: the `Risk label` workflow labels PRs that touch high-risk paths, and a round happens only when one is asked for. Steps 1–4 apply unchanged; this replaces how a round starts (Step 5) and when you may merge (Step 6). In any other repo `codex-review.sh scope` answers `mode:"legacy", verdict:"auto"` and nothing here applies.
+
+**Request rounds only through `codex-review.sh request`.** The `@codex review` prohibition still holds for anything typed by hand. With nothing else able to trigger a review, `request` is the trigger, and it posts only when the rules below allow — a hand-typed comment skips every one of them.
+
+1. After opening the PR, run `codex-review.sh scope`. It waits for the `Risk label` run on the current head (`CODEX_REVIEW_SCOPE_TIMEOUT_SECONDS`, default 300) and prints a `verdict`. It fails closed: a run that is missing, late, failed, or only on an older head gives `review`, never `skip`.
+2. **`skip`** — no review. Wait for green CI, then merge-check and merge (4).
+3. **`review`** — capture `SHA` and `SINCE` (Step 3), run `codex-review.sh request`, then `codex-review.sh wait "$SHA" "$SINCE"`. Work the findings as one batch (Steps 1–4, pushing through `codex-review.sh push`), then capture and `request` again. Repeat until `wait` is clean or `request` hits the cap.
+4. Merge only the head `merge-check` evaluated, within Step 6's authorization rule:
+
+   ```bash
+   codex-review.sh merge-check --head "$SHA" &&
+     gh pr merge "$PR" --repo "$REPO" --squash --delete-branch --match-head-commit "$SHA"
+   ```
+
+   Either verdict needs green CI on that head: each workflow in `CODEX_REVIEW_REQUIRED_WORKFLOWS` (comma-separated, default `CI`) has a latest run that concluded `success`, every other latest run concluded `success`, `neutral`, or `skipped`, and the newest commit status per context is `success` (release-policy's `Release policy` and `Release approval` contexts are a policy gate, not CI, and are skipped). A `review` head also needs `status` to read `clean` for it since its request (so `open=0`), or an approving substitute receipt for that exact head.
+
+`request` refuses, posting nothing, with 20 (not risk-scoped), 21 (verdict `skip`), 22 (this head already requested), 23 (cap), or 3 (churn gate). When `wait` exits 11 or 13, run the substitute review [Review availability](../../../docs/review-policy.md#review-availability) requires — a fresh-context reviewer, never the implementing session — and post it with `codex-review.sh receipt`. The latest receipt for that exact head decides: `approve` satisfies the review, and `changes` refuses the merge under either verdict — even over a clean Codex review — until a later `approve`.
+
+**The round cap is what bounds the loop here.** `REVIEW_ROUND_CAP` (default 3) is the initial review plus two corrections: after two failed corrections, stop correcting and reframe. On exit 23, stop — summarize the open findings, then escalate to the operator or restart in a fresh session with a reframed prompt. The churn gate cannot do this job alone: it derives seams from imports, so a finding class whose sites are Markdown or YAML never gates. PR #566 went 12 rounds that way.
 
 ## When you compose the review prompt yourself
 

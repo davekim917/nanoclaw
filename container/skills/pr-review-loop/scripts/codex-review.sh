@@ -14,6 +14,25 @@
 #   codex-review.sh wait <sha> <since_iso> [minutes]
 #                                             # foreground GraphQL poll, default $CODEX_REVIEW_WAIT_MINUTES or 15
 #                                             # open/status print a STOP banner at rounds>=4 — diagnose, do not push
+#   codex-review.sh scope                     # risk-scoped repos: JSON {repo,pr,head,mode,verdict,labels,reason} for the current head
+#   codex-review.sh request                   # risk-scoped repos: post `@codex review` for the current head when every rule allows it
+#   codex-review.sh merge-check [--head <sha>]
+#                                             # exit 0 only when merging exactly that head is allowed
+#   codex-review.sh receipt --head <sha> --outcome approve|changes --reviewer "<model + runtime>" --body-file <file>
+#                                             # post a substitute review's durable receipt for exactly that head
+#
+# Exit codes, one contract across commands (0 and 3 are the originals):
+#   0   pass; verdict printed; merge allowed (legacy merge-check: defer to SKILL.md Step 6)
+#   1   no verdict — a GitHub read or validation failed; never read it as a pass
+#   2   usage, no JS runtime, or a push shape the churn gate cannot judge
+#   3   REFRAME REQUIRED — the churn gate refused (gate, push, request)
+#   10  wait: findings   11 wait: timeout   12 wait: head changed   13 wait: connector unavailable
+#   20  request: not risk-scoped — automatic review handles this repo; never request
+#   21  request: scope verdict is skip — this head merges on green CI, no round
+#   22  request: a review of this head was already requested
+#   23  request: REVIEW_ROUND_CAP reached — stop, summarize, escalate or reframe
+#   24  merge-check: merging this head is not allowed — CI is not green on it, or it has
+#       neither a clean Codex review nor an approving substitute receipt
 #
 # `gate` is the rule the advisory detector never was: three rounds on ONE
 # finding class (or one seam, severity not falling) is a design defect at a
@@ -437,7 +456,223 @@ run_gate() {
   return 0
 }
 
-case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait}" in
+# ── Risk-scoped repos ────────────────────────────────────────────────────────
+# A repo opts in by defining a top-level `risk:high` key in .github/labeler.yml
+# on the PR's BASE branch. There the `Risk label` workflow (actions/labeler on
+# pull_request_target) labels PRs that touch high-risk paths, Codex automatic
+# review is off, and a round happens only when `request` asks for one. Every
+# other repo is legacy: `scope` answers `auto`, `request` refuses, `merge-check`
+# defers, and no command above this block reads any of it.
+RISK_LABEL_WORKFLOW='Risk label'
+# release-policy.py's own contexts are a policy gate, not CI: a pending human approval must never read as ci_pending.
+CI_EXCLUDED_CONTEXTS='["Release policy","Release approval"]'
+# The request marker, hidden in the rendered comment. It is how `request`
+# dedupes per head and counts rounds, and how `merge-check` learns when THIS
+# head's review was asked for.
+REQUEST_MARKER_RE='(^|\n)<!-- pr-review-loop:request head=(?<head>[0-9a-f]{40}) round=(?<round>[0-9]+) -->'
+# A substitute review's receipt (docs/review-policy.md, "Review availability").
+# When Codex cannot review, the latest receipt for exactly this head decides
+# instead. Only an author with write access counts: a receipt unlocks a merge,
+# and anyone who can read a public repo can comment on its PRs.
+RECEIPT_MARKER_RE='(^|\n)<!-- pr-review-loop:substitute-receipt head=(?<head>[0-9a-f]{40}) outcome=(?<outcome>approve|changes) -->'
+
+# `risk-scoped` or `legacy`. Read from BASE through the API, never the
+# checkout: a PR can edit its own copy. A 404 is absence (legacy); any other
+# failure is no verdict, never a guess. gh prints the error body on stdout.
+repo_mode() {
+  local ref raw status=0
+  ref=$(jq -rn --arg r "$1" '$r | @uri')
+  raw=$(gh api -H 'Accept: application/vnd.github.raw+json' "repos/$REPO/contents/.github/labeler.yml?ref=$ref" 2>/dev/null) || status=$?
+  if [ "$status" -ne 0 ]; then
+    if printf '%s' "$raw" | jq -e '.status == "404"' >/dev/null 2>&1; then
+      echo legacy
+      return 0
+    fi
+    echo "could not read .github/labeler.yml on $1 in $REPO" >&2
+    return 1
+  fi
+  if printf '%s\n' "$raw" | grep -Eq "^(risk:high|'risk:high'|\"risk:high\")[[:space:]]*:"; then
+    echo risk-scoped
+  else
+    echo legacy
+  fi
+}
+
+# The newest `Risk label` run for exactly HEAD, polled until it completes.
+# Prints `completed <conclusion>`, `pending <status>` (still running at the
+# deadline), or `missing` (no run for this head by the deadline). The API
+# filters are repeated client-side: a run for an older head is not evidence
+# about this one.
+risk_label_run() {
+  local head="$1" timeout="$2" poll="$3" runs latest state="" start now deadline sleep_seconds
+  start=$(date +%s) || return 1
+  deadline=$((start + timeout))
+  while :; do
+    latest=""
+    if runs=$(gh api "repos/$REPO/actions/runs?head_sha=$head&event=pull_request_target&per_page=100" 2>/dev/null); then
+      latest=$(printf '%s' "$runs" | jq -c --arg name "$RISK_LABEL_WORKFLOW" --arg sha "$head" '
+        [ .workflow_runs[]? | select(.name == $name and .event == "pull_request_target" and .head_sha == $sha) ]
+        | sort_by(.created_at, .id) | last // empty' 2>/dev/null) || latest=""
+    fi
+    if [ -n "$latest" ]; then
+      state=$(printf '%s' "$latest" | jq -r '"\(.status) \(.conclusion // "none")"')
+      case "$state" in completed\ *) echo "$state"; return 0 ;; esac
+    fi
+    now=$(date +%s) || return 1
+    if [ "$now" -ge "$deadline" ]; then
+      if [ -n "$latest" ]; then echo "pending ${state%% *}"; else echo missing; fi
+      return 0
+    fi
+    sleep_seconds="$poll"
+    if [ $((deadline - now)) -lt "$sleep_seconds" ]; then sleep_seconds=$((deadline - now)); fi
+    sleep "$sleep_seconds"
+  done
+}
+
+# Sets SCOPE_HEAD SCOPE_MODE SCOPE_VERDICT SCOPE_LABELS SCOPE_REASON for the
+# PR's current head. Returns 1 only when there is no verdict at all.
+SCOPE_HEAD=""
+SCOPE_MODE=""
+SCOPE_VERDICT=""
+SCOPE_LABELS="[]"
+SCOPE_REASON=""
+scope_eval() {
+  local pr_json base run after
+  local timeout="${CODEX_REVIEW_SCOPE_TIMEOUT_SECONDS:-300}" poll="${CODEX_REVIEW_SCOPE_POLL_SECONDS:-10}"
+  if ! [[ "$timeout" =~ ^[0-9]+$ ]] || ! [[ "$poll" =~ ^[1-9][0-9]*$ ]]; then
+    echo "CODEX_REVIEW_SCOPE_TIMEOUT_SECONDS must be a whole number of seconds, CODEX_REVIEW_SCOPE_POLL_SECONDS a positive one" >&2
+    exit 2
+  fi
+  pr_json=$(gh pr view "$PR" --repo "$REPO" --json headRefOid,baseRefName,labels) || return 1
+  SCOPE_HEAD=$(printf '%s' "$pr_json" | jq -er .headRefOid) || return 1
+  base=$(printf '%s' "$pr_json" | jq -er .baseRefName) || return 1
+  SCOPE_LABELS=$(printf '%s' "$pr_json" | jq -c '[.labels[]?.name]') || return 1
+  SCOPE_MODE=$(repo_mode "$base") || return 1
+  if [ "$SCOPE_MODE" = legacy ]; then
+    SCOPE_VERDICT=auto
+    SCOPE_REASON="no top-level risk:high in .github/labeler.yml on $base; automatic review handles this repo"
+    return 0
+  fi
+  # Fail closed: `skip` needs the labeler's completed answer for THIS head. A
+  # push that touches a risky path is unlabeled until that run lands, and a
+  # verdict read in between would skip exactly the PR the label exists for.
+  run=$(risk_label_run "$SCOPE_HEAD" "$timeout" "$poll") || return 1
+  SCOPE_VERDICT=review
+  case "$run" in
+    "completed success") ;;
+    completed\ *) SCOPE_REASON="fail closed: the $RISK_LABEL_WORKFLOW run for this head concluded ${run#completed }"; return 0 ;;
+    missing) SCOPE_REASON="fail closed: no $RISK_LABEL_WORKFLOW run for this head within ${timeout}s"; return 0 ;;
+    *) SCOPE_REASON="fail closed: the $RISK_LABEL_WORKFLOW run for this head was still ${run#pending } after ${timeout}s"; return 0 ;;
+  esac
+  # Head and labels in ONE read, after the run: the labels are the labeler's
+  # answer only while the head is still the one it labeled.
+  pr_json=$(gh pr view "$PR" --repo "$REPO" --json headRefOid,labels) || return 1
+  after=$(printf '%s' "$pr_json" | jq -er .headRefOid) || return 1
+  SCOPE_LABELS=$(printf '%s' "$pr_json" | jq -c '[.labels[]?.name]') || return 1
+  if [ "$after" != "$SCOPE_HEAD" ]; then
+    SCOPE_REASON="fail closed: the head moved from $SCOPE_HEAD while its $RISK_LABEL_WORKFLOW run was awaited"
+    SCOPE_HEAD="$after"
+    return 0
+  fi
+  if printf '%s' "$SCOPE_LABELS" | jq -e 'index("risk:high")' >/dev/null; then
+    SCOPE_REASON="labeled risk:high"
+  elif printf '%s' "$SCOPE_LABELS" | jq -e 'index("review:requested")' >/dev/null; then
+    SCOPE_REASON="labeled review:requested"
+  else
+    SCOPE_VERDICT=skip
+    SCOPE_REASON="the $RISK_LABEL_WORKFLOW run for this head succeeded and set neither risk:high nor review:requested"
+  fi
+}
+
+# Review requests `request` has posted on this PR, oldest first:
+# [{head, round, at}]. Read through the same paginated connection `status` uses.
+request_markers() {
+  local pages
+  pages=$(paginate_connection comments comments_page) || return 1
+  printf '%s\n' "$pages" | jq -cs --arg re "$REQUEST_MARKER_RE" '
+    [ .[] | .data.repository.pullRequest.comments.nodes[]
+      | .createdAt as $at
+      | [ (.body // "") | capture($re) ] | first // empty
+      | { head, round: (.round | tonumber), at: $at } ]
+    | sort_by(.at)'
+}
+
+# The comments connection again, with the author's relationship to the repo,
+# which only receipts need.
+receipt_comments_page() {
+  gh api graphql -f query='
+    query($owner:String!,$name:String!,$pr:Int!,$after:String){
+      repository(owner:$owner,name:$name){ pullRequest(number:$pr){
+        headRefOid comments(first:100,after:$after){ pageInfo{hasNextPage endCursor} nodes{
+          author{login} authorAssociation createdAt body
+        } }
+      } }
+    }' \
+    -F owner="$OWNER" -F name="$NAME" -F pr="$PR" -F after="$1"
+}
+
+# The outcome of the latest substitute-review receipt for exactly HEAD, or
+# nothing. A later `changes` supersedes an earlier `approve`, and a receipt for
+# any other head says nothing about this one.
+receipt_outcome() {
+  local pages
+  pages=$(paginate_connection comments receipt_comments_page) || return 1
+  printf '%s\n' "$pages" | jq -rs --arg re "$RECEIPT_MARKER_RE" --arg head "$1" '
+    [ .[] | .data.repository.pullRequest.comments.nodes[]
+      | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
+      | .createdAt as $at
+      | [ (.body // "") | capture($re) ] | first // empty
+      | select(.head == $head)
+      | { outcome, at: $at } ]
+    | sort_by(.at) | last | .outcome // empty'
+}
+
+# Empty when CI on exactly HEAD is green; otherwise `ci_missing`, `ci_red` or
+# `ci_pending` and what caused it. Workflow runs come from `actions/runs`, not
+# `commits/<sha>/check-runs`: that 403s ("Resource not accessible by personal
+# access token") under the narrower-scoped tokens container agents may hold,
+# which fail-closed 13 PRs for the sibling release-policy.py on 2026-09-06.
+# Commit statuses cover CI that is not Actions. Neither at all is refused: CI
+# that never ran did not pass.
+#
+# Every workflow named in CODEX_REVIEW_REQUIRED_WORKFLOWS (comma-separated,
+# default `CI`) must have a latest run on this head that concluded `success`.
+# Green-so-far is not enough: a head checked before CI registered its run would
+# otherwise pass on whatever else had already finished.
+#
+# Only the newest run per workflow name counts, since a rerun leaves the failed
+# run it replaced in the list, and only the newest status per context, since
+# /statuses keeps every status ever posted. The Risk label run is left out: it
+# decides the scope, and counting it would pass a head no CI ever ran on. The
+# pages go through stdin, not --argjson, because a page of runs can exceed the
+# kernel's per-argument limit.
+ci_verdict() {
+  local runs statuses required="${CODEX_REVIEW_REQUIRED_WORKFLOWS:-CI}"
+  runs=$(gh api --paginate --slurp "repos/$REPO/actions/runs?head_sha=$1&per_page=100") || return 1
+  statuses=$(gh api --paginate --slurp "repos/$REPO/commits/$1/statuses?per_page=100") || return 1
+  printf '%s\n%s\n' "$runs" "$statuses" | jq -rs --arg head "$1" --arg labeler "$RISK_LABEL_WORKFLOW" --arg requiredList "$required" --argjson excluded "$CI_EXCLUDED_CONTEXTS" '
+    ( $requiredList | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) ) as $required
+    | ( [ .[0][].workflow_runs[]?
+        | select(.head_sha == $head)
+        | select((.name == $labeler and .event == "pull_request_target") | not) ]
+      | group_by(.name) | map(max_by([.run_started_at // .created_at // "", .id // 0])) ) as $runs
+    | ( [ .[1][][]? | select(.context as $c | $excluded | index($c) | not) ] | group_by(.context) | map(max_by([.created_at // "", .id // 0])) ) as $statuses
+    | ( [ $runs[] | select(.status == "completed")
+          | (.name as $n | $required | index($n) != null) as $isRequired
+          | select((.conclusion // "") as $c | if $isRequired then $c != "success" else ($c | IN("success", "neutral", "skipped") | not) end)
+          | "\(.name)=\(.conclusion // "none")\(if $isRequired then " (required)" else "" end)" ]
+        + [ $statuses[] | select(.state != "success" and .state != "pending") | "\(.context)=\(.state)" ] ) as $red
+    | [ $required[] | . as $n | select(any($runs[]; .name == $n) | not) ] as $missing
+    | ( [ $runs[] | select(.status != "completed") | "\(.name)=\(.status)" ]
+        + [ $statuses[] | select(.state == "pending") | "\(.context)=pending" ] ) as $pending
+    | if ($runs | length) == 0 and ($statuses | length) == 0 then "ci_missing: no workflow run or commit status on this head — CI never ran"
+      elif ($red | length) > 0 then "ci_red: " + ($red | join(", "))
+      elif ($missing | length) > 0 then "ci_missing: " + ($missing | join(", ")) + " — required, but no run on this head"
+      elif ($pending | length) > 0 then "ci_pending: " + ($pending | join(", "))
+      else empty end'
+}
+
+case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|scope|request|merge-check|receipt}" in
   open)
     # thread_id  comment_id  file:line  outdated?  severity  title
     rounds_banner "$(rounds_count)"
@@ -689,6 +924,170 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait}" 
       sleep "$sleep_seconds"
       tick=$((tick + 1))
     done
+    ;;
+  scope)
+    # The risk-scoped verdict for the PR's current head, as one JSON line.
+    scope_eval || exit 1
+    jq -cn --arg repo "$REPO" --arg pr "$PR" --arg head "$SCOPE_HEAD" --arg mode "$SCOPE_MODE" \
+      --arg verdict "$SCOPE_VERDICT" --argjson labels "$SCOPE_LABELS" --arg reason "$SCOPE_REASON" \
+      '{repo: $repo, pr: ($pr | tonumber), head: $head, mode: $mode, verdict: $verdict, labels: $labels, reason: $reason}'
+    ;;
+  request)
+    # The only sanctioned way to ask for a round, and only in a risk-scoped
+    # repo. Every refusal posts nothing and has its own exit code (header).
+    scope_eval || exit 1
+    if [ "$SCOPE_MODE" = legacy ]; then
+      echo "request refused: $REPO is not risk-scoped — automatic review handles this repo; never request a review here" >&2
+      exit 20
+    fi
+    if [ "$SCOPE_VERDICT" != review ]; then
+      echo "request refused: scope verdict for $SCOPE_HEAD is $SCOPE_VERDICT ($SCOPE_REASON); it merges on green CI without a review round" >&2
+      exit 21
+    fi
+    markers=$(request_markers) || exit 1
+    if printf '%s' "$markers" | jq -e --arg head "$SCOPE_HEAD" 'any(.[]; .head == $head)' >/dev/null; then
+      echo "request refused: a review of $SCOPE_HEAD was already requested; wait for it instead of asking twice" >&2
+      exit 22
+    fi
+    # "After two failed corrections, stop correcting and reframe": the initial
+    # review plus two correction rounds. This cap is also what bounds a class
+    # the churn gate cannot see — the gate derives seams from imports, so
+    # findings on Markdown/YAML sites never gate (PR #566: 12 rounds).
+    cap="${REVIEW_ROUND_CAP:-3}"
+    if ! [[ "$cap" =~ ^[1-9][0-9]*$ ]]; then
+      echo "REVIEW_ROUND_CAP must be a positive whole number" >&2
+      exit 2
+    fi
+    requested=$(printf '%s' "$markers" | jq -er 'length') || exit 1
+    if [ "$requested" -ge "$cap" ]; then
+      {
+        echo "CAP: $requested of $cap review rounds already requested on PR #$PR — do not request another."
+        echo "Stop the loop, summarize the open findings (codex-review.sh open), and escalate to the"
+        echo "operator, or restart in a fresh session with a reframed prompt."
+      } >&2
+      exit 23
+    fi
+    # A request starts a round, so the churn gate judges it as it judges a push:
+    # committed history at the head the reviewer will read. Exit 3 propagates.
+    run_gate --committed-only --head "$SCOPE_HEAD"
+    round=$((requested + 1))
+    url=$(gh pr comment "$PR" --repo "$REPO" --body "@codex review
+
+<!-- pr-review-loop:request head=$SCOPE_HEAD round=$round -->")
+    echo "requested: round=$round/$cap head=$SCOPE_HEAD $url"
+    ;;
+  merge-check)
+    # Exit 0 only when merging exactly this head is allowed; the merge then pins
+    # it with `gh pr merge --match-head-commit <head>`. Legacy repos defer to
+    # SKILL.md Step 6 — no new check there.
+    shift
+    want=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --head) want="${2:?--head needs a sha}"; shift 2 ;;
+        *) echo "merge-check: unknown argument $1" >&2; exit 2 ;;
+      esac
+    done
+    scope_eval || exit 1
+    if [ "$SCOPE_MODE" = legacy ]; then
+      echo "merge=defer mode=legacy: $REPO is not risk-scoped; the existing Step-6 evidence rules apply"
+      exit 0
+    fi
+    if [ -n "$want" ] && [[ "$SCOPE_HEAD" != "$want"* ]]; then
+      echo "merge=refused head=$SCOPE_HEAD: the PR head is not $want" >&2
+      exit 24
+    fi
+    # No branch protection holds this line, so merge-check does, whatever the
+    # verdict: every check run on exactly this head, completed green.
+    ci=$(ci_verdict "$SCOPE_HEAD") || exit 1
+    if [ -n "$ci" ]; then
+      echo "merge=refused head=$SCOPE_HEAD: $ci" >&2
+      exit 24
+    fi
+    # A substitute reviewer who read exactly this head and said no outranks
+    # everything else here: `changes` refuses under either verdict, a clean
+    # Codex review included, until a later receipt for this head approves.
+    receipt=$(receipt_outcome "$SCOPE_HEAD") || exit 1
+    if [ "$receipt" = changes ]; then
+      echo "merge=refused head=$SCOPE_HEAD verdict=$SCOPE_VERDICT: latest substitute receipt: changes — a substitute reviewer said no on this head" >&2
+      exit 24
+    fi
+    if [ "$SCOPE_VERDICT" = skip ]; then
+      echo "merge=allowed head=$SCOPE_HEAD mode=risk-scoped verdict=skip ci=green: $SCOPE_REASON"
+      exit 0
+    fi
+    # verdict=review: the latest substitute receipt for THIS head approves, or
+    # the review requested for this head is clean. `status` is the loop's one
+    # definition of clean — a review of this head (or a 👍) newer than the
+    # request, no unresolved Codex thread from any round, the head unmoved — so
+    # it is reused here, not restated.
+    if [ "$receipt" = approve ]; then
+      echo "merge=allowed head=$SCOPE_HEAD mode=risk-scoped verdict=review ci=green: the latest substitute receipt for this head approves"
+      exit 0
+    fi
+    markers=$(request_markers) || exit 1
+    since=$(printf '%s' "$markers" | jq -r --arg head "$SCOPE_HEAD" '[.[] | select(.head == $head)] | first | .at // empty') || exit 1
+    if [ -z "$since" ]; then
+      echo "merge=refused head=$SCOPE_HEAD verdict=review: no review of this head was requested and no substitute receipt approves it (latest receipt: ${receipt:-none}; $SCOPE_REASON)" >&2
+      exit 24
+    fi
+    observation=$(status_observation "$SCOPE_HEAD" "$since") || exit 1
+    case "$observation" in
+      codex=clean*) echo "merge=allowed head=$SCOPE_HEAD mode=risk-scoped verdict=review ci=green: $observation" ;;
+      *)
+        echo "merge=refused head=$SCOPE_HEAD verdict=review: $observation; latest substitute receipt: ${receipt:-none}" >&2
+        exit 24
+        ;;
+    esac
+    ;;
+  receipt)
+    # A substitute review's durable receipt (docs/review-policy.md, "Review
+    # availability"), tied to exactly one head. The reviewer is a fresh
+    # context, never the implementing session; the body file carries its
+    # complete-diff and relevant-file scope and every finding with its
+    # disposition. `merge-check` reads the marker this writes.
+    shift
+    head="" outcome="" reviewer="" body_file=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --head) head="${2:?--head needs a sha}"; shift 2 ;;
+        --outcome) outcome="${2:?--outcome needs approve or changes}"; shift 2 ;;
+        --reviewer) reviewer="${2:?--reviewer needs the model and runtime}"; shift 2 ;;
+        --body-file) body_file="${2:?--body-file needs a file}"; shift 2 ;;
+        *) echo "receipt: unknown argument $1" >&2; exit 2 ;;
+      esac
+    done
+    if ! [[ "$head" =~ ^[0-9a-f]{40}$ ]]; then
+      echo "receipt: --head must be the full 40-character SHA the substitute reviewer read" >&2
+      exit 2
+    fi
+    case "$outcome" in
+      approve|changes) ;;
+      *) echo "receipt: --outcome must be approve or changes" >&2; exit 2 ;;
+    esac
+    if [ -z "$reviewer" ] || [ -z "$body_file" ] || [ ! -s "$body_file" ]; then
+      echo "receipt: needs --reviewer and a non-empty --body-file (scope, then every finding with its disposition)" >&2
+      exit 2
+    fi
+    body=$(cat "$body_file")
+    # This command writes the receipt's only marker. One smuggled in through the
+    # body or the reviewer would be read first and could approve another head.
+    case "$reviewer$body" in
+      *pr-review-loop:*)
+        echo "receipt: --reviewer and the body may not contain a pr-review-loop marker" >&2
+        exit 2
+        ;;
+    esac
+    url=$(gh pr comment "$PR" --repo "$REPO" --body "### Substitute review receipt
+
+- **Head:** \`$head\`
+- **Reviewer and runtime:** $reviewer
+- **Outcome:** $outcome
+
+$body
+
+<!-- pr-review-loop:substitute-receipt head=$head outcome=$outcome -->")
+    echo "receipt: outcome=$outcome head=$head $url"
     ;;
   *) echo "unknown command: $1" >&2; exit 2 ;;
 esac
