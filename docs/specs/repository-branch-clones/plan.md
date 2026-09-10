@@ -2,7 +2,9 @@
 
 **Status:** APPROVED, revision 2 (2026-09-10, operator), with build-time criterion corrections
 rev 2.1: §5.7.3 optional packages, §5.7.4 recovery, the §5.7.5 cap, §5.7.8 `off`, and P1-4/9/19–21.
-None changes intent, scope, or an invariant (see `run.md`). It applies the plan-review corrections
+None changes intent, scope, or an invariant (see `run.md`). Implementation-review corrections
+rev 2.2 are in §5.7.3–§5.7.5 and §5.7.8, and add P1-10's second case plus P1-22–25. Rev 2.3
+(NEW-1, approved by the operator) bounds content reads by the cap and adds P1-26. It applies the plan-review corrections
 M1–M7 plus S2, S5, and S6 (see `run.md`). The corrections themselves are cross-model reviewed
 at `/team-review --implementation`. Build order: Phase 1, then Phase 2 after Phase 1 is applied.
 
@@ -416,7 +418,7 @@ A tree is complete when all of these hold:
    `libc`. Others were correct: native binaries really missing, such as `@esbuild/linux-x64` in 14
    trees.)* Optional-only is sufficient in Phase 1 because no Phase 1 operation changes a
    workspace's file set: adopt shares the source tree's own inodes, and convert requires
-   inventory equality. Phase 2's link-at-checkout does hand content to a workspace that never
+   byte-for-byte equality (inventory and content manifest). Phase 2's link-at-checkout does hand content to a workspace that never
    installed it, so it needs a strict rule (§5.7.5). The evidence and the platform-aware
    implementation are kept for it.
 2. Every package path in that map exists as a directory whose `package.json` `name` and `version`
@@ -426,8 +428,15 @@ A tree is complete when all of these hold:
 Root-level dot entries other than `.bin` and `.package-lock.json`, such as `.vite` and `.cache`,
 are workspace-private. They are excluded from every check and never shared.
 
+The hidden lockfile `.package-lock.json` is checked like any other file but is **never
+hardlinked**. npm rewrites it in place on every reify (`@npmcli/arborist` `reify.js:254` →
+`shrinkwrap.js:1164`), and on a read-only shared inode npm unlinks it instead. Every farm and
+adopted source therefore keeps its own writable copy, with its mtime preserved (rev 2.2).
+
 An **inventory** is the sorted list of `(relative path, type, size)` for every regular file and
-symlink, private dot entries excluded.
+symlink, private dot entries excluded. A **content manifest** adds each item's sha256 (for a
+symlink, its target string) and its executable bits. It is computed only when a tree is adopted
+or converted (rev 2.2).
 
 #### 5.7.4 Operations
 
@@ -441,18 +450,20 @@ All operations are host-side, on one mount, and use `cp -al` semantics.
 
   Any failure quarantines the entry (§5.7.6).
 - **Adopt.** For a complete, untampered tree with no sealed entry for its key:
-  1. link it into `<key>.tmp/node_modules`, skipping private dot entries;
-  2. `chmod a-w` every regular file;
-  3. write `SEALED` with the key inputs, the source, `sealedAt`, and the inventory with its
-     sha256;
+  1. link it into `<key>.tmp/node_modules`, skipping private dot entries, and copying the
+     hidden lockfile instead of linking it;
+  2. `chmod a-w` every regular file in the entry;
+  3. write `SEALED` with the key inputs, the source, `sealedAt`, the inventory with its sha256,
+     and the content manifest's sha256 (from one read of the tree);
   4. rename `<key>.tmp` to `<key>`.
 
   A link failure (`EPERM`/`EXDEV`) aborts with the tree untouched and a WARN.
-- **Convert (M3).** For a complete private tree whose key has a verified entry and whose inventory
-  equals the entry's. On an inventory mismatch the tree is kept private, with a WARN and a
-  `convert-mismatch` count. Otherwise:
+- **Convert (M3).** For a complete private tree whose key has a verified entry, and whose
+  inventory and content manifest both equal the entry's, so only byte-identical installs merge
+  (rev 2.2). On any mismatch the tree is kept private, with a WARN and a `convert-mismatch`
+  count. Otherwise:
   1. link the entry to `<pkg>/.node_modules.nanoclaw-new`. This dir only ever holds shared farm
-     links, never private bytes;
+     links and a copy of the entry's hidden lockfile, never private bytes;
   2. rename `node_modules` to `<pkg>/.node_modules.nanoclaw-old`;
   3. rename `.new` to `node_modules`;
   4. move each private root dot entry from `.old` into `node_modules`, one rename each;
@@ -472,7 +483,8 @@ All operations are host-side, on one mount, and use `cp -al` semantics.
   again.
 - **Link.** For a package dir with no `node_modules` whose key has a verified entry: link it to
   `.new`, then rename to `node_modules`.
-- **Already a farm.** A sample file's inode equals the entry's. Nothing to do.
+- **Already a farm.** The first regular file in the entry's inventory, other than the hidden
+  lockfile, shares its inode with the workspace's copy. Nothing to do.
 
 #### 5.7.5 Triggers
 
@@ -486,7 +498,16 @@ All operations are host-side, on one mount, and use `cp -al` semantics.
   on the production disk. Further eligible trees are counted as `deferred` and follow today's
   delete rule until a later pass takes them. Recovery, verification, and GC are uncapped. The
   pass runs in the storage maintenance worker thread (`src/storage-maintenance-worker.ts`), off
-  the host event loop.
+  the host event loop. Each adopt or convert also reads its tree once to hash contents.
+  **The cap counts content reads (rev 2.3, NEW-1).** Every adopt and every convert attempt that
+  reads a tree's bytes takes a slot, including one that ends in `convert-mismatch`. A
+  content-mismatch verdict is remembered, keyed by the package dir, its inventory sha, its
+  hidden-lockfile mtime, and the entry's content sha, so an unchanged mismatched tree is never
+  read again. Each pass reports a `contentReads` counter.
+- **Pending conversions are never swept (rev 2.2):** in any flag mode, the 2-day delete never
+  removes a `node_modules` whose package dir holds `.node_modules.nanoclaw-new` or
+  `.node_modules.nanoclaw-old`. The regenerable delete action enforces this in its apply-time
+  recheck under the claim, so recovery always finds what it needs.
 - **Phase 2:** additionally, **link** during `repository_checkout` (§5.2 step 5, and reuse).
   Linking gives a workspace content it did not install, so the entry must first pass a strict
   completeness rule: no absent optional that this platform would install. Its exact definition
@@ -518,8 +539,11 @@ days past `sealedAt` or its last link. Quarantined entries go after 7 days.
 `NANOCLAW_REGENERABLE_SWEEP_DAYS`.
 
 - **`apply`:** recovery, adopt, convert, the farm exemption, and GC.
-- **`report`:** logs every decision, including the recovery and GC it would do, plus the
-  estimated bytes. It mutates nothing and keeps today's delete behavior, following the
+- **`report`:** logs every decision an `apply` pass would make, including recovery and GC, plus
+  the estimated bytes. On a cold cache, a key the pass would adopt counts as sealed for later
+  trees, so the report shows the real adopt-then-convert split (rev 2.2). It mutates nothing,
+  including recovery, which waits for `apply` or `off`. Pending conversions are protected from
+  the delete (§5.7.5). Otherwise today's delete behavior applies, following the
   `NANOCLAW_STORAGE_GC` convention.
 - **`off`:** no new sharing (no adopt, convert, link, or farm exemption). An applying storage
   pass still runs **recovery** and **cache GC**, so a rollback never strands an interrupted
@@ -704,7 +728,7 @@ the action payload and response shapes (§5.2), and `nanoclaw-checkout.json` (§
 | P1-7 | `in-place writes to a farm file fail and unlink-then-create leaves the entry unchanged` | Append throws `EACCES`. After unlink and recreate, the entry bytes and inode are unchanged. |
 | P1-8 | `quarantines an entry with a file modified after sealedAt and never links it again` | The entry is renamed `*.quarantined-*`, and a following link/convert for that key is a no-op with a WARN. |
 | P1-9 | `conversion survives interruption at every step with private bytes intact` | Simulate a crash after steps 1, 2, 3, and midway through step 4 (one of two private entries moved), with sentinel bytes in `.vite` and `.cache`. After steps 1–2, recovery restores the original private tree. After step 3 or mid-step 4, it completes the move. A second recovery run is a no-op. In every case the same pass then ends with a farm `node_modules` holding both private entries with their original bytes and inodes, and no `.new` or `.old`. |
-| P1-10 | `never adopts or converts under a live container mount or held storage claim` | With the mount/claim fixture present, trees are untouched. `storage-manager` suite. |
+| P1-10 | `never adopts or converts under a live container mount or held storage claim` | With the mount/claim fixture present, trees are untouched. Second case: a container mounts the topic between the scan and the mutation. The mount lookup returns nothing at scan time and the topic on the re-check under the claim, so the tree stays untouched while a control topic is adopted. `storage-manager` suite. |
 | P1-11 | `entries never cross workgroups` | A key sealed in workgroup A is not linked into a workgroup B tree with an identical lockfile. B adopts its own. |
 | P1-12 | `cache GC deletes an entry only when no farm links remain and it is aged` | An entry with a linked farm survives. After the farm is removed and the age passes, it is deleted. |
 | P1-13 | `reclaimable bytes exclude files hardlinked elsewhere` | `dirSizeBytes` of a farm counts 0 for shared files and full size for private files. `storage-manager` suite. |
@@ -716,6 +740,11 @@ the action payload and response shapes (§5.2), and `nanoclaw-checkout.json` (§
 | P1-19 | `accepts a tree whose only absent packages are optional` | With package-lock entries `node_modules/@esbuild/linux-x64` `{optional:true, os:["linux"], cpu:["x64"]}` and `node_modules/@esbuild/aix-ppc64` `{optional:true, os:["aix"], cpu:["ppc64"]}` both absent from the hidden lockfile, the tree is adopted. |
 | P1-20 | `off still recovers interrupted conversions and garbage-collects unlinked entries` | With the flag `off`: a package dir with `.old` and no `node_modules` is restored, an aged unlinked entry is deleted, and a complete private tree is not adopted or converted. |
 | P1-21 | `a pass mutates at most the per-pass cap and defers the rest` | With 7 eligible trees, one pass mutates 5 and counts 2 `deferred`. The next pass finishes the other 2. |
+| P1-22 | `conversion keeps a private tree whose file contents or symlink targets differ at equal size` | Two fixtures: a same-size file with different bytes, and a symlink with a same-length different target. Neither tree is converted, every original inode and byte remains, and `convert-mismatch` is counted. |
+| P1-23 | `the 2-day delete never removes node_modules beside a pending conversion, in any flag mode` | An aged idle topic's package dir holds `.node_modules.nanoclaw-old` with a private sentinel, next to a `node_modules` holding a moved private sentinel, and recovery is blocked. With the flag at `apply`, `off`, and `report`, both dirs and both sentinels survive the sweep. `storage-manager` suite. |
+| P1-24 | `a cold-cache report predicts one adopt and converts the rest with estimated bytes` | With two same-key trees, an empty cache, and the flag at `report`, the decisions are 1 adopt and 1 convert with `estimatedBytes > 0`, and nothing on disk changes. |
+| P1-26 | `content reads count against the per-pass cap and an unchanged mismatched tree is not re-read` | With 7 trees whose inventory matches the entry but whose bytes differ, pass 1 reports `contentReads` of 5 and 2 `deferred`. Pass 2 reads only the 2 unread trees (`contentReads` 2). Pass 3 reads 0. After one tree's hidden lockfile mtime changes, pass 4 reads that tree alone. |
+| P1-25 | `an npm-style rewrite of the hidden lockfile keeps a farm a farm and leaves the entry untouched` | After unlinking and rewriting `node_modules/.package-lock.json` in a farm, the package dir is still detected as a farm, and the entry's hidden lockfile bytes and inode are unchanged. |
 
 ### Phase 2
 

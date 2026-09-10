@@ -149,3 +149,52 @@ hand that checkout a tree missing its native binary.
 
 npm platform semantics used: `npm-install-checks/lib/index.js:34-38` (lists checked only when the
 entry declares them; a declared libc with unknown local libc fails) and `:59-82` (`checkList`).
+
+## 2026-09-10 — /team-review --implementation (Phase 1)
+
+- Target: approved plan rev 2 / build-time rev 2.1 + `git diff 4f5c1d795 a5c215872 -- src/` (2994 lines). Lenses: correctness, simplicity, plan fidelity, failure handling, verification quality + security/data-loss, state & rollback, performance (named risks: file renames/deletes inside live production workspaces; spawn races; first-pass I/O).
+- Fresh risk-selected checks (lead): related storage suites that consume the changed `dirSizeBytes`/`StoragePolicy` — `vitest run src/storage-activity.test.ts src/storage-gc.test.ts src/storage-maintenance-worker.test.ts src/storage-pressure-alert.test.ts src/worktree-cleanup.test.ts` (flock + ionice + `--maxWorkers=2`) → **5 files, 144/144 passed**. `dirSizeBytes` callers: storage-manager.ts:1818,1828,1854,2053,2061,2489,2604; worktree-cleanup.ts:900,970 (all want reclaimable bytes).
+
+### Reviewers
+
+| Reviewer | Transport / model / effort | Status | Raw verdict |
+|---|---|---|---|
+| Codex (other family, contract reviewer) | `codex exec --ignore-user-config --model gpt-6-astra -c model_reasoning_effort="high" --ephemeral --yolo --output-schema … --output-last-message …` from the worktree, prompt+bundle on stdin (184,920 bytes), timeout 3600000 | `completed`, 188 s; header model gpt-6-astra / openai / high (matches) | `needs-attention`, 2 findings (both high) → `must_fix` |
+| Fable 5.1 adversarial (same family, added coverage — named risk: data loss in live workspaces) | Agent worker-frontier, read-only | running | — |
+
+### Codex findings — lead verification
+
+- **CX1 (high) inventory equality ≠ content equality.** Verified: `inventoryFromWalk` records `[rel, type, size]` only (`src/dependency-cache.ts:273-275`); `convertVerified` compares that digest (`:965`) then deletes `.old` (`:1006`). Same-size different-content files (or symlink targets) pass and are replaced. Violates the plan's own rev-2.1 premise ("only identical installs merge", §5.7.3) that justifies the optional-only rule. ACCEPTED MUST-FIX.
+- **CX2 (high) unsafe cache states fall through to the 2-day delete.** Verified in the storage-manager diff: `recoverPackageDir` results are discarded and the keep-set covers only farm/adopted/converted outcomes; the delete loop iterates every target, including `node_modules` of package dirs that still hold `.node_modules.nanoclaw-old` (recovery `blocked`/`failed`, interrupted convert). Deleting that `node_modules` can drop private entries already moved into it, making later recovery lossy; applies in `off` and flag-`report` passes too. ACCEPTED MUST-FIX. The sub-claim that `convert-mismatch`/deferred trees are deleted after 2 idle days is today's regenerable rule and the plan's stated behavior (§5.7.5) — REJECTED as a finding (not a regression).
+
+### Fable adversarial findings — lead verification
+
+Raw verdict `clear`, 4 SHOULD-FIX (no MUST-FIX).
+
+- **FB1 cold-cache report mispredicts** — verified `dependency-cache.ts:886-889` (report adopt creates no entry) and `:1067/:1085` (`isRealDir(entryDir)` sole entry signal): every same-key tree reports `adopt`, so the §7 24 h report cannot show converts/mismatches/bytes. ACCEPTED (the rollout gate depends on report truthfulness) → per-pass would-be-sealed keys; P1-24.
+- **FB2 hidden lockfile shared read-only** — cited npm 10.9.8 `@npmcli/arborist` `reify.js:254` → `shrinkwrap.js:1164` (write in place; on error unlink). Consistent with the lead's earlier experiment (after `npm install <pkg>` in a farm the cache copy's link count dropped to 1). Every farm would lose farm detection + completeness on its first install. ACCEPTED → copy, never link, the hidden lockfile; farm detection by first non-lockfile inventory inode; P1-25.
+- **FB3 flag `report` never recovers; delete sweeps beside pending temp names** — same class as CX2; ACCEPTED, folded into the CX2 fix (primitive: the regenerable delete's apply-time recheck, every flag mode). Report stays non-mutating; recovery waits for `apply`/`off`.
+- **FB4 P1-10 not discriminating for the under-claim mount re-check** — verified: the scan-time `args.mounts` refusal (`storage-manager.ts:2588-2599`) already refuses the fixture, so removing the `topicIsUnmounted` re-check (`:2621`) stays green. ACCEPTED → mount-between-scan-and-mutation case, with a disable-and-fail confirmation.
+
+### Correction batch (rev 2.2)
+
+Plan updated first (§5.7.3 hidden lockfile + content manifest, §5.7.4 adopt/convert/farm detection, §5.7.5 pending-conversion protection + I/O note, §5.7.8 report semantics, §9 P1-10 second case + P1-22..25). One batch sent to the builder: CX1, CX2+FB3, FB1, FB2, FB4.
+
+### Correction batch result — verification (2026-09-10)
+
+- Builder commit `992965e07` (CX1, CX2+FB3, FB1, FB2, FB4). Lead re-run of affected checks (once, fresh): vitest on the 7 storage files → **7 files, 287/287 passed**; `tsc --noEmit` → exit 0, no output; eslint on the 4 files → 0 errors, 67 warnings (warn-level `no-catch-all`, 2 new); ratchet → `UNCHANGED 959 … (Δ 0)`; live checkout status empty. Builder reports P1-10's new case fails with the under-claim `topicIsUnmounted` re-check disabled (`storage-manager.test.ts:3316`) and passes restored.
+- Real-tree count (read-only): 30/33 accepted (population shrank by one topic's two trees since the last count); the same 3 refusals.
+- Accepted builder deviations: a tree whose only regular file is its hidden lockfile is `ineligible`; quarantined-entry farm check falls back to a short walk when SEALED is unreadable; no pending-conversion counter in `skipped` (foreign test literal); SEALED now requires `contentSha256` (no entries exist yet).
+- **NEW-1 (created by the CX1 correction) — content reads escape the per-pass cap.** Verified `src/dependency-cache.ts:1107-1111`: `deferIfCapped` runs before the content read, but a content mismatch returns at `:1109` without consuming a slot (`pass.mutations` increments only at `:1111`). Every tree whose inventory matches its entry but whose bytes differ (e.g. per-install native-build outputs) is fully re-hashed (~0.7 GB each) on every hourly pass, apply and report alike — unbounded I/O on the production disk, contradicting §5.7.5's cap rationale. Classification: mechanism flaw (the cap bounds mutations, not reads), not an external invariant. Per the correction rule (one batch per review entry), stopped and brought to the operator with a proposed bounded fix: count every content read against the cap, and memoize mismatch verdicts keyed by (package dir, inventory sha, hidden-lockfile mtime, entry content sha) so an unchanged mismatched tree is not re-read.
+- Review status: **must_fix (NEW-1) pending operator decision**; all six original findings verified fixed.
+- 2026-09-10 — operator approved applying the NEW-1 fix ("yes, apply the fix"). Plan rev 2.3: §5.7.5 cap counts content reads + mismatch-verdict memo + `contentReads` counter; P1-26. Sent to the builder as a single scoped fix; affected checks to be re-run once afterwards.
+
+### NEW-1 fix — verification and review conclusion (2026-09-10)
+
+- Builder commit `b3be98d2b` (src/dependency-cache.ts +82/−7, test +45). Diff inspected: `convertVerified` takes the cap slot and counts `contentReads` before `contentManifestSha256`; a mismatch memoizes {inventory sha, hidden-lockfile mtime, entry content sha} per package dir; a matching memo returns `convert-mismatch` with no read and no slot; memo pruned each pass for vanished dirs; memo in module memory because the storage worker is persistent (`storage-maintenance-worker.ts:69,136,171`; `storage-maintenance-worker-thread.ts:45`). Stale verdicts fail closed (tree stays private, never deleted).
+- Lead re-run of affected checks (once, fresh): vitest on the 7 storage files → **7 files, 288/288 passed**; `tsc --noEmit` → exit 0, no output; eslint on the 2 changed files → 0 errors, 25 warnings (warn-level `no-catch-all`, none new); ratchet → `UNCHANGED 959 … (Δ 0)`; live checkout status empty.
+- Builder deviations accepted: memoized mismatches still counted in `convertMismatch` but log only the decision line; test-only `_convertMismatchMemoSizeForTesting`. Noted: one confirming test run by the builder ran at ionice/nice priority but outside the flock.
+
+**Review verdict: clear.** Other-family coverage complete (Codex, gpt-6-astra/high, completed); same-family adversarial coverage (Fable) added. Findings: CX1, CX2 (MUST-FIX) and FB1–FB4 (SHOULD-FIX) accepted and verified fixed in `992965e07`; the CX2 sub-claim about deleting mismatched/deferred trees rejected (today's rule, plan §5.7.5); NEW-1 (created by the CX1 fix) fixed in `b3be98d2b` with operator approval.
+
+Known risks carried to ship: stale fingerprint until host restart; chmod residual (accident-proof only); trees whose postinstall writes after the hidden lockfile stay private (Prisma case); Phase 2 GC-vs-link race and strict completeness (Phase 2 scope); origin/main has moved since base `4f5c1d795` — rebase before PR.
