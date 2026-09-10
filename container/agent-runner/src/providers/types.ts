@@ -460,12 +460,16 @@ export type ProviderEvent =
       text: string | null;
       isError?: boolean;
       /**
-       * Whether this turn consumed a prompt the runner pushed. `false` only
-       * when the provider can tell it did not: a turn the CLI started itself,
-       * such as its synthetic "Continue from where you left off." turn on
-       * resuming an interrupted session, or one a background-task notification
-       * started. Undefined when the provider cannot tell, which poll-loop treats
-       * as prompted.
+       * Whether this turn echoed a prompt the runner pushed. `false` when the
+       * provider tracks echoes and this turn echoed none of its prompts: a turn
+       * the CLI started itself, such as its synthetic "Continue from where you
+       * left off." turn on resuming an interrupted session, or one a
+       * background-task notification started. A turn that did consume a runner
+       * prompt but whose result carries no echo also reads `false`; for Claude
+       * the SDK lists those cases on SDKResultSuccess/SDKResultError (a batch
+       * led by a meta prompt, a zeroed result, older producers). Undefined from
+       * a provider that does not track echoes, which poll-loop treats as
+       * prompted.
        */
       prompted?: boolean;
       usage?: TurnUsageInfo | TurnUsageInfo[];

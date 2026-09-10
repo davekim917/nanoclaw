@@ -11,6 +11,8 @@ import {
   type PostToolUseHookInput,
   type PreCompactHookInput,
   type PreToolUseHookInput,
+  type SDKResultError,
+  type SDKResultSuccess,
   type SdkPluginConfig,
 } from '@anthropic-ai/claude-agent-sdk';
 
@@ -2722,8 +2724,10 @@ export class ClaudeProvider implements AgentProvider {
             result?: string;
             is_error?: boolean;
             errors?: string[];
-            user_message_uuid?: string;
-            user_message_uuids?: string[];
+            // Typed from the SDK so a bump that drops the echo fails typecheck
+            // instead of silently making every result unprompted.
+            user_message_uuid?: (SDKResultSuccess | SDKResultError)['user_message_uuid'];
+            user_message_uuids?: (SDKResultSuccess | SDKResultError)['user_message_uuids'];
             usage?: {
               input_tokens?: number | null;
               output_tokens?: number | null;

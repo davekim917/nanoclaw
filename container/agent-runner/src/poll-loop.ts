@@ -773,15 +773,17 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Written when the turn reports it, not when the fire ends. A task stream
     // is never ended, so the fire "ends" only when the host reaps its
     // container, and nothing can be written after that. The `finally` writes
-    // only what this never did: a synthesised failure, or a write that failed
-    // here. Once per fire key, so a retry of the same batch cannot add a
-    // second record.
+    // only a synthesised failure, for a fire that never reported an outcome.
+    // The key is reserved before the write, so the first outcome reported for
+    // a fire is the only one attempted: a retry of the same batch can neither
+    // add a second record nor replace the first, and a failed write is logged,
+    // not retried.
     const writtenFireKeys = new Set<string>();
     const writeFireOutcome = async (key: string, outcome: FireOutcome): Promise<void> => {
       if (writtenFireKeys.has(key)) return;
+      writtenFireKeys.add(key);
       try {
         await autoAppendTaskLog(outcome.text, outcome.isError, outcome.model);
-        writtenFireKeys.add(key);
       } catch (logErr) {
         log(`Could not record task run outcome: ${logErr instanceof Error ? logErr.message : String(logErr)}`);
       }
@@ -1375,7 +1377,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       //
       // Best-effort; a bookkeeping write must never mask the turn's own error.
       // Flush ONE record per admitted task turn, in admission order, skipping
-      // any written when its turn reported it (`writeFireOutcome`). A turn
+      // any already reported when its turn answered (`writeFireOutcome`). A turn
       // with no outcome and no error to synthesise from records nothing; a
       // deferred batch records nothing at all, because the same occurrence runs
       // again and that re-run records its own.
