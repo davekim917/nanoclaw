@@ -61,6 +61,7 @@ import { guard } from '../guard/index.js';
 import { log } from '../log.js';
 import {
   CLOSE_REASON_MAX_CHARS,
+  readSessionInbound,
   withExistingNanoclawOutbound,
   withExistingNanoclawOutboundSync,
   type DoneProposal,
@@ -162,6 +163,31 @@ function readSessionProposalSync(agentGroupId: string, sessionId: string): DoneP
     return withExistingNanoclawOutboundSync(agentGroupId, sessionId, (outbound) => outbound.readDoneProposal()) ?? null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Series ids of every LIVE (pending|paused) task row this session's
+ * inbound.db carries, deduplicated. `readSessionInbound` is the read-only
+ * mailbox funnel (`../modules/mailbox/read-only.ts`) — fully synchronous, so
+ * it fits the same no-await decision span `readSessionProposalSync` fits, and
+ * it never provisions or migrates a session it only means to inspect.
+ *
+ * Same fail-open rule as `readSessionProposalSync` immediately above: an
+ * absent or unreadable inbound.db reports no live series rather than
+ * blocking every future close of the thread. Closing a thread whose series
+ * really is live and whose DB happens to be momentarily unreadable is a rare
+ * miss, not a correctness hazard — the operator can simply try again, and a
+ * close-close that a decayed session can never pass again is the worse
+ * failure mode for an operator console.
+ */
+function liveTaskSeriesIdsSync(agentGroupId: string, sessionId: string): string[] {
+  try {
+    const rows = readSessionInbound({ agentGroupId, sessionId }, (inbound) => inbound.listLiveTaskRows());
+    if (!rows) return [];
+    return [...new Set(rows.map((row) => row.series_id).filter((id): id is string => id !== null))];
+  } catch {
+    return [];
   }
 }
 
@@ -351,12 +377,24 @@ const NOT_FOUND = { status: 404 as const, body: { error: 'thread_not_found' } };
 
 /** The single decision every reservation input and reported field comes from. */
 export interface ClosureDecision {
-  outcome: 'reserve' | 'confirmation-required' | 'refused';
+  /**
+   * `live-task-series` is its own outcome, not folded into `refused`: unlike
+   * every other refusal on this path, it is safe to disclose to a caller who
+   * is already an admin of a group on the thread (they can already see the
+   * thread — that's what "an admin of a group on the thread" means — so
+   * naming the series discloses nothing a 404 was protecting). Every other
+   * refusal (no admin privilege, no sessions) stays folded into `refused`,
+   * which the response surface collapses to the same not-found a caller with
+   * no visibility gets.
+   */
+  outcome: 'reserve' | 'confirmation-required' | 'live-task-series' | 'refused';
   /** As of `freshVisible` — this is what the row stores AND what the response reports. */
   agentProposed: boolean;
   required: 1 | 2;
   sessionIds: string[];
   agentGroupIds: string[];
+  /** Populated only when `outcome === 'live-task-series'`; empty otherwise. */
+  liveTaskSeriesIds: string[];
   reason?: string;
 }
 
@@ -400,25 +438,50 @@ export function decideClosure(
 ): ClosureDecision {
   const agentProposed = freshVisible.some((s) => proposalsBySession.get(s.id) === true);
   const required = requiredConfirmations(agentProposed);
+  // Read directly here rather than pre-sampled like `proposalsBySession`:
+  // inbound.db is host-owned (no concurrent container writer to race against
+  // the way outbound.db's `done_proposal` can change mid-decision), so there
+  // is no stale-vs-fresh distinction to preserve across an await this
+  // function never takes. See `liveTaskSeriesIdsSync`'s doc comment for the
+  // fail-open rule on an unreadable session.
+  const liveTaskSeriesIds = [...new Set(freshVisible.flatMap((s) => liveTaskSeriesIdsSync(s.agent_group_id, s.id)))];
   const reported = {
     agentProposed,
     required,
     sessionIds: freshVisible.map((s) => s.id),
     agentGroupIds: freshVisible.map((s) => s.agent_group_id),
+    liveTaskSeriesIds,
   };
 
   const decision = guard(threadsClose, {
     actor: { kind: 'human', userId: caller.userId },
     resource: { threadId: caller.threadId },
-    payload: { agentGroupIds: reported.agentGroupIds, agentProposed, confirmations },
+    payload: { agentGroupIds: reported.agentGroupIds, agentProposed, confirmations, liveTaskSeriesIds },
   });
   if (decision.effect === 'allow') return { ...reported, outcome: 'reserve' };
+
+  // Computed once, reused by both branches below: whether THIS caller can
+  // already see the thread. Neither branch may disclose anything to a caller
+  // this is false for — that is what "collapses to not-found" means.
+  const callerIsAdmin = freshVisible.some((s) => hasAdminPrivilege(caller.userId, s.agent_group_id));
+
+  // A live task series is disclosed to an admin, unlike every other refusal
+  // here: the admin can already see this thread exists (that is what
+  // `callerIsAdmin` means), so naming the series and the fix is not the
+  // "does this thread exist" leak the not-found collapse below exists to
+  // prevent. Checked BEFORE the confirmation-count branch and unconditionally
+  // (not `liveTaskSeriesIds.length === 0`-guarded the other way) because a
+  // live series is a hard block no confirmation count satisfies — see
+  // `thread-close-guard.ts`'s `decide`.
+  if (liveTaskSeriesIds.length > 0 && callerIsAdmin) {
+    return { ...reported, outcome: 'live-task-series', reason: decision.reason };
+  }
 
   // Two refusals that must not look alike. Too few confirmations is a state
   // the caller can act on — it is told the number and asks again. Anything
   // else (not an admin on this thread any more, no sessions) collapses to the
   // not-found so the surface never discloses that a thread exists.
-  if (confirmations < required && freshVisible.some((s) => hasAdminPrivilege(caller.userId, s.agent_group_id))) {
+  if (confirmations < required && callerIsAdmin) {
     return { ...reported, outcome: 'confirmation-required', reason: decision.reason };
   }
   return { ...reported, outcome: 'refused', reason: decision.reason };
@@ -604,6 +667,26 @@ export async function requestThreadClose(
           required_confirmations: decision.required,
           confirmations,
           agent_proposed: decision.agentProposed,
+        },
+      };
+    }
+    if (decision.outcome === 'live-task-series') {
+      // Disclosed, unlike the generic refusal below — `decideClosure` already
+      // established this caller can see the thread (that's what the
+      // `live-task-series` outcome means), so naming the series and the
+      // reason discloses nothing a 404 was protecting.
+      log.info('thread-close: refused — live task series', {
+        threadId,
+        userId: ctx.user.id,
+        seriesIds: decision.liveTaskSeriesIds,
+      });
+      return {
+        status: 409,
+        body: {
+          error: 'live_task_series',
+          thread_id: threadId,
+          series_ids: decision.liveTaskSeriesIds,
+          reason: decision.reason,
         },
       };
     }

@@ -128,7 +128,7 @@ function materializeSession(agentGroupId: string, sessionId: string): void {
 
 import { log } from '../log.js';
 import { parseDirectOutboundWrite } from '../mailbox/model.js';
-import { clearWorkContinuation } from '../modules/mailbox/index.js';
+import { clearWorkContinuation, insertTaskRow } from '../modules/mailbox/index.js';
 import { withExistingMailboxSession } from '../session-manager.js';
 import {
   CLOSE_CONFIRM_WINDOW_MS,
@@ -267,6 +267,38 @@ describe('threads.close guard', () => {
     for (const confirmations of [0, 1, 2, 3]) {
       expect((await consult({ confirmations })).effect).not.toBe('hold');
     }
+  });
+
+  // ── Live task series (#601) ────────────────────────────────────────────────
+
+  it('denies a close when a session behind the thread backs a live task series, naming it and the fix', async () => {
+    const denial = await consult({ liveTaskSeriesIds: ['weekly-smoke-sweep'], confirmations: 2 });
+    expect(denial.effect).toBe('deny');
+    expect(denial.reason).toContain('weekly-smoke-sweep');
+    expect(denial.reason).toContain('ncl tasks cancel --id <series>');
+    // NOT pause: a paused series is still `liveTaskSeriesIds`-live (this same
+    // guard denies it identically), so telling the operator to pause would
+    // send them straight back into the same denial. Only cancel — or
+    // recreating the series after the close — actually clears it.
+    expect(denial.reason).not.toContain('ncl tasks pause');
+  });
+
+  it('names every series when more than one live series is behind the thread', async () => {
+    const denial = await consult({ liveTaskSeriesIds: ['series-a', 'series-b'], confirmations: 2 });
+    expect(denial.effect).toBe('deny');
+    expect(denial.reason).toContain('series-a');
+    expect(denial.reason).toContain('series-b');
+  });
+
+  it('the live-series deny is not satisfied by more confirmations — it is a hard block', async () => {
+    // Two is already the max requiredConfirmations ever asks for; a live
+    // series must still deny, because no confirmation count fixes it.
+    expect((await consult({ liveTaskSeriesIds: ['s'], confirmations: 2, agentProposed: true })).effect).toBe('deny');
+  });
+
+  it('threads with no live task series are unaffected — empty or absent both allow normally', async () => {
+    expect((await consult({ liveTaskSeriesIds: [] })).effect).toBe('allow');
+    expect((await consult({})).effect).toBe('allow');
   });
 });
 
@@ -762,6 +794,113 @@ describe('requestThreadClose', () => {
     expect(text).toContain('cancel_continuation');
     expect(text).toContain('propose_done');
     expect(text).toContain('10 minutes');
+  });
+});
+
+// ── Live task series end to end (#601) ───────────────────────────────────────
+//
+// A per-series task thread (`system:tasks:<seriesId>`) is 1:1 with its
+// session (`src/session-manager.ts:409`, `src/delivery.ts:1382`) — exactly
+// the shape that stranded a series in production (#601's report): the close
+// archived the session, the series stayed `pending`, and every fire refused
+// with "session is archived" forever after. These exercise the real
+// wiring — `decideClosure`'s synchronous `listLiveTaskRows()` read over a
+// materialized inbound.db, through to the HTTP-level outcome — not just the
+// guard's own `decide`.
+describe('requestThreadClose — live task series (#601)', () => {
+  const THREAD_TASK = 'system:tasks:weekly-smoke-sweep';
+
+  function materializeTaskSession(sessionId: string): void {
+    insertSession(sessionId, 'ag1', THREAD_TASK);
+    fs.rmSync(path.dirname(dbPathFor('ag1', sessionId, 'inbound.db')), { recursive: true, force: true });
+    materializeSession('ag1', sessionId);
+  }
+
+  /** One task row, in the state a real `ncl tasks`-created series leaves it. */
+  function seedTaskRow(sessionId: string, status: 'pending' | 'paused'): void {
+    const db = new Database(dbPathFor('ag1', sessionId, 'inbound.db'));
+    insertTaskRow(db, {
+      id: 'weekly-smoke-sweep',
+      seriesId: 'weekly-smoke-sweep',
+      processAfter: iso(-3_600_000),
+      recurrence: '0 9 * * 1',
+      content: JSON.stringify({ prompt: 'run the weekly smoke sweep' }),
+      status,
+    });
+    db.close();
+  }
+
+  it('denies closing the thread while its series is pending, naming the series to the admin caller', async () => {
+    materializeTaskSession('s-task-live');
+    seedTaskRow('s-task-live', 'pending');
+
+    const res = await requestThreadClose(THREAD_TASK, { confirmations: 2 }, ctxFor('admin'));
+
+    // Disclosed, not the generic 404 collapse: the caller is already an admin
+    // of a group on this thread (that's what `hasAdminPrivilege` establishes
+    // in `decideClosure`), so it can already see the thread exists — naming
+    // the series here discloses nothing the 404 collapse (used for every OTHER
+    // refusal — no admin privilege, no sessions) exists to protect.
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({
+      error: 'live_task_series',
+      thread_id: THREAD_TASK,
+      series_ids: ['weekly-smoke-sweep'],
+    });
+    expect(res.body.reason).toContain('weekly-smoke-sweep');
+    expect(res.body.reason).toContain('ncl tasks cancel --id <series>');
+    // The wrong remedy must never surface: pausing a pending series does not
+    // clear this refusal — a paused series is still live — so telling the
+    // operator to pause would send them straight back into the same denial.
+    expect(res.body.reason).not.toContain('ncl tasks pause');
+    expect(getRawDb().prepare('SELECT 1 FROM thread_closures WHERE thread_id = ?').get(THREAD_TASK)).toBeUndefined();
+  });
+
+  it('denies while the series is only paused — paused is still live, same disclosed 409', async () => {
+    materializeTaskSession('s-task-paused');
+    seedTaskRow('s-task-paused', 'paused');
+
+    const res = await requestThreadClose(THREAD_TASK, { confirmations: 2 }, ctxFor('admin'));
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({ error: 'live_task_series', series_ids: ['weekly-smoke-sweep'] });
+    expect(res.body.reason).not.toContain('ncl tasks pause');
+  });
+
+  it('a caller with no admin privilege on the thread gets the ordinary 404 — the series is never disclosed to them', async () => {
+    materializeTaskSession('s-task-nonadmin');
+    seedTaskRow('s-task-nonadmin', 'pending');
+
+    // 'nobody' (seeded with no user_roles row at all) is visible on every
+    // thread under this suite's default ctxFor (no_filter: true) but holds no
+    // admin privilege anywhere — exactly the caller the disclosure must stay
+    // closed for.
+    const res = await requestThreadClose(THREAD_TASK, { confirmations: 2 }, ctxFor('nobody'));
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ error: 'thread_not_found' });
+  });
+
+  it('succeeds once the series is cancelled first', async () => {
+    materializeTaskSession('s-task-cancelled');
+    seedTaskRow('s-task-cancelled', 'pending');
+    const db = new Database(dbPathFor('ag1', 's-task-cancelled', 'inbound.db'));
+    db.prepare("UPDATE messages_in SET status = 'cancelled' WHERE series_id = ?").run('weekly-smoke-sweep');
+    db.close();
+
+    const res = await requestThreadClose(THREAD_TASK, { confirmations: 2 }, ctxFor('admin'));
+    expect(res.status).toBe(202);
+    expect(getRawDb().prepare('SELECT state FROM thread_closures WHERE thread_id = ?').get(THREAD_TASK)).toMatchObject({
+      state: 'awaiting_confirmation',
+    });
+  });
+
+  it('an ordinary thread with no task series at all is unaffected', async () => {
+    const THREAD_CHAT = 'slack:C1:no-task-series';
+    insertSession('s-chat-only', 'ag1', THREAD_CHAT);
+    fs.rmSync(path.dirname(dbPathFor('ag1', 's-chat-only', 'inbound.db')), { recursive: true, force: true });
+    materializeSession('ag1', 's-chat-only');
+
+    const res = await requestThreadClose(THREAD_CHAT, { confirmations: 2 }, ctxFor('admin'));
+    expect(res.status).toBe(202);
   });
 });
 
