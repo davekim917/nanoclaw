@@ -1089,16 +1089,17 @@ human reads never shows a bare token — it shows the translation:
 
 Reason codes become plain sentences — "the deployed build changed mid-run, so
 the frozen build could no longer be proven", never `BLOCKED_BUILD_IDENTITY`
-in prose. The run ID and short SHA stay verbatim (they anchor the thread).
+in prose. The run ID and short SHA stay verbatim (they anchor the thread),
+on the post's last line — never in the headline a reader scans first.
 
 Post a compact, human-formatted channel summary (platform bold/bullets, no
 key-value dump) and attach the detailed manifest/evidence plus the key
 screenshots:
 
 ```text
-**Smoke <run_id> — <chat language from the table>**
+**<subject in words, e.g. PR #123 or Re-verification> — <chat language from the table>**
 *<one-sentence reason a non-operator understands>*
-- Build `<sha12>` on <environment> — <scope in words>
+- Scope: <scope in words>, on <environment>
 - Coverage: ran <executed> of <planned> checks (<passed> passed, <failed>
   failed, <blocked> blocked) — plus exact test counts and limitations
 - Floor: <entries walked and their outcome; each blocked entry with its
@@ -1114,6 +1115,7 @@ screenshots:
   paste the record inline: the post carries the verdict, the link carries
   the detail.>
 **Recommendation: <chat language> — <one sentence why>**
+Run `<run_id>` · build `<sha12>`
 ```
 
 The coordinator synthesizes recorded evidence; it must not invent a result,
