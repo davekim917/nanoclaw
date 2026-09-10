@@ -1,0 +1,9 @@
+[Unit]
+Description=Nightly NanoClaw git safety net at 08:30 UTC (before storage-gc)
+
+[Timer]
+OnCalendar=*-*-* 08:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

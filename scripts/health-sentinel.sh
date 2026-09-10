@@ -16,6 +16,8 @@
 #                    gates fail OPEN on it, so nothing else would say so)
 #   9. timers      — a watched sibling timer stopped firing (opt-in via
 #                    WATCHED_TIMERS; systemd cannot see this for a oneshot)
+#  10. deploy-lag  — work merged to origin/main that the host is not running
+#                    (default 3h; DEPLOY_LAG_MAX_S=0 turns it off)
 #
 # Log windows are measured by BYTE OFFSET deltas stored in the state file —
 # never by log timestamps (the log has multiple writers stamping different
@@ -25,6 +27,7 @@
 #
 # Manual run:   bash scripts/health-sentinel.sh
 # Test the DM:  TEST_ALERT=1 bash scripts/health-sentinel.sh
+# Dry run:      DRY_RUN=1 bash scripts/health-sentinel.sh   (prints; sends and writes nothing)
 
 set -euo pipefail
 
@@ -326,8 +329,49 @@ PYEOF
   done <<< "$PAUSED_OUT"
 fi
 
+# Deploy lag. Merges land on GitHub and nothing deploys them by default, so
+# the host can sit a day behind with every fix "merged" and nobody told.
+# Measured against dist/BUILD_INFO.json — the build the service runs — never
+# against HEAD: a bare `git pull` moves HEAD and deploys nothing (observed
+# 2026-09-10: HEAD pulled 31 commits past the running build, and a HEAD-based
+# check read the host as caught up). The wait is timed from the first merge
+# onto main that the build lacks (first-parent committer time), never from
+# the oldest commit in the range: a feature branch's commits can predate their
+# merge by weeks. A failed fetch falls back to the last-fetched ref, which can
+# only under-report. With no readable BUILD_INFO it falls back to HEAD.
+DEPLOY_LAG_MAX_S="${DEPLOY_LAG_MAX_S:-10800}"
+if [ "$DEPLOY_LAG_MAX_S" -gt 0 ] && git rev-parse -q --verify origin/main >/dev/null 2>&1; then
+  timeout 30 git fetch --quiet origin main 2>/dev/null || true
+  DEPLOYED=$(jq -r '.sha // empty' "$NANOCLAW_DIR/dist/BUILD_INFO.json" 2>/dev/null || true)
+  git cat-file -e "${DEPLOYED:-none}^{commit}" 2>/dev/null || DEPLOYED=$(git rev-parse HEAD)
+  BEHIND=$(git rev-list --count "$DEPLOYED"..origin/main 2>/dev/null || echo 0)
+  if [ "$BEHIND" -gt 0 ]; then
+    FIRST_MERGE=$( (git log --first-parent --format=%ct "$DEPLOYED"..origin/main 2>/dev/null | tail -1) || true)
+    LAG=$((NOW - ${FIRST_MERGE:-$NOW}))
+    if [ "$LAG" -ge "$DEPLOY_LAG_MAX_S" ]; then
+      NOTES=""
+      [ "$(git rev-parse HEAD)" != "$DEPLOYED" ] && NOTES=" The checkout was pulled to $(git rev-parse --short HEAD) but never built — a pull deploys nothing."
+      TRACKED_DIRTY=$(git status --porcelain --untracked-files=no 2>/dev/null | wc -l)
+      [ "$TRACKED_DIRTY" -gt 0 ] && NOTES="$NOTES The live checkout has $TRACKED_DIRTY uncommitted tracked file(s), and deploy.sh refuses until they are committed."
+      BREACHES+=("deploy-lag|$BEHIND merged commit(s) on origin/main are not deployed; the oldest merge has waited $((LAG / 3600))h and the host runs $(git rev-parse --short "$DEPLOYED"). Deploy with scripts/deploy.sh (it snapshots for rollback).$NOTES")
+    fi
+  fi
+fi
+
 if [ "${TEST_ALERT:-0}" = "1" ]; then
   BREACHES+=("test|test alert requested via TEST_ALERT=1 — delivery path verified, no action needed")
+fi
+
+# Dry run: print what would be sent, then stop before any delivery or any
+# cursor/cooldown write, so a new vital can be checked against the live host.
+if [ "${DRY_RUN:-0}" = "1" ]; then
+  if [ ${#BREACHES[@]} -eq 0 ]; then
+    echo "health-sentinel (dry run): all vitals OK"
+  else
+    echo "health-sentinel (dry run) would alert:"
+    for b in "${BREACHES[@]}"; do echo "- ${b#*|}"; done
+  fi
+  exit 0
 fi
 
 # ── dedup + persist window cursors ──────────────────────────────────────────
