@@ -252,6 +252,16 @@ export const sendFile: McpToolDefinition = {
     const filePath = args.path as string;
     if (!filePath) return err('path is required');
 
+    // Same final-response habit send_message guards against: a caption wrapped
+    // in a routing envelope would otherwise reach the channel as literal
+    // `<message to="...">` text. Rejects before anything is staged.
+    let caption = '';
+    if (args.text) {
+      const normalized = normalizeToolMessageText(args.text as string);
+      if ('error' in normalized) return err(normalized.error);
+      caption = normalized.text;
+    }
+
     const denial = chatSendDenial();
     if (denial) return err(denial);
 
@@ -307,7 +317,7 @@ export const sendFile: McpToolDefinition = {
       platform_id: routing.platform_id,
       channel_type: routing.channel_type,
       thread_id: routing.thread_id,
-      content: JSON.stringify({ text: (args.text as string) || '', files: [filename] }),
+      content: JSON.stringify({ text: caption, files: [filename] }),
     });
 
     log(`send_file: ${id} → ${routing.resolvedName} (${filename}), awaiting host ack`);

@@ -16,7 +16,7 @@ import { describe, it, test, expect, beforeEach, afterEach } from 'bun:test';
 import { getInboundDb, getOutboundDb } from '../mailbox/sqlite/connection.js';
 import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
-import { editMessage, sendMessage, isAllowedFilePath } from './core.js';
+import { editMessage, sendFile, sendMessage, isAllowedFilePath } from './core.js';
 
 /**
  * Publish the a2a reply stamp the way the poll loop does: a direct write to
@@ -198,6 +198,46 @@ describe('send_message MCP tool — final-output envelope normalization', () => 
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(2);
     expect(JSON.parse(out[1].content)).toMatchObject({ operation: 'edit', text: 'edited reply' });
+  });
+});
+
+describe('send_file MCP tool — caption envelope normalization', () => {
+  // The delivered path needs a real file under /workspace plus a host delivery
+  // ack, so it cannot run hermetically. These pin the wiring; the strip itself
+  // is the same normalizeToolMessageText the send_message cases cover.
+  it('rejects an unclosed routing envelope in the caption before staging anything', async () => {
+    const result = await sendFile.handler({
+      to: 'peer',
+      path: '/workspace/agent/report.html',
+      text: '<message to="here">unfinished caption',
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('one complete');
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
+  it('rejects multiple addressed envelopes in the caption', async () => {
+    const result = await sendFile.handler({
+      to: 'peer',
+      path: '/workspace/agent/report.html',
+      text: '<message to="here">a</message><message to="other">b</message>',
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('multiple routing message envelopes');
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
+  it('passes a complete envelope through to the file checks', async () => {
+    const result = await sendFile.handler({
+      to: 'peer',
+      path: '/nonexistent-send-file-test/report.html',
+      text: '<message to="here">caption</message>',
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('File not found');
   });
 });
 
