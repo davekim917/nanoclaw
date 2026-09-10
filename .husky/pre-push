@@ -79,21 +79,36 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   fi
 done < "$refs_file"
 
-if [ -n "$needs_remote_tips" ]; then
-  advertised_refs=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-remote.XXXXXX")
-  known_remote_tips=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-known.XXXXXX")
-  if [ -z "$remote_url" ] || ! git -C "$worktree_root" ls-remote "$remote_url" > "$advertised_refs"; then
+# Always learn the live advertised tips, not only when a ref is new or its
+# remote_sha is unknown locally. An EXISTING ref's own remote_sha only tells
+# us what that one ref pointed to; other refs (main, chiefly) routinely carry
+# history this branch already merged. Scoping the scan to remote_sha..local_sha
+# alone re-walks commits that are already on the remote through those other
+# refs, and since the install's identifier registry grows over time, a commit
+# that passed when first pushed can start failing a later, unrelated push that
+# merely rev-lists over it again. Re-scanning published commits protects
+# nothing, so every known remote tip is excluded below, not just this ref's.
+advertised_refs=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-remote.XXXXXX")
+known_remote_tips=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-known.XXXXXX")
+if [ -z "$remote_url" ] || ! git -C "$worktree_root" ls-remote "$remote_url" > "$advertised_refs"; then
+  if [ -n "$needs_remote_tips" ]; then
     echo "pre-push: failed to list advertised refs for $remote_name" >&2
     exit 1
   fi
+  # Every pushed ref is existing with a locally known remote_sha: fall back to
+  # each ref's own remote_sha..local_sha range (today's behavior without live
+  # tips). That scans more commits than the live-tips path, never fewer, so
+  # it stays fail-closed for the boundary check.
+  echo "pre-push: failed to list advertised refs for $remote_name; falling back to each ref's own remote-tracking range" >&2
+else
   while read -r remote_tip remote_ref; do
     if git -C "$worktree_root" cat-file -e "$remote_tip^{commit}" 2>/dev/null; then
       printf '%s\n' "$remote_tip" >> "$known_remote_tips"
     fi
   done < "$advertised_refs"
-  remove_file "$advertised_refs"
-  advertised_refs=''
 fi
+remove_file "$advertised_refs"
+advertised_refs=''
 
 scan_message() {
   if [ ! -e "$worktree_root/node_modules" ] && [ ! -L "$worktree_root/node_modules" ]; then
@@ -184,20 +199,25 @@ objects_for_ref() {
   local_sha=$1
   remote_sha=$2
   object_list=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-commits.XXXXXX")
+  # Exclude this ref's own remote_sha (when known) AND every other known
+  # remote tip, so a commit already reachable from the remote through another
+  # ref (main, chiefly) is not re-scanned just because it also sits behind
+  # this ref's own baseline. A commit already on the remote is already
+  # published; re-walking it here protects nothing and only risks a stale
+  # pass turning into a spurious failure as the identifier registry grows.
+  set --
   if [ "$remote_sha" != "$zero_sha" ] && git -C "$worktree_root" cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
-    git -C "$worktree_root" rev-list --objects --no-object-names --filter=tree:0 "$remote_sha..$local_sha" > "$object_list"
+    set -- "$remote_sha"
+  fi
+  if [ -n "$known_remote_tips" ]; then
+    while read -r remote_tip; do
+      set -- "$@" "$remote_tip"
+    done < "$known_remote_tips"
+  fi
+  if [ "$#" -eq 0 ]; then
+    git -C "$worktree_root" rev-list --objects --no-object-names --filter=tree:0 "$local_sha" > "$object_list"
   else
-    set --
-    if [ -n "$known_remote_tips" ]; then
-      while read -r remote_tip; do
-        set -- "$@" "$remote_tip"
-      done < "$known_remote_tips"
-    fi
-    if [ "$#" -eq 0 ]; then
-      git -C "$worktree_root" rev-list --objects --no-object-names --filter=tree:0 "$local_sha" > "$object_list"
-    else
-      git -C "$worktree_root" rev-list --objects --no-object-names --filter=tree:0 "$local_sha" --not "$@" > "$object_list"
-    fi
+    git -C "$worktree_root" rev-list --objects --no-object-names --filter=tree:0 "$local_sha" --not "$@" > "$object_list"
   fi
   # Keep annotated tag objects (including nested tags), not just peeled commits.
   # Commit snapshots cover their trees, so omit tree/blob traversal here.

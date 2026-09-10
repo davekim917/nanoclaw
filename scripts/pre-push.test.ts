@@ -314,6 +314,66 @@ describe('.husky/pre-push', () => {
     expect(records(f.log).join('\n')).not.toContain('remote-base');
   });
 
+  it('excludes a commit already reachable via a known remote tip, even for an existing ref whose own remote_sha predates it', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    // Already published to origin via `main` (advertised below), but NOT an
+    // ancestor of this ref's own remote_sha — exactly what a branch merging
+    // (or rebasing onto) a newer main looks like.
+    const publishedViaMain = commit(f.root, 'already-on-main');
+    const pushed = commit(f.root, 'new-on-branch');
+    const result = push(f, `refs/heads/current ${pushed} refs/heads/current ${base}\n`, {
+      fail: 'boundary:already-on-main',
+      remoteRefs: `${publishedViaMain}\trefs/heads/main\n`,
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(records(f.log).join('\n')).toContain('new-on-branch');
+    expect(records(f.log).join('\n')).not.toContain('already-on-main');
+  });
+
+  it('still scans a genuinely new commit on that same existing-ref push', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const publishedViaMain = commit(f.root, 'clean-on-main');
+    const pushed = commit(f.root, 'flagged-new-work');
+    const result = push(f, `refs/heads/current ${pushed} refs/heads/current ${base}\n`, {
+      fail: 'boundary:flagged-new-work',
+      remoteRefs: `${publishedViaMain}\trefs/heads/main\n`,
+    });
+
+    expect(result.status).toBe(1);
+    expect(records(f.log).join('\n')).toContain('flagged-new-work');
+  });
+
+  it('falls back to the old remote_sha..local_sha range, and still scans it, when ls-remote fails on an existing-ref push', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const pushed = commit(f.root, 'flagged-in-fallback-range');
+    const result = push(f, `refs/heads/current ${pushed} refs/heads/current ${base}\n`, {
+      fail: 'boundary:flagged-in-fallback-range',
+      remoteFailure: true,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('falling back to each ref');
+    expect(records(f.log).join('\n')).toContain('flagged-in-fallback-range');
+  });
+
+  it('leaves a new-ref push unaffected by the always-on ls-remote lookup', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const pushed = commit(f.root, 'new-ref-push');
+    const result = push(f, `refs/heads/new ${pushed} refs/heads/new ${zeroSha}\n`, {
+      fail: 'boundary:new-ref-push',
+      remoteRefs: `${base}\trefs/heads/main\n`,
+    });
+
+    expect(result.status).toBe(1);
+    expect(records(f.log).join('\n')).toContain('new-ref-push');
+    expect(records(f.log).join('\n')).not.toContain('remote-base');
+  });
+
   it('fails closed when live advertised refs cannot be listed', () => {
     const f = fixture();
     const pushed = commit(f.root, 'new-ref');
