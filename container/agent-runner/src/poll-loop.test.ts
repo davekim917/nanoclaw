@@ -2298,7 +2298,10 @@ describe('processQuery provider_executing', () => {
     expect(providerExecuting()).toBe(0);
   });
 
-  it('stays clear when a turn ends and the stream produces nothing further', async () => {
+  // Baseline / negative control for the two SDK-started-turn cases above —
+  // passes with or without the `init` fix (there is no second turn to miss),
+  // so it proves the fix didn't just start pinning the flag unconditionally.
+  it('baseline: stays clear when a turn ends and the stream produces nothing further', async () => {
     async function* events(): AsyncGenerator<ProviderEvent> {
       yield { type: 'init', continuation: 'sess-quiet' };
       yield { type: 'result', text: '<internal>done</internal>' };
@@ -2307,6 +2310,35 @@ describe('processQuery provider_executing', () => {
 
     await processQuery(query, ERR_ROUTING, ['m-quiet'], 'claude', undefined, 'prompt', undefined, {});
 
+    expect(providerExecuting()).toBe(0);
+  });
+
+  // The sibling case to the empty-result one above: the SDK can also start
+  // an unprompted further turn after an ORDINARY non-empty result (e.g. a
+  // background task's notification lands as a normal turn, then the SDK
+  // keeps working on its own). Covered separately because a non-empty result
+  // walks a different code path (dispatchResultText / completeDeliveredPrompt)
+  // before the next `init` arrives, and that path must not be what's making
+  // the fix above look like it works.
+  it('raises again on an SDK-started turn after a non-empty result (background-notification path)', async () => {
+    const observed: Record<string, number> = {};
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-notify' };
+      yield { type: 'result', text: '<internal>background task finished</internal>' };
+      observed.afterFirstResult = providerExecuting();
+      // The SDK starts a further turn on its own — not a pushToQuery call.
+      yield { type: 'init', continuation: 'sess-notify' };
+      observed.afterSecondInit = providerExecuting();
+      yield { type: 'result', text: '<internal>done</internal>' };
+      observed.afterFinalResult = providerExecuting();
+    }
+    const query: AgentQuery = { push: () => {}, end: () => {}, events: events(), abort: () => {} };
+
+    await processQuery(query, ERR_ROUTING, ['m-notify'], 'claude', undefined, 'prompt', undefined, {});
+
+    expect(observed.afterFirstResult).toBe(0);
+    expect(observed.afterSecondInit).toBe(1);
+    expect(observed.afterFinalResult).toBe(0);
     expect(providerExecuting()).toBe(0);
   });
 });
@@ -2818,6 +2850,54 @@ describe('durable continuation wiring', () => {
       expect(pushes.filter((p) => p.includes('single launch only'))).toHaveLength(1);
       // Single-flight claim: the record can never be handed out twice.
       expect(markWorkContinuationRunning(queued.continuation.id, 'runner-a')).toBeUndefined();
+    }, 30_000);
+
+    // Fleet incident follow-up, 2026-09-10: raising `provider_executing` on
+    // an SDK-started `init` (the reaper fix above) stops the task reaper, but
+    // `turnIdle` is untouched by that event — only `pushToQuery` and `result`
+    // touch it. Left stale-true across the SDK-started turn, the poll tick's
+    // turnIdle-gated launch (same danger this describe block is named for)
+    // pushes the queued continuation INTO the running turn before it has
+    // produced its own result — merged, so its eventual result would answer
+    // for two ledger entries at once.
+    it('does not push a queued continuation into an SDK-started turn before its own result', async () => {
+      const queued = queueWorkContinuation('resume after sdk-started turn');
+      if (!queued.accepted) throw new Error('expected continuation');
+      const pushes: string[] = [];
+      const pushedBeforeSecondResult: boolean[] = [];
+      let secondResultYielded = false;
+
+      async function* events(): AsyncGenerator<ProviderEvent> {
+        yield { type: 'init', continuation: 'sess-resume' };
+        // Empty first turn of a resume: no dispatch, no push, turnIdle → true.
+        yield { type: 'result', text: null };
+        // The SDK starts the real turn on its own — not a pushToQuery call.
+        yield { type: 'init', continuation: 'sess-resume' };
+        // Outlast several poll ticks while this turn is nominally still
+        // running. Pre-fix, the tick's turnIdle-gated launch fires in here.
+        await Bun.sleep(1600); // ≥3 poll ticks
+        secondResultYielded = true;
+        yield { type: 'result', text: '<internal>done</internal>' };
+      }
+      const query: AgentQuery = {
+        push: (m) => {
+          pushes.push(m);
+          pushedBeforeSecondResult.push(!secondResultYielded);
+        },
+        end: () => {},
+        abort: () => {},
+        events: events(),
+      };
+
+      await processQuery(query, ERR_ROUTING, ['m-resume'], 'claude', undefined, 'prompt', undefined, {}, 'runner-a');
+
+      const continuationPushes = pushes
+        .map((m, i) => ({ m, before: pushedBeforeSecondResult[i] }))
+        .filter((p) => p.m.includes('resume after sdk-started turn'));
+      expect(continuationPushes).toHaveLength(1);
+      // Must land only once the SDK-started turn produced its own result —
+      // never merged into the still-running turn.
+      expect(continuationPushes[0]!.before).toBe(false);
     }, 30_000);
   });
 
