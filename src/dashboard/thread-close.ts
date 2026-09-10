@@ -61,6 +61,7 @@ import { guard } from '../guard/index.js';
 import { log } from '../log.js';
 import {
   CLOSE_REASON_MAX_CHARS,
+  readSessionInbound,
   withExistingNanoclawOutbound,
   withExistingNanoclawOutboundSync,
   type DoneProposal,
@@ -162,6 +163,31 @@ function readSessionProposalSync(agentGroupId: string, sessionId: string): DoneP
     return withExistingNanoclawOutboundSync(agentGroupId, sessionId, (outbound) => outbound.readDoneProposal()) ?? null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Series ids of every LIVE (pending|paused) task row this session's
+ * inbound.db carries, deduplicated. `readSessionInbound` is the read-only
+ * mailbox funnel (`../modules/mailbox/read-only.ts`) — fully synchronous, so
+ * it fits the same no-await decision span `readSessionProposalSync` fits, and
+ * it never provisions or migrates a session it only means to inspect.
+ *
+ * Same fail-open rule as `readSessionProposalSync` immediately above: an
+ * absent or unreadable inbound.db reports no live series rather than
+ * blocking every future close of the thread. Closing a thread whose series
+ * really is live and whose DB happens to be momentarily unreadable is a rare
+ * miss, not a correctness hazard — the operator can simply try again, and a
+ * close-close that a decayed session can never pass again is the worse
+ * failure mode for an operator console.
+ */
+function liveTaskSeriesIdsSync(agentGroupId: string, sessionId: string): string[] {
+  try {
+    const rows = readSessionInbound({ agentGroupId, sessionId }, (inbound) => inbound.listLiveTaskRows());
+    if (!rows) return [];
+    return [...new Set(rows.map((row) => row.series_id).filter((id): id is string => id !== null))];
+  } catch {
+    return [];
   }
 }
 
@@ -400,6 +426,13 @@ export function decideClosure(
 ): ClosureDecision {
   const agentProposed = freshVisible.some((s) => proposalsBySession.get(s.id) === true);
   const required = requiredConfirmations(agentProposed);
+  // Read directly here rather than pre-sampled like `proposalsBySession`:
+  // inbound.db is host-owned (no concurrent container writer to race against
+  // the way outbound.db's `done_proposal` can change mid-decision), so there
+  // is no stale-vs-fresh distinction to preserve across an await this
+  // function never takes. See `liveTaskSeriesIdsSync`'s doc comment for the
+  // fail-open rule on an unreadable session.
+  const liveTaskSeriesIds = [...new Set(freshVisible.flatMap((s) => liveTaskSeriesIdsSync(s.agent_group_id, s.id)))];
   const reported = {
     agentProposed,
     required,
@@ -410,15 +443,23 @@ export function decideClosure(
   const decision = guard(threadsClose, {
     actor: { kind: 'human', userId: caller.userId },
     resource: { threadId: caller.threadId },
-    payload: { agentGroupIds: reported.agentGroupIds, agentProposed, confirmations },
+    payload: { agentGroupIds: reported.agentGroupIds, agentProposed, confirmations, liveTaskSeriesIds },
   });
   if (decision.effect === 'allow') return { ...reported, outcome: 'reserve' };
 
   // Two refusals that must not look alike. Too few confirmations is a state
   // the caller can act on — it is told the number and asks again. Anything
-  // else (not an admin on this thread any more, no sessions) collapses to the
-  // not-found so the surface never discloses that a thread exists.
-  if (confirmations < required && freshVisible.some((s) => hasAdminPrivilege(caller.userId, s.agent_group_id))) {
+  // else (not an admin on this thread any more, no sessions, a live task
+  // series) collapses to the not-found so the surface never discloses that a
+  // thread exists. `liveTaskSeriesIds.length === 0` guards the first branch
+  // because giving more confirmations can never satisfy a live-series deny —
+  // reporting "confirmation required" there would tell the operator to do the
+  // one thing that will not fix it.
+  if (
+    liveTaskSeriesIds.length === 0 &&
+    confirmations < required &&
+    freshVisible.some((s) => hasAdminPrivilege(caller.userId, s.agent_group_id))
+  ) {
     return { ...reported, outcome: 'confirmation-required', reason: decision.reason };
   }
   return { ...reported, outcome: 'refused', reason: decision.reason };

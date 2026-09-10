@@ -16,13 +16,24 @@
  * shape that would grow one. Nothing pairs with an approval handler here
  * because nothing is ever waiting for one.
  *
- * **Two rules, and both are in `decide` rather than in the handler**, so the
+ * **Three rules, and all are in `decide` rather than in the handler**, so the
  * seam is the authority and a second caller cannot arrive later with its own
  * looser copy:
  *
  *  1. An admin of at least one agent group backing the thread — the same
  *     privilege the rest of this surface's mutating verbs demand.
- *  2. The confirmation count. An agent-proposed close needs ONE confirmation:
+ *  2. No session behind the thread may back a LIVE (pending or paused) task
+ *     series. A per-series task thread (`system:tasks:<seriesId>`) is 1:1
+ *     with its session — archiving that session strands the series: it stays
+ *     `pending`/`paused` forever, `unwakeableReason` refuses every fire with
+ *     "session is archived" (`src/container-runner.ts`), and nothing
+ *     reopens it, because `unarchiveSessionById` has no callers. A silent
+ *     cascade-cancel was considered and rejected — closing a thread must not
+ *     quietly end scheduled work — so this is a hard refusal, not a third
+ *     confirmation: the operator must explicitly end the series first
+ *     (`ncl tasks cancel --id <series>` or `ncl tasks pause --id <series>`)
+ *     before the thread can close.
+ *  3. The confirmation count. An agent-proposed close needs ONE confirmation:
  *     the agent already vouched that it is finished, and the operator is
  *     agreeing. A close with no proposal needs TWO, because it overrides an
  *     agent that still believes it has work — which is precisely the case the
@@ -68,6 +79,14 @@ export interface ThreadClosePayload extends Record<string, unknown> {
   agentProposed: boolean;
   /** Confirmations the operator actually gave, as counted by the caller. */
   confirmations: number;
+  /**
+   * Series ids of any LIVE (pending|paused) task series a session behind this
+   * thread backs, sampled by the caller before the decision — `decide` never
+   * touches a per-session mailbox itself, the same reason `agentProposed`
+   * arrives pre-sampled rather than re-derived in here. See
+   * `src/dashboard/thread-close.ts`'s `liveTaskSeriesIdsSync`.
+   */
+  liveTaskSeriesIds: string[];
 }
 
 export const threadsClose = defineGuardedAction({
@@ -87,6 +106,18 @@ export const threadsClose = defineGuardedAction({
     if (agentGroupIds.length === 0) return DENY('no sessions back this thread');
     if (!agentGroupIds.some((id) => hasAdminPrivilege(actor.userId, id))) {
       return DENY('not an admin of any agent group on this thread');
+    }
+
+    const liveTaskSeriesIds = Array.isArray(payload.liveTaskSeriesIds)
+      ? payload.liveTaskSeriesIds.filter((id): id is string => typeof id === 'string' && id !== '')
+      : [];
+    if (liveTaskSeriesIds.length > 0) {
+      const plural = liveTaskSeriesIds.length > 1;
+      return DENY(
+        `a session behind this thread backs ${plural ? 'live task series' : 'a live task series'} ` +
+          `(${liveTaskSeriesIds.join(', ')}) — run \`ncl tasks cancel --id <series>\` or ` +
+          `\`ncl tasks pause --id <series>\` to end ${plural ? 'them' : 'it'} before closing this thread`,
+      );
     }
 
     const required = requiredConfirmations(payload.agentProposed === true);
