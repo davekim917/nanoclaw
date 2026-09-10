@@ -1,0 +1,26 @@
+# Applies `risk:high` from .github/labeler.yml. See that file for what the label means.
+#
+# pull_request_target, not pull_request: the labeler then reads its config from the
+# BASE branch, so a PR cannot edit labeler.yml to drop its own risk label. This is safe
+# only because nothing here checks out or executes PR code — the labeler reads the
+# changed-file list through the API. Do not add a checkout of the PR head to this job.
+#
+# One consequence (documented upstream in actions/labeler): the PR that introduces or
+# changes this workflow is labeled by the base branch's copy, not its own.
+name: Risk label
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/labeler@v7
+        with:
+          sync-labels: true
