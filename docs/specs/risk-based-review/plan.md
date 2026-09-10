@@ -139,8 +139,8 @@ each is a large mechanical migration and none of them is implicated in any defec
 
 `container/skills/smoke-test/` is a mature agentic QA system: 150+ campaigns since August,
 real browser plus backend assertions, seat rotation for permission crossings, deterministic
-bash scheduling gates. It runs **against exactly one client workgroup**. No `smokehouse/`
-directory exists under any other workgroup, and nothing points it at this repo.
+bash scheduling gates. It runs **against exactly one client workgroup**. No equivalent QA state
+exists under any other workgroup, and nothing points it at this repo.
 
 So for NanoClaw itself, Codex review is the last line with no net beneath it. A NanoClaw-self
 campaign, post-deploy, asserting the paths a unit test cannot reach:
