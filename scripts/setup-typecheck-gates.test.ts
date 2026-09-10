@@ -204,11 +204,14 @@ function runGate(
   // worktree add/remove, show --no-patch) rather than the handful of
   // deterministic canned answers the build-gate fixture's fake `git` gives —
   // there is no meaningful way to fake that plumbing, so turn this fixture
-  // into a real, minimal one-commit repo and push it for real.
+  // into a real, minimal one-commit repo and push it for real. Only ls-remote
+  // stays fake: `--get-url` echoes the URL back unchanged (no insteadOf
+  // rewriting), and a listing advertises no refs.
   fs.rmSync(path.join(root, 'bin', 'git'), { force: true });
   executable(
     path.join(root, 'bin', 'git'),
     `if [ "$1" = -C ] && [ "$3" = ls-remote ]; then shift 2; fi
+if [ "$1" = ls-remote ] && [ "$2" = --get-url ]; then printf '%s\\n' "$3"; exit 0; fi
 if [ "$1" = ls-remote ]; then exit 0; fi
 exec ${quote(realGit)} "$@"`,
   );
