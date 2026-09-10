@@ -2118,6 +2118,32 @@ export async function processQuery(
         // effectively orphaned and the next message started a blank
         // Claude session with no prior context.
         setContinuation(providerName, event.continuation);
+        // The SDK emits `init` at the start of EVERY turn, including one it
+        // starts on its own inside an already-open stream (e.g. a resume
+        // whose first turn answers empty, then genuinely does the work on a
+        // second turn nobody pushed). That second turn is not a `pushToQuery`
+        // call — `hasQueuedWork` is unimplemented on claude.ts, so the prior
+        // empty `result` already lowered the flag — so without this, the
+        // task reaper sees it as idle and kills it mid-work on the next tick.
+        //
+        // `turnIdle` and `turnStartedAtMs` are normally only touched by
+        // `pushToQuery` (a runner-initiated push) and the `result` handler
+        // below — this SDK-started turn is neither. Left stale-true, the poll
+        // tick's continuation launch (turnIdle-gated, a few lines down) reads
+        // "provider idle" and pushes a queued continuation INTO this running
+        // turn: the SDK merges it, so one `result` answers two ledger
+        // entries, which is exactly what `turnIdle` exists to prevent (see
+        // its own comment above). Reset both here — but ONLY when `turnIdle`
+        // was still true, i.e. this `init` was never preceded by a push for
+        // this turn: a pushed turn's `init` arrives after `pushToQuery`
+        // already cleared it and stamped the real push-time clock, and
+        // re-stamping here would throw away that earlier, more accurate
+        // start time.
+        if (turnIdle) {
+          turnIdle = false;
+          turnStartedAtMs = Date.now();
+        }
+        setProviderTurnExecuting(true);
       } else if (event.type === 'result') {
         sawResult = true; // the SDK produced output → any prior api_retry recovered
         // The provider is between turns as of right now. Set before the

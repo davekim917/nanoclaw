@@ -165,8 +165,8 @@ describe('container instruction contracts', async () => {
     // No credential-security assertion: the operator removed that section —
     // never-soliciting-credentials is model table stakes, and vault mechanics
     // live in the onecli-gateway skill.
-    // 30-minute idle ceiling.
-    expect(instructions).toContain('killed after ~30 minutes without an active turn');
+    // Idle-reap window (task/chat/ceiling tiers).
+    expect(instructions).toContain('reaped once it goes quiet');
     // Shared memory limit + its OOM-symptom warning (SIGKILL, not a clean failure).
     expect(instructions).toContain('one memory limit');
     expect(instructions).toContain('SIGKILLs individual child processes');
