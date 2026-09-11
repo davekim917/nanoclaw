@@ -389,3 +389,47 @@ describe('AGENTS.md is never truncated', () => {
     });
   }
 });
+
+describe('workgroup wiki section (src/workgroup-wiki.ts)', () => {
+  const WIKI_SECTION = '## Workgroup wiki\n\nSENTINEL_WIKI_7c3e';
+
+  it('composes the host wiki section into CLAUDE.md', async () => {
+    const ag = group('ag-wiki', 'wiki-group');
+    await seed(ag);
+
+    await composeGroupClaudeMd(ag, 'claude', { workgroupId: 'wiki-group', workgroupWikiInstructions: WIKI_SECTION });
+
+    expect(docOf(ag.folder)).toContain('SENTINEL_WIKI_7c3e');
+  });
+
+  it('composes the same section into AGENTS.md for non-Claude providers', async () => {
+    const ag = group('ag-wiki-codex', 'wiki-codex-group');
+    await seed(ag);
+
+    await composeGroupClaudeMd(ag, 'codex', {
+      workgroupId: 'wiki-codex-group',
+      workgroupWikiInstructions: WIKI_SECTION,
+    });
+
+    const agents = fs.readFileSync(path.join(GROUPS_DIR, ag.folder, 'AGENTS.md'), 'utf-8');
+    expect(agents).toContain('SENTINEL_WIKI_7c3e');
+  });
+
+  it('omits the section when no wiki is mounted', async () => {
+    const ag = group('ag-no-wiki', 'no-wiki-group');
+    await seed(ag);
+
+    await composeGroupClaudeMd(ag, 'claude', { workgroupId: 'no-wiki-group', workgroupWikiInstructions: null });
+
+    expect(docOf(ag.folder)).not.toContain('## Workgroup wiki');
+  });
+
+  it('refuses wiki instructions without a spawn-resolved workgroup ID', async () => {
+    const ag = group('ag-wiki-no-wg', 'wiki-no-wg-group');
+    await seed(ag);
+
+    await expect(composeGroupClaudeMd(ag, 'claude', { workgroupWikiInstructions: WIKI_SECTION })).rejects.toThrow(
+      'spawn-resolved workgroup ID',
+    );
+  });
+});
