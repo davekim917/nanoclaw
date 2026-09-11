@@ -4,6 +4,7 @@ import { enforceHermeticity } from '../src/test-hermeticity.js';
 
 import {
   buildShadowReviewIndex,
+  computeFetchSinceIso,
   computeReport,
   computeShadowCoverage,
   extractFixesPrNumber,
@@ -625,5 +626,45 @@ describe('computeShadowCoverage', () => {
     const coverage = computeShadowCoverage(prs, [], [], []);
     expect(coverage.sinceIso).toBe(SHADOW_REVIEW_GO_LIVE_ISO);
     expect(coverage.eligible).toBe(0); // #9 merged before go-live
+  });
+});
+
+describe('computeFetchSinceIso', () => {
+  const goLive = '2026-09-11T15:59:15Z';
+
+  it('uses switch - days when that is earlier than go-live', () => {
+    // switch - days = 2026-08-27, well before go-live — the before/after bucket's own
+    // window should win here, since it's the one actually asking for more history.
+    const since = computeFetchSinceIso('2026-09-10T00:00:00Z', 14, goLive);
+    expect(since).toBe(new Date('2026-08-27T00:00:00Z').toISOString());
+  });
+
+  it('uses go-live when switch - days would be later than go-live', () => {
+    // --switch 2026-10-01 --days 7 -> switch - days = 2026-09-24, AFTER go-live. Fetching
+    // from there alone would silently drop every PR merged 09-11..09-24 from allPRs,
+    // undercounting computeShadowCoverage even though its own "since" label still reads
+    // "since go-live" — see the file header / computeFetchSinceIso's own doc comment.
+    const since = computeFetchSinceIso('2026-10-01T00:00:00Z', 7, goLive);
+    expect(since).toBe(new Date(goLive).toISOString());
+  });
+
+  it('is inclusive at the boundary: switch - days exactly equal to go-live', () => {
+    const since = computeFetchSinceIso('2026-09-11T15:59:15Z', 0, goLive);
+    expect(since).toBe(new Date(goLive).toISOString());
+  });
+
+  it('compares timestamps, not ISO strings (go-live has no milliseconds)', () => {
+    // A naive string comparison of a bare-seconds ISO string ('...15Z') against a
+    // .toISOString() result ('...15.000Z') sorts '.' before 'Z', so the millisecond
+    // form would read as "earlier" even when the instants are equal or later — this
+    // case pins the correct (numeric) comparison at exactly that boundary.
+    const since = computeFetchSinceIso('2026-09-11T15:59:16Z', 0, goLive);
+    expect(since).toBe(new Date(goLive).toISOString());
+  });
+
+  it('defaults goLiveIso to SHADOW_REVIEW_GO_LIVE_ISO', () => {
+    // switch - days = 2026-10-01, well after go-live — only the default takes effect here.
+    const since = computeFetchSinceIso('2026-10-01T00:00:00Z', 0);
+    expect(since).toBe(new Date(SHADOW_REVIEW_GO_LIVE_ISO).toISOString());
   });
 });

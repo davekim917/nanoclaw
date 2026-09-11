@@ -101,8 +101,8 @@
  * disagree with what `shadow-review.yml` itself actually selected, which reads CURRENT
  * labels (`risk:high` / `review:requested`), not a glob replay. `computeShadowCoverage`
  * answers a narrower, more literal question — "of the PRs the workflow should be picking
- * up since it went live, how many did it actually review?" — using the workflow's own
- * selection rule (`shadow-review.yml:147-151`): base ref `main` (`baseRefName`,
+ * up since it went live, how many did it actually review?" — using `report`'s own
+ * selection rule (`shadow-review.yml:350-356`): base ref `main` (`baseRefName`,
  * `SHADOW_REVIEW_BASE_REF`) and CURRENT labels excluding `risk:high`/`review:requested`
  * (`isEligibleForShadowReview`), scoped to PRs merged at or after PR #660's merge time
  * (`SHADOW_REVIEW_GO_LIVE_ISO`, when shadow review went live). Its one caveat: label
@@ -396,7 +396,7 @@ const REVIEW_REQUESTED_LABEL = 'review:requested';
 
 /**
  * Mirrors the LABEL half of `shadow-review.yml`'s own selection rule (`report`'s
- * job-level `if:`, shadow-review.yml:147-151): eligible for shadow review when CURRENT
+ * job-level `if:`, shadow-review.yml:350-356): eligible for shadow review when CURRENT
  * labels include neither `risk:high` nor `review:requested`. The base-ref half of that
  * same `if:` (`github.event.pull_request.base.ref == 'main'`) is checked separately in
  * `computeShadowCoverage` via `baseRefName`, since it isn't a label. Used only by
@@ -959,6 +959,28 @@ function printReport(report: ReportResult): void {
   printShadowCoverage(report.shadowCoverage);
 }
 
+/**
+ * The `merged:>=X` lower bound `fetchMergedPRs` fetches from — the EARLIER of
+ * `switch - days` (what the before/after bucket needs) and `goLiveIso` (what
+ * `computeShadowCoverage` needs). `switch - days` alone isn't enough: a run like
+ * `--switch 2026-10-01 --days 7` would fetch nothing earlier than 2026-09-24, silently
+ * dropping every PR merged between go-live (2026-09-11) and then from `allPRs` — and
+ * `computeShadowCoverage`'s own denominator would undercount without any error, since it
+ * only ever sees what `allPRs` contains. Compared as timestamps, not ISO strings: a bare
+ * `SHADOW_REVIEW_GO_LIVE_ISO` (no milliseconds) and a `.toISOString()` result (always
+ * `.sssZ`) don't sort the same lexically as they do chronologically (`.` sorts before
+ * `Z`), so a string comparison here would silently pick the wrong bound.
+ */
+export function computeFetchSinceIso(
+  switchIso: string,
+  days: number,
+  goLiveIso: string = SHADOW_REVIEW_GO_LIVE_ISO,
+): string {
+  const switchBasedMs = new Date(switchIso).getTime() - days * MS_PER_DAY;
+  const goLiveMs = new Date(goLiveIso).getTime();
+  return new Date(Math.min(switchBasedMs, goLiveMs)).toISOString();
+}
+
 function main(): void {
   const options = parseArgs(process.argv.slice(2));
 
@@ -966,7 +988,7 @@ function main(): void {
   const labelerConfig = parse(labelerYaml) as Record<string, unknown>;
   const riskHighGlobs = globsForRiskHigh(labelerConfig);
 
-  const sinceIso = new Date(new Date(options.switchIso).getTime() - options.days * MS_PER_DAY).toISOString();
+  const sinceIso = computeFetchSinceIso(options.switchIso, options.days);
   const allPRs = fetchMergedPRs(options.repo, sinceIso);
   const shadowReviewIssues = fetchShadowReviewIssues(options.repo);
   const shadowReviewFailedPrNumbers = fetchShadowReviewFailedPRs(options.repo);
