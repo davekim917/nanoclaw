@@ -6,6 +6,14 @@ on:
   push:
     branches: [main]
 
+# Read-only token. These jobs run the PR's own code (install, tests), and this repo's
+# default workflow token is write, so without this block any PR's tests could edit labels
+# as github-actions[bot], the identity the merge gate trusts to remove risk:high
+# (container/skills/pr-review-loop/scripts/codex-review.sh). Every scope not listed
+# here is none.
+permissions:
+  contents: read
+
 # Two jobs, run in parallel, both blocking. The split is purely about
 # legibility: `correctness` red means the code is broken, `bookkeeping` red
 # means a committed manifest is stale and needs regenerating. When both lived in
