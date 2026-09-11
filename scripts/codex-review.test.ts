@@ -281,12 +281,21 @@ function commitStatus(context: string, state: string, createdAt = '2026-09-05T00
   return { id: Date.parse(createdAt) / 1000, context, state, created_at: createdAt };
 }
 
-function receiptComment(head: string, outcome: string, createdAt: string, authorAssociation = 'OWNER'): Page {
+// `reviewer` defaults to an allowed worker-high model so existing approve-path
+// fixtures keep passing the model-allowlist check merge-check now applies;
+// tests of the allowlist itself pass a disallowed (or omitted) reviewer.
+function receiptComment(
+  head: string,
+  outcome: string,
+  createdAt: string,
+  authorAssociation = 'OWNER',
+  reviewer = 'claude-opus-5 (worker-high)',
+): Page {
   return {
     author: { login: 'davekim917' },
     authorAssociation,
     createdAt,
-    body: `### Substitute review receipt\n\n- **Outcome:** ${outcome}\n\n<!-- pr-review-loop:substitute-receipt head=${head} outcome=${outcome} -->`,
+    body: `### Substitute review receipt\n\n- **Reviewer and runtime:** ${reviewer}\n- **Outcome:** ${outcome}\n\n<!-- pr-review-loop:substitute-receipt head=${head} outcome=${outcome} -->`,
   };
 }
 
@@ -1185,6 +1194,81 @@ describe('codex-review risk-scoped review requests', () => {
     ]);
     expect(result.status).toBe(2);
     expect(result.posted).toBeNull();
+  });
+
+  it.each([
+    ['claude-sonnet-5', 'claude-sonnet-5'],
+    ['claude-haiku-4-5', 'claude-haiku-4-5 (worker-fast)'],
+    ['gpt-5.6-luna', 'gpt-5.6-luna via codex exec'],
+    ['gpt-5.6-terra', 'gpt-5.6-terra via codex exec'],
+    ['a bare model name with no id', 'Opus 5'],
+  ])('refuses a receipt whose --reviewer names %s, a non-allowlisted model, posting nothing', (_case, reviewer) => {
+    const root = tempRoot();
+    const bodyFile = path.join(root, 'review.md');
+    fs.writeFileSync(bodyFile, 'Scope: complete diff.\n');
+
+    const result = runHelper(root, [
+      'receipt',
+      '--head',
+      HEAD,
+      '--outcome',
+      'approve',
+      '--reviewer',
+      reviewer,
+      '--body-file',
+      bodyFile,
+    ]);
+    expect(result.status).toBe(2);
+    expect(result.posted).toBeNull();
+    expect(result.stderr).toContain('reviewer-models.txt');
+  });
+
+  it('accepts a receipt whose --reviewer names every listed model id, including a [1m] form', () => {
+    const modelsFile = path.resolve('container/skills/pr-review-loop/reviewer-models.txt');
+    const ids = fs
+      .readFileSync(modelsFile, 'utf8')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && !line.startsWith('#'));
+    expect(ids.length).toBeGreaterThan(0);
+
+    // Every plain listed id, plus one with the [1m] context-window suffix appended.
+    const reviewers = [...ids.map((id) => `${id} (worker-high)`), `${ids[0]}[1m] (worker-high)`];
+    for (const reviewer of reviewers) {
+      const root = tempRoot();
+      const bodyFile = path.join(root, 'review.md');
+      fs.writeFileSync(bodyFile, 'Scope: complete diff.\n');
+
+      const result = runHelper(root, [
+        'receipt',
+        '--head',
+        HEAD,
+        '--outcome',
+        'approve',
+        '--reviewer',
+        reviewer,
+        '--body-file',
+        bodyFile,
+      ]);
+      expect(result.status, `reviewer "${reviewer}" was refused: ${result.stderr}`).toBe(0);
+      expect(result.posted).toContain(`- **Reviewer and runtime:** ${reviewer}`);
+    }
+  });
+
+  it('refuses a review-verdict head whose approving receipt names a disallowed reviewer model', () => {
+    const root = tempRoot();
+    scopeFixture(root, {
+      labels: ['risk:high'],
+      comments: [
+        marker(HEAD, 1),
+        receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-sonnet-5'),
+      ],
+    });
+
+    const result = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain('disallowed reviewer');
+    expect(result.stderr).toContain('reviewer-models.txt');
   });
 
   it('allows a review-verdict head on an approving substitute receipt for exactly that head', () => {

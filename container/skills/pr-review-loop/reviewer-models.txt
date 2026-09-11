@@ -1,0 +1,10 @@
+# generated from the tier config: edit container/agents/worker-{high,frontier}.md or
+# CODEX_WORKER_TIERS, then run `pnpm run reviewer-models -- --write`
+#
+# One reviewer-eligible model id per line — the high and frontier tiers, whichever
+# vendor. container/skills/pr-review-loop/scripts/codex-review.sh reads this file to
+# gate `receipt` and `merge-check`. See scripts/reviewer-models.ts.
+claude-fable-5-1
+claude-opus-5
+gpt-5.6-sol
+gpt-6-astra

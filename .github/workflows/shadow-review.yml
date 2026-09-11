@@ -193,6 +193,33 @@ jobs:
             mv "$RUNNER_TEMP/shadow-review.diff.trunc" "$RUNNER_TEMP/shadow-review.diff"
           fi
 
+      # The reviewer-eligibility tier rule (scripts/reviewer-models.ts, "generated
+      # from the tier config") says this reviewer must run worker-high's Claude
+      # model. Resolved from container/agents/worker-high.md's `model:` frontmatter
+      # (the same source the generator reads) rather than the flat
+      # reviewer-models.txt allowlist, which unions both tiers and both vendors and
+      # so cannot say which id is worker-high specifically. Read from the PR's BASE
+      # sha via the Contents API, never the merge commit that is about to be
+      # checked out: a PR could otherwise edit its own worker-high.md to pick which
+      # model reviews it — same contents-API-from-base pattern
+      # codex-review.sh's repo_mode() uses for labeler.yml.
+      - name: Resolve the worker-high reviewer model
+        id: reviewer_model
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          content=$(gh api -H 'Accept: application/vnd.github.raw+json' \
+            "repos/$REPO/contents/container/agents/worker-high.md?ref=$BASE_SHA")
+          model=$(printf '%s\n' "$content" | grep -m1 -oP '^model:\s*\K\S+' | sed -E 's/\[1[Mm]\]$//')
+          if [ -z "$model" ]; then
+            echo "could not resolve worker-high's model id from container/agents/worker-high.md@$BASE_SHA" >&2
+            exit 1
+          fi
+          echo "model=$model" >> "$GITHUB_OUTPUT"
+
       # Read-only reviewer of a checkout whose sensitive paths the action has
       # already restored from origin/main, further locked down by
       # --setting-sources user (project settings + CLAUDE.md) and
@@ -239,7 +266,7 @@ jobs:
             precise and conservative: this feeds a program that moves a PR's paths onto
             the mandatory-review list on a real P1, so a false P1 has a real cost.
           claude_args: |
-            --model claude-opus-5
+            --model ${{ steps.reviewer_model.outputs.model }}
             --setting-sources user
             --strict-mcp-config
             --allowedTools "Read,Grep,Glob"
