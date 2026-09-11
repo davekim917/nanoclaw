@@ -155,7 +155,7 @@ def classify(files, rules):
     full_globs_from = rules.get("fullGlobsFrom")
     if full_globs_from is not None:
         imported_globs, error = load_full_globs_from(full_globs_from)
-        if error is not None:
+        if error is not None or imported_globs is None:
             return "full", "full: {}".format(error)
         # Union with any local `full` globs, order preserved, no duplicates.
         for g in imported_globs:

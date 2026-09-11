@@ -435,8 +435,9 @@ it. Adding to the floor is a standing-instruction edit and therefore a human's
 call: a coordinator that can extend its own floor can also quietly shrink it.
 
 **Cadence: every standard or full campaign walks at least one floor entry,
-least-recently-passed first; light campaigns do not — the install's scheduled
-sweep keeps the floor fresh.** The flat option — walk the whole floor every campaign — was rejected on
+least-recently-passed first. A light campaign walks only entries already past
+their `max_interval`, usually none; standard and full campaigns and the
+install's scheduled sweep keep the floor fresh.** The flat option — walk the whole floor every campaign — was rejected on
 two grounds. At about three campaigns a day a five-entry floor becomes fifteen
 full browser journeys a day, which is exactly the re-derivation cost the skip
 rule below was written to remove; and a walk repeated ninety times a month
@@ -448,9 +449,10 @@ both, bounded:
 - **Every standard or full campaign declares at least one lane of kind `floor`
   in the contract, one lane per entry it walks, with the entry's `id` as the
   lane id. Never zero** — not on a backend-only diff, not on a one-line
-  change, not on a campaign that found nothing. Light campaigns declare none;
-  they lean on the install's scheduled sweep to keep the floor from going
-  stale between them.
+  change, not on a campaign that found nothing. A light campaign's contract
+  may carry zero floor lanes, but only when no entry was actually overdue as
+  of that campaign's own timestamp — recomputable after the fact with the
+  same `jq` query below, so "light, so none" is never taken on faith.
 - **Which entries are due is computed, not chosen.** Every entry past its
   `max_interval` is due, all of them, however many that is — the ceiling is the
   deployment's own stated tolerance and nothing overrides it. If none are
@@ -532,9 +534,13 @@ because it is the same failure wearing a different name:
 
 **Checkable after the fact**, from a finished run's artifacts alone:
 
-- **The contract carries at least one lane of kind `floor`.** A contract with
-  none is a campaign that ran with no floor at all, visible in one `jq` before
-  any evidence is read.
+- **The contract carries at least one lane of kind `floor`, unless it is a
+  light campaign with nothing overdue.** A non-light contract with none is a
+  campaign that ran with no floor at all, visible in one `jq` before any
+  evidence is read. A light contract with none is legitimate only when the
+  least-recently-passed query above, recomputed as of that run's timestamp,
+  also shows zero entries past `max_interval` — the same recomputation the
+  "Selection is recomputable" check below already runs.
 - **Every floor lane has a terminal marker.** The synthesis barrier enforced
   that to publish, so a published run structurally has one; a missing or `void`
   marker beside a published verdict means the barrier was bypassed.
@@ -1551,7 +1557,8 @@ Run a changed-surface `audit` for each settled develop SHA. Any user-visible
 change must include a real-browser frontend lane even when the diff looks
 backend-only. Changed surface decides what a campaign runs *extra*; the
 coverage floor (§2) runs in every standard or full campaign regardless of the
-diff, including this one — a light campaign skips it. Run `full` for a
+diff, including this one — a light campaign walks only whatever is already
+past its `max_interval` (§2), usually nothing. Run `full` for a
 release candidate, a manually named feature, a high-risk label, or a scheduled
 nightly/weekly sweep. This preserves continuous coverage without paying for idle
 turns or rerunning an unchanged build.
