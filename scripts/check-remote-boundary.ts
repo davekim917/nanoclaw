@@ -198,31 +198,48 @@ function git(args: string[], cwd = INSTALL_ROOT): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
 }
 
+/**
+ * Where to read `.public-boundary-allowlist.json` from for a scan of `snapshot`.
+ *
+ * `snapshot` IS a checkout of the commit being scanned (`withSnapshot`), so its
+ * own working copy of the file already is that commit's COMMITTED allowlist —
+ * no separate `git show` is needed. The install checkout's own copy
+ * (`INSTALL_ROOT/.public-boundary-allowlist.json`, the old source of this
+ * argument) is NOT a safe substitute: it lags `origin/main` between a merge
+ * and the next deploy, and it can hold an uncommitted edit — the same class of
+ * hole `.husky/pre-push` closed for pushed refs (#651). A tree with no
+ * committed allowlist at all (a commit that predates the file) falls back to
+ * an empty one written to a throwaway temp file — exempts nothing, still the
+ * strictest outcome — rather than letting the checker's own missing-file
+ * error turn "nothing to exempt" into a "could not run" alert.
+ *
+ * Pure filesystem logic, deliberately split out so it is testable without
+ * git, a network or a real `pnpm` invocation — same reasoning as `CleanupOps`
+ * above.
+ */
+export function resolveAllowlistPath(snapshot: string): { path: string; cleanup: () => void } {
+  const treeAllowlist = path.join(snapshot, '.public-boundary-allowlist.json');
+  if (fs.existsSync(treeAllowlist)) return { path: treeAllowlist, cleanup: () => {} };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-remote-boundary-allowlist-'));
+  const emptyAllowlist = path.join(dir, 'allowlist.json');
+  fs.writeFileSync(emptyAllowlist, '{"entries": []}\n');
+  return { path: emptyAllowlist, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
+}
+
 /** Run the boundary checker over `snapshot`, against this install's registry. */
 function scanSnapshot(snapshot: string): BoundaryScan {
-  const result = spawnSync(
-    'pnpm',
-    [
-      'run',
-      'check:public-boundary',
-      '--',
-      '--root',
-      snapshot,
-      '--index',
-      // This job only ever scans origin/main (see the file header), and the
-      // live install checkout IS origin/main's tip, so its own on-disk
-      // allowlist already is that tip's committed allowlist — no separate
-      // read from $snapshot's tree is needed. This is unrelated to
-      // `.husky/pre-push`, which resolves an allowlist per pushed ref, from
-      // that ref's own committed tip, because it has to judge refs other
-      // than main (#651).
-      '--allowlist',
-      path.join(INSTALL_ROOT, '.public-boundary-allowlist.json'),
-    ],
-    { cwd: INSTALL_ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
-  );
-  if (result.error) throw result.error;
-  return { code: result.status ?? 2, detail: cleanCheckerOutput(result.stderr ?? '') };
+  const allowlist = resolveAllowlistPath(snapshot);
+  try {
+    const result = spawnSync(
+      'pnpm',
+      ['run', 'check:public-boundary', '--', '--root', snapshot, '--index', '--allowlist', allowlist.path],
+      { cwd: INSTALL_ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    if (result.error) throw result.error;
+    return { code: result.status ?? 2, detail: cleanCheckerOutput(result.stderr ?? '') };
+  } finally {
+    allowlist.cleanup();
+  }
 }
 
 export interface SnapshotRun<T> {

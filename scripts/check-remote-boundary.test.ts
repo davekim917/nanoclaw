@@ -3,9 +3,13 @@
  * a real Slack workspace or systemd. The IO half (fetch, snapshot worktree,
  * `pnpm run check:public-boundary`) is deliberately not covered here — it is a
  * few lines of subprocess plumbing around this decision, and faking it would
- * test the fake.
+ * test the fake. `resolveAllowlistPath` is the one exception: it is pure
+ * filesystem logic with no subprocess of its own, so it is tested directly
+ * against real temp directories, the same way `pre-push.test.ts` exercises
+ * `.husky/pre-push`'s filesystem behavior.
  */
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -21,6 +25,7 @@ import {
   reportCleanup,
   reportOutcome,
   reportScan,
+  resolveAllowlistPath,
   trimDetail,
   type Alert,
   type Reporter,
@@ -149,6 +154,54 @@ describe('reportScan', () => {
     const r = recorder(2);
     await expect(reportScan({ code: 1, detail: FINDING }, 'abc1234', r)).resolves.toBe(1);
     expect(r.errors[0]).toContain('could not be attempted');
+  });
+});
+
+describe('resolveAllowlistPath', () => {
+  function tempDir(): string {
+    return fs.mkdtempSync(path.join(os.tmpdir(), 'remote-boundary-allowlist-test-'));
+  }
+
+  it('reads the committed allowlist from the tree being scanned, not the install checkout', () => {
+    const snapshot = tempDir();
+    const committed = JSON.stringify({
+      entries: [{ path: 'src/example.ts', value: 'Private Customer', reason: 'committed, reviewed' }],
+    });
+    fs.writeFileSync(path.join(snapshot, '.public-boundary-allowlist.json'), committed);
+
+    // Stands in for the install checkout's own file, holding an edit that was
+    // never committed to the tree being scanned — the class of hole #651
+    // closed for `.husky/pre-push`. `resolveAllowlistPath` must never read it.
+    const installCheckout = tempDir();
+    fs.writeFileSync(
+      path.join(installCheckout, '.public-boundary-allowlist.json'),
+      JSON.stringify({ entries: [] }),
+    );
+
+    const resolved = resolveAllowlistPath(snapshot);
+    try {
+      expect(resolved.path).toBe(path.join(snapshot, '.public-boundary-allowlist.json'));
+      expect(fs.readFileSync(resolved.path, 'utf8')).toBe(committed);
+    } finally {
+      resolved.cleanup();
+      fs.rmSync(snapshot, { recursive: true, force: true });
+      fs.rmSync(installCheckout, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to a fresh empty allowlist when the tree has none, and cleans it up', () => {
+    const snapshot = tempDir();
+    // No .public-boundary-allowlist.json written into the tree — models a
+    // commit whose history never introduced the file.
+
+    const resolved = resolveAllowlistPath(snapshot);
+    expect(resolved.path).not.toBe(path.join(snapshot, '.public-boundary-allowlist.json'));
+    expect(JSON.parse(fs.readFileSync(resolved.path, 'utf8'))).toEqual({ entries: [] });
+
+    const fallbackDir = path.dirname(resolved.path);
+    resolved.cleanup();
+    expect(fs.existsSync(fallbackDir)).toBe(false);
+    fs.rmSync(snapshot, { recursive: true, force: true });
   });
 });
 

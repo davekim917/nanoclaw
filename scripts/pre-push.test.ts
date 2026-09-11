@@ -872,6 +872,25 @@ describe('.husky/pre-push', () => {
     expect(result.stderr).toContain('private-identifier');
   });
 
+  it('does not let the missing-allowlist fallback read the working copy instead of synthesizing an empty one', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    // The working copy's allowlist, left on disk and never committed, exempts
+    // the identifier below. The pushed tip's own tree carries no allowlist at
+    // all, so this push must fall back to a FRESH empty allowlist, not this
+    // file — if the fallback ever read the working copy instead, this
+    // identifier would wrongly pass unflagged.
+    fs.writeFileSync(
+      path.join(f.root, '.public-boundary-allowlist.json'),
+      JSON.stringify({ entries: [{ path: 'COMMIT_EDITMSG', value: 'Private Customer', reason: 'uncommitted' }] }),
+    );
+    const pushed = commitWithoutAllowlist(f.root, 'clean-tree', 'fix: Private Customer, no allowlist in tree');
+    const result = push(f, `refs/heads/current ${pushed} refs/heads/current ${base}\n`);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('private-identifier');
+  });
+
   it.each(['tree', 'message'] as const)(
     'honors a later approved exception for an intermediate commit %s',
     (surface) => {
