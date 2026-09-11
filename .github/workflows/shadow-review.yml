@@ -579,16 +579,30 @@ jobs:
       # `exit 1`), `gh pr comment` failing, or `gh issue create` failing.
       # Whatever happened, nothing was actually posted: label the PR failed
       # rather than let it read as reviewed (or, worse, as neither — see the
-      # coverage-denominator caveat in `scripts/review-outcomes.ts`), and tell
-      # the PR the same way "Report that analyze failed" above does — same
-      # MARKER, same idempotent count, so a human reading the PR sees one
-      # consistent "no review on record" signal regardless of which of the two
-      # failure paths fired. `if: always() && failure()`, matching the
-      # analyze-failed step's pattern above: `failure()` already contains a status
-      # function so GitHub would not auto-prepend `success()` to it either way, but
-      # spelling out `always()` keeps both failure-catching steps in this job
-      # visually consistent. Never itself fails the job further: every write is
-      # tolerated.
+      # coverage-denominator caveat in `scripts/review-outcomes.ts`). `if: always()
+      # && failure()`, matching the analyze-failed step's pattern above:
+      # `failure()` already contains a status function so GitHub would not
+      # auto-prepend `success()` to it either way, but spelling out `always()`
+      # keeps both failure-catching steps in this job visually consistent. Never
+      # itself fails the job further: every write is tolerated.
+      #
+      # The PR comment below is FIXED TEXT, not built from anything this step ran
+      # alongside — never `$STRUCTURED_OUTPUT`, never the step summary text below,
+      # never anything from "File findings"'s own log. The one path into this step
+      # that matters most is the scrub refusing a token-shaped string: whatever
+      # tripped it is still sitting in that step's log and in `$STRUCTURED_OUTPUT`
+      # (this step's own env doesn't even receive it), and a comment built from
+      # either would risk echoing the very credential the scrub existed to keep
+      # off GitHub.
+      #
+      # Its own MARKER, distinct from "Report that analyze failed"'s: this step
+      # ran (unlike that one, where analyze itself never produced a result), so
+      # reusing that marker would be a wrong description AND a wrong duplicate
+      # check — a PR that already carries an analyze-failure comment from an
+      # earlier, unrelated run would match that marker's `startswith` test here
+      # and this step would silently skip posting its own comment, even though
+      # THIS run's failure (a filing failure, not an analyze failure) was never
+      # reported at all.
       - name: Report a filing failure
         if: always() && failure()
         env:
@@ -600,17 +614,17 @@ jobs:
           gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label shadow-review-failed \
             || echo "::warning::could not label #$PR_NUMBER shadow-review-failed"
 
-          REASON="filing the shadow review result failed — see the \"File findings, or confirm none were found\" step's own log above for why"
           {
             echo "## Shadow review ran, but filing the result failed"
             echo ""
-            echo "$REASON"
+            echo "See the \"File findings, or confirm none were found\" step's own log above for why."
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # Idempotent across retries: same marker and page-safe count as
-          # "Report that analyze failed" above (see that step for why `--jq`
-          # under `--paginate` needs one id per line, not `| length`).
-          MARKER="Shadow review could not run"
+          # Idempotent across retries, same page-safe count pattern as "Report
+          # that analyze failed" above (see that step for why `--jq` under
+          # `--paginate` needs one id per line, not `| length`) — but its OWN
+          # marker, per the comment above this step.
+          MARKER="Shadow review ran but its result could not be posted"
           existing=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
             --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" 2>/dev/null \
             | wc -l) || existing=0
@@ -618,11 +632,11 @@ jobs:
             ''|*[!0-9]*) existing=0 ;;
           esac
           if [ "$existing" -gt 0 ]; then
-            echo "Failure comment already posted on #$PR_NUMBER; not posting again."
+            echo "Filing-failure comment already posted on #$PR_NUMBER; not posting again."
             exit 0
           fi
 
           gh pr comment "$PR_NUMBER" --repo "$REPO" \
-            --body "$MARKER: ${REASON}. This merge has no post-merge review until it is re-run." \
+            --body "$MARKER. See the workflow run. This merge has no recorded post-merge review until it is re-run or labelled by hand." \
             || echo "::warning::could not comment on #$PR_NUMBER"
           exit 0
