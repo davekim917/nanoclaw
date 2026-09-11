@@ -64,11 +64,11 @@ describe('origin="host"', () => {
     expect(tagFor('odd-1')).not.toContain('origin=');
   });
 
-  it('labels a host note from="host", not as an unknown agent', () => {
+  it('renders a host note with no from, never as an unknown agent', () => {
     insertChat('host-2', { text: LINE, sender: 'system', senderId: 'system', origin: 'host' }, 'agent', 'ag-self');
     const tag = tagFor('host-2');
-    expect(tag).toContain('from="host"');
-    expect(tag).not.toContain('unknown:agent');
+    expect(tag).toContain('origin="host"');
+    expect(tag).not.toContain('from=');
   });
 
   it('keeps the routing-derived from on a row without the mark', () => {
