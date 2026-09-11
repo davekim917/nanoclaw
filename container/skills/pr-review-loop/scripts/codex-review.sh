@@ -813,14 +813,22 @@ receipt_comments_page() {
 # means posted later: receipts are ordered by the comment's database id, which
 # GitHub assigns in posting order (fullDatabaseId, a string of digits), never by
 # createdAt, which is to the second, so an approve and the changes receipt after
-# it can share one. Under `audit`, a receipt posted after GATE_AS_OF (the merge)
-# did not gate it, and a comment edited since is not read at all: its text at
-# the merge is unknown, and it could have been a receipt. When such a comment,
-# from an author whose receipts count, was posted after the latest receipt that
-# is read, or in the same second, or no receipt is read, the receipts at the
-# merge are unknown: the outcome is `unknown`, and the reviewer text says which
-# comment. Dropping only the edited receipts would let a `changes` receipt,
-# edited after the merge, hand the verdict back to the `approve` before it.
+# it can share one. The id is a BigInt bigger than 2^53 for a normal-sized repo's
+# history, so it is compared as a digit string — sort by length, then
+# lexicographically — never via `tonumber`, which is a jq double and would
+# round two ids to the same value. A receipt whose fullDatabaseId is missing,
+# null, empty, or not all digits cannot be placed in that order at all: rather
+# than assign it a synthetic position (a null read as "0" ranks a real receipt
+# below one posted earlier), every receipt matching this head is reported
+# `unknown` — no order is inferred from any other field. Under `audit`, a
+# receipt posted after GATE_AS_OF (the merge) did not gate it, and a comment
+# edited since is not read at all: its text at the merge is unknown, and it
+# could have been a receipt. When such a comment, from an author whose
+# receipts count, was posted after the latest receipt that is read, or in the
+# same second, or no receipt is read, the receipts at the merge are unknown:
+# the outcome is `unknown`, and the reviewer text says which comment. Dropping
+# only the edited receipts would let a `changes` receipt, edited after the
+# merge, hand the verdict back to the `approve` before it.
 receipt_outcome() {
   local pages
   pages=$(paginate_connection comments receipt_comments_page) || return 1
@@ -828,20 +836,29 @@ receipt_outcome() {
     [ .[] | .data.repository.pullRequest.comments.nodes[]
       | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
       | select($asof == "" or .createdAt <= $asof)
-      | .seq = ((.fullDatabaseId // "0") | tonumber) ] as $comments
+      | .idstr = ((.fullDatabaseId // "") | tostring) ] as $comments
     | [ $comments[] | select($asof != "" and (.lastEditedAt // "") > $asof) ] as $edited
     | [ $comments[] | select($asof == "" or (.lastEditedAt // "") <= $asof)
         | .createdAt as $at
-        | .seq as $seq
+        | .idstr as $idstr
+        | .author as $author
         | .body as $body
         | [ ($body // "" | capture($re)) ] | first // empty
         | select(.head == $head)
-        | { outcome, at: $at, seq: $seq, reviewer: (($body // "" | capture($reviewerRe)).reviewer // "") } ]
-    | (sort_by(.seq) | last) as $latest
-    | ([ $edited[] | select($latest == null or .createdAt >= $latest.at or .seq > $latest.seq) ] | sort_by(.seq) | last) as $unread
-    | if $unread != null then "unknown\t\($unread.author.login // "someone") posted a comment at \($unread.createdAt) and edited it at \($unread.lastEditedAt)"
-      elif $latest == null then empty
-      else "\($latest.outcome)\t\($latest.reviewer)" end'
+        | { outcome, at: $at, idstr: $idstr, author: $author, reviewer: (($body // "" | capture($reviewerRe)).reviewer // "") } ] as $matches
+    | ([ $matches[] | select((.idstr | test("^[0-9]+$")) | not) ] | first) as $bad
+    | if $bad != null then
+        "unknown\treceipt_order_unknown: a receipt comment for this head from \($bad.author.login // "someone") has no usable database id (fullDatabaseId=\(if $bad.idstr == "" then "null" else $bad.idstr end)); receipt order cannot be determined without assigning it a synthetic position"
+      else
+        ( $matches | sort_by([(.idstr | length), .idstr]) | last ) as $latest
+        | ( [ $edited[] | select($latest == null or .createdAt >= $latest.at
+              or (.idstr | length) > ($latest.idstr | length)
+              or ((.idstr | length) == ($latest.idstr | length) and .idstr > $latest.idstr)) ]
+            | sort_by([(.idstr | length), .idstr]) | last ) as $unread
+        | if $unread != null then "unknown\t\($unread.author.login // "someone") posted a comment at \($unread.createdAt) and edited it at \($unread.lastEditedAt)"
+          elif $latest == null then empty
+          else "\($latest.outcome)\t\($latest.reviewer)" end
+        end'
 }
 
 # Empty when CI on exactly HEAD is green; otherwise `ci_missing`, `ci_red` or
@@ -948,6 +965,12 @@ merge_check_main() {
   receipt_raw=$(receipt_outcome "$SCOPE_HEAD") || exit 1
   receipt="${receipt_raw%%$'\t'*}"
   receipt_reviewer="${receipt_raw#*$'\t'}"
+  # receipt_outcome fails closed rather than infer an order: never read that
+  # as no receipt or an approval.
+  if [ "$receipt" = unknown ]; then
+    echo "merge=refused head=$SCOPE_HEAD: $receipt_reviewer" >&2
+    exit 24
+  fi
   if [ "$receipt" = changes ]; then
     echo "merge=refused head=$SCOPE_HEAD verdict=$SCOPE_VERDICT: latest substitute receipt: changes — a substitute reviewer said no on this head" >&2
     exit 24
@@ -1486,7 +1509,16 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|sc
     receipt="${receipt_raw%%$'\t'*}"
     receipt_reviewer="${receipt_raw#*$'\t'}"
     if [ "$receipt" = unknown ]; then
-      echo "audit=violation $where: $receipt_reviewer after the merge; that comment could have been a later substitute receipt, so what the receipts said at the merge is unknown"
+      case "$receipt_reviewer" in
+        receipt_order_unknown:*)
+          # A receipt's own database id can't place it in posting order — never
+          # inferred from createdAt or any other field.
+          echo "audit=violation $where: $receipt_reviewer"
+          ;;
+        *)
+          echo "audit=violation $where: $receipt_reviewer after the merge; that comment could have been a later substitute receipt, so what the receipts said at the merge is unknown"
+          ;;
+      esac
       exit 28
     fi
     if [ "$receipt" = changes ]; then

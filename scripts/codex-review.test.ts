@@ -372,7 +372,10 @@ function receiptComment(
   createdAt: string,
   authorAssociation = 'OWNER',
   reviewer = 'claude-opus-5 (worker-high)',
-  databaseId = String(Date.parse(createdAt) / 1000),
+  // `null` reproduces a real GraphQL null fullDatabaseId (the nullable BigInt
+  // case); a non-digit string reproduces a malformed one. Either must fail the
+  // gate closed rather than sort as if it were "0".
+  databaseId: string | null = String(Date.parse(createdAt) / 1000),
 ): Page {
   return {
     author: { login: 'davekim917' },
@@ -1639,6 +1642,32 @@ describe('codex-review risk-scoped review requests', () => {
       ],
       'receipt: changes',
     ],
+    // 20-digit ids differ only in the last digit — past 2^53, `tonumber` is a
+    // jq double and can round both to the same value. Listed with the later
+    // (higher) id first, so only an exact digit-string comparison, not list
+    // order and not a lossy numeric one, finds it the later `changes`.
+    [
+      'approved, then asked for changes within the same second, with ids past double precision',
+      [
+        receiptComment(
+          HEAD,
+          'changes',
+          '2026-09-05T00:20:00Z',
+          'OWNER',
+          'claude-opus-5 (worker-high)',
+          '12345678901234567891',
+        ),
+        receiptComment(
+          HEAD,
+          'approve',
+          '2026-09-05T00:20:00Z',
+          'OWNER',
+          'claude-opus-5 (worker-high)',
+          '12345678901234567890',
+        ),
+      ],
+      'receipt: changes',
+    ],
     ['asks for changes', [receiptComment(HEAD, 'changes', '2026-09-05T00:20:00Z')], 'receipt: changes'],
     [
       'approves but comes from an author without write access',
@@ -1652,6 +1681,58 @@ describe('codex-review risk-scoped review requests', () => {
     const result = runHelper(root, ['merge-check', '--head', HEAD]);
     expect(result.status).toBe(24);
     expect(result.stderr).toContain(`latest substitute ${reason}`);
+  });
+
+  // Codex's round-3 repro (#679): page 1 carries an approval (id "100"); a
+  // later same-second `changes` receipt lands on page 2 with a null
+  // fullDatabaseId — GraphQL's real behavior for that nullable BigInt field.
+  // `(.fullDatabaseId // "0") | tonumber` used to read the null as 0, ranking
+  // it below the approval and merging over a rejection. It must instead
+  // refuse: no order is inferred for it.
+  it('refuses to merge when a same-second receipt has a null database id, split across comment pages', () => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: ['risk:high'] });
+    writePage(
+      root,
+      'comments',
+      1,
+      connectionPage(
+        'comments',
+        [receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', '100')],
+        true,
+        'comments-2',
+      ),
+    );
+    writePage(
+      root,
+      'comments',
+      2,
+      connectionPage('comments', [
+        receiptComment(HEAD, 'changes', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', null),
+      ]),
+    );
+
+    const result = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain('receipt_order_unknown');
+  });
+
+  it.each([
+    ['a non-digit id', 'abc'],
+    ['an empty-string id', ''],
+  ])('refuses to merge when a receipt has %s instead of a database id', (_case, badId) => {
+    const root = tempRoot();
+    scopeFixture(root, {
+      labels: ['risk:high'],
+      comments: [
+        receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', '100'),
+        receiptComment(HEAD, 'changes', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', badId),
+      ],
+    });
+
+    const result = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain('receipt_order_unknown');
   });
 
   it.each([
@@ -2127,6 +2208,55 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
     expect(result.stdout).toContain(
       `verdict=review: davekim917 posted a comment at ${postedAt} and edited it at 2026-09-05T02:00:00Z after the merge; that comment could have been a later substitute receipt`,
     );
+  });
+
+  // Same repro as merge-check's: a null fullDatabaseId must not be read as an
+  // earlier receipt, so a merge the gate would have refused isn't audited as
+  // clean either.
+  it('flags a merge when a same-second receipt has a null database id, split across comment pages', () => {
+    const root = tempRoot();
+    auditFixture(root, { labels: ['risk:high'] });
+    writePage(
+      root,
+      'comments',
+      1,
+      connectionPage(
+        'comments',
+        [receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', '100')],
+        true,
+        'comments-2',
+      ),
+    );
+    writePage(
+      root,
+      'comments',
+      2,
+      connectionPage('comments', [
+        receiptComment(HEAD, 'changes', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', null),
+      ]),
+    );
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(28);
+    expect(result.stdout).toContain('receipt_order_unknown');
+  });
+
+  it.each([
+    ['a non-digit id', 'abc'],
+    ['an empty-string id', ''],
+  ])('flags a merge when a receipt has %s instead of a database id', (_case, badId) => {
+    const root = tempRoot();
+    auditFixture(root, {
+      labels: ['risk:high'],
+      comments: [
+        receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', '100'),
+        receiptComment(HEAD, 'changes', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', badId),
+      ],
+    });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(28);
+    expect(result.stdout).toContain('receipt_order_unknown');
   });
 
   it('still reads an approving receipt that postdates the only comment edited after the merge', () => {
