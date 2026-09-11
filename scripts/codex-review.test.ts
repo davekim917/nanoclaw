@@ -1202,6 +1202,19 @@ describe('codex-review risk-scoped review requests', () => {
     ['gpt-5.6-luna', 'gpt-5.6-luna via codex exec'],
     ['gpt-5.6-terra', 'gpt-5.6-terra via codex exec'],
     ['a bare model name with no id', 'Opus 5'],
+    // Mutation evidence for the grep-argument-injection fix: these tokens, if
+    // ever handed to grep as a bare pattern argument again (no `-e`/`--`),
+    // would be parsed as grep's OWN flags and exit 0 on no real match —
+    // "fixed" nothing, posted anyway. Pure-bash string comparison never does
+    // that regardless of what the token looks like.
+    ['a grep -V flag token', 'claude-sonnet-5 -V'],
+    ['a bare grep --version flag token', '--version'],
+    ['a grep --help flag token', 'claude-haiku-4-5 --help'],
+    ['a grep -v flag token', 'claude-sonnet-5 -v x'],
+    // Mutation evidence for first-token-only matching: an allowed id appearing
+    // ANYWHERE but the first word must still refuse — the documented receipt
+    // format leads with the id, so this is not a legitimate reviewer string.
+    ['an allowed id mentioned after a disallowed first token', 'claude-sonnet-5 (fallback from claude-opus-5)'],
   ])('refuses a receipt whose --reviewer names %s, a non-allowlisted model, posting nothing', (_case, reviewer) => {
     const root = tempRoot();
     const bodyFile = path.join(root, 'review.md');
@@ -1270,6 +1283,27 @@ describe('codex-review risk-scoped review requests', () => {
     expect(result.stderr).toContain('disallowed reviewer');
     expect(result.stderr).toContain('reviewer-models.txt');
   });
+
+  it.each([
+    ['a grep -V flag token', 'claude-sonnet-5 -V'],
+    ['a bare grep --version flag token', '--version'],
+    ['a grep --help flag token', 'claude-haiku-4-5 --help'],
+    ['a grep -v flag token', 'claude-sonnet-5 -v x'],
+    ['an allowed id mentioned after a disallowed first token', 'claude-sonnet-5 (fallback from claude-opus-5)'],
+  ])(
+    'refuses a review-verdict head whose approving receipt reviewer is %s (mutation evidence for the grep-injection/first-token fix)',
+    (_case, reviewer) => {
+      const root = tempRoot();
+      scopeFixture(root, {
+        labels: ['risk:high'],
+        comments: [marker(HEAD, 1), receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', reviewer)],
+      });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status, `reviewer "${reviewer}" was wrongly allowed: ${result.stdout}`).toBe(24);
+      expect(result.stderr).toContain('disallowed reviewer');
+    },
+  );
 
   it('allows a review-verdict head on an approving substitute receipt for exactly that head', () => {
     const root = tempRoot();

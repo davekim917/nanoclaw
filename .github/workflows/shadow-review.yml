@@ -213,9 +213,15 @@ jobs:
           set -euo pipefail
           content=$(gh api -H 'Accept: application/vnd.github.raw+json' \
             "repos/$REPO/contents/container/agents/worker-high.md?ref=$BASE_SHA")
-          model=$(printf '%s\n' "$content" | grep -m1 -oP '^model:\s*\K\S+' | sed -E 's/\[1[Mm]\]$//')
+          # `grep -m1` exits 1 on no match, and under pipefail that becomes the
+          # WHOLE pipeline's exit status even though sed (after it) exits 0 —
+          # which would trip `set -e` right here, on this assignment, before
+          # the `-z "$model"` check below ever runs. `|| true` on the grep
+          # neutralizes that so a genuine no-match reaches the check below
+          # instead of failing with no message.
+          model=$(printf '%s\n' "$content" | { grep -m1 -oP '^model:\s*\K\S+' || true; } | sed -E 's/\[1[Mm]\]$//')
           if [ -z "$model" ]; then
-            echo "could not resolve worker-high's model id from container/agents/worker-high.md@$BASE_SHA" >&2
+            echo "could not resolve worker-high's model id from container/agents/worker-high.md@$BASE_SHA (no 'model:' frontmatter line found)" >&2
             exit 1
           fi
           echo "model=$model" >> "$GITHUB_OUTPUT"

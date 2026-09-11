@@ -25,13 +25,14 @@
  * Modes:
  *   --write   regenerate the file from the tier config
  *   --check   fail (exit 1) if the file on disk doesn't match; the drift
- *             test (reviewer-models.test.ts) runs this on every test pass
+ *             test (reviewer-models-freshness.test.ts) runs this on every
+ *             test pass
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { CODEX_WORKER_TIERS } from '../src/claude-agent-md.js';
+import { CODEX_WORKER_TIERS, extractScalar } from '../src/claude-agent-md.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -52,11 +53,26 @@ export const REVIEWER_MODELS_HEADER = [
   '# gate `receipt` and `merge-check`. See scripts/reviewer-models.ts.',
 ].join('\n');
 
+/**
+ * Slice the raw frontmatter block out of a Claude subagent .md, the same way
+ * parseClaudeAgentMd does (src/claude-agent-md.ts:72-77) — duplicated rather
+ * than imported because that function only returns name/description/body,
+ * never the frontmatter itself, and `model` isn't one of the three.
+ */
+function frontmatterOf(content: string): string {
+  const normalized = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  if (!normalized.startsWith('---\n')) throw new Error('no frontmatter block (must start with `---`)');
+  const rest = normalized.slice('---\n'.length);
+  const endIdx = rest.indexOf('\n---');
+  if (endIdx < 0) throw new Error('no closing `---` for the frontmatter block');
+  return rest.slice(0, endIdx);
+}
+
 /** Pull the `model:` scalar out of a Claude subagent .md's YAML frontmatter. */
 function extractModelLine(content: string): string {
-  const match = content.match(/^model:\s*(\S+)\s*$/m);
-  if (!match) throw new Error('no `model:` frontmatter line found');
-  return match[1];
+  const model = extractScalar(frontmatterOf(content), 'model');
+  if (!model) throw new Error('no `model:` frontmatter line found');
+  return model;
 }
 
 /** Strip the `[1m]` extended-context-window marker some Claude model ids carry. */
@@ -64,15 +80,34 @@ function stripContextWindowSuffix(modelId: string): string {
   return modelId.replace(/\[1m\]$/i, '');
 }
 
+/**
+ * Refuse a bare alias ("opus", "sonnet", "inherit") standing in for a real
+ * model id — those resolve to whatever the runtime's current default is, so
+ * "who is allowed to review" would silently follow that default around
+ * instead of naming a fixed tier. Every real id here (Claude or Codex) carries
+ * a version number, so requiring a digit is enough to catch an alias without
+ * hardcoding the alias list.
+ */
+function assertConcreteModelId(id: string, source: string): void {
+  if (!/[0-9]/.test(id)) {
+    throw new Error(
+      `${source}: "${id}" is not a concrete versioned model id — bare aliases like "opus", "sonnet", or "inherit" are not allowed here`,
+    );
+  }
+}
+
 /** The reviewer-eligible model ids, sorted and de-duplicated. */
 export function computeReviewerModelIds(repoRoot: string = REPO_ROOT): string[] {
   const claudeIds = CLAUDE_TIER_AGENT_FILES.map((rel) => {
     const content = fs.readFileSync(path.join(repoRoot, rel), 'utf8');
-    return stripContextWindowSuffix(extractModelLine(content));
+    const id = stripContextWindowSuffix(extractModelLine(content));
+    assertConcreteModelId(id, rel);
+    return id;
   });
   const codexIds = CODEX_TIER_NAMES.map((tier) => {
     const entry = CODEX_WORKER_TIERS[tier];
     if (!entry) throw new Error(`CODEX_WORKER_TIERS is missing "${tier}"`);
+    assertConcreteModelId(entry.model, `CODEX_WORKER_TIERS['${tier}']`);
     return entry.model;
   });
   return Array.from(new Set([...claudeIds, ...codexIds])).sort();

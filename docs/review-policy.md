@@ -43,11 +43,13 @@ Haiku), never Codex `luna`/`terra`, and never a flash or mini model. The
 allowed ids are generated from that tier config, not hand-maintained —
 `container/skills/pr-review-loop/reviewer-models.txt`
 (`scripts/reviewer-models.ts --write`) — and `codex-review.sh receipt` /
-`merge-check` enforce it mechanically: a `--reviewer` naming anything else is
-refused before it posts, and an approving receipt naming anything else does
-not unlock a merge. The reviewer reports its **exact model id from its own
-runtime** — a Claude subagent from its system prompt, Codex from the `-m` it
-ran with or `codex exec`'s session metadata — and the receipt's `--reviewer`
+`merge-check` enforce it mechanically against `--reviewer`'s **first
+whitespace-delimited word** (a `[1m]` suffix on that word is tolerated): a
+`--reviewer` not starting with an allowed id is refused before it posts, and
+an approving receipt whose first word isn't allowed does not unlock a merge.
+The reviewer reports its **exact model id from its own runtime** — a Claude
+subagent from its system prompt, Codex from the `-m` it ran with or
+`codex exec`'s session metadata — as that first word, and the receipt's `--reviewer`
 copies it verbatim, e.g. `claude-opus-5 (worker-high)` or
 `gpt-5.6-sol high (codex exec)`. Nobody has to be free for this: the author
 may start that reviewer as a fresh process

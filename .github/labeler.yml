@@ -94,7 +94,7 @@ risk:high:
     # the worker-tier agent defs it derives Claude ids from, and the Codex tier
     # map (CODEX_WORKER_TIERS) it imports rather than reparses. A change to any
     # of these changes who is allowed to approve a merge.
-    - 'scripts/reviewer-models.ts'
+    - 'scripts/reviewer-models*.ts'
     - 'container/agents/**'
     - 'src/claude-agent-md.ts'
     # Executable agent and tool config: a hook (.claude/settings.json), an
@@ -215,7 +215,7 @@ risk:gates:
     - '.public-boundary-allowlist.json'
     - 'container/skills/pr-review-loop/**'
     - 'docs/review-policy.md'
-    - 'scripts/reviewer-models.ts'
+    - 'scripts/reviewer-models*.ts'
     - 'container/agents/**'
     - 'src/claude-agent-md.ts'
     - '.claude/**'
