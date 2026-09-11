@@ -10,6 +10,7 @@ import fs from 'fs';
 import { afterAll, beforeAll, describe, expect, it, afterEach, vi } from 'vitest';
 
 import { allowSubprocess, enforceHermeticity } from '../../test-hermeticity.js';
+import { scaledTimeout } from '../../test-timeout-scale.js';
 import { decideTaskAction } from './watchdog.js';
 import type { Task } from './db/tasks.js';
 import * as mailboxIndex from '../mailbox/index.js';
@@ -477,28 +478,30 @@ describe('pendingTerminalSpawnOutboundSeenAt busy_timeout', () => {
   // watchdog's own synchronous read — the read would simply block the one JS
   // thread the "releasing" timer also needs. A child process is the only way
   // to hold the lock concurrently with the parent's read.
-  it('reads through real lock contention that outlasts the old 1s default', async () => {
-    const agentGroupId = TEST_AG_PREFIX + 'lock-test';
-    const sessionId = 'sess-lock-test';
-    const db = makeTmpOutboundDb(agentGroupId, sessionId);
-    db.prepare("INSERT INTO messages_out VALUES ('m1', 1, null, '2026-01-01T00:05:00.000Z', 'system', ?)").run(
-      JSON.stringify({ action: 'spawn_complete', task_id: 'task-1' }),
-    );
-    db.close();
-    const dbPath = path.join(TEST_ROOT, agentGroupId, sessionId, 'outbound.db');
+  it(
+    'reads through real lock contention that outlasts the old 1s default',
+    async () => {
+      const agentGroupId = TEST_AG_PREFIX + 'lock-test';
+      const sessionId = 'sess-lock-test';
+      const db = makeTmpOutboundDb(agentGroupId, sessionId);
+      db.prepare("INSERT INTO messages_out VALUES ('m1', 1, null, '2026-01-01T00:05:00.000Z', 'system', ?)").run(
+        JSON.stringify({ action: 'spawn_complete', task_id: 'task-1' }),
+      );
+      db.close();
+      const dbPath = path.join(TEST_ROOT, agentGroupId, sessionId, 'outbound.db');
 
-    // Codex P2 (thread PRRT_kwDORfvfVM6fFQHh): a fixed delay before starting
-    // the parent read raced the child under load — the child might not have
-    // run BEGIN EXCLUSIVE yet, so the read would find the lock free, return
-    // instantly, and the elapsed-time assertion would fail spuriously (and
-    // throwing there skipped `holder.kill()`, leaking the child into
-    // teardown). The child now prints a line to stdout the instant it holds
-    // the lock, and the parent's read starts only once it has seen that line
-    // — no fixed timer, no race either direction.
-    //
-    // Holds an EXCLUSIVE transaction for ~1.5s (past the old 1s default,
-    // inside the fixed 5s) before committing and exiting.
-    const child = `
+      // Codex P2 (thread PRRT_kwDORfvfVM6fFQHh): a fixed delay before starting
+      // the parent read raced the child under load — the child might not have
+      // run BEGIN EXCLUSIVE yet, so the read would find the lock free, return
+      // instantly, and the elapsed-time assertion would fail spuriously (and
+      // throwing there skipped `holder.kill()`, leaking the child into
+      // teardown). The child now prints a line to stdout the instant it holds
+      // the lock, and the parent's read starts only once it has seen that line
+      // — no fixed timer, no race either direction.
+      //
+      // Holds an EXCLUSIVE transaction for ~1.5s (past the old 1s default,
+      // inside the fixed 5s) before committing and exiting.
+      const child = `
       const Database = require('better-sqlite3');
       const db = new Database(${JSON.stringify(dbPath)});
       db.prepare('BEGIN EXCLUSIVE').run();
@@ -509,39 +512,44 @@ describe('pendingTerminalSpawnOutboundSeenAt busy_timeout', () => {
         process.exit(0);
       }, 1500);
     `;
-    const holder = spawn(process.execPath, ['-e', child], { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'ignore'] });
-
-    try {
-      await new Promise<void>((resolve, reject) => {
-        let buf = '';
-        holder.stdout!.on('data', (chunk: Buffer) => {
-          buf += chunk.toString();
-          if (buf.includes('locked')) resolve();
-        });
-        holder.once('exit', (code) => reject(new Error(`lock holder exited early (code ${code})`)));
-        holder.once('error', reject);
+      const holder = spawn(process.execPath, ['-e', child], {
+        cwd: process.cwd(),
+        stdio: ['ignore', 'pipe', 'ignore'],
       });
 
-      const start = Date.now();
-      const { pendingTerminalSpawnOutboundSeenAt } = await import('./watchdog.js');
-      // With the fix (5s busy_timeout): waits out the child's remaining hold
-      // and reads the committed row. Without it (1s default): times out well
-      // before the child commits and answers null — the false "no terminal
-      // spawn seen" this whole fix exists to close.
-      const result = pendingTerminalSpawnOutboundSeenAt(agentGroupId, sessionId);
-      const elapsedMs = Date.now() - start;
-      // eslint-disable-next-line no-console
-      console.log(`[lock-test] elapsed waiting on the held lock: ${elapsedMs}ms`);
+      try {
+        await new Promise<void>((resolve, reject) => {
+          let buf = '';
+          holder.stdout!.on('data', (chunk: Buffer) => {
+            buf += chunk.toString();
+            if (buf.includes('locked')) resolve();
+          });
+          holder.once('exit', (code) => reject(new Error(`lock holder exited early (code ${code})`)));
+          holder.once('error', reject);
+        });
 
-      expect(result).toBe('2026-01-01T00:05:00.000Z');
-      // Proves the read actually waited on the lock rather than finding it
-      // already free — a read that returned instantly wouldn't demonstrate
-      // contention tolerance at all. The lock was confirmed held immediately
-      // before this, so any wait here is against the child's own hold, not a
-      // race on the start line above.
-      expect(elapsedMs).toBeGreaterThan(300);
-    } finally {
-      holder.kill();
-    }
-  }, 20000);
+        const start = Date.now();
+        const { pendingTerminalSpawnOutboundSeenAt } = await import('./watchdog.js');
+        // With the fix (5s busy_timeout): waits out the child's remaining hold
+        // and reads the committed row. Without it (1s default): times out well
+        // before the child commits and answers null — the false "no terminal
+        // spawn seen" this whole fix exists to close.
+        const result = pendingTerminalSpawnOutboundSeenAt(agentGroupId, sessionId);
+        const elapsedMs = Date.now() - start;
+        // eslint-disable-next-line no-console
+        console.log(`[lock-test] elapsed waiting on the held lock: ${elapsedMs}ms`);
+
+        expect(result).toBe('2026-01-01T00:05:00.000Z');
+        // Proves the read actually waited on the lock rather than finding it
+        // already free — a read that returned instantly wouldn't demonstrate
+        // contention tolerance at all. The lock was confirmed held immediately
+        // before this, so any wait here is against the child's own hold, not a
+        // race on the start line above.
+        expect(elapsedMs).toBeGreaterThan(300);
+      } finally {
+        holder.kill();
+      }
+    },
+    scaledTimeout(20000),
+  );
 });

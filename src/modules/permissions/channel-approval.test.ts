@@ -200,6 +200,13 @@ function dmEvent(platformId: string, text = 'hello') {
     channelType: 'telegram',
     platformId,
     threadId: null,
+    // This fixture models a DM, so it declares that explicitly. router.ts
+    // now defaults an unknown isGroup/isDM signal to group/mention mode
+    // (the safe direction to be wrong in for an adapter that might be a
+    // real group chat) rather than DM-style — so a fixture that stayed
+    // silent on this would silently get treated as a group, regardless of
+    // what any particular adapter does or doesn't report.
+    isDM: true,
     message: {
       id: `msg-${Math.random().toString(36).slice(2, 8)}`,
       kind: 'chat' as const,

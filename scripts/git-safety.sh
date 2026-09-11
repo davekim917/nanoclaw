@@ -37,9 +37,19 @@
 #      anything is staged.
 #
 # Silent on success (a pending deletion still gets its own DM even on an
-# otherwise clean run — see below). On FAILURE it DMs the owner via
-# scripts/notify-owner.ts and exits 1. Runs before storage-gc so anything the
-# GC takes is captured.
+# otherwise clean run — see below). On FAILURE it exits 1 and does NOT DM
+# the owner itself: the installed unit's OnFailure=nanoclaw-unit-alert@%n
+# (groups/_ops/systemd/nanoclaw-git-safety.service — tracked in the SEPARATE
+# davekim917/nanoclaw-groups repo, not this one's data/systemd/) already
+# fires on any non-zero exit and DMs ONE journal line — the unit's last
+# error-like line, else its plain last line, cut to 300 characters — plus
+# a `journalctl` pointer, at most once per 30 minutes per unit
+# (unit-alert-dm.sh:36-39, its cooldown). Before this both fired — the
+# script's own DM plus OnFailure's — for every handled failure (#628 item
+# 8); FAILURES are still printed to stderr (>> the unit's journal, which
+# is what that one DM line is read from) so the escalation stays
+# actionable. Runs before storage-gc so
+# anything the GC takes is captured.
 #
 # Env:
 #   GIT_SAFETY_DIR                snapshot root (default ~/nanoclaw-backups)
@@ -315,26 +325,19 @@ done
 find "$OUT" -mindepth 1 -type d -empty -delete 2>/dev/null
 
 # ── phase 2: snapshot groups/'s pending tracked-file edits ──────────────────
-# Broad, case-insensitive, and deliberately over-inclusive: refusing a
-# non-secret line costs a manual `git -C groups diff` and a re-run; missing a
-# real one costs a leaked credential. Covers common vendor token shapes
-# (OpenAI, Stripe, GitHub PAT/OAuth/App, Slack bot/app, AWS, Google), PEM
-# private keys, JWTs, connection-string credentials, env/export assignments,
-# and JSON/YAML/plain "key: value" or "key=value" forms for
-# password/secret/token/api_key (the bare "token" alternative also matches
-# "access_token", "refresh_token", etc. as a substring — deliberately, so the
-# list doesn't need every compound name spelled out).
-# \b before sk- matters: without it, "sk-" matches as a mid-word substring
-# of any longer hyphenated token that happens to contain it (e.g. a
-# "desk-<40-char-hash>" config value) — the historical false-positive driver
-# per #628. gh[ousr]_ covers OAuth/User-to-server/Server-to-server/Refresh
-# tokens (gho_/ghu_/ghs_/ghr_); xox[abpre]- adds the legacy/rotation xoxe-
-# prefix; (AKIA|ASIA) adds AWS STS temporary credentials. The identifier
-# alternative matches ANY name containing key/secret/token/password/
-# passphrase/pass (exported or not) followed by `=` or `:` and a value, so
-# it also catches `*_PASSPHRASE=`, `*_PASS=`, and a plain unexported
-# `MY_KEY=...` that never had "export" in front of it.
-SECRET_RE='(\bsk-[A-Za-z0-9_-]{20,}|(sk|rk)_live_[A-Za-z0-9]{10,}|ghp_[A-Za-z0-9]{30,}|gh[ousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abpre]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9.-]{10,}|(AKIA|ASIA)[0-9A-Z]{16}|AIza[A-Za-z0-9_-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|eyJ[A-Za-z0-9_=-]+\.eyJ[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]+|[A-Za-z][A-Za-z0-9+.-]*://[^/@[:space:]:]+:[^/@[:space:]]+@|authorization:[[:space:]]*bearer[[:space:]]+[A-Za-z0-9._-]{10,}|[A-Za-z_][A-Za-z0-9_]*(KEY|SECRET|TOKEN|PASSWORD|PASSPHRASE|PASS)[A-Za-z0-9_]*[[:space:]]*=[[:space:]]*[^[:space:]]|(token|api[_-]?key|password|secret)[^A-Za-z0-9]{0,3}[:=][[:space:]]*[^[:space:]])'
+# SECRET_RE and secret_scan_hits() live in lib/secret-scan.sh. Guarded: there
+# is no `-e` in this script (many commands below are deliberately allowed to
+# fail and get recorded in FAILURES/NOTICES instead of killing the run), so
+# an unguarded `source` of a missing/unreadable file would just continue with
+# secret_scan_hits undefined — the later `hits=$(secret_scan_hits "$diff")`
+# call would itself fail silently (command not found), `hits` would end up
+# empty, `${hits:-0}` reads that as 0, and the secret gate would pass every
+# pending change through unchecked. Fail closed instead: refuse to build any
+# groups/ snapshot at all rather than build one with a gate that never ran.
+source "${SCRIPT_DIR}/lib/secret-scan.sh" || {
+  echo "git-safety: cannot load ${SCRIPT_DIR}/lib/secret-scan.sh — refusing to build a groups/ snapshot without a working secret gate" >&2
+  exit 1
+}
 
 # Sensitive filenames are never staged even when git already tracks them —
 # excluded via pathspec BEFORE `add -u` runs, so they never touch the scratch
@@ -411,13 +414,19 @@ _commit_groups_impl() { # <scratch index file>
   fi
 
   local diff_text
-  diff_text=$(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --no-color --text HEAD 2>>"$ERR")
+  # --src-prefix/--dst-prefix pinned explicitly: secret_scan_hits() only
+  # excludes the `+++ b/...`/`+++ /dev/null` header shapes git emits with
+  # its DEFAULT prefixes. A user's diff.noprefix or diff.mnemonicPrefix
+  # config would change that shape (diff.noprefix drops "b/" entirely) and
+  # make the exclusion miss the real header — this pins the shape the
+  # exclusion actually expects, independent of whatever's in ~/.gitconfig.
+  diff_text=$(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --no-color --text --src-prefix=a/ --dst-prefix=b/ HEAD 2>>"$ERR")
   if [ -z "$diff_text" ]; then
     GROUPS_RESULT="nothing pending"; return
   fi
 
   local hits
-  hits=$(grep -E '^\+' <<<"$diff_text" | grep -vE '^\+\+\+ ' | grep -icE "$SECRET_RE" || true)
+  hits=$(secret_scan_hits "$diff_text")
   if [ "${hits:-0}" -gt 0 ]; then
     printf '%s\n' "$diff_text" > "$OUT/groups-refused.patch" 2>/dev/null
     FAILURES+=("groups: $hits added line(s) look like a secret — refused to commit any pending change; scanned diff saved to $OUT/groups-refused.patch")
@@ -514,16 +523,18 @@ find "$SNAP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '20*Z' -mtime +"$KEEP_DA
 
 SIZE=$(du -sh "$OUT" 2>/dev/null | cut -f1)
 if [ ${#FAILURES[@]} -gt 0 ]; then
-  BODY="$(printf -- '- %s\n' "${FAILURES[@]}")
-
-Whatever did succeed is in $OUT ($SIZE)."
-  printf '%s\n' "${FAILURES[@]}" >&2
-  if [ "$GROUPS_MODE" = "dry" ]; then
-    echo "git-safety: dry run — owner not notified" >&2
-  else
-    node_modules/.bin/tsx scripts/notify-owner.ts --title "Git safety net needs attention" --body "$BODY" ||
-      echo "git-safety: FAILURE AND NOBODY WAS TOLD" >&2
-  fi
+  # Own-DM removed deliberately (#628 item 8): the unit's OnFailure=
+  # already DMs the owner on this exit code, so a second DM here would just
+  # double-alert every handled failure. Printing to stderr is what makes
+  # that OnFailure DM actionable — unit-alert-dm.sh reads the journal tail.
+  #
+  # Order matters: unit-alert-dm.sh's keyword grep misses most FAILURES
+  # wording ("failed" alone isn't one of its keywords), so it falls back to
+  # the LAST line of the unit's last 30 minutes of output. The context line
+  # goes first and the failure list last, so that fallback lands on an
+  # actual reason instead of "whatever did succeed."
+  echo "Whatever did succeed is in $OUT ($SIZE)." >&2
+  printf -- '- %s\n' "${FAILURES[@]}" >&2
   exit 1
 fi
 if [ ${#NOTICES[@]} -gt 0 ] && [ "$GROUPS_MODE" != "dry" ]; then

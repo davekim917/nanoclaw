@@ -151,21 +151,38 @@ Write narration per step rather than as one long track. Per-step audio starts
 with its step, so re-recording one line never re-times the rest of the video.
 
 **Generating narration** needs a text-to-speech credential. The vault holds
-`OpenAI` (`api.openai.com`) and `ElevenLabs` (`api.elevenlabs.io`), but a group
+`ElevenLabs` (`api.elevenlabs.io`) and `OpenAI` (`api.openai.com`), but a group
 only reaches one if it is declared in that group's `onecliSecrets` — otherwise
-the call returns `401`. With one granted, the gateway injects the key and the
-ordinary REST call works:
+the call returns `401`. Prefer ElevenLabs; it sounds the most natural. Pick one
+voice from `GET https://api.elevenlabs.io/v1/voices` and reuse its `voice_id`
+for every step, so the video has a single narrator:
+
+```bash
+curl -sS "https://api.elevenlabs.io/v1/text-to-speech/<voice_id>" \
+  -H 'Content-Type: application/json' \
+  -d '{"model_id":"eleven_multilingual_v2","text":"Forecast the quarter in three clicks."}' \
+  -o public/audio/02.mp3
+```
+
+With only OpenAI, use `gpt-4o-mini-tts` with a named voice and an
+`instructions` line for delivery. Without one the read comes out flat:
 
 ```bash
 curl -sS https://api.openai.com/v1/audio/speech \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-4o-mini-tts","voice":"alloy","input":"Forecast the quarter in three clicks."}' \
+  -d '{"model":"gpt-4o-mini-tts","voice":"coral","instructions":"Warm, calm product-demo narrator. Conversational pace, no hype.","input":"Forecast the quarter in three clicks."}' \
   -o public/audio/02.mp3
 ```
 
 Never put an API key in the command — the gateway attaches it at the proxy
 boundary. If you get a `401`, the credential is not scoped to your group; ask an
 operator rather than trying to supply a key yourself.
+
+**No credential, no voice.** Never synthesize narration offline with ffmpeg's
+`flite`, `espeak` or `say`. Those voices sound robotic and make the whole video
+read as broken. Without a text-to-speech credential, ship captions and music
+only, and say in the hand-off that narration was skipped for lack of a
+credential.
 
 ### Why stills and not the screen recording
 

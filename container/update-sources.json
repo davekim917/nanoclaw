@@ -9,7 +9,10 @@
     { "id": "vercel", "name": "Vercel CLI", "arg": "VERCEL_VERSION", "source": { "kind": "npm", "package": "vercel" } },
     { "id": "bun", "name": "Bun", "arg": "BUN_VERSION", "source": { "kind": "github", "repo": "oven-sh/bun" } },
     { "id": "mermaid-cli", "name": "Mermaid CLI", "arg": "MMDC_VERSION", "source": { "kind": "npm", "package": "@mermaid-js/mermaid-cli" } },
-    { "id": "google-workspace-cli", "name": "Google Workspace CLI", "arg": "GWS_VERSION", "source": { "kind": "npm", "package": "@googleworkspace/cli" } },
+    { "id": "google-workspace-cli", "name": "Google Workspace CLI", "arg": "GWS_VERSION", "source": { "kind": "npm", "package": "@googleworkspace/cli" }, "checksums": [
+      { "arg": "GWS_SHA256_amd64", "url": "https://github.com/googleworkspace/cli/releases/download/v{version}/google-workspace-cli-x86_64-unknown-linux-musl.tar.gz.sha256" },
+      { "arg": "GWS_SHA256_arm64", "url": "https://github.com/googleworkspace/cli/releases/download/v{version}/google-workspace-cli-aarch64-unknown-linux-musl.tar.gz.sha256" }
+    ] },
     { "id": "codex", "name": "Codex CLI", "arg": "CODEX_VERSION", "source": { "kind": "npm", "package": "@openai/codex" } },
     { "id": "opencode", "name": "OpenCode", "arg": "OPENCODE_VERSION", "source": { "kind": "npm", "package": "opencode-ai" } },
     { "id": "wix-cli", "name": "Wix CLI", "arg": "WIX_CLI_VERSION", "source": { "kind": "npm", "package": "@wix/cli" } },
