@@ -797,7 +797,7 @@
 "src/host-sweep.feeds.test.ts":{"diff":148,"mode":"100644","sha256":null,"deleted":true},
 "src/host-sweep.queue.test.ts":{"diff":113,"mode":"100644","sha256":null,"deleted":true},
 "src/host-sweep.test.ts":{"diff":1128,"mode":"100644","sha256":"fa66ce2971ac43eb717d07a621f355794ab60edf1ab893e7029f671e596504f8"},
-"src/host-sweep.ts":{"diff":1544,"mode":"100644","sha256":"8e768a1d32023672b542b48c5457da0f93a3733c4e37419c79119922fff4ecbe"},
+"src/host-sweep.ts":{"diff":1610,"mode":"100644","sha256":"d72f30aab05183c8c7a8fc03eb1b6a1458f3066647984a05251933d86fd2e421"},
 "src/inbox-safety.ts":{"diff":0,"mode":"100644","sha256":"da36be19ab19bf3b10eb5ab36cf53f9c5696a637c2372007881f748dd0578e00"},
 "src/index.ts":{"diff":209,"mode":"100644","sha256":"8fbd6e14eccbcb488048c82cee83795e9f9aee1752f7eefd6d64b3d901b33774"},
 "src/install-slug.test.ts":{"diff":28,"mode":"100644","sha256":null,"deleted":true},
