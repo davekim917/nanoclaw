@@ -74,6 +74,20 @@ run_safety() { # extra env assignments as "$@", e.g. run_safety GIT_SAFETY_GROUP
 
 latest_snapshot() { ls -td "$BACKUPS"/*/ 2>/dev/null | head -1; }
 
+# unit-alert-dm.sh's keyword grep misses most FAILURES wording ("failed"
+# alone isn't a keyword), so on a FAILURES exit it falls back to the LAST
+# non-empty line of the unit's recent output for its DM. That line must be
+# an actual failure reason, not the "whatever did succeed" context line
+# that used to print after it (#658 review).
+assert_failure_reason_is_last() { # label, $OUT
+  local label="$1" out="$2" tail_line
+  tail_line=$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -1)
+  case "$tail_line" in
+    *"Whatever did succeed"*) bad "$label: context line, not the failure, is last" "tail=[$tail_line]" ;;
+    *) ok "$label: the failure reason is the last line (what unit-alert-dm.sh's DM would show)" ;;
+  esac
+}
+
 # ═══ 1. Phase 2 never touches groups' HEAD, index, or working tree ═════════
 new_fixture
 BEFORE_HEAD=$(git -C "$G" rev-parse HEAD)
@@ -130,6 +144,26 @@ case "$OUT" in
   *) bad "color.ui=always defeated the scan" "$OUT" ;;
 esac
 
+# A non-UTF-8 byte on the same line as a real secret must not blind the
+# scan either (#658 review). Under the installed unit's LANG=en_US.UTF-8,
+# GNU grep classifies a diff containing an invalid UTF-8 byte as binary and
+# `-c` reports 0/"binary file matches" instead of the line — verified
+# empirically before the LC_ALL=C fix: this exact line counted 0 hits
+# under LANG=en_US.UTF-8, 1 under LC_ALL=C. Force the vulnerable locale
+# here (LC_ALL= clears any inherited override) so the test fails if the
+# LC_ALL=C fix in lib/secret-scan.sh regresses.
+new_fixture
+printf '{"a":2}\n' > "$G/foo/container.json"
+printf 'binary junk: \x80\x81\x82 export SLACK_APP_TOKEN=xapp-1-A0123-4567890123-abcdefabcdefabcdefabcdefabcdef\n' >> "$G/foo/container.json"
+run_safety LANG=en_US.UTF-8 LC_ALL=
+case "$OUT" in
+  *"look like a secret"*) ok "secret gate not blinded by a non-UTF-8 byte on the same line" ;;
+  *) bad "a non-UTF-8 byte blinded the scan to an adjacent real secret" "$OUT" ;;
+esac
+if git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1; then
+  bad "non-UTF-8 line: pushed anyway" "$(git --git-dir="$REMOTE" log --oneline host-snapshot)"
+fi
+
 # ═══ Refuse binary changes ══════════════════════════════════════════════
 new_fixture
 printf '\x00\x01binarydata\x02\x03' > "$G/foo/container.json"
@@ -141,6 +175,7 @@ esac
 if git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1; then
   bad "binary change: pushed anyway" "$(git --git-dir="$REMOTE" log --oneline host-snapshot)"
 fi
+assert_failure_reason_is_last "binary change refusal" "$OUT"
 
 # ═══ Never auto-commit sensitive filenames; report them instead ══════════
 new_fixture
@@ -267,6 +302,7 @@ esac
 # never via the script's own notify-owner.ts call too.
 [ ! -s "$DM_LOG" ] && ok "a FAILURES exit sends no DM of its own (OnFailure= alerts instead)" \
   || bad "a FAILURES exit still sent its own DM — double-alerts with OnFailure=" "$(cat "$DM_LOG")"
+assert_failure_reason_is_last "permanent push failure" "$OUT"
 
 # ═══ Dry mode: no fetch, no fast-forward, no push, no DM ══════════════════
 new_fixture
@@ -309,7 +345,37 @@ esac
   || bad "phase-1 error did not fail the run" "$OUT"
 [ ! -s "$DM_LOG" ] && ok "phase-1 FAILURES exit sends no DM of its own either" \
   || bad "phase-1 FAILURES exit still sent its own DM" "$(cat "$DM_LOG")"
+assert_failure_reason_is_last "phase-1 update-ref failure" "$OUT"
 git -C "$NCDIR" worktree remove --force "$WT" >/dev/null 2>&1
+
+# ═══ A missing lib/secret-scan.sh fails closed, not open ══════════════════
+# git-safety.sh sources lib/secret-scan.sh with `${SCRIPT_DIR}/lib/...`,
+# where SCRIPT_DIR is derived from ${BASH_SOURCE[0]} — the path of whatever
+# copy of the script bash actually runs. Exercise the SHIPPED script's
+# source-guard (`|| exit 1`, #658 review) by running a byte-for-byte copy of
+# it from a scratch directory with no lib/ sibling at all, so this never
+# touches the real scripts/lib/secret-scan.sh in this checkout. Before the
+# guard, a missing lib left secret_scan_hits() undefined: the later
+# `hits=$(secret_scan_hits ...)` failed silently (command not found), hits
+# ended up "", and `${hits:-0}` read that as 0 — the secret gate passed
+# every pending change through unchecked.
+new_fixture
+NOLIB_DIR="$FIX/nolib-scripts"
+mkdir -p "$NOLIB_DIR"
+cp "$REAL" "$NOLIB_DIR/git-safety.sh"
+echo '{"a":2}' > "$G/foo/container.json"
+OUT=$(env NANOCLAW_DIR="$NCDIR" GIT_SAFETY_DIR="$BACKUPS" HOME="$HOME2" bash "$NOLIB_DIR/git-safety.sh" 2>&1)
+RC=$?
+[ "$RC" -ne 0 ] && ok "a missing lib/secret-scan.sh fails the run" \
+  || bad "a missing lib/secret-scan.sh did NOT fail the run (fail-open)" "$OUT"
+case "$OUT" in
+  *"cannot load"*"secret-scan.sh"*) ok "missing-lib failure names the file it could not load" ;;
+  *) bad "missing-lib failure did not explain itself" "$OUT" ;;
+esac
+git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1 \
+  && bad "missing-lib run pushed a host-snapshot commit anyway (fail-OPEN, gate never ran)" \
+    "$(git --git-dir="$REMOTE" log --oneline host-snapshot)" \
+  || ok "missing-lib run pushed nothing — fails closed"
 
 # ═══ Worktree slugs get a hash suffix (uniqueness even after truncation) ══
 # Unit-test slug() directly (extracted verbatim from the shipped script),

@@ -39,9 +39,10 @@
 # Silent on success (a pending deletion still gets its own DM even on an
 # otherwise clean run — see below). On FAILURE it exits 1 and does NOT DM
 # the owner itself: the installed unit's OnFailure=nanoclaw-unit-alert@%n
-# (data/systemd/, or groups/_ops/systemd/nanoclaw-git-safety.service on this
-# host) already fires on any non-zero exit and DMs the actionable journal
-# tail (unit-alert-dm.sh). Before this both fired — the script's own DM plus
+# (groups/_ops/systemd/nanoclaw-git-safety.service — tracked in the SEPARATE
+# davekim917/nanoclaw-groups repo, not this one's data/systemd/) already
+# fires on any non-zero exit and DMs the actionable journal tail
+# (unit-alert-dm.sh). Before this both fired — the script's own DM plus
 # OnFailure's — for every handled failure (#628 item 8); FAILURES are still
 # printed to stderr (>> the unit's journal, which is what OnFailure's DM
 # reads) so the escalation stays actionable. Runs before storage-gc so
@@ -321,9 +322,19 @@ done
 find "$OUT" -mindepth 1 -type d -empty -delete 2>/dev/null
 
 # ── phase 2: snapshot groups/'s pending tracked-file edits ──────────────────
-# SECRET_RE and secret_scan_hits() live in lib/secret-scan.sh, shared with
-# scripts/wiki-autopush.sh so the pattern set has exactly one copy.
-source "${SCRIPT_DIR}/lib/secret-scan.sh"
+# SECRET_RE and secret_scan_hits() live in lib/secret-scan.sh. Guarded: there
+# is no `-e` in this script (many commands below are deliberately allowed to
+# fail and get recorded in FAILURES/NOTICES instead of killing the run), so
+# an unguarded `source` of a missing/unreadable file would just continue with
+# secret_scan_hits undefined — the later `hits=$(secret_scan_hits "$diff")`
+# call would itself fail silently (command not found), `hits` would end up
+# empty, `${hits:-0}` reads that as 0, and the secret gate would pass every
+# pending change through unchecked. Fail closed instead: refuse to build any
+# groups/ snapshot at all rather than build one with a gate that never ran.
+source "${SCRIPT_DIR}/lib/secret-scan.sh" || {
+  echo "git-safety: cannot load ${SCRIPT_DIR}/lib/secret-scan.sh — refusing to build a groups/ snapshot without a working secret gate" >&2
+  exit 1
+}
 
 # Sensitive filenames are never staged even when git already tracks them —
 # excluded via pathspec BEFORE `add -u` runs, so they never touch the scratch
@@ -507,8 +518,14 @@ if [ ${#FAILURES[@]} -gt 0 ]; then
   # already DMs the owner on this exit code, so a second DM here would just
   # double-alert every handled failure. Printing to stderr is what makes
   # that OnFailure DM actionable — unit-alert-dm.sh reads the journal tail.
-  printf -- '- %s\n' "${FAILURES[@]}" >&2
+  #
+  # Order matters: unit-alert-dm.sh's keyword grep misses most FAILURES
+  # wording ("failed" alone isn't one of its keywords), so it falls back to
+  # the LAST line of the unit's last 30 minutes of output. The context line
+  # goes first and the failure list last, so that fallback lands on an
+  # actual reason instead of "whatever did succeed."
   echo "Whatever did succeed is in $OUT ($SIZE)." >&2
+  printf -- '- %s\n' "${FAILURES[@]}" >&2
   exit 1
 fi
 if [ ${#NOTICES[@]} -gt 0 ] && [ "$GROUPS_MODE" != "dry" ]; then

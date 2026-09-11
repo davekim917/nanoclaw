@@ -1,7 +1,6 @@
 # Shared secret-shaped-content detector. Sourced by scripts/git-safety.sh
-# (groups/ snapshot) and scripts/wiki-autopush.sh (wiki repo pushes) — kept
-# here so the pattern set has exactly one copy instead of drifting between
-# the two call sites.
+# (groups/ snapshot) — kept in its own file so the pattern set has exactly
+# one copy for any future caller to share.
 #
 # Broad, case-insensitive, and deliberately over-inclusive: refusing a
 # non-secret line costs a manual `git diff` and a re-run; missing a real one
@@ -29,6 +28,19 @@ SECRET_RE='(\bsk-[A-Za-z0-9_-]{20,}|(sk|rk)_live_[A-Za-z0-9]{10,}|ghp_[A-Za-z0-9
 # header) that match SECRET_RE, case-insensitively. Callers refuse the
 # change whenever this is > 0. Never fails under `set -e`: an empty/no-match
 # grep would otherwise return 1 and abort the caller.
+#
+# LC_ALL=C on all three greps: under the installed units' LANG=en_US.UTF-8,
+# GNU grep classifies a diff containing an invalid UTF-8 byte (a truncated
+# multibyte sequence — common in a binary-ish paste, a foreign-language
+# comment with a bad encoding, or an adversarial line built to exploit
+# exactly this) as a BINARY file. In binary mode `-c` reports "binary file
+# matches" / a bare 0 instead of the actual matching lines, so the FIRST
+# grep in this pipe (`^\+`) silently stops emitting any line at all — the
+# downstream secret grep then sees nothing and counts 0 hits, even with a
+# live secret sitting right next to the bad byte (verified empirically: a
+# diff line combining bytes 0x80-0x82 with a real xapp- token counts 0
+# hits under LANG=en_US.UTF-8, 1 under LC_ALL=C). C locale treats every
+# byte as plain text, so this binary misclassification never triggers.
 secret_scan_hits() {
-  grep -E '^\+' <<<"$1" | grep -vE '^\+\+\+ ' | grep -icE "$SECRET_RE" || true
+  LC_ALL=C grep -E '^\+' <<<"$1" | LC_ALL=C grep -vE '^\+\+\+ ' | LC_ALL=C grep -icE "$SECRET_RE" || true
 }

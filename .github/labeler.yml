@@ -72,13 +72,11 @@ risk:high:
     - 'container/Dockerfile'
     - 'container/build.sh'
     # Deploy and rollback (src/deploy-crash-guard.ts is covered by *guard*), and the
-    # nightly host snapshot and the wiki autopush — both push to a remote and both
-    # scan for secrets before doing so (their selfchecks are covered by the *
-    # globs), off one shared pattern set (secret-scan.sh); a weakened pattern there
-    # silently disables both scans
+    # nightly host snapshot that scans for secrets then pushes config to a remote
+    # (and its selfcheck, covered by the * glob), off secret-scan.sh's pattern set
+    # (a weakened pattern there silently disables the scan)
     - 'scripts/deploy.sh'
     - 'scripts/git-safety*.sh'
-    - 'scripts/wiki-autopush*.sh'
     - 'scripts/lib/secret-scan.sh'
     # The gates themselves: CI workflows, this file, the git hooks, the public-boundary
     # checkers and allowlist, and the PR review loop that IS the review gate. CI runs
@@ -170,7 +168,6 @@ risk:deploy:
   - any-glob-to-any-file:
     - 'scripts/deploy.sh'
     - 'scripts/git-safety*.sh'
-    - 'scripts/wiki-autopush*.sh'
     - 'scripts/lib/secret-scan.sh'
 
 risk:gates:
