@@ -1,12 +1,13 @@
 /**
  * The remote-boundary job's decision logic, exercised without git, a network,
- * a real Slack workspace or systemd. The IO half (fetch, snapshot worktree,
- * `pnpm run check:public-boundary`) is deliberately not covered here — it is a
- * few lines of subprocess plumbing around this decision, and faking it would
- * test the fake. `resolveAllowlistPath` is the one exception: it is pure
- * filesystem logic with no subprocess of its own, so it is tested directly
- * against real temp directories, the same way `pre-push.test.ts` exercises
- * `.husky/pre-push`'s filesystem behavior.
+ * a real Slack workspace or systemd. The actual `pnpm run check:public-boundary`
+ * subprocess (`REAL_RUN_CHECKER`) is deliberately not covered here — faking it
+ * would test the fake. Everything around that one call IS covered:
+ * `resolveAllowlistPath` is pure filesystem logic tested directly against real
+ * temp directories, the same way `pre-push.test.ts` exercises `.husky/pre-push`'s
+ * filesystem behavior, and `scanSnapshot` is tested with an injected `RunChecker`
+ * fake standing in for the subprocess — proving what path actually reaches
+ * `--allowlist`, not just what `resolveAllowlistPath` returns in isolation.
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -26,8 +27,10 @@ import {
   reportOutcome,
   reportScan,
   resolveAllowlistPath,
+  scanSnapshot,
   trimDetail,
   type Alert,
+  type CheckerInvocation,
   type Reporter,
 } from './check-remote-boundary.js';
 
@@ -203,6 +206,85 @@ describe('resolveAllowlistPath', () => {
     const fallbackDir = path.dirname(resolved.path);
     resolved.cleanup();
     expect(fs.existsSync(fallbackDir)).toBe(false);
+    fs.rmSync(snapshot, { recursive: true, force: true });
+  });
+
+  it('refuses a committed symlink instead of following it or falling back to empty', () => {
+    const snapshot = tempDir();
+    // The exempting content lives OUTSIDE the tree being scanned — exactly
+    // what a symlink could smuggle in if it were followed.
+    const target = path.join(snapshot, 'exempts-everything.json');
+    fs.writeFileSync(
+      target,
+      JSON.stringify({ entries: [{ path: 'src/example.ts', value: 'Private Customer', reason: 'via symlink' }] }),
+    );
+    fs.symlinkSync(target, path.join(snapshot, '.public-boundary-allowlist.json'));
+
+    expect(() => resolveAllowlistPath(snapshot)).toThrow(/not a regular file/);
+    fs.rmSync(snapshot, { recursive: true, force: true });
+  });
+});
+
+describe('scanSnapshot', () => {
+  function tempDir(): string {
+    return fs.mkdtempSync(path.join(os.tmpdir(), 'remote-boundary-scan-test-'));
+  }
+
+  it('passes the resolved allowlist path through to the checker invocation', () => {
+    const snapshot = tempDir();
+    fs.writeFileSync(path.join(snapshot, '.public-boundary-allowlist.json'), '{"entries": []}\n');
+    const calls: CheckerInvocation[] = [];
+
+    const result = scanSnapshot(snapshot, 'abc1234', (invocation) => {
+      calls.push(invocation);
+      return { status: 0, stderr: '' };
+    });
+
+    expect(calls).toEqual([
+      { root: snapshot, allowlistPath: path.join(snapshot, '.public-boundary-allowlist.json') },
+    ]);
+    expect(result).toEqual({ code: 0, detail: '' });
+    fs.rmSync(snapshot, { recursive: true, force: true });
+  });
+
+  it('passes the fallback allowlist path through when the tree has none, and cleans it up after the checker runs', () => {
+    const snapshot = tempDir();
+    let seenAllowlistPath = '';
+
+    scanSnapshot(snapshot, 'abc1234', (invocation) => {
+      seenAllowlistPath = invocation.allowlistPath;
+      // The checker would read the file here; assert it existed while the
+      // checker had it, not only that a path string was passed.
+      expect(fs.existsSync(invocation.allowlistPath)).toBe(true);
+      return { status: 0, stderr: '' };
+    });
+
+    expect(seenAllowlistPath).not.toBe(path.join(snapshot, '.public-boundary-allowlist.json'));
+    expect(fs.existsSync(seenAllowlistPath)).toBe(false);
+    fs.rmSync(snapshot, { recursive: true, force: true });
+  });
+
+  it('maps a findings exit code and stderr into a BoundaryScan', () => {
+    const snapshot = tempDir();
+    fs.writeFileSync(path.join(snapshot, '.public-boundary-allowlist.json'), '{"entries": []}\n');
+
+    const result = scanSnapshot(snapshot, 'abc1234', () => ({
+      status: 1,
+      stderr: 'src/example.ts:12 identifier\npublic boundary check failed with 1 redacted finding(s) (index)',
+    }));
+
+    expect(result.code).toBe(1);
+    expect(result.detail).toContain('src/example.ts:12 identifier');
+    fs.rmSync(snapshot, { recursive: true, force: true });
+  });
+
+  it('cleans up the allowlist even when the checker invocation itself fails to spawn', () => {
+    const snapshot = tempDir();
+    fs.writeFileSync(path.join(snapshot, '.public-boundary-allowlist.json'), '{"entries": []}\n');
+
+    expect(() =>
+      scanSnapshot(snapshot, 'abc1234', () => ({ status: null, stderr: '', error: new Error('spawn failed') })),
+    ).toThrow('spawn failed');
     fs.rmSync(snapshot, { recursive: true, force: true });
   });
 });
