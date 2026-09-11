@@ -35,11 +35,24 @@ own change. A substitute review still triages findings under this policy and
 does not relax required CI, holds, or merge authorization.
 
 The substitute, like every review (a delta check after a rebase or ratchet
-regeneration, adversarial verification, a gap analysis), is an Opus-tier or
-Fable-tier Claude model or a different model family such as Codex/GPT, and the
-receipt's `--reviewer` names the model. A Sonnet-tier or Haiku-tier model never
-reviews, and neither does a subagent that runs on one. Nobody has to be
-free for this: the author may start that reviewer as a fresh process
+regeneration, adversarial verification, a gap analysis), must run on the high
+or frontier tier, whichever vendor: `worker-high`/`worker-frontier`'s `model:`
+frontmatter for Claude, `CODEX_WORKER_TIERS['worker-high']`/`['worker-frontier']`
+for Codex (`src/claude-agent-md.ts`). Never `worker`/`worker-fast` (Sonnet or
+Haiku), never Codex `luna`/`terra`, and never a flash or mini model. The
+allowed ids are generated from that tier config, not hand-maintained —
+`container/skills/pr-review-loop/reviewer-models.txt`
+(`scripts/reviewer-models.ts --write`) — and `codex-review.sh receipt` /
+`merge-check` enforce it mechanically against `--reviewer`'s **first
+whitespace-delimited word** (a `[1m]` suffix on that word is tolerated): a
+`--reviewer` not starting with an allowed id is refused before it posts, and
+an approving receipt whose first word isn't allowed does not unlock a merge.
+The reviewer reports its **exact model id from its own runtime** — a Claude
+subagent from its system prompt, Codex from the `-m` it ran with or
+`codex exec`'s session metadata — as that first word, and the receipt's `--reviewer`
+copies it verbatim, e.g. `claude-opus-5 (worker-high)` or
+`gpt-5.6-sol high (codex exec)`. Nobody has to be free for this: the author
+may start that reviewer as a fresh process
 (`codex exec -m <model> -c model_reasoning_effort=high`, or
 `claude -p --model opus --effort high`) and hand it the inputs above.
 

@@ -1,6 +1,6 @@
 ---
 name: worker-fast
-description: Cheapest execution worker, for mechanical bulk work where the answer is unambiguous and only the volume is the cost — renames across many files, boilerplate, format/syntax conversion, log and test-output triage, applying a change that is already specified line by line. If the task needs a judgment call or the acceptance criteria are fuzzy, use worker instead. Runs on Haiku. Never a reviewer.
+description: Cheapest execution worker, for mechanical bulk work where the answer is unambiguous and only the volume is the cost — renames across many files, boilerplate, format/syntax conversion, log and test-output triage, applying a change that is already specified line by line. If the task needs a judgment call or the acceptance criteria are fuzzy, use worker instead. Never a reviewer. Runs on Haiku.
 model: claude-haiku-4-5-20251001
 ---
 

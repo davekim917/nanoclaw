@@ -341,12 +341,21 @@ function commitStatus(context: string, state: string, createdAt = '2026-09-05T00
   return { id: Date.parse(createdAt) / 1000, context, state, created_at: createdAt };
 }
 
-function receiptComment(head: string, outcome: string, createdAt: string, authorAssociation = 'OWNER'): Page {
+// `reviewer` defaults to an allowed worker-high model so existing approve-path
+// fixtures keep passing the model-allowlist check merge-check now applies;
+// tests of the allowlist itself pass a disallowed (or omitted) reviewer.
+function receiptComment(
+  head: string,
+  outcome: string,
+  createdAt: string,
+  authorAssociation = 'OWNER',
+  reviewer = 'claude-opus-5 (worker-high)',
+): Page {
   return {
     author: { login: 'davekim917' },
     authorAssociation,
     createdAt,
-    body: `### Substitute review receipt\n\n- **Outcome:** ${outcome}\n\n<!-- pr-review-loop:substitute-receipt head=${head} outcome=${outcome} -->`,
+    body: `### Substitute review receipt\n\n- **Reviewer and runtime:** ${reviewer}\n- **Outcome:** ${outcome}\n\n<!-- pr-review-loop:substitute-receipt head=${head} outcome=${outcome} -->`,
   };
 }
 
@@ -1438,6 +1447,141 @@ describe('codex-review risk-scoped review requests', () => {
     expect(result.status).toBe(2);
     expect(result.posted).toBeNull();
   });
+
+  it.each([
+    ['an embedded newline (a\\nb)', 'a\nb'],
+    ['an embedded newline (b\\na)', 'b\na'],
+    ['a trailing carriage return', 'claude-opus-5\r'],
+    ['an embedded carriage return', 'claude-opus-5\rmore'],
+  ])('refuses a receipt whose --reviewer contains %s, posting nothing', (_case, reviewer) => {
+    const root = tempRoot();
+    const bodyFile = path.join(root, 'review.md');
+    fs.writeFileSync(bodyFile, 'Scope: complete diff.\n');
+
+    const result = runHelper(root, [
+      'receipt',
+      '--head',
+      HEAD,
+      '--outcome',
+      'approve',
+      '--reviewer',
+      reviewer,
+      '--body-file',
+      bodyFile,
+    ]);
+    expect(result.status).toBe(2);
+    expect(result.posted).toBeNull();
+    expect(result.stderr).toContain('newline or carriage return');
+  });
+
+  it.each([
+    ['claude-sonnet-5', 'claude-sonnet-5'],
+    ['claude-haiku-4-5', 'claude-haiku-4-5 (worker-fast)'],
+    ['gpt-5.6-luna', 'gpt-5.6-luna via codex exec'],
+    ['gpt-5.6-terra', 'gpt-5.6-terra via codex exec'],
+    ['a bare model name with no id', 'Opus 5'],
+    // Mutation evidence for the grep-argument-injection fix: these tokens, if
+    // ever handed to grep as a bare pattern argument again (no `-e`/`--`),
+    // would be parsed as grep's OWN flags and exit 0 on no real match —
+    // "fixed" nothing, posted anyway. Pure-bash string comparison never does
+    // that regardless of what the token looks like.
+    ['a grep -V flag token', 'claude-sonnet-5 -V'],
+    ['a bare grep --version flag token', '--version'],
+    ['a grep --help flag token', 'claude-haiku-4-5 --help'],
+    ['a grep -v flag token', 'claude-sonnet-5 -v x'],
+    // Mutation evidence for first-token-only matching: an allowed id appearing
+    // ANYWHERE but the first word must still refuse — the documented receipt
+    // format leads with the id, so this is not a legitimate reviewer string.
+    ['an allowed id mentioned after a disallowed first token', 'claude-sonnet-5 (fallback from claude-opus-5)'],
+  ])('refuses a receipt whose --reviewer names %s, a non-allowlisted model, posting nothing', (_case, reviewer) => {
+    const root = tempRoot();
+    const bodyFile = path.join(root, 'review.md');
+    fs.writeFileSync(bodyFile, 'Scope: complete diff.\n');
+
+    const result = runHelper(root, [
+      'receipt',
+      '--head',
+      HEAD,
+      '--outcome',
+      'approve',
+      '--reviewer',
+      reviewer,
+      '--body-file',
+      bodyFile,
+    ]);
+    expect(result.status).toBe(2);
+    expect(result.posted).toBeNull();
+    expect(result.stderr).toContain('reviewer-models.txt');
+  });
+
+  it('accepts a receipt whose --reviewer names every listed model id, including a [1m] form', () => {
+    const modelsFile = path.resolve('container/skills/pr-review-loop/reviewer-models.txt');
+    const ids = fs
+      .readFileSync(modelsFile, 'utf8')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && !line.startsWith('#'));
+    expect(ids.length).toBeGreaterThan(0);
+
+    // Every plain listed id, plus one with the [1m] context-window suffix appended.
+    const reviewers = [...ids.map((id) => `${id} (worker-high)`), `${ids[0]}[1m] (worker-high)`];
+    for (const reviewer of reviewers) {
+      const root = tempRoot();
+      const bodyFile = path.join(root, 'review.md');
+      fs.writeFileSync(bodyFile, 'Scope: complete diff.\n');
+
+      const result = runHelper(root, [
+        'receipt',
+        '--head',
+        HEAD,
+        '--outcome',
+        'approve',
+        '--reviewer',
+        reviewer,
+        '--body-file',
+        bodyFile,
+      ]);
+      expect(result.status, `reviewer "${reviewer}" was refused: ${result.stderr}`).toBe(0);
+      expect(result.posted).toContain(`- **Reviewer and runtime:** ${reviewer}`);
+    }
+  });
+
+  it('refuses a review-verdict head whose approving receipt names a disallowed reviewer model', () => {
+    const root = tempRoot();
+    scopeFixture(root, {
+      labels: ['risk:high'],
+      comments: [
+        marker(HEAD, 1),
+        receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-sonnet-5'),
+      ],
+    });
+
+    const result = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain('disallowed reviewer');
+    expect(result.stderr).toContain('reviewer-models.txt');
+  });
+
+  it.each([
+    ['a grep -V flag token', 'claude-sonnet-5 -V'],
+    ['a bare grep --version flag token', '--version'],
+    ['a grep --help flag token', 'claude-haiku-4-5 --help'],
+    ['a grep -v flag token', 'claude-sonnet-5 -v x'],
+    ['an allowed id mentioned after a disallowed first token', 'claude-sonnet-5 (fallback from claude-opus-5)'],
+  ])(
+    'refuses a review-verdict head whose approving receipt reviewer is %s (mutation evidence for the grep-injection/first-token fix)',
+    (_case, reviewer) => {
+      const root = tempRoot();
+      scopeFixture(root, {
+        labels: ['risk:high'],
+        comments: [marker(HEAD, 1), receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', reviewer)],
+      });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status, `reviewer "${reviewer}" was wrongly allowed: ${result.stdout}`).toBe(24);
+      expect(result.stderr).toContain('disallowed reviewer');
+    },
+  );
 
   it('allows a review-verdict head on an approving substitute receipt for exactly that head', () => {
     const root = tempRoot();

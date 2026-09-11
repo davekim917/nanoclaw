@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
 import { describe, expect, test } from 'vitest';
 
 import {
@@ -7,6 +10,8 @@ import {
   isManagedToml,
   parseClaudeAgentMd,
 } from './claude-agent-md.js';
+
+const REPO_ROOT = path.resolve(__dirname, '..');
 
 describe('parseClaudeAgentMd', () => {
   test('parses plain frontmatter', () => {
@@ -156,6 +161,32 @@ describe('formatCodexAgentToml — worker model tiering', () => {
     const out = formatCodexAgentToml({ name: 'worker-fast', description: 'Bulk work.', body: 'b' });
     expect(out).toContain('Bulk work. Runs on gpt-5.6-luna at max reasoning.');
   });
+
+  test('preserves a "never a reviewer" clause that precedes the Runs on sentence', () => {
+    // retargetRunsOnSentence strips from " Runs on" to the end of the
+    // description, so any routing-relevant clause MUST come before it or a
+    // Codex sibling loses it. Regression for the "never a reviewer" clause
+    // once living inside the stripped Runs-on sentence itself.
+    const out = formatCodexAgentToml({
+      name: 'worker',
+      description:
+        'Default execution worker. It is never a reviewer: review and verification go elsewhere. Runs on Sonnet at xhigh effort.',
+      body: 'b',
+    });
+    expect(out).toContain('It is never a reviewer: review and verification go elsewhere.');
+    expect(out).toContain('Runs on gpt-5.6-terra at xhigh reasoning.');
+  });
+
+  test.each(['worker', 'worker-fast'])(
+    'the real container/agents/%s.md keeps its "never a reviewer" clause after Codex conversion',
+    (name) => {
+      const content = fs.readFileSync(path.join(REPO_ROOT, 'container/agents', `${name}.md`), 'utf8');
+      const agent = parseClaudeAgentMd(content);
+      expect(agent).not.toBeNull();
+      const out = formatCodexAgentToml(agent!);
+      expect(out.toLowerCase()).toContain('never a reviewer');
+    },
+  );
 
   test('leaves untiered agents inheriting the parent model', () => {
     const out = formatCodexAgentToml({ name: 'codex-rescue', description: 'd', body: 'b' });

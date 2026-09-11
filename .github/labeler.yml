@@ -97,6 +97,13 @@ risk:high:
     - '.public-boundary-allowlist.json'
     - 'container/skills/pr-review-loop/**'
     - 'docs/review-policy.md'
+    # The reviewer-eligibility tier rule the merge gate enforces: the generator,
+    # the worker-tier agent defs it derives Claude ids from, and the Codex tier
+    # map (CODEX_WORKER_TIERS) it imports rather than reparses. A change to any
+    # of these changes who is allowed to approve a merge.
+    - 'scripts/reviewer-models*.ts'
+    - 'container/agents/**'
+    - 'src/claude-agent-md.ts'
     # Executable agent and tool config: a hook (.claude/settings.json), an
     # auto-trusted MCP server (.mcp.json — any agent/CI tooling that honors
     # enableAllProjectMcpServers connects to it with no prompt), Claude Code's own
@@ -220,6 +227,9 @@ risk:gates:
     - '.public-boundary-allowlist.json'
     - 'container/skills/pr-review-loop/**'
     - 'docs/review-policy.md'
+    - 'scripts/reviewer-models*.ts'
+    - 'container/agents/**'
+    - 'src/claude-agent-md.ts'
     - '.claude/**'
     - '.mcp.json'
     - '.claude.json'
