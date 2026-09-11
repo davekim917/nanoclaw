@@ -185,9 +185,28 @@ describe('reserved origin field', () => {
 
   it('leaves content without the field, and non-JSON content, byte-identical', () => {
     const plain = '{"text":"hi","sender":"Alice"}';
-    expect(withoutHostFields(plain)).toBe(plain);
-    expect(withoutHostFields('not json')).toBe('not json');
-    expect(withoutHostFields('["origin"]')).toBe('["origin"]');
-    expect(JSON.parse(withoutHostFields('{"text":"hi","event":"choice_response"}'))).toEqual({ text: 'hi' });
+    expect(withoutHostFields(plain, 'chat')).toBe(plain);
+    expect(withoutHostFields('not json', 'chat')).toBe('not json');
+    expect(withoutHostFields('["origin"]', 'chat')).toBe('["origin"]');
+    expect(JSON.parse(withoutHostFields('{"text":"hi","event":"choice_response"}', 'chat'))).toEqual({ text: 'hi' });
+  });
+
+  it('strips only the kinds the runner marks: a webhook keeps its own event field', async () => {
+    // formatWebhookMessage renders a webhook row's `event` (formatter.ts:534-537);
+    // stripping it would silently turn every such row into event="unknown".
+    const hook = JSON.stringify({ source: 'github', event: 'push', origin: 'api', payload: {} });
+    for (const kind of ['webhook', 'task', 'system']) expect(withoutHostFields(hook, kind)).toBe(hook);
+    expect(JSON.parse(withoutHostFields(hook, 'chat-sdk'))).toEqual({ source: 'github', payload: {} });
+
+    await writeSessionMessage(AG, SESS, {
+      id: 'webhook-1',
+      kind: 'webhook',
+      timestamp: now(),
+      platformId: 'webhook:github',
+      channelType: 'webhook',
+      threadId: null,
+      content: hook,
+    });
+    expect(stored('webhook-1')).toMatchObject({ source: 'github', event: 'push', origin: 'api' });
   });
 });
