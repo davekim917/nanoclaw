@@ -75,7 +75,8 @@ describe('main.ts starts no duty timer directly', () => {
  * Covers every named value export any src/**\/*.ts file imports from
  * 'child_process' / 'node:child_process' — verified via
  * `grep -rh "from '\(node:\)\?child_process'" src --include=*.ts | sort -u`:
- * exec, execFile, execFileSync (worktree-cleanup.ts, commit-scan.ts,
+ * exec, execFile (commit-scan.ts, among others — issue #648 moved it off
+ * execFileSync), execFileSync (worktree-cleanup.ts,
  * modules/repository-workspaces/index.ts, repository-workspaces.ts),
  * execSync, spawn (repository-workspaces.ts), spawnSync. `fork` is not
  * imported anywhere today but is included so a future duty adding it can't
@@ -199,8 +200,9 @@ describe('a timer that fails to start still aborts boot, and a failing interval 
     vi.doMock('./log.js', () => ({ log: logMock }));
     // Tripwire (see childProcessTripwireFactory): getAllAgentGroups()
     // returning [] already means commit-scan's own group loop — the only
-    // path that reaches execFileSync('git', …) — never runs; this is
-    // regression insurance, not the primary guard. spawnAttempts must stay
+    // path that reaches execFile('git', …) (async since #648; was
+    // execFileSync) — never runs; this is regression insurance, not the
+    // primary guard. spawnAttempts must stay
     // empty (asserted below) even though the module already `.catch`es its
     // own git failures, which would otherwise swallow a bare thrown tripwire
     // without ever failing the test.
