@@ -2269,6 +2269,41 @@ describe('repository_checkout host action (plan §5.2, Phase 2)', { timeout: 60_
     );
   });
 
+  it('refuses a clone checkout for a scan-policy repo (wiki), and leaves nothing staged; an ordinary repo is unaffected (#680 follow-up)', async () => {
+    // checkoutRepository is the ONLY place a clone-shaped checkout is
+    // created or served: createCloneWorktree's `repository_checkout`
+    // request (container/agent-runner/src/mcp-tools/git-worktrees.ts:987-1000)
+    // -> applyRepositoryCheckoutAction (index.ts:1205) -> here -> createCheckout
+    // -> stageClone, a full independent `git clone` with no core.hooksPath set.
+    // isScanPolicyRepositoryName (src/managed-git-hooks.ts) is the host's
+    // single source of truth for which repos must never be served that way
+    // — refusing right here fails closed even if the runner's own copy of
+    // the predicate (container/agent-runner/src/mcp-tools/scan-policy-repos.json)
+    // ever drifted from the host's (src/managed-git-hooks.test.ts's
+    // "runner/host scan-policy lists" test guards against exactly that).
+    networkCanonical(root, 'wiki');
+    const unit = threadUnit('scan-policy-clone');
+    const topicRoot = topicWorktreesDir(unit, root);
+    const staged = (): string[] => {
+      try {
+        return fs.readdirSync(checkoutStagingRoot(topicRoot));
+      } catch {
+        return [];
+      }
+    };
+
+    await expect(checkout(unit, null, root, 'wiki')).rejects.toThrow(/secret-scan policy/);
+    await expect(checkout(unit, 'feat-wiki', root, 'wiki')).rejects.toThrow(/secret-scan policy/);
+    expect(listTopicCheckouts(topicRoot)).toEqual([]);
+    expect(staged()).toEqual([]);
+
+    // An ordinary code repo is completely unaffected: it still clones.
+    networkCanonical(root, 'proj');
+    const codeResult = await checkout(unit, 'feat-proj', root, 'proj');
+    expect(codeResult.shape).toBe('clone');
+    expect(codeResult.created).toBe(true);
+  });
+
   it('repository_checkout links node_modules farms for package dirs with a verified entry', async () => {
     const canonical = networkCanonical(root);
     const donor = path.join(root, 'donor', 'app');
@@ -2538,5 +2573,26 @@ describe('repository_checkout host action (plan §5.2, Phase 2)', { timeout: 60_
       applyRepositoryRefreshAction({ requestId, repo: 'missing-repo', workUnitKey: unitOf(session).key }, session),
     ).rejects.toThrow();
     expect(Object.keys(responseFor(requestId))).toEqual(['type', 'requestId', 'ok', 'message']);
+  });
+
+  it('applyRepositoryCheckoutAction surfaces the scan-policy clone refusal for wiki in its existing response shape (#680 follow-up)', async () => {
+    // checkoutRepository throws the refusal (see the dedicated test above);
+    // this confirms applyRepositoryCheckoutAction needs no extra handling of
+    // its own — the catch block it already has answers with the same
+    // ok:false/message shape every other checkoutRepository refusal gets.
+    networkCanonical(hostActionDataDir, 'wiki');
+    mockAgentGroup();
+    const session = taskSession('session-scan-policy', 'scan-policy');
+    const unit = unitOf(session);
+    const requestId = nextRequestId();
+
+    await applyRepositoryCheckoutAction(
+      { action: 'repository_checkout', requestId, repo: 'wiki', branch: null, workUnitKey: unit.key },
+      session,
+    );
+    const response = responseFor(requestId);
+    expect(response).toMatchObject({ type: 'repository_action_response', requestId, ok: false, retryable: false });
+    expect(String(response.message)).toContain('secret-scan policy');
+    expect(listTopicCheckouts(topicWorktreesDir(unit, hostActionDataDir))).toEqual([]);
   });
 });

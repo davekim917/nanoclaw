@@ -25,6 +25,7 @@ import { checkoutDirName, checkoutShapeAt } from './checkout-layout.js';
 import { getMessageIn, markCompleted } from '../db/messages-in.js';
 import { writeMessageOut } from '../db/messages-out.js';
 import { evaluateReviewChurnGate } from '../review-churn-gate.js';
+import { SCAN_POLICY_REPOSITORY_NAMES } from './scan-policy-repos.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
@@ -98,19 +99,38 @@ function checkoutMode(): CheckoutMode {
 // mode this container has no other signal for "is this a scan-policy repo"
 // — it cannot import src/managed-git-hooks.ts (container/agent-runner is a
 // separate Bun package tree, no shared modules with host src/, per
-// CLAUDE.md's Module System section) — so the name check is duplicated
-// here, kept in exact lockstep with the host's
-// `isScanPolicyRepositoryName` (src/managed-git-hooks.ts:77-78: `name ===
-// 'wiki'`). #666-follow-up: a wiki checkout must always be a linked
-// worktree, whatever NANOCLAW_CHECKOUT_MODE says, or its pushes go
-// unscanned.
+// CLAUDE.md's Module System section) — so the list is duplicated here, as
+// scan-policy-repos.json, kept in exact lockstep with the host's own
+// `SCAN_POLICY_REPOSITORY_NAMES` (src/managed-git-hooks.ts) — a
+// src/managed-git-hooks.test.ts drift test reads both and fails CI the
+// moment either side widens without the other. #666-follow-up: a wiki
+// checkout must always be a linked worktree, whatever NANOCLAW_CHECKOUT_MODE
+// says, or its pushes go unscanned.
 function isScanPolicyRepositoryName(name: string): boolean {
-  return name === 'wiki';
+  return SCAN_POLICY_REPOSITORY_NAMES.includes(name);
 }
 
 /** Per-repo effective mode: a scan-policy repo is pinned to `worktree` regardless of the global setting. */
 function effectiveCheckoutModeFor(repo: string): CheckoutMode {
   return isScanPolicyRepositoryName(repo) ? 'worktree' : checkoutMode();
+}
+
+/**
+ * Shared refusal text for a scan-policy repo's leftover clone-shaped
+ * checkout, whether hit at creation (`create_worktree`) or at resolution
+ * time for every other tool (`worktreeForTool`). A clone has its own
+ * independent `.git/config` with no `core.hooksPath` set (see the block
+ * comment above `isScanPolicyRepositoryName`), so nothing pushed from it is
+ * ever scanned by the host-managed pre-push hook (#666-follow-up) — it must
+ * be removed, never served or pushed from, so re-running create_worktree is
+ * the only way forward.
+ */
+function scanPolicyCloneLeftoverMessage(repo: string, checkoutPath: string): string {
+  return (
+    `${checkoutPath} is a clone of '${repo}' left over from a clone-mode period and is not secret-scanned on push. ` +
+    'Remove it without pushing anything from it, then re-run create_worktree to get a linked worktree that shares ' +
+    "the canonical's scan hook."
+  );
 }
 
 function runGitAt(cwd: string, args: string[], timeoutMs = 120_000): string {
@@ -902,6 +922,13 @@ function worktreeForTool(
   try {
     const context = contextFor(repo);
     const resolved = resolveCheckout(context, branchArg);
+    // Same refusal as create_worktree's reuse branch above, at resolution
+    // time: this is the one choke point git_commit, git_push and open_pr all
+    // route through (see their handlers below), so it also covers a
+    // `wiki@<branch>` position, not just the primary one.
+    if (resolved.shape === 'clone' && isScanPolicyRepositoryName(repo)) {
+      return { error: err(scanPolicyCloneLeftoverMessage(repo, resolved.path)) };
+    }
     log(`resolved ${repo}${branchArg ? `@${branchArg}` : ''} -> ${resolved.shape} at ${resolved.path}`);
     return { context: contextForCheckout(context, resolved), checkout: resolved, canonical: context };
   } catch (error) {
@@ -1202,7 +1229,8 @@ const CREATE_WORKTREE_DESCRIPTIONS: Record<CheckoutMode, string> = {
     'must change. continueFromThreadId moves an inactive legacy linked checkout here instead of creating a new one; ' +
     'after requesting a transfer, end your turn at once and do not wait or poll for the worktree, because the move ' +
     'waits for this turn to stop and this topic then restarts with the result. Typical flow from here: git_commit → ' +
-    'git_push → open_pr.',
+    'git_push → open_pr. A repo under host-managed secret-scan policy (currently wiki) always gets a linked ' +
+    'worktree here instead, whatever this mode says, so its push scan still applies.',
   worktree:
     "Create or reuse this thread's linked worktree of repo at /workspace/worktrees/<repo> — one checkout per repo " +
     'for the thread. With branch, a new worktree starts on that branch, and an existing one on a different branch is ' +
@@ -1297,6 +1325,15 @@ export const createWorktreeTool: McpToolDefinition = {
     }
 
     if (existing?.shape === 'clone' && mode === 'worktree') {
+      // A scan-policy repo (isScanPolicyRepositoryName) is pinned to
+      // `worktree` mode precisely so its pushes go through a linked worktree
+      // sharing the canonical's `core.hooksPath` (#666-follow-up). Serving
+      // this leftover clone as-is, the way a non-scan-policy repo's leftover
+      // clone is served below, would hand back a checkout whose pushes are
+      // never scanned — refuse instead of reusing it.
+      if (isScanPolicyRepositoryName(repo)) {
+        return err(scanPolicyCloneLeftoverMessage(repo, existing.path));
+      }
       // A clone-shaped checkout left over from a clone-mode period is served
       // as-is (R10, P2-18) — worktree-mode creation below only knows how to
       // create or reuse a LINKED worktree at the primary position, and has

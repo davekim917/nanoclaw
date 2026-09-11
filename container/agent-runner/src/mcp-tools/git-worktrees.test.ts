@@ -14,7 +14,7 @@ import {
 } from 'fs';
 import { fileURLToPath } from 'url';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { dirname, join } from 'path';
 
 import { cloneRepoTool, createWorktreeTool, gitCommitTool, gitPushTool, openPrTool } from './git-worktrees';
 import { checkoutDirName } from './checkout-layout';
@@ -787,6 +787,34 @@ describe('topic-linked worktree topology', () => {
       return { startCommit };
     }
 
+    // container/agent-runner/src/mcp-tools/git-worktrees.test.ts ->
+    // (mcp-tools, src, agent-runner, container) -> repo root, so this stays
+    // correct regardless of the bun test process's own cwd.
+    const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..');
+
+    /**
+     * Installs a byte-for-byte copy of the real host-managed scan hook
+     * (scripts/wiki-pre-push-hook.sh + scripts/lib/secret-scan.sh, the same
+     * two sources src/managed-git-hooks.ts's refreshManagedGitHooks installs
+     * in production) as `canonicalPath`'s `core.hooksPath` — the #680
+     * review-round fixtures below use the real hook, not a stand-in
+     * directory, for the same reason the canonical always carries it in
+     * production: a leftover CLONE's own independent `.git/config` has no
+     * `core.hooksPath` at all (stageClone, src/modules/repository-workspaces/
+     * index.ts:872-902), so it never reaches this hook either way — this is
+     * what makes serving it unscanned a real gap, not merely a difference
+     * from a stand-in.
+     */
+    function installManagedScanHook(canonicalPath: string): string {
+      const hooksDir = join(dataDir, 'managed-git-hooks', 'scan');
+      mkdirSync(hooksDir, { recursive: true });
+      writeFileSync(join(hooksDir, 'nanoclaw-secret-patterns.sh'), readFileSync(join(REPO_ROOT, 'scripts', 'lib', 'secret-scan.sh')));
+      writeFileSync(join(hooksDir, 'pre-push'), readFileSync(join(REPO_ROOT, 'scripts', 'wiki-pre-push-hook.sh')));
+      chmodSync(join(hooksDir, 'pre-push'), 0o755);
+      git(canonicalPath, ['config', 'core.hooksPath', hooksDir]);
+      return hooksDir;
+    }
+
     function writeRepositoryActionResponse(inbound: any, requestId: string, payload: Record<string, unknown>): void {
       inbound
         .query(
@@ -1160,6 +1188,10 @@ describe('topic-linked worktree topology', () => {
       const cloneText = createWorktreeTool.tool.description ?? '';
       expect(cloneText).toContain('/workspace/worktrees/<repo>@<branch>');
       expect(cloneText).toContain('Any number of threads may hold the same branch at once');
+      // #680 review round 1, cosmetic: the clone-mode description must warn
+      // that a scan-policy repo (wiki) never actually gets the clone-mode
+      // behaviour just described.
+      expect(cloneText).toContain('always gets a linked worktree');
     });
 
     test('clone mode plus a wiki repo still gives a linked worktree, with the canonical hooksPath visible (#666 follow-up)', async () => {
@@ -1205,6 +1237,98 @@ describe('topic-linked worktree topology', () => {
           (row) => JSON.parse(row.content).action,
         );
         expect(actions).not.toContain('repository_checkout');
+      } finally {
+        closeSessionDb();
+      }
+    });
+
+    test('a leftover wiki CLONE at the primary position is refused in both worktree and clone mode, and git_commit/git_push refuse too (#680 review round 1)', async () => {
+      // The Opus review on #682 proved this end to end: a wiki CLONE left
+      // over from a clone-mode period, still parked at the primary
+      // position, was served as-is by create_worktree's reuse branch (the
+      // ok() a few lines above the new guard in the source) and pushed from
+      // by git_push -> worktreeForTool -> resolveCheckout, neither of which
+      // knew the difference between it and any other repo's leftover clone
+      // — and a token pushed through it reached the remote unscanned. Both
+      // paths must now refuse for a scan-policy repo
+      // (isScanPolicyRepositoryName), whatever NANOCLAW_CHECKOUT_MODE says
+      // (effectiveCheckoutModeFor already pins the repo to `worktree`
+      // regardless, so toggling the global setting below exercises the
+      // description-only difference, not a different guard).
+      const wikiCanonical = seedNamedCanonical('wiki');
+      installManagedScanHook(wikiCanonical);
+      const remoteRefsBefore = git(remote, ['for-each-ref', '--format=%(refname) %(objectname)']);
+
+      const worktree = join(firstTopic, 'wiki');
+      createHostClone(remote, worktree, { repo: 'wiki', branch: 'main', startedFrom: 'origin-head' });
+
+      const { outbound } = initTestSessionDb();
+      try {
+        for (const globalMode of ['worktree', 'clone'] as const) {
+          if (globalMode === 'clone') process.env.NANOCLAW_CHECKOUT_MODE = 'clone';
+          else delete process.env.NANOCLAW_CHECKOUT_MODE;
+
+          const created = await createWorktreeTool.handler({ repo: 'wiki' });
+          expect(created.isError).toBe(true);
+          expect(created.content[0].text).toContain('left over from a clone-mode period');
+          expect(created.content[0].text).toContain('not secret-scanned on push');
+        }
+
+        // Still a clone (its own independent .git directory) at the primary
+        // path — refusing it never touched or moved it.
+        expect(lstatSync(join(worktree, '.git')).isDirectory()).toBe(true);
+
+        const committed = await gitCommitTool.handler({ repo: 'wiki', message: 'should never land' });
+        expect(committed.isError).toBe(true);
+
+        const pushed = await gitPushTool.handler({ repo: 'wiki' });
+        expect(pushed.isError).toBe(true);
+
+        // No repository_checkout host round-trip was ever requested, in
+        // either mode — the refusal never falls through to createCloneWorktree.
+        const actions = (outbound.query('SELECT content FROM messages_out').all() as { content: string }[]).map(
+          (row) => JSON.parse(row.content).action,
+        );
+        expect(actions).not.toContain('repository_checkout');
+
+        // Nothing local moved (git_commit refused before its add/commit ever
+        // ran) and nothing reached the remote either.
+        expect(git(worktree, ['status', '--porcelain'])).toBe('');
+        expect(git(remote, ['for-each-ref', '--format=%(refname) %(objectname)'])).toBe(remoteRefsBefore);
+      } finally {
+        closeSessionDb();
+      }
+    });
+
+    test('a leftover wiki@<branch> CLONE is refused the same way, and git_commit/git_push refuse for that branch too', async () => {
+      const wikiCanonical = seedNamedCanonical('wiki');
+      installManagedScanHook(wikiCanonical);
+      const remoteRefsBefore = git(remote, ['for-each-ref', '--format=%(refname) %(objectname)']);
+
+      const branch = 'topic-feature';
+      const branchWorktree = join(firstTopic, checkoutDirName('wiki', branch));
+      createHostClone(remote, branchWorktree, { repo: 'wiki', branch, startedFrom: 'origin-head' });
+
+      const { outbound } = initTestSessionDb();
+      try {
+        const created = await createWorktreeTool.handler({ repo: 'wiki', branch });
+        expect(created.isError).toBe(true);
+        expect(created.content[0].text).toContain('left over from a clone-mode period');
+        expect(created.content[0].text).toContain('not secret-scanned on push');
+
+        const committed = await gitCommitTool.handler({ repo: 'wiki', branch, message: 'should never land' });
+        expect(committed.isError).toBe(true);
+
+        const pushed = await gitPushTool.handler({ repo: 'wiki', branch });
+        expect(pushed.isError).toBe(true);
+
+        const actions = (outbound.query('SELECT content FROM messages_out').all() as { content: string }[]).map(
+          (row) => JSON.parse(row.content).action,
+        );
+        expect(actions).not.toContain('repository_checkout');
+
+        expect(git(branchWorktree, ['status', '--porcelain'])).toBe('');
+        expect(git(remote, ['for-each-ref', '--format=%(refname) %(objectname)'])).toBe(remoteRefsBefore);
       } finally {
         closeSessionDb();
       }
