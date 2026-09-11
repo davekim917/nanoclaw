@@ -7,9 +7,9 @@
  * Read from `process.env` at first use, never at import: main.ts loads `.env`
  * into process.env inside main() (`loadEnvIntoProcess`, src/main.ts:226, called
  * at :602), after every module has been imported, so an import-time read would
- * miss a value set only in `.env`. The repository-workspaces module resolves it
- * from an `onHostStart` callback, so a refusal WARNs once at host start. The
- * value is then fixed for the process: changing it takes a restart.
+ * miss a value set only in `.env`. It is resolved at first use (the first
+ * spawn), which WARNs once for a refused value, and is then fixed for the
+ * process: changing it takes a restart.
  */
 import { containerRunsAsHostUser } from './github-token-file.js';
 import { log } from './log.js';

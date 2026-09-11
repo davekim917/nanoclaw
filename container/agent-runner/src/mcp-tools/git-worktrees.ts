@@ -703,6 +703,14 @@ interface ResolvedCheckout {
  */
 class CheckoutNotFoundError extends Error {}
 
+/**
+ * A clone-shaped checkout that exists but may not be served: an R3 mismatch,
+ * a detached HEAD, unreadable metadata, or an origin that drifted from the pin.
+ * In worktree mode this is the only resolution failure `create_worktree` stops
+ * on; every other one keeps today's linked-worktree handling.
+ */
+class CloneCheckoutRefusedError extends Error {}
+
 function validateCloneCandidate(
   context: RepositoryContext,
   checkoutPath: string,
@@ -756,10 +764,10 @@ function validateLinkedCandidate(
     if (current !== branch) {
       throw new CheckoutNotFoundError(`No checkout exists yet for ${context.repo} on branch '${branch}'`);
     }
-  } else if (!current) {
-    throw new Error(`Worktree at ${checkoutPath} is on a detached HEAD and was left untouched`);
   }
-  return { path: checkoutPath, dirName, shape: 'linked', branch: current || branch! };
+  // A detached legacy checkout serves branchless tools as it always has, with
+  // '' as its branch; git_push and open_pr refuse a detached HEAD themselves.
+  return { path: checkoutPath, dirName, shape: 'linked', branch: current || branch || '' };
 }
 
 function validateCandidate(
@@ -774,7 +782,14 @@ function validateCandidate(
     );
   }
   const shape = checkoutShapeAt(checkoutPath);
-  if (shape === 'clone') return validateCloneCandidate(context, checkoutPath, dirName, branch);
+  if (shape === 'clone') {
+    try {
+      return validateCloneCandidate(context, checkoutPath, dirName, branch);
+    } catch (error) {
+      if (error instanceof CheckoutNotFoundError) throw error;
+      throw new CloneCheckoutRefusedError(error instanceof Error ? error.message : String(error), { cause: error });
+    }
+  }
   if (shape === 'linked') return validateLinkedCandidate(context, checkoutPath, dirName, branch);
   throw new Error(`Checkout at ${checkoutPath} has unrecognized Git metadata and was left untouched`);
 }
@@ -1180,14 +1195,19 @@ export const createWorktreeTool: McpToolDefinition = {
     // mismatch, an origin-pin drift) is refused right here rather than
     // silently falling through to a mode-specific creation path, which would
     // ignore it and act on an unrelated path or an unrelated host action
-    // (R3, P2-7). Only a clean "nothing here yet" falls through.
+    // (R3, P2-7). Only a clean "nothing here yet" falls through. In worktree
+    // mode only a clone's refusal stops here: a linked, empty or unrecognized
+    // primary keeps today's handling in createLinkedWorktree, which validates a
+    // linked checkout and recovers one a crash left as an empty directory.
     let existing: ResolvedCheckout | null = null;
     try {
       existing = resolveCheckout(context, branch ?? null);
     } catch (error) {
-      if (!(error instanceof CheckoutNotFoundError)) {
-        return err(error instanceof Error ? error.message : String(error));
-      }
+      const refused =
+        checkoutMode() === 'clone'
+          ? !(error instanceof CheckoutNotFoundError)
+          : error instanceof CloneCheckoutRefusedError;
+      if (refused) return err(error instanceof Error ? error.message : String(error));
     }
 
     if (existing?.shape === 'clone' && checkoutMode() === 'worktree') {

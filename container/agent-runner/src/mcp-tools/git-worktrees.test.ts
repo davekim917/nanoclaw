@@ -591,6 +591,28 @@ describe('topic-linked worktree topology', () => {
     expect(response.content[0].text).toContain('detached HEAD');
   });
 
+  // Worktree mode (the default) keeps today's handling of a legacy linked
+  // checkout: branchless tools still work on a detached HEAD, and a checkout
+  // left as an empty directory by a crash is recovered.
+  test('branchless git_commit still works on a detached linked checkout', async () => {
+    expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    const worktree = join(firstTopic, 'proj');
+    git(worktree, ['checkout', '-q', '--detach']);
+    writeFileSync(join(worktree, 'detached.txt'), 'detached\n');
+    const response = await gitCommitTool.handler({ repo: 'proj', message: 'detached work' });
+    expect(response.isError).toBeFalsy();
+    expect(git(worktree, ['log', '-1', '--format=%s'])).toBe('detached work');
+  });
+
+  test('a bare create_worktree still recovers a linked checkout left as an empty directory', async () => {
+    expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    const worktree = join(firstTopic, 'proj');
+    for (const name of readdirSync(worktree)) rmSync(join(worktree, name), { recursive: true, force: true });
+    const response = await createWorktreeTool.handler({ repo: 'proj' });
+    expect(response.isError).toBeFalsy();
+    expect(existsSync(join(worktree, '.git'))).toBe(true);
+  });
+
   test('a sibling committing under the gate cannot smuggle that commit into the push', async () => {
     // The gate runs outside the repository lock, and same-topic siblings share
     // this worktree, so the checkout can move after the verdict. The push names

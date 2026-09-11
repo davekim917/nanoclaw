@@ -25,7 +25,6 @@ import {
 import { registerDeliveryAction, type DeliveryActionResult } from '../../delivery.js';
 import { containerRunsAsHostUser } from '../../github-token-file.js';
 import { unguarded } from '../../guard/index.js';
-import { onHostStart } from '../../host-lifecycle.js';
 import { log } from '../../log.js';
 import { resolveStoragePolicy } from '../../storage-manager.js';
 import { REPOSITORY_REQUEST_ID_PATTERN, runRepositoryActionDetached } from './job-runner.js';
@@ -1896,9 +1895,3 @@ registerDeliveryAction(
     "thread-scoped host clone of the workgroup canonical into the requester's own topic; host-local, no network or ambient credentials",
   ),
 );
-
-// Resolve NANOCLAW_CHECKOUT_MODE once main() has loaded `.env`, so a refused
-// `clone` WARNs at host start rather than at the first spawn (checkout-mode.ts).
-onHostStart(function checkoutModeHostStart() {
-  effectiveCheckoutMode();
-});

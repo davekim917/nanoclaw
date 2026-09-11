@@ -167,7 +167,8 @@ With `NANOCLAW_DEPENDENCY_CACHE=apply`, each package dir whose lockfile has a
 verified cache entry holding every package npm would install on this platform
 gets a shared read-only `node_modules` farm; any other gets none, and `npm ci`
 makes a private copy. `clone` needs containers that run as the host uid and is
-refused, with a WARN at host start, otherwise. Resolution is shape-aware in
+refused, with a WARN when first
+used, otherwise. Resolution is shape-aware in
 both modes, so switching back to `worktree` strands no clone. Worktree cleanup
 collects an idle clone only after proving every local branch, HEAD and the
 stash already on the remote.
