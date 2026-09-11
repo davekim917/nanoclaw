@@ -406,6 +406,16 @@ describe('centralTransaction closures await only DB work', () => {
     expect(dbOnlyAwaits.every((a) => !a.forbidden)).toBe(true);
   });
 
+  // This builds a full ts.Program over transactionCallFiles() (dozens of files, full
+  // type checking) inside the test body, not at collection time like the `every
+  // .transaction( receiver` describe block above. Comfortably fast normally, but
+  // `--coverage`'s V8 instrumentation overhead applies to every statement executed
+  // process-wide — including this one, even though transaction-closures.test.ts
+  // itself matches no risk:high glob — and pushed it past the 5000ms default in CI
+  // (PR #662). No explicit per-test timeout here: vitest.config.ts's
+  // COVERAGE_TIMEOUT_MULTIPLIER scales the GLOBAL default under --coverage instead
+  // (a fixed per-test override would ignore that scaling and need updating by hand
+  // every time the multiplier does).
   it('no production centralTransaction closure awaits a forbidden subsystem', () => {
     const offenders = awaitedCalleesInCentralTransactions(transactionCallFiles())
       // `src/db/drivers/**` and `src/db/testing/**` ARE the driver and its
@@ -575,6 +585,12 @@ describe('nothing called from inside a centralTransaction opens another one', ()
     expect(found.map((c) => c.callee)).toEqual(['opensItsOwnTransaction']);
   });
 
+  // Same reason as the sibling test above (`no production centralTransaction closure
+  // awaits a forbidden subsystem`): a full ts.Program over centralTransactionFiles()
+  // built inside the test body, slow enough under `--coverage`'s V8 instrumentation
+  // overhead to miss the default timeout in CI (PR #662). No explicit per-test
+  // timeout — vitest.config.ts's COVERAGE_TIMEOUT_MULTIPLIER scales the global
+  // default instead; see that sibling test's comment for why.
   it('no production centralTransaction closure calls a callee that opens its own', () => {
     const offenders = nestingCallsInCentralTransactions(centralTransactionFiles())
       .filter((c) => !isExcluded(c.file))

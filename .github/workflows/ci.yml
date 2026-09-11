@@ -13,6 +13,27 @@ on:
 permissions:
   contents: read
 
+# This repo is private on the GitHub Free plan: 2,000 Actions minutes/month, and
+# running out kills every job account-wide until the 1st (happened 2026-08-31).
+# A superseded run on the same PR is minutes spent proving something an already-newer
+# push made moot, so cancel it instead of letting it finish. Runs on `main` are never
+# cancelled — a push there is the merge itself, not a draft in progress.
+#
+# Safe against merge-check misreading a cancelled run as belonging to the CURRENT
+# head: `merge-check`'s per-head CI check (container/skills/pr-review-loop/scripts/
+# codex-review.sh, the `ci_verdict()` function — cited by name, not a line number:
+# #664 is expected to rewrite this file) queries `actions/runs?head_sha=$1`, where
+# `$1` is the exact head SHA `merge-check` was asked about — so a run for an OLDER,
+# superseded head_sha is never even fetched for a newer head's check, cancelled or
+# not. Within one head_sha it also keeps only the newest run per workflow name
+# (`group_by(.name) | map(max_by(...))`), so a rerun's stale failed attempt can't
+# outrank the fresh one either. Two runs only ever share a head_sha by re-running the
+# exact same push, which cancel-in-progress does not do (it cancels a DIFFERENT,
+# older SHA's run, never re-triggers the current one).
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # Two jobs, run in parallel, both blocking. The split is purely about
 # legibility: `correctness` red means the code is broken, `bookkeeping` red
 # means a committed manifest is stale and needs regenerating. When both lived in
@@ -65,9 +86,32 @@ jobs:
         run: pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
 
       # Everything except the three drift tests, which belong to `bookkeeping`.
-      # See DRIFT_TESTS in vitest.config.ts.
+      # See DRIFT_TESTS in vitest.config.ts. ONE step, not a plain run followed
+      # by a second `--coverage` run: this repo's Actions-minutes budget is
+      # tight (see the concurrency block above), and a second full
+      # correctness-lane run to add coverage would roughly double this job's
+      # minutes on every push. `--coverage` runs the exact same tests, not a
+      # smaller/faster set, so this step's own duration is the honest cost.
+      #
+      # coverage-v8 starts V8's precise/detailed coverage profiler for the
+      # WHOLE worker regardless of vitest.config.ts's `coverage.include` (see
+      # that file's own comment, and scripts/check-risk-coverage.ts's file
+      # header) — the CPU overhead is global to the process, not confined to
+      # risk:high files. That overhead once turned an unrelated, CPU-heavy
+      # TS-compiler test's normal 5.1s into 18.1s, past vitest's 5000ms
+      # default testTimeout, and red "correctness" for a reason that had
+      # nothing to do with the code under test (PR #662). Fixed generically,
+      # not per-test: vitest.config.ts's COVERAGE_TIMEOUT_MULTIPLIER scales
+      # `testTimeout`/`hookTimeout` under `--coverage` (4x — sized to the
+      # 18.1s case, not the 3x that would only reach 15s), and
+      # src/test-timeout-scale.ts's `scaledTimeout()` gives the same
+      # multiplier to the handful of tests with their own explicit timeout
+      # (which vitest lets override `testTimeout` entirely, so they don't
+      # inherit that scaling on their own).
+      #
+      # Feeds scripts/check-risk-coverage.ts below.
       - name: Host tests
-        run: pnpm exec vitest run
+        run: pnpm exec vitest run --coverage
         env:
           VITEST_LANE: correctness
 
@@ -91,7 +135,67 @@ jobs:
         # hermeticity tripwire preload (issue #305). bunfig.toml would be the
         # natural home for it, but that file is a byte-for-byte upstream port
         # pinned by src/mailbox-seam-upstream.test.ts.
-        run: bun run test
+        #
+        # `--coverage`/`--coverage-reporter` are extra args after `bun run
+        # test`'s own `--`, not a bunfig.toml edit (see the pin note above).
+        # lcov feeds scripts/check-risk-coverage.ts; text keeps the per-file
+        # breakdown visible in this step's own log. The full agent-runner
+        # suite ran clean under `--coverage` in local verification (1709
+        # pass, 0 fail, no timeouts) with no equivalent to the host's
+        # CPU-heavy-test regression found, so this needed no timeout scaling
+        # of its own. Revisit if a bun-side test starts timing out under
+        # coverage the way transaction-closures.test.ts did on the host.
+        run: bun run test -- --coverage --coverage-reporter=lcov --coverage-reporter=text
+
+      # Feeds scripts/check-risk-coverage.ts against the committed
+      # coverage-risk-baseline.json (docs/specs/risk-based-review/plan.md,
+      # "Tests on risky paths"): a per-file floor set by each risk file's OWN
+      # prior measurement, never a single fixed number like 85% (the plan's
+      # Non-goals rule that out), and raised only manually via --write, never
+      # automatically. Fails when a risk file drops more than 0.5 points
+      # below its baseline, or a new risk file has no tests at all — see
+      # that script's own file header for the complete classification model
+      # and fail-closed list (a missing baseline, a risk file missing from
+      # either report entirely, a missing container report). Runs from the
+      # repo root against both reports produced above, in the same job so no
+      # artifact hand-off is needed for the gate itself (the steps below are
+      # only for regenerating the baseline from a real CI run).
+      - name: Risk-path coverage ratchet
+        run: pnpm exec tsx scripts/check-risk-coverage.ts
+
+      # A SEPARATE, unconditional (`if: always()`) computation from the same
+      # two reports: writes a FRESH baseline candidate to a throwaway path,
+      # never the real coverage-risk-baseline.json the step above reads, so
+      # it can never collide with or accidentally satisfy that gate.
+      # `--bootstrap`: this step's only job is producing a candidate, even
+      # before any baseline is committed at all (true on this very PR).
+      #
+      # This is the sanctioned way to regenerate the baseline: download this
+      # artifact and commit the file it contains directly. NOT "download the
+      # raw reports and run `--write` locally" — the host suite runs on a
+      # memory-constrained, production-serving box that must never run the
+      # full vitest suite with coverage (docs/specs/risk-based-review/plan.md),
+      # and even a partial local run's `--write` would resolve
+      # coverage-summary.json's absolute paths against THIS box's checkout
+      # root, not the one that generated the report — see
+      # scripts/check-risk-coverage.ts's parseVitestJsonSummary and file
+      # header for the full mismatched-root hazard this sidesteps.
+      - name: Generate coverage baseline candidate
+        if: always()
+        run: >-
+          pnpm exec tsx scripts/check-risk-coverage.ts --write --bootstrap
+          --baseline /tmp/coverage-risk-baseline-candidate.json
+
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: risk-coverage-reports
+          path: |
+            coverage/coverage-summary.json
+            container/agent-runner/coverage/lcov.info
+            /tmp/coverage-risk-baseline-candidate.json
+          retention-days: 14
 
   bookkeeping:
     runs-on: ubuntu-latest
