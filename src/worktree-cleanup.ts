@@ -51,7 +51,7 @@ import {
   type TopicCheckout,
 } from './repository-workspaces.js';
 
-import { safeGitArgs, safeGitEnv } from './safe-git.js';
+import { safeGitArgs, safeGitEnv, safeGitFilterNames } from './safe-git.js';
 import { dirSizeBytes, sessionWasReclaimed } from './storage-manager.js';
 
 const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
@@ -134,14 +134,20 @@ interface SessionRow {
   idle_since: string;
 }
 
-function git(cwd: string, args: string[], env: NodeJS.ProcessEnv = {}): string | null {
+function git(
+  cwd: string,
+  args: string[],
+  env: NodeJS.ProcessEnv = {},
+  filterNames: readonly string[] = [],
+): string | null {
   try {
-    return execFileSync('git', safeGitArgs(args), {
+    return execFileSync('git', safeGitArgs(args, undefined, filterNames), {
       cwd,
       env: safeGitEnv(env),
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 30_000,
+      maxBuffer: 64 * 1024 * 1024,
     }).trim();
   } catch {
     return null;
@@ -160,6 +166,23 @@ function git(cwd: string, args: string[], env: NodeJS.ProcessEnv = {}): string |
  */
 function checkoutGitEnv(dir: string): NodeJS.ProcessEnv {
   return { GIT_CEILING_DIRECTORIES: path.dirname(path.resolve(dir)) };
+}
+
+/**
+ * Every filter the repository at `dir` defines in its effective config (local,
+ * includes, worktree), so safeGitArgs can neutralize each one by name; `null`
+ * when that config cannot be read. A clone's `.git` is container-writable
+ * (worktrees/ is mounted read-write, container-runner.ts:4386), and `status`
+ * runs a clean filter whenever it rehashes a file.
+ */
+function repositoryFilterNames(dir: string, env: NodeJS.ProcessEnv): string[] | null {
+  const gitDir = git(dir, ['rev-parse', '--absolute-git-dir'], env);
+  if (gitDir === null) return null;
+  try {
+    return safeGitFilterNames(gitDir, dir);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -759,17 +782,38 @@ function provenDisposable(dir: string, scope: 'head' | 'all'): { ok: boolean; re
   if (isWorktreeLocked(dir)) return { ok: false, reason: 'worktree-locked' };
   const env = checkoutGitEnv(dir);
 
-  const status = git(dir, ['status', '--porcelain=v1', '-z', '--untracked-files=all'], env);
+  // Host git runs inside a repository a container may have configured. Every
+  // host call has signature programs off (safe-git.ts BASE_CONFIG), and each
+  // filter this repository defines is neutralized by name. An embedded
+  // repository is refused before `status` could recurse into it: its own config
+  // is out of the overrides' reach, and its history out of this proof's.
+  // `--ignore-submodules=all` covers one added between the two commands.
+  // A repository whose config or index cannot be read has a status no host
+  // command can safely prove.
+  const filters = repositoryFilterNames(dir, env);
+  if (filters === null) return { ok: false, reason: 'status-unprovable' };
+  const modes = git(dir, ['ls-files', '-z', '--format=%(objectmode)'], env, filters);
+  if (modes === null) return { ok: false, reason: 'status-unprovable' };
+  if (modes.split('\0').includes('160000')) return { ok: false, reason: 'submodule' };
+
+  const status = git(
+    dir,
+    ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignore-submodules=all'],
+    env,
+    filters,
+  );
   if (status === null) return { ok: false, reason: 'status-unprovable' };
   if (status !== '') return { ok: false, reason: 'dirty' };
 
   // Scope 'all' names HEAD as well as every branch: a commit reachable only
   // from a detached HEAD is on no branch, and `--branches` alone reads it as
   // pushed (measured on this host). An unborn HEAD makes `log HEAD` fail, so
-  // such a repository reads as unprovable, never as clean.
+  // such a repository reads as unprovable, never as clean. And only origin's
+  // remote-tracking refs are evidence for a clone: another remote (a sibling
+  // clone, a local backup) can hold commits no real remote has.
   const unpushedArgs =
     scope === 'all'
-      ? ['log', '--branches', 'HEAD', '--not', '--remotes', '--oneline']
+      ? ['log', '--branches', 'HEAD', '--not', '--remotes=origin', '--oneline']
       : ['log', 'HEAD', '--not', '--remotes', '--oneline'];
   const unpushed = git(dir, unpushedArgs, env);
   if (unpushed === null) return { ok: false, reason: 'log-unprovable' };

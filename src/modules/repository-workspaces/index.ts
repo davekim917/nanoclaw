@@ -931,29 +931,17 @@ function stageClone(input: { canonical: string; staging: string; branch: string;
 
 /**
  * Package dirs of a checkout: every tracked `package-lock.json`'s directory,
- * outside node_modules. A directory reached through a symlink is skipped: an
- * existing checkout is container-writable, so such a link can point anywhere on
- * the host, and a farm linked there would be written outside the checkout.
+ * outside node_modules. Called only on a staging clone, which no container can
+ * reach (checkoutStagingRoot).
  */
 function checkoutPackageDirs(checkoutPath: string): string[] {
   const listed = git(checkoutPath, ['ls-files', '-z', '--', 'package-lock.json', '*/package-lock.json'], 60_000);
-  const realCheckout = fs.realpathSync(checkoutPath);
   const dirs = new Set<string>();
   for (const rel of listed.split('\0').filter(Boolean)) {
     if (rel.split('/').includes('node_modules')) continue;
-    const relDir = path.dirname(rel);
-    if (!resolvesTo(path.join(checkoutPath, relDir), path.join(realCheckout, relDir))) continue;
-    dirs.add(path.join(checkoutPath, relDir));
+    dirs.add(path.join(checkoutPath, path.dirname(rel)));
   }
   return [...dirs].sort();
-}
-
-function resolvesTo(candidate: string, expected: string): boolean {
-  try {
-    return fs.realpathSync(candidate) === expected;
-  } catch {
-    return false;
-  }
 }
 
 /**
@@ -1139,8 +1127,10 @@ export async function checkoutRepository(input: CheckoutRepositoryInput): Promis
         branch: served,
         created: false,
         shape: target.existing.shape === 'linked' ? 'linked' : 'clone',
-        // Existing: link any farm it is missing (§5.2 "Existing directory" step 3).
-        farmsLinked: linkCheckoutFarms(target.path, workgroupId, farms, dataDir),
+        // A published checkout is live and container-writable, so the host
+        // writes no farm into it (plan §5.2, rev 2.6): npm installs a private
+        // tree there, and the sweep converts it once the topic is idle.
+        farmsLinked: 0,
       };
     }
     return createCheckout({ workgroupId, repo, requestId, dataDir, canonical, pin, topicRoot, target, farms });

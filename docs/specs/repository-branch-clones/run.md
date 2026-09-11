@@ -307,3 +307,77 @@ Known risks carried to ship: stale fingerprint until host restart; chmod residua
   - **Container:** `bun test` over git-worktrees, checkout-layout and instruction-fragment-migration: 56/56. `tsc -p container/agent-runner/tsconfig.json` is clean.
   - **Host checks:** `tsc --noEmit` is clean, eslint `--quiet` on changed `src/` reports 0 errors, and prettier is clean.
   - **Ratchet:** growth accepted for `src/container-runner.ts` (+2: the mode env beside `NANOCLAW_WORK_UNIT_KEY`) and `CHANGELOG.md` (+2), leaving Δ 0.
+
+## 2026-09-11 — /team-review --implementation (Phase 2)
+
+- **Target:** approved plan rev 2.5 plus `git diff 04ae8a871..f8cd4c6a2` (27 files, +4989/−138).
+- **Lenses:** correctness, simplicity, plan fidelity, failure handling and verification quality. Also:
+  - security, because host code reads and writes agent-writable trees and runs host git over container-written config;
+  - state and rollback: the flag flip, a crash mid-checkout, lanes, claims and locks, and GC versus checkout.
+
+### Reviewers
+
+| Reviewer | Transport / model / effort | Status | Raw verdict |
+|---|---|---|---|
+| Codex (other family, contract reviewer) | `codex exec --ignore-user-config --model gpt-6-astra -c model_reasoning_effort="high" --ephemeral -s read-only --output-schema … --output-last-message …` from the worktree. The vendored prompt, plan, recorded deviations and diff went on stdin (345,862 bytes). Timeout 3600000. | `completed` in 274 s. Header: gpt-6-astra / openai / high, which matches. | `needs-attention`, 4 findings → `must_fix` |
+| Fable 5.1 adversarial (same family, added coverage; named risk: data loss in clone GC, and host code acting in container-writable trees) | Agent worker-frontier, read-only | `completed` | `must_fix`, 1 finding |
+
+**Transport deviation:** `-s read-only` replaces `--yolo`. This session's permission classifier refuses `--yolo`. The host is not nested Docker, so the sandbox works and enforces no-mutation at the OS level.
+
+### Findings — lead verification
+
+- **CX1 (critical): host code execution through container-written git config in the disposability proof.**
+  - Verified: worktree cleanup's `git()` passed no filter names to `safeGitArgs` (`worktree-cleanup.ts:139`). `safe-git.ts` neutralizes only named filters (`:35-55`). A clone's `.git` is container-writable (`container-runner.ts:4386`).
+  - Reproduced in a scratch repo on git 2.43.0 with the exact overrides:
+    - a clean filter selected through `info/attributes` ran during `status`;
+    - `gpg.program` ran during `log`, with `log.showSignature=true` and a commit carrying a `gpgsig` header;
+    - an embedded repository's own filter ran through `status` recursion.
+  - Each is neutralized by, respectively, naming the filter, `log.showSignature=false`, and `--ignore-submodules=all`.
+  - **ACCEPTED, MUST-FIX.** FB1 (Fable reproduced the gpg path independently) is the same class and folded in.
+- **CX2 (high): `--remotes` evidence is agent-writable.**
+  - Verified: the scope-`all` proof subtracts every remote's refs (`worktree-cleanup.ts:770-775`). An agent can add remotes or rewrite remote-tracking refs after creation-time hygiene.
+  - The non-malicious route: a second remote pointing at a sibling clone or a local backup makes unpushed work look pushed. **ACCEPTED**, with a narrowed fix: only `origin`'s refs count (`--remotes=origin`).
+  - The residual: an agent that deliberately forges `refs/remotes/origin/*`, which refresh absorb also propagates. It affects only that agent's own commits, and they stay recoverable from the 30-day trash (`worktree-cleanup.ts:1148`). **RECORDED.** Re-raise if a trashed clone is found holding unpushed work, or before clone GC can reach work its own agent did not create.
+  - The reviewer's alternative, a host-protected proof of origin reachability, is out of Phase 2's scope.
+- **CX3 (high): reuse-time farm linking writes into a live, container-writable checkout.**
+  - Verified: on a failed exclusive mkdir, `linkPackageDir` removes a `.node_modules.nanoclaw-new` it did not create (`dependency-cache.ts:1582`; `linkTree`'s first act is `mkdirSync(dst)`, `:927`).
+  - **ACCEPTED, MUST-FIX.** Reuse now links nothing, and farms are linked only in host-only staging.
+  - This retires the lead's integration symlink guard, which is dead once no live tree is linked, and its test.
+  - Plan §5.2 "Existing directory" step 3 and P2-14 are corrected (rev 2.6).
+  - Not changed: `linkPackageDir`'s cleanup ownership. No caller links into a live tree any more. Re-raise before adding one.
+- **CX4 (medium): the `git_push` refresh never named the clone** (`git-worktrees.ts:1341`), so a clone's push never reached the canonical. **ACCEPTED, SHOULD-FIX** (functional, small).
+
+### Correction batch (rev 2.6), test-first
+
+- **Fixes:**
+  - **`safe-git.ts` `BASE_CONFIG`:** `log.showSignature=false`, and `gpg.program`, `gpg.ssh.program` and `gpg.x509.program` all set to `/bin/false`.
+  - **`provenDisposable` (`worktree-cleanup.ts`):**
+    - Every filter the repository's effective config defines is neutralized by name (`safeGitFilterNames`).
+    - An embedded repository (an index gitlink) refuses the checkout as `submodule` before `status` runs, and `status` carries `--ignore-submodules=all`.
+    - Scope `all` trusts only `--remotes=origin`.
+    - A config or index that cannot be read keeps the existing `status-unprovable` contract, which `storage-gc.test.ts` asserts.
+  - **`index.ts`:** reuse links no farm, and the `checkoutPackageDirs` guard is removed.
+  - **`git-worktrees.ts`:** `git_push` names the clone in its refresh.
+- **Tests:**
+  - New: `the disposability proof runs nothing a clone configures: filters, signature programs, or a submodule` (P2-21). Before the fix, all three sentinels were written.
+  - P2-12 gains `p212-sibling-remote`, which was collected before the fix, and `p212-submodule`.
+  - P2-14 asserts that reuse links nothing. Before the fix it linked one.
+  - P2-8 asserts that a clone push's refresh carries `checkout`. It fails against the committed push and passes with the fix.
+  - Removed: the integration symlink-farm test.
+- **Plan rev 2.6:** §5.2 "Existing directory" step 3, the §5.8 proof text and residual, P2-12, P2-14, and a new P2-21.
+
+### Fresh results (re-run once, after the batch)
+
+- **Host vitest,** over worktree-cleanup*, both repository-workspaces suites, safe-git, repository-migration, mailbox-seam, ratchet, storage-gc, storage-manager and dependency-cache: 20 files and 549 tests, 547 passed.
+  - The 2 failures: the storage-gc reason label, and the seam pin for the new `safeGitFilterNames` import. Both are fixed.
+  - The re-run of the affected files: 7 files, 203/203.
+- **Container:** `bun test` over git-worktrees, checkout-layout and instruction-fragment-migration: 56/56. `tsc -p container/agent-runner/tsconfig.json` is clean.
+- **Host checks:** `tsc --noEmit` is clean, eslint `--quiet` reports 0 errors, prettier is clean, and the ratchet is at Δ 0.
+
+**Review verdict: clear**, after one correction batch.
+- **Coverage:** other-family (Codex gpt-6-astra/high, completed) plus same-family adversarial (Fable).
+- **Residual risks carried to ship:**
+  - forged origin refs (above);
+  - check-then-use path races in container-writable trees, as with the existing sweep;
+  - same-thread spawns retry while a checkout runs;
+  - `linkPackageDir` cleanup ownership, which has no live-tree caller.

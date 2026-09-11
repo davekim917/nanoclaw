@@ -699,6 +699,38 @@ describe('branch clone checkouts', () => {
           git(dir, ['branch', '-f', 'feat', 'refs/remotes/origin/main']);
         },
       },
+      {
+        // Evidence only another local repository holds. A remote pointing at a
+        // sibling clone is not origin, so its refs prove nothing was pushed.
+        thread: 'p212-sibling-remote',
+        name: 'repo-a@feat',
+        branch: 'feat',
+        reason: 'unpushed',
+        arrange: (dir) => {
+          commitFile(dir, 'sibling.txt');
+          const sibling = path.join(state.dataDir, 'fixtures', 'p212-sibling');
+          fs.mkdirSync(path.dirname(sibling), { recursive: true });
+          execFileSync('git', ['clone', '-q', dir, sibling]);
+          git(dir, ['remote', 'add', 'sibling', sibling]);
+          git(dir, ['fetch', '-q', 'sibling']);
+        },
+      },
+      {
+        // A committed embedded repository: its history and config are out of
+        // the proof's reach, so the checkout is never collected.
+        thread: 'p212-submodule',
+        name: 'repo-a@feat',
+        branch: 'feat',
+        reason: 'submodule',
+        arrange: (dir) => {
+          const nested = path.join(dir, 'nested');
+          fs.mkdirSync(nested);
+          git(nested, ['init', '-q']);
+          commitFile(nested, 'inner.txt');
+          git(dir, ['add', 'nested']);
+          git(dir, ['commit', '-q', '-m', 'embed']);
+        },
+      },
     ];
     const refused = cases.map((spec) => {
       const fixture = cloneCheckout(canon, spec.thread, spec.name, spec.branch, spec.startedFrom);
@@ -745,6 +777,59 @@ describe('branch clone checkouts', () => {
     const trashedCopy = path.join(state.trashDir, `2-${path.basename(quarantined)}`);
     expect(fs.readFileSync(path.join(trashedCopy, 'README.md'), 'utf8')).toBe('base\n');
     expect(git(trashedCopy, ['symbolic-ref', '--short', 'HEAD'])).toBe('feat');
+  });
+
+  it('the disposability proof runs nothing a clone configures: filters, signature programs, or a submodule', () => {
+    // A clone's .git is container-writable (worktrees/ is mounted read-write,
+    // container-runner.ts:4386), and the proof runs host git inside it.
+    const canon = canonicalFixture('repo-a');
+    const sentinels = path.join(state.dataDir, 'fixtures', 'exec-sentinels');
+    fs.mkdirSync(sentinels, { recursive: true });
+    const script = (name: string): string => {
+      const file = path.join(sentinels, `${name}.sh`);
+      fs.writeFileSync(file, `#!/bin/sh\ntouch ${path.join(sentinels, name)}\ncat\n`, { mode: 0o755 });
+      return file;
+    };
+
+    // A clean filter selected by an attribute runs whenever status rehashes a file.
+    const filtered = cloneCheckout(canon, 'exec-filter', 'repo-a@feat', 'feat');
+    git(filtered.checkout, ['config', 'filter.evil.clean', script('filter')]);
+    fs.writeFileSync(path.join(filtered.checkout, '.git', 'info', 'attributes'), '* filter=evil\n');
+    fs.utimesSync(path.join(filtered.checkout, 'README.md'), OLD, OLD);
+
+    // log.showSignature makes `git log` run gpg.program on a signed commit.
+    const signed = cloneCheckout(canon, 'exec-gpg', 'repo-a@feat', 'feat');
+    git(signed.checkout, ['config', 'log.showSignature', 'true']);
+    git(signed.checkout, ['config', 'gpg.program', script('gpg')]);
+    const tree = git(signed.checkout, ['rev-parse', 'HEAD^{tree}']);
+    const parent = git(signed.checkout, ['rev-parse', 'HEAD']);
+    const commit = execFileSync('git', ['hash-object', '-t', 'commit', '-w', '--stdin'], {
+      cwd: signed.checkout,
+      encoding: 'utf8',
+      input:
+        `tree ${tree}\nparent ${parent}\nauthor a <a@b> 1 +0000\ncommitter a <a@b> 1 +0000\n` +
+        'gpgsig -----BEGIN PGP SIGNATURE-----\n \n -----END PGP SIGNATURE-----\n\nsigned\n',
+    }).trim();
+    git(signed.checkout, ['update-ref', 'refs/heads/feat', commit]);
+
+    // A committed embedded repository: status recurses into it and runs its own filter.
+    const embedding = cloneCheckout(canon, 'exec-submodule', 'repo-a@feat', 'feat');
+    const nested = path.join(embedding.checkout, 'nested');
+    fs.mkdirSync(nested);
+    git(nested, ['init', '-q']);
+    commitFile(nested, 'inner.txt');
+    git(nested, ['config', 'filter.inner.clean', script('submodule')]);
+    fs.writeFileSync(path.join(nested, '.git', 'info', 'attributes'), '* filter=inner\n');
+    git(embedding.checkout, ['add', 'nested']);
+    git(embedding.checkout, ['commit', '-q', '-m', 'embed']);
+    fs.utimesSync(path.join(nested, 'inner.txt'), OLD, OLD);
+
+    const verdicts = [filtered, signed, embedding].map((fixture) =>
+      disposability.proveCheckoutDisposable({ path: fixture.checkout, shape: 'clone' }),
+    );
+
+    expect(fs.readdirSync(sentinels).filter((name) => !name.endsWith('.sh'))).toEqual([]);
+    expect(verdicts.map((verdict) => verdict.reason)).toEqual(['clean-and-pushed', 'unpushed', 'submodule']);
   });
 
   it('orphan-topic GC enumerates through the lister, proves clones with scope all, and refuses unknown shapes', async () => {

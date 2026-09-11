@@ -847,7 +847,7 @@ describe('worktree-cleanup.ts contains no literal seam call, and the only contai
         'withHostRepositoryLock',
         'withRepositoryLifecycleClaims',
       ],
-      'src/safe-git.ts': ['safeGitArgs', 'safeGitEnv'],
+      'src/safe-git.ts': ['safeGitArgs', 'safeGitEnv', 'safeGitFilterNames'],
       'src/storage-manager.ts': ['dirSizeBytes', 'sessionWasReclaimed'],
     });
   });

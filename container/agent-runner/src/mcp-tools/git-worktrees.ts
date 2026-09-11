@@ -822,13 +822,16 @@ function contextForCheckout(context: RepositoryContext, resolved: ResolvedChecko
   };
 }
 
-function worktreeForTool(repo: string, branch?: string): { context: RepositoryContext } | { error: ToolResult } {
+function worktreeForTool(
+  repo: string,
+  branch?: string,
+): { context: RepositoryContext; checkout: ResolvedCheckout } | { error: ToolResult } {
   const branchArg = branch && branch.trim() ? branch.trim() : null;
   try {
     const context = contextFor(repo);
     const resolved = resolveCheckout(context, branchArg);
     log(`resolved ${repo}${branchArg ? `@${branchArg}` : ''} -> ${resolved.shape} at ${resolved.path}`);
-    return { context: contextForCheckout(context, resolved) };
+    return { context: contextForCheckout(context, resolved), checkout: resolved };
   } catch (error) {
     return { error: err(error instanceof Error ? error.message : String(error)) };
   }
@@ -1338,7 +1341,12 @@ export const gitPushTool: McpToolDefinition = {
         // tracking config the old form set is restored explicitly. Best effort:
         // it is a convenience, and the push has already landed.
         tryGitAt(worktree, ['branch', `--set-upstream-to=origin/${branch}`, branch]);
-        await emitRefresh(resolved.context);
+        // A clone records the push only in its own remote-tracking refs, so the
+        // refresh names it for the host to absorb them (plan §5.5).
+        await emitRefresh(
+          resolved.context,
+          resolved.checkout.shape === 'clone' ? resolved.checkout.dirName : undefined,
+        );
         return ok(
           `Pushed ${branch} at ${head.slice(0, 8)} to origin${args.force === true ? ' (force-with-lease)' : ''}. ` +
             `Pass branch=${branch} to open_pr so the PR is opened for this push, not for the checkout.`,

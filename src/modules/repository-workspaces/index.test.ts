@@ -2101,53 +2101,17 @@ describe('repository_checkout host action (plan §5.2, Phase 2)', { timeout: 60_
       fs.statSync(path.join(entryNm, '.package-lock.json')).ino,
     );
 
-    // Reuse relinks a farm the checkout lost, and leaves a present one alone.
+    // Reuse links nothing. A published checkout is live and container-writable,
+    // so the host writes no farm into it: a lost farm is reinstalled by npm and
+    // later converted by the sweep.
     fs.rmSync(path.join(clone, 'app', 'node_modules'), { recursive: true, force: true });
-    await expect(checkout(unit, null, root, 'proj', farms)).resolves.toMatchObject({ created: false, farmsLinked: 1 });
-    expect(sharesEntry()).toBe(true);
     await expect(checkout(unit, null, root, 'proj', farms)).resolves.toMatchObject({ created: false, farmsLinked: 0 });
-    expect(sharesEntry()).toBe(true);
+    expect(fs.existsSync(path.join(clone, 'app', 'node_modules'))).toBe(false);
 
     // With the cache flag off, a checkout shares nothing.
     const other = threadUnit('p2-14-off');
     await expect(checkout(other, null, root, 'proj', OFF)).resolves.toMatchObject({ created: true, farmsLinked: 0 });
     expect(fs.existsSync(path.join(topicWorktreesDir(other, root), 'proj', 'app', 'node_modules'))).toBe(false);
-  });
-
-  it('never links a farm into a package dir an existing checkout reaches through a symlink', async () => {
-    const canonical = networkCanonical(root);
-    const donor = path.join(root, 'donor', 'app');
-    writeNpmProject(donor, { tree: true });
-    pushToRemote(canonical, 'main', {
-      'app/package.json': fs.readFileSync(path.join(donor, 'package.json')),
-      'app/package-lock.json': fs.readFileSync(path.join(donor, 'package-lock.json')),
-    });
-    const pass = startDependencyCachePass({
-      mode: 'apply',
-      cacheRoot: path.join(root, DEPENDENCY_CACHE_DIRNAME),
-      now: Date.now(),
-      reclaimableBytes: () => 0,
-      fingerprint: () => FP,
-    });
-    expect(processPackageDir(pass, WG, donor)).toBe('adopted');
-    const unit = threadUnit('farm-symlink');
-    await expect(checkout(unit, null, root, 'proj', OFF)).resolves.toMatchObject({ created: true, farmsLinked: 0 });
-
-    // An existing checkout is container-writable: its agent swaps the package
-    // dir for a symlink to a host directory holding the same manifests, so the
-    // key matches the verified entry.
-    const hostDir = path.join(root, 'host-owned', 'app');
-    fs.mkdirSync(hostDir, { recursive: true });
-    for (const name of ['package.json', 'package-lock.json']) {
-      fs.copyFileSync(path.join(donor, name), path.join(hostDir, name));
-    }
-    const pkgDir = path.join(topicWorktreesDir(unit, root), 'proj', 'app');
-    fs.rmSync(pkgDir, { recursive: true, force: true });
-    fs.symlinkSync(hostDir, pkgDir);
-
-    const farms: CheckoutFarmPolicy = { mode: 'apply', fingerprint: () => FP };
-    await expect(checkout(unit, null, root, 'proj', farms)).resolves.toMatchObject({ created: false, farmsLinked: 0 });
-    expect(fs.existsSync(path.join(hostDir, 'node_modules'))).toBe(false);
   });
 
   it('a crash before publication leaves no enumerated checkout and a retry creates normally', async () => {

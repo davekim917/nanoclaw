@@ -990,6 +990,8 @@ describe('topic-linked worktree topology', () => {
     });
 
     test('git_commit, git_push, and open_pr act on the checkout selected by branch and default to the primary', async () => {
+      const { outbound } = initTestSessionDb();
+      delete process.env.NANOCLAW_REPOSITORY_ACTION_TRANSPORT; // record the host actions asserted below
       expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
       const primary = join(firstTopic, 'proj');
       const primaryBranch = git(primary, ['branch', '--show-current']);
@@ -1008,6 +1010,13 @@ describe('topic-linked worktree topology', () => {
       const altPush = await gitPushTool.handler({ repo: 'proj', branch: altBranch });
       expect(altPush.isError).toBeFalsy();
       expect(git(remote, ['show-ref', '--verify', `refs/heads/${altBranch}`])).toContain(altBranch);
+      // A clone's push refreshes the canonical FROM that clone (plan §5.5): its
+      // remote-tracking refs are the only place the push is recorded.
+      const refreshes = (): Array<Record<string, unknown>> =>
+        (outbound.query('SELECT content FROM messages_out').all() as { content: string }[])
+          .map((row) => JSON.parse(row.content) as Record<string, unknown>)
+          .filter((content) => content.action === 'repository_refresh');
+      expect(refreshes().at(-1)).toMatchObject({ checkout: dirName });
 
       writeFileSync(join(primary, 'primary.txt'), 'primary\n');
       const primaryCommit = await gitCommitTool.handler({ repo: 'proj', message: 'primary work' });

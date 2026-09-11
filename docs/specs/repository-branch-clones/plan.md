@@ -272,7 +272,9 @@ once after 5 s.
 
 1. Validate its shape through `resolveCheckout` rules (§5.3).
 2. Enforce R3.
-3. Link any missing dependency farms (§5.7.4).
+3. Link nothing (build rev 2.6). A published checkout is live and container-writable, so the host
+   writes no farm into it; a lost farm is reinstalled by npm and converted by the sweep once the
+   topic is idle.
 4. Respond `{ok, path, branch, created:false}`.
 
 **New directory: the host fully initializes it, then publishes (M5).**
@@ -572,7 +574,7 @@ days past `sealedAt` or its last link. Quarantined entries go after 7 days.
   (`storage-manager.ts:651-663`).
 - **`proveCheckoutDisposable(checkout)` (M2)** is the one disposability primitive:
   - `clone` → `provenDisposable(path,'all')`, which also refuses any local branch whose commits are
-    not in `--remotes`;
+    not in origin's remote-tracking refs (`--remotes=origin`, build rev 2.6);
   - `linked` → `provenDisposable(path,'head')`, as today;
   - `unknown` → refuse, fail-closed.
 
@@ -587,6 +589,12 @@ days past `sealedAt` or its last link. Quarantined entries go after 7 days.
 - **Why the `--remotes` proof holds for clones.** Remote-ref hygiene (§5.2 step 2) guarantees a
   clone's `refs/remotes/origin/*` never contains canonical local branches. Local-only clones have
   no remote refs, so any branch with commits is "unpushed" and is never collected.
+  **Build rev 2.6:** hygiene holds at creation only, because an agent can add remotes or rewrite
+  remote-tracking refs later. So the proof trusts only `origin`'s refs and refuses a checkout that
+  holds an embedded repository (`submodule`). It also runs nothing the repository configures:
+  signature programs are off for every host git call, and every filter the repository defines is
+  neutralized by name. An agent that deliberately forges `refs/remotes/origin/*` can still make its
+  own unpushed commits look pushed; the trash keeps them for 30 days.
 - **No alternates.** Clones never use `objects/info/alternates` (`git clone` without `--shared`),
   so canonical GC cannot break them. This is asserted in §9.
 
@@ -781,15 +789,16 @@ Host tests go in `src/modules/repository-workspaces/index.test.ts`, `job-runner`
 | P2-9 | `refresh absorbs a clone's origin refs fast-forward only` | After a push, canonical `origin/B` equals the pushed commit. A clone with a stale `origin/B` cannot rewind it. A path outside the caller's topic is rejected. |
 | P2-10 | `worktree mode creates linked worktrees exactly as today` | The existing linked-worktree creation tests pass unchanged under `NANOCLAW_CHECKOUT_MODE=worktree`. |
 | P2-11 | `legacy linked checkouts are reused in clone mode and transfer still works for them` | The existing transfer tests pass with clone mode on. |
-| P2-12 | `clone disposability refuses dirty, unpushed, stashed, non-HEAD unpushed branches, and copied legacy branches` | Fixtures: dirty tree; unpushed HEAD; an unpushed non-HEAD local branch; a copied canonical `refs/heads/B` absent from the remote; a stash. All are refused with their reason, in both the clone branch and the orphan-topic loop. Only a clean pushed clone is trashed. |
+| P2-12 | `clone disposability refuses dirty, unpushed, stashed, non-HEAD unpushed branches, and copied legacy branches` | Fixtures: dirty tree; unpushed HEAD; an unpushed non-HEAD local branch; a copied canonical `refs/heads/B` absent from the remote; a stash. All are refused with their reason, in both the clone branch and the orphan-topic loop. Only a clean pushed clone is trashed. An unpushed commit only a sibling remote holds is refused (`unpushed`), and so is a checkout holding an embedded repository (`submodule`) (rev 2.6). |
 | P2-13 | `orphan-topic GC enumerates through the lister, proves clones with scope all, and refuses unknown shapes` | Spies show `listTopicCheckouts` and `proveCheckoutDisposable` as the only enumerator and prover. An `unknown` entry refuses the topic, and `.staging` does not. |
-| P2-14 | `repository_checkout links node_modules farms for package dirs with a verified entry` | After a new checkout and after reuse, `<pkg>/node_modules` files share inodes with the entry. |
+| P2-14 | `repository_checkout links node_modules farms for package dirs with a verified entry` | After a new checkout, `<pkg>/node_modules` files share inodes with the entry. Reuse links nothing (rev 2.6). |
 | P2-15 | `create_worktree waits for the host response, retries a retryable error once, and times out cleanly` | A response at 1 s resolves the tool. A retryable response is retried once. No response within the injected timeout returns an error naming the request id. |
 | P2-16 | `a crash before publication leaves no enumerated checkout and a retry creates normally` | With the host job killed after staging is populated: `listTopicCheckouts` returns nothing for it, a later pass removes the stale staging, and a retry creates the checkout. |
 | P2-17 | `local-only canonicals: clone has no origin, starts from preserved refs, skips fetch and refresh, refuses push/PR` | A new branch starts at canonical `HEAD^{commit}`, an existing canonical `refs/heads/B` is preserved exactly, reuse succeeds, and push and open_pr are refused. |
 | P2-18 | `clones stay usable after rollback to worktree mode` | Create a primary and a secondary clone in clone mode, with dirty bytes and a stash. Switch to worktree mode. `create_worktree` (no branch and branch B), `git_commit`, `git_push`, and `open_pr` succeed on them, and the dirty bytes, refs, and stash are preserved. |
 | P2-19 | `a host completion after the tool timed out is served on the next call` | The tool times out and the host finishes later. The next `create_worktree` returns `created:false` with correct HEAD, index, and files. |
 | P2-20 | `a checkout is not delayed by an unrelated repository job` | With a held global-lane publish job, a checkout on another work unit's lane completes, asserted by ordering rather than timing. |
+| P2-21 | `the disposability proof runs nothing a clone configures: filters, signature programs, or a submodule` | Rev 2.6. Clones configure a clean filter selected by an attribute, `log.showSignature` with `gpg.program` on a signed commit, and an embedded repository with its own filter. The proof runs and no program writes its sentinel. The verdicts are `clean-and-pushed`, `unpushed` and `submodule`. |
 
 ## 10. Risks and open questions
 
