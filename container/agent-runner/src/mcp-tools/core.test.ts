@@ -210,6 +210,41 @@ describe('send_message MCP tool — final-output envelope normalization', () => 
     expect(getUndeliveredMessages()).toHaveLength(0);
   });
 
+  it('rejects a nested, un-addressed <message> inside the envelope instead of guessing the outer boundary', async () => {
+    // Pins the deliberate choice, not just an artifact of scanning for the
+    // first closing tag: the inner `<message>` (no `to=`, so it isn't a
+    // routing envelope on its own) terminates the scan, leaving
+    // " for detail</message>" as trailing non-whitespace content — the same
+    // "not one complete envelope" rejection as an unclosed or doubly-closed
+    // envelope, never a silent unwrap past the inner tag to the outer one.
+    const result = await sendMessage.handler({
+      to: 'peer',
+      text: '<message to="here">See <message>hi</message> for detail</message>',
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('one complete');
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
+  it('normalizes a legitimate 1MB body instead of failing closed the way a backtracking regex would', async () => {
+    // Regression: a tempered-token regex (`(?:(?!<\/message>)[\s\S])*`)
+    // re-runs its lookahead at every character, and under Bun/JSC that
+    // silently fails to match on legitimate bodies at roughly 688KB+ — no
+    // error, just treated as not a routing envelope. The indexOf-based scan
+    // has no such cliff.
+    const bigBody = 'x'.repeat(1024 * 1024);
+    const result = await sendMessage.handler({
+      to: 'peer',
+      text: `<message to="here">${bigBody}</message>`,
+    });
+
+    expect(result.isError).toBeUndefined();
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe(bigBody);
+  });
+
   it('applies the same normalization to edit_message text', async () => {
     await sendMessage.handler({ to: 'peer', text: 'original reply' });
     const [original] = getUndeliveredMessages();

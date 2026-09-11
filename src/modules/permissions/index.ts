@@ -210,11 +210,15 @@ async function handleUnknownSender(
   // makes decline_notify hold must card, not decline behind the guard's back.
   if (decision.effect === 'deny' && isDeclineNotify) {
     // The decline copy assumes a 1:1 DM surface, so this needs POSITIVE
-    // evidence of one — `mg.is_group !== 1` is not that. An adapter that
-    // reports neither isDM nor isGroup (older chat-sdk plugin builds;
-    // `adapterIsDM` returns undefined) gets is_group = 0 from the router's
-    // auto-create default, so 0 can mean "uncertain", not "confirmed DM"
-    // — the same reason the user_dms cache requires `event.isDM === true`
+    // evidence of one — `mg.is_group !== 1` is not that. The router's
+    // auto-create default (router.ts:599,608) now resolves an adapter that
+    // reports NEITHER isDM nor isGroup to is_group = 1 (group/mention-safe),
+    // so a row created after that fix reading is_group = 0 does mean an
+    // adapter explicitly said DM. But a row auto-created BEFORE the fix can
+    // still carry a stale is_group = 0 from back when "neither reported"
+    // defaulted to DM — so `mg.is_group` alone still isn't proof for a row
+    // of unknown vintage, and this event's own live signal is required —
+    // the same reason the user_dms cache requires `event.isDM === true`
     // (src/router.ts, the 2a branch). Without the evidence the drop above
     // stands and nothing is sent: silence beats posting "I'm <owner>'s
     // personal agent" into a channel.

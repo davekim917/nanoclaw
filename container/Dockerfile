@@ -370,7 +370,12 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 # here unchanged. Swap it in, checked against a SHA256 pinned in this
 # Dockerfile (same convention as the hex CLI above) rather than a sidecar
 # fetched from the same release — a sidecar proves nothing if the release
-# asset itself was replaced.
+# asset itself was replaced. Regenerated automatically on a GWS_VERSION bump
+# by the container-updates flow (container/update-sources.json's
+# google-workspace-cli entry); to do it by hand, read the canonical .sha256
+# sidecar files at:
+#   curl -sL https://github.com/googleworkspace/cli/releases/download/v$V/google-workspace-cli-x86_64-unknown-linux-musl.tar.gz.sha256
+#   curl -sL https://github.com/googleworkspace/cli/releases/download/v$V/google-workspace-cli-aarch64-unknown-linux-musl.tar.gz.sha256
 # Drop this step once the base image ships glibc >= 2.39.
 ARG GWS_SHA256_amd64=4db473dde4b1ab872e4ff35d769b0d4af1f1a6441a605e79d5cf8ada9c87e920
 ARG GWS_SHA256_arm64=e700fe63524932b10ec2130b47ece90aa850e66005fe52ccfc4cf8767bf9919a
