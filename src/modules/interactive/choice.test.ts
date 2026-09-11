@@ -17,7 +17,7 @@ import {
   teardownChannelAdapters,
 } from '../../channels/channel-registry.js';
 import { wakeContainer } from '../../container-runner.js';
-import { initTestDb, closeDb, runMigrations, getRawDb } from '../../db/index.js';
+import { closeDb, getDb, initMigratedTestDb } from '../../db/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { createMessagingGroup, createMessagingGroupAgent } from '../../db/messaging-groups.js';
 import {
@@ -186,8 +186,7 @@ beforeEach(async () => {
   vi.clearAllMocks();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  await initTestDb();
-  runMigrations(getRawDb());
+  await initMigratedTestDb();
   await initChannelAdapters(() => ({
     onInbound: () => {},
     onInboundEvent: () => {},
@@ -404,7 +403,7 @@ describe('request_choice click authority and resolution', () => {
   it('with no live session to take it, resolves without delivery and marks the card no longer active', async () => {
     // The card's channel is not wired, so the only candidate is the requester — which has ended.
     const row = (await ask(session))!;
-    getRawDb().prepare('UPDATE sessions SET status = ? WHERE id = ?').run('closed', 'sess-1');
+    await getDb().run('UPDATE sessions SET status = ? WHERE id = ?', 'closed', 'sess-1');
 
     expect(await click(row.approval_id, 'ship-a', ADMIN)).toBe(true);
 
@@ -457,10 +456,11 @@ describe('where the answer lands', () => {
     await click(row.approval_id, 'hold', ADMIN);
 
     expect(notes().map((n) => n.sessionId)).toEqual(['sess-1']);
-    const count = getRawDb().prepare('SELECT COUNT(*) AS n FROM sessions WHERE agent_group_id = ?').get('ag-1') as {
-      n: number;
-    };
-    expect(count.n).toBe(2); // no session was created for the click
+    const count = await getDb().get<{ n: number }>(
+      'SELECT COUNT(*) AS n FROM sessions WHERE agent_group_id = ?',
+      'ag-1',
+    );
+    expect(count?.n).toBe(2); // no session was created for the click
   });
 
   it('a card in a channel the agent is not wired to falls back to the requester', async () => {
