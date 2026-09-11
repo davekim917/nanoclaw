@@ -19,7 +19,12 @@
 #   in the window — from a history walk. `sweep` exists to catch exactly what a
 #   push-triggered job never runs for: a skip-CI push, or one that landed during a
 #   GitHub Actions outage.
-# Neither job runs PR code. `provenance` checks out only the commit its push already
+# A third job, `gate-audit`, runs on the same pushes and asks a different question: not
+# whether main moved through a merged PR, but whether that PR had the evidence the merge
+# gate requires, judged as of its merge (codex-review.sh audit, via
+# .github/scripts/gate-audit.sh). It writes one thing, a `gate-bypass` issue per flagged
+# PR, and blocks nothing.
+# None of the three runs PR code. `provenance` checks out only the commit its push already
 # landed; `sweep` checks out whatever ref triggered it — main on the daily schedule,
 # or another ref if `workflow_dispatch` is run from one — just far enough to have its
 # own script. It queries history through the Activity API, not `git log`.
@@ -52,7 +57,7 @@ on:
 
 # The default GITHUB_TOKEN for this repo is still `write`, not read-only, so every job
 # below declares its own minimal `permissions:` rather than relying on a workflow-level
-# default — both jobs only ever read.
+# default. `provenance` and `sweep` only ever read; `gate-audit` also writes issues.
 permissions: {}
 
 jobs:
@@ -99,3 +104,32 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: .github/scripts/sweep-main-activity.sh 50
+
+  gate-audit:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    # One audit at a time, so a re-run and the next push can't both file the same PR's
+    # issue before either sees the other's.
+    concurrency:
+      group: gate-audit
+      cancel-in-progress: false
+    # What merge-check reads, read-only (labeler.yml and the comparison, the PR and its
+    # comments, Actions runs, commit statuses), plus the one thing this job writes: a
+    # `gate-bypass` issue and its label.
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      statuses: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: The merged PR had the evidence the merge gate requires
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: .github/scripts/gate-audit.sh "$SHA"

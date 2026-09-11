@@ -18,6 +18,9 @@
 #   codex-review.sh request                   # risk-scoped repos: post `@codex review` for the current head when every rule allows it
 #   codex-review.sh merge-check [--head <sha>]
 #                                             # exit 0 only when merging exactly that head is allowed
+#   codex-review.sh merge --head <sha> [--method merge|squash]
+#                                             # risk-scoped repos' only merge path: merge-check, then gh pr merge on its exit 0 alone
+#   codex-review.sh audit                     # a merged PR against merge-check's rules as of its merge; exit 28 = it bypassed the gate
 #   codex-review.sh receipt --head <sha> --outcome approve|changes --reviewer "<model + runtime>" --body-file <file>
 #                                             # post a substitute review's durable receipt for exactly that head
 #
@@ -38,6 +41,8 @@
 #       re-read, so the verdict may be stale — re-run merge-check
 #   26  merge-check: `merge=defer mode=legacy` — not risk-scoped, so SKILL.md Step 6's
 #       evidence rules decide this merge; never chain it into `gh pr merge`
+#   27  merge: merge-check allowed the head, but `gh pr merge` did not merge it
+#   28  audit: merge-check would have refused this PR at its merge — a gate bypass
 #
 # `gate` is the rule the advisory detector never was: three rounds on ONE
 # finding class (or one seam, severity not falling) is a design defect at a
@@ -244,7 +249,8 @@ paginate_connection() {
 # One complete observation of the exact pushed head. Review and reaction
 # evidence must be newer than SINCE so a previous round cannot bless this one.
 # Unresolved Codex threads intentionally have no date filter: an older thread
-# remains open work until it is replied to and resolved.
+# remains open work until it is replied to and resolved. Under `audit`, review
+# and reaction evidence newer than GATE_AS_OF (the merge) does not count either.
 status_observation() {
   local sha="$1" since="$2" thread_pages review_pages comment_pages reaction_pages
   local observed_heads head_count head_changed head_oid open_count review_matches review_count last_review_at last_valid_review_at last_valid_verdict_at quota_matches quota_count last_usage_limit_at reaction_matches reaction_count last_thumbs_up_at rounds codex
@@ -281,11 +287,12 @@ status_observation() {
       | select((.comments.nodes[0].author.login // "") | ascii_downcase | startswith("chatgpt-codex-connector"))
       | .comments.nodes[0].pullRequestReview.id // empty
     ] | unique | length') || return 1
-  review_matches=$(printf '%s\n' "$review_pages" | jq -cs --arg sha "$head_oid" --arg since "$since" --arg usageLimitRe "$CODEX_REVIEW_USAGE_LIMIT_RE" '
+  review_matches=$(printf '%s\n' "$review_pages" | jq -cs --arg sha "$head_oid" --arg since "$since" --arg until "$GATE_AS_OF" --arg usageLimitRe "$CODEX_REVIEW_USAGE_LIMIT_RE" '
     [ .[] | .data.repository.pullRequest.reviews.nodes[]
       | select((.author.login // "") | ascii_downcase | startswith("chatgpt-codex-connector"))
       | select((.commit.oid // "") | startswith($sha))
       | select(.submittedAt != null and .submittedAt > $since)
+      | select($until == "" or .submittedAt <= $until)
       | select((.body // "") | test($usageLimitRe; "i") | not)
     ]') || return 1
   review_count=$(printf '%s' "$review_matches" | jq -er 'length') || return 1
@@ -295,34 +302,38 @@ status_observation() {
        | select((.author.login // "") | ascii_downcase | startswith("chatgpt-codex-connector"))
        | .submittedAt
      ] | max) // "none"') || return 1
-  reaction_matches=$(printf '%s\n' "$reaction_pages" | jq -cs --arg since "$since" '
+  reaction_matches=$(printf '%s\n' "$reaction_pages" | jq -cs --arg since "$since" --arg until "$GATE_AS_OF" '
     [ .[] | .data.repository.pullRequest.reactions.nodes[]
       | select((.user.login // "") | ascii_downcase | startswith("chatgpt-codex-connector"))
       | select(.content == "THUMBS_UP")
       | select(.createdAt > $since)
+      | select($until == "" or .createdAt <= $until)
     ]') || return 1
   reaction_count=$(printf '%s' "$reaction_matches" | jq -er 'length') || return 1
-  last_thumbs_up_at=$(printf '%s\n' "$reaction_pages" | jq -ers '
+  last_thumbs_up_at=$(printf '%s\n' "$reaction_pages" | jq -ers --arg until "$GATE_AS_OF" '
     ([ .[] | .data.repository.pullRequest.reactions.nodes[]
        | select((.user.login // "") | ascii_downcase | startswith("chatgpt-codex-connector"))
        | select(.content == "THUMBS_UP")
+       | select($until == "" or .createdAt <= $until)
        | .createdAt
      ] | max) // "none"') || return 1
   last_valid_verdict_at="$last_valid_review_at"
   if [ "$last_thumbs_up_at" != "none" ] && { [ "$last_valid_verdict_at" = "none" ] || [[ "$last_thumbs_up_at" > "$last_valid_verdict_at" ]]; }; then
     last_valid_verdict_at="$last_thumbs_up_at"
   fi
-  quota_matches=$(printf '%s\n%s\n' "$review_pages" "$comment_pages" | jq -cs --arg sha "$head_oid" --arg since "$since" --arg usageLimitRe "$CODEX_REVIEW_USAGE_LIMIT_RE" '
+  quota_matches=$(printf '%s\n%s\n' "$review_pages" "$comment_pages" | jq -cs --arg sha "$head_oid" --arg since "$since" --arg until "$GATE_AS_OF" --arg usageLimitRe "$CODEX_REVIEW_USAGE_LIMIT_RE" '
     [ .[] | .data.repository.pullRequest as $pr
       | ($pr.reviews.nodes[]?
           | select((.author.login // "") | ascii_downcase | startswith("chatgpt-codex-connector"))
           | select((.commit.oid // "") | startswith($sha))
           | select(.submittedAt != null and .submittedAt > $since)
+          | select($until == "" or .submittedAt <= $until)
           | select((.body // "") | test($usageLimitRe; "i"))
           | { at: .submittedAt })
       , ($pr.comments.nodes[]?
           | select((.author.login // "") | ascii_downcase | startswith("chatgpt-codex-connector"))
           | select(.createdAt != null and .createdAt > $since)
+          | select($until == "" or .createdAt <= $until)
           | select((.body // "") | test($usageLimitRe; "i"))
           | { at: .createdAt })
     ]') || return 1
@@ -498,6 +509,27 @@ RECEIPT_REVIEWER_LINE_RE='\*\*Reviewer and runtime:\*\* (?<reviewer>[^\n]+)'
 FIX_TITLE_RE='^\s*fix(\([^)]*\))?!?:'
 FIXES_PR_LINE_RE='(^|\n)Fixes-PR:[ \t]*(#[0-9]+|none)\b'
 
+# `missing` when a fix title's body has no Fixes-PR line, else `ok`, for a
+# {title, body} JSON object on stdin — merge-check's rule, and audit's. A line
+# inside a code fence or an HTML comment is an example or a template, not a
+# link, so both are cut first. Fences follow CommonMark: up to 3 spaces, then
+# 3+ backticks or 3+ tildes; only a bare run of the same character, at least
+# as long, closes one; an unclosed fence runs to the end, as GitHub renders it.
+fix_link_state() {
+  jq -r --arg titleRe "$FIX_TITLE_RE" --arg lineRe "$FIXES_PR_LINE_RE" '
+    def unfenced:
+      reduce split("\n")[] as $line ({out: [], fence: null};
+        ($line | capture("^ {0,3}(?<run>`{3,}|~{3,})") // null) as $open
+        | if .fence == null then
+            if $open then .fence = $open.run else .out += [$line] end
+          elif $open and ($open.run[0:1] == .fence[0:1]) and (($open.run | length) >= (.fence | length))
+               and ($line | test("^ {0,3}" + $open.run + "[ \t]*\r?$")) then .fence = null
+          else . end)
+      | .out | join("\n");
+    (.body // "" | unfenced | gsub("<!--[\\s\\S]*?(-->|$)"; "")) as $body
+    | if (.title | test($titleRe; "i")) and ($body | test($lineRe; "i") | not) then "missing" else "ok" end'
+}
+
 # The reviewer-model allowlist, generated by scripts/reviewer-models.ts from the
 # worker-high/worker-frontier tier config — see that file's header. Read next to
 # THIS script (via $HERE, already resolved above from BASH_SOURCE), not the
@@ -612,6 +644,13 @@ SCOPE_VERDICT=""
 SCOPE_LABELS="[]"
 SCOPE_REASON=""
 
+# `audit` alone sets these, to judge a merged PR as of its merge: the commit it
+# merged onto, and the moment its evidence must predate. Assigned here rather
+# than read from the environment, so no caller of merge-check can pin its base
+# or backdate its evidence.
+SCOPE_PIN_BASE=""
+GATE_AS_OF=""
+
 # The commit branch $1 points at now, or non-zero.
 base_tip() {
   gh api "repos/$REPO/git/ref/heads/$(jq -rn --arg r "$1" '$r | split("/") | map(@uri) | join("/")')" \
@@ -630,13 +669,18 @@ scope_eval() {
   # is the base tip as of the PR's last push (REST `base.sha`), so a rule main
   # has added since would not bind an open PR until its author pushed again.
   # Any doubt about the base is risk-scoped and `review`, never `legacy`.
+  # `audit` pins the base to the commit a merged PR merged onto instead.
   SCOPE_BASE_REF="$base"
-  SCOPE_BASE=$(base_tip "$base") || {
-    SCOPE_MODE=risk-scoped
-    SCOPE_VERDICT=review
-    SCOPE_REASON="fail closed: could not resolve base branch $base to a commit"
-    return 0
-  }
+  if [ -n "$SCOPE_PIN_BASE" ]; then
+    SCOPE_BASE="$SCOPE_PIN_BASE"
+  else
+    SCOPE_BASE=$(base_tip "$base") || {
+      SCOPE_MODE=risk-scoped
+      SCOPE_VERDICT=review
+      SCOPE_REASON="fail closed: could not resolve base branch $base to a commit"
+      return 0
+    }
+  fi
   repo_mode "$SCOPE_BASE" || {
     SCOPE_MODE=risk-scoped
     SCOPE_VERDICT=review
@@ -715,12 +759,14 @@ refuse_if_base_moved() {
 
 # Review requests `request` has posted on this PR, oldest first:
 # [{head, round, at}]. Read through the same paginated connection `status` uses.
+# Under `audit`, a request made after GATE_AS_OF (the merge) never happened.
 request_markers() {
   local pages
   pages=$(paginate_connection comments comments_page) || return 1
-  printf '%s\n' "$pages" | jq -cs --arg re "$REQUEST_MARKER_RE" '
+  printf '%s\n' "$pages" | jq -cs --arg re "$REQUEST_MARKER_RE" --arg asof "$GATE_AS_OF" '
     [ .[] | .data.repository.pullRequest.comments.nodes[]
       | .createdAt as $at
+      | select($asof == "" or $at <= $asof)
       | [ (.body // "") | capture($re) ] | first // empty
       | { head, round: (.round | tonumber), at: $at } ]
     | sort_by(.at)'
@@ -744,13 +790,15 @@ receipt_comments_page() {
 # nothing, as "<outcome>\t<reviewer text>" (reviewer text empty for a receipt
 # written before the reviewer line existed). A later `changes` supersedes an
 # earlier `approve`, and a receipt for any other head says nothing about this
-# one. `outcome` alone (no tab, no reviewer) means no receipt was found.
+# one. `outcome` alone (no tab, no reviewer) means no receipt was found. Under
+# `audit`, a receipt posted after GATE_AS_OF (the merge) did not gate it.
 receipt_outcome() {
   local pages
   pages=$(paginate_connection comments receipt_comments_page) || return 1
-  printf '%s\n' "$pages" | jq -rs --arg re "$RECEIPT_MARKER_RE" --arg reviewerRe "$RECEIPT_REVIEWER_LINE_RE" --arg head "$1" '
+  printf '%s\n' "$pages" | jq -rs --arg re "$RECEIPT_MARKER_RE" --arg reviewerRe "$RECEIPT_REVIEWER_LINE_RE" --arg head "$1" --arg asof "$GATE_AS_OF" '
     [ .[] | .data.repository.pullRequest.comments.nodes[]
       | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
+      | select($asof == "" or .createdAt <= $asof)
       | .createdAt as $at
       | .body as $body
       | [ ($body // "" | capture($re)) ] | first // empty
@@ -778,18 +826,23 @@ receipt_outcome() {
 # /statuses keeps every status ever posted. The Risk label run is left out: it
 # only labels the PR for people to read, and counting it would pass a head no
 # CI ever ran on. The pages go through stdin, not --argjson, because a page of
-# runs can exceed the kernel's per-argument limit.
+# runs can exceed the kernel's per-argument limit. Under `audit`, a run or
+# status created after GATE_AS_OF (the merge) did not gate it: shadow-review.yml
+# runs on the head seconds after every merge, on `pull_request_target: closed`.
 ci_verdict() {
   local runs statuses required="${CODEX_REVIEW_REQUIRED_WORKFLOWS:-CI}"
   runs=$(gh api --paginate --slurp "repos/$REPO/actions/runs?head_sha=$1&per_page=100") || return 1
   statuses=$(gh api --paginate --slurp "repos/$REPO/commits/$1/statuses?per_page=100") || return 1
-  printf '%s\n%s\n' "$runs" "$statuses" | jq -rs --arg head "$1" --arg labeler "$RISK_LABEL_WORKFLOW" --arg requiredList "$required" --argjson excluded "$CI_EXCLUDED_CONTEXTS" '
+  printf '%s\n%s\n' "$runs" "$statuses" | jq -rs --arg head "$1" --arg labeler "$RISK_LABEL_WORKFLOW" --arg requiredList "$required" --argjson excluded "$CI_EXCLUDED_CONTEXTS" --arg asof "$GATE_AS_OF" '
     ( $requiredList | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) ) as $required
     | ( [ .[0][].workflow_runs[]?
         | select(.head_sha == $head)
+        | select($asof == "" or (.created_at // "") <= $asof)
         | select((.name == $labeler and .event == "pull_request_target") | not) ]
       | group_by(.name) | map(max_by([.run_started_at // .created_at // "", .id // 0])) ) as $runs
-    | ( [ .[1][][]? | select(.context as $c | $excluded | index($c) | not) ] | group_by(.context) | map(max_by([.created_at // "", .id // 0])) ) as $statuses
+    | ( [ .[1][][]? | select(.context as $c | $excluded | index($c) | not)
+          | select($asof == "" or (.created_at // "") <= $asof) ]
+        | group_by(.context) | map(max_by([.created_at // "", .id // 0])) ) as $statuses
     | ( [ $runs[] | select(.status == "completed")
           | (.name as $n | $required | index($n) != null) as $isRequired
           | select((.conclusion // "") as $c | if $isRequired then $c != "success" else ($c | IN("success", "neutral", "skipped") | not) end)
@@ -805,7 +858,7 @@ ci_verdict() {
       else empty end'
 }
 
-case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|scope|request|merge-check|receipt}" in
+case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|scope|request|merge-check|merge|audit|receipt}" in
   open)
     # thread_id  comment_id  file:line  outdated?  severity  title
     rounds_banner "$(rounds_count)"
@@ -1133,25 +1186,10 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|sc
       echo "merge=refused head=$SCOPE_HEAD: the PR head is not $want" >&2
       exit 24
     fi
-    # A fix PR names the PR it fixes, or says `none`. Read at merge time: the
-    # title and body can both change after the PR opens. A line inside a code
-    # fence or an HTML comment is an example or a template, not a link, so both
-    # are cut first. Fences follow CommonMark: up to 3 spaces, then 3+ backticks
-    # or 3+ tildes; only a bare run of the same character, at least as long,
-    # closes one; an unclosed fence runs to the end, as GitHub renders it.
+    # A fix PR names the PR it fixes, or says `none` (fix_link_state). Read at
+    # merge time: the title and body can both change after the PR opens.
     pr_text=$(gh pr view "$PR" --repo "$REPO" --json title,body) || exit 1
-    fix_link=$(printf '%s' "$pr_text" | jq -r --arg titleRe "$FIX_TITLE_RE" --arg lineRe "$FIXES_PR_LINE_RE" '
-      def unfenced:
-        reduce split("\n")[] as $line ({out: [], fence: null};
-          ($line | capture("^ {0,3}(?<run>`{3,}|~{3,})") // null) as $open
-          | if .fence == null then
-              if $open then .fence = $open.run else .out += [$line] end
-            elif $open and ($open.run[0:1] == .fence[0:1]) and (($open.run | length) >= (.fence | length))
-                 and ($line | test("^ {0,3}" + $open.run + "[ \t]*\r?$")) then .fence = null
-            else . end)
-        | .out | join("\n");
-      (.body // "" | unfenced | gsub("<!--[\\s\\S]*?(-->|$)"; "")) as $body
-      | if (.title | test($titleRe; "i")) and ($body | test($lineRe; "i") | not) then "missing" else "ok" end') || exit 1
+    fix_link=$(printf '%s' "$pr_text" | fix_link_state) || exit 1
     if [ "$fix_link" = missing ]; then
       echo "merge=refused head=$SCOPE_HEAD: a fix PR needs a 'Fixes-PR: #<n>' line in its body naming the PR it fixes, or 'Fixes-PR: none'" >&2
       exit 24
@@ -1214,6 +1252,159 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|sc
       *)
         echo "merge=refused head=$SCOPE_HEAD verdict=review: $observation; latest substitute receipt: ${receipt:-none}" >&2
         exit 24
+        ;;
+    esac
+    ;;
+  merge)
+    # The one merge path for a risk-scoped repo (SKILL.md, Risk-scoped repos):
+    # merge-check for exactly this head, and `gh pr merge --match-head-commit`
+    # on its exit 0 and nothing else. Twice a pipeline swallowed a refusal —
+    # `merge-check | tail -1 && gh pr merge` merged #675 over a missing
+    # Fixes-PR line, and a grep pipe hid a red vitest before #401 merged — so
+    # the decision and the merge are one command, and the decision is
+    # merge-check itself, run as a child of this script rather than restated
+    # here. Exit 25 (the base moved during the check) runs it once more; every
+    # other refusal passes its own code through, and nothing merges. It never
+    # deletes the branch: `gh pr merge --delete-branch` also switches the local
+    # checkout, which in a shared worktree is not this command's to move.
+    shift
+    head="" method=merge
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --head) head="${2:?--head needs a sha}"; shift 2 ;;
+        --method) method="${2:?--method needs merge or squash}"; shift 2 ;;
+        *) echo "merge: unknown argument $1" >&2; exit 2 ;;
+      esac
+    done
+    if ! [[ "$head" =~ ^[0-9a-f]{40}$ ]]; then
+      echo "merge: --head must be the full 40-character SHA you checked" >&2
+      exit 2
+    fi
+    case "$method" in
+      merge|squash) ;;
+      # GitHub does not sign a rebase merge, so main-provenance.yml's
+      # provenance job fails one (see that workflow's header).
+      *) echo "merge: --method must be merge or squash; a rebase merge fails main provenance" >&2; exit 2 ;;
+    esac
+    self="$HERE/$(basename "${BASH_SOURCE[0]}")"
+    checked=0
+    REPO="$REPO" PR="$PR" BRANCH='' "$BASH" "$self" merge-check --head "$head" || checked=$?
+    if [ "$checked" -eq 25 ]; then
+      echo "merge: the base moved while merge-check ran; checking once more" >&2
+      checked=0
+      REPO="$REPO" PR="$PR" BRANCH='' "$BASH" "$self" merge-check --head "$head" || checked=$?
+    fi
+    [ "$checked" -eq 0 ] || exit "$checked"
+    gh pr merge "$PR" --repo "$REPO" "--$method" --match-head-commit "$head" || {
+      echo "merge=failed head=$head: merge-check allowed it, but gh pr merge did not merge PR #$PR" >&2
+      exit 27
+    }
+    merged=$(gh pr view "$PR" --repo "$REPO" --json state,mergeCommit) || merged='{}'
+    commit=$(printf '%s' "$merged" | jq -r 'if .state == "MERGED" then (.mergeCommit.oid // empty) else empty end')
+    if [ -z "$commit" ]; then
+      echo "merge=failed head=$head: gh pr merge returned success, but PR #$PR does not read as merged" >&2
+      exit 27
+    fi
+    echo "merged pr=$PR head=$head method=$method commit=$commit"
+    ;;
+  audit)
+    # After the fact: would merge-check have allowed this merged PR, at its
+    # merged head, as of its merge? main-provenance.yml's gate-audit job runs
+    # it on every push to main, and .github/scripts/gate-audit.sh files one
+    # `gate-bypass` issue per PR it flags. The rules are merge-check's, through
+    # the same helpers; only the moment is pinned to the merge. The base is
+    # the commit the PR merged onto (the merge commit's first parent), the
+    # title and body are the revisions current at mergedAt (#675's Fixes-PR
+    # line was added a minute after it merged), and a receipt, a review
+    # request or a Codex verdict counts only if it predates the merge
+    # (GATE_AS_OF). Unresolved threads, labels and CI conclusions are read as
+    # they stand now: GitHub keeps no history of them to replay cheaply. A
+    # legacy repo had no gate to bypass.
+    shift
+    [ $# -eq 0 ] || { echo "audit: takes no arguments; set PR" >&2; exit 2; }
+    audit_pr=$(gh api graphql -f query='
+      query($owner:String!,$name:String!,$pr:Int!){
+        repository(owner:$owner,name:$name){ pullRequest(number:$pr){
+          state mergedAt headRefOid title body
+          mergeCommit{ oid parents(first:1){ nodes{ oid } } }
+          userContentEdits(first:100){ pageInfo{hasNextPage} nodes{ editedAt deletedAt diff } }
+          timelineItems(itemTypes:[RENAMED_TITLE_EVENT],first:100){ pageInfo{hasNextPage} nodes{ ... on RenamedTitleEvent{ createdAt previousTitle } } }
+        } } }' -F owner="$OWNER" -F name="$NAME" -F pr="$PR") || { echo "audit=error pr=$PR: could not read the PR" >&2; exit 1; }
+    state=$(printf '%s' "$audit_pr" | jq -er '.data.repository.pullRequest.state') || { echo "audit=error pr=$PR: could not read the PR's state" >&2; exit 1; }
+    if [ "$state" != MERGED ]; then
+      echo "audit: PR #$PR is $state, not merged; there is no merge to audit" >&2
+      exit 2
+    fi
+    # The PR as it stood at mergedAt. A body revision GitHub no longer shows (a
+    # deleted edit) is no answer, not a pass.
+    at_merge=$(printf '%s' "$audit_pr" | jq -ce '
+      .data.repository.pullRequest as $p
+      | $p.mergedAt as $t
+      | if $p.userContentEdits.pageInfo.hasNextPage or $p.timelineItems.pageInfo.hasNextPage then error("more than 100 body edits or title renames") else . end
+      | ([ $p.userContentEdits.nodes[] | select(.editedAt <= $t) ] | max_by(.editedAt)) as $rev
+      | { mergedAt: $t,
+          head: $p.headRefOid,
+          base: ($p.mergeCommit.parents.nodes[0].oid // error("no merge commit parent")),
+          title: (([ $p.timelineItems.nodes[] | select(.createdAt > $t) ] | min_by(.createdAt) | .previousTitle) // $p.title),
+          body: (if ($p.userContentEdits.nodes | length) == 0 then $p.body
+                 elif $rev == null or $rev.deletedAt != null or $rev.diff == null then error("its body revision at the merge is gone")
+                 else $rev.diff end) }') || { echo "audit=error pr=$PR: could not reconstruct the PR as it stood at its merge" >&2; exit 1; }
+    GATE_AS_OF=$(printf '%s' "$at_merge" | jq -r .mergedAt)
+    SCOPE_PIN_BASE=$(printf '%s' "$at_merge" | jq -r .base)
+    audit_head=$(printf '%s' "$at_merge" | jq -r .head)
+    where="pr=$PR head=$audit_head base=$SCOPE_PIN_BASE merged=$GATE_AS_OF"
+    scope_eval || { echo "audit=error $where: no scope verdict" >&2; exit 1; }
+    if [ "$SCOPE_MODE" = legacy ]; then
+      echo "audit=legacy $where: not risk-scoped at the commit it merged onto, so merge-check deferred it to Step 6"
+      exit 0
+    fi
+    if [ "$SCOPE_HEAD" != "$audit_head" ]; then
+      echo "audit=error $where: GitHub now reports head $SCOPE_HEAD" >&2
+      exit 1
+    fi
+    where="$where verdict=$SCOPE_VERDICT"
+    fix_link=$(printf '%s' "$at_merge" | fix_link_state) || { echo "audit=error $where: could not read the title and body" >&2; exit 1; }
+    if [ "$fix_link" = missing ]; then
+      echo "audit=violation $where: a fix PR merged with no 'Fixes-PR:' line in its body at merge time"
+      exit 28
+    fi
+    ci=$(ci_verdict "$audit_head") || { echo "audit=error $where: could not read CI on the head" >&2; exit 1; }
+    if [ -n "$ci" ]; then
+      echo "audit=violation $where: $ci"
+      exit 28
+    fi
+    receipt_raw=$(receipt_outcome "$audit_head") || { echo "audit=error $where: could not read receipts" >&2; exit 1; }
+    receipt="${receipt_raw%%$'\t'*}"
+    receipt_reviewer="${receipt_raw#*$'\t'}"
+    if [ "$receipt" = changes ]; then
+      echo "audit=violation $where: the latest substitute receipt before the merge asked for changes"
+      exit 28
+    fi
+    if [ "$SCOPE_VERDICT" = skip ]; then
+      echo "audit=pass $where: $SCOPE_REASON"
+      exit 0
+    fi
+    if [ "$receipt" = approve ]; then
+      [ -f "$REVIEWER_MODELS_FILE" ] || { echo "audit=error $where: $REVIEWER_MODELS_FILE not found" >&2; exit 1; }
+      if reviewer_model_allowed "$receipt_reviewer"; then
+        echo "audit=pass $where: an approving substitute receipt before the merge ($receipt_reviewer)"
+        exit 0
+      fi
+      echo "audit=violation $where: the approving substitute receipt names a disallowed reviewer (\"$receipt_reviewer\")"
+      exit 28
+    fi
+    markers=$(request_markers) || { echo "audit=error $where: could not read review requests" >&2; exit 1; }
+    since=$(printf '%s' "$markers" | jq -r --arg head "$audit_head" '[.[] | select(.head == $head)] | first | .at // empty') || exit 1
+    if [ -z "$since" ]; then
+      echo "audit=violation $where: it merged with no review of this head requested and no approving receipt before the merge ($SCOPE_REASON)"
+      exit 28
+    fi
+    observation=$(status_observation "$audit_head" "$since") || { echo "audit=error $where: could not read the Codex review" >&2; exit 1; }
+    case "$observation" in
+      codex=clean*) echo "audit=pass $where: $observation" ;;
+      *)
+        echo "audit=violation $where: $observation before the merge; latest substitute receipt: ${receipt:-none}"
+        exit 28
         ;;
     esac
     ;;

@@ -84,7 +84,13 @@ if [ "$1" = pr ]; then
   printf 'pr %s\\n' "$2" >> "$MOCK_CALLS"
   if [ "$2" = view ]; then
     n=$(grep -c '^pr view$' "$MOCK_CALLS")
-    if [ -f "$MOCK_DIR/pr-$n.json" ]; then cat "$MOCK_DIR/pr-$n.json"; else cat "$MOCK_DIR/pr.json"; fi
+    if [ -f "$MOCK_DIR/merged" ] && [ -f "$MOCK_DIR/pr-merged.json" ]; then cat "$MOCK_DIR/pr-merged.json"
+    elif [ -f "$MOCK_DIR/pr-$n.json" ]; then cat "$MOCK_DIR/pr-$n.json"; else cat "$MOCK_DIR/pr.json"; fi
+  elif [ "$2" = merge ]; then
+    # merge-args records exactly what merged; MOCK_MERGE_STATUS makes the merge fail.
+    printf 'merge-args %s\\n' "$*" >> "$MOCK_CALLS"
+    if [ "\${MOCK_MERGE_STATUS:-0}" != 0 ]; then echo 'gh: merge failed' >&2; exit "$MOCK_MERGE_STATUS"; fi
+    touch "$MOCK_DIR/merged"
   elif [ "$2" = comment ]; then
     while [ $# -gt 0 ]; do
       if [ "$1" = --body ]; then printf '%s' "$2" > "$MOCK_DIR/posted"; fi
@@ -185,6 +191,7 @@ for arg in "$@"; do
   esac
 done
 case "$query" in
+  *userContentEdits*) connection=audit ;;
   *reviewThreads*) connection=reviewThreads ;;
   *reviews*) connection=reviews ;;
   *reactions*) connection=reactions ;;
@@ -262,6 +269,10 @@ const OTHER_HEAD = 'dddddddddddddddddddddddddddddddddddddddd';
 const BASE_OID = 'ffffffffffffffffffffffffffffffffffffffff';
 const STALE_BASE = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
 const MOVED_BASE = '9999999999999999999999999999999999999999';
+// A merge: its commit, the base commit it merged onto, and when.
+const MERGE_OID = '7777777777777777777777777777777777777777';
+const MERGE_PARENT = '8888888888888888888888888888888888888888';
+const MERGED_AT = '2026-09-05T01:00:00Z';
 const RISK_CONFIG =
   "risk:high:\n- changed-files:\n  - any-glob-to-any-file:\n    - 'src/router.ts'\n    - '.github/**'\n";
 
@@ -437,7 +448,7 @@ function scopeFixture(
 function runHelper(root: string, args: string[], env: Record<string, string> = {}) {
   const { bin, calls, sleepLog } = writeMocks(root);
   const posted = path.join(root, 'posted');
-  for (const file of [calls, sleepLog, posted]) fs.rmSync(file, { force: true });
+  for (const file of [calls, sleepLog, posted, path.join(root, 'merged')]) fs.rmSync(file, { force: true });
   fs.writeFileSync(
     path.join(bin, 'node'),
     `#!/usr/bin/env bash
@@ -1550,10 +1561,7 @@ describe('codex-review risk-scoped review requests', () => {
     const root = tempRoot();
     scopeFixture(root, {
       labels: ['risk:high'],
-      comments: [
-        marker(HEAD, 1),
-        receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-sonnet-5'),
-      ],
+      comments: [marker(HEAD, 1), receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-sonnet-5')],
     });
 
     const result = runHelper(root, ['merge-check', '--head', HEAD]);
@@ -1680,5 +1688,354 @@ describe('codex-review risk-scoped review requests', () => {
     expect(result.calls).not.toContain('statuses');
     expect(result.calls).not.toContain('/files');
     expect(result.calls).not.toMatch(/^comments /m);
+  });
+});
+
+// After `gh pr merge` succeeds, the PR reads as merged into MERGE_OID.
+function mergesTo(root: string): void {
+  writeJson(root, 'pr-merged.json', { ...prState([]), state: 'MERGED', mergeCommit: { oid: MERGE_OID } });
+}
+
+// A merged PR as `audit` reads it: merged at MERGED_AT onto MERGE_PARENT, with its
+// body's revisions (none = never edited) and title renames. labeler.yml and the
+// comparison at MERGE_PARENT are the base's as of the merge.
+function auditFixture(
+  root: string,
+  opts: NonNullable<Parameters<typeof scopeFixture>[1]> & {
+    state?: string;
+    edits?: Page[];
+    renames?: Page[];
+    parentConfig?: string | null;
+  } = {},
+): void {
+  scopeFixture(root, opts);
+  const files = opts.files ?? [changedFile('docs/notes.md')];
+  writeJson(root, `compare--${MERGE_PARENT}...${HEAD}.json`, { status: 'ahead', files });
+  const labeler = path.join(root, `labeler--${MERGE_PARENT}.yml`);
+  if (opts.parentConfig === null) fs.rmSync(labeler, { force: true });
+  else fs.writeFileSync(labeler, opts.parentConfig ?? RISK_CONFIG);
+  writePage(root, 'audit', 1, {
+    data: {
+      repository: {
+        pullRequest: {
+          state: opts.state ?? 'MERGED',
+          mergedAt: MERGED_AT,
+          headRefOid: HEAD,
+          title: opts.title ?? 'feat: route a new message kind',
+          body: opts.body ?? '',
+          mergeCommit: { oid: MERGE_OID, parents: { nodes: [{ oid: MERGE_PARENT }] } },
+          userContentEdits: { pageInfo: { hasNextPage: false }, nodes: opts.edits ?? [] },
+          timelineItems: { pageInfo: { hasNextPage: false }, nodes: opts.renames ?? [] },
+        },
+      },
+    },
+  });
+}
+
+describe('codex-review merge, the only merge path for a risk-scoped repo', () => {
+  it('merges a head merge-check allows, pinned to that head, and prints the merge commit', () => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: [] });
+    mergesTo(root);
+
+    const result = runHelper(root, ['merge', '--head', HEAD]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(
+      `merge=allowed head=${HEAD} mode=risk-scoped verdict=skip ci=green base=${BASE_OID}`,
+    );
+    expect(result.stdout).toContain(`merged pr=1 head=${HEAD} method=merge commit=${MERGE_OID}`);
+    expect(result.calls.match(/^merge-args .*$/gm)).toEqual([
+      `merge-args pr merge 1 --repo example/repository --merge --match-head-commit ${HEAD}`,
+    ]);
+  });
+
+  it('squashes when asked', () => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: [] });
+    mergesTo(root);
+
+    const result = runHelper(root, ['merge', '--head', HEAD, '--method', 'squash']);
+    expect(result.status).toBe(0);
+    expect(result.calls).toContain(
+      `merge-args pr merge 1 --repo example/repository --squash --match-head-commit ${HEAD}`,
+    );
+  });
+
+  it.each([
+    ['CI is red on the head', { ci: [workflowRun('CI', 'completed', 'failure')] }, 24],
+    ['a fix PR names no Fixes-PR', { title: 'fix: close the gate' }, 24],
+    ['a review-verdict head has no review', { labels: ['risk:high'] }, 24],
+    ['a receipt asked for changes', { comments: [receiptComment(HEAD, 'changes', '2026-09-05T00:20:00Z')] }, 24],
+    ['the repo is legacy', { baseConfig: null }, 26],
+  ])('never merges, and passes the code through, when merge-check refuses because %s', (_case, fixture, code) => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: [], ...fixture });
+    mergesTo(root);
+
+    const result = runHelper(root, ['merge', '--head', HEAD]);
+    expect(result.status).toBe(code);
+    expect(result.calls).not.toContain('merge-args');
+    expect(result.stdout).not.toContain('merged pr=');
+  });
+
+  it('never merges when merge-check reaches no verdict', () => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: [] });
+    mergesTo(root);
+    fs.rmSync(path.join(root, 'runs.json'));
+
+    const result = runHelper(root, ['merge', '--head', HEAD]);
+    expect(result.status).toBe(1);
+    expect(result.calls).not.toContain('merge-args');
+  });
+
+  it('checks once more when the base moves during the check, and merges on that allow', () => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: [] });
+    mergesTo(root);
+    fs.writeFileSync(path.join(root, 'ref--main-2'), MOVED_BASE);
+
+    const result = runHelper(root, ['merge', '--head', HEAD]);
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain('base moved during check');
+    expect(result.stderr).toContain('merge: the base moved while merge-check ran; checking once more');
+    expect(result.calls.match(/^rest repos\/example\/repository\/git\/ref\/heads\/main$/gm)).toHaveLength(4);
+    expect(result.calls.match(/^merge-args /gm)).toHaveLength(1);
+  });
+
+  it('never merges when the base moves during both checks', () => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: [] });
+    mergesTo(root);
+    fs.writeFileSync(path.join(root, 'ref--main-2'), MOVED_BASE);
+    fs.writeFileSync(path.join(root, 'ref--main-4'), MOVED_BASE);
+
+    const result = runHelper(root, ['merge', '--head', HEAD]);
+    expect(result.status).toBe(25);
+    expect(result.calls).not.toContain('merge-args');
+  });
+
+  it('exits 27 when gh pr merge fails after merge-check allows the head', () => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: [] });
+    mergesTo(root);
+
+    const result = runHelper(root, ['merge', '--head', HEAD], { MOCK_MERGE_STATUS: '1' });
+    expect(result.status).toBe(27);
+    expect(result.stderr).toContain(
+      `merge=failed head=${HEAD}: merge-check allowed it, but gh pr merge did not merge PR #1`,
+    );
+  });
+
+  it('exits 27 when gh pr merge returns but GitHub does not show the PR merged', () => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: [] });
+
+    const result = runHelper(root, ['merge', '--head', HEAD]);
+    expect(result.status).toBe(27);
+    expect(result.stderr).toContain('does not read as merged');
+  });
+
+  it.each([
+    ['no --head', ['merge']],
+    ['a short head', ['merge', '--head', HEAD.slice(0, 12)]],
+    ['a rebase merge', ['merge', '--head', HEAD, '--method', 'rebase']],
+    ['an unknown argument', ['merge', '--head', HEAD, '--delete-branch']],
+  ])('refuses %s before reading anything', (_case, args) => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: [] });
+    mergesTo(root);
+
+    const result = runHelper(root, args);
+    expect(result.status).toBe(2);
+    expect(result.calls).toBe('');
+  });
+});
+
+describe('codex-review audit, the gate re-judged as of a merge', () => {
+  it('passes a merge the gate would have allowed, judged from the commit it merged onto', () => {
+    const root = tempRoot();
+    auditFixture(root, { labels: [] });
+    // Today's main has a rule that would select docs/notes.md; the merge predates it.
+    fs.writeFileSync(
+      path.join(root, `labeler--${BASE_OID}.yml`),
+      "risk:high:\n- changed-files:\n  - any-glob-to-any-file:\n    - 'docs/**'\n",
+    );
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(
+      `audit=pass pr=1 head=${HEAD} base=${MERGE_PARENT} merged=${MERGED_AT} verdict=skip: no changed file matches`,
+    );
+    expect(result.calls).toContain(`rest repos/example/repository/contents/.github/labeler.yml?ref=${MERGE_PARENT}\n`);
+    expect(result.calls).toContain(`rest repos/example/repository/compare/${MERGE_PARENT}...${HEAD}?per_page=1\n`);
+    expect(result.calls).not.toContain('git/ref');
+  });
+
+  it('flags a fix PR whose body had no Fixes-PR line at its merge, though one was added after (#675)', () => {
+    const root = tempRoot();
+    auditFixture(root, {
+      labels: [],
+      title: 'fix(agents): the fleet workers are never reviewers',
+      body: 'Why.\n\nFixes-PR: none',
+      edits: [
+        { editedAt: '2026-09-05T01:00:29Z', deletedAt: null, diff: 'Why.\n\nFixes-PR: none' },
+        { editedAt: '2026-09-05T00:30:00Z', deletedAt: null, diff: 'Why.' },
+      ],
+    });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(28);
+    expect(result.stdout).toContain(
+      `audit=violation pr=1 head=${HEAD} base=${MERGE_PARENT} merged=${MERGED_AT} verdict=skip: a fix PR merged with no 'Fixes-PR:' line in its body at merge time`,
+    );
+  });
+
+  it('passes a fix PR whose Fixes-PR line was in place before its merge', () => {
+    const root = tempRoot();
+    auditFixture(root, {
+      labels: [],
+      title: 'fix: close the gate',
+      body: 'Why.\n\nFixes-PR: #12',
+      edits: [
+        { editedAt: '2026-09-05T00:50:00Z', deletedAt: null, diff: 'Why.\n\nFixes-PR: #12' },
+        { editedAt: '2026-09-05T00:30:00Z', deletedAt: null, diff: 'Why.' },
+      ],
+    });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('audit=pass');
+  });
+
+  it('judges the title the PR had at its merge, not one it was renamed to after', () => {
+    const root = tempRoot();
+    auditFixture(root, {
+      labels: [],
+      title: 'feat: renamed after the merge',
+      body: 'Why.',
+      renames: [{ createdAt: '2026-09-05T02:00:00Z', previousTitle: 'fix: the title it merged with' }],
+    });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(28);
+    expect(result.stdout).toContain("no 'Fixes-PR:' line in its body at merge time");
+  });
+
+  it('flags a merge whose head CI was not green', () => {
+    const root = tempRoot();
+    auditFixture(root, { labels: [], ci: [workflowRun('CI', 'completed', 'failure')] });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(28);
+    expect(result.stdout).toContain('verdict=skip: ci_red: CI=failure (required)');
+  });
+
+  it('counts only the CI that ran before the merge, not a run the merge itself set off', () => {
+    const root = tempRoot();
+    auditFixture(root, {
+      labels: [],
+      ci: [
+        workflowRun('CI', 'completed', 'success', '2026-09-05T00:01:00Z'),
+        // shadow-review.yml runs on pull_request_target: closed — on the head, seconds after the merge.
+        workflowRun('Shadow review', 'completed', 'failure', '2026-09-05T01:00:03Z'),
+      ],
+    });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('audit=pass');
+  });
+
+  it.each([
+    [
+      'an approving receipt from an allowed reviewer, before the merge',
+      { comments: [receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z')] },
+      0,
+      'an approving substitute receipt before the merge (claude-opus-5 (worker-high))',
+    ],
+    [
+      'a clean Codex review, requested and given before the merge',
+      { comments: [marker(HEAD, 1, '2026-09-05T00:05:00Z')], reviews: [review('2026-09-05T00:10:00Z', HEAD)] },
+      0,
+      'codex=clean',
+    ],
+    [
+      'an approving receipt posted only after the merge',
+      { comments: [receiptComment(HEAD, 'approve', '2026-09-05T02:00:00Z')] },
+      28,
+      'it merged with no review of this head requested and no approving receipt before the merge',
+    ],
+    [
+      'a Codex review that came only after the merge',
+      { comments: [marker(HEAD, 1, '2026-09-05T00:05:00Z')], reviews: [review('2026-09-05T02:00:00Z', HEAD)] },
+      28,
+      'codex=pending',
+    ],
+    [
+      'an approving receipt from a disallowed reviewer',
+      { comments: [receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-sonnet-5 (worker)')] },
+      28,
+      'the approving substitute receipt names a disallowed reviewer ("claude-sonnet-5 (worker)")',
+    ],
+    [
+      'a receipt that asked for changes',
+      { comments: [receiptComment(HEAD, 'changes', '2026-09-05T00:20:00Z')] },
+      28,
+      'the latest substitute receipt before the merge asked for changes',
+    ],
+  ])('judges a review-verdict merge with %s', (_case, fixture, code, reason) => {
+    const root = tempRoot();
+    auditFixture(root, { labels: ['risk:high'], ...fixture });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(code);
+    expect(result.stdout).toContain(`verdict=review: ${reason}`);
+  });
+
+  it('calls a merge into a base that was not risk-scoped then legacy, not a bypass', () => {
+    const root = tempRoot();
+    auditFixture(root, { labels: [], parentConfig: null, title: 'fix: no link' });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`audit=legacy pr=1 head=${HEAD} base=${MERGE_PARENT}`);
+  });
+
+  it('refuses to audit a PR that has not merged', () => {
+    const root = tempRoot();
+    auditFixture(root, { labels: [], state: 'OPEN' });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('PR #1 is OPEN, not merged');
+  });
+
+  it('fails loudly, never passing, when the body revision current at the merge was deleted', () => {
+    const root = tempRoot();
+    auditFixture(root, {
+      labels: [],
+      title: 'fix: close the gate',
+      edits: [
+        { editedAt: '2026-09-05T01:30:00Z', deletedAt: null, diff: 'Fixes-PR: none' },
+        { editedAt: '2026-09-05T00:30:00Z', deletedAt: '2026-09-05T03:00:00Z', diff: null },
+      ],
+    });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('audit=error pr=1: could not reconstruct the PR as it stood at its merge');
+    expect(result.stdout).not.toContain('audit=pass');
+  });
+
+  it('fails loudly, never passing, when CI on the head cannot be read', () => {
+    const root = tempRoot();
+    auditFixture(root, { labels: [] });
+    fs.rmSync(path.join(root, 'runs.json'));
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('could not read CI on the head');
+    expect(result.stdout).not.toContain('audit=pass');
   });
 });
