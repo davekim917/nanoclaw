@@ -123,6 +123,7 @@ import {
   canonicalRepoDir,
   checkoutInheritedTagsPath,
   checkoutStagingRoot,
+  cloneIdentity,
   defaultTopicBranch,
   listTopicCheckouts,
   repositoryLockPath,
@@ -811,6 +812,7 @@ describe('branch clone checkouts', () => {
     const recordTags = (checkout: string): void =>
       writeCheckoutInheritedTags(
         checkout,
+        cloneIdentity(checkout)!,
         git(checkout, ['for-each-ref', '--format=%(objectname) %(refname)', 'refs/tags']),
       );
 
@@ -848,6 +850,18 @@ describe('branch clone checkouts', () => {
         recorded: false,
         reason: 'unpushed',
         arrange: () => {},
+      },
+      {
+        // Another clone put, by hand, where a recorded one was. The record
+        // belongs to the clone it was written for, so every tag counts again.
+        thread: 'p672-replaced-clone',
+        recorded: true,
+        reason: 'unpushed',
+        arrange: (dir) => {
+          fs.rmSync(dir, { recursive: true, force: true });
+          execFileSync('git', ['clone', '-q', canon.canonical, dir]);
+          git(dir, ['remote', 'set-url', 'origin', canon.remote]);
+        },
       },
     ];
     const refused = cases.map((spec) => {

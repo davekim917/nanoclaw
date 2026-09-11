@@ -34,6 +34,7 @@ import {
   canonicalRepoDir,
   checkoutDirName,
   checkoutStagingRoot,
+  cloneIdentity,
   defaultTopicBranch,
   isRepositoryLifecycleClaimed,
   listTopicCheckouts,
@@ -1054,14 +1055,17 @@ async function createCheckout(input: {
     // The tags the clone holds now are the ones it inherited from the canonical;
     // the disposability proof skips them while they stay unchanged (#672).
     const inheritedTags = git(staging, ['for-each-ref', '--format=%(objectname) %(refname)', 'refs/tags'], 60_000);
+    // The publish rename keeps this identity; any other clone at the target has another.
+    const identity = cloneIdentity(staging);
+    if (identity === null) throw new RepositoryCheckoutError(`${target.dirName} staging has no .git directory`);
     // 6. Publish: one rename inside the topic root. rename(2) would replace an
     // empty directory, so anything already at the target refuses instead.
     if (fs.existsSync(target.path) || isSymlink(target.path)) {
       throw new RepositoryCheckoutError(`${target.dirName} already exists and is not a checkout this host can serve`);
     }
-    // Recorded host-only (checkoutInheritedTagsPath) once the target is known
-    // free, so a record never describes a checkout this host did not build.
-    writeCheckoutInheritedTags(target.path, inheritedTags);
+    // Recorded host-only (checkoutInheritedTagsPath), bound to this clone's
+    // identity, once the target is known free.
+    writeCheckoutInheritedTags(target.path, identity, inheritedTags);
     tagsRecorded = true;
     fs.renameSync(staging, target.path);
   } catch (error) {

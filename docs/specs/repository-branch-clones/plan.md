@@ -606,7 +606,9 @@ days past `sealedAt` or its last link. Quarantined entries go after 7 days.
     unborn HEAD is unprovable. The stash is read first and keeps its own reason. A clone keeps the
     canonical's tags (§5.2 step 1 deletes only heads and remote refs). Since #672 the host records
     the clone's tags just before it publishes the clone, in `<topic>/checkout-tags/<dirName>`
-    (the topic state dir, which no container mounts). A tag the clone still holds exactly as
+    (the topic state dir, which no container mounts), bound to the identity of the clone's `.git`
+    directory (device, inode, birth time): a rename keeps it, and any other clone at that path
+    gets no exemption from it. A tag the clone still holds exactly as
     recorded is dropped from the roots, and the rest go to
     `git log HEAD --stdin --not --remotes=origin`. The canonical is not read at proof time: its
     refs are container-writable, and a tag a sibling topic planted there could exempt another

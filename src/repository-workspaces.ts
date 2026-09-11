@@ -738,8 +738,29 @@ export function writeCheckoutMetadata(checkoutPath: string, metadata: CheckoutMe
 // staging note above). The canonical is never read at proof time: its refs are
 // container-writable, and a tag a sibling topic planted there could exempt
 // another thread's tag-only work.
+//
+// A record names a path, and whatever occupies that path later may be another
+// clone: one an agent put there by hand, or one a quarantine rollback left
+// beside a record it restored separately. So the record also holds the
+// identity of the clone it was written for (cloneIdentity). A rename keeps it,
+// so quarantine and rollback moving the same directory keep the record valid;
+// any replacement changes it, and the record is then ignored.
 
 const CHECKOUT_TAGS_DIRNAME = 'checkout-tags';
+
+/**
+ * `<dev>:<ino>:<birth ns>` of the clone's `.git` directory, or `null` when it
+ * is not a directory. rename(2) keeps all three; a new directory never matches
+ * (inode reuse would also need the same birth time to the nanosecond).
+ */
+export function cloneIdentity(checkoutPath: string): string | null {
+  try {
+    const stat = fs.lstatSync(path.join(checkoutPath, '.git'), { bigint: true });
+    return stat.isDirectory() ? `${stat.dev}:${stat.ino}:${stat.birthtimeNs}` : null;
+  } catch {
+    return null;
+  }
+}
 
 /** `<topic>/checkout-tags/<dirName>` for the checkout at `<topic>/worktrees/<dirName>`. */
 export function checkoutInheritedTagsPath(checkoutPath: string): string {
@@ -748,18 +769,20 @@ export function checkoutInheritedTagsPath(checkoutPath: string): string {
 
 /**
  * Record `forEachRef`, the output of `git for-each-ref --format='%(objectname)
- * %(refname)' refs/tags` in a clone the host just built, as the tags the
- * checkout at `checkoutPath` inherited. One rename replaces any earlier
+ * %(refname)' refs/tags` in a clone the host just built, as the tags that
+ * clone inherited. `identity` is the clone's cloneIdentity, and `checkoutPath`
+ * the path it is about to be published at. One rename replaces any earlier
  * record for that name.
  */
-export function writeCheckoutInheritedTags(checkoutPath: string, forEachRef: string): void {
+export function writeCheckoutInheritedTags(checkoutPath: string, identity: string, forEachRef: string): void {
   const file = checkoutInheritedTagsPath(checkoutPath);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  const tags = forEachRef === '' || forEachRef.endsWith('\n') ? forEachRef : `${forEachRef}\n`;
   try {
     const fd = fs.openSync(tmp, 'wx', 0o644);
     try {
-      fs.writeFileSync(fd, forEachRef === '' || forEachRef.endsWith('\n') ? forEachRef : `${forEachRef}\n`, 'utf8');
+      fs.writeFileSync(fd, `clone ${identity}\n${tags}`, 'utf8');
       fs.fsyncSync(fd);
     } finally {
       fs.closeSync(fd);
@@ -772,11 +795,13 @@ export function writeCheckoutInheritedTags(checkoutPath: string, forEachRef: str
 }
 
 /**
- * The recorded tags, full ref name to object id; `null` when there is no
- * record, or it cannot be read, or a line is not `<object> refs/tags/<name>`.
- * Null only withdraws the exemption: every tag counts.
+ * The tags recorded for the clone now at `checkoutPath`, full ref name to
+ * object id; `null` when there is no record, it cannot be read, it was written
+ * for another clone than the one at `checkoutPath`, or a line is not
+ * `<object> refs/tags/<name>`. Null only withdraws the exemption: every tag
+ * counts.
  */
-export function readCheckoutInheritedTags(recordPath: string): Map<string, string> | null {
+export function readCheckoutInheritedTags(recordPath: string, checkoutPath: string): Map<string, string> | null {
   let text: string;
   let fd: number;
   try {
@@ -792,8 +817,11 @@ export function readCheckoutInheritedTags(recordPath: string): Map<string, strin
   } finally {
     fs.closeSync(fd);
   }
+  const [header, ...lines] = text.split('\n');
+  const identity = cloneIdentity(checkoutPath);
+  if (identity === null || header !== `clone ${identity}`) return null;
   const tags = new Map<string, string>();
-  for (const line of text.split('\n')) {
+  for (const line of lines) {
     if (!line) continue;
     const match = /^([0-9a-f]{40,64}) (refs\/tags\/\S+)$/.exec(line);
     if (!match) return null;

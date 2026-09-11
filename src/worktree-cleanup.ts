@@ -934,7 +934,11 @@ export function proveCheckoutDisposable(
   reason: string;
 } {
   if (checkout.shape === 'clone') {
-    const inherited = checkout.inheritedTagsRecord ? readCheckoutInheritedTags(checkout.inheritedTagsRecord) : null;
+    // The record is bound to the clone it was written for, which a quarantine
+    // rename keeps: the re-proof of the moved copy still matches it.
+    const inherited = checkout.inheritedTagsRecord
+      ? readCheckoutInheritedTags(checkout.inheritedTagsRecord, checkout.path)
+      : null;
     return disposability.provenDisposable(checkout.path, 'all', inherited);
   }
   if (checkout.shape === 'linked') return disposability.provenDisposable(checkout.path, 'head');
