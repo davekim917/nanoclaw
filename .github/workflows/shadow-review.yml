@@ -16,46 +16,84 @@ name: Shadow review
 # TWO JOBS, deliberately, over one trust boundary:
 #
 #   analyze (contents: read, pull-requests: read — no write scope at all) runs the
-#   model. It never checks out the repository: the merged tree can carry a
-#   `.claude/settings.json` hook, a `.mcp.json` server the action auto-trusts
-#   (`enableAllProjectMcpServers: true`, set unconditionally — base-action's
-#   `setup-claude-code-settings.ts:62-64`), a CLAUDE.md/CLAUDE.local.md, or a
-#   `.ripgreprc`, all planted by the very PR being reviewed, none of which a
-#   tool-permission list like `--disallowedTools Bash` gates — hooks and MCP
-#   servers aren't tools, they run on session start. `--setting-sources user`
-#   alone does NOT close this: it governs `.claude/settings.json` only — the SDK
-#   docs (`@anthropic-ai/claude-agent-sdk` `sdk.d.ts`, the `settingSources` doc
-#   comment) say excluding `'project'` also drops CLAUDE.md ("Must include
-#   'project' to load CLAUDE.md files"), but say nothing about CLAUDE.local.md,
-#   and `.mcp.json` loading is a SEPARATE switch (`strictMcpConfig` /
-#   `--strict-mcp-config`, `sdk.d.ts` ~2127-2134) untouched by `settingSources`.
-#   The action's own threat model agrees this whole set is sensitive: on a PR
-#   event WITH a checkout, it restores `.claude/`, `.mcp.json`, `.claude.json`,
-#   `.gitmodules`, `.ripgreprc`, `CLAUDE.md`, `CLAUDE.local.md` and `.husky/` from
-#   the PR's BASE branch before running Claude, specifically so the PR head can't
-#   plant any of them (`docs/security.md`, "Which files come from the base branch
-#   on pull requests"). That restore mechanism doesn't apply here — this event is
-#   `closed`, not `opened`/`synchronize`, and there is no PR head to restore
-#   away from — so instead of relying on it, there is no checkout at all: the
-#   model gets `gh pr diff` (works for every merge method, closed or open) and
-#   `docs/review-policy.md`'s raw content at the merge commit, written into the
-#   otherwise-empty default workspace, and nothing else. (Those same paths —
-#   `.claude/**`, `.mcp.json`, `.claude.json`, `.gitmodules`, `CLAUDE.local.md`,
-#   `.ripgreprc` — are also added to `risk:high`/`risk:gates` in
-#   `.github/labeler.yml`: this workflow's own no-checkout design neutralizes
-#   them here, but nothing protects a PR that reaches a checkout-based agent
-#   session elsewhere in this fleet. Plain `CLAUDE.md` is deliberately left off
-#   that list — it changes often enough that flagging every edit has a real
-#   review cost, and it's fully covered by this design already.)
+#   model. A no-checkout design was tried and does NOT work: the action calls
+#   `restoreConfigFromBase()` unconditionally on any PR-shaped context — this
+#   `pull_request_target` event sets `isPR: true` for every `types` value, not
+#   just `opened`/`synchronize` (`src/github/context.ts:191-200`), and
+#   `run.ts:263-274` calls it whenever `isPR` is true, before Claude starts. That
+#   function's `listTrackedPaths()` shells out to `git diff`/`git ls-files` with
+#   no try/catch (`src/github/operations/restore-config.ts:51-81`), which throws
+#   in a workspace with no `.git` — confirmed by running that exact command by
+#   hand outside a repo (exit 129, "Not a git repository") and, for contrast,
+#   inside a real `fetch-depth: 1` checkout of a merge-commit SHA, where the
+#   whole restore-config command sequence (`git diff --name-only -z ... HEAD --`,
+#   `git ls-files -z`, `git fetch origin main --depth=1 --no-recurse-submodules`,
+#   `git checkout origin/main -- <path>` per path, `git reset -- <paths>`) ran
+#   clean end to end. So `analyze` DOES check out `merge_commit_sha`
+#   (`fetch-depth: 1`, `persist-credentials: false`) — `gh pr diff` still
+#   supplies the actual diff text (works for every merge method, closed or
+#   open), and the checkout exists only so the action's own machinery has a
+#   `.git` to run its restore against and so Claude can read
+#   `docs/review-policy.md` locally, at the exact merge-commit version. This
+#   repo is private, so `restoreConfigFromBase`'s `git fetch origin main` needs
+#   auth: `run.ts:229-236` runs `prepareAgentMode` (which authenticates the
+#   remote via `configureGitAuth`, see below) BEFORE `run.ts:263-274` calls
+#   `restoreConfigFromBase`, so that fetch is already authenticated by the time
+#   it runs.
+#
+#   The checkout DOES put PR-controlled config on disk — `.claude/settings.json`
+#   (hooks), `.mcp.json` (a server the action auto-trusts via
+#   `enableAllProjectMcpServers: true`, set unconditionally,
+#   `base-action/src/setup-claude-code-settings.ts:62-64`), CLAUDE.md,
+#   CLAUDE.local.md, `.ripgreprc`, etc. — none of which a tool-permission list
+#   like `--disallowedTools Bash` gates, since hooks and MCP servers aren't
+#   tools; they run on session start, before any tool-permission check. Three
+#   layers close this, not one:
+#   1. The action's OWN defense: `restoreConfigFromBase()` (triggered as above)
+#      overwrites `restore-config.ts`'s exact `SENSITIVE_PATHS` list — `.claude`,
+#      `.mcp.json`, `.claude.json`, `.gitmodules`, `.ripgreprc`, `CLAUDE.md`,
+#      `CLAUDE.local.md`, `.husky` (`restore-config.ts:26-35`) — with the
+#      current `origin/main` version of each BEFORE Claude reads anything
+#      (`restore-config.ts:234-240`'s own docstring: the CLI "reads `.mcp.json`,
+#      `.claude/settings.json`, and `.claude/settings.local.json` from the
+#      working directory and acts on them before any tool-permission gating —
+#      executing hooks ... auto-approving MCP servers"). For a closed/merged PR
+#      the checked-out `merge_commit_sha` and `origin/main` are the same trust
+#      level (both already-merged code), so this isn't the open-PR "restore to
+#      the pre-merge trusted state" case — it's a no-op-ish restore here, and
+#      not load-bearing for us on its own.
+#   2. `--setting-sources user` in `claude_args`: drops the `'project'` source
+#      (`.claude/settings.json`, hooks) and CLAUDE.md — the SDK's own doc
+#      comment is explicit: "Must include 'project' to load CLAUDE.md files"
+#      (`@anthropic-ai/claude-agent-sdk` `sdk.d.ts:2076-2085`).
+#   3. `--strict-mcp-config` in `claude_args`: `.mcp.json` loading is a SEPARATE
+#      switch `settingSources` does not touch (`sdk.d.ts:2127-2134`: without it,
+#      the CLI honors "project `.mcp.json`, user settings, plugins, and on-disk
+#      agent frontmatter" regardless of `settingSources`).
+#   With all three, whatever ends up on disk — restored-from-base or, if that
+#   somehow failed, still the PR's own — is inert to the model regardless.
+#   (`.claude/**`, `.mcp.json`, `.claude.json`, `.gitmodules`, `CLAUDE.local.md`,
+#   `.ripgreprc` are also on `risk:high`/`risk:gates` in `.github/labeler.yml` —
+#   this workflow neutralizes them for ITS OWN reviewer via the three layers
+#   above, but nothing protects a PR that reaches a checkout-based agent session
+#   elsewhere in this fleet. Plain CLAUDE.md is deliberately left off that list:
+#   it changes often enough that flagging every edit has a real review cost, and
+#   layer 2 above fully covers it for this specific reviewer.)
+#
+#   `gh pr diff` itself has a documented ceiling: GitHub's diff API refuses a
+#   sufficiently large diff (HTTP 406). A PR that large gets no shadow review —
+#   loudly, as a failed `analyze` run visible in the Actions tab, never silently
+#   — which is the intended trade over guessing at a partial diff.
 #
 #   Also unconditionally: `configureGitAuth`/`replaceCheckoutCredentials`
 #   (`src/github/operations/git-config.ts:129-134`) embeds the action's own
-#   write-capable token into `.git/config`'s remote URL, which the model's Read tool
-#   could read straight out of a checkout — another reason not to give it one, and
-#   why the token this job passes (`github_token: ${{ github.token }}`, this job's
-#   own `contents: read, pull-requests: read` token — no issues/pull-requests WRITE)
-#   is the least damaging one that leak could expose. `github_token` also short-
-#   circuits `setupGitHubToken()` (`src/github/token.ts:158-165`) before it reaches
+#   token into `.git/config`'s remote URL — readable by the model's Read tool
+#   straight out of this checkout. This is why the token this job passes
+#   (`github_token: ${{ github.token }}`, this job's own
+#   `contents: read, pull-requests: read` token — no issues/pull-requests WRITE)
+#   is the least damaging one that leak could expose, and why `report` (below)
+#   scrubs the findings before posting. `github_token` also short-circuits
+#   `setupGitHubToken()` (`src/github/token.ts:158-165`) before it reaches
 #   `getOidcToken()` (`:56-66`), so `id-token: write` is never needed.
 #
 #   report (contents: read, issues: write, pull-requests: write — no model) is the
@@ -72,8 +110,8 @@ name: Shadow review
 #
 # Trust boundary: `pull_request_target` runs both jobs with repo secrets and a
 # write-capable default token regardless of who opened the PR. Never check out
-# `github.event.pull_request.head.sha` here — only ever `merge_commit_sha`, and (per
-# the above) `analyze` doesn't even do that.
+# `github.event.pull_request.head.sha` here — only ever `merge_commit_sha`, a commit
+# already reachable from `main` through a merge GitHub performed.
 #
 # `analyze` uses the `prompt` input, which runs the action's "agent mode"
 # (`src/modes/agent/index.ts`); that mode calls `checkHumanActor` unconditionally
@@ -112,15 +150,29 @@ jobs:
     outputs:
       findings: ${{ steps.review.outputs.structured_output }}
     steps:
-      # No checkout. `gh pr diff` works for every GitHub merge method (merge, squash,
-      # rebase) and for an already-closed PR — verified against this repo's own #643,
-      # merged and closed, from a plain non-repo directory.
-      - name: Fetch the PR's diff and the review policy
+      # merge_commit_sha, never head.sha (see the trust-boundary note above). This
+      # ref is already reachable from main, so nothing here executes PR-authored
+      # code that wasn't already merged. Required so the action's own
+      # restoreConfigFromBase() has a `.git` to run against — see the top-of-file
+      # comment for why a no-checkout design doesn't work here, and for the three
+      # layers (this restore, --setting-sources user, --strict-mcp-config) that
+      # keep whatever lands in this checkout inert to the model.
+      - name: Checkout the merge commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      # gh pr diff, not a local git diff: works for every GitHub merge method
+      # (merge, squash, rebase) and for an already-closed PR — verified against
+      # this repo's own #643, merged and closed, from a plain non-repo directory —
+      # where HEAD~1 would only be correct for some of those methods.
+      - name: Fetch the PR's diff
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
         run: |
           set -euo pipefail
           gh pr diff "$PR_NUMBER" --repo "$REPO" > "$RUNNER_TEMP/shadow-review.diff"
@@ -133,16 +185,15 @@ jobs:
               >> "$RUNNER_TEMP/shadow-review.diff.trunc"
             mv "$RUNNER_TEMP/shadow-review.diff.trunc" "$RUNNER_TEMP/shadow-review.diff"
           fi
-          # The policy doc as it stood at the merge commit, fetched by content API —
-          # no local checkout of the (untrusted-until-reviewed) merged tree.
-          gh api "repos/$REPO/contents/docs/review-policy.md?ref=$MERGE_SHA" \
-            -H "Accept: application/vnd.github.raw" > "$RUNNER_TEMP/review-policy.md"
 
-      # Read-only reviewer, in the runner's default (empty — nothing was checked out)
-      # workspace: no Bash/Write/Edit, and --setting-sources user drops project-level
-      # settings and CLAUDE.md even though there is nothing on disk to load anyway.
-      # --json-schema turns the review into one validated `structured_output` field
-      # this job exposes as an output — the model never touches the GitHub write API.
+      # Read-only reviewer of a checkout whose sensitive paths the action has
+      # already restored from origin/main, further locked down by
+      # --setting-sources user (project settings + CLAUDE.md) and
+      # --strict-mcp-config (.mcp.json) — see the top-of-file comment for the
+      # three-layer defense this rests on. No Bash/Write/Edit: the model never
+      # runs a command or writes a file. --json-schema turns the review into one
+      # validated `structured_output` field this job exposes as an output — the
+      # model never touches the GitHub write API either way.
       - name: Shadow review
         id: review
         uses: anthropics/claude-code-action@0a8d3c9443bbff909ab973b6a17a340b913f229f # v1.0.221
@@ -156,11 +207,13 @@ jobs:
             (.github/labeler.yml). Review it anyway, after the fact. This is advisory
             only — you never block anything, you only report what you find.
 
-            1. Read your review policy at ${{ runner.temp }}/review-policy.md (this
-               repo's docs/review-policy.md as it stood at the merge commit) for the
-               severity contract: what counts as a real finding, what its
+            1. Read docs/review-policy.md in this checkout (at the merge commit) for
+               the severity contract: what counts as a real finding, what its
                "Blocks — destructive" bar names, and what "Do not report" excludes.
-            2. Read the PR's diff at ${{ runner.temp }}/shadow-review.diff.
+            2. Read the PR's diff at ${{ runner.temp }}/shadow-review.diff — this is
+               the change to review; do not review the rest of the checkout, which is
+               present only so the review policy above and this workflow's own
+               machinery have real files to work with.
             3. Classify each real finding:
                - **P1** — it matches the "Blocks — destructive" bar (data
                  loss/corruption; money computed, moved or reported wrong; tenant or
@@ -178,13 +231,10 @@ jobs:
             Cite file:line for every finding, and name the class it belongs to. Be
             precise and conservative: this feeds a program that moves a PR's paths onto
             the mandatory-review list on a real P1, so a false P1 has a real cost.
-
-            You have no access to this repository's actual files (no checkout was
-            performed for this review, by design) — work only from the diff and policy
-            text above.
           claude_args: |
             --model claude-opus-5
             --setting-sources user
+            --strict-mcp-config
             --allowedTools "Read,Grep,Glob"
             --disallowedTools "Bash,Write,Edit,WebSearch,WebFetch"
             --json-schema '{"type":"object","properties":{"findings":{"type":"array","items":{"type":"object","properties":{"severity":{"type":"string","enum":["P1","P2"]},"file":{"type":"string"},"line":{"type":["integer","null"]},"class":{"type":"string"},"description":{"type":"string"}},"required":["severity","file","description"]}}},"required":["findings"]}'
