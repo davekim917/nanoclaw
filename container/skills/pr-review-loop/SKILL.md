@@ -176,7 +176,8 @@ codex-review.sh scope                     # risk-scoped repos: review|skip for t
 codex-review.sh request                   # risk-scoped repos: the only way to ask for a round
 codex-review.sh merge-check [--head <sha>] # exit 0 only when merging exactly that head is allowed; 26 = legacy repo, Step 6 decides
 codex-review.sh receipt --head <sha> --outcome approve|changes --reviewer "<model + runtime>" --body-file <file>
-                                         # post a substitute review's receipt for exactly that head
+                                         # post a substitute review's receipt for exactly that head — --reviewer
+                                         # must start with an allowed model ID (container/skills/pr-review-loop/reviewer-models.txt)
 ```
 
 Three details it encodes, each of which has cost real debugging time — keep them if you ever hand-roll the API calls:
@@ -422,9 +423,32 @@ A repo is **risk-scoped** when `.github/labeler.yml` on the PR's base branch nam
 
    The chain is for exit 0 (`merge=allowed`) only, and `&&` keeps it that way. Exit 26 (`merge=defer mode=legacy`) is not a pass: the repo is not risk-scoped, so take Step 6 instead. Run the two back to back with nothing in between. `--match-head-commit` pins the head, but GitHub's merge takes no base SHA, so merge-check re-reads the base branch last: exit 25 means it moved while the check ran, so re-run it. The `merge=allowed` line names the `base=` commit the verdict read. That leaves a window of seconds. A `labeler.yml` change landing on the base in the gap between the two calls can still let a PR merge that the new rules would have reviewed, and that PR then gets only post-merge review. Shadow review (#660) is that net for every skipped merge, and a `labeler.yml` change is itself `risk:high`.
 
+   `merge-check` must run against **main's copy of the whole skill directory,
+   at origin/main's current tip** — not a single-file extraction of
+   `codex-review.sh`, and not a checkout that predates the latest push to main.
+   It reads `reviewer-models.txt` next to itself: a copy with no sibling file
+   fails closed (every receipt is refused as unlisted) rather than silently
+   skipping the check, and a stale checkout just runs whatever gate main had
+   at that older commit — no failure, just the wrong rules. Running it from
+   inside a checkout of main already at that tip needs nothing extra. Driving
+   it from a scratch extraction instead — the normal case, since mergers
+   typically work from outside the repo entirely — extract the directory, not
+   the file:
+
+   ```bash
+   SP=<scratch dir>
+   git -C <repo> fetch origin main
+   mkdir -p "$SP" && git -C <repo> archive origin/main container/skills/pr-review-loop | tar -x -C "$SP"
+   "$SP"/container/skills/pr-review-loop/scripts/codex-review.sh merge-check --head "$SHA"
+   ```
+
+   `bash <(git show origin/main:container/skills/pr-review-loop/scripts/codex-review.sh)`
+   or copying just the script has the same failure mode — no sibling file, gate
+   fails closed.
+
    Either verdict needs green CI on that head: each workflow in `CODEX_REVIEW_REQUIRED_WORKFLOWS` (comma-separated, default `CI`) has a latest run that concluded `success`, every other latest run concluded `success`, `neutral`, or `skipped`, and the newest commit status per context is `success` (release-policy's `Release policy` and `Release approval` contexts are a policy gate, not CI, and are skipped). A `review` head also needs `status` to read `clean` for it since its request (so `open=0`), or an approving substitute receipt for that exact head. A `fix:` or `fix(...)` title also needs a body line naming the PR it fixes, `Fixes-PR: #<n>`, or `Fixes-PR: none`, outside any code fence or HTML comment; merge-check refuses without one.
 
-`request` refuses, posting nothing, with 20 (not risk-scoped), 21 (verdict `skip`), 22 (this head already requested), 23 (cap), or 3 (churn gate). When `wait` exits 11 or 13, run the substitute review [Review availability](../../../docs/review-policy.md#review-availability) requires — a fresh-context reviewer, never the implementing session — and post it with `codex-review.sh receipt`. That reviewer, like every review (a delta check after a rebase or ratchet regeneration, adversarial verification, a gap analysis), is an Opus-tier or Fable-tier Claude model or a different model family such as Codex/GPT, and `--reviewer` names the model. A Sonnet-tier or Haiku-tier model never reviews, and neither does a subagent that runs on one. Don't wait for a reviewer to be free: start one yourself as a fresh process, `codex exec -m <model> -c model_reasoning_effort=high` or `claude -p --model opus --effort high`, give it the head SHA, the complete diff, the relevant files and the review policy, and post its report as the receipt body. The latest receipt for that exact head decides: `approve` satisfies the review, and `changes` refuses the merge under either verdict — even over a clean Codex review — until a later `approve`.
+`request` refuses, posting nothing, with 20 (not risk-scoped), 21 (verdict `skip`), 22 (this head already requested), 23 (cap), or 3 (churn gate). When `wait` exits 11 or 13, run the substitute review [Review availability](../../../docs/review-policy.md#review-availability) requires — a fresh-context reviewer, never the implementing session — and post it with `codex-review.sh receipt`. Reviewer eligibility is a **tier rule**, not prose: it is whichever model runs the high or frontier tier, for either vendor — `worker-high`/`worker-frontier`'s `model:` frontmatter for Claude, `CODEX_WORKER_TIERS['worker-high']`/`['worker-frontier']` for Codex (`src/claude-agent-md.ts`) — never `worker`/`worker-fast` (Sonnet/Haiku), never Codex `luna`/`terra`, and never a flash or mini model. The allowed ids are generated, not hand-maintained: `container/skills/pr-review-loop/reviewer-models.txt` (`scripts/reviewer-models.ts --write`), and `receipt`/`merge-check` check only `--reviewer`'s **first whitespace-delimited word** against it (a `[1m]` suffix on that word is tolerated) — `--reviewer` not starting with an allowed id is refused before it posts. Report the reviewer's **exact model id from its own runtime** — a Claude subagent from its system prompt, Codex from the `-m` it ran with or `codex exec`'s session metadata — as that first word, e.g. `claude-opus-5 (worker-high)` or `gpt-5.6-sol high (codex exec)`. Don't wait for a reviewer to be free: start one yourself as a fresh process, `codex exec -m <model> -c model_reasoning_effort=high` or `claude -p --model opus --effort high`, give it the head SHA, the complete diff, the relevant files and the review policy, and post its report as the receipt body. The latest receipt for that exact head decides: `approve` satisfies the review, and `changes` refuses the merge under either verdict — even over a clean Codex review — until a later `approve`. A receipt posted before this allowlist gate existed, whose `--reviewer` doesn't START with an allowed id, no longer unlocks a merge — re-post a fresh receipt with an allowlisted `--reviewer` to merge through the new gate.
 
 **Read the review notes first.** Before starting, the author and the reviewer read `docs/review-notes.md` (in a container: `/workspace/project/docs/review-notes.md`). Deferring a finding to an issue, or reverting a PR, appends one line there. When the PR carries `risk:*` dimension labels, they scope the reviewer's brief.
 

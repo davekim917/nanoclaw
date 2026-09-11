@@ -60,6 +60,10 @@ const KNOWN_NON_CODE_GLOBS: ReadonlySet<string> = new Set([
   '.public-boundary-allowlist.json',
   'container/skills/pr-review-loop/**',
   'docs/review-policy.md',
+  // The worker-tier agent definitions the reviewer-model allowlist generator
+  // (scripts/reviewer-models.ts) derives Claude ids from — .md frontmatter/prose,
+  // not source either lane's test suite instruments.
+  'container/agents/**',
   // Executable agent/tool config added to risk:high by #660 — a hook, an
   // auto-trusted MCP server, Claude Code's own trust state, a ripgrep config, and a
   // submodule URL (see .github/labeler.yml's own comment on this block). None of

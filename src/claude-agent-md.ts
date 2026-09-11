@@ -104,7 +104,7 @@ export function parseClaudeAgentMd(content: string): ClaudeAgent | null {
  * care about. Returns the raw scalar with quotes unwrapped and escape
  * sequences resolved; null when the key is missing.
  */
-function extractScalar(frontmatter: string, key: string): string | null {
+export function extractScalar(frontmatter: string, key: string): string | null {
   const lines = frontmatter.split('\n');
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];

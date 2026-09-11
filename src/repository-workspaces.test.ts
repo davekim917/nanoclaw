@@ -7,11 +7,14 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   canonicalGitDir,
   canonicalRepoDir,
+  checkoutDirName,
   defaultTopicBranch,
   discoverCanonicalRepositories,
   ensureRepositoryLock,
   isWorkgroupRepositoryMountClaimed,
+  listTopicCheckouts,
   originPinPath,
+  parseCheckoutDirName,
   readOriginPin,
   repositoryLockPath,
   resolveRepositoryWorkUnit,
@@ -373,5 +376,49 @@ describe('host-only origin pins', () => {
         root,
       ),
     ).toThrow(/malformed/);
+  });
+});
+
+// ── Checkout layout primitive (plan §5.1) ────────────────────────────────────
+
+describe('checkout layout', () => {
+  // One vector file pins this copy and the container's (checkout-layout.ts).
+  const fixtures = JSON.parse(
+    fs.readFileSync(
+      path.join(process.cwd(), 'container/agent-runner/src/mcp-tools/checkout-layout.fixtures.json'),
+      'utf8',
+    ),
+  ) as {
+    checkoutDirName: Array<{ repo: string; branch: string | null; name: string }>;
+    parseCheckoutDirName: Array<{ name: string; expected: { repo: string; slug: string | null } | null }>;
+  };
+
+  it('checkout names round-trip and never collide', () => {
+    for (const vector of fixtures.checkoutDirName) {
+      expect(checkoutDirName(vector.repo, vector.branch), `${vector.repo} + ${vector.branch}`).toBe(vector.name);
+    }
+    for (const vector of fixtures.parseCheckoutDirName) {
+      expect(parseCheckoutDirName(vector.name), vector.name).toEqual(vector.expected);
+    }
+    expect(checkoutDirName('app', 'feat/x')).not.toBe(checkoutDirName('app', 'feat-x'));
+    for (const name of ['.staging', '.pnpm-store', '.app.tmp-x']) expect(parseCheckoutDirName(name)).toBeNull();
+  });
+
+  it('lists only parsed checkout names, with the shape their .git gives them', () => {
+    const topic = path.join(root, 'worktrees');
+    fs.mkdirSync(path.join(topic, 'app', '.git'), { recursive: true });
+    fs.mkdirSync(path.join(topic, 'app@feat-x'), { recursive: true });
+    fs.writeFileSync(path.join(topic, 'app@feat-x', '.git'), 'gitdir: /somewhere\n');
+    fs.mkdirSync(path.join(topic, 'app@bare'), { recursive: true });
+    fs.mkdirSync(path.join(topic, '.staging', 'req-1', 'app@new'), { recursive: true });
+    fs.mkdirSync(path.join(topic, '.pnpm-store'), { recursive: true });
+    fs.writeFileSync(path.join(topic, 'app@file-not-dir'), '');
+
+    expect(listTopicCheckouts(topic).map(({ name, repo, slug, shape }) => ({ name, repo, slug, shape }))).toEqual([
+      { name: 'app', repo: 'app', slug: null, shape: 'clone' },
+      { name: 'app@bare', repo: 'app', slug: 'bare', shape: 'unknown' },
+      { name: 'app@feat-x', repo: 'app', slug: 'feat-x', shape: 'linked' },
+    ]);
+    expect(listTopicCheckouts(path.join(root, 'no-such-topic'))).toEqual([]);
   });
 });

@@ -8,6 +8,11 @@
  * prove the tree is clean and has no commits absent from local remote refs,
  * the branch is merged into origin/HEAD or gone from the already-fetched
  * origin namespace, and the topic has been idle for at least seven days.
+ *
+ * A branch clone (`.git` a directory; plan §5.8) takes its own branch: there
+ * is no registration to remove, so it is quarantined and trashed, and only on
+ * the topic's side-(a) evidence, seven idle days, and a proof covering every
+ * local branch, HEAD and the stash. See cleanupCloneCheckout.
  */
 import { execFileSync } from 'child_process';
 import fs from 'fs';
@@ -33,17 +38,20 @@ import {
   canonicalRepoDir,
   defaultTopicBranch,
   ensureRepositoryLock,
-  isRepositoryName,
+  listTopicCheckouts,
+  parseCheckoutDirName,
   resolveRepositoryWorkUnit,
   topicStateDir,
   topicWorktreesDir,
   transferTombstonesDir,
   withHostRepositoryLock,
   withRepositoryLifecycleClaims,
+  type CheckoutShape,
   type RepositoryWorkUnit,
+  type TopicCheckout,
 } from './repository-workspaces.js';
 
-import { safeGitArgs, safeGitEnv } from './safe-git.js';
+import { safeGitArgs, safeGitEnv, safeGitFilterNames } from './safe-git.js';
 import { dirSizeBytes, sessionWasReclaimed } from './storage-manager.js';
 
 const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
@@ -109,6 +117,8 @@ export interface TopicWorktreeTarget {
   participants: TopicParticipant[];
   repo: string;
   worktreePath: string;
+  /** As the lister decided it: a clone takes the clone branch, anything else the linked path. */
+  shape: CheckoutShape;
   canonicalRepoPath: string;
 }
 
@@ -124,15 +134,52 @@ interface SessionRow {
   idle_since: string;
 }
 
-function git(cwd: string, args: string[]): string | null {
+function git(
+  cwd: string,
+  args: string[],
+  env: NodeJS.ProcessEnv = {},
+  filterNames: readonly string[] = [],
+): string | null {
   try {
-    return execFileSync('git', safeGitArgs(args), {
+    return execFileSync('git', safeGitArgs(args, undefined, filterNames), {
       cwd,
-      env: safeGitEnv(),
+      env: safeGitEnv(env),
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 30_000,
+      maxBuffer: 64 * 1024 * 1024,
     }).trim();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Git's environment for a question about exactly one checkout.
+ *
+ * With a `.git` that is missing or not a repository, Git's discovery walks up
+ * the parent directories, and on this host `data/` sits inside the install's
+ * own checkout: the answer would describe that repository, not this directory
+ * (measured: a corrupt `.git` directory under a nested repo resolves
+ * `--show-toplevel` to the outer repo). The ceiling stops discovery at `dir`,
+ * so such a checkout fails, and reads as unprovable.
+ */
+function checkoutGitEnv(dir: string): NodeJS.ProcessEnv {
+  return { GIT_CEILING_DIRECTORIES: path.dirname(path.resolve(dir)) };
+}
+
+/**
+ * Every filter the repository at `dir` defines in its effective config (local,
+ * includes, worktree), so safeGitArgs can neutralize each one by name; `null`
+ * when that config cannot be read. A clone's `.git` is container-writable
+ * (worktrees/ is mounted read-write, container-runner.ts:4386), and `status`
+ * runs a clean filter whenever it rehashes a file.
+ */
+function repositoryFilterNames(dir: string, env: NodeJS.ProcessEnv): string[] | null {
+  const gitDir = git(dir, ['rev-parse', '--absolute-git-dir'], env);
+  if (gitDir === null) return null;
+  try {
+    return safeGitFilterNames(gitDir, dir);
   } catch {
     return null;
   }
@@ -157,6 +204,22 @@ function safeDirectories(directory: string): string[] | null {
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
     log.warn('Worktree cleanup: worktrees root unreadable; preserving its topic', { directory, err });
+    return null;
+  }
+}
+
+/**
+ * A topic's checkouts through the one lister (plan §5.1), or `null` when its
+ * worktrees root could not be read. `listTopicCheckouts` returns [] only for
+ * ENOENT and throws on every other read failure
+ * (repository-workspaces.ts:607-613), so an unreadable root is counted and
+ * preserved here, never mistaken for an empty one.
+ */
+function readTopicCheckouts(worktreeRoot: string): TopicCheckout[] | null {
+  try {
+    return listTopicCheckouts(worktreeRoot);
+  } catch (err) {
+    log.warn('Worktree cleanup: worktrees root unreadable; preserving its topic', { directory: worktreeRoot, err });
     return null;
   }
 }
@@ -269,37 +332,38 @@ function discover(dataDir: string, rows: SessionRow[] | null): DiscoveryResult {
   for (const [statePath, { unit, participants }] of mapping) {
     if (!fs.existsSync(statePath)) continue;
     const worktreeRoot = topicWorktreesDir(unit, dataDir);
-    const names = safeDirectories(worktreeRoot);
-    if (names === null) {
+    const checkouts = readTopicCheckouts(worktreeRoot);
+    if (checkouts === null) {
       unreadableRoots += 1;
       continue;
     }
-    for (const repo of names) {
-      // The worktrees root is not a pure repository namespace: the storage
-      // activity lease (`.nanoclaw-storage-active`) and the shared pnpm cache
-      // (`.pnpm-store`) live here too. Their names are not valid repository
-      // segments, so canonicalRepoDir() throws on them — and before this
-      // guard, one such directory aborted the entire cleanup pass at
-      // discovery, fleet-wide, forever.
-      //
-      // The filter is deliberately NOT widened to admit them. `SAFE_SEGMENT`
-      // is a path-traversal boundary, and a checkout that it rejects is
-      // preserved, never deleted. But some rejected names are legitimate
-      // repositories — `.github` and `.github-private` are real GitHub repos —
-      // so every filtered name is reported rather than dropped silently. A
-      // repository name in that report is an operator signal, not noise.
-      if (!isRepositoryName(repo)) {
-        filteredNames.add(`${unit.workgroupId}/${unit.kind}-${unit.id}/${repo}`);
-        continue;
-      }
-      const worktreePath = path.join(worktreeRoot, repo);
-      if (!fs.existsSync(worktreePath)) continue;
+    // The worktrees root is not a pure checkout namespace: the storage
+    // activity lease (`.nanoclaw-storage-active`) and a shared pnpm cache
+    // (`.pnpm-store`) live here too. The lister returns only names that parse
+    // as `<repo>` or `<repo>@<slug>` (repository-workspaces.ts:590-598), so
+    // none of them becomes a target;
+    // before a name filter existed, one such directory made canonicalRepoDir()
+    // throw and aborted the entire cleanup pass at discovery, fleet-wide.
+    //
+    // The parse is deliberately NOT widened to admit them. `SAFE_SEGMENT` is a
+    // path-traversal boundary, and a checkout it rejects is preserved, never
+    // deleted. But some rejected names are legitimate repositories — `.github`
+    // and `.github-private` are real GitHub repos — so every directory the
+    // lister skips is reported rather than dropped silently. A repository name
+    // in that report is an operator signal, not noise.
+    const listed = new Set(checkouts.map((checkout) => checkout.name));
+    for (const name of safeDirectories(worktreeRoot) ?? []) {
+      if (listed.has(name)) continue;
+      filteredNames.add(`${unit.workgroupId}/${unit.kind}-${unit.id}/${name}`);
+    }
+    for (const checkout of checkouts) {
       targets.push({
         workUnit: unit,
         participants,
-        repo,
-        worktreePath,
-        canonicalRepoPath: canonicalRepoDir(unit.workgroupId, repo, dataDir),
+        repo: checkout.repo,
+        worktreePath: checkout.path,
+        shape: checkout.shape,
+        canonicalRepoPath: canonicalRepoDir(unit.workgroupId, checkout.repo, dataDir),
       });
     }
   }
@@ -467,7 +531,81 @@ function branchMayBeRemoved(target: TopicWorktreeTarget): { eligible: boolean; r
   return { eligible: merged || gone, reason: merged ? 'merged' : gone ? 'remote-branch-gone' : 'unmerged' };
 }
 
-async function cleanupOne(target: TopicWorktreeTarget, dataDir: string = DATA_DIR): Promise<void> {
+/** What the clone branch decided for one clone checkout. The linked path reports nothing. */
+export interface CloneCleanupDecision {
+  collected: boolean;
+  reason: string;
+}
+
+async function cleanupOne(
+  target: TopicWorktreeTarget,
+  dataDir: string = DATA_DIR,
+): Promise<CloneCleanupDecision | undefined> {
+  if (target.shape === 'clone') return cleanupCloneCheckout(target, dataDir);
+  await cleanupLinkedCheckout(target, dataDir);
+  return undefined;
+}
+
+/**
+ * The clone branch of worktree cleanup (plan §5.8).
+ *
+ * A clone is a whole repository, not a registration in the canonical, so
+ * there is nothing for `git worktree remove` to do and nothing to deregister:
+ * it goes to the trash, as a scratch clone does. That is a heavier act than
+ * removing a linked checkout, so it asks for more:
+ *  - the topic's side-(a) evidence (sideAClear), on top of the busy and
+ *    transfer checks the linked path makes;
+ *  - the checkout itself idle for at least MINIMUM_IDLE_DAYS;
+ *  - proveCheckoutDisposable, which holds a clone to scope `all`: a clean
+ *    tree, no stash, and no commit on any local branch or HEAD that
+ *    `--remotes` lacks.
+ * Then quarantine, re-prove the moved copy, and trash (finalizeCloneCollection).
+ * Every check re-runs under the lifecycle claim and the repository lock, the
+ * pair repository_checkout holds (plan §5.2), so a checkout request cannot
+ * reuse this directory halfway through its collection.
+ */
+async function cleanupCloneCheckout(target: TopicWorktreeTarget, dataDir: string): Promise<CloneCleanupDecision> {
+  const context = {
+    workgroupId: target.workUnit.workgroupId,
+    workUnit: target.workUnit.key,
+    repo: target.repo,
+    path: target.worktreePath,
+  };
+  const refusal = (): string | null => {
+    if (!sideAClear(target.participants, topicIdleReclaimDays()).pass) return 'topic-open';
+    if (topicIsBusy(target.participants, dataDir)) return 'topic-busy';
+    if (transferReferencesPath(target, dataDir)) return 'transfer-referenced';
+    if (idleDays(target.worktreePath) < MINIMUM_IDLE_DAYS) return 'recent';
+    return null;
+  };
+  const early = refusal();
+  if (early) return { collected: false, reason: early };
+
+  return withRepositoryLifecycleClaims([target.workUnit], () =>
+    withHostRepositoryLock(
+      target.workUnit.workgroupId,
+      target.repo,
+      (): CloneCleanupDecision => {
+        const late = refusal();
+        if (late) return { collected: false, reason: late };
+        const proof = disposability.proveCheckoutDisposable({ path: target.worktreePath, shape: target.shape });
+        if (!proof.ok) {
+          if (idleDays(target.worktreePath) >= STALE_WARNING_DAYS) {
+            log.warn('Worktree cleanup: preserving stale clone checkout', { ...context, reason: proof.reason });
+          }
+          return { collected: false, reason: proof.reason };
+        }
+        const finalized = finalizeCloneCollection({ path: target.worktreePath }, dataDir, 'topic-checkout');
+        if (!finalized.ok) return { collected: false, reason: finalized.reason ?? 'finalize-refused' };
+        log.info('Worktree cleanup: trashed an idle clean pushed clone checkout', context);
+        return { collected: true, reason: proof.reason };
+      },
+      dataDir,
+    ),
+  );
+}
+
+async function cleanupLinkedCheckout(target: TopicWorktreeTarget, dataDir: string): Promise<void> {
   const context = { workgroupId: target.workUnit.workgroupId, workUnit: target.workUnit.key, repo: target.repo };
   if (topicIsBusy(target.participants, dataDir)) return;
   if (transferReferencesPath(target, dataDir)) return;
@@ -627,7 +765,7 @@ function gcMode(): 'dry-run' | 'apply' {
  * only a linked worktree's git-dir has a `locked` file to find.
  */
 function isWorktreeLocked(dir: string): boolean {
-  const gitDir = git(dir, ['rev-parse', '--path-format=absolute', '--git-dir']);
+  const gitDir = git(dir, ['rev-parse', '--path-format=absolute', '--git-dir'], checkoutGitEnv(dir));
   return gitDir !== null && fs.existsSync(path.join(gitDir, 'locked'));
 }
 
@@ -635,28 +773,75 @@ function isWorktreeLocked(dir: string): boolean {
  * Positive proof that a checkout holds nothing worth keeping.
  *
  * `scope` is 'head' for a linked worktree (its branch is the only one it owns)
- * and 'all' for a clone, which owns every local branch in it. A git invocation
+ * and 'all' for a clone, which owns every local branch in it and its HEAD.
+ * Reach it through proveCheckoutDisposable, which picks the scope. A git invocation
  * that fails — the usual cause is a pruned worktree admin directory or a gitdir
  * only resolvable inside a container — returns unprovable, never clean.
  */
 function provenDisposable(dir: string, scope: 'head' | 'all'): { ok: boolean; reason: string } {
   if (isWorktreeLocked(dir)) return { ok: false, reason: 'worktree-locked' };
+  const env = checkoutGitEnv(dir);
 
-  const status = git(dir, ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
+  // Host git runs inside a repository a container may have configured. Every
+  // host call has signature programs off (safe-git.ts BASE_CONFIG), and each
+  // filter this repository defines is neutralized by name. An embedded
+  // repository is refused before `status` could recurse into it: its own config
+  // is out of the overrides' reach, and its history out of this proof's.
+  // `--ignore-submodules=all` covers one added between the two commands.
+  // A repository whose config or index cannot be read has a status no host
+  // command can safely prove.
+  const filters = repositoryFilterNames(dir, env);
+  if (filters === null) return { ok: false, reason: 'status-unprovable' };
+  const modes = git(dir, ['ls-files', '-z', '--format=%(objectmode)'], env, filters);
+  if (modes === null) return { ok: false, reason: 'status-unprovable' };
+  if (modes.split('\0').includes('160000')) return { ok: false, reason: 'submodule' };
+
+  const status = git(
+    dir,
+    ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignore-submodules=all'],
+    env,
+    filters,
+  );
   if (status === null) return { ok: false, reason: 'status-unprovable' };
   if (status !== '') return { ok: false, reason: 'dirty' };
 
+  const stashVerdict = (): { ok: boolean; reason: string } | null => {
+    const stash = git(dir, ['stash', 'list'], env);
+    if (stash === null) return { ok: false, reason: 'stash-unprovable' };
+    return stash === '' ? null : { ok: false, reason: 'stashed' };
+  };
+  // For a clone the stash is read BEFORE the log below, which counts
+  // refs/stash too and would otherwise report a stash as 'unpushed'. The log
+  // still backs it: a refs/stash with no reflog is invisible to `stash list`
+  // but not to `--all` (measured on this host, git 2.43).
+  if (scope === 'all') {
+    const stashed = stashVerdict();
+    if (stashed) return stashed;
+  }
+
+  // Scope 'all': every local ref's commits must be on origin. `--all` names
+  // HEAD, every branch, tag, note and replace ref, the stash and every other
+  // remote's refs. A commit reachable only from a tag, a detached HEAD or a
+  // note is on no branch, and the former `--branches HEAD` read a tag-only
+  // commit as pushed (PR #657 review, round 2). HEAD stays named explicitly:
+  // `--all` alone exits 0 with no output on an unborn HEAD (measured, git
+  // 2.43), while `log HEAD` fails there, so such a repository reads as
+  // unprovable, never as clean. Only origin's remote-tracking refs are
+  // evidence for a clone: another remote (a sibling clone, a local backup)
+  // can hold commits no real remote has. Scope 'head' is a linked worktree's
+  // proof, unchanged: its HEAD against every remote-tracking ref.
   const unpushedArgs =
     scope === 'all'
-      ? ['log', '--branches', '--not', '--remotes', '--oneline']
+      ? ['log', '--all', 'HEAD', '--not', '--remotes=origin', '--oneline']
       : ['log', 'HEAD', '--not', '--remotes', '--oneline'];
-  const unpushed = git(dir, unpushedArgs);
+  const unpushed = git(dir, unpushedArgs, env);
   if (unpushed === null) return { ok: false, reason: 'log-unprovable' };
   if (unpushed !== '') return { ok: false, reason: 'unpushed' };
 
-  const stash = git(dir, ['stash', 'list']);
-  if (stash === null) return { ok: false, reason: 'stash-unprovable' };
-  if (stash !== '') return { ok: false, reason: 'stashed' };
+  if (scope === 'head') {
+    const stashed = stashVerdict();
+    if (stashed) return stashed;
+  }
 
   // A repository that backs linked worktrees owns an object store those
   // checkouts share; trashing it destroys their history, and nothing above
@@ -675,7 +860,7 @@ function provenDisposable(dir: string, scope: 'head' | 'all'): { ok: boolean; re
   // Only for scope 'all' (a clone). A linked worktree is itself an entry in
   // some other repo's registry and legitimately has none of its own.
   if (scope === 'all') {
-    const gitDir = git(dir, ['rev-parse', '--path-format=absolute', '--git-dir']);
+    const gitDir = git(dir, ['rev-parse', '--path-format=absolute', '--git-dir'], env);
     if (gitDir === null) return { ok: false, reason: 'gitdir-unprovable' };
     const registered = safeDirectories(path.join(gitDir, 'worktrees'));
     // null is "the directory exists but could not be read" — unprovable, not
@@ -688,6 +873,28 @@ function provenDisposable(dir: string, scope: 'head' | 'all'): { ok: boolean; re
 
   return { ok: true, reason: 'clean-and-pushed' };
 }
+
+/**
+ * The one disposability primitive (plan §5.8). A clone owns every local branch
+ * in it, so it is proved with scope `all`; a linked worktree owns only its
+ * HEAD, as it always has; a checkout whose shape the lister could not decide
+ * is refused outright.
+ */
+export function proveCheckoutDisposable(checkout: Pick<TopicCheckout, 'path' | 'shape'>): {
+  ok: boolean;
+  reason: string;
+} {
+  if (checkout.shape === 'clone') return disposability.provenDisposable(checkout.path, 'all');
+  if (checkout.shape === 'linked') return disposability.provenDisposable(checkout.path, 'head');
+  return { ok: false, reason: 'unknown-shape' };
+}
+
+/**
+ * Every proof in this file is called through this object, never by bare name,
+ * so a spy sees each one (plan §9 P2-13). Only proveCheckoutDisposable calls
+ * provenDisposable.
+ */
+export const disposability = { provenDisposable, proveCheckoutDisposable };
 
 /** Directories with a real .git DIRECTORY. Symlinks are never candidates: a
  *  bedroom link such as agent/<name> -> workgroup/<name> is not a clone, and a
@@ -826,6 +1033,33 @@ function record(report: GcReport, candidate: GcCandidate): void {
   }
 }
 
+/**
+ * Everything under a topic's `worktrees/` that must be proved disposable
+ * before the topic can be (plan §5.8), or `null` when the root cannot be read.
+ *
+ * - Each checkout the lister returns, with the shape it decided.
+ * - Each other directory, as shape `unknown`: probed like a checkout, and so
+ *   refused. A leftover lease dir, a stray `.pnpm-store` or a legacy `.github`
+ *   checkout lands here; a name the lister cannot parse is not evidence that
+ *   anything under it is disposable. repository_checkout's staging is not in
+ *   `worktrees/` at all (`checkoutStagingRoot`); it goes with its topic.
+ *
+ * The second read exists only to find what the lister deliberately skips. An
+ * entry created between the two reads shows up only in the second, as
+ * `unknown`, so that race refuses the topic rather than passing it.
+ */
+function topicDisposabilityProbes(worktreeRoot: string): Array<Pick<TopicCheckout, 'path' | 'shape'>> | null {
+  const checkouts = readTopicCheckouts(worktreeRoot);
+  if (checkouts === null) return null;
+  const names = safeDirectories(worktreeRoot);
+  if (names === null) return null;
+  const listed = new Set(checkouts.map((checkout) => checkout.name));
+  const others = names
+    .filter((name) => !listed.has(name))
+    .map((name) => ({ path: path.join(worktreeRoot, name), shape: 'unknown' as const }));
+  return [...checkouts, ...others];
+}
+
 function collectOrphanTopics(report: GcReport, dataDir: string, owners: Map<string, TopicParticipant[]>): void {
   const topicsRoot = path.join(dataDir, 'v2-topics');
   const idleReclaimDays = topicIdleReclaimDays();
@@ -868,21 +1102,22 @@ function collectOrphanTopics(report: GcReport, dataDir: string, owners: Map<stri
         continue;
       }
 
-      // The ONE safeDirectories call here that must not fall back to []. The
-      // loop below is what proves every checkout under this topic disposable;
+      // The ONE enumeration here that must not fall back to []. The loop
+      // below is what proves every checkout under this topic disposable;
       // reading an unreadable root as empty leaves `refused` null and records
       // the whole topic as collectable on the strength of a directory nobody
       // could read. The discovery-side calls in this file may use `?? []`
       // because a missed candidate is a missed deletion; this one authorizes
-      // one.
-      const repos = safeDirectories(worktreeRoot);
-      if (repos === null) {
+      // one. Every entry is proved through proveCheckoutDisposable, so a
+      // clone answers for all of its branches, not only its HEAD.
+      const probes = topicDisposabilityProbes(worktreeRoot);
+      if (probes === null) {
         skip('worktrees-unreadable');
         continue;
       }
       let refused: string | null = null;
-      for (const repo of repos) {
-        const decision = provenDisposable(path.join(worktreeRoot, repo), 'head');
+      for (const probe of probes) {
+        const decision = disposability.proveCheckoutDisposable(probe);
         if (!decision.ok) {
           refused = decision.reason;
           break;
@@ -957,7 +1192,9 @@ function collectClones(
       skip('bound-worktrees');
       continue;
     }
-    const decision = provenDisposable(candidate.dir, 'all');
+    // isPrivateClone found a real `.git` directory, which is the lister's own
+    // definition of a clone (repository-workspaces.ts:632).
+    const decision = disposability.proveCheckoutDisposable({ path: candidate.dir, shape: 'clone' });
     if (!decision.ok) {
       skip(decision.reason);
       continue;
@@ -1183,7 +1420,88 @@ function overlapsAny(target: string, mounts: string[]): boolean {
  * copy to the real `trash` for its 30-day retention.
  */
 /**
- * Roll a quarantined topic back toward its original path, repo by repo.
+ * Every entry name in `directory` — files and links included, not only
+ * directories — sorted; `[]` when it is absent and `null` when it cannot be
+ * read. A rollback must see everything the quarantine holds, because an entry
+ * it does not see is one it cannot put back.
+ */
+function quarantineEntryNames(directory: string): string[] | null {
+  try {
+    return fs.readdirSync(directory).sort();
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'ENOENT' ? [] : null;
+  }
+}
+
+/** Best-effort: puts a topic's recovery marker back, so recoverOrphanedQuarantine can still find the entry. */
+function rewriteQuarantineMarker(quarantinePath: string, originalPath: string): void {
+  try {
+    fs.writeFileSync(path.join(quarantinePath, QUARANTINE_META_FILE), JSON.stringify({ originalPath }));
+  } catch (err) {
+    log.error('Storage GC: could not put a quarantine recovery marker back', { quarantinePath, err });
+  }
+}
+
+/**
+ * Put one quarantined entry back at `to`, or trash it when a live copy
+ * already holds that slot. Returns true once the entry has left quarantine
+ * (restored or trashed), false while it is still there. `deregistration` is
+ * set only for a linked worktree: trashing its copy leaves a canonical
+ * registration to remove afterward, which the caller does.
+ */
+function restoreQuarantinedEntry(
+  from: string,
+  to: string,
+  deregistration: PendingWorktreeRemoval | null,
+  pendingRemovals: PendingWorktreeRemoval[],
+): boolean {
+  const entry = path.basename(from);
+  if (fs.existsSync(to)) {
+    log.warn('Storage GC: idle-topic rollback found the destination already recreated; keeping the live copy', {
+      entry,
+      to,
+    });
+    // A locked copy restores, never trashes — leave it in quarantine
+    // rather than destroy something explicitly marked "don't touch".
+    if (isWorktreeLocked(from)) {
+      log.warn('Storage GC: superseded quarantine copy is locked; leaving it in quarantine, not trashing', {
+        entry,
+        from,
+      });
+      return false;
+    }
+    try {
+      trashPath(from);
+    } catch (err) {
+      log.error('Storage GC: could not trash a superseded quarantine copy', { entry, from, err });
+      return false;
+    }
+    if (deregistration) pendingRemovals.push(deregistration);
+    return true;
+  }
+  try {
+    fs.renameSync(from, to);
+    return true;
+  } catch (err) {
+    log.error('Storage GC: idle-topic rollback rename failed for one entry; trashing that copy instead', {
+      entry,
+      from,
+      to,
+      err,
+    });
+  }
+  try {
+    trashPath(from);
+  } catch (trashErr) {
+    log.error('Storage GC: could not even trash the stranded quarantine copy', { entry, from, err: trashErr });
+    return false;
+  }
+  if (deregistration) pendingRemovals.push(deregistration);
+  return true;
+}
+
+/**
+ * Roll a quarantined topic back to its original path.
  *
  * Precondition: every topic reaching finalizeIdleCollection already passed
  * provenDisposable (clean, pushed, no stash) at scan time. So no interleaving
@@ -1192,105 +1510,121 @@ function overlapsAny(target: string, mounts: string[]): boolean {
  * on an empty root). Every branch below is designed to end in a state the
  * next spawn can build from.
  *
- * Naive whole-topic rename-back isn't safe: the spawn path does
+ * One rule serves the first attempt and every retry, whatever an earlier
+ * attempt left behind: what occupies the original path decides, never what
+ * the quarantine still holds. While nothing does, the whole topic goes back in
+ * one rename. Once something does — the spawn path does
  * `mkdirSync(<topic>/worktrees, {recursive:true})` (container-runner.ts:1746)
- * on its own, so a live container can already have recreated the destination
- * by the time we get here, and a bare rename would EEXIST. Reconcile per repo
- * instead: if the destination slot is absent, rename that repo back in place
- * (its registration is still valid there, so the checkout works immediately).
- * If the destination is already occupied (the agent beat us to it), keep the
- * live copy and trash the quarantined one — safe per the precondition above.
- * If one repo copy cannot be restored and is successfully trashed, remove
- * only that exact missing checkout's canonical registration afterward. A
- * repository-wide prune is forbidden here: another missing registration can
- * still hold the only copy of an agent's staged index.
+ * on its own, so a live container can recreate the destination at any moment,
+ * and a bare rename onto it fails — each entry goes back on its own: every
+ * entry of the quarantined `worktrees/` (a `<repo>` or `<repo>@<slug>`
+ * checkout, or a name the lister does not parse) and every other entry of the
+ * topic. If an entry's slot is absent, rename it back in place (a linked
+ * worktree's registration is still valid there, so it works immediately). If
+ * the slot is already occupied (the agent beat us to it), keep the live copy
+ * and trash the quarantined one — safe per the precondition above — unless it
+ * is locked. If a linked copy cannot be restored and is successfully trashed,
+ * remove only that exact missing checkout's canonical registration afterward,
+ * from the canonical of the repo its name parses to; a clone is registered
+ * nowhere. A repository-wide prune is forbidden here: another missing
+ * registration can still hold the only copy of an agent's staged index.
+ *
+ * Nothing whole is ever trashed, and a failed whole-topic restore stays in
+ * quarantine. A directory that cannot be listed restores nothing: an entry
+ * that was never seen is one whose lock was never checked. The recovery marker
+ * goes only once every entry has been restored or deliberately trashed;
+ * anything left behind keeps it, so recoverOrphanedQuarantine retries next
+ * pass: an entry without a marker is one it can never identify.
  */
 function reconcileQuarantine(candidate: GcCandidate, quarantinePath: string, dataDir: string): void {
-  // Never let the recovery marker itself land back inside a restored topic.
-  try {
-    fs.rmSync(path.join(quarantinePath, QUARANTINE_META_FILE), { force: true });
-  } catch {
-    // Best-effort — a leftover marker is a leak, not a correctness issue.
-  }
-  const repos = (safeDirectories(path.join(quarantinePath, 'worktrees')) ?? []).filter(isRepositoryName);
-  const pendingRemovals: PendingWorktreeRemoval[] = [];
+  if (!fs.existsSync(quarantinePath)) return;
+  const marker = path.join(quarantinePath, QUARANTINE_META_FILE);
 
-  if (repos.length > 0) {
-    const destWorktrees = path.join(candidate.path, 'worktrees');
-    fs.mkdirSync(destWorktrees, { recursive: true });
-    for (const repo of repos) {
-      const from = path.join(quarantinePath, 'worktrees', repo);
-      const to = path.join(destWorktrees, repo);
-      if (fs.existsSync(to)) {
-        log.warn('Storage GC: idle-topic rollback found the destination already recreated; keeping the live copy', {
-          repo,
-          to,
-        });
-        // A locked copy restores, never trashes — leave it in quarantine
-        // rather than destroy something explicitly marked "don't touch".
-        if (isWorktreeLocked(from)) {
-          log.warn('Storage GC: superseded quarantine repo copy is locked; leaving it in quarantine, not trashing', {
-            repo,
-            from,
-          });
-        } else {
-          try {
-            trashPath(from);
-            pendingRemovals.push({
-              workgroupId: path.basename(path.dirname(candidate.path)),
-              repo,
-              worktreePath: to,
-            });
-          } catch (err) {
-            log.error('Storage GC: could not trash a superseded quarantine repo copy', { repo, from, err });
-          }
-        }
-        continue;
-      }
-      try {
-        fs.renameSync(from, to);
-      } catch (err) {
-        log.error('Storage GC: idle-topic rollback rename failed for one repo; trashing that copy instead', {
-          repo,
-          from,
-          to,
-          err,
-        });
-        try {
-          trashPath(from);
-          pendingRemovals.push({ workgroupId: path.basename(path.dirname(candidate.path)), repo, worktreePath: to });
-        } catch (trashErr) {
-          log.error('Storage GC: could not even trash the stranded quarantine repo copy', {
-            repo,
-            from,
-            err: trashErr,
-          });
-        }
-      }
-    }
-    // Best-effort tidy of the now-empty quarantine entry; a leftover here is
-    // harmless (next reclaim pass or tmpfiles.d cleans it up regardless).
+  if (!fs.existsSync(candidate.path)) {
+    // Never let the recovery marker itself land back inside a restored topic.
     try {
-      fs.rmdirSync(path.join(quarantinePath, 'worktrees'));
-      fs.rmdirSync(quarantinePath);
+      fs.rmSync(marker, { force: true });
     } catch {
-      // Non-empty (a repo copy got stranded above) or already gone — fine.
+      // Best-effort — a leftover marker is a leak, not a correctness issue.
     }
-  } else if (fs.existsSync(quarantinePath)) {
-    // No repo split to reconcile — fall back to a whole-topic restore.
     try {
       fs.renameSync(quarantinePath, candidate.path);
+      return;
     } catch (err) {
-      log.error('Storage GC: idle-topic rollback rename failed; trashing the quarantined copy instead', {
-        quarantinePath,
-        original: candidate.path,
-        err,
-      });
-      try {
-        trashPath(quarantinePath);
-      } catch (trashErr) {
-        log.error('Storage GC: could not even trash the stranded quarantine copy', { quarantinePath, err: trashErr });
+      rewriteQuarantineMarker(quarantinePath, candidate.path);
+      if (!fs.existsSync(candidate.path)) {
+        log.error('Storage GC: idle-topic rollback rename failed; leaving the topic in quarantine for a retry', {
+          quarantinePath,
+          original: candidate.path,
+          err,
+        });
+        return;
       }
+      // Recreated between the check and the rename: go back entry by entry.
+    }
+  }
+
+  const workgroupId = path.basename(path.dirname(candidate.path));
+  const pendingRemovals: PendingWorktreeRemoval[] = [];
+  const topLevel = quarantineEntryNames(quarantinePath);
+  let leftBehind = topLevel === null;
+  for (const name of topLevel ?? []) {
+    if (name === QUARANTINE_META_FILE) continue;
+    if (name !== 'worktrees') {
+      if (!restoreQuarantinedEntry(path.join(quarantinePath, name), path.join(candidate.path, name), null, [])) {
+        leftBehind = true;
+      }
+      continue;
+    }
+    const quarantineWorktrees = path.join(quarantinePath, name);
+    const entries = quarantineEntryNames(quarantineWorktrees);
+    if (entries === null) {
+      leftBehind = true;
+      continue;
+    }
+    // Shapes come from the one lister (plan §5.1): only a linked entry (its
+    // `.git` is a file) is registered with a canonical, under the repo its
+    // name parses to. A read failure here only loses deregistrations, which
+    // leave a stale registration, never lost work; every entry still goes back.
+    const linkedRepo = new Map(
+      (readTopicCheckouts(quarantineWorktrees) ?? [])
+        .filter((checkout) => checkout.shape === 'linked')
+        .map((checkout) => [checkout.name, checkout.repo] as const),
+    );
+    const destWorktrees = path.join(candidate.path, 'worktrees');
+    if (entries.length > 0) fs.mkdirSync(destWorktrees, { recursive: true });
+    let worktreesLeftBehind = false;
+    for (const entry of entries) {
+      const to = path.join(destWorktrees, entry);
+      const repo = linkedRepo.get(entry);
+      const deregistration = repo === undefined ? null : { workgroupId, repo, worktreePath: to };
+      if (!restoreQuarantinedEntry(path.join(quarantineWorktrees, entry), to, deregistration, pendingRemovals)) {
+        worktreesLeftBehind = true;
+      }
+    }
+    if (worktreesLeftBehind) {
+      leftBehind = true;
+      continue;
+    }
+    try {
+      fs.rmdirSync(quarantineWorktrees);
+    } catch {
+      leftBehind = true; // Something is still in there: keep the marker.
+    }
+  }
+
+  if (leftBehind) {
+    log.warn('Storage GC: idle-topic rollback left entries in quarantine; keeping its recovery marker for a retry', {
+      quarantinePath,
+      original: candidate.path,
+    });
+  } else {
+    // Only now is nothing the marker describes left in quarantine.
+    try {
+      fs.rmSync(marker, { force: true });
+      fs.rmdirSync(quarantinePath);
+    } catch {
+      // Best-effort: a marker-only entry left here is reconciled next pass.
     }
   }
 
@@ -1470,7 +1804,9 @@ function removeMissingWorktreeRegistration(
     typeof entry.repo !== 'string' ||
     typeof entry.worktreePath !== 'string' ||
     !path.isAbsolute(entry.worktreePath) ||
-    path.basename(entry.worktreePath) !== entry.repo ||
+    // `<repo>` or `<repo>@<slug>`: the checkout's name must parse to the repo
+    // whose canonical holds the registration.
+    parseCheckoutDirName(path.basename(entry.worktreePath))?.repo !== entry.repo ||
     path.basename(path.dirname(entry.worktreePath)) !== 'worktrees'
   ) {
     return false;
@@ -1730,7 +2066,11 @@ function restoreQuarantinedClone(originalPath: string, quarantinePath: string): 
  * post-move check than a timestamp, because it re-answers the actual question
  * ("is everything in here recoverable?") rather than a proxy for it.
  */
-function finalizeCloneCollection(candidate: GcCandidate, dataDir: string): { ok: boolean; reason?: string } {
+function finalizeCloneCollection(
+  candidate: Pick<GcCandidate, 'path'>,
+  dataDir: string,
+  kind: 'scratch' | 'topic-checkout' = 'scratch',
+): { ok: boolean; reason?: string } {
   const resolvedOriginal = fs.realpathSync(candidate.path);
   const quarantineRoot = path.join(dataDir, '.gc-quarantine');
   const quarantinePath = path.join(quarantineRoot, `${path.basename(candidate.path)}-${Date.now()}`);
@@ -1765,8 +2105,15 @@ function finalizeCloneCollection(candidate: GcCandidate, dataDir: string): { ok:
     return { ok: false, reason };
   };
 
+  // A scratch clone under an active group is always inside a mount source
+  // (#190), so only the strong relation refuses one. A topic checkout lives
+  // under `<topic>/worktrees`, which is mounted only into its own work unit's
+  // containers (container-runner.ts:4379-4385): inside any mount source means
+  // a running container can reach it, so it refuses on anything but 'clear',
+  // as finalizeIdleCollection does for a whole topic.
   const freshMounts = runningContainerMounts();
-  if (freshMounts === null || mountRelation(resolvedOriginal, freshMounts) === 'is-mount-source') {
+  const relation = freshMounts === null ? null : mountRelation(resolvedOriginal, freshMounts);
+  if (relation === null || relation === 'is-mount-source' || (kind === 'topic-checkout' && relation !== 'clear')) {
     return restore('aborted-late-mount');
   }
   const freshCwds = liveProcessCwds();
@@ -1775,7 +2122,8 @@ function finalizeCloneCollection(candidate: GcCandidate, dataDir: string): { ok:
   }
   // Re-prove the moved copy, not the original path: this is the check that
   // catches a write landing in the gap between the scan and now.
-  const decision = provenDisposable(quarantinePath, 'all');
+  // Both callers only ever finalize a clone, so the moved copy is proved as one.
+  const decision = disposability.proveCheckoutDisposable({ path: quarantinePath, shape: 'clone' });
   if (!decision.ok) return restore(`aborted-${decision.reason}`);
 
   try {
@@ -1825,10 +2173,12 @@ async function finalizeIdleCollection(
     return { ok: false, reason: 'aborted-late-activity' };
   }
 
-  // Capture the repo list before trashing (quarantinePath won't exist to list
-  // afterward).
-  const repoListing = safeDirectories(path.join(quarantinePath, 'worktrees'));
-  if (repoListing === null) {
+  // Capture the checkouts before trashing (quarantinePath won't exist to list
+  // afterward), through the one lister. Only a linked worktree (its `.git` is
+  // a file) is registered with a canonical, under the repo its name parses
+  // to, `<repo>` or `<repo>@<slug>`; a clone has nothing to deregister.
+  const listed = readTopicCheckouts(path.join(quarantinePath, 'worktrees'));
+  if (listed === null) {
     // A real read failure (EACCES/EIO), not "no worktrees" — treating it as
     // empty would prune nothing yet still trash the topic. Leave the entry in
     // quarantine untouched: recoverOrphanedQuarantine retries it next pass,
@@ -1838,8 +2188,14 @@ async function finalizeIdleCollection(
     });
     return { ok: false, reason: 'quarantine-unreadable' };
   }
-  const repos = repoListing.filter(isRepositoryName);
   const workgroupId = path.basename(path.dirname(candidate.path));
+  const deregistrations: PendingWorktreeRemoval[] = listed
+    .filter((checkout) => checkout.shape === 'linked')
+    .map((checkout) => ({
+      workgroupId,
+      repo: checkout.repo,
+      worktreePath: path.join(candidate.path, 'worktrees', checkout.name),
+    }));
 
   // #183: the durable-write fence runs LAST, immediately before the
   // irreversible trash — not before freshMounts/repoListing above, which
@@ -1887,14 +2243,7 @@ async function finalizeIdleCollection(
     // leaves a durable record instead of a silently dangling registration.
     // runPendingPrunes sweeps this at the start of the next apply pass.
     const priorPending = readPendingPrunes(dataDir);
-    const journaled = writePendingPrunes(dataDir, [
-      ...priorPending,
-      ...repos.map((repo) => ({
-        workgroupId,
-        repo,
-        worktreePath: path.join(candidate.path, 'worktrees', repo),
-      })),
-    ]);
+    const journaled = writePendingPrunes(dataDir, [...priorPending, ...deregistrations]);
     if (!journaled) {
       // Codex P2: a read-only dataDir or ENOSPC here must not fall through to
       // trashing anyway — that's exactly the crash-without-a-record window
@@ -1928,23 +2277,21 @@ async function finalizeIdleCollection(
   // because the checkout was proven disposable before trash and the helper
   // re-proves that the private linked index is clean and unlocked. Never use
   // repository-wide prune: unrelated missing owners may retain staged work.
-  for (const repo of repos) {
-    const pending = {
-      workgroupId,
-      repo,
-      worktreePath: path.join(candidate.path, 'worktrees', repo),
-    };
+  for (const pending of deregistrations) {
     if (!removeMissingWorktreeRegistration(pending, dataDir)) {
-      log.warn(
-        'Storage GC: targeted worktree deregistration failed after idle collection; retry is journaled',
-        pending,
-      );
+      log.warn('Storage GC: targeted worktree deregistration failed after idle collection; retry is journaled', {
+        ...pending,
+      });
     } else {
       writePendingPrunes(
         dataDir,
         readPendingPrunes(dataDir).filter(
           (entry) =>
-            !(entry.workgroupId === workgroupId && entry.repo === repo && entry.worktreePath === pending.worktreePath),
+            !(
+              entry.workgroupId === pending.workgroupId &&
+              entry.repo === pending.repo &&
+              entry.worktreePath === pending.worktreePath
+            ),
         ),
       );
     }
@@ -2029,10 +2376,10 @@ function recoverOrphanedQuarantine(dataDir: string, report: GcReport): void {
       continue;
     }
     if (category === 'clone') {
-      // A clone's rollback is a plain rename; reconcileQuarantine's per-repo
-      // split and canonical prune would be meaningless here and its
-      // `isRepositoryName` filter could misread a coincidental `worktrees`
-      // directory inside the clone's own tree.
+      // A clone's rollback is a plain rename; reconcileQuarantine's per-entry
+      // split and canonical deregistration would be meaningless here, and it
+      // would take a coincidental `worktrees` directory inside the clone's
+      // own tree for a topic's.
       restoreQuarantinedClone(originalPath, quarantinePath);
       log.warn('Storage GC: restored an orphaned clone quarantine entry after an interrupted pass', {
         originalPath,
@@ -2056,7 +2403,7 @@ function recoverOrphanedQuarantine(dataDir: string, report: GcReport): void {
     };
     if (fs.existsSync(originalPath)) {
       // A spawn recreated the destination while the process was down —
-      // reconcile exactly like a live rollback (per-repo, conditional prune).
+      // reconcile exactly like a live rollback (per entry, exact deregistration).
       reconcileQuarantine(placeholder, quarantinePath, dataDir);
       log.warn('Storage GC: reconciled an orphaned quarantine entry after an interrupted pass', {
         originalPath,
@@ -2091,6 +2438,9 @@ function recoverOrphanedQuarantine(dataDir: string, report: GcReport): void {
         quarantinePath,
         err,
       });
+      // The marker was removed so it would not land in the restored topic;
+      // the entry stayed, so put it back or no later pass can find it.
+      rewriteQuarantineMarker(quarantinePath, originalPath);
     }
   }
   try {
@@ -2201,8 +2551,11 @@ export async function _discoveryStatsForTesting(dataDir: string = DATA_DIR): Pro
   return discover(dataDir, await readSessionInventory());
 }
 
-export async function _cleanupOneForTesting(target: TopicWorktreeTarget, dataDir: string = DATA_DIR): Promise<void> {
-  await cleanupOne(target, dataDir);
+export async function _cleanupOneForTesting(
+  target: TopicWorktreeTarget,
+  dataDir: string = DATA_DIR,
+): Promise<CloneCleanupDecision | undefined> {
+  return cleanupOne(target, dataDir);
 }
 
 export function _hostPathForProcessCwdForTesting(mountinfoText: string, cwd: string): string | null {

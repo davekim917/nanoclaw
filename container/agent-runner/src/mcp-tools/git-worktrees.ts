@@ -2,9 +2,18 @@
  * Git repository MCP tools.
  *
  * One host-owned normal canonical clone exists per (workgroup, repository).
- * Each topic receives one standard linked worktree. The host mounts the topic
- * root and canonical metadata at their exact host paths, so Git records paths
- * that work unchanged from both the host and every sibling container.
+ * Each thread's checkouts live under the topic root. In
+ * `NANOCLAW_CHECKOUT_MODE=worktree` (default) a thread has one linked worktree
+ * per repo at `/workspace/worktrees/<repo>`, and another branch is refused. In
+ * `clone` mode `/workspace/worktrees/<repo>` is the primary and
+ * `/workspace/worktrees/<repo>@<slug>` holds any other branch, each an
+ * independent clone (plan docs/specs/repository-branch-clones/plan.md
+ * §5.2-§5.3). Resolution
+ * (`resolveCheckout`) is shape-aware and branch-aware in both modes, so a
+ * clone created under `clone` mode stays usable after a rollback to
+ * `worktree` mode (R10). The host mounts the topic root and canonical
+ * metadata at their exact host paths, so Git records paths that work
+ * unchanged from both the host and every sibling container.
  */
 import { dlopen } from 'bun:ffi';
 import { execFileSync } from 'child_process';
@@ -12,6 +21,8 @@ import { createHash, randomBytes } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
+import { checkoutDirName, checkoutShapeAt } from './checkout-layout.js';
+import { getMessageIn, markCompleted } from '../db/messages-in.js';
 import { writeMessageOut } from '../db/messages-out.js';
 import { evaluateReviewChurnGate } from '../review-churn-gate.js';
 import { registerTools } from './server.js';
@@ -65,6 +76,18 @@ function validateSegment(value: string, label: string): string | null {
   return null;
 }
 
+// ── Checkout mode (plan §5.3 M1) ─────────────────────────────────────────────
+//
+// Controls creation only. Resolution (resolveCheckout) is shape-aware and
+// branch-aware regardless of mode, so a clone made under `clone` mode keeps
+// working after a rollback to `worktree` mode (R10, P2-18).
+
+type CheckoutMode = 'worktree' | 'clone';
+
+function checkoutMode(): CheckoutMode {
+  return process.env.NANOCLAW_CHECKOUT_MODE === 'clone' ? 'clone' : 'worktree';
+}
+
 function runGitAt(cwd: string, args: string[], timeoutMs = 120_000): string {
   return execFileSync('git', args, {
     cwd,
@@ -87,6 +110,11 @@ function runGitAt(cwd: string, args: string[], timeoutMs = 120_000): string {
  * existed: the gate judges one PR's history while the refspec pushes the other
  * branch's commit. `status --porcelain=v2 --branch` reports both from a single
  * snapshot, so there is no window to lose rather than a smaller one.
+ *
+ * Unchanged by the branch-clones plan (§5.3): `context.worktree` and
+ * `context.lockPath` already point at whichever checkout `resolveCheckout`
+ * selected (see `contextForCheckout`), so this primitive never needs to know
+ * about checkout shape at all.
  */
 async function capturedIdentity(
   context: RepositoryContext,
@@ -266,22 +294,30 @@ function identity(stat: fs.Stats): string {
   return `${stat.dev}:${stat.ino}`;
 }
 
-async function withRepositoryLock<T>(context: RepositoryContext, fn: () => Promise<T> | T): Promise<T> {
+/**
+ * The flock loop shared by every checkout's lock, whatever its path: the
+ * canonical `repository.lock` for a linked checkout, or a clone's own
+ * `.git/nanoclaw-checkout.lock` (plan §5.3 "Locking"). The lock file itself
+ * must already exist — `withRepositoryLock` relies on the host having
+ * provisioned the canonical lock, and clone callers provision their own
+ * on demand via `ensureCloneLock` before calling this.
+ */
+async function withFlockAt<T>(lockPath: string, fn: () => Promise<T> | T): Promise<T> {
   let fd: number;
   try {
-    fd = fs.openSync(context.lockPath, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW);
+    fd = fs.openSync(lockPath, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ELOOP') throw new Error('repository lock must not be a symlink');
-    throw new Error(`repository lock is unavailable for ${context.repo}`);
+    throw new Error(`repository lock is unavailable: ${lockPath}`);
   }
   const openedIdentity = identity(fs.fstatSync(fd));
   const deadline = Date.now() + LOCK_WAIT_MS;
   try {
     while (libc.symbols.flock(fd, LOCK_EX_NB) !== 0) {
-      if (Date.now() >= deadline) throw new Error(`timed out acquiring repository lock for ${context.repo}`);
+      if (Date.now() >= deadline) throw new Error(`timed out acquiring repository lock: ${lockPath}`);
       await Bun.sleep(25);
     }
-    const current = fs.lstatSync(context.lockPath);
+    const current = fs.lstatSync(lockPath);
     if (!current.isFile() || current.isSymbolicLink() || identity(current) !== openedIdentity) {
       throw new Error('repository lock identity changed');
     }
@@ -290,6 +326,26 @@ async function withRepositoryLock<T>(context: RepositoryContext, fn: () => Promi
     libc.symbols.flock(fd, LOCK_UN);
     fs.closeSync(fd);
   }
+}
+
+async function withRepositoryLock<T>(context: RepositoryContext, fn: () => Promise<T> | T): Promise<T> {
+  return withFlockAt(context.lockPath, fn);
+}
+
+/** Creates `<clone>/.git/nanoclaw-checkout.lock` on demand — no host mount provisions it (plan §5.3 "Locking"). */
+function ensureCloneLock(checkoutPath: string): string {
+  const file = path.join(checkoutPath, '.git', 'nanoclaw-checkout.lock');
+  try {
+    const fd = fs.openSync(file, 'wx', 0o600);
+    fs.closeSync(fd);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  }
+  return file;
+}
+
+async function withCheckoutLock<T>(checkoutPath: string, fn: () => Promise<T> | T): Promise<T> {
+  return withFlockAt(ensureCloneLock(checkoutPath), fn);
 }
 
 function worktreeCommonDir(worktree: string): string | null {
@@ -449,8 +505,45 @@ async function queueHostAction(action: string, payload: Record<string, unknown>)
   return requestId;
 }
 
+/**
+ * Asks the host to move the canonical's own checkout to the origin/HEAD this
+ * container's fetch recorded. It names no checkout: refresh never reads or
+ * fetches from an agent checkout (plan §5.5, rev 2.7). The host still
+ * validates reused checkouts and proves cleanup candidates, as it does for
+ * linked worktrees.
+ */
 async function emitRefresh(context: RepositoryContext): Promise<void> {
-  await queueHostAction('repository_refresh', { repo: context.repo, workUnitKey: context.workUnitKey });
+  await queueHostAction('repository_refresh', {
+    repo: context.repo,
+    workUnitKey: context.workUnitKey,
+  });
+}
+
+/**
+ * Fetches origin into the workgroup canonical through this container's scoped
+ * identity and returns origin/HEAD's ref (plan §5.5). The caller holds the
+ * canonical's repository lock and has a network pin. The canonical's config,
+ * HEAD, index, hooks and objects/info are read-only overlays in both checkout
+ * modes (src/container-runner.ts canonicalGitControlMounts, :4413), so this
+ * writes refs and objects only.
+ */
+function fetchCanonicalHeld(context: RepositoryContext): string {
+  runGitDir(context.gitDir, ['fetch', 'origin', '--prune'], 300_000);
+  runGitDir(context.gitDir, ['remote', 'set-head', 'origin', '--auto'], 120_000);
+  const baseRef = runGitDir(context.gitDir, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD'], 10_000);
+  runGitDir(context.gitDir, ['rev-parse', '--verify', `${baseRef}^{commit}`], 10_000);
+  return baseRef;
+}
+
+/**
+ * `fetchCanonicalHeld` under the canonical's repository lock, for the clone
+ * paths, which do not otherwise hold it. `context` must be the canonical's
+ * own (from `contextFor`), never a clone's: its `lockPath` is the lock taken.
+ */
+async function fetchCanonical(context: RepositoryContext): Promise<void> {
+  await withRepositoryLock(context, () => {
+    fetchCanonicalHeld(context);
+  });
 }
 
 async function createLinkedWorktree(context: RepositoryContext, branchArg: string | undefined): Promise<ToolResult> {
@@ -466,10 +559,7 @@ async function createLinkedWorktree(context: RepositoryContext, branchArg: strin
   if (context.pin.kind === 'local-only') {
     baseRef = runGitDir(context.gitDir, ['rev-parse', '--verify', 'HEAD^{commit}'], 10_000);
   } else {
-    runGitDir(context.gitDir, ['fetch', 'origin', '--prune'], 300_000);
-    runGitDir(context.gitDir, ['remote', 'set-head', 'origin', '--auto'], 120_000);
-    baseRef = runGitDir(context.gitDir, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD'], 10_000);
-    runGitDir(context.gitDir, ['rev-parse', '--verify', `${baseRef}^{commit}`], 10_000);
+    baseRef = fetchCanonicalHeld(context);
   }
   removeEmptyTopicPlaceholder(context);
   const existing = validateExistingWorktree(context, branchArg);
@@ -545,6 +635,448 @@ async function createLinkedWorktree(context: RepositoryContext, branchArg: strin
   return ok(
     `Worktree created at ${context.worktree} on branch ${branch} from the preserved local-only canonical; ` +
       'fetch, push, and PR operations remain unavailable until an operator publishes an origin',
+  );
+}
+
+// ── resolveCheckout (plan §5.3) ──────────────────────────────────────────────
+
+interface CloneCheckoutMetadata {
+  version: 1;
+  repo: string;
+  branch: string;
+  startCommit: string;
+  startedFrom: 'canonical-local' | 'origin-branch' | 'origin-head' | 'local-head';
+}
+
+function cloneMetadataPath(checkoutPath: string): string {
+  return path.join(checkoutPath, '.git', 'nanoclaw-checkout.json');
+}
+
+/** Throws with a descriptive, non-mutating error on any malformed metadata. */
+function readCloneMetadataStrict(checkoutPath: string): CloneCheckoutMetadata {
+  const file = cloneMetadataPath(checkoutPath);
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(file);
+  } catch (error) {
+    throw new Error(`Clone checkout at ${checkoutPath} is missing its metadata file and was left untouched`, {
+      cause: error,
+    });
+  }
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error(`Clone checkout metadata must be a regular file: ${checkoutPath}`);
+  }
+  let parsed: Partial<CloneCheckoutMetadata>;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<CloneCheckoutMetadata>;
+  } catch (error) {
+    throw new Error(`Clone checkout metadata is not valid JSON: ${checkoutPath}`, { cause: error });
+  }
+  if (
+    parsed.version !== 1 ||
+    typeof parsed.repo !== 'string' ||
+    typeof parsed.branch !== 'string' ||
+    typeof parsed.startCommit !== 'string' ||
+    (parsed.startedFrom !== 'canonical-local' &&
+      parsed.startedFrom !== 'origin-branch' &&
+      parsed.startedFrom !== 'origin-head' &&
+      parsed.startedFrom !== 'local-head')
+  ) {
+    throw new Error(`Clone checkout metadata is malformed: ${checkoutPath}`);
+  }
+  return parsed as CloneCheckoutMetadata;
+}
+
+function writeCloneMetadata(checkoutPath: string, metadata: CloneCheckoutMetadata): void {
+  const file = cloneMetadataPath(checkoutPath);
+  const temp = `${file}.tmp-${process.pid}-${randomBytes(8).toString('hex')}`;
+  fs.writeFileSync(temp, `${JSON.stringify(metadata, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(temp, file);
+}
+
+/** Lenient — used only for routing between `<repo>` and `<repo>@<slug>`. Never throws. */
+function readCloneRecordedBranch(checkoutPath: string): string | null {
+  try {
+    return readCloneMetadataStrict(checkoutPath).branch;
+  } catch {
+    return null;
+  }
+}
+
+function currentGitBranch(worktreePath: string): string | null {
+  return tryGitAt(worktreePath, ['branch', '--show-current'], 10_000);
+}
+
+function pathExists(candidate: string): boolean {
+  try {
+    fs.lstatSync(candidate);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+interface ResolvedCheckout {
+  path: string;
+  dirName: string;
+  shape: 'clone' | 'linked';
+  branch: string;
+}
+
+/**
+ * Thrown by `resolveCheckout` specifically when nothing exists yet at the
+ * candidate path — as opposed to something existing there but being invalid
+ * (unknown shape, an R3 mismatch, a detached HEAD, an origin-pin mismatch).
+ * Callers that fall back to a mode-specific creation path on "not found"
+ * (`create_worktree` in worktree mode) must NOT fall back on any other
+ * failure: a mismatched checkout is refused, not silently worked around
+ * (R3, P2-7).
+ */
+class CheckoutNotFoundError extends Error {}
+
+/**
+ * A clone-shaped checkout that exists but may not be served: an R3 mismatch,
+ * a detached HEAD, unreadable metadata, or an origin that drifted from the pin.
+ * In worktree mode this is the only resolution failure `create_worktree` stops
+ * on; every other one keeps today's linked-worktree handling.
+ */
+class CloneCheckoutRefusedError extends Error {}
+
+function validateCloneCandidate(
+  context: RepositoryContext,
+  checkoutPath: string,
+  dirName: string,
+  branch: string | null,
+): ResolvedCheckout {
+  const metadata = readCloneMetadataStrict(checkoutPath);
+  const currentBranch = currentGitBranch(checkoutPath);
+  if (!currentBranch) {
+    throw new Error(`Clone checkout at ${checkoutPath} is on a detached HEAD and was left untouched`);
+  }
+  // R3: a checkout's current branch must equal its recorded branch, or it is
+  // refused, not reused, for any branch.
+  if (metadata.branch !== currentBranch) {
+    throw new Error(
+      `Clone checkout at ${checkoutPath} is on '${currentBranch}', not its recorded branch '${metadata.branch}'. ` +
+        'It was left untouched and is not served for any branch.',
+    );
+  }
+  if (branch !== null && currentBranch !== branch) {
+    throw new CheckoutNotFoundError(`No checkout exists yet for ${context.repo} on branch '${branch}'`);
+  }
+  const configuredOrigin = tryGitAt(checkoutPath, ['config', '--get', 'remote.origin.url'], 10_000);
+  if (context.pin.kind === 'local-only') {
+    if (configuredOrigin !== null) {
+      throw new Error(`Clone checkout at ${checkoutPath} unexpectedly has an origin for a local-only repository`);
+    }
+  } else if (configuredOrigin === null || normalizeOrigin(configuredOrigin) !== normalizeOrigin(context.pin.origin)) {
+    throw new Error(`Clone checkout at ${checkoutPath} origin does not match the host origin pin for ${context.repo}`);
+  }
+  return { path: checkoutPath, dirName, shape: 'clone', branch: currentBranch };
+}
+
+function validateLinkedCandidate(
+  context: RepositoryContext,
+  checkoutPath: string,
+  dirName: string,
+  branch: string | null,
+): ResolvedCheckout {
+  const pointer = path.join(checkoutPath, '.git');
+  const pointerStat = fs.lstatSync(pointer);
+  if (!pointerStat.isFile()) {
+    throw new Error(`Existing topic checkout is not a linked worktree and was left untouched: ${checkoutPath}`);
+  }
+  const common = worktreeCommonDir(checkoutPath);
+  if (!common || canonicalPath(common) !== canonicalPath(context.gitDir)) {
+    throw new Error(`Existing topic worktree is attached to different canonical metadata: ${checkoutPath}`);
+  }
+  const current = tryGitAt(checkoutPath, ['branch', '--show-current'], 10_000) ?? '';
+  if (branch !== null) {
+    if (current !== branch) {
+      throw new CheckoutNotFoundError(`No checkout exists yet for ${context.repo} on branch '${branch}'`);
+    }
+  }
+  // A detached legacy checkout serves branchless tools as it always has, with
+  // '' as its branch; git_push and open_pr refuse a detached HEAD themselves.
+  return { path: checkoutPath, dirName, shape: 'linked', branch: current || branch || '' };
+}
+
+function validateCandidate(
+  context: RepositoryContext,
+  checkoutPath: string,
+  dirName: string,
+  branch: string | null,
+): ResolvedCheckout {
+  if (!pathExists(checkoutPath)) {
+    throw new CheckoutNotFoundError(
+      `No checkout exists yet for ${context.repo}${branch ? ` on branch '${branch}'` : ''}`,
+    );
+  }
+  const shape = checkoutShapeAt(checkoutPath);
+  if (shape === 'clone') {
+    try {
+      return validateCloneCandidate(context, checkoutPath, dirName, branch);
+    } catch (error) {
+      if (error instanceof CheckoutNotFoundError) throw error;
+      throw new CloneCheckoutRefusedError(error instanceof Error ? error.message : String(error), { cause: error });
+    }
+  }
+  if (shape === 'linked') return validateLinkedCandidate(context, checkoutPath, dirName, branch);
+  throw new Error(`Checkout at ${checkoutPath} has unrecognized Git metadata and was left untouched`);
+}
+
+/**
+ * Picks the checkout serving `(repo, branch)` by the plan §5.1 rule, without
+ * creating anything: no branch, or the primary checkout's own branch already
+ * matches, resolves to `<repo>`; otherwise `<repo>@<slug>`. Shape- and
+ * branch-aware in both modes (§5.3) — a clone left over from a `clone`-mode
+ * period resolves the same way after a rollback to `worktree` mode (R10).
+ * Throws, mutating nothing, on an unknown shape or an R3 mismatch.
+ */
+function resolveCheckout(context: RepositoryContext, branch: string | null): ResolvedCheckout {
+  const primaryPath = context.worktree;
+  if (branch === null) return validateCandidate(context, primaryPath, context.repo, null);
+
+  if (pathExists(primaryPath)) {
+    const shape = checkoutShapeAt(primaryPath);
+    const primaryBranch =
+      shape === 'clone'
+        ? readCloneRecordedBranch(primaryPath)
+        : shape === 'linked'
+          ? currentGitBranch(primaryPath)
+          : null;
+    if (primaryBranch === branch) {
+      return validateCandidate(context, primaryPath, context.repo, branch);
+    }
+  }
+  const dirName = checkoutDirName(context.repo, branch);
+  return validateCandidate(context, path.join(context.topicRoot, dirName), dirName, branch);
+}
+
+/**
+ * Yields a context whose `.worktree`/`.lockPath` point at the RESOLVED
+ * checkout, so every downstream primitive (`capturedIdentity`,
+ * `withRepositoryLock`, the git_commit/git_push/open_pr handler bodies) keeps
+ * operating on `context.worktree`/`context.lockPath` completely unchanged
+ * (plan §5.3: "capturedIdentity and the refspec push are unchanged").
+ */
+function contextForCheckout(context: RepositoryContext, resolved: ResolvedCheckout): RepositoryContext {
+  return {
+    ...context,
+    worktree: resolved.path,
+    lockPath: resolved.shape === 'clone' ? ensureCloneLock(resolved.path) : context.lockPath,
+  };
+}
+
+/** `canonical` is the canonical's own context: its `lockPath` is the canonical lock even when `context`'s is a clone's. */
+function worktreeForTool(
+  repo: string,
+  branch?: string,
+): { context: RepositoryContext; checkout: ResolvedCheckout; canonical: RepositoryContext } | { error: ToolResult } {
+  const branchArg = branch && branch.trim() ? branch.trim() : null;
+  try {
+    const context = contextFor(repo);
+    const resolved = resolveCheckout(context, branchArg);
+    log(`resolved ${repo}${branchArg ? `@${branchArg}` : ''} -> ${resolved.shape} at ${resolved.path}`);
+    return { context: contextForCheckout(context, resolved), checkout: resolved, canonical: context };
+  } catch (error) {
+    return { error: err(error instanceof Error ? error.message : String(error)) };
+  }
+}
+
+// ── Clone creation (plan §5.2-§5.3) ──────────────────────────────────────────
+
+interface RepositoryActionResponsePayload {
+  requestId: string;
+  ok: boolean;
+  message: string;
+  dirName?: string;
+  branch?: string;
+  created?: boolean;
+  startedFrom?: string;
+  objectsLinked?: boolean;
+  farmsLinked?: number;
+  retryable?: boolean;
+}
+
+// Overridable only for tests — production always uses the plan's 120s/5s.
+function repositoryCheckoutPollTimeoutMs(): number {
+  const raw = Number(process.env.NANOCLAW_REPOSITORY_CHECKOUT_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 120_000;
+}
+
+function repositoryCheckoutRetryDelayMs(): number {
+  const raw = Number(process.env.NANOCLAW_REPOSITORY_CHECKOUT_RETRY_DELAY_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 5_000;
+}
+
+async function pollRepositoryActionResponse(
+  requestId: string,
+  timeoutMs: number,
+): Promise<RepositoryActionResponsePayload | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    // The host writes the answer at this exact id (src/modules/repository-workspaces/index.ts:595).
+    // getMessageIn opens a fresh read-only handle per call, the cross-mount
+    // visibility rule findCliResponse relies on (mailbox/sqlite/operations.ts:94-101).
+    const row = getMessageIn(`repository-action-response-${requestId}`);
+    if (row && row.status === 'pending') {
+      markCompleted([row.id]);
+      return JSON.parse(row.content) as RepositoryActionResponsePayload;
+    }
+    await Bun.sleep(200);
+  }
+  return null;
+}
+
+/** Writes `repository_checkout` and polls for its response (plan §5.3 steps 1-2), retrying once on `retryable:true`. */
+async function requestRepositoryCheckout(
+  context: RepositoryContext,
+  branch: string | null,
+): Promise<RepositoryActionResponsePayload> {
+  const requestId = await queueHostAction('repository_checkout', {
+    repo: context.repo,
+    branch,
+    workUnitKey: context.workUnitKey,
+  });
+  let response = await pollRepositoryActionResponse(requestId, repositoryCheckoutPollTimeoutMs());
+  if (!response) {
+    throw new Error(`Timed out waiting for the host to complete repository checkout ${requestId} for ${context.repo}`);
+  }
+  if (!response.ok && response.retryable) {
+    await Bun.sleep(repositoryCheckoutRetryDelayMs());
+    const retryId = await queueHostAction('repository_checkout', {
+      repo: context.repo,
+      branch,
+      workUnitKey: context.workUnitKey,
+    });
+    response = await pollRepositoryActionResponse(retryId, repositoryCheckoutPollTimeoutMs());
+    if (!response) {
+      throw new Error(`Timed out waiting for the host to complete repository checkout ${retryId} for ${context.repo}`);
+    }
+  }
+  return response;
+}
+
+function isAncestor(cwd: string, ancestor: string, descendant: string): boolean {
+  try {
+    execFileSync('git', ['merge-base', '--is-ancestor', ancestor, descendant], {
+      cwd,
+      stdio: 'ignore',
+      timeout: 10_000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+interface FreshnessNote {
+  branch: string;
+  status: 'moved-fast-forward' | 'moved-reset' | 'left-as-is';
+  diverged: boolean;
+}
+
+/**
+ * The container-side post-step after every clone-mode `create_worktree`
+ * response, for a network pin only (plan §5.3 step 3). Runs under the
+ * per-checkout lock so it is idempotent: a real `git fetch` through this
+ * container's own scoped identity (the host never talks to GitHub), then —
+ * only when the checkout is pristine (HEAD still at the recorded
+ * `startCommit` and a clean status) — moves it to fresh remote state and
+ * records the new `startCommit`. A non-pristine checkout, or one that started
+ * from preserved local work (`canonical-local`), is left exactly as is.
+ */
+async function runCloneFreshnessStep(context: RepositoryContext, checkoutPath: string): Promise<FreshnessNote> {
+  return await withCheckoutLock(checkoutPath, async () => {
+    runGitAt(checkoutPath, ['fetch', 'origin', '--prune'], 300_000);
+
+    const metadata = readCloneMetadataStrict(checkoutPath);
+    const head = runGitAt(checkoutPath, ['rev-parse', 'HEAD'], 10_000);
+    const status = runGitAt(checkoutPath, ['status', '--porcelain'], 10_000);
+    const pristine = head === metadata.startCommit && status === '';
+
+    const finish = async (note: FreshnessNote): Promise<FreshnessNote> => {
+      await emitRefresh(context);
+      return note;
+    };
+
+    if (!pristine || metadata.startedFrom === 'canonical-local') {
+      const originCommit = tryGitAt(
+        checkoutPath,
+        ['rev-parse', '--verify', `refs/remotes/origin/${metadata.branch}`],
+        10_000,
+      );
+      const diverged =
+        metadata.startedFrom === 'origin-branch' &&
+        originCommit !== null &&
+        !isAncestor(checkoutPath, head, originCommit);
+      return finish({ branch: metadata.branch, status: 'left-as-is', diverged });
+    }
+
+    if (metadata.startedFrom === 'origin-branch') {
+      const originCommit = tryGitAt(
+        checkoutPath,
+        ['rev-parse', '--verify', `refs/remotes/origin/${metadata.branch}`],
+        10_000,
+      );
+      if (originCommit && isAncestor(checkoutPath, head, originCommit)) {
+        runGitAt(checkoutPath, ['merge', '--ff-only', originCommit], 30_000);
+        writeCloneMetadata(checkoutPath, {
+          ...metadata,
+          startCommit: runGitAt(checkoutPath, ['rev-parse', 'HEAD'], 10_000),
+        });
+        return finish({ branch: metadata.branch, status: 'moved-fast-forward', diverged: false });
+      }
+      const diverged = originCommit !== null && !isAncestor(checkoutPath, head, originCommit);
+      return finish({ branch: metadata.branch, status: 'left-as-is', diverged });
+    }
+
+    if (metadata.startedFrom === 'origin-head') {
+      const originHeadRef = tryGitAt(checkoutPath, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD'], 10_000);
+      if (originHeadRef) {
+        const freshHead = tryGitAt(checkoutPath, ['rev-parse', '--verify', `${originHeadRef}^{commit}`], 10_000);
+        if (freshHead) {
+          runGitAt(checkoutPath, ['reset', '--keep', freshHead], 30_000);
+          writeCloneMetadata(checkoutPath, { ...metadata, startCommit: freshHead });
+          return finish({ branch: metadata.branch, status: 'moved-reset', diverged: false });
+        }
+      }
+      return finish({ branch: metadata.branch, status: 'left-as-is', diverged: false });
+    }
+
+    // startedFrom === 'local-head': a brand-new branch with nothing upstream
+    // to compare against yet.
+    return finish({ branch: metadata.branch, status: 'left-as-is', diverged: false });
+  });
+}
+
+async function createCloneWorktree(context: RepositoryContext, branch: string | null): Promise<ToolResult> {
+  // A network pin fetches the canonical first, as a linked worktree does, so
+  // the host stages from current refs and starts B from origin/B when another
+  // thread already pushed it. Local-only pins fetch nothing.
+  if (context.pin.kind !== 'local-only') await fetchCanonical(context);
+  const response = await requestRepositoryCheckout(context, branch);
+  if (!response.ok) return err(response.message || `repository checkout failed for ${context.repo}`);
+
+  const dirName = response.dirName ?? checkoutDirName(context.repo, branch);
+  const checkoutPath = path.join(context.topicRoot, dirName);
+  const resolvedBranch = response.branch ?? branch ?? dirName;
+
+  if (context.pin.kind === 'local-only') {
+    // Local-only pins skip the whole post-step, including refresh (today's
+    // rule for linked worktrees, `git-worktrees.ts:541-547`, carried over).
+    return ok(
+      `Worktree ready at ${checkoutPath} on branch ${resolvedBranch} from the preserved local-only canonical; ` +
+        'fetch, push, and PR operations remain unavailable until an operator publishes an origin',
+    );
+  }
+
+  const note = await runCloneFreshnessStep(context, checkoutPath);
+  const divergedNote = note.diverged ? '; origin has diverged from this checkout' : '';
+  return ok(
+    `Worktree ready at ${checkoutPath} on branch ${note.branch} (${note.status}${divergedNote}); ` +
+      'host canonical refresh queued',
   );
 }
 
@@ -628,13 +1160,41 @@ export const cloneRepoTool: McpToolDefinition = {
   },
 };
 
+/**
+ * create_worktree's behaviour depends on the mode the spawn passed in, so its
+ * description does too: worktree mode refuses a second branch
+ * (validateExistingWorktree), and must not offer one.
+ */
+const CREATE_WORKTREE_DESCRIPTIONS: Record<CheckoutMode, string> = {
+  clone:
+    "Create or reuse a checkout of repo for this thread. With no branch, this is the thread's own checkout at " +
+    "/workspace/worktrees/<repo>. With branch, it is that branch's own independent checkout — still " +
+    "/workspace/worktrees/<repo> when the thread's checkout is already on it, otherwise " +
+    '/workspace/worktrees/<repo>@<branch>. Any number of threads may hold the same branch at once; share work by ' +
+    "pushing, never by switching a checkout another thread may be using — a checkout's branch is never switched " +
+    'automatically, so request the branch you need instead. Files under node_modules may be shared and read-only ' +
+    'across checkouts; never chmod them — run npm ci or npm install for a private writable copy when dependencies ' +
+    'must change. continueFromThreadId moves an inactive legacy linked checkout here instead of creating a new one; ' +
+    'after requesting a transfer, end your turn at once and do not wait or poll for the worktree, because the move ' +
+    'waits for this turn to stop and this topic then restarts with the result. Typical flow from here: git_commit → ' +
+    'git_push → open_pr.',
+  worktree:
+    "Create or reuse this thread's linked worktree of repo at /workspace/worktrees/<repo> — one checkout per repo " +
+    'for the thread. With branch, a new worktree starts on that branch, and an existing one on a different branch is ' +
+    'refused. Existing worktrees are never rebased or branch-switched, and dirty/staged/untracked state persists ' +
+    'exactly as left. Files under node_modules may be shared and read-only across checkouts; never chmod them — run ' +
+    'npm ci or npm install for a private writable copy when dependencies must change. continueFromThreadId moves an ' +
+    'inactive linked checkout here from another thread instead of creating a new one; after requesting a transfer, ' +
+    'end your turn at once and do not wait or poll for the worktree, because the move waits for this turn to stop ' +
+    'and this topic then restarts with the result. Typical flow from here: git_commit → git_push → open_pr.',
+};
+
 export const createWorktreeTool: McpToolDefinition = {
   tool: {
     name: 'create_worktree',
-    description:
-      "Create or reuse this topic's standard linked worktree at /workspace/worktrees/<repo>. Existing worktrees are " +
-      'never rebased or branch-switched, and dirty/staged/untracked state persists exactly as left. Optionally transfer ' +
-      'exact work from an inactive source thread. Typical flow from here: git_commit → git_push → open_pr.',
+    get description() {
+      return CREATE_WORKTREE_DESCRIPTIONS[checkoutMode()];
+    },
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -673,8 +1233,9 @@ export const createWorktreeTool: McpToolDefinition = {
         destinationWorkUnitKey: workUnitKey,
       });
       return ok(
-        `Repository transfer queued durably for ${repo}. This topic will restart after the exact linked ` +
-          'worktree has moved, then receive an explicit success or failure message.',
+        `Repository transfer queued durably for ${repo}. End your turn now; do not wait or poll for the worktree. ` +
+          'The move waits for this turn to stop, then this topic restarts with the exact linked worktree and ' +
+          'receives an explicit success or failure message.',
       );
     }
     let context: RepositoryContext;
@@ -684,6 +1245,45 @@ export const createWorktreeTool: McpToolDefinition = {
       return err(error instanceof Error ? error.message : String(error));
     }
 
+    // Resolve what already exists here, in EITHER mode, before deciding how
+    // to create anything. A checkout that resolves but is INVALID (an R3
+    // mismatch, an origin-pin drift) is refused right here rather than
+    // silently falling through to a mode-specific creation path, which would
+    // ignore it and act on an unrelated path or an unrelated host action
+    // (R3, P2-7). Only a clean "nothing here yet" falls through. In worktree
+    // mode only a clone's refusal stops here: a linked, empty or unrecognized
+    // primary keeps today's handling in createLinkedWorktree, which validates a
+    // linked checkout and recovers one a crash left as an empty directory.
+    let existing: ResolvedCheckout | null = null;
+    try {
+      existing = resolveCheckout(context, branch ?? null);
+    } catch (error) {
+      const refused =
+        checkoutMode() === 'clone'
+          ? !(error instanceof CheckoutNotFoundError)
+          : error instanceof CloneCheckoutRefusedError;
+      if (refused) return err(error instanceof Error ? error.message : String(error));
+    }
+
+    if (existing?.shape === 'clone' && checkoutMode() === 'worktree') {
+      // A clone-shaped checkout left over from a clone-mode period is served
+      // as-is (R10, P2-18) — worktree-mode creation below only knows how to
+      // create or reuse a LINKED worktree at the primary position, and has
+      // no idea a `<repo>@<slug>` clone exists at all.
+      return ok(`Checkout ready at ${existing.path} on branch ${existing.branch} (existing clone; left untouched)`);
+    }
+
+    if (checkoutMode() === 'clone' && existing?.shape !== 'linked') {
+      try {
+        return await createCloneWorktree(context, branch ?? null);
+      } catch (error) {
+        return err(`create_worktree failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
+    // worktree mode, or a legacy linked checkout reused unchanged in clone
+    // mode (R10, §5.10, P2-11): createLinkedWorktree runs its own
+    // fetch-then-reuse-or-create flow exactly as today.
     try {
       return await withRepositoryLock(context, () => createLinkedWorktree(context, branch));
     } catch (error) {
@@ -692,24 +1292,11 @@ export const createWorktreeTool: McpToolDefinition = {
   },
 };
 
-function worktreeForTool(repo: string): { context: RepositoryContext } | { error: ToolResult } {
-  try {
-    const context = contextFor(repo);
-    const existing = validateExistingWorktree(context, undefined);
-    if (!existing || ('isError' in existing && existing.isError)) {
-      return { error: existing ?? err(`Worktree not found: ${repo}`) };
-    }
-    return { context };
-  } catch (error) {
-    return { error: err(error instanceof Error ? error.message : String(error)) };
-  }
-}
-
 export const gitCommitTool: McpToolDefinition = {
   tool: {
     name: 'git_commit',
     description:
-      'Stage and commit all changes in this topic worktree. Returns the short commit SHA. Stages every dirty file in ' +
+      'Stage and commit all changes in this checkout. Returns the short commit SHA. Stages every dirty file in ' +
       'the checkout, including any left by same-topic siblings sharing it — coordinate before committing. Never add ' +
       '"Co-Authored-By" trailers or "Generated with Claude Code" footers to the message.',
     inputSchema: {
@@ -717,6 +1304,12 @@ export const gitCommitTool: McpToolDefinition = {
       properties: {
         repo: { type: 'string', description: 'Repository name.' },
         message: { type: 'string', description: 'Commit message.' },
+        branch: {
+          type: 'string',
+          description:
+            "Optional branch selecting which of this thread's checkouts to commit in. Defaults to the primary " +
+            'checkout for repo.',
+        },
       },
       required: ['repo', 'message'],
     },
@@ -724,8 +1317,9 @@ export const gitCommitTool: McpToolDefinition = {
   handler: async (args: Record<string, unknown>) => {
     const repo = typeof args.repo === 'string' ? args.repo : '';
     const message = typeof args.message === 'string' ? args.message : '';
+    const branchArg = typeof args.branch === 'string' ? args.branch : undefined;
     if (!message.trim()) return err('message is required');
-    const resolved = worktreeForTool(repo);
+    const resolved = worktreeForTool(repo, branchArg);
     if ('error' in resolved) return resolved.error;
     try {
       return await withRepositoryLock(resolved.context, () => {
@@ -752,7 +1346,7 @@ export const gitPushTool: McpToolDefinition = {
   tool: {
     name: 'git_push',
     description:
-      'Push this topic worktree branch through the container-scoped origin identity. Sends the branch and commit ' +
+      "Push this checkout's branch through the container-scoped origin identity. Sends the branch and commit " +
       'as they stood when the call started, so work a sibling adds meanwhile is not carried along — push again to ' +
       'send it. Refused while the pr-review-loop churn gate is holding: three review rounds on one finding class ' +
       'means the fix belongs in the primitive every flagged site calls, not at one more site.',
@@ -761,13 +1355,20 @@ export const gitPushTool: McpToolDefinition = {
       properties: {
         repo: { type: 'string', description: 'Repository name.' },
         force: { type: 'boolean', description: 'Use --force-with-lease.' },
+        branch: {
+          type: 'string',
+          description:
+            "Optional branch selecting which of this thread's checkouts to push. Defaults to the primary checkout " +
+            'for repo.',
+        },
       },
       required: ['repo'],
     },
   },
   handler: async (args: Record<string, unknown>) => {
     const repo = typeof args.repo === 'string' ? args.repo : '';
-    const resolved = worktreeForTool(repo);
+    const branchArg = typeof args.branch === 'string' ? args.branch : undefined;
+    const resolved = worktreeForTool(repo, branchArg);
     if ('error' in resolved) return resolved.error;
     const worktree = resolved.context.worktree;
     try {
@@ -803,7 +1404,7 @@ export const gitPushTool: McpToolDefinition = {
       });
       if (gate.status === 'refused') return err(gate.message);
 
-      return await withRepositoryLock(resolved.context, async () => {
+      await withRepositoryLock(resolved.context, () => {
         const push = [
           'push',
           ...(args.force === true ? [`--force-with-lease=refs/heads/${branch}:${identity.lease}`] : []),
@@ -815,12 +1416,27 @@ export const gitPushTool: McpToolDefinition = {
         // tracking config the old form set is restored explicitly. Best effort:
         // it is a convenience, and the push has already landed.
         tryGitAt(worktree, ['branch', `--set-upstream-to=origin/${branch}`, branch]);
-        await emitRefresh(resolved.context);
-        return ok(
-          `Pushed ${branch} at ${head.slice(0, 8)} to origin${args.force === true ? ' (force-with-lease)' : ''}. ` +
-            `Pass branch=${branch} to open_pr so the PR is opened for this push, not for the checkout.`,
-        );
       });
+      // A linked worktree's push is recorded in the canonical's own refs. A
+      // clone's is recorded only in the clone, so the canonical fetches origin
+      // itself (plan §5.5), after the clone's lock is released so the two
+      // locks never nest. The push has landed either way, so a failed fetch is
+      // reported, not raised.
+      let canonicalNote = '';
+      if (resolved.checkout.shape === 'clone' && resolved.canonical.pin.kind !== 'local-only') {
+        try {
+          await fetchCanonical(resolved.canonical);
+        } catch (error) {
+          canonicalNote =
+            ` The workgroup canonical could not fetch it yet (${error instanceof Error ? error.message : String(error)}); ` +
+            'the next create_worktree or push fetches it.';
+        }
+      }
+      await emitRefresh(resolved.context);
+      return ok(
+        `Pushed ${branch} at ${head.slice(0, 8)} to origin${args.force === true ? ' (force-with-lease)' : ''}. ` +
+          `Pass branch=${branch} to open_pr so the PR is opened for this push, not for the checkout.${canonicalNote}`,
+      );
     } catch (error) {
       return err(`git push failed: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -831,7 +1447,7 @@ export const openPrTool: McpToolDefinition = {
   tool: {
     name: 'open_pr',
     description:
-      'Open a GitHub pull request from the current topic worktree branch. After it opens: add_ship_log to record it, ' +
+      "Open a GitHub pull request from this checkout's branch. After it opens: add_ship_log to record it, " +
       'update_backlog_item to resolve any backlog item it addresses, and add_backlog_item for any new bugs found along the way.',
     inputSchema: {
       type: 'object' as const,
@@ -842,8 +1458,8 @@ export const openPrTool: McpToolDefinition = {
         branch: {
           type: 'string',
           description:
-            'Branch to open the PR for. Pass the branch git_push reported; without it the current checkout is used, ' +
-            'which a same-topic sibling can have switched since the push.',
+            'Branch to open the PR for, and to select the checkout — pass the branch git_push reported. Without it, ' +
+            "the primary checkout's current branch is used, which a same-topic sibling can have switched since the push.",
         },
       },
       required: ['repo', 'title'],
@@ -854,7 +1470,13 @@ export const openPrTool: McpToolDefinition = {
     const title = typeof args.title === 'string' ? args.title : '';
     const body = typeof args.body === 'string' ? args.body : '';
     if (!title.trim()) return err('title is required');
-    const resolved = worktreeForTool(repo);
+    const branchArg = typeof args.branch === 'string' && args.branch.trim() ? args.branch.trim() : undefined;
+    // `branch` selects the checkout holding it. When none does (the push came
+    // from a checkout a same-topic sibling has since switched), the PR still
+    // opens for it: `gh` needs only some checkout of the repository to run in,
+    // and `--head` names the branch.
+    let resolved = worktreeForTool(repo, branchArg);
+    if ('error' in resolved && branchArg) resolved = worktreeForTool(repo);
     if ('error' in resolved) return resolved.error;
     try {
       // Bound to a named branch, never to whatever is checked out when `gh`
@@ -865,10 +1487,10 @@ export const openPrTool: McpToolDefinition = {
       // `branch` is what closes the window between a push and this call, which
       // no locking here can reach: git_push names the branch it pushed, and
       // passing that name back makes this call describe that push rather than
-      // the checkout as it now stands. Absent it, the branch is captured under
-      // the lock, which is correct whenever the checkout has not moved.
-      const named = typeof args.branch === 'string' ? args.branch.trim() : '';
-      let head = named;
+      // the checkout as it now stands, whichever checkout `gh` runs in. Absent
+      // it, the branch is captured under the lock, which is correct whenever
+      // the checkout has not moved.
+      let head = branchArg;
       if (!head) {
         const identity = await capturedIdentity(resolved.context);
         if (!identity) return err('Cannot open a PR from a detached HEAD; create or switch to a branch explicitly');

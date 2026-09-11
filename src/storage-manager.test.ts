@@ -3199,9 +3199,14 @@ describe('storage-manager regenerable tree sweep', () => {
    * only shape the dependency cache will share. `makeTopic`'s tree is eligible
    * but incomplete, so it could never prove anything about adopt or convert.
    */
-  function makeNpmTopic(name: string, leftPadVersion = '1.3.0', idleDays = 10): { topicDir: string; repoDir: string } {
+  function makeNpmTopic(
+    name: string,
+    leftPadVersion = '1.3.0',
+    idleDays = 10,
+    checkoutName = 'XZO-BACKEND',
+  ): { topicDir: string; repoDir: string } {
     const topicDir = path.join(topicsRoot, 'wg-acme', name);
-    const repoDir = path.join(topicDir, 'worktrees', 'XZO-BACKEND');
+    const repoDir = path.join(topicDir, 'worktrees', checkoutName);
     const packages: Record<string, { version: string; resolved: string; integrity: string }> = {
       'node_modules/left-pad': {
         version: leftPadVersion,
@@ -3557,6 +3562,60 @@ describe('storage-manager regenerable tree sweep', () => {
     expect(report.actions.map((action) => action.path).sort()).toEqual(
       [path.join(workspaces.repoDir, 'node_modules'), path.join(pnpm.repoDir, 'node_modules')].sort(),
     );
+  });
+
+  it('processes an npm tree in a <repo>@<slug> clone like <repo>, and never one under .staging', () => {
+    enableDependencyCache();
+    const primary = makeNpmTopic('thread-c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1');
+    // A branch clone (plan §5.1): the same lockfile, at `<repo>@<slug>`, with a `.git` directory.
+    const clone = makeNpmTopic('thread-c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2', '1.3.0', 10, 'XZO-BACKEND@feat-x');
+    fs.mkdirSync(path.join(clone.repoDir, '.git'));
+    // A dot-prefixed directory in the same topic, which the lister skips,
+    // holding a clone of the same lockfile whose package dir is mid-way through
+    // a conversion. Nothing says whose it is, so the sweep must neither delete,
+    // adopt, convert, nor recover anything in it.
+    const staged = makeNpmTopic(
+      'thread-c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2',
+      '1.3.0',
+      10,
+      path.join('.staging', 'req-1', 'XZO-BACKEND@feat-y'),
+    );
+    fs.mkdirSync(path.join(staged.repoDir, FARM_OLD_NAME, '.vite'), { recursive: true });
+    fs.writeFileSync(path.join(staged.repoDir, FARM_OLD_NAME, '.vite', 'sentinel'), 'private');
+    ageTopic(clone.topicDir);
+    const stagingRoot = path.join(clone.topicDir, 'worktrees', '.staging');
+    const stagingBefore = treeState(stagingRoot);
+
+    const report = sweep();
+
+    expect(treeState(stagingRoot)).toEqual(stagingBefore);
+    expect(report.actions.filter((action) => action.path?.startsWith(`${stagingRoot}${path.sep}`))).toEqual([]);
+    // One entry for the lockfile, shared by the primary and the clone alike.
+    expect(report.dependencyCache?.counters).toEqual(
+      expect.objectContaining({ adopted: 1, converted: 1, recovered: 0 }),
+    );
+    const key = dependencyKey(clone.repoDir, envFingerprint('22.23.2'))!.key;
+    const entryFile = path.join(dataRoot, 'dependency-cache', 'wg-acme', key, 'node_modules', 'left-pad', 'index.js');
+    for (const repoDir of [primary.repoDir, clone.repoDir]) {
+      expect(fs.lstatSync(path.join(repoDir, 'node_modules', 'left-pad', 'index.js')).ino, repoDir).toBe(
+        fs.lstatSync(entryFile).ino,
+      );
+    }
+  });
+
+  it('still sweeps a regenerable store at the worktrees root, beside the checkouts', () => {
+    // Production topics carry a `.pnpm-store` at the worktrees root. It is not a
+    // checkout, so the lister skips it, but it is a regenerable name and the
+    // 2-day delete must keep reclaiming it.
+    const topic = makeNpmTopic('thread-c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3');
+    const store = path.join(topic.topicDir, 'worktrees', '.pnpm-store');
+    fs.mkdirSync(path.join(store, 'v3'), { recursive: true });
+    fs.writeFileSync(path.join(store, 'v3', 'blob'), 'x'.repeat(100));
+    ageTopic(topic.topicDir);
+
+    const report = sweep();
+
+    expect(report.actions.map((action) => action.path)).toContain(store);
   });
 
   it('reclaimable bytes exclude files hardlinked elsewhere', () => {

@@ -13,6 +13,17 @@ const BASE_CONFIG = [
   'credential.helper=',
   '-c',
   'protocol.file.allow=always',
+  // Signature verification runs a configured program: `log.showSignature` makes
+  // every `git log` (and `stash list`) verify signed commits through
+  // `gpg.program`, and a container can set both in a repository it writes.
+  '-c',
+  'log.showSignature=false',
+  '-c',
+  'gpg.program=/bin/false',
+  '-c',
+  'gpg.ssh.program=/bin/false',
+  '-c',
+  'gpg.x509.program=/bin/false',
 ];
 
 export function safeGitEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {

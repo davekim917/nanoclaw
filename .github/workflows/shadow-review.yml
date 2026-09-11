@@ -156,6 +156,7 @@ jobs:
       pull-requests: read
     outputs:
       findings: ${{ steps.review.outputs.structured_output }}
+      failure_reason: ${{ steps.failure-reason.outputs.reason }}
     steps:
       # merge_commit_sha, never head.sha (see the trust-boundary note above). This
       # ref is already reachable from main, so nothing here executes PR-authored
@@ -192,6 +193,98 @@ jobs:
               >> "$RUNNER_TEMP/shadow-review.diff.trunc"
             mv "$RUNNER_TEMP/shadow-review.diff.trunc" "$RUNNER_TEMP/shadow-review.diff"
           fi
+
+      # The reviewer-eligibility tier rule (scripts/reviewer-models.ts, "generated
+      # from the tier config") says this reviewer must run worker-high's Claude
+      # model. Resolved from container/agents/worker-high.md's `model:` frontmatter
+      # (the same source the generator reads) rather than the flat
+      # reviewer-models.txt allowlist, which unions both tiers and both vendors and
+      # so cannot say which id is worker-high specifically. Read from the PR's BASE
+      # sha via the Contents API, never the merge commit that is about to be
+      # checked out: a PR could otherwise edit its own worker-high.md to pick which
+      # model reviews it — same contents-API-from-base pattern
+      # codex-review.sh's repo_mode() uses for labeler.yml.
+      - name: Resolve the worker-high reviewer model
+        id: reviewer_model
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          content=$(gh api -H 'Accept: application/vnd.github.raw+json' \
+            "repos/$REPO/contents/container/agents/worker-high.md?ref=$BASE_SHA")
+
+          # Normalize CRLF/lone-CR line endings the same way the generator's
+          # frontmatterOf() does, before anything else looks at line breaks.
+          content=$(printf '%s' "$content" | tr -d '\r')
+
+          # Scope to the frontmatter block ONLY (between the first two `---`
+          # lines), and ONLY if a closing `---` is actually present. Buffered,
+          # not streamed: awk exiting mid-file on an unclosed frontmatter
+          # would otherwise have already printed every line up to EOF,
+          # including the body — so a body `model:` line would read as if it
+          # were in frontmatter. Mirrors scripts/reviewer-models.ts's
+          # frontmatterOf()/extractScalar(), reimplemented in bash since this
+          # step has no Node/tsx runtime.
+          frontmatter=$(printf '%s\n' "$content" | awk '
+            NR==1 && $0=="---" { infm=1; next }
+            infm && $0=="---" { closed=1; exit }
+            infm { buf = buf $0 "\n" }
+            END { if (closed) printf "%s", buf }
+          ')
+
+          # `grep -m1` exits 1 on no match, and under pipefail that becomes
+          # the whole pipeline's exit status — `|| true` neutralizes that so a
+          # genuine no-match reaches the validation below instead of aborting
+          # silently before it (a prior version of this step had exactly that
+          # bug on the `-z "$model"` check).
+          raw=$(printf '%s\n' "$frontmatter" | grep -m1 -E '^model:[[:space:]]*' || true)
+          value="${raw#model:}"
+          while [ "${value#[[:space:]]}" != "$value" ]; do value="${value#[[:space:]]}"; done
+
+          # Folded block scalar (`model: |` then an indented line below) —
+          # take that first continuation line as the value.
+          if [ "$value" = '|' ] || [ "$value" = '|-' ] || [ "$value" = '|+' ] || [ "$value" = '>' ]; then
+            value=$(printf '%s\n' "$frontmatter" | awk '
+              found { if ($0 ~ /^[[:space:]]+/) { sub(/^[[:space:]]+/, ""); print; exit } else exit }
+              /^model:/ { found=1 }
+            ')
+          fi
+
+          # Trailing whitespace on the value — parity with the generator's own
+          # line-oriented handling, so "model: claude-opus-5[1m]  " (trailing
+          # spaces) resolves the same id here as it would there.
+          value=$(printf '%s' "$value" | sed -E 's/[[:space:]]+$//')
+
+          # Strip a wrapping quote pair, then a trailing [1m] context-window
+          # suffix (case-insensitive) — same normalization the generator does.
+          case "$value" in
+            \"*\") value="${value#\"}"; value="${value%\"}" ;;
+            \'*\') value="${value#\'}"; value="${value%\'}" ;;
+          esac
+          value="${value%\[1[Mm]\]}"
+          model="$value"
+
+          # Reject anything that isn't a bare model id, matching
+          # assertConcreteModelId's two checks in scripts/reviewer-models.ts:
+          # a bare alias with no digit ("opus", "sonnet", "inherit"), and any
+          # shape that isn't purely id characters (a trailing comment or extra
+          # words — extractScalar isn't a full YAML parser, so either reads
+          # back as part of the value) would otherwise silently name the wrong
+          # --model.
+          case "$model" in
+            *[0-9]*) ;;
+            *)
+              echo "could not resolve a valid worker-high model id from container/agents/worker-high.md@$BASE_SHA (no versioned 'model:' frontmatter scalar found)" >&2
+              exit 1
+              ;;
+          esac
+          if ! printf '%s' "$model" | grep -qE '^[A-Za-z0-9._-]+$'; then
+            echo "could not resolve a valid worker-high model id from container/agents/worker-high.md@$BASE_SHA (no bare 'model:' frontmatter scalar found)" >&2
+            exit 1
+          fi
+          echo "model=$model" >> "$GITHUB_OUTPUT"
 
       # Read-only reviewer of a checkout whose sensitive paths the action has
       # already restored from origin/main, further locked down by
@@ -239,20 +332,120 @@ jobs:
             precise and conservative: this feeds a program that moves a PR's paths onto
             the mandatory-review list on a real P1, so a false P1 has a real cost.
           claude_args: |
-            --model claude-opus-5
+            --model ${{ steps.reviewer_model.outputs.model }}
             --setting-sources user
             --strict-mcp-config
             --allowedTools "Read,Grep,Glob"
             --disallowedTools "Bash,Write,Edit,WebSearch,WebFetch"
             --json-schema '{"type":"object","properties":{"findings":{"type":"array","items":{"type":"object","properties":{"severity":{"type":"string","enum":["P1","P2"]},"file":{"type":"string"},"line":{"type":["integer","null"]},"class":{"type":"string"},"description":{"type":"string"}},"required":["severity","file","description"]}}},"required":["findings"]}'
 
+      # Steps with no explicit `shell:` run as `bash -e {0}`
+      # (actions/runner `ScriptHandlerHelpers.cs:19`) — errexit is on regardless of
+      # what `set` says, so every command here that can legitimately fail is
+      # either inside an `if`/`case` test (exempt from `-e`) or explicitly
+      # `|| ...`-guarded. `set -uo pipefail` still adds real value on top of that:
+      # `-u` catches an unset-variable typo, and `pipefail` makes a failing `gh`
+      # inside a pipe abort the pipeline instead of silently succeeding on `wc`'s
+      # exit code.
+      #
+      # The action hides the model's actual result/error text from normal logs by
+      # design (`sanitizeSdkOutput`, `base-action/src/run-claude-sdk.ts:117-160`,
+      # only prints a sanitized summary — subtype/is_error/duration/cost/turns —
+      # never the text itself). But it always writes the full, unsanitized SDK
+      # message transcript to `$RUNNER_TEMP/claude-execution-output.json`
+      # (`base-action/src/execution-file.ts:6,8-13,15-32`: one JSON array, written
+      # by `writeExecutionFile` before the run either returns or re-throws,
+      # `run-claude-sdk.ts:186,213-214,222`). The pinned action returns right
+      # after writing a result message (`run-claude-sdk.ts:190-209`), so on a
+      # normal completion the result IS the last array entry — but an
+      # SDK-THROW path (an error before any result forms) writes the
+      # transcript up to whatever message came last and then throws with NO
+      # result message in it at all, so blindly reading `.[-1]` could pick up
+      # some other message type and misread its fields as if they were
+      # `.result`/`.errors`. Filtering for `type=="result"` explicitly (and
+      # taking the last match, since only one should ever exist) avoids that;
+      # when none exists at all, the `$r == null` branch below reports it
+      # plainly instead. On `SDKResultSuccess`
+      # (subtype "success", `sdk.d.ts` ~4999-5040) `.result` carries the final
+      # assistant text OR, when `is_error` is true, "the error text when the turn
+      # ended on an API error" (the type's own doc comment); on `SDKResultError`
+      # (`sdk.d.ts` ~4957-4988, the max-turns/max-budget/max-structured-output-
+      # retries/during-execution subtypes) there is no `.result` field at all,
+      # only `errors: string[]`. jq's `//` treats only `false`/`null` as absent,
+      # NOT `""`, so an empty `.result` string is folded into "absent" explicitly
+      # before falling back to `.errors`; a final fallback covers no result
+      # message at all (a failure before `runClaudeWithSdk` ran, e.g.
+      # `checkHumanActor`, `restoreConfigFromBase`, CLI install), and `|| true`
+      # after the whole substitution stops a jq parse error on a malformed/
+      # truncated file from aborting the step under `-e` before REASON's own
+      # empty-string fallback below gets a chance to run.
+      - name: Report the failure reason
+        id: failure-reason
+        if: failure()
+        run: |
+          set -uo pipefail
+          FILE="${{ runner.temp }}/claude-execution-output.json"
+          if [ ! -f "$FILE" ]; then
+            REASON="no execution output was written — the run failed before Claude started"
+          else
+            REASON=$(jq -r '
+              ([.[] | select(.type=="result")] | last) as $r
+              | if $r == null then "no result message recorded in the execution output"
+                else
+                  ( ($r.result // "") as $res
+                    | if $res != "" then $res
+                      else ( (($r.errors // []) | join("; ")) as $errs
+                        | if $errs != "" then $errs
+                          else "result message present but no result/errors field"
+                          end
+                      )
+                      end
+                  )
+                end
+            ' "$FILE" 2>/dev/null) || true
+            if [ -z "$REASON" ]; then
+              REASON="could not parse the execution output"
+            fi
+          fi
+          # Flatten to one line and cap length before it goes anywhere (step
+          # summary, a later job output, potentially a PR comment via `report`).
+          REASON=$(printf '%s' "$REASON" | tr -d '\r' | tr '\n' ' ' | cut -c1-300)
+          # Same known-token-prefix scrub as `report` — see that job for why a
+          # generic secret-shape heuristic isn't used.
+          if printf '%s' "$REASON" | grep -qE 'ghs_|ghp_|gho_|ghu_|ghr_|github_pat_|sk-ant-'; then
+            REASON="[redacted: the raw error text contained a token-shaped string]"
+          fi
+          echo "Shadow review failed. Reason: $REASON"
+          {
+            echo "## Shadow review failed"
+            echo ""
+            echo "$REASON"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "reason=$REASON" >> "$GITHUB_OUTPUT"
+
   report:
     needs: analyze
+    # `always()` bypasses the implicit `success()` gate `needs:` puts on this job,
+    # so it isn't itself skipped by `analyze` failing — but it must still respect
+    # the same selection predicate `analyze` used (so an unselected PR's `report`
+    # doesn't fire just because `always()` is present), AND only proceed when
+    # `analyze` actually ran to a real conclusion: 'success' is the normal path,
+    # 'failure' and 'cancelled' both take the failure path below (see that step),
+    # and 'skipped' is the only one that leaves this job skipped too.
+    # `cancelled` is treated as a real failure signal, not a benign no-op: the
+    # merged PR that triggered this run can't be reopened, so this workflow's own
+    # `concurrency: cancel-in-progress` (scoped to the PR number) never cancels a
+    # merged PR's run — nothing about this workflow's design produces a
+    # `cancelled` `analyze` in normal operation. A `cancelled` result here means a
+    # manual cancel or an infrastructure interruption, and either way no review
+    # ran, which is exactly the silent-failure mode this job exists to surface.
     if: >-
+      always() &&
       github.event.pull_request.merged == true &&
       github.event.pull_request.base.ref == 'main' &&
       !contains(github.event.pull_request.labels.*.name, 'risk:high') &&
-      !contains(github.event.pull_request.labels.*.name, 'review:requested')
+      !contains(github.event.pull_request.labels.*.name, 'review:requested') &&
+      (needs.analyze.result == 'success' || needs.analyze.result == 'failure' || needs.analyze.result == 'cancelled')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -261,26 +454,113 @@ jobs:
       pull-requests: write
     steps:
       # Idempotent: creates the label on first run, no-ops (via --force, which updates
-      # rather than errors) on every run after.
-      - name: Ensure the shadow-review label exists
+      # rather than errors) on every run after. Each create is `|| echo ::warning`
+      # rather than left to fail the step outright: under `bash -e` (see the note in
+      # `analyze`'s "Report the failure reason" step), an unguarded transient 5xx on
+      # the FIRST create would abort the step before the others ran, and — with no
+      # `always()` — silently skip both steps below it too, since their `if:` is
+      # implicitly ANDed with this step's `success()`.
+      - name: Ensure the shadow-review labels exist
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
+          set -uo pipefail
           gh label create shadow-review \
             --repo "$REPO" \
             --color 5319E7 \
             --description "Findings from a post-merge advisory review of a PR that merged without review (docs/specs/risk-based-review/plan.md)" \
-            --force
+            --force \
+            || echo "::warning::could not create the shadow-review label"
+          gh label create shadow-review-failed \
+            --repo "$REPO" \
+            --color B60205 \
+            --description "This merge has no post-merge shadow review on record — analyze errored or was cancelled, or the result could not be filed — until this workflow is re-run (docs/specs/risk-based-review/plan.md)" \
+            --force \
+            || echo "::warning::could not create the shadow-review-failed label"
+          gh label create shadow-reviewed \
+            --repo "$REPO" \
+            --color 0E8A16 \
+            --description "This PR was reviewed by the post-merge shadow-review workflow, clean or with findings (docs/specs/risk-based-review/plan.md)" \
+            --force \
+            || echo "::warning::could not create the shadow-reviewed label"
 
-      # The only step in this workflow that writes to GitHub — see the trust-boundary
-      # comment at the top of this file for why the model never reaches this token.
-      # `scripts/review-outcomes.ts` reads what this step writes back
-      # (buildShadowReviewIndex) to count skipped PRs that were reviewed and the P1s
-      # among them — it matches this exact title shape and the "- **P1**" / "- **P2**"
-      # bullet format below, so don't change either without updating that script's
-      # SHADOW_REVIEW_TITLE_RE / P1_LINE_RE.
+      # analyze errored, or was cancelled, before Claude produced a result. Either
+      # way this merge gets neither an issue nor a clean-review comment — say so
+      # explicitly, once, rather than let it read as silently clean, and label it
+      # failed. Adds shadow-review-failed ONLY — never removes shadow-reviewed:
+      # this step has no way to know whether an EARLIER run already reviewed this
+      # PR successfully, and a failed re-run (e.g. someone re-running all jobs on
+      # an old, already-reviewed PR) must not erase that history.
+      # `scripts/review-outcomes.ts`'s classifyShadowReview() encodes the resulting
+      # precedence: reviewed wins over failed, so a PR that carries both labels
+      # (this one, plus a stale shadow-reviewed from before) still reads as
+      # reviewed. On a cancel, analyze's own `if: failure()` "Report the failure
+      # reason" step never runs (cancellation isn't a step failure), so
+      # `failure_reason` is unset here — substitute the literal "(cancelled)"
+      # rather than falling through to a generic "unknown reason" that would look
+      # like an unread execution-output file when actually nothing ran long enough
+      # to produce one.
+      #
+      # `if: always() && (...)`, not a bare `(...)`: without `always()` this step's
+      # condition is implicitly ANDed with `success()` of every prior step in this
+      # job, so a transient failure in "Ensure the shadow-review labels exist"
+      # (hardened above, but defense in depth) would otherwise skip this step too —
+      # exactly the silent-failure shape this workflow exists to prevent, one job
+      # over. Never itself fails the job a second time: every write is tolerated,
+      # and the step always exits 0.
+      - name: Report that analyze failed
+        if: always() && (needs.analyze.result == 'failure' || needs.analyze.result == 'cancelled')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          ANALYZE_RESULT: ${{ needs.analyze.result }}
+          REASON: ${{ needs.analyze.outputs.failure_reason }}
+        run: |
+          set -uo pipefail
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label shadow-review-failed \
+            || echo "::warning::could not label #$PR_NUMBER shadow-review-failed"
+
+          # Idempotent across retries of this job: skip if already posted. `--jq`
+          # under `--paginate` runs the filter once PER PAGE, not once over the
+          # combined result set — a `| length` here would silently break on a PR
+          # with more than one page of comments (a multi-line count, `[ -gt 0 ]`
+          # erroring on the second line under `-e`, and a duplicate comment
+          # getting posted). Emitting one matching id per line instead makes
+          # multi-page output concatenate correctly, and `wc -l` counts the total
+          # regardless of how many pages contributed.
+          MARKER="Shadow review could not run"
+          existing=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+            --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" 2>/dev/null \
+            | wc -l) || existing=0
+          case "$existing" in
+            ''|*[!0-9]*) existing=0 ;;
+          esac
+          if [ "$existing" -gt 0 ]; then
+            echo "Failure comment already posted on #$PR_NUMBER; not posting again."
+            exit 0
+          fi
+
+          if [ "$ANALYZE_RESULT" = "cancelled" ]; then
+            reason="(cancelled)"
+          else
+            reason="${REASON:-unknown reason}"
+          fi
+          gh pr comment "$PR_NUMBER" --repo "$REPO" \
+            --body "$MARKER: ${reason}. This merge has no post-merge review until it is re-run." \
+            || echo "::warning::could not comment on #$PR_NUMBER"
+          exit 0
+
+      # The only step in this workflow that writes findings to GitHub — see the
+      # trust-boundary comment at the top of this file for why the model never
+      # reaches this token. `scripts/review-outcomes.ts` reads what this step
+      # writes back (buildShadowReviewIndex) to count skipped PRs that were
+      # reviewed and the P1s among them — it matches this exact title shape and
+      # the "- **P1**" / "- **P2**" bullet format below, so don't change either
+      # without updating that script's SHADOW_REVIEW_TITLE_RE / P1_LINE_RE.
       - name: File findings, or confirm none were found
+        if: needs.analyze.result == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -289,6 +569,26 @@ jobs:
           STRUCTURED_OUTPUT: ${{ needs.analyze.outputs.findings }}
         run: |
           set -euo pipefail
+
+          # The runner drops any step output that contains a masked secret — never
+          # replaces it with a placeholder, just an empty string
+          # (actions/runner `JobExtension.cs:810-812`). So if the model echoed
+          # analyze's own token into a finding's free text (the very prompt-
+          # injection scenario the scrub below defends against), `findings`
+          # arrives here as `''` even though `analyze` itself reported success.
+          # An empty STRUCTURED_OUTPUT must never fall through to "no findings"
+          # below: jq on empty input silently exits 0 with no output at all
+          # (confirmed: `echo -n '' | jq '.x'` prints nothing, exit 0 — not an
+          # error), so `findings_count` would end up empty, `[ "" -eq 0 ]` would
+          # fail its own integer test (exit 2, not "true"), and execution would
+          # fall into the FINDINGS branch with an empty `body` — filing a blank
+          # issue and labeling the PR `shadow-reviewed`, turning a masked
+          # credential exposure into "reviewed, clean". Fail closed instead, so
+          # "Report a filing failure" below labels it `shadow-review-failed`.
+          if [ -z "$STRUCTURED_OUTPUT" ]; then
+            echo "::error::findings output is empty (the runner drops outputs containing a masked secret — treat as a possible credential exposure)" >&2
+            exit 1
+          fi
 
           # Fail closed on a known token prefix anywhere in the model's output —
           # defense in depth (see the top-of-file comment: the job split, not
@@ -312,10 +612,34 @@ jobs:
             exit 1
           fi
 
+          # Label AFTER a post actually succeeds, never before: `gh pr comment` and
+          # `gh issue create` below are unguarded, so if either fails, `-e` aborts
+          # the step before its label-swap runs, and the "Report a filing failure"
+          # step (below, `if: failure()`) applies shadow-review-failed instead — a
+          # PR whose review never actually got posted must never read as reviewed.
+          # The swap itself IS guarded: the review already posted by this point, so
+          # a labeling hiccup afterward is a warning, not a reason to fail the step.
           findings_count=$(jq '.findings | length' <<<"$STRUCTURED_OUTPUT")
+          # Defense in depth alongside the empty-output check above: `[ -eq ]`
+          # below only ever compares against a true integer safely if
+          # findings_count actually is one. A non-integer here (multiple
+          # concatenated JSON values in STRUCTURED_OUTPUT producing one
+          # `length` per value, e.g. "0\n1") would make `[ "$findings_count"
+          # -eq 0 ]` itself fail its own integer test (exit 2, read as "false"
+          # by `if`, not an error) and silently fall through to the FINDINGS
+          # branch below with a garbled `body` — fail closed instead.
+          case "$findings_count" in
+            ''|*[!0-9]*)
+              echo "::error::findings output has no usable finding count (got: '$findings_count')" >&2
+              exit 1
+              ;;
+          esac
           if [ "$findings_count" -eq 0 ]; then
             gh pr comment "$PR_NUMBER" --repo "$REPO" \
               --body "Shadow review (post-merge, advisory — docs/specs/risk-based-review/plan.md): no findings."
+            gh pr edit "$PR_NUMBER" --repo "$REPO" \
+              --add-label shadow-reviewed --remove-label shadow-review-failed \
+              || echo "::warning::could not update labels on #$PR_NUMBER after a clean review"
             exit 0
           fi
 
@@ -338,3 +662,73 @@ jobs:
             --title "$full_title" \
             --label shadow-review \
             --body "$body"
+          gh pr edit "$PR_NUMBER" --repo "$REPO" \
+            --add-label shadow-reviewed --remove-label shadow-review-failed \
+            || echo "::warning::could not update labels on #$PR_NUMBER after filing findings"
+
+      # analyze succeeded, but posting the result broke somewhere above — the scrub
+      # refusing a token-shaped finding or an unreadable findings_count (both
+      # `exit 1`), `gh pr comment` failing, or `gh issue create` failing.
+      # Whatever happened, nothing was actually posted: label the PR failed
+      # rather than let it read as reviewed (or, worse, as neither — see the
+      # coverage-denominator caveat in `scripts/review-outcomes.ts`). `if: always()
+      # && failure()`, matching the analyze-failed step's pattern above:
+      # `failure()` already contains a status function so GitHub would not
+      # auto-prepend `success()` to it either way, but spelling out `always()`
+      # keeps both failure-catching steps in this job visually consistent. Never
+      # itself fails the job further: every write is tolerated.
+      #
+      # The PR comment below is FIXED TEXT, not built from anything this step ran
+      # alongside — never `$STRUCTURED_OUTPUT`, never the step summary text below,
+      # never anything from "File findings"'s own log. The one path into this step
+      # that matters most is the scrub refusing a token-shaped string: whatever
+      # tripped it is still sitting in that step's log and in `$STRUCTURED_OUTPUT`
+      # (this step's own env doesn't even receive it), and a comment built from
+      # either would risk echoing the very credential the scrub existed to keep
+      # off GitHub.
+      #
+      # Its own MARKER, distinct from "Report that analyze failed"'s: this step
+      # ran (unlike that one, where analyze itself never produced a result), so
+      # reusing that marker would be a wrong description AND a wrong duplicate
+      # check — a PR that already carries an analyze-failure comment from an
+      # earlier, unrelated run would match that marker's `startswith` test here
+      # and this step would silently skip posting its own comment, even though
+      # THIS run's failure (a filing failure, not an analyze failure) was never
+      # reported at all.
+      - name: Report a filing failure
+        if: always() && failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -uo pipefail
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label shadow-review-failed \
+            || echo "::warning::could not label #$PR_NUMBER shadow-review-failed"
+
+          {
+            echo "## Shadow review ran, but filing the result failed"
+            echo ""
+            echo "See the \"File findings, or confirm none were found\" step's own log above for why."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Idempotent across retries, same page-safe count pattern as "Report
+          # that analyze failed" above (see that step for why `--jq` under
+          # `--paginate` needs one id per line, not `| length`) — but its OWN
+          # marker, per the comment above this step.
+          MARKER="Shadow review ran but its result could not be posted"
+          existing=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+            --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" 2>/dev/null \
+            | wc -l) || existing=0
+          case "$existing" in
+            ''|*[!0-9]*) existing=0 ;;
+          esac
+          if [ "$existing" -gt 0 ]; then
+            echo "Filing-failure comment already posted on #$PR_NUMBER; not posting again."
+            exit 0
+          fi
+
+          gh pr comment "$PR_NUMBER" --repo "$REPO" \
+            --body "$MARKER. See the workflow run. This merge has no recorded post-merge review until it is re-run or labelled by hand." \
+            || echo "::warning::could not comment on #$PR_NUMBER"
+          exit 0

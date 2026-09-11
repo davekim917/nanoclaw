@@ -60,6 +60,7 @@ vi.mock('../../repo-fence-recovery.js', async (importOriginal) => ({
 const {
   runRepositoryActionDetached,
   _repositoryActionChainForTesting,
+  _repositoryActionLaneCountForTesting,
   _resetRepositoryActionsForTesting,
   REPOSITORY_REQUEST_ID_PATTERN,
 } = await import('./job-runner.js');
@@ -258,6 +259,99 @@ describe('runRepositoryActionDetached', () => {
     );
     expect(apply).toHaveBeenCalledTimes(1);
     expect(marks).toEqual([]);
+  });
+
+  it('runs a work-unit lane beside a held global job and serializes jobs within one lane', async () => {
+    const order: string[] = [];
+    let releaseGlobal: (() => void) | null = null;
+    let releaseFirst: (() => void) | null = null;
+    await runRepositoryActionDetached(
+      'repository_publish',
+      async () => {
+        order.push('global:start');
+        await new Promise<void>((resolve) => {
+          releaseGlobal = resolve;
+        });
+        order.push('global:end');
+      },
+      { requestId: requestId('10') },
+      session,
+    );
+    await runRepositoryActionDetached(
+      'repository_checkout',
+      async () => {
+        order.push('unit-a:first:start');
+        await new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+        order.push('unit-a:first:end');
+      },
+      { requestId: requestId('11') },
+      session,
+      'checkout:wg:unit-a',
+    );
+    await runRepositoryActionDetached(
+      'repository_checkout',
+      async () => {
+        order.push('unit-a:second');
+      },
+      { requestId: requestId('12') },
+      session,
+      'checkout:wg:unit-a',
+    );
+    await runRepositoryActionDetached(
+      'repository_checkout',
+      async () => {
+        order.push('unit-b');
+      },
+      { requestId: requestId('13') },
+      session,
+      'checkout:wg:unit-b',
+    );
+
+    // Unit B finishes while the global job and unit A's first job both hold.
+    await _repositoryActionChainForTesting('checkout:wg:unit-b');
+    await tick();
+    expect(order).toEqual(['global:start', 'unit-a:first:start', 'unit-b']);
+
+    // Unit A's second job waited for its own lane only.
+    releaseFirst!();
+    await _repositoryActionChainForTesting('checkout:wg:unit-a');
+    expect(order).toEqual(['global:start', 'unit-a:first:start', 'unit-b', 'unit-a:first:end', 'unit-a:second']);
+
+    releaseGlobal!();
+    await _repositoryActionChainForTesting();
+    expect(order.at(-1)).toBe('global:end');
+    expect(marks.map((mark) => mark.id).sort()).toEqual(
+      [requestId('10'), requestId('11'), requestId('12'), requestId('13')].sort(),
+    );
+  });
+
+  it('forgets a lane once its last job settles, and dedups a request id across lanes', async () => {
+    const apply = vi.fn(async () => {});
+    const id = requestId('14');
+    let release: (() => void) | null = null;
+    await runRepositoryActionDetached(
+      'repository_checkout',
+      async () => {
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      },
+      { requestId: id },
+      session,
+      'checkout:wg:unit-c',
+    );
+    // The row is re-dispatched while its job runs; the dedup is by request id.
+    await runRepositoryActionDetached('repository_checkout', apply, { requestId: id }, session, 'checkout:wg:unit-d');
+    await tick();
+    expect(apply).not.toHaveBeenCalled();
+    expect(_repositoryActionLaneCountForTesting()).toBe(1);
+
+    release!();
+    await _repositoryActionChainForTesting('checkout:wg:unit-c');
+    await tick();
+    expect(_repositoryActionLaneCountForTesting()).toBe(0);
   });
 
   it('accepts the request ids the container actually generates', () => {
