@@ -135,7 +135,7 @@ import {
   workgroupReadAccessInstructions,
 } from './workgroup-read-access.js';
 import { resolveWorkgroupWiki, workgroupWikiInstructions } from './workgroup-wiki.js';
-import { loadPluginScopes, pluginAllowedForWorkgroup } from './plugin-scopes.js';
+import { loadPluginScopes, pluginAllowedForWorkgroup, warnUnmatchedPluginScopes } from './plugin-scopes.js';
 import YAML from 'yaml';
 
 import { extractToolScopes, filterConfigSections, isToolEnabled } from './scoped-env.js';
@@ -4899,6 +4899,7 @@ export async function buildMounts(
     } catch (err) {
       log.warn('Failed to read ~/plugins directory', { err });
     }
+    warnUnmatchedPluginScopes(pluginScopes, entries);
     for (const entry of entries) {
       if (excluded.has(entry) || !pluginAllowedForWorkgroup(entry, wgKey, pluginScopes)) continue;
       const pluginHostPath = path.join(pluginsHostDir, entry);

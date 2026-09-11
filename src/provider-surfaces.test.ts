@@ -40,6 +40,7 @@ vi.mock('./db/messaging-groups.js', async (importOriginal) => {
 });
 
 import { buildMounts } from './container-runner.js';
+import { log } from './log.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { sessionContextPath, sessionDir, writeSessionContext } from './session-manager.js';
 import { inboundDbPath } from './mailbox/sqlite/paths.js';
@@ -916,7 +917,7 @@ describe('buildMounts agent surfaces', async () => {
     fs.mkdirSync(DATA_DIR, { recursive: true });
     fs.writeFileSync(
       path.join(DATA_DIR, 'plugin-scopes.json'),
-      JSON.stringify({ version: 1, plugins: { 'client-plugin': ['client-wg'] } }),
+      JSON.stringify({ version: 1, plugins: { 'client-plugin': ['client-wg'], 'missing-plugin': ['client-wg'] } }),
     );
     const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(homedir);
 
@@ -949,6 +950,10 @@ describe('buildMounts agent surfaces', async () => {
       expect(memberPaths).toContain('/workspace/plugins/shared-plugin');
       expect(outsiderPaths).not.toContain('/workspace/plugins/client-plugin');
       expect(outsiderPaths).toContain('/workspace/plugins/shared-plugin');
+      expect(log.warn).toHaveBeenCalledWith(
+        expect.stringContaining('Plugin scope names no ~/plugins directory'),
+        expect.objectContaining({ plugin: 'missing-plugin' }),
+      );
     } finally {
       homedirSpy.mockRestore();
     }

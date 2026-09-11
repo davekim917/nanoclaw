@@ -3,11 +3,21 @@ import path from 'path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { DATA_DIR } = vi.hoisted(() => ({ DATA_DIR: `${uniqueTmpRoot('plugin-scopes-test')}/data` }));
+const { DATA_DIR, warn } = vi.hoisted(() => ({
+  DATA_DIR: `${uniqueTmpRoot('plugin-scopes-test')}/data`,
+  warn: vi.fn(),
+}));
 
 vi.mock('./config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./config.js')>()),
   DATA_DIR,
+}));
+
+// NOT spread: log.ts installs process-wide handlers at module scope.
+vi.mock('./log.js', () => ({
+  setLogScrubber: vi.fn(),
+  log: { debug: vi.fn(), info: vi.fn(), warn, error: vi.fn(), fatal: vi.fn() },
+  isSurvivableIoError: vi.fn(() => false),
 }));
 
 import {
@@ -16,6 +26,7 @@ import {
   parsePluginScopes,
   pluginAllowedForWorkgroup,
   scopedPluginNames,
+  warnUnmatchedPluginScopes,
 } from './plugin-scopes.js';
 
 function writePolicy(policy: unknown): void {
@@ -86,5 +97,18 @@ describe('pluginAllowedForWorkgroup', () => {
 
   it('delivers a plugin scoped to an empty list nowhere', () => {
     expect(pluginAllowedForWorkgroup('retired', 'client-wg', scopes)).toBe(false);
+  });
+});
+
+describe('warnUnmatchedPluginScopes', () => {
+  it('warns once for a scoped name that matches no plugin directory, and never for one that does', () => {
+    warn.mockClear();
+    const scopes = parsePluginScopes(
+      JSON.stringify({ version: 1, plugins: { 'typo-plugin': ['client-wg'], 'real-plugin': ['client-wg'] } }),
+    );
+    warnUnmatchedPluginScopes(scopes, ['real-plugin', 'shared-plugin']);
+    warnUnmatchedPluginScopes(scopes, ['real-plugin', 'shared-plugin']);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][1]).toMatchObject({ plugin: 'typo-plugin' });
   });
 });

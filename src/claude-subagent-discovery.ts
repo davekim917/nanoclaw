@@ -10,6 +10,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { loadPluginScopes, scopedPluginNames } from './plugin-scopes.js';
+
 export interface DiscoveredSubagent {
   name: string;
   path: string;
@@ -42,11 +44,15 @@ export function discoverClaudeSubagents(): DiscoveredSubagent[] {
     }
   }
 
-  // Plugin tree.
+  // Plugin tree. A workgroup-scoped plugin's agents are never mirrored: both
+  // consumers (codex-sync, opencode-sync) write to targets not keyed by
+  // workgroup (src/plugin-scopes.ts). Claude loads plugin agents from the
+  // plugin mount, which the scope already gates.
   const pluginsRoot = path.join(home, 'plugins');
   if (fs.existsSync(pluginsRoot)) {
+    const scoped = scopedPluginNames(loadPluginScopes());
     for (const plugin of fs.readdirSync(pluginsRoot)) {
-      if (plugin.startsWith('.')) continue;
+      if (plugin.startsWith('.') || scoped.has(plugin)) continue;
       walkPluginAgents(path.join(pluginsRoot, plugin), seen);
     }
   }

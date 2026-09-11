@@ -18,15 +18,25 @@ vi.mock('./log.js', () => ({
   isSurvivableIoError: vi.fn(() => false),
 }));
 
-import { syncOpenCodePluginSkills } from './opencode-sync.js';
+import { syncOpenCodePluginSkills, syncOpenCodeSubagents } from './opencode-sync.js';
 
 const HOME = path.join(TEST_ROOT, 'home');
 const GLOBAL_SKILLS = path.join(HOME, '.config', 'opencode', 'skill');
+const GLOBAL_AGENTS = path.join(HOME, '.config', 'opencode', 'agent');
 
 function pluginSkill(plugin: string, name: string): void {
   const dir = path.join(HOME, 'plugins', plugin, 'skills', name);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'SKILL.md'), `---\nname: ${name}\ndescription: Test skill ${name}.\n---\n\nBody.\n`);
+}
+
+function pluginAgent(plugin: string, name: string): void {
+  const dir = path.join(HOME, 'plugins', plugin, 'agents');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, `${name}.md`),
+    `---\nname: ${name}\ndescription: Test agent ${name}.\n---\n\nYou are ${name}.\n`,
+  );
 }
 
 function scopePlugins(plugins: Record<string, string[]>): void {
@@ -67,6 +77,17 @@ describe('syncOpenCodePluginSkills with workgroup-scoped plugins (src/plugin-sco
     expect(fs.existsSync(path.join(GLOBAL_SKILLS, 'shared-skill'))).toBe(true);
   });
 
+  it('lets an unscoped plugin keep a skill name a scoped plugin also uses', () => {
+    pluginSkill('a-client', 'dup-skill');
+    pluginSkill('b-shared', 'dup-skill');
+    fs.appendFileSync(path.join(HOME, 'plugins', 'b-shared', 'skills', 'dup-skill', 'SKILL.md'), 'FROM_B_SHARED\n');
+    scopePlugins({ 'a-client': ['client-wg'] });
+
+    syncOpenCodePluginSkills();
+
+    expect(fs.readFileSync(path.join(GLOBAL_SKILLS, 'dup-skill', 'SKILL.md'), 'utf-8')).toContain('FROM_B_SHARED');
+  });
+
   it('keeps a scoped plugin skill out of per-sibling targets too', () => {
     const sibling = path.join(HOME, '.local', 'share', 'opencode-client-wg-opencode');
     fs.mkdirSync(sibling, { recursive: true });
@@ -78,5 +99,20 @@ describe('syncOpenCodePluginSkills with workgroup-scoped plugins (src/plugin-sco
     expect(result.targets).toContain(path.join(sibling, 'skill'));
     expect(fs.existsSync(path.join(sibling, 'skill', 'client-skill'))).toBe(false);
     expect(fs.existsSync(path.join(sibling, 'skill', 'shared-skill'))).toBe(true);
+  });
+});
+
+describe('syncOpenCodeSubagents with workgroup-scoped plugins (src/plugin-scopes.ts)', () => {
+  it('never mirrors a scoped plugin agent, and prunes one mirrored before it was scoped', () => {
+    pluginAgent('client-plugin', 'client-agent');
+    pluginAgent('shared-plugin', 'shared-agent');
+    syncOpenCodeSubagents();
+    expect(fs.existsSync(path.join(GLOBAL_AGENTS, 'client-agent.md'))).toBe(true);
+
+    scopePlugins({ 'client-plugin': ['client-wg'] });
+    syncOpenCodeSubagents();
+
+    expect(fs.existsSync(path.join(GLOBAL_AGENTS, 'client-agent.md'))).toBe(false);
+    expect(fs.existsSync(path.join(GLOBAL_AGENTS, 'shared-agent.md'))).toBe(true);
   });
 });

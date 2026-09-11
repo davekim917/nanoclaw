@@ -31,6 +31,7 @@ import { GITHUB_APP_SENTINEL, peekGitHubAppTokenExpiry } from './github-app-toke
 import { GH_TOKEN_CONTAINER_PATH, githubTokenDeliveredAsEnv } from './github-token-file.js';
 import { isOwnerSafeSlackSession } from './modules/permissions/slack-user-token-gate.js';
 import { getAllMessagingGroups } from './db/messaging-groups.js';
+import { loadPluginScopes, pluginAllowedForWorkgroup } from './plugin-scopes.js';
 import { extractToolScopes } from './scoped-env.js';
 
 // Read version once at module load.
@@ -198,6 +199,22 @@ const SCOPED_ENV_NAMES = [
   'ATLASSIAN_BASE_URL',
   'SELECT_ORGANIZATION_ID',
 ];
+
+/**
+ * Host plugins as one agent group may see them: inside a container the
+ * snapshot must not name another workgroup's scoped plugin (src/plugin-scopes.ts).
+ * The host-wide view (no group) lists everything. A spawn reconciles the group's
+ * workgroup (src/container-runner.ts:1681) before it writes the snapshot (:1863),
+ * so workgroup_id here is the key the plugin mount uses.
+ */
+async function installedPluginsFor(agentGroupId: string | undefined): Promise<string[]> {
+  const installed = listHostPlugins();
+  if (!agentGroupId) return installed;
+  const group = await getAgentGroup(agentGroupId);
+  const workgroupId = group?.workgroup_id ?? group?.folder;
+  const scopes = loadPluginScopes();
+  return installed.filter((plugin) => pluginAllowedForWorkgroup(plugin, workgroupId, scopes));
+}
 
 function listHostPlugins(): string[] {
   const dir = path.join(os.homedir(), 'plugins');
@@ -940,7 +957,7 @@ export async function getHostCapabilities(
     },
     plugins: {
       builtin: [],
-      installed: listHostPlugins(),
+      installed: await installedPluginsFor(forAgentGroupId),
     },
     agentGroups,
     messagingGroupsByChannel: byChannel,

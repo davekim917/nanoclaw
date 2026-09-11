@@ -104,13 +104,21 @@ A plugin named there reaches only agent groups in the listed workgroups, on
 every path plugin content takes:
 - the mount (Claude, and Codex, which registers plugins from it);
 - the always-on ruleset composed for Codex and OpenCode;
-- the OpenCode skill mirror, which never copies a scoped plugin's skills.
+- the Codex and OpenCode subagent mirrors and the OpenCode skill mirror, which
+  never copy a scoped plugin's agents or skills, because their targets aren't
+  keyed by workgroup. A copy made before scoping is pruned the next time that
+  mirror runs: hourly for subagents, at the next enable run for skills;
+- the capabilities snapshot, which names a scoped plugin only inside its
+  workgroups.
 
 Plugins the policy doesn't name keep the fleet-wide default, and
 `excludePlugins` still applies. No file means nothing is scoped. A file that
-doesn't parse aborts the spawn, the same rule as
-`data/workgroup-read-access.json`. The policy sits outside the plugin clone,
-so re-cloning a plugin can't drop its scope. See `src/plugin-scopes.ts`.
+doesn't parse stops every spawn on the host until it's fixed (queued messages
+wait and the sweep retries), the same rule as
+`data/workgroup-read-access.json`. A scoped name that matches no `~/plugins`
+directory enforces nothing, and the host logs a warning once per process. The
+policy sits outside the plugin clone, so re-cloning a plugin can't drop its
+scope. See `src/plugin-scopes.ts`.
 
 ---
 

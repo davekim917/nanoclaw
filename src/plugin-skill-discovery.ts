@@ -47,7 +47,7 @@ export interface DiscoveredSkill {
  * Plugins to skip entirely. These wrap Claude-only runtime functionality
  * (Skill tool, Agent tool, slash-command machinery).
  */
-const DEFAULT_DENY_PLUGINS = new Set<string>([
+export const DEFAULT_DENY_PLUGINS = new Set<string>([
   // bootstrap: many sub-plugins inside; we walk it with a finer-grained denylist
   //            via DENY_SUB_PLUGIN_SKILL_DIRS, not at the top level.
   // codex: skills here are Codex-plugin internal, already loaded via the codex

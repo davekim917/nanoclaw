@@ -19,16 +19,22 @@
  * plugins were meant to be scoped. An empty list scopes a plugin to no
  * workgroup at all.
  *
- * Enforced on every path plugin content takes into a container: the plugin
- * mount (Claude and Codex, which registers plugins from that mount), the
- * always-on ruleset composed for Codex and OpenCode (src/claude-md-compose.ts),
- * and the OpenCode skill mirror, which never copies a scoped plugin's skills
- * because none of its targets is keyed by workgroup (src/opencode-sync.ts).
+ * Enforced on every path plugin content takes into a container:
+ * - the plugin mount (Claude and Codex, which registers plugins from that mount);
+ * - the always-on ruleset composed for Codex and OpenCode (src/claude-md-compose.ts);
+ * - the Codex and OpenCode subagent mirrors (src/claude-subagent-discovery.ts) and
+ *   the OpenCode skill mirror (src/opencode-sync.ts), which never copy a scoped
+ *   plugin's agents or skills because none of their targets is keyed by workgroup;
+ * - the capabilities snapshot, which names a scoped plugin only inside its
+ *   workgroups (src/capabilities.ts).
+ * A scoped name that matches no ~/plugins directory enforces nothing, so the
+ * mount loop warns about it once per process.
  */
 import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR } from './config.js';
+import { log } from './log.js';
 
 export const PLUGIN_SCOPES_POLICY_PATH = path.join(DATA_DIR, 'plugin-scopes.json');
 
@@ -107,4 +113,22 @@ export function pluginAllowedForWorkgroup(
 
 export function scopedPluginNames(scopes: PluginScopes): ReadonlySet<string> {
   return new Set(scopes.keys());
+}
+
+const warnedUnmatched = new Set<string>();
+
+/**
+ * Warn, once per process per name, about each scoped plugin that matches no
+ * directory in `pluginDirs`. Such a scope enforces nothing: a typo or a clone
+ * under a different directory name leaves the real plugin fleet-wide.
+ */
+export function warnUnmatchedPluginScopes(scopes: PluginScopes, pluginDirs: readonly string[]): void {
+  for (const plugin of scopes.keys()) {
+    if (pluginDirs.includes(plugin) || warnedUnmatched.has(plugin)) continue;
+    warnedUnmatched.add(plugin);
+    log.warn('Plugin scope names no ~/plugins directory; it enforces nothing until the names match', {
+      plugin,
+      policy: PLUGIN_SCOPES_POLICY_PATH,
+    });
+  }
 }
