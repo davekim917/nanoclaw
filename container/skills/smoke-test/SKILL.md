@@ -753,6 +753,38 @@ Attach clips with `send_file` to the run thread. Files under the run root are
 already inside the allowed prefixes, and the 50MB attachment cap is far above a
 60s clip.
 
+**`smoke-evidence-barrier.sh` enforces this at the marker level.** A marker
+declaring `confirmedFindings: ["<id>", ...]` must carry, per id, either
+`clips/<id>.mp4` (a real, nonempty file) or a `clip-skipped: <id>: <reason>`
+line in its `evidence` array — silence fails the barrier, exactly like the
+`record start` failure above must still be recorded rather than dropped. Set
+`confirmedFindings` with the scaffold, never by hand — `smoke-run-scaffold.sh
+marker <run-dir> <lane-id> <status> [summary] [evidence-csv]
+--confirmed-findings <id>[,<id>...]` — the same rule that forbids hand-written
+markers elsewhere in this file applies here too, and the flag is optional
+(omit it and the field is omitted, exactly as before this existed).
+
+### Contact sheet
+
+At kickoff, once previews are live, capture every diff-touched screen at
+desktop and phone width into one labelled image:
+`smoke-contact-sheet.sh <run-dir> <base-url> <auth-state.json>`. It reads
+caller-provided `<run-dir>/contact-sheet/shots.json` (capped at 8; the
+script itself is generic, no product knowledge), captures through one named
+`agent-browser` session, and writes `sheet.png` + `manifest.json`. A failed
+screen is `failed: <reason>` plus a placeholder tile, never dropped. Post
+`sheet.png` with `send_file` right after kickoff and link it from the
+verdict. A deployment may also run a fresh, read-only design critic on the
+shot PNGs — shadow only, posted but never gating the verdict.
+
+**Auth state is a live session token — never put it in the run dir or under
+the shared workgroup tree.** The script refuses both (`realpath`-checked
+against `<run-dir>` and `$SMOKE_WORKGROUP_ROOT`, default
+`/workspace/workgroup`) and never copies its content anywhere. Keep it at a
+private path like `/tmp/contact-sheet-auth-<runId>.json` and delete it once
+the sheet is captured — the script doesn't own that file and won't delete it
+for you.
+
 ### Backend and specification verifier
 
 The coordinator normally assigns this lane to a native Claude Sonnet 5 worker

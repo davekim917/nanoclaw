@@ -204,4 +204,71 @@ bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$EVIDENCE_DIR" lanes \
   | jq -e '.ready == true' >/dev/null || { echo "expected a blocked marker without success evidence to remain terminal" >&2; exit 1; }
 rm -rf "$EVIDENCE_DIR"
 
+# A marker naming a CONFIRMED finding must carry that finding's clip, or a
+# stated skip reason — silence fails the barrier. This applies independent of
+# `status` (a confirmed finding pairs naturally with a `fail` lane, not a
+# `pass` one), so exercise it on a non-pass marker to prove it is not
+# piggybacking on the pass-evidence check above.
+CLIP_DIR="$(mktemp -d)"
+mkdir -p "$CLIP_DIR/markers" "$CLIP_DIR/clips"
+cat >"$CLIP_DIR/completion-contract.json" <<'JSON'
+{"schemaVersion":1,"sourceSha":"dddddddddddddddddddddddddddddddddddddddd","requiredLaneMarkers":["markers/B1.json"]}
+JSON
+
+# No clip, no skip line: silence must fail the barrier.
+cat >"$CLIP_DIR/markers/B1.json" <<'JSON'
+{"schemaVersion":1,"lane":"B1","sourceSha":"dddddddddddddddddddddddddddddddddddddddd","status":"fail","completedAt":"2026-09-11T10:00:00Z","confirmedFindings":["F1"],"evidence":["screenshot: unrelated"]}
+JSON
+RESULT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$CLIP_DIR" lanes || true)"
+echo "$RESULT" | jq -e '(.ready == false) and (.invalidReasons[0] | contains("has no clip evidence"))' >/dev/null || {
+  echo "expected a confirmed finding with no clip and no skip reason to fail" >&2; echo "$RESULT" >&2; exit 1; }
+
+# A stated clip-skipped reason satisfies the check on its own — "a failed
+# recording never blocks" — with no clip file required.
+jq '.evidence = ["clip-skipped: F1: no browser lease available"]' "$CLIP_DIR/markers/B1.json" \
+  >"$CLIP_DIR/markers/.marker.json"
+mv "$CLIP_DIR/markers/.marker.json" "$CLIP_DIR/markers/B1.json"
+bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$CLIP_DIR" lanes \
+  | jq -e '.ready == true' >/dev/null || {
+  echo "expected a stated clip-skipped reason to clear the barrier with no clip file" >&2; exit 1; }
+
+# An empty reason after the prefix does not count as "stated".
+jq '.evidence = ["clip-skipped: F1: "]' "$CLIP_DIR/markers/B1.json" >"$CLIP_DIR/markers/.marker.json"
+mv "$CLIP_DIR/markers/.marker.json" "$CLIP_DIR/markers/B1.json"
+RESULT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$CLIP_DIR" lanes || true)"
+echo "$RESULT" | jq -e '.ready == false' >/dev/null || {
+  echo "expected an empty clip-skipped reason to still fail the barrier" >&2; echo "$RESULT" >&2; exit 1; }
+
+# Referencing the clip without the file existing must fail — a promised clip
+# path is not durable evidence until the file is actually there.
+jq '.evidence = ["clips/F1.mp4"]' "$CLIP_DIR/markers/B1.json" >"$CLIP_DIR/markers/.marker.json"
+mv "$CLIP_DIR/markers/.marker.json" "$CLIP_DIR/markers/B1.json"
+RESULT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$CLIP_DIR" lanes || true)"
+echo "$RESULT" | jq -e '(.ready == false) and (.invalidReasons[0] | contains("clip is missing"))' >/dev/null || {
+  echo "expected a referenced-but-missing clip file to fail" >&2; echo "$RESULT" >&2; exit 1; }
+
+# A real, nonempty clip file clears the barrier.
+printf '%s\n' 'fake mp4 bytes' >"$CLIP_DIR/clips/F1.mp4"
+bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$CLIP_DIR" lanes \
+  | jq -e '.ready == true' >/dev/null || {
+  echo "expected a real, nonempty clip file to clear the barrier" >&2; exit 1; }
+
+# An empty clip file is not durable evidence either, same as pass evidence.
+: >"$CLIP_DIR/clips/F1.mp4"
+RESULT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$CLIP_DIR" lanes || true)"
+echo "$RESULT" | jq -e '(.ready == false) and (.invalidReasons[0] | contains("clip is empty"))' >/dev/null || {
+  echo "expected an empty clip file to fail" >&2; echo "$RESULT" >&2; exit 1; }
+
+# Backward compatible: a marker with no confirmedFindings field at all is
+# unaffected by any of this.
+printf '%s\n' 'fake mp4 bytes' >"$CLIP_DIR/clips/F1.mp4"
+jq 'del(.confirmedFindings) | .evidence = ["screenshot: unrelated"]' "$CLIP_DIR/markers/B1.json" \
+  >"$CLIP_DIR/markers/.marker.json"
+mv "$CLIP_DIR/markers/.marker.json" "$CLIP_DIR/markers/B1.json"
+bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$CLIP_DIR" lanes \
+  | jq -e '.ready == true' >/dev/null || {
+  echo "expected a marker with no confirmedFindings field to be unaffected" >&2; exit 1; }
+
+rm -rf "$CLIP_DIR"
+
 echo "smoke evidence barrier tests passed"
