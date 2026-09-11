@@ -22,6 +22,22 @@ import Database from 'better-sqlite3';
 import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, CONTAINER_INSTALL_LABEL, DATA_DIR } from './config.js';
 import { runningContainerMounts as inspectRunningContainerMounts } from './container-mounts.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
+import {
+  collectCacheGarbage,
+  DEPENDENCY_CACHE_DIRNAME,
+  DEPENDENCY_CACHE_TEMP_NAMES,
+  finishDependencyCachePass,
+  hasPendingConversion,
+  isEligiblePackageDir,
+  isFarmPackageDir,
+  processPackageDir,
+  recoverPackageDir,
+  startDependencyCachePass,
+  type DependencyCacheMode,
+  type DependencyCachePass,
+  type DependencyCacheReport,
+  type PackageOutcome,
+} from './dependency-cache.js';
 import { type RawStatements, withCentralSync, withRawDb } from './db/central-lease.js';
 // Every remaining `getRawDb()` in this file executes in the storage maintenance
 // worker thread (`storage-maintenance-worker-thread.ts`), which opens its own
@@ -221,6 +237,15 @@ export interface StoragePolicy {
    * or CAS machinery. 0 disables the sweep.
    */
   regenerableSweepMs: number;
+  /**
+   * `NANOCLAW_DEPENDENCY_CACHE` (docs/specs/repository-branch-clones/plan.md
+   * §5.7.8). `off` leaves the regenerable sweep exactly as it was; `report`
+   * logs every dependency-cache decision and mutates nothing; `apply` shares
+   * eligible npm trees as verified hardlink farms inside the same sweep.
+   * `resolveStoragePolicy` always sets it; a hand-built policy without it is
+   * `off`.
+   */
+  dependencyCacheMode?: DependencyCacheMode;
   scanCadenceMs: number;
   dockerPruneCadenceMs: number;
   dockerBuildCacheUnusedFor: string;
@@ -411,6 +436,8 @@ export interface StorageReport {
     budgetDeferredSessions: number;
   };
   warnings: string[];
+  /** Present when the dependency cache ran in this pass (flag not `off`). */
+  dependencyCache?: DependencyCacheReport;
 }
 
 export interface StorageReportOptions {
@@ -495,6 +522,27 @@ function parseRegenerableSweepDays(): number {
     log.warn('storage-manager: invalid NANOCLAW_REGENERABLE_SWEEP_DAYS, disabling regenerable sweep', { value: raw });
   }
   return 0;
+}
+
+let warnedBadDependencyCacheMode = false;
+
+/**
+ * Read exactly like `parseRegenerableSweepDays`: from `process.env` at policy
+ * resolution time, inside the storage worker. That worker is created after
+ * main.ts's `loadEnvIntoProcess()` and inherits its environment, so a value set
+ * only in `.env` arrives — the import-time capture trap in config.ts does not
+ * apply to a call-time read. UNSET -> `off`. Anything else that is not one of
+ * the three values -> `off` with one WARN: a typo must never turn it on.
+ */
+function parseDependencyCacheMode(): DependencyCacheMode {
+  const raw = process.env.NANOCLAW_DEPENDENCY_CACHE;
+  if (raw === undefined) return 'off';
+  if (raw === 'off' || raw === 'report' || raw === 'apply') return raw;
+  if (!warnedBadDependencyCacheMode) {
+    warnedBadDependencyCacheMode = true;
+    log.warn('storage-manager: invalid NANOCLAW_DEPENDENCY_CACHE, dependency cache off', { value: raw });
+  }
+  return 'off';
 }
 
 function parseNonNegativeNumber(value: string | undefined, fallback: number): number {
@@ -587,6 +635,7 @@ export function resolveStoragePolicy(overrides: Partial<StoragePolicy> = {}): St
     sessionReclaimMaxMs: sessionReclaimMaxSeconds * 1000,
     sessionActiveCap,
     regenerableSweepMs: parseRegenerableSweepDays() * 24 * 60 * 60 * 1000,
+    dependencyCacheMode: parseDependencyCacheMode(),
     rescueRetentionMs: rescueRetentionDays * 24 * 60 * 60 * 1000,
     scanCadenceMs: scanHours * 60 * 60 * 1000,
     dockerPruneCadenceMs: dockerPruneHours * 60 * 60 * 1000,
@@ -671,6 +720,14 @@ function isPathInside(parent: string, child: string): boolean {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
+/**
+ * Bytes a recursive delete of `root` would actually free (plan §5.8, R9).
+ *
+ * Only regular files with a link count of 1 count. A file hardlinked from
+ * anywhere else — a dependency-cache farm's shared files, a pnpm store — keeps
+ * its blocks after this path is gone, so counting it overstated every reclaim
+ * estimate. Real usage still comes from `df` (`getFilesystemUsage`).
+ */
 export function dirSizeBytes(root: string): number {
   let total = 0;
   const stack: string[] = [root];
@@ -688,7 +745,7 @@ export function dirSizeBytes(root: string): number {
         const st = fs.lstatSync(full);
         if (st.isDirectory() && !st.isSymbolicLink()) {
           stack.push(full);
-        } else if (st.isFile()) {
+        } else if (st.isFile() && st.nlink === 1) {
           total += st.size;
         }
       } catch {
@@ -2071,8 +2128,13 @@ function hasRecordedReproducer(parentDir: string, name: string): boolean {
  * Skipping the class outright is a shorter argument than gating it, and the
  * walk never descends through one either, so nothing outside the topic is
  * reachable from here.
+ *
+ * The dependency cache's temp names are never descended either, in any flag
+ * mode: mid-convert, `.node_modules.nanoclaw-old` holds a private tree, and a
+ * nested `node_modules` inside it is not a regenerable target of anything.
+ * Every package dir holding one is reported in `recoveryDirs` instead.
  */
-function findRegenerableTargets(root: string): string[] {
+function findRegenerableTargets(root: string, recoveryDirs: string[] = []): string[] {
   const targets: string[] = [];
   const stack: string[] = [root];
   while (stack.length > 0) {
@@ -2085,6 +2147,10 @@ function findRegenerableTargets(root: string): string[] {
       // isSymbolicLink() and NOT isDirectory(), so this covers both.
       if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
       if (SKIP_DESCEND_DIR_NAMES.has(entry.name)) continue;
+      if (DEPENDENCY_CACHE_TEMP_NAMES.includes(entry.name)) {
+        if (!recoveryDirs.includes(dir)) recoveryDirs.push(dir);
+        continue;
+      }
       if (REGENERABLE_SWEEP_DIR_NAMES.has(entry.name)) {
         // Do not descend: the whole tree goes, and a nested node_modules inside
         // it would only be counted twice.
@@ -2327,11 +2393,13 @@ function topicIsUnmounted(topicDir: string, lookup: () => string[] | null): bool
  */
 function collectTopicRegenerableActions(args: {
   now: number;
+  mode: StorageMode;
   topicsRoot: string;
   policy: StoragePolicy;
   runningMounts: () => string[] | null;
   skipped: StorageReport['skipped'];
   warnings: string[];
+  dependencyCacheOut: { report?: DependencyCacheReport };
 }): StorageAction[] {
   const actions: StorageAction[] = [];
   if (args.policy.regenerableSweepMs <= 0) return actions;
@@ -2360,6 +2428,13 @@ function collectTopicRegenerableActions(args: {
   };
 
   const idleDays = Math.round(args.policy.regenerableSweepMs / 86400000);
+  const cache = startTopicDependencyCache({
+    now: args.now,
+    mode: args.mode,
+    topicsRoot: args.topicsRoot,
+    policy: args.policy,
+    warnings: args.warnings,
+  });
   for (const workgroupEntry of safeReaddirDirents(args.topicsRoot)) {
     if (!workgroupEntry.isDirectory() || workgroupEntry.isSymbolicLink()) continue;
     const workgroupDir = path.join(args.topicsRoot, workgroupEntry.name);
@@ -2369,7 +2444,31 @@ function collectTopicRegenerableActions(args: {
       const worktreeRoot = path.join(topicDir, TOPIC_WORKTREES_DIRNAME);
       const key = `${workgroupEntry.name}/${topicEntry.name}`;
 
-      for (const target of findRegenerableTargets(worktreeRoot)) {
+      const recoveryDirs: string[] = [];
+      const targets = findRegenerableTargets(worktreeRoot, recoveryDirs);
+      const keptByCache = cache
+        ? runTopicDependencyCache({
+            cache,
+            workgroupId: workgroupEntry.name,
+            topicDir,
+            worktreeRoot,
+            targets,
+            recoveryDirs,
+            mounts,
+            runningMounts: args.runningMounts,
+          })
+        : new Set<string>();
+
+      for (const target of targets) {
+        // A farm is exempt from the 2-day delete (plan §5.7.5): it frees
+        // nothing another workspace still holds, and deleting it only loses
+        // the dedupe. A farm of a quarantined entry is not in this set.
+        if (keptByCache.has(target)) continue;
+        // A package dir mid-conversion (recovery blocked, failed, or not run
+        // in this flag mode) can hold private entries in the node_modules
+        // beside its temp name. Never collected, in any flag mode; the apply
+        // path re-checks under the claim.
+        if (hasPendingConversion(path.dirname(target))) continue;
         const refusal = sweepEligibility({
           now: args.now,
           idleMs: args.policy.regenerableSweepMs,
@@ -2403,8 +2502,11 @@ function collectTopicRegenerableActions(args: {
             // claim, so it composes with the claim's own lease check to cover
             // both NanoClaw and external containers. Everything else the scan
             // decided is held by the recorded-reproducer gate: losing those
-            // races costs a reinstall, not work.
-            canApply: () => topicIsUnmounted(topicDir, args.runningMounts),
+            // races costs a reinstall, not work. A conversion that became
+            // pending since collection is the other exception: that can be
+            // private work, so it is re-proven here too.
+            canApply: () =>
+              topicIsUnmounted(topicDir, args.runningMounts) && !hasPendingConversion(path.dirname(target)),
             safety:
               'Dependency-install tree under an idle topic worktree with a recorded manifest beside it, re-proven unmounted by the container runtime immediately before deletion.',
           }),
@@ -2412,7 +2514,140 @@ function collectTopicRegenerableActions(args: {
       }
     }
   }
+  if (cache) {
+    collectCacheGarbage(cache.pass);
+    // An `off` pass with nothing to clean stays as silent as `off` always was.
+    if (!cache.cleanupOnly || cache.pass.decisions.length > 0) {
+      const report = finishDependencyCachePass(cache.pass);
+      args.dependencyCacheOut.report = report;
+      if (report.fingerprintAvailable === false) {
+        args.warnings.push('dependency cache: agent image fingerprint unavailable, adopt/convert/link skipped');
+      }
+    }
+  }
   return actions;
+}
+
+interface TopicDependencyCache {
+  pass: DependencyCachePass;
+  /** Operations really run: an applying storage pass with the flag at `apply` or `off`. */
+  mutate: boolean;
+  /**
+   * Flag `apply`: farms, and trees this pass adopts or converts, skip the
+   * 2-day delete — in a dry-run report too, so the report predicts the apply
+   * pass. Flag `report` keeps today's delete behavior and only logs.
+   */
+  exemptFarms: boolean;
+  /**
+   * Flag `off`, applying pass: recovery and cache GC only, so a rollback to
+   * `off` never strands an interrupted conversion and entries still age out
+   * (plan §5.7.8). No adopt, convert, link, farm exemption or counting.
+   */
+  cleanupOnly: boolean;
+}
+
+function startTopicDependencyCache(args: {
+  now: number;
+  mode: StorageMode;
+  topicsRoot: string;
+  policy: StoragePolicy;
+  warnings: string[];
+}): TopicDependencyCache | null {
+  const flag = args.policy.dependencyCacheMode ?? 'off';
+  if (flag === 'off' && args.mode !== 'apply') return null;
+  const mutate = args.mode === 'apply' && flag !== 'report';
+  // The fingerprint is resolved lazily: an `off` pass, or one with nothing
+  // eligible, never inspects the agent image. Without one, the pass cannot key
+  // anything, so it recovers and collects garbage and skips adopt/convert/link.
+  const pass = startDependencyCachePass({
+    mode: mutate ? 'apply' : 'report',
+    // A sibling of v2-topics, so every link stays on one filesystem and mount.
+    cacheRoot: path.join(path.dirname(args.topicsRoot), DEPENDENCY_CACHE_DIRNAME),
+    now: args.now,
+    reclaimableBytes: dirSizeBytes,
+  });
+  return { pass, mutate, exemptFarms: flag === 'apply', cleanupOnly: flag === 'off' };
+}
+
+const KEPT_BY_CACHE: ReadonlySet<PackageOutcome> = new Set<PackageOutcome>(['farm', 'adopted', 'converted']);
+
+/**
+ * One topic's dependency-cache work (plan §5.7.5): recovery first, then adopt
+ * or convert, for eligible npm trees. No idle threshold — these operations
+ * preserve content — but the same two guards as a delete: never under a live
+ * container mount, and only inside the topic's storage cleanup claim, with the
+ * runtime mount lookup re-run under the claim exactly as `canApply` does in
+ * `createDeleteArtifactAction` (the claim covers our spawn path's markers, the
+ * lookup covers containers that plant none). A cleanup-only (`off`) pass
+ * runs the recovery half and nothing else.
+ *
+ * Returns the targets the 2-day delete must skip.
+ */
+function runTopicDependencyCache(args: {
+  cache: TopicDependencyCache;
+  workgroupId: string;
+  topicDir: string;
+  worktreeRoot: string;
+  targets: string[];
+  recoveryDirs: string[];
+  mounts: string[];
+  runningMounts: () => string[] | null;
+}): Set<string> {
+  const kept = new Set<string>();
+  const { pass } = args.cache;
+  const npmTargets = args.cache.cleanupOnly
+    ? []
+    : args.targets.filter(
+        (target) => path.basename(target) === 'node_modules' && isEligiblePackageDir(path.dirname(target)),
+      );
+  if (npmTargets.length === 0 && args.recoveryDirs.length === 0) return kept;
+  if (!isRealDirectory(args.worktreeRoot)) return kept;
+
+  if (args.mounts.some((mount) => pathsOverlap(args.topicDir, mount))) {
+    // Nothing is touched under a live mount; this only measures what agents
+    // are keeping private (the §2 guard-escalation trigger). The delete loop
+    // refuses the topic on its own.
+    for (const target of npmTargets) {
+      if (isFarmPackageDir(pass, args.workgroupId, path.dirname(target))) continue;
+      pass.counters.privateInMountedTopics += 1;
+      pass.counters.privateInMountedTopicsBytes += dirSizeBytes(target);
+    }
+    return kept;
+  }
+
+  const run = (): Map<string, PackageOutcome> => {
+    for (const dir of args.recoveryDirs) recoverPackageDir(pass, args.workgroupId, dir);
+    const outcomes = new Map<string, PackageOutcome>();
+    for (const target of npmTargets) {
+      outcomes.set(target, processPackageDir(pass, args.workgroupId, path.dirname(target)));
+    }
+    return outcomes;
+  };
+  const result: { outcomes?: Map<string, PackageOutcome> } = {};
+  try {
+    if (args.cache.mutate) {
+      tryRunWithStorageCleanupClaim(args.worktreeRoot, () => {
+        if (!topicIsUnmounted(args.topicDir, args.runningMounts)) return;
+        result.outcomes = run();
+      });
+    } else {
+      result.outcomes = run();
+    }
+  } catch (err) {
+    log.warn('storage-manager: dependency cache failed for a topic', { topicDir: args.topicDir, err });
+  }
+
+  if (!args.cache.exemptFarms) return kept;
+  for (const target of npmTargets) {
+    const outcome = result.outcomes?.get(target);
+    // No outcome means the claim or the mount re-check refused and nothing
+    // ran; an existing farm is still a farm.
+    const isKept = outcome
+      ? KEPT_BY_CACHE.has(outcome)
+      : isFarmPackageDir(pass, args.workgroupId, path.dirname(target));
+    if (isKept) kept.add(target);
+  }
+  return kept;
 }
 
 /**
@@ -3121,6 +3356,7 @@ function runStorageReportPass(options: StorageReportOptions, policy: StoragePoli
   const dockerCollection = includeDocker
     ? collectDockerActions(policy, now, mode, warnings, usageBefore, options.force === true)
     : { actions: [], images: [] };
+  const dependencyCacheOut: { report?: DependencyCacheReport } = {};
   const actions: StorageAction[] = [
     ...collectSessionCacheActions({
       now,
@@ -3140,11 +3376,13 @@ function runStorageReportPass(options: StorageReportOptions, policy: StoragePoli
     }),
     ...collectTopicRegenerableActions({
       now,
+      mode,
       topicsRoot,
       policy,
       runningMounts: options.runningContainerMounts ?? inspectRunningContainerMounts,
       skipped,
       warnings,
+      dependencyCacheOut,
     }),
     ...collectRescueRetentionActions({ now, dataRoot: path.dirname(sessionsRoot), policy }),
     ...dockerCollection.actions,
@@ -3187,6 +3425,7 @@ function runStorageReportPass(options: StorageReportOptions, policy: StoragePoli
       failedActions: actionReports.filter((a) => a.status === 'failed').length,
       skippedActions: actionReports.filter((a) => a.status === 'skipped').length,
       skipped,
+      dependencyCache: dependencyCacheOut.report?.counters ?? null,
     });
   }
 
@@ -3202,6 +3441,7 @@ function runStorageReportPass(options: StorageReportOptions, policy: StoragePoli
     pools: summarize(actionReports),
     skipped,
     warnings,
+    ...(dependencyCacheOut.report ? { dependencyCache: dependencyCacheOut.report } : {}),
   };
 }
 
