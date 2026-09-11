@@ -65,6 +65,8 @@ risk:high:
     - 'src/dashboard/steer.ts'
     - 'src/dashboard/assign.ts'
     - 'src/dashboard/api/scheduled-shared.ts'
+    - 'src/dashboard/thread-close.ts'
+    - 'src/dashboard/thread-snooze.ts'
     # Irreversible against a live DB
     - 'src/db/migrations/**'
     # Supply chain: pnpm allowBuilds, and the container image it builds
@@ -179,6 +181,8 @@ risk:credential:
     - 'src/dashboard/steer.ts'
     - 'src/dashboard/assign.ts'
     - 'src/dashboard/api/scheduled-shared.ts'
+    - 'src/dashboard/thread-close.ts'
+    - 'src/dashboard/thread-snooze.ts'
 
 risk:migration:
 - changed-files:

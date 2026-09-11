@@ -5,31 +5,69 @@
 # branch protection on a private Free-plan repo. This is detection, not prevention: a
 # red run on main, which GitHub reports to whoever pushed.
 #
-# Two conditions, both required:
-# - GitHub made the tip. A merge, squash or rebase through GitHub is signed by GitHub
-#   and committed by its `web-flow` account. A local `git merge` of a PR branch pushed
-#   straight to main also marks that PR merged, with the local commit as its
-#   merge_commit_sha, so the PR link alone would pass it (it has, 5 times: #148, #255,
-#   #377, #380, #381). A local commit can borrow web-flow's email, never its signature.
-# - A merged PR into main names the tip as its merge_commit_sha, and the tip is not the
-#   PR's own head (pushing a PR's head straight to main also marks it merged). This
-#   rules out a commit GitHub made some other way, such as a web edit.
-# A force-push fails outright, since it can rewind main onto an old merge commit.
+# Two jobs, two different sources of truth for the same rule — main only moves through
+# a merged PR:
+# - `provenance` runs on every push to main and checks only the tip that push just
+#   landed, via .github/scripts/check-provenance-commit.sh (test-merge format,
+#   GitHub-made, PR-linked — see that script for what each proves).
+# - `sweep` runs daily (plus on-demand) and checks GitHub's repository Activity API
+#   over the last 50 hours of main (floored at a one-time policy-start date so it never
+#   re-flags known history predating this check — see that script), via
+#   .github/scripts/sweep-main-activity.sh. It does NOT walk `git log --since`: that
+#   filters on committer date, a value the pusher controls, so a backdated commit
+#   carrying a skip-CI commit-message marker would hide itself — and everything earlier
+#   in the window — from a history walk. `sweep` exists to catch exactly what a
+#   push-triggered job never runs for: a skip-CI push, or one that landed during a
+#   GitHub Actions outage.
+# Neither job runs PR code. `provenance` checks out only the commit its push already
+# landed; `sweep` checks out whatever ref triggered it — main on the daily schedule,
+# or another ref if `workflow_dispatch` is run from one — just far enough to have its
+# own script. It queries history through the Activity API, not `git log`.
+# A force-push fails `provenance` outright, since it can rewind main onto an old merge
+# commit; `sweep`'s Activity API window covers force-pushes too (`force_push` is one of
+# the activity types it treats as an offender).
+#
+# GitHub does not sign rebase-merge commits (GitHub docs, "Signature verification for
+# rebase and merge": "GitHub didn't truly create this commit, and can't therefore sign
+# it"). Rebase merging is still enabled in this repo's settings and has been used once —
+# PR #74, merged 2026-05-01, merge_commit_sha b2b3b90ee0, which has a single parent, is
+# unsigned, and is committed by the user account rather than `web-flow`. That fails
+# `provenance`'s GitHub-made check in check-provenance-commit.sh — intended, not a bug
+# to route around. It does NOT fail `sweep`: the Activity API records a rebase merge as
+# `pr_merge` (confirmed live for #74), the same as any other GitHub-performed merge, so
+# `sweep` correctly treats it as a genuine PR merge — this repo's two checks disagree on
+# purpose, one checking provenance (came from a PR) and the other checking signature
+# (GitHub made the commit). Disabling rebase merging is the operator's call, not this
+# workflow's; an earlier attempt to do so was blocked.
 name: Main provenance
 
 on:
   push:
     branches: [main]
+  schedule:
+    # 08:17 UTC daily — clear of the hour/half-hour marks where scheduled-workflow
+    # load (and GitHub's "may be delayed" best-effort scheduling) concentrates.
+    - cron: '17 8 * * *'
+  workflow_dispatch: {}
 
-permissions:
-  contents: read
-  pull-requests: read
+# The default GITHUB_TOKEN for this repo is still `write`, not read-only, so every job
+# below declares its own minimal `permissions:` rather than relying on a workflow-level
+# default — both jobs only ever read.
+permissions: {}
 
 jobs:
   provenance:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: The new main came from a merged PR
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -40,23 +78,24 @@ jobs:
             echo "::error::main was force-pushed to $SHA; changes reach main only through a PR merge"
             exit 1
           fi
-          made=$(gh api "repos/$REPO/commits/$SHA" \
-            --jq '.commit.verification.verified == true and .committer.login == "web-flow"')
-          if [ "$made" != true ]; then
-            echo "::error::main moved to $SHA, a commit GitHub did not make (unsigned or not GitHub's); changes reach main only through a PR merge"
-            exit 1
-          fi
-          # GitHub links the commit to its PR asynchronously, so give it a minute.
-          for attempt in 1 2 3 4 5 6; do
-            prs=$(gh api "repos/$REPO/commits/$SHA/pulls" | jq -r --arg sha "$SHA" '
-              [ .[] | select(.merged_at != null and .base.ref == "main"
-                             and .merge_commit_sha == $sha and .head.sha != $sha)
-                | "#\(.number)" ] | join(" ")')
-            if [ -n "$prs" ]; then
-              echo "main at $SHA came from $prs"
-              exit 0
-            fi
-            [ "$attempt" -lt 6 ] && sleep 10
-          done
-          echo "::error::main moved to $SHA, which no merged PR produced; changes reach main only through a PR merge"
-          exit 1
+          .github/scripts/check-provenance-commit.sh "$SHA"
+
+  sweep:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # Contents read only: sweep-main-activity.sh calls only the Activity API, which
+    # GitHub's permissions-required-for-github-apps reference lists under Contents —
+    # unlike `provenance`, it never calls the PR-link endpoint, so no pull-requests
+    # permission here.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Every activity on main in the last 50 hours came from a merged PR
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: .github/scripts/sweep-main-activity.sh 50
