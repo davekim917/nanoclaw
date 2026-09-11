@@ -4,6 +4,7 @@ import { resolveContainedRoot, readContainedFile } from '../api/attention-fs.js'
 import type { ScheduledSnapshot } from '../api/scheduled-assembly.js';
 import { getScheduledCache } from '../api/scheduled-shared.js';
 import { getDb } from '../../db/connection.js';
+import { isAnswerCardAction } from '../../answer-cards.js';
 import {
   buildObservatoryScene,
   type ObservatoryScene,
@@ -658,6 +659,9 @@ export async function buildSignalData(
         return [];
       });
     for (const p of approvals) {
+      // An answer card (e.g. request_choice) asks for an answer the host relays,
+      // not a privileged approval, so it does not belong in this queue.
+      if (isAnswerCardAction(p.action)) continue;
       if (!groupVisible(ctx, p.agent_group_id)) continue;
       if (p.expires_at && Date.parse(p.expires_at) <= now) continue;
       if (

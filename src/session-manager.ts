@@ -21,6 +21,7 @@ import type { OutboundFile } from './channels/adapter.js';
 import { DATA_DIR } from './config.js';
 import { assertChannelRoutingConsistency } from './delivery.js';
 import { ensureContainedInboxDir, isPathInside } from './inbox-safety.js';
+import { withoutReservedOrigin } from './host-origin.js';
 import { acquireStorageActivityLease } from './storage-activity.js';
 import { evaluateGuardSync, withCentralSync } from './db/central-lease.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
@@ -937,6 +938,15 @@ export interface WriteSessionMessageOptions {
    * write is.
    */
   guard?: WriteGuard;
+  /**
+   * Keep a top-level `origin` field in the content. Every other write has it
+   * removed (withoutReservedOrigin), so the runner's `origin="host"` marker
+   * (container/agent-runner/src/formatter.ts) can only come from the host's own
+   * notes: a person or a peer agent controls `sender` and `senderId` in content
+   * they author, but never an `origin` that survives this writer. The one
+   * caller is notifyAgent (modules/approvals/primitive.ts).
+   */
+  hostOrigin?: boolean;
 }
 
 /** Thrown when a write's guard refuses at the last instant. No row is written. */
@@ -983,7 +993,14 @@ export async function writeSessionMessage(
   message: SessionMessageInput,
   options: WriteSessionMessageOptions = {},
 ): Promise<void> {
-  await writeSessionMessageInternal(agentGroupId, sessionId, message, false, options.guard);
+  await writeSessionMessageInternal(
+    agentGroupId,
+    sessionId,
+    message,
+    false,
+    options.guard,
+    options.hostOrigin === true,
+  );
 }
 
 /** Idempotent channel-ingress variant; false means this platform id was already routed. */
@@ -993,7 +1010,14 @@ export async function writeSessionMessageIfNew(
   message: SessionMessageInput,
   options: WriteSessionMessageOptions = {},
 ): Promise<boolean> {
-  return writeSessionMessageInternal(agentGroupId, sessionId, message, true, options.guard);
+  return writeSessionMessageInternal(
+    agentGroupId,
+    sessionId,
+    message,
+    true,
+    options.guard,
+    options.hostOrigin === true,
+  );
 }
 
 async function writeSessionMessageInternal(
@@ -1001,7 +1025,8 @@ async function writeSessionMessageInternal(
   sessionId: string,
   message: SessionMessageInput,
   ignoreDuplicateId: boolean,
-  guard?: WriteGuard,
+  guard: WriteGuard | undefined,
+  hostOrigin: boolean,
 ): Promise<boolean> {
   // A session mid-archival is about to lose its directory. Re-provisioning it
   // below would resurrect the dir seconds before the reclaim removes it, and
@@ -1029,7 +1054,7 @@ async function writeSessionMessageInternal(
   // see its claim and wait for it to finish.
   const lease = await acquireStorageActivityLease(sessionDir(agentGroupId, sessionId), `inbound-${sessionId}`);
   try {
-    return await writeSessionMessageLocked(agentGroupId, sessionId, message, ignoreDuplicateId, guard);
+    return await writeSessionMessageLocked(agentGroupId, sessionId, message, ignoreDuplicateId, guard, hostOrigin);
   } finally {
     await lease.release();
   }
@@ -1040,7 +1065,8 @@ async function writeSessionMessageLocked(
   sessionId: string,
   message: SessionMessageInput,
   ignoreDuplicateId: boolean,
-  guard?: WriteGuard,
+  guard: WriteGuard | undefined,
+  hostOrigin: boolean,
 ): Promise<boolean> {
   // Waiting for the claim above can mean waiting out a reclaim that archived
   // and deleted this session while we queued. Re-provisioning it here would
@@ -1130,7 +1156,9 @@ async function writeSessionMessageLocked(
   }
 
   // Extract base64 attachment data, save to inbox, replace with file paths
-  const { content, writtenPaths } = extractAttachmentFiles(agentGroupId, sessionId, message.id, message.content);
+  // The reserved `origin` survives only a host note (WriteSessionMessageOptions.hostOrigin).
+  const messageContent = hostOrigin ? message.content : withoutReservedOrigin(message.content);
+  const { content, writtenPaths } = extractAttachmentFiles(agentGroupId, sessionId, message.id, messageContent);
 
   // Scheduled occurrences are always inert until the due-time admission seam
   // builds current recall and flips them wakeable. Keep this invariant even if

@@ -7,6 +7,7 @@ import type { ObservatoryScene, ReleaseStateItem } from '../api/observatory.js';
 import type { ThreadSummary } from '../api/threads.js';
 import type { AuthedRequestContext } from '../router.js';
 import { buildSignalData, type SourceDeps } from './sources.js';
+import { registerAnswerCardAction } from '../../answer-cards.js';
 
 const WORKGROUP_ID = 'wg-source-fixture';
 const AS_OF = '2026-09-06T01:00:00.000Z';
@@ -156,5 +157,33 @@ describe('Signal source validation and mapping ambiguity', () => {
       status: 'unavailable',
       detail: 'Multiple project mappings match source facts; affected work remains under Unmapped work.',
     });
+  });
+});
+
+describe('pending approvals queue', () => {
+  it('leaves answer cards out of the privileged-approval queue', async () => {
+    registerAnswerCardAction('test_answer_card');
+    await getDb().exec(`INSERT INTO agent_groups VALUES('ag-source', '${WORKGROUP_ID}', 'Agent');`);
+    for (const [id, action] of [
+      ['appr-privileged', 'install_packages'],
+      ['appr-answer', 'test_answer_card'],
+    ]) {
+      await getDb().run(
+        `INSERT INTO pending_approvals
+           (approval_id, agent_group_id, session_id, title, action, created_at, expires_at, approver_user_id,
+            channel_type, platform_id, platform_message_id, status)
+         VALUES (?, 'ag-source', NULL, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 'pending')`,
+        id,
+        id,
+        action,
+        AS_OF,
+      );
+    }
+
+    const data = await buildSignalData(ctx(), WORKGROUP_ID, deps([]));
+
+    expect(data.decisions.filter((d) => d.source_kind === 'approval').map((d) => d.source_id)).toEqual([
+      'appr-privileged',
+    ]);
   });
 });

@@ -1,6 +1,7 @@
 /**
  * request_choice host side: delivery action → approvals-backed card → click
- * authority → one relayed line in the right session, which is woken.
+ * authority → one host-marked line in the right session, which is woken → the
+ * card edited to show the answer.
  *
  * Real central DB, real approvals response handler, and a live fake channel
  * adapter with threads on, so the router's thread policy applies. The delivery
@@ -16,6 +17,7 @@ import {
   registerChannelAdapter,
   teardownChannelAdapters,
 } from '../../channels/channel-registry.js';
+import { registerSlackBot, unregisterSlackBot } from '../../channels/slack-mentions.js';
 import { wakeContainer } from '../../container-runner.js';
 import { closeDb, getDb, initMigratedTestDb } from '../../db/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
@@ -28,7 +30,7 @@ import {
 } from '../../db/sessions.js';
 import { getDeliveryAction, setDeliveryAdapter } from '../../delivery.js';
 import { log } from '../../log.js';
-import { writeSessionMessage } from '../../session-manager.js';
+import { sessionMessageExists, writeSessionMessage } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { createDestination } from '../agent-to-agent/db/agent-destinations.js';
 import { registerApprovalHandler, requestApproval } from '../approvals/primitive.js';
@@ -49,7 +51,7 @@ vi.mock('../../config.js', async () => {
 
 vi.mock('../../session-manager.js', async () => {
   const actual = await vi.importActual<typeof import('../../session-manager.js')>('../../session-manager.js');
-  return { ...actual, writeSessionMessage: vi.fn() };
+  return { ...actual, writeSessionMessage: vi.fn(), sessionMessageExists: vi.fn().mockResolvedValue(false) };
 });
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-request-choice') }));
@@ -57,11 +59,13 @@ const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-request-c
 // A Slack variant (isChannelVariant, types.ts:194-196), so the Slack
 // thread-id composition applies, under its own registry key.
 const CHANNEL = 'slack-fixture';
+const SIBLING = 'slack-fixture-sibling';
 const OWN = 'slack:chan-1';
 const OWN_THREAD = 'slack:chan-1:100.1';
 const RELEASE = 'slack:chan-2';
 const OTHER = 'slack:chan-3';
 const ADMIN = `${CHANNEL}:admin-1`;
+const ADMIN_TWO = `${CHANNEL}:admin-2`;
 const MEMBER = `${CHANNEL}:member-1`;
 const OPTIONS = [
   { label: 'Ship A', value: 'ship-a', style: 'primary' },
@@ -69,6 +73,7 @@ const OPTIONS = [
   { label: 'Hold', value: 'hold', style: 'danger' },
 ];
 const TO_RELEASE = { to: 'release-room', channelType: CHANNEL, platformId: RELEASE };
+const ASK_TEXT = 'Release\n\nWhich change ships?';
 
 registerChannelAdapter(CHANNEL, {
   factory: (): ChannelAdapter => ({
@@ -96,6 +101,7 @@ let session: Session;
 let taskSession: Session;
 let delivered: Delivered[];
 let failEdits: boolean;
+let failPosts: boolean;
 
 function now(): string {
   return new Date().toISOString();
@@ -123,6 +129,11 @@ function notes(): Array<{ sessionId: string; text: string }> {
   }));
 }
 
+/** Deliveries after the first `n` (the card posts). */
+function after(n: number): Delivered[] {
+  return delivered.slice(n);
+}
+
 async function ask(
   from: Session,
   extra: Record<string, unknown> = {},
@@ -142,12 +153,12 @@ async function ask(
   return (await getPendingApprovalsByAction(REQUEST_CHOICE_ACTION)).find((r) => r.request_id === choiceId);
 }
 
-function click(approvalId: string, value: string, handle: string): Promise<boolean> {
+function click(approvalId: string, value: string, handle: string, channelType = CHANNEL): Promise<boolean> {
   return handleApprovalsResponse({
     questionId: approvalId,
     value,
-    userId: handle.slice(CHANNEL.length + 1),
-    channelType: CHANNEL,
+    userId: handle.slice(channelType.length + 1),
+    channelType,
     platformId: '',
     threadId: null,
   });
@@ -184,6 +195,7 @@ async function destinationOnly(mgId: string, name: string): Promise<void> {
 
 beforeEach(async () => {
   vi.clearAllMocks();
+  vi.mocked(sessionMessageExists).mockResolvedValue(false);
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
   await initMigratedTestDb();
@@ -216,13 +228,19 @@ beforeEach(async () => {
   taskSession = sessionRow('sess-task', 'ag-1', null, 'system:tasks:watch-1');
   await createSession(taskSession);
 
-  // An admin of ag-1, and a thread member with no role.
-  await upsertUser({ id: ADMIN, kind: CHANNEL, display_name: 'Admin One', created_at: now() });
-  await grantRole({ user_id: ADMIN, role: 'admin', agent_group_id: 'ag-1', granted_by: null, granted_at: now() });
+  // Two admins of ag-1, and a thread member with no role.
+  for (const [id, name] of [
+    [ADMIN, 'Admin One'],
+    [ADMIN_TWO, 'Admin Two'],
+  ]) {
+    await upsertUser({ id, kind: CHANNEL, display_name: name, created_at: now() });
+    await grantRole({ user_id: id, role: 'admin', agent_group_id: 'ag-1', granted_by: null, granted_at: now() });
+  }
   await upsertUser({ id: MEMBER, kind: CHANNEL, display_name: 'Member One', created_at: now() });
 
   delivered = [];
   failEdits = false;
+  failPosts = false;
   let seq = 0;
   setDeliveryAdapter({
     async deliver(
@@ -237,6 +255,7 @@ beforeEach(async () => {
       const parsed = JSON.parse(content) as Record<string, unknown>;
       delivered.push({ channelType, platformId, threadId, instance, content: parsed });
       if (failEdits && parsed.operation === 'edit') throw new Error('platform down');
+      if (failPosts && parsed.type === 'ask_question') throw new Error('platform down');
       seq += 1;
       return `pm-${seq}`;
     },
@@ -280,18 +299,12 @@ describe('request_choice delivery', () => {
       title: 'Release',
       question: 'Which change ships?',
     });
-    const buttons = card.content.options as Array<{
-      label: string;
-      value: string;
-      selectedLabel: string;
-      style?: string;
-    }>;
+    const buttons = card.content.options as Array<{ label: string; value: string; style?: string }>;
     expect(buttons.map((b) => [b.label, b.value, b.style])).toEqual([
       ['Ship A', 'ship-a', 'primary'],
       ['Ship all (2)', 'ship-all', undefined],
       ['Hold', 'hold', 'danger'],
     ]);
-    expect(buttons.map((b) => b.selectedLabel)).toEqual(['✅ Ship A', '✅ Ship all (2)', '✅ Hold']);
     expect(notes()).toEqual([]);
   });
 
@@ -332,7 +345,7 @@ describe('request_choice delivery', () => {
 });
 
 describe('request_choice click authority and resolution', () => {
-  it('relays an admin click as one line with the choice, the value and the clicker, wakes the session, and resolves the row', async () => {
+  it('relays an admin click as one host-marked line, wakes the session, resolves the row, then edits the card', async () => {
     const row = (await ask(session))!;
 
     expect(await click(row.approval_id, 'ship-all', ADMIN)).toBe(true);
@@ -343,40 +356,48 @@ describe('request_choice click authority and resolution', () => {
         text: 'choice_response choice_id=choice-1 value=ship-all label=Ship%20all%20(2) user_id=slack-fixture%3Aadmin-1 user_name=Admin%20One',
       },
     ]);
-    expect(vi.mocked(writeSessionMessage).mock.calls[0][2].kind).toBe('chat');
+    const [, , message, options] = vi.mocked(writeSessionMessage).mock.calls[0];
+    expect(message.kind).toBe('chat');
+    expect(message.id).toBe(`choice-answer-${row.approval_id}`);
+    expect(JSON.parse(message.content)).toMatchObject({ origin: 'host' });
+    expect(options).toEqual({ hostOrigin: true });
     expect(vi.mocked(wakeContainer)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(wakeContainer).mock.calls[0][0].id).toBe('sess-1');
     expect(await getPendingApproval(row.approval_id)).toBeUndefined();
+    // The host's edit is the only one: the bridge leaves answer cards alone.
+    expect(after(1)).toHaveLength(1);
+    expect(after(1)[0]).toMatchObject({ instance: row.instance ?? CHANNEL });
+    expect(after(1)[0].content).toEqual({
+      operation: 'edit',
+      messageId: 'pm-1',
+      text: `${ASK_TEXT}\n\n✅ Ship all (2) — Admin One`,
+    });
   });
 
-  it('ignores a non-admin thread member, keeps the row pending, and re-posts the card', async () => {
+  it('ignores a non-admin thread member: nothing is sent, the row stays pending, the card is untouched', async () => {
     const row = (await ask(session))!;
 
     expect(await click(row.approval_id, 'ship-a', MEMBER)).toBe(true);
 
     expect(notes()).toEqual([]);
     expect(vi.mocked(wakeContainer)).not.toHaveBeenCalled();
-    const after = await getPendingApproval(row.approval_id);
-    expect(after?.status).toBe('pending');
+    expect((await getPendingApproval(row.approval_id))?.status).toBe('pending');
+    expect(after(1)).toEqual([]);
 
-    // The bridge strips buttons before the host sees a click, so the host
-    // edits the old message and posts the card again with the same buttons.
-    expect(delivered).toHaveLength(3);
-    expect(delivered[1].content).toMatchObject({ operation: 'edit', messageId: 'pm-1' });
-    expect(delivered[1].content.text).toContain('only an admin of this agent can answer');
-    expect(delivered[2]).toMatchObject({ channelType: CHANNEL, platformId: OWN, threadId: OWN_THREAD });
-    expect(delivered[2].content).toMatchObject({ type: 'ask_question', questionId: row.approval_id });
-    expect((delivered[2].content.options as Array<{ value: string }>).map((o) => o.value)).toEqual([
-      'ship-a',
-      'ship-all',
-      'hold',
-    ]);
-    expect(after?.platform_message_id).toBe('pm-3');
-
-    // The re-posted card still answers for an admin.
+    // The same card still answers for an admin.
     await click(row.approval_id, 'hold', ADMIN);
     expect(notes()).toHaveLength(1);
     expect(notes()[0].text).toContain('value=hold');
+  });
+
+  it('ignores an unknown option without touching the row or the card', async () => {
+    const row = (await ask(session))!;
+
+    await click(row.approval_id, 'not-an-option', ADMIN);
+
+    expect(notes()).toEqual([]);
+    expect((await getPendingApproval(row.approval_id))?.status).toBe('pending');
+    expect(after(1)).toEqual([]);
   });
 
   it('treats a second click as a no-op', async () => {
@@ -394,25 +415,70 @@ describe('request_choice click authority and resolution', () => {
   it('lets exactly one of two racing admin clicks through', async () => {
     const row = (await ask(session))!;
 
-    await Promise.all([click(row.approval_id, 'hold', ADMIN), click(row.approval_id, 'ship-a', ADMIN)]);
+    await Promise.all([click(row.approval_id, 'hold', ADMIN), click(row.approval_id, 'ship-a', ADMIN_TWO)]);
 
     expect(notes()).toHaveLength(1);
     expect(await getPendingApproval(row.approval_id)).toBeUndefined();
+    expect(after(1).filter((d) => d.content.operation === 'edit')).toHaveLength(1);
   });
 
-  it('with no live session to take it, resolves without delivery and marks the card no longer active', async () => {
+  it('a click that loses the claim does nothing: no answer and no edit (the winner edits)', async () => {
+    for (const status of ['approved', 'expired']) {
+      const row = (await ask(session, {}, `c-${status}`))!;
+      await getDb().run('UPDATE pending_approvals SET status = ? WHERE approval_id = ?', status, row.approval_id);
+      const before = delivered.length;
+
+      await click(row.approval_id, 'hold', ADMIN);
+
+      expect(delivered.length - before).toBe(0);
+    }
+    expect(notes()).toEqual([]);
+  });
+
+  it('with no live session to take the answer, leaves the card open and logs at error', async () => {
     // The card's channel is not wired, so the only candidate is the requester — which has ended.
     const row = (await ask(session))!;
     await getDb().run('UPDATE sessions SET status = ? WHERE id = ?', 'closed', 'sess-1');
+    const errorSpy = vi.spyOn(log, 'error');
+    try {
+      expect(await click(row.approval_id, 'ship-a', ADMIN)).toBe(true);
 
-    expect(await click(row.approval_id, 'ship-a', ADMIN)).toBe(true);
+      expect(notes()).toEqual([]);
+      expect((await getPendingApproval(row.approval_id))?.status).toBe('pending');
+      expect(after(1)).toEqual([]);
+      expect(errorSpy).toHaveBeenCalledWith(
+        'Choice answered but no live session can take it — card left open',
+        expect.objectContaining({ approvalId: row.approval_id }),
+      );
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
 
-    expect(notes()).toEqual([]);
-    expect(vi.mocked(wakeContainer)).not.toHaveBeenCalled();
+  it('reopens the card when the answer was not recorded, so a later click can deliver it', async () => {
+    const row = (await ask(session))!;
+    vi.mocked(writeSessionMessage).mockRejectedValueOnce(new Error('disk full'));
+
+    await click(row.approval_id, 'ship-a', ADMIN);
+
+    expect((await getPendingApproval(row.approval_id))?.status).toBe('pending');
+    expect(after(1)).toEqual([]);
+
+    await click(row.approval_id, 'ship-a', ADMIN);
     expect(await getPendingApproval(row.approval_id)).toBeUndefined();
-    const last = delivered.at(-1)!;
-    expect(last.content).toMatchObject({ operation: 'edit', messageId: 'pm-1' });
-    expect(last.content.text).toContain('No longer active');
+    expect(after(1).map((d) => d.content.operation)).toEqual(['edit']);
+  });
+
+  it('treats a recorded answer as delivered even when writing failed after the insert', async () => {
+    const row = (await ask(session))!;
+    vi.mocked(writeSessionMessage).mockRejectedValueOnce(new Error('wake bookkeeping failed'));
+    vi.mocked(sessionMessageExists).mockResolvedValueOnce(true);
+
+    await click(row.approval_id, 'ship-a', ADMIN);
+
+    expect(vi.mocked(sessionMessageExists)).toHaveBeenCalledWith('ag-1', 'sess-1', `choice-answer-${row.approval_id}`);
+    expect(await getPendingApproval(row.approval_id)).toBeUndefined();
+    expect(after(1).map((d) => d.content.operation)).toEqual(['edit']);
   });
 
   it('is not resolvable through the approve/reject host path', async () => {
@@ -420,6 +486,47 @@ describe('request_choice click authority and resolution', () => {
     const result = await resolveApprovalFromHost(row.approval_id, 'approve', ADMIN);
     expect(result.resolved).toBe(false);
     expect((await getPendingApproval(row.approval_id))?.status).toBe('pending');
+  });
+});
+
+describe('request_choice approvers', () => {
+  it('a narrowed card refuses an admin who is not listed, and answers for one who is', async () => {
+    const row = (await ask(session, { approvers: [ADMIN] }))!;
+
+    await click(row.approval_id, 'ship-a', ADMIN_TWO);
+    expect(notes()).toEqual([]);
+    expect((await getPendingApproval(row.approval_id))?.status).toBe('pending');
+    expect(after(1)).toEqual([]);
+
+    await click(row.approval_id, 'hold', ADMIN);
+    expect(notes()).toHaveLength(1);
+    expect(notes()[0].text).toContain('user_id=slack-fixture%3Aadmin-1');
+  });
+
+  it('matches a listed Slack id through a same-workspace sibling instance', async () => {
+    const own = { userId: 'UBOT1', userName: 'bot', teamId: 'T-fixture' } as never;
+    const sibling = { userId: 'UBOT2', userName: 'bot-two', teamId: 'T-fixture' } as never;
+    registerSlackBot(CHANNEL, own);
+    registerSlackBot(SIBLING, sibling);
+    try {
+      const row = (await ask(session, { approvers: [ADMIN] }))!;
+
+      await click(row.approval_id, 'hold', `${SIBLING}:admin-1`, SIBLING);
+
+      expect(notes()).toHaveLength(1);
+      expect(notes()[0].text).toContain('user_id=slack-fixture-sibling%3Aadmin-1');
+    } finally {
+      unregisterSlackBot(CHANNEL, own);
+      unregisterSlackBot(SIBLING, sibling);
+    }
+  });
+
+  it('refuses a card that names an approver without admin privilege', async () => {
+    expect(await ask(session, { approvers: [ADMIN, MEMBER] })).toBeUndefined();
+    expect(delivered).toHaveLength(0);
+    expect(notes().map((n) => n.text)).toEqual([
+      `request_choice failed: approver "${MEMBER}" is not an owner or admin of this agent group.`,
+    ]);
   });
 });
 
@@ -471,41 +578,38 @@ describe('where the answer lands', () => {
 
     expect(notes().map((n) => n.sessionId)).toEqual(['sess-task']);
   });
-
-  it('after a refused click re-posts a top-level card, the answer still lands in the original ask’s thread', async () => {
-    await wire('mg-2');
-    const row = (await ask(taskSession, TO_RELEASE))!; // pm-1
-
-    await click(row.approval_id, 'ship-a', MEMBER); // edit pm-2, re-post pm-3
-    expect((await getPendingApproval(row.approval_id))?.platform_message_id).toBe('pm-3');
-    await click(row.approval_id, 'ship-a', ADMIN);
-
-    const threadSession = await findSessionForAgent('ag-1', 'mg-2', `${RELEASE}:pm-1`);
-    expect(notes().map((n) => n.sessionId)).toEqual([threadSession!.id]);
-  });
 });
 
 describe('replace, never stack (key)', () => {
-  it('a newer ask with the same key supersedes the open card', async () => {
+  it('a newer ask with the same key posts first, then supersedes the open card', async () => {
     const first = (await ask(session, { key: 'release:web' }, 'choice-1'))!;
     const second = (await ask(session, { key: 'release:web' }, 'choice-2'))!;
 
     expect(await getPendingApproval(first.approval_id)).toBeUndefined();
     expect(second.status).toBe('pending');
-    const edit = delivered.find((d) => d.content.operation === 'edit')!;
-    expect(edit.content).toMatchObject({ operation: 'edit', messageId: first.platform_message_id });
-    expect(edit.content.text).toBe(`Release\n\nWhich change ships?\n\n${SUPERSEDED_LINE}`);
-    expect(edit.instance).toBe(first.instance ?? first.channel_type);
-    // The old card is retired before the new one posts.
     expect(delivered.map((d) => d.content.operation ?? d.content.type)).toEqual([
       'ask_question',
-      'edit',
       'ask_question',
+      'edit',
     ]);
+    const edit = delivered[2];
+    expect(edit.content).toMatchObject({ operation: 'edit', messageId: first.platform_message_id });
+    expect(edit.content.text).toBe(`${ASK_TEXT}\n\n${SUPERSEDED_LINE}`);
+    expect(edit.instance).toBe(first.instance ?? first.channel_type);
 
     // A late click on the superseded card does nothing.
     expect(await click(first.approval_id, 'ship-a', ADMIN)).toBe(false);
     expect(notes()).toEqual([]);
+  });
+
+  it('keeps the open card when the newer ask fails to post', async () => {
+    const first = (await ask(session, { key: 'release:web' }, 'choice-1'))!;
+    failPosts = true;
+
+    expect(await ask(session, { key: 'release:web' }, 'choice-2')).toBeUndefined();
+
+    expect((await getPendingApproval(first.approval_id))?.status).toBe('pending');
+    expect(delivered.some((d) => d.content.operation === 'edit')).toBe(false);
   });
 
   it('leaves a different key and another agent group’s card alone', async () => {

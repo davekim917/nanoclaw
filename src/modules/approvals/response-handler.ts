@@ -27,7 +27,7 @@ import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { hasAdminPrivilege, isGlobalAdmin, isOwner } from '../permissions/db/user-roles.js';
-import { getChoiceHandler, refuseChoiceClick, resolveChoice } from './choices.js';
+import { choiceClickAllowed, getChoiceHandler, resolveChoice } from './choices.js';
 import { finalizeReject } from './finalize.js';
 import { ONECLI_ACTION, resolveOneCLIApproval } from './onecli-approvals.js';
 import { getApprovalHandler, notifyApprovalResolved, REJECT_WITH_REASON_VALUE } from './primitive.js';
@@ -68,8 +68,6 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
       userId: payload.userId,
       channelType: payload.channelType,
     });
-    // A refused click on a choice card re-posts it — see choices.ts.
-    if (getChoiceHandler(approval.action)) await refuseChoiceClick(approval);
     return true;
   }
 
@@ -230,6 +228,9 @@ async function isAuthorizedApprovalClick(approval: PendingApproval, payload: Res
     const session = await getSession(approval.session_id);
     if (session && (await isThreadDelivery(approval, session))) return true;
   }
+
+  // A choice card may narrow who answers to named approvers (choices.ts).
+  if (getChoiceHandler(approval.action) && !choiceClickAllowed(approval, userId)) return false;
 
   const agentGroupId =
     approval.agent_group_id ?? (approval.session_id ? (await getSession(approval.session_id))?.agent_group_id : null);

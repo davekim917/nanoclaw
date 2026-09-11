@@ -90,6 +90,12 @@ describe('request_choice', () => {
     expect(outbound('system')[0].content.key).toBe('release:web');
   });
 
+  it('carries approvers through', async () => {
+    inConversation();
+    await requestChoice.handler({ ...ASK, approvers: ['slack:admin-1', 'slack:admin-2'] });
+    expect(outbound('system')[0].content.approvers).toEqual(['slack:admin-1', 'slack:admin-2']);
+  });
+
   it('with `to`: resolves the channel destination into the action', async () => {
     inTask();
     const result = await requestChoice.handler({ ...ASK, to: 'release-room' });
@@ -173,6 +179,14 @@ describe('request_choice', () => {
     ['a missing title', { question: 'Q', options: OPTIONS }, /title and question/],
     ['a malformed key', { ...ASK, key: 'has spaces' }, /key must be/],
     ['an over-long key', { ...ASK, key: 'k'.repeat(129) }, /key must be/],
+    ['approvers that are not a list', { ...ASK, approvers: 'slack:admin-1' }, /approvers must hold/],
+    ['an empty approvers list', { ...ASK, approvers: [] }, /approvers must hold/],
+    ['an approver without a namespace', { ...ASK, approvers: ['admin-1'] }, /approvers must hold/],
+    [
+      'too many approvers',
+      { ...ASK, approvers: Array.from({ length: 21 }, (_, i) => `slack:user-${i}`) },
+      /approvers must hold/,
+    ],
   ])('rejects %s and writes nothing', async (_name, args, message) => {
     inConversation();
     const result = await requestChoice.handler(args as Record<string, unknown>);

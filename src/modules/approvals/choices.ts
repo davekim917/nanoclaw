@@ -3,24 +3,27 @@
  *
  * A module that wants an answer rather than an approve/reject decision calls
  * requestApproval with custom `options` and registers a handler here under the
- * same action. The response handler then routes the row through this file
- * instead of the approve/reject path:
+ * same action. The response handler then routes the row through this file:
  *
  *   - Authority is never thread membership: isAuthorizedApprovalClick skips its
- *     any-thread-member shortcut for a registered choice action, so a choice
- *     needs the named approver or admin privilege on the agent group.
- *   - Any stored option is an answer, and the first authorized click wins
- *     (resolveChoice). The handler decides which session receives it.
- *   - A click the host refuses leaves the row pending and re-posts the card
- *     (refuseChoiceClick), because the bridge has already stripped its buttons.
- *   - retireChoice closes an open card without an answer (e.g. superseded).
+ *     any-thread-member shortcut for these, requires owner/admin privilege on
+ *     the agent group, and a card may narrow that further to named approvers
+ *     (choiceClickAllowed).
+ *   - The bridge does not edit an answer card on click (src/answer-cards.ts).
+ *     The host edits it here, and only after the first authorized click has won
+ *     the pending→approved compare-and-swap AND its answer was delivered. So a
+ *     refused click, an unknown option and a losing click all leave the card
+ *     exactly as it was, still live, with nothing to repair.
+ *   - A click whose answer cannot be delivered is not consumed: the row goes
+ *     back to pending and the card stays live.
+ *   - retireChoice closes an open card without an answer (superseded).
  *
  * A leaf file like finalize.ts, so primitive.ts and response-handler.ts carry
  * only the seams. Keyed by action like the approval registry, so the rules are
  * back in force as soon as the owning module re-registers after a host restart.
  */
+import { registerAnswerCardAction } from '../../answer-cards.js';
 import type { NormalizedOption } from '../../channels/ask-question.js';
-import { getDb } from '../../db/connection.js';
 import {
   deletePendingApproval,
   getSession,
@@ -29,7 +32,9 @@ import {
 } from '../../db/sessions.js';
 import { getDeliveryAdapter } from '../../delivery.js';
 import { log } from '../../log.js';
+import { equivalentSlackUserIds } from '../../slack-user-identity.js';
 import type { PendingApproval, Session } from '../../types.js';
+import { getUser } from '../permissions/db/users.js';
 import { notifyApprovalResolved } from './primitive.js';
 
 export interface ChoiceHandlerContext {
@@ -44,7 +49,13 @@ export interface ChoiceHandlerContext {
   userId: string;
 }
 
-/** Deliver the answer. Resolves to the session that received it, or null when no live session can. */
+/**
+ * Deliver the answer. Resolve to the session that received it, or null when no
+ * live session can take it. Throw only when the answer was NOT recorded: once
+ * the row is written, a failed wake is not a failed delivery, because the sweep
+ * wakes a session with due rows (sweep-scheduling/index.ts:76,
+ * sweep-continuation/index.ts:674).
+ */
 export type ChoiceHandler = (ctx: ChoiceHandlerContext) => Promise<Session | null>;
 
 const choiceHandlers = new Map<string, ChoiceHandler>();
@@ -54,6 +65,7 @@ export function registerChoiceHandler(action: string, handler: ChoiceHandler): v
     log.warn('Choice handler re-registered (overwriting)', { action });
   }
   choiceHandlers.set(action, handler);
+  registerAnswerCardAction(action);
 }
 
 export function getChoiceHandler(action: string): ChoiceHandler | undefined {
@@ -61,26 +73,18 @@ export function getChoiceHandler(action: string): ChoiceHandler | undefined {
 }
 
 /**
- * The message whose thread is the card's conversation: the first message the
- * card was posted as. A re-post (refuseChoiceClick) moves the live card to a
- * new message but keeps this anchor in the payload, so an answer still lands
- * where replies to the original ask do.
+ * Whether `userId` is among the card's named approvers. A card without
+ * `approvers` (payload) names none, and the response handler's owner/admin
+ * check is the whole rule. Narrowing only: that check still applies to a
+ * listed user. A listed Slack id matches the clicker's same-workspace sibling
+ * ids, the equivalence role checks use (equivalentSlackUserIds,
+ * slack-user-identity.ts:26-45; user-roles.ts:27-30).
  */
-export function choiceAnchorMessageId(approval: PendingApproval): string | null {
-  const anchor = parsePayload(approval).anchorMessageId;
-  return typeof anchor === 'string' ? anchor : approval.platform_message_id;
-}
-
-/** The response handler refused a click on this choice card: keep it answerable. */
-export async function refuseChoiceClick(approval: PendingApproval): Promise<void> {
-  if (approval.status !== 'pending') return;
-  await repostChoiceCard(
-    approval,
-    cardText(
-      approval,
-      'That click was not applied: only an admin of this agent can answer. The card has been re-posted below.',
-    ),
-  );
+export function choiceClickAllowed(approval: PendingApproval, userId: string): boolean {
+  const approvers = payloadApprovers(approval);
+  if (approvers === undefined) return true;
+  const clicker = new Set(equivalentSlackUserIds(userId));
+  return approvers.some((approver) => clicker.has(approver));
 }
 
 /**
@@ -88,8 +92,8 @@ export async function refuseChoiceClick(approval: PendingApproval): Promise<void
  * legitimate answer — there is no approve/reject vocabulary here — and the
  * first click wins: the pending→approved compare-and-swap
  * (transitionPendingApprovalStatus, src/db/sessions.ts:726-737) lets exactly
- * one racing click through, and the row is deleted once the handler has run,
- * so a later click finds nothing.
+ * one racing click through, and the row is deleted once the answer is
+ * delivered, so a later click finds nothing.
  */
 export async function resolveChoice(approval: PendingApproval, selectedOption: string, userId: string): Promise<void> {
   const handler = getChoiceHandler(approval.action);
@@ -97,23 +101,18 @@ export async function resolveChoice(approval: PendingApproval, selectedOption: s
 
   const option = storedOptions(approval).find((o) => o.value === selectedOption);
   if (!option) {
-    // Untrusted transport input, not a decision: keep the card answerable.
+    // Untrusted transport input, not a decision. The card was not touched.
     log.warn('Ignoring choice response with an unknown option', {
       approvalId: approval.approval_id,
       action: approval.action,
       selectedOption,
       userId,
     });
-    if (approval.status === 'pending') {
-      await repostChoiceCard(
-        approval,
-        cardText(approval, 'That click could not be read. The card has been re-posted below.'),
-      );
-    }
     return;
   }
 
   if (!(await transitionPendingApprovalStatus(approval.approval_id, 'pending', 'approved'))) {
+    // The winner delivers and edits the card.
     log.info('Ignoring click on an already-resolved choice', { approvalId: approval.approval_id, userId });
     return;
   }
@@ -127,30 +126,26 @@ export async function resolveChoice(approval: PendingApproval, selectedOption: s
       label: option.label,
       userId,
     });
-    // eslint-disable-next-line no-catch-all/no-catch-all -- nothing reached the agent; reopen the card instead of losing the answer
+    // eslint-disable-next-line no-catch-all/no-catch-all -- the answer was not recorded (ChoiceHandler); keep the click unconsumed
   } catch (err) {
-    log.error('Choice handler threw — reopening the card', {
+    log.error('Choice answer could not be delivered — card left open', {
       approvalId: approval.approval_id,
       action: approval.action,
+      userId,
       err,
     });
     await updatePendingApprovalStatus(approval.approval_id, 'pending');
-    await repostChoiceCard(
-      approval,
-      cardText(approval, 'That answer could not be delivered. The card has been re-posted below.'),
-    );
     return;
   }
 
   if (!deliveredTo) {
-    log.warn('Choice answered but no live session can take it — resolved without delivery', {
+    log.error('Choice answered but no live session can take it — card left open', {
       approvalId: approval.approval_id,
       action: approval.action,
       sessionId: approval.session_id,
       userId,
     });
-    await deletePendingApproval(approval.approval_id);
-    await editChoiceCard(approval, cardText(approval, 'No longer active: the conversation that asked this has ended.'));
+    await updatePendingApprovalStatus(approval.approval_id, 'pending');
     return;
   }
 
@@ -161,6 +156,8 @@ export async function resolveChoice(approval: PendingApproval, selectedOption: s
     sessionId: deliveredTo.id,
   });
   await deletePendingApproval(approval.approval_id);
+  const name = (await getUser(userId))?.display_name || userId;
+  await editChoiceCard(approval, cardText(approval, `✅ ${option.label} — ${name}`));
   // A choice resolves as approval of the chosen option.
   await notifyApprovalResolved({ approval, session: deliveredTo, outcome: 'approve', userId });
 }
@@ -187,8 +184,8 @@ async function liveSession(sessionId: string | null): Promise<Session | undefine
 /**
  * Edit a choice card's message to `text`. The editCardResolution pattern
  * (onecli-approvals.ts:513-538): dispatch through `instance ?? channel_type`,
- * because dispatch is exact-key, and fail loudly — the row is gone or about
- * to be, so a swallowed failure leaves live-looking buttons that do nothing.
+ * because dispatch is exact-key, and fail loudly — the row is gone by now, so
+ * a swallowed failure leaves live-looking buttons that do nothing.
  */
 async function editChoiceCard(approval: PendingApproval, text: string): Promise<void> {
   const adapter = getDeliveryAdapter();
@@ -209,63 +206,13 @@ async function editChoiceCard(approval: PendingApproval, text: string): Promise<
   }
 }
 
-/**
- * Put a still-pending card back in front of its deciders: edit the old message
- * to `notice`, post the card again with its stored buttons, and point the row
- * at the new message (keeping the first one as the conversation anchor).
- *
- * Needed because the chat-sdk bridge strips a card's buttons BEFORE the host
- * sees the click (chat-sdk-bridge.ts:1161-1193; Discord :2057-2085), so a click
- * the host refuses would otherwise leave a live row behind a dead card, and the
- * bridge's edit operation renders text only (chat-sdk-bridge.ts:1299-1316) —
- * the buttons cannot be edited back onto the old message.
- */
-async function repostChoiceCard(approval: PendingApproval, notice: string): Promise<void> {
-  if (!approval.channel_type || !approval.platform_id) return;
-  const adapter = getDeliveryAdapter();
-  if (!adapter) return;
-  await editChoiceCard(approval, notice);
+function payloadApprovers(approval: PendingApproval): string[] | undefined {
   try {
-    const platformMsgId = await adapter.deliver(
-      approval.channel_type,
-      approval.platform_id,
-      approval.thread_id,
-      'chat-sdk',
-      JSON.stringify({
-        type: 'ask_question',
-        questionId: approval.approval_id,
-        title: approval.title,
-        question: approval.question,
-        options: JSON.parse(approval.options_json),
-      }),
-      undefined,
-      approval.instance ?? approval.channel_type,
-    );
-    if (platformMsgId) {
-      const payload = parsePayload(approval);
-      if (payload.anchorMessageId === undefined && approval.platform_message_id) {
-        payload.anchorMessageId = approval.platform_message_id;
-      }
-      await getDb().run(
-        'UPDATE pending_approvals SET platform_message_id = ?, payload = ? WHERE approval_id = ?',
-        platformMsgId,
-        JSON.stringify(payload),
-        approval.approval_id,
-      );
-    }
-    // eslint-disable-next-line no-catch-all/no-catch-all -- best-effort like editApprovalCard: the row stays pending either way
-  } catch (err) {
-    log.warn('Failed to re-post choice card', { approvalId: approval.approval_id, err });
-  }
-}
-
-function parsePayload(approval: PendingApproval): Record<string, unknown> {
-  try {
-    const parsed: unknown = JSON.parse(approval.payload);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
-    // eslint-disable-next-line no-catch-all/no-catch-all -- a corrupt payload carries no anchor or key
+    const approvers = (JSON.parse(approval.payload) as { approvers?: unknown }).approvers;
+    return Array.isArray(approvers) ? approvers.filter((a): a is string => typeof a === 'string') : undefined;
+    // eslint-disable-next-line no-catch-all/no-catch-all -- a corrupt payload names no approvers; the admin check still applies
   } catch {
-    return {};
+    return undefined;
   }
 }
 

@@ -14,18 +14,19 @@
  * The card outlives the container. The pending_approvals row is central, and a
  * module approval row carries no expiry: the only writer of `expires_at` on one
  * is the reject-with-reason hold (src/db/sessions.ts:748-751), which a choice
- * card never enters. A `key` retires the agent group's open card under the same
- * key before the new one posts ("replace, never stack").
+ * card never enters. `approvers` narrows who may answer; `key` retires the agent
+ * group's open card under the same key once the new one has posted ("replace,
+ * never stack").
  *
- * An authorized click — admin privilege on the agent group; thread membership
- * does not count for choice cards (approvals/choices.ts) — reaches relayChoice,
- * which writes one line into the session a typed reply in the card's thread
+ * An authorized click (approvals/choices.ts) reaches relayChoice, which writes
+ * one host-marked line into the session a typed reply in the card's thread
  * would reach, and wakes it. What a value means, and who ought to answer, is
  * the agent's business; this module only carries the answer back.
  */
 import type { OptionStyle, RawOption } from '../../channels/ask-question.js';
 import { resolveThreadPolicy } from '../../channels/channel-defaults.js';
 import { getChannelAdapter, getChannelDefaults } from '../../channels/channel-registry.js';
+import { withCentralSync } from '../../db/central-lease.js';
 import { getDb, hasTable } from '../../db/connection.js';
 import {
   getMessagingGroup,
@@ -36,21 +37,19 @@ import { getPendingApprovalsByAction } from '../../db/sessions.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
 import { log } from '../../log.js';
-import { resolveSession } from '../../session-manager.js';
+import { resolveSession, sessionMessageExists } from '../../session-manager.js';
 import { isChannelVariant, type MessagingGroup, type PendingApproval, type Session } from '../../types.js';
-import {
-  choiceAnchorMessageId,
-  registerChoiceHandler,
-  retireChoice,
-  type ChoiceHandlerContext,
-} from '../approvals/choices.js';
+import { registerChoiceHandler, retireChoice, type ChoiceHandlerContext } from '../approvals/choices.js';
 import { notifyAgent, requestApproval, type RequestApprovalOptions } from '../approvals/primitive.js';
+import { hasAdminPrivilege } from '../permissions/db/user-roles.js';
 import { getUser } from '../permissions/db/users.js';
 
 export const REQUEST_CHOICE_ACTION = 'request_choice';
 export const MAX_CHOICE_OPTIONS = 10;
+export const MAX_CHOICE_APPROVERS = 20;
 export const SUPERSEDED_LINE = '↩️ Superseded by a newer ask';
 const ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+const USER_ID_RE = /^[^:\s]+:\S+$/;
 const OPTION_STYLES = new Set<unknown>(['primary', 'danger', 'default']);
 
 export interface ChoiceRequest {
@@ -60,6 +59,8 @@ export interface ChoiceRequest {
   options: Array<{ label: string; value: string; style?: OptionStyle }>;
   /** Replace-never-stack key: a newer ask under the same key retires this one. */
   key?: string;
+  /** Namespaced user ids allowed to answer; each must hold admin privilege on the group. */
+  approvers?: string[];
   /** Routing the container resolved `to` into. Container-written, so re-authorized here. */
   target?: { name: string; channelType: string; platformId: string };
 }
@@ -69,7 +70,7 @@ export interface ChoiceRequest {
  * host's own check, since the outbound row is container-written.
  */
 export function parseChoiceRequest(content: Record<string, unknown>): ChoiceRequest | { error: string } {
-  const { choiceId, title, question, options, key, to, channelType, platformId } = content;
+  const { choiceId, title, question, options, key, approvers, to, channelType, platformId } = content;
   if (typeof choiceId !== 'string' || !ID_RE.test(choiceId)) return { error: 'choiceId is missing or malformed' };
   if (typeof title !== 'string' || !title.trim()) return { error: 'title is required' };
   if (typeof question !== 'string' || !question.trim()) return { error: 'question is required' };
@@ -90,6 +91,17 @@ export function parseChoiceRequest(content: Record<string, unknown>): ChoiceRequ
   if (key !== undefined && (typeof key !== 'string' || !ID_RE.test(key))) {
     return { error: 'key must be 1-128 characters of letters, digits and . _ : -' };
   }
+  if (
+    approvers !== undefined &&
+    (!Array.isArray(approvers) ||
+      approvers.length < 1 ||
+      approvers.length > MAX_CHOICE_APPROVERS ||
+      !approvers.every((a) => typeof a === 'string' && USER_ID_RE.test(a)))
+  ) {
+    return {
+      error: `approvers must hold 1 to ${MAX_CHOICE_APPROVERS} namespaced user ids (<channel>:<user id>)`,
+    };
+  }
   let target: ChoiceRequest['target'];
   if (to !== undefined || channelType !== undefined || platformId !== undefined) {
     if (typeof to !== 'string' || !to || typeof channelType !== 'string' || typeof platformId !== 'string') {
@@ -103,6 +115,7 @@ export function parseChoiceRequest(content: Record<string, unknown>): ChoiceRequ
     question,
     options: parsed,
     ...(key !== undefined ? { key } : {}),
+    ...(approvers !== undefined ? { approvers: [...new Set(approvers as string[])] } : {}),
     ...(target ? { target } : {}),
   };
 }
@@ -112,6 +125,21 @@ async function handleRequestChoice(content: Record<string, unknown>, session: Se
   if ('error' in request) {
     await notifyAgent(session, `request_choice failed: ${request.error}`);
     return;
+  }
+
+  // Narrow, never widen: every named approver must already be allowed to answer.
+  if (request.approvers) {
+    const outsider = await withCentralSync(
+      () => request.approvers!.find((userId) => !hasAdminPrivilege(userId, session.agent_group_id)),
+      'request_choice approvers',
+    );
+    if (outsider !== undefined) {
+      await notifyAgent(
+        session,
+        `request_choice failed: approver "${outsider}" is not an owner or admin of this agent group.`,
+      );
+      return;
+    }
   }
 
   let conversation: RequestApprovalOptions['conversation'];
@@ -131,29 +159,33 @@ async function handleRequestChoice(content: Record<string, unknown>, session: Se
     conversation = { channelType: mg.channel_type, platformId: mg.platform_id, threadId: null, instance: mg.instance };
   }
 
-  if (request.key !== undefined) await supersedeOpenChoices(session.agent_group_id, request.key);
-
   const options: RawOption[] = request.options.map((o) => ({
     label: o.label,
-    // What the card shows once answered; the bridge appends the clicker's
-    // name to it (chat-sdk-bridge.ts:1161-1168).
-    selectedLabel: `✅ ${o.label}`,
     value: o.value,
     ...(o.style ? { style: o.style } : {}),
   }));
   // Delivery failures notify the agent from inside requestApproval.
-  await requestApproval({
+  const posted = await requestApproval({
     session,
     agentName: session.agent_group_id,
     action: REQUEST_CHOICE_ACTION,
     requestId: request.choiceId,
-    payload: { choiceId: request.choiceId, ...(request.key !== undefined ? { key: request.key } : {}) },
+    payload: {
+      choiceId: request.choiceId,
+      ...(request.key !== undefined ? { key: request.key } : {}),
+      ...(request.approvers ? { approvers: request.approvers } : {}),
+    },
     title: request.title,
     question: request.question,
     deliveryTarget: 'thread',
     conversation,
     options,
   });
+
+  // Post first, then retire: an ask that failed to post leaves the old card live.
+  if (posted && request.key !== undefined) {
+    await supersedeOpenChoices(session.agent_group_id, request.key, request.choiceId);
+  }
 }
 
 /**
@@ -186,15 +218,16 @@ async function authorizedDestination(
 
 /**
  * Replace, never stack: retire every open request_choice card this agent
- * group posted under `key`. The key lives in the row's payload JSON, not a
- * column of its own: open choice cards per group are few,
- * getPendingApprovalsByAction already narrows to this action (indexed by
+ * group posted under `key`, except the one just posted. The key lives in the
+ * row's payload JSON, not a column of its own: open choice cards per group are
+ * few, getPendingApprovalsByAction already narrows to this action (indexed by
  * idx_pending_approvals_action_status), filtering in JS keeps the query
  * portable (no json_extract), and a column would be schema for one action.
  */
-async function supersedeOpenChoices(agentGroupId: string, key: string): Promise<void> {
+async function supersedeOpenChoices(agentGroupId: string, key: string, keepChoiceId: string): Promise<void> {
   for (const row of await getPendingApprovalsByAction(REQUEST_CHOICE_ACTION)) {
-    if (row.status !== 'pending' || row.agent_group_id !== agentGroupId || payloadKey(row) !== key) continue;
+    if (row.status !== 'pending' || row.agent_group_id !== agentGroupId || row.request_id === keepChoiceId) continue;
+    if (payloadKey(row) !== key) continue;
     if (await retireChoice(row, SUPERSEDED_LINE)) {
       log.info('Choice superseded by a newer ask', { approvalId: row.approval_id, agentGroupId, key });
     }
@@ -244,7 +277,7 @@ async function cardConversationSession(
   );
   let sessionMode = wiring.session_mode;
   if (threadsEnabled && sessionMode !== 'agent-shared' && mg.is_group !== 0) sessionMode = 'per-thread';
-  const threadId = threadsEnabled ? (approval.thread_id ?? replyThreadId(mg, choiceAnchorMessageId(approval))) : null;
+  const threadId = threadsEnabled ? (approval.thread_id ?? replyThreadId(mg, approval.platform_message_id)) : null;
   const { session } = await resolveSession(agentGroupId, mg.id, threadId, sessionMode);
   return session;
 }
@@ -278,6 +311,8 @@ const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF
  * unchanged: the runner XML-escapes chat text (& < > ", formatter.ts:716-718
  * in container/agent-runner/src), and encodeURIComponent output contains none
  * of those. Lone surrogates, which encodeURIComponent throws on, become U+FFFD.
+ * Anyone can type this line; the agent trusts it only inside a message the
+ * runner marks origin="host" (notifyAgent).
  */
 export function formatChoiceResponse(fields: {
   choiceId: string;
@@ -305,16 +340,35 @@ async function relayChoice(ctx: ChoiceHandlerContext): Promise<Session | null> {
   // the clicker's users row — an authorized clicker holds a user_roles row,
   // which references users(id) (src/db/schema.ts:88-89).
   const user = await getUser(ctx.userId);
-  await notifyAgent(
-    target,
-    formatChoiceResponse({
-      choiceId: ctx.approval.request_id,
-      value: ctx.value,
-      label: ctx.label,
-      userId: ctx.userId,
-      userName: user?.display_name ?? null,
-    }),
-  );
+  const id = `choice-answer-${ctx.approval.approval_id}`;
+  try {
+    await notifyAgent(
+      target,
+      formatChoiceResponse({
+        choiceId: ctx.approval.request_id,
+        value: ctx.value,
+        label: ctx.label,
+        userId: ctx.userId,
+        userName: user?.display_name ?? null,
+      }),
+      { id },
+    );
+  } catch (err) {
+    // notifyAgent inserts the row, then reads the session back and wakes it
+    // (primitive.ts). A failure after the insert still leaves a due row, and
+    // the sweep wakes a session with due rows (sweep-scheduling/index.ts:76,
+    // sweep-continuation/index.ts:674) — so a recorded answer is delivered.
+    // Only an unrecorded one may reopen the card (ChoiceHandler contract).
+    if (await sessionMessageExists(target.agent_group_id, target.id, id)) {
+      log.warn('Choice answer recorded but the wake failed — the sweep will wake the session', {
+        approvalId: ctx.approval.approval_id,
+        sessionId: target.id,
+        err,
+      });
+      return target;
+    }
+    throw err;
+  }
   return target;
 }
 

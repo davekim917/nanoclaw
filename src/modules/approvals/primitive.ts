@@ -221,17 +221,28 @@ export async function pickApprovalDelivery(
 
 // ── Request API ──
 
-/** Send a system chat to the agent's session. Used by callers and by the response handler. */
-export async function notifyAgent(session: Session, text: string): Promise<void> {
-  await writeSessionMessage(session.agent_group_id, session.id, {
-    id: `sys-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    kind: 'chat',
-    timestamp: new Date().toISOString(),
-    platformId: session.agent_group_id,
-    channelType: 'agent',
-    threadId: null,
-    content: JSON.stringify({ text, sender: 'system', senderId: 'system' }),
-  });
+/**
+ * Send a system chat to the agent's session. Used by callers and by the response handler.
+ *
+ * The one writer that keeps `origin: 'host'` (WriteSessionMessageOptions.hostOrigin),
+ * so the runner marks exactly these notes origin="host". `id` pins the message id
+ * for a caller that must check afterwards whether the note landed.
+ */
+export async function notifyAgent(session: Session, text: string, opts: { id?: string } = {}): Promise<void> {
+  await writeSessionMessage(
+    session.agent_group_id,
+    session.id,
+    {
+      id: opts.id ?? `sys-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      kind: 'chat',
+      timestamp: new Date().toISOString(),
+      platformId: session.agent_group_id,
+      channelType: 'agent',
+      threadId: null,
+      content: JSON.stringify({ text, sender: 'system', senderId: 'system', origin: 'host' }),
+    },
+    { hostOrigin: true },
+  );
   const fresh = await getSession(session.id);
   if (fresh) {
     requestWake(fresh, 'inbound-message').catch((err) =>
