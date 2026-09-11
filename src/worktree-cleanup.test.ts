@@ -795,6 +795,103 @@ describe('branch clone checkouts', () => {
     expect(git(trashedCopy, ['symbolic-ref', '--short', 'HEAD'])).toBe('feat');
   });
 
+  it('tags a clone inherited unchanged from its canonical are not its own work; every other tag still is (#672)', async () => {
+    // The canonical holds tags on a commit no origin branch reaches, as a
+    // repository's release tags often do. A clone copies every canonical tag
+    // (repository_checkout removes only heads and remote-tracking refs).
+    const canon = canonicalFixture('repo-a');
+    const base = git(canon.canonical, ['rev-parse', 'HEAD']);
+    const release = git(canon.canonical, ['commit-tree', `${base}^{tree}`, '-p', base, '-m', 'release']);
+    git(canon.canonical, ['tag', 'release-1', release]);
+    git(canon.canonical, ['tag', '-a', '-m', 'annotated release', 'release-2', release]);
+    git(canon.canonical, ['tag', 'tree-tag', `${base}^{tree}`]);
+    // A second workgroup canonical that is gone by the time cleanup runs.
+    const gone = canonicalFixture('repo-b');
+    git(gone.canonical, [
+      'tag',
+      'release-1',
+      git(gone.canonical, ['commit-tree', 'HEAD^{tree}', '-p', 'HEAD', '-m', 'r']),
+    ]);
+
+    const cases: Array<{ thread: string; repo: string; reason: string; arrange: (dir: string) => void }> = [
+      {
+        // The clone's own work under an inherited tag's name: same name, another commit.
+        thread: 'p672-moved-tag',
+        repo: 'repo-a',
+        reason: 'unpushed',
+        arrange: (dir) => {
+          git(dir, ['checkout', '-q', '--detach']);
+          commitFile(dir, 'moved.txt');
+          git(dir, ['tag', '-f', 'release-1']);
+          git(dir, ['checkout', '-q', 'feat']);
+        },
+      },
+      {
+        // A sibling topic in the workgroup can write the canonical's refs. A tag
+        // it plants there on this clone's unpushed commit is not this clone's
+        // tag, so the commit, which a branch holds, still counts.
+        thread: 'p672-planted-canonical-tag',
+        repo: 'repo-a',
+        reason: 'unpushed',
+        arrange: (dir) => {
+          git(dir, ['checkout', '-q', '-b', 'side']);
+          commitFile(dir, 'victim.txt');
+          git(dir, ['checkout', '-q', 'feat']);
+          git(canon.canonical, ['fetch', '-q', dir, '+refs/heads/side:refs/tags/planted']);
+        },
+      },
+      {
+        // No canonical to compare against: every tag counts, as before.
+        thread: 'p672-canonical-gone',
+        repo: 'repo-b',
+        reason: 'unpushed',
+        arrange: () => {},
+      },
+    ];
+    const refused = cases.map((spec) => {
+      const fixture = cloneCheckout(spec.repo === 'repo-a' ? canon : gone, spec.thread, `${spec.repo}@feat`, 'feat');
+      spec.arrange(fixture.checkout);
+      age(fixture.checkout);
+      return { ...spec, ...fixture, before: snapshot(fixture.checkout) };
+    });
+    fs.rmSync(gone.canonical, { recursive: true, force: true });
+    const inherited = cloneCheckout(canon, 'p672-inherited', 'repo-a@feat', 'feat');
+    expect(git(inherited.checkout, ['tag', '--list']).split('\n').sort()).toEqual([
+      'planted',
+      'release-1',
+      'release-2',
+      'tree-tag',
+    ]);
+    state.rows = [...refused.map((spec) => closedRow(spec.thread)), closedRow('p672-inherited')];
+
+    // The orphan-topic loop, applying.
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const groupsDir = path.join(state.dataDir, 'groups');
+    fs.mkdirSync(groupsDir, { recursive: true });
+    const report = await runStorageGcOnce(state.dataDir, groupsDir);
+    for (const spec of refused) {
+      expect(find(report, spec.topicDir), spec.thread).toMatchObject({ collect: false, reason: spec.reason });
+      expect(snapshot(spec.checkout), spec.thread).toEqual(spec.before);
+    }
+    expect(find(report, inherited.topicDir)).toMatchObject({ collect: true, reason: 'closed-and-clean' });
+    expect(state.trashed).toEqual([inherited.topicDir]);
+
+    // The clone branch of worktree cleanup, including its re-proof of the
+    // quarantined copy.
+    const fresh = cloneCheckout(canon, 'p672-inherited-branch', 'repo-a@feat', 'feat');
+    state.rows.push(closedRow('p672-inherited-branch'));
+    const decisions = new Map<string, unknown>();
+    for (const target of await _discoverWorktreesForTesting(state.dataDir)) {
+      decisions.set(target.worktreePath, await _cleanupOneForTesting(target, state.dataDir));
+    }
+    for (const spec of refused) {
+      expect(decisions.get(spec.checkout), spec.thread).toEqual({ collected: false, reason: spec.reason });
+      expect(snapshot(spec.checkout), spec.thread).toEqual(spec.before);
+    }
+    expect(decisions.get(fresh.checkout)).toEqual({ collected: true, reason: 'clean-and-pushed' });
+    expect(state.trashed).toHaveLength(2);
+  });
+
   /** Every path under `dir` with its type and bytes: what "restored byte for byte" compares. */
   function treeDigest(dir: string): Record<string, string> {
     const digest: Record<string, string> = {};
