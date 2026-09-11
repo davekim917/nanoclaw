@@ -262,6 +262,11 @@ esac
 # next time except the untouched real working tree edit.
 [ -n "$(git -C "$G" status --porcelain)" ] && ok "pending edit remains on disk for the next run to retry" \
   || bad "pending edit was lost after the permanent push failure" ""
+# #628 item 8: a FAILURES exit must alert exactly once — via the installed
+# unit's OnFailure= (which reads the journal this script's stderr just fed),
+# never via the script's own notify-owner.ts call too.
+[ ! -s "$DM_LOG" ] && ok "a FAILURES exit sends no DM of its own (OnFailure= alerts instead)" \
+  || bad "a FAILURES exit still sent its own DM — double-alerts with OnFailure=" "$(cat "$DM_LOG")"
 
 # ═══ Dry mode: no fetch, no fast-forward, no push, no DM ══════════════════
 new_fixture
@@ -285,8 +290,9 @@ git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1 \
 # ═══ Phase 1 errors are non-silent (update-ref / diff / tar) ══════════════
 # A plain FILE sitting where update-ref needs to create
 # refs/git-safety/detached/<slug> (a directory) makes the ref update fail;
-# assert the run reports it as a FAILURE (and therefore DMs and exits
-# non-zero) instead of swallowing it into errors.log alone.
+# assert the run reports it as a FAILURE and exits non-zero (which is what
+# the installed unit's OnFailure= escalation keys off) instead of
+# swallowing it into errors.log alone.
 new_fixture
 WT="$FIX/detached-wt"
 git -C "$NCDIR" worktree add -q --detach "$WT" HEAD >/dev/null 2>&1
@@ -299,8 +305,10 @@ case "$OUT" in
   *"update-ref"*) ok "a failing update-ref is reported as a failure" ;;
   *) bad "a failing update-ref was silent" "$OUT" ;;
 esac
-[ "$RC" -ne 0 ] && ok "phase-1 error causes non-zero exit + DM" \
+[ "$RC" -ne 0 ] && ok "phase-1 error causes non-zero exit (for OnFailure= to escalate)" \
   || bad "phase-1 error did not fail the run" "$OUT"
+[ ! -s "$DM_LOG" ] && ok "phase-1 FAILURES exit sends no DM of its own either" \
+  || bad "phase-1 FAILURES exit still sent its own DM" "$(cat "$DM_LOG")"
 git -C "$NCDIR" worktree remove --force "$WT" >/dev/null 2>&1
 
 # ═══ Worktree slugs get a hash suffix (uniqueness even after truncation) ══

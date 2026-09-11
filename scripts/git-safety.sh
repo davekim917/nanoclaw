@@ -37,9 +37,15 @@
 #      anything is staged.
 #
 # Silent on success (a pending deletion still gets its own DM even on an
-# otherwise clean run — see below). On FAILURE it DMs the owner via
-# scripts/notify-owner.ts and exits 1. Runs before storage-gc so anything the
-# GC takes is captured.
+# otherwise clean run — see below). On FAILURE it exits 1 and does NOT DM
+# the owner itself: the installed unit's OnFailure=nanoclaw-unit-alert@%n
+# (data/systemd/, or groups/_ops/systemd/nanoclaw-git-safety.service on this
+# host) already fires on any non-zero exit and DMs the actionable journal
+# tail (unit-alert-dm.sh). Before this both fired — the script's own DM plus
+# OnFailure's — for every handled failure (#628 item 8); FAILURES are still
+# printed to stderr (>> the unit's journal, which is what OnFailure's DM
+# reads) so the escalation stays actionable. Runs before storage-gc so
+# anything the GC takes is captured.
 #
 # Env:
 #   GIT_SAFETY_DIR                snapshot root (default ~/nanoclaw-backups)
@@ -315,26 +321,9 @@ done
 find "$OUT" -mindepth 1 -type d -empty -delete 2>/dev/null
 
 # ── phase 2: snapshot groups/'s pending tracked-file edits ──────────────────
-# Broad, case-insensitive, and deliberately over-inclusive: refusing a
-# non-secret line costs a manual `git -C groups diff` and a re-run; missing a
-# real one costs a leaked credential. Covers common vendor token shapes
-# (OpenAI, Stripe, GitHub PAT/OAuth/App, Slack bot/app, AWS, Google), PEM
-# private keys, JWTs, connection-string credentials, env/export assignments,
-# and JSON/YAML/plain "key: value" or "key=value" forms for
-# password/secret/token/api_key (the bare "token" alternative also matches
-# "access_token", "refresh_token", etc. as a substring — deliberately, so the
-# list doesn't need every compound name spelled out).
-# \b before sk- matters: without it, "sk-" matches as a mid-word substring
-# of any longer hyphenated token that happens to contain it (e.g. a
-# "desk-<40-char-hash>" config value) — the historical false-positive driver
-# per #628. gh[ousr]_ covers OAuth/User-to-server/Server-to-server/Refresh
-# tokens (gho_/ghu_/ghs_/ghr_); xox[abpre]- adds the legacy/rotation xoxe-
-# prefix; (AKIA|ASIA) adds AWS STS temporary credentials. The identifier
-# alternative matches ANY name containing key/secret/token/password/
-# passphrase/pass (exported or not) followed by `=` or `:` and a value, so
-# it also catches `*_PASSPHRASE=`, `*_PASS=`, and a plain unexported
-# `MY_KEY=...` that never had "export" in front of it.
-SECRET_RE='(\bsk-[A-Za-z0-9_-]{20,}|(sk|rk)_live_[A-Za-z0-9]{10,}|ghp_[A-Za-z0-9]{30,}|gh[ousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abpre]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9.-]{10,}|(AKIA|ASIA)[0-9A-Z]{16}|AIza[A-Za-z0-9_-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|eyJ[A-Za-z0-9_=-]+\.eyJ[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]+|[A-Za-z][A-Za-z0-9+.-]*://[^/@[:space:]:]+:[^/@[:space:]]+@|authorization:[[:space:]]*bearer[[:space:]]+[A-Za-z0-9._-]{10,}|[A-Za-z_][A-Za-z0-9_]*(KEY|SECRET|TOKEN|PASSWORD|PASSPHRASE|PASS)[A-Za-z0-9_]*[[:space:]]*=[[:space:]]*[^[:space:]]|(token|api[_-]?key|password|secret)[^A-Za-z0-9]{0,3}[:=][[:space:]]*[^[:space:]])'
+# SECRET_RE and secret_scan_hits() live in lib/secret-scan.sh, shared with
+# scripts/wiki-autopush.sh so the pattern set has exactly one copy.
+source "${SCRIPT_DIR}/lib/secret-scan.sh"
 
 # Sensitive filenames are never staged even when git already tracks them —
 # excluded via pathspec BEFORE `add -u` runs, so they never touch the scratch
@@ -417,7 +406,7 @@ _commit_groups_impl() { # <scratch index file>
   fi
 
   local hits
-  hits=$(grep -E '^\+' <<<"$diff_text" | grep -vE '^\+\+\+ ' | grep -icE "$SECRET_RE" || true)
+  hits=$(secret_scan_hits "$diff_text")
   if [ "${hits:-0}" -gt 0 ]; then
     printf '%s\n' "$diff_text" > "$OUT/groups-refused.patch" 2>/dev/null
     FAILURES+=("groups: $hits added line(s) look like a secret — refused to commit any pending change; scanned diff saved to $OUT/groups-refused.patch")
@@ -514,16 +503,12 @@ find "$SNAP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '20*Z' -mtime +"$KEEP_DA
 
 SIZE=$(du -sh "$OUT" 2>/dev/null | cut -f1)
 if [ ${#FAILURES[@]} -gt 0 ]; then
-  BODY="$(printf -- '- %s\n' "${FAILURES[@]}")
-
-Whatever did succeed is in $OUT ($SIZE)."
-  printf '%s\n' "${FAILURES[@]}" >&2
-  if [ "$GROUPS_MODE" = "dry" ]; then
-    echo "git-safety: dry run — owner not notified" >&2
-  else
-    node_modules/.bin/tsx scripts/notify-owner.ts --title "Git safety net needs attention" --body "$BODY" ||
-      echo "git-safety: FAILURE AND NOBODY WAS TOLD" >&2
-  fi
+  # Own-DM removed deliberately (#628 item 8): the unit's OnFailure=
+  # already DMs the owner on this exit code, so a second DM here would just
+  # double-alert every handled failure. Printing to stderr is what makes
+  # that OnFailure DM actionable — unit-alert-dm.sh reads the journal tail.
+  printf -- '- %s\n' "${FAILURES[@]}" >&2
+  echo "Whatever did succeed is in $OUT ($SIZE)." >&2
   exit 1
 fi
 if [ ${#NOTICES[@]} -gt 0 ] && [ "$GROUPS_MODE" != "dry" ]; then
