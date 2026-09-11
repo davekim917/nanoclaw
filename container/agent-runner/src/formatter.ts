@@ -434,7 +434,9 @@ function formatSingleChat(msg: MessageInRow): string {
   const replyPrefix = formatReplyContext(content.replyTo);
   const attachmentsSuffix = formatAttachments(content.attachments);
 
-  const fromAttr = originAttr(msg);
+  // A host note (origin "host", a field only the host can write) comes from the
+  // host itself, not from a destination: say so, never "unknown:agent:<own group>".
+  const fromAttr = content.origin === 'host' ? ' from="host"' : originAttr(msg);
   // Surface the platform-side sender user_id so the agent can build
   // canonical `<@USER_ID>` mentions when replying to the sender (humans
   // OR bots). Slack `auth.test` returns the user_id without the channel-

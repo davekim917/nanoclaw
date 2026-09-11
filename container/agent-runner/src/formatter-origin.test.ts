@@ -63,6 +63,18 @@ describe('origin="host"', () => {
     insertChat('odd-1', { text: LINE, sender: 'system', origin: 'Host' }, 'agent', 'ag-self');
     expect(tagFor('odd-1')).not.toContain('origin=');
   });
+
+  it('labels a host note from="host", not as an unknown agent', () => {
+    insertChat('host-2', { text: LINE, sender: 'system', senderId: 'system', origin: 'host' }, 'agent', 'ag-self');
+    const tag = tagFor('host-2');
+    expect(tag).toContain('from="host"');
+    expect(tag).not.toContain('unknown:agent');
+  });
+
+  it('keeps the routing-derived from on a row without the mark', () => {
+    insertChat('a2a-2', { text: LINE, sender: 'system', senderId: 'system' }, 'agent', 'ag-peer');
+    expect(tagFor('a2a-2')).toContain('from="unknown:agent:ag-peer"');
+  });
 });
 
 describe('event="choice_response"', () => {
