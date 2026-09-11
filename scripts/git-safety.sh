@@ -60,11 +60,14 @@
 
 set -uo pipefail
 
-# `git status`/`git diff` opportunistically rewrite `.git/index` even when
-# nothing changes (the "refresh" optimization) — across every worktree of a
-# shared checkout, that collides with a concurrent deploy, pull or reset.
-# This variable is respected by every git subcommand this script (and
-# anything it shells out to) invokes.
+# `git status` opportunistically rewrites `.git/index` even when nothing
+# changes (the "refresh" optimization) — across every worktree of a shared
+# checkout, that collides with a concurrent deploy, pull or reset. This
+# variable stops that. It does NOT stop the equivalent rewrite from
+# PORCELAIN `git diff` on a stat-dirty file (verified empirically: it
+# rewrites the index with this variable set to either 0 or 1) — that's why
+# every `diff` this script runs against a real repo's real index uses the
+# `diff-index` plumbing command instead, which never does it.
 export GIT_OPTIONAL_LOCKS=0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -85,6 +88,14 @@ FAILURES=()
 NOTICES=()
 GROUPS_RESULT="skipped (no groups/ repo)"
 
+# Scratch files/dirs (the phase-2 index, verify_bundle's scratch repo and
+# extracted pack) are removed on every normal return path already; this trap
+# is the backstop for a SIGTERM/SIGINT mid-run, which would otherwise leave
+# them in $TMPDIR indefinitely.
+CLEANUP_PATHS=()
+cleanup_scratch() { local p; for p in ${CLEANUP_PATHS[@]+"${CLEANUP_PATHS[@]}"}; do [ -n "$p" ] && rm -rf "$p" 2>/dev/null; done; }
+trap cleanup_scratch EXIT INT TERM
+
 # Everything under $OUT (patches, tarballs, the manifest) holds config and,
 # for untracked files, potentially secret-shaped content that slipped past
 # .gitignore. New files/dirs default to owner-only from here on.
@@ -94,7 +105,12 @@ mkdir -p "$OUT" || { echo "git-safety: cannot create $OUT" >&2; exit 1; }
 say() { echo "$*" >> "$MAN"; }
 slug() { # <path> -> unique, valid-ref-name-safe slug
   local raw="$1" base hash
-  base=$(printf '%s' "$raw" | sed 's#^/##; s#[^A-Za-z0-9._-]#_#g' | tail -c 100)
+  # `..` anywhere in a ref name is invalid (git-check-ref-format), and the
+  # character-class substitution below leaves a literal ".." untouched
+  # (both chars are in the allowed set) whenever the path has one — a
+  # worktree under a path like /a/../b would otherwise produce an unusable
+  # ref name and its commits would silently never get pinned.
+  base=$(printf '%s' "$raw" | sed 's#^/##; s#[^A-Za-z0-9._-]#_#g; s#\.\.\+#_#g' | tail -c 100)
   # A truncated slug alone can collide (two long paths sharing the same
   # tail); a checksum of the FULL untruncated path makes every slug unique
   # even when two paths collide after truncation.
@@ -108,9 +124,14 @@ check_err() { # <errfile> <failure-label> — non-silent errors from a phase-1 s
   cat "$1" >> "$ERR" 2>/dev/null
   rm -f "$1"
 }
+# Kept in sync with GROUPS_SENSITIVE_EXCLUDES/PATHSPECS below (phase 2) —
+# an untracked secret-shaped file is exactly as sensitive as a tracked one,
+# and #628 found this list narrower than that one (.netrc, id_rsa* and
+# friends, prod.env-style names, secrets.yaml were still tarred here).
 excluded_snapshot_name() { # <basename> -> 0 if it must never enter a tarball
   case "$1" in
-    .env|.env.*|*.pem|*.p8|*.key|credentials*|credentials.*) return 0 ;;
+    .env|.env.*|*.env|*.pem|*.p8|*.key|credentials*|credentials.*|\
+    .netrc|id_rsa*|id_ed25519*|id_ecdsa*|profiles.yml|secrets.yaml|secrets.yml) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -128,14 +149,32 @@ verify_bundle() { # <bundle-path> <source-repo> — real integrity check
   # forces real decompression and a trailer-checksum check no matter what
   # the scratch repo can already see; --fix-thin plus the alternate resolves
   # prerequisite base objects the same way a real restore would.
-  local bundle=$1 src=$2 scratch objdir pack_off tmp_pack rc
+  local bundle=$1 src=$2 scratch objdir blank_off pack_off tmp_pack rc
   scratch=$(mktemp -d) || return 1
+  CLEANUP_PATHS+=("$scratch")
   if ! git init --bare -q "$scratch" >/dev/null 2>&1; then rm -rf "$scratch"; return 1; fi
   objdir=$(git -C "$src" rev-parse --git-path objects 2>/dev/null) || { rm -rf "$scratch"; return 1; }
   case "$objdir" in /*) : ;; *) objdir="$src/$objdir" ;; esac
-  pack_off=$(grep -abo -m1 'PACK' "$bundle" 2>/dev/null | head -1 | cut -d: -f1)
-  if [ -z "$pack_off" ]; then rm -rf "$scratch"; return 1; fi
+  # The bundle header (signature line, then one ref/prerequisite line per
+  # ref) ends at the first blank line, and the raw pack — which happens to
+  # start with the literal 4 bytes "PACK" — follows immediately after. A
+  # prerequisite line embeds that commit's SUBJECT as a trailing comment
+  # ("-<sha> <subject>"), so searching the whole file for the first literal
+  # "PACK" is wrong whenever a boundary commit's subject contains that word
+  # (reproduced: a subject "...PACK format details..." matched 95 bytes
+  # before the real pack, corrupting the offset). Anchoring on the blank
+  # line instead is unambiguous: ref names and commit subjects are single
+  # lines and can't contain one.
+  # No `-o`: GNU grep prints nothing for a zero-length match under `-o`
+  # (verified empirically — rc=0 but empty stdout, on grep 3.11, even on a
+  # trivial "a\n\nb\n" file), while `-b`/`-n` alone still report the
+  # line:byte prefix for it. The match text is empty either way, so `-o`
+  # was never needed.
+  blank_off=$(grep -abn -m1 '^$' "$bundle" 2>/dev/null | head -1 | cut -d: -f2)
+  if [ -z "$blank_off" ]; then rm -rf "$scratch"; return 1; fi
+  pack_off=$((blank_off + 1))
   tmp_pack=$(mktemp)
+  CLEANUP_PATHS+=("$tmp_pack")
   tail -c +$((pack_off + 1)) "$bundle" > "$tmp_pack"
   GIT_ALTERNATE_OBJECT_DIRECTORIES="$objdir" GIT_DIR="$scratch" \
     git index-pack --stdin --fix-thin -o "$scratch/verify.idx" < "$tmp_pack" >/dev/null 2>&1
@@ -229,7 +268,12 @@ snapshot_repo() { # <repo path> <label>
     s=$(slug "$w")
     list="$dir/$s.untracked"
     local pe; pe=$(mktemp)
-    git -C "$w" diff --binary --no-color HEAD > "$dir/$s.patch" 2>"$pe"
+    # `diff-index` (not porcelain `diff`): GIT_OPTIONAL_LOCKS=0 does NOT stop
+    # `git diff HEAD` from rewriting .git/index when a tracked file is
+    # stat-dirty (mtime changed, content identical) — verified empirically
+    # while building this fix, on both settings of the variable. `diff-index`
+    # never does that rewrite, with or without the variable.
+    git -C "$w" diff-index --no-color -p --binary HEAD > "$dir/$s.patch" 2>"$pe"
     check_err "$pe" "$label: diff for $w"
     [ -s "$dir/$s.patch" ] || rm -f "$dir/$s.patch"
     git -C "$w" ls-files --others --exclude-standard -z 2>/dev/null |
@@ -280,21 +324,42 @@ find "$OUT" -mindepth 1 -type d -empty -delete 2>/dev/null
 # password/secret/token/api_key (the bare "token" alternative also matches
 # "access_token", "refresh_token", etc. as a substring — deliberately, so the
 # list doesn't need every compound name spelled out).
-SECRET_RE='(sk-[A-Za-z0-9_-]{20,}|sk_live_[A-Za-z0-9]{10,}|ghp_[A-Za-z0-9]{30,}|gh[os]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abpr]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9.-]{10,}|AKIA[0-9A-Z]{16}|AIza[A-Za-z0-9_-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|eyJ[A-Za-z0-9_=-]+\.eyJ[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]+|[A-Za-z][A-Za-z0-9+.-]*://[^/@[:space:]:]+:[^/@[:space:]]+@|export[[:space:]]+[A-Za-z0-9_]*(KEY|SECRET|TOKEN|PASSWORD)[A-Za-z0-9_]*[[:space:]]*=|(token|api[_-]?key|password|secret)[^A-Za-z0-9]{0,3}[:=][[:space:]]*[^[:space:]])'
+# \b before sk- matters: without it, "sk-" matches as a mid-word substring
+# of any longer hyphenated token that happens to contain it (e.g. a
+# "desk-<40-char-hash>" config value) — the historical false-positive driver
+# per #628. gh[ousr]_ covers OAuth/User-to-server/Server-to-server/Refresh
+# tokens (gho_/ghu_/ghs_/ghr_); xox[abpre]- adds the legacy/rotation xoxe-
+# prefix; (AKIA|ASIA) adds AWS STS temporary credentials. The identifier
+# alternative matches ANY name containing key/secret/token/password/
+# passphrase/pass (exported or not) followed by `=` or `:` and a value, so
+# it also catches `*_PASSPHRASE=`, `*_PASS=`, and a plain unexported
+# `MY_KEY=...` that never had "export" in front of it.
+SECRET_RE='(\bsk-[A-Za-z0-9_-]{20,}|(sk|rk)_live_[A-Za-z0-9]{10,}|ghp_[A-Za-z0-9]{30,}|gh[ousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abpre]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9.-]{10,}|(AKIA|ASIA)[0-9A-Z]{16}|AIza[A-Za-z0-9_-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|eyJ[A-Za-z0-9_=-]+\.eyJ[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]+|[A-Za-z][A-Za-z0-9+.-]*://[^/@[:space:]:]+:[^/@[:space:]]+@|authorization:[[:space:]]*bearer[[:space:]]+[A-Za-z0-9._-]{10,}|[A-Za-z_][A-Za-z0-9_]*(KEY|SECRET|TOKEN|PASSWORD|PASSPHRASE|PASS)[A-Za-z0-9_]*[[:space:]]*=[[:space:]]*[^[:space:]]|(token|api[_-]?key|password|secret)[^A-Za-z0-9]{0,3}[:=][[:space:]]*[^[:space:]])'
 
 # Sensitive filenames are never staged even when git already tracks them —
 # excluded via pathspec BEFORE `add -u` runs, so they never touch the scratch
 # index in the first place.
+# Kept in sync with excluded_snapshot_name() above (phase 1) — see its
+# comment. Additions here also need the plain (non-exclude) form mirrored
+# into GROUPS_SENSITIVE_PATHSPECS just below, for the "report what was left
+# uncommitted" query.
 GROUPS_SENSITIVE_EXCLUDES=(
   ':(exclude,glob)**/.env'
   ':(exclude,glob)**/.env.*'
+  ':(exclude,glob)**/*.env'
   ':(exclude,glob)**/*.pem'
   ':(exclude,glob)**/*.p8'
   ':(exclude,glob)**/*.key'
   ':(exclude,glob)**/credentials*'
   ':(exclude,glob)**/profiles.yml'
+  ':(exclude,glob)**/.netrc'
+  ':(exclude,glob)**/id_rsa*'
+  ':(exclude,glob)**/id_ed25519*'
+  ':(exclude,glob)**/id_ecdsa*'
+  ':(exclude,glob)**/secrets.yaml'
+  ':(exclude,glob)**/secrets.yml'
 )
-GROUPS_SENSITIVE_PATHSPECS=(':(glob)**/.env' ':(glob)**/.env.*' ':(glob)**/*.pem' ':(glob)**/*.p8' ':(glob)**/*.key' ':(glob)**/credentials*' ':(glob)**/profiles.yml')
+GROUPS_SENSITIVE_PATHSPECS=(':(glob)**/.env' ':(glob)**/.env.*' ':(glob)**/*.env' ':(glob)**/*.pem' ':(glob)**/*.p8' ':(glob)**/*.key' ':(glob)**/credentials*' ':(glob)**/profiles.yml' ':(glob)**/.netrc' ':(glob)**/id_rsa*' ':(glob)**/id_ed25519*' ':(glob)**/id_ecdsa*' ':(glob)**/secrets.yaml' ':(glob)**/secrets.yml')
 
 _commit_groups_impl() { # <scratch index file>
   local TMPIDX=$1
@@ -312,16 +377,24 @@ _commit_groups_impl() { # <scratch index file>
   # Deletions are staged by `add -u` like any other tracked change; excluding
   # them here means the scratch index (and the commit built from it) keeps
   # HEAD's last-known-good content for that path — reported, never committed.
+  # Read against the SCRATCH index (== HEAD, just loaded above), not the
+  # real one: another session may have `git add`ed or `git rm --cached`ed
+  # something in groups' real index without committing, which would make
+  # `ls-files --deleted` (real index) disagree with what `add -u` is about
+  # to stage into the scratch index moments later — silently letting a
+  # `git rm`/`git mv` deletion reach host-snapshot unreported.
   local deleted=() f
-  while IFS= read -r f; do [ -n "$f" ] && deleted+=("$f"); done < <(git -C "$G" ls-files --deleted)
+  while IFS= read -r f; do [ -n "$f" ] && deleted+=("$f"); done < <(GIT_INDEX_FILE="$TMPIDX" git -C "$G" ls-files --deleted)
   local excludes=("${GROUPS_SENSITIVE_EXCLUDES[@]}")
   for f in "${deleted[@]}"; do excludes+=(":(exclude)$f"); done
 
   GIT_INDEX_FILE="$TMPIDX" git -C "$G" add -u -- . "${excludes[@]}" 2>>"$ERR" || {
     FAILURES+=("groups: staging tracked changes into the scratch index failed"); GROUPS_RESULT="failed (add -u)"; return; }
 
+  # diff-index, not diff: see the comment on the phase-1 patch call above —
+  # this reads groups' REAL index/working tree and must not rewrite it.
   local sensitive
-  sensitive=$(git -C "$G" diff --name-only HEAD -- "${GROUPS_SENSITIVE_PATHSPECS[@]}" 2>/dev/null)
+  sensitive=$(git -C "$G" diff-index --name-only HEAD -- "${GROUPS_SENSITIVE_PATHSPECS[@]}" 2>/dev/null)
   [ -n "$sensitive" ] && say "groups: left uncommitted on purpose (secret-shaped path): $(tr '\n' ' ' <<<"$sensitive")"
   if [ "${#deleted[@]}" -gt 0 ]; then
     local dlist; dlist=$(printf '%s, ' "${deleted[@]}")
@@ -364,6 +437,27 @@ _commit_groups_impl() { # <scratch index file>
   tree=$(GIT_INDEX_FILE="$TMPIDX" git -C "$G" write-tree 2>>"$ERR") || {
     FAILURES+=("groups: write-tree failed"); GROUPS_RESULT="failed (write-tree)"; return; }
 
+  # The leading "+" forces the tracking ref to update even on a
+  # non-fast-forward change upstream (a force-reset of host-snapshot, which
+  # is otherwise never expected but not impossible). Without it a stale
+  # refs/remotes/origin/$SNAPSHOT_BRANCH silently wins every night after
+  # such a reset: this fetch reports success (nothing to reject), the
+  # tracking ref just never advances, so the next commit-tree keeps using
+  # the old, now-diverged parent and every subsequent push fails.
+  git -C "$G" fetch --quiet origin "+refs/heads/$SNAPSHOT_BRANCH:refs/remotes/origin/$SNAPSHOT_BRANCH" 2>>"$ERR" || true
+  local snap_parent prev_tree
+  snap_parent=$(git -C "$G" rev-parse -q --verify "refs/remotes/origin/$SNAPSHOT_BRANCH" 2>/dev/null || true)
+  if [ -n "$snap_parent" ]; then
+    prev_tree=$(git -C "$G" rev-parse -q --verify "$snap_parent^{tree}" 2>/dev/null || true)
+    if [ -n "$prev_tree" ] && [ "$prev_tree" = "$tree" ]; then
+      # Same persistent uncommitted drift as the last snapshot (nobody has
+      # committed it to main): pushing an identical tree again would just
+      # grow host-snapshot with no-op commits forever.
+      GROUPS_RESULT="unchanged since last snapshot ($snap_parent already has this tree)"
+      return
+    fi
+  fi
+
   local commit_msg
   commit_msg="chore(groups): nightly snapshot of $n pending config change(s)
 
@@ -373,10 +467,14 @@ Committed by scripts/git-safety.sh onto refs/heads/$SNAPSHOT_BRANCH (never
 main, never groups' own HEAD). Host sync scripts and operator sessions edit
 these files in place and nothing else commits them."
 
-  local attempt commit_hash snap_parent rc
+  local attempt commit_hash rc
   for attempt in 1 2; do
-    git -C "$G" fetch --quiet origin "refs/heads/$SNAPSHOT_BRANCH:refs/remotes/origin/$SNAPSHOT_BRANCH" 2>>"$ERR" || true
-    snap_parent=$(git -C "$G" rev-parse -q --verify "refs/remotes/origin/$SNAPSHOT_BRANCH" 2>/dev/null || true)
+    if [ "$attempt" -gt 1 ]; then
+      # Retrying after a rejected push: re-fetch so the new parent reflects
+      # whoever won the race, then rebuild the commit on top of them.
+      git -C "$G" fetch --quiet origin "+refs/heads/$SNAPSHOT_BRANCH:refs/remotes/origin/$SNAPSHOT_BRANCH" 2>>"$ERR" || true
+      snap_parent=$(git -C "$G" rev-parse -q --verify "refs/remotes/origin/$SNAPSHOT_BRANCH" 2>/dev/null || true)
+    fi
     # Parents: the previous snapshot-branch tip (so the push fast-forwards)
     # and groups' current HEAD (so the snapshot's relation to main stays
     # recorded in the commit graph).
@@ -404,6 +502,7 @@ these files in place and nothing else commits them."
 commit_groups() {
   local TMPIDX
   TMPIDX=$(mktemp) && rm -f "$TMPIDX"
+  CLEANUP_PATHS+=("$TMPIDX")
   _commit_groups_impl "$TMPIDX"
   rm -f "$TMPIDX"
 }

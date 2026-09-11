@@ -214,6 +214,13 @@ else
 fi
 
 # ═══ Rejected push: retry once, then succeed ═══════════════════════════════
+# (git's pre-receive hooks run inside a ref-update quarantine and cannot
+# mutate refs themselves — verified empirically while building this: a
+# `git update-ref` inside the hook fails with "forbidden inside quarantine
+# environment" — so a genuine concurrent-writer race is exercised
+# separately below, via a real out-of-band `update-ref` on the bare repo
+# between two runs, which proves the fresh-parent property without needing
+# to fight that restriction.)
 new_fixture
 cat > "$REMOTE/hooks/pre-receive" <<'HOOK'
 #!/bin/bash
@@ -297,6 +304,38 @@ esac
 git -C "$NCDIR" worktree remove --force "$WT" >/dev/null 2>&1
 
 # ═══ Worktree slugs get a hash suffix (uniqueness even after truncation) ══
+# Unit-test slug() directly (extracted verbatim from the shipped script),
+# with two paths engineered to be BYTE-IDENTICAL in their last 100 chars —
+# the truncation alone would collide them; only the hash (of the FULL,
+# untruncated path) can tell them apart. The old version of this check just
+# counted patch files from two merely-long paths, which passes even if the
+# hash suffix were deleted entirely, as long as the paths differ before the
+# truncation point.
+eval "$(sed -n '/^slug() {/,/^}/p' "$REAL")"
+PREFIX_A="aaa"; PREFIX_B="bbb"
+SHARED_TAIL=$(printf 'x%.0s' $(seq 1 120))
+SLUG_A=$(slug "/tmp/$PREFIX_A/$SHARED_TAIL")
+SLUG_B=$(slug "/tmp/$PREFIX_B/$SHARED_TAIL")
+[ "$SLUG_A" != "$SLUG_B" ] && ok "slug() disambiguates two paths identical in their last 100 chars" \
+  || bad "slug() collided on two different paths" "a=$SLUG_A b=$SLUG_B"
+
+# `..` anywhere in a worktree path must not survive into the slug: git
+# forbids two consecutive dots in a ref name, so an untreated ".." would
+# make update-ref fail and that worktree's commits would never get pinned.
+DOTDOT_SLUG=$(slug "/tmp/a/../b/worktree")
+case "$DOTDOT_SLUG" in
+  *..*) bad "slug() left '..' in the output" "$DOTDOT_SLUG" ;;
+  *) ok "slug() strips '..' from the output ($DOTDOT_SLUG)" ;;
+esac
+# Prove it's actually a valid ref name, not just eyeballed.
+new_fixture
+if git -C "$NCDIR" update-ref "refs/git-safety/detached/$DOTDOT_SLUG" HEAD 2>/dev/null; then
+  ok "the '..'-stripped slug is a valid ref name"
+  git -C "$NCDIR" update-ref -d "refs/git-safety/detached/$DOTDOT_SLUG" 2>/dev/null
+else
+  bad "the '..'-stripped slug is still not a valid ref name" "$DOTDOT_SLUG"
+fi
+
 new_fixture
 LONGA="$FIX/$(printf 'a%.0s' $(seq 1 140))-one"
 LONGB="$FIX/$(printf 'a%.0s' $(seq 1 140))-two"
@@ -336,7 +375,10 @@ find "$manifest" -name '*untracked.tgz' -exec tar tzf {} \; 2>/dev/null | grep -
   && bad ".env ended up in an untracked-files tarball" "" \
   || ok ".env was excluded from every untracked-files tarball"
 # umask 077: everything created under the snapshot root is owner-only.
-PERM_BAD=$(find "$manifest" \( -perm -g+rwx -o -perm -o+rwx \) 2>/dev/null)
+# `-perm /077` (ANY group/other bit set) — `-perm -g+rwx -o -perm -o+rwx`
+# would only fire on ALL of group's or ALL of other's rwx bits, missing a
+# file at, say, mode 640 (group-readable, not group-writable/executable).
+PERM_BAD=$(find "$manifest" -perm /077 2>/dev/null)
 [ -z "$PERM_BAD" ] && ok "snapshot files are owner-only (umask 077)" \
   || bad "snapshot files are group/world accessible" "$PERM_BAD"
 
@@ -422,6 +464,173 @@ run_safety
 IDX_AFTER=$(stat -c %Y "$G/.git/index" 2>/dev/null || echo 0)
 [ "$IDX_BEFORE" = "$IDX_AFTER" ] && ok "groups/.git/index mtime untouched (GIT_OPTIONAL_LOCKS=0 honored)" \
   || bad "groups/.git/index was rewritten" "before=$IDX_BEFORE after=$IDX_AFTER"
+
+# ═══ A stat-dirty file (mtime touched, content unchanged) must not rewrite
+# the real index either — GIT_OPTIONAL_LOCKS=0 does NOT stop this for
+# porcelain `git diff` (verified empirically while building this fix: it
+# rewrites the index regardless of the variable's setting); only the
+# `diff-index` plumbing command this script now uses never does it. #628.
+new_fixture
+git -C "$NCDIR" commit --allow-empty -qm "second commit so README.md is tracked and clean" >/dev/null
+sleep 1.1
+touch "$NCDIR/README.md"
+IDX_BEFORE=$(stat -c %Y "$NCDIR/.git/index")
+run_safety
+IDX_AFTER=$(stat -c %Y "$NCDIR/.git/index")
+[ "$IDX_BEFORE" = "$IDX_AFTER" ] && ok "a stat-dirty (not content-dirty) tracked file does not rewrite .git/index" \
+  || bad "a stat-dirty file's index refresh leaked through" "before=$IDX_BEFORE after=$IDX_AFTER"
+
+# ═══ #628 follow-ups ═══════════════════════════════════════════════════════
+
+# ─ A force-reset of host-snapshot must not wedge the next run (the fetch
+# refspec needs a leading "+") ─
+new_fixture
+echo '{"a":2}' > "$G/foo/container.json"
+run_safety
+FIRST_SNAP_TIP=$(git --git-dir="$REMOTE" rev-parse host-snapshot)
+FORCE_RESET_TIP=$(git --git-dir="$REMOTE" commit-tree "$FIRST_SNAP_TIP^{tree}" -m "operator force-reset target" 2>/dev/null)
+git --git-dir="$REMOTE" update-ref refs/heads/host-snapshot "$FORCE_RESET_TIP"
+echo '{"a":3}' > "$G/foo/container.json"
+run_safety
+[ "$RC" -eq 0 ] && ok "a force-reset remote does not wedge the next run" \
+  || bad "a force-reset remote wedged the run" "$OUT"
+AFTER_RESET_TIP=$(git --git-dir="$REMOTE" rev-parse -q --verify host-snapshot 2>/dev/null)
+AFTER_RESET_PARENT=$(git --git-dir="$REMOTE" log -1 --format=%P "$AFTER_RESET_TIP" 2>/dev/null | awk '{print $1}')
+[ "$AFTER_RESET_PARENT" = "$FORCE_RESET_TIP" ] \
+  && ok "the next commit is built on the force-reset tip, not a stale cached one" \
+  || bad "the next commit used the wrong parent after a force-reset" "expected=$FORCE_RESET_TIP got=${AFTER_RESET_PARENT:-<none>}"
+
+# ─ A `git rm` (or `git mv`) reaches host-snapshot unannounced only if the
+# deletion check reads the real index instead of the scratch one ─
+new_fixture
+mkdir -p "$G/other"; echo '{"x":1}' > "$G/other/thing.json"
+git -C "$G" add other/thing.json
+git -C "$G" commit -qm "add other file" >/dev/null
+git -C "$G" push -q origin HEAD:main
+# `git rm` removes the path from BOTH the real index and the working tree —
+# the real index no longer even lists it as tracked, which is exactly the
+# state that made the old `ls-files --deleted` (against the real index)
+# blind to it.
+git -C "$G" rm -q foo/container.json
+echo '{"x":2}' > "$G/other/thing.json"
+run_safety
+SNAP_TIP=$(git --git-dir="$REMOTE" rev-parse -q --verify host-snapshot 2>/dev/null)
+if [ -n "$SNAP_TIP" ] && git --git-dir="$REMOTE" show "$SNAP_TIP:foo/container.json" >/dev/null 2>&1; then
+  ok "a git-rm'd file is kept at last-known content in the snapshot commit"
+else
+  bad "a git-rm'd file's content is missing from the snapshot commit (reached host-snapshot as a real deletion)" "tip=${SNAP_TIP:-<none>}"
+fi
+grep -q "foo/container.json" "$(latest_snapshot)/MANIFEST.txt" 2>/dev/null \
+  && ok "the git-rm deletion was reported in the manifest" \
+  || bad "the git-rm deletion was not reported" "$(cat "$(latest_snapshot)/MANIFEST.txt" 2>/dev/null)"
+
+# ─ verify_bundle's PACK-offset search must not be fooled by a prerequisite
+# commit whose subject contains the literal word "PACK" ─
+new_fixture
+echo base > "$NCDIR/base.txt"
+git -C "$NCDIR" add base.txt
+git -C "$NCDIR" commit -qm "base commit whose subject mentions the PACK format explicitly" >/dev/null
+PACK_REMOTE="$FIX/nanoclaw-remote.git"
+git init --bare -q "$PACK_REMOTE"
+git -C "$NCDIR" remote add pushtest "$PACK_REMOTE" 2>/dev/null || git -C "$NCDIR" remote set-url pushtest "$PACK_REMOTE"
+git -C "$NCDIR" push -q pushtest HEAD:main
+echo unpushed >> "$NCDIR/base.txt"
+git -C "$NCDIR" commit -qam "unpushed on top of the PACK-mentioning base" >/dev/null
+run_safety
+case "$OUT" in
+  *"could not write a verified bundle"*) bad "a PACK-mentioning prerequisite subject broke verify_bundle" "$OUT" ;;
+  *) ok "a prerequisite commit subject containing 'PACK' does not break the offset search" ;;
+esac
+[ -s "$(latest_snapshot)nanoclaw/unpushed-commits.bundle" ] \
+  && ok "the bundle was still written despite the PACK-mentioning prerequisite" \
+  || bad "no bundle was written" "$OUT"
+
+# ─ An identical tree is not committed again every night ─
+new_fixture
+echo '{"a":2}' > "$G/foo/container.json"
+run_safety
+FIRST_RUN_TIP=$(git --git-dir="$REMOTE" rev-parse -q --verify host-snapshot 2>/dev/null)
+[ "$RC" -eq 0 ] && [ -n "$FIRST_RUN_TIP" ] && ok "first run with a pending edit commits and pushes" \
+  || bad "first run did not push" "$OUT"
+# Same persistent uncommitted edit, unchanged, on the second run.
+run_safety
+SECOND_RUN_TIP=$(git --git-dir="$REMOTE" rev-parse -q --verify host-snapshot 2>/dev/null)
+[ "$SECOND_RUN_TIP" = "$FIRST_RUN_TIP" ] \
+  && ok "a second run with the identical pending edit does not push a new no-op commit" \
+  || bad "an identical tree was committed again" "first=$FIRST_RUN_TIP second=${SECOND_RUN_TIP:-<none>}"
+case "$OUT" in
+  *"unchanged since last snapshot"*) ok "the no-op run reports why it skipped" ;;
+  *) bad "the no-op run did not explain itself" "$OUT" ;;
+esac
+
+# ─ Scratch-file cleanup trap is wired to EXIT/INT/TERM (#628 item 6) ─
+# NOT tested here: winning the timing race of an actual SIGTERM landing
+# mid-`add -u`. bash defers a pending trap until the current foreground
+# child (git) returns control to it — confirmed empirically while building
+# this: `kill -TERM` on a script blocked in a 30s `sleep` did not run its
+# TERM trap until the full 30s elapsed, matching POSIX shell semantics, not
+# a bug in this script. Reproducing systemd's real behavior (SIGTERM to the
+# whole cgroup, so git dies too and unblocks bash immediately) needs a
+# process-group-aware harness this fixture doesn't have; a naive version of
+# that test would either always pass for the wrong reason (racing a
+# same-process kill against a background job with no real interruption) or
+# flake on timing, which is worse than no test. What IS checked, cheaply and
+# deterministically: the extracted trap declaration (verbatim from the
+# shipped script) actually registers `cleanup_scratch` for all three
+# signals, and that function actually empties CLEANUP_PATHS when invoked
+# directly.
+eval "$(sed -n '/^CLEANUP_PATHS=()/,/^trap cleanup_scratch EXIT INT TERM/p' "$REAL")"
+TRAPPED=$(trap -p | grep -c cleanup_scratch)
+[ "$TRAPPED" -eq 3 ] && ok "cleanup_scratch is registered for EXIT, INT and TERM" \
+  || bad "cleanup_scratch is not registered for all three signals" "$(trap -p)"
+SCRATCH_A=$(mktemp -d); SCRATCH_B=$(mktemp)
+CLEANUP_PATHS+=("$SCRATCH_A" "$SCRATCH_B")
+cleanup_scratch
+[ ! -e "$SCRATCH_A" ] && [ ! -e "$SCRATCH_B" ] \
+  && ok "cleanup_scratch() removes every path it was given" \
+  || bad "cleanup_scratch() left a path behind" "a=$([ -e "$SCRATCH_A" ] && echo present) b=$([ -e "$SCRATCH_B" ] && echo present)"
+
+# ─ Secret-gate regex gaps named in #628 ─
+secret_case "github user-to-server token (ghu_)" 'export GITHUB_TOKEN=ghu_16C7e42F292c6912E7710c838347Ae178B4a'
+secret_case "github refresh token (ghr_)"         'export GITHUB_TOKEN=ghr_16C7e42F292c6912E7710c838347Ae178B4a'
+secret_case "stripe restricted key (rk_live_)"    '"stripe_key": "rk_live_51H8xamplekeyvalueabc123"'
+secret_case "slack rotation token (xoxe-)"        'export SLACK_TOKEN=xoxe-1-abcdefghijklmnopqrstuvwxyz'
+secret_case "AWS STS temp key (ASIA)"             'aws_key = ASIAABCDEFGHIJKLMNOP'
+secret_case "*_PASSPHRASE="                       'export SIGNING_KEY_PASSPHRASE=averylongpassphrasevalue123'
+secret_case "*_PASS="                              'export DB_PASS=averylongpasswordvalue123'
+secret_case "unexported *_KEY="                   'SOME_SERVICE_KEY=abcdefghijklmnop123456'
+secret_case "Authorization: Bearer"               'Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789'
+
+# False-positive reduction: "sk-" needs a word boundary — a long hyphenated
+# value that merely CONTAINS "sk-" as a mid-word substring must not trip
+# the gate (the historical 3.3%-per-commit false-positive driver per #628).
+new_fixture
+printf '{"a":2}\ndesk-configurationabcdefghijklmnopqrstuvwxyz\n' > "$G/foo/container.json"
+run_safety
+case "$OUT" in
+  *"look like a secret"*) bad "false positive: 'desk-...' mid-word match on sk-" "$OUT" ;;
+  *) ok "'sk-' requires a word boundary — 'desk-...' is not flagged" ;;
+esac
+git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1 \
+  && ok "the non-secret 'desk-...' change was committed normally" \
+  || bad "a non-secret change was refused" "$OUT"
+
+# ─ Phase 1's untracked-file exclusions now match phase 2's list (#628) ─
+untracked_excluded_case() { # label, filename, content
+  new_fixture
+  printf '%s' "$3" > "$NCDIR/$2"
+  run_safety
+  manifest=$(latest_snapshot)
+  if find "$manifest" -name '*untracked.tgz' -exec tar tzf {} \; 2>/dev/null | grep -qF "$2"; then
+    bad "phase 1: $1 ($2) was tarred" ""
+  else
+    ok "phase 1: $1 ($2) excluded from every untracked-files tarball"
+  fi
+}
+untracked_excluded_case ".netrc"       ".netrc"        "machine example.com login me password hunter2"
+untracked_excluded_case "SSH key"      "id_rsa"        "-----BEGIN OPENSSH PRIVATE KEY-----"
+untracked_excluded_case "prod.env"     "prod.env"      "SECRET=abc"
+untracked_excluded_case "secrets.yaml" "secrets.yaml"  "password: abc"
 
 echo
 [ "$FAILED" -eq 0 ] && echo "git-safety-selfcheck: all checks passed" || echo "git-safety-selfcheck: FAILURES"
