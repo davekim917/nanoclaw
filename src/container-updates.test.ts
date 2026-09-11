@@ -22,6 +22,13 @@ import {
   type AuditItem,
 } from './container-updates.js';
 
+// Extracts a pinned checksum ARG's name from a Dockerfile line. The hex value
+// stops at a trailing word boundary, not end-of-line: the updater's own
+// read/rewrite regexes (container-updates.ts:949, :960) don't anchor the
+// end either, so `ARG X_SHA256_amd64=<hex>  # comment` is a valid, updatable
+// pin to the updater and must be recognized as one here too.
+const DOCKERFILE_SHA_ARG_RE = /^ARG\s+([A-Za-z0-9_]+)=[0-9a-f]{64}(?=\s|$)/gm;
+
 describe('latest-stable release policy', () => {
   it('rejects npm prerelease latest tags instead of silently selecting them', () => {
     expect(latestStableNpmVersion({ 'dist-tags': { latest: '3.0.0-rc.1' } })).toEqual({
@@ -305,13 +312,29 @@ describe('tracked repository update surfaces', () => {
     const sources = JSON.parse(await readFile(path.join(root, 'container', 'update-sources.json'), 'utf8')) as {
       dockerfile: Array<{ checksums?: Array<{ arg: string }> }>;
     };
-    const dockerfileShaArgs = new Set(
-      [...dockerfile.matchAll(/^ARG\s+([A-Za-z0-9_]+)=[0-9a-f]{64}$/gm)].map((match) => match[1]),
-    );
+    const dockerfileShaArgs = new Set([...dockerfile.matchAll(DOCKERFILE_SHA_ARG_RE)].map((match) => match[1]));
     const registeredShaArgs = new Set(
       sources.dockerfile.flatMap((entry) => (entry.checksums ?? []).map((checksum) => checksum.arg)),
     );
     expect(registeredShaArgs).toEqual(dockerfileShaArgs);
+  });
+
+  it('recognizes a checksum ARG that carries a trailing comment, matching what the updater itself accepts', () => {
+    // Regression: the extraction regex anchored the hex value on `$` (end of
+    // line), so `ARG X_SHA256_amd64=<hex>  # pinned, see release notes` would
+    // NOT be recognized as a checksum ARG here — silently exempting exactly
+    // the kind of line this invariant exists to police. The updater's own
+    // regexes that read and rewrite these ARGs (container-updates.ts:949,
+    // :960) don't anchor the end either, so a commented pin is a perfectly
+    // valid, updatable line to the updater. The extraction now stops at a
+    // trailing word boundary (`(?=\s|$)`) instead of end-of-line, so it sees
+    // exactly what the updater sees.
+    const dockerfile = [
+      'ARG SOME_TOOL_VERSION=1.0.0',
+      `ARG SOME_TOOL_SHA256_amd64=${'a'.repeat(64)}  # pinned, regenerate on bump`,
+    ].join('\n');
+    const shaArgs = new Set([...dockerfile.matchAll(DOCKERFILE_SHA_ARG_RE)].map((match) => match[1]));
+    expect(shaArgs.has('SOME_TOOL_SHA256_amd64')).toBe(true);
   });
 });
 
