@@ -41,6 +41,8 @@ export interface ArchiveProjectionResponse {
   bytes?: number;
   ms?: number;
   sinceRowid?: number | null;
+  /** 'seeded' only (#667): the sibling projection this session was copied from. */
+  seededFrom?: string | null;
   error?: string;
 }
 
@@ -64,6 +66,7 @@ port.on('message', (message: ArchiveProjectionRequest) => {
       bytes: result.bytes,
       ms: result.ms,
       sinceRowid: result.sinceRowid,
+      seededFrom: result.seededFrom,
     } satisfies ArchiveProjectionResponse);
   } catch (error) {
     port.postMessage({
