@@ -70,7 +70,13 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   old_tree="$remote_sha"
   [ "$old_tree" = "$ZERO_SHA" ] && old_tree="$EMPTY_TREE_SHA"
 
-  diff_text=$(LC_ALL=C git diff --no-color --text --no-ext-diff --no-textconv "$old_tree" "$local_sha" 2>/dev/null)
+  # --src-prefix/--dst-prefix pinned explicitly: the header exclusion in
+  # _wiki_secret_scan_added_lines only recognizes `+++ b/...`/`+++ "b/..."`
+  # /`+++ /dev/null` — the shapes git emits with its DEFAULT prefixes. A
+  # user's diff.noprefix or diff.mnemonicPrefix config would change that
+  # shape (diff.noprefix drops "b/" entirely) and make the exclusion miss
+  # the real header.
+  diff_text=$(LC_ALL=C git diff --no-color --text --no-ext-diff --no-textconv --src-prefix=a/ --dst-prefix=b/ "$old_tree" "$local_sha" 2>/dev/null)
   [ -n "$diff_text" ] || continue
 
   block_hits=$(secret_scan_block_hits "$diff_text")

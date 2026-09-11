@@ -189,6 +189,79 @@ case "$PUSH_OUT" in
   *) bad "missing pattern file: no explanation printed" "$PUSH_OUT" ;;
 esac
 
+# ═══ The '+++ ' header exclusion, narrowed the same way as
+# scripts/lib/secret-scan.sh (nanoclaw-v2#658 round 2) ══════════════════════
+# An ADDED line is itself printed as `+` followed by its own content, so a
+# real added line whose content starts with "++ " becomes "+++ ..." on the
+# wire — syntactically identical to a `+++ ` diff header. Verified: the
+# blanket `^\+\+\+ ` exclusion this used to carry drops this exact line.
+new_fixture
+install_hook
+BEFORE_TIP=$(remote_tip)
+printf '++ %s\n' 'export SLACK_APP_TOKEN=xapp-1-A0123-4567890123-abcdefabcdefabcdefabcdefabcdef' >> "$WIKI/README.md"
+git -C "$WIKI" commit -qam "an added line starting with ++ "
+push_main
+[ "$PUSH_RC" -ne 0 ] && ok "an added line starting with '++ ' is still blocked, not mistaken for a header" \
+  || bad "an added line starting with '++ ' slipped through (header-exclusion hole)" "$PUSH_OUT"
+[ "$(remote_tip)" = "$BEFORE_TIP" ] && ok "'++ '-prefixed secret: remote unchanged" \
+  || bad "'++ '-prefixed secret: remote advanced" ""
+
+# LC_ALL=C counts BYTES for a character class — a 3-byte UTF-8 smart quote
+# can burn most of a small {0,N} budget on its own; {0,3} in the WARN
+# pattern's last alternative let this exact line slip past under
+# LC_ALL=C though it matched under a UTF-8 locale. Widened to {0,6}.
+new_fixture
+install_hook
+BEFORE_TIP=$(remote_tip)
+printf '“password” : hunter2x\n' >> "$WIKI/README.md"
+git -C "$WIKI" commit -qam "a smart-quote password-shaped line"
+push_main
+[ "$PUSH_RC" -eq 0 ] && ok "smart-quote WARN line: push allowed" \
+  || bad "smart-quote WARN line: push blocked" "$PUSH_OUT"
+case "$PUSH_OUT" in
+  *"WARNING"*) ok "smart-quote WARN line: still caught under LC_ALL=C" ;;
+  *) bad "smart-quote WARN line: not caught (LC_ALL=C byte-budget regression)" "$PUSH_OUT" ;;
+esac
+[ "$(remote_tip)" != "$BEFORE_TIP" ] && ok "smart-quote WARN line: remote advanced" \
+  || bad "smart-quote WARN line: remote did not advance" ""
+
+# A file whose path happens to look like an sk- secret, already tracked
+# (this repeats the wiki's actual push shape — an edit, not a new file),
+# must not be scanned via its own `+++ b/<path>` header line.
+new_fixture
+install_hook
+mkdir -p "$WIKI/tasks"
+echo placeholder > "$WIKI/tasks/sk-learn-migration-plan-2026.md"
+git -C "$WIKI" add tasks/sk-learn-migration-plan-2026.md
+git -C "$WIKI" commit -qm "add placeholder task file"
+git -C "$WIKI" push -q origin main
+BEFORE_TIP=$(remote_tip)
+printf 'ordinary planning notes, nothing secret here\n' >> "$WIKI/tasks/sk-learn-migration-plan-2026.md"
+git -C "$WIKI" commit -qam "edit the sk--looking file"
+push_main
+[ "$PUSH_RC" -eq 0 ] && ok "sk--looking header path: push allowed" \
+  || bad "sk--looking header path: push blocked (header misread as content)" "$PUSH_OUT"
+[ "$(remote_tip)" != "$BEFORE_TIP" ] && ok "sk--looking header path: remote advanced" \
+  || bad "sk--looking header path: remote did not advance" ""
+
+# git C-quotes a path containing non-ASCII bytes in its diff header
+# (`+++ "b/café.md"` rather than `+++ b/café.md`) — the exclusion must
+# recognize that quoted form too.
+new_fixture
+install_hook
+printf 'placeholder\n' > "$WIKI/café.md"
+git -C "$WIKI" add café.md
+git -C "$WIKI" commit -qm "add cafe placeholder"
+git -C "$WIKI" push -q origin main
+BEFORE_TIP=$(remote_tip)
+printf 'ordinary content, nothing secret here\n' >> "$WIKI/café.md"
+git -C "$WIKI" commit -qam "edit the non-ASCII-named file"
+push_main
+[ "$PUSH_RC" -eq 0 ] && ok "quoted-path header: push allowed" \
+  || bad "quoted-path header: push blocked (header misread as content)" "$PUSH_OUT"
+[ "$(remote_tip)" != "$BEFORE_TIP" ] && ok "quoted-path header: remote advanced" \
+  || bad "quoted-path header: remote did not advance" ""
+
 # ═══ Installer: idempotent re-run ═══════════════════════════════════════════
 new_fixture
 install_hook
