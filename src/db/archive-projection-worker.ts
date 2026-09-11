@@ -123,6 +123,7 @@ class ArchiveProjectionWorker {
           bytes: message.bytes ?? 0,
           ms: message.ms ?? 0,
           sinceRowid: message.sinceRowid ?? null,
+          seededFrom: message.seededFrom ?? null,
         });
       } else {
         pending.reject(new Error(message.error ?? 'Archive projection build failed'));
@@ -193,7 +194,23 @@ export async function ensureArchiveProjection(
   }
 
   const scope = workgroupMemberIds?.length ?? null;
-  if (result.mode === 'reused') {
+  if (result.mode === 'seeded') {
+    // Distinct log mode (#667): production can grep this apart from ordinary
+    // 'reused'/'appended' traffic to confirm a fresh session avoided the
+    // full-build path.
+    log.info('Archive projection seeded', {
+      agentGroupId,
+      dstPath,
+      seededFrom: result.seededFrom,
+      rows: result.rows,
+      merged: result.merged,
+      bytes: result.bytes,
+      ms: result.ms,
+      sinceRowid: result.sinceRowid,
+      offThread,
+      scope,
+    });
+  } else if (result.mode === 'reused') {
     log.info('Archive projection reused', {
       agentGroupId,
       dstPath,
