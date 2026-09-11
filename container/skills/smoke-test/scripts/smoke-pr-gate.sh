@@ -1017,7 +1017,12 @@ evaluate_pr() {
       size_determinable=false
       size_fail_reason="the freeze target diff is truncated (>=300 files)"
     else
-      size_files_json="$(jq -c '[.files[].filename]' <<<"$target_files_json" 2>/dev/null || printf '[]')"
+      # Both the new AND previous path matter: a renamed file (status
+      # "renamed") carries `previous_filename`, and a file moved OUT of a
+      # `full` path (e.g. a migration or a scope module renamed into a UI
+      # folder) must still classify off where it came from, not just where
+      # it landed — classifying by new path alone could read as `light`.
+      size_files_json="$(jq -c '[.files[] | .filename, (.previous_filename // empty)]' <<<"$target_files_json" 2>/dev/null || printf '[]')"
     fi
   else
     if [ "$files_fetch_failed" = true ]; then
@@ -1027,7 +1032,9 @@ evaluate_pr() {
       size_determinable=false
       size_fail_reason="the PR file list is truncated (>=100 files)"
     else
-      size_files_json="$(jq -c '[.[].filename]' <<<"$files_json" 2>/dev/null || printf '[]')"
+      # See the freeze branch above: a rename's `previous_filename` must also
+      # be checked, or a file moved OUT of a `full` path is missed entirely.
+      size_files_json="$(jq -c '[.[] | .filename, (.previous_filename // empty)]' <<<"$files_json" 2>/dev/null || printf '[]')"
     fi
   fi
   local size_out campaign_size campaign_size_reason

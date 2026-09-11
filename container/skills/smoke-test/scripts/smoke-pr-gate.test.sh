@@ -1521,6 +1521,14 @@ bash "$GATE" check 300 | jq -e '
   .sizeReason == "standard: backend/service/handler.ts not matched by lightAllowed"
 ' >/dev/null
 
+# --- 27a. A rename out of a `full` path is sized off BOTH paths: previous
+# path matches `full`, new path matches `lightAllowed` -- must still be full.
+export STUB_PR_FILES='[{"filename":"frontend/moved.tsx","previous_filename":"backend/migrations/1_x.sql","status":"renamed"}]'
+bash "$GATE" check 300 | jq -e '
+  .campaignSize == "full" and
+  .sizeReason == "full: backend/migrations/1_x.sql matched backend/migrations/**"
+' >/dev/null
+
 # --- 28. Own-diff fetch failure: fails closed to full, independent of rules -
 export STUB_PR_FILES_EXIT=1
 bash "$GATE" check 300 | jq -e '
