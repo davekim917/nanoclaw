@@ -84,6 +84,27 @@ function readHostRiskGlobs(): string[] {
  */
 const coverageRequested = process.argv.some((arg) => arg === '--coverage' || arg.startsWith('--coverage.'));
 
+/**
+ * coverage-v8's whole-worker instrumentation (see readHostRiskGlobs's comment above)
+ * slows every test's CPU-bound work under `--coverage`, generically — not just the one
+ * test this was first caught on. Measured on this host: the two heaviest cases in
+ * src/db/transaction-closures.test.ts (a full ts.Program built inside the test body)
+ * went from a few hundred ms uninstrumented to 8.4s/10.0s under coverage; CI's own run
+ * (PR #662) measured one of the two at 18.1s, up from a normal 5.1s. 4x — not 3x —
+ * is what actually covers that CI number: 3 × vitest's 5000ms default testTimeout is
+ * 15000ms, less than the 18100ms CI observed, which would have reproduced the exact
+ * timeout this exists to prevent. `hookTimeout` gets the same multiplier for
+ * consistency, though nothing here specifically implicated hooks.
+ *
+ * `NANOCLAW_COVERAGE_TIMEOUT_MULTIPLIER` carries this same number into the test
+ * process's env (ONLY when coverage is requested) so src/test-timeout-scale.ts's
+ * `scaledTimeout()` — for the handful of tests with their OWN explicit timeout, which
+ * vitest lets override `testTimeout` entirely and therefore never inherits this config
+ * block's scaling on its own — can apply the identical multiplier instead of a second,
+ * separately-maintained number.
+ */
+const COVERAGE_TIMEOUT_MULTIPLIER = 4;
+
 export default defineConfig({
   test: {
     setupFiles: ['src/test-hermeticity.ts', 'src/test-setup.ts'],
@@ -126,6 +147,11 @@ export default defineConfig({
     // Tests within a file still run concurrently; only cross-file parallelism
     // is off. Measured cost: ~9 minutes for the full suite.
     fileParallelism: false,
+    // Scaled under --coverage only (see COVERAGE_TIMEOUT_MULTIPLIER above) — a plain
+    // `vitest run` gets vitest's own unmodified defaults (5000/10000), not these.
+    testTimeout: coverageRequested ? 5000 * COVERAGE_TIMEOUT_MULTIPLIER : undefined,
+    hookTimeout: coverageRequested ? 10000 * COVERAGE_TIMEOUT_MULTIPLIER : undefined,
+    env: coverageRequested ? { NANOCLAW_COVERAGE_TIMEOUT_MULTIPLIER: String(COVERAGE_TIMEOUT_MULTIPLIER) } : {},
     // `coverage.enabled` defaults to false — this block only takes effect when a
     // caller passes `--coverage` (scripts/check-risk-coverage.ts, the `pnpm run
     // test:coverage:risk` script, or CI's coverage step), so a plain `vitest run`

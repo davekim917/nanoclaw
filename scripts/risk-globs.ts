@@ -56,6 +56,16 @@ const KNOWN_NON_CODE_GLOBS: ReadonlySet<string> = new Set([
   '.public-boundary-allowlist.json',
   'container/skills/pr-review-loop/**',
   'docs/review-policy.md',
+  // Executable agent/tool config added to risk:high by #660 — a hook, an
+  // auto-trusted MCP server, Claude Code's own trust state, a ripgrep config, and a
+  // submodule URL (see .github/labeler.yml's own comment on this block). None of
+  // these is source this repo's own test suites instrument; they are config other
+  // tools read.
+  '.claude/**',
+  '.mcp.json',
+  '.claude.json',
+  '.ripgreprc',
+  '.gitmodules',
   // The coverage baseline itself: docs/specs/risk-based-review/plan.md, "Tests on
   // risky paths" — a PR that deletes tests should not also get to delete the
   // evidence, so this file is on risk:high, but it carries no line coverage.

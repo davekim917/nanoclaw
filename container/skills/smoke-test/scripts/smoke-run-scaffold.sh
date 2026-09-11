@@ -11,13 +11,22 @@
 # silent reversion to vibes is worse than no gate.
 #
 #   smoke-run-scaffold.sh contract    <run-dir> <source-sha> <lane>[:kind[:title]]... [--regenerate]
-#   smoke-run-scaffold.sh marker      <run-dir> <lane-id> <status> [summary] [evidence-csv]
+#   smoke-run-scaffold.sh marker      <run-dir> <lane-id> <status> [summary] [evidence-csv] [--confirmed-findings <id>[,<id>...]]
 #   smoke-run-scaffold.sh redispatch  <run-dir> <lane-id>
 #
 # The marker verb reads sourceSha from the contract rather than taking it as
 # an argument. A worker therefore cannot stamp a marker with a build it was
 # not assigned, which is the property the barrier's SHA check exists to
 # enforce and the one freehand markers dropped.
+#
+# `--confirmed-findings` writes the marker's `confirmedFindings` array, which
+# smoke-evidence-barrier.sh's finding_clip_problem() then requires a
+# `clips/<id>.mp4` or `clip-skipped: <id>: <reason>` entry for, per id, in
+# `evidence`. Omit the flag entirely and the field is omitted too — hand-
+# writing a marker is refused for provenance (see below), so before this flag
+# existed the barrier's clip check had no writer and was structurally
+# unreachable, exactly the "enforcing a field nothing could emit" failure
+# mode the LANE GENERATIONS section below describes for `generation`.
 #
 # LANE GENERATIONS. smoke-evidence-barrier.sh validates a marker's
 # `.generation` against the contract's `.lanes[].generation`, which closes two
@@ -44,13 +53,25 @@
 # would make a re-dispatch look identical to a lane that never ran.
 set -euo pipefail
 
-# `--regenerate` may appear anywhere in the argument list, same convention as
-# `--takeover` in the gate scripts, so no verb has to know its position and a
-# stale positional can never mean "retire every marker".
+# `--regenerate` and `--confirmed-findings <csv>` may appear anywhere in the
+# argument list, same convention as `--takeover` in the gate scripts, so no
+# verb has to know its position and a stale positional can never mean
+# "retire every marker" or "these findings are confirmed".
 REGENERATE=false
+CONFIRMED_FINDINGS_CSV=""
+_CF_WANT_VALUE=false
 _ARGS=()
 for _a in "$@"; do
-  if [ "$_a" = "--regenerate" ]; then REGENERATE=true; else _ARGS+=("$_a"); fi
+  if [ "$_CF_WANT_VALUE" = true ]; then
+    CONFIRMED_FINDINGS_CSV="$_a"
+    _CF_WANT_VALUE=false
+    continue
+  fi
+  case "$_a" in
+    --regenerate) REGENERATE=true ;;
+    --confirmed-findings) _CF_WANT_VALUE=true ;;
+    *) _ARGS+=("$_a") ;;
+  esac
 done
 set -- ${_ARGS[@]+"${_ARGS[@]}"}
 
@@ -58,6 +79,10 @@ COMMAND="${1:-}"
 RUN_DIR="${2:-}"
 
 die() { jq -cn --arg e "$1" '{ok:false,error:$e}'; exit 2; }
+
+[ "$_CF_WANT_VALUE" = false ] || die "--confirmed-findings requires a value"
+[ -z "$CONFIRMED_FINDINGS_CSV" ] || [ "$COMMAND" = marker ] ||
+  die "--confirmed-findings is only valid with the marker command"
 
 iso_now() { date -u +'%Y-%m-%dT%H:%M:%SZ'; }
 
@@ -388,6 +413,20 @@ marker)
   EVIDENCE="$(printf '%s\n' "$EVIDENCE_CSV" | jq -Rc 'split(",") | map(select(length > 0))')"
   NOW="$(iso_now)"
 
+  # `--confirmed-findings` is optional; omitting it omits `confirmedFindings`
+  # from the marker entirely (CONFIRMED_FINDINGS stays the JSON `null`
+  # sentinel below, never an empty array) — every marker written before this
+  # flag existed round-trips unchanged, and the barrier's finding_clip_problem
+  # already treats a marker with no such key as unaffected.
+  CONFIRMED_FINDINGS=null
+  if [ -n "$CONFIRMED_FINDINGS_CSV" ]; then
+    CONFIRMED_FINDINGS="$(printf '%s\n' "$CONFIRMED_FINDINGS_CSV" | jq -Rc 'split(",") | map(select(length > 0))')"
+    jq -e 'length > 0' <<<"$CONFIRMED_FINDINGS" >/dev/null 2>&1 ||
+      die "--confirmed-findings requires at least one non-empty id"
+    jq -e 'all(.[]; test("^[A-Za-z0-9_-]+$"))' <<<"$CONFIRMED_FINDINGS" >/dev/null 2>&1 ||
+      die "--confirmed-findings ids must be alphanumeric/dash/underscore: $CONFIRMED_FINDINGS_CSV"
+  fi
+
   mkdir -p "$RUN_DIR/markers"
   archive_prior_marker_if_superseded "$RUN_DIR/markers/$LANE.json" "$GENERATION"
   tmp="$(mktemp "$RUN_DIR/markers/.marker.XXXXXX")"
@@ -399,6 +438,7 @@ marker)
     --arg summary "$SUMMARY" \
     --argjson evidence "$EVIDENCE" \
     --argjson generation "$GENERATION" \
+    --argjson confirmedFindings "$CONFIRMED_FINDINGS" \
     '{schemaVersion:1,
       lane:$lane,
       sourceSha:$sha,
@@ -407,11 +447,13 @@ marker)
       completedAt:$now,
       finishedAt:$now,
       summary:(if $summary == "" then null else $summary end),
-      evidence:$evidence}' > "$tmp"
+      evidence:$evidence}
+      + (if $confirmedFindings == null then {} else {confirmedFindings:$confirmedFindings} end)' > "$tmp"
   mv "$tmp" "$RUN_DIR/markers/$LANE.json"
   jq -cn --arg lane "$LANE" --arg sha "$SOURCE_SHA" --arg status "$STATUS" \
-    --argjson generation "$GENERATION" \
-    '{ok:true,lane:$lane,sourceSha:$sha,generation:$generation,status:$status}'
+    --argjson generation "$GENERATION" --argjson confirmedFindings "$CONFIRMED_FINDINGS" \
+    '{ok:true,lane:$lane,sourceSha:$sha,generation:$generation,status:$status}
+      + (if $confirmedFindings == null then {} else {confirmedFindings:$confirmedFindings} end)'
   ;;
 
 redispatch)

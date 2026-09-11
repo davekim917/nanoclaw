@@ -227,6 +227,12 @@ jq -e --arg sha "$SHA" '
 jq -e '.evidence == [] and .summary == "wallet math deviates"' \
   "$FIXTURE_DIR/markers/S1.json" >/dev/null
 
+# Neither marker above passed --confirmed-findings; the field must be
+# entirely absent, not an empty array — that's what makes every marker
+# written before this flag existed round-trip unchanged.
+jq -e 'has("confirmedFindings") | not' "$FIXTURE_DIR/markers/B1.json" >/dev/null || {
+  echo "expected no --confirmed-findings flag to omit the field entirely" >&2; exit 1; }
+
 barrier "$FIXTURE_DIR" lanes | jq -e '.ready == true' >/dev/null
 
 if barrier "$FIXTURE_DIR" synthesis >/dev/null 2>&1; then
@@ -418,5 +424,56 @@ OUT="$(SMOKE_LANE_ROLE=challenger scaffold redispatch "$FRESH" B2 2>&1 || true)"
 jq -e '.ok == false and (.error | test("SMOKE_LANE_ROLE"))' <<<"$OUT" >/dev/null
 OUT="$(scaffold redispatch "$FRESH" NOPE 2>&1 || true)"
 jq -e '.ok == false and (.error | test("not declared"))' <<<"$OUT" >/dev/null
+
+# --confirmed-findings: the only writer of smoke-evidence-barrier.sh's
+# finding_clip_problem() input. Isolated fixture — a marker with
+# confirmedFindings set changes what the barrier's `lanes` phase requires,
+# so this must not share state with the FIXTURE_DIR/FRESH assertions above.
+CLIP="$(dirname "$FIXTURE_DIR")/clip-fixture"
+mkdir -p "$CLIP/clips"
+gate_owns "$(basename "$CLIP")"
+scaffold contract "$CLIP" "$SHA" B1:browser >/dev/null
+
+scaffold marker "$CLIP" B1 fail 'two confirmed findings' --confirmed-findings F1,F2 \
+  | jq -e '.ok == true and .confirmedFindings == ["F1","F2"]' >/dev/null || {
+  echo "expected --confirmed-findings to appear in the ok:true result" >&2; exit 1; }
+jq -e '.confirmedFindings == ["F1","F2"]' "$CLIP/markers/B1.json" >/dev/null || {
+  echo "expected confirmedFindings to be written into the marker" >&2; exit 1; }
+
+# Same convention as --regenerate: works from any position in the argument
+# list, not just trailing.
+scaffold marker "$CLIP" --confirmed-findings F3 B1 fail 'repositioned flag' >/dev/null
+jq -e '.confirmedFindings == ["F3"]' "$CLIP/markers/B1.json" >/dev/null || {
+  echo "expected --confirmed-findings to work from any argument position" >&2; exit 1; }
+
+# Malformed input is refused, not silently coerced.
+if scaffold marker "$CLIP" B1 fail 'bad ids' --confirmed-findings 'not an id!' >/dev/null 2>&1; then
+  echo "expected a non-alphanumeric finding id to be refused" >&2; exit 1
+fi
+if scaffold marker "$CLIP" B1 fail 'no value' --confirmed-findings >/dev/null 2>&1; then
+  echo "expected a trailing --confirmed-findings with no value to be refused" >&2; exit 1
+fi
+if scaffold contract "$CLIP" "$SHA" B1:browser --confirmed-findings F1 --regenerate >/dev/null 2>&1; then
+  echo "expected --confirmed-findings on a non-marker command to be refused" >&2; exit 1
+fi
+
+# End to end: the barrier actually enforces what the scaffold just wrote.
+# F3 has no clip and no clip-skipped line yet — the lanes phase must refuse.
+barrier "$CLIP" lanes >/dev/null 2>&1 && {
+  echo "expected the barrier to refuse a confirmed finding with no clip evidence" >&2; exit 1; }
+
+# A stated clip-skipped reason (still written through the scaffold's normal
+# evidence-csv positional, since it is just another evidence-array string)
+# clears the barrier with no clip file.
+scaffold marker "$CLIP" B1 fail 'skipped clip' 'clip-skipped: F3: no browser lease' \
+  --confirmed-findings F3 >/dev/null
+barrier "$CLIP" lanes | jq -e '.ready == true' >/dev/null || {
+  echo "expected a stated clip-skipped reason to clear the barrier" >&2; exit 1; }
+
+# A real, nonempty clip file also clears it.
+printf 'fake mp4 bytes\n' >"$CLIP/clips/F3.mp4"
+scaffold marker "$CLIP" B1 fail 'real clip' 'clips/F3.mp4' --confirmed-findings F3 >/dev/null
+barrier "$CLIP" lanes | jq -e '.ready == true' >/dev/null || {
+  echo "expected a real clip file to clear the barrier" >&2; exit 1; }
 
 echo "smoke run scaffold tests passed"
