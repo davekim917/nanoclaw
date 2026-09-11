@@ -235,3 +235,9 @@ Known risks carried to ship: stale fingerprint until host restart; chmod residua
 - Rule 4 over the 38 current topic installs (read-only): it accepts the 25 x64 trees and the one with no native packages, and refuses exactly the 10 arm64 and 2 mixed trees.
 - Other-family review (Codex CLI): **clear**. One NIT, which needs no change: `platformListAccepts` skips non-string list entries, where npm's `checkList` would throw. That is reachable only with malformed lockfile data npm itself cannot produce.
 - PR **#632**.
+
+## 2026-09-11 — /team-build (Phase 2)
+
+- Approved plan: `docs/specs/repository-branch-clones/plan.md`, revision 2 with corrections through rev 2.4. The Phase 2 precondition is met: Phase 1 was merged in #625 and #632, deployed, and set to `NANOCLAW_DEPENDENCY_CACHE=apply` at 2026-09-11 12:25Z. The first apply pass adopted 4, converted 1, with 0 mismatches. A production farm was verified to share inodes with its entry, with a private hidden lockfile.
+- Worktree `.claude/worktrees/branch-clones`, branch `feat/repository-branch-clones`, base `04ae8a871` (origin/main). The live checkout is untouched.
+- The one definition the plan leaves to this build is the strict completeness rule for link-at-checkout (§5.7.5), defined below once built.

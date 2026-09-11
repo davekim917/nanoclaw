@@ -554,3 +554,81 @@ export function writeOriginPin(
     }
   }
 }
+
+// ── Checkout layout (plan §5.1) ──────────────────────────────────────────────
+//
+// `worktrees/<repo>` is the thread's primary checkout and `worktrees/<repo>@<slug>`
+// any other branch's; `@` is outside SAFE_SEGMENT, so names parse unambiguously.
+// Duplicated on purpose in container/agent-runner/src/mcp-tools/checkout-layout.ts,
+// and both copies are pinned by checkout-layout.fixtures.json beside it.
+
+const CHECKOUT_SLUG = /^[A-Za-z0-9._-]+$/;
+const CHECKOUT_SLUG_MAX_CHARS = 80;
+
+export type CheckoutShape = 'clone' | 'linked' | 'unknown';
+
+export interface TopicCheckout {
+  name: string;
+  repo: string;
+  slug: string | null;
+  path: string;
+  shape: CheckoutShape;
+}
+
+/** `<repo>` for no branch, else `<repo>@<slug>`. A lossy slug carries the branch's hash, so `feat/x` and `feat-x` never collide. */
+export function checkoutDirName(repo: string, branch: string | null): string {
+  if (branch === null) return repo;
+  let slug = branch
+    .replace(/[^A-Za-z0-9._-]/g, '-')
+    .replace(/^[^A-Za-z0-9]+/, '')
+    .slice(0, CHECKOUT_SLUG_MAX_CHARS);
+  if (slug !== branch) slug += `-${createHash('sha256').update(branch, 'utf8').digest('hex').slice(0, 8)}`;
+  return `${repo}@${slug}`;
+}
+
+/** `{repo, slug}` for a checkout dir name; `null` for anything else, every dot-prefixed name included. */
+export function parseCheckoutDirName(name: string): { repo: string; slug: string | null } | null {
+  if (name.startsWith('.')) return null;
+  const at = name.indexOf('@');
+  const repo = at === -1 ? name : name.slice(0, at);
+  if (!SAFE_SEGMENT.test(repo)) return null;
+  if (at === -1) return { repo, slug: null };
+  const slug = name.slice(at + 1);
+  return CHECKOUT_SLUG.test(slug) ? { repo, slug } : null;
+}
+
+/**
+ * The only enumerator of a topic's checkouts: directories whose names parse,
+ * each with the shape its `.git` gives it (a directory is a clone, a file a
+ * linked worktree, anything else `unknown`). A missing topic dir has none; any
+ * other read failure throws, so no caller can mistake "unreadable" for "empty".
+ */
+export function listTopicCheckouts(topicWorktreesDir: string): TopicCheckout[] {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(topicWorktreesDir, { withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw err;
+  }
+  const checkouts: TopicCheckout[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const parsed = parseCheckoutDirName(entry.name);
+    if (!parsed) continue;
+    const checkoutPath = path.join(topicWorktreesDir, entry.name);
+    checkouts.push({ name: entry.name, ...parsed, path: checkoutPath, shape: checkoutShape(checkoutPath) });
+  }
+  return checkouts.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function checkoutShape(checkoutPath: string): CheckoutShape {
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(path.join(checkoutPath, '.git'));
+  } catch {
+    return 'unknown';
+  }
+  if (stat.isDirectory()) return 'clone';
+  return stat.isFile() ? 'linked' : 'unknown';
+}

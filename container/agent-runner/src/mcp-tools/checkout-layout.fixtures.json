@@ -1,0 +1,191 @@
+{
+  "$comment": "Shared vectors for the checkout layout primitive (plan §5.1): the host copy (src/repository-workspaces.ts) and the container copy (container/agent-runner/src/mcp-tools/checkout-layout.ts) must both reproduce every entry. Regenerate only with a plan change.",
+  "checkoutDirName": [
+    {
+      "repo": "app",
+      "branch": null,
+      "name": "app"
+    },
+    {
+      "repo": "app",
+      "branch": "main",
+      "name": "app@main"
+    },
+    {
+      "repo": "app",
+      "branch": "feat/x",
+      "name": "app@feat-x-79b4cc55"
+    },
+    {
+      "repo": "app",
+      "branch": "feat-x",
+      "name": "app@feat-x"
+    },
+    {
+      "repo": "app",
+      "branch": "_leading",
+      "name": "app@leading-7072877e"
+    },
+    {
+      "repo": "app",
+      "branch": "release/v1.2.0",
+      "name": "app@release-v1.2.0-e52ed09e"
+    },
+    {
+      "repo": "app",
+      "branch": "UPPER_case.1",
+      "name": "app@UPPER_case.1"
+    },
+    {
+      "repo": "Web.App",
+      "branch": "x",
+      "name": "Web.App@x"
+    },
+    {
+      "repo": "app",
+      "branch": "---",
+      "name": "app@-cb3f91d5"
+    },
+    {
+      "repo": "app",
+      "branch": "fix/é",
+      "name": "app@fix---8c8a071a"
+    },
+    {
+      "repo": "app",
+      "branch": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "name": "app@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-28165978"
+    },
+    {
+      "repo": "api-server",
+      "branch": "dependabot/npm_and_yarn/lodash-4.17.21",
+      "name": "api-server@dependabot-npm_and_yarn-lodash-4.17.21-b7180b7c"
+    }
+  ],
+  "parseCheckoutDirName": [
+    {
+      "name": "app",
+      "expected": {
+        "repo": "app",
+        "slug": null
+      }
+    },
+    {
+      "name": "app@main",
+      "expected": {
+        "repo": "app",
+        "slug": "main"
+      }
+    },
+    {
+      "name": "app@feat-x-79b4cc55",
+      "expected": {
+        "repo": "app",
+        "slug": "feat-x-79b4cc55"
+      }
+    },
+    {
+      "name": "app@feat-x",
+      "expected": {
+        "repo": "app",
+        "slug": "feat-x"
+      }
+    },
+    {
+      "name": "app@leading-7072877e",
+      "expected": {
+        "repo": "app",
+        "slug": "leading-7072877e"
+      }
+    },
+    {
+      "name": "app@release-v1.2.0-e52ed09e",
+      "expected": {
+        "repo": "app",
+        "slug": "release-v1.2.0-e52ed09e"
+      }
+    },
+    {
+      "name": "app@UPPER_case.1",
+      "expected": {
+        "repo": "app",
+        "slug": "UPPER_case.1"
+      }
+    },
+    {
+      "name": "Web.App@x",
+      "expected": {
+        "repo": "Web.App",
+        "slug": "x"
+      }
+    },
+    {
+      "name": "app@-cb3f91d5",
+      "expected": {
+        "repo": "app",
+        "slug": "-cb3f91d5"
+      }
+    },
+    {
+      "name": "app@fix---8c8a071a",
+      "expected": {
+        "repo": "app",
+        "slug": "fix---8c8a071a"
+      }
+    },
+    {
+      "name": "app@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-28165978",
+      "expected": {
+        "repo": "app",
+        "slug": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-28165978"
+      }
+    },
+    {
+      "name": "api-server@dependabot-npm_and_yarn-lodash-4.17.21-b7180b7c",
+      "expected": {
+        "repo": "api-server",
+        "slug": "dependabot-npm_and_yarn-lodash-4.17.21-b7180b7c"
+      }
+    },
+    {
+      "name": ".staging",
+      "expected": null
+    },
+    {
+      "name": ".pnpm-store",
+      "expected": null
+    },
+    {
+      "name": ".app.tmp-123",
+      "expected": null
+    },
+    {
+      "name": "app@",
+      "expected": null
+    },
+    {
+      "name": "app@a@b",
+      "expected": null
+    },
+    {
+      "name": "-app",
+      "expected": null
+    },
+    {
+      "name": "app@feat/x",
+      "expected": null
+    },
+    {
+      "name": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expected": null
+    },
+    {
+      "name": "@main",
+      "expected": null
+    },
+    {
+      "name": "app@ space",
+      "expected": null
+    }
+  ]
+}
