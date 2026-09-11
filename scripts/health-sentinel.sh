@@ -16,9 +16,11 @@
 #                    gates fail OPEN on it, so nothing else would say so)
 #   9. timers      — a watched sibling timer stopped firing (opt-in via
 #                    WATCHED_TIMERS; systemd cannot see this for a oneshot)
-#  10. deploy-lag  — runtime changes merged to origin/main that the host is not
-#                    running, or a build it never restarted onto (default 3h;
-#                    DEPLOY_LAG_MAX_S=0 turns it off)
+#  10. deploy-lag  — merges the host is not running: host or agent-runner code
+#                    the build lacks (3h, DEPLOY_LAG_MAX_S), scripts or skills
+#                    the checkout lacks (24h, DEPLOY_LAG_PULL_MAX_S), or a
+#                    build it never restarted onto. DEPLOY_LAG_MAX_S=0 turns
+#                    it off.
 #
 # Log windows are measured by BYTE OFFSET deltas stored in the state file —
 # never by log timestamps (the log has multiple writers stamping different
@@ -341,6 +343,7 @@ fi
 # merge by weeks. A failed fetch falls back to the last-fetched ref, which can
 # only under-report. With no readable BUILD_INFO it falls back to HEAD.
 DEPLOY_LAG_MAX_S="${DEPLOY_LAG_MAX_S:-10800}"
+DEPLOY_LAG_PULL_MAX_S="${DEPLOY_LAG_PULL_MAX_S:-86400}"
 if [ "$DEPLOY_LAG_MAX_S" -gt 0 ] && git rev-parse -q --verify origin/main >/dev/null 2>&1; then
   timeout 30 git fetch --quiet origin main 2>/dev/null || true
   DEPLOYED=$(jq -r '.sha // empty' "$NANOCLAW_DIR/dist/BUILD_INFO.json" 2>/dev/null || true)
@@ -348,22 +351,38 @@ if [ "$DEPLOY_LAG_MAX_S" -gt 0 ] && git rev-parse -q --verify origin/main >/dev/
   # Only merges that change something this host runs are counted. Docs, root
   # markdown, CI config, tests and the reference unit copies in data/systemd/
   # never execute here, and alerting on them would teach the owner to ignore
-  # this vital. Deliberately wider than isMaterialPath() (src/build-info.ts:143),
-  # which answers a narrower question — can a REBUILD change the host — and so
-  # leaves out the runner (container/**) and scripts/, both of which go live
-  # here only through a pull and a restart. Skill markdown under container/
-  # stays in: agents load it.
-  RUNTIME_PATHS=(. ':(exclude)docs' ':(exclude,glob)*.md' ':(exclude).github' ':(exclude)data/systemd' ':(exclude,glob)**/*.test.*')
-  BEHIND=$(git rev-list --count --first-parent "$DEPLOYED"..origin/main -- "${RUNTIME_PATHS[@]}" 2>/dev/null || echo 0)
-  if [ "$BEHIND" -gt 0 ]; then
-    FIRST_MERGE=$( (git log --first-parent --format=%ct "$DEPLOYED"..origin/main -- "${RUNTIME_PATHS[@]}" 2>/dev/null | tail -1) || true)
-    LAG=$((NOW - ${FIRST_MERGE:-$NOW}))
-    if [ "$LAG" -ge "$DEPLOY_LAG_MAX_S" ]; then
-      NOTES=""
-      [ "$(git rev-parse HEAD)" != "$DEPLOYED" ] && NOTES=" The checkout was pulled to $(git rev-parse --short HEAD) but never built — a pull deploys nothing."
-      TRACKED_DIRTY=$(git status --porcelain --untracked-files=no 2>/dev/null | wc -l)
-      [ "$TRACKED_DIRTY" -gt 0 ] && NOTES="$NOTES The live checkout has $TRACKED_DIRTY uncommitted tracked file(s), and deploy.sh refuses until they are committed."
-      BREACHES+=("deploy-lag|$BEHIND merge(s) on origin/main change what this host runs and are not deployed; the oldest merge has waited $((LAG / 3600))h and the host runs $(git rev-parse --short "$DEPLOYED"). Deploy with scripts/deploy.sh (it snapshots for rollback).$NOTES")
+  # this vital. What counts splits by how it goes live:
+  #  - RESTART_PATHS need a build and a restart: the compiled host and
+  #    dashboard (the isMaterialPath() set, src/build-info.ts:143) and
+  #    container/, whose agent-runner is a boot snapshot rather than the
+  #    checkout (src/container-runner.ts:4722). Timed against BUILD_INFO on
+  #    the DEPLOY_LAG_MAX_S bound.
+  #  - Everything else, scripts/ and container/skills/ (mounted from this
+  #    checkout at each spawn, src/container-runner.ts:4729), is live once the
+  #    checkout is pulled and needs no restart of its own. Timed against HEAD
+  #    on the longer DEPLOY_LAG_PULL_MAX_S bound, so it rides the next deploy
+  #    instead of prompting a restart that interrupts live sessions.
+  EXCLUDE=(':(exclude)docs' ':(exclude,glob)*.md' ':(exclude).github' ':(exclude)data/systemd' ':(exclude,glob)**/*.test.*')
+  RESTART_PATHS=(src dashboard package.json pnpm-lock.yaml container ':(exclude)container/skills' "${EXCLUDE[@]}")
+  RUNTIME_PATHS=(. "${EXCLUDE[@]}")
+  merges_behind() { # <from> <pathspec...> -> "<count> <committer time of the first merge>"
+    local from=$1; shift
+    echo "$(git rev-list --count --first-parent "$from"..origin/main -- "$@" 2>/dev/null || echo 0)" \
+      "$( (git log --first-parent --format=%ct "$from"..origin/main -- "$@" 2>/dev/null | tail -1) || true)"
+  }
+  read -r BEHIND FIRST_MERGE <<<"$(merges_behind "$DEPLOYED" "${RESTART_PATHS[@]}")"
+  LAG=$((NOW - ${FIRST_MERGE:-$NOW}))
+  if [ "$BEHIND" -gt 0 ] && [ "$LAG" -ge "$DEPLOY_LAG_MAX_S" ]; then
+    NOTES=""
+    [ "$(git rev-parse HEAD)" != "$DEPLOYED" ] && NOTES=" The checkout was pulled to $(git rev-parse --short HEAD) but never built — a pull deploys nothing."
+    TRACKED_DIRTY=$(git status --porcelain --untracked-files=no 2>/dev/null | wc -l)
+    [ "$TRACKED_DIRTY" -gt 0 ] && NOTES="$NOTES The live checkout has $TRACKED_DIRTY uncommitted tracked file(s), and deploy.sh refuses until they are committed."
+    BREACHES+=("deploy-lag|$BEHIND merge(s) on origin/main change the host or its agent runner and are not deployed; the oldest merge has waited $((LAG / 3600))h and the host runs $(git rev-parse --short "$DEPLOYED"). Deploy with scripts/deploy.sh (it snapshots for rollback, then restarts the service).$NOTES")
+  else
+    read -r PULL_BEHIND PULL_FIRST <<<"$(merges_behind HEAD "${RUNTIME_PATHS[@]}")"
+    PULL_LAG=$((NOW - ${PULL_FIRST:-$NOW}))
+    if [ "$PULL_BEHIND" -gt 0 ] && [ "$PULL_LAG" -ge "$DEPLOY_LAG_PULL_MAX_S" ]; then
+      BREACHES+=("deploy-lag|$PULL_BEHIND merge(s) to scripts or skills have waited $((PULL_LAG / 3600))h for a deploy; the checkout is at $(git rev-parse --short HEAD). None needs a restart of its own, so run scripts/deploy.sh at a quiet moment.")
     fi
   fi
   # A build the service never restarted onto: dist/ moved but the running
