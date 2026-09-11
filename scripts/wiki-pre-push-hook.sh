@@ -145,10 +145,25 @@ scan_range() {
   #    what was actually recorded — so content that exists ONLY in a
   #    conflict resolution (never in either parent) gets scanned too (#666
   #    review H1). Non-merge commits are unaffected by this flag either way.
+  #
+  #    Piped through `tr '\000' ' '` (#666 review P2-A): this whole line is
+  #    captured via `combined_text=$(scan_range ...)` at the call site,
+  #    and bash command substitution silently DROPS NUL bytes rather than
+  #    erroring. A binary file (a PNG's tEXt chunk, confirmed with a real
+  #    fixture; 4 of 20 random binaries reproduced it too) can carry a real
+  #    token with NUL bytes on either side of it — dropping those bytes
+  #    FUSES the token with its neighboring bytes into one long run that no
+  #    longer satisfies any boundary-anchored BLOCK/SECRET_RE alternative.
+  #    Replacing each NUL with a space instead keeps the token's own
+  #    boundaries intact (a space is a valid non-token boundary character
+  #    for every alternative) without doing that fusion. `pipefail` (set at
+  #    the top of this file) keeps `|| rc=$?` reading git's own exit code
+  #    here, not `tr`'s.
   LC_ALL=C git log -p --no-color --text --no-ext-diff --no-textconv \
     --src-prefix=a/ --dst-prefix=b/ --diff-merges=remerge \
     --output-indicator-new="$SECRET_SCAN_NEW_INDICATOR" --output-indicator-old=- --output-indicator-context=' ' \
-    "$local_sha" --not --remotes || rc=$?
+    "$local_sha" --not --remotes \
+    | LC_ALL=C tr '\000' ' ' || rc=$?
   # 1b. Octopus merges (3+ parents) print NOTHING under --diff-merges=remerge
   #     (confirmed by testing, not just documentation — #666 review H1) — a
   #     second, deliberately over-broad pass diffs an octopus merge against
@@ -156,11 +171,14 @@ scan_range() {
   #     still gets scanned even though this isn't isolated to just the
   #     resolution the way remerge is for an ordinary two-parent merge.
   #     --min-parents=3 means this pass touches nothing an ordinary merge or
-  #     single-parent commit already had scanned in step 1 above.
+  #     single-parent commit already had scanned in step 1 above. Same
+  #     NUL-to-space piping as step 1, and for the same reason (#666 review
+  #     P2-A).
   LC_ALL=C git log -p --no-color --text --no-ext-diff --no-textconv \
     --src-prefix=a/ --dst-prefix=b/ --min-parents=3 --diff-merges=first-parent \
     --output-indicator-new="$SECRET_SCAN_NEW_INDICATOR" --output-indicator-old=- --output-indicator-context=' ' \
-    "$local_sha" --not --remotes || rc=$?
+    "$local_sha" --not --remotes \
+    | LC_ALL=C tr '\000' ' ' || rc=$?
   # 2. Every new commit's own message body. `git log -p --format=%B` would
   #    interleave message text with the marked patch lines above, but
   #    --output-indicator-new only touches diff/patch content — message

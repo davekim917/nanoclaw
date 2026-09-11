@@ -140,6 +140,54 @@ function isHostOwned(dir: string): boolean {
 }
 
 /**
+ * Create `path.join(parent, name)` if missing and confirm it is a real,
+ * non-symlink directory — `parent` itself must already be a validated real
+ * directory (the caller's job; see ensureManagedDirChain below). Uses a
+ * NON-recursive mkdirSync deliberately (#666 review P3-1): a recursive
+ * mkdir creates every missing intermediate component in one call, so if
+ * `parent` turned out to be a symlink, the write would already have
+ * happened INSIDE the symlink's target by the time any validation ran
+ * afterward. One component at a time, lstat immediately after each
+ * create, is what keeps validation ahead of every write instead of behind
+ * it.
+ */
+function ensureRealDirectoryComponent(parent: string, name: string): string {
+  const target = path.join(parent, name);
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(target);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    fs.mkdirSync(target, { mode: 0o755 });
+    stat = fs.lstatSync(target);
+  }
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error(`unsafe managed-hooks path component (not a real directory): ${target}`);
+  }
+  return target;
+}
+
+/**
+ * Validate/create the full `<root>/managed-git-hooks/<leaf>` chain
+ * component by component, BEFORE any file write — see
+ * ensureRealDirectoryComponent's doc comment for why recursive mkdir is
+ * never used here. `root` (DATA_DIR in production) is validated but never
+ * created: it must already exist by the time the host is running, and
+ * creating it here would be the wrong failure mode if it somehow didn't.
+ */
+function ensureManagedDirChain(dir: string): void {
+  const leaf = path.basename(dir);
+  const middle = path.basename(path.dirname(dir));
+  const root = path.dirname(path.dirname(dir));
+  const rootStat = fs.lstatSync(root);
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    throw new Error(`unsafe managed-hooks root (not a real directory): ${root}`);
+  }
+  const managedRoot = ensureRealDirectoryComponent(root, middle);
+  ensureRealDirectoryComponent(managedRoot, leaf);
+}
+
+/**
  * Refresh MANAGED_GIT_HOOKS_SCAN_DIR from the shipped sources. Idempotent —
  * safe to call on every host start and to call more than once. The
  * directory itself is never replaced (only rename-in-place inside it) so a
@@ -161,11 +209,7 @@ export function refreshManagedGitHooks(scanDir: string = MANAGED_GIT_HOOKS_SCAN_
   hookSha256: string;
   patternsSha256: string;
 } {
-  fs.mkdirSync(scanDir, { recursive: true, mode: 0o755 });
-  const dirStat = fs.lstatSync(scanDir);
-  if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) {
-    throw new Error(`managed git hooks scan path is not a real directory: ${scanDir}`);
-  }
+  ensureManagedDirChain(scanDir);
   const patterns = readSourceOrThrow(patternsSourcePath());
   const hook = readSourceOrThrow(hookSourcePath());
   atomicWriteInDir(scanDir, MANAGED_PATTERNS_FILENAME, patterns, 0o644);
@@ -241,11 +285,7 @@ const REFUSE_HOOK_CONTENT = Buffer.from(
  * strand every scan-policy repo without even the refuse fallback.
  */
 export function ensureRefuseHook(refuseDir: string = MANAGED_GIT_HOOKS_REFUSE_DIR): void {
-  fs.mkdirSync(refuseDir, { recursive: true, mode: 0o755 });
-  const dirStat = fs.lstatSync(refuseDir);
-  if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) {
-    throw new Error(`managed git hooks refuse path is not a real directory: ${refuseDir}`);
-  }
+  ensureManagedDirChain(refuseDir);
   atomicWriteInDir(refuseDir, MANAGED_HOOK_FILENAME, REFUSE_HOOK_CONTENT, 0o755);
 }
 

@@ -211,15 +211,35 @@ function getRealPath(p: string): string | null {
  * and a mount request for a non-existent host path is already refused
  * earlier in validateMount regardless.
  */
-function touchesManagedGitHooksRoot(realPath: string): boolean {
-  const managedRoot = getRealPath(path.join(DATA_DIR, 'managed-git-hooks'));
-  if (managedRoot === null) return false;
-  if (realPath === managedRoot) return true;
-  const asDescendant = path.relative(managedRoot, realPath);
+/** True when `candidate` equals, is a descendant of, or is an ancestor of `root` (both directions "touch" it — see touchesManagedGitHooksRoot's own doc comment for why both matter). */
+function isPathContainedOrContains(root: string, candidate: string): boolean {
+  if (candidate === root) return true;
+  const asDescendant = path.relative(root, candidate);
   if (!asDescendant.startsWith('..') && !path.isAbsolute(asDescendant)) return true;
-  const asAncestor = path.relative(realPath, managedRoot);
-  if (!asAncestor.startsWith('..') && !path.isAbsolute(asAncestor)) return true;
-  return false;
+  const asAncestor = path.relative(candidate, root);
+  return !asAncestor.startsWith('..') && !path.isAbsolute(asAncestor);
+}
+
+function touchesManagedGitHooksRoot(realPath: string): boolean {
+  // Lexical comparison first (#666 review P3-6/"nudge" follow-up): this
+  // never requires data/managed-git-hooks/ to exist on disk at all, so it
+  // still refuses a mount aimed there even before the very first host
+  // restart that creates the directory (realpathSync on a not-yet-existing
+  // path throws, which the realpath-based check below has to route
+  // around; the lexical check has no such gap in the first place).
+  const managedRootLiteral = path.join(DATA_DIR, 'managed-git-hooks');
+  if (isPathContainedOrContains(managedRootLiteral, realPath)) return true;
+
+  // Realpath comparison, rooted at DATA_DIR's OWN realpath rather than
+  // managed-git-hooks/'s (#666 review P3-6: "DATA_DIR always exists, even
+  // when the leaf doesn't") — this is what a purely lexical check alone
+  // would miss: a read-write mount through a symlinked ALIAS of DATA_DIR
+  // (or of managed-git-hooks itself) resolves to the same real target
+  // without matching the literal string.
+  const dataDirReal = getRealPath(DATA_DIR);
+  if (dataDirReal === null) return true; // DATA_DIR itself unreadable — cannot verify, fail closed
+  const managedRootReal = path.join(dataDirReal, 'managed-git-hooks');
+  return isPathContainedOrContains(managedRootReal, realPath);
 }
 
 /**

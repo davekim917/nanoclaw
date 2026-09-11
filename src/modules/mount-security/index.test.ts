@@ -182,11 +182,21 @@ describe('managed git-hooks tree containment (#666 review B9)', () => {
     expect(result.effectiveReadonly).toBe(true);
   });
 
-  it('is a no-op (never blocks) when the managed git-hooks tree does not exist yet on this host', () => {
+  it('is a no-op (never blocks) for an UNRELATED mount when the managed git-hooks tree does not exist yet on this host', () => {
     // No managed-git-hooks directory created under mockState.dataDir at all.
     writeAllowlist({ allowedRoots: [{ path: projectsDir, allowReadWrite: true }], blockedPatterns: [] });
     const result = validateMount({ hostPath: repoDir, readonly: false });
     expect(result.allowed).toBe(true);
+  });
+
+  it('still refuses a read-write mount of DATA_DIR itself even when managed-git-hooks/ does not exist yet — the lexical check needs no realpath resolution of the (absent) leaf (#666 review P3-6)', () => {
+    // mockState.dataDir exists (created in beforeEach), but nothing under
+    // it named managed-git-hooks does — the exact "before the first host
+    // restart that creates it" case the old realpath-only check missed.
+    writeAllowlist({ allowedRoots: [{ path: tmpDir, allowReadWrite: true }], blockedPatterns: [] });
+    const result = validateMount({ hostPath: mockState.dataDir, readonly: false });
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toMatch(/host-managed git-hooks tree/);
   });
 
   it('an ordinary read-write mount elsewhere under an allowed root is unaffected', () => {

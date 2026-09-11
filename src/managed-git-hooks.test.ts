@@ -108,6 +108,20 @@ describe('refreshManagedGitHooks', () => {
     const patterns = fs.readFileSync(path.join(scanDir, MANAGED_PATTERNS_FILENAME), 'utf8');
     expect(patterns).toContain('secret_scan_selftest');
   });
+
+  it('throws and writes NOTHING inside a symlinked managed-git-hooks parent — validation happens BEFORE any write, not after (#666 review P3-1)', () => {
+    // Symlink the shared grandparent (`<root>/managed-git-hooks`) to an
+    // unrelated real directory before scan/refuse exist at all. A
+    // recursive mkdir would create scan/ INSIDE that symlink's target
+    // before any validation ran; this asserts the target stays empty.
+    const managedRoot = path.dirname(scanDir); // <root>/managed-git-hooks
+    const evilTarget = `${managedRoot}-evil-target`;
+    fs.mkdirSync(evilTarget, { recursive: true });
+    fs.symlinkSync(evilTarget, managedRoot);
+
+    expect(() => refreshManagedGitHooks(scanDir)).toThrow();
+    expect(fs.readdirSync(evilTarget)).toEqual([]);
+  });
 });
 
 describe('ensureRefuseHook', () => {
@@ -136,6 +150,16 @@ describe('ensureRefuseHook', () => {
     fs.renameSync(refuseDir, real);
     fs.symlinkSync(real, refuseDir);
     expect(() => ensureRefuseHook(refuseDir)).toThrow();
+  });
+
+  it('throws and writes NOTHING inside a symlinked managed-git-hooks parent (#666 review P3-1)', () => {
+    const managedRoot = path.dirname(refuseDir); // <root>/managed-git-hooks
+    const evilTarget = `${managedRoot}-evil-target`;
+    fs.mkdirSync(evilTarget, { recursive: true });
+    fs.symlinkSync(evilTarget, managedRoot);
+
+    expect(() => ensureRefuseHook(refuseDir)).toThrow();
+    expect(fs.readdirSync(evilTarget)).toEqual([]);
   });
 });
 

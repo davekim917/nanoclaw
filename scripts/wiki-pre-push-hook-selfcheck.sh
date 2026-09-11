@@ -334,12 +334,77 @@ write_unbalanced_regex() { printf 'SECRET_RE="(unbalanced"\nSECRET_BLOCK_RE="(un
 write_truncated_before_functions() { sed -n '1,/^SECRET_BLOCK_RE=/p' "$PATTERNS_SRC" > "$1"; }
 write_block_re_unset() { sed '/^SECRET_BLOCK_RE=/d' "$PATTERNS_SRC" > "$1"; }
 write_missing_extract_fn() { grep -v '^secret_scan_extract_added()' "$PATTERNS_SRC" | sed '/^secret_scan_extract_added/,/^}/d' > "$1"; }
+# #666 review P2-B: the allowlist literal becoming a glob metacharacter
+# (e.g. an edit that leaves it as `*`) must fail closed at selftest time,
+# never silently wipe every scanned line via `${text//$LITERAL/ }` glob
+# matching. Same corrupt_variant_case harness as the other 6 variants.
+write_allowlist_literal_glob() { sed "s/^SECRET_SCAN_ALLOWLISTED_LITERAL=.*/SECRET_SCAN_ALLOWLISTED_LITERAL='*'/" "$PATTERNS_SRC" > "$1"; }
 corrupt_variant_case "missing file" write_missing
 corrupt_variant_case "zero-byte file" write_zero_byte
 corrupt_variant_case "unbalanced regex" write_unbalanced_regex
 corrupt_variant_case "truncated before the functions" write_truncated_before_functions
 corrupt_variant_case "SECRET_BLOCK_RE unset" write_block_re_unset
 corrupt_variant_case "missing secret_scan_extract_added" write_missing_extract_fn
+corrupt_variant_case "allowlist literal is a glob metacharacter" write_allowlist_literal_glob
+
+# ═══ Mutation evidence: without quoting the allowlist substitution, a glob ═══
+# ═══     literal wipes the ENTIRE scanned text instead of just failing the ═══
+# ═══     selftest above (#666 review P2-B) ═════════════════════════════════
+# The selftest check just proven above is one layer; this proves the
+# quoting fix in secret_scan_count itself is the other, independent layer
+# — even if the selftest check were bypassed, the unquoted substitution
+# alone is the actual fail-open mechanism. Mutate ONLY the substitution
+# back to unquoted (the pre-fix shape) and ALSO strip the new selftest
+# glob-metacharacter check, so this variant's patterns file passes its own
+# selftest (as the pre-#666-round-3 file would have) yet still corrupts
+# the literal to '*'. A real secret must then slip through undetected.
+new_fixture
+MUTANT_LIB=$(mktemp)
+python3 -c "
+import re
+src = open('$PATTERNS_SRC').read()
+out = src
+# 1. Unquote the substitution (the pre-fix shape).
+needle = 'filtered=\"\${text//\"\$SECRET_SCAN_ALLOWLISTED_LITERAL\"/ }\"'
+replacement = 'filtered=\"\${text//\$SECRET_SCAN_ALLOWLISTED_LITERAL/ }\"'
+assert needle in out, 'quoted substitution not found — patterns file has drifted from this fixture'
+out = out.replace(needle, replacement)
+# 2. Corrupt the literal to a glob metacharacter.
+out = re.sub(r\"^SECRET_SCAN_ALLOWLISTED_LITERAL=.*$\", \"SECRET_SCAN_ALLOWLISTED_LITERAL='*'\", out, count=1, flags=re.M)
+# 3. Remove the new selftest glob-metacharacter check block AND the new
+#    positive-control block entirely, so this variant's selftest still
+#    passes — reproducing the actual pre-#666-round-3 file, not just the
+#    quoting change in isolation, since the positive control would
+#    otherwise also (correctly) catch this corruption on its own and mask
+#    what we're specifically trying to prove here.
+block_start = out.index('  case \"\$SECRET_SCAN_ALLOWLISTED_LITERAL\" in')
+block_end = out.index('  esac', block_start) + len('  esac')
+out = out[:block_start] + out[block_end:]
+pc_start = out.index('  # Positive controls (#666 review H4/P3-1, P3-2):')
+pc_end = out.index('  return 0\n}', pc_start)
+out = out[:pc_start] + out[pc_end:]
+open('$MUTANT_LIB', 'w').write(out)
+"
+if [ ! -s "$MUTANT_LIB" ] || diff -q "$PATTERNS_SRC" "$MUTANT_LIB" >/dev/null 2>&1; then
+  bad "P2-B mutation evidence: mutation script produced no change — patterns file has drifted from this fixture" ""
+else
+  install_hook_files "$HOOK_SRC" "$MUTANT_LIB"
+  BEFORE_TIP=$(remote_tip)
+  echo 'export GITHUB_TOKEN=ghp_16C7e42F292c6912E7710c838347Ae178B4aXYZ123' >> "$WIKI/README.md"
+  git -C "$WIKI" commit -qam "real secret, but the allowlist literal+substitution are both pre-fix"
+  push_main
+  [ "$PUSH_RC" -eq 0 ] && ok "P2-B mutation evidence: pre-fix unquoted substitution + glob literal lets a real secret through — bug reproduces" \
+    || bad "P2-B mutation evidence: mutant unexpectedly still blocked (fixture doesn't reproduce the bug — check the mutation sed/awk above)" "$PUSH_OUT"
+fi
+rm -f "$MUTANT_LIB"
+
+new_fixture
+BEFORE_TIP=$(remote_tip)
+echo 'export GITHUB_TOKEN=ghp_16C7e42F292c6912E7710c838347Ae178B4aXYZ123' >> "$WIKI/README.md"
+git -C "$WIKI" commit -qam "real secret, shipped hook + shipped patterns (retry, for comparison)"
+push_main
+[ "$PUSH_RC" -ne 0 ] && ok "P2-B mutation evidence: shipped hook+patterns still blocks the identical secret" \
+  || bad "P2-B mutation evidence: shipped hook+patterns unexpectedly did not block" "$PUSH_OUT"
 
 # ═══ Any git error while building the scan range fails CLOSED ═════════════
 # #666 review P1-2: a `push -f` retried after an earlier rejection can
@@ -531,6 +596,119 @@ PUSH_RC=$?
 git --git-dir="$REMOTE" rev-parse -q --verify lightweight-tree-tag >/dev/null 2>&1 \
   && bad "lightweight tag on a tree: pushed anyway" "" \
   || ok "lightweight tag on a tree: nothing landed on the remote"
+
+# ═══ 26. A secret token adjacent to a NUL byte in a PNG-shaped blob is BLOCKED (#666 review P2-A) ═══
+# `git log -p`'s raw plumbing output embeds a blob's literal bytes
+# verbatim, NUL bytes included. Bash command substitution ($(...)) silently
+# DROPS NUL bytes (`x=$(printf 'a\0b'); echo "$x"` prints "ab", no gap) —
+# scan_range captures git log -p's output that way, so a token with a NUL
+# immediately on one side gets FUSED to whatever alnum byte sits on the
+# other side of that NUL once it vanishes, which can break a
+# boundary-anchored BLOCK/SECRET_RE alternative. A PNG tEXt chunk is
+# exactly this shape: "keyword\0text" — one NUL directly between two
+# arbitrary byte runs.
+new_fixture
+BEFORE_TIP=$(remote_tip)
+python3 -c "
+import struct, zlib
+def chunk(tag, data):
+    c = tag + data
+    return struct.pack('>I', len(data)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
+sig = b'\x89PNG\r\n\x1a\n'
+ihdr = chunk(b'IHDR', struct.pack('>IIBBBBB', 1, 1, 8, 6, 0, 0, 0))
+# tEXt: keyword NUL text. Keyword ends in an alnum char right up against
+# the NUL, and the token starts right after it — the exact adjacency that
+# lets the fused string break the token's left boundary once NUL is
+# dropped by \$(...).
+text = chunk(b'tEXt', b'authtoken\x00ghp_16C7e42F292c6912E7710c838347Ae178B4aXYZ123')
+iend = chunk(b'IEND', b'')
+open('$WIKI/icon.png', 'wb').write(sig + ihdr + text + iend)
+"
+git -C "$WIKI" add icon.png
+git -C "$WIKI" commit -qam "add a PNG with a secret token NUL-adjacent in a tEXt chunk"
+push_main
+[ "$PUSH_RC" -ne 0 ] && ok "PNG tEXt-chunk secret, NUL-adjacent: blocked" \
+  || bad "PNG tEXt-chunk secret, NUL-adjacent: push succeeded" "$PUSH_OUT"
+[ "$(remote_tip)" = "$BEFORE_TIP" ] && ok "PNG tEXt-chunk secret: remote unchanged" \
+  || bad "PNG tEXt-chunk secret: remote advanced" ""
+
+# ═══ 27. A secret token flanked by NUL bytes in an otherwise-random binary blob is BLOCKED (#666 review P2-A) ═══
+# review-666 reproduced this in 4 of 20 random binaries: whenever the byte
+# immediately across a NUL from the token happens to be alnum, the same
+# fusion breaks the boundary. Fixed seed + deliberate alnum bytes abutting
+# each NUL reproduce that shape reliably rather than depending on chance.
+new_fixture
+BEFORE_TIP=$(remote_tip)
+python3 -c "
+import random
+random.seed(2)
+noise_a = bytes(random.randint(1, 255) for _ in range(500)) + b'X'  # alnum right before the NUL
+noise_b = b'Y' + bytes(random.randint(1, 255) for _ in range(500))  # alnum right after the NUL
+token = b'ghp_16C7e42F292c6912E7710c838347Ae178B4aXYZ123'
+data = noise_a + b'\x00' + token + b'\x00' + noise_b
+open('$WIKI/blob.bin', 'wb').write(data)
+"
+git -C "$WIKI" add blob.bin
+git -C "$WIKI" commit -qam "add a random binary blob with a NUL-flanked secret token"
+push_main
+[ "$PUSH_RC" -ne 0 ] && ok "NUL-flanked secret token in random binary: blocked" \
+  || bad "NUL-flanked secret token in random binary: push succeeded" "$PUSH_OUT"
+[ "$(remote_tip)" = "$BEFORE_TIP" ] && ok "NUL-flanked secret token: remote unchanged" \
+  || bad "NUL-flanked secret token: remote advanced" ""
+
+# ═══ 28. Mutation evidence: without the NUL->space translation, fixture #27's ═══
+# ═══     push slips through; the shipped hook still blocks it (#666 review P2-A) ═══
+# Prove the fix is load-bearing, not just present: install a MUTATED copy
+# of the shipped hook with the `| LC_ALL=C tr '\000' ' '` pipe stripped
+# from scan_range's two `git log -p` calls (exactly the pre-fix code —
+# verified below to actually change the file, so this can't silently
+# no-op), replay fixture #27's exact push against it, and confirm the
+# mutant lets the secret through. Then replay the identical push against
+# the real shipped hook (fresh fixture) and confirm it blocks. Sed'd from
+# the real hook file, never a re-implementation of its logic.
+new_fixture
+MUTANT_HOOK=$(mktemp)
+sed -E "s/\| LC_ALL=C tr '\\\\000' ' ' \|\|/||/g" "$HOOK_SRC" > "$MUTANT_HOOK"
+if diff -q "$HOOK_SRC" "$MUTANT_HOOK" >/dev/null 2>&1; then
+  bad "P2-A mutation evidence: sed found no tr pipe to remove — hook source has drifted from this fixture" ""
+else
+  chmod +x "$MUTANT_HOOK"
+  install_hook_files "$MUTANT_HOOK" "$PATTERNS_SRC"
+  python3 -c "
+import random
+random.seed(2)
+noise_a = bytes(random.randint(1, 255) for _ in range(500)) + b'X'
+noise_b = b'Y' + bytes(random.randint(1, 255) for _ in range(500))
+token = b'ghp_16C7e42F292c6912E7710c838347Ae178B4aXYZ123'
+data = noise_a + b'\x00' + token + b'\x00' + noise_b
+open('$WIKI/blob.bin', 'wb').write(data)
+"
+  git -C "$WIKI" add blob.bin
+  git -C "$WIKI" commit -qam "add a random binary blob with a NUL-flanked secret token"
+  push_main
+  [ "$PUSH_RC" -eq 0 ] && ok "P2-A mutation evidence: pre-fix hook (tr pipe removed) lets the NUL-flanked secret through — bug reproduces" \
+    || bad "P2-A mutation evidence: pre-fix hook unexpectedly still blocked (fixture doesn't reproduce the bug)" "$PUSH_OUT"
+fi
+rm -f "$MUTANT_HOOK"
+
+new_fixture
+BEFORE_TIP=$(remote_tip)
+python3 -c "
+import random
+random.seed(2)
+noise_a = bytes(random.randint(1, 255) for _ in range(500)) + b'X'
+noise_b = b'Y' + bytes(random.randint(1, 255) for _ in range(500))
+token = b'ghp_16C7e42F292c6912E7710c838347Ae178B4aXYZ123'
+data = noise_a + b'\x00' + token + b'\x00' + noise_b
+open('$WIKI/blob.bin', 'wb').write(data)
+"
+git -C "$WIKI" add blob.bin
+git -C "$WIKI" commit -qam "add a random binary blob with a NUL-flanked secret token (retry against the real shipped hook)"
+push_main
+[ "$PUSH_RC" -ne 0 ] && ok "P2-A mutation evidence: shipped hook (tr pipe intact) blocks the identical push" \
+  || bad "P2-A mutation evidence: shipped hook unexpectedly did not block" "$PUSH_OUT"
+[ "$(remote_tip)" = "$BEFORE_TIP" ] && ok "P2-A mutation evidence: remote unchanged under the shipped hook" \
+  || bad "P2-A mutation evidence: remote advanced under the shipped hook" ""
 
 echo
 if [ "$FAILED" -eq 0 ]; then

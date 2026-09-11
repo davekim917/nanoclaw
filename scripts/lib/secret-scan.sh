@@ -150,20 +150,27 @@ secret_scan_extract_added() {
 # empty or unset (`${VAR:-}`, never bare `$VAR`, under the callers' `set
 # -u`) — substituting an empty pattern would otherwise match at every
 # position and corrupt the text, not exempt nothing. `${text//pattern/ }`
-# is bash's own literal (non-regex) substring replace, so it cannot itself
-# fail the way an external `sed`/`grep` call could — there is no subprocess
-# exit status to lose track of. It performs GLOB pattern matching, not a
-# byte-for-byte literal match, so SECRET_SCAN_ALLOWLISTED_LITERAL must
-# never contain a glob metacharacter (`* ? [ ] ( ) | @ + !`) without
-# revisiting this — true today (a plain alphanumeric AWS example key) and
-# asserted structurally, not just by convention, in secret_scan_selftest.
+# is bash's own substring replace, so it cannot itself fail the way an
+# external `sed`/`grep` call could — there is no subprocess exit status to
+# lose track of. The PATTERN side of `${var//pattern/replacement}` is
+# GLOB-matched, not a byte-for-byte literal match, UNLESS the pattern is
+# quoted (`${var//"$pattern"/replacement}`) — quoting forces a literal,
+# non-glob match. Left unquoted (#666 review P2-B), a literal edited or
+# corrupted to a bare glob character (`*` above all — matches any string,
+# including the empty one, so it would fail OPEN by silently wiping the
+# ENTIRE scanned text to a single space instead of exempting nothing)
+# would still pass a bare `-n` emptiness check and this file's own
+# selftest, yet stop scanning anything at all. Quoted here, and rejected
+# outright by secret_scan_selftest below if it ever contains a glob
+# metacharacter, so a corruption of this specific shape fails closed at
+# the selftest instead of silently at scan time.
 secret_scan_count() {
   local text="$1" re="$2" case_mode="$3"
   local -a grep_opts=(-c -E)
   [ "$case_mode" = insensitive ] && grep_opts+=(-i)
   local filtered="$text"
   if [ -n "${SECRET_SCAN_ALLOWLISTED_LITERAL:-}" ]; then
-    filtered="${text//$SECRET_SCAN_ALLOWLISTED_LITERAL/ }"
+    filtered="${text//"$SECRET_SCAN_ALLOWLISTED_LITERAL"/ }"
   fi
   local out
   out=$(LC_ALL=C grep "${grep_opts[@]}" "$re" <<<"$filtered")
@@ -227,16 +234,41 @@ secret_scan_selftest() {
     echo "secret-scan selftest: SECRET_SCAN_ALLOWLISTED_LITERAL is not declared" >&2
     return 1
   fi
-  # Positive control (#666 review H4/P3-1): the checks above only prove the
-  # patterns COMPILE (a grep -E against EMPTY input returns 0 or 1, never
-  # proof of an actual match) — build a synthetic high-confidence token at
-  # runtime and confirm SECRET_BLOCK_RE actually fires on it, so a
-  # corruption that leaves the regex syntactically valid but unable to
-  # match anything real (an over-escaped character class, a swapped
-  # anchor) still fails closed here instead of only in review.
+  # secret_scan_count's `${text//"$SECRET_SCAN_ALLOWLISTED_LITERAL"/ }` is
+  # quoted, so it is a literal (non-glob) match today — but the CORRECTNESS
+  # of that quoting depends on nobody removing it later, and a corrupted
+  # copy of this file could carry an unquoted version. This is the
+  # complementary check: reject the LITERAL VALUE itself if it contains a
+  # glob metacharacter, so even an accidental reversion of the quoting
+  # fails closed here (the literal can never become `*`, which unquoted
+  # would match and blank the entire scanned text) rather than silently at
+  # scan time (#666 review P2-B).
+  case "$SECRET_SCAN_ALLOWLISTED_LITERAL" in
+    *[\*\?\[\\]*)
+      echo "secret-scan selftest: SECRET_SCAN_ALLOWLISTED_LITERAL contains a glob metacharacter" >&2
+      return 1
+      ;;
+  esac
+  # Positive controls (#666 review H4/P3-1, P3-2): the checks above only
+  # prove the patterns COMPILE (a grep -E against EMPTY input returns 0 or
+  # 1, never proof of an actual match) — build synthetic tokens at runtime
+  # and confirm both tiers actually fire, so a corruption that leaves a
+  # regex syntactically valid but unable to match anything real (an
+  # over-escaped character class, a swapped anchor) still fails closed
+  # here instead of only in review. SECRET_RE's own control goes through
+  # the real extract+count path (secret_scan_extract_added,
+  # secret_scan_count), not a bare grep, so it also proves those two
+  # functions still exist and work together, not just the regex alone.
   local synthetic="ghp_$(printf 'A%.0s' {1..36})"
   if ! LC_ALL=C grep -qE "$SECRET_BLOCK_RE" <<<"$synthetic"; then
     echo "secret-scan selftest: BLOCK positive control did not match a synthetic high-confidence token" >&2
+    return 1
+  fi
+  local re_synthetic_text re_hits
+  re_synthetic_text="${SECRET_SCAN_NEW_INDICATOR}export MY_SECRET_KEY=${synthetic}"
+  re_hits=$(secret_scan_count "$(secret_scan_extract_added "$re_synthetic_text")" "$SECRET_RE" insensitive)
+  if [ "$?" -ne 0 ] || [ "${re_hits:-0}" -eq 0 ]; then
+    echo "secret-scan selftest: SECRET_RE positive control did not match a synthetic secret-shaped line" >&2
     return 1
   fi
   return 0

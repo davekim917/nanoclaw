@@ -1534,7 +1534,11 @@ function alertScanPolicyHooksOnce(repository: { gitDir: string }, outcome: 'refu
   scanPolicyHooksAlerted.add(repository.gitDir);
   log.error('managed-git-hooks: scan-policy repository degraded below the real hook', {
     outcome,
-    // gitDir only, never a repo/workgroup name in a log line other systems may forward.
+    // gitDir DOES contain the workgroup id and repo name as path segments
+    // (#666 review P3-5: an earlier comment here incorrectly claimed
+    // otherwise) — this is a host log line, not the count-only report
+    // migrateExistingCanonicalHooksPath returns to callers, so it is fine
+    // for it to be more specific.
     gitDir: repository.gitDir,
   });
 }

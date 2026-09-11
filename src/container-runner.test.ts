@@ -2474,4 +2474,39 @@ describe('resolveScanPolicyHooksMount', () => {
     expect(alertCalls).toHaveLength(1);
     refreshManagedGitHooks(); // restore
   });
+
+  it('two scan-policy repositories in one workgroup dedupe to exactly one hooks mount by container path (#666 review P3-7)', () => {
+    // isScanPolicyRepositoryName only matches the literal name "wiki"
+    // today, and repo directory names are unique within one workgroup, so
+    // two ACTUAL scan-policy repos can't coexist in production yet — but
+    // the mount-loop's dedup-by-containerPath invariant (container-runner.ts,
+    // right after canonicalGitControlMounts) has to hold regardless of
+    // whether it's reachable today, since resolveScanPolicyHooksMount is
+    // repo-agnostic: it decides from the GLOBAL scan/refuse state, not
+    // from anything about the specific repository passed in. This
+    // exercises the exact dedup pattern the real mount loop uses, against
+    // two DIFFERENT real fixture repos both configured to the managed dir.
+    refreshManagedGitHooks();
+    const repoA = gitFixtureRepo('dedupe-a');
+    const repoB = gitFixtureRepo('dedupe-b');
+    safeGitConfigSet(repositoryConfigPath(path.join(repoA, '.git')), 'core.hooksPath', MANAGED_GIT_HOOKS_SCAN_DIR);
+    safeGitConfigSet(repositoryConfigPath(path.join(repoB, '.git')), 'core.hooksPath', MANAGED_GIT_HOOKS_SCAN_DIR);
+
+    const mounts: Array<{ hostPath: string; containerPath: string; readonly: boolean }> = [];
+    for (const repo of [{ gitDir: path.join(repoA, '.git') }, { gitDir: path.join(repoB, '.git') }]) {
+      const decision = resolveScanPolicyHooksMount(repo);
+      expect(decision.withhold).toBe(false);
+      for (const mount of decision.mounts) {
+        if (!mounts.some((existing) => existing.containerPath === mount.containerPath)) {
+          mounts.push(mount);
+        }
+      }
+    }
+    expect(mounts).toHaveLength(1);
+    expect(mounts[0]).toEqual({
+      hostPath: MANAGED_GIT_HOOKS_SCAN_DIR,
+      containerPath: MANAGED_GIT_HOOKS_SCAN_DIR,
+      readonly: true,
+    });
+  });
 });

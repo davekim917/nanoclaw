@@ -803,11 +803,11 @@ export async function main(): Promise<void> {
   // initChannelAdapters() below, all three of which can already trigger a
   // spawn. A spawn that mounts a scan-policy (wiki) repo depends on this
   // having already run at least once THIS process
-  // (scanPolicyHookMounts -> assertManagedGitHooksIntegrity in
-  // container-runner.ts falls back to the refuse hook, never throws the
-  // whole spawn, when it hasn't — see managed-git-hooks.ts's own doc
-  // comments on why this is a direct call here, not an onHostStart
-  // registrant with the six timer modules below).
+  // (resolveScanPolicyHooksMount -> decideHooksMountStrategy in
+  // container-runner.ts/managed-git-hooks.ts falls back to the refuse
+  // hook, never throws the whole spawn, when it hasn't — see
+  // managed-git-hooks.ts's own doc comments on why this is a direct call
+  // here, not an onHostStart registrant with the six timer modules below).
   initializeManagedGitHooks();
 
   // Host-computed upstreamPin/heldByMerge snapshot for the container-updates

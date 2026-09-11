@@ -564,7 +564,14 @@ if [ -s "$BUNDLE" ]; then
   fi
   CORRUPT_AT=$((PACK_OFFSET + 12))
   printf '\xff' | dd of="$FIX/corrupt.bundle" bs=1 seek="$CORRUPT_AT" count=1 conv=notrunc status=none
-  if git bundle verify "$FIX/corrupt.bundle" >/dev/null 2>&1; then
+  # `-C "$NCDIR"` (#666 review P3-3): without it, `git bundle verify` needs
+  # the CURRENT WORKING DIRECTORY to already be inside a git repo (or one
+  # of its ancestors) — location-dependent in exactly the same way the
+  # earlier last-byte corruption offset was, and for the same underlying
+  # reason (this script's own behavior must not depend on where it's run
+  # from). Verified by running this whole selfcheck from a directory
+  # outside any git repo entirely (see the PR body's test-plan evidence).
+  if git -C "$NCDIR" bundle verify "$FIX/corrupt.bundle" >/dev/null 2>&1; then
     ok "confirmed: plain 'git bundle verify' does not catch this pack corruption (motivates the fix)"
   else
     bad "test setup: plain bundle verify already caught the corruption — strengthen the corruption" ""
@@ -656,7 +663,7 @@ if [ "$RC" -ne 0 ] || ! git --git-dir="$REMOTE" rev-parse -q --verify host-snaps
   bad "setup: first run_safety did not produce a host-snapshot to force-reset" "rc=$RC out=$OUT"
 fi
 FIRST_SNAP_TIP=$(git --git-dir="$REMOTE" rev-parse host-snapshot)
-FORCE_RESET_TIP=$(git --git-dir="$REMOTE" commit-tree "$FIRST_SNAP_TIP^{tree}" -m "operator force-reset target" 2>/dev/null)
+FORCE_RESET_TIP=$(git -c user.name=selfcheck -c user.email=selfcheck@example.invalid --git-dir="$REMOTE" commit-tree "$FIRST_SNAP_TIP^{tree}" -m "operator force-reset target" 2>/dev/null)
 git --git-dir="$REMOTE" update-ref refs/heads/host-snapshot "$FORCE_RESET_TIP"
 echo '{"a":3}' > "$G/foo/container.json"
 run_safety

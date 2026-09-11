@@ -156,11 +156,28 @@ jobs:
       # deletion, a fallback re-introduced) that still compiles fine.
       # #666 review T1 — this was in the original wiki-hook spec and had
       # been missing from CI until now. A real gate, not `continue-on-error`.
+      # Both selfchecks build real fixture repos and expect a usable git
+      # identity to be available for the odd direct commit-tree/commit/tag
+      # call that isn't inside a fixture repo with its own configured
+      # user.email/user.name — this runner has no global git identity at
+      # all (review-666 P2-C: a bare-remote commit-tree call without one
+      # failed here, though not locally, where a personal git identity
+      # happened to hide it).
       - name: git-safety.sh selfcheck
         run: pnpm run check:git-safety-selfcheck
+        env:
+          GIT_AUTHOR_NAME: selfcheck
+          GIT_AUTHOR_EMAIL: selfcheck@example.invalid
+          GIT_COMMITTER_NAME: selfcheck
+          GIT_COMMITTER_EMAIL: selfcheck@example.invalid
 
       - name: wiki-pre-push-hook.sh selfcheck
         run: pnpm run check:wiki-pre-push-hook-selfcheck
+        env:
+          GIT_AUTHOR_NAME: selfcheck
+          GIT_AUTHOR_EMAIL: selfcheck@example.invalid
+          GIT_COMMITTER_NAME: selfcheck
+          GIT_COMMITTER_EMAIL: selfcheck@example.invalid
 
       # Feeds scripts/check-risk-coverage.ts against the committed
       # coverage-risk-baseline.json (docs/specs/risk-based-review/plan.md,
