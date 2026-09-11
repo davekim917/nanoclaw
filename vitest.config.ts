@@ -5,7 +5,7 @@ import { parse as parseYaml } from 'yaml';
 import { defaultExclude, defineConfig } from 'vitest/config';
 
 import { globsForRiskHigh } from './scripts/review-outcomes.js';
-import { hostRiskGlobs } from './scripts/risk-globs.js';
+import { splitRiskGlobs } from './scripts/risk-globs.js';
 import skillsConfig from './vitest.skills.config.js';
 
 /**
@@ -41,28 +41,48 @@ const DRIFT_TESTS = [
 const lane = process.env.VITEST_LANE;
 
 /**
- * Coverage instrumentation is scoped to the risk:high paths this vitest run can
- * actually import — `.ts` under `src/`/`scripts/` (see scripts/risk-globs.ts for the
- * host/container split; container/agent-runner is Bun-only and covered separately by
- * `bun test --coverage`). Derived at run time from `.github/labeler.yml` rather than
- * hardcoded, so the coverage ratchet's scope can never silently drift from the review
- * gate's scope (docs/specs/risk-based-review/plan.md, "Tests on risky paths").
+ * `coverage.include` scopes what gets REPORTED to the risk:high paths this vitest run
+ * can actually import — `.ts` under `src/`/`scripts/` (see scripts/risk-globs.ts for
+ * the host/container split; container/agent-runner is Bun-only and covered separately
+ * by `bun test --coverage`). It does NOT scope instrumentation: coverage-v8 starts
+ * V8's precise/detailed coverage profiler for the whole worker regardless of `include`
+ * (`Profiler.startPreciseCoverage({ callCount: true, detailed: true })`,
+ * node_modules/@vitest/coverage-v8/dist/index.js) and applies `include`/`exclude` only
+ * once building the report — see scripts/check-risk-coverage.ts's file header and
+ * ci.yml for what that overhead meant for one CPU-heavy, unrelated test. Derived at run
+ * time from `.github/labeler.yml` rather than hardcoded, so the coverage ratchet's
+ * scope can never silently drift from the review gate's scope
+ * (docs/specs/risk-based-review/plan.md, "Tests on risky paths").
  *
- * This list is ONLY read when `--coverage` is passed (see `coverage.include` below);
- * it has no effect, and costs one extra file read, on a plain `vitest run`.
+ * Called lazily, only when `coverage.enabled` below is actually true — not eagerly as
+ * part of this config object — so a malformed `.github/labeler.yml` (or an unrecognized
+ * risk:high glob; see splitRiskGlobs) fails only a coverage run, never a plain
+ * `vitest run`, which would otherwise break EVERY lane on every config load.
  */
 function readHostRiskGlobs(): string[] {
   const labelerPath = path.join(import.meta.dirname, '.github', 'labeler.yml');
   const config = parseYaml(fs.readFileSync(labelerPath, 'utf8')) as Record<string, unknown>;
-  // scripts/risk-globs.ts's hostRiskGlobs only guarantees ".ts under src/ or
-  // scripts/" as a directory (a glob ending `/**` matches every file in that
-  // tree, README.md and *.md skill docs included) — narrow each directory
-  // glob to `.ts` files specifically, or vitest's coverage-v8 provider tries
-  // to parse those non-TS files as source and logs a "Failed to parse ...
-  // Excluding it from coverage" warning per file (harmless, but noisy: every
+  const { host } = splitRiskGlobs(globsForRiskHigh(config));
+  // host only guarantees ".ts under src/ or scripts/" as a directory (a glob ending
+  // `/**` matches every file in that tree, README.md and *.md skill docs included) —
+  // narrow each directory glob to `.ts` files specifically, or vitest's coverage-v8
+  // provider tries to parse those non-TS files as source and logs a "Failed to parse
+  // ... Excluding it from coverage" warning per file (harmless, but noisy: every
   // module directory under risk:high carries at least one .md).
-  return hostRiskGlobs(globsForRiskHigh(config)).map((glob) => (glob.endsWith('/**') ? `${glob}/*.ts` : glob));
+  return host.map((glob) => (glob.endsWith('/**') ? `${glob}/*.ts` : glob));
 }
+
+/**
+ * `vitest run --coverage` and `--coverage.<option>=...` both enable coverage (vitest
+ * CLI: any `--coverage*` flag sets `coverage.enabled`); this repo's own coverage
+ * entrypoints (`pnpm run test:coverage:risk`, scripts/check-risk-coverage.ts's usage
+ * text) only ever pass the bare `--coverage` form. Checked directly against argv,
+ * ahead of vitest parsing its own CLI flags, purely to decide whether
+ * `readHostRiskGlobs()` — which reads and parses a file, and can throw — is worth
+ * calling; getting this detection wrong only means paying that one extra read on a
+ * plain run, never a correctness issue for coverage.include itself.
+ */
+const coverageRequested = process.argv.some((arg) => arg === '--coverage' || arg.startsWith('--coverage.'));
 
 export default defineConfig({
   test: {
@@ -112,14 +132,16 @@ export default defineConfig({
     // stays exactly as fast as before this block existed.
     coverage: {
       provider: 'v8',
-      // Setting `include` is what makes vitest report every matching file, even one
+      // Setting `include` is what makes vitest REPORT every matching file, even one
       // no test ever touched, at 0% (vitest docs, CoverageOptions.include: "By
       // default only files covered by tests are included" — the opposite is true
       // once `include` is set). Verified against a real run: scoping `include` to
       // this repo's risk:high host globs and running only two unrelated test files
       // still produced entries for every risk file, not just the ones those two
-      // files happened to import.
-      include: readHostRiskGlobs(),
+      // files happened to import. See readHostRiskGlobs's own comment: this is a
+      // reporting scope, not an instrumentation one — the coverage profiler's CPU
+      // overhead still applies to the whole run either way.
+      include: coverageRequested ? readHostRiskGlobs() : [],
       reporter: ['text', 'json-summary'],
       reportsDirectory: 'coverage',
     },

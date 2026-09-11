@@ -93,6 +93,11 @@ risk:high:
     - 'src/agent-runner-source.ts'
     - 'src/group-init.ts'
     - 'container/agent-runner/src/mcp-tools/**'
+    # The coverage-ratchet baseline (docs/specs/risk-based-review/plan.md, "Tests on
+    # risky paths"): scripts/check-risk-coverage.ts fails closed on a missing baseline,
+    # but a PR could still delete tests and `--write` a new, lower baseline over the old
+    # one unreviewed if this file were not itself on risk:high.
+    - 'coverage-risk-baseline.json'
 
 risk:guard:
 - changed-files:
@@ -179,6 +184,7 @@ risk:gates:
     - '.public-boundary-allowlist.json'
     - 'container/skills/pr-review-loop/**'
     - 'docs/review-policy.md'
+    - 'coverage-risk-baseline.json'
 
 risk:runner:
 - changed-files:

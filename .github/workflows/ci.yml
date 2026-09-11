@@ -66,12 +66,30 @@ jobs:
         run: pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
 
       # Everything except the three drift tests, which belong to `bookkeeping`.
-      # See DRIFT_TESTS in vitest.config.ts. `--coverage` adds instrumentation
-      # overhead but runs the exact same tests — vitest.config.ts's
-      # `coverage.include` already scopes it to the host half of risk:high
-      # (scripts/risk-globs.ts), so this isn't a second, slower run of the
-      # whole suite. Feeds scripts/check-risk-coverage.ts below.
+      # See DRIFT_TESTS in vitest.config.ts. No `--coverage` here — this step
+      # is exactly what a plain `pnpm test` runs, unaffected by any of the
+      # coverage-ratchet work below.
       - name: Host tests
+        run: pnpm exec vitest run
+        env:
+          VITEST_LANE: correctness
+
+      # A SEPARATE step, not `--coverage` appended to the one above, and a
+      # SECOND full run of the same tests, not a smaller/faster one:
+      # coverage-v8 starts V8's precise/detailed coverage profiler for the
+      # WHOLE worker regardless of vitest.config.ts's `coverage.include`
+      # (see that file's own comment, and scripts/check-risk-coverage.ts's
+      # file header) — the CPU overhead is global to the process, not
+      # confined to risk:high files. Folding it into "Host tests" once
+      # already turned an unrelated, CPU-heavy TS-compiler test's normal
+      # 5.1s into 18.1s, past vitest's 5000ms default testTimeout, and red
+      # "correctness" for a reason that had nothing to do with the code
+      # under test (PR #662). A separate step costs roughly another full
+      # correctness-lane run in CI time — see this workflow's own run history
+      # for the measured delta — but it means a coverage-only slowdown can
+      # only ever red THIS step, never "correctness" for a code reason.
+      # Feeds scripts/check-risk-coverage.ts below.
+      - name: Host coverage
         run: pnpm exec vitest run --coverage
         env:
           VITEST_LANE: correctness
@@ -100,27 +118,52 @@ jobs:
         # `--coverage`/`--coverage-reporter` are extra args after `bun run
         # test`'s own `--`, not a bunfig.toml edit (see the pin note above).
         # lcov feeds scripts/check-risk-coverage.ts; text keeps the per-file
-        # breakdown visible in this step's own log.
+        # breakdown visible in this step's own log. Unlike the host suite
+        # above, NOT split into a separate coverage step: the full
+        # agent-runner suite ran clean under `--coverage` in local
+        # verification (1709 pass, 0 fail, no timeouts) with no equivalent to
+        # the host's CPU-heavy-test regression found, so paying for a second
+        # full bun run here bought nothing. Revisit if a bun-side test starts
+        # timing out under coverage the way transaction-closures.test.ts did.
         run: bun run test -- --coverage --coverage-reporter=lcov --coverage-reporter=text
 
       # Feeds scripts/check-risk-coverage.ts against the committed
       # coverage-risk-baseline.json (docs/specs/risk-based-review/plan.md,
       # "Tests on risky paths"): a ratchet, not a fixed floor — it fails only
       # when a risk file drops more than 0.5 points below ITS OWN prior
-      # measurement, or a new risk file has no tests at all. Runs from the
-      # repo root against both reports produced above, in the same job so no
-      # artifact hand-off is needed for the gate itself (the upload below is
-      # only for regenerating the baseline from a real CI run — see that
-      # step's comment).
+      # measurement, or a new risk file has no tests at all — see that
+      # script's own file header for the complete fail-closed list (a
+      # missing baseline, a risk file missing from either report entirely,
+      # a missing container report). Runs from the repo root against both
+      # reports produced above, in the same job so no artifact hand-off is
+      # needed for the gate itself (the steps below are only for
+      # regenerating the baseline from a real CI run).
       - name: Risk-path coverage ratchet
         run: pnpm exec tsx scripts/check-risk-coverage.ts
 
-      # scripts/check-risk-coverage.ts --write regenerates
-      # coverage-risk-baseline.json, but the memory-constrained host this repo
-      # is normally developed on must never run the full vitest suite with
-      # coverage (docs/specs/risk-based-review/plan.md), so an honest baseline
-      # comes from HERE: download this artifact, then run `--write` locally
-      # against the downloaded reports instead of a live run.
+      # A SEPARATE, unconditional (`if: always()`) computation from the same
+      # two reports: writes a FRESH baseline candidate to a throwaway path,
+      # never the real coverage-risk-baseline.json the step above reads, so
+      # it can never collide with or accidentally satisfy that gate.
+      # `--bootstrap`: this step's only job is producing a candidate, even
+      # before any baseline is committed at all (true on this very PR).
+      #
+      # This is the sanctioned way to regenerate the baseline: download this
+      # artifact and commit the file it contains directly. NOT "download the
+      # raw reports and run `--write` locally" — the host suite runs on a
+      # memory-constrained, production-serving box that must never run the
+      # full vitest suite with coverage (docs/specs/risk-based-review/plan.md),
+      # and even a partial local run's `--write` would resolve
+      # coverage-summary.json's absolute paths against THIS box's checkout
+      # root, not the one that generated the report — see
+      # scripts/check-risk-coverage.ts's parseVitestJsonSummary and file
+      # header for the full mismatched-root hazard this sidesteps.
+      - name: Generate coverage baseline candidate
+        if: always()
+        run: >-
+          pnpm exec tsx scripts/check-risk-coverage.ts --write --bootstrap
+          --baseline /tmp/coverage-risk-baseline-candidate.json
+
       - name: Upload coverage reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -129,6 +172,7 @@ jobs:
           path: |
             coverage/coverage-summary.json
             container/agent-runner/coverage/lcov.info
+            /tmp/coverage-risk-baseline-candidate.json
           retention-days: 14
 
   bookkeeping:

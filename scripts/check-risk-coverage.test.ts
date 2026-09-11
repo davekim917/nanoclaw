@@ -7,17 +7,25 @@ import { enforceHermeticity } from '../src/test-hermeticity.js';
 
 import {
   buildBaseline,
+  classifyAll,
+  classifyFile,
   containerSfToRepoPath,
   discoverRiskFiles,
   evaluate,
+  findMissingFromReport,
+  hasExecutableCode,
   mergeCoverage,
   parseLcov,
   parseVitestJsonSummary,
+  raiseHints,
   readRiskGlobs,
   renderTable,
+  resolveBaseline,
   summarize,
   type Baseline,
+  type Classification,
   type CoverageStat,
+  type FileRow,
 } from './check-risk-coverage.js';
 
 // This suite never shells out or touches the network — every case here exercises the
@@ -79,24 +87,56 @@ describe('discoverRiskFiles', () => {
     fs.writeFileSync(path.join(root, 'src', 'node_modules', 'pkg', 'index.ts'), '');
     expect(discoverRiskFiles(root, ['src/**'])).toEqual([]);
   });
+
+  it('excludes __fixtures__ and __test-fixtures__ directories', () => {
+    const root = globalThis.uniqueTmpRoot('check-risk-coverage-discover-fixtures');
+    fs.mkdirSync(path.join(root, 'src', 'db', 'migrations', '__fixtures__'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'src', 'db', 'migrations', '__fixtures__', 'seed.ts'), '');
+    fs.mkdirSync(path.join(root, 'src', 'providers', '__test-fixtures__'), { recursive: true });
+    // A fixture named like a risk glob (*guard*.ts) should still be excluded — the
+    // directory name is what matters, not whether the filename happens to match.
+    fs.writeFileSync(path.join(root, 'src', 'providers', '__test-fixtures__', 'guard-core-stub.ts'), '');
+    fs.mkdirSync(path.join(root, 'src', 'db', 'migrations'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'src', 'db', 'migrations', 'index.ts'), '');
+
+    expect(discoverRiskFiles(root, ['src/db/migrations/**', 'src/**/*guard*.ts'])).toEqual([
+      'src/db/migrations/index.ts',
+    ]);
+  });
 });
 
 describe('parseVitestJsonSummary', () => {
-  it('strips the repo root prefix and reads lines.covered/lines.total', () => {
-    const repoRoot = '/repo';
+  it('matches a report key by suffix against the known risk-file list, regardless of what root produced it', () => {
     const summary = {
       total: { lines: { covered: 1, total: 2, pct: 50 } },
-      '/repo/src/router.ts': { lines: { covered: 8, total: 10, pct: 80 } },
-      '/other/src/router.ts': { lines: { covered: 1, total: 1, pct: 100 } },
+      '/home/runner/work/nanoclaw/nanoclaw/src/router.ts': { lines: { covered: 8, total: 10, pct: 80 } },
+      // A different file that merely ends the same way must not be misattributed.
+      '/home/runner/work/nanoclaw/nanoclaw/src/other/router.ts': { lines: { covered: 1, total: 1, pct: 100 } },
     };
-    const result = parseVitestJsonSummary(summary, repoRoot);
+    const result = parseVitestJsonSummary(summary, ['src/router.ts']);
     expect(result.size).toBe(1);
     expect(result.get('src/router.ts')).toEqual({ covered: 8, total: 10, pct: 80 });
   });
 
+  it('matches regardless of which machine produced the absolute root (this box vs. CI)', () => {
+    const ciSummary = { '/home/runner/work/nanoclaw/nanoclaw/src/guard/guard.ts': { lines: { covered: 5, total: 5 } } };
+    const localSummary = { '/home/ubuntu/nanoclaw-v2/src/guard/guard.ts': { lines: { covered: 5, total: 5 } } };
+    for (const summary of [ciSummary, localSummary]) {
+      expect(parseVitestJsonSummary(summary, ['src/guard/guard.ts']).get('src/guard/guard.ts')).toEqual({
+        covered: 5,
+        total: 5,
+        pct: 100,
+      });
+    }
+  });
+
   it('ignores entries with no usable lines block', () => {
-    const result = parseVitestJsonSummary({ '/repo/src/x.ts': {} }, '/repo');
+    const result = parseVitestJsonSummary({ '/repo/src/x.ts': {} }, ['src/x.ts']);
     expect(result.size).toBe(0);
+  });
+
+  it('finds nothing for a risk file the report never mentions', () => {
+    expect(parseVitestJsonSummary({}, ['src/never-touched.ts']).size).toBe(0);
   });
 });
 
@@ -149,93 +189,301 @@ describe('mergeCoverage', () => {
   });
 });
 
+describe('hasExecutableCode', () => {
+  it('is false for a file of only imports, re-exports, interfaces, and type aliases', () => {
+    const source = [
+      "import type { Tool } from '@modelcontextprotocol/sdk/types.js';",
+      "export { touchHeartbeat } from '../heartbeat.js';",
+      "export type { MessageInRow } from './messages-in.js';",
+      'export interface McpToolDefinition {',
+      '  tool: Tool;',
+      '}',
+      'type Alias = string;',
+    ].join('\n');
+    expect(hasExecutableCode(source)).toBe(false);
+  });
+
+  it('is true for a file with a real function body', () => {
+    expect(hasExecutableCode('export function add(a: number, b: number): number {\n  return a + b;\n}')).toBe(true);
+  });
+
+  it('is true for a bare const with a computed value', () => {
+    expect(hasExecutableCode('export const now = Date.now();')).toBe(true);
+  });
+
+  it('is true for export default', () => {
+    expect(hasExecutableCode('export default 42;')).toBe(true);
+  });
+
+  it('does not look past the first executable statement into re-exported modules it cannot see', () => {
+    // The point of the check is "does THIS file have anything to cover" — a re-export
+    // is never executable on its own terms regardless of what it points at.
+    expect(hasExecutableCode("export { anything } from './somewhere-with-lots-of-logic.js';")).toBe(false);
+  });
+
+  it('is false for an empty file', () => {
+    expect(hasExecutableCode('')).toBe(false);
+  });
+});
+
+describe('classifyFile', () => {
+  const nonEmptySource = (): string => 'export function f() { return 1; }';
+  const emptySource = (): string => "export type { X } from './x.js';";
+
+  it('classifies a measured file with total > 0 and pct > 0 as measured', () => {
+    expect(classifyFile({ covered: 8, total: 10, pct: 80 }, nonEmptySource)).toEqual({
+      kind: 'measured',
+      pct: 80,
+    });
+  });
+
+  it('classifies a reported file with total === 0 as n/a regardless of source (report is authoritative)', () => {
+    expect(classifyFile({ covered: 0, total: 0, pct: 100 }, nonEmptySource)).toEqual({ kind: 'n/a' });
+  });
+
+  it('classifies a reported file with total > 0 and 0 covered as untested', () => {
+    expect(classifyFile({ covered: 0, total: 10, pct: 0 }, nonEmptySource)).toEqual({ kind: 'untested' });
+  });
+
+  it('falls back to a static read when the file has no report entry at all: real code -> untested', () => {
+    expect(classifyFile(undefined, nonEmptySource)).toEqual({ kind: 'untested' });
+  });
+
+  it('falls back to a static read when the file has no report entry at all: no executable code -> n/a', () => {
+    expect(classifyFile(undefined, emptySource)).toEqual({ kind: 'n/a' });
+  });
+
+  it('never reads the source when a report entry already exists', () => {
+    let called = false;
+    classifyFile({ covered: 1, total: 1, pct: 100 }, () => {
+      called = true;
+      return '';
+    });
+    expect(called).toBe(false);
+  });
+});
+
+describe('classifyAll', () => {
+  it('classifies every risk file, reading real source only for ones absent from the report', () => {
+    const root = globalThis.uniqueTmpRoot('check-risk-coverage-classify-all');
+    fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'src', 'untested.ts'), 'export function f() { return 1; }');
+    fs.writeFileSync(path.join(root, 'src', 'barrel.ts'), "export type { X } from './x.js';");
+
+    const current = new Map<string, CoverageStat>([['src/measured.ts', { covered: 5, total: 10, pct: 50 }]]);
+    const result = classifyAll(root, ['src/measured.ts', 'src/untested.ts', 'src/barrel.ts'], current);
+
+    expect(result.get('src/measured.ts')).toEqual({ kind: 'measured', pct: 50 });
+    expect(result.get('src/untested.ts')).toEqual({ kind: 'untested' });
+    expect(result.get('src/barrel.ts')).toEqual({ kind: 'n/a' });
+  });
+});
+
 describe('evaluate', () => {
-  const stat = (pct: number): CoverageStat => ({ covered: pct, total: 100, pct });
-  const baseline = (files: Record<string, number>): Baseline => ({ generatedAt: '2026-01-01T00:00:00Z', files });
+  const classify = (entries: Record<string, Classification>): Map<string, Classification> =>
+    new Map(Object.entries(entries));
+  const baseline = (files: Record<string, Baseline['files'][string]>): Baseline => ({
+    generatedAt: '2026-01-01T00:00:00Z',
+    files,
+  });
 
   it('passes a file that held or improved on its baseline', () => {
-    const current = new Map([['src/a.ts', stat(90)]]);
+    const current = classify({ 'src/a.ts': { kind: 'measured', pct: 90 } });
     const result = evaluate(['src/a.ts'], current, baseline({ 'src/a.ts': 90 }));
     expect(result.passed).toBe(true);
     expect(result.rows[0]).toMatchObject({ status: 'ok', delta: 0 });
   });
 
   it('passes a drop within the threshold', () => {
-    const current = new Map([['src/a.ts', stat(89.6)]]);
+    const current = classify({ 'src/a.ts': { kind: 'measured', pct: 89.6 } });
     const result = evaluate(['src/a.ts'], current, baseline({ 'src/a.ts': 90 }), 0.5);
     expect(result.passed).toBe(true);
   });
 
   it('fails a drop past the threshold', () => {
-    const current = new Map([['src/a.ts', stat(89)]]);
+    const current = classify({ 'src/a.ts': { kind: 'measured', pct: 89 } });
     const result = evaluate(['src/a.ts'], current, baseline({ 'src/a.ts': 90 }), 0.5);
     expect(result.passed).toBe(false);
     expect(result.failures).toHaveLength(1);
     expect(result.rows[0].status).toBe('regressed');
   });
 
-  it('treats a baseline file missing from the current report as a drop to 0%', () => {
-    const result = evaluate(['src/a.ts'], new Map(), baseline({ 'src/a.ts': 10 }));
+  it('treats a baseline file that is now untested as a drop to 0%', () => {
+    const current = classify({ 'src/a.ts': { kind: 'untested' } });
+    const result = evaluate(['src/a.ts'], current, baseline({ 'src/a.ts': 10 }));
     expect(result.passed).toBe(false);
-    expect(result.rows[0]).toMatchObject({ status: 'regressed', currentPct: null, delta: -10 });
+    expect(result.rows[0]).toMatchObject({ status: 'regressed', current: 'untested', delta: -10 });
   });
 
   it('does not fail a new file (not in baseline) that has some coverage', () => {
-    const current = new Map([['src/new.ts', stat(40)]]);
+    const current = classify({ 'src/new.ts': { kind: 'measured', pct: 40 } });
     const result = evaluate(['src/new.ts'], current, baseline({}));
     expect(result.passed).toBe(true);
     expect(result.rows[0].status).toBe('new');
   });
 
-  it('fails a new file (not in baseline) with 0% coverage', () => {
-    const current = new Map([['src/new.ts', stat(0)]]);
+  it('fails a new file (not in baseline) that is untested', () => {
+    const current = classify({ 'src/new.ts': { kind: 'untested' } });
     const result = evaluate(['src/new.ts'], current, baseline({}));
     expect(result.passed).toBe(false);
     expect(result.rows[0].status).toBe('new-untested');
   });
 
-  it('fails a new file (not in baseline) entirely absent from the coverage report', () => {
-    const result = evaluate(['src/new.ts'], new Map(), baseline({}));
-    expect(result.passed).toBe(false);
-    expect(result.rows[0].status).toBe('new-untested');
+  it('never fails a file currently classified n/a, regardless of baseline history', () => {
+    const baselineVariants: Record<string, Baseline['files'][string]>[] = [
+      {},
+      { 'src/a.ts': 40 },
+      { 'src/a.ts': 'untested' },
+    ];
+    for (const files of baselineVariants) {
+      const current = classify({ 'src/a.ts': { kind: 'n/a' } });
+      const result = evaluate(['src/a.ts'], current, baseline(files));
+      expect(result.passed).toBe(true);
+      expect(result.rows[0].status).toBe('n/a');
+    }
+  });
+
+  it('does not fail a baseline "untested" file that is still untested — accepted debt, not a new failure', () => {
+    // This is the seeding scenario: a file untested at baseline time reads back as
+    // KNOWN debt, not as a brand-new "new-untested" failure.
+    const current = classify({ 'src/debt.ts': { kind: 'untested' } });
+    const result = evaluate(['src/debt.ts'], current, baseline({ 'src/debt.ts': 'untested' }));
+    expect(result.passed).toBe(true);
+    expect(result.rows[0].status).toBe('ok');
+  });
+
+  it('does not fail a baseline "untested" file that gained coverage', () => {
+    const current = classify({ 'src/debt.ts': { kind: 'measured', pct: 30 } });
+    const result = evaluate(['src/debt.ts'], current, baseline({ 'src/debt.ts': 'untested' }));
+    expect(result.passed).toBe(true);
+    expect(result.rows[0].status).toBe('ok');
+  });
+
+  it('reports a baseline entry for a deleted/renamed file as removed, without failing', () => {
+    const result = evaluate([], new Map(), baseline({ 'src/gone.ts': 80 }));
+    expect(result.passed).toBe(true);
+    expect(result.rows).toEqual([
+      { file: 'src/gone.ts', baseline: 80, current: 'n/a', delta: null, status: 'removed' },
+    ]);
   });
 });
 
 describe('buildBaseline', () => {
-  it('records current pct for every risk file, defaulting to 0 when uncovered', () => {
-    const current = new Map<string, CoverageStat>([['src/a.ts', { covered: 3, total: 4, pct: 75 }]]);
-    const result = buildBaseline(['src/a.ts', 'src/b.ts'], current);
-    expect(result.files).toEqual({ 'src/a.ts': 75, 'src/b.ts': 0 });
+  it('records the classification for every risk file: number, untested, or n/a', () => {
+    const current = new Map<string, Classification>([
+      ['src/a.ts', { kind: 'measured', pct: 75 }],
+      ['src/b.ts', { kind: 'untested' }],
+      ['src/c.ts', { kind: 'n/a' }],
+    ]);
+    const result = buildBaseline(['src/a.ts', 'src/b.ts', 'src/c.ts'], current);
+    expect(result.files).toEqual({ 'src/a.ts': 75, 'src/b.ts': 'untested', 'src/c.ts': 'n/a' });
     expect(new Date(result.generatedAt).toString()).not.toBe('Invalid Date');
   });
 
-  it('rounds to 2 decimal places', () => {
-    const current = new Map<string, CoverageStat>([['src/a.ts', { covered: 1, total: 3, pct: (1 / 3) * 100 }]]);
+  it('defaults an unclassified risk file to n/a', () => {
+    expect(buildBaseline(['src/a.ts'], new Map()).files).toEqual({ 'src/a.ts': 'n/a' });
+  });
+
+  it('rounds a measured pct to 2 decimal places', () => {
+    const current = new Map<string, Classification>([['src/a.ts', { kind: 'measured', pct: (1 / 3) * 100 }]]);
     expect(buildBaseline(['src/a.ts'], current).files['src/a.ts']).toBe(33.33);
+  });
+
+  it('seeding scenario: a currently-untested file goes in as accepted debt, not silently 0', () => {
+    const current = new Map<string, Classification>([['src/legacy.ts', { kind: 'untested' }]]);
+    const seeded = buildBaseline(['src/legacy.ts'], current);
+    expect(seeded.files['src/legacy.ts']).toBe('untested');
+
+    // And the seeded baseline passes on itself — the whole point of requirement 1.
+    const result = evaluate(['src/legacy.ts'], current, seeded);
+    expect(result.passed).toBe(true);
+
+    // But a DIFFERENT, genuinely new untested risk file introduced after seeding still
+    // fails — seeding only forgives debt that already existed at seed time.
+    const withNewFile = new Map<string, Classification>(current).set('src/brand-new.ts', { kind: 'untested' });
+    const afterNewFile = evaluate(['src/legacy.ts', 'src/brand-new.ts'], withNewFile, seeded);
+    expect(afterNewFile.passed).toBe(false);
+    expect(afterNewFile.failures.map((f) => f.file)).toEqual(['src/brand-new.ts']);
   });
 });
 
 describe('renderTable / summarize', () => {
-  it('renders one aligned row per file and computes min/median', () => {
-    const result = evaluate(
-      ['src/a.ts', 'src/b.ts'],
-      new Map<string, CoverageStat>([
-        ['src/a.ts', { covered: 90, total: 100, pct: 90 }],
-        ['src/b.ts', { covered: 70, total: 100, pct: 70 }],
-      ]),
-      { generatedAt: '2026-01-01T00:00:00Z', files: { 'src/a.ts': 90, 'src/b.ts': 70 } },
-    );
+  it('renders one aligned row per file and computes min/median, excluding n/a rows', () => {
+    const current = new Map<string, Classification>([
+      ['src/a.ts', { kind: 'measured', pct: 90 }],
+      ['src/b.ts', { kind: 'measured', pct: 70 }],
+      ['src/c.ts', { kind: 'n/a' }],
+    ]);
+    const result = evaluate(['src/a.ts', 'src/b.ts', 'src/c.ts'], current, {
+      generatedAt: '2026-01-01T00:00:00Z',
+      files: { 'src/a.ts': 90, 'src/b.ts': 70, 'src/c.ts': 'n/a' },
+    });
     const table = renderTable(result.rows);
     expect(table).toContain('src/a.ts');
     expect(table).toContain('src/b.ts');
-    expect(table.split('\n')).toHaveLength(4); // header + separator + 2 rows
+    expect(table).toContain('src/c.ts');
+    expect(table.split('\n')).toHaveLength(5); // header + separator + 3 rows
 
-    expect(summarize(result.rows)).toEqual({ count: 2, min: 70, median: 80 });
+    expect(summarize(result.rows)).toEqual({ count: 3, min: 70, median: 80 });
   });
 
   it('summarize handles no coverage data at all', () => {
-    expect(
-      summarize([{ file: 'src/a.ts', baselinePct: null, currentPct: null, delta: null, status: 'new-untested' }]),
-    ).toEqual({ count: 1, min: null, median: null });
+    const rows: FileRow[] = [
+      { file: 'src/a.ts', baseline: null, current: 'untested', delta: null, status: 'new-untested' },
+    ];
+    expect(summarize(rows)).toEqual({ count: 1, min: null, median: null });
+  });
+});
+
+describe('findMissingFromReport', () => {
+  it('lists host risk files absent from the coverage map', () => {
+    const current = new Map<string, CoverageStat>([['src/a.ts', { covered: 1, total: 1, pct: 100 }]]);
+    expect(findMissingFromReport(['src/a.ts', 'src/b.ts'], current)).toEqual(['src/b.ts']);
+  });
+
+  it('is empty when every host risk file has an entry', () => {
+    const current = new Map<string, CoverageStat>([['src/a.ts', { covered: 0, total: 0, pct: 100 }]]);
+    expect(findMissingFromReport(['src/a.ts'], current)).toEqual([]);
+  });
+});
+
+describe('resolveBaseline', () => {
+  it('fails closed when the baseline is missing and --bootstrap was not passed', () => {
+    const result = resolveBaseline(false, null, false);
+    expect(result.ok).toBe(false);
+  });
+
+  it('bootstraps an empty baseline when --bootstrap was passed and none exists', () => {
+    const result = resolveBaseline(false, null, true);
+    expect(result).toMatchObject({ ok: true, baseline: { files: {} } });
+  });
+
+  it('parses the committed baseline when it exists, regardless of --bootstrap', () => {
+    const raw = JSON.stringify({
+      generatedAt: '2026-01-01T00:00:00Z',
+      files: { 'src/a.ts': 80, 'src/b.ts': 'untested' },
+    });
+    for (const bootstrap of [true, false]) {
+      expect(resolveBaseline(true, raw, bootstrap)).toEqual({
+        ok: true,
+        baseline: { generatedAt: '2026-01-01T00:00:00Z', files: { 'src/a.ts': 80, 'src/b.ts': 'untested' } },
+      });
+    }
+  });
+});
+
+describe('raiseHints', () => {
+  it('flags a file that rose more than 2 points above its baseline', () => {
+    const rows: FileRow[] = [
+      { file: 'src/up.ts', baseline: 50, current: 60, delta: 10, status: 'ok' },
+      { file: 'src/flat.ts', baseline: 50, current: 51, delta: 1, status: 'ok' },
+      { file: 'src/new.ts', baseline: null, current: 40, delta: null, status: 'new' },
+    ];
+    expect(raiseHints(rows).map((r) => r.file)).toEqual(['src/up.ts']);
+  });
+
+  it('is empty when nothing rose past the hint threshold', () => {
+    const rows: FileRow[] = [{ file: 'src/a.ts', baseline: 50, current: 50, delta: 0, status: 'ok' }];
+    expect(raiseHints(rows)).toEqual([]);
   });
 });
