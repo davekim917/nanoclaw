@@ -36,7 +36,15 @@ export function workgroupWikiHostPath(workgroupId: string): string {
   return path.join(DATA_DIR, 'wikis', workgroupId);
 }
 
-export function resolveWorkgroupWiki(workgroupId: string | null | undefined): WorkgroupWiki | null {
+/**
+ * `workspaceHostRoot` is the host directory mounted at `/workspace` (the
+ * agent-writable session dir). When given, the wiki is skipped if something
+ * other than a directory already sits at its `wiki` mountpoint.
+ */
+export function resolveWorkgroupWiki(
+  workgroupId: string | null | undefined,
+  workspaceHostRoot?: string,
+): WorkgroupWiki | null {
   if (!workgroupId || !WORKGROUP_ID_RE.test(workgroupId)) return null;
   const hostPath = workgroupWikiHostPath(workgroupId);
   let stat: fs.Stats;
@@ -54,10 +62,34 @@ export function resolveWorkgroupWiki(workgroupId: string | null | undefined): Wo
     log.warn('Workgroup wiki path is not a plain directory; not mounting it', { workgroupId, hostPath });
     return null;
   }
+  if (workspaceHostRoot && mountpointBlocked(path.join(workspaceHostRoot, 'wiki'))) {
+    log.warn('Something other than a directory sits at the /workspace/wiki mountpoint; not mounting the wiki', {
+      workgroupId,
+      mountpoint: path.join(workspaceHostRoot, 'wiki'),
+    });
+    return null;
+  }
   return {
     mount: { hostPath, containerPath: WORKGROUP_WIKI_CONTAINER_PATH, readonly: true },
     hasIndex: fs.existsSync(path.join(hostPath, 'index.md')),
   };
+}
+
+/**
+ * An agent in a session that predates the wiki can leave a file or symlink at
+ * `/workspace/wiki`. The mountpoint-stub loop keeps whatever already exists
+ * there (`if (fs.existsSync(stubPath)) continue`, src/container-runner.ts:6654),
+ * and Docker then fails a directory bind onto a file on every spawn of that
+ * session. Skipping the optional wiki keeps the spawn alive.
+ */
+function mountpointBlocked(mountpoint: string): boolean {
+  try {
+    const stat = fs.lstatSync(mountpoint);
+    return stat.isSymbolicLink() || !stat.isDirectory();
+    // eslint-disable-next-line no-catch-all/no-catch-all -- absent is the normal case (the stub loop creates it); any other failure means the mountpoint can't be vouched for, so the optional mount is skipped.
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== 'ENOENT';
+  }
 }
 
 /** The composed-doc section for a mounted wiki; null when there is none. */

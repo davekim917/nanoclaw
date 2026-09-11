@@ -84,6 +84,10 @@ refreshes the checkout; keeping it current (an hourly `git pull`, say) is
 install config. A symlink or a non-directory at that path is refused, not
 followed.
 
+Every sibling can read the whole checkout, `.git/config` included, so keep
+credentials out of it: no token in the remote URL and no `http.extraheader`.
+Authenticate the refresh through the host's git credential helper.
+
 ---
 
 ## Declaration model

@@ -491,6 +491,53 @@ describe('buildMounts agent surfaces', async () => {
     expect(denied.some((mount) => mount.workgroupReadAccess)).toBe(false);
   });
 
+  it('mounts the workgroup wiki read-only for every provider sibling and composes its section', async () => {
+    const claudeAg = group('ag-wiki-main', 'wiki-main');
+    const siblingAg = group('ag-wiki-codex', 'wiki-codex');
+    const other = group('ag-wiki-other', 'wiki-other');
+    for (const ag of [claudeAg, siblingAg, other]) await createAgentGroup(ag);
+    assignWorkgroup(claudeAg, 'wiki-wg');
+    assignWorkgroup(siblingAg, 'wiki-wg');
+    assignWorkgroup(other, 'other-wg');
+    for (const ag of [claudeAg, siblingAg, other]) await ensureContainerConfig(ag.id);
+    for (const ag of [claudeAg, siblingAg, other]) initGroupFilesystem(ag, {});
+    const wikiDir = path.join(DATA_DIR, 'wikis', 'wiki-wg');
+    fs.mkdirSync(wikiDir, { recursive: true });
+    fs.writeFileSync(path.join(wikiDir, 'index.md'), '# Index\n');
+
+    for (const [provider, ag] of [
+      ['claude', claudeAg],
+      ['codex', siblingAg],
+      ['opencode', siblingAg],
+    ] as const) {
+      const mounts = await buildMounts(
+        ag,
+        session(`s-wiki-${provider}`, ag.id),
+        containerConfig(),
+        provider,
+        {},
+        'wiki-wg',
+      );
+      expect(mounts.filter((mount) => mount.containerPath === '/workspace/wiki')).toEqual([
+        { hostPath: wikiDir, containerPath: '/workspace/wiki', readonly: true },
+      ]);
+      expect(fs.readFileSync(path.join(GROUPS_DIR, ag.folder, 'AGENTS.md'), 'utf8')).toContain('## Workgroup wiki');
+    }
+
+    const without = await buildMounts(
+      other,
+      session('s-wiki-none', other.id),
+      containerConfig(),
+      'claude',
+      {},
+      'other-wg',
+    );
+    expect(without.some((mount) => mount.containerPath === '/workspace/wiki')).toBe(false);
+    expect(fs.readFileSync(path.join(GROUPS_DIR, other.folder, 'AGENTS.md'), 'utf8')).not.toContain(
+      '## Workgroup wiki',
+    );
+  });
+
   it('canonical-working-tree-is-not-container-accessible', async () => {
     const workgroupId = 'wg-repositories';
     const ag = group('ag-repositories', 'repositories-agent');

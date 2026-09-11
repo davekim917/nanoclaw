@@ -102,6 +102,39 @@ describe('resolveWorkgroupWiki', () => {
   });
 });
 
+describe('resolveWorkgroupWiki against the session /workspace mountpoint', () => {
+  function workspace(): string {
+    return path.join(DATA_DIR, 'session');
+  }
+
+  beforeEach(() => {
+    makeWiki('example-labs', true);
+    fs.mkdirSync(workspace());
+  });
+
+  it('mounts when nothing sits at the mountpoint yet', () => {
+    expect(resolveWorkgroupWiki('example-labs', workspace())).not.toBeNull();
+  });
+
+  it('mounts over an existing directory stub', () => {
+    fs.mkdirSync(path.join(workspace(), 'wiki'));
+    expect(resolveWorkgroupWiki('example-labs', workspace())).not.toBeNull();
+  });
+
+  it('skips the wiki when an agent left a file at the mountpoint', () => {
+    fs.writeFileSync(path.join(workspace(), 'wiki'), 'notes');
+    expect(resolveWorkgroupWiki('example-labs', workspace())).toBeNull();
+    expect(warn).toHaveBeenCalledOnce();
+  });
+
+  it('skips the wiki when an agent left a symlink at the mountpoint', () => {
+    fs.mkdirSync(path.join(DATA_DIR, 'elsewhere'));
+    fs.symlinkSync(path.join(DATA_DIR, 'elsewhere'), path.join(workspace(), 'wiki'));
+    expect(resolveWorkgroupWiki('example-labs', workspace())).toBeNull();
+    expect(warn).toHaveBeenCalledOnce();
+  });
+});
+
 describe('workgroupWikiInstructions', () => {
   it('is null when no wiki is mounted', () => {
     expect(workgroupWikiInstructions(null)).toBeNull();

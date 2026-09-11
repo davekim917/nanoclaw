@@ -4291,8 +4291,8 @@ export async function buildMounts(
       )
     : [];
   logSpawnStage('workgroup-read-access', workgroupReadAccessStartedAt);
-  // Resolved once so the composed doc and the mount set describe the same directory.
-  const workgroupWiki = resolveWorkgroupWiki(wgKey);
+  // Resolved once, against this session's /workspace, so the composed doc and the mount set agree.
+  const workgroupWiki = resolveWorkgroupWiki(wgKey, sessionDir(agentGroup.id, session.id));
 
   // Default agent surfaces (composed project doc, skill links, provider state
   // dir) apply unless the provider's registration declares it provides its
