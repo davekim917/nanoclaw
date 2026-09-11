@@ -460,6 +460,32 @@ describe('repository mount poll and tool admission barrier', () => {
     expect(taskLogRowsNow().map((r) => r.text)).toEqual(['Answered without an echo.']);
   }, 5_000);
 
+  it('retries an outcome write that failed, and still writes exactly one record', async () => {
+    // The outbound insert is its own transaction, so a write that throws
+    // committed nothing and the same outcome can be written again.
+    insertMessage('task-write-retry', 'task', { prompt: 'Summarise the release queue once.' });
+    const operations = getAgentMailbox().operations;
+    const write = operations.writeMessageOut.bind(operations);
+    let failed = 0;
+    const spy = spyOn(operations, 'writeMessageOut').mockImplementation(async (message) => {
+      if (message.kind === 'task_log' && failed === 0) {
+        failed += 1;
+        throw new Error('SQLITE_BUSY: database is locked');
+      }
+      return write(message);
+    });
+    const fake = openAfterResultProvider();
+    const run = startOpenStreamLoop(fake);
+    try {
+      await waitForTaskLog();
+    } finally {
+      await run.stop();
+      spy.mockRestore();
+    }
+    expect(failed).toBe(1);
+    expect(taskLogRowsNow().map((r) => r.text)).toEqual(['Finished attempt 1.']);
+  }, 5_000);
+
   // R-8 (plan §8): the outer loop consults the admission seam, not the fence
   // directly. A registered gate that holds must stop dispatch entirely — no
   // claim, no provider call — and releasing it must let the same pending row

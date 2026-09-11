@@ -776,16 +776,29 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // only a synthesised failure, for a fire that never reported an outcome.
     // The key is reserved before the write, so the first outcome reported for
     // a fire is the only one attempted: a retry of the same batch can neither
-    // add a second record nor replace the first, and a failed write is logged,
-    // not retried.
+    // add a second record nor replace the first.
     const writtenFireKeys = new Set<string>();
     const writeFireOutcome = async (key: string, outcome: FireOutcome): Promise<void> => {
       if (writtenFireKeys.has(key)) return;
       writtenFireKeys.add(key);
-      try {
-        await autoAppendTaskLog(outcome.text, outcome.isError, outcome.model);
-      } catch (logErr) {
-        log(`Could not record task run outcome: ${logErr instanceof Error ? logErr.message : String(logErr)}`);
+      // A write that throws committed nothing: the outbound insert is its own
+      // transaction, rolled back on failure (mailbox/sqlite/operations.ts:131,
+      // :169). So the same outcome is retried in place, briefly. What three
+      // short attempts do not heal (a full disk, a closed db), a later one
+      // would not either.
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          await autoAppendTaskLog(outcome.text, outcome.isError, outcome.model);
+          return;
+        } catch (logErr) {
+          const reason = logErr instanceof Error ? logErr.message : String(logErr);
+          if (attempt === 3) {
+            log(`Could not record task run outcome: ${reason}`);
+            return;
+          }
+          log(`Task run outcome write failed (attempt ${attempt} of 3), retrying: ${reason}`);
+          await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
+        }
       }
     };
     const reportTaskOutcome = async (key: string, reported: FireOutcome): Promise<void> => {
