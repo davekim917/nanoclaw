@@ -1084,6 +1084,7 @@ async function sweepOnce(generation: number): Promise<void> {
     log.error('Host sweep: failed to load active sessions', { err });
     sessions = [];
   }
+  if (generation !== tickGeneration) return; // abandoned (#637): reset nothing the live tick has recorded
 
   // Isolate failures per-session — a throw from one stuck session's
   // cleanup must not skip every later session for the rest of the tick.
@@ -1117,6 +1118,7 @@ async function sweepOnce(generation: number): Promise<void> {
     sessionsRunning.set(session.id, generation);
     try {
       const quietUntil = await sweepSession(session, tick);
+      if (generation !== tickGeneration) return; // abandoned (#637): a verdict from phases it skipped
       if (quietUntil !== null) {
         quietSessions.set(session.id, { skipUntilMs: quietUntil, lastActive: session.last_active });
         // Carry the basis: the flush happens after the whole fan-out, and
