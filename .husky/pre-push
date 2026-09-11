@@ -3,8 +3,6 @@
 set -e
 repo_root=$(dirname "$(cd "$(git rev-parse --git-common-dir)" && pwd)")
 worktree_root=$(git rev-parse --show-toplevel)
-# Reviewed exceptions are current policy, even when inspecting older content.
-allowlist_path="$worktree_root/.public-boundary-allowlist.json"
 git_local_env=$(git rev-parse --local-env-vars)
 # Git hooks export the invoking checkout's repository selection variables.
 # Keep command-scoped `git -c` configuration so remote access still inherits it.
@@ -31,6 +29,8 @@ object_list=''
 commit_message=''
 snapshot_parent=''
 snapshot_root=''
+allowlist_path=''
+ref_allowlist_file=''
 
 remove_file() {
   if [ -n "$1" ] && [ -e "$1" ] && ! rm -f "$1"; then
@@ -51,6 +51,7 @@ cleanup() {
     echo "pre-push: failed to remove temporary snapshot directory" >&2
   fi
   remove_file "$object_list"
+  remove_file "$ref_allowlist_file"
   remove_file "$advertised_refs"
   remove_file "$known_remote_tips"
   remove_file "$seen_objects"
@@ -71,9 +72,12 @@ cat > "$refs_file"
 # so refuse any update or deletion of a remote main here, before any other
 # work. For an emergency, NANOCLAW_ALLOW_MAIN_PUSH=1 lets the push through and
 # the boundary scan below still runs; --no-verify would skip that scan too.
+# The refusal below does not name that override: printing it hands the next
+# reader (agent or human) a ready-made bypass for a guard that exists to make
+# them stop and open a PR instead.
 while read -r local_ref local_sha remote_ref remote_sha; do
   if [ "$remote_ref" = refs/heads/main ] && [ "${NANOCLAW_ALLOW_MAIN_PUSH:-}" != 1 ]; then
-    echo "pre-push: refusing to push to main on $remote_name. main takes changes through pull requests only: push a branch and open a PR. For an emergency, rerun with NANOCLAW_ALLOW_MAIN_PUSH=1 (the boundary scan still runs)." >&2
+    echo "pre-push: refusing to push to main on $remote_name. main takes changes through pull requests only: push a branch and open a PR." >&2
     exit 1
   fi
 done < "$refs_file"
@@ -98,16 +102,18 @@ done < "$refs_file"
 # nothing, so every known remote tip is excluded below, not just this ref's.
 advertised_refs=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-remote.XXXXXX")
 known_remote_tips=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-known.XXXXXX")
-# `url.<base>.insteadOf` rewrites the FETCH side, but git push still resolves
-# $remote_url against its own (possibly different) config, or none at all for
-# a literal URL argument. If ls-remote silently queried a rewritten URL (e.g.
-# a local mirror), its tips could exclude a commit that the real push target
-# has never seen. --get-url reports what ls-remote would actually resolve
-# $remote_url to; a mismatch means it would not be asking the push target, so
-# treat it exactly like "no remote_url" and fall into the failure branch
-# below. A failing --get-url itself prints nothing, so it differs from
-# $remote_url (non-empty) and takes the same fail-closed branch; set -e does
-# not abort here because the substitution sits inside an `if` condition.
+# $remote_url ($2) is not a literal argument by the time this hook sees it:
+# git push has already resolved it through any url.<base>.pushInsteadOf or
+# url.<base>.insteadOf rule that matches (for example an identity
+# pushInsteadOf), so $remote_url IS the rewritten URL. `ls-remote --get-url`
+# reports what ls-remote would itself resolve that same string to under its
+# own (fetch-side) insteadOf rules, which can differ from the push-side ones
+# — a local mirror, say. A mismatch means the ls-remote call below would not
+# be asking the actual push target, so treat it exactly like "no remote_url"
+# and fall into the failure branch below. A failing --get-url itself prints
+# nothing, so it differs from $remote_url (non-empty) and takes the same
+# fail-closed branch; set -e does not abort here because the substitution
+# sits inside an `if` condition.
 if [ -n "$remote_url" ] && [ "$(git -C "$worktree_root" ls-remote --get-url "$remote_url")" != "$remote_url" ]; then
   echo "pre-push: fetch-side URL rewriting applies to $remote_url; ls-remote would not query the push target" >&2
   remote_url=""
@@ -118,9 +124,9 @@ if [ -z "$remote_url" ] || ! git -C "$worktree_root" ls-remote "$remote_url" > "
     exit 1
   fi
   # Every pushed ref is existing with a locally known remote_sha: fall back to
-  # today's remote_sha..local_sha range for that ref alone, without the extra
-  # exclusion of other known remote tips. That scans at least as many commits
-  # as the live-tips path would have, never fewer, so it stays fail-closed.
+  # each ref's own remote_sha..local_sha range, without the extra exclusion of
+  # other known remote tips. That scans at least as many commits as the
+  # live-tips path would have, never fewer, so it stays fail-closed.
   echo "pre-push: failed to list advertised refs for $remote_name; falling back to each ref's own remote-tracking range" >&2
 else
   # A per-tip `git cat-file -e` loop is one process per advertised ref; origin
@@ -129,16 +135,22 @@ else
   # the old per-tip `$tip^{commit}` check did. Each input line pairs the peel
   # expression with the ORIGINAL tip SHA so `%(rest)` echoes that original
   # SHA back on a hit; a miss instead prints the peel expression itself
-  # followed by `missing`, which the filter below drops. `|| true` covers the
-  # case where every tip is unknown/non-commit: grep then finds nothing to
-  # print and exits 1, which must not be mistaken by `set -e` for a real
-  # failure — an empty known_remote_tips is already handled as "no known
-  # tips" and only means more scanning, never less.
+  # followed by `missing` (verified: `printf '%s^{commit} %s\n' sha sha |
+  # git cat-file --batch-check='%(rest)'` emits the bare sha on a hit, and
+  # `sha^{commit} missing` on a miss). Filter FOR the hit shape — a bare
+  # full-length hex object id, sha1 (40) or sha256 (64) — rather than
+  # filtering out the miss suffix: an allowlist fails closed if cat-file's
+  # missing-line format ever changes, where a denylist would silently start
+  # trusting unknown tips again (#612). `|| true` covers the case where every
+  # tip is unknown/non-commit: grep then finds nothing to print and exits 1,
+  # which must not be mistaken by `set -e` for a real failure — an empty
+  # known_remote_tips is already handled as "no known tips" and only means
+  # more scanning, never less.
   while read -r remote_tip remote_ref; do
     printf '%s^{commit} %s\n' "$remote_tip" "$remote_tip"
   done < "$advertised_refs" \
     | git -C "$worktree_root" cat-file --batch-check='%(rest)' 2>/dev/null \
-    | grep -v ' missing$' > "$known_remote_tips" || true
+    | grep -xE '[0-9a-f]{40}|[0-9a-f]{64}' > "$known_remote_tips" || true
 fi
 remove_file "$advertised_refs"
 advertised_refs=''
@@ -234,6 +246,19 @@ objects_for_ref() {
   local_sha=$1
   remote_sha=$2
   object_list=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-commits.XXXXXX")
+  ref_allowlist_file=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-allowlist.XXXXXX")
+  # Read the allowlist from $local_sha's own committed tree, not the pushing
+  # worktree's working copy: the working copy can hold an uncommitted entry
+  # that exempts a value nothing on the remote actually backs (#651). This
+  # still applies one allowlist — reviewed exceptions are current policy —
+  # across every commit objects_for_ref scans below, including older ones
+  # this ref's history carries; it is just sourced from a commit that will
+  # actually land on the remote instead of from disk.
+  if ! git -C "$worktree_root" show "$local_sha:.public-boundary-allowlist.json" > "$ref_allowlist_file" 2>/dev/null; then
+    echo "pre-push: $local_sha has no committed .public-boundary-allowlist.json" >&2
+    exit 1
+  fi
+  allowlist_path="$ref_allowlist_file"
   # Exclude this ref's own remote_sha (when known) AND every other known
   # remote tip, so a commit already reachable from the remote through another
   # ref (main, chiefly) is not re-scanned just because it also sits behind
@@ -269,6 +294,9 @@ objects_for_ref() {
   done < "$object_list"
   remove_file "$object_list"
   object_list=''
+  remove_file "$ref_allowlist_file"
+  ref_allowlist_file=''
+  allowlist_path=''
 }
 
 while read -r local_ref local_sha remote_ref remote_sha; do
