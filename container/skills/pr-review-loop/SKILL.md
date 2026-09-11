@@ -174,7 +174,7 @@ codex-review.sh wait <sha> <since_iso> [minutes]
                                          # foreground 60s GraphQL poll; default $CODEX_REVIEW_WAIT_MINUTES or 15
 codex-review.sh scope                     # risk-scoped repos: review|skip for the current head (legacy: auto)
 codex-review.sh request                   # risk-scoped repos: the only way to ask for a round
-codex-review.sh merge-check [--head <sha>] # exit 0 only when merging exactly that head is allowed
+codex-review.sh merge-check [--head <sha>] # exit 0 only when merging exactly that head is allowed; 26 = legacy repo, Step 6 decides
 codex-review.sh receipt --head <sha> --outcome approve|changes --reviewer "<model + runtime>" --body-file <file>
                                          # post a substitute review's receipt for exactly that head
 ```
@@ -395,8 +395,10 @@ never route around it. Ask only when nothing the operator set authorizes
 this merge. Then:
 
 ```bash
-gh pr merge "$PR" --repo "$REPO" --squash --delete-branch
+gh pr merge "$PR" --repo "$REPO" --squash --delete-branch --match-head-commit "$SHA"
 ```
+
+In a legacy repo (nanoclaw-groups, for one), `codex-review.sh merge-check` exits 26 and this is the merge: check the evidence above, then run it as its own step, pinned to the head you checked. Never chain it onto merge-check.
 
 Squash is the default. Use `--merge` when the PR's topology matters — an upstream-sync PR whose second parent must survive; squashing one drops the merge base and makes the fork report "behind" forever.
 
@@ -404,11 +406,11 @@ Then run whatever post-PR bookkeeping your environment expects — e.g. `add_shi
 
 ## Risk-scoped repos
 
-A repo is **risk-scoped** when `.github/labeler.yml` on the PR's base branch defines a top-level `risk:high` key. Automatic review is off there: the `Risk label` workflow labels PRs that touch high-risk paths, and a round happens only when one is asked for. Steps 1–4 apply unchanged; this replaces how a round starts (Step 5) and when you may merge (Step 6). In any other repo `codex-review.sh scope` answers `mode:"legacy", verdict:"auto"` and nothing here applies.
+A repo is **risk-scoped** when `.github/labeler.yml` on the PR's base branch names `risk:high` anywhere, or holds any backslash (a double-quoted YAML key can spell `risk:high` with escapes). Automatic review is off there, and a round happens only when one is asked for. Steps 1–4 apply unchanged; this replaces how a round starts (Step 5) and when you may merge (Step 6). In any other repo `codex-review.sh scope` answers `mode:"legacy", verdict:"auto"`, `merge-check` exits 26 (`merge=defer mode=legacy`), and nothing here applies: Step 6 governs the merge.
 
 **Request rounds only through `codex-review.sh request`.** The `@codex review` prohibition still holds for anything typed by hand. With nothing else able to trigger a review, `request` is the trigger, and it posts only when the rules below allow — a hand-typed comment skips every one of them.
 
-1. After opening the PR, run `codex-review.sh scope`. It waits for the `Risk label` run on the current head (`CODEX_REVIEW_SCOPE_TIMEOUT_SECONDS`, default 300) and prints a `verdict`. It fails closed: a run that is missing, late, failed, or only on an older head gives `review`, never `skip`. So does a `risk:high` or `review:requested` label that anyone but the labeler (`github-actions[bot]`) took off, one that is gone with no `unlabeled` event (the label was deleted or renamed), and label events it cannot read.
+1. After opening the PR, run `codex-review.sh scope`. It prints a `verdict` for the current head, computed from the files that exact commit changes rather than read off the PR's labels. It resolves the base branch to one commit, then reads `.github/labeler.yml` and a comparison pinned to both SHAs at that commit: `review` when a changed path, or the old path of a renamed file, matches a `risk:high` glob there, matched as the labeler matches them (minimatch with `dot: true`). A `risk:high` or `review:requested` label adds review, but a missing one never skips it; the `Risk label` workflow's labels are there for people to read. To ask for review on a head the globs don't select, add `review:requested`. `scope` fails closed to `review` when it cannot judge the files: the listing fails, reaches GitHub's 300-file cap for a comparison, or disagrees with the PR's file count, the head moves while it is read, or `risk:high` is not in the one shape it reads (a top-level `risk:high:` key holding one rule with one `any-glob-to-any-file` list of quoted globs that use only `*` and `**`).
 2. **`skip`** — no review. Wait for green CI, then merge-check and merge (4).
 3. **`review`** — capture `SHA` and `SINCE` (Step 3), run `codex-review.sh request`, then `codex-review.sh wait "$SHA" "$SINCE"`. Work the findings as one batch (Steps 1–4, pushing through `codex-review.sh push`), then capture and `request` again. Repeat until `wait` is clean or `request` hits the cap.
 4. Merge only the head `merge-check` evaluated, within Step 6's authorization rule:
@@ -417,6 +419,8 @@ A repo is **risk-scoped** when `.github/labeler.yml` on the PR's base branch def
    codex-review.sh merge-check --head "$SHA" &&
      gh pr merge "$PR" --repo "$REPO" --squash --delete-branch --match-head-commit "$SHA"
    ```
+
+   The chain is for exit 0 (`merge=allowed`) only, and `&&` keeps it that way. Exit 26 (`merge=defer mode=legacy`) is not a pass: the repo is not risk-scoped, so take Step 6 instead. Run the two back to back with nothing in between. `--match-head-commit` pins the head, but GitHub's merge takes no base SHA, so merge-check re-reads the base branch last: exit 25 means it moved while the check ran, so re-run it. The `merge=allowed` line names the `base=` commit the verdict read. That leaves a window of seconds. A `labeler.yml` change landing on the base in the gap between the two calls can still let a PR merge that the new rules would have reviewed, and that PR then gets only post-merge review. Shadow review (#660) is that net for every skipped merge, and a `labeler.yml` change is itself `risk:high`.
 
    Either verdict needs green CI on that head: each workflow in `CODEX_REVIEW_REQUIRED_WORKFLOWS` (comma-separated, default `CI`) has a latest run that concluded `success`, every other latest run concluded `success`, `neutral`, or `skipped`, and the newest commit status per context is `success` (release-policy's `Release policy` and `Release approval` contexts are a policy gate, not CI, and are skipped). A `review` head also needs `status` to read `clean` for it since its request (so `open=0`), or an approving substitute receipt for that exact head. A `fix:` or `fix(...)` title also needs a body line naming the PR it fixes, `Fixes-PR: #<n>`, or `Fixes-PR: none`, outside any code fence or HTML comment; merge-check refuses without one.
 

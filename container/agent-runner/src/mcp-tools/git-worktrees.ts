@@ -1174,16 +1174,19 @@ const CREATE_WORKTREE_DESCRIPTIONS: Record<CheckoutMode, string> = {
     "pushing, never by switching a checkout another thread may be using — a checkout's branch is never switched " +
     'automatically, so request the branch you need instead. Files under node_modules may be shared and read-only ' +
     'across checkouts; never chmod them — run npm ci or npm install for a private writable copy when dependencies ' +
-    'must change. continueFromThreadId moves an inactive legacy linked checkout here instead of creating a new one. ' +
-    'Typical flow from here: git_commit → git_push → open_pr.',
+    'must change. continueFromThreadId moves an inactive legacy linked checkout here instead of creating a new one; ' +
+    'after requesting a transfer, end your turn at once and do not wait or poll for the worktree, because the move ' +
+    'waits for this turn to stop and this topic then restarts with the result. Typical flow from here: git_commit → ' +
+    'git_push → open_pr.',
   worktree:
     "Create or reuse this thread's linked worktree of repo at /workspace/worktrees/<repo> — one checkout per repo " +
     'for the thread. With branch, a new worktree starts on that branch, and an existing one on a different branch is ' +
     'refused. Existing worktrees are never rebased or branch-switched, and dirty/staged/untracked state persists ' +
     'exactly as left. Files under node_modules may be shared and read-only across checkouts; never chmod them — run ' +
     'npm ci or npm install for a private writable copy when dependencies must change. continueFromThreadId moves an ' +
-    'inactive linked checkout here from another thread instead of creating a new one. Typical flow from here: ' +
-    'git_commit → git_push → open_pr.',
+    'inactive linked checkout here from another thread instead of creating a new one; after requesting a transfer, ' +
+    'end your turn at once and do not wait or poll for the worktree, because the move waits for this turn to stop ' +
+    'and this topic then restarts with the result. Typical flow from here: git_commit → git_push → open_pr.',
 };
 
 export const createWorktreeTool: McpToolDefinition = {
@@ -1230,8 +1233,9 @@ export const createWorktreeTool: McpToolDefinition = {
         destinationWorkUnitKey: workUnitKey,
       });
       return ok(
-        `Repository transfer queued durably for ${repo}. This topic will restart after the exact linked ` +
-          'worktree has moved, then receive an explicit success or failure message.',
+        `Repository transfer queued durably for ${repo}. End your turn now; do not wait or poll for the worktree. ` +
+          'The move waits for this turn to stop, then this topic restarts with the exact linked worktree and ' +
+          'receives an explicit success or failure message.',
       );
     }
     let context: RepositoryContext;

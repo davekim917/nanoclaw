@@ -25,6 +25,24 @@ const hostActionMocks = vi.hoisted(() => ({
   writeSessionMessageIfNew: vi.fn(),
   withExistingMailboxSession: vi.fn(),
   requestWake: vi.fn(),
+  sessionsHoldRepoIngressFence: vi.fn(),
+  killContainer: vi.fn(),
+}));
+
+// The real fence reader by default, so a fixture with no mailbox on disk reads
+// as holding no fence. A test that models durable barriers only through the
+// mocked quiescence overrides it to report those barriers.
+vi.mock('../../repo-fence-recovery.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../repo-fence-recovery.js')>();
+  hostActionMocks.sessionsHoldRepoIngressFence.mockImplementation(
+    (...args: Parameters<typeof actual.sessionsHoldRepoIngressFence>) => actual.sessionsHoldRepoIngressFence(...args),
+  );
+  return { ...actual, sessionsHoldRepoIngressFence: hostActionMocks.sessionsHoldRepoIngressFence };
+});
+
+vi.mock('../../container-runner.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../container-runner.js')>()),
+  killContainer: hostActionMocks.killContainer,
 }));
 
 vi.mock('../../config.js', async () => {
@@ -151,6 +169,9 @@ function fakeMailbox() {
     markDeliveryFailed: (id: string) => {
       mailboxAcks.push({ kind: 'failed', id });
     },
+    // No fixture writes a durable ingress fence. sessionsHoldRepoIngressFence
+    // reads through this mailbox and treats a read that throws as a held fence.
+    readRepoIngressFence: () => null,
   };
 }
 
@@ -1209,12 +1230,141 @@ describe('exact topic transfer', () => {
     expect(sourceFailureText).toContain('handoff finalization');
     expect(sourceFailureText).not.toContain('remains with this topic');
 
+    // The barriers this fixture keeps durable live only in the mocked
+    // quiescence, so the fence reader is told about them: a replay that still
+    // holds its own barriers must take the path that re-adopts and releases them.
+    hostActionMocks.sessionsHoldRepoIngressFence.mockImplementationOnce(
+      async (_sessions: Session[], epochs: readonly string[]) => epochs.some((epoch) => durableBarriers.has(epoch)),
+    );
     await applyRepositoryTransferAction(action, destinationSession);
     expect(observedEpochs).toEqual([sourceEpoch, destinationEpoch, sourceEpoch, destinationEpoch]);
     expect(durableBarriers.size).toBe(0);
     expect(fs.readFileSync(path.join(destinationPath, 'ongoing.txt'), 'utf8')).toBe('preserve through replay\n');
     const woken = hostActionMocks.wakeRepositoryMountSessions.mock.calls.at(-1)![0] as Session[];
     expect(woken.map((candidate) => candidate.id)).toEqual([destinationSession.id, sourceSession.id]);
+  });
+
+  it('answers a duplicate request for a completed transfer without draining or stopping any container', async () => {
+    await initTestDb();
+    const db = getRawDb();
+    runMigrations(db);
+    const now = new Date().toISOString();
+    db.prepare("INSERT INTO workgroups (id, onecli_secrets, created_at) VALUES ('wg-a', '[]', ?)").run(now);
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, agent_provider, created_at, workgroup_id)
+       VALUES (?, ?, ?, 'claude', ?, 'wg-a')`,
+    ).run('agent-a', 'Agent A', 'agent-a', now);
+    for (const [id, platformId, name] of [
+      ['mg-source', 'C-source', 'source'],
+      ['mg-destination', 'C-destination', 'destination'],
+    ]) {
+      db.prepare(
+        `INSERT INTO messaging_groups
+           (id, channel_type, platform_id, instance, name, is_group, unknown_sender_policy, created_at)
+         VALUES (?, 'slack', ?, 'slack', ?, 1, 'strict', ?)`,
+      ).run(id, platformId, name, now);
+    }
+    const sourceSession = {
+      id: 'session-source',
+      agent_group_id: 'agent-a',
+      messaging_group_id: 'mg-source',
+      thread_id: '111.111',
+      agent_provider: 'claude',
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      created_at: now,
+    } satisfies Session;
+    const destinationSession = {
+      ...sourceSession,
+      id: 'session-destination',
+      messaging_group_id: 'mg-destination',
+      thread_id: '222.222',
+      container_status: 'running',
+    } satisfies Session;
+    for (const candidate of [sourceSession, destinationSession]) {
+      db.prepare(
+        `INSERT INTO sessions
+           (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status, last_active, created_at)
+         VALUES (@id, @agent_group_id, @messaging_group_id, @thread_id, @agent_provider, @status, @container_status, @last_active, @created_at)`,
+      ).run(candidate);
+    }
+
+    hostActionMocks.getAgentGroup.mockReturnValue({ id: 'agent-a', folder: 'agent-a', workgroup_id: 'wg-a' });
+    hostActionMocks.getAllAgentGroups.mockReturnValue([{ id: 'agent-a', folder: 'agent-a', workgroup_id: 'wg-a' }]);
+    hostActionMocks.getSessionsByAgentGroup.mockReturnValue([sourceSession, destinationSession]);
+    hostActionMocks.quiesceSessionsForRepositoryMounts.mockImplementation(
+      async (sessions: Session[], epoch: string) => ({ epoch, sessions: [], barrierSessions: sessions }),
+    );
+    hostActionMocks.releaseRepositoryMountQuiescence.mockReturnValue([]);
+    hostActionMocks.writeSessionMessageIfNew.mockResolvedValue(true);
+    hostActionMocks.wakeRepositoryMountSessions.mockImplementation(() => undefined);
+
+    const canonical = canonicalRepoDir('wg-a', 'proj', hostActionDataDir);
+    cloneTo(canonical);
+    const source = resolveRepositoryWorkUnit({
+      workgroupId: 'wg-a',
+      sessionId: sourceSession.id,
+      platformId: 'C-source',
+      messagingGroupId: sourceSession.messaging_group_id,
+      threadId: sourceSession.thread_id,
+    });
+    const destination = resolveRepositoryWorkUnit({
+      workgroupId: 'wg-a',
+      sessionId: destinationSession.id,
+      platformId: 'C-destination',
+      messagingGroupId: destinationSession.messaging_group_id,
+      threadId: destinationSession.thread_id,
+    });
+    const sourcePath = path.join(topicWorktreesDir(source, hostActionDataDir), 'proj');
+    const destinationPath = path.join(topicWorktreesDir(destination, hostActionDataDir), 'proj');
+    fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
+    git(canonical, ['worktree', 'add', '-b', 'transfer-duplicate', sourcePath]);
+    fs.writeFileSync(path.join(sourcePath, 'ongoing.txt'), 'moved once\n');
+
+    const request = (requestId: string) => ({
+      requestId,
+      repo: 'proj',
+      sourceThreadId: sourceSession.thread_id,
+      destinationWorkUnitKey: destination.key,
+    });
+    await applyRepositoryTransferAction(request('repo-1723600000000-1212121212121212'), destinationSession);
+    expect(fs.existsSync(sourcePath)).toBe(false);
+    expect(readTransferTombstone(source, 'proj', hostActionDataDir)?.phase).toBe('moved');
+    expect(hostActionMocks.quiesceSessionsForRepositoryMounts).toHaveBeenCalledTimes(2);
+
+    for (const mock of [
+      hostActionMocks.quiesceSessionsForRepositoryMounts,
+      hostActionMocks.releaseRepositoryMountQuiescence,
+      hostActionMocks.writeSessionMessageIfNew,
+      hostActionMocks.wakeRepositoryMountSessions,
+      hostActionMocks.killContainer,
+    ]) {
+      mock.mockClear();
+    }
+
+    // The agent retried after the move had already landed: a new request id
+    // for the same source and destination.
+    const duplicateRequestId = 'repo-1723600000000-3434343434343434';
+    await applyRepositoryTransferAction(request(duplicateRequestId), destinationSession);
+
+    expect(hostActionMocks.quiesceSessionsForRepositoryMounts).not.toHaveBeenCalled();
+    expect(hostActionMocks.releaseRepositoryMountQuiescence).not.toHaveBeenCalled();
+    expect(hostActionMocks.killContainer).not.toHaveBeenCalled();
+    expect(fs.existsSync(sourcePath)).toBe(false);
+    expect(fs.readFileSync(path.join(destinationPath, 'ongoing.txt'), 'utf8')).toBe('moved once\n');
+    expect(readTransferTombstone(source, 'proj', hostActionDataDir)?.phase).toBe('moved');
+
+    // Only the requester is answered, and on a plain row: its container was not
+    // stopped, so an on_wake row would sit unseen until some later respawn.
+    const answers = hostActionMocks.writeSessionMessageIfNew.mock.calls;
+    expect(answers.map((call) => [call[1], (call[2] as { id: string }).id])).toEqual([
+      [destinationSession.id, `repository-transfer-complete-${duplicateRequestId}`],
+    ]);
+    const answer = answers[0]![2] as { content: string; onWake: number };
+    expect(answer.onWake).toBe(0);
+    expect(JSON.parse(answer.content).text).toContain('already complete');
+    expect(hostActionMocks.wakeRepositoryMountSessions).toHaveBeenCalledWith([destinationSession]);
   });
 
   it('delivers pre-quiescence failures and ignores stale mailbox residue once the source task closes', async () => {
