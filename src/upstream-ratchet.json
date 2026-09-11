@@ -216,7 +216,7 @@
 ".github/labeler.yml":{"diff":477,"mode":"100644","sha256":"338e49e415b2c1bf1823c1e811efddcb397591273985cf9e75a35e6846d1d4ce"},
 ".github/renovate.json":{"diff":37,"mode":"100644","sha256":null,"deleted":true},
 ".github/workflows/approve-agent-image.yml":{"diff":221,"mode":"100644","sha256":null,"deleted":true},
-".github/workflows/ci.yml":{"diff":103,"mode":"100644","sha256":"ec01d1cace42b2e7677f316c97fae4193c6f79d616e02cbdcdfc118568130ed4"},
+".github/workflows/ci.yml":{"diff":111,"mode":"100644","sha256":"95673c23606af329eeba789d4b709b71afdef5c9a3c94504acbfa2b17c4f967b"},
 ".github/workflows/label-area.yml":{"diff":32,"mode":"100644","sha256":null,"deleted":true},
 ".github/workflows/label-pr.yml":{"diff":311,"mode":"100644","sha256":"58c9e1d6ddbce411360237f36034a60adfce4b1606f07ceb5092628c8f8f829f"},
 ".github/workflows/refresh-agent-image.yml":{"diff":197,"mode":"100644","sha256":null,"deleted":true},
