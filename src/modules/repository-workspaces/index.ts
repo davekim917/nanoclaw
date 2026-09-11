@@ -35,6 +35,7 @@ import {
   type RepositoryWorkUnit,
 } from '../../repository-workspaces.js';
 import { observedOriginsSha256 } from '../../repository-migration-recovery.js';
+import { sessionsHoldRepoIngressFence } from '../../repo-fence-recovery.js';
 import { readSessionOutbound } from '../mailbox/index.js';
 import { sessionDir, withExistingMailboxSession, writeSessionMessageIfNew } from '../../session-manager.js';
 import { safeGitArgs, safeGitConfigGet, safeGitEnv } from '../../safe-git.js';
@@ -64,6 +65,15 @@ export interface TransferRepositoryWorktreeInput {
   source: RepositoryWorkUnit;
   destination: RepositoryWorkUnit;
   loadSourceSessions: () => Promise<RepositorySourceSessionState[]> | RepositorySourceSessionState[];
+  /**
+   * Asked under the lifecycle claims and BEFORE any quiescence, only when the
+   * source tombstone already records a finished move to this destination.
+   * Resolving true answers that move as it stands: nothing is drained or
+   * stopped and no hook below runs. Resolving false takes the ordinary path,
+   * whose recovery branch re-adopts and releases barriers a crashed attempt
+   * left behind.
+   */
+  answerCompletedMoveWithoutQuiescence?: () => Promise<boolean> | boolean;
   beforeSourceActivityCheckWhileClaimed?: () => Promise<void> | void;
   beforeMoveWhileClaimed?: () => Promise<void> | void;
   afterMoveWhileClaimed?: (result: { sourcePath: string; destinationPath: string }) => Promise<void> | void;
@@ -356,15 +366,47 @@ function removeOwnedTombstone(file: string): void {
   }
 }
 
+/**
+ * The finished move the source tombstone records to this destination, or null
+ * when the ordinary path still has something to do: a `prepared` phase, a
+ * reverse tombstone to clean up, or filesystem state that does not match. The
+ * same predicate as the recovery branch in `transferRepositoryWorktree`,
+ * without the repairs that branch performs.
+ */
+function completedTransfer(
+  input: TransferRepositoryWorktreeInput,
+): { sourcePath: string; destinationPath: string } | null {
+  const tombstone = readTransferTombstone(input.source, input.repo, input.dataDir);
+  if (!tombstone || tombstone.phase !== 'moved' || tombstone.destinationWorkUnitKey !== input.destination.key) {
+    return null;
+  }
+  if (readTransferTombstone(input.destination, input.repo, input.dataDir)) return null;
+  if (fs.existsSync(tombstone.sourcePath) || !fs.existsSync(tombstone.destinationPath)) return null;
+  return { sourcePath: tombstone.sourcePath, destinationPath: tombstone.destinationPath };
+}
+
 export async function transferRepositoryWorktree(
   input: TransferRepositoryWorktreeInput,
-): Promise<{ sourcePath: string; destinationPath: string }> {
+): Promise<{ sourcePath: string; destinationPath: string; alreadyMoved?: true }> {
   if (input.source.workgroupId !== input.workgroupId || input.destination.workgroupId !== input.workgroupId) {
     throw new Error('source and destination must use the same workgroup canonical');
   }
   if (input.source.key === input.destination.key) throw new Error('source and destination topics are identical');
 
   return withRepositoryLifecycleClaims([input.source, input.destination], async () => {
+    // A duplicate of a finished move must not drain anything. The drains below
+    // stop every container involved, and kill them all if one does not
+    // quiesce in time, so an agent retrying a move that already landed would
+    // pay that again for nothing. Tombstones and the move change only inside
+    // this function under both lifecycle claims, which this call holds (topic
+    // cleanup takes the same claim first, worktree-cleanup.ts), so reading
+    // them here, before the Git lock, is sound.
+    if (input.answerCompletedMoveWithoutQuiescence) {
+      const completed = completedTransfer(input);
+      if (completed && (await input.answerCompletedMoveWithoutQuiescence())) {
+        return { ...completed, alreadyMoved: true as const };
+      }
+    }
     // Stop source writers at a safe turn boundary before taking the Git lock.
     // A draining source tool may itself need that lock; taking it first would
     // deadlock quiescence against the very Git operation we are waiting on.
@@ -919,20 +961,27 @@ export async function applyRepositoryTransferAction(content: Record<string, unkn
       workgroupId,
     );
     const source = resolveTransferSourceWorkUnit(workgroupId, sourceThreadId, sourceRows);
+    const sourceEpoch = `repository-transfer-source:${requestId}`;
+    const destinationEpoch = `repository-transfer:${requestId}`;
 
-    await transferRepositoryWorktree({
+    const transferred = await transferRepositoryWorktree({
       workgroupId,
       repo,
       source,
       destination,
+      // A new request for a move that already landed has no barrier of its
+      // own to release, so it answers without draining. A replay of THIS
+      // request can still hold its barriers after a crash, and only the
+      // quiescing path re-adopts and releases them.
+      answerCompletedMoveWithoutQuiescence: async () =>
+        !(await sessionsHoldRepoIngressFence(
+          uniqueSessionsById(await sessionsForWorkUnit(source), await sessionsForWorkUnit(destination)),
+          [sourceEpoch, destinationEpoch],
+        )),
       beforeSourceActivityCheckWhileClaimed: async () => {
         sourceSessions = await sessionsForWorkUnit(source);
         rememberQuiescence(
-          await quiesceSessionsForRepositoryMounts(
-            sourceSessions,
-            `repository-transfer-source:${requestId}`,
-            REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS,
-          ),
+          await quiesceSessionsForRepositoryMounts(sourceSessions, sourceEpoch, REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS),
         );
         // Re-read under the lifecycle claim. A row created while barriers
         // activated cannot spawn, but it must still participate in the final
@@ -944,7 +993,7 @@ export async function applyRepositoryTransferAction(content: Record<string, unkn
         rememberQuiescence(
           await quiesceSessionsForRepositoryMounts(
             await sessionsForWorkUnit(destination),
-            `repository-transfer:${requestId}`,
+            destinationEpoch,
             REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS,
           ),
         );
@@ -999,6 +1048,28 @@ export async function applyRepositoryTransferAction(content: Record<string, unkn
         for (const pending of [...pendingQuiescences].reverse()) await releaseQuiescence(pending);
       },
     });
+    if (transferred.alreadyMoved) {
+      await writeSessionMessageIfNew(session.agent_group_id, session.id, {
+        id: `repository-transfer-complete-${requestId}`,
+        kind: 'chat',
+        timestamp: new Date().toISOString(),
+        platformId: session.agent_group_id,
+        channelType: 'agent',
+        threadId: session.thread_id,
+        content: JSON.stringify({
+          text:
+            `Repository transfer already complete: ${repo} is at ${transferred.destinationPath} in this topic. ` +
+            'Nothing was moved or restarted; continue working there.',
+          sender: 'system',
+          senderId: 'system',
+        }),
+        // A plain row: this answer stopped no container, and an on_wake row
+        // is read only by a fresh container's first poll.
+        onWake: 0,
+      });
+      wakeRepositoryMountSessions([session]);
+      return;
+    }
     const sessionsToWake = uniqueSessionsById(
       affectedSessions,
       releaseWakeSessions,

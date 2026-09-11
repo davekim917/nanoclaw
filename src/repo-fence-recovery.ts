@@ -111,6 +111,35 @@ function repositoryTransitionInFlight(
 }
 
 /**
+ * Does any of these sessions still hold an ACTIVE ingress fence under one of
+ * `epochs`?
+ *
+ * Asked before a repository transfer answers an already-completed move without
+ * quiescing: a replay of a crashed attempt can still hold its own barriers,
+ * and only the quiescing path re-adopts and releases them. A session with no
+ * mailbox holds no fence (`withExistingMailboxSession` resolves `undefined`,
+ * the answer the orphan pass below relies on too). A mailbox that cannot be
+ * read answers true, so doubt keeps the quiescing path.
+ */
+export async function sessionsHoldRepoIngressFence(sessions: Session[], epochs: readonly string[]): Promise<boolean> {
+  const wanted = new Set(epochs);
+  for (const [index, session] of sessions.entries()) {
+    await yieldEventLoop(index);
+    try {
+      const held = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => {
+        const fence = mailbox.readRepoIngressFence();
+        return fence?.state === 'active' && wanted.has(fence.epoch);
+      });
+      if (held) return true;
+    } catch (err) {
+      if (err instanceof SessionDbMissingError) continue;
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Release every active repository ingress fence whose publication is gone.
  *
  * Per-session isolated by construction: a session whose inbound DB cannot be
