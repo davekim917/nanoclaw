@@ -462,5 +462,34 @@ describe('computeReport', () => {
     const report = computeReport(prs, RISK_GLOBS, options);
     expect(report.after.shadowReviewed).toBe(0);
     expect(report.after.shadowReviewP1).toBe(0);
+    expect(report.after.shadowReviewFailed).toBe(0);
+  });
+
+  it('counts shadow-review-failed low-risk PRs separately, not as reviewed', () => {
+    const prs = [
+      // low-risk, after the switch, shadow-reviewed with a P1
+      pr({ number: 3, title: 'feat: c', mergedAt: '2026-09-11T00:00:00Z', files: ['docs/c.md'] }),
+      // low-risk, after the switch, analyze failed (no issue exists for it)
+      pr({ number: 7, title: 'feat: g', mergedAt: '2026-09-12T00:00:00Z', files: ['docs/g.md'] }),
+      // high-risk, so a matching shadow-review-failed label still never lands in the
+      // low-risk denominator (mirrors the high-risk exclusion test above)
+      pr({ number: 8, title: 'fix(guard): h', mergedAt: '2026-09-13T00:00:00Z', files: ['src/guard/x.ts'] }),
+    ];
+    const issues: ShadowReviewIssueData[] = [shadowReviewIssue({ number: 3, body: '- **P1** — a.ts:1 — bad' })];
+    const report = computeReport(prs, RISK_GLOBS, options, issues, [7, 8]);
+    expect(report.after.lowRiskMerged).toBe(2);
+    expect(report.after.shadowReviewFailed).toBe(1);
+    expect(report.after.shadowReviewFailedPRs).toEqual([7]);
+    expect(report.after.shadowReviewFailedRate).toBeCloseTo(1 / 2);
+    // #7 failed, not reviewed — must not also count as shadow-reviewed.
+    expect(report.after.shadowReviewed).toBe(1);
+    expect(report.after.shadowReviewedPRs).toEqual([3]);
+  });
+
+  it('defaults shadow-review-failed counts to zero when no PR numbers are supplied', () => {
+    const prs = [pr({ number: 1, title: 'feat: a', mergedAt: '2026-09-11T00:00:00Z', files: ['docs/a.md'] })];
+    const report = computeReport(prs, RISK_GLOBS, options, []);
+    expect(report.after.shadowReviewFailed).toBe(0);
+    expect(report.after.shadowReviewFailedPRs).toEqual([]);
   });
 });

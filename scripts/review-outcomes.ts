@@ -62,6 +62,15 @@
  * the conservative direction for a metric whose job is to justify tightening the risk
  * list, not to over-claim coverage.
  *
+ * Shadow-review FAILURE counting is separate and deliberately not folded into "not
+ * shadow-reviewed": when `analyze` errors before Claude produces a result (an expired
+ * credential, an action-side crash), `report` labels the PR `shadow-review-failed` instead
+ * of opening an issue or posting a clean-review comment (`.github/workflows/shadow-
+ * review.yml`, "Report that analyze failed"). Counting a failed run the same as "clean, no
+ * issue" would hide an outage inside a number that looks reassuring; `shadowReviewFailed`
+ * reports it as its own count instead, scoped to the same low-risk population as
+ * `shadowReviewed`.
+ *
  * Usage:
  *   pnpm exec tsx scripts/review-outcomes.ts [--repo owner/repo] [--switch <ISO>]
  *     [--days <n>] [--followup-days <n>] [--json]
@@ -111,6 +120,9 @@ export interface BucketResult {
   shadowReviewP1: number;
   shadowReviewP1Rate: number;
   shadowReviewP1PRs: number[];
+  shadowReviewFailed: number;
+  shadowReviewFailedRate: number;
+  shadowReviewFailedPRs: number[];
   caveat: string | null;
 }
 
@@ -363,6 +375,7 @@ function buildBucket(
   riskHighGlobs: string[],
   followupDays: number,
   shadowReviewIndex: Map<number, { hasP1: boolean }>,
+  shadowReviewFailedPrNumbers: ReadonlySet<number>,
 ): BucketResult {
   const lowRiskPRs = windowPRs.filter((pr) => isLowRisk(pr.files, riskHighGlobs));
 
@@ -375,6 +388,9 @@ function buildBucket(
 
   const shadowReviewedPRs = lowRiskPRs.filter((pr) => shadowReviewIndex.has(pr.number)).map((pr) => pr.number);
   const shadowReviewP1PRs = shadowReviewedPRs.filter((n) => shadowReviewIndex.get(n)?.hasP1 === true);
+  const shadowReviewFailedPRs = lowRiskPRs
+    .filter((pr) => shadowReviewFailedPrNumbers.has(pr.number))
+    .map((pr) => pr.number);
 
   for (const pr of lowRiskPRs) {
     const cutoff = new Date(pr.mergedAt).getTime() + followupDays * MS_PER_DAY;
@@ -422,6 +438,9 @@ function buildBucket(
     shadowReviewP1: shadowReviewP1PRs.length,
     shadowReviewP1Rate: n === 0 ? 0 : shadowReviewP1PRs.length / n,
     shadowReviewP1PRs,
+    shadowReviewFailed: shadowReviewFailedPRs.length,
+    shadowReviewFailedRate: n === 0 ? 0 : shadowReviewFailedPRs.length / n,
+    shadowReviewFailedPRs,
     caveat:
       n < MIN_SAMPLE_FOR_SIGNAL
         ? `only ${n} low-risk PR(s) merged ${label} the switch (<${MIN_SAMPLE_FOR_SIGNAL}) — only a large difference would show`
@@ -434,6 +453,7 @@ export function computeReport(
   riskHighGlobs: string[],
   options: Options,
   shadowReviewIssues: ShadowReviewIssueData[] = [],
+  shadowReviewFailedPrNumbers: number[] = [],
 ): ReportResult {
   const switchMs = new Date(options.switchIso).getTime();
   const beforeStart = switchMs - options.days * MS_PER_DAY;
@@ -441,6 +461,7 @@ export function computeReport(
 
   const sorted = [...allPRs].sort((a, b) => new Date(a.mergedAt).getTime() - new Date(b.mergedAt).getTime());
   const shadowReviewIndex = buildShadowReviewIndex(shadowReviewIssues);
+  const failedPrNumberSet = new Set(shadowReviewFailedPrNumbers);
 
   const beforePRs = sorted.filter((pr) => {
     const t = new Date(pr.mergedAt).getTime();
@@ -451,8 +472,24 @@ export function computeReport(
     return t >= switchMs && t < afterEnd;
   });
 
-  const before = buildBucket('before', beforePRs, sorted, riskHighGlobs, options.followupDays, shadowReviewIndex);
-  const after = buildBucket('after', afterPRs, sorted, riskHighGlobs, options.followupDays, shadowReviewIndex);
+  const before = buildBucket(
+    'before',
+    beforePRs,
+    sorted,
+    riskHighGlobs,
+    options.followupDays,
+    shadowReviewIndex,
+    failedPrNumberSet,
+  );
+  const after = buildBucket(
+    'after',
+    afterPRs,
+    sorted,
+    riskHighGlobs,
+    options.followupDays,
+    shadowReviewIndex,
+    failedPrNumberSet,
+  );
 
   const wholeWindowPRs = sorted.filter((pr) => {
     const t = new Date(pr.mergedAt).getTime();
@@ -559,6 +596,34 @@ export function fetchShadowReviewIssues(repo: string): ShadowReviewIssueData[] {
   return issues.map((issue) => ({ number: issue.number, title: issue.title, body: issue.body ?? '' }));
 }
 
+interface RawLabeledPr {
+  number: number;
+}
+
+/**
+ * PR numbers currently carrying `shadow-review-failed` — `analyze` errored before
+ * producing a result, so no shadow-review issue exists for these even though they were
+ * selected for review (see the file header, "Shadow-review FAILURE counting").
+ */
+export function fetchShadowReviewFailedPRs(repo: string): number[] {
+  const raw = gh([
+    'pr',
+    'list',
+    '--repo',
+    repo,
+    '--label',
+    'shadow-review-failed',
+    '--state',
+    'all',
+    '--json',
+    'number',
+    '--limit',
+    '1000',
+  ]);
+  const prs = JSON.parse(raw) as RawLabeledPr[];
+  return prs.map((pr) => pr.number);
+}
+
 // ─────────────────────────── CLI ───────────────────────────────────────────
 
 function parseArgs(argv: readonly string[]): Options {
@@ -646,6 +711,10 @@ function printBucket(bucket: BucketResult): void {
     `    shadow-review P1:          ${bucket.shadowReviewP1} (${pct(bucket.shadowReviewP1Rate)})` +
       (bucket.shadowReviewP1PRs.length ? ` [${bucket.shadowReviewP1PRs.map((n) => `#${n}`).join(', ')}]` : ''),
   );
+  console.log(
+    `    shadow-review FAILED:      ${bucket.shadowReviewFailed} (${pct(bucket.shadowReviewFailedRate)})` +
+      (bucket.shadowReviewFailedPRs.length ? ` [${bucket.shadowReviewFailedPRs.map((n) => `#${n}`).join(', ')}]` : ''),
+  );
   if (bucket.caveat) console.log(`    caveat: ${bucket.caveat}`);
 }
 
@@ -674,8 +743,9 @@ function main(): void {
   const sinceIso = new Date(new Date(options.switchIso).getTime() - options.days * MS_PER_DAY).toISOString();
   const allPRs = fetchMergedPRs(options.repo, sinceIso);
   const shadowReviewIssues = fetchShadowReviewIssues(options.repo);
+  const shadowReviewFailedPrNumbers = fetchShadowReviewFailedPRs(options.repo);
 
-  const report = computeReport(allPRs, riskHighGlobs, options, shadowReviewIssues);
+  const report = computeReport(allPRs, riskHighGlobs, options, shadowReviewIssues, shadowReviewFailedPrNumbers);
 
   if (options.json) {
     console.log(JSON.stringify(report, null, 2));

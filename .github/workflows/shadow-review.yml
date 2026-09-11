@@ -156,6 +156,7 @@ jobs:
       pull-requests: read
     outputs:
       findings: ${{ steps.review.outputs.structured_output }}
+      failure_reason: ${{ steps.failure-reason.outputs.reason }}
     steps:
       # merge_commit_sha, never head.sha (see the trust-boundary note above). This
       # ref is already reachable from main, so nothing here executes PR-authored
@@ -246,13 +247,74 @@ jobs:
             --disallowedTools "Bash,Write,Edit,WebSearch,WebFetch"
             --json-schema '{"type":"object","properties":{"findings":{"type":"array","items":{"type":"object","properties":{"severity":{"type":"string","enum":["P1","P2"]},"file":{"type":"string"},"line":{"type":["integer","null"]},"class":{"type":"string"},"description":{"type":"string"}},"required":["severity","file","description"]}}},"required":["findings"]}'
 
+      # The action hides the model's actual result/error text from normal logs by
+      # design (`sanitizeSdkOutput`, `base-action/src/run-claude-sdk.ts:117-160`,
+      # only prints a sanitized summary — subtype/is_error/duration/cost/turns —
+      # never the text itself). But it always writes the full, unsanitized SDK
+      # message transcript to `$RUNNER_TEMP/claude-execution-output.json`
+      # (`base-action/src/execution-file.ts:6,8-13,15-32`: one JSON array, written
+      # by `writeExecutionFile` before the run either returns or re-throws,
+      # `run-claude-sdk.ts:186,213-214,222`). Its last entry is the `result`
+      # message: on `SDKResultSuccess` (subtype "success", `sdk.d.ts` ~4999-5040)
+      # `.result` carries the final assistant text OR, when `is_error` is true,
+      # "the error text when the turn ended on an API error" (the type's own doc
+      # comment); on `SDKResultError` (`sdk.d.ts` ~4957-4988, the max-turns/
+      # max-budget/max-structured-output-retries/during-execution subtypes) there
+      # is no `.result` field at all, only `errors: string[]`. So this reads
+      # `.result`, falls back to `.errors` joined, and falls back again to a
+      # generic message if the file is missing entirely (a failure before
+      # `runClaudeWithSdk` ran at all — e.g. `checkHumanActor`,
+      # `restoreConfigFromBase`, CLI install).
+      - name: Report the failure reason
+        id: failure-reason
+        if: failure()
+        run: |
+          set -uo pipefail
+          FILE="${{ runner.temp }}/claude-execution-output.json"
+          if [ ! -f "$FILE" ]; then
+            REASON="no execution output was written — the run failed before Claude started"
+          else
+            REASON=$(jq -r '
+              if length == 0 then "no messages recorded in the execution output"
+              else (.[-1].result // (.[-1].errors // [] | join("; ")) // "message present but no result/errors field")
+              end
+            ' "$FILE" 2>/dev/null)
+            if [ -z "$REASON" ]; then
+              REASON="could not parse the execution output"
+            fi
+          fi
+          # Flatten to one line and cap length before it goes anywhere (step
+          # summary, a later job output, potentially a PR comment via `report`).
+          REASON=$(printf '%s' "$REASON" | tr -d '\r' | tr '\n' ' ' | cut -c1-300)
+          # Same known-token-prefix scrub as `report` — see that job for why a
+          # generic secret-shape heuristic isn't used.
+          if printf '%s' "$REASON" | grep -qE 'ghs_|ghp_|gho_|ghu_|ghr_|github_pat_|sk-ant-'; then
+            REASON="[redacted: the raw error text contained a token-shaped string]"
+          fi
+          echo "Shadow review failed. Reason: $REASON"
+          {
+            echo "## Shadow review failed"
+            echo ""
+            echo "$REASON"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "reason=$REASON" >> "$GITHUB_OUTPUT"
+
   report:
     needs: analyze
+    # `always()` bypasses the implicit `success()` gate `needs:` puts on this job,
+    # so it isn't itself skipped by `analyze` failing — but it must still respect
+    # the same selection predicate `analyze` used (so an unselected PR's `report`
+    # doesn't fire just because `always()` is present), AND only proceed when
+    # `analyze` actually ran to a real conclusion: 'success' is the normal path,
+    # 'failure' is the new one below, and 'skipped'/'cancelled' fall through to
+    # neither and this job is skipped too.
     if: >-
+      always() &&
       github.event.pull_request.merged == true &&
       github.event.pull_request.base.ref == 'main' &&
       !contains(github.event.pull_request.labels.*.name, 'risk:high') &&
-      !contains(github.event.pull_request.labels.*.name, 'review:requested')
+      !contains(github.event.pull_request.labels.*.name, 'review:requested') &&
+      (needs.analyze.result == 'success' || needs.analyze.result == 'failure')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -262,7 +324,7 @@ jobs:
     steps:
       # Idempotent: creates the label on first run, no-ops (via --force, which updates
       # rather than errors) on every run after.
-      - name: Ensure the shadow-review label exists
+      - name: Ensure the shadow-review labels exist
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -272,15 +334,53 @@ jobs:
             --color 5319E7 \
             --description "Findings from a post-merge advisory review of a PR that merged without review (docs/specs/risk-based-review/plan.md)" \
             --force
+          gh label create shadow-review-failed \
+            --repo "$REPO" \
+            --color B60205 \
+            --description "The shadow-review analyze job errored before producing a result — this merge has no post-merge review until re-run (docs/specs/risk-based-review/plan.md)" \
+            --force
 
-      # The only step in this workflow that writes to GitHub — see the trust-boundary
-      # comment at the top of this file for why the model never reaches this token.
-      # `scripts/review-outcomes.ts` reads what this step writes back
-      # (buildShadowReviewIndex) to count skipped PRs that were reviewed and the P1s
-      # among them — it matches this exact title shape and the "- **P1**" / "- **P2**"
-      # bullet format below, so don't change either without updating that script's
-      # SHADOW_REVIEW_TITLE_RE / P1_LINE_RE.
+      # analyze errored before Claude produced a result (see that job's own
+      # "Report the failure reason" step). This merge gets neither an issue nor a
+      # clean-review comment — say so explicitly, once, rather than let it read as
+      # silently clean. Never itself fails the job a second time: every write is
+      # tolerated, and the step always exits 0.
+      - name: Report that analyze failed
+        if: needs.analyze.result == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REASON: ${{ needs.analyze.outputs.failure_reason }}
+        run: |
+          set -uo pipefail
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label shadow-review-failed \
+            || echo "::warning::could not label #$PR_NUMBER shadow-review-failed"
+
+          # Idempotent across retries of this job: skip if already posted.
+          MARKER="Shadow review could not run"
+          existing=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+            --jq "[.[] | select(.body | startswith(\"$MARKER\"))] | length" 2>/dev/null)
+          if [ "${existing:-0}" -gt 0 ]; then
+            echo "Failure comment already posted on #$PR_NUMBER; not posting again."
+            exit 0
+          fi
+
+          reason="${REASON:-unknown reason}"
+          gh pr comment "$PR_NUMBER" --repo "$REPO" \
+            --body "$MARKER: ${reason}. This merge has no post-merge review until it is re-run." \
+            || echo "::warning::could not comment on #$PR_NUMBER"
+          exit 0
+
+      # The only step in this workflow that writes findings to GitHub — see the
+      # trust-boundary comment at the top of this file for why the model never
+      # reaches this token. `scripts/review-outcomes.ts` reads what this step
+      # writes back (buildShadowReviewIndex) to count skipped PRs that were
+      # reviewed and the P1s among them — it matches this exact title shape and
+      # the "- **P1**" / "- **P2**" bullet format below, so don't change either
+      # without updating that script's SHADOW_REVIEW_TITLE_RE / P1_LINE_RE.
       - name: File findings, or confirm none were found
+        if: needs.analyze.result == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
