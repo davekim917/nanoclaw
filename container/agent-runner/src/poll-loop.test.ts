@@ -3409,6 +3409,36 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     expect(result.taskTurns!.map((t) => t.outcome?.text)).toEqual(['Real answer.']);
   });
 
+  // A no-echo result that consumed the fire's prompt draws a task-block
+  // nudge, which the CLI runs straight after it, with no idle in between.
+  // The nudge's own echo must not clear the held outcome before idle settles
+  // the fire's prompt (#619 review, P3-2).
+  it('keeps a no-echo outcome held across a nudge the CLI answers before idle', async () => {
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'c1' };
+      yield { type: 'result', text: '<message to="someone">done, echo dropped</message>', answeredPrompts: [] };
+      yield { type: 'init', continuation: 'c1' };
+      yield { type: 'result', text: 'Nothing left to send.', answeredPrompts: ['p-push-1'] };
+      yield { type: 'settled', unansweredPrompts: ['p-initial'] };
+    }
+    const pushed: string[] = [];
+    const query: AgentQuery = {
+      push: (m: string) => {
+        pushed.push(m);
+        return `p-push-${pushed.length}`;
+      },
+      initialPromptId: 'p-initial',
+      end: () => {},
+      abort: () => {},
+      events: events(),
+    };
+
+    const result = await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {});
+
+    expect(pushed.some((m) => m.includes('was not delivered'))).toBe(true);
+    expect(result.taskTurns!.map((t) => t.outcome?.text)).toEqual(['<message to="someone">done, echo dropped</message>']);
+  });
+
   it('a batch after a live change is compared against the LIVE settings, not the creation snapshot', async () => {
     // Round-2 P2, the same seam from the other side. `querySettings` is the
     // immutable creation snapshot, so once a live change lands it no longer

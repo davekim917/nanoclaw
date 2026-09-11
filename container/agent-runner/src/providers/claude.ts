@@ -511,6 +511,14 @@ class MessageStream {
    * consumed with no echo. The CLI does not go idle between queued turns, so
    * nothing it has yet to run is settled here. A prompt pushed after that
    * result is left alone too, since this idle may predate its arrival.
+   *
+   * The snapshot is taken when the runner READS a result, not when the CLI
+   * produced it, so a prompt pushed in the milliseconds between can still be
+   * settled at an idle that predates it and credited with that result.
+   * Leaving recent pushes out instead would strand a prompt that really was
+   * consumed with no echo: nothing would ever clear it, and the turn level
+   * would stay up until the ceiling. One misattributed record in that race is
+   * the cheaper failure.
    */
   settle(): string[] {
     const settled = [...this.settleable].filter((id) => this.outstanding.has(id));
@@ -3068,6 +3076,13 @@ export class ClaudeProvider implements AgentProvider {
     return {
       push: (msg) => stream.push(msg),
       initialPromptId,
+      // Holds the turn level while a prompt is unanswered. The hold ends at the
+      // prompt's echo or at the CLI's idle; there is no runner-side timer. It
+      // relies on the CLI (2.1.263) emitting idle even while background agents
+      // run: a CLI that withheld idle during background work (for example with
+      // CLAUDE_CODE_BG_TASKS_REPORT_RUNNING on by default) would hold the level
+      // for that work's duration after a dropped echo, bounded only by the
+      // 30-minute ceiling.
       hasQueuedWork: () => sessionStateSeen && stream.outstanding.size > 0,
       end: () => stream.end(),
       events: translateEvents(),
