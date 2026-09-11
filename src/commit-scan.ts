@@ -16,15 +16,18 @@
  * Same logic + state table as the container-side tool — they coexist
  * idempotently because both gate on commit_digest_state.last_commit_sha.
  */
-import { execFileSync } from 'child_process';
+import { execFile } from 'node:child_process';
 import fs from 'fs';
 import path from 'path';
+import { promisify } from 'node:util';
 
 import { GROUPS_DIR } from './config.js';
 import { addShipLogEntry, getCommitDigestState, upsertCommitDigestState } from './db/backlog.js';
 import { getAllAgentGroups } from './db/agent-groups.js';
 import { onHostShutdown, onHostStart } from './host-lifecycle.js';
 import { log } from './log.js';
+
+const execFileAsync = promisify(execFile);
 
 const SCAN_INTERVAL_MS = 10 * 60 * 1000;
 const STARTUP_DELAY_MS = 90_000;
@@ -38,11 +41,33 @@ const FIRST_SCAN_COMMIT_CAP = 100;
 const DESCRIPTION_COMMIT_CAP = 20;
 
 let timer: NodeJS.Timeout | null = null;
+// Guards against overlapping scans now that git calls are async (#648
+// follow-up): the old execFileSync-based scan could never overlap its own
+// re-armed timer, because every await inside it settled as a same-tick
+// microtask before the event loop could reach a timer callback. Now each git
+// call actually yields, so a scan slower than SCAN_INTERVAL_MS (e.g. every
+// repo's `git fetch` timing out at 30s with the network down — 72 repos ×
+// 30s ≈ 36min) would otherwise let two scans run at once: both read
+// commit_digest_state.last_commit_sha before either updates it, so the same
+// commits get recorded twice, and concurrent fetches in one repo contend on
+// git's own lock.
+let scanInFlight = false;
 
 export function startCommitScan(): void {
   if (timer) return;
   timer = setTimeout(function tick() {
-    runCommitScanOnce().catch((error) => log.error('Commit scan failed', { error: errorMessage(error) }));
+    if (scanInFlight) {
+      log.debug('Commit scan tick skipped — previous scan still in flight');
+    } else {
+      scanInFlight = true;
+      runCommitScanOnce()
+        .catch((error) => log.error('Commit scan failed', { error: errorMessage(error) }))
+        .finally(() => {
+          scanInFlight = false;
+        });
+    }
+    // Re-armed unconditionally, same as before: a skipped or failed tick must
+    // not stop future ticks from firing.
     timer = setTimeout(tick, SCAN_INTERVAL_MS);
     timer.unref?.();
   }, STARTUP_DELAY_MS);
@@ -77,7 +102,7 @@ export async function runCommitScanOnce(groupsDir: string = GROUPS_DIR): Promise
   for (const group of groups) {
     const groupDir = path.join(groupsDir, group.folder);
     if (!fs.existsSync(groupDir)) continue;
-    const repos = discoverRepos(groupDir);
+    const repos = await discoverRepos(groupDir);
     for (const repoDir of repos) {
       const commits = await scanRepo(repoDir, group.id);
       if (commits > 0) totalCommits += commits;
@@ -89,14 +114,15 @@ export async function runCommitScanOnce(groupsDir: string = GROUPS_DIR): Promise
   }
 }
 
-function isGitRepo(dir: string): boolean {
+async function isGitRepo(dir: string): Promise<boolean> {
   if (!fs.existsSync(path.join(dir, '.git'))) return false;
-  return readGit(dir, ['rev-parse', '--is-inside-work-tree'], 'validate checkout')?.trim() === 'true';
+  const stdout = await readGit(dir, ['rev-parse', '--is-inside-work-tree'], 'validate checkout');
+  return stdout?.trim() === 'true';
 }
 
-export function discoverRepos(root: string): string[] {
+export async function discoverRepos(root: string): Promise<string[]> {
   const repos: string[] = [];
-  if (isGitRepo(root)) repos.push(root);
+  if (await isGitRepo(root)) repos.push(root);
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(root, { withFileTypes: true });
@@ -106,7 +132,7 @@ export function discoverRepos(root: string): string[] {
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const subDir = path.join(root, entry.name);
-    if (isGitRepo(subDir)) repos.push(subDir);
+    if (await isGitRepo(subDir)) repos.push(subDir);
   }
   return repos;
 }
@@ -116,14 +142,25 @@ function errorMessage(error: unknown): string {
   return String(error);
 }
 
-function readGit(repoDir: string, args: string[], operation: string, timeout = 5000): string | null {
+async function readGit(repoDir: string, args: string[], operation: string, timeout = 5000): Promise<string | null> {
   try {
-    return execFileSync('git', args, {
+    // execFile has no `stdio` option — @types/node's ExecFileOptions
+    // (node_modules/@types/node/child_process.d.ts:1053) extends only
+    // CommonOptions + Abortable, unlike CommonSpawnOptions (:658), so it
+    // can't reject a fetch's credential prompt the way execFileSync's
+    // `stdio: ['ignore', 'pipe', 'pipe']` did. util.promisify's custom
+    // execFile implementation attaches the live ChildProcess as `.child`
+    // on the returned promise (PromiseWithChild, :1023), so ending stdin
+    // immediately reproduces the same "no prompt, fail on timeout"
+    // behavior instead of leaving the pipe open for git to block on.
+    const pending = execFileAsync('git', args, {
       cwd: repoDir,
       encoding: 'utf-8',
       timeout,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    }).toString();
+    });
+    pending.child.stdin?.end();
+    const { stdout } = await pending;
+    return stdout.toString();
   } catch (error) {
     const stderr = (error as { stderr?: unknown }).stderr;
     const stderrText = Buffer.isBuffer(stderr) ? stderr.toString('utf8').trim() : String(stderr ?? '').trim();
@@ -149,15 +186,17 @@ function parseCommitLine(line: string): CommitInfo {
   return { sha, shortSha, subject, authorName, date };
 }
 
-function getDefaultBranch(repoDir: string): string | null {
-  const stdout = readGit(repoDir, ['symbolic-ref', 'refs/remotes/origin/HEAD'], 'read default branch');
+async function getDefaultBranch(repoDir: string): Promise<string | null> {
+  const stdout = await readGit(repoDir, ['symbolic-ref', 'refs/remotes/origin/HEAD'], 'read default branch');
   if (stdout !== null) {
     const ref = stdout.trim();
     const match = ref.match(/^refs\/remotes\/origin\/(.+)$/);
     if (match) return match[1];
   } else {
     for (const branch of ['main', 'master', 'develop']) {
-      if (readGit(repoDir, ['rev-parse', '--verify', `refs/heads/${branch}`], `verify default branch ${branch}`)) {
+      if (
+        await readGit(repoDir, ['rev-parse', '--verify', `refs/heads/${branch}`], `verify default branch ${branch}`)
+      ) {
         return branch;
       }
     }
@@ -165,21 +204,21 @@ function getDefaultBranch(repoDir: string): string | null {
   return null;
 }
 
-function fetchOrigin(repoDir: string): void {
-  if (readGit(repoDir, ['fetch', '--quiet', '--no-tags', 'origin'], 'fetch origin', 30_000) === null) {
+async function fetchOrigin(repoDir: string): Promise<void> {
+  if ((await readGit(repoDir, ['fetch', '--quiet', '--no-tags', 'origin'], 'fetch origin', 30_000)) === null) {
     // Network failure, auth missing, repo without origin — fall through and
     // scan whatever the local refs already have. Loud failure here would
     // suppress every repo's data on a transient blip.
   }
 }
 
-function getLatestCommitSha(repoDir: string, branch: string): string | null {
-  const stdout = readGit(repoDir, ['rev-parse', branch], `read latest commit ${branch}`);
+async function getLatestCommitSha(repoDir: string, branch: string): Promise<string | null> {
+  const stdout = await readGit(repoDir, ['rev-parse', branch], `read latest commit ${branch}`);
   return stdout?.trim() || null;
 }
 
-function getDirectCommitsSince(repoDir: string, branch: string, sinceSha: string): CommitInfo[] {
-  const stdout = readGit(
+async function getDirectCommitsSince(repoDir: string, branch: string, sinceSha: string): Promise<CommitInfo[]> {
+  const stdout = await readGit(
     repoDir,
     ['log', '--no-merges', '--first-parent', '--format=%H%x00%h%x00%s%x00%an%x00%aI', `${sinceSha}..${branch}`],
     'read direct commits',
@@ -189,8 +228,8 @@ function getDirectCommitsSince(repoDir: string, branch: string, sinceSha: string
   return stdout.trim().split('\n').map(parseCommitLine).reverse();
 }
 
-function getRecentCommits(repoDir: string, branch: string, limit: number): CommitInfo[] {
-  const stdout = readGit(
+async function getRecentCommits(repoDir: string, branch: string, limit: number): Promise<CommitInfo[]> {
+  const stdout = await readGit(
     repoDir,
     [
       'log',
@@ -210,7 +249,7 @@ function getRecentCommits(repoDir: string, branch: string, limit: number): Commi
 }
 
 async function scanRepo(repoDir: string, agentGroupId: string): Promise<number> {
-  const defaultBranch = getDefaultBranch(repoDir);
+  const defaultBranch = await getDefaultBranch(repoDir);
   if (!defaultBranch) return 0;
 
   // Refresh remote refs before reading. Without this we'd see whatever the
@@ -218,13 +257,13 @@ async function scanRepo(repoDir: string, agentGroupId: string): Promise<number> 
   // commits and merged PRs, that's exactly the wrong thing. Fetch only
   // updates refs/remotes/* and doesn't touch the working tree, so safe even
   // when the agent has WIP in a worktree.
-  fetchOrigin(repoDir);
+  await fetchOrigin(repoDir);
 
   // Track origin/<branch>, not local <branch>. The local ref drifts whenever
   // the user works on a feature branch and forgets to pull main; the remote
   // ref is what actually represents "shipped to default branch."
   const remoteRef = `origin/${defaultBranch}`;
-  const latestSha = getLatestCommitSha(repoDir, remoteRef);
+  const latestSha = await getLatestCommitSha(repoDir, remoteRef);
   if (!latestSha) return 0;
 
   const state = await getCommitDigestState(repoDir);
@@ -232,8 +271,8 @@ async function scanRepo(repoDir: string, agentGroupId: string): Promise<number> 
   if (lastSha === latestSha) return 0;
 
   const commits = lastSha
-    ? getDirectCommitsSince(repoDir, remoteRef, lastSha)
-    : getRecentCommits(repoDir, remoteRef, FIRST_SCAN_COMMIT_CAP);
+    ? await getDirectCommitsSince(repoDir, remoteRef, lastSha)
+    : await getRecentCommits(repoDir, remoteRef, FIRST_SCAN_COMMIT_CAP);
 
   await upsertCommitDigestState({
     repo_path: repoDir,

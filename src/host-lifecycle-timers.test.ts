@@ -75,7 +75,8 @@ describe('main.ts starts no duty timer directly', () => {
  * Covers every named value export any src/**\/*.ts file imports from
  * 'child_process' / 'node:child_process' — verified via
  * `grep -rh "from '\(node:\)\?child_process'" src --include=*.ts | sort -u`:
- * exec, execFile, execFileSync (worktree-cleanup.ts, commit-scan.ts,
+ * exec, execFile (commit-scan.ts, among others — issue #648 moved it off
+ * execFileSync), execFileSync (worktree-cleanup.ts,
  * modules/repository-workspaces/index.ts, repository-workspaces.ts),
  * execSync, spawn (repository-workspaces.ts), spawnSync. `fork` is not
  * imported anywhere today but is included so a future duty adding it can't
@@ -199,8 +200,9 @@ describe('a timer that fails to start still aborts boot, and a failing interval 
     vi.doMock('./log.js', () => ({ log: logMock }));
     // Tripwire (see childProcessTripwireFactory): getAllAgentGroups()
     // returning [] already means commit-scan's own group loop — the only
-    // path that reaches execFileSync('git', …) — never runs; this is
-    // regression insurance, not the primary guard. spawnAttempts must stay
+    // path that reaches execFile('git', …) (async since #648; was
+    // execFileSync) — never runs; this is regression insurance, not the
+    // primary guard. spawnAttempts must stay
     // empty (asserted below) even though the module already `.catch`es its
     // own git failures, which would otherwise swallow a bare thrown tripwire
     // without ever failing the test.
@@ -229,6 +231,69 @@ describe('a timer that fails to start still aborts boot, and a failing interval 
     expect(spawnAttempts).toEqual([]);
 
     expect(unhandled).toEqual([]);
+  });
+
+  it('T-2c: a tick that fires while the previous scan is still in flight is skipped, and the next tick after it settles runs a new scan (#648 follow-up)', async () => {
+    vi.resetModules();
+    vi.useFakeTimers();
+
+    let callCount = 0;
+    // The first call returns a promise that only resolves once
+    // resolveFirstScan() is invoked below, so runCommitScanOnce()'s first
+    // await (`const groups = await getAllAgentGroups();`) hangs exactly as a
+    // real scan would while working through 72 repos' worth of git calls.
+    // Every later call resolves immediately with no groups. Held on an
+    // object rather than a bare `let`: TS's control-flow narrowing for a
+    // `let`-declared function-or-null variable reassigned inside a Promise
+    // executor collapses the later optional-call site to `never` (reproduced
+    // in isolation while writing this test) — a property write sidesteps it.
+    const state: { resolveFirstScan: (() => void) | null } = { resolveFirstScan: null };
+    vi.doMock('./db/agent-groups.js', () => ({
+      getAllAgentGroups: () => {
+        callCount += 1;
+        if (callCount === 1) {
+          return new Promise<never[]>((resolve) => {
+            state.resolveFirstScan = () => resolve([]);
+          });
+        }
+        return [];
+      },
+    }));
+    const logMock = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    vi.doMock('./log.js', () => ({ log: logMock }));
+    // Tripwire (see childProcessTripwireFactory), same regression insurance
+    // as T-2b: getAllAgentGroups() never resolving to a non-empty group list
+    // here means commit-scan's git-calling path never runs either.
+    const spawnAttempts: string[] = [];
+    vi.doMock('child_process', () => childProcessTripwireFactory(spawnAttempts));
+    vi.doMock('node:child_process', () => childProcessTripwireFactory(spawnAttempts));
+
+    const commitScan = await import('./commit-scan.js');
+    commitScan.startCommitScan();
+
+    // STARTUP_DELAY_MS (90s): fires the first tick, which starts a scan that
+    // hangs at its first await until resolveFirstScan() runs, below.
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(callCount).toBe(1);
+    expect(state.resolveFirstScan).not.toBeNull();
+
+    // SCAN_INTERVAL_MS (10min): the next tick fires while the first scan is
+    // still in flight. It must be skipped — no second scan started — not run
+    // concurrently with the first.
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+    expect(callCount).toBe(1);
+    expect(logMock.debug).toHaveBeenCalledWith('Commit scan tick skipped — previous scan still in flight');
+
+    // Let the first scan settle.
+    state.resolveFirstScan?.();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // The next tick after it settles starts a new scan.
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+    expect(callCount).toBe(2);
+
+    commitScan.stopCommitScan();
+    expect(spawnAttempts).toEqual([]);
   });
 });
 
