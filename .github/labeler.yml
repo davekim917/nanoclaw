@@ -18,7 +18,7 @@
 # deploy, gates, runner) so a reviewer can see which seam a PR touches without reading
 # the whole diff; `scripts/labeler-config.test.ts` asserts the two stay in sync. Keep
 # `risk:high` in the one shape the gate reads — one rule holding one
-# `any-glob-to-any-file` list of quoted globs that use only `*`, `?` and `**` — or every
+# `any-glob-to-any-file` list of quoted globs that use only `*` and `**` — or every
 # PR fails closed to review; `scripts/risk-scope.test.ts` checks this file against it.
 #
 # Replayed against PRs #510–#595 on 2026-09-10 (measured before the dimension labels

@@ -68,7 +68,7 @@ function pathsShapedLike(glob: string): string[] {
     for (const star of ['', 's', '.s']) {
       const p = glob
         .split('/')
-        .map((seg) => (seg === '**' ? deep : seg.replaceAll('*', star).replaceAll('?', 'q')))
+        .map((seg) => (seg === '**' ? deep : seg.replaceAll('*', star)))
         .filter(Boolean)
         .join('/');
       shaped.push(p, `${p}x`, `x${p}`, `x/${p}`, `${p}/x`, p.toUpperCase());
@@ -126,6 +126,18 @@ describe('risk-scope.jq reads labeler.yml', () => {
     const result = jq('risk_high_globs', yml, true);
     expect(result.status).toBe(5);
     expect(result.stderr).toContain('risk:high');
+  });
+
+  // Valid YAML the labeler reads, in a form this reader does not. codex-review.sh
+  // still calls such a repo risk-scoped, so the refusal fails closed to review.
+  it.each([
+    ['an indented document', "  risk:high:\n  - changed-files:\n    - any-glob-to-any-file:\n      - 'a'\n"],
+    ['an explicit key', "? risk:high\n: - changed-files:\n    - any-glob-to-any-file:\n      - 'a'\n"],
+  ])('refuses %s, which a YAML parser reads', (_name, yml) => {
+    expect(globsForRiskHigh(parse(yml) as Record<string, unknown>)).toEqual(['a']);
+    const result = jq('risk_high_globs', yml, true);
+    expect(result.status).toBe(5);
+    expect(result.stderr).toContain('not the one top-level `risk:high:` key');
   });
 });
 
@@ -185,7 +197,16 @@ describe('risk-scope.jq matches as actions/labeler v7 does', () => {
     expect(jqMatrix([glob], [file])).toEqual([[expected]]);
   });
 
+  it('refuses `?`, which the labeler counts in UTF-16 code units and jq in code points', () => {
+    // Under minimatch, `??` takes the two halves of one emoji.
+    expect(path.matchesGlob('a/\u{1F600}', 'a/??')).toBe(true);
+    const result = jq('glob_regex', 'a/??');
+    expect(result.status).toBe(5);
+    expect(result.stderr).toContain('uses syntax codex-review.sh does not match');
+  });
+
   it.each([
+    'src/a?.ts',
     'src/{a,b}.ts',
     'src/[ab].ts',
     'src/+(a).ts',

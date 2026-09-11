@@ -23,7 +23,8 @@ def risk_high_globs:
   def shape: error("risk:high in .github/labeler.yml is not the one shape codex-review.sh reads (- changed-files: - any-glob-to-any-file: - '<glob>' ...)");
   [ split("\n")[] | sub("\r$"; "") ] as $lines
   | [ range($lines | length) | select($lines[.] | test(key)) ] as $at
-  | if ($at | length) != 1 then error("risk:high is defined \($at | length) times in .github/labeler.yml")
+  | if ($at | length) == 0 then error("risk:high in .github/labeler.yml is not the one top-level `risk:high:` key codex-review.sh reads")
+    elif ($at | length) > 1 then error("risk:high is defined \($at | length) times in .github/labeler.yml")
     elif ($lines[$at[0]] | test(key + tail) | not) then shape
     else . end
   # The key's block runs to the next line that opens a top-level entry;
@@ -48,10 +49,12 @@ def risk_high_globs:
 # does — what actions/labeler v7 builds: `new Minimatch(g, {dot})`
 # (src/changedFiles.ts:229 at tag v7), with its `dot` input defaulting to true
 # (action.yml:17-19), which .github/workflows/risk-label.yml leaves alone. Only
-# the syntax labeler.yml uses is supported: literal characters, `*`, `?`, and
-# `**` as a whole segment. Braces, classes, extglobs, escapes, negation,
-# comments, and empty, `.` or `..` segments are errors, which codex-review.sh
-# turns into a `review` verdict instead of a guess.
+# the syntax labeler.yml uses is supported: literal characters, `*`, and `**` as
+# a whole segment. Braces, classes, extglobs, escapes, negation, comments, and
+# empty, `.` or `..` segments are errors, which codex-review.sh turns into a
+# `review` verdict instead of a guess. So is `?`: minimatch matches it against
+# one UTF-16 code unit and jq against one code point, so `a/??` matches `a/😀`
+# for the labeler and not here.
 def glob_regex:
   # Under dot: true a wildcard may match a name that starts with a dot, but a
   # segment it opens never matches `.` or `..`, and neither does `**`.
@@ -59,16 +62,15 @@ def glob_regex:
   def any_segment: notraverse + "[^/]*";
   def segment:
     if . == "*" then notraverse + "[^/]+"
-    else (if test("^[*?]") then notraverse else "" end)
+    else (if test("^[*]") then notraverse else "" end)
       + ([ explode[] | [.] | implode
            | if . == "*" then "[^/]*"
-             elif . == "?" then "[^/]"
              elif test("[.^$|+]") then "\\" + .
              else . end ]
          | join(""))
     end;
   if type != "string" or . == "" then error("risk:high holds an empty glob")
-  elif test("[\\[\\]{}()\\\\]|^[!#]|^/|/$|//|(^|/)\\.\\.?(/|$)") then error("risk:high glob \(tojson) uses syntax codex-review.sh does not match")
+  elif test("[?\\[\\]{}()\\\\]|^[!#]|^/|/$|//|(^|/)\\.\\.?(/|$)") then error("risk:high glob \(tojson) uses syntax codex-review.sh does not match")
   else
     # Consecutive `**` segments match what one does.
     (split("/") | reduce .[] as $s ([]; if $s == "**" and .[-1] == "**" then . else . + [$s] end)) as $segs

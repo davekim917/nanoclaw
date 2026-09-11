@@ -120,7 +120,21 @@ if [ -n "$rest" ]; then
       printf ']'
       exit 0
       ;;
+    */compare/*)
+      # compare--<head>.json is the comparison pinned to that head. Absent = the read fails.
+      basehead="\${rest#*/compare/}"
+      basehead="\${basehead%%\\?*}"
+      pinned="$MOCK_DIR/compare--\${basehead##*...}.json"
+      if [ ! -f "$pinned" ]; then
+        echo '{"message":"Not Found","status":"404"}'
+        echo 'gh: Not Found (HTTP 404)' >&2
+        exit 1
+      fi
+      cat "$pinned"
+      exit 0
+      ;;
     */pulls/*/files\\?*)
+      # What the unpinned listing serves: whatever the head is at that moment.
       # files.json holds every page, as --paginate --slurp prints them. Absent = the read fails.
       if [ ! -f "$MOCK_DIR/files.json" ]; then
         echo '{"message":"Server Error","status":"500"}'
@@ -322,7 +336,8 @@ function scopeFixture(
   opts: {
     labels?: string[];
     baseConfig?: string | null;
-    files?: Page[][] | null;
+    files?: Page[] | null;
+    unpinnedFiles?: Page[];
     changedFiles?: number;
     ci?: Page[];
     statuses?: Page[];
@@ -334,13 +349,19 @@ function scopeFixture(
     body?: string;
   } = {},
 ): void {
-  // The changed files, one array per page, as --paginate --slurp prints them.
-  // null = the listing fails. The PR's file count defaults to what is listed.
-  const files = opts.files === undefined ? [[changedFile('docs/notes.md')]] : opts.files;
-  const listed = files === null ? 1 : files.flat().length;
-  writeJson(root, 'pr.json', prState(opts.labels ?? [], HEAD, opts.title, opts.body, opts.changedFiles ?? listed));
-  if (files === null) fs.rmSync(path.join(root, 'files.json'), { force: true });
-  else writeJson(root, 'files.json', files);
+  // The files HEAD changes, as the comparison pinned to it lists them; null =
+  // that read fails. The unpinned `pulls/<n>/files` serves the same list unless
+  // a test moves the head underneath it (unpinnedFiles). The PR's file count
+  // defaults to what is listed.
+  const files = opts.files === undefined ? [changedFile('docs/notes.md')] : opts.files;
+  writeJson(
+    root,
+    'pr.json',
+    prState(opts.labels ?? [], HEAD, opts.title, opts.body, opts.changedFiles ?? files?.length ?? 1),
+  );
+  for (const name of [`compare--${HEAD}.json`, 'files.json']) fs.rmSync(path.join(root, name), { force: true });
+  if (files !== null) writeJson(root, `compare--${HEAD}.json`, { status: 'ahead', files });
+  if (files !== null || opts.unpinnedFiles) writeJson(root, 'files.json', [opts.unpinnedFiles ?? files]);
   if (opts.baseConfig !== null) fs.writeFileSync(path.join(root, 'labeler--main.yml'), opts.baseConfig ?? RISK_CONFIG);
   // One Actions listing, as the API returns it: the Risk label run, which
   // merge-check leaves out of CI, and the CI runs it requires green.
@@ -685,10 +706,7 @@ describe('codex-review risk-scoped review requests', () => {
 
   it.each([
     ['only on the PR head branch', null],
-    [
-      'on the base without a top-level risk:high key',
-      "docs:\n- changed-files:\n  - any-glob-to-any-file: ['docs/**']\n  risk:high: nested\n",
-    ],
+    ['on the base without risk:high anywhere', "docs:\n- changed-files:\n  - any-glob-to-any-file: ['docs/**']\n"],
   ])('treats a repo whose labeler.yml is %s as legacy', (_case, baseConfig) => {
     const root = tempRoot();
     scopeFixture(root, { baseConfig, labels: ['risk:high'] });
@@ -700,6 +718,35 @@ describe('codex-review risk-scoped review requests', () => {
     expect(result.calls).toContain('rest repos/example/repository/contents/.github/labeler.yml?ref=main\n');
     expect(result.calls).not.toContain('ref=feat');
   });
+
+  it.each([
+    [
+      'nested under another label',
+      "docs:\n- changed-files:\n  - any-glob-to-any-file: ['docs/**']\n  risk:high: nested\n",
+    ],
+    [
+      'in an indented document',
+      "  risk:high:\n  - changed-files:\n    - any-glob-to-any-file:\n      - 'src/router.ts'\n",
+    ],
+    ['as an explicit key', "? risk:high\n: - changed-files:\n    - any-glob-to-any-file:\n      - 'src/router.ts'\n"],
+  ])(
+    'treats a base labeler.yml that names risk:high %s as risk-scoped, and fails closed to review',
+    (_case, baseConfig) => {
+      const root = tempRoot();
+      scopeFixture(root, { baseConfig, labels: [] });
+
+      const scope = runHelper(root, ['scope']);
+      expect(scope.status).toBe(0);
+      const out = JSON.parse(scope.stdout) as { reason: string };
+      expect(out).toMatchObject({ mode: 'risk-scoped', verdict: 'review' });
+      expect(out.reason).toContain(
+        'fail closed: risk:high in .github/labeler.yml is not the one top-level `risk:high:` key codex-review.sh reads',
+      );
+
+      const merge = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(merge.status).toBe(24);
+    },
+  );
 
   it.each([
     [['risk:high'], 'labeled risk:high'],
@@ -726,7 +773,7 @@ describe('codex-review risk-scoped review requests', () => {
     const root = tempRoot();
     scopeFixture(root, {
       labels: ['PR: Fix'],
-      files: [[changedFile('docs/notes.md'), changedFile('src/routes.ts'), changedFile('github/ci.yml')]],
+      files: [changedFile('docs/notes.md'), changedFile('src/routes.ts'), changedFile('github/ci.yml')],
     });
 
     const scope = runHelper(root, ['scope']);
@@ -734,7 +781,8 @@ describe('codex-review risk-scoped review requests', () => {
     const out = JSON.parse(scope.stdout) as { reason: string };
     expect(out).toMatchObject({ mode: 'risk-scoped', verdict: 'skip', head: HEAD, labels: ['PR: Fix'] });
     expect(out.reason).toContain('no changed file matches a risk:high glob');
-    expect(scope.calls).toContain('rest repos/example/repository/pulls/1/files?per_page=100\n');
+    expect(scope.calls).toContain(`rest repos/example/repository/compare/main...${HEAD}?per_page=1\n`);
+    expect(scope.calls).not.toContain('/pulls/1/files');
     expect(scope.calls).not.toContain('actions/runs');
     expect(scope.sleep).toBe('');
 
@@ -744,10 +792,9 @@ describe('codex-review risk-scoped review requests', () => {
   });
 
   it.each([
-    ['a file on a risky path', [[changedFile('src/router.ts')]], 'src/router.ts'],
-    ['a new workflow under a dot directory', [[changedFile('.github/workflows/new.yml')]], '.github/workflows/new.yml'],
-    ['a rename off a risky path', [[changedFile('src/routing.ts', 'src/router.ts')]], 'src/router.ts'],
-    ['a risky file on the second page', [[changedFile('docs/a.md')], [changedFile('src/router.ts')]], 'src/router.ts'],
+    ['a file on a risky path', [changedFile('src/router.ts')], 'src/router.ts'],
+    ['a new workflow under a dot directory', [changedFile('.github/workflows/new.yml')], '.github/workflows/new.yml'],
+    ['a rename off a risky path', [changedFile('src/routing.ts', 'src/router.ts')], 'src/router.ts'],
   ])('reviews a head with no label that changes %s', (_case, files, file) => {
     const root = tempRoot();
     scopeFixture(root, { labels: [], files });
@@ -770,7 +817,7 @@ describe('codex-review risk-scoped review requests', () => {
     const root = tempRoot();
     scopeFixture(root, {
       labels: ['review:requested'],
-      files: [['e', 'd', 'c', 'b', 'a'].map((n) => changedFile(`.github/${n}.yml`)).concat(changedFile('docs/x.md'))],
+      files: [...['e', 'd', 'c', 'b', 'a'].map((n) => changedFile(`.github/${n}.yml`)), changedFile('docs/x.md')],
     });
 
     const scope = runHelper(root, ['scope']);
@@ -782,10 +829,15 @@ describe('codex-review risk-scoped review requests', () => {
   });
 
   it.each([
-    ['the changed files cannot be listed', { files: null }, "fail closed: could not list this PR's changed files"],
+    ['the changed files cannot be listed', { files: null }, 'fail closed: could not list the files this head changes'],
+    [
+      "the comparison reaches GitHub's 300-file cap",
+      { files: Array.from({ length: 300 }, (_, i) => changedFile(`docs/${i}.md`)) },
+      'fail closed: the comparison lists 300 files, the most GitHub lists',
+    ],
     [
       'the PR changes more files than GitHub listed',
-      { files: [[changedFile('docs/a.md')]], changedFiles: 3001 },
+      { files: [changedFile('docs/a.md')], changedFiles: 3001 },
       'fail closed: the PR changes 3001 files but GitHub listed 1',
     ],
     [
@@ -810,6 +862,29 @@ describe('codex-review risk-scoped review requests', () => {
 
     const merge = runHelper(root, ['merge-check', '--head', HEAD]);
     expect(merge.status).toBe(24);
+  });
+
+  it('judges the files of the head it read, not what the unpinned listing serves meanwhile', () => {
+    // The head it read changes src/router.ts. Between the two head reads the
+    // branch is pushed to a harmless commit with as many files and back again, so
+    // both reads see the same head while pulls/<n>/files lists the other commit.
+    const root = tempRoot();
+    scopeFixture(root, {
+      labels: [],
+      files: [changedFile('src/router.ts')],
+      unpinnedFiles: [changedFile('docs/notes.md')],
+    });
+
+    const scope = runHelper(root, ['scope']);
+    expect(scope.status).toBe(0);
+    expect(JSON.parse(scope.stdout)).toMatchObject({
+      head: HEAD,
+      verdict: 'review',
+      reason: 'changes risk:high path src/router.ts',
+    });
+    expect(scope.calls).toContain(`rest repos/example/repository/compare/main...${HEAD}?per_page=1\n`);
+    expect(scope.calls).not.toContain('/pulls/1/files');
+    expect(scope.calls.match(/^pr view$/gm)).toHaveLength(2);
   });
 
   it('fails closed when the head moves while its changed files are listed', () => {

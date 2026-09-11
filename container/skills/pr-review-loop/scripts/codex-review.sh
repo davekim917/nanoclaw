@@ -458,8 +458,8 @@ run_gate() {
 }
 
 # ── Risk-scoped repos ────────────────────────────────────────────────────────
-# A repo opts in by defining a top-level `risk:high` key in .github/labeler.yml
-# on the PR's BASE branch. There Codex automatic review is off, a round happens
+# A repo opts in by naming `risk:high` in .github/labeler.yml on the PR's BASE
+# branch. There Codex automatic review is off, a round happens
 # only when `request` asks for one, and `scope` decides whether a head needs
 # one by matching the PR's changed files against those globs itself
 # (risk-scope.jq). The `Risk label` workflow puts the same answer on the PR as
@@ -491,6 +491,11 @@ FIXES_PR_LINE_RE='(^|\n)Fixes-PR:[ \t]*(#[0-9]+|none)\b'
 # through the API, never the checkout: a PR can edit its own copy. A 404 is
 # absence (legacy); any other failure is no verdict, never a guess. gh prints
 # the error body on stdout.
+#
+# Detection is deliberately loose, `risk:high` anywhere in the file, and parsing
+# (risk-scope.jq) deliberately strict: an indented document or an explicit
+# `? risk:high` key is valid YAML the labeler reads, and a form the reader cannot
+# parse must fail closed to `review`, never fall through to legacy.
 LABELER_YML=""
 repo_mode() {
   local ref raw status=0
@@ -506,7 +511,7 @@ repo_mode() {
     return 1
   fi
   LABELER_YML="$raw"
-  if printf '%s\n' "$raw" | grep -Eq "^(risk:high|'risk:high'|\"risk:high\")[[:space:]]*:"; then
+  if printf '%s\n' "$raw" | grep -qF 'risk:high'; then
     SCOPE_MODE=risk-scoped
   else
     SCOPE_MODE=legacy
@@ -522,9 +527,9 @@ repo_mode() {
 # labeler.yml — its path, or for a rename its old path too, since moving a file
 # off a risky path changes that path — or when risk:high or review:requested is
 # on the PR. Anything that keeps the files from being judged is `review` as
-# well: a failed listing, a listing shorter than the PR's file count (GitHub
-# lists at most 3000), a head that moved while they were read, and a labeler.yml
-# risk-scope.jq cannot read.
+# well: a failed listing, one at GitHub's 300-file cap for a comparison or
+# shorter than the PR's file count, a head that moved while they were read, and
+# a labeler.yml risk-scope.jq cannot read.
 SCOPE_HEAD=""
 SCOPE_MODE=""
 SCOPE_VERDICT=""
@@ -539,16 +544,24 @@ scope_eval() {
   repo_mode "$base" || return 1
   if [ "$SCOPE_MODE" = legacy ]; then
     SCOPE_VERDICT=auto
-    SCOPE_REASON="no top-level risk:high in .github/labeler.yml on $base; automatic review handles this repo"
+    SCOPE_REASON="no risk:high in .github/labeler.yml on $base; automatic review handles this repo"
     return 0
   fi
   SCOPE_VERDICT=review
-  files=$(gh api --paginate --slurp "repos/$REPO/pulls/$PR/files?per_page=100") || {
-    SCOPE_REASON="fail closed: could not list this PR's changed files"
+  # The files come from a comparison pinned to the head SHA read above, so they
+  # are that commit's files and no other's. `pulls/<n>/files` is not pinned: it
+  # lists whatever the head is when it is served, so a head pushed away and back
+  # between the two head reads would pass another commit's files off as this
+  # one's. A comparison lists its files on the first page only, at most 300 of
+  # them (docs.github.com/en/rest/commits/commits#compare-two-commits), so
+  # per_page=1 only trims the commit list.
+  files=$(gh api "repos/$REPO/compare/$(jq -rn --arg r "$base" '$r | @uri')...$SCOPE_HEAD?per_page=1") || {
+    SCOPE_REASON="fail closed: could not list the files this head changes"
     return 0
   }
-  # Head, labels and file count in ONE read, after the listing: the files
-  # describe this head only if it did not move while they were read.
+  # Head, labels and file count in ONE read, after the listing. The files are
+  # already this head's; a head that has moved since means the verdict is about
+  # a commit the PR no longer has.
   pr_json=$(gh pr view "$PR" --repo "$REPO" --json headRefOid,labels,changedFiles) || return 1
   after=$(printf '%s' "$pr_json" | jq -er .headRefOid) || return 1
   SCOPE_LABELS=$(printf '%s' "$pr_json" | jq -c '[.labels[]?.name]') || return 1
@@ -557,18 +570,20 @@ scope_eval() {
     SCOPE_HEAD="$after"
     return 0
   fi
-  # The listing goes through stdin, not --argjson: 3000 files can exceed the
-  # kernel's per-argument limit. The reason names the first few matches.
+  # The comparison goes through stdin, not --argjson: with its patches it can
+  # exceed the kernel's per-argument limit. The reason names the first few
+  # matches.
   decision=$(printf '%s' "$files" | jq -c -L "$HERE" --arg yml "$LABELER_YML" --argjson pr "$pr_json" '
     include "risk-scope";
     [ $pr.labels[]?.name | select(. == "risk:high" or . == "review:requested") | "labeled \(.)" ] as $labeled
     | (try (
         ($yml | risk_high_globs | map(glob_regex)) as $regexes
-        | if type == "array" and all(.[]; type == "array") then [ .[][] ] else error("the changed-file listing is not a list of pages") end
+        | if (.files | type) == "array" then .files else error("the comparison lists no files") end
         | if all(.[]; (.filename | type) == "string") then . else error("a changed file has no filename") end
         | ([ .[].filename ] | unique | length) as $listed
-        | if ($pr.changedFiles | type) != "number" then error("GitHub did not say how many files this PR changes")
-          elif $pr.changedFiles > $listed then error("the PR changes \($pr.changedFiles) files but GitHub listed \($listed), and it lists at most 3000")
+        | if $listed >= 300 then error("the comparison lists \($listed) files, the most GitHub lists, so some may be missing")
+          elif ($pr.changedFiles | type) != "number" then error("GitHub did not say how many files this PR changes")
+          elif $pr.changedFiles > $listed then error("the PR changes \($pr.changedFiles) files but GitHub listed \($listed)")
           else . end
         | [ .[] | .filename, (.previous_filename // empty) ] | unique | matching($regexes)
         | if length == 0 then []
