@@ -69,6 +69,15 @@ describe('labeler.yml dimension labels stay in sync with risk:high', () => {
       expect(dimGlobs.has(glob), `risk:high glob "${glob}" is not covered by any risk:<dimension> label`).toBe(true);
     }
   });
+
+  // scripts/check-risk-coverage.ts fails closed on a missing baseline, but nothing stops
+  // a PR from deleting tests and committing a lower `--write`d baseline over the old one
+  // if this file itself were not gated — docs/specs/risk-based-review/plan.md, "Tests on
+  // risky paths".
+  it('protects the coverage ratchet baseline (coverage-risk-baseline.json)', () => {
+    expect(highGlobs.has('coverage-risk-baseline.json')).toBe(true);
+    expect(globsFor(config, 'risk:gates')).toContain('coverage-risk-baseline.json');
+  });
 });
 
 describe('globsFor', () => {
