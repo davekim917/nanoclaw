@@ -56,6 +56,22 @@ constraints:
     text: "Existing wiki repos under groups/*/wiki/ and scripts/wiki-autopush.sh cron must remain operational throughout rebuild."
     source: brief
     verified: true
+    status: retired
+    retired_note: >-
+      Retired 2026-09-11 during davekim917/nanoclaw#658's review. This
+      spec's own build-state.md already marks the whole feature "ARCHIVED
+      AND SUPERSEDED -- not current runtime state" (superseded by
+      docs/specs/workgroup-memory-and-session-capabilities/), so the
+      constraint's rebuild-window subject no longer applies regardless.
+      Separately, scripts/wiki-autopush.sh was found dormant on its own
+      evidence: no cron entry anywhere on the host (ubuntu/root crontab,
+      /etc/crontab, /etc/cron.d/*, cron.{hourly,daily,weekly}), no
+      systemd unit (installed or tracked in this repo's _ops/systemd/),
+      no ncl task or skill invokes it, its log last wrote 2026-07-20, and
+      its groups/*/wiki + data/workgroups/*/wiki globs miss where wiki
+      repos actually live (data/repositories/<workgroup>/wiki). Deleted
+      in nanoclaw#658 rather than repaired; its selfcheck and both
+      .github/labeler.yml glob entries were deleted with it.
   - id: C11
     type: HARD
     text: "Existing Ollama systemd unit on host must remain unmodified."
