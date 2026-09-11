@@ -258,6 +258,28 @@ export interface ArchiveProjectionStamp {
   mutations: number | null;
 }
 
+/** The fields of a stamp that identify WHICH projection it describes, not how fresh it is. */
+type ArchiveProjectionIdentity = Pick<ArchiveProjectionStamp, 'version' | 'agentGroupId' | 'scope'>;
+
+/**
+ * True when two stamps describe the same projection identity — same builder
+ * version on both sides, same calling agent, same scope.
+ *
+ * The ONE identity check, shared by `decideArchiveProjectionMode` (may this
+ * local stamp be trusted for reuse/append?) and `findArchiveSeedCandidate`
+ * (#667/#668: may this sibling's stamp be trusted as a seed?), so the two
+ * cannot drift apart — a sibling seed and a local append must agree on
+ * exactly what counts as "the same projection."
+ */
+function sameProjectionIdentity(a: ArchiveProjectionIdentity, b: ArchiveProjectionIdentity): boolean {
+  return (
+    a.version === ARCHIVE_PROJECTION_STAMP_VERSION &&
+    b.version === ARCHIVE_PROJECTION_STAMP_VERSION &&
+    a.agentGroupId === b.agentGroupId &&
+    JSON.stringify(a.scope ?? null) === JSON.stringify(b.scope ?? null)
+  );
+}
+
 /**
  * The SQL scope filter, matching `buildArchiveProjection`'s two branches
  * exactly — including that an EMPTY member array falls through to the legacy
@@ -463,23 +485,6 @@ export function readArchiveProjectionStamp(dstPath: string): ArchiveProjectionSt
   }
 }
 
-/**
- * The scope key by which two projections are compared for #667 seeding —
- * NOT `stamp.scope` verbatim, because `computeArchiveProjectionStamp` records
- * an empty `workgroupMemberIds` array as `[]` (truthy) rather than `null`,
- * while `archiveScopeFilter` (the function that actually decides which rows
- * land in the file, above) treats an empty array exactly like `undefined` —
- * both take the single-agent filter (`if (workgroupMemberIds &&
- * workgroupMemberIds.length > 0)`, this file, `buildArchiveProjection`).
- * Normalizing here closes that gap: without it, two DIFFERENT agents each
- * spawning with `workgroupMemberIds: []` would carry the "same" `[]` stamp
- * scope while actually holding their own, different, single-agent rows, and
- * this function would wrongly call that identical scope.
- */
-function seedScopeKey(scope: string[] | null): string[] | null {
-  return scope && scope.length > 0 ? [...scope].sort() : null;
-}
-
 /** What a seed candidate needs for #667: where its file is and what it claims to hold. */
 interface ArchiveSeedCandidate {
   dstPath: string;
@@ -487,17 +492,33 @@ interface ArchiveSeedCandidate {
 }
 
 /**
- * Look for an existing, same-scope sibling projection this brand-new session
- * can be seeded from instead of paying a full rebuild (#667).
+ * Look for an existing projection from THIS SAME agent group, at the same
+ * scope, that a brand-new session of theirs can be seeded from instead of
+ * paying a full rebuild (#667).
  *
- * "Identical scope" is the data-isolation boundary: a widened (workgroup)
- * scope matches only on the SORTED member set, because that set — not the
- * calling agent's id — is what `archiveScopeFilter` actually filters on for
- * a widened projection. The single-agent (legacy) scope has no member set to
- * compare, so it matches only a stamp for the SAME agent group — the one
- * case where "identical scope" and "identical caller" coincide. A mismatch on
- * either axis returns no candidate, which sends the caller down the existing
- * full-rebuild path — never a wrong-scope seed.
+ * Restricted to the calling agent's OWN prior sessions — not any workgroup
+ * sibling — via `sameProjectionIdentity`, the identical check
+ * `decideArchiveProjectionMode` uses to trust a LOCAL stamp. A full build
+ * always stamps every row with the caller's own `agent_group_id`
+ * (`buildArchiveProjection`, above), so a same-agent candidate's bytes are
+ * already exactly what a full build would write — nothing needs relabeling.
+ * An earlier version of this function widened to any workgroup sibling and
+ * relabeled `agent_group_id` after the copy; that relabel measured 7.4s and
+ * ~20% file growth on a 273 MB / 131k-row projection (FTS5's `AFTER UPDATE`
+ * trigger re-indexes every touched row), which would have eaten most of the
+ * win this issue is chasing. Production logs over 2.65 days show 211 of 217
+ * full builds (97%) already had a same-agent, same-scope projection built
+ * earlier, so this narrower rule keeps nearly all the benefit for none of
+ * that cost.
+ *
+ * "Same scope" is still the data-isolation boundary for the workgroup member
+ * set: a widened (workgroup) scope matches only the same SORTED member set,
+ * because that's what `archiveScopeFilter` actually filters rows on. A
+ * mismatch on any axis — different agent, different scope, a wrong-version
+ * stamp, a stamp whose file is gone — returns no candidate, which sends the
+ * caller down the existing full-rebuild path, never a wrong seed.
+ * `seedArchiveProjectionFrom` re-verifies this same boundary against the
+ * copied bytes before trusting the file at all.
  *
  * Scans every stamp under `DATA_DIR/projection-stamps`: cheap (one small JSON
  * read per existing session projection) and only reached when THIS session's
@@ -509,7 +530,11 @@ function findArchiveSeedCandidate(
   workgroupMemberIds: string[] | undefined,
   excludeDstPath: string,
 ): ArchiveSeedCandidate | null {
-  const wantScope = seedScopeKey(workgroupMemberIds ? [...workgroupMemberIds] : null);
+  const desiredIdentity: ArchiveProjectionIdentity = {
+    version: ARCHIVE_PROJECTION_STAMP_VERSION,
+    agentGroupId,
+    scope: workgroupMemberIds && workgroupMemberIds.length > 0 ? [...workgroupMemberIds].sort() : null,
+  };
   let entries: string[];
   try {
     entries = fs.readdirSync(PROJECTION_STAMPS_DIR);
@@ -526,15 +551,9 @@ function findArchiveSeedCandidate(
     } catch {
       continue; // Unreadable/corrupt stamp — never a seed source.
     }
-    if (!parsed || parsed.version !== ARCHIVE_PROJECTION_STAMP_VERSION) continue;
+    if (!parsed) continue;
     if (typeof parsed.dstPath !== 'string' || parsed.dstPath === excludeResolved) continue;
-
-    const candidateScope = seedScopeKey(parsed.scope ?? null);
-    const scopeMatches =
-      wantScope === null
-        ? candidateScope === null && parsed.agentGroupId === agentGroupId
-        : candidateScope !== null && JSON.stringify(candidateScope) === JSON.stringify(wantScope);
-    if (!scopeMatches) continue;
+    if (!sameProjectionIdentity(parsed, desiredIdentity)) continue;
 
     try {
       if (fs.statSync(parsed.dstPath).size === 0) continue; // Orphaned/partial file — not trustworthy.
@@ -551,21 +570,25 @@ function findArchiveSeedCandidate(
 }
 
 /**
- * Copy a same-scope sibling's projection file into `dstPath`, then relabel
- * every row to `agentGroupId` — the same attribution `buildArchiveProjection`
- * applies to every row it writes (see the comment on the workgroup-widened
- * SELECT above: "the row belongs to whoever is querying this projection").
+ * Copy a same-agent sibling's projection file into `dstPath`, verbatim.
  *
- * This relabel is not cosmetic. `appendArchiveProjection`'s dedup guard
- * (`ARCHIVE_DEDUP_KEY_SQL`) matches on `agent_group_id = @agent_group_id`
- * where `@agent_group_id` is always the CALLING agent — so a seeded row still
- * carrying the sibling's id would never match that guard, and cross-batch
- * dedup against the seeded rows would silently stop working the moment this
- * session starts appending its own workgroup's new messages.
+ * No relabel: `findArchiveSeedCandidate` only ever returns a candidate whose
+ * stamp carries the caller's own `agentGroupId` (see `sameProjectionIdentity`
+ * there), and a full build always stamps every row that way too — so a valid
+ * candidate's bytes already ARE what a full build would write.
  *
- * `fsync` before handing the file back to the caller: this copy is about to
- * be trusted as the durable baseline every append after it builds on, so it
- * must not still be sitting only in the page cache.
+ * That "only ever" is exactly what this function re-checks before returning,
+ * fail-closed, rather than trusting the stamp alone: `MIN`/`MAX
+ * (agent_group_id)` are both served by `idx_archive_ag_sent`, which leads
+ * with that column, so this costs about 1 ms even on a 131k-row projection —
+ * cheap insurance for a data-isolation boundary. A foreign id here means the
+ * candidate file on disk disagrees with what its own stamp claimed (a stale
+ * copy from an older build, a hand-edited fixture, corruption), and the
+ * caller must not trust it.
+ *
+ * `fsync` before any of that: this copy is about to be trusted as the
+ * durable baseline every append after it builds on, so it must not still be
+ * sitting only in the page cache.
  */
 function seedArchiveProjectionFrom(candidate: ArchiveSeedCandidate, dstPath: string, agentGroupId: string): void {
   fs.copyFileSync(candidate.dstPath, dstPath);
@@ -575,13 +598,24 @@ function seedArchiveProjectionFrom(candidate: ArchiveSeedCandidate, dstPath: str
   } finally {
     fs.closeSync(fd);
   }
-  const dst = new Database(dstPath);
+  const dst = new Database(dstPath, { readonly: true });
+  let bounds: { lo: string | null; hi: string | null };
   try {
-    dst
-      .prepare(`UPDATE messages_archive SET agent_group_id = ? WHERE agent_group_id != ?`)
-      .run(agentGroupId, agentGroupId);
+    bounds = dst.prepare(`SELECT MIN(agent_group_id) AS lo, MAX(agent_group_id) AS hi FROM messages_archive`).get() as {
+      lo: string | null;
+      hi: string | null;
+    };
   } finally {
     dst.close();
+  }
+  // An empty table (lo/hi both NULL) passes — there's nothing foreign in it.
+  const foreign =
+    (bounds.lo !== null && bounds.lo !== agentGroupId) || (bounds.hi !== null && bounds.hi !== agentGroupId);
+  if (foreign) {
+    throw new Error(
+      `Archive projection seed candidate ${candidate.dstPath} contains a foreign agent_group_id ` +
+        `(expected only ${agentGroupId}, saw range [${bounds.lo}, ${bounds.hi}])`,
+    );
   }
 }
 
@@ -667,10 +701,7 @@ export function decideArchiveProjectionMode(
 ): { mode: ArchiveProjectionMode; sinceRowid: number | null } {
   const rebuild = { mode: 'rebuilt' as const, sinceRowid: null };
   if (!previous) return rebuild;
-  if (previous.version !== ARCHIVE_PROJECTION_STAMP_VERSION) return rebuild;
-  if (current.version !== ARCHIVE_PROJECTION_STAMP_VERSION) return rebuild;
-  if (previous.agentGroupId !== current.agentGroupId) return rebuild;
-  if (JSON.stringify(previous.scope ?? null) !== JSON.stringify(current.scope ?? null)) return rebuild;
+  if (!sameProjectionIdentity(previous, current)) return rebuild;
   try {
     if (fs.statSync(dstPath).size === 0) return rebuild;
   } catch {
@@ -916,20 +947,21 @@ export function materializeArchiveProjection(
   // file with a stamp still claiming it) keeps taking the exact path it took
   // before this change: this block never runs for them, so their fail-closed
   // behavior is unchanged. A seed candidate whose own stamp is missing,
-  // wrong-version, wrong-scope, or whose file is gone is never returned by
-  // `findArchiveSeedCandidate` — such a session still lands on a full build,
-  // just like today.
+  // wrong-version, wrong-agent, wrong-scope, or whose file is gone is never
+  // returned by `findArchiveSeedCandidate` — such a session still lands on a
+  // full build, just like today.
   if (previous === null && !fs.existsSync(dstPath)) {
     const candidate = findArchiveSeedCandidate(agentGroupId, workgroupMemberIds, dstPath);
     if (candidate) {
       try {
         seedArchiveProjectionFrom(candidate, dstPath, agentGroupId);
-        // The copy is byte-for-byte the candidate's file (only the
-        // agent_group_id column changes), so its watermark against the
-        // source archive is exactly the candidate's own stamp — not `stamp`
-        // (the live signature just computed for THIS request), which the
-        // reuse/append decision below reconciles it against.
-        previous = { ...candidate.stamp, agentGroupId };
+        // The copy is byte-for-byte the candidate's file, unmodified (same
+        // agent, so no relabel needed — see `findArchiveSeedCandidate`), so
+        // its watermark against the source archive is exactly the
+        // candidate's own stamp — not `stamp` (the live signature just
+        // computed for THIS request), which the reuse/append decision below
+        // reconciles it against.
+        previous = candidate.stamp;
         writeArchiveProjectionStamp(dstPath, previous);
         seededFrom = path.relative(DATA_DIR, candidate.dstPath);
       } catch (err) {
