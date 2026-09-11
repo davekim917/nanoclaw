@@ -17,6 +17,7 @@ import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { allowWritesTo, clearHermeticityAttempts, enforceHermeticity } from '../test-hermeticity.js';
+import { log } from '../log.js';
 import {
   __setArchiveProjectionWorkerFactoryForTest,
   ensureArchiveProjection,
@@ -1054,5 +1055,154 @@ describe('#360 — a message elsewhere does not rebuild this projection', () => 
     expect((await ensureArchiveProjection(src, dst, 'ag-one-a', scope)).mode).toBe('rebuilt');
     expect((await ensureArchiveProjection(src, dst, 'ag-one-a', scope)).mode).toBe('reused');
     expect(allRows(dst)).toEqual([]);
+  });
+});
+
+describe('#667 — seeding a fresh session from a same-scope sibling', () => {
+  const wgOne = ['ag-one-a', 'ag-one-b'];
+
+  it('seeds a fresh session and lands the same row set as a full build', async () => {
+    const src = makeTwoWorkgroupSource('seed-basic');
+    useFakeWorker();
+
+    const siblingDst = tmpPath('seed-basic-sibling');
+    expect((await ensureArchiveProjection(src, siblingDst, 'ag-one-a', wgOne)).mode).toBe('rebuilt');
+
+    const freshDst = tmpPath('seed-basic-fresh');
+    const result = await ensureArchiveProjection(src, freshDst, 'ag-one-b', wgOne);
+    expect(result.mode).toBe('seeded');
+    expect(result.seededFrom).toBe(path.relative(TEST_DATA_DIR, siblingDst));
+
+    const expected = tmpPath('seed-basic-expected');
+    buildArchiveProjection(src, expected, 'ag-one-b', wgOne);
+    expect(allRows(freshDst)).toEqual(allRows(expected));
+    // Every row is relabeled to the SEEDED session's own caller, exactly as a
+    // full build would stamp it — never the sibling it was copied from.
+    expect(allRows(freshDst).every((r) => r.agent_group_id === 'ag-one-b')).toBe(true);
+  });
+
+  it('brings a seeded projection current by appending rows that arrived after the sibling was built', async () => {
+    const src = makeTwoWorkgroupSource('seed-append');
+    useFakeWorker();
+
+    const siblingDst = tmpPath('seed-append-sibling');
+    await ensureArchiveProjection(src, siblingDst, 'ag-one-a', wgOne);
+
+    archiveInto(src, {
+      id: 'w1-new',
+      agent_group_id: 'ag-one-b',
+      role: 'assistant',
+      sender_id: 'ag-one-b',
+      text: 'a brand new reply',
+      sent_at: '2026-01-01T12:00:00Z',
+    });
+
+    const freshDst = tmpPath('seed-append-fresh');
+    const result = await ensureArchiveProjection(src, freshDst, 'ag-one-b', wgOne);
+    expect(result.mode).toBe('seeded');
+    expect(result.rows).toBe(1);
+    expect(allRows(freshDst).map((r) => r.text)).toContain('a brand new reply');
+
+    const expected = tmpPath('seed-append-expected');
+    buildArchiveProjection(src, expected, 'ag-one-b', wgOne);
+    expect(allRows(freshDst)).toEqual(allRows(expected));
+  });
+
+  it('never seeds from a sibling with a different workgroup member set', async () => {
+    const src = makeTwoWorkgroupSource('seed-scope-mismatch');
+    useFakeWorker();
+
+    const siblingDst = tmpPath('seed-scope-mismatch-sibling');
+    await ensureArchiveProjection(src, siblingDst, 'ag-two-a', ['ag-two-a', 'ag-two-b']);
+
+    const freshDst = tmpPath('seed-scope-mismatch-fresh');
+    const result = await ensureArchiveProjection(src, freshDst, 'ag-one-a', wgOne);
+    expect(result.mode).toBe('rebuilt');
+    const texts = allRows(freshDst).map((r) => r.text);
+    expect(texts).toContain('shared question'); // the real, own-scope build still ran
+    expect(texts).not.toContain('other tenant secret'); // workgroup TWO's content never leaked in
+  });
+
+  it('never seeds a candidate whose stamp is from an older builder', async () => {
+    const src = makeTwoWorkgroupSource('seed-old-version');
+    useFakeWorker();
+
+    const siblingDst = tmpPath('seed-old-version-sibling');
+    await ensureArchiveProjection(src, siblingDst, 'ag-one-a', wgOne);
+    const staleStamp = computeArchiveProjectionStamp(src, 'ag-one-a', wgOne);
+    fs.writeFileSync(
+      archiveProjectionStampPath(siblingDst),
+      JSON.stringify({ ...staleStamp, version: staleStamp.version - 1 }),
+    );
+
+    const freshDst = tmpPath('seed-old-version-fresh');
+    expect((await ensureArchiveProjection(src, freshDst, 'ag-one-b', wgOne)).mode).toBe('rebuilt');
+  });
+
+  it('never seeds from a stamp whose projection file is gone', async () => {
+    const src = makeTwoWorkgroupSource('seed-orphaned');
+    useFakeWorker();
+
+    const siblingDst = tmpPath('seed-orphaned-sibling');
+    await ensureArchiveProjection(src, siblingDst, 'ag-one-a', wgOne);
+    // The sibling session directory was cleaned up, but its stamp is still there.
+    fs.unlinkSync(siblingDst);
+
+    const freshDst = tmpPath('seed-orphaned-fresh');
+    expect((await ensureArchiveProjection(src, freshDst, 'ag-one-b', wgOne)).mode).toBe('rebuilt');
+  });
+
+  it('seeds a second fresh session of the same agent group in legacy (non-workgroup) mode', async () => {
+    const src = makeTwoWorkgroupSource('seed-legacy');
+    useFakeWorker();
+
+    const firstDst = tmpPath('seed-legacy-first');
+    await ensureArchiveProjection(src, firstDst, 'ag-one-a', undefined);
+
+    const secondDst = tmpPath('seed-legacy-second');
+    expect((await ensureArchiveProjection(src, secondDst, 'ag-one-a', undefined)).mode).toBe('seeded');
+
+    const expected = tmpPath('seed-legacy-expected');
+    buildArchiveProjection(src, expected, 'ag-one-a', undefined);
+    expect(allRows(secondDst)).toEqual(allRows(expected));
+  });
+
+  it('never seeds legacy-mode rows across two different agent groups', async () => {
+    const src = makeTwoWorkgroupSource('seed-legacy-cross');
+    useFakeWorker();
+
+    const firstDst = tmpPath('seed-legacy-cross-a');
+    await ensureArchiveProjection(src, firstDst, 'ag-one-a', undefined);
+
+    const secondDst = tmpPath('seed-legacy-cross-b');
+    const result = await ensureArchiveProjection(src, secondDst, 'ag-one-b', undefined);
+    expect(result.mode).toBe('rebuilt');
+    // ag-one-b's legacy projection must hold only ag-one-b's own rows — never
+    // ag-one-a's, even though ag-one-a's sibling row shares the same text.
+    expect(
+      allRows(secondDst)
+        .map((r) => r.id)
+        .sort(),
+    ).toEqual(['w1-a-b', 'w1-u-b']);
+  });
+
+  it('logs a distinct "Archive projection seeded" line with source, rows and ms', async () => {
+    const src = makeTwoWorkgroupSource('seed-log');
+    const infoSpy = vi.spyOn(log, 'info');
+    useFakeWorker();
+
+    const siblingDst = tmpPath('seed-log-sibling');
+    await ensureArchiveProjection(src, siblingDst, 'ag-one-a', wgOne);
+
+    const freshDst = tmpPath('seed-log-fresh');
+    await ensureArchiveProjection(src, freshDst, 'ag-one-b', wgOne);
+
+    const call = infoSpy.mock.calls.find(([message]) => message === 'Archive projection seeded');
+    expect(call).toBeDefined();
+    const payload = call?.[1] as Record<string, unknown>;
+    expect(typeof payload.ms).toBe('number');
+    expect(typeof payload.rows).toBe('number');
+    expect(payload.seededFrom).toBe(path.relative(TEST_DATA_DIR, siblingDst));
+    infoSpy.mockRestore();
   });
 });
