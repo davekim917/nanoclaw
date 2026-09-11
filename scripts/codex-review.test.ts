@@ -120,11 +120,22 @@ if [ -n "$rest" ]; then
       printf ']'
       exit 0
       ;;
+    */git/ref/heads/*)
+      # ref--<branch> holds the commit the branch points at. Absent = no such branch.
+      branch="\${rest#*/git/ref/heads/}"
+      if [ ! -f "$MOCK_DIR/ref--$branch" ]; then
+        echo '{"message":"Not Found","status":"404"}'
+        echo 'gh: Not Found (HTTP 404)' >&2
+        exit 1
+      fi
+      printf '{"ref":"refs/heads/%s","object":{"sha":"%s","type":"commit"}}\\n' "$branch" "$(cat "$MOCK_DIR/ref--$branch")"
+      exit 0
+      ;;
     */compare/*)
-      # compare--<head>.json is the comparison pinned to that head. Absent = the read fails.
+      # compare--<base>...<head>.json is the comparison of exactly those two. Absent = the read fails.
       basehead="\${rest#*/compare/}"
       basehead="\${basehead%%\\?*}"
-      pinned="$MOCK_DIR/compare--\${basehead##*...}.json"
+      pinned="$MOCK_DIR/compare--$basehead.json"
       if [ ! -f "$pinned" ]; then
         echo '{"message":"Not Found","status":"404"}'
         echo 'gh: Not Found (HTTP 404)' >&2
@@ -228,6 +239,11 @@ function run(root: string, command: string, minutes?: string, sha = HEAD) {
 
 const OLD_HEAD = 'cccccccccccccccccccccccccccccccccccccccc';
 const OTHER_HEAD = 'dddddddddddddddddddddddddddddddddddddddd';
+// The base branch's commit now, which scope resolves once and reads both base
+// files at; and the PR's own baseRefOid, the base as of its last push, which it
+// must not use.
+const BASE_OID = 'ffffffffffffffffffffffffffffffffffffffff';
+const STALE_BASE = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
 const RISK_CONFIG =
   "risk:high:\n- changed-files:\n  - any-glob-to-any-file:\n    - 'src/router.ts'\n    - '.github/**'\n";
 
@@ -245,6 +261,7 @@ function prState(
   return {
     headRefOid: head,
     baseRefName: 'main',
+    baseRefOid: STALE_BASE,
     headRefName: 'feat',
     title,
     body,
@@ -349,7 +366,7 @@ function scopeFixture(
     body?: string;
   } = {},
 ): void {
-  // The files HEAD changes, as the comparison pinned to it lists them; null =
+  // The files HEAD changes, as the comparison from BASE_OID lists them; null =
   // that read fails. The unpinned `pulls/<n>/files` serves the same list unless
   // a test moves the head underneath it (unpinnedFiles). The PR's file count
   // defaults to what is listed.
@@ -359,10 +376,19 @@ function scopeFixture(
     'pr.json',
     prState(opts.labels ?? [], HEAD, opts.title, opts.body, opts.changedFiles ?? files?.length ?? 1),
   );
-  for (const name of [`compare--${HEAD}.json`, 'files.json']) fs.rmSync(path.join(root, name), { force: true });
-  if (files !== null) writeJson(root, `compare--${HEAD}.json`, { status: 'ahead', files });
+  // The base branch points at BASE_OID. Its labeler.yml (null = absent) and the
+  // comparison are served at that commit, and under the branch name too, unless
+  // a test moves the branch between reads.
+  fs.writeFileSync(path.join(root, 'ref--main'), BASE_OID);
+  const compares = [`compare--${BASE_OID}...${HEAD}.json`, `compare--main...${HEAD}.json`];
+  for (const name of [...compares, 'files.json']) fs.rmSync(path.join(root, name), { force: true });
+  if (files !== null) for (const name of compares) writeJson(root, name, { status: 'ahead', files });
   if (files !== null || opts.unpinnedFiles) writeJson(root, 'files.json', [opts.unpinnedFiles ?? files]);
-  if (opts.baseConfig !== null) fs.writeFileSync(path.join(root, 'labeler--main.yml'), opts.baseConfig ?? RISK_CONFIG);
+  for (const ref of [BASE_OID, 'main']) {
+    const labeler = path.join(root, `labeler--${ref}.yml`);
+    if (opts.baseConfig === null) fs.rmSync(labeler, { force: true });
+    else fs.writeFileSync(labeler, opts.baseConfig ?? RISK_CONFIG);
+  }
   // One Actions listing, as the API returns it: the Risk label run, which
   // merge-check leaves out of CI, and the CI runs it requires green.
   const runs = [labelRun('completed', 'success'), ...(opts.ci ?? [workflowRun('CI', 'completed', 'success')])];
@@ -715,8 +741,9 @@ describe('codex-review risk-scoped review requests', () => {
     const result = runHelper(root, ['scope']);
     expect(result.status).toBe(0);
     expect(JSON.parse(result.stdout)).toMatchObject({ mode: 'legacy', verdict: 'auto' });
-    expect(result.calls).toContain('rest repos/example/repository/contents/.github/labeler.yml?ref=main\n');
-    expect(result.calls).not.toContain('ref=feat');
+    expect(result.calls).toContain('rest repos/example/repository/git/ref/heads/main\n');
+    expect(result.calls).toContain(`rest repos/example/repository/contents/.github/labeler.yml?ref=${BASE_OID}\n`);
+    expect(result.calls).not.toMatch(/ref=(feat|main)/);
   });
 
   it.each([
@@ -729,6 +756,15 @@ describe('codex-review risk-scoped review requests', () => {
       "  risk:high:\n  - changed-files:\n    - any-glob-to-any-file:\n      - 'src/router.ts'\n",
     ],
     ['as an explicit key', "? risk:high\n: - changed-files:\n    - any-glob-to-any-file:\n      - 'src/router.ts'\n"],
+    ['with a hex escape', `"\\x72isk:high":\n- changed-files:\n  - any-glob-to-any-file:\n    - 'src/router.ts'\n`],
+    [
+      'with a unicode escape',
+      `"\\u0072isk:high":\n- changed-files:\n  - any-glob-to-any-file:\n    - 'src/router.ts'\n`,
+    ],
+    [
+      'across an escaped line break',
+      `? "ri\\\n  sk:high"\n: - changed-files:\n    - any-glob-to-any-file:\n      - 'src/router.ts'\n`,
+    ],
   ])(
     'treats a base labeler.yml that names risk:high %s as risk-scoped, and fails closed to review',
     (_case, baseConfig) => {
@@ -781,7 +817,7 @@ describe('codex-review risk-scoped review requests', () => {
     const out = JSON.parse(scope.stdout) as { reason: string };
     expect(out).toMatchObject({ mode: 'risk-scoped', verdict: 'skip', head: HEAD, labels: ['PR: Fix'] });
     expect(out.reason).toContain('no changed file matches a risk:high glob');
-    expect(scope.calls).toContain(`rest repos/example/repository/compare/main...${HEAD}?per_page=1\n`);
+    expect(scope.calls).toContain(`rest repos/example/repository/compare/${BASE_OID}...${HEAD}?per_page=1\n`);
     expect(scope.calls).not.toContain('/pulls/1/files');
     expect(scope.calls).not.toContain('actions/runs');
     expect(scope.sleep).toBe('');
@@ -838,7 +874,12 @@ describe('codex-review risk-scoped review requests', () => {
     [
       'the PR changes more files than GitHub listed',
       { files: [changedFile('docs/a.md')], changedFiles: 3001 },
-      'fail closed: the PR changes 3001 files but GitHub listed 1',
+      'fail closed: the PR changes 3001 files but the comparison lists 1',
+    ],
+    [
+      'the comparison lists more files than the PR changes',
+      { files: [changedFile('docs/a.md'), changedFile('docs/b.md')], changedFiles: 1 },
+      'fail closed: the PR changes 1 files but the comparison lists 2',
     ],
     [
       "the base branch's risk:high holds a second rule, which the labeler would AND",
@@ -882,9 +923,53 @@ describe('codex-review risk-scoped review requests', () => {
       verdict: 'review',
       reason: 'changes risk:high path src/router.ts',
     });
-    expect(scope.calls).toContain(`rest repos/example/repository/compare/main...${HEAD}?per_page=1\n`);
+    expect(scope.calls).toContain(`rest repos/example/repository/compare/${BASE_OID}...${HEAD}?per_page=1\n`);
     expect(scope.calls).not.toContain('/pulls/1/files');
     expect(scope.calls.match(/^pr view$/gm)).toHaveLength(2);
+  });
+
+  it('reads labeler.yml and the comparison at the one base commit it resolved, whatever the branch name serves', () => {
+    // The base branch moves after scope resolves it: read by name now, labeler.yml
+    // has no risky glob and the comparison shows only a harmless file. Both base
+    // reads must use the commit it resolved, where src/router.ts is risky.
+    const root = tempRoot();
+    scopeFixture(root, { labels: [], files: [changedFile('src/router.ts')] });
+    fs.writeFileSync(
+      path.join(root, 'labeler--main.yml'),
+      "risk:high:\n- changed-files:\n  - any-glob-to-any-file:\n    - 'nothing/**'\n",
+    );
+    writeJson(root, `compare--main...${HEAD}.json`, { status: 'ahead', files: [changedFile('docs/notes.md')] });
+
+    const scope = runHelper(root, ['scope']);
+    expect(scope.status).toBe(0);
+    expect(JSON.parse(scope.stdout)).toMatchObject({
+      head: HEAD,
+      verdict: 'review',
+      reason: 'changes risk:high path src/router.ts',
+    });
+    const baseReads = scope.calls.split('\n').filter((line) => /git\/ref|labeler\.yml|\/compare\//.test(line));
+    expect(baseReads).toEqual([
+      'rest repos/example/repository/git/ref/heads/main',
+      `rest repos/example/repository/contents/.github/labeler.yml?ref=${BASE_OID}`,
+      `rest repos/example/repository/compare/${BASE_OID}...${HEAD}?per_page=1`,
+    ]);
+  });
+
+  it("judges an open PR by the base branch's rules now, not those at its last push", () => {
+    // .mcp.json became risky on main after this PR's last push, so the labeler.yml
+    // at the PR's own baseRefOid (STALE_BASE) has no rule for it.
+    const root = tempRoot();
+    scopeFixture(root, {
+      labels: [],
+      files: [changedFile('.mcp.json')],
+      baseConfig: "risk:high:\n- changed-files:\n  - any-glob-to-any-file:\n    - 'src/router.ts'\n    - '.mcp.json'\n",
+    });
+    fs.writeFileSync(path.join(root, `labeler--${STALE_BASE}.yml`), RISK_CONFIG);
+    writeJson(root, `compare--${STALE_BASE}...${HEAD}.json`, { status: 'ahead', files: [changedFile('.mcp.json')] });
+
+    const scope = runHelper(root, ['scope']);
+    expect(JSON.parse(scope.stdout)).toMatchObject({ verdict: 'review', reason: 'changes risk:high path .mcp.json' });
+    expect(scope.calls).not.toContain(STALE_BASE);
   });
 
   it('fails closed when the head moves while its changed files are listed', () => {

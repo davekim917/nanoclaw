@@ -492,10 +492,12 @@ FIXES_PR_LINE_RE='(^|\n)Fixes-PR:[ \t]*(#[0-9]+|none)\b'
 # absence (legacy); any other failure is no verdict, never a guess. gh prints
 # the error body on stdout.
 #
-# Detection is deliberately loose, `risk:high` anywhere in the file, and parsing
-# (risk-scope.jq) deliberately strict: an indented document or an explicit
-# `? risk:high` key is valid YAML the labeler reads, and a form the reader cannot
-# parse must fail closed to `review`, never fall through to legacy.
+# Detection is deliberately loose and parsing (risk-scope.jq) deliberately
+# strict. Any doubt is risk-scoped: `risk:high` anywhere in the file, or any
+# backslash, since a double-quoted YAML key can spell risk:high with escapes
+# ("\x72isk:high") or an escaped line break, and the labeler decodes those. An
+# indented document or an explicit `? risk:high` key is valid YAML too. A form
+# the reader cannot parse fails closed to `review`, never through to legacy.
 LABELER_YML=""
 repo_mode() {
   local ref raw status=0
@@ -511,7 +513,7 @@ repo_mode() {
     return 1
   fi
   LABELER_YML="$raw"
-  if printf '%s\n' "$raw" | grep -qF 'risk:high'; then
+  if printf '%s\n' "$raw" | grep -qF -e 'risk:high' -e '\'; then
     SCOPE_MODE=risk-scoped
   else
     SCOPE_MODE=legacy
@@ -527,21 +529,28 @@ repo_mode() {
 # labeler.yml — its path, or for a rename its old path too, since moving a file
 # off a risky path changes that path — or when risk:high or review:requested is
 # on the PR. Anything that keeps the files from being judged is `review` as
-# well: a failed listing, one at GitHub's 300-file cap for a comparison or
-# shorter than the PR's file count, a head that moved while they were read, and
-# a labeler.yml risk-scope.jq cannot read.
+# well: a failed listing, one at GitHub's 300-file cap for a comparison or not
+# matching the PR's file count, a head that moved while they were read, and a
+# labeler.yml risk-scope.jq cannot read.
 SCOPE_HEAD=""
 SCOPE_MODE=""
 SCOPE_VERDICT=""
 SCOPE_LABELS="[]"
 SCOPE_REASON=""
 scope_eval() {
-  local pr_json base files after decision
+  local pr_json base base_oid files after decision
   pr_json=$(gh pr view "$PR" --repo "$REPO" --json headRefOid,baseRefName,labels) || return 1
   SCOPE_HEAD=$(printf '%s' "$pr_json" | jq -er .headRefOid) || return 1
   base=$(printf '%s' "$pr_json" | jq -er .baseRefName) || return 1
   SCOPE_LABELS=$(printf '%s' "$pr_json" | jq -c '[.labels[]?.name]') || return 1
-  repo_mode "$base" || return 1
+  # The base branch as one commit, resolved once. labeler.yml and the comparison
+  # both read that commit, so the globs and the file list come from one base
+  # even when the branch moves between the reads. Not the PR's baseRefOid: that
+  # is the base tip as of the PR's last push (REST `base.sha`), so a rule main
+  # has added since would not bind an open PR until its author pushed again.
+  base_oid=$(gh api "repos/$REPO/git/ref/heads/$(jq -rn --arg r "$base" '$r | split("/") | map(@uri) | join("/")')" \
+    | jq -er '.object.sha | strings | select(test("^[0-9a-f]{40}$"))') || return 1
+  repo_mode "$base_oid" || return 1
   if [ "$SCOPE_MODE" = legacy ]; then
     SCOPE_VERDICT=auto
     SCOPE_REASON="no risk:high in .github/labeler.yml on $base; automatic review handles this repo"
@@ -555,7 +564,7 @@ scope_eval() {
   # one's. A comparison lists its files on the first page only, at most 300 of
   # them (docs.github.com/en/rest/commits/commits#compare-two-commits), so
   # per_page=1 only trims the commit list.
-  files=$(gh api "repos/$REPO/compare/$(jq -rn --arg r "$base" '$r | @uri')...$SCOPE_HEAD?per_page=1") || {
+  files=$(gh api "repos/$REPO/compare/$base_oid...$SCOPE_HEAD?per_page=1") || {
     SCOPE_REASON="fail closed: could not list the files this head changes"
     return 0
   }
@@ -583,7 +592,7 @@ scope_eval() {
         | ([ .[].filename ] | unique | length) as $listed
         | if $listed >= 300 then error("the comparison lists \($listed) files, the most GitHub lists, so some may be missing")
           elif ($pr.changedFiles | type) != "number" then error("GitHub did not say how many files this PR changes")
-          elif $pr.changedFiles > $listed then error("the PR changes \($pr.changedFiles) files but GitHub listed \($listed)")
+          elif $pr.changedFiles != $listed then error("the PR changes \($pr.changedFiles) files but the comparison lists \($listed)")
           else . end
         | [ .[] | .filename, (.previous_filename // empty) ] | unique | matching($regexes)
         | if length == 0 then []

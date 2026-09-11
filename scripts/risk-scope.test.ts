@@ -133,6 +133,12 @@ describe('risk-scope.jq reads labeler.yml', () => {
   it.each([
     ['an indented document', "  risk:high:\n  - changed-files:\n    - any-glob-to-any-file:\n      - 'a'\n"],
     ['an explicit key', "? risk:high\n: - changed-files:\n    - any-glob-to-any-file:\n      - 'a'\n"],
+    ['a hex-escaped key', `"\\x72isk:high":\n- changed-files:\n  - any-glob-to-any-file:\n    - 'a'\n`],
+    ['a unicode-escaped key', `"\\u0072isk:high":\n- changed-files:\n  - any-glob-to-any-file:\n    - 'a'\n`],
+    [
+      'a key across an escaped line break',
+      `? "ri\\\n  sk:high"\n: - changed-files:\n    - any-glob-to-any-file:\n      - 'a'\n`,
+    ],
   ])('refuses %s, which a YAML parser reads', (_name, yml) => {
     expect(globsForRiskHigh(parse(yml) as Record<string, unknown>)).toEqual(['a']);
     const result = jq('risk_high_globs', yml, true);
