@@ -786,10 +786,38 @@ esac
 # shipped script) actually registers `cleanup_scratch` for all three
 # signals, and that function actually empties CLEANUP_PATHS when invoked
 # directly.
-eval "$(sed -n '/^CLEANUP_PATHS=()/,/^trap cleanup_scratch EXIT INT TERM/p' "$REAL")"
+# review-683 P3-5 split the shipped script's single `trap cleanup_scratch
+# EXIT INT TERM` line into three separate `trap` statements (so INT/TERM
+# actually exit after cleanup, instead of resuming — see that fix below);
+# the range end-anchor here must track whichever is now the LAST such
+# line, or this sed range never closes and captures the rest of the file
+# to EOF, eval'ing far more of the real script than intended in THIS
+# process (reproduced while making this exact change: it read all the way
+# through to code that references $TS, which this truncated eval never
+# assigns, and blew up with "TS: unbound variable").
+eval "$(sed -n "/^CLEANUP_PATHS=()/,/^trap 'cleanup_scratch; exit 143' TERM/p" "$REAL")"
 TRAPPED=$(trap -p | grep -c cleanup_scratch)
 [ "$TRAPPED" -eq 3 ] && ok "cleanup_scratch is registered for EXIT, INT and TERM" \
   || bad "cleanup_scratch is not registered for all three signals" "$(trap -p)"
+# review-683 P3-5, deterministic half: the registered INT/TERM trap TEXT
+# itself must contain the `exit N` that actually stops the script — a bare
+# `trap cleanup_scratch EXIT INT TERM` (the pre-fix shape) also registers
+# cleanup_scratch for all three signals and would pass the check above,
+# but never exits on a caught INT/TERM. A live SIGTERM-mid-run race is
+# deliberately NOT asserted here (same reasoning as the comment above this
+# block): reproduced empirically while building this fix, sending TERM at
+# a random instant can land while bash is mid-parse of a multi-line
+# command, which can itself abort the trap's own execution with a
+# "trap: ... unexpected EOF" parse diagnostic and let the run continue
+# regardless of the fix's correctness — flaky for a reason unrelated to
+# whether the fix works, exactly the class of test this file already
+# declines to write. Manually verified outside this harness instead
+# (dozens of real kill -TERM runs, rc=143 and nothing pushed whenever the
+# signal was NOT delivered mid-parse).
+[[ $(trap -p INT) == *"exit 130"* ]] && ok "the INT trap actually exits (130), not just cleans up" \
+  || bad "the INT trap has no exit — bash would resume after it" "$(trap -p INT)"
+[[ $(trap -p TERM) == *"exit 143"* ]] && ok "the TERM trap actually exits (143), not just cleans up" \
+  || bad "the TERM trap has no exit — bash would resume after it (the exact #628 item 9 regression: TERM mid-run pushed anyway)" "$(trap -p TERM)"
 SCRATCH_A=$(mktemp -d); SCRATCH_B=$(mktemp)
 CLEANUP_PATHS+=("$SCRATCH_A" "$SCRATCH_B")
 cleanup_scratch
@@ -952,11 +980,24 @@ grep -q "token: string" "$G/bar/types.ts" 2>/dev/null && ok "case 1: the pending
   || bad "case 1: the pending edit vanished from the working tree" ""
 
 # Mutation evidence: the reset-to-HEAD step is what actually implements
-# containment. Disable ONLY that one line and replay the identical fixture —
-# detection still fires (still reported "held"), but the content leaks.
-MUTANT=$(make_mutant_git_safety \
-  'GIT_INDEX_FILE="$TMPIDX" git -C "$G" reset -q HEAD -- "$path" 2>>"$ERR"' \
-  'true # MUTATED (#628 item 9 case 1): detected as offending, never reset back to HEAD')
+# containment. Disable ONLY that one call (never even attempt it) and
+# replay the identical fixture — detection still fires (still reported
+# "held"), but the content leaks. The exact same `if ! ... reset ...; then`
+# text also appears for the TAB/LF/CR-poisoned-path branch above it in the
+# file — the FAILURES message text that follows is included here so the
+# substitution targets the ORDINARY held-path branch specifically, not
+# whichever occurrence happens to come first.
+P1_MUTATION_OLD=$(cat <<'OLDEOF'
+if ! GIT_INDEX_FILE="$TMPIDX" git -C "$G" reset -q HEAD -- ":(literal)$path" 2>>"$ERR"; then
+        FAILURES+=("groups: could not reset a held path back to HEAD in the scratch index: $path — refused to commit any pending change")
+OLDEOF
+)
+P1_MUTATION_NEW=$(cat <<'NEWEOF'
+if false; then # MUTATED (#628 item 9 case 1): the reset never even runs, detected as offending but never contained
+        FAILURES+=("groups: could not reset a held path back to HEAD in the scratch index: $path — refused to commit any pending change")
+NEWEOF
+)
+MUTANT=$(make_mutant_git_safety "$P1_MUTATION_OLD" "$P1_MUTATION_NEW")
 new_fixture
 mkdir -p "$G/bar"
 echo placeholder > "$G/bar/types.ts"
@@ -1125,6 +1166,243 @@ if [ "$CONTAINER_TIP" = '{"a":1}' ]; then
 else
   bad "case 8: unexpected snapshot content for the deleted-and-held path" "content=[$CONTAINER_TIP]"
 fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# review-683, round 1 on #628 item 9 (CHANGES): a P1 quoted/pathspec-magic
+# filename bypass, two P2s, and several P3s. Each fix gets its own case
+# below; P1-1/P2-1/P2-2/the TERM fix also get mutation evidence.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ─ P1-1: quoted and pathspec-magic filenames must not bypass the scan ─────
+# `diff --cached --name-only HEAD` (no `-z`) quotes a special-byte path per
+# core.quotePath — the quoted STRING then never matches anything as a
+# pathspec, so the file is never scanned or held, yet `add -u` already
+# staged it and it commits regardless. All 13 names below either need
+# real bytes a shell would otherwise treat specially, or resemble git
+# pathspec magic syntax closely enough to break unquoted use as one.
+hostile_name_case() { # <label> <filename (may contain any byte but NUL and /)>
+  new_fixture
+  local label="$1" name="$2"
+  printf 'placeholder\n' > "$G/$name"
+  git -C "$G" add -- "$name"
+  git -C "$G" commit -qm "add hostile-name placeholder" >/dev/null
+  git -C "$G" push -q origin HEAD:main
+  printf 'placeholder\n%s\n' "$GHP_LINE" > "$G/$name"
+  run_safety
+  local remote_content
+  remote_content=$(git --git-dir="$REMOTE" show "host-snapshot:$name" 2>/dev/null || echo "<no-entry>")
+  case "$remote_content" in
+    *ghp_*) bad "P1-1 hostile filename ($label): secret leaked into host-snapshot" "content=[$remote_content]" ;;
+    *) ok "P1-1 hostile filename ($label): held, never committed" ;;
+  esac
+}
+hostile_name_case "café.md, core.quotePath default (true)" "café.md"
+hostile_name_case 'd"q.md (embedded double quote)' 'd"q.md'
+hostile_name_case 'back\slash.md (embedded backslash)' 'back\slash.md'
+hostile_name_case ':(exclude)* (pathspec-magic-shaped name)' ':(exclude)star.md'
+hostile_name_case ':(top)zz.md (pathspec-magic-shaped name)' ':(top)zz.md'
+hostile_name_case "a space" "a b.md"
+hostile_name_case "a leading dash" "-x.md"
+hostile_name_case "a bare asterisk" "*.md"
+hostile_name_case "bracket glob shape" "[ab].md"
+hostile_name_case ":!x (pathspec exclude-shorthand shape)" ":!x.md"
+new_fixture
+git -C "$G" config core.quotePath false
+hostile_name_case "café.md, core.quotePath=false" "café2.md"
+
+# TAB/LF/CR in a path corrupt the TSV state/allowlist rows outright — per
+# spec, such a path is ALWAYS held and alerts on EVERY run, never gets a
+# state row, and can never be allowlisted; the operator's only path
+# forward is to rename it. Two of the review's 13 names (embedded TAB,
+# embedded LF) exercise exactly this branch, not ordinary one-time
+# containment — checked against 3 consecutive runs with no other change,
+# each of which must still alert.
+poisoned_name_case() { # <label> <filename with an embedded TAB, LF or CR>
+  new_fixture
+  local label="$1" name="$2"
+  printf 'placeholder\n' > "$G/$name"
+  git -C "$G" add -- "$name"
+  git -C "$G" commit -qm "add poisoned-name placeholder" >/dev/null
+  git -C "$G" push -q origin HEAD:main
+  printf 'placeholder\nordinary content, no secret at all\n' > "$G/$name"
+  local i
+  for i in 1 2 3; do
+    run_safety
+    [ "$RC" -ne 0 ] || bad "P1-1 poisoned filename ($label): run $i did not alert" "$OUT"
+  done
+  case "$OUT" in
+    *"TAB/LF/CR"*) ok "P1-1 poisoned filename ($label): names why it's held every run" ;;
+    *) bad "P1-1 poisoned filename ($label): no TAB/LF/CR diagnostic" "$OUT" ;;
+  esac
+  [ -s "$(held_state_file)" ] && bad "P1-1 poisoned filename ($label): got a state-file row despite never being allowlistable" "$(cat "$(held_state_file)")" \
+    || ok "P1-1 poisoned filename ($label): never gets a state-file row"
+  local remote_content
+  remote_content=$(git --git-dir="$REMOTE" show "host-snapshot:$name" 2>/dev/null || echo "<no-entry>")
+  case "$remote_content" in
+    *"ordinary content"*) bad "P1-1 poisoned filename ($label): reached the snapshot anyway" "content=[$remote_content]" ;;
+    *) ok "P1-1 poisoned filename ($label): never reaches the snapshot" ;;
+  esac
+}
+poisoned_name_case "embedded TAB" $'ta\tb.md'
+poisoned_name_case "embedded LF" $'new\nline.md'
+
+# Mutation evidence for P1-1: restore the old newline-split, non-literal
+# pathspec code and show the hostile-name bypass reproduces. Built via
+# heredoc-populated variables, not inline single-quoted literals — the
+# real text contains an embedded `''` (read -d ''), which is painful and
+# error-prone to escape correctly inside a single-quoted bash argument.
+P1_1_OLD=$(cat <<'OLDEOF'
+while IFS= read -r -d '' path; do
+    [ -n "$path" ] && changed_paths+=("$path")
+  done < <(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --name-only -z HEAD 2>>"$ERR")
+OLDEOF
+)
+P1_1_NEW=$(cat <<'NEWEOF'
+while IFS= read -r path; do [ -n "$path" ] && changed_paths+=("$path"); done < <(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --name-only HEAD 2>>"$ERR")
+NEWEOF
+)
+MUTANT=$(make_mutant_git_safety "$P1_1_OLD" "$P1_1_NEW")
+new_fixture
+printf 'placeholder\n' > "$G/café.md"
+git -C "$G" add -- café.md
+git -C "$G" commit -qm "add cafe placeholder" >/dev/null
+git -C "$G" push -q origin HEAD:main
+printf 'placeholder\n%s\n' "$GHP_LINE" > "$G/café.md"
+run_script "$MUTANT"
+MUTANT_CONTENT=$(git --git-dir="$REMOTE" show "host-snapshot:café.md" 2>/dev/null || echo "<no-entry>")
+case "$MUTANT_CONTENT" in
+  *ghp_*) ok "P1-1 mutation evidence: the newline-split/non-literal-pathspec mutant leaks café.md's secret into host-snapshot — reproduces the exact bypass this fix closes" ;;
+  *) bad "P1-1 mutation evidence: mutant unexpectedly still held café.md (fixture doesn't isolate the regression)" "content=[$MUTANT_CONTENT]" ;;
+esac
+
+# ─ P2-1 mutation evidence: skip the state rewrite on the empty-diff path ──
+# (P2-1's own behavioral case — new hold, revert, re-add, must alert again
+# — already lives above, in the original #628 item 9 case list; this adds
+# the mutation evidence review-683 asked for.)
+MUTANT=$(make_mutant_git_safety \
+  'done < <(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --name-only -z HEAD 2>>"$ERR")
+  # No early return here even when $changed_paths is empty (review-683' \
+  'done < <(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --name-only -z HEAD 2>>"$ERR")
+  if [ "${#changed_paths[@]}" -eq 0 ]; then GROUPS_RESULT="nothing pending"; return; fi
+  # (review-683 mutation: restores the removed early return) (review-683')
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_script "$MUTANT"
+[ "$RC" -ne 0 ] || bad "P2-1 mutation setup: the first mutant run should have alerted (new hold)" "$OUT"
+git -C "$G" checkout -q -- foo/container.json
+run_script "$MUTANT"
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_script "$MUTANT"
+[ "$RC" -eq 0 ] && ok "P2-1 mutation evidence: with the early return restored, revert-then-readd of the SAME secret goes quiet (rc=0) — reproduces the missed-re-alert bug" \
+  || bad "P2-1 mutation evidence: mutant unexpectedly still alerted (fixture doesn't isolate the regression)" "$OUT"
+
+# ─ P2-2: secret-scan-allow.sh must actually print something ───────────────
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_safety
+[ "$RC" -ne 0 ] || bad "P2-2 setup: the run should have held and alerted" "$OUT"
+ALLOW_OUT=$(env NANOCLAW_DIR="$NCDIR" GIT_SAFETY_DIR="$BACKUPS" HOME="$HOME2" bash "$(dirname "$REAL")/secret-scan-allow.sh" foo/container.json)
+case "$ALLOW_OUT" in
+  *"foo/container.json"*"ALLOW:"*) ok "P2-2: prints exactly one ready-to-append allowlist line" ;;
+  *) bad "P2-2: printed nothing usable" "$ALLOW_OUT" ;;
+esac
+case "$ALLOW_OUT" in
+  *"$GHP_LINE"*) bad "P2-2: printed the UNMASKED secret line" "$ALLOW_OUT" ;;
+  *"export G..."*) ok "P2-2: the offending line is masked to its first 8 characters" ;;
+  *) bad "P2-2: masking looks wrong" "$ALLOW_OUT" ;;
+esac
+[ -e "$G/.secret-scan-allow" ] && bad "P2-2: the helper wrote groups/.secret-scan-allow itself" "" \
+  || ok "P2-2: the helper wrote nothing on its own"
+
+# Mutation evidence for P2-2: options after `--` are pathspecs, not
+# options — restore that ordering and show the helper prints nothing.
+# Built via heredoc-populated variables passed through the ENVIRONMENT
+# (not embedded in the python source string) — the same reliable pattern
+# make_mutant_git_safety uses, for the same reason: this text is long,
+# multi-line, and full of embedded quotes/backslashes that are painful and
+# error-prone to escape correctly inline.
+P2_2_OLD=$(cat <<'OLDEOF'
+FILE_DIFF=$(git -C "$GROUPS_DIR" diff-index --no-color -p --text \
+  --src-prefix=a/ --dst-prefix=b/ \
+  --output-indicator-new="$SECRET_SCAN_NEW_INDICATOR" --output-indicator-old=- --output-indicator-context=' ' \
+  HEAD -- ":(literal)$TARGET_PATH" 2>/dev/null | LC_ALL=C tr '\000' ' ')
+OLDEOF
+)
+P2_2_NEW=$(cat <<'NEWEOF'
+FILE_DIFF=$(git -C "$GROUPS_DIR" diff-index --no-color -p --text HEAD -- "$TARGET_PATH" \
+  --src-prefix=a/ --dst-prefix=b/ \
+  --output-indicator-new="$SECRET_SCAN_NEW_INDICATOR" --output-indicator-old=- --output-indicator-context=' ' 2>/dev/null)
+NEWEOF
+)
+MUTANT_ALLOW=$(mktemp)
+ALLOW_SRC="$(dirname "$REAL")/secret-scan-allow.sh"
+OLDSTR="$P2_2_OLD" NEWSTR="$P2_2_NEW" SRC="$ALLOW_SRC" DST="$MUTANT_ALLOW" python3 -c "
+import os
+src = open(os.environ['SRC']).read()
+old = os.environ['OLDSTR']
+new = os.environ['NEWSTR']
+assert old in src, 'mutation target text not found in secret-scan-allow.sh — source has drifted from this fixture'
+open(os.environ['DST'], 'w').write(src.replace(old, new, 1))
+"
+chmod +x "$MUTANT_ALLOW"
+MUTANT_ALLOW_OUT=$(env NANOCLAW_DIR="$NCDIR" GIT_SAFETY_DIR="$BACKUPS" HOME="$HOME2" bash "$MUTANT_ALLOW" foo/container.json)
+case "$MUTANT_ALLOW_OUT" in
+  *"ALLOW:"*) bad "P2-2 mutation evidence: mutant unexpectedly still printed a usable line" "$MUTANT_ALLOW_OUT" ;;
+  *) ok "P2-2 mutation evidence: options placed after -- print nothing at all — reproduces the bug this fix closes" ;;
+esac
+rm -f "$MUTANT_ALLOW"
+
+# ─ P3-1: an unparseable timestamp counts as epoch 0 (re-alerts), not "now" ─
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_safety
+[ "$RC" -ne 0 ] || bad "P3-1 setup: the first run should have alerted" "$OUT"
+HASH=$(cut -f2 "$(held_state_file)")
+printf 'foo/container.json\t%s\tnot-a-timestamp\tnot-a-timestamp\n' "$HASH" > "$(held_state_file)"
+run_safety
+[ "$RC" -ne 0 ] && ok "P3-1: an unparseable first_seen/last_alerted re-alerts instead of going quiet" \
+  || bad "P3-1: an unparseable timestamp was silently treated as fresh (rc=0)" "$OUT"
+
+# ─ P3-3: allowlist parsing rejects an empty field or a malformed hash ─────
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_safety
+[ "$RC" -ne 0 ] || bad "P3-3 setup: the first run should have alerted" "$OUT"
+printf 'foo/container.json\t\ttest allow\n' > "$G/.secret-scan-allow" # empty hash field
+git -C "$G" add .secret-scan-allow
+git -C "$G" commit -qm "malformed: empty hash field" >/dev/null
+run_safety
+CONTAINER_TIP=$(git --git-dir="$REMOTE" show host-snapshot:foo/container.json 2>/dev/null || echo "<no-entry>")
+case "$CONTAINER_TIP" in
+  *ghp_*) bad "P3-3: an empty allowlist field released the hold" "content=[$CONTAINER_TIP]" ;;
+  *) ok "P3-3: an empty allowlist field fails closed" ;;
+esac
+printf 'foo/container.json\tNOTAVALIDHASH\ttest allow\n' > "$G/.secret-scan-allow" # not 64 lowercase hex chars
+git -C "$G" add .secret-scan-allow
+git -C "$G" commit -qm "malformed: bad hash shape" >/dev/null
+run_safety
+CONTAINER_TIP=$(git --git-dir="$REMOTE" show host-snapshot:foo/container.json 2>/dev/null || echo "<no-entry>")
+case "$CONTAINER_TIP" in
+  *ghp_*) bad "P3-3: a malformed (non-hex) hash released the hold" "content=[$CONTAINER_TIP]" ;;
+  *) ok "P3-3: a malformed hash shape fails closed" ;;
+esac
+
+# P3-5's deterministic check (the INT/TERM trap text actually contains
+# `exit N`) lives above, alongside the pre-existing #628 item 6 trap-
+# registration test — see the comment there for why a live SIGTERM-mid-run
+# race isn't asserted here as its own case.
+
+# ─ P3-6: bare vendor-shaped tokens, with no identifier-assignment context ─
+# to fall back on, must still match — the #630 fixtures already in this
+# file (`export GITHUB_TOKEN=ghu_...` etc.) also satisfy the GENERIC
+# identifier alternative on their own (…TOKEN=…), so they never actually
+# proved the vendor-specific gh[ousr]_/  (sk|rk)_live_/xox[abpre]-/
+# (AKIA|ASIA) alternatives fire independently.
+secret_case "bare github user-to-server token (ghu_), no identifier context"  'ghu_16C7e42F292c6912E7710c838347Ae178B4a'
+secret_case "bare github refresh token (ghr_), no identifier context"         'ghr_16C7e42F292c6912E7710c838347Ae178B4a'
+secret_case "bare stripe restricted key (rk_live_), no identifier context"    'rk_live_51H8xamplekeyvalueabc123'
+secret_case "bare slack rotation token (xoxe-), no identifier context"       'xoxe-1-abcdefghijklmnopqrstuvwxyz'
+secret_case "bare AWS STS temp key (ASIA), no identifier context"           'ASIAABCDEFGHIJKLMNOP'
 
 echo
 [ "$FAILED" -eq 0 ] && echo "git-safety-selfcheck: all checks passed" || echo "git-safety-selfcheck: FAILURES"

@@ -75,10 +75,21 @@ fi
 # Re-derive the CURRENT live diff for this one path against groups' HEAD —
 # diff-index, not porcelain diff, so this read-only helper never rewrites
 # groups' real .git/index (same reasoning as scripts/git-safety.sh's own
-# phase-1 patch call).
-FILE_DIFF=$(git -C "$GROUPS_DIR" diff-index --no-color -p --text HEAD -- "$TARGET_PATH" \
+# phase-1 patch call). review-683 P2-2: every option MUST come before the
+# `--` — anything after it is a pathspec, not an option, and `git` parses
+# it that way with no error, so `--src-prefix=a/`/`--output-indicator-new`
+# etc. silently never took effect, --output-indicator-new above all: added
+# lines kept git's default `+` marker instead of SECRET_SCAN_NEW_INDICATOR,
+# secret_scan_extract_added (which greps for THAT byte) found nothing, and
+# this script never printed anything at all, for any path, ever.
+# `:(literal)` (matching git-safety.sh's own P1-1 fix) turns off pathspec
+# magic, so a path starting with `-` or containing `*`/`:` still matches
+# itself, byte-for-byte, and nothing else. Piped through
+# `LC_ALL=C tr '\000' ' '` for the same NUL-byte reason as git-safety.sh.
+FILE_DIFF=$(git -C "$GROUPS_DIR" diff-index --no-color -p --text \
   --src-prefix=a/ --dst-prefix=b/ \
-  --output-indicator-new="$SECRET_SCAN_NEW_INDICATOR" --output-indicator-old=- --output-indicator-context=' ' 2>/dev/null)
+  --output-indicator-new="$SECRET_SCAN_NEW_INDICATOR" --output-indicator-old=- --output-indicator-context=' ' \
+  HEAD -- ":(literal)$TARGET_PATH" 2>/dev/null | LC_ALL=C tr '\000' ' ')
 ADDED=$(secret_scan_extract_added "$FILE_DIFF")
 MATCHES=$(secret_scan_matching_lines "$ADDED" "$SECRET_RE" insensitive)
 

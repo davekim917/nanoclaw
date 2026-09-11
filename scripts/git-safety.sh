@@ -114,8 +114,13 @@ HELD_STATE_FILE="$STATE_DIR/secret-scan-held.tsv"
 # for at least this long re-alerts even with no change, so it can't be
 # forgotten forever — but only if it also hasn't been ALERTED in that long,
 # so a fresh hold doesn't immediately re-fire a second time at day 7 for no
-# reason.
-HOLD_REALERT_SECONDS=$((7 * 24 * 3600))
+# reason. 7 days MINUS 1 hour (review-683 P3-2): the nightly timer fires
+# once a day at a fixed wall-clock time, so a full 7*24h threshold measured
+# against the exact previous alert instant can miss its 7th-day run by
+# whatever jitter that day's run started early or late by. The 1-hour
+# margin absorbs ordinary timer jitter without meaningfully shortening the
+# quiet period.
+HOLD_REALERT_SECONDS=$(( (7 * 24 - 1) * 3600 ))
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 OUT="$SNAP_ROOT/$TS"
 MAN="$OUT/MANIFEST.txt"
@@ -130,7 +135,20 @@ GROUPS_RESULT="skipped (no groups/ repo)"
 # them in $TMPDIR indefinitely.
 CLEANUP_PATHS=()
 cleanup_scratch() { local p; for p in ${CLEANUP_PATHS[@]+"${CLEANUP_PATHS[@]}"}; do [ -n "$p" ] && rm -rf "$p" 2>/dev/null; done; }
-trap cleanup_scratch EXIT INT TERM
+# review-683 P3-5: a bare `trap cleanup_scratch EXIT INT TERM` runs the
+# handler on a caught INT/TERM but does NOT stop the script — bash resumes
+# the very next line after a signal trap returns, unless the trap itself
+# exits. Observed in practice: a TERM mid-phase-2 ran cleanup, then kept
+# going and pushed an empty-tree snapshot commit built from whatever
+# partial state the scratch index was left in. Each signal now gets its
+# own trap that cleans up AND exits with the conventional 128+signal code;
+# EXIT stays separate since it must fire on every ordinary return too, not
+# just a caught signal (and would otherwise run cleanup_scratch a second,
+# harmless time after an INT/TERM trap's own `exit` — rm -rf on already-
+# removed paths is a no-op).
+trap cleanup_scratch EXIT
+trap 'cleanup_scratch; exit 130' INT
+trap 'cleanup_scratch; exit 143' TERM
 
 # Everything under $OUT (patches, tarballs, the manifest) holds config and,
 # for untracked files, potentially secret-shaped content that slipped past
@@ -183,14 +201,35 @@ epoch_of() { # <ISO 8601 UTC timestamp> -> epoch seconds, or empty on a bad valu
 line_hash() {
   printf '%s\t%s' "$1" "$2" | sha256sum | cut -d' ' -f1
 }
+# parse_allowlist_line <line> -> on a well-formed line (exactly 3 tab-
+# separated fields, none empty, the hash field exactly 64 lowercase hex
+# characters), sets PARSED_PATH/PARSED_HASH/PARSED_REASON and returns 0.
+# On anything else, clears all three and returns 1. The ONE parsing
+# routine both read_secret_scan_allowlist (validates the whole file) and
+# is_allowlisted (matches one entry) use (review-683 P3-3: they used to
+# parse differently — an `awk NF` field count in one, an `IFS=$'\t' read`
+# split in the other — which could disagree on what counts as malformed).
+parse_allowlist_line() {
+  PARSED_PATH="" PARSED_HASH="" PARSED_REASON=""
+  local line=$1 extra
+  IFS=$'\t' read -r PARSED_PATH PARSED_HASH PARSED_REASON extra <<<"$line"
+  if [ -z "$PARSED_PATH" ] || [ -z "$PARSED_HASH" ] || [ -z "$PARSED_REASON" ] || [ -n "$extra" ]; then
+    PARSED_PATH="" PARSED_HASH="" PARSED_REASON=""
+    return 1
+  fi
+  if ! [[ "$PARSED_HASH" =~ ^[0-9a-f]{64}$ ]]; then
+    PARSED_PATH="" PARSED_HASH="" PARSED_REASON=""
+    return 1
+  fi
+  return 0
+}
 # read_secret_scan_allowlist <groups-repo> -> the TSV content of
 # groups/.secret-scan-allow at groups' own committed HEAD (never the
 # working tree — an uncommitted edit must not release a hold), or empty on
-# a missing file. Malformed content (any non-comment, non-blank line
-# without exactly path/sha256/reason, tab-separated) is ALSO reported as
-# empty, printing one stderr line — a parse error fails closed (existing
-# holds stay held) rather than silently exempting nothing, or worse,
-# everything.
+# a missing file. Malformed content (any non-comment, non-blank line that
+# parse_allowlist_line rejects) is ALSO reported as empty, printing one
+# stderr line — a parse error fails closed (existing holds stay held)
+# rather than silently exempting nothing, or worse, everything.
 read_secret_scan_allowlist() {
   local g=$1 raw
   raw=$(git -C "$g" show HEAD:.secret-scan-allow 2>/dev/null) || return 0
@@ -198,10 +237,8 @@ read_secret_scan_allowlist() {
   while IFS= read -r line; do
     [ -z "$line" ] && continue
     case "$line" in '#'*) continue ;; esac
-    local field_count
-    field_count=$(awk -F'\t' '{print NF}' <<<"$line")
-    if [ "$field_count" -ne 3 ]; then
-      echo "git-safety: groups/.secret-scan-allow is malformed at HEAD (not path<TAB>sha256<TAB>reason) — treating as empty, holds stay (fail closed)" >&2
+    if ! parse_allowlist_line "$line"; then
+      echo "git-safety: groups/.secret-scan-allow is malformed at HEAD (want path<TAB>sha256<TAB>reason, no field empty, sha256 = 64 lowercase hex chars) — treating as empty, holds stay (fail closed)" >&2
       return 0
     fi
   done <<<"$raw"
@@ -209,10 +246,12 @@ read_secret_scan_allowlist() {
 }
 # is_allowlisted <path> <hash> <allowlist-tsv-content>
 is_allowlisted() {
-  local path=$1 hash=$2 tsv=$3 line row_path row_hash
-  while IFS=$'\t' read -r row_path row_hash _; do
-    [ -z "$row_path" ] && continue
-    if [ "$row_path" = "$path" ] && [ "$row_hash" = "$hash" ]; then
+  local path=$1 hash=$2 tsv=$3 line
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    case "$line" in '#'*) continue ;; esac
+    parse_allowlist_line "$line" || continue
+    if [ "$PARSED_PATH" = "$path" ] && [ "$PARSED_HASH" = "$hash" ]; then
       return 0
     fi
   done <<<"$tsv"
@@ -497,12 +536,6 @@ _commit_groups_impl() { # <scratch index file>
     GROUPS_RESULT="refused (binary change)"; return
   fi
 
-  local diff_probe
-  diff_probe=$(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --name-only HEAD 2>>"$ERR")
-  if [ -z "$diff_probe" ]; then
-    GROUPS_RESULT="nothing pending"; return
-  fi
-
   # ── #628 item 9: per-file secret-shaped-content hold ──────────────────────
   # A SECRET_RE match in a file's own added lines holds ONLY that file
   # (reset back to HEAD's content in the scratch index) instead of refusing
@@ -513,18 +546,71 @@ _commit_groups_impl() { # <scratch index file>
   local allow_tsv
   allow_tsv=$(read_secret_scan_allowlist "$G")
 
+  # review-683 P1-1: `diff --cached --name-only HEAD` (no `-z`) quotes any
+  # path with a special byte per core.quotePath (default true) — e.g.
+  # café.md prints as "caf\303\251.md", a literal backslash-escaped STRING,
+  # not the real path. Splitting that output on newlines and using it
+  # DIRECTLY as a pathspec (both for the per-file diff below and the reset
+  # that implements containment) matched NOTHING: the file was never
+  # scanned, never held, yet `add -u` had already staged it — a real
+  # regression this rewrite must not reintroduce. `-z` emits raw,
+  # unquoted, NUL-terminated paths; `read -r -d ''` splits on NUL only, so
+  # even a path containing a literal newline or tab survives intact.
   local changed_paths=() path
-  while IFS= read -r path; do [ -n "$path" ] && changed_paths+=("$path"); done <<<"$diff_probe"
+  while IFS= read -r -d '' path; do
+    [ -n "$path" ] && changed_paths+=("$path")
+  done < <(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --name-only -z HEAD 2>>"$ERR")
+  # No early return here even when $changed_paths is empty (review-683
+  # P2-1): the loop below is simply a no-op in that case, but the state
+  # rewrite after it must still run — an early return here would skip it,
+  # and a stale hold from a PREVIOUS run (recorded, then its offending
+  # edit reverted with nothing else pending that night) would sit in
+  # secret-scan-held.tsv forever. If that exact line is re-added later,
+  # the stale entry makes it look already-known and the run would exit 0
+  # instead of alerting on what is, from the state file's perspective, a
+  # brand-new hold.
 
-  local held_paths=() held_diffs="" new_state_rows=()
+  local held_paths=() held_diffs="" new_state_rows=() poisoned_paths=()
   for path in "${changed_paths[@]}"; do
+    # A path containing a TAB, LF or CR cannot be stored as one field of
+    # the held-state or allowlist TSVs without corrupting either — rather
+    # than encode or escape it (a new parsing surface of its own), such a
+    # path is ALWAYS held and ALWAYS alerts, on every run, regardless of
+    # its actual content: it never gets a state row (so no first-seen/
+    # last-alerted bookkeeping applies to it) and the line-hash allowlist
+    # can never release it. The operator's only path forward is to rename
+    # the file. Ordinary non-ASCII names (café.md) are unaffected — UTF-8
+    # bytes are fine in a TSV field; only these three specific control
+    # bytes are refused.
+    case "$path" in
+      *$'\t'*|*$'\n'*|*$'\r'*)
+        poisoned_paths+=("$path")
+        held_paths+=("$path")
+        if ! GIT_INDEX_FILE="$TMPIDX" git -C "$G" reset -q HEAD -- ":(literal)$path" 2>>"$ERR"; then
+          FAILURES+=("groups: could not reset a TAB/LF/CR-named held path back to HEAD in the scratch index — refused to commit any pending change")
+          GROUPS_RESULT="failed (hold reset)"; return
+        fi
+        continue
+        ;;
+    esac
+
     local file_diff added extract_rc matches scan_rc
     # Same options as the old combined diff (comment preserved below this
     # loop, at the write-tree call, for why each one is pinned) — just
-    # scoped to one path via a pathspec.
+    # scoped to one path via a pathspec. `:(literal)` (review-683 P1-1)
+    # turns off ALL pathspec magic — glob wildcards, a leading `:`, a
+    # leading `-` that `git diff` would otherwise try to parse as another
+    # option — so the path matches byte-for-byte and nothing else, exactly
+    # like the fixed name-listing above requires. Piped through
+    # `LC_ALL=C tr '\000' ' '` (review-683 P3-4) for the same reason #666
+    # applied it to wiki-pre-push-hook.sh: `$(...)` command substitution
+    # silently drops NUL bytes, which can fuse a token with a neighboring
+    # byte and defeat SECRET_RE's boundary anchors; `pipefail` (set at the
+    # top of this file) keeps the `2>>"$ERR"` redirect on git's own
+    # process, and preserves git's own exit status through the pipe.
     file_diff=$(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --no-color --text --src-prefix=a/ --dst-prefix=b/ \
       --output-indicator-new="$SECRET_SCAN_NEW_INDICATOR" --output-indicator-old=- --output-indicator-context=' ' \
-      HEAD -- "$path" 2>>"$ERR")
+      HEAD -- ":(literal)$path" 2>>"$ERR" | LC_ALL=C tr '\000' ' ')
     added=$(secret_scan_extract_added "$file_diff")
     extract_rc=$?
     if [ "$extract_rc" -ge 2 ]; then
@@ -557,9 +643,24 @@ _commit_groups_impl() { # <scratch index file>
       # Reset ONLY this path back to HEAD in the SCRATCH index — never the
       # working tree (git reset's default; no --hard, no path in the
       # working-tree arguments). Nothing on disk is touched or lost.
-      GIT_INDEX_FILE="$TMPIDX" git -C "$G" reset -q HEAD -- "$path" 2>>"$ERR"
+      # review-683 P1-1: the exit status used to go unchecked — a failed
+      # reset would silently leave the offending edit staged, so a
+      # "held" file could still reach the commit. Fail the whole groups
+      # snapshot instead of ever risking that.
+      if ! GIT_INDEX_FILE="$TMPIDX" git -C "$G" reset -q HEAD -- ":(literal)$path" 2>>"$ERR"; then
+        FAILURES+=("groups: could not reset a held path back to HEAD in the scratch index: $path — refused to commit any pending change")
+        GROUPS_RESULT="failed (hold reset)"; return
+      fi
     fi
   done
+
+  if [ "${#poisoned_paths[@]}" -gt 0 ]; then
+    local poisoned_list; poisoned_list=$(printf '%s, ' "${poisoned_paths[@]}"); poisoned_list=${poisoned_list%, }
+    say "groups: ${#poisoned_paths[@]} path(s) with a TAB/LF/CR byte held EVERY run and cannot be allowlisted — rename to resolve: $poisoned_list"
+    if [ "$GROUPS_MODE" != "dry" ]; then
+      FAILURES+=("groups: ${#poisoned_paths[@]} path(s) with a TAB/LF/CR byte in the name held every run (never allowlistable) — rename: $poisoned_list")
+    fi
+  fi
 
   if [ "${#held_paths[@]}" -gt 0 ]; then
     printf '%s' "$held_diffs" > "$OUT/groups-held.patch" 2>/dev/null
@@ -607,9 +708,14 @@ _commit_groups_impl() { # <scratch index file>
           # cases alert, per spec.
           first_seen="$now_iso"; last_alerted="$now_iso"; alert_worthy=1
         else
+          # review-683 P3-1: an unparseable timestamp (a state file hand-
+          # edited or corrupted) defaults to epoch 0 — ancient, not "now"
+          # — so the 7-day-unresolved check below reads it as overdue and
+          # re-alerts, rather than silently treating garbage as freshly
+          # seen and going quiet on a hold nobody can actually account for.
           local first_epoch last_epoch
-          first_epoch=$(epoch_of "$first_seen"); first_epoch=${first_epoch:-$now_epoch}
-          last_epoch=$(epoch_of "${last_alerted:-$first_seen}"); last_epoch=${last_epoch:-$now_epoch}
+          first_epoch=$(epoch_of "$first_seen"); first_epoch=${first_epoch:-0}
+          last_epoch=$(epoch_of "${last_alerted:-$first_seen}"); last_epoch=${last_epoch:-0}
           if [ $((now_epoch - first_epoch)) -ge "$HOLD_REALERT_SECONDS" ] && [ $((now_epoch - last_epoch)) -ge "$HOLD_REALERT_SECONDS" ]; then
             last_alerted="$now_iso"; alert_worthy=1
           fi
@@ -639,10 +745,18 @@ _commit_groups_impl() { # <scratch index file>
   folders=$(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --name-only HEAD | awk -F/ '{print $1}' | sort -u | tr '\n' ' ')
 
   if [ "$n" -eq 0 ]; then
-    # Every changed path was held; nothing else is pending. Never write a
-    # no-op commit identical to HEAD just because a hold consumed
-    # everything that was staged.
-    GROUPS_RESULT="nothing committed — all $((${#held_paths[@]})) pending change(s) held for secret-shaped content"
+    # Either every changed path was held (nothing else pending — never
+    # write a no-op commit identical to HEAD just because a hold consumed
+    # everything that was staged) or there was genuinely nothing pending
+    # at all (review-683 P2-1: this branch is what the removed early
+    # return above used to short-circuit to, skipping the state rewrite
+    # above it — that rewrite now always runs first, so this return is
+    # safe either way).
+    if [ "${#held_paths[@]}" -gt 0 ]; then
+      GROUPS_RESULT="nothing committed — all ${#held_paths[@]} pending change(s) held for secret-shaped content"
+    else
+      GROUPS_RESULT="nothing pending"
+    fi
     return
   fi
 
