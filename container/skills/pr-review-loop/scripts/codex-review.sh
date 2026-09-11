@@ -1042,10 +1042,21 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|sc
     # A fix PR names the PR it fixes, or says `none`. Read at merge time: the
     # title and body can both change after the PR opens. A line inside a code
     # fence or an HTML comment is an example or a template, not a link, so both
-    # are cut first; an unclosed one runs to the end, as GitHub renders it.
+    # are cut first. Fences follow CommonMark: up to 3 spaces, then 3+ backticks
+    # or 3+ tildes; only a bare run of the same character, at least as long,
+    # closes one; an unclosed fence runs to the end, as GitHub renders it.
     pr_text=$(gh pr view "$PR" --repo "$REPO" --json title,body) || exit 1
     fix_link=$(printf '%s' "$pr_text" | jq -r --arg titleRe "$FIX_TITLE_RE" --arg lineRe "$FIXES_PR_LINE_RE" '
-      (.body // "" | gsub("```[\\s\\S]*?(```|$)"; "") | gsub("<!--[\\s\\S]*?(-->|$)"; "")) as $body
+      def unfenced:
+        reduce split("\n")[] as $line ({out: [], fence: null};
+          ($line | capture("^ {0,3}(?<run>`{3,}|~{3,})") // null) as $open
+          | if .fence == null then
+              if $open then .fence = $open.run else .out += [$line] end
+            elif $open and ($open.run[0:1] == .fence[0:1]) and (($open.run | length) >= (.fence | length))
+                 and ($line | test("^ {0,3}" + $open.run + "[ \t]*\r?$")) then .fence = null
+            else . end)
+        | .out | join("\n");
+      (.body // "" | unfenced | gsub("<!--[\\s\\S]*?(-->|$)"; "")) as $body
       | if (.title | test($titleRe; "i")) and ($body | test($lineRe; "i") | not) then "missing" else "ok" end') || exit 1
     if [ "$fix_link" = missing ]; then
       echo "merge=refused head=$SCOPE_HEAD: a fix PR needs a 'Fixes-PR: #<n>' line in its body naming the PR it fixes, or 'Fixes-PR: none'" >&2

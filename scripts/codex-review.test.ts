@@ -974,6 +974,11 @@ describe('codex-review risk-scoped review requests', () => {
     ['fix: fenced example', 'Write it like this:\n\n```\nFixes-PR: #12\n```'],
     ['fix: unclosed fence', 'Example:\n```\nFixes-PR: #12'],
     ['fix: template comment', '<!-- Fixes-PR: none -->'],
+    ['fix: tilde fence', 'Like this:\n~~~\nFixes-PR: #12\n~~~'],
+    ['fix: four-backtick fence around a three-backtick line', '````md\n```\nFixes-PR: #12\n```\n````'],
+    ['fix: indented fence', 'Like this:\n   ```\nFixes-PR: #12\n   ```'],
+    ['fix: fence with CRLF endings', 'Like this:\r\n```\r\nFixes-PR: #12\r\n```\r\n'],
+    ['fix: a tilde line does not close a backtick fence', '```\n~~~\nFixes-PR: #12\n~~~'],
   ])('refuses the fix PR %j with body %j, which names no Fixes-PR', (title, body) => {
     const root = tempRoot();
     scopeFixture(root, { labels: [], title, body });
@@ -988,6 +993,8 @@ describe('codex-review risk-scoped review requests', () => {
     ['fix(runner): a new bug', 'fixes-pr: none'],
     ['fix: windows line endings', 'Summary.\r\n\r\nFixes-PR:#12\r\nMore.'],
     ['fix: a real line after an example', '```\nFixes-PR: #1\n```\n\nFixes-PR: #608'],
+    ['fix: a real line after a tilde fence', '~~~\nFixes-PR: #1\n~~~\nFixes-PR: #608'],
+    ['fix: a real line after a CRLF fence', '```\r\nx\r\n```\r\nFixes-PR: none\r\n'],
     ['feat: add a gate', ''],
     ['docs: fix a typo', ''],
   ])('allows %j with body %j', (title, body) => {
