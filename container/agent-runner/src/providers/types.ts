@@ -299,19 +299,31 @@ export interface AgentQuery {
    * real traffic here rather than through `query()`, so media has to travel on
    * this path too. Providers that ignore the argument behave as before — the
    * formatter still describes every attachment inside `message`.
+   *
+   * Returns the id the provider stamped on the prompt when it tracks prompt
+   * ids (see `answeredPrompts`); a provider that does not returns nothing.
    */
-  push(message: string, attachments?: PromptAttachment[]): void;
+  push(message: string, attachments?: PromptAttachment[]): string | void;
+  /**
+   * The id of the prompt `query()` was created with, when the provider tracks
+   * prompt ids. With `push()`'s return value, it is what `answeredPrompts`
+   * and `settled` refer to.
+   */
+  readonly initialPromptId?: string;
 
   /**
    * Optional. True when the provider is holding work it has ACCEPTED but not
    * started running: a `push()` it queued as its own future turn rather than
    * merging into the turn already in flight.
    *
-   * Only providers whose `push()` queues need this. `claude.ts` merges every
-   * push into the running turn (one `result` settles them all) and `codex.ts`
-   * steers the live turn, so both omit it and the poll-loop reads `false`.
    * `opencode.ts` has no merge path at all: every push lands in `pending` and
-   * is dequeued later as a separate turn.
+   * is dequeued later as a separate turn. `codex.ts` counts queued pushes and
+   * steers still in flight. `claude.ts` merges a push into the running turn
+   * when it can, but its CLI can also answer a turn it started itself (a
+   * synthetic resume turn, a background-task notification) while the
+   * runner's prompt is still queued behind it. So it reports a prompt as
+   * queued until a result echoes the prompt's id or the CLI goes idle, and
+   * only once the CLI has shown it emits session-state events.
    *
    * The poll-loop reads it at `result` to decide whether it may lower the
    * published busy level. Without it, the result that ends turn A publishes
@@ -460,22 +472,29 @@ export type ProviderEvent =
       text: string | null;
       isError?: boolean;
       /**
-       * Whether this turn echoed a prompt the runner pushed. `false` when the
-       * provider tracks echoes and this turn echoed none of its prompts: a turn
-       * the CLI started itself, such as its synthetic "Continue from where you
-       * left off." turn on resuming an interrupted session, or one a
-       * background-task notification started. A turn that did consume a runner
-       * prompt but whose result carries no echo also reads `false`; for Claude
-       * the SDK lists those cases on SDKResultSuccess/SDKResultError (a batch
-       * led by a meta prompt, a zeroed result, older producers). Undefined from
-       * a provider that does not track echoes, which poll-loop treats as
-       * prompted.
+       * Ids of the runner's prompts this turn consumed, as the provider saw
+       * them echoed. Present only from a provider that tracks prompt ids,
+       * which also returns an id from `push()` and exposes `initialPromptId`.
+       * Empty when the turn consumed none of them: a turn the CLI started
+       * itself, such as its synthetic "Continue from where you left off."
+       * turn on resuming an interrupted session, or one a background-task
+       * notification started. A prompt consumed with no echo (the SDK lists
+       * the cases on SDKResultSuccess/SDKResultError) is reported later
+       * through `settled`. Undefined from a provider that does not track
+       * prompt ids.
        */
-      prompted?: boolean;
+      answeredPrompts?: string[];
       usage?: TurnUsageInfo | TurnUsageInfo[];
       steps?: number | null;
       rateLimit?: { type: string | null; utilization: number | null; resetsAt: string | null } | null;
     }
+  /**
+   * The provider went idle holding prompts it accepted but never saw
+   * answered: their echo was dropped. The last result that answered none of
+   * the runner's prompts is the one that consumed them. Only a provider that
+   * tracks prompt ids emits it.
+   */
+  | { type: 'settled'; unansweredPrompts: string[] }
   | { type: 'error'; message: string; retryable: boolean; classification?: string }
   | { type: 'progress'; message: string }
   /**

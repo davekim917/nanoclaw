@@ -473,10 +473,20 @@ class MessageStream {
    * ids the CLI mints for its own queued work.
    */
   readonly stamped = new Set<string>();
+  /**
+   * Stamped prompts no result has echoed yet: accepted, not yet answered. The
+   * CLI can answer a turn it started itself while one of these is still
+   * queued behind it, so this, not the turn count, says whether work is
+   * queued. An echo clears an id; so does `settle()` at idle.
+   */
+  readonly outstanding = new Set<string>();
+  /** Outstanding as of the last result: the only ids `settle()` may clear. */
+  private settleable = new Set<string>();
 
-  push(text: string): void {
+  push(text: string): string {
     const uuid = randomUUID();
     this.stamped.add(uuid);
+    this.outstanding.add(uuid);
     this.queue.push({
       type: 'user',
       message: { role: 'user', content: text },
@@ -485,6 +495,28 @@ class MessageStream {
       uuid,
     });
     this.waiting?.();
+    return uuid;
+  }
+
+  /** A result arrived: clear the prompts it echoed and return them. */
+  answer(echoed: string[]): string[] {
+    const answered = [...new Set(echoed)].filter((id) => this.stamped.has(id));
+    for (const id of answered) this.outstanding.delete(id);
+    this.settleable = new Set(this.outstanding);
+    return answered;
+  }
+
+  /**
+   * The CLI went idle: a prompt still outstanding since the last result was
+   * consumed with no echo. The CLI does not go idle between queued turns, so
+   * nothing it has yet to run is settled here. A prompt pushed after that
+   * result is left alone too, since this idle may predate its arrival.
+   */
+  settle(): string[] {
+    const settled = [...this.settleable].filter((id) => this.outstanding.has(id));
+    for (const id of settled) this.outstanding.delete(id);
+    this.settleable.clear();
+    return settled;
   }
 
   end(): void {
@@ -2138,7 +2170,13 @@ export class ClaudeProvider implements AgentProvider {
       Object.entries(options.mcpServers ?? {}).map(([name, server]) => [name, shimCwd(server)]),
     );
     this.additionalDirectories = options.additionalDirectories;
-    this.env = filterSdkEnv({ ...(options.env ?? {}), CLAUDE_CODE_AUTO_COMPACT_WINDOW });
+    // The CLI emits `session_state_changed` (running/idle) only when asked.
+    // Idle is what settles a prompt whose echo was dropped; see MessageStream.
+    this.env = filterSdkEnv({
+      ...(options.env ?? {}),
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW,
+      CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1',
+    });
     this.stickyConfig = claudeConfigSchema.parse(options.providerConfig ?? {});
     this.fallbackKeys = Object.entries(this.env)
       .filter(([k, v]) => ANTHROPIC_FALLBACK_RE.test(k) && typeof v === 'string' && v.length > 0)
@@ -2414,7 +2452,11 @@ export class ClaudeProvider implements AgentProvider {
   query(input: QueryInput): AgentQuery {
     if (!this.memorySessionHook) throw new Error('Claude memory session hook was not registered');
     const stream = new MessageStream();
-    stream.push(input.prompt);
+    const initialPromptId = stream.push(input.prompt);
+    // Set by the first `session_state_changed`: proof this CLI emits the idle
+    // that ends every wait on an outstanding prompt. Until then, report no
+    // queued work, as before, so a CLI without the events cannot pin a turn.
+    let sessionStateSeen = false;
 
     const instructions = input.systemContext?.instructions;
 
@@ -2781,11 +2823,13 @@ export class ClaudeProvider implements AgentProvider {
             type: 'result',
             text,
             isError: m.is_error === true,
-            // Whether this turn consumed a prompt this stream pushed. See
-            // MessageStream.stamped.
-            prompted: [...(m.user_message_uuids ?? []), ...(m.user_message_uuid ? [m.user_message_uuid] : [])].some(
-              (id) => stream.stamped.has(id),
-            ),
+            // The runner's prompts this turn consumed, as echoed. Cleared from
+            // the outstanding set before the yield, so hasQueuedWork is
+            // already truthful when poll-loop reads it at this result.
+            answeredPrompts: stream.answer([
+              ...(m.user_message_uuids ?? []),
+              ...(m.user_message_uuid ? [m.user_message_uuid] : []),
+            ]),
             // Effort is a request parameter — no API bills it back, so it is
             // stamped on here rather than read out of `modelUsage`. On a
             // multi-model turn only the entry for `activeModel` gets it; the
@@ -2895,6 +2939,12 @@ export class ClaudeProvider implements AgentProvider {
             const summary = tn.summary || 'Task notification';
             const emoji = (tn.status && TASK_NOTIFICATION_EMOJI[tn.status]) || '🔧';
             yield { type: 'progress', message: formatBlockquoteLabel(emoji, summary) };
+          }
+        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'session_state_changed') {
+          sessionStateSeen = true;
+          if ((message as { state?: string }).state === 'idle') {
+            const unansweredPrompts = stream.settle();
+            if (unansweredPrompts.length > 0) yield { type: 'settled', unansweredPrompts };
           }
         } else if (message.type === 'assistant') {
           // Record tool_use id → name so a later task_notification can be
@@ -3017,6 +3067,8 @@ export class ClaudeProvider implements AgentProvider {
 
     return {
       push: (msg) => stream.push(msg),
+      initialPromptId,
+      hasQueuedWork: () => sessionStateSeen && stream.outstanding.size > 0,
       end: () => stream.end(),
       events: translateEvents(),
       // Live view of `activeModel`, which is the resolved creation model and

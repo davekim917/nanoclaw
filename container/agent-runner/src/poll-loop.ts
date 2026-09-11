@@ -776,16 +776,29 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // only a synthesised failure, for a fire that never reported an outcome.
     // The key is reserved before the write, so the first outcome reported for
     // a fire is the only one attempted: a retry of the same batch can neither
-    // add a second record nor replace the first, and a failed write is logged,
-    // not retried.
+    // add a second record nor replace the first.
     const writtenFireKeys = new Set<string>();
     const writeFireOutcome = async (key: string, outcome: FireOutcome): Promise<void> => {
       if (writtenFireKeys.has(key)) return;
       writtenFireKeys.add(key);
-      try {
-        await autoAppendTaskLog(outcome.text, outcome.isError, outcome.model);
-      } catch (logErr) {
-        log(`Could not record task run outcome: ${logErr instanceof Error ? logErr.message : String(logErr)}`);
+      // A write that throws committed nothing: the outbound insert is its own
+      // transaction, rolled back on failure (mailbox/sqlite/operations.ts:131,
+      // :169). So the same outcome is retried in place, briefly. What three
+      // short attempts do not heal (a full disk, a closed db), a later one
+      // would not either.
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          await autoAppendTaskLog(outcome.text, outcome.isError, outcome.model);
+          return;
+        } catch (logErr) {
+          const reason = logErr instanceof Error ? logErr.message : String(logErr);
+          if (attempt === 3) {
+            log(`Could not record task run outcome: ${reason}`);
+            return;
+          }
+          log(`Task run outcome write failed (attempt ${attempt} of 3), retrying: ${reason}`);
+          await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
+        }
       }
     };
     const reportTaskOutcome = async (key: string, reported: FireOutcome): Promise<void> => {
@@ -1615,6 +1628,8 @@ interface QueryResult {
 export interface TaskTurnRecord {
   key: string;
   outcome?: FireOutcome;
+  /** Ids of the prompts that started this turn, when the provider tracks them. */
+  promptIds?: string[];
 }
 
 export async function processQuery(
@@ -1694,20 +1709,37 @@ export async function processQuery(
    */
   const taskTurns: TaskTurnRecord[] = [];
   if (routing.taskRun && initialBatchIds.length > 0) {
-    taskTurns.push({ key: initialBatchIds.join(',') });
+    taskTurns.push({
+      key: initialBatchIds.join(','),
+      ...(query.initialPromptId ? { promptIds: [query.initialPromptId] } : {}),
+    });
   }
+  // The latest result that answered none of the runner's prompts, held in case
+  // the provider later settles a prompt whose echo was dropped: that result is
+  // the one that consumed it. See the `settled` branch.
+  let provisionalOutcome: FireOutcome | undefined;
   /**
-   * Fill the OLDEST unanswered turn, matching the documented stream semantics
-   * that "each result event consumes the oldest unanswered prompt". When every
-   * turn is already answered the result is an in-stream nudge/wrapping retry of
-   * the turn that just closed, and is deliberately dropped: coalescing is
-   * scoped to retries OF a turn, never across turns.
+   * Fill the task turns a result answered. With prompt ids (`answered`), that
+   * is every open turn whose prompt the result consumed: a merged result
+   * answers each fire it took in, and a nudge's answer fills none. Without
+   * them, fill the OLDEST unanswered turn, matching the documented stream
+   * semantics that "each result event consumes the oldest unanswered prompt".
+   * When every turn is already answered the result is an in-stream
+   * nudge/wrapping retry of the turn that just closed, and is deliberately
+   * dropped: coalescing is scoped to retries OF a turn, never across turns.
    */
-  const recordTaskTurn = async (outcome: FireOutcome): Promise<void> => {
-    const open = taskTurns.find((t) => !t.outcome);
-    if (!open) return;
-    open.outcome = outcome;
-    await onTaskOutcome?.(open.key, outcome);
+  const recordTaskTurn = async (outcome: FireOutcome, answered?: string[]): Promise<void> => {
+    const oldest = taskTurns.find((t) => !t.outcome);
+    const slots =
+      answered === undefined
+        ? oldest
+          ? [oldest]
+          : []
+        : taskTurns.filter((t) => !t.outcome && t.promptIds?.some((id) => answered.includes(id)));
+    for (const slot of slots) {
+      slot.outcome = outcome;
+      await onTaskOutcome?.(slot.key, outcome);
+    }
   };
   // Prompt queue for the exchange hook — each result event consumes the
   // oldest unanswered prompt, except a wrapping-retry result, which answers
@@ -1742,7 +1774,7 @@ export async function processQuery(
   // real push (initial batch, in-turn follow-up, durable continuation
   // launch) restarts the clock for the turn it starts.
   let turnStartedAtMs = Date.now();
-  const pushToQuery = (message: string, attachments?: PromptAttachment[]): void => {
+  const pushToQuery = (message: string, attachments?: PromptAttachment[]): string | undefined => {
     turnIdle = false;
     // Same boundary as `turnIdle`, published for the host. A pushed turn runs
     // with no processing claim of its own (the initial batch was completed at
@@ -1750,7 +1782,8 @@ export async function processQuery(
     // and the idle reaper.
     setProviderTurnExecuting(true);
     turnStartedAtMs = Date.now();
-    query.push(message, attachments);
+    const id = query.push(message, attachments);
+    return typeof id === 'string' ? id : undefined;
   };
 
   const pauseAnsweredPrompt = (): void => {
@@ -1772,6 +1805,9 @@ export async function processQuery(
     // before its prompt is ever pushed.
     if (!ignoreLedger && archivePrompts.length > 0) return;
     if (getActiveRepositoryMountBarrier() !== null) return;
+    // Work the provider has accepted but not yet answered would merge with the
+    // continuation into one turn, and one result would answer both.
+    if (query.hasQueuedWork?.()) return;
     const queued = getWorkContinuation();
     if (!queued || !isWorkContinuationRunnable(queued, runnerId)) return;
     const running = markWorkContinuationRunning(queued.id, runnerId);
@@ -2013,11 +2049,16 @@ export async function processQuery(
         // slot — or, once that was filled, vanished — so a frequently failing
         // series could sit below the escalation threshold forever, which is
         // precisely the outcome this feature exists to prevent.
+        let admittedTurn: TaskTurnRecord | undefined;
         if (routing.taskRun) {
           const admittedTaskIds = keep.filter((m) => m.kind === 'task').map((m) => m.id);
-          if (admittedTaskIds.length > 0) taskTurns.push({ key: admittedTaskIds.join(',') });
+          if (admittedTaskIds.length > 0) {
+            admittedTurn = { key: admittedTaskIds.join(',') };
+            taskTurns.push(admittedTurn);
+          }
         }
-        pushToQuery(prompt, extractAttachments(keep));
+        const pushedId = pushToQuery(prompt, extractAttachments(keep));
+        if (admittedTurn && pushedId) admittedTurn.promptIds = [pushedId];
         archivePrompts.push({ prompt });
         admittedInbound = true;
         markCompleted(keptIds);
@@ -2166,8 +2207,8 @@ export async function processQuery(
         // starts on its own inside an already-open stream (e.g. a resume
         // whose first turn answers empty, then genuinely does the work on a
         // second turn nobody pushed). That second turn is not a `pushToQuery`
-        // call — `hasQueuedWork` is unimplemented on claude.ts, so the prior
-        // empty `result` already lowered the flag — so without this, the
+        // call, and a provider that cannot tell it is still queued has let the
+        // prior empty `result` lower the flag, so without this, the
         // task reaper sees it as idle and kills it mid-work on the next tick.
         //
         // `turnIdle` and `turnStartedAtMs` are normally only touched by
@@ -2194,11 +2235,19 @@ export async function processQuery(
         // task fire: the CLI's synthetic "Continue from where you left off."
         // turn on resuming an interrupted session, or a turn a background-task
         // notification started. Recorded, it would take the fire's one outcome
-        // slot and drop the real turn's result (#606). Only a provider that can
-        // tell says `false`; undefined keeps every result eligible.
-        const answersRunnerPrompt = event.prompted !== false;
+        // slot and drop the real turn's result (#606). A provider that tracks
+        // prompt ids says which prompts each result answered
+        // (`answeredPrompts`, empty for none); one that does not leaves every
+        // result eligible.
+        const answersRunnerPrompt = event.answeredPrompts === undefined || event.answeredPrompts.length > 0;
         if (routing.taskRun && !answersRunnerPrompt) {
           log('Result answered no runner prompt (a turn the CLI started itself); not recorded as the task outcome');
+        }
+        if (event.answeredPrompts !== undefined) {
+          provisionalOutcome =
+            routing.taskRun && !answersRunnerPrompt
+              ? { text: event.text ?? '', isError: event.isError === true, model: modelInForce }
+              : undefined;
         }
         // The provider is between turns as of right now. Set before the
         // handling below, so any push it makes (nudge, continuation launch)
@@ -2306,8 +2355,13 @@ export async function processQuery(
           }
           const { sent, hasUnwrapped, taskBlocks } = await dispatchResultText(event.text, routing);
           const willRetryTaskBlocks = shouldNudgeTaskBlocks(routing.taskRun, taskBlocks, taskBlockNudged);
-          if (routing.taskRun && !taskBlockNudged && answersRunnerPrompt)
-            await recordTaskTurn({ text: event.text, isError: event.isError === true, model: modelInForce });
+          // With prompt ids a nudge's answer matches no fire, so only the id-less
+          // path needs `taskBlockNudged` to keep it out of the next fire's slot.
+          if (routing.taskRun && (event.answeredPrompts !== undefined || (!taskBlockNudged && answersRunnerPrompt)))
+            await recordTaskTurn(
+              { text: event.text, isError: event.isError === true, model: modelInForce },
+              event.answeredPrompts,
+            );
           if ((event.isError === true || aupRefusal) && !routing.taskRun) {
             // Non-retryable error turn (e.g. a 403 billing_error) with no
             // <message> envelope: deliver the notice instead of dropping it as
@@ -2359,8 +2413,8 @@ export async function processQuery(
           // recording it is what lets a recovered run RESET a stale failure
           // streak — skipping it would leave the streak frozen at its last
           // failing value across a recovery.
-          if (routing.taskRun && !taskBlockNudged && answersRunnerPrompt) {
-            await recordTaskTurn({ text: '', isError: event.isError === true, model: modelInForce });
+          if (routing.taskRun && (event.answeredPrompts !== undefined || (!taskBlockNudged && answersRunnerPrompt))) {
+            await recordTaskTurn({ text: '', isError: event.isError === true, model: modelInForce }, event.answeredPrompts);
           }
           pauseAnsweredPrompt();
         }
@@ -2368,6 +2422,16 @@ export async function processQuery(
         // again and the published bit stays 1; if it did not, this is where
         // the container becomes reapable.
         closeResultScope();
+      } else if (event.type === 'settled') {
+        // The provider went idle holding prompts it never saw answered, so
+        // their echo was dropped (sdk.d.ts lists the cases). The last result
+        // that answered none of the runner's prompts is the one that consumed
+        // them.
+        if (routing.taskRun && provisionalOutcome) await recordTaskTurn(provisionalOutcome, event.unansweredPrompts);
+        provisionalOutcome = undefined;
+        // `result` kept the level up while these prompts looked queued
+        // (lowerTurnLevelUnlessQueued). The turn is over now.
+        lowerTurnLevelUnlessQueued();
       } else if (event.type === 'compacted') {
         advanceMemoryContextEpoch(providerName);
         // The SDK auto-compacted the conversation. After compaction the
