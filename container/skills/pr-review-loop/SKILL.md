@@ -174,7 +174,7 @@ codex-review.sh wait <sha> <since_iso> [minutes]
                                          # foreground 60s GraphQL poll; default $CODEX_REVIEW_WAIT_MINUTES or 15
 codex-review.sh scope                     # risk-scoped repos: review|skip for the current head (legacy: auto)
 codex-review.sh request                   # risk-scoped repos: the only way to ask for a round
-codex-review.sh merge-check [--head <sha>] # exit 0 only when merging exactly that head is allowed
+codex-review.sh merge-check [--head <sha>] # exit 0 only when merging exactly that head is allowed; 26 = legacy repo, Step 6 decides
 codex-review.sh receipt --head <sha> --outcome approve|changes --reviewer "<model + runtime>" --body-file <file>
                                          # post a substitute review's receipt for exactly that head
 ```
@@ -395,8 +395,10 @@ never route around it. Ask only when nothing the operator set authorizes
 this merge. Then:
 
 ```bash
-gh pr merge "$PR" --repo "$REPO" --squash --delete-branch
+gh pr merge "$PR" --repo "$REPO" --squash --delete-branch --match-head-commit "$SHA"
 ```
+
+In a legacy repo (nanoclaw-groups, for one), `codex-review.sh merge-check` exits 26 and this is the merge: check the evidence above, then run it as its own step, pinned to the head you checked. Never chain it onto merge-check.
 
 Squash is the default. Use `--merge` when the PR's topology matters — an upstream-sync PR whose second parent must survive; squashing one drops the merge base and makes the fork report "behind" forever.
 
@@ -404,7 +406,7 @@ Then run whatever post-PR bookkeeping your environment expects — e.g. `add_shi
 
 ## Risk-scoped repos
 
-A repo is **risk-scoped** when `.github/labeler.yml` on the PR's base branch names `risk:high` anywhere, or holds any backslash (a double-quoted YAML key can spell `risk:high` with escapes). Automatic review is off there, and a round happens only when one is asked for. Steps 1–4 apply unchanged; this replaces how a round starts (Step 5) and when you may merge (Step 6). In any other repo `codex-review.sh scope` answers `mode:"legacy", verdict:"auto"` and nothing here applies.
+A repo is **risk-scoped** when `.github/labeler.yml` on the PR's base branch names `risk:high` anywhere, or holds any backslash (a double-quoted YAML key can spell `risk:high` with escapes). Automatic review is off there, and a round happens only when one is asked for. Steps 1–4 apply unchanged; this replaces how a round starts (Step 5) and when you may merge (Step 6). In any other repo `codex-review.sh scope` answers `mode:"legacy", verdict:"auto"`, `merge-check` exits 26 (`merge=defer mode=legacy`), and nothing here applies: Step 6 governs the merge.
 
 **Request rounds only through `codex-review.sh request`.** The `@codex review` prohibition still holds for anything typed by hand. With nothing else able to trigger a review, `request` is the trigger, and it posts only when the rules below allow — a hand-typed comment skips every one of them.
 
@@ -418,7 +420,7 @@ A repo is **risk-scoped** when `.github/labeler.yml` on the PR's base branch nam
      gh pr merge "$PR" --repo "$REPO" --squash --delete-branch --match-head-commit "$SHA"
    ```
 
-   Run the two back to back with nothing in between. `--match-head-commit` pins the head, but GitHub's merge takes no base SHA, so merge-check re-reads the base branch last: exit 25 means it moved while the check ran, so re-run it. The `merge=allowed` line names the `base=` commit the verdict read. That leaves a window of seconds. A `labeler.yml` change landing on the base in the gap between the two calls can still let a PR merge that the new rules would have reviewed, and that PR then gets only post-merge review. Shadow review (#660) is that net for every skipped merge, and a `labeler.yml` change is itself `risk:high`.
+   The chain is for exit 0 (`merge=allowed`) only, and `&&` keeps it that way. Exit 26 (`merge=defer mode=legacy`) is not a pass: the repo is not risk-scoped, so take Step 6 instead. Run the two back to back with nothing in between. `--match-head-commit` pins the head, but GitHub's merge takes no base SHA, so merge-check re-reads the base branch last: exit 25 means it moved while the check ran, so re-run it. The `merge=allowed` line names the `base=` commit the verdict read. That leaves a window of seconds. A `labeler.yml` change landing on the base in the gap between the two calls can still let a PR merge that the new rules would have reviewed, and that PR then gets only post-merge review. Shadow review (#660) is that net for every skipped merge, and a `labeler.yml` change is itself `risk:high`.
 
    Either verdict needs green CI on that head: each workflow in `CODEX_REVIEW_REQUIRED_WORKFLOWS` (comma-separated, default `CI`) has a latest run that concluded `success`, every other latest run concluded `success`, `neutral`, or `skipped`, and the newest commit status per context is `success` (release-policy's `Release policy` and `Release approval` contexts are a policy gate, not CI, and are skipped). A `review` head also needs `status` to read `clean` for it since its request (so `open=0`), or an approving substitute receipt for that exact head. A `fix:` or `fix(...)` title also needs a body line naming the PR it fixes, `Fixes-PR: #<n>`, or `Fixes-PR: none`, outside any code fence or HTML comment; merge-check refuses without one.
 

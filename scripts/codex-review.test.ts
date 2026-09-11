@@ -717,7 +717,7 @@ describe('codex-review risk-scoped review requests', () => {
     expect(request.calls).not.toMatch(/^(node|pr comment)/m);
 
     const merge = runHelper(root, ['merge-check', '--head', HEAD]);
-    expect(merge.status).toBe(0);
+    expect(merge.status).toBe(26);
     expect(merge.stdout).toContain('merge=defer mode=legacy');
     expect(merge.stdout).toContain('Step-6 evidence rules apply');
     expect(merge.calls).not.toMatch(/^(reviews|reactions|comments|reviewThreads) /m);
@@ -1004,7 +1004,7 @@ describe('codex-review risk-scoped review requests', () => {
     expect(scope.calls).toContain(`rest repos/example/repository/contents/.github/labeler.yml?ref=${BASE_OID}\n`);
 
     const merge = runHelper(root, ['merge-check', '--head', HEAD]);
-    expect(merge.status).toBe(0);
+    expect(merge.status).toBe(26);
     expect(merge.stdout).toContain('merge=defer mode=legacy');
   });
 
@@ -1058,6 +1058,29 @@ describe('codex-review risk-scoped review requests', () => {
       `base=${BASE_OID}: base moved during check (main is now ${MOVED_BASE}); re-run merge-check`,
     );
     expect(moved.stdout).not.toContain('merge=allowed');
+  });
+
+  it('defers a legacy repo with exit 26, never 0, after re-reading its base', () => {
+    const root = tempRoot();
+    scopeFixture(root, { baseConfig: null, labels: [] });
+
+    const merge = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(merge.status).toBe(26);
+    expect(merge.stdout).toContain('merge=defer mode=legacy: example/repository is not risk-scoped');
+    expect(merge.stdout).not.toContain('merge=allowed');
+    expect(merge.calls.match(/^rest repos\/example\/repository\/git\/ref\/heads\/main$/gm)).toHaveLength(2);
+  });
+
+  it('refuses a legacy defer with exit 25 when the base moves while merge-check runs', () => {
+    // The moved base may be the commit that opts the repo in, so the defer is stale.
+    const root = tempRoot();
+    scopeFixture(root, { baseConfig: null, labels: [] });
+    fs.writeFileSync(path.join(root, 'ref--main-2'), MOVED_BASE);
+
+    const merge = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(merge.status).toBe(25);
+    expect(merge.stderr).toContain(`base moved during check (main is now ${MOVED_BASE}); re-run merge-check`);
+    expect(merge.stdout).not.toContain('merge=');
   });
 
   it('fails closed when the head moves while its changed files are listed', () => {
@@ -1507,7 +1530,7 @@ describe('codex-review risk-scoped review requests', () => {
     });
 
     const result = runHelper(root, ['merge-check', '--head', HEAD]);
-    expect(result.status).toBe(0);
+    expect(result.status).toBe(26);
     expect(result.stdout).toContain('merge=defer mode=legacy');
     expect(result.calls).not.toContain('actions/runs');
     expect(result.calls).not.toContain('statuses');

@@ -22,7 +22,7 @@
 #                                             # post a substitute review's durable receipt for exactly that head
 #
 # Exit codes, one contract across commands (0 and 3 are the originals):
-#   0   pass; verdict printed; merge allowed (legacy merge-check: defer to SKILL.md Step 6)
+#   0   pass; verdict printed; merge allowed. For merge-check, only `merge=allowed`
 #   1   no verdict — a GitHub read or validation failed; never read it as a pass
 #   2   usage, no JS runtime, or a push shape the churn gate cannot judge
 #   3   REFRAME REQUIRED — the churn gate refused (gate, push, request)
@@ -36,6 +36,8 @@
 #       fix PR whose body has no Fixes-PR line
 #   25  merge-check: the base branch moved while the check ran, or could not be
 #       re-read, so the verdict may be stale — re-run merge-check
+#   26  merge-check: `merge=defer mode=legacy` — not risk-scoped, so SKILL.md Step 6's
+#       evidence rules decide this merge; never chain it into `gh pr merge`
 #
 # `gate` is the rule the advisory detector never was: three rounds on ONE
 # finding class (or one seam, severity not falling) is a design defect at a
@@ -1041,8 +1043,10 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|sc
     ;;
   merge-check)
     # Exit 0 only when merging exactly this head is allowed; the merge then pins
-    # it with `gh pr merge --match-head-commit <head>`. Legacy repos defer to
-    # SKILL.md Step 6 — no new check there.
+    # it with `gh pr merge --match-head-commit <head>`. A legacy repo exits 26,
+    # not 0: its merge is Step 6's evidence rules, and a caller chaining
+    # merge-check into `gh pr merge` must never read a defer as a pass. Its base
+    # is re-read first, since a base that moved may have opted in since.
     shift
     want=""
     while [ $# -gt 0 ]; do
@@ -1053,8 +1057,9 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|sc
     done
     scope_eval || exit 1
     if [ "$SCOPE_MODE" = legacy ]; then
+      refuse_if_base_moved
       echo "merge=defer mode=legacy: $REPO is not risk-scoped; the existing Step-6 evidence rules apply"
-      exit 0
+      exit 26
     fi
     if [ -n "$want" ] && [[ "$SCOPE_HEAD" != "$want"* ]]; then
       echo "merge=refused head=$SCOPE_HEAD: the PR head is not $want" >&2
