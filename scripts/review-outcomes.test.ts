@@ -3,8 +3,10 @@ import { describe, expect, it } from 'vitest';
 import { enforceHermeticity } from '../src/test-hermeticity.js';
 
 import {
+  buildShadowReviewIndex,
   computeReport,
   extractFixesPrNumber,
+  extractShadowReviewPrNumber,
   filesOverlap,
   findFollowUp,
   findRevert,
@@ -12,12 +14,14 @@ import {
   isFixTitle,
   isLowRisk,
   isoWeekKey,
+  issueHasP1,
   isRevertOf,
   isRevertPR,
   matchesAnyGlob,
-  weeklyRevertRate,
   type Options,
   type PullRequestData,
+  type ShadowReviewIssueData,
+  weeklyRevertRate,
 } from './review-outcomes.js';
 
 // This suite never shells out or touches the network — every case here exercises the
@@ -243,6 +247,72 @@ describe('findRevert', () => {
   });
 });
 
+function shadowReviewIssue(overrides: Partial<ShadowReviewIssueData> & { number: number }): ShadowReviewIssueData {
+  return { title: `shadow review: #${overrides.number} some title`, body: '', ...overrides };
+}
+
+describe('extractShadowReviewPrNumber', () => {
+  it('reads the PR number from the workflow-authored title', () => {
+    expect(extractShadowReviewPrNumber('shadow review: #643 fix(x): y')).toBe(643);
+  });
+
+  it('is case-insensitive on the prefix', () => {
+    expect(extractShadowReviewPrNumber('Shadow Review: #12 z')).toBe(12);
+  });
+
+  it('returns null for a title that is not a shadow-review issue', () => {
+    expect(extractShadowReviewPrNumber('some other issue')).toBeNull();
+  });
+});
+
+describe('issueHasP1', () => {
+  it('matches a P1-labeled finding line', () => {
+    expect(issueHasP1('- **P1** — src/guard/x.ts:12 — auth bypass')).toBe(true);
+  });
+
+  it('is case-insensitive', () => {
+    expect(issueHasP1('- p1 — src/x.ts:1 — foo')).toBe(true);
+  });
+
+  it('is false when only P2 findings are present', () => {
+    expect(issueHasP1('- **P2** — src/x.ts:1 — cosmetic')).toBe(false);
+  });
+
+  it('does not match "P10" or "GP1" (word-bounded)', () => {
+    expect(issueHasP1('see P10 for details')).toBe(false);
+    expect(issueHasP1('GP1 unrelated token')).toBe(false);
+  });
+
+  it('is false on an empty body', () => {
+    expect(issueHasP1('')).toBe(false);
+  });
+});
+
+describe('buildShadowReviewIndex', () => {
+  it('maps a PR number to hasP1 from its issue', () => {
+    const index = buildShadowReviewIndex([
+      shadowReviewIssue({ number: 643, body: '- **P1** — a.ts:1 — bad' }),
+      shadowReviewIssue({ number: 653, body: '- **P2** — b.ts:1 — minor' }),
+    ]);
+    expect(index.get(643)).toEqual({ hasP1: true });
+    expect(index.get(653)).toEqual({ hasP1: false });
+    expect(index.has(652)).toBe(false);
+  });
+
+  it('ignores issues whose title is not a shadow-review title', () => {
+    const index = buildShadowReviewIndex([shadowReviewIssue({ number: 1, title: 'unrelated issue' })]);
+    expect(index.size).toBe(0);
+  });
+
+  it('ORs hasP1 across duplicate issues for the same PR', () => {
+    const index = buildShadowReviewIndex([
+      shadowReviewIssue({ number: 1, body: '- **P2** — a.ts:1 — minor' }),
+      shadowReviewIssue({ number: 1, body: '- **P1** — b.ts:2 — bad' }),
+    ]);
+    expect(index.get(1)).toEqual({ hasP1: true });
+  });
+});
+
 describe('isoWeekKey', () => {
   it('computes the ISO week for a known date', () => {
     expect(isoWeekKey('2026-09-10T12:00:00Z')).toBe('2026-W37');
@@ -348,5 +418,37 @@ describe('computeReport', () => {
     ];
     const report = computeReport(prs, RISK_GLOBS, options);
     expect(report.weeklyRevertRate.length).toBeGreaterThan(0);
+  });
+
+  it('counts shadow-reviewed low-risk PRs and P1s among them, per bucket', () => {
+    const prs = [
+      // low-risk, after the switch, shadow-reviewed with a P1
+      pr({ number: 3, title: 'feat: c', mergedAt: '2026-09-11T00:00:00Z', files: ['docs/c.md'] }),
+      // low-risk, after the switch, shadow-reviewed clean (P2 only)
+      pr({ number: 4, title: 'feat: d', mergedAt: '2026-09-12T00:00:00Z', files: ['docs/d.md'] }),
+      // low-risk, after the switch, never shadow-reviewed (no issue)
+      pr({ number: 5, title: 'feat: e', mergedAt: '2026-09-13T00:00:00Z', files: ['docs/e.md'] }),
+      // high-risk, so it never lands in the low-risk denominator even with a matching issue
+      pr({ number: 6, title: 'fix(guard): f', mergedAt: '2026-09-14T00:00:00Z', files: ['src/guard/x.ts'] }),
+    ];
+    const issues: ShadowReviewIssueData[] = [
+      shadowReviewIssue({ number: 3, body: '- **P1** — a.ts:1 — auth bypass' }),
+      shadowReviewIssue({ number: 4, body: '- **P2** — b.ts:1 — cosmetic' }),
+      shadowReviewIssue({ number: 6, body: '- **P1** — should not count, #6 is high-risk' }),
+    ];
+    const report = computeReport(prs, RISK_GLOBS, options, issues);
+    expect(report.after.lowRiskMerged).toBe(3);
+    expect(report.after.shadowReviewed).toBe(2);
+    expect(report.after.shadowReviewedPRs).toEqual([3, 4]);
+    expect(report.after.shadowReviewP1).toBe(1);
+    expect(report.after.shadowReviewP1PRs).toEqual([3]);
+    expect(report.after.shadowReviewedRate).toBeCloseTo(2 / 3);
+  });
+
+  it('defaults shadow-review counts to zero when no issues are supplied', () => {
+    const prs = [pr({ number: 1, title: 'feat: a', mergedAt: '2026-09-11T00:00:00Z', files: ['docs/a.md'] })];
+    const report = computeReport(prs, RISK_GLOBS, options);
+    expect(report.after.shadowReviewed).toBe(0);
+    expect(report.after.shadowReviewP1).toBe(0);
   });
 });

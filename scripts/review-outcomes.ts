@@ -44,6 +44,20 @@
  *   `Reverts #N` and `This reverts ... #N` (a bounded gap between the word and the
  *   number, verified against #610's actual body: "This reverts #608 (merge `...`)").
  *
+ * Shadow-review counting — the direct measurement `docs/specs/risk-based-review/plan.md`'s
+ * rollback section names as primary, over the file-overlap upper bound above:
+ * `.github/workflows/shadow-review.yml` opens one issue per low-risk PR it finds a
+ * problem in, titled `shadow review: #<n> <title>` and labeled `shadow-review`; a clean
+ * PR gets a PR comment instead, no issue. So "was this skipped PR shadow-reviewed, and
+ * did the review find a P1" is answerable from the issue list alone: match each issue's
+ * title against `SHADOW_REVIEW_TITLE_RE` to recover the PR number, and its body against
+ * `P1_RE` for whether any finding was severity P1 (the workflow's prompt has Claude label
+ * every finding P1 or P2 inline, e.g. "- **P1** — file:line — ..."). This undercounts by
+ * design: a low-risk PR with no shadow-review issue was either clean (a PR comment, not
+ * an issue) or the workflow hasn't run yet — both read as "not shadow-reviewed", which is
+ * the conservative direction for a metric whose job is to justify tightening the risk
+ * list, not to over-claim coverage.
+ *
  * Usage:
  *   pnpm exec tsx scripts/review-outcomes.ts [--repo owner/repo] [--switch <ISO>]
  *     [--days <n>] [--followup-days <n>] [--json]
@@ -87,7 +101,20 @@ export interface BucketResult {
   followedUpByLinkPRs: number[];
   followedUpByOverlapPRs: number[];
   revertedPRs: number[];
+  shadowReviewed: number;
+  shadowReviewedRate: number;
+  shadowReviewedPRs: number[];
+  shadowReviewP1: number;
+  shadowReviewP1Rate: number;
+  shadowReviewP1PRs: number[];
   caveat: string | null;
+}
+
+/** One issue `.github/workflows/shadow-review.yml` opened or could have opened. */
+export interface ShadowReviewIssueData {
+  number: number;
+  title: string;
+  body: string;
 }
 
 export interface WeeklyRevertRow {
@@ -243,6 +270,43 @@ export function findRevert(candidate: PullRequestData, laterPRs: PullRequestData
   return null;
 }
 
+// `.github/workflows/shadow-review.yml` titles every issue it opens exactly
+// `shadow review: #<n> <title>` (see that workflow), read case-insensitively same as
+// the other title/body regexes above.
+const SHADOW_REVIEW_TITLE_RE = /^shadow review:\s*#(\d+)\b/i;
+
+// The workflow's prompt has Claude mark every finding's severity inline as "P1" or
+// "P2" (see shadow-review.yml's prompt). Word-bounded so "P10" or "GP1" don't match;
+// case-insensitive so a casing drift in the model's output doesn't silently undercount.
+const P1_RE = /\bP1\b/i;
+
+/** The PR number a shadow-review issue's title names, or null if the title doesn't match. */
+export function extractShadowReviewPrNumber(title: string): number | null {
+  const match = SHADOW_REVIEW_TITLE_RE.exec(title);
+  return match ? Number(match[1]) : null;
+}
+
+/** Whether a shadow-review issue body names at least one P1 (destructive/fail-open) finding. */
+export function issueHasP1(body: string): boolean {
+  return P1_RE.test(body);
+}
+
+/**
+ * PR number -> whether its shadow-review issue (if any) named a P1. A PR absent from
+ * the map was never shadow-reviewed-with-findings: either it was clean (a PR comment,
+ * not an issue — see file header) or the workflow hasn't run on it yet.
+ */
+export function buildShadowReviewIndex(issues: ShadowReviewIssueData[]): Map<number, { hasP1: boolean }> {
+  const index = new Map<number, { hasP1: boolean }>();
+  for (const issue of issues) {
+    const prNumber = extractShadowReviewPrNumber(issue.title);
+    if (prNumber === null) continue;
+    const hasP1 = issueHasP1(issue.body) || (index.get(prNumber)?.hasP1 ?? false);
+    index.set(prNumber, { hasP1 });
+  }
+  return index;
+}
+
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 /**
@@ -292,6 +356,7 @@ function buildBucket(
   allPRsSortedByMergedAt: PullRequestData[],
   riskHighGlobs: string[],
   followupDays: number,
+  shadowReviewIndex: Map<number, { hasP1: boolean }>,
 ): BucketResult {
   const lowRiskPRs = windowPRs.filter((pr) => isLowRisk(pr.files, riskHighGlobs));
 
@@ -301,6 +366,9 @@ function buildBucket(
   const followedUpByLinkPRs: number[] = [];
   const followedUpByOverlapPRs: number[] = [];
   const revertedPRs: number[] = [];
+
+  const shadowReviewedPRs = lowRiskPRs.filter((pr) => shadowReviewIndex.has(pr.number)).map((pr) => pr.number);
+  const shadowReviewP1PRs = shadowReviewedPRs.filter((n) => shadowReviewIndex.get(n)?.hasP1 === true);
 
   for (const pr of lowRiskPRs) {
     const cutoff = new Date(pr.mergedAt).getTime() + followupDays * MS_PER_DAY;
@@ -342,6 +410,12 @@ function buildBucket(
     followedUpByLinkPRs,
     followedUpByOverlapPRs,
     revertedPRs,
+    shadowReviewed: shadowReviewedPRs.length,
+    shadowReviewedRate: n === 0 ? 0 : shadowReviewedPRs.length / n,
+    shadowReviewedPRs,
+    shadowReviewP1: shadowReviewP1PRs.length,
+    shadowReviewP1Rate: n === 0 ? 0 : shadowReviewP1PRs.length / n,
+    shadowReviewP1PRs,
     caveat:
       n < MIN_SAMPLE_FOR_SIGNAL
         ? `only ${n} low-risk PR(s) merged ${label} the switch (<${MIN_SAMPLE_FOR_SIGNAL}) — only a large difference would show`
@@ -349,12 +423,18 @@ function buildBucket(
   };
 }
 
-export function computeReport(allPRs: PullRequestData[], riskHighGlobs: string[], options: Options): ReportResult {
+export function computeReport(
+  allPRs: PullRequestData[],
+  riskHighGlobs: string[],
+  options: Options,
+  shadowReviewIssues: ShadowReviewIssueData[] = [],
+): ReportResult {
   const switchMs = new Date(options.switchIso).getTime();
   const beforeStart = switchMs - options.days * MS_PER_DAY;
   const afterEnd = switchMs + options.days * MS_PER_DAY;
 
   const sorted = [...allPRs].sort((a, b) => new Date(a.mergedAt).getTime() - new Date(b.mergedAt).getTime());
+  const shadowReviewIndex = buildShadowReviewIndex(shadowReviewIssues);
 
   const beforePRs = sorted.filter((pr) => {
     const t = new Date(pr.mergedAt).getTime();
@@ -365,8 +445,8 @@ export function computeReport(allPRs: PullRequestData[], riskHighGlobs: string[]
     return t >= switchMs && t < afterEnd;
   });
 
-  const before = buildBucket('before', beforePRs, sorted, riskHighGlobs, options.followupDays);
-  const after = buildBucket('after', afterPRs, sorted, riskHighGlobs, options.followupDays);
+  const before = buildBucket('before', beforePRs, sorted, riskHighGlobs, options.followupDays, shadowReviewIndex);
+  const after = buildBucket('after', afterPRs, sorted, riskHighGlobs, options.followupDays, shadowReviewIndex);
 
   const wholeWindowPRs = sorted.filter((pr) => {
     const t = new Date(pr.mergedAt).getTime();
@@ -445,6 +525,32 @@ export function fetchMergedPRs(repo: string, sinceIso: string): PullRequestData[
     mergedAt: pr.mergedAt,
     files: resolveFiles(repo, pr),
   }));
+}
+
+interface RawIssue {
+  number: number;
+  title: string;
+  body: string | null;
+}
+
+/** Every issue ever labeled `shadow-review` — open or closed, the label is the filter. */
+export function fetchShadowReviewIssues(repo: string): ShadowReviewIssueData[] {
+  const raw = gh([
+    'issue',
+    'list',
+    '--repo',
+    repo,
+    '--label',
+    'shadow-review',
+    '--state',
+    'all',
+    '--json',
+    'number,title,body',
+    '--limit',
+    '1000',
+  ]);
+  const issues = JSON.parse(raw) as RawIssue[];
+  return issues.map((issue) => ({ number: issue.number, title: issue.title, body: issue.body ?? '' }));
 }
 
 // ─────────────────────────── CLI ───────────────────────────────────────────
@@ -526,6 +632,14 @@ function printBucket(bucket: BucketResult): void {
     `    reverted:                  ${bucket.reverted} (${pct(bucket.revertedRate)})` +
       (bucket.revertedPRs.length ? ` [${bucket.revertedPRs.map((n) => `#${n}`).join(', ')}]` : ''),
   );
+  console.log(
+    `    shadow-reviewed:           ${bucket.shadowReviewed} (${pct(bucket.shadowReviewedRate)})` +
+      (bucket.shadowReviewedPRs.length ? ` [${bucket.shadowReviewedPRs.map((n) => `#${n}`).join(', ')}]` : ''),
+  );
+  console.log(
+    `    shadow-review P1:          ${bucket.shadowReviewP1} (${pct(bucket.shadowReviewP1Rate)})` +
+      (bucket.shadowReviewP1PRs.length ? ` [${bucket.shadowReviewP1PRs.map((n) => `#${n}`).join(', ')}]` : ''),
+  );
   if (bucket.caveat) console.log(`    caveat: ${bucket.caveat}`);
 }
 
@@ -553,8 +667,9 @@ function main(): void {
 
   const sinceIso = new Date(new Date(options.switchIso).getTime() - options.days * MS_PER_DAY).toISOString();
   const allPRs = fetchMergedPRs(options.repo, sinceIso);
+  const shadowReviewIssues = fetchShadowReviewIssues(options.repo);
 
-  const report = computeReport(allPRs, riskHighGlobs, options);
+  const report = computeReport(allPRs, riskHighGlobs, options, shadowReviewIssues);
 
   if (options.json) {
     console.log(JSON.stringify(report, null, 2));
