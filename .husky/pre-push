@@ -249,14 +249,16 @@ objects_for_ref() {
   ref_allowlist_file=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-allowlist.XXXXXX")
   # Read the allowlist from $local_sha's own committed tree, not the pushing
   # worktree's working copy: the working copy can hold an uncommitted entry
-  # that exempts a value nothing on the remote actually backs (#651). This
-  # still applies one allowlist — reviewed exceptions are current policy —
-  # across every commit objects_for_ref scans below, including older ones
-  # this ref's history carries; it is just sourced from a commit that will
-  # actually land on the remote instead of from disk.
+  # that exempts a value nothing on the remote actually backs (#651). A ref
+  # whose tip carries no .public-boundary-allowlist.json at all — the
+  # long-lived channels/providers sibling branches, most local tags — is not
+  # refused for that: it gets an empty allowlist, which exempts nothing and
+  # is still the strictest outcome. The pushed commit's own committed
+  # entries govern every commit objects_for_ref scans below, including
+  # older ones this ref's history carries; changes to that file are
+  # reviewed when they merge, because it is risk:high.
   if ! git -C "$worktree_root" show "$local_sha:.public-boundary-allowlist.json" > "$ref_allowlist_file" 2>/dev/null; then
-    echo "pre-push: $local_sha has no committed .public-boundary-allowlist.json" >&2
-    exit 1
+    printf '{"entries": []}\n' > "$ref_allowlist_file"
   fi
   allowlist_path="$ref_allowlist_file"
   # Exclude this ref's own remote_sha (when known) AND every other known

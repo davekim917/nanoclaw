@@ -43,6 +43,22 @@ function commit(root: string, value: string, message = value): string {
   return runGit(root, ['rev-parse', 'HEAD']);
 }
 
+// Like commit(), but the resulting commit's own tree carries no
+// .public-boundary-allowlist.json — modeling a ref whose history never
+// introduced the file (the long-lived channels/providers sibling branches,
+// most local tags). --cached only: the file stays on disk so it does not
+// disturb any later ordinary commit() call in the same fixture.
+function commitWithoutAllowlist(root: string, value: string, message = value): string {
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'src', 'gate.ts'), `${value}\n`);
+  fs.writeFileSync(path.join(root, 'scripts', 'gate.ts'), `${value}\n`);
+  runGit(root, ['add', 'src/gate.ts', 'scripts/gate.ts']);
+  runGit(root, ['rm', '--cached', '--quiet', '.public-boundary-allowlist.json']);
+  runGit(root, ['commit', '-m', message, '--quiet']);
+  return runGit(root, ['rev-parse', 'HEAD']);
+}
+
 function fixture(objectFormat?: 'sha256'): { root: string; hook: string; log: string; bin: string } {
   const root = tempRoot();
   runGit(root, objectFormat ? ['init', `--object-format=${objectFormat}`, '--quiet'] : ['init', '--quiet']);
@@ -830,6 +846,26 @@ describe('.husky/pre-push', () => {
       path.join(f.root, '.public-boundary-allowlist.json'),
       JSON.stringify({ entries: [{ path: 'COMMIT_EDITMSG', value: 'Private Customer', reason: 'uncommitted' }] }),
     );
+    const result = push(f, `refs/heads/current ${pushed} refs/heads/current ${base}\n`);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('private-identifier');
+  });
+
+  it('treats a pushed tip with no committed allowlist as an empty one, not a refusal', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const pushed = commitWithoutAllowlist(f.root, 'no-allowlist-clean');
+    const result = push(f, `refs/heads/current ${pushed} refs/heads/current ${base}\n`);
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(records(f.log).join('\n')).toContain('no-allowlist-clean');
+  });
+
+  it('still refuses a pushed tip with no committed allowlist when it carries an identifier', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const pushed = commitWithoutAllowlist(f.root, 'clean-tree', 'fix: Private Customer, no allowlist');
     const result = push(f, `refs/heads/current ${pushed} refs/heads/current ${base}\n`);
 
     expect(result.status).toBe(1);

@@ -209,8 +209,13 @@ function scanSnapshot(snapshot: string): BoundaryScan {
       '--root',
       snapshot,
       '--index',
-      // The allowlist is current policy, not the policy of whatever content is
-      // being inspected — same reasoning as `.husky/pre-push`'s `allowlist_path`.
+      // This job only ever scans origin/main (see the file header), and the
+      // live install checkout IS origin/main's tip, so its own on-disk
+      // allowlist already is that tip's committed allowlist — no separate
+      // read from $snapshot's tree is needed. This is unrelated to
+      // `.husky/pre-push`, which resolves an allowlist per pushed ref, from
+      // that ref's own committed tip, because it has to judge refs other
+      // than main (#651).
       '--allowlist',
       path.join(INSTALL_ROOT, '.public-boundary-allowlist.json'),
     ],
