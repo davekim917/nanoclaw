@@ -34,6 +34,8 @@
 #   24  merge-check: merging this head is not allowed — CI is not green on it, it has
 #       neither a clean Codex review nor an approving substitute receipt, or it is a
 #       fix PR whose body has no Fixes-PR line
+#   25  merge-check: the base branch moved while the check ran, or could not be
+#       re-read, so the verdict may be stale — re-run merge-check
 #
 # `gate` is the rule the advisory detector never was: three rounds on ONE
 # finding class (or one seam, severity not falling) is a design defect at a
@@ -488,9 +490,13 @@ FIXES_PR_LINE_RE='(^|\n)Fixes-PR:[ \t]*(#[0-9]+|none)\b'
 
 # Sets SCOPE_MODE to `risk-scoped` or `legacy`, and LABELER_YML to the file it
 # read, so the globs come from the same read as the mode. Read from BASE
-# through the API, never the checkout: a PR can edit its own copy. A 404 is
-# absence (legacy); any other failure is no verdict, never a guess. gh prints
-# the error body on stdout.
+# through the API, never the checkout, since a PR can edit its own copy, and
+# only at the commit scope_eval resolved the base branch to, never by name.
+# The file is absent (legacy) only on GitHub's plain path-not-found 404, which
+# on a commit just resolved means that commit has no labeler.yml. A ref GitHub
+# cannot find is a 404 too ("No commit found for the ref ..."), and that, like
+# any other failure, returns non-zero for the caller to fail closed on. gh
+# prints the error body on stdout.
 #
 # Detection is deliberately loose and parsing (risk-scope.jq) deliberately
 # strict. Any doubt is risk-scoped: `risk:high` anywhere in the file, or any
@@ -500,16 +506,16 @@ FIXES_PR_LINE_RE='(^|\n)Fixes-PR:[ \t]*(#[0-9]+|none)\b'
 # the reader cannot parse fails closed to `review`, never through to legacy.
 LABELER_YML=""
 repo_mode() {
-  local ref raw status=0
-  ref=$(jq -rn --arg r "$1" '$r | @uri')
-  raw=$(gh api -H 'Accept: application/vnd.github.raw+json' "repos/$REPO/contents/.github/labeler.yml?ref=$ref" 2>/dev/null) || status=$?
+  local raw status=0
+  [[ "$1" =~ ^[0-9a-f]{40}$ ]] || return 1
+  raw=$(gh api -H 'Accept: application/vnd.github.raw+json' "repos/$REPO/contents/.github/labeler.yml?ref=$1" 2>/dev/null) || status=$?
   if [ "$status" -ne 0 ]; then
-    if printf '%s' "$raw" | jq -e '.status == "404"' >/dev/null 2>&1; then
+    if printf '%s' "$raw" | jq -e '.status == "404" and .message == "Not Found"' >/dev/null 2>&1; then
       SCOPE_MODE=legacy
       LABELER_YML=""
       return 0
     fi
-    echo "could not read .github/labeler.yml on $1 in $REPO" >&2
+    echo "could not read .github/labeler.yml at $1 in $REPO" >&2
     return 1
   fi
   LABELER_YML="$raw"
@@ -533,12 +539,21 @@ repo_mode() {
 # matching the PR's file count, a head that moved while they were read, and a
 # labeler.yml risk-scope.jq cannot read.
 SCOPE_HEAD=""
+SCOPE_BASE=""
+SCOPE_BASE_REF=""
 SCOPE_MODE=""
 SCOPE_VERDICT=""
 SCOPE_LABELS="[]"
 SCOPE_REASON=""
+
+# The commit branch $1 points at now, or non-zero.
+base_tip() {
+  gh api "repos/$REPO/git/ref/heads/$(jq -rn --arg r "$1" '$r | split("/") | map(@uri) | join("/")')" \
+    | jq -er '.object.sha | strings | select(test("^[0-9a-f]{40}$"))'
+}
+
 scope_eval() {
-  local pr_json base base_oid files after decision
+  local pr_json base files after decision
   pr_json=$(gh pr view "$PR" --repo "$REPO" --json headRefOid,baseRefName,labels) || return 1
   SCOPE_HEAD=$(printf '%s' "$pr_json" | jq -er .headRefOid) || return 1
   base=$(printf '%s' "$pr_json" | jq -er .baseRefName) || return 1
@@ -548,9 +563,20 @@ scope_eval() {
   # even when the branch moves between the reads. Not the PR's baseRefOid: that
   # is the base tip as of the PR's last push (REST `base.sha`), so a rule main
   # has added since would not bind an open PR until its author pushed again.
-  base_oid=$(gh api "repos/$REPO/git/ref/heads/$(jq -rn --arg r "$base" '$r | split("/") | map(@uri) | join("/")')" \
-    | jq -er '.object.sha | strings | select(test("^[0-9a-f]{40}$"))') || return 1
-  repo_mode "$base_oid" || return 1
+  # Any doubt about the base is risk-scoped and `review`, never `legacy`.
+  SCOPE_BASE_REF="$base"
+  SCOPE_BASE=$(base_tip "$base") || {
+    SCOPE_MODE=risk-scoped
+    SCOPE_VERDICT=review
+    SCOPE_REASON="fail closed: could not resolve base branch $base to a commit"
+    return 0
+  }
+  repo_mode "$SCOPE_BASE" || {
+    SCOPE_MODE=risk-scoped
+    SCOPE_VERDICT=review
+    SCOPE_REASON="fail closed: could not read .github/labeler.yml at $SCOPE_BASE"
+    return 0
+  }
   if [ "$SCOPE_MODE" = legacy ]; then
     SCOPE_VERDICT=auto
     SCOPE_REASON="no risk:high in .github/labeler.yml on $base; automatic review handles this repo"
@@ -564,7 +590,7 @@ scope_eval() {
   # one's. A comparison lists its files on the first page only, at most 300 of
   # them (docs.github.com/en/rest/commits/commits#compare-two-commits), so
   # per_page=1 only trims the commit list.
-  files=$(gh api "repos/$REPO/compare/$base_oid...$SCOPE_HEAD?per_page=1") || {
+  files=$(gh api "repos/$REPO/compare/$SCOPE_BASE...$SCOPE_HEAD?per_page=1") || {
     SCOPE_REASON="fail closed: could not list the files this head changes"
     return 0
   }
@@ -603,6 +629,22 @@ scope_eval() {
       else { verdict: "review", reason: join("; ") } end') || return 1
   SCOPE_VERDICT=$(printf '%s' "$decision" | jq -er .verdict) || return 1
   SCOPE_REASON=$(printf '%s' "$decision" | jq -er .reason) || return 1
+}
+
+# merge-check's last read before it allows a merge. `gh pr merge
+# --match-head-commit` pins the head, but GitHub's merge endpoint takes no base
+# SHA, so a verdict computed against one base commit could merge after the
+# branch has moved on, say to a labeler.yml with a new glob. Re-reading the base
+# here narrows that to the seconds between this read and the merge call; it
+# cannot close it (SKILL.md, Risk-scoped repos). Exit 25 when the branch no
+# longer points at the commit the verdict read, or cannot be re-read.
+refuse_if_base_moved() {
+  local now
+  now=$(base_tip "$SCOPE_BASE_REF") || now=unreadable
+  if [ "$now" != "$SCOPE_BASE" ]; then
+    echo "merge=refused head=$SCOPE_HEAD base=${SCOPE_BASE:-unresolved}: base moved during check ($SCOPE_BASE_REF is now $now); re-run merge-check" >&2
+    exit 25
+  fi
 }
 
 # Review requests `request` has posted on this PR, oldest first:
@@ -1057,7 +1099,8 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|sc
       exit 24
     fi
     if [ "$SCOPE_VERDICT" = skip ]; then
-      echo "merge=allowed head=$SCOPE_HEAD mode=risk-scoped verdict=skip ci=green: $SCOPE_REASON"
+      refuse_if_base_moved
+      echo "merge=allowed head=$SCOPE_HEAD mode=risk-scoped verdict=skip ci=green base=$SCOPE_BASE: $SCOPE_REASON"
       exit 0
     fi
     # verdict=review: the latest substitute receipt for THIS head approves, or
@@ -1066,7 +1109,8 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|sc
     # request, no unresolved Codex thread from any round, the head unmoved — so
     # it is reused here, not restated.
     if [ "$receipt" = approve ]; then
-      echo "merge=allowed head=$SCOPE_HEAD mode=risk-scoped verdict=review ci=green: the latest substitute receipt for this head approves"
+      refuse_if_base_moved
+      echo "merge=allowed head=$SCOPE_HEAD mode=risk-scoped verdict=review ci=green base=$SCOPE_BASE: the latest substitute receipt for this head approves"
       exit 0
     fi
     markers=$(request_markers) || exit 1
@@ -1077,7 +1121,10 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|sc
     fi
     observation=$(status_observation "$SCOPE_HEAD" "$since") || exit 1
     case "$observation" in
-      codex=clean*) echo "merge=allowed head=$SCOPE_HEAD mode=risk-scoped verdict=review ci=green: $observation" ;;
+      codex=clean*)
+        refuse_if_base_moved
+        echo "merge=allowed head=$SCOPE_HEAD mode=risk-scoped verdict=review ci=green base=$SCOPE_BASE: $observation"
+        ;;
       *)
         echo "merge=refused head=$SCOPE_HEAD verdict=review: $observation; latest substitute receipt: ${receipt:-none}" >&2
         exit 24

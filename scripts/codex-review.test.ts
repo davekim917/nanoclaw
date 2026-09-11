@@ -102,7 +102,20 @@ if [ -n "$rest" ]; then
   printf 'rest %s\\n' "$rest" >> "$MOCK_CALLS"
   case "$rest" in
     */contents/.github/labeler.yml\\?ref=*)
-      config="$MOCK_DIR/labeler--\${rest##*ref=}.yml"
+      # labeler--<ref>.yml is the file at that ref. A .nocommit marker answers as
+      # GitHub does for a ref it cannot find, and a .error marker fails another way.
+      ref="\${rest##*ref=}"
+      if [ -f "$MOCK_DIR/labeler--$ref.nocommit" ]; then
+        printf '{"message":"No commit found for the ref %s","status":"404"}\\n' "$ref"
+        echo 'gh: No commit found for the ref (HTTP 404)' >&2
+        exit 1
+      fi
+      if [ -f "$MOCK_DIR/labeler--$ref.error" ]; then
+        echo '{"message":"Server Error","status":"500"}'
+        echo 'gh: Server Error (HTTP 500)' >&2
+        exit 1
+      fi
+      config="$MOCK_DIR/labeler--$ref.yml"
       if [ -f "$config" ]; then cat "$config"; exit 0; fi
       echo '{"message":"Not Found","status":"404"}'
       echo 'gh: Not Found (HTTP 404)' >&2
@@ -121,14 +134,18 @@ if [ -n "$rest" ]; then
       exit 0
       ;;
     */git/ref/heads/*)
-      # ref--<branch> holds the commit the branch points at. Absent = no such branch.
+      # ref--<branch> holds the commit the branch points at; ref--<branch>-<n>, when
+      # present, answers the nth read of it in this run instead. Absent = no such branch.
       branch="\${rest#*/git/ref/heads/}"
-      if [ ! -f "$MOCK_DIR/ref--$branch" ]; then
+      target="$MOCK_DIR/ref--$branch"
+      n=$(grep -c "^rest $rest\\$" "$MOCK_CALLS")
+      if [ -f "$target-$n" ]; then target="$target-$n"; fi
+      if [ ! -f "$target" ]; then
         echo '{"message":"Not Found","status":"404"}'
         echo 'gh: Not Found (HTTP 404)' >&2
         exit 1
       fi
-      printf '{"ref":"refs/heads/%s","object":{"sha":"%s","type":"commit"}}\\n' "$branch" "$(cat "$MOCK_DIR/ref--$branch")"
+      printf '{"ref":"refs/heads/%s","object":{"sha":"%s","type":"commit"}}\\n' "$branch" "$(cat "$target")"
       exit 0
       ;;
     */compare/*)
@@ -244,6 +261,7 @@ const OTHER_HEAD = 'dddddddddddddddddddddddddddddddddddddddd';
 // must not use.
 const BASE_OID = 'ffffffffffffffffffffffffffffffffffffffff';
 const STALE_BASE = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
+const MOVED_BASE = '9999999999999999999999999999999999999999';
 const RISK_CONFIG =
   "risk:high:\n- changed-files:\n  - any-glob-to-any-file:\n    - 'src/router.ts'\n    - '.github/**'\n";
 
@@ -380,6 +398,8 @@ function scopeFixture(
   // comparison are served at that commit, under the branch name, and at the PR's
   // stale baseRefOid too, unless a test sets them apart; so a base read by the
   // wrong name fails on the content a test gives it, not on a missing fixture.
+  for (const name of fs.readdirSync(root))
+    if (/^ref--|^labeler--.*\.(nocommit|error)$/.test(name)) fs.rmSync(path.join(root, name));
   fs.writeFileSync(path.join(root, 'ref--main'), BASE_OID);
   const bases = [BASE_OID, 'main', STALE_BASE];
   const compares = bases.map((base) => `compare--${base}...${HEAD}.json`);
@@ -974,6 +994,72 @@ describe('codex-review risk-scoped review requests', () => {
     expect(scope.calls).not.toContain(STALE_BASE);
   });
 
+  it('calls a repo legacy when the base commit it resolved has no labeler.yml, as in a repo that never opted in', () => {
+    const root = tempRoot();
+    scopeFixture(root, { baseConfig: null, labels: [] });
+
+    const scope = runHelper(root, ['scope']);
+    expect(scope.status).toBe(0);
+    expect(JSON.parse(scope.stdout)).toMatchObject({ mode: 'legacy', verdict: 'auto' });
+    expect(scope.calls).toContain(`rest repos/example/repository/contents/.github/labeler.yml?ref=${BASE_OID}\n`);
+
+    const merge = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(merge.status).toBe(0);
+    expect(merge.stdout).toContain('merge=defer mode=legacy');
+  });
+
+  it.each([
+    [
+      'the base branch does not resolve to a commit',
+      (root: string) => fs.rmSync(path.join(root, 'ref--main')),
+      'fail closed: could not resolve base branch main to a commit',
+    ],
+    [
+      'GitHub finds no commit for the base it resolved',
+      (root: string) => fs.writeFileSync(path.join(root, `labeler--${BASE_OID}.nocommit`), ''),
+      `fail closed: could not read .github/labeler.yml at ${BASE_OID}`,
+    ],
+    [
+      'reading labeler.yml fails with anything but path-not-found',
+      (root: string) => fs.writeFileSync(path.join(root, `labeler--${BASE_OID}.error`), ''),
+      `fail closed: could not read .github/labeler.yml at ${BASE_OID}`,
+    ],
+  ])('fails closed to review, not legacy, when %s', (_case, breakBase, reason) => {
+    const root = tempRoot();
+    scopeFixture(root, { baseConfig: null, labels: [] });
+    breakBase(root);
+
+    const scope = runHelper(root, ['scope']);
+    expect(scope.status).toBe(0);
+    expect(JSON.parse(scope.stdout)).toMatchObject({ mode: 'risk-scoped', verdict: 'review', reason });
+
+    const merge = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(merge.status).toBe(24);
+    expect(merge.stdout).not.toContain('merge=');
+  });
+
+  it('refuses the merge when the base branch moves while merge-check runs, and names the base it allowed on', () => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: [] });
+
+    const allowed = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(allowed.status).toBe(0);
+    expect(allowed.stdout).toContain(
+      `merge=allowed head=${HEAD} mode=risk-scoped verdict=skip ci=green base=${BASE_OID}:`,
+    );
+    expect(allowed.calls.match(/^rest repos\/example\/repository\/git\/ref\/heads\/main$/gm)).toHaveLength(2);
+
+    // main moves to a commit whose labeler.yml would select this head, between
+    // the verdict's read and the one merge-check makes before allowing.
+    fs.writeFileSync(path.join(root, 'ref--main-2'), MOVED_BASE);
+    const moved = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(moved.status).toBe(25);
+    expect(moved.stderr).toContain(
+      `base=${BASE_OID}: base moved during check (main is now ${MOVED_BASE}); re-run merge-check`,
+    );
+    expect(moved.stdout).not.toContain('merge=allowed');
+  });
+
   it('fails closed when the head moves while its changed files are listed', () => {
     const root = tempRoot();
     scopeFixture(root, { labels: [] });
@@ -1073,7 +1159,7 @@ describe('codex-review risk-scoped review requests', () => {
     const result = runHelper(root, ['merge-check', '--head', HEAD]);
     expect(result.status).toBe(0);
     expect(result.stdout).toContain(
-      `merge=allowed head=${HEAD} mode=risk-scoped verdict=review ci=green: codex=clean head=${HEAD} open=0`,
+      `merge=allowed head=${HEAD} mode=risk-scoped verdict=review ci=green base=${BASE_OID}: codex=clean head=${HEAD} open=0`,
     );
   });
 
@@ -1340,7 +1426,7 @@ describe('codex-review risk-scoped review requests', () => {
     const result = runHelper(root, ['merge-check', '--head', HEAD]);
     expect(result.status).toBe(0);
     expect(result.stdout).toContain(
-      `merge=allowed head=${HEAD} mode=risk-scoped verdict=review ci=green: the latest substitute receipt for this head approves`,
+      `merge=allowed head=${HEAD} mode=risk-scoped verdict=review ci=green base=${BASE_OID}: the latest substitute receipt for this head approves`,
     );
   });
 
