@@ -538,19 +538,27 @@ risk_label_run() {
   done
 }
 
-# `risk:high` and `review:requested` removals by anyone but the labeler, as one
-# `<label> removed by <login>; …` line, empty when there are none. The labels
-# are read at merge time, so a hand removal after the labeler ran would pass for
-# its answer. `sync-labels` taking risk:high off once a push stops touching
-# risky paths is the labeler's own removal and stays allowed. A failed read
-# returns non-zero, which scope_eval treats as no answer.
-hand_removed_scope_labels() {
+# Why an absent `risk:high` or `review:requested` might not be the labeler's
+# answer, as one `…; …` line, empty when nothing explains it but the labeler.
+# Called only when both labels are absent, since they are read at merge time
+# and a removal after the labeler ran would pass for its answer. Two causes:
+#   - an `unlabeled` event by anyone but the labeler. `sync-labels` taking
+#     risk:high off once a push stops touching risky paths is the labeler's own
+#     removal and stays allowed.
+#   - more `labeled` than `unlabeled` events for a label that is gone. The label
+#     was deleted or renamed, which may record no event at all. Counting instead
+#     of reading the last event keeps this independent of the API's event order.
+# A failed read returns non-zero, which scope_eval treats as no answer.
+unexplained_scope_removals() {
   gh api --paginate --slurp "repos/$REPO/issues/$PR/events?per_page=100" \
     | jq -r --arg bot "$RISK_LABEL_ACTOR" '
-      [ .[][] | select(.event == "unlabeled")
-        | select(.label.name == "risk:high" or .label.name == "review:requested")
-        | select((.actor.login // "") != $bot)
-        | "\(.label.name) removed by \(.actor.login // "an unknown account")" ]
+      [ .[][] | select(.event == "labeled" or .event == "unlabeled")
+        | select(.label.name == "risk:high" or .label.name == "review:requested") ] as $events
+      | [ ( $events[] | select(.event == "unlabeled" and (.actor.login // "") != $bot)
+            | "\(.label.name) removed by \(.actor.login // "an unknown account")" ),
+          ( $events | group_by(.label.name)[]
+            | select((map(select(.event == "labeled")) | length) > (map(select(.event == "unlabeled")) | length))
+            | "\(.[0].label.name) is gone with no unlabeled event (the label was deleted or renamed)" ) ]
       | join("; ")'
 }
 
@@ -604,8 +612,8 @@ scope_eval() {
   elif printf '%s' "$SCOPE_LABELS" | jq -e 'index("review:requested")' >/dev/null; then
     SCOPE_REASON="labeled review:requested"
   else
-    # Absent labels are the labeler's answer only if nobody else removed one.
-    removed=$(hand_removed_scope_labels) || {
+    # Absent labels are the labeler's answer only if nothing else explains them.
+    removed=$(unexplained_scope_removals) || {
       SCOPE_REASON="fail closed: could not read this PR's label events to rule out a hand-removed risk:high or review:requested"
       return 0
     }
@@ -1032,10 +1040,13 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|sc
       exit 24
     fi
     # A fix PR names the PR it fixes, or says `none`. Read at merge time: the
-    # title and body can both change after the PR opens.
+    # title and body can both change after the PR opens. A line inside a code
+    # fence or an HTML comment is an example or a template, not a link, so both
+    # are cut first; an unclosed one runs to the end, as GitHub renders it.
     pr_text=$(gh pr view "$PR" --repo "$REPO" --json title,body) || exit 1
     fix_link=$(printf '%s' "$pr_text" | jq -r --arg titleRe "$FIX_TITLE_RE" --arg lineRe "$FIXES_PR_LINE_RE" '
-      if (.title | test($titleRe; "i")) and ((.body // "") | test($lineRe; "i") | not) then "missing" else "ok" end') || exit 1
+      (.body // "" | gsub("```[\\s\\S]*?(```|$)"; "") | gsub("<!--[\\s\\S]*?(-->|$)"; "")) as $body
+      | if (.title | test($titleRe; "i")) and ($body | test($lineRe; "i") | not) then "missing" else "ok" end') || exit 1
     if [ "$fix_link" = missing ]; then
       echo "merge=refused head=$SCOPE_HEAD: a fix PR needs a 'Fixes-PR: #<n>' line in its body naming the PR it fixes, or 'Fixes-PR: none'" >&2
       exit 24
