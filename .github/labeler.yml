@@ -29,6 +29,9 @@ risk:high:
     - 'src/**/*guard*.ts'
     - 'container/agent-runner/src/**/*guard*.ts'
     - 'src/guard/**'
+    # ...and the approval gates named otherwise: destructive/bash commands, held a2a messages
+    - 'src/modules/bash-gate/**'
+    - 'src/modules/agent-to-agent/message-gate.ts'
     # The message path, both ends
     - 'src/router.ts'
     - 'src/delivery.ts'
@@ -53,6 +56,11 @@ risk:high:
     - 'src/cli/registry.ts'
     - 'src/modules/approvals/**'
     - 'src/modules/permissions/**'
+    - 'src/modules/interactive/choice.ts'
+    - 'src/modules/channel-config/**'
+    - 'src/dashboard/auth/**'
+    - 'src/dashboard/api/auth-me.ts'
+    - 'src/dashboard/db/dashboard-tokens.ts'
     # Irreversible against a live DB
     - 'src/db/migrations/**'
     # Supply chain: pnpm allowBuilds, and the container image it builds
@@ -60,9 +68,11 @@ risk:high:
     - 'container/Dockerfile'
     - 'container/build.sh'
     # Deploy and rollback (src/deploy-crash-guard.ts is covered by *guard*), and the
-    # nightly host snapshot that scans for secrets then pushes config to a remote
+    # nightly host snapshot that scans for secrets then pushes config to a remote (and its
+    # selfcheck), and the wiki autopush, which pushes to a remote with no scan at all
     - 'scripts/deploy.sh'
-    - 'scripts/git-safety.sh'
+    - 'scripts/git-safety*.sh'
+    - 'scripts/wiki-autopush.sh'
     # The gates themselves: CI workflows, this file, the git hooks, the public-boundary
     # checkers and allowlist, and the PR review loop that IS the review gate. CI runs
     # only the portable boundary mode, so the strict identifier check runs only in the
@@ -86,6 +96,8 @@ risk:guard:
     - 'src/**/*guard*.ts'
     - 'container/agent-runner/src/**/*guard*.ts'
     - 'src/guard/**'
+    - 'src/modules/bash-gate/**'
+    - 'src/modules/agent-to-agent/message-gate.ts'
 
 risk:message-path:
 - changed-files:
@@ -124,6 +136,11 @@ risk:credential:
     - 'src/cli/registry.ts'
     - 'src/modules/approvals/**'
     - 'src/modules/permissions/**'
+    - 'src/modules/interactive/choice.ts'
+    - 'src/modules/channel-config/**'
+    - 'src/dashboard/auth/**'
+    - 'src/dashboard/api/auth-me.ts'
+    - 'src/dashboard/db/dashboard-tokens.ts'
 
 risk:migration:
 - changed-files:
@@ -141,7 +158,8 @@ risk:deploy:
 - changed-files:
   - any-glob-to-any-file:
     - 'scripts/deploy.sh'
-    - 'scripts/git-safety.sh'
+    - 'scripts/git-safety*.sh'
+    - 'scripts/wiki-autopush.sh'
 
 risk:gates:
 - changed-files:

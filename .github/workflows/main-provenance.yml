@@ -1,0 +1,49 @@
+# Flags a commit that reached main without going through a merged PR.
+#
+# The pre-push hook refuses direct pushes to main, but only on this host's checkout:
+# container pushes run no hook (scripts/pin-git-hooks-path.sh), and GitHub offers no
+# branch protection on a private Free-plan repo. This is detection, not prevention: a
+# red run on main, which GitHub reports to whoever pushed.
+#
+# A merge through GitHub (merge, squash or rebase) makes a new commit, and the PR's
+# merge_commit_sha names it. Pushing a PR's head straight to main also marks the PR
+# merged, but with merge_commit_sha equal to the PR's own head, so that fails here too,
+# as does a force-push, which can rewind main onto an old merge commit.
+name: Main provenance
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  provenance:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The new main came from a merged PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          FORCED: ${{ github.event.forced }}
+        run: |
+          if [ "$FORCED" = true ]; then
+            echo "::error::main was force-pushed to $SHA; changes reach main only through a PR merge"
+            exit 1
+          fi
+          # GitHub links the commit to its PR asynchronously, so give it a minute.
+          for attempt in 1 2 3 4 5 6; do
+            prs=$(gh api "repos/$REPO/commits/$SHA/pulls" | jq -r --arg sha "$SHA" '
+              [ .[] | select(.merged_at != null and .merge_commit_sha == $sha and .head.sha != $sha)
+                | "#\(.number)" ] | join(" ")')
+            if [ -n "$prs" ]; then
+              echo "main at $SHA came from $prs"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::main moved to $SHA, which no merged PR produced; changes reach main only through a PR merge"
+          exit 1
