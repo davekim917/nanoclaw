@@ -800,28 +800,42 @@ describe('.husky/pre-push', () => {
     expect(boundaryRecord).not.toContain('source-index');
   });
 
-  it('uses and removes a caller worktree node_modules link for raw message scanning', () => {
-    const main = fixture();
-    const base = commit(main.root, 'base');
-    const linkedRoot = tempRoot();
-    runGit(main.root, ['-c', 'core.hooksPath=/dev/null', 'worktree', 'add', '--detach', '--quiet', linkedRoot, base]);
-    linkedWorktrees.push({ main: main.root, root: linkedRoot });
-    const hook = path.join(linkedRoot, '.husky', 'pre-push');
+  function linkedWorktree(main: ReturnType<typeof fixture>, base: string): ReturnType<typeof fixture> {
+    const root = tempRoot();
+    runGit(main.root, ['-c', 'core.hooksPath=/dev/null', 'worktree', 'add', '--detach', '--quiet', root, base]);
+    linkedWorktrees.push({ main: main.root, root });
+    const hook = path.join(root, '.husky', 'pre-push');
     fs.mkdirSync(path.dirname(hook), { recursive: true });
     fs.copyFileSync(new URL('../.husky/pre-push', import.meta.url), hook);
-    fs.symlinkSync(
-      new URL('../scripts/check-public-boundary.ts', import.meta.url),
-      path.join(linkedRoot, 'scripts', 'check-public-boundary.ts'),
-    );
+    return { ...main, root, hook, log: path.join(root, 'hook.log') };
+  }
 
-    const result = push(
-      { ...main, root: linkedRoot, hook, log: path.join(linkedRoot, 'hook.log') },
-      `refs/heads/current ${base} refs/heads/current ${zeroSha}\n`,
-    );
+  it("scans raw messages with the main checkout's tooling and never links into a linked worktree", () => {
+    const main = fixture();
+    const base = commit(main.root, 'base');
+    const linked = linkedWorktree(main, base);
 
-    expect(result.status).toBe(0);
-    expect(records(path.join(linkedRoot, 'hook.log')).join('\n')).toContain('--message-raw');
-    expect(fs.existsSync(path.join(linkedRoot, 'node_modules'))).toBe(false);
+    const result = push(linked, `refs/heads/current ${base} refs/heads/current ${zeroSha}\n`);
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(records(linked.log).join('\n')).toContain('--message-raw');
+    expect(fs.existsSync(path.join(linked.root, 'node_modules'))).toBe(false);
+  });
+
+  it('scans raw messages from a linked worktree whose node_modules is a partial real directory', () => {
+    // A stray cache directory used to make the hook skip its node_modules link
+    // and then run a tsx that did not exist: exit 127 on every push (#623).
+    const main = fixture();
+    const base = commit(main.root, 'base');
+    const linked = linkedWorktree(main, base);
+    fs.mkdirSync(path.join(linked.root, 'node_modules', '.cache'), { recursive: true });
+
+    const result = push(linked, `refs/heads/current ${base} refs/heads/current ${zeroSha}\n`);
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(records(linked.log).join('\n')).toContain('--message-raw');
+    expect(fs.lstatSync(path.join(linked.root, 'node_modules')).isSymbolicLink()).toBe(false);
+    expect(fs.existsSync(path.join(linked.root, 'node_modules', '.cache'))).toBe(true);
   });
 
   it('runs the boundary check through nice when ionice is unavailable', () => {
