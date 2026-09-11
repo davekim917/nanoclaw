@@ -16,7 +16,7 @@ import { getConfig } from './config.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { touchHeartbeat } from './heartbeat.js';
-import { clearStaleProcessingAcks } from './db/container-state.js';
+import { clearContainerToolInFlight, clearStaleProcessingAcks } from './db/container-state.js';
 import {
   clearContinuation,
   clearCurrentInReplyTo,
@@ -40,6 +40,7 @@ import {
   getStickyModel,
   getStickyUltracode,
   getWorkContinuation,
+  isOwnRepositoryTransferBarrier,
   isWorkContinuationRunnable,
   markWorkContinuationRunning,
   recordTurnUsage,
@@ -1847,6 +1848,22 @@ export async function processQuery(
   // can dispatch them through the canonical command path. Once we've decided to
   // end, gate further polling so we don't reclaim the rows mid-teardown.
   let endedForCommand = false;
+  // A repository barrier normally only ends the query: the current turn and
+  // tool finish, and the outer loop acknowledges after processQuery returns.
+  // The exception is the destination drain of a transfer THIS session queued.
+  // The requester sits in the topic being drained, so ending would make the
+  // host wait on the very turn that asked for the move, typically until the
+  // quiescence timeout kills every container involved. That turn was already
+  // told to stop, so abort it the way a slash command does.
+  let abortedForOwnTransfer = false;
+  const abortForOwnTransfer = (barrier: string): boolean => {
+    if (!isOwnRepositoryTransferBarrier(barrier)) return false;
+    log(`Repository mount barrier ${barrier} is this session's own transfer — aborting active query`);
+    endedForCommand = true;
+    abortedForOwnTransfer = true;
+    query.abort();
+    return true;
+  };
   let corruptionStreak = 0;
   const pollHandle = setInterval(() => {
     if (done || pollInFlight || endedForCommand) return;
@@ -1861,6 +1878,7 @@ export async function processQuery(
       try {
         const repositoryBarrier = getActiveRepositoryMountBarrier();
         if (repositoryBarrier !== null) {
+          if (abortForOwnTransfer(repositoryBarrier)) return;
           // Stop accepting follow-ups and let the current provider turn/tool
           // finish. The outer loop acknowledges only after processQuery has
           // returned, which proves this active query is fully drained.
@@ -2022,6 +2040,7 @@ export async function processQuery(
         const keptIds = keep.map((m) => m.id);
         const lateRepositoryBarrier = getActiveRepositoryMountBarrier();
         if (lateRepositoryBarrier !== null) {
+          if (abortForOwnTransfer(lateRepositoryBarrier)) return;
           log(`Repository mount barrier ${lateRepositoryBarrier} committed before follow-up claim — ending query`);
           endedForCommand = true;
           query.end();
@@ -2419,7 +2438,10 @@ export async function processQuery(
           // streak — skipping it would leave the streak frozen at its last
           // failing value across a recovery.
           if (routing.taskRun && (event.answeredPrompts !== undefined || (!taskBlockNudged && answersRunnerPrompt))) {
-            await recordTaskTurn({ text: '', isError: event.isError === true, model: modelInForce }, event.answeredPrompts);
+            await recordTaskTurn(
+              { text: '', isError: event.isError === true, model: modelInForce },
+              event.answeredPrompts,
+            );
           }
           pauseAnsweredPrompt();
         }
@@ -2489,6 +2511,18 @@ export async function processQuery(
     // Floor for the abort/throw paths, which never reach a `result`.
     closeResultScope();
     setProviderTurnExecuting(false);
+    // An aborted Claude CLI never reports the end of the tool it was running
+    // (PostToolUse is the only clear, providers/claude.ts postToolUseHook), and
+    // the host reads a set current_tool as not drained
+    // (src/container-restart.ts sessionReachedRepositoryBarrier), so the drain
+    // this abort exists to unblock would still time out. The query is over.
+    if (abortedForOwnTransfer) {
+      try {
+        clearContainerToolInFlight();
+      } catch (err) {
+        log(`Could not clear the aborted tool marker: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
   }
 
   return { continuation: queryContinuation, taskTurns };

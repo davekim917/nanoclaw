@@ -634,7 +634,9 @@ export const createWorktreeTool: McpToolDefinition = {
     description:
       "Create or reuse this topic's standard linked worktree at /workspace/worktrees/<repo>. Existing worktrees are " +
       'never rebased or branch-switched, and dirty/staged/untracked state persists exactly as left. Optionally transfer ' +
-      'exact work from an inactive source thread. Typical flow from here: git_commit → git_push → open_pr.',
+      'exact work from an inactive source thread with continueFromThreadId; after requesting a transfer, end your turn ' +
+      'at once and do not wait or poll for the worktree, because the move waits for this turn to stop and this topic ' +
+      'then restarts with the result. Typical flow from here: git_commit → git_push → open_pr.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -673,8 +675,9 @@ export const createWorktreeTool: McpToolDefinition = {
         destinationWorkUnitKey: workUnitKey,
       });
       return ok(
-        `Repository transfer queued durably for ${repo}. This topic will restart after the exact linked ` +
-          'worktree has moved, then receive an explicit success or failure message.',
+        `Repository transfer queued durably for ${repo}. End your turn now; do not wait or poll for the worktree. ` +
+          'The move waits for this turn to stop, then this topic restarts with the exact linked worktree and ' +
+          'receives an explicit success or failure message.',
       );
     }
     let context: RepositoryContext;

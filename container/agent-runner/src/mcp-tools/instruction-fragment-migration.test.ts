@@ -138,6 +138,10 @@ describe('container/CLAUDE.md "Working with Repos" prose migrated into the repo 
   it('create_worktree description and continueFromThreadId param carry the tool-sequence and transfer guidance', () => {
     const description = createWorktreeTool.tool.description;
     expect(description).toMatch(/git_commit.*git_push.*open_pr/);
+    // A transfer requester is in the destination topic the host must drain, so
+    // it has to stop, not wait for the move it is itself holding up.
+    expect(description).toMatch(/end your turn/i);
+    expect(description).toMatch(/do not wait or poll/i);
     const continueFromThreadId = createWorktreeTool.tool.inputSchema.properties.continueFromThreadId as {
       description: string;
     };

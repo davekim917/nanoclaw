@@ -66,6 +66,42 @@ export function getActiveRepositoryMountBarrier(): string | null {
   }
 }
 
+/** The host's destination-drain epoch for a transfer (src/modules/repository-workspaces/index.ts). */
+const TRANSFER_DESTINATION_EPOCH_PREFIX = 'repository-transfer:';
+
+/**
+ * Is this barrier the destination drain of a repository transfer THIS session
+ * queued?
+ *
+ * The requester is always in the destination topic, and the host's
+ * destination drain waits on every session in it, so it waits on the very
+ * turn that asked for the move. `create_worktree` queues the request as an
+ * outbound system row whose id IS the request id (`queueHostAction`,
+ * mcp-tools/git-worktrees.ts). The MCP tools run in a separate process (the
+ * `bun run` stdio server in index.ts), so that durable row, not process
+ * memory, is how the poll loop knows the request is its own.
+ *
+ * `barrier` is the token `activeRepositoryMountBarrier` returns,
+ * `JSON.stringify([epoch, generation])`. Any doubt answers false, which keeps
+ * the ordinary graceful drain.
+ */
+export function isOwnRepositoryTransferBarrier(barrier: string): boolean {
+  try {
+    const token: unknown = JSON.parse(barrier);
+    const epoch = Array.isArray(token) ? token[0] : undefined;
+    if (typeof epoch !== 'string' || !epoch.startsWith(TRANSFER_DESTINATION_EPOCH_PREFIX)) return false;
+    const requestId = epoch.slice(TRANSFER_DESTINATION_EPOCH_PREFIX.length);
+    const row = getOutboundDb()
+      .prepare("SELECT content FROM messages_out WHERE id = ? AND kind = 'system'")
+      .get(requestId) as { content: string } | undefined;
+    if (!row) return false;
+    const payload = JSON.parse(row.content) as { action?: unknown; requestId?: unknown };
+    return payload.action === 'repository_transfer' && payload.requestId === requestId;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * The token the admission gate read at this poll tick's boundary
  * (`modules/mailbox/admission.ts`), consumed by the selection below so a fenced

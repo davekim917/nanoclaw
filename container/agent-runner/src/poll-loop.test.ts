@@ -40,6 +40,7 @@ import {
 } from './modules/mailbox/index.js';
 import { MockProvider } from './providers/mock.js';
 import { postToolUseHook, preToolUseHook } from './providers/claude.js';
+import { createWorktreeTool } from './mcp-tools/git-worktrees.js';
 import type { AgentQuery, ProviderEvent } from './providers/types.js';
 
 beforeEach(() => {
@@ -170,6 +171,139 @@ describe('repository mount poll and tool admission barrier', () => {
       value: JSON.stringify(['repository-transfer:req-2', 'generation-repository-transfer:req-2']),
     });
   }, 5_000);
+
+  // The session that asked for a transfer is always in the destination topic,
+  // and the host's destination drain waits on it. Ending its query lets the
+  // turn run to its natural end first, and that turn is often polling for the
+  // very worktree the drain is holding back. So a barrier on the session's OWN
+  // transfer aborts the query; every other barrier still only ends it.
+  describe('own repository transfer', () => {
+    const TRANSFER_ENV = ['NANOCLAW_WORKGROUP_ID', 'NANOCLAW_WORK_UNIT_KEY', 'NANOCLAW_REPOSITORY_ACTION_TRANSPORT'];
+    let savedEnv: Record<string, string | undefined>;
+
+    beforeEach(() => {
+      savedEnv = Object.fromEntries(TRANSFER_ENV.map((key) => [key, process.env[key]]));
+      process.env.NANOCLAW_WORKGROUP_ID = 'wg-test';
+      process.env.NANOCLAW_WORK_UNIT_KEY = 'topic-destination';
+      delete process.env.NANOCLAW_REPOSITORY_ACTION_TRANSPORT;
+    });
+
+    afterEach(() => {
+      for (const key of TRANSFER_ENV) {
+        if (savedEnv[key] === undefined) delete process.env[key];
+        else process.env[key] = savedEnv[key];
+      }
+    });
+
+    /** Queue a transfer exactly as the agent does, and return the request id the host will fence with. */
+    async function queueOwnTransfer(): Promise<{ requestId: string; text: string }> {
+      const result = await createWorktreeTool.handler({ repo: 'proj', continueFromThreadId: '111.111' });
+      expect(result.isError).toBeFalsy();
+      const row = getOutboundDb().prepare("SELECT id, content FROM messages_out WHERE kind = 'system'").get() as {
+        id: string;
+        content: string;
+      };
+      expect(JSON.parse(row.content)).toMatchObject({ action: 'repository_transfer', requestId: row.id });
+      return { requestId: row.id, text: result.content[0]!.text };
+    }
+
+    function drainableQuery() {
+      let finishTurn!: () => void;
+      const turnFinished = new Promise<void>((resolve) => {
+        finishTurn = resolve;
+      });
+      let signalDrain!: () => void;
+      const drainRequested = new Promise<void>((resolve) => {
+        signalDrain = resolve;
+      });
+      const calls = { end: 0, abort: 0 };
+      async function* events(): AsyncGenerator<ProviderEvent> {
+        yield { type: 'init', continuation: 'requester-turn' };
+        await turnFinished;
+      }
+      const query: AgentQuery = {
+        push: () => {},
+        end: () => {
+          calls.end += 1;
+          signalDrain();
+        },
+        abort: () => {
+          calls.abort += 1;
+          signalDrain();
+          finishTurn();
+        },
+        events: events(),
+      };
+      return { query, calls, drainRequested, finishTurn };
+    }
+
+    const barrierAck = () =>
+      getOutboundDb().prepare("SELECT value FROM session_state WHERE key = 'repository_mount_barrier_ack'").get();
+
+    it('aborts for a barrier on its own queued transfer, clears the aborted tool, and acknowledges', async () => {
+      const { requestId, text } = await queueOwnTransfer();
+      const active = drainableQuery();
+      const running = processQuery(active.query, ERR_ROUTING, [], 'claude', undefined, 'requester turn', undefined, {});
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      // The requester kept working after queueing. An aborted CLI never runs
+      // PostToolUse for this tool, and a set current_tool alone keeps the
+      // host drain from ever reading this session as drained.
+      await preToolUseHook(
+        { tool_name: 'Bash', tool_input: { command: 'sleep 600', timeout: 600_000 } } as never,
+        {} as never,
+        {} as never,
+      );
+      activateBarrier(`repository-transfer:${requestId}`);
+      await active.drainRequested;
+      await running;
+
+      expect(active.calls).toEqual({ end: 0, abort: 1 });
+      expect(getOutboundDb().prepare('SELECT current_tool FROM container_state WHERE id = 1').get()).toEqual({
+        current_tool: null,
+      });
+      expect(getOutboundDb().prepare('SELECT COUNT(*) AS count FROM processing_ack').get()).toEqual({ count: 0 });
+      expect(evaluateAdmission()).toBe(true);
+      expect(barrierAck()).toEqual({
+        value: JSON.stringify([`repository-transfer:${requestId}`, `generation-repository-transfer:${requestId}`]),
+      });
+      // The tool result is the other half: the agent is told to stop, not wait.
+      expect(text).toContain('End your turn now');
+      expect(text).toMatch(/do not wait or poll/i);
+    }, 5_000);
+
+    it('still ends, never aborts, for a transfer barrier this session did not queue', async () => {
+      const { requestId } = await queueOwnTransfer();
+      const active = drainableQuery();
+      const running = processQuery(active.query, ERR_ROUTING, [], 'claude', undefined, 'requester turn', undefined, {});
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      // Another session's transfer into this topic, and this session's own
+      // request under the source-side epoch: neither is the drain this turn blocks.
+      const foreignRequestId = 'repo-1723600000000-ffffffffffffffff';
+      expect(foreignRequestId).not.toBe(requestId);
+      activateBarrier(`repository-transfer:${foreignRequestId}`);
+      await active.drainRequested;
+      expect(active.calls).toEqual({ end: 1, abort: 0 });
+
+      active.finishTurn();
+      await running;
+      expect(active.calls).toEqual({ end: 1, abort: 0 });
+    }, 5_000);
+
+    it('ends for the source-side epoch of its own request', async () => {
+      const { requestId } = await queueOwnTransfer();
+      const active = drainableQuery();
+      const running = processQuery(active.query, ERR_ROUTING, [], 'claude', undefined, 'requester turn', undefined, {});
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      activateBarrier(`repository-transfer-source:${requestId}`);
+      await active.drainRequested;
+      active.finishTurn();
+      await running;
+      expect(active.calls).toEqual({ end: 1, abort: 0 });
+    }, 5_000);
+  });
 
   it('requeues a failed admitted batch instead of starting an in-turn recovery after the fence lands', async () => {
     insertMessage('retry-me-after-transition', 'chat', { sender: 'Operator', text: 'preserve this request' });
@@ -3436,7 +3570,9 @@ describe('terminal task outcomes reach the run-outcome ledger', () => {
     const result = await processQuery(query, TASK_ROUTING, ['occ-1'], 'claude', undefined, 'p', undefined, {});
 
     expect(pushed.some((m) => m.includes('was not delivered'))).toBe(true);
-    expect(result.taskTurns!.map((t) => t.outcome?.text)).toEqual(['<message to="someone">done, echo dropped</message>']);
+    expect(result.taskTurns!.map((t) => t.outcome?.text)).toEqual([
+      '<message to="someone">done, echo dropped</message>',
+    ]);
   });
 
   it('a batch after a live change is compared against the LIVE settings, not the creation snapshot', async () => {
