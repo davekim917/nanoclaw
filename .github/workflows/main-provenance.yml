@@ -5,10 +5,16 @@
 # branch protection on a private Free-plan repo. This is detection, not prevention: a
 # red run on main, which GitHub reports to whoever pushed.
 #
-# A merge through GitHub (merge, squash or rebase) makes a new commit, and the PR's
-# merge_commit_sha names it. Pushing a PR's head straight to main also marks the PR
-# merged, but with merge_commit_sha equal to the PR's own head, so that fails here too,
-# as does a force-push, which can rewind main onto an old merge commit.
+# Two conditions, both required:
+# - GitHub made the tip. A merge, squash or rebase through GitHub is signed by GitHub
+#   and committed by its `web-flow` account. A local `git merge` of a PR branch pushed
+#   straight to main also marks that PR merged, with the local commit as its
+#   merge_commit_sha, so the PR link alone would pass it (it has, 5 times: #148, #255,
+#   #377, #380, #381). A local commit can borrow web-flow's email, never its signature.
+# - A merged PR into main names the tip as its merge_commit_sha, and the tip is not the
+#   PR's own head (pushing a PR's head straight to main also marks it merged). This
+#   rules out a commit GitHub made some other way, such as a web edit.
+# A force-push fails outright, since it can rewind main onto an old merge commit.
 name: Main provenance
 
 on:
@@ -34,16 +40,23 @@ jobs:
             echo "::error::main was force-pushed to $SHA; changes reach main only through a PR merge"
             exit 1
           fi
+          made=$(gh api "repos/$REPO/commits/$SHA" \
+            --jq '.commit.verification.verified == true and .committer.login == "web-flow"')
+          if [ "$made" != true ]; then
+            echo "::error::main moved to $SHA, a commit GitHub did not make (unsigned or not GitHub's); changes reach main only through a PR merge"
+            exit 1
+          fi
           # GitHub links the commit to its PR asynchronously, so give it a minute.
           for attempt in 1 2 3 4 5 6; do
             prs=$(gh api "repos/$REPO/commits/$SHA/pulls" | jq -r --arg sha "$SHA" '
-              [ .[] | select(.merged_at != null and .merge_commit_sha == $sha and .head.sha != $sha)
+              [ .[] | select(.merged_at != null and .base.ref == "main"
+                             and .merge_commit_sha == $sha and .head.sha != $sha)
                 | "#\(.number)" ] | join(" ")')
             if [ -n "$prs" ]; then
               echo "main at $SHA came from $prs"
               exit 0
             fi
-            sleep 10
+            [ "$attempt" -lt 6 ] && sleep 10
           done
           echo "::error::main moved to $SHA, which no merged PR produced; changes reach main only through a PR merge"
           exit 1

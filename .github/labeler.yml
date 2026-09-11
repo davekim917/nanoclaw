@@ -32,6 +32,7 @@ risk:high:
     # ...and the approval gates named otherwise: destructive/bash commands, held a2a messages
     - 'src/modules/bash-gate/**'
     - 'src/modules/agent-to-agent/message-gate.ts'
+    - 'src/command-gate.ts'
     # The message path, both ends
     - 'src/router.ts'
     - 'src/delivery.ts'
@@ -61,6 +62,9 @@ risk:high:
     - 'src/dashboard/auth/**'
     - 'src/dashboard/api/auth-me.ts'
     - 'src/dashboard/db/dashboard-tokens.ts'
+    - 'src/dashboard/steer.ts'
+    - 'src/dashboard/assign.ts'
+    - 'src/dashboard/api/scheduled-shared.ts'
     # Irreversible against a live DB
     - 'src/db/migrations/**'
     # Supply chain: pnpm allowBuilds, and the container image it builds
@@ -98,6 +102,7 @@ risk:guard:
     - 'src/guard/**'
     - 'src/modules/bash-gate/**'
     - 'src/modules/agent-to-agent/message-gate.ts'
+    - 'src/command-gate.ts'
 
 risk:message-path:
 - changed-files:
@@ -141,6 +146,9 @@ risk:credential:
     - 'src/dashboard/auth/**'
     - 'src/dashboard/api/auth-me.ts'
     - 'src/dashboard/db/dashboard-tokens.ts'
+    - 'src/dashboard/steer.ts'
+    - 'src/dashboard/assign.ts'
+    - 'src/dashboard/api/scheduled-shared.ts'
 
 risk:migration:
 - changed-files:
