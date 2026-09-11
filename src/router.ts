@@ -835,14 +835,16 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
   //
   //     Guard: require event.isDM === true explicitly (not just
   //     mg.is_group === 0). is_group=0 is not proof of a confirmed DM: the
-  //     messaging-group creation path (router.ts:599,608) defaults
+  //     messaging-group creation path (router.ts:599,608) only defaults
   //     is_group to 1 (group/mention-safe) when the adapter passes neither
-  //     message.isGroup nor isDM, so is_group=0 only ever means an adapter
-  //     that explicitly said isDM. Still, "is_group happens to read 0"
-  //     is a fact about that row's history, not this event's — caching a
-  //     shared channel as a user's DM off a stale or coincidental read
-  //     would poison subsequent DM resolution. (Codex P2 catch on PR #108
-  //     follow-up.)
+  //     message.isGroup nor isDM, but is_group also defaults to 0 with NO
+  //     adapter evidence at all on other paths — the CLI's `is_group`
+  //     field (src/cli/resources/messaging-groups.ts:102-106) and the
+  //     column itself (src/db/schema.ts:37) both default to 0. So
+  //     "is_group happens to read 0" is a fact about that row's history,
+  //     not this event's — caching a shared channel as a user's DM off a
+  //     stale or coincidental read would poison subsequent DM resolution.
+  //     (Codex P2 catch on PR #108 follow-up.)
   if (userId !== null && event.isDM === true) {
     try {
       const { upsertUserDm } = await import('./modules/permissions/db/user-dms.js');

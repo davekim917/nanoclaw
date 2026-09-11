@@ -211,17 +211,17 @@ async function handleUnknownSender(
   if (decision.effect === 'deny' && isDeclineNotify) {
     // The decline copy assumes a 1:1 DM surface, so this needs POSITIVE
     // evidence of one — `mg.is_group !== 1` is not that. The router's
-    // auto-create default (router.ts:599,608) now resolves an adapter that
-    // reports NEITHER isDM nor isGroup to is_group = 1 (group/mention-safe),
-    // so a row created after that fix reading is_group = 0 does mean an
-    // adapter explicitly said DM. But a row auto-created BEFORE the fix can
-    // still carry a stale is_group = 0 from back when "neither reported"
-    // defaulted to DM — so `mg.is_group` alone still isn't proof for a row
-    // of unknown vintage, and this event's own live signal is required —
-    // the same reason the user_dms cache requires `event.isDM === true`
-    // (src/router.ts, the 2a branch). Without the evidence the drop above
-    // stands and nothing is sent: silence beats posting "I'm <owner>'s
-    // personal agent" into a channel.
+    // auto-create default (router.ts:599,608) only resolves an adapter
+    // that reports NEITHER isDM nor isGroup to is_group = 1
+    // (group/mention-safe); is_group also defaults to 0 with NO adapter
+    // evidence at all on other paths that create a row — the CLI's
+    // `is_group` field (src/cli/resources/messaging-groups.ts:102-106) and
+    // the column itself (src/db/schema.ts:37) both default to 0. So
+    // `mg.is_group` alone is never proof either way, and this event's own
+    // live signal is required — the same reason the user_dms cache
+    // requires `event.isDM === true` (src/router.ts, the 2a branch).
+    // Without the evidence the drop above stands and nothing is sent:
+    // silence beats posting "I'm <owner>'s personal agent" into a channel.
     const confirmedDm = mg.is_group !== 1 && (event.isDM === true || event.message.isGroup === false);
     if (!confirmedDm) {
       log.warn('decline_notify skipped — no confirmed 1:1 DM context (no public decline)', {

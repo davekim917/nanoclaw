@@ -287,6 +287,32 @@ describe('tracked repository update surfaces', () => {
     expect(dockerfile).not.toMatch(/pip install[^\n]*--upgrade pip setuptools wheel/);
     expect(dockerfile).not.toMatch(/pip install[^\n]*--no-cache-dir uv(?:\s|\\)/);
   });
+
+  it('registers every pinned checksum ARG in update-sources.json', async () => {
+    // The gws musl download was checked against a fetched .sha256 sidecar
+    // instead of a pinned hash (a replaced release asset would pass its own
+    // replaced sidecar); pinning the hash as a Dockerfile ARG fixed that,
+    // but the update-sources.json entry was left without a `checksums`
+    // declaration — so container-updates.ts's rewrite-in-lockstep path
+    // (:941-963) had nothing to rewrite, and the next automated
+    // GWS_VERSION bump would have left the pinned hash stale, silently
+    // failing every image build's `sha256sum -c`. This asserts the
+    // invariant directly so the next pinned-checksum tool can't repeat the
+    // gap: every `ARG <NAME>=<64-hex>` line in the Dockerfile must be
+    // registered as a `checksums[].arg` somewhere in update-sources.json.
+    const root = path.resolve(import.meta.dirname, '..');
+    const dockerfile = await readFile(path.join(root, 'container', 'Dockerfile'), 'utf8');
+    const sources = JSON.parse(await readFile(path.join(root, 'container', 'update-sources.json'), 'utf8')) as {
+      dockerfile: Array<{ checksums?: Array<{ arg: string }> }>;
+    };
+    const dockerfileShaArgs = new Set(
+      [...dockerfile.matchAll(/^ARG\s+([A-Za-z0-9_]+)=[0-9a-f]{64}$/gm)].map((match) => match[1]),
+    );
+    const registeredShaArgs = new Set(
+      sources.dockerfile.flatMap((entry) => (entry.checksums ?? []).map((checksum) => checksum.arg)),
+    );
+    expect(registeredShaArgs).toEqual(dockerfileShaArgs);
+  });
 });
 
 describe('plugin version surface', () => {
