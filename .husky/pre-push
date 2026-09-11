@@ -243,8 +243,9 @@ snapshot_commit() {
 }
 
 objects_for_ref() {
-  local_sha=$1
-  remote_sha=$2
+  local_ref=$1
+  local_sha=$2
+  remote_sha=$3
   object_list=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-commits.XXXXXX")
   ref_allowlist_file=$(mktemp "${TMPDIR:-/tmp}/nanoclaw-pre-push-allowlist.XXXXXX")
   # Read the allowlist from $local_sha's own committed tree, not the pushing
@@ -259,6 +260,11 @@ objects_for_ref() {
   # reviewed when they merge, because it is risk:high.
   if ! git -C "$worktree_root" show "$local_sha:.public-boundary-allowlist.json" > "$ref_allowlist_file" 2>/dev/null; then
     printf '{"entries": []}\n' > "$ref_allowlist_file"
+    # Non-fatal, and it does not change the scan's outcome (empty exempts
+    # nothing either way), but a later alert about a finding on this ref
+    # should explain itself rather than leave "why wasn't this exempted?"
+    # unanswered.
+    echo "pre-push: $local_ref ($local_sha) has no committed .public-boundary-allowlist.json — scanning with an empty allowlist" >&2
   fi
   allowlist_path="$ref_allowlist_file"
   # Exclude this ref's own remote_sha (when known) AND every other known
@@ -307,5 +313,5 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     echo "pre-push: unsupported ref target; expected a commit or tag pointing to a commit" >&2
     exit 1
   fi
-  objects_for_ref "$local_sha" "$remote_sha"
+  objects_for_ref "$local_ref" "$local_sha" "$remote_sha"
 done < "$refs_file"

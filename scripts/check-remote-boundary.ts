@@ -213,22 +213,33 @@ function git(args: string[], cwd = INSTALL_ROOT): string {
  * strictest outcome — rather than letting the checker's own missing-file
  * error turn "nothing to exempt" into a "could not run" alert.
  *
- * Pure filesystem logic, deliberately split out so it is testable without
- * git, a network or a real `pnpm` invocation — same reasoning as `CleanupOps`
- * above.
+ * `usedFallback` says which happened, so a caller that knows which commit is
+ * being scanned can log it — this function does not, and stays pure
+ * filesystem logic with no `commit` argument, deliberately split out so it
+ * is testable without git, a network or a real `pnpm` invocation — same
+ * reasoning as `CleanupOps` above.
  */
-export function resolveAllowlistPath(snapshot: string): { path: string; cleanup: () => void } {
+export function resolveAllowlistPath(snapshot: string): { path: string; usedFallback: boolean; cleanup: () => void } {
   const treeAllowlist = path.join(snapshot, '.public-boundary-allowlist.json');
-  if (fs.existsSync(treeAllowlist)) return { path: treeAllowlist, cleanup: () => {} };
+  if (fs.existsSync(treeAllowlist)) return { path: treeAllowlist, usedFallback: false, cleanup: () => {} };
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-remote-boundary-allowlist-'));
   const emptyAllowlist = path.join(dir, 'allowlist.json');
   fs.writeFileSync(emptyAllowlist, '{"entries": []}\n');
-  return { path: emptyAllowlist, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
+  return { path: emptyAllowlist, usedFallback: true, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
 }
 
-/** Run the boundary checker over `snapshot`, against this install's registry. */
-function scanSnapshot(snapshot: string): BoundaryScan {
+/** Run the boundary checker over `snapshot` (a checkout of `commit`), against this install's registry. */
+function scanSnapshot(snapshot: string, commit: string): BoundaryScan {
   const allowlist = resolveAllowlistPath(snapshot);
+  if (allowlist.usedFallback) {
+    // Non-fatal, and it does not change the scan's outcome (empty exempts
+    // nothing either way), but a later alert about a finding on this commit
+    // should explain itself rather than leave "why wasn't this exempted?"
+    // unanswered.
+    console.error(
+      `remote-boundary: ${REF_LABEL} @ ${commit} has no committed .public-boundary-allowlist.json — scanning with an empty allowlist`,
+    );
+  }
   try {
     const result = spawnSync(
       'pnpm',
@@ -371,7 +382,7 @@ async function main(): Promise<number> {
   try {
     git(['fetch', '--quiet', 'origin', 'main']);
     commit = git(['rev-parse', '--short', REF]);
-    ({ value: scan, cleanupError } = withSnapshot(commit, scanSnapshot));
+    ({ value: scan, cleanupError } = withSnapshot(commit, (snapshot) => scanSnapshot(snapshot, commit)));
     // eslint-disable-next-line no-catch-all/no-catch-all
   } catch (err) {
     // Nothing was scanned, so there is no redacted checker output to send and

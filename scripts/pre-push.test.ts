@@ -860,6 +860,10 @@ describe('.husky/pre-push', () => {
 
     expect(result.status, result.stderr).toBe(0);
     expect(records(f.log).join('\n')).toContain('no-allowlist-clean');
+    // Non-fatal, and it does not change the result, but a later alert about a
+    // finding on this ref should be able to explain itself.
+    expect(result.stderr).toContain(`refs/heads/current (${pushed})`);
+    expect(result.stderr).toContain('scanning with an empty allowlist');
   });
 
   it('still refuses a pushed tip with no committed allowlist when it carries an identifier', () => {

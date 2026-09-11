@@ -182,6 +182,7 @@ describe('resolveAllowlistPath', () => {
     try {
       expect(resolved.path).toBe(path.join(snapshot, '.public-boundary-allowlist.json'));
       expect(fs.readFileSync(resolved.path, 'utf8')).toBe(committed);
+      expect(resolved.usedFallback).toBe(false);
     } finally {
       resolved.cleanup();
       fs.rmSync(snapshot, { recursive: true, force: true });
@@ -197,6 +198,7 @@ describe('resolveAllowlistPath', () => {
     const resolved = resolveAllowlistPath(snapshot);
     expect(resolved.path).not.toBe(path.join(snapshot, '.public-boundary-allowlist.json'));
     expect(JSON.parse(fs.readFileSync(resolved.path, 'utf8'))).toEqual({ entries: [] });
+    expect(resolved.usedFallback).toBe(true);
 
     const fallbackDir = path.dirname(resolved.path);
     resolved.cleanup();
