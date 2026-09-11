@@ -20,7 +20,7 @@
 #                                             # exit 0 only when merging exactly that head is allowed
 #   codex-review.sh merge --head <sha> [--method merge|squash]
 #                                             # risk-scoped repos' only merge path: merge-check, then gh pr merge on its exit 0 alone
-#   codex-review.sh audit                     # a merged PR against merge-check's rules as of its merge; exit 28 = it bypassed the gate
+#   codex-review.sh audit                     # a merged PR as of its merge, by the merge-check rules of THIS copy; exit 28 = it bypassed the gate
 #   codex-review.sh receipt --head <sha> --outcome approve|changes --reviewer "<model + runtime>" --body-file <file>
 #                                             # post a substitute review's receipt for exactly that head — --reviewer
 #                                             # must start with an allowed model ID (reviewer-models.txt)
@@ -1315,8 +1315,13 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|sc
     # After the fact: would merge-check have allowed this merged PR, at its
     # merged head, as of its merge? main-provenance.yml's gate-audit job runs
     # it on every push to main, and .github/scripts/gate-audit.sh files one
-    # `gate-bypass` issue per PR it flags. The rules are merge-check's, through
-    # the same helpers; only the moment is pinned to the merge. The base is
+    # `gate-bypass` issue per PR it flags. The rules are merge-check's as
+    # written in the copy of this script that runs, through the same helpers:
+    # the rules are the audit code of the commit being judged. The job checks
+    # out the merge commit, so a push-triggered audit applies the rules that
+    # commit carries. A manual backfill with newer code applies newer rules to
+    # older merges, such as today's reviewer allowlist to a receipt posted
+    # before it existed. What IS pinned to the merge is the moment. The base is
     # the commit the PR merged onto (the merge commit's first parent), the
     # title and body are the revisions current at mergedAt (#675's Fixes-PR
     # line was added a minute after it merged), and a receipt, a review

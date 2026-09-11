@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # main-provenance.yml's gate-audit job. For the PR a push to main just merged,
 # run the merge gate's own after-the-fact check — codex-review.sh audit, the
-# helpers merge-check decides with, judged as of the merge — and file ONE
+# helpers merge-check decides with, judged as of the merge by the audit code
+# in the merge commit this job checked out — and file ONE
 # `gate-bypass` issue per PR it flags. Detection, not prevention: the merge
 # already happened, so this blocks nothing. It is loud when it cannot judge a
 # merge (a red job, never a quiet pass), and it never files twice for one PR:
