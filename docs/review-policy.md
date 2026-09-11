@@ -52,7 +52,9 @@ its disposition. A local completion claim is not substitute-review coverage.
 Before starting, the author and the reviewer read `docs/review-notes.md`.
 Deferring a finding to an issue, or reverting a PR, appends one line there.
 When the PR carries `risk:*` dimension labels, they scope the reviewer's
-brief.
+brief. Labels are for reading: `codex-review.sh scope` decides whether a head
+is reviewed at all from the PR's changed files, and a label can only add
+review, never remove it.
 
 Every `fix` PR carries `Fixes-PR: #<n>`, naming the PR it fixes, or
 `Fixes-PR: none` in its body; `codex-review.sh merge-check` enforces it. A
