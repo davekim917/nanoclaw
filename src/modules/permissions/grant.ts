@@ -104,7 +104,8 @@ export async function handleGrantAccess(content: Record<string, unknown>, sessio
     return;
   }
   if (role !== 'member' && role !== 'admin') {
-    await notifyAgent(session, `grant_access failed: role must be \`member\` or \`admin\`, got \`${role}\`.`);
+    // Say what is allowed, not what was sent: the role is caller-supplied text.
+    await notifyAgent(session, 'grant_access failed: role must be `member` or `admin`.');
     return;
   }
   if (!(await getAgentGroup(targetAgentGroupId))) {

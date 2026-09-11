@@ -33,7 +33,7 @@ import {
   getMessagingGroupAgentByPair,
   getMessagingGroupByPlatform,
 } from '../../db/messaging-groups.js';
-import { getPendingApprovalsByAction } from '../../db/sessions.js';
+import { getPendingApprovalByRequestId, getPendingApprovalsByAction } from '../../db/sessions.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
 import { log } from '../../log.js';
@@ -48,6 +48,8 @@ export const REQUEST_CHOICE_ACTION = 'request_choice';
 export const MAX_CHOICE_OPTIONS = 10;
 export const MAX_CHOICE_APPROVERS = 20;
 export const SUPERSEDED_LINE = '↩️ Superseded by a newer ask';
+/** The host-only event tag on a relayed answer (notifyAgent); the agent acts on nothing else. */
+export const CHOICE_RESPONSE_EVENT = 'choice_response';
 const ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 const USER_ID_RE = /^[^:\s]+:\S+$/;
 const OPTION_STYLES = new Set<unknown>(['primary', 'danger', 'default']);
@@ -184,7 +186,9 @@ async function handleRequestChoice(content: Record<string, unknown>, session: Se
 
   // Post first, then retire: an ask that failed to post leaves the old card live.
   if (posted && request.key !== undefined) {
-    await supersedeOpenChoices(session.agent_group_id, request.key, request.choiceId);
+    const own = await getPendingApprovalByRequestId(request.choiceId);
+    // Gone already means a newer same-key ask retired it: nothing older to retire.
+    if (own) await supersedeOpenChoices(session.agent_group_id, request.key, own);
   }
 }
 
@@ -218,20 +222,32 @@ async function authorizedDestination(
 
 /**
  * Replace, never stack: retire every open request_choice card this agent
- * group posted under `key`, except the one just posted. The key lives in the
- * row's payload JSON, not a column of its own: open choice cards per group are
- * few, getPendingApprovalsByAction already narrows to this action (indexed by
- * idx_pending_approvals_action_status), filtering in JS keeps the query
- * portable (no json_extract), and a column would be schema for one action.
+ * group posted under `key` BEFORE `newest` (createdBefore), so the newest card
+ * always survives. Two same-key asks from different sessions of one group can
+ * be handled at the same time — the active poll (delivery.ts:521-524) and the
+ * sweep (delivery.ts:896-905) are separate loops — and "everything but my own
+ * row" let each retire the other, leaving no card open.
+ *
+ * The key lives in the row's payload JSON, not a column of its own: open
+ * choice cards per group are few, getPendingApprovalsByAction already narrows
+ * to this action (indexed by idx_pending_approvals_action_status), filtering in
+ * JS keeps the query portable (no json_extract), and a column would be schema
+ * for one action.
  */
-async function supersedeOpenChoices(agentGroupId: string, key: string, keepChoiceId: string): Promise<void> {
+async function supersedeOpenChoices(agentGroupId: string, key: string, newest: PendingApproval): Promise<void> {
   for (const row of await getPendingApprovalsByAction(REQUEST_CHOICE_ACTION)) {
-    if (row.status !== 'pending' || row.agent_group_id !== agentGroupId || row.request_id === keepChoiceId) continue;
+    if (row.status !== 'pending' || row.agent_group_id !== agentGroupId || !createdBefore(row, newest)) continue;
     if (payloadKey(row) !== key) continue;
     if (await retireChoice(row, SUPERSEDED_LINE)) {
       log.info('Choice superseded by a newer ask', { approvalId: row.approval_id, agentGroupId, key });
     }
   }
+}
+
+/** Strictly earlier: created_at (ISO, so string order is time order), then approval_id to break a tie. */
+function createdBefore(row: PendingApproval, newest: PendingApproval): boolean {
+  if (row.created_at !== newest.created_at) return row.created_at < newest.created_at;
+  return row.approval_id < newest.approval_id;
 }
 
 function payloadKey(row: PendingApproval): string | undefined {
@@ -311,8 +327,9 @@ const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF
  * unchanged: the runner XML-escapes chat text (& < > ", formatter.ts:716-718
  * in container/agent-runner/src), and encodeURIComponent output contains none
  * of those. Lone surrogates, which encodeURIComponent throws on, become U+FFFD.
- * Anyone can type this line; the agent trusts it only inside a message the
- * runner marks origin="host" (notifyAgent).
+ * Anyone can type this line, and a host note can echo text it was sent, so the
+ * agent trusts it only inside a message the runner marks origin="host" AND
+ * event="choice_response" (notifyAgent with CHOICE_RESPONSE_EVENT).
  */
 export function formatChoiceResponse(fields: {
   choiceId: string;
@@ -351,7 +368,7 @@ async function relayChoice(ctx: ChoiceHandlerContext): Promise<Session | null> {
         userId: ctx.userId,
         userName: user?.display_name ?? null,
       }),
-      { id },
+      { id, event: CHOICE_RESPONSE_EVENT },
     );
   } catch (err) {
     // notifyAgent inserts the row, then reads the session back and wakes it

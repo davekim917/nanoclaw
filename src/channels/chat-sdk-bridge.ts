@@ -26,7 +26,7 @@ import { log } from '../log.js';
 import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
 import { getAskQuestionRender } from '../db/sessions.js';
-import { isAnswerCard } from '../answer-cards.js';
+import { isAnswerCardAction } from '../answer-cards.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import type {
   ChannelAdapter,
@@ -1164,8 +1164,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         // an answer a refused or losing click never gave. No edit is needed to
         // acknowledge the click: the adapter acks the platform event itself
         // (Slack answers block_actions 200 before dispatch, @chat-adapter/slack
-        // dist/index.js:1408-1411).
-        if (await isAnswerCard(questionId)) {
+        // dist/index.js:1408-1411). Classified from the render read above, not a
+        // second one: a row the winning click deletes in between would otherwise
+        // read as "not an answer card" and fall through to the edit below.
+        if (render?.action !== undefined && isAnswerCardAction(render.action)) {
           setupConfig.onAction(questionId, selectedOption, userId);
           return;
         }
@@ -2065,8 +2067,9 @@ export async function handleForwardedEvent(
           }
           return;
         }
-        if (await isAnswerCard(questionId)) {
-          // Answer card: acknowledge without touching the message (type 6,
+        if (render?.action !== undefined && isAnswerCardAction(render.action)) {
+          // Answer card, classified from the render read above (see the Chat SDK
+          // path): acknowledge without touching the message (type 6,
           // DEFERRED_UPDATE_MESSAGE — InteractionResponseType.DeferredMessageUpdate,
           // discord-api-types payloads/v10/_interactions/responses.d.ts:66-69).
           // The host edits the card once the answer is delivered.

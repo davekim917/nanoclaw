@@ -359,7 +359,7 @@ describe('request_choice click authority and resolution', () => {
     const [, , message, options] = vi.mocked(writeSessionMessage).mock.calls[0];
     expect(message.kind).toBe('chat');
     expect(message.id).toBe(`choice-answer-${row.approval_id}`);
-    expect(JSON.parse(message.content)).toMatchObject({ origin: 'host' });
+    expect(JSON.parse(message.content)).toMatchObject({ origin: 'host', event: 'choice_response' });
     expect(options).toEqual({ hostOrigin: true });
     expect(vi.mocked(wakeContainer)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(wakeContainer).mock.calls[0][0].id).toBe('sess-1');
@@ -600,6 +600,20 @@ describe('replace, never stack (key)', () => {
     // A late click on the superseded card does nothing.
     expect(await click(first.approval_id, 'ship-a', ADMIN)).toBe(false);
     expect(notes()).toEqual([]);
+  });
+
+  it('two same-key asks from two sessions of the group, handled at once, leave exactly one open card', async () => {
+    const other = sessionRow('sess-x', 'ag-1', 'mg-1', 'slack:chan-1:300.1');
+    await createSession(other);
+
+    await Promise.all([
+      ask(session, { key: 'release:web' }, 'choice-1'),
+      ask(other, { key: 'release:web' }, 'choice-2'),
+    ]);
+
+    const open = (await getPendingApprovalsByAction(REQUEST_CHOICE_ACTION)).filter((r) => r.status === 'pending');
+    expect(open).toHaveLength(1);
+    expect(delivered.filter((d) => d.content.operation === 'edit')).toHaveLength(1);
   });
 
   it('keeps the open card when the newer ask fails to post', async () => {

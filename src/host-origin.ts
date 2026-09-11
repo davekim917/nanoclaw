@@ -1,18 +1,23 @@
 /**
- * The reserved `origin` content field on inbound session messages.
+ * The host-only content fields on inbound session messages: `origin` and
+ * `event`.
  *
- * The runner renders origin="host" from this field alone
+ * The runner renders origin="host" and event="..." from these fields alone
  * (container/agent-runner/src/formatter.ts). writeSessionMessage strips it
  * from every inbound write except a host note (WriteSessionMessageOptions.hostOrigin,
  * session-manager.ts), so a person or a peer agent — who controls `sender`
  * and `senderId` in content they author — can never make it survive.
  */
 
+/** Content fields only a host note may carry: the origin marker and its purpose tag. */
+export const HOST_ONLY_FIELDS = ['origin', 'event'] as const;
+
 /**
- * Drop a top-level `origin` from JSON-object content. Anything else — no such
- * field, non-JSON, a non-object — passes through byte-identical.
+ * Drop the host-only fields (HOST_ONLY_FIELDS) from JSON-object content.
+ * Anything else — none present, non-JSON, a non-object — passes through
+ * byte-identical.
  */
-export function withoutReservedOrigin(content: string): string {
+export function withoutHostFields(content: string): string {
   let parsed: unknown;
   try {
     parsed = JSON.parse(content);
@@ -20,10 +25,9 @@ export function withoutReservedOrigin(content: string): string {
   } catch {
     return content;
   }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || !Object.hasOwn(parsed, 'origin')) {
-    return content;
-  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return content;
+  if (!HOST_ONLY_FIELDS.some((field) => Object.hasOwn(parsed, field))) return content;
   const copy = { ...(parsed as Record<string, unknown>) };
-  delete copy.origin;
+  for (const field of HOST_ONLY_FIELDS) delete copy[field];
   return JSON.stringify(copy);
 }

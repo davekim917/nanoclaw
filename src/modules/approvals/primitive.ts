@@ -225,10 +225,16 @@ export async function pickApprovalDelivery(
  * Send a system chat to the agent's session. Used by callers and by the response handler.
  *
  * The one writer that keeps `origin: 'host'` (WriteSessionMessageOptions.hostOrigin),
- * so the runner marks exactly these notes origin="host". `id` pins the message id
- * for a caller that must check afterwards whether the note landed.
+ * so the runner marks exactly these notes origin="host". `event` tags a note with
+ * its purpose (e.g. `choice_response`); like origin it survives no other writer, so
+ * a host note that echoes someone's text cannot pass for one. `id` pins the message
+ * id for a caller that must check afterwards whether the note landed.
  */
-export async function notifyAgent(session: Session, text: string, opts: { id?: string } = {}): Promise<void> {
+export async function notifyAgent(
+  session: Session,
+  text: string,
+  opts: { id?: string; event?: string } = {},
+): Promise<void> {
   await writeSessionMessage(
     session.agent_group_id,
     session.id,
@@ -239,7 +245,13 @@ export async function notifyAgent(session: Session, text: string, opts: { id?: s
       platformId: session.agent_group_id,
       channelType: 'agent',
       threadId: null,
-      content: JSON.stringify({ text, sender: 'system', senderId: 'system', origin: 'host' }),
+      content: JSON.stringify({
+        text,
+        sender: 'system',
+        senderId: 'system',
+        origin: 'host',
+        ...(opts.event ? { event: opts.event } : {}),
+      }),
     },
     { hostOrigin: true },
   );

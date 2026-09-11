@@ -450,8 +450,15 @@ function formatSingleChat(msg: MessageInRow): string {
   // WriteSessionMessageOptions.hostOrigin). sender/sender_id are whatever the
   // author put in content, so they prove nothing about who wrote the message.
   const hostAttr = content.origin === 'host' ? ' origin="host"' : '';
+  // event="..." names a host note's purpose (e.g. choice_response). The host strips
+  // it from every other write too, so a host note that merely echoes someone's
+  // text (a refused grant, say) never carries it.
+  const eventAttr =
+    content.origin === 'host' && typeof content.event === 'string' && /^[a-z_]{1,64}$/.test(content.event)
+      ? ` event="${content.event}"`
+      : '';
 
-  return `<message${idAttr}${fromAttr}${hostAttr} sender="${escapeXml(sender)}"${senderIdAttr} time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${attachmentsSuffix}</message>`;
+  return `<message${idAttr}${fromAttr}${hostAttr}${eventAttr} sender="${escapeXml(sender)}"${senderIdAttr} time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${attachmentsSuffix}</message>`;
 }
 
 /**

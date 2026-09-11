@@ -21,7 +21,7 @@ import type { OutboundFile } from './channels/adapter.js';
 import { DATA_DIR } from './config.js';
 import { assertChannelRoutingConsistency } from './delivery.js';
 import { ensureContainedInboxDir, isPathInside } from './inbox-safety.js';
-import { withoutReservedOrigin } from './host-origin.js';
+import { withoutHostFields } from './host-origin.js';
 import { acquireStorageActivityLease } from './storage-activity.js';
 import { evaluateGuardSync, withCentralSync } from './db/central-lease.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
@@ -939,12 +939,12 @@ export interface WriteSessionMessageOptions {
    */
   guard?: WriteGuard;
   /**
-   * Keep a top-level `origin` field in the content. Every other write has it
-   * removed (withoutReservedOrigin), so the runner's `origin="host"` marker
-   * (container/agent-runner/src/formatter.ts) can only come from the host's own
-   * notes: a person or a peer agent controls `sender` and `senderId` in content
-   * they author, but never an `origin` that survives this writer. The one
-   * caller is notifyAgent (modules/approvals/primitive.ts).
+   * Keep the host-only `origin` and `event` fields in the content. Every other
+   * write has them removed (withoutHostFields), so the runner's `origin="host"`
+   * and `event="..."` markers (container/agent-runner/src/formatter.ts) can only
+   * come from the host's own notes: a person or a peer agent controls `sender`
+   * and `senderId` in content they author, but never a field that survives this
+   * writer. The one caller is notifyAgent (modules/approvals/primitive.ts).
    */
   hostOrigin?: boolean;
 }
@@ -1156,8 +1156,8 @@ async function writeSessionMessageLocked(
   }
 
   // Extract base64 attachment data, save to inbox, replace with file paths
-  // The reserved `origin` survives only a host note (WriteSessionMessageOptions.hostOrigin).
-  const messageContent = hostOrigin ? message.content : withoutReservedOrigin(message.content);
+  // The host-only fields survive only a host note (WriteSessionMessageOptions.hostOrigin).
+  const messageContent = hostOrigin ? message.content : withoutHostFields(message.content);
   const { content, writtenPaths } = extractAttachmentFiles(agentGroupId, sessionId, message.id, messageContent);
 
   // Scheduled occurrences are always inert until the due-time admission seam

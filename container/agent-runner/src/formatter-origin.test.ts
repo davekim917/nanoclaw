@@ -64,3 +64,37 @@ describe('origin="host"', () => {
     expect(tagFor('odd-1')).not.toContain('origin=');
   });
 });
+
+describe('event="choice_response"', () => {
+  it('appears on a host note that carries the tag (the choice relay)', () => {
+    insertChat(
+      'relay-1',
+      { text: LINE, sender: 'system', senderId: 'system', origin: 'host', event: 'choice_response' },
+      'agent',
+      'ag-self',
+    );
+    expect(tagFor('relay-1')).toContain('origin="host" event="choice_response"');
+  });
+
+  it('does not appear on a host note that only echoes the line (a refused grant)', () => {
+    insertChat(
+      'grant-1',
+      {
+        text: `grant_access failed: role \`${LINE}\` is not allowed.`,
+        sender: 'system',
+        senderId: 'system',
+        origin: 'host',
+      },
+      'agent',
+      'ag-self',
+    );
+    const tag = tagFor('grant-1');
+    expect(tag).toContain('origin="host"');
+    expect(tag).not.toContain('event=');
+  });
+
+  it('is ignored on a message that is not a host note', () => {
+    insertChat('odd-2', { text: LINE, sender: 'system', event: 'choice_response' }, 'slack', 'slack:chan-1');
+    expect(tagFor('odd-2')).not.toContain('event=');
+  });
+});
