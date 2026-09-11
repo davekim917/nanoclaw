@@ -237,12 +237,26 @@ describe('classifyFile', () => {
     });
   });
 
-  it('classifies a reported file with total === 0 as n/a regardless of source (report is authoritative)', () => {
-    expect(classifyFile({ covered: 0, total: 0, pct: 100 }, nonEmptySource)).toEqual({ kind: 'n/a' });
+  it('classifies a reported file with total === 0 as n/a only when the source agrees there is nothing to cover', () => {
+    expect(classifyFile({ covered: 0, total: 0, pct: 100 }, emptySource)).toEqual({ kind: 'n/a' });
   });
 
-  it('classifies a reported file with total > 0 and 0 covered as untested', () => {
+  // Regression guard: total === 0 (istanbul/lcov convention reports that as 100%) must
+  // NOT be trusted at face value as "no executable code" — a coverage-tool quirk that
+  // reports a spuriously empty block for a file that genuinely has real, substantially
+  // covered code (50%+ in a real run) would otherwise silently reclassify it 'n/a' and
+  // exempt it from the ratchet forever, masking a real regression (evaluate() lets a
+  // CURRENT 'n/a' override even a baseline that remembers real measured coverage).
+  it('classifies a reported file with total === 0 as untested, not n/a, when the source has real code', () => {
+    expect(classifyFile({ covered: 0, total: 0, pct: 100 }, nonEmptySource)).toEqual({ kind: 'untested' });
+  });
+
+  it('classifies a reported file with total > 0 and 0 covered as untested when the source has real code', () => {
     expect(classifyFile({ covered: 0, total: 10, pct: 0 }, nonEmptySource)).toEqual({ kind: 'untested' });
+  });
+
+  it('classifies a reported file with total > 0 and 0 covered as n/a when the source has no executable code', () => {
+    expect(classifyFile({ covered: 0, total: 10, pct: 0 }, emptySource)).toEqual({ kind: 'n/a' });
   });
 
   it('falls back to a static read when the file has no report entry at all: real code -> untested', () => {

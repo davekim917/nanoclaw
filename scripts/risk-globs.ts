@@ -50,7 +50,10 @@ const KNOWN_NON_CODE_GLOBS: ReadonlySet<string> = new Set([
   'container/build.sh',
   'scripts/deploy.sh',
   'scripts/git-safety*.sh',
-  'scripts/wiki-autopush.sh',
+  // scripts/wiki-autopush.sh is gone (removed from risk:high upstream) — deliberately
+  // not left here as a stale entry; an unclassified glob should still throw if this
+  // path ever comes back under a different name.
+  'scripts/lib/secret-scan.sh',
   '.github/**',
   '.husky/**',
   '.public-boundary-allowlist.json',

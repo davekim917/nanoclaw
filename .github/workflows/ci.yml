@@ -21,15 +21,16 @@ permissions:
 # cancelled — a push there is the merge itself, not a draft in progress.
 #
 # Safe against merge-check misreading a cancelled run as belonging to the CURRENT
-# head: `ci_verdict()` (container/skills/pr-review-loop/scripts/codex-review.sh:691)
-# queries `repos/$REPO/actions/runs?head_sha=$1` (:693) — `$1` is the exact head SHA
-# `merge-check` was asked about — so a run for an OLDER, superseded head_sha is never
-# even fetched for a newer head's check, cancelled or not. Within one head_sha it
-# also keeps only the newest run per workflow name (`group_by(.name) |
-# map(max_by(...))`, :698), so a rerun's stale failed attempt can't outrank the
-# fresh one either. Two runs only ever share a head_sha by re-running the exact same
-# push, which cancel-in-progress does not do (it cancels a DIFFERENT, older SHA's
-# run, never re-triggers the current one).
+# head: `merge-check`'s per-head CI check (container/skills/pr-review-loop/scripts/
+# codex-review.sh, the `ci_verdict()` function — cited by name, not a line number:
+# #664 is expected to rewrite this file) queries `actions/runs?head_sha=$1`, where
+# `$1` is the exact head SHA `merge-check` was asked about — so a run for an OLDER,
+# superseded head_sha is never even fetched for a newer head's check, cancelled or
+# not. Within one head_sha it also keeps only the newest run per workflow name
+# (`group_by(.name) | map(max_by(...))`), so a rerun's stale failed attempt can't
+# outrank the fresh one either. Two runs only ever share a head_sha by re-running the
+# exact same push, which cancel-in-progress does not do (it cancels a DIFFERENT,
+# older SHA's run, never re-triggers the current one).
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -149,15 +150,17 @@ jobs:
 
       # Feeds scripts/check-risk-coverage.ts against the committed
       # coverage-risk-baseline.json (docs/specs/risk-based-review/plan.md,
-      # "Tests on risky paths"): a ratchet, not a fixed floor — it fails only
-      # when a risk file drops more than 0.5 points below ITS OWN prior
-      # measurement, or a new risk file has no tests at all — see that
-      # script's own file header for the complete fail-closed list (a
-      # missing baseline, a risk file missing from either report entirely,
-      # a missing container report). Runs from the repo root against both
-      # reports produced above, in the same job so no artifact hand-off is
-      # needed for the gate itself (the steps below are only for
-      # regenerating the baseline from a real CI run).
+      # "Tests on risky paths"): a per-file floor set by each risk file's OWN
+      # prior measurement, never a single fixed number like 85% (the plan's
+      # Non-goals rule that out), and raised only manually via --write, never
+      # automatically. Fails when a risk file drops more than 0.5 points
+      # below its baseline, or a new risk file has no tests at all — see
+      # that script's own file header for the complete classification model
+      # and fail-closed list (a missing baseline, a risk file missing from
+      # either report entirely, a missing container report). Runs from the
+      # repo root against both reports produced above, in the same job so no
+      # artifact hand-off is needed for the gate itself (the steps below are
+      # only for regenerating the baseline from a real CI run).
       - name: Risk-path coverage ratchet
         run: pnpm exec tsx scripts/check-risk-coverage.ts
 

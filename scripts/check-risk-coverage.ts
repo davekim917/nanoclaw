@@ -284,10 +284,10 @@ export function parseLcov(lcov: string, sfToRepoPath: (sf: string) => string): M
   return out;
 }
 
-/** Istanbul/lcov convention: a file with zero countable lines is 100% covered. Only
- * used for display on a file classifyFile has already decided is genuinely measured —
- * classification itself never trusts this convention (see classifyFile: `total === 0`
- * routes straight to `'n/a'`, before pct ever enters the picture). */
+/** Istanbul/lcov convention: a file with zero countable lines is 100% covered.
+ * `classifyFile` never trusts this at face value for a classification decision — a
+ * `total === 0` entry is never classified `'measured'`; it falls through to
+ * `hasExecutableCode` like an absent one (see that function's own comment). */
 function pctOf(covered: number, total: number): number {
   return total === 0 ? 100 : (covered / total) * 100;
 }
@@ -337,18 +337,26 @@ export function hasExecutableCode(sourceText: string): boolean {
 
 /**
  * Resolves one risk file's `Classification` from its measured `CoverageStat` (if the
- * report has one) or, absent that, a static read of the file itself — see the file
- * header's "The container gap" for why absence needs a fallback at all, and
- * `hasExecutableCode` for what the fallback actually checks. `readSource` is injected
- * (rather than calling `fs.readFileSync` directly) purely so this stays unit-testable
- * without a real file on disk.
+ * report has one and shows unambiguous positive coverage) or, otherwise, a static read
+ * of the file itself — see the file header's "The container gap" for why absence needs
+ * a fallback at all, and `hasExecutableCode` for what the fallback actually checks.
+ *
+ * A report entry is trusted OUTRIGHT only when `total > 0 && pct > 0` — real,
+ * unambiguous measured coverage. Anything else (absent from the report; `total === 0`,
+ * which istanbul/lcov convention reports as 100% — see `pctOf` — and would otherwise be
+ * misread as "measured, fully covered"; or `pct === 0`) is cross-checked against the
+ * file's own source instead of taken at face value: `hasExecutableCode` is the single
+ * source of truth for the n/a-vs-untested distinction, so a coverage-tool quirk that
+ * reports a spuriously empty or zero block for a file with real code can't silently
+ * exempt it from the ratchet forever — `evaluate()` lets a CURRENT 'n/a' override even a
+ * baseline that remembers real measured coverage, by design (see its own comment), so
+ * getting 'n/a' wrong here would be a real masked regression, not just a display quirk.
+ *
+ * `readSource` is injected (rather than calling `fs.readFileSync` directly) purely so
+ * this stays unit-testable without a real file on disk.
  */
 export function classifyFile(stat: CoverageStat | undefined, readSource: () => string): Classification {
-  if (stat) {
-    if (stat.total === 0) return { kind: 'n/a' };
-    if (stat.pct > 0) return { kind: 'measured', pct: stat.pct };
-    return { kind: 'untested' }; // total > 0, covered === 0: real code, genuinely zero coverage
-  }
+  if (stat && stat.total > 0 && stat.pct > 0) return { kind: 'measured', pct: stat.pct };
   return hasExecutableCode(readSource()) ? { kind: 'untested' } : { kind: 'n/a' };
 }
 

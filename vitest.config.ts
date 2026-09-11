@@ -1,3 +1,11 @@
+/**
+ * `@vitest/coverage-v8` (package.json devDependencies) is a `vitest` peer, not an
+ * independent package — it must stay EXACT-PINNED to the SAME version as `vitest`
+ * itself (currently 4.1.10 for both; see docs/dependency-updates.md). Bumping `vitest`
+ * without bumping `@vitest/coverage-v8` to match (or vice versa) risks a version
+ * mismatch the coverage machinery below silently tolerates at install time but not at
+ * run time.
+ */
 import fs from 'node:fs';
 import path from 'node:path';
 
