@@ -1,19 +1,25 @@
 # Risk-based review scope — the single source of truth for which PRs get Codex review.
 #
-# A PR that changes ANY path below is labeled `risk:high` by
-# .github/workflows/risk-label.yml, and only `risk:high` PRs are reviewed. Everything
-# else merges on green CI. Rationale, audit data and rollback condition:
+# A PR that changes ANY path below is reviewed; everything else merges on green CI. The
+# merge gate (container/skills/pr-review-loop/scripts/codex-review.sh, `scope` and
+# `merge-check`) matches the PR's changed files against the `risk:high` globs itself,
+# reading this file from the base branch. .github/workflows/risk-label.yml puts the same
+# answer on the PR as the `risk:high` label for people to read, and a missing label never
+# skips review. Rationale, audit data and rollback condition:
 # docs/specs/risk-based-review/plan.md.
 #
 # Rule for adding a path: a mistake there is privileged, irreversible, or silently
 # breaks every session — AND no deterministic gate already covers it. Upstream-owned
 # files are deliberately absent: the upstream ratchet already gates them in CI.
 #
-# `risk:high` is the union of every path below and stays the only label the merge gate
-# reads. Alongside it, each path also carries a `risk:<dimension>` label (guard,
+# `risk:high` is the union of every path below and the only list the merge gate matches.
+# Alongside it, each path also carries a `risk:<dimension>` label (guard,
 # message-path, sweep, session-db, self-mod, credential, migration, supply-chain,
 # deploy, gates, runner) so a reviewer can see which seam a PR touches without reading
-# the whole diff; `scripts/labeler-config.test.ts` asserts the two stay in sync.
+# the whole diff; `scripts/labeler-config.test.ts` asserts the two stay in sync. Keep
+# `risk:high` in the one shape the gate reads — one rule holding one
+# `any-glob-to-any-file` list of quoted globs that use only `*`, `?` and `**` — or every
+# PR fails closed to review; `scripts/risk-scope.test.ts` checks this file against it.
 #
 # Replayed against PRs #510–#595 on 2026-09-10 (measured before the dimension labels
 # and the risk:runner/message-path/gates/supply-chain additions below): 18 of 60 (30%)

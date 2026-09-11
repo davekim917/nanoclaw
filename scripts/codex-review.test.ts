@@ -120,14 +120,14 @@ if [ -n "$rest" ]; then
       printf ']'
       exit 0
       ;;
-    */issues/*/events\\?*)
-      # events.json holds every page, as --paginate --slurp prints them. Absent = the read fails.
-      if [ ! -f "$MOCK_DIR/events.json" ]; then
+    */pulls/*/files\\?*)
+      # files.json holds every page, as --paginate --slurp prints them. Absent = the read fails.
+      if [ ! -f "$MOCK_DIR/files.json" ]; then
         echo '{"message":"Server Error","status":"500"}'
         echo 'gh: Server Error (HTTP 500)' >&2
         exit 1
       fi
-      if printf '%s\\n' "$@" | grep -qx -- --slurp; then cat "$MOCK_DIR/events.json"; else jq -c '.[0]' "$MOCK_DIR/events.json"; fi
+      if printf '%s\\n' "$@" | grep -qx -- --slurp; then cat "$MOCK_DIR/files.json"; else jq -c '.[0]' "$MOCK_DIR/files.json"; fi
       exit 0
       ;;
   esac
@@ -214,29 +214,40 @@ function run(root: string, command: string, minutes?: string, sha = HEAD) {
 
 const OLD_HEAD = 'cccccccccccccccccccccccccccccccccccccccc';
 const OTHER_HEAD = 'dddddddddddddddddddddddddddddddddddddddd';
-const RISK_CONFIG = "risk:high:\n- changed-files:\n  - any-glob-to-any-file:\n    - 'src/router.ts'\n";
-const LABELER = 'github-actions[bot]';
+const RISK_CONFIG =
+  "risk:high:\n- changed-files:\n  - any-glob-to-any-file:\n    - 'src/router.ts'\n    - '.github/**'\n";
 
 function writeJson(root: string, name: string, value: unknown): void {
   fs.writeFileSync(path.join(root, name), JSON.stringify(value));
 }
 
-function prState(labels: string[], head = HEAD, title = 'feat: route a new message kind', body = ''): Page {
+function prState(
+  labels: string[],
+  head = HEAD,
+  title = 'feat: route a new message kind',
+  body = '',
+  changedFiles = 1,
+): Page {
   return {
     headRefOid: head,
     baseRefName: 'main',
     headRefName: 'feat',
     title,
     body,
+    changedFiles,
     labels: labels.map((name) => ({ name })),
   };
 }
 
-// A label put on or taken off the PR, as `issues/<n>/events` lists it.
-function labelEvent(event: 'labeled' | 'unlabeled', label: string, login: string): Page {
-  return { event, label: { name: label }, actor: { login }, created_at: '2026-09-05T00:00:40Z' };
+// One entry of `pulls/<n>/files`; a rename also names the path it left.
+function changedFile(filename: string, previousFilename?: string): Page {
+  return previousFilename
+    ? { filename, previous_filename: previousFilename, status: 'renamed' }
+    : { filename, status: 'modified' };
 }
 
+// The Risk label workflow's run on a head, as `actions/runs` lists it. The
+// workflow only labels the PR now, and merge-check must leave it out of CI.
 function labelRun(status: string, conclusion: string | null, head = HEAD, name = 'Risk label'): Page {
   return {
     id: 1,
@@ -304,62 +315,51 @@ function threadsPage(nodes: unknown[]): Page {
   };
 }
 
-// One PR: its base-branch labeler config (null = absent), the Risk label runs
-// the Actions API returns, its labels, and every GraphQL connection.
+// One PR: its base-branch labeler config (null = absent), its changed files,
+// its labels, its Actions runs, and every GraphQL connection.
 function scopeFixture(
   root: string,
   opts: {
     labels?: string[];
     baseConfig?: string | null;
-    runs?: Page[];
+    files?: Page[][] | null;
+    changedFiles?: number;
     ci?: Page[];
     statuses?: Page[];
     comments?: Page[];
     reviews?: Page[];
     reactions?: Page[];
     threads?: Page[];
-    events?: Page[][] | null;
     title?: string;
     body?: string;
   } = {},
 ): void {
-  writeJson(root, 'pr.json', prState(opts.labels ?? [], HEAD, opts.title, opts.body));
+  // The changed files, one array per page, as --paginate --slurp prints them.
+  // null = the listing fails. The PR's file count defaults to what is listed.
+  const files = opts.files === undefined ? [[changedFile('docs/notes.md')]] : opts.files;
+  const listed = files === null ? 1 : files.flat().length;
+  writeJson(root, 'pr.json', prState(opts.labels ?? [], HEAD, opts.title, opts.body, opts.changedFiles ?? listed));
+  if (files === null) fs.rmSync(path.join(root, 'files.json'), { force: true });
+  else writeJson(root, 'files.json', files);
   if (opts.baseConfig !== null) fs.writeFileSync(path.join(root, 'labeler--main.yml'), opts.baseConfig ?? RISK_CONFIG);
-  // One Actions listing serves both readers, as the API does: the Risk label
-  // runs `scope` waits on, and the CI runs `merge-check` requires green.
-  const runs = [
-    ...(opts.runs ?? [labelRun('completed', 'success')]),
-    ...(opts.ci ?? [workflowRun('CI', 'completed', 'success')]),
-  ];
+  // One Actions listing, as the API returns it: the Risk label run, which
+  // merge-check leaves out of CI, and the CI runs it requires green.
+  const runs = [labelRun('completed', 'success'), ...(opts.ci ?? [workflowRun('CI', 'completed', 'success')])];
   writeJson(root, 'runs.json', { total_count: runs.length, workflow_runs: runs });
   writeJson(root, `statuses--${HEAD}.json`, opts.statuses ?? []);
   writePage(root, 'comments', 1, connectionPage('comments', opts.comments ?? []));
   writePage(root, 'reviews', 1, connectionPage('reviews', opts.reviews ?? []));
   writePage(root, 'reactions', 1, connectionPage('reactions', opts.reactions ?? []));
   writePage(root, 'reviewThreads', 1, threadsPage(opts.threads ?? []));
-  // The PR's issue events, one array per page. null = the read fails.
-  if (opts.events === null) fs.rmSync(path.join(root, 'events.json'), { force: true });
-  else writeJson(root, 'events.json', opts.events ?? [[]]);
 }
 
-// Runs the helper with any arguments. Each run starts a fresh call log, clock,
-// and posted-comment slot, so assertions describe that run alone. `node` is a
-// stub for the churn classifier (exit MOCK_GATE_STATUS), and the clock advances
-// one second per `date` call so a tiny scope timeout expires deterministically.
+// Runs the helper with any arguments. Each run starts a fresh call log and
+// posted-comment slot, so assertions describe that run alone. `node` is a stub
+// for the churn classifier (exit MOCK_GATE_STATUS).
 function runHelper(root: string, args: string[], env: Record<string, string> = {}) {
   const { bin, calls, sleepLog } = writeMocks(root);
   const posted = path.join(root, 'posted');
-  const clock = path.join(root, 'clock');
-  for (const file of [calls, sleepLog, posted, clock]) fs.rmSync(file, { force: true });
-  fs.writeFileSync(
-    path.join(bin, 'date'),
-    `#!/usr/bin/env bash
-n=$(cat "$MOCK_CLOCK" 2>/dev/null || echo 0)
-echo $((n + 1)) > "$MOCK_CLOCK"
-echo "$n"
-`,
-    { mode: 0o755 },
-  );
+  for (const file of [calls, sleepLog, posted]) fs.rmSync(file, { force: true });
   fs.writeFileSync(
     path.join(bin, 'node'),
     `#!/usr/bin/env bash
@@ -390,9 +390,6 @@ exit 64
       MOCK_DIR: root,
       MOCK_CALLS: calls,
       MOCK_SLEEP_LOG: sleepLog,
-      MOCK_CLOCK: clock,
-      CODEX_REVIEW_SCOPE_TIMEOUT_SECONDS: '2',
-      CODEX_REVIEW_SCOPE_POLL_SECONDS: '1',
       REVIEW_ROUND_CAP: '',
       CODEX_REVIEW_REQUIRED_WORKFLOWS: '',
       ...env,
@@ -642,6 +639,7 @@ describe('codex-review risk-scoped review requests', () => {
       labels: ['risk:high'],
     });
     expect(scope.calls).not.toContain('actions/runs');
+    expect(scope.calls).not.toContain('/files');
 
     const request = runHelper(root, ['request']);
     expect(request.status).toBe(20);
@@ -704,102 +702,41 @@ describe('codex-review risk-scoped review requests', () => {
   });
 
   it.each([
-    [['risk:high'], 'review', 'labeled risk:high'],
-    [['review:requested'], 'review', 'labeled review:requested'],
-    [['PR: Fix'], 'skip', 'set neither risk:high nor review:requested'],
-  ])('reads labels %j as a %s verdict once the Risk label run for this head succeeds', (labels, verdict, reason) => {
+    [['risk:high'], 'labeled risk:high'],
+    [['review:requested'], 'labeled review:requested'],
+    [['review:requested', 'risk:high'], 'labeled review:requested; labeled risk:high'],
+  ])('reviews a head labeled %j that changes no risky file: a label only adds review', (labels, reason) => {
     const root = tempRoot();
     scopeFixture(root, { labels });
 
     const result = runHelper(root, ['scope']);
     expect(result.status).toBe(0);
-    const out = JSON.parse(result.stdout) as { reason: string };
-    expect(out).toMatchObject({ mode: 'risk-scoped', verdict, head: HEAD, labels });
-    expect(out.reason).toContain(reason);
-    expect(result.calls).toContain(
-      `rest repos/example/repository/actions/runs?head_sha=${HEAD}&event=pull_request_target`,
-    );
+    expect(JSON.parse(result.stdout)).toEqual({
+      repo: 'example/repository',
+      pr: 1,
+      head: HEAD,
+      mode: 'risk-scoped',
+      verdict: 'review',
+      labels,
+      reason,
+    });
   });
 
-  it.each([
-    ['still running past the timeout', [labelRun('in_progress', null)], 'still in_progress after 2s'],
-    ['missing', [], 'no Risk label run for this head within 2s'],
-    ['failed', [labelRun('completed', 'failure')], 'concluded failure'],
-    [
-      'completed only for an older head',
-      [labelRun('completed', 'success', OLD_HEAD)],
-      'no Risk label run for this head',
-    ],
-    ['from another workflow', [labelRun('completed', 'success', HEAD, 'Label PR')], 'no Risk label run for this head'],
-  ])('fails closed to review when the labeler run is %s', (_case, runs, reason) => {
-    const root = tempRoot();
-    scopeFixture(root, { labels: [], runs });
-
-    const result = runHelper(root, ['scope']);
-    expect(result.status).toBe(0);
-    const out = JSON.parse(result.stdout) as { verdict: string; reason: string };
-    expect(out.verdict).toBe('review');
-    expect(out.reason).toContain(reason);
-  });
-
-  it('polls a pending labeler run until the deadline before failing closed', () => {
-    const root = tempRoot();
-    scopeFixture(root, { labels: [], runs: [labelRun('queued', null)] });
-
-    const result = runHelper(root, ['scope']);
-    expect(JSON.parse(result.stdout)).toMatchObject({ verdict: 'review' });
-    expect(result.calls.match(/actions\/runs/g)).toHaveLength(2);
-    expect(result.sleep).toBe('1\n');
-  });
-
-  it('fails closed when the head moves while its labeler run is awaited', () => {
-    const root = tempRoot();
-    scopeFixture(root, { labels: [] });
-    writeJson(root, 'pr-2.json', prState([], OTHER_HEAD));
-
-    const result = runHelper(root, ['scope']);
-    const out = JSON.parse(result.stdout) as { reason: string };
-    expect(out).toMatchObject({ verdict: 'review', head: OTHER_HEAD });
-    expect(out.reason).toContain(`the head moved from ${HEAD}`);
-  });
-
-  it.each(['risk:high', 'review:requested'])(
-    'fails closed to review when %s was taken off by hand, reading every page of the label events',
-    (label) => {
-      const root = tempRoot();
-      scopeFixture(root, {
-        labels: [],
-        events: [[labelEvent('labeled', 'risk:high', LABELER)], [labelEvent('unlabeled', label, 'some-agent')]],
-      });
-
-      const scope = runHelper(root, ['scope']);
-      expect(scope.status).toBe(0);
-      const out = JSON.parse(scope.stdout) as { verdict: string; reason: string };
-      expect(out.verdict).toBe('review');
-      expect(out.reason).toContain(`${label} removed by some-agent`);
-      expect(scope.calls).toContain('rest repos/example/repository/issues/1/events?per_page=100\n');
-
-      const merge = runHelper(root, ['merge-check', '--head', HEAD]);
-      expect(merge.status).toBe(24);
-      expect(merge.stderr).toContain(`${label} removed by some-agent`);
-    },
-  );
-
-  it('still skips when only the labeler took risk:high off, whoever removed an unrelated label', () => {
+  it('skips a head that changes no risky file and carries neither scope label, waiting on no labeler run', () => {
     const root = tempRoot();
     scopeFixture(root, {
-      labels: [],
-      events: [
-        [
-          labelEvent('labeled', 'risk:high', LABELER),
-          labelEvent('unlabeled', 'risk:high', LABELER),
-          labelEvent('unlabeled', 'PR: Fix', 'some-agent'),
-        ],
-      ],
+      labels: ['PR: Fix'],
+      files: [[changedFile('docs/notes.md'), changedFile('src/routes.ts'), changedFile('github/ci.yml')]],
     });
 
     const scope = runHelper(root, ['scope']);
-    expect(JSON.parse(scope.stdout)).toMatchObject({ verdict: 'skip' });
+    expect(scope.status).toBe(0);
+    const out = JSON.parse(scope.stdout) as { reason: string };
+    expect(out).toMatchObject({ mode: 'risk-scoped', verdict: 'skip', head: HEAD, labels: ['PR: Fix'] });
+    expect(out.reason).toContain('no changed file matches a risk:high glob');
+    expect(scope.calls).toContain('rest repos/example/repository/pulls/1/files?per_page=100\n');
+    expect(scope.calls).not.toContain('actions/runs');
+    expect(scope.sleep).toBe('');
 
     const merge = runHelper(root, ['merge-check', '--head', HEAD]);
     expect(merge.status).toBe(0);
@@ -807,40 +744,84 @@ describe('codex-review risk-scoped review requests', () => {
   });
 
   it.each([
-    ['labeled once', [labelEvent('labeled', 'risk:high', LABELER)]],
-    [
-      'labeled again after the labeler took it off',
-      [
-        labelEvent('labeled', 'risk:high', LABELER),
-        labelEvent('unlabeled', 'risk:high', LABELER),
-        labelEvent('labeled', 'risk:high', LABELER),
-      ],
-    ],
-  ])('fails closed to review when risk:high, %s, is gone with no unlabeled event', (_name, events) => {
+    ['a file on a risky path', [[changedFile('src/router.ts')]], 'src/router.ts'],
+    ['a new workflow under a dot directory', [[changedFile('.github/workflows/new.yml')]], '.github/workflows/new.yml'],
+    ['a rename off a risky path', [[changedFile('src/routing.ts', 'src/router.ts')]], 'src/router.ts'],
+    ['a risky file on the second page', [[changedFile('docs/a.md')], [changedFile('src/router.ts')]], 'src/router.ts'],
+  ])('reviews a head with no label that changes %s', (_case, files, file) => {
     const root = tempRoot();
-    scopeFixture(root, { labels: [], events: [events] });
+    scopeFixture(root, { labels: [], files });
 
     const scope = runHelper(root, ['scope']);
-    const out = JSON.parse(scope.stdout) as { verdict: string; reason: string };
-    expect(out.verdict).toBe('review');
-    expect(out.reason).toContain('risk:high is gone with no unlabeled event (the label was deleted or renamed)');
+    expect(scope.status).toBe(0);
+    expect(JSON.parse(scope.stdout)).toMatchObject({
+      verdict: 'review',
+      labels: [],
+      reason: `changes risk:high path ${file}`,
+    });
 
     const merge = runHelper(root, ['merge-check', '--head', HEAD]);
     expect(merge.status).toBe(24);
+    expect(merge.stderr).toContain(`no review of this head was requested`);
+    expect(merge.stderr).toContain(`changes risk:high path ${file}`);
   });
 
-  it('fails closed to review when the label events cannot be read', () => {
+  it('names the first three risky paths, counts the rest, then the scope labels', () => {
     const root = tempRoot();
-    scopeFixture(root, { labels: [], events: null });
+    scopeFixture(root, {
+      labels: ['review:requested'],
+      files: [['e', 'd', 'c', 'b', 'a'].map((n) => changedFile(`.github/${n}.yml`)).concat(changedFile('docs/x.md'))],
+    });
+
+    const scope = runHelper(root, ['scope']);
+    expect(JSON.parse(scope.stdout)).toMatchObject({
+      verdict: 'review',
+      reason:
+        'changes risk:high paths .github/a.yml, .github/b.yml, .github/c.yml and 2 more; labeled review:requested',
+    });
+  });
+
+  it.each([
+    ['the changed files cannot be listed', { files: null }, "fail closed: could not list this PR's changed files"],
+    [
+      'the PR changes more files than GitHub listed',
+      { files: [[changedFile('docs/a.md')]], changedFiles: 3001 },
+      'fail closed: the PR changes 3001 files but GitHub listed 1',
+    ],
+    [
+      "the base branch's risk:high holds a second rule, which the labeler would AND",
+      { baseConfig: `${RISK_CONFIG}- changed-files:\n  - any-glob-to-any-file:\n    - 'docs/**'\n` },
+      'is not the one shape codex-review.sh reads',
+    ],
+    [
+      'a base branch risk:high glob uses syntax the matcher does not read',
+      { baseConfig: "risk:high:\n- changed-files:\n  - any-glob-to-any-file:\n    - 'src/{router,delivery}.ts'\n" },
+      'uses syntax codex-review.sh does not match',
+    ],
+  ])('fails closed to review when %s', (_case, fixture, reason) => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: [], ...fixture });
 
     const scope = runHelper(root, ['scope']);
     expect(scope.status).toBe(0);
     const out = JSON.parse(scope.stdout) as { verdict: string; reason: string };
     expect(out.verdict).toBe('review');
-    expect(out.reason).toContain("could not read this PR's label events");
+    expect(out.reason).toContain(reason);
 
     const merge = runHelper(root, ['merge-check', '--head', HEAD]);
     expect(merge.status).toBe(24);
+  });
+
+  it('fails closed when the head moves while its changed files are listed', () => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: [] });
+    writeJson(root, 'pr-2.json', prState([], OTHER_HEAD));
+
+    const result = runHelper(root, ['scope']);
+    expect(result.status).toBe(0);
+    const out = JSON.parse(result.stdout) as { reason: string };
+    expect(out).toMatchObject({ verdict: 'review', head: OTHER_HEAD });
+    expect(out.reason).toContain(`the head moved from ${HEAD} while its changed files were listed`);
   });
 
   it('posts one marked request for the current head when every rule holds', () => {
@@ -1282,7 +1263,7 @@ describe('codex-review risk-scoped review requests', () => {
     expect(result.stdout).toContain('merge=defer mode=legacy');
     expect(result.calls).not.toContain('actions/runs');
     expect(result.calls).not.toContain('statuses');
-    expect(result.calls).not.toContain('/events');
+    expect(result.calls).not.toContain('/files');
     expect(result.calls).not.toMatch(/^comments /m);
   });
 });

@@ -1,4 +1,8 @@
-# Applies `risk:high` from .github/labeler.yml. See that file for what the label means.
+# Applies `risk:high` from .github/labeler.yml, for people to read. See that file for what
+# the label means. The merge gate does not read it to decide scope: it matches the PR's
+# changed files against the same globs itself
+# (container/skills/pr-review-loop/scripts/codex-review.sh), so a label that is late,
+# missing or removed never lets a PR skip review.
 #
 # pull_request_target, not pull_request: the labeler then reads its config from the
 # BASE branch, so a PR cannot edit labeler.yml to drop its own risk label. This is safe

@@ -7,14 +7,14 @@ import { describe, expect, it } from 'vitest';
 /**
  * Drift guard for .github/labeler.yml: `risk:high` is documented as the union of
  * every dimension label's globs (risk:guard, risk:message-path, ...), and the
- * merge gate (container/skills/pr-review-loop/scripts/codex-review.sh) reads only
- * `risk:high`. If someone adds a path to a dimension label without adding it to
+ * merge gate (container/skills/pr-review-loop/scripts/codex-review.sh) matches only
+ * `risk:high`'s globs. If someone adds a path to a dimension label without adding it to
  * risk:high, or vice versa, the two silently drift apart and a reviewer's
  * dimension-scoped view stops matching what actually triggers review.
  *
  * Deliberately not pinned here: the risk:high glob list itself. Dropping a path from
- * it edits labeler.yml, which sits under `.github/**`, and the labeler reads its config
- * from the base branch (.github/workflows/risk-label.yml), so that PR is reviewed.
+ * it edits labeler.yml, which sits under `.github/**`, and the merge gate reads its globs
+ * from the base branch, as the labeler does, so that PR is reviewed.
  */
 
 const LABELER_PATH = path.join(__dirname, '..', '.github', 'labeler.yml');

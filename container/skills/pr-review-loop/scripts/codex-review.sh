@@ -459,15 +459,16 @@ run_gate() {
 
 # ── Risk-scoped repos ────────────────────────────────────────────────────────
 # A repo opts in by defining a top-level `risk:high` key in .github/labeler.yml
-# on the PR's BASE branch. There the `Risk label` workflow (actions/labeler on
-# pull_request_target) labels PRs that touch high-risk paths, Codex automatic
-# review is off, and a round happens only when `request` asks for one. Every
-# other repo is legacy: `scope` answers `auto`, `request` refuses, `merge-check`
-# defers, and no command above this block reads any of it.
+# on the PR's BASE branch. There Codex automatic review is off, a round happens
+# only when `request` asks for one, and `scope` decides whether a head needs
+# one by matching the PR's changed files against those globs itself
+# (risk-scope.jq). The `Risk label` workflow puts the same answer on the PR as
+# a label for people to read; the gate never takes a missing label as an
+# answer. `risk:high` or `review:requested` being present adds review, and
+# nothing takes it away. Every other repo is legacy: `scope` answers `auto`,
+# `request` refuses, `merge-check` defers, and no command above this block
+# reads any of it.
 RISK_LABEL_WORKFLOW='Risk label'
-# The account that workflow labels as. A scope label anyone else took off was
-# removed by hand, so the labels no longer carry the labeler's answer.
-RISK_LABEL_ACTOR='github-actions[bot]'
 # release-policy.py's own contexts are a policy gate, not CI: a pending human approval must never read as ci_pending.
 CI_EXCLUDED_CONTEXTS='["Release policy","Release approval"]'
 # The request marker, hidden in the rendered comment. It is how `request`
@@ -485,145 +486,99 @@ RECEIPT_MARKER_RE='(^|\n)<!-- pr-review-loop:substitute-receipt head=(?<head>[0-
 FIX_TITLE_RE='^\s*fix(\([^)]*\))?!?:'
 FIXES_PR_LINE_RE='(^|\n)Fixes-PR:[ \t]*(#[0-9]+|none)\b'
 
-# `risk-scoped` or `legacy`. Read from BASE through the API, never the
-# checkout: a PR can edit its own copy. A 404 is absence (legacy); any other
-# failure is no verdict, never a guess. gh prints the error body on stdout.
+# Sets SCOPE_MODE to `risk-scoped` or `legacy`, and LABELER_YML to the file it
+# read, so the globs come from the same read as the mode. Read from BASE
+# through the API, never the checkout: a PR can edit its own copy. A 404 is
+# absence (legacy); any other failure is no verdict, never a guess. gh prints
+# the error body on stdout.
+LABELER_YML=""
 repo_mode() {
   local ref raw status=0
   ref=$(jq -rn --arg r "$1" '$r | @uri')
   raw=$(gh api -H 'Accept: application/vnd.github.raw+json' "repos/$REPO/contents/.github/labeler.yml?ref=$ref" 2>/dev/null) || status=$?
   if [ "$status" -ne 0 ]; then
     if printf '%s' "$raw" | jq -e '.status == "404"' >/dev/null 2>&1; then
-      echo legacy
+      SCOPE_MODE=legacy
+      LABELER_YML=""
       return 0
     fi
     echo "could not read .github/labeler.yml on $1 in $REPO" >&2
     return 1
   fi
+  LABELER_YML="$raw"
   if printf '%s\n' "$raw" | grep -Eq "^(risk:high|'risk:high'|\"risk:high\")[[:space:]]*:"; then
-    echo risk-scoped
+    SCOPE_MODE=risk-scoped
   else
-    echo legacy
+    SCOPE_MODE=legacy
   fi
-}
-
-# The newest `Risk label` run for exactly HEAD, polled until it completes.
-# Prints `completed <conclusion>`, `pending <status>` (still running at the
-# deadline), or `missing` (no run for this head by the deadline). The API
-# filters are repeated client-side: a run for an older head is not evidence
-# about this one.
-risk_label_run() {
-  local head="$1" timeout="$2" poll="$3" runs latest state="" start now deadline sleep_seconds
-  start=$(date +%s) || return 1
-  deadline=$((start + timeout))
-  while :; do
-    latest=""
-    if runs=$(gh api "repos/$REPO/actions/runs?head_sha=$head&event=pull_request_target&per_page=100" 2>/dev/null); then
-      latest=$(printf '%s' "$runs" | jq -c --arg name "$RISK_LABEL_WORKFLOW" --arg sha "$head" '
-        [ .workflow_runs[]? | select(.name == $name and .event == "pull_request_target" and .head_sha == $sha) ]
-        | sort_by(.created_at, .id) | last // empty' 2>/dev/null) || latest=""
-    fi
-    if [ -n "$latest" ]; then
-      state=$(printf '%s' "$latest" | jq -r '"\(.status) \(.conclusion // "none")"')
-      case "$state" in completed\ *) echo "$state"; return 0 ;; esac
-    fi
-    now=$(date +%s) || return 1
-    if [ "$now" -ge "$deadline" ]; then
-      if [ -n "$latest" ]; then echo "pending ${state%% *}"; else echo missing; fi
-      return 0
-    fi
-    sleep_seconds="$poll"
-    if [ $((deadline - now)) -lt "$sleep_seconds" ]; then sleep_seconds=$((deadline - now)); fi
-    sleep "$sleep_seconds"
-  done
-}
-
-# Why an absent `risk:high` or `review:requested` might not be the labeler's
-# answer, as one `…; …` line, empty when nothing explains it but the labeler.
-# Called only when both labels are absent, since they are read at merge time
-# and a removal after the labeler ran would pass for its answer. Two causes:
-#   - an `unlabeled` event by anyone but the labeler. `sync-labels` taking
-#     risk:high off once a push stops touching risky paths is the labeler's own
-#     removal and stays allowed.
-#   - more `labeled` than `unlabeled` events for a label that is gone. The label
-#     was deleted or renamed, which may record no event at all. Counting instead
-#     of reading the last event keeps this independent of the API's event order.
-# A failed read returns non-zero, which scope_eval treats as no answer.
-unexplained_scope_removals() {
-  gh api --paginate --slurp "repos/$REPO/issues/$PR/events?per_page=100" \
-    | jq -r --arg bot "$RISK_LABEL_ACTOR" '
-      [ .[][] | select(.event == "labeled" or .event == "unlabeled")
-        | select(.label.name == "risk:high" or .label.name == "review:requested") ] as $events
-      | [ ( $events[] | select(.event == "unlabeled" and (.actor.login // "") != $bot)
-            | "\(.label.name) removed by \(.actor.login // "an unknown account")" ),
-          ( $events | group_by(.label.name)[]
-            | select((map(select(.event == "labeled")) | length) > (map(select(.event == "unlabeled")) | length))
-            | "\(.[0].label.name) is gone with no unlabeled event (the label was deleted or renamed)" ) ]
-      | join("; ")'
 }
 
 # Sets SCOPE_HEAD SCOPE_MODE SCOPE_VERDICT SCOPE_LABELS SCOPE_REASON for the
 # PR's current head. Returns 1 only when there is no verdict at all.
+#
+# The verdict is computed from the diff, never read off a label: a label says
+# only what whoever last edited it wanted, and a PR's own workflow can be the
+# editor. `review` when a changed file matches a risk:high glob from BASE's
+# labeler.yml — its path, or for a rename its old path too, since moving a file
+# off a risky path changes that path — or when risk:high or review:requested is
+# on the PR. Anything that keeps the files from being judged is `review` as
+# well: a failed listing, a listing shorter than the PR's file count (GitHub
+# lists at most 3000), a head that moved while they were read, and a labeler.yml
+# risk-scope.jq cannot read.
 SCOPE_HEAD=""
 SCOPE_MODE=""
 SCOPE_VERDICT=""
 SCOPE_LABELS="[]"
 SCOPE_REASON=""
 scope_eval() {
-  local pr_json base run after removed
-  local timeout="${CODEX_REVIEW_SCOPE_TIMEOUT_SECONDS:-300}" poll="${CODEX_REVIEW_SCOPE_POLL_SECONDS:-10}"
-  if ! [[ "$timeout" =~ ^[0-9]+$ ]] || ! [[ "$poll" =~ ^[1-9][0-9]*$ ]]; then
-    echo "CODEX_REVIEW_SCOPE_TIMEOUT_SECONDS must be a whole number of seconds, CODEX_REVIEW_SCOPE_POLL_SECONDS a positive one" >&2
-    exit 2
-  fi
+  local pr_json base files after decision
   pr_json=$(gh pr view "$PR" --repo "$REPO" --json headRefOid,baseRefName,labels) || return 1
   SCOPE_HEAD=$(printf '%s' "$pr_json" | jq -er .headRefOid) || return 1
   base=$(printf '%s' "$pr_json" | jq -er .baseRefName) || return 1
   SCOPE_LABELS=$(printf '%s' "$pr_json" | jq -c '[.labels[]?.name]') || return 1
-  SCOPE_MODE=$(repo_mode "$base") || return 1
+  repo_mode "$base" || return 1
   if [ "$SCOPE_MODE" = legacy ]; then
     SCOPE_VERDICT=auto
     SCOPE_REASON="no top-level risk:high in .github/labeler.yml on $base; automatic review handles this repo"
     return 0
   fi
-  # Fail closed: `skip` needs the labeler's completed answer for THIS head. A
-  # push that touches a risky path is unlabeled until that run lands, and a
-  # verdict read in between would skip exactly the PR the label exists for.
-  run=$(risk_label_run "$SCOPE_HEAD" "$timeout" "$poll") || return 1
   SCOPE_VERDICT=review
-  case "$run" in
-    "completed success") ;;
-    completed\ *) SCOPE_REASON="fail closed: the $RISK_LABEL_WORKFLOW run for this head concluded ${run#completed }"; return 0 ;;
-    missing) SCOPE_REASON="fail closed: no $RISK_LABEL_WORKFLOW run for this head within ${timeout}s"; return 0 ;;
-    *) SCOPE_REASON="fail closed: the $RISK_LABEL_WORKFLOW run for this head was still ${run#pending } after ${timeout}s"; return 0 ;;
-  esac
-  # Head and labels in ONE read, after the run: the labels are the labeler's
-  # answer only while the head is still the one it labeled.
-  pr_json=$(gh pr view "$PR" --repo "$REPO" --json headRefOid,labels) || return 1
+  files=$(gh api --paginate --slurp "repos/$REPO/pulls/$PR/files?per_page=100") || {
+    SCOPE_REASON="fail closed: could not list this PR's changed files"
+    return 0
+  }
+  # Head, labels and file count in ONE read, after the listing: the files
+  # describe this head only if it did not move while they were read.
+  pr_json=$(gh pr view "$PR" --repo "$REPO" --json headRefOid,labels,changedFiles) || return 1
   after=$(printf '%s' "$pr_json" | jq -er .headRefOid) || return 1
   SCOPE_LABELS=$(printf '%s' "$pr_json" | jq -c '[.labels[]?.name]') || return 1
   if [ "$after" != "$SCOPE_HEAD" ]; then
-    SCOPE_REASON="fail closed: the head moved from $SCOPE_HEAD while its $RISK_LABEL_WORKFLOW run was awaited"
+    SCOPE_REASON="fail closed: the head moved from $SCOPE_HEAD while its changed files were listed"
     SCOPE_HEAD="$after"
     return 0
   fi
-  if printf '%s' "$SCOPE_LABELS" | jq -e 'index("risk:high")' >/dev/null; then
-    SCOPE_REASON="labeled risk:high"
-  elif printf '%s' "$SCOPE_LABELS" | jq -e 'index("review:requested")' >/dev/null; then
-    SCOPE_REASON="labeled review:requested"
-  else
-    # Absent labels are the labeler's answer only if nothing else explains them.
-    removed=$(unexplained_scope_removals) || {
-      SCOPE_REASON="fail closed: could not read this PR's label events to rule out a hand-removed risk:high or review:requested"
-      return 0
-    }
-    if [ -n "$removed" ]; then
-      SCOPE_REASON="fail closed: $removed; only the $RISK_LABEL_WORKFLOW workflow ($RISK_LABEL_ACTOR) may take a scope label off"
-      return 0
-    fi
-    SCOPE_VERDICT=skip
-    SCOPE_REASON="the $RISK_LABEL_WORKFLOW run for this head succeeded and set neither risk:high nor review:requested"
-  fi
+  # The listing goes through stdin, not --argjson: 3000 files can exceed the
+  # kernel's per-argument limit. The reason names the first few matches.
+  decision=$(printf '%s' "$files" | jq -c -L "$HERE" --arg yml "$LABELER_YML" --argjson pr "$pr_json" '
+    include "risk-scope";
+    [ $pr.labels[]?.name | select(. == "risk:high" or . == "review:requested") | "labeled \(.)" ] as $labeled
+    | (try (
+        ($yml | risk_high_globs | map(glob_regex)) as $regexes
+        | if type == "array" and all(.[]; type == "array") then [ .[][] ] else error("the changed-file listing is not a list of pages") end
+        | if all(.[]; (.filename | type) == "string") then . else error("a changed file has no filename") end
+        | ([ .[].filename ] | unique | length) as $listed
+        | if ($pr.changedFiles | type) != "number" then error("GitHub did not say how many files this PR changes")
+          elif $pr.changedFiles > $listed then error("the PR changes \($pr.changedFiles) files but GitHub listed \($listed), and it lists at most 3000")
+          else . end
+        | [ .[] | .filename, (.previous_filename // empty) ] | unique | matching($regexes)
+        | if length == 0 then []
+          else [ "changes risk:high path\(if length > 1 then "s" else "" end) \(.[:3] | join(", "))\(if length > 3 then " and \(length - 3) more" else "" end)" ] end
+      ) catch [ "fail closed: \(.)" ])
+    | . + $labeled
+    | if length == 0 then { verdict: "skip", reason: "no changed file matches a risk:high glob in .github/labeler.yml, and neither risk:high nor review:requested is on the PR" }
+      else { verdict: "review", reason: join("; ") } end') || return 1
+  SCOPE_VERDICT=$(printf '%s' "$decision" | jq -er .verdict) || return 1
+  SCOPE_REASON=$(printf '%s' "$decision" | jq -er .reason) || return 1
 }
 
 # Review requests `request` has posted on this PR, oldest first:
@@ -685,9 +640,9 @@ receipt_outcome() {
 # Only the newest run per workflow name counts, since a rerun leaves the failed
 # run it replaced in the list, and only the newest status per context, since
 # /statuses keeps every status ever posted. The Risk label run is left out: it
-# decides the scope, and counting it would pass a head no CI ever ran on. The
-# pages go through stdin, not --argjson, because a page of runs can exceed the
-# kernel's per-argument limit.
+# only labels the PR for people to read, and counting it would pass a head no
+# CI ever ran on. The pages go through stdin, not --argjson, because a page of
+# runs can exceed the kernel's per-argument limit.
 ci_verdict() {
   local runs statuses required="${CODEX_REVIEW_REQUIRED_WORKFLOWS:-CI}"
   runs=$(gh api --paginate --slurp "repos/$REPO/actions/runs?head_sha=$1&per_page=100") || return 1
