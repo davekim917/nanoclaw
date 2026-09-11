@@ -924,7 +924,7 @@
 "src/session-manager.attachments.test.ts":{"diff":11,"mode":"100644","sha256":"6e67158f9257cff6d70d2287d8f4737c9f138bc8bfd7a88d81fdad5acbd9dc7b"},
 "src/session-manager.feeds.test.ts":{"diff":82,"mode":"100644","sha256":null,"deleted":true},
 "src/session-manager.test.ts":{"diff":2583,"mode":"100644","sha256":"0f9dc1c13e558fd0140ca5650005e7cf24ba1c4b989371d20a2bfbcb638a1713"},
-"src/session-manager.ts":{"diff":1957,"mode":"100644","sha256":"be8638860b2812f03f4a3ed4ffe02618805fc1a1637f11c6894f5cff5fbb51b5"},
+"src/session-manager.ts":{"diff":1957,"mode":"100644","sha256":"99fa5d3fd27c4d917e8aa7b78e8babd04b66e739f38c0796a7e028febf79caef"},
 "src/state-sqlite.test.ts":{"diff":50,"mode":"100644","sha256":"9721430c93a71b869a0578794f4bdedca0eef8eaf8833becbc6fe18068bdbf38"},
 "src/state-sqlite.ts":{"diff":266,"mode":"100644","sha256":"2184bf520a4361e46302b8d938e0f616ace31fb59d15a8d3348a7e2bf218098d"},
 "src/templates/create-agent.test.ts":{"diff":195,"mode":"100644","sha256":"6c1472810da949b6fd83b3c62cf93bb632db8b6f5c8cb23caf9eb10cfbd54e78"},

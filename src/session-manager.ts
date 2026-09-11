@@ -940,7 +940,7 @@ export interface WriteSessionMessageOptions {
   guard?: WriteGuard;
   /**
    * Keep the host-only `origin` and `event` fields in the content. Every other
-   * write has them removed (withoutHostFields), so the runner's `origin="host"`
+   * chat write has them removed (withoutHostFields), so the runner's `origin="host"`
    * and `event="..."` markers (container/agent-runner/src/formatter.ts) can only
    * come from the host's own notes: a person or a peer agent controls `sender`
    * and `senderId` in content they author, but never a field that survives this
@@ -1157,7 +1157,7 @@ async function writeSessionMessageLocked(
 
   // Extract base64 attachment data, save to inbox, replace with file paths
   // The host-only fields survive only a host note (WriteSessionMessageOptions.hostOrigin).
-  const messageContent = hostOrigin ? message.content : withoutHostFields(message.content);
+  const messageContent = hostOrigin ? message.content : withoutHostFields(message.content, message.kind);
   const { content, writtenPaths } = extractAttachmentFiles(agentGroupId, sessionId, message.id, messageContent);
 
   // Scheduled occurrences are always inert until the due-time admission seam
