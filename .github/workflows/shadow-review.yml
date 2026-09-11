@@ -214,15 +214,23 @@ jobs:
           content=$(gh api -H 'Accept: application/vnd.github.raw+json' \
             "repos/$REPO/contents/container/agents/worker-high.md?ref=$BASE_SHA")
 
+          # Normalize CRLF/lone-CR line endings the same way the generator's
+          # frontmatterOf() does, before anything else looks at line breaks.
+          content=$(printf '%s' "$content" | tr -d '\r')
+
           # Scope to the frontmatter block ONLY (between the first two `---`
-          # lines) — a whole-file regex could match a decoy `model:` line in
-          # the body (the description below this once did). Mirrors
-          # scripts/reviewer-models.ts's frontmatterOf()/extractScalar(),
-          # reimplemented in bash since this step has no Node/tsx runtime.
+          # lines), and ONLY if a closing `---` is actually present. Buffered,
+          # not streamed: awk exiting mid-file on an unclosed frontmatter
+          # would otherwise have already printed every line up to EOF,
+          # including the body — so a body `model:` line would read as if it
+          # were in frontmatter. Mirrors scripts/reviewer-models.ts's
+          # frontmatterOf()/extractScalar(), reimplemented in bash since this
+          # step has no Node/tsx runtime.
           frontmatter=$(printf '%s\n' "$content" | awk '
             NR==1 && $0=="---" { infm=1; next }
-            infm && $0=="---" { exit }
-            infm { print }
+            infm && $0=="---" { closed=1; exit }
+            infm { buf = buf $0 "\n" }
+            END { if (closed) printf "%s", buf }
           ')
 
           # `grep -m1` exits 1 on no match, and under pipefail that becomes
@@ -243,6 +251,11 @@ jobs:
             ')
           fi
 
+          # Trailing whitespace on the value — parity with the generator's own
+          # line-oriented handling, so "model: claude-opus-5[1m]  " (trailing
+          # spaces) resolves the same id here as it would there.
+          value=$(printf '%s' "$value" | sed -E 's/[[:space:]]+$//')
+
           # Strip a wrapping quote pair, then a trailing [1m] context-window
           # suffix (case-insensitive) — same normalization the generator does.
           case "$value" in
@@ -252,11 +265,21 @@ jobs:
           value="${value%\[1[Mm]\]}"
           model="$value"
 
-          # Reject anything that isn't a bare model id — a trailing comment or
-          # extra words (extractScalar isn't a full YAML parser, so either
-          # reads back as part of the value) would otherwise silently name the
-          # wrong --model.
-          if [ -z "$model" ] || ! printf '%s' "$model" | grep -qE '^[A-Za-z0-9._-]+$'; then
+          # Reject anything that isn't a bare model id, matching
+          # assertConcreteModelId's two checks in scripts/reviewer-models.ts:
+          # a bare alias with no digit ("opus", "sonnet", "inherit"), and any
+          # shape that isn't purely id characters (a trailing comment or extra
+          # words — extractScalar isn't a full YAML parser, so either reads
+          # back as part of the value) would otherwise silently name the wrong
+          # --model.
+          case "$model" in
+            *[0-9]*) ;;
+            *)
+              echo "could not resolve a valid worker-high model id from container/agents/worker-high.md@$BASE_SHA (no versioned 'model:' frontmatter scalar found)" >&2
+              exit 1
+              ;;
+          esac
+          if ! printf '%s' "$model" | grep -qE '^[A-Za-z0-9._-]+$'; then
             echo "could not resolve a valid worker-high model id from container/agents/worker-high.md@$BASE_SHA (no bare 'model:' frontmatter scalar found)" >&2
             exit 1
           fi

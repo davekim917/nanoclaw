@@ -509,6 +509,7 @@ FIXES_PR_LINE_RE='(^|\n)Fixes-PR:[ \t]*(#[0-9]+|none)\b'
 # below). The one supported extraction (mergers typically run this from
 # outside the repo entirely, so the destination is a scratch dir):
 #   SP=<scratch dir>
+#   git -C <repo> fetch origin main
 #   mkdir -p "$SP" && git -C <repo> archive origin/main container/skills/pr-review-loop | tar -x -C "$SP"
 #   "$SP"/container/skills/pr-review-loop/scripts/codex-review.sh ...
 # A single-file extraction (copying just codex-review.sh) or `bash <(git show

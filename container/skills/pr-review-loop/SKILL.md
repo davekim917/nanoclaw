@@ -433,6 +433,7 @@ A repo is **risk-scoped** when `.github/labeler.yml` on the PR's base branch def
 
    ```bash
    SP=<scratch dir>
+   git -C <repo> fetch origin main
    mkdir -p "$SP" && git -C <repo> archive origin/main container/skills/pr-review-loop | tar -x -C "$SP"
    "$SP"/container/skills/pr-review-loop/scripts/codex-review.sh merge-check --head "$SHA"
    ```
