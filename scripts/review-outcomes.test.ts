@@ -492,4 +492,47 @@ describe('computeReport', () => {
     expect(report.after.shadowReviewFailed).toBe(0);
     expect(report.after.shadowReviewFailedPRs).toEqual([]);
   });
+
+  it('counts a clean re-run (shadow-reviewed label, no issue) as reviewed and not failed', () => {
+    const prs = [pr({ number: 9, title: 'feat: i', mergedAt: '2026-09-11T00:00:00Z', files: ['docs/i.md'] })];
+    // No issue — a clean review posts a PR comment, not an issue — and the PR is no
+    // longer in the shadow-review-failed list (report's success path removes it).
+    const report = computeReport(prs, RISK_GLOBS, options, [], [], [9]);
+    expect(report.after.shadowReviewed).toBe(1);
+    expect(report.after.shadowReviewedPRs).toEqual([9]);
+    expect(report.after.shadowReviewP1).toBe(0);
+    expect(report.after.shadowReviewFailed).toBe(0);
+  });
+
+  it('counts a P1 re-run (shadow-reviewed label AND an issue) as reviewed, P1, and not failed', () => {
+    const prs = [pr({ number: 10, title: 'feat: j', mergedAt: '2026-09-11T00:00:00Z', files: ['docs/j.md'] })];
+    const issues: ShadowReviewIssueData[] = [shadowReviewIssue({ number: 10, body: '- **P1** — a.ts:1 — bad' })];
+    const report = computeReport(prs, RISK_GLOBS, options, issues, [], [10]);
+    expect(report.after.shadowReviewed).toBe(1);
+    expect(report.after.shadowReviewedPRs).toEqual([10]);
+    expect(report.after.shadowReviewP1).toBe(1);
+    expect(report.after.shadowReviewP1PRs).toEqual([10]);
+    expect(report.after.shadowReviewFailed).toBe(0);
+  });
+
+  it('still counts a PR reviewed via issue alone as reviewed, with no shadow-reviewed label (pre-label history)', () => {
+    const prs = [pr({ number: 11, title: 'feat: k', mergedAt: '2026-09-11T00:00:00Z', files: ['docs/k.md'] })];
+    const issues: ShadowReviewIssueData[] = [shadowReviewIssue({ number: 11, body: '- **P2** — a.ts:1 — minor' })];
+    // No shadow-reviewed label numbers passed at all — this PR predates the label.
+    const report = computeReport(prs, RISK_GLOBS, options, issues);
+    expect(report.after.shadowReviewed).toBe(1);
+    expect(report.after.shadowReviewedPRs).toEqual([11]);
+  });
+
+  it('counts a PR carrying both shadow-reviewed and shadow-review-failed labels as reviewed (mid-transition)', () => {
+    const prs = [pr({ number: 12, title: 'feat: l', mergedAt: '2026-09-11T00:00:00Z', files: ['docs/l.md'] })];
+    // Both label lists name #12: the success path's label-add and the failure path's
+    // label-remove are separate, independently-failable gh calls, so a PR can carry
+    // both mid-transition. It must still count as reviewed — see the file header.
+    const report = computeReport(prs, RISK_GLOBS, options, [], [12], [12]);
+    expect(report.after.shadowReviewed).toBe(1);
+    expect(report.after.shadowReviewedPRs).toEqual([12]);
+    expect(report.after.shadowReviewFailed).toBe(1);
+    expect(report.after.shadowReviewFailedPRs).toEqual([12]);
+  });
 });
