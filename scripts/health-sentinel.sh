@@ -111,6 +111,14 @@ if [ "$PREV_LOG_OFF" -gt 0 ] || [ "$PREV_ERR_OFF" -gt 0 ]; then
     BREACHES+=("sweep|$SLOW_SWEEPS sweep tick(s) over $((SWEEP_MS_MAX / 1000))s in the last window (control-plane saturation)")
   fi
 
+  # A tick the host abandoned after it hung past the stall bound (#637). Before
+  # that bound, a hung tick left the sweep dead with every vital here green:
+  # a dead sweep logs no slow ticks and no errors.
+  STALLED_SWEEPS=$(window_err | grep -c "Host sweep tick stalled" || true)
+  if [ "$STALLED_SWEEPS" -ge 1 ]; then
+    BREACHES+=("sweep-stalled|$STALLED_SWEEPS sweep tick(s) hung past the stall bound and were abandoned — the stuck duty is named in logs/nanoclaw.error.log")
+  fi
+
   # A session whose container repeatedly exits non-zero is an agent that
   # silently never answers (wake -> crash -> re-wake). Observed live: a
   # schema-migration gap crash-looped a channel session for weeks with user

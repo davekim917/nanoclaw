@@ -43,6 +43,9 @@ vi.mock('./db/agent-groups.js', async (importOriginal) => {
 // cadence, its own guard, or its own DB access is left alone: the reschedule
 // property is about the tick completing and re-arming, not about doing less.
 const spawnAttempts = vi.hoisted(() => [] as string[]);
+// T13 (storage-maintenance) runs after T6 (orchestrator-reconciler) in
+// tick:post-session, so its call count shows how far a tick got.
+const storageRuns = vi.hoisted(() => ({ count: 0 }));
 
 /**
  * A tripwire, not a functional mock. It records the call (every caller here
@@ -76,7 +79,10 @@ vi.mock('./egress-lockdown.js', async (importOriginal) => ({
 }));
 vi.mock('./storage-maintenance-worker.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./storage-maintenance-worker.js')>()),
-  runStorageMaintenanceInBackground: async () => null,
+  runStorageMaintenanceInBackground: async () => {
+    storageRuns.count++;
+    return null;
+  },
   stopStorageMaintenanceWorker: () => undefined,
 }));
 vi.mock('./storage-pressure-alert.js', async (importOriginal) => ({
@@ -116,12 +122,15 @@ vi.mock('./dashboard/db/dashboard-tokens.js', async (importOriginal) => ({
   pruneDashboardTokens: () => undefined,
 }));
 
-import { SWEEP_INTERVAL_MS, startHostSweep, stopHostSweep } from './host-sweep.js';
+import { SWEEP_INTERVAL_MS, SWEEP_TICK_STALL_MS, startHostSweep, stopHostSweep } from './host-sweep.js';
 import { log } from './log.js';
 // T6 orchestrator-reconciler now lives in this family module, registering at
 // import — needed so the case below (which drives a whole real tick through
 // the registry) actually finds it registered. See src/modules/index.ts.
 import './modules/sweep-orchestrator/index.js';
+// T13 (storage-maintenance), the probe for how far a tick got; its body is the
+// storage worker mock above.
+import './modules/sweep-storage/index.js';
 
 describe('host sweep reschedule', () => {
   beforeEach(() => {
@@ -130,6 +139,7 @@ describe('host sweep reschedule', () => {
     activeSessions.rows = [];
     // Truncate, never reassign: the tripwire factory closed over THIS array.
     spawnAttempts.length = 0;
+    storageRuns.count = 0;
   });
 
   afterEach(() => {
@@ -157,6 +167,44 @@ describe('host sweep reschedule', () => {
     await vi.waitFor(() => expect(mockRunReconcilerSweep).toHaveBeenCalledTimes(2));
     await vi.advanceTimersByTimeAsync(SWEEP_INTERVAL_MS);
     await vi.waitFor(() => expect(mockRunReconcilerSweep).toHaveBeenCalledTimes(3));
+  });
+
+  // A tick that never SETTLES, where the case above throws. Live 2026-09-11: a
+  // duty awaited through an event-loop stall never resumed, the chain never
+  // re-armed, and the sweep stayed dead ~7h with no error (#637).
+  it('abandons a tick stuck on a duty that never settles, names the duty, and keeps ticking', async () => {
+    let release: () => void = () => {};
+    mockRunReconcilerSweep.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    const error = vi.spyOn(log, 'error').mockImplementation(() => {});
+
+    startHostSweep();
+    await vi.waitFor(() => expect(mockRunReconcilerSweep).toHaveBeenCalledTimes(1));
+    expect(storageRuns.count).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(SWEEP_TICK_STALL_MS);
+    await vi.waitFor(() =>
+      expect(error).toHaveBeenCalledWith(
+        'Host sweep tick stalled — abandoning it and rescheduling',
+        expect.objectContaining({ duty: 'orchestrator-reconciler', window: 'tick:post-session' }),
+      ),
+    );
+
+    // The next tick runs, all the way through.
+    await vi.advanceTimersByTimeAsync(SWEEP_INTERVAL_MS);
+    await vi.waitFor(() => expect(mockRunReconcilerSweep).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(storageRuns.count).toBe(1));
+
+    // The stuck duty finally settles. The abandoned tick stops at its next
+    // checkpoint instead of running the rest of its phase.
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(storageRuns.count).toBe(1);
+    error.mockRestore();
   });
 
   // A session the host cannot open used to return the same silent quiet-until

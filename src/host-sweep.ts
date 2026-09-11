@@ -598,15 +598,21 @@ export function dutyFailureFields(err: unknown): { duty?: string; window?: Sweep
 }
 
 async function runDutyBody<T>(duty: string, window: SweepWindow, body: () => T | Promise<T>): Promise<T> {
+  const entry = { duty, window, startedAtMs: Date.now() }; // what a stalled tick names (#637)
+  activeDuties.push(entry);
   try {
     return await body();
   } catch (err) {
     throw tagDutyFailure(err, duty, window);
+  } finally {
+    const index = activeDuties.indexOf(entry);
+    if (index !== -1) activeDuties.splice(index, 1);
   }
 }
 
-async function runTickPhase(ctx: SweepTickContext, phase: SweepPhase): Promise<void> {
+async function runTickPhase(ctx: SweepTickContext, phase: SweepPhase, generation: number): Promise<void> {
   for (const duty of dutiesForPhase(phase)) {
+    if (generation !== tickGeneration) return; // abandoned (#637): never run beside its replacement
     try {
       await runDutyBody(duty.name, phase, () => duty.run(ctx));
     } catch (err) {
@@ -909,6 +915,13 @@ export type SessionRunner = <T>(action: (mailbox: NanoclawMailboxSession) => T |
 
 let running = false;
 
+/** A tick past this is stuck on an await that may never settle; it is abandoned (#637). */
+export const SWEEP_TICK_STALL_MS = 5 * 60_000;
+/** Bumped at each tick start and on abandonment; a tick compares it at its checkpoints. */
+let tickGeneration = 0;
+/** Duty bodies in flight, innermost last: what a stalled tick is stuck in. */
+const activeDuties: Array<{ duty: string; window: SweepWindow; startedAtMs: number }> = [];
+
 export function startHostSweep(): void {
   if (running) return;
   running = true;
@@ -937,22 +950,48 @@ export function stopHostSweep(): void {
 let quietCacheWarmed = false;
 
 async function sweep(): Promise<void> {
+  const generation = ++tickGeneration;
+  let stallTimer: ReturnType<typeof setTimeout> | undefined;
   try {
-    // Once, before the first tick's body, never per tick: a warm that ran
-    // every tick would be a second source of truth racing the map the tick is
-    // writing. It is awaited here (the warm reads the central DB through the
-    // async driver) so the first tick starts from the warmed map.
-    if (!quietCacheWarmed) {
-      quietCacheWarmed = true;
-      await warmQuietSessionCache();
-    }
-    await sweepOnce();
+    const tick = (async () => {
+      // Once, before the first tick's body, never per tick: a warm that ran
+      // every tick would be a second source of truth racing the map the tick is
+      // writing. It is awaited here (the warm reads the central DB through the
+      // async driver) so the first tick starts from the warmed map.
+      if (!quietCacheWarmed) {
+        quietCacheWarmed = true;
+        await warmQuietSessionCache();
+      }
+      await sweepOnce(generation);
+      return 'done' as const;
+    })();
+    // A throw is caught below; a tick that never settles held the reschedule
+    // forever (#637: dead ~7h on 2026-09-11, every vital green). Race it
+    // against the stall bound; a loser that resumes stops at its checkpoints.
+    const stalled = new Promise<'stalled'>((resolve) => {
+      stallTimer = setTimeout(() => resolve('stalled'), SWEEP_TICK_STALL_MS);
+    });
+    if ((await Promise.race([tick, stalled])) === 'stalled') abandonStalledTick(generation);
   } catch (err) {
     log.error('Host sweep tick threw — rescheduling anyway', { err });
+  } finally {
+    clearTimeout(stallTimer);
   }
   setTimeout(() => {
     void sweep();
   }, SWEEP_INTERVAL_MS);
+}
+
+function abandonStalledTick(generation: number): void {
+  const stuck = activeDuties.at(-1);
+  if (tickGeneration === generation) tickGeneration++;
+  activeDuties.length = 0; // the abandoned tick's entries must not be blamed for the next stall
+  log.error('Host sweep tick stalled — abandoning it and rescheduling', {
+    stallMs: SWEEP_TICK_STALL_MS,
+    duty: stuck?.duty ?? null,
+    window: stuck?.window ?? null,
+    dutyElapsedMs: stuck ? Date.now() - stuck.startedAtMs : null,
+  });
 }
 
 /**
@@ -989,7 +1028,7 @@ export function _lastSweepTickStatsForTesting(): {
   return { ...lastTickStats };
 }
 
-async function sweepOnce(): Promise<void> {
+async function sweepOnce(generation: number): Promise<void> {
   // Stall attribution: the sweep is the main 60s-periodic bulk worker, so a
   // slow tick is the first suspect whenever the event-loop stall detector
   // fires. One line per slow tick, with the per-session share, convicts or
@@ -1019,7 +1058,7 @@ async function sweepOnce(): Promise<void> {
     },
   };
 
-  await runTickPhase(tick, 'tick:pre-session');
+  await runTickPhase(tick, 'tick:pre-session', generation);
 
   try {
     sessions = await getActiveSessions();
@@ -1049,6 +1088,7 @@ async function sweepOnce(): Promise<void> {
   // never reaches the write.
   const newQuietMarks: QuietSessionMark[] = [];
   for (const session of sessions) {
+    if (generation !== tickGeneration) return; // abandoned (#637): sweep no further
     const mark = quietSessions.get(session.id);
     if (mark && Date.now() < mark.skipUntilMs && mark.lastActive === session.last_active) {
       skippedQuiet++;
@@ -1129,8 +1169,9 @@ async function sweepOnce(): Promise<void> {
     });
   }
 
-  await runTickPhase(tick, 'tick:post-session');
-  await runTickPhase(tick, 'tick:housekeeping');
+  await runTickPhase(tick, 'tick:post-session', generation);
+  await runTickPhase(tick, 'tick:housekeeping', generation);
+  if (generation !== tickGeneration) return; // abandoned (#637): the stats belong to the live tick
 
   lastTickStats.ticks++;
   lastTickStats.sweptSessions = sweptSessions;
@@ -1165,7 +1206,7 @@ export async function _sweepOnceForTesting(): Promise<void> {
   const wasRunning = running;
   running = true;
   try {
-    await sweepOnce();
+    await sweepOnce(++tickGeneration);
   } finally {
     running = wasRunning;
   }

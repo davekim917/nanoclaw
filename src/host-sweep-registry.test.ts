@@ -1385,6 +1385,7 @@ describe('sweep duty registry (S2-PR2)', () => {
       'startHostSweep',
       'stopHostSweep',
       'SWEEP_INTERVAL_MS',
+      'SWEEP_TICK_STALL_MS',
       'ABSOLUTE_CEILING_MS',
       'CLAIM_STUCK_MS',
       'SPAWN_GRACE_MS',
@@ -1521,7 +1522,16 @@ describe('sweep duty registry (S2-PR2)', () => {
     // two lines this file's own count had spare. The duty BODY is in
     // `src/modules/sweep-task-escalation/index.ts`, which is the property the
     // three structural assertions above pin and the reason this number exists.
-    expect(source.split('\n').length).toBeLessThanOrEqual(1462);
+    //
+    // **Raised 1,462 → 1,503 by #637 (sweep stall bound).** Measured to the
+    // line, zero headroom. The addition is driver mechanics, not a duty body:
+    // - the tick chain races each tick against `SWEEP_TICK_STALL_MS` and
+    //   re-arms past it;
+    // - `runDutyBody` records the duty in flight, so the abandonment names it;
+    // - generation checkpoints stop an abandoned tick that later resumes.
+    // A tick that never settled left the sweep dead ~7h on 2026-09-11 with
+    // every vital green. The three structural assertions above are unchanged.
+    expect(source.split('\n').length).toBeLessThanOrEqual(1503);
     expect(h.spawns).toEqual([]);
   });
 
