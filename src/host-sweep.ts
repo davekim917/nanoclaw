@@ -915,8 +915,8 @@ export type SessionRunner = <T>(action: (mailbox: NanoclawMailboxSession) => T |
 
 let running = false;
 
-/** A tick past this is stuck on an await that may never settle; it is abandoned (#637). */
-export const SWEEP_TICK_STALL_MS = 5 * 60_000;
+/** A tick past this is stuck on an await that may never settle; it is abandoned (#637). 2× the worst live tick (7m30s, #516). */
+export const SWEEP_TICK_STALL_MS = 15 * 60_000;
 /** Bumped at each tick start and on abandonment; a tick compares it at its checkpoints. */
 let tickGeneration = 0;
 /** Duty bodies in flight, innermost last: what a stalled tick is stuck in. */
