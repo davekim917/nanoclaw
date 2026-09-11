@@ -80,6 +80,11 @@ function writeMocks(root: string): { bin: string; calls: string; sleepLog: strin
     path.join(bin, 'gh'),
     `#!/usr/bin/env bash
 set -euo pipefail
+# MOCK_SWAP_SCRIPT: at the run's first gh call, overwrite that file in place with evil.sh.
+if [ -n "\${MOCK_SWAP_SCRIPT:-}" ] && [ ! -f "$MOCK_DIR/swapped" ]; then
+  cat "$MOCK_DIR/evil.sh" > "$MOCK_SWAP_SCRIPT"
+  touch "$MOCK_DIR/swapped"
+fi
 if [ "$1" = pr ]; then
   printf 'pr %s\\n' "$2" >> "$MOCK_CALLS"
   if [ "$2" = view ]; then
@@ -317,6 +322,7 @@ function labelRun(status: string, conclusion: string | null, head = HEAD, name =
     status,
     conclusion,
     created_at: '2026-09-05T00:00:30Z',
+    updated_at: '2026-09-05T00:00:30Z',
   };
 }
 
@@ -328,13 +334,15 @@ function marker(head: string, round: number, createdAt = '2026-09-05T00:05:00Z')
   );
 }
 
-// An Actions run of one workflow on a head, as `actions/runs?head_sha=` lists it.
+// An Actions run of one workflow on a head, as `actions/runs?head_sha=` lists it;
+// updatedAt is when it last changed, which for a finished run is when it finished.
 function workflowRun(
   name: string,
   status: string,
   conclusion: string | null,
   startedAt = '2026-09-05T00:01:00Z',
   head = HEAD,
+  updatedAt = startedAt,
 ): Page {
   return {
     id: Date.parse(startedAt) / 1000,
@@ -345,6 +353,7 @@ function workflowRun(
     conclusion,
     created_at: startedAt,
     run_started_at: startedAt,
+    updated_at: updatedAt,
   };
 }
 
@@ -445,10 +454,11 @@ function scopeFixture(
 // Runs the helper with any arguments. Each run starts a fresh call log and
 // posted-comment slot, so assertions describe that run alone. `node` is a stub
 // for the churn classifier (exit MOCK_GATE_STATUS).
-function runHelper(root: string, args: string[], env: Record<string, string> = {}) {
+function runHelper(root: string, args: string[], env: Record<string, string> = {}, script = HELPER) {
   const { bin, calls, sleepLog } = writeMocks(root);
   const posted = path.join(root, 'posted');
-  for (const file of [calls, sleepLog, posted, path.join(root, 'merged')]) fs.rmSync(file, { force: true });
+  for (const file of [calls, sleepLog, posted, path.join(root, 'merged'), path.join(root, 'swapped')])
+    fs.rmSync(file, { force: true });
   fs.writeFileSync(
     path.join(bin, 'node'),
     `#!/usr/bin/env bash
@@ -468,7 +478,7 @@ exit 64
 `,
     { mode: 0o755 },
   );
-  const result = spawnSync('bash', [HELPER, ...args], {
+  const result = spawnSync('bash', [script, ...args], {
     cwd: root,
     encoding: 'utf8',
     env: {
@@ -1696,15 +1706,34 @@ function mergesTo(root: string): void {
   writeJson(root, 'pr-merged.json', { ...prState([]), state: 'MERGED', mergeCommit: { oid: MERGE_OID } });
 }
 
-// A merged PR as `audit` reads it: merged at MERGED_AT onto MERGE_PARENT, with its
-// body's revisions (none = never edited) and title renames. labeler.yml and the
-// comparison at MERGE_PARENT are the base's as of the merge.
+// How a PR can land: a merge commit whose second parent is the head, or a squash
+// GitHub signed, both of which `merge` makes; a rebase merge, one unsigned parent
+// that may be one of the PR's own commits; and a merge made by hand of another commit.
+const MERGE_SHAPES = {
+  merge: { parents: [MERGE_PARENT, HEAD], signature: { isValid: true, wasSignedByGitHub: true } },
+  squash: { parents: [MERGE_PARENT], signature: { isValid: true, wasSignedByGitHub: true } },
+  rebase: { parents: [OTHER_HEAD], signature: null },
+  manual: { parents: [MERGE_PARENT, OTHER_HEAD], signature: null },
+};
+
+// A label event on the PR's timeline.
+function labelEvent(name: string, createdAt: string, removed = false): Page {
+  return { __typename: removed ? 'UnlabeledEvent' : 'LabeledEvent', createdAt, label: { name } };
+}
+
+// A merged PR as `audit` reads it: merged at MERGED_AT onto MERGE_PARENT, by
+// default through a merge commit, with its body's revisions (none = never
+// edited), title renames and label events (by default, its labels added before
+// the merge). labeler.yml and the comparison at MERGE_PARENT are the base's as
+// of the merge.
 function auditFixture(
   root: string,
   opts: NonNullable<Parameters<typeof scopeFixture>[1]> & {
     state?: string;
     edits?: Page[];
     renames?: Page[];
+    labelEvents?: Page[];
+    shape?: keyof typeof MERGE_SHAPES;
     parentConfig?: string | null;
   } = {},
 ): void {
@@ -1714,6 +1743,7 @@ function auditFixture(
   const labeler = path.join(root, `labeler--${MERGE_PARENT}.yml`);
   if (opts.parentConfig === null) fs.rmSync(labeler, { force: true });
   else fs.writeFileSync(labeler, opts.parentConfig ?? RISK_CONFIG);
+  const shape = MERGE_SHAPES[opts.shape ?? 'merge'];
   writePage(root, 'audit', 1, {
     data: {
       repository: {
@@ -1723,9 +1753,17 @@ function auditFixture(
           headRefOid: HEAD,
           title: opts.title ?? 'feat: route a new message kind',
           body: opts.body ?? '',
-          mergeCommit: { oid: MERGE_OID, parents: { nodes: [{ oid: MERGE_PARENT }] } },
+          mergeCommit: {
+            oid: MERGE_OID,
+            parents: { totalCount: shape.parents.length, nodes: shape.parents.map((oid) => ({ oid })) },
+            signature: shape.signature,
+          },
           userContentEdits: { pageInfo: { hasNextPage: false }, nodes: opts.edits ?? [] },
-          timelineItems: { pageInfo: { hasNextPage: false }, nodes: opts.renames ?? [] },
+          renames: { pageInfo: { hasNextPage: false }, nodes: opts.renames ?? [] },
+          labelEvents: {
+            pageInfo: { hasNextPage: false },
+            nodes: opts.labelEvents ?? (opts.labels ?? []).map((name) => labelEvent(name, '2026-09-05T00:00:10Z')),
+          },
         },
       },
     },
@@ -1801,6 +1839,46 @@ describe('codex-review merge, the only merge path for a risk-scoped repo', () =>
     expect(result.stderr).toContain('merge: the base moved while merge-check ran; checking once more');
     expect(result.calls.match(/^rest repos\/example\/repository\/git\/ref\/heads\/main$/gm)).toHaveLength(4);
     expect(result.calls.match(/^merge-args /gm)).toHaveLength(1);
+  });
+
+  it('runs merge-check inside this process, so a script replaced on disk mid-merge changes nothing', () => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: [] });
+    mergesTo(root);
+    // The base moves during the first check (exit 25) to a commit whose labeler.yml
+    // selects docs/notes.md, so the second check refuses: no review of this head.
+    for (const n of [2, 3, 4]) fs.writeFileSync(path.join(root, `ref--main-${n}`), MOVED_BASE);
+    fs.writeFileSync(
+      path.join(root, `labeler--${MOVED_BASE}.yml`),
+      "risk:high:\n- changed-files:\n  - any-glob-to-any-file:\n    - 'docs/**'\n",
+    );
+    writeJson(root, `compare--${MOVED_BASE}...${HEAD}.json`, {
+      status: 'ahead',
+      files: [changedFile('docs/notes.md')],
+    });
+    // A copy of the skill to run, whose script the first gh call overwrites with one
+    // that allows everything.
+    const skill = path.join(root, 'skill');
+    fs.mkdirSync(path.join(skill, 'scripts'), { recursive: true });
+    for (const name of ['codex-review.sh', 'risk-scope.jq'])
+      fs.copyFileSync(path.join(path.dirname(HELPER), name), path.join(skill, 'scripts', name));
+    fs.copyFileSync(
+      path.join(path.dirname(HELPER), '..', 'reviewer-models.txt'),
+      path.join(skill, 'reviewer-models.txt'),
+    );
+    const script = path.join(skill, 'scripts', 'codex-review.sh');
+    fs.writeFileSync(
+      path.join(root, 'evil.sh'),
+      '#!/usr/bin/env bash\ntouch "$MOCK_DIR/evil-ran"\necho merge=allowed\nexit 0\n',
+    );
+
+    const result = runHelper(root, ['merge', '--head', HEAD], { MOCK_SWAP_SCRIPT: script }, script);
+    expect(fs.readFileSync(script, 'utf8')).toContain('evil-ran');
+    expect(result.stderr).toContain('merge: the base moved while merge-check ran; checking once more');
+    expect(result.stderr).toContain(`merge=refused head=${HEAD} verdict=review: no review of this head was requested`);
+    expect(result.status).toBe(24);
+    expect(fs.existsSync(path.join(root, 'evil-ran'))).toBe(false);
+    expect(result.calls).not.toContain('merge-args');
   });
 
   it('never merges when the base moves during both checks', () => {
@@ -1973,6 +2051,15 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
       'codex=pending',
     ],
     [
+      'a review request edited after the merge',
+      {
+        comments: [{ ...marker(HEAD, 1, '2026-09-05T00:05:00Z'), lastEditedAt: '2026-09-05T02:00:00Z' }],
+        reviews: [review('2026-09-05T00:10:00Z', HEAD)],
+      },
+      28,
+      'it merged with no review of this head requested and no approving receipt before the merge',
+    ],
+    [
       'an approving receipt from a disallowed reviewer',
       { comments: [receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-sonnet-5 (worker)')] },
       28,
@@ -1991,6 +2078,120 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
     const result = runHelper(root, ['audit']);
     expect(result.status).toBe(code);
     expect(result.stdout).toContain(`verdict=review: ${reason}`);
+  });
+
+  it.each([
+    [
+      'the only approving receipt was edited after the merge',
+      [{ ...receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z'), lastEditedAt: '2026-09-05T02:00:00Z' }],
+      '2026-09-05T00:20:00Z',
+    ],
+    [
+      'a comment after the approving receipt was edited after the merge, and may have asked for changes',
+      [
+        receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z'),
+        { ...receiptComment(HEAD, 'approve', '2026-09-05T00:30:00Z'), lastEditedAt: '2026-09-05T02:00:00Z' },
+      ],
+      '2026-09-05T00:30:00Z',
+    ],
+  ])('flags a review-verdict merge when %s', (_case, comments, postedAt) => {
+    const root = tempRoot();
+    auditFixture(root, { labels: ['risk:high'], comments });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(28);
+    expect(result.stdout).toContain(
+      `verdict=review: davekim917 posted a comment at ${postedAt} and edited it at 2026-09-05T02:00:00Z after the merge; that comment could have been a later substitute receipt`,
+    );
+  });
+
+  it('still reads an approving receipt that postdates the only comment edited after the merge', () => {
+    const root = tempRoot();
+    auditFixture(root, {
+      labels: ['risk:high'],
+      comments: [
+        {
+          author: { login: 'davekim917' },
+          authorAssociation: 'OWNER',
+          createdAt: '2026-09-05T00:10:00Z',
+          lastEditedAt: '2026-09-05T02:00:00Z',
+          body: 'CI is green.',
+        },
+        receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z'),
+      ],
+    });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('verdict=review: an approving substitute receipt before the merge');
+  });
+
+  it('counts a run that finished only after the merge as pending at it, however it ended', () => {
+    const root = tempRoot();
+    auditFixture(root, {
+      labels: [],
+      ci: [workflowRun('CI', 'completed', 'success', '2026-09-05T00:01:00Z', HEAD, '2026-09-05T01:30:00Z')],
+    });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(28);
+    expect(result.stdout).toContain('verdict=skip: ci_pending: CI=updated after the merge');
+  });
+
+  it('judges the labels the PR had at its merge, counting one removed after it', () => {
+    const root = tempRoot();
+    auditFixture(root, {
+      labels: [],
+      labelEvents: [
+        labelEvent('risk:high', '2026-09-05T00:00:10Z'),
+        labelEvent('risk:high', '2026-09-05T02:00:00Z', true),
+      ],
+    });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(28);
+    expect(result.stdout).toContain(
+      'verdict=review: it merged with no review of this head requested and no approving receipt before the merge (labeled risk:high)',
+    );
+  });
+
+  it('does not count a label added after the merge', () => {
+    const root = tempRoot();
+    auditFixture(root, { labels: ['risk:high'], labelEvents: [labelEvent('risk:high', '2026-09-05T02:00:00Z')] });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(
+      `audit=pass pr=1 head=${HEAD} base=${MERGE_PARENT} merged=${MERGED_AT} verdict=skip`,
+    );
+  });
+
+  it.each(['merge', 'squash'] as const)('judges a %s from the commit it merged onto', (shape) => {
+    const root = tempRoot();
+    auditFixture(root, { labels: [], shape });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`audit=pass pr=1 head=${HEAD} base=${MERGE_PARENT}`);
+  });
+
+  it.each([
+    ['a rebase merge', 'rebase', `1 parent (${OTHER_HEAD}) and is not signed by GitHub`],
+    [
+      'a merge made by hand of another commit',
+      'manual',
+      `2 parents (${MERGE_PARENT}, ${OTHER_HEAD}) and is not signed by GitHub`,
+    ],
+  ] as const)('flags %s outright, never judging it from a guessed base', (_case, shape, detail) => {
+    const root = tempRoot();
+    auditFixture(root, { labels: [], shape });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(28);
+    expect(result.stdout).toContain(
+      `audit=violation pr=1 head=${HEAD} merged=${MERGED_AT}: merge method the gate does not authorize (rebase or manual): merge commit ${MERGE_OID} has ${detail}`,
+    );
+    expect(result.calls).not.toContain('labeler.yml');
   });
 
   it('calls a merge into a base that was not risk-scoped then legacy, not a bypass', () => {
