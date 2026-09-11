@@ -130,6 +130,14 @@ describe('filesOverlap', () => {
     expect(filesOverlap(['a.ts'], ['b.ts'])).toBe(false);
   });
 
+  it.each(['src/upstream-ratchet.json', 'pnpm-lock.yaml', 'container/agent-runner/bun.lock'])(
+    'ignores %s, which tools regenerate as a side effect',
+    (generated) => {
+      expect(filesOverlap(['a.ts', generated], ['b.ts', generated])).toBe(false);
+      expect(filesOverlap(['a.ts', generated], ['a.ts', generated])).toBe(true);
+    },
+  );
+
   it('is false when either side is empty', () => {
     expect(filesOverlap([], ['a.ts'])).toBe(false);
     expect(filesOverlap(['a.ts'], [])).toBe(false);

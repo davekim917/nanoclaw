@@ -32,6 +32,9 @@
  *   links to the candidate, per plan.md's Measurement status: "same-subsystem
  *   follow-ups will be computed from git history instead, as a later `fix` PR ... that
  *   touches the same files" once the `Fixes-PR:` convention isn't consistently used.
+ *   Generated files (the ratchet manifest, lockfiles) don't count as shared: see
+ *   `GENERATED_FILES`. Overlap still over-counts in a busy repo, so read it as an upper
+ *   bound; the link rate is the real signal once `Fixes-PR:` lines accumulate.
  * - revert — this repo's real revert PRs (e.g. #610, "revert(runner): back out ending
  *   a task stream after its result (#608)") do not follow GitHub's auto-revert
  *   template (`Revert "<title>"` / "This reverts pull request #N."); they use the same
@@ -157,8 +160,16 @@ export function extractFixesPrNumber(body: string): number | null {
   return match[3] ? Number(match[3]) : null;
 }
 
+/**
+ * Files a tool rewrites as a side effect of unrelated edits. They say nothing about
+ * whether two PRs touched the same code: `src/upstream-ratchet.json` alone produced 32 of
+ * 93 overlap matches in the 30 days before the switch, because every upstream-owned edit
+ * regenerates it.
+ */
+const GENERATED_FILES = new Set(['src/upstream-ratchet.json', 'pnpm-lock.yaml', 'container/agent-runner/bun.lock']);
+
 export function filesOverlap(a: string[], b: string[]): boolean {
-  const bSet = new Set(b);
+  const bSet = new Set(b.filter((f) => !GENERATED_FILES.has(f)));
   return a.some((f) => bSet.has(f));
 }
 
