@@ -71,6 +71,8 @@ risk:high:
     - 'src/dashboard/steer.ts'
     - 'src/dashboard/assign.ts'
     - 'src/dashboard/api/scheduled-shared.ts'
+    - 'src/dashboard/thread-close.ts'
+    - 'src/dashboard/thread-snooze.ts'
     # Irreversible against a live DB
     - 'src/db/migrations/**'
     # Supply chain: pnpm allowBuilds, and the container image it builds
@@ -78,11 +80,12 @@ risk:high:
     - 'container/Dockerfile'
     - 'container/build.sh'
     # Deploy and rollback (src/deploy-crash-guard.ts is covered by *guard*), and the
-    # nightly host snapshot that scans for secrets then pushes config to a remote (and its
-    # selfcheck), and the wiki autopush, which pushes to a remote with no scan at all
+    # nightly host snapshot that scans for secrets then pushes config to a remote
+    # (and its selfcheck, covered by the * glob), off secret-scan.sh's pattern set
+    # (a weakened pattern there silently disables the scan)
     - 'scripts/deploy.sh'
     - 'scripts/git-safety*.sh'
-    - 'scripts/wiki-autopush.sh'
+    - 'scripts/lib/secret-scan.sh'
     # The gates themselves: CI workflows, this file, the git hooks, the public-boundary
     # checkers and allowlist, and the PR review loop that IS the review gate. CI runs
     # only the portable boundary mode, so the strict identifier check runs only in the
@@ -180,6 +183,8 @@ risk:credential:
     - 'src/dashboard/steer.ts'
     - 'src/dashboard/assign.ts'
     - 'src/dashboard/api/scheduled-shared.ts'
+    - 'src/dashboard/thread-close.ts'
+    - 'src/dashboard/thread-snooze.ts'
 
 risk:migration:
 - changed-files:
@@ -198,7 +203,7 @@ risk:deploy:
   - any-glob-to-any-file:
     - 'scripts/deploy.sh'
     - 'scripts/git-safety*.sh'
-    - 'scripts/wiki-autopush.sh'
+    - 'scripts/lib/secret-scan.sh'
 
 risk:gates:
 - changed-files:

@@ -198,26 +198,116 @@ function git(args: string[], cwd = INSTALL_ROOT): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
 }
 
-/** Run the boundary checker over `snapshot`, against this install's registry. */
-function scanSnapshot(snapshot: string): BoundaryScan {
+/**
+ * Where to read `.public-boundary-allowlist.json` from for a scan of `snapshot`.
+ *
+ * `snapshot` IS a checkout of the commit being scanned (`withSnapshot`), so its
+ * own working copy of the file already is that commit's COMMITTED allowlist —
+ * no separate `git show` is needed. The install checkout's own copy
+ * (`INSTALL_ROOT/.public-boundary-allowlist.json`, the old source of this
+ * argument) is NOT a safe substitute: it lags `origin/main` between a merge
+ * and the next deploy, and it can hold an uncommitted edit — the same class of
+ * hole `.husky/pre-push` closed for pushed refs (#651).
+ *
+ * Three cases, told apart by `lstat` (not `stat`, which follows a symlink and
+ * would silently exempt whatever the link points at — the hook's own read,
+ * `git show <sha>:path`, cannot be fooled this way, since it returns a
+ * symlink blob's literal target STRING, which then fails `JSON.parse` and
+ * aborts the hook closed; this function makes the same case fail closed
+ * explicitly instead of relying on `JSON.parse` to eventually notice):
+ *
+ *   - Missing (`ENOENT`) — a commit that predates the file, or a ref that
+ *     never carried it (the long-lived `channels`/`providers` sibling
+ *     branches). Falls back to an empty allowlist written to a throwaway
+ *     temp file — exempts nothing, still the strictest outcome — rather than
+ *     letting the checker's own missing-file error turn "nothing to exempt"
+ *     into a "could not run" alert.
+ *   - Present but not a regular file (a symlink, most plausibly, but this
+ *     also covers a directory or anything else committed under that path) —
+ *     throws. This is not a case to paper over with a fallback: the tree
+ *     claims to carry a reviewed policy file at this path and does not, so
+ *     the scan should fail loudly rather than silently treat "who knows
+ *     what this is" as either "reviewed" or "empty".
+ *   - Present and a regular file — that IS the committed allowlist, used
+ *     as-is.
+ *
+ * `usedFallback` says which of the first two happened, so a caller that
+ * knows which commit is being scanned can log it — this function does not,
+ * and stays pure filesystem logic with no `commit` argument, deliberately
+ * split out so it is testable without git, a network or a real `pnpm`
+ * invocation — same reasoning as `CleanupOps` above.
+ */
+export function resolveAllowlistPath(snapshot: string): { path: string; usedFallback: boolean; cleanup: () => void } {
+  const treeAllowlist = path.join(snapshot, '.public-boundary-allowlist.json');
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(treeAllowlist);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-remote-boundary-allowlist-'));
+    const emptyAllowlist = path.join(dir, 'allowlist.json');
+    fs.writeFileSync(emptyAllowlist, '{"entries": []}\n');
+    return { path: emptyAllowlist, usedFallback: true, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
+  }
+  if (!stat.isFile()) {
+    throw new Error(
+      `${treeAllowlist} is committed but is not a regular file (a symlink, most likely) — refusing to treat it as the allowlist`,
+    );
+  }
+  return { path: treeAllowlist, usedFallback: false, cleanup: () => {} };
+}
+
+/** One invocation of the boundary checker, as `scanSnapshot` builds it. */
+export interface CheckerInvocation {
+  root: string;
+  allowlistPath: string;
+}
+
+/** The checker's raw process result, ahead of `scanSnapshot`'s `BoundaryScan` mapping. */
+export interface CheckerResult {
+  status: number | null;
+  stderr: string;
+  error?: Error;
+}
+
+/**
+ * Runs the checker, injected so `scanSnapshot`'s OWN logic — the allowlist
+ * fallback, the fallback log line, and above all which path actually reaches
+ * `--allowlist` — is testable without a real `pnpm` invocation. Same
+ * reasoning as `CleanupOps`: without this seam, a rewrite that silently
+ * passes the wrong path (or drops `--allowlist` entirely) would still make
+ * `resolveAllowlistPath`'s own tests pass, having tested only half the wire.
+ */
+export type RunChecker = (invocation: CheckerInvocation) => CheckerResult;
+
+const REAL_RUN_CHECKER: RunChecker = ({ root, allowlistPath }) => {
   const result = spawnSync(
     'pnpm',
-    [
-      'run',
-      'check:public-boundary',
-      '--',
-      '--root',
-      snapshot,
-      '--index',
-      // The allowlist is current policy, not the policy of whatever content is
-      // being inspected — same reasoning as `.husky/pre-push`'s `allowlist_path`.
-      '--allowlist',
-      path.join(INSTALL_ROOT, '.public-boundary-allowlist.json'),
-    ],
+    ['run', 'check:public-boundary', '--', '--root', root, '--index', '--allowlist', allowlistPath],
     { cwd: INSTALL_ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
   );
-  if (result.error) throw result.error;
-  return { code: result.status ?? 2, detail: cleanCheckerOutput(result.stderr ?? '') };
+  return { status: result.status, stderr: result.stderr ?? '', error: result.error };
+};
+
+/** Run the boundary checker over `snapshot` (a checkout of `commit`), against this install's registry. */
+export function scanSnapshot(snapshot: string, commit: string, runChecker: RunChecker = REAL_RUN_CHECKER): BoundaryScan {
+  const allowlist = resolveAllowlistPath(snapshot);
+  if (allowlist.usedFallback) {
+    // Non-fatal, and it does not change the scan's outcome (empty exempts
+    // nothing either way), but a later alert about a finding on this commit
+    // should explain itself rather than leave "why wasn't this exempted?"
+    // unanswered.
+    console.error(
+      `remote-boundary: ${REF_LABEL} @ ${commit} has no committed .public-boundary-allowlist.json — scanning with an empty allowlist`,
+    );
+  }
+  try {
+    const result = runChecker({ root: snapshot, allowlistPath: allowlist.path });
+    if (result.error) throw result.error;
+    return { code: result.status ?? 2, detail: cleanCheckerOutput(result.stderr) };
+  } finally {
+    allowlist.cleanup();
+  }
 }
 
 export interface SnapshotRun<T> {
@@ -349,7 +439,7 @@ async function main(): Promise<number> {
   try {
     git(['fetch', '--quiet', 'origin', 'main']);
     commit = git(['rev-parse', '--short', REF]);
-    ({ value: scan, cleanupError } = withSnapshot(commit, scanSnapshot));
+    ({ value: scan, cleanupError } = withSnapshot(commit, (snapshot) => scanSnapshot(snapshot, commit)));
     // eslint-disable-next-line no-catch-all/no-catch-all
   } catch (err) {
     // Nothing was scanned, so there is no redacted checker output to send and
