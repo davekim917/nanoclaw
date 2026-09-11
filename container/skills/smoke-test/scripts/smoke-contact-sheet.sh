@@ -14,7 +14,22 @@
 #                       shot's `path`.
 #   <auth-state.json>   an agent-browser `state save` file (QA-seat cookies +
 #                       storage). Loaded once, before any navigation, into one
-#                       named session — never a fresh login.
+#                       named session — never a fresh login. MUST live outside
+#                       the run dir and outside the shared workgroup tree —
+#                       see the security note below. The caller deletes this
+#                       file once the sheet is captured; this script never
+#                       does (it doesn't own the file).
+#
+# SECURITY: the auth state file holds a live session token. This script
+# REFUSES a path that resolves (realpath) inside <run-dir> or anywhere under
+# the shared workgroup tree ($SMOKE_WORKGROUP_ROOT, default
+# /workspace/workgroup) — both are shared/durable trees other sessions and,
+# for the run dir, eventual posting/review can read, and that is exactly
+# where a QA-token leak has happened before. Keep the auth state in a private
+# path instead, e.g. /tmp/contact-sheet-auth-<runId>.json, and delete it after
+# this script exits. This script only ever passes that PATH to `agent-browser
+# state load` — it never reads the file's bytes itself, so auth content never
+# reaches manifest.json, the HTML grid, or this script's own output.
 #
 # shots.json shape (written by the caller, capped here at 8 entries):
 #   [{ "name": "settings-pricing", "path": "/settings",
@@ -64,6 +79,27 @@ AUTH_STATE="${3:-}"
 printf '%s' "$BASE_URL" | grep -Eq '^https?://' ||
   die "base url must start with http:// or https://"
 [ -s "$AUTH_STATE" ] || die "auth state file is missing or empty: $AUTH_STATE"
+
+# The auth state file holds a live session token — refuse it inside either
+# shared, durable tree. `realpath -e` on RUN_DIR/AUTH_STATE is safe (both are
+# already proven to exist above); the workgroup root is resolved with `-m`
+# (no existence requirement) since a test double or a host without
+# /workspace/workgroup must still compare correctly.
+WORKGROUP_ROOT="${SMOKE_WORKGROUP_ROOT:-/workspace/workgroup}"
+RUN_DIR_RESOLVED="$(realpath -e "$RUN_DIR")"
+AUTH_STATE_RESOLVED="$(realpath -e "$AUTH_STATE")"
+WORKGROUP_ROOT_RESOLVED="$(realpath -m "$WORKGROUP_ROOT")"
+
+case "$AUTH_STATE_RESOLVED" in
+  "$RUN_DIR_RESOLVED"|"$RUN_DIR_RESOLVED"/*)
+    die "auth state must not live inside the run dir (shared, readable evidence tree): $AUTH_STATE"
+    ;;
+esac
+case "$AUTH_STATE_RESOLVED" in
+  "$WORKGROUP_ROOT_RESOLVED"|"$WORKGROUP_ROOT_RESOLVED"/*)
+    die "auth state must not live under the shared workgroup tree ($WORKGROUP_ROOT): $AUTH_STATE"
+    ;;
+esac
 
 CS_DIR="$RUN_DIR/contact-sheet"
 SHOTS_JSON="$CS_DIR/shots.json"
@@ -251,7 +287,7 @@ import json
 import os
 import sys
 
-cs_dir, base_url, auth_state, build_sha, requested, capped, generated_at = sys.argv[1:8]
+cs_dir, base_url, build_sha, requested, capped, generated_at = sys.argv[1:7]
 requested = int(requested)
 capped = capped == "1"
 
@@ -264,7 +300,9 @@ for s in screens:
 manifest = {
     "schemaVersion": 1,
     "baseUrl": base_url,
-    "authState": auth_state,
+    # No authState field, deliberately — the auth state path is never copied
+    # into this shared, durable artifact (see the security note in the
+    # script header). This script never reads the file's bytes either way.
     "buildSha": build_sha,
     "generatedAt": generated_at,
     "requested": requested,
@@ -332,7 +370,7 @@ PYEOF
 
 CAPPED_FLAG=0
 [ "$CAPPED" = true ] && CAPPED_FLAG=1 || true
-python3 "$RENDER_SCRIPT" "$CS_DIR" "$BASE_URL" "$AUTH_STATE" "$BUILD_SHA" "$REQUESTED" "$CAPPED_FLAG" "$GENERATED_AT" \
+python3 "$RENDER_SCRIPT" "$CS_DIR" "$BASE_URL" "$BUILD_SHA" "$REQUESTED" "$CAPPED_FLAG" "$GENERATED_AT" \
   <"$RESULTS_FILE"
 rm -f "$RENDER_SCRIPT"
 

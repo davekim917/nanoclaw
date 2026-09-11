@@ -772,6 +772,14 @@ screen is `failed: <reason>` plus a placeholder tile, never dropped. Post
 verdict. A deployment may also run a fresh, read-only design critic on the
 shot PNGs — shadow only, posted but never gating the verdict.
 
+**Auth state is a live session token — never put it in the run dir or under
+the shared workgroup tree.** The script refuses both (`realpath`-checked
+against `<run-dir>` and `$SMOKE_WORKGROUP_ROOT`, default
+`/workspace/workgroup`) and never copies its content anywhere. Keep it at a
+private path like `/tmp/contact-sheet-auth-<runId>.json` and delete it once
+the sheet is captured — the script doesn't own that file and won't delete it
+for you.
+
 ### Backend and specification verifier
 
 The coordinator normally assigns this lane to a native Claude Sonnet 5 worker

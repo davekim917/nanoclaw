@@ -151,7 +151,7 @@ grep -q ' find text Get started click' "$STUB_LOG" \
 grep -q ' click text=' "$STUB_LOG" \
   && { echo "happy path: text= step must never be passed straight to click" >&2; exit 1; }
 
-echo "1/5 happy path ok"
+echo "1/7 happy path ok"
 
 # --- 2. A failed screen stays as a placeholder, never silently dropped ------
 RUN2="$(fresh_run_dir failed-screen)"
@@ -180,7 +180,7 @@ grep -q 'FAILED' "$RUN2/contact-sheet/grid.html" \
 grep -q 'class="desktop placeholder"' "$RUN2/contact-sheet/grid.html" \
   || { echo "failed screen: expected a desktop placeholder div" >&2; exit 1; }
 
-echo "2/5 failed screen stays a placeholder ok"
+echo "2/7 failed screen stays a placeholder ok"
 
 # --- 3. The 8-screen cap ------------------------------------------------------
 RUN3="$(fresh_run_dir cap)"
@@ -196,7 +196,7 @@ echo "$RESULT" | jq -e '.ok == true and .requested == 10 and .capped == true and
 jq -e '.requested == 10 and .capped == true and (.screens | length) == 8' "$RUN3/contact-sheet/manifest.json" \
   >/dev/null || { echo "cap: manifest did not record the 8-screen cap correctly" >&2; exit 1; }
 
-echo "3/5 8-screen cap ok"
+echo "3/7 8-screen cap ok"
 
 # --- 4. Missing auth state: refuse, never touch the browser ------------------
 RUN4="$(fresh_run_dir no-auth)"
@@ -214,7 +214,7 @@ echo "$RESULT" | jq -e '.ok == false and (.error | test("auth state"))' >/dev/nu
   || { echo "missing auth state: expected a refusal naming the auth state: $RESULT" >&2; exit 1; }
 [ ! -s "$STUB_LOG" ] || { echo "missing auth state: agent-browser must never be invoked" >&2; exit 1; }
 
-echo "4/5 missing auth state refuses before touching the browser ok"
+echo "4/7 missing auth state refuses before touching the browser ok"
 
 # --- 5. Empty shots file: refuse -----------------------------------------------
 RUN5="$(fresh_run_dir empty-shots)"
@@ -240,6 +240,63 @@ set -e
 echo "$RESULT" | jq -e '.ok == false' >/dev/null \
   || { echo "missing shots file: expected a refusal: $RESULT" >&2; exit 1; }
 
-echo "5/5 empty/missing shots file refuses ok"
+echo "5/7 empty/missing shots file refuses ok"
+
+# --- 6. Auth state inside the run dir: refuse ---------------------------------
+# The auth state file holds a live session token; the run dir is a shared,
+# durable evidence tree (and eventually posted/reviewed) — exactly where a
+# QA-token leak has happened before.
+RUN6="$(fresh_run_dir auth-in-rundir)"
+cat >"$RUN6/contact-sheet/shots.json" <<'JSON'
+[{ "name": "home", "path": "/" }]
+JSON
+AUTH_IN_RUNDIR="$RUN6/contact-sheet/auth-state.json"
+printf '{"cookies":[],"origins":[]}' >"$AUTH_IN_RUNDIR"
+
+: >"$STUB_LOG"
+set +e
+RESULT="$(bash "$SCRIPT" "$RUN6" "https://example.test" "$AUTH_IN_RUNDIR" 2>&1)"
+EC=$?
+set -e
+[ "$EC" -eq 2 ] || { echo "auth in run dir: expected exit 2, got $EC" >&2; exit 1; }
+echo "$RESULT" | jq -e '.ok == false and (.error | test("run dir"))' >/dev/null \
+  || { echo "auth in run dir: expected a refusal naming the run dir: $RESULT" >&2; exit 1; }
+[ ! -s "$STUB_LOG" ] || { echo "auth in run dir: agent-browser must never be invoked" >&2; exit 1; }
+
+echo "6/7 auth state inside the run dir refuses ok"
+
+# --- 7. Auth state under the shared workgroup tree: refuse --------------------
+# Override the workgroup root so the test never depends on /workspace/workgroup
+# actually existing on the host running this suite.
+RUN7="$(fresh_run_dir auth-in-workgroup)"
+cat >"$RUN7/contact-sheet/shots.json" <<'JSON'
+[{ "name": "home", "path": "/" }]
+JSON
+FAKE_WORKGROUP_ROOT="$WORK/fake-workgroup"
+mkdir -p "$FAKE_WORKGROUP_ROOT/qa-smoke"
+AUTH_IN_WORKGROUP="$FAKE_WORKGROUP_ROOT/qa-smoke/auth-state.json"
+printf '{"cookies":[],"origins":[]}' >"$AUTH_IN_WORKGROUP"
+
+: >"$STUB_LOG"
+set +e
+RESULT="$(SMOKE_WORKGROUP_ROOT="$FAKE_WORKGROUP_ROOT" \
+  bash "$SCRIPT" "$RUN7" "https://example.test" "$AUTH_IN_WORKGROUP" 2>&1)"
+EC=$?
+set -e
+[ "$EC" -eq 2 ] || { echo "auth under workgroup root: expected exit 2, got $EC" >&2; exit 1; }
+echo "$RESULT" | jq -e '.ok == false and (.error | test("workgroup"))' >/dev/null \
+  || { echo "auth under workgroup root: expected a refusal naming the workgroup tree: $RESULT" >&2; exit 1; }
+[ ! -s "$STUB_LOG" ] || { echo "auth under workgroup root: agent-browser must never be invoked" >&2; exit 1; }
+
+# A private path outside both trees must still work fine even with the
+# override set — the check is about containment, not the env var's mere
+# presence.
+: >"$STUB_LOG"
+RESULT="$(SMOKE_WORKGROUP_ROOT="$FAKE_WORKGROUP_ROOT" \
+  bash "$SCRIPT" "$RUN7" "https://example.test" "$AUTH_STATE")"
+echo "$RESULT" | jq -e '.ok == true' >/dev/null \
+  || { echo "auth under workgroup root: a private auth path must still succeed: $RESULT" >&2; exit 1; }
+
+echo "7/7 auth state under the shared workgroup tree refuses ok"
 
 echo "smoke contact sheet tests passed"
