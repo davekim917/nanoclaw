@@ -176,14 +176,26 @@ Mike Julian states plainly that Duckbill does not track defect escape rate: "bug
 filed — they're just fixed." So the thread's +94% proves throughput, not that quality held.
 This install serves production workgroups daily; that blind spot is not affordable here.
 
-Before Tier 1 flips on, start recording, per merged PR: whether it was review-labeled, and
-whether a follow-up fix touched the same subsystem within 14 days. The audit could not
-compute this retroactively — there is no PR-to-PR linkage convention in this repo's commit
-messages — so the cheapest fix is a `Fixes-PR:` trailer on follow-up commits, and the metric
-becomes a query.
+Record, per merged PR, whether it was review-labeled and whether a later fix touched the same
+files within 14 days. A follow-up links itself: every `fix` PR carries `Fixes-PR: #<n>` or
+`Fixes-PR: none` in its body, which merge-check enforces once the gate-integrity change lands.
+Where a link is missing, file overlap is the fallback.
 
-**Rollback condition, agreed in advance:** if the same-subsystem follow-up rate for
-unreviewed PRs exceeds that of reviewed PRs over 30 days, the exempt path list shrinks.
+**Compare like with like.** Reviewed and unreviewed PRs differ by path by design, and risky
+paths draw more follow-up fixes whether or not they were reviewed. Comparing the two groups
+would measure the paths, not the review. So the comparison runs within the low-risk class:
+low-risk PRs merged before the switch, all of which were auto-reviewed, against low-risk PRs
+merged after it, unreviewed. The same query reports the weekly revert rate.
+
+**Size the expectation.** About 30 low-risk nanoclaw PRs merge in 30 days, so only a large
+difference will show; the 30-day read is a first look, not a verdict. XZO's volume, 393 PRs
+in the 30 days before its switch, supports a firmer read. A post-merge advisory review of
+skipped PRs measures misses directly instead of waiting for production to surface them. It
+files what it finds and never blocks.
+
+**Rollback condition, agreed in advance** (corrected 2026-09-11; the first version compared
+the confounded groups): if low-risk PRs merged without review draw more same-file follow-ups
+or reverts than low-risk PRs did while they were still reviewed, the exempt path list shrinks.
 
 ## Non-goals
 
@@ -225,10 +237,27 @@ unreviewed PRs exceeds that of reviewed PRs over 30 days, the exempt path list s
       - **#566.** The breaker is diagnosed. `codex-review.sh gate` derives seams from
         imports, so a finding class whose sites are Markdown or YAML is never gated. Tier 1
         routes around it, because docs-only PRs are not reviewed at all.
-- [ ] Measurement — partly in place. Each PR carries its review label (`risk:high`), but
-      the follow-up linkage is not: no agent writes a `Fixes-PR:` trailer. At the 30-day
-      check (around 2026-10-10), same-subsystem follow-ups will be computed from git
-      history instead, as a later `fix` PR within 14 days that touches the same files. That
-      method needs nothing from agents, and its bias falls equally on reviewed and
-      unreviewed PRs, which is what the rollback condition compares.
+- [ ] Measurement — corrected 2026-09-11. The earlier method compared reviewed with
+      unreviewed PRs and assumed its bias fell equally on both. It doesn't, because the groups
+      differ by path. The comparison is now before-and-after within the low-risk class. Links
+      come from a required `Fixes-PR:` line, and revert rate is tracked alongside. First read
+      around 2026-10-10.
+- [ ] Revised plan, 2026-09-11, after an independent second opinion and a comparison with
+      Augment's Cosmos:
+      - **Gate integrity:** merge-check fails closed when `risk:high` was removed by anyone
+        but the labeler, and requires `Fixes-PR:` on fix PRs. Substitute reviews of risky
+        PRs must come from an Opus- or Fable-tier model, or from another model family.
+      - **Reviewer identity:** every gate runs under one GitHub identity, so a self-approval
+        can't be told apart from a review. This is an operator decision: a second identity for
+        receipts, or a public repo so branch protection applies. A history scan for public
+        readiness is under way.
+      - **Measurement:** the correction above.
+      - **Tests on risky paths:** no coverage tooling is installed yet. Unit tests for the #608
+        failure exist (`container/agent-runner/src/poll-loop.test.ts:390` onward). The missing
+        piece is a check that runs the real CLI and confirms the hooks still fire.
+      - **Memory and decisions:**
+        - review-dimension labels such as `risk:guard` and `risk:migration`;
+        - a `docs/review-notes.md` that gets a line whenever a finding is deferred or a PR is
+          reverted;
+        - on XZO, a `Decision:` line plus the existing `needs-product-decision` label.
 - [ ] Tier 2 · Tier 3 · Tier 4 — not started
