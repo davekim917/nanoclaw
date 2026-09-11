@@ -34,6 +34,7 @@ Each provider reaches the plugin by its own path, all rooted at the `~/plugins` 
 | **Skills / commands** (`skills/<n>/SKILL.md`) | `.claude-plugin/plugin.json` + mount (`CLAUDE_PLUGINS_ROOT`) | native registration at spawn from the mount, needs `.codex-plugin/plugin.json` + `.agents/plugins/marketplace.json` | mirror → `~/.config/opencode/skill/` (no plugin loader) |
 | **Always-on ruleset** (e.g. impeccable) | plugin SessionStart hook (auto) | `~/plugins/<n>/.nanoclaw-always-on.md` → `AGENTS.md`/`CLAUDE.md` | same |
 | **Opt-out** | `excludePlugins` (drops mount) | `excludePlugins` (drops mount) + skip the ruleset | `excludePlugins` skips the **ruleset only** — skills stay. The mirror is synced globally, not per group |
+| **Workgroup scope** | `data/plugin-scopes.json` (mounts only in the listed workgroups) | same: drops the mount + skips the ruleset elsewhere | skips the ruleset elsewhere; the skill mirror never copies a scoped plugin's skills |
 
 So the only artifacts ever worth generating are: **(1)** the manifests a repo ships
 none of, and **(2)** a condensed always-on ruleset for "mode" plugins. A skills-only
@@ -185,7 +186,9 @@ next spawn, and the enabler run is just a verification pass.
    | `--deny <provider>` (per plugin, all groups) | only before a manifest exists | drops the skills, **keeps the ruleset** | drops the skills, **keeps the ruleset** |
    | remove from `~/plugins` | effective | effective | **does not remove already-synced skills** |
 
-   `excludePlugins` is the only per-group control, and it is not uniform. The plugin
+   `excludePlugins` is the only per-group opt-out, and it is not uniform. (A plugin that
+   carries one workgroup's content belongs in `data/plugin-scopes.json` instead: opt-in,
+   and uniform across all three providers. See docs/workgroups.md.) The plugin
    mount in `src/container-runner.ts:4753-4767` has no provider conditional, so an
    excluded plugin is absent from `/workspace/plugins` for every provider — which is
    why Codex loses its skills too: `planCodexPluginRegistration` reads that mount, and

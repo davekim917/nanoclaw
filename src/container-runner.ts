@@ -135,6 +135,7 @@ import {
   workgroupReadAccessInstructions,
 } from './workgroup-read-access.js';
 import { resolveWorkgroupWiki, workgroupWikiInstructions } from './workgroup-wiki.js';
+import { loadPluginScopes, pluginAllowedForWorkgroup } from './plugin-scopes.js';
 import YAML from 'yaml';
 
 import { extractToolScopes, filterConfigSections, isToolEnabled } from './scoped-env.js';
@@ -4891,6 +4892,7 @@ export async function buildMounts(
     // MCP server with a different allowed root. Host/OSS-only by design.
     const IN_TREE_SHADOWED_PLUGINS = ['design-artifact-loop', 'gitnexus'];
     const excluded = new Set([...IN_TREE_SHADOWED_PLUGINS, ...(containerConfig.excludePlugins ?? [])]);
+    const pluginScopes = loadPluginScopes(); // client plugins mount only in their workgroups
     let entries: string[] = [];
     try {
       entries = fs.readdirSync(pluginsHostDir);
@@ -4898,7 +4900,7 @@ export async function buildMounts(
       log.warn('Failed to read ~/plugins directory', { err });
     }
     for (const entry of entries) {
-      if (excluded.has(entry)) continue;
+      if (excluded.has(entry) || !pluginAllowedForWorkgroup(entry, wgKey, pluginScopes)) continue;
       const pluginHostPath = path.join(pluginsHostDir, entry);
       try {
         if (!fs.statSync(pluginHostPath).isDirectory()) continue;

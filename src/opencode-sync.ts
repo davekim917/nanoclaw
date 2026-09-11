@@ -30,6 +30,7 @@ import { parseClaudeAgentMd } from './claude-agent-md.js';
 import { discoverClaudeSubagents, type DiscoveredSubagent } from './claude-subagent-discovery.js';
 import { formatOpenCodeAgentMd, isManagedOpenCodeAgent } from './opencode-agent-md.js';
 import { discoverPortableSkills, syncSkillSymlinks } from './plugin-skill-discovery.js';
+import { loadPluginScopes, scopedPluginNames } from './plugin-scopes.js';
 
 export interface OpenCodeSubagentsSyncResult {
   /** Every OpenCode agent/ dir we wrote into (global + per-group siblings). */
@@ -241,7 +242,14 @@ export interface OpenCodeSkillSyncResult {
  */
 export function syncOpenCodePluginSkills(): OpenCodeSkillSyncResult {
   const pluginsRoot = path.join(os.homedir(), 'plugins');
-  const discovered = discoverPortableSkills(pluginsRoot, { runtime: 'opencode' });
+  // A workgroup-scoped plugin's skills are never mirrored. Every target here is
+  // either the global dir, which any OpenCode group without its own falls back
+  // to, or a per-sibling dir not keyed by workgroup (src/plugin-scopes.ts).
+  // Filtering by top-level directory also prunes a mirror copied before scoping.
+  const scoped = scopedPluginNames(loadPluginScopes());
+  const discovered = discoverPortableSkills(pluginsRoot, { runtime: 'opencode' }).filter(
+    (skill) => !scoped.has(path.relative(pluginsRoot, skill.skillDir).split(path.sep)[0]),
+  );
   const targets = discoverOpenCodeXdgTargets('skill');
 
   // Collect sibling support dirs (non-SKILL-md children of skills/ roots, e.g.
