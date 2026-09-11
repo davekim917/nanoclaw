@@ -377,14 +377,16 @@ function scopeFixture(
     prState(opts.labels ?? [], HEAD, opts.title, opts.body, opts.changedFiles ?? files?.length ?? 1),
   );
   // The base branch points at BASE_OID. Its labeler.yml (null = absent) and the
-  // comparison are served at that commit, and under the branch name too, unless
-  // a test moves the branch between reads.
+  // comparison are served at that commit, under the branch name, and at the PR's
+  // stale baseRefOid too, unless a test sets them apart; so a base read by the
+  // wrong name fails on the content a test gives it, not on a missing fixture.
   fs.writeFileSync(path.join(root, 'ref--main'), BASE_OID);
-  const compares = [`compare--${BASE_OID}...${HEAD}.json`, `compare--main...${HEAD}.json`];
+  const bases = [BASE_OID, 'main', STALE_BASE];
+  const compares = bases.map((base) => `compare--${base}...${HEAD}.json`);
   for (const name of [...compares, 'files.json']) fs.rmSync(path.join(root, name), { force: true });
   if (files !== null) for (const name of compares) writeJson(root, name, { status: 'ahead', files });
   if (files !== null || opts.unpinnedFiles) writeJson(root, 'files.json', [opts.unpinnedFiles ?? files]);
-  for (const ref of [BASE_OID, 'main']) {
+  for (const ref of bases) {
     const labeler = path.join(root, `labeler--${ref}.yml`);
     if (opts.baseConfig === null) fs.rmSync(labeler, { force: true });
     else fs.writeFileSync(labeler, opts.baseConfig ?? RISK_CONFIG);
