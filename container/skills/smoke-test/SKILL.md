@@ -434,8 +434,9 @@ nomination in the run record, name it on the report, and do not start running
 it. Adding to the floor is a standing-instruction edit and therefore a human's
 call: a coordinator that can extend its own floor can also quietly shrink it.
 
-**Cadence: every campaign walks at least one floor entry, least-recently-passed
-first.** The flat option — walk the whole floor every campaign — was rejected on
+**Cadence: every standard or full campaign walks at least one floor entry,
+least-recently-passed first; light campaigns do not — the install's scheduled
+sweep keeps the floor fresh.** The flat option — walk the whole floor every campaign — was rejected on
 two grounds. At about three campaigns a day a five-entry floor becomes fifteen
 full browser journeys a day, which is exactly the re-derivation cost the skip
 rule below was written to remove; and a walk repeated ninety times a month
@@ -444,10 +445,12 @@ no per-campaign obligation was rejected too: it leaves the mechanism cold for
 days, and a mechanism nobody exercises is one nobody notices has broken. So,
 both, bounded:
 
-- **Every campaign declares at least one lane of kind `floor` in the contract,
-  one lane per entry it walks, with the entry's `id` as the lane id. Never
-  zero** — not on a backend-only diff, not on a one-line change, not on a
-  campaign that found nothing.
+- **Every standard or full campaign declares at least one lane of kind `floor`
+  in the contract, one lane per entry it walks, with the entry's `id` as the
+  lane id. Never zero** — not on a backend-only diff, not on a one-line
+  change, not on a campaign that found nothing. Light campaigns declare none;
+  they lean on the install's scheduled sweep to keep the floor from going
+  stale between them.
 - **Which entries are due is computed, not chosen.** Every entry past its
   `max_interval` is due, all of them, however many that is — the ceiling is the
   deployment's own stated tolerance and nothing overrides it. If none are
@@ -1547,8 +1550,8 @@ left over is narration that should not have posted.
 Run a changed-surface `audit` for each settled develop SHA. Any user-visible
 change must include a real-browser frontend lane even when the diff looks
 backend-only. Changed surface decides what a campaign runs *extra*; the
-coverage floor (§2) runs in every campaign regardless of the diff, including
-this one. Run `full` for a
+coverage floor (§2) runs in every standard or full campaign regardless of the
+diff, including this one — a light campaign skips it. Run `full` for a
 release candidate, a manually named feature, a high-risk label, or a scheduled
 nightly/weekly sweep. This preserves continuous coverage without paying for idle
 turns or rerunning an unchanged build.
@@ -1583,6 +1586,11 @@ PR sizes off its develop-compare target diff, never its own two-marker diff.
 No rules file means `standard`, `sizeReason: "no sizing rules"` — unchanged
 behavior for installs that never added one. The install's own campaign prompt
 decides what each size actually runs; this gate only classifies, never picks lanes.
+A rules file's `full` list can also import from the install's own release-policy
+module via `fullGlobsFrom: {"path": ..., "name": ...}`, unioned with any local
+`full` globs — so smoke never keeps a second, driftable copy of that list;
+any import problem (missing file, import error, absent or mistyped variable)
+fails closed to `full`.
 
 Commands: `poll` (default), `check <pr>` (read-only, mirrors the develop
 gate's `check`), `claim <run-id> <pr> <sha> [owner-token]`,

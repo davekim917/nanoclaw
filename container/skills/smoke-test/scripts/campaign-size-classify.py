@@ -16,6 +16,7 @@ failure, truncated listing) — that fail-closed call is made by the caller
 truncation) this script has no access to. This script only classifies a
 complete, known file list against the rules.
 """
+import importlib.util
 import json
 import re
 import sys
@@ -113,8 +114,55 @@ def match_first(path, compiled_rules):
     return None
 
 
+def load_full_globs_from(spec):
+    """Load `fullGlobsFrom: {"path": <python file>, "name": <variable>}`.
+
+    Returns (globs, None) on success or (None, reason) on any failure. The
+    install's release policy already owns its sensitive-path list; this lets
+    smoke import it directly instead of keeping a second, driftable copy.
+    Every failure mode here is a caller instruction to fail closed to `full`
+    — a missing file, an import-time exception, a missing variable, and a
+    variable of the wrong type are all indistinguishable from "this rules
+    file's full-glob policy could not be read," which must never silently
+    fall through to a lighter campaign.
+    """
+    if not isinstance(spec, dict):
+        return None, "fullGlobsFrom must be an object with path and name"
+    path = spec.get("path")
+    name = spec.get("name")
+    if not isinstance(path, str) or not path:
+        return None, "fullGlobsFrom.path is missing or not a string"
+    if not isinstance(name, str) or not name:
+        return None, "fullGlobsFrom.name is missing or not a string"
+    try:
+        module_spec = importlib.util.spec_from_file_location("_campaign_size_full_globs", path)
+        if module_spec is None or module_spec.loader is None:
+            return None, "fullGlobsFrom.path {} could not be loaded as a module".format(path)
+        module = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+    except Exception as exc:  # noqa: BLE001 -- any import-time failure fails closed
+        return None, "fullGlobsFrom.path {} raised on import: {}".format(path, exc)
+    if not hasattr(module, name):
+        return None, "fullGlobsFrom.name {} not found in {}".format(name, path)
+    value = getattr(module, name)
+    if not isinstance(value, (list, tuple)) or not all(isinstance(v, str) for v in value):
+        return None, "fullGlobsFrom.name {} in {} is not a list of strings".format(name, path)
+    return list(value), None
+
+
 def classify(files, rules):
-    full_rules = compile_rule_list(rules.get("full", []) or [])
+    full_globs = list(rules.get("full", []) or [])
+    full_globs_from = rules.get("fullGlobsFrom")
+    if full_globs_from is not None:
+        imported_globs, error = load_full_globs_from(full_globs_from)
+        if error is not None:
+            return "full", "full: {}".format(error)
+        # Union with any local `full` globs, order preserved, no duplicates.
+        for g in imported_globs:
+            if g not in full_globs:
+                full_globs.append(g)
+
+    full_rules = compile_rule_list(full_globs)
     allowed_rules = compile_rule_list(rules.get("lightAllowed", []) or [])
     deny_rules = compile_rule_list(rules.get("lightDeny", []) or [])
 

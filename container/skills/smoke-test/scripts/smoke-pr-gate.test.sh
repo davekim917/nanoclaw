@@ -1588,4 +1588,78 @@ echo '["frontend/sub/a.css"]' | python3 "$CLASSIFY" "$STAR_RULES" | jq -e '
   .campaignSize == "standard" and .sizeReason == "standard: frontend/sub/a.css not matched by lightAllowed"
 ' >/dev/null
 
+# --- 32. `fullGlobsFrom`: import the install's own release-policy module
+# instead of keeping a second copy of its sensitive-path list in the rules
+# file. Every failure mode here (missing file, import error, absent or
+# mistyped variable) fails closed to `full` -- exercised directly against
+# campaign-size-classify.py, same as the glob unit cases above.
+POLICY_MOD="$STATE_DIR/policy.py"
+cat > "$POLICY_MOD" <<'PY'
+SENSITIVE_GLOBS = ["backend/permissions/**", "backend/billing/**"]
+PY
+
+FGF_RULES="$STATE_DIR/fgf-rules.json"
+cat > "$FGF_RULES" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],"lightDeny":[],
+ "fullGlobsFrom":{"path":"$POLICY_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+# A file matching the imported policy's own glob: full.
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$FGF_RULES" | jq -e '
+  .campaignSize == "full" and
+  .sizeReason == "full: backend/billing/charge.ts matched backend/billing/**"
+' >/dev/null
+# No match against the imported globs: falls through to the ordinary
+# light/standard rules exactly as if fullGlobsFrom were absent.
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$FGF_RULES" | jq -e '
+  .campaignSize == "light"
+' >/dev/null
+
+# Import error (file does not exist): fails closed to full, names the path.
+FGF_MISSING="$STATE_DIR/fgf-missing.json"
+cat > "$FGF_MISSING" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$STATE_DIR/does-not-exist.py","name":"X"}}
+JSON
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$FGF_MISSING" | jq -e '
+  .campaignSize == "full" and (.sizeReason | startswith("full: fullGlobsFrom.path"))
+' >/dev/null
+
+# Wrong type (a string instead of a list): fails closed to full.
+BAD_TYPE_MOD="$STATE_DIR/policy-bad-type.py"
+cat > "$BAD_TYPE_MOD" <<'PY'
+SENSITIVE_GLOBS = "backend/permissions/**"
+PY
+FGF_BADTYPE="$STATE_DIR/fgf-badtype.json"
+cat > "$FGF_BADTYPE" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$BAD_TYPE_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$FGF_BADTYPE" | jq -e '
+  .campaignSize == "full" and (.sizeReason | test("is not a list of strings"))
+' >/dev/null
+
+# Absent variable: fails closed to full.
+FGF_MISSINGVAR="$STATE_DIR/fgf-missingvar.json"
+cat > "$FGF_MISSINGVAR" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$POLICY_MOD","name":"NOT_THERE"}}
+JSON
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$FGF_MISSINGVAR" | jq -e '
+  .campaignSize == "full" and (.sizeReason | test("not found in"))
+' >/dev/null
+
+# Local `full` globs and imported globs are unioned, not one replacing the
+# other -- a file matching either must classify full.
+FGF_UNION="$STATE_DIR/fgf-union.json"
+cat > "$FGF_UNION" <<JSON
+{"full":["frontend/auth/**"],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$POLICY_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["frontend/auth/login.tsx"]' | python3 "$CLASSIFY" "$FGF_UNION" | jq -e '
+  .campaignSize == "full" and (.sizeReason | test("matched frontend/auth"))
+' >/dev/null
+echo '["backend/permissions/roles.ts"]' | python3 "$CLASSIFY" "$FGF_UNION" | jq -e '
+  .campaignSize == "full" and (.sizeReason | test("matched backend/permissions"))
+' >/dev/null
+
 echo "smoke pr gate tests passed"
