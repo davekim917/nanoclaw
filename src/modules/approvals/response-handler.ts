@@ -12,6 +12,8 @@
  *   2. OneCLI credential approvals (`action = 'onecli_credential'`). Resolved
  *      row-keyed, so the card stays clickable across a host restart — see
  *      onecli-approvals.ts.
+ *   3. Choice cards (`registerChoiceHandler`, choices.ts) — the card carries
+ *      the requester's own buttons; any stored option is an answer.
  *
  * The response handler is registered via core's `registerResponseHandler`;
  * core iterates handlers and the first one to return `true` claims the response.
@@ -25,6 +27,7 @@ import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { hasAdminPrivilege, isGlobalAdmin, isOwner } from '../permissions/db/user-roles.js';
+import { choiceClickAllowed, getChoiceHandler, resolveChoice } from './choices.js';
 import { finalizeReject } from './finalize.js';
 import { ONECLI_ACTION, resolveOneCLIApproval } from './onecli-approvals.js';
 import { getApprovalHandler, notifyApprovalResolved, REJECT_WITH_REASON_VALUE } from './primitive.js';
@@ -81,6 +84,11 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
     return true;
   }
 
+  if (getChoiceHandler(approval.action)) {
+    await resolveChoice(approval, payload.value, namespacedUserId(payload) ?? '');
+    return true;
+  }
+
   await handleRegisteredApproval(approval, payload.value, namespacedUserId(payload) ?? '');
   return true;
 }
@@ -106,6 +114,9 @@ export async function resolveApprovalFromHost(
       resolved: false,
       error: 'OneCLI credential approvals resolve through the gateway flow, not the CLI.',
     };
+  }
+  if (getChoiceHandler(approval.action)) {
+    return { resolved: false, error: 'Choice cards resolve by clicking one of their options, not approve/reject.' };
   }
   await handleRegisteredApproval(approval, decision, userId);
   return { resolved: true };
@@ -211,10 +222,15 @@ async function isAuthorizedApprovalClick(approval: PendingApproval, payload: Res
   // Thread-delivered cards (deliveryTarget='thread', e.g. bash/email gates)
   // post into the originating conversation, where thread access IS the
   // approval authority — any thread member may resolve. See primitive.ts.
-  if (approval.session_id) {
+  // Choice cards never take this shortcut: an answer is a decision the agent
+  // acts on, so it needs admin privilege exactly like an admin-DM card.
+  if (approval.session_id && !getChoiceHandler(approval.action)) {
     const session = await getSession(approval.session_id);
     if (session && (await isThreadDelivery(approval, session))) return true;
   }
+
+  // A choice card may narrow who answers to named approvers (choices.ts).
+  if (getChoiceHandler(approval.action) && !choiceClickAllowed(approval, userId)) return false;
 
   const agentGroupId =
     approval.agent_group_id ?? (approval.session_id ? (await getSession(approval.session_id))?.agent_group_id : null);

@@ -11,6 +11,7 @@ import '../modules/index.js';
 import { getAgentMailbox, readMailboxContext } from '../mailbox/index.js';
 import './core.js';
 import './interactive.js';
+import './request-choice.js';
 import './agents.js';
 import { registerProviderSpecificSelfModTools } from './self-mod.js';
 import './thread-search.js';

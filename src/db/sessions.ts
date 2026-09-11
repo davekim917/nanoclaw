@@ -773,10 +773,15 @@ export async function getPendingApprovalsByAction(action: string): Promise<Pendi
  * card, regardless of whether it was persisted as a pending_question (generic
  * ask_user_question) or a pending_approval (self-mod / OneCLI credential).
  */
-export async function getAskQuestionRender(
-  id: string,
-): Promise<
-  { title: string; question?: string; options: import('../channels/ask-question.js').NormalizedOption[] } | undefined
+export async function getAskQuestionRender(id: string): Promise<
+  | {
+      title: string;
+      question?: string;
+      options: import('../channels/ask-question.js').NormalizedOption[];
+      /** pending_approvals rows only: the action, so a reader classifies the card from this same read. */
+      action?: string;
+    }
+  | undefined
 > {
   const db = getDb();
   const q = await getPendingQuestion(id);
@@ -805,12 +810,12 @@ export async function getAskQuestionRender(
     }
   };
 
-  const a = await db.get<{ title: string; question: string; options_json: string }>(
-    'SELECT title, question, options_json FROM pending_approvals WHERE approval_id = ?',
+  const a = await db.get<{ title: string; question: string; options_json: string; action: string }>(
+    'SELECT title, question, options_json, action FROM pending_approvals WHERE approval_id = ?',
     id,
   );
   const approvalRender = parseRender(a);
-  if (approvalRender) return approvalRender;
+  if (approvalRender) return { ...approvalRender, action: a!.action };
 
   // Channel-registration + unknown-sender approvals persist title/options_json
   // the same way pending_approvals does — just SELECT and return.

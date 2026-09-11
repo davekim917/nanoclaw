@@ -26,6 +26,7 @@ import { log } from '../log.js';
 import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
 import { getAskQuestionRender } from '../db/sessions.js';
+import { isAnswerCardAction } from '../answer-cards.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import type {
   ChannelAdapter,
@@ -1158,6 +1159,18 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           });
           return;
         }
+        // Answer cards (answer-cards.ts) are edited by the host, once the click
+        // is authorized and its answer delivered. Editing here first would show
+        // an answer a refused or losing click never gave. No edit is needed to
+        // acknowledge the click: the adapter acks the platform event itself
+        // (Slack answers block_actions 200 before dispatch, @chat-adapter/slack
+        // dist/index.js:1408-1411). Classified from the render read above, not a
+        // second one: a row the winning click deletes in between would otherwise
+        // read as "not an answer card" and fall through to the edit below.
+        if (render?.action !== undefined && isAnswerCardAction(render.action)) {
+          setupConfig.onAction(questionId, selectedOption, userId);
+          return;
+        }
         const title = render?.title ?? '❓ Question';
         const matched = render?.options.find((o) => o.value === selectedOption);
         const selectedLabel = matched?.selectedLabel ?? selectedOption;
@@ -2052,6 +2065,24 @@ export async function handleForwardedEvent(
           } catch (err) {
             log.error('Failed to acknowledge unresolved Discord card action', { err });
           }
+          return;
+        }
+        if (render?.action !== undefined && isAnswerCardAction(render.action)) {
+          // Answer card, classified from the render read above (see the Chat SDK
+          // path): acknowledge without touching the message (type 6,
+          // DEFERRED_UPDATE_MESSAGE — InteractionResponseType.DeferredMessageUpdate,
+          // discord-api-types payloads/v10/_interactions/responses.d.ts:66-69).
+          // The host edits the card once the answer is delivered.
+          try {
+            await fetch(`https://discord.com/api/v10/interactions/${interactionId}/${interactionToken}/callback`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ type: 6 }),
+            });
+          } catch (err) {
+            log.error('Failed to acknowledge Discord answer-card action', { err });
+          }
+          setupConfig.onAction(questionId, selectedOption, user?.id || '');
           return;
         }
         const cardTitle = render?.title ?? ((originalEmbeds[0]?.title as string) || '❓ Question');
