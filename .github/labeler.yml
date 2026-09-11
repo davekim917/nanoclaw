@@ -41,6 +41,9 @@ risk:high:
     - 'src/container-runner.ts'
     - 'src/cli/dispatch.ts'
     - 'src/cli/registry.ts'
+    # Who may approve a privileged action: approval cards, click authorization, roles
+    - 'src/modules/approvals/**'
+    - 'src/modules/permissions/**'
     # Irreversible against a live DB
     - 'src/db/migrations/**'
     # Supply chain: pnpm allowBuilds lives here
