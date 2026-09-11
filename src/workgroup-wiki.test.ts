@@ -127,6 +127,16 @@ describe('resolveWorkgroupWiki against the session /workspace mountpoint', () =>
     expect(warn).toHaveBeenCalledOnce();
   });
 
+  it.skipIf(process.getuid?.() === 0)('skips the wiki when the mountpoint cannot be checked', () => {
+    fs.chmodSync(workspace(), 0o000);
+    try {
+      expect(resolveWorkgroupWiki('example-labs', workspace())).toBeNull();
+      expect(warn).toHaveBeenCalledOnce();
+    } finally {
+      fs.chmodSync(workspace(), 0o755);
+    }
+  });
+
   it('skips the wiki when an agent left a symlink at the mountpoint', () => {
     fs.mkdirSync(path.join(DATA_DIR, 'elsewhere'));
     fs.symlinkSync(path.join(DATA_DIR, 'elsewhere'), path.join(workspace(), 'wiki'));
