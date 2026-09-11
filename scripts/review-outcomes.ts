@@ -48,19 +48,44 @@
  * rollback section names as primary, over the file-overlap upper bound above:
  * `.github/workflows/shadow-review.yml` opens one issue per low-risk PR it finds a
  * problem in, titled `shadow review: #<n> <title>` and labeled `shadow-review`; a clean
- * PR gets a PR comment instead, no issue. So "was this skipped PR shadow-reviewed, and
- * did the review find a P1" is answerable from the issue list alone: match each issue's
- * title against `SHADOW_REVIEW_TITLE_RE` to recover the PR number, and its body against
- * `P1_LINE_RE` for a finding line marked P1 (the workflow's report step renders every
- * finding as its own bullet, e.g. "- **P1** — file:line — class: description" —
- * `.github/workflows/shadow-review.yml`'s "File findings" step). The match is anchored to
- * that bullet's start (`^- \*\*P1\*\*`, multiline), not a bare `\bP1\b`, so a P2 finding
- * whose free-text description merely *mentions* "P1" (e.g. referencing another PR's
- * finding) doesn't get counted as one. This undercounts by
- * design: a low-risk PR with no shadow-review issue was either clean (a PR comment, not
- * an issue) or the workflow hasn't run yet — both read as "not shadow-reviewed", which is
- * the conservative direction for a metric whose job is to justify tightening the risk
- * list, not to over-claim coverage.
+ * PR gets a PR comment instead, no issue. An issue alone therefore undercounts coverage
+ * — a clean review leaves no issue to find — so `report`'s success path ALSO applies a
+ * `shadow-reviewed` label to the PR itself, whether the review was clean or found
+ * something ("File findings, or confirm none were found", both branches). "Was this
+ * skipped PR shadow-reviewed" is `shadow-reviewed` label present OR a shadow-review issue
+ * exists for it — the OR keeps counting PRs reviewed before the label existed, which have
+ * an issue but no label, so that history isn't lost when this label shipped later than the
+ * issue mechanism. "Did the review find a P1" stays issue-only, unaffected by the label:
+ * match each issue's title against `SHADOW_REVIEW_TITLE_RE` to recover the PR number, and
+ * its body against `P1_LINE_RE` for a finding line marked P1 (the workflow's report step
+ * renders every finding as its own bullet, e.g. "- **P1** — file:line — class:
+ * description"). The match is anchored to that bullet's start (`^- \*\*P1\*\*`, multiline),
+ * not a bare `\bP1\b`, so a P2 finding whose free-text description merely *mentions* "P1"
+ * (e.g. referencing another PR's finding) doesn't get counted as one.
+ *
+ * Shadow-review FAILURE counting is separate and deliberately not folded into "not
+ * shadow-reviewed": when `analyze` errors before Claude produces a result (an expired
+ * credential, an action-side crash), or when `report` itself fails to file the result
+ * after a successful `analyze` (a scrub refusal, a `gh pr comment`/`gh issue create`
+ * failure), `report` labels the PR `shadow-review-failed` instead of applying
+ * `shadow-reviewed` (`.github/workflows/shadow-review.yml`, "Report that analyze failed"
+ * and "Report a filing failure"). Counting a failed run the same as "clean, no issue"
+ * would hide an outage inside a number that looks reassuring; `shadowReviewFailed`
+ * reports it as its own count instead, scoped to the same low-risk population as
+ * `shadowReviewed`.
+ *
+ * **Precedence: a real review is never erased.** The success path applies
+ * `shadow-reviewed` and clears `shadow-review-failed` in ONE `gh pr edit --add-label
+ * shadow-reviewed --remove-label shadow-review-failed` call, made only after the PR
+ * comment or issue actually posts. The failure path — both "analyze failed/cancelled"
+ * and "report failed to file after analyze succeeded" — ONLY ever ADDS
+ * `shadow-review-failed`; it never removes `shadow-reviewed`. That asymmetry is
+ * deliberate: a failed re-run (say, a transient `gh` outage on a PR reviewed cleanly
+ * last week) must never erase evidence that the PR WAS reviewed. Counting mirrors this:
+ * `classifyShadowReview` computes `reviewedPRs` first (issue OR `shadow-reviewed` label),
+ * then computes `failedPRs` as "carries `shadow-review-failed`" MINUS `reviewedPRs` — a
+ * PR carrying both labels (or an issue and the failed label, e.g. mid-transition or after
+ * a failed re-run of an already-reviewed PR) counts as reviewed, never as failed.
  *
  * Usage:
  *   pnpm exec tsx scripts/review-outcomes.ts [--repo owner/repo] [--switch <ISO>]
@@ -68,6 +93,22 @@
  *
  * Defaults: --repo davekim917/nanoclaw, --switch 2026-09-10T00:00:00Z (when risk-scoped
  * review went live here), --days 30, --followup-days 14.
+ *
+ * **Shadow coverage** (separate from the before/after bucket above): the before/after
+ * bucket's low-risk population is a REPLAY of `.github/labeler.yml`'s file globs, kept
+ * that way so pre-labeler PRs (which carry no `risk:high` label at all) still get
+ * classified — see "Low-risk classification" above. But that means its denominator can
+ * disagree with what `shadow-review.yml` itself actually selected, which reads CURRENT
+ * labels (`risk:high` / `review:requested`), not a glob replay. `computeShadowCoverage`
+ * answers a narrower, more literal question — "of the PRs the workflow should be picking
+ * up since it went live, how many did it actually review?" — using `report`'s own
+ * selection rule (`shadow-review.yml:350-356`): base ref `main` (`baseRefName`,
+ * `SHADOW_REVIEW_BASE_REF`) and CURRENT labels excluding `risk:high`/`review:requested`
+ * (`isEligibleForShadowReview`), scoped to PRs merged at or after PR #660's merge time
+ * (`SHADOW_REVIEW_GO_LIVE_ISO`, when shadow review went live). Its one caveat: label
+ * eligibility is judged against a PR's CURRENT labels, which can drift from what
+ * they were at merge time (a PR later relabeled `risk:high`, or `review:requested`
+ * cleared after the fact) — see `LABEL_DRIFT_CAVEAT`.
  */
 import { execFileSync } from 'node:child_process';
 import nodePath from 'node:path';
@@ -82,6 +123,8 @@ export interface PullRequestData {
   body: string;
   mergedAt: string; // ISO-8601 UTC
   files: string[];
+  labels: string[]; // CURRENT labels, not a merge-time snapshot — see "Shadow coverage" below
+  baseRefName: string; // e.g. "main" — shadow-review.yml only selects PRs merged INTO main
 }
 
 export interface Options {
@@ -111,6 +154,9 @@ export interface BucketResult {
   shadowReviewP1: number;
   shadowReviewP1Rate: number;
   shadowReviewP1PRs: number[];
+  shadowReviewFailed: number;
+  shadowReviewFailedRate: number;
+  shadowReviewFailedPRs: number[];
   caveat: string | null;
 }
 
@@ -136,6 +182,7 @@ export interface ReportResult {
   before: BucketResult;
   after: BucketResult;
   weeklyRevertRate: WeeklyRevertRow[];
+  shadowCoverage: ShadowCoverageResult;
 }
 
 const MIN_SAMPLE_FOR_SIGNAL = 30;
@@ -313,6 +360,134 @@ export function buildShadowReviewIndex(issues: ShadowReviewIssueData[]): Map<num
   return index;
 }
 
+export interface ShadowReviewClassification {
+  reviewedPRs: number[];
+  p1PRs: number[];
+  failedPRs: number[];
+}
+
+/**
+ * Classifies `prNumbers` into reviewed / P1 / failed, applying the precedence rule from
+ * the file header: a real review is never erased by a stale (or concurrent) failure
+ * label. Reviewed is computed first (issue OR `shadow-reviewed` label); failed is then
+ * "carries `shadow-review-failed`" MINUS reviewed, so a PR holding both never double-
+ * counts as failed. Shared by `buildBucket` (file-based low-risk population) and
+ * `computeShadowCoverage` (label-based eligible population) so the precedence rule can't
+ * drift between the two.
+ */
+export function classifyShadowReview(
+  prNumbers: number[],
+  shadowReviewIndex: Map<number, { hasP1: boolean }>,
+  reviewedLabelPrNumbers: ReadonlySet<number>,
+  failedLabelPrNumbers: ReadonlySet<number>,
+): ShadowReviewClassification {
+  const reviewedPRs = prNumbers.filter((n) => shadowReviewIndex.has(n) || reviewedLabelPrNumbers.has(n));
+  const reviewedSet = new Set(reviewedPRs);
+  // P1 is issue-derived only: shadowReviewIndex.get(n) is undefined for a label-only PR
+  // (no issue), and `?.hasP1 === true` reads that as false, which is correct — the label
+  // alone carries no severity information.
+  const p1PRs = reviewedPRs.filter((n) => shadowReviewIndex.get(n)?.hasP1 === true);
+  const failedPRs = prNumbers.filter((n) => failedLabelPrNumbers.has(n) && !reviewedSet.has(n));
+  return { reviewedPRs, p1PRs, failedPRs };
+}
+
+const RISK_HIGH_LABEL = 'risk:high';
+const REVIEW_REQUESTED_LABEL = 'review:requested';
+
+/**
+ * Mirrors the LABEL half of `shadow-review.yml`'s own selection rule (`report`'s
+ * job-level `if:`, shadow-review.yml:350-356): eligible for shadow review when CURRENT
+ * labels include neither `risk:high` nor `review:requested`. The base-ref half of that
+ * same `if:` (`github.event.pull_request.base.ref == 'main'`) is checked separately in
+ * `computeShadowCoverage` via `baseRefName`, since it isn't a label. Used only by
+ * `computeShadowCoverage` — the before/after bucket keeps the file-based glob replay
+ * (see file header).
+ */
+export function isEligibleForShadowReview(labels: string[]): boolean {
+  return !labels.includes(RISK_HIGH_LABEL) && !labels.includes(REVIEW_REQUESTED_LABEL);
+}
+
+/** `shadow-review.yml`'s `report` job only ever runs against PRs merged into this branch. */
+const SHADOW_REVIEW_BASE_REF = 'main';
+
+/**
+ * When shadow review went live: PR #660's merge time (`gh pr view 660 --json mergedAt`
+ * against davekim917/nanoclaw). PRs merged before this were never candidates for shadow
+ * review at all, so `computeShadowCoverage` excludes them from its denominator.
+ */
+export const SHADOW_REVIEW_GO_LIVE_ISO = '2026-09-11T15:59:15Z';
+
+export interface ShadowCoverageResult {
+  sinceIso: string;
+  eligible: number;
+  reviewed: number;
+  reviewedRate: number;
+  reviewedPRs: number[];
+  failed: number;
+  failedRate: number;
+  failedPRs: number[];
+  notYetRun: number;
+  notYetRunRate: number;
+  notYetRunPRs: number[];
+  caveat: string;
+}
+
+export const LABEL_DRIFT_CAVEAT =
+  'eligibility is judged against CURRENT labels, not labels at merge time — a PR relabeled ' +
+  'risk:high or review:requested after merging drops out of (or into) this denominator even ' +
+  'though the workflow selected (or skipped) it based on labels as they stood at merge time. ' +
+  '(base ref is not subject to this drift — a PR merges into one branch permanently.)';
+
+/**
+ * Shadow coverage since go-live — see the file header's "Shadow coverage" section for
+ * why this is a separate denominator from the before/after bucket above. `allPRs` should
+ * already include every PR merged at or after `sinceIso` (the caller's fetch window);
+ * PRs merged earlier are filtered out here regardless.
+ */
+export function computeShadowCoverage(
+  allPRs: PullRequestData[],
+  shadowReviewIssues: ShadowReviewIssueData[],
+  reviewedLabelPrNumbers: number[],
+  failedLabelPrNumbers: number[],
+  sinceIso: string = SHADOW_REVIEW_GO_LIVE_ISO,
+): ShadowCoverageResult {
+  const sinceMs = new Date(sinceIso).getTime();
+  const eligiblePRs = allPRs.filter(
+    (pr) =>
+      pr.baseRefName === SHADOW_REVIEW_BASE_REF &&
+      new Date(pr.mergedAt).getTime() >= sinceMs &&
+      isEligibleForShadowReview(pr.labels),
+  );
+  const shadowReviewIndex = buildShadowReviewIndex(shadowReviewIssues);
+  const { reviewedPRs, failedPRs } = classifyShadowReview(
+    eligiblePRs.map((pr) => pr.number),
+    shadowReviewIndex,
+    new Set(reviewedLabelPrNumbers),
+    new Set(failedLabelPrNumbers),
+  );
+  const reviewedSet = new Set(reviewedPRs);
+  const failedSet = new Set(failedPRs);
+  const notYetRunPRs = eligiblePRs
+    .filter((pr) => !reviewedSet.has(pr.number) && !failedSet.has(pr.number))
+    .map((pr) => pr.number);
+
+  const n = eligiblePRs.length;
+  return {
+    sinceIso,
+    eligible: n,
+    reviewed: reviewedPRs.length,
+    reviewedRate: n === 0 ? 0 : reviewedPRs.length / n,
+    reviewedPRs,
+    failed: failedPRs.length,
+    failedRate: n === 0 ? 0 : failedPRs.length / n,
+    failedPRs,
+    notYetRun: notYetRunPRs.length,
+    notYetRunRate: n === 0 ? 0 : notYetRunPRs.length / n,
+    notYetRunPRs,
+    caveat: LABEL_DRIFT_CAVEAT,
+  };
+}
+
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 /**
@@ -363,6 +538,8 @@ function buildBucket(
   riskHighGlobs: string[],
   followupDays: number,
   shadowReviewIndex: Map<number, { hasP1: boolean }>,
+  shadowReviewFailedPrNumbers: ReadonlySet<number>,
+  shadowReviewedLabelPrNumbers: ReadonlySet<number>,
 ): BucketResult {
   const lowRiskPRs = windowPRs.filter((pr) => isLowRisk(pr.files, riskHighGlobs));
 
@@ -373,8 +550,20 @@ function buildBucket(
   const followedUpByOverlapPRs: number[] = [];
   const revertedPRs: number[] = [];
 
-  const shadowReviewedPRs = lowRiskPRs.filter((pr) => shadowReviewIndex.has(pr.number)).map((pr) => pr.number);
-  const shadowReviewP1PRs = shadowReviewedPRs.filter((n) => shadowReviewIndex.get(n)?.hasP1 === true);
+  // Reviewed = has a shadow-review issue OR carries the shadow-reviewed label — see the
+  // file header for why the label is needed (a clean review leaves no issue) and why the
+  // OR (a PR reviewed before the label shipped has only an issue). Failed excludes
+  // reviewed — see the file header's "Precedence" note: a real review is never erased.
+  const {
+    reviewedPRs: shadowReviewedPRs,
+    p1PRs: shadowReviewP1PRs,
+    failedPRs: shadowReviewFailedPRs,
+  } = classifyShadowReview(
+    lowRiskPRs.map((pr) => pr.number),
+    shadowReviewIndex,
+    shadowReviewedLabelPrNumbers,
+    shadowReviewFailedPrNumbers,
+  );
 
   for (const pr of lowRiskPRs) {
     const cutoff = new Date(pr.mergedAt).getTime() + followupDays * MS_PER_DAY;
@@ -422,6 +611,9 @@ function buildBucket(
     shadowReviewP1: shadowReviewP1PRs.length,
     shadowReviewP1Rate: n === 0 ? 0 : shadowReviewP1PRs.length / n,
     shadowReviewP1PRs,
+    shadowReviewFailed: shadowReviewFailedPRs.length,
+    shadowReviewFailedRate: n === 0 ? 0 : shadowReviewFailedPRs.length / n,
+    shadowReviewFailedPRs,
     caveat:
       n < MIN_SAMPLE_FOR_SIGNAL
         ? `only ${n} low-risk PR(s) merged ${label} the switch (<${MIN_SAMPLE_FOR_SIGNAL}) — only a large difference would show`
@@ -434,6 +626,8 @@ export function computeReport(
   riskHighGlobs: string[],
   options: Options,
   shadowReviewIssues: ShadowReviewIssueData[] = [],
+  shadowReviewFailedPrNumbers: number[] = [],
+  shadowReviewedLabelPrNumbers: number[] = [],
 ): ReportResult {
   const switchMs = new Date(options.switchIso).getTime();
   const beforeStart = switchMs - options.days * MS_PER_DAY;
@@ -441,6 +635,8 @@ export function computeReport(
 
   const sorted = [...allPRs].sort((a, b) => new Date(a.mergedAt).getTime() - new Date(b.mergedAt).getTime());
   const shadowReviewIndex = buildShadowReviewIndex(shadowReviewIssues);
+  const failedPrNumberSet = new Set(shadowReviewFailedPrNumbers);
+  const reviewedLabelPrNumberSet = new Set(shadowReviewedLabelPrNumbers);
 
   const beforePRs = sorted.filter((pr) => {
     const t = new Date(pr.mergedAt).getTime();
@@ -451,13 +647,38 @@ export function computeReport(
     return t >= switchMs && t < afterEnd;
   });
 
-  const before = buildBucket('before', beforePRs, sorted, riskHighGlobs, options.followupDays, shadowReviewIndex);
-  const after = buildBucket('after', afterPRs, sorted, riskHighGlobs, options.followupDays, shadowReviewIndex);
+  const before = buildBucket(
+    'before',
+    beforePRs,
+    sorted,
+    riskHighGlobs,
+    options.followupDays,
+    shadowReviewIndex,
+    failedPrNumberSet,
+    reviewedLabelPrNumberSet,
+  );
+  const after = buildBucket(
+    'after',
+    afterPRs,
+    sorted,
+    riskHighGlobs,
+    options.followupDays,
+    shadowReviewIndex,
+    failedPrNumberSet,
+    reviewedLabelPrNumberSet,
+  );
 
   const wholeWindowPRs = sorted.filter((pr) => {
     const t = new Date(pr.mergedAt).getTime();
     return t >= beforeStart && t < afterEnd;
   });
+
+  const shadowCoverage = computeShadowCoverage(
+    allPRs,
+    shadowReviewIssues,
+    shadowReviewedLabelPrNumbers,
+    shadowReviewFailedPrNumbers,
+  );
 
   return {
     repo: options.repo,
@@ -467,6 +688,7 @@ export function computeReport(
     before,
     after,
     weeklyRevertRate: weeklyRevertRate(wholeWindowPRs),
+    shadowCoverage,
   };
 }
 
@@ -485,6 +707,10 @@ interface RawPrFile {
   filename?: string;
 }
 
+interface RawPrLabel {
+  name: string;
+}
+
 interface RawPr {
   number: number;
   title: string;
@@ -492,6 +718,8 @@ interface RawPr {
   mergedAt: string;
   changedFiles: number;
   files: RawPrFile[];
+  labels?: RawPrLabel[];
+  baseRefName: string;
 }
 
 function fetchAllFilesViaRest(repo: string, prNumber: number): string[] {
@@ -519,7 +747,7 @@ export function fetchMergedPRs(repo: string, sinceIso: string): PullRequestData[
     '--search',
     `merged:>=${sinceIso}`,
     '--json',
-    'number,title,body,mergedAt,changedFiles,files',
+    'number,title,body,mergedAt,changedFiles,files,labels,baseRefName',
     '--limit',
     '1000',
   ]);
@@ -530,6 +758,8 @@ export function fetchMergedPRs(repo: string, sinceIso: string): PullRequestData[
     body: pr.body ?? '',
     mergedAt: pr.mergedAt,
     files: resolveFiles(repo, pr),
+    labels: (pr.labels ?? []).map((label) => label.name),
+    baseRefName: pr.baseRefName,
   }));
 }
 
@@ -557,6 +787,47 @@ export function fetchShadowReviewIssues(repo: string): ShadowReviewIssueData[] {
   ]);
   const issues = JSON.parse(raw) as RawIssue[];
   return issues.map((issue) => ({ number: issue.number, title: issue.title, body: issue.body ?? '' }));
+}
+
+interface RawLabeledPr {
+  number: number;
+}
+
+function fetchPRsByLabel(repo: string, label: string): number[] {
+  const raw = gh([
+    'pr',
+    'list',
+    '--repo',
+    repo,
+    '--label',
+    label,
+    '--state',
+    'all',
+    '--json',
+    'number',
+    '--limit',
+    '1000',
+  ]);
+  const prs = JSON.parse(raw) as RawLabeledPr[];
+  return prs.map((pr) => pr.number);
+}
+
+/**
+ * PR numbers currently carrying `shadow-review-failed` — `analyze` errored before
+ * producing a result, so no shadow-review issue exists for these even though they were
+ * selected for review (see the file header, "Shadow-review FAILURE counting").
+ */
+export function fetchShadowReviewFailedPRs(repo: string): number[] {
+  return fetchPRsByLabel(repo, 'shadow-review-failed');
+}
+
+/**
+ * PR numbers currently carrying `shadow-reviewed` — applied by `report`'s success path
+ * whether the review was clean or found something, so a clean review (no issue) still
+ * counts as coverage (see the file header, "Shadow-review counting").
+ */
+export function fetchShadowReviewedPRs(repo: string): number[] {
+  return fetchPRsByLabel(repo, 'shadow-reviewed');
 }
 
 // ─────────────────────────── CLI ───────────────────────────────────────────
@@ -646,7 +917,29 @@ function printBucket(bucket: BucketResult): void {
     `    shadow-review P1:          ${bucket.shadowReviewP1} (${pct(bucket.shadowReviewP1Rate)})` +
       (bucket.shadowReviewP1PRs.length ? ` [${bucket.shadowReviewP1PRs.map((n) => `#${n}`).join(', ')}]` : ''),
   );
+  console.log(
+    `    shadow-review FAILED:      ${bucket.shadowReviewFailed} (${pct(bucket.shadowReviewFailedRate)})` +
+      (bucket.shadowReviewFailedPRs.length ? ` [${bucket.shadowReviewFailedPRs.map((n) => `#${n}`).join(', ')}]` : ''),
+  );
   if (bucket.caveat) console.log(`    caveat: ${bucket.caveat}`);
+}
+
+function printShadowCoverage(coverage: ShadowCoverageResult): void {
+  console.log(`Shadow coverage since go-live (${coverage.sinceIso}), by CURRENT label eligibility:`);
+  console.log(`  eligible:     ${coverage.eligible}`);
+  console.log(
+    `  reviewed:     ${coverage.reviewed} (${pct(coverage.reviewedRate)})` +
+      (coverage.reviewedPRs.length ? ` [${coverage.reviewedPRs.map((n) => `#${n}`).join(', ')}]` : ''),
+  );
+  console.log(
+    `  FAILED:       ${coverage.failed} (${pct(coverage.failedRate)})` +
+      (coverage.failedPRs.length ? ` [${coverage.failedPRs.map((n) => `#${n}`).join(', ')}]` : ''),
+  );
+  console.log(
+    `  not yet run:  ${coverage.notYetRun} (${pct(coverage.notYetRunRate)})` +
+      (coverage.notYetRunPRs.length ? ` [${coverage.notYetRunPRs.map((n) => `#${n}`).join(', ')}]` : ''),
+  );
+  console.log(`  caveat: ${coverage.caveat}`);
 }
 
 function printReport(report: ReportResult): void {
@@ -662,6 +955,30 @@ function printReport(report: ReportResult): void {
   for (const row of report.weeklyRevertRate) {
     console.log(`  ${row.isoWeek}: ${row.reverts}/${row.merged} (${pct(row.rate)})`);
   }
+  console.log('');
+  printShadowCoverage(report.shadowCoverage);
+}
+
+/**
+ * The `merged:>=X` lower bound `fetchMergedPRs` fetches from — the EARLIER of
+ * `switch - days` (what the before/after bucket needs) and `goLiveIso` (what
+ * `computeShadowCoverage` needs). `switch - days` alone isn't enough: a run like
+ * `--switch 2026-10-01 --days 7` would fetch nothing earlier than 2026-09-24, silently
+ * dropping every PR merged between go-live (2026-09-11) and then from `allPRs` — and
+ * `computeShadowCoverage`'s own denominator would undercount without any error, since it
+ * only ever sees what `allPRs` contains. Compared as timestamps, not ISO strings: a bare
+ * `SHADOW_REVIEW_GO_LIVE_ISO` (no milliseconds) and a `.toISOString()` result (always
+ * `.sssZ`) don't sort the same lexically as they do chronologically (`.` sorts before
+ * `Z`), so a string comparison here would silently pick the wrong bound.
+ */
+export function computeFetchSinceIso(
+  switchIso: string,
+  days: number,
+  goLiveIso: string = SHADOW_REVIEW_GO_LIVE_ISO,
+): string {
+  const switchBasedMs = new Date(switchIso).getTime() - days * MS_PER_DAY;
+  const goLiveMs = new Date(goLiveIso).getTime();
+  return new Date(Math.min(switchBasedMs, goLiveMs)).toISOString();
 }
 
 function main(): void {
@@ -671,11 +988,20 @@ function main(): void {
   const labelerConfig = parse(labelerYaml) as Record<string, unknown>;
   const riskHighGlobs = globsForRiskHigh(labelerConfig);
 
-  const sinceIso = new Date(new Date(options.switchIso).getTime() - options.days * MS_PER_DAY).toISOString();
+  const sinceIso = computeFetchSinceIso(options.switchIso, options.days);
   const allPRs = fetchMergedPRs(options.repo, sinceIso);
   const shadowReviewIssues = fetchShadowReviewIssues(options.repo);
+  const shadowReviewFailedPrNumbers = fetchShadowReviewFailedPRs(options.repo);
+  const shadowReviewedLabelPrNumbers = fetchShadowReviewedPRs(options.repo);
 
-  const report = computeReport(allPRs, riskHighGlobs, options, shadowReviewIssues);
+  const report = computeReport(
+    allPRs,
+    riskHighGlobs,
+    options,
+    shadowReviewIssues,
+    shadowReviewFailedPrNumbers,
+    shadowReviewedLabelPrNumbers,
+  );
 
   if (options.json) {
     console.log(JSON.stringify(report, null, 2));

@@ -4,13 +4,16 @@ import { enforceHermeticity } from '../src/test-hermeticity.js';
 
 import {
   buildShadowReviewIndex,
+  computeFetchSinceIso,
   computeReport,
+  computeShadowCoverage,
   extractFixesPrNumber,
   extractShadowReviewPrNumber,
   filesOverlap,
   findFollowUp,
   findRevert,
   globsForRiskHigh,
+  isEligibleForShadowReview,
   isFixTitle,
   isLowRisk,
   isoWeekKey,
@@ -18,6 +21,7 @@ import {
   isRevertOf,
   isRevertPR,
   matchesAnyGlob,
+  SHADOW_REVIEW_GO_LIVE_ISO,
   type Options,
   type PullRequestData,
   type ShadowReviewIssueData,
@@ -34,6 +38,8 @@ function pr(overrides: Partial<PullRequestData> & { number: number }): PullReque
     body: '',
     mergedAt: '2026-09-01T00:00:00Z',
     files: [],
+    labels: [],
+    baseRefName: 'main',
     ...overrides,
   };
 }
@@ -462,5 +468,203 @@ describe('computeReport', () => {
     const report = computeReport(prs, RISK_GLOBS, options);
     expect(report.after.shadowReviewed).toBe(0);
     expect(report.after.shadowReviewP1).toBe(0);
+    expect(report.after.shadowReviewFailed).toBe(0);
+  });
+
+  it('counts shadow-review-failed low-risk PRs separately, not as reviewed', () => {
+    const prs = [
+      // low-risk, after the switch, shadow-reviewed with a P1
+      pr({ number: 3, title: 'feat: c', mergedAt: '2026-09-11T00:00:00Z', files: ['docs/c.md'] }),
+      // low-risk, after the switch, analyze failed (no issue exists for it)
+      pr({ number: 7, title: 'feat: g', mergedAt: '2026-09-12T00:00:00Z', files: ['docs/g.md'] }),
+      // high-risk, so a matching shadow-review-failed label still never lands in the
+      // low-risk denominator (mirrors the high-risk exclusion test above)
+      pr({ number: 8, title: 'fix(guard): h', mergedAt: '2026-09-13T00:00:00Z', files: ['src/guard/x.ts'] }),
+    ];
+    const issues: ShadowReviewIssueData[] = [shadowReviewIssue({ number: 3, body: '- **P1** — a.ts:1 — bad' })];
+    const report = computeReport(prs, RISK_GLOBS, options, issues, [7, 8]);
+    expect(report.after.lowRiskMerged).toBe(2);
+    expect(report.after.shadowReviewFailed).toBe(1);
+    expect(report.after.shadowReviewFailedPRs).toEqual([7]);
+    expect(report.after.shadowReviewFailedRate).toBeCloseTo(1 / 2);
+    // #7 failed, not reviewed — must not also count as shadow-reviewed.
+    expect(report.after.shadowReviewed).toBe(1);
+    expect(report.after.shadowReviewedPRs).toEqual([3]);
+  });
+
+  it('defaults shadow-review-failed counts to zero when no PR numbers are supplied', () => {
+    const prs = [pr({ number: 1, title: 'feat: a', mergedAt: '2026-09-11T00:00:00Z', files: ['docs/a.md'] })];
+    const report = computeReport(prs, RISK_GLOBS, options, []);
+    expect(report.after.shadowReviewFailed).toBe(0);
+    expect(report.after.shadowReviewFailedPRs).toEqual([]);
+  });
+
+  it('counts a clean re-run (shadow-reviewed label, no issue) as reviewed and not failed', () => {
+    const prs = [pr({ number: 9, title: 'feat: i', mergedAt: '2026-09-11T00:00:00Z', files: ['docs/i.md'] })];
+    // No issue — a clean review posts a PR comment, not an issue — and the PR is no
+    // longer in the shadow-review-failed list (report's success path removes it).
+    const report = computeReport(prs, RISK_GLOBS, options, [], [], [9]);
+    expect(report.after.shadowReviewed).toBe(1);
+    expect(report.after.shadowReviewedPRs).toEqual([9]);
+    expect(report.after.shadowReviewP1).toBe(0);
+    expect(report.after.shadowReviewFailed).toBe(0);
+  });
+
+  it('counts a P1 re-run (shadow-reviewed label AND an issue) as reviewed, P1, and not failed', () => {
+    const prs = [pr({ number: 10, title: 'feat: j', mergedAt: '2026-09-11T00:00:00Z', files: ['docs/j.md'] })];
+    const issues: ShadowReviewIssueData[] = [shadowReviewIssue({ number: 10, body: '- **P1** — a.ts:1 — bad' })];
+    const report = computeReport(prs, RISK_GLOBS, options, issues, [], [10]);
+    expect(report.after.shadowReviewed).toBe(1);
+    expect(report.after.shadowReviewedPRs).toEqual([10]);
+    expect(report.after.shadowReviewP1).toBe(1);
+    expect(report.after.shadowReviewP1PRs).toEqual([10]);
+    expect(report.after.shadowReviewFailed).toBe(0);
+  });
+
+  it('still counts a PR reviewed via issue alone as reviewed, with no shadow-reviewed label (pre-label history)', () => {
+    const prs = [pr({ number: 11, title: 'feat: k', mergedAt: '2026-09-11T00:00:00Z', files: ['docs/k.md'] })];
+    const issues: ShadowReviewIssueData[] = [shadowReviewIssue({ number: 11, body: '- **P2** — a.ts:1 — minor' })];
+    // No shadow-reviewed label numbers passed at all — this PR predates the label.
+    const report = computeReport(prs, RISK_GLOBS, options, issues);
+    expect(report.after.shadowReviewed).toBe(1);
+    expect(report.after.shadowReviewedPRs).toEqual([11]);
+  });
+
+  it('counts a PR carrying both shadow-reviewed and shadow-review-failed labels as reviewed, not failed (precedence)', () => {
+    const prs = [pr({ number: 12, title: 'feat: l', mergedAt: '2026-09-11T00:00:00Z', files: ['docs/l.md'] })];
+    // Both label lists name #12: e.g. a failed re-run against a PR reviewed cleanly
+    // earlier only ADDS shadow-review-failed — it never removes shadow-reviewed (see the
+    // file header's "Precedence" note). A real review is never erased by a stale or
+    // concurrent failure label, so #12 must count as reviewed and NOT as failed.
+    const report = computeReport(prs, RISK_GLOBS, options, [], [12], [12]);
+    expect(report.after.shadowReviewed).toBe(1);
+    expect(report.after.shadowReviewedPRs).toEqual([12]);
+    expect(report.after.shadowReviewFailed).toBe(0);
+    expect(report.after.shadowReviewFailedPRs).toEqual([]);
+  });
+});
+
+describe('isEligibleForShadowReview', () => {
+  it('is eligible with no risk:high or review:requested label', () => {
+    expect(isEligibleForShadowReview([])).toBe(true);
+    expect(isEligibleForShadowReview(['bug', 'docs'])).toBe(true);
+  });
+
+  it('is ineligible with risk:high', () => {
+    expect(isEligibleForShadowReview(['risk:high'])).toBe(false);
+  });
+
+  it('is ineligible with review:requested', () => {
+    expect(isEligibleForShadowReview(['review:requested'])).toBe(false);
+  });
+
+  it('is ineligible with both', () => {
+    expect(isEligibleForShadowReview(['risk:high', 'review:requested'])).toBe(false);
+  });
+});
+
+describe('computeShadowCoverage', () => {
+  const sinceIso = '2026-09-11T15:59:15Z';
+
+  it('excludes a PR merged before go-live from the denominator', () => {
+    const prs = [
+      pr({ number: 1, mergedAt: '2026-09-11T15:59:14Z', labels: [] }),
+      pr({ number: 2, mergedAt: '2026-09-11T15:59:15Z', labels: [] }),
+    ];
+    const coverage = computeShadowCoverage(prs, [], [], [], sinceIso);
+    expect(coverage.eligible).toBe(1);
+    expect(coverage.notYetRunPRs).toEqual([2]);
+  });
+
+  it('excludes a low-risk-by-files PR labeled review:requested from the denominator', () => {
+    // Low-risk by the file-glob rule (no src/guard/** touch), but labeled
+    // review:requested — the workflow's own selection rule (isEligibleForShadowReview)
+    // skips it, so the coverage denominator must skip it too, unlike the file-based
+    // before/after bucket which only looks at files.
+    const prs = [
+      pr({ number: 3, mergedAt: '2026-09-12T00:00:00Z', files: ['docs/a.md'], labels: ['review:requested'] }),
+      pr({ number: 4, mergedAt: '2026-09-12T00:00:00Z', files: ['docs/b.md'], labels: [] }),
+    ];
+    const coverage = computeShadowCoverage(prs, [], [], [], sinceIso);
+    expect(coverage.eligible).toBe(1);
+    expect(coverage.notYetRunPRs).toEqual([4]);
+  });
+
+  it('excludes a PR merged into a branch other than main from the denominator', () => {
+    // shadow-review.yml's report job only ever runs for github.event.pull_request.base.ref
+    // == 'main' (shadow-review.yml:149) — a PR merged into some other branch (a long-lived
+    // feature branch, say) was never a candidate, so it must not inflate the denominator.
+    const prs = [
+      pr({ number: 5, mergedAt: '2026-09-12T00:00:00Z', labels: [], baseRefName: 'release' }),
+      pr({ number: 6, mergedAt: '2026-09-12T00:00:00Z', labels: [], baseRefName: 'main' }),
+    ];
+    const coverage = computeShadowCoverage(prs, [], [], [], sinceIso);
+    expect(coverage.eligible).toBe(1);
+    expect(coverage.notYetRunPRs).toEqual([6]);
+  });
+
+  it('partitions eligible PRs into reviewed, failed, and not-yet-run', () => {
+    const prs = [
+      pr({ number: 5, mergedAt: '2026-09-12T00:00:00Z', labels: [] }), // reviewed via label
+      pr({ number: 6, mergedAt: '2026-09-12T00:00:00Z', labels: [] }), // failed
+      pr({ number: 7, mergedAt: '2026-09-12T00:00:00Z', labels: [] }), // not yet run
+      pr({ number: 8, mergedAt: '2026-09-12T00:00:00Z', labels: [] }), // reviewed + failed → reviewed wins
+    ];
+    const coverage = computeShadowCoverage(prs, [], [5, 8], [6, 8], sinceIso);
+    expect(coverage.eligible).toBe(4);
+    expect(coverage.reviewed).toBe(2);
+    expect(coverage.reviewedPRs).toEqual([5, 8]);
+    expect(coverage.failed).toBe(1);
+    expect(coverage.failedPRs).toEqual([6]);
+    expect(coverage.notYetRun).toBe(1);
+    expect(coverage.notYetRunPRs).toEqual([7]);
+    expect(coverage.caveat).toMatch(/CURRENT labels/);
+  });
+
+  it('defaults sinceIso to SHADOW_REVIEW_GO_LIVE_ISO', () => {
+    const prs = [pr({ number: 9, mergedAt: '2026-09-01T00:00:00Z', labels: [] })];
+    const coverage = computeShadowCoverage(prs, [], [], []);
+    expect(coverage.sinceIso).toBe(SHADOW_REVIEW_GO_LIVE_ISO);
+    expect(coverage.eligible).toBe(0); // #9 merged before go-live
+  });
+});
+
+describe('computeFetchSinceIso', () => {
+  const goLive = '2026-09-11T15:59:15Z';
+
+  it('uses switch - days when that is earlier than go-live', () => {
+    // switch - days = 2026-08-27, well before go-live — the before/after bucket's own
+    // window should win here, since it's the one actually asking for more history.
+    const since = computeFetchSinceIso('2026-09-10T00:00:00Z', 14, goLive);
+    expect(since).toBe(new Date('2026-08-27T00:00:00Z').toISOString());
+  });
+
+  it('uses go-live when switch - days would be later than go-live', () => {
+    // --switch 2026-10-01 --days 7 -> switch - days = 2026-09-24, AFTER go-live. Fetching
+    // from there alone would silently drop every PR merged 09-11..09-24 from allPRs,
+    // undercounting computeShadowCoverage even though its own "since" label still reads
+    // "since go-live" — see the file header / computeFetchSinceIso's own doc comment.
+    const since = computeFetchSinceIso('2026-10-01T00:00:00Z', 7, goLive);
+    expect(since).toBe(new Date(goLive).toISOString());
+  });
+
+  it('is inclusive at the boundary: switch - days exactly equal to go-live', () => {
+    const since = computeFetchSinceIso('2026-09-11T15:59:15Z', 0, goLive);
+    expect(since).toBe(new Date(goLive).toISOString());
+  });
+
+  it('compares timestamps, not ISO strings (go-live has no milliseconds)', () => {
+    // A naive string comparison of a bare-seconds ISO string ('...15Z') against a
+    // .toISOString() result ('...15.000Z') sorts '.' before 'Z', so the millisecond
+    // form would read as "earlier" even when the instants are equal or later — this
+    // case pins the correct (numeric) comparison at exactly that boundary.
+    const since = computeFetchSinceIso('2026-09-11T15:59:16Z', 0, goLive);
+    expect(since).toBe(new Date(goLive).toISOString());
+  });
+
+  it('defaults goLiveIso to SHADOW_REVIEW_GO_LIVE_ISO', () => {
+    // switch - days = 2026-10-01, well after go-live — only the default takes effect here.
+    const since = computeFetchSinceIso('2026-10-01T00:00:00Z', 0);
+    expect(since).toBe(new Date(SHADOW_REVIEW_GO_LIVE_ISO).toISOString());
   });
 });
