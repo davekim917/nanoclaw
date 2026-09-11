@@ -497,16 +497,20 @@ FIXES_PR_LINE_RE='(^|\n)Fixes-PR:[ \t]*(#[0-9]+|none)\b'
 # worker-high/worker-frontier tier config — see that file's header. Read next to
 # THIS script (via $HERE, already resolved above from BASH_SOURCE), not the
 # caller's cwd or $REPO: a repo that vendors this skill carries its own copy
-# next to the script, and during a merge-check run the checked-out tree is
-# main's, so this is always main's allowlist for the head being evaluated,
-# never the PR branch's (a PR could otherwise edit its own way past the gate).
+# next to the script, so the allowlist this reads is whichever copy of the
+# skill directory $HERE sits in — the caller's job is to make sure that's
+# main's copy at main's CURRENT tip, never the PR branch's (a PR could
+# otherwise edit its own way past the gate) and never a stale checkout (which
+# runs whatever the gate was at that older commit, silently — no failure).
 #
 # A merge-check run MUST extract the whole skill directory, not just this
 # script, or REVIEWER_MODELS_FILE resolves to nothing next to it and every
 # receipt/merge-check call fails closed (see reviewer_model_allowed's error
-# below). The one supported extraction:
-#   git archive origin/main container/skills/pr-review-loop | tar -x -C <dir>
-#   <dir>/container/skills/pr-review-loop/scripts/codex-review.sh ...
+# below). The one supported extraction (mergers typically run this from
+# outside the repo entirely, so the destination is a scratch dir):
+#   SP=<scratch dir>
+#   mkdir -p "$SP" && git -C <repo> archive origin/main container/skills/pr-review-loop | tar -x -C "$SP"
+#   "$SP"/container/skills/pr-review-loop/scripts/codex-review.sh ...
 # A single-file extraction (copying just codex-review.sh) or `bash <(git show
 # origin/main:container/skills/pr-review-loop/scripts/codex-review.sh)` has no
 # sibling reviewer-models.txt on disk and fails closed the same way.

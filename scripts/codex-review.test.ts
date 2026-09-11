@@ -1197,6 +1197,32 @@ describe('codex-review risk-scoped review requests', () => {
   });
 
   it.each([
+    ['an embedded newline (a\\nb)', 'a\nb'],
+    ['an embedded newline (b\\na)', 'b\na'],
+    ['a trailing carriage return', 'claude-opus-5\r'],
+    ['an embedded carriage return', 'claude-opus-5\rmore'],
+  ])('refuses a receipt whose --reviewer contains %s, posting nothing', (_case, reviewer) => {
+    const root = tempRoot();
+    const bodyFile = path.join(root, 'review.md');
+    fs.writeFileSync(bodyFile, 'Scope: complete diff.\n');
+
+    const result = runHelper(root, [
+      'receipt',
+      '--head',
+      HEAD,
+      '--outcome',
+      'approve',
+      '--reviewer',
+      reviewer,
+      '--body-file',
+      bodyFile,
+    ]);
+    expect(result.status).toBe(2);
+    expect(result.posted).toBeNull();
+    expect(result.stderr).toContain('newline or carriage return');
+  });
+
+  it.each([
     ['claude-sonnet-5', 'claude-sonnet-5'],
     ['claude-haiku-4-5', 'claude-haiku-4-5 (worker-fast)'],
     ['gpt-5.6-luna', 'gpt-5.6-luna via codex exec'],

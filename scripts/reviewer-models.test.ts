@@ -73,4 +73,18 @@ describe('extractModelLine edge cases', () => {
     });
     expect(() => computeReviewerModelIds(root)).toThrow(/not a concrete versioned model id/);
   });
+
+  it('refuses a model line carrying a trailing comment (extractScalar reads it as part of the value)', () => {
+    const root = writeFixtureRepo({
+      workerHigh: '---\nname: worker-high\ndescription: d\nmodel: claude-opus-5[1m] # pinned\neffort: high\n---\n\nbody\n',
+    });
+    expect(() => computeReviewerModelIds(root)).toThrow(/is not a bare model id/);
+  });
+
+  it('refuses a model line that is several space-separated words, not one id', () => {
+    const root = writeFixtureRepo({
+      workerHigh: '---\nname: worker-high\ndescription: d\nmodel: claude opus 5\neffort: high\n---\n\nbody\n',
+    });
+    expect(() => computeReviewerModelIds(root)).toThrow(/is not a bare model id/);
+  });
 });

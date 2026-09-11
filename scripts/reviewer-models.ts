@@ -81,17 +81,33 @@ function stripContextWindowSuffix(modelId: string): string {
 }
 
 /**
- * Refuse a bare alias ("opus", "sonnet", "inherit") standing in for a real
- * model id — those resolve to whatever the runtime's current default is, so
- * "who is allowed to review" would silently follow that default around
- * instead of naming a fixed tier. Every real id here (Claude or Codex) carries
- * a version number, so requiring a digit is enough to catch an alias without
- * hardcoding the alias list.
+ * Refuse anything that isn't a bare model id, in two ways:
+ *
+ * 1. A bare alias ("opus", "sonnet", "inherit") standing in for a real model
+ *    id — those resolve to whatever the runtime's current default is, so "who
+ *    is allowed to review" would silently follow that default around instead
+ *    of naming a fixed tier. Every real id here (Claude or Codex) carries a
+ *    version number, so requiring a digit is enough to catch an alias without
+ *    hardcoding the alias list.
+ * 2. A shape that isn't purely `[A-Za-z0-9._-]+` — extractScalar is NOT a
+ *    full YAML parser (its own doc comment says so), so `model: claude-opus-5
+ *    # pinned` reads back the trailing ` # pinned` as part of the value, and
+ *    `model: claude opus 5` reads back as three space-separated words. Both
+ *    contain a digit and would pass check 1, then silently fail to match
+ *    anything's first word at review time — Opus loses reviewer eligibility
+ *    with the drift test still green. Requiring the id to be nothing but
+ *    id-shaped characters (checked AFTER the `[1m]` suffix is stripped)
+ *    catches both.
  */
 function assertConcreteModelId(id: string, source: string): void {
   if (!/[0-9]/.test(id)) {
     throw new Error(
       `${source}: "${id}" is not a concrete versioned model id — bare aliases like "opus", "sonnet", or "inherit" are not allowed here`,
+    );
+  }
+  if (!/^[A-Za-z0-9._-]+$/.test(id)) {
+    throw new Error(
+      `${source}: "${id}" is not a bare model id — expected only letters, digits, '.', '_', '-' (no comments, extra words, or other trailing text) after stripping any [1m] suffix`,
     );
   }
 }
