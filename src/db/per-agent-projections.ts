@@ -517,24 +517,23 @@ interface ArchiveSeedCandidate {
  * mismatch on any axis — different agent, different scope, a wrong-version
  * stamp, a stamp whose file is gone — returns no candidate, which sends the
  * caller down the existing full-rebuild path, never a wrong seed.
- * `seedArchiveProjectionFrom` re-verifies this same boundary against the
- * copied bytes before trusting the file at all.
+ * `seedArchiveProjectionFrom` re-verifies the AGENT half of this against the
+ * copied bytes (every row must actually be labeled with the caller); the
+ * member-set half rests on the stamp itself, which is host-only and never
+ * sits inside a container-mounted tree (see "Where the stamp lives" above).
+ *
+ * `stamp` is the caller's own freshly-computed identity — `agentGroupId` and
+ * `workgroupMemberIds` folded into exactly the shape `computeArchiveProjectionStamp`
+ * produces, via the one caller, `materializeArchiveProjection`. Comparing
+ * against it directly (rather than re-deriving the same fields by hand here)
+ * is what keeps this match and `decideArchiveProjectionMode`'s local-stamp
+ * match from drifting apart.
  *
  * Scans every stamp under `DATA_DIR/projection-stamps`: cheap (one small JSON
  * read per existing session projection) and only reached when THIS session's
- * own projection has neither a file nor a stamp yet, i.e. genuinely fresh —
- * see the one caller, `materializeArchiveProjection`.
+ * own projection has neither a file nor a stamp yet, i.e. genuinely fresh.
  */
-function findArchiveSeedCandidate(
-  agentGroupId: string,
-  workgroupMemberIds: string[] | undefined,
-  excludeDstPath: string,
-): ArchiveSeedCandidate | null {
-  const desiredIdentity: ArchiveProjectionIdentity = {
-    version: ARCHIVE_PROJECTION_STAMP_VERSION,
-    agentGroupId,
-    scope: workgroupMemberIds && workgroupMemberIds.length > 0 ? [...workgroupMemberIds].sort() : null,
-  };
+function findArchiveSeedCandidate(stamp: ArchiveProjectionStamp, excludeDstPath: string): ArchiveSeedCandidate | null {
   let entries: string[];
   try {
     entries = fs.readdirSync(PROJECTION_STAMPS_DIR);
@@ -553,7 +552,7 @@ function findArchiveSeedCandidate(
     }
     if (!parsed) continue;
     if (typeof parsed.dstPath !== 'string' || parsed.dstPath === excludeResolved) continue;
-    if (!sameProjectionIdentity(parsed, desiredIdentity)) continue;
+    if (!sameProjectionIdentity(parsed, stamp)) continue;
 
     try {
       if (fs.statSync(parsed.dstPath).size === 0) continue; // Orphaned/partial file — not trustworthy.
@@ -577,14 +576,26 @@ function findArchiveSeedCandidate(
  * there), and a full build always stamps every row that way too — so a valid
  * candidate's bytes already ARE what a full build would write.
  *
- * That "only ever" is exactly what this function re-checks before returning,
- * fail-closed, rather than trusting the stamp alone: `MIN`/`MAX
- * (agent_group_id)` are both served by `idx_archive_ag_sent`, which leads
- * with that column, so this costs about 1 ms even on a 131k-row projection —
- * cheap insurance for a data-isolation boundary. A foreign id here means the
+ * That "only ever" is exactly what the MIN/MAX check below re-verifies
+ * fail-closed, rather than trusting the stamp alone — but only the AGENT
+ * half of the identity: it proves every row in the copied file is labeled
+ * with the caller, nothing about the workgroup member set. That's fine here
+ * because the member-set half was never a property of the file's CONTENTS to
+ * begin with — it rests entirely on the stamp, which lives in a host-only
+ * tree outside every container mount ("Where the stamp lives", above) and so
+ * can't be tampered with from inside a container the way the projection file
+ * itself, in principle, could be. A foreign `agent_group_id` here means the
  * candidate file on disk disagrees with what its own stamp claimed (a stale
  * copy from an older build, a hand-edited fixture, corruption), and the
  * caller must not trust it.
+ *
+ * MIN and MAX run as two separate queries, not `SELECT MIN(x), MAX(x)` in
+ * one: measured against a real 131,632-row/273MB projection, the combined
+ * form took 9-17ms (`EXPLAIN QUERY PLAN` shows a full `SCAN … USING COVERING
+ * INDEX idx_archive_ag_sent` — SQLite's single-aggregate min/max shortcut
+ * only fires for a query with exactly one `MIN()`/`MAX()`), while each query
+ * split out took 0.03-0.1ms (`SEARCH … USING COVERING INDEX`, i.e. an actual
+ * index lookup rather than a scan).
  *
  * `fsync` before any of that: this copy is about to be trusted as the
  * durable baseline every append after it builds on, so it must not still be
@@ -599,22 +610,20 @@ function seedArchiveProjectionFrom(candidate: ArchiveSeedCandidate, dstPath: str
     fs.closeSync(fd);
   }
   const dst = new Database(dstPath, { readonly: true });
-  let bounds: { lo: string | null; hi: string | null };
+  let lo: string | null;
+  let hi: string | null;
   try {
-    bounds = dst.prepare(`SELECT MIN(agent_group_id) AS lo, MAX(agent_group_id) AS hi FROM messages_archive`).get() as {
-      lo: string | null;
-      hi: string | null;
-    };
+    lo = (dst.prepare(`SELECT MIN(agent_group_id) AS v FROM messages_archive`).get() as { v: string | null }).v;
+    hi = (dst.prepare(`SELECT MAX(agent_group_id) AS v FROM messages_archive`).get() as { v: string | null }).v;
   } finally {
     dst.close();
   }
   // An empty table (lo/hi both NULL) passes — there's nothing foreign in it.
-  const foreign =
-    (bounds.lo !== null && bounds.lo !== agentGroupId) || (bounds.hi !== null && bounds.hi !== agentGroupId);
+  const foreign = (lo !== null && lo !== agentGroupId) || (hi !== null && hi !== agentGroupId);
   if (foreign) {
     throw new Error(
       `Archive projection seed candidate ${candidate.dstPath} contains a foreign agent_group_id ` +
-        `(expected only ${agentGroupId}, saw range [${bounds.lo}, ${bounds.hi}])`,
+        `(expected only ${agentGroupId}, saw range [${lo}, ${hi}])`,
     );
   }
 }
@@ -951,7 +960,7 @@ export function materializeArchiveProjection(
   // returned by `findArchiveSeedCandidate` — such a session still lands on a
   // full build, just like today.
   if (previous === null && !fs.existsSync(dstPath)) {
-    const candidate = findArchiveSeedCandidate(agentGroupId, workgroupMemberIds, dstPath);
+    const candidate = findArchiveSeedCandidate(stamp, dstPath);
     if (candidate) {
       try {
         seedArchiveProjectionFrom(candidate, dstPath, agentGroupId);
