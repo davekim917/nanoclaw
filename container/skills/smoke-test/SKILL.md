@@ -757,7 +757,12 @@ already inside the allowed prefixes, and the 50MB attachment cap is far above a
 declaring `confirmedFindings: ["<id>", ...]` must carry, per id, either
 `clips/<id>.mp4` (a real, nonempty file) or a `clip-skipped: <id>: <reason>`
 line in its `evidence` array — silence fails the barrier, exactly like the
-`record start` failure above must still be recorded rather than dropped.
+`record start` failure above must still be recorded rather than dropped. Set
+`confirmedFindings` with the scaffold, never by hand — `smoke-run-scaffold.sh
+marker <run-dir> <lane-id> <status> [summary] [evidence-csv]
+--confirmed-findings <id>[,<id>...]` — the same rule that forbids hand-written
+markers elsewhere in this file applies here too, and the flag is optional
+(omit it and the field is omitted, exactly as before this existed).
 
 ### Contact sheet
 
