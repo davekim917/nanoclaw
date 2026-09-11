@@ -853,7 +853,7 @@ healthz_ok() {
 # defaults to not-ready. Prints one JSON facts line.
 evaluate_pr() {
   local pr="$1" head_sha="$2" head_ref="${3:-}"
-  local files_json files_len files_fetch_failed migrations_touched frontend_touched is_freeze ci_sha
+  local files_json files_len files_fetch_failed migrations_touched frontend_touched frontend_required is_freeze ci_sha
   local migration_files migrations_determinable target_files_json target_files_len target_compare_failed
   local runs_json runs_len ci_total ci_pending ci_failed ci_succeeded ci_ready ci_truncated
   local services_json backend backend_id backend_url backend_deploy_sha backend_ready
@@ -958,6 +958,14 @@ evaluate_pr() {
     [ -n "$migration_files" ] && jq -e 'type == "array"' <<<"$migration_files" >/dev/null 2>&1 || migration_files='[]'
   fi
 
+  # `frontendTouched` remains a factual target-diff field. It is not an
+  # identity requirement for a detected two-marker freeze: the marker pair
+  # itself says the frozen source has both backend and frontend previews. A
+  # moving-branch compare with no frontend paths (equal/ancestor targets) can
+  # never prove the frontend preview is absent, stale, or still building.
+  frontend_required="$frontend_touched"
+  if [ "$is_freeze" = true ]; then frontend_required=true; fi
+
   # CI facts come from `gh run list --branch`, deliberately NOT the check-runs
   # REST endpoint. This gate originally read
   # `repos/<repo>/commits/<sha>/check-runs`, which works with an operator token
@@ -1024,7 +1032,7 @@ evaluate_pr() {
 
   frontend_ready=true
   frontend=""; frontend_id=""; frontend_url=""; frontend_deploy_sha=""
-  if [ "$frontend_touched" = true ]; then
+  if [ "$frontend_required" = true ]; then
     frontend_ready=false
     frontend="$(find_preview "$services_json" "$FRONTEND_SERVICE" "$pr")"
     if [ "$frontend" != "null" ] && [ -n "$frontend" ]; then
@@ -1053,6 +1061,7 @@ evaluate_pr() {
     --argjson fetchOk "$fetch_ok" \
     --argjson migrationsTouched "$migrations_touched" \
     --argjson frontendTouched "$frontend_touched" \
+    --argjson frontendRequired "$frontend_required" \
     --argjson isFreezePr "$is_freeze" \
     --arg ciSha "$ci_sha" \
     --argjson ciReady "$ci_ready" --argjson ciTotal "$ci_total" \
@@ -1067,6 +1076,7 @@ evaluate_pr() {
     '{
       pr: $pr, headSha: $headSha, fetchOk: $fetchOk,
       migrationsTouched: $migrationsTouched, frontendTouched: $frontendTouched,
+      frontendRequired: $frontendRequired,
       # migrationFiles names the pending migrations directly — the whole point
       # of this field is that an agent never has to re-derive what MG-1 took a
       # coordinator+challenger 30 minutes to find by hand. migrationsDeterminable
