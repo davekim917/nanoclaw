@@ -364,17 +364,21 @@ function commitStatus(context: string, state: string, createdAt = '2026-09-05T00
 // `reviewer` defaults to an allowed worker-high model so existing approve-path
 // fixtures keep passing the model-allowlist check merge-check now applies;
 // tests of the allowlist itself pass a disallowed (or omitted) reviewer.
+// `databaseId` is the comment's posting order, which receipts are ordered by;
+// by default it follows createdAt, to the second.
 function receiptComment(
   head: string,
   outcome: string,
   createdAt: string,
   authorAssociation = 'OWNER',
   reviewer = 'claude-opus-5 (worker-high)',
+  databaseId = String(Date.parse(createdAt) / 1000),
 ): Page {
   return {
     author: { login: 'davekim917' },
     authorAssociation,
     createdAt,
+    fullDatabaseId: databaseId,
     body: `### Substitute review receipt\n\n- **Reviewer and runtime:** ${reviewer}\n- **Outcome:** ${outcome}\n\n<!-- pr-review-loop:substitute-receipt head=${head} outcome=${outcome} -->`,
   };
 }
@@ -1617,12 +1621,21 @@ describe('codex-review risk-scoped review requests', () => {
 
   it.each([
     ['approves an older head', [receiptComment(OLD_HEAD, 'approve', '2026-09-05T00:20:00Z')], 'receipt: none'],
-    // Listed newest first, so only a sort by time — not list order — finds the later `changes`.
+    // Listed newest first, so only a sort by posting order — not list order — finds the later `changes`.
     [
       'approved, then asked for changes',
       [
         receiptComment(HEAD, 'changes', '2026-09-05T00:30:00Z'),
         receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z'),
+      ],
+      'receipt: changes',
+    ],
+    // One second, listed out of posting order: only the comment's database id finds the later `changes`.
+    [
+      'approved, then asked for changes within the same second',
+      [
+        receiptComment(HEAD, 'changes', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', '101'),
+        receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', '100'),
       ],
       'receipt: changes',
     ],
@@ -2093,6 +2106,17 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
         { ...receiptComment(HEAD, 'approve', '2026-09-05T00:30:00Z'), lastEditedAt: '2026-09-05T02:00:00Z' },
       ],
       '2026-09-05T00:30:00Z',
+    ],
+    [
+      'a changes receipt posted in the same second as the approval was edited after the merge',
+      [
+        receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', '100'),
+        {
+          ...receiptComment(HEAD, 'changes', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', '101'),
+          lastEditedAt: '2026-09-05T02:00:00Z',
+        },
+      ],
+      '2026-09-05T00:20:00Z',
     ],
   ])('flags a review-verdict merge when %s', (_case, comments, postedAt) => {
     const root = tempRoot();

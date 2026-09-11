@@ -14,9 +14,10 @@ enforceHermeticity();
  * .github/scripts/gate-audit.sh, main-provenance.yml's gate-audit jobs: for the PR a
  * push to main merged, or (--sweep) for every recent PR merge whose push-triggered
  * audit left no result, run `codex-review.sh audit` and file one `gate-bypass` issue
- * per PR it flags. `gh` and `git` are faked; so is the audit helper, whose own rules
- * scripts/codex-review.test.ts covers. The push mode's helper comes from
- * CODEX_REVIEW; the sweep's from each merge commit's tree, through `git archive`.
+ * per PR it flags. `gh` and `git` are faked, `gh` over an issue store two runs can
+ * share; so is the audit helper, whose own rules scripts/codex-review.test.ts covers.
+ * The push mode's helper comes from CODEX_REVIEW; the sweep's from each merge
+ * commit's tree, through `git archive`.
  */
 
 const SCRIPT = path.resolve('.github/scripts/gate-audit.sh');
@@ -36,6 +37,12 @@ interface Job {
   conclusion: string | null;
 }
 
+interface Issue {
+  number: number;
+  state: string;
+  body: string;
+}
+
 // One record in main's Activity API feed, and what GitHub knows about its commit.
 interface Merge {
   sha: string;
@@ -44,6 +51,18 @@ interface Merge {
   prs?: number[];
   carriesAudit?: boolean;
   runs?: { id: number; status: string; path?: string; jobs: Job[] }[];
+}
+
+interface Options {
+  args?: string[];
+  prs?: number[];
+  merges?: Merge[];
+  audits?: Record<number, Audit>;
+  filed?: { number: number; body: string; state?: string }[];
+  issueCreateFails?: boolean;
+  relistFails?: boolean;
+  // Each of two runs (CALLER a and b) waits at its already-filed check until both reach it.
+  barrier?: boolean;
 }
 
 function pulls(prs: number[], merged: string) {
@@ -59,22 +78,20 @@ function job(name: string, status: string, conclusion: string | null = null): Jo
   return { name, status, conclusion };
 }
 
-function gateAudit(opts: {
-  args?: string[];
-  prs?: number[];
-  merges?: Merge[];
-  audits?: Record<number, Audit>;
-  filed?: { number: number; body: string }[];
-  issueCreateFails?: boolean;
-}) {
+// A temp dir holding the fakes and the fixtures they answer from, and the env to run in.
+function fixture(opts: Options) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-audit-'));
   roots.push(root);
   const bin = path.join(root, 'bin');
   fs.mkdirSync(bin);
+  fs.mkdirSync(path.join(root, 'issues'));
   const write = (name: string, value: unknown) => fs.writeFileSync(path.join(root, name), JSON.stringify(value));
   write(`pulls-${SHA}.json`, pulls(opts.prs ?? [], SHA));
-  write('issues.json', opts.filed ?? []);
+  for (const issue of opts.filed ?? [])
+    write(`issues/${issue.number}.json`, { number: issue.number, state: issue.state ?? 'open', body: issue.body });
   if (opts.issueCreateFails) fs.writeFileSync(path.join(root, 'issue-create-fails'), '');
+  if (opts.relistFails) fs.writeFileSync(path.join(root, 'relist-fails'), '');
+  if (opts.barrier) fs.writeFileSync(path.join(root, 'barrier'), '');
   for (const [pr, result] of Object.entries(opts.audits ?? {})) {
     fs.writeFileSync(path.join(root, `audit-${pr}.out`), result.out);
     fs.writeFileSync(path.join(root, `audit-${pr}.status`), String(result.status));
@@ -110,24 +127,52 @@ exit "$(cat "$MOCK_DIR/audit-$PR.status")"
     });
     for (const r of m.runs ?? []) write(`jobs-${r.id}.json`, { total_count: r.jobs.length, jobs: r.jobs });
   }
+  // Issues live one per file in issues/, numbered from 900 under a lock, so two runs
+  // filing at once get distinct numbers and see each other's issues.
   fs.writeFileSync(
     path.join(bin, 'gh'),
     `#!/usr/bin/env bash
 set -euo pipefail
 printf 'gh %s\\n' "$*" >> "$MOCK_DIR/calls"
+issues="$MOCK_DIR/issues"
+list_issues() {
+  local files=("$issues"/*.json)
+  if [ ! -e "\${files[0]}" ]; then echo '[]'; return 0; fi
+  jq -s --arg state "$1" '[ .[] | select($state == "all" or .state == $state) ]' "\${files[@]}"
+}
 case "$1 $2" in
   "label create") exit 0 ;;
   "issue create")
     if [ -f "$MOCK_DIR/issue-create-fails" ]; then echo 'gh: HTTP 403' >&2; exit 1; fi
+    title="" label="" body=""
     while [ $# -gt 0 ]; do
       case "$1" in
-        --title) printf '%s' "$2" > "$MOCK_DIR/issue-title" ;;
-        --label) printf '%s' "$2" > "$MOCK_DIR/issue-label" ;;
-        --body) printf '%s' "$2" > "$MOCK_DIR/issue-body" ;;
+        --title) title="$2" ;;
+        --label) label="$2" ;;
+        --body) body="$2" ;;
       esac
       shift
     done
-    echo "https://github.com/example/repository/issues/900"
+    printf '%s' "$title" > "$MOCK_DIR/issue-title"
+    printf '%s' "$label" > "$MOCK_DIR/issue-label"
+    printf '%s' "$body" > "$MOCK_DIR/issue-body"
+    until mkdir "$MOCK_DIR/lock" 2>/dev/null; do /bin/sleep 0.01; done
+    n=$(cat "$MOCK_DIR/next-issue" 2>/dev/null || echo 900)
+    echo $((n + 1)) > "$MOCK_DIR/next-issue"
+    rmdir "$MOCK_DIR/lock"
+    jq -n --argjson n "$n" --arg body "$body" '{ number: $n, state: "open", body: $body }' > "$issues/$n.json"
+    echo "https://github.com/example/repository/issues/$n"
+    exit 0
+    ;;
+  "issue close")
+    n="$3" comment=""
+    while [ $# -gt 0 ]; do
+      if [ "$1" = --comment ]; then comment="$2"; fi
+      shift
+    done
+    printf 'closed #%s: %s\\n' "$n" "$comment" >> "$MOCK_DIR/closed"
+    jq '.state = "closed"' "$issues/$n.json" > "$issues/.$n.$$"
+    mv "$issues/.$n.$$" "$issues/$n.json"
     exit 0
     ;;
 esac
@@ -138,7 +183,19 @@ case "$rest" in
     commit="\${rest#*/commits/}"
     cat "$MOCK_DIR/pulls-\${commit%%/*}.json"
     ;;
-  repos/example/repository/issues\\?*) cat "$MOCK_DIR/issues.json" ;;
+  repos/example/repository/issues\\?*)
+    state="\${rest#*state=}"
+    state="\${state%%&*}"
+    if [ "$state" = all ] && [ -f "$MOCK_DIR/barrier" ] && [ ! -e "$MOCK_DIR/arrived-\${CALLER:-}" ]; then
+      touch "$MOCK_DIR/arrived-\${CALLER:-}"
+      for _ in $(seq 1 400); do
+        if [ "$(find "$MOCK_DIR" -maxdepth 1 -name 'arrived-*' | wc -l)" -ge 2 ]; then break; fi
+        /bin/sleep 0.025
+      done
+    fi
+    if [ "$state" = open ] && [ -f "$MOCK_DIR/relist-fails" ]; then echo 'gh: HTTP 502' >&2; exit 1; fi
+    list_issues "$state"
+    ;;
   repos/example/repository/activity\\?*) cat "$MOCK_DIR/activity.json" ;;
   repos/example/repository/actions/runs\\?head_sha=*)
     commit="\${rest#*head_sha=}"
@@ -178,26 +235,39 @@ esac
   fs.writeFileSync(path.join(bin, 'sleep'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
   const pushHelper = path.join(root, 'codex-review.sh');
   fs.writeFileSync(pushHelper, helper('checkout'), { mode: 0o755 });
-  const result = spawnSync('bash', [SCRIPT, ...(opts.args ?? [SHA])], {
-    cwd: root,
-    encoding: 'utf8',
-    env: {
-      ...process.env,
-      PATH: `${bin}:${process.env.PATH ?? ''}`,
-      REPO: 'example/repository',
-      GH_TOKEN: 'unused',
-      MOCK_DIR: root,
-      CODEX_REVIEW: pushHelper,
-    },
-  });
-  const read = (name: string) =>
-    fs.existsSync(path.join(root, name)) ? fs.readFileSync(path.join(root, name), 'utf8') : null;
+  const env = {
+    ...process.env,
+    PATH: `${bin}:${process.env.PATH ?? ''}`,
+    REPO: 'example/repository',
+    GH_TOKEN: 'unused',
+    MOCK_DIR: root,
+    CODEX_REVIEW: pushHelper,
+  };
+  return { root, env };
+}
+
+function read(root: string, name: string): string | null {
+  return fs.existsSync(path.join(root, name)) ? fs.readFileSync(path.join(root, name), 'utf8') : null;
+}
+
+function issuesIn(root: string): Issue[] {
+  return fs
+    .readdirSync(path.join(root, 'issues'))
+    .filter((name) => name.endsWith('.json'))
+    .map((name) => JSON.parse(fs.readFileSync(path.join(root, 'issues', name), 'utf8')) as Issue)
+    .sort((a, b) => a.number - b.number);
+}
+
+function gateAudit(opts: Options) {
+  const { root, env } = fixture(opts);
+  const result = spawnSync('bash', [SCRIPT, ...(opts.args ?? [SHA])], { cwd: root, encoding: 'utf8', env });
   return {
     ...result,
-    calls: read('calls') ?? '',
-    title: read('issue-title'),
-    label: read('issue-label'),
-    body: read('issue-body'),
+    calls: read(root, 'calls') ?? '',
+    title: read(root, 'issue-title'),
+    label: read(root, 'issue-label'),
+    body: read(root, 'issue-body'),
+    issues: issuesIn(root),
   };
 }
 
@@ -219,6 +289,7 @@ describe('gate-audit.sh', () => {
     expect(result.body).toContain(VIOLATION);
     expect(result.body).toMatch(/<!-- gate-bypass pr=675 -->$/);
     expect(result.stdout).toContain('::warning::#675 merged without the merge gate');
+    expect(result.issues.map((i) => [i.number, i.state])).toEqual([[900, 'open']]);
   });
 
   it('never files a second issue for a PR already filed, whatever state that issue is in', () => {
@@ -227,7 +298,7 @@ describe('gate-audit.sh', () => {
       audits: { 675: { status: 28, out: VIOLATION } },
       filed: [
         { number: 812, body: 'first finding\n\n<!-- gate-bypass pr=674 -->' },
-        { number: 813, body: 'first finding\n\n<!-- gate-bypass pr=675 -->' },
+        { number: 813, body: 'first finding\n\n<!-- gate-bypass pr=675 -->', state: 'closed' },
       ],
     });
     expect(result.status).toBe(0);
@@ -243,6 +314,39 @@ describe('gate-audit.sh', () => {
     });
     expect(result.status).toBe(0);
     expect(result.calls).toContain('gh issue create');
+    expect(result.calls).not.toContain('gh issue close');
+  });
+
+  it('leaves exactly one issue open when two runs pass the already-filed check together and both file', () => {
+    const { root, env } = fixture({ prs: [675], audits: { 675: { status: 28, out: VIOLATION } }, barrier: true });
+    const result = spawnSync(
+      'bash',
+      [
+        '-c',
+        `CALLER=a bash "$SCRIPT" "$SHA" > "$MOCK_DIR/out-a" 2>&1 & a=$!
+CALLER=b bash "$SCRIPT" "$SHA" > "$MOCK_DIR/out-b" 2>&1 & b=$!
+wait "$a"; ra=$?; wait "$b"; rb=$?
+echo "$ra $rb"`,
+      ],
+      { cwd: root, encoding: 'utf8', env: { ...env, SCRIPT, SHA } },
+    );
+    expect(result.stdout.trim()).toBe('0 0');
+    // Both got past the already-filed check before either filed.
+    expect(fs.readdirSync(root).filter((name) => name.startsWith('arrived-'))).toHaveLength(2);
+    const issues = issuesIn(root);
+    expect(issues.map((i) => i.number)).toEqual([900, 901]);
+    expect(issues.filter((i) => i.state === 'open').map((i) => i.number)).toEqual([900]);
+    expect(read(root, 'closed')).toContain(
+      'closed #901: Duplicate of #900: both were filed for #675 at the same time.',
+    );
+  });
+
+  it('fails the job when it cannot re-list the issues after filing, since a duplicate may be left open', () => {
+    const result = gateAudit({ prs: [675], audits: { 675: { status: 28, out: VIOLATION } }, relistFails: true });
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain(
+      '::error::filed https://github.com/example/repository/issues/900 for #675, but could not re-list gate-bypass issues',
+    );
   });
 
   it.each([

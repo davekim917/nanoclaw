@@ -6,7 +6,8 @@
 # Detection, not prevention: the merge already happened, so this blocks
 # nothing. It is loud when it cannot judge a merge (a red job, never a quiet
 # pass), and it never files twice for one PR: a re-run, the daily backstop, or
-# the same PR seen by two pushes, finds the first issue by its marker.
+# the same PR seen by two pushes, finds the first issue by its marker, and two
+# runs that file at the same moment leave only the lowest-numbered issue open.
 #
 # Two modes:
 # - `gate-audit.sh <sha>`, the gate-audit job on every push: the PR(s) whose
@@ -35,7 +36,7 @@ repo_root=$(cd "$here/../.." && pwd)
 # it and file again. Every step returns its own failure: the callers run this
 # under `||`, which switches `set -e` off inside it.
 file_bypass() {
-  local pr="$1" finding="$2" mark filed url
+  local pr="$1" finding="$2" mark filed url mine open keep n
   mark="<!-- gate-bypass pr=$pr -->"
   filed=$(gh api --paginate "repos/$REPO/issues?labels=gate-bypass&state=all&per_page=100" \
     | jq -rs --arg mark "$mark" '[ .[][] | select((.body // "") | contains($mark)) | .number ] | first // empty') || return 1
@@ -56,7 +57,27 @@ $finding
 Found by main-provenance.yml's gate-audit job (\`codex-review.sh audit\`). Close this with what happened: a review after the fact, a follow-up fix, or why the evidence was sound.
 
 $mark") || return 1
-  echo "::warning::#$pr merged without the merge gate's evidence; filed $url"
+  mine="${url##*/}"
+  [[ "$mine" =~ ^[0-9]+$ ]] || { echo "::error::filed an issue for #$pr, but gh returned no issue number ($url)"; return 1; }
+  # The check above and the filing are two calls, so two runs can both pass the
+  # check and both file. Settle it after the fact: the lowest-numbered open
+  # issue with this PR's marker is the one, and each newer one is closed as its
+  # duplicate. Every run that filed does this, so the last to finish leaves one
+  # open. A re-list that fails fails the job, since a duplicate may be left
+  # open; a close that fails is a warning.
+  open=$(gh api --paginate "repos/$REPO/issues?labels=gate-bypass&state=open&per_page=100" \
+    | jq -rs --arg mark "$mark" --argjson mine "$mine" '
+      [ .[][] | select((.body // "") | contains($mark)) | .number ] + [ $mine ] | unique | .[]') || {
+    echo "::error::filed $url for #$pr, but could not re-list gate-bypass issues to close a duplicate filed alongside it"
+    return 1
+  }
+  keep=$(printf '%s\n' "$open" | head -n 1)
+  for n in $open; do
+    [ "$n" = "$keep" ] && continue
+    gh issue close "$n" --repo "$REPO" --comment "Duplicate of #$keep: both were filed for #$pr at the same time." >/dev/null \
+      || echo "::warning::could not close #$n, a duplicate of #$keep"
+  done
+  echo "::warning::#$pr merged without the merge gate's evidence; filed #$keep"
 }
 
 # The merged PR(s) whose merge commit $1 is. GitHub links them as

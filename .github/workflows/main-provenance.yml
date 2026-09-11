@@ -27,10 +27,15 @@
 # `sweep`: every PR merge on main in the last 50 hours whose push-triggered audit left no
 # result (the run was skipped, dropped or failed) is audited then, through the same filing.
 # None of the four runs PR code. `provenance` and `gate-audit` check out only the commit
-# their push already landed; `sweep` and `gate-audit-sweep` check out whatever ref
-# triggered them — main on the daily schedule, or another ref if `workflow_dispatch` is
-# run from one — for their own scripts. `sweep` queries history through the Activity API,
-# not `git log`; `gate-audit-sweep` does too, then runs each merge commit's own audit code.
+# their push already landed. `sweep` checks out whatever ref triggered it — main on the
+# daily schedule, or another ref if `workflow_dispatch` is run from one — for its own
+# script, which only reads. `gate-audit-sweep`, which writes issues, runs only main's
+# copy of its script: its `if:` skips a dispatch from any other ref, and its checkout
+# names `main`, so dispatching an unmerged branch never runs that branch's gate-audit.sh
+# with `issues: write`. (A branch that also edits this workflow file is dispatched with
+# its own job definition; no condition in main's copy reaches that.) Both query history
+# through the Activity API, not `git log`; `gate-audit-sweep` then runs each merge
+# commit's own audit code, extracted from that commit with `git archive`.
 # A force-push fails `provenance` outright, since it can rewind main onto an old merge
 # commit; `sweep`'s Activity API window covers force-pushes too (`force_push` is one of
 # the activity types it treats as an offender).
@@ -144,8 +149,14 @@ jobs:
         run: .github/scripts/gate-audit.sh "$SHA"
 
   gate-audit-sweep:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Main's copy of gate-audit.sh only, never an unmerged branch's (see the header).
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
+    # One sweep at a time, so a scheduled and a dispatched sweep can't both file the
+    # same PR's issue; gate-audit.sh also closes a duplicate that gets through.
+    concurrency:
+      group: gate-audit-sweep
+      cancel-in-progress: false
     # A job of its own rather than a step in `sweep`, so `sweep` keeps its read-only
     # token and each fails on its own. The same permissions as `gate-audit`.
     permissions:
@@ -159,6 +170,7 @@ jobs:
       # carries, extracted with `git archive`.
       - uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
           persist-credentials: false
       - name: Every PR merge in the last 50 hours had its gate audit

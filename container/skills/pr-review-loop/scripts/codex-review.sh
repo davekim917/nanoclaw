@@ -798,7 +798,7 @@ receipt_comments_page() {
     query($owner:String!,$name:String!,$pr:Int!,$after:String){
       repository(owner:$owner,name:$name){ pullRequest(number:$pr){
         headRefOid comments(first:100,after:$after){ pageInfo{hasNextPage endCursor} nodes{
-          author{login} authorAssociation createdAt lastEditedAt body
+          author{login} authorAssociation createdAt lastEditedAt fullDatabaseId body
         } }
       } }
     }' \
@@ -809,31 +809,36 @@ receipt_comments_page() {
 # nothing, as "<outcome>\t<reviewer text>" (reviewer text empty for a receipt
 # written before the reviewer line existed). A later `changes` supersedes an
 # earlier `approve`, and a receipt for any other head says nothing about this
-# one. `outcome` alone (no tab, no reviewer) means no receipt was found. Under
-# `audit`, a receipt posted after GATE_AS_OF (the merge) did not gate it, and a
-# comment edited since is not read at all: its text at the merge is unknown,
-# and it could have been a receipt. When such a comment, from an author whose
-# receipts count, postdates the latest receipt that is read (or no receipt is
-# read), the receipts at the merge are unknown: the outcome is `unknown`, and
-# the reviewer text says which comment. Dropping only the edited receipts would
-# let a `changes` receipt, edited after the merge, hand the verdict back to the
-# `approve` before it.
+# one. `outcome` alone (no tab, no reviewer) means no receipt was found. Later
+# means posted later: receipts are ordered by the comment's database id, which
+# GitHub assigns in posting order (fullDatabaseId, a string of digits), never by
+# createdAt, which is to the second, so an approve and the changes receipt after
+# it can share one. Under `audit`, a receipt posted after GATE_AS_OF (the merge)
+# did not gate it, and a comment edited since is not read at all: its text at
+# the merge is unknown, and it could have been a receipt. When such a comment,
+# from an author whose receipts count, was posted after the latest receipt that
+# is read, or in the same second, or no receipt is read, the receipts at the
+# merge are unknown: the outcome is `unknown`, and the reviewer text says which
+# comment. Dropping only the edited receipts would let a `changes` receipt,
+# edited after the merge, hand the verdict back to the `approve` before it.
 receipt_outcome() {
   local pages
   pages=$(paginate_connection comments receipt_comments_page) || return 1
   printf '%s\n' "$pages" | jq -rs --arg re "$RECEIPT_MARKER_RE" --arg reviewerRe "$RECEIPT_REVIEWER_LINE_RE" --arg head "$1" --arg asof "$GATE_AS_OF" '
     [ .[] | .data.repository.pullRequest.comments.nodes[]
       | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
-      | select($asof == "" or .createdAt <= $asof) ] as $comments
+      | select($asof == "" or .createdAt <= $asof)
+      | .seq = ((.fullDatabaseId // "0") | tonumber) ] as $comments
     | [ $comments[] | select($asof != "" and (.lastEditedAt // "") > $asof) ] as $edited
     | [ $comments[] | select($asof == "" or (.lastEditedAt // "") <= $asof)
         | .createdAt as $at
+        | .seq as $seq
         | .body as $body
         | [ ($body // "" | capture($re)) ] | first // empty
         | select(.head == $head)
-        | { outcome, at: $at, reviewer: (($body // "" | capture($reviewerRe)).reviewer // "") } ]
-    | (sort_by(.at) | last) as $latest
-    | ([ $edited[] | select(.createdAt > ($latest.at // "")) ] | sort_by(.createdAt) | last) as $unread
+        | { outcome, at: $at, seq: $seq, reviewer: (($body // "" | capture($reviewerRe)).reviewer // "") } ]
+    | (sort_by(.seq) | last) as $latest
+    | ([ $edited[] | select($latest == null or .createdAt >= $latest.at or .seq > $latest.seq) ] | sort_by(.seq) | last) as $unread
     | if $unread != null then "unknown\t\($unread.author.login // "someone") posted a comment at \($unread.createdAt) and edited it at \($unread.lastEditedAt)"
       elif $latest == null then empty
       else "\($latest.outcome)\t\($latest.reviewer)" end'
