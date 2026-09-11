@@ -290,32 +290,24 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Fail closed on anything token-shaped anywhere in the model's output —
-          # defense in depth (see the top-of-file comment: the job split is the
-          # primary control) against a prompt injection in the diff that tries to
-          # exfiltrate or fabricate a credential through a finding's free-text
-          # fields. Never post a redacted body — a hit refuses the whole post.
+          # Fail closed on a known token prefix anywhere in the model's output —
+          # defense in depth (see the top-of-file comment: the job split, not
+          # this scrub, is the primary control — analyze's token is read-only
+          # and expires with that job, before this one even starts) against a
+          # prompt injection in the diff that tries to exfiltrate or fabricate a
+          # credential through a finding's free-text fields. Never post a
+          # redacted body — a hit refuses the whole post.
           #
-          # 1. Known token prefixes.
+          # Deliberately NOT a generic "36+ mixed-case chars" heuristic: that
+          # rule matched 203 real identifiers in this repo (e.g.
+          # insertDeferredMessageWithContextIfNew,
+          # loadRepositoryMigrationPrestageCache — both 36+ chars, mixed case),
+          # so a finding that simply NAMES the function or variable it's about
+          # would fail this step and the whole review would be lost. Prefixes
+          # cover every credential in reach here, since that's all there is to
+          # leak.
           PREFIX_RE='ghs_|ghp_|gho_|ghu_|ghr_|github_pat_|sk-ant-'
-          # 2. A generic mixed-case secret shape: 36+ chars of [A-Za-z0-9_-]
-          #    containing BOTH an uppercase and a lowercase letter. Bounded to
-          #    mixed case specifically so a bare commit SHA (40 lowercase hex
-          #    chars) in a finding's description never trips this.
-          token_hit=0
           if grep -qE "$PREFIX_RE" <<<"$STRUCTURED_OUTPUT"; then
-            token_hit=1
-          fi
-          if [ "$token_hit" -eq 0 ]; then
-            while IFS= read -r run; do
-              [ -z "$run" ] && continue
-              if grep -q '[A-Z]' <<<"$run" && grep -q '[a-z]' <<<"$run"; then
-                token_hit=1
-                break
-              fi
-            done < <(grep -oE '[A-Za-z0-9_-]{36,}' <<<"$STRUCTURED_OUTPUT")
-          fi
-          if [ "$token_hit" -eq 1 ]; then
             echo "::error::shadow review findings contain a token-shaped string; refusing to post" >&2
             exit 1
           fi

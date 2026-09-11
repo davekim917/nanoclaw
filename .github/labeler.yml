@@ -96,13 +96,17 @@ risk:high:
     # names it alongside these, i.e. Anthropic's own threat model treats it as
     # sensitive project config, not just prose), or a submodule URL (.gitmodules,
     # which a clone/checkout can fetch from). All five merge unreviewed today and
-    # run (or load) the moment something checks the tree out — including
-    # .github/workflows/shadow-review.yml's own reviewer. CLAUDE.local.md is on
-    # that same SENSITIVE_PATHS list but deliberately NOT here: .gitignore:29
-    # (`**/CLAUDE.local.md`) means it can never appear in a PR diff, so this rule
-    # would never fire. Plain CLAUDE.md is also NOT on this list: it changes often
-    # enough that flagging every edit has a real review cost, and
-    # shadow-review.yml's own reviewer already suppresses it via
+    # run (or load) the moment something checks the tree out and runs Claude
+    # Code against it with default settings — including, in principle,
+    # .github/workflows/shadow-review.yml's own reviewer, which DOES check the
+    # tree out (required — see that file's top comment for why a no-checkout
+    # design doesn't work against this action) but neutralizes them via
+    # `--setting-sources user` and `--strict-mcp-config` in its `claude_args`.
+    # CLAUDE.local.md is on that same SENSITIVE_PATHS list but deliberately NOT
+    # here: .gitignore:29 (`**/CLAUDE.local.md`) means it can never appear in a
+    # PR diff, so this rule would never fire. Plain CLAUDE.md is also NOT on
+    # this list: it changes often enough that flagging every edit has a real
+    # review cost, and shadow-review.yml's own reviewer already suppresses it via
     # `--setting-sources user` — see that file's top comment.
     - '.claude/**'
     - '.mcp.json'
