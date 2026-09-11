@@ -230,7 +230,7 @@
 ".nvmrc":{"diff":0,"mode":"100644","sha256":"f14b4987904bcb5814e4459a057ed4d20f58a633152288a761214dcd28780b56"},
 ".prettierrc":{"diff":0,"mode":"100644","sha256":"c9396af8dd02064188ba41407fb182d2e8fdc3103a1f5f3ea4d1ec703e29bafd"},
 "AGENTS.md":{"diff":0,"mode":"120000","sha256":"6ebdb617a8104a7756d0cf36578ab01103dc9f07e4dc6feb751296b9c402faf7"},
-"CHANGELOG.md":{"diff":143,"mode":"100644","sha256":"26b9abf886439b2c49ac0df78223f464812048225df481fe73cbe75ae908383a"},
+"CHANGELOG.md":{"diff":143,"mode":"100644","sha256":"1528ee00dcb1ee482d9e02aa8b7de10208910e5082dd2ca6a07c1c2b697870e9"},
 "CLAUDE.md":{"diff":332,"mode":"100644","sha256":"7c1613b5dfd3683630d409e970189ad0018fa83370d6f632ee6ab366b8afbce3"},
 "CODE_OF_CONDUCT.md":{"diff":0,"mode":"100644","sha256":"ffb0652539c6d61f2cf0219f908f7221140764bb70cb1b78a9d15d3e5e1f5d36"},
 "CONTRIBUTING.md":{"diff":110,"mode":"100644","sha256":"2b1722afd70df3d79182f87f8e0d3ac7016ff4e79fb3f4ff0759f9f2fd8bf391"},

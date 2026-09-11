@@ -107,6 +107,7 @@ vi.mock('../mailbox/read-only.js', async () => {
 import {
   canonicalRepoDir,
   checkoutDirName,
+  checkoutInheritedTagsPath,
   checkoutStagingRoot,
   defaultTopicBranch,
   isWorkgroupRepositoryMountClaimed,
@@ -1921,6 +1922,7 @@ describe('repository_checkout host action (plan §5.2, Phase 2)', { timeout: 60_
     const canonical = networkCanonical(root);
     // A canonical local branch: `git clone` would map it into origin/*.
     git(canonical, ['branch', 'canonical-only']);
+    git(canonical, ['tag', 'v-p22']);
     git(canonical, ['repack', '-a', '-d', '-q']);
     const unit = threadUnit('p2-2');
     const requestId = nextRequestId();
@@ -1972,6 +1974,13 @@ describe('repository_checkout host action (plan §5.2, Phase 2)', { timeout: 60_
       { name: 'proj', shape: 'clone' },
     ]);
     expect(fs.existsSync(path.join(checkoutStagingRoot(topicRoot), requestId))).toBe(false);
+    // The tags the clone inherited are recorded host-only, beside worktrees/
+    // rather than in it (#672).
+    const record = checkoutInheritedTagsPath(clone);
+    expect(path.relative(topicRoot, record).startsWith('..')).toBe(true);
+    const tags = git(clone, ['for-each-ref', '--format=%(objectname) %(refname)', 'refs/tags']);
+    expect(tags).toContain(' refs/tags/v-p22');
+    expect(fs.readFileSync(record, 'utf8')).toBe(`${tags}\n`);
   });
 
   it('a second branch in the same thread gets <repo>@<slug> and the primary is untouched', async () => {

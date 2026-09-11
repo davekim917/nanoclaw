@@ -836,10 +836,12 @@ describe('worktree-cleanup.ts contains no literal seam call, and the only contai
       'src/modules/mailbox/index.ts': ['readSessionOutbound', 'sessionMailboxPath'],
       'src/repository-workspaces.ts': [
         'canonicalRepoDir',
+        'checkoutInheritedTagsPath',
         'defaultTopicBranch',
         'ensureRepositoryLock',
         'listTopicCheckouts',
         'parseCheckoutDirName',
+        'readCheckoutInheritedTags',
         'resolveRepositoryWorkUnit',
         'topicStateDir',
         'topicWorktreesDir',

@@ -727,6 +727,86 @@ export function writeCheckoutMetadata(checkoutPath: string, metadata: CheckoutMe
   }
 }
 
+// ── Inherited tags (#672) ─────────────────────────────────────────────────────
+//
+// A clone copies every canonical tag, and the clone disposability proof counts
+// every local ref's commits against origin, so one release tag off every origin
+// branch would keep every clone of that repository forever. When the host
+// builds a clone it records the tags the clone holds; the proof drops a tag
+// only while the clone still holds it exactly as recorded. The record sits in
+// the topic state dir beside `worktrees/`, which no container mounts (see the
+// staging note above). The canonical is never read at proof time: its refs are
+// container-writable, and a tag a sibling topic planted there could exempt
+// another thread's tag-only work.
+
+const CHECKOUT_TAGS_DIRNAME = 'checkout-tags';
+
+/** `<topic>/checkout-tags/<dirName>` for the checkout at `<topic>/worktrees/<dirName>`. */
+export function checkoutInheritedTagsPath(checkoutPath: string): string {
+  return path.join(path.dirname(path.dirname(checkoutPath)), CHECKOUT_TAGS_DIRNAME, path.basename(checkoutPath));
+}
+
+/**
+ * Record `forEachRef`, the output of `git for-each-ref --format='%(objectname)
+ * %(refname)' refs/tags` in a clone the host just built, as the tags the
+ * checkout at `checkoutPath` inherited. One rename replaces any earlier
+ * record for that name.
+ */
+export function writeCheckoutInheritedTags(checkoutPath: string, forEachRef: string): void {
+  const file = checkoutInheritedTagsPath(checkoutPath);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    const fd = fs.openSync(tmp, 'wx', 0o644);
+    try {
+      fs.writeFileSync(fd, forEachRef === '' || forEachRef.endsWith('\n') ? forEachRef : `${forEachRef}\n`, 'utf8');
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmp, file);
+  } catch (error) {
+    fs.rmSync(tmp, { force: true });
+    throw error;
+  }
+}
+
+/**
+ * The recorded tags, full ref name to object id; `null` when there is no
+ * record, or it cannot be read, or a line is not `<object> refs/tags/<name>`.
+ * Null only withdraws the exemption: every tag counts.
+ */
+export function readCheckoutInheritedTags(recordPath: string): Map<string, string> | null {
+  let text: string;
+  let fd: number;
+  try {
+    fd = fs.openSync(recordPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  } catch {
+    return null;
+  }
+  try {
+    if (!fs.fstatSync(fd).isFile()) return null;
+    text = fs.readFileSync(fd, 'utf8');
+  } catch {
+    return null;
+  } finally {
+    fs.closeSync(fd);
+  }
+  const tags = new Map<string, string>();
+  for (const line of text.split('\n')) {
+    if (!line) continue;
+    const match = /^([0-9a-f]{40,64}) (refs\/tags\/\S+)$/.exec(line);
+    if (!match) return null;
+    tags.set(match[2]!, match[1]!);
+  }
+  return tags;
+}
+
+/** Drop the record of a checkout that is gone. A record left behind is replaced when that name is next built. */
+export function removeCheckoutInheritedTags(checkoutPath: string): void {
+  fs.rmSync(checkoutInheritedTagsPath(checkoutPath), { force: true });
+}
+
 /**
  * Delete `checkout-staging/<requestId>` entries, other than `keep`, whose mtime is at
  * least `maxAgeMs` old. Returns the removed names.

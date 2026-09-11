@@ -12,8 +12,8 @@
  * A branch clone (`.git` a directory; plan §5.8) takes its own branch: there
  * is no registration to remove, so it is quarantined and trashed, and only on
  * the topic's side-(a) evidence, seven idle days, and a proof covering every
- * local ref, HEAD and the stash, less the tags it inherited unchanged from its
- * workgroup canonical. See cleanupCloneCheckout and provenDisposable.
+ * local ref, HEAD and the stash, less the tags the host recorded when it built
+ * the clone. See cleanupCloneCheckout and provenDisposable.
  */
 import { execFileSync } from 'child_process';
 import fs from 'fs';
@@ -37,10 +37,12 @@ import { onHostShutdown, onHostStart } from './host-lifecycle.js';
 import { log } from './log.js';
 import {
   canonicalRepoDir,
+  checkoutInheritedTagsPath,
   defaultTopicBranch,
   ensureRepositoryLock,
   listTopicCheckouts,
   parseCheckoutDirName,
+  readCheckoutInheritedTags,
   resolveRepositoryWorkUnit,
   topicStateDir,
   topicWorktreesDir,
@@ -594,7 +596,7 @@ async function cleanupCloneCheckout(target: TopicWorktreeTarget, dataDir: string
         const proof = disposability.proveCheckoutDisposable({
           path: target.worktreePath,
           shape: target.shape,
-          canonicalRepoPath: target.canonicalRepoPath,
+          inheritedTagsRecord: checkoutInheritedTagsPath(target.worktreePath),
         });
         if (!proof.ok) {
           if (idleDays(target.worktreePath) >= STALE_WARNING_DAYS) {
@@ -606,7 +608,7 @@ async function cleanupCloneCheckout(target: TopicWorktreeTarget, dataDir: string
           { path: target.worktreePath },
           dataDir,
           'topic-checkout',
-          target.canonicalRepoPath,
+          checkoutInheritedTagsPath(target.worktreePath),
         );
         if (!finalized.ok) return { collected: false, reason: finalized.reason ?? 'finalize-refused' };
         log.info('Worktree cleanup: trashed an idle clean pushed clone checkout', context);
@@ -847,17 +849,17 @@ function provenDisposable(
   // can hold commits no real remote has. Scope 'head' is a linked worktree's
   // proof, unchanged: its HEAD against every remote-tracking ref.
   //
-  // One exception for a clone (#672): a tag it inherited unchanged from its
-  // workgroup's canonical, the same name holding the same object, is the
-  // canonical's, not the clone's own work. A clone copies every canonical tag
-  // (repository_checkout removes only heads and remote-tracking refs,
+  // One exception for a clone (#672): a tag the host recorded when it built
+  // the clone, still held at the same object, is the canonical's, not the
+  // clone's own work. A clone copies every canonical tag (repository_checkout
+  // removes only heads and remote-tracking refs,
   // modules/repository-workspaces/index.ts:889-904), and a release tag off
   // every origin branch would otherwise keep every clone of that repository
-  // forever. The canonical's tag TARGETS are deliberately not subtracted: a
-  // sibling topic can write the canonical's refs, and a tag it planted on this
-  // clone's branch commit would make that branch read as pushed. Matching by
-  // name and object only drops roots, so a commit any other ref holds still
-  // counts. The roots go in on stdin, before `--not`.
+  // forever. The record is host-only (checkoutInheritedTagsPath). The
+  // canonical's refs are container-writable and are never read here, so no
+  // other topic can exempt this clone's work. Matching name and object only
+  // drops roots, so a commit any other ref holds still counts. The roots go in
+  // on stdin, before `--not`.
   let unpushed: string | null;
   if (scope === 'all' && inheritedTags !== null && inheritedTags.size > 0) {
     const refs = git(dir, ['for-each-ref', '--format=%(objectname) %(refname)'], env);
@@ -918,45 +920,21 @@ function provenDisposable(
 }
 
 /**
- * The workgroup canonical's tags, full ref name to object id, or `null` when
- * they cannot be read. The canonical is host-owned (its config and HEAD are
- * read-only in every container, canonicalGitControlMounts in
- * container-runner.ts:1472), but the top of
- * its `.git` is container-writable (#669), so one holding a `commondir` file,
- * which would redirect this read to another repository's refs, answers null.
- * Null only withdraws the inherited-tag exemption: every tag counts again.
- */
-function canonicalTags(canonical: string): Map<string, string> | null {
-  if (fs.existsSync(path.join(canonical, '.git', 'commondir'))) return null;
-  const out = git(
-    canonical,
-    ['for-each-ref', '--format=%(objectname) %(refname)', 'refs/tags'],
-    checkoutGitEnv(canonical),
-  );
-  if (out === null) return null;
-  const tags = new Map<string, string>();
-  for (const line of out.split('\n').filter(Boolean)) {
-    const separator = line.indexOf(' ');
-    tags.set(line.slice(separator + 1), line.slice(0, separator));
-  }
-  return tags;
-}
-
-/**
  * The one disposability primitive (plan §5.8). A clone owns every local branch
  * in it, so it is proved with scope `all`; a linked worktree owns only its
  * HEAD, as it always has; a checkout whose shape the lister could not decide
- * is refused outright. `canonicalRepoPath`, when a clone was built from a
- * workgroup canonical, lets its inherited tags drop out of the proof (#672).
+ * is refused outright. `inheritedTagsRecord` names the host-only record of the
+ * tags a topic clone inherited when the host built it (#672); only a topic
+ * checkout has one, and a clone without a record counts every tag.
  */
 export function proveCheckoutDisposable(
-  checkout: Pick<TopicCheckout, 'path' | 'shape'> & { canonicalRepoPath?: string | null },
+  checkout: Pick<TopicCheckout, 'path' | 'shape'> & { inheritedTagsRecord?: string | null },
 ): {
   ok: boolean;
   reason: string;
 } {
   if (checkout.shape === 'clone') {
-    const inherited = checkout.canonicalRepoPath ? canonicalTags(checkout.canonicalRepoPath) : null;
+    const inherited = checkout.inheritedTagsRecord ? readCheckoutInheritedTags(checkout.inheritedTagsRecord) : null;
     return disposability.provenDisposable(checkout.path, 'all', inherited);
   }
   if (checkout.shape === 'linked') return disposability.provenDisposable(checkout.path, 'head');
@@ -1122,9 +1100,7 @@ function record(report: GcReport, candidate: GcCandidate): void {
  * entry created between the two reads shows up only in the second, as
  * `unknown`, so that race refuses the topic rather than passing it.
  */
-function topicDisposabilityProbes(
-  worktreeRoot: string,
-): Array<Pick<TopicCheckout, 'path' | 'shape'> & { repo: string | null }> | null {
+function topicDisposabilityProbes(worktreeRoot: string): Array<Pick<TopicCheckout, 'path' | 'shape'>> | null {
   const checkouts = readTopicCheckouts(worktreeRoot);
   if (checkouts === null) return null;
   const names = safeDirectories(worktreeRoot);
@@ -1132,7 +1108,7 @@ function topicDisposabilityProbes(
   const listed = new Set(checkouts.map((checkout) => checkout.name));
   const others = names
     .filter((name) => !listed.has(name))
-    .map((name) => ({ path: path.join(worktreeRoot, name), shape: 'unknown' as const, repo: null }));
+    .map((name) => ({ path: path.join(worktreeRoot, name), shape: 'unknown' as const }));
   return [...checkouts, ...others];
 }
 
@@ -1194,9 +1170,8 @@ function collectOrphanTopics(report: GcReport, dataDir: string, owners: Map<stri
       let refused: string | null = null;
       for (const probe of probes) {
         const decision = disposability.proveCheckoutDisposable({
-          path: probe.path,
-          shape: probe.shape,
-          canonicalRepoPath: probe.repo === null ? null : canonicalRepoDir(workgroupId, probe.repo, dataDir),
+          ...probe,
+          inheritedTagsRecord: probe.shape === 'clone' ? checkoutInheritedTagsPath(probe.path) : null,
         });
         if (!decision.ok) {
           refused = decision.reason;
@@ -2150,7 +2125,7 @@ function finalizeCloneCollection(
   candidate: Pick<GcCandidate, 'path'>,
   dataDir: string,
   kind: 'scratch' | 'topic-checkout' = 'scratch',
-  canonicalRepoPath: string | null = null,
+  inheritedTagsRecord: string | null = null,
 ): { ok: boolean; reason?: string } {
   const resolvedOriginal = fs.realpathSync(candidate.path);
   const quarantineRoot = path.join(dataDir, '.gc-quarantine');
@@ -2204,8 +2179,8 @@ function finalizeCloneCollection(
   // Re-prove the moved copy, not the original path: this is the check that
   // catches a write landing in the gap between the scan and now.
   // Both callers only ever finalize a clone, so the moved copy is proved as one,
-  // against the same canonical as the first proof.
-  const decision = disposability.proveCheckoutDisposable({ path: quarantinePath, shape: 'clone', canonicalRepoPath });
+  // against the same tag record as the first proof.
+  const decision = disposability.proveCheckoutDisposable({ path: quarantinePath, shape: 'clone', inheritedTagsRecord });
   if (!decision.ok) return restore(`aborted-${decision.reason}`);
 
   try {
@@ -2219,6 +2194,9 @@ function finalizeCloneCollection(
   // a correctness step — and doing it BEFORE the trash would be the stranding
   // bug this sidecar exists to avoid.
   fs.rmSync(cloneSidecarPath(quarantinePath), { force: true });
+  // The clone's tag record goes with it. One left behind is harmless: the next
+  // build of this name replaces it before publishing.
+  if (inheritedTagsRecord) fs.rmSync(inheritedTagsRecord, { force: true });
   return { ok: true };
 }
 

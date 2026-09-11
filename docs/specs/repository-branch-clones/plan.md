@@ -604,12 +604,13 @@ days past `sealedAt` or its last link. Quarantined entries go after 7 days.
     (`--remotes=origin`, build rev 2.6; `--all` since the PR #657 review round 2, because
     `--branches HEAD` read a commit only a tag reached as pushed). `HEAD` stays named, so an
     unborn HEAD is unprovable. The stash is read first and keeps its own reason. A clone keeps the
-    canonical's tags (§5.2 step 1 deletes only heads and remote refs). Since #672 a tag the clone
-    holds unchanged from its canonical, the same name at the same object, is dropped from the
-    roots, and the rest go to `git log HEAD --stdin --not --remotes=origin`. The canonical's tag
-    targets are not subtracted: a sibling topic can write the canonical's refs, and a tag it
-    planted on this clone's branch commit would read that branch as pushed. An unreadable
-    canonical, or one holding `commondir`, withdraws the exemption, fail-closed;
+    canonical's tags (§5.2 step 1 deletes only heads and remote refs). Since #672 the host records
+    the clone's tags just before it publishes the clone, in `<topic>/checkout-tags/<dirName>`
+    (the topic state dir, which no container mounts). A tag the clone still holds exactly as
+    recorded is dropped from the roots, and the rest go to
+    `git log HEAD --stdin --not --remotes=origin`. The canonical is not read at proof time: its
+    refs are container-writable, and a tag a sibling topic planted there could exempt another
+    thread's tag-only work. A clone with no readable record counts every tag, fail-closed;
   - `linked` → `provenDisposable(path,'head')`, as today;
   - `unknown` → refuse, fail-closed.
 

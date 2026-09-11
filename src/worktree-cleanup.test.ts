@@ -121,6 +121,7 @@ import {
 } from './worktree-cleanup.js';
 import {
   canonicalRepoDir,
+  checkoutInheritedTagsPath,
   checkoutStagingRoot,
   defaultTopicBranch,
   listTopicCheckouts,
@@ -128,6 +129,7 @@ import {
   resolveRepositoryWorkUnit,
   topicStateDir,
   topicWorktreesDir,
+  writeCheckoutInheritedTags,
   writeTransferTombstone,
 } from './repository-workspaces.js';
 import { SESSION_RECLAIM_JOURNAL_FILENAME, SESSION_RESCUES_DIRNAME } from './storage-manager.js';
@@ -795,7 +797,7 @@ describe('branch clone checkouts', () => {
     expect(git(trashedCopy, ['symbolic-ref', '--short', 'HEAD'])).toBe('feat');
   });
 
-  it('tags a clone inherited unchanged from its canonical are not its own work; every other tag still is (#672)', async () => {
+  it('tags the host recorded when it built a clone are not its own work; every other tag still is (#672)', async () => {
     // The canonical holds tags on a commit no origin branch reaches, as a
     // repository's release tags often do. A clone copies every canonical tag
     // (repository_checkout removes only heads and remote-tracking refs).
@@ -805,19 +807,18 @@ describe('branch clone checkouts', () => {
     git(canon.canonical, ['tag', 'release-1', release]);
     git(canon.canonical, ['tag', '-a', '-m', 'annotated release', 'release-2', release]);
     git(canon.canonical, ['tag', 'tree-tag', `${base}^{tree}`]);
-    // A second workgroup canonical that is gone by the time cleanup runs.
-    const gone = canonicalFixture('repo-b');
-    git(gone.canonical, [
-      'tag',
-      'release-1',
-      git(gone.canonical, ['commit-tree', 'HEAD^{tree}', '-p', 'HEAD', '-m', 'r']),
-    ]);
+    /** Record the clone's tags, as repository_checkout does just before it publishes a clone. */
+    const recordTags = (checkout: string): void =>
+      writeCheckoutInheritedTags(
+        checkout,
+        git(checkout, ['for-each-ref', '--format=%(objectname) %(refname)', 'refs/tags']),
+      );
 
-    const cases: Array<{ thread: string; repo: string; reason: string; arrange: (dir: string) => void }> = [
+    const cases: Array<{ thread: string; recorded: boolean; reason: string; arrange: (dir: string) => void }> = [
       {
-        // The clone's own work under an inherited tag's name: same name, another commit.
+        // The clone's own work under a recorded tag's name: same name, another commit.
         thread: 'p672-moved-tag',
-        repo: 'repo-a',
+        recorded: true,
         reason: 'unpushed',
         arrange: (dir) => {
           git(dir, ['checkout', '-q', '--detach']);
@@ -827,40 +828,42 @@ describe('branch clone checkouts', () => {
         },
       },
       {
-        // A sibling topic in the workgroup can write the canonical's refs. A tag
-        // it plants there on this clone's unpushed commit is not this clone's
-        // tag, so the commit, which a branch holds, still counts.
-        thread: 'p672-planted-canonical-tag',
-        repo: 'repo-a',
+        // Tag-only work, then a sibling topic, which can write the canonical's
+        // refs, plants the same tag name at the same object there. The record
+        // was written when the clone was built, so the tag still counts.
+        thread: 'p672-planted-after-work',
+        recorded: true,
         reason: 'unpushed',
         arrange: (dir) => {
-          git(dir, ['checkout', '-q', '-b', 'side']);
-          commitFile(dir, 'victim.txt');
+          git(dir, ['checkout', '-q', '--detach']);
+          commitFile(dir, 'tag-only.txt');
+          git(dir, ['tag', 'wip']);
           git(dir, ['checkout', '-q', 'feat']);
-          git(canon.canonical, ['fetch', '-q', dir, '+refs/heads/side:refs/tags/planted']);
+          git(canon.canonical, ['fetch', '-q', dir, '+refs/tags/wip:refs/tags/wip']);
         },
       },
       {
-        // No canonical to compare against: every tag counts, as before.
-        thread: 'p672-canonical-gone',
-        repo: 'repo-b',
+        // A clone this host did not build has no record: every tag counts.
+        thread: 'p672-no-record',
+        recorded: false,
         reason: 'unpushed',
         arrange: () => {},
       },
     ];
     const refused = cases.map((spec) => {
-      const fixture = cloneCheckout(spec.repo === 'repo-a' ? canon : gone, spec.thread, `${spec.repo}@feat`, 'feat');
+      const fixture = cloneCheckout(canon, spec.thread, 'repo-a@feat', 'feat');
+      if (spec.recorded) recordTags(fixture.checkout);
       spec.arrange(fixture.checkout);
       age(fixture.checkout);
       return { ...spec, ...fixture, before: snapshot(fixture.checkout) };
     });
-    fs.rmSync(gone.canonical, { recursive: true, force: true });
     const inherited = cloneCheckout(canon, 'p672-inherited', 'repo-a@feat', 'feat');
+    recordTags(inherited.checkout);
     expect(git(inherited.checkout, ['tag', '--list']).split('\n').sort()).toEqual([
-      'planted',
       'release-1',
       'release-2',
       'tree-tag',
+      'wip',
     ]);
     state.rows = [...refused.map((spec) => closedRow(spec.thread)), closedRow('p672-inherited')];
 
@@ -879,6 +882,7 @@ describe('branch clone checkouts', () => {
     // The clone branch of worktree cleanup, including its re-proof of the
     // quarantined copy.
     const fresh = cloneCheckout(canon, 'p672-inherited-branch', 'repo-a@feat', 'feat');
+    recordTags(fresh.checkout);
     state.rows.push(closedRow('p672-inherited-branch'));
     const decisions = new Map<string, unknown>();
     for (const target of await _discoverWorktreesForTesting(state.dataDir)) {
@@ -890,6 +894,9 @@ describe('branch clone checkouts', () => {
     }
     expect(decisions.get(fresh.checkout)).toEqual({ collected: true, reason: 'clean-and-pushed' });
     expect(state.trashed).toHaveLength(2);
+    // The collected clone's record went with it; a refused clone keeps its own.
+    expect(fs.existsSync(checkoutInheritedTagsPath(fresh.checkout))).toBe(false);
+    expect(fs.existsSync(checkoutInheritedTagsPath(refused[0]!.checkout))).toBe(true);
   });
 
   /** Every path under `dir` with its type and bytes: what "restored byte for byte" compares. */
