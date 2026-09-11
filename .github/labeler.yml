@@ -9,8 +9,16 @@
 # breaks every session — AND no deterministic gate already covers it. Upstream-owned
 # files are deliberately absent: the upstream ratchet already gates them in CI.
 #
-# Replayed against PRs #510–#595 on 2026-09-10: 18 of 60 (30%) would be reviewed.
-# `sync-labels: true` removes the label when a later push stops touching these paths.
+# `risk:high` is the union of every path below and stays the only label the merge gate
+# reads. Alongside it, each path also carries a `risk:<dimension>` label (guard,
+# message-path, sweep, session-db, self-mod, credential, migration, supply-chain,
+# deploy, gates, runner) so a reviewer can see which seam a PR touches without reading
+# the whole diff; `scripts/labeler-config.test.ts` asserts the two stay in sync.
+#
+# Replayed against PRs #510–#595 on 2026-09-10 (measured before the dimension labels
+# and the risk:runner/message-path/gates/supply-chain additions below): 18 of 60 (30%)
+# would be reviewed.
+# `sync-labels: true` removes a label when a later push stops touching its paths.
 # To request review on a PR this file does not select, add `review:requested` by hand —
 # never `risk:high`, which is machine-owned and would be removed on the next sync.
 
@@ -24,6 +32,7 @@ risk:high:
     # The message path, both ends
     - 'src/router.ts'
     - 'src/delivery.ts'
+    - 'container/agent-runner/src/admission-gate.ts'
     # Everything on a timer — the sweep plus the modules it was decomposed into
     - 'src/host-sweep.ts'
     - 'src/modules/sweep-scheduling/**'
@@ -35,28 +44,119 @@ risk:high:
     - 'container/agent-runner/src/poll-loop.ts'
     # Agents editing their own container config
     - 'src/modules/self-mod/**'
-    # Credential, identity and privilege scoping (onecliSecrets, cli_scope, mounts)
+    # Credential, identity and privilege scoping (onecliSecrets, cli_scope, mounts) and
+    # who may approve a privileged action (approval cards, click authorization, roles)
     - 'src/onecli-secrets.ts'
     - 'src/container-config.ts'
     - 'src/container-runner.ts'
     - 'src/cli/dispatch.ts'
     - 'src/cli/registry.ts'
-    # Who may approve a privileged action: approval cards, click authorization, roles
     - 'src/modules/approvals/**'
     - 'src/modules/permissions/**'
     # Irreversible against a live DB
     - 'src/db/migrations/**'
-    # Supply chain: pnpm allowBuilds lives here
+    # Supply chain: pnpm allowBuilds, and the container image it builds
     - 'pnpm-workspace.yaml'
-    # Deploy and rollback (src/deploy-crash-guard.ts is covered by *guard*)
+    - 'container/Dockerfile'
+    - 'container/build.sh'
+    # Deploy and rollback (src/deploy-crash-guard.ts is covered by *guard*), and the
+    # nightly host snapshot that scans for secrets then pushes config to a remote
     - 'scripts/deploy.sh'
-    # Nightly host snapshot: scans for secrets, then pushes config to a remote
     - 'scripts/git-safety.sh'
-    # The gates themselves: CI workflows, this file, the git hooks, and the public-boundary
-    # checkers and allowlist. CI runs only the portable boundary mode, so the strict
-    # identifier check runs only in the hooks and the daily remote scan.
+    # The gates themselves: CI workflows, this file, the git hooks, the public-boundary
+    # checkers and allowlist, and the PR review loop that IS the review gate. CI runs
+    # only the portable boundary mode, so the strict identifier check runs only in the
+    # hooks and the daily remote scan.
     - '.github/**'
     - '.husky/**'
     - 'scripts/check-public-boundary.ts'
     - 'scripts/check-remote-boundary.ts'
     - '.public-boundary-allowlist.json'
+    - 'container/skills/pr-review-loop/**'
+    - 'docs/review-policy.md'
+    # The agent-runner boot snapshot mounted read-only into every group, and its MCP
+    # tool surface
+    - 'src/agent-runner-source.ts'
+    - 'src/group-init.ts'
+    - 'container/agent-runner/src/mcp-tools/**'
+
+risk:guard:
+- changed-files:
+  - any-glob-to-any-file:
+    - 'src/**/*guard*.ts'
+    - 'container/agent-runner/src/**/*guard*.ts'
+    - 'src/guard/**'
+
+risk:message-path:
+- changed-files:
+  - any-glob-to-any-file:
+    - 'src/router.ts'
+    - 'src/delivery.ts'
+    - 'container/agent-runner/src/admission-gate.ts'
+
+risk:sweep:
+- changed-files:
+  - any-glob-to-any-file:
+    - 'src/host-sweep.ts'
+    - 'src/modules/sweep-scheduling/**'
+
+risk:session-db:
+- changed-files:
+  - any-glob-to-any-file:
+    - 'src/modules/mailbox/**'
+    - 'src/mailbox/sqlite/**'
+    - 'container/agent-runner/src/mailbox/sqlite/**'
+    - 'container/agent-runner/src/db/**'
+    - 'container/agent-runner/src/poll-loop.ts'
+
+risk:self-mod:
+- changed-files:
+  - any-glob-to-any-file:
+    - 'src/modules/self-mod/**'
+
+risk:credential:
+- changed-files:
+  - any-glob-to-any-file:
+    - 'src/onecli-secrets.ts'
+    - 'src/container-config.ts'
+    - 'src/container-runner.ts'
+    - 'src/cli/dispatch.ts'
+    - 'src/cli/registry.ts'
+    - 'src/modules/approvals/**'
+    - 'src/modules/permissions/**'
+
+risk:migration:
+- changed-files:
+  - any-glob-to-any-file:
+    - 'src/db/migrations/**'
+
+risk:supply-chain:
+- changed-files:
+  - any-glob-to-any-file:
+    - 'pnpm-workspace.yaml'
+    - 'container/Dockerfile'
+    - 'container/build.sh'
+
+risk:deploy:
+- changed-files:
+  - any-glob-to-any-file:
+    - 'scripts/deploy.sh'
+    - 'scripts/git-safety.sh'
+
+risk:gates:
+- changed-files:
+  - any-glob-to-any-file:
+    - '.github/**'
+    - '.husky/**'
+    - 'scripts/check-public-boundary.ts'
+    - 'scripts/check-remote-boundary.ts'
+    - '.public-boundary-allowlist.json'
+    - 'container/skills/pr-review-loop/**'
+    - 'docs/review-policy.md'
+
+risk:runner:
+- changed-files:
+  - any-glob-to-any-file:
+    - 'src/agent-runner-source.ts'
+    - 'src/group-init.ts'
+    - 'container/agent-runner/src/mcp-tools/**'
