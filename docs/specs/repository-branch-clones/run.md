@@ -215,3 +215,16 @@ Known risks carried to ship: stale fingerprint until host restart; chmod residua
 - `merge-check --head 55a8af9b5` → exit 24 `ci_red`. Fix delegated to the builder (commit only; lead verifies and pushes via `codex-review.sh push`).
 - CI fix: builder commit `63092438c` (tests only) — `src/dependency-cache.ts` pinned in storage-manager's import manifest (comment corrected by the builder: config.ts is not a leaf; the claim that holds is "reaches nothing storage-manager.ts did not already reach"); the three `getStorageReport`-based tests (P1-14, P1-20, P1-24) moved into the pinned `storage-manager.test.ts`, and the `getRawDb` mock removed from `dependency-cache.test.ts` (`RAW_DB_IMPORTERS` unchanged).
 - Lead verification on `63092438c`: standing tripwire set (`raw-db-ratchet`, `raw-outside-lease`, `insert-or-adopt`, `transaction-closures`, `async-seam-tripwires`, `skill-resources-async-callers`, `wake-chokepoint`, `migrations/registry`) + `mailbox-seam-unreachable-scripts` + `mailbox-seam-ratchet` + 7 storage suites → **17 files, 410/410**; `tsc` host and scripts exit 0; prettier `--check` clean on changed files; eslint 0 errors; ratchet Δ 0.
+
+## 2026-09-11 — Deploy, first report pass, rev 2.4 (Phase 1)
+
+- The operator deployed with `scripts/deploy.sh` at 03:30:08Z. Build `306b0f8b7` == HEAD == origin/main (clean), with `NANOCLAW_DEPENDENCY_CACHE=report` in the live `.env`. OneCLI preflight ok; no new errors.
+- First pass, 03:30Z:
+  - `decisions=36 adopted=5 convertMismatch=5 deferred=22 contentReads=5 privateInMountedTopics=2 (1.09 GB) fingerprintAvailable=true`.
+  - 4 trees incomplete: a hidden lockfile missing; a postinstall engine newer than the hidden lockfile (the known postinstall case); two nested non-optional package-lock entries absent from the hidden lockfile.
+- **Finding: every one of the 5 convert-mismatches first differs at `.package-lock.json`.**
+  - Diffing two pairs: the `packages` maps are identical except 5–6 keys. One tree holds `@esbuild/linux-x64` and `@rollup/rollup-linux-x64-*`; the other holds the `linux-arm64` builds.
+  - Host `x86_64`, agent image `linux/amd64`, fingerprint `arch=x64` (`process.arch`, `src/dependency-cache.ts:76`).
+  - Across all 37 topic installs: 24 x64, 10 arm64 (all installed 09-06..09-08), 2 mixed, 1 with no native packages. Two of the 5 predicted adopts were arm64 trees. What produced the arm64 installs is not identified.
+- **Impact:** none in `report`. In `apply`, rules 1–3 would seal arm64 entries under x64 keys. Convert still fails closed on content equality, and `linkPackageDir` has no production caller in Phase 1. So the harm is x64 trees never deduplicating, plus a wrong-platform entry waiting for Phase 2's link.
+- **Correction (rev 2.4):** plan §5.7.3 rule 4, where installed packages must accept the platform's `os`/`cpu`, matched as npm-install-checks 7.1.2 `checkList` does (`/usr/lib/node_modules/npm/node_modules/npm-install-checks/lib/index.js:59-83`). `apply` waits for this fix.

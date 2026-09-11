@@ -424,6 +424,20 @@ A tree is complete when all of these hold:
 2. Every package path in that map exists as a directory whose `package.json` `name` and `version`
    match the lockfile entry.
 3. No regular file under `node_modules` has an mtime newer than the hidden lockfile's.
+4. Every installed package that declares `os` or `cpu` accepts `linux` and `process.arch`. That
+   is every entry in the hidden lockfile's `packages` map with those fields. They're matched the
+   way npm matches them (npm-install-checks `checkList`): a `!value` naming the platform refuses,
+   and otherwise the list must name it, consist only of negations, or be `any`. `libc` is not
+   checked, because real trees hold the -gnu and -musl builds of a native package side by side.
+   *(Report-mode correction, rev 2.4.)*
+   - **What the first report pass found.** 12 of 37 topic installs held arm64 native packages
+     under keys whose fingerprint says x64: the same lockfile, installed for another CPU. Rules 1–3
+     accept them, so a first-come adopt could seal an arm64 entry for an x64 key. Every x64 tree
+     would then mismatch that entry forever, and Phase 2's link would hand arm64 binaries to an
+     x64 workspace.
+   - **Why this rule has no false refusals.** It checks installed packages, not absent ones, so
+     the refusals described under rule 1 can't occur. Without `--force`, npm never installs a
+     package whose `os`/`cpu` excludes the platform it installs for.
 
 Root-level dot entries other than `.bin` and `.package-lock.json`, such as `.vite` and `.cache`,
 are workspace-private. They are excluded from every check and never shared.
