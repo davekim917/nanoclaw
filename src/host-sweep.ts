@@ -632,8 +632,15 @@ async function runTickPhase(ctx: SweepTickContext, phase: SweepPhase, generation
   }
 }
 
+/** A session whose sweeping tick was abandoned starts no further duty (#637). */
+function sessionTickAbandoned(ctx: SweepSessionContext): boolean {
+  const owner = sessionsRunning.get(ctx.session.id);
+  return owner !== undefined && owner !== tickGeneration;
+}
+
 async function runSessionPhase(ctx: SweepSessionContext, phase: SweepPhase): Promise<void> {
   for (const duty of dutiesForPhase(phase)) {
+    if (sessionTickAbandoned(ctx)) return;
     await runDutyBody(duty.name, phase, () => duty.run(ctx));
   }
 }
@@ -643,14 +650,15 @@ async function runExclusiveSessionPhase(ctx: SweepSessionContext, phase: SweepPh
   const duties = dutiesForPhase(phase);
   for (const duty of duties) {
     if (!duty.claims) continue;
+    if (sessionTickAbandoned(ctx)) return;
     const claimed = await runDutyBody(duty.name, phase, () => duty.claims!(ctx));
     if (claimed) {
-      await runDutyBody(duty.name, phase, () => duty.run(ctx));
+      if (!sessionTickAbandoned(ctx)) await runDutyBody(duty.name, phase, () => duty.run(ctx));
       return;
     }
   }
   const fallthrough = duties.find((d) => !d.claims);
-  if (fallthrough) await runDutyBody(fallthrough.name, phase, () => fallthrough.run(ctx));
+  if (fallthrough && !sessionTickAbandoned(ctx)) await runDutyBody(fallthrough.name, phase, () => fallthrough.run(ctx));
 }
 
 export async function runSlaObservationHooks(
@@ -930,7 +938,7 @@ let tickGeneration = 0;
 const activeDuties: Array<{ duty: string; window: SweepWindow; startedAtMs: number }> = [];
 /** Tick duties and sessions still running, possibly under an abandoned tick: never re-entered (#637). */
 const tickDutiesRunning = new Set<string>();
-const sessionsRunning = new Set<string>();
+const sessionsRunning = new Map<string, number>(); // session → the generation sweeping it
 
 export function startHostSweep(): void {
   if (running) return;
@@ -1106,7 +1114,7 @@ async function sweepOnce(generation: number): Promise<void> {
       continue;
     }
     quietSessions.delete(session.id);
-    sessionsRunning.add(session.id);
+    sessionsRunning.set(session.id, generation);
     try {
       const quietUntil = await sweepSession(session, tick);
       if (quietUntil !== null) {
@@ -1144,6 +1152,7 @@ async function sweepOnce(generation: number): Promise<void> {
     // overhead is microseconds against that cost.
     await sweepYield();
   }
+  if (generation !== tickGeneration) return; // abandoned (#637): persist nothing against reset state
   // Bound the cache to sessions that still exist (closed sessions drop out
   // of getActiveSessions and would otherwise accumulate forever).
   if (quietSessions.size > sessions.length + 500) {

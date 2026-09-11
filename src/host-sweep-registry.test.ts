@@ -780,6 +780,74 @@ describe('sweep duty registry (S2-PR2)', () => {
     warn.mockRestore();
   });
 
+  // #637 (Codex re-review): once resumed, an abandoned tick may finish only the
+  // duty body it is inside. It must start no later phase, and must persist
+  // nothing computed against sweep state its replacement has since reset.
+  it('a resumed abandoned tick runs no later session phase', async () => {
+    _resetSweepRegistryForTesting({ builtins: false });
+    h.sessions = [fakeSession('A')];
+    h.running.add('A');
+    const wakes: string[] = [];
+    let plans = 0;
+    let release: () => void = () => {};
+    registerSweepDuty({
+      name: 'p',
+      phase: 'session:plan',
+      order: 10,
+      run: () => {
+        plans += 1;
+        if (plans === 1) return new Promise<void>((resolve) => (release = resolve));
+      },
+    });
+    registerSweepDuty({
+      name: 'w',
+      phase: 'session:wake',
+      order: 10,
+      run: (ctx) => {
+        wakes.push((ctx as SweepSessionContext).session.id);
+      },
+    });
+
+    const first = _sweepOnceForTesting();
+    try {
+      await vi.waitFor(() => expect(plans).toBe(1));
+      await _sweepOnceForTesting(); // supersedes the first, and skips A
+    } finally {
+      release();
+      await first;
+    }
+    expect(wakes).toEqual([]);
+    await _sweepOnceForTesting();
+    expect(wakes).toEqual(['A']);
+  });
+
+  it('a resumed abandoned tick persists no quiet marks', async () => {
+    _resetSweepRegistryForTesting({ builtins: false });
+    h.sessions = [fakeSession('Q')]; // no container: a quiet session
+    let plans = 0;
+    let release: () => void = () => {};
+    registerSweepDuty({
+      name: 'p',
+      phase: 'session:plan',
+      order: 10,
+      run: () => {
+        plans += 1;
+        if (plans === 1) return new Promise<void>((resolve) => (release = resolve));
+      },
+    });
+
+    const writesBefore = h.quietWrites.length;
+    const first = _sweepOnceForTesting();
+    try {
+      await vi.waitFor(() => expect(plans).toBe(1));
+      await _sweepOnceForTesting(); // supersedes the first, and skips Q
+    } finally {
+      release();
+      await first;
+    }
+    expect(h.quietWrites.length).toBe(writesBefore);
+  });
+
   // ── R-3 ────────────────────────────────────────────────────────────────────
   it('one getActiveSessions call per tick regardless of duty count', async () => {
     _resetSweepRegistryForTesting({ builtins: false });
@@ -1593,17 +1661,18 @@ describe('sweep duty registry (S2-PR2)', () => {
     // `src/modules/sweep-task-escalation/index.ts`, which is the property the
     // three structural assertions above pin and the reason this number exists.
     //
-    // **Raised 1,462 → 1,517 by #637 (sweep stall bound).** Measured to the
+    // **Raised 1,462 → 1,526 by #637 (sweep stall bound).** Measured to the
     // line, zero headroom. The addition is driver mechanics, not a duty body:
     // - the tick chain races each tick against `SWEEP_TICK_STALL_MS` and
     //   re-arms past it;
     // - `runDutyBody` records the duty in flight, so the abandonment names it;
-    // - generation checkpoints stop an abandoned tick that later resumes;
+    // - generation checkpoints (tick phases, session phases, the loop exit)
+    //   stop a resumed abandoned tick from starting or persisting anything;
     // - running sets keep a later tick from re-entering a duty or a session
     //   the abandoned tick is still inside (its host task script, for one).
     // A tick that never settled left the sweep dead ~7h on 2026-09-11 with
     // every vital green. The three structural assertions above are unchanged.
-    expect(source.split('\n').length).toBeLessThanOrEqual(1517);
+    expect(source.split('\n').length).toBeLessThanOrEqual(1526);
     expect(h.spawns).toEqual([]);
   });
 
