@@ -110,7 +110,6 @@ import {
   processPackageDir,
   startDependencyCachePass,
 } from '../../dependency-cache.js';
-import { log } from '../../log.js';
 import { sessionDir } from '../../session-manager.js';
 import { closeDb, initTestDb, getRawDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
@@ -126,7 +125,6 @@ import {
   publishStagedCanonical,
   refreshCanonicalFromLocalRefs,
   repositoryCheckoutLane,
-  resolveTopicCloneCheckout,
   resolveTransferSourceWorkUnit,
   transferRepositoryWorktree,
   type CheckoutFarmPolicy,
@@ -1983,88 +1981,101 @@ describe('repository_checkout host action (plan §5.2, Phase 2)', { timeout: 60_
     expect(git(canonical, ['rev-parse', 'refs/heads/dual'])).toBe(dualLocal);
   });
 
-  it("refresh absorbs a clone's origin refs fast-forward only", async () => {
+  it('refresh never reads a checkout: a clone redirecting to another repository leaks nothing', async () => {
     const dataDir = hostActionDataDir;
     const canonical = networkCanonical(dataDir);
-    const originRef = (): string => git(canonical, ['rev-parse', 'refs/remotes/origin/feat-9']);
-    const v1 = pushToRemote(canonical, 'feat-9', { 'nine.txt': 'v1\n' });
-    const sessionA = taskSession('session-p2-9-a', 'p2-9-a');
-    const unitA = unitOf(sessionA);
-    const unitB = threadUnit('p2-9-b');
-    const a = await checkout(unitA, 'feat-9', dataDir);
-    const b = await checkout(unitB, 'feat-9', dataDir);
-    expect([a.startedFrom, b.startedFrom]).toEqual(['origin-branch', 'origin-branch']);
-    const aPath = path.join(topicWorktreesDir(unitA, dataDir), a.dirName);
+    const session = taskSession('session-p2-9', 'p2-9');
+    const topicRoot = topicWorktreesDir(unitOf(session), dataDir);
+    fs.mkdirSync(topicRoot, { recursive: true });
 
-    fs.writeFileSync(path.join(aPath, 'nine.txt'), 'v2\n');
-    git(aPath, ['commit', '-q', '-am', 'v2']);
-    git(aPath, ['push', '-q', 'origin', 'feat-9']);
-    const v2 = git(aPath, ['rev-parse', 'HEAD']);
-    expect(git(aPath, ['rev-parse', 'refs/remotes/origin/feat-9'])).toBe(v2);
-    expect(originRef()).toBe(v1);
+    // Another workgroup's repository, holding one secret object per route.
+    const other = canonicalRepoDir('wg-other', 'secret', dataDir);
+    fs.mkdirSync(other, { recursive: true });
+    git(other, ['init', '-q', '-b', 'main']);
+    const secrets: Record<string, string> = {};
+    for (const route of ['commondir', 'alternates', 'objects-link']) {
+      fs.writeFileSync(path.join(other, 'secret.txt'), `other workgroup secret via ${route}\n`);
+      git(other, ['add', '-A']);
+      git(other, ['commit', '-q', '-m', `secret ${route}`]);
+      secrets[route] = git(other, ['rev-parse', 'HEAD']);
+    }
+    // The commondir route exposes the other repository's own refs.
+    git(other, ['update-ref', 'refs/remotes/origin/leaked-commondir', secrets.commondir]);
+    const otherGit = path.join(other, '.git');
 
-    await refreshCanonicalFromLocalRefs({
-      workgroupId: WG,
-      repo: 'proj',
-      dataDir,
-      absorbFrom: resolveTopicCloneCheckout(unitA, 'proj', a.dirName, dataDir),
-    });
-    expect(originRef()).toBe(v2);
+    // Clones in the caller's own topic, each redirecting Git to that repository.
+    const viaCommondir = path.join(topicRoot, 'proj@via-commondir');
+    execFileSync('git', ['clone', '-q', canonical, viaCommondir]);
+    fs.writeFileSync(path.join(viaCommondir, '.git', 'commondir'), `${otherGit}\n`);
 
-    // A clone whose origin/feat-9 is stale cannot rewind the canonical.
-    const warn = vi.spyOn(log, 'warn');
-    await refreshCanonicalFromLocalRefs({
-      workgroupId: WG,
-      repo: 'proj',
-      dataDir,
-      absorbFrom: resolveTopicCloneCheckout(unitB, 'proj', b.dirName, dataDir),
-    });
-    expect(originRef()).toBe(v2);
-    expect(warn).toHaveBeenCalledWith(
-      expect.stringMatching(/fast-forward/),
-      expect.objectContaining({ rejected: [expect.stringContaining('feat-9')] }),
-    );
-    warn.mockRestore();
+    const viaAlternates = path.join(topicRoot, 'proj@via-alternates');
+    execFileSync('git', ['clone', '-q', canonical, viaAlternates]);
+    fs.writeFileSync(path.join(viaAlternates, '.git', 'objects', 'info', 'alternates'), `${otherGit}/objects\n`);
+    git(viaAlternates, ['update-ref', 'refs/remotes/origin/leaked-alternates', secrets.alternates]);
 
-    // Only a clone in the caller's own topic can be named.
-    const onlyB = await checkout(unitB, 'only-b', dataDir);
-    const topicA = topicWorktreesDir(unitA, dataDir);
-    fs.symlinkSync(path.join(topicWorktreesDir(unitB, dataDir), onlyB.dirName), path.join(topicA, 'proj@via-link'));
-    git(canonical, ['worktree', 'add', '-q', '--detach', path.join(topicA, 'proj@linked'), 'HEAD']);
-    for (const name of [
-      onlyB.dirName,
-      'proj@via-link',
-      'proj@linked',
-      '../proj',
-      'proj/../../proj',
-      '.staging',
-      'other@feat-9',
-      '',
-    ]) {
-      expect(() => resolveTopicCloneCheckout(unitA, 'proj', name, dataDir), name).toThrow();
+    const viaObjectsLink = path.join(topicRoot, 'proj@via-objects-link');
+    fs.mkdirSync(viaObjectsLink);
+    git(viaObjectsLink, ['init', '-q', '-b', 'main']);
+    fs.rmSync(path.join(viaObjectsLink, '.git', 'objects'), { recursive: true });
+    fs.symlinkSync(path.join(otherGit, 'objects'), path.join(viaObjectsLink, '.git', 'objects'));
+    git(viaObjectsLink, ['update-ref', 'refs/remotes/origin/leaked-objects-link', secrets['objects-link']]);
+
+    const refsBefore = remoteRefs(canonical);
+    mockAgentGroup();
+    const requests = ['proj@via-commondir', 'proj@via-alternates', 'proj@via-objects-link'].map((dirName) => ({
+      requestId: nextRequestId(),
+      dirName,
+    }));
+    const settled = [];
+    for (const { requestId, dirName } of requests) {
+      // A container that has not restarted since rev 2.7 still names a checkout.
+      settled.push(
+        await Promise.allSettled([
+          applyRepositoryRefreshAction(
+            { requestId, repo: 'proj', workUnitKey: unitOf(session).key, checkout: dirName },
+            session,
+          ),
+        ]),
+      );
     }
 
-    mockAgentGroup();
-    const refused = nextRequestId();
-    await expect(
-      applyRepositoryRefreshAction(
-        { requestId: refused, repo: 'proj', workUnitKey: unitA.key, checkout: onlyB.dirName },
-        sessionA,
-      ),
-    ).rejects.toThrow(/this topic/);
-    expect(responseFor(refused)).toMatchObject({ ok: false });
-    expect(originRef()).toBe(v2);
+    // Neither a ref nor an object crossed into this workgroup's canonical.
+    expect(remoteRefs(canonical)).toBe(refsBefore);
+    for (const [route, oid] of Object.entries(secrets)) {
+      expect(tryGitOut(canonical, ['cat-file', '-e', `${oid}^{commit}`]), route).toBeNull();
+    }
+    // Each is a plain refresh, and it succeeds.
+    expect(settled.flat().map((result) => result.status)).toEqual(['fulfilled', 'fulfilled', 'fulfilled']);
+    for (const { requestId } of requests) {
+      expect(mailboxInbound.has(`repository-action-response-${requestId}`)).toBe(false);
+    }
+  });
 
-    // Through the action, the caller's own clone is absorbed.
-    fs.writeFileSync(path.join(aPath, 'nine.txt'), 'v3\n');
-    git(aPath, ['commit', '-q', '-am', 'v3']);
-    git(aPath, ['push', '-q', 'origin', 'feat-9']);
-    const v3 = git(aPath, ['rev-parse', 'HEAD']);
-    await applyRepositoryRefreshAction(
-      { requestId: nextRequestId(), repo: 'proj', workUnitKey: unitA.key, checkout: a.dirName },
-      sessionA,
+  it('a canonical whose .git holds a commondir file is refused, and nothing is staged', async () => {
+    const canonical = networkCanonical(root);
+    const elsewhere = path.join(root, 'elsewhere');
+    fs.mkdirSync(elsewhere);
+    git(elsewhere, ['init', '-q', '-b', 'main']);
+    git(elsewhere, ['commit', '-q', '--allow-empty', '-m', 'elsewhere']);
+    // The canonical .git is mounted read-write into containers (container-runner.ts:4406).
+    fs.writeFileSync(path.join(canonical, '.git', 'commondir'), `${path.join(elsewhere, '.git')}\n`);
+    const unit = threadUnit('commondir');
+    const topicRoot = topicWorktreesDir(unit, root);
+    const staged = (): string[] => {
+      try {
+        return fs.readdirSync(checkoutStagingRoot(topicRoot));
+      } catch {
+        return [];
+      }
+    };
+
+    await expect(checkout(unit, 'feat-commondir', root)).rejects.toThrow(/commondir/);
+    await expect(checkout(unit, null, root)).rejects.toThrow(/commondir/);
+    expect(listTopicCheckouts(topicRoot)).toEqual([]);
+    expect(staged()).toEqual([]);
+    await expect(refreshCanonicalFromLocalRefs({ workgroupId: WG, repo: 'proj', dataDir: root })).rejects.toThrow(
+      /commondir/,
     );
-    expect(originRef()).toBe(v3);
   });
 
   it('repository_checkout links node_modules farms for package dirs with a verified entry', async () => {
@@ -2225,14 +2236,6 @@ describe('repository_checkout host action (plan §5.2, Phase 2)', { timeout: 60_
       created: false,
     });
     await expect(checkout(unit, null, root, 'solo')).resolves.toMatchObject({ dirName: 'solo', created: false });
-    await expect(
-      refreshCanonicalFromLocalRefs({
-        workgroupId: WG,
-        repo: 'solo',
-        dataDir: root,
-        absorbFrom: resolveTopicCloneCheckout(unit, 'solo', 'solo@keep-me', root),
-      }),
-    ).rejects.toThrow(/local-only/);
     expect(git(canonical, ['for-each-ref', 'refs/remotes'])).toBe('');
   });
 

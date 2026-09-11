@@ -7,6 +7,9 @@ rev 2.2 are in §5.7.3–§5.7.5 and §5.7.8, and add P1-10's second case plus P
 (NEW-1, approved by the operator) bounds content reads by the cap and adds P1-26. It applies the plan-review corrections
 M1–M7 plus S2, S5, and S6 (see `run.md`). The corrections themselves are cross-model reviewed
 at `/team-review --implementation`. Build order: Phase 1, then Phase 2 after Phase 1 is applied.
+Rev 2.7 (2026-09-11, operator decision after the PR #657 review) drops the host's refresh from a
+clone: containers fetch into the canonical instead, as linked worktrees do (§5.3, §5.4, §5.5,
+P2-8, P2-9).
 
 **Change type:** behavior-changing. The acceptance criteria in §9 are the exact test cases
 `/team-build` materializes first.
@@ -35,8 +38,8 @@ In scope:
 - Host-side dependency cache for npm projects: key, verify, adopt, convert-to-farm, link, seal,
   tamper check, and GC.
 - Host-side creation and full initialization of independent clones per (thread, branch). This
-  covers the `create_worktree`/`git_commit`/`git_push`/`open_pr` tool changes, clone GC, and a
-  fast-forward-only canonical refresh from clones.
+  covers the `create_worktree`/`git_commit`/`git_push`/`open_pr` tool changes, clone GC, and
+  keeping the canonical current through container-side fetches, as linked worktrees do (rev 2.7).
 - One checkout-layout primitive and one disposability primitive, used by every scanner.
 - Byte accounting that stays correct with hardlinks.
 - Agent-facing tool descriptions and instruction text.
@@ -328,7 +331,7 @@ anything:
 
 **`create_worktree` in `clone` mode:**
 
-1. Write `repository_checkout`.
+1. Network pin only: fetch origin into the canonical (§5.5). Then write `repository_checkout`.
 2. Poll for `repository-action-response-<requestId>` for up to 120 s, through a new mailbox op
    `findRepositoryActionResponse` that mirrors `findCliResponse` (`ncl.ts:75-95`). On a retryable
    error, retry once.
@@ -342,7 +345,7 @@ anything:
       Then update `startCommit`.
    3. When the checkout is not pristine, or `startedFrom` is `'canonical-local'`, never move it.
       Report "left as-is", and whether `origin/B` diverged.
-   4. Emit `repository_refresh` with the checkout dir name (§5.5).
+   4. Emit `repository_refresh`. It names no checkout (§5.5, rev 2.7).
 4. Local-only pins skip step 3 entirely, including refresh (today's `git-worktrees.ts:541-547`).
 5. Return the path, the branch, and the start-point note.
 
@@ -352,7 +355,8 @@ checkout and gets `created:false`. `continueFromThreadId` remains in its legacy-
 
 **`git_commit`, `git_push`, `open_pr`** gain an optional `branch` parameter that selects the
 checkout through `resolveCheckout`, defaulting to `<repo>`. `capturedIdentity` and the refspec
-push are unchanged. Push and PR stay refused for local-only pins, as today.
+push are unchanged. Push and PR stay refused for local-only pins, as today. After a clone's push,
+the canonical fetches origin, then a refresh is queued (§5.5).
 
 **Locking.**
 
@@ -362,26 +366,46 @@ push are unchanged. Push and PR stay refused for local-only pins, as today.
 
 ### 5.4 Mounts
 
-No mount changes in Phase 2. Clone-mode tools never touch the canonical mount, and removing that
-mount belongs to Phase 3.
+No mount changes in Phase 2. Clone-mode tools use the canonical mount only to fetch origin into it
+(§5.5, rev 2.7). Removing that mount belongs to Phase 3.
 
-### 5.5 Canonical freshness (S5)
+### 5.5 Canonical freshness (S5, rev 2.7)
 
-`repository_refresh` gains an optional `checkout` dir name. Given one, the host resolves the path
-inside the session's own topic root with `parseCheckoutDirName`. It requires `shape==='clone'`
-and a network pin, and runs a fast-forward-only fetch under the repo lock:
+Containers keep the canonical current by fetching into it, exactly as linked worktrees do today:
+`git fetch origin --prune`, then `git remote set-head origin --auto`, under the canonical's
+repository lock. That fetch is one container helper (`fetchCanonical` in `git-worktrees.ts`), and
+it runs in three places:
 
-```
-git -C <canonical> fetch --no-tags <checkoutPath> 'refs/remotes/origin/*:refs/remotes/origin/*'
-```
+- a linked `create_worktree`, as today;
+- a clone-mode `create_worktree`, before `repository_checkout` is written, so the host stages from
+  current refs and starts B from `origin/B` when another thread already pushed it;
+- after a clone's `git_push`, so the canonical learns the pushed branch. The fetch runs once the
+  clone's lock is released, so the two locks never nest. The push has already landed, so a failed
+  fetch is reported in the tool result, not raised.
 
-The refspec has no `+`, so a stale clone can never rewind the canonical. Refs rejected as
-non-fast-forward are logged, not fatal. The existing fast-forward of the canonical checkout then
-runs.
+The fetch goes through the canonical Git mount. In both checkout modes, its config, HEAD, index,
+hooks and `objects/info` are read-only overlays (`container-runner.ts` `canonicalGitControlMounts`,
+`:4413`), so a container writes only refs and objects there. Local-only pins fetch nothing and
+emit no refresh, as today.
 
-Trust is unchanged from today: containers already hold a read-write canonical `.git` mount and
-fetch into it (`container-runner.ts:4405`). Without a `checkout`, refresh behaves exactly as
-today.
+`repository_refresh` carries `{requestId, repo, workUnitKey}`. The host never reads a checkout. It
+moves the canonical's own checkout to `origin/HEAD` from the refs already there, as it did before
+Phase 2. A payload that still carries `checkout`, sent by a container that has not restarted since
+this change, is a plain refresh.
+
+**Why the host no longer absorbs from a clone.** Rev 2.6 had the host run
+`git fetch <clone> 'refs/remotes/origin/*:refs/remotes/origin/*'` into the canonical. A clone's
+`.git` is container-writable, and Git follows what it finds there. If a `.git/commondir`, an
+`objects/info/alternates` entry or a symlinked `.git/objects` points at another repository, that
+fetch copies the other repository's refs and objects. All three routes were reproduced on git 2.43
+in a scratch dir, so an agent could pull another workgroup's refs and objects into its own
+canonical. The operator dropped absorb on 2026-09-11.
+
+**Residual.** The canonical `.git` is still mounted read-write (`container-runner.ts:4406`), so a
+container could plant `commondir` there too. `assertNormalClone` refuses any repository whose
+`.git` holds `commondir`, before any host Git command runs. It guards every caller: the canonical
+before a clone is staged, refresh, publish and transfer. That is a fail-closed check on a
+container-writable mount, not a structural fix. A separate issue tracks the mount.
 
 ### 5.6 Publish
 
@@ -718,7 +742,7 @@ Build in a git worktree, never in the live checkout.
    - the `job-runner.ts` lane key;
    - the `repository_checkout` handler, including staging, remote-ref hygiene, start point,
      metadata, farm link, and publish;
-   - refresh with fast-forward-only absorption;
+   - refresh that never reads a checkout, and the `commondir` refusal (rev 2.7);
    - the clone-mode startup precondition (`src/modules/repository-workspaces/index.ts`, `job-runner.ts`).
 3. **Container:**
    - `findRepositoryActionResponse`;
@@ -785,8 +809,8 @@ Host tests go in `src/modules/repository-workspaces/index.test.ts`, `job-runner`
 | P2-5 | `same-thread siblings get one path, including while the first checkout is still initializing` | With the first host job paused inside staging, a second request for the same branch waits on the lane, then returns the same `path` with `created:false`. One dir exists, with correct HEAD and files. |
 | P2-6 | `start point prefers canonical refs/heads/B, then origin/B, then origin/HEAD, and the post-fetch step only moves pristine checkouts` | Four fixtures assert the resulting HEAD and note, including a non-pristine checkout that is left as-is. |
 | P2-7 | `a checkout whose current branch differs from its recorded branch is refused, not reused` | After a manual `git switch` inside `<repo>@<slug>`, `create_worktree(branch)` and `git_push(branch)` return the R3 error, and nothing is mutated. |
-| P2-8 | `git_commit, git_push, and open_pr act on the checkout selected by branch and default to the primary` | A commit lands in the selected clone only. A push refspec names that clone's HEAD. |
-| P2-9 | `refresh absorbs a clone's origin refs fast-forward only` | After a push, canonical `origin/B` equals the pushed commit. A clone with a stale `origin/B` cannot rewind it. A path outside the caller's topic is rejected. |
+| P2-8 | `git_commit, git_push, and open_pr act on the checkout selected by branch and default to the primary` | A commit lands in the selected clone only. A push refspec names that clone's HEAD. A clone's push queues a refresh with no `checkout`, and canonical `origin/B` equals the pushed commit (rev 2.7). |
+| P2-9 | `refresh never reads a checkout: a clone redirecting to another repository leaks nothing` | Rev 2.7. In the caller's topic, `<repo>@x` clones redirect Git to another workgroup's repository through `.git/commondir`, `objects/info/alternates` and a symlinked `.git/objects`. A refresh naming each one as `checkout` succeeds as a plain refresh, and the canonical gains none of the other repository's refs or objects. Also: `a canonical whose .git holds a commondir file is refused, and nothing is staged` (checkout and refresh), and, in the container, `clone-mode create_worktree fetches the canonical before requesting the checkout`: `origin/B`, pushed after the canonical's last fetch, is in the canonical when `repository_checkout` is queued. |
 | P2-10 | `worktree mode creates linked worktrees exactly as today` | The existing linked-worktree creation tests pass unchanged under `NANOCLAW_CHECKOUT_MODE=worktree`. |
 | P2-11 | `legacy linked checkouts are reused in clone mode and transfer still works for them` | The existing transfer tests pass with clone mode on. |
 | P2-12 | `clone disposability refuses dirty, unpushed, stashed, non-HEAD unpushed branches, and copied legacy branches` | Fixtures: dirty tree; unpushed HEAD; an unpushed non-HEAD local branch; a copied canonical `refs/heads/B` absent from the remote; a stash. All are refused with their reason, in both the clone branch and the orphan-topic loop. Only a clean pushed clone is trashed. An unpushed commit only a sibling remote holds is refused (`unpushed`), and so is a checkout holding an embedded repository (`submodule`) (rev 2.6). |

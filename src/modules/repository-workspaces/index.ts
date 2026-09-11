@@ -36,7 +36,6 @@ import {
   defaultTopicBranch,
   isRepositoryLifecycleClaimed,
   listTopicCheckouts,
-  parseCheckoutDirName,
   readCheckoutMetadata,
   readOriginPin,
   readTransferTombstone,
@@ -160,6 +159,17 @@ function assertNormalClone(repoPath: string, label: string): void {
   const gitDir = path.join(repoPath, '.git');
   const gitStat = fs.lstatSync(gitDir);
   if (gitStat.isSymbolicLink() || !gitStat.isDirectory()) throw new Error(`${label} must be a normal clone`);
+  // A normal clone's .git never holds `commondir`, and Git follows one to
+  // another repository's refs, objects and config. This is a fail-closed check
+  // on a container-writable mount (the canonical .git is mounted read-write,
+  // container-runner.ts:4406), not a structural fix: a separate issue tracks
+  // the mount itself. It runs before any git command here, which would follow it.
+  try {
+    fs.lstatSync(path.join(gitDir, 'commondir'));
+    throw new Error(`${label} must be a normal clone, and its .git holds a commondir file`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
   if (git(repoPath, ['rev-parse', '--is-bare-repository'], 10_000) !== 'false') {
     throw new Error(`${label} must be a normal clone`);
   }
@@ -338,53 +348,10 @@ export async function publishStagedCanonical(
   );
 }
 
-/**
- * Absorb a clone's remote-tracking refs into the canonical, fast-forward only
- * (plan §5.5, S5). The refspec has no `+`, so a clone whose origin refs are
- * stale can never rewind the canonical's. Git applies every ref that
- * fast-forwards and rejects the rest with exit 1 and a `! [rejected]` line per
- * ref (seen in a scratch repo, 2026-09-11): those are logged, not fatal.
- * Anything else that fails is.
- */
-function absorbCheckoutOriginRefs(input: {
-  workgroupId: string;
-  repo: string;
-  dataDir?: string;
-  canonical: string;
-  checkoutPath: string;
-}): void {
-  const pin = readOriginPin(input.workgroupId, input.repo, input.dataDir);
-  if (!pin || pin.kind === 'local-only') {
-    throw new Error(`${input.repo} has a local-only canonical; it has no origin refs to absorb from a clone`);
-  }
-  try {
-    git(
-      input.canonical,
-      ['fetch', '--no-tags', input.checkoutPath, 'refs/remotes/origin/*:refs/remotes/origin/*'],
-      300_000,
-    );
-  } catch (error) {
-    const stderr = String((error as { stderr?: unknown }).stderr ?? '');
-    const rejected = stderr
-      .split('\n')
-      .filter((line) => /^\s*!\s+\[rejected\]/.test(line))
-      .map((line) => line.trim());
-    if (rejected.length === 0 || /^fatal:/m.test(stderr)) throw error;
-    log.warn('Repository refresh left refs a clone could not fast-forward unchanged', {
-      workgroupId: input.workgroupId,
-      repo: input.repo,
-      checkout: input.checkoutPath,
-      rejected,
-    });
-  }
-}
-
 export async function refreshCanonicalFromLocalRefs(input: {
   workgroupId: string;
   repo: string;
   dataDir?: string;
-  /** A clone (from `resolveTopicCloneCheckout`) whose origin refs are absorbed first, fast-forward only. */
-  absorbFrom?: string;
 }): Promise<{ oid: string; ref: string }> {
   const canonical = canonicalRepoDir(input.workgroupId, input.repo, input.dataDir);
   return withHostRepositoryLock(
@@ -394,9 +361,6 @@ export async function refreshCanonicalFromLocalRefs(input: {
       assertNormalClone(canonical, 'canonical repository');
       const status = git(canonical, ['status', '--porcelain=v1', '--untracked-files=all'], 10_000);
       if (status !== '') throw new Error('canonical repository has local modifications; refresh refused');
-      if (input.absorbFrom !== undefined) {
-        absorbCheckoutOriginRefs({ ...input, canonical, checkoutPath: input.absorbFrom });
-      }
       const remoteHead = git(canonical, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD'], 10_000);
       if (!remoteHead.startsWith('refs/remotes/origin/')) throw new Error('origin/HEAD is not resolved');
       const oid = git(canonical, ['rev-parse', '--verify', `${remoteHead}^{commit}`], 10_000);
@@ -1254,28 +1218,6 @@ export async function dispatchRepositoryCheckout(
   );
 }
 
-/**
- * The host path of a clone named by `repository_refresh`'s `checkout` (plan
- * §5.5): a checkout dir name, parsed, looked up in the caller's OWN topic root
- * only, and required to be a clone. The lister returns only real directories
- * whose names parse, so neither a symlink nor a path can name anything else.
- */
-export function resolveTopicCloneCheckout(
-  workUnit: RepositoryWorkUnit,
-  repo: string,
-  dirName: string,
-  dataDir?: string,
-): string {
-  const parsed = parseCheckoutDirName(dirName);
-  if (!parsed || parsed.repo !== repo) throw new Error(`${JSON.stringify(dirName)} is not a checkout name for ${repo}`);
-  const found = listTopicCheckouts(topicWorktreesDir(workUnit, dataDir)).find((checkout) => checkout.name === dirName);
-  if (!found) throw new Error(`${dirName} is not a checkout in this topic`);
-  if (found.shape !== 'clone') {
-    throw new Error(`${dirName} is a ${found.shape} checkout; only a clone's origin refs are absorbed`);
-  }
-  return found.path;
-}
-
 function assertRepositoryRequestId(requestId: string): void {
   if (!REPOSITORY_REQUEST_ID_PATTERN.test(requestId)) {
     throw new Error('repository action request id is invalid');
@@ -1440,21 +1382,16 @@ export async function applyRepositoryPublishAction(content: Record<string, unkno
 export async function applyRepositoryRefreshAction(content: Record<string, unknown>, session: Session): Promise<void> {
   const requestId = typeof content.requestId === 'string' ? content.requestId : '';
   const repo = typeof content.repo === 'string' ? content.repo : '';
-  const checkout = content.checkout;
-  if (!requestId || !repo || (checkout !== undefined && typeof checkout !== 'string')) {
-    throw new Error('repository_refresh payload is invalid');
-  }
+  if (!requestId || !repo) throw new Error('repository_refresh payload is invalid');
   assertRepositoryRequestId(requestId);
   const workgroupId = await workgroupForSession(session);
   try {
-    // With `checkout` (plan §5.5), the named clone is looked up in the
-    // session's OWN topic, from the trusted work unit; without one, refresh is
-    // exactly what it was.
-    const absorbFrom =
-      typeof checkout === 'string'
-        ? resolveTopicCloneCheckout(await workUnitForSession(session, workgroupId), repo, checkout)
-        : undefined;
-    await refreshCanonicalFromLocalRefs({ workgroupId, repo, absorbFrom });
+    // The host never reads a checkout (plan §5.5, rev 2.7). A `checkout` field
+    // from a container that has not restarted since is ignored: a clone's .git
+    // is container-writable, and a planted commondir or object alternate there
+    // redirects a host fetch to another workgroup's repository. Containers
+    // fetch origin into the canonical themselves, as linked worktrees do.
+    await refreshCanonicalFromLocalRefs({ workgroupId, repo });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await response(session, requestId, false, `Host canonical refresh failed for ${repo}: ${message}`);

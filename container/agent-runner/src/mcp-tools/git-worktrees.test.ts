@@ -1032,13 +1032,18 @@ describe('topic-linked worktree topology', () => {
       const altPush = await gitPushTool.handler({ repo: 'proj', branch: altBranch });
       expect(altPush.isError).toBeFalsy();
       expect(git(remote, ['show-ref', '--verify', `refs/heads/${altBranch}`])).toContain(altBranch);
-      // A clone's push refreshes the canonical FROM that clone (plan §5.5): its
-      // remote-tracking refs are the only place the push is recorded.
+      // A clone's push lands only in the clone, so the canonical fetches origin
+      // itself (plan §5.5, rev 2.7). The refresh names no checkout: the host
+      // never reads one.
       const refreshes = (): Array<Record<string, unknown>> =>
         (outbound.query('SELECT content FROM messages_out').all() as { content: string }[])
           .map((row) => JSON.parse(row.content) as Record<string, unknown>)
           .filter((content) => content.action === 'repository_refresh');
-      expect(refreshes().at(-1)).toMatchObject({ checkout: dirName });
+      expect(refreshes().length).toBeGreaterThan(0);
+      expect(refreshes().at(-1)).not.toHaveProperty('checkout');
+      expect(git(canonical, ['rev-parse', `refs/remotes/origin/${altBranch}`])).toBe(
+        git(altPath, ['rev-parse', 'HEAD']),
+      );
 
       writeFileSync(join(primary, 'primary.txt'), 'primary\n');
       const primaryCommit = await gitCommitTool.handler({ repo: 'proj', message: 'primary work' });
@@ -1061,6 +1066,51 @@ describe('topic-linked worktree topology', () => {
         expect(primaryPr.content[0].text).toContain(`head=${primaryBranch}`);
       } finally {
         fakeGh.restore();
+      }
+    });
+
+    test('clone-mode create_worktree fetches the canonical before requesting the checkout', async () => {
+      process.env.NANOCLAW_CHECKOUT_MODE = 'clone';
+      const { inbound, outbound } = initTestSessionDb();
+      delete process.env.NANOCLAW_REPOSITORY_ACTION_TRANSPORT;
+      try {
+        // Another thread pushed B after the canonical's last fetch.
+        const branch = 'pushed-elsewhere';
+        const scratch = join(root, 'elsewhere');
+        execFileSync('git', ['clone', '-q', remote, scratch]);
+        git(scratch, ['checkout', '-q', '-b', branch]);
+        writeFileSync(join(scratch, 'elsewhere.txt'), 'elsewhere\n');
+        git(scratch, ['add', '-A']);
+        git(scratch, ['commit', '-q', '-m', 'elsewhere']);
+        git(scratch, ['push', '-q', 'origin', branch]);
+        const pushed = git(scratch, ['rev-parse', 'HEAD']);
+        expect(tryPlainGit(canonical, ['rev-parse', '--verify', `refs/remotes/origin/${branch}`])).toBeNull();
+
+        const seen = new Set<string>();
+        const callPromise = createWorktreeTool.handler({ repo: 'proj', branch });
+        await waitForOutboundAction(outbound, 'repository_checkout', seen);
+        // Observed when the request is queued, before any host answer: the host
+        // stages from these refs and so starts B from origin/B.
+        expect(tryPlainGit(canonical, ['rev-parse', '--verify', `refs/remotes/origin/${branch}`])).toBe(pushed);
+
+        const dirName = checkoutDirName('proj', branch);
+        createHostClone(remote, join(firstTopic, dirName), { repo: 'proj', branch, startedFrom: 'origin-branch' });
+        const request = await waitForOutboundAction(outbound, 'repository_checkout', new Set());
+        writeRepositoryActionResponse(inbound, request.requestId, {
+          ok: true,
+          dirName,
+          branch,
+          created: true,
+          startedFrom: 'origin-branch',
+        });
+        expect((await callPromise).isError).toBeFalsy();
+        const refreshes = (outbound.query('SELECT content FROM messages_out').all() as { content: string }[])
+          .map((row) => JSON.parse(row.content) as Record<string, unknown>)
+          .filter((content) => content.action === 'repository_refresh');
+        expect(refreshes.length).toBe(1);
+        expect(refreshes[0]).not.toHaveProperty('checkout');
+      } finally {
+        closeSessionDb();
       }
     });
 

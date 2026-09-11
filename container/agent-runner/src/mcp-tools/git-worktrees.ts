@@ -503,12 +503,42 @@ async function queueHostAction(action: string, payload: Record<string, unknown>)
   return requestId;
 }
 
-/** `checkoutDirNameValue`, when given, is threaded onto the refresh payload (plan §5.5) so the host can fast-forward the canonical from that specific clone. */
-async function emitRefresh(context: RepositoryContext, checkoutDirNameValue?: string): Promise<void> {
+/**
+ * Asks the host to move the canonical's own checkout to the origin/HEAD this
+ * container's fetch recorded. It names no checkout: the host never reads one
+ * (plan §5.5, rev 2.7).
+ */
+async function emitRefresh(context: RepositoryContext): Promise<void> {
   await queueHostAction('repository_refresh', {
     repo: context.repo,
     workUnitKey: context.workUnitKey,
-    ...(checkoutDirNameValue ? { checkout: checkoutDirNameValue } : {}),
+  });
+}
+
+/**
+ * Fetches origin into the workgroup canonical through this container's scoped
+ * identity and returns origin/HEAD's ref (plan §5.5). The caller holds the
+ * canonical's repository lock and has a network pin. The canonical's config,
+ * HEAD, index, hooks and objects/info are read-only overlays in both checkout
+ * modes (src/container-runner.ts canonicalGitControlMounts, :4413), so this
+ * writes refs and objects only.
+ */
+function fetchCanonicalHeld(context: RepositoryContext): string {
+  runGitDir(context.gitDir, ['fetch', 'origin', '--prune'], 300_000);
+  runGitDir(context.gitDir, ['remote', 'set-head', 'origin', '--auto'], 120_000);
+  const baseRef = runGitDir(context.gitDir, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD'], 10_000);
+  runGitDir(context.gitDir, ['rev-parse', '--verify', `${baseRef}^{commit}`], 10_000);
+  return baseRef;
+}
+
+/**
+ * `fetchCanonicalHeld` under the canonical's repository lock, for the clone
+ * paths, which do not otherwise hold it. `context` must be the canonical's
+ * own (from `contextFor`), never a clone's: its `lockPath` is the lock taken.
+ */
+async function fetchCanonical(context: RepositoryContext): Promise<void> {
+  await withRepositoryLock(context, () => {
+    fetchCanonicalHeld(context);
   });
 }
 
@@ -525,10 +555,7 @@ async function createLinkedWorktree(context: RepositoryContext, branchArg: strin
   if (context.pin.kind === 'local-only') {
     baseRef = runGitDir(context.gitDir, ['rev-parse', '--verify', 'HEAD^{commit}'], 10_000);
   } else {
-    runGitDir(context.gitDir, ['fetch', 'origin', '--prune'], 300_000);
-    runGitDir(context.gitDir, ['remote', 'set-head', 'origin', '--auto'], 120_000);
-    baseRef = runGitDir(context.gitDir, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD'], 10_000);
-    runGitDir(context.gitDir, ['rev-parse', '--verify', `${baseRef}^{commit}`], 10_000);
+    baseRef = fetchCanonicalHeld(context);
   }
   removeEmptyTopicPlaceholder(context);
   const existing = validateExistingWorktree(context, branchArg);
@@ -837,16 +864,17 @@ function contextForCheckout(context: RepositoryContext, resolved: ResolvedChecko
   };
 }
 
+/** `canonical` is the canonical's own context: its `lockPath` is the canonical lock even when `context`'s is a clone's. */
 function worktreeForTool(
   repo: string,
   branch?: string,
-): { context: RepositoryContext; checkout: ResolvedCheckout } | { error: ToolResult } {
+): { context: RepositoryContext; checkout: ResolvedCheckout; canonical: RepositoryContext } | { error: ToolResult } {
   const branchArg = branch && branch.trim() ? branch.trim() : null;
   try {
     const context = contextFor(repo);
     const resolved = resolveCheckout(context, branchArg);
     log(`resolved ${repo}${branchArg ? `@${branchArg}` : ''} -> ${resolved.shape} at ${resolved.path}`);
-    return { context: contextForCheckout(context, resolved), checkout: resolved };
+    return { context: contextForCheckout(context, resolved), checkout: resolved, canonical: context };
   } catch (error) {
     return { error: err(error instanceof Error ? error.message : String(error)) };
   }
@@ -955,11 +983,7 @@ interface FreshnessNote {
  * records the new `startCommit`. A non-pristine checkout, or one that started
  * from preserved local work (`canonical-local`), is left exactly as is.
  */
-async function runCloneFreshnessStep(
-  context: RepositoryContext,
-  checkoutPath: string,
-  dirName: string,
-): Promise<FreshnessNote> {
+async function runCloneFreshnessStep(context: RepositoryContext, checkoutPath: string): Promise<FreshnessNote> {
   return await withCheckoutLock(checkoutPath, async () => {
     runGitAt(checkoutPath, ['fetch', 'origin', '--prune'], 300_000);
 
@@ -969,7 +993,7 @@ async function runCloneFreshnessStep(
     const pristine = head === metadata.startCommit && status === '';
 
     const finish = async (note: FreshnessNote): Promise<FreshnessNote> => {
-      await emitRefresh(context, dirName);
+      await emitRefresh(context);
       return note;
     };
 
@@ -1024,6 +1048,10 @@ async function runCloneFreshnessStep(
 }
 
 async function createCloneWorktree(context: RepositoryContext, branch: string | null): Promise<ToolResult> {
+  // A network pin fetches the canonical first, as a linked worktree does, so
+  // the host stages from current refs and starts B from origin/B when another
+  // thread already pushed it. Local-only pins fetch nothing.
+  if (context.pin.kind !== 'local-only') await fetchCanonical(context);
   const response = await requestRepositoryCheckout(context, branch);
   if (!response.ok) return err(response.message || `repository checkout failed for ${context.repo}`);
 
@@ -1040,7 +1068,7 @@ async function createCloneWorktree(context: RepositoryContext, branch: string | 
     );
   }
 
-  const note = await runCloneFreshnessStep(context, checkoutPath, dirName);
+  const note = await runCloneFreshnessStep(context, checkoutPath);
   const divergedNote = note.diverged ? '; origin has diverged from this checkout' : '';
   return ok(
     `Worktree ready at ${checkoutPath} on branch ${note.branch} (${note.status}${divergedNote}); ` +
@@ -1349,7 +1377,7 @@ export const gitPushTool: McpToolDefinition = {
       });
       if (gate.status === 'refused') return err(gate.message);
 
-      return await withRepositoryLock(resolved.context, async () => {
+      await withRepositoryLock(resolved.context, () => {
         const push = [
           'push',
           ...(args.force === true ? [`--force-with-lease=refs/heads/${branch}:${identity.lease}`] : []),
@@ -1361,17 +1389,27 @@ export const gitPushTool: McpToolDefinition = {
         // tracking config the old form set is restored explicitly. Best effort:
         // it is a convenience, and the push has already landed.
         tryGitAt(worktree, ['branch', `--set-upstream-to=origin/${branch}`, branch]);
-        // A clone records the push only in its own remote-tracking refs, so the
-        // refresh names it for the host to absorb them (plan §5.5).
-        await emitRefresh(
-          resolved.context,
-          resolved.checkout.shape === 'clone' ? resolved.checkout.dirName : undefined,
-        );
-        return ok(
-          `Pushed ${branch} at ${head.slice(0, 8)} to origin${args.force === true ? ' (force-with-lease)' : ''}. ` +
-            `Pass branch=${branch} to open_pr so the PR is opened for this push, not for the checkout.`,
-        );
       });
+      // A linked worktree's push is recorded in the canonical's own refs. A
+      // clone's is recorded only in the clone, so the canonical fetches origin
+      // itself (plan §5.5), after the clone's lock is released so the two
+      // locks never nest. The push has landed either way, so a failed fetch is
+      // reported, not raised.
+      let canonicalNote = '';
+      if (resolved.checkout.shape === 'clone' && resolved.canonical.pin.kind !== 'local-only') {
+        try {
+          await fetchCanonical(resolved.canonical);
+        } catch (error) {
+          canonicalNote =
+            ` The workgroup canonical could not fetch it yet (${error instanceof Error ? error.message : String(error)}); ` +
+            'the next create_worktree or push fetches it.';
+        }
+      }
+      await emitRefresh(resolved.context);
+      return ok(
+        `Pushed ${branch} at ${head.slice(0, 8)} to origin${args.force === true ? ' (force-with-lease)' : ''}. ` +
+          `Pass branch=${branch} to open_pr so the PR is opened for this push, not for the checkout.${canonicalNote}`,
+      );
     } catch (error) {
       return err(`git push failed: ${error instanceof Error ? error.message : String(error)}`);
     }

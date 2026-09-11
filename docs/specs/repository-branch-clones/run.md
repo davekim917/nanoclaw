@@ -381,3 +381,46 @@ Known risks carried to ship: stale fingerprint until host restart; chmod residua
   - check-then-use path races in container-writable trees, as with the existing sweep;
   - same-thread spawns retry while a checkout runs;
   - `linkPackageDir` cleanup ownership, which has no live-tree caller.
+
+## 2026-09-11 — PR #657 review (substitute Codex at b40e5dc54)
+
+### Findings
+
+- **Isolation bypass through refresh absorb (critical). ACCEPTED, fixed in rev 2.7.**
+  - Rev 2.6 had the host run `git fetch <clone> 'refs/remotes/origin/*:refs/remotes/origin/*'` into the canonical (`absorbCheckoutOriginRefs`, reached from `applyRepositoryRefreshAction`'s `checkout`). A clone's `.git` is container-writable.
+  - Reproduced on git 2.43 in a scratch dir, three routes. A clone's `.git/commondir`, its `.git/objects/info/alternates`, or a symlinked `.git/objects` points at another repository, and the fetch copies that repository's refs and objects into the canonical. So an agent could pull another workgroup's refs and objects into its own canonical.
+  - The canonical `.git` is itself mounted read-write (`container-runner.ts:4406`), and the read-only overlays (`canonicalGitControlMounts`, `:4413`) do not cover `commondir`.
+- **Two worktree-mode NITs:** an empty checkout directory a crash left behind was no longer recovered, and branchless tools refused a detached linked checkout. **Fixed in f465f14ce.**
+- **CI failure, `src/main.test.ts` T-5:** the checkout-mode `onHostStart` hook broke the pinned host-start registrants. **Fixed in f465f14ce.**
+
+### Operator decision (2026-09-11)
+
+Drop absorb. Keep the canonical current through container-side fetches, the way linked worktrees already do it.
+
+### Correction (rev 2.7), test-first
+
+- **Host (`index.ts`).**
+  - Removed `absorbCheckoutOriginRefs`, `resolveTopicCloneCheckout` and `absorbFrom`.
+  - `applyRepositoryRefreshAction` ignores `checkout`, so a payload from a container that has not restarted is a plain refresh. `requestId`/`repo` validation is kept.
+  - `assertNormalClone` refuses a `.git` holding `commondir` before any git command runs. This is fail-closed on a container-writable mount, not a structural fix; the mount is tracked separately.
+- **Container (`git-worktrees.ts`).**
+  - `fetchCanonicalHeld` is `createLinkedWorktree`'s fetch, unchanged, and `fetchCanonical` wraps it in the canonical lock.
+  - Clone mode fetches the canonical before `repository_checkout` is written, and again after a clone's `git_push`, once the clone lock is released so the locks never nest.
+  - A failed post-push fetch is reported in the tool result, not raised, because the push has already landed.
+  - `emitRefresh` takes no checkout. Local-only pins fetch nothing and refresh nothing.
+- **Tests, each observed failing first.**
+  - Host P2-9 is now `refresh never reads a checkout: a clone redirecting to another repository leaks nothing`, covering all three routes. Before the fix, the canonical's `refs/remotes/origin` set changed.
+  - Host `a canonical whose .git holds a commondir file is refused, and nothing is staged`. Before the fix it was not refused, and git followed the file (`update_ref failed for ref 'HEAD' … nonexistent object`).
+  - Container P2-8: the refresh carries no `checkout`, and canonical `origin/<branch>` equals the pushed commit. Before the fix it carried `checkout: "proj@alt-branch"`.
+  - Container `clone-mode create_worktree fetches the canonical before requesting the checkout`. Before the fix, `origin/pushed-elsewhere` was absent when the request was queued.
+  - The local-only host test lost its absorb assertion.
+- **Plan rev 2.7:** status line, the §2 scope bullet, §5.3 steps 1 and 3.4 plus the push note, §5.4, §5.5 rewritten, §8, and the P2-8 and P2-9 rows.
+
+### Fresh results
+
+- **Host vitest** (`--maxWorkers=2`, under the shared flock) over repository-workspaces (both suites), worktree-cleanup, main, checkout-mode, container-runner, safe-git, repository-migration, storage-gc, ratchet, tripwire, mailbox-seam, storage-manager, dependency-cache and host-sweep: 28 files, 784/784.
+  - After a lint-only change (an unused import), `src/modules/repository-workspaces/` passed again: 2 files, 53/53.
+- **Container:** `bun test` over git-worktrees, checkout-layout and instruction-fragment-migration: 59/59.
+- **Typecheck:** `tsc -p tsconfig.json` and `tsc -p container/agent-runner/tsconfig.json` are both clean.
+- **Lint and format:** eslint `--quiet` and prettier `--check` on the four changed `.ts` files are clean.
+- **Ratchet:** UNCHANGED 959, Δ 0.
