@@ -341,7 +341,7 @@ fresh; run_sentinel
 has_key deploy-lag && ok "a runtime merge past the bound breached deploy-lag" \
   || bad "a 4h-old runtime merge did not breach" "$OUT"
 # The count must skip the docs merge in front of it.
-if grep -qh '^- 1 merge(s) on origin/main change what this host runs' "$OUTBOX"/*health-sentinel*.md 2>/dev/null; then
+if grep -qh '^- 1 merge(s) on origin/main change the host or its agent runner' "$OUTBOX"/*health-sentinel*.md 2>/dev/null; then
   ok "deploy-lag counts only the runtime merge"
 else
   bad "deploy-lag miscounted merges" "$(cat "$OUTBOX"/*health-sentinel*.md 2>/dev/null)"
@@ -363,6 +363,31 @@ fresh; run_sentinel STUB_SVC_START="$(date -d '3 hours ago')"
 case "$OUT" in
   *"all vitals OK"*) ok "a service restarted after its build stays quiet" ;;
   *) bad "a service restarted onto its build still breached" "$OUT" ;;
+esac
+
+# A scripts-only merge the checkout has not pulled, 5h old. It goes live with a
+# pull and needs no restart, so the 3h restart bound must not fire on it.
+build_info "$YOUNG" '2 hours ago'
+SCRIPT=$(commit_at scripts/tool.sh '5 hours ago')
+git -C "$ROOT" update-ref refs/remotes/origin/main "$SCRIPT"
+git -C "$ROOT" update-ref refs/heads/main "$YOUNG"
+fresh; run_sentinel STUB_SVC_START="$(date -d '1 hour ago')"
+case "$OUT" in
+  *"all vitals OK"*) ok "a 5h-old scripts-only merge stays inside the pull bound" ;;
+  *) bad "a scripts-only merge breached on the restart bound" "$OUT" ;;
+esac
+fresh; run_sentinel STUB_SVC_START="$(date -d '1 hour ago')" DEPLOY_LAG_PULL_MAX_S=14400
+if grep -qh '^- 1 merge(s) to scripts or skills have waited 5h' "$OUTBOX"/*health-sentinel*.md 2>/dev/null; then
+  ok "a scripts-only merge past the pull bound breached, as a pull, not a restart"
+else
+  bad "a scripts-only merge past the pull bound did not breach as a pull" "$OUT"
+fi
+# Pulled but never built: the script is live and no host code is pending.
+git -C "$ROOT" update-ref refs/heads/main "$SCRIPT"
+fresh; run_sentinel STUB_SVC_START="$(date -d '1 hour ago')" DEPLOY_LAG_PULL_MAX_S=14400
+case "$OUT" in
+  *"all vitals OK"*) ok "a pulled scripts-only merge stays quiet with no rebuild" ;;
+  *) bad "a pulled scripts-only merge still breached" "$OUT" ;;
 esac
 
 [ "$FAILED" -eq 0 ] && echo "health-sentinel-selfcheck: all checks passed" || echo "health-sentinel-selfcheck: FAILURES"
