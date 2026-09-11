@@ -8,16 +8,62 @@ name: Shadow review
 # scripts/review-outcomes.ts's file-overlap heuristic was always meant to stand in for.
 #
 # Selection is by LABEL on purpose, not a recomputed risk-list replay: this review is
-# advisory only — it files what it finds and never blocks (see the last step below) —
-# so a wrongly-removed `risk:high` label only costs a redundant review, never a risky
+# advisory only — it files what it finds and never blocks (see the "report" job below)
+# — so a wrongly-removed `risk:high` label only costs a redundant review, never a risky
 # PR shipping unwatched. That asymmetry is what makes label-based selection safe here;
 # it would NOT be safe if this workflow ever gated a merge, so it must not become one.
 #
-# Trust boundary: `pull_request_target` runs with repo secrets and a write token
-# regardless of who opened the PR, so this job must never build or execute
-# PR-supplied code. The checkout below pins `merge_commit_sha` — a commit already on
-# `main`, reachable only through a merge GitHub performed — and NEVER the PR head
-# (`github.event.pull_request.head.sha`). Do not add a step that checks that out.
+# TWO JOBS, deliberately, over one trust boundary:
+#
+#   analyze (contents: read, pull-requests: read — no write scope at all) runs the
+#   model. It never checks out the repository: the merged tree can carry a
+#   `.claude/settings.json` hook, a `.mcp.json` server the action auto-trusts
+#   (`enableAllProjectMcpServers: true`, set unconditionally — base-action's
+#   `setup-claude-code-settings.ts:62-64`), or a CLAUDE.md, all planted by the very
+#   PR being reviewed, none of which a tool-permission list like `--disallowedTools
+#   Bash` gates — hooks and MCP servers aren't tools, they run on session start.
+#   `--setting-sources user` alone doesn't close this either: the SDK docs
+#   (`@anthropic-ai/claude-agent-sdk` `sdk.d.ts`, the `settingSources` doc comment)
+#   say excluding `'project'` drops `.claude/settings.json` (hooks) and CLAUDE.md,
+#   but `.mcp.json` loading is a SEPARATE switch (`strictMcpConfig` /
+#   `--strict-mcp-config`, `sdk.d.ts` ~2127-2134) that `settingSources` does not
+#   touch. So instead of trying to lock down a checkout, there is no checkout: the
+#   model gets `gh pr diff` (works for every merge method, closed or open) and
+#   `docs/review-policy.md`'s raw content at the merge commit, written into the
+#   otherwise-empty default workspace, and nothing else.
+#
+#   Also unconditionally: `configureGitAuth`/`replaceCheckoutCredentials`
+#   (`src/github/operations/git-config.ts:129-134`) embeds the action's own
+#   write-capable token into `.git/config`'s remote URL, which the model's Read tool
+#   could read straight out of a checkout — another reason not to give it one, and
+#   why the token this job passes (`github_token: ${{ github.token }}`, this job's
+#   own `contents: read, pull-requests: read` token — no issues/pull-requests WRITE)
+#   is the least damaging one that leak could expose. `github_token` also short-
+#   circuits `setupGitHubToken()` (`src/github/token.ts:158-165`) before it reaches
+#   `getOidcToken()` (`:56-66`), so `id-token: write` is never needed.
+#
+#   report (contents: read, issues: write, pull-requests: write — no model) is the
+#   ONLY step that calls the GitHub write API. It reads `analyze`'s findings as a
+#   job output — never lets the write-scoped token anywhere near the model or a
+#   checkout — and scrubs token-shaped strings before posting, failing closed if one
+#   appears (belt-and-suspenders against `structured_output` itself having been
+#   manipulated by a prompt injection in the diff).
+#
+# Trust boundary: `pull_request_target` runs both jobs with repo secrets and a
+# write-capable default token regardless of who opened the PR. Never check out
+# `github.event.pull_request.head.sha` here — only ever `merge_commit_sha`, and (per
+# the above) `analyze` doesn't even do that.
+#
+# `analyze` uses the `prompt` input, which runs the action's "agent mode"
+# (`src/modes/agent/index.ts`); that mode calls `checkHumanActor` unconditionally
+# (`index.ts:30`, `src/github/validation/actor.ts`) and throws if `github.actor` — the
+# account that closed/merged the PR — resolves to a non-`User` account not on
+# `allowed_bots` (unset here, so no bot is allowed). Checked against this repo's last
+# several merges (`gh api repos/.../pulls/<n> --jq '.merged_by'`): every one was
+# `davekim917`, type `User`, so this passes today. If merges here start happening
+# through a bot identity, this job fails loudly (visible in the Actions tab) rather
+# than silently — the fix is `allowed_bots: <bot-login>` on the `analyze` step, not a
+# workaround here.
 
 on:
   pull_request_target:
@@ -31,22 +77,113 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  shadow-review:
+  analyze:
     if: >-
       github.event.pull_request.merged == true &&
       github.event.pull_request.base.ref == 'main' &&
       !contains(github.event.pull_request.labels.*.name, 'risk:high') &&
       !contains(github.event.pull_request.labels.*.name, 'review:requested')
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      findings: ${{ steps.review.outputs.structured_output }}
+    steps:
+      # No checkout. `gh pr diff` works for every GitHub merge method (merge, squash,
+      # rebase) and for an already-closed PR — verified against this repo's own #643,
+      # merged and closed, from a plain non-repo directory.
+      - name: Fetch the PR's diff and the review policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          set -euo pipefail
+          gh pr diff "$PR_NUMBER" --repo "$REPO" > "$RUNNER_TEMP/shadow-review.diff"
+          bytes=$(wc -c < "$RUNNER_TEMP/shadow-review.diff")
+          # Cap at 400KB (~100k tokens) so one unusually large PR can't blow the
+          # review's context or its cost; it still gets a review, just a partial one.
+          if [ "$bytes" -gt 400000 ]; then
+            head -c 400000 "$RUNNER_TEMP/shadow-review.diff" > "$RUNNER_TEMP/shadow-review.diff.trunc"
+            printf '\n... TRUNCATED at 400000 of %s bytes — review the visible portion only.\n' "$bytes" \
+              >> "$RUNNER_TEMP/shadow-review.diff.trunc"
+            mv "$RUNNER_TEMP/shadow-review.diff.trunc" "$RUNNER_TEMP/shadow-review.diff"
+          fi
+          # The policy doc as it stood at the merge commit, fetched by content API —
+          # no local checkout of the (untrusted-until-reviewed) merged tree.
+          gh api "repos/$REPO/contents/docs/review-policy.md?ref=$MERGE_SHA" \
+            -H "Accept: application/vnd.github.raw" > "$RUNNER_TEMP/review-policy.md"
+
+      # Read-only reviewer, in the runner's default (empty — nothing was checked out)
+      # workspace: no Bash/Write/Edit, and --setting-sources user drops project-level
+      # settings and CLAUDE.md even though there is nothing on disk to load anyway.
+      # --json-schema turns the review into one validated `structured_output` field
+      # this job exposes as an output — the model never touches the GitHub write API.
+      - name: Shadow review
+        id: review
+        uses: anthropics/claude-code-action@0a8d3c9443bbff909ab973b6a17a340b913f229f # v1.0.221
+        with:
+          github_token: ${{ github.token }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            You are the shadow reviewer defined in docs/specs/risk-based-review/plan.md.
+            PR #${{ github.event.pull_request.number }} merged into main WITHOUT a Codex
+            review, because it did not touch a path on the risk list
+            (.github/labeler.yml). Review it anyway, after the fact. This is advisory
+            only — you never block anything, you only report what you find.
+
+            1. Read your review policy at ${{ runner.temp }}/review-policy.md (this
+               repo's docs/review-policy.md as it stood at the merge commit) for the
+               severity contract: what counts as a real finding, what its
+               "Blocks — destructive" bar names, and what "Do not report" excludes.
+            2. Read the PR's diff at ${{ runner.temp }}/shadow-review.diff.
+            3. Classify each real finding:
+               - **P1** — it matches the "Blocks — destructive" bar (data
+                 loss/corruption; money computed, moved or reported wrong; tenant or
+                 scope isolation breached; auth or permission bypassed; credentials
+                 exposed; a migration with no undo) OR is a fail-open in a security or
+                 safety control.
+               - **P2** — any other real, notable bug.
+               Do NOT report anything the policy's "Do not report" section excludes
+               (generated files, style a formatter already enforces, pre-existing
+               defects outside this diff, anything a deterministic gate already
+               covers).
+            4. If nothing is worth reporting, return an empty findings array — do not
+               manufacture a finding to have something to say.
+
+            Cite file:line for every finding, and name the class it belongs to. Be
+            precise and conservative: this feeds a program that moves a PR's paths onto
+            the mandatory-review list on a real P1, so a false P1 has a real cost.
+
+            You have no access to this repository's actual files (no checkout was
+            performed for this review, by design) — work only from the diff and policy
+            text above.
+          claude_args: |
+            --model claude-opus-5
+            --setting-sources user
+            --allowedTools "Read,Grep,Glob"
+            --disallowedTools "Bash,Write,Edit,WebSearch,WebFetch"
+            --json-schema '{"type":"object","properties":{"findings":{"type":"array","items":{"type":"object","properties":{"severity":{"type":"string","enum":["P1","P2"]},"file":{"type":"string"},"line":{"type":["integer","null"]},"class":{"type":"string"},"description":{"type":"string"}},"required":["severity","file","description"]}}},"required":["findings"]}'
+
+  report:
+    needs: analyze
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.base.ref == 'main' &&
+      !contains(github.event.pull_request.labels.*.name, 'risk:high') &&
+      !contains(github.event.pull_request.labels.*.name, 'review:requested')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
       issues: write
       pull-requests: write
     steps:
       # Idempotent: creates the label on first run, no-ops (via --force, which updates
-      # rather than errors) on every run after. Loud on failure — if this repo's token
-      # can't manage labels, later steps that need the label would fail anyway.
+      # rather than errors) on every run after.
       - name: Ensure the shadow-review label exists
         env:
           GH_TOKEN: ${{ github.token }}
@@ -58,99 +195,40 @@ jobs:
             --description "Findings from a post-merge advisory review of a PR that merged without review (docs/specs/risk-based-review/plan.md)" \
             --force
 
-      # merge_commit_sha, never head.sha — see the trust-boundary note above. This ref
-      # is already reachable from main, so nothing here executes PR-authored code that
-      # wasn't already merged.
-      - name: Checkout the merge commit
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
-          fetch-depth: 2
-          persist-credentials: false
-
-      # HEAD~1 is the merge commit's first parent, i.e. main's tip immediately before
-      # this merge — true for a real merge commit (first-parent chain), a squash merge,
-      # and a rebase merge alike, so one diff computation covers all three merge
-      # methods GitHub offers.
-      - name: Compute the PR's diff
-        run: |
-          set -euo pipefail
-          git diff HEAD~1 HEAD -- . > "$RUNNER_TEMP/shadow-review.diff"
-          bytes=$(wc -c < "$RUNNER_TEMP/shadow-review.diff")
-          # Cap at 400KB (~100k tokens) so one unusually large PR can't blow the
-          # review's context or its cost; it still gets a review, just a partial one.
-          if [ "$bytes" -gt 400000 ]; then
-            head -c 400000 "$RUNNER_TEMP/shadow-review.diff" > "$RUNNER_TEMP/shadow-review.diff.head"
-            mv "$RUNNER_TEMP/shadow-review.diff.head" "$RUNNER_TEMP/shadow-review.diff.trunc"
-            printf '\n... TRUNCATED at 400000 of %s bytes — review the visible portion only.\n' "$bytes" \
-              >> "$RUNNER_TEMP/shadow-review.diff.trunc"
-            mv "$RUNNER_TEMP/shadow-review.diff.trunc" "$RUNNER_TEMP/shadow-review.diff"
-          fi
-
-      # Read-only reviewer: no Bash/Write/Edit, so the worst a misleading diff or PR
-      # metadata can do is produce a wrong REPORT, never touch the runner or the repo.
-      # --json-schema turns the review into one validated `structured_output` field the
-      # next (deterministic, non-Claude) step reads — Claude never calls the GitHub API
-      # itself, so there is exactly one place that writes an issue or a comment.
-      - name: Shadow review
-        id: review
-        uses: anthropics/claude-code-action@0a8d3c9443bbff909ab973b6a17a340b913f229f # v1.0.221
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          prompt: |
-            You are the shadow reviewer defined in docs/specs/risk-based-review/plan.md.
-            PR #${{ github.event.pull_request.number }} merged into main WITHOUT a Codex
-            review, because it did not touch a path on the risk list
-            (.github/labeler.yml). Review it anyway, after the fact. This is advisory
-            only — you never block anything, you only report what you find.
-
-            1. Read docs/review-policy.md in this checkout (already at the merge commit)
-               for the severity contract: what counts as a real finding, what its
-               "Blocks — destructive" bar names, and what "Do not report" excludes.
-            2. Read the PR's diff at ${{ runner.temp }}/shadow-review.diff.
-            3. Classify each real finding:
-               - **P1** — it matches docs/review-policy.md's "Blocks — destructive" bar
-                 (data loss/corruption; money computed, moved or reported wrong; tenant
-                 or scope isolation breached; auth or permission bypassed; credentials
-                 exposed; a migration with no undo) OR is a fail-open in a security or
-                 safety control.
-               - **P2** — any other real, notable bug.
-               Do NOT report anything docs/review-policy.md's "Do not report" section
-               excludes (generated files, style a formatter already enforces,
-               pre-existing defects outside this diff, anything a deterministic gate
-               already covers).
-            4. If nothing is worth reporting, return an empty findings array — do not
-               manufacture a finding to have something to say.
-
-            Cite file:line for every finding, and name the class it belongs to. Be
-            precise and conservative: this feeds a program that moves a PR's paths onto
-            the mandatory-review list on a real P1, so a false P1 has a real cost.
-          claude_args: |
-            --model claude-opus-5
-            --allowedTools "Read,Grep,Glob"
-            --disallowedTools "Bash,Write,Edit,WebSearch,WebFetch"
-            --json-schema '{"type":"object","properties":{"findings":{"type":"array","items":{"type":"object","properties":{"severity":{"type":"string","enum":["P1","P2"]},"file":{"type":"string"},"line":{"type":["integer","null"]},"class":{"type":"string"},"description":{"type":"string"}},"required":["severity","file","description"]}}},"required":["findings"]}'
-
-      # The only step that writes to GitHub. `scripts/review-outcomes.ts` reads these
-      # issues back (buildShadowReviewIndex) to count skipped PRs that were reviewed and
-      # the P1s among them — it matches on the exact title shape and the "**P1**" /
-      # "**P2**" severity markers below, so don't change either without updating that
-      # script's SHADOW_REVIEW_TITLE_RE / P1_RE.
+      # The only step in this workflow that writes to GitHub — see the trust-boundary
+      # comment at the top of this file for why the model never reaches this token.
+      # `scripts/review-outcomes.ts` reads what this step writes back
+      # (buildShadowReviewIndex) to count skipped PRs that were reviewed and the P1s
+      # among them — it matches this exact title shape and the "- **P1**" / "- **P2**"
+      # bullet format below, so don't change either without updating that script's
+      # SHADOW_REVIEW_TITLE_RE / P1_LINE_RE.
       - name: File findings, or confirm none were found
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
-          STRUCTURED_OUTPUT: ${{ steps.review.outputs.structured_output }}
+          STRUCTURED_OUTPUT: ${{ needs.analyze.outputs.findings }}
         run: |
           set -euo pipefail
+
+          # Fail closed on anything token-shaped anywhere in the model's output —
+          # defense in depth against a prompt injection in the diff that tries to
+          # exfiltrate a credential (e.g. one it read out of a leaked .git/config in
+          # some other context) through a finding's free-text fields.
+          TOKEN_RE='gh[pousr]_[A-Za-z0-9]+|github_pat_[A-Za-z0-9]+|sk-ant-[A-Za-z0-9-]+'
+          if grep -qE "$TOKEN_RE" <<<"$STRUCTURED_OUTPUT"; then
+            echo "::error::shadow review findings contain a token-shaped string; refusing to post" >&2
+            exit 1
+          fi
+
           findings_count=$(jq '.findings | length' <<<"$STRUCTURED_OUTPUT")
           if [ "$findings_count" -eq 0 ]; then
             gh pr comment "$PR_NUMBER" --repo "$REPO" \
               --body "Shadow review (post-merge, advisory — docs/specs/risk-based-review/plan.md): no findings."
             exit 0
           fi
+
           body=$(jq -r '
             "Post-merge advisory review of a PR that merged without review (docs/specs/risk-based-review/plan.md). This never blocked the merge — it is filed after the fact.\n\n"
             + ([.findings[]
@@ -158,7 +236,15 @@ jobs:
                   + " — " + (.class // "finding") + ": " + .description
                ] | join("\n"))
           ' <<<"$STRUCTURED_OUTPUT")
+
+          # GitHub issue titles are capped at 256 characters; a long PR title plus the
+          # "shadow review: #<n> " prefix can exceed it.
+          full_title="shadow review: #$PR_NUMBER $PR_TITLE"
+          if [ "${#full_title}" -gt 256 ]; then
+            full_title="${full_title:0:253}..."
+          fi
+
           gh issue create --repo "$REPO" \
-            --title "shadow review: #$PR_NUMBER $PR_TITLE" \
+            --title "$full_title" \
             --label shadow-review \
             --body "$body"

@@ -51,8 +51,12 @@
  * PR gets a PR comment instead, no issue. So "was this skipped PR shadow-reviewed, and
  * did the review find a P1" is answerable from the issue list alone: match each issue's
  * title against `SHADOW_REVIEW_TITLE_RE` to recover the PR number, and its body against
- * `P1_RE` for whether any finding was severity P1 (the workflow's prompt has Claude label
- * every finding P1 or P2 inline, e.g. "- **P1** — file:line — ..."). This undercounts by
+ * `P1_LINE_RE` for a finding line marked P1 (the workflow's report step renders every
+ * finding as its own bullet, e.g. "- **P1** — file:line — class: description" —
+ * `.github/workflows/shadow-review.yml`'s "File findings" step). The match is anchored to
+ * that bullet's start (`^- \*\*P1\*\*`, multiline), not a bare `\bP1\b`, so a P2 finding
+ * whose free-text description merely *mentions* "P1" (e.g. referencing another PR's
+ * finding) doesn't get counted as one. This undercounts by
  * design: a low-risk PR with no shadow-review issue was either clean (a PR comment, not
  * an issue) or the workflow hasn't run yet — both read as "not shadow-reviewed", which is
  * the conservative direction for a metric whose job is to justify tightening the risk
@@ -275,10 +279,12 @@ export function findRevert(candidate: PullRequestData, laterPRs: PullRequestData
 // the other title/body regexes above.
 const SHADOW_REVIEW_TITLE_RE = /^shadow review:\s*#(\d+)\b/i;
 
-// The workflow's prompt has Claude mark every finding's severity inline as "P1" or
-// "P2" (see shadow-review.yml's prompt). Word-bounded so "P10" or "GP1" don't match;
-// case-insensitive so a casing drift in the model's output doesn't silently undercount.
-const P1_RE = /\bP1\b/i;
+// The workflow's "File findings" step (shadow-review.yml) renders every finding as its
+// own bullet starting "- **P1** — " or "- **P2** — ". Anchored to that bullet start
+// (multiline `^`), not a bare `\bP1\b`, so a P2 finding whose free-text description
+// happens to mention "P1" — e.g. "similar to the P1 in #642" — isn't counted as one.
+// Case-insensitive so a casing drift in the rendering doesn't silently undercount.
+const P1_LINE_RE = /^- \*\*P1\*\*/im;
 
 /** The PR number a shadow-review issue's title names, or null if the title doesn't match. */
 export function extractShadowReviewPrNumber(title: string): number | null {
@@ -288,7 +294,7 @@ export function extractShadowReviewPrNumber(title: string): number | null {
 
 /** Whether a shadow-review issue body names at least one P1 (destructive/fail-open) finding. */
 export function issueHasP1(body: string): boolean {
-  return P1_RE.test(body);
+  return P1_LINE_RE.test(body);
 }
 
 /**

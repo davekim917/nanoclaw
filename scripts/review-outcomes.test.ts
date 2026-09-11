@@ -270,17 +270,29 @@ describe('issueHasP1', () => {
     expect(issueHasP1('- **P1** — src/guard/x.ts:12 — auth bypass')).toBe(true);
   });
 
+  it('matches a P1 line that is not the first line of the body', () => {
+    const body = 'Post-merge advisory review.\n\n- **P2** — a.ts:1 — cosmetic\n- **P1** — b.ts:2 — auth bypass';
+    expect(issueHasP1(body)).toBe(true);
+  });
+
   it('is case-insensitive', () => {
-    expect(issueHasP1('- p1 — src/x.ts:1 — foo')).toBe(true);
+    expect(issueHasP1('- **p1** — src/x.ts:1 — foo')).toBe(true);
   });
 
   it('is false when only P2 findings are present', () => {
     expect(issueHasP1('- **P2** — src/x.ts:1 — cosmetic')).toBe(false);
   });
 
-  it('does not match "P10" or "GP1" (word-bounded)', () => {
-    expect(issueHasP1('see P10 for details')).toBe(false);
-    expect(issueHasP1('GP1 unrelated token')).toBe(false);
+  // The regex is anchored to the bullet's start ("- **P1**"), not a bare "P1" anywhere
+  // in the text, precisely so a P2 finding that merely mentions "P1" in its free-text
+  // description isn't miscounted as a P1.
+  it('does not count a P2 finding whose description mentions "P1"', () => {
+    const body = '- **P2** — src/x.ts:1 — cosmetic, similar to the P1 finding fixed in #642';
+    expect(issueHasP1(body)).toBe(false);
+  });
+
+  it('does not match a look-alike severity like "P10"', () => {
+    expect(issueHasP1('- **P10** — src/x.ts:1 — not a real severity')).toBe(false);
   });
 
   it('is false on an empty body', () => {

@@ -88,6 +88,17 @@ risk:high:
     - '.public-boundary-allowlist.json'
     - 'container/skills/pr-review-loop/**'
     - 'docs/review-policy.md'
+    # Executable agent and tool config: a hook (.claude/settings.json), an
+    # auto-trusted MCP server (.mcp.json — any agent/CI tooling that honors
+    # enableAllProjectMcpServers connects to it with no prompt), Claude Code's own
+    # project trust/onboarding state (.claude.json), or a submodule URL (.gitmodules,
+    # which a clone/checkout can fetch from). All four merge unreviewed today and run
+    # the moment something checks the tree out — including .github/workflows/shadow-
+    # review.yml's own reviewer, which is why it never checks the tree out at all.
+    - '.claude/**'
+    - '.mcp.json'
+    - '.claude.json'
+    - '.gitmodules'
     # The agent-runner boot snapshot mounted read-only into every group, and its MCP
     # tool surface
     - 'src/agent-runner-source.ts'
@@ -179,6 +190,10 @@ risk:gates:
     - '.public-boundary-allowlist.json'
     - 'container/skills/pr-review-loop/**'
     - 'docs/review-policy.md'
+    - '.claude/**'
+    - '.mcp.json'
+    - '.claude.json'
+    - '.gitmodules'
 
 risk:runner:
 - changed-files:
