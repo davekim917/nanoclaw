@@ -228,3 +228,10 @@ Known risks carried to ship: stale fingerprint until host restart; chmod residua
   - Across all 37 topic installs: 24 x64, 10 arm64 (all installed 09-06..09-08), 2 mixed, 1 with no native packages. Two of the 5 predicted adopts were arm64 trees. What produced the arm64 installs is not identified.
 - **Impact:** none in `report`. In `apply`, rules 1–3 would seal arm64 entries under x64 keys. Convert still fails closed on content equality, and `linkPackageDir` has no production caller in Phase 1. So the harm is x64 trees never deduplicating, plus a wrong-platform entry waiting for Phase 2's link.
 - **Correction (rev 2.4):** plan §5.7.3 rule 4, where installed packages must accept the platform's `os`/`cpu`, matched as npm-install-checks 7.1.2 `checkList` does (`/usr/lib/node_modules/npm/node_modules/npm-install-checks/lib/index.js:59-83`). `apply` waits for this fix.
+- Build, test-first. Before the fix the new tests failed as expected: the arm64 tree was `adopted`, and foreign `cpu`/`os` entries were accepted. They pass on `b3981864e`.
+  - Storage suites plus the standing tripwire set: **17 files, 419/419**.
+  - `tsc` exit 0; eslint 0 errors (25 pre-existing warnings); ratchet `UNCHANGED 959 (Δ 0)`.
+  - prettier: code files clean. Both spec docs already fail prettier on main (pre-existing, left alone).
+- Rule 4 over the 38 current topic installs (read-only): it accepts the 25 x64 trees and the one with no native packages, and refuses exactly the 10 arm64 and 2 mixed trees.
+- Other-family review (Codex CLI): **clear**. One NIT, which needs no change: `platformListAccepts` skips non-string list entries, where npm's `checkList` would throw. That is reachable only with malformed lockfile data npm itself cannot produce.
+- PR **#632**.
