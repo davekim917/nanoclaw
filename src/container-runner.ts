@@ -134,6 +134,7 @@ import {
   resolveWorkgroupReadAccess,
   workgroupReadAccessInstructions,
 } from './workgroup-read-access.js';
+import { resolveWorkgroupWiki, workgroupWikiInstructions } from './workgroup-wiki.js';
 import YAML from 'yaml';
 
 import { extractToolScopes, filterConfigSections, isToolEnabled } from './scoped-env.js';
@@ -4364,6 +4365,8 @@ export async function buildMounts(
       )
     : [];
   logSpawnStage('workgroup-read-access', workgroupReadAccessStartedAt);
+  // Resolved once, against this session's /workspace, so the composed doc and the mount set agree.
+  const workgroupWiki = resolveWorkgroupWiki(wgKey, sessionDir(agentGroup.id, session.id));
 
   // Default agent surfaces (composed project doc, skill links, provider state
   // dir) apply unless the provider's registration declares it provides its
@@ -4403,6 +4406,7 @@ export async function buildMounts(
         workgroupReadAccess,
         validatedWorkgroupReadAccess,
       ),
+      workgroupWikiInstructions: workgroupWikiInstructions(workgroupWiki),
     });
     logSpawnStage('claude-md-compose', claudeMdStartedAt);
   }
@@ -4803,6 +4807,8 @@ export async function buildMounts(
   await ensureArchiveProjection(archiveSrc, archiveDst, agentGroup.id, workgroupMemberIds);
   logSpawnStage('archive-projection', archiveProjectionStartedAt);
   mounts.push({ hostPath: archiveDst, containerPath: '/workspace/archive.db', readonly: true });
+  // The workgroup's domain wiki, read-only, when the host keeps one (src/workgroup-wiki.ts).
+  if (workgroupWiki) mounts.push(workgroupWiki.mount);
 
   const centralSrc = path.join(DATA_DIR, 'v2.db');
   const centralDst = path.join(sessionDir(agentGroup.id, session.id), 'central.db');

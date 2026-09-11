@@ -69,6 +69,25 @@ provider sibling receives the same access at its next spawn. See
 [Cross-workgroup read access](workgroup-read-access.md) for the policy schema,
 mounted paths, activation, and rollback.
 
+## Workgroup wiki
+
+A workgroup can keep a domain wiki for its agents to read. When the host has a
+checkout at `data/wikis/<workgroup-id>/`, every agent sibling in that
+workgroup, whatever its provider, gets it mounted read-only at
+`/workspace/wiki` at its next spawn. The composed `CLAUDE.md` / `AGENTS.md`
+gains a short section: before asking a human a domain or product question,
+read `index.md` and grep the pages; name the page relied on; flag a gap when
+asking. See `src/workgroup-wiki.ts`.
+
+No directory means no mount and no section. Trunk never creates, clones, or
+refreshes the checkout; keeping it current (an hourly `git pull`, say) is
+install config. A symlink or a non-directory at that path is refused, not
+followed.
+
+Every sibling can read the whole checkout, `.git/config` included, so keep
+credentials out of it: no token in the remote URL and no `http.extraheader`.
+Authenticate the refresh through the host's git credential helper.
+
 ---
 
 ## Declaration model

@@ -57,6 +57,8 @@ export interface ComposeGroupClaudeMdOptions {
   workgroupId?: string;
   /** Host-generated from the same policy and mounts as this spawn. */
   workgroupReadAccessInstructions?: string | null;
+  /** Host-generated from the same wiki mount as this spawn (src/workgroup-wiki.ts). */
+  workgroupWikiInstructions?: string | null;
 }
 
 /**
@@ -126,6 +128,10 @@ export async function composeGroupClaudeMd(
     if (!options.workgroupId)
       throw new Error('workgroup read-access instructions require a spawn-resolved workgroup ID');
     desired.set('host-workgroup-read-access.md', options.workgroupReadAccessInstructions);
+  }
+  if (options.workgroupWikiInstructions) {
+    if (!options.workgroupId) throw new Error('workgroup wiki instructions require a spawn-resolved workgroup ID');
+    desired.set('host-workgroup-wiki.md', options.workgroupWikiInstructions);
   }
 
   // Built-in module fragments — every MCP/CLI module that ships a
