@@ -232,6 +232,69 @@ describe('a timer that fails to start still aborts boot, and a failing interval 
 
     expect(unhandled).toEqual([]);
   });
+
+  it('T-2c: a tick that fires while the previous scan is still in flight is skipped, and the next tick after it settles runs a new scan (#648 follow-up)', async () => {
+    vi.resetModules();
+    vi.useFakeTimers();
+
+    let callCount = 0;
+    // The first call returns a promise that only resolves once
+    // resolveFirstScan() is invoked below, so runCommitScanOnce()'s first
+    // await (`const groups = await getAllAgentGroups();`) hangs exactly as a
+    // real scan would while working through 72 repos' worth of git calls.
+    // Every later call resolves immediately with no groups. Held on an
+    // object rather than a bare `let`: TS's control-flow narrowing for a
+    // `let`-declared function-or-null variable reassigned inside a Promise
+    // executor collapses the later optional-call site to `never` (reproduced
+    // in isolation while writing this test) — a property write sidesteps it.
+    const state: { resolveFirstScan: (() => void) | null } = { resolveFirstScan: null };
+    vi.doMock('./db/agent-groups.js', () => ({
+      getAllAgentGroups: () => {
+        callCount += 1;
+        if (callCount === 1) {
+          return new Promise<never[]>((resolve) => {
+            state.resolveFirstScan = () => resolve([]);
+          });
+        }
+        return [];
+      },
+    }));
+    const logMock = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    vi.doMock('./log.js', () => ({ log: logMock }));
+    // Tripwire (see childProcessTripwireFactory), same regression insurance
+    // as T-2b: getAllAgentGroups() never resolving to a non-empty group list
+    // here means commit-scan's git-calling path never runs either.
+    const spawnAttempts: string[] = [];
+    vi.doMock('child_process', () => childProcessTripwireFactory(spawnAttempts));
+    vi.doMock('node:child_process', () => childProcessTripwireFactory(spawnAttempts));
+
+    const commitScan = await import('./commit-scan.js');
+    commitScan.startCommitScan();
+
+    // STARTUP_DELAY_MS (90s): fires the first tick, which starts a scan that
+    // hangs at its first await until resolveFirstScan() runs, below.
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(callCount).toBe(1);
+    expect(state.resolveFirstScan).not.toBeNull();
+
+    // SCAN_INTERVAL_MS (10min): the next tick fires while the first scan is
+    // still in flight. It must be skipped — no second scan started — not run
+    // concurrently with the first.
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+    expect(callCount).toBe(1);
+    expect(logMock.debug).toHaveBeenCalledWith('Commit scan tick skipped — previous scan still in flight');
+
+    // Let the first scan settle.
+    state.resolveFirstScan?.();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // The next tick after it settles starts a new scan.
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+    expect(callCount).toBe(2);
+
+    commitScan.stopCommitScan();
+    expect(spawnAttempts).toEqual([]);
+  });
 });
 
 describe("module intervals are unref'd and cleared on shutdown", () => {

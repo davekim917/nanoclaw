@@ -41,11 +41,33 @@ const FIRST_SCAN_COMMIT_CAP = 100;
 const DESCRIPTION_COMMIT_CAP = 20;
 
 let timer: NodeJS.Timeout | null = null;
+// Guards against overlapping scans now that git calls are async (#648
+// follow-up): the old execFileSync-based scan could never overlap its own
+// re-armed timer, because every await inside it settled as a same-tick
+// microtask before the event loop could reach a timer callback. Now each git
+// call actually yields, so a scan slower than SCAN_INTERVAL_MS (e.g. every
+// repo's `git fetch` timing out at 30s with the network down — 72 repos ×
+// 30s ≈ 36min) would otherwise let two scans run at once: both read
+// commit_digest_state.last_commit_sha before either updates it, so the same
+// commits get recorded twice, and concurrent fetches in one repo contend on
+// git's own lock.
+let scanInFlight = false;
 
 export function startCommitScan(): void {
   if (timer) return;
   timer = setTimeout(function tick() {
-    runCommitScanOnce().catch((error) => log.error('Commit scan failed', { error: errorMessage(error) }));
+    if (scanInFlight) {
+      log.debug('Commit scan tick skipped — previous scan still in flight');
+    } else {
+      scanInFlight = true;
+      runCommitScanOnce()
+        .catch((error) => log.error('Commit scan failed', { error: errorMessage(error) }))
+        .finally(() => {
+          scanInFlight = false;
+        });
+    }
+    // Re-armed unconditionally, same as before: a skipped or failed tick must
+    // not stop future ticks from firing.
     timer = setTimeout(tick, SCAN_INTERVAL_MS);
     timer.unref?.();
   }, STARTUP_DELAY_MS);
