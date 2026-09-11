@@ -120,6 +120,16 @@ if [ -n "$rest" ]; then
       printf ']'
       exit 0
       ;;
+    */issues/*/events\\?*)
+      # events.json holds every page, as --paginate --slurp prints them. Absent = the read fails.
+      if [ ! -f "$MOCK_DIR/events.json" ]; then
+        echo '{"message":"Server Error","status":"500"}'
+        echo 'gh: Server Error (HTTP 500)' >&2
+        exit 1
+      fi
+      if printf '%s\\n' "$@" | grep -qx -- --slurp; then cat "$MOCK_DIR/events.json"; else jq -c '.[0]' "$MOCK_DIR/events.json"; fi
+      exit 0
+      ;;
   esac
   echo "unexpected REST path $rest" >&2
   exit 64
@@ -205,13 +215,26 @@ function run(root: string, command: string, minutes?: string, sha = HEAD) {
 const OLD_HEAD = 'cccccccccccccccccccccccccccccccccccccccc';
 const OTHER_HEAD = 'dddddddddddddddddddddddddddddddddddddddd';
 const RISK_CONFIG = "risk:high:\n- changed-files:\n  - any-glob-to-any-file:\n    - 'src/router.ts'\n";
+const LABELER = 'github-actions[bot]';
 
 function writeJson(root: string, name: string, value: unknown): void {
   fs.writeFileSync(path.join(root, name), JSON.stringify(value));
 }
 
-function prState(labels: string[], head = HEAD): Page {
-  return { headRefOid: head, baseRefName: 'main', headRefName: 'feat', labels: labels.map((name) => ({ name })) };
+function prState(labels: string[], head = HEAD, title = 'feat: route a new message kind', body = ''): Page {
+  return {
+    headRefOid: head,
+    baseRefName: 'main',
+    headRefName: 'feat',
+    title,
+    body,
+    labels: labels.map((name) => ({ name })),
+  };
+}
+
+// A label put on or taken off the PR, as `issues/<n>/events` lists it.
+function labelEvent(event: 'labeled' | 'unlabeled', label: string, login: string): Page {
+  return { event, label: { name: label }, actor: { login }, created_at: '2026-09-05T00:00:40Z' };
 }
 
 function labelRun(status: string, conclusion: string | null, head = HEAD, name = 'Risk label'): Page {
@@ -295,9 +318,12 @@ function scopeFixture(
     reviews?: Page[];
     reactions?: Page[];
     threads?: Page[];
+    events?: Page[][] | null;
+    title?: string;
+    body?: string;
   } = {},
 ): void {
-  writeJson(root, 'pr.json', prState(opts.labels ?? []));
+  writeJson(root, 'pr.json', prState(opts.labels ?? [], HEAD, opts.title, opts.body));
   if (opts.baseConfig !== null) fs.writeFileSync(path.join(root, 'labeler--main.yml'), opts.baseConfig ?? RISK_CONFIG);
   // One Actions listing serves both readers, as the API does: the Risk label
   // runs `scope` waits on, and the CI runs `merge-check` requires green.
@@ -311,6 +337,9 @@ function scopeFixture(
   writePage(root, 'reviews', 1, connectionPage('reviews', opts.reviews ?? []));
   writePage(root, 'reactions', 1, connectionPage('reactions', opts.reactions ?? []));
   writePage(root, 'reviewThreads', 1, threadsPage(opts.threads ?? []));
+  // The PR's issue events, one array per page. null = the read fails.
+  if (opts.events === null) fs.rmSync(path.join(root, 'events.json'), { force: true });
+  else writeJson(root, 'events.json', opts.events ?? [[]]);
 }
 
 // Runs the helper with any arguments. Each run starts a fresh call log, clock,
@@ -734,6 +763,63 @@ describe('codex-review risk-scoped review requests', () => {
     expect(out.reason).toContain(`the head moved from ${HEAD}`);
   });
 
+  it.each(['risk:high', 'review:requested'])(
+    'fails closed to review when %s was taken off by hand, reading every page of the label events',
+    (label) => {
+      const root = tempRoot();
+      scopeFixture(root, {
+        labels: [],
+        events: [[labelEvent('labeled', 'risk:high', LABELER)], [labelEvent('unlabeled', label, 'some-agent')]],
+      });
+
+      const scope = runHelper(root, ['scope']);
+      expect(scope.status).toBe(0);
+      const out = JSON.parse(scope.stdout) as { verdict: string; reason: string };
+      expect(out.verdict).toBe('review');
+      expect(out.reason).toContain(`${label} removed by some-agent`);
+      expect(scope.calls).toContain('rest repos/example/repository/issues/1/events?per_page=100\n');
+
+      const merge = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(merge.status).toBe(24);
+      expect(merge.stderr).toContain(`${label} removed by some-agent`);
+    },
+  );
+
+  it('still skips when only the labeler took risk:high off, whoever removed an unrelated label', () => {
+    const root = tempRoot();
+    scopeFixture(root, {
+      labels: [],
+      events: [
+        [
+          labelEvent('labeled', 'risk:high', LABELER),
+          labelEvent('unlabeled', 'risk:high', LABELER),
+          labelEvent('unlabeled', 'PR: Fix', 'some-agent'),
+        ],
+      ],
+    });
+
+    const scope = runHelper(root, ['scope']);
+    expect(JSON.parse(scope.stdout)).toMatchObject({ verdict: 'skip' });
+
+    const merge = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(merge.status).toBe(0);
+    expect(merge.stdout).toContain(`merge=allowed head=${HEAD} mode=risk-scoped verdict=skip ci=green`);
+  });
+
+  it('fails closed to review when the label events cannot be read', () => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: [], events: null });
+
+    const scope = runHelper(root, ['scope']);
+    expect(scope.status).toBe(0);
+    const out = JSON.parse(scope.stdout) as { verdict: string; reason: string };
+    expect(out.verdict).toBe('review');
+    expect(out.reason).toContain("could not read this PR's label events");
+
+    const merge = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(merge.status).toBe(24);
+  });
+
   it('posts one marked request for the current head when every rule holds', () => {
     const root = tempRoot();
     scopeFixture(root, { labels: ['risk:high'], comments: [marker(OLD_HEAD, 1)] });
@@ -853,6 +939,37 @@ describe('codex-review risk-scoped review requests', () => {
     const unrequested = runHelper(root, ['merge-check', '--head', HEAD]);
     expect(unrequested.status).toBe(24);
     expect(unrequested.stderr).toContain('no review of this head was requested');
+  });
+
+  it.each([
+    ['fix: close the gate', ''],
+    ['fix(runner): keep the stream open', 'Follows up on #608.'],
+    ['Fix(hooks)!: refuse rewritten remotes', 'Fixes-PR: 611'],
+    ['FIX: a typo', 'See Fixes-PR: #12 above.'],
+    ['fix: split value', 'Fixes-PR:\n#12'],
+    ['fix: glued value', 'Fixes-PR: #12abc'],
+  ])('refuses the fix PR %j with body %j, which names no Fixes-PR', (title, body) => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: [], title, body });
+
+    const result = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain("a fix PR needs a 'Fixes-PR: #<n>' line in its body");
+  });
+
+  it.each([
+    ['fix: close the gate', 'Summary.\n\nFixes-PR: #608'],
+    ['fix(runner): a new bug', 'fixes-pr: none'],
+    ['fix: windows line endings', 'Summary.\r\n\r\nFixes-PR:#12\r\nMore.'],
+    ['feat: add a gate', ''],
+    ['docs: fix a typo', ''],
+  ])('allows %j with body %j', (title, body) => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: [], title, body });
+
+    const result = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`merge=allowed head=${HEAD} mode=risk-scoped verdict=skip ci=green`);
   });
 
   it.each([
@@ -1120,6 +1237,7 @@ describe('codex-review risk-scoped review requests', () => {
     scopeFixture(root, {
       baseConfig: null,
       labels: ['risk:high'],
+      title: 'fix: a fix with no Fixes-PR line',
       comments: [receiptComment(HEAD, 'changes', '2026-09-05T00:20:00Z')],
       ci: [workflowRun('CI', 'completed', 'failure')],
       statuses: [commitStatus('ci/external', 'pending')],
@@ -1130,6 +1248,7 @@ describe('codex-review risk-scoped review requests', () => {
     expect(result.stdout).toContain('merge=defer mode=legacy');
     expect(result.calls).not.toContain('actions/runs');
     expect(result.calls).not.toContain('statuses');
+    expect(result.calls).not.toContain('/events');
     expect(result.calls).not.toMatch(/^comments /m);
   });
 });
