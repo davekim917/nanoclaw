@@ -107,7 +107,11 @@ every path plugin content takes:
 - the Codex and OpenCode subagent mirrors and the OpenCode skill mirror, which
   never copy a scoped plugin's agents or skills, because their targets aren't
   keyed by workgroup. A copy made before scoping is pruned the next time that
-  mirror runs: hourly for subagents, at the next enable run for skills;
+  mirror runs. The subagent mirrors run when a plugin pull brings changes, when
+  the codex-sync watcher sees a watched file change, and when it restarts. The
+  skill mirror runs at the next enable. To prune at once, run
+  `pnpm exec tsx scripts/sync-codex-subagents.ts` and
+  `pnpm exec tsx scripts/sync-opencode-subagents.ts`;
 - the capabilities snapshot, which names a scoped plugin only inside its
   workgroups.
 
@@ -119,6 +123,11 @@ wait and the sweep retries), the same rule as
 directory enforces nothing, and the host logs a warning once per process. The
 policy sits outside the plugin clone, so re-cloning a plugin can't drop its
 scope. See `src/plugin-scopes.ts`.
+
+The codex-sync watcher (`nanoclaw-codex-sync`) runs as its own long-lived
+process. After deploying a change to these paths, restart it with
+`sudo systemctl restart nanoclaw-codex-sync`, or it keeps mirroring with the
+code it started with.
 
 ---
 

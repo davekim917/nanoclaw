@@ -201,17 +201,15 @@ const SCOPED_ENV_NAMES = [
 ];
 
 /**
- * Host plugins as one agent group may see them: inside a container the
- * snapshot must not name another workgroup's scoped plugin (src/plugin-scopes.ts).
- * The host-wide view (no group) lists everything. A spawn reconciles the group's
- * workgroup (src/container-runner.ts:1681) before it writes the snapshot (:1863),
- * so workgroup_id here is the key the plugin mount uses.
+ * Host plugins as one agent group may see them. Inside a container the
+ * snapshot must not name another workgroup's scoped plugin
+ * (src/plugin-scopes.ts), so a group snapshot filters by `workgroupId`, the
+ * spawn-resolved workgroup the plugin mount also keys on. Without one, every
+ * scoped plugin is withheld. The host-wide view (no group) lists everything.
  */
-async function installedPluginsFor(agentGroupId: string | undefined): Promise<string[]> {
+function installedPluginsFor(agentGroupId: string | undefined, workgroupId: string | undefined): string[] {
   const installed = listHostPlugins();
   if (!agentGroupId) return installed;
-  const group = await getAgentGroup(agentGroupId);
-  const workgroupId = group?.workgroup_id ?? group?.folder;
   const scopes = loadPluginScopes();
   return installed.filter((plugin) => pluginAllowedForWorkgroup(plugin, workgroupId, scopes));
 }
@@ -911,6 +909,8 @@ export function buildSessionServicesSnapshotFrom(
 export async function getHostCapabilities(
   forAgentGroupId?: string,
   sessionMessagingGroupId?: string | null,
+  /** The spawn-resolved workgroup; filters `plugins.installed` for a group snapshot. */
+  workgroupId?: string,
 ): Promise<HostCapabilities> {
   const registered = getRegisteredChannelNames();
 
@@ -957,7 +957,7 @@ export async function getHostCapabilities(
     },
     plugins: {
       builtin: [],
-      installed: await installedPluginsFor(forAgentGroupId),
+      installed: installedPluginsFor(forAgentGroupId, workgroupId),
     },
     agentGroups,
     messagingGroupsByChannel: byChannel,

@@ -1860,7 +1860,7 @@ async function spawnContainer(
   // (which has none by construction) this resolves the series' delivery
   // destination so the gate judges WHERE THE TASK POSTS instead of
   // fail-closing on null. See resolveSlackSafetyMessagingGroupId.
-  await writeCapabilitiesSnapshot(agentGroup.id, session.id, slackSafetyMessagingGroupId);
+  await writeCapabilitiesSnapshot(agentGroup.id, session.id, slackSafetyMessagingGroupId, resolvedWgId);
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
 
@@ -4096,8 +4096,9 @@ function resolveGcpServiceAccountKey(credentialFolder: string): string | null {
 export async function renderCapabilitiesSnapshot(
   agentGroupId: string,
   sessionMessagingGroupId: string | null,
+  workgroupId?: string,
 ): Promise<string> {
-  const caps = await getHostCapabilities(agentGroupId, sessionMessagingGroupId);
+  const caps = await getHostCapabilities(agentGroupId, sessionMessagingGroupId, workgroupId);
   return JSON.stringify(caps, null, 2) + '\n';
 }
 
@@ -4105,9 +4106,10 @@ async function writeCapabilitiesSnapshot(
   agentGroupId: string,
   sessionId: string,
   sessionMessagingGroupId: string | null,
+  workgroupId: string,
 ): Promise<void> {
   try {
-    const rendered = await renderCapabilitiesSnapshot(agentGroupId, sessionMessagingGroupId);
+    const rendered = await renderCapabilitiesSnapshot(agentGroupId, sessionMessagingGroupId, workgroupId);
     const outPath = path.join(sessionDir(agentGroupId, sessionId), 'capabilities.json');
     fs.writeFileSync(outPath, rendered);
   } catch (err) {

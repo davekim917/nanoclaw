@@ -344,12 +344,14 @@ describe('buildSessionServicesSnapshot', () => {
     const previousHome = process.env.HOME;
     process.env.HOME = dirs.TEST_ROOT;
     try {
-      const memberInstalled = (await getHostCapabilities(member.id)).plugins.installed;
-      const outsiderInstalled = (await getHostCapabilities(outsider.id)).plugins.installed;
+      const memberInstalled = (await getHostCapabilities(member.id, undefined, 'client-wg')).plugins.installed;
+      const outsiderInstalled = (await getHostCapabilities(outsider.id, undefined, 'other-wg')).plugins.installed;
+      const unresolved = (await getHostCapabilities(member.id)).plugins.installed;
       const hostWide = (await getHostCapabilities()).plugins.installed;
       expect(memberInstalled).toEqual(expect.arrayContaining(['client-plugin', 'shared-plugin']));
       expect(outsiderInstalled).toContain('shared-plugin');
       expect(outsiderInstalled).not.toContain('client-plugin');
+      expect(unresolved).not.toContain('client-plugin');
       expect(hostWide).toEqual(expect.arrayContaining(['client-plugin', 'shared-plugin']));
     } finally {
       if (previousHome === undefined) delete process.env.HOME;

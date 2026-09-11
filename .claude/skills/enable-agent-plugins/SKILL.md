@@ -34,7 +34,7 @@ Each provider reaches the plugin by its own path, all rooted at the `~/plugins` 
 | **Skills / commands** (`skills/<n>/SKILL.md`) | `.claude-plugin/plugin.json` + mount (`CLAUDE_PLUGINS_ROOT`) | native registration at spawn from the mount, needs `.codex-plugin/plugin.json` + `.agents/plugins/marketplace.json` | mirror → `~/.config/opencode/skill/` (no plugin loader) |
 | **Always-on ruleset** (e.g. impeccable) | plugin SessionStart hook (auto) | `~/plugins/<n>/.nanoclaw-always-on.md` → `AGENTS.md`/`CLAUDE.md` | same |
 | **Opt-out** | `excludePlugins` (drops mount) | `excludePlugins` (drops mount) + skip the ruleset | `excludePlugins` skips the **ruleset only** — skills stay. The mirror is synced globally, not per group |
-| **Workgroup scope** | `data/plugin-scopes.json`: mounts only in the listed workgroups | same, and the ruleset and subagent mirror skip it elsewhere | the ruleset skips it elsewhere; the skill and subagent mirrors never copy it |
+| **Workgroup scope** | `data/plugin-scopes.json`: mounts only in the listed workgroups | same, and the ruleset skips it elsewhere; the subagent mirror never copies it | the ruleset skips it elsewhere; the skill and subagent mirrors never copy it |
 
 So the only artifacts ever worth generating are: **(1)** the manifests a repo ships
 none of, and **(2)** a condensed always-on ruleset for "mode" plugins. A skills-only
