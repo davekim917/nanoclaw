@@ -272,7 +272,8 @@ export interface RequestApprovalOptions {
    *   in the channel should be able to self-approve (bash/email gates,
    *   destructive-command gates). Response-handler.ts does NOT check
    *   clicker identity against pickApprover — thread access IS the
-   *   approval authority for this target.
+   *   approval authority for this target. Choice actions (choices.ts)
+   *   are the exception: admin privilege always.
    */
   deliveryTarget?: 'thread' | 'admin';
   /** Deliver the card to this specific user instead of all of the session group's admins. */
@@ -285,6 +286,20 @@ export interface RequestApprovalOptions {
    * Ignored when approverUserId is set.
    */
   approvers?: string[];
+  /**
+   * Custom card buttons in place of Approve / Reject / Reject with reason….
+   * Pair with registerChoiceHandler (choices.ts) on the same action: the
+   * response handler then hands any stored option to that handler instead of
+   * applying approve/reject semantics. Omitted → the standard approval buttons.
+   */
+  options?: RawOption[];
+  /**
+   * With deliveryTarget 'thread': post into this conversation instead of the
+   * session's own. The caller must already have authorized it (e.g. against
+   * the agent's destinations). `instance` is the delivering adapter instance,
+   * stored on the row so later edits reach the same bot.
+   */
+  conversation?: { channelType: string; platformId: string; threadId: string | null; instance?: string | null };
 }
 
 /**
@@ -304,13 +319,30 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<boo
     deliveryTarget = 'admin',
     approverUserId,
     approvers: approverOverride,
+    options: customOptions,
   } = opts;
+  const cardOptions = customOptions ?? APPROVAL_OPTIONS;
 
   // Resolve delivery destination based on target policy.
   // thread: originating messaging_group + session's thread_id.
   // admin:  first reachable admin's DM (v1/v2 default behavior).
-  let destination: { channelType: string; platformId: string; threadId: string | null; label: string };
-  if (deliveryTarget === 'thread') {
+  let destination: {
+    channelType: string;
+    platformId: string;
+    threadId: string | null;
+    label: string;
+    instance?: string | null;
+  };
+  if (deliveryTarget === 'thread' && opts.conversation) {
+    const c = opts.conversation;
+    destination = {
+      channelType: c.channelType,
+      platformId: c.platformId,
+      threadId: c.threadId,
+      instance: c.instance ?? null,
+      label: `conversation ${c.channelType}/${c.platformId}${c.threadId ? ':' + c.threadId : ''}`,
+    };
+  } else if (deliveryTarget === 'thread') {
     if (!session.messaging_group_id) {
       await notifyAgent(session, `${action} failed: session has no originating channel to post approval in.`);
       return false;
@@ -353,7 +385,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<boo
   }
 
   const approvalId = `appr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const normalizedOptions = normalizeOptions(APPROVAL_OPTIONS);
+  const normalizedOptions = normalizeOptions(cardOptions);
   await createPendingApproval({
     approval_id: approvalId,
     session_id: session.id,
@@ -372,6 +404,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<boo
     channel_type: destination.channelType,
     platform_id: destination.platformId,
     thread_id: destination.threadId,
+    instance: destination.instance ?? null,
     approver_user_id: approverUserId ?? null,
   });
 
@@ -399,8 +432,10 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<boo
         questionId: approvalId,
         title,
         question,
-        options: APPROVAL_OPTIONS,
+        options: cardOptions,
       }),
+      undefined,
+      destination.instance ?? undefined,
     );
     if (platformMsgId) {
       await updatePendingApprovalMessageId(approvalId, platformMsgId);

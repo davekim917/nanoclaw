@@ -62,3 +62,6 @@ async function handleInteractiveResponse(payload: ResponsePayload): Promise<bool
 }
 
 registerResponseHandler(handleInteractiveResponse);
+
+// request_choice — the non-blocking, approvals-backed sibling of ask_user_question.
+import './choice.js';
