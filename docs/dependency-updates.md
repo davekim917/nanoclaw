@@ -12,3 +12,7 @@ The policy is latest stable, including major releases. Prerelease, beta, RC, dev
 The weekly task runs the audit as a pre-task script. A deterministic all-current result returns `wakeAgent:false`; otherwise the agent posts an advisory only. It never edits, opens a PR, merges, deploys, or restarts. `/update-container` presents exact item IDs, waits for human selection, applies only those IDs in writable clones, runs the relevant gates, and opens unmerged PRs.
 
 Host and container changes use separate NanoClaw PRs. Host changes activate through the host build/deploy/restart path. Container changes activate through an image rebuild. Codex-synchronized files target the bootstrap repository and use a third PR.
+
+## Host peer-version lockstep: `vitest` / `@vitest/coverage-v8`
+
+Outside the container-update flow above: `@vitest/coverage-v8` (`package.json` devDependencies) is a `vitest` peer, not an independently-versioned package, and must stay exact-pinned to the SAME version as `vitest` itself. Bumping one without the other risks a version mismatch the install silently tolerates but the coverage machinery (`vitest.config.ts`, `scripts/check-risk-coverage.ts`) does not. When bumping `vitest`, bump `@vitest/coverage-v8` to the identical version in the same change.

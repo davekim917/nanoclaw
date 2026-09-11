@@ -367,13 +367,22 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 # so the installed binary aborts at exec and every agent loses Google Workspace:
 #   gws: /lib/*/libc.so.6: version `GLIBC_2.39' not found
 # The musl artifact of the SAME pinned version is statically linked and runs
-# here unchanged. Swap it in, verifying upstream's published SHA256 exactly as
-# the package's own install.js does, so the integrity model is unchanged.
+# here unchanged. Swap it in, checked against a SHA256 pinned in this
+# Dockerfile (same convention as the hex CLI above) rather than a sidecar
+# fetched from the same release — a sidecar proves nothing if the release
+# asset itself was replaced. Regenerated automatically on a GWS_VERSION bump
+# by the container-updates flow (container/update-sources.json's
+# google-workspace-cli entry); to do it by hand, read the canonical .sha256
+# sidecar files at:
+#   curl -sL https://github.com/googleworkspace/cli/releases/download/v$V/google-workspace-cli-x86_64-unknown-linux-musl.tar.gz.sha256
+#   curl -sL https://github.com/googleworkspace/cli/releases/download/v$V/google-workspace-cli-aarch64-unknown-linux-musl.tar.gz.sha256
 # Drop this step once the base image ships glibc >= 2.39.
+ARG GWS_SHA256_amd64=4db473dde4b1ab872e4ff35d769b0d4af1f1a6441a605e79d5cf8ada9c87e920
+ARG GWS_SHA256_arm64=e700fe63524932b10ec2130b47ece90aa850e66005fe52ccfc4cf8767bf9919a
 RUN set -eux; \
     case "$(dpkg --print-architecture)" in \
-      amd64) gws_triple=x86_64-unknown-linux-musl ;; \
-      arm64) gws_triple=aarch64-unknown-linux-musl ;; \
+      amd64) gws_triple=x86_64-unknown-linux-musl; gws_sha="$GWS_SHA256_amd64" ;; \
+      arm64) gws_triple=aarch64-unknown-linux-musl; gws_sha="$GWS_SHA256_arm64" ;; \
       *) echo "gws: unsupported architecture" >&2; exit 1 ;; \
     esac; \
     gws_bin="$(find /pnpm -type f -path '*/@googleworkspace/cli/bin/gws' -print -quit)"; \
@@ -381,8 +390,7 @@ RUN set -eux; \
     gws_url="https://github.com/googleworkspace/cli/releases/download/v${GWS_VERSION}/google-workspace-cli-${gws_triple}.tar.gz"; \
     tmp="$(mktemp -d)"; \
     curl -fsSL "$gws_url" -o "$tmp/gws.tar.gz"; \
-    curl -fsSL "$gws_url.sha256" -o "$tmp/gws.tar.gz.sha256"; \
-    echo "$(awk '{print $1}' "$tmp/gws.tar.gz.sha256")  $tmp/gws.tar.gz" | sha256sum -c -; \
+    echo "$gws_sha  $tmp/gws.tar.gz" | sha256sum -c -; \
     tar xzf "$tmp/gws.tar.gz" -C "$tmp"; \
     install -m 0755 "$tmp/gws" "$gws_bin"; \
     rm -rf "$tmp"; \

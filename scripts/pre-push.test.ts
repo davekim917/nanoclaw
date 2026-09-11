@@ -43,6 +43,22 @@ function commit(root: string, value: string, message = value): string {
   return runGit(root, ['rev-parse', 'HEAD']);
 }
 
+// Like commit(), but the resulting commit's own tree carries no
+// .public-boundary-allowlist.json — modeling a ref whose history never
+// introduced the file (the long-lived channels/providers sibling branches,
+// most local tags). --cached only: the file stays on disk so it does not
+// disturb any later ordinary commit() call in the same fixture.
+function commitWithoutAllowlist(root: string, value: string, message = value): string {
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'src', 'gate.ts'), `${value}\n`);
+  fs.writeFileSync(path.join(root, 'scripts', 'gate.ts'), `${value}\n`);
+  runGit(root, ['add', 'src/gate.ts', 'scripts/gate.ts']);
+  runGit(root, ['rm', '--cached', '--quiet', '.public-boundary-allowlist.json']);
+  runGit(root, ['commit', '-m', message, '--quiet']);
+  return runGit(root, ['rev-parse', 'HEAD']);
+}
+
 function fixture(objectFormat?: 'sha256'): { root: string; hook: string; log: string; bin: string } {
   const root = tempRoot();
   runGit(root, objectFormat ? ['init', `--object-format=${objectFormat}`, '--quiet'] : ['init', '--quiet']);
@@ -93,6 +109,10 @@ exec "$HOOK_REAL_TSX" "$script" "$@"
     `#!/bin/sh
 if [ "$1" = -C ] && [ "$3" = ls-remote ]; then shift 2; fi
 if [ "$1" = ls-remote ] && [ "$2" = --get-url ]; then
+  # HOOK_GET_URL_FAILS simulates --get-url itself failing (nonzero exit, no
+  # output) — distinct from HOOK_GET_URL, which simulates a successful
+  # resolution to a different URL.
+  [ "\${HOOK_GET_URL_FAILS:-}" != 1 ] || exit 1
   # Default: echo the URL back unchanged (no fetch-side rewrite in play).
   # HOOK_GET_URL overrides it to simulate insteadOf resolving elsewhere.
   printf '%s\\n' "\${HOOK_GET_URL:-$3}"
@@ -137,6 +157,7 @@ function push(
     remoteFailure?: boolean;
     lsRemoteFailAfterOutput?: boolean;
     getUrl?: string;
+    getUrlFails?: boolean;
     sourceGitEnv?: boolean;
     commandScopedConfig?: 'count' | 'parameters';
     withoutIonice?: boolean;
@@ -172,6 +193,7 @@ exec "$@"
       HOOK_LS_REMOTE_FAIL: options.remoteFailure ? '1' : '',
       HOOK_LS_REMOTE_FAIL_AFTER_OUTPUT: options.lsRemoteFailAfterOutput ? '1' : '',
       HOOK_GET_URL: options.getUrl ?? '',
+      HOOK_GET_URL_FAILS: options.getUrlFails ? '1' : '',
       HOOK_REQUIRE_CONFIG: options.commandScopedConfig ?? '',
       HOOK_REAL_GIT: realGit,
       HOOK_REAL_TSX: realTsx,
@@ -225,6 +247,19 @@ describe('.husky/pre-push', () => {
 
     expect(result.status).toBe(1);
     expect(result.stderr).toContain('refusing to push to main');
+  });
+
+  it('does not name its own bypass in the refusal message', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const pushed = commit(f.root, 'direct-to-main-again');
+    const result = push(f, `refs/heads/main ${pushed} refs/heads/main ${base}\n`, {
+      remoteRefs: `${base}\trefs/heads/main\n`,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('refusing to push to main');
+    expect(result.stderr).not.toContain('NANOCLAW_ALLOW_MAIN_PUSH');
   });
 
   it('lets an emergency main push through with NANOCLAW_ALLOW_MAIN_PUSH=1, and still scans it', () => {
@@ -442,6 +477,26 @@ describe('.husky/pre-push', () => {
     expect(records(f.log).join('\n')).not.toContain('remote-base');
   });
 
+  it('drops an advertised tip unknown locally instead of trusting the batch lookup line for it', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const pushed = commit(f.root, 'existing-ref-with-unknown-sibling-tip');
+    // A real remote routinely advertises tips this clone has never fetched
+    // (81 of origin's 740, per #612) — here, a sibling ref pointing at a SHA
+    // this repo has no object for. If the batch cat-file miss for it ever
+    // leaked into known_remote_tips, it would be handed to `rev-list --not`
+    // as a bogus revision and the push would die with a git error instead of
+    // scanning anything.
+    const unknownTip = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    const result = push(f, `refs/heads/current ${pushed} refs/heads/current ${base}\n`, {
+      fail: 'boundary:existing-ref-with-unknown-sibling-tip',
+      remoteRefs: `${base}\trefs/heads/current\n${unknownTip}\trefs/heads/other\n`,
+    });
+
+    expect(result.status).toBe(1);
+    expect(records(f.log).join('\n')).toContain('existing-ref-with-unknown-sibling-tip');
+  });
+
   it('refuses to trust ls-remote once fetch-side URL rewriting is detected, for an existing ref', () => {
     const f = fixture();
     const base = commit(f.root, 'remote-base');
@@ -467,6 +522,36 @@ describe('.husky/pre-push', () => {
     const pushed = commit(f.root, 'new-ref-under-rewrite');
     const result = push(f, `refs/heads/new ${pushed} refs/heads/new ${zeroSha}\n`, {
       getUrl: 'https://internal-mirror.invalid/nanoclaw.git',
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('fetch-side URL rewriting');
+  });
+
+  it('takes the same fail-closed branch when --get-url itself fails, for an existing ref', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    // If the hook trusted a fetch-side lookup it never actually validated
+    // against the push target, this tip would wrongly be treated as known
+    // and would exclude the flagged commit below.
+    const wouldBeTrustedTip = commit(f.root, 'already-on-main-get-url-fails');
+    const pushed = commit(f.root, 'new-on-branch-get-url-fails');
+    const result = push(f, `refs/heads/current ${pushed} refs/heads/current ${base}\n`, {
+      fail: 'boundary:already-on-main-get-url-fails',
+      remoteRefs: `${wouldBeTrustedTip}\trefs/heads/main\n`,
+      getUrlFails: true,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('fetch-side URL rewriting');
+    expect(records(f.log).join('\n')).toContain('already-on-main-get-url-fails');
+  });
+
+  it('takes the same fail-closed branch when --get-url itself fails, for a new ref', () => {
+    const f = fixture();
+    const pushed = commit(f.root, 'new-ref-get-url-fails');
+    const result = push(f, `refs/heads/new ${pushed} refs/heads/new ${zeroSha}\n`, {
+      getUrlFails: true,
     });
 
     expect(result.status).toBe(1);
@@ -747,6 +832,67 @@ describe('.husky/pre-push', () => {
     const messages = records(f.log).filter((record) => record.startsWith('message|'));
     expect(messages).toHaveLength(2);
     expect(messages.every((record) => record.includes('/COMMIT_EDITMSG --message-raw'))).toBe(true);
+  });
+
+  it('does not honor an uncommitted allowlist entry: reads the allowlist from the pushed tree', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const pushed = commit(f.root, 'clean-tree', 'fix: Private Customer');
+    // Edit the allowlist in the pushing worktree WITHOUT committing it. If
+    // the hook read this file instead of $local_sha's own committed tree,
+    // this uncommitted edit would exempt the identifier above with nothing
+    // on the remote actually backing the exception (#651).
+    fs.writeFileSync(
+      path.join(f.root, '.public-boundary-allowlist.json'),
+      JSON.stringify({ entries: [{ path: 'COMMIT_EDITMSG', value: 'Private Customer', reason: 'uncommitted' }] }),
+    );
+    const result = push(f, `refs/heads/current ${pushed} refs/heads/current ${base}\n`);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('private-identifier');
+  });
+
+  it('treats a pushed tip with no committed allowlist as an empty one, not a refusal', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const pushed = commitWithoutAllowlist(f.root, 'no-allowlist-clean');
+    const result = push(f, `refs/heads/current ${pushed} refs/heads/current ${base}\n`);
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(records(f.log).join('\n')).toContain('no-allowlist-clean');
+    // Non-fatal, and it does not change the result, but a later alert about a
+    // finding on this ref should be able to explain itself.
+    expect(result.stderr).toContain(`refs/heads/current (${pushed})`);
+    expect(result.stderr).toContain('scanning with an empty allowlist');
+  });
+
+  it('still refuses a pushed tip with no committed allowlist when it carries an identifier', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    const pushed = commitWithoutAllowlist(f.root, 'clean-tree', 'fix: Private Customer, no allowlist');
+    const result = push(f, `refs/heads/current ${pushed} refs/heads/current ${base}\n`);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('private-identifier');
+  });
+
+  it('does not let the missing-allowlist fallback read the working copy instead of synthesizing an empty one', () => {
+    const f = fixture();
+    const base = commit(f.root, 'remote-base');
+    // The working copy's allowlist, left on disk and never committed, exempts
+    // the identifier below. The pushed tip's own tree carries no allowlist at
+    // all, so this push must fall back to a FRESH empty allowlist, not this
+    // file — if the fallback ever read the working copy instead, this
+    // identifier would wrongly pass unflagged.
+    fs.writeFileSync(
+      path.join(f.root, '.public-boundary-allowlist.json'),
+      JSON.stringify({ entries: [{ path: 'COMMIT_EDITMSG', value: 'Private Customer', reason: 'uncommitted' }] }),
+    );
+    const pushed = commitWithoutAllowlist(f.root, 'clean-tree', 'fix: Private Customer, no allowlist in tree');
+    const result = push(f, `refs/heads/current ${pushed} refs/heads/current ${base}\n`);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('private-identifier');
   });
 
   it.each(['tree', 'message'] as const)(

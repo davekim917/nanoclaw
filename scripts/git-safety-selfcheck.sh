@@ -74,6 +74,20 @@ run_safety() { # extra env assignments as "$@", e.g. run_safety GIT_SAFETY_GROUP
 
 latest_snapshot() { ls -td "$BACKUPS"/*/ 2>/dev/null | head -1; }
 
+# unit-alert-dm.sh's keyword grep misses most FAILURES wording ("failed"
+# alone isn't a keyword), so on a FAILURES exit it falls back to the LAST
+# non-empty line of the unit's recent output for its DM. That line must be
+# an actual failure reason, not the "whatever did succeed" context line
+# that used to print after it (#658 review).
+assert_failure_reason_is_last() { # label, $OUT
+  local label="$1" out="$2" tail_line
+  tail_line=$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -1)
+  case "$tail_line" in
+    *"Whatever did succeed"*) bad "$label: context line, not the failure, is last" "tail=[$tail_line]" ;;
+    *) ok "$label: the failure reason is the last line (what unit-alert-dm.sh's DM would show)" ;;
+  esac
+}
+
 # ═══ 1. Phase 2 never touches groups' HEAD, index, or working tree ═════════
 new_fixture
 BEFORE_HEAD=$(git -C "$G" rev-parse HEAD)
@@ -130,6 +144,26 @@ case "$OUT" in
   *) bad "color.ui=always defeated the scan" "$OUT" ;;
 esac
 
+# A non-UTF-8 byte on the same line as a real secret must not blind the
+# scan either (#658 review). Under the installed unit's LANG=en_US.UTF-8,
+# GNU grep classifies a diff containing an invalid UTF-8 byte as binary and
+# `-c` reports 0/"binary file matches" instead of the line — verified
+# empirically before the LC_ALL=C fix: this exact line counted 0 hits
+# under LANG=en_US.UTF-8, 1 under LC_ALL=C. Force the vulnerable locale
+# here (LC_ALL= clears any inherited override) so the test fails if the
+# LC_ALL=C fix in lib/secret-scan.sh regresses.
+new_fixture
+printf '{"a":2}\n' > "$G/foo/container.json"
+printf 'binary junk: \x80\x81\x82 export SLACK_APP_TOKEN=xapp-1-A0123-4567890123-abcdefabcdefabcdefabcdefabcdef\n' >> "$G/foo/container.json"
+run_safety LANG=en_US.UTF-8 LC_ALL=
+case "$OUT" in
+  *"look like a secret"*) ok "secret gate not blinded by a non-UTF-8 byte on the same line" ;;
+  *) bad "a non-UTF-8 byte blinded the scan to an adjacent real secret" "$OUT" ;;
+esac
+if git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1; then
+  bad "non-UTF-8 line: pushed anyway" "$(git --git-dir="$REMOTE" log --oneline host-snapshot)"
+fi
+
 # ═══ Refuse binary changes ══════════════════════════════════════════════
 new_fixture
 printf '\x00\x01binarydata\x02\x03' > "$G/foo/container.json"
@@ -141,6 +175,7 @@ esac
 if git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1; then
   bad "binary change: pushed anyway" "$(git --git-dir="$REMOTE" log --oneline host-snapshot)"
 fi
+assert_failure_reason_is_last "binary change refusal" "$OUT"
 
 # ═══ Never auto-commit sensitive filenames; report them instead ══════════
 new_fixture
@@ -262,6 +297,12 @@ esac
 # next time except the untouched real working tree edit.
 [ -n "$(git -C "$G" status --porcelain)" ] && ok "pending edit remains on disk for the next run to retry" \
   || bad "pending edit was lost after the permanent push failure" ""
+# #628 item 8: a FAILURES exit must alert exactly once — via the installed
+# unit's OnFailure= (which reads the journal this script's stderr just fed),
+# never via the script's own notify-owner.ts call too.
+[ ! -s "$DM_LOG" ] && ok "a FAILURES exit sends no DM of its own (OnFailure= alerts instead)" \
+  || bad "a FAILURES exit still sent its own DM — double-alerts with OnFailure=" "$(cat "$DM_LOG")"
+assert_failure_reason_is_last "permanent push failure" "$OUT"
 
 # ═══ Dry mode: no fetch, no fast-forward, no push, no DM ══════════════════
 new_fixture
@@ -285,8 +326,9 @@ git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1 \
 # ═══ Phase 1 errors are non-silent (update-ref / diff / tar) ══════════════
 # A plain FILE sitting where update-ref needs to create
 # refs/git-safety/detached/<slug> (a directory) makes the ref update fail;
-# assert the run reports it as a FAILURE (and therefore DMs and exits
-# non-zero) instead of swallowing it into errors.log alone.
+# assert the run reports it as a FAILURE and exits non-zero (which is what
+# the installed unit's OnFailure= escalation keys off) instead of
+# swallowing it into errors.log alone.
 new_fixture
 WT="$FIX/detached-wt"
 git -C "$NCDIR" worktree add -q --detach "$WT" HEAD >/dev/null 2>&1
@@ -299,9 +341,41 @@ case "$OUT" in
   *"update-ref"*) ok "a failing update-ref is reported as a failure" ;;
   *) bad "a failing update-ref was silent" "$OUT" ;;
 esac
-[ "$RC" -ne 0 ] && ok "phase-1 error causes non-zero exit + DM" \
+[ "$RC" -ne 0 ] && ok "phase-1 error causes non-zero exit (for OnFailure= to escalate)" \
   || bad "phase-1 error did not fail the run" "$OUT"
+[ ! -s "$DM_LOG" ] && ok "phase-1 FAILURES exit sends no DM of its own either" \
+  || bad "phase-1 FAILURES exit still sent its own DM" "$(cat "$DM_LOG")"
+assert_failure_reason_is_last "phase-1 update-ref failure" "$OUT"
 git -C "$NCDIR" worktree remove --force "$WT" >/dev/null 2>&1
+
+# ═══ A missing lib/secret-scan.sh fails closed, not open ══════════════════
+# git-safety.sh sources lib/secret-scan.sh with `${SCRIPT_DIR}/lib/...`,
+# where SCRIPT_DIR is derived from ${BASH_SOURCE[0]} — the path of whatever
+# copy of the script bash actually runs. Exercise the SHIPPED script's
+# source-guard (`|| exit 1`, #658 review) by running a byte-for-byte copy of
+# it from a scratch directory with no lib/ sibling at all, so this never
+# touches the real scripts/lib/secret-scan.sh in this checkout. Before the
+# guard, a missing lib left secret_scan_hits() undefined: the later
+# `hits=$(secret_scan_hits ...)` failed silently (command not found), hits
+# ended up "", and `${hits:-0}` read that as 0 — the secret gate passed
+# every pending change through unchecked.
+new_fixture
+NOLIB_DIR="$FIX/nolib-scripts"
+mkdir -p "$NOLIB_DIR"
+cp "$REAL" "$NOLIB_DIR/git-safety.sh"
+echo '{"a":2}' > "$G/foo/container.json"
+OUT=$(env NANOCLAW_DIR="$NCDIR" GIT_SAFETY_DIR="$BACKUPS" HOME="$HOME2" bash "$NOLIB_DIR/git-safety.sh" 2>&1)
+RC=$?
+[ "$RC" -ne 0 ] && ok "a missing lib/secret-scan.sh fails the run" \
+  || bad "a missing lib/secret-scan.sh did NOT fail the run (fail-open)" "$OUT"
+case "$OUT" in
+  *"cannot load"*"secret-scan.sh"*) ok "missing-lib failure names the file it could not load" ;;
+  *) bad "missing-lib failure did not explain itself" "$OUT" ;;
+esac
+git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1 \
+  && bad "missing-lib run pushed a host-snapshot commit anyway (fail-OPEN, gate never ran)" \
+    "$(git --git-dir="$REMOTE" log --oneline host-snapshot)" \
+  || ok "missing-lib run pushed nothing — fails closed"
 
 # ═══ Worktree slugs get a hash suffix (uniqueness even after truncation) ══
 # Unit-test slug() directly (extracted verbatim from the shipped script),
@@ -614,6 +688,65 @@ esac
 git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1 \
   && ok "the non-secret 'desk-...' change was committed normally" \
   || bad "a non-secret change was refused" "$OUT"
+
+# ═══ The '+++ ' header exclusion, narrowed after review (#658 round 2) ════
+# An ADDED line is itself printed as `+` followed by its own content, so a
+# real added line whose content starts with "++ " becomes "+++ ..." on the
+# wire — syntactically identical to a `+++ ` diff header. The old blanket
+# `grep -vE '^\+\+\+ '` exclusion dropped that content along with real
+# headers (verified: reverting to it makes this exact case count 0 hits
+# instead of 1). Narrowed to the shapes git actually emits for a header
+# (`+++ b/<path>`, `+++ "b/<path>"`, `+++ /dev/null`).
+secret_case "an added line starting with '++ ' is still scanned, not mistaken for a diff header" \
+  '++ token=abc123secretabc123secretabc'
+
+# LC_ALL=C counts BYTES for a character class, not characters — a 3-byte
+# UTF-8 smart quote can burn most of a small {0,N} budget on its own.
+# `{0,3}` let this exact line (smart-quote punctuation before the `:`)
+# slip past under LC_ALL=C, though it matched fine under a UTF-8 locale
+# (verified: reverting to {0,3} makes it count 0 hits instead of 1).
+secret_case "smart-quote punctuation before ':' is still caught under LC_ALL=C" \
+  '“password” : hunter2x'
+
+# A file whose path happens to look like an sk- secret, already TRACKED
+# (add -u only picks up edits to tracked files, never new ones — a brand
+# new file wouldn't exercise this diff at all), gets a real content edit.
+# The diff's own `+++ b/<path>` header line must not itself be scanned via
+# the coincidental resemblance.
+new_fixture
+mkdir -p "$G/foo/tasks"
+echo placeholder > "$G/foo/tasks/sk-learn-migration-plan-2026.md"
+git -C "$G" add foo/tasks/sk-learn-migration-plan-2026.md
+git -C "$G" commit -qm "add placeholder task file" >/dev/null
+git -C "$G" push -q origin HEAD:main
+printf 'ordinary planning notes, nothing secret here\n' >> "$G/foo/tasks/sk-learn-migration-plan-2026.md"
+run_safety
+case "$OUT" in
+  *"look like a secret"*) bad "a '+++ b/…sk-learn-….md' header was scanned as content" "$OUT" ;;
+  *) ok "a '+++ b/…sk-learn-….md' header is recognized as a header, not scanned" ;;
+esac
+git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1 \
+  && ok "the sk--looking file's edit was committed normally" \
+  || bad "the sk--looking file's edit was refused" "$OUT"
+
+# git C-quotes a path containing non-ASCII bytes in its diff header
+# (`+++ "b/café.md"` rather than `+++ b/café.md`) — the exclusion must
+# recognize that quoted form too. Same reasoning as above: the file must
+# already be tracked for `add -u` to pick up the edit.
+new_fixture
+printf 'placeholder\n' > "$G/foo/café.md"
+git -C "$G" add foo/café.md
+git -C "$G" commit -qm "add cafe placeholder" >/dev/null
+git -C "$G" push -q origin HEAD:main
+printf 'ordinary content, nothing secret here\n' >> "$G/foo/café.md"
+run_safety
+case "$OUT" in
+  *"look like a secret"*) bad "a quoted-path '+++ \"b/café.md\"' header was scanned as content" "$OUT" ;;
+  *) ok "a quoted-path header is recognized as a header, not scanned" ;;
+esac
+git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1 \
+  && ok "the non-ASCII-named file's edit was committed normally" \
+  || bad "the non-ASCII-named file's edit was refused" "$OUT"
 
 # ─ Phase 1's untracked-file exclusions now match phase 2's list (#628) ─
 untracked_excluded_case() { # label, filename, content

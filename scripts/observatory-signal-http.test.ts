@@ -1,6 +1,7 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { allowNetwork } from '../src/test-hermeticity.js';
+import { scaledTimeout } from '../src/test-timeout-scale.js';
 import { beforeAll, afterAll, expect, it } from 'vitest';
 import { initTestDb, getDb, closeDb } from '../src/db/connection.js';
 import { SIGNAL_SCHEMA } from '../src/db/migrations/072-observatory-signal.js';
@@ -194,87 +195,91 @@ afterAll(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()));
   await closeDb();
 });
-it('authenticated HTTP ownership, delivery, project persistence and evidence conflicts are isolated end to end', async () => {
-  allowNetwork(); // Ephemeral loopback server only; downstream transport remains fake.
-  const base = '/dashboard/api/observatory/v2';
-  expect((await request(base, null)).status).toBe(401);
-  const first = await request(base);
-  expect(first.status).toBe(200);
-  const source = first.body.decisions[0];
-  const path = base + '/decisions/' + source.id;
-  const claim = {
-    expected_version: 0,
-    evidence_hash: source.evidence_hash,
-    action: 'claim',
-    idempotency_key: 'claim-d',
-  };
-  expect((await request(path + '/review', 'd', 'POST', claim, { origin: 'https://evil.example' })).status).toBe(403);
-  expect((await request(path + '/review', 'member', 'POST', claim)).status).toBe(404);
-  expect((await request(base + '?workgroup=other', 'member')).body.decisions).toEqual([]);
-  const race = await Promise.all([
-    request(path + '/review', 'd', 'POST', claim),
-    request(path + '/review', 'j', 'POST', { ...claim, idempotency_key: 'claim-j' }),
-  ]);
-  expect(race.map((r) => r.status).sort()).toEqual([200, 409]);
-  const winner = race[0]!.status === 200 ? 'd' : 'j';
-  const loser = winner === 'd' ? 'j' : 'd';
-  const shared = await request(path, loser);
-  expect(shared.status, JSON.stringify(shared.body)).toBe(200);
-  expect(shared.body.decision.owner?.id).toBe(winner);
-  expect(shared.body.decision.version).toBe(1);
-  const answer = await request(path + '/review', winner, 'POST', {
-    expected_version: 1,
-    evidence_hash: source.evidence_hash,
-    action: 'answer',
-    text: 'Allow editing with an audit log.',
-    idempotency_key: 'answer',
-  });
-  expect(answer.status).toBe(200);
-  expect(delivered.size).toBe(0);
-  const dispatchBody = {
-    expected_version: answer.body.decision.version,
-    evidence_hash: source.evidence_hash,
-    agent_group_id: 'a',
-    target_thread_id: 'slack:C:123',
-  };
-  expect((await request(path + '/dispatch', winner, 'POST', dispatchBody)).status).toBe(500);
-  expect((await request(path, winner)).body.decision.dispatch_state).toBe('pending');
-  simulateCrash = false;
-  expect((await request(path + '/dispatch', winner, 'POST', dispatchBody)).body.decision.dispatch_state).toBe('sent');
-  expect((await request(path + '/dispatch', winner, 'POST', dispatchBody)).body.decision.dispatch_state).toBe('sent');
-  expect([...delivered.values()]).toEqual([
-    {
-      session: 'isolated-session',
-      text: `${winner === 'd' ? 'Reviewer One' : 'Reviewer Two'} sent a decision from the Observatory.\n\nQuestion: Allow editing?\n\nTheir answer, verbatim:\nAllow editing with an audit log.\n\nReply in this thread with what you did or what prevents action.`,
-    },
-  ]);
-  const project = {
-    workgroup_id: 'w',
-    name: 'Widget',
-    description: 'Source-backed goal',
-    repositories: ['acme/widget'],
-    channel_keys: [],
-    expected_version: 0,
-  };
-  expect((await request(base + '/projects/widget', 'member', 'PUT', project)).status).toBe(404);
-  expect((await request(base + '/projects/widget', 'd', 'PUT', project)).status).toBe(200);
-  expect((await request(base, 'j')).body.projects.find((p: { id: string }) => p.id === 'widget')?.items).toHaveLength(
-    1,
-  );
-  expect((await request(base + '/projects/widget', 'd', 'PUT', project)).status).toBe(409);
-  item = { ...item, why: 'Evidence materially changed.' };
-  const fresh = (await request(path, winner)).body.decision;
-  expect(fresh.state).toBe('changed');
-  expect(fresh.history.some((e) => e.note === 'Allow editing with an audit log.')).toBe(true);
-  expect(
-    (
-      await request(path + '/review', winner, 'POST', {
-        expected_version: fresh.version,
-        evidence_hash: source.evidence_hash,
-        action: 'answer',
-        text: 'Old answer',
-        idempotency_key: 'stale',
-      })
-    ).status,
-  ).toBe(409);
-}, 20000);
+it(
+  'authenticated HTTP ownership, delivery, project persistence and evidence conflicts are isolated end to end',
+  async () => {
+    allowNetwork(); // Ephemeral loopback server only; downstream transport remains fake.
+    const base = '/dashboard/api/observatory/v2';
+    expect((await request(base, null)).status).toBe(401);
+    const first = await request(base);
+    expect(first.status).toBe(200);
+    const source = first.body.decisions[0];
+    const path = base + '/decisions/' + source.id;
+    const claim = {
+      expected_version: 0,
+      evidence_hash: source.evidence_hash,
+      action: 'claim',
+      idempotency_key: 'claim-d',
+    };
+    expect((await request(path + '/review', 'd', 'POST', claim, { origin: 'https://evil.example' })).status).toBe(403);
+    expect((await request(path + '/review', 'member', 'POST', claim)).status).toBe(404);
+    expect((await request(base + '?workgroup=other', 'member')).body.decisions).toEqual([]);
+    const race = await Promise.all([
+      request(path + '/review', 'd', 'POST', claim),
+      request(path + '/review', 'j', 'POST', { ...claim, idempotency_key: 'claim-j' }),
+    ]);
+    expect(race.map((r) => r.status).sort()).toEqual([200, 409]);
+    const winner = race[0]!.status === 200 ? 'd' : 'j';
+    const loser = winner === 'd' ? 'j' : 'd';
+    const shared = await request(path, loser);
+    expect(shared.status, JSON.stringify(shared.body)).toBe(200);
+    expect(shared.body.decision.owner?.id).toBe(winner);
+    expect(shared.body.decision.version).toBe(1);
+    const answer = await request(path + '/review', winner, 'POST', {
+      expected_version: 1,
+      evidence_hash: source.evidence_hash,
+      action: 'answer',
+      text: 'Allow editing with an audit log.',
+      idempotency_key: 'answer',
+    });
+    expect(answer.status).toBe(200);
+    expect(delivered.size).toBe(0);
+    const dispatchBody = {
+      expected_version: answer.body.decision.version,
+      evidence_hash: source.evidence_hash,
+      agent_group_id: 'a',
+      target_thread_id: 'slack:C:123',
+    };
+    expect((await request(path + '/dispatch', winner, 'POST', dispatchBody)).status).toBe(500);
+    expect((await request(path, winner)).body.decision.dispatch_state).toBe('pending');
+    simulateCrash = false;
+    expect((await request(path + '/dispatch', winner, 'POST', dispatchBody)).body.decision.dispatch_state).toBe('sent');
+    expect((await request(path + '/dispatch', winner, 'POST', dispatchBody)).body.decision.dispatch_state).toBe('sent');
+    expect([...delivered.values()]).toEqual([
+      {
+        session: 'isolated-session',
+        text: `${winner === 'd' ? 'Reviewer One' : 'Reviewer Two'} sent a decision from the Observatory.\n\nQuestion: Allow editing?\n\nTheir answer, verbatim:\nAllow editing with an audit log.\n\nReply in this thread with what you did or what prevents action.`,
+      },
+    ]);
+    const project = {
+      workgroup_id: 'w',
+      name: 'Widget',
+      description: 'Source-backed goal',
+      repositories: ['acme/widget'],
+      channel_keys: [],
+      expected_version: 0,
+    };
+    expect((await request(base + '/projects/widget', 'member', 'PUT', project)).status).toBe(404);
+    expect((await request(base + '/projects/widget', 'd', 'PUT', project)).status).toBe(200);
+    expect((await request(base, 'j')).body.projects.find((p: { id: string }) => p.id === 'widget')?.items).toHaveLength(
+      1,
+    );
+    expect((await request(base + '/projects/widget', 'd', 'PUT', project)).status).toBe(409);
+    item = { ...item, why: 'Evidence materially changed.' };
+    const fresh = (await request(path, winner)).body.decision;
+    expect(fresh.state).toBe('changed');
+    expect(fresh.history.some((e) => e.note === 'Allow editing with an audit log.')).toBe(true);
+    expect(
+      (
+        await request(path + '/review', winner, 'POST', {
+          expected_version: fresh.version,
+          evidence_hash: source.evidence_hash,
+          action: 'answer',
+          text: 'Old answer',
+          idempotency_key: 'stale',
+        })
+      ).status,
+    ).toBe(409);
+  },
+  scaledTimeout(20000),
+);

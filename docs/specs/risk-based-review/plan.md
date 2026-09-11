@@ -191,11 +191,29 @@ merged after it, unreviewed. The same query reports the weekly revert rate.
 difference will show; the 30-day read is a first look, not a verdict. XZO's volume, 393 PRs
 in the 30 days before its switch, supports a firmer read. A post-merge advisory review of
 skipped PRs measures misses directly instead of waiting for production to surface them. It
-files what it finds and never blocks.
+files what it finds and never blocks — shipped 2026-09-11 as
+`.github/workflows/shadow-review.yml`: on every PR merged into `main` that carried neither
+`risk:high` nor `review:requested` at merge time, an Opus-tier Claude reviews the merge
+commit's diff against `docs/review-policy.md`'s severity bar and either opens one
+`shadow-review`-labeled issue (`shadow review: #<n> <title>`, findings marked **P1**/**P2**
+inline) or, on no findings, leaves a one-line PR comment. `scripts/review-outcomes.ts`
+reads those issues back (`buildShadowReviewIndex`) to count, per bucket, how many skipped
+PRs were shadow-reviewed and how many drew a P1.
 
-**Rollback condition, agreed in advance** (corrected 2026-09-11; the first version compared
-the confounded groups): if low-risk PRs merged without review draw more same-file follow-ups
-or reverts than low-risk PRs did while they were still reviewed, the exempt path list shrinks.
+**Rollback condition, agreed in advance** (corrected 2026-09-11 for the confounded-groups
+bug; superseded 2026-09-11 by the direct signal below, once shadow review shipped). The
+**primary signal is shadow-review findings on skipped PRs**, not file overlap: a P1 finding
+on a skipped PR is direct evidence that PR's *paths*, not just that PR's diff, were
+under-covered by the risk list. It moves those paths onto `risk:high` in
+`.github/labeler.yml` — a path-level ratchet the labeler list learns from — recorded as one
+line in `docs/review-notes.md` describing the rule (see that file). **Secondary signal:**
+reverts, before vs. after the switch (the weekly rate above already tracks this). **File
+overlap is reported only as an upper bound**, cited but never acted on alone: replayed
+against `davekim917/nanoclaw` on 2026-09-11 (`pnpm exec tsx scripts/review-outcomes.ts`),
+69.7% (85/122) of low-risk PRs merged in the 30 days *before* the switch — every one of them
+reviewed — still show a same-file follow-up within 14 days. A metric that flags most PRs
+regardless of whether they were reviewed cannot tell a miss from noise, which is exactly why
+shadow review, not file overlap, is the signal this rollback condition acts on.
 
 ## Non-goals
 
@@ -237,11 +255,12 @@ or reverts than low-risk PRs did while they were still reviewed, the exempt path
       - **#566.** The breaker is diagnosed. `codex-review.sh gate` derives seams from
         imports, so a finding class whose sites are Markdown or YAML is never gated. Tier 1
         routes around it, because docs-only PRs are not reviewed at all.
-- [ ] Measurement — corrected 2026-09-11. The earlier method compared reviewed with
-      unreviewed PRs and assumed its bias fell equally on both. It doesn't, because the groups
-      differ by path. The comparison is now before-and-after within the low-risk class. Links
-      come from a required `Fixes-PR:` line, and revert rate is tracked alongside. First read
-      around 2026-10-10.
+- [ ] Measurement — corrected 2026-09-11, then shadow review shipped 2026-09-11. The
+      earlier method compared reviewed with unreviewed PRs and assumed its bias fell
+      equally on both. It doesn't, because the groups differ by path. The comparison is
+      now before-and-after within the low-risk class. Links come from a required
+      `Fixes-PR:` line, and revert rate is tracked alongside. First read around
+      2026-10-10.
       The query shipped 2026-09-11: `pnpm exec tsx scripts/review-outcomes.ts`
       (`--repo`, `--switch`, `--days`, `--followup-days`, `--json`). It replays
       `.github/labeler.yml`'s `risk:high` globs against every merged PR's own file list
@@ -250,25 +269,53 @@ or reverts than low-risk PRs did while they were still reviewed, the exempt path
       fallback separately, and reverts are unbounded in time. A same-day smoke run
       (30/30 days around the switch) found zero `Fixes-PR:`-linked follow-ups on
       low-risk PRs on either side — the trailer isn't used on low-risk PRs in
-      practice — so the fallback overlap rate is carrying the signal for now: 75.6%
+      practice — so the fallback overlap rate was carrying the signal at first: 75.6%
       before vs. 40.0% after, with only 10 low-risk PRs merged after the switch as of
-      this run, under the 30-PR floor this plan sets for a readable difference.
-- [ ] Revised plan, 2026-09-11, after an independent second opinion and a comparison with
-      Augment's Cosmos:
-      - **Gate integrity:** merge-check fails closed when `risk:high` was removed by anyone
-        but the labeler, and requires `Fixes-PR:` on fix PRs. Substitute reviews of risky
-        PRs must come from an Opus- or Fable-tier model, or from another model family.
-      - **Reviewer identity:** every gate runs under one GitHub identity, so a self-approval
-        can't be told apart from a review. This is an operator decision: a second identity for
-        receipts, or a public repo so branch protection applies. A history scan for public
-        readiness is under way.
-      - **Measurement:** the correction above.
-      - **Tests on risky paths:** no coverage tooling is installed yet. Unit tests for the #608
-        failure exist (`container/agent-runner/src/poll-loop.test.ts:390` onward). The missing
-        piece is a check that runs the real CLI and confirms the hooks still fire.
-      - **Memory and decisions:**
-        - review-dimension labels such as `risk:guard` and `risk:migration`;
-        - a `docs/review-notes.md` that gets a line whenever a finding is deferred or a PR is
-          reverted;
-        - on XZO, a `Decision:` line plus the existing `needs-product-decision` label.
+      that run, under the 30-PR floor this plan sets for a readable difference. Rerun
+      2026-09-11 (122 low-risk PRs before, 12 after): 69.7% before vs. 33.3% after —
+      still both high and both under the after-switch sample floor, confirming file
+      overlap alone can't discriminate a miss from a busy file. That is why shadow
+      review (below) is now the primary signal and file overlap is reported only as an
+      upper bound, per the corrected rollback condition above.
+      `.github/workflows/shadow-review.yml` ships the direct signal:
+      post-merge advisory Opus review of every skipped PR, one `shadow-review`-labeled
+      issue per PR with findings (or a PR comment on none), never blocking. Selection is
+      by the PR's labels *at the `closed` event* (`risk:high` / `review:requested`), not
+      a label re-check, so a wrongly-removed label only means more review, never a risky
+      PR going unwatched — see the workflow's header comment. `review-outcomes.ts` now
+      also reports, per bucket, how many skipped PRs a shadow-review issue exists for and
+      how many of those carried a P1 (`buildShadowReviewIndex`, `fetchShadowReviewIssues`).
+      A P1 on a skipped PR moves that PR's paths onto `risk:high`
+      (`.github/labeler.yml`) by hand — the path-level ratchet the rollback condition
+      names — recorded as one line in `docs/review-notes.md`.
+- [x] Revised plan, 2026-09-11, after an independent second opinion and a comparison with
+      Augment's Cosmos. Where each item stands:
+      - **Gate integrity — shipped, then redesigned.** merge-check fails closed when a scope
+        label was removed by anyone but the labeler, and requires `Fixes-PR:` on fix PRs
+        (#642); unexplained removals and fenced `Fixes-PR:` lines are handled (#649). #664
+        (in review) replaces label trust with the diff itself: risk is computed from the PR's
+        own file list at a pinned base and head, so a label can add review but never remove it.
+      - **Reviewer tier — tightened.** Reviews come only from the high or frontier tier:
+        Claude Opus or Fable, Codex Sol or Astra. Never Sonnet, Haiku, or Codex Luna/Terra.
+        A follow-up PR derives the allowed model IDs from the tier config
+        (`container/agents/worker-{high,frontier}.md`, `CODEX_WORKER_TIERS`) and makes
+        `receipt`/`merge-check` enforce them, so a model release needs no policy edit.
+      - **Reviewer identity — operator decision, unchanged.** Every gate still runs under one
+        GitHub identity; a second identity or a public repo (branch protection) would
+        separate review from self-approval.
+      - **Main integrity — shipped.** CI runs with a read-only token (#644). Every push to
+        `main` must be a GitHub-made merge commit of a merged PR (#652), and a daily sweep of
+        GitHub's Activity API catches pushes the push trigger never saw, refusing test-merge
+        tips (#656). Rebase merging is still enabled in the repository settings; turning it
+        off is an operator setting.
+      - **Measurement — shipped** (above: `review-outcomes.ts` #653, shadow review #660).
+      - **Tests on risky paths — in review.** #662 adds a per-file coverage ratchet over the
+        `risk:high` paths (vitest for the host, bun lcov for the agent-runner), with
+        untested files recorded as explicit debt and CI minutes kept flat.
+      - **Secret scanning on push paths.** The pre-push hook reads the allowlist from the
+        pushed tree (#659); git-safety uses one shared pattern file (#658). #666 (in rework)
+        adds a host-managed pre-push scan for the wiki repositories agents push to.
+      - **Memory and decisions — shipped.** Review-dimension labels are derived in
+        `scripts/labeler-config.test.ts` (#643); `docs/review-notes.md` records deferred
+        findings and reverts.
 - [ ] Tier 2 · Tier 3 · Tier 4 — not started

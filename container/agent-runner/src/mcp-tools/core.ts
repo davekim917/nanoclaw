@@ -94,27 +94,69 @@ function destinationList(): string {
 // text. Recognize only one complete, top-level routing envelope: XML in prose
 // or code blocks remains user content.
 const ROUTING_MESSAGE_OPENER_RE = /<message\s+to="([^"]*)"\s*>/g;
-const ROUTING_MESSAGE_ENVELOPE_RE = /^\s*<message\s+to="[^"]*"\s*>([\s\S]*)<\/message>\s*$/;
+// Matches ONLY the leading opener (used to find where its content starts,
+// and to short-circuit text that isn't a routing envelope at all).
+const ROUTING_MESSAGE_LEADING_OPENER_RE = /^\s*<message\s+to="[^"]*"\s*>/;
+const ROUTING_MESSAGE_CLOSER = '</message>';
 
-function normalizeToolMessageText(text: string): { text: string } | { error: string } {
+/**
+ * Strip a leading `<message to="...">...</message>` envelope, terminating
+ * at the FIRST closing tag — never the last, and never a nested one.
+ *
+ * This used to be a single regex whose inner group was a tempered token,
+ * `(?:(?!<\/message>)[\s\S])*` — "anything that isn't the start of a
+ * closing tag" — to stop at the first `</message>` instead of a plain
+ * greedy `[\s\S]*` backtracking to the last one. But a tempered token still
+ * re-runs its negative lookahead at every character position, and under
+ * Bun/JSC that per-character backtracking hits an internal engine limit:
+ * on a legitimate body at roughly 688KB and up the match SILENTLY fails —
+ * no error, no timeout, just "not a routing envelope" — and even below
+ * that threshold it costs on the order of 0.4s/MB. A chat message or
+ * send_file caption can legitimately be that large (a long report, a
+ * pasted log), so this scans with `indexOf` instead: O(n), no
+ * backtracking, no size cliff.
+ *
+ * Terminating at the first closing tag (rather than requiring a UNIQUE one)
+ * is deliberate, not just an artifact of the scan: a nested, un-addressed
+ * `<message>` inside the envelope — e.g. `<message to="x">See <message>hi
+ * </message> for detail</message>` — must not be silently unwrapped past
+ * the inner tag to the outer one. Stopping at the first `</message>` (the
+ * inner one here) leaves "for detail</message>" as trailing, non-whitespace
+ * content, which fails the check below and rejects the whole thing as not
+ * one complete envelope — the same outcome as an unclosed envelope, not a
+ * guess at which closing tag was "really" meant.
+ */
+function stripRoutingEnvelope(text: string): string | undefined {
+  const opener = text.match(ROUTING_MESSAGE_LEADING_OPENER_RE);
+  if (!opener) return undefined;
+  const contentStart = opener[0].length;
+  const closeIdx = text.indexOf(ROUTING_MESSAGE_CLOSER, contentStart);
+  if (closeIdx === -1) return undefined;
+  const rest = text.slice(closeIdx + ROUTING_MESSAGE_CLOSER.length);
+  if (!/^\s*$/.test(rest)) return undefined;
+  return text.slice(contentStart, closeIdx);
+}
+
+function normalizeToolMessageText(
+  text: string,
+  callerTool: 'send_message' | 'send_file' | 'edit_message',
+): { text: string } | { error: string } {
   // An inline example or fenced code block does not begin with an envelope,
   // so preserve it exactly. `<message>` without a routing attribute is also
   // ordinary XML, not a NanoClaw routing instruction.
-  if (!/^\s*<message\s+to="[^"]*"\s*>/.test(text)) return { text };
+  if (!ROUTING_MESSAGE_LEADING_OPENER_RE.test(text)) return { text };
 
   const openers = [...text.matchAll(ROUTING_MESSAGE_OPENER_RE)];
   if (openers.length !== 1) {
     const destinations = [...new Set(openers.map((opener) => opener[1]))];
     const detail = destinations.length > 1 ? ` to multiple destinations (${destinations.join(', ')})` : '';
     return {
-      error:
-        `text contains multiple routing message envelopes${detail}. ` +
-        'Use one send_message or edit_message call per message.',
+      error: `text contains multiple routing message envelopes${detail}. ` + `Use one ${callerTool} call per message.`,
     };
   }
 
-  const envelope = text.match(ROUTING_MESSAGE_ENVELOPE_RE);
-  if (!envelope) {
+  const envelope = stripRoutingEnvelope(text);
+  if (envelope === undefined) {
     return {
       error:
         'text starts with a routing message envelope but is not one complete `<message to="...">...</message>` block.',
@@ -123,7 +165,7 @@ function normalizeToolMessageText(text: string): { text: string } | { error: str
 
   // The envelope's `to` is deliberately ignored: the MCP tool's `to` (or its
   // current-conversation default) is the only routing authority on this path.
-  return { text: envelope[1] };
+  return { text: envelope };
 }
 
 /**
@@ -206,7 +248,7 @@ export const sendMessage: McpToolDefinition = {
   async handler(args) {
     const rawText = args.text as string;
     if (!rawText) return err('text is required');
-    const normalized = normalizeToolMessageText(rawText);
+    const normalized = normalizeToolMessageText(rawText, 'send_message');
     if ('error' in normalized) return err(normalized.error);
     const text = normalized.text;
     if (!text) return err('text is required');
@@ -257,7 +299,7 @@ export const sendFile: McpToolDefinition = {
     // `<message to="...">` text. Rejects before anything is staged.
     let caption = '';
     if (args.text) {
-      const normalized = normalizeToolMessageText(args.text as string);
+      const normalized = normalizeToolMessageText(args.text as string, 'send_file');
       if ('error' in normalized) return err(normalized.error);
       caption = normalized.text;
     }
@@ -368,7 +410,7 @@ export const editMessage: McpToolDefinition = {
     const seq = Number(args.messageId);
     const rawText = args.text as string;
     if (!seq || !rawText) return err('messageId and text are required');
-    const normalized = normalizeToolMessageText(rawText);
+    const normalized = normalizeToolMessageText(rawText, 'edit_message');
     if ('error' in normalized) return err(normalized.error);
     const text = normalized.text;
     if (!text) return err('messageId and text are required');

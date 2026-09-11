@@ -80,9 +80,12 @@ export interface InboundEvent {
   threadId: string | null;
   /**
    * Platform-confirmed "this is a DM, not a group/channel" signal. When
-   * the adapter sets false, the router marks auto-created messaging_groups
-   * as is_group=1 (vs the legacy is_group=0 default). undefined means the
-   * adapter didn't tell us — router defaults to is_group=0.
+   * the adapter sets false (or message.isGroup is set true), the router
+   * marks auto-created messaging_groups as is_group=1. undefined AND
+   * message.isGroup also undefined means the adapter told us nothing —
+   * router now defaults to is_group=1 (group/mention-safe) rather than
+   * DM-style, since treating an actual group chat as a DM means
+   * always-engage on every message (router.ts:599,608).
    */
   isDM?: boolean;
   /** Internal replay marker identifying platform-history catch-up. */
@@ -128,10 +131,12 @@ export interface InboundMessage {
   /**
    * Platform-confirmed "this is a DM, not a group/channel" signal.
    * Adapters set false explicitly for group/channel messages so the router's
-   * auto-created messaging_groups get is_group=1 (vs the legacy is_group=0
-   * default). Chat SDK bridge sets this from the SDK's onDirectMessage vs
-   * channel handlers. undefined means the adapter didn't tell us → router
-   * defaults to is_group=0 for backwards compatibility.
+   * auto-created messaging_groups get is_group=1. Chat SDK bridge sets this
+   * from the SDK's onDirectMessage vs channel handlers. undefined (with
+   * isGroup also undefined) means the adapter didn't tell us → router
+   * defaults to is_group=1 (group/mention-safe): an adapter that never
+   * reports either field and turns out to be a real group chat must not
+   * get always-engage treatment (router.ts:599,608).
    */
   isDM?: boolean;
   /** Inverse of isDM. Kept alongside for upstream code paths that key off isGroup. */

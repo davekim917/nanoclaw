@@ -6,6 +6,12 @@ node_modules/
 # Build output
 dist/
 
+# Coverage output (host: vitest --coverage; container: bun test --coverage) — the
+# risk-coverage ratchet reads these, and commits only its baseline
+# (coverage-risk-baseline.json), never the raw report.
+coverage/
+container/agent-runner/coverage/
+
 # Local data & auth
 store/
 # data/* (not data/) so the !data/systemd/ and !data/logrotate/ exceptions
