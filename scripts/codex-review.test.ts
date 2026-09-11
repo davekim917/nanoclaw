@@ -806,6 +806,29 @@ describe('codex-review risk-scoped review requests', () => {
     expect(merge.stdout).toContain(`merge=allowed head=${HEAD} mode=risk-scoped verdict=skip ci=green`);
   });
 
+  it.each([
+    ['labeled once', [labelEvent('labeled', 'risk:high', LABELER)]],
+    [
+      'labeled again after the labeler took it off',
+      [
+        labelEvent('labeled', 'risk:high', LABELER),
+        labelEvent('unlabeled', 'risk:high', LABELER),
+        labelEvent('labeled', 'risk:high', LABELER),
+      ],
+    ],
+  ])('fails closed to review when risk:high, %s, is gone with no unlabeled event', (_name, events) => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: [], events: [events] });
+
+    const scope = runHelper(root, ['scope']);
+    const out = JSON.parse(scope.stdout) as { verdict: string; reason: string };
+    expect(out.verdict).toBe('review');
+    expect(out.reason).toContain('risk:high is gone with no unlabeled event (the label was deleted or renamed)');
+
+    const merge = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(merge.status).toBe(24);
+  });
+
   it('fails closed to review when the label events cannot be read', () => {
     const root = tempRoot();
     scopeFixture(root, { labels: [], events: null });
@@ -948,6 +971,14 @@ describe('codex-review risk-scoped review requests', () => {
     ['FIX: a typo', 'See Fixes-PR: #12 above.'],
     ['fix: split value', 'Fixes-PR:\n#12'],
     ['fix: glued value', 'Fixes-PR: #12abc'],
+    ['fix: fenced example', 'Write it like this:\n\n```\nFixes-PR: #12\n```'],
+    ['fix: unclosed fence', 'Example:\n```\nFixes-PR: #12'],
+    ['fix: template comment', '<!-- Fixes-PR: none -->'],
+    ['fix: tilde fence', 'Like this:\n~~~\nFixes-PR: #12\n~~~'],
+    ['fix: four-backtick fence around a three-backtick line', '````md\n```\nFixes-PR: #12\n```\n````'],
+    ['fix: indented fence', 'Like this:\n   ```\nFixes-PR: #12\n   ```'],
+    ['fix: fence with CRLF endings', 'Like this:\r\n```\r\nFixes-PR: #12\r\n```\r\n'],
+    ['fix: a tilde line does not close a backtick fence', '```\n~~~\nFixes-PR: #12\n~~~'],
   ])('refuses the fix PR %j with body %j, which names no Fixes-PR', (title, body) => {
     const root = tempRoot();
     scopeFixture(root, { labels: [], title, body });
@@ -961,6 +992,9 @@ describe('codex-review risk-scoped review requests', () => {
     ['fix: close the gate', 'Summary.\n\nFixes-PR: #608'],
     ['fix(runner): a new bug', 'fixes-pr: none'],
     ['fix: windows line endings', 'Summary.\r\n\r\nFixes-PR:#12\r\nMore.'],
+    ['fix: a real line after an example', '```\nFixes-PR: #1\n```\n\nFixes-PR: #608'],
+    ['fix: a real line after a tilde fence', '~~~\nFixes-PR: #1\n~~~\nFixes-PR: #608'],
+    ['fix: a real line after a CRLF fence', '```\r\nx\r\n```\r\nFixes-PR: none\r\n'],
     ['feat: add a gate', ''],
     ['docs: fix a typo', ''],
   ])('allows %j with body %j', (title, body) => {

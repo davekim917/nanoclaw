@@ -34,10 +34,14 @@ another capable agent or provider. Implementation reasoning cannot approve its
 own change. A substitute review still triages findings under this policy and
 does not relax required CI, holds, or merge authorization.
 
-On a `risk:high` PR the substitute is an Opus-tier or Fable-tier Claude
-model, or a different model family such as Codex/GPT, and the receipt's
-`--reviewer` names the model. Sonnet-tier and Haiku-tier reviewers give
-advisory reviews only, and only on non-risk PRs.
+The substitute, like every review (a delta check after a rebase or ratchet
+regeneration, adversarial verification, a gap analysis), is an Opus-tier or
+Fable-tier Claude model or a different model family such as Codex/GPT, and the
+receipt's `--reviewer` names the model. A Sonnet-tier or Haiku-tier model never
+reviews, and neither does a subagent that runs on one. Nobody has to be
+free for this: the author may start that reviewer as a fresh process
+(`codex exec -m <model> -c model_reasoning_effort=high`, or
+`claude -p --model opus --effort high`) and hand it the inputs above.
 
 Record a durable review receipt tied to the exact final SHA: reviewer and
 runtime, complete-diff and relevant-file scope, outcome, and every finding with
@@ -51,7 +55,8 @@ When the PR carries `risk:*` dimension labels, they scope the reviewer's
 brief.
 
 Every `fix` PR carries `Fixes-PR: #<n>`, naming the PR it fixes, or
-`Fixes-PR: none` in its body; `codex-review.sh merge-check` enforces it.
+`Fixes-PR: none` in its body; `codex-review.sh merge-check` enforces it. A
+line inside a code fence or an HTML comment doesn't count.
 
 ## The test is blocking, not correctness
 
