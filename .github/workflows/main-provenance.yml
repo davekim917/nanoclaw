@@ -20,8 +20,9 @@
 #   push-triggered job never runs for: a skip-CI push, or one that landed during a
 #   GitHub Actions outage.
 # Neither job runs PR code. `provenance` checks out only the commit its push already
-# landed; `sweep` checks out main's default ref just far enough to have its script — it
-# queries history through the Activity API, not `git log`.
+# landed; `sweep` checks out whatever ref triggered it — main on the daily schedule,
+# or another ref if `workflow_dispatch` is run from one — just far enough to have its
+# own script. It queries history through the Activity API, not `git log`.
 # A force-push fails `provenance` outright, since it can rewind main onto an old merge
 # commit; `sweep`'s Activity API window covers force-pushes too (`force_push` is one of
 # the activity types it treats as an offender).
@@ -30,11 +31,14 @@
 # rebase and merge": "GitHub didn't truly create this commit, and can't therefore sign
 # it"). Rebase merging is still enabled in this repo's settings and has been used once —
 # PR #74, merged 2026-05-01, merge_commit_sha b2b3b90ee0, which has a single parent, is
-# unsigned, and is committed by the user account rather than `web-flow`. A rebase merge
-# fails the GitHub-made check in check-provenance-commit.sh (and `sweep`'s Activity-API
-# check, which records a rebase merge as a plain `push`, never `pr_merge`) — that's
-# intended, not a bug to route around. Disabling rebase merging is the operator's call,
-# not this workflow's; an earlier attempt to do so was blocked.
+# unsigned, and is committed by the user account rather than `web-flow`. That fails
+# `provenance`'s GitHub-made check in check-provenance-commit.sh — intended, not a bug
+# to route around. It does NOT fail `sweep`: the Activity API records a rebase merge as
+# `pr_merge` (confirmed live for #74), the same as any other GitHub-performed merge, so
+# `sweep` correctly treats it as a genuine PR merge — this repo's two checks disagree on
+# purpose, one checking provenance (came from a PR) and the other checking signature
+# (GitHub made the commit). Disabling rebase merging is the operator's call, not this
+# workflow's; an earlier attempt to do so was blocked.
 name: Main provenance
 
 on:

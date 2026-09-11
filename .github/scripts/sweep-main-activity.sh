@@ -20,25 +20,44 @@
 # item's `timestamp`. `gh api --paginate` follows the Link-header cursor and merges every
 # page's JSON array into one; this repo's busiest 50h stretch on main had 292 events
 # (206 in one day) — well over one per_page=100 page, so pagination is load-bearing, not
-# an optimization. `set -euo pipefail` plus the `items=$(...)` assignment already fails
+# an optimization. `set -euo pipefail` plus the `$(...)` assignments below already fail
 # the job if any page request errors: a simple command's exit status propagates through
 # `set -e` even inside a command substitution assigned to a variable.
 #
 # A GitHub-made merge into main is recorded as activity_type `pr_merge` or, if this repo
 # ever turns on a merge queue, `merge_queue_merge` — the same provenance guarantee a
 # normal PR merge gives, so it's accepted too even though this repo does not use one
-# today. Every other activity_type this repo's full history has ever produced on main —
-# `push` and `force_push` (`branch_creation`/`branch_deletion` are still possible in
-# principle, never observed) — reached main without a merged PR and fails the sweep.
-# That includes a rebase merge: GitHub records one as `push`, not `pr_merge`, since it
-# doesn't create a GitHub-signed commit (see main-provenance.yml's header comment on
-# #74) — a rebase merge is meant to fail this sweep, same as check-provenance-commit.sh.
+# today. `pr_merge` covers every way GitHub itself performs a merge, INCLUDING a rebase
+# merge: this repo's one rebase merge (PR #74, see main-provenance.yml's header comment)
+# shows up in the live feed as `pr_merge`, not `push` — confirmed via `gh api`, not
+# guessed. So this sweep passes a legitimate rebase merge; only check-provenance-commit.sh's
+# signed-tip check (which a rebase merge fails, since GitHub doesn't sign one) catches
+# it. That split is fine: a rebase merge IS a genuine PR merge, just one this repo's
+# separate signed-tip rule happens not to accept. Every other activity_type this repo's
+# full history has ever produced on main — `push` and `force_push`
+# (`branch_creation`/`branch_deletion` are still possible in principle, never observed)
+# — reached main without a merged PR and fails the sweep.
 #
 # POLICY_START is a floor under the WINDOW_HOURS cutoff: six known, already-accepted
 # direct pushes to main (2026-09-09T17:11Z through 2026-09-10T22:04Z, predating this
 # check) would otherwise turn main red for days once WINDOW_HOURS next covers them. The
 # floor is a timestamp after the last of those pushes; every push after it is new
 # history this check is meant to catch.
+#
+# Freshness guard: the Activity API can lag a live push. Scanning a feed that hasn't
+# caught up yet would either miss a real offender (worse than useless) or, in the
+# degenerate case of an empty response, print "checked 0" and pass green for the wrong
+# reason. Before scanning, this reads main's ACTUAL tip from the API — never
+# `git rev-parse HEAD` or `${{ github.sha }}`, because a workflow_dispatch run from a
+# non-main ref checks out that ref, and either of those would compare against the wrong
+# commit — and requires it to appear somewhere in the full WEEK query (not the
+# WINDOW_HOURS/POLICY_START-floored slice below: a quiet week with zero merges must
+# still prove the feed reflects that, not silently pass because nothing matched a
+# narrower window). The tip is read BEFORE the feed, so a merge landing mid-check can
+# only make the feed more complete, never less. One retry after 60s absorbs ordinary
+# lag; if the tip still isn't there, this fails rather than scan a feed that might be
+# silently missing recent history — including the case of a genuinely empty feed, which
+# is worth a human's attention, not a quiet pass.
 #
 # Usage: sweep-main-activity.sh [window_hours=50]
 # Env: GH_TOKEN, REPO (both already required by `gh api` in the caller).
@@ -52,13 +71,38 @@ if [ "$window_hours" -gt 168 ]; then
   exit 1
 fi
 
+fetch_main_tip() {
+  gh api "repos/$REPO/commits/main" --jq '.sha'
+}
+
+fetch_activity_week() {
+  gh api --paginate "repos/$REPO/activity?ref=refs/heads/main&time_period=week&per_page=100"
+}
+
+tip_in_feed() {
+  jq -e --arg sha "$1" 'any(.[]; .after == $sha)' <<<"$2" >/dev/null
+}
+
+tip_sha=$(fetch_main_tip)
+items=$(fetch_activity_week)
+
+if ! tip_in_feed "$tip_sha" "$items"; then
+  echo "main's tip ($tip_sha) is not yet in the Activity API's week feed; waiting 60s for lag and re-checking once"
+  sleep 60
+  tip_sha=$(fetch_main_tip)
+  items=$(fetch_activity_week)
+  if ! tip_in_feed "$tip_sha" "$items"; then
+    echo "::error::main's tip ($tip_sha) never appeared in the Activity API feed after a 60s retry; the feed may be stale, lagging, or genuinely empty (no push to main this week) — failing rather than scan a feed that might be missing recent history" >&2
+    exit 1
+  fi
+fi
+
 window_cutoff_epoch=$(date -u -d "${window_hours} hours ago" +%s)
 policy_start_epoch=$(date -u -d "$policy_start" +%s)
 cutoff_epoch=$window_cutoff_epoch
 [ "$policy_start_epoch" -gt "$cutoff_epoch" ] && cutoff_epoch=$policy_start_epoch
 cutoff_iso=$(date -u -d "@$cutoff_epoch" -Iseconds)
 
-items=$(gh api --paginate "repos/$REPO/activity?ref=refs/heads/main&time_period=week&per_page=100")
 in_window=$(jq --argjson cutoff "$cutoff_epoch" \
   '[.[] | select((.timestamp | fromdateiso8601) >= $cutoff)]' <<<"$items")
 checked=$(jq 'length' <<<"$in_window")
