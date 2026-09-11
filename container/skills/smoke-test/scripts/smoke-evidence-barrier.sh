@@ -156,6 +156,106 @@ pass_evidence_problem() {
   done < <(jq -r '.evidence[]' "$marker_path")
 }
 
+# A lane marker declaring one or more CONFIRMED findings (`.confirmedFindings`,
+# an array of finding ids) must account for each finding's reproduction clip —
+# silence about a promised clip is indistinguishable from "nobody recorded it
+# and nobody noticed", the same failure mode pass-marker evidence above
+# already guards against, mirrored here for clips. `.confirmedFindings` is
+# optional and backward compatible, same convention as `.lanes[]` above: a
+# marker without it is unaffected.
+#
+# Per finding id, the marker's `.evidence` array must carry exactly one of:
+#   - "clips/<id>.mp4"                  a real, durable, nonempty file under
+#                                        the run root — same file-path safety
+#                                        checks as pass_evidence_problem above
+#                                        (no absolute/traversal path, no
+#                                        symlink escape, must be a regular
+#                                        file).
+#   - "clip-skipped: <id>: <reason>"    a stated, non-empty reason. The
+#                                        `agent-browser` skill's reproduction-
+#                                        clips convention treats a failed
+#                                        recording (no ffmpeg, no browser
+#                                        lease) as normal and non-blocking —
+#                                        "a failed recording never blocks".
+#                                        This is how that stays true while an
+#                                        UNSTATED silence still fails.
+# The finding id is embedded in the skip line (not a bare "clip-skipped:
+# <reason>") because one marker can carry several confirmed findings and an
+# unqualified reason would not say which one it excuses.
+finding_clip_problem() {
+  local marker_path="$1" finding_id clip_entry skip_prefix skip_reason
+  local run_root candidate resolved
+
+  if ! jq -e 'has("confirmedFindings")' "$marker_path" >/dev/null 2>&1; then
+    return
+  fi
+  if ! jq -e '
+    (.confirmedFindings | type == "array") and
+    all(.confirmedFindings[]; type == "string" and length > 0)
+  ' "$marker_path" >/dev/null 2>&1; then
+    printf 'confirmedFindings must be an array of non-empty finding ids'
+    return
+  fi
+
+  run_root="$(realpath -e "$RUN_DIR" 2>/dev/null || true)"
+  if [ -z "$run_root" ]; then
+    printf 'run root cannot be resolved while validating finding clip evidence'
+    return
+  fi
+
+  while IFS= read -r finding_id; do
+    case "$finding_id" in
+      */*|.|..)
+        printf 'confirmed finding id is not a safe path segment: %s' "$finding_id"
+        return
+        ;;
+    esac
+
+    clip_entry="clips/$finding_id.mp4"
+    skip_prefix="clip-skipped: $finding_id: "
+
+    # A well-formed skip line satisfies this finding on its own — no file to
+    # check, matching "a failed recording never blocks".
+    skip_reason="$(jq -r --arg pfx "$skip_prefix" '
+      [(.evidence // [])[] | select(startswith($pfx)) | ltrimstr($pfx) | select(length > 0)][0] // empty
+    ' "$marker_path" 2>/dev/null)"
+    if [ -n "$skip_reason" ]; then
+      continue
+    fi
+
+    if ! jq -e --arg e "$clip_entry" '(.evidence // []) | index($e) != null' \
+      "$marker_path" >/dev/null 2>&1; then
+      printf 'confirmed finding %s has no clip evidence: expected "%s" or a "%s<reason>" entry in evidence' \
+        "$finding_id" "$clip_entry" "$skip_prefix"
+      return
+    fi
+
+    candidate="$RUN_DIR/$clip_entry"
+    if [ ! -e "$candidate" ]; then
+      printf 'confirmed finding %s clip is missing: %s' "$finding_id" "$clip_entry"
+      return
+    fi
+    resolved="$(realpath -e "$candidate" 2>/dev/null || true)"
+    case "$resolved" in
+      "$run_root"/*) ;;
+      *)
+        printf 'confirmed finding %s clip path resolves outside the run root: %s' \
+          "$finding_id" "$clip_entry"
+        return
+        ;;
+    esac
+    if [ -L "$candidate" ] || [ ! -f "$candidate" ]; then
+      printf 'confirmed finding %s clip path is not a regular file in the run: %s' \
+        "$finding_id" "$clip_entry"
+      return
+    fi
+    if [ ! -s "$candidate" ]; then
+      printf 'confirmed finding %s clip is empty: %s' "$finding_id" "$clip_entry"
+      return
+    fi
+  done < <(jq -r '.confirmedFindings[]?' "$marker_path")
+}
+
 # `disposition` gates the challenger's THREAD POST, not its file write.
 #
 # Independence was ordered around files, but the disposition is posted in the
@@ -223,9 +323,15 @@ while IFS= read -r marker; do
     (.completedAt | type == "string" and length > 0)
   ' "$marker_path" >/dev/null 2>&1; then
     marker_valid=false
-  elif [ "$(jq -r '.status' "$marker_path" 2>/dev/null)" = pass ]; then
-    evidence_problem="$(pass_evidence_problem "$marker_path")"
-    [ -z "$evidence_problem" ] || marker_valid=false
+  else
+    if [ "$(jq -r '.status' "$marker_path" 2>/dev/null)" = pass ]; then
+      evidence_problem="$(pass_evidence_problem "$marker_path")"
+      [ -z "$evidence_problem" ] || marker_valid=false
+    fi
+    if [ "$marker_valid" = true ]; then
+      evidence_problem="$(finding_clip_problem "$marker_path")"
+      [ -z "$evidence_problem" ] || marker_valid=false
+    fi
   fi
 
   if [ "$marker_valid" != true ]; then
