@@ -1240,10 +1240,16 @@ describe('#667/#668 — seeding a fresh session from a same-agent, same-scope si
     // The candidate is built with agentGroupId 'ax' but workgroupMemberIds
     // ['ay', 'az'] — 'ax' is not even a member of its own declared scope.
     // Production never does this (the real caller's own agent is always a
-    // member of its resolved workgroup, container-runner.ts's W3 check), but
-    // buildArchiveProjection places no such requirement, and this is exactly
-    // the synthetic case needed to make the two watermarks coincide while the
-    // agent stays fixed at 'ax' on both sides.
+    // member of its resolved workgroup, container-runner.ts's W3 check), and
+    // it isn't NEEDED to make the watermarks coincide — it's chosen only
+    // because it's the simplest fixture that does. A candidate where 'ax' IS
+    // a member of both scopes coincides too: rows for ay, az and ax give
+    // (count=2, maxRowid=3) for BOTH {ax,ay} and {ax,az} equally (each pulls
+    // in az's row plus exactly one more), and that version leaks under the
+    // same deleted comparison. The scope comparison is what production
+    // relies on here, not just this fixture: an ordinary membership change
+    // (an agent added to or dropped from a workgroup) is exactly the kind of
+    // event that can make two real scopes' watermarks coincide by accident.
     const src = makeEmptyArchiveSource('seed-scope-coincidence');
     archiveInto(src, {
       id: 'r-ax',
@@ -1351,32 +1357,76 @@ describe('#667/#668 — seeding a fresh session from a same-agent, same-scope si
     expect(allRows(freshDst)).toEqual(allRows(expected));
   });
 
-  it('never seeds through a symlinked candidate file, even with a matching stamp', async () => {
-    // #668 round 3 (F3): a candidate must be lstat'd, not stat'd — a symlink
-    // planted at the stamp's dstPath must never be followed and trusted.
-    const src = makeTwoWorkgroupSource('seed-symlink-candidate');
+  it('never follows a symlink swapped in for a legitimately-stamped candidate, even with no other candidate to fall back on', async () => {
+    // #668 round 4 (F7): the round-3 version of this test pointed the link at
+    // the SAME valid, same-scope file, leaving that file itself in place as a
+    // second, equally-valid candidate — so nothing could leak (both eligible
+    // candidates were correct), and the only observable outcome was which of
+    // two equal-maxRowid candidates readdir listed first, which is
+    // nondeterministic. That version went red only 3 of 8 runs when `lstat`
+    // was reverted to `stat` — a coin flip, not a proof.
+    //
+    // This version leaves exactly ONE matching candidate for the fresh
+    // session's scope: a stamp that was legitimately built at that scope
+    // (`s1Dst`), whose underlying FILE is then swapped for a symlink to a
+    // DIFFERENT projection (`wDst`) — built for the SAME agent, but at a
+    // WIDER scope that leaks one extra, out-of-scope row. `wDst`'s own stamp
+    // carries the wider scope, so it is never itself a seed candidate for
+    // the narrower scope under test — the only way this test can pass by
+    // accident is if the guard actually blocks the symlink.
+    const src = makeEmptyArchiveSource('seed-symlink-swap');
+    archiveInto(src, {
+      id: 'r-ax',
+      agent_group_id: 'ax',
+      role: 'user',
+      sender_id: 'u-ax',
+      text: 'ax own message',
+      sent_at: '2026-01-01T10:00:00Z',
+    });
+    archiveInto(src, {
+      id: 'r-ay',
+      agent_group_id: 'ay',
+      role: 'user',
+      sender_id: 'u-ay',
+      text: 'ay sibling message',
+      sent_at: '2026-01-01T10:01:00Z',
+    });
+    archiveInto(src, {
+      id: 'r-az',
+      agent_group_id: 'az',
+      role: 'user',
+      sender_id: 'u-az',
+      text: 'PLANTED FOREIGN-SCOPE ROW — MUST NOT LEAK',
+      sent_at: '2026-01-01T10:02:00Z',
+    });
     useFakeWorker();
 
-    const realSiblingDst = tmpPath('seed-symlink-candidate-real');
-    await ensureArchiveProjection(src, realSiblingDst, 'ag-one-a', wgOne);
+    const scopeS = ['ax', 'ay']; // the fresh session's real, narrow scope
+    const scopeWide = ['ax', 'ay', 'az']; // a wider scope of the SAME agent
 
-    // A second, symlinked "session dir" whose stamp claims the real file's
-    // identity but whose dstPath is a symlink pointing AT that real file.
-    const linkedSiblingDst = tmpPath('seed-symlink-candidate-link');
-    fs.symlinkSync(realSiblingDst, linkedSiblingDst);
-    const linkedStamp = computeArchiveProjectionStamp(src, 'ag-one-a', wgOne);
-    fs.writeFileSync(
-      archiveProjectionStampPath(linkedSiblingDst),
-      JSON.stringify({ ...linkedStamp, dstPath: path.resolve(linkedSiblingDst) }),
-    );
+    // W: a real, valid projection at the WIDER scope — includes az's row.
+    const wDst = tmpPath('seed-symlink-swap-wide');
+    await ensureArchiveProjection(src, wDst, 'ax', scopeWide);
 
-    const freshDst = tmpPath('seed-symlink-candidate-fresh');
-    const result = await ensureArchiveProjection(src, freshDst, 'ag-one-a', wgOne);
-    // The REAL sibling is still a valid, non-symlinked candidate, so this
-    // still seeds — just never from the symlinked one specifically. Assert
-    // the seed source is the real file, never the link.
-    expect(result.mode).toBe('seeded');
-    expect(result.seededFrom).toBe(path.relative(TEST_DATA_DIR, realSiblingDst));
+    // S1: a real, valid projection at the NARROW scope — the fresh session's
+    // own scope. This is what makes the stamp legitimate.
+    const s1Dst = tmpPath('seed-symlink-swap-narrow');
+    await ensureArchiveProjection(src, s1Dst, 'ax', scopeS);
+
+    // Swap S1's FILE for a symlink to W, leaving S1's STAMP untouched — the
+    // stamp still (truthfully, as of when it was written) claims scope S;
+    // only the file underneath it changed.
+    fs.unlinkSync(s1Dst);
+    fs.symlinkSync(wDst, s1Dst);
+
+    const freshDst = tmpPath('seed-symlink-swap-fresh');
+    const result = await ensureArchiveProjection(src, freshDst, 'ax', scopeS);
+    expect(result.mode).toBe('rebuilt');
+    expect(result.seededFrom).toBeNull();
+    const texts = allRows(freshDst).map((r) => r.text);
+    expect(texts).toContain('ax own message');
+    expect(texts).toContain('ay sibling message');
+    expect(texts).not.toContain('PLANTED FOREIGN-SCOPE ROW — MUST NOT LEAK');
   });
 
   it('never writes a seed copy through a dangling symlink at the fresh dstPath', async () => {

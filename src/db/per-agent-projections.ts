@@ -555,15 +555,28 @@ function findArchiveSeedCandidate(stamp: ArchiveProjectionStamp, excludeDstPath:
     if (!sameProjectionIdentity(parsed, stamp)) continue;
 
     try {
-      // `lstat`, not `stat`: a symlink at this path must never be followed
-      // and trusted as the candidate's own file (#668 F3) — require a plain,
-      // non-empty regular file. `isFile()` under `lstat` is already false for
-      // a symlink (lstat reports the link itself, never its target), but the
-      // explicit `isSymbolicLink()` check says so directly rather than by
-      // implication. `size === 0` also covers a partial file left by a build
-      // that died after the schema but before any row.
+      // `lstat`, not `stat`: reports the path itself, never a target it may
+      // point at, so `isFile()` is already false for a symlink — this is the
+      // ONLY barrier against a symlinked candidate (#668 F7), not a
+      // redundant check alongside some other one. A stamp can legitimately
+      // describe a real, same-scope file that a later write replaced with a
+      // link to a DIFFERENT (wider-scope) projection of the same agent;
+      // nothing else here would catch that.
+      //
+      // `size === 0`, by contrast, is a cheap short-circuit, not a
+      // correctness boundary: a missing or empty candidate is ALSO caught by
+      // `seedArchiveProjectionFrom`'s own fail-closed catch, whether via
+      // `copyFileSync`'s `ENOENT` or (for a file that exists but is empty —
+      // SQLite opens a 0-byte file fine, but it has no schema) the "no such
+      // table" the post-copy query throws. Skipping here just avoids
+      // attempting a copy and a query that would fail anyway. It does not,
+      // in particular, catch a build that died mid-write: the stamp is
+      // always removed before any write starts (`removeArchiveProjectionStamp`,
+      // before both the append and the rebuild paths below) and rewritten
+      // only after it succeeds, so a session with no complete file has no
+      // stamp to be found by at all.
       const st = fs.lstatSync(parsed.dstPath);
-      if (!st.isFile() || st.isSymbolicLink() || st.size === 0) continue;
+      if (!st.isFile() || st.size === 0) continue;
     } catch {
       continue; // Stamp outlived its projection (session cleaned up) — not a candidate.
     }
