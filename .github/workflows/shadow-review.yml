@@ -65,20 +65,27 @@ name: Shadow review
 #   2. `--setting-sources user` in `claude_args`: drops the `'project'` source
 #      (`.claude/settings.json`, hooks) and CLAUDE.md — the SDK's own doc
 #      comment is explicit: "Must include 'project' to load CLAUDE.md files"
-#      (`@anthropic-ai/claude-agent-sdk` `sdk.d.ts:2076-2085`).
-#   3. `--strict-mcp-config` in `claude_args`: `.mcp.json` loading is a SEPARATE
-#      switch `settingSources` does not touch (`sdk.d.ts:2127-2134`: without it,
-#      the CLI honors "project `.mcp.json`, user settings, plugins, and on-disk
-#      agent frontmatter" regardless of `settingSources`).
+#      (`@anthropic-ai/claude-agent-sdk` `sdk.d.ts:2076-2085`). Empirically
+#      verified this flag ALSO suppresses `.mcp.json` at CLI 2.1.268 (the exact
+#      version this action installs, `run.ts:80`): a scratch `.mcp.json`
+#      server whose `command` touched a marker file was spawned (marker
+#      created) with default `settingSources`, and never spawned (no marker,
+#      reproduced twice) with `--setting-sources user` alone, both runs
+#      otherwise identical (same `.mcp.json`, same unauthenticated `HOME`).
+#   3. `--strict-mcp-config` in `claude_args` anyway, belt-and-braces: its own
+#      doc names `.mcp.json` as a config source it independently blocks
+#      (`sdk.d.ts:2127-2134`), and it costs nothing to keep both.
 #   With all three, whatever ends up on disk — restored-from-base or, if that
 #   somehow failed, still the PR's own — is inert to the model regardless.
-#   (`.claude/**`, `.mcp.json`, `.claude.json`, `.gitmodules`, `CLAUDE.local.md`,
-#   `.ripgreprc` are also on `risk:high`/`risk:gates` in `.github/labeler.yml` —
-#   this workflow neutralizes them for ITS OWN reviewer via the three layers
-#   above, but nothing protects a PR that reaches a checkout-based agent session
-#   elsewhere in this fleet. Plain CLAUDE.md is deliberately left off that list:
-#   it changes often enough that flagging every edit has a real review cost, and
-#   layer 2 above fully covers it for this specific reviewer.)
+#   (`.claude/**`, `.mcp.json`, `.claude.json`, `.gitmodules`, `.ripgreprc` are
+#   also on `risk:high`/`risk:gates` in `.github/labeler.yml` — this workflow
+#   neutralizes them for ITS OWN reviewer via the layers above, but nothing
+#   protects a PR that reaches a checkout-based agent session elsewhere in this
+#   fleet. CLAUDE.local.md is on `restore-config.ts`'s `SENSITIVE_PATHS` too but
+#   NOT on the labeler list: `.gitignore:29` (`**/CLAUDE.local.md`) means it can
+#   never appear in a PR diff, so that rule would never fire. Plain CLAUDE.md is
+#   also not on the list: it changes often enough that flagging every edit has a
+#   real review cost, and layer 2 above fully covers it for this reviewer.)
 #
 #   `gh pr diff` itself has a documented ceiling: GitHub's diff API refuses a
 #   sufficiently large diff (HTTP 406). A PR that large gets no shadow review —
