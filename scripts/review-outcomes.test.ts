@@ -38,6 +38,7 @@ function pr(overrides: Partial<PullRequestData> & { number: number }): PullReque
     mergedAt: '2026-09-01T00:00:00Z',
     files: [],
     labels: [],
+    baseRefName: 'main',
     ...overrides,
   };
 }
@@ -586,6 +587,19 @@ describe('computeShadowCoverage', () => {
     const coverage = computeShadowCoverage(prs, [], [], [], sinceIso);
     expect(coverage.eligible).toBe(1);
     expect(coverage.notYetRunPRs).toEqual([4]);
+  });
+
+  it('excludes a PR merged into a branch other than main from the denominator', () => {
+    // shadow-review.yml's report job only ever runs for github.event.pull_request.base.ref
+    // == 'main' (shadow-review.yml:149) — a PR merged into some other branch (a long-lived
+    // feature branch, say) was never a candidate, so it must not inflate the denominator.
+    const prs = [
+      pr({ number: 5, mergedAt: '2026-09-12T00:00:00Z', labels: [], baseRefName: 'release' }),
+      pr({ number: 6, mergedAt: '2026-09-12T00:00:00Z', labels: [], baseRefName: 'main' }),
+    ];
+    const coverage = computeShadowCoverage(prs, [], [], [], sinceIso);
+    expect(coverage.eligible).toBe(1);
+    expect(coverage.notYetRunPRs).toEqual([6]);
   });
 
   it('partitions eligible PRs into reviewed, failed, and not-yet-run', () => {

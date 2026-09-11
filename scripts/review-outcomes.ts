@@ -102,10 +102,11 @@
  * labels (`risk:high` / `review:requested`), not a glob replay. `computeShadowCoverage`
  * answers a narrower, more literal question — "of the PRs the workflow should be picking
  * up since it went live, how many did it actually review?" — using the workflow's own
- * label-based selection rule (`isEligibleForShadowReview`, mirroring
- * `shadow-review.yml:147-151`) and a denominator scoped to PRs merged at or after PR
- * #660's merge time (`SHADOW_REVIEW_GO_LIVE_ISO`, when shadow review went live). Its one
- * caveat: eligibility is judged against a PR's CURRENT labels, which can drift from what
+ * selection rule (`shadow-review.yml:147-151`): base ref `main` (`baseRefName`,
+ * `SHADOW_REVIEW_BASE_REF`) and CURRENT labels excluding `risk:high`/`review:requested`
+ * (`isEligibleForShadowReview`), scoped to PRs merged at or after PR #660's merge time
+ * (`SHADOW_REVIEW_GO_LIVE_ISO`, when shadow review went live). Its one caveat: label
+ * eligibility is judged against a PR's CURRENT labels, which can drift from what
  * they were at merge time (a PR later relabeled `risk:high`, or `review:requested`
  * cleared after the fact) — see `LABEL_DRIFT_CAVEAT`.
  */
@@ -123,6 +124,7 @@ export interface PullRequestData {
   mergedAt: string; // ISO-8601 UTC
   files: string[];
   labels: string[]; // CURRENT labels, not a merge-time snapshot — see "Shadow coverage" below
+  baseRefName: string; // e.g. "main" — shadow-review.yml only selects PRs merged INTO main
 }
 
 export interface Options {
@@ -393,14 +395,20 @@ const RISK_HIGH_LABEL = 'risk:high';
 const REVIEW_REQUESTED_LABEL = 'review:requested';
 
 /**
- * Mirrors `shadow-review.yml`'s own selection rule (`report`'s job-level `if:`,
- * shadow-review.yml:147-151): eligible for shadow review when CURRENT labels include
- * neither `risk:high` nor `review:requested`. Used only by `computeShadowCoverage` — the
- * before/after bucket keeps the file-based glob replay (see file header).
+ * Mirrors the LABEL half of `shadow-review.yml`'s own selection rule (`report`'s
+ * job-level `if:`, shadow-review.yml:147-151): eligible for shadow review when CURRENT
+ * labels include neither `risk:high` nor `review:requested`. The base-ref half of that
+ * same `if:` (`github.event.pull_request.base.ref == 'main'`) is checked separately in
+ * `computeShadowCoverage` via `baseRefName`, since it isn't a label. Used only by
+ * `computeShadowCoverage` — the before/after bucket keeps the file-based glob replay
+ * (see file header).
  */
 export function isEligibleForShadowReview(labels: string[]): boolean {
   return !labels.includes(RISK_HIGH_LABEL) && !labels.includes(REVIEW_REQUESTED_LABEL);
 }
+
+/** `shadow-review.yml`'s `report` job only ever runs against PRs merged into this branch. */
+const SHADOW_REVIEW_BASE_REF = 'main';
 
 /**
  * When shadow review went live: PR #660's merge time (`gh pr view 660 --json mergedAt`
@@ -427,7 +435,8 @@ export interface ShadowCoverageResult {
 export const LABEL_DRIFT_CAVEAT =
   'eligibility is judged against CURRENT labels, not labels at merge time — a PR relabeled ' +
   'risk:high or review:requested after merging drops out of (or into) this denominator even ' +
-  'though the workflow selected (or skipped) it based on labels as they stood at merge time.';
+  'though the workflow selected (or skipped) it based on labels as they stood at merge time. ' +
+  '(base ref is not subject to this drift — a PR merges into one branch permanently.)';
 
 /**
  * Shadow coverage since go-live — see the file header's "Shadow coverage" section for
@@ -444,7 +453,10 @@ export function computeShadowCoverage(
 ): ShadowCoverageResult {
   const sinceMs = new Date(sinceIso).getTime();
   const eligiblePRs = allPRs.filter(
-    (pr) => new Date(pr.mergedAt).getTime() >= sinceMs && isEligibleForShadowReview(pr.labels),
+    (pr) =>
+      pr.baseRefName === SHADOW_REVIEW_BASE_REF &&
+      new Date(pr.mergedAt).getTime() >= sinceMs &&
+      isEligibleForShadowReview(pr.labels),
   );
   const shadowReviewIndex = buildShadowReviewIndex(shadowReviewIssues);
   const { reviewedPRs, failedPRs } = classifyShadowReview(
@@ -707,6 +719,7 @@ interface RawPr {
   changedFiles: number;
   files: RawPrFile[];
   labels?: RawPrLabel[];
+  baseRefName: string;
 }
 
 function fetchAllFilesViaRest(repo: string, prNumber: number): string[] {
@@ -734,7 +747,7 @@ export function fetchMergedPRs(repo: string, sinceIso: string): PullRequestData[
     '--search',
     `merged:>=${sinceIso}`,
     '--json',
-    'number,title,body,mergedAt,changedFiles,files,labels',
+    'number,title,body,mergedAt,changedFiles,files,labels,baseRefName',
     '--limit',
     '1000',
   ]);
@@ -746,6 +759,7 @@ export function fetchMergedPRs(repo: string, sinceIso: string): PullRequestData[
     mergedAt: pr.mergedAt,
     files: resolveFiles(repo, pr),
     labels: (pr.labels ?? []).map((label) => label.name),
+    baseRefName: pr.baseRefName,
   }));
 }
 
