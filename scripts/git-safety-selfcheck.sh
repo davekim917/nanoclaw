@@ -647,6 +647,14 @@ IDX_AFTER=$(stat -c %Y "$NCDIR/.git/index")
 new_fixture
 echo '{"a":2}' > "$G/foo/container.json"
 run_safety
+# This first run_safety's own success was never actually checked before
+# reading host-snapshot back — a transient failure here (seen once in CI,
+# never locally) surfaced two lines later as an opaque "fatal: : not a
+# valid SHA1" instead of the real reason. Diagnose loudly instead of
+# silently treating "no host-snapshot yet" as this test's own assertion.
+if [ "$RC" -ne 0 ] || ! git --git-dir="$REMOTE" rev-parse -q --verify host-snapshot >/dev/null 2>&1; then
+  bad "setup: first run_safety did not produce a host-snapshot to force-reset" "rc=$RC out=$OUT"
+fi
 FIRST_SNAP_TIP=$(git --git-dir="$REMOTE" rev-parse host-snapshot)
 FORCE_RESET_TIP=$(git --git-dir="$REMOTE" commit-tree "$FIRST_SNAP_TIP^{tree}" -m "operator force-reset target" 2>/dev/null)
 git --git-dir="$REMOTE" update-ref refs/heads/host-snapshot "$FORCE_RESET_TIP"
