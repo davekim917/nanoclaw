@@ -77,6 +77,12 @@ risk:high:
     - 'scripts/deploy.sh'
     - 'scripts/git-safety*.sh'
     - 'scripts/wiki-autopush.sh'
+    # The pre-push secret-scan hook agents' own containers run when pushing a wiki repo
+    # (and its selfcheck/installer) — a weakened pattern here silently lets a secret
+    # reach a real remote with no other gate on that path at all
+    - 'scripts/wiki-pre-push-hook*.sh'
+    - 'scripts/install-wiki-pre-push-hook.sh'
+    - 'scripts/lib/wiki-secret-patterns.sh'
     # The gates themselves: CI workflows, this file, the git hooks, the public-boundary
     # checkers and allowlist, and the PR review loop that IS the review gate. CI runs
     # only the portable boundary mode, so the strict identifier check runs only in the
@@ -168,6 +174,9 @@ risk:deploy:
     - 'scripts/deploy.sh'
     - 'scripts/git-safety*.sh'
     - 'scripts/wiki-autopush.sh'
+    - 'scripts/wiki-pre-push-hook*.sh'
+    - 'scripts/install-wiki-pre-push-hook.sh'
+    - 'scripts/lib/wiki-secret-patterns.sh'
 
 risk:gates:
 - changed-files:
