@@ -1716,8 +1716,12 @@ export async function processQuery(
   }
   // The latest result that answered none of the runner's prompts, held in case
   // the provider later settles a prompt whose echo was dropped: that result is
-  // the one that consumed it. See the `settled` branch.
-  let provisionalOutcome: FireOutcome | undefined;
+  // the one that consumed it. Keyed to the prompts of the fires still open when
+  // it arrived, and dropped only once those fires are answered or settled, so
+  // a result for some other prompt (a nudge the CLI ran straight after it)
+  // cannot clear it first. See the `settled` branch.
+  let provisional: { outcome: FireOutcome; promptIds: string[] } | undefined;
+  const openPromptIds = (): string[] => taskTurns.filter((t) => !t.outcome).flatMap((t) => t.promptIds ?? []);
   /**
    * Fill the task turns a result answered. With prompt ids (`answered`), that
    * is every open turn whose prompt the result consumed: a merged result
@@ -2243,10 +2247,11 @@ export async function processQuery(
         if (routing.taskRun && !answersRunnerPrompt) {
           log('Result answered no runner prompt (a turn the CLI started itself); not recorded as the task outcome');
         }
-        if (event.answeredPrompts !== undefined) {
-          provisionalOutcome =
-            routing.taskRun && !answersRunnerPrompt
-              ? { text: event.text ?? '', isError: event.isError === true, model: modelInForce }
+        if (routing.taskRun && event.answeredPrompts !== undefined && !answersRunnerPrompt) {
+          const promptIds = openPromptIds();
+          provisional =
+            promptIds.length > 0
+              ? { outcome: { text: event.text ?? '', isError: event.isError === true, model: modelInForce }, promptIds }
               : undefined;
         }
         // The provider is between turns as of right now. Set before the
@@ -2418,6 +2423,11 @@ export async function processQuery(
           }
           pauseAnsweredPrompt();
         }
+        // A provisional outcome stays only while a fire it could answer is open.
+        if (provisional) {
+          const stillOpen = openPromptIds();
+          if (!provisional.promptIds.some((id) => stillOpen.includes(id))) provisional = undefined;
+        }
         // Handling is done deciding. If it pushed, the turn level is raised
         // again and the published bit stays 1; if it did not, this is where
         // the container becomes reapable.
@@ -2427,8 +2437,12 @@ export async function processQuery(
         // their echo was dropped (sdk.d.ts lists the cases). The last result
         // that answered none of the runner's prompts is the one that consumed
         // them.
-        if (routing.taskRun && provisionalOutcome) await recordTaskTurn(provisionalOutcome, event.unansweredPrompts);
-        provisionalOutcome = undefined;
+        if (routing.taskRun && provisional) {
+          const held = provisional;
+          const covered = event.unansweredPrompts.filter((id) => held.promptIds.includes(id));
+          if (covered.length > 0) await recordTaskTurn(held.outcome, covered);
+        }
+        provisional = undefined;
         // `result` kept the level up while these prompts looked queued
         // (lowerTurnLevelUnlessQueued). The turn is over now.
         lowerTurnLevelUnlessQueued();
