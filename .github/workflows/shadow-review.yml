@@ -306,15 +306,22 @@ jobs:
     # the same selection predicate `analyze` used (so an unselected PR's `report`
     # doesn't fire just because `always()` is present), AND only proceed when
     # `analyze` actually ran to a real conclusion: 'success' is the normal path,
-    # 'failure' is the new one below, and 'skipped'/'cancelled' fall through to
-    # neither and this job is skipped too.
+    # 'failure' and 'cancelled' both take the failure path below (see that step),
+    # and 'skipped' is the only one that leaves this job skipped too.
+    # `cancelled` is treated as a real failure signal, not a benign no-op: the
+    # merged PR that triggered this run can't be reopened, so this workflow's own
+    # `concurrency: cancel-in-progress` (scoped to the PR number) never cancels a
+    # merged PR's run — nothing about this workflow's design produces a
+    # `cancelled` `analyze` in normal operation. A `cancelled` result here means a
+    # manual cancel or an infrastructure interruption, and either way no review
+    # ran, which is exactly the silent-failure mode this job exists to surface.
     if: >-
       always() &&
       github.event.pull_request.merged == true &&
       github.event.pull_request.base.ref == 'main' &&
       !contains(github.event.pull_request.labels.*.name, 'risk:high') &&
       !contains(github.event.pull_request.labels.*.name, 'review:requested') &&
-      (needs.analyze.result == 'success' || needs.analyze.result == 'failure')
+      (needs.analyze.result == 'success' || needs.analyze.result == 'failure' || needs.analyze.result == 'cancelled')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -340,17 +347,23 @@ jobs:
             --description "The shadow-review analyze job errored before producing a result — this merge has no post-merge review until re-run (docs/specs/risk-based-review/plan.md)" \
             --force
 
-      # analyze errored before Claude produced a result (see that job's own
-      # "Report the failure reason" step). This merge gets neither an issue nor a
-      # clean-review comment — say so explicitly, once, rather than let it read as
-      # silently clean. Never itself fails the job a second time: every write is
-      # tolerated, and the step always exits 0.
+      # analyze errored, or was cancelled, before Claude produced a result. Either
+      # way this merge gets neither an issue nor a clean-review comment — say so
+      # explicitly, once, rather than let it read as silently clean. On a cancel,
+      # analyze's own `if: failure()` "Report the failure reason" step never runs
+      # (cancellation isn't a step failure), so `failure_reason` is unset here —
+      # substitute the literal "(cancelled)" rather than falling through to a
+      # generic "unknown reason" that would look like an unread execution-output
+      # file when actually nothing ran long enough to produce one. Never itself
+      # fails the job a second time: every write is tolerated, and the step always
+      # exits 0.
       - name: Report that analyze failed
-        if: needs.analyze.result == 'failure'
+        if: needs.analyze.result == 'failure' || needs.analyze.result == 'cancelled'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          ANALYZE_RESULT: ${{ needs.analyze.result }}
           REASON: ${{ needs.analyze.outputs.failure_reason }}
         run: |
           set -uo pipefail
@@ -366,7 +379,11 @@ jobs:
             exit 0
           fi
 
-          reason="${REASON:-unknown reason}"
+          if [ "$ANALYZE_RESULT" = "cancelled" ]; then
+            reason="(cancelled)"
+          else
+            reason="${REASON:-unknown reason}"
+          fi
           gh pr comment "$PR_NUMBER" --repo "$REPO" \
             --body "$MARKER: ${reason}. This merge has no post-merge review until it is re-run." \
             || echo "::warning::could not comment on #$PR_NUMBER"
