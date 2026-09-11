@@ -172,6 +172,12 @@ import {
   topicWorktreesDir,
   type RepositoryWorkUnit,
 } from './repository-workspaces.js';
+import {
+  decideHooksMountStrategy,
+  MANAGED_GIT_HOOKS_REFUSE_DIR,
+  MANAGED_GIT_HOOKS_SCAN_DIR,
+} from './managed-git-hooks.js';
+import { repositoryConfigPath, safeGitConfigGet } from './safe-git.js';
 import { resolveStoragePolicy } from './storage-manager.js';
 import { assertStorageAdmissionInBackground } from './storage-maintenance-worker.js';
 import { acquireStorageActivityLease, type StorageActivityLease } from './storage-activity.js';
@@ -1462,7 +1468,7 @@ export async function resolveSessionRepositoryWorkUnit(
   });
 }
 
-function canonicalGitControlMounts(gitDir: string, stateDir: string): VolumeMount[] {
+export function canonicalGitControlMounts(gitDir: string, stateDir: string): VolumeMount[] {
   const config = path.join(gitDir, 'config');
   const head = path.join(gitDir, 'HEAD');
   const index = path.join(gitDir, 'index');
@@ -1518,6 +1524,74 @@ function canonicalGitControlMounts(gitDir: string, stateDir: string): VolumeMoun
     { hostPath: hooks, containerPath: hooks, readonly: true },
     { hostPath: objectsInfo, containerPath: objectsInfo, readonly: true },
   ];
+}
+
+/** Module-lifetime (one boot) dedup so a repository whose hooks decision degrades doesn't alert on every spawn — see resolveScanPolicyHooksMount's doc comment. Keyed by gitDir, which is unique per canonical repository. */
+const scanPolicyHooksAlerted = new Set<string>();
+
+function alertScanPolicyHooksOnce(repository: { gitDir: string }, outcome: 'refuse' | 'withhold'): void {
+  if (scanPolicyHooksAlerted.has(repository.gitDir)) return;
+  scanPolicyHooksAlerted.add(repository.gitDir);
+  log.error('managed-git-hooks: scan-policy repository degraded below the real hook', {
+    outcome,
+    // gitDir DOES contain the workgroup id and repo name as path segments
+    // (#666 review P3-5: an earlier comment here incorrectly claimed
+    // otherwise) — this is a host log line, not the count-only report
+    // migrateExistingCanonicalHooksPath returns to callers, so it is fine
+    // for it to be more specific.
+    gitDir: repository.gitDir,
+  });
+}
+
+export interface ScanPolicyHooksMountResult {
+  /**
+   * true only when even the refuse hook failed validation — the caller MUST
+   * withhold every mount for this repository (gitDir, control mounts, lock,
+   * origin pin), following the transfer-tombstone `continue` precedent
+   * above, so git in that worktree fails outright rather than running with
+   * no hook at all. `mounts` is always empty when this is true.
+   */
+  withhold: boolean;
+  /** The managed-hooks mount to add for this repository — empty when the repo isn't scan-policy-configured at all, or `withhold` is true. */
+  mounts: VolumeMount[];
+}
+
+/**
+ * Resolves a canonical repository's `core.hooksPath` against
+ * MANAGED_GIT_HOOKS_SCAN_DIR (the ONE value every writer uses — B12) and,
+ * only for repositories actually configured that way, runs
+ * decideHooksMountStrategy's scan -> refuse -> withhold fallback (see its
+ * own doc comment in src/managed-git-hooks.ts for the full ordering
+ * rationale). `core.hooksPath` IS the signal read here — this does not
+ * re-derive "is this repo scan-policy" from the repo name; it reads
+ * whatever value is already committed in the repo's own .git/config.
+ *
+ * Never throws for a degraded outcome: 'refuse' returns a mount (at the
+ * SAME container path the real hook would use, so git still finds a hook
+ * and still runs it — the refuse hook itself), and 'withhold' returns
+ * `{ withhold: true }` for the caller to act on. Alerts (once per boot per
+ * repository, via alertScanPolicyHooksOnce above) on both degraded
+ * outcomes; the 'scan' (real hook) outcome is silent.
+ */
+export function resolveScanPolicyHooksMount(repository: { gitDir: string }): ScanPolicyHooksMountResult {
+  const configuredHooksPath = safeGitConfigGet(repositoryConfigPath(repository.gitDir), 'core.hooksPath');
+  if (configuredHooksPath !== MANAGED_GIT_HOOKS_SCAN_DIR) return { withhold: false, mounts: [] };
+  const strategy = decideHooksMountStrategy();
+  if (strategy === 'scan') {
+    return {
+      withhold: false,
+      mounts: [{ hostPath: MANAGED_GIT_HOOKS_SCAN_DIR, containerPath: MANAGED_GIT_HOOKS_SCAN_DIR, readonly: true }],
+    };
+  }
+  if (strategy === 'refuse') {
+    alertScanPolicyHooksOnce(repository, 'refuse');
+    return {
+      withhold: false,
+      mounts: [{ hostPath: MANAGED_GIT_HOOKS_REFUSE_DIR, containerPath: MANAGED_GIT_HOOKS_SCAN_DIR, readonly: true }],
+    };
+  }
+  alertScanPolicyHooksOnce(repository, 'withhold');
+  return { withhold: true, mounts: [] };
 }
 
 async function spawnContainer(
@@ -4403,6 +4477,17 @@ export async function buildMounts(
       // rather than relying only on the create_worktree MCP check.
       continue;
     }
+    // A scan-policy repository whose managed hook AND its refuse fallback
+    // both failed validation gets every mount withheld (same `continue`
+    // shape as the tombstone check above) rather than running with no hook
+    // at all — see resolveScanPolicyHooksMount's doc comment for the full
+    // fallback order. Computed before the gitDir mount deliberately: a
+    // partial withhold (say, gitDir mounted but hooks skipped) would still
+    // let an agent push unscanned from that worktree.
+    const hooksDecision = resolveScanPolicyHooksMount(repository);
+    if (hooksDecision.withhold) {
+      continue;
+    }
     mounts.push({ hostPath: repository.gitDir, containerPath: repository.gitDir, readonly: false });
     // The common object/ref/worktree store is writable, but host-executable
     // configuration, hooks, canonical main-worktree HEAD/index, and
@@ -4411,6 +4496,16 @@ export async function buildMounts(
     // Git can fetch/commit/push without being able to clobber the host
     // canonical checkout state.
     mounts.push(...canonicalGitControlMounts(repository.gitDir, path.dirname(repository.lockPath)));
+    // Deduped by container path (#666 review B8): two scan-policy
+    // repositories in one workgroup would otherwise both resolve to the
+    // SAME containerPath (MANAGED_GIT_HOOKS_SCAN_DIR — one host-managed
+    // directory for the whole install, not per-repo), and Docker rejects a
+    // duplicate bind mount to the same container path.
+    for (const mount of hooksDecision.mounts) {
+      if (!mounts.some((existing) => existing.containerPath === mount.containerPath)) {
+        mounts.push(mount);
+      }
+    }
     mounts.push({ hostPath: repository.lockPath, containerPath: repository.lockPath, readonly: false });
     mounts.push({ hostPath: repository.originPinPath, containerPath: repository.originPinPath, readonly: true });
   }

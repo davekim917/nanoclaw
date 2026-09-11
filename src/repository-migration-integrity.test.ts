@@ -22,6 +22,7 @@ import {
   resolveRepositoryWorkUnit,
   topicWorktreesDir,
 } from './repository-workspaces.js';
+import { MANAGED_GIT_HOOKS_SCAN_DIR } from './managed-git-hooks.js';
 
 function git(cwd: string, args: string[]): string {
   return execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', ...args], {
@@ -164,6 +165,20 @@ describe('repository migration cutover integrity', () => {
     expect(persistedManifest).not.toContain(secret);
     expect(persistedManifest).not.toContain(rawOrigin);
   }, 30_000);
+
+  it('writes core.hooksPath to the one exported MANAGED_GIT_HOOKS_SCAN_DIR constant for a wiki repo, /dev/null otherwise (#666 review B12/P3-7)', async () => {
+    // The temp-canonical writer (repository-migration.ts's
+    // executeRepositoryMigrationLocked, "canonical-published" phase) is the
+    // path every fresh migration takes — `canonical` never exists yet on a
+    // first run, so this is the ordinary case, not just crash recovery.
+    for (const repo of ['wiki', 'code']) {
+      const expected = repo === 'wiki' ? MANAGED_GIT_HOOKS_SCAN_DIR : '/dev/null';
+      const manifest = activeManifest(repo);
+      await executeRepositoryMigration(manifest, { assertQuiescent: () => undefined });
+      const canonical = canonicalRepoDir('wg-a', repo, dataDir);
+      expect(git(canonical, ['config', '--get', 'core.hooksPath'])).toBe(expected);
+    }
+  });
 
   it('hash-binds deterministic rollback fields before execution and uses them unchanged', async () => {
     const manifest = activeManifest('integrity', true);

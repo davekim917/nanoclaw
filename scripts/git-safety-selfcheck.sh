@@ -27,8 +27,24 @@ HOME2=""
 BACKUPS=""
 NCDIR=""
 
+# #666 review P3-10: every new_fixture() call overwrote FIX with a fresh
+# mktemp -d, but only the LAST one was ever removed (the old convention
+# left every earlier run's fixture on disk) — ~57 leaked temp dirs per full
+# run of this script, each containing planted fake secrets. Track every one
+# and remove them all on exit, matching the pattern already fixed the same
+# way in scripts/wiki-pre-push-hook-selfcheck.sh.
+FIXTURE_DIRS=()
+cleanup_fixtures() {
+  local dir
+  for dir in "${FIXTURE_DIRS[@]}"; do
+    rm -rf "$dir"
+  done
+}
+trap cleanup_fixtures EXIT INT TERM
+
 new_fixture() {
   FIX=$(mktemp -d)
+  FIXTURE_DIRS+=("$FIX")
   HOME2="$FIX/home"
   BACKUPS="$FIX/home/backups"
   NCDIR="$FIX/nanoclaw"
@@ -377,6 +393,56 @@ git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1 \
     "$(git --git-dir="$REMOTE" log --oneline host-snapshot)" \
   || ok "missing-lib run pushed nothing — fails closed"
 
+# ═══ A PRESENT but CORRUPT lib/secret-scan.sh also fails closed ═══════════
+# Distinct from the missing-file case above: git-safety.sh now calls
+# secret_scan_selftest() right after sourcing the lib (#666 rework) so a
+# lib that sources cleanly (rc=0, every function/variable name still
+# exists) but whose regex/variables are broken is still caught, not just a
+# lib that fails to source at all.
+new_fixture
+BADLIB_DIR="$FIX/badlib-scripts"
+mkdir -p "$BADLIB_DIR/lib"
+cp "$REAL" "$BADLIB_DIR/git-safety.sh"
+sed '/^SECRET_BLOCK_RE=/d' "$(dirname "$REAL")/lib/secret-scan.sh" > "$BADLIB_DIR/lib/secret-scan.sh"
+echo '{"a":2}' > "$G/foo/container.json"
+OUT=$(env NANOCLAW_DIR="$NCDIR" GIT_SAFETY_DIR="$BACKUPS" HOME="$HOME2" bash "$BADLIB_DIR/git-safety.sh" 2>&1)
+RC=$?
+[ "$RC" -ne 0 ] && ok "a corrupt (but sourceable) lib/secret-scan.sh fails the run" \
+  || bad "a corrupt lib/secret-scan.sh did NOT fail the run (fail-open)" "$OUT"
+case "$OUT" in
+  *"self-test"*) ok "corrupt-lib failure names the self-test, not a generic error" ;;
+  *) bad "corrupt-lib failure did not mention the self-test" "$OUT" ;;
+esac
+git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1 \
+  && bad "corrupt-lib run pushed a host-snapshot commit anyway (fail-OPEN, gate never ran)" \
+    "$(git --git-dir="$REMOTE" log --oneline host-snapshot)" \
+  || ok "corrupt-lib run pushed nothing — fails closed"
+
+# ═══ SECRET_BLOCK_RE is a literal subset of SECRET_RE (#666 addendum 2) ═══
+# git-safety.sh has only ONE tier (over the full, case-insensitive
+# SECRET_RE) — it never consults SECRET_BLOCK_RE directly. This assertion
+# exists here anyway because git-safety.sh and the wiki pre-push hook share
+# this one lib file: if a future edit ever widened SECRET_BLOCK_RE past
+# SECRET_RE, the wiki hook's BLOCK tier would start rejecting pushes that
+# git-safety.sh's own single-tier scan would have let through as clean —
+# silently inconsistent secret handling between the two call sites.
+# shellcheck source=lib/secret-scan.sh
+source "$(dirname "$REAL")/lib/secret-scan.sh"
+BLOCK_SUBSET_FIXTURES=(
+  'export SLACK_APP_TOKEN=xapp-1-A0123-4567890123-abcdefabcdefabcdefabcdefabcdef'
+  'export GITHUB_TOKEN=ghp_16C7e42F292c6912E7710c838347Ae178B4aXYZ123'
+  'AKIAIOSFODNN7ABCDEFG'
+  '-----BEGIN PGP PRIVATE KEY BLOCK-----'
+)
+BLOCK_SUBSET_OK=1
+for line in "${BLOCK_SUBSET_FIXTURES[@]}"; do
+  if LC_ALL=C grep -qE "$SECRET_BLOCK_RE" <<<"$line" && ! LC_ALL=C grep -qiE "$SECRET_RE" <<<"$line"; then
+    BLOCK_SUBSET_OK=0
+    bad "BLOCK-subset: '$line' matches SECRET_BLOCK_RE but not SECRET_RE" ""
+  fi
+done
+[ "$BLOCK_SUBSET_OK" -eq 1 ] && ok "SECRET_BLOCK_RE stays a literal subset of SECRET_RE across sample fixtures"
+
 # ═══ Worktree slugs get a hash suffix (uniqueness even after truncation) ══
 # Unit-test slug() directly (extracted verbatim from the shipped script),
 # with two paths engineered to be BYTE-IDENTICAL in their last 100 chars —
@@ -475,10 +541,37 @@ if [ -s "$BUNDLE" ]; then
   # (it's the same repo the bundle came from) and never touches the pack
   # bytes at all; that dead end is why verify_bundle extracts the pack and
   # feeds it to index-pack directly instead.
-  SIZE=$(stat -c %s "$BUNDLE")
   cp "$BUNDLE" "$FIX/corrupt.bundle"
-  printf '\x00' | dd of="$FIX/corrupt.bundle" bs=1 seek=$((SIZE - 1)) count=1 conv=notrunc status=none
-  if git bundle verify "$FIX/corrupt.bundle" >/dev/null 2>&1; then
+  # Corrupt a byte at a COMPUTED OFFSET inside the pack's own OBJECT data,
+  # not the file's last byte (#666 review T1: the last-byte version failed
+  # 4 of 4 times when review-666 ran this script from a copied directory
+  # instead of in-tree, and passed in-tree — location-dependent). A bundle
+  # is header lines (refs, prerequisites) + a blank line + the pack itself,
+  # which starts with the 4-byte "PACK" magic; corrupting the file's LAST
+  # byte instead lands in the pack's trailing checksum, whose exact
+  # position (and so, apparently, its effect on plain `git bundle verify`)
+  # shifts with incidental header content. PACK's own magic bytes are
+  # always findable regardless of where the file lives or how long the
+  # header is, and 12 bytes past it (4-byte magic + 4-byte version + 4-byte
+  # object count) is always inside the first object's zlib-compressed data
+  # — which plain verify never inspects but index-pack (verify_bundle)
+  # always does. Verified location-independent by running this exact
+  # selfcheck both in-tree and from a copy of the whole repo at a
+  # different path (see the PR body's test-plan evidence for both runs).
+  PACK_OFFSET=$(LC_ALL=C grep -aob 'PACK' "$FIX/corrupt.bundle" | head -1 | cut -d: -f1)
+  if [ -z "$PACK_OFFSET" ]; then
+    bad "test setup: could not find the PACK magic inside the bundle to corrupt" ""
+  fi
+  CORRUPT_AT=$((PACK_OFFSET + 12))
+  printf '\xff' | dd of="$FIX/corrupt.bundle" bs=1 seek="$CORRUPT_AT" count=1 conv=notrunc status=none
+  # `-C "$NCDIR"` (#666 review P3-3): without it, `git bundle verify` needs
+  # the CURRENT WORKING DIRECTORY to already be inside a git repo (or one
+  # of its ancestors) — location-dependent in exactly the same way the
+  # earlier last-byte corruption offset was, and for the same underlying
+  # reason (this script's own behavior must not depend on where it's run
+  # from). Verified by running this whole selfcheck from a directory
+  # outside any git repo entirely (see the PR body's test-plan evidence).
+  if git -C "$NCDIR" bundle verify "$FIX/corrupt.bundle" >/dev/null 2>&1; then
     ok "confirmed: plain 'git bundle verify' does not catch this pack corruption (motivates the fix)"
   else
     bad "test setup: plain bundle verify already caught the corruption — strengthen the corruption" ""
@@ -561,8 +654,16 @@ IDX_AFTER=$(stat -c %Y "$NCDIR/.git/index")
 new_fixture
 echo '{"a":2}' > "$G/foo/container.json"
 run_safety
+# This first run_safety's own success was never actually checked before
+# reading host-snapshot back — a transient failure here (seen once in CI,
+# never locally) surfaced two lines later as an opaque "fatal: : not a
+# valid SHA1" instead of the real reason. Diagnose loudly instead of
+# silently treating "no host-snapshot yet" as this test's own assertion.
+if [ "$RC" -ne 0 ] || ! git --git-dir="$REMOTE" rev-parse -q --verify host-snapshot >/dev/null 2>&1; then
+  bad "setup: first run_safety did not produce a host-snapshot to force-reset" "rc=$RC out=$OUT"
+fi
 FIRST_SNAP_TIP=$(git --git-dir="$REMOTE" rev-parse host-snapshot)
-FORCE_RESET_TIP=$(git --git-dir="$REMOTE" commit-tree "$FIRST_SNAP_TIP^{tree}" -m "operator force-reset target" 2>/dev/null)
+FORCE_RESET_TIP=$(git -c user.name=selfcheck -c user.email=selfcheck@example.invalid --git-dir="$REMOTE" commit-tree "$FIRST_SNAP_TIP^{tree}" -m "operator force-reset target" 2>/dev/null)
 git --git-dir="$REMOTE" update-ref refs/heads/host-snapshot "$FORCE_RESET_TIP"
 echo '{"a":3}' > "$G/foo/container.json"
 run_safety
@@ -663,6 +764,20 @@ cleanup_scratch
 [ ! -e "$SCRATCH_A" ] && [ ! -e "$SCRATCH_B" ] \
   && ok "cleanup_scratch() removes every path it was given" \
   || bad "cleanup_scratch() left a path behind" "a=$([ -e "$SCRATCH_A" ] && echo present) b=$([ -e "$SCRATCH_B" ] && echo present)"
+
+# #666 review P3-10, root cause: the `eval` above runs the SHIPPED script's
+# own `trap cleanup_scratch EXIT INT TERM` line directly in THIS process
+# (not a subshell), which silently REPLACES this file's own
+# `cleanup_fixtures` trap registered near the top — bash trap registration
+# is last-wins per signal, not cumulative. Every fixture dir created before
+# this point (most of them: new_fixture() is called dozens of times above)
+# was then never cleaned up at exit, because cleanup_scratch — a different
+# function, with nothing in CLEANUP_PATHS — ran instead. Re-registered here
+# once this section's own assertions (which specifically need
+# cleanup_scratch active) are done, restoring cleanup over FIXTURE_DIRS for
+# the rest of this run and confirmed by measuring zero leaked tmp dirs
+# after a full run, not just by inspection.
+trap cleanup_fixtures EXIT INT TERM
 
 # ─ Secret-gate regex gaps named in #628 ─
 secret_case "github user-to-server token (ghu_)" 'export GITHUB_TOKEN=ghu_16C7e42F292c6912E7710c838347Ae178B4a'

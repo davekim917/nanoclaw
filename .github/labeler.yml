@@ -85,7 +85,14 @@ risk:high:
     # (a weakened pattern there silently disables the scan)
     - 'scripts/deploy.sh'
     - 'scripts/git-safety*.sh'
+    # The pre-push secret-scan hook agents' own containers run when pushing a wiki repo
+    # (and its selfcheck) — a weakened pattern here silently lets a secret reach a real
+    # remote with no other gate on that path at all
+    - 'scripts/wiki-pre-push-hook*.sh'
     - 'scripts/lib/secret-scan.sh'
+    # Host-side refresh/integrity-check/mount-decision for the hook above — a bug here
+    # either mounts a stale or tampered hook, or silently drops the scan for a wiki repo
+    - 'src/managed-git-hooks.ts'
     # The gates themselves: CI workflows, this file, the git hooks, the public-boundary
     # checkers and allowlist, and the PR review loop that IS the review gate. CI runs
     # only the portable boundary mode, so the strict identifier check runs only in the
@@ -215,7 +222,9 @@ risk:deploy:
   - any-glob-to-any-file:
     - 'scripts/deploy.sh'
     - 'scripts/git-safety*.sh'
+    - 'scripts/wiki-pre-push-hook*.sh'
     - 'scripts/lib/secret-scan.sh'
+    - 'src/managed-git-hooks.ts'
 
 risk:gates:
 - changed-files:

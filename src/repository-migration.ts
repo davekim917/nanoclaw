@@ -15,6 +15,7 @@ import {
   type RepositoryWorkUnit,
 } from './repository-workspaces.js';
 import { safeGitArgs, safeGitEnv, safeGitFilterNames } from './safe-git.js';
+import { MANAGED_GIT_HOOKS_SCAN_DIR, isScanPolicyRepositoryName } from './managed-git-hooks.js';
 import {
   observedOriginsSha256,
   recoverySeedGitDirSha256,
@@ -2902,7 +2903,16 @@ async function executeRepositoryMigrationLocked(
         git(['-C', temp, 'init', '-q', `--object-format=${manifest.canonicalBase.objectFormat}`]);
         writeMigrationOwner(temp, manifest);
         if (manifest.origin !== null) git(['-C', temp, 'remote', 'add', 'origin', manifest.origin]);
-        git(['-C', temp, 'config', 'core.hooksPath', '/dev/null']);
+        // Scan-policy repos (today: the wiki canonical repo) point at the
+        // ONE host-managed, read-only-mounted hook directory instead of
+        // /dev/null — see managed-git-hooks.ts's header.
+        git([
+          '-C',
+          temp,
+          'config',
+          'core.hooksPath',
+          isScanPolicyRepositoryName(manifest.repo) ? MANAGED_GIT_HOOKS_SCAN_DIR : '/dev/null',
+        ]);
         git(['-C', temp, 'config', 'core.fsmonitor', 'false']);
         git(['-C', temp, 'config', 'gc.auto', '0']);
         git(['-C', temp, 'config', 'gc.worktreePruneExpire', 'never']);

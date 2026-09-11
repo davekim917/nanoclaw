@@ -688,3 +688,46 @@ describe('boot mount-change ordering', () => {
     db.close();
   });
 });
+
+describe('initializeManagedGitHooks runs after the boot door and before anything that can spawn', () => {
+  // #666 review: at an earlier head this ran inside startHostModules, AFTER
+  // startDashboard/honorPendingStopIntents/initChannelAdapters had already
+  // opened paths that can spawn a container — a spawn racing ahead of the
+  // refresh would have found the previous boot's hook copies (or none at
+  // all). startNanoClaw() itself is not practical to drive end-to-end in a
+  // unit test (real DB, HTTP dashboard, channel adapters, an OneCLI network
+  // preflight — no existing test in this repo attempts it), so this
+  // verifies the property the way this file already tests the mount door's
+  // "nothing mutates before the door returns" invariant: as a fact about
+  // src/main.ts's own source order, read once as text.
+  it('initializeManagedGitHooks() is called after runBootMountQuiescence(db) and before startDashboard()/honorPendingStopIntents(/initChannelAdapters(', () => {
+    const source = fs.readFileSync(path.join(__dirname, 'main.ts'), 'utf8');
+    const indexOf = (needle: string): number => {
+      const idx = source.indexOf(needle);
+      expect(idx, `expected to find ${JSON.stringify(needle)} in src/main.ts`).toBeGreaterThan(-1);
+      return idx;
+    };
+
+    const doorCall = indexOf('await runBootMountQuiescence(db)');
+    const initCall = indexOf('initializeManagedGitHooks();');
+    const dashboardCall = indexOf('startDashboard();');
+    const stopIntentsCall = indexOf('await honorPendingStopIntents(');
+    const channelAdaptersCall = indexOf('await initChannelAdapters(');
+
+    expect(initCall).toBeGreaterThan(doorCall);
+    expect(initCall).toBeLessThan(dashboardCall);
+    expect(initCall).toBeLessThan(stopIntentsCall);
+    expect(initCall).toBeLessThan(channelAdaptersCall);
+  });
+
+  it('is a direct awaited-style call in startNanoClaw, not an onHostStart registrant', () => {
+    // Guards against a regression back to onHostStart, which main.test.ts's
+    // T-5 pins to exactly the six recurring timer modules — see
+    // src/managed-git-hooks.ts's own doc comment on initializeManagedGitHooks
+    // for why a one-shot pass with a harder deadline than "once delivery is
+    // ready" does not belong there.
+    const source = fs.readFileSync(path.join(__dirname, 'main.ts'), 'utf8');
+    expect(source).not.toMatch(/onHostStart\(\s*function managedGitHooksHostStart/);
+    expect(source).toMatch(/import \{ initializeManagedGitHooks \} from '\.\/managed-git-hooks\.js';/);
+  });
+});

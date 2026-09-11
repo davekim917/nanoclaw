@@ -54,6 +54,7 @@ const KNOWN_NON_CODE_GLOBS: ReadonlySet<string> = new Set([
   // not left here as a stale entry; an unclassified glob should still throw if this
   // path ever comes back under a different name.
   'scripts/lib/secret-scan.sh',
+  'scripts/wiki-pre-push-hook*.sh',
   '.github/**',
   '.husky/**',
   '.public-boundary-allowlist.json',
