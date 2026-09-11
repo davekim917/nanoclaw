@@ -73,6 +73,23 @@ agent-browser get url             # Get current URL
 agent-browser get count ".item"   # Count matching elements
 ```
 
+### Sessions & viewport
+
+```bash
+agent-browser --session myapp open <url>     # Named session: persists across
+                                              # invocations, so a later call
+                                              # with the same --session reuses
+                                              # the same daemon/browser state
+                                              # instead of starting fresh.
+agent-browser set viewport 1280 900          # Resize the viewport (w h)
+agent-browser set device "iPhone 14"         # Or use a named device preset
+```
+
+`--session <name>` is a global option (works on every command, before the
+subcommand). It's how one script drives the same browser across multiple
+`agent-browser` invocations — e.g. loading auth state once, then navigating
+and capturing several screens without re-authenticating each time.
+
 ### Screenshots, PDF & video
 
 ```bash
@@ -173,6 +190,12 @@ agent-browser find text "Sign In" click
 agent-browser find label "Email" fill "user@test.com"
 agent-browser find placeholder "Search" type "query"
 ```
+
+`click`/`fill`/etc. take a CSS selector, XPath, or `@ref` only — **not** a
+`text=...` prefix (that's a different tool's shorthand agent-browser doesn't
+recognize; it fails with "Element not found" instead of erroring on the
+syntax). To click or fill by visible text, use `find text "<value>" click`
+above, not `click "text=<value>"`.
 
 ### Authentication with saved state
 
