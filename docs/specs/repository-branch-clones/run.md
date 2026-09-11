@@ -424,3 +424,53 @@ Drop absorb. Keep the canonical current through container-side fetches, the way 
 - **Typecheck:** `tsc -p tsconfig.json` and `tsc -p container/agent-runner/tsconfig.json` are both clean.
 - **Lint and format:** eslint `--quiet` and prettier `--check` on the four changed `.ts` files are clean.
 - **Ratchet:** UNCHANGED 959, Δ 0.
+
+## 2026-09-11 — PR #657 review round 2 (substitute Codex at 771b514a4)
+
+### Findings and dispositions
+
+- **[1] Destructive: a commit only a tag reached read as pushed. ACCEPTED, fixed at the primitive.**
+  - `provenDisposable` scope `'all'` ran `git log --branches HEAD --not --remotes=origin`. A commit reachable only from a tag, a note, a replace ref or another remote's ref was not counted. Such a clone was proven disposable and trashed by all three callers: the clone collector, the orphan-topic loop and the quarantine re-proof.
+  - It now runs `git log --all HEAD --not --remotes=origin`. The invariant: every local ref's commits must be on origin.
+  - `HEAD` stays named. `--all` alone exits 0 with no output on an unborn HEAD (measured, git 2.43), where `log HEAD` fails, so an unborn HEAD stays unprovable.
+  - For scope `'all'` the stash is read before the log, so it keeps its own reason (`--all` counts `refs/stash` too). Measured: a `refs/stash` with no reflog is invisible to `stash list` but counted by `--all`.
+  - Scope `'head'` (linked worktrees) is unchanged: same command, same check order.
+- **[2] Rollback stranded `<repo>@<slug>` checkouts. ACCEPTED.**
+  - `reconcileQuarantine` and `finalizeIdleCollection` filtered the quarantined `worktrees/` with `isRepositoryName`. On rollback a branch checkout stayed in quarantine, and the recovery marker had already been removed, so recovery could never find it.
+  - `reconcileQuarantine` now restores every entry of the quarantined `worktrees/`, files and links included, and every other entry of the topic.
+    - The per-entry rule is kept: when the destination was recreated, keep the live copy and trash the quarantined one unless it is locked.
+    - Shapes come from `listTopicCheckouts`. Only a linked entry is deregistered, from the canonical of the repo its name parses to.
+    - The marker is removed only when nothing is left. A locked superseded copy or a failed trash keeps it.
+  - `finalizeIdleCollection` lists the quarantined topic through `readTopicCheckouts` and journals and deregisters linked entries only.
+  - `removeMissingWorktreeRegistration` now requires the checkout's basename to parse to the repo (`<repo>` or `<repo>@<slug>`) rather than equal it. Otherwise a linked `<repo>@<slug>` deregistration would be refused and stay journaled forever.
+  - Two marker-loss paths of the same kind are also fixed. The whole-topic fallback and `recoverOrphanedQuarantine`'s plain restore both remove the marker before renaming. When the entry stays in quarantine anyway, the marker is now written back.
+- **[3] Wording. ACCEPTED.** "The host never reads a checkout" is narrowed: refresh never reads or fetches from an agent checkout, and the host still validates reused checkouts and proves cleanup candidates, as it does for linked worktrees. Changed in the `index.ts` refresh handler comment, the `emitRefresh` doc and plan §5.5. Plan §5.8 states the new invariant.
+
+### Tests, each observed failing first
+
+- **`p212-tag-only`** in the P2-12 cases, asserted by both the orphan-topic loop and the clone branch.
+  - Before the fix, the orphan-topic assertion `{collect: false, reason: 'unpushed'}` failed for it.
+  - The P2-12 snapshot now lists every ref, not only `refs/heads`.
+- **`an idle topic rolled back by late activity gets every checkout back, branch clones included`.**
+  - Setup: clean pushed clones `repo-a` and `repo-a@feat`, and a mount of the topic that appears right after the quarantine rename.
+  - Before the fix, the worktrees root held only `repo-a`.
+  - After the fix: both clones are restored byte for byte (tree digest), the quarantine is empty, no marker remains, and nothing is trashed.
+- **`a rollback that leaves a locked superseded copy behind keeps the recovery marker`.**
+  - Setup: a clone that is restored, a locked superseded linked `repo-b` that stays in quarantine, and an unlocked superseded linked `repo-b@side` that is trashed and deregistered from the `repo-b` canonical.
+  - Before the fix, the marker was gone (ENOENT).
+- **The mailbox-seam manifest pin** for `worktree-cleanup.ts` is updated: `isRepositoryName` out, `parseCheckoutDirName` in.
+
+### Fresh results
+
+- **Host vitest** (`--maxWorkers=2`, under the shared flock) over worktree-cleanup, storage-gc, repository-workspaces (both suites), main, mailbox-seam, ratchet, tripwire and storage-manager: 17 files, 503/503.
+  - The first run was 502/503. The one failure was the manifest pin, which is now updated.
+- **Container:** `bun test` over git-worktrees, checkout-layout and instruction-fragment-migration: 59/59.
+- **Typecheck:** `tsc -p tsconfig.json` and `tsc -p container/agent-runner/tsconfig.json` are both clean.
+- **Lint and format:** eslint `--quiet` and prettier `--check` on the five changed `.ts` files are clean.
+- **Ratchet:** UNCHANGED 959, Δ 0.
+
+### Residual risks
+
+- A clone keeps the canonical's tags (§5.2 step 1 deletes only heads and remote refs). A tag on a commit that no origin branch reaches now reads as unpushed, so that clone is never collected. This fails closed and costs only disk.
+- Commits reachable only from a reflog or `ORIG_HEAD` are not refs and are not counted, as before.
+- A forged `refs/remotes/origin/*` still makes unpushed work look pushed. This is carried from rev 2.6; the trash keeps it for 30 days.

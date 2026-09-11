@@ -505,8 +505,10 @@ async function queueHostAction(action: string, payload: Record<string, unknown>)
 
 /**
  * Asks the host to move the canonical's own checkout to the origin/HEAD this
- * container's fetch recorded. It names no checkout: the host never reads one
- * (plan §5.5, rev 2.7).
+ * container's fetch recorded. It names no checkout: refresh never reads or
+ * fetches from an agent checkout (plan §5.5, rev 2.7). The host still
+ * validates reused checkouts and proves cleanup candidates, as it does for
+ * linked worktrees.
  */
 async function emitRefresh(context: RepositoryContext): Promise<void> {
   await queueHostAction('repository_refresh', {

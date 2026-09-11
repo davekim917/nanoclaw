@@ -1386,7 +1386,9 @@ export async function applyRepositoryRefreshAction(content: Record<string, unkno
   assertRepositoryRequestId(requestId);
   const workgroupId = await workgroupForSession(session);
   try {
-    // The host never reads a checkout (plan §5.5, rev 2.7). A `checkout` field
+    // Refresh never reads or fetches from an agent checkout (plan §5.5, rev
+    // 2.7); the host still validates reused checkouts and proves cleanup
+    // candidates, as it does for linked worktrees. A `checkout` field
     // from a container that has not restarted since is ignored: a clone's .git
     // is container-writable, and a planted commondir or object alternate there
     // redirects a host fetch to another workgroup's repository. Containers

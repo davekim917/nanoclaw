@@ -388,9 +388,10 @@ hooks and `objects/info` are read-only overlays (`container-runner.ts` `canonica
 `:4413`), so a container writes only refs and objects there. Local-only pins fetch nothing and
 emit no refresh, as today.
 
-`repository_refresh` carries `{requestId, repo, workUnitKey}`. The host never reads a checkout. It
-moves the canonical's own checkout to `origin/HEAD` from the refs already there, as it did before
-Phase 2. A payload that still carries `checkout`, sent by a container that has not restarted since
+`repository_refresh` carries `{requestId, repo, workUnitKey}`. Refresh never reads or fetches from
+an agent checkout; the host still validates reused checkouts and proves cleanup candidates, as it
+does for linked worktrees. Refresh moves the canonical's own checkout to `origin/HEAD` from the refs
+already there, as it did before Phase 2. A payload that still carries `checkout`, sent by a container that has not restarted since
 this change, is a plain refresh.
 
 **Why the host no longer absorbs from a clone.** Rev 2.6 had the host run
@@ -597,8 +598,14 @@ days past `sealedAt` or its last link. Quarantined entries go after 7 days.
   cannot free bytes another link still holds (R9). Real usage keeps coming from `df`
   (`storage-manager.ts:651-663`).
 - **`proveCheckoutDisposable(checkout)` (M2)** is the one disposability primitive:
-  - `clone` → `provenDisposable(path,'all')`, which also refuses any local branch whose commits are
-    not in origin's remote-tracking refs (`--remotes=origin`, build rev 2.6);
+  - `clone` → `provenDisposable(path,'all')`. Invariant: every local ref's commits must be on
+    origin. `git log --all HEAD --not --remotes=origin` counts HEAD, every branch, tag, note and
+    replace ref, the stash and other remotes' refs against origin's remote-tracking refs only
+    (`--remotes=origin`, build rev 2.6; `--all` since the PR #657 review round 2, because
+    `--branches HEAD` read a commit only a tag reached as pushed). `HEAD` stays named, so an
+    unborn HEAD is unprovable. The stash is read first and keeps its own reason. A clone keeps the
+    canonical's tags (§5.2 step 1 deletes only heads and remote refs), so a tag on a commit no
+    origin branch reaches reads as unpushed: the clone is kept, fail-closed;
   - `linked` → `provenDisposable(path,'head')`, as today;
   - `unknown` → refuse, fail-closed.
 
@@ -612,7 +619,7 @@ days past `sealedAt` or its last link. Quarantined entries go after 7 days.
   (`worktree-cleanup.ts:1733-1793`). The linked path is unchanged.
 - **Why the `--remotes` proof holds for clones.** Remote-ref hygiene (§5.2 step 2) guarantees a
   clone's `refs/remotes/origin/*` never contains canonical local branches. Local-only clones have
-  no remote refs, so any branch with commits is "unpushed" and is never collected.
+  no remote refs, so any local ref with commits is "unpushed" and is never collected.
   **Build rev 2.6:** hygiene holds at creation only, because an agent can add remotes or rewrite
   remote-tracking refs later. So the proof trusts only `origin`'s refs and refuses a checkout that
   holds an embedded repository (`submodule`). It also runs nothing the repository configures:

@@ -617,7 +617,7 @@ describe('branch clone checkouts', () => {
   function snapshot(dir: string): Record<string, string> {
     return {
       head: git(dir, ['rev-parse', 'HEAD']),
-      refs: git(dir, ['for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads']),
+      refs: git(dir, ['for-each-ref', '--format=%(refname) %(objectname)']),
       status: git(dir, ['status', '--porcelain=v1', '--untracked-files=all']),
       stash: git(dir, ['stash', 'list']),
     };
@@ -700,6 +700,22 @@ describe('branch clone checkouts', () => {
         },
       },
       {
+        // An unpushed commit reachable only from a tag: on no branch, and not
+        // HEAD once the pushed branch is checked back out. Every local ref's
+        // commits must be on origin, not only the branches' and HEAD's.
+        thread: 'p212-tag-only',
+        name: 'repo-a@feat',
+        branch: 'feat',
+        reason: 'unpushed',
+        arrange: (dir) => {
+          git(dir, ['checkout', '-q', '--detach']);
+          commitFile(dir, 'tagged.txt');
+          git(dir, ['tag', 'kept-only-by-a-tag']);
+          git(dir, ['checkout', '-q', 'feat']);
+          expect(git(dir, ['rev-parse', 'HEAD'])).toBe(git(dir, ['rev-parse', 'refs/remotes/origin/main']));
+        },
+      },
+      {
         // Evidence only another local repository holds. A remote pointing at a
         // sibling clone is not origin, so its refs prove nothing was pushed.
         thread: 'p212-sibling-remote',
@@ -777,6 +793,123 @@ describe('branch clone checkouts', () => {
     const trashedCopy = path.join(state.trashDir, `2-${path.basename(quarantined)}`);
     expect(fs.readFileSync(path.join(trashedCopy, 'README.md'), 'utf8')).toBe('base\n');
     expect(git(trashedCopy, ['symbolic-ref', '--short', 'HEAD'])).toBe('feat');
+  });
+
+  /** Every path under `dir` with its type and bytes: what "restored byte for byte" compares. */
+  function treeDigest(dir: string): Record<string, string> {
+    const digest: Record<string, string> = {};
+    const walk = (current: string): void => {
+      for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+        const full = path.join(current, entry.name);
+        const relative = path.relative(dir, full);
+        if (entry.isSymbolicLink()) {
+          digest[relative] = `link:${fs.readlinkSync(full)}`;
+        } else if (entry.isDirectory()) {
+          digest[relative] = 'dir';
+          walk(full);
+        } else {
+          digest[relative] = createHash('sha256').update(fs.readFileSync(full)).digest('hex');
+        }
+      }
+    };
+    walk(dir);
+    return digest;
+  }
+
+  /** An active session idle past the reclaim floor: the path finalizeIdleCollection quarantines. */
+  function idleRow(threadId: string) {
+    return { ...row(`s-${threadId}`, threadId, 'active'), folder: 'folder-a', idle_since: OLD.toISOString() };
+  }
+
+  /**
+   * Runs one apply pass with `afterQuarantine` hooked onto the quarantine
+   * rename, the first rename of the pass. A mount of the topic's worktrees
+   * root appearing there is the late activity finalizeIdleCollection
+   * re-checks before anything is trashed, so the pass must roll back.
+   */
+  async function runWithLateActivity(
+    worktreesRoot: string,
+    afterQuarantine: (quarantinePath: string) => void = () => {},
+  ): Promise<{ report: GcReport; quarantinePath: string }> {
+    const realRename = fs.renameSync.bind(fs);
+    let quarantinePath = '';
+    const rename = vi.spyOn(fs, 'renameSync').mockImplementationOnce((from, to) => {
+      realRename(from, to);
+      quarantinePath = String(to);
+      state.mounts = [worktreesRoot];
+      afterQuarantine(quarantinePath);
+    });
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const groupsDir = path.join(state.dataDir, 'groups');
+    fs.mkdirSync(groupsDir, { recursive: true });
+    try {
+      return { report: await runStorageGcOnce(state.dataDir, groupsDir), quarantinePath };
+    } finally {
+      rename.mockRestore();
+    }
+  }
+
+  it('an idle topic rolled back by late activity gets every checkout back, branch clones included', async () => {
+    const canon = canonicalFixture('repo-a');
+    const primary = cloneCheckout(canon, 'rollback-all', 'repo-a', 'nc-topic');
+    const branchClone = cloneCheckout(canon, 'rollback-all', 'repo-a@feat', 'feat');
+    age(branchClone.checkout);
+    const before = { primary: treeDigest(primary.checkout), branchClone: treeDigest(branchClone.checkout) };
+    state.rows = [idleRow('rollback-all')];
+
+    const { report, quarantinePath } = await runWithLateActivity(primary.root);
+
+    expect(path.dirname(quarantinePath)).toBe(path.join(state.dataDir, '.gc-quarantine'));
+    expect(find(report, primary.topicDir)).toMatchObject({ collect: false, reason: 'aborted-late-activity' });
+    expect(fs.readdirSync(primary.root).sort()).toEqual(['repo-a', 'repo-a@feat']);
+    expect(treeDigest(primary.checkout)).toEqual(before.primary);
+    expect(treeDigest(branchClone.checkout)).toEqual(before.branchClone);
+    // Nothing is left in quarantine and no marker survives, in either place.
+    expect(fs.readdirSync(path.join(state.dataDir, '.gc-quarantine'))).toEqual([]);
+    expect(fs.readdirSync(primary.topicDir)).toEqual(['worktrees']);
+    expect(state.trashed).toEqual([]);
+  });
+
+  it('a rollback that leaves a locked superseded copy behind keeps the recovery marker', async () => {
+    const canonA = canonicalFixture('repo-a');
+    const canonB = canonicalFixture('repo-b');
+    const primary = cloneCheckout(canonA, 'rollback-locked', 'repo-a', 'nc-topic');
+    // Two linked worktrees of repo-b: `repo-b` will be superseded and locked,
+    // `repo-b@side` superseded and trashable.
+    const lockedLinked = path.join(primary.root, 'repo-b');
+    const sideLinked = path.join(primary.root, 'repo-b@side');
+    git(canonB.canonical, ['worktree', 'add', '-q', '-b', 'topic-b', lockedLinked, 'origin/HEAD']);
+    git(canonB.canonical, ['worktree', 'add', '-q', '-b', 'side-b', sideLinked, 'origin/HEAD']);
+    const lockedAdmin = git(lockedLinked, ['rev-parse', '--absolute-git-dir']);
+    age(lockedLinked);
+    age(sideLinked);
+    const before = treeDigest(primary.checkout);
+    state.rows = [idleRow('rollback-locked')];
+
+    const { report, quarantinePath } = await runWithLateActivity(primary.root, () => {
+      // A spawn recreated both repo-b slots before the rollback ran, and the
+      // copy of `repo-b` now in quarantine is locked (`git worktree lock`
+      // writes exactly this file into the worktree's admin directory).
+      fs.mkdirSync(lockedLinked, { recursive: true });
+      fs.writeFileSync(path.join(lockedLinked, 'live.txt'), 'live\n');
+      fs.mkdirSync(sideLinked, { recursive: true });
+      fs.writeFileSync(path.join(lockedAdmin, 'locked'), 'held\n');
+    });
+
+    expect(find(report, primary.topicDir)).toMatchObject({ collect: false, reason: 'aborted-late-activity' });
+    expect(treeDigest(primary.checkout)).toEqual(before);
+    // The live copy is kept; the locked quarantined copy is neither restored nor trashed...
+    expect(fs.readFileSync(path.join(lockedLinked, 'live.txt'), 'utf8')).toBe('live\n');
+    expect(fs.existsSync(path.join(quarantinePath, 'worktrees', 'repo-b', '.git'))).toBe(true);
+    // ...so the marker stays, and recoverOrphanedQuarantine can still find its way home.
+    const marker = path.join(quarantinePath, '.gc-quarantine-meta.json');
+    expect(JSON.parse(fs.readFileSync(marker, 'utf8'))).toEqual({ originalPath: primary.topicDir });
+    expect(fs.existsSync(path.join(primary.topicDir, '.gc-quarantine-meta.json'))).toBe(false);
+    // The unlocked superseded linked copy is trashed and its registration
+    // removed from the canonical of the repo its name parses to.
+    expect(state.trashed).toEqual([path.join(quarantinePath, 'worktrees', 'repo-b@side')]);
+    expect(git(canonB.canonical, ['worktree', 'list', '--porcelain'])).not.toContain('branch refs/heads/side-b\n');
+    expect(git(canonB.canonical, ['worktree', 'list', '--porcelain'])).toContain('branch refs/heads/topic-b\n');
   });
 
   it('the disposability proof runs nothing a clone configures: filters, signature programs, or a submodule', () => {

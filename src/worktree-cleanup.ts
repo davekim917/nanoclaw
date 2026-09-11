@@ -38,8 +38,8 @@ import {
   canonicalRepoDir,
   defaultTopicBranch,
   ensureRepositoryLock,
-  isRepositoryName,
   listTopicCheckouts,
+  parseCheckoutDirName,
   resolveRepositoryWorkUnit,
   topicStateDir,
   topicWorktreesDir,
@@ -805,23 +805,43 @@ function provenDisposable(dir: string, scope: 'head' | 'all'): { ok: boolean; re
   if (status === null) return { ok: false, reason: 'status-unprovable' };
   if (status !== '') return { ok: false, reason: 'dirty' };
 
-  // Scope 'all' names HEAD as well as every branch: a commit reachable only
-  // from a detached HEAD is on no branch, and `--branches` alone reads it as
-  // pushed (measured on this host). An unborn HEAD makes `log HEAD` fail, so
-  // such a repository reads as unprovable, never as clean. And only origin's
-  // remote-tracking refs are evidence for a clone: another remote (a sibling
-  // clone, a local backup) can hold commits no real remote has.
+  const stashVerdict = (): { ok: boolean; reason: string } | null => {
+    const stash = git(dir, ['stash', 'list'], env);
+    if (stash === null) return { ok: false, reason: 'stash-unprovable' };
+    return stash === '' ? null : { ok: false, reason: 'stashed' };
+  };
+  // For a clone the stash is read BEFORE the log below, which counts
+  // refs/stash too and would otherwise report a stash as 'unpushed'. The log
+  // still backs it: a refs/stash with no reflog is invisible to `stash list`
+  // but not to `--all` (measured on this host, git 2.43).
+  if (scope === 'all') {
+    const stashed = stashVerdict();
+    if (stashed) return stashed;
+  }
+
+  // Scope 'all': every local ref's commits must be on origin. `--all` names
+  // HEAD, every branch, tag, note and replace ref, the stash and every other
+  // remote's refs. A commit reachable only from a tag, a detached HEAD or a
+  // note is on no branch, and the former `--branches HEAD` read a tag-only
+  // commit as pushed (PR #657 review, round 2). HEAD stays named explicitly:
+  // `--all` alone exits 0 with no output on an unborn HEAD (measured, git
+  // 2.43), while `log HEAD` fails there, so such a repository reads as
+  // unprovable, never as clean. Only origin's remote-tracking refs are
+  // evidence for a clone: another remote (a sibling clone, a local backup)
+  // can hold commits no real remote has. Scope 'head' is a linked worktree's
+  // proof, unchanged: its HEAD against every remote-tracking ref.
   const unpushedArgs =
     scope === 'all'
-      ? ['log', '--branches', 'HEAD', '--not', '--remotes=origin', '--oneline']
+      ? ['log', '--all', 'HEAD', '--not', '--remotes=origin', '--oneline']
       : ['log', 'HEAD', '--not', '--remotes', '--oneline'];
   const unpushed = git(dir, unpushedArgs, env);
   if (unpushed === null) return { ok: false, reason: 'log-unprovable' };
   if (unpushed !== '') return { ok: false, reason: 'unpushed' };
 
-  const stash = git(dir, ['stash', 'list'], env);
-  if (stash === null) return { ok: false, reason: 'stash-unprovable' };
-  if (stash !== '') return { ok: false, reason: 'stashed' };
+  if (scope === 'head') {
+    const stashed = stashVerdict();
+    if (stashed) return stashed;
+  }
 
   // A repository that backs linked worktrees owns an object store those
   // checkouts share; trashing it destroys their history, and nothing above
@@ -1400,7 +1420,88 @@ function overlapsAny(target: string, mounts: string[]): boolean {
  * copy to the real `trash` for its 30-day retention.
  */
 /**
- * Roll a quarantined topic back toward its original path, repo by repo.
+ * Every entry name in `directory` — files and links included, not only
+ * directories — sorted; `[]` when it is absent and `null` when it cannot be
+ * read. A rollback must see everything the quarantine holds, because an entry
+ * it does not see is one it cannot put back.
+ */
+function quarantineEntryNames(directory: string): string[] | null {
+  try {
+    return fs.readdirSync(directory).sort();
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'ENOENT' ? [] : null;
+  }
+}
+
+/** Best-effort: puts a topic's recovery marker back, so recoverOrphanedQuarantine can still find the entry. */
+function rewriteQuarantineMarker(quarantinePath: string, originalPath: string): void {
+  try {
+    fs.writeFileSync(path.join(quarantinePath, QUARANTINE_META_FILE), JSON.stringify({ originalPath }));
+  } catch (err) {
+    log.error('Storage GC: could not put a quarantine recovery marker back', { quarantinePath, err });
+  }
+}
+
+/**
+ * Put one quarantined entry back at `to`, or trash it when a live copy
+ * already holds that slot. Returns true once the entry has left quarantine
+ * (restored or trashed), false while it is still there. `deregistration` is
+ * set only for a linked worktree: trashing its copy leaves a canonical
+ * registration to remove afterward, which the caller does.
+ */
+function restoreQuarantinedEntry(
+  from: string,
+  to: string,
+  deregistration: PendingWorktreeRemoval | null,
+  pendingRemovals: PendingWorktreeRemoval[],
+): boolean {
+  const entry = path.basename(from);
+  if (fs.existsSync(to)) {
+    log.warn('Storage GC: idle-topic rollback found the destination already recreated; keeping the live copy', {
+      entry,
+      to,
+    });
+    // A locked copy restores, never trashes — leave it in quarantine
+    // rather than destroy something explicitly marked "don't touch".
+    if (isWorktreeLocked(from)) {
+      log.warn('Storage GC: superseded quarantine copy is locked; leaving it in quarantine, not trashing', {
+        entry,
+        from,
+      });
+      return false;
+    }
+    try {
+      trashPath(from);
+    } catch (err) {
+      log.error('Storage GC: could not trash a superseded quarantine copy', { entry, from, err });
+      return false;
+    }
+    if (deregistration) pendingRemovals.push(deregistration);
+    return true;
+  }
+  try {
+    fs.renameSync(from, to);
+    return true;
+  } catch (err) {
+    log.error('Storage GC: idle-topic rollback rename failed for one entry; trashing that copy instead', {
+      entry,
+      from,
+      to,
+      err,
+    });
+  }
+  try {
+    trashPath(from);
+  } catch (trashErr) {
+    log.error('Storage GC: could not even trash the stranded quarantine copy', { entry, from, err: trashErr });
+    return false;
+  }
+  if (deregistration) pendingRemovals.push(deregistration);
+  return true;
+}
+
+/**
+ * Roll a quarantined topic back toward its original path, entry by entry.
  *
  * Precondition: every topic reaching finalizeIdleCollection already passed
  * provenDisposable (clean, pushed, no stash) at scan time. So no interleaving
@@ -1412,89 +1513,92 @@ function overlapsAny(target: string, mounts: string[]): boolean {
  * Naive whole-topic rename-back isn't safe: the spawn path does
  * `mkdirSync(<topic>/worktrees, {recursive:true})` (container-runner.ts:1746)
  * on its own, so a live container can already have recreated the destination
- * by the time we get here, and a bare rename would EEXIST. Reconcile per repo
- * instead: if the destination slot is absent, rename that repo back in place
- * (its registration is still valid there, so the checkout works immediately).
- * If the destination is already occupied (the agent beat us to it), keep the
- * live copy and trash the quarantined one — safe per the precondition above.
- * If one repo copy cannot be restored and is successfully trashed, remove
- * only that exact missing checkout's canonical registration afterward. A
- * repository-wide prune is forbidden here: another missing registration can
- * still hold the only copy of an agent's staged index.
+ * by the time we get here, and a bare rename would EEXIST. Reconcile per
+ * entry instead. The whole topic was collected, so the whole topic goes back:
+ * every entry of the quarantined `worktrees/` — a `<repo>` or `<repo>@<slug>`
+ * checkout, or a name the lister does not parse — and every other entry of
+ * the topic. If the destination slot is absent, rename that entry back in
+ * place (a linked worktree's registration is still valid there, so it works
+ * immediately). If the destination is already occupied (the agent beat us to
+ * it), keep the live copy and trash the quarantined one — safe per the
+ * precondition above — unless it is locked. If a linked copy cannot be
+ * restored and is successfully trashed, remove only that exact missing
+ * checkout's canonical registration afterward, from the canonical of the repo
+ * its name parses to; a clone is registered nowhere. A repository-wide prune
+ * is forbidden here: another missing registration can still hold the only
+ * copy of an agent's staged index.
+ *
+ * The recovery marker goes only once every entry has been restored or
+ * deliberately trashed. Anything left behind (a locked superseded copy, a
+ * failed trash) keeps it, so recoverOrphanedQuarantine retries next pass: an
+ * entry without a marker is one it can never identify.
  */
 function reconcileQuarantine(candidate: GcCandidate, quarantinePath: string, dataDir: string): void {
-  // Never let the recovery marker itself land back inside a restored topic.
-  try {
-    fs.rmSync(path.join(quarantinePath, QUARANTINE_META_FILE), { force: true });
-  } catch {
-    // Best-effort — a leftover marker is a leak, not a correctness issue.
-  }
-  const repos = (safeDirectories(path.join(quarantinePath, 'worktrees')) ?? []).filter(isRepositoryName);
+  const marker = path.join(quarantinePath, QUARANTINE_META_FILE);
+  const workgroupId = path.basename(path.dirname(candidate.path));
+  const quarantineWorktrees = path.join(quarantinePath, 'worktrees');
+  const entries = quarantineEntryNames(quarantineWorktrees);
   const pendingRemovals: PendingWorktreeRemoval[] = [];
 
-  if (repos.length > 0) {
+  if (entries !== null && entries.length > 0) {
+    // Shapes come from the one lister (plan §5.1): only a linked entry (its
+    // `.git` is a file) is registered with a canonical, under the repo its
+    // name parses to. A read failure here only loses deregistrations, which
+    // leave a stale registration, never lost work; every entry still goes back.
+    const linkedRepo = new Map(
+      (readTopicCheckouts(quarantineWorktrees) ?? [])
+        .filter((checkout) => checkout.shape === 'linked')
+        .map((checkout) => [checkout.name, checkout.repo] as const),
+    );
     const destWorktrees = path.join(candidate.path, 'worktrees');
     fs.mkdirSync(destWorktrees, { recursive: true });
-    for (const repo of repos) {
-      const from = path.join(quarantinePath, 'worktrees', repo);
-      const to = path.join(destWorktrees, repo);
-      if (fs.existsSync(to)) {
-        log.warn('Storage GC: idle-topic rollback found the destination already recreated; keeping the live copy', {
-          repo,
-          to,
-        });
-        // A locked copy restores, never trashes — leave it in quarantine
-        // rather than destroy something explicitly marked "don't touch".
-        if (isWorktreeLocked(from)) {
-          log.warn('Storage GC: superseded quarantine repo copy is locked; leaving it in quarantine, not trashing', {
-            repo,
-            from,
-          });
-        } else {
-          try {
-            trashPath(from);
-            pendingRemovals.push({
-              workgroupId: path.basename(path.dirname(candidate.path)),
-              repo,
-              worktreePath: to,
-            });
-          } catch (err) {
-            log.error('Storage GC: could not trash a superseded quarantine repo copy', { repo, from, err });
-          }
-        }
-        continue;
-      }
-      try {
-        fs.renameSync(from, to);
-      } catch (err) {
-        log.error('Storage GC: idle-topic rollback rename failed for one repo; trashing that copy instead', {
-          repo,
-          from,
-          to,
-          err,
-        });
-        try {
-          trashPath(from);
-          pendingRemovals.push({ workgroupId: path.basename(path.dirname(candidate.path)), repo, worktreePath: to });
-        } catch (trashErr) {
-          log.error('Storage GC: could not even trash the stranded quarantine repo copy', {
-            repo,
-            from,
-            err: trashErr,
-          });
-        }
+    let leftBehind = false;
+    for (const name of entries) {
+      const to = path.join(destWorktrees, name);
+      const repo = linkedRepo.get(name);
+      const deregistration = repo === undefined ? null : { workgroupId, repo, worktreePath: to };
+      if (!restoreQuarantinedEntry(path.join(quarantineWorktrees, name), to, deregistration, pendingRemovals)) {
+        leftBehind = true;
       }
     }
-    // Best-effort tidy of the now-empty quarantine entry; a leftover here is
-    // harmless (next reclaim pass or tmpfiles.d cleans it up regardless).
-    try {
-      fs.rmdirSync(path.join(quarantinePath, 'worktrees'));
-      fs.rmdirSync(quarantinePath);
-    } catch {
-      // Non-empty (a repo copy got stranded above) or already gone — fine.
+    // The rest of the topic beside worktrees/ goes back by the same rule.
+    const topLevel = quarantineEntryNames(quarantinePath);
+    if (topLevel === null) leftBehind = true;
+    for (const name of topLevel ?? []) {
+      if (name === 'worktrees' || name === QUARANTINE_META_FILE) continue;
+      if (!restoreQuarantinedEntry(path.join(quarantinePath, name), path.join(candidate.path, name), null, [])) {
+        leftBehind = true;
+      }
+    }
+    if (!leftBehind) {
+      try {
+        fs.rmdirSync(quarantineWorktrees);
+      } catch {
+        leftBehind = true; // Something is still in there: keep the marker.
+      }
+    }
+    if (leftBehind) {
+      log.warn('Storage GC: idle-topic rollback left entries in quarantine; keeping its recovery marker for a retry', {
+        quarantinePath,
+        original: candidate.path,
+      });
+    } else {
+      // Only now is nothing the marker describes left in quarantine.
+      try {
+        fs.rmSync(marker, { force: true });
+        fs.rmdirSync(quarantinePath);
+      } catch {
+        // Best-effort: a marker-only entry left here is reconciled next pass.
+      }
     }
   } else if (fs.existsSync(quarantinePath)) {
-    // No repo split to reconcile — fall back to a whole-topic restore.
+    // No worktrees split to reconcile — fall back to a whole-topic restore.
+    // Never let the recovery marker itself land back inside a restored topic.
+    try {
+      fs.rmSync(marker, { force: true });
+    } catch {
+      // Best-effort — a leftover marker is a leak, not a correctness issue.
+    }
     try {
       fs.renameSync(quarantinePath, candidate.path);
     } catch (err) {
@@ -1507,6 +1611,7 @@ function reconcileQuarantine(candidate: GcCandidate, quarantinePath: string, dat
         trashPath(quarantinePath);
       } catch (trashErr) {
         log.error('Storage GC: could not even trash the stranded quarantine copy', { quarantinePath, err: trashErr });
+        rewriteQuarantineMarker(quarantinePath, candidate.path);
       }
     }
   }
@@ -1687,7 +1792,9 @@ function removeMissingWorktreeRegistration(
     typeof entry.repo !== 'string' ||
     typeof entry.worktreePath !== 'string' ||
     !path.isAbsolute(entry.worktreePath) ||
-    path.basename(entry.worktreePath) !== entry.repo ||
+    // `<repo>` or `<repo>@<slug>`: the checkout's name must parse to the repo
+    // whose canonical holds the registration.
+    parseCheckoutDirName(path.basename(entry.worktreePath))?.repo !== entry.repo ||
     path.basename(path.dirname(entry.worktreePath)) !== 'worktrees'
   ) {
     return false;
@@ -2054,10 +2161,12 @@ async function finalizeIdleCollection(
     return { ok: false, reason: 'aborted-late-activity' };
   }
 
-  // Capture the repo list before trashing (quarantinePath won't exist to list
-  // afterward).
-  const repoListing = safeDirectories(path.join(quarantinePath, 'worktrees'));
-  if (repoListing === null) {
+  // Capture the checkouts before trashing (quarantinePath won't exist to list
+  // afterward), through the one lister. Only a linked worktree (its `.git` is
+  // a file) is registered with a canonical, under the repo its name parses
+  // to, `<repo>` or `<repo>@<slug>`; a clone has nothing to deregister.
+  const listed = readTopicCheckouts(path.join(quarantinePath, 'worktrees'));
+  if (listed === null) {
     // A real read failure (EACCES/EIO), not "no worktrees" — treating it as
     // empty would prune nothing yet still trash the topic. Leave the entry in
     // quarantine untouched: recoverOrphanedQuarantine retries it next pass,
@@ -2067,8 +2176,14 @@ async function finalizeIdleCollection(
     });
     return { ok: false, reason: 'quarantine-unreadable' };
   }
-  const repos = repoListing.filter(isRepositoryName);
   const workgroupId = path.basename(path.dirname(candidate.path));
+  const deregistrations: PendingWorktreeRemoval[] = listed
+    .filter((checkout) => checkout.shape === 'linked')
+    .map((checkout) => ({
+      workgroupId,
+      repo: checkout.repo,
+      worktreePath: path.join(candidate.path, 'worktrees', checkout.name),
+    }));
 
   // #183: the durable-write fence runs LAST, immediately before the
   // irreversible trash — not before freshMounts/repoListing above, which
@@ -2116,14 +2231,7 @@ async function finalizeIdleCollection(
     // leaves a durable record instead of a silently dangling registration.
     // runPendingPrunes sweeps this at the start of the next apply pass.
     const priorPending = readPendingPrunes(dataDir);
-    const journaled = writePendingPrunes(dataDir, [
-      ...priorPending,
-      ...repos.map((repo) => ({
-        workgroupId,
-        repo,
-        worktreePath: path.join(candidate.path, 'worktrees', repo),
-      })),
-    ]);
+    const journaled = writePendingPrunes(dataDir, [...priorPending, ...deregistrations]);
     if (!journaled) {
       // Codex P2: a read-only dataDir or ENOSPC here must not fall through to
       // trashing anyway — that's exactly the crash-without-a-record window
@@ -2157,23 +2265,21 @@ async function finalizeIdleCollection(
   // because the checkout was proven disposable before trash and the helper
   // re-proves that the private linked index is clean and unlocked. Never use
   // repository-wide prune: unrelated missing owners may retain staged work.
-  for (const repo of repos) {
-    const pending = {
-      workgroupId,
-      repo,
-      worktreePath: path.join(candidate.path, 'worktrees', repo),
-    };
+  for (const pending of deregistrations) {
     if (!removeMissingWorktreeRegistration(pending, dataDir)) {
-      log.warn(
-        'Storage GC: targeted worktree deregistration failed after idle collection; retry is journaled',
-        pending,
-      );
+      log.warn('Storage GC: targeted worktree deregistration failed after idle collection; retry is journaled', {
+        ...pending,
+      });
     } else {
       writePendingPrunes(
         dataDir,
         readPendingPrunes(dataDir).filter(
           (entry) =>
-            !(entry.workgroupId === workgroupId && entry.repo === repo && entry.worktreePath === pending.worktreePath),
+            !(
+              entry.workgroupId === pending.workgroupId &&
+              entry.repo === pending.repo &&
+              entry.worktreePath === pending.worktreePath
+            ),
         ),
       );
     }
@@ -2258,10 +2364,10 @@ function recoverOrphanedQuarantine(dataDir: string, report: GcReport): void {
       continue;
     }
     if (category === 'clone') {
-      // A clone's rollback is a plain rename; reconcileQuarantine's per-repo
-      // split and canonical prune would be meaningless here and its
-      // `isRepositoryName` filter could misread a coincidental `worktrees`
-      // directory inside the clone's own tree.
+      // A clone's rollback is a plain rename; reconcileQuarantine's per-entry
+      // split and canonical deregistration would be meaningless here, and it
+      // would take a coincidental `worktrees` directory inside the clone's
+      // own tree for a topic's.
       restoreQuarantinedClone(originalPath, quarantinePath);
       log.warn('Storage GC: restored an orphaned clone quarantine entry after an interrupted pass', {
         originalPath,
@@ -2285,7 +2391,7 @@ function recoverOrphanedQuarantine(dataDir: string, report: GcReport): void {
     };
     if (fs.existsSync(originalPath)) {
       // A spawn recreated the destination while the process was down —
-      // reconcile exactly like a live rollback (per-repo, conditional prune).
+      // reconcile exactly like a live rollback (per entry, exact deregistration).
       reconcileQuarantine(placeholder, quarantinePath, dataDir);
       log.warn('Storage GC: reconciled an orphaned quarantine entry after an interrupted pass', {
         originalPath,
@@ -2320,6 +2426,9 @@ function recoverOrphanedQuarantine(dataDir: string, report: GcReport): void {
         quarantinePath,
         err,
       });
+      // The marker was removed so it would not land in the restored topic;
+      // the entry stayed, so put it back or no later pass can find it.
+      rewriteQuarantineMarker(quarantinePath, originalPath);
     }
   }
   try {
