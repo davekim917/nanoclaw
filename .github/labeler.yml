@@ -65,6 +65,8 @@ risk:high:
     - 'src/dashboard/steer.ts'
     - 'src/dashboard/assign.ts'
     - 'src/dashboard/api/scheduled-shared.ts'
+    - 'src/dashboard/thread-close.ts'
+    - 'src/dashboard/thread-snooze.ts'
     # Irreversible against a live DB
     - 'src/db/migrations/**'
     # Supply chain: pnpm allowBuilds, and the container image it builds
@@ -72,17 +74,16 @@ risk:high:
     - 'container/Dockerfile'
     - 'container/build.sh'
     # Deploy and rollback (src/deploy-crash-guard.ts is covered by *guard*), and the
-    # nightly host snapshot that scans for secrets then pushes config to a remote (and its
-    # selfcheck), and the wiki autopush, which pushes to a remote with no scan at all
+    # nightly host snapshot that scans for secrets then pushes config to a remote
+    # (and its selfcheck, covered by the * glob), off secret-scan.sh's pattern set
+    # (a weakened pattern there silently disables the scan)
     - 'scripts/deploy.sh'
     - 'scripts/git-safety*.sh'
-    - 'scripts/wiki-autopush.sh'
     # The pre-push secret-scan hook agents' own containers run when pushing a wiki repo
-    # (and its selfcheck/installer) — a weakened pattern here silently lets a secret
-    # reach a real remote with no other gate on that path at all
+    # (and its selfcheck) — a weakened pattern here silently lets a secret reach a real
+    # remote with no other gate on that path at all
     - 'scripts/wiki-pre-push-hook*.sh'
-    - 'scripts/install-wiki-pre-push-hook.sh'
-    - 'scripts/lib/wiki-secret-patterns.sh'
+    - 'scripts/lib/secret-scan.sh'
     # The gates themselves: CI workflows, this file, the git hooks, the public-boundary
     # checkers and allowlist, and the PR review loop that IS the review gate. CI runs
     # only the portable boundary mode, so the strict identifier check runs only in the
@@ -94,6 +95,31 @@ risk:high:
     - '.public-boundary-allowlist.json'
     - 'container/skills/pr-review-loop/**'
     - 'docs/review-policy.md'
+    # Executable agent and tool config: a hook (.claude/settings.json), an
+    # auto-trusted MCP server (.mcp.json — any agent/CI tooling that honors
+    # enableAllProjectMcpServers connects to it with no prompt), Claude Code's own
+    # project trust/onboarding state (.claude.json), a ripgrep config (.ripgreprc —
+    # the claude-code-action's own restore-config.ts:26-35 SENSITIVE_PATHS list
+    # names it alongside these, i.e. Anthropic's own threat model treats it as
+    # sensitive project config, not just prose), or a submodule URL (.gitmodules,
+    # which a clone/checkout can fetch from). All five merge unreviewed today and
+    # run (or load) the moment something checks the tree out and runs Claude
+    # Code against it with default settings — including, in principle,
+    # .github/workflows/shadow-review.yml's own reviewer, which DOES check the
+    # tree out (required — see that file's top comment for why a no-checkout
+    # design doesn't work against this action) but neutralizes them via
+    # `--setting-sources user` and `--strict-mcp-config` in its `claude_args`.
+    # CLAUDE.local.md is on that same SENSITIVE_PATHS list but deliberately NOT
+    # here: .gitignore:29 (`**/CLAUDE.local.md`) means it can never appear in a
+    # PR diff, so this rule would never fire. Plain CLAUDE.md is also NOT on
+    # this list: it changes often enough that flagging every edit has a real
+    # review cost, and shadow-review.yml's own reviewer already suppresses it via
+    # `--setting-sources user` — see that file's top comment.
+    - '.claude/**'
+    - '.mcp.json'
+    - '.claude.json'
+    - '.ripgreprc'
+    - '.gitmodules'
     # The agent-runner boot snapshot mounted read-only into every group, and its MCP
     # tool surface
     - 'src/agent-runner-source.ts'
@@ -155,6 +181,8 @@ risk:credential:
     - 'src/dashboard/steer.ts'
     - 'src/dashboard/assign.ts'
     - 'src/dashboard/api/scheduled-shared.ts'
+    - 'src/dashboard/thread-close.ts'
+    - 'src/dashboard/thread-snooze.ts'
 
 risk:migration:
 - changed-files:
@@ -173,10 +201,8 @@ risk:deploy:
   - any-glob-to-any-file:
     - 'scripts/deploy.sh'
     - 'scripts/git-safety*.sh'
-    - 'scripts/wiki-autopush.sh'
     - 'scripts/wiki-pre-push-hook*.sh'
-    - 'scripts/install-wiki-pre-push-hook.sh'
-    - 'scripts/lib/wiki-secret-patterns.sh'
+    - 'scripts/lib/secret-scan.sh'
 
 risk:gates:
 - changed-files:
@@ -188,6 +214,11 @@ risk:gates:
     - '.public-boundary-allowlist.json'
     - 'container/skills/pr-review-loop/**'
     - 'docs/review-policy.md'
+    - '.claude/**'
+    - '.mcp.json'
+    - '.claude.json'
+    - '.ripgreprc'
+    - '.gitmodules'
 
 risk:runner:
 - changed-files:
