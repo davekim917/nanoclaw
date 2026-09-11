@@ -26,6 +26,7 @@ import {
   _convertMismatchMemoSizeForTesting,
   _resetDependencyCacheForTesting,
   agentImageFingerprint,
+  checkCompleteness,
   collectCacheGarbage,
   convertPackageDir,
   DEPENDENCY_CACHE_MAX_MUTATIONS_PER_PASS,
@@ -72,6 +73,8 @@ interface PkgSpec {
   name: string;
   version: string;
   files: Record<string, string>;
+  /** Extra fields for its package-lock and hidden-lockfile entries, such as `os`/`cpu`. */
+  lock?: Record<string, unknown>;
 }
 
 const PKGS: PkgSpec[] = [
@@ -108,14 +111,15 @@ function variantPkgs(tag: string): PkgSpec[] {
   ];
 }
 
-function lockEntries(pkgs: PkgSpec[]): Record<string, { version: string; resolved: string; integrity: string }> {
-  const entries: Record<string, { version: string; resolved: string; integrity: string }> = {};
+function lockEntries(pkgs: PkgSpec[]): Record<string, Record<string, unknown>> {
+  const entries: Record<string, Record<string, unknown>> = {};
   for (const pkg of pkgs) {
     const base = pkg.name.split('/').pop()!;
     entries[pkg.key] = {
       version: pkg.version,
       resolved: `https://registry.npmjs.org/${pkg.name}/-/${base}-${pkg.version}.tgz`,
       integrity: `sha512-${crypto.createHash('sha256').update(`${pkg.name}@${pkg.version}`).digest('base64')}`,
+      ...pkg.lock,
     };
   }
   return entries;
@@ -823,6 +827,55 @@ describe('dependency cache', () => {
 
     expect(cacheEntries('wg-a')).toEqual([keyOf(src)]);
     expect(pass.counters.adopted).toBe(1);
+  });
+
+  it('refuses a tree holding a package installed for another cpu, so no entry contradicts its key', () => {
+    // The first report pass on the host found arm64 installs under x64 keys:
+    // the same lockfile, with arm64 esbuild and rollup builds where x64 ones belong.
+    const foreignCpu = process.arch === 'arm64' ? 'x64' : 'arm64';
+    const native: PkgSpec = {
+      key: `node_modules/@esbuild/linux-${foreignCpu}`,
+      name: `@esbuild/linux-${foreignCpu}`,
+      version: '0.25.0',
+      files: { 'bin/esbuild': 'native binary\n' },
+      lock: { optional: true, os: ['linux'], cpu: [foreignCpu] },
+    };
+    const src = makeProject(path.join(tmpRoot, 'topic-a', 'repo'), { pkgs: [...PKGS, native] });
+    const pass = startPass();
+
+    expect(processPackageDir(pass, 'wg-a', src)).toBe('incomplete');
+
+    expect(cacheEntries('wg-a')).toEqual([]);
+    expect(log.info).toHaveBeenCalledWith(
+      'dependency-cache: decision',
+      expect.objectContaining({
+        op: 'incomplete',
+        detail: `installed for another platform: ${native.key} (cpu=["${foreignCpu}"])`,
+      }),
+    );
+  });
+
+  it.each([
+    [{ cpu: ['x64'] }, true],
+    [{ cpu: ['arm64'] }, false],
+    [{ cpu: ['!arm64'] }, true],
+    [{ cpu: ['!x64'] }, false],
+    [{ cpu: ['any'] }, true],
+    [{ os: ['darwin'] }, false],
+    [{ os: ['!win32'], cpu: ['x64', 'arm64'] }, true],
+    // libc is deliberately unchecked: real trees carry -gnu and -musl builds side by side.
+    [{ libc: ['musl'] }, true],
+  ])("matches an installed package's os/cpu as npm does: %j on linux-x64 is complete: %s", (constraints, complete) => {
+    const native: PkgSpec = {
+      key: 'node_modules/native',
+      name: 'native',
+      version: '1.0.0',
+      files: { 'index.js': 'module.exports = 0;\n' },
+      lock: { optional: true, ...constraints },
+    };
+    const pkgDir = makeProject(path.join(tmpRoot, 'topic-a', 'repo'), { pkgs: [...PKGS, native] });
+
+    expect(checkCompleteness(pkgDir, { os: 'linux', cpu: 'x64' }).complete).toBe(complete);
   });
 
   it('a pass mutates at most the per-pass cap and defers the rest', () => {

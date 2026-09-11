@@ -71,10 +71,22 @@ export const DEPENDENCY_CACHE_MAX_MUTATIONS_PER_PASS = 5;
 
 // ── Environment fingerprint ─────────────────────────────────────────────────
 
+/**
+ * The platform every keyed install is for: the agent container's (§5.7.2).
+ * The key names it, and verified completeness refuses a tree holding a package
+ * built for any other (§5.7.3 rule 4), so an entry's contents match its key.
+ */
+export interface InstallPlatform {
+  readonly os: string;
+  readonly cpu: string;
+}
+
+const INSTALL_PLATFORM: InstallPlatform = { os: 'linux', cpu: process.arch };
+
 const fingerprintByImage = new Map<string, string>();
 
-export function envFingerprint(nodeVersion: string, arch: string = process.arch): string {
-  return `node=${nodeVersion};platform=linux;arch=${arch}`;
+export function envFingerprint(nodeVersion: string, arch: string = INSTALL_PLATFORM.cpu): string {
+  return `node=${nodeVersion};platform=${INSTALL_PLATFORM.os};arch=${arch}`;
 }
 
 /**
@@ -401,23 +413,69 @@ function isContainedPackageKey(key: string): boolean {
 }
 
 /**
+ * npm's os/cpu list match, as npm-install-checks 7.1.2 `checkList` decides it
+ * (lib/index.js:59-83): a `!value` naming the platform refuses; otherwise the
+ * list must name it, hold only negations, or be exactly `any`.
+ */
+function platformListAccepts(value: string, list: unknown): boolean {
+  const entries = typeof list === 'string' ? [list] : list;
+  if (!Array.isArray(entries)) return true;
+  if (entries.length === 1 && entries[0] === 'any') return true;
+  let negated = 0;
+  let match = false;
+  for (const entry of entries) {
+    if (typeof entry !== 'string') continue;
+    if (entry.startsWith('!')) {
+      negated += 1;
+      if (entry.slice(1) === value) return false;
+    } else if (entry === value) {
+      match = true;
+    }
+  }
+  return match || negated === entries.length;
+}
+
+/** The first `os`/`cpu` constraint of an installed package that `platform` fails, as `cpu=["arm64"]`. */
+function foreignPlatform(entry: JsonObject, platform: InstallPlatform): string | null {
+  for (const [field, value] of [
+    ['os', platform.os],
+    ['cpu', platform.cpu],
+  ] as const) {
+    if (entry[field] !== undefined && !platformListAccepts(value, entry[field])) {
+      return `${field}=${JSON.stringify(entry[field])}`;
+    }
+  }
+  return null;
+}
+
+/**
  * A tree is complete when:
  *   (1) every hidden-lockfile package entry (the root excluded) is in
  *       package-lock.json with equal {version, resolved, integrity}, and every
  *       package-lock entry ABSENT from the hidden lockfile is `optional: true`;
  *   (2) every hidden-lockfile package path is a real directory whose
- *       package.json name and version match; and
- *   (3) no regular file is newer than the hidden lockfile.
+ *       package.json name and version match;
+ *   (3) no regular file is newer than the hidden lockfile; and
+ *   (4) every installed package that declares `os` or `cpu` accepts the
+ *       install platform.
  *
  * (1) deliberately does not ask WHY an optional package is absent (skipped for
  * this platform, skipped with its dependent, or failed to install). Phase 1
  * never changes a workspace's file set: adopt shares the source tree's own
  * inodes, and convert requires inventory equality with the entry, so only
  * identical installs merge and no working tree is replaced by a degraded one.
- * A platform-aware rule belongs to linking into a workspace that never
- * installed (plan Phase 2).
+ * Requiring the platform's own optional packages to be present belongs to
+ * linking into a workspace that never installed (plan Phase 2).
+ *
+ * (4) keeps an entry true to its key, whose fingerprint names the platform: a
+ * tree installed for another CPU passes (1)-(3), and the first report pass on
+ * the host found arm64 trees under x64 keys. Only installed packages are
+ * checked, and without --force npm never installs one whose os/cpu excludes the
+ * platform it installs for (npm-install-checks lib/index.js:34-35), so a
+ * genuine install is never refused. libc is not checked: real trees hold the
+ * -gnu and -musl builds of a native package side by side.
  */
-export function checkCompleteness(pkgDir: string): Completeness {
+export function checkCompleteness(pkgDir: string, platform: InstallPlatform = INSTALL_PLATFORM): Completeness {
   const nm = path.join(pkgDir, NODE_MODULES);
   const incomplete = (reason: string): Completeness => ({ complete: false, reason });
   const hiddenPath = path.join(nm, HIDDEN_LOCKFILE);
@@ -449,6 +507,8 @@ export function checkCompleteness(pkgDir: string): Completeness {
     for (const field of ['version', 'resolved', 'integrity'] as const) {
       if (hidden[field] !== locked[field]) return incomplete(`hidden lockfile ${field} differs: ${key}`);
     }
+    const foreign = foreignPlatform(hidden, platform);
+    if (foreign) return incomplete(`installed for another platform: ${key} (${foreign})`);
     if (!isContainedPackageKey(key)) return incomplete(`unsupported package path: ${key}`);
     const dir = path.join(pkgDir, key);
     if (!isRealDir(dir)) return incomplete(`package dir missing: ${key}`);
