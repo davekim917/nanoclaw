@@ -377,6 +377,56 @@ git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1 \
     "$(git --git-dir="$REMOTE" log --oneline host-snapshot)" \
   || ok "missing-lib run pushed nothing — fails closed"
 
+# ═══ A PRESENT but CORRUPT lib/secret-scan.sh also fails closed ═══════════
+# Distinct from the missing-file case above: git-safety.sh now calls
+# secret_scan_selftest() right after sourcing the lib (#666 rework) so a
+# lib that sources cleanly (rc=0, every function/variable name still
+# exists) but whose regex/variables are broken is still caught, not just a
+# lib that fails to source at all.
+new_fixture
+BADLIB_DIR="$FIX/badlib-scripts"
+mkdir -p "$BADLIB_DIR/lib"
+cp "$REAL" "$BADLIB_DIR/git-safety.sh"
+sed '/^SECRET_BLOCK_RE=/d' "$(dirname "$REAL")/lib/secret-scan.sh" > "$BADLIB_DIR/lib/secret-scan.sh"
+echo '{"a":2}' > "$G/foo/container.json"
+OUT=$(env NANOCLAW_DIR="$NCDIR" GIT_SAFETY_DIR="$BACKUPS" HOME="$HOME2" bash "$BADLIB_DIR/git-safety.sh" 2>&1)
+RC=$?
+[ "$RC" -ne 0 ] && ok "a corrupt (but sourceable) lib/secret-scan.sh fails the run" \
+  || bad "a corrupt lib/secret-scan.sh did NOT fail the run (fail-open)" "$OUT"
+case "$OUT" in
+  *"self-test"*) ok "corrupt-lib failure names the self-test, not a generic error" ;;
+  *) bad "corrupt-lib failure did not mention the self-test" "$OUT" ;;
+esac
+git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1 \
+  && bad "corrupt-lib run pushed a host-snapshot commit anyway (fail-OPEN, gate never ran)" \
+    "$(git --git-dir="$REMOTE" log --oneline host-snapshot)" \
+  || ok "corrupt-lib run pushed nothing — fails closed"
+
+# ═══ SECRET_BLOCK_RE is a literal subset of SECRET_RE (#666 addendum 2) ═══
+# git-safety.sh has only ONE tier (over the full, case-insensitive
+# SECRET_RE) — it never consults SECRET_BLOCK_RE directly. This assertion
+# exists here anyway because git-safety.sh and the wiki pre-push hook share
+# this one lib file: if a future edit ever widened SECRET_BLOCK_RE past
+# SECRET_RE, the wiki hook's BLOCK tier would start rejecting pushes that
+# git-safety.sh's own single-tier scan would have let through as clean —
+# silently inconsistent secret handling between the two call sites.
+# shellcheck source=lib/secret-scan.sh
+source "$(dirname "$REAL")/lib/secret-scan.sh"
+BLOCK_SUBSET_FIXTURES=(
+  'export SLACK_APP_TOKEN=xapp-1-A0123-4567890123-abcdefabcdefabcdefabcdefabcdef'
+  'export GITHUB_TOKEN=ghp_16C7e42F292c6912E7710c838347Ae178B4aXYZ123'
+  'AKIAIOSFODNN7ABCDEFG'
+  '-----BEGIN PGP PRIVATE KEY BLOCK-----'
+)
+BLOCK_SUBSET_OK=1
+for line in "${BLOCK_SUBSET_FIXTURES[@]}"; do
+  if LC_ALL=C grep -qE "$SECRET_BLOCK_RE" <<<"$line" && ! LC_ALL=C grep -qiE "$SECRET_RE" <<<"$line"; then
+    BLOCK_SUBSET_OK=0
+    bad "BLOCK-subset: '$line' matches SECRET_BLOCK_RE but not SECRET_RE" ""
+  fi
+done
+[ "$BLOCK_SUBSET_OK" -eq 1 ] && ok "SECRET_BLOCK_RE stays a literal subset of SECRET_RE across sample fixtures"
+
 # ═══ Worktree slugs get a hash suffix (uniqueness even after truncation) ══
 # Unit-test slug() directly (extracted verbatim from the shipped script),
 # with two paths engineered to be BYTE-IDENTICAL in their last 100 chars —

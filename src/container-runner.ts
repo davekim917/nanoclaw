@@ -171,6 +171,8 @@ import {
   topicWorktreesDir,
   type RepositoryWorkUnit,
 } from './repository-workspaces.js';
+import { MANAGED_GIT_HOOKS_DIR, assertManagedGitHooksIntegrity } from './managed-git-hooks.js';
+import { repositoryConfigPath, safeGitConfigGet } from './safe-git.js';
 import { resolveStoragePolicy } from './storage-manager.js';
 import { assertStorageAdmissionInBackground } from './storage-maintenance-worker.js';
 import { acquireStorageActivityLease, type StorageActivityLease } from './storage-activity.js';
@@ -1461,7 +1463,7 @@ export async function resolveSessionRepositoryWorkUnit(
   });
 }
 
-function canonicalGitControlMounts(gitDir: string, stateDir: string): VolumeMount[] {
+export function canonicalGitControlMounts(gitDir: string, stateDir: string): VolumeMount[] {
   const config = path.join(gitDir, 'config');
   const head = path.join(gitDir, 'HEAD');
   const index = path.join(gitDir, 'index');
@@ -1517,6 +1519,29 @@ function canonicalGitControlMounts(gitDir: string, stateDir: string): VolumeMoun
     { hostPath: hooks, containerPath: hooks, readonly: true },
     { hostPath: objectsInfo, containerPath: objectsInfo, readonly: true },
   ];
+}
+
+/**
+ * Mounts MANAGED_GIT_HOOKS_DIR at its exact host path — the only way a
+ * `core.hooksPath` value pointing there (written by sanitizeCanonicalConfig
+ * or the repository-migration hooksPath pass) resolves inside the
+ * container, since `.git/config` is itself bind-mounted read-only at its
+ * own exact host path (canonicalGitControlMounts above) and carries that
+ * absolute string verbatim.
+ *
+ * `core.hooksPath` IS the signal read here — this does not re-derive
+ * "is this repo scan-policy" from the repo name; it reads whatever value
+ * is already committed in the repo's own .git/config (managed-git-hooks.ts
+ * header explains why). Fails closed: any spawn that would mount a
+ * scan-policy repo also asserts the managed hook's integrity first
+ * (assertManagedGitHooksIntegrity throws on anything but an exact match to
+ * what shipped) — never mounts a hook that doesn't match.
+ */
+export function scanPolicyHookMounts(repository: { gitDir: string }): VolumeMount[] {
+  const configuredHooksPath = safeGitConfigGet(repositoryConfigPath(repository.gitDir), 'core.hooksPath');
+  if (configuredHooksPath !== MANAGED_GIT_HOOKS_DIR) return [];
+  assertManagedGitHooksIntegrity();
+  return [{ hostPath: MANAGED_GIT_HOOKS_DIR, containerPath: MANAGED_GIT_HOOKS_DIR, readonly: true }];
 }
 
 async function spawnContainer(
@@ -4410,6 +4435,7 @@ export async function buildMounts(
     // Git can fetch/commit/push without being able to clobber the host
     // canonical checkout state.
     mounts.push(...canonicalGitControlMounts(repository.gitDir, path.dirname(repository.lockPath)));
+    mounts.push(...scanPolicyHookMounts(repository));
     mounts.push({ hostPath: repository.lockPath, containerPath: repository.lockPath, readonly: false });
     mounts.push({ hostPath: repository.originPinPath, containerPath: repository.originPinPath, readonly: true });
   }

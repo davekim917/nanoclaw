@@ -124,6 +124,7 @@ vi.mock('./memory-admission.js', () => {
   };
 });
 
+import { execFileSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -159,7 +160,10 @@ import {
   isContainerRunning,
   isContainerSpawning,
   renderCapabilitiesSnapshot,
+  scanPolicyHookMounts,
 } from './container-runner.js';
+import { MANAGED_GIT_HOOKS_DIR, refreshManagedGitHooks } from './managed-git-hooks.js';
+import { repositoryConfigPath, safeGitConfigSet } from './safe-git.js';
 import { formatMemoryMb, resolveContainerResources } from './container-resources.js';
 import { mergeWorkgroupAndGroupSecrets } from './onecli-secrets.js';
 import { getProviderContainerConfig } from './providers/provider-container-registry.js';
@@ -2373,5 +2377,56 @@ describe('renderCapabilitiesSnapshot (seam 3: getHostCapabilities is async)', ()
     } finally {
       await closeDb();
     }
+  });
+});
+
+describe('scanPolicyHookMounts', () => {
+  function gitFixtureRepo(name: string): string {
+    const dir = path.join(uniqueTmpRoot(`scan-policy-hook-${name}`), 'repo');
+    fs.mkdirSync(dir, { recursive: true });
+    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'init', '-q', '-b', 'main'], { cwd: dir });
+    return dir;
+  }
+
+  it('mounts nothing for a repo with no core.hooksPath set', () => {
+    const repo = gitFixtureRepo('unset');
+    expect(scanPolicyHookMounts({ gitDir: path.join(repo, '.git') })).toEqual([]);
+  });
+
+  it('mounts nothing for a repo whose core.hooksPath is /dev/null', () => {
+    const repo = gitFixtureRepo('devnull');
+    safeGitConfigSet(repositoryConfigPath(path.join(repo, '.git')), 'core.hooksPath', '/dev/null');
+    expect(scanPolicyHookMounts({ gitDir: path.join(repo, '.git') })).toEqual([]);
+  });
+
+  it('mounts nothing for a repo whose core.hooksPath points somewhere else entirely', () => {
+    const repo = gitFixtureRepo('other');
+    safeGitConfigSet(repositoryConfigPath(path.join(repo, '.git')), 'core.hooksPath', '.husky/_');
+    expect(scanPolicyHookMounts({ gitDir: path.join(repo, '.git') })).toEqual([]);
+  });
+
+  it('mounts MANAGED_GIT_HOOKS_DIR read-only at its own host path when core.hooksPath points there, after a valid refresh', () => {
+    // Any mount list containing a scan-policy canonical gitDir must also
+    // contain the managed-hooks mount — the invariant this function exists
+    // to enforce. refreshManagedGitHooks() runs for real here (against
+    // TEST_DATA_DIR, per this file's config.js mock) so
+    // assertManagedGitHooksIntegrity() inside scanPolicyHookMounts has a
+    // genuinely valid installed copy to check against, not a stub.
+    refreshManagedGitHooks();
+    const repo = gitFixtureRepo('managed');
+    safeGitConfigSet(repositoryConfigPath(path.join(repo, '.git')), 'core.hooksPath', MANAGED_GIT_HOOKS_DIR);
+    expect(scanPolicyHookMounts({ gitDir: path.join(repo, '.git') })).toEqual([
+      { hostPath: MANAGED_GIT_HOOKS_DIR, containerPath: MANAGED_GIT_HOOKS_DIR, readonly: true },
+    ]);
+  });
+
+  it('fails closed: throws instead of mounting when the installed hook does not match the shipped source', () => {
+    refreshManagedGitHooks();
+    fs.appendFileSync(path.join(MANAGED_GIT_HOOKS_DIR, 'pre-push'), '\n# tampered\n');
+    const repo = gitFixtureRepo('tampered');
+    safeGitConfigSet(repositoryConfigPath(path.join(repo, '.git')), 'core.hooksPath', MANAGED_GIT_HOOKS_DIR);
+    expect(() => scanPolicyHookMounts({ gitDir: path.join(repo, '.git') })).toThrow();
+    // Restore for any later test in this suite that also depends on a valid managed-hooks dir.
+    refreshManagedGitHooks();
   });
 });

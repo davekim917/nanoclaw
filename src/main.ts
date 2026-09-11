@@ -62,6 +62,7 @@ import { drainClosedSessionPendingBacklog } from './session-close-expiry.js';
 // src/host-lifecycle.ts at import time. See "7–10b" in startNanoClaw below.
 import './worktree-cleanup.js';
 import './repo-freshness.js';
+import './managed-git-hooks.js';
 import './plugin-updater.js';
 import './commit-scan.js';
 import './backlog-canvas.js';

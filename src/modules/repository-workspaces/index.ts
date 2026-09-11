@@ -11,6 +11,7 @@ import {
   type RepositoryMountQuiescence,
 } from '../../container-restart.js';
 import { REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS } from '../../config.js';
+import { MANAGED_GIT_HOOKS_DIR, isScanPolicyRepositoryName } from '../../managed-git-hooks.js';
 import { getAgentGroup, getAllAgentGroups } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
@@ -207,9 +208,15 @@ function sanitizeCanonicalConfig(repoPath: string, expectedOrigin: string): void
   }
   const formatVersion = objectFormat === 'sha256' ? '1' : '0';
   const escapedOrigin = normalizeOrigin(origin).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
+  // Scan-policy repos (today: the wiki canonical repo) point at the ONE
+  // host-managed, read-only-mounted hook directory instead of /dev/null —
+  // see managed-git-hooks.ts's header for why hooksPath itself is the
+  // signal container-runner.ts reads to decide whether to mount it.
+  const hooksPath = isScanPolicyRepositoryName(path.basename(repoPath)) ? MANAGED_GIT_HOOKS_DIR : '/dev/null';
+  const escapedHooksPath = hooksPath.replaceAll('\\', '\\\\').replaceAll('"', '\\"');
   const body =
     `[core]\n\trepositoryformatversion = ${formatVersion}\n\tfilemode = true\n\tbare = false\n` +
-    `\tlogallrefupdates = true\n\thooksPath = /dev/null\n\tfsmonitor = false\n` +
+    `\tlogallrefupdates = true\n\thooksPath = ${escapedHooksPath}\n\tfsmonitor = false\n` +
     (objectFormat === 'sha256' ? `[extensions]\n\tobjectFormat = sha256\n` : '') +
     `[remote "origin"]\n\turl = ${escapedOrigin}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n` +
     `[gc]\n\tauto = 0\n\tworktreePruneExpire = never\n`;

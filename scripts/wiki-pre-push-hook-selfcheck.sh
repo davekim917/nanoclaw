@@ -1,34 +1,51 @@
 #!/usr/bin/env bash
-# Self-check for scripts/wiki-pre-push-hook.sh and
-# scripts/install-wiki-pre-push-hook.sh, modeled on
-# scripts/wiki-autopush-selfcheck.sh / scripts/git-safety-selfcheck.sh:
-# builds real fixture repos (a throwaway NANOCLAW_DIR with a wiki repo
-# cloned from a local bare remote), runs the SHIPPED installer and the
-# SHIPPED hook it installs, and asserts on repo/remote state afterwards —
-# never a re-implementation of either script's logic. Never touches a real
-# nanoclaw-v2 install or a real canonical repository.
+# Self-check for scripts/wiki-pre-push-hook.sh, modeled on
+# scripts/git-safety-selfcheck.sh: builds real fixture repos (a bare
+# remote plus a wiki-shaped worktree), installs the SHIPPED hook + the
+# SHIPPED scripts/lib/secret-scan.sh directly into `.git/hooks/` (this
+# script simulates what src/managed-git-hooks.ts writes at host startup —
+# there is no per-repo installer script anymore; the TS module and its
+# vitest coverage are the source of truth for the real host behavior), and
+# runs a real `git push` against it. Never a re-implementation of the
+# hook's own logic. Never touches a real nanoclaw-v2 install or a real
+# canonical repository.
 #
 #   bash scripts/wiki-pre-push-hook-selfcheck.sh
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INSTALLER="$SCRIPT_DIR/install-wiki-pre-push-hook.sh"
+HOOK_SRC="$SCRIPT_DIR/wiki-pre-push-hook.sh"
+PATTERNS_SRC="$SCRIPT_DIR/lib/secret-scan.sh"
 FAILED=0
 ok() { printf 'PASS  %s\n' "$1"; }
 bad() { printf 'FAIL  %s\n     %s\n' "$1" "$2"; FAILED=1; }
 
 # ── fixture builder ──────────────────────────────────────────────────────
-FIX=""
-NCDIR=""   # throwaway NANOCLAW_DIR
-WIKI=""    # $NCDIR/data/repositories/testwg/wiki worktree
+# P3-8 (#666 review): the OLD version of this script leaked every fixture
+# dir it created — new_fixture() overwrote $FIX with a fresh `mktemp -d`
+# on every call and only the LAST one was ever removed, at the very end.
+# Track every one in FIXTURE_DIRS and remove them all via an EXIT trap, so
+# an interrupted run (or the ~15 fixtures a full run creates) never leaves
+# planted fake-secret content on disk.
+FIXTURE_DIRS=()
+cleanup_fixtures() {
+  local dir
+  for dir in "${FIXTURE_DIRS[@]}"; do
+    rm -rf "$dir"
+  done
+}
+trap cleanup_fixtures EXIT INT TERM
+
+WIKI=""    # <fixture>/wiki worktree, shaped like data/repositories/<wg>/wiki
 REMOTE=""  # bare remote the wiki pushes to
 
 new_fixture() {
-  FIX=$(mktemp -d)
-  NCDIR="$FIX/nanoclaw"
-  REMOTE="$FIX/remote-wiki.git"
-  WIKI="$NCDIR/data/repositories/testwg/wiki"
+  local fix
+  fix=$(mktemp -d)
+  FIXTURE_DIRS+=("$fix")
+  REMOTE="$fix/remote-wiki.git"
+  WIKI="$fix/repositories/testwg/wiki"
 
   git init --bare -q "$REMOTE"
   mkdir -p "$WIKI"
@@ -40,36 +57,31 @@ new_fixture() {
   git -C "$WIKI" commit -qm init >/dev/null
   git -C "$WIKI" remote add origin "$REMOTE"
   git -C "$WIKI" push -q origin main
+  install_hook_files "$HOOK_SRC" "$PATTERNS_SRC"
 }
 
-install_hook() { # extra installer args as "$@"
-  INSTALL_OUT=$(NANOCLAW_DIR="$NCDIR" bash "$INSTALLER" "$@" 2>&1)
-  INSTALL_RC=$?
+# install_hook_files <hook-source> <patterns-source>
+# Simulates a host startup refresh: copies the given hook + patterns files
+# into $WIKI/.git/hooks/ verbatim, executable bit on the hook only.
+install_hook_files() {
+  mkdir -p "$WIKI/.git/hooks"
+  cp "$1" "$WIKI/.git/hooks/pre-push"
+  chmod +x "$WIKI/.git/hooks/pre-push"
+  cp "$2" "$WIKI/.git/hooks/nanoclaw-secret-patterns.sh"
 }
 
-push_main() {
-  PUSH_OUT=$(git -C "$WIKI" push origin main 2>&1)
+push_ref() { # <local-ref> <remote-ref (defaults to local-ref)>
+  local local_ref="$1" remote_ref="${2:-$1}"
+  PUSH_OUT=$(git -C "$WIKI" push origin "${local_ref}:${remote_ref}" 2>&1)
   PUSH_RC=$?
 }
 
-remote_tip() { git --git-dir="$REMOTE" rev-parse -q --verify main 2>/dev/null; }
+push_main() { push_ref main main; }
 
-# ═══ Installer puts the hook + patterns in place ═══════════════════════════
-new_fixture
-install_hook
-[ "$INSTALL_RC" -eq 0 ] && ok "installer exits 0 on a fresh fixture" \
-  || bad "installer failed on a fresh fixture" "$INSTALL_OUT"
-[ -x "$WIKI/.git/hooks/pre-push" ] && ok "pre-push hook installed and executable" \
-  || bad "pre-push hook missing or not executable" "$(ls -la "$WIKI/.git/hooks/" 2>&1)"
-[ -f "$WIKI/.git/hooks/nanoclaw-secret-patterns.sh" ] && ok "pattern file installed alongside the hook" \
-  || bad "nanoclaw-secret-patterns.sh missing" ""
-grep -q "nanoclaw-managed-hook" "$WIKI/.git/hooks/pre-push" \
-  && ok "installed hook carries the ownership marker" \
-  || bad "installed hook is missing its marker" ""
+remote_tip() { git --git-dir="$REMOTE" rev-parse -q --verify main 2>/dev/null; }
 
 # ═══ 1. A high-confidence token is BLOCKED ═════════════════════════════════
 new_fixture
-install_hook
 BEFORE_TIP=$(remote_tip)
 echo 'export SLACK_APP_TOKEN=xapp-1-A0123-4567890123-abcdefabcdefabcdefabcdefabcdef' >> "$WIKI/README.md"
 git -C "$WIKI" commit -qam "add a high-confidence token"
@@ -80,12 +92,15 @@ case "$PUSH_OUT" in
   *"BLOCKED"*) ok "high-confidence token: hook reports BLOCKED" ;;
   *) bad "high-confidence token: no BLOCKED message" "$PUSH_OUT" ;;
 esac
+case "$PUSH_OUT" in
+  *"--no-verify"*) ok "high-confidence token: block message tells the agent not to bypass it" ;;
+  *) bad "high-confidence token: block message doesn't mention --no-verify" "$PUSH_OUT" ;;
+esac
 [ "$(remote_tip)" = "$BEFORE_TIP" ] && ok "high-confidence token: remote main did not advance" \
   || bad "high-confidence token: remote advanced anyway" "before=$BEFORE_TIP after=$(remote_tip)"
 
 # ═══ 2. A fuzzy pattern WARNS but is allowed ═══════════════════════════════
 new_fixture
-install_hook
 BEFORE_TIP=$(remote_tip)
 echo 'export DB_PASS=averylongpasswordvalue123' >> "$WIKI/README.md"
 git -C "$WIKI" commit -qam "add a fuzzy password-shaped line"
@@ -102,7 +117,6 @@ AFTER_TIP=$(remote_tip)
 
 # ═══ 3. An ordinary clean push is allowed, no warning at all ═══════════════
 new_fixture
-install_hook
 BEFORE_TIP=$(remote_tip)
 echo 'nothing sensitive here, just prose about the roadmap' >> "$WIKI/README.md"
 git -C "$WIKI" commit -qam "ordinary content change"
@@ -119,11 +133,10 @@ esac
 # ═══ 4. A binary/font blob with a "password" substring isn't blocked ═══════
 # BLOCK_RE has no bare "password" alternative at all (only vendor token
 # shapes) — this is what actually guarantees it, but exercise it with real
-# binary content anyway: this is exactly the shape #658's review measured
-# git-safety's single broad SECRET_RE false-positiving on (base64 fonts,
-# "Hide password" UI strings) that motivated the two-tier split.
+# binary content anyway: the shape review-666 (and #658 before it) measured
+# a single broad pattern false-positiving on (base64 fonts, "Hide password"
+# UI strings) that motivated the two-tier split in the first place.
 new_fixture
-install_hook
 BEFORE_TIP=$(remote_tip)
 python3 -c "
 import random
@@ -145,10 +158,9 @@ esac
   || bad "binary blob: remote main did not advance" ""
 
 # ═══ 5. A secret buried in an EARLIER (non-tip) unpushed commit is BLOCKED ═
-# Proves the hook diffs the whole remote_sha..local_sha range, not just the
-# tip commit — a per-commit-only scan would miss this.
+# Per-commit patch scanning (git log -p) walks every commit in the range,
+# not just the diff between two end-states.
 new_fixture
-install_hook
 BEFORE_TIP=$(remote_tip)
 echo 'export GITHUB_TOKEN=ghp_16C7e42F292c6912E7710c838347Ae178B4aXYZ123' > "$WIKI/secret-mid.txt"
 git -C "$WIKI" add secret-mid.txt
@@ -161,169 +173,190 @@ push_main
 [ "$(remote_tip)" = "$BEFORE_TIP" ] && ok "secret in an earlier unpushed commit: remote unchanged" \
   || bad "secret in an earlier unpushed commit: remote advanced" ""
 
-# ═══ 6. A brand-new local branch (remote_sha all-zero) is still scanned ════
+# ═══ 6. Added, then removed, within the SAME push is still BLOCKED ════════
+# #666 review P1-1: the old design diffed only the two push end-states, so
+# a token added in one commit and deleted (or redacted) in a later commit
+# of the same push never appeared in that diff at all. Per-commit patch
+# scanning catches the commit that introduced it regardless of what a
+# later commit in the same push does.
 new_fixture
-install_hook
+BEFORE_TIP=$(remote_tip)
+echo 'export GITHUB_TOKEN=ghp_16C7e42F292c6912E7710c838347Ae178B4aXYZ123' >> "$WIKI/README.md"
+git -C "$WIKI" commit -qam "commit A: adds the secret"
+git -C "$WIKI" checkout -q HEAD~1 -- README.md
+git -C "$WIKI" commit -qam "commit B: removes it again"
+push_main
+[ "$PUSH_RC" -ne 0 ] && ok "added-then-removed within one push: still blocked" \
+  || bad "added-then-removed within one push: push succeeded" "$PUSH_OUT"
+[ "$(remote_tip)" = "$BEFORE_TIP" ] && ok "added-then-removed within one push: remote unchanged" \
+  || bad "added-then-removed within one push: remote advanced" ""
+
+# ═══ 7. A brand-new local branch is still scanned ══════════════════════════
+new_fixture
 git -C "$WIKI" checkout -qb feature-new
 echo 'export GITHUB_TOKEN=ghp_16C7e42F292c6912E7710c838347Ae178B4aXYZ123' >> "$WIKI/README.md"
 git -C "$WIKI" commit -qam "new branch with a token"
-PUSH_OUT=$(git -C "$WIKI" push origin feature-new 2>&1)
-PUSH_RC=$?
+push_ref feature-new
 [ "$PUSH_RC" -ne 0 ] && ok "brand-new branch with a token: blocked" \
   || bad "brand-new branch with a token: push succeeded" "$PUSH_OUT"
 git --git-dir="$REMOTE" rev-parse -q --verify feature-new >/dev/null 2>&1 \
   && bad "brand-new branch: pushed anyway" "$(git --git-dir="$REMOTE" log --oneline feature-new)" \
   || ok "brand-new branch: nothing landed on the remote"
 
-# ═══ Missing/unreadable pattern file fails CLOSED, not open ════════════════
+# ═══ 8. A secret typed ONLY in a commit message is BLOCKED ════════════════
+# #666 review P3-1: git log -p's --output-indicator-new marks diff/patch
+# content only — a commit's own message body carries no marker at all, so
+# a secret typed directly into a commit message (never as file content)
+# would otherwise be silently dropped by the extraction step.
 new_fixture
-install_hook
-rm -f "$WIKI/.git/hooks/nanoclaw-secret-patterns.sh"
-echo 'export SLACK_APP_TOKEN=xapp-1-A0123-4567890123-abcdefabcdefabcdefabcdefabcdef' >> "$WIKI/README.md"
-git -C "$WIKI" commit -qam "would-be secret, but the pattern file is gone"
+BEFORE_TIP=$(remote_tip)
+echo 'unrelated content change' >> "$WIKI/README.md"
+git -C "$WIKI" commit -qam "here's a token for reference: xapp-1-A0123-4567890123-abcdefabcdefabcdefabcdefabcdef"
 push_main
-[ "$PUSH_RC" -ne 0 ] && ok "missing pattern file: push fails closed" \
-  || bad "missing pattern file: push succeeded (fail-OPEN)" "$PUSH_OUT"
+[ "$PUSH_RC" -ne 0 ] && ok "secret only in a commit message: blocked" \
+  || bad "secret only in a commit message: push succeeded" "$PUSH_OUT"
+[ "$(remote_tip)" = "$BEFORE_TIP" ] && ok "secret only in a commit message: remote unchanged" \
+  || bad "secret only in a commit message: remote advanced" ""
+
+# ═══ 9. A secret in an ANNOTATED TAG's own message is BLOCKED ═════════════
+# git log never renders a tag object's own message (it only ever walks the
+# peeled commit) — the hook fetches it separately via `git cat-file -p`.
+new_fixture
+git -C "$WIKI" tag -a v1.0-test -m "release notes: token=xapp-1-A0123-4567890123-abcdefabcdefabcdefabcdefabcdef"
+push_ref v1.0-test
+[ "$PUSH_RC" -ne 0 ] && ok "secret in an annotated tag message: blocked" \
+  || bad "secret in an annotated tag message: push succeeded" "$PUSH_OUT"
+git --git-dir="$REMOTE" rev-parse -q --verify v1.0-test >/dev/null 2>&1 \
+  && bad "annotated tag: pushed anyway" "" \
+  || ok "annotated tag: nothing landed on the remote"
+
+# ═══ 10. BLOCK is case-SENSITIVE; a lowercase near-miss falls to WARN ══════
+# #666 review P2-2: a case-insensitive BLOCK measured 3 false positives
+# over 327 real wiki commits, all from a lowercase "akia" plus 16
+# characters matching random data. Case-sensitive BLOCK gives 0 there;
+# the near-miss still isn't silently dropped — it falls into WARN, which
+# stays case-insensitive over the whole (broader) SECRET_RE.
+new_fixture
+BEFORE_TIP=$(remote_tip)
+echo 'aws_key = akiaiosfodnn7abcdefg' >> "$WIKI/README.md"
+git -C "$WIKI" commit -qam "lowercase akia-shaped, not a real key"
+push_main
+[ "$PUSH_RC" -eq 0 ] && ok "lowercase akia-shaped line: not blocked (BLOCK is case-sensitive)" \
+  || bad "lowercase akia-shaped line: blocked" "$PUSH_OUT"
 case "$PUSH_OUT" in
-  *"cannot load"*) ok "missing pattern file: hook explains itself" ;;
-  *) bad "missing pattern file: no explanation printed" "$PUSH_OUT" ;;
+  *"WARNING"*) ok "lowercase akia-shaped line: still caught, as WARN" ;;
+  *) bad "lowercase akia-shaped line: not caught at all" "$PUSH_OUT" ;;
 esac
+[ "$(remote_tip)" != "$BEFORE_TIP" ] && ok "lowercase akia-shaped line: remote advanced" \
+  || bad "lowercase akia-shaped line: remote did not advance" ""
 
-# ═══ The '+++ ' header exclusion, narrowed the same way as
-# scripts/lib/secret-scan.sh (nanoclaw-v2#658 round 2) ══════════════════════
-# An ADDED line is itself printed as `+` followed by its own content, so a
-# real added line whose content starts with "++ " becomes "+++ ..." on the
-# wire — syntactically identical to a `+++ ` diff header. Verified: the
-# blanket `^\+\+\+ ` exclusion this used to carry drops this exact line.
+# ═══ 11. AWS's own documentation example key is allowlisted, exactly ═══════
 new_fixture
-install_hook
 BEFORE_TIP=$(remote_tip)
-printf '++ %s\n' 'export SLACK_APP_TOKEN=xapp-1-A0123-4567890123-abcdefabcdefabcdefabcdefabcdef' >> "$WIKI/README.md"
-git -C "$WIKI" commit -qam "an added line starting with ++ "
+echo 'aws_key = AKIAIOSFODNN7EXAMPLE' >> "$WIKI/README.md"
+git -C "$WIKI" commit -qam "aws docs example key"
 push_main
-[ "$PUSH_RC" -ne 0 ] && ok "an added line starting with '++ ' is still blocked, not mistaken for a header" \
-  || bad "an added line starting with '++ ' slipped through (header-exclusion hole)" "$PUSH_OUT"
-[ "$(remote_tip)" = "$BEFORE_TIP" ] && ok "'++ '-prefixed secret: remote unchanged" \
-  || bad "'++ '-prefixed secret: remote advanced" ""
-
-# LC_ALL=C counts BYTES for a character class — a 3-byte UTF-8 smart quote
-# can burn most of a small {0,N} budget on its own; {0,3} in the WARN
-# pattern's last alternative let this exact line slip past under
-# LC_ALL=C though it matched under a UTF-8 locale. Widened to {0,6}.
-new_fixture
-install_hook
-BEFORE_TIP=$(remote_tip)
-printf '“password” : hunter2x\n' >> "$WIKI/README.md"
-git -C "$WIKI" commit -qam "a smart-quote password-shaped line"
-push_main
-[ "$PUSH_RC" -eq 0 ] && ok "smart-quote WARN line: push allowed" \
-  || bad "smart-quote WARN line: push blocked" "$PUSH_OUT"
+[ "$PUSH_RC" -eq 0 ] && ok "AWS docs example key: not blocked" \
+  || bad "AWS docs example key: blocked" "$PUSH_OUT"
 case "$PUSH_OUT" in
-  *"WARNING"*) ok "smart-quote WARN line: still caught under LC_ALL=C" ;;
-  *) bad "smart-quote WARN line: not caught (LC_ALL=C byte-budget regression)" "$PUSH_OUT" ;;
+  *"BLOCKED"*|*"WARNING"*) bad "AWS docs example key: hook said something anyway" "$PUSH_OUT" ;;
+  *) ok "AWS docs example key: no BLOCKED/WARNING at all" ;;
 esac
-[ "$(remote_tip)" != "$BEFORE_TIP" ] && ok "smart-quote WARN line: remote advanced" \
-  || bad "smart-quote WARN line: remote did not advance" ""
+[ "$(remote_tip)" != "$BEFORE_TIP" ] && ok "AWS docs example key: remote advanced" \
+  || bad "AWS docs example key: remote did not advance" ""
 
-# A file whose path happens to look like an sk- secret, already tracked
-# (this repeats the wiki's actual push shape — an edit, not a new file),
-# must not be scanned via its own `+++ b/<path>` header line.
+# ═══ 12. A PGP private-key block header is BLOCKED ═════════════════════════
 new_fixture
-install_hook
-mkdir -p "$WIKI/tasks"
-echo placeholder > "$WIKI/tasks/sk-learn-migration-plan-2026.md"
-git -C "$WIKI" add tasks/sk-learn-migration-plan-2026.md
-git -C "$WIKI" commit -qm "add placeholder task file"
-git -C "$WIKI" push -q origin main
 BEFORE_TIP=$(remote_tip)
-printf 'ordinary planning notes, nothing secret here\n' >> "$WIKI/tasks/sk-learn-migration-plan-2026.md"
-git -C "$WIKI" commit -qam "edit the sk--looking file"
+echo '-----BEGIN PGP PRIVATE KEY BLOCK-----' >> "$WIKI/README.md"
+git -C "$WIKI" commit -qam "add a pgp private key header"
 push_main
-[ "$PUSH_RC" -eq 0 ] && ok "sk--looking header path: push allowed" \
-  || bad "sk--looking header path: push blocked (header misread as content)" "$PUSH_OUT"
-[ "$(remote_tip)" != "$BEFORE_TIP" ] && ok "sk--looking header path: remote advanced" \
-  || bad "sk--looking header path: remote did not advance" ""
+[ "$PUSH_RC" -ne 0 ] && ok "PGP private-key header: blocked" \
+  || bad "PGP private-key header: push succeeded" "$PUSH_OUT"
+[ "$(remote_tip)" = "$BEFORE_TIP" ] && ok "PGP private-key header: remote unchanged" \
+  || bad "PGP private-key header: remote advanced" ""
 
-# git C-quotes a path containing non-ASCII bytes in its diff header
-# (`+++ "b/café.md"` rather than `+++ b/café.md`) — the exclusion must
-# recognize that quoted form too.
+# ═══ 13. BLOCK's ghp_ length matches SECRET_RE's (#666 review P2-item2) ════
+# A 20-29 character ghp_ token used to match a merged gh[pousr]_{20,}
+# BLOCK alternative while missing SECRET_RE's own separate ghp_{30,}
+# requirement — BLOCK matching something SECRET_RE itself wouldn't. Below
+# 30 characters it must not BLOCK (still may WARN via the generic
+# identifier alternative, which it does here).
 new_fixture
-install_hook
-printf 'placeholder\n' > "$WIKI/café.md"
-git -C "$WIKI" add café.md
-git -C "$WIKI" commit -qm "add cafe placeholder"
-git -C "$WIKI" push -q origin main
 BEFORE_TIP=$(remote_tip)
-printf 'ordinary content, nothing secret here\n' >> "$WIKI/café.md"
-git -C "$WIKI" commit -qam "edit the non-ASCII-named file"
+echo 'export GITHUB_TOKEN=ghp_abcdefghijklmnopqrstu' >> "$WIKI/README.md" # 25 chars after ghp_
+git -C "$WIKI" commit -qam "25-char ghp_ token, below the 30-char threshold"
 push_main
-[ "$PUSH_RC" -eq 0 ] && ok "quoted-path header: push allowed" \
-  || bad "quoted-path header: push blocked (header misread as content)" "$PUSH_OUT"
-[ "$(remote_tip)" != "$BEFORE_TIP" ] && ok "quoted-path header: remote advanced" \
-  || bad "quoted-path header: remote did not advance" ""
+[ "$PUSH_RC" -eq 0 ] && ok "25-char ghp_ token: not blocked (below SECRET_RE's own 30-char ghp_ threshold)" \
+  || bad "25-char ghp_ token: blocked" "$PUSH_OUT"
+[ "$(remote_tip)" != "$BEFORE_TIP" ] && ok "25-char ghp_ token: remote advanced" \
+  || bad "25-char ghp_ token: remote did not advance" ""
 
-# ═══ Installer: idempotent re-run ═══════════════════════════════════════════
+# ═══ 14. Every SECRET_BLOCK_RE fixture used above also matches SECRET_RE ═══
+# #666 review addendum 2: BLOCK must be a literal subset of SECRET_RE, so
+# git-safety.sh (single-tier, over SECRET_RE) never passes something this
+# hook would BLOCK. Reuses the actual planted BLOCK-tier lines above.
+BLOCK_FIXTURE_LINES=(
+  'export SLACK_APP_TOKEN=xapp-1-A0123-4567890123-abcdefabcdefabcdefabcdefabcdef'
+  'export GITHUB_TOKEN=ghp_16C7e42F292c6912E7710c838347Ae178B4aXYZ123'
+  '-----BEGIN PGP PRIVATE KEY BLOCK-----'
+)
 new_fixture
-install_hook
-FIRST_HOOK_SUM=$(sha256sum "$WIKI/.git/hooks/pre-push" | cut -d' ' -f1)
-install_hook
-SECOND_HOOK_SUM=$(sha256sum "$WIKI/.git/hooks/pre-push" | cut -d' ' -f1)
-[ "$INSTALL_RC" -eq 0 ] && ok "installer: second run exits 0" \
-  || bad "installer: second run failed" "$INSTALL_OUT"
-[ "$FIRST_HOOK_SUM" = "$SECOND_HOOK_SUM" ] && ok "installer: re-run reinstalls the identical hook (idempotent)" \
-  || bad "installer: re-run produced a different hook" "first=$FIRST_HOOK_SUM second=$SECOND_HOOK_SUM"
-NO_BACKUPS=$(find "$WIKI/.git/hooks" -name 'pre-push.pre-nanoclaw-backup-*' | wc -l)
-[ "$NO_BACKUPS" -eq 0 ] && ok "installer: re-run over its own hook creates no backup" \
-  || bad "installer: re-run over its own hook created a backup" "$(find "$WIKI/.git/hooks" -name 'pre-push.pre-nanoclaw-backup-*')"
+# shellcheck source=lib/secret-scan.sh
+source "$PATTERNS_SRC"
+for line in "${BLOCK_FIXTURE_LINES[@]}"; do
+  if LC_ALL=C grep -qE "$SECRET_BLOCK_RE" <<<"$line" && ! LC_ALL=C grep -qiE "$SECRET_RE" <<<"$line"; then
+    bad "BLOCK-subset: '$line' matches SECRET_BLOCK_RE but not SECRET_RE" ""
+  else
+    ok "BLOCK-subset: '$line' — SECRET_BLOCK_RE match implies a SECRET_RE match too"
+  fi
+done
 
-# ═══ Installer: never overwrites a foreign hook without backing it up ══════
-new_fixture
-cat > "$WIKI/.git/hooks/pre-push" <<'FOREIGN'
-#!/bin/bash
-echo "some other team's hook" >&2
-exit 0
-FOREIGN
-chmod +x "$WIKI/.git/hooks/pre-push"
-install_hook
-[ "$INSTALL_RC" -eq 0 ] && ok "installer over a foreign hook: exits 0" \
-  || bad "installer over a foreign hook: failed" "$INSTALL_OUT"
-BACKUP=$(find "$WIKI/.git/hooks" -name 'pre-push.pre-nanoclaw-backup-*' | head -1)
-[ -n "$BACKUP" ] && ok "installer over a foreign hook: a backup file exists" \
-  || bad "installer over a foreign hook: no backup was made" "$(ls "$WIKI/.git/hooks")"
-if [ -n "$BACKUP" ]; then
-  grep -q "some other team's hook" "$BACKUP" \
-    && ok "installer over a foreign hook: the backup holds the original content" \
-    || bad "installer over a foreign hook: the backup is not the original content" "$(cat "$BACKUP")"
-fi
-grep -q "nanoclaw-managed-hook" "$WIKI/.git/hooks/pre-push" \
-  && ok "installer over a foreign hook: our hook is now installed" \
-  || bad "installer over a foreign hook: our hook was not installed" ""
+# ═══ Missing/corrupt pattern file: 6 variants, all fail CLOSED ═════════════
+# #666 review P2-1: 4 of 6 corrupt-file variants failed OPEN before
+# secret_scan_selftest existed (source returns 0 for all of these; only
+# the eventual `${hits:-0}` stood between that and every secret passing).
+corrupt_variant_case() { # <label> <writer-function-name>
+  new_fixture
+  "$2" "$WIKI/.git/hooks/nanoclaw-secret-patterns.sh"
+  BEFORE_TIP=$(remote_tip)
+  echo 'export SLACK_APP_TOKEN=xapp-1-A0123-4567890123-abcdefabcdefabcdefabcdefabcdef' >> "$WIKI/README.md"
+  git -C "$WIKI" commit -qam "would-be secret, but the pattern file is corrupt: $1"
+  push_main
+  [ "$PUSH_RC" -ne 0 ] && ok "corrupt pattern file ($1): push fails closed" \
+    || bad "corrupt pattern file ($1): push succeeded (fail-OPEN)" "$PUSH_OUT"
+  [ "$(remote_tip)" = "$BEFORE_TIP" ] && ok "corrupt pattern file ($1): remote unchanged" \
+    || bad "corrupt pattern file ($1): remote advanced" ""
+}
+write_missing() { rm -f "$1"; }
+write_zero_byte() { : > "$1"; }
+write_unbalanced_regex() { printf 'SECRET_RE="(unbalanced"\nSECRET_BLOCK_RE="(unbalanced"\n%s\n' "$(cat "$PATTERNS_SRC")" > "$1"; }
+write_truncated_before_functions() { sed -n '1,/^SECRET_BLOCK_RE=/p' "$PATTERNS_SRC" > "$1"; }
+write_block_re_unset() { sed '/^SECRET_BLOCK_RE=/d' "$PATTERNS_SRC" > "$1"; }
+write_missing_extract_fn() { grep -v '^secret_scan_extract_added()' "$PATTERNS_SRC" | sed '/^secret_scan_extract_added/,/^}/d' > "$1"; }
+corrupt_variant_case "missing file" write_missing
+corrupt_variant_case "zero-byte file" write_zero_byte
+corrupt_variant_case "unbalanced regex" write_unbalanced_regex
+corrupt_variant_case "truncated before the functions" write_truncated_before_functions
+corrupt_variant_case "SECRET_BLOCK_RE unset" write_block_re_unset
+corrupt_variant_case "missing secret_scan_extract_added" write_missing_extract_fn
 
-# ═══ Installer: skips a repo whose core.hooksPath is overridden ═══════════
+# ═══ Any git error while building the scan range fails CLOSED ═════════════
+# #666 review P1-2: a `push -f` retried after an earlier rejection can
+# pass a remote_sha this repo no longer has locally; simulate any git
+# failure the same way by feeding the hook a local_sha that doesn't exist.
 new_fixture
-git -C "$WIKI" config core.hooksPath /dev/null
-install_hook
-case "$INSTALL_OUT" in
-  *"SKIP"*"core.hooksPath"*) ok "installer: reports SKIP for a core.hooksPath override" ;;
-  *) bad "installer: did not report the hooksPath skip" "$INSTALL_OUT" ;;
+BEFORE_TIP=$(remote_tip)
+BOGUS_SHA='0123456789abcdef0123456789abcdef01234567'
+PUSH_OUT=$(printf 'refs/heads/main %s refs/heads/main %s\n' "$BOGUS_SHA" "$(git -C "$WIKI" rev-parse origin/main)" \
+  | (cd "$WIKI" && bash .git/hooks/pre-push origin "$REMOTE") 2>&1)
+PUSH_RC=$?
+[ "$PUSH_RC" -ne 0 ] && ok "unresolvable local_sha (simulated git error): fails closed" \
+  || bad "unresolvable local_sha (simulated git error): exited 0" "$PUSH_OUT"
+case "$PUSH_OUT" in
+  *"BLOCKED"*) ok "unresolvable local_sha: hook reports BLOCKED" ;;
+  *) bad "unresolvable local_sha: no BLOCKED message" "$PUSH_OUT" ;;
 esac
-[ -e "$WIKI/.git/hooks/nanoclaw-secret-patterns.sh" ] \
-  && bad "installer: installed into a repo with core.hooksPath overridden anyway" "" \
-  || ok "installer: nothing installed into a repo with core.hooksPath overridden"
-
-# ═══ Installer: --dry-run changes nothing ══════════════════════════════════
-new_fixture
-install_hook --dry-run
-[ ! -e "$WIKI/.git/hooks/pre-push" ] && ok "installer --dry-run: no hook installed" \
-  || bad "installer --dry-run: installed a hook anyway" ""
-[ ! -e "$WIKI/.git/hooks/nanoclaw-secret-patterns.sh" ] && ok "installer --dry-run: no pattern file installed" \
-  || bad "installer --dry-run: installed the pattern file anyway" ""
-case "$INSTALL_OUT" in
-  *"[dry-run]"*) ok "installer --dry-run: reports intent" ;;
-  *) bad "installer --dry-run: silent" "$INSTALL_OUT" ;;
-esac
-
-rm -rf "$FIX"
 
 echo
 if [ "$FAILED" -eq 0 ]; then

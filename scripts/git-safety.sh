@@ -338,6 +338,17 @@ source "${SCRIPT_DIR}/lib/secret-scan.sh" || {
   echo "git-safety: cannot load ${SCRIPT_DIR}/lib/secret-scan.sh — refusing to build a groups/ snapshot without a working secret gate" >&2
   exit 1
 }
+# A missing file is one failure mode; a PRESENT but corrupt one (a
+# zero-byte file, one truncated mid-function, one with an unbalanced
+# regex, or one where SECRET_RE ends up unset) is another — `source`
+# returns 0 for all of those too. secret_scan_selftest validates the
+# functions exist and the patterns actually compile; #666 review found 4
+# of 6 corrupt-file variants fail OPEN without this check (the eventual
+# `${hits:-0}` silently reads a scan failure as "no secrets found").
+if ! secret_scan_selftest; then
+  echo "git-safety: ${SCRIPT_DIR}/lib/secret-scan.sh failed its self-test — refusing to build a groups/ snapshot without a validated secret gate" >&2
+  exit 1
+fi
 
 # Sensitive filenames are never staged even when git already tracks them —
 # excluded via pathspec BEFORE `add -u` runs, so they never touch the scratch
@@ -414,20 +425,36 @@ _commit_groups_impl() { # <scratch index file>
   fi
 
   local diff_text
-  # --src-prefix/--dst-prefix pinned explicitly: secret_scan_hits() only
-  # excludes the `+++ b/...`/`+++ /dev/null` header shapes git emits with
-  # its DEFAULT prefixes. A user's diff.noprefix or diff.mnemonicPrefix
-  # config would change that shape (diff.noprefix drops "b/" entirely) and
-  # make the exclusion miss the real header — this pins the shape the
-  # exclusion actually expects, independent of whatever's in ~/.gitconfig.
-  diff_text=$(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --no-color --text --src-prefix=a/ --dst-prefix=b/ HEAD 2>>"$ERR")
+  # --output-indicator-new marks every added line with
+  # SECRET_SCAN_NEW_INDICATOR (a byte that can never start a real source
+  # line) instead of the default '+' — secret_scan_hits() filters on that
+  # marker, so a real added line whose content happens to start with
+  # "++ " (which used to read identically to a `+++ ` file-header line
+  # under the old plain '+' scheme) can no longer be mistaken for one; see
+  # lib/secret-scan.sh's comment on SECRET_SCAN_NEW_INDICATOR.
+  # --src-prefix/--dst-prefix are pinned too, out of caution: they don't
+  # affect indicator-marked content lines, only the (untouched, no longer
+  # scanned for) `+++`/`---` header lines themselves, but pinning them
+  # keeps this diff's output shape predictable regardless of a user's
+  # diff.noprefix/diff.mnemonicPrefix config.
+  diff_text=$(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --no-color --text --src-prefix=a/ --dst-prefix=b/ \
+    --output-indicator-new="$SECRET_SCAN_NEW_INDICATOR" --output-indicator-old=- --output-indicator-context=' ' \
+    HEAD 2>>"$ERR")
   if [ -z "$diff_text" ]; then
     GROUPS_RESULT="nothing pending"; return
   fi
 
-  local hits
+  local hits hits_rc
   hits=$(secret_scan_hits "$diff_text")
-  if [ "${hits:-0}" -gt 0 ]; then
+  hits_rc=$?
+  if [ "$hits_rc" -ne 0 ]; then
+    # secret_scan_hits/secret_scan_count returns nonzero (and echoes
+    # NOTHING) only on a grep failure it can't recover from — never read
+    # that as "0 hits"; the selftest above already guards the common
+    # cases, this is the last-resort net for a genuinely transient one.
+    FAILURES+=("groups: secret scan itself failed — refused to commit any pending change"); GROUPS_RESULT="failed (secret scan)"; return
+  fi
+  if [ "$hits" -gt 0 ]; then
     printf '%s\n' "$diff_text" > "$OUT/groups-refused.patch" 2>/dev/null
     FAILURES+=("groups: $hits added line(s) look like a secret — refused to commit any pending change; scanned diff saved to $OUT/groups-refused.patch")
     GROUPS_RESULT="refused (secret-shaped content)"; return
