@@ -116,6 +116,18 @@ MIGRATIONS_PREFIX="XZO-BACKEND/migrations/"
 FREEZE_MARKER_BACKEND="XZO-BACKEND/.render-freeze"
 FREEZE_MARKER_FRONTEND="XZO-FRONTEND/.render-freeze"
 
+# Campaign-size classification: the install supplies a rules file naming
+# which changed paths force the full gauntlet vs. which are UI-only enough to
+# get a light campaign — never agent judgment (two PRs called "low risk" by
+# eye carried real P1 bugs). Missing file = today's behavior, unchanged
+# (`standard`, every field below still emitted for backward compatibility).
+SIZING_RULES="${SMOKE_SIZING_RULES:-/workspace/agent/campaign-sizing.json}"
+# Resolved next to this script rather than hardcoded to the container path so
+# the test suite (which runs this file from container/skills/smoke-test/scripts/,
+# not /workspace/agent/) exercises the real classifier, not a stand-in.
+SIZING_CLASSIFIER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SIZING_CLASSIFIER="$SIZING_CLASSIFIER_DIR/campaign-size-classify.py"
+
 mkdir -p "$STATE_DIR"
 
 iso_now() {
@@ -845,6 +857,35 @@ healthz_ok() {
   [ "$code" = "200" ]
 }
 
+# Prints one `{campaignSize, sizeReason}` JSON object. Classification is
+# mechanical, never agent judgment — the whole point (two PRs called "low
+# risk" by eye carried real P1 bugs). Two ways in:
+#   determinable=false -> fail closed to `full` on fail_reason alone, no rules
+#     file or glob matching ever runs. The caller decides "determinable" from
+#     facts this function has no access to (fetchOk, truncation) — same
+#     fail-closed direction as migrationsTouched/frontendTouched above.
+#   determinable=true  -> delegate to campaign-size-classify.py, which reads
+#     the install-supplied rules file (or reports "no sizing rules" if it is
+#     absent — backward compatible: nothing changes for installs that never
+#     added one) and matches changed_files_json (a JSON array of repo-relative
+#     paths) against it. A classifier crash or malformed reply is itself
+#     fail-closed to `full`, same direction as every other fetch in this gate.
+campaign_size_classify() {
+  local determinable="$1" fail_reason="$2" changed_files_json="${3:-[]}"
+  local rules_path="$SIZING_RULES" out
+  if [ "$determinable" != true ]; then
+    jq -cn --arg reason "$fail_reason" '{campaignSize:"full", sizeReason:("full: " + $reason)}'
+    return 0
+  fi
+  if ! out="$(printf '%s' "$changed_files_json" | timeout 10 python3 "$SIZING_CLASSIFIER" "$rules_path" 2>/dev/null)" ||
+     ! jq -e 'type == "object" and (.campaignSize | type == "string") and (.sizeReason | type == "string")' \
+       <<<"$out" >/dev/null 2>&1; then
+    jq -cn '{campaignSize:"full", sizeReason:"full: campaign size classifier failed"}'
+    return 0
+  fi
+  printf '%s' "$out"
+}
+
 # Core settle computation for one PR — shared by `check` (read-only) and
 # `poll` (per-candidate evaluation). Every fetch is timeout-bounded; any hard
 # failure or truncated (>=100, same ceiling smoke-develop-gate.sh uses for its
@@ -957,6 +998,49 @@ evaluate_pr() {
     migration_files="$(jq -c --arg p "$MIGRATIONS_PREFIX" '[.[].filename | select(startswith($p))]' <<<"$files_json" 2>/dev/null)"
     [ -n "$migration_files" ] && jq -e 'type == "array"' <<<"$migration_files" >/dev/null 2>&1 || migration_files='[]'
   fi
+
+  # --- Campaign-size classification -----------------------------------------
+  # A freeze PR's OWN diff is always exactly the two markers (see the
+  # migrationsTouched/frontendTouched comment above) — same reason this must
+  # classify off the develop-compare's target_files_json, never files_json,
+  # for a freeze PR. Determinability mirrors migrations_determinable exactly:
+  # both ultimately depend on the same target-diff fetch/truncation guard.
+  local size_files_json='[]' size_determinable=true size_fail_reason=""
+  if [ "$is_freeze" = true ]; then
+    if [ -z "$ci_sha" ]; then
+      size_determinable=false
+      size_fail_reason="the freeze target commit could not be determined"
+    elif [ "$target_compare_failed" = true ]; then
+      size_determinable=false
+      size_fail_reason="the freeze target diff could not be fetched"
+    elif { [ "$target_files_len" -ge 300 ] 2>/dev/null; }; then
+      size_determinable=false
+      size_fail_reason="the freeze target diff is truncated (>=300 files)"
+    else
+      # Both the new AND previous path matter: a renamed file (status
+      # "renamed") carries `previous_filename`, and a file moved OUT of a
+      # `full` path (e.g. a migration or a scope module renamed into a UI
+      # folder) must still classify off where it came from, not just where
+      # it landed — classifying by new path alone could read as `light`.
+      size_files_json="$(jq -c '[.files[] | .filename, (.previous_filename // empty)]' <<<"$target_files_json" 2>/dev/null || printf '[]')"
+    fi
+  else
+    if [ "$files_fetch_failed" = true ]; then
+      size_determinable=false
+      size_fail_reason="the PR file list could not be fetched"
+    elif { [ "$files_len" -ge 100 ] 2>/dev/null; }; then
+      size_determinable=false
+      size_fail_reason="the PR file list is truncated (>=100 files)"
+    else
+      # See the freeze branch above: a rename's `previous_filename` must also
+      # be checked, or a file moved OUT of a `full` path is missed entirely.
+      size_files_json="$(jq -c '[.[] | .filename, (.previous_filename // empty)]' <<<"$files_json" 2>/dev/null || printf '[]')"
+    fi
+  fi
+  local size_out campaign_size campaign_size_reason
+  size_out="$(campaign_size_classify "$size_determinable" "$size_fail_reason" "$size_files_json")"
+  campaign_size="$(jq -r '.campaignSize' <<<"$size_out")"
+  campaign_size_reason="$(jq -r '.sizeReason' <<<"$size_out")"
 
   # `frontendTouched` remains a factual target-diff field. It is not an
   # identity requirement for a detected two-marker freeze: the marker pair
@@ -1073,10 +1157,16 @@ evaluate_pr() {
     --arg frontendDeploySha "$frontend_deploy_sha" --argjson frontendReady "$frontend_ready" \
     --argjson healthzReady "$healthz_ready" --argjson settled "$settled" \
     --argjson migrationFiles "$migration_files" --argjson migrationsDeterminable "$migrations_determinable" \
+    --arg campaignSize "$campaign_size" --arg sizeReason "$campaign_size_reason" \
     '{
       pr: $pr, headSha: $headSha, fetchOk: $fetchOk,
       migrationsTouched: $migrationsTouched, frontendTouched: $frontendTouched,
       frontendRequired: $frontendRequired,
+      # Mechanical, install-rules-driven sizing — never agent judgment. See
+      # campaign_size_classify(): campaignSize is one of full/standard/light,
+      # sizeReason names the first file (and glob) that forced the verdict,
+      # or "no sizing rules" when the install never supplied a rules file.
+      campaignSize: $campaignSize, sizeReason: $sizeReason,
       # migrationFiles names the pending migrations directly — the whole point
       # of this field is that an agent never has to re-derive what MG-1 took a
       # coordinator+challenger 30 minutes to find by hand. migrationsDeterminable
