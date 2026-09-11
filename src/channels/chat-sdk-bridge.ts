@@ -795,7 +795,9 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   /**
    * Ask the SDK adapter whether a given thread id represents a DM.
    * Some adapters don't expose isDM (older plugin builds); returns undefined
-   * so the router keeps its legacy is_group=0 default rather than guessing.
+   * so the router falls back to its own default — is_group=1
+   * (group/mention-safe) when message.isGroup is also unset, rather than
+   * this function guessing (router.ts:599,608).
    */
   function adapterIsDM(a: typeof adapter, threadId: string): boolean | undefined {
     const fn = (a as unknown as { isDM?: (t: string) => boolean }).isDM;

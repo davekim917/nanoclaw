@@ -835,6 +835,46 @@ describe('workspace-trust auto-wire inherits voice and engagement defaults', () 
       }),
     );
   });
+
+  // Regression: a brand-new messaging_groups row's is_group used to default
+  // to 0 (DM-style) whenever an adapter declared neither message.isGroup nor
+  // event.isDM. Downstream that resolves to engage_pattern='.' — always
+  // engage on every message — so an adapter that never reports either field
+  // and happens to be a real group chat would have the agent reply to
+  // everything in the channel, unprompted, rather than requiring a mention.
+  // Unknown must default to group/mention mode: the worst case there is a
+  // real DM stuck needing an explicit mention, not unsolicited chatter in a
+  // shared room.
+  it('defaults a brand-new channel with no isGroup/isDM signal to mention mode, not always-engage', async () => {
+    let created: MessagingGroup | undefined;
+    vi.mocked(createMessagingGroup).mockImplementation(async (mg: MessagingGroup) => {
+      created = mg;
+    });
+    // First lookup finds nothing (fresh channel) — routeInbound auto-creates
+    // it. The re-entrant lookup after wiring (see comment on arrangeAutoWire
+    // above) must then report the row that was actually created, agentCount
+    // 1, or routeInbound recurses forever.
+    vi.mocked(getMessagingGroupWithAgentCount).mockImplementation(async () =>
+      created ? { mg: created, agentCount: 1 } : null,
+    );
+    vi.mocked(getMessagingGroupAgents).mockResolvedValue([makeAgent({ messaging_group_id: 'mg-new-unknown' })]);
+    vi.mocked(getDb).mockReturnValue({
+      all: async (sql: string) =>
+        /DISTINCT/.test(sql)
+          ? [{ tone: 'engineering' }]
+          : [{ agent_group_id: 'ag-1', messaging_group_id: 'mg-src', cnt: 3 }],
+      transaction: async (fn: () => Promise<unknown>) => fn(),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any);
+
+    await routeInbound(makeChatEvent('@bot hello', { platformId: 'slack:CNEW-UNKNOWN', isDM: undefined }));
+
+    expect(created).toBeDefined();
+    expect(created?.is_group).toBe(1);
+    expect(createMessagingGroupAgentInTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({ engage_mode: 'mention', engage_pattern: null }),
+    );
+  });
 });
 
 describe('34: pre-fanout intercept fan-out dedup + denial reply', () => {

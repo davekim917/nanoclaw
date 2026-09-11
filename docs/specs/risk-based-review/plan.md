@@ -288,22 +288,34 @@ shadow review, not file overlap, is the signal this rollback condition acts on.
       A P1 on a skipped PR moves that PR's paths onto `risk:high`
       (`.github/labeler.yml`) by hand — the path-level ratchet the rollback condition
       names — recorded as one line in `docs/review-notes.md`.
-- [ ] Revised plan, 2026-09-11, after an independent second opinion and a comparison with
-      Augment's Cosmos:
-      - **Gate integrity:** merge-check fails closed when `risk:high` was removed by anyone
-        but the labeler, and requires `Fixes-PR:` on fix PRs. Substitute reviews of risky
-        PRs must come from an Opus- or Fable-tier model, or from another model family.
-      - **Reviewer identity:** every gate runs under one GitHub identity, so a self-approval
-        can't be told apart from a review. This is an operator decision: a second identity for
-        receipts, or a public repo so branch protection applies. A history scan for public
-        readiness is under way.
-      - **Measurement:** the correction above.
-      - **Tests on risky paths:** no coverage tooling is installed yet. Unit tests for the #608
-        failure exist (`container/agent-runner/src/poll-loop.test.ts:390` onward). The missing
-        piece is a check that runs the real CLI and confirms the hooks still fire.
-      - **Memory and decisions:**
-        - review-dimension labels such as `risk:guard` and `risk:migration`;
-        - a `docs/review-notes.md` that gets a line whenever a finding is deferred or a PR is
-          reverted;
-        - on XZO, a `Decision:` line plus the existing `needs-product-decision` label.
+- [x] Revised plan, 2026-09-11, after an independent second opinion and a comparison with
+      Augment's Cosmos. Where each item stands:
+      - **Gate integrity — shipped, then redesigned.** merge-check fails closed when a scope
+        label was removed by anyone but the labeler, and requires `Fixes-PR:` on fix PRs
+        (#642); unexplained removals and fenced `Fixes-PR:` lines are handled (#649). #664
+        (in review) replaces label trust with the diff itself: risk is computed from the PR's
+        own file list at a pinned base and head, so a label can add review but never remove it.
+      - **Reviewer tier — tightened.** Reviews come only from the high or frontier tier:
+        Claude Opus or Fable, Codex Sol or Astra. Never Sonnet, Haiku, or Codex Luna/Terra.
+        A follow-up PR derives the allowed model IDs from the tier config
+        (`container/agents/worker-{high,frontier}.md`, `CODEX_WORKER_TIERS`) and makes
+        `receipt`/`merge-check` enforce them, so a model release needs no policy edit.
+      - **Reviewer identity — operator decision, unchanged.** Every gate still runs under one
+        GitHub identity; a second identity or a public repo (branch protection) would
+        separate review from self-approval.
+      - **Main integrity — shipped.** CI runs with a read-only token (#644). Every push to
+        `main` must be a GitHub-made merge commit of a merged PR (#652), and a daily sweep of
+        GitHub's Activity API catches pushes the push trigger never saw, refusing test-merge
+        tips (#656). Rebase merging is still enabled in the repository settings; turning it
+        off is an operator setting.
+      - **Measurement — shipped** (above: `review-outcomes.ts` #653, shadow review #660).
+      - **Tests on risky paths — in review.** #662 adds a per-file coverage ratchet over the
+        `risk:high` paths (vitest for the host, bun lcov for the agent-runner), with
+        untested files recorded as explicit debt and CI minutes kept flat.
+      - **Secret scanning on push paths.** The pre-push hook reads the allowlist from the
+        pushed tree (#659); git-safety uses one shared pattern file (#658). #666 (in rework)
+        adds a host-managed pre-push scan for the wiki repositories agents push to.
+      - **Memory and decisions — shipped.** Review-dimension labels are derived in
+        `scripts/labeler-config.test.ts` (#643); `docs/review-notes.md` records deferred
+        findings and reverts.
 - [ ] Tier 2 · Tier 3 · Tier 4 — not started

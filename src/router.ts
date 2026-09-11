@@ -586,6 +586,17 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
     // channels we merely sit in stays silent — no row, no DB writes.
     if (!isMention) return;
     const mgId = `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    // Adapter tells us whether this is a DM or a group chat — prefer the
+    // explicit message.isGroup, then the isDM inverse. When BOTH are
+    // unknown (an adapter that declares neither), default to group/mention
+    // mode, not DM-style: downstream, is_group=0 resolves to
+    // engage_pattern='.' (always-engage on every message), so defaulting
+    // unknown to DM-style would make an actual group chat on an
+    // undeclared adapter reply to everything in the channel unprompted.
+    // Defaulting to group/mention mode instead means the worst case is a
+    // real DM that needs an explicit mention until the operator notices
+    // and flips it — the safe direction to be wrong in.
+    const isGroupChat = event.message.isGroup ?? (event.isDM === undefined ? true : event.isDM === false);
     mg = {
       id: mgId,
       channel_type: event.channelType,
@@ -594,10 +605,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
       // would absorb every sibling instance's traffic.
       instance: event.instance ?? event.channelType,
       name: null,
-      // Adapter tells us whether this is a DM or a group chat — prefer the
-      // explicit message.isGroup, fall back to the isDM inverse. When
-      // unknown, default to 0 (DM-style) to preserve legacy behavior.
-      is_group: (event.message.isGroup ?? event.isDM === false) ? 1 : 0,
+      is_group: isGroupChat ? 1 : 0,
       // Declared adapters get their declared policy (DM vs group context).
       // Fork policy for UNDECLARED adapters: public-by-default — any sender
       // in the channel can mention the bot without a separate sender-approval
@@ -605,11 +613,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
       // faithful fallback would be 'request_approval'. Operator can lock
       // individual channels down later via messaging_groups.unknown_sender_policy.
       unknown_sender_policy: hasDeclaredChannelDefaults(event.instance ?? event.channelType, event.channelType)
-        ? resolveUnknownSenderPolicy(
-            event.instance ?? event.channelType,
-            (event.message.isGroup ?? event.isDM === false) === true,
-            event.channelType,
-          )
+        ? resolveUnknownSenderPolicy(event.instance ?? event.channelType, isGroupChat, event.channelType)
         : 'public',
       denied_at: null,
       created_at: new Date().toISOString(),
@@ -830,12 +834,17 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
   //     prewarmed the cache. Writing here makes the cache reliable.
   //
   //     Guard: require event.isDM === true explicitly (not just
-  //     mg.is_group === 0). The messaging-group creation path defaults
-  //     is_group to 0 when the adapter doesn't pass isDM (line above
-  //     this branch — `event.isDM === false ? 1 : 0`), so is_group=0
-  //     can mean "uncertain adapter" rather than "confirmed DM." Caching
-  //     a shared channel as a user's DM would poison subsequent DM
-  //     resolution. (Codex P2 catch on PR #108 follow-up.)
+  //     mg.is_group === 0). is_group=0 is not proof of a confirmed DM: the
+  //     messaging-group creation path (router.ts:599,608) only defaults
+  //     is_group to 1 (group/mention-safe) when the adapter passes neither
+  //     message.isGroup nor isDM, but is_group also defaults to 0 with NO
+  //     adapter evidence at all on other paths — the CLI's `is_group`
+  //     field (src/cli/resources/messaging-groups.ts:102-106) and the
+  //     column itself (src/db/schema.ts:37) both default to 0. So
+  //     "is_group happens to read 0" is a fact about that row's history,
+  //     not this event's — caching a shared channel as a user's DM off a
+  //     stale or coincidental read would poison subsequent DM resolution.
+  //     (Codex P2 catch on PR #108 follow-up.)
   if (userId !== null && event.isDM === true) {
     try {
       const { upsertUserDm } = await import('./modules/permissions/db/user-dms.js');
