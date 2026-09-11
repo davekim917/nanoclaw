@@ -29,7 +29,6 @@ advertised_refs=''
 known_remote_tips=''
 object_list=''
 commit_message=''
-worktree_node_modules_link=''
 snapshot_parent=''
 snapshot_root=''
 
@@ -52,9 +51,6 @@ cleanup() {
     echo "pre-push: failed to remove temporary snapshot directory" >&2
   fi
   remove_file "$object_list"
-  if [ "$worktree_node_modules_link" = 1 ] && [ -L "$worktree_root/node_modules" ] && ! rm "$worktree_root/node_modules"; then
-    echo "pre-push: failed to remove worktree node_modules link" >&2
-  fi
   remove_file "$advertised_refs"
   remove_file "$known_remote_tips"
   remove_file "$seen_objects"
@@ -148,11 +144,13 @@ remove_file "$advertised_refs"
 advertised_refs=''
 
 scan_message() {
-  if [ ! -e "$worktree_root/node_modules" ] && [ ! -L "$worktree_root/node_modules" ]; then
-    ln -s "$repo_root/node_modules" "$worktree_root/node_modules"
-    worktree_node_modules_link=1
-  fi
-  "$worktree_root/node_modules/.bin/tsx" "$worktree_root/scripts/check-public-boundary.ts" --root "$1" --message "$2" --message-raw --allowlist "$allowlist_path" </dev/null
+  # Run the main checkout's checker from the main checkout, as the snapshot scan
+  # below does. Hooks run from there (scripts/pin-git-hooks-path.sh pins
+  # core.hooksPath to it), so that is the checker version this hook expects, and
+  # its better-sqlite3 import resolves there. A linked worktree's own
+  # node_modules may be absent or a partial real directory (a stray .cache), so
+  # it is never used; linking into it used to fail with "tsx: not found".
+  (cd "$repo_root" && "$repo_root/node_modules/.bin/tsx" "$repo_root/scripts/check-public-boundary.ts" --root "$1" --message "$2" --message-raw --allowlist "$allowlist_path") </dev/null
 }
 
 scan_tag() {
