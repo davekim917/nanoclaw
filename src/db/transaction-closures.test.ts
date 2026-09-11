@@ -406,6 +406,13 @@ describe('centralTransaction closures await only DB work', () => {
     expect(dbOnlyAwaits.every((a) => !a.forbidden)).toBe(true);
   });
 
+  // 30s, not the 5s default: this builds a full ts.Program over
+  // transactionCallFiles() (dozens of files, full type checking) inside the
+  // test body, not at collection time like the `every .transaction( receiver`
+  // describe block above. Comfortably fast normally, but `--coverage`'s V8
+  // instrumentation overhead applies to every statement executed process-wide
+  // — including this one, even though transaction-closures.test.ts itself
+  // matches no risk:high glob — and pushed it past 5000ms in CI (PR #662).
   it('no production centralTransaction closure awaits a forbidden subsystem', () => {
     const offenders = awaitedCalleesInCentralTransactions(transactionCallFiles())
       // `src/db/drivers/**` and `src/db/testing/**` ARE the driver and its
@@ -420,7 +427,7 @@ describe('centralTransaction closures await only DB work', () => {
         'from a suspended continuation — after a rollback, or joining an unrelated transaction. Move the effect ' +
         'after the transaction resolves. See plan §4.4.',
     ).toEqual([]);
-  });
+  }, 30000);
 });
 
 /**
@@ -575,6 +582,11 @@ describe('nothing called from inside a centralTransaction opens another one', ()
     expect(found.map((c) => c.callee)).toEqual(['opensItsOwnTransaction']);
   });
 
+  // 30s, not the 5s default — same reason as the sibling test in the describe
+  // block above (`no production centralTransaction closure awaits a forbidden
+  // subsystem`): a full ts.Program over centralTransactionFiles() built
+  // inside the test body, slow enough under `--coverage`'s V8 instrumentation
+  // overhead to miss the default timeout in CI (PR #662).
   it('no production centralTransaction closure calls a callee that opens its own', () => {
     const offenders = nestingCallsInCentralTransactions(centralTransactionFiles())
       .filter((c) => !isExcluded(c.file))
@@ -589,7 +601,7 @@ describe('nothing called from inside a centralTransaction opens another one', ()
         'createMessagingGroupAgentInTransaction). Except it here only if the nesting call is provably ' +
         'unreachable while the lease is held.',
     ).toEqual([]);
-  });
+  }, 30000);
 
   it('lists real, unique exceptions with a reason each', () => {
     const callees = NESTED_TRANSACTION_EXCEPTIONS.map((e) => e.callee);

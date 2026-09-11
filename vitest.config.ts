@@ -54,7 +54,14 @@ const lane = process.env.VITEST_LANE;
 function readHostRiskGlobs(): string[] {
   const labelerPath = path.join(import.meta.dirname, '.github', 'labeler.yml');
   const config = parseYaml(fs.readFileSync(labelerPath, 'utf8')) as Record<string, unknown>;
-  return hostRiskGlobs(globsForRiskHigh(config));
+  // scripts/risk-globs.ts's hostRiskGlobs only guarantees ".ts under src/ or
+  // scripts/" as a directory (a glob ending `/**` matches every file in that
+  // tree, README.md and *.md skill docs included) — narrow each directory
+  // glob to `.ts` files specifically, or vitest's coverage-v8 provider tries
+  // to parse those non-TS files as source and logs a "Failed to parse ...
+  // Excluding it from coverage" warning per file (harmless, but noisy: every
+  // module directory under risk:high carries at least one .md).
+  return hostRiskGlobs(globsForRiskHigh(config)).map((glob) => (glob.endsWith('/**') ? `${glob}/*.ts` : glob));
 }
 
 export default defineConfig({
