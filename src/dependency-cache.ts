@@ -820,12 +820,16 @@ function quarantinedDirsFor(pass: DependencyCachePass, workgroupId: string, key:
   return names.filter((name) => name.startsWith(`${key}.quarantined-`)).map((name) => path.join(wgDir, name));
 }
 
+/**
+ * A key with no entry is ordinary (a branch with its own lockfile, a cold
+ * cache), so it logs at INFO. A key whose entry was quarantined is not (§5.7.6),
+ * so that one WARNs.
+ */
 function warnNoEntry(pass: DependencyCachePass, workgroupId: string, key: string, pkgDir: string): void {
-  log.warn('dependency-cache: no verified entry for key', {
-    path: pkgDir,
-    key,
-    quarantined: quarantinedDirsFor(pass, workgroupId, key).length > 0,
-  });
+  const quarantined = quarantinedDirsFor(pass, workgroupId, key).length > 0;
+  const detail = { path: pkgDir, key, quarantined };
+  if (quarantined) log.warn('dependency-cache: no verified entry for key', detail);
+  else log.info('dependency-cache: no verified entry for key', detail);
 }
 
 /**
@@ -1025,7 +1029,171 @@ export type PackageOutcome =
   | 'deferred'
   | 'failed';
 
-export type LinkOutcome = 'linked' | 'exists' | 'ineligible' | 'unkeyable' | 'no-entry' | 'quarantined' | 'failed';
+export type LinkOutcome =
+  | 'linked'
+  | 'exists'
+  | 'ineligible'
+  | 'unkeyable'
+  | 'no-entry'
+  | 'quarantined'
+  | 'incomplete'
+  | 'failed';
+
+// ── Strict completeness for link-at-checkout (§5.7.5, Phase 2) ──────────────
+
+/**
+ * The platform a farm is linked for: the install platform plus its libc
+ * family. The agent image is Debian bookworm (node:22-slim), glibc 2.36, x64:
+ * verified 2026-09-11 in nanoclaw-agent-v2-2a38bd3e:latest with `ldd --version`
+ * and `process.report` (glibcVersionRuntime 2.36, arch x64), with no musl loader
+ * present. npm names that family `glibc` (npm-install-checks 7.1.2
+ * lib/current-env.js:24-25,38-39).
+ */
+export interface LinkPlatform extends InstallPlatform {
+  readonly libc: string;
+}
+
+const LINK_PLATFORM: LinkPlatform = { ...INSTALL_PLATFORM, libc: 'glibc' };
+
+/** A musl build by name: `…-linuxmusl-…` (sharp) or `…-musl` (rollup, lightningcss, css-inline, unrs). */
+const MUSL_BUILD_NAME = /(^|[-/])(linux)?musl($|[-/])/;
+
+export type LinkCompleteness = { complete: true } | { complete: false; reason: string };
+
+/**
+ * The package-lock key `from` reaches for `name`, by node resolution: the
+ * nearest `node_modules/<name>` walking up from `from`'s own directory, which
+ * is where npm installs it. `null` when the lockfile holds none.
+ */
+function resolveDependency(packages: JsonObject, from: string, name: string): string | null {
+  let base = from;
+  for (;;) {
+    const candidate = base === '' ? `${NODE_MODULES}/${name}` : `${base}/${NODE_MODULES}/${name}`;
+    if (Object.prototype.hasOwnProperty.call(packages, candidate)) return candidate;
+    if (base === '') return null;
+    const parent = base.lastIndexOf(`/${NODE_MODULES}/`);
+    base = parent === -1 ? '' : base.slice(0, parent);
+  }
+}
+
+/**
+ * The names an installed `entry` makes npm install: its dependencies, optional
+ * dependencies and non-optional peers; for the root alone, its dev
+ * dependencies too (a dependency's own devDependencies are never installed).
+ */
+function requiredNames(key: string, entry: JsonObject): string[] {
+  const names = new Set<string>();
+  const addAll = (field: unknown): void => {
+    if (isJsonObject(field)) for (const name of Object.keys(field)) names.add(name);
+  };
+  addAll(entry.dependencies);
+  addAll(entry.optionalDependencies);
+  if (key === '') addAll(entry.devDependencies);
+  const peerMeta = isJsonObject(entry.peerDependenciesMeta) ? entry.peerDependenciesMeta : {};
+  if (isJsonObject(entry.peerDependencies)) {
+    for (const name of Object.keys(entry.peerDependencies)) {
+      const meta = peerMeta[name];
+      if (!(isJsonObject(meta) && meta.optional === true)) names.add(name);
+    }
+  }
+  return [...names];
+}
+
+/** npm's platform test on a lockfile entry: os/cpu, and libc when it declares one. */
+function platformExcludes(entry: JsonObject, platform: LinkPlatform): boolean {
+  if (foreignPlatform(entry, platform) !== null) return true;
+  return entry.libc !== undefined && !platformListAccepts(platform.libc, entry.libc);
+}
+
+/**
+ * Strict completeness: the precondition of LINKING an entry into a package dir
+ * that never installed it (plan §5.7.5, Phase 2). `checkCompleteness` rule (1)
+ * lets any optional package be absent, which is sound only while no operation
+ * changes a workspace's file set. A link does: it must also refuse an entry
+ * missing an optional package npm WOULD install on this platform, or a fresh
+ * checkout gets a tree without its native binary (run.md "Phase 2 evidence"
+ * class C: `@esbuild/linux-x64` absent from 14 real trees whose `esbuild` is
+ * installed).
+ *
+ * An absent package-lock entry is excused when:
+ *   (a) its lockfile `os`/`cpu` exclude this platform, or it declares a `libc`
+ *       that excludes it. That is npm's own test (npm-install-checks 7.1.2
+ *       lib/index.js:34-39; lists matched by `checkList`, :59-83, which
+ *       `platformListAccepts` mirrors).
+ *   (b) it declares `os` or `cpu`, declares no `libc`, and is named as a musl
+ *       build, while this platform is glibc. Lockfiles written before npm
+ *       recorded `libc` omit it, and npm skips these builds after reading the
+ *       package manifest's `libc` (run.md class B). The platform's own glibc
+ *       build is a separate lockfile entry, judged on its own.
+ *   (c) at least one entry requires it, and every one that does is itself
+ *       absent and excused: a transitive dependency of a skipped optional
+ *       (run.md class A). Requirers are found by node resolution from each
+ *       requiring entry, not by name, and (c) is a least fixpoint, so a cycle
+ *       of absent packages with no excused root excuses nothing.
+ * Anything else absent refuses the link. So does an absent entry that is not
+ * `optional`, which rule (1) already refuses at adopt.
+ *
+ * Reads `package-lock.json` from `pkgDir` (the key pins its bytes, so it equals
+ * the entry source's) and the hidden lockfile from `nodeModulesDir`.
+ */
+export function checkLinkCompleteness(
+  pkgDir: string,
+  nodeModulesDir: string,
+  platform: LinkPlatform = LINK_PLATFORM,
+): LinkCompleteness {
+  const lockPackages = packagesOf(readJsonObject(path.join(pkgDir, 'package-lock.json')));
+  const hiddenPackages = packagesOf(readJsonObject(path.join(nodeModulesDir, HIDDEN_LOCKFILE)));
+  if (!lockPackages || !hiddenPackages) return { complete: false, reason: 'lockfile packages unreadable' };
+  const installed = (key: string): boolean => key === '' || Object.prototype.hasOwnProperty.call(hiddenPackages, key);
+  const absent = Object.keys(lockPackages)
+    .filter((key) => !installed(key))
+    .sort();
+  if (absent.length === 0) return { complete: true };
+  for (const key of absent) {
+    const entry = lockPackages[key];
+    if (!isJsonObject(entry) || entry.optional !== true) {
+      return { complete: false, reason: `non-optional package absent: ${key}` };
+    }
+  }
+
+  const requiredBy = new Map<string, Set<string>>();
+  for (const [key, entry] of Object.entries(lockPackages)) {
+    if (!isJsonObject(entry)) continue;
+    for (const name of requiredNames(key, entry)) {
+      const target = resolveDependency(lockPackages, key, name);
+      if (target === null || target === key) continue;
+      const requirers = requiredBy.get(target) ?? new Set<string>();
+      requirers.add(key);
+      requiredBy.set(target, requirers);
+    }
+  }
+
+  const excused = new Set<string>();
+  for (const key of absent) {
+    const entry = lockPackages[key] as JsonObject;
+    const muslBuild =
+      platform.libc === 'glibc' &&
+      (entry.os !== undefined || entry.cpu !== undefined) &&
+      entry.libc === undefined &&
+      MUSL_BUILD_NAME.test(typeof entry.name === 'string' ? entry.name : nameFromPackageKey(key));
+    if (platformExcludes(entry, platform) || muslBuild) excused.add(key);
+  }
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const key of absent) {
+      if (excused.has(key)) continue;
+      const requirers = requiredBy.get(key);
+      if (requirers && requirers.size > 0 && [...requirers].every((by) => !installed(by) && excused.has(by))) {
+        excused.add(key);
+        grew = true;
+      }
+    }
+  }
+  const missing = absent.find((key) => !excused.has(key));
+  return missing === undefined
+    ? { complete: true }
+    : { complete: false, reason: `optional package this platform installs is absent: ${missing}` };
+}
 
 export type RecoveryOutcome = 'clean' | 'recovered' | 'blocked' | 'failed';
 
@@ -1387,6 +1555,18 @@ export function linkPackageDir(pass: DependencyCachePass, workgroupId: string, p
   if (!verified.ok) {
     quarantineEntry(pass, pkg.entryDir, verified);
     return 'quarantined';
+  }
+  // A link hands this workspace content it never installed, so the entry must
+  // also hold every optional package npm would install here (§5.7.5).
+  const strict = checkLinkCompleteness(pkgDir, path.join(pkg.entryDir, NODE_MODULES));
+  if (!strict.complete) {
+    decide(pass, 'link-refused', pkgDir, { key: pkg.key, detail: strict.reason });
+    log.warn('dependency-cache: link refused, entry lacks a package this platform installs', {
+      path: pkgDir,
+      key: pkg.key,
+      reason: strict.reason,
+    });
+    return 'incomplete';
   }
   decide(pass, 'link', pkgDir, { key: pkg.key });
   if (pass.mode === 'report') {

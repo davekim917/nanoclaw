@@ -23,6 +23,8 @@ const hostActionMocks = vi.hoisted(() => ({
   releaseRepositoryMountQuiescence: vi.fn(),
   wakeRepositoryMountSessions: vi.fn(),
   writeSessionMessageIfNew: vi.fn(),
+  withExistingMailboxSession: vi.fn(),
+  requestWake: vi.fn(),
   sessionsHoldRepoIngressFence: vi.fn(),
   killContainer: vi.fn(),
 }));
@@ -75,8 +77,22 @@ vi.mock('../../session-manager.js', async () => {
   return {
     ...actual,
     writeSessionMessageIfNew: hostActionMocks.writeSessionMessageIfNew,
+    // Action responses and the job runner's delivery acks land in `fakeMailbox`.
+    withExistingMailboxSession: hostActionMocks.withExistingMailboxSession,
   };
 });
+
+// Clone mode's precondition (plan §5.2). These fixtures stand in for a host
+// whose containers run as the host uid, whatever uid runs the suite.
+vi.mock('../../github-token-file.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../github-token-file.js')>()),
+  containerRunsAsHostUser: () => true,
+}));
+
+vi.mock('../../request-wake.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../request-wake.js')>()),
+  requestWake: hostActionMocks.requestWake,
+}));
 
 // The quiescence probe reads the source sessions' outbound state through the
 // mailbox module's read-only seam (PR 6). Mocked at the seam rather than at a
@@ -90,26 +106,80 @@ vi.mock('../mailbox/read-only.js', async () => {
 
 import {
   canonicalRepoDir,
+  checkoutDirName,
+  checkoutStagingRoot,
+  defaultTopicBranch,
   isWorkgroupRepositoryMountClaimed,
+  listTopicCheckouts,
   readTransferTombstone,
   resolveRepositoryWorkUnit,
   topicWorktreesDir,
+  withRepositoryLifecycleClaims,
   withWorkgroupRepositoryMountClaim,
+  writeOriginPin,
   writeTransferTombstone,
+  type RepositoryWorkUnit,
 } from '../../repository-workspaces.js';
 import { REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS } from '../../config.js';
+import {
+  DEPENDENCY_CACHE_DIRNAME,
+  dependencyKey,
+  envFingerprint,
+  processPackageDir,
+  startDependencyCachePass,
+} from '../../dependency-cache.js';
 import { sessionDir } from '../../session-manager.js';
 import { closeDb, initTestDb, getRawDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
 import type { Session } from '../../types.js';
 import {
+  _setRepositoryCheckoutHooksForTesting,
+  applyRepositoryCheckoutAction,
   applyRepositoryPublishAction,
+  applyRepositoryRefreshAction,
   applyRepositoryTransferAction,
+  checkoutRepository,
+  dispatchRepositoryCheckout,
   publishStagedCanonical,
   refreshCanonicalFromLocalRefs,
+  repositoryCheckoutLane,
   resolveTransferSourceWorkUnit,
   transferRepositoryWorktree,
+  type CheckoutFarmPolicy,
 } from './index.js';
+import {
+  _repositoryActionChainForTesting,
+  _resetRepositoryActionsForTesting,
+  runRepositoryActionDetached,
+} from './job-runner.js';
+
+/** In-memory inbound for action responses, and the delivery acks the job runner writes. */
+const mailboxInbound = new Map<string, { id: string; content: string }>();
+const mailboxAcks: Array<{ kind: 'delivered' | 'failed'; id: string }> = [];
+
+function fakeMailbox() {
+  return {
+    inboundHasMessage: (id: string) => mailboxInbound.has(id),
+    insertMessage: async (message: { id: string; content: string }) => {
+      mailboxInbound.set(message.id, message);
+    },
+    markDelivered: (id: string) => {
+      mailboxAcks.push({ kind: 'delivered', id });
+    },
+    markDeliveryFailed: (id: string) => {
+      mailboxAcks.push({ kind: 'failed', id });
+    },
+    // No fixture writes a durable ingress fence. sessionsHoldRepoIngressFence
+    // reads through this mailbox and treats a read that throws as a held fence.
+    readRepoIngressFence: () => null,
+  };
+}
+
+function responseFor(requestId: string): Record<string, unknown> {
+  const row = mailboxInbound.get(`repository-action-response-${requestId}`);
+  if (!row) throw new Error(`no repository action response for ${requestId}`);
+  return JSON.parse(row.content) as Record<string, unknown>;
+}
 
 let root: string;
 let remote: string;
@@ -150,6 +220,15 @@ beforeEach(() => {
   hostActionMocks.releaseRepositoryMountQuiescence.mockReset();
   hostActionMocks.wakeRepositoryMountSessions.mockReset();
   hostActionMocks.writeSessionMessageIfNew.mockReset();
+  hostActionMocks.withExistingMailboxSession.mockReset();
+  hostActionMocks.withExistingMailboxSession.mockImplementation(
+    async (_agentGroupId: string, _sessionId: string, action: (mailbox: unknown) => unknown) => action(fakeMailbox()),
+  );
+  hostActionMocks.requestWake.mockReset();
+  mailboxInbound.clear();
+  mailboxAcks.length = 0;
+  _resetRepositoryActionsForTesting();
+  _setRepositoryCheckoutHooksForTesting(null);
   fs.rmSync(hostActionDataDir, { recursive: true, force: true });
   fs.mkdirSync(hostActionDataDir, { recursive: true, mode: 0o700 });
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'repository-actions-'));
@@ -1608,5 +1687,815 @@ describe('transfer source thread resolution', () => {
         threadId: '171234.567',
       }).key,
     );
+  });
+});
+
+// Real git work per case, run under `ionice -c3 nice` on the host: allow it time.
+describe('repository_checkout host action (plan §5.2, Phase 2)', { timeout: 60_000 }, () => {
+  const WG = 'wg-co';
+  const FP = envFingerprint('22.23.2', process.arch);
+  const OFF: CheckoutFarmPolicy = { mode: 'off' };
+  let requestSeq = 0;
+  const nextRequestId = (): string => `repo-1789000000000-${(++requestSeq).toString(16).padStart(16, '0')}`;
+  const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+  async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error(message)), ms);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function taskSession(id: string, anchor: string): Session {
+    return {
+      id,
+      agent_group_id: 'agent-co',
+      messaging_group_id: null,
+      thread_id: `system:tasks:${anchor}`,
+      agent_provider: 'claude',
+      status: 'active',
+      container_status: 'running',
+      last_active: null,
+      created_at: new Date().toISOString(),
+    } satisfies Session;
+  }
+
+  function unitOf(session: Session): RepositoryWorkUnit {
+    return resolveRepositoryWorkUnit({
+      workgroupId: WG,
+      sessionId: session.id,
+      platformId: null,
+      messagingGroupId: null,
+      threadId: session.thread_id,
+    });
+  }
+
+  function threadUnit(anchor: string): RepositoryWorkUnit {
+    return unitOf(taskSession(`session-${anchor}`, anchor));
+  }
+
+  function mockAgentGroup(): void {
+    hostActionMocks.getAgentGroup.mockReturnValue({ id: 'agent-co', folder: 'agent-co', workgroup_id: WG });
+  }
+
+  function tryGitOut(cwd: string, args: string[]): string | null {
+    try {
+      return git(cwd, args);
+    } catch {
+      return null;
+    }
+  }
+
+  /** A workgroup canonical with a network pin, kept detached as the host keeps it (index.ts:302,338). */
+  function networkCanonical(dataDir: string, repo = 'proj'): string {
+    const canonical = canonicalRepoDir(WG, repo, dataDir);
+    cloneTo(canonical);
+    git(canonical, ['checkout', '-q', '--detach', 'HEAD']);
+    writeOriginPin(WG, repo, { origin: remote, repositoryId: remote }, dataDir);
+    return canonical;
+  }
+
+  /** A canonical that never had a remote, preserved under a local-only pin. */
+  function localOnlyCanonical(dataDir: string, repo: string): string {
+    const canonical = canonicalRepoDir(WG, repo, dataDir);
+    fs.mkdirSync(canonical, { recursive: true });
+    git(canonical, ['init', '-q', '-b', 'main']);
+    fs.writeFileSync(path.join(canonical, 'solo.txt'), 'solo\n');
+    git(canonical, ['add', '-A']);
+    git(canonical, ['commit', '-q', '-m', 'solo base']);
+    git(canonical, ['checkout', '-q', '--detach', 'HEAD']);
+    writeOriginPin(WG, repo, { kind: 'local-only', origin: null, repositoryId: `local-only:${repo}` }, dataDir);
+    return canonical;
+  }
+
+  /** Committed-but-unpushed work on `refs/heads/<branch>`, made without touching the checkout. */
+  function unpushedBranch(repoPath: string, branch: string, message: string): string {
+    const tree = git(repoPath, ['rev-parse', 'HEAD^{tree}']);
+    const commit = git(repoPath, ['commit-tree', tree, '-p', 'HEAD', '-m', message]);
+    git(repoPath, ['update-ref', `refs/heads/${branch}`, commit]);
+    return commit;
+  }
+
+  /** Push a commit on `branch` to the remote, then fetch it into `canonical` as a container would. */
+  function pushToRemote(canonical: string, branch: string, files: Record<string, string | Buffer>): string {
+    const scratch = fs.mkdtempSync(path.join(root, 'push-'));
+    execFileSync('git', ['clone', '-q', remote, scratch]);
+    const onRemote = git(scratch, ['branch', '-r', '--list', `origin/${branch}`]) !== '';
+    git(scratch, ['checkout', '-q', '-B', branch, onRemote ? `origin/${branch}` : 'origin/main']);
+    for (const [rel, body] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(scratch, rel)), { recursive: true });
+      fs.writeFileSync(path.join(scratch, rel), body);
+    }
+    git(scratch, ['add', '-A']);
+    git(scratch, ['commit', '-q', '-m', `${branch}: ${Object.keys(files).join(', ')}`]);
+    git(scratch, ['push', '-q', 'origin', branch]);
+    git(canonical, ['fetch', '-q', 'origin']);
+    return git(scratch, ['rev-parse', 'HEAD']);
+  }
+
+  /** An npm project; with `tree`, installed the way `npm ci` leaves it (hidden lockfile written last). */
+  function writeNpmProject(dir: string, options: { tree: boolean }): void {
+    fs.mkdirSync(dir, { recursive: true });
+    const dependencies = { 'left-pad': '^1.3.0' };
+    const locked = {
+      version: '1.3.0',
+      resolved: 'https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz',
+      integrity: 'sha512-leftpad',
+    };
+    fs.writeFileSync(
+      path.join(dir, 'package.json'),
+      `${JSON.stringify({ name: 'app', version: '1.0.0', dependencies }, null, 2)}\n`,
+    );
+    fs.writeFileSync(
+      path.join(dir, 'package-lock.json'),
+      `${JSON.stringify(
+        {
+          name: 'app',
+          version: '1.0.0',
+          lockfileVersion: 3,
+          requires: true,
+          packages: { '': { name: 'app', version: '1.0.0', dependencies }, 'node_modules/left-pad': locked },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    if (!options.tree) return;
+    const nm = path.join(dir, 'node_modules');
+    fs.mkdirSync(path.join(nm, 'left-pad'), { recursive: true });
+    fs.writeFileSync(path.join(nm, 'left-pad', 'package.json'), JSON.stringify({ name: 'left-pad', version: '1.3.0' }));
+    fs.writeFileSync(path.join(nm, 'left-pad', 'index.js'), 'module.exports = (s) => s;\n');
+    const hourAgo = (Date.now() - 60 * 60 * 1000) / 1000;
+    for (const rel of ['left-pad/package.json', 'left-pad/index.js'])
+      fs.utimesSync(path.join(nm, rel), hourAgo, hourAgo);
+    fs.writeFileSync(
+      path.join(nm, '.package-lock.json'),
+      JSON.stringify({
+        name: 'app',
+        version: '1.0.0',
+        lockfileVersion: 3,
+        requires: true,
+        packages: { 'node_modules/left-pad': locked },
+      }),
+    );
+    fs.utimesSync(path.join(nm, '.package-lock.json'), hourAgo + 30, hourAgo + 30);
+  }
+
+  function checkout(
+    unit: RepositoryWorkUnit,
+    branch: string | null,
+    dataDir: string,
+    repo = 'proj',
+    farms: CheckoutFarmPolicy = OFF,
+  ) {
+    return checkoutRepository({
+      workgroupId: WG,
+      workUnit: unit,
+      repo,
+      branch,
+      requestId: nextRequestId(),
+      dataDir,
+      farms,
+    });
+  }
+
+  function metadataOf(checkoutPath: string): Record<string, unknown> {
+    return JSON.parse(fs.readFileSync(path.join(checkoutPath, '.git', 'nanoclaw-checkout.json'), 'utf8')) as Record<
+      string,
+      unknown
+    >;
+  }
+
+  const remoteRefs = (repoPath: string): string =>
+    git(repoPath, ['for-each-ref', '--format=%(refname) %(objectname) %(symref)', 'refs/remotes/origin']);
+
+  it('repository_checkout publishes a fully initialized self-contained clone', async () => {
+    const canonical = networkCanonical(root);
+    // A canonical local branch: `git clone` would map it into origin/*.
+    git(canonical, ['branch', 'canonical-only']);
+    git(canonical, ['repack', '-a', '-d', '-q']);
+    const unit = threadUnit('p2-2');
+    const requestId = nextRequestId();
+
+    const result = await checkoutRepository({
+      workgroupId: WG,
+      workUnit: unit,
+      repo: 'proj',
+      branch: 'feat-p22',
+      requestId,
+      dataDir: root,
+      farms: OFF,
+    });
+
+    const topicRoot = topicWorktreesDir(unit, root);
+    const clone = path.join(topicRoot, 'proj');
+    expect(result).toMatchObject({
+      dirName: 'proj',
+      branch: 'feat-p22',
+      created: true,
+      shape: 'clone',
+      startedFrom: 'origin-head',
+      objectsLinked: true,
+      farmsLinked: 0,
+    });
+    expect(fs.lstatSync(path.join(clone, '.git')).isDirectory()).toBe(true);
+    expect(fs.existsSync(path.join(clone, '.git', 'objects', 'info', 'alternates'))).toBe(false);
+    const packs = fs.readdirSync(path.join(clone, '.git', 'objects', 'pack')).filter((name) => name.endsWith('.pack'));
+    expect(packs.length).toBeGreaterThan(0);
+    expect(fs.statSync(path.join(clone, '.git', 'objects', 'pack', packs[0]!)).nlink).toBeGreaterThanOrEqual(2);
+    expect(remoteRefs(clone)).toBe(remoteRefs(canonical));
+    expect(remoteRefs(clone)).not.toContain('canonical-only');
+    expect(git(clone, ['for-each-ref', '--format=%(refname)', 'refs/heads'])).toBe('refs/heads/feat-p22');
+    expect(git(clone, ['symbolic-ref', 'HEAD'])).toBe('refs/heads/feat-p22');
+    expect(fs.readFileSync(path.join(clone, 'tracked.txt'), 'utf8')).toBe('base\n');
+    expect(git(clone, ['status', '--porcelain=v1', '--untracked-files=all'])).toBe('');
+    const head = git(clone, ['rev-parse', 'HEAD']);
+    expect(head).toBe(git(canonical, ['rev-parse', 'refs/remotes/origin/HEAD']));
+    expect(metadataOf(clone)).toEqual({
+      version: 1,
+      repo: 'proj',
+      branch: 'feat-p22',
+      startCommit: head,
+      startedFrom: 'origin-head',
+    });
+    expect(git(clone, ['config', '--get', 'remote.origin.url'])).toBe(fs.realpathSync(remote));
+    expect(git(clone, ['config', '--get', 'gc.auto'])).toBe('0');
+    expect(listTopicCheckouts(topicRoot).map(({ name, shape }) => ({ name, shape }))).toEqual([
+      { name: 'proj', shape: 'clone' },
+    ]);
+    expect(fs.existsSync(path.join(checkoutStagingRoot(topicRoot), requestId))).toBe(false);
+  });
+
+  it('a second branch in the same thread gets <repo>@<slug> and the primary is untouched', async () => {
+    networkCanonical(root);
+    const unit = threadUnit('p2-3');
+    const topicRoot = topicWorktreesDir(unit, root);
+    const primary = await checkout(unit, null, root);
+    expect(primary).toMatchObject({ dirName: 'proj', branch: defaultTopicBranch(unit, 'proj'), created: true });
+    const primaryPath = path.join(topicRoot, 'proj');
+    fs.writeFileSync(path.join(primaryPath, 'staged.txt'), 'staged\n');
+    git(primaryPath, ['add', 'staged.txt']);
+    fs.writeFileSync(path.join(primaryPath, 'tracked.txt'), 'unstaged edit\n');
+    fs.writeFileSync(path.join(primaryPath, 'untracked.txt'), 'untracked\n');
+    const snapshot = () => ({
+      head: git(primaryPath, ['rev-parse', 'HEAD']),
+      branch: git(primaryPath, ['symbolic-ref', 'HEAD']),
+      status: git(primaryPath, ['status', '--porcelain=v2', '--untracked-files=all']),
+      index: git(primaryPath, ['ls-files', '--stage']),
+      tracked: fs.readFileSync(path.join(primaryPath, 'tracked.txt'), 'utf8'),
+      staged: fs.readFileSync(path.join(primaryPath, 'staged.txt'), 'utf8'),
+      untracked: fs.readFileSync(path.join(primaryPath, 'untracked.txt'), 'utf8'),
+      metadata: fs.readFileSync(path.join(primaryPath, '.git', 'nanoclaw-checkout.json'), 'utf8'),
+    });
+    const before = snapshot();
+
+    const second = await checkout(unit, 'feat/second', root);
+
+    expect(second).toMatchObject({
+      dirName: checkoutDirName('proj', 'feat/second'),
+      branch: 'feat/second',
+      created: true,
+    });
+    expect(second.dirName).toMatch(/^proj@feat-second-[0-9a-f]{8}$/);
+    expect(git(path.join(topicRoot, second.dirName), ['symbolic-ref', 'HEAD'])).toBe('refs/heads/feat/second');
+    expect(snapshot()).toEqual(before);
+    // No branch, or the primary's own branch, keeps serving the primary.
+    await expect(checkout(unit, null, root)).resolves.toMatchObject({ dirName: 'proj', created: false });
+    await expect(checkout(unit, defaultTopicBranch(unit, 'proj'), root)).resolves.toMatchObject({
+      dirName: 'proj',
+      created: false,
+    });
+    await expect(checkout(unit, 'feat/second', root)).resolves.toMatchObject({
+      dirName: second.dirName,
+      created: false,
+    });
+    expect(snapshot()).toEqual(before);
+    expect(listTopicCheckouts(topicRoot).map((entry) => entry.name)).toEqual(['proj', second.dirName]);
+  });
+
+  it('two threads check out the same branch concurrently', async () => {
+    networkCanonical(hostActionDataDir);
+    mockAgentGroup();
+    const sessions = [taskSession('session-p24-a', 'p2-4-a'), taskSession('session-p24-b', 'p2-4-b')];
+    // Each job waits inside staging until the other has reached staging too, so
+    // both are provably in flight at once rather than one after the other.
+    const reached = new Set<string>();
+    let bothReached!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      bothReached = resolve;
+    });
+    _setRepositoryCheckoutHooksForTesting({
+      afterStagingPopulated: async (stagingCheckout) => {
+        reached.add(stagingCheckout);
+        if (reached.size === 2) bothReached();
+        await withTimeout(barrier, 30_000, 'the other thread never reached staging');
+      },
+    });
+    const requests = sessions.map((session) => ({ session, requestId: nextRequestId() }));
+
+    for (const { session, requestId } of requests) {
+      await expect(
+        dispatchRepositoryCheckout(
+          {
+            action: 'repository_checkout',
+            requestId,
+            repo: 'proj',
+            branch: 'shared-b',
+            workUnitKey: unitOf(session).key,
+          },
+          session,
+        ),
+      ).resolves.toEqual({ deferAck: true });
+    }
+    await Promise.all(
+      requests.map(({ session }) => _repositoryActionChainForTesting(repositoryCheckoutLane(WG, unitOf(session)))),
+    );
+
+    expect(reached.size).toBe(2);
+    for (const { session, requestId } of requests) {
+      expect(responseFor(requestId)).toMatchObject({
+        type: 'repository_action_response',
+        requestId,
+        ok: true,
+        dirName: 'proj',
+        branch: 'shared-b',
+        created: true,
+        startedFrom: 'origin-head',
+      });
+      const clone = path.join(topicWorktreesDir(unitOf(session), hostActionDataDir), 'proj');
+      expect(git(clone, ['symbolic-ref', 'HEAD'])).toBe('refs/heads/shared-b');
+    }
+    expect(hostActionMocks.quiesceSessionsForRepositoryMounts).not.toHaveBeenCalled();
+    expect(mailboxAcks).toEqual(
+      expect.arrayContaining(requests.map(({ requestId }) => ({ kind: 'delivered', id: requestId }))),
+    );
+  });
+
+  it('same-thread siblings get one path, including while the first checkout is still initializing', async () => {
+    networkCanonical(hostActionDataDir);
+    mockAgentGroup();
+    const first = taskSession('session-p25-a', 'p2-5');
+    const sibling = taskSession('session-p25-b', 'p2-5');
+    const unit = unitOf(first);
+    expect(unitOf(sibling).key).toBe(unit.key);
+    const topicRoot = topicWorktreesDir(unit, hostActionDataDir);
+    let pausedAt: string | null = null;
+    let resume!: () => void;
+    const resumed = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    _setRepositoryCheckoutHooksForTesting({
+      afterStagingPopulated: async (stagingCheckout) => {
+        pausedAt = stagingCheckout;
+        await resumed;
+      },
+    });
+    const firstId = nextRequestId();
+    const siblingId = nextRequestId();
+    const request = (requestId: string) => ({
+      action: 'repository_checkout',
+      requestId,
+      repo: 'proj',
+      branch: 'feat-shared',
+      workUnitKey: unit.key,
+    });
+
+    await dispatchRepositoryCheckout(request(firstId), first);
+    await vi.waitFor(() => expect(pausedAt).not.toBeNull(), { timeout: 30_000 });
+    await dispatchRepositoryCheckout(request(siblingId), sibling);
+    await tick();
+    await tick();
+
+    // The sibling waits on the lane; the first checkout is not yet published.
+    expect(mailboxInbound.has(`repository-action-response-${siblingId}`)).toBe(false);
+    expect(listTopicCheckouts(topicRoot)).toEqual([]);
+    expect(pausedAt!.startsWith(path.join(checkoutStagingRoot(topicRoot), firstId))).toBe(true);
+
+    resume();
+    await _repositoryActionChainForTesting(repositoryCheckoutLane(WG, unit));
+
+    expect(responseFor(firstId)).toMatchObject({ ok: true, created: true, dirName: 'proj', branch: 'feat-shared' });
+    expect(responseFor(siblingId)).toMatchObject({ ok: true, created: false, dirName: 'proj', branch: 'feat-shared' });
+    expect(listTopicCheckouts(topicRoot).map((entry) => entry.name)).toEqual(['proj']);
+    const clone = path.join(topicRoot, 'proj');
+    expect(git(clone, ['symbolic-ref', 'HEAD'])).toBe('refs/heads/feat-shared');
+    expect(fs.readFileSync(path.join(clone, 'tracked.txt'), 'utf8')).toBe('base\n');
+    expect(git(clone, ['status', '--porcelain=v1', '--untracked-files=all'])).toBe('');
+  });
+
+  it('start point prefers canonical refs/heads/B, then origin/B, then origin/HEAD, and the post-fetch step only moves pristine checkouts', async () => {
+    // Host half of P2-6: the start point and its note. The post-fetch step
+    // runs in the container (git-worktrees.test.ts).
+    const canonical = networkCanonical(root);
+    const remoteOnly = pushToRemote(canonical, 'feat-remote', { 'remote.txt': 'remote\n' });
+    pushToRemote(canonical, 'dual', { 'dual.txt': 'remote\n' });
+    const legacy = unpushedBranch(canonical, 'legacy-local', 'committed, never pushed');
+    const dualLocal = unpushedBranch(canonical, 'dual', 'local work on a branch the remote also has');
+    const originHead = git(canonical, ['rev-parse', 'refs/remotes/origin/HEAD']);
+    const unit = threadUnit('p2-6');
+    const topicRoot = topicWorktreesDir(unit, root);
+    const cases = [
+      { branch: 'legacy-local', startedFrom: 'canonical-local', head: legacy, upstream: null },
+      { branch: 'dual', startedFrom: 'canonical-local', head: dualLocal, upstream: null },
+      { branch: 'feat-remote', startedFrom: 'origin-branch', head: remoteOnly, upstream: 'origin/feat-remote' },
+      { branch: 'brand-new', startedFrom: 'origin-head', head: originHead, upstream: null },
+    ];
+
+    for (const expected of cases) {
+      const result = await checkout(unit, expected.branch, root);
+      expect(result, expected.branch).toMatchObject({
+        created: true,
+        branch: expected.branch,
+        startedFrom: expected.startedFrom,
+      });
+      const clone = path.join(topicRoot, result.dirName);
+      expect(git(clone, ['rev-parse', 'HEAD']), expected.branch).toBe(expected.head);
+      expect(metadataOf(clone), expected.branch).toMatchObject({
+        branch: expected.branch,
+        startCommit: expected.head,
+        startedFrom: expected.startedFrom,
+      });
+      expect(tryGitOut(clone, ['rev-parse', '--abbrev-ref', `${expected.branch}@{upstream}`]), expected.branch).toBe(
+        expected.upstream,
+      );
+    }
+    // The canonical keeps its own refs exactly.
+    expect(git(canonical, ['rev-parse', 'refs/heads/legacy-local'])).toBe(legacy);
+    expect(git(canonical, ['rev-parse', 'refs/heads/dual'])).toBe(dualLocal);
+  });
+
+  it('refresh never reads a checkout: a clone redirecting to another repository leaks nothing', async () => {
+    const dataDir = hostActionDataDir;
+    const canonical = networkCanonical(dataDir);
+    const session = taskSession('session-p2-9', 'p2-9');
+    const topicRoot = topicWorktreesDir(unitOf(session), dataDir);
+    fs.mkdirSync(topicRoot, { recursive: true });
+
+    // Another workgroup's repository, holding one secret object per route.
+    const other = canonicalRepoDir('wg-other', 'secret', dataDir);
+    fs.mkdirSync(other, { recursive: true });
+    git(other, ['init', '-q', '-b', 'main']);
+    const secrets: Record<string, string> = {};
+    for (const route of ['commondir', 'alternates', 'objects-link']) {
+      fs.writeFileSync(path.join(other, 'secret.txt'), `other workgroup secret via ${route}\n`);
+      git(other, ['add', '-A']);
+      git(other, ['commit', '-q', '-m', `secret ${route}`]);
+      secrets[route] = git(other, ['rev-parse', 'HEAD']);
+    }
+    // The commondir route exposes the other repository's own refs.
+    git(other, ['update-ref', 'refs/remotes/origin/leaked-commondir', secrets.commondir]);
+    const otherGit = path.join(other, '.git');
+
+    // Clones in the caller's own topic, each redirecting Git to that repository.
+    const viaCommondir = path.join(topicRoot, 'proj@via-commondir');
+    execFileSync('git', ['clone', '-q', canonical, viaCommondir]);
+    fs.writeFileSync(path.join(viaCommondir, '.git', 'commondir'), `${otherGit}\n`);
+
+    const viaAlternates = path.join(topicRoot, 'proj@via-alternates');
+    execFileSync('git', ['clone', '-q', canonical, viaAlternates]);
+    fs.writeFileSync(path.join(viaAlternates, '.git', 'objects', 'info', 'alternates'), `${otherGit}/objects\n`);
+    git(viaAlternates, ['update-ref', 'refs/remotes/origin/leaked-alternates', secrets.alternates]);
+
+    const viaObjectsLink = path.join(topicRoot, 'proj@via-objects-link');
+    fs.mkdirSync(viaObjectsLink);
+    git(viaObjectsLink, ['init', '-q', '-b', 'main']);
+    fs.rmSync(path.join(viaObjectsLink, '.git', 'objects'), { recursive: true });
+    fs.symlinkSync(path.join(otherGit, 'objects'), path.join(viaObjectsLink, '.git', 'objects'));
+    git(viaObjectsLink, ['update-ref', 'refs/remotes/origin/leaked-objects-link', secrets['objects-link']]);
+
+    const refsBefore = remoteRefs(canonical);
+    mockAgentGroup();
+    const requests = ['proj@via-commondir', 'proj@via-alternates', 'proj@via-objects-link'].map((dirName) => ({
+      requestId: nextRequestId(),
+      dirName,
+    }));
+    const settled = [];
+    for (const { requestId, dirName } of requests) {
+      // A container that has not restarted since rev 2.7 still names a checkout.
+      settled.push(
+        await Promise.allSettled([
+          applyRepositoryRefreshAction(
+            { requestId, repo: 'proj', workUnitKey: unitOf(session).key, checkout: dirName },
+            session,
+          ),
+        ]),
+      );
+    }
+
+    // Neither a ref nor an object crossed into this workgroup's canonical.
+    expect(remoteRefs(canonical)).toBe(refsBefore);
+    for (const [route, oid] of Object.entries(secrets)) {
+      expect(tryGitOut(canonical, ['cat-file', '-e', `${oid}^{commit}`]), route).toBeNull();
+    }
+    // Each is a plain refresh, and it succeeds.
+    expect(settled.flat().map((result) => result.status)).toEqual(['fulfilled', 'fulfilled', 'fulfilled']);
+    for (const { requestId } of requests) {
+      expect(mailboxInbound.has(`repository-action-response-${requestId}`)).toBe(false);
+    }
+  });
+
+  it('a canonical whose .git holds a commondir file is refused, and nothing is staged', async () => {
+    const canonical = networkCanonical(root);
+    const elsewhere = path.join(root, 'elsewhere');
+    fs.mkdirSync(elsewhere);
+    git(elsewhere, ['init', '-q', '-b', 'main']);
+    git(elsewhere, ['commit', '-q', '--allow-empty', '-m', 'elsewhere']);
+    // The canonical .git is mounted read-write into containers (container-runner.ts:4406).
+    fs.writeFileSync(path.join(canonical, '.git', 'commondir'), `${path.join(elsewhere, '.git')}\n`);
+    const unit = threadUnit('commondir');
+    const topicRoot = topicWorktreesDir(unit, root);
+    const staged = (): string[] => {
+      try {
+        return fs.readdirSync(checkoutStagingRoot(topicRoot));
+      } catch {
+        return [];
+      }
+    };
+
+    await expect(checkout(unit, 'feat-commondir', root)).rejects.toThrow(/commondir/);
+    await expect(checkout(unit, null, root)).rejects.toThrow(/commondir/);
+    expect(listTopicCheckouts(topicRoot)).toEqual([]);
+    expect(staged()).toEqual([]);
+    await expect(refreshCanonicalFromLocalRefs({ workgroupId: WG, repo: 'proj', dataDir: root })).rejects.toThrow(
+      /commondir/,
+    );
+  });
+
+  it('repository_checkout links node_modules farms for package dirs with a verified entry', async () => {
+    const canonical = networkCanonical(root);
+    const donor = path.join(root, 'donor', 'app');
+    writeNpmProject(donor, { tree: true });
+    pushToRemote(canonical, 'main', {
+      'app/package.json': fs.readFileSync(path.join(donor, 'package.json')),
+      'app/package-lock.json': fs.readFileSync(path.join(donor, 'package-lock.json')),
+    });
+    const cacheRoot = path.join(root, DEPENDENCY_CACHE_DIRNAME);
+    const pass = startDependencyCachePass({
+      mode: 'apply',
+      cacheRoot,
+      now: Date.now(),
+      reclaimableBytes: () => 0,
+      fingerprint: () => FP,
+    });
+    expect(processPackageDir(pass, WG, donor)).toBe('adopted');
+    const entryNm = path.join(cacheRoot, WG, dependencyKey(donor, FP)!.key, 'node_modules');
+    const farms: CheckoutFarmPolicy = { mode: 'apply', fingerprint: () => FP };
+    const unit = threadUnit('p2-14');
+    const clone = path.join(topicWorktreesDir(unit, root), 'proj');
+    const sharesEntry = (): boolean => {
+      const mine = fs.statSync(path.join(clone, 'app', 'node_modules', 'left-pad', 'index.js'));
+      const theirs = fs.statSync(path.join(entryNm, 'left-pad', 'index.js'));
+      return mine.dev === theirs.dev && mine.ino === theirs.ino;
+    };
+
+    await expect(checkout(unit, null, root, 'proj', farms)).resolves.toMatchObject({ created: true, farmsLinked: 1 });
+    expect(sharesEntry()).toBe(true);
+    // Every farm keeps its own hidden lockfile (npm rewrites it).
+    expect(fs.statSync(path.join(clone, 'app', 'node_modules', '.package-lock.json')).ino).not.toBe(
+      fs.statSync(path.join(entryNm, '.package-lock.json')).ino,
+    );
+
+    // Reuse links nothing. A published checkout is live and container-writable,
+    // so the host writes no farm into it: a lost farm is reinstalled by npm and
+    // later converted by the sweep.
+    fs.rmSync(path.join(clone, 'app', 'node_modules'), { recursive: true, force: true });
+    await expect(checkout(unit, null, root, 'proj', farms)).resolves.toMatchObject({ created: false, farmsLinked: 0 });
+    expect(fs.existsSync(path.join(clone, 'app', 'node_modules'))).toBe(false);
+
+    // With the cache flag off, a checkout shares nothing.
+    const other = threadUnit('p2-14-off');
+    await expect(checkout(other, null, root, 'proj', OFF)).resolves.toMatchObject({ created: true, farmsLinked: 0 });
+    expect(fs.existsSync(path.join(topicWorktreesDir(other, root), 'proj', 'app', 'node_modules'))).toBe(false);
+  });
+
+  it('a crash before publication leaves no enumerated checkout and a retry creates normally', async () => {
+    networkCanonical(root);
+    const unit = threadUnit('p2-16');
+    const topicRoot = topicWorktreesDir(unit, root);
+    const stagingRoot = checkoutStagingRoot(topicRoot);
+    const residue = path.join(root, 'killed-job-residue');
+    const crashedId = nextRequestId();
+    const request = {
+      workgroupId: WG,
+      workUnit: unit,
+      repo: 'proj',
+      branch: null,
+      requestId: crashedId,
+      dataDir: root,
+      farms: OFF,
+    };
+    _setRepositoryCheckoutHooksForTesting({
+      afterStagingPopulated: (stagingCheckout) => {
+        // Capture exactly what a host killed at this point leaves on disk.
+        fs.cpSync(path.dirname(stagingCheckout), residue, { recursive: true, verbatimSymlinks: true });
+        throw new Error('simulated host kill');
+      },
+    });
+    await expect(checkoutRepository(request)).rejects.toThrow(/simulated host kill/);
+    _setRepositoryCheckoutHooksForTesting(null);
+    fs.cpSync(residue, path.join(stagingRoot, crashedId), { recursive: true, verbatimSymlinks: true });
+    expect(fs.existsSync(path.join(stagingRoot, crashedId, 'proj', '.git', 'nanoclaw-checkout.json'))).toBe(true);
+    expect(listTopicCheckouts(topicRoot)).toEqual([]);
+
+    // A host restart replays the undelivered row under the same request id.
+    await expect(checkoutRepository(request)).resolves.toMatchObject({ dirName: 'proj', created: true });
+    expect(listTopicCheckouts(topicRoot).map((entry) => entry.name)).toEqual(['proj']);
+    expect(git(path.join(topicRoot, 'proj'), ['symbolic-ref', 'HEAD'])).toBe(
+      `refs/heads/${defaultTopicBranch(unit, 'proj')}`,
+    );
+    expect(fs.existsSync(path.join(stagingRoot, crashedId))).toBe(false);
+
+    // Other requests' residue: the next checkout on this lane removes what is
+    // over an hour old and keeps what is younger.
+    const staleId = nextRequestId();
+    const freshId = nextRequestId();
+    for (const id of [staleId, freshId]) {
+      fs.cpSync(residue, path.join(stagingRoot, id), { recursive: true, verbatimSymlinks: true });
+    }
+    const twoHoursAgo = (Date.now() - 2 * 60 * 60 * 1000) / 1000;
+    fs.utimesSync(path.join(stagingRoot, staleId), twoHoursAgo, twoHoursAgo);
+    await checkout(unit, 'after-crash', root);
+    expect(fs.existsSync(path.join(stagingRoot, staleId))).toBe(false);
+    expect(fs.existsSync(path.join(stagingRoot, freshId))).toBe(true);
+    expect(listTopicCheckouts(topicRoot).map((entry) => entry.name)).toEqual(['proj', 'proj@after-crash']);
+  });
+
+  it('stages outside the container-writable worktrees root, so a planted .staging is never followed', async () => {
+    networkCanonical(root);
+    const unit = threadUnit('staging-trust');
+    const topicRoot = topicWorktreesDir(unit, root);
+    fs.mkdirSync(topicRoot, { recursive: true });
+    // An agent can write anything under worktrees/ (mounted read-write,
+    // container-runner.ts:4386), including a `.staging` symlink to host data
+    // whose entries are old enough to look like crash residue.
+    const victim = path.join(root, 'host-data');
+    fs.mkdirSync(path.join(victim, 'precious'), { recursive: true });
+    const twoHoursAgo = (Date.now() - 2 * 60 * 60 * 1000) / 1000;
+    fs.utimesSync(path.join(victim, 'precious'), twoHoursAgo, twoHoursAgo);
+    fs.symlinkSync(victim, path.join(topicRoot, '.staging'));
+
+    await expect(checkout(unit, null, root, 'proj', OFF)).resolves.toMatchObject({ dirName: 'proj', created: true });
+
+    expect(fs.readdirSync(victim)).toEqual(['precious']);
+    expect(path.relative(topicRoot, checkoutStagingRoot(topicRoot)).startsWith('..')).toBe(true);
+  });
+
+  it('local-only canonicals: clone has no origin, starts from preserved refs, skips fetch and refresh, refuses push/PR', async () => {
+    // Host half of P2-17. The skipped fetch and the push/PR refusal are
+    // container-side (git-worktrees.test.ts).
+    const canonical = localOnlyCanonical(root, 'solo');
+    const kept = unpushedBranch(canonical, 'keep-me', 'preserved local-only work');
+    const head = git(canonical, ['rev-parse', 'HEAD^{commit}']);
+    const unit = threadUnit('p2-17');
+    const topicRoot = topicWorktreesDir(unit, root);
+
+    const primary = await checkout(unit, null, root, 'solo');
+    const preserved = await checkout(unit, 'keep-me', root, 'solo');
+    const fresh = await checkout(unit, 'fresh-branch', root, 'solo');
+
+    expect(primary).toMatchObject({
+      dirName: 'solo',
+      branch: defaultTopicBranch(unit, 'solo'),
+      created: true,
+      startedFrom: 'local-head',
+    });
+    expect(preserved).toMatchObject({ dirName: 'solo@keep-me', created: true, startedFrom: 'canonical-local' });
+    expect(fresh).toMatchObject({ dirName: 'solo@fresh-branch', created: true, startedFrom: 'local-head' });
+    for (const [result, expected] of [
+      [primary, head],
+      [preserved, kept],
+      [fresh, head],
+    ] as const) {
+      const clone = path.join(topicRoot, result.dirName);
+      expect(git(clone, ['rev-parse', 'HEAD']), result.dirName).toBe(expected);
+      expect(git(clone, ['remote']), result.dirName).toBe('');
+      expect(git(clone, ['for-each-ref', 'refs/remotes']), result.dirName).toBe('');
+      expect(tryGitOut(clone, ['config', '--get', 'remote.origin.url']), result.dirName).toBeNull();
+    }
+    expect(git(canonical, ['rev-parse', 'refs/heads/keep-me'])).toBe(kept);
+
+    await expect(checkout(unit, 'keep-me', root, 'solo')).resolves.toMatchObject({
+      dirName: 'solo@keep-me',
+      created: false,
+    });
+    await expect(checkout(unit, null, root, 'solo')).resolves.toMatchObject({ dirName: 'solo', created: false });
+    expect(git(canonical, ['for-each-ref', 'refs/remotes'])).toBe('');
+  });
+
+  it('a checkout is not delayed by an unrelated repository job', async () => {
+    networkCanonical(hostActionDataDir);
+    mockAgentGroup();
+    const publisher = taskSession('session-p220-publisher', 'p2-20-publisher');
+    const requester = taskSession('session-p220-requester', 'p2-20-requester');
+    const order: string[] = [];
+    let releasePublish!: () => void;
+    await runRepositoryActionDetached(
+      'repository_publish',
+      async () => {
+        order.push('publish:start');
+        await new Promise<void>((resolve) => {
+          releasePublish = resolve;
+        });
+        order.push('publish:end');
+      },
+      { requestId: nextRequestId() },
+      publisher,
+    );
+    await tick();
+    expect(order).toEqual(['publish:start']);
+
+    const requestId = nextRequestId();
+    await dispatchRepositoryCheckout(
+      { action: 'repository_checkout', requestId, repo: 'proj', branch: null, workUnitKey: unitOf(requester).key },
+      requester,
+    );
+    await _repositoryActionChainForTesting(repositoryCheckoutLane(WG, unitOf(requester)));
+    order.push('checkout:answered');
+
+    expect(responseFor(requestId)).toMatchObject({ ok: true, created: true, dirName: 'proj' });
+    expect(order).toEqual(['publish:start', 'checkout:answered']);
+    releasePublish();
+    await _repositoryActionChainForTesting();
+    expect(order).toEqual(['publish:start', 'checkout:answered', 'publish:end']);
+  });
+
+  it('a checkout switched off its recorded branch is refused, not reused, and nothing is mutated', async () => {
+    networkCanonical(root);
+    const unit = threadUnit('r3');
+    const topicRoot = topicWorktreesDir(unit, root);
+    await checkout(unit, null, root);
+    const second = await checkout(unit, 'feat-r3', root);
+    const secondPath = path.join(topicRoot, second.dirName);
+    git(secondPath, ['switch', '-q', '-c', 'moved-elsewhere']);
+
+    await expect(checkout(unit, 'feat-r3', root)).rejects.toThrow(/recorded/);
+    expect(git(secondPath, ['symbolic-ref', 'HEAD'])).toBe('refs/heads/moved-elsewhere');
+
+    const primaryPath = path.join(topicRoot, 'proj');
+    git(primaryPath, ['switch', '-q', '-c', 'primary-moved']);
+    await expect(checkout(unit, null, root)).rejects.toThrow(/recorded/);
+    expect(git(primaryPath, ['symbolic-ref', 'HEAD'])).toBe('refs/heads/primary-moved');
+    expect(listTopicCheckouts(topicRoot).map((entry) => entry.name)).toEqual(['proj', second.dirName]);
+  });
+
+  it("refuses a work unit that is not the session's own, and answers retryable while the lifecycle is claimed", async () => {
+    networkCanonical(hostActionDataDir);
+    mockAgentGroup();
+    const session = taskSession('session-guard', 'guard');
+    const unit = unitOf(session);
+    const topicRoot = topicWorktreesDir(unit, hostActionDataDir);
+    const request = (requestId: string, workUnitKey: string) => ({
+      action: 'repository_checkout',
+      requestId,
+      repo: 'proj',
+      branch: null,
+      workUnitKey,
+    });
+
+    const forged = nextRequestId();
+    await applyRepositoryCheckoutAction(request(forged, threadUnit('someone-else').key), session);
+    expect(responseFor(forged)).toMatchObject({
+      type: 'repository_action_response',
+      requestId: forged,
+      ok: false,
+      retryable: false,
+    });
+    expect(listTopicCheckouts(topicRoot)).toEqual([]);
+
+    const claimed = nextRequestId();
+    await withRepositoryLifecycleClaims([unit], () =>
+      applyRepositoryCheckoutAction(request(claimed, unit.key), session),
+    );
+    expect(responseFor(claimed)).toMatchObject({ ok: false, retryable: true });
+    expect(listTopicCheckouts(topicRoot)).toEqual([]);
+
+    const granted = nextRequestId();
+    await applyRepositoryCheckoutAction(request(granted, unit.key), session);
+    expect(responseFor(granted)).toMatchObject({
+      ok: true,
+      dirName: 'proj',
+      branch: defaultTopicBranch(unit, 'proj'),
+      created: true,
+      startedFrom: 'origin-head',
+      objectsLinked: true,
+      farmsLinked: 0,
+    });
+  });
+
+  it('extends the action response with structured fields for checkout only', async () => {
+    mockAgentGroup();
+    const session = taskSession('session-shape', 'shape');
+    const requestId = nextRequestId();
+    await expect(
+      applyRepositoryRefreshAction({ requestId, repo: 'missing-repo', workUnitKey: unitOf(session).key }, session),
+    ).rejects.toThrow();
+    expect(Object.keys(responseFor(requestId))).toEqual(['type', 'requestId', 'ok', 'message']);
   });
 });

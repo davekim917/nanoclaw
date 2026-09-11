@@ -147,12 +147,33 @@ Each `(workgroup, repository)` has one host-owned normal clone at
 `data/repositories/<workgroup>/<repo>`. Its working tree is never mounted into
 agent containers; host tooling reads that clean tree directly.
 
-Each conversation topic gets one standard linked worktree under
-`data/v2-topics/<workgroup>/<work-unit>/worktrees/<repo>`, mounted at
-`/workspace/worktrees/<repo>`. Sibling agents in the same topic resolve the
-same work-unit and checkout. Different topics have distinct paths, branches,
-indexes, and Git admin directories. Existing worktrees are never automatically
-rebased, branch-switched, or reset.
+Each conversation topic keeps its checkouts under
+`data/v2-topics/<workgroup>/<work-unit>/worktrees/`, mounted at
+`/workspace/worktrees/`. `<repo>` is the thread's primary checkout. In `clone`
+mode, `<repo>@<slug>` holds any other branch the thread asks for
+(`create_worktree` with `branch`), so threads never contend for one shared
+checkout; in `worktree` mode a thread keeps one checkout per repository, and a
+request for another branch is refused. Sibling
+agents in the same topic resolve the same work-unit and checkouts. Different
+topics have distinct paths, branches, indexes, and Git admin directories.
+Existing checkouts are never automatically rebased, branch-switched, or reset,
+and a checkout no longer on the branch it was created for is refused, not
+reused.
+
+`NANOCLAW_CHECKOUT_MODE` decides how a NEW checkout is made. `worktree` (the
+default) makes a standard linked worktree of the canonical, as before. `clone`
+has the host build an independent clone (`repository_checkout`): it hardlinks
+the canonical's objects, is built in a staging dir beside `worktrees/` that no
+container mounts, and appears with one rename only once fully initialized.
+With `NANOCLAW_DEPENDENCY_CACHE=apply`, each package dir whose lockfile has a
+verified cache entry holding every package npm would install on this platform
+gets a shared read-only `node_modules` farm; any other gets none, and `npm ci`
+makes a private copy. `clone` needs containers that run as the host uid and is
+refused, with a WARN when first
+used, otherwise. Resolution is shape-aware in
+both modes, so switching back to `worktree` strands no clone. Worktree cleanup
+collects an idle clone only after proving that the commits of every local ref,
+HEAD and the stash are already on `origin`.
 
 Containers fetch with their scoped OneCLI identity. The host never performs a
 credentialed Git network operation: it publishes validated local clones and

@@ -14,7 +14,47 @@ const state = vi.hoisted(() => ({
   tools: new Set<string>(),
   continuations: new Set<string>(),
   unreadable: new Set<string>(),
+  /** What the container runtime reports as bind-mounted; `null` is "cannot list". */
+  mounts: [] as string[] | null,
+  /** Every path handed to the trash binary, in order. */
+  trashed: [] as string[],
+  trashDir: '',
 }));
+
+// The GC's removal is `/usr/bin/trash` (TRASH_BIN in worktree-cleanup.ts).
+// Stand in for it so a test run never fills this host's trash can: record the
+// path and move it aside, where a test can still read what was trashed.
+// Everything else passes through to the real child_process.
+vi.mock('child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('child_process')>();
+  const realFs = await vi.importActual<typeof import('fs')>('fs');
+  const realPath = await vi.importActual<typeof import('path')>('path');
+  return {
+    ...actual,
+    execFileSync: (...args: Parameters<typeof actual.execFileSync>) => {
+      const [file, fileArgs] = args;
+      if (file === '/usr/bin/trash' && Array.isArray(fileArgs)) {
+        const target = String(fileArgs[0]);
+        state.trashed.push(target);
+        realFs.renameSync(
+          target,
+          realPath.join(state.trashDir, `${state.trashed.length}-${realPath.basename(target)}`),
+        );
+        return Buffer.alloc(0);
+      }
+      return actual.execFileSync(...args);
+    },
+  };
+});
+vi.mock('./container-mounts.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./container-mounts.js')>()),
+  runningContainerMounts: () => state.mounts,
+}));
+// A pass-through spy: P2-13 asserts the lister is how the GC finds checkouts.
+vi.mock('./repository-workspaces.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./repository-workspaces.js')>();
+  return { ...actual, listTopicCheckouts: vi.fn(actual.listTopicCheckouts) };
+});
 
 vi.mock('./config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./config.js')>()),
@@ -73,13 +113,20 @@ import {
   _cleanupOneForTesting,
   _discoverWorktreesForTesting,
   _discoveryStatsForTesting,
+  disposability,
+  runStorageGcOnce,
   runWorktreeCleanupOnce,
+  type GcCandidate,
+  type GcReport,
 } from './worktree-cleanup.js';
 import {
   canonicalRepoDir,
+  checkoutStagingRoot,
   defaultTopicBranch,
+  listTopicCheckouts,
   repositoryLockPath,
   resolveRepositoryWorkUnit,
+  topicStateDir,
   topicWorktreesDir,
   writeTransferTombstone,
 } from './repository-workspaces.js';
@@ -125,7 +172,8 @@ function unit(threadId = 'thread-1', sessionId = 's1') {
   });
 }
 
-function repositoryFixture(threadId = 'thread-1', repo = 'repo-a') {
+/** A bare remote holding one pushed commit, and the workgroup's canonical clone of it. */
+function canonicalFixture(repo = 'repo-a'): { remote: string; canonical: string } {
   const seed = path.join(state.dataDir, 'seed', repo);
   fs.mkdirSync(seed, { recursive: true });
   git(seed, ['init', '-q', '-b', 'main']);
@@ -141,6 +189,11 @@ function repositoryFixture(threadId = 'thread-1', repo = 'repo-a') {
   execFileSync('git', ['clone', '-q', remote, canonical]);
   git(canonical, ['remote', 'set-head', 'origin', '--auto']);
   git(canonical, ['config', 'gc.auto', '0']);
+  return { remote, canonical };
+}
+
+function repositoryFixture(threadId = 'thread-1', repo = 'repo-a') {
+  const { canonical } = canonicalFixture(repo);
 
   const workUnit = unit(threadId);
   const worktree = path.join(topicWorktreesDir(workUnit, state.dataDir), repo);
@@ -161,10 +214,17 @@ beforeEach(() => {
   state.tools.clear();
   state.continuations.clear();
   state.unreadable.clear();
+  state.mounts = [];
+  state.trashed = [];
+  state.trashDir = fs.mkdtempSync(path.join(os.tmpdir(), 'topic-cleanup-trash-'));
+  vi.mocked(listTopicCheckouts).mockClear();
+  delete process.env.NANOCLAW_STORAGE_GC;
 });
 
 afterEach(() => {
   fs.rmSync(state.dataDir, { recursive: true, force: true });
+  fs.rmSync(state.trashDir, { recursive: true, force: true });
+  delete process.env.NANOCLAW_STORAGE_GC;
 });
 
 describe('per-topic linked worktree cleanup', () => {
@@ -486,5 +546,603 @@ describe('per-topic linked worktree cleanup', () => {
 
     const stats = await _discoveryStatsForTesting(state.dataDir);
     expect(stats).toMatchObject({ targets: [], filteredNames: [], unreadableRoots: 0 });
+  });
+});
+
+// ── Branch clones (docs/specs/repository-branch-clones/plan.md §5.8) ────────
+
+describe('branch clone checkouts', () => {
+  const OLD = new Date(Date.now() - 30 * 86_400_000);
+
+  function threadUnit(threadId: string) {
+    return unit(threadId, `s-${threadId}`);
+  }
+
+  /** A closed session row, the topic side-(a) evidence both collectors accept. */
+  function closedRow(threadId: string) {
+    return { ...row(`s-${threadId}`, threadId, 'closed'), folder: 'folder-a', idle_since: OLD.toISOString() };
+  }
+
+  /** Back-date a checkout and its topic's worktrees root past every idle floor. Call it last. */
+  function age(checkout: string): void {
+    fs.utimesSync(checkout, OLD, OLD);
+    fs.utimesSync(path.dirname(checkout), OLD, OLD);
+  }
+
+  /**
+   * A clone checkout built the way repository_checkout builds one (plan §5.2):
+   * a local clone of the canonical whose `refs/remotes/origin/*` is replaced by
+   * the canonical's own remote-tracking refs (remote-ref hygiene, step 2), with
+   * origin pointed at the pin, on `branch` started from origin/main or copied
+   * from canonical `refs/heads/<branch>` (step 3).
+   */
+  function cloneCheckout(
+    canon: { remote: string; canonical: string },
+    threadId: string,
+    name: string,
+    branch: string,
+    startedFrom: 'origin' | 'canonical-local' = 'origin',
+  ): { topicDir: string; root: string; checkout: string } {
+    const root = topicWorktreesDir(threadUnit(threadId), state.dataDir);
+    const checkout = path.join(root, name);
+    fs.mkdirSync(root, { recursive: true });
+    execFileSync('git', ['clone', '-q', '--no-checkout', canon.canonical, checkout]);
+    const cloned = git(checkout, ['for-each-ref', '--format=%(refname)', 'refs/remotes/origin']);
+    for (const ref of cloned.split('\n').filter(Boolean)) git(checkout, ['update-ref', '--no-deref', '-d', ref]);
+    git(checkout, ['fetch', '-q', canon.canonical, '+refs/remotes/origin/*:refs/remotes/origin/*']);
+    git(checkout, ['remote', 'set-url', 'origin', canon.remote]);
+    if (startedFrom === 'canonical-local') {
+      git(checkout, ['fetch', '-q', canon.canonical, `+refs/heads/${branch}:refs/heads/${branch}`]);
+    } else {
+      git(checkout, ['branch', '-f', branch, 'refs/remotes/origin/main']);
+    }
+    git(checkout, ['checkout', '-q', branch]);
+    git(checkout, ['config', 'gc.auto', '0']);
+    // The premise of the `--remotes` proof: no canonical head reached the clone's remote refs.
+    expect(git(checkout, ['for-each-ref', '--format=%(refname)', 'refs/remotes/origin']).split('\n').sort()).toEqual([
+      'refs/remotes/origin/HEAD',
+      'refs/remotes/origin/main',
+    ]);
+    age(checkout);
+    return { topicDir: topicStateDir(threadUnit(threadId), state.dataDir), root, checkout };
+  }
+
+  function commitFile(dir: string, file: string): void {
+    fs.writeFileSync(path.join(dir, file), `${file}\n`);
+    git(dir, ['add', '-A']);
+    git(dir, ['commit', '-q', '-m', file]);
+  }
+
+  /** Everything a collector could lose: HEAD, every local ref, the tree's status, and the stash. */
+  function snapshot(dir: string): Record<string, string> {
+    return {
+      head: git(dir, ['rev-parse', 'HEAD']),
+      refs: git(dir, ['for-each-ref', '--format=%(refname) %(objectname)']),
+      status: git(dir, ['status', '--porcelain=v1', '--untracked-files=all']),
+      stash: git(dir, ['stash', 'list']),
+    };
+  }
+
+  function find(report: GcReport, target: string): GcCandidate | undefined {
+    return report.candidates.find((candidate) => candidate.path === target);
+  }
+
+  it('clone disposability refuses dirty, unpushed, stashed, non-HEAD unpushed branches, and copied legacy branches', async () => {
+    const canon = canonicalFixture('repo-a');
+    // Committed-but-unpushed legacy work in canonical refs/heads/legacy, which
+    // plan §5.2 step 3 copies into a new clone's local branch.
+    const base = git(canon.canonical, ['rev-parse', 'HEAD']);
+    const legacy = git(canon.canonical, ['commit-tree', `${base}^{tree}`, '-p', base, '-m', 'legacy work']);
+    git(canon.canonical, ['update-ref', 'refs/heads/legacy', legacy]);
+
+    const cases: Array<{
+      thread: string;
+      name: string;
+      branch: string;
+      startedFrom?: 'canonical-local';
+      reason: string;
+      arrange: (dir: string) => void;
+    }> = [
+      {
+        thread: 'p212-dirty',
+        name: 'repo-a@feat',
+        branch: 'feat',
+        reason: 'dirty',
+        arrange: (dir) => fs.writeFileSync(path.join(dir, 'scratch.txt'), 'uncommitted\n'),
+      },
+      {
+        thread: 'p212-unpushed-head',
+        name: 'repo-a',
+        branch: 'feat',
+        reason: 'unpushed',
+        arrange: (dir) => commitFile(dir, 'head-only.txt'),
+      },
+      {
+        thread: 'p212-unpushed-branch',
+        name: 'repo-a@feat',
+        branch: 'feat',
+        reason: 'unpushed',
+        arrange: (dir) => {
+          git(dir, ['checkout', '-q', '-b', 'side']);
+          commitFile(dir, 'side.txt');
+          git(dir, ['checkout', '-q', 'feat']);
+        },
+      },
+      {
+        thread: 'p212-legacy',
+        name: 'repo-a@legacy',
+        branch: 'legacy',
+        startedFrom: 'canonical-local',
+        reason: 'unpushed',
+        arrange: (dir) => expect(git(dir, ['rev-parse', 'HEAD'])).toBe(legacy),
+      },
+      {
+        thread: 'p212-stash',
+        name: 'repo-a@feat',
+        branch: 'feat',
+        reason: 'stashed',
+        arrange: (dir) => {
+          fs.writeFileSync(path.join(dir, 'README.md'), 'stashed edit\n');
+          git(dir, ['stash', 'push', '-q', '-m', 'wip']);
+        },
+      },
+      {
+        // An unpushed commit reachable only from a detached HEAD: `--branches`
+        // alone cannot see it.
+        thread: 'p212-detached',
+        name: 'repo-a@feat',
+        branch: 'feat',
+        reason: 'unpushed',
+        arrange: (dir) => {
+          commitFile(dir, 'detached.txt');
+          git(dir, ['checkout', '-q', '--detach']);
+          git(dir, ['branch', '-f', 'feat', 'refs/remotes/origin/main']);
+        },
+      },
+      {
+        // An unpushed commit reachable only from a tag: on no branch, and not
+        // HEAD once the pushed branch is checked back out. Every local ref's
+        // commits must be on origin, not only the branches' and HEAD's.
+        thread: 'p212-tag-only',
+        name: 'repo-a@feat',
+        branch: 'feat',
+        reason: 'unpushed',
+        arrange: (dir) => {
+          git(dir, ['checkout', '-q', '--detach']);
+          commitFile(dir, 'tagged.txt');
+          git(dir, ['tag', 'kept-only-by-a-tag']);
+          git(dir, ['checkout', '-q', 'feat']);
+          expect(git(dir, ['rev-parse', 'HEAD'])).toBe(git(dir, ['rev-parse', 'refs/remotes/origin/main']));
+        },
+      },
+      {
+        // Evidence only another local repository holds. A remote pointing at a
+        // sibling clone is not origin, so its refs prove nothing was pushed.
+        thread: 'p212-sibling-remote',
+        name: 'repo-a@feat',
+        branch: 'feat',
+        reason: 'unpushed',
+        arrange: (dir) => {
+          commitFile(dir, 'sibling.txt');
+          const sibling = path.join(state.dataDir, 'fixtures', 'p212-sibling');
+          fs.mkdirSync(path.dirname(sibling), { recursive: true });
+          execFileSync('git', ['clone', '-q', dir, sibling]);
+          git(dir, ['remote', 'add', 'sibling', sibling]);
+          git(dir, ['fetch', '-q', 'sibling']);
+        },
+      },
+      {
+        // A committed embedded repository: its history and config are out of
+        // the proof's reach, so the checkout is never collected.
+        thread: 'p212-submodule',
+        name: 'repo-a@feat',
+        branch: 'feat',
+        reason: 'submodule',
+        arrange: (dir) => {
+          const nested = path.join(dir, 'nested');
+          fs.mkdirSync(nested);
+          git(nested, ['init', '-q']);
+          commitFile(nested, 'inner.txt');
+          git(dir, ['add', 'nested']);
+          git(dir, ['commit', '-q', '-m', 'embed']);
+        },
+      },
+    ];
+    const refused = cases.map((spec) => {
+      const fixture = cloneCheckout(canon, spec.thread, spec.name, spec.branch, spec.startedFrom);
+      spec.arrange(fixture.checkout);
+      age(fixture.checkout);
+      return { ...spec, ...fixture, before: snapshot(fixture.checkout) };
+    });
+    const clean = cloneCheckout(canon, 'p212-clean', 'repo-a', 'feat');
+    state.rows = [...refused.map((spec) => closedRow(spec.thread)), closedRow('p212-clean')];
+
+    // The orphan-topic loop, applying: every refused topic keeps its checkout
+    // byte for byte; only the clean pushed clone's topic is trashed.
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const groupsDir = path.join(state.dataDir, 'groups');
+    fs.mkdirSync(groupsDir, { recursive: true });
+    const report = await runStorageGcOnce(state.dataDir, groupsDir);
+    for (const spec of refused) {
+      expect(find(report, spec.topicDir), spec.thread).toMatchObject({ collect: false, reason: spec.reason });
+      expect(snapshot(spec.checkout), spec.thread).toEqual(spec.before);
+    }
+    expect(find(report, clean.topicDir)).toMatchObject({ collect: true, reason: 'closed-and-clean' });
+    expect(state.trashed).toEqual([clean.topicDir]);
+
+    // The clone branch of worktree cleanup: the same refusals, the same
+    // reasons, and only a fresh clean pushed clone is quarantined and trashed.
+    const fresh = cloneCheckout(canon, 'p212-clean-branch', 'repo-a@feat', 'feat');
+    state.rows.push(closedRow('p212-clean-branch'));
+    const decisions = new Map<string, unknown>();
+    for (const target of await _discoverWorktreesForTesting(state.dataDir)) {
+      decisions.set(target.worktreePath, await _cleanupOneForTesting(target, state.dataDir));
+    }
+    for (const spec of refused) {
+      expect(decisions.get(spec.checkout), spec.thread).toEqual({ collected: false, reason: spec.reason });
+      expect(snapshot(spec.checkout), spec.thread).toEqual(spec.before);
+    }
+    expect(decisions.get(fresh.checkout)).toEqual({ collected: true, reason: 'clean-and-pushed' });
+    expect(fs.existsSync(fresh.checkout)).toBe(false);
+    expect(state.trashed).toHaveLength(2);
+    const quarantined = state.trashed[1]!;
+    expect(path.dirname(quarantined)).toBe(path.join(state.dataDir, '.gc-quarantine'));
+    expect(path.basename(quarantined)).toMatch(/^repo-a@feat-\d+$/);
+    expect(fs.existsSync(`${quarantined}.meta.json`)).toBe(false);
+    // The trashed copy is the clone itself, working tree and history intact.
+    const trashedCopy = path.join(state.trashDir, `2-${path.basename(quarantined)}`);
+    expect(fs.readFileSync(path.join(trashedCopy, 'README.md'), 'utf8')).toBe('base\n');
+    expect(git(trashedCopy, ['symbolic-ref', '--short', 'HEAD'])).toBe('feat');
+  });
+
+  /** Every path under `dir` with its type and bytes: what "restored byte for byte" compares. */
+  function treeDigest(dir: string): Record<string, string> {
+    const digest: Record<string, string> = {};
+    const walk = (current: string): void => {
+      for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+        const full = path.join(current, entry.name);
+        const relative = path.relative(dir, full);
+        if (entry.isSymbolicLink()) {
+          digest[relative] = `link:${fs.readlinkSync(full)}`;
+        } else if (entry.isDirectory()) {
+          digest[relative] = 'dir';
+          walk(full);
+        } else {
+          digest[relative] = createHash('sha256').update(fs.readFileSync(full)).digest('hex');
+        }
+      }
+    };
+    walk(dir);
+    return digest;
+  }
+
+  /** An active session idle past the reclaim floor: the path finalizeIdleCollection quarantines. */
+  function idleRow(threadId: string) {
+    return { ...row(`s-${threadId}`, threadId, 'active'), folder: 'folder-a', idle_since: OLD.toISOString() };
+  }
+
+  /**
+   * Runs one apply pass with `afterQuarantine` hooked onto the quarantine
+   * rename, the first rename of the pass. A mount of the topic's worktrees
+   * root appearing there is the late activity finalizeIdleCollection
+   * re-checks before anything is trashed, so the pass must roll back.
+   */
+  async function runWithLateActivity(
+    worktreesRoot: string,
+    afterQuarantine: (quarantinePath: string) => void = () => {},
+  ): Promise<{ report: GcReport; quarantinePath: string }> {
+    const realRename = fs.renameSync.bind(fs);
+    let quarantinePath = '';
+    const rename = vi.spyOn(fs, 'renameSync').mockImplementationOnce((from, to) => {
+      realRename(from, to);
+      quarantinePath = String(to);
+      state.mounts = [worktreesRoot];
+      afterQuarantine(quarantinePath);
+    });
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const groupsDir = path.join(state.dataDir, 'groups');
+    fs.mkdirSync(groupsDir, { recursive: true });
+    try {
+      return { report: await runStorageGcOnce(state.dataDir, groupsDir), quarantinePath };
+    } finally {
+      rename.mockRestore();
+    }
+  }
+
+  it('an idle topic rolled back by late activity gets every checkout back, branch clones included', async () => {
+    const canon = canonicalFixture('repo-a');
+    const primary = cloneCheckout(canon, 'rollback-all', 'repo-a', 'nc-topic');
+    const branchClone = cloneCheckout(canon, 'rollback-all', 'repo-a@feat', 'feat');
+    age(branchClone.checkout);
+    const before = { primary: treeDigest(primary.checkout), branchClone: treeDigest(branchClone.checkout) };
+    state.rows = [idleRow('rollback-all')];
+
+    const { report, quarantinePath } = await runWithLateActivity(primary.root);
+
+    expect(path.dirname(quarantinePath)).toBe(path.join(state.dataDir, '.gc-quarantine'));
+    expect(find(report, primary.topicDir)).toMatchObject({ collect: false, reason: 'aborted-late-activity' });
+    expect(fs.readdirSync(primary.root).sort()).toEqual(['repo-a', 'repo-a@feat']);
+    expect(treeDigest(primary.checkout)).toEqual(before.primary);
+    expect(treeDigest(branchClone.checkout)).toEqual(before.branchClone);
+    // Nothing is left in quarantine and no marker survives, in either place.
+    expect(fs.readdirSync(path.join(state.dataDir, '.gc-quarantine'))).toEqual([]);
+    expect(fs.readdirSync(primary.topicDir)).toEqual(['worktrees']);
+    expect(state.trashed).toEqual([]);
+  });
+
+  it('a rollback that leaves a locked superseded copy behind keeps the recovery marker', async () => {
+    const canonA = canonicalFixture('repo-a');
+    const canonB = canonicalFixture('repo-b');
+    const primary = cloneCheckout(canonA, 'rollback-locked', 'repo-a', 'nc-topic');
+    // Two linked worktrees of repo-b: `repo-b` will be superseded and locked,
+    // `repo-b@side` superseded and trashable.
+    const lockedLinked = path.join(primary.root, 'repo-b');
+    const sideLinked = path.join(primary.root, 'repo-b@side');
+    git(canonB.canonical, ['worktree', 'add', '-q', '-b', 'topic-b', lockedLinked, 'origin/HEAD']);
+    git(canonB.canonical, ['worktree', 'add', '-q', '-b', 'side-b', sideLinked, 'origin/HEAD']);
+    const lockedAdmin = git(lockedLinked, ['rev-parse', '--absolute-git-dir']);
+    age(lockedLinked);
+    age(sideLinked);
+    const before = treeDigest(primary.checkout);
+    state.rows = [idleRow('rollback-locked')];
+
+    const { report, quarantinePath } = await runWithLateActivity(primary.root, () => {
+      // A spawn recreated both repo-b slots before the rollback ran, and the
+      // copy of `repo-b` now in quarantine is locked (`git worktree lock`
+      // writes exactly this file into the worktree's admin directory).
+      fs.mkdirSync(lockedLinked, { recursive: true });
+      fs.writeFileSync(path.join(lockedLinked, 'live.txt'), 'live\n');
+      fs.mkdirSync(sideLinked, { recursive: true });
+      fs.writeFileSync(path.join(lockedAdmin, 'locked'), 'held\n');
+    });
+
+    expect(find(report, primary.topicDir)).toMatchObject({ collect: false, reason: 'aborted-late-activity' });
+    expect(treeDigest(primary.checkout)).toEqual(before);
+    // The live copy is kept; the locked quarantined copy is neither restored nor trashed...
+    expect(fs.readFileSync(path.join(lockedLinked, 'live.txt'), 'utf8')).toBe('live\n');
+    expect(fs.existsSync(path.join(quarantinePath, 'worktrees', 'repo-b', '.git'))).toBe(true);
+    // ...so the marker stays, and recoverOrphanedQuarantine can still find its way home.
+    const marker = path.join(quarantinePath, '.gc-quarantine-meta.json');
+    expect(JSON.parse(fs.readFileSync(marker, 'utf8'))).toEqual({ originalPath: primary.topicDir });
+    expect(fs.existsSync(path.join(primary.topicDir, '.gc-quarantine-meta.json'))).toBe(false);
+    // The unlocked superseded linked copy is trashed and its registration
+    // removed from the canonical of the repo its name parses to.
+    expect(state.trashed).toEqual([path.join(quarantinePath, 'worktrees', 'repo-b@side')]);
+    expect(git(canonB.canonical, ['worktree', 'list', '--porcelain'])).not.toContain('branch refs/heads/side-b\n');
+    expect(git(canonB.canonical, ['worktree', 'list', '--porcelain'])).toContain('branch refs/heads/topic-b\n');
+  });
+
+  it('a retry after a partial rollback restores what is left instead of trashing the topic', async () => {
+    const canon = canonicalFixture('repo-a');
+    const primary = cloneCheckout(canon, 'rollback-retry', 'repo-a', 'nc-topic');
+    const before = treeDigest(primary.checkout);
+    // What a first attempt that stopped after its last checkout leaves behind:
+    // the checkouts are home, and quarantine still holds an emptied
+    // worktrees/, a topic entry beside it, and the recovery marker.
+    const quarantinePath = path.join(state.dataDir, '.gc-quarantine', `${path.basename(primary.topicDir)}-1`);
+    fs.mkdirSync(path.join(quarantinePath, 'worktrees'), { recursive: true });
+    fs.writeFileSync(path.join(quarantinePath, 'topic-note.txt'), 'kept\n');
+    fs.writeFileSync(
+      path.join(quarantinePath, '.gc-quarantine-meta.json'),
+      JSON.stringify({ originalPath: primary.topicDir }),
+    );
+    // A live container holds the topic, so the pass collects nothing else.
+    state.mounts = [primary.root];
+    state.rows = [{ ...row('s-rollback-retry', 'rollback-retry', 'active'), folder: 'folder-a' }];
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const groupsDir = path.join(state.dataDir, 'groups');
+    fs.mkdirSync(groupsDir, { recursive: true });
+
+    const report = await runStorageGcOnce(state.dataDir, groupsDir);
+
+    expect(find(report, primary.topicDir)).toMatchObject({ collect: false, reason: 'quarantine-reconciled' });
+    expect(fs.readFileSync(path.join(primary.topicDir, 'topic-note.txt'), 'utf8')).toBe('kept\n');
+    expect(treeDigest(primary.checkout)).toEqual(before);
+    expect(state.trashed).toEqual([]);
+    expect(fs.existsSync(path.join(state.dataDir, '.gc-quarantine'))).toBe(false);
+  });
+
+  it('a rollback that cannot list the quarantined worktrees leaves it for a retry, trashing nothing', async () => {
+    const canon = canonicalFixture('repo-a');
+    const primary = cloneCheckout(canon, 'rollback-unlistable', 'repo-a', 'nc-topic');
+    state.rows = [idleRow('rollback-unlistable')];
+    let unlistable = '';
+    try {
+      const run = await runWithLateActivity(primary.root, (quarantined) => {
+        // A spawn recreated the topic, and the quarantined worktrees/ cannot be read.
+        fs.mkdirSync(primary.root, { recursive: true });
+        unlistable = path.join(quarantined, 'worktrees');
+        fs.chmodSync(unlistable, 0o000);
+      });
+      expect(find(run.report, primary.topicDir)).toMatchObject({ collect: false, reason: 'aborted-late-activity' });
+      expect(state.trashed).toEqual([]);
+      expect(JSON.parse(fs.readFileSync(path.join(run.quarantinePath, '.gc-quarantine-meta.json'), 'utf8'))).toEqual({
+        originalPath: primary.topicDir,
+      });
+    } finally {
+      // Wherever the unreadable directory ended up, make it removable again.
+      const trashedCopies = state.trashed.map((target, index) =>
+        path.join(state.trashDir, `${index + 1}-${path.basename(target)}`, 'worktrees'),
+      );
+      for (const dir of [unlistable, ...trashedCopies]) {
+        if (dir && fs.existsSync(dir)) fs.chmodSync(dir, 0o755);
+      }
+    }
+    expect(fs.existsSync(path.join(unlistable, 'repo-a', '.git'))).toBe(true);
+  });
+
+  it('a whole-topic restore that fails keeps the topic in quarantine for a retry, trashing nothing', async () => {
+    const canon = canonicalFixture('repo-a');
+    const primary = cloneCheckout(canon, 'rollback-renamefail', 'repo-a', 'nc-topic');
+    const before = treeDigest(primary.checkout);
+    state.rows = [idleRow('rollback-renamefail')];
+
+    const { report, quarantinePath } = await runWithLateActivity(primary.root, () => {
+      // Nothing recreated the topic; the restore is the next rename, and it fails.
+      vi.mocked(fs.renameSync).mockImplementationOnce(() => {
+        throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+      });
+    });
+
+    expect(find(report, primary.topicDir)).toMatchObject({ collect: false, reason: 'aborted-late-activity' });
+    expect(state.trashed).toEqual([]);
+    expect(fs.existsSync(primary.topicDir)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(path.join(quarantinePath, '.gc-quarantine-meta.json'), 'utf8'))).toEqual({
+      originalPath: primary.topicDir,
+    });
+    expect(treeDigest(path.join(quarantinePath, 'worktrees', 'repo-a'))).toEqual(before);
+
+    // The next pass finds the marker and puts the topic back.
+    const second = await runStorageGcOnce(state.dataDir, path.join(state.dataDir, 'groups'));
+    expect(find(second, primary.topicDir)).toMatchObject({ collect: false, reason: 'quarantine-recovered' });
+    expect(treeDigest(primary.checkout)).toEqual(before);
+    expect(state.trashed).toEqual([]);
+  });
+
+  it('the disposability proof runs nothing a clone configures: filters, signature programs, or a submodule', () => {
+    // A clone's .git is container-writable (worktrees/ is mounted read-write,
+    // container-runner.ts:4386), and the proof runs host git inside it.
+    const canon = canonicalFixture('repo-a');
+    const sentinels = path.join(state.dataDir, 'fixtures', 'exec-sentinels');
+    fs.mkdirSync(sentinels, { recursive: true });
+    const script = (name: string): string => {
+      const file = path.join(sentinels, `${name}.sh`);
+      fs.writeFileSync(file, `#!/bin/sh\ntouch ${path.join(sentinels, name)}\ncat\n`, { mode: 0o755 });
+      return file;
+    };
+
+    // A clean filter selected by an attribute runs whenever status rehashes a file.
+    const filtered = cloneCheckout(canon, 'exec-filter', 'repo-a@feat', 'feat');
+    git(filtered.checkout, ['config', 'filter.evil.clean', script('filter')]);
+    fs.writeFileSync(path.join(filtered.checkout, '.git', 'info', 'attributes'), '* filter=evil\n');
+    fs.utimesSync(path.join(filtered.checkout, 'README.md'), OLD, OLD);
+
+    // log.showSignature makes `git log` run gpg.program on a signed commit.
+    const signed = cloneCheckout(canon, 'exec-gpg', 'repo-a@feat', 'feat');
+    git(signed.checkout, ['config', 'log.showSignature', 'true']);
+    git(signed.checkout, ['config', 'gpg.program', script('gpg')]);
+    const tree = git(signed.checkout, ['rev-parse', 'HEAD^{tree}']);
+    const parent = git(signed.checkout, ['rev-parse', 'HEAD']);
+    const commit = execFileSync('git', ['hash-object', '-t', 'commit', '-w', '--stdin'], {
+      cwd: signed.checkout,
+      encoding: 'utf8',
+      input:
+        `tree ${tree}\nparent ${parent}\nauthor a <a@b> 1 +0000\ncommitter a <a@b> 1 +0000\n` +
+        'gpgsig -----BEGIN PGP SIGNATURE-----\n \n -----END PGP SIGNATURE-----\n\nsigned\n',
+    }).trim();
+    git(signed.checkout, ['update-ref', 'refs/heads/feat', commit]);
+
+    // A committed embedded repository: status recurses into it and runs its own filter.
+    const embedding = cloneCheckout(canon, 'exec-submodule', 'repo-a@feat', 'feat');
+    const nested = path.join(embedding.checkout, 'nested');
+    fs.mkdirSync(nested);
+    git(nested, ['init', '-q']);
+    commitFile(nested, 'inner.txt');
+    git(nested, ['config', 'filter.inner.clean', script('submodule')]);
+    fs.writeFileSync(path.join(nested, '.git', 'info', 'attributes'), '* filter=inner\n');
+    git(embedding.checkout, ['add', 'nested']);
+    git(embedding.checkout, ['commit', '-q', '-m', 'embed']);
+    fs.utimesSync(path.join(nested, 'inner.txt'), OLD, OLD);
+
+    const verdicts = [filtered, signed, embedding].map((fixture) =>
+      disposability.proveCheckoutDisposable({ path: fixture.checkout, shape: 'clone' }),
+    );
+
+    expect(fs.readdirSync(sentinels).filter((name) => !name.endsWith('.sh'))).toEqual([]);
+    expect(verdicts.map((verdict) => verdict.reason)).toEqual(['clean-and-pushed', 'unpushed', 'submodule']);
+  });
+
+  it('orphan-topic GC enumerates through the lister, proves clones with scope all, and refuses unknown shapes', async () => {
+    const canonA = canonicalFixture('repo-a');
+    const canonB = canonicalFixture('repo-b');
+
+    // A topic with a clean clone, a clean linked worktree, and host staging
+    // holding a half-built clone with bytes nobody committed.
+    const mixed = cloneCheckout(canonA, 'p213-mixed', 'repo-a', 'feat');
+    const linked = path.join(mixed.root, 'repo-b');
+    git(canonB.canonical, ['worktree', 'add', '-q', '-b', 'topic-p213', linked, 'origin/HEAD']);
+    const staged = path.join(checkoutStagingRoot(mixed.root), 'req-1', 'repo-a@wip');
+    fs.mkdirSync(path.join(staged, '.git'), { recursive: true });
+    fs.writeFileSync(path.join(staged, 'half-built.txt'), 'not yet published\n');
+    age(linked);
+    age(mixed.checkout);
+
+    // A parsed checkout name whose `.git` is missing: shape `unknown`.
+    const unknown = cloneCheckout(canonA, 'p213-unknown', 'repo-a', 'feat');
+    const unknownEntry = path.join(unknown.root, 'repo-c');
+    fs.mkdirSync(unknownEntry);
+    fs.writeFileSync(path.join(unknownEntry, 'notes.md'), 'whose is this?\n');
+    age(unknownEntry);
+
+    // A name the lister does not parse, beside a clean clone.
+    const odd = cloneCheckout(canonA, 'p213-odd', 'repo-a', 'feat');
+    const oddEntry = path.join(odd.root, '.github');
+    fs.mkdirSync(oddEntry);
+    fs.writeFileSync(path.join(oddEntry, 'CODEOWNERS'), '* @someone\n');
+    age(oddEntry);
+
+    // A worktrees root nobody can read: refused, never proved empty.
+    const unreadable = cloneCheckout(canonA, 'p213-unreadable', 'repo-a', 'feat');
+
+    state.rows = [];
+    const prove = vi.spyOn(disposability, 'proveCheckoutDisposable');
+    const proven = vi.spyOn(disposability, 'provenDisposable');
+    const groupsDir = path.join(state.dataDir, 'groups');
+    fs.mkdirSync(groupsDir, { recursive: true });
+    fs.chmodSync(unreadable.root, 0o000);
+    let report: GcReport;
+    // Copied before mockRestore, which also clears a spy's recorded calls.
+    let proveCalls: typeof prove.mock.calls;
+    let provenCalls: typeof proven.mock.calls;
+    try {
+      report = await runStorageGcOnce(state.dataDir, groupsDir);
+    } finally {
+      fs.chmodSync(unreadable.root, 0o755);
+      proveCalls = [...prove.mock.calls];
+      provenCalls = [...proven.mock.calls];
+      prove.mockRestore();
+      proven.mockRestore();
+    }
+
+    expect(find(report, mixed.topicDir)).toMatchObject({ collect: true, reason: 'orphaned-and-clean' });
+    expect(find(report, unknown.topicDir)).toMatchObject({ collect: false, reason: 'unknown-shape' });
+    expect(find(report, odd.topicDir)).toMatchObject({ collect: false, reason: 'unknown-shape' });
+    expect(find(report, unreadable.topicDir)).toMatchObject({ collect: false, reason: 'worktrees-unreadable' });
+
+    // The lister is the one enumerator: called once for every topic examined.
+    expect(
+      vi
+        .mocked(listTopicCheckouts)
+        .mock.calls.map(([root]) => root)
+        .sort(),
+    ).toEqual([mixed.root, unknown.root, odd.root, unreadable.root].sort());
+
+    // Every entry was proved through proveCheckoutDisposable, with the shape
+    // the lister gave it; a non-parsing entry is probed as `unknown`.
+    const byPath = (a: string[], b: string[]) => a[0]!.localeCompare(b[0]!);
+    expect(proveCalls.map(([checkout]) => [checkout.path, checkout.shape]).sort(byPath)).toEqual(
+      [
+        [mixed.checkout, 'clone'],
+        [linked, 'linked'],
+        [unknown.checkout, 'clone'],
+        [unknownEntry, 'unknown'],
+        [odd.checkout, 'clone'],
+        [oddEntry, 'unknown'],
+      ].sort(byPath),
+    );
+    // ...and nothing reached the underlying git proof any other way: clones
+    // with scope `all`, the linked worktree with `head`, `unknown` never.
+    expect(provenCalls.map(([dir, scope]) => [dir, scope]).sort(byPath)).toEqual(
+      [
+        [mixed.checkout, 'all'],
+        [linked, 'head'],
+        [unknown.checkout, 'all'],
+        [odd.checkout, 'all'],
+      ].sort(byPath),
+    );
+    // Staging sits outside worktrees/ and goes with its topic: never probed.
+    const proved = [...proveCalls.map(([c]) => c.path), ...provenCalls.map(([dir]) => dir)];
+    expect(proved.filter((dir) => dir.startsWith(checkoutStagingRoot(mixed.root)))).toEqual([]);
+    expect(fs.readFileSync(path.join(staged, 'half-built.txt'), 'utf8')).toBe('not yet published\n');
   });
 });

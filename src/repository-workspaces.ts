@@ -554,3 +554,210 @@ export function writeOriginPin(
     }
   }
 }
+
+// ── Checkout layout (plan §5.1) ──────────────────────────────────────────────
+//
+// `worktrees/<repo>` is the thread's primary checkout and `worktrees/<repo>@<slug>`
+// any other branch's; `@` is outside SAFE_SEGMENT, so names parse unambiguously.
+// Duplicated on purpose in container/agent-runner/src/mcp-tools/checkout-layout.ts,
+// and both copies are pinned by checkout-layout.fixtures.json beside it.
+
+const CHECKOUT_SLUG = /^[A-Za-z0-9._-]+$/;
+const CHECKOUT_SLUG_MAX_CHARS = 80;
+
+export type CheckoutShape = 'clone' | 'linked' | 'unknown';
+
+export interface TopicCheckout {
+  name: string;
+  repo: string;
+  slug: string | null;
+  path: string;
+  shape: CheckoutShape;
+}
+
+/** `<repo>` for no branch, else `<repo>@<slug>`. A lossy slug carries the branch's hash, so `feat/x` and `feat-x` never collide. */
+export function checkoutDirName(repo: string, branch: string | null): string {
+  if (branch === null) return repo;
+  let slug = branch
+    .replace(/[^A-Za-z0-9._-]/g, '-')
+    .replace(/^[^A-Za-z0-9]+/, '')
+    .slice(0, CHECKOUT_SLUG_MAX_CHARS);
+  if (slug !== branch) slug += `-${createHash('sha256').update(branch, 'utf8').digest('hex').slice(0, 8)}`;
+  return `${repo}@${slug}`;
+}
+
+/** `{repo, slug}` for a checkout dir name; `null` for anything else, every dot-prefixed name included. */
+export function parseCheckoutDirName(name: string): { repo: string; slug: string | null } | null {
+  if (name.startsWith('.')) return null;
+  const at = name.indexOf('@');
+  const repo = at === -1 ? name : name.slice(0, at);
+  if (!SAFE_SEGMENT.test(repo)) return null;
+  if (at === -1) return { repo, slug: null };
+  const slug = name.slice(at + 1);
+  return CHECKOUT_SLUG.test(slug) ? { repo, slug } : null;
+}
+
+/**
+ * The only enumerator of a topic's checkouts: directories whose names parse,
+ * each with the shape its `.git` gives it (a directory is a clone, a file a
+ * linked worktree, anything else `unknown`). A missing topic dir has none; any
+ * other read failure throws, so no caller can mistake "unreadable" for "empty".
+ */
+export function listTopicCheckouts(topicWorktreesDir: string): TopicCheckout[] {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(topicWorktreesDir, { withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw err;
+  }
+  const checkouts: TopicCheckout[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const parsed = parseCheckoutDirName(entry.name);
+    if (!parsed) continue;
+    const checkoutPath = path.join(topicWorktreesDir, entry.name);
+    checkouts.push({ name: entry.name, ...parsed, path: checkoutPath, shape: checkoutShape(checkoutPath) });
+  }
+  return checkouts.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function checkoutShape(checkoutPath: string): CheckoutShape {
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(path.join(checkoutPath, '.git'));
+  } catch {
+    return 'unknown';
+  }
+  if (stat.isDirectory()) return 'clone';
+  return stat.isFile() ? 'linked' : 'unknown';
+}
+
+// ── Checkout staging and metadata (plan §5.2) ────────────────────────────────
+//
+// The host builds a clone under `<topic>/checkout-staging/<requestId>/<name>`
+// and publishes it into `<topic>/worktrees/` with one rename on the same
+// filesystem, so a checkout exists only once it is fully initialized.
+//
+// Staging sits BESIDE `worktrees/`, never inside it. `worktrees/` is mounted
+// read-write into the topic's containers (container-runner.ts:4386), so an
+// agent can plant anything there, a symlink included, and the host's staging
+// mkdir and crash-residue removal would follow it into host data. The topic
+// state dir itself is not mounted, so nothing a container writes can steer
+// them, and no lister or sweep of `worktrees/` ever sees a half-built clone.
+
+const CHECKOUT_STAGING_DIRNAME = 'checkout-staging';
+export const CHECKOUT_METADATA_FILENAME = 'nanoclaw-checkout.json';
+/** A staging entry this old, on a lane with no job running, is crash residue. */
+export const CHECKOUT_STAGING_STALE_MS = 60 * 60 * 1000;
+
+export type CheckoutStartedFrom = 'canonical-local' | 'origin-branch' | 'origin-head' | 'local-head';
+
+const CHECKOUT_STARTED_FROM: ReadonlySet<string> = new Set<CheckoutStartedFrom>([
+  'canonical-local',
+  'origin-branch',
+  'origin-head',
+  'local-head',
+]);
+
+/** `<clone>/.git/nanoclaw-checkout.json`, written by the host when it creates a clone. */
+export interface CheckoutMetadata {
+  version: 1;
+  repo: string;
+  branch: string;
+  startCommit: string;
+  startedFrom: CheckoutStartedFrom;
+}
+
+export function checkoutStagingRoot(topicWorktreesDir: string): string {
+  // Beside the worktrees root in the topic state dir, outside every container mount.
+  return path.join(path.dirname(topicWorktreesDir), CHECKOUT_STAGING_DIRNAME);
+}
+
+export function checkoutMetadataPath(checkoutPath: string): string {
+  return path.join(checkoutPath, '.git', CHECKOUT_METADATA_FILENAME);
+}
+
+/** The clone's recorded identity; `null` when the file is absent, a throw when it is not a valid record. */
+export function readCheckoutMetadata(checkoutPath: string): CheckoutMetadata | null {
+  const file = checkoutMetadataPath(checkoutPath);
+  let fd: number;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw new Error(`checkout metadata is unreadable: ${file}`, { cause: error });
+  }
+  let parsed: Partial<CheckoutMetadata>;
+  try {
+    if (!fs.fstatSync(fd).isFile()) throw new Error(`checkout metadata is not a regular file: ${file}`);
+    parsed = JSON.parse(fs.readFileSync(fd, 'utf8')) as Partial<CheckoutMetadata>;
+  } finally {
+    fs.closeSync(fd);
+  }
+  if (
+    parsed.version !== 1 ||
+    typeof parsed.repo !== 'string' ||
+    typeof parsed.branch !== 'string' ||
+    !parsed.branch ||
+    typeof parsed.startCommit !== 'string' ||
+    !/^[0-9a-f]{40,64}$/.test(parsed.startCommit) ||
+    typeof parsed.startedFrom !== 'string' ||
+    !CHECKOUT_STARTED_FROM.has(parsed.startedFrom)
+  ) {
+    throw new Error(`checkout metadata is malformed: ${file}`);
+  }
+  return {
+    version: 1,
+    repo: parsed.repo,
+    branch: parsed.branch,
+    startCommit: parsed.startCommit,
+    startedFrom: parsed.startedFrom,
+  };
+}
+
+export function writeCheckoutMetadata(checkoutPath: string, metadata: CheckoutMetadata): void {
+  const file = checkoutMetadataPath(checkoutPath);
+  const fd = fs.openSync(file, 'wx', 0o644);
+  try {
+    fs.writeFileSync(fd, `${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Delete `checkout-staging/<requestId>` entries, other than `keep`, whose mtime is at
+ * least `maxAgeMs` old. Returns the removed names.
+ *
+ * Safe only where no job can be building inside one of them: the caller must
+ * be the one job its topic's lane is running (job-runner lanes run one job at a
+ * time per work unit), or otherwise prove the lane idle. A staging entry only
+ * ever holds a host-built clone that was never published, so removing it loses
+ * no agent work.
+ */
+export function removeStaleCheckoutStaging(
+  topicWorktreesDir: string,
+  options: { now: number; keep?: string; maxAgeMs?: number },
+): string[] {
+  const root = checkoutStagingRoot(topicWorktreesDir);
+  const maxAgeMs = options.maxAgeMs ?? CHECKOUT_STAGING_STALE_MS;
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+  const removed: string[] = [];
+  for (const entry of entries) {
+    if (entry.name === options.keep) continue;
+    const full = path.join(root, entry.name);
+    const stat = fs.lstatSync(full);
+    if (options.now - stat.mtimeMs < maxAgeMs) continue;
+    fs.rmSync(full, { recursive: true, force: true });
+    removed.push(entry.name);
+  }
+  return removed.sort();
+}

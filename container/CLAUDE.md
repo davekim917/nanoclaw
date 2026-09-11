@@ -72,7 +72,7 @@ Delegate to Codex with `codex exec --yolo "<prompt>"`, not `/codex:*` plugin ski
 
 ## Working with Repos
 
-One canonical clone per workgroup, mounted at `/workspace/worktrees/<repo>` — never an ad-hoc clone. See the `clone_repo`, `create_worktree`, `git_commit`, `git_push`, and `open_pr` tool descriptions for how to use it.
+Checkouts live under `/workspace/worktrees/` — never an ad-hoc clone. See the `clone_repo`, `create_worktree`, `git_commit`, `git_push`, and `open_pr` tool descriptions for how to use it.
 
 ## Feature Work Routing
 

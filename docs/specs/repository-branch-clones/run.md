@@ -235,3 +235,292 @@ Known risks carried to ship: stale fingerprint until host restart; chmod residua
 - Rule 4 over the 38 current topic installs (read-only): it accepts the 25 x64 trees and the one with no native packages, and refuses exactly the 10 arm64 and 2 mixed trees.
 - Other-family review (Codex CLI): **clear**. One NIT, which needs no change: `platformListAccepts` skips non-string list entries, where npm's `checkList` would throw. That is reachable only with malformed lockfile data npm itself cannot produce.
 - PR **#632**.
+
+## 2026-09-11 — /team-build (Phase 2)
+
+- Approved plan: `docs/specs/repository-branch-clones/plan.md`, revision 2 with corrections through rev 2.4. The Phase 2 precondition is met: Phase 1 was merged in #625 and #632, deployed, and set to `NANOCLAW_DEPENDENCY_CACHE=apply` at 2026-09-11 12:25Z. The first apply pass adopted 4, converted 1, with 0 mismatches. A production farm was verified to share inodes with its entry, with a private hidden lockfile.
+- Worktree `.claude/worktrees/branch-clones`, branch `feat/repository-branch-clones`, base `04ae8a871` (origin/main). The live checkout is untouched.
+- The one definition the plan leaves to this build is the strict completeness rule for link-at-checkout (§5.7.5), defined below once built.
+
+### Builders and integration (2026-09-11)
+
+- **Builders.**
+  - H1: host checkout action, lanes, refresh absorb, strict link rule, mode flag and spawn env.
+  - H2: storage sweep and worktree cleanup through the lister, plus clone GC.
+  - C: container tools and instructions.
+
+  Their reports are leads. Everything below was re-verified by the lead.
+- **Strict link rule (§5.7.5), as built** (`checkLinkCompleteness`, `src/dependency-cache.ts`). A package-lock entry absent from the entry's hidden lockfile must be `optional`, and must be excused by one of:
+  - (a) its lockfile `os`/`cpu`, or a declared `libc`, exclude linux/`process.arch`/glibc;
+  - (b) it declares `os` or `cpu` with no `libc` and is named as a musl build;
+  - (c) every entry that requires it, found by node resolution, is itself absent and excused (least fixpoint; a cycle excuses nothing).
+
+  The platform is the agent image: Debian bookworm, glibc 2.36, x64, with no musl loader.
+- **Lead fixes at integration.** Each was test-first and failed for the stated reason before the fix.
+  1. **Staging moved out of `worktrees/` (security).**
+     - The hole: `worktrees/` is mounted read-write into the topic's containers (`container-runner.ts:4386`), so `worktrees/.staging` was agent-writable. A planted `.staging` symlink led the checkout job's crash-residue removal to delete host data.
+     - The proof: `stages outside the container-writable worktrees root, so a planted .staging is never followed` deleted `host-data/precious` before the fix.
+     - The fix: staging is now `<topic>/checkout-staging/` (`checkoutStagingRoot`), which no container mounts. The host creates `worktrees/` before publishing.
+     - Cleanup's `.staging` exclusions are gone. Anything the lister skips in `worktrees/` is reported, and refuses orphan-topic collection as `unknown`.
+     - Plan note: rev 2.5 at §5.1.
+  2. **A farm link never follows a symlinked package dir.**
+     - The hole: on reuse of an existing, container-writable clone, the host linked a farm into a host directory the agent had symlinked in.
+     - The proof: `never links a farm into a package dir an existing checkout reaches through a symlink` got farmsLinked 1 before the fix.
+     - The fix: `checkoutPackageDirs` keeps only dirs whose realpath is their path inside the checkout.
+  3. **Root-level regenerable stores are still swept.**
+     - The hole: H2's lister-only walk stopped reclaiming `worktrees/.pnpm-store`, which production topics carry.
+     - The fix: `findTopicRegenerableTargets` also takes a real directory with a regenerable name at the worktrees root.
+     - The proof: `still sweeps a regenerable store at the worktrees root, beside the checkouts`.
+  4. **No edits to upstream-ported mailbox files.**
+     - The problem: C added `findRepositoryActionResponse` to `db/messages-in.ts` and to the three `mailbox/` files pinned by `UPSTREAM-MANIFEST.json`, which `mailbox-seam-upstream.test.ts` failed on.
+     - The fix: reverted. The tool reads the response with the existing exact-id `getMessageIn`, which opens a fresh handle per call (`mailbox/sqlite/operations.ts:94-101`), and requires `status === 'pending'`.
+  5. **`open_pr` keeps its documented contract.**
+     - The problem: selecting the checkout by `branch` made `open_pr` fail when no checkout still holds the pushed branch, which is the very case `branch` exists for.
+     - The fix: it falls back to the primary checkout as the `gh` cwd. `--head` is the named branch either way.
+     - The proof: `open_pr opens the PR for a pushed branch that no checkout holds any more`.
+  6. **Import pins.** `mailbox-seam-unreachable-scripts.test.ts` gains `listTopicCheckouts` for storage-manager and worktree-cleanup. Both are pure layout functions from a module those manifests already pin.
+- **Decisions.**
+  - **The strict rule stays fail-closed on build-script optionals.** H1 measured 36 real trees: Phase 1's rules accept 28 and the strict rule accepts 23. The 13 refusals:
+    - 5 arm64 installs missing a linux-x64 binary: correct.
+    - 2 trees missing a non-optional package: correct.
+    - 6 x64 trees of one repository missing `lzo`. It is optional, has no `os`/`cpu`, and has an install script. It is absent in all 8 trees that lock it, so its source build evidently never succeeds in this image.
+
+    Excusing absent build-script optionals would accept 29 of 36, but it would also excuse a build that failed only transiently. So those checkouts get no shared farm and install their own, and the sweep still dedupes them afterwards. **Re-raise if** clone-mode logs show `link refused … lzo` dominating farm misses.
+  - Clone GC gets no `NANOCLAW_STORAGE_GC=apply` gate, the same as the linked path and the plan.
+  - `disposability` is an exported seam for the P2-13 spies.
+  - `GIT_CEILING_DIRECTORIES` is set on every git question about one checkout.
+  - Clone scope `all` includes HEAD.
+  - **H1 deviations, accepted:**
+    - The flock covers only the steps that read the canonical.
+    - Clone hygiene also detaches HEAD and drops the guessed branch and its config.
+    - A refusal is an answer: `ok:false`, acked.
+    - A transfer tombstone refuses a checkout.
+    - `canonical-local` sets no upstream.
+    - A network canonical without `origin/HEAD` is an error.
+  - **C deviations, accepted:** test-only env overrides for the 120 s/5 s poll, and `CheckoutNotFoundError` to tell "nothing here" from "invalid here".
+- **Known risks for review.**
+  - **Absorb trusts a clone's remote-tracking refs (plan §5.5).** An agent that forges `refs/remotes/origin/*` in its clone can fast-forward the canonical's copy to an unpushed descendant, and the `--remotes` disposability proof then reads that commit as pushed. The update is fast-forward only, and the canonical's next real fetch force-updates it back.
+  - **Path checks on container-writable trees are check-then-use.** For farm links and clone GC, an agent racing the host can still swap a directory between check and use, as with the existing sweep.
+  - **Same-thread spawns retry during a checkout.** Holding the lifecycle claim for a whole checkout makes them retry for its duration (`container-runner.ts:1611-1612`).
+- **Fresh results at integration.**
+  - **Host vitest,** over storage-manager, worktree-cleanup, both repository-workspaces suites, dependency-cache, checkout-mode, container-runner*, ratchet, tripwire, mailbox-seam and host-sweep*: 21 files, 666 of 667 passed. The one failure was the ratchet pin on the CHANGELOG entry. After the accept, `upstream-ratchet.test.ts` passed 17/17.
+  - **Container:** `bun test` over git-worktrees, checkout-layout and instruction-fragment-migration: 56/56. `tsc -p container/agent-runner/tsconfig.json` is clean.
+  - **Host checks:** `tsc --noEmit` is clean, eslint `--quiet` on changed `src/` reports 0 errors, and prettier is clean.
+  - **Ratchet:** growth accepted for `src/container-runner.ts` (+2: the mode env beside `NANOCLAW_WORK_UNIT_KEY`) and `CHANGELOG.md` (+2), leaving Δ 0.
+
+## 2026-09-11 — /team-review --implementation (Phase 2)
+
+- **Target:** approved plan rev 2.5 plus `git diff 04ae8a871..f8cd4c6a2` (27 files, +4989/−138).
+- **Lenses:** correctness, simplicity, plan fidelity, failure handling and verification quality. Also:
+  - security, because host code reads and writes agent-writable trees and runs host git over container-written config;
+  - state and rollback: the flag flip, a crash mid-checkout, lanes, claims and locks, and GC versus checkout.
+
+### Reviewers
+
+| Reviewer | Transport / model / effort | Status | Raw verdict |
+|---|---|---|---|
+| Codex (other family, contract reviewer) | `codex exec --ignore-user-config --model gpt-6-astra -c model_reasoning_effort="high" --ephemeral -s read-only --output-schema … --output-last-message …` from the worktree. The vendored prompt, plan, recorded deviations and diff went on stdin (345,862 bytes). Timeout 3600000. | `completed` in 274 s. Header: gpt-6-astra / openai / high, which matches. | `needs-attention`, 4 findings → `must_fix` |
+| Fable 5.1 adversarial (same family, added coverage; named risk: data loss in clone GC, and host code acting in container-writable trees) | Agent worker-frontier, read-only | `completed` | `must_fix`, 1 finding |
+
+**Transport deviation:** `-s read-only` replaces `--yolo`. This session's permission classifier refuses `--yolo`. The host is not nested Docker, so the sandbox works and enforces no-mutation at the OS level.
+
+### Findings — lead verification
+
+- **CX1 (critical): host code execution through container-written git config in the disposability proof.**
+  - Verified: worktree cleanup's `git()` passed no filter names to `safeGitArgs` (`worktree-cleanup.ts:139`). `safe-git.ts` neutralizes only named filters (`:35-55`). A clone's `.git` is container-writable (`container-runner.ts:4386`).
+  - Reproduced in a scratch repo on git 2.43.0 with the exact overrides:
+    - a clean filter selected through `info/attributes` ran during `status`;
+    - `gpg.program` ran during `log`, with `log.showSignature=true` and a commit carrying a `gpgsig` header;
+    - an embedded repository's own filter ran through `status` recursion.
+  - Each is neutralized by, respectively, naming the filter, `log.showSignature=false`, and `--ignore-submodules=all`.
+  - **ACCEPTED, MUST-FIX.** FB1 (Fable reproduced the gpg path independently) is the same class and folded in.
+- **CX2 (high): `--remotes` evidence is agent-writable.**
+  - Verified: the scope-`all` proof subtracts every remote's refs (`worktree-cleanup.ts:770-775`). An agent can add remotes or rewrite remote-tracking refs after creation-time hygiene.
+  - The non-malicious route: a second remote pointing at a sibling clone or a local backup makes unpushed work look pushed. **ACCEPTED**, with a narrowed fix: only `origin`'s refs count (`--remotes=origin`).
+  - The residual: an agent that deliberately forges `refs/remotes/origin/*`, which refresh absorb also propagates. It affects only that agent's own commits, and they stay recoverable from the 30-day trash (`worktree-cleanup.ts:1148`). **RECORDED.** Re-raise if a trashed clone is found holding unpushed work, or before clone GC can reach work its own agent did not create.
+  - The reviewer's alternative, a host-protected proof of origin reachability, is out of Phase 2's scope.
+- **CX3 (high): reuse-time farm linking writes into a live, container-writable checkout.**
+  - Verified: on a failed exclusive mkdir, `linkPackageDir` removes a `.node_modules.nanoclaw-new` it did not create (`dependency-cache.ts:1582`; `linkTree`'s first act is `mkdirSync(dst)`, `:927`).
+  - **ACCEPTED, MUST-FIX.** Reuse now links nothing, and farms are linked only in host-only staging.
+  - This retires the lead's integration symlink guard, which is dead once no live tree is linked, and its test.
+  - Plan §5.2 "Existing directory" step 3 and P2-14 are corrected (rev 2.6).
+  - Not changed: `linkPackageDir`'s cleanup ownership. No caller links into a live tree any more. Re-raise before adding one.
+- **CX4 (medium): the `git_push` refresh never named the clone** (`git-worktrees.ts:1341`), so a clone's push never reached the canonical. **ACCEPTED, SHOULD-FIX** (functional, small).
+
+### Correction batch (rev 2.6), test-first
+
+- **Fixes:**
+  - **`safe-git.ts` `BASE_CONFIG`:** `log.showSignature=false`, and `gpg.program`, `gpg.ssh.program` and `gpg.x509.program` all set to `/bin/false`.
+  - **`provenDisposable` (`worktree-cleanup.ts`):**
+    - Every filter the repository's effective config defines is neutralized by name (`safeGitFilterNames`).
+    - An embedded repository (an index gitlink) refuses the checkout as `submodule` before `status` runs, and `status` carries `--ignore-submodules=all`.
+    - Scope `all` trusts only `--remotes=origin`.
+    - A config or index that cannot be read keeps the existing `status-unprovable` contract, which `storage-gc.test.ts` asserts.
+  - **`index.ts`:** reuse links no farm, and the `checkoutPackageDirs` guard is removed.
+  - **`git-worktrees.ts`:** `git_push` names the clone in its refresh.
+- **Tests:**
+  - New: `the disposability proof runs nothing a clone configures: filters, signature programs, or a submodule` (P2-21). Before the fix, all three sentinels were written.
+  - P2-12 gains `p212-sibling-remote`, which was collected before the fix, and `p212-submodule`.
+  - P2-14 asserts that reuse links nothing. Before the fix it linked one.
+  - P2-8 asserts that a clone push's refresh carries `checkout`. It fails against the committed push and passes with the fix.
+  - Removed: the integration symlink-farm test.
+- **Plan rev 2.6:** §5.2 "Existing directory" step 3, the §5.8 proof text and residual, P2-12, P2-14, and a new P2-21.
+
+### Fresh results (re-run once, after the batch)
+
+- **Host vitest,** over worktree-cleanup*, both repository-workspaces suites, safe-git, repository-migration, mailbox-seam, ratchet, storage-gc, storage-manager and dependency-cache: 20 files and 549 tests, 547 passed.
+  - The 2 failures: the storage-gc reason label, and the seam pin for the new `safeGitFilterNames` import. Both are fixed.
+  - The re-run of the affected files: 7 files, 203/203.
+- **Container:** `bun test` over git-worktrees, checkout-layout and instruction-fragment-migration: 56/56. `tsc -p container/agent-runner/tsconfig.json` is clean.
+- **Host checks:** `tsc --noEmit` is clean, eslint `--quiet` reports 0 errors, prettier is clean, and the ratchet is at Δ 0.
+
+**Review verdict: clear**, after one correction batch.
+- **Coverage:** other-family (Codex gpt-6-astra/high, completed) plus same-family adversarial (Fable).
+- **Residual risks carried to ship:**
+  - forged origin refs (above);
+  - check-then-use path races in container-writable trees, as with the existing sweep;
+  - same-thread spawns retry while a checkout runs;
+  - `linkPackageDir` cleanup ownership, which has no live-tree caller.
+
+## 2026-09-11 — PR #657 review (substitute Codex at b40e5dc54)
+
+### Findings
+
+- **Isolation bypass through refresh absorb (critical). ACCEPTED, fixed in rev 2.7.**
+  - Rev 2.6 had the host run `git fetch <clone> 'refs/remotes/origin/*:refs/remotes/origin/*'` into the canonical (`absorbCheckoutOriginRefs`, reached from `applyRepositoryRefreshAction`'s `checkout`). A clone's `.git` is container-writable.
+  - Reproduced on git 2.43 in a scratch dir, three routes. A clone's `.git/commondir`, its `.git/objects/info/alternates`, or a symlinked `.git/objects` points at another repository, and the fetch copies that repository's refs and objects into the canonical. So an agent could pull another workgroup's refs and objects into its own canonical.
+  - The canonical `.git` is itself mounted read-write (`container-runner.ts:4406`), and the read-only overlays (`canonicalGitControlMounts`, `:4413`) do not cover `commondir`.
+- **Two worktree-mode NITs:** an empty checkout directory a crash left behind was no longer recovered, and branchless tools refused a detached linked checkout. **Fixed in f465f14ce.**
+- **CI failure, `src/main.test.ts` T-5:** the checkout-mode `onHostStart` hook broke the pinned host-start registrants. **Fixed in f465f14ce.**
+
+### Operator decision (2026-09-11)
+
+Drop absorb. Keep the canonical current through container-side fetches, the way linked worktrees already do it.
+
+### Correction (rev 2.7), test-first
+
+- **Host (`index.ts`).**
+  - Removed `absorbCheckoutOriginRefs`, `resolveTopicCloneCheckout` and `absorbFrom`.
+  - `applyRepositoryRefreshAction` ignores `checkout`, so a payload from a container that has not restarted is a plain refresh. `requestId`/`repo` validation is kept.
+  - `assertNormalClone` refuses a `.git` holding `commondir` before any git command runs. This is fail-closed on a container-writable mount, not a structural fix; the mount is tracked separately.
+- **Container (`git-worktrees.ts`).**
+  - `fetchCanonicalHeld` is `createLinkedWorktree`'s fetch, unchanged, and `fetchCanonical` wraps it in the canonical lock.
+  - Clone mode fetches the canonical before `repository_checkout` is written, and again after a clone's `git_push`, once the clone lock is released so the locks never nest.
+  - A failed post-push fetch is reported in the tool result, not raised, because the push has already landed.
+  - `emitRefresh` takes no checkout. Local-only pins fetch nothing and refresh nothing.
+- **Tests, each observed failing first.**
+  - Host P2-9 is now `refresh never reads a checkout: a clone redirecting to another repository leaks nothing`, covering all three routes. Before the fix, the canonical's `refs/remotes/origin` set changed.
+  - Host `a canonical whose .git holds a commondir file is refused, and nothing is staged`. Before the fix it was not refused, and git followed the file (`update_ref failed for ref 'HEAD' … nonexistent object`).
+  - Container P2-8: the refresh carries no `checkout`, and canonical `origin/<branch>` equals the pushed commit. Before the fix it carried `checkout: "proj@alt-branch"`.
+  - Container `clone-mode create_worktree fetches the canonical before requesting the checkout`. Before the fix, `origin/pushed-elsewhere` was absent when the request was queued.
+  - The local-only host test lost its absorb assertion.
+- **Plan rev 2.7:** status line, the §2 scope bullet, §5.3 steps 1 and 3.4 plus the push note, §5.4, §5.5 rewritten, §8, and the P2-8 and P2-9 rows.
+
+### Fresh results
+
+- **Host vitest** (`--maxWorkers=2`, under the shared flock) over repository-workspaces (both suites), worktree-cleanup, main, checkout-mode, container-runner, safe-git, repository-migration, storage-gc, ratchet, tripwire, mailbox-seam, storage-manager, dependency-cache and host-sweep: 28 files, 784/784.
+  - After a lint-only change (an unused import), `src/modules/repository-workspaces/` passed again: 2 files, 53/53.
+- **Container:** `bun test` over git-worktrees, checkout-layout and instruction-fragment-migration: 59/59.
+- **Typecheck:** `tsc -p tsconfig.json` and `tsc -p container/agent-runner/tsconfig.json` are both clean.
+- **Lint and format:** eslint `--quiet` and prettier `--check` on the four changed `.ts` files are clean.
+- **Ratchet:** UNCHANGED 959, Δ 0.
+
+## 2026-09-11 — PR #657 review round 2 (substitute Codex at 771b514a4)
+
+### Findings and dispositions
+
+- **[1] Destructive: a commit only a tag reached read as pushed. ACCEPTED, fixed at the primitive.**
+  - `provenDisposable` scope `'all'` ran `git log --branches HEAD --not --remotes=origin`. A commit reachable only from a tag, a note, a replace ref or another remote's ref was not counted. Such a clone was proven disposable and trashed by all three callers: the clone collector, the orphan-topic loop and the quarantine re-proof.
+  - It now runs `git log --all HEAD --not --remotes=origin`. The invariant: every local ref's commits must be on origin.
+  - `HEAD` stays named. `--all` alone exits 0 with no output on an unborn HEAD (measured, git 2.43), where `log HEAD` fails, so an unborn HEAD stays unprovable.
+  - For scope `'all'` the stash is read before the log, so it keeps its own reason (`--all` counts `refs/stash` too). Measured: a `refs/stash` with no reflog is invisible to `stash list` but counted by `--all`.
+  - Scope `'head'` (linked worktrees) is unchanged: same command, same check order.
+- **[2] Rollback stranded `<repo>@<slug>` checkouts. ACCEPTED.**
+  - `reconcileQuarantine` and `finalizeIdleCollection` filtered the quarantined `worktrees/` with `isRepositoryName`. On rollback a branch checkout stayed in quarantine, and the recovery marker had already been removed, so recovery could never find it.
+  - `reconcileQuarantine` now restores every entry of the quarantined `worktrees/`, files and links included, and every other entry of the topic.
+    - The per-entry rule is kept: when the destination was recreated, keep the live copy and trash the quarantined one unless it is locked.
+    - Shapes come from `listTopicCheckouts`. Only a linked entry is deregistered, from the canonical of the repo its name parses to.
+    - The marker is removed only when nothing is left. A locked superseded copy or a failed trash keeps it.
+  - `finalizeIdleCollection` lists the quarantined topic through `readTopicCheckouts` and journals and deregisters linked entries only.
+  - `removeMissingWorktreeRegistration` now requires the checkout's basename to parse to the repo (`<repo>` or `<repo>@<slug>`) rather than equal it. Otherwise a linked `<repo>@<slug>` deregistration would be refused and stay journaled forever.
+  - Two marker-loss paths of the same kind are also fixed. The whole-topic fallback and `recoverOrphanedQuarantine`'s plain restore both remove the marker before renaming. When the entry stays in quarantine anyway, the marker is now written back.
+- **[3] Wording. ACCEPTED.** "The host never reads a checkout" is narrowed: refresh never reads or fetches from an agent checkout, and the host still validates reused checkouts and proves cleanup candidates, as it does for linked worktrees. Changed in the `index.ts` refresh handler comment, the `emitRefresh` doc and plan §5.5. Plan §5.8 states the new invariant.
+
+### Tests, each observed failing first
+
+- **`p212-tag-only`** in the P2-12 cases, asserted by both the orphan-topic loop and the clone branch.
+  - Before the fix, the orphan-topic assertion `{collect: false, reason: 'unpushed'}` failed for it.
+  - The P2-12 snapshot now lists every ref, not only `refs/heads`.
+- **`an idle topic rolled back by late activity gets every checkout back, branch clones included`.**
+  - Setup: clean pushed clones `repo-a` and `repo-a@feat`, and a mount of the topic that appears right after the quarantine rename.
+  - Before the fix, the worktrees root held only `repo-a`.
+  - After the fix: both clones are restored byte for byte (tree digest), the quarantine is empty, no marker remains, and nothing is trashed.
+- **`a rollback that leaves a locked superseded copy behind keeps the recovery marker`.**
+  - Setup: a clone that is restored, a locked superseded linked `repo-b` that stays in quarantine, and an unlocked superseded linked `repo-b@side` that is trashed and deregistered from the `repo-b` canonical.
+  - Before the fix, the marker was gone (ENOENT).
+- **The mailbox-seam manifest pin** for `worktree-cleanup.ts` is updated: `isRepositoryName` out, `parseCheckoutDirName` in.
+
+### Fresh results
+
+- **Host vitest** (`--maxWorkers=2`, under the shared flock) over worktree-cleanup, storage-gc, repository-workspaces (both suites), main, mailbox-seam, ratchet, tripwire and storage-manager: 17 files, 503/503.
+  - The first run was 502/503. The one failure was the manifest pin, which is now updated.
+- **Container:** `bun test` over git-worktrees, checkout-layout and instruction-fragment-migration: 59/59.
+- **Typecheck:** `tsc -p tsconfig.json` and `tsc -p container/agent-runner/tsconfig.json` are both clean.
+- **Lint and format:** eslint `--quiet` and prettier `--check` on the five changed `.ts` files are clean.
+- **Ratchet:** UNCHANGED 959, Δ 0.
+
+### Residual risks
+
+- A clone keeps the canonical's tags (§5.2 step 1 deletes only heads and remote refs). A tag on a commit that no origin branch reaches now reads as unpushed, so that clone is never collected. This fails closed and costs only disk.
+- Commits reachable only from a reflog or `ORIG_HEAD` are not refs and are not counted, as before.
+- A forged `refs/remotes/origin/*` still makes unpushed work look pushed. This is carried from rev 2.6; the trash keeps it for 30 days.
+
+## 2026-09-11 — PR #657 review round 3 (substitute Codex at 044de7f11)
+
+The connector stayed usage-limited (a fresh notice at 18:10Z), so this round again ran the vendored contract prompt through `codex exec` (gpt-6-astra, high, read-only).
+
+### Diagnosis before fixing
+
+This is the second round in a row on `reconcileQuarantine`.
+- Round 2 asked for every entry to go back, with the marker kept until nothing is left. Both went into the per-entry branch; the whole-topic fallback stayed as it was on main.
+- Round 3 found that keeping the marker made retries reach that fallback.
+
+Both findings circle one invariant: a retry must converge from whatever an earlier attempt left. The branch was chosen by what the quarantine held (a non-empty `worktrees/`), and that changes as an attempt progresses. The fix moves the decision to what occupies the original path, which is what makes a whole-topic rename fail.
+
+### Findings and dispositions
+
+- **[1] Destructive: a rollback retry trashed what a first attempt left. ACCEPTED, fixed at the seam.**
+  - When a first attempt stopped after its last checkout (a left-behind top-level entry, or a crash), quarantine held an emptied `worktrees/` and the marker. The retry saw no checkout entries and took the whole-topic fallback. Its rename failed on the restored, non-empty topic, and the fallback trashed the rest.
+  - An unreadable `worktrees/` took the same fallback and skipped the per-entry lock checks.
+  - Main could not reach this: it removed the marker up front, so no retry ever ran.
+  - `reconcileQuarantine` now has one rule for the first attempt and every retry.
+    - While the original path is empty, the topic goes back in one rename. A failed rename writes the marker back and leaves the topic in quarantine, or continues entry by entry if the path was recreated in between.
+    - Once the path is occupied, every top-level entry goes back on its own, and `worktrees/` entry by entry.
+    - A directory it cannot list restores nothing and keeps the marker. Nothing whole is trashed.
+  - `restoreQuarantinedEntry` is unchanged. An occupied slot keeps the live copy and trashes an unlocked quarantined one, and a per-entry rename failure trashes that entry, as on main.
+- **[2] PR-body contradiction: per-branch checkouts promised in worktree mode. ACCEPTED.**
+  - Verified at `git-worktrees.ts:369-373`: worktree mode passes the primary context to `createLinkedWorktree`, and `validateExistingWorktree` refuses another branch.
+  - `create_worktree`'s description is now chosen by the container's mode (`NANOCLAW_CHECKOUT_MODE`, passed at spawn). Clone mode keeps the per-branch text; worktree mode describes one linked worktree per repo and the refusal.
+  - Narrowed to match: `container/CLAUDE.md` "Working with Repos", `docs/workgroups.md`, the CHANGELOG entry, the `git-worktrees.ts` header comment and the PR body. The docs and the CHANGELOG now also say "every local ref" for the clone proof, matching round 2.
+
+### Tests, each observed failing first
+
+- **`a retry after a partial rollback restores what is left instead of trashing the topic`.** Before the fix, the topic entry was gone: the fallback had trashed it.
+- **`a rollback that cannot list the quarantined worktrees leaves it for a retry, trashing nothing`.** Before the fix, the whole quarantine was trashed.
+- **`a whole-topic restore that fails keeps the topic in quarantine for a retry, trashing nothing`.** Before the fix, the quarantine was trashed. After it, the next pass restores the topic byte for byte.
+- **`create_worktree promises a checkout per branch only in clone mode`** (container). Before the fix, the worktree-mode description contained `@<branch>`.
+
+### Fresh results
+
+- **Host vitest** (`--maxWorkers=2`, under the shared flock):
+  - worktree-cleanup, storage-gc and the ratchet at the final tree: 3 files, 128/128;
+  - repository-workspaces (both suites), main, mailbox-seam, ratchet, tripwire, storage-manager, provider-surfaces and agents-md-flatten: 17 files, 440/441. The one failure was the ratchet manifest pin, since regenerated and passing.
+- **Container:** `bun test` over git-worktrees and instruction-fragment-migration: 57/57.
+- **Typecheck:** `tsc -p tsconfig.json` and the container typecheck are both clean.
+- **Lint and format:** eslint `--quiet` and prettier `--check` on the four changed `.ts` files are clean.
+- **Ratchet:** UNCHANGED 959, Δ 0. The manifest is re-pinned (two content hashes).
+
+### Residual risks
+
+- A per-entry rename that fails while its slot is still empty trashes that entry, as on main. The scan-time disposability proof keeps it recoverable from the 30-day trash.
+- The whole-topic path removes the marker before its rename, as on main. A crash between the two leaves an entry that recovery cannot identify.

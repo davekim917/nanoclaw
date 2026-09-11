@@ -10,29 +10,50 @@ import {
   RepositoryMountQuiescenceError,
   type RepositoryMountQuiescence,
 } from '../../container-restart.js';
-import { REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS } from '../../config.js';
+import { effectiveCheckoutMode } from '../../checkout-mode.js';
+import { DATA_DIR, REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS } from '../../config.js';
 import { getAgentGroup, getAllAgentGroups } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
-import { registerDeliveryAction } from '../../delivery.js';
+import {
+  DEPENDENCY_CACHE_DIRNAME,
+  linkPackageDir,
+  startDependencyCachePass,
+  type DependencyCacheMode,
+} from '../../dependency-cache.js';
+import { registerDeliveryAction, type DeliveryActionResult } from '../../delivery.js';
+import { containerRunsAsHostUser } from '../../github-token-file.js';
 import { unguarded } from '../../guard/index.js';
 import { log } from '../../log.js';
+import { resolveStoragePolicy } from '../../storage-manager.js';
 import { REPOSITORY_REQUEST_ID_PATTERN, runRepositoryActionDetached } from './job-runner.js';
 import {
+  assertRepositoryName,
   canonicalRepoDir,
+  checkoutDirName,
+  checkoutStagingRoot,
+  defaultTopicBranch,
+  isRepositoryLifecycleClaimed,
+  listTopicCheckouts,
+  readCheckoutMetadata,
   readOriginPin,
   readTransferTombstone,
+  removeStaleCheckoutStaging,
   resolveRepositoryWorkUnit,
   topicWorktreesDir,
   transferTombstonePath,
   withHostRepositoryLock,
   withRepositoryLifecycleClaims,
   withWorkgroupRepositoryMountClaim,
+  writeCheckoutMetadata,
   writeOriginPin,
   writeTransferTombstone,
+  type CheckoutStartedFrom,
+  type OriginPin,
   type RepositoryTransferTombstone,
   type RepositoryWorkUnit,
+  type TopicCheckout,
 } from '../../repository-workspaces.js';
 import { observedOriginsSha256 } from '../../repository-migration-recovery.js';
 import { sessionsHoldRepoIngressFence } from '../../repo-fence-recovery.js';
@@ -148,6 +169,17 @@ function assertNormalClone(repoPath: string, label: string): void {
   const gitDir = path.join(repoPath, '.git');
   const gitStat = fs.lstatSync(gitDir);
   if (gitStat.isSymbolicLink() || !gitStat.isDirectory()) throw new Error(`${label} must be a normal clone`);
+  // A normal clone's .git never holds `commondir`, and Git follows one to
+  // another repository's refs, objects and config. This is a fail-closed check
+  // on a container-writable mount (the canonical .git is mounted read-write,
+  // container-runner.ts:4406), not a structural fix: a separate issue tracks
+  // the mount itself. It runs before any git command here, which would follow it.
+  try {
+    fs.lstatSync(path.join(gitDir, 'commondir'));
+    throw new Error(`${label} must be a normal clone, and its .git holds a commondir file`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
   if (git(repoPath, ['rev-parse', '--is-bare-repository'], 10_000) !== 'false') {
     throw new Error(`${label} must be a normal clone`);
   }
@@ -547,7 +579,24 @@ export async function transferRepositoryWorktree(
  * this answers was read out of that very mailbox, so it exists. A session that
  * has vanished has no container left to read the answer.
  */
-async function response(session: Session, requestId: string, ok: boolean, message: string): Promise<void> {
+/** Structured fields a `repository_checkout` answer carries. Every other action answers with the message alone. */
+export interface RepositoryActionResponseDetail {
+  dirName?: string;
+  branch?: string;
+  created?: boolean;
+  startedFrom?: CheckoutStartedFrom;
+  objectsLinked?: boolean;
+  farmsLinked?: number;
+  retryable?: boolean;
+}
+
+async function response(
+  session: Session,
+  requestId: string,
+  ok: boolean,
+  message: string,
+  detail: RepositoryActionResponseDetail = {},
+): Promise<void> {
   const id = `repository-action-response-${requestId}`;
   const written = await withExistingMailboxSession(session.agent_group_id, session.id, async (mailbox) => {
     if (mailbox.inboundHasMessage(id)) return true;
@@ -558,7 +607,7 @@ async function response(session: Session, requestId: string, ok: boolean, messag
       platformId: null,
       channelType: null,
       threadId: null,
-      content: JSON.stringify({ type: 'repository_action_response', requestId, ok, message }),
+      content: JSON.stringify({ type: 'repository_action_response', requestId, ok, message, ...detail }),
       processAfter: null,
       recurrence: null,
       trigger: 0,
@@ -568,6 +617,647 @@ async function response(session: Session, requestId: string, ok: boolean, messag
   if (written === undefined) {
     log.warn('Repository action response dropped — session mailbox is gone', { requestId, sessionId: session.id });
   }
+}
+
+// ── repository_checkout (plan §5.2) ─────────────────────────────────────────
+//
+// One (thread, branch) gets one independent clone. The host builds it in the
+// topic's staging dir (beside `worktrees/`, outside every container mount:
+// checkoutStagingRoot), initializes it fully, and publishes it with one rename,
+// so a checkout exists only once it is ready. The job runs on its work unit's
+// own lane (job-runner.ts), takes that unit's lifecycle claim and the
+// repository flock, and never quiesces anything.
+//
+// It runs on the host because inside a container the canonical and the topic
+// root are different bind mounts: link(2) returns EXDEV across mounts, and Git
+// would copy every object into every clone (plan §4.6).
+
+export interface CheckoutFarmPolicy {
+  /** `NANOCLAW_DEPENDENCY_CACHE`: `apply` links farms, `report` logs what it would link, `off` shares nothing (§5.7.8). */
+  mode: DependencyCacheMode;
+  /** The environment fingerprint; the agent image's when omitted. */
+  fingerprint?: () => string | null;
+}
+
+export interface CheckoutRepositoryInput {
+  workgroupId: string;
+  workUnit: RepositoryWorkUnit;
+  repo: string;
+  /** `null`: the thread's primary checkout `<repo>`. */
+  branch: string | null;
+  requestId: string;
+  dataDir?: string;
+  farms?: CheckoutFarmPolicy;
+}
+
+export interface CheckoutRepositoryResult {
+  dirName: string;
+  path: string;
+  /** The branch the checkout serves; `null` only for a legacy linked checkout on a detached HEAD. */
+  branch: string | null;
+  created: boolean;
+  shape: 'clone' | 'linked';
+  startedFrom?: CheckoutStartedFrom;
+  objectsLinked?: boolean;
+  farmsLinked: number;
+}
+
+/** A refusal the requester can act on; `retryable` when waiting a few seconds is the whole fix. */
+export class RepositoryCheckoutError extends Error {
+  constructor(
+    message: string,
+    readonly retryable = false,
+  ) {
+    super(message);
+    this.name = 'RepositoryCheckoutError';
+  }
+}
+
+export interface RepositoryCheckoutHooks {
+  afterStagingPopulated?: (stagingCheckoutPath: string) => Promise<void> | void;
+}
+
+let checkoutHooks: RepositoryCheckoutHooks = {};
+
+/** Test seam: pause or fail a checkout once its staging clone is fully built. */
+export function _setRepositoryCheckoutHooksForTesting(hooks: RepositoryCheckoutHooks | null): void {
+  checkoutHooks = hooks ?? {};
+}
+
+/** The job-runner lane for one (workgroup, work unit). */
+export function repositoryCheckoutLane(workgroupId: string, workUnit: RepositoryWorkUnit): string {
+  return `checkout:${workgroupId}:${workUnit.id}`;
+}
+
+function gitWithInput(cwd: string, args: string[], input: string, timeout = 120_000): void {
+  const config = path.join(cwd, '.git', 'config');
+  execFileSync('git', safeGitArgs(args, fs.existsSync(config) ? config : undefined), {
+    cwd,
+    env: safeGitEnv(),
+    input,
+    encoding: 'utf8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+    timeout,
+  });
+}
+
+/** Delete refs by name. A symbolic ref is deleted itself, never its target. */
+function deleteRefs(repoPath: string, refs: string[]): void {
+  if (refs.length === 0) return;
+  gitWithInput(repoPath, ['update-ref', '--stdin'], refs.map((ref) => `option no-deref\ndelete ${ref}\n`).join(''));
+}
+
+/** A branch name `git branch` would accept, checked without letting `--branch` expand `@{-N}`. */
+function assertCheckoutBranch(canonical: string, branch: string): void {
+  if (
+    !branch ||
+    branch === 'HEAD' ||
+    branch.startsWith('-') ||
+    tryGit(canonical, ['check-ref-format', `refs/heads/${branch}`], 10_000) === null
+  ) {
+    throw new RepositoryCheckoutError(`Invalid branch name: ${JSON.stringify(branch)}`);
+  }
+}
+
+function currentBranch(checkoutPath: string): string | null {
+  return tryGit(checkoutPath, ['symbolic-ref', '--quiet', '--short', 'HEAD'], 10_000);
+}
+
+/** The branch a checkout is FOR: a clone's recorded branch, a linked worktree's current one. `null` when unknown. */
+function branchOfCheckout(checkout: TopicCheckout): string | null {
+  if (checkout.shape === 'linked') return currentBranch(checkout.path);
+  if (checkout.shape !== 'clone') return null;
+  try {
+    return readCheckoutMetadata(checkout.path)?.branch ?? null;
+  } catch {
+    return null;
+  }
+}
+
+interface CheckoutTarget {
+  dirName: string;
+  path: string;
+  /** The branch a new checkout here is created on (ignored when `existing`). */
+  branch: string;
+  existing: TopicCheckout | null;
+}
+
+/**
+ * Which checkout serves (repo, branch) (plan §5.1): no branch -> `<repo>`;
+ * `<repo>` absent -> `<repo>`, created on the branch; `<repo>`'s own branch ->
+ * `<repo>`; anything else -> `<repo>@<slug>`. A `<repo>` whose branch cannot be
+ * read serves only requests without a branch, and is then refused by validation.
+ */
+function selectCheckoutTarget(
+  topicRoot: string,
+  repo: string,
+  branch: string | null,
+  workUnit: RepositoryWorkUnit,
+): CheckoutTarget {
+  const checkouts = listTopicCheckouts(topicRoot);
+  const named = (name: string): TopicCheckout | null => checkouts.find((checkout) => checkout.name === name) ?? null;
+  const primary = named(repo);
+  const at = (dirName: string, targetBranch: string, existing: TopicCheckout | null): CheckoutTarget => ({
+    dirName,
+    path: path.join(topicRoot, dirName),
+    branch: targetBranch,
+    existing,
+  });
+  if (branch === null) return at(repo, defaultTopicBranch(workUnit, repo), primary);
+  if (!primary || branchOfCheckout(primary) === branch) return at(repo, branch, primary);
+  const dirName = checkoutDirName(repo, branch);
+  return at(dirName, branch, named(dirName));
+}
+
+/**
+ * The resolution rules of plan §5.3, host side. A clone must still be on its
+ * recorded branch (R3) with the origin its pin allows; a linked worktree must
+ * belong to this workgroup's canonical. Anything else is refused and left
+ * exactly as it is. Returns the branch the checkout serves.
+ */
+function validateExistingCheckout(input: {
+  checkout: TopicCheckout;
+  repo: string;
+  branch: string | null;
+  canonical: string;
+  pin: OriginPin;
+}): string | null {
+  const { checkout } = input;
+  if (checkout.shape === 'unknown') {
+    throw new RepositoryCheckoutError(`${checkout.name} is not a Git checkout and was left untouched`);
+  }
+  if (checkout.shape === 'linked') {
+    const common = tryGit(checkout.path, ['rev-parse', '--path-format=absolute', '--git-common-dir'], 10_000);
+    if (!common || fs.realpathSync(common) !== fs.realpathSync(path.join(input.canonical, '.git'))) {
+      throw new RepositoryCheckoutError(
+        `${checkout.name} is a linked worktree Git cannot serve from this workgroup's canonical; it was left untouched`,
+      );
+    }
+    const current = currentBranch(checkout.path);
+    if (input.branch !== null && current !== input.branch) {
+      throw new RepositoryCheckoutError(
+        `${checkout.name} is on '${current ?? 'detached HEAD'}', not '${input.branch}'; it was left untouched`,
+      );
+    }
+    return current;
+  }
+  const metadata = readCheckoutMetadata(checkout.path);
+  if (!metadata || metadata.repo !== input.repo) {
+    throw new RepositoryCheckoutError(`${checkout.name} is a clone this host did not record; it was left untouched`);
+  }
+  const current = currentBranch(checkout.path);
+  if (current !== metadata.branch) {
+    throw new RepositoryCheckoutError(
+      `${checkout.name} is on '${current ?? 'detached HEAD'}' but its recorded branch is '${metadata.branch}'. ` +
+        'A checkout is never served for another branch; it was left untouched.',
+    );
+  }
+  if (input.branch !== null && input.branch !== metadata.branch) {
+    throw new RepositoryCheckoutError(
+      `${checkout.name} is recorded for '${metadata.branch}', not '${input.branch}'; it was left untouched`,
+    );
+  }
+  const configured = safeGitConfigGet(path.join(checkout.path, '.git', 'config'), 'remote.origin.url');
+  if (input.pin.kind === 'local-only') {
+    if (configured)
+      throw new RepositoryCheckoutError(`${checkout.name} has an origin, but its canonical is local-only`);
+  } else {
+    let matches: boolean;
+    try {
+      matches = configured !== null && normalizeOrigin(configured) === normalizeOrigin(input.pin.origin);
+    } catch {
+      matches = false;
+    }
+    if (!matches)
+      throw new RepositoryCheckoutError(`${checkout.name}'s origin does not match the workgroup's origin pin`);
+  }
+  return metadata.branch;
+}
+
+/** Did the clone hardlink the canonical's objects? Judged by one pack's (else one loose object's) link count. */
+function objectsAreLinked(clonePath: string): boolean {
+  const objects = path.join(clonePath, '.git', 'objects');
+  const list = (dir: string): string[] => {
+    try {
+      return fs.readdirSync(dir).sort();
+    } catch {
+      return [];
+    }
+  };
+  const pack = list(path.join(objects, 'pack')).find((name) => name.endsWith('.pack'));
+  if (pack) return fs.statSync(path.join(objects, 'pack', pack)).nlink >= 2;
+  for (const fanout of list(objects)) {
+    if (!/^[0-9a-f]{2}$/.test(fanout)) continue;
+    const loose = list(path.join(objects, fanout))[0];
+    if (loose) return fs.statSync(path.join(objects, fanout, loose)).nlink >= 2;
+  }
+  return false;
+}
+
+/**
+ * Steps 1-3 of plan §5.2, under the repository flock because they read the
+ * canonical: clone, remote-ref hygiene, and the start point.
+ */
+function stageClone(input: { canonical: string; staging: string; branch: string; pin: OriginPin }): {
+  startedFrom: CheckoutStartedFrom;
+  startCommit: string;
+  objectsLinked: boolean;
+} {
+  const { canonical, staging, branch, pin } = input;
+  // 1. A local clone hardlinks the canonical's object files, copying only what
+  // it cannot link, and without --shared it never writes objects/info/alternates,
+  // so canonical GC cannot break the clone (plan §5.8).
+  git(path.dirname(staging), ['clone', '--no-checkout', '--quiet', canonical, staging], 600_000);
+  const objectsLinked = objectsAreLinked(staging);
+
+  // 2. Remote-ref hygiene (M2). `git clone <canonical>` maps the canonical's own
+  // refs/heads/* into refs/remotes/origin/* and guesses a local branch from its
+  // detached HEAD (both seen in a scratch clone, 2026-09-11). Neither may
+  // survive: the clone disposability proof trusts --remotes (plan §5.8).
+  git(staging, ['update-ref', '--no-deref', 'HEAD', git(staging, ['rev-parse', '--verify', 'HEAD^{commit}'], 10_000)]);
+  const cloned = git(staging, ['for-each-ref', '--format=%(refname)', 'refs/heads', 'refs/remotes'], 10_000)
+    .split('\n')
+    .filter(Boolean);
+  deleteRefs(staging, cloned);
+  // The guessed branch also got `branch.<name>` tracking config; drop it with the ref.
+  for (const ref of cloned.filter((name) => name.startsWith('refs/heads/'))) {
+    tryGit(staging, ['config', '--remove-section', `branch.${ref.slice('refs/heads/'.length)}`], 10_000);
+  }
+  if (pin.kind === 'local-only') {
+    // M7: a local-only canonical has no origin, so neither does its clone.
+    git(staging, ['remote', 'remove', 'origin'], 10_000);
+  } else {
+    git(staging, ['config', 'remote.origin.url', pin.origin], 10_000);
+    git(staging, ['fetch', '--quiet', '--no-tags', canonical, '+refs/remotes/origin/*:refs/remotes/origin/*'], 600_000);
+    // The glob copies origin/HEAD as a plain ref; the canonical's is symbolic.
+    deleteRefs(staging, ['refs/remotes/origin/HEAD']);
+    const originHead = tryGit(canonical, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD'], 10_000);
+    if (originHead) git(staging, ['symbolic-ref', 'refs/remotes/origin/HEAD', originHead], 10_000);
+  }
+
+  // 3. The start point (R4): the most complete known state of the branch.
+  // Every canonical object is already here, so committed-but-unpushed legacy
+  // work in canonical refs/heads/B stays reachable.
+  let startedFrom: CheckoutStartedFrom;
+  let startCommit: string | null = tryGit(
+    canonical,
+    ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}^{commit}`],
+    10_000,
+  );
+  if (startCommit) {
+    startedFrom = 'canonical-local';
+  } else if (pin.kind === 'local-only') {
+    // Today's local-only rule (container git-worktrees.ts:465-468).
+    startCommit = git(canonical, ['rev-parse', '--verify', 'HEAD^{commit}'], 10_000);
+    startedFrom = 'local-head';
+  } else {
+    startCommit = tryGit(
+      staging,
+      ['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}^{commit}`],
+      10_000,
+    );
+    startedFrom = 'origin-branch';
+    if (!startCommit) {
+      startCommit = tryGit(staging, ['rev-parse', '--verify', '--quiet', 'refs/remotes/origin/HEAD^{commit}'], 10_000);
+      startedFrom = 'origin-head';
+    }
+    if (!startCommit) {
+      throw new RepositoryCheckoutError(
+        'the workgroup canonical has no origin/HEAD to start a new branch from; refresh it, then retry',
+      );
+    }
+  }
+  git(staging, ['update-ref', `refs/heads/${branch}`, startCommit], 10_000);
+  if (startedFrom === 'origin-branch') {
+    git(staging, ['branch', '--quiet', `--set-upstream-to=origin/${branch}`, branch], 10_000);
+  }
+  return { startedFrom, startCommit, objectsLinked };
+}
+
+/**
+ * Package dirs of a checkout: every tracked `package-lock.json`'s directory,
+ * outside node_modules. Called only on a staging clone, which no container can
+ * reach (checkoutStagingRoot).
+ */
+function checkoutPackageDirs(checkoutPath: string): string[] {
+  const listed = git(checkoutPath, ['ls-files', '-z', '--', 'package-lock.json', '*/package-lock.json'], 60_000);
+  const dirs = new Set<string>();
+  for (const rel of listed.split('\0').filter(Boolean)) {
+    if (rel.split('/').includes('node_modules')) continue;
+    dirs.add(path.join(checkoutPath, path.dirname(rel)));
+  }
+  return [...dirs].sort();
+}
+
+/**
+ * Link a farm into every package dir that has no `node_modules` and whose key
+ * has a verified, strictly complete entry (plan §5.7.4, §5.7.5). All the
+ * deciding is `linkPackageDir`'s, and so is the WARN on every refusal or link
+ * failure. Returns how many farms it linked.
+ */
+function linkCheckoutFarms(
+  checkoutPath: string,
+  workgroupId: string,
+  farms: CheckoutFarmPolicy,
+  dataDir: string,
+): number {
+  if (farms.mode === 'off') return 0;
+  const pkgDirs = checkoutPackageDirs(checkoutPath);
+  if (pkgDirs.length === 0) return 0;
+  const pass = startDependencyCachePass({
+    mode: farms.mode === 'apply' ? 'apply' : 'report',
+    // A sibling of v2-topics, as the sweep's (storage-manager.ts:2565), so every link stays on one mount.
+    cacheRoot: path.join(path.resolve(dataDir), DEPENDENCY_CACHE_DIRNAME),
+    now: Date.now(),
+    // Only convert and GC decisions read reclaimable bytes; a link reclaims nothing.
+    reclaimableBytes: () => 0,
+    fingerprint: farms.fingerprint,
+  });
+  let linked = 0;
+  for (const pkgDir of pkgDirs) {
+    try {
+      if (linkPackageDir(pass, workgroupId, pkgDir) === 'linked' && pass.mode === 'apply') linked += 1;
+    } catch (err) {
+      log.warn('Repository checkout could not link a dependency farm', { path: pkgDir, err });
+    }
+  }
+  return linked;
+}
+
+function checkoutFarmPolicyFromEnvironment(): CheckoutFarmPolicy {
+  return { mode: resolveStoragePolicy().dependencyCacheMode ?? 'off' };
+}
+
+/** Steps 1-7 of plan §5.2 for a checkout that does not exist yet. */
+async function createCheckout(input: {
+  workgroupId: string;
+  repo: string;
+  requestId: string;
+  dataDir: string;
+  canonical: string;
+  pin: OriginPin;
+  topicRoot: string;
+  target: CheckoutTarget;
+  farms: CheckoutFarmPolicy;
+}): Promise<CheckoutRepositoryResult> {
+  const { target } = input;
+  const requestRoot = path.join(checkoutStagingRoot(input.topicRoot), input.requestId);
+  const staging = path.join(requestRoot, target.dirName);
+  // Both live in the topic state dir, which no container mounts: staging
+  // beside `worktrees/` (checkoutStagingRoot), and `worktrees/` itself, the
+  // publish destination, which may not exist before the topic's first spawn.
+  fs.mkdirSync(requestRoot, { recursive: true });
+  fs.mkdirSync(input.topicRoot, { recursive: true });
+  let staged: { startedFrom: CheckoutStartedFrom; startCommit: string; objectsLinked: boolean };
+  let farmsLinked: number;
+  try {
+    staged = await withHostRepositoryLock(
+      input.workgroupId,
+      input.repo,
+      () => stageClone({ canonical: input.canonical, staging, branch: target.branch, pin: input.pin }),
+      input.dataDir,
+    );
+    if (!staged.objectsLinked) {
+      log.warn('Repository checkout copied Git objects instead of hardlinking them', {
+        repo: input.repo,
+        dirName: target.dirName,
+        canonical: input.canonical,
+      });
+    }
+    // 4. Materialize the working tree, then record what this checkout is.
+    git(staging, ['checkout', '--quiet', '--force', target.branch], 600_000);
+    git(staging, ['config', 'gc.auto', '0'], 10_000);
+    writeCheckoutMetadata(staging, {
+      version: 1,
+      repo: input.repo,
+      branch: target.branch,
+      startCommit: staged.startCommit,
+      startedFrom: staged.startedFrom,
+    });
+    await checkoutHooks.afterStagingPopulated?.(staging);
+    // 5. Farms, now that the manifests exist.
+    farmsLinked = linkCheckoutFarms(staging, input.workgroupId, input.farms, input.dataDir);
+    // 6. Publish: one rename inside the topic root. rename(2) would replace an
+    // empty directory, so anything already at the target refuses instead.
+    if (fs.existsSync(target.path) || isSymlink(target.path)) {
+      throw new RepositoryCheckoutError(`${target.dirName} already exists and is not a checkout this host can serve`);
+    }
+    fs.renameSync(staging, target.path);
+  } catch (error) {
+    // Nothing outside this request's own staging dir was touched.
+    fs.rmSync(requestRoot, { recursive: true, force: true });
+    throw error;
+  }
+  try {
+    fsyncDirectories(input.topicRoot, requestRoot);
+    fs.rmdirSync(requestRoot);
+  } catch (error) {
+    // Published: the checkout is ready either way, and an empty request dir is swept later.
+    log.warn('Repository checkout published but could not tidy its staging dir', {
+      requestRoot,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  return {
+    dirName: target.dirName,
+    path: target.path,
+    branch: target.branch,
+    created: true,
+    shape: 'clone',
+    startedFrom: staged.startedFrom,
+    objectsLinked: staged.objectsLinked,
+    farmsLinked,
+  };
+}
+
+function isSymlink(target: string): boolean {
+  try {
+    return fs.lstatSync(target).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The checkout serving (repo, branch) in this work unit's topic: reused when it
+ * exists and passes validation, otherwise created (plan §5.2). Preconditions
+ * come from the trusted work unit, never from payload paths.
+ */
+export async function checkoutRepository(input: CheckoutRepositoryInput): Promise<CheckoutRepositoryResult> {
+  const dataDir = input.dataDir ?? DATA_DIR;
+  const { workgroupId, workUnit, repo, branch, requestId } = input;
+  assertRepositoryName(repo);
+  assertRepositoryRequestId(requestId);
+  if (workUnit.workgroupId !== workgroupId) {
+    throw new RepositoryCheckoutError('the checkout work unit belongs to another workgroup');
+  }
+  // Transfer and cleanup hold this claim for seconds to minutes, so the answer
+  // is "retry", not "failed". The check and the claim below are one synchronous
+  // step: withRepositoryLifecycleClaims tests and takes its keys before its
+  // first await (repository-workspaces.ts:233-237).
+  if (isRepositoryLifecycleClaimed(workUnit)) {
+    throw new RepositoryCheckoutError(
+      "this thread's repository checkouts are being moved or cleaned up; retry in a few seconds",
+      true,
+    );
+  }
+  return withRepositoryLifecycleClaims([workUnit], async () => {
+    const canonical = canonicalRepoDir(workgroupId, repo, dataDir);
+    if (!fs.existsSync(canonical)) {
+      throw new RepositoryCheckoutError(`${repo} has no workgroup canonical; clone_repo it first`);
+    }
+    assertNormalClone(canonical, 'canonical repository');
+    const pin = readOriginPin(workgroupId, repo, dataDir);
+    if (!pin) throw new RepositoryCheckoutError(`${repo}'s workgroup canonical has no origin pin`);
+    if (readTransferTombstone(workUnit, repo, dataDir)) {
+      throw new RepositoryCheckoutError(`this thread's ${repo} checkout was transferred to another thread`);
+    }
+    if (branch !== null) assertCheckoutBranch(canonical, branch);
+
+    const topicRoot = topicWorktreesDir(workUnit, dataDir);
+    // This job is the one its lane is running, so no other staging entry in
+    // this topic is being built: older ones are crash residue, and so is any
+    // left by an earlier attempt at this same request (a replay after a host
+    // restart), which was never published.
+    removeStaleCheckoutStaging(topicRoot, { now: Date.now(), keep: requestId });
+    fs.rmSync(path.join(checkoutStagingRoot(topicRoot), requestId), { recursive: true, force: true });
+
+    const target = selectCheckoutTarget(topicRoot, repo, branch, workUnit);
+    const farms = input.farms ?? checkoutFarmPolicyFromEnvironment();
+    if (target.existing) {
+      const served = validateExistingCheckout({ checkout: target.existing, repo, branch, canonical, pin });
+      return {
+        dirName: target.dirName,
+        path: target.path,
+        branch: served,
+        created: false,
+        shape: target.existing.shape === 'linked' ? 'linked' : 'clone',
+        // A published checkout is live and container-writable, so the host
+        // writes no farm into it (plan §5.2, rev 2.6): npm installs a private
+        // tree there, and the sweep converts it once the topic is idle.
+        farmsLinked: 0,
+      };
+    }
+    return createCheckout({ workgroupId, repo, requestId, dataDir, canonical, pin, topicRoot, target, farms });
+  });
+}
+
+const STARTED_FROM_NOTE: Record<CheckoutStartedFrom, string> = {
+  'canonical-local': "from the canonical's local branch of that name (committed work preserved)",
+  'origin-branch': 'from origin/<branch>, tracking it',
+  'origin-head': 'as a new branch from origin/HEAD',
+  'local-head': "as a new branch from the local-only canonical's HEAD",
+};
+
+function checkoutMessage(result: CheckoutRepositoryResult): string {
+  const where = `/workspace/worktrees/${result.dirName}`;
+  if (!result.created) {
+    return `Checkout ready at ${where} (existing ${result.shape} on ${result.branch ?? 'detached HEAD'}; left untouched)`;
+  }
+  const from = result.startedFrom
+    ? ` ${STARTED_FROM_NOTE[result.startedFrom].replace('<branch>', result.branch ?? '')}`
+    : '';
+  return `Checkout created at ${where} on branch ${result.branch}${from}`;
+}
+
+/**
+ * `repository_checkout` (container -> host): `{requestId, repo, branch, workUnitKey}`.
+ * Always answers in the requester's inbound with `repository-action-response-<requestId>`;
+ * a refusal is an answer (`ok:false`), not a failed delivery.
+ */
+export async function applyRepositoryCheckoutAction(content: Record<string, unknown>, session: Session): Promise<void> {
+  const startedAt = Date.now();
+  const requestId = typeof content.requestId === 'string' ? content.requestId : '';
+  // Unkeyable: no answer can be addressed, so the delivery loop keeps the row.
+  assertRepositoryRequestId(requestId);
+  const repo = typeof content.repo === 'string' ? content.repo : '';
+  let lane = `checkout:session:${session.id}`;
+  try {
+    const workUnitKey = typeof content.workUnitKey === 'string' ? content.workUnitKey : '';
+    const branch = content.branch ?? null;
+    if (!repo || !workUnitKey || (branch !== null && typeof branch !== 'string')) {
+      throw new RepositoryCheckoutError('repository_checkout payload is invalid');
+    }
+    if (!containerRunsAsHostUser()) {
+      throw new RepositoryCheckoutError(
+        'clone checkouts need containers that run as the host uid, and this host does not',
+      );
+    }
+    const workgroupId = await workgroupForSession(session);
+    const workUnit = await workUnitForSession(session, workgroupId);
+    if (workUnit.key !== workUnitKey) {
+      throw new RepositoryCheckoutError(
+        "repository_checkout names a work unit that is not the requesting session's own",
+      );
+    }
+    lane = repositoryCheckoutLane(workgroupId, workUnit);
+    const result = await checkoutRepository({ workgroupId, workUnit, repo, branch, requestId });
+    log.info('Repository checkout', {
+      lane,
+      mode: effectiveCheckoutMode(),
+      repo,
+      dirName: result.dirName,
+      shape: result.shape,
+      created: result.created,
+      startedFrom: result.startedFrom ?? null,
+      objectsLinked: result.objectsLinked ?? null,
+      farmsLinked: result.farmsLinked,
+      ms: Date.now() - startedAt,
+      requestId,
+      sessionId: session.id,
+    });
+    await response(session, requestId, true, checkoutMessage(result), {
+      dirName: result.dirName,
+      ...(result.branch !== null ? { branch: result.branch } : {}),
+      created: result.created,
+      ...(result.created ? { startedFrom: result.startedFrom, objectsLinked: result.objectsLinked } : {}),
+      farmsLinked: result.farmsLinked,
+    });
+  } catch (error) {
+    const retryable = error instanceof RepositoryCheckoutError && error.retryable;
+    const message = error instanceof Error ? error.message : String(error);
+    log.warn('Repository checkout refused', {
+      lane,
+      repo,
+      requestId,
+      sessionId: session.id,
+      retryable,
+      error: message,
+    });
+    await response(
+      session,
+      requestId,
+      false,
+      `Repository checkout failed for ${repo || 'an unnamed repository'}: ${message}`,
+      {
+        retryable,
+      },
+    );
+  }
+}
+
+async function checkoutLaneForSession(session: Session): Promise<string> {
+  try {
+    const workgroupId = await workgroupForSession(session);
+    return repositoryCheckoutLane(workgroupId, await workUnitForSession(session, workgroupId));
+  } catch {
+    // The apply reaches the same failure and answers it; any lane of its own will do.
+    return `checkout:session:${session.id}`;
+  }
+}
+
+/** Delivery-action entry: the job runs on its work unit's lane, never the global one. */
+export async function dispatchRepositoryCheckout(
+  content: Record<string, unknown>,
+  session: Session,
+): Promise<DeliveryActionResult> {
+  return runRepositoryActionDetached(
+    'repository_checkout',
+    applyRepositoryCheckoutAction,
+    content,
+    session,
+    await checkoutLaneForSession(session),
+  );
 }
 
 function assertRepositoryRequestId(requestId: string): void {
@@ -738,6 +1428,13 @@ export async function applyRepositoryRefreshAction(content: Record<string, unkno
   assertRepositoryRequestId(requestId);
   const workgroupId = await workgroupForSession(session);
   try {
+    // Refresh never reads or fetches from an agent checkout (plan §5.5, rev
+    // 2.7); the host still validates reused checkouts and proves cleanup
+    // candidates, as it does for linked worktrees. A `checkout` field
+    // from a container that has not restarted since is ignored: a clone's .git
+    // is container-writable, and a planted commondir or object alternate there
+    // redirects a host fetch to another workgroup's repository. Containers
+    // fetch origin into the canonical themselves, as linked worktrees do.
     await refreshCanonicalFromLocalRefs({ workgroupId, repo });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -1166,12 +1863,14 @@ export async function applyRepositoryTransferAction(content: Record<string, unkn
   }
 }
 
-// All three run OFF the serial delivery drain (job-runner.ts): a publish's
+// All four run OFF the serial delivery drain (job-runner.ts): a publish's
 // quiescence now waits up to REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS for sibling
 // containers to reach a safe point, and no other session's outbound messages may
 // queue behind that. `repository_refresh` joins them because it contends for the
 // same per-repository flock that a detached transfer holds across its whole
-// quiescence — left inline it would simply move the delivery block.
+// quiescence — left inline it would simply move the delivery block. Publish,
+// refresh and transfer share the global lane; `repository_checkout` runs on its
+// work unit's own lane, so it never waits behind them (plan §5.2, M6).
 //
 // MAX_DELIVERY_ATTEMPTS no longer applies to these rows: the runner owns the
 // `delivered` row (deferAck) and gives each action exactly one attempt per host
@@ -1198,4 +1897,11 @@ registerDeliveryAction(
   (content, session) =>
     runRepositoryActionDetached('repository_transfer', applyRepositoryTransferAction, content, session),
   unguarded('same-workgroup exact linked-worktree move after fail-closed lifecycle checks'),
+);
+registerDeliveryAction(
+  'repository_checkout',
+  dispatchRepositoryCheckout,
+  unguarded(
+    "thread-scoped host clone of the workgroup canonical into the requester's own topic; host-local, no network or ambient credentials",
+  ),
 );

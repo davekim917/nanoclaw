@@ -27,6 +27,7 @@ import {
   _resetDependencyCacheForTesting,
   agentImageFingerprint,
   checkCompleteness,
+  checkLinkCompleteness,
   collectCacheGarbage,
   convertPackageDir,
   DEPENDENCY_CACHE_MAX_MUTATIONS_PER_PASS,
@@ -311,6 +312,154 @@ function decisionOps(): string[] {
     .mock.calls.filter(([message]) => message === 'dependency-cache: decision')
     .map(([, data]) => String((data as { op: string }).op));
 }
+
+// ── Phase 2: strict completeness for link-at-checkout (§5.7.5) ──────────────
+
+describe('strict completeness for link-at-checkout', () => {
+  const X64 = { os: 'linux', cpu: 'x64', libc: 'glibc' } as const;
+
+  function nativeParent(name: string, optionalDependencies: string[]): PkgSpec {
+    return {
+      key: `node_modules/${name}`,
+      name,
+      version: '1.0.0',
+      files: { 'index.js': `module.exports = '${name}';\n` },
+      lock: { optionalDependencies: Object.fromEntries(optionalDependencies.map((dep) => [dep, '0.25.0'])) },
+    };
+  }
+
+  function installedBuild(name: string, constraints: Record<string, string[]>): PkgSpec {
+    return {
+      key: `node_modules/${name}`,
+      name,
+      version: '0.25.0',
+      files: { 'bin/native': `${name}\n` },
+      lock: { optional: true, ...constraints },
+    };
+  }
+
+  /** A package dir whose package-lock also records `absent`, which its tree does not hold. */
+  function project(name: string, installed: PkgSpec[], absent: Record<string, Record<string, unknown>>): string {
+    return makeProject(path.join(tmpRoot, name, 'repo'), { pkgs: installed, extraLock: absent });
+  }
+
+  const strict = (pkgDir: string) => checkLinkCompleteness(pkgDir, path.join(pkgDir, 'node_modules'), X64);
+
+  it('refuses an entry missing an optional build this platform installs, which Phase 1 still adopts', () => {
+    const dir = project('class-c', [nativeParent('esbuild', ['@esbuild/linux-x64', '@esbuild/aix-ppc64']), ...PKGS], {
+      'node_modules/@esbuild/linux-x64': optionalEntry({ os: ['linux'], cpu: ['x64'] }),
+      'node_modules/@esbuild/aix-ppc64': optionalEntry({ os: ['aix'], cpu: ['ppc64'] }),
+    });
+    expect(checkCompleteness(dir, { os: 'linux', cpu: 'x64' }).complete).toBe(true);
+    expect(strict(dir)).toEqual({
+      complete: false,
+      reason: expect.stringContaining('node_modules/@esbuild/linux-x64'),
+    });
+  });
+
+  it('accepts optionals skipped for another platform, with a skipped dependent, or as the other libc build', () => {
+    const dir = project(
+      'accepted',
+      [
+        nativeParent('esbuild', ['@esbuild/linux-x64', '@esbuild/aix-ppc64']),
+        installedBuild('@esbuild/linux-x64', { os: ['linux'], cpu: ['x64'] }),
+        nativeParent('sharp', [
+          '@img/sharp-linux-x64',
+          '@img/sharp-linuxmusl-x64',
+          '@img/sharp-libvips-linuxmusl-x64',
+          '@img/sharp-wasm32',
+        ]),
+        installedBuild('@img/sharp-linux-x64', { os: ['linux'], cpu: ['x64'] }),
+        { key: 'node_modules/helper', name: 'helper', version: '2.0.0', files: { 'index.js': 'top-level helper\n' } },
+        ...PKGS,
+      ],
+      {
+        // Another platform's build: its own os/cpu exclude linux-x64.
+        'node_modules/@esbuild/aix-ppc64': optionalEntry({ os: ['aix'], cpu: ['ppc64'] }),
+        // The musl build, whose lockfile entry omits `libc` (run.md rev 2.1 class B).
+        'node_modules/@img/sharp-linuxmusl-x64': optionalEntry({ os: ['linux'], cpu: ['x64'] }),
+        // A musl build that does declare it.
+        'node_modules/@img/sharp-libvips-linuxmusl-x64': optionalEntry({ os: ['linux'], cpu: ['x64'], libc: ['musl'] }),
+        // A wasm32 build, and what only it depends on (run.md rev 2.1 class A).
+        'node_modules/@img/sharp-wasm32': {
+          ...optionalEntry({ cpu: ['wasm32'] }),
+          dependencies: { '@emnapi/runtime': '^1.2.0', helper: '^1.0.0' },
+        },
+        'node_modules/@emnapi/runtime': optionalEntry({}),
+        // Resolved from the wasm32 build only. The root's `helper` resolves to
+        // node_modules/helper, so matching dependents by name instead of by
+        // node resolution would wrongly count the installed root and refuse.
+        'node_modules/@img/sharp-wasm32/node_modules/helper': optionalEntry({}),
+      },
+    );
+    expect(strict(dir)).toEqual({ complete: true });
+  });
+
+  it('refuses a declared-glibc build, a cycle of absent optionals, and an optional nothing depends on', () => {
+    const cases: Array<[string, PkgSpec[], Record<string, Record<string, unknown>>, string]> = [
+      [
+        'glibc',
+        [nativeParent('rollup', ['@rollup/rollup-linux-x64-gnu']), ...PKGS],
+        {
+          'node_modules/@rollup/rollup-linux-x64-gnu': optionalEntry({ os: ['linux'], cpu: ['x64'], libc: ['glibc'] }),
+        },
+        'node_modules/@rollup/rollup-linux-x64-gnu',
+      ],
+      [
+        'cycle',
+        PKGS,
+        {
+          'node_modules/cycle-a': { ...optionalEntry({}), dependencies: { 'cycle-b': '^1.0.0' } },
+          'node_modules/cycle-b': { ...optionalEntry({}), dependencies: { 'cycle-a': '^1.0.0' } },
+        },
+        'node_modules/cycle-',
+      ],
+      ['orphan', PKGS, { 'node_modules/lonely': optionalEntry({}) }, 'node_modules/lonely'],
+    ];
+    for (const [name, installed, absent, offender] of cases) {
+      expect(strict(project(name, installed, absent)), name).toEqual({
+        complete: false,
+        reason: expect.stringContaining(offender),
+      });
+    }
+  });
+
+  it('link refuses an entry lacking a build this platform installs, and still links a complete one', () => {
+    // linkPackageDir checks against this host's own platform.
+    const cpu = process.arch;
+    const withNative = [nativeParent('esbuild', [`@esbuild/linux-${cpu}`]), ...PKGS];
+    const absent = { [`node_modules/@esbuild/linux-${cpu}`]: optionalEntry({ os: ['linux'], cpu: [cpu] }) };
+    const src = makeProject(path.join(tmpRoot, 'topic-a', 'repo'), { pkgs: withNative, extraLock: absent });
+    expect(processPackageDir(startPass(), 'wg-a', src)).toBe('adopted');
+    const bare = path.join(tmpRoot, 'topic-b', 'repo');
+    writeManifests(bare, { pkgs: withNative, extraLock: absent });
+    const pass = startPass();
+
+    expect(linkPackageDir(pass, 'wg-a', bare)).toBe('incomplete');
+
+    expect(fs.existsSync(path.join(bare, 'node_modules'))).toBe(false);
+    expect(tempNamesUnder(bare)).toEqual([]);
+    expect(pass.counters.linked).toBe(0);
+    expect(log.warn).toHaveBeenCalledWith(
+      'dependency-cache: link refused, entry lacks a package this platform installs',
+      expect.objectContaining({ path: bare, reason: expect.stringContaining(`@esbuild/linux-${cpu}`) }),
+    );
+
+    const complete = makeProject(path.join(tmpRoot, 'topic-c', 'repo'));
+    expect(processPackageDir(startPass(), 'wg-a', complete)).toBe('adopted');
+    const bareComplete = path.join(tmpRoot, 'topic-d', 'repo');
+    writeManifests(bareComplete);
+    expect(linkPackageDir(startPass(), 'wg-a', bareComplete)).toBe('linked');
+    expectFarmOf(bareComplete, path.join(cacheRoot, 'wg-a', keyOf(bareComplete)));
+  });
+
+  it('a key with no entry is not a warning unless the key was quarantined', () => {
+    const bare = path.join(tmpRoot, 'topic-e', 'repo');
+    writeManifests(bare);
+    expect(linkPackageDir(startPass(), 'wg-a', bare)).toBe('no-entry');
+    expect(log.warn).not.toHaveBeenCalledWith('dependency-cache: no verified entry for key', expect.anything());
+  });
+});
 
 // ── P1 acceptance ───────────────────────────────────────────────────────────
 
