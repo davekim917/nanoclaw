@@ -22,7 +22,8 @@
 #                                             # risk-scoped repos' only merge path: merge-check, then gh pr merge on its exit 0 alone
 #   codex-review.sh audit                     # a merged PR against merge-check's rules as of its merge; exit 28 = it bypassed the gate
 #   codex-review.sh receipt --head <sha> --outcome approve|changes --reviewer "<model + runtime>" --body-file <file>
-#                                             # post a substitute review's durable receipt for exactly that head
+#                                             # post a substitute review's receipt for exactly that head — --reviewer
+#                                             # must start with an allowed model ID (reviewer-models.txt)
 #
 # Exit codes, one contract across commands (0 and 3 are the originals):
 #   0   pass; verdict printed; merge allowed. For merge-check, only `merge=allowed`
@@ -35,7 +36,8 @@
 #   22  request: a review of this head was already requested
 #   23  request: REVIEW_ROUND_CAP reached — stop, summarize, escalate or reframe
 #   24  merge-check: merging this head is not allowed — CI is not green on it, it has
-#       neither a clean Codex review nor an approving substitute receipt, or it is a
+#       neither a clean Codex review nor an approving substitute receipt, the
+#       approving receipt's reviewer isn't a model in reviewer-models.txt, or it is a
 #       fix PR whose body has no Fixes-PR line
 #   25  merge-check: the base branch moved while the check ran, or could not be
 #       re-read, so the verdict may be stale — re-run merge-check
@@ -43,6 +45,8 @@
 #       evidence rules decide this merge; never chain it into `gh pr merge`
 #   27  merge: merge-check allowed the head, but `gh pr merge` did not merge it
 #   28  audit: merge-check would have refused this PR at its merge — a gate bypass
+#   `merge` passes merge-check's 1, 24, 25 (after one re-check) and 26 through unchanged,
+#   and merges only on its 0.
 #
 # `gate` is the rule the advisory detector never was: three rounds on ONE
 # finding class (or one seam, severity not falling) is a design defect at a
