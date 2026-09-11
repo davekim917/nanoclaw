@@ -11,7 +11,10 @@
  * it the same way the poll-loop process does (a direct DB write) rather than
  * via any in-memory helper, so they exercise the real process boundary.
  */
-import { describe, it, test, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 
 import { getInboundDb, getOutboundDb } from '../mailbox/sqlite/connection.js';
 import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
@@ -189,6 +192,24 @@ describe('send_message MCP tool — final-output envelope normalization', () => 
     expect(getUndeliveredMessages()).toHaveLength(0);
   });
 
+  it('rejects a stray closing tag after the envelope instead of keeping it as literal text', async () => {
+    // Regression: the envelope regex used to be greedy (`[\s\S]*` before the
+    // trailing `</message>$` anchor), so it backtracked all the way to the
+    // LAST `</message>` in the string. That silently folded the extra
+    // `</message>` — and anything between the two closing tags — into the
+    // "stripped" text instead of recognizing the input isn't one complete,
+    // top-level envelope. It must now fail closed the same way an unclosed
+    // envelope does, matching only the first closing tag.
+    const result = await sendMessage.handler({
+      to: 'peer',
+      text: '<message to="here">a</message> b </message>',
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('one complete');
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
   it('applies the same normalization to edit_message text', async () => {
     await sendMessage.handler({ to: 'peer', text: 'original reply' });
     const [original] = getUndeliveredMessages();
@@ -226,6 +247,10 @@ describe('send_file MCP tool — caption envelope normalization', () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('multiple routing message envelopes');
+    // Regression: this error text used to be shared verbatim with
+    // send_message/edit_message ("Use one send_message or edit_message call
+    // per message"), which is wrong advice for a send_file caller.
+    expect(result.content[0].text).toContain('Use one send_file call per message');
     expect(getUndeliveredMessages()).toHaveLength(0);
   });
 
@@ -238,6 +263,64 @@ describe('send_file MCP tool — caption envelope normalization', () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('File not found');
+  });
+
+  it('strips a complete envelope from the caption end-to-end, through a successful delivery', async () => {
+    // Only the rejection paths above stop before writeMessageOut. This
+    // exercises the full success path: a real file under an allowed prefix,
+    // the caption stripped of its envelope, and the host's delivery ack
+    // (written directly to `delivered`, the same table delivery.ts writes)
+    // resolving the handler's awaitDeliveryAck wait.
+    //
+    // The handler stages the outgoing file under the hardcoded /workspace/
+    // outbox/<id>/ — that path only exists inside the agent container, not
+    // on the host this test runs on, so mkdirSync/writeFileSync are spied
+    // for just that prefix and left real for everything else (reading the
+    // real source file below, under an allowed /tmp/ prefix).
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-send-file-'));
+    const filePath = path.join(tmpDir, 'report.txt');
+    fs.writeFileSync(filePath, 'file contents');
+
+    const realMkdirSync = fs.mkdirSync.bind(fs);
+    const realWriteFileSync = fs.writeFileSync.bind(fs);
+    const mkdirSpy = spyOn(fs, 'mkdirSync').mockImplementation((target, opts) => {
+      if (typeof target === 'string' && target.startsWith('/workspace/outbox')) return undefined;
+      return realMkdirSync(target, opts as never);
+    });
+    const writeFileSpy = spyOn(fs, 'writeFileSync').mockImplementation((target, data, opts) => {
+      if (typeof target === 'string' && target.startsWith('/workspace/outbox')) return undefined;
+      return realWriteFileSync(target, data as never, opts as never);
+    });
+
+    try {
+      const handlerPromise = sendFile.handler({
+        to: 'peer',
+        path: filePath,
+        text: '<message to="here">a</message>',
+      });
+
+      // Poll for the outbound row the handler writes before it starts
+      // awaiting the delivery ack.
+      let out = getUndeliveredMessages();
+      for (let i = 0; i < 100 && out.length === 0; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        out = getUndeliveredMessages();
+      }
+      expect(out).toHaveLength(1);
+      expect(JSON.parse(out[0].content)).toMatchObject({ text: 'a', files: ['report.txt'] });
+
+      getInboundDb()
+        .prepare("INSERT INTO delivered (message_out_id, status, delivered_at) VALUES (?, 'delivered', ?)")
+        .run(out[0].id, new Date().toISOString());
+
+      const result = await handlerPromise;
+      expect(result.isError).toBeUndefined();
+      expect(result.content[0].text).toContain('delivered to peer');
+    } finally {
+      mkdirSpy.mockRestore();
+      writeFileSpy.mockRestore();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });
 

@@ -94,9 +94,19 @@ function destinationList(): string {
 // text. Recognize only one complete, top-level routing envelope: XML in prose
 // or code blocks remains user content.
 const ROUTING_MESSAGE_OPENER_RE = /<message\s+to="([^"]*)"\s*>/g;
-const ROUTING_MESSAGE_ENVELOPE_RE = /^\s*<message\s+to="[^"]*"\s*>([\s\S]*)<\/message>\s*$/;
+// The inner group is "anything that isn't the start of a closing tag", so it
+// terminates at the FIRST `</message>` rather than backtracking to the last
+// one. A plain `[\s\S]*` here is greedy and, combined with the trailing `$`
+// anchor, is forced to match through to the final `</message>` in the
+// string — so a caption like `<message to="x">a</message> b </message>`
+// would silently keep the literal `</message> b ` inside the stripped text
+// instead of being rejected as not-one-complete-envelope.
+const ROUTING_MESSAGE_ENVELOPE_RE = /^\s*<message\s+to="[^"]*"\s*>((?:(?!<\/message>)[\s\S])*)<\/message>\s*$/;
 
-function normalizeToolMessageText(text: string): { text: string } | { error: string } {
+function normalizeToolMessageText(
+  text: string,
+  callerTool: 'send_message' | 'send_file' | 'edit_message',
+): { text: string } | { error: string } {
   // An inline example or fenced code block does not begin with an envelope,
   // so preserve it exactly. `<message>` without a routing attribute is also
   // ordinary XML, not a NanoClaw routing instruction.
@@ -107,9 +117,7 @@ function normalizeToolMessageText(text: string): { text: string } | { error: str
     const destinations = [...new Set(openers.map((opener) => opener[1]))];
     const detail = destinations.length > 1 ? ` to multiple destinations (${destinations.join(', ')})` : '';
     return {
-      error:
-        `text contains multiple routing message envelopes${detail}. ` +
-        'Use one send_message or edit_message call per message.',
+      error: `text contains multiple routing message envelopes${detail}. ` + `Use one ${callerTool} call per message.`,
     };
   }
 
@@ -206,7 +214,7 @@ export const sendMessage: McpToolDefinition = {
   async handler(args) {
     const rawText = args.text as string;
     if (!rawText) return err('text is required');
-    const normalized = normalizeToolMessageText(rawText);
+    const normalized = normalizeToolMessageText(rawText, 'send_message');
     if ('error' in normalized) return err(normalized.error);
     const text = normalized.text;
     if (!text) return err('text is required');
@@ -257,7 +265,7 @@ export const sendFile: McpToolDefinition = {
     // `<message to="...">` text. Rejects before anything is staged.
     let caption = '';
     if (args.text) {
-      const normalized = normalizeToolMessageText(args.text as string);
+      const normalized = normalizeToolMessageText(args.text as string, 'send_file');
       if ('error' in normalized) return err(normalized.error);
       caption = normalized.text;
     }
@@ -368,7 +376,7 @@ export const editMessage: McpToolDefinition = {
     const seq = Number(args.messageId);
     const rawText = args.text as string;
     if (!seq || !rawText) return err('messageId and text are required');
-    const normalized = normalizeToolMessageText(rawText);
+    const normalized = normalizeToolMessageText(rawText, 'edit_message');
     if ('error' in normalized) return err(normalized.error);
     const text = normalized.text;
     if (!text) return err('messageId and text are required');

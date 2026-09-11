@@ -586,6 +586,17 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
     // channels we merely sit in stays silent — no row, no DB writes.
     if (!isMention) return;
     const mgId = `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    // Adapter tells us whether this is a DM or a group chat — prefer the
+    // explicit message.isGroup, then the isDM inverse. When BOTH are
+    // unknown (an adapter that declares neither), default to group/mention
+    // mode, not DM-style: downstream, is_group=0 resolves to
+    // engage_pattern='.' (always-engage on every message), so defaulting
+    // unknown to DM-style would make an actual group chat on an
+    // undeclared adapter reply to everything in the channel unprompted.
+    // Defaulting to group/mention mode instead means the worst case is a
+    // real DM that needs an explicit mention until the operator notices
+    // and flips it — the safe direction to be wrong in.
+    const isGroupChat = event.message.isGroup ?? (event.isDM === undefined ? true : event.isDM === false);
     mg = {
       id: mgId,
       channel_type: event.channelType,
@@ -594,10 +605,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
       // would absorb every sibling instance's traffic.
       instance: event.instance ?? event.channelType,
       name: null,
-      // Adapter tells us whether this is a DM or a group chat — prefer the
-      // explicit message.isGroup, fall back to the isDM inverse. When
-      // unknown, default to 0 (DM-style) to preserve legacy behavior.
-      is_group: (event.message.isGroup ?? event.isDM === false) ? 1 : 0,
+      is_group: isGroupChat ? 1 : 0,
       // Declared adapters get their declared policy (DM vs group context).
       // Fork policy for UNDECLARED adapters: public-by-default — any sender
       // in the channel can mention the bot without a separate sender-approval
@@ -605,11 +613,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
       // faithful fallback would be 'request_approval'. Operator can lock
       // individual channels down later via messaging_groups.unknown_sender_policy.
       unknown_sender_policy: hasDeclaredChannelDefaults(event.instance ?? event.channelType, event.channelType)
-        ? resolveUnknownSenderPolicy(
-            event.instance ?? event.channelType,
-            (event.message.isGroup ?? event.isDM === false) === true,
-            event.channelType,
-          )
+        ? resolveUnknownSenderPolicy(event.instance ?? event.channelType, isGroupChat, event.channelType)
         : 'public',
       denied_at: null,
       created_at: new Date().toISOString(),
