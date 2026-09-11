@@ -88,6 +88,31 @@ function checkoutMode(): CheckoutMode {
   return process.env.NANOCLAW_CHECKOUT_MODE === 'clone' ? 'clone' : 'worktree';
 }
 
+// A `clone`-mode checkout is a full `git clone` with its own independent
+// `.git/config` (src/modules/repository-workspaces/index.ts:872-902,
+// `stageClone`) — it never inherits the canonical's `core.hooksPath`. A
+// `worktree`-mode checkout is a linked worktree sharing the canonical's
+// `.git` (createLinkedWorktree below), so it DOES inherit `core.hooksPath`,
+// which is how a scan-policy repo's host-managed pre-push hook
+// (src/managed-git-hooks.ts) actually gets scanned. Under global `clone`
+// mode this container has no other signal for "is this a scan-policy repo"
+// — it cannot import src/managed-git-hooks.ts (container/agent-runner is a
+// separate Bun package tree, no shared modules with host src/, per
+// CLAUDE.md's Module System section) — so the name check is duplicated
+// here, kept in exact lockstep with the host's
+// `isScanPolicyRepositoryName` (src/managed-git-hooks.ts:77-78: `name ===
+// 'wiki'`). #666-follow-up: a wiki checkout must always be a linked
+// worktree, whatever NANOCLAW_CHECKOUT_MODE says, or its pushes go
+// unscanned.
+function isScanPolicyRepositoryName(name: string): boolean {
+  return name === 'wiki';
+}
+
+/** Per-repo effective mode: a scan-policy repo is pinned to `worktree` regardless of the global setting. */
+function effectiveCheckoutModeFor(repo: string): CheckoutMode {
+  return isScanPolicyRepositoryName(repo) ? 'worktree' : checkoutMode();
+}
+
 function runGitAt(cwd: string, args: string[], timeoutMs = 120_000): string {
   return execFileSync('git', args, {
     cwd,
@@ -1254,18 +1279,24 @@ export const createWorktreeTool: McpToolDefinition = {
     // mode only a clone's refusal stops here: a linked, empty or unrecognized
     // primary keeps today's handling in createLinkedWorktree, which validates a
     // linked checkout and recovers one a crash left as an empty directory.
+    //
+    // `mode` is per-repo, not the raw global `checkoutMode()`: a scan-policy
+    // repo (isScanPolicyRepositoryName above) is pinned to `worktree`
+    // regardless of NANOCLAW_CHECKOUT_MODE, so its pushes always go through
+    // a linked worktree sharing the canonical's `core.hooksPath` — a `clone`
+    // checkout has its own independent git config with no hooksPath set at
+    // all, and would never be scanned (#666 follow-up).
+    const mode = effectiveCheckoutModeFor(repo);
     let existing: ResolvedCheckout | null = null;
     try {
       existing = resolveCheckout(context, branch ?? null);
     } catch (error) {
       const refused =
-        checkoutMode() === 'clone'
-          ? !(error instanceof CheckoutNotFoundError)
-          : error instanceof CloneCheckoutRefusedError;
+        mode === 'clone' ? !(error instanceof CheckoutNotFoundError) : error instanceof CloneCheckoutRefusedError;
       if (refused) return err(error instanceof Error ? error.message : String(error));
     }
 
-    if (existing?.shape === 'clone' && checkoutMode() === 'worktree') {
+    if (existing?.shape === 'clone' && mode === 'worktree') {
       // A clone-shaped checkout left over from a clone-mode period is served
       // as-is (R10, P2-18) — worktree-mode creation below only knows how to
       // create or reuse a LINKED worktree at the primary position, and has
@@ -1273,7 +1304,7 @@ export const createWorktreeTool: McpToolDefinition = {
       return ok(`Checkout ready at ${existing.path} on branch ${existing.branch} (existing clone; left untouched)`);
     }
 
-    if (checkoutMode() === 'clone' && existing?.shape !== 'linked') {
+    if (mode === 'clone' && existing?.shape !== 'linked') {
       try {
         return await createCloneWorktree(context, branch ?? null);
       } catch (error) {

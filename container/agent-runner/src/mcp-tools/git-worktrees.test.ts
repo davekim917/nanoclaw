@@ -112,6 +112,19 @@ describe('topic-linked worktree topology', () => {
     writeFileSync(join(state, 'repository.lock'), '');
   }
 
+  /** Same shape as seedCanonical, for a second repository name — used by the #666-follow-up scan-policy tests. */
+  function seedNamedCanonical(name: string): string {
+    const named = join(dataDir, 'repositories', 'wg-a', name);
+    execFileSync('git', ['clone', '-q', remote, named]);
+    git(named, ['remote', 'set-head', 'origin', '--auto']);
+    git(named, ['config', 'gc.auto', '0']);
+    const state = join(dataDir, 'repository-state', 'wg-a', name);
+    mkdirSync(state, { recursive: true });
+    writeFileSync(join(state, 'origin.json'), JSON.stringify({ origin: remote, repositoryId: `${remote}#${name}` }));
+    writeFileSync(join(state, 'repository.lock'), '');
+    return named;
+  }
+
   function useTopic(name: string, workUnitKey: string): string {
     const topic = join(dataDir, 'v2-topics', 'wg-a', name, 'worktrees');
     mkdirSync(topic, { recursive: true });
@@ -1147,6 +1160,85 @@ describe('topic-linked worktree topology', () => {
       const cloneText = createWorktreeTool.tool.description ?? '';
       expect(cloneText).toContain('/workspace/worktrees/<repo>@<branch>');
       expect(cloneText).toContain('Any number of threads may hold the same branch at once');
+    });
+
+    test('clone mode plus a wiki repo still gives a linked worktree, with the canonical hooksPath visible (#666 follow-up)', async () => {
+      // A `clone`-mode checkout is a full clone with its own independent
+      // .git/config (stageClone, host src/modules/repository-workspaces/
+      // index.ts:872-902) — it never inherits the canonical's
+      // core.hooksPath, so a wiki push through it would go unscanned. A
+      // scan-policy repo (isScanPolicyRepositoryName, git-worktrees.ts) must
+      // always get a linked worktree instead, whatever the global mode, so
+      // the host-managed hooks mount (whose eligibility is driven by
+      // core.hooksPath on the shared canonical .git/config) still applies.
+      const wikiCanonical = seedNamedCanonical('wiki');
+      // Simulate what the host's managed-git-hooks refresh does at startup
+      // for a scan-policy repo: point its core.hooksPath at the managed,
+      // read-only-mounted scan directory.
+      const managedHooksDir = join(dataDir, 'managed-git-hooks', 'scan');
+      git(wikiCanonical, ['config', 'core.hooksPath', managedHooksDir]);
+
+      process.env.NANOCLAW_CHECKOUT_MODE = 'clone';
+      const { outbound } = initTestSessionDb();
+      delete process.env.NANOCLAW_REPOSITORY_ACTION_TRANSPORT;
+      try {
+        const response = await createWorktreeTool.handler({ repo: 'wiki' });
+        expect(response.isError).toBeFalsy();
+
+        const worktree = join(firstTopic, 'wiki');
+        // Linked worktree, not a clone: `.git` is a file (a gitdir pointer),
+        // and it shares the canonical's own `.git` — exactly what a clone
+        // (its own independent .git directory) would never do.
+        expect(lstatSync(join(worktree, '.git')).isFile()).toBe(true);
+        expect(git(worktree, ['rev-parse', '--path-format=absolute', '--git-common-dir'])).toBe(
+          join(wikiCanonical, '.git'),
+        );
+        // The managed hooks mount's eligibility signal (core.hooksPath) is
+        // therefore visible from inside the checkout too — this is the
+        // actual mechanism that lets the host-managed pre-push hook apply.
+        expect(git(worktree, ['config', '--get', 'core.hooksPath'])).toBe(managedHooksDir);
+
+        // No repository_checkout host round-trip was ever requested — the
+        // scan-policy override took the linked-worktree path directly,
+        // never createCloneWorktree.
+        const actions = (outbound.query('SELECT content FROM messages_out').all() as { content: string }[]).map(
+          (row) => JSON.parse(row.content).action,
+        );
+        expect(actions).not.toContain('repository_checkout');
+      } finally {
+        closeSessionDb();
+      }
+    });
+
+    test('clone mode plus an ordinary code repo still gives a clone (#666 follow-up: unaffected)', async () => {
+      process.env.NANOCLAW_CHECKOUT_MODE = 'clone';
+      const { inbound, outbound } = initTestSessionDb();
+      delete process.env.NANOCLAW_REPOSITORY_ACTION_TRANSPORT;
+      try {
+        const seen = new Set<string>();
+        const branch = 'still-a-clone-branch';
+        const dirName = checkoutDirName('proj', branch);
+        const clonePath = join(firstTopic, dirName);
+        createHostClone(remote, clonePath, { repo: 'proj', branch, startedFrom: 'origin-head' });
+
+        const callPromise = createWorktreeTool.handler({ repo: 'proj', branch });
+        // A non-scan-policy repo still goes through the host repository_checkout
+        // round-trip — the scan-policy override only pins 'wiki'.
+        const request = await waitForOutboundAction(outbound, 'repository_checkout', seen);
+        writeRepositoryActionResponse(inbound, request.requestId, {
+          ok: true,
+          dirName,
+          branch,
+          created: true,
+          startedFrom: 'origin-head',
+        });
+        const response = await callPromise;
+        expect(response.isError).toBeFalsy();
+        // A clone has its own independent `.git` directory, never a gitdir pointer file.
+        expect(lstatSync(join(clonePath, '.git')).isDirectory()).toBe(true);
+      } finally {
+        closeSessionDb();
+      }
     });
 
     test('worktree mode creates linked worktrees exactly as today', async () => {
