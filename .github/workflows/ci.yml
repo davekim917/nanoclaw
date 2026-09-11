@@ -66,9 +66,13 @@ jobs:
         run: pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
 
       # Everything except the three drift tests, which belong to `bookkeeping`.
-      # See DRIFT_TESTS in vitest.config.ts.
+      # See DRIFT_TESTS in vitest.config.ts. `--coverage` adds instrumentation
+      # overhead but runs the exact same tests — vitest.config.ts's
+      # `coverage.include` already scopes it to the host half of risk:high
+      # (scripts/risk-globs.ts), so this isn't a second, slower run of the
+      # whole suite. Feeds scripts/check-risk-coverage.ts below.
       - name: Host tests
-        run: pnpm exec vitest run
+        run: pnpm exec vitest run --coverage
         env:
           VITEST_LANE: correctness
 
@@ -92,7 +96,40 @@ jobs:
         # hermeticity tripwire preload (issue #305). bunfig.toml would be the
         # natural home for it, but that file is a byte-for-byte upstream port
         # pinned by src/mailbox-seam-upstream.test.ts.
-        run: bun run test
+        #
+        # `--coverage`/`--coverage-reporter` are extra args after `bun run
+        # test`'s own `--`, not a bunfig.toml edit (see the pin note above).
+        # lcov feeds scripts/check-risk-coverage.ts; text keeps the per-file
+        # breakdown visible in this step's own log.
+        run: bun run test -- --coverage --coverage-reporter=lcov --coverage-reporter=text
+
+      # Feeds scripts/check-risk-coverage.ts against the committed
+      # coverage-risk-baseline.json (docs/specs/risk-based-review/plan.md,
+      # "Tests on risky paths"): a ratchet, not a fixed floor — it fails only
+      # when a risk file drops more than 0.5 points below ITS OWN prior
+      # measurement, or a new risk file has no tests at all. Runs from the
+      # repo root against both reports produced above, in the same job so no
+      # artifact hand-off is needed for the gate itself (the upload below is
+      # only for regenerating the baseline from a real CI run — see that
+      # step's comment).
+      - name: Risk-path coverage ratchet
+        run: pnpm exec tsx scripts/check-risk-coverage.ts
+
+      # scripts/check-risk-coverage.ts --write regenerates
+      # coverage-risk-baseline.json, but the memory-constrained host this repo
+      # is normally developed on must never run the full vitest suite with
+      # coverage (docs/specs/risk-based-review/plan.md), so an honest baseline
+      # comes from HERE: download this artifact, then run `--write` locally
+      # against the downloaded reports instead of a live run.
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: risk-coverage-reports
+          path: |
+            coverage/coverage-summary.json
+            container/agent-runner/coverage/lcov.info
+          retention-days: 14
 
   bookkeeping:
     runs-on: ubuntu-latest

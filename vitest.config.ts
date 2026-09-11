@@ -1,4 +1,11 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
+import { parse as parseYaml } from 'yaml';
 import { defaultExclude, defineConfig } from 'vitest/config';
+
+import { globsForRiskHigh } from './scripts/review-outcomes.js';
+import { hostRiskGlobs } from './scripts/risk-globs.js';
 import skillsConfig from './vitest.skills.config.js';
 
 /**
@@ -32,6 +39,23 @@ const DRIFT_TESTS = [
 ] as const;
 
 const lane = process.env.VITEST_LANE;
+
+/**
+ * Coverage instrumentation is scoped to the risk:high paths this vitest run can
+ * actually import — `.ts` under `src/`/`scripts/` (see scripts/risk-globs.ts for the
+ * host/container split; container/agent-runner is Bun-only and covered separately by
+ * `bun test --coverage`). Derived at run time from `.github/labeler.yml` rather than
+ * hardcoded, so the coverage ratchet's scope can never silently drift from the review
+ * gate's scope (docs/specs/risk-based-review/plan.md, "Tests on risky paths").
+ *
+ * This list is ONLY read when `--coverage` is passed (see `coverage.include` below);
+ * it has no effect, and costs one extra file read, on a plain `vitest run`.
+ */
+function readHostRiskGlobs(): string[] {
+  const labelerPath = path.join(import.meta.dirname, '.github', 'labeler.yml');
+  const config = parseYaml(fs.readFileSync(labelerPath, 'utf8')) as Record<string, unknown>;
+  return hostRiskGlobs(globsForRiskHigh(config));
+}
 
 export default defineConfig({
   test: {
@@ -75,5 +99,22 @@ export default defineConfig({
     // Tests within a file still run concurrently; only cross-file parallelism
     // is off. Measured cost: ~9 minutes for the full suite.
     fileParallelism: false,
+    // `coverage.enabled` defaults to false — this block only takes effect when a
+    // caller passes `--coverage` (scripts/check-risk-coverage.ts, the `pnpm run
+    // test:coverage:risk` script, or CI's coverage step), so a plain `vitest run`
+    // stays exactly as fast as before this block existed.
+    coverage: {
+      provider: 'v8',
+      // Setting `include` is what makes vitest report every matching file, even one
+      // no test ever touched, at 0% (vitest docs, CoverageOptions.include: "By
+      // default only files covered by tests are included" — the opposite is true
+      // once `include` is set). Verified against a real run: scoping `include` to
+      // this repo's risk:high host globs and running only two unrelated test files
+      // still produced entries for every risk file, not just the ones those two
+      // files happened to import.
+      include: readHostRiskGlobs(),
+      reporter: ['text', 'json-summary'],
+      reportsDirectory: 'coverage',
+    },
   },
 });
