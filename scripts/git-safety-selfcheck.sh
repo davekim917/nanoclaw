@@ -83,9 +83,41 @@ EOF
   chmod +x "$NCDIR/node_modules/.bin/tsx"
 }
 
-run_safety() { # extra env assignments as "$@", e.g. run_safety GIT_SAFETY_GROUPS_COMMIT=dry
-  OUT=$(env "$@" NANOCLAW_DIR="$NCDIR" GIT_SAFETY_DIR="$BACKUPS" HOME="$HOME2" bash "$REAL" 2>&1)
+run_script() { # <script-path> extra env assignments as "$@..."
+  local script=$1; shift
+  OUT=$(env "$@" NANOCLAW_DIR="$NCDIR" GIT_SAFETY_DIR="$BACKUPS" HOME="$HOME2" bash "$script" 2>&1)
   RC=$?
+}
+run_safety() { # extra env assignments as "$@", e.g. run_safety GIT_SAFETY_GROUPS_COMMIT=dry
+  run_script "$REAL" "$@"
+}
+
+# make_mutant_git_safety <old-literal> <new-literal> -> prints a mutant
+# script path, exactly one literal substitution applied to a full copy of
+# the REAL scripts/git-safety.sh (#628 item 9 mutation evidence). Fails
+# loudly (via python's assert) if <old-literal> isn't found verbatim,
+# rather than silently producing a byte-identical, unmutated copy — a
+# fixture that stopped reproducing a bug is worse than no fixture. Lives
+# in its own directory with lib/secret-scan.sh SYMLINKED alongside it
+# (never copied — no drift risk) so the mutant's own
+# `${SCRIPT_DIR}/lib/secret-scan.sh` source line resolves exactly like the
+# real script's does, relative to itself.
+make_mutant_git_safety() {
+  local old=$1 new=$2 mutdir
+  mutdir=$(mktemp -d)
+  FIXTURE_DIRS+=("$mutdir")
+  mkdir -p "$mutdir/lib"
+  ln -s "$(dirname "$REAL")/lib/secret-scan.sh" "$mutdir/lib/secret-scan.sh"
+  OLDSTR="$old" NEWSTR="$new" SRC="$REAL" DST="$mutdir/git-safety.sh" python3 -c "
+import os
+src = open(os.environ['SRC']).read()
+old = os.environ['OLDSTR']
+new = os.environ['NEWSTR']
+assert old in src, 'mutation target text not found in git-safety.sh — source has drifted from this fixture'
+open(os.environ['DST'], 'w').write(src.replace(old, new, 1))
+"
+  chmod +x "$mutdir/git-safety.sh"
+  echo "$mutdir/git-safety.sh"
 }
 
 latest_snapshot() { ls -td "$BACKUPS"/*/ 2>/dev/null | head -1; }
@@ -126,7 +158,7 @@ secret_case() { # label, secret-line
   printf '{"a":2}\n%s\n' "$2" > "$G/foo/container.json"
   run_safety
   case "$OUT" in
-    *"look like a secret"*) ok "secret gate: $1" ;;
+    *"held for secret-shaped content"*) ok "secret gate: $1" ;;
     *) bad "secret gate missed: $1" "line=[$2] out=$OUT" ;;
   esac
   # Refused means nothing pushed.
@@ -156,7 +188,7 @@ git -C "$G" config color.ui always
 printf '{"a":2}\nexport API_KEY=abcdefghijklmnop123456\n' > "$G/foo/container.json"
 run_safety
 case "$OUT" in
-  *"look like a secret"*) ok "secret gate not blinded by color.ui=always" ;;
+  *"held for secret-shaped content"*) ok "secret gate not blinded by color.ui=always" ;;
   *) bad "color.ui=always defeated the scan" "$OUT" ;;
 esac
 
@@ -173,7 +205,7 @@ printf '{"a":2}\n' > "$G/foo/container.json"
 printf 'binary junk: \x80\x81\x82 export SLACK_APP_TOKEN=xapp-1-A0123-4567890123-abcdefabcdefabcdefabcdefabcdef\n' >> "$G/foo/container.json"
 run_safety LANG=en_US.UTF-8 LC_ALL=
 case "$OUT" in
-  *"look like a secret"*) ok "secret gate not blinded by a non-UTF-8 byte on the same line" ;;
+  *"held for secret-shaped content"*) ok "secret gate not blinded by a non-UTF-8 byte on the same line" ;;
   *) bad "a non-UTF-8 byte blinded the scan to an adjacent real secret" "$OUT" ;;
 esac
 if git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1; then
@@ -797,7 +829,7 @@ new_fixture
 printf '{"a":2}\ndesk-configurationabcdefghijklmnopqrstuvwxyz\n' > "$G/foo/container.json"
 run_safety
 case "$OUT" in
-  *"look like a secret"*) bad "false positive: 'desk-...' mid-word match on sk-" "$OUT" ;;
+  *"held for secret-shaped content"*) bad "false positive: 'desk-...' mid-word match on sk-" "$OUT" ;;
   *) ok "'sk-' requires a word boundary — 'desk-...' is not flagged" ;;
 esac
 git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1 \
@@ -837,7 +869,7 @@ git -C "$G" push -q origin HEAD:main
 printf 'ordinary planning notes, nothing secret here\n' >> "$G/foo/tasks/sk-learn-migration-plan-2026.md"
 run_safety
 case "$OUT" in
-  *"look like a secret"*) bad "a '+++ b/…sk-learn-….md' header was scanned as content" "$OUT" ;;
+  *"held for secret-shaped content"*) bad "a '+++ b/…sk-learn-….md' header was scanned as content" "$OUT" ;;
   *) ok "a '+++ b/…sk-learn-….md' header is recognized as a header, not scanned" ;;
 esac
 git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1 \
@@ -856,7 +888,7 @@ git -C "$G" push -q origin HEAD:main
 printf 'ordinary content, nothing secret here\n' >> "$G/foo/café.md"
 run_safety
 case "$OUT" in
-  *"look like a secret"*) bad "a quoted-path '+++ \"b/café.md\"' header was scanned as content" "$OUT" ;;
+  *"held for secret-shaped content"*) bad "a quoted-path '+++ \"b/café.md\"' header was scanned as content" "$OUT" ;;
   *) ok "a quoted-path header is recognized as a header, not scanned" ;;
 esac
 git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1 \
@@ -879,6 +911,220 @@ untracked_excluded_case ".netrc"       ".netrc"        "machine example.com logi
 untracked_excluded_case "SSH key"      "id_rsa"        "-----BEGIN OPENSSH PRIVATE KEY-----"
 untracked_excluded_case "prod.env"     "prod.env"      "SECRET=abc"
 untracked_excluded_case "secrets.yaml" "secrets.yaml"  "password: abc"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #628 item 9: per-file hold, alert-once, and the line-hash allowlist.
+# review-658 measured 32 of 430 real groups commits (7.4%) would be refused
+# WHOLE under the old single-tier gate — mostly TypeScript type annotations
+# like `token: string`. These cases exercise the replacement: a match holds
+# only its own file (everything else still commits), an alert fires once
+# per (path, line-hash) — not every night — and a reviewed line can only be
+# released by a COMMITTED entry in groups/.secret-scan-allow.
+# ═══════════════════════════════════════════════════════════════════════════
+GHP_LINE='export GITHUB_TOKEN=ghp_16C7e42F292c6912E7710c838347Ae178B4aXYZ123'
+allow_hash() { printf '%s\t%s' "$1" "$2" | sha256sum | cut -d' ' -f1; } # <path> <line> -> same key git-safety.sh/secret-scan-allow.sh use
+held_state_file() { printf '%s/.git-safety-state/secret-scan-held.tsv' "$BACKUPS"; }
+
+# ─ Case 1: a false positive (review-658's own TypeScript shape) holds only
+# its own file; a genuinely clean, unrelated file still commits ───────────
+new_fixture
+mkdir -p "$G/bar"
+echo placeholder > "$G/bar/types.ts"
+git -C "$G" add bar/types.ts
+git -C "$G" commit -qm "add bar/types.ts" >/dev/null
+git -C "$G" push -q origin HEAD:main
+echo 'clean edit' >> "$G/foo/container.json"
+echo 'token: string' >> "$G/bar/types.ts"
+run_safety
+case "$OUT" in
+  *"1 file(s) held for secret-shaped content"*) ok "case 1: exactly one file held (the false positive), named in the output" ;;
+  *) bad "case 1: wrong hold reporting" "$OUT" ;;
+esac
+CONTAINER_TIP=$(git --git-dir="$REMOTE" show host-snapshot:foo/container.json 2>/dev/null)
+case "$CONTAINER_TIP" in
+  *"clean edit"*) ok "case 1: the unrelated clean file still committed" ;;
+  *) bad "case 1: the clean file's edit did not commit" "content=[$CONTAINER_TIP]" ;;
+esac
+TYPES_TIP=$(git --git-dir="$REMOTE" show host-snapshot:bar/types.ts 2>/dev/null)
+[ "$TYPES_TIP" = "placeholder" ] && ok "case 1: the held file's snapshot content is HEAD's version, not the pending false-positive edit" \
+  || bad "case 1: the held file's edit leaked into the snapshot" "content=[$TYPES_TIP]"
+grep -q "token: string" "$G/bar/types.ts" 2>/dev/null && ok "case 1: the pending edit is still on disk in the working tree — nothing was lost" \
+  || bad "case 1: the pending edit vanished from the working tree" ""
+
+# Mutation evidence: the reset-to-HEAD step is what actually implements
+# containment. Disable ONLY that one line and replay the identical fixture —
+# detection still fires (still reported "held"), but the content leaks.
+MUTANT=$(make_mutant_git_safety \
+  'GIT_INDEX_FILE="$TMPIDX" git -C "$G" reset -q HEAD -- "$path" 2>>"$ERR"' \
+  'true # MUTATED (#628 item 9 case 1): detected as offending, never reset back to HEAD')
+new_fixture
+mkdir -p "$G/bar"
+echo placeholder > "$G/bar/types.ts"
+git -C "$G" add bar/types.ts
+git -C "$G" commit -qm "add bar/types.ts" >/dev/null
+git -C "$G" push -q origin HEAD:main
+echo 'clean edit' >> "$G/foo/container.json"
+echo 'token: string' >> "$G/bar/types.ts"
+run_script "$MUTANT"
+MUTANT_TYPES=$(git --git-dir="$REMOTE" show host-snapshot:bar/types.ts 2>/dev/null)
+case "$MUTANT_TYPES" in
+  *"token: string"*) ok "case 1 mutation evidence: without the reset-to-HEAD step, the 'held' file's edit leaks into the snapshot anyway — the reset is what actually implements containment, not just the detection" ;;
+  *) bad "case 1 mutation evidence: mutant unexpectedly still contained the edit (fixture doesn't isolate the reset step)" "content=[$MUTANT_TYPES]" ;;
+esac
+
+# ─ Case 2: a brand-new hold exits non-zero exactly once ──────────────────
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_safety
+[ "$RC" -ne 0 ] && ok "case 2: a brand-new hold exits non-zero" || bad "case 2: a new hold did not exit non-zero" "$OUT"
+case "$OUT" in
+  *"new, changed, or unresolved 7+ days"*) ok "case 2: the alert names why (new/changed/stale)" ;;
+  *) bad "case 2: no alert reason in the output" "$OUT" ;;
+esac
+
+MUTANT=$(make_mutant_git_safety \
+  'first_seen="$now_iso"; last_alerted="$now_iso"; alert_worthy=1' \
+  'first_seen="$now_iso"; last_alerted="$now_iso"; alert_worthy=0 # MUTATED (#628 item 9 case 2): a brand-new hold never alerts')
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_script "$MUTANT"
+[ "$RC" -eq 0 ] && ok "case 2 mutation evidence: without alert_worthy=1 on a new hold, the run exits 0 — a real new secret would silently never alert anyone" \
+  || bad "case 2 mutation evidence: mutant unexpectedly still exited non-zero" "$OUT"
+
+# ─ Case 3: the SAME unchanged hold exits 0 on the very next run ──────────
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_safety
+[ "$RC" -ne 0 ] || bad "case 3 setup: the first run should have alerted (new hold)" "$OUT"
+run_safety
+[ "$RC" -eq 0 ] && ok "case 3: an unchanged hold exits 0 on the next run" || bad "case 3: an unchanged hold re-alerted" "$OUT"
+case "$OUT" in
+  *"1 file(s) held for secret-shaped content"*) ok "case 3: still names the still-pending held file even though it doesn't alert" ;;
+  *) bad "case 3: no stderr line naming the still-pending hold" "$OUT" ;;
+esac
+
+MUTANT=$(make_mutant_git_safety \
+  'if [ $((now_epoch - first_epoch)) -ge "$HOLD_REALERT_SECONDS" ] && [ $((now_epoch - last_epoch)) -ge "$HOLD_REALERT_SECONDS" ]; then' \
+  'if true; then # MUTATED (#628 item 9 case 3): every existing hold re-alerts every run, 7-day gate removed')
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_script "$MUTANT"
+[ "$RC" -ne 0 ] || bad "case 3 mutation setup: the first mutant run should still alert (new hold)" "$OUT"
+run_script "$MUTANT"
+[ "$RC" -ne 0 ] && ok "case 3 mutation evidence: without the 7-day gate, an UNCHANGED hold re-alerts on the very next run — reproduces the nightly alert-loop this item fixes" \
+  || bad "case 3 mutation evidence: mutant unexpectedly stayed quiet on an unchanged hold" "$OUT"
+
+# ─ Case 4: a COMMITTED allowlist entry releases a hold; an UNCOMMITTED one doesn't ─
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_safety
+[ "$RC" -ne 0 ] || bad "case 4 setup: the first run should have held and alerted" "$OUT"
+HASH=$(allow_hash "foo/container.json" "$GHP_LINE")
+printf 'foo/container.json\t%s\ttest allow\n' "$HASH" > "$G/.secret-scan-allow"
+run_safety
+CONTAINER_TIP=$(git --git-dir="$REMOTE" show host-snapshot:foo/container.json 2>/dev/null)
+case "$CONTAINER_TIP" in
+  *ghp_*) bad "case 4: an UNCOMMITTED .secret-scan-allow edit released the hold" "content=[$CONTAINER_TIP]" ;;
+  *) ok "case 4: an uncommitted .secret-scan-allow edit does NOT release the hold" ;;
+esac
+git -C "$G" add .secret-scan-allow
+git -C "$G" commit -qm "allow reviewed line" >/dev/null
+run_safety
+CONTAINER_TIP=$(git --git-dir="$REMOTE" show host-snapshot:foo/container.json 2>/dev/null)
+case "$CONTAINER_TIP" in
+  *ghp_*) ok "case 4: a COMMITTED .secret-scan-allow entry releases the hold" ;;
+  *) bad "case 4: a committed allowlist entry did not release the hold" "content=[$CONTAINER_TIP]" ;;
+esac
+[ -s "$(held_state_file)" ] && bad "case 4: the released entry is still in the held-state file" "$(cat "$(held_state_file)")" \
+  || ok "case 4: the released entry dropped out of the held-state file"
+
+MUTANT=$(make_mutant_git_safety \
+  'raw=$(git -C "$g" show HEAD:.secret-scan-allow 2>/dev/null) || return 0' \
+  'raw=$(cat "$g/.secret-scan-allow" 2>/dev/null) || return 0 # MUTATED (#628 item 9 case 4): reads the WORKING TREE, not committed HEAD')
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_script "$MUTANT"
+HASH=$(allow_hash "foo/container.json" "$GHP_LINE")
+printf 'foo/container.json\t%s\ttest allow\n' "$HASH" > "$G/.secret-scan-allow"
+run_script "$MUTANT"
+MUTANT_TIP=$(git --git-dir="$REMOTE" show host-snapshot:foo/container.json 2>/dev/null)
+case "$MUTANT_TIP" in
+  *ghp_*) ok "case 4 mutation evidence: reading the allowlist from the WORKING TREE releases the hold from a merely UNCOMMITTED edit — reproduces the bug the HEAD-only read prevents" ;;
+  *) bad "case 4 mutation evidence: mutant unexpectedly did not release the hold" "content=[$MUTANT_TIP]" ;;
+esac
+
+# ─ Case 5: a real ghp_ token stays held, never committed ─────────────────
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_safety
+CONTAINER_TIP=$(git --git-dir="$REMOTE" show host-snapshot:foo/container.json 2>/dev/null || echo "<no snapshot>")
+case "$CONTAINER_TIP" in
+  *ghp_*) bad "case 5: a real ghp_ token was committed to host-snapshot" "content=[$CONTAINER_TIP]" ;;
+  *) ok "case 5: a real ghp_ token stays held, never committed" ;;
+esac
+
+# ─ Case 6: a hold unresolved and unalerted for 7+ days re-alerts, then goes quiet again ─
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_safety
+[ "$RC" -ne 0 ] || bad "case 6 setup: the first run should have alerted" "$OUT"
+STATE_FILE=$(held_state_file)
+HASH=$(cut -f2 "$STATE_FILE")
+STALE=$(date -u -d '8 days ago' +%Y-%m-%dT%H:%M:%SZ)
+printf 'foo/container.json\t%s\t%s\t%s\n' "$HASH" "$STALE" "$STALE" > "$STATE_FILE"
+run_safety
+[ "$RC" -ne 0 ] && ok "case 6: an 8-day-old, unresolved and unalerted-in-8-days hold re-alerts" \
+  || bad "case 6: an 8-day-stale hold did not re-alert" "$OUT"
+run_safety
+[ "$RC" -eq 0 ] && ok "case 6: immediately after the 7-day re-alert, the very next run is quiet again (last_alerted just moved to now)" \
+  || bad "case 6: re-alerted twice with no further time passing" "$OUT"
+
+# ─ Case 7: a corrupt groups/.secret-scan-allow fails closed (holds stay) ─
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_safety
+[ "$RC" -ne 0 ] || bad "case 7 setup: the first run should have alerted" "$OUT"
+HASH=$(allow_hash "foo/container.json" "$GHP_LINE")
+printf 'foo/container.json\t%s\n' "$HASH" > "$G/.secret-scan-allow" # malformed: missing the "reason" column
+git -C "$G" add .secret-scan-allow
+git -C "$G" commit -qm "malformed allowlist" >/dev/null
+run_safety
+case "$OUT" in
+  *"malformed"*"treating as empty"*) ok "case 7: a malformed allowlist is diagnosed and treated as empty" ;;
+  *) bad "case 7: no malformed-allowlist diagnostic in the output" "$OUT" ;;
+esac
+CONTAINER_TIP=$(git --git-dir="$REMOTE" show host-snapshot:foo/container.json 2>/dev/null || echo "<no snapshot>")
+case "$CONTAINER_TIP" in
+  *ghp_*) bad "case 7: a corrupt allowlist released the hold anyway (fail-OPEN)" "content=[$CONTAINER_TIP]" ;;
+  *) ok "case 7: a corrupt allowlist fails closed — the hold stays" ;;
+esac
+
+# ─ Case 8: a held file, later deleted from the working tree, is held too ─
+# A second, unrelated clean file changes too, so run 1 actually produces a
+# snapshot commit at all — if the held path were the ONLY pending change,
+# holding it leaves nothing to commit and no snapshot exists yet either
+# way, which would make this case vacuous.
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+mkdir -p "$G/bar"
+echo placeholder > "$G/bar/types.ts"
+git -C "$G" add bar/types.ts
+git -C "$G" commit -qm "add bar/types.ts" >/dev/null
+git -C "$G" push -q origin HEAD:main
+echo 'unrelated clean edit' >> "$G/bar/types.ts"
+run_safety
+[ "$RC" -ne 0 ] || bad "case 8 setup: the first run should have held and alerted" "$OUT"
+rm -f "$G/foo/container.json"
+run_safety
+git --git-dir="$REMOTE" cat-file -e host-snapshot:foo/container.json 2>&1 \
+  && ok "case 8: a held file's later deletion never reaches the snapshot as a deletion" \
+  || bad "case 8: the held file's deletion reached the snapshot" ""
+CONTAINER_TIP=$(git --git-dir="$REMOTE" show host-snapshot:foo/container.json 2>/dev/null)
+if [ "$CONTAINER_TIP" = '{"a":1}' ]; then
+  ok "case 8: the snapshot keeps the file's original committed content — no secret, and not the deleted state"
+else
+  bad "case 8: unexpected snapshot content for the deleted-and-held path" "content=[$CONTAINER_TIP]"
+fi
 
 echo
 [ "$FAILED" -eq 0 ] && echo "git-safety-selfcheck: all checks passed" || echo "git-safety-selfcheck: FAILURES"

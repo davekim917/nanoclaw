@@ -32,9 +32,25 @@
 #      are reported, never committed — a file missing from disk stays in the
 #      snapshot commit at its last known-good content. Sensitive filenames
 #      (.env*, *.pem, *.p8, *.key, credentials*, profiles.yml) are never
-#      staged even when tracked; they are reported instead. A secret-shaped
-#      added line, or any binary change, refuses the whole commit before
-#      anything is staged.
+#      staged even when tracked; they are reported instead. Any binary
+#      change still refuses the WHOLE commit before anything is staged. A
+#      SECRET_RE match in a file's added lines instead HOLDS ONLY THAT FILE
+#      (#628 item 9: a single false positive used to refuse everything —
+#      review-658 measured 32 of 430 groups commits, 7.4%, would be refused
+#      whole under the old gate): the held path is reset back to HEAD's
+#      content in the scratch index (never the working tree, so nothing on
+#      disk is lost) and every other file's change still commits. A held
+#      line's hash is recorded in $GIT_SAFETY_DIR/.git-safety-state/
+#      secret-scan-held.tsv (mode 0600) so a nightly run alerts (exit
+#      nonzero) only for a NEW hold, a hold whose offending line CHANGED, or
+#      one that has sat unresolved and unalerted for 7+ days — an unchanged
+#      pending hold exits 0 and prints one stderr line naming the held
+#      paths. An operator releases a specific reviewed line via
+#      scripts/secret-scan-allow.sh <path>, which prints ready-to-append,
+#      MASKED lines for groups/.secret-scan-allow (a tracked TSV keyed on
+#      sha256(path + line) — read only from that file's COMMITTED HEAD
+#      version, never the working tree, so an uncommitted edit releases
+#      nothing).
 #
 # Silent on success (a pending deletion still gets its own DM even on an
 # otherwise clean run — see below). On FAILURE it exits 1 and does NOT DM
@@ -61,6 +77,8 @@
 #                                 (default host-snapshot)
 #   GIT_SAFETY_MAX_UNTRACKED_BYTES  size cap for untracked files captured in a
 #                                 snapshot tarball (default 104857600 = 100MB)
+#   GIT_SAFETY_STATE_DIR          per-file secret-scan hold state directory
+#                                 (default $GIT_SAFETY_DIR/.git-safety-state)
 #
 # Manual run:  bash scripts/git-safety.sh
 # Restore:     see MANIFEST.txt in the snapshot directory. groups/ config
@@ -90,6 +108,14 @@ GROUPS_MODE="${GIT_SAFETY_GROUPS_COMMIT:-apply}"
 GROUPS_DIR="$NANOCLAW_DIR/groups"
 SNAPSHOT_BRANCH="${GIT_SAFETY_SNAPSHOT_BRANCH:-host-snapshot}"
 MAX_UNTRACKED_BYTES="${GIT_SAFETY_MAX_UNTRACKED_BYTES:-104857600}"
+STATE_DIR="${GIT_SAFETY_STATE_DIR:-$SNAP_ROOT/.git-safety-state}"
+HELD_STATE_FILE="$STATE_DIR/secret-scan-held.tsv"
+# #628 item 9: a hold that has sat unresolved (not allowlisted, not fixed)
+# for at least this long re-alerts even with no change, so it can't be
+# forgotten forever — but only if it also hasn't been ALERTED in that long,
+# so a fresh hold doesn't immediately re-fire a second time at day 7 for no
+# reason.
+HOLD_REALERT_SECONDS=$((7 * 24 * 3600))
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 OUT="$SNAP_ROOT/$TS"
 MAN="$OUT/MANIFEST.txt"
@@ -144,6 +170,53 @@ excluded_snapshot_name() { # <basename> -> 0 if it must never enter a tarball
     .netrc|id_rsa*|id_ed25519*|id_ecdsa*|profiles.yml|secrets.yaml|secrets.yml) return 0 ;;
     *) return 1 ;;
   esac
+}
+# ── #628 item 9: per-file hold / alert-once / line-hash allowlist ──────────
+iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+epoch_of() { # <ISO 8601 UTC timestamp> -> epoch seconds, or empty on a bad value
+  date -u -d "$1" +%s 2>/dev/null
+}
+# line_hash <path> <line-text> — sha256(path + TAB + line), exactly the key
+# groups/.secret-scan-allow and secret-scan-held.tsv both use. Including
+# the path in the hashed input means the identical line text in a
+# different file is never accidentally exempt.
+line_hash() {
+  printf '%s\t%s' "$1" "$2" | sha256sum | cut -d' ' -f1
+}
+# read_secret_scan_allowlist <groups-repo> -> the TSV content of
+# groups/.secret-scan-allow at groups' own committed HEAD (never the
+# working tree — an uncommitted edit must not release a hold), or empty on
+# a missing file. Malformed content (any non-comment, non-blank line
+# without exactly path/sha256/reason, tab-separated) is ALSO reported as
+# empty, printing one stderr line — a parse error fails closed (existing
+# holds stay held) rather than silently exempting nothing, or worse,
+# everything.
+read_secret_scan_allowlist() {
+  local g=$1 raw
+  raw=$(git -C "$g" show HEAD:.secret-scan-allow 2>/dev/null) || return 0
+  local line
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    case "$line" in '#'*) continue ;; esac
+    local field_count
+    field_count=$(awk -F'\t' '{print NF}' <<<"$line")
+    if [ "$field_count" -ne 3 ]; then
+      echo "git-safety: groups/.secret-scan-allow is malformed at HEAD (not path<TAB>sha256<TAB>reason) — treating as empty, holds stay (fail closed)" >&2
+      return 0
+    fi
+  done <<<"$raw"
+  printf '%s' "$raw"
+}
+# is_allowlisted <path> <hash> <allowlist-tsv-content>
+is_allowlisted() {
+  local path=$1 hash=$2 tsv=$3 line row_path row_hash
+  while IFS=$'\t' read -r row_path row_hash _; do
+    [ -z "$row_path" ] && continue
+    if [ "$row_path" = "$path" ] && [ "$row_hash" = "$hash" ]; then
+      return 0
+    fi
+  done <<<"$tsv"
+  return 1
 }
 verify_bundle() { # <bundle-path> <source-repo> — real integrity check
   # `git bundle verify` only checks that the bundle's prerequisite commits
@@ -424,48 +497,161 @@ _commit_groups_impl() { # <scratch index file>
     GROUPS_RESULT="refused (binary change)"; return
   fi
 
-  local diff_text
-  # --output-indicator-new marks every added line with
-  # SECRET_SCAN_NEW_INDICATOR (a byte that can never start a real source
-  # line) instead of the default '+' — secret_scan_hits() filters on that
-  # marker, so a real added line whose content happens to start with
-  # "++ " (which used to read identically to a `+++ ` file-header line
-  # under the old plain '+' scheme) can no longer be mistaken for one; see
-  # lib/secret-scan.sh's comment on SECRET_SCAN_NEW_INDICATOR.
-  # --src-prefix/--dst-prefix are pinned too, out of caution: they don't
-  # affect indicator-marked content lines, only the (untouched, no longer
-  # scanned for) `+++`/`---` header lines themselves, but pinning them
-  # keeps this diff's output shape predictable regardless of a user's
-  # diff.noprefix/diff.mnemonicPrefix config.
-  diff_text=$(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --no-color --text --src-prefix=a/ --dst-prefix=b/ \
-    --output-indicator-new="$SECRET_SCAN_NEW_INDICATOR" --output-indicator-old=- --output-indicator-context=' ' \
-    HEAD 2>>"$ERR")
-  if [ -z "$diff_text" ]; then
+  local diff_probe
+  diff_probe=$(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --name-only HEAD 2>>"$ERR")
+  if [ -z "$diff_probe" ]; then
     GROUPS_RESULT="nothing pending"; return
   fi
 
-  local hits hits_rc
-  hits=$(secret_scan_hits "$diff_text")
-  hits_rc=$?
-  if [ "$hits_rc" -ne 0 ]; then
-    # secret_scan_hits/secret_scan_count returns nonzero (and echoes
-    # NOTHING) only on a grep failure it can't recover from — never read
-    # that as "0 hits"; the selftest above already guards the common
-    # cases, this is the last-resort net for a genuinely transient one.
-    FAILURES+=("groups: secret scan itself failed — refused to commit any pending change"); GROUPS_RESULT="failed (secret scan)"; return
+  # ── #628 item 9: per-file secret-shaped-content hold ──────────────────────
+  # A SECRET_RE match in a file's own added lines holds ONLY that file
+  # (reset back to HEAD's content in the scratch index) instead of refusing
+  # the whole commit — every other changed file still commits. Scanned per
+  # file (not as one combined diff) because a hold is a per-FILE decision:
+  # committing everything else requires knowing exactly which files to
+  # leave staged and which to reset.
+  local allow_tsv
+  allow_tsv=$(read_secret_scan_allowlist "$G")
+
+  local changed_paths=() path
+  while IFS= read -r path; do [ -n "$path" ] && changed_paths+=("$path"); done <<<"$diff_probe"
+
+  local held_paths=() held_diffs="" new_state_rows=()
+  for path in "${changed_paths[@]}"; do
+    local file_diff added extract_rc matches scan_rc
+    # Same options as the old combined diff (comment preserved below this
+    # loop, at the write-tree call, for why each one is pinned) — just
+    # scoped to one path via a pathspec.
+    file_diff=$(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --no-color --text --src-prefix=a/ --dst-prefix=b/ \
+      --output-indicator-new="$SECRET_SCAN_NEW_INDICATOR" --output-indicator-old=- --output-indicator-context=' ' \
+      HEAD -- "$path" 2>>"$ERR")
+    added=$(secret_scan_extract_added "$file_diff")
+    extract_rc=$?
+    if [ "$extract_rc" -ge 2 ]; then
+      FAILURES+=("groups: secret scan extraction itself failed on $path — refused to commit any pending change"); GROUPS_RESULT="failed (secret scan)"; return
+    fi
+    matches=$(secret_scan_matching_lines "$added" "$SECRET_RE" insensitive)
+    scan_rc=$?
+    if [ "$scan_rc" -ne 0 ]; then
+      # Same fail-closed contract as the old single-tier gate: a genuine
+      # scan failure (grep exit >=2 — not a match, an actual tool failure)
+      # refuses the WHOLE commit, never just holds one file. A false
+      # positive (the scan RAN and found something) is the only case that
+      # gets the new per-file treatment below.
+      FAILURES+=("groups: secret scan itself failed on $path — refused to commit any pending change"); GROUPS_RESULT="failed (secret scan)"; return
+    fi
+    [ -z "$matches" ] && continue
+
+    local offending=0 line hash
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      hash=$(line_hash "$path" "$line")
+      is_allowlisted "$path" "$hash" "$allow_tsv" && continue
+      offending=1
+      new_state_rows+=("$path"$'\t'"$hash")
+    done <<<"$matches"
+
+    if [ "$offending" -eq 1 ]; then
+      held_paths+=("$path")
+      held_diffs+="$file_diff"$'\n'
+      # Reset ONLY this path back to HEAD in the SCRATCH index — never the
+      # working tree (git reset's default; no --hard, no path in the
+      # working-tree arguments). Nothing on disk is touched or lost.
+      GIT_INDEX_FILE="$TMPIDX" git -C "$G" reset -q HEAD -- "$path" 2>>"$ERR"
+    fi
+  done
+
+  if [ "${#held_paths[@]}" -gt 0 ]; then
+    printf '%s' "$held_diffs" > "$OUT/groups-held.patch" 2>/dev/null
+    local held_list; held_list=$(printf '%s, ' "${held_paths[@]}"); held_list=${held_list%, }
+    say "groups: ${#held_paths[@]} file(s) held for secret-shaped content: $held_list — diff saved to $OUT/groups-held.patch; release a reviewed line via scripts/secret-scan-allow.sh <path>"
+    # Always one stderr line naming the held paths, whether or not this run
+    # alerts for them — an unchanged, still-pending hold must still be
+    # visible in the journal even when it doesn't escalate.
+    echo "git-safety: ${#held_paths[@]} file(s) held for secret-shaped content: $held_list" >&2
   fi
-  if [ "$hits" -gt 0 ]; then
-    printf '%s\n' "$diff_text" > "$OUT/groups-refused.patch" 2>/dev/null
-    FAILURES+=("groups: $hits added line(s) look like a secret — refused to commit any pending change; scanned diff saved to $OUT/groups-refused.patch")
-    GROUPS_RESULT="refused (secret-shaped content)"; return
+
+  # State is rewritten every run (not just when something is currently
+  # held): $new_state_rows is exactly this run's live offending set, so an
+  # entry from a PREVIOUS run that isn't in it anymore — its line changed,
+  # was removed, or the allowlist released it — is simply not written back
+  # here, which IS how it drops out of the state (#628 item 9 §2). Skipped
+  # entirely in dry mode, which must not mutate anything persistent.
+  if [ "$GROUPS_MODE" != "dry" ]; then
+    local now_iso now_epoch
+    now_iso=$(iso_now)
+    now_epoch=$(epoch_of "$now_iso")
+    declare -A OLD_FIRST_SEEN=() OLD_LAST_ALERTED=()
+    if [ -s "$HELD_STATE_FILE" ]; then
+      local sp sh sfirst slast
+      while IFS=$'\t' read -r sp sh sfirst slast; do
+        [ -n "$sp" ] || continue
+        OLD_FIRST_SEEN["$sp"$'\t'"$sh"]="$sfirst"
+        OLD_LAST_ALERTED["$sp"$'\t'"$sh"]="$slast"
+      done < "$HELD_STATE_FILE"
+    fi
+
+    local alert_worthy=0 new_state_lines=() key
+    if [ "${#new_state_rows[@]}" -gt 0 ]; then
+      while IFS= read -r key; do
+        [ -n "$key" ] || continue
+        local row_path row_hash first_seen last_alerted
+        row_path=${key%%$'\t'*}
+        row_hash=${key#*$'\t'}
+        first_seen="${OLD_FIRST_SEEN[$key]:-}"
+        last_alerted="${OLD_LAST_ALERTED[$key]:-}"
+        if [ -z "$first_seen" ]; then
+          # A brand-new (path, line-hash) pair: either a genuinely new
+          # hold, or the same file's offending line CHANGED (a changed
+          # line hashes differently, so it looks new here too) — both
+          # cases alert, per spec.
+          first_seen="$now_iso"; last_alerted="$now_iso"; alert_worthy=1
+        else
+          local first_epoch last_epoch
+          first_epoch=$(epoch_of "$first_seen"); first_epoch=${first_epoch:-$now_epoch}
+          last_epoch=$(epoch_of "${last_alerted:-$first_seen}"); last_epoch=${last_epoch:-$now_epoch}
+          if [ $((now_epoch - first_epoch)) -ge "$HOLD_REALERT_SECONDS" ] && [ $((now_epoch - last_epoch)) -ge "$HOLD_REALERT_SECONDS" ]; then
+            last_alerted="$now_iso"; alert_worthy=1
+          fi
+        fi
+        new_state_lines+=("$row_path"$'\t'"$row_hash"$'\t'"$first_seen"$'\t'"$last_alerted")
+      done < <(printf '%s\n' "${new_state_rows[@]}" | sort -u)
+    fi
+
+    mkdir -p "$STATE_DIR"
+    local state_tmp; state_tmp=$(mktemp "$STATE_DIR/.secret-scan-held.XXXXXX")
+    CLEANUP_PATHS+=("$state_tmp")
+    if [ "${#new_state_lines[@]}" -gt 0 ]; then
+      printf '%s\n' "${new_state_lines[@]}" > "$state_tmp"
+    else
+      : > "$state_tmp"
+    fi
+    chmod 600 "$state_tmp"
+    mv -f "$state_tmp" "$HELD_STATE_FILE"
+
+    if [ "$alert_worthy" -eq 1 ]; then
+      FAILURES+=("groups: a secret-shaped hold is new, changed, or unresolved 7+ days — see $OUT/groups-held.patch, or release a reviewed line via scripts/secret-scan-allow.sh <path>")
+    fi
   fi
 
   local n folders
   n=$(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --name-only HEAD | wc -l)
   folders=$(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --name-only HEAD | awk -F/ '{print $1}' | sort -u | tr '\n' ' ')
 
+  if [ "$n" -eq 0 ]; then
+    # Every changed path was held; nothing else is pending. Never write a
+    # no-op commit identical to HEAD just because a hold consumed
+    # everything that was staged.
+    GROUPS_RESULT="nothing committed — all $((${#held_paths[@]})) pending change(s) held for secret-shaped content"
+    return
+  fi
+
   if [ "$GROUPS_MODE" = "dry" ]; then
-    GROUPS_RESULT="dry run: would commit $n tracked change(s) in: $folders"
+    if [ "${#held_paths[@]}" -gt 0 ]; then
+      GROUPS_RESULT="dry run: would hold ${#held_paths[@]} file(s) for secret-shaped content; would commit $n other tracked change(s) in: $folders"
+    else
+      GROUPS_RESULT="dry run: would commit $n tracked change(s) in: $folders"
+    fi
     return
   fi
 
@@ -525,7 +711,11 @@ these files in place and nothing else commits them."
     rc=$?
     if [ "$rc" -eq 0 ]; then
       say "groups: snapshot $commit_hash built from HEAD=$groups_head, pushed to $SNAPSHOT_BRANCH"
-      GROUPS_RESULT="committed $n tracked change(s) in: $folders; pushed to $SNAPSHOT_BRANCH"
+      if [ "${#held_paths[@]}" -gt 0 ]; then
+        GROUPS_RESULT="committed $n tracked change(s) in: $folders; pushed to $SNAPSHOT_BRANCH; ${#held_paths[@]} file(s) held for secret-shaped content"
+      else
+        GROUPS_RESULT="committed $n tracked change(s) in: $folders; pushed to $SNAPSHOT_BRANCH"
+      fi
       return
     fi
     [ "$attempt" -eq 1 ] || break

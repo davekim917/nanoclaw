@@ -1,6 +1,8 @@
 # Shared secret-shaped-content detector. Sourced by scripts/git-safety.sh
-# (groups/ snapshot, single-tier: refuses the WHOLE commit before anything
-# is staged) and scripts/wiki-pre-push-hook.sh (two-tier BLOCK/WARN: a
+# (groups/ snapshot: a SECRET_RE match in a file's pending changes holds
+# only that file — see secret_scan_matching_lines below and #628 item 9 —
+# every other file's changes still commit) and scripts/wiki-pre-push-hook.sh
+# (two-tier BLOCK/WARN: a
 # `pre-push` hook the host installs into
 # data/managed-git-hooks/nanoclaw-secret-patterns.sh — a byte-for-byte copy
 # of this file, made at host startup by src/managed-git-hooks.ts, so the
@@ -182,6 +184,54 @@ secret_scan_count() {
   return 0
 }
 
+# secret_scan_matching_lines <extracted-lines-text> <regex> <sensitive|insensitive>
+# Like secret_scan_count, but emits each MATCHING line's raw original
+# content (the leading SECRET_SCAN_NEW_INDICATOR byte stripped) instead of
+# a count — one line per match, in order. Used by a caller that needs to
+# identify or hash individual offending lines (git-safety.sh's per-file
+# hold, #628 item 9), not just decide pass/refuse.
+#
+# Matching itself goes through the SAME allowlisted-literal substitution
+# as secret_scan_count — a line whose only secret-shaped content is the
+# allowlisted literal must not be reported here either, for the same
+# reason secret_scan_count doesn't count it as a hit — but the line TEXT
+# this emits is always the ORIGINAL, unsubstituted content: a caller
+# hashing this line to check its own line-hash allowlist needs the line's
+# real content, not a copy with the allowlisted literal blanked out.
+# Matches are located by line NUMBER in the (allowlist-filtered) text and
+# then re-read from the ORIGINAL text at that same line number — the two
+# texts have identical line counts and ordering, since the substitution
+# only ever replaces a literal substring with a same-line single space,
+# never adds or removes a line.
+#
+# Same fail-closed contract as secret_scan_count: echoes nothing and
+# returns 1 on any grep failure (exit >=2, e.g. a malformed regex); zero
+# matching lines is a normal, successful (return 0) empty result, not a
+# failure — a caller must not conflate the two.
+secret_scan_matching_lines() {
+  local text="$1" re="$2" case_mode="$3"
+  local -a grep_opts=(-n -E)
+  [ "$case_mode" = insensitive ] && grep_opts+=(-i)
+  local filtered="$text"
+  if [ -n "${SECRET_SCAN_ALLOWLISTED_LITERAL:-}" ]; then
+    filtered="${text//"$SECRET_SCAN_ALLOWLISTED_LITERAL"/ }"
+  fi
+  local hits rc
+  hits=$(LC_ALL=C grep "${grep_opts[@]}" "$re" <<<"$filtered")
+  rc=$?
+  if [ "$rc" -ge 2 ]; then
+    return 1
+  fi
+  [ -z "$hits" ] && return 0
+  local lineno original
+  while IFS=: read -r lineno _; do
+    [ -n "$lineno" ] || continue
+    original=$(sed -n "${lineno}p" <<<"$text")
+    printf '%s\n' "${original#"$SECRET_SCAN_NEW_INDICATOR"}"
+  done <<<"$hits"
+  return 0
+}
+
 # secret_scan_selftest
 # Validates the pattern set is usable at all: the extraction/counting
 # functions exist, and every pattern this file exports is non-empty and
@@ -196,7 +246,7 @@ secret_scan_count() {
 # variants failed exactly this way before this function existed).
 secret_scan_selftest() {
   local fn
-  for fn in secret_scan_extract_added secret_scan_count; do
+  for fn in secret_scan_extract_added secret_scan_count secret_scan_matching_lines; do
     if ! declare -F "$fn" >/dev/null 2>&1; then
       echo "secret-scan selftest: missing function $fn" >&2
       return 1
@@ -269,6 +319,15 @@ secret_scan_selftest() {
   re_hits=$(secret_scan_count "$(secret_scan_extract_added "$re_synthetic_text")" "$SECRET_RE" insensitive)
   if [ "$?" -ne 0 ] || [ "${re_hits:-0}" -eq 0 ]; then
     echo "secret-scan selftest: SECRET_RE positive control did not match a synthetic secret-shaped line" >&2
+    return 1
+  fi
+  # secret_scan_matching_lines' own positive control (#628 item 9): must
+  # return exactly the synthetic line above, indicator stripped — not just
+  # a nonzero count the way secret_scan_count's control above only proves.
+  local matched_lines
+  matched_lines=$(secret_scan_matching_lines "$(secret_scan_extract_added "$re_synthetic_text")" "$SECRET_RE" insensitive)
+  if [ "$?" -ne 0 ] || [ "$matched_lines" != "${re_synthetic_text#"$SECRET_SCAN_NEW_INDICATOR"}" ]; then
+    echo "secret-scan selftest: secret_scan_matching_lines positive control did not return the expected line" >&2
     return 1
   fi
   return 0
