@@ -3,24 +3,15 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Every docker call in this file goes through this mock. The fingerprint is
-// injected into each pass directly, so only the fingerprint test and the sweep
-// suite (which exercises the production default) ever reach it.
+// injected into each pass directly, so only the fingerprint test ever reaches
+// it. Tests that run the real sweep, and need its central-DB inventory, live
+// in storage-manager.test.ts, which owns that setup.
 const mockExecFileSync = vi.fn();
 vi.mock('child_process', () => ({
   execFileSync: (...args: unknown[]) => mockExecFileSync(...args),
-}));
-
-const centralDbMock = vi.hoisted(() => ({ current: null as null | { db: Database.Database } }));
-vi.mock('./db/connection.js', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('./db/connection.js')>()),
-  getRawDb: () => {
-    if (!centralDbMock.current) throw new Error('central db unavailable in dependency-cache unit test');
-    return centralDbMock.current.db;
-  },
 }));
 
 // A complete stub, not a spread: log.ts installs process-wide handlers at
@@ -44,7 +35,6 @@ import {
   FARM_OLD_NAME,
   finishDependencyCachePass,
   inventoryOf,
-  isEligiblePackageDir,
   linkPackageDir,
   processPackageDir,
   recoverPackageDir,
@@ -53,7 +43,7 @@ import {
   type ConvertStep,
   type DependencyCachePass,
 } from './dependency-cache.js';
-import { _resetStorageManagerThrottleForTesting, dirSizeBytes, getStorageReport } from './storage-manager.js';
+import { dirSizeBytes } from './storage-manager.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { log } from './log.js';
 
@@ -218,26 +208,6 @@ function optionalEntry(constraints: Record<string, string[]>): Record<string, un
     optional: true,
     ...constraints,
   };
-}
-
-/** Make an entry look sealed `sealedDaysAgo` days ago, with every file older still. */
-function backdateEntry(entryDir: string, sealedDaysAgo: number): void {
-  const sealedAtMs = Date.now() - sealedDaysAgo * DAY_MS;
-  const fileStamp = (sealedAtMs - DAY_MS) / 1000;
-  const walk = (dir: string): void => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) walk(full);
-      else if (entry.isSymbolicLink()) fs.lutimesSync(full, fileStamp, fileStamp);
-      else fs.utimesSync(full, fileStamp, fileStamp);
-    }
-  };
-  walk(path.join(entryDir, 'node_modules'));
-  const sealedPath = path.join(entryDir, 'SEALED');
-  const sealed = JSON.parse(fs.readFileSync(sealedPath, 'utf8')) as Record<string, unknown>;
-  const iso = new Date(sealedAtMs).toISOString();
-  fs.unlinkSync(sealedPath);
-  fs.writeFileSync(sealedPath, JSON.stringify({ ...sealed, sealedAt: iso, lastLinkedAt: iso }));
 }
 
 function isPrivateRootName(rel: string): boolean {
@@ -1036,193 +1006,5 @@ describe('dependency cache', () => {
 
     mockExecFileSync.mockImplementation(() => 'PATH=/usr/local/bin\n');
     expect(agentImageFingerprint('agent:latest')).toBeNull();
-  });
-});
-
-// ── P1-14 through the real sweep ────────────────────────────────────────────
-
-describe('dependency cache inside the regenerable sweep', () => {
-  let dataRoot: string;
-  let topicsRoot: string;
-  let sessionsRoot: string;
-  let savedFlag: string | undefined;
-
-  beforeEach(() => {
-    _resetStorageManagerThrottleForTesting();
-    savedFlag = process.env.NANOCLAW_DEPENDENCY_CACHE;
-    process.env.NANOCLAW_DEPENDENCY_CACHE = 'apply';
-    dataRoot = path.join(tmpRoot, 'data');
-    topicsRoot = path.join(dataRoot, 'v2-topics');
-    sessionsRoot = path.join(dataRoot, 'v2-sessions');
-    fs.mkdirSync(sessionsRoot, { recursive: true });
-    const db = new Database(':memory:');
-    db.exec(`CREATE TABLE sessions (
-      id TEXT PRIMARY KEY, agent_group_id TEXT NOT NULL, messaging_group_id TEXT,
-      thread_id TEXT, status TEXT, last_active TEXT, created_at TEXT NOT NULL
-    )`);
-    db.exec('CREATE TABLE agent_groups (id TEXT PRIMARY KEY, folder TEXT, workgroup_id TEXT)');
-    db.exec('CREATE TABLE messaging_groups (id TEXT PRIMARY KEY, platform_id TEXT)');
-    centralDbMock.current = { db };
-    mockExecFileSync.mockImplementation((cmd: string, args: string[]) => {
-      if (cmd === 'df') {
-        return 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 1000 500 500 50% /\n';
-      }
-      if (cmd === CONTAINER_RUNTIME_BIN && args[0] === 'image' && args[1] === 'inspect') {
-        return 'PATH=/usr/local/bin\nNODE_VERSION=22.23.2\n';
-      }
-      throw new Error(`unexpected command ${cmd}`);
-    });
-  });
-
-  afterEach(() => {
-    centralDbMock.current?.db.close();
-    centralDbMock.current = null;
-    if (savedFlag === undefined) delete process.env.NANOCLAW_DEPENDENCY_CACHE;
-    else process.env.NANOCLAW_DEPENDENCY_CACHE = savedFlag;
-  });
-
-  function makeTopic(name: string, build: (repoDir: string) => void, idleDays = 10): string {
-    const topicDir = path.join(topicsRoot, 'wg-acme', name);
-    const repoDir = path.join(topicDir, 'worktrees', 'REPO');
-    fs.mkdirSync(repoDir, { recursive: true });
-    build(repoDir);
-    const stamp = (Date.now() - idleDays * DAY_MS) / 1000;
-    const worktreeRoot = path.join(topicDir, 'worktrees');
-    for (const entry of fs.readdirSync(worktreeRoot)) fs.utimesSync(path.join(worktreeRoot, entry), stamp, stamp);
-    fs.utimesSync(worktreeRoot, stamp, stamp);
-    return repoDir;
-  }
-
-  it('a cold-cache report predicts one adopt and converts the rest with estimated bytes', () => {
-    process.env.NANOCLAW_DEPENDENCY_CACHE = 'report';
-    // Fresh topics: flag `report` keeps today's 2-day delete, and these are inside its window.
-    makeTopic('thread-77777777777777777777777777777777', (repo) => makeProject(repo), 0);
-    makeTopic('thread-88888888888888888888888888888888', (repo) => makeProject(repo), 0);
-    const before = snapshotTree(topicsRoot);
-
-    const report = getStorageReport({
-      mode: 'apply',
-      now: Date.now(),
-      sessionsRoot,
-      threadsRoot: path.join(dataRoot, 'no-threads'),
-      topicsRoot,
-      runningContainerMounts: () => [],
-      includeDocker: false,
-      policy: { filesystemPath: tmpRoot },
-    });
-
-    expect(report.dependencyCache?.mode).toBe('report');
-    expect(report.dependencyCache?.counters).toEqual(expect.objectContaining({ adopted: 1, converted: 1 }));
-    const decisions = report.dependencyCache?.decisions ?? [];
-    expect(decisions.map((decision) => decision.op).sort()).toEqual(['adopt', 'convert']);
-    expect(decisions.find((decision) => decision.op === 'convert')?.estimatedBytes).toBeGreaterThan(0);
-    expect(snapshotTree(topicsRoot)).toEqual(before);
-    expect(fs.existsSync(path.join(dataRoot, 'dependency-cache'))).toBe(false);
-  });
-
-  it('off still recovers interrupted conversions and garbage-collects unlinked entries', () => {
-    // Unset IS `off`, the production default.
-    delete process.env.NANOCLAW_DEPENDENCY_CACHE;
-    let interruptedInodes = new Map<string, number>();
-    const interrupted = makeTopic('thread-55555555555555555555555555555555', (repo) => {
-      makeProject(repo, { privateDirs: true });
-      interruptedInodes = inodes(path.join(repo, 'node_modules'), { includePrivate: true });
-      // A convert that crashed after step 2 in an `apply` pass, then a rollback to `off`.
-      fs.renameSync(path.join(repo, 'node_modules'), path.join(repo, FARM_OLD_NAME));
-    });
-    const outside = makeProject(path.join(tmpRoot, 'outside', 'repo'));
-    expect(processPackageDir(startPass(), 'wg-acme', outside)).toBe('adopted');
-    const agedEntry = path.join(cacheRoot, 'wg-acme', keyOf(outside));
-    fs.rmSync(path.join(outside, 'node_modules'), { recursive: true });
-    backdateEntry(agedEntry, 20);
-    // Same lockfile as the aged entry, and fresh, so only the cache could touch it.
-    const keptPrivate = makeTopic('thread-66666666666666666666666666666666', (repo) => makeProject(repo), 0);
-    const privateBefore = snapshotTree(path.join(keptPrivate, 'node_modules'));
-
-    const report = getStorageReport({
-      mode: 'apply',
-      now: Date.now(),
-      sessionsRoot,
-      threadsRoot: path.join(dataRoot, 'no-threads'),
-      topicsRoot,
-      runningContainerMounts: () => [],
-      includeDocker: false,
-      policy: { filesystemPath: tmpRoot },
-    });
-
-    expect(report.policy.dependencyCacheMode).toBe('off');
-    expect(inodes(path.join(interrupted, 'node_modules'), { includePrivate: true })).toEqual(interruptedInodes);
-    expect(tempNamesUnder(interrupted)).toEqual([]);
-    expect(fs.existsSync(agedEntry)).toBe(false);
-    expect(cacheEntries('wg-acme')).toEqual([]);
-    expect(snapshotTree(path.join(keptPrivate, 'node_modules'))).toEqual(privateBefore);
-    expect(report.dependencyCache?.counters).toEqual(
-      expect.objectContaining({ recovered: 1, gcDeleted: 1, adopted: 0, converted: 0, privateInMountedTopics: 0 }),
-    );
-    // Neither recovering `.old` nor GC needs a key, so `off` never inspects the image.
-    expect(
-      mockExecFileSync.mock.calls.some(
-        ([cmd, args]) => cmd === CONTAINER_RUNTIME_BIN && (args as string[])[0] === 'image',
-      ),
-    ).toBe(false);
-  });
-
-  it('npm-workspaces, pnpm, and lockfile-less projects are left to the existing sweep rule', () => {
-    const workspaces = makeTopic('thread-11111111111111111111111111111111', (repo) => {
-      writeManifests(repo, { pkgJson: { workspaces: ['packages/*'] } });
-      installTree(repo);
-    });
-    const pnpm = makeTopic('thread-22222222222222222222222222222222', (repo) => {
-      fs.writeFileSync(path.join(repo, 'package.json'), '{"name":"app","version":"1.0.0"}\n');
-      fs.writeFileSync(path.join(repo, 'pnpm-lock.yaml'), "lockfileVersion: '9.0'\n");
-      const store = path.join(repo, 'node_modules', '.pnpm', 'left-pad@1.3.0', 'node_modules', 'left-pad');
-      fs.mkdirSync(store, { recursive: true });
-      fs.writeFileSync(path.join(store, 'index.js'), 'pnpm-installed');
-    });
-    const lockless = makeTopic('thread-33333333333333333333333333333333', (repo) => {
-      fs.writeFileSync(path.join(repo, 'package.json'), '{"name":"app","version":"1.0.0"}\n');
-      fs.mkdirSync(path.join(repo, 'node_modules', 'left-pad'), { recursive: true });
-      fs.writeFileSync(path.join(repo, 'node_modules', 'left-pad', 'index.js'), 'ad-hoc');
-    });
-    // A control that IS eligible, so the flag is provably live in this pass.
-    const npm = makeTopic('thread-44444444444444444444444444444444', (repo) => makeProject(repo));
-
-    for (const dir of [workspaces, pnpm, lockless]) {
-      expect(isEligiblePackageDir(dir)).toBe(false);
-      expect(processPackageDir(startPass('report'), 'wg-acme', dir)).toBe('ineligible');
-    }
-    vi.mocked(log.info).mockClear();
-
-    const report = getStorageReport({
-      mode: 'apply',
-      now: Date.now(),
-      sessionsRoot,
-      threadsRoot: path.join(dataRoot, 'no-threads'),
-      topicsRoot,
-      runningContainerMounts: () => [],
-      includeDocker: false,
-      policy: { filesystemPath: tmpRoot },
-    });
-
-    // The existing 2-day rule, unchanged: lockfile-backed trees go, a tree with
-    // no recorded reproducer stays.
-    expect(fs.existsSync(path.join(workspaces, 'node_modules'))).toBe(false);
-    expect(fs.existsSync(path.join(pnpm, 'node_modules'))).toBe(false);
-    expect(fs.readFileSync(path.join(lockless, 'node_modules', 'left-pad', 'index.js'), 'utf8')).toBe('ad-hoc');
-    expect(report.skipped.noManifestTrees).toBe(1);
-
-    // Adopt/convert touched only the eligible control, which is kept as a farm.
-    expect(report.dependencyCache?.counters).toEqual(expect.objectContaining({ adopted: 1, converted: 0 }));
-    const entries = fs.readdirSync(path.join(dataRoot, 'dependency-cache', 'wg-acme'));
-    // The sweep's fingerprint is the production default: the inspected image on this arch.
-    expect(entries).toEqual([dependencyKey(npm, envFingerprint('22.23.2'))!.key]);
-    const sealed = JSON.parse(
-      fs.readFileSync(path.join(dataRoot, 'dependency-cache', 'wg-acme', entries[0]!, 'SEALED'), 'utf8'),
-    ) as { source: string };
-    expect(sealed.source).toBe(npm);
-    expect(fs.existsSync(path.join(npm, 'node_modules', 'left-pad', 'index.js'))).toBe(true);
-    expect(report.actions.map((action) => action.path).sort()).toEqual(
-      [path.join(workspaces, 'node_modules'), path.join(pnpm, 'node_modules')].sort(),
-    );
   });
 });

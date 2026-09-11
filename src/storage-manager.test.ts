@@ -47,7 +47,16 @@ import {
   type StorageReport,
 } from './storage-manager.js';
 import { acquireStorageActivityLease, tryRunWithStorageCleanupClaim } from './storage-activity.js';
-import { _resetDependencyCacheForTesting, dependencyKey, envFingerprint, FARM_OLD_NAME } from './dependency-cache.js';
+import {
+  _resetDependencyCacheForTesting,
+  dependencyKey,
+  envFingerprint,
+  FARM_NEW_NAME,
+  FARM_OLD_NAME,
+  isEligiblePackageDir,
+  processPackageDir,
+  startDependencyCachePass,
+} from './dependency-cache.js';
 import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, CONTAINER_INSTALL_LABEL } from './config.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { resolveRepositoryWorkUnit } from './repository-workspaces.js';
@@ -3190,7 +3199,7 @@ describe('storage-manager regenerable tree sweep', () => {
    * only shape the dependency cache will share. `makeTopic`'s tree is eligible
    * but incomplete, so it could never prove anything about adopt or convert.
    */
-  function makeNpmTopic(name: string, leftPadVersion = '1.3.0'): { topicDir: string; repoDir: string } {
+  function makeNpmTopic(name: string, leftPadVersion = '1.3.0', idleDays = 10): { topicDir: string; repoDir: string } {
     const topicDir = path.join(topicsRoot, 'wg-acme', name);
     const repoDir = path.join(topicDir, 'worktrees', 'XZO-BACKEND');
     const packages: Record<string, { version: string; resolved: string; integrity: string }> = {
@@ -3245,11 +3254,11 @@ describe('storage-manager regenerable tree sweep', () => {
       JSON.stringify({ name: 'app', version: '1.0.0', lockfileVersion: 3, requires: true, packages }),
     );
     fs.utimesSync(hidden, old + 30, old + 30);
-    ageTopic(topicDir);
+    ageTopic(topicDir, idleDays);
     return { topicDir, repoDir };
   }
 
-  /** Inode, mode and bytes of everything under `root`. */
+  /** Inode, mode, mtime, link count and bytes of everything under `root`. */
   function treeState(root: string): Record<string, string> {
     const out: Record<string, string> = {};
     const walk = (dir: string, rel: string): void => {
@@ -3257,15 +3266,46 @@ describe('storage-manager regenerable tree sweep', () => {
         const full = path.join(dir, entry.name);
         const childRel = rel ? `${rel}/${entry.name}` : entry.name;
         const st = fs.lstatSync(full);
-        if (st.isSymbolicLink()) out[childRel] = `l:${fs.readlinkSync(full)}`;
+        const head = `${st.ino}:${st.mode}:${st.mtimeMs}:${st.nlink}`;
+        if (st.isSymbolicLink()) out[childRel] = `l:${head}:${fs.readlinkSync(full)}`;
         else if (st.isDirectory()) {
-          out[childRel] = `d:${st.ino}:${st.mode}`;
+          out[childRel] = `d:${head}`;
           walk(full, childRel);
-        } else out[childRel] = `f:${st.ino}:${st.mode}:${fs.readFileSync(full, 'utf8')}`;
+        } else out[childRel] = `f:${head}:${fs.readFileSync(full, 'utf8')}`;
       }
     };
     walk(root, '');
     return out;
+  }
+
+  /** Make a cache entry look sealed at `sealedAtMs`, with every file in it older still. */
+  function backdateEntry(entryDir: string, sealedAtMs: number): void {
+    const fileStamp = (sealedAtMs - DAY_MS) / 1000;
+    const walk = (dir: string): void => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else if (entry.isSymbolicLink()) fs.lutimesSync(full, fileStamp, fileStamp);
+        else fs.utimesSync(full, fileStamp, fileStamp);
+      }
+    };
+    walk(path.join(entryDir, 'node_modules'));
+    const sealedPath = path.join(entryDir, 'SEALED');
+    const sealed = JSON.parse(fs.readFileSync(sealedPath, 'utf8')) as Record<string, unknown>;
+    const iso = new Date(sealedAtMs).toISOString();
+    fs.unlinkSync(sealedPath);
+    fs.writeFileSync(sealedPath, JSON.stringify({ ...sealed, sealedAt: iso, lastLinkedAt: iso }));
+  }
+
+  /** A report-mode pass with the fingerprint the sweep's image mock answers. */
+  function reportPass(): ReturnType<typeof startDependencyCachePass> {
+    return startDependencyCachePass({
+      mode: 'report',
+      cacheRoot: path.join(dataRoot, 'dependency-cache'),
+      now,
+      reclaimableBytes: dirSizeBytes,
+      fingerprint: () => envFingerprint('22.23.2'),
+    });
   }
 
   it('never adopts or converts under a live container mount or held storage claim', async () => {
@@ -3401,6 +3441,122 @@ describe('storage-manager regenerable tree sweep', () => {
       expect.objectContaining({ status: 'skipped' }),
     ]);
     expect(fs.existsSync(path.join(lateRepo, 'node_modules', 'left-pad', 'index.js'))).toBe(true);
+  });
+
+  it('a cold-cache report predicts one adopt and converts the rest with estimated bytes', () => {
+    enableDependencyCache();
+    process.env[cacheFlag] = 'report';
+    // Fresh topics: flag `report` keeps today's 2-day delete, and these are inside its window.
+    makeNpmTopic('thread-f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1', '1.3.0', 0);
+    makeNpmTopic('thread-f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2', '1.3.0', 0);
+    const before = treeState(topicsRoot);
+
+    const report = sweep();
+
+    expect(report.dependencyCache?.mode).toBe('report');
+    expect(report.dependencyCache?.counters).toEqual(expect.objectContaining({ adopted: 1, converted: 1 }));
+    const decisions = report.dependencyCache?.decisions ?? [];
+    expect(decisions.map((decision) => decision.op).sort()).toEqual(['adopt', 'convert']);
+    expect(decisions.find((decision) => decision.op === 'convert')?.estimatedBytes).toBeGreaterThan(0);
+    expect(treeState(topicsRoot)).toEqual(before);
+    expect(fs.existsSync(path.join(dataRoot, 'dependency-cache'))).toBe(false);
+  });
+
+  it('off still recovers interrupted conversions and garbage-collects unlinked entries', () => {
+    // Unset IS `off`, the production default (beforeEach deletes the flag).
+    const interrupted = makeNpmTopic('thread-a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7');
+    const interruptedNm = path.join(interrupted.repoDir, 'node_modules');
+    fs.mkdirSync(path.join(interruptedNm, '.vite'), { recursive: true });
+    fs.writeFileSync(path.join(interruptedNm, '.vite', 'sentinel'), 'vite-private');
+    const interruptedBefore = treeState(interruptedNm);
+    // A convert that crashed after step 2 in an `apply` pass, then a rollback to `off`.
+    fs.renameSync(interruptedNm, path.join(interrupted.repoDir, FARM_OLD_NAME));
+    ageTopic(interrupted.topicDir);
+    const cacheRoot = path.join(dataRoot, 'dependency-cache');
+    const outside = makeNpmTopic('thread-a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8');
+    const adoptPass = startDependencyCachePass({
+      mode: 'apply',
+      cacheRoot,
+      now,
+      reclaimableBytes: dirSizeBytes,
+      fingerprint: () => envFingerprint('22.23.2'),
+    });
+    expect(processPackageDir(adoptPass, 'wg-acme', outside.repoDir)).toBe('adopted');
+    const agedEntry = path.join(cacheRoot, 'wg-acme', dependencyKey(outside.repoDir, envFingerprint('22.23.2'))!.key);
+    fs.rmSync(path.join(outside.repoDir, 'node_modules'), { recursive: true });
+    backdateEntry(agedEntry, now - 20 * DAY_MS);
+    // Same lockfile as the aged entry, and fresh, so only the cache could touch it.
+    const keptPrivate = makeNpmTopic('thread-a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9', '1.3.0', 0);
+    const privateBefore = treeState(path.join(keptPrivate.repoDir, 'node_modules'));
+
+    const report = sweep();
+
+    expect(report.policy.dependencyCacheMode).toBe('off');
+    expect(treeState(interruptedNm)).toEqual(interruptedBefore);
+    expect(fs.existsSync(path.join(interrupted.repoDir, FARM_OLD_NAME))).toBe(false);
+    expect(fs.existsSync(path.join(interrupted.repoDir, FARM_NEW_NAME))).toBe(false);
+    expect(fs.existsSync(agedEntry)).toBe(false);
+    expect(fs.readdirSync(path.join(cacheRoot, 'wg-acme'))).toEqual([]);
+    expect(treeState(path.join(keptPrivate.repoDir, 'node_modules'))).toEqual(privateBefore);
+    expect(report.dependencyCache?.counters).toEqual(
+      expect.objectContaining({ recovered: 1, gcDeleted: 1, adopted: 0, converted: 0, privateInMountedTopics: 0 }),
+    );
+    // Neither recovering `.old` nor GC needs a key, so `off` never inspects the image.
+    expect(
+      mockExecFileSync.mock.calls.some(
+        ([cmd, args]) => cmd === CONTAINER_RUNTIME_BIN && (args as string[])[0] === 'image',
+      ),
+    ).toBe(false);
+  });
+
+  it('npm-workspaces, pnpm, and lockfile-less projects are left to the existing sweep rule', () => {
+    enableDependencyCache();
+    const workspaces = makeNpmTopic('thread-e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1');
+    const workspacesManifest = path.join(workspaces.repoDir, 'package.json');
+    fs.writeFileSync(
+      workspacesManifest,
+      JSON.stringify({
+        ...(JSON.parse(fs.readFileSync(workspacesManifest, 'utf8')) as object),
+        workspaces: ['packages/*'],
+      }),
+    );
+    ageTopic(workspaces.topicDir);
+    const pnpm = makeTopic('thread-e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2', { lockfile: false });
+    fs.writeFileSync(path.join(pnpm.repoDir, 'pnpm-lock.yaml'), "lockfileVersion: '9.0'\n");
+    ageTopic(pnpm.topicDir);
+    const lockless = makeTopic('thread-e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3', { lockfile: false });
+    // A control that IS eligible, so the flag is provably live in this pass.
+    const npm = makeNpmTopic('thread-e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4');
+
+    for (const dir of [workspaces.repoDir, pnpm.repoDir, lockless.repoDir]) {
+      expect(isEligiblePackageDir(dir)).toBe(false);
+      expect(processPackageDir(reportPass(), 'wg-acme', dir)).toBe('ineligible');
+    }
+
+    const report = sweep();
+
+    // The existing 2-day rule, unchanged: lockfile-backed trees go, a tree with
+    // no recorded reproducer stays.
+    expect(fs.existsSync(path.join(workspaces.repoDir, 'node_modules'))).toBe(false);
+    expect(fs.existsSync(path.join(pnpm.repoDir, 'node_modules'))).toBe(false);
+    expect(fs.readFileSync(path.join(lockless.repoDir, 'node_modules', 'left-pad', 'index.js'), 'utf8')).toBe(
+      'reinstallable',
+    );
+    expect(report.skipped.noManifestTrees).toBe(1);
+
+    // Adopt/convert touched only the eligible control, which is kept as a farm.
+    expect(report.dependencyCache?.counters).toEqual(expect.objectContaining({ adopted: 1, converted: 0 }));
+    const entries = fs.readdirSync(path.join(dataRoot, 'dependency-cache', 'wg-acme'));
+    // The sweep's fingerprint is the production default: the inspected image on this arch.
+    expect(entries).toEqual([dependencyKey(npm.repoDir, envFingerprint('22.23.2'))!.key]);
+    const sealed = JSON.parse(
+      fs.readFileSync(path.join(dataRoot, 'dependency-cache', 'wg-acme', entries[0]!, 'SEALED'), 'utf8'),
+    ) as { source: string };
+    expect(sealed.source).toBe(npm.repoDir);
+    expect(fs.existsSync(path.join(npm.repoDir, 'node_modules', 'left-pad', 'index.js'))).toBe(true);
+    expect(report.actions.map((action) => action.path).sort()).toEqual(
+      [path.join(workspaces.repoDir, 'node_modules'), path.join(pnpm.repoDir, 'node_modules')].sort(),
+    );
   });
 
   it('reclaimable bytes exclude files hardlinked elsewhere', () => {

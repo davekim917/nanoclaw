@@ -734,6 +734,24 @@ describe('storage-manager.ts / storage-activity.ts contain no literal seam call'
       // inside the storage maintenance worker thread and the synchronous
       // reclaim executors, neither of which can await the async driver.
       'src/db/container-configs.ts': ['CONTAINER_CONFIGS_ALL_SQL'],
+      // The npm dependency cache (docs/specs/repository-branch-clones/plan.md
+      // §5.7). dependency-cache.ts's own relative imports are config.ts,
+      // container-runtime.ts and log.ts, all three already pinned in this
+      // manifest, so this edge reaches no module — and so no path to the
+      // mailbox seam — that storage-manager.ts did not already reach. Its
+      // `type` specifiers contribute no runtime binding.
+      'src/dependency-cache.ts': [
+        'collectCacheGarbage',
+        'DEPENDENCY_CACHE_DIRNAME',
+        'DEPENDENCY_CACHE_TEMP_NAMES',
+        'finishDependencyCachePass',
+        'hasPendingConversion',
+        'isEligiblePackageDir',
+        'isFarmPackageDir',
+        'processPackageDir',
+        'recoverPackageDir',
+        'startDependencyCachePass',
+      ],
       'src/log.ts': ['log'],
       'src/modules/mailbox/index.ts': ['sessionMailboxPath'],
       'src/repository-workspaces.ts': ['resolveRepositoryWorkUnit'],
