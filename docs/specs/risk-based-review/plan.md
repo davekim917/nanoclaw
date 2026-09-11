@@ -242,6 +242,17 @@ or reverts than low-risk PRs did while they were still reviewed, the exempt path
       differ by path. The comparison is now before-and-after within the low-risk class. Links
       come from a required `Fixes-PR:` line, and revert rate is tracked alongside. First read
       around 2026-10-10.
+      The query shipped 2026-09-11: `pnpm exec tsx scripts/review-outcomes.ts`
+      (`--repo`, `--switch`, `--days`, `--followup-days`, `--json`). It replays
+      `.github/labeler.yml`'s `risk:high` globs against every merged PR's own file list
+      rather than trusting the stored label, so PRs merged before the labeler existed
+      classify too; follow-up counts `Fixes-PR:` links and the fix-title/file-overlap
+      fallback separately, and reverts are unbounded in time. A same-day smoke run
+      (30/30 days around the switch) found zero `Fixes-PR:`-linked follow-ups on
+      low-risk PRs on either side — the trailer isn't used on low-risk PRs in
+      practice — so the fallback overlap rate is carrying the signal for now: 75.6%
+      before vs. 40.0% after, with only 10 low-risk PRs merged after the switch as of
+      this run, under the 30-PR floor this plan sets for a readable difference.
 - [ ] Revised plan, 2026-09-11, after an independent second opinion and a comparison with
       Augment's Cosmos:
       - **Gate integrity:** merge-check fails closed when `risk:high` was removed by anyone
