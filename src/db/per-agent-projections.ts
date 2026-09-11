@@ -555,7 +555,15 @@ function findArchiveSeedCandidate(stamp: ArchiveProjectionStamp, excludeDstPath:
     if (!sameProjectionIdentity(parsed, stamp)) continue;
 
     try {
-      if (fs.statSync(parsed.dstPath).size === 0) continue; // Orphaned/partial file — not trustworthy.
+      // `lstat`, not `stat`: a symlink at this path must never be followed
+      // and trusted as the candidate's own file (#668 F3) — require a plain,
+      // non-empty regular file. `isFile()` under `lstat` is already false for
+      // a symlink (lstat reports the link itself, never its target), but the
+      // explicit `isSymbolicLink()` check says so directly rather than by
+      // implication. `size === 0` also covers a partial file left by a build
+      // that died after the schema but before any row.
+      const st = fs.lstatSync(parsed.dstPath);
+      if (!st.isFile() || st.isSymbolicLink() || st.size === 0) continue;
     } catch {
       continue; // Stamp outlived its projection (session cleaned up) — not a candidate.
     }
@@ -579,15 +587,21 @@ function findArchiveSeedCandidate(stamp: ArchiveProjectionStamp, excludeDstPath:
  * That "only ever" is exactly what the MIN/MAX check below re-verifies
  * fail-closed, rather than trusting the stamp alone — but only the AGENT
  * half of the identity: it proves every row in the copied file is labeled
- * with the caller, nothing about the workgroup member set. That's fine here
- * because the member-set half was never a property of the file's CONTENTS to
- * begin with — it rests entirely on the stamp, which lives in a host-only
- * tree outside every container mount ("Where the stamp lives", above) and so
- * can't be tampered with from inside a container the way the projection file
- * itself, in principle, could be. A foreign `agent_group_id` here means the
- * candidate file on disk disagrees with what its own stamp claimed (a stale
- * copy from an older build, a hand-edited fixture, corruption), and the
- * caller must not trust it.
+ * with the caller, nothing about the workgroup member set. Which members'
+ * rows a file holds IS its contents, and this check cannot see that — it can
+ * only see the one column every row carries. The member-set half is instead
+ * a claim the stamp makes about those contents, trusted because only the
+ * host ever writes a session's `archive.db` or its stamp: containers mount
+ * their own copy read-only (`container-runner.ts:4709`) over the read-write
+ * session directory the host itself created, no other mount source in this
+ * tree covers `DATA_DIR/v2-sessions/` or `DATA_DIR/projection-stamps/`
+ * (`container-runner.ts`'s `mounts.push` call sites), and the storage
+ * reclaimer that deletes a stopped session's `archive.db` leaves its stamp
+ * behind as an orphan rather than reusing it — an orphan `findArchiveSeedCandidate`
+ * already skips via the `lstat` check above. A foreign `agent_group_id` here
+ * means the candidate file on disk disagrees with what its own stamp claimed
+ * (a stale copy from an older build, a hand-edited fixture, corruption), and
+ * the caller must not trust it.
  *
  * MIN and MAX run as two separate queries, not `SELECT MIN(x), MAX(x)` in
  * one: measured against a real 131,632-row/273MB projection, the combined
@@ -597,12 +611,20 @@ function findArchiveSeedCandidate(stamp: ArchiveProjectionStamp, excludeDstPath:
  * split out took 0.03-0.1ms (`SEARCH … USING COVERING INDEX`, i.e. an actual
  * index lookup rather than a scan).
  *
+ * `COPYFILE_EXCL`: refuse to copy through anything already sitting at
+ * `dstPath`, dangling symlink included — `fs.existsSync` reads false for a
+ * dangling link (`materializeArchiveProjection`'s freshness gate above would
+ * otherwise treat it as "no file" and let a plain copy silently write
+ * through it). This throws `EEXIST` instead, and the caller's catch removes
+ * whatever is at `dstPath` — `fs.rmSync` unlinks a symlink itself, never its
+ * target — and falls back to a full build.
+ *
  * `fsync` before any of that: this copy is about to be trusted as the
  * durable baseline every append after it builds on, so it must not still be
  * sitting only in the page cache.
  */
 function seedArchiveProjectionFrom(candidate: ArchiveSeedCandidate, dstPath: string, agentGroupId: string): void {
-  fs.copyFileSync(candidate.dstPath, dstPath);
+  fs.copyFileSync(candidate.dstPath, dstPath, fs.constants.COPYFILE_EXCL);
   const fd = fs.openSync(dstPath, 'r+');
   try {
     fs.fsyncSync(fd);
