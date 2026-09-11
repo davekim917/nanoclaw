@@ -19,18 +19,34 @@ name: Shadow review
 #   model. It never checks out the repository: the merged tree can carry a
 #   `.claude/settings.json` hook, a `.mcp.json` server the action auto-trusts
 #   (`enableAllProjectMcpServers: true`, set unconditionally — base-action's
-#   `setup-claude-code-settings.ts:62-64`), or a CLAUDE.md, all planted by the very
-#   PR being reviewed, none of which a tool-permission list like `--disallowedTools
-#   Bash` gates — hooks and MCP servers aren't tools, they run on session start.
-#   `--setting-sources user` alone doesn't close this either: the SDK docs
-#   (`@anthropic-ai/claude-agent-sdk` `sdk.d.ts`, the `settingSources` doc comment)
-#   say excluding `'project'` drops `.claude/settings.json` (hooks) and CLAUDE.md,
-#   but `.mcp.json` loading is a SEPARATE switch (`strictMcpConfig` /
-#   `--strict-mcp-config`, `sdk.d.ts` ~2127-2134) that `settingSources` does not
-#   touch. So instead of trying to lock down a checkout, there is no checkout: the
+#   `setup-claude-code-settings.ts:62-64`), a CLAUDE.md/CLAUDE.local.md, or a
+#   `.ripgreprc`, all planted by the very PR being reviewed, none of which a
+#   tool-permission list like `--disallowedTools Bash` gates — hooks and MCP
+#   servers aren't tools, they run on session start. `--setting-sources user`
+#   alone does NOT close this: it governs `.claude/settings.json` only — the SDK
+#   docs (`@anthropic-ai/claude-agent-sdk` `sdk.d.ts`, the `settingSources` doc
+#   comment) say excluding `'project'` also drops CLAUDE.md ("Must include
+#   'project' to load CLAUDE.md files"), but say nothing about CLAUDE.local.md,
+#   and `.mcp.json` loading is a SEPARATE switch (`strictMcpConfig` /
+#   `--strict-mcp-config`, `sdk.d.ts` ~2127-2134) untouched by `settingSources`.
+#   The action's own threat model agrees this whole set is sensitive: on a PR
+#   event WITH a checkout, it restores `.claude/`, `.mcp.json`, `.claude.json`,
+#   `.gitmodules`, `.ripgreprc`, `CLAUDE.md`, `CLAUDE.local.md` and `.husky/` from
+#   the PR's BASE branch before running Claude, specifically so the PR head can't
+#   plant any of them (`docs/security.md`, "Which files come from the base branch
+#   on pull requests"). That restore mechanism doesn't apply here — this event is
+#   `closed`, not `opened`/`synchronize`, and there is no PR head to restore
+#   away from — so instead of relying on it, there is no checkout at all: the
 #   model gets `gh pr diff` (works for every merge method, closed or open) and
 #   `docs/review-policy.md`'s raw content at the merge commit, written into the
-#   otherwise-empty default workspace, and nothing else.
+#   otherwise-empty default workspace, and nothing else. (Those same paths —
+#   `.claude/**`, `.mcp.json`, `.claude.json`, `.gitmodules`, `CLAUDE.local.md`,
+#   `.ripgreprc` — are also added to `risk:high`/`risk:gates` in
+#   `.github/labeler.yml`: this workflow's own no-checkout design neutralizes
+#   them here, but nothing protects a PR that reaches a checkout-based agent
+#   session elsewhere in this fleet. Plain `CLAUDE.md` is deliberately left off
+#   that list — it changes often enough that flagging every edit has a real
+#   review cost, and it's fully covered by this design already.)
 #
 #   Also unconditionally: `configureGitAuth`/`replaceCheckoutCredentials`
 #   (`src/github/operations/git-config.ts:129-134`) embeds the action's own
@@ -43,11 +59,16 @@ name: Shadow review
 #   `getOidcToken()` (`:56-66`), so `id-token: write` is never needed.
 #
 #   report (contents: read, issues: write, pull-requests: write — no model) is the
-#   ONLY step that calls the GitHub write API. It reads `analyze`'s findings as a
-#   job output — never lets the write-scoped token anywhere near the model or a
-#   checkout — and scrubs token-shaped strings before posting, failing closed if one
-#   appears (belt-and-suspenders against `structured_output` itself having been
-#   manipulated by a prompt injection in the diff).
+#   ONLY step that calls the GitHub write API, and the ONLY job holding a
+#   write-capable token — `analyze`'s own `GITHUB_TOKEN` is read-only AND, like
+#   every job's default token, expires when that job ends, before `report` even
+#   starts (GitHub Actions: a job's `GITHUB_TOKEN` is minted per job and is valid
+#   only for that job's duration). So the split alone already keeps a
+#   write-capable credential out of reach of the model and anything it produces.
+#   The token-shaped-string scrub below, before `report` posts anything, is
+#   defense in depth on top of that — for a credential from somewhere else
+#   entirely (e.g. one a prompt injection tries to fabricate or reference) — not
+#   the primary control.
 #
 # Trust boundary: `pull_request_target` runs both jobs with repo secrets and a
 # write-capable default token regardless of who opened the PR. Never check out
@@ -213,11 +234,31 @@ jobs:
           set -euo pipefail
 
           # Fail closed on anything token-shaped anywhere in the model's output —
-          # defense in depth against a prompt injection in the diff that tries to
-          # exfiltrate a credential (e.g. one it read out of a leaked .git/config in
-          # some other context) through a finding's free-text fields.
-          TOKEN_RE='gh[pousr]_[A-Za-z0-9]+|github_pat_[A-Za-z0-9]+|sk-ant-[A-Za-z0-9-]+'
-          if grep -qE "$TOKEN_RE" <<<"$STRUCTURED_OUTPUT"; then
+          # defense in depth (see the top-of-file comment: the job split is the
+          # primary control) against a prompt injection in the diff that tries to
+          # exfiltrate or fabricate a credential through a finding's free-text
+          # fields. Never post a redacted body — a hit refuses the whole post.
+          #
+          # 1. Known token prefixes.
+          PREFIX_RE='ghs_|ghp_|gho_|ghu_|ghr_|github_pat_|sk-ant-'
+          # 2. A generic mixed-case secret shape: 36+ chars of [A-Za-z0-9_-]
+          #    containing BOTH an uppercase and a lowercase letter. Bounded to
+          #    mixed case specifically so a bare commit SHA (40 lowercase hex
+          #    chars) in a finding's description never trips this.
+          token_hit=0
+          if grep -qE "$PREFIX_RE" <<<"$STRUCTURED_OUTPUT"; then
+            token_hit=1
+          fi
+          if [ "$token_hit" -eq 0 ]; then
+            while IFS= read -r run; do
+              [ -z "$run" ] && continue
+              if grep -q '[A-Z]' <<<"$run" && grep -q '[a-z]' <<<"$run"; then
+                token_hit=1
+                break
+              fi
+            done < <(grep -oE '[A-Za-z0-9_-]{36,}' <<<"$STRUCTURED_OUTPUT")
+          fi
+          if [ "$token_hit" -eq 1 ]; then
             echo "::error::shadow review findings contain a token-shaped string; refusing to post" >&2
             exit 1
           fi
