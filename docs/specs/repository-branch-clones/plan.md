@@ -217,7 +217,9 @@ It is pinned by `instruction-fragment-migration.test.ts:123-148`. Codex trusts
 The layout is `worktrees/<repo>` for the thread's primary checkout and `worktrees/<repo>@<slug>`
 for any other branch. `@` falls outside the repository-name charset
 (`src/repository-workspaces.ts:16`), so parsing is unambiguous. The host-owned staging area is
-`worktrees/.staging/`.
+`worktrees/.staging/`. **Build rev 2.5:** staging moved to `<topic>/checkout-staging/`, beside
+`worktrees/` and outside every container mount; wherever this plan says `.staging`, read that
+(run.md, "Phase 2 integration").
 
 - **`checkoutDirName(repo, branch | null)`.**
   - With `null`, it returns `<repo>`.

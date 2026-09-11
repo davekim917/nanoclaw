@@ -49,7 +49,7 @@ import { getRawDb } from './db/connection.js';
 import { CONTAINER_CONFIGS_ALL_SQL } from './db/container-configs.js';
 import type { ContainerConfigRow } from './types.js';
 import { log } from './log.js';
-import { resolveRepositoryWorkUnit } from './repository-workspaces.js';
+import { listTopicCheckouts, resolveRepositoryWorkUnit } from './repository-workspaces.js';
 import { STORAGE_INTERNAL_ENTRY_NAMES, tryRunWithStorageCleanupClaim } from './storage-activity.js';
 // The session-directory LAYOUT, not the data: this file's reclaim probes open
 // their own read-only handles, so all they need from the seam is where a
@@ -2164,6 +2164,42 @@ function findRegenerableTargets(root: string, recoveryDirs: string[] = []): stri
 }
 
 /**
+ * A topic's regenerable targets, walked checkout by checkout.
+ *
+ * `listTopicCheckouts` is the only enumerator of a topic's checkouts (plan
+ * §5.1), so a branch clone at `<repo>@<slug>` is walked, shared and swept
+ * exactly like `<repo>`. What the lister skips is never walked: every
+ * dot-prefixed name (repository-workspaces.ts:591). Nothing under one is
+ * deleted, adopted, converted or recovered. repository_checkout builds its
+ * clones outside `worktrees/` altogether (`checkoutStagingRoot`), so a
+ * half-built clone is never here.
+ *
+ * One kind of non-checkout entry is still a target: a regenerable store
+ * sitting directly at the worktrees root, beside the checkouts. Production
+ * topics carry a `.pnpm-store` there, and before the lister existed the walk
+ * from the root reclaimed it; skipping it would stop that reclaim for good.
+ * Only the entry itself is taken, never descended, and only under a
+ * regenerable name.
+ *
+ * `null` when the worktrees root cannot be read: the lister returns [] only
+ * for ENOENT and throws on anything else (repository-workspaces.ts:607-613),
+ * so the caller counts the topic unreadable instead of sweeping it as empty.
+ */
+function findTopicRegenerableTargets(worktreeRoot: string, recoveryDirs: string[]): string[] | null {
+  let checkouts: ReturnType<typeof listTopicCheckouts>;
+  try {
+    checkouts = listTopicCheckouts(worktreeRoot);
+  } catch (err) {
+    log.warn('storage-manager: topic worktrees root unreadable; skipping the topic', { worktreeRoot, err });
+    return null;
+  }
+  const rootStores = safeReaddirDirents(worktreeRoot)
+    .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink() && REGENERABLE_SWEEP_DIR_NAMES.has(entry.name))
+    .map((entry) => path.join(worktreeRoot, entry.name));
+  return [...rootStores, ...checkouts.flatMap((checkout) => findRegenerableTargets(checkout.path, recoveryDirs))];
+}
+
+/**
  * Newest `sessions.last_active` per topic, keyed `<workgroup>/<kind>-<id>` —
  * the last two path segments of a topic state dir, so the map is independent
  * of which root the caller scans.
@@ -2445,7 +2481,11 @@ function collectTopicRegenerableActions(args: {
       const key = `${workgroupEntry.name}/${topicEntry.name}`;
 
       const recoveryDirs: string[] = [];
-      const targets = findRegenerableTargets(worktreeRoot, recoveryDirs);
+      const targets = findTopicRegenerableTargets(worktreeRoot, recoveryDirs);
+      if (targets === null) {
+        args.skipped.unreadableTopics += 1;
+        continue;
+      }
       const keptByCache = cache
         ? runTopicDependencyCache({
             cache,

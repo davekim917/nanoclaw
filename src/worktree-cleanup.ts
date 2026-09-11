@@ -8,6 +8,11 @@
  * prove the tree is clean and has no commits absent from local remote refs,
  * the branch is merged into origin/HEAD or gone from the already-fetched
  * origin namespace, and the topic has been idle for at least seven days.
+ *
+ * A branch clone (`.git` a directory; plan §5.8) takes its own branch: there
+ * is no registration to remove, so it is quarantined and trashed, and only on
+ * the topic's side-(a) evidence, seven idle days, and a proof covering every
+ * local branch, HEAD and the stash. See cleanupCloneCheckout.
  */
 import { execFileSync } from 'child_process';
 import fs from 'fs';
@@ -34,13 +39,16 @@ import {
   defaultTopicBranch,
   ensureRepositoryLock,
   isRepositoryName,
+  listTopicCheckouts,
   resolveRepositoryWorkUnit,
   topicStateDir,
   topicWorktreesDir,
   transferTombstonesDir,
   withHostRepositoryLock,
   withRepositoryLifecycleClaims,
+  type CheckoutShape,
   type RepositoryWorkUnit,
+  type TopicCheckout,
 } from './repository-workspaces.js';
 
 import { safeGitArgs, safeGitEnv } from './safe-git.js';
@@ -109,6 +117,8 @@ export interface TopicWorktreeTarget {
   participants: TopicParticipant[];
   repo: string;
   worktreePath: string;
+  /** As the lister decided it: a clone takes the clone branch, anything else the linked path. */
+  shape: CheckoutShape;
   canonicalRepoPath: string;
 }
 
@@ -124,11 +134,11 @@ interface SessionRow {
   idle_since: string;
 }
 
-function git(cwd: string, args: string[]): string | null {
+function git(cwd: string, args: string[], env: NodeJS.ProcessEnv = {}): string | null {
   try {
     return execFileSync('git', safeGitArgs(args), {
       cwd,
-      env: safeGitEnv(),
+      env: safeGitEnv(env),
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 30_000,
@@ -136,6 +146,20 @@ function git(cwd: string, args: string[]): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Git's environment for a question about exactly one checkout.
+ *
+ * With a `.git` that is missing or not a repository, Git's discovery walks up
+ * the parent directories, and on this host `data/` sits inside the install's
+ * own checkout: the answer would describe that repository, not this directory
+ * (measured: a corrupt `.git` directory under a nested repo resolves
+ * `--show-toplevel` to the outer repo). The ceiling stops discovery at `dir`,
+ * so such a checkout fails, and reads as unprovable.
+ */
+function checkoutGitEnv(dir: string): NodeJS.ProcessEnv {
+  return { GIT_CEILING_DIRECTORIES: path.dirname(path.resolve(dir)) };
 }
 
 /**
@@ -157,6 +181,22 @@ function safeDirectories(directory: string): string[] | null {
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
     log.warn('Worktree cleanup: worktrees root unreadable; preserving its topic', { directory, err });
+    return null;
+  }
+}
+
+/**
+ * A topic's checkouts through the one lister (plan §5.1), or `null` when its
+ * worktrees root could not be read. `listTopicCheckouts` returns [] only for
+ * ENOENT and throws on every other read failure
+ * (repository-workspaces.ts:607-613), so an unreadable root is counted and
+ * preserved here, never mistaken for an empty one.
+ */
+function readTopicCheckouts(worktreeRoot: string): TopicCheckout[] | null {
+  try {
+    return listTopicCheckouts(worktreeRoot);
+  } catch (err) {
+    log.warn('Worktree cleanup: worktrees root unreadable; preserving its topic', { directory: worktreeRoot, err });
     return null;
   }
 }
@@ -269,37 +309,38 @@ function discover(dataDir: string, rows: SessionRow[] | null): DiscoveryResult {
   for (const [statePath, { unit, participants }] of mapping) {
     if (!fs.existsSync(statePath)) continue;
     const worktreeRoot = topicWorktreesDir(unit, dataDir);
-    const names = safeDirectories(worktreeRoot);
-    if (names === null) {
+    const checkouts = readTopicCheckouts(worktreeRoot);
+    if (checkouts === null) {
       unreadableRoots += 1;
       continue;
     }
-    for (const repo of names) {
-      // The worktrees root is not a pure repository namespace: the storage
-      // activity lease (`.nanoclaw-storage-active`) and the shared pnpm cache
-      // (`.pnpm-store`) live here too. Their names are not valid repository
-      // segments, so canonicalRepoDir() throws on them — and before this
-      // guard, one such directory aborted the entire cleanup pass at
-      // discovery, fleet-wide, forever.
-      //
-      // The filter is deliberately NOT widened to admit them. `SAFE_SEGMENT`
-      // is a path-traversal boundary, and a checkout that it rejects is
-      // preserved, never deleted. But some rejected names are legitimate
-      // repositories — `.github` and `.github-private` are real GitHub repos —
-      // so every filtered name is reported rather than dropped silently. A
-      // repository name in that report is an operator signal, not noise.
-      if (!isRepositoryName(repo)) {
-        filteredNames.add(`${unit.workgroupId}/${unit.kind}-${unit.id}/${repo}`);
-        continue;
-      }
-      const worktreePath = path.join(worktreeRoot, repo);
-      if (!fs.existsSync(worktreePath)) continue;
+    // The worktrees root is not a pure checkout namespace: the storage
+    // activity lease (`.nanoclaw-storage-active`) and a shared pnpm cache
+    // (`.pnpm-store`) live here too. The lister returns only names that parse
+    // as `<repo>` or `<repo>@<slug>` (repository-workspaces.ts:590-598), so
+    // none of them becomes a target;
+    // before a name filter existed, one such directory made canonicalRepoDir()
+    // throw and aborted the entire cleanup pass at discovery, fleet-wide.
+    //
+    // The parse is deliberately NOT widened to admit them. `SAFE_SEGMENT` is a
+    // path-traversal boundary, and a checkout it rejects is preserved, never
+    // deleted. But some rejected names are legitimate repositories — `.github`
+    // and `.github-private` are real GitHub repos — so every directory the
+    // lister skips is reported rather than dropped silently. A repository name
+    // in that report is an operator signal, not noise.
+    const listed = new Set(checkouts.map((checkout) => checkout.name));
+    for (const name of safeDirectories(worktreeRoot) ?? []) {
+      if (listed.has(name)) continue;
+      filteredNames.add(`${unit.workgroupId}/${unit.kind}-${unit.id}/${name}`);
+    }
+    for (const checkout of checkouts) {
       targets.push({
         workUnit: unit,
         participants,
-        repo,
-        worktreePath,
-        canonicalRepoPath: canonicalRepoDir(unit.workgroupId, repo, dataDir),
+        repo: checkout.repo,
+        worktreePath: checkout.path,
+        shape: checkout.shape,
+        canonicalRepoPath: canonicalRepoDir(unit.workgroupId, checkout.repo, dataDir),
       });
     }
   }
@@ -467,7 +508,81 @@ function branchMayBeRemoved(target: TopicWorktreeTarget): { eligible: boolean; r
   return { eligible: merged || gone, reason: merged ? 'merged' : gone ? 'remote-branch-gone' : 'unmerged' };
 }
 
-async function cleanupOne(target: TopicWorktreeTarget, dataDir: string = DATA_DIR): Promise<void> {
+/** What the clone branch decided for one clone checkout. The linked path reports nothing. */
+export interface CloneCleanupDecision {
+  collected: boolean;
+  reason: string;
+}
+
+async function cleanupOne(
+  target: TopicWorktreeTarget,
+  dataDir: string = DATA_DIR,
+): Promise<CloneCleanupDecision | undefined> {
+  if (target.shape === 'clone') return cleanupCloneCheckout(target, dataDir);
+  await cleanupLinkedCheckout(target, dataDir);
+  return undefined;
+}
+
+/**
+ * The clone branch of worktree cleanup (plan §5.8).
+ *
+ * A clone is a whole repository, not a registration in the canonical, so
+ * there is nothing for `git worktree remove` to do and nothing to deregister:
+ * it goes to the trash, as a scratch clone does. That is a heavier act than
+ * removing a linked checkout, so it asks for more:
+ *  - the topic's side-(a) evidence (sideAClear), on top of the busy and
+ *    transfer checks the linked path makes;
+ *  - the checkout itself idle for at least MINIMUM_IDLE_DAYS;
+ *  - proveCheckoutDisposable, which holds a clone to scope `all`: a clean
+ *    tree, no stash, and no commit on any local branch or HEAD that
+ *    `--remotes` lacks.
+ * Then quarantine, re-prove the moved copy, and trash (finalizeCloneCollection).
+ * Every check re-runs under the lifecycle claim and the repository lock, the
+ * pair repository_checkout holds (plan §5.2), so a checkout request cannot
+ * reuse this directory halfway through its collection.
+ */
+async function cleanupCloneCheckout(target: TopicWorktreeTarget, dataDir: string): Promise<CloneCleanupDecision> {
+  const context = {
+    workgroupId: target.workUnit.workgroupId,
+    workUnit: target.workUnit.key,
+    repo: target.repo,
+    path: target.worktreePath,
+  };
+  const refusal = (): string | null => {
+    if (!sideAClear(target.participants, topicIdleReclaimDays()).pass) return 'topic-open';
+    if (topicIsBusy(target.participants, dataDir)) return 'topic-busy';
+    if (transferReferencesPath(target, dataDir)) return 'transfer-referenced';
+    if (idleDays(target.worktreePath) < MINIMUM_IDLE_DAYS) return 'recent';
+    return null;
+  };
+  const early = refusal();
+  if (early) return { collected: false, reason: early };
+
+  return withRepositoryLifecycleClaims([target.workUnit], () =>
+    withHostRepositoryLock(
+      target.workUnit.workgroupId,
+      target.repo,
+      (): CloneCleanupDecision => {
+        const late = refusal();
+        if (late) return { collected: false, reason: late };
+        const proof = disposability.proveCheckoutDisposable({ path: target.worktreePath, shape: target.shape });
+        if (!proof.ok) {
+          if (idleDays(target.worktreePath) >= STALE_WARNING_DAYS) {
+            log.warn('Worktree cleanup: preserving stale clone checkout', { ...context, reason: proof.reason });
+          }
+          return { collected: false, reason: proof.reason };
+        }
+        const finalized = finalizeCloneCollection({ path: target.worktreePath }, dataDir, 'topic-checkout');
+        if (!finalized.ok) return { collected: false, reason: finalized.reason ?? 'finalize-refused' };
+        log.info('Worktree cleanup: trashed an idle clean pushed clone checkout', context);
+        return { collected: true, reason: proof.reason };
+      },
+      dataDir,
+    ),
+  );
+}
+
+async function cleanupLinkedCheckout(target: TopicWorktreeTarget, dataDir: string): Promise<void> {
   const context = { workgroupId: target.workUnit.workgroupId, workUnit: target.workUnit.key, repo: target.repo };
   if (topicIsBusy(target.participants, dataDir)) return;
   if (transferReferencesPath(target, dataDir)) return;
@@ -627,7 +742,7 @@ function gcMode(): 'dry-run' | 'apply' {
  * only a linked worktree's git-dir has a `locked` file to find.
  */
 function isWorktreeLocked(dir: string): boolean {
-  const gitDir = git(dir, ['rev-parse', '--path-format=absolute', '--git-dir']);
+  const gitDir = git(dir, ['rev-parse', '--path-format=absolute', '--git-dir'], checkoutGitEnv(dir));
   return gitDir !== null && fs.existsSync(path.join(gitDir, 'locked'));
 }
 
@@ -635,26 +750,32 @@ function isWorktreeLocked(dir: string): boolean {
  * Positive proof that a checkout holds nothing worth keeping.
  *
  * `scope` is 'head' for a linked worktree (its branch is the only one it owns)
- * and 'all' for a clone, which owns every local branch in it. A git invocation
+ * and 'all' for a clone, which owns every local branch in it and its HEAD.
+ * Reach it through proveCheckoutDisposable, which picks the scope. A git invocation
  * that fails — the usual cause is a pruned worktree admin directory or a gitdir
  * only resolvable inside a container — returns unprovable, never clean.
  */
 function provenDisposable(dir: string, scope: 'head' | 'all'): { ok: boolean; reason: string } {
   if (isWorktreeLocked(dir)) return { ok: false, reason: 'worktree-locked' };
+  const env = checkoutGitEnv(dir);
 
-  const status = git(dir, ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
+  const status = git(dir, ['status', '--porcelain=v1', '-z', '--untracked-files=all'], env);
   if (status === null) return { ok: false, reason: 'status-unprovable' };
   if (status !== '') return { ok: false, reason: 'dirty' };
 
+  // Scope 'all' names HEAD as well as every branch: a commit reachable only
+  // from a detached HEAD is on no branch, and `--branches` alone reads it as
+  // pushed (measured on this host). An unborn HEAD makes `log HEAD` fail, so
+  // such a repository reads as unprovable, never as clean.
   const unpushedArgs =
     scope === 'all'
-      ? ['log', '--branches', '--not', '--remotes', '--oneline']
+      ? ['log', '--branches', 'HEAD', '--not', '--remotes', '--oneline']
       : ['log', 'HEAD', '--not', '--remotes', '--oneline'];
-  const unpushed = git(dir, unpushedArgs);
+  const unpushed = git(dir, unpushedArgs, env);
   if (unpushed === null) return { ok: false, reason: 'log-unprovable' };
   if (unpushed !== '') return { ok: false, reason: 'unpushed' };
 
-  const stash = git(dir, ['stash', 'list']);
+  const stash = git(dir, ['stash', 'list'], env);
   if (stash === null) return { ok: false, reason: 'stash-unprovable' };
   if (stash !== '') return { ok: false, reason: 'stashed' };
 
@@ -675,7 +796,7 @@ function provenDisposable(dir: string, scope: 'head' | 'all'): { ok: boolean; re
   // Only for scope 'all' (a clone). A linked worktree is itself an entry in
   // some other repo's registry and legitimately has none of its own.
   if (scope === 'all') {
-    const gitDir = git(dir, ['rev-parse', '--path-format=absolute', '--git-dir']);
+    const gitDir = git(dir, ['rev-parse', '--path-format=absolute', '--git-dir'], env);
     if (gitDir === null) return { ok: false, reason: 'gitdir-unprovable' };
     const registered = safeDirectories(path.join(gitDir, 'worktrees'));
     // null is "the directory exists but could not be read" — unprovable, not
@@ -688,6 +809,28 @@ function provenDisposable(dir: string, scope: 'head' | 'all'): { ok: boolean; re
 
   return { ok: true, reason: 'clean-and-pushed' };
 }
+
+/**
+ * The one disposability primitive (plan §5.8). A clone owns every local branch
+ * in it, so it is proved with scope `all`; a linked worktree owns only its
+ * HEAD, as it always has; a checkout whose shape the lister could not decide
+ * is refused outright.
+ */
+export function proveCheckoutDisposable(checkout: Pick<TopicCheckout, 'path' | 'shape'>): {
+  ok: boolean;
+  reason: string;
+} {
+  if (checkout.shape === 'clone') return disposability.provenDisposable(checkout.path, 'all');
+  if (checkout.shape === 'linked') return disposability.provenDisposable(checkout.path, 'head');
+  return { ok: false, reason: 'unknown-shape' };
+}
+
+/**
+ * Every proof in this file is called through this object, never by bare name,
+ * so a spy sees each one (plan §9 P2-13). Only proveCheckoutDisposable calls
+ * provenDisposable.
+ */
+export const disposability = { provenDisposable, proveCheckoutDisposable };
 
 /** Directories with a real .git DIRECTORY. Symlinks are never candidates: a
  *  bedroom link such as agent/<name> -> workgroup/<name> is not a clone, and a
@@ -826,6 +969,33 @@ function record(report: GcReport, candidate: GcCandidate): void {
   }
 }
 
+/**
+ * Everything under a topic's `worktrees/` that must be proved disposable
+ * before the topic can be (plan §5.8), or `null` when the root cannot be read.
+ *
+ * - Each checkout the lister returns, with the shape it decided.
+ * - Each other directory, as shape `unknown`: probed like a checkout, and so
+ *   refused. A leftover lease dir, a stray `.pnpm-store` or a legacy `.github`
+ *   checkout lands here; a name the lister cannot parse is not evidence that
+ *   anything under it is disposable. repository_checkout's staging is not in
+ *   `worktrees/` at all (`checkoutStagingRoot`); it goes with its topic.
+ *
+ * The second read exists only to find what the lister deliberately skips. An
+ * entry created between the two reads shows up only in the second, as
+ * `unknown`, so that race refuses the topic rather than passing it.
+ */
+function topicDisposabilityProbes(worktreeRoot: string): Array<Pick<TopicCheckout, 'path' | 'shape'>> | null {
+  const checkouts = readTopicCheckouts(worktreeRoot);
+  if (checkouts === null) return null;
+  const names = safeDirectories(worktreeRoot);
+  if (names === null) return null;
+  const listed = new Set(checkouts.map((checkout) => checkout.name));
+  const others = names
+    .filter((name) => !listed.has(name))
+    .map((name) => ({ path: path.join(worktreeRoot, name), shape: 'unknown' as const }));
+  return [...checkouts, ...others];
+}
+
 function collectOrphanTopics(report: GcReport, dataDir: string, owners: Map<string, TopicParticipant[]>): void {
   const topicsRoot = path.join(dataDir, 'v2-topics');
   const idleReclaimDays = topicIdleReclaimDays();
@@ -868,21 +1038,22 @@ function collectOrphanTopics(report: GcReport, dataDir: string, owners: Map<stri
         continue;
       }
 
-      // The ONE safeDirectories call here that must not fall back to []. The
-      // loop below is what proves every checkout under this topic disposable;
+      // The ONE enumeration here that must not fall back to []. The loop
+      // below is what proves every checkout under this topic disposable;
       // reading an unreadable root as empty leaves `refused` null and records
       // the whole topic as collectable on the strength of a directory nobody
       // could read. The discovery-side calls in this file may use `?? []`
       // because a missed candidate is a missed deletion; this one authorizes
-      // one.
-      const repos = safeDirectories(worktreeRoot);
-      if (repos === null) {
+      // one. Every entry is proved through proveCheckoutDisposable, so a
+      // clone answers for all of its branches, not only its HEAD.
+      const probes = topicDisposabilityProbes(worktreeRoot);
+      if (probes === null) {
         skip('worktrees-unreadable');
         continue;
       }
       let refused: string | null = null;
-      for (const repo of repos) {
-        const decision = provenDisposable(path.join(worktreeRoot, repo), 'head');
+      for (const probe of probes) {
+        const decision = disposability.proveCheckoutDisposable(probe);
         if (!decision.ok) {
           refused = decision.reason;
           break;
@@ -957,7 +1128,9 @@ function collectClones(
       skip('bound-worktrees');
       continue;
     }
-    const decision = provenDisposable(candidate.dir, 'all');
+    // isPrivateClone found a real `.git` directory, which is the lister's own
+    // definition of a clone (repository-workspaces.ts:632).
+    const decision = disposability.proveCheckoutDisposable({ path: candidate.dir, shape: 'clone' });
     if (!decision.ok) {
       skip(decision.reason);
       continue;
@@ -1730,7 +1903,11 @@ function restoreQuarantinedClone(originalPath: string, quarantinePath: string): 
  * post-move check than a timestamp, because it re-answers the actual question
  * ("is everything in here recoverable?") rather than a proxy for it.
  */
-function finalizeCloneCollection(candidate: GcCandidate, dataDir: string): { ok: boolean; reason?: string } {
+function finalizeCloneCollection(
+  candidate: Pick<GcCandidate, 'path'>,
+  dataDir: string,
+  kind: 'scratch' | 'topic-checkout' = 'scratch',
+): { ok: boolean; reason?: string } {
   const resolvedOriginal = fs.realpathSync(candidate.path);
   const quarantineRoot = path.join(dataDir, '.gc-quarantine');
   const quarantinePath = path.join(quarantineRoot, `${path.basename(candidate.path)}-${Date.now()}`);
@@ -1765,8 +1942,15 @@ function finalizeCloneCollection(candidate: GcCandidate, dataDir: string): { ok:
     return { ok: false, reason };
   };
 
+  // A scratch clone under an active group is always inside a mount source
+  // (#190), so only the strong relation refuses one. A topic checkout lives
+  // under `<topic>/worktrees`, which is mounted only into its own work unit's
+  // containers (container-runner.ts:4379-4385): inside any mount source means
+  // a running container can reach it, so it refuses on anything but 'clear',
+  // as finalizeIdleCollection does for a whole topic.
   const freshMounts = runningContainerMounts();
-  if (freshMounts === null || mountRelation(resolvedOriginal, freshMounts) === 'is-mount-source') {
+  const relation = freshMounts === null ? null : mountRelation(resolvedOriginal, freshMounts);
+  if (relation === null || relation === 'is-mount-source' || (kind === 'topic-checkout' && relation !== 'clear')) {
     return restore('aborted-late-mount');
   }
   const freshCwds = liveProcessCwds();
@@ -1775,7 +1959,8 @@ function finalizeCloneCollection(candidate: GcCandidate, dataDir: string): { ok:
   }
   // Re-prove the moved copy, not the original path: this is the check that
   // catches a write landing in the gap between the scan and now.
-  const decision = provenDisposable(quarantinePath, 'all');
+  // Both callers only ever finalize a clone, so the moved copy is proved as one.
+  const decision = disposability.proveCheckoutDisposable({ path: quarantinePath, shape: 'clone' });
   if (!decision.ok) return restore(`aborted-${decision.reason}`);
 
   try {
@@ -2201,8 +2386,11 @@ export async function _discoveryStatsForTesting(dataDir: string = DATA_DIR): Pro
   return discover(dataDir, await readSessionInventory());
 }
 
-export async function _cleanupOneForTesting(target: TopicWorktreeTarget, dataDir: string = DATA_DIR): Promise<void> {
-  await cleanupOne(target, dataDir);
+export async function _cleanupOneForTesting(
+  target: TopicWorktreeTarget,
+  dataDir: string = DATA_DIR,
+): Promise<CloneCleanupDecision | undefined> {
+  return cleanupOne(target, dataDir);
 }
 
 export function _hostPathForProcessCwdForTesting(mountinfoText: string, cwd: string): string | null {

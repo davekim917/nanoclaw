@@ -632,3 +632,132 @@ function checkoutShape(checkoutPath: string): CheckoutShape {
   if (stat.isDirectory()) return 'clone';
   return stat.isFile() ? 'linked' : 'unknown';
 }
+
+// ── Checkout staging and metadata (plan §5.2) ────────────────────────────────
+//
+// The host builds a clone under `<topic>/checkout-staging/<requestId>/<name>`
+// and publishes it into `<topic>/worktrees/` with one rename on the same
+// filesystem, so a checkout exists only once it is fully initialized.
+//
+// Staging sits BESIDE `worktrees/`, never inside it. `worktrees/` is mounted
+// read-write into the topic's containers (container-runner.ts:4386), so an
+// agent can plant anything there, a symlink included, and the host's staging
+// mkdir and crash-residue removal would follow it into host data. The topic
+// state dir itself is not mounted, so nothing a container writes can steer
+// them, and no lister or sweep of `worktrees/` ever sees a half-built clone.
+
+const CHECKOUT_STAGING_DIRNAME = 'checkout-staging';
+export const CHECKOUT_METADATA_FILENAME = 'nanoclaw-checkout.json';
+/** A staging entry this old, on a lane with no job running, is crash residue. */
+export const CHECKOUT_STAGING_STALE_MS = 60 * 60 * 1000;
+
+export type CheckoutStartedFrom = 'canonical-local' | 'origin-branch' | 'origin-head' | 'local-head';
+
+const CHECKOUT_STARTED_FROM: ReadonlySet<string> = new Set<CheckoutStartedFrom>([
+  'canonical-local',
+  'origin-branch',
+  'origin-head',
+  'local-head',
+]);
+
+/** `<clone>/.git/nanoclaw-checkout.json`, written by the host when it creates a clone. */
+export interface CheckoutMetadata {
+  version: 1;
+  repo: string;
+  branch: string;
+  startCommit: string;
+  startedFrom: CheckoutStartedFrom;
+}
+
+export function checkoutStagingRoot(topicWorktreesDir: string): string {
+  // Beside the worktrees root in the topic state dir, outside every container mount.
+  return path.join(path.dirname(topicWorktreesDir), CHECKOUT_STAGING_DIRNAME);
+}
+
+export function checkoutMetadataPath(checkoutPath: string): string {
+  return path.join(checkoutPath, '.git', CHECKOUT_METADATA_FILENAME);
+}
+
+/** The clone's recorded identity; `null` when the file is absent, a throw when it is not a valid record. */
+export function readCheckoutMetadata(checkoutPath: string): CheckoutMetadata | null {
+  const file = checkoutMetadataPath(checkoutPath);
+  let fd: number;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw new Error(`checkout metadata is unreadable: ${file}`, { cause: error });
+  }
+  let parsed: Partial<CheckoutMetadata>;
+  try {
+    if (!fs.fstatSync(fd).isFile()) throw new Error(`checkout metadata is not a regular file: ${file}`);
+    parsed = JSON.parse(fs.readFileSync(fd, 'utf8')) as Partial<CheckoutMetadata>;
+  } finally {
+    fs.closeSync(fd);
+  }
+  if (
+    parsed.version !== 1 ||
+    typeof parsed.repo !== 'string' ||
+    typeof parsed.branch !== 'string' ||
+    !parsed.branch ||
+    typeof parsed.startCommit !== 'string' ||
+    !/^[0-9a-f]{40,64}$/.test(parsed.startCommit) ||
+    typeof parsed.startedFrom !== 'string' ||
+    !CHECKOUT_STARTED_FROM.has(parsed.startedFrom)
+  ) {
+    throw new Error(`checkout metadata is malformed: ${file}`);
+  }
+  return {
+    version: 1,
+    repo: parsed.repo,
+    branch: parsed.branch,
+    startCommit: parsed.startCommit,
+    startedFrom: parsed.startedFrom,
+  };
+}
+
+export function writeCheckoutMetadata(checkoutPath: string, metadata: CheckoutMetadata): void {
+  const file = checkoutMetadataPath(checkoutPath);
+  const fd = fs.openSync(file, 'wx', 0o644);
+  try {
+    fs.writeFileSync(fd, `${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Delete `checkout-staging/<requestId>` entries, other than `keep`, whose mtime is at
+ * least `maxAgeMs` old. Returns the removed names.
+ *
+ * Safe only where no job can be building inside one of them: the caller must
+ * be the one job its topic's lane is running (job-runner lanes run one job at a
+ * time per work unit), or otherwise prove the lane idle. A staging entry only
+ * ever holds a host-built clone that was never published, so removing it loses
+ * no agent work.
+ */
+export function removeStaleCheckoutStaging(
+  topicWorktreesDir: string,
+  options: { now: number; keep?: string; maxAgeMs?: number },
+): string[] {
+  const root = checkoutStagingRoot(topicWorktreesDir);
+  const maxAgeMs = options.maxAgeMs ?? CHECKOUT_STAGING_STALE_MS;
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+  const removed: string[] = [];
+  for (const entry of entries) {
+    if (entry.name === options.keep) continue;
+    const full = path.join(root, entry.name);
+    const stat = fs.lstatSync(full);
+    if (options.now - stat.mtimeMs < maxAgeMs) continue;
+    fs.rmSync(full, { recursive: true, force: true });
+    removed.push(entry.name);
+  }
+  return removed.sort();
+}

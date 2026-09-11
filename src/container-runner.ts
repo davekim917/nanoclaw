@@ -84,6 +84,7 @@ import { readEnvFileMatching } from './env.js';
 import { resolveGitHubToken as resolveGitHubTokenForContainer } from './github-token.js';
 export { resolveGitHubToken } from './github-token.js';
 import { containerRunsAsHostUser, planGitHubTokenSpawn, registerGroupTokenRefresher } from './github-token-file.js';
+import { CHECKOUT_MODE_ENV, effectiveCheckoutMode } from './checkout-mode.js';
 import {
   getAgentGroup,
   getAllAgentGroups,
@@ -5993,6 +5994,7 @@ async function buildContainerArgs(
     args.push('-e', `NANOCLAW_HOST_DATA_DIR=${DATA_DIR}`);
     args.push('-e', `NANOCLAW_HOST_TOPIC_WORKTREES_DIR=${topicWorktreesDir(repositoryWorkUnit)}`);
     args.push('-e', `NANOCLAW_WORK_UNIT_KEY=${repositoryWorkUnit.key}`);
+    args.push('-e', `${CHECKOUT_MODE_ENV}=${effectiveCheckoutMode()}`);
   }
 
   // Workgroup awareness — the agent learns which workgroup (multi-agent

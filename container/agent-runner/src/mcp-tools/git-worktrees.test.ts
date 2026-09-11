@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { execFileSync } from 'child_process';
 import { randomBytes } from 'crypto';
 import {
@@ -16,7 +16,8 @@ import { fileURLToPath } from 'url';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
-import { cloneRepoTool, createWorktreeTool, gitCommitTool, gitPushTool } from './git-worktrees';
+import { cloneRepoTool, createWorktreeTool, gitCommitTool, gitPushTool, openPrTool } from './git-worktrees';
+import { checkoutDirName } from './checkout-layout';
 import { builtInNanoclawMcpEnv } from '../nanoclaw-mcp-env.js';
 import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
 describe('topic-linked worktree topology', () => {
@@ -34,6 +35,10 @@ describe('topic-linked worktree topology', () => {
     'NANOCLAW_REPOSITORY_ALLOW_LOCAL_ORIGIN',
     'NANOCLAW_REPOSITORY_ACTION_TRANSPORT',
     'NANOCLAW_REVIEW_CHURN_GATE_SCRIPT',
+    'NANOCLAW_CHECKOUT_MODE',
+    'NANOCLAW_REPOSITORY_CHECKOUT_TIMEOUT_MS',
+    'NANOCLAW_REPOSITORY_CHECKOUT_RETRY_DELAY_MS',
+    'PATH',
     'GIT_AUTHOR_NAME',
     'GIT_AUTHOR_EMAIL',
     'GIT_COMMITTER_NAME',
@@ -690,5 +695,654 @@ describe('topic-linked worktree topology', () => {
     } finally {
       closeSessionDb();
     }
+  });
+
+  // ── Branch clones (docs/specs/repository-branch-clones/plan.md §5.2-§5.3) ──
+  //
+  // repository_checkout is a host action (owned by the lead / host builder,
+  // src/modules/repository-workspaces/index.ts). These tests simulate the
+  // host side of that round trip by hand: they write the inbound response row
+  // directly and, for a "the host already published this" scenario, build the
+  // clone directory on disk the same way §5.2 says the host would — a plain
+  // `git clone` from the pin's origin (or the canonical, for a local-only
+  // pin), checked out on the target branch, with `.git/nanoclaw-checkout.json`
+  // written by hand. What's under test is the CONTAINER side: resolveCheckout,
+  // the create_worktree poll/retry/timeout loop, and the post-fetch freshness
+  // step — never the host's own directory creation or start-point selection.
+  describe('branch clones (plan §5.2-§5.3)', () => {
+    function tryPlainGit(cwd: string, args: string[]): string | null {
+      try {
+        return plainGit(cwd, args);
+      } catch {
+        return null;
+      }
+    }
+
+    function createHostClone(
+      sourceUrl: string,
+      clonePath: string,
+      opts: {
+        repo: string;
+        branch: string;
+        startedFrom: 'canonical-local' | 'origin-branch' | 'origin-head' | 'local-head';
+        localOnly?: boolean;
+      },
+    ): { startCommit: string } {
+      execFileSync('git', ['clone', '-q', sourceUrl, clonePath], { stdio: 'pipe' });
+      plainGit(clonePath, ['config', 'gc.auto', '0']);
+      if (opts.localOnly) plainGit(clonePath, ['remote', 'remove', 'origin']);
+      const localExists = tryPlainGit(clonePath, ['show-ref', '--verify', `refs/heads/${opts.branch}`]) !== null;
+      if (localExists) {
+        git(clonePath, ['checkout', '-q', opts.branch]);
+      } else {
+        const remoteExists =
+          !opts.localOnly &&
+          tryPlainGit(clonePath, ['show-ref', '--verify', `refs/remotes/origin/${opts.branch}`]) !== null;
+        if (remoteExists) {
+          git(clonePath, ['checkout', '-q', '-b', opts.branch, `origin/${opts.branch}`]);
+        } else {
+          git(clonePath, ['checkout', '-q', '-b', opts.branch]);
+        }
+      }
+      const startCommit = git(clonePath, ['rev-parse', 'HEAD']);
+      writeFileSync(
+        join(clonePath, '.git', 'nanoclaw-checkout.json'),
+        `${JSON.stringify({ version: 1, repo: opts.repo, branch: opts.branch, startCommit, startedFrom: opts.startedFrom }, null, 2)}\n`,
+      );
+      return { startCommit };
+    }
+
+    function writeRepositoryActionResponse(inbound: any, requestId: string, payload: Record<string, unknown>): void {
+      inbound
+        .query(
+          `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, recurrence, series_id, tries, trigger, platform_id, channel_type, thread_id, content, on_wake)
+           VALUES (?, NULL, 'system', ?, 'pending', NULL, NULL, NULL, 0, 0, NULL, NULL, NULL, ?, 0)`,
+        )
+        .run(
+          `repository-action-response-${requestId}`,
+          new Date().toISOString(),
+          JSON.stringify({ type: 'repository_action_response', requestId, ...payload }),
+        );
+    }
+
+    async function waitForOutboundAction(
+      outbound: any,
+      action: string,
+      seen: Set<string>,
+      timeoutMs = 5000,
+    ): Promise<{ requestId: string; [key: string]: unknown }> {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const rows = outbound.query('SELECT content FROM messages_out ORDER BY seq ASC').all() as { content: string }[];
+        for (const row of rows) {
+          let parsed: { action?: string; requestId?: string; [key: string]: unknown };
+          try {
+            parsed = JSON.parse(row.content);
+          } catch {
+            continue;
+          }
+          if (parsed.action === action && typeof parsed.requestId === 'string' && !seen.has(parsed.requestId)) {
+            seen.add(parsed.requestId);
+            return parsed as { requestId: string; [key: string]: unknown };
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      throw new Error(`timed out waiting for outbound ${action}`);
+    }
+
+    // Bun's execFileSync (no explicit `env`) resolves the executable through
+    // a snapshot taken independently of later `process.env.PATH` mutations,
+    // so a PATH-prepended stub script is never picked up — verified against
+    // this Bun version. `mock.module` replaces `child_process` even for
+    // `git-worktrees.ts`'s already-bound import (Bun supports retroactive
+    // module replacement), so `gh` is faked here while `git` (and everything
+    // else) passes through to the real implementation unchanged.
+    const realChildProcess = require('child_process') as typeof import('child_process');
+    const realExecFileSync = realChildProcess.execFileSync;
+
+    /** Fakes only `gh pr create`, echoing back the `--head` value it was given. */
+    function installFakeGh(): { restore: () => void } {
+      mock.module('child_process', () => ({
+        ...realChildProcess,
+        execFileSync: (file: string, args: string[], opts?: Record<string, unknown>) => {
+          if (file === 'gh') {
+            const headIndex = args.indexOf('--head');
+            const head = headIndex !== -1 ? args[headIndex + 1] : '';
+            return `https://example.invalid/pr/fake?head=${head}\n`;
+          }
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          return (realExecFileSync as any)(file, args, opts);
+        },
+      }));
+      return {
+        restore: () => {
+          mock.module('child_process', () => realChildProcess);
+        },
+      };
+    }
+
+    test('start point prefers canonical refs/heads/B, then origin/B, then origin/HEAD, and the post-fetch step only moves pristine checkouts', async () => {
+      // Container half only (P2-6): the host's own start-point SELECTION is
+      // simulated by hand via createHostClone; what's asserted here is the
+      // container's post-fetch pristine-move rule.
+      process.env.NANOCLAW_CHECKOUT_MODE = 'clone';
+      const { inbound, outbound } = initTestSessionDb();
+      delete process.env.NANOCLAW_REPOSITORY_ACTION_TRANSPORT;
+      try {
+        const seen = new Set<string>();
+
+        // Fixture 1: pristine, startedFrom origin-branch, origin/B advanced
+        // as a descendant of startCommit -> fast-forward.
+        {
+          const branch = 'ff-branch';
+          const seedScratch = join(root, 'ff-seed');
+          execFileSync('git', ['clone', '-q', remote, seedScratch]);
+          git(seedScratch, ['checkout', '-q', '-b', branch]);
+          git(seedScratch, ['push', '-q', 'origin', branch]);
+
+          const dirName = checkoutDirName('proj', branch);
+          const clonePath = join(firstTopic, dirName);
+          const { startCommit } = createHostClone(remote, clonePath, {
+            repo: 'proj',
+            branch,
+            startedFrom: 'origin-branch',
+          });
+
+          writeFileSync(join(seedScratch, 'ff.txt'), 'ff\n');
+          git(seedScratch, ['add', '-A']);
+          git(seedScratch, ['commit', '-q', '-m', 'advance']);
+          git(seedScratch, ['push', '-q', 'origin', branch]);
+          const advanced = git(seedScratch, ['rev-parse', 'HEAD']);
+          expect(advanced).not.toBe(startCommit);
+
+          const callPromise = createWorktreeTool.handler({ repo: 'proj', branch });
+          const request = await waitForOutboundAction(outbound, 'repository_checkout', seen);
+          writeRepositoryActionResponse(inbound, request.requestId, {
+            ok: true,
+            dirName,
+            branch,
+            created: true,
+            startedFrom: 'origin-branch',
+          });
+          const response = await callPromise;
+          expect(response.isError).toBeFalsy();
+          expect(response.content[0].text).toContain('moved-fast-forward');
+          expect(git(clonePath, ['rev-parse', 'HEAD'])).toBe(advanced);
+          expect(JSON.parse(readFileSync(join(clonePath, '.git', 'nanoclaw-checkout.json'), 'utf8')).startCommit).toBe(
+            advanced,
+          );
+        }
+
+        // Fixture 2: pristine, startedFrom origin-head -> reset --keep to a
+        // fresh origin/HEAD.
+        {
+          const branch = 'reset-branch';
+          const dirName = checkoutDirName('proj', branch);
+          const clonePath = join(firstTopic, dirName);
+          createHostClone(remote, clonePath, { repo: 'proj', branch, startedFrom: 'origin-head' });
+
+          const scratch = join(root, 'reset-scratch');
+          execFileSync('git', ['clone', '-q', remote, scratch]);
+          writeFileSync(join(scratch, 'reset.txt'), 'reset\n');
+          git(scratch, ['add', '-A']);
+          git(scratch, ['commit', '-q', '-m', 'advance main']);
+          git(scratch, ['push', '-q', 'origin', 'main']);
+          const advanced = git(scratch, ['rev-parse', 'HEAD']);
+
+          const callPromise = createWorktreeTool.handler({ repo: 'proj', branch });
+          const request = await waitForOutboundAction(outbound, 'repository_checkout', seen);
+          writeRepositoryActionResponse(inbound, request.requestId, {
+            ok: true,
+            dirName,
+            branch,
+            created: true,
+            startedFrom: 'origin-head',
+          });
+          const response = await callPromise;
+          expect(response.isError).toBeFalsy();
+          expect(response.content[0].text).toContain('moved-reset');
+          expect(git(clonePath, ['rev-parse', 'HEAD'])).toBe(advanced);
+        }
+
+        // Fixture 3: not pristine (dirty working tree) -> left-as-is, even
+        // though origin has moved further.
+        {
+          const branch = 'dirty-branch';
+          const dirName = checkoutDirName('proj', branch);
+          const clonePath = join(firstTopic, dirName);
+          const { startCommit } = createHostClone(remote, clonePath, {
+            repo: 'proj',
+            branch,
+            startedFrom: 'origin-head',
+          });
+          writeFileSync(join(clonePath, 'dirty.txt'), 'dirty\n');
+
+          const callPromise = createWorktreeTool.handler({ repo: 'proj', branch });
+          const request = await waitForOutboundAction(outbound, 'repository_checkout', seen);
+          writeRepositoryActionResponse(inbound, request.requestId, {
+            ok: true,
+            dirName,
+            branch,
+            created: false,
+            startedFrom: 'origin-head',
+          });
+          const response = await callPromise;
+          expect(response.isError).toBeFalsy();
+          expect(response.content[0].text).toContain('left-as-is');
+          expect(git(clonePath, ['rev-parse', 'HEAD'])).toBe(startCommit);
+          expect(existsSync(join(clonePath, 'dirty.txt'))).toBe(true);
+        }
+
+        // Fixture 4: pristine, but startedFrom canonical-local (preserved
+        // legacy work) -> never moved, even though it is pristine.
+        {
+          const branch = 'canonical-local-branch';
+          git(canonical, ['branch', branch]);
+          const dirName = checkoutDirName('proj', branch);
+          const clonePath = join(firstTopic, dirName);
+          const { startCommit } = createHostClone(remote, clonePath, {
+            repo: 'proj',
+            branch,
+            startedFrom: 'canonical-local',
+          });
+
+          const callPromise = createWorktreeTool.handler({ repo: 'proj', branch });
+          const request = await waitForOutboundAction(outbound, 'repository_checkout', seen);
+          writeRepositoryActionResponse(inbound, request.requestId, {
+            ok: true,
+            dirName,
+            branch,
+            created: true,
+            startedFrom: 'canonical-local',
+          });
+          const response = await callPromise;
+          expect(response.isError).toBeFalsy();
+          expect(response.content[0].text).toContain('left-as-is');
+          expect(git(clonePath, ['rev-parse', 'HEAD'])).toBe(startCommit);
+        }
+      } finally {
+        closeSessionDb();
+      }
+    });
+
+    test('a checkout whose current branch differs from its recorded branch is refused, not reused', async () => {
+      const branch = 'r3-branch';
+      const dirName = checkoutDirName('proj', branch);
+      const clonePath = join(firstTopic, dirName);
+      createHostClone(remote, clonePath, { repo: 'proj', branch, startedFrom: 'origin-head' });
+      // A manual `git switch` inside `<repo>@<slug>` breaks R3.
+      git(clonePath, ['switch', '-q', '-c', 'switched-away']);
+      const before = git(clonePath, ['rev-parse', 'HEAD']);
+      const indexBefore = readFileSync(join(clonePath, '.git', 'index'));
+
+      const createResp = await createWorktreeTool.handler({ repo: 'proj', branch });
+      expect(createResp.isError).toBe(true);
+      expect(createResp.content[0].text).toContain('not its recorded branch');
+
+      const pushResp = await gitPushTool.handler({ repo: 'proj', branch });
+      expect(pushResp.isError).toBe(true);
+      expect(pushResp.content[0].text).toContain('not its recorded branch');
+
+      expect(git(clonePath, ['rev-parse', 'HEAD'])).toBe(before);
+      expect(readFileSync(join(clonePath, '.git', 'index'))).toEqual(indexBefore);
+      expect(git(clonePath, ['branch', '--show-current'])).toBe('switched-away');
+    });
+
+    test('git_commit, git_push, and open_pr act on the checkout selected by branch and default to the primary', async () => {
+      expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+      const primary = join(firstTopic, 'proj');
+      const primaryBranch = git(primary, ['branch', '--show-current']);
+
+      const altBranch = 'alt-branch';
+      const dirName = checkoutDirName('proj', altBranch);
+      const altPath = join(firstTopic, dirName);
+      createHostClone(remote, altPath, { repo: 'proj', branch: altBranch, startedFrom: 'origin-head' });
+
+      writeFileSync(join(altPath, 'alt.txt'), 'alt\n');
+      const altCommit = await gitCommitTool.handler({ repo: 'proj', message: 'alt work', branch: altBranch });
+      expect(altCommit.isError).toBeFalsy();
+      expect(git(altPath, ['log', '-1', '--format=%s'])).toBe('alt work');
+      expect(git(primary, ['status', '--porcelain'])).toBe('');
+
+      const altPush = await gitPushTool.handler({ repo: 'proj', branch: altBranch });
+      expect(altPush.isError).toBeFalsy();
+      expect(git(remote, ['show-ref', '--verify', `refs/heads/${altBranch}`])).toContain(altBranch);
+
+      writeFileSync(join(primary, 'primary.txt'), 'primary\n');
+      const primaryCommit = await gitCommitTool.handler({ repo: 'proj', message: 'primary work' });
+      expect(primaryCommit.isError).toBeFalsy();
+      expect(git(primary, ['log', '-1', '--format=%s'])).toBe('primary work');
+      expect(git(altPath, ['log', '-1', '--format=%s'])).toBe('alt work');
+
+      const primaryPush = await gitPushTool.handler({ repo: 'proj' });
+      expect(primaryPush.isError).toBeFalsy();
+      expect(git(remote, ['show-ref', '--verify', `refs/heads/${primaryBranch}`])).toContain(primaryBranch);
+
+      const fakeGh = installFakeGh();
+      try {
+        const altPr = await openPrTool.handler({ repo: 'proj', title: 'Alt PR', branch: altBranch });
+        expect(altPr.isError).toBeFalsy();
+        expect(altPr.content[0].text).toContain(`head=${altBranch}`);
+
+        const primaryPr = await openPrTool.handler({ repo: 'proj', title: 'Primary PR' });
+        expect(primaryPr.isError).toBeFalsy();
+        expect(primaryPr.content[0].text).toContain(`head=${primaryBranch}`);
+      } finally {
+        fakeGh.restore();
+      }
+    });
+
+    test('open_pr opens the PR for a pushed branch that no checkout holds any more', async () => {
+      expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+      const primary = join(firstTopic, 'proj');
+      const pushed = git(primary, ['branch', '--show-current']);
+      writeFileSync(join(primary, 'work.txt'), 'work\n');
+      expect((await gitCommitTool.handler({ repo: 'proj', message: 'work' })).isError).toBeFalsy();
+      expect((await gitPushTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+      // A same-topic sibling switches the shared checkout between the push and the PR.
+      git(primary, ['checkout', '-q', '-b', 'sibling-branch']);
+
+      const fakeGh = installFakeGh();
+      try {
+        const pr = await openPrTool.handler({ repo: 'proj', title: 'Pushed work', branch: pushed });
+        expect(pr.isError).toBeFalsy();
+        expect(pr.content[0].text).toContain(`head=${pushed}`);
+      } finally {
+        fakeGh.restore();
+      }
+    });
+
+    test('worktree mode creates linked worktrees exactly as today', async () => {
+      process.env.NANOCLAW_CHECKOUT_MODE = 'worktree';
+      const first = await createWorktreeTool.handler({ repo: 'proj' });
+      const second = await createWorktreeTool.handler({ repo: 'proj' });
+      const worktree = join(firstTopic, 'proj');
+
+      expect(first.isError).toBeFalsy();
+      expect(second.isError).toBeFalsy();
+      expect(lstatSync(join(worktree, '.git')).isFile()).toBe(true);
+      expect(git(worktree, ['rev-parse', '--path-format=absolute', '--git-common-dir'])).toBe(join(canonical, '.git'));
+      expect(second.content[0].text).toContain('Worktree ready');
+    });
+
+    test('legacy linked checkouts are reused in clone mode and transfer still works for them', async () => {
+      expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+      const worktree = join(firstTopic, 'proj');
+      const branch = git(worktree, ['branch', '--show-current']);
+      const headBefore = git(worktree, ['rev-parse', 'HEAD']);
+
+      process.env.NANOCLAW_CHECKOUT_MODE = 'clone';
+      const reused = await createWorktreeTool.handler({ repo: 'proj' });
+      expect(reused.isError).toBeFalsy();
+      // Still a linked worktree — clone mode never converts an existing one.
+      expect(lstatSync(join(worktree, '.git')).isFile()).toBe(true);
+      expect(git(worktree, ['branch', '--show-current'])).toBe(branch);
+      expect(git(worktree, ['rev-parse', 'HEAD'])).toBe(headBefore);
+
+      const transferResp = await createWorktreeTool.handler({
+        repo: 'proj',
+        continueFromThreadId: 'topic-source-locator',
+      });
+      expect(transferResp.isError).toBeFalsy();
+      expect(transferResp.content[0].text).toContain('Repository transfer queued durably');
+    });
+
+    test('create_worktree waits for the host response, retries a retryable error once, and times out cleanly', async () => {
+      process.env.NANOCLAW_CHECKOUT_MODE = 'clone';
+      process.env.NANOCLAW_REPOSITORY_CHECKOUT_RETRY_DELAY_MS = '50';
+      const { inbound, outbound } = initTestSessionDb();
+      delete process.env.NANOCLAW_REPOSITORY_ACTION_TRANSPORT;
+      try {
+        const seen = new Set<string>();
+
+        // A response well inside the poll window resolves the tool.
+        {
+          const branch = 'resolves-branch';
+          const dirName = checkoutDirName('proj', branch);
+          const clonePath = join(firstTopic, dirName);
+          createHostClone(remote, clonePath, { repo: 'proj', branch, startedFrom: 'origin-head' });
+
+          const callPromise = createWorktreeTool.handler({ repo: 'proj', branch });
+          const request = await waitForOutboundAction(outbound, 'repository_checkout', seen);
+          writeRepositoryActionResponse(inbound, request.requestId, {
+            ok: true,
+            dirName,
+            branch,
+            created: true,
+            startedFrom: 'origin-head',
+          });
+          const response = await callPromise;
+          expect(response.isError).toBeFalsy();
+        }
+
+        // A retryable error is retried exactly once, against a NEW request id.
+        {
+          const branch = 'retry-branch';
+          const dirName = checkoutDirName('proj', branch);
+          const clonePath = join(firstTopic, dirName);
+          createHostClone(remote, clonePath, { repo: 'proj', branch, startedFrom: 'origin-head' });
+
+          const callPromise = createWorktreeTool.handler({ repo: 'proj', branch });
+          const firstRequest = await waitForOutboundAction(outbound, 'repository_checkout', seen);
+          writeRepositoryActionResponse(inbound, firstRequest.requestId, {
+            ok: false,
+            message: 'repository lifecycle is claimed',
+            retryable: true,
+          });
+          const secondRequest = await waitForOutboundAction(outbound, 'repository_checkout', seen);
+          expect(secondRequest.requestId).not.toBe(firstRequest.requestId);
+          writeRepositoryActionResponse(inbound, secondRequest.requestId, {
+            ok: true,
+            dirName,
+            branch,
+            created: true,
+            startedFrom: 'origin-head',
+          });
+          const response = await callPromise;
+          expect(response.isError).toBeFalsy();
+        }
+
+        // No response within the injected timeout returns an error naming the request id.
+        {
+          process.env.NANOCLAW_REPOSITORY_CHECKOUT_TIMEOUT_MS = '150';
+          const response = await createWorktreeTool.handler({ repo: 'proj', branch: 'timeout-branch' });
+          expect(response.isError).toBe(true);
+          expect(response.content[0].text).toMatch(/repo-\d+-[0-9a-f]{16}/);
+        }
+      } finally {
+        closeSessionDb();
+      }
+    });
+
+    test('local-only canonicals: clone has no origin, starts from preserved refs, skips fetch and refresh, refuses push/PR', async () => {
+      git(canonical, ['remote', 'remove', 'origin']);
+      writeFileSync(
+        join(dataDir, 'repository-state', 'wg-a', 'proj', 'origin.json'),
+        JSON.stringify({ kind: 'local-only', origin: null, repositoryId: 'local-only:wg-a-proj' }),
+      );
+      const canonicalHead = git(canonical, ['rev-parse', 'HEAD']);
+
+      process.env.NANOCLAW_CHECKOUT_MODE = 'clone';
+      const { inbound, outbound } = initTestSessionDb();
+      delete process.env.NANOCLAW_REPOSITORY_ACTION_TRANSPORT;
+      try {
+        const branch = 'local-only-branch';
+        const dirName = checkoutDirName('proj', branch);
+        const clonePath = join(firstTopic, dirName);
+        createHostClone(canonical, clonePath, { repo: 'proj', branch, startedFrom: 'local-head', localOnly: true });
+        expect(git(clonePath, ['rev-parse', 'HEAD'])).toBe(canonicalHead);
+        expect(tryPlainGit(clonePath, ['remote', 'get-url', 'origin'])).toBeNull();
+
+        const seen = new Set<string>();
+        const callPromise = createWorktreeTool.handler({ repo: 'proj', branch });
+        const request = await waitForOutboundAction(outbound, 'repository_checkout', seen);
+        writeRepositoryActionResponse(inbound, request.requestId, {
+          ok: true,
+          dirName,
+          branch,
+          created: true,
+          startedFrom: 'local-head',
+        });
+        const response = await callPromise;
+        expect(response.isError).toBeFalsy();
+        expect(response.content[0].text).toContain('preserved local-only canonical');
+
+        // No fetch, no refresh (today's rule for linked worktrees, carried over).
+        const outboundActions = (outbound.query('SELECT content FROM messages_out').all() as { content: string }[]).map(
+          (row) => JSON.parse(row.content).action,
+        );
+        expect(outboundActions).not.toContain('repository_refresh');
+        expect(existsSync(join(clonePath, '.git', 'FETCH_HEAD'))).toBe(false);
+
+        writeFileSync(join(clonePath, 'local.txt'), 'local work\n');
+        expect((await gitCommitTool.handler({ repo: 'proj', message: 'local work', branch })).isError).toBeFalsy();
+
+        const pushResp = await gitPushTool.handler({ repo: 'proj', branch });
+        expect(pushResp.isError).toBe(true);
+
+        const prResp = await openPrTool.handler({ repo: 'proj', title: 'Local only', branch });
+        expect(prResp.isError).toBe(true);
+      } finally {
+        closeSessionDb();
+      }
+    });
+
+    test('clones stay usable after rollback to worktree mode', async () => {
+      process.env.NANOCLAW_CHECKOUT_MODE = 'clone';
+      const { inbound, outbound } = initTestSessionDb();
+      delete process.env.NANOCLAW_REPOSITORY_ACTION_TRANSPORT;
+      try {
+        const seen = new Set<string>();
+        const primaryPath = join(firstTopic, 'proj');
+        const primaryStartBranch = 'nc/topic-rollback';
+        const secondaryBranch = 'rollback-secondary';
+        const secondaryDirName = checkoutDirName('proj', secondaryBranch);
+        const secondaryPath = join(firstTopic, secondaryDirName);
+
+        {
+          createHostClone(remote, primaryPath, {
+            repo: 'proj',
+            branch: primaryStartBranch,
+            startedFrom: 'origin-head',
+          });
+          const callPromise = createWorktreeTool.handler({ repo: 'proj' });
+          const request = await waitForOutboundAction(outbound, 'repository_checkout', seen);
+          writeRepositoryActionResponse(inbound, request.requestId, {
+            ok: true,
+            dirName: 'proj',
+            branch: primaryStartBranch,
+            created: true,
+            startedFrom: 'origin-head',
+          });
+          expect((await callPromise).isError).toBeFalsy();
+        }
+
+        {
+          createHostClone(remote, secondaryPath, { repo: 'proj', branch: secondaryBranch, startedFrom: 'origin-head' });
+          const callPromise = createWorktreeTool.handler({ repo: 'proj', branch: secondaryBranch });
+          const request = await waitForOutboundAction(outbound, 'repository_checkout', seen);
+          writeRepositoryActionResponse(inbound, request.requestId, {
+            ok: true,
+            dirName: secondaryDirName,
+            branch: secondaryBranch,
+            created: true,
+            startedFrom: 'origin-head',
+          });
+          expect((await callPromise).isError).toBeFalsy();
+        }
+
+        writeFileSync(join(secondaryPath, 'dirty.txt'), 'dirty bytes\n');
+        writeFileSync(join(secondaryPath, 'stash-me.txt'), 'stash me\n');
+        git(secondaryPath, ['add', 'stash-me.txt']);
+        git(secondaryPath, ['stash', 'push', '-m', 'rollback stash']);
+        const dirtyBefore = readFileSync(join(secondaryPath, 'dirty.txt'), 'utf8');
+        const stashListBefore = git(secondaryPath, ['stash', 'list']);
+        expect(stashListBefore).toContain('rollback stash');
+
+        // Roll back to worktree mode.
+        process.env.NANOCLAW_CHECKOUT_MODE = 'worktree';
+
+        const primaryReuse = await createWorktreeTool.handler({ repo: 'proj' });
+        expect(primaryReuse.isError).toBeFalsy();
+        expect(lstatSync(join(primaryPath, '.git')).isDirectory()).toBe(true);
+
+        const secondaryReuse = await createWorktreeTool.handler({ repo: 'proj', branch: secondaryBranch });
+        expect(secondaryReuse.isError).toBeFalsy();
+        expect(lstatSync(join(secondaryPath, '.git')).isDirectory()).toBe(true);
+
+        const commitResp = await gitCommitTool.handler({
+          repo: 'proj',
+          message: 'rollback commit',
+          branch: secondaryBranch,
+        });
+        expect(commitResp.isError).toBeFalsy();
+        const pushResp = await gitPushTool.handler({ repo: 'proj', branch: secondaryBranch });
+        expect(pushResp.isError).toBeFalsy();
+        expect(git(remote, ['show-ref', '--verify', `refs/heads/${secondaryBranch}`])).toContain(secondaryBranch);
+
+        const fakeGh = installFakeGh();
+        try {
+          const prResp = await openPrTool.handler({ repo: 'proj', title: 'Rollback PR', branch: secondaryBranch });
+          expect(prResp.isError).toBeFalsy();
+        } finally {
+          fakeGh.restore();
+        }
+
+        expect(readFileSync(join(secondaryPath, 'dirty.txt'), 'utf8')).toBe(dirtyBefore);
+        expect(git(secondaryPath, ['stash', 'list'])).toBe(stashListBefore);
+      } finally {
+        closeSessionDb();
+      }
+    });
+
+    test('a host completion after the tool timed out is served on the next call', async () => {
+      process.env.NANOCLAW_CHECKOUT_MODE = 'clone';
+      process.env.NANOCLAW_REPOSITORY_CHECKOUT_TIMEOUT_MS = '150';
+      const { inbound, outbound } = initTestSessionDb();
+      delete process.env.NANOCLAW_REPOSITORY_ACTION_TRANSPORT;
+      try {
+        const branch = 'late-completion-branch';
+        const dirName = checkoutDirName('proj', branch);
+        const clonePath = join(firstTopic, dirName);
+        const seen = new Set<string>();
+
+        const timedOutPromise = createWorktreeTool.handler({ repo: 'proj', branch });
+        // Mark the first (never-answered) request seen so the second call's
+        // wait below can't mistake it for its own request.
+        await waitForOutboundAction(outbound, 'repository_checkout', seen);
+        const timedOut = await timedOutPromise;
+        expect(timedOut.isError).toBe(true);
+        expect(timedOut.content[0].text).toMatch(/Timed out/);
+
+        // The host finishes the job late and publishes the checkout — harmless,
+        // since nothing is still polling the first request's response.
+        const { startCommit } = createHostClone(remote, clonePath, {
+          repo: 'proj',
+          branch,
+          startedFrom: 'origin-head',
+        });
+        const indexBefore = readFileSync(join(clonePath, '.git', 'index'));
+
+        process.env.NANOCLAW_REPOSITORY_CHECKOUT_TIMEOUT_MS = '120000';
+        const callPromise = createWorktreeTool.handler({ repo: 'proj', branch });
+        const request = await waitForOutboundAction(outbound, 'repository_checkout', seen);
+        writeRepositoryActionResponse(inbound, request.requestId, {
+          ok: true,
+          dirName,
+          branch,
+          created: false,
+          startedFrom: 'origin-head',
+        });
+        const response = await callPromise;
+
+        expect(response.isError).toBeFalsy();
+        expect(git(clonePath, ['rev-parse', 'HEAD'])).toBe(startCommit);
+        expect(readFileSync(join(clonePath, '.git', 'index'))).toEqual(indexBefore);
+        expect(existsSync(join(clonePath, 'README.md'))).toBe(true);
+      } finally {
+        closeSessionDb();
+      }
+    });
   });
 });

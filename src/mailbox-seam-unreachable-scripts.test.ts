@@ -754,7 +754,7 @@ describe('storage-manager.ts / storage-activity.ts contain no literal seam call'
       ],
       'src/log.ts': ['log'],
       'src/modules/mailbox/index.ts': ['sessionMailboxPath'],
-      'src/repository-workspaces.ts': ['resolveRepositoryWorkUnit'],
+      'src/repository-workspaces.ts': ['listTopicCheckouts', 'resolveRepositoryWorkUnit'],
       'src/session-manager.ts': ['sessionContextPathFor', 'sessionsBaseDir', 'threadsBaseDir', 'threadWorktreeDir'],
       'src/storage-activity.ts': ['STORAGE_INTERNAL_ENTRY_NAMES', 'tryRunWithStorageCleanupClaim'],
       // `import type { ContainerConfigRow }` — a whole-clause type-only
@@ -839,6 +839,7 @@ describe('worktree-cleanup.ts contains no literal seam call, and the only contai
         'defaultTopicBranch',
         'ensureRepositoryLock',
         'isRepositoryName',
+        'listTopicCheckouts',
         'resolveRepositoryWorkUnit',
         'topicStateDir',
         'topicWorktreesDir',

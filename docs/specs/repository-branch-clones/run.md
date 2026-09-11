@@ -241,3 +241,69 @@ Known risks carried to ship: stale fingerprint until host restart; chmod residua
 - Approved plan: `docs/specs/repository-branch-clones/plan.md`, revision 2 with corrections through rev 2.4. The Phase 2 precondition is met: Phase 1 was merged in #625 and #632, deployed, and set to `NANOCLAW_DEPENDENCY_CACHE=apply` at 2026-09-11 12:25Z. The first apply pass adopted 4, converted 1, with 0 mismatches. A production farm was verified to share inodes with its entry, with a private hidden lockfile.
 - Worktree `.claude/worktrees/branch-clones`, branch `feat/repository-branch-clones`, base `04ae8a871` (origin/main). The live checkout is untouched.
 - The one definition the plan leaves to this build is the strict completeness rule for link-at-checkout (§5.7.5), defined below once built.
+
+### Builders and integration (2026-09-11)
+
+- **Builders.**
+  - H1: host checkout action, lanes, refresh absorb, strict link rule, mode flag and spawn env.
+  - H2: storage sweep and worktree cleanup through the lister, plus clone GC.
+  - C: container tools and instructions.
+
+  Their reports are leads. Everything below was re-verified by the lead.
+- **Strict link rule (§5.7.5), as built** (`checkLinkCompleteness`, `src/dependency-cache.ts`). A package-lock entry absent from the entry's hidden lockfile must be `optional`, and must be excused by one of:
+  - (a) its lockfile `os`/`cpu`, or a declared `libc`, exclude linux/`process.arch`/glibc;
+  - (b) it declares `os` or `cpu` with no `libc` and is named as a musl build;
+  - (c) every entry that requires it, found by node resolution, is itself absent and excused (least fixpoint; a cycle excuses nothing).
+
+  The platform is the agent image: Debian bookworm, glibc 2.36, x64, with no musl loader.
+- **Lead fixes at integration.** Each was test-first and failed for the stated reason before the fix.
+  1. **Staging moved out of `worktrees/` (security).**
+     - The hole: `worktrees/` is mounted read-write into the topic's containers (`container-runner.ts:4386`), so `worktrees/.staging` was agent-writable. A planted `.staging` symlink led the checkout job's crash-residue removal to delete host data.
+     - The proof: `stages outside the container-writable worktrees root, so a planted .staging is never followed` deleted `host-data/precious` before the fix.
+     - The fix: staging is now `<topic>/checkout-staging/` (`checkoutStagingRoot`), which no container mounts. The host creates `worktrees/` before publishing.
+     - Cleanup's `.staging` exclusions are gone. Anything the lister skips in `worktrees/` is reported, and refuses orphan-topic collection as `unknown`.
+     - Plan note: rev 2.5 at §5.1.
+  2. **A farm link never follows a symlinked package dir.**
+     - The hole: on reuse of an existing, container-writable clone, the host linked a farm into a host directory the agent had symlinked in.
+     - The proof: `never links a farm into a package dir an existing checkout reaches through a symlink` got farmsLinked 1 before the fix.
+     - The fix: `checkoutPackageDirs` keeps only dirs whose realpath is their path inside the checkout.
+  3. **Root-level regenerable stores are still swept.**
+     - The hole: H2's lister-only walk stopped reclaiming `worktrees/.pnpm-store`, which production topics carry.
+     - The fix: `findTopicRegenerableTargets` also takes a real directory with a regenerable name at the worktrees root.
+     - The proof: `still sweeps a regenerable store at the worktrees root, beside the checkouts`.
+  4. **No edits to upstream-ported mailbox files.**
+     - The problem: C added `findRepositoryActionResponse` to `db/messages-in.ts` and to the three `mailbox/` files pinned by `UPSTREAM-MANIFEST.json`, which `mailbox-seam-upstream.test.ts` failed on.
+     - The fix: reverted. The tool reads the response with the existing exact-id `getMessageIn`, which opens a fresh handle per call (`mailbox/sqlite/operations.ts:94-101`), and requires `status === 'pending'`.
+  5. **`open_pr` keeps its documented contract.**
+     - The problem: selecting the checkout by `branch` made `open_pr` fail when no checkout still holds the pushed branch, which is the very case `branch` exists for.
+     - The fix: it falls back to the primary checkout as the `gh` cwd. `--head` is the named branch either way.
+     - The proof: `open_pr opens the PR for a pushed branch that no checkout holds any more`.
+  6. **Import pins.** `mailbox-seam-unreachable-scripts.test.ts` gains `listTopicCheckouts` for storage-manager and worktree-cleanup. Both are pure layout functions from a module those manifests already pin.
+- **Decisions.**
+  - **The strict rule stays fail-closed on build-script optionals.** H1 measured 36 real trees: Phase 1's rules accept 28 and the strict rule accepts 23. The 13 refusals:
+    - 5 arm64 installs missing a linux-x64 binary: correct.
+    - 2 trees missing a non-optional package: correct.
+    - 6 x64 trees of one repository missing `lzo`. It is optional, has no `os`/`cpu`, and has an install script. It is absent in all 8 trees that lock it, so its source build evidently never succeeds in this image.
+
+    Excusing absent build-script optionals would accept 29 of 36, but it would also excuse a build that failed only transiently. So those checkouts get no shared farm and install their own, and the sweep still dedupes them afterwards. **Re-raise if** clone-mode logs show `link refused … lzo` dominating farm misses.
+  - Clone GC gets no `NANOCLAW_STORAGE_GC=apply` gate, the same as the linked path and the plan.
+  - `disposability` is an exported seam for the P2-13 spies.
+  - `GIT_CEILING_DIRECTORIES` is set on every git question about one checkout.
+  - Clone scope `all` includes HEAD.
+  - **H1 deviations, accepted:**
+    - The flock covers only the steps that read the canonical.
+    - Clone hygiene also detaches HEAD and drops the guessed branch and its config.
+    - A refusal is an answer: `ok:false`, acked.
+    - A transfer tombstone refuses a checkout.
+    - `canonical-local` sets no upstream.
+    - A network canonical without `origin/HEAD` is an error.
+  - **C deviations, accepted:** test-only env overrides for the 120 s/5 s poll, and `CheckoutNotFoundError` to tell "nothing here" from "invalid here".
+- **Known risks for review.**
+  - **Absorb trusts a clone's remote-tracking refs (plan §5.5).** An agent that forges `refs/remotes/origin/*` in its clone can fast-forward the canonical's copy to an unpushed descendant, and the `--remotes` disposability proof then reads that commit as pushed. The update is fast-forward only, and the canonical's next real fetch force-updates it back.
+  - **Path checks on container-writable trees are check-then-use.** For farm links and clone GC, an agent racing the host can still swap a directory between check and use, as with the existing sweep.
+  - **Same-thread spawns retry during a checkout.** Holding the lifecycle claim for a whole checkout makes them retry for its duration (`container-runner.ts:1611-1612`).
+- **Fresh results at integration.**
+  - **Host vitest,** over storage-manager, worktree-cleanup, both repository-workspaces suites, dependency-cache, checkout-mode, container-runner*, ratchet, tripwire, mailbox-seam and host-sweep*: 21 files, 666 of 667 passed. The one failure was the ratchet pin on the CHANGELOG entry. After the accept, `upstream-ratchet.test.ts` passed 17/17.
+  - **Container:** `bun test` over git-worktrees, checkout-layout and instruction-fragment-migration: 56/56. `tsc -p container/agent-runner/tsconfig.json` is clean.
+  - **Host checks:** `tsc --noEmit` is clean, eslint `--quiet` on changed `src/` reports 0 errors, and prettier is clean.
+  - **Ratchet:** growth accepted for `src/container-runner.ts` (+2: the mode env beside `NANOCLAW_WORK_UNIT_KEY`) and `CHANGELOG.md` (+2), leaving Δ 0.
