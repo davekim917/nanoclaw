@@ -60,9 +60,12 @@ import { finishInterruptedSessionArchivals } from './storage-manager.js';
 import { drainClosedSessionPendingBacklog } from './session-close-expiry.js';
 // Side-effect only: each registers its onHostStart/onHostShutdown timer with
 // src/host-lifecycle.ts at import time. See "7–10b" in startNanoClaw below.
+// managed-git-hooks.js is NOT one of these — it's a one-shot startup step
+// with a harder deadline (before anything can spawn), called explicitly
+// below via initializeManagedGitHooks, not registered as a timer.
 import './worktree-cleanup.js';
 import './repo-freshness.js';
-import './managed-git-hooks.js';
+import { initializeManagedGitHooks } from './managed-git-hooks.js';
 import './plugin-updater.js';
 import './commit-scan.js';
 import './backlog-canvas.js';
@@ -657,6 +660,17 @@ export async function main(): Promise<void> {
   // must happen before anything can spawn a container, so every spawn this
   // process makes mounts the same tree, not the live checkout mid-`git pull`.
   activateAgentRunnerSource();
+
+  // Refresh the host-managed pre-push secret-scan hooks directory and run
+  // the scan-policy core.hooksPath migration pass — same "nothing above
+  // this point can spawn" window as the two calls above. A spawn that
+  // mounts a scan-policy (wiki) repo asserts this directory's integrity
+  // (scanPolicyHookMounts -> assertManagedGitHooksIntegrity in
+  // container-runner.ts) and throws if it isn't populated yet, so this must
+  // run before any spawn can reach that path, not merely before delivery
+  // opens — see initializeManagedGitHooks's own doc comment for why this
+  // isn't one of the onHostStart timer registrants below.
+  initializeManagedGitHooks();
 
   await resetProcessingChannelIngress();
 

@@ -25,7 +25,6 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR, REPO_ROOT } from './config.js';
-import { onHostStart } from './host-lifecycle.js';
 import { log } from './log.js';
 import { repositoryConfigPath, safeGitConfigGet, safeGitConfigSet } from './safe-git.js';
 import { discoverCanonicalRepositories, repositoriesRoot } from './repository-workspaces.js';
@@ -34,8 +33,20 @@ export const MANAGED_GIT_HOOKS_DIR = path.join(DATA_DIR, 'managed-git-hooks');
 export const MANAGED_HOOK_FILENAME = 'pre-push';
 export const MANAGED_PATTERNS_FILENAME = 'nanoclaw-secret-patterns.sh';
 
-const HOOK_SOURCE = path.join(REPO_ROOT, 'scripts', 'wiki-pre-push-hook.sh');
-const PATTERNS_SOURCE = path.join(REPO_ROOT, 'scripts', 'lib', 'secret-scan.sh');
+// Computed lazily (never at module scope, unlike MANAGED_GIT_HOOKS_DIR above)
+// — this module is imported transitively by repository-workspaces/index.ts,
+// which a lot of unrelated tests pull in through a PARTIAL `./config.js`
+// mock that has no reason to know about REPO_ROOT. A module-scope
+// `path.join(REPO_ROOT, ...)` crashed every one of those at import time
+// (main.ts's registrant-contract review, round 2) even though none of them
+// ever call refreshManagedGitHooks/assertManagedGitHooksIntegrity. Only
+// evaluate REPO_ROOT inside the two functions that actually read these.
+function hookSourcePath(): string {
+  return path.join(REPO_ROOT, 'scripts', 'wiki-pre-push-hook.sh');
+}
+function patternsSourcePath(): string {
+  return path.join(REPO_ROOT, 'scripts', 'lib', 'secret-scan.sh');
+}
 
 /**
  * Today: the wiki canonical repo per workgroup (data/repositories/<wg>/wiki).
@@ -107,8 +118,8 @@ export function refreshManagedGitHooks(hooksDir: string = MANAGED_GIT_HOOKS_DIR)
   if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) {
     throw new Error(`managed git hooks path is not a real directory: ${hooksDir}`);
   }
-  const patterns = readSourceOrThrow(PATTERNS_SOURCE);
-  const hook = readSourceOrThrow(HOOK_SOURCE);
+  const patterns = readSourceOrThrow(patternsSourcePath());
+  const hook = readSourceOrThrow(hookSourcePath());
   atomicWriteInDir(hooksDir, MANAGED_PATTERNS_FILENAME, patterns, 0o644);
   atomicWriteInDir(hooksDir, MANAGED_HOOK_FILENAME, hook, 0o755);
   return { hookSha256: sha256(hook), patternsSha256: sha256(patterns) };
@@ -136,7 +147,7 @@ export function assertManagedGitHooksIntegrity(hooksDir: string = MANAGED_GIT_HO
     throw new Error(`managed pre-push hook is not a safe executable file: ${hookPath}`);
   }
   const installedHook = fs.readFileSync(hookPath);
-  const shippedHook = readSourceOrThrow(HOOK_SOURCE);
+  const shippedHook = readSourceOrThrow(hookSourcePath());
   if (!installedHook.equals(shippedHook)) {
     throw new Error(`managed pre-push hook content does not match the shipped source: ${hookPath}`);
   }
@@ -146,7 +157,7 @@ export function assertManagedGitHooksIntegrity(hooksDir: string = MANAGED_GIT_HO
     throw new Error(`managed secret-patterns file is not a safe regular file: ${patternsPath}`);
   }
   const installedPatterns = fs.readFileSync(patternsPath);
-  const shippedPatterns = readSourceOrThrow(PATTERNS_SOURCE);
+  const shippedPatterns = readSourceOrThrow(patternsSourcePath());
   if (!installedPatterns.equals(shippedPatterns)) {
     throw new Error(`managed secret-patterns content does not match the shipped source: ${patternsPath}`);
   }
@@ -214,11 +225,29 @@ export function migrateExistingCanonicalHooksPath(dataDir: string = DATA_DIR): C
   return { updated, alerts };
 }
 
-onHostStart(function managedGitHooksHostStart() {
-  // UNGUARDED — a synchronous startup failure must abort boot: a host that
-  // cannot guarantee the managed hook is genuine must not spawn a container
-  // that would mount it.
+/**
+ * One-shot startup init — NOT an onHostStart registrant. onHostStart's six
+ * registrants (worktree-cleanup, repo-freshness, plugin-updater, commit-scan,
+ * daily-summary, backlog-canvas — see the import list at the top of
+ * src/main.ts) are all recurring timers/intervals that `startHostModules`
+ * only starts once the DB and delivery adapter are ready — deliberately
+ * late, and host-lifecycle-timers.test.ts pins exactly those six as the
+ * timer-handle contract. This module starts nothing recurring; it runs once
+ * and returns. It also has a harder deadline than "once delivery is ready":
+ * `assertManagedGitHooksIntegrity` (container-runner.ts's scanPolicyHookMounts)
+ * depends on refreshManagedGitHooks having already populated
+ * MANAGED_GIT_HOOKS_DIR, so this must run before ANYTHING can spawn a
+ * container — the same "nothing above this point can spawn" window
+ * `ensureArchiveSchema`/`activateAgentRunnerSource` already rely on in
+ * src/main.ts's startup sequence. Call this directly from there, not via
+ * onHostStart.
+ *
+ * UNGUARDED — a synchronous startup failure must abort boot: a host that
+ * cannot guarantee the managed hook is genuine must not spawn a container
+ * that would mount it.
+ */
+export function initializeManagedGitHooks(): void {
   const { hookSha256 } = refreshManagedGitHooks();
   const { updated, alerts } = migrateExistingCanonicalHooksPath();
   log.info('Managed git hooks refreshed', { hookSha256, hooksPathMigrated: updated, hooksPathAlerts: alerts.length });
-});
+}
