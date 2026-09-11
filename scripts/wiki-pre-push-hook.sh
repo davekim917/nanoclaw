@@ -59,14 +59,18 @@
 #     git 2.39.5, not just the host's 2.43.0), so this hook runs the same
 #     in both places.
 #
-# Scope: this hook itself also checks it's running against a wiki
-# canonical repo's common git dir (a defensive fallback only — the real
-# gate is that core.hooksPath points here at all, which only happens for
-# scan-policy repos) and exits 0 immediately for anything else. Widening
-# scan-policy to code repos needs its own false-positive measurement first
-# — SECRET_BLOCK_RE has real false-positive vectors in code (PEM/AWS
-# example fixtures, test tokens named things like `token: string`) that a
-# wiki's prose content doesn't.
+# Scope: this hook has NO repo-name check of its own (#666 review H7/P3-9 —
+# an earlier version also matched its own common git dir against `*/wiki/.git`
+# as a defensive fallback; removed deliberately). `core.hooksPath` pointing
+# here at all IS the policy, decided once on the host
+# (isScanPolicyRepositoryName in src/managed-git-hooks.ts) — this script
+# scans UNCONDITIONALLY whenever git invokes it, so there is exactly one
+# place the scan-policy decision is made, not two that could silently
+# diverge. Widening scan-policy to code repos needs its own false-positive
+# measurement first — SECRET_BLOCK_RE has real false-positive vectors in
+# code (PEM/AWS example fixtures, test tokens named things like
+# `token: string`) that a wiki's prose content doesn't; that measurement
+# belongs in isScanPolicyRepositoryName, not a second predicate here.
 #
 # Protocol (githooks(5) `pre-push`): stdin carries one line per ref being
 # pushed — "<local ref> <local sha1> <remote ref> <remote sha1>". A push is
@@ -85,21 +89,6 @@ if ! secret_scan_selftest 2>/dev/null; then
   echo "pre-push: secret-pattern self-test failed -- refusing to push without a validated scanner" >&2
   exit 1
 fi
-
-# Defensive fallback (see Scope above): the real gate is host-side
-# (core.hooksPath only points here for scan-policy repos), but if this
-# script somehow ends up wired to a non-wiki repo anyway, do nothing.
-# --path-format=absolute is required: plain --git-common-dir returns a
-# path RELATIVE to cwd (e.g. bare ".git") whenever git is invoked from
-# inside the repo's own worktree root — which a pre-push hook always is —
-# so without it this check silently matched nothing and exited 0 for
-# every repo, wiki included (caught by testing this hook directly against
-# a real fixture, not just by inspection).
-GIT_COMMON_DIR_RESOLVED=$(LC_ALL=C git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || exit 0
-case "$GIT_COMMON_DIR_RESOLVED" in
-  */wiki/.git) ;;
-  *) exit 0 ;;
-esac
 
 ZERO_SHA='0000000000000000000000000000000000000000'
 
@@ -128,12 +117,48 @@ ZERO_SHA='0000000000000000000000000000000000000000'
 scan_range() {
   local local_sha="$1"
   local rc=0
+
+  # A ref that does not peel to a commit — a lightweight tag on a blob or
+  # tree, or (rarer) an annotated tag whose own target is a blob or tree —
+  # makes every commit-walk below silently produce NOTHING: verified
+  # directly (not assumed), `git log <blob-sha> --not --remotes` exits 0
+  # with empty output, it does not error (#666 review H5). That would let
+  # this scan_range return rc=0 with an empty combined_text, and the caller
+  # would read that as "nothing added" and allow the push — even though the
+  # object's own raw content (what a lightweight blob tag actually pushes)
+  # was never looked at. Refuse outright rather than guess how to scan an
+  # object shape wiki content never legitimately takes; `^{commit}` peels
+  # an annotated tag automatically, so a normal tag-on-a-commit is
+  # unaffected.
+  if ! LC_ALL=C git rev-parse --verify --quiet "${local_sha}^{commit}" >/dev/null 2>&1; then
+    echo "pre-push: ${local_sha} does not resolve to a commit -- refusing to push a non-commit ref blind." >&2
+    return 1
+  fi
+
   # 1. Every new commit's patch, added lines marked via
   #    --output-indicator-new (see secret-scan.sh's comment on
   #    SECRET_SCAN_NEW_INDICATOR for why this replaces a header-exclusion
   #    regex entirely instead of trying to enumerate every header shape).
+  #    --diff-merges=remerge (git >=2.36; the image has 2.39.5, the host
+  #    2.43) makes a MERGE commit's own patch the "remerge diff" — the
+  #    difference between what an automatic merge would have produced and
+  #    what was actually recorded — so content that exists ONLY in a
+  #    conflict resolution (never in either parent) gets scanned too (#666
+  #    review H1). Non-merge commits are unaffected by this flag either way.
   LC_ALL=C git log -p --no-color --text --no-ext-diff --no-textconv \
-    --src-prefix=a/ --dst-prefix=b/ \
+    --src-prefix=a/ --dst-prefix=b/ --diff-merges=remerge \
+    --output-indicator-new="$SECRET_SCAN_NEW_INDICATOR" --output-indicator-old=- --output-indicator-context=' ' \
+    "$local_sha" --not --remotes || rc=$?
+  # 1b. Octopus merges (3+ parents) print NOTHING under --diff-merges=remerge
+  #     (confirmed by testing, not just documentation — #666 review H1) — a
+  #     second, deliberately over-broad pass diffs an octopus merge against
+  #     only its first parent instead, so content introduced by ANY parent
+  #     still gets scanned even though this isn't isolated to just the
+  #     resolution the way remerge is for an ordinary two-parent merge.
+  #     --min-parents=3 means this pass touches nothing an ordinary merge or
+  #     single-parent commit already had scanned in step 1 above.
+  LC_ALL=C git log -p --no-color --text --no-ext-diff --no-textconv \
+    --src-prefix=a/ --dst-prefix=b/ --min-parents=3 --diff-merges=first-parent \
     --output-indicator-new="$SECRET_SCAN_NEW_INDICATOR" --output-indicator-old=- --output-indicator-context=' ' \
     "$local_sha" --not --remotes || rc=$?
   # 2. Every new commit's own message body. `git log -p --format=%B` would
@@ -177,6 +202,16 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   fi
 
   added_text=$(secret_scan_extract_added "$combined_text")
+  extract_rc=$?
+  if [ "$extract_rc" -ge 2 ]; then
+    # #666 review H6/P3-3: an extraction failure (grep exit >=2) must not
+    # read the same as "legitimately nothing added" (extract's own exit 1)
+    # — both produce empty output, but only one of them means there was
+    # genuinely nothing to scan.
+    echo "pre-push: BLOCKED $local_ref -> $remote_ref: the secret scanner itself failed -- refusing to push blind." >&2
+    blocked=1
+    continue
+  fi
   [ -n "$added_text" ] || continue
 
   block_hits=$(secret_scan_count "$added_text" "$SECRET_BLOCK_RE" sensitive)

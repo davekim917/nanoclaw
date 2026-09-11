@@ -34,6 +34,8 @@
     "test:coverage:risk": "VITEST_LANE=correctness vitest run --coverage",
     "check:risk-coverage": "tsx scripts/check-risk-coverage.ts",
     "check:public-boundary": "tsx scripts/check-public-boundary.ts",
+    "check:git-safety-selfcheck": "bash scripts/git-safety-selfcheck.sh",
+    "check:wiki-pre-push-hook-selfcheck": "bash scripts/wiki-pre-push-hook-selfcheck.sh",
     "ratchet:report": "tsx scripts/upstream-ratchet-report.ts",
     "upstream-dryrun-report": "tsx scripts/upstream-dry-run-report.ts",
     "build:dashboard": "tsx scripts/build-dashboard-spa.ts --install",

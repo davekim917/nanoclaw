@@ -148,6 +148,21 @@ jobs:
         # coverage the way transaction-closures.test.ts did on the host.
         run: bun run test -- --coverage --coverage-reporter=lcov --coverage-reporter=text
 
+      # Both build real fixture repos and run the SHIPPED scripts against
+      # them (never a re-implementation of either script's own logic) — the
+      # runtime self-tests each script's own hook/library calls
+      # (secret_scan_selftest) can only prove the pattern set compiles and
+      # actually matches something; only these catch a semantic regression
+      # (a boundary anchor removed, the allowlist substitution reverted to
+      # deletion, a fallback re-introduced) that still compiles fine.
+      # #666 review T1 — this was in the original wiki-hook spec and had
+      # been missing from CI until now. A real gate, not `continue-on-error`.
+      - name: git-safety.sh selfcheck
+        run: pnpm run check:git-safety-selfcheck
+
+      - name: wiki-pre-push-hook.sh selfcheck
+        run: pnpm run check:wiki-pre-push-hook-selfcheck
+
       # Feeds scripts/check-risk-coverage.ts against the committed
       # coverage-risk-baseline.json (docs/specs/risk-based-review/plan.md,
       # "Tests on risky paths"): a per-file floor set by each risk file's OWN

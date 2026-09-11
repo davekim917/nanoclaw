@@ -358,6 +358,180 @@ case "$PUSH_OUT" in
   *) bad "unresolvable local_sha: no BLOCKED message" "$PUSH_OUT" ;;
 esac
 
+# ═══ 15. A merge commit's own conflict resolution is scanned (H1) ═════════
+# --diff-merges=remerge: content that exists ONLY in the merge commit's own
+# tree (not in either parent) — the shape a real conflict resolution takes
+# — must still be scanned. Simulated with `merge --no-commit` plus an extra
+# edit before committing, which produces exactly that shape without needing
+# an actual textual conflict.
+new_fixture
+BEFORE_TIP=$(remote_tip)
+git -C "$WIKI" checkout -qb feature
+echo 'feature branch content' > "$WIKI/feature.md"
+git -C "$WIKI" add feature.md
+git -C "$WIKI" commit -qm "feature commit"
+git -C "$WIKI" checkout -q main
+echo 'main branch content' > "$WIKI/main-only.md"
+git -C "$WIKI" add main-only.md
+git -C "$WIKI" commit -qm "main commit"
+git -C "$WIKI" merge --no-commit --no-ff feature -q
+echo 'export GITHUB_TOKEN=ghp_16C7e42F292c6912E7710c838347Ae178B4aXYZ123' >> "$WIKI/main-only.md"
+git -C "$WIKI" add -A
+git -C "$WIKI" commit -qm "merge feature into main, with a token added only in the merge's own resolution"
+push_main
+[ "$PUSH_RC" -ne 0 ] && ok "token in a merge commit's own resolution: blocked" \
+  || bad "token in a merge commit's own resolution: push succeeded" "$PUSH_OUT"
+[ "$(remote_tip)" = "$BEFORE_TIP" ] && ok "merge-resolution token: remote unchanged" \
+  || bad "merge-resolution token: remote advanced" ""
+
+# ═══ 16. A genuinely CONFLICTING merge's resolution is scanned (H1) ═══════
+new_fixture
+BEFORE_TIP=$(remote_tip)
+echo 'line one' > "$WIKI/conflict.md"
+git -C "$WIKI" add conflict.md
+git -C "$WIKI" commit -qam "base file for a real conflict"
+git -C "$WIKI" checkout -qb conflict-branch
+echo 'branch version' > "$WIKI/conflict.md"
+git -C "$WIKI" commit -qam "branch edits the same line"
+git -C "$WIKI" checkout -q main
+echo 'main version' > "$WIKI/conflict.md"
+git -C "$WIKI" commit -qam "main edits the same line"
+git -C "$WIKI" merge --no-ff conflict-branch -q 2>/dev/null || true
+printf 'export GITHUB_TOKEN=ghp_16C7e42F292c6912E7710c838347Ae178B4aXYZ123\n' > "$WIKI/conflict.md"
+git -C "$WIKI" add -A
+git -C "$WIKI" commit -qm "resolve the conflict by hand, introducing a token"
+push_main
+[ "$PUSH_RC" -ne 0 ] && ok "token introduced resolving a real conflict: blocked" \
+  || bad "token introduced resolving a real conflict: push succeeded" "$PUSH_OUT"
+[ "$(remote_tip)" = "$BEFORE_TIP" ] && ok "conflict-resolution token: remote unchanged" \
+  || bad "conflict-resolution token: remote advanced" ""
+
+# ═══ 17. An octopus (3+ parent) merge is scanned via the first-parent pass (H1) ═══
+new_fixture
+BEFORE_TIP=$(remote_tip)
+git -C "$WIKI" checkout -qb branchB
+echo 'b' > "$WIKI/b.md"
+git -C "$WIKI" add b.md
+git -C "$WIKI" commit -qm "b"
+git -C "$WIKI" checkout -q main
+git -C "$WIKI" checkout -qb branchC
+echo 'c' > "$WIKI/c.md"
+git -C "$WIKI" add c.md
+git -C "$WIKI" commit -qm "c"
+git -C "$WIKI" checkout -q main
+# main must diverge from BOTH branches with its own commit, or `git merge
+# branchB branchC` fast-forwards to whichever branch main hasn't diverged
+# from instead of creating a real 3-parent octopus commit.
+echo 'main diverges too' > "$WIKI/main-diverge.md"
+git -C "$WIKI" add main-diverge.md
+git -C "$WIKI" commit -qm "main diverges from both branches"
+git -C "$WIKI" merge --no-commit -q branchB branchC
+echo 'export GITHUB_TOKEN=ghp_16C7e42F292c6912E7710c838347Ae178B4aXYZ123' > "$WIKI/octopus-secret.md"
+git -C "$WIKI" add -A
+git -C "$WIKI" commit -qm "octopus merge with a token added only in the merge itself"
+ACTUAL_PARENTS=$(git -C "$WIKI" show -s --format=%P HEAD | wc -w)
+[ "$ACTUAL_PARENTS" -eq 3 ] && ok "octopus fixture: the merge commit really has 3 parents" \
+  || bad "octopus fixture: expected 3 parents, got $ACTUAL_PARENTS (fixture is broken, not the hook)" ""
+push_main
+[ "$PUSH_RC" -ne 0 ] && ok "token in an octopus merge: blocked" \
+  || bad "token in an octopus merge: push succeeded" "$PUSH_OUT"
+[ "$(remote_tip)" = "$BEFORE_TIP" ] && ok "octopus-merge token: remote unchanged" \
+  || bad "octopus-merge token: remote advanced" ""
+
+# ═══ 18. Allowlist: a real token sharing a line with the AWS example key still blocks (H2) ═══
+new_fixture
+BEFORE_TIP=$(remote_tip)
+echo 'aws_key = AKIAIOSFODNN7EXAMPLE ghp_16C7e42F292c6912E7710c838347Ae178B4aXYZ123' >> "$WIKI/README.md"
+git -C "$WIKI" commit -qam "AWS example key sharing a line with a real token"
+push_main
+[ "$PUSH_RC" -ne 0 ] && ok "allowlisted example + real token on one line: blocked" \
+  || bad "allowlisted example + real token on one line: push succeeded" "$PUSH_OUT"
+[ "$(remote_tip)" = "$BEFORE_TIP" ] && ok "allowlist+real-token line: remote unchanged" \
+  || bad "allowlist+real-token line: remote advanced" ""
+
+# ═══ 19. Allowlist: an EMPTY literal skips the substitution, still blocks (H2) ═══
+write_allowlist_empty() { sed "s/^SECRET_SCAN_ALLOWLISTED_LITERAL=.*/SECRET_SCAN_ALLOWLISTED_LITERAL=''/" "$PATTERNS_SRC" > "$1"; }
+corrupt_variant_case "allowlist literal set to empty string" write_allowlist_empty
+
+# ═══ 20. Allowlist: an UNSET literal (line deleted) fails the selftest, so this also fails closed (H2) ═══
+write_allowlist_unset() { grep -v '^SECRET_SCAN_ALLOWLISTED_LITERAL=' "$PATTERNS_SRC" > "$1"; }
+corrupt_variant_case "allowlist literal declaration removed" write_allowlist_unset
+
+# ═══ 21. Allowlist join edge case: a space substitution can occasionally  ═══
+# manufacture a NEW coincidental match from characters that weren't one
+# before (never a deletion-style HIDDEN match — the documented, accepted
+# trade-off of substituting with a space instead of deleting the literal;
+# #666 review P2-4/H2). BLOCKing here is the expected, safe outcome.
+new_fixture
+BEFORE_TIP=$(remote_tip)
+AIZA35=$(printf 'A%.0s' $(seq 1 35))
+printf 'AIza%sAKIAIOSFODNN7EXAMPLE-\n' "$AIZA35" >> "$WIKI/README.md"
+git -C "$WIKI" commit -qam "allowlist-join edge case"
+push_main
+[ "$PUSH_RC" -ne 0 ] && ok "allowlist-join edge case: blocked (expected — space substitution, not a real secret)" \
+  || bad "allowlist-join edge case: push succeeded" "$PUSH_OUT"
+
+# ═══ 22. BLOCK boundary contexts (H3) ══════════════════════════════════════
+boundary_block_case() { # label, line
+  new_fixture
+  BEFORE_TIP=$(remote_tip)
+  printf '%s\n' "$2" >> "$WIKI/README.md"
+  git -C "$WIKI" commit -qam "boundary case: $1"
+  push_main
+  [ "$PUSH_RC" -ne 0 ] && ok "BLOCK boundary ($1): blocked" \
+    || bad "BLOCK boundary ($1): push succeeded" "$PUSH_OUT"
+  [ "$(remote_tip)" = "$BEFORE_TIP" ] && ok "BLOCK boundary ($1): remote unchanged" \
+    || bad "BLOCK boundary ($1): remote advanced" ""
+}
+boundary_block_case "quoted token" 'TOKEN = "ghp_16C7e42F292c6912E7710c838347Ae178B4aXYZ123"'
+boundary_block_case "token after =" 'GITHUB_TOKEN=ghp_16C7e42F292c6912E7710c838347Ae178B4aXYZ123'
+boundary_block_case "token in a URL" 'remote: https://ghp_16C7e42F292c6912E7710c838347Ae178B4aXYZ123@github.com/org/repo.git'
+boundary_block_case "token at column 0" 'ghp_16C7e42F292c6912E7710c838347Ae178B4aXYZ123'
+
+# ═══ 23. A token-length run embedded in a LONGER base64url string must NOT block (H3) ═══
+new_fixture
+BEFORE_TIP=$(remote_tip)
+# 30+ alnum chars immediately preceded AND followed by more base64url
+# characters — never bounded by a non-token character on either side, so no
+# BLOCK alternative's boundary requirement is satisfied anywhere in it.
+printf 'blob: %s\n' "$(printf 'A%.0s' $(seq 1 20))ghp_$(printf 'B%.0s' $(seq 1 40))" >> "$WIKI/README.md"
+git -C "$WIKI" commit -qam "token-shaped run embedded in a longer base64url-like string"
+push_main
+[ "$PUSH_RC" -eq 0 ] && ok "token-length run embedded in longer base64url: not blocked" \
+  || bad "token-length run embedded in longer base64url: blocked" "$PUSH_OUT"
+[ "$(remote_tip)" != "$BEFORE_TIP" ] && ok "embedded run: remote advanced" \
+  || bad "embedded run: remote did not advance" ""
+
+# ═══ 24. A lightweight tag pointing at a blob (not a commit) fails closed (H5) ═══
+# A lightweight tag has no tag object at all — the ref points directly at
+# the target. `git log`/`git log --format=%B` both require a commit-ish and
+# fail on a blob, and scan_range's fail-closed-on-any-git-error path (P1-2)
+# already covers this structurally; this fixture proves it, not just the
+# per-commit "tag" branch (which never even runs here, since
+# `git cat-file -t` reports "blob", not "tag").
+new_fixture
+BLOB_SHA=$(git -C "$WIKI" hash-object -w --stdin <<<'not a commit, just a blob')
+git -C "$WIKI" tag lightweight-blob-tag "$BLOB_SHA"
+PUSH_OUT=$(git -C "$WIKI" push origin lightweight-blob-tag 2>&1)
+PUSH_RC=$?
+[ "$PUSH_RC" -ne 0 ] && ok "lightweight tag on a blob: fails closed" \
+  || bad "lightweight tag on a blob: push succeeded" "$PUSH_OUT"
+git --git-dir="$REMOTE" rev-parse -q --verify lightweight-blob-tag >/dev/null 2>&1 \
+  && bad "lightweight tag on a blob: pushed anyway" "" \
+  || ok "lightweight tag on a blob: nothing landed on the remote"
+
+# ═══ 25. A lightweight tag pointing at a tree (not a commit) also fails closed (H5) ═══
+new_fixture
+TREE_SHA=$(git -C "$WIKI" write-tree)
+git -C "$WIKI" tag lightweight-tree-tag "$TREE_SHA"
+PUSH_OUT=$(git -C "$WIKI" push origin lightweight-tree-tag 2>&1)
+PUSH_RC=$?
+[ "$PUSH_RC" -ne 0 ] && ok "lightweight tag on a tree: fails closed" \
+  || bad "lightweight tag on a tree: push succeeded" "$PUSH_OUT"
+git --git-dir="$REMOTE" rev-parse -q --verify lightweight-tree-tag >/dev/null 2>&1 \
+  && bad "lightweight tag on a tree: pushed anyway" "" \
+  || ok "lightweight tag on a tree: nothing landed on the remote"
+
 echo
 if [ "$FAILED" -eq 0 ]; then
   echo "wiki-pre-push-hook-selfcheck: all checks passed"

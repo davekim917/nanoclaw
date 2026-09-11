@@ -9,7 +9,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { MOUNT_ALLOWLIST_PATH } from '../../config.js';
+import { DATA_DIR, MOUNT_ALLOWLIST_PATH } from '../../config.js';
 import { log } from '../../log.js';
 
 export interface AdditionalMount {
@@ -193,6 +193,36 @@ function getRealPath(p: string): string | null {
 }
 
 /**
+ * True when `realPath` touches the host-managed git-hooks tree
+ * (data/managed-git-hooks/ — src/managed-git-hooks.ts) in either direction
+ * (#666 review B9: "equals or contains data/managed-git-hooks (DATA_DIR or
+ * any ancestor)"):
+ *   - realPath EQUALS the tree root, or is a DESCENDANT of it (mounting
+ *     into scan/ or refuse/ directly — a container could overwrite the
+ *     hook or pattern lib);
+ *   - realPath is an ANCESTOR of the tree root — DATA_DIR itself, or
+ *     anything above it — because a read-write mount of a broader
+ *     directory reaches the managed tree through the parent just as surely
+ *     as mounting it directly.
+ * Compares REALPATHS both ways (#666 review B11), not the raw strings, so a
+ * symlink that only resolves into (or over) the tree is caught the same as
+ * a direct path. Returns false (never blocks) if the tree doesn't exist yet
+ * on this host — nothing to protect before the first boot that creates it,
+ * and a mount request for a non-existent host path is already refused
+ * earlier in validateMount regardless.
+ */
+function touchesManagedGitHooksRoot(realPath: string): boolean {
+  const managedRoot = getRealPath(path.join(DATA_DIR, 'managed-git-hooks'));
+  if (managedRoot === null) return false;
+  if (realPath === managedRoot) return true;
+  const asDescendant = path.relative(managedRoot, realPath);
+  if (!asDescendant.startsWith('..') && !path.isAbsolute(asDescendant)) return true;
+  const asAncestor = path.relative(realPath, managedRoot);
+  if (!asAncestor.startsWith('..') && !path.isAbsolute(asAncestor)) return true;
+  return false;
+}
+
+/**
  * Check if a path matches any blocked pattern
  */
 function matchesBlockedPattern(realPath: string, blockedPatterns: string[]): string | null {
@@ -316,6 +346,19 @@ export function validateMount(mount: AdditionalMount): MountValidationResult {
     return {
       allowed: false,
       reason: `Path matches blocked pattern "${blockedMatch}": "${realPath}"`,
+    };
+  }
+
+  // Refuse a read-write mount into the host-managed git-hooks tree
+  // unconditionally (#666 review B9) — a container that could write there
+  // could overwrite the boot-snapshotted hook or pattern lib every
+  // scan-policy repo's push depends on, regardless of what the allowlist
+  // otherwise permits. Read-only mounts of the same tree are unaffected —
+  // the allowlist's normal root/pattern checks still apply to those.
+  if (mount.readonly === false && touchesManagedGitHooksRoot(realPath)) {
+    return {
+      allowed: false,
+      reason: `Path "${realPath}" is read-write inside the host-managed git-hooks tree — refused unconditionally`,
     };
   }
 

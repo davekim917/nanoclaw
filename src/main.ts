@@ -416,6 +416,17 @@ export async function runBootMountQuiescence(
   const fatal = deps.fatal ?? bootFatal;
 
   const allWorkgroupIds = listWorkgroupIds(db);
+  // D2 note (not built — see initializeManagedGitHooks's own call site in
+  // startNanoClaw, and its module's doc comments): once a D2 survivable-
+  // container path exists, THIS predicate is where "this workgroup's wiki
+  // repo's core.hooksPath is about to change" must also count as a mount
+  // change — a survivor that keeps its pre-migration `.git/config` file
+  // mount would otherwise carry no hook at all until its next respawn. That
+  // check has to be computed here, BEFORE the door runs (same
+  // changedBeforeQuiescence snapshot timing as the other two predicates),
+  // even though the actual hooksPath write happens AFTER the door returns
+  // (initializeManagedGitHooks runs later in startNanoClaw, once this
+  // function's stops are known to be done).
   const evaluateChanged = (): string[] =>
     allWorkgroupIds.filter((id) => memoryWouldChange(db, id) || (sharedFsEnabled && sharedWouldChange(db, id)));
 
@@ -661,17 +672,6 @@ export async function main(): Promise<void> {
   // process makes mounts the same tree, not the live checkout mid-`git pull`.
   activateAgentRunnerSource();
 
-  // Refresh the host-managed pre-push secret-scan hooks directory and run
-  // the scan-policy core.hooksPath migration pass — same "nothing above
-  // this point can spawn" window as the two calls above. A spawn that
-  // mounts a scan-policy (wiki) repo asserts this directory's integrity
-  // (scanPolicyHookMounts -> assertManagedGitHooksIntegrity in
-  // container-runner.ts) and throws if it isn't populated yet, so this must
-  // run before any spawn can reach that path, not merely before delivery
-  // opens — see initializeManagedGitHooks's own doc comment for why this
-  // isn't one of the onHostStart timer registrants below.
-  initializeManagedGitHooks();
-
   await resetProcessingChannelIngress();
 
   // Workgroup FS reconciliation — runs after migrations to drain the
@@ -794,6 +794,21 @@ export async function main(): Promise<void> {
   // Failing here logs ERROR and exits non-zero BEFORE markDeployBootHealthy(),
   // so the unit-failure alert fires and the deploy stays rollback-eligible.
   await runOnecliBootPreflight();
+
+  // 1-ter. Host-managed pre-push secret-scan hooks: refresh the boot-snapshot
+  // directories and run the scan-policy core.hooksPath migration pass. Must
+  // run after runBootMountQuiescence (the boot door may stop containers
+  // whose workgroup's mounts are about to change — see its own D2 note
+  // above) and before startDashboard()/honorPendingStopIntents()/
+  // initChannelAdapters() below, all three of which can already trigger a
+  // spawn. A spawn that mounts a scan-policy (wiki) repo depends on this
+  // having already run at least once THIS process
+  // (scanPolicyHookMounts -> assertManagedGitHooksIntegrity in
+  // container-runner.ts falls back to the refuse hook, never throws the
+  // whole spawn, when it hasn't — see managed-git-hooks.ts's own doc
+  // comments on why this is a direct call here, not an onHostStart
+  // registrant with the six timer modules below).
+  initializeManagedGitHooks();
 
   // Host-computed upstreamPin/heldByMerge snapshot for the container-updates
   // audit. Containers can't derive this themselves (/workspace/project has no

@@ -15,7 +15,7 @@ import {
   type RepositoryWorkUnit,
 } from './repository-workspaces.js';
 import { safeGitArgs, safeGitEnv, safeGitFilterNames } from './safe-git.js';
-import { MANAGED_GIT_HOOKS_DIR, isScanPolicyRepositoryName } from './managed-git-hooks.js';
+import { MANAGED_GIT_HOOKS_SCAN_DIR, isScanPolicyRepositoryName } from './managed-git-hooks.js';
 import {
   observedOriginsSha256,
   recoverySeedGitDirSha256,
@@ -2911,7 +2911,7 @@ async function executeRepositoryMigrationLocked(
           temp,
           'config',
           'core.hooksPath',
-          isScanPolicyRepositoryName(manifest.repo) ? MANAGED_GIT_HOOKS_DIR : '/dev/null',
+          isScanPolicyRepositoryName(manifest.repo) ? MANAGED_GIT_HOOKS_SCAN_DIR : '/dev/null',
         ]);
         git(['-C', temp, 'config', 'core.fsmonitor', 'false']);
         git(['-C', temp, 'config', 'gc.auto', '0']);

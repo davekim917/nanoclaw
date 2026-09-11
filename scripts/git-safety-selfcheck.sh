@@ -27,8 +27,24 @@ HOME2=""
 BACKUPS=""
 NCDIR=""
 
+# #666 review P3-10: every new_fixture() call overwrote FIX with a fresh
+# mktemp -d, but only the LAST one was ever removed (the old convention
+# left every earlier run's fixture on disk) — ~57 leaked temp dirs per full
+# run of this script, each containing planted fake secrets. Track every one
+# and remove them all on exit, matching the pattern already fixed the same
+# way in scripts/wiki-pre-push-hook-selfcheck.sh.
+FIXTURE_DIRS=()
+cleanup_fixtures() {
+  local dir
+  for dir in "${FIXTURE_DIRS[@]}"; do
+    rm -rf "$dir"
+  done
+}
+trap cleanup_fixtures EXIT INT TERM
+
 new_fixture() {
   FIX=$(mktemp -d)
+  FIXTURE_DIRS+=("$FIX")
   HOME2="$FIX/home"
   BACKUPS="$FIX/home/backups"
   NCDIR="$FIX/nanoclaw"
@@ -525,9 +541,29 @@ if [ -s "$BUNDLE" ]; then
   # (it's the same repo the bundle came from) and never touches the pack
   # bytes at all; that dead end is why verify_bundle extracts the pack and
   # feeds it to index-pack directly instead.
-  SIZE=$(stat -c %s "$BUNDLE")
   cp "$BUNDLE" "$FIX/corrupt.bundle"
-  printf '\x00' | dd of="$FIX/corrupt.bundle" bs=1 seek=$((SIZE - 1)) count=1 conv=notrunc status=none
+  # Corrupt a byte at a COMPUTED OFFSET inside the pack's own OBJECT data,
+  # not the file's last byte (#666 review T1: the last-byte version failed
+  # 4 of 4 times when review-666 ran this script from a copied directory
+  # instead of in-tree, and passed in-tree — location-dependent). A bundle
+  # is header lines (refs, prerequisites) + a blank line + the pack itself,
+  # which starts with the 4-byte "PACK" magic; corrupting the file's LAST
+  # byte instead lands in the pack's trailing checksum, whose exact
+  # position (and so, apparently, its effect on plain `git bundle verify`)
+  # shifts with incidental header content. PACK's own magic bytes are
+  # always findable regardless of where the file lives or how long the
+  # header is, and 12 bytes past it (4-byte magic + 4-byte version + 4-byte
+  # object count) is always inside the first object's zlib-compressed data
+  # — which plain verify never inspects but index-pack (verify_bundle)
+  # always does. Verified location-independent by running this exact
+  # selfcheck both in-tree and from a copy of the whole repo at a
+  # different path (see the PR body's test-plan evidence for both runs).
+  PACK_OFFSET=$(LC_ALL=C grep -aob 'PACK' "$FIX/corrupt.bundle" | head -1 | cut -d: -f1)
+  if [ -z "$PACK_OFFSET" ]; then
+    bad "test setup: could not find the PACK magic inside the bundle to corrupt" ""
+  fi
+  CORRUPT_AT=$((PACK_OFFSET + 12))
+  printf '\xff' | dd of="$FIX/corrupt.bundle" bs=1 seek="$CORRUPT_AT" count=1 conv=notrunc status=none
   if git bundle verify "$FIX/corrupt.bundle" >/dev/null 2>&1; then
     ok "confirmed: plain 'git bundle verify' does not catch this pack corruption (motivates the fix)"
   else
@@ -713,6 +749,20 @@ cleanup_scratch
 [ ! -e "$SCRATCH_A" ] && [ ! -e "$SCRATCH_B" ] \
   && ok "cleanup_scratch() removes every path it was given" \
   || bad "cleanup_scratch() left a path behind" "a=$([ -e "$SCRATCH_A" ] && echo present) b=$([ -e "$SCRATCH_B" ] && echo present)"
+
+# #666 review P3-10, root cause: the `eval` above runs the SHIPPED script's
+# own `trap cleanup_scratch EXIT INT TERM` line directly in THIS process
+# (not a subshell), which silently REPLACES this file's own
+# `cleanup_fixtures` trap registered near the top — bash trap registration
+# is last-wins per signal, not cumulative. Every fixture dir created before
+# this point (most of them: new_fixture() is called dozens of times above)
+# was then never cleaned up at exit, because cleanup_scratch — a different
+# function, with nothing in CLEANUP_PATHS — ran instead. Re-registered here
+# once this section's own assertions (which specifically need
+# cleanup_scratch active) are done, restoring cleanup over FIXTURE_DIRS for
+# the rest of this run and confirmed by measuring zero leaked tmp dirs
+# after a full run, not just by inspection.
+trap cleanup_fixtures EXIT INT TERM
 
 # ─ Secret-gate regex gaps named in #628 ─
 secret_case "github user-to-server token (ghu_)" 'export GITHUB_TOKEN=ghu_16C7e42F292c6912E7710c838347Ae178B4a'

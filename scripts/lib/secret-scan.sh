@@ -65,7 +65,24 @@ SECRET_RE='(\bsk-[A-Za-z0-9_-]{20,}|(sk|rk)_live_[A-Za-z0-9]{10,}|ghp_[A-Za-z0-9
 # is split out from SECRET_RE's combined (AKIA|ASIA) alternative — ASIA
 # (AWS STS temporary credentials) stays WARN-only; only permanent AKIA
 # access-key IDs are high-confidence enough to block on.
-SECRET_BLOCK_RE='(\bsk-[A-Za-z0-9_-]{20,}|(sk|rk)_live_[A-Za-z0-9]{10,}|ghp_[A-Za-z0-9]{30,}|gh[ousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abpre]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9.-]{10,}|AKIA[0-9A-Z]{16}|AIza[A-Za-z0-9_-]{20,}|-----BEGIN (PGP PRIVATE KEY BLOCK|[A-Z ]*PRIVATE KEY)-----)'
+#
+# Boundary-anchored (#666 review H3, regex given verbatim): every
+# alternative requires a non-token character (or start/end of the scanned
+# text) immediately before and after the token shape, so a token-length run
+# of matching characters embedded in something longer — base64url, a hash,
+# minified code — cannot satisfy it just by containing the right substring.
+# Stripe (sk|rk)_live_ needs {24,}, not SECRET_RE's {10,}: real Stripe live
+# keys run well past 24 characters, and {10,} blocked short placeholder
+# values in code/docs — still a proper subset of SECRET_RE's own {10,}
+# alternative (24+ chars always satisfies a 10+-char requirement too). AIza
+# is fixed at exactly 35 characters (real Google API keys are always
+# AIza + 35), which is what actually fixed the one historical wiki-history
+# BLOCK-tier false positive review-666 found (a ~50k-character single line
+# coincidentally containing a 20+-char run starting with AIza — a run that
+# long has essentially no chance of being bounded by non-token characters
+# on both sides AND being exactly 35 characters, whereas the open-ended
+# {20,} that produced the false positive had neither constraint).
+SECRET_BLOCK_RE='((^|[^A-Za-z0-9_-])sk-[A-Za-z0-9_-]{20,}([^A-Za-z0-9_-]|$)|(^|[^A-Za-z0-9_])(sk|rk)_live_[A-Za-z0-9]{24,}([^A-Za-z0-9]|$)|(^|[^A-Za-z0-9_])ghp_[A-Za-z0-9]{30,}([^A-Za-z0-9]|$)|(^|[^A-Za-z0-9_])gh[ousr]_[A-Za-z0-9]{20,}([^A-Za-z0-9]|$)|(^|[^A-Za-z0-9_])github_pat_[A-Za-z0-9_]{20,}([^A-Za-z0-9_]|$)|(^|[^A-Za-z0-9-])xox[abpre]-[A-Za-z0-9-]{10,}([^A-Za-z0-9-]|$)|(^|[^A-Za-z0-9.-])xapp-[A-Za-z0-9.-]{10,}([^A-Za-z0-9.-]|$)|(^|[^A-Za-z0-9])AKIA[0-9A-Z]{16}([^A-Za-z0-9]|$)|(^|[^A-Za-z0-9_-])AIza[A-Za-z0-9_-]{35}([^A-Za-z0-9_-]|$)|-----BEGIN (PGP PRIVATE KEY BLOCK|[A-Z ]*PRIVATE KEY)-----)'
 
 # AWS's own official "this is never a real key" documentation example
 # (used throughout aws-cli/boto3/Terraform docs and fixtures). A
@@ -119,12 +136,35 @@ secret_scan_extract_added() {
 # explicit `local rc=$?` capture is the only place that reads grep's exit
 # status, so a `set -e` caller sourcing this file is unaffected by whether
 # the eventual match count is 0.
+#
+# The allowlist exclusion (#666 review P2-4/H2) substitutes the literal
+# IN PLACE with a single SPACE — it never drops the whole line (a
+# whole-line `grep -vF` exemption let one AWS example key anywhere on a
+# line silently exempt everything else on that line, including a real
+# token) and never deletes the literal outright either (deleting it can
+# JOIN its neighbors into a brand-new run that didn't exist before — e.g.
+# `AIza<35 chars>AKIAIOSFODNN7EXAMPLE-` collapsing straight to
+# `AIza<35 chars>-`, still one continuous run; a space in its place breaks
+# any such join while a genuine separate token elsewhere on the same line
+# is untouched and still counts). Skipped entirely when the literal is
+# empty or unset (`${VAR:-}`, never bare `$VAR`, under the callers' `set
+# -u`) — substituting an empty pattern would otherwise match at every
+# position and corrupt the text, not exempt nothing. `${text//pattern/ }`
+# is bash's own literal (non-regex) substring replace, so it cannot itself
+# fail the way an external `sed`/`grep` call could — there is no subprocess
+# exit status to lose track of. It performs GLOB pattern matching, not a
+# byte-for-byte literal match, so SECRET_SCAN_ALLOWLISTED_LITERAL must
+# never contain a glob metacharacter (`* ? [ ] ( ) | @ + !`) without
+# revisiting this — true today (a plain alphanumeric AWS example key) and
+# asserted structurally, not just by convention, in secret_scan_selftest.
 secret_scan_count() {
   local text="$1" re="$2" case_mode="$3"
   local -a grep_opts=(-c -E)
   [ "$case_mode" = insensitive ] && grep_opts+=(-i)
-  local filtered
-  filtered=$(LC_ALL=C grep -vF "$SECRET_SCAN_ALLOWLISTED_LITERAL" <<<"$text")
+  local filtered="$text"
+  if [ -n "${SECRET_SCAN_ALLOWLISTED_LITERAL:-}" ]; then
+    filtered="${text//$SECRET_SCAN_ALLOWLISTED_LITERAL/ }"
+  fi
   local out
   out=$(LC_ALL=C grep "${grep_opts[@]}" "$re" <<<"$filtered")
   local rc=$?
@@ -177,6 +217,28 @@ secret_scan_selftest() {
     echo "secret-scan selftest: SECRET_SCAN_NEW_INDICATOR is unset" >&2
     return 1
   fi
+  # SECRET_SCAN_ALLOWLISTED_LITERAL must be DECLARED (even as an empty
+  # string, which secret_scan_count treats as "skip the allowlist step" —
+  # a deliberate, tested, working state) — only a totally missing
+  # assignment (the line itself deleted from a corrupt copy of this file)
+  # is a real failure here. `declare -p` distinguishes "bound, empty" from
+  # "never assigned" the way a plain `${VAR:-}` -z check cannot.
+  if ! declare -p SECRET_SCAN_ALLOWLISTED_LITERAL >/dev/null 2>&1; then
+    echo "secret-scan selftest: SECRET_SCAN_ALLOWLISTED_LITERAL is not declared" >&2
+    return 1
+  fi
+  # Positive control (#666 review H4/P3-1): the checks above only prove the
+  # patterns COMPILE (a grep -E against EMPTY input returns 0 or 1, never
+  # proof of an actual match) — build a synthetic high-confidence token at
+  # runtime and confirm SECRET_BLOCK_RE actually fires on it, so a
+  # corruption that leaves the regex syntactically valid but unable to
+  # match anything real (an over-escaped character class, a swapped
+  # anchor) still fails closed here instead of only in review.
+  local synthetic="ghp_$(printf 'A%.0s' {1..36})"
+  if ! LC_ALL=C grep -qE "$SECRET_BLOCK_RE" <<<"$synthetic"; then
+    echo "secret-scan selftest: BLOCK positive control did not match a synthetic high-confidence token" >&2
+    return 1
+  fi
   return 0
 }
 
@@ -188,5 +250,15 @@ secret_scan_selftest() {
 # nonzero (a scan failure) OR echoes a value greater than 0 — see
 # secret_scan_count's contract; do not read a missing echo as 0.
 secret_scan_hits() {
-  secret_scan_count "$(secret_scan_extract_added "$1")" "$SECRET_RE" insensitive
+  local added
+  added=$(secret_scan_extract_added "$1")
+  local extract_rc=$?
+  # #666 review H6/P3-3: extraction's own failure (grep exit >=2) must not
+  # be swallowed by the command substitution above and read as "nothing
+  # added" — that's what an EMPTY match (extract's exit 1) already looks
+  # like, and only one of the two means genuinely nothing was there to scan.
+  if [ "$extract_rc" -ge 2 ]; then
+    return 1
+  fi
+  secret_scan_count "$added" "$SECRET_RE" insensitive
 }

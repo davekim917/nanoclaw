@@ -11,7 +11,7 @@ import {
   type RepositoryMountQuiescence,
 } from '../../container-restart.js';
 import { REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS } from '../../config.js';
-import { MANAGED_GIT_HOOKS_DIR, isScanPolicyRepositoryName } from '../../managed-git-hooks.js';
+import { MANAGED_GIT_HOOKS_SCAN_DIR, isScanPolicyRepositoryName } from '../../managed-git-hooks.js';
 import { getAgentGroup, getAllAgentGroups } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
@@ -212,11 +212,15 @@ function sanitizeCanonicalConfig(repoPath: string, expectedOrigin: string): void
   // host-managed, read-only-mounted hook directory instead of /dev/null —
   // see managed-git-hooks.ts's header for why hooksPath itself is the
   // signal container-runner.ts reads to decide whether to mount it.
-  const hooksPath = isScanPolicyRepositoryName(path.basename(repoPath)) ? MANAGED_GIT_HOOKS_DIR : '/dev/null';
+  const hooksPath = isScanPolicyRepositoryName(path.basename(repoPath)) ? MANAGED_GIT_HOOKS_SCAN_DIR : '/dev/null';
+  // Quoted (#666 review P3-6): the backslash/quote escaping below is only
+  // correct inside a quoted git-config value — written bare, a literal `\`
+  // or `"` in the path would land unescaped instead of being interpreted,
+  // corrupting the value silently.
   const escapedHooksPath = hooksPath.replaceAll('\\', '\\\\').replaceAll('"', '\\"');
   const body =
     `[core]\n\trepositoryformatversion = ${formatVersion}\n\tfilemode = true\n\tbare = false\n` +
-    `\tlogallrefupdates = true\n\thooksPath = ${escapedHooksPath}\n\tfsmonitor = false\n` +
+    `\tlogallrefupdates = true\n\thooksPath = "${escapedHooksPath}"\n\tfsmonitor = false\n` +
     (objectFormat === 'sha256' ? `[extensions]\n\tobjectFormat = sha256\n` : '') +
     `[remote "origin"]\n\turl = ${escapedOrigin}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n` +
     `[gc]\n\tauto = 0\n\tworktreePruneExpire = never\n`;

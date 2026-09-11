@@ -80,6 +80,8 @@ import {
   writeTransferTombstone,
 } from '../../repository-workspaces.js';
 import { REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS } from '../../config.js';
+import { MANAGED_GIT_HOOKS_SCAN_DIR } from '../../managed-git-hooks.js';
+import { repositoryConfigPath, safeGitConfigGet } from '../../safe-git.js';
 import { sessionDir } from '../../session-manager.js';
 import { closeDb, initTestDb, getRawDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
@@ -360,6 +362,45 @@ describe('durable canonical publication core', () => {
       }),
     ).rejects.toThrow(/origin pin conflict|repository identity/);
     expect(fs.existsSync(path.join(conflictStage, '.git'))).toBe(true);
+  });
+
+  it('sanitizeCanonicalConfig writes core.hooksPath to the one exported MANAGED_GIT_HOOKS_SCAN_DIR constant for a wiki repo, and /dev/null otherwise (#666 review B12/P3-7)', async () => {
+    // Exercises BOTH sanitizeCanonicalConfig call sites: the first publish
+    // (new canonical, no prior .git/config) and a re-publish against an
+    // already-existing, matching canonical (the "existing" branch) — a
+    // writer bug in either path would otherwise silently drop a repo out of
+    // hook coverage (core.hooksPath pointing at a value nothing mounts).
+    for (const repo of ['wiki', 'code']) {
+      const expected = repo === 'wiki' ? MANAGED_GIT_HOOKS_SCAN_DIR : '/dev/null';
+
+      const firstStage = path.join(root, 'sessions', 'sess-a', 'repository-staging', `hookspath-first-${repo}`, repo);
+      cloneTo(firstStage);
+      await publishStagedCanonical({
+        workgroupId: 'wg-hookspath',
+        repo,
+        origin: remote,
+        repositoryId: `${remote}-${repo}`,
+        stagingPath: firstStage,
+        dataDir: root,
+      });
+      const canonical = canonicalRepoDir('wg-hookspath', repo, root);
+      expect(safeGitConfigGet(repositoryConfigPath(path.join(canonical, '.git')), 'core.hooksPath')).toBe(expected);
+
+      // Re-publish against the SAME, already-existing, matching canonical —
+      // the "existing" branch's own sanitizeCanonicalConfig call.
+      const retryStage = path.join(root, 'sessions', 'sess-a', 'repository-staging', `hookspath-retry-${repo}`, repo);
+      cloneTo(retryStage);
+      const retry = await publishStagedCanonical({
+        workgroupId: 'wg-hookspath',
+        repo,
+        origin: remote,
+        repositoryId: `${remote}-${repo}`,
+        stagingPath: retryStage,
+        dataDir: root,
+      });
+      expect(retry.status).toBe('existing');
+      expect(safeGitConfigGet(repositoryConfigPath(path.join(canonical, '.git')), 'core.hooksPath')).toBe(expected);
+    }
   });
 
   it('rejects conflicting origin identity and a symlinked staging path without mutation', async () => {
