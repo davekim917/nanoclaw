@@ -1572,6 +1572,18 @@ at most **one** wake per call — the coordinator that consumes it is serial.
 Same conventions as the develop gate otherwise: env-only config, jq-composed
 state, fail-closed on every fetch, one-line JSON stdout.
 
+#### Campaign size
+
+`check`/`poll` also emit `campaignSize` (`full` / `standard` / `light`) and
+`sizeReason`, computed mechanically off the changed-file list against an
+install-supplied rules file (`SMOKE_SIZING_RULES`, default
+`/workspace/agent/campaign-sizing.json`) — never agent judgment; classification
+fails closed to `full` on an unreadable or truncated file list, and a freeze
+PR sizes off its develop-compare target diff, never its own two-marker diff.
+No rules file means `standard`, `sizeReason: "no sizing rules"` — unchanged
+behavior for installs that never added one. The install's own campaign prompt
+decides what each size actually runs; this gate only classifies, never picks lanes.
+
 Commands: `poll` (default), `check <pr>` (read-only, mirrors the develop
 gate's `check`), `claim <run-id> <pr> <sha> [owner-token]`,
 `progress <run-id> [owner-token]`, `release <run-id> [owner-token]`,

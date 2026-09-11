@@ -1471,4 +1471,113 @@ done
 bash "$GATE" poll | jq -e '.data.missing | index("SMOKE_GATE_WARMUP_TIMEOUT") == null' >/dev/null
 export SMOKE_GATE_REPO=org/repo
 
+# =============================================================================
+# Campaign-size classification (mechanical, install-rules-driven, fail-closed)
+# =============================================================================
+
+# --- 23. No rules file at all: standard, backward compatible ---------------
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_SIZING_RULES="$STATE_DIR/does-not-exist.json"
+HEAD_SHA="$(sha 3)"
+export STUB_PR_VIEW="{\"number\":300,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"frontend/a.css"}]'
+bash "$GATE" check 300 | jq -e '
+  .campaignSize == "standard" and .sizeReason == "no sizing rules"
+' >/dev/null
+
+RULES="$STATE_DIR/sizing.json"
+cat > "$RULES" <<'JSON'
+{"full":["backend/migrations/**"],"lightAllowed":["frontend/**"],"lightDeny":["frontend/auth/**"]}
+JSON
+export SMOKE_SIZING_RULES="$RULES"
+
+# --- 24. UI-only PR: light --------------------------------------------------
+export STUB_PR_FILES='[{"filename":"frontend/a.css"},{"filename":"frontend/sub/b.tsx"}]'
+bash "$GATE" check 300 | jq -e '
+  .campaignSize == "light" and (.sizeReason | startswith("light:"))
+' >/dev/null
+
+# --- 25. A UI file under lightDeny forces standard --------------------------
+export STUB_PR_FILES='[{"filename":"frontend/auth/login.tsx"}]'
+bash "$GATE" check 300 | jq -e '
+  .campaignSize == "standard" and
+  .sizeReason == "standard: frontend/auth/login.tsx matched frontend/auth/**"
+' >/dev/null
+
+# --- 26. One backend file under a `full` glob: full -------------------------
+export STUB_PR_FILES='[{"filename":"backend/migrations/0099_add_col.sql"}]'
+bash "$GATE" check 300 | jq -e '
+  .campaignSize == "full" and
+  .sizeReason == "full: backend/migrations/0099_add_col.sql matched backend/migrations/**"
+' >/dev/null
+
+# --- 27. Mixed UI + ordinary backend file (matches neither lightAllowed nor
+# lightDeny): standard, never light just because most files were UI ---------
+export STUB_PR_FILES='[{"filename":"frontend/a.css"},{"filename":"backend/service/handler.ts"}]'
+bash "$GATE" check 300 | jq -e '
+  .campaignSize == "standard" and
+  .sizeReason == "standard: backend/service/handler.ts not matched by lightAllowed"
+' >/dev/null
+
+# --- 28. Own-diff fetch failure: fails closed to full, independent of rules -
+export STUB_PR_FILES_EXIT=1
+bash "$GATE" check 300 | jq -e '
+  .campaignSize == "full" and .sizeReason == "full: the PR file list could not be fetched"
+' >/dev/null
+export STUB_PR_FILES_EXIT=0
+
+# --- 29. >=100 changed files: truncated listing fails closed to full -------
+export STUB_PR_FILES="$(python3 -c 'import json; print(json.dumps([{"filename": f"backend/f{i}.ts"} for i in range(100)]))')"
+bash "$GATE" check 300 | jq -e '
+  .campaignSize == "full" and .sizeReason == "full: the PR file list is truncated (>=100 files)"
+' >/dev/null
+
+# --- 30. Freeze PR: sized from the develop-compare target diff, never the
+# freeze PR's own two-marker diff (same MG-1 rule migrationsTouched follows).
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_SIZING_RULES="$RULES"
+PARENT_SHA="$(sha e)"
+FREEZE_SHA="$(sha f)"
+export STUB_PR_VIEW="{\"number\":301,\"state\":\"OPEN\",\"isDraft\":true,\"headRefOid\":\"$FREEZE_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
+export STUB_PARENT_SHA="$PARENT_SHA"
+export STUB_COMPARE_FILES='{"status":"ahead","files":[{"filename":"backend/migrations/1_x.sql"}]}'
+export STUB_RUN_LIST="[{\"headSha\":\"$PARENT_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"pr-title-check\"}]"
+bash "$GATE" check 301 | jq -e '
+  .isFreezePr == true and .campaignSize == "full" and
+  .sizeReason == "full: backend/migrations/1_x.sql matched backend/migrations/**"
+' >/dev/null
+unset STUB_PARENT_SHA STUB_COMPARE_FILES SMOKE_SIZING_RULES
+
+# --- 31. Glob-translation unit cases: **, {a,b}, and a single * that does not
+# cross `/`. Exercised directly against campaign-size-classify.py so a glob
+# regression is caught even if no gate-level scenario happens to hit it.
+CLASSIFY="$SCRIPT_DIR/campaign-size-classify.py"
+GLOB_RULES="$STATE_DIR/glob-rules.json"
+cat > "$GLOB_RULES" <<'JSON'
+{"full":["backend/migrations/**"],"lightAllowed":["frontend/**/*.{css,tsx}"],"lightDeny":[]}
+JSON
+# `**` crosses directories: a nested migration file still matches `backend/migrations/**`.
+echo '["backend/migrations/nested/deep/2_y.sql"]' | python3 "$CLASSIFY" "$GLOB_RULES" | jq -e '
+  .campaignSize == "full"
+' >/dev/null
+# `{a,b}` alternation: both extensions in the brace group are individually allowed.
+echo '["frontend/a.css","frontend/sub/b.tsx"]' | python3 "$CLASSIFY" "$GLOB_RULES" | jq -e '
+  .campaignSize == "light"
+' >/dev/null
+# a bare `*` does not cross `/`: `frontend/*.css` must not match a file one
+# directory deeper.
+STAR_RULES="$STATE_DIR/star-rules.json"
+cat > "$STAR_RULES" <<'JSON'
+{"full":[],"lightAllowed":["frontend/*.css"],"lightDeny":[]}
+JSON
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$STAR_RULES" | jq -e '.campaignSize == "light"' >/dev/null
+echo '["frontend/sub/a.css"]' | python3 "$CLASSIFY" "$STAR_RULES" | jq -e '
+  .campaignSize == "standard" and .sizeReason == "standard: frontend/sub/a.css not matched by lightAllowed"
+' >/dev/null
+
 echo "smoke pr gate tests passed"
