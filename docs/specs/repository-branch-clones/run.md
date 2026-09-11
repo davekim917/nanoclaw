@@ -474,3 +474,53 @@ Drop absorb. Keep the canonical current through container-side fetches, the way 
 - A clone keeps the canonical's tags (§5.2 step 1 deletes only heads and remote refs). A tag on a commit that no origin branch reaches now reads as unpushed, so that clone is never collected. This fails closed and costs only disk.
 - Commits reachable only from a reflog or `ORIG_HEAD` are not refs and are not counted, as before.
 - A forged `refs/remotes/origin/*` still makes unpushed work look pushed. This is carried from rev 2.6; the trash keeps it for 30 days.
+
+## 2026-09-11 — PR #657 review round 3 (substitute Codex at 044de7f11)
+
+The connector stayed usage-limited (a fresh notice at 18:10Z), so this round again ran the vendored contract prompt through `codex exec` (gpt-6-astra, high, read-only).
+
+### Diagnosis before fixing
+
+This is the second round in a row on `reconcileQuarantine`.
+- Round 2 asked for every entry to go back, with the marker kept until nothing is left. Both went into the per-entry branch; the whole-topic fallback stayed as it was on main.
+- Round 3 found that keeping the marker made retries reach that fallback.
+
+Both findings circle one invariant: a retry must converge from whatever an earlier attempt left. The branch was chosen by what the quarantine held (a non-empty `worktrees/`), and that changes as an attempt progresses. The fix moves the decision to what occupies the original path, which is what makes a whole-topic rename fail.
+
+### Findings and dispositions
+
+- **[1] Destructive: a rollback retry trashed what a first attempt left. ACCEPTED, fixed at the seam.**
+  - When a first attempt stopped after its last checkout (a left-behind top-level entry, or a crash), quarantine held an emptied `worktrees/` and the marker. The retry saw no checkout entries and took the whole-topic fallback. Its rename failed on the restored, non-empty topic, and the fallback trashed the rest.
+  - An unreadable `worktrees/` took the same fallback and skipped the per-entry lock checks.
+  - Main could not reach this: it removed the marker up front, so no retry ever ran.
+  - `reconcileQuarantine` now has one rule for the first attempt and every retry.
+    - While the original path is empty, the topic goes back in one rename. A failed rename writes the marker back and leaves the topic in quarantine, or continues entry by entry if the path was recreated in between.
+    - Once the path is occupied, every top-level entry goes back on its own, and `worktrees/` entry by entry.
+    - A directory it cannot list restores nothing and keeps the marker. Nothing whole is trashed.
+  - `restoreQuarantinedEntry` is unchanged. An occupied slot keeps the live copy and trashes an unlocked quarantined one, and a per-entry rename failure trashes that entry, as on main.
+- **[2] PR-body contradiction: per-branch checkouts promised in worktree mode. ACCEPTED.**
+  - Verified at `git-worktrees.ts:369-373`: worktree mode passes the primary context to `createLinkedWorktree`, and `validateExistingWorktree` refuses another branch.
+  - `create_worktree`'s description is now chosen by the container's mode (`NANOCLAW_CHECKOUT_MODE`, passed at spawn). Clone mode keeps the per-branch text; worktree mode describes one linked worktree per repo and the refusal.
+  - Narrowed to match: `container/CLAUDE.md` "Working with Repos", `docs/workgroups.md`, the CHANGELOG entry, the `git-worktrees.ts` header comment and the PR body. The docs and the CHANGELOG now also say "every local ref" for the clone proof, matching round 2.
+
+### Tests, each observed failing first
+
+- **`a retry after a partial rollback restores what is left instead of trashing the topic`.** Before the fix, the topic entry was gone: the fallback had trashed it.
+- **`a rollback that cannot list the quarantined worktrees leaves it for a retry, trashing nothing`.** Before the fix, the whole quarantine was trashed.
+- **`a whole-topic restore that fails keeps the topic in quarantine for a retry, trashing nothing`.** Before the fix, the quarantine was trashed. After it, the next pass restores the topic byte for byte.
+- **`create_worktree promises a checkout per branch only in clone mode`** (container). Before the fix, the worktree-mode description contained `@<branch>`.
+
+### Fresh results
+
+- **Host vitest** (`--maxWorkers=2`, under the shared flock):
+  - worktree-cleanup, storage-gc and the ratchet at the final tree: 3 files, 128/128;
+  - repository-workspaces (both suites), main, mailbox-seam, ratchet, tripwire, storage-manager, provider-surfaces and agents-md-flatten: 17 files, 440/441. The one failure was the ratchet manifest pin, since regenerated and passing.
+- **Container:** `bun test` over git-worktrees and instruction-fragment-migration: 57/57.
+- **Typecheck:** `tsc -p tsconfig.json` and the container typecheck are both clean.
+- **Lint and format:** eslint `--quiet` and prettier `--check` on the four changed `.ts` files are clean.
+- **Ratchet:** UNCHANGED 959, Δ 0. The manifest is re-pinned (two content hashes).
+
+### Residual risks
+
+- A per-entry rename that fails while its slot is still empty trashes that entry, as on main. The scan-time disposability proof keeps it recoverable from the 30-day trash.
+- The whole-topic path removes the marker before its rename, as on main. A crash between the two leaves an entry that recovery cannot identify.

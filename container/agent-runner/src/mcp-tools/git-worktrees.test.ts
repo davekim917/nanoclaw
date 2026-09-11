@@ -1134,6 +1134,21 @@ describe('topic-linked worktree topology', () => {
       }
     });
 
+    test('create_worktree promises a checkout per branch only in clone mode', () => {
+      // Worktree mode keeps one checkout per thread and repo: another branch is
+      // refused (validateExistingWorktree), so its description must not offer one.
+      process.env.NANOCLAW_CHECKOUT_MODE = 'worktree';
+      const worktreeText = createWorktreeTool.tool.description ?? '';
+      expect(worktreeText).not.toContain('@<branch>');
+      expect(worktreeText).not.toContain('same branch at once');
+      expect(worktreeText).toContain('never rebased or branch-switched');
+
+      process.env.NANOCLAW_CHECKOUT_MODE = 'clone';
+      const cloneText = createWorktreeTool.tool.description ?? '';
+      expect(cloneText).toContain('/workspace/worktrees/<repo>@<branch>');
+      expect(cloneText).toContain('Any number of threads may hold the same branch at once');
+    });
+
     test('worktree mode creates linked worktrees exactly as today', async () => {
       process.env.NANOCLAW_CHECKOUT_MODE = 'worktree';
       const first = await createWorktreeTool.handler({ repo: 'proj' });

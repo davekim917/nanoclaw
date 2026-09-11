@@ -912,6 +912,93 @@ describe('branch clone checkouts', () => {
     expect(git(canonB.canonical, ['worktree', 'list', '--porcelain'])).toContain('branch refs/heads/topic-b\n');
   });
 
+  it('a retry after a partial rollback restores what is left instead of trashing the topic', async () => {
+    const canon = canonicalFixture('repo-a');
+    const primary = cloneCheckout(canon, 'rollback-retry', 'repo-a', 'nc-topic');
+    const before = treeDigest(primary.checkout);
+    // What a first attempt that stopped after its last checkout leaves behind:
+    // the checkouts are home, and quarantine still holds an emptied
+    // worktrees/, a topic entry beside it, and the recovery marker.
+    const quarantinePath = path.join(state.dataDir, '.gc-quarantine', `${path.basename(primary.topicDir)}-1`);
+    fs.mkdirSync(path.join(quarantinePath, 'worktrees'), { recursive: true });
+    fs.writeFileSync(path.join(quarantinePath, 'topic-note.txt'), 'kept\n');
+    fs.writeFileSync(
+      path.join(quarantinePath, '.gc-quarantine-meta.json'),
+      JSON.stringify({ originalPath: primary.topicDir }),
+    );
+    // A live container holds the topic, so the pass collects nothing else.
+    state.mounts = [primary.root];
+    state.rows = [{ ...row('s-rollback-retry', 'rollback-retry', 'active'), folder: 'folder-a' }];
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const groupsDir = path.join(state.dataDir, 'groups');
+    fs.mkdirSync(groupsDir, { recursive: true });
+
+    const report = await runStorageGcOnce(state.dataDir, groupsDir);
+
+    expect(find(report, primary.topicDir)).toMatchObject({ collect: false, reason: 'quarantine-reconciled' });
+    expect(fs.readFileSync(path.join(primary.topicDir, 'topic-note.txt'), 'utf8')).toBe('kept\n');
+    expect(treeDigest(primary.checkout)).toEqual(before);
+    expect(state.trashed).toEqual([]);
+    expect(fs.existsSync(path.join(state.dataDir, '.gc-quarantine'))).toBe(false);
+  });
+
+  it('a rollback that cannot list the quarantined worktrees leaves it for a retry, trashing nothing', async () => {
+    const canon = canonicalFixture('repo-a');
+    const primary = cloneCheckout(canon, 'rollback-unlistable', 'repo-a', 'nc-topic');
+    state.rows = [idleRow('rollback-unlistable')];
+    let unlistable = '';
+    try {
+      const run = await runWithLateActivity(primary.root, (quarantined) => {
+        // A spawn recreated the topic, and the quarantined worktrees/ cannot be read.
+        fs.mkdirSync(primary.root, { recursive: true });
+        unlistable = path.join(quarantined, 'worktrees');
+        fs.chmodSync(unlistable, 0o000);
+      });
+      expect(find(run.report, primary.topicDir)).toMatchObject({ collect: false, reason: 'aborted-late-activity' });
+      expect(state.trashed).toEqual([]);
+      expect(JSON.parse(fs.readFileSync(path.join(run.quarantinePath, '.gc-quarantine-meta.json'), 'utf8'))).toEqual({
+        originalPath: primary.topicDir,
+      });
+    } finally {
+      // Wherever the unreadable directory ended up, make it removable again.
+      const trashedCopies = state.trashed.map((target, index) =>
+        path.join(state.trashDir, `${index + 1}-${path.basename(target)}`, 'worktrees'),
+      );
+      for (const dir of [unlistable, ...trashedCopies]) {
+        if (dir && fs.existsSync(dir)) fs.chmodSync(dir, 0o755);
+      }
+    }
+    expect(fs.existsSync(path.join(unlistable, 'repo-a', '.git'))).toBe(true);
+  });
+
+  it('a whole-topic restore that fails keeps the topic in quarantine for a retry, trashing nothing', async () => {
+    const canon = canonicalFixture('repo-a');
+    const primary = cloneCheckout(canon, 'rollback-renamefail', 'repo-a', 'nc-topic');
+    const before = treeDigest(primary.checkout);
+    state.rows = [idleRow('rollback-renamefail')];
+
+    const { report, quarantinePath } = await runWithLateActivity(primary.root, () => {
+      // Nothing recreated the topic; the restore is the next rename, and it fails.
+      vi.mocked(fs.renameSync).mockImplementationOnce(() => {
+        throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+      });
+    });
+
+    expect(find(report, primary.topicDir)).toMatchObject({ collect: false, reason: 'aborted-late-activity' });
+    expect(state.trashed).toEqual([]);
+    expect(fs.existsSync(primary.topicDir)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(path.join(quarantinePath, '.gc-quarantine-meta.json'), 'utf8'))).toEqual({
+      originalPath: primary.topicDir,
+    });
+    expect(treeDigest(path.join(quarantinePath, 'worktrees', 'repo-a'))).toEqual(before);
+
+    // The next pass finds the marker and puts the topic back.
+    const second = await runStorageGcOnce(state.dataDir, path.join(state.dataDir, 'groups'));
+    expect(find(second, primary.topicDir)).toMatchObject({ collect: false, reason: 'quarantine-recovered' });
+    expect(treeDigest(primary.checkout)).toEqual(before);
+    expect(state.trashed).toEqual([]);
+  });
+
   it('the disposability proof runs nothing a clone configures: filters, signature programs, or a submodule', () => {
     // A clone's .git is container-writable (worktrees/ is mounted read-write,
     // container-runner.ts:4386), and the proof runs host git inside it.

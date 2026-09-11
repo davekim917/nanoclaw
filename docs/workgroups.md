@@ -149,9 +149,11 @@ agent containers; host tooling reads that clean tree directly.
 
 Each conversation topic keeps its checkouts under
 `data/v2-topics/<workgroup>/<work-unit>/worktrees/`, mounted at
-`/workspace/worktrees/`. `<repo>` is the thread's primary checkout;
-`<repo>@<slug>` holds any other branch the thread asks for (`create_worktree`
-with `branch`), so threads never contend for one shared checkout. Sibling
+`/workspace/worktrees/`. `<repo>` is the thread's primary checkout. In `clone`
+mode, `<repo>@<slug>` holds any other branch the thread asks for
+(`create_worktree` with `branch`), so threads never contend for one shared
+checkout; in `worktree` mode a thread keeps one checkout per repository, and a
+request for another branch is refused. Sibling
 agents in the same topic resolve the same work-unit and checkouts. Different
 topics have distinct paths, branches, indexes, and Git admin directories.
 Existing checkouts are never automatically rebased, branch-switched, or reset,
@@ -170,8 +172,8 @@ makes a private copy. `clone` needs containers that run as the host uid and is
 refused, with a WARN when first
 used, otherwise. Resolution is shape-aware in
 both modes, so switching back to `worktree` strands no clone. Worktree cleanup
-collects an idle clone only after proving every local branch, HEAD and the
-stash already on the remote.
+collects an idle clone only after proving that the commits of every local ref,
+HEAD and the stash are already on `origin`.
 
 Containers fetch with their scoped OneCLI identity. The host never performs a
 credentialed Git network operation: it publishes validated local clones and

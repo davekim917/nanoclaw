@@ -2,11 +2,13 @@
  * Git repository MCP tools.
  *
  * One host-owned normal canonical clone exists per (workgroup, repository).
- * Each thread's checkout lives under the topic root at
- * `/workspace/worktrees/<repo>` (primary) or `/workspace/worktrees/<repo>@<slug>`
- * (any other branch) — a linked worktree in `NANOCLAW_CHECKOUT_MODE=worktree`
- * (default), or an independent clone in `clone` mode (plan
- * docs/specs/repository-branch-clones/plan.md §5.2-§5.3). Resolution
+ * Each thread's checkouts live under the topic root. In
+ * `NANOCLAW_CHECKOUT_MODE=worktree` (default) a thread has one linked worktree
+ * per repo at `/workspace/worktrees/<repo>`, and another branch is refused. In
+ * `clone` mode `/workspace/worktrees/<repo>` is the primary and
+ * `/workspace/worktrees/<repo>@<slug>` holds any other branch, each an
+ * independent clone (plan docs/specs/repository-branch-clones/plan.md
+ * §5.2-§5.3). Resolution
  * (`resolveCheckout`) is shape-aware and branch-aware in both modes, so a
  * clone created under `clone` mode stays usable after a rollback to
  * `worktree` mode (R10). The host mounts the topic root and canonical
@@ -1158,19 +1160,38 @@ export const cloneRepoTool: McpToolDefinition = {
   },
 };
 
+/**
+ * create_worktree's behaviour depends on the mode the spawn passed in, so its
+ * description does too: worktree mode refuses a second branch
+ * (validateExistingWorktree), and must not offer one.
+ */
+const CREATE_WORKTREE_DESCRIPTIONS: Record<CheckoutMode, string> = {
+  clone:
+    "Create or reuse a checkout of repo for this thread. With no branch, this is the thread's own checkout at " +
+    "/workspace/worktrees/<repo>. With branch, it is that branch's own independent checkout — still " +
+    "/workspace/worktrees/<repo> when the thread's checkout is already on it, otherwise " +
+    '/workspace/worktrees/<repo>@<branch>. Any number of threads may hold the same branch at once; share work by ' +
+    "pushing, never by switching a checkout another thread may be using — a checkout's branch is never switched " +
+    'automatically, so request the branch you need instead. Files under node_modules may be shared and read-only ' +
+    'across checkouts; never chmod them — run npm ci or npm install for a private writable copy when dependencies ' +
+    'must change. continueFromThreadId moves an inactive legacy linked checkout here instead of creating a new one. ' +
+    'Typical flow from here: git_commit → git_push → open_pr.',
+  worktree:
+    "Create or reuse this thread's linked worktree of repo at /workspace/worktrees/<repo> — one checkout per repo " +
+    'for the thread. With branch, a new worktree starts on that branch, and an existing one on a different branch is ' +
+    'refused. Existing worktrees are never rebased or branch-switched, and dirty/staged/untracked state persists ' +
+    'exactly as left. Files under node_modules may be shared and read-only across checkouts; never chmod them — run ' +
+    'npm ci or npm install for a private writable copy when dependencies must change. continueFromThreadId moves an ' +
+    'inactive linked checkout here from another thread instead of creating a new one. Typical flow from here: ' +
+    'git_commit → git_push → open_pr.',
+};
+
 export const createWorktreeTool: McpToolDefinition = {
   tool: {
     name: 'create_worktree',
-    description:
-      "Create or reuse a checkout of repo for this thread. With no branch, this is the thread's own checkout at " +
-      "/workspace/worktrees/<repo>. With branch, it is that branch's own independent checkout — still " +
-      "/workspace/worktrees/<repo> when the thread's checkout is already on it, otherwise " +
-      '/workspace/worktrees/<repo>@<branch>. Any number of threads may hold the same branch at once; share work by ' +
-      "pushing, never by switching a checkout another thread may be using — a checkout's branch is never switched " +
-      'automatically, so request the branch you need instead. Files under node_modules may be shared and read-only ' +
-      'across checkouts; never chmod them — run npm ci or npm install for a private writable copy when dependencies ' +
-      'must change. continueFromThreadId moves an inactive legacy linked checkout here instead of creating a new one. ' +
-      'Typical flow from here: git_commit → git_push → open_pr.',
+    get description() {
+      return CREATE_WORKTREE_DESCRIPTIONS[checkoutMode()];
+    },
     inputSchema: {
       type: 'object' as const,
       properties: {
