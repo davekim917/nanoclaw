@@ -710,6 +710,76 @@ describe('sweep duty registry (S2-PR2)', () => {
     expect(h.spawns).toEqual([]);
   });
 
+  // #637: a tick abandoned past the stall bound keeps running detached. Its
+  // replacement must not sweep a session the abandoned tick is still inside, or
+  // re-enter a tick duty it is still running: either runs the same work twice at
+  // once (a host task script, an admission, a wake).
+  it('never sweeps a session that an earlier tick is still inside', async () => {
+    _resetSweepRegistryForTesting({ builtins: false });
+    h.sessions = [fakeSession('A'), fakeSession('B')];
+    h.running.add('A');
+    h.running.add('B');
+    const plans: string[] = [];
+    let release: () => void = () => {};
+    registerSweepDuty({
+      name: 'p',
+      phase: 'session:plan',
+      order: 10,
+      run: (ctx) => {
+        const id = (ctx as SweepSessionContext).session.id;
+        plans.push(id);
+        if (id === 'A' && plans.length === 1) return new Promise<void>((resolve) => (release = resolve));
+      },
+    });
+
+    const first = _sweepOnceForTesting();
+    try {
+      await vi.waitFor(() => expect(plans).toEqual(['A']));
+      await _sweepOnceForTesting();
+      expect(plans).toEqual(['A', 'B']); // A skipped: still inside the first tick
+    } finally {
+      release();
+      await first; // superseded, so it stops at its next checkpoint: no second B
+    }
+    expect(plans).toEqual(['A', 'B']);
+    await _sweepOnceForTesting();
+    expect(plans.filter((id) => id === 'A')).toHaveLength(2);
+  });
+
+  it('never re-enters a tick duty that an earlier tick is still running', async () => {
+    _resetSweepRegistryForTesting({ builtins: false });
+    const { log } = await import('./log.js');
+    const warn = vi.spyOn(log, 'warn');
+    let posts = 0;
+    let release: () => void = () => {};
+    registerSweepDuty({
+      name: 'post',
+      phase: 'tick:post-session',
+      order: 10,
+      run: () => {
+        posts += 1;
+        if (posts === 1) return new Promise<void>((resolve) => (release = resolve));
+      },
+    });
+
+    const first = _sweepOnceForTesting();
+    try {
+      await vi.waitFor(() => expect(posts).toBe(1));
+      await _sweepOnceForTesting();
+      expect(posts).toBe(1);
+      expect(warn).toHaveBeenCalledWith(
+        'Host sweep duty still running under an abandoned tick — skipped',
+        expect.objectContaining({ duty: 'post', window: 'tick:post-session' }),
+      );
+    } finally {
+      release();
+      await first;
+    }
+    await _sweepOnceForTesting();
+    expect(posts).toBe(2);
+    warn.mockRestore();
+  });
+
   // ── R-3 ────────────────────────────────────────────────────────────────────
   it('one getActiveSessions call per tick regardless of duty count', async () => {
     _resetSweepRegistryForTesting({ builtins: false });
@@ -1523,15 +1593,17 @@ describe('sweep duty registry (S2-PR2)', () => {
     // `src/modules/sweep-task-escalation/index.ts`, which is the property the
     // three structural assertions above pin and the reason this number exists.
     //
-    // **Raised 1,462 → 1,503 by #637 (sweep stall bound).** Measured to the
+    // **Raised 1,462 → 1,517 by #637 (sweep stall bound).** Measured to the
     // line, zero headroom. The addition is driver mechanics, not a duty body:
     // - the tick chain races each tick against `SWEEP_TICK_STALL_MS` and
     //   re-arms past it;
     // - `runDutyBody` records the duty in flight, so the abandonment names it;
-    // - generation checkpoints stop an abandoned tick that later resumes.
+    // - generation checkpoints stop an abandoned tick that later resumes;
+    // - running sets keep a later tick from re-entering a duty or a session
+    //   the abandoned tick is still inside (its host task script, for one).
     // A tick that never settled left the sweep dead ~7h on 2026-09-11 with
     // every vital green. The three structural assertions above are unchanged.
-    expect(source.split('\n').length).toBeLessThanOrEqual(1503);
+    expect(source.split('\n').length).toBeLessThanOrEqual(1517);
     expect(h.spawns).toEqual([]);
   });
 

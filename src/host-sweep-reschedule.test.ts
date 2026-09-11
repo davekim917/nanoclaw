@@ -194,16 +194,20 @@ describe('host sweep reschedule', () => {
       ),
     );
 
-    // The next tick runs, all the way through.
+    // The next tick runs through, except that it never re-enters the duty
+    // still stuck under the abandoned tick.
     await vi.advanceTimersByTimeAsync(SWEEP_INTERVAL_MS);
-    await vi.waitFor(() => expect(mockRunReconcilerSweep).toHaveBeenCalledTimes(2));
     await vi.waitFor(() => expect(storageRuns.count).toBe(1));
+    expect(mockRunReconcilerSweep).toHaveBeenCalledTimes(1);
 
     // The stuck duty finally settles. The abandoned tick stops at its next
-    // checkpoint instead of running the rest of its phase.
+    // checkpoint instead of running the rest of its phase...
     release();
     await vi.advanceTimersByTimeAsync(0);
     expect(storageRuns.count).toBe(1);
+    // ...and the next tick runs the duty again.
+    await vi.advanceTimersByTimeAsync(SWEEP_INTERVAL_MS);
+    await vi.waitFor(() => expect(mockRunReconcilerSweep).toHaveBeenCalledTimes(2));
     error.mockRestore();
   });
 

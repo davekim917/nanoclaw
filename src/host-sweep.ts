@@ -613,6 +613,11 @@ async function runDutyBody<T>(duty: string, window: SweepWindow, body: () => T |
 async function runTickPhase(ctx: SweepTickContext, phase: SweepPhase, generation: number): Promise<void> {
   for (const duty of dutiesForPhase(phase)) {
     if (generation !== tickGeneration) return; // abandoned (#637): never run beside its replacement
+    if (tickDutiesRunning.has(duty.name)) {
+      log.warn('Host sweep duty still running under an abandoned tick — skipped', { duty: duty.name, window: phase });
+      continue;
+    }
+    tickDutiesRunning.add(duty.name);
     try {
       await runDutyBody(duty.name, phase, () => duty.run(ctx));
     } catch (err) {
@@ -621,6 +626,8 @@ async function runTickPhase(ctx: SweepTickContext, phase: SweepPhase, generation
       // family PR's post-deploy check filters on its own duty names rather
       // than counting a shared string.
       log.error('Host sweep duty failed', { err, duty: duty.name, window: phase });
+    } finally {
+      tickDutiesRunning.delete(duty.name);
     }
   }
 }
@@ -921,6 +928,9 @@ export const SWEEP_TICK_STALL_MS = 15 * 60_000;
 let tickGeneration = 0;
 /** Duty bodies in flight, innermost last: what a stalled tick is stuck in. */
 const activeDuties: Array<{ duty: string; window: SweepWindow; startedAtMs: number }> = [];
+/** Tick duties and sessions still running, possibly under an abandoned tick: never re-entered (#637). */
+const tickDutiesRunning = new Set<string>();
+const sessionsRunning = new Set<string>();
 
 export function startHostSweep(): void {
   if (running) return;
@@ -1089,12 +1099,14 @@ async function sweepOnce(generation: number): Promise<void> {
   const newQuietMarks: QuietSessionMark[] = [];
   for (const session of sessions) {
     if (generation !== tickGeneration) return; // abandoned (#637): sweep no further
+    if (sessionsRunning.has(session.id)) continue; // still inside an abandoned tick (#637)
     const mark = quietSessions.get(session.id);
     if (mark && Date.now() < mark.skipUntilMs && mark.lastActive === session.last_active) {
       skippedQuiet++;
       continue;
     }
     quietSessions.delete(session.id);
+    sessionsRunning.add(session.id);
     try {
       const quietUntil = await sweepSession(session, tick);
       if (quietUntil !== null) {
@@ -1119,6 +1131,8 @@ async function sweepOnce(generation: number): Promise<void> {
       // family PR's post-deploy check filters on its own duty names rather
       // than counting a shared string.
       log.error('Host sweep duty failed', { err, sessionId: session.id, ...dutyFailureFields(err) });
+    } finally {
+      sessionsRunning.delete(session.id);
     }
     // Yield to the macrotask queue so a large sweep batch cannot trip the
     // event-loop stall detector even on a cold tick.
