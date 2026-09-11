@@ -1,0 +1,12 @@
+# Review notes
+
+Lessons from past reviews, one line each. The author and the reviewer read
+this before starting (`docs/review-policy.md`, "Review notes and fix links").
+Append a line when a finding is deferred to an issue or a PR is reverted.
+
+Format: `YYYY-MM-DD · PR · class · lesson · structural fix (if any)`
+
+- 2026-09-05 · #401 · merge head · The gate passed one head, a newer one was pushed right after, and `gh pr merge` merged the newer one; merge exactly the head that was gated · `codex-review.sh merge-check --head <sha>`, then `gh pr merge --match-head-commit <sha>`
+- 2026-09-10 · #608 · stream lifetime · Ending a task's stream right after its result closes the CLI's stdin, but the CLI can still run a queued turn, and that turn's SDK hook callbacks, answered over stdin, fail open; never end the stream while work may remain · reverted in #610; tests at `container/agent-runner/src/poll-loop.test.ts:390` onward (#613, #619) and `:3416` (#631)
+- 2026-09-10 · #611 · URL rewriting · `url.<base>.insteadOf` rewrites the fetch side, so `ls-remote` can query a different repo than the push target · `.husky/pre-push` fails closed when `ls-remote --get-url` differs from the push URL; tested in `scripts/pre-push.test.ts`
+- 2026-09-11 · #623/#626 · hook tests · Four test files cover `.husky/pre-push`, each with its own fixture, so a hook change runs all four: `scripts/pre-push.test.ts`, `scripts/setup-typecheck-gates.test.ts`, `scripts/git-hooks-path.test.ts`, `scripts/check-public-boundary.test.ts` · none; #611 passed its own suite, then failed CI on another file's fake git

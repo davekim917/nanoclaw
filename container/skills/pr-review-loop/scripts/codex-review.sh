@@ -31,8 +31,9 @@
 #   21  request: scope verdict is skip — this head merges on green CI, no round
 #   22  request: a review of this head was already requested
 #   23  request: REVIEW_ROUND_CAP reached — stop, summarize, escalate or reframe
-#   24  merge-check: merging this head is not allowed — CI is not green on it, or it has
-#       neither a clean Codex review nor an approving substitute receipt
+#   24  merge-check: merging this head is not allowed — CI is not green on it, it has
+#       neither a clean Codex review nor an approving substitute receipt, or it is a
+#       fix PR whose body has no Fixes-PR line
 #
 # `gate` is the rule the advisory detector never was: three rounds on ONE
 # finding class (or one seam, severity not falling) is a design defect at a
@@ -464,6 +465,9 @@ run_gate() {
 # other repo is legacy: `scope` answers `auto`, `request` refuses, `merge-check`
 # defers, and no command above this block reads any of it.
 RISK_LABEL_WORKFLOW='Risk label'
+# The account that workflow labels as. A scope label anyone else took off was
+# removed by hand, so the labels no longer carry the labeler's answer.
+RISK_LABEL_ACTOR='github-actions[bot]'
 # release-policy.py's own contexts are a policy gate, not CI: a pending human approval must never read as ci_pending.
 CI_EXCLUDED_CONTEXTS='["Release policy","Release approval"]'
 # The request marker, hidden in the rendered comment. It is how `request`
@@ -475,6 +479,11 @@ REQUEST_MARKER_RE='(^|\n)<!-- pr-review-loop:request head=(?<head>[0-9a-f]{40}) 
 # instead. Only an author with write access counts: a receipt unlocks a merge,
 # and anyone who can read a public repo can comment on its PRs.
 RECEIPT_MARKER_RE='(^|\n)<!-- pr-review-loop:substitute-receipt head=(?<head>[0-9a-f]{40}) outcome=(?<outcome>approve|changes) -->'
+# A conventional-commit fix title, and the body line `merge-check` requires of
+# one: the PR it fixes, or `none`. The follow-up measurement in
+# docs/specs/risk-based-review/plan.md links a fix to its PR through this line.
+FIX_TITLE_RE='^\s*fix(\([^)]*\))?!?:'
+FIXES_PR_LINE_RE='(^|\n)Fixes-PR:[ \t]*(#[0-9]+|none)\b'
 
 # `risk-scoped` or `legacy`. Read from BASE through the API, never the
 # checkout: a PR can edit its own copy. A 404 is absence (legacy); any other
@@ -529,6 +538,22 @@ risk_label_run() {
   done
 }
 
+# `risk:high` and `review:requested` removals by anyone but the labeler, as one
+# `<label> removed by <login>; …` line, empty when there are none. The labels
+# are read at merge time, so a hand removal after the labeler ran would pass for
+# its answer. `sync-labels` taking risk:high off once a push stops touching
+# risky paths is the labeler's own removal and stays allowed. A failed read
+# returns non-zero, which scope_eval treats as no answer.
+hand_removed_scope_labels() {
+  gh api --paginate --slurp "repos/$REPO/issues/$PR/events?per_page=100" \
+    | jq -r --arg bot "$RISK_LABEL_ACTOR" '
+      [ .[][] | select(.event == "unlabeled")
+        | select(.label.name == "risk:high" or .label.name == "review:requested")
+        | select((.actor.login // "") != $bot)
+        | "\(.label.name) removed by \(.actor.login // "an unknown account")" ]
+      | join("; ")'
+}
+
 # Sets SCOPE_HEAD SCOPE_MODE SCOPE_VERDICT SCOPE_LABELS SCOPE_REASON for the
 # PR's current head. Returns 1 only when there is no verdict at all.
 SCOPE_HEAD=""
@@ -537,7 +562,7 @@ SCOPE_VERDICT=""
 SCOPE_LABELS="[]"
 SCOPE_REASON=""
 scope_eval() {
-  local pr_json base run after
+  local pr_json base run after removed
   local timeout="${CODEX_REVIEW_SCOPE_TIMEOUT_SECONDS:-300}" poll="${CODEX_REVIEW_SCOPE_POLL_SECONDS:-10}"
   if ! [[ "$timeout" =~ ^[0-9]+$ ]] || ! [[ "$poll" =~ ^[1-9][0-9]*$ ]]; then
     echo "CODEX_REVIEW_SCOPE_TIMEOUT_SECONDS must be a whole number of seconds, CODEX_REVIEW_SCOPE_POLL_SECONDS a positive one" >&2
@@ -579,6 +604,15 @@ scope_eval() {
   elif printf '%s' "$SCOPE_LABELS" | jq -e 'index("review:requested")' >/dev/null; then
     SCOPE_REASON="labeled review:requested"
   else
+    # Absent labels are the labeler's answer only if nobody else removed one.
+    removed=$(hand_removed_scope_labels) || {
+      SCOPE_REASON="fail closed: could not read this PR's label events to rule out a hand-removed risk:high or review:requested"
+      return 0
+    }
+    if [ -n "$removed" ]; then
+      SCOPE_REASON="fail closed: $removed; only the $RISK_LABEL_WORKFLOW workflow ($RISK_LABEL_ACTOR) may take a scope label off"
+      return 0
+    fi
     SCOPE_VERDICT=skip
     SCOPE_REASON="the $RISK_LABEL_WORKFLOW run for this head succeeded and set neither risk:high nor review:requested"
   fi
@@ -995,6 +1029,15 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|sc
     fi
     if [ -n "$want" ] && [[ "$SCOPE_HEAD" != "$want"* ]]; then
       echo "merge=refused head=$SCOPE_HEAD: the PR head is not $want" >&2
+      exit 24
+    fi
+    # A fix PR names the PR it fixes, or says `none`. Read at merge time: the
+    # title and body can both change after the PR opens.
+    pr_text=$(gh pr view "$PR" --repo "$REPO" --json title,body) || exit 1
+    fix_link=$(printf '%s' "$pr_text" | jq -r --arg titleRe "$FIX_TITLE_RE" --arg lineRe "$FIXES_PR_LINE_RE" '
+      if (.title | test($titleRe; "i")) and ((.body // "") | test($lineRe; "i") | not) then "missing" else "ok" end') || exit 1
+    if [ "$fix_link" = missing ]; then
+      echo "merge=refused head=$SCOPE_HEAD: a fix PR needs a 'Fixes-PR: #<n>' line in its body naming the PR it fixes, or 'Fixes-PR: none'" >&2
       exit 24
     fi
     # No branch protection holds this line, so merge-check does, whatever the

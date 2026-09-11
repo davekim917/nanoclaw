@@ -34,9 +34,24 @@ another capable agent or provider. Implementation reasoning cannot approve its
 own change. A substitute review still triages findings under this policy and
 does not relax required CI, holds, or merge authorization.
 
+On a `risk:high` PR the substitute is an Opus-tier or Fable-tier Claude
+model, or a different model family such as Codex/GPT, and the receipt's
+`--reviewer` names the model. Sonnet-tier and Haiku-tier reviewers give
+advisory reviews only, and only on non-risk PRs.
+
 Record a durable review receipt tied to the exact final SHA: reviewer and
 runtime, complete-diff and relevant-file scope, outcome, and every finding with
 its disposition. A local completion claim is not substitute-review coverage.
+
+## Review notes and fix links
+
+Before starting, the author and the reviewer read `docs/review-notes.md`.
+Deferring a finding to an issue, or reverting a PR, appends one line there.
+When the PR carries `risk:*` dimension labels, they scope the reviewer's
+brief.
+
+Every `fix` PR carries `Fixes-PR: #<n>`, naming the PR it fixes, or
+`Fixes-PR: none` in its body; `codex-review.sh merge-check` enforces it.
 
 ## The test is blocking, not correctness
 
