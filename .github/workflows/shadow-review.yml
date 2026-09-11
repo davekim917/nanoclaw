@@ -388,14 +388,20 @@ jobs:
 
       # analyze errored, or was cancelled, before Claude produced a result. Either
       # way this merge gets neither an issue nor a clean-review comment — say so
-      # explicitly, once, rather than let it read as silently clean, and flip the
-      # label state so this PR reads as failed, not reviewed (a later clean re-run
-      # flips it back — see "File findings" below). On a cancel, analyze's own
-      # `if: failure()` "Report the failure reason" step never runs (cancellation
-      # isn't a step failure), so `failure_reason` is unset here — substitute the
-      # literal "(cancelled)" rather than falling through to a generic "unknown
-      # reason" that would look like an unread execution-output file when actually
-      # nothing ran long enough to produce one.
+      # explicitly, once, rather than let it read as silently clean, and label it
+      # failed. Adds shadow-review-failed ONLY — never removes shadow-reviewed:
+      # this step has no way to know whether an EARLIER run already reviewed this
+      # PR successfully, and a failed re-run (e.g. someone re-running all jobs on
+      # an old, already-reviewed PR) must not erase that history.
+      # `scripts/review-outcomes.ts`'s classifyShadowReview() encodes the resulting
+      # precedence: reviewed wins over failed, so a PR that carries both labels
+      # (this one, plus a stale shadow-reviewed from before) still reads as
+      # reviewed. On a cancel, analyze's own `if: failure()` "Report the failure
+      # reason" step never runs (cancellation isn't a step failure), so
+      # `failure_reason` is unset here — substitute the literal "(cancelled)"
+      # rather than falling through to a generic "unknown reason" that would look
+      # like an unread execution-output file when actually nothing ran long enough
+      # to produce one.
       #
       # `if: always() && (...)`, not a bare `(...)`: without `always()` this step's
       # condition is implicitly ANDed with `success()` of every prior step in this
@@ -416,7 +422,6 @@ jobs:
           set -uo pipefail
           gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label shadow-review-failed \
             || echo "::warning::could not label #$PR_NUMBER shadow-review-failed"
-          gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label shadow-reviewed || true
 
           # Idempotent across retries of this job: skip if already posted. `--jq`
           # under `--paginate` runs the filter once PER PAGE, not once over the
@@ -466,17 +471,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # A real review ran, clean or with findings — label it reviewed and
-          # clear any stale failed-label from an earlier attempt on this PR, so
-          # `scripts/review-outcomes.ts` (which counts by label, falling back to
-          # "an issue exists" for PRs reviewed before this label existed) reads
-          # this PR correctly either way. Guarded, not left to fail the step: a
-          # transient labeling error here must not stop the actual review from
-          # being posted below.
-          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label shadow-reviewed \
-            || echo "::warning::could not label #$PR_NUMBER shadow-reviewed"
-          gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label shadow-review-failed || true
-
           # Fail closed on a known token prefix anywhere in the model's output —
           # defense in depth (see the top-of-file comment: the job split, not
           # this scrub, is the primary control — analyze's token is read-only
@@ -499,10 +493,20 @@ jobs:
             exit 1
           fi
 
+          # Label AFTER a post actually succeeds, never before: `gh pr comment` and
+          # `gh issue create` below are unguarded, so if either fails, `-e` aborts
+          # the step before its label-swap runs, and the "Report a filing failure"
+          # step (below, `if: failure()`) applies shadow-review-failed instead — a
+          # PR whose review never actually got posted must never read as reviewed.
+          # The swap itself IS guarded: the review already posted by this point, so
+          # a labeling hiccup afterward is a warning, not a reason to fail the step.
           findings_count=$(jq '.findings | length' <<<"$STRUCTURED_OUTPUT")
           if [ "$findings_count" -eq 0 ]; then
             gh pr comment "$PR_NUMBER" --repo "$REPO" \
               --body "Shadow review (post-merge, advisory — docs/specs/risk-based-review/plan.md): no findings."
+            gh pr edit "$PR_NUMBER" --repo "$REPO" \
+              --add-label shadow-reviewed --remove-label shadow-review-failed \
+              || echo "::warning::could not update labels on #$PR_NUMBER after a clean review"
             exit 0
           fi
 
@@ -525,3 +529,34 @@ jobs:
             --title "$full_title" \
             --label shadow-review \
             --body "$body"
+          gh pr edit "$PR_NUMBER" --repo "$REPO" \
+            --add-label shadow-reviewed --remove-label shadow-review-failed \
+            || echo "::warning::could not update labels on #$PR_NUMBER after filing findings"
+
+      # analyze succeeded, but posting the result broke somewhere above — the scrub
+      # refusing a token-shaped finding (`exit 1`), `gh pr comment` failing, or
+      # `gh issue create` failing. Whatever happened, nothing was actually posted:
+      # label the PR failed rather than let it read as reviewed (or, worse, as
+      # neither — see the coverage-denominator caveat in
+      # `scripts/review-outcomes.ts`). `if: always() && failure()`, matching the
+      # analyze-failed step's pattern above: `failure()` already contains a status
+      # function so GitHub would not auto-prepend `success()` to it either way, but
+      # spelling out `always()` keeps both failure-catching steps in this job
+      # visually consistent. Never itself fails the job further: every write is
+      # tolerated.
+      - name: Report a filing failure
+        if: always() && failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -uo pipefail
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label shadow-review-failed \
+            || echo "::warning::could not label #$PR_NUMBER shadow-review-failed"
+          {
+            echo "## Shadow review ran, but filing the result failed"
+            echo ""
+            echo "See the \"File findings, or confirm none were found\" step's own log above for why."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
