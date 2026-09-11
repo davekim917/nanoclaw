@@ -1,11 +1,17 @@
 # Shared secret-shaped-content detector. Sourced by scripts/git-safety.sh
-# (groups/ snapshot) — kept in its own file so the pattern set has exactly
-# one copy for any future caller to share.
+# (groups/ snapshot, single-tier: refuses the WHOLE commit before anything
+# is staged) and scripts/wiki-pre-push-hook.sh (two-tier BLOCK/WARN: a
+# `pre-push` hook the host installs into
+# data/managed-git-hooks/nanoclaw-secret-patterns.sh — a byte-for-byte copy
+# of this file, made at host startup by src/managed-git-hooks.ts, so the
+# pattern set has exactly ONE source of truth regardless of which caller
+# runs where). Both callers MUST call secret_scan_selftest immediately
+# after sourcing and fail closed if it returns nonzero.
 #
 # Broad, case-insensitive, and deliberately over-inclusive: refusing a
 # non-secret line costs a manual `git diff` and a re-run; missing a real one
 # costs a leaked credential. Covers common vendor token shapes (OpenAI,
-# Stripe, GitHub PAT/OAuth/App, Slack bot/app, AWS, Google), PEM private
+# Stripe, GitHub PAT/OAuth/App, Slack bot/app, AWS, Google), PEM/PGP private
 # keys, JWTs, connection-string credentials, env/export assignments, and
 # JSON/YAML/plain "key: value" or "key=value" forms for
 # password/secret/token/api_key (the bare "token" alternative also matches
@@ -14,59 +20,277 @@
 # \b before sk- matters: without it, "sk-" matches as a mid-word substring
 # of any longer hyphenated token that happens to contain it (e.g. a
 # "desk-<40-char-hash>" config value) — the historical false-positive driver
-# per #628. gh[ousr]_ covers OAuth/User-to-server/Server-to-server/Refresh
-# tokens (gho_/ghu_/ghs_/ghr_); xox[abpre]- adds the legacy/rotation xoxe-
-# prefix; (AKIA|ASIA) adds AWS STS temporary credentials. The identifier
-# alternative matches ANY name containing key/secret/token/password/
-# passphrase/pass (exported or not) followed by `=` or `:` and a value, so
-# it also catches `*_PASSPHRASE=`, `*_PASS=`, and a plain unexported
-# `MY_KEY=...` that never had "export" in front of it.
-# [^A-Za-z0-9]{0,6} (not {0,3}): under this file's LC_ALL=C (see
-# secret_scan_hits below), a character class counts BYTES, not characters —
-# a single multibyte punctuation character (e.g. a smart quote “/” at 3
-# bytes each in UTF-8) can burn the whole budget by itself. `{0,3}` let a
-# real match slip through under LC_ALL=C that matched fine under a UTF-8
-# locale (`“password” : x` — close-quote + space is 4 bytes); `{0,6}`
-# restores headroom for a couple of multibyte punctuation characters plus
-# ordinary whitespace without meaningfully loosening the ASCII case.
-SECRET_RE='(\bsk-[A-Za-z0-9_-]{20,}|(sk|rk)_live_[A-Za-z0-9]{10,}|ghp_[A-Za-z0-9]{30,}|gh[ousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abpre]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9.-]{10,}|(AKIA|ASIA)[0-9A-Z]{16}|AIza[A-Za-z0-9_-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|eyJ[A-Za-z0-9_=-]+\.eyJ[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]+|[A-Za-z][A-Za-z0-9+.-]*://[^/@[:space:]:]+:[^/@[:space:]]+@|authorization:[[:space:]]*bearer[[:space:]]+[A-Za-z0-9._-]{10,}|[A-Za-z_][A-Za-z0-9_]*(KEY|SECRET|TOKEN|PASSWORD|PASSPHRASE|PASS)[A-Za-z0-9_]*[[:space:]]*=[[:space:]]*[^[:space:]]|(token|api[_-]?key|password|secret)[^A-Za-z0-9]{0,6}[:=][[:space:]]*[^[:space:]])'
+# per #628. It also makes a separate sk-ant- alternative redundant: an
+# Anthropic key ("sk-ant-api03-...") already satisfies \bsk- followed by
+# 20+ [A-Za-z0-9_-] characters. gh[ousr]_ covers OAuth/User-to-server/
+# Server-to-server/Refresh tokens (gho_/ghu_/ghs_/ghr_) at a 20-char
+# minimum; ghp_ (classic PAT) keeps its own longer 30-char minimum — kept
+# as two separate alternatives (not merged into one gh[pousr]_ class) so
+# SECRET_BLOCK_RE below can copy exactly these two and stay a true subset
+# (a merged form would let a 20-29 char ghp_ token match BLOCK while
+# missing SECRET_RE's own 30-char requirement — found in #666 review).
+# xox[abpre]- adds the legacy/rotation xoxe- prefix; (AKIA|ASIA) adds AWS
+# STS temporary credentials. The PEM alternative also matches a PGP private
+# key block, whose trailer text differs ("...KEY BLOCK-----", not
+# "...KEY-----"). The identifier alternative matches ANY name containing
+# key/secret/token/password/passphrase/pass (exported or not) followed by
+# `=` or `:` and a value, so it also catches `*_PASSPHRASE=`, `*_PASS=`,
+# and a plain unexported `MY_KEY=...` that never had "export" in front of
+# it.
+# [^A-Za-z0-9]{0,6} in that last alternative (not {0,3}): under this file's
+# LC_ALL=C (see secret_scan_extract_added below), a character class counts
+# BYTES, not characters — a single multibyte punctuation character (e.g. a
+# smart quote at 3 bytes each in UTF-8) can burn most of a small budget by
+# itself. `{0,3}` let a real match — `“password” : x`, curly close-quote
+# plus space before the colon, 4 bytes — slip through under a UTF-8 locale
+# but miss under LC_ALL=C; `{0,6}` restores headroom for a couple of
+# multibyte punctuation characters plus ordinary whitespace without
+# meaningfully loosening the ASCII case.
+SECRET_RE='(\bsk-[A-Za-z0-9_-]{20,}|(sk|rk)_live_[A-Za-z0-9]{10,}|ghp_[A-Za-z0-9]{30,}|gh[ousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abpre]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9.-]{10,}|(AKIA|ASIA)[0-9A-Z]{16}|AIza[A-Za-z0-9_-]{20,}|-----BEGIN (PGP PRIVATE KEY BLOCK|[A-Z ]*PRIVATE KEY)-----|eyJ[A-Za-z0-9_=-]+\.eyJ[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]+|[A-Za-z][A-Za-z0-9+.-]*://[^/@[:space:]:]+:[^/@[:space:]]+@|authorization:[[:space:]]*bearer[[:space:]]+[A-Za-z0-9._-]{10,}|[A-Za-z_][A-Za-z0-9_]*(KEY|SECRET|TOKEN|PASSWORD|PASSPHRASE|PASS)[A-Za-z0-9_]*[[:space:]]*=[[:space:]]*[^[:space:]]|(token|api[_-]?key|password|secret)[^A-Za-z0-9]{0,6}[:=][[:space:]]*[^[:space:]])'
+
+# High-confidence subset of SECRET_RE only: a fixed vendor prefix plus a
+# long enough random-looking suffix. These essentially never appear by
+# coincidence in prose, config comments, or binary/font blobs, so a
+# wiki-pre-push-hook.sh BLOCK on one is safe — contrast the fuzzier
+# remainder of SECRET_RE (identifier assignment forms, connection strings,
+# JWTs), which is too collision-prone with ordinary prose/config to block a
+# push on and is only ever used as WARN there (secret_scan_warn_hits below
+# reuses SECRET_RE itself, case-insensitively — see its comment).
+#
+# EVERY alternative here is a literal copy of, or a narrower pattern than,
+# a SECRET_RE alternative above, so SECRET_BLOCK_RE is provably a subset:
+# anything BLOCK matches, SECRET_RE also matches (asserted directly by a
+# selfcheck case in both scripts/git-safety-selfcheck.sh and
+# scripts/wiki-pre-push-hook-selfcheck.sh, over every BLOCK fixture). AKIA
+# is split out from SECRET_RE's combined (AKIA|ASIA) alternative — ASIA
+# (AWS STS temporary credentials) stays WARN-only; only permanent AKIA
+# access-key IDs are high-confidence enough to block on.
+#
+# Boundary-anchored (#666 review H3, regex given verbatim): every
+# alternative requires a non-token character (or start/end of the scanned
+# text) immediately before and after the token shape, so a token-length run
+# of matching characters embedded in something longer — base64url, a hash,
+# minified code — cannot satisfy it just by containing the right substring.
+# Stripe (sk|rk)_live_ needs {24,}, not SECRET_RE's {10,}: real Stripe live
+# keys run well past 24 characters, and {10,} blocked short placeholder
+# values in code/docs — still a proper subset of SECRET_RE's own {10,}
+# alternative (24+ chars always satisfies a 10+-char requirement too). AIza
+# is fixed at exactly 35 characters (real Google API keys are always
+# AIza + 35), which is what actually fixed the one historical wiki-history
+# BLOCK-tier false positive review-666 found (a ~50k-character single line
+# coincidentally containing a 20+-char run starting with AIza — a run that
+# long has essentially no chance of being bounded by non-token characters
+# on both sides AND being exactly 35 characters, whereas the open-ended
+# {20,} that produced the false positive had neither constraint).
+SECRET_BLOCK_RE='((^|[^A-Za-z0-9_-])sk-[A-Za-z0-9_-]{20,}([^A-Za-z0-9_-]|$)|(^|[^A-Za-z0-9_])(sk|rk)_live_[A-Za-z0-9]{24,}([^A-Za-z0-9]|$)|(^|[^A-Za-z0-9_])ghp_[A-Za-z0-9]{30,}([^A-Za-z0-9]|$)|(^|[^A-Za-z0-9_])gh[ousr]_[A-Za-z0-9]{20,}([^A-Za-z0-9]|$)|(^|[^A-Za-z0-9_])github_pat_[A-Za-z0-9_]{20,}([^A-Za-z0-9_]|$)|(^|[^A-Za-z0-9-])xox[abpre]-[A-Za-z0-9-]{10,}([^A-Za-z0-9-]|$)|(^|[^A-Za-z0-9.-])xapp-[A-Za-z0-9.-]{10,}([^A-Za-z0-9.-]|$)|(^|[^A-Za-z0-9])AKIA[0-9A-Z]{16}([^A-Za-z0-9]|$)|(^|[^A-Za-z0-9_-])AIza[A-Za-z0-9_-]{35}([^A-Za-z0-9_-]|$)|-----BEGIN (PGP PRIVATE KEY BLOCK|[A-Z ]*PRIVATE KEY)-----)'
+
+# AWS's own official "this is never a real key" documentation example
+# (used throughout aws-cli/boto3/Terraform docs and fixtures). A
+# case-sensitive BLOCK still matches its AKIA-shaped literal — allowlisted
+# by this EXACT string only, nothing broader (no wildcard, no path, no
+# pattern) — see secret_scan_count below.
+SECRET_SCAN_ALLOWLISTED_LITERAL='AKIAIOSFODNN7EXAMPLE'
+
+# The unified-diff/log "added line" marker every git diff/log call in both
+# callers passes via --output-indicator-new=$SECRET_SCAN_NEW_INDICATOR
+# (context/old lines keep git's defaults, ' '/'-', so they never collide
+# with this). A single non-printable byte (ASCII SOH) that cannot appear at
+# the start of any real source line, unlike '+': an ADDED line is itself
+# printed as the indicator followed by its own content, so a real added
+# line whose content happened to start with "++ " (e.g.
+# "++ token=abc123...") used to come out as "+++ token=abc123..." on the
+# wire — syntactically identical to a `+++ ` file-header line, so a
+# blanket `^\+\+\+ ` header exclusion silently dropped it (#666 review
+# P3-3, and the same bug independently in #658 before that). Overriding
+# the indicator removes the ambiguity entirely instead of trying to
+# pattern-match every header shape git might emit: the `+++`/`---` file
+# header lines are untouched by --output-indicator-new (confirmed
+# empirically against both the host's git 2.43.0 and the agent image's git
+# 2.39.5), so they never start with this byte either.
+SECRET_SCAN_NEW_INDICATOR=$'\x01'
+
+# secret_scan_extract_added <text>
+# Emits lines from <text> that start with SECRET_SCAN_NEW_INDICATOR —
+# i.e. every line a caller's git diff/log call marked as added via
+# --output-indicator-new, PLUS (wiki-pre-push-hook.sh) any non-diff text a
+# caller rendered with that same prefix itself, such as a commit message
+# body (git's own --output-indicator-new only touches diff/patch content,
+# never `git log --format=%B` message text — a secret typed directly into
+# a commit message needs its own render path; see that script). The
+# indicator byte stays part of the emitted line: no SECRET_RE/BLOCK/WARN
+# alternative anchors to the start of the line, so counting against the
+# untouched line is exactly as accurate as against a stripped one, and
+# skipping the strip avoids one more tool invocation.
+secret_scan_extract_added() {
+  LC_ALL=C grep -E "^${SECRET_SCAN_NEW_INDICATOR}" <<<"$1"
+}
+
+# secret_scan_count <extracted-lines-text> <regex> <sensitive|insensitive>
+# Counts lines matching <regex>, applying the allowlisted-literal exclusion
+# above first. Echoes the count and returns 0 whenever grep could run at
+# all (0 or 1 matches found is exit 0/1 respectively, and both are valid
+# results with `-c`). On any grep failure (exit >=2: malformed regex,
+# read error) echoes NOTHING and returns 1 — never a non-integer, and
+# callers MUST treat a nonzero return as fail-closed, never read the
+# missing echo as a count of 0. Never fails under `set -e` on its own: the
+# explicit `local rc=$?` capture is the only place that reads grep's exit
+# status, so a `set -e` caller sourcing this file is unaffected by whether
+# the eventual match count is 0.
+#
+# The allowlist exclusion (#666 review P2-4/H2) substitutes the literal
+# IN PLACE with a single SPACE — it never drops the whole line (a
+# whole-line `grep -vF` exemption let one AWS example key anywhere on a
+# line silently exempt everything else on that line, including a real
+# token) and never deletes the literal outright either (deleting it can
+# JOIN its neighbors into a brand-new run that didn't exist before — e.g.
+# `AIza<35 chars>AKIAIOSFODNN7EXAMPLE-` collapsing straight to
+# `AIza<35 chars>-`, still one continuous run; a space in its place breaks
+# any such join while a genuine separate token elsewhere on the same line
+# is untouched and still counts). Skipped entirely when the literal is
+# empty or unset (`${VAR:-}`, never bare `$VAR`, under the callers' `set
+# -u`) — substituting an empty pattern would otherwise match at every
+# position and corrupt the text, not exempt nothing. `${text//pattern/ }`
+# is bash's own substring replace, so it cannot itself fail the way an
+# external `sed`/`grep` call could — there is no subprocess exit status to
+# lose track of. The PATTERN side of `${var//pattern/replacement}` is
+# GLOB-matched, not a byte-for-byte literal match, UNLESS the pattern is
+# quoted (`${var//"$pattern"/replacement}`) — quoting forces a literal,
+# non-glob match. Left unquoted (#666 review P2-B), a literal edited or
+# corrupted to a bare glob character (`*` above all — matches any string,
+# including the empty one, so it would fail OPEN by silently wiping the
+# ENTIRE scanned text to a single space instead of exempting nothing)
+# would still pass a bare `-n` emptiness check and this file's own
+# selftest, yet stop scanning anything at all. Quoted here, and rejected
+# outright by secret_scan_selftest below if it ever contains a glob
+# metacharacter, so a corruption of this specific shape fails closed at
+# the selftest instead of silently at scan time.
+secret_scan_count() {
+  local text="$1" re="$2" case_mode="$3"
+  local -a grep_opts=(-c -E)
+  [ "$case_mode" = insensitive ] && grep_opts+=(-i)
+  local filtered="$text"
+  if [ -n "${SECRET_SCAN_ALLOWLISTED_LITERAL:-}" ]; then
+    filtered="${text//"$SECRET_SCAN_ALLOWLISTED_LITERAL"/ }"
+  fi
+  local out
+  out=$(LC_ALL=C grep "${grep_opts[@]}" "$re" <<<"$filtered")
+  local rc=$?
+  if [ "$rc" -ge 2 ]; then
+    return 1
+  fi
+  printf '%s' "$out"
+  return 0
+}
+
+# secret_scan_selftest
+# Validates the pattern set is usable at all: the extraction/counting
+# functions exist, and every pattern this file exports is non-empty and
+# compiles (a `grep -E` against it on empty input returns 0 or 1, never
+# >=2). Both callers run this immediately after `source`-ing this file and
+# fail closed (refuse to proceed) if it returns nonzero — otherwise a
+# corrupt copy of this file (a zero-byte file, one truncated mid-function,
+# one with an unbalanced regex, or one where a pattern variable is unset)
+# lets `source` return 0 anyway, and the ONLY thing standing between that
+# and every secret silently passing through is `${hits:-0}` reading a
+# missing/empty result as zero (#666 review P2-1: 4 of 6 corrupt-file
+# variants failed exactly this way before this function existed).
+secret_scan_selftest() {
+  local fn
+  for fn in secret_scan_extract_added secret_scan_count; do
+    if ! declare -F "$fn" >/dev/null 2>&1; then
+      echo "secret-scan selftest: missing function $fn" >&2
+      return 1
+    fi
+  done
+  local re
+  # ${VAR:-} (never bare "$VAR") — under the callers' `set -u`, a totally
+  # unset SECRET_RE/SECRET_BLOCK_RE (e.g. a pattern file truncated above
+  # the assignment) must still reach the -z check below and this
+  # function's own "an expected pattern is empty" message, not die on
+  # bash's own blunt "unbound variable" error one line earlier.
+  for re in "${SECRET_RE:-}" "${SECRET_BLOCK_RE:-}"; do
+    if [ -z "$re" ]; then
+      echo "secret-scan selftest: an expected pattern is empty" >&2
+      return 1
+    fi
+    LC_ALL=C grep -E "$re" </dev/null >/dev/null 2>&1
+    local rc=$?
+    if [ "$rc" -ge 2 ]; then
+      echo "secret-scan selftest: a pattern does not compile (grep exit $rc)" >&2
+      return 1
+    fi
+  done
+  if [ -z "${SECRET_SCAN_NEW_INDICATOR:-}" ]; then
+    echo "secret-scan selftest: SECRET_SCAN_NEW_INDICATOR is unset" >&2
+    return 1
+  fi
+  # SECRET_SCAN_ALLOWLISTED_LITERAL must be DECLARED (even as an empty
+  # string, which secret_scan_count treats as "skip the allowlist step" —
+  # a deliberate, tested, working state) — only a totally missing
+  # assignment (the line itself deleted from a corrupt copy of this file)
+  # is a real failure here. `declare -p` distinguishes "bound, empty" from
+  # "never assigned" the way a plain `${VAR:-}` -z check cannot.
+  if ! declare -p SECRET_SCAN_ALLOWLISTED_LITERAL >/dev/null 2>&1; then
+    echo "secret-scan selftest: SECRET_SCAN_ALLOWLISTED_LITERAL is not declared" >&2
+    return 1
+  fi
+  # secret_scan_count's `${text//"$SECRET_SCAN_ALLOWLISTED_LITERAL"/ }` is
+  # quoted, so it is a literal (non-glob) match today — but the CORRECTNESS
+  # of that quoting depends on nobody removing it later, and a corrupted
+  # copy of this file could carry an unquoted version. This is the
+  # complementary check: reject the LITERAL VALUE itself if it contains a
+  # glob metacharacter, so even an accidental reversion of the quoting
+  # fails closed here (the literal can never become `*`, which unquoted
+  # would match and blank the entire scanned text) rather than silently at
+  # scan time (#666 review P2-B).
+  case "$SECRET_SCAN_ALLOWLISTED_LITERAL" in
+    *[\*\?\[\\]*)
+      echo "secret-scan selftest: SECRET_SCAN_ALLOWLISTED_LITERAL contains a glob metacharacter" >&2
+      return 1
+      ;;
+  esac
+  # Positive controls (#666 review H4/P3-1, P3-2): the checks above only
+  # prove the patterns COMPILE (a grep -E against EMPTY input returns 0 or
+  # 1, never proof of an actual match) — build synthetic tokens at runtime
+  # and confirm both tiers actually fire, so a corruption that leaves a
+  # regex syntactically valid but unable to match anything real (an
+  # over-escaped character class, a swapped anchor) still fails closed
+  # here instead of only in review. SECRET_RE's own control goes through
+  # the real extract+count path (secret_scan_extract_added,
+  # secret_scan_count), not a bare grep, so it also proves those two
+  # functions still exist and work together, not just the regex alone.
+  local synthetic="ghp_$(printf 'A%.0s' {1..36})"
+  if ! LC_ALL=C grep -qE "$SECRET_BLOCK_RE" <<<"$synthetic"; then
+    echo "secret-scan selftest: BLOCK positive control did not match a synthetic high-confidence token" >&2
+    return 1
+  fi
+  local re_synthetic_text re_hits
+  re_synthetic_text="${SECRET_SCAN_NEW_INDICATOR}export MY_SECRET_KEY=${synthetic}"
+  re_hits=$(secret_scan_count "$(secret_scan_extract_added "$re_synthetic_text")" "$SECRET_RE" insensitive)
+  if [ "$?" -ne 0 ] || [ "${re_hits:-0}" -eq 0 ]; then
+    echo "secret-scan selftest: SECRET_RE positive control did not match a synthetic secret-shaped line" >&2
+    return 1
+  fi
+  return 0
+}
 
 # secret_scan_hits <unified-diff-text>
-# Counts ADDED lines (unified-diff `+` lines, excluding the `+++` file
-# header) that match SECRET_RE, case-insensitively. Callers refuse the
-# change whenever this is > 0. Never fails under `set -e`: an empty/no-match
-# grep would otherwise return 1 and abort the caller.
-#
-# The header exclusion is narrow on purpose: an ADDED line is itself
-# printed as `+` followed by its content, so a real added line whose
-# content starts with `++ ` (e.g. `++ token=abc123...`) becomes
-# `+++ token=abc123...` on the wire — syntactically identical to a
-# `+++ ` file-header line. A blanket `^\+\+\+ ` exclusion (the previous
-# version of this file) drops that line's content along with the real
-# headers, silently exempting it from the scan. Matching only the shapes
-# `git diff` actually emits for a header — `+++ b/<path>`, `+++ "b/<path>"`
-# (git C-quotes a path containing unusual characters), or `+++ /dev/null`
-# (file deleted) — means an added line that merely LOOKS like a header
-# text but isn't one of those three shapes still gets scanned. Any real
-# header shape this pattern doesn't recognize also still gets scanned,
-# which is the safe direction (worst case: one extra false-positive-checked
-# line, never a missed real one). --src-prefix=a/ --dst-prefix=b/ is pinned
-# on every `git diff` call that feeds this function (see git-safety.sh)
-# specifically so the header always has this shape, regardless of a
-# user's diff.noprefix/diff.mnemonicPrefix config.
-#
-# LC_ALL=C on all three greps: under the installed units' LANG=en_US.UTF-8,
-# GNU grep classifies a diff containing an invalid UTF-8 byte (a truncated
-# multibyte sequence — common in a binary-ish paste, a foreign-language
-# comment with a bad encoding, or an adversarial line built to exploit
-# exactly this) as a BINARY file. In binary mode `-c` reports "binary file
-# matches" / a bare 0 instead of the actual matching lines, so the FIRST
-# grep in this pipe (`^\+`) silently stops emitting any line at all — the
-# downstream secret grep then sees nothing and counts 0 hits, even with a
-# live secret sitting right next to the bad byte (verified empirically: a
-# diff line combining bytes 0x80-0x82 with a real xapp- token counts 0
-# hits under LANG=en_US.UTF-8, 1 under LC_ALL=C). C locale treats every
-# byte as plain text, so this binary misclassification never triggers.
+# git-safety.sh's single-tier gate: counts ADDED lines (per
+# secret_scan_extract_added — the caller's `git diff` must pass
+# --output-indicator-new=$SECRET_SCAN_NEW_INDICATOR) matching SECRET_RE,
+# case-insensitively. Callers refuse the change whenever this returns
+# nonzero (a scan failure) OR echoes a value greater than 0 — see
+# secret_scan_count's contract; do not read a missing echo as 0.
 secret_scan_hits() {
-  LC_ALL=C grep -E '^\+' <<<"$1" | LC_ALL=C grep -vE '^\+\+\+ ("?b/|/dev/null$)' | LC_ALL=C grep -icE "$SECRET_RE" || true
+  local added
+  added=$(secret_scan_extract_added "$1")
+  local extract_rc=$?
+  # #666 review H6/P3-3: extraction's own failure (grep exit >=2) must not
+  # be swallowed by the command substitution above and read as "nothing
+  # added" — that's what an EMPTY match (extract's exit 1) already looks
+  # like, and only one of the two means genuinely nothing was there to scan.
+  if [ "$extract_rc" -ge 2 ]; then
+    return 1
+  fi
+  secret_scan_count "$added" "$SECRET_RE" insensitive
 }

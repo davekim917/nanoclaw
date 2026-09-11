@@ -159,6 +159,24 @@ export function safeGitConfigGet(configPath: string, key: string): string | null
   }
 }
 
+/**
+ * Set exactly one key in a config file, leaving every other key untouched.
+ * Used for the targeted core.hooksPath migration on EXISTING canonical
+ * repositories (managed-git-hooks.ts) rather than a full config rewrite
+ * (sanitizeCanonicalConfig's template), which needs the repo's origin and
+ * would drop any non-template key the repo happens to carry.
+ */
+export function safeGitConfigSet(configPath: string, key: string, value: string): void {
+  const stat = fs.lstatSync(configPath);
+  if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`unsafe Git config path: ${configPath}`);
+  execFileSync('git', ['config', '--file', configPath, key, value], {
+    encoding: 'utf8',
+    env: safeGitEnv(),
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 10_000,
+  });
+}
+
 export function safeGitOptions(
   options: Omit<ExecFileSyncOptionsWithStringEncoding, 'encoding' | 'env'> & { env?: NodeJS.ProcessEnv } = {},
 ): ExecFileSyncOptionsWithStringEncoding {
