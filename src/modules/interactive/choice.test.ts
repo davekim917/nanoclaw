@@ -580,9 +580,23 @@ describe('where the answer lands', () => {
   });
 });
 
+/**
+ * Make a card strictly older than the next ask. Two asks in one millisecond tie
+ * on created_at, and createdBefore then orders them by approval_id's random
+ * suffix (choice.ts:248-251) — a coin flip for which card survives.
+ */
+async function backdate(approvalId: string): Promise<void> {
+  await getDb().run(
+    'UPDATE pending_approvals SET created_at = ? WHERE approval_id = ?',
+    '2000-01-01T00:00:00.000Z',
+    approvalId,
+  );
+}
+
 describe('replace, never stack (key)', () => {
   it('a newer ask with the same key posts first, then supersedes the open card', async () => {
     const first = (await ask(session, { key: 'release:web' }, 'choice-1'))!;
+    await backdate(first.approval_id);
     const second = (await ask(session, { key: 'release:web' }, 'choice-2'))!;
 
     expect(await getPendingApproval(first.approval_id)).toBeUndefined();
@@ -651,6 +665,7 @@ describe('replace, never stack (key)', () => {
     const errorSpy = vi.spyOn(log, 'error');
     try {
       const first = (await ask(session, { key: 'release:web' }, 'choice-1'))!;
+      await backdate(first.approval_id);
       failEdits = true;
       const second = (await ask(session, { key: 'release:web' }, 'choice-2'))!;
 
