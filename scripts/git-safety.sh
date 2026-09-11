@@ -41,11 +41,14 @@
 # the owner itself: the installed unit's OnFailure=nanoclaw-unit-alert@%n
 # (groups/_ops/systemd/nanoclaw-git-safety.service — tracked in the SEPARATE
 # davekim917/nanoclaw-groups repo, not this one's data/systemd/) already
-# fires on any non-zero exit and DMs the actionable journal tail
-# (unit-alert-dm.sh). Before this both fired — the script's own DM plus
-# OnFailure's — for every handled failure (#628 item 8); FAILURES are still
-# printed to stderr (>> the unit's journal, which is what OnFailure's DM
-# reads) so the escalation stays actionable. Runs before storage-gc so
+# fires on any non-zero exit and DMs ONE journal line — the unit's last
+# error-like line, else its plain last line, cut to 300 characters — plus
+# a `journalctl` pointer, at most once per 30 minutes per unit
+# (unit-alert-dm.sh:36-39, its cooldown). Before this both fired — the
+# script's own DM plus OnFailure's — for every handled failure (#628 item
+# 8); FAILURES are still printed to stderr (>> the unit's journal, which
+# is what that one DM line is read from) so the escalation stays
+# actionable. Runs before storage-gc so
 # anything the GC takes is captured.
 #
 # Env:
@@ -411,7 +414,13 @@ _commit_groups_impl() { # <scratch index file>
   fi
 
   local diff_text
-  diff_text=$(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --no-color --text HEAD 2>>"$ERR")
+  # --src-prefix/--dst-prefix pinned explicitly: secret_scan_hits() only
+  # excludes the `+++ b/...`/`+++ /dev/null` header shapes git emits with
+  # its DEFAULT prefixes. A user's diff.noprefix or diff.mnemonicPrefix
+  # config would change that shape (diff.noprefix drops "b/" entirely) and
+  # make the exclusion miss the real header — this pins the shape the
+  # exclusion actually expects, independent of whatever's in ~/.gitconfig.
+  diff_text=$(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --no-color --text --src-prefix=a/ --dst-prefix=b/ HEAD 2>>"$ERR")
   if [ -z "$diff_text" ]; then
     GROUPS_RESULT="nothing pending"; return
   fi

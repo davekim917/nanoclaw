@@ -689,6 +689,65 @@ git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1 \
   && ok "the non-secret 'desk-...' change was committed normally" \
   || bad "a non-secret change was refused" "$OUT"
 
+# ═══ The '+++ ' header exclusion, narrowed after review (#658 round 2) ════
+# An ADDED line is itself printed as `+` followed by its own content, so a
+# real added line whose content starts with "++ " becomes "+++ ..." on the
+# wire — syntactically identical to a `+++ ` diff header. The old blanket
+# `grep -vE '^\+\+\+ '` exclusion dropped that content along with real
+# headers (verified: reverting to it makes this exact case count 0 hits
+# instead of 1). Narrowed to the shapes git actually emits for a header
+# (`+++ b/<path>`, `+++ "b/<path>"`, `+++ /dev/null`).
+secret_case "an added line starting with '++ ' is still scanned, not mistaken for a diff header" \
+  '++ token=abc123secretabc123secretabc'
+
+# LC_ALL=C counts BYTES for a character class, not characters — a 3-byte
+# UTF-8 smart quote can burn most of a small {0,N} budget on its own.
+# `{0,3}` let this exact line (smart-quote punctuation before the `:`)
+# slip past under LC_ALL=C, though it matched fine under a UTF-8 locale
+# (verified: reverting to {0,3} makes it count 0 hits instead of 1).
+secret_case "smart-quote punctuation before ':' is still caught under LC_ALL=C" \
+  '“password” : hunter2x'
+
+# A file whose path happens to look like an sk- secret, already TRACKED
+# (add -u only picks up edits to tracked files, never new ones — a brand
+# new file wouldn't exercise this diff at all), gets a real content edit.
+# The diff's own `+++ b/<path>` header line must not itself be scanned via
+# the coincidental resemblance.
+new_fixture
+mkdir -p "$G/foo/tasks"
+echo placeholder > "$G/foo/tasks/sk-learn-migration-plan-2026.md"
+git -C "$G" add foo/tasks/sk-learn-migration-plan-2026.md
+git -C "$G" commit -qm "add placeholder task file" >/dev/null
+git -C "$G" push -q origin HEAD:main
+printf 'ordinary planning notes, nothing secret here\n' >> "$G/foo/tasks/sk-learn-migration-plan-2026.md"
+run_safety
+case "$OUT" in
+  *"look like a secret"*) bad "a '+++ b/…sk-learn-….md' header was scanned as content" "$OUT" ;;
+  *) ok "a '+++ b/…sk-learn-….md' header is recognized as a header, not scanned" ;;
+esac
+git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1 \
+  && ok "the sk--looking file's edit was committed normally" \
+  || bad "the sk--looking file's edit was refused" "$OUT"
+
+# git C-quotes a path containing non-ASCII bytes in its diff header
+# (`+++ "b/café.md"` rather than `+++ b/café.md`) — the exclusion must
+# recognize that quoted form too. Same reasoning as above: the file must
+# already be tracked for `add -u` to pick up the edit.
+new_fixture
+printf 'placeholder\n' > "$G/foo/café.md"
+git -C "$G" add foo/café.md
+git -C "$G" commit -qm "add cafe placeholder" >/dev/null
+git -C "$G" push -q origin HEAD:main
+printf 'ordinary content, nothing secret here\n' >> "$G/foo/café.md"
+run_safety
+case "$OUT" in
+  *"look like a secret"*) bad "a quoted-path '+++ \"b/café.md\"' header was scanned as content" "$OUT" ;;
+  *) ok "a quoted-path header is recognized as a header, not scanned" ;;
+esac
+git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1 \
+  && ok "the non-ASCII-named file's edit was committed normally" \
+  || bad "the non-ASCII-named file's edit was refused" "$OUT"
+
 # ─ Phase 1's untracked-file exclusions now match phase 2's list (#628) ─
 untracked_excluded_case() { # label, filename, content
   new_fixture
