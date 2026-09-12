@@ -124,6 +124,7 @@ import {
   checkoutInheritedTagsPath,
   checkoutStagingRoot,
   defaultTopicBranch,
+  isRepositoryLifecycleClaimed,
   isWorkgroupRepositoryMountClaimed,
   listTopicCheckouts,
   originPinPath,
@@ -152,6 +153,7 @@ import { closeDb, initTestDb, getRawDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
 import type { Session } from '../../types.js';
 import {
+  _setPublishClaimWaitForTesting,
   _setRepositoryCheckoutHooksForTesting,
   applyRepositoryCheckoutAction,
   applyRepositoryPublishAction,
@@ -227,6 +229,100 @@ function cloneTo(destination: string): void {
   fs.mkdirSync(path.dirname(destination), { recursive: true });
   execFileSync('git', ['clone', '-q', remote, destination]);
   git(destination, ['remote', 'set-head', 'origin', '--auto']);
+}
+
+/**
+ * A central DB holding exactly these rows, which publish reads through
+ * sessionsForWorkUnit (index.ts). The agent-group and session mocks mirror the
+ * same rows, so origin/main's workgroup-wide read sees the same fixture and a
+ * test fails on its assertions rather than on a missing mock.
+ */
+async function seedPublishFixture(input: {
+  agentGroups: Array<{ id: string; workgroupId: string }>;
+  messagingGroups: Array<{ id: string; platformId: string }>;
+  sessions: Session[];
+}): Promise<void> {
+  await initTestDb();
+  const db = getRawDb();
+  runMigrations(db);
+  const now = new Date().toISOString();
+  for (const workgroupId of new Set(input.agentGroups.map((group) => group.workgroupId))) {
+    db.prepare('INSERT INTO workgroups (id, onecli_secrets, created_at) VALUES (?, ?, ?)').run(workgroupId, '[]', now);
+  }
+  for (const group of input.agentGroups) {
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, agent_provider, created_at, workgroup_id)
+       VALUES (?, ?, ?, 'claude', ?, ?)`,
+    ).run(group.id, group.id, group.id, now, group.workgroupId);
+  }
+  for (const messagingGroup of input.messagingGroups) {
+    db.prepare(
+      `INSERT INTO messaging_groups
+         (id, channel_type, platform_id, instance, name, is_group, unknown_sender_policy, created_at)
+       VALUES (?, 'slack', ?, 'slack', ?, 1, 'strict', ?)`,
+    ).run(messagingGroup.id, messagingGroup.platformId, messagingGroup.id, now);
+  }
+  for (const candidate of input.sessions) {
+    db.prepare(
+      `INSERT INTO sessions
+         (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status, last_active, created_at)
+       VALUES (@id, @agent_group_id, @messaging_group_id, @thread_id, @agent_provider, @status, @container_status, @last_active, @created_at)`,
+    ).run(candidate);
+  }
+  const groupRows = input.agentGroups.map((group) => ({
+    id: group.id,
+    folder: group.id,
+    workgroup_id: group.workgroupId,
+  }));
+  hostActionMocks.getAgentGroup.mockImplementation((id: string) => groupRows.find((group) => group.id === id));
+  hostActionMocks.getAllAgentGroups.mockReturnValue(groupRows);
+  hostActionMocks.getSessionsByAgentGroup.mockImplementation((agentGroupId: string) =>
+    input.sessions.filter((candidate) => candidate.agent_group_id === agentGroupId),
+  );
+}
+
+/** Session ids in sorted order: sessionsForWorkUnit's query has no ORDER BY. */
+function sortedIds(sessions: Session[]): string[] {
+  return sessions.map((candidate) => candidate.id).sort();
+}
+
+/**
+ * Mocks a publish whose drain succeeds, recording what it drained and woke and
+ * the notices it wrote. Every drain asserts the #655 scope: the requester's work
+ * unit is claimed, the other thread's is not, and no workgroup mount claim is
+ * held, so container-runner.ts:1685-1690 still admits the other thread's spawns.
+ * Fencing and stopping act only on the sessions handed to the drain
+ * (container-restart.ts:392-402), so a session outside that set is neither
+ * fenced nor killed.
+ */
+function observeThreadScopedPublish(requesterUnit: RepositoryWorkUnit, otherUnit: RepositoryWorkUnit) {
+  const drained: string[][] = [];
+  const woken: string[][] = [];
+  const notices: Array<{ agentGroupId: string; sessionId: string; id: string; onWake?: number; text: string }> = [];
+  hostActionMocks.quiesceSessionsForRepositoryMounts.mockImplementation(async (sessions: Session[], epoch: string) => {
+    expect(isRepositoryLifecycleClaimed(requesterUnit)).toBe(true);
+    expect(isRepositoryLifecycleClaimed(otherUnit)).toBe(false);
+    expect(isWorkgroupRepositoryMountClaimed(requesterUnit.workgroupId)).toBe(false);
+    drained.push(sortedIds(sessions));
+    return { epoch, sessions, barrierSessions: sessions, barrierAcks: {}, barrierGenerations: {} };
+  });
+  hostActionMocks.releaseRepositoryMountQuiescence.mockImplementation(async () => {
+    expect(isRepositoryLifecycleClaimed(requesterUnit)).toBe(true);
+    return [];
+  });
+  hostActionMocks.writeSessionMessageIfNew.mockImplementation(
+    async (agentGroupId: string, sessionId: string, message: { id: string; onWake?: number; content: string }) => {
+      const text = (JSON.parse(message.content) as { text: string }).text;
+      notices.push({ agentGroupId, sessionId, id: message.id, onWake: message.onWake, text });
+      return true;
+    },
+  );
+  hostActionMocks.wakeRepositoryMountSessions.mockImplementation((sessions: Session[]) => {
+    // Woken only after the claim is gone, or the spawn gate would refuse them.
+    expect(isRepositoryLifecycleClaimed(requesterUnit)).toBe(false);
+    woken.push(sortedIds(sessions));
+  });
+  return { drained, woken, notices };
 }
 
 beforeEach(() => {
@@ -580,12 +676,48 @@ describe('durable canonical publication core', () => {
     expect(fs.existsSync(path.join(conflictStage, '.git'))).toBe(true);
   });
 
+  it('never rewrites the canonical .git/config after the staging rename (#655)', async () => {
+    // Other threads keep running through a publish, so a spawn can bind the
+    // canonical's .git/config by path (container-runner.ts:1523) the instant
+    // the rename lands. The file it binds must be the one the canonical keeps.
+    const stage = path.join(root, 'sessions', 'sess-a', 'repository-staging', 'request-config-inode', 'proj');
+    cloneTo(stage);
+    const canonical = canonicalRepoDir('wg-a', 'proj', root);
+    // A hard link holds the config file a racing spawn would bind, the way a
+    // bind mount does. Comparing bare inode numbers would not do: a rewritten
+    // file can land on a freed inode number and read as unchanged.
+    const boundAtRename = path.join(root, 'config-bound-at-rename');
+    const realRename = fs.renameSync;
+    const rename = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (from === stage && to === canonical) fs.linkSync(path.join(stage, '.git', 'config'), boundAtRename);
+      realRename(from, to);
+    });
+    try {
+      await publishStagedCanonical({
+        workgroupId: 'wg-a',
+        repo: 'proj',
+        origin: remote,
+        repositoryId: remote,
+        stagingPath: stage,
+        dataDir: root,
+      });
+    } finally {
+      rename.mockRestore();
+    }
+
+    expect(fs.statSync(path.join(canonical, '.git', 'config')).ino).toBe(fs.statSync(boundAtRename).ino);
+    // Written into the staging config before the rename (sanitizeCanonicalConfig).
+    expect(git(canonical, ['config', 'gc.auto'])).toBe('0');
+    expect(git(canonical, ['config', 'gc.worktreePruneExpire'])).toBe('never');
+  });
+
   it('sanitizeCanonicalConfig writes core.hooksPath to the one exported MANAGED_GIT_HOOKS_SCAN_DIR constant for a wiki repo, and /dev/null otherwise (#666 review B12/P3-7)', async () => {
-    // Exercises BOTH sanitizeCanonicalConfig call sites: the first publish
-    // (new canonical, no prior .git/config) and a re-publish against an
-    // already-existing, matching canonical (the "existing" branch) — a
-    // writer bug in either path would otherwise silently drop a repo out of
-    // hook coverage (core.hooksPath pointing at a value nothing mounts).
+    // The first publish sanitizes the config and writes core.hooksPath. A
+    // re-publish against the already-existing, matching canonical (the
+    // "existing" branch) must leave that value exactly as written: the branch
+    // is read-only on the canonical (PR #738 review). A writer bug in either path
+    // would otherwise silently drop a repo out of hook coverage (core.hooksPath
+    // pointing at a value nothing mounts).
     for (const repo of ['wiki', 'code']) {
       const expected = repo === 'wiki' ? MANAGED_GIT_HOOKS_SCAN_DIR : '/dev/null';
 
@@ -603,7 +735,7 @@ describe('durable canonical publication core', () => {
       expect(safeGitConfigGet(repositoryConfigPath(path.join(canonical, '.git')), 'core.hooksPath')).toBe(expected);
 
       // Re-publish against the SAME, already-existing, matching canonical —
-      // the "existing" branch's own sanitizeCanonicalConfig call.
+      // the "existing" branch, which must not rewrite the config.
       const retryStage = path.join(root, 'sessions', 'sess-a', 'repository-staging', `hookspath-retry-${repo}`, repo);
       cloneTo(retryStage);
       const retry = await publishStagedCanonical({
@@ -664,7 +796,7 @@ describe('durable canonical publication core', () => {
     expect(fs.existsSync(realStage)).toBe(true);
   });
 
-  it('clone-publication-is-crash-resumable-and-workgroup-mounts-remain-consistent', async () => {
+  it("clone-publication-is-crash-resumable-under-the-requester's-thread-claim", async () => {
     const requestId = 'repo-1723600000000-0123456789abcdef';
     const requester = {
       id: 'session-requester',
@@ -677,28 +809,35 @@ describe('durable canonical publication core', () => {
       last_active: null,
       created_at: new Date().toISOString(),
     } satisfies Session;
+    // Same thread, another agent group: the same work unit, so drained with the requester.
     const sibling = { ...requester, id: 'session-sibling', agent_group_id: 'agent-b' } satisfies Session;
     const otherWorkgroup = { ...requester, id: 'session-other', agent_group_id: 'agent-other' } satisfies Session;
-    const mountSessions = [requester, sibling];
+    const mountSessionIds = [requester.id, sibling.id];
     const lifecycle: string[] = [];
     const insertedIds = new Set<string>();
 
-    hostActionMocks.getAgentGroup.mockReturnValue({ id: 'agent-a', folder: 'agent-a', workgroup_id: 'wg-a' });
-    hostActionMocks.getAllAgentGroups.mockReturnValue([
-      { id: 'agent-a', folder: 'agent-a', workgroup_id: 'wg-a' },
-      { id: 'agent-b', folder: 'agent-b', workgroup_id: 'wg-a' },
-      { id: 'agent-other', folder: 'agent-other', workgroup_id: 'wg-other' },
-    ]);
-    hostActionMocks.getSessionsByAgentGroup.mockImplementation((agentGroupId: string) => {
-      if (agentGroupId === 'agent-a') return [requester];
-      if (agentGroupId === 'agent-b') return [sibling];
-      if (agentGroupId === 'agent-other') return [otherWorkgroup];
-      return [];
+    await seedPublishFixture({
+      agentGroups: [
+        { id: 'agent-a', workgroupId: 'wg-a' },
+        { id: 'agent-b', workgroupId: 'wg-a' },
+        { id: 'agent-other', workgroupId: 'wg-other' },
+      ],
+      messagingGroups: [{ id: 'messaging-a', platformId: 'C-a' }],
+      sessions: [requester, sibling, otherWorkgroup],
+    });
+    const requesterUnit = resolveRepositoryWorkUnit({
+      workgroupId: 'wg-a',
+      sessionId: requester.id,
+      platformId: 'C-a',
+      messagingGroupId: requester.messaging_group_id,
+      threadId: requester.thread_id,
     });
     hostActionMocks.quiesceSessionsForRepositoryMounts.mockImplementation(
       async (sessions: Session[], epoch: string, timeoutMs: number) => {
-        expect(isWorkgroupRepositoryMountClaimed('wg-a')).toBe(true);
-        expect(sessions).toEqual(mountSessions);
+        // The requester's lifecycle claim, never the workgroup mount claim (#655).
+        expect(isRepositoryLifecycleClaimed(requesterUnit)).toBe(true);
+        expect(isWorkgroupRepositoryMountClaimed('wg-a')).toBe(false);
+        expect(sortedIds(sessions)).toEqual(mountSessionIds);
         expect(epoch).toBe(`repository-publish:${requestId}`);
         // Detached from the delivery drain, so the wait for siblings to reach a
         // safe point is the configured one (10 min), not container-restart's
@@ -711,16 +850,16 @@ describe('durable canonical publication core', () => {
     );
     hostActionMocks.releaseRepositoryMountQuiescence.mockImplementation(
       (quiescence: { sessions: Session[]; barrierSessions: Session[] }) => {
-        expect(isWorkgroupRepositoryMountClaimed('wg-a')).toBe(true);
-        expect(quiescence.sessions).toEqual(mountSessions);
-        expect(quiescence.barrierSessions).toEqual(mountSessions);
+        expect(isRepositoryLifecycleClaimed(requesterUnit)).toBe(true);
+        expect(sortedIds(quiescence.sessions)).toEqual(mountSessionIds);
+        expect(sortedIds(quiescence.barrierSessions)).toEqual(mountSessionIds);
         lifecycle.push('release');
-        return mountSessions;
+        return quiescence.sessions;
       },
     );
     hostActionMocks.wakeRepositoryMountSessions.mockImplementation((sessions: Session[]) => {
-      expect(isWorkgroupRepositoryMountClaimed('wg-a')).toBe(false);
-      expect(sessions).toEqual(mountSessions);
+      expect(isRepositoryLifecycleClaimed(requesterUnit)).toBe(false);
+      expect(sortedIds(sessions)).toEqual(mountSessionIds);
       lifecycle.push('wake');
     });
     hostActionMocks.writeSessionMessageIfNew.mockImplementation(
@@ -746,7 +885,7 @@ describe('durable canonical publication core', () => {
     expect(fs.existsSync(stage)).toBe(false);
     expect(git(canonical, ['branch', '--show-current'])).toBe('');
     expect(lifecycle).toEqual(['quiesce', 'release', 'wake']);
-    await expect(withWorkgroupRepositoryMountClaim('wg-a', async () => 'released')).resolves.toBe('released');
+    await expect(withRepositoryLifecycleClaims([requesterUnit], async () => 'released')).resolves.toBe('released');
 
     // Crash replay: the durable action is retried after the staging checkout
     // was atomically renamed and after the deterministic confirmation landed.
@@ -759,7 +898,7 @@ describe('durable canonical publication core', () => {
     ]);
     expect(insertedIds).toEqual(new Set([`repository-publish-complete-${requestId}`]));
     expect(git(canonical, ['status', '--porcelain=v1', '--untracked-files=all'])).toBe('');
-    await expect(withWorkgroupRepositoryMountClaim('wg-a', async () => 'released-again')).resolves.toBe(
+    await expect(withRepositoryLifecycleClaims([requesterUnit], async () => 'released-again')).resolves.toBe(
       'released-again',
     );
   });
@@ -781,16 +920,25 @@ describe('durable canonical publication core', () => {
     const mountSessions = [requester, sibling];
     const lifecycle: string[] = [];
 
-    hostActionMocks.getAgentGroup.mockReturnValue({ id: 'agent-a', folder: 'agent-a', workgroup_id: 'wg-a' });
-    hostActionMocks.getAllAgentGroups.mockReturnValue([
-      { id: 'agent-a', folder: 'agent-a', workgroup_id: 'wg-a' },
-      { id: 'agent-b', folder: 'agent-b', workgroup_id: 'wg-a' },
-    ]);
-    hostActionMocks.getSessionsByAgentGroup.mockImplementation((agentGroupId: string) =>
-      agentGroupId === 'agent-a' ? [requester] : agentGroupId === 'agent-b' ? [sibling] : [],
-    );
+    await seedPublishFixture({
+      agentGroups: [
+        { id: 'agent-a', workgroupId: 'wg-a' },
+        { id: 'agent-b', workgroupId: 'wg-a' },
+      ],
+      messagingGroups: [{ id: 'messaging-a', platformId: 'C-a' }],
+      sessions: [requester, sibling],
+    });
+    const requesterUnit = resolveRepositoryWorkUnit({
+      workgroupId: 'wg-a',
+      sessionId: requester.id,
+      platformId: 'C-a',
+      messagingGroupId: requester.messaging_group_id,
+      threadId: requester.thread_id,
+    });
     hostActionMocks.quiesceSessionsForRepositoryMounts.mockImplementation(
       async (_sessions: Session[], epoch: string) => {
+        // The partial kill happens under the requester's lifecycle claim (#655).
+        expect(isRepositoryLifecycleClaimed(requesterUnit)).toBe(true);
         lifecycle.push('partial-kill');
         throw new hostActionMocks.RepositoryMountQuiescenceError(
           { epoch, sessions: mountSessions, barrierSessions: mountSessions },
@@ -801,6 +949,7 @@ describe('durable canonical publication core', () => {
     );
     hostActionMocks.writeSessionMessageIfNew.mockImplementation(
       async (_group: string, _id: string, message: { onWake?: number }) => {
+        expect(isRepositoryLifecycleClaimed(requesterUnit)).toBe(false);
         expect(isWorkgroupRepositoryMountClaimed('wg-a')).toBe(false);
         expect(message.onWake).toBe(1);
         lifecycle.push('failure-notice');
@@ -808,6 +957,7 @@ describe('durable canonical publication core', () => {
       },
     );
     hostActionMocks.wakeRepositoryMountSessions.mockImplementation((sessions: Session[]) => {
+      expect(isRepositoryLifecycleClaimed(requesterUnit)).toBe(false);
       expect(isWorkgroupRepositoryMountClaimed('wg-a')).toBe(false);
       expect(sessions.map((candidate) => candidate.id)).toEqual(['session-requester', 'session-sibling']);
       lifecycle.push('wake');
@@ -877,6 +1027,295 @@ describe('durable canonical publication core', () => {
     expect(notices[0]!.onWake).toBe(0);
     expect(hostActionMocks.wakeRepositoryMountSessions).toHaveBeenCalledWith([requester]);
     expect(fs.existsSync(path.join(stage, '.git'))).toBe(true);
+  });
+
+  describe("drains only the requester's thread (#655)", () => {
+    const requester = {
+      id: 'session-requester',
+      agent_group_id: 'agent-a',
+      messaging_group_id: 'messaging-a',
+      thread_id: '171234.567',
+      agent_provider: 'claude',
+      status: 'active',
+      container_status: 'running',
+      last_active: null,
+      created_at: new Date().toISOString(),
+    } satisfies Session;
+    // Same thread, another agent group: the requester's work unit.
+    const sameThread = { ...requester, id: 'session-same-thread', agent_group_id: 'agent-b' } satisfies Session;
+    // Same workgroup, same agent group, another thread: another work unit, running.
+    const otherThread = { ...requester, id: 'session-other-thread', thread_id: '171234.999' } satisfies Session;
+    const unitFor = (candidate: Session) =>
+      resolveRepositoryWorkUnit({
+        workgroupId: 'wg-a',
+        sessionId: candidate.id,
+        platformId: 'C-a',
+        messagingGroupId: candidate.messaging_group_id,
+        threadId: candidate.thread_id,
+      });
+
+    async function seed(): Promise<void> {
+      await seedPublishFixture({
+        agentGroups: [
+          { id: 'agent-a', workgroupId: 'wg-a' },
+          { id: 'agent-b', workgroupId: 'wg-a' },
+        ],
+        messagingGroups: [{ id: 'messaging-a', platformId: 'C-a' }],
+        sessions: [requester, sameThread, otherThread],
+      });
+      expect(unitFor(sameThread).key).toBe(unitFor(requester).key);
+      expect(unitFor(otherThread).key).not.toBe(unitFor(requester).key);
+    }
+
+    function stageFor(requestId: string): string {
+      const stage = path.join(
+        sessionDir(requester.agent_group_id, requester.id),
+        'repository-staging',
+        requestId,
+        'proj',
+      );
+      cloneTo(stage);
+      return stage;
+    }
+
+    it("publishes a new canonical, leaving another thread's running session unfenced, unquiesced and unkilled", async () => {
+      const requestId = 'repo-1723600000000-0a1b2c3d4e5f6071';
+      await seed();
+      const observed = observeThreadScopedPublish(unitFor(requester), unitFor(otherThread));
+      const stage = stageFor(requestId);
+
+      await applyRepositoryPublishAction({ requestId, repo: 'proj', origin: remote, repositoryId: remote }, requester);
+
+      expect(observed.drained).toEqual([[requester.id, sameThread.id].sort()]);
+      expect(observed.woken).toEqual([[requester.id, sameThread.id].sort()]);
+      expect(observed.notices).toHaveLength(1);
+      expect(observed.notices[0]).toMatchObject({
+        agentGroupId: requester.agent_group_id,
+        sessionId: requester.id,
+        id: `repository-publish-complete-${requestId}`,
+        onWake: 1,
+      });
+      expect(observed.notices[0]!.text).toContain('proj is published as the workgroup canonical');
+      expect(observed.notices[0]!.text).toContain('other threads see it at their next container start');
+      expect(fs.existsSync(path.join(canonicalRepoDir('wg-a', 'proj', hostActionDataDir), '.git'))).toBe(true);
+      expect(fs.existsSync(stage)).toBe(false);
+    });
+
+    it('answers a re-publish of an existing matching canonical under the same scope and removes the staging clone', async () => {
+      const requestId = 'repo-1723600000000-8192a3b4c5d6e7f8';
+      await seed();
+      // An earlier request already published this repository.
+      const earlierStage = path.join(hostActionDataDir, 'earlier-request', 'proj');
+      cloneTo(earlierStage);
+      await publishStagedCanonical({
+        workgroupId: 'wg-a',
+        repo: 'proj',
+        origin: remote,
+        repositoryId: remote,
+        stagingPath: earlierStage,
+      });
+      const canonical = canonicalRepoDir('wg-a', 'proj', hostActionDataDir);
+      const canonicalHead = git(canonical, ['rev-parse', 'HEAD']);
+      const observed = observeThreadScopedPublish(unitFor(requester), unitFor(otherThread));
+      const stage = stageFor(requestId);
+
+      await applyRepositoryPublishAction({ requestId, repo: 'proj', origin: remote, repositoryId: remote }, requester);
+
+      expect(observed.drained).toEqual([[requester.id, sameThread.id].sort()]);
+      expect(observed.woken).toEqual([[requester.id, sameThread.id].sort()]);
+      expect(observed.notices).toHaveLength(1);
+      expect(observed.notices[0]).toMatchObject({
+        sessionId: requester.id,
+        id: `repository-publish-complete-${requestId}`,
+        onWake: 1,
+      });
+      expect(observed.notices[0]!.text).toContain('proj already matched the workgroup canonical');
+      expect(observed.notices[0]!.text).toContain('staging clone was discarded');
+      // The staging clone and its request root are gone; the canonical is untouched.
+      expect(fs.existsSync(stage)).toBe(false);
+      expect(fs.existsSync(path.dirname(stage))).toBe(false);
+      expect(git(canonical, ['rev-parse', 'HEAD'])).toBe(canonicalHead);
+    });
+
+    it("waits for another operation's claim on the requester's work unit, then publishes once it is released", async () => {
+      // The real 1 s poll: a same-thread checkout or cleanup holds this claim
+      // for seconds, and the publish must outwait it rather than fail.
+      const requestId = 'repo-1723600000000-1c2d3e4f5a6b7c8d';
+      await seed();
+      const requesterUnit = unitFor(requester);
+      const observed = observeThreadScopedPublish(requesterUnit, unitFor(otherThread));
+      const stage = stageFor(requestId);
+      let releaseOther!: () => void;
+      const otherOperation = withRepositoryLifecycleClaims(
+        [requesterUnit],
+        () =>
+          new Promise<void>((resolve) => {
+            releaseOther = resolve;
+          }),
+      );
+
+      const settled = applyRepositoryPublishAction(
+        { requestId, repo: 'proj', origin: remote, repositoryId: remote },
+        requester,
+      ).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      // Still waiting on the other operation: nothing drained, nothing answered.
+      expect(observed.drained).toEqual([]);
+      expect(observed.notices).toEqual([]);
+
+      releaseOther();
+      await otherOperation;
+      expect(await settled).toBeNull();
+      expect(observed.drained).toEqual([[requester.id, sameThread.id].sort()]);
+      expect(observed.notices.map((notice) => notice.id)).toEqual([`repository-publish-complete-${requestId}`]);
+      expect(fs.existsSync(path.join(canonicalRepoDir('wg-a', 'proj', hostActionDataDir), '.git'))).toBe(true);
+      expect(fs.existsSync(stage)).toBe(false);
+    });
+
+    it('fails with a retryable explanation when the claim outlasts the wait, draining nothing', async () => {
+      const requestId = 'repo-1723600000000-9e8d7c6b5a4f3e2d';
+      await seed();
+      const requesterUnit = unitFor(requester);
+      const observed = observeThreadScopedPublish(requesterUnit, unitFor(otherThread));
+      // The other operation still holds the claim when the requester is woken
+      // with its failure notice, so this wake runs under that claim.
+      hostActionMocks.wakeRepositoryMountSessions.mockImplementation(() => undefined);
+      const stage = stageFor(requestId);
+
+      _setPublishClaimWaitForTesting({ pollMs: 10, timeoutMs: 50 });
+      try {
+        await withRepositoryLifecycleClaims([requesterUnit], async () => {
+          await expect(
+            applyRepositoryPublishAction({ requestId, repo: 'proj', origin: remote, repositoryId: remote }, requester),
+          ).rejects.toThrow(/another repository operation on this thread held its lifecycle claim/);
+        });
+      } finally {
+        _setPublishClaimWaitForTesting(null);
+      }
+
+      expect(observed.drained).toEqual([]);
+      expect(observed.notices).toHaveLength(1);
+      expect(observed.notices[0]).toMatchObject({ id: `repository-publish-failed-${requestId}`, onWake: 0 });
+      expect(observed.notices[0]!.text).toContain('another repository operation on this thread');
+      expect(observed.notices[0]!.text).toContain('clone_repo can be retried');
+      expect(fs.existsSync(path.join(stage, '.git'))).toBe(true);
+      expect(fs.existsSync(canonicalRepoDir('wg-a', 'proj', hostActionDataDir))).toBe(false);
+    });
+
+    it('waits for an operator workgroup mount claim, then publishes once it is released', async () => {
+      // `ncl repositories activate|rollback` holds the workgroup mount claim
+      // while it quiesces every session in the workgroup, the requester's
+      // included (cli/resources/repositories.ts:78). That claim is a different
+      // namespace from the lifecycle claim, so nothing but this wait keeps the
+      // two from fencing the requester's sessions under different epochs.
+      const requestId = 'repo-1723600000000-2b3c4d5e6f708192';
+      await seed();
+      const observed = observeThreadScopedPublish(unitFor(requester), unitFor(otherThread));
+      const stage = stageFor(requestId);
+      let releaseOperator!: () => void;
+      const operatorTransition = withWorkgroupRepositoryMountClaim(
+        'wg-a',
+        () =>
+          new Promise<void>((resolve) => {
+            releaseOperator = resolve;
+          }),
+      );
+
+      const settled = applyRepositoryPublishAction(
+        { requestId, repo: 'proj', origin: remote, repositoryId: remote },
+        requester,
+      ).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      // Still waiting on the operator transition: nothing drained, nothing answered.
+      expect(observed.drained).toEqual([]);
+      expect(observed.notices).toEqual([]);
+
+      releaseOperator();
+      await operatorTransition;
+      expect(await settled).toBeNull();
+      expect(observed.drained).toEqual([[requester.id, sameThread.id].sort()]);
+      expect(observed.notices.map((notice) => notice.id)).toEqual([`repository-publish-complete-${requestId}`]);
+      expect(fs.existsSync(path.join(canonicalRepoDir('wg-a', 'proj', hostActionDataDir), '.git'))).toBe(true);
+      expect(fs.existsSync(stage)).toBe(false);
+    });
+
+    it('fails with a retryable explanation when an operator workgroup claim outlasts the wait, draining nothing', async () => {
+      const requestId = 'repo-1723600000000-3c4d5e6f708192a3';
+      await seed();
+      const observed = observeThreadScopedPublish(unitFor(requester), unitFor(otherThread));
+      const stage = stageFor(requestId);
+
+      _setPublishClaimWaitForTesting({ pollMs: 10, timeoutMs: 50 });
+      try {
+        await withWorkgroupRepositoryMountClaim('wg-a', async () => {
+          await expect(
+            applyRepositoryPublishAction({ requestId, repo: 'proj', origin: remote, repositoryId: remote }, requester),
+          ).rejects.toThrow(/workgroup repository transition held the mount claim on wg-a/);
+        });
+      } finally {
+        _setPublishClaimWaitForTesting(null);
+      }
+
+      // Nothing drained and nothing published: the staging clone is still the
+      // requester's to retry with, and no canonical exists.
+      expect(observed.drained).toEqual([]);
+      expect(observed.notices).toHaveLength(1);
+      expect(observed.notices[0]).toMatchObject({ id: `repository-publish-failed-${requestId}`, onWake: 0 });
+      expect(observed.notices[0]!.text).toContain('clone_repo can be retried');
+      expect(fs.existsSync(path.join(stage, '.git'))).toBe(true);
+      expect(fs.existsSync(canonicalRepoDir('wg-a', 'proj', hostActionDataDir))).toBe(false);
+    });
+
+    it("leaves a legacy canonical's config, HEAD and index byte- and inode-identical on a re-publish", async () => {
+      // Other threads keep running through a publish and bind the canonical's
+      // config, HEAD and index by file (container-runner.ts:1522-1528). A
+      // re-publish must not replace any of them.
+      const requestId = 'repo-1723600000000-5a4b3c2d1e0f9a8b';
+      await seed();
+      const earlierStage = path.join(hostActionDataDir, 'earlier-request', 'proj');
+      cloneTo(earlierStage);
+      await publishStagedCanonical({
+        workgroupId: 'wg-a',
+        repo: 'proj',
+        origin: remote,
+        repositoryId: remote,
+        stagingPath: earlierStage,
+      });
+      const canonical = canonicalRepoDir('wg-a', 'proj', hostActionDataDir);
+      // A config sanitize would rewrite (a legacy hooksPath, a key it drops) and
+      // a HEAD on a branch, which a checkout --detach would rewrite.
+      git(canonical, ['config', 'core.hooksPath', '/legacy/hooks']);
+      git(canonical, ['config', 'legacy.keep', 'true']);
+      git(canonical, ['checkout', '-q', 'main']);
+      // Hard links hold each file as a bind mount does, so a replaced file
+      // cannot land on a freed inode number and read as unchanged.
+      const held = ['config', 'HEAD', 'index'].map((name) => {
+        const file = path.join(canonical, '.git', name);
+        const link = path.join(hostActionDataDir, `held-${name}`);
+        fs.linkSync(file, link);
+        return { name, file, link, bytes: fs.readFileSync(file) };
+      });
+      const observed = observeThreadScopedPublish(unitFor(requester), unitFor(otherThread));
+      const stage = stageFor(requestId);
+
+      await applyRepositoryPublishAction({ requestId, repo: 'proj', origin: remote, repositoryId: remote }, requester);
+
+      for (const entry of held) {
+        expect(fs.readFileSync(entry.file).equals(entry.bytes), `${entry.name} bytes`).toBe(true);
+        expect(fs.statSync(entry.file).ino, `${entry.name} inode`).toBe(fs.statSync(entry.link).ino);
+      }
+      expect(observed.drained).toEqual([[requester.id, sameThread.id].sort()]);
+      expect(observed.woken).toEqual([[requester.id, sameThread.id].sort()]);
+      expect(observed.notices.map((notice) => notice.id)).toEqual([`repository-publish-complete-${requestId}`]);
+      expect(observed.notices[0]!.text).toContain('proj already matched the workgroup canonical');
+      expect(fs.existsSync(stage)).toBe(false);
+    });
   });
 });
 

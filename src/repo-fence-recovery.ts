@@ -71,8 +71,11 @@ async function yieldEventLoop(index: number): Promise<void> {
  * Both fencing paths take an in-memory claim BEFORE they quiesce and hold it
  * until after the barrier release:
  *
- * - publish  → `withWorkgroupRepositoryMountClaim(workgroupId, …)` wraps the
- *   whole of `applyRepositoryPublishAction`'s quiesce → publish → release.
+ * - publish  → `withRepositoryLifecycleClaims([requesterWorkUnit], …)` wraps the
+ *   whole of `applyRepositoryPublishAction`'s quiesce → publish → release,
+ *   which fences only the requester's work unit (#655). The workgroup mount
+ *   claim is still what `ncl repositories` activation holds
+ *   (cli/resources/repositories.ts:78).
  * - transfer → `withRepositoryLifecycleClaims([source, destination], …)` inside
  *   `transferRepositoryWorktree` wraps `beforeMoveWhileClaimed` (which
  *   quiesces the destination work unit) through the release.
