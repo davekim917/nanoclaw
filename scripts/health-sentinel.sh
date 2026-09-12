@@ -369,11 +369,28 @@ DEPLOY_LAG_PULL_MAX_S="${DEPLOY_LAG_PULL_MAX_S:-86400}"
 # HEAD — exactly the under-report mode the header comment above warns about.
 # All three now raise their own breach instead of picking a default.
 # DEPLOY_LAG_MAX_S=0 stays the one documented, intentional off switch.
-is_nonneg_int() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; }
+#
+# Length-capped, not just digit-checked: `[ "$1" -eq 0 ]` / `[ "$1" -ge N ]` on
+# a numeral past int64 range (2^63-1 = 19 digits) errors with exit status 2,
+# which `if`/`elif` reads as plain false, not a crash — so an overflowing
+# threshold used to sail past this validation as "a non-negative integer" and
+# then silently turn the whole vital off a few lines down, the exact
+# quietly-vanishes shape this validation exists to close. 18 digits is a
+# comfortable ceiling under that boundary; no real timeout config needs more.
+is_nonneg_int() {
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#1}" -le 18 ]
+}
 
+# Each config fault gets its own dedup key. They used to share
+# `deploy-lag-config`, and the dedup loop below sends only the first message
+# per key within the 6h cooldown — so an invalid DEPLOY_LAG_PULL_MAX_S and a
+# missing jq at the same time delivered only one of the two breaches and the
+# cooldown then hid the other for 6h. One key per fault, same pattern
+# WATCHED_TIMERS already uses (`unit-$unit` per watched unit).
 DEPLOY_LAG_ENABLED=1
 if ! is_nonneg_int "$DEPLOY_LAG_MAX_S"; then
-  BREACHES+=("deploy-lag-config|DEPLOY_LAG_MAX_S='$DEPLOY_LAG_MAX_S' is not a non-negative integer — the deploy-lag vital cannot be evaluated, so this is reported as a breach instead of silently skipping the whole vital")
+  BREACHES+=("deploy-lag-config-max|DEPLOY_LAG_MAX_S='$DEPLOY_LAG_MAX_S' is not a non-negative integer of at most 18 digits — the deploy-lag vital cannot be evaluated, so this is reported as a breach instead of silently skipping the whole vital")
   DEPLOY_LAG_ENABLED=0
 elif [ "$DEPLOY_LAG_MAX_S" -eq 0 ]; then
   DEPLOY_LAG_ENABLED=0 # documented off switch — not an error, no breach
@@ -383,11 +400,11 @@ DEPLOY_LAG_PULL_MAX_S_OK=1
 JQ_OK=1
 if [ "$DEPLOY_LAG_ENABLED" = 1 ]; then
   if ! is_nonneg_int "$DEPLOY_LAG_PULL_MAX_S"; then
-    BREACHES+=("deploy-lag-config|DEPLOY_LAG_PULL_MAX_S='$DEPLOY_LAG_PULL_MAX_S' is not a non-negative integer — the pull-lag half of the deploy-lag vital cannot be evaluated, so this is reported as a breach instead of silently skipping it")
+    BREACHES+=("deploy-lag-config-pull|DEPLOY_LAG_PULL_MAX_S='$DEPLOY_LAG_PULL_MAX_S' is not a non-negative integer of at most 18 digits — the pull-lag half of the deploy-lag vital cannot be evaluated, so this is reported as a breach instead of silently skipping it")
     DEPLOY_LAG_PULL_MAX_S_OK=0
   fi
   if ! command -v jq >/dev/null 2>&1; then
-    BREACHES+=("deploy-lag-config|jq is not installed — the deploy-lag vital cannot read dist/BUILD_INFO.json and would otherwise silently fall back to comparing against HEAD; reported as a breach instead")
+    BREACHES+=("deploy-lag-jq|jq is not installed — the deploy-lag vital cannot read dist/BUILD_INFO.json and would otherwise silently fall back to comparing against HEAD; reported as a breach instead")
     JQ_OK=0
   fi
 fi
@@ -438,7 +455,11 @@ if [ "$DEPLOY_LAG_ENABLED" = 1 ] && [ "$JQ_OK" = 1 ] && git rev-parse -q --verif
     read -r PULL_BEHIND PULL_FIRST <<<"$(merges_behind HEAD "${RUNTIME_PATHS[@]}")"
     PULL_LAG=$((NOW - ${PULL_FIRST:-$NOW}))
     if [ "$PULL_BEHIND" -gt 0 ] && [ "$PULL_LAG" -ge "$DEPLOY_LAG_PULL_MAX_S" ]; then
-      BREACHES+=("deploy-lag|$PULL_BEHIND merge(s) to scripts or skills have waited $((PULL_LAG / 3600))h for a deploy; the checkout is at $(git rev-parse --short HEAD). None needs a restart of its own, so run scripts/deploy.sh at a quiet moment.$DRY_RUN_LAG_NOTE")
+      # Own dedup key, not `deploy-lag`: that key is restart-lag's. They used to
+      # share it, so a pull-lag alert (24h bound, cosmetic) stamped the same
+      # cooldown a restart-lag breach (3h bound, the more serious of the two)
+      # relies on, hiding it for up to 6h behind an unrelated alert.
+      BREACHES+=("deploy-lag-pull|$PULL_BEHIND merge(s) to scripts or skills have waited $((PULL_LAG / 3600))h for a deploy; the checkout is at $(git rev-parse --short HEAD). None needs a restart of its own, so run scripts/deploy.sh at a quiet moment.$DRY_RUN_LAG_NOTE")
     fi
   fi
   # A build the service never restarted onto: dist/ moved but the running
