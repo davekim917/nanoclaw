@@ -82,6 +82,37 @@ risk:high:
     - 'src/dashboard/observatory-v2/api.ts'
     - 'src/dashboard/router.ts'
     - 'src/dashboard/thread-message.ts'
+    # #651 round 2 — the seams #651's own follow-up comment named as still open: gates
+    # that decide who may act (requireAuth's per-route wiring, the SSE feed's
+    # per-connection scope filter, the two scheduled-task management gates, Signal
+    # claim release, and dispatch-destination selection) and read-side scoping that
+    # decides which groups'/workgroups' data a caller sees (the inbox/console/workgroup
+    # list-and-detail endpoints, and the canAssign call sites that gate who a
+    # nudge/steer may target).
+    - 'src/dashboard/index.ts'
+    - 'src/dashboard/api/events.ts'
+    - 'src/dashboard/api/scheduled-mutations.ts'
+    - 'src/dashboard/api/scheduled-move.ts'
+    - 'src/dashboard/observatory-v2/state.ts'
+    - 'src/dashboard/observatory-v2/destination.ts'
+    - 'src/dashboard/api/sessions.ts'
+    - 'src/dashboard/api/threads.ts'
+    - 'src/dashboard/api/groups.ts'
+    - 'src/dashboard/api/workgroups.ts'
+    - 'src/dashboard/api/observatory.ts'
+    - 'src/dashboard/api/scheduled-read.ts'
+    - 'src/dashboard/api/scheduled-assembly.ts'
+    - 'src/dashboard/nudge.ts'
+    - 'src/dashboard/observatory-steer.ts'
+    # Deliberately NOT on this list: 'src/dashboard/static.ts' (public SPA asset
+    # handler — path-containment only, no authorization decision), 'observatory-v2/
+    # types.ts' (pure interface declarations, no logic to cover), the attention/sweep/
+    # idempotency files ('api/attention-fs.ts', 'api/board-attention.ts',
+    # 'api/desk-attention.ts', 'session-title-sweep.ts', 'db/steer-idempotency.ts' —
+    # file-read item producers, a title-generation sweep, and a request-dedupe cache,
+    # none of which decide who may act or what they may see), and 'webhook-server.ts'
+    # (HTTP transport plumbing only — it delegates all routing/dispatch to router.ts,
+    # which is already on this list).
     # Irreversible against a live DB
     - 'src/db/migrations/**'
     # Supply chain: pnpm allowBuilds, and the container image it builds
@@ -217,6 +248,21 @@ risk:credential:
     - 'src/dashboard/observatory-v2/api.ts'
     - 'src/dashboard/router.ts'
     - 'src/dashboard/thread-message.ts'
+    - 'src/dashboard/index.ts'
+    - 'src/dashboard/api/events.ts'
+    - 'src/dashboard/api/scheduled-mutations.ts'
+    - 'src/dashboard/api/scheduled-move.ts'
+    - 'src/dashboard/observatory-v2/state.ts'
+    - 'src/dashboard/observatory-v2/destination.ts'
+    - 'src/dashboard/api/sessions.ts'
+    - 'src/dashboard/api/threads.ts'
+    - 'src/dashboard/api/groups.ts'
+    - 'src/dashboard/api/workgroups.ts'
+    - 'src/dashboard/api/observatory.ts'
+    - 'src/dashboard/api/scheduled-read.ts'
+    - 'src/dashboard/api/scheduled-assembly.ts'
+    - 'src/dashboard/nudge.ts'
+    - 'src/dashboard/observatory-steer.ts'
 
 risk:migration:
 - changed-files:
