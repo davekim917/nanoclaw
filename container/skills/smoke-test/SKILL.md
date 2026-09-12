@@ -1815,9 +1815,12 @@ importing the file, so the file is never executed; any problem (unreadable or
 unparseable file, the name missing at top level, the name bound or mutated by
 any other top-level statement (`+=`, `.extend`/`.append`, `del`, a second
 assignment, an alias `X = NAME`, `from x import NAME`, `import x as NAME`, a
-star import, `def`/`class NAME`, `except … as NAME`, a `match` capture), a
-top-level statement that reaches the namespace by string (`globals`, `vars`,
-`setattr`, `exec`, `eval`, `__import__`, `sys.modules`), a computed rather
+star import, `def`/`class NAME`, `except … as NAME`, a `match` capture), the
+constant handed to a call that could mutate it in place (`_widen(NAME)`,
+`list.append(NAME, …)` — anything but `len`/`sorted`/`tuple`/`list`/`set`/
+`any`/`all`/`"…".join`), a top-level statement that reaches the namespace by
+string (`globals`, `vars`, `setattr`, `exec`, `eval`, `__import__`,
+`sys.modules`) or that calls a function whose body does, a computed rather
 than literal value, or a mistyped value) fails closed to `full`. A plain READ
 of the constant elsewhere in that file — `ALL = NAME + OTHER`, `len(NAME)` —
 is not a problem and does not change the size: the one constant plus the

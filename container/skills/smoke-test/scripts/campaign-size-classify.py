@@ -181,6 +181,94 @@ def _roots_at_name(node, name):
     return isinstance(cur, ast.Name) and cur.id == name
 
 
+# Callees that cannot mutate what they are handed, so passing the constant
+# to one of them is a READ. Anything else -- a module-level helper, an
+# imported function, `list.append(NAME, ...)` -- receives the list BY
+# REFERENCE and can mutate it in place while the file is being imported,
+# which leaves the literal this classifier reads a stale, partial policy
+# (round-2 review of #736).
+_PURE_CALLEES = frozenset(("len", "sorted", "tuple", "list", "set", "any", "all"))
+
+
+def _call_is_pure(func):
+    """True for a callee that cannot mutate its arguments: one of the
+    `_PURE_CALLEES` builtins, or `str.join` on a literal separator -- the
+    `"|".join(NAME)` a real policy file actually writes."""
+    if isinstance(func, ast.Name) and func.id in _PURE_CALLEES:
+        return True
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr == "join"
+        and isinstance(func.value, ast.Constant)
+        and isinstance(func.value.value, str)
+    )
+
+
+def _passes_name(call, name):
+    """True if `call` hands `name` ITSELF to its callee -- positionally, by
+    keyword, or unpacked (`f(*NAME)`, `f(**NAME)`). A nested call needs no
+    special case: `f(g(NAME))` is two Call nodes, and the walk that uses this
+    checks each one, so an impure `g` is caught at `g`."""
+    handed = [arg.value if isinstance(arg, ast.Starred) else arg for arg in call.args]
+    # `f(x=NAME)` carries the name on the keyword's value, and so does
+    # `f(**NAME)` (a keyword whose `arg` is None).
+    handed.extend(kw.value for kw in call.keywords)
+    return any(isinstance(a, ast.Name) and a.id == name for a in handed)
+
+
+def _module_function_defs(tree):
+    """Module-level `def`s by name -- every callee a top-level call can
+    reach without going through an import."""
+    return {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
+def _called_function_escape(node, defs):
+    """`(function, escape)` for a namespace escape inside a function that
+    this top-level statement CALLS, or None.
+
+    `_namespace_escape` deliberately does not scan function bodies -- they
+    are not import-time code. But a body that is *called* at top level does
+    run at import time, and `setattr(sys.modules[__name__], "NAME", [])` in
+    there rebinds the constant with nothing at top level naming either the
+    builtin or the constant (round-2 review of #736). Calls are followed
+    transitively, so a helper that delegates to another helper is covered.
+
+    Deliberately NOT "refuse every top-level call to a module-level
+    function": a real policy file calls its own helpers freely (the live one
+    does so 46 times at module level), and refusing those is round 1's
+    regression again. Only a reachable namespace escape refuses."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return None
+    pending = [
+        sub.func.id
+        for sub in _module_level_nodes(node)
+        if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id in defs
+    ]
+    seen = set()
+    while pending:
+        fname = pending.pop()
+        if fname in seen:
+            continue
+        seen.add(fname)
+        for sub in ast.walk(defs[fname]):
+            if isinstance(sub, ast.Name) and sub.id in _NAMESPACE_BUILTINS:
+                return fname, sub.id
+            if (
+                isinstance(sub, ast.Attribute)
+                and sub.attr == "modules"
+                and isinstance(sub.value, ast.Name)
+                and sub.value.id == "sys"
+            ):
+                return fname, "sys.modules"
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id in defs:
+                pending.append(sub.func.id)
+    return None
+
+
 def _rebinding_use(node, name):
     """How top-level statement `node` binds or mutates `name`, as a phrase,
     or None if it does neither.
@@ -224,6 +312,15 @@ def _rebinding_use(node, name):
             and _roots_at_name(sub.func, name)
         ):
             return "calls a method on"
+        # The constant HANDED to a call that could mutate it in place:
+        # `_widen(NAME)`, where the helper does `globs.append(...)`, or
+        # `list.append(NAME, "...")`. Both read like a plain use at the call
+        # site -- nothing else in this function would see them -- and both
+        # leave the literal above a partial policy once the module is
+        # imported for real. Only a callee that provably cannot mutate its
+        # argument is allowed through (round-2 review of #736).
+        if isinstance(sub, ast.Call) and not _call_is_pure(sub.func) and _passes_name(sub, name):
+            return "hands it to a call that could mutate"
         if isinstance(sub, (ast.Global, ast.Nonlocal)) and name in sub.names:
             return "declares a global/nonlocal binding for"
         # `X = NAME` / `X: T = NAME` -- an alias shares the one list object,
@@ -281,11 +378,17 @@ def _find_top_level_assignment(tree, name):
     assignment must be at top level: a value assigned conditionally or built
     inside a function is not a fixed policy constant this format can trust."""
     found = None
+    defs = _module_function_defs(tree)
     for node in tree.body:
         escape = _namespace_escape(node)
         if escape is not None:
             return None, "a top-level {} statement uses {}, which can rebind any name by string".format(
                 type(node).__name__, escape
+            )
+        called = _called_function_escape(node, defs)
+        if called is not None:
+            return None, "a top-level {} statement calls {}(), whose body uses {}, which can rebind any name by string".format(
+                type(node).__name__, called[0], called[1]
             )
         # A bare annotation (`name: list[str]`) declares a type for the
         # assignment below it. It binds nothing and carries no value, so it

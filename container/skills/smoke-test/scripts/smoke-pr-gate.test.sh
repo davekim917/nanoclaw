@@ -2327,6 +2327,106 @@ import sys
 sys.modules[__name__].SENSITIVE_GLOBS = ["backend/billing/**"]
 ' 'sys.modules'
 
+# --- A top-level CALL runs at import time and can mutate the constant in
+# place, leaving the literal this classifier reads a partial policy -- #723's
+# class by a route no name-level check sees (#736 round-2). Three shapes, one
+# cause: the constant handed to something that can mutate it.
+
+# 1. A helper that mutates its parameter. The call site reads like a plain
+#    use; only the callee knows.
+assert_policy_refused widen-call 'def _widen(globs):
+    globs.append("backend/billing/**")
+
+
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+_widen(SENSITIVE_GLOBS)
+' 'Expr'
+
+# 2. The same cause with the constant as an argument to an unbound method --
+#    `SENSITIVE_GLOBS.append(...)` is already refused, so this is the way
+#    round it.
+assert_policy_refused list-append-call 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+list.append(SENSITIVE_GLOBS, "backend/billing/**")
+' 'Expr'
+
+# 3. A helper whose BODY reaches the namespace by string, invoked at top
+#    level: nothing at top level names either `setattr` or the constant, and
+#    `_namespace_escape` does not scan function bodies, so only resolving the
+#    callee finds it.
+assert_policy_refused setattr-helper 'import sys
+
+
+def _install(value):
+    setattr(sys.modules[__name__], "SENSITIVE_GLOBS", value)
+
+
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+_install(["backend/billing/**"])
+' 'setattr|sys.modules'
+
+# Read-only control: the constant passed to callees that CANNOT mutate it
+# still classifies exactly as the minimal policy does. Refusing every call
+# that takes the constant, or every top-level call to a module-level helper,
+# would size every PR on a real install `full` -- round 1's regression.
+CALLREAD_MOD="$STATE_DIR/policy-callread.py"
+cat > "$CALLREAD_MOD" <<'PY'
+SENSITIVE_GLOBS = ["backend/permissions/**", "backend/billing/**"]
+GLOB_COUNT = len(SENSITIVE_GLOBS)
+SORTED_GLOBS = sorted(SENSITIVE_GLOBS)
+FROZEN_GLOBS = tuple(SENSITIVE_GLOBS)
+COPIED_GLOBS = list(SENSITIVE_GLOBS)
+UNIQUE_GLOBS = set(SENSITIVE_GLOBS)
+HAS_ANY = any(SENSITIVE_GLOBS)
+HAS_ALL = all(SENSITIVE_GLOBS)
+GLOB_RE = "|".join(SENSITIVE_GLOBS)
+ALL_GLOBS = SENSITIVE_GLOBS + ["backend/legacy/**"]
+PY
+CALLREAD_RULES="$STATE_DIR/fgf-callread.json"
+cat > "$CALLREAD_RULES" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$CALLREAD_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$CALLREAD_RULES" | jq -e '
+  .campaignSize == "full" and
+  .sizeReason == "full: backend/billing/charge.ts matched backend/billing/**"
+' >/dev/null
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$CALLREAD_RULES" | jq -e '
+  .campaignSize == "light"
+' >/dev/null
+
+# Read-only control 2: a policy file that CALLS its own helpers at top level
+# classifies normally, as long as no reachable body escapes the namespace.
+# The live policy does this 46 times; refusing it is the round-1 regression.
+HELPERS_MOD="$STATE_DIR/policy-helpers.py"
+cat > "$HELPERS_MOD" <<'PY'
+import re
+
+
+def _glob_re(glob):
+    return glob.replace("**", ".*")
+
+
+def _describe(count):
+    return "{} sensitive globs".format(count)
+
+
+SENSITIVE_GLOBS = ["backend/permissions/**", "backend/billing/**"]
+SENSITIVE_RE = re.compile("|".join(_glob_re(g) for g in SENSITIVE_GLOBS))
+SUMMARY = _describe(len(SENSITIVE_GLOBS))
+PY
+HELPERS_RULES="$STATE_DIR/fgf-helpers.json"
+cat > "$HELPERS_RULES" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$HELPERS_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$HELPERS_RULES" | jq -e '
+  .campaignSize == "full" and
+  .sizeReason == "full: backend/billing/charge.ts matched backend/billing/**"
+' >/dev/null
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$HELPERS_RULES" | jq -e '
+  .campaignSize == "light"
+' >/dev/null
+
 # --- A DANGLING SYMLINK is present, not absent (#736 round-1 P2-2). open()
 # raises FileNotFoundError for it exactly as it does for a path that was
 # never created, so it used to collapse into "no sizing rules" -- #721's
