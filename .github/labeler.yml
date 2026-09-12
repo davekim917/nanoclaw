@@ -111,9 +111,11 @@ risk:high:
     # another workgroup's private issue body. The leak itself is fixed in its own
     # security PR (a hasWorkgroupAccess check, same shape as api/observatory.ts's),
     # but the file belongs on this list regardless of who reads it next. And
-    # messaging-groups.ts's own header names its global, unscoped list a deliberate
-    # choice (messaging groups aren't authz-scoped the way agent_group_ids are) — a
-    # visibility decision worth review even though it is intentional, not a bug.
+    # messaging-groups.ts's list was global and unscoped when it was added here — a
+    # visibility decision worth review even though it was intentional, not a bug.
+    # #746 has since gated the whole list to canManageScheduled (owner/global-admin),
+    # closing that read; the file stays on this list because it still makes an
+    # authorization decision, now an explicit one.
     - 'src/dashboard/issue-brief.ts'
     - 'src/dashboard/api/messaging-groups.ts'
     # Deliberately NOT on this list: 'src/dashboard/static.ts' (public SPA asset
