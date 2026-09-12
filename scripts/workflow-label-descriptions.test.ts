@@ -27,6 +27,9 @@ import { enforceHermeticity } from '../src/test-hermeticity.js';
  * rather than hardcoding today's descriptions, so a future edit is caught too.
  */
 
+// Pure fs reads under the repo root — no subprocess, network, or writes.
+enforceHermeticity();
+
 const WORKFLOWS_DIR = path.resolve('.github/workflows');
 const MAX_LABEL_DESCRIPTION_LENGTH = 100;
 
