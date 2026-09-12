@@ -62,8 +62,39 @@ its disposition. A local completion claim is not substitute-review coverage.
 
 ## Review notes and fix links
 
-Before starting, the author and the reviewer read `docs/review-notes.md`.
-Deferring a finding to an issue, or reverting a PR, appends one line there.
+Before writing or reviewing code, the author and the reviewer read
+`docs/review-notes.md`.
+
+Every review verdict this fleet produces is posted as a receipt
+(`codex-review.sh receipt`), `changes` included: a verdict that stays in chat
+leaves nothing for the gate or the notes to read. A PR that received any
+`changes` receipt, on any head, adds or amends a line in `docs/review-notes.md`
+in the same PR, or carries a body line `Review-notes: none (<reason>)` with a
+non-empty reason. A finding fixed during review is a lesson as much as a
+deferred one, and it is the kind that used to go unrecorded.
+`codex-review.sh merge-check` refuses without one (exit 24,
+`review_notes_missing`), and `audit` re-checks it as of the merge. A line
+inside a code fence or an HTML comment doesn't count, and the reason is one
+parenthesised phrase, nothing after it on the line, with at least one visible
+character. Zero-width space, soft hyphen, zero-width joiner, and other Unicode
+format characters are allowed inside an otherwise-visible reason; a reason
+left with nothing but those, whitespace, control characters, bare combining
+marks, or a handful of blank-looking codepoints (U+2800, U+3164, U+115F,
+U+1160, U+FFA0) once they're stripped is refused. Deferring a finding to an
+issue, or reverting a PR, adds a line too.
+
+When this rule, or any merge-check rule, changes on main, re-extract the gate
+before the next merge. A PR merged through a skill copy extracted before the
+change landed, but merged after it, is audited under the rule its merge
+commit carries — each merge is audited with its own commit's copy of the
+skill (`.github/scripts/gate-audit.sh:175-180`) — and can be flagged
+`gate-bypass`. No go-live cutoff is needed.
+
+A class on a second line must name a structural fix on its newest line: the
+lint rule, test or primitive that now catches it. `scripts/review-notes.test.ts`
+fails the PR that records the second occurrence without one, which is where
+that fix belongs.
+
 When the PR carries `risk:*` dimension labels, they scope the reviewer's
 brief. Labels are for reading: `codex-review.sh scope` decides whether a head
 is reviewed at all from the PR's changed files, and a label can only add

@@ -211,6 +211,9 @@ esac
 page=1
 [ "$after" = "null" ] || page=2
 printf '%s %s\\n' "$connection" "$after" >> "$MOCK_CALLS"
+# <connection>-fail-<n>: the nth read of that connection in this run fails, as a GraphQL error would.
+n=$(grep -c "^$connection " "$MOCK_CALLS")
+if [ -f "$MOCK_DIR/$connection-fail-$n" ]; then echo 'gh: GraphQL request failed (HTTP 502)' >&2; exit 1; fi
 if [ "$connection" = "reviewThreads" ] && [ -f "$MOCK_DIR/threads-after-review.json" ] && grep -q '^reviews ' "$MOCK_CALLS"; then
   cat "$MOCK_DIR/threads-after-review.json"
 else
@@ -2068,6 +2071,9 @@ describe('codex-review risk-scoped review requests', () => {
     const root = tempRoot();
     scopeFixture(root, {
       labels: ['risk:high'],
+      // The head records the lesson, so the review-notes rule is met and receipt
+      // order alone decides.
+      files: [changedFile('docs/review-notes.md')],
       comments: [
         receiptComment(HEAD, 'approve', '2026-09-05T00:30:00Z'),
         receiptComment(HEAD, 'changes', '2026-09-05T00:20:00Z'),
@@ -2097,6 +2103,86 @@ describe('codex-review risk-scoped review requests', () => {
     expect(result.calls).not.toContain('statuses');
     expect(result.calls).not.toContain('/files');
     expect(result.calls).not.toMatch(/^comments /m);
+  });
+
+  // merge-check's own --head (unlike ci-wait/merge/receipt) is optional, but a
+  // bare --head with no value must still exit the usage code 2, not bash's
+  // ${2:?} exit 1 (#698 fixed the same bug in ci-wait, merge and receipt).
+  it('refuses a bare --head, reading nothing', () => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: [] });
+
+    const result = runHelper(root, ['merge-check', '--head']);
+    expect(result.status).toBe(2);
+    expect(result.calls).toBe('');
+  });
+});
+
+// Every subcommand whose --head parsing (its own case arm, or a function it
+// dispatches to as `<fn>_main "$@"`) appears in codex-review.sh, derived from
+// the script's own source rather than a hand-maintained list here — so a
+// future subcommand that adds --head parsing without validating its format
+// fails this test automatically, instead of depending on someone remembering
+// to add a case (#713 P1; docs/review-notes.md's "usage exit code" class, a
+// recurrence of #698's — a SHA argument not validated at the entry point).
+function headTakingSubcommands(source: string): string[] {
+  const lines = source.split('\n');
+  const dispatchStart = lines.findIndex((l) => /^case "\$\{1:\?usage:/.test(l));
+  if (dispatchStart === -1) throw new Error('codex-review.sh: could not find the command dispatcher');
+  const dispatchEnd = lines.findIndex((l, i) => i > dispatchStart && l === 'esac');
+  if (dispatchEnd === -1) throw new Error("codex-review.sh: could not find the dispatcher's closing esac");
+
+  // Top-level arms are exactly two-space indented `<name>)`, never the `*)`
+  // catch-all (which carries its body on the same line).
+  const armRe = /^ {2}([a-z][a-z-]*)\)$/;
+  const arms: { name: string; start: number }[] = [];
+  for (let i = dispatchStart + 1; i < dispatchEnd; i++) {
+    const m = armRe.exec(lines[i]);
+    if (m) arms.push({ name: m[1], start: i });
+  }
+  if (arms.length === 0) throw new Error('codex-review.sh: found no top-level subcommand arms');
+
+  // Every function in this file opens and closes at column 0 (checked by hand
+  // against merge_check_main and ci_wait_main), so its body is the lines from
+  // `<name>() {` to the next `}` line.
+  function functionBody(name: string): string {
+    const start = lines.findIndex((l) => l === `${name}() {`);
+    if (start === -1) return '';
+    const end = lines.findIndex((l, i) => i > start && l === '}');
+    return end === -1 ? '' : lines.slice(start, end + 1).join('\n');
+  }
+
+  const headTaking: string[] = [];
+  for (let i = 0; i < arms.length; i++) {
+    const end = i + 1 < arms.length ? arms[i + 1].start : dispatchEnd;
+    let block = lines.slice(arms[i].start, end).join('\n');
+    const delegate = block.match(/(\w+_main)\s+"\$@"/);
+    if (delegate) block += `\n${functionBody(delegate[1])}`;
+    if (/^\s*--head\)/m.test(block)) headTaking.push(arms[i].name);
+  }
+  return headTaking;
+}
+
+describe('every subcommand that parses --head validates it as a hex sha before reading anything (#713 P1)', () => {
+  const subcommands = headTakingSubcommands(fs.readFileSync(HELPER, 'utf8'));
+
+  // A parser regression that silently found zero subcommands would make every
+  // case below vacuous (it.each on an empty list runs nothing); pin the known
+  // members so that failure mode is itself a visible test failure.
+  it('found the subcommands this file is known to cover', () => {
+    expect(subcommands).toEqual(expect.arrayContaining(['ci-wait', 'merge-check', 'merge', 'receipt']));
+  });
+
+  it.each(subcommands.flatMap((cmd) => [
+    [cmd, ''],
+    [cmd, 'zzz'],
+    [cmd, 'a'],
+  ]))('%s --head %j exits 2, reading nothing', (cmd, value) => {
+    const root = tempRoot();
+
+    const result = runHelper(root, [cmd, '--head', value]);
+    expect(result.status).toBe(2);
+    expect(result.calls).toBe('');
   });
 });
 
@@ -2259,7 +2345,7 @@ describe('codex-review merge, the only merge path for a risk-scoped repo', () =>
     // that allows everything.
     const skill = path.join(root, 'skill');
     fs.mkdirSync(path.join(skill, 'scripts'), { recursive: true });
-    for (const name of ['codex-review.sh', 'risk-scope.jq', 'receipt-order.jq'])
+    for (const name of fs.readdirSync(path.dirname(HELPER)))
       fs.copyFileSync(path.join(path.dirname(HELPER), name), path.join(skill, 'scripts', name));
     fs.copyFileSync(
       path.join(path.dirname(HELPER), '..', 'reviewer-models.txt'),
@@ -2578,6 +2664,10 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
     const root = tempRoot();
     auditFixture(root, {
       labels: ['risk:high'],
+      // A trusted comment edited after the merge could have been a changes
+      // receipt, so the review-notes rule applies; the head meets it, and
+      // receipt order alone decides.
+      files: [changedFile('docs/review-notes.md')],
       comments: [
         {
           author: { login: 'davekim917' },
@@ -2683,6 +2773,10 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
     const root = tempRoot();
     auditFixture(root, {
       labels: ['risk:high'],
+      // A trusted comment edited after the merge could have been a changes
+      // receipt, so the review-notes rule applies; the head meets it, and
+      // receipt order alone decides.
+      files: [changedFile('docs/review-notes.md')],
       comments: [
         {
           author: { login: 'davekim917' },
@@ -2812,5 +2906,471 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
     expect(result.status).toBe(1);
     expect(result.stderr).toContain('could not read CI on the head');
     expect(result.stdout).not.toContain('audit=pass');
+  });
+});
+
+describe('codex-review review-notes rule: a PR a reviewer said no to records its lesson', () => {
+  // A substitute reviewer asked for changes on an earlier head; this head was then approved.
+  const CHANGES_EARLIER = receiptComment(OLD_HEAD, 'changes', '2026-09-05T00:10:00Z');
+  const APPROVED = receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z');
+  const NOTES = changedFile('docs/review-notes.md');
+  // The receipts' author, as receiptComment writes it.
+  const LOGIN = (APPROVED.author as { login: string }).login;
+  const MISSING = `review_notes_missing: ${LOGIN} asked for changes on ${OLD_HEAD.slice(0, 12)} at 2026-09-05T00:10:00Z`;
+
+  it.each([
+    ['a skip-verdict head with no receipt at all', [], []],
+    ['approvals only', ['risk:high'], [receiptComment(OLD_HEAD, 'approve', '2026-09-05T00:10:00Z'), APPROVED]],
+    [
+      'a changes receipt from an author without write access',
+      ['risk:high'],
+      [receiptComment(OLD_HEAD, 'changes', '2026-09-05T00:10:00Z', 'NONE'), APPROVED],
+    ],
+  ])('asks nothing of a PR with %s', (_case, labels, comments) => {
+    const root = tempRoot();
+    scopeFixture(root, { labels, comments });
+
+    const result = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('merge=allowed');
+  });
+
+  it.each([
+    ['review', ['risk:high']],
+    ['skip', []],
+  ])(
+    'refuses (24) a %s-verdict head a receipt said changes on, with no notes touch and no body line (mutation: the merge-check requirement removed)',
+    (verdict, labels) => {
+      const root = tempRoot();
+      scopeFixture(root, { labels, comments: [CHANGES_EARLIER, APPROVED] });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD]);
+      expect(result.status).toBe(24);
+      expect(result.stderr).toContain(
+        `merge=refused head=${HEAD} verdict=${verdict}: ${MISSING}; this head does not touch docs/review-notes.md`,
+      );
+      expect(result.stdout).not.toContain('merge=allowed');
+    },
+  );
+
+  it('allows it once the head adds or amends docs/review-notes.md', () => {
+    const root = tempRoot();
+    scopeFixture(root, {
+      labels: ['risk:high'],
+      files: [changedFile('docs/notes.md'), NOTES],
+      comments: [CHANGES_EARLIER, APPROVED],
+    });
+
+    const result = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('the latest substitute receipt for this head approves');
+  });
+
+  it('does not count deleting docs/review-notes.md as recording the lesson', () => {
+    const root = tempRoot();
+    scopeFixture(root, {
+      labels: ['risk:high'],
+      files: [{ filename: 'docs/review-notes.md', status: 'removed' }],
+      comments: [CHANGES_EARLIER, APPROVED],
+    });
+
+    const result = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain('this head does not touch docs/review-notes.md');
+  });
+
+  it('allows it with a Review-notes: none line that gives a reason', () => {
+    const root = tempRoot();
+    scopeFixture(root, {
+      labels: ['risk:high'],
+      body: 'Why.\n\nReview-notes: none (the finding was a typo in a log message; no class to learn)',
+      comments: [CHANGES_EARLIER, APPROVED],
+    });
+
+    const result = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('merge=allowed');
+  });
+
+  it.each([
+    ['trailing spaces', 'Review-notes: none (docs-only change)   '],
+    ['a CRLF line ending before more text', 'Review-notes: none (docs-only change)\r\nMore text.'],
+    ['a lower-case key', 'review-notes: none (docs-only change)'],
+    // #707 P3-b: a format character (\p{Cf}) inside an otherwise-visible
+    // reason must not sink it: it is stripped first, and what is left is
+    // what is judged.
+    ['a zero-width space inside a visible reason', 'Review-notes: none (docs\u200b only)'],
+    ['a soft hyphen inside a word', 'Review-notes: none (this\u00adword had a typo)'],
+    ['an emoji ZWJ sequence', 'Review-notes: none (fixed by \u{1F469}\u200d\u{1F4BB})'],
+    ['a Unicode reason', 'Review-notes: none (na\u00efve fix, already covered)'],
+  ])('allows a Review-notes: none line with %s', (_case, line) => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: ['risk:high'], body: `Why.\n\n${line}`, comments: [CHANGES_EARLIER, APPROVED] });
+
+    const result = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('merge=allowed');
+  });
+
+  it.each([
+    ['an empty reason', 'Review-notes: none ()'],
+    ['a blank reason', 'Review-notes: none (   )'],
+    ['no reason at all', 'Review-notes: none'],
+    ['the line inside a code fence', '```\nReview-notes: none (an example)\n```'],
+    ['the line inside an HTML comment', '<!-- Review-notes: none (a template) -->'],
+    ['a stray parenthesis after the reason (mutation: the loose reason regex)', 'Review-notes: none ()x)'],
+    ['a second closing parenthesis', 'Review-notes: none ( ) )'],
+    ['text after the closing parenthesis', 'Review-notes: none (a reason) and more'],
+    ['a nested parenthesis', 'Review-notes: none (see (the #679 line))'],
+    ['a zero-width space for a reason', 'Review-notes: none (\u200b)'],
+    ['a no-break space for a reason', 'Review-notes: none (\u00a0)'],
+    // #707 P3-b: these look blank but are not \p{Cf}, so stripping alone
+    // never removes them: real_reason must name them not-visible directly.
+    ['a braille blank (U+2800) for a reason', 'Review-notes: none (\u2800)'],
+    ['a Hangul filler (U+3164) for a reason', 'Review-notes: none (\u3164)'],
+    ['a lone combining mark for a reason', 'Review-notes: none (\u0301)'],
+  ])('refuses (24) a body line with %s', (_case, line) => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: ['risk:high'], body: `Why.\n\n${line}`, comments: [CHANGES_EARLIER, APPROVED] });
+
+    const result = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain(MISSING);
+  });
+
+  // #707 P3-c: the refusal names which shape rule failed, instead of one
+  // generic "no reason" line for every case.
+  it.each([
+    ['no body line at all', 'Why.', 'the body has no `Review-notes: none (<reason>)` line at all'],
+    ['an empty reason', 'Why.\n\nReview-notes: none ()', 'its reason is empty or has no visible character'],
+    [
+      'text after the closing parenthesis',
+      'Why.\n\nReview-notes: none (a reason) and more',
+      'it has text after the closing parenthesis ("and more")',
+    ],
+    [
+      'a nested parenthesis',
+      'Why.\n\nReview-notes: none (see (the #679 line))',
+      'its reason has an unmatched or nested parenthesis',
+    ],
+    // #713 P3: jq's `index` returns a byte offset below 1.8, but a slice
+    // counts codepoints; a multi-byte reason made the two disagree. A
+    // non-ASCII but invisible reason must still read as no visible character
+    // (not, say, a truncated or off-by-several-bytes reason).
+    [
+      'a non-ASCII invisible reason (U+3164, Hangul filler)',
+      'Why.\n\nReview-notes: none (ㅤ)',
+      'its reason is empty or has no visible character',
+    ],
+    // A visible multi-byte reason with trailing text: the trailing text must
+    // be quoted correctly, not shifted by the reason's byte length.
+    [
+      'a non-ASCII visible reason with text after the parenthesis',
+      'Why.\n\nReview-notes: none (日本語) and more',
+      'it has text after the closing parenthesis ("and more")',
+    ],
+    [
+      'the line inside a code fence',
+      'Why.\n\n```\nReview-notes: none (an example)\n```',
+      'it is inside a code fence or an HTML comment',
+    ],
+    [
+      'the line inside an HTML comment',
+      'Why.\n\n<!-- Review-notes: none (a template) -->',
+      'it is inside a code fence or an HTML comment',
+    ],
+  ])('names %s in the refusal message', (_case, body, detail) => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: ['risk:high'], body, comments: [CHANGES_EARLIER, APPROVED] });
+
+    const result = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain(detail);
+  });
+
+  // A natural closing sentence ("none (typo only).") reads as text after the
+  // parenthesis; the refusal calls out the trailing period specifically,
+  // since it is the likeliest way to trip this over an ordinary sentence.
+  it('hints at the trailing period on a natural `none (typo only).` line', () => {
+    const root = tempRoot();
+    scopeFixture(root, {
+      labels: ['risk:high'],
+      body: 'Why.\n\nReview-notes: none (typo only).',
+      comments: [CHANGES_EARLIER, APPROVED],
+    });
+
+    const result = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain('text after the closing parenthesis (".")');
+    expect(result.stderr).toContain('a trailing period counts as text after the parenthesis; drop it');
+  });
+
+  // merge-check reads the comments twice: receipt_outcome, then this rule. The
+  // second read failing must never read as "no changes receipt".
+  it('refuses, never allows, when the receipts cannot be read for the rule (mutation: a failed read taken as no receipts)', () => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: ['risk:high'], comments: [CHANGES_EARLIER, APPROVED] });
+    fs.writeFileSync(path.join(root, 'comments-fail-2'), '');
+
+    const result = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('GraphQL comments request failed');
+    expect(result.stdout).not.toContain('merge=allowed');
+    expect(result.calls.match(/^comments /gm)).toHaveLength(2);
+  });
+
+  it('never counts a file list it could not check as a touch, while the body line still counts', () => {
+    const unread = tempRoot();
+    scopeFixture(unread, { labels: ['risk:high'], files: null, comments: [CHANGES_EARLIER, APPROVED] });
+    const refused = runHelper(unread, ['merge-check', '--head', HEAD]);
+    expect(refused.status).toBe(24);
+    expect(refused.stderr).toContain(
+      `${MISSING}; the files this head changes could not be checked, so no touch of docs/review-notes.md counts`,
+    );
+
+    const said = tempRoot();
+    scopeFixture(said, {
+      labels: ['risk:high'],
+      files: null,
+      body: 'Review-notes: none (covered by the line #700 added)',
+      comments: [CHANGES_EARLIER, APPROVED],
+    });
+    const allowed = runHelper(said, ['merge-check', '--head', HEAD]);
+    expect(allowed.status).toBe(0);
+  });
+
+  it('audit flags a merge a receipt said changes on, with no notes touch and no body line at the merge', () => {
+    const root = tempRoot();
+    auditFixture(root, { labels: ['risk:high'], comments: [CHANGES_EARLIER, APPROVED] });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(28);
+    expect(result.stdout).toContain(
+      `audit=violation pr=1 head=${HEAD} base=${MERGE_PARENT} merged=${MERGED_AT} verdict=review: ${MISSING}`,
+    );
+  });
+
+  it('audit passes it when the merged head touched docs/review-notes.md', () => {
+    const root = tempRoot();
+    auditFixture(root, { labels: ['risk:high'], files: [NOTES], comments: [CHANGES_EARLIER, APPROVED] });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('audit=pass');
+  });
+
+  it('audit reads the body line as it stood at the merge, not one added after', () => {
+    const line = 'Why.\n\nReview-notes: none (the lesson is already on the #679 line)';
+    const late = tempRoot();
+    auditFixture(late, {
+      labels: ['risk:high'],
+      body: line,
+      edits: [
+        { editedAt: '2026-09-05T02:00:00Z', deletedAt: null, diff: line },
+        { editedAt: '2026-09-05T00:30:00Z', deletedAt: null, diff: 'Why.' },
+      ],
+      comments: [CHANGES_EARLIER, APPROVED],
+    });
+    const flagged = runHelper(late, ['audit']);
+    expect(flagged.status).toBe(28);
+    expect(flagged.stdout).toContain(MISSING);
+
+    const early = tempRoot();
+    auditFixture(early, {
+      labels: ['risk:high'],
+      body: line,
+      edits: [
+        { editedAt: '2026-09-05T00:50:00Z', deletedAt: null, diff: line },
+        { editedAt: '2026-09-05T00:30:00Z', deletedAt: null, diff: 'Why.' },
+      ],
+      comments: [CHANGES_EARLIER, APPROVED],
+    });
+    const passed = runHelper(early, ['audit']);
+    expect(passed.status).toBe(0);
+  });
+
+  it('audit treats a trusted comment edited after the merge as a possible changes receipt', () => {
+    const root = tempRoot();
+    auditFixture(root, {
+      labels: ['risk:high'],
+      comments: [
+        {
+          author: { login: LOGIN },
+          authorAssociation: 'OWNER',
+          createdAt: '2026-09-05T00:10:00Z',
+          lastEditedAt: '2026-09-05T02:00:00Z',
+          fullDatabaseId: '10',
+          body: 'CI is green.',
+        },
+        APPROVED,
+      ],
+    });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(28);
+    expect(result.stdout).toContain(
+      `review_notes_missing: whether a substitute receipt asked for changes is unknown: ${LOGIN} posted a comment at 2026-09-05T00:10:00Z and edited it at 2026-09-05T02:00:00Z`,
+    );
+  });
+
+  it('audit does not count a changes receipt posted after the merge', () => {
+    const root = tempRoot();
+    auditFixture(root, {
+      labels: ['risk:high'],
+      comments: [APPROVED, receiptComment(OLD_HEAD, 'changes', '2026-09-05T02:00:00Z')],
+    });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('audit=pass');
+  });
+
+  it('audit reports an error, never a pass, when the receipts cannot be read for the rule', () => {
+    const root = tempRoot();
+    auditFixture(root, { labels: ['risk:high'], comments: [CHANGES_EARLIER, APPROVED] });
+    fs.writeFileSync(path.join(root, 'comments-fail-2'), '');
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('could not read receipts');
+    expect(result.stdout).not.toContain('audit=pass');
+  });
+});
+
+describe('codex-review exact verdicts: a wrong pr-body.jq never passes a check open', () => {
+  // A copy of the skill to run, with its pr-body.jq rewritten by `edit`.
+  function skillWithPrBody(root: string, edit: (module: string) => string): string {
+    const skill = path.join(root, 'skill');
+    fs.mkdirSync(path.join(skill, 'scripts'), { recursive: true });
+    for (const name of fs.readdirSync(path.dirname(HELPER)))
+      fs.copyFileSync(path.join(path.dirname(HELPER), name), path.join(skill, 'scripts', name));
+    fs.copyFileSync(
+      path.join(path.dirname(HELPER), '..', 'reviewer-models.txt'),
+      path.join(skill, 'reviewer-models.txt'),
+    );
+    const module = path.join(skill, 'scripts', 'pr-body.jq');
+    fs.writeFileSync(module, edit(fs.readFileSync(module, 'utf8')));
+    return path.join(skill, 'scripts', 'codex-review.sh');
+  }
+
+  // Valid jq, wrong answer: the whole module replaced by one that yields no body,
+  // or two. Before exact verdicts, either left fix_link empty or doubled, which
+  // is not `missing`, so a fix PR with no Fixes-PR line merged and audited clean.
+  const WRONG_MODULES: [string, () => string][] = [
+    ['yields no body', () => 'def pr_body_text: empty;\n'],
+    ['yields two bodies', () => 'def pr_body_text: (.body // ""), (.body // "");\n'],
+  ];
+
+  it.each(WRONG_MODULES)(
+    'merge-check exits 1, never allowed, on a pr-body.jq that %s (mutation: the site tests only = missing)',
+    (_case, stub) => {
+      const root = tempRoot();
+      scopeFixture(root, { labels: [], title: 'fix: a fix with no Fixes-PR line' });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD], {}, skillWithPrBody(root, stub));
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('the Fixes-PR check gave no verdict');
+      expect(result.stdout).not.toContain('merge=allowed');
+    },
+  );
+
+  it.each(WRONG_MODULES)(
+    'audit exits 1, never passes, on a pr-body.jq that %s (mutation: the site tests only = missing)',
+    (_case, stub) => {
+      const root = tempRoot();
+      auditFixture(root, { labels: [], title: 'fix: a fix with no Fixes-PR line', body: 'Why.' });
+
+      const result = runHelper(root, ['audit'], {}, skillWithPrBody(root, stub));
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('the Fixes-PR check gave no verdict');
+      expect(result.stdout).not.toContain('audit=pass');
+    },
+  );
+
+  it("fails loudly through pr-body.jq's own check when a refactor inside it yields two bodies", () => {
+    const root = tempRoot();
+    // With the real module this head merges: its body says Fixes-PR: none.
+    scopeFixture(root, { labels: [], title: 'fix: a fix', body: 'Fixes-PR: none' });
+    const script = skillWithPrBody(root, (module) => {
+      const edited = module.replace('[ .body // "" | unfenced', '[ (.body // ""), (.body // "") | unfenced');
+      if (edited === module) throw new Error('pr-body.jq no longer holds the expression this test edits');
+      return edited;
+    });
+
+    const result = runHelper(root, ['merge-check', '--head', HEAD], {}, script);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('pr_body_text must yield exactly one string, got 2');
+    expect(result.stdout).not.toContain('merge=allowed');
+  });
+
+  // #707 P3-a: pr_body_text's own one-string check lives inside pr-body.jq, so
+  // a module that replaces the whole def replaces the check too. On a feat PR
+  // (fix_link_state's title test is false) with no changes receipt
+  // (review_notes_state never even calls pr_body_text), the old callers never
+  // evaluated $body at all — `and`'s short circuit meant a wrong-typed single
+  // value never surfaced as an error. Both callers now assert the shape
+  // themselves before ever branching on the title or the changes state.
+  const WRONG_TYPE_MODULES: [string, () => string][] = [
+    ['yields an object', () => 'def pr_body_text: {};\n'],
+    ['yields a number', () => 'def pr_body_text: 5;\n'],
+    ['yields null', () => 'def pr_body_text: null;\n'],
+  ];
+
+  it.each(WRONG_TYPE_MODULES)(
+    'merge-check exits 1, never allowed, on a pr-body.jq that %s, on a feat PR with no changes receipt',
+    (_case, stub) => {
+      const root = tempRoot();
+      scopeFixture(root, { labels: [], title: 'feat: a new feature' });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD], {}, skillWithPrBody(root, stub));
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('pr_body_text (pr-body.jq) must yield exactly one string');
+      expect(result.stdout).not.toContain('merge=allowed');
+    },
+  );
+
+  it.each(WRONG_TYPE_MODULES)(
+    'audit exits 1, never passes, on a pr-body.jq that %s, on a feat PR with no changes receipt',
+    (_case, stub) => {
+      const root = tempRoot();
+      auditFixture(root, { labels: [], title: 'feat: a new feature', body: 'Why.' });
+
+      const result = runHelper(root, ['audit'], {}, skillWithPrBody(root, stub));
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('pr_body_text (pr-body.jq) must yield exactly one string');
+      expect(result.stdout).not.toContain('audit=pass');
+    },
+  );
+});
+
+describe('codex-review review-notes rule: the same-second edit boundary', () => {
+  const APPROVED = receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z');
+  const LOGIN = (APPROVED.author as { login: string }).login;
+
+  // GitHub's timestamps are to the second, so an edit stamped with the merge's
+  // own second may have landed after it: the comment's text at the merge is
+  // unknown, and it could have been a changes receipt.
+  it("audit reads a trusted comment edited in the merge's own second as a possible changes receipt (mutation: >= loosened to >)", () => {
+    const root = tempRoot();
+    auditFixture(root, {
+      labels: ['risk:high'],
+      comments: [
+        {
+          author: { login: LOGIN },
+          authorAssociation: 'OWNER',
+          createdAt: '2026-09-05T00:10:00Z',
+          lastEditedAt: MERGED_AT,
+          fullDatabaseId: '10',
+          body: 'CI is green.',
+        },
+        APPROVED,
+      ],
+    });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(28);
+    expect(result.stdout).toContain(
+      `review_notes_missing: whether a substitute receipt asked for changes is unknown: ${LOGIN} posted a comment at 2026-09-05T00:10:00Z and edited it at ${MERGED_AT}`,
+    );
   });
 });

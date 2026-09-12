@@ -550,8 +550,12 @@ export function readWorkgroupSignals(
  * workgroups.ts's resolveWorkgroup, minus the "row exists" check (a
  * nonexistent workgroup id naturally yields empty query results below, so
  * there's no separate not-found branch to maintain).
+ *
+ * Exported for issue-brief.ts, whose endpoint takes the same `workgroup` query
+ * value and must refuse it on the same predicate before it touches that
+ * workgroup's board or its scoped GitHub token.
  */
-async function hasWorkgroupAccess(workgroupId: string, ctx: AuthedRequestContext): Promise<boolean> {
+export async function hasWorkgroupAccess(workgroupId: string, ctx: AuthedRequestContext): Promise<boolean> {
   if (ctx.scopes.no_filter) return true;
   if (ctx.scopes.allowed_group_ids.length === 0) return false;
   const placeholders = ctx.scopes.allowed_group_ids.map(() => '?').join(', ');

@@ -11,6 +11,7 @@ cat >"$FIXTURE_DIR/completion-contract.json" <<'JSON'
 {
   "schemaVersion": 1,
   "sourceSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "ownershipKind": "develop",
   "requiredLaneMarkers": [
     "coordinator/browser.complete.json",
     "challenger/challenge.complete.json"
@@ -97,6 +98,7 @@ cat >"$GEN_DIR/completion-contract.json" <<'JSON'
 {
   "schemaVersion": 1,
   "sourceSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "ownershipKind": "develop",
   "requiredLaneMarkers": ["markers/B1.json", "markers/B2.json"],
   "lanes": [
     {"id": "B1", "kind": "browser", "title": "Depletions planner"},
@@ -157,7 +159,7 @@ rm -rf "$GEN_DIR"
 EVIDENCE_DIR="$(mktemp -d)"
 mkdir -p "$EVIDENCE_DIR/markers" "$EVIDENCE_DIR/evidence"
 cat >"$EVIDENCE_DIR/completion-contract.json" <<'JSON'
-{"schemaVersion":1,"sourceSha":"cccccccccccccccccccccccccccccccccccccccc","requiredLaneMarkers":["markers/B1.json"]}
+{"schemaVersion":1,"sourceSha":"cccccccccccccccccccccccccccccccccccccccc","ownershipKind":"develop","requiredLaneMarkers":["markers/B1.json"]}
 JSON
 
 cat >"$EVIDENCE_DIR/markers/B1.json" <<'JSON'
@@ -212,7 +214,7 @@ rm -rf "$EVIDENCE_DIR"
 CLIP_DIR="$(mktemp -d)"
 mkdir -p "$CLIP_DIR/markers" "$CLIP_DIR/clips"
 cat >"$CLIP_DIR/completion-contract.json" <<'JSON'
-{"schemaVersion":1,"sourceSha":"dddddddddddddddddddddddddddddddddddddddd","requiredLaneMarkers":["markers/B1.json"]}
+{"schemaVersion":1,"sourceSha":"dddddddddddddddddddddddddddddddddddddddd","ownershipKind":"develop","requiredLaneMarkers":["markers/B1.json"]}
 JSON
 
 # No clip, no skip line: silence must fail the barrier.
@@ -270,5 +272,133 @@ bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$CLIP_DIR" lanes \
   echo "expected a marker with no confirmedFindings field to be unaffected" >&2; exit 1; }
 
 rm -rf "$CLIP_DIR"
+
+# --- ownershipKind and coordinatorOwnerToken: the certify-1657 shape -------
+# A hand-composed contract is refused two ways: it never carries
+# `ownershipKind` at all (only the scaffold's `contract` verb ever writes
+# that field), and even a contract that fakes a `pr`/`task` ownershipKind
+# still can't fake a non-null coordinatorOwnerToken (only a live claim
+# produces one — see smoke-evidence-barrier.sh's comments for the file:line
+# proof). A `develop`-owned contract's null token is the one legitimate case
+# and must never trip either check.
+OWNER_DIR="$(mktemp -d)"
+mkdir -p "$OWNER_DIR/markers"
+
+# No ownershipKind field at all — the exact shape of every hand-composed
+# contract, since nothing outside the scaffold ever writes this field.
+cat >"$OWNER_DIR/completion-contract.json" <<'JSON'
+{
+  "schemaVersion": 1,
+  "sourceSha": "cccccccccccccccccccccccccccccccccccccccc",
+  "requiredLaneMarkers": ["markers/B1.json"]
+}
+JSON
+NO_KIND_OUT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$OWNER_DIR" lanes || true)"
+echo "$NO_KIND_OUT" | jq -e '
+  (.ready == false) and (.invalid == ["'"$OWNER_DIR"'/completion-contract.json"]) and
+  (.invalidReasons[0] | contains("no ownershipKind") and contains("claim") and contains("scaffold"))
+' >/dev/null || {
+  echo "expected a contract with no ownershipKind field to be refused, naming claim + the scaffold as the fix" >&2
+  echo "$NO_KIND_OUT" >&2; exit 1; }
+
+# A `task` ownershipKind with a null token — claims to be scaffold-written
+# but carries the one field only a live claim can produce as non-null.
+jq '.ownershipKind = "task" | .coordinatorOwnerToken = null' "$OWNER_DIR/completion-contract.json" \
+  >"$OWNER_DIR/.contract.tmp"
+mv "$OWNER_DIR/.contract.tmp" "$OWNER_DIR/completion-contract.json"
+NULL_TOKEN_OUT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$OWNER_DIR" lanes || true)"
+echo "$NULL_TOKEN_OUT" | jq -e '
+  (.ready == false) and (.invalid == ["'"$OWNER_DIR"'/completion-contract.json"]) and
+  (.invalidReasons[0] | contains("task") and contains("no coordinatorOwnerToken") and contains("task-claim"))
+' >/dev/null || {
+  echo "expected a task-owned contract with a null token to be refused, naming task-claim as the fix" >&2
+  echo "$NULL_TOKEN_OUT" >&2; exit 1; }
+
+# Same shape for a `pr` ownership kind.
+jq '.ownershipKind = "pr"' "$OWNER_DIR/completion-contract.json" >"$OWNER_DIR/.contract.tmp"
+mv "$OWNER_DIR/.contract.tmp" "$OWNER_DIR/completion-contract.json"
+bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$OWNER_DIR" lanes >/dev/null 2>&1 && {
+  echo "expected a pr-owned contract with a null token to be refused too" >&2; exit 1; }
+
+# A `develop`-owned contract with a null token is exactly the legitimate
+# shape begin_active_run_fence's develop branch produces — never refused on
+# either ground. (Still refused on missing markers, which is what "not
+# ready" below asserts; it must not be refused as an invalid CONTRACT.)
+jq '.ownershipKind = "develop"' "$OWNER_DIR/completion-contract.json" >"$OWNER_DIR/.contract.tmp"
+mv "$OWNER_DIR/.contract.tmp" "$OWNER_DIR/completion-contract.json"
+DEVELOP_OUT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$OWNER_DIR" lanes || true)"
+echo "$DEVELOP_OUT" | jq -e '.invalid != ["'"$OWNER_DIR"'/completion-contract.json"]' >/dev/null || {
+  echo "expected a develop-owned contract with a null token to be refused only for missing markers, not as an invalid contract" >&2
+  echo "$DEVELOP_OUT" >&2; exit 1; }
+
+rm -rf "$OWNER_DIR"
+
+# --- floor lanes require browser evidence unless declared API-only ---------
+# A floor lane resets its entry's staleness clock on `pass` (SKILL.md "The
+# coverage floor"). Without this check, a lane with API-only receipts (or no
+# evidence at all beyond the bare minimum) could satisfy the barrier and reset
+# that clock with no journey ever walked in a browser.
+FLOOR_DIR="$(mktemp -d)"
+mkdir -p "$FLOOR_DIR/markers" "$FLOOR_DIR/evidence"
+cat >"$FLOOR_DIR/completion-contract.json" <<'JSON'
+{
+  "schemaVersion": 1,
+  "sourceSha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "ownershipKind": "develop",
+  "requiredLaneMarkers": ["markers/F1.json"],
+  "lanes": [
+    {"id": "F1", "kind": "floor", "title": "Payout approval walk"}
+  ]
+}
+JSON
+
+# API-only evidence (a JSON receipt, no image/video extension) on a plain
+# `floor` lane — not declared `evidence:"api"` in the contract — must be
+# refused, even though the evidence file is real, durable, and non-empty.
+printf '{"status":200}\n' >"$FLOOR_DIR/evidence/api-receipt.json"
+cat >"$FLOOR_DIR/markers/F1.json" <<'JSON'
+{"schemaVersion":1,"lane":"F1","sourceSha":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","status":"pass","completedAt":"2026-09-12T10:00:00Z","evidence":["evidence/api-receipt.json"]}
+JSON
+RESULT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$FLOOR_DIR" lanes || true)"
+echo "$RESULT" | jq -e '(.ready == false) and (.invalidReasons[0] | contains("floor pass without browser evidence"))' >/dev/null || {
+  echo "expected an API-only pass on an undeclared floor lane to be refused" >&2; echo "$RESULT" >&2; exit 1; }
+
+# A screenshot that actually exists on disk clears the barrier.
+printf 'fake png bytes\n' >"$FLOOR_DIR/evidence/screenshot.png"
+jq '.evidence = ["evidence/screenshot.png"]' "$FLOOR_DIR/markers/F1.json" >"$FLOOR_DIR/markers/.marker.json"
+mv "$FLOOR_DIR/markers/.marker.json" "$FLOOR_DIR/markers/F1.json"
+bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$FLOOR_DIR" lanes \
+  | jq -e '.ready == true' >/dev/null || {
+  echo "expected a floor pass with a real screenshot on disk to be ready" >&2; exit 1; }
+
+# Naming a screenshot that does not exist is refused by pass_evidence_problem
+# already (evidence must be durable), and must stay refused for a floor lane
+# too — not silently reclassified as the floor-specific reason.
+jq '.evidence = ["evidence/missing-screenshot.png"]' "$FLOOR_DIR/markers/F1.json" >"$FLOOR_DIR/markers/.marker.json"
+mv "$FLOOR_DIR/markers/.marker.json" "$FLOOR_DIR/markers/F1.json"
+RESULT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$FLOOR_DIR" lanes || true)"
+echo "$RESULT" | jq -e '(.ready == false) and (.invalidReasons[0] | contains("evidence file is missing"))' >/dev/null || {
+  echo "expected a floor pass naming a nonexistent screenshot to be refused for the missing file" >&2; echo "$RESULT" >&2; exit 1; }
+
+# A lane the contract declares `evidence:"api"` is exempt: its API receipts
+# alone clear the barrier, because the declaration lives on the CONTRACT lane
+# entry (never inferred from the marker).
+jq '.lanes[0].evidence = "api"' "$FLOOR_DIR/completion-contract.json" >"$FLOOR_DIR/.contract.tmp"
+mv "$FLOOR_DIR/.contract.tmp" "$FLOOR_DIR/completion-contract.json"
+jq '.evidence = ["evidence/api-receipt.json"]' "$FLOOR_DIR/markers/F1.json" >"$FLOOR_DIR/markers/.marker.json"
+mv "$FLOOR_DIR/markers/.marker.json" "$FLOOR_DIR/markers/F1.json"
+bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$FLOOR_DIR" lanes \
+  | jq -e '.ready == true' >/dev/null || {
+  echo "expected a declared API-only floor lane with API receipts to be ready" >&2; exit 1; }
+
+# A non-floor lane (default "lane" kind) with the same API-only evidence is
+# untouched by this check — it only applies to kind == "floor".
+jq '.lanes = [{"id":"F1","kind":"lane"}]' "$FLOOR_DIR/completion-contract.json" >"$FLOOR_DIR/.contract.tmp"
+mv "$FLOOR_DIR/.contract.tmp" "$FLOOR_DIR/completion-contract.json"
+bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$FLOOR_DIR" lanes \
+  | jq -e '.ready == true' >/dev/null || {
+  echo "expected a non-floor lane with API-only evidence to be unaffected" >&2; exit 1; }
+
+rm -rf "$FLOOR_DIR"
 
 echo "smoke evidence barrier tests passed"

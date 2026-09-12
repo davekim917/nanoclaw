@@ -41,8 +41,10 @@
 #   23  request: REVIEW_ROUND_CAP reached — stop, summarize, escalate or reframe
 #   24  merge-check: merging this head is not allowed — CI is not green on it, it has
 #       neither a clean Codex review nor an approving substitute receipt, the
-#       approving receipt's reviewer isn't a model in reviewer-models.txt, or it is a
-#       fix PR whose body has no Fixes-PR line
+#       approving receipt's reviewer isn't a model in reviewer-models.txt, it is a
+#       fix PR whose body has no Fixes-PR line, or a substitute receipt on the PR
+#       asked for changes and it neither touches docs/review-notes.md nor carries a
+#       `Review-notes: none (<reason>)` line (`review_notes_missing`)
 #   25  merge-check: the base branch moved while the check ran, or could not be
 #       re-read, so the verdict may be stale — re-run merge-check
 #   26  merge-check: `merge=defer mode=legacy` — not risk-scoped, so SKILL.md Step 6's
@@ -524,26 +526,64 @@ RECEIPT_REVIEWER_LINE_RE='\*\*Reviewer and runtime:\*\* (?<reviewer>[^\n]+)'
 # docs/specs/risk-based-review/plan.md links a fix to its PR through this line.
 FIX_TITLE_RE='^\s*fix(\([^)]*\))?!?:'
 FIXES_PR_LINE_RE='(^|\n)Fixes-PR:[ \t]*(#[0-9]+|none)\b'
+# The review-notes rule (docs/review-policy.md, "Review notes and fix links"):
+# a PR any substitute receipt asked for changes on adds or amends a line in
+# REVIEW_NOTES_FILE, or its body carries this line, read the way the Fixes-PR
+# line is (review_notes_state). The reason is ONE parenthesised phrase, with no
+# parenthesis inside it and nothing after it on the line, so `none ()x)` and
+# `none ( ) )` never pass for one; review_notes_state strips every \p{Cf}
+# (format) character from the reason first — a soft hyphen or an emoji ZWJ
+# sequence must not sink an otherwise-visible reason — then requires at least
+# one character that is not whitespace, a control character, a combining mark
+# with no base of its own, or one of the specific blank-looking codepoints
+# U+2800/U+3164/U+115F/U+1160/U+FFA0 (real_reason, #707 P3-b).
+REVIEW_NOTES_FILE='docs/review-notes.md'
+REVIEW_NOTES_NONE_LINE_RE='(^|\n)Review-notes:[ \t]*none[ \t]*\((?<reason>[^()\n]*)\)[ \t]*\r?(?=\n|\z)'
+# Looser than REVIEW_NOTES_NONE_LINE_RE: matches an attempted line (up to end
+# of line, whatever its shape) so review_notes_state can name which shape rule
+# it failed, rather than a blanket "no verdict" (#707 P3-c).
+REVIEW_NOTES_NONE_CANDIDATE_RE='(^|\n)Review-notes:[ \t]*none[ \t]*\((?<rest>[^\n]*)'
+# Unanchored so it also finds an attempt GitHub's own line breaks would not
+# otherwise show as line-initial — an inline HTML comment ("<!-- Review-notes:
+# none (x) -->") never starts a physical line, so REVIEW_NOTES_NONE_CANDIDATE_RE's
+# line anchor cannot see it either. Used only to tell "hidden by a fence or
+# comment" apart from "no line at all", never to parse the reason itself.
+REVIEW_NOTES_NONE_ANYWHERE_RE='Review-notes:[ \t]*none[ \t]*\('
+# Splits a candidate's `rest` (everything after `none (`) into the reason and
+# whatever follows the closing parenthesis, without jq's `index`/slice, which
+# disagree on offsets below jq 1.8: `index` counts bytes, a slice counts
+# codepoints, so a non-ASCII reason (multi-byte UTF-8) misaligned them and cut
+# the reason short (#713 P3). No match at all — no unescaped `)`, or a `(`
+# before one — means an unmatched or nested parenthesis, read by capture's
+# empty result rather than a byte offset.
+REVIEW_NOTES_REASON_SPLIT_RE='^(?<reason>[^()]*)\)(?<trailing>.*)$'
 
 # `missing` when a fix title's body has no Fixes-PR line, else `ok`, for a
 # {title, body} JSON object on stdin — merge-check's rule, and audit's. A line
 # inside a code fence or an HTML comment is an example or a template, not a
-# link, so both are cut first. Fences follow CommonMark: up to 3 spaces, then
-# 3+ backticks or 3+ tildes; only a bare run of the same character, at least
-# as long, closes one; an unclosed fence runs to the end, as GitHub renders it.
+# link, so both are cut first (pr_body_text, pr-body.jq).
 fix_link_state() {
-  jq -r --arg titleRe "$FIX_TITLE_RE" --arg lineRe "$FIXES_PR_LINE_RE" '
-    def unfenced:
-      reduce split("\n")[] as $line ({out: [], fence: null};
-        ($line | capture("^ {0,3}(?<run>`{3,}|~{3,})") // null) as $open
-        | if .fence == null then
-            if $open then .fence = $open.run else .out += [$line] end
-          elif $open and ($open.run[0:1] == .fence[0:1]) and (($open.run | length) >= (.fence | length))
-               and ($line | test("^ {0,3}" + $open.run + "[ \t]*\r?$")) then .fence = null
-          else . end)
-      | .out | join("\n");
-    (.body // "" | unfenced | gsub("<!--[\\s\\S]*?(-->|$)"; "")) as $body
-    | if (.title | test($titleRe; "i")) and ($body | test($lineRe; "i") | not) then "missing" else "ok" end'
+  jq -r -L "$HERE" --arg titleRe "$FIX_TITLE_RE" --arg lineRe "$FIXES_PR_LINE_RE" '
+    include "pr-body";
+    # pr_body_text checks its own shape inside pr-body.jq, but a stub or
+    # replacement module can drop that check along with the rest of the
+    # module (#707 P3-a). The boolean `and` below short-circuits away from
+    # ever touching $body when the title is not a fix title, so a
+    # wrong-typed pr_body_text on a feat PR would otherwise never surface as
+    # an error — assert the shape up front, before ever reading .title,
+    # whenever pr_body_text yields exactly one value of the wrong type.
+    # Empty or doubled output is left alone: the case statement in each
+    # caller of this function still reads that as "no verdict", same as before.
+    (
+      [pr_body_text] as $pr_body
+      | if ($pr_body | length) == 1 and ($pr_body[0] | type) != "string"
+        then error("pr_body_text (pr-body.jq) must yield exactly one string, got \($pr_body[0])")
+        else empty end
+    ),
+    (
+      pr_body_text as $body
+      | if (.title | test($titleRe; "i")) and ($body | test($lineRe; "i") | not) then "missing" else "ok" end
+    )'
 }
 
 # The reviewer-model allowlist, generated by scripts/reviewer-models.ts from the
@@ -659,6 +699,12 @@ SCOPE_MODE=""
 SCOPE_VERDICT=""
 SCOPE_LABELS="[]"
 SCOPE_REASON=""
+# The post-image paths this head changes, as a JSON array, from the same pinned
+# comparison and the same completeness checks the verdict reads; `null` when
+# that listing was not read or did not pass them (every fail-closed return in
+# scope_eval, and a legacy repo, which never lists files). The review-notes
+# rule reads it, and never reads `null` as a touch.
+SCOPE_FILES=null
 
 # `audit` alone sets these, to judge a merged PR as of its merge: the commit it
 # merged onto, the moment its evidence must predate, and the labels it had then
@@ -684,6 +730,7 @@ base_tip() {
 
 scope_eval() {
   local pr_json base files after decision
+  SCOPE_FILES=null
   pr_json=$(gh pr view "$PR" --repo "$REPO" --json headRefOid,baseRefName,labels) || return 1
   pr_json=$(labels_as_of "$pr_json") || return 1
   SCOPE_HEAD=$(printf '%s' "$pr_json" | jq -er .headRefOid) || return 1
@@ -744,28 +791,35 @@ scope_eval() {
   fi
   # The comparison goes through stdin, not --argjson: with its patches it can
   # exceed the kernel's per-argument limit. The reason names the first few
-  # matches.
+  # matches. complete_listing is every check that makes the verdict fail
+  # closed on the listing, defined once so the `files` this also returns (for
+  # SCOPE_FILES) have passed exactly the checks the verdict's files did.
   decision=$(printf '%s' "$files" | jq -c -L "$HERE" --arg yml "$LABELER_YML" --argjson pr "$pr_json" '
     include "risk-scope";
+    def complete_listing:
+      if (.files | type) == "array" then .files else error("the comparison lists no files") end
+      | if all(.[]; (.filename | type) == "string") then . else error("a changed file has no filename") end
+      | ([ .[].filename ] | unique | length) as $listed
+      | if $listed >= 300 then error("the comparison lists \($listed) files, the most GitHub lists, so some may be missing")
+        elif ($pr.changedFiles | type) != "number" then error("GitHub did not say how many files this PR changes")
+        elif $pr.changedFiles != $listed then error("the PR changes \($pr.changedFiles) files but the comparison lists \($listed)")
+        else . end;
     [ $pr.labels[]?.name | select(. == "risk:high" or . == "review:requested") | "labeled \(.)" ] as $labeled
+    | (try (complete_listing | [ .[] | select(.status != "removed") | .filename ]) catch null) as $present
     | (try (
         ($yml | risk_high_globs | map(glob_regex)) as $regexes
-        | if (.files | type) == "array" then .files else error("the comparison lists no files") end
-        | if all(.[]; (.filename | type) == "string") then . else error("a changed file has no filename") end
-        | ([ .[].filename ] | unique | length) as $listed
-        | if $listed >= 300 then error("the comparison lists \($listed) files, the most GitHub lists, so some may be missing")
-          elif ($pr.changedFiles | type) != "number" then error("GitHub did not say how many files this PR changes")
-          elif $pr.changedFiles != $listed then error("the PR changes \($pr.changedFiles) files but the comparison lists \($listed)")
-          else . end
+        | complete_listing
         | [ .[] | .filename, (.previous_filename // empty) ] | unique | matching($regexes)
         | if length == 0 then []
           else [ "changes risk:high path\(if length > 1 then "s" else "" end) \(.[:3] | join(", "))\(if length > 3 then " and \(length - 3) more" else "" end)" ] end
       ) catch [ "fail closed: \(.)" ])
     | . + $labeled
     | if length == 0 then { verdict: "skip", reason: "no changed file matches a risk:high glob in .github/labeler.yml, and neither risk:high nor review:requested is on the PR" }
-      else { verdict: "review", reason: join("; ") } end') || return 1
+      else { verdict: "review", reason: join("; ") } end
+    | .files = $present') || return 1
   SCOPE_VERDICT=$(printf '%s' "$decision" | jq -er .verdict) || return 1
   SCOPE_REASON=$(printf '%s' "$decision" | jq -er .reason) || return 1
+  SCOPE_FILES=$(printf '%s' "$decision" | jq -c .files) || return 1
 }
 
 # merge-check's last read before it allows a merge. `gh pr merge
@@ -881,6 +935,128 @@ receipt_outcome() {
         end'
 }
 
+# Whether any substitute receipt on this PR, for ANY head, asked for changes —
+# the review-notes rule's trigger (review_notes_state): `changes\t<who, which
+# head, when>` when one did, `none` when none did, `unknown\t<why>` when that
+# cannot be told. Read as receipt_outcome reads receipts: trusted authors only,
+# and under `audit` nothing posted after GATE_AS_OF. A trusted comment posted
+# in the merge's own second, or edited in or after it, is not read: GitHub's
+# timestamps are to the second, so either may have landed after the merge, and
+# its text at the merge is unknown. It could have been a `changes` receipt, so
+# it makes the answer `unknown`, which the rule treats like `changes`, never
+# like `none`. No posting order is needed, so a receipt without a usable
+# database id counts like any other. Non-zero when the comments cannot be
+# read; the caller never reads that as `none`.
+changes_receipt_state() {
+  local pages
+  pages=$(paginate_connection comments receipt_comments_page) || return 1
+  printf '%s\n' "$pages" | jq -rs --arg re "$RECEIPT_MARKER_RE" --arg asof "$GATE_AS_OF" '
+    [ .[] | .data.repository.pullRequest.comments.nodes[]
+      | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
+      | select($asof == "" or .createdAt <= $asof) ] as $comments
+    | [ $comments[] | select($asof != "" and ((.lastEditedAt // "") >= $asof or .createdAt == $asof)) ] as $unreadable
+    | ([ $comments[] | select($asof == "" or ((.lastEditedAt // "") < $asof and .createdAt < $asof))
+         | . as $c
+         | [ (.body // "") | capture($re; "g") | select(.outcome == "changes") ] | first // empty
+         | { head, login: ($c.author.login // "someone"), at: $c.createdAt } ] | first) as $changes
+    | ($unreadable | first) as $unread
+    | if $changes != null then "changes\t\($changes.login) asked for changes on \($changes.head[0:12]) at \($changes.at)"
+      elif $unread != null then
+        "unknown\t\($unread.author.login // "someone") posted a comment at \($unread.createdAt)\(if ($unread.lastEditedAt // "") >= $asof then " and edited it at \($unread.lastEditedAt)" else "" end), in or after the second the PR merged, and it may have been a changes receipt"
+      else "none" end'
+}
+
+# The review-notes rule, merge-check's and audit's (docs/review-policy.md,
+# "Review notes and fix links"): once any substitute receipt on the PR has
+# asked for changes (changes_receipt_state), the PR adds or amends a line in
+# REVIEW_NOTES_FILE, or its body carries `Review-notes: none (<reason>)` with
+# a non-empty reason, outside code fences and HTML comments as the Fixes-PR
+# line is read. The touch comes from SCOPE_FILES — the pinned comparison
+# scope_eval checked — and a listing it could not check never counts as one.
+# Prints exactly `ok` when the rule holds or does not apply — its callers read
+# anything else but the reason as no verdict — else the reason,
+# `review_notes_missing: …`. $1 is the PR as a {body} JSON object: now for
+# merge-check, as it stood at the merge for audit. Non-zero when the receipts
+# cannot be read.
+review_notes_state() {
+  local state
+  state=$(changes_receipt_state) || return 1
+  if [ "$state" = none ]; then echo ok; return 0; fi
+  printf '%s' "$1" | jq -r -L "$HERE" --arg state "$state" --arg lineRe "$REVIEW_NOTES_NONE_LINE_RE" \
+    --arg candidateRe "$REVIEW_NOTES_NONE_CANDIDATE_RE" --arg anywhereRe "$REVIEW_NOTES_NONE_ANYWHERE_RE" \
+    --arg splitRe "$REVIEW_NOTES_REASON_SPLIT_RE" \
+    --arg notes "$REVIEW_NOTES_FILE" --argjson files "$SCOPE_FILES" '
+    include "pr-body";
+    # Strip every format character first, then require at least one visible
+    # one left: a soft hyphen or an emoji ZWJ sequence must not sink an
+    # otherwise-visible reason. A handful of codepoints look blank but are
+    # not \p{Cf}, so they are named explicitly; a combining mark is excluded
+    # outright, since a real base character elsewhere already satisfies this
+    # test on its own, and a combining mark with no base must not (#707 P3-b).
+    def real_reason:
+      gsub("\\p{Cf}"; "") as $stripped
+      | ($stripped | test("[^\\s\\p{Z}\\p{Cc}\\p{M}\\x{2800}\\x{3164}\\x{115F}\\x{1160}\\x{FFA0}]"));
+    # pr_body_text checks its own shape inside pr-body.jq, but a replacement
+    # module can drop that check along with the rest of the module (#707
+    # P3-a) — assert the shape up front, whenever pr_body_text yields exactly
+    # one value of the wrong type. Empty or doubled output is left alone: the
+    # case statement in each caller of this function still reads that as "no
+    # verdict", same as before.
+    (
+      [pr_body_text] as $pr_body
+      | if ($pr_body | length) == 1 and ($pr_body[0] | type) != "string"
+        then error("pr_body_text (pr-body.jq) must yield exactly one string, got \($pr_body[0])")
+        else empty end
+    ),
+    (
+    ($state | split("\t")) as [$kind, $why]
+    | pr_body_text as $body
+    | if [ $body | capture($lineRe; "gi") ] | any(.reason | real_reason) then "ok"
+      elif ($files | type) == "array" and any($files[]; . == $notes) then "ok"
+      else
+        ( if $kind == "changes" then $why
+          else "whether a substitute receipt asked for changes is unknown: \($why)" end ) as $whyText
+        | ( if ($files | type) == "array" then "this head does not touch \($notes)"
+            else "the files this head changes could not be checked, so no touch of \($notes) counts" end ) as $touch
+        # Names which shape rule the line failed, instead of a blanket "no
+        # reason" (#707 P3-c): the loose candidate regex finds an attempted
+        # line even where the strict one refuses to, so its tail can be
+        # inspected for what specifically is wrong with it.
+        | ( [ $body | capture($candidateRe; "gi") ] ) as $candidates
+        | ( ((.body // "") | test($anywhereRe; "i")) and (($body | test($anywhereRe; "i")) | not) ) as $hiddenByStripping
+        | ( if ($candidates | length) > 0 then
+              ($candidates[0].rest) as $rest
+              # capture, not index/slice: a byte offset from index and a
+              # codepoint offset from a slice disagree once $rest holds a
+              # multi-byte UTF-8 reason, and this must never depend on which
+              # one wins (#713 P3). No match — no unescaped `)`, or a `(`
+              # before the first `)` — comes back as an empty array, same as
+              # the old "unmatched or nested" branch.
+              | ( [ $rest | capture($splitRe) ] ) as $split
+              | if ($split | length) == 0 then
+                  "the body carries a `Review-notes: none (...)` line, but its reason has an unmatched or nested parenthesis, which the check cannot parse. Remove the inner parenthesis, or add or amend the lesson in \($notes)"
+                else
+                  ($split[0].reason) as $reasonContent
+                  | ($split[0].trailing | gsub("^[ \t]+"; "") | gsub("[ \t\r]+$"; "")) as $trailing
+                  | if ($reasonContent | real_reason | not) then
+                      "the body carries a `Review-notes: none ()` line, but its reason is empty or has no visible character. Give it a visible reason, or add or amend the lesson in \($notes)"
+                    elif ($trailing | length) > 0 then
+                      "the body carries a `Review-notes: none (<reason>)` line, but it has text after the closing parenthesis (\"\($trailing)\"), which the check reads as not ending the line\(if $trailing == "." then " (a trailing period counts as text after the parenthesis; drop it)" else "" end). Remove it, or add or amend the lesson in \($notes)"
+                    else
+                      "the body carries a `Review-notes: none (...)` line that does not count as a statement, for a reason the check could not name precisely. Add or amend the lesson in \($notes), or say why there is none in that body line"
+                    end
+                end
+            elif $hiddenByStripping then
+              "the body carries a `Review-notes: none (...)` line, but it is inside a code fence or an HTML comment, so it does not count as a statement. Move it outside both, or add or amend the lesson in \($notes)"
+            else
+              "the body has no `Review-notes: none (<reason>)` line at all. Add or amend the lesson in \($notes), or add that body line saying why there is none"
+            end
+          ) as $shapeDetail
+        | "review_notes_missing: \($whyText); \($touch), and \($shapeDetail)"
+      end
+    )'
+}
+
 # Empty when CI on exactly HEAD is green; otherwise `ci_missing`, `ci_red` or
 # `ci_pending` and what caused it. Workflow runs come from `actions/runs`, not
 # `commits/<sha>/check-runs`: that 403s ("Resource not accessible by personal
@@ -947,10 +1123,12 @@ ci_verdict() {
 # never read a defer as a pass. Its base is re-read first, since a base that
 # moved may have opted in since.
 merge_check_main() {
-  local want="" pr_text fix_link ci receipt_raw receipt receipt_reviewer markers since observation
+  local want="" pr_text fix_link ci receipt_raw receipt receipt_reviewer notes markers since observation
   while [ $# -gt 0 ]; do
     case "$1" in
-      --head) want="${2:?--head needs a sha}"; shift 2 ;;
+      --head)
+        [ $# -ge 2 ] && [[ "$2" =~ ^[0-9a-f]{7,40}$ ]] || { echo "merge-check: --head needs a hex sha (7-40)" >&2; exit 2; }
+        want="$2"; shift 2 ;;
       *) echo "merge-check: unknown argument $1" >&2; exit 2 ;;
     esac
   done
@@ -968,10 +1146,20 @@ merge_check_main() {
   # merge time: the title and body can both change after the PR opens.
   pr_text=$(gh pr view "$PR" --repo "$REPO" --json title,body) || exit 1
   fix_link=$(printf '%s' "$pr_text" | fix_link_state) || exit 1
-  if [ "$fix_link" = missing ]; then
-    echo "merge=refused head=$SCOPE_HEAD: a fix PR needs a 'Fixes-PR: #<n>' line in its body naming the PR it fixes, or 'Fixes-PR: none'" >&2
-    exit 24
-  fi
+  # Exactly `ok` or `missing`. Anything else — no line, two lines — is no
+  # verdict, never a pass: a pr-body.jq that yields nothing must not wave a fix
+  # PR through.
+  case "$fix_link" in
+    ok) ;;
+    missing)
+      echo "merge=refused head=$SCOPE_HEAD: a fix PR needs a 'Fixes-PR: #<n>' line in its body naming the PR it fixes, or 'Fixes-PR: none'" >&2
+      exit 24
+      ;;
+    *)
+      echo "merge=error head=$SCOPE_HEAD: the Fixes-PR check gave no verdict (got \"$fix_link\")" >&2
+      exit 1
+      ;;
+  esac
   # No branch protection holds this line, so merge-check does, whatever the
   # verdict: every check run on exactly this head, completed green.
   ci=$(ci_verdict "$SCOPE_HEAD") || exit 1
@@ -995,6 +1183,21 @@ merge_check_main() {
     echo "merge=refused head=$SCOPE_HEAD verdict=$SCOPE_VERDICT: latest substitute receipt: changes — a substitute reviewer said no on this head" >&2
     exit 24
   fi
+  # A review that said no on any head leaves its lesson in docs/review-notes.md,
+  # or the body says why there is none (review_notes_state). Read at merge
+  # time, like the Fixes-PR line, and under either verdict.
+  notes=$(review_notes_state "$pr_text") || exit 1
+  case "$notes" in
+    ok) ;;
+    review_notes_missing:*)
+      echo "merge=refused head=$SCOPE_HEAD verdict=$SCOPE_VERDICT: $notes" >&2
+      exit 24
+      ;;
+    *)
+      echo "merge=error head=$SCOPE_HEAD: the review-notes check gave no verdict (got \"$notes\")" >&2
+      exit 1
+      ;;
+  esac
   if [ "$SCOPE_VERDICT" = skip ]; then
     refuse_if_base_moved
     echo "merge=allowed head=$SCOPE_HEAD mode=risk-scoped verdict=skip ci=green base=$SCOPE_BASE: $SCOPE_REASON"
@@ -1706,10 +1909,17 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
     fi
     where="$where verdict=$SCOPE_VERDICT"
     fix_link=$(printf '%s' "$at_merge" | fix_link_state) || { echo "audit=error $where: could not read the title and body" >&2; exit 1; }
-    if [ "$fix_link" = missing ]; then
-      echo "audit=violation $where: a fix PR merged with no 'Fixes-PR:' line in its body at merge time"
-      exit 28
-    fi
+    case "$fix_link" in
+      ok) ;;
+      missing)
+        echo "audit=violation $where: a fix PR merged with no 'Fixes-PR:' line in its body at merge time"
+        exit 28
+        ;;
+      *)
+        echo "audit=error $where: the Fixes-PR check gave no verdict (got \"$fix_link\")" >&2
+        exit 1
+        ;;
+    esac
     ci=$(ci_verdict "$audit_head") || { echo "audit=error $where: could not read CI on the head" >&2; exit 1; }
     if [ -n "$ci" ]; then
       echo "audit=violation $where: $ci"
@@ -1735,6 +1945,20 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
       echo "audit=violation $where: the latest substitute receipt before the merge asked for changes"
       exit 28
     fi
+    # The review-notes rule, with the body at the merge and the comparison onto
+    # the commit it merged onto; receipts as of the merge (changes_receipt_state).
+    notes=$(review_notes_state "$at_merge") || { echo "audit=error $where: could not read receipts" >&2; exit 1; }
+    case "$notes" in
+      ok) ;;
+      review_notes_missing:*)
+        echo "audit=violation $where: $notes"
+        exit 28
+        ;;
+      *)
+        echo "audit=error $where: the review-notes check gave no verdict (got \"$notes\")" >&2
+        exit 1
+        ;;
+    esac
     if [ "$SCOPE_VERDICT" = skip ]; then
       echo "audit=pass $where: $SCOPE_REASON"
       exit 0

@@ -10,9 +10,18 @@
 # barrier-governed posture it did not have. A gate whose failure mode is
 # silent reversion to vibes is worse than no gate.
 #
-#   smoke-run-scaffold.sh contract    <run-dir> <source-sha> <lane>[:kind[:title]]... [--regenerate]
+#   smoke-run-scaffold.sh contract    <run-dir> <source-sha> <lane>[:kind[:title]]... [--regenerate] [--evidence <lane-id>=api]...
 #   smoke-run-scaffold.sh marker      <run-dir> <lane-id> <status> [summary] [evidence-csv] [--confirmed-findings <id>[,<id>...]]
 #   smoke-run-scaffold.sh redispatch  <run-dir> <lane-id>
+#
+# `--evidence <lane-id>=api` declares a `floor` lane's proof is an API
+# contract by design (a guard that must not be exercised through the UI),
+# writing `evidence:"api"` onto that lane's contract entry. It is the ONLY way
+# to set it — never inferred from a marker, never assumed from a lane's kind —
+# because a coordinator that could wave off a floor lane's browser-evidence
+# requirement after the fact could quietly launder any floor pass through it.
+# smoke-evidence-barrier.sh requires real screenshot/video evidence on every
+# `floor` lane's `pass` marker unless its contract entry carries this flag.
 #
 # The marker verb reads sourceSha from the contract rather than taking it as
 # an argument. A worker therefore cannot stamp a marker with a build it was
@@ -60,6 +69,8 @@ set -euo pipefail
 REGENERATE=false
 CONFIRMED_FINDINGS_CSV=""
 _CF_WANT_VALUE=false
+EVIDENCE_DECLS=()
+_EV_WANT_VALUE=false
 _ARGS=()
 for _a in "$@"; do
   if [ "$_CF_WANT_VALUE" = true ]; then
@@ -67,9 +78,15 @@ for _a in "$@"; do
     _CF_WANT_VALUE=false
     continue
   fi
+  if [ "$_EV_WANT_VALUE" = true ]; then
+    EVIDENCE_DECLS+=("$_a")
+    _EV_WANT_VALUE=false
+    continue
+  fi
   case "$_a" in
     --regenerate) REGENERATE=true ;;
     --confirmed-findings) _CF_WANT_VALUE=true ;;
+    --evidence) _EV_WANT_VALUE=true ;;
     *) _ARGS+=("$_a") ;;
   esac
 done
@@ -83,6 +100,29 @@ die() { jq -cn --arg e "$1" '{ok:false,error:$e}'; exit 2; }
 [ "$_CF_WANT_VALUE" = false ] || die "--confirmed-findings requires a value"
 [ -z "$CONFIRMED_FINDINGS_CSV" ] || [ "$COMMAND" = marker ] ||
   die "--confirmed-findings is only valid with the marker command"
+
+[ "$_EV_WANT_VALUE" = false ] || die "--evidence requires a value"
+[ "${#EVIDENCE_DECLS[@]}" -eq 0 ] || [ "$COMMAND" = contract ] ||
+  die "--evidence is only valid with the contract command"
+# Validated eagerly, before the contract's own lane loop, so a malformed
+# `--evidence` argument fails the same way for every command path rather than
+# surfacing only once a matching lane id happens to be declared.
+for _ev in "${EVIDENCE_DECLS[@]:-}"; do
+  [ -n "$_ev" ] || continue
+  case "$_ev" in
+    *=*) ;;
+    *) die "--evidence must be <lane-id>=api (got: $_ev)" ;;
+  esac
+  _ev_id="${_ev%%=*}"
+  _ev_val="${_ev#*=}"
+  printf '%s' "$_ev_id" | grep -Eq '^[A-Za-z0-9_-]+$' ||
+    die "--evidence lane id must be alphanumeric/dash/underscore: $_ev_id"
+  # "api" is the only recognized value on purpose: it names one exemption
+  # (this floor entry's proof is an API contract by design), not an open
+  # vocabulary a coordinator could grow into a general escape hatch.
+  [ "$_ev_val" = api ] ||
+    die "--evidence only supports the value 'api' (got: $_ev_val for lane $_ev_id)"
+done
 
 iso_now() { date -u +'%Y-%m-%dT%H:%M:%SZ'; }
 
@@ -164,11 +204,58 @@ begin_active_run_fence() {  # <artifact description>
      [ "$(jq -r '.activeRunId // empty' "$state_dir/develop-state.json" 2>/dev/null)" = "$run_id" ]; then
     FENCED_STATE_FILE="$state_dir/develop-state.json"; state_kind="develop"; count=$(( count + 1 ))
   fi
+  # A certification, re-verification or evidence-recovery run has no PR and no
+  # develop campaign — `smoke-pr-gate.sh task-claim` writes this third shape.
+  # Before this branch existed, such a run matched neither of the two above,
+  # so `count` stayed 0 and every task-scoped write was refused outright; the
+  # gap made coordinators hand-compose the contract and markers directly,
+  # skipping every check in this function.
+  if [ -e "$state_dir/task-$run_id-state.json" ] &&
+     [ "$(jq -r '.activeRunId // empty' "$state_dir/task-$run_id-state.json" 2>/dev/null)" = "$run_id" ]; then
+    FENCED_STATE_FILE="$state_dir/task-$run_id-state.json"; state_kind="task"; count=$(( count + 1 ))
+  fi
   [ "$count" -eq 1 ] || die "run '$run_id' does not hold the gate in exactly one active slot — STOP this campaign; do not write $description"
+  # Recorded into the contract below so the barrier can tell a `develop`-fenced
+  # run (the only shape a null coordinatorOwnerToken is ever legitimate for)
+  # apart from a pr/task run whose null token means it was never actually
+  # claimed.
+  FENCED_STATE_KIND="$state_kind"
   state="$(jq -c '.' "$FENCED_STATE_FILE" 2>/dev/null)" || die "active PR state is unreadable — refusing $description"
   if [ "$state_kind" = develop ]; then
     FENCED_ACTIVE_SHA="$(jq -r '.activeSha // empty' <<<"$state")"
     FENCED_OWNER=""
+    return 0
+  fi
+  if [ "$state_kind" = task ]; then
+    owner="$(jq -r '.activeLeaseOwner // empty' <<<"$state")"
+    [ -n "$owner" ] && [ "$owner" = "$DEFAULT_OWNER" ] ||
+      die "caller owner does not match the owner recorded by task-claim — STOP this run; do not write $description"
+    prepare_lease_dir
+    exec 8>"$LEASE_DIR/task-lease-$run_id.lock" || die "could not open shared task lease lock"
+    flock -w "$LOCK_WAIT" 8 || die "shared task lease lock is busy — retry this metadata write"
+    state="$(jq -c '.' "$FENCED_STATE_FILE" 2>/dev/null)" || die "active task state became unreadable under the shared fence"
+    [ "$(jq -r '.activeRunId // empty' <<<"$state")" = "$run_id" ] &&
+      [ "$(jq -r '.activeLeaseOwner // empty' <<<"$state")" = "$DEFAULT_OWNER" ] ||
+      die "run ownership changed before the metadata write — STOP this run"
+    FENCED_ACTIVE_SHA="$(jq -r '.activeSha // empty' <<<"$state")"
+    FENCED_OWNER="$DEFAULT_OWNER"
+    lease="$(jq -c 'select(type == "object" and .schemaVersion == 1 and .kind == "task" and
+      (.runId|type == "string" and length > 0) and
+      (.deploySha|type == "string" and test("^[0-9a-f]{40}$")) and
+      (.owner|type == "string" and length > 0) and
+      (.claimedAt|type == "string" and length > 0) and
+      (.renewedAt|type == "string" and length > 0) and
+      (.expiresAt|type == "string" and length > 0))' \
+      "$LEASE_DIR/task-lease-$run_id.json" 2>/dev/null)" || die "shared task lease is missing or malformed — refusing $description"
+    [ "$(jq -r '.owner' <<<"$lease")" = "$DEFAULT_OWNER" ] || die "shared task lease belongs to another owner — STOP this run"
+    [ "$(jq -r '.runId' <<<"$lease")" = "$run_id" ] || die "shared task lease belongs to another run — STOP this run"
+    [ "$(jq -r '.deploySha' <<<"$lease")" = "$FENCED_ACTIVE_SHA" ] || die "shared task lease belongs to another deploy — STOP this run"
+    for timestamp_field in claimedAt renewedAt expiresAt; do
+      valid_utc_timestamp "$(jq -r --arg field "$timestamp_field" '.[$field]' <<<"$lease")" ||
+        die "shared task lease has an invalid UTC timestamp — refusing $description"
+    done
+    expires_epoch="$(date -u -d "$(jq -r '.expiresAt' <<<"$lease")" +%s 2>/dev/null || printf 0)"
+    [ "$(date -u +%s)" -lt "$expires_epoch" ] || die "shared task lease expired — STOP this run"
     return 0
   fi
   owner="$(jq -r '.activeLeaseOwner // empty' <<<"$state")"
@@ -329,6 +416,7 @@ contract)
 
   LANES='[]'
   MARKERS='[]'
+  DECLARED_IDS=()
   for spec in "$@"; do
     id="${spec%%:*}"
     rest="${spec#"$id"}"; rest="${rest#:}"
@@ -336,10 +424,35 @@ contract)
     title="${rest#"$kind"}"; title="${title#:}"
     printf '%s' "$id" | grep -Eq '^[A-Za-z0-9_-]+$' ||
       die "lane id must be alphanumeric/dash/underscore: $id"
+    DECLARED_IDS+=("$id")
+    lane_evidence=""
+    for _ev in "${EVIDENCE_DECLS[@]:-}"; do
+      [ -n "$_ev" ] || continue
+      case "$_ev" in
+        "$id="*) lane_evidence="${_ev#*=}" ;;
+      esac
+    done
     LANES="$(jq -c --arg id "$id" --arg kind "${kind:-lane}" --arg title "$title" \
-      --argjson gen "$GENERATION" \
-      '. + [{id:$id,kind:$kind,title:(if $title == "" then null else $title end),generation:$gen}]' <<<"$LANES")"
+      --arg evidence "$lane_evidence" --argjson gen "$GENERATION" \
+      '. + [{id:$id,kind:$kind,title:(if $title == "" then null else $title end),generation:$gen}
+        + (if $evidence == "" then {} else {evidence:$evidence} end)]' <<<"$LANES")"
     MARKERS="$(jq -c --arg m "markers/$id.json" '. + [$m]' <<<"$MARKERS")"
+  done
+
+  # An `--evidence` entry naming a lane id that was never declared on this call
+  # is silently a no-op above — fail loudly instead, the same reasoning as
+  # every other fail-closed check in this script: a typo here would otherwise
+  # leave a floor lane requiring browser evidence it was meant to be exempted
+  # from, discovered only when the barrier refuses it.
+  for _ev in "${EVIDENCE_DECLS[@]:-}"; do
+    [ -n "$_ev" ] || continue
+    _ev_id="${_ev%%=*}"
+    _ev_found=false
+    for _d in "${DECLARED_IDS[@]:-}"; do
+      [ "$_d" = "$_ev_id" ] && { _ev_found=true; break; }
+    done
+    [ "$_ev_found" = true ] ||
+      die "--evidence declares lane '$_ev_id' which is not among the lanes being scaffolded"
   done
 
   # Deployment-specific fields (environment, leasePolicy, frontendDeploySha…)
@@ -355,6 +468,7 @@ contract)
     --arg sha "$SOURCE_SHA" \
     --arg now "$(iso_now)" \
     --arg owner "$FENCED_OWNER" \
+    --arg kind "$FENCED_STATE_KIND" \
     --argjson lanes "$LANES" \
     --argjson markers "$MARKERS" \
     --argjson extra "$EXTRA" \
@@ -363,6 +477,7 @@ contract)
       runId: $runId,
       sourceSha: $sha,
       coordinatorOwnerToken:(if $owner == "" then null else $owner end),
+      ownershipKind: $kind,
       requiredLaneMarkers: $markers,
       lanes: $lanes,
       markerDir: "markers",

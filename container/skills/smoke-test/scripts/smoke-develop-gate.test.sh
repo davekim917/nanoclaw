@@ -71,9 +71,18 @@ case "$1 $2" in
   "api repos/org/repo/branches/develop")
     printf '{"commit":{"sha":"%s"}}' "$STUB_SOURCE_SHA" ;;
   "run list")
+    # wait-settled tests only: flip from failure to success after N calls, so
+    # a bounded poll loop can observe a build settle mid-wait instead of every
+    # attempt reading the same static fixture. Unset = unchanged behavior.
+    FRONTEND_CI="${STUB_FRONTEND_CI:-success}"
+    if [ -n "${STUB_UNSETTLE_COUNTER_FILE:-}" ]; then
+      COUNT=$(( $(cat "$STUB_UNSETTLE_COUNTER_FILE" 2>/dev/null || echo 0) + 1 ))
+      printf '%s' "$COUNT" > "$STUB_UNSETTLE_COUNTER_FILE"
+      if [ "$COUNT" -lt "${STUB_UNSETTLE_UNTIL_ATTEMPT:-999999}" ]; then FRONTEND_CI=failure; else FRONTEND_CI=success; fi
+    fi
     printf '[{"headSha":"%s","status":"completed","conclusion":"%s","workflowName":"Frontend CI"},
              {"headSha":"%s","status":"completed","conclusion":"success","workflowName":"Backend CI"}]' \
-      "$STUB_SOURCE_SHA" "${STUB_FRONTEND_CI:-success}" "$STUB_SOURCE_SHA" ;;
+      "$STUB_SOURCE_SHA" "$FRONTEND_CI" "$STUB_SOURCE_SHA" ;;
   *)
     case "$2" in
       */compare/*)
@@ -1574,6 +1583,43 @@ bash "$GATE" poll | jq -e '
   .data.trigger == "gate_hold_tampered" and .data.ledgerRunId == "offender-two"
 ' >/dev/null
 unset SMOKE_GATE_HOLD_FILE
+
+# --- 58. wait-settled: bounded poll, never a FAIL on an unsettled build ----
+# A re-verification run must wait and re-check, not score an unsettled/red
+# environment as a product FAIL (see SKILL.md's re-verification guidance).
+
+# 58a. Never settles within the bound: exits non-zero, reports timedOut:true,
+# and still carries the underlying check's own diagnostic (failedChecks).
+fresh_state
+export STUB_SOURCE_SHA="$(printf '8%.0s' $(seq 40))"
+export STUB_FRONTEND_CI=failure
+export SMOKE_GATE_WAIT_INTERVAL_SECONDS=0 SMOKE_GATE_WAIT_MAX_SECONDS=0
+if bash "$GATE" wait-settled > "$STATE_DIR2/wait-out.json"; then
+  echo "expected wait-settled to exit non-zero when the build never settles" >&2; exit 1
+fi
+jq -e '.settled == false and .timedOut == true and .failedChecks == 1 and (.attempts | type) == "number"' \
+  "$STATE_DIR2/wait-out.json" >/dev/null
+unset STUB_FRONTEND_CI SMOKE_GATE_WAIT_INTERVAL_SECONDS SMOKE_GATE_WAIT_MAX_SECONDS
+
+# 58b. Settles mid-wait: the same command that woke on `develop_unsettled`
+# eventually observes settled:true without a human re-invoking anything.
+fresh_state
+export STUB_SOURCE_SHA="$(printf '9%.0s' $(seq 40))"
+export STUB_FRONTEND_CI=failure
+export STUB_UNSETTLE_COUNTER_FILE="$STATE_DIR2/unsettle-count"
+export STUB_UNSETTLE_UNTIL_ATTEMPT=3
+export SMOKE_GATE_WAIT_INTERVAL_SECONDS=0 SMOKE_GATE_WAIT_MAX_SECONDS=30
+bash "$GATE" wait-settled > "$STATE_DIR2/wait-out2.json"
+jq -e '.settled == true and .timedOut == false and .attempts >= 3' "$STATE_DIR2/wait-out2.json" >/dev/null
+unset STUB_FRONTEND_CI STUB_UNSETTLE_COUNTER_FILE STUB_UNSETTLE_UNTIL_ATTEMPT \
+      SMOKE_GATE_WAIT_INTERVAL_SECONDS SMOKE_GATE_WAIT_MAX_SECONDS
+
+# 58c. Already settled: succeeds on the first attempt, no waiting needed.
+fresh_state
+export STUB_SOURCE_SHA="$(printf '5%.0s' $(seq 40))"
+export SMOKE_GATE_WAIT_INTERVAL_SECONDS=0 SMOKE_GATE_WAIT_MAX_SECONDS=30
+bash "$GATE" wait-settled | jq -e '.settled == true and .attempts == 1' >/dev/null
+unset SMOKE_GATE_WAIT_INTERVAL_SECONDS SMOKE_GATE_WAIT_MAX_SECONDS
 
 echo "smoke develop gate tests passed"
 

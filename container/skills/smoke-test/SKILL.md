@@ -97,6 +97,46 @@ both:
    while the ownership locks are held. A changed claim cannot inherit evidence
    from the previous build.
 
+**A certification, re-verification, or evidence-recovery run has no PR.**
+Never hand-compose the contract or a marker for one just because there is no
+freeze PR to `claim` against — that reproduces the exact incident this scaffold
+exists to prevent, only on a run the barrier can never see as governed. Claim
+the run itself instead, through the same deployed wrapper a PR campaign
+`claim`s through — **never the raw skill script directly.** The wrapper is
+what sets `SMOKE_GATE_STATE_DIR`/`SMOKE_GATE_LEASE_DIR` to this install's real
+paths; calling `/app/skills/smoke-test/scripts/smoke-pr-gate.sh` bare instead
+falls through to the gate's hardcoded defaults, which a PR campaign's state
+and locks do not live under, and neither will anything this run writes later:
+
+```bash
+bash /workspace/agent/smoke-pr-gate.sh task-claim <run-id> <deploy-sha>
+```
+
+This opens the same door a PR `claim` does: a shared, cross-container lease
+under the workgroup mount, which `begin_active_run_fence` accepts as a third
+active-slot shape alongside `pr` and `develop`. `task-progress <run-id>`
+renews it during a long run and `task-release <run-id>` drops it when the run
+ends; `--takeover` on `task-claim` may reassign a live lease to a new owner,
+same as a PR claim, but the deploy SHA itself binds **permanently** at claim
+and has no takeover escape — a different build always gets a different run id.
+`task-finish <run-id> <deploy-sha> <verdict>` is the terminal step: only the
+run's current lease owner may call it, only for the SHA it claimed, and it
+writes the run's write-once verdict and releases the lease in the same
+step — same reconciliation refusal as `finish` if a second, different verdict
+is ever attempted for the same run.
+
+`smoke-run-scaffold.sh` and `smoke-evidence-barrier.sh` are always invoked
+directly (never through a wrapper) and read those same two env vars from
+whatever process calls them — they do not inherit anything the wrapper
+exported in its own, separate process. An install solves this with its own
+versioned env file (exporting everything its wrapper exports) that the
+wrapper itself sources and that a coordinator also sources before every
+direct scaffold/barrier call — one file both paths read, never a fresh
+per-run copy of the same values. Source that same install env file before a
+task-scoped run's own contract/marker/barrier calls too. Skipping this does
+not fail loudly — it fails exactly like the bare-script case above, into a
+state dir the claim itself never wrote to.
+
 Before dispatch, the coordinator writes the contract with the frozen SHA and
 every lane it is committing to:
 
@@ -307,6 +347,62 @@ coverage. **Browser lanes must not start if this script
 exits non-zero.** Treat that exit as `BLOCKED_BUILD_IDENTITY` and stop — do not
 dispatch the UI adversary or backend verifier lanes against an unproven build.
 
+**Freeze the deployed PAIR with `scripts/smoke-pair-identity.sh`, not a
+per-run ad hoc script.** `smoke-build-identity.sh` proves the bundle/host
+binding once; it does not re-prove the environment still serves the SAME
+build a minute, or an hour, into a long run. A shared dev environment can be
+replaced under a live run by an unrelated deploy — a different failure from
+`smoke-build-identity.sh`'s bundle-host seam and not caught by it. Configure
+`SMOKE_GATE_FRONTEND_SERVICE` / `SMOKE_GATE_BACKEND_SERVICE` (the same names
+`smoke-develop-gate.sh` reads — one wrapper env file configures both) and:
+
+```bash
+bash /app/skills/smoke-test/scripts/smoke-pair-identity.sh start <run-dir>
+bash /app/skills/smoke-test/scripts/smoke-pair-identity.sh check <run-dir> <label>
+bash /app/skills/smoke-test/scripts/smoke-pair-identity.sh finish <run-dir>
+```
+
+Every run, from the coordinator freezing before dispatch: `start` before any
+lane runs; every lane (worker, challenger, coordinator) `check`s at its own
+start and end; the coordinator `finish`es before publication. `check`/`finish`
+exit 3 on drift — finish the run **BLOCKED**, never a scored verdict — exit 2
+means the identity itself is unreadable/invalid (refuse, do not proceed), and
+exit 4 from `start` means this run already froze an identity: never re-freeze
+by calling `start` again. Reachability checks (`smoke-build-identity.sh`'s
+bundle/host and `/healthz`) stay separate from identity — they answer "is
+something serving", not "is it the pair this run claimed."
+
+**On drift, the coordinator may re-freeze exactly once per run** with
+`refreeze <run-dir> <reason>`, instead of finishing the whole run BLOCKED for
+what may be one unrelated redeploy:
+
+```bash
+bash /app/skills/smoke-test/scripts/smoke-pair-identity.sh refreeze <run-dir> "<reason>"
+```
+
+This is bounded, not a way to paper over drift: a second `refreeze` call in
+the same run — whether or not another drift is ever detected — is refused
+(exit 4), so a run gets at most one do-over. `refreeze` records the OLD pair,
+the NEW pair, the reason, and a timestamp in `identity.json`'s `history[]`
+(cite both pairs in the run record and the verdict, never just the new one)
+and bumps an internal `freezeGeneration`. Every `check`/`finish` receipt from
+before the re-freeze stays on disk as an honest record that the drift
+happened, but `finish` only looks at receipts recorded at the run's CURRENT
+freeze generation — a stale-generation receipt neither blocks nor clears
+publication, the same way `smoke-run-scaffold.sh`'s lane generations already
+work (see "Re-running a lane" above; this reuses that mechanism rather than
+inventing a parallel one). Concretely, after a `refreeze`:
+
+1. every lane already dispatched against the OLD pair has evidence that
+   predates the run's current identity — `redispatch` it before trusting
+   anything it reports from here on: `smoke-run-scaffold.sh redispatch
+   <run-dir> <lane-id>` for each such lane, then re-brief and re-run it;
+2. each redispatched lane calls `check <run-dir> <label>` again at its new
+   start/end, so a receipt exists at the CURRENT generation — `finish` refuses
+   (exit 2) until at least one does;
+3. a second drift after the one allowed re-freeze finishes the run BLOCKED,
+   exactly like an unhandled first drift would.
+
 A scheduled run arrives with the head already proven settled by the gate. A
 campaign someone asked for in chat does not, and must prove it before freezing
 and claim the environment after — see "Human-requested campaigns" below.
@@ -389,7 +485,7 @@ identity in this skill.** It lives in the deploying group's standing
 instructions beside the repo, environment, QA channel, run root, and credential
 locations — never here, because the journeys that matter belong to the
 deployment, not to the skill. What lives here is the contract the list must
-satisfy. Each floor entry declares six things:
+satisfy. Each floor entry declares six things, plus an optional seventh:
 
 | Field | What it must say |
 |---|---|
@@ -399,6 +495,22 @@ satisfy. Each floor entry declares six things:
 | `seed` | the account, seat, tier, fixture, or data row the walk needs, and where it comes from |
 | `max_interval` | the longest this deployment tolerates going without this journey proven on a deployed build |
 | `restore` | how the walk's mutations are reverted, since it runs repeatedly against live-shaped data |
+| `evidence` (optional) | `api` when this entry's proof is an API contract by design — a guard that must not be exercised through the UI. Absent means the default: this entry proves itself with a browser journey and its pass marker must carry real screenshot/video evidence like any other floor lane. This is a per-entry declaration in the install's floor table, never a coordinator's after-the-fact call — inventing an exemption at run time is exactly the failure this field exists to prevent. |
+
+**A floor entry's `evidence: api` declaration in the standing instructions is
+inert until the coordinator carries it into the contract.** When scaffolding a
+`floor` lane for an entry declared `evidence: api`, pass that through to
+`smoke-run-scaffold.sh contract` with `--evidence <entry-id>=api` so the lane
+object in the contract itself says so:
+
+```bash
+bash /app/skills/smoke-test/scripts/smoke-run-scaffold.sh contract \
+  <run-dir> <source-sha> <entry-id>:floor:'<title>' --evidence <entry-id>=api
+```
+
+Omitting the flag for an entry the floor table marks `evidence: api` is a
+scaffolding bug, not a stricter run — the barrier below will refuse the pass
+marker for lacking browser evidence it was never going to have.
 
 **What earns a place on the floor — two questions, both answered with a
 citation rather than an adjective.**
@@ -460,13 +572,26 @@ both, bounded:
   get to pick the convenient one.
 - **"Last passed" is read off the run root, not off a ledger.** An entry's last
   exercise is the newest `pass` marker carrying its lane id, anywhere under the
-  run root. Markers are already durable, already SHA-bound, and already survive
-  media retention, so this needs no new artifact and cannot be asserted without
-  leaving one:
+  run root — but only a marker that actually carries proof counts: a `pass`
+  marker whose evidence is browser media, or one whose run declared this entry
+  `evidence: api` in its contract, at the time that run happened. A `pass` with
+  neither is not evidence of anything and must not reset the clock (see the
+  barrier rule below). Markers are already durable, already SHA-bound, and
+  already survive media retention, so this needs no new artifact and cannot be
+  asserted without leaving one:
 
   ```bash
-  jq -r 'select(.status == "pass") | "\(.completedAt) \(input_filename)"' \
-    <run-root>/*/markers/<entry-id>.json 2>/dev/null | sort | tail -1
+  for marker in <run-root>/*/markers/<entry-id>.json; do
+    [ -f "$marker" ] || continue
+    [ "$(jq -r '.status' "$marker")" = pass ] || continue
+    contract="$(dirname "$(dirname "$marker")")/completion-contract.json"
+    has_media="$(jq -r '[(.evidence // [])[] |
+      select(test("\\.(png|jpg|jpeg|webp|gif|mp4|webm)$"; "i"))] | length > 0' "$marker")"
+    is_api="$(jq -r --arg id "<entry-id>" \
+      '[.lanes[]? | select(.id == $id) | (.evidence == "api")][0] // false' \
+      "$contract" 2>/dev/null)"
+    { [ "$has_media" = true ] || [ "$is_api" = true ]; } && jq -r '.completedAt' "$marker"
+  done | sort | tail -1
   ```
 
 At one entry per campaign a five-entry floor comes fully around every day or
@@ -545,7 +670,16 @@ because it is the same failure wearing a different name:
   that to publish, so a published run structurally has one; a missing or `void`
   marker beside a published verdict means the barrier was bypassed.
 - **Each entry walked carries its own screenshot evidence on the frozen SHA**,
-  named in the marker's evidence list — the same bar as any other browser lane.
+  named in the marker's evidence list — the same bar as any other browser
+  lane, unless the contract declares that entry `evidence: api`. The barrier
+  enforces this directly: `smoke-evidence-barrier.sh` refuses readiness when a
+  `floor` lane's `pass` marker names no media file (png/jpg/jpeg/webp/gif/mp4/
+  webm) that exists under the run root, unless the lane's own contract entry
+  carries `evidence: "api"` — set only by `smoke-run-scaffold.sh contract
+  --evidence <lane-id>=api` at scaffold time, never inferred from the marker
+  or asserted after the fact. A published run with a floor `pass` and no
+  qualifying evidence means this check did not run, not that the entry was
+  legitimately API-only.
 - **Selection is recomputable.** Re-run the least-recently-passed query above as
   of that run's timestamp. A run that walked a freshly-passed entry while
   another sat past its ceiling shows up as a mismatch between what was due and
@@ -1428,6 +1562,50 @@ Downstream rule: flag present → automatic hold on promotion; flag absent → n
 smoke objection. Absence semantics make rollout safe — history predating the
 smoke watcher never gates anything.
 
+### Re-verification and other scheduled tasks: unsettled or red is BLOCKED, never FAIL
+
+A scheduled re-verification, certification, or evidence-recovery task reads
+`smoke-develop-gate.sh check` the same way a human-requested campaign does
+(above), but it is usually not opening a campaign at all — it is re-checking a
+specific closed finding against whatever develop currently deploys. That task
+still has to decide what to do when `check` reports `settled:false` or a red
+CI check on the head it was told to test.
+
+**An unsettled or red environment is not a product result.** It answers "is
+this build ready to look at", not "does the fix work" — scoring it PASS or
+FAIL either way manufactures a verdict about a build nobody actually tested. A
+`FAIL` recorded here reopens a closed issue over CI timing, not a regression,
+and the next retry that finds the SAME build green makes that reopen visibly
+wrong after the fact.
+
+The correct outcome is **BLOCKED, with the reason named**, reached by waiting
+and re-checking rather than checking once and giving up:
+
+```bash
+bash /workspace/agent/smoke-develop-gate.sh wait-settled
+```
+
+This polls `check` on `SMOKE_GATE_WAIT_INTERVAL_SECONDS` (default 5 min) up to
+`SMOKE_GATE_WAIT_MAX_SECONDS` (default 45 min total), read-only throughout —
+no claim, no state write. It exits 0 with `settled:true` the moment the build
+settles, so the task simply carries on into its normal read/verify steps using
+the SHAs the settled response names. If the environment never settles inside
+the window, it exits non-zero with `timedOut:true` and the underlying check's
+own diagnostic (`failedChecks`, `pendingChecks`, `deployLagAccepted`, …) still
+attached — finish the task **BLOCKED** with that reason, post it plainly, and
+schedule a follow-up rather than silently absorbing the wait: a build that is
+still red 45 minutes later is itself worth naming, not just retrying forever
+unannounced. Never issue PASS, FAIL, VERIFIED, or NOT VERIFIED off a
+`timedOut:true` response — those verbs are for a build this task actually
+observed.
+
+`wait-settled` never claims the slot, so it composes with everything above:
+a human-requested campaign still calls plain `check` once and freezes
+immediately on `settled:true` per the campaign-open flow; `wait-settled` is
+for a task that would otherwise have to hand-roll its own poll-and-sleep loop
+around `check` — which is what produced a 20-minute cron job and a bespoke
+wait script for one run on 2026-09-11, reinventing exactly this.
+
 ### An undecided hold stops the next round (`SMOKE_GATE_DECISION_LEDGER`)
 
 Holding promotion and continuing to test are two different questions, and until
@@ -1720,7 +1898,44 @@ seam and semantics as the develop gate — one readiness command run once per
 poll, immediately before a settled candidate is actually claimed), and
 `SMOKE_GATE_WARMUP_TIMEOUT` (default 600s — a backend stuck past this long
 without a healthy `/healthz` after going `live` raises one throttled
-`pr_warmup_stuck` alarm instead of polling silently forever).
+`pr_warmup_stuck` alarm instead of polling silently forever — but never for a
+SHA this gate's own `finish` already completed and suspended: `finish`
+suspending its preview by design produces the identical
+backendReady-true/healthzReady-false shape, and is checked first).
+
+**Preview identity is never a positional pick.** Render has provisioned two
+services sharing one display name under the same parent more than once (a
+`renderer` retry, a stale service left behind) — `check`/`poll` facts carry
+`backendCandidates` / `frontendCandidates` (every match, not just the first),
+`backendSelectionMethod` / `frontendSelectionMethod` (`none` / `single` /
+`bundle-disambiguated` / `ambiguous`), and `previewAmbiguous` /
+`previewAmbiguityReason`. On exactly one match, selection is unchanged. On
+2+ backend candidates, the gate fetches the served frontend HTML, extracts
+the hashed JS bundle path (`SMOKE_GATE_BUNDLE_PATTERN`, same technique and
+knob-naming as `smoke-build-identity.sh`'s `SMOKE_BUILD_ID_BUNDLE_PATTERN` —
+this one's default already accepts the `-` that base64url content hashes
+legitimately contain, e.g. `index-Cg8w-v89.js`; `SMOKE_BUILD_ID_BUNDLE_PATTERN`
+still lacks it, tracked separately as #1366), fetches the bundle, and prefers
+whichever candidate's host the
+bundle actually references — but ONLY when that resolves to exactly one
+candidate. Any other outcome (no frontend URL to check against, the fetch
+failing, the bundle naming zero or 2+ candidates) is a REFUSAL: no id/url is
+selected, `fetchOk` goes false so the stall alarms as `pr_facts_unavailable`
+rather than retrying forever in silence, and `previewAmbiguityReason` names
+every colliding service. There is no oracle for a frontend-side duplicate —
+2+ frontend candidates is always a refusal. The exact same resolution runs at
+the mutating `finish`/suspend call site, so a wrong-twin pick can never POST
+`.../suspend` against a service nobody chose; on ambiguity there, `finish`
+attempts no suspend, records the reason in the verdict receipt, and still
+completes rather than stranding the run. `SMOKE_GATE_IDENTITY_TIMEOUT`
+(default 10s) bounds each disambiguation fetch.
+
+A `frontendEvidenceGap: true` fact marks a null `frontendPreviewUrl` as a
+gap in the evidence available for browser-lane build-identity attestation
+(`smoke-build-identity.sh` needs that URL), not a silent "not applicable" —
+the frontend preview is now looked up on every PR regardless of whether its
+diff touched `XZO-FRONTEND/`, since the disambiguation oracle above needs it
+even on a backend-only PR.
 
 Full design and the live Render verification behind every rule above:
 `groups/_ops/specs/fleet-hardening/phase5-preview-envs.md`.
