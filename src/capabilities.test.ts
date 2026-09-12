@@ -6,12 +6,15 @@ const dirs = vi.hoisted(() => {
   return {
     TEST_ROOT: testRoot,
     GROUPS_DIR: `${testRoot}/groups`,
+    DATA_DIR: `${testRoot}/data`,
   };
 });
 
 vi.mock('./config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./config.js')>()),
   GROUPS_DIR: dirs.GROUPS_DIR,
+  // Hermetic: the plugin scope policy (src/plugin-scopes.ts) must never be read from the host.
+  DATA_DIR: dirs.DATA_DIR,
 }));
 
 import { buildSessionServicesSnapshot, getHostCapabilities, renderSessionCapabilities } from './capabilities.js';
@@ -317,6 +320,39 @@ describe('buildSessionServicesSnapshot', () => {
       expect((await capabilities).plugins.installed).not.toContain('gitnexus');
       expect((await capabilities).plugins.installed).toContain('ordinary-plugin');
       expect(SIBLING_BOUND_FIELDS.has('gitnexusInjectAgentsMd')).toBe(false);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+  });
+
+  it('names a workgroup-scoped plugin only to groups in its workgroups (src/plugin-scopes.ts)', async () => {
+    fs.mkdirSync(`${dirs.TEST_ROOT}/plugins/client-plugin`, { recursive: true });
+    fs.mkdirSync(`${dirs.TEST_ROOT}/plugins/shared-plugin`, { recursive: true });
+    fs.mkdirSync(dirs.DATA_DIR, { recursive: true });
+    fs.writeFileSync(
+      `${dirs.DATA_DIR}/plugin-scopes.json`,
+      JSON.stringify({ version: 1, plugins: { 'client-plugin': ['client-wg'] } }),
+    );
+    insertWorkgroup('client-wg', []);
+    insertWorkgroup('other-wg', []);
+    const member = group('ag-caps-member', 'caps-member');
+    const outsider = group('ag-caps-outsider', 'caps-outsider');
+    await createGroupInWorkgroup(member, 'client-wg');
+    await createGroupInWorkgroup(outsider, 'other-wg');
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = dirs.TEST_ROOT;
+    try {
+      const memberInstalled = (await getHostCapabilities(member.id, undefined, 'client-wg')).plugins.installed;
+      const outsiderInstalled = (await getHostCapabilities(outsider.id, undefined, 'other-wg')).plugins.installed;
+      const unresolved = (await getHostCapabilities(member.id)).plugins.installed;
+      const hostWide = (await getHostCapabilities()).plugins.installed;
+      expect(memberInstalled).toEqual(expect.arrayContaining(['client-plugin', 'shared-plugin']));
+      expect(outsiderInstalled).toContain('shared-plugin');
+      expect(outsiderInstalled).not.toContain('client-plugin');
+      expect(unresolved).not.toContain('client-plugin');
+      expect(hostWide).toEqual(expect.arrayContaining(['client-plugin', 'shared-plugin']));
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;

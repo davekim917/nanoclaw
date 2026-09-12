@@ -40,6 +40,7 @@ vi.mock('./db/messaging-groups.js', async (importOriginal) => {
 });
 
 import { buildMounts } from './container-runner.js';
+import { log } from './log.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { sessionContextPath, sessionDir, writeSessionContext } from './session-manager.js';
 import { inboundDbPath } from './mailbox/sqlite/paths.js';
@@ -904,6 +905,55 @@ describe('buildMounts agent surfaces', async () => {
       expect(paths).not.toContain('/workspace/plugins/gitnexus');
       expect(paths).not.toContain('/workspace/plugins/nanoclaw-hooks');
       expect(paths).toContain('/workspace/plugins/unrelated-plugin');
+    } finally {
+      homedirSpy.mockRestore();
+    }
+  });
+
+  it('mounts a workgroup-scoped plugin only for groups in its workgroups (src/plugin-scopes.ts)', async () => {
+    const homedir = path.join(TEST_ROOT, 'home');
+    fs.mkdirSync(path.join(homedir, 'plugins', 'client-plugin'), { recursive: true });
+    fs.mkdirSync(path.join(homedir, 'plugins', 'shared-plugin'), { recursive: true });
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(
+      path.join(DATA_DIR, 'plugin-scopes.json'),
+      JSON.stringify({ version: 1, plugins: { 'client-plugin': ['client-wg'], 'missing-plugin': ['client-wg'] } }),
+    );
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(homedir);
+
+    try {
+      const member = group('ag-scope-member', 'scope-member');
+      const outsider = group('ag-scope-outsider', 'scope-outsider');
+      for (const ag of [member, outsider]) await createAgentGroup(ag);
+      assignWorkgroup(member, 'client-wg');
+      assignWorkgroup(outsider, 'other-wg');
+      for (const ag of [member, outsider]) {
+        await ensureContainerConfig(ag.id);
+        initGroupFilesystem(ag, {});
+      }
+
+      const memberPaths = (
+        await buildMounts(member, session('s-scope-member', member.id), containerConfig(), 'claude', {}, 'client-wg')
+      ).map((mount) => mount.containerPath);
+      const outsiderPaths = (
+        await buildMounts(
+          outsider,
+          session('s-scope-outsider', outsider.id),
+          containerConfig(),
+          'claude',
+          {},
+          'other-wg',
+        )
+      ).map((mount) => mount.containerPath);
+
+      expect(memberPaths).toContain('/workspace/plugins/client-plugin');
+      expect(memberPaths).toContain('/workspace/plugins/shared-plugin');
+      expect(outsiderPaths).not.toContain('/workspace/plugins/client-plugin');
+      expect(outsiderPaths).toContain('/workspace/plugins/shared-plugin');
+      expect(log.warn).toHaveBeenCalledWith(
+        expect.stringContaining('Plugin scope names no ~/plugins directory'),
+        expect.objectContaining({ plugin: 'missing-plugin' }),
+      );
     } finally {
       homedirSpy.mockRestore();
     }

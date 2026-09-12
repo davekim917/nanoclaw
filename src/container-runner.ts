@@ -135,6 +135,7 @@ import {
   workgroupReadAccessInstructions,
 } from './workgroup-read-access.js';
 import { resolveWorkgroupWiki, workgroupWikiInstructions } from './workgroup-wiki.js';
+import { loadPluginScopes, pluginAllowedForWorkgroup, warnUnmatchedPluginScopes } from './plugin-scopes.js';
 import YAML from 'yaml';
 
 import { extractToolScopes, filterConfigSections, isToolEnabled } from './scoped-env.js';
@@ -1859,7 +1860,7 @@ async function spawnContainer(
   // (which has none by construction) this resolves the series' delivery
   // destination so the gate judges WHERE THE TASK POSTS instead of
   // fail-closing on null. See resolveSlackSafetyMessagingGroupId.
-  await writeCapabilitiesSnapshot(agentGroup.id, session.id, slackSafetyMessagingGroupId);
+  await writeCapabilitiesSnapshot(agentGroup.id, session.id, slackSafetyMessagingGroupId, resolvedWgId);
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
 
@@ -4095,8 +4096,9 @@ function resolveGcpServiceAccountKey(credentialFolder: string): string | null {
 export async function renderCapabilitiesSnapshot(
   agentGroupId: string,
   sessionMessagingGroupId: string | null,
+  workgroupId?: string,
 ): Promise<string> {
-  const caps = await getHostCapabilities(agentGroupId, sessionMessagingGroupId);
+  const caps = await getHostCapabilities(agentGroupId, sessionMessagingGroupId, workgroupId);
   return JSON.stringify(caps, null, 2) + '\n';
 }
 
@@ -4104,9 +4106,10 @@ async function writeCapabilitiesSnapshot(
   agentGroupId: string,
   sessionId: string,
   sessionMessagingGroupId: string | null,
+  workgroupId: string,
 ): Promise<void> {
   try {
-    const rendered = await renderCapabilitiesSnapshot(agentGroupId, sessionMessagingGroupId);
+    const rendered = await renderCapabilitiesSnapshot(agentGroupId, sessionMessagingGroupId, workgroupId);
     const outPath = path.join(sessionDir(agentGroupId, sessionId), 'capabilities.json');
     fs.writeFileSync(outPath, rendered);
   } catch (err) {
@@ -4891,14 +4894,16 @@ export async function buildMounts(
     // MCP server with a different allowed root. Host/OSS-only by design.
     const IN_TREE_SHADOWED_PLUGINS = ['design-artifact-loop', 'gitnexus'];
     const excluded = new Set([...IN_TREE_SHADOWED_PLUGINS, ...(containerConfig.excludePlugins ?? [])]);
+    const pluginScopes = loadPluginScopes(); // client plugins mount only in their workgroups
     let entries: string[] = [];
     try {
       entries = fs.readdirSync(pluginsHostDir);
     } catch (err) {
       log.warn('Failed to read ~/plugins directory', { err });
     }
+    warnUnmatchedPluginScopes(pluginScopes, entries);
     for (const entry of entries) {
-      if (excluded.has(entry)) continue;
+      if (excluded.has(entry) || !pluginAllowedForWorkgroup(entry, wgKey, pluginScopes)) continue;
       const pluginHostPath = path.join(pluginsHostDir, entry);
       try {
         if (!fs.statSync(pluginHostPath).isDirectory()) continue;

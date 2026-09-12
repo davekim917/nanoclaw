@@ -1,4 +1,5 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -8,6 +9,8 @@ const GROUPS_DIR = path.join(TEST_ROOT, 'groups');
 vi.mock('./config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./config.js')>()),
   GROUPS_DIR: `${TEST_ROOT}/groups`,
+  // Hermetic: the plugin scope policy (src/plugin-scopes.ts) must never be read from the host.
+  DATA_DIR: `${TEST_ROOT}/data`,
 }));
 
 // NOT spread: log.ts installs process-wide uncaughtException/unhandledRejection
@@ -431,5 +434,41 @@ describe('workgroup wiki section (src/workgroup-wiki.ts)', () => {
     await expect(composeGroupClaudeMd(ag, 'claude', { workgroupWikiInstructions: WIKI_SECTION })).rejects.toThrow(
       'spawn-resolved workgroup ID',
     );
+  });
+});
+
+describe('workgroup-scoped plugin rulesets (src/plugin-scopes.ts)', () => {
+  it('composes a scoped plugin ruleset only for groups in its workgroups', async () => {
+    const home = path.join(TEST_ROOT, 'home');
+    for (const [plugin, sentinel] of [
+      ['client-plugin', 'SENTINEL_CLIENT_RULES_5b1d'],
+      ['shared-plugin', 'SENTINEL_SHARED_RULES_2e8a'],
+    ]) {
+      fs.mkdirSync(path.join(home, 'plugins', plugin), { recursive: true });
+      fs.writeFileSync(path.join(home, 'plugins', plugin, '.nanoclaw-always-on.md'), `${sentinel}\n`);
+    }
+    fs.mkdirSync(path.join(TEST_ROOT, 'data'), { recursive: true });
+    fs.writeFileSync(
+      path.join(TEST_ROOT, 'data', 'plugin-scopes.json'),
+      JSON.stringify({ version: 1, plugins: { 'client-plugin': ['client-wg'] } }),
+    );
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+
+    try {
+      const member = group('ag-rules-member', 'rules-member');
+      const outsider = group('ag-rules-outsider', 'rules-outsider');
+      await seed(member);
+      await seed(outsider);
+
+      await composeGroupClaudeMd(member, 'codex', { workgroupId: 'client-wg' });
+      await composeGroupClaudeMd(outsider, 'codex', { workgroupId: 'other-wg' });
+
+      const agentsDoc = (folder: string) => fs.readFileSync(path.join(GROUPS_DIR, folder, 'AGENTS.md'), 'utf-8');
+      expect(agentsDoc(member.folder)).toContain('SENTINEL_CLIENT_RULES_5b1d');
+      expect(agentsDoc(outsider.folder)).not.toContain('SENTINEL_CLIENT_RULES_5b1d');
+      expect(agentsDoc(outsider.folder)).toContain('SENTINEL_SHARED_RULES_2e8a');
+    } finally {
+      homedirSpy.mockRestore();
+    }
   });
 });

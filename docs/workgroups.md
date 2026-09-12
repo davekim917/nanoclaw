@@ -88,6 +88,47 @@ Every sibling can read the whole checkout, `.git/config` included, so keep
 credentials out of it: no token in the remote URL and no `http.extraheader`.
 Authenticate the refresh through the host's git credential helper.
 
+## Workgroup-scoped plugins
+
+`~/plugins` is fleet-wide: every agent group mounts every plugin unless its
+`container.json` `excludePlugins` names it. For a plugin that carries one
+tenant's content, that default is backwards, because a group created later
+receives it until someone remembers to exclude it. The host-owned policy
+`data/plugin-scopes.json` makes such a plugin opt-in:
+
+```json
+{ "version": 1, "plugins": { "<plugin directory name>": ["<workgroup-id>"] } }
+```
+
+A plugin named there reaches only agent groups in the listed workgroups, on
+every path plugin content takes:
+- the mount (Claude, and Codex, which registers plugins from it);
+- the always-on ruleset composed for Codex and OpenCode;
+- the Codex and OpenCode subagent mirrors and the OpenCode skill mirror, which
+  never copy a scoped plugin's agents or skills, because their targets aren't
+  keyed by workgroup. A copy made before scoping is pruned the next time that
+  mirror runs. The subagent mirrors run when a plugin pull brings changes, when
+  the codex-sync watcher sees a watched file change, and when it restarts. The
+  skill mirror runs at the next enable. To prune at once, run
+  `pnpm exec tsx scripts/sync-codex-subagents.ts` and
+  `pnpm exec tsx scripts/sync-opencode-subagents.ts`;
+- the capabilities snapshot, which names a scoped plugin only inside its
+  workgroups.
+
+Plugins the policy doesn't name keep the fleet-wide default, and
+`excludePlugins` still applies. No file means nothing is scoped. A file that
+doesn't parse stops every spawn on the host until it's fixed (queued messages
+wait and the sweep retries), the same rule as
+`data/workgroup-read-access.json`. A scoped name that matches no `~/plugins`
+directory enforces nothing, and the host logs a warning once per process. The
+policy sits outside the plugin clone, so re-cloning a plugin can't drop its
+scope. See `src/plugin-scopes.ts`.
+
+The codex-sync watcher (`nanoclaw-codex-sync`) runs as its own long-lived
+process. After deploying a change to these paths, restart it with
+`sudo systemctl restart nanoclaw-codex-sync`, or it keeps mirroring with the
+code it started with.
+
 ---
 
 ## Declaration model

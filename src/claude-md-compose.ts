@@ -38,6 +38,7 @@ import { CODEX_PROJECT_DOC_CONFIGURED_MAX_BYTES, warnIfOversized } from './codex
 import { readGroupPersona } from './group-persona.js';
 import { getDb } from './db/connection.js';
 import { log } from './log.js';
+import { loadPluginScopes, pluginAllowedForWorkgroup } from './plugin-scopes.js';
 import type { AgentGroup } from './types.js';
 
 // Fragment holding a group's standing instructions. Imported FIRST (before
@@ -170,8 +171,11 @@ export async function composeGroupClaudeMd(
   // (the /enable-agent-plugins skill authors this). Per-group opt-out reuses
   // `excludePlugins` — the same field that drops the Claude mount — so excluding
   // a plugin from a group removes it on every provider. See docs/skills-model.md.
+  // A workgroup-scoped plugin's ruleset reaches only its workgroups, matching the
+  // mount (src/plugin-scopes.ts); with no spawn-resolved workgroup it reaches none.
   if (provider !== 'claude') {
     const excluded = new Set(readContainerConfig(group.folder).excludePlugins ?? []);
+    const pluginScopes = loadPluginScopes();
     const pluginsRoot = path.join(os.homedir(), 'plugins');
     let pluginDirs: string[] = [];
     try {
@@ -180,7 +184,7 @@ export async function composeGroupClaudeMd(
       /* no ~/plugins — nothing to inject */
     }
     for (const name of pluginDirs) {
-      if (excluded.has(name)) continue;
+      if (excluded.has(name) || !pluginAllowedForWorkgroup(name, options.workgroupId, pluginScopes)) continue;
       const rulesetFile = path.join(pluginsRoot, name, '.nanoclaw-always-on.md');
       let content: string;
       try {

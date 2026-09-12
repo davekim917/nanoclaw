@@ -31,6 +31,7 @@ import { GITHUB_APP_SENTINEL, peekGitHubAppTokenExpiry } from './github-app-toke
 import { GH_TOKEN_CONTAINER_PATH, githubTokenDeliveredAsEnv } from './github-token-file.js';
 import { isOwnerSafeSlackSession } from './modules/permissions/slack-user-token-gate.js';
 import { getAllMessagingGroups } from './db/messaging-groups.js';
+import { loadPluginScopes, pluginAllowedForWorkgroup } from './plugin-scopes.js';
 import { extractToolScopes } from './scoped-env.js';
 
 // Read version once at module load.
@@ -198,6 +199,20 @@ const SCOPED_ENV_NAMES = [
   'ATLASSIAN_BASE_URL',
   'SELECT_ORGANIZATION_ID',
 ];
+
+/**
+ * Host plugins as one agent group may see them. Inside a container the
+ * snapshot must not name another workgroup's scoped plugin
+ * (src/plugin-scopes.ts), so a group snapshot filters by `workgroupId`, the
+ * spawn-resolved workgroup the plugin mount also keys on. Without one, every
+ * scoped plugin is withheld. The host-wide view (no group) lists everything.
+ */
+function installedPluginsFor(agentGroupId: string | undefined, workgroupId: string | undefined): string[] {
+  const installed = listHostPlugins();
+  if (!agentGroupId) return installed;
+  const scopes = loadPluginScopes();
+  return installed.filter((plugin) => pluginAllowedForWorkgroup(plugin, workgroupId, scopes));
+}
 
 function listHostPlugins(): string[] {
   const dir = path.join(os.homedir(), 'plugins');
@@ -894,6 +909,8 @@ export function buildSessionServicesSnapshotFrom(
 export async function getHostCapabilities(
   forAgentGroupId?: string,
   sessionMessagingGroupId?: string | null,
+  /** The spawn-resolved workgroup; filters `plugins.installed` for a group snapshot. */
+  workgroupId?: string,
 ): Promise<HostCapabilities> {
   const registered = getRegisteredChannelNames();
 
@@ -940,7 +957,7 @@ export async function getHostCapabilities(
     },
     plugins: {
       builtin: [],
-      installed: listHostPlugins(),
+      installed: installedPluginsFor(forAgentGroupId, workgroupId),
     },
     agentGroups,
     messagingGroupsByChannel: byChannel,

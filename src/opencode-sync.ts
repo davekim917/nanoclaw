@@ -29,7 +29,8 @@ import path from 'path';
 import { parseClaudeAgentMd } from './claude-agent-md.js';
 import { discoverClaudeSubagents, type DiscoveredSubagent } from './claude-subagent-discovery.js';
 import { formatOpenCodeAgentMd, isManagedOpenCodeAgent } from './opencode-agent-md.js';
-import { discoverPortableSkills, syncSkillSymlinks } from './plugin-skill-discovery.js';
+import { DEFAULT_DENY_PLUGINS, discoverPortableSkills, syncSkillSymlinks } from './plugin-skill-discovery.js';
+import { loadPluginScopes, scopedPluginNames } from './plugin-scopes.js';
 
 export interface OpenCodeSubagentsSyncResult {
   /** Every OpenCode agent/ dir we wrote into (global + per-group siblings). */
@@ -241,7 +242,17 @@ export interface OpenCodeSkillSyncResult {
  */
 export function syncOpenCodePluginSkills(): OpenCodeSkillSyncResult {
   const pluginsRoot = path.join(os.homedir(), 'plugins');
-  const discovered = discoverPortableSkills(pluginsRoot, { runtime: 'opencode' });
+  // A workgroup-scoped plugin's skills are never mirrored. Every target here is
+  // either the global dir, which any OpenCode group without its own falls back
+  // to, or a per-sibling dir not keyed by workgroup (src/plugin-scopes.ts). They
+  // are denied before discovery's first-plugin-wins name dedup, so a scoped
+  // plugin can't shadow a same-named skill in an unscoped one, and the cleanup
+  // pass prunes a copy made before scoping the next time this runs.
+  const scoped = scopedPluginNames(loadPluginScopes());
+  const discovered = discoverPortableSkills(pluginsRoot, {
+    runtime: 'opencode',
+    denyPlugins: new Set([...DEFAULT_DENY_PLUGINS, ...scoped]),
+  });
   const targets = discoverOpenCodeXdgTargets('skill');
 
   // Collect sibling support dirs (non-SKILL-md children of skills/ roots, e.g.
