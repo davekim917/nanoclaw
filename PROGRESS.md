@@ -132,5 +132,13 @@ Review: /home/ubuntu/scratch/autoagent-0912/codex-710b-review.md
   ignored, M3 ON CONFLICT DO NOTHING restored, M4 insert moved after the
   delete, M5 nativeId assignment deleted, M6 CLI exclusion deleted, M7 tool
   description reverted to the stale key order.
-- Commit 10e73c25. Next: full host + container suites, commit the ratchet,
-  push, update the PR body.
+- Commit 10e73c25; ratchet + this file as 6f90348e, both pushed.
+- Full host suite: 499/499 files, 8646 tests pass, 1 todo, ZERO failures.
+  The storage-gc.test.ts flake the PR body documented from an earlier round
+  did NOT reproduce at this head; the body now says so instead of claiming a
+  failure that is no longer there.
+- Full container suite: 1765 pass, 4 skip, 0 fail, 125 files.
+- PR body rewritten: round-3 fixes, the counterfactual table, the scoping
+  and boot-safety rationale for migration 078, and the ratchet justification
+  (5 paths, +71 diff lines, each named).
+- Round 3 COMPLETE. Not merged, not deployed, nothing restarted.
