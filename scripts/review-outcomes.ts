@@ -1341,9 +1341,19 @@ function pctStr(rate: number): string {
  * the weekly workflow's own spec), then the cumulative before/after-switch comparison
  * `computeReport` already produces — one document, one `gh issue comment` post.
  */
-export function renderWeeklyMarkdown(weekly: WeeklyReport, cumulative: ReportResult, weeksToShow = 8): string {
+export function renderWeeklyMarkdown(
+  weekly: WeeklyReport,
+  cumulative: ReportResult,
+  window: WeeklyWindowInfo,
+  weeksToShow = 8,
+  nowIso: string = new Date().toISOString(),
+): string {
   const lines: string[] = [];
   lines.push('## Review metrics (weekly)');
+  lines.push('');
+  lines.push(formatWeeklyWindowLine(window));
+  const staleWarning = formatStaleMainTipWarning(window.untilIso, nowIso);
+  if (staleWarning) lines.push(staleWarning);
   lines.push('');
   lines.push(
     "These are this file's own definitions, not a reproduction of Augment's Cosmos post — " +
@@ -1786,6 +1796,104 @@ export function resolveMainTipUntilIso(marginMs: number = UNTIL_ISO_SEARCH_INDEX
     );
   }
   return new Date(tipMs - marginMs).toISOString();
+}
+
+/** `origin/main`'s short SHA and tip committer time, read the same way
+ *  `resolveMainTipUntilIso` reads its committer date (a `git log -1` against
+ *  `origin/main`, never `HEAD`) — kept as its own small `git` call rather than folded
+ *  into `resolveMainTipUntilIso` so that function's return type and tested error
+ *  messages stay untouched. Threaded into the weekly report's window line so a human
+ *  reading the posted comment (or the plain-console form) can see the exact commit
+ *  `untilIso` was derived from, not just the derived timestamp — the #717 round-2 P3:
+ *  with only `untilIso` in `--json`'s `until` field, a hand run against a stale
+ *  `origin/main` (fetched days ago) silently cut the current week short with nothing in
+ *  the posted comment saying so.
+ */
+export interface MainTipInfo {
+  shortSha: string;
+  tipIso: string;
+}
+
+export function resolveMainTipInfo(): MainTipInfo {
+  let raw: string;
+  try {
+    raw = execFileSync('git', ['log', '-1', '--format=%h%x1f%cI', 'origin/main'], {
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch (err) {
+    throw new Error(
+      `review-outcomes: resolveMainTipInfo: could not resolve origin/main's tip commit (\`git log -1 ` +
+        `--format=%h%x1f%cI origin/main\` failed) — the weekly window line must name the checked-out ` +
+        `origin/main's own tip, never a wall-clock fallback. Underlying error: ${err instanceof Error ? err.message : String(err)}`,
+      { cause: err },
+    );
+  }
+  const sepIdx = raw.indexOf('\x1f');
+  const shortSha = sepIdx === -1 ? '' : raw.slice(0, sepIdx);
+  const tipIso = sepIdx === -1 ? '' : raw.slice(sepIdx + 1);
+  if (!shortSha || !tipIso || !Number.isFinite(new Date(tipIso).getTime())) {
+    throw new Error(
+      `review-outcomes: resolveMainTipInfo: unparseable output from \`git log -1 --format=%h%x1f%cI ` +
+        `origin/main\`: ${JSON.stringify(raw)}`,
+    );
+  }
+  return { shortSha, tipIso };
+}
+
+/** The search window this run used, plus the exact `origin/main` commit `untilIso` came
+ *  from — everything `formatWeeklyWindowLine` and `formatStaleMainTipWarning` need,
+ *  computed once in `main()` and threaded into both `renderWeeklyMarkdown` (the posted
+ *  comment) and `printWeeklyReport` (the plain-console form) so neither can silently
+ *  omit it the way `--json`'s `until` field alone did before this change.
+ */
+export interface WeeklyWindowInfo {
+  sinceIso: string;
+  untilIso: string;
+  tip: MainTipInfo;
+}
+
+/** `window: <since>..<until> (origin/main <short sha> @ <tip committer time>)` — printed
+ *  identically by both weekly outputs (the markdown comment and the plain-console
+ *  report) so a reader can always see which commit grounded the numbers, not just the
+ *  numbers themselves.
+ */
+export function formatWeeklyWindowLine(window: WeeklyWindowInfo): string {
+  return `window: ${window.sinceIso}..${window.untilIso} (origin/main ${window.tip.shortSha} @ ${window.tip.tipIso})`;
+}
+
+/** How far `origin/main`'s tip may trail the wall clock before the weekly report warns
+ *  that the checkout looks stale. `untilIso` is frozen at whatever `origin/main` pointed
+ *  to when this run's own `git log` read it (`resolveMainTipUntilIso`) — a scheduled CI
+ *  run always starts from a fresh `actions/checkout`, so this never fires there, but a
+ *  hand run against a checkout fetched hours or days ago silently cuts the current week
+ *  short with no signal in the posted comment. Deliberately well above
+ *  `UNTIL_ISO_SEARCH_INDEX_LAG_MARGIN_MS` (~2 minutes of ordinary search-index lag, not
+ *  staleness) so this only fires on genuine staleness, never on the margin itself. */
+export const STALE_MAIN_TIP_WARNING_THRESHOLD_MS = 60 * 60 * 1000;
+
+/**
+ * A warning line for both weekly outputs when `origin/main`'s tip trails the wall clock
+ * by more than `STALE_MAIN_TIP_WARNING_THRESHOLD_MS` (default 1h) — evidence the
+ * checkout this run read `untilIso` from is stale and should be re-fetched before the
+ * numbers are trusted. Returns `null` (never throws) when the gap is within the
+ * threshold: this is a warning, not a gate, and a stale checkout is never a reason to
+ * fail the run.
+ */
+export function formatStaleMainTipWarning(
+  untilIso: string,
+  nowIso: string = new Date().toISOString(),
+  thresholdMs: number = STALE_MAIN_TIP_WARNING_THRESHOLD_MS,
+): string | null {
+  const lagMs = new Date(nowIso).getTime() - new Date(untilIso).getTime();
+  if (lagMs <= thresholdMs) return null;
+  const lagHours = (lagMs / (60 * 60 * 1000)).toFixed(1);
+  return (
+    `WARNING: origin/main looks stale — its tip is ${lagHours}h behind wall-clock time, well past the ` +
+    `~2-minute search-index-lag margin. Fetch origin/main and re-run before trusting this window; a ` +
+    'hand run against a stale checkout can silently cut the current week short.'
+  );
 }
 
 export function fetchMergedPRs(repo: string, sinceIso: string, untilIso: string): PullRequestData[] {
@@ -2480,11 +2588,18 @@ export function computeWeeklyFetchSinceIso(untilIso: string, weeklyDays: number)
   return new Date(new Date(untilIso).getTime() - weeklyDays * MS_PER_DAY).toISOString();
 }
 
-function printWeeklyReport(weekly: WeeklyReport): void {
+export function printWeeklyReport(
+  weekly: WeeklyReport,
+  window: WeeklyWindowInfo,
+  nowIso: string = new Date().toISOString(),
+): void {
   console.log(
     `review-outcomes --weekly: gate go-live = ${GATE_GO_LIVE_ISO}, Fixes-PR convention start = ${weekly.conventionStartIso}`,
   );
   console.log("(these are this file's own definitions — not directly comparable to Augment Cosmos's figures)");
+  console.log(formatWeeklyWindowLine(window));
+  const staleWarning = formatStaleMainTipWarning(window.untilIso, nowIso);
+  if (staleWarning) console.log(staleWarning);
   console.log('');
   for (const row of weekly.rows) {
     const gate = row.isMixedGateWeek ? 'mixed' : row.preGateMerged > 0 ? 'pre-gate' : 'post-gate';
@@ -2552,6 +2667,12 @@ function main(): void {
       new Date(weeklySinceIso).getTime() < new Date(beforeAfterSinceIso).getTime()
         ? weeklySinceIso
         : beforeAfterSinceIso;
+    // Read right alongside `untilIso` above (same `origin/main`, nothing re-fetches it
+    // mid-run) so the window line printed below always names the exact commit
+    // `untilIso` came from — see `resolveMainTipInfo`'s own doc comment for why this
+    // is a second small `git log` rather than a change to `resolveMainTipUntilIso`'s
+    // tested return shape.
+    const windowInfo: WeeklyWindowInfo = { sinceIso, untilIso, tip: resolveMainTipInfo() };
     const fetchedPRs = fetchMergedPRs(options.repo, sinceIso, untilIso);
     const shadowReviewIssues = fetchShadowReviewIssues(options.repo);
     const shadowReviewFailedPrNumbers = fetchShadowReviewFailedPRs(options.repo);
@@ -2597,14 +2718,14 @@ function main(): void {
             until: untilIso,
             weekly,
             cumulative,
-            markdown: renderWeeklyMarkdown(weekly, cumulative),
+            markdown: renderWeeklyMarkdown(weekly, cumulative, windowInfo),
           },
           null,
           2,
         ),
       );
     } else {
-      printWeeklyReport(weekly);
+      printWeeklyReport(weekly, windowInfo);
       console.log('');
       printReport(cumulative);
     }

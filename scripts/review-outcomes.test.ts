@@ -33,6 +33,8 @@ import {
   findFollowUp,
   findRevert,
   FIXES_PR_CONVENTION_START_ISO,
+  formatStaleMainTipWarning,
+  formatWeeklyWindowLine,
   GATE_GO_LIVE_ISO,
   generatedFileChangedLines,
   globsForRiskHigh,
@@ -49,6 +51,7 @@ import {
   matchesAnyGlob,
   mergeCommitParentsLocal,
   parseGitNameStatus,
+  printWeeklyReport,
   readRiskHighGlobsAtShaLocal,
   replayLabelsAtMerge,
   renderWeeklyMarkdown,
@@ -56,12 +59,15 @@ import {
   resolveAtMergeFileContextLocal,
   resolveMainTipUntilIso,
   SHADOW_REVIEW_GO_LIVE_ISO,
+  STALE_MAIN_TIP_WARNING_THRESHOLD_MS,
   stripFencedAndCommented,
   UNTIL_ISO_SEARCH_INDEX_LAG_MARGIN_MS,
   verifyMergedPrTotalCount,
+  type MainTipInfo,
   type Options,
   type PullRequestData,
   type ShadowReviewIssueData,
+  type WeeklyWindowInfo,
   weeklyRevertRate,
 } from './review-outcomes.js';
 
@@ -71,6 +77,19 @@ import {
 // allowed; `gh` stays blocked, which the GraphQL-failure test below relies on directly.
 enforceHermeticity();
 allowSubprocess(['git']);
+
+function testMainTip(overrides: Partial<MainTipInfo> = {}): MainTipInfo {
+  return { shortSha: 'abc1234', tipIso: '2026-09-12T00:00:00Z', ...overrides };
+}
+
+function testWindow(overrides: Partial<WeeklyWindowInfo> = {}): WeeklyWindowInfo {
+  return {
+    sinceIso: '2026-08-01T00:00:00Z',
+    untilIso: '2026-09-12T00:00:00Z',
+    tip: testMainTip(),
+    ...overrides,
+  };
+}
 
 function pr(overrides: Partial<PullRequestData> & { number: number }): PullRequestData {
   return {
@@ -1403,7 +1422,7 @@ describe('renderWeeklyMarkdown', () => {
       json: false,
     };
     const cumulative = computeReport(prs, [], options);
-    const markdown = renderWeeklyMarkdown(weekly, cumulative, 8);
+    const markdown = renderWeeklyMarkdown(weekly, cumulative, testWindow(), 8);
     expect(weekly.rows).toHaveLength(10);
     expect(markdown).toContain('Last 8 week(s) of 10 total');
     // The two oldest weeks are sliced off; only the eight most recent isoWeek keys appear.
@@ -1417,9 +1436,94 @@ describe('renderWeeklyMarkdown', () => {
     const weekly = computeWeeklyReport(prs, [], 14, '2026-09-12T00:00:00Z');
     const options: Options = { repo: 'x/y', switchIso: '2026-09-10T00:00:00Z', days: 5, followupDays: 14, json: false };
     const cumulative = computeReport(prs, [], options);
-    const markdown = renderWeeklyMarkdown(weekly, cumulative, 8);
+    const markdown = renderWeeklyMarkdown(weekly, cumulative, testWindow(), 8);
     expect(markdown).toContain('Cumulative');
     expect(markdown).toContain(cumulative.switchIso);
+  });
+
+  it('#717 review round 2 (P3): includes the window line naming since/until and the origin/main commit untilIso came from', () => {
+    const prs = [pr({ number: 1, mergedAt: '2026-09-08T00:00:00Z' })];
+    const weekly = computeWeeklyReport(prs, [], 14, '2026-09-12T00:00:00Z');
+    const options: Options = { repo: 'x/y', switchIso: '2026-09-10T00:00:00Z', days: 5, followupDays: 14, json: false };
+    const cumulative = computeReport(prs, [], options);
+    const window = testWindow({
+      sinceIso: '2026-08-01T00:00:00.000Z',
+      untilIso: '2026-09-12T00:00:00.000Z',
+      tip: testMainTip({ shortSha: 'deadbee', tipIso: '2026-09-12T00:02:00.000Z' }),
+    });
+    // Fresh relative to the window's own `untilIso`, so no stale warning muddies this
+    // assertion — that path is covered by the dedicated stale-warning tests below.
+    const markdown = renderWeeklyMarkdown(weekly, cumulative, window, 8, '2026-09-12T00:05:00.000Z');
+    expect(markdown).toContain(formatWeeklyWindowLine(window));
+    expect(markdown).toContain(
+      'window: 2026-08-01T00:00:00.000Z..2026-09-12T00:00:00.000Z (origin/main deadbee @ 2026-09-12T00:02:00.000Z)',
+    );
+  });
+
+  it('#717 review round 2 (P3): the stale-origin/main warning appears past the threshold and not below it', () => {
+    const prs = [pr({ number: 1, mergedAt: '2026-09-08T00:00:00Z' })];
+    const weekly = computeWeeklyReport(prs, [], 14, '2026-09-12T00:00:00Z');
+    const options: Options = { repo: 'x/y', switchIso: '2026-09-10T00:00:00Z', days: 5, followupDays: 14, json: false };
+    const cumulative = computeReport(prs, [], options);
+    const untilIso = '2026-09-12T00:00:00.000Z';
+    const window = testWindow({ untilIso });
+
+    // Exactly at the threshold: no warning.
+    const atThresholdNowIso = new Date(new Date(untilIso).getTime() + STALE_MAIN_TIP_WARNING_THRESHOLD_MS).toISOString();
+    const notStaleMarkdown = renderWeeklyMarkdown(weekly, cumulative, window, 8, atThresholdNowIso);
+    expect(notStaleMarkdown).not.toContain('origin/main looks stale');
+
+    // One millisecond past the threshold: warning appears.
+    const pastThresholdNowIso = new Date(
+      new Date(untilIso).getTime() + STALE_MAIN_TIP_WARNING_THRESHOLD_MS + 1,
+    ).toISOString();
+    const staleMarkdown = renderWeeklyMarkdown(weekly, cumulative, window, 8, pastThresholdNowIso);
+    expect(staleMarkdown).toContain('origin/main looks stale');
+    expect(staleMarkdown).toMatch(/fetch/i);
+  });
+});
+
+describe('printWeeklyReport', () => {
+  it('#717 review round 2 (P3): prints the window line, and the stale warning only past the threshold', () => {
+    const prs = [pr({ number: 1, mergedAt: '2026-09-08T00:00:00Z' })];
+    const weekly = computeWeeklyReport(prs, [], 14, '2026-09-12T00:00:00Z');
+    const untilIso = '2026-09-12T00:00:00.000Z';
+    const window = testWindow({ untilIso });
+
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      printWeeklyReport(weekly, window, untilIso); // fresh — nowIso == untilIso
+      const freshOutput = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(freshOutput).toContain(formatWeeklyWindowLine(window));
+      expect(freshOutput).not.toContain('origin/main looks stale');
+
+      logSpy.mockClear();
+      const staleNowIso = new Date(
+        new Date(untilIso).getTime() + STALE_MAIN_TIP_WARNING_THRESHOLD_MS + 1,
+      ).toISOString();
+      printWeeklyReport(weekly, window, staleNowIso);
+      const staleOutput = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(staleOutput).toContain(formatWeeklyWindowLine(window));
+      expect(staleOutput).toContain('origin/main looks stale');
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+});
+
+describe('formatStaleMainTipWarning — mutation coverage for the staleness comparison', () => {
+  it('is null at and below the threshold, non-null just past it', () => {
+    const untilIso = '2026-09-12T00:00:00.000Z';
+    const atThreshold = new Date(new Date(untilIso).getTime() + STALE_MAIN_TIP_WARNING_THRESHOLD_MS).toISOString();
+    const justPast = new Date(
+      new Date(untilIso).getTime() + STALE_MAIN_TIP_WARNING_THRESHOLD_MS + 1,
+    ).toISOString();
+    const wellBelow = new Date(new Date(untilIso).getTime() + 1000).toISOString();
+
+    expect(formatStaleMainTipWarning(untilIso, wellBelow)).toBeNull();
+    expect(formatStaleMainTipWarning(untilIso, atThreshold)).toBeNull();
+    expect(formatStaleMainTipWarning(untilIso, justPast)).not.toBeNull();
+    expect(formatStaleMainTipWarning(untilIso, justPast)).toContain('origin/main looks stale');
   });
 });
 
