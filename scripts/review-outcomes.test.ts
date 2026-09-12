@@ -7,20 +7,27 @@ import {
   computeFetchSinceIso,
   computeReport,
   computeShadowCoverage,
+  computeWeeklyFetchSinceIso,
+  computeWeeklyReport,
   extractFixesPrNumber,
   extractShadowReviewPrNumber,
   filesOverlap,
+  findConventionStartIso,
   findFollowUp,
   findRevert,
   globsForRiskHigh,
+  hasFixesPrLine,
   isEligibleForShadowReview,
   isFixTitle,
   isLowRisk,
+  isoWeekDateRange,
   isoWeekKey,
+  isSkipVerdict,
   issueHasP1,
   isRevertOf,
   isRevertPR,
   matchesAnyGlob,
+  renderWeeklyMarkdown,
   SHADOW_REVIEW_GO_LIVE_ISO,
   type Options,
   type PullRequestData,
@@ -40,6 +47,7 @@ function pr(overrides: Partial<PullRequestData> & { number: number }): PullReque
     files: [],
     labels: [],
     baseRefName: 'main',
+    changedLines: 0,
     ...overrides,
   };
 }
@@ -666,5 +674,269 @@ describe('computeFetchSinceIso', () => {
     // switch - days = 2026-10-01, well after go-live — only the default takes effect here.
     const since = computeFetchSinceIso('2026-10-01T00:00:00Z', 0);
     expect(since).toBe(new Date(SHADOW_REVIEW_GO_LIVE_ISO).toISOString());
+  });
+});
+
+describe('hasFixesPrLine', () => {
+  it('is true for a linked Fixes-PR line', () => {
+    expect(hasFixesPrLine('body\nFixes-PR: #10\nmore')).toBe(true);
+  });
+
+  it('is true for Fixes-PR: none — the convention was followed, even though there is no link', () => {
+    expect(hasFixesPrLine('Fixes-PR: none')).toBe(true);
+  });
+
+  it('is false when the trailer is absent entirely', () => {
+    expect(hasFixesPrLine('nothing here')).toBe(false);
+  });
+});
+
+describe('findConventionStartIso', () => {
+  it('returns the mergedAt of the earliest PR carrying a Fixes-PR line, by merge time not array order', () => {
+    const prs = [
+      pr({ number: 1, mergedAt: '2026-09-05T00:00:00Z', body: '' }), // no line, later merge — irrelevant
+      pr({ number: 2, mergedAt: '2026-09-03T00:00:00Z', body: 'Fixes-PR: none' }), // earliest WITH a line
+      pr({ number: 3, mergedAt: '2026-09-04T00:00:00Z', body: 'Fixes-PR: #1' }),
+    ];
+    expect(findConventionStartIso(prs)).toBe('2026-09-03T00:00:00Z');
+  });
+
+  it('counts a Fixes-PR: none line as evidence the convention started, not just a link', () => {
+    expect(findConventionStartIso([pr({ number: 1, mergedAt: '2026-09-03T00:00:00Z', body: 'Fixes-PR: none' })])).toBe(
+      '2026-09-03T00:00:00Z',
+    );
+  });
+
+  it('returns null when no PR carries the line', () => {
+    expect(findConventionStartIso([pr({ number: 1, body: '' }), pr({ number: 2, body: 'unrelated' })])).toBeNull();
+  });
+
+  it('returns null for an empty list', () => {
+    expect(findConventionStartIso([])).toBeNull();
+  });
+});
+
+describe('isSkipVerdict', () => {
+  const RISK_GLOBS = ['src/guard/**'];
+
+  it('is true (skip) for a low-risk PR with no risk:high/review:requested label — codex-review.sh:765-767', () => {
+    expect(isSkipVerdict(pr({ number: 1, files: ['docs/a.md'], labels: [] }), RISK_GLOBS)).toBe(true);
+  });
+
+  it('is false (review) when the diff matches a risk:high glob, replaying the file half of the rule', () => {
+    expect(isSkipVerdict(pr({ number: 1, files: ['src/guard/x.ts'], labels: [] }), RISK_GLOBS)).toBe(false);
+  });
+
+  it('is false (review) when the PR carries review:requested despite low-risk files', () => {
+    expect(isSkipVerdict(pr({ number: 1, files: ['docs/a.md'], labels: ['review:requested'] }), RISK_GLOBS)).toBe(
+      false,
+    );
+  });
+
+  it('is false (review) when the PR carries risk:high despite low-risk files', () => {
+    expect(isSkipVerdict(pr({ number: 1, files: ['docs/a.md'], labels: ['risk:high'] }), RISK_GLOBS)).toBe(false);
+  });
+});
+
+describe('isoWeekDateRange', () => {
+  it('round-trips with isoWeekKey for a known week', () => {
+    const { startIso, endIso } = isoWeekDateRange('2026-W37');
+    expect(startIso).toBe('2026-09-07T00:00:00.000Z');
+    expect(endIso).toBe('2026-09-13T23:59:59.999Z');
+    expect(isoWeekKey(startIso)).toBe('2026-W37');
+    expect(isoWeekKey(endIso)).toBe('2026-W37');
+  });
+
+  it('round-trips across a year boundary (week 1 starts in the prior calendar year)', () => {
+    const { startIso, endIso } = isoWeekDateRange('2025-W01');
+    expect(startIso).toBe('2024-12-30T00:00:00.000Z');
+    expect(endIso).toBe('2025-01-05T23:59:59.999Z');
+    expect(isoWeekKey(startIso)).toBe('2025-W01');
+    expect(isoWeekKey(endIso)).toBe('2025-W01');
+  });
+
+  it('throws on an invalid week key', () => {
+    expect(() => isoWeekDateRange('garbage')).toThrow(/invalid ISO week key/);
+  });
+});
+
+describe('computeWeeklyFetchSinceIso', () => {
+  it('subtracts weeklyDays from nowIso', () => {
+    expect(computeWeeklyFetchSinceIso('2026-09-12T00:00:00Z', 90)).toBe(new Date('2026-06-14T00:00:00Z').toISOString());
+  });
+});
+
+describe('computeWeeklyReport', () => {
+  const RISK_GLOBS = ['src/guard/**'];
+
+  it('buckets PRs into one row per ISO week, ascending, across a year boundary', () => {
+    const prs = [
+      pr({ number: 1, mergedAt: '2024-12-31T00:00:00Z' }), // 2025-W01
+      pr({ number: 2, mergedAt: '2025-01-06T00:00:00Z' }), // 2025-W02
+    ];
+    const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-01-01T00:00:00Z');
+    expect(weekly.rows.map((r) => r.isoWeek)).toEqual(['2025-W01', '2025-W02']);
+    expect(weekly.rows[0]!.merged).toBe(1);
+    expect(weekly.rows[1]!.merged).toBe(1);
+  });
+
+  it('excludes a PR merged into a branch other than main', () => {
+    const prs = [
+      pr({ number: 1, mergedAt: '2026-09-08T00:00:00Z', baseRefName: 'release' }),
+      pr({ number: 2, mergedAt: '2026-09-08T00:00:00Z', baseRefName: 'main' }),
+    ];
+    const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-12T00:00:00Z');
+    expect(weekly.rows).toHaveLength(1);
+    expect(weekly.rows[0]!.merged).toBe(1);
+  });
+
+  // The full scenario below is the one verified by hand (tsx one-liner) while building
+  // this function: 3 PRs merge in 2026-W37 (one high-risk, one low-risk-but-labeled
+  // review:requested, one plain low-risk skip), and two "fix" PRs merge the following
+  // week — one linking back via Fixes-PR (ground truth), one only sharing a file with a
+  // fix-shaped title (the overlap heuristic, which must stay a SEPARATE count).
+  describe('a realistic week with both lanes and both follow-up kinds', () => {
+    const prs = [
+      pr({
+        number: 1,
+        title: 'fix(guard): a',
+        mergedAt: '2026-09-08T00:00:00Z',
+        files: ['src/guard/x.ts'],
+        changedLines: 500,
+      }), // reviewed — high-risk file
+      pr({
+        number: 2,
+        title: 'feat: b',
+        mergedAt: '2026-09-09T00:00:00Z',
+        files: ['docs/b.md'],
+        labels: ['review:requested'],
+        changedLines: 300,
+      }), // reviewed — labeled, despite low-risk files
+      pr({
+        number: 3,
+        title: 'feat: c',
+        mergedAt: '2026-09-10T00:00:00Z',
+        files: ['docs/c.md'],
+        changedLines: 1200,
+      }), // skipped
+      pr({ number: 4, title: 'fix: patch a', mergedAt: '2026-09-15T00:00:00Z', body: 'Fixes-PR: #1', files: [] }),
+      pr({ number: 5, title: 'fix: patch c', mergedAt: '2026-09-16T00:00:00Z', files: ['docs/c.md'] }),
+    ];
+    const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-12T00:00:00Z');
+    const row = weekly.rows[0]!;
+
+    it('splits merged PRs into reviewed/skipped lanes', () => {
+      expect(row.isoWeek).toBe('2026-W37');
+      expect(row.merged).toBe(3);
+      expect(row.reviewed).toBe(2);
+      expect(row.skipped).toBe(1);
+    });
+
+    it('counts link-matched and overlap-heuristic follow-ups separately, overall', () => {
+      expect(row.overall.linked).toBe(1);
+      expect(row.overall.overlapHeuristic).toBe(1);
+    });
+
+    it('reports the bug-introducing rate per lane, not just overall', () => {
+      // #1 (reviewed) was linked by #4 — the reviewed lane's only member, so linked=1/1.
+      expect(row.reviewedLane.merged).toBe(2);
+      expect(row.reviewedLane.linked).toBe(1);
+      expect(row.reviewedLane.overlapHeuristic).toBe(0);
+      // #3 (skipped) was only overlap-matched by #5 (shares docs/c.md, fix-shaped title).
+      expect(row.skippedLane.merged).toBe(1);
+      expect(row.skippedLane.linked).toBe(0);
+      expect(row.skippedLane.overlapHeuristic).toBe(1);
+    });
+
+    it('computes the linked rate per 1,000 changed lines from the linked (ground-truth) count only', () => {
+      // changedLines = 500 + 300 + 1200 = 2000; overall.linked = 1 -> 1 / (2000/1000) = 0.5.
+      expect(row.changedLines).toBe(2000);
+      expect(row.linkedPerKLoc).toBe(0.5);
+    });
+
+    it('flags the week heuristic-only: it ends before the Fixes-PR convention started', () => {
+      // The convention's first sighting is #4's body, merged 2026-09-15 — after this
+      // week (2026-W37) already ended (2026-09-13T23:59:59.999Z).
+      expect(weekly.conventionStartIso).toBe('2026-09-15T00:00:00Z');
+      expect(row.heuristicOnly).toBe(true);
+    });
+
+    it('does not flag the following week heuristic-only once its end is at/after convention start', () => {
+      const nextWeek = weekly.rows[1]!;
+      expect(nextWeek.isoWeek).toBe('2026-W38');
+      expect(nextWeek.heuristicOnly).toBe(false);
+    });
+  });
+
+  it('flags every week heuristic-only when no PR has ever carried a Fixes-PR line', () => {
+    const prs = [pr({ number: 1, mergedAt: '2026-09-08T00:00:00Z' })];
+    const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-12T00:00:00Z');
+    expect(weekly.conventionStartIso).toBeNull();
+    expect(weekly.rows[0]!.heuristicOnly).toBe(true);
+  });
+
+  it('computes the weekly revert rate at the row level', () => {
+    const prs = [
+      pr({ number: 1, title: 'feat: a', mergedAt: '2026-09-08T00:00:00Z' }),
+      pr({ number: 2, title: 'revert: back out #1', mergedAt: '2026-09-09T00:00:00Z' }),
+    ];
+    const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-12T00:00:00Z');
+    expect(weekly.rows[0]!.reverted).toBe(1);
+    expect(weekly.rows[0]!.revertRate).toBe(0.5);
+  });
+
+  it('handles changedLines of 0 without dividing by zero', () => {
+    const prs = [pr({ number: 1, mergedAt: '2026-09-08T00:00:00Z', changedLines: 0 })];
+    const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-12T00:00:00Z');
+    expect(weekly.rows[0]!.linkedPerKLoc).toBe(0);
+  });
+
+  describe('the immature flag', () => {
+    // 2026-W37 ends 2026-09-13T23:59:59.999Z; +14 days = 2026-09-27T23:59:59.999Z.
+    const prs = [pr({ number: 1, mergedAt: '2026-09-08T00:00:00Z' })];
+
+    it('is true one millisecond before followupDays have passed since the week ended', () => {
+      const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-27T23:59:59.998Z');
+      expect(weekly.rows[0]!.immature).toBe(true);
+    });
+
+    it('is false exactly when followupDays have passed since the week ended', () => {
+      const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-27T23:59:59.999Z');
+      expect(weekly.rows[0]!.immature).toBe(false);
+    });
+  });
+});
+
+describe('renderWeeklyMarkdown', () => {
+  it('shows only the most recent weeksToShow rows out of a longer history, plainly stating n', () => {
+    const prs = Array.from({ length: 10 }, (_, i) =>
+      pr({ number: i + 1, mergedAt: new Date(Date.UTC(2026, 0, 1) + i * 7 * 24 * 60 * 60 * 1000).toISOString() }),
+    );
+    const weekly = computeWeeklyReport(prs, [], 14, '2027-01-01T00:00:00Z');
+    const options: Options = {
+      repo: 'x/y',
+      switchIso: '2026-02-01T00:00:00Z',
+      days: 30,
+      followupDays: 14,
+      json: false,
+    };
+    const cumulative = computeReport(prs, [], options);
+    const markdown = renderWeeklyMarkdown(weekly, cumulative, 8);
+    expect(weekly.rows).toHaveLength(10);
+    expect(markdown).toContain('Last 8 week(s) of 10 total');
+    // The two oldest weeks are sliced off; only the eight most recent isoWeek keys appear.
+    expect(markdown).not.toContain(weekly.rows[0]!.isoWeek);
+    expect(markdown).not.toContain(weekly.rows[1]!.isoWeek);
+    expect(markdown).toContain(weekly.rows[9]!.isoWeek);
+  });
+
+  it('includes the cumulative before/after comparison', () => {
+    const prs = [pr({ number: 1, mergedAt: '2026-09-08T00:00:00Z' })];
+    const weekly = computeWeeklyReport(prs, [], 14, '2026-09-12T00:00:00Z');
+    const options: Options = { repo: 'x/y', switchIso: '2026-09-10T00:00:00Z', days: 5, followupDays: 14, json: false };
+    const cumulative = computeReport(prs, [], options);
+    const markdown = renderWeeklyMarkdown(weekly, cumulative, 8);
+    expect(markdown).toContain('Cumulative');
+    expect(markdown).toContain(cumulative.switchIso);
   });
 });

@@ -1,0 +1,99 @@
+# Weekly review-quality time series — docs/specs/risk-based-review/plan.md,
+# "Measurement". Runs scripts/review-outcomes.ts's `--weekly` mode and posts ONE
+# comment per run on the "Review metrics (weekly)" tracking issue (label
+# `review-metrics`), so the ~2026-10-10 check (30 days after the switch to
+# risk-scoped review) has a comparable weekly series on record rather than a
+# single retroactive read.
+#
+# Triggers: the weekly schedule, and `workflow_dispatch` for an on-demand run
+# (e.g. re-posting after a labeler.yml change). Both are pinned to `main`: the
+# `if:` accepts a scheduled run unconditionally (schedule always fires against
+# the default branch) or a dispatch run only when `github.ref` is
+# `refs/heads/main` — dispatching this workflow from any other ref (a branch
+# that also edits this file) never posts to the tracking issue. `checkout`
+# pins `ref: main` for the same reason a dispatch from elsewhere must still
+# read and run main's own copy of the script, not the dispatching ref's.
+#
+# Permissions: `contents: read` to check out the repo and let
+# scripts/review-outcomes.ts read `.github/labeler.yml` via the GitHub API
+# (`gh api repos/.../contents/...`), `issues: write` to post the comment, and
+# `pull-requests: read` — not in the brief's original two-permission list, but
+# `gh pr list` (fetchMergedPRs, fetchShadowReviewFailedPRs,
+# fetchShadowReviewedPRs — every PR-reading call the script makes) 403s
+# without it once a `permissions:` block is declared at all; shadow-review.yml
+# and main-provenance.yml's own `analyze`/`provenance` jobs already carry this
+# same scope for the same reason. No Claude/Anthropic token anywhere in this
+# workflow — only the default `GITHUB_TOKEN` (`github.token`), read via `gh`'s
+# own `GH_TOKEN` env convention.
+#
+# Budget: this repo is on a private-plan Actions quota (see ci.yml's own
+# comment on the same constraint). `--weekly-days` defaults to 90, bounding
+# the fetch to roughly 13 weeks of PR history rather than this repo's full
+# lifetime, and `--json` computes the weekly rows, the cumulative before/after
+# comparison, AND the ready-to-post markdown in the SAME fetch (see
+# `renderWeeklyMarkdown` / the `main()` weekly branch in
+# scripts/review-outcomes.ts) — one `gh`-fetching process, not two.
+
+name: Review metrics (weekly)
+
+on:
+  schedule:
+    # Monday 09:00 UTC.
+    - cron: '0 9 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: review-metrics-weekly
+  cancel-in-progress: true
+
+jobs:
+  report:
+    if: github.event_name == 'schedule' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Compute the weekly review-metrics report
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pnpm exec tsx scripts/review-outcomes.ts --weekly --json > /tmp/review-metrics.json
+          node -e "
+            const fs = require('fs');
+            const report = JSON.parse(fs.readFileSync('/tmp/review-metrics.json', 'utf8'));
+            fs.writeFileSync('/tmp/review-metrics.md', report.markdown);
+          "
+
+      - name: Post the weekly comment on the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Found by label, not a hardcoded number: the tracking issue is created once,
+          # by hand (see the PR body / docs/specs/risk-based-review/plan.md), and this
+          # workflow only ever needs to find it again.
+          issue=$(gh issue list --repo "$REPO" --label review-metrics --state open --json number --jq '.[0].number // empty')
+          if [ -z "$issue" ]; then
+            echo "::error::no OPEN issue labeled review-metrics found — create it once with: gh issue create -R $REPO --title \"Review metrics (weekly)\" --label review-metrics" >&2
+            exit 1
+          fi
+          gh issue comment "$issue" --repo "$REPO" --body-file /tmp/review-metrics.md

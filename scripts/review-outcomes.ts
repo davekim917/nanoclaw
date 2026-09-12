@@ -125,6 +125,7 @@ export interface PullRequestData {
   files: string[];
   labels: string[]; // CURRENT labels, not a merge-time snapshot — see "Shadow coverage" below
   baseRefName: string; // e.g. "main" — shadow-review.yml only selects PRs merged INTO main
+  changedLines: number; // additions + deletions — the weekly report's "per output unit" denominator
 }
 
 export interface Options {
@@ -133,6 +134,10 @@ export interface Options {
   days: number;
   followupDays: number;
   json: boolean;
+  // Weekly-mode-only fields. Optional so the before/after mode's existing Options
+  // literals (this file's own tests included) need not name them.
+  weekly?: boolean;
+  weeklyDays?: number;
 }
 
 export interface BucketResult {
@@ -236,6 +241,38 @@ export function extractFixesPrNumber(body: string): number | null {
   const match = FIXES_PR_LINE_RE.exec(body);
   if (!match) return null;
   return match[3] ? Number(match[3]) : null;
+}
+
+/**
+ * Whether `body` carries a `Fixes-PR:` line at all — `#<n>` OR the literal `none`.
+ * Distinct from `extractFixesPrNumber`, which returns `null` for BOTH "no line" and
+ * "line says none": the weekly report needs to tell those two apart to find when the
+ * convention started (`findConventionStartIso`), which a PR merged with `Fixes-PR: none`
+ * still counts as evidence of — the trailer existed and was filled in, deliberately, as
+ * "not a fix".
+ */
+export function hasFixesPrLine(body: string): boolean {
+  return FIXES_PR_LINE_RE.test(body);
+}
+
+/**
+ * When the `Fixes-PR:` convention started: the `mergedAt` of the earliest-merged PR
+ * (by merge time, not fetch order) whose body carries the line at all (link or `none`
+ * — see `hasFixesPrLine`). `null` when no PR in `prs` carries it yet. The weekly report
+ * flags every week that ends before this instant `heuristicOnly` (see
+ * `computeWeeklyReport`): `Fixes-PR:` links are read as ground truth only once the
+ * convention was actually in force, per plan.md's Measurement section ("Where a link is
+ * missing, file overlap is the fallback").
+ */
+export function findConventionStartIso(prs: readonly PullRequestData[]): string | null {
+  let earliest: string | null = null;
+  for (const pr of prs) {
+    if (!hasFixesPrLine(pr.body)) continue;
+    if (earliest === null || new Date(pr.mergedAt).getTime() < new Date(earliest).getTime()) {
+      earliest = pr.mergedAt;
+    }
+  }
+  return earliest;
 }
 
 /**
@@ -399,12 +436,32 @@ const REVIEW_REQUESTED_LABEL = 'review:requested';
  * job-level `if:`, shadow-review.yml:350-356): eligible for shadow review when CURRENT
  * labels include neither `risk:high` nor `review:requested`. The base-ref half of that
  * same `if:` (`github.event.pull_request.base.ref == 'main'`) is checked separately in
- * `computeShadowCoverage` via `baseRefName`, since it isn't a label. Used only by
- * `computeShadowCoverage` — the before/after bucket keeps the file-based glob replay
- * (see file header).
+ * `computeShadowCoverage` via `baseRefName`, since it isn't a label. Used by
+ * `computeShadowCoverage` (the before/after bucket keeps the file-based glob replay, see
+ * file header) and by `isSkipVerdict` below, which composes it with `isLowRisk` to
+ * replay the merge gate's OWN skip-verdict rule.
  */
 export function isEligibleForShadowReview(labels: string[]): boolean {
   return !labels.includes(RISK_HIGH_LABEL) && !labels.includes(REVIEW_REQUESTED_LABEL);
+}
+
+/**
+ * Replays `codex-review.sh`'s `scope_eval` skip-verdict rule (`codex-review.sh:750`,
+ * `:765-767`): a PR merges on `verdict=skip` — no review requested at all — iff no
+ * changed file matches a `risk:high` glob AND the PR carries neither the `risk:high` nor
+ * the `review:requested` label. Both halves already exist as their own exported
+ * functions: `isLowRisk` replays the file-glob half (the same glob replay
+ * `risk-label.yml` and the merge gate itself use), and `isEligibleForShadowReview` is the
+ * identical label check `shadow-review.yml`'s own selection rule uses. Composing them
+ * here — rather than re-deriving the rule a third time — is the whole point: the
+ * weekly report's reviewed/skipped lane split can never drift from what the gate itself
+ * decided at merge time for a given diff and label set.
+ *
+ * Same caveat as `computeShadowCoverage` (`LABEL_DRIFT_CAVEAT`): `labels` is read as
+ * CURRENT labels, which can drift from what they were at merge time.
+ */
+export function isSkipVerdict(pr: PullRequestData, riskHighGlobs: string[]): boolean {
+  return isLowRisk(pr.files, riskHighGlobs) && isEligibleForShadowReview(pr.labels);
 }
 
 /** `shadow-review.yml`'s `report` job only ever runs against PRs merged into this branch. */
@@ -692,6 +749,275 @@ export function computeReport(
   };
 }
 
+// ─────────────────────────── weekly mode ───────────────────────────────────
+//
+// `--weekly` is a different SHAPE over the same population and the same classification
+// functions above — one row per ISO week of PRs merged into `main`, not a single
+// before/after split. It answers the tracking-issue question directly: for THIS week,
+// how many PRs merged reviewed vs skipped, how many reverted, and how many drew a
+// follow-up fix, at both the PR-count grain and per 1,000 changed lines (Cosmos's "per
+// output unit"). Nothing here re-derives matching logic: every row is built from
+// `isSkipVerdict`, `findFollowUp`, `isRevertPR` and `isoWeekKey`, the same functions the
+// before/after bucket and `weeklyRevertRate` already use.
+
+/** One lane's (overall / reviewed / skipped) follow-up counts for one week. */
+export interface WeeklyLaneStats {
+  merged: number;
+  linked: number;
+  linkedRate: number;
+  overlapHeuristic: number;
+  overlapHeuristicRate: number;
+}
+
+export interface WeeklyReviewRow {
+  isoWeek: string;
+  weekStartIso: string;
+  weekEndIso: string; // inclusive — the last millisecond of that ISO week, UTC
+  merged: number;
+  reviewed: number;
+  reviewedRate: number;
+  skipped: number;
+  skippedRate: number;
+  reverted: number;
+  revertRate: number;
+  changedLines: number;
+  overall: WeeklyLaneStats;
+  reviewedLane: WeeklyLaneStats;
+  skippedLane: WeeklyLaneStats;
+  /** Overall linked (ground-truth) bug-introducing count per 1,000 changed lines. 0 when
+   *  `changedLines` is 0 — an all-deletion or metadata-only week, not a divide-by-zero. */
+  linkedPerKLoc: number;
+  /** `--followup-days` have not yet passed since `weekEndIso` — this week's follow-up
+   *  counts can still change and are not a final read. */
+  immature: boolean;
+  /** This week ended before the `Fixes-PR:` convention started (see
+   *  `findConventionStartIso`): its `linked`/`linkedPerKLoc` counts read as 0 not
+   *  because no follow-up existed, but because the convention that makes a follow-up
+   *  DISCOVERABLE by link wasn't in force yet. Only the overlap heuristic (an upper
+   *  bound, never ground truth — see the file header) says anything about this week. */
+  heuristicOnly: boolean;
+}
+
+export interface WeeklyReport {
+  rows: WeeklyReviewRow[];
+  conventionStartIso: string | null;
+}
+
+/**
+ * Inverse of `isoWeekKey`: the UTC instant range `[startIso, endIso]` (inclusive) an
+ * ISO week key covers. Mirrors that function's own week-1-anchor math exactly (Jan 4
+ * always falls in week 1; the anchor is Jan 4 shifted back to the start of its own ISO
+ * week), so `isoWeekKey(isoWeekDateRange(k).startIso) === k` for every `k` it produces.
+ */
+export function isoWeekDateRange(isoWeek: string): { startIso: string; endIso: string } {
+  const match = /^(\d{4})-W(\d{2})$/.exec(isoWeek);
+  if (!match) throw new Error(`invalid ISO week key: ${isoWeek}`);
+  const isoYear = Number(match[1]);
+  const weekNum = Number(match[2]);
+  const jan4 = new Date(Date.UTC(isoYear, 0, 4));
+  const jan4DayNum = (jan4.getUTCDay() + 6) % 7;
+  const week1Anchor = new Date(jan4);
+  week1Anchor.setUTCDate(jan4.getUTCDate() - jan4DayNum);
+  const start = new Date(week1Anchor);
+  start.setUTCDate(week1Anchor.getUTCDate() + (weekNum - 1) * 7);
+  const end = new Date(start);
+  end.setUTCDate(start.getUTCDate() + 6);
+  end.setUTCHours(23, 59, 59, 999);
+  return { startIso: start.toISOString(), endIso: end.toISOString() };
+}
+
+/** `lanePRs`' follow-up counts against `sortedAll` (every fetched PR, ascending), within
+ *  `followupDays` of each candidate's own merge — same window rule `buildBucket` uses. */
+function weeklyLaneStats(
+  lanePRs: readonly PullRequestData[],
+  sortedAll: readonly PullRequestData[],
+  followupDays: number,
+): WeeklyLaneStats {
+  let linked = 0;
+  let overlapHeuristic = 0;
+  for (const candidate of lanePRs) {
+    const mergedMs = new Date(candidate.mergedAt).getTime();
+    const cutoffMs = mergedMs + followupDays * MS_PER_DAY;
+    const laterPRs = sortedAll.filter((other) => {
+      const t = new Date(other.mergedAt).getTime();
+      return other.number !== candidate.number && t > mergedMs && t <= cutoffMs;
+    });
+    const followUp = findFollowUp(candidate, laterPRs);
+    if (followUp.kind === 'link') linked += 1;
+    else if (followUp.kind === 'overlap') overlapHeuristic += 1;
+  }
+  const n = lanePRs.length;
+  return {
+    merged: n,
+    linked,
+    linkedRate: n === 0 ? 0 : linked / n,
+    overlapHeuristic,
+    overlapHeuristicRate: n === 0 ? 0 : overlapHeuristic / n,
+  };
+}
+
+function buildWeeklyRow(
+  isoWeek: string,
+  weekPRs: readonly PullRequestData[],
+  sortedAll: readonly PullRequestData[],
+  riskHighGlobs: string[],
+  followupDays: number,
+  conventionStartIso: string | null,
+  nowMs: number,
+): WeeklyReviewRow {
+  const { startIso, endIso } = isoWeekDateRange(isoWeek);
+  const reviewedPRs = weekPRs.filter((pr) => !isSkipVerdict(pr, riskHighGlobs));
+  const skippedPRs = weekPRs.filter((pr) => isSkipVerdict(pr, riskHighGlobs));
+  const reverted = weekPRs.filter(isRevertPR).length;
+  const changedLines = weekPRs.reduce((sum, pr) => sum + pr.changedLines, 0);
+
+  const overall = weeklyLaneStats(weekPRs, sortedAll, followupDays);
+  const reviewedLane = weeklyLaneStats(reviewedPRs, sortedAll, followupDays);
+  const skippedLane = weeklyLaneStats(skippedPRs, sortedAll, followupDays);
+
+  const n = weekPRs.length;
+  const weekEndMs = new Date(endIso).getTime();
+  return {
+    isoWeek,
+    weekStartIso: startIso,
+    weekEndIso: endIso,
+    merged: n,
+    reviewed: reviewedPRs.length,
+    reviewedRate: n === 0 ? 0 : reviewedPRs.length / n,
+    skipped: skippedPRs.length,
+    skippedRate: n === 0 ? 0 : skippedPRs.length / n,
+    reverted,
+    revertRate: n === 0 ? 0 : reverted / n,
+    changedLines,
+    overall,
+    reviewedLane,
+    skippedLane,
+    linkedPerKLoc: changedLines === 0 ? 0 : overall.linked / (changedLines / 1000),
+    immature: nowMs < weekEndMs + followupDays * MS_PER_DAY,
+    heuristicOnly: conventionStartIso === null || weekEndMs < new Date(conventionStartIso).getTime(),
+  };
+}
+
+/**
+ * One row per ISO week of PRs merged into `main`, ascending. `allPRs` need not be
+ * pre-filtered to `main` — filtered here, same as `computeShadowCoverage` filters by
+ * `baseRefName` for its own reason. `nowIso` defaults to the real current time; tests
+ * pin it explicitly so the `immature` flag is deterministic.
+ */
+export function computeWeeklyReport(
+  allPRs: readonly PullRequestData[],
+  riskHighGlobs: string[],
+  followupDays: number,
+  nowIso: string = new Date().toISOString(),
+): WeeklyReport {
+  const mainPRs = allPRs.filter((pr) => pr.baseRefName === SHADOW_REVIEW_BASE_REF);
+  const sorted = [...mainPRs].sort((a, b) => new Date(a.mergedAt).getTime() - new Date(b.mergedAt).getTime());
+  const conventionStartIso = findConventionStartIso(sorted);
+  const nowMs = new Date(nowIso).getTime();
+
+  const buckets = new Map<string, PullRequestData[]>();
+  for (const pr of sorted) {
+    const week = isoWeekKey(pr.mergedAt);
+    const bucket = buckets.get(week);
+    if (bucket) bucket.push(pr);
+    else buckets.set(week, [pr]);
+  }
+
+  const rows = [...buckets.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([isoWeek, weekPRs]) =>
+      buildWeeklyRow(isoWeek, weekPRs, sorted, riskHighGlobs, followupDays, conventionStartIso, nowMs),
+    );
+
+  return { rows, conventionStartIso };
+}
+
+function pctStr(rate: number): string {
+  return `${(rate * 100).toFixed(1)}%`;
+}
+
+/**
+ * The tracking-issue comment body: the most recent `weeksToShow` weeks (default 8, per
+ * the weekly workflow's own spec), then the cumulative before/after-switch comparison
+ * `computeReport` already produces — one document, one `gh issue comment` post.
+ */
+export function renderWeeklyMarkdown(weekly: WeeklyReport, cumulative: ReportResult, weeksToShow = 8): string {
+  const lines: string[] = [];
+  lines.push('## Review metrics (weekly)');
+  lines.push('');
+  lines.push(
+    `Convention start (\`Fixes-PR:\` line first seen): ${weekly.conventionStartIso ?? '_not yet observed_'}. ` +
+      'A week ending before that instant is marked `heuristic-only` below: its `linked` count reads as 0 ' +
+      'because the convention that makes a follow-up discoverable by link was not yet in force, not because ' +
+      'no follow-up existed — only the overlap heuristic (an upper bound, never ground truth) says anything ' +
+      'about it.',
+  );
+  lines.push('');
+  const shown = weekly.rows.slice(-weeksToShow);
+  lines.push(`### Last ${shown.length} week(s) of ${weekly.rows.length} total`);
+  lines.push('');
+  lines.push(
+    '| Week | Range (UTC) | n | Reviewed | Skipped | Reverted | Bug-introducing (linked) | Bug-introducing (overlap, upper bound) | Per 1k LOC | Status |',
+  );
+  lines.push('|---|---|---|---|---|---|---|---|---|---|');
+  for (const row of shown) {
+    const range = `${row.weekStartIso.slice(0, 10)} – ${row.weekEndIso.slice(0, 10)}`;
+    const status = [row.immature ? 'immature' : null, row.heuristicOnly ? 'heuristic-only' : null]
+      .filter((s): s is string => s !== null)
+      .join(', ');
+    lines.push(
+      `| ${row.isoWeek} | ${range} | ${row.merged} | ${row.reviewed} (${pctStr(row.reviewedRate)}) | ` +
+        `${row.skipped} (${pctStr(row.skippedRate)}) | ${row.reverted} (${pctStr(row.revertRate)}) | ` +
+        `${row.overall.linked}/${row.overall.merged} (${pctStr(row.overall.linkedRate)}) | ` +
+        `${row.overall.overlapHeuristic}/${row.overall.merged} (${pctStr(row.overall.overlapHeuristicRate)}) | ` +
+        `${row.linkedPerKLoc.toFixed(3)} | ${status || 'final'} |`,
+    );
+  }
+  lines.push('');
+  lines.push('Per lane (reviewed vs skipped), bug-introducing rate by link (ground truth) and overlap (heuristic):');
+  lines.push('');
+  lines.push('| Week | Reviewed: linked | Reviewed: overlap | Skipped: linked | Skipped: overlap |');
+  lines.push('|---|---|---|---|---|');
+  for (const row of shown) {
+    lines.push(
+      `| ${row.isoWeek} | ${row.reviewedLane.linked}/${row.reviewedLane.merged} (${pctStr(row.reviewedLane.linkedRate)}) | ` +
+        `${row.reviewedLane.overlapHeuristic}/${row.reviewedLane.merged} (${pctStr(row.reviewedLane.overlapHeuristicRate)}) | ` +
+        `${row.skippedLane.linked}/${row.skippedLane.merged} (${pctStr(row.skippedLane.linkedRate)}) | ` +
+        `${row.skippedLane.overlapHeuristic}/${row.skippedLane.merged} (${pctStr(row.skippedLane.overlapHeuristicRate)}) |`,
+    );
+  }
+  lines.push('');
+  lines.push(`### Cumulative, ±${cumulative.days}d around the switch (${cumulative.switchIso})`);
+  lines.push('');
+  lines.push('| | Before | After |');
+  lines.push('|---|---|---|');
+  lines.push(`| Merged (all risk levels) | ${cumulative.before.totalMerged} | ${cumulative.after.totalMerged} |`);
+  lines.push(`| Merged (low-risk) | ${cumulative.before.lowRiskMerged} | ${cumulative.after.lowRiskMerged} |`);
+  lines.push(
+    `| Followed up — link | ${cumulative.before.followedUpByLink} (${pctStr(cumulative.before.followedUpByLinkRate)}) | ` +
+      `${cumulative.after.followedUpByLink} (${pctStr(cumulative.after.followedUpByLinkRate)}) |`,
+  );
+  lines.push(
+    `| Followed up — overlap | ${cumulative.before.followedUpByOverlap} (${pctStr(cumulative.before.followedUpByOverlapRate)}) | ` +
+      `${cumulative.after.followedUpByOverlap} (${pctStr(cumulative.after.followedUpByOverlapRate)}) |`,
+  );
+  lines.push(
+    `| Reverted | ${cumulative.before.reverted} (${pctStr(cumulative.before.revertedRate)}) | ` +
+      `${cumulative.after.reverted} (${pctStr(cumulative.after.revertedRate)}) |`,
+  );
+  lines.push(
+    `| Shadow-reviewed | ${cumulative.before.shadowReviewed} (${pctStr(cumulative.before.shadowReviewedRate)}) | ` +
+      `${cumulative.after.shadowReviewed} (${pctStr(cumulative.after.shadowReviewedRate)}) |`,
+  );
+  lines.push(
+    `| Shadow-review P1 | ${cumulative.before.shadowReviewP1} (${pctStr(cumulative.before.shadowReviewP1Rate)}) | ` +
+      `${cumulative.after.shadowReviewP1} (${pctStr(cumulative.after.shadowReviewP1Rate)}) |`,
+  );
+  if (cumulative.before.caveat) lines.push(`\n_before caveat: ${cumulative.before.caveat}_`);
+  if (cumulative.after.caveat) lines.push(`\n_after caveat: ${cumulative.after.caveat}_`);
+  return lines.join('\n');
+}
+
 // ─────────────────────────── gh I/O ────────────────────────────────────────
 
 function gh(args: string[]): string {
@@ -720,6 +1046,8 @@ interface RawPr {
   files: RawPrFile[];
   labels?: RawPrLabel[];
   baseRefName: string;
+  additions: number;
+  deletions: number;
 }
 
 function fetchAllFilesViaRest(repo: string, prNumber: number): string[] {
@@ -747,7 +1075,7 @@ export function fetchMergedPRs(repo: string, sinceIso: string): PullRequestData[
     '--search',
     `merged:>=${sinceIso}`,
     '--json',
-    'number,title,body,mergedAt,changedFiles,files,labels,baseRefName',
+    'number,title,body,mergedAt,changedFiles,files,labels,baseRefName,additions,deletions',
     '--limit',
     '1000',
   ]);
@@ -760,6 +1088,7 @@ export function fetchMergedPRs(repo: string, sinceIso: string): PullRequestData[
     files: resolveFiles(repo, pr),
     labels: (pr.labels ?? []).map((label) => label.name),
     baseRefName: pr.baseRefName,
+    changedLines: pr.additions + pr.deletions,
   }));
 }
 
@@ -857,6 +1186,8 @@ function parseArgs(argv: readonly string[]): Options {
     else if (name === '--days') options.days = Number(inline ?? next());
     else if (name === '--followup-days') options.followupDays = Number(inline ?? next());
     else if (name === '--json') options.json = true;
+    else if (name === '--weekly') options.weekly = true;
+    else if (name === '--weekly-days') options.weeklyDays = Number(inline ?? next());
     else if (name === '--help' || name === '-h') usage();
     else if (arg !== '--') fail(`unknown argument: ${arg}`);
   }
@@ -865,6 +1196,8 @@ function parseArgs(argv: readonly string[]): Options {
     fail('--followup-days must be a positive number');
   if (Number.isNaN(new Date(options.switchIso).getTime()))
     fail(`--switch is not a valid ISO date: ${options.switchIso}`);
+  if (options.weeklyDays !== undefined && (!Number.isFinite(options.weeklyDays) || options.weeklyDays <= 0))
+    fail('--weekly-days must be a positive number');
   return options;
 }
 
@@ -878,10 +1211,21 @@ function usage(): never {
     [
       'Usage: tsx scripts/review-outcomes.ts [--repo owner/repo] [--switch <ISO>]',
       '         [--days <n>] [--followup-days <n>] [--json]',
+      '         [--weekly [--weekly-days <n>]]',
       '',
       'Measures whether low-risk PRs merged without review (after --switch) drew more',
       'follow-up fixes or reverts than low-risk PRs did while every PR was reviewed',
       '(before --switch). See docs/specs/risk-based-review/plan.md, "Measurement".',
+      '',
+      '--weekly reports one row per ISO week of PRs merged into main instead: merged',
+      "PRs split into reviewed/skipped lanes (replaying the merge gate's own skip-verdict",
+      'rule), the revert rate, and the bug-introducing rate (Fixes-PR link, ground truth,',
+      'and file-overlap heuristic, kept separate) overall and per lane, plus the linked',
+      'rate per 1,000 changed lines. --weekly-days (default 90) bounds how far back of',
+      '"now" it fetches; --json emits { weekly, cumulative, markdown } in one call, where',
+      '`cumulative` is the same before/after report --switch/--days already compute and',
+      '`markdown` is the ready-to-post tracking-issue comment body (last 8 weeks plus the',
+      'cumulative comparison).',
     ].join('\n'),
   );
   process.exit(0);
@@ -981,6 +1325,43 @@ export function computeFetchSinceIso(
   return new Date(Math.min(switchBasedMs, goLiveMs)).toISOString();
 }
 
+/** The lower fetch bound `--weekly` needs on its own: `weeklyDays` back from `nowIso`. */
+export function computeWeeklyFetchSinceIso(nowIso: string, weeklyDays: number): string {
+  return new Date(new Date(nowIso).getTime() - weeklyDays * MS_PER_DAY).toISOString();
+}
+
+function printWeeklyReport(weekly: WeeklyReport): void {
+  console.log(`review-outcomes --weekly: convention start = ${weekly.conventionStartIso ?? '(not yet observed)'}`);
+  console.log('');
+  for (const row of weekly.rows) {
+    console.log(`${row.isoWeek} (${row.weekStartIso.slice(0, 10)} – ${row.weekEndIso.slice(0, 10)}):`);
+    console.log(
+      `  merged: ${row.merged}  reviewed: ${row.reviewed} (${pct(row.reviewedRate)})  skipped: ${row.skipped} (${pct(row.skippedRate)})`,
+    );
+    console.log(`  reverted: ${row.reverted} (${pct(row.revertRate)})`);
+    console.log(
+      `  bug-introducing — overall:  linked ${row.overall.linked}/${row.overall.merged} (${pct(row.overall.linkedRate)}), ` +
+        `overlap (heuristic upper bound) ${row.overall.overlapHeuristic}/${row.overall.merged} (${pct(row.overall.overlapHeuristicRate)})`,
+    );
+    console.log(
+      `  bug-introducing — reviewed: linked ${row.reviewedLane.linked}/${row.reviewedLane.merged} (${pct(row.reviewedLane.linkedRate)}), ` +
+        `overlap ${row.reviewedLane.overlapHeuristic}/${row.reviewedLane.merged} (${pct(row.reviewedLane.overlapHeuristicRate)})`,
+    );
+    console.log(
+      `  bug-introducing — skipped:  linked ${row.skippedLane.linked}/${row.skippedLane.merged} (${pct(row.skippedLane.linkedRate)}), ` +
+        `overlap ${row.skippedLane.overlapHeuristic}/${row.skippedLane.merged} (${pct(row.skippedLane.overlapHeuristicRate)})`,
+    );
+    console.log(
+      `  linked per 1,000 changed lines: ${row.linkedPerKLoc.toFixed(3)} (changed lines: ${row.changedLines})`,
+    );
+    const flags = [row.immature ? 'immature' : null, row.heuristicOnly ? 'heuristic-only' : null].filter(
+      (f): f is string => f !== null,
+    );
+    if (flags.length) console.log(`  flags: ${flags.join(', ')}`);
+    console.log('');
+  }
+}
+
 function main(): void {
   const options = parseArgs(process.argv.slice(2));
 
@@ -988,8 +1369,59 @@ function main(): void {
   const labelerConfig = parse(labelerYaml) as Record<string, unknown>;
   const riskHighGlobs = globsForRiskHigh(labelerConfig);
 
-  const sinceIso = computeFetchSinceIso(options.switchIso, options.days);
-  const allPRs = fetchMergedPRs(options.repo, sinceIso);
+  const beforeAfterSinceIso = computeFetchSinceIso(options.switchIso, options.days);
+
+  if (options.weekly) {
+    // One `gh` fetch batch serves both reports: the weekly rows need `--weekly-days`
+    // of history back from now, and the cumulative before/after comparison
+    // (`renderWeeklyMarkdown`'s second table) needs the same window `computeReport`
+    // always has — so the fetch bound is the EARLIER of the two, same reasoning as
+    // `computeFetchSinceIso` already applies to its own two callers.
+    const weeklySinceIso = computeWeeklyFetchSinceIso(new Date().toISOString(), options.weeklyDays ?? 90);
+    const sinceIso =
+      new Date(weeklySinceIso).getTime() < new Date(beforeAfterSinceIso).getTime()
+        ? weeklySinceIso
+        : beforeAfterSinceIso;
+    const allPRs = fetchMergedPRs(options.repo, sinceIso);
+    const shadowReviewIssues = fetchShadowReviewIssues(options.repo);
+    const shadowReviewFailedPrNumbers = fetchShadowReviewFailedPRs(options.repo);
+    const shadowReviewedLabelPrNumbers = fetchShadowReviewedPRs(options.repo);
+
+    const cumulative = computeReport(
+      allPRs,
+      riskHighGlobs,
+      options,
+      shadowReviewIssues,
+      shadowReviewFailedPrNumbers,
+      shadowReviewedLabelPrNumbers,
+    );
+    const weekly = computeWeeklyReport(allPRs, riskHighGlobs, options.followupDays);
+
+    if (options.json) {
+      console.log(
+        JSON.stringify(
+          {
+            repo: options.repo,
+            followupDays: options.followupDays,
+            weeklyDays: options.weeklyDays ?? 90,
+            since: sinceIso,
+            weekly,
+            cumulative,
+            markdown: renderWeeklyMarkdown(weekly, cumulative),
+          },
+          null,
+          2,
+        ),
+      );
+    } else {
+      printWeeklyReport(weekly);
+      console.log('');
+      printReport(cumulative);
+    }
+    return;
+  }
+
+  const allPRs = fetchMergedPRs(options.repo, beforeAfterSinceIso);
   const shadowReviewIssues = fetchShadowReviewIssues(options.repo);
   const shadowReviewFailedPrNumbers = fetchShadowReviewFailedPRs(options.repo);
   const shadowReviewedLabelPrNumbers = fetchShadowReviewedPRs(options.repo);
