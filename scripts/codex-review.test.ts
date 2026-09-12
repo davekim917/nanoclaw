@@ -773,6 +773,19 @@ describe('codex-review ci-wait, the only way to wait on CI', () => {
     expect(result.sleep).toBe('');
   });
 
+  // #692 P3-3: the accepted --timeout form is capped at 6 digits so the
+  // deadline arithmetic (start + timeout) cannot overflow; the maximum value
+  // that cap allows must still be accepted, not refused as out of range.
+  it('accepts the maximum allowed --timeout (999999) and still reports green', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    writeRuns(root, 'runs.json', [workflowRun('CI', 'completed', 'success')]);
+
+    const result = ciWait(root, ['--head', HEAD, '--timeout', '999999'], [0, 0]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`ci=green head=${HEAD}`);
+  });
+
   it('polls again after a pending verdict instead of stopping (mutation: exits on the first pending, or never re-polls)', () => {
     const root = tempRoot();
     writeJson(root, 'pr.json', ciPr());
@@ -944,9 +957,16 @@ describe('codex-review ci-wait, the only way to wait on CI', () => {
 
   it.each([
     ['no --head', []],
+    // #692 P3-2: a bare --head (no value follows) must exit the usage code 2,
+    // not bash's ${2:?} exit 1 — a validation failure is never read as a
+    // GitHub-read failure by a caller branching on exit code.
+    ['a bare --head', ['--head']],
     ['a short head', ['--head', HEAD.slice(0, 12)]],
     ['a zero timeout', ['--head', HEAD, '--timeout', '0']],
     ['a non-numeric timeout', ['--head', HEAD, '--timeout', 'x']],
+    // #692 P3-3: a 20-digit timeout passes the old unbounded regex and
+    // overflows the deadline arithmetic; it must be refused as out of range.
+    ['a 20-digit timeout', ['--head', HEAD, '--timeout', '12345678901234567890']],
     ['an unknown argument', ['--head', HEAD, '--bogus']],
   ])('refuses %s, reading nothing (mutation: validation after the first read)', (_case, args) => {
     const root = tempRoot();
@@ -1719,6 +1739,16 @@ describe('codex-review risk-scoped review requests', () => {
     );
   });
 
+  // #692 P3-2: a bare --head (no value follows) must exit the usage code 2,
+  // not bash's ${2:?} exit 1.
+  it('refuses a bare --head, posting nothing', () => {
+    const root = tempRoot();
+
+    const result = runHelper(root, ['receipt', '--head']);
+    expect(result.status).toBe(2);
+    expect(result.posted).toBeNull();
+  });
+
   it.each([
     ['a short SHA', HEAD.slice(0, 12), 'approve', 'Scope: complete diff.\n'],
     ['an unknown outcome', HEAD, 'lgtm', 'Scope: complete diff.\n'],
@@ -2285,6 +2315,9 @@ describe('codex-review merge, the only merge path for a risk-scoped repo', () =>
 
   it.each([
     ['no --head', ['merge']],
+    // #692 P3-2: a bare --head must exit the usage code 2, not bash's ${2:?}
+    // exit 1.
+    ['a bare --head', ['merge', '--head']],
     ['a short head', ['merge', '--head', HEAD.slice(0, 12)]],
     ['a rebase merge', ['merge', '--head', HEAD, '--method', 'rebase']],
     ['an unknown argument', ['merge', '--head', HEAD, '--delete-branch']],
@@ -2599,6 +2632,45 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
       labels: ['risk:high'],
       comments: [
         receiptComment(HEAD, 'approve', '2026-09-05T00:59:59Z', 'OWNER', 'claude-opus-5 (worker-high)', '100'),
+      ],
+    });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('verdict=review: an approving substitute receipt before the merge');
+  });
+
+  // #692 P3-1: an edit landing in the merge's OWN second must not be read as
+  // "at or before" it — timestamps have second resolution, so an edit at
+  // exactly MERGED_AT may have happened after the merge. Before the fix,
+  // $unreadable only caught lastEditedAt > $asof, and $matches accepted
+  // lastEditedAt <= $asof, so this receipt read as clean.
+  it("flags a receipt edited in the merge's own second, even though it was posted well before the merge (mutation: the pre-fix <= read set passes it)", () => {
+    const root = tempRoot();
+    auditFixture(root, {
+      labels: ['risk:high'],
+      comments: [
+        {
+          ...receiptComment(HEAD, 'approve', '2026-09-05T00:30:00Z', 'OWNER', 'claude-opus-5 (worker-high)', '100'),
+          lastEditedAt: MERGED_AT,
+        },
+      ],
+    });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(28);
+    expect(result.stdout).toContain('verdict=review:');
+  });
+
+  it('passes a receipt edited one second before the merge (mutation: an off-by-one pushes the edit boundary a second early)', () => {
+    const root = tempRoot();
+    auditFixture(root, {
+      labels: ['risk:high'],
+      comments: [
+        {
+          ...receiptComment(HEAD, 'approve', '2026-09-05T00:30:00Z', 'OWNER', 'claude-opus-5 (worker-high)', '100'),
+          lastEditedAt: '2026-09-05T00:59:59Z',
+        },
       ],
     });
 

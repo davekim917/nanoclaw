@@ -855,8 +855,8 @@ receipt_outcome() {
       | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
       | select($asof == "" or .createdAt <= $asof)
       | .idstr = ((.fullDatabaseId // "") | tostring) ] as $comments
-    | [ $comments[] | select($asof != "" and ((.lastEditedAt // "") > $asof or .createdAt == $asof)) ] as $unreadable
-    | [ $comments[] | select($asof == "" or ((.lastEditedAt // "") <= $asof and .createdAt < $asof))
+    | [ $comments[] | select($asof != "" and ((.lastEditedAt // "") >= $asof or .createdAt == $asof)) ] as $unreadable
+    | [ $comments[] | select($asof == "" or ((.lastEditedAt // "") < $asof and .createdAt < $asof))
         | .createdAt as $at
         | .idstr as $idstr
         | .author as $author
@@ -1080,7 +1080,9 @@ ci_wait_main() {
   local poll="${CODEX_REVIEW_CI_POLL_SECONDS:-30}" register="${CODEX_REVIEW_CI_REGISTER_SECONDS:-180}"
   while [ $# -gt 0 ]; do
     case "$1" in
-      --head) head="${2:?--head needs a sha}"; shift 2 ;;
+      --head)
+        [ $# -ge 2 ] || { echo "ci-wait: --head needs a sha" >&2; exit 2; }
+        head="$2"; shift 2 ;;
       --timeout) timeout="${2:?--timeout needs seconds}"; shift 2 ;;
       *) echo "ci-wait: unknown argument $1" >&2; exit 2 ;;
     esac
@@ -1088,7 +1090,7 @@ ci_wait_main() {
   # Validated before any read: a bad --head/--timeout/knob or an unknown
   # argument must cost nothing against GitHub.
   [[ "$head" =~ ^[0-9a-f]{40}$ ]] || { echo "ci-wait: --head must be the full 40-character SHA you pushed" >&2; exit 2; }
-  [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || { echo "ci-wait: --timeout must be a positive whole number of seconds" >&2; exit 2; }
+  [[ "$timeout" =~ ^[1-9][0-9]{0,5}$ ]] || { echo "ci-wait: --timeout must be a positive whole number of seconds, up to 999999" >&2; exit 2; }
   [[ "$poll" =~ ^[1-9][0-9]*$ ]] || { echo "ci-wait: CODEX_REVIEW_CI_POLL_SECONDS must be a positive whole number" >&2; exit 2; }
   [[ "$register" =~ ^[1-9][0-9]*$ ]] || { echo "ci-wait: CODEX_REVIEW_CI_REGISTER_SECONDS must be a positive whole number" >&2; exit 2; }
 
@@ -1550,7 +1552,9 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
     head="" method=merge
     while [ $# -gt 0 ]; do
       case "$1" in
-        --head) head="${2:?--head needs a sha}"; shift 2 ;;
+        --head)
+          [ $# -ge 2 ] || { echo "merge: --head needs a sha" >&2; exit 2; }
+          head="$2"; shift 2 ;;
         --method) method="${2:?--method needs merge or squash}"; shift 2 ;;
         *) echo "merge: unknown argument $1" >&2; exit 2 ;;
       esac
@@ -1769,7 +1773,9 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
     head="" outcome="" reviewer="" body_file=""
     while [ $# -gt 0 ]; do
       case "$1" in
-        --head) head="${2:?--head needs a sha}"; shift 2 ;;
+        --head)
+          [ $# -ge 2 ] || { echo "receipt: --head needs a sha" >&2; exit 2; }
+          head="$2"; shift 2 ;;
         --outcome) outcome="${2:?--outcome needs approve or changes}"; shift 2 ;;
         --reviewer) reviewer="${2:?--reviewer needs the model and runtime}"; shift 2 ;;
         --body-file) body_file="${2:?--body-file needs a file}"; shift 2 ;;
