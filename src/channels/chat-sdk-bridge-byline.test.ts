@@ -1,13 +1,19 @@
 /**
- * Approval-card actor byline in the Chat SDK bridge.
+ * Actor byline on the cards the Chat SDK bridge still edits.
  *
  * Drives the bridge's real onAction handler through the real Chat SDK
  * dispatch (`chat.processAction`): `bridge.setup()` registers the handler on
  * a real Chat instance, which the test captures from the webhook-server
  * registration (mocked so no HTTP server binds a port). After a button click
  * the bridge edits the card; the edit must append " — <actor>" so shared
- * channels see who resolved an approval. Goes red if the byLine concatenation
- * is removed from the edited markdown.
+ * channels see who resolved it. Goes red if the byLine concatenation is
+ * removed from the edited markdown.
+ *
+ * The bridge edits a card whose render came from pending_questions (an agent's
+ * ask_user_question) or from no row at all. It edits NO pending_approvals card
+ * — it has not checked whose card was clicked — and the last case pins that;
+ * the host writes those bylines instead (modules/approvals/primitive.ts
+ * editApprovalCardResolution, covered in modules/approvals/click-binding.test.ts).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -103,7 +109,14 @@ async function seedApproval(id: string, title = '⚠️ Test approval', question
   });
 }
 
-async function seedInteractiveQuestion(id: string, title: string, question: string): Promise<void> {
+async function seedInteractiveQuestion(
+  id: string,
+  title: string,
+  question: string,
+  options: Array<{ label: string; selectedLabel: string; value: string }> = [
+    { label: 'Proceed', selectedLabel: '✅ Proceeded', value: 'proceed' },
+  ],
+): Promise<void> {
   const createdAt = new Date().toISOString();
   await createAgentGroup({
     id: 'ag-1',
@@ -132,7 +145,7 @@ async function seedInteractiveQuestion(id: string, title: string, question: stri
     thread_id: null,
     title,
     question,
-    options: [{ label: 'Proceed', selectedLabel: '✅ Proceeded', value: 'proceed' }],
+    options,
     created_at: createdAt,
   });
 }
@@ -174,8 +187,11 @@ describe('chat-sdk-bridge approval-card byline', () => {
     expect(edits[0].markdown).toContain('approve');
   });
 
-  it('resolves an indexed Approve button to approve before dispatching it', async () => {
-    await seedApproval('q-1');
+  it('resolves an indexed button to its value before dispatching it', async () => {
+    await seedInteractiveQuestion('q-1', 'Run this?', '', [
+      { label: 'Approve', selectedLabel: '✅ Approved', value: 'approve' },
+      { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject' },
+    ]);
 
     const { edits, actions } = await fireAction(
       { userId: 'U1', userName: 'gavriel' },
@@ -184,10 +200,10 @@ describe('chat-sdk-bridge approval-card byline', () => {
 
     expect(actions).toEqual(['q-1:approve:U1']);
     expect(edits).toHaveLength(1);
-    expect(edits[0].markdown).toContain('✅ Approved');
+    expect(edits[0].markdown).toContain('✅ Approved — gavriel');
   });
 
-  it('keeps the decision context visible after an approval resolves', async () => {
+  it('leaves an approval card alone: the host edits the card that row names', async () => {
     await seedApproval('q-1', 'Install Packages Request', 'Agent "example-group" wants to install WebKit libraries.');
 
     const { edits, actions } = await fireAction(
@@ -195,11 +211,10 @@ describe('chat-sdk-bridge approval-card byline', () => {
       { actionId: 'ncq:q-1:0', value: '0' },
     );
 
+    // Dispatched, but nothing of the approval's content is written back to the
+    // clicked message — the bridge does not yet know whose card it was.
     expect(actions).toEqual(['q-1:approve:U1']);
-    expect(edits).toHaveLength(1);
-    expect(edits[0].card?.title).toBe('Install Packages Request');
-    expect(edits[0].card?.subtitle).toBe('Agent "example-group" wants to install WebKit libraries.');
-    expect(edits[0].card?.children?.[0]?.content).toContain('✅ Approved — gavriel');
+    expect(edits).toEqual([]);
   });
 
   it('keeps interactive-question context visible when pending_questions is the render source', async () => {

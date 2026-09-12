@@ -26,7 +26,6 @@ import { log } from '../log.js';
 import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
 import { getAskQuestionRender } from '../db/sessions.js';
-import { isAnswerCardAction } from '../answer-cards.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import type {
   ChannelAdapter,
@@ -1146,6 +1145,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const questionId = parts[1];
         const tail = parts.slice(2).join(':');
         const userId = event.user?.userId || '';
+        // The clicked message itself. The button names only a questionId,
+        // which any card can carry, so approvals bind the click to their own
+        // card with this id (response-handler.ts).
+        const messageId = event.messageId || null;
 
         // Resolve render metadata BEFORE dispatching onAction (which deletes the row).
         const render = await getAskQuestionRender(questionId);
@@ -1161,16 +1164,29 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           });
           return;
         }
-        // Answer cards (answer-cards.ts) are edited by the host, once the click
-        // is authorized and its answer delivered. Editing here first would show
-        // an answer a refused or losing click never gave. No edit is needed to
-        // acknowledge the click: the adapter acks the platform event itself
-        // (Slack answers block_actions 200 before dispatch, @chat-adapter/slack
-        // dist/index.js:1408-1411). Classified from the render read above, not a
-        // second one: a row the winning click deletes in between would otherwise
-        // read as "not an answer card" and fall through to the edit below.
-        if (render?.action !== undefined && isAnswerCardAction(render.action)) {
-          setupConfig.onAction(questionId, selectedOption, userId);
+        // A card the host posted for a pending_approvals row is never edited
+        // here. All the bridge knows is the id the button carried: it has not
+        // checked that the clicked message is that approval's own card, nor
+        // that the clicker may decide it. Editing first would write the
+        // approval's title and question into whatever message was clicked — a
+        // counterfeit card carrying the same id, in a channel the approval was
+        // never delivered to, included — and label it resolved, moments before
+        // the handler refuses the click (modules/approvals/response-handler.ts).
+        // So dispatch, and let the host edit the card the row itself names once
+        // the click is bound and authorized (editApprovalCardResolution,
+        // modules/approvals/primitive.ts). A refused, unauthorized or losing
+        // click then leaves every card exactly as it was.
+        //
+        // No edit is needed to acknowledge the click: the adapter acks the
+        // platform event itself (Slack answers block_actions 200 before
+        // dispatch, @chat-adapter/slack dist/index.js:1408-1411).
+        //
+        // `action` is set only on a pending_approvals render
+        // (db/sessions.ts:819-824), and it comes from the render read above,
+        // not a second one: a row the winning click deletes in between would
+        // otherwise read as "not an approval" and fall through to the edit.
+        if (render?.action !== undefined) {
+          setupConfig.onAction(questionId, selectedOption, userId, messageId);
           return;
         }
         const title = render?.title ?? '❓ Question';
@@ -1205,7 +1221,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           log.warn('Failed to update card after action', { err });
         }
 
-        setupConfig.onAction(questionId, selectedOption, userId);
+        setupConfig.onAction(questionId, selectedOption, userId, messageId);
       });
 
       // Native slash commands (e.g. Slack's registered `/dashboard-token`,
@@ -2021,6 +2037,9 @@ export async function handleForwardedEvent(
           (interaction.user as Record<string, string> | undefined);
         const interactionId = interaction.id as string;
         const interactionToken = interaction.token as string;
+        // The clicked message, which approvals bind the click to (see the Chat SDK path).
+        const clickedMessage = (interaction.message as Record<string, unknown> | undefined)?.id;
+        const messageId = typeof clickedMessage === 'string' && clickedMessage ? clickedMessage : null;
 
         // Parse the selected option from custom_id
         let questionId: string | undefined;
@@ -2069,12 +2088,13 @@ export async function handleForwardedEvent(
           }
           return;
         }
-        if (render?.action !== undefined && isAnswerCardAction(render.action)) {
-          // Answer card, classified from the render read above (see the Chat SDK
-          // path): acknowledge without touching the message (type 6,
-          // DEFERRED_UPDATE_MESSAGE — InteractionResponseType.DeferredMessageUpdate,
-          // discord-api-types payloads/v10/_interactions/responses.d.ts:66-69).
-          // The host edits the card once the answer is delivered.
+        if (render?.action !== undefined) {
+          // An approval card, classified from the render read above (see the
+          // Chat SDK path for why none is edited here): acknowledge without
+          // touching the message (type 6, DEFERRED_UPDATE_MESSAGE —
+          // InteractionResponseType.DeferredMessageUpdate, discord-api-types
+          // payloads/v10/_interactions/responses.d.ts:66-69). The host edits
+          // the card the row names, once the click is bound and authorized.
           try {
             await fetch(`https://discord.com/api/v10/interactions/${interactionId}/${interactionToken}/callback`, {
               method: 'POST',
@@ -2084,7 +2104,7 @@ export async function handleForwardedEvent(
           } catch (err) {
             log.error('Failed to acknowledge Discord answer-card action', { err });
           }
-          setupConfig.onAction(questionId, selectedOption, user?.id || '');
+          setupConfig.onAction(questionId, selectedOption, user?.id || '', messageId);
           return;
         }
         const cardTitle = render?.title ?? ((originalEmbeds[0]?.title as string) || '❓ Question');
@@ -2115,7 +2135,7 @@ export async function handleForwardedEvent(
         }
 
         // Dispatch to host
-        setupConfig.onAction(questionId, selectedOption, user?.id || '');
+        setupConfig.onAction(questionId, selectedOption, user?.id || '', messageId);
         return;
       }
     }

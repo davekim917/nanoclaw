@@ -3,17 +3,19 @@
  * relays to an agent (modules/approvals/choices.ts), not an approve/reject
  * decision on a privileged action.
  *
- * Two readers treat them differently from approval cards:
- *  - the chat-sdk bridge does not edit the card on click. The host edits it
- *    once the click is authorized and its answer delivered, so a refused or a
- *    losing click leaves the card exactly as it was. The bridge classifies the
- *    card from the action its render read returns (getAskQuestionRender), so
- *    one read decides both;
- *  - the observatory's privileged-approval queue leaves them out.
+ * One reader treats them differently from approval cards: the observatory's
+ * privileged-approval queue leaves them out.
  *
- * Actions register at module import, like approval handlers. The bridge and
- * the dashboard run in the host process (src/main.ts:79, :796), so both see
- * the registrations.
+ * Card editing is no longer what separates the two. The chat-sdk bridge edits
+ * NO pending_approvals card on click (chat-sdk-bridge.ts:1176, :2079) — a
+ * click reaches it before anyone has checked which card it was made on or
+ * whether the clicker may decide it — so every approval card, answer cards
+ * included, is edited by the host once a click is bound and authorized
+ * (editApprovalCardResolution, modules/approvals/primitive.ts; a choice card's
+ * own edit waits for its answer to be delivered, modules/approvals/choices.ts).
+ *
+ * Actions register at module import, like approval handlers. The dashboard
+ * runs in the host process (src/main.ts:796), so it sees the registrations.
  */
 const answerCardActions = new Set<string>();
 

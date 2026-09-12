@@ -423,6 +423,12 @@ contract re-scaffolded on a different `sourceSha` after the re-freeze
 satisfies the snapshot, because the barrier's sourceSha check already refuses
 every marker written before it.
 
+A run re-frozen under a script older than `refreezeLaneSnapshot` has no
+snapshot to check, so `finish` and the barrier now refuse it (a re-freeze
+with no lane snapshot reads as an unreadable identity, not as "nothing to
+redispatch") and `refreeze` itself has no repair verb for it — a second call
+is always refused (exit 4). Such a run must be re-scaffolded, not repaired.
+
 A scheduled run arrives with the head already proven settled by the gate. A
 campaign someone asked for in chat does not, and must prove it before freezing
 and claim the environment after — see "Human-requested campaigns" below.
