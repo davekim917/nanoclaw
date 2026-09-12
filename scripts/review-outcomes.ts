@@ -91,8 +91,9 @@
  *   pnpm exec tsx scripts/review-outcomes.ts [--repo owner/repo] [--switch <ISO>]
  *     [--days <n>] [--followup-days <n>] [--json]
  *
- * Defaults: --repo davekim917/nanoclaw, --switch 2026-09-10T00:00:00Z (when risk-scoped
- * review went live here), --days 30, --followup-days 14.
+ * Defaults: --repo davekim917/nanoclaw, --switch 2026-09-10T16:43:16Z (`GATE_GO_LIVE_ISO`
+ * — PR #605's mergedAt, the exact instant the merge gate went live here, not a rounded
+ * midnight), --days 30, --followup-days 14.
  *
  * **Shadow coverage** (separate from the before/after bucket above): the before/after
  * bucket's low-risk population is a REPLAY of `.github/labeler.yml`'s file globs, kept
@@ -125,7 +126,43 @@ export interface PullRequestData {
   files: string[];
   labels: string[]; // CURRENT labels, not a merge-time snapshot — see "Shadow coverage" below
   baseRefName: string; // e.g. "main" — shadow-review.yml only selects PRs merged INTO main
-  changedLines: number; // additions + deletions — the weekly report's "per output unit" denominator
+  changedLines: number; // additions + deletions, EXCLUDING GENERATED_FILES — the weekly report's kLOC denominator
+  changedFiles: number; // GitHub's own file count for this PR — the completeness check `resolveAtMergeContexts` needs
+  /**
+   * Only ever populated for a PR merged at/after `GATE_GO_LIVE_ISO` (the review-metrics
+   * fetch layer never attempts it for an earlier one — see "Pre-gate vs. post-gate"
+   * below). `undefined`: not attempted at all (every pre-gate PR; every unit-test fixture
+   * that isn't exercising post-gate lane classification). `null`: attempted but the PR's
+   * at-merge context could not be reconstructed (a merge shape `resolveAtMergeBaseSha`
+   * doesn't recognize, an incomplete file listing, a `.github/labeler.yml` read that
+   * failed) — classified `review`, never `skip`, by `classifyAtMergeVerdict`, mirroring
+   * codex-review.sh `scope_eval`'s own "any doubt is review" rule.
+   */
+  atMergeContext?: AtMergeContext | null;
+}
+
+/**
+ * What the merge gate actually saw for one PR AT THE MOMENT it merged — the file-glob
+ * and label half of codex-review.sh `audit`'s own reconstruction (`SCOPE_PIN_BASE`,
+ * `GATE_LABELS`; codex-review.sh:663-701,1660-1695), replayed here from the same public
+ * facts audit itself reads (the merge commit's first parent, the PR's labeled/unlabeled
+ * event history, GitHub's compare API), not from whatever's true today. A `risk:high`
+ * glob list grows over time — 22 at go-live to 62 as of this file's last edit — and a
+ * label can be added or removed after merge; either drift silently rewrites history if
+ * the replay uses CURRENT state instead of AT-MERGE state (see the file header's
+ * "Pre-gate vs. post-gate" note for the concrete case, PR #620, this fixes).
+ */
+export interface AtMergeContext {
+  /** The merge commit's diff against its base, filenames ∪ renamed files' PREVIOUS
+   *  filenames (codex-review.sh:760) — moving a file OFF a risky path still changes
+   *  that path. */
+  files: string[];
+  /** Labels as of `mergedAt`, replayed from the PR's LabeledEvent/UnlabeledEvent
+   *  timeline (`replayLabelsAtMerge`) — never the PR's CURRENT labels. */
+  labels: string[];
+  /** `risk:high` from `.github/labeler.yml` AT the merge commit's first-parent base —
+   *  never the CURRENT `.github/labeler.yml` on `main`'s tip. */
+  riskHighGlobs: string[];
 }
 
 export interface Options {
@@ -230,29 +267,117 @@ export function isLowRisk(files: string[], riskHighGlobs: string[]): boolean {
 
 // Same regexes codex-review.sh's merge-check reads at merge time.
 const FIX_TITLE_RE = /^\s*fix(\([^)]*\))?!?:/i;
-const FIXES_PR_LINE_RE = /(^|\n)Fixes-PR:[ \t]*(#([0-9]+)|none)\b/i;
+
+/**
+ * Strips CommonMark fenced code blocks and HTML comments from `body`, mirroring
+ * codex-review.sh's `fix_link_state`'s `unfenced` + `gsub("<!--...-->")` EXACTLY
+ * (`codex-review.sh:520-545`): a `Fixes-PR:` line inside either is an example or a
+ * template being quoted, not a real link, and must not be read as one — the same reason
+ * `fix_link_state` strips both before testing `FIXES_PR_LINE_RE` at merge time. Fence
+ * rule: up to 3 leading spaces, then 3+ backticks or 3+ tildes opens one; only a BARE
+ * run of the same character, at least as long, on its own line closes it; an unclosed
+ * fence runs to the end of the body, same as GitHub renders it.
+ */
+export function stripFencedAndCommented(body: string): string {
+  const lines = body.split('\n');
+  const out: string[] = [];
+  let fenceChar: '`' | '~' | null = null;
+  let fenceLen = 0;
+  const openRe = /^ {0,3}(`{3,}|~{3,})/;
+  for (const line of lines) {
+    const openMatch = openRe.exec(line);
+    if (fenceChar === null) {
+      if (openMatch) {
+        fenceChar = openMatch[1][0] as '`' | '~';
+        fenceLen = openMatch[1].length;
+      } else {
+        out.push(line);
+      }
+    } else if (
+      openMatch &&
+      openMatch[1][0] === fenceChar &&
+      openMatch[1].length >= fenceLen &&
+      /^ {0,3}(`{3,}|~{3,})[ \t]*\r?$/.test(line)
+    ) {
+      fenceChar = null;
+      fenceLen = 0;
+    }
+    // else: still fenced (or a non-closing candidate line) — dropped, not emitted.
+  }
+  return out.join('\n').replace(/<!--[\s\S]*?(-->|$)/g, '');
+}
 
 export function isFixTitle(title: string): boolean {
   return FIX_TITLE_RE.test(title);
 }
 
-/** The PR number a `Fixes-PR:` line names, or null if absent or `Fixes-PR: none`. */
-export function extractFixesPrNumber(body: string): number | null {
-  const match = FIXES_PR_LINE_RE.exec(body);
-  if (!match) return null;
-  return match[3] ? Number(match[3]) : null;
+// A `Fixes-PR:` line's whole value (everything after the colon, same line) —
+// extraction reads the value apart, rather than matching one fixed `#N`/`none` shape,
+// so it can tell a real same-repo reference from a cross-repo one and from `none`.
+const FIXES_PR_LINE_VALUE_RE = /^[ \t]*Fixes-PR:[ \t]*(.*)$/gim;
+// `owner/repo#N` (GitHub's cross-repo shorthand — a different repository's numbering,
+// e.g. `nanocoai/nanoclaw#605` is upstream's #605, never this repo's) and any
+// parenthetical remark that names "upstream" at all (e.g. `(upstream already covers
+// this)`) — both are stripped from a value before its `#N`s are read as OUR PR numbers.
+const CROSS_REPO_OR_UPSTREAM_RE = /\([^)]*\bupstream\b[^)]*\)|[\w.-]+\/[\w.-]+#\d+/gi;
+const NONE_TOKEN_RE = /\bnone\b/i;
+
+/**
+ * Every same-repo PR number a `Fixes-PR:` line names — link(s) only, `none` credits
+ * nothing. Handles more than one `Fixes-PR:` line, and more than one `#N` on one line
+ * (`Fixes-PR: #605, #620`). Fenced/commented occurrences are never read (see
+ * `stripFencedAndCommented`); a cross-repo `owner/repo#N` or an "(upstream ...)"
+ * parenthetical is stripped before numbers are read, so neither is credited as this
+ * repo's own PR. **`none` anywhere alongside a real number anywhere else — same line or
+ * a separate one — credits NOTHING at all**, per the coordinator's "`none` followed by
+ * `#2` must credit nothing": an internally contradictory declaration cannot be trusted
+ * for either signal, so the whole extraction returns `[]` rather than picking a side.
+ */
+export function extractFixesPrNumbers(body: string): number[] {
+  const cleaned = stripFencedAndCommented(body);
+  FIXES_PR_LINE_VALUE_RE.lastIndex = 0;
+  const numbers = new Set<number>();
+  let sawNone = false;
+  let sawNumber = false;
+  let match: RegExpExecArray | null;
+  while ((match = FIXES_PR_LINE_VALUE_RE.exec(cleaned)) !== null) {
+    const value = match[1].replace(CROSS_REPO_OR_UPSTREAM_RE, ' ');
+    const lineNumbers = [...value.matchAll(/#(\d+)\b/g)].map((m) => Number(m[1]));
+    const lineHasNone = NONE_TOKEN_RE.test(value);
+    if (lineHasNone && lineNumbers.length > 0) return []; // contradictory on ONE line
+    if (lineHasNone) sawNone = true;
+    for (const n of lineNumbers) {
+      numbers.add(n);
+      sawNumber = true;
+    }
+  }
+  if (sawNone && sawNumber) return []; // contradictory ACROSS separate lines
+  return [...numbers];
 }
 
 /**
- * Whether `body` carries a `Fixes-PR:` line at all — `#<n>` OR the literal `none`.
- * Distinct from `extractFixesPrNumber`, which returns `null` for BOTH "no line" and
- * "line says none": the weekly report needs to tell those two apart to find when the
- * convention started (`findConventionStartIso`), which a PR merged with `Fixes-PR: none`
- * still counts as evidence of — the trailer existed and was filled in, deliberately, as
- * "not a fix".
+ * The FIRST same-repo PR number a `Fixes-PR:` line names, or `null` if there isn't
+ * exactly one to credit — absent, `none`, or a contradictory body (see
+ * `extractFixesPrNumbers`). Kept for callers that only ever expect a single reference;
+ * `findFollowUp` uses the plural form directly since a fix can name more than one.
+ */
+export function extractFixesPrNumber(body: string): number | null {
+  const numbers = extractFixesPrNumbers(body);
+  return numbers.length > 0 ? numbers[0] : null;
+}
+
+/**
+ * Whether `body` carries a well-formed `Fixes-PR:` line at all — `#<n>` OR the literal
+ * `none` — OUTSIDE any fence or HTML comment (see `stripFencedAndCommented`). Distinct
+ * from `extractFixesPrNumber`, which returns `null` for BOTH "no line" and "line says
+ * none": the weekly report needs to tell those two apart to find when the convention
+ * started (`findConventionStartIso`), which a PR merged with `Fixes-PR: none` still
+ * counts as evidence of — the trailer existed and was filled in, deliberately, as "not a
+ * fix". Unaffected by the none-vs-number contradiction rule above: that rule is about
+ * what to CREDIT, not about whether the convention's syntax was used at all.
  */
 export function hasFixesPrLine(body: string): boolean {
-  return FIXES_PR_LINE_RE.test(body);
+  return /^[ \t]*Fixes-PR:[ \t]*(?:#\d+|none)\b/im.test(stripFencedAndCommented(body));
 }
 
 /**
@@ -295,18 +420,33 @@ export function filesOverlap(a: string[], b: string[]): boolean {
  */
 const REVERT_TITLE_RE = /^\s*revert\b/i;
 
-/** `reverts #N` / `This reverts ... #N`, one regex, N captured. Gap capped at 60 chars, same line. */
-const REVERT_BODY_RE = /reverts?\b[^\n#]{0,60}?#(\d+)\b/gi;
+/**
+ * `Reverts #N` / `This reverts ... #N`, ANCHORED TO A LINE'S START (`^`, multiline) —
+ * not a bare search anywhere in the body. `#653`'s own body is the concrete case this
+ * fixes: its prose explains this repo's revert convention by QUOTING #610's title —
+ * `` `revert(runner): back out ending a task stream after its result (#608)` `` — and
+ * separately says "revert matching including the real #610 shape" and "the one real
+ * revert in the window (#610 reverting #608)". The unanchored version matched all three
+ * as if #653 itself named a revert target; #653 never reverted anything, and its title
+ * isn't revert-shaped either. Every one of those three matches sits mid-sentence (a
+ * quoted title inside backticks, a `-`-bulleted list item's prose, an ordinary
+ * sentence) — none starts its own line with `revert(s)`, so anchoring excludes all
+ * three while keeping every real case this suite already covers: `Reverts #608 because
+ * it broke prod.`, `This reverts #608 (merge ...)`, and GitHub's own `This reverts pull
+ * request #608.` template — every one of those genuinely opens its line with the word.
+ * Gap after the word capped at 60 chars, same line, same as before.
+ */
+const REVERT_BODY_LINE_RE = /^[ \t]*(?:this\s+)?reverts?\b[^\n#]{0,60}?#(?<num>\d+)\b/gim;
 
 function titleNamesTarget(title: string, target: PullRequestData): boolean {
   return title.includes(`#${target.number}`) || title.includes(target.title);
 }
 
 function bodyNamesNumber(body: string, number: number): boolean {
-  REVERT_BODY_RE.lastIndex = 0;
+  REVERT_BODY_LINE_RE.lastIndex = 0;
   let match: RegExpExecArray | null;
-  while ((match = REVERT_BODY_RE.exec(body)) !== null) {
-    if (Number(match[1]) === number) return true;
+  while ((match = REVERT_BODY_LINE_RE.exec(body)) !== null) {
+    if (Number(match.groups?.num) === number) return true;
   }
   return false;
 }
@@ -320,8 +460,8 @@ export function isRevertOf(candidate: PullRequestData, target: PullRequestData):
 /** Whether `pr` is a revert of ANYTHING (no target linkage needed) — for the weekly rate. */
 export function isRevertPR(pr: PullRequestData): boolean {
   if (REVERT_TITLE_RE.test(pr.title)) return true;
-  REVERT_BODY_RE.lastIndex = 0;
-  return REVERT_BODY_RE.test(pr.body);
+  REVERT_BODY_LINE_RE.lastIndex = 0;
+  return REVERT_BODY_LINE_RE.test(pr.body);
 }
 
 export interface FollowUpResult {
@@ -330,20 +470,37 @@ export interface FollowUpResult {
 }
 
 /**
+ * Whether `body`'s `Fixes-PR:` trailer, if it exists at all, names no specific PR —
+ * an explicit `Fixes-PR: none`, or a body `extractFixesPrNumbers` reads as internally
+ * contradictory (see that function). Either way, this fix PR itself says (or cannot be
+ * trusted to say) it isn't tied to a particular prior PR, so it must not stand in as
+ * file-overlap evidence that some OTHER candidate PR was bug-introducing — a preventive
+ * or unrelated fix touching the same files is not evidence of anything. A PR that never
+ * carries the trailer at all (pre-convention, or simply omitted) is NOT excluded here:
+ * absence isn't a declaration either way, so it still falls through to the overlap
+ * fallback, same as before this existed.
+ */
+function declaresFixesPrNone(body: string): boolean {
+  return hasFixesPrLine(body) && extractFixesPrNumbers(body).length === 0;
+}
+
+/**
  * Follow-up status of `candidate` against `laterPRs` (already filtered to merged after
  * `candidate` and within `followupDays`). Link takes priority; overlap is the fallback
  * ONLY when no PR links to `candidate` — plan.md's Measurement status entry: "same-
  * subsystem follow-ups will be computed from git history instead" once linking is
- * unreliable, i.e. overlap stands in for a missing link, not alongside one.
+ * unreliable, i.e. overlap stands in for a missing link, not alongside one. A later PR
+ * that declares `Fixes-PR: none` (or an equivalent contradictory body) is skipped
+ * entirely in the overlap pass — see `declaresFixesPrNone`.
  */
 export function findFollowUp(candidate: PullRequestData, laterPRs: PullRequestData[]): FollowUpResult {
   for (const later of laterPRs) {
-    if (extractFixesPrNumber(later.body) === candidate.number) {
+    if (extractFixesPrNumbers(later.body).includes(candidate.number)) {
       return { kind: 'link', prNumber: later.number };
     }
   }
   for (const later of laterPRs) {
-    if (isFixTitle(later.title) && filesOverlap(later.files, candidate.files)) {
+    if (isFixTitle(later.title) && !declaresFixesPrNone(later.body) && filesOverlap(later.files, candidate.files)) {
       return { kind: 'overlap', prNumber: later.number };
     }
   }
@@ -446,26 +603,133 @@ export function isEligibleForShadowReview(labels: string[]): boolean {
 }
 
 /**
- * Replays `codex-review.sh`'s `scope_eval` skip-verdict rule (`codex-review.sh:750`,
- * `:765-767`): a PR merges on `verdict=skip` — no review requested at all — iff no
- * changed file matches a `risk:high` glob AND the PR carries neither the `risk:high` nor
- * the `review:requested` label. Both halves already exist as their own exported
- * functions: `isLowRisk` replays the file-glob half (the same glob replay
- * `risk-label.yml` and the merge gate itself use), and `isEligibleForShadowReview` is the
- * identical label check `shadow-review.yml`'s own selection rule uses. Composing them
- * here — rather than re-deriving the rule a third time — is the whole point: the
- * weekly report's reviewed/skipped lane split can never drift from what the gate itself
- * decided at merge time for a given diff and label set.
+ * Composes `isLowRisk` (the file-glob half of `codex-review.sh`'s `scope_eval`
+ * skip-verdict rule, `codex-review.sh:750`,`:765-767`) with `isEligibleForShadowReview`
+ * (the identical label check `shadow-review.yml`'s own selection rule uses) against
+ * `riskHighGlobs`/`pr.labels` AS GIVEN — CURRENT state, whatever the caller passes.
  *
- * Same caveat as `computeShadowCoverage` (`LABEL_DRIFT_CAVEAT`): `labels` is read as
- * CURRENT labels, which can drift from what they were at merge time.
+ * **This is NOT a historical replay and must never be read as one.** `riskHighGlobs`
+ * grows over time (22 at go-live, 62 as of this file's last edit) and `pr.labels` is a
+ * PR's CURRENT labels, which can drift from what they were at its merge (see
+ * `computeShadowCoverage`'s own `LABEL_DRIFT_CAVEAT`). Calling this with CURRENT globs
+ * against an OLD PR silently answers "would this merge on skip TODAY", not "did it merge
+ * on skip AT ITS OWN MERGE" — the exact bug PR #620 exposed (skipped correctly under the
+ * 22 globs live at its merge; flips to "reviewed" under the 62 live now, and #620 is
+ * itself a linked bug-introducer, so the flip hides a real miss). The weekly report's
+ * post-gate reviewed/skipped lane split uses `classifyAtMergeVerdict` below instead,
+ * which replays `.github/labeler.yml` and labels AS THEY STOOD at each PR's own merge.
+ * This function stays exported for ad-hoc "under today's rules" questions, where CURRENT
+ * state is exactly what's wanted.
  */
 export function isSkipVerdict(pr: PullRequestData, riskHighGlobs: string[]): boolean {
   return isLowRisk(pr.files, riskHighGlobs) && isEligibleForShadowReview(pr.labels);
 }
 
+/**
+ * Classifies a PR's post-gate lane from its `AtMergeContext` — `null`/`undefined`
+ * (context unresolved, or never attempted) fails closed to `'review'`, mirroring
+ * `codex-review.sh scope_eval`'s own philosophy that any doubt about the files or labels
+ * a verdict would be based on is `review`, never `skip` (see that function's own comment,
+ * "Anything that keeps the files from being judged is `review` as well").
+ */
+export function classifyAtMergeVerdict(ctx: AtMergeContext | null | undefined): 'skip' | 'review' {
+  if (ctx == null) return 'review';
+  return isLowRisk(ctx.files, ctx.riskHighGlobs) && isEligibleForShadowReview(ctx.labels) ? 'skip' : 'review';
+}
+
 /** `shadow-review.yml`'s `report` job only ever runs against PRs merged into this branch. */
 const SHADOW_REVIEW_BASE_REF = 'main';
+
+/**
+ * When the risk-scoped merge gate went live: PR #605's `mergedAt`
+ * (`gh pr view 605 --json mergedAt` against davekim917/nanoclaw —
+ * `container/skills/pr-review-loop/scripts/codex-review.sh`'s `merge-check`/`scope_eval`
+ * started gating merges at this instant). Every PR merged before it was auto-reviewed —
+ * there was no skip verdict to have merged on — so the weekly report classifies it by a
+ * plain low-risk/high-risk file class (`isLowRisk` against the CURRENT glob list, same as
+ * the before/after bucket already does), never as "reviewed" or "skipped". A PR merged at
+ * or after this instant gets the real post-gate verdict, replayed via
+ * `classifyAtMergeVerdict`/`AtMergeContext`.
+ */
+export const GATE_GO_LIVE_ISO = '2026-09-10T16:43:16Z';
+
+/**
+ * When the `Fixes-PR:` convention started: PR #642's `mergedAt` (verified via
+ * `gh pr view 642 --json mergedAt`; #642 introduced the gate-integrity change that
+ * requires the trailer on `fix`-titled PRs — plan.md, Tier 1 status). Pinned as a
+ * constant, NOT recomputed via `findConventionStartIso` over each run's own fetch
+ * window: a window that doesn't reach back far enough would compute a LATER date than
+ * the truth, silently misclassifying weeks that are actually link-complete as
+ * `heuristicOnly`/partial. `findConventionStartIso` stays exported for verifying this
+ * constant against a fresh, wide fetch — not for the weekly report to call itself.
+ */
+export const FIXES_PR_CONVENTION_START_ISO = '2026-09-11T12:44:10Z';
+
+// ─────────────────────────── at-merge replay (pure) ────────────────────────
+//
+// The pure half of reconstructing a PR's `AtMergeContext` — codex-review.sh `audit`'s
+// own two mechanisms (`codex-review.sh:663-701` for the base, `:1660-1695` for labels),
+// factored so each is independently testable without a real merge commit or GraphQL
+// response. The I/O half (fetching the merge commit's shape, its label-event timeline,
+// the compare listing, and `.github/labeler.yml` AT that base) lives in the "gh I/O"
+// section below, in `resolveAtMergeContexts`.
+
+/** One `LabeledEvent`/`UnlabeledEvent` from a PR's timeline, as `audit` itself reads it. */
+export interface RawLabelEvent {
+  type: 'labeled' | 'unlabeled';
+  name: string;
+  createdAt: string; // ISO-8601 UTC
+}
+
+/**
+ * Replays a PR's label history up to (and including) `mergedAtIso`, mirroring
+ * `codex-review.sh`'s `audit` case's own `reduce` over `labelEvents` sorted by
+ * `createdAt` (`codex-review.sh:1688-1691`): a `LabeledEvent` adds the name, an
+ * `UnlabeledEvent` removes it, applied strictly in time order, and anything after the
+ * merge is not read at all — labels the PR grew or lost afterward say nothing about
+ * what the gate saw when it merged.
+ */
+export function replayLabelsAtMerge(events: readonly RawLabelEvent[], mergedAtIso: string): string[] {
+  const mergedMs = new Date(mergedAtIso).getTime();
+  const relevant = events
+    .filter((e) => new Date(e.createdAt).getTime() <= mergedMs)
+    .slice()
+    .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+  const labels = new Set<string>();
+  for (const e of relevant) {
+    if (e.type === 'labeled') labels.add(e.name);
+    else labels.delete(e.name);
+  }
+  return [...labels];
+}
+
+/** The shape of one PR's merge commit, as `audit` reads it to decide how (and whether)
+ *  it can name the commit the PR merged onto. */
+export interface MergeCommitShape {
+  headRefOid: string;
+  mergeCommitOid: string | null;
+  parentOids: string[];
+}
+
+/**
+ * The commit a PR's merge commit merged ONTO, or `null` when that cannot be determined
+ * reliably — mirrors `audit`'s own `shape.method` classification (`codex-review.sh
+ * :1657-1661`), simplified for measurement rather than enforcement: a 2-parent merge
+ * commit whose second parent IS the PR's head names its first parent as the base (a
+ * normal "Create a merge commit" merge); a 1-parent commit names that parent (a squash).
+ * Anything else — 0 or 3+ parents, or a 2-parent commit whose second parent ISN'T this
+ * PR's head (an octopus merge, or a base resolved for the wrong head) — is NOT trusted:
+ * `null`, so the caller fails closed to `review` rather than guess. Unlike `audit`, this
+ * does not require the commit be GitHub-signed: that check exists to prove GitHub (not
+ * a human with push access) made the commit, which matters for a merge GATE's authority
+ * but not for reading which commit history a diff should be measured against.
+ */
+export function resolveAtMergeBaseSha(shape: MergeCommitShape): string | null {
+  if (shape.mergeCommitOid === null) return null;
+  if (shape.parentOids.length === 2 && shape.parentOids[1] === shape.headRefOid) return shape.parentOids[0];
+  if (shape.parentOids.length === 1) return shape.parentOids[0];
+  return null;
+}
 
 /**
  * When shadow review went live: PR #660's merge time (`gh pr view 660 --json mergedAt`
@@ -755,12 +1019,39 @@ export function computeReport(
 // functions above — one row per ISO week of PRs merged into `main`, not a single
 // before/after split. It answers the tracking-issue question directly: for THIS week,
 // how many PRs merged reviewed vs skipped, how many reverted, and how many drew a
-// follow-up fix, at both the PR-count grain and per 1,000 changed lines (Cosmos's "per
-// output unit"). Nothing here re-derives matching logic: every row is built from
-// `isSkipVerdict`, `findFollowUp`, `isRevertPR` and `isoWeekKey`, the same functions the
-// before/after bucket and `weeklyRevertRate` already use.
+// follow-up fix, at both the PR-count grain and per 1,000 changed lines. These are this
+// file's OWN definitions — Augment's Cosmos post names neither its output unit nor its
+// matching method, so a number here is not directly comparable to Cosmos's, only to an
+// earlier run of this same query.
+//
+// **Pre-gate vs. post-gate.** `GATE_GO_LIVE_ISO` (PR #605) is when the skip verdict
+// itself started existing. A PR merged before it was auto-reviewed unconditionally —
+// there was no gate to have merged on skip — so counting it as "reviewed" or "skipped"
+// answers a question that didn't apply yet. Such a PR gets a purely DESCRIPTIVE
+// low-risk/high-risk file class instead (`isLowRisk` against the CURRENT glob list,
+// same as the before/after bucket already does), reported under `preGate*` fields, never
+// folded into `reviewed`/`skipped`. A PR merged at or after go-live gets the real verdict,
+// replayed AT ITS OWN MERGE via `classifyAtMergeVerdict`/`AtMergeContext` — never a
+// CURRENT-state replay: the `risk:high` glob list has grown from 22 at go-live to 62 as
+// of this file's last edit, and PR #620 is the concrete case that growth mis-scores under
+// a naive CURRENT-state replay (skipped correctly under the 22 globs live at its merge;
+// flips to "reviewed" under the 62 live now — and #620 is itself a linked
+// bug-introducer, so the flip would have hidden a real miss instead of exposing it). A
+// week whose PRs straddle go-live (`isMixedGateWeek`) reports BOTH the pre-gate
+// descriptive counts and the post-gate verdict counts, clearly separated, so the table
+// can't be misread as one uniform "reviewed vs skipped" split.
+//
+// **Bug-introducing, ground truth.** A PR counts as bug-introducing (the `linked`
+// count — the only one this file treats as ground truth, never the overlap heuristic)
+// when EITHER a later PR names it via `Fixes-PR:` OR a later PR reverts it
+// (`findRevert`), both within `followupDays` — a revert is exactly as strong evidence
+// that a PR introduced a bug as a linked fix is, and #608 (reverted by #610, never
+// itself `Fixes-PR:`-linked) would otherwise silently not count as one.
 
-/** One lane's (overall / reviewed / skipped) follow-up counts for one week. */
+/** One lane's (overall / reviewed / skipped) follow-up counts for one week. `linked` is
+ *  the GROUND-TRUTH count — a `Fixes-PR:` link OR a revert found within the window (see
+ *  the section header above); `overlapHeuristic` is the file-overlap fallback, an upper
+ *  bound never folded into `linked`. */
 export interface WeeklyLaneStats {
   merged: number;
   linked: number;
@@ -774,33 +1065,64 @@ export interface WeeklyReviewRow {
   weekStartIso: string;
   weekEndIso: string; // inclusive — the last millisecond of that ISO week, UTC
   merged: number;
+  /** True when this week's PRs straddle `GATE_GO_LIVE_ISO` — some pre-gate, some
+   *  post-gate. Render this prominently: it is the reason `reviewed + skipped` can be
+   *  LESS than `merged` for this row (`preGateMerged` accounts for the rest). */
+  isMixedGateWeek: boolean;
+  /** Merged before `GATE_GO_LIVE_ISO` — descriptive only, see the section header. */
+  preGateMerged: number;
+  preGateLowRisk: number;
+  preGateHighRisk: number;
+  /** Merged at/after `GATE_GO_LIVE_ISO` — `reviewed + skipped + postGateUnresolved`. */
+  postGateMerged: number;
+  /** Post-gate PRs whose at-merge replay verdict is `review`. Rate is over
+   *  `postGateMerged`, NOT `merged` — a mixed week's pre-gate PRs never had a verdict to
+   *  be counted against. */
   reviewed: number;
   reviewedRate: number;
+  /** Post-gate PRs whose at-merge replay verdict is `skip`. */
   skipped: number;
   skippedRate: number;
+  /** Post-gate PRs whose `AtMergeContext` could not be resolved at all — counted in
+   *  neither `reviewed` nor `skipped` (fail-closed to "unknown", not silently folded
+   *  into either bucket). Expected to be 0 in ordinary operation; see
+   *  `resolveAtMergeContexts`'s own comment for what can produce one. */
+  postGateUnresolved: number;
+  /** PRs merged THIS WEEK that are themselves reverts (`isRevertPR`) — the numerator of
+   *  the WEEKLY revert rate. A different thing from a low-risk PR LATER reverted, which
+   *  the cumulative before/after bucket (`BucketResult.reverted`) reports instead —
+   *  `renderWeeklyMarkdown` labels both explicitly so the two never sit side by side
+   *  looking like the same number. */
   reverted: number;
   revertRate: number;
+  /** additions+deletions summed over the week, EXCLUDING `GENERATED_FILES` (see
+   *  `generatedFileChangedLines`) — the kLOC denominator below. */
   changedLines: number;
-  overall: WeeklyLaneStats;
-  reviewedLane: WeeklyLaneStats;
-  skippedLane: WeeklyLaneStats;
-  /** Overall linked (ground-truth) bug-introducing count per 1,000 changed lines. 0 when
-   *  `changedLines` is 0 — an all-deletion or metadata-only week, not a divide-by-zero. */
+  overall: WeeklyLaneStats; // over ALL PRs this week, pre- and post-gate alike
+  reviewedLane: WeeklyLaneStats; // over POST-GATE reviewed PRs only
+  skippedLane: WeeklyLaneStats; // over POST-GATE skipped PRs only
+  /** Overall linked (ground-truth) bug-introducing count per 1,000 non-generated changed
+   *  lines. 0 when `changedLines` is 0 — an all-deletion or metadata-only week, not a
+   *  divide-by-zero. */
   linkedPerKLoc: number;
   /** `--followup-days` have not yet passed since `weekEndIso` — this week's follow-up
    *  counts can still change and are not a final read. */
   immature: boolean;
-  /** This week ended before the `Fixes-PR:` convention started (see
-   *  `findConventionStartIso`): its `linked`/`linkedPerKLoc` counts read as 0 not
-   *  because no follow-up existed, but because the convention that makes a follow-up
-   *  DISCOVERABLE by link wasn't in force yet. Only the overlap heuristic (an upper
-   *  bound, never ground truth — see the file header) says anything about this week. */
-  heuristicOnly: boolean;
+  /** `weekStartIso >= FIXES_PR_CONVENTION_START_ISO` — every PR in this week merged
+   *  after the `Fixes-PR:` convention started, so its `linked` count is a real read, not
+   *  an artifact of the convention not existing yet. `false` means "partial": some (see
+   *  `preConventionMerged`) or all of this week's PRs predate the convention, and their
+   *  `linked` contribution reads as an undercount, not a true zero — only the overlap
+   *  heuristic (an upper bound, never ground truth) says anything about THOSE PRs. */
+  linkComplete: boolean;
+  /** PRs in this week merged before `FIXES_PR_CONVENTION_START_ISO` — 0 whenever
+   *  `linkComplete` is true. */
+  preConventionMerged: number;
 }
 
 export interface WeeklyReport {
   rows: WeeklyReviewRow[];
-  conventionStartIso: string | null;
+  conventionStartIso: string; // always FIXES_PR_CONVENTION_START_ISO — pinned, not recomputed (see that constant)
 }
 
 /**
@@ -827,7 +1149,10 @@ export function isoWeekDateRange(isoWeek: string): { startIso: string; endIso: s
 }
 
 /** `lanePRs`' follow-up counts against `sortedAll` (every fetched PR, ascending), within
- *  `followupDays` of each candidate's own merge — same window rule `buildBucket` uses. */
+ *  `followupDays` of each candidate's own merge — same window rule `buildBucket` uses.
+ *  `linked` counts a `Fixes-PR:` link OR a revert found in that same window as ground
+ *  truth (see the section header's "Bug-introducing, ground truth"); a candidate never
+ *  double-counts even when both apply. */
 function weeklyLaneStats(
   lanePRs: readonly PullRequestData[],
   sortedAll: readonly PullRequestData[],
@@ -843,7 +1168,8 @@ function weeklyLaneStats(
       return other.number !== candidate.number && t > mergedMs && t <= cutoffMs;
     });
     const followUp = findFollowUp(candidate, laterPRs);
-    if (followUp.kind === 'link') linked += 1;
+    const revertedWithinWindow = findRevert(candidate, laterPRs) !== null;
+    if (followUp.kind === 'link' || revertedWithinWindow) linked += 1;
     else if (followUp.kind === 'overlap') overlapHeuristic += 1;
   }
   const n = lanePRs.length;
@@ -862,12 +1188,28 @@ function buildWeeklyRow(
   sortedAll: readonly PullRequestData[],
   riskHighGlobs: string[],
   followupDays: number,
-  conventionStartIso: string | null,
   nowMs: number,
 ): WeeklyReviewRow {
   const { startIso, endIso } = isoWeekDateRange(isoWeek);
-  const reviewedPRs = weekPRs.filter((pr) => !isSkipVerdict(pr, riskHighGlobs));
-  const skippedPRs = weekPRs.filter((pr) => isSkipVerdict(pr, riskHighGlobs));
+  const goLiveMs = new Date(GATE_GO_LIVE_ISO).getTime();
+  const conventionStartMs = new Date(FIXES_PR_CONVENTION_START_ISO).getTime();
+
+  const preGatePRs = weekPRs.filter((pr) => new Date(pr.mergedAt).getTime() < goLiveMs);
+  const postGatePRs = weekPRs.filter((pr) => new Date(pr.mergedAt).getTime() >= goLiveMs);
+  // `classifyAtMergeVerdict` itself fails closed to `'review'` for a nullish context —
+  // correct for a caller that only wants one bit ("would this have gated?"), but WRONG
+  // here on its own: it would silently fold every unresolved PR into `reviewed`,
+  // contradicting `postGateUnresolved`'s own contract ("neither reviewed nor skipped").
+  // So resolution is checked FIRST, before the verdict is even asked for.
+  const isResolved = (pr: PullRequestData): boolean => pr.atMergeContext != null;
+  const reviewedPRs = postGatePRs.filter(
+    (pr) => isResolved(pr) && classifyAtMergeVerdict(pr.atMergeContext) === 'review',
+  );
+  const skippedPRs = postGatePRs.filter((pr) => isResolved(pr) && classifyAtMergeVerdict(pr.atMergeContext) === 'skip');
+  const postGateUnresolved = postGatePRs.filter((pr) => !isResolved(pr)).length;
+
+  const preGateLowRisk = preGatePRs.filter((pr) => isLowRisk(pr.files, riskHighGlobs)).length;
+
   const reverted = weekPRs.filter(isRevertPR).length;
   const changedLines = weekPRs.reduce((sum, pr) => sum + pr.changedLines, 0);
 
@@ -876,16 +1218,29 @@ function buildWeeklyRow(
   const skippedLane = weeklyLaneStats(skippedPRs, sortedAll, followupDays);
 
   const n = weekPRs.length;
+  const postGateMerged = postGatePRs.length;
   const weekEndMs = new Date(endIso).getTime();
+  const weekStartMs = new Date(startIso).getTime();
+  const linkComplete = weekStartMs >= conventionStartMs;
+  const preConventionMerged = linkComplete
+    ? 0
+    : weekPRs.filter((pr) => new Date(pr.mergedAt).getTime() < conventionStartMs).length;
+
   return {
     isoWeek,
     weekStartIso: startIso,
     weekEndIso: endIso,
     merged: n,
+    isMixedGateWeek: preGatePRs.length > 0 && postGatePRs.length > 0,
+    preGateMerged: preGatePRs.length,
+    preGateLowRisk,
+    preGateHighRisk: preGatePRs.length - preGateLowRisk,
+    postGateMerged,
     reviewed: reviewedPRs.length,
-    reviewedRate: n === 0 ? 0 : reviewedPRs.length / n,
+    reviewedRate: postGateMerged === 0 ? 0 : reviewedPRs.length / postGateMerged,
     skipped: skippedPRs.length,
-    skippedRate: n === 0 ? 0 : skippedPRs.length / n,
+    skippedRate: postGateMerged === 0 ? 0 : skippedPRs.length / postGateMerged,
+    postGateUnresolved,
     reverted,
     revertRate: n === 0 ? 0 : reverted / n,
     changedLines,
@@ -894,7 +1249,8 @@ function buildWeeklyRow(
     skippedLane,
     linkedPerKLoc: changedLines === 0 ? 0 : overall.linked / (changedLines / 1000),
     immature: nowMs < weekEndMs + followupDays * MS_PER_DAY,
-    heuristicOnly: conventionStartIso === null || weekEndMs < new Date(conventionStartIso).getTime(),
+    linkComplete,
+    preConventionMerged,
   };
 }
 
@@ -902,7 +1258,10 @@ function buildWeeklyRow(
  * One row per ISO week of PRs merged into `main`, ascending. `allPRs` need not be
  * pre-filtered to `main` — filtered here, same as `computeShadowCoverage` filters by
  * `baseRefName` for its own reason. `nowIso` defaults to the real current time; tests
- * pin it explicitly so the `immature` flag is deterministic.
+ * pin it explicitly so the `immature` flag is deterministic. Post-gate lane
+ * classification reads each PR's OWN `atMergeContext` (set by `resolveAtMergeContexts`,
+ * or left `undefined` for a pre-gate PR / a fixture that isn't exercising it) — this
+ * function does no I/O and assumes that resolution already happened.
  */
 export function computeWeeklyReport(
   allPRs: readonly PullRequestData[],
@@ -912,7 +1271,6 @@ export function computeWeeklyReport(
 ): WeeklyReport {
   const mainPRs = allPRs.filter((pr) => pr.baseRefName === SHADOW_REVIEW_BASE_REF);
   const sorted = [...mainPRs].sort((a, b) => new Date(a.mergedAt).getTime() - new Date(b.mergedAt).getTime());
-  const conventionStartIso = findConventionStartIso(sorted);
   const nowMs = new Date(nowIso).getTime();
 
   const buckets = new Map<string, PullRequestData[]>();
@@ -925,11 +1283,9 @@ export function computeWeeklyReport(
 
   const rows = [...buckets.entries()]
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-    .map(([isoWeek, weekPRs]) =>
-      buildWeeklyRow(isoWeek, weekPRs, sorted, riskHighGlobs, followupDays, conventionStartIso, nowMs),
-    );
+    .map(([isoWeek, weekPRs]) => buildWeeklyRow(isoWeek, weekPRs, sorted, riskHighGlobs, followupDays, nowMs));
 
-  return { rows, conventionStartIso };
+  return { rows, conventionStartIso: FIXES_PR_CONVENTION_START_ISO };
 }
 
 function pctStr(rate: number): string {
@@ -946,48 +1302,83 @@ export function renderWeeklyMarkdown(weekly: WeeklyReport, cumulative: ReportRes
   lines.push('## Review metrics (weekly)');
   lines.push('');
   lines.push(
-    `Convention start (\`Fixes-PR:\` line first seen): ${weekly.conventionStartIso ?? '_not yet observed_'}. ` +
-      'A week ending before that instant is marked `heuristic-only` below: its `linked` count reads as 0 ' +
-      'because the convention that makes a follow-up discoverable by link was not yet in force, not because ' +
-      'no follow-up existed — only the overlap heuristic (an upper bound, never ground truth) says anything ' +
-      'about it.',
+    "These are this file's own definitions, not a reproduction of Augment's Cosmos post — " +
+      'that post names neither its output unit nor its matching method, so a number below is ' +
+      "comparable only to an earlier run of this same query, not to Cosmos's figures.",
+  );
+  lines.push('');
+  lines.push(
+    `The merge gate went live ${GATE_GO_LIVE_ISO} (PR #605): a week entirely before it has no ` +
+      '`reviewed`/`skipped` verdict at all (there was no gate to merge on), so it reports a ' +
+      'plain low-risk/high-risk **file class** instead, under separate `pre-gate` columns. A ' +
+      '`mixed` week straddles that instant — its `reviewed`/`skipped` counts and rates are OVER ' +
+      "POST-GATE PRs ONLY, not over the whole week's `n`.",
+  );
+  lines.push('');
+  lines.push(
+    `The \`Fixes-PR:\` convention started ${weekly.conventionStartIso} (PR #642): a week whose ` +
+      'own start precedes that instant is `partial`, not `link-complete` — some or all of its ' +
+      "PRs' `linked` contribution is an undercount, not a true zero, because the convention " +
+      "that makes a follow-up discoverable by link wasn't in force yet for them. Only the " +
+      'overlap heuristic (an upper bound, never ground truth) says anything about those PRs.',
   );
   lines.push('');
   const shown = weekly.rows.slice(-weeksToShow);
   lines.push(`### Last ${shown.length} week(s) of ${weekly.rows.length} total`);
   lines.push('');
   lines.push(
-    '| Week | Range (UTC) | n | Reviewed | Skipped | Reverted | Bug-introducing (linked) | Bug-introducing (overlap, upper bound) | Per 1k LOC | Status |',
+    '| Week | Range (UTC) | n | Pre-gate: low/high-risk | Reviewed (of post-gate) | Skipped (of post-gate) | ' +
+      'Unresolved | This-week reverts | Bug-introducing: linked (ground truth) | ' +
+      'Bug-introducing: linked+overlap (upper bound) | Per 1k LOC | Status |',
   );
-  lines.push('|---|---|---|---|---|---|---|---|---|---|');
+  lines.push('|---|---|---|---|---|---|---|---|---|---|---|---|');
   for (const row of shown) {
     const range = `${row.weekStartIso.slice(0, 10)} – ${row.weekEndIso.slice(0, 10)}`;
-    const status = [row.immature ? 'immature' : null, row.heuristicOnly ? 'heuristic-only' : null]
+    const gate = row.isMixedGateWeek ? 'mixed' : row.preGateMerged > 0 ? 'pre-gate' : 'post-gate';
+    const status = [
+      row.immature ? 'immature' : null,
+      row.linkComplete ? null : `partial (${row.preConventionMerged} pre-convention)`,
+    ]
       .filter((s): s is string => s !== null)
       .join(', ');
+    const upperBound = row.overall.linked + row.overall.overlapHeuristic;
+    const upperBoundRate = row.overall.merged === 0 ? 0 : upperBound / row.overall.merged;
     lines.push(
-      `| ${row.isoWeek} | ${range} | ${row.merged} | ${row.reviewed} (${pctStr(row.reviewedRate)}) | ` +
-        `${row.skipped} (${pctStr(row.skippedRate)}) | ${row.reverted} (${pctStr(row.revertRate)}) | ` +
+      `| ${row.isoWeek} | ${range} | ${row.merged} (${gate}) | ${row.preGateLowRisk}/${row.preGateHighRisk} | ` +
+        `${row.reviewed} (${pctStr(row.reviewedRate)}) | ${row.skipped} (${pctStr(row.skippedRate)}) | ` +
+        `${row.postGateUnresolved} | ${row.reverted} (${pctStr(row.revertRate)}) | ` +
         `${row.overall.linked}/${row.overall.merged} (${pctStr(row.overall.linkedRate)}) | ` +
-        `${row.overall.overlapHeuristic}/${row.overall.merged} (${pctStr(row.overall.overlapHeuristicRate)}) | ` +
+        `${upperBound}/${row.overall.merged} (${pctStr(upperBoundRate)}) | ` +
         `${row.linkedPerKLoc.toFixed(3)} | ${status || 'final'} |`,
     );
   }
   lines.push('');
-  lines.push('Per lane (reviewed vs skipped), bug-introducing rate by link (ground truth) and overlap (heuristic):');
+  lines.push(
+    'Per lane (reviewed vs skipped, POST-GATE PRs only), bug-introducing rate by link ' +
+      '(ground truth) and the linked+overlap upper bound:',
+  );
   lines.push('');
-  lines.push('| Week | Reviewed: linked | Reviewed: overlap | Skipped: linked | Skipped: overlap |');
+  lines.push('| Week | Reviewed: linked | Reviewed: upper bound | Skipped: linked | Skipped: upper bound |');
   lines.push('|---|---|---|---|---|');
   for (const row of shown) {
+    const reviewedBound = row.reviewedLane.linked + row.reviewedLane.overlapHeuristic;
+    const reviewedBoundRate = row.reviewedLane.merged === 0 ? 0 : reviewedBound / row.reviewedLane.merged;
+    const skippedBound = row.skippedLane.linked + row.skippedLane.overlapHeuristic;
+    const skippedBoundRate = row.skippedLane.merged === 0 ? 0 : skippedBound / row.skippedLane.merged;
     lines.push(
       `| ${row.isoWeek} | ${row.reviewedLane.linked}/${row.reviewedLane.merged} (${pctStr(row.reviewedLane.linkedRate)}) | ` +
-        `${row.reviewedLane.overlapHeuristic}/${row.reviewedLane.merged} (${pctStr(row.reviewedLane.overlapHeuristicRate)}) | ` +
+        `${reviewedBound}/${row.reviewedLane.merged} (${pctStr(reviewedBoundRate)}) | ` +
         `${row.skippedLane.linked}/${row.skippedLane.merged} (${pctStr(row.skippedLane.linkedRate)}) | ` +
-        `${row.skippedLane.overlapHeuristic}/${row.skippedLane.merged} (${pctStr(row.skippedLane.overlapHeuristicRate)}) |`,
+        `${skippedBound}/${row.skippedLane.merged} (${pctStr(skippedBoundRate)}) |`,
     );
   }
   lines.push('');
   lines.push(`### Cumulative, ±${cumulative.days}d around the switch (${cumulative.switchIso})`);
+  lines.push('');
+  lines.push(
+    '_"Reverted" here is a DIFFERENT definition from the weekly table above: this is low-risk ' +
+      'PRs LATER reverted (within the before/after window), not PRs that are themselves reverts._',
+  );
   lines.push('');
   lines.push('| | Before | After |');
   lines.push('|---|---|---|');
@@ -1002,7 +1393,7 @@ export function renderWeeklyMarkdown(weekly: WeeklyReport, cumulative: ReportRes
       `${cumulative.after.followedUpByOverlap} (${pctStr(cumulative.after.followedUpByOverlapRate)}) |`,
   );
   lines.push(
-    `| Reverted | ${cumulative.before.reverted} (${pctStr(cumulative.before.revertedRate)}) | ` +
+    `| Low-risk PRs later reverted | ${cumulative.before.reverted} (${pctStr(cumulative.before.revertedRate)}) | ` +
       `${cumulative.after.reverted} (${pctStr(cumulative.after.revertedRate)}) |`,
   );
   lines.push(
@@ -1031,6 +1422,8 @@ function fetchLabelerYaml(repo: string): string {
 interface RawPrFile {
   path?: string;
   filename?: string;
+  additions?: number;
+  deletions?: number;
 }
 
 interface RawPrLabel {
@@ -1050,18 +1443,42 @@ interface RawPr {
   deletions: number;
 }
 
-function fetchAllFilesViaRest(repo: string, prNumber: number): string[] {
-  const raw = gh(['api', `repos/${repo}/pulls/${prNumber}/files`, '--paginate', '--slurp']);
-  const pages = JSON.parse(raw) as RawPrFile[][];
-  return pages.flat().map((f) => f.filename ?? f.path ?? '');
+interface ResolvedFileEntry {
+  path: string;
+  additions: number;
+  deletions: number;
 }
 
-function resolveFiles(repo: string, pr: RawPr): string[] {
+function fetchAllFileEntriesViaRest(repo: string, prNumber: number): ResolvedFileEntry[] {
+  const raw = gh(['api', `repos/${repo}/pulls/${prNumber}/files`, '--paginate', '--slurp']);
+  const pages = JSON.parse(raw) as RawPrFile[][];
+  return pages
+    .flat()
+    .map((f) => ({ path: f.filename ?? f.path ?? '', additions: f.additions ?? 0, deletions: f.deletions ?? 0 }));
+}
+
+function resolveFileEntries(repo: string, pr: RawPr): ResolvedFileEntry[] {
   if (pr.files.length < pr.changedFiles) {
     // gh pr list's `files` field truncates on large PRs; changedFiles is the true total.
-    return fetchAllFilesViaRest(repo, pr.number);
+    return fetchAllFileEntriesViaRest(repo, pr.number);
   }
-  return pr.files.map((f) => f.path ?? f.filename ?? '');
+  return pr.files.map((f) => ({
+    path: f.path ?? f.filename ?? '',
+    additions: f.additions ?? 0,
+    deletions: f.deletions ?? 0,
+  }));
+}
+
+/**
+ * Sum of `additions`+`deletions` across files this suite already treats as generated
+ * noise (`GENERATED_FILES`) — excluded from the weekly report's kLOC denominator for the
+ * same reason the file header already excludes them from file-overlap matching:
+ * `src/upstream-ratchet.json` alone produced 32 of 93 overlap matches in an early run,
+ * because every upstream-owned edit regenerates it, and a huge auto-regenerated diff
+ * would dilute a per-output-unit rate the same way.
+ */
+export function generatedFileChangedLines(entries: readonly ResolvedFileEntry[]): number {
+  return entries.filter((e) => GENERATED_FILES.has(e.path)).reduce((sum, e) => sum + e.additions + e.deletions, 0);
 }
 
 export function fetchMergedPRs(repo: string, sinceIso: string): PullRequestData[] {
@@ -1080,16 +1497,230 @@ export function fetchMergedPRs(repo: string, sinceIso: string): PullRequestData[
     '1000',
   ]);
   const prs = JSON.parse(raw) as RawPr[];
-  return prs.map((pr) => ({
-    number: pr.number,
-    title: pr.title,
-    body: pr.body ?? '',
-    mergedAt: pr.mergedAt,
-    files: resolveFiles(repo, pr),
-    labels: (pr.labels ?? []).map((label) => label.name),
-    baseRefName: pr.baseRefName,
-    changedLines: pr.additions + pr.deletions,
-  }));
+  return prs.map((pr) => {
+    const fileEntries = resolveFileEntries(repo, pr);
+    return {
+      number: pr.number,
+      title: pr.title,
+      body: pr.body ?? '',
+      mergedAt: pr.mergedAt,
+      files: fileEntries.map((f) => f.path),
+      labels: (pr.labels ?? []).map((label) => label.name),
+      baseRefName: pr.baseRefName,
+      changedLines: Math.max(0, pr.additions + pr.deletions - generatedFileChangedLines(fileEntries)),
+      changedFiles: pr.changedFiles,
+    };
+  });
+}
+
+// ─────────────────────────── at-merge replay (I/O) ─────────────────────────
+//
+// Resolves `AtMergeContext` for every PR merged at/after `GATE_GO_LIVE_ISO` — the I/O
+// half of the pure functions above. Deliberately scoped to POST-GATE PRs only: a
+// pre-gate PR was never subject to any skip verdict at all (see the file header and
+// `GATE_GO_LIVE_ISO`'s own doc comment), so spending a GraphQL + two REST calls per PR
+// on history that predates the gate would only cost budget for a number nobody reads.
+//
+// Cost note (a known, deliberately deferred scaling concern, not fixed here): this
+// population only grows — every week that passes adds its PRs to "post-gate" and none
+// ever leave. At this file's last measurement (2026-09-12, ~68 post-gate PRs since
+// go-live two days earlier) a full run took well under a minute. Once `--weekly-days`'
+// window is mostly post-gate PRs (a few weeks from now, at this repo's throughput),
+// this may need a persistent cache keyed by PR number — an at-merge fact is immutable
+// once computed, so the RIGHT fix is caching the RESULT, not narrowing the window. Re-
+// raise if a real run starts approaching the 2-minute Actions budget the workflow's own
+// header cites.
+
+interface RawAtMergeLabelEventNode {
+  __typename: 'LabeledEvent' | 'UnlabeledEvent';
+  createdAt: string;
+  label: { name: string } | null;
+}
+
+interface RawAtMergePrNode {
+  headRefOid: string;
+  mergeCommit: { oid: string; parents: { totalCount: number; nodes: { oid: string }[] } } | null;
+  labelEvents: { pageInfo: { hasNextPage: boolean }; nodes: RawAtMergeLabelEventNode[] };
+}
+
+const AT_MERGE_GRAPHQL_BATCH_SIZE = 15;
+
+/**
+ * One batched GraphQL call per `AT_MERGE_GRAPHQL_BATCH_SIZE` PR numbers — every PR
+ * aliased (`pr0`, `pr1`, ...) in a single query, rather than one call per PR, to keep
+ * this bounded as the post-gate population grows. PR numbers are our own already-
+ * fetched integers (never PR-authored text), so inlining them directly into the query
+ * string, instead of threading N `-F` variables through aliases, is safe here.
+ */
+function fetchAtMergeGitContextBatch(repo: string, prNumbers: readonly number[]): Map<number, RawAtMergePrNode> {
+  const [owner, name] = repo.split('/');
+  const fields = prNumbers
+    .map(
+      (n, i) => `pr${i}: pullRequest(number: ${n}) {
+        headRefOid
+        mergeCommit { oid parents(first: 3) { totalCount nodes { oid } } }
+        labelEvents: timelineItems(itemTypes: [LABELED_EVENT, UNLABELED_EVENT], first: 100) {
+          pageInfo { hasNextPage }
+          nodes {
+            __typename
+            ... on LabeledEvent { createdAt label { name } }
+            ... on UnlabeledEvent { createdAt label { name } }
+          }
+        }
+      }`,
+    )
+    .join('\n');
+  const query = `query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) {\n${fields}\n} }`;
+  const raw = gh(['api', 'graphql', '-f', `query=${query}`, '-F', `owner=${owner}`, '-F', `name=${name}`]);
+  const parsed = JSON.parse(raw) as { data: { repository: Record<string, RawAtMergePrNode | null> } };
+  const result = new Map<number, RawAtMergePrNode>();
+  prNumbers.forEach((n, i) => {
+    const node = parsed.data.repository[`pr${i}`];
+    if (node) result.set(n, node);
+  });
+  return result;
+}
+
+interface RawCompareFile {
+  filename?: string;
+  previous_filename?: string;
+}
+
+/**
+ * The merge commit's diff against `baseSha`, mirroring `codex-review.sh scope_eval`'s
+ * own completeness rule EXACTLY (`codex-review.sh:756-760`): a comparison lists at most
+ * 300 files, and if the listed count doesn't match GitHub's own `changedFiles` for this
+ * PR, the listing is incomplete — either way, `null` (fail closed), never a partial
+ * list read as the whole truth. Includes each rename's `previous_filename` alongside
+ * its new name, same as `scope_eval`: moving a file OFF a risky path still changes that
+ * path.
+ */
+function fetchFilesAtMerge(
+  repo: string,
+  baseSha: string,
+  mergeCommitOid: string,
+  changedFiles: number,
+): string[] | null {
+  let raw: string;
+  try {
+    raw = gh(['api', `repos/${repo}/compare/${baseSha}...${mergeCommitOid}?per_page=1`]);
+    // Deliberately fail closed to `null` (unresolvable at-merge context) on ANY `gh api`
+    // failure — a network error, a 404 for a commit GitHub has since garbage-collected,
+    // anything — same "any doubt is review, never skip" rule `scope_eval` itself applies.
+    // eslint-disable-next-line no-catch-all/no-catch-all
+  } catch {
+    return null;
+  }
+  let parsed: { files?: RawCompareFile[] };
+  try {
+    parsed = JSON.parse(raw) as { files?: RawCompareFile[] };
+    // Same fail-closed reasoning: unparseable JSON from `gh` is not a listing to trust.
+    // eslint-disable-next-line no-catch-all/no-catch-all
+  } catch {
+    return null;
+  }
+  const files = parsed.files;
+  if (!Array.isArray(files)) return null;
+  const names = new Set<string>();
+  for (const f of files) {
+    if (typeof f.filename !== 'string') return null;
+    names.add(f.filename);
+    if (typeof f.previous_filename === 'string') names.add(f.previous_filename);
+  }
+  const listedCount = new Set(files.map((f) => f.filename)).size;
+  if (listedCount >= 300) return null; // GitHub's per-comparison cap — some files may be missing
+  if (listedCount !== changedFiles) return null; // count mismatch — incomplete or wrong listing
+  return [...names];
+}
+
+const riskHighGlobsAtShaCache = new Map<string, string[] | null>();
+
+/**
+ * `risk:high` from `.github/labeler.yml` AT commit `sha` — never the current tip.
+ * Memoized per sha: consecutive PRs' at-merge bases are usually distinct commits (each
+ * merge advances `main`'s first-parent chain by one), so this rarely re-hits, but costs
+ * nothing when it does. `null` — fail closed — when the file didn't exist at that
+ * commit yet (a PR merged before `.github/labeler.yml` itself landed) or couldn't be
+ * read or parsed.
+ */
+function fetchRiskHighGlobsAtSha(repo: string, sha: string): string[] | null {
+  const cached = riskHighGlobsAtShaCache.get(sha);
+  if (cached !== undefined) return cached;
+  let globs: string[] | null;
+  try {
+    const raw = gh([
+      'api',
+      `repos/${repo}/contents/.github/labeler.yml?ref=${sha}`,
+      '-H',
+      'Accept: application/vnd.github.raw',
+    ]);
+    globs = globsForRiskHigh(parse(raw) as Record<string, unknown>);
+    // Fail closed to `null` whether the file didn't exist yet at this commit (a 404 — a
+    // PR merged before `.github/labeler.yml` itself landed), the YAML failed to parse,
+    // or `globsForRiskHigh` rejected its shape: none of those is a `risk:high` list this
+    // replay can trust.
+    // eslint-disable-next-line no-catch-all/no-catch-all
+  } catch {
+    globs = null;
+  }
+  riskHighGlobsAtShaCache.set(sha, globs);
+  return globs;
+}
+
+/**
+ * Resolves `AtMergeContext` (or `null`, fail-closed) for every PR in `prs` merged at or
+ * after `GATE_GO_LIVE_ISO`; a PR merged before it is left absent from the returned map
+ * entirely (never attempted — see the section header above). `prs` needs only the three
+ * fields the resolution actually reads, so a caller can pass raw fetch data straight
+ * through without building full `PullRequestData` first.
+ */
+export function resolveAtMergeContexts(
+  repo: string,
+  prs: readonly { number: number; mergedAt: string; changedFiles: number }[],
+): Map<number, AtMergeContext | null> {
+  const result = new Map<number, AtMergeContext | null>();
+  const goLiveMs = new Date(GATE_GO_LIVE_ISO).getTime();
+  const postGate = prs.filter((pr) => new Date(pr.mergedAt).getTime() >= goLiveMs);
+  for (let i = 0; i < postGate.length; i += AT_MERGE_GRAPHQL_BATCH_SIZE) {
+    const batch = postGate.slice(i, i + AT_MERGE_GRAPHQL_BATCH_SIZE);
+    const gitContexts = fetchAtMergeGitContextBatch(
+      repo,
+      batch.map((pr) => pr.number),
+    );
+    for (const pr of batch) {
+      const node = gitContexts.get(pr.number);
+      if (!node || !node.mergeCommit || node.labelEvents.pageInfo.hasNextPage) {
+        result.set(pr.number, null);
+        continue;
+      }
+      const shape: MergeCommitShape = {
+        headRefOid: node.headRefOid,
+        mergeCommitOid: node.mergeCommit.oid,
+        parentOids: node.mergeCommit.parents.nodes.map((p) => p.oid),
+      };
+      const baseSha = resolveAtMergeBaseSha(shape);
+      if (baseSha === null) {
+        result.set(pr.number, null);
+        continue;
+      }
+      const files = fetchFilesAtMerge(repo, baseSha, node.mergeCommit.oid, pr.changedFiles);
+      const riskHighGlobs = files === null ? null : fetchRiskHighGlobsAtSha(repo, baseSha);
+      if (files === null || riskHighGlobs === null) {
+        result.set(pr.number, null);
+        continue;
+      }
+      const events: RawLabelEvent[] = node.labelEvents.nodes
+        .filter((n): n is RawAtMergeLabelEventNode & { label: { name: string } } => n.label !== null)
+        .map((n) => ({
+          type: n.__typename === 'LabeledEvent' ? 'labeled' : 'unlabeled',
+          name: n.label.name,
+          createdAt: n.createdAt,
+        }));
+      const labels = replayLabelsAtMerge(events, pr.mergedAt);
+      result.set(pr.number, { files, labels, riskHighGlobs });
+    }
+  }
+  return result;
 }
 
 interface RawIssue {
@@ -1164,7 +1795,11 @@ export function fetchShadowReviewedPRs(repo: string): number[] {
 function parseArgs(argv: readonly string[]): Options {
   const options: Options = {
     repo: 'davekim917/nanoclaw',
-    switchIso: '2026-09-10T00:00:00Z',
+    // The gate's actual go-live instant (GATE_GO_LIVE_ISO, PR #605's mergedAt) — not a
+    // rounded midnight. Before this correction the default read 2026-09-10T00:00:00Z,
+    // over 16 hours earlier than the real switch, which misclassified every PR merged
+    // in that gap as "after" when the gate hadn't gone live yet.
+    switchIso: GATE_GO_LIVE_ISO,
     days: 30,
     followupDays: 14,
     json: false,
@@ -1331,32 +1966,45 @@ export function computeWeeklyFetchSinceIso(nowIso: string, weeklyDays: number): 
 }
 
 function printWeeklyReport(weekly: WeeklyReport): void {
-  console.log(`review-outcomes --weekly: convention start = ${weekly.conventionStartIso ?? '(not yet observed)'}`);
+  console.log(
+    `review-outcomes --weekly: gate go-live = ${GATE_GO_LIVE_ISO}, Fixes-PR convention start = ${weekly.conventionStartIso}`,
+  );
+  console.log("(these are this file's own definitions — not directly comparable to Augment Cosmos's figures)");
   console.log('');
   for (const row of weekly.rows) {
-    console.log(`${row.isoWeek} (${row.weekStartIso.slice(0, 10)} – ${row.weekEndIso.slice(0, 10)}):`);
+    const gate = row.isMixedGateWeek ? 'mixed' : row.preGateMerged > 0 ? 'pre-gate' : 'post-gate';
+    console.log(`${row.isoWeek} (${row.weekStartIso.slice(0, 10)} – ${row.weekEndIso.slice(0, 10)}) [${gate}]:`);
+    console.log(`  merged: ${row.merged}`);
+    if (row.preGateMerged > 0) {
+      console.log(
+        `  pre-gate (descriptive, NOT a review verdict): ${row.preGateMerged} — low-risk ${row.preGateLowRisk}, high-risk ${row.preGateHighRisk}`,
+      );
+    }
+    if (row.postGateMerged > 0) {
+      console.log(
+        `  post-gate: ${row.postGateMerged} — reviewed ${row.reviewed} (${pct(row.reviewedRate)}), skipped ${row.skipped} (${pct(row.skippedRate)})` +
+          (row.postGateUnresolved > 0 ? `, unresolved ${row.postGateUnresolved}` : ''),
+      );
+    }
+    console.log(`  this-week reverts: ${row.reverted} (${pct(row.revertRate)})`);
+    const overallBound = row.overall.linked + row.overall.overlapHeuristic;
     console.log(
-      `  merged: ${row.merged}  reviewed: ${row.reviewed} (${pct(row.reviewedRate)})  skipped: ${row.skipped} (${pct(row.skippedRate)})`,
-    );
-    console.log(`  reverted: ${row.reverted} (${pct(row.revertRate)})`);
-    console.log(
-      `  bug-introducing — overall:  linked ${row.overall.linked}/${row.overall.merged} (${pct(row.overall.linkedRate)}), ` +
-        `overlap (heuristic upper bound) ${row.overall.overlapHeuristic}/${row.overall.merged} (${pct(row.overall.overlapHeuristicRate)})`,
+      `  bug-introducing — overall: linked (ground truth) ${row.overall.linked}/${row.overall.merged} (${pct(row.overall.linkedRate)}), ` +
+        `linked+overlap (upper bound) ${overallBound}/${row.overall.merged}`,
     );
     console.log(
-      `  bug-introducing — reviewed: linked ${row.reviewedLane.linked}/${row.reviewedLane.merged} (${pct(row.reviewedLane.linkedRate)}), ` +
-        `overlap ${row.reviewedLane.overlapHeuristic}/${row.reviewedLane.merged} (${pct(row.reviewedLane.overlapHeuristicRate)})`,
+      `  bug-introducing — reviewed lane: linked ${row.reviewedLane.linked}/${row.reviewedLane.merged} (${pct(row.reviewedLane.linkedRate)})`,
     );
     console.log(
-      `  bug-introducing — skipped:  linked ${row.skippedLane.linked}/${row.skippedLane.merged} (${pct(row.skippedLane.linkedRate)}), ` +
-        `overlap ${row.skippedLane.overlapHeuristic}/${row.skippedLane.merged} (${pct(row.skippedLane.overlapHeuristicRate)})`,
+      `  bug-introducing — skipped lane:  linked ${row.skippedLane.linked}/${row.skippedLane.merged} (${pct(row.skippedLane.linkedRate)})`,
     );
     console.log(
-      `  linked per 1,000 changed lines: ${row.linkedPerKLoc.toFixed(3)} (changed lines: ${row.changedLines})`,
+      `  linked per 1,000 changed lines (generated files excluded): ${row.linkedPerKLoc.toFixed(3)} (changed lines: ${row.changedLines})`,
     );
-    const flags = [row.immature ? 'immature' : null, row.heuristicOnly ? 'heuristic-only' : null].filter(
-      (f): f is string => f !== null,
-    );
+    const flags = [
+      row.immature ? 'immature' : null,
+      row.linkComplete ? null : `partial (${row.preConventionMerged} pre-convention)`,
+    ].filter((f): f is string => f !== null);
     if (flags.length) console.log(`  flags: ${flags.join(', ')}`);
     console.log('');
   }
@@ -1382,10 +2030,17 @@ function main(): void {
       new Date(weeklySinceIso).getTime() < new Date(beforeAfterSinceIso).getTime()
         ? weeklySinceIso
         : beforeAfterSinceIso;
-    const allPRs = fetchMergedPRs(options.repo, sinceIso);
+    const fetchedPRs = fetchMergedPRs(options.repo, sinceIso);
     const shadowReviewIssues = fetchShadowReviewIssues(options.repo);
     const shadowReviewFailedPrNumbers = fetchShadowReviewFailedPRs(options.repo);
     const shadowReviewedLabelPrNumbers = fetchShadowReviewedPRs(options.repo);
+
+    // Post-gate lane classification needs each PR's OWN at-merge context (never
+    // current-state data — see the "weekly mode" section header's "Pre-gate vs.
+    // post-gate" note). Resolved once here, attached onto each PR object, so
+    // `computeWeeklyReport` itself stays a pure function over `PullRequestData[]`.
+    const atMergeContexts = resolveAtMergeContexts(options.repo, fetchedPRs);
+    const allPRs = fetchedPRs.map((pr) => ({ ...pr, atMergeContext: atMergeContexts.get(pr.number) ?? undefined }));
 
     const cumulative = computeReport(
       allPRs,

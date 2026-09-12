@@ -4,17 +4,21 @@ import { enforceHermeticity } from '../src/test-hermeticity.js';
 
 import {
   buildShadowReviewIndex,
+  classifyAtMergeVerdict,
   computeFetchSinceIso,
   computeReport,
   computeShadowCoverage,
   computeWeeklyFetchSinceIso,
   computeWeeklyReport,
   extractFixesPrNumber,
+  extractFixesPrNumbers,
   extractShadowReviewPrNumber,
   filesOverlap,
   findConventionStartIso,
   findFollowUp,
   findRevert,
+  FIXES_PR_CONVENTION_START_ISO,
+  generatedFileChangedLines,
   globsForRiskHigh,
   hasFixesPrLine,
   isEligibleForShadowReview,
@@ -27,8 +31,11 @@ import {
   isRevertOf,
   isRevertPR,
   matchesAnyGlob,
+  replayLabelsAtMerge,
   renderWeeklyMarkdown,
+  resolveAtMergeBaseSha,
   SHADOW_REVIEW_GO_LIVE_ISO,
+  stripFencedAndCommented,
   type Options,
   type PullRequestData,
   type ShadowReviewIssueData,
@@ -48,6 +55,7 @@ function pr(overrides: Partial<PullRequestData> & { number: number }): PullReque
     labels: [],
     baseRefName: 'main',
     changedLines: 0,
+    changedFiles: overrides.files?.length ?? 0,
     ...overrides,
   };
 }
@@ -782,118 +790,210 @@ describe('computeWeeklyReport', () => {
 
   it('excludes a PR merged into a branch other than main', () => {
     const prs = [
-      pr({ number: 1, mergedAt: '2026-09-08T00:00:00Z', baseRefName: 'release' }),
-      pr({ number: 2, mergedAt: '2026-09-08T00:00:00Z', baseRefName: 'main' }),
+      pr({ number: 1, mergedAt: '2026-09-11T00:00:00Z', baseRefName: 'release' }),
+      pr({ number: 2, mergedAt: '2026-09-11T00:00:00Z', baseRefName: 'main' }),
     ];
-    const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-12T00:00:00Z');
+    const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
     expect(weekly.rows).toHaveLength(1);
     expect(weekly.rows[0]!.merged).toBe(1);
   });
 
-  // The full scenario below is the one verified by hand (tsx one-liner) while building
-  // this function: 3 PRs merge in 2026-W37 (one high-risk, one low-risk-but-labeled
-  // review:requested, one plain low-risk skip), and two "fix" PRs merge the following
-  // week — one linking back via Fixes-PR (ground truth), one only sharing a file with a
-  // fix-shaped title (the overlap heuristic, which must stay a SEPARATE count).
-  describe('a realistic week with both lanes and both follow-up kinds', () => {
+  it('always reports the pinned FIXES_PR_CONVENTION_START_ISO, never a recomputed value', () => {
+    // Every PR here carries a Fixes-PR line dated LATER than the pinned constant — if
+    // conventionStartIso were still recomputed via findConventionStartIso over this
+    // fetch window, it would read as this PR's own (later) mergedAt instead.
+    const prs = [pr({ number: 1, mergedAt: '2026-09-20T00:00:00Z', body: 'Fixes-PR: none' })];
+    const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-25T00:00:00Z');
+    expect(weekly.conventionStartIso).toBe(FIXES_PR_CONVENTION_START_ISO);
+  });
+
+  describe('pre-gate vs. post-gate — P2 #1', () => {
+    it('never counts a pre-gate PR as reviewed or skipped, only as a descriptive file class', () => {
+      // Merged before GATE_GO_LIVE_ISO (2026-09-10T16:43:16Z) — the gate did not exist
+      // yet, so there was no skip verdict to have merged on.
+      const prs = [pr({ number: 601, mergedAt: '2026-09-10T10:00:00Z', files: ['docs/pre.md'] })];
+      const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+      const row = weekly.rows[0]!;
+      expect(row.preGateMerged).toBe(1);
+      expect(row.preGateLowRisk).toBe(1);
+      expect(row.preGateHighRisk).toBe(0);
+      expect(row.postGateMerged).toBe(0);
+      expect(row.reviewed).toBe(0);
+      expect(row.skipped).toBe(0);
+      expect(row.isMixedGateWeek).toBe(false);
+    });
+
+    it('classifies a pre-gate PR high-risk when its files match the (current) risk:high globs', () => {
+      const prs = [pr({ number: 601, mergedAt: '2026-09-10T10:00:00Z', files: ['src/guard/x.ts'] })];
+      const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+      const row = weekly.rows[0]!;
+      expect(row.preGateLowRisk).toBe(0);
+      expect(row.preGateHighRisk).toBe(1);
+    });
+
+    it('flags isMixedGateWeek when a week straddles go-live, and scopes reviewed/skipped to the post-gate subset', () => {
+      const prs = [
+        pr({ number: 601, mergedAt: '2026-09-10T10:00:00Z', files: ['docs/pre.md'] }), // pre-gate
+        pr({
+          number: 602,
+          mergedAt: '2026-09-10T18:00:00Z', // post-gate, same week (2026-W37)
+          files: ['docs/post.md'],
+          atMergeContext: { files: ['docs/post.md'], labels: [], riskHighGlobs: RISK_GLOBS },
+        }),
+      ];
+      const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+      const row = weekly.rows[0]!;
+      expect(row.isMixedGateWeek).toBe(true);
+      expect(row.merged).toBe(2);
+      expect(row.preGateMerged).toBe(1);
+      expect(row.postGateMerged).toBe(1);
+      expect(row.skipped).toBe(1);
+      expect(row.skippedRate).toBe(1); // over postGateMerged (1), not merged (2)
+    });
+
+    it('counts a post-gate PR with an unresolvable at-merge context as unresolved, not reviewed or skipped', () => {
+      const prs = [pr({ number: 604, mergedAt: '2026-09-11T00:00:00Z', atMergeContext: null })];
+      const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+      const row = weekly.rows[0]!;
+      expect(row.postGateMerged).toBe(1);
+      expect(row.reviewed).toBe(0);
+      expect(row.skipped).toBe(0);
+      expect(row.postGateUnresolved).toBe(1);
+    });
+  });
+
+  describe('post-gate lane classification replays the AT-MERGE state, never current state — P2 #2', () => {
+    // The concrete case the review round named: PR #620 was correctly SKIPPED under the
+    // 22 risk:high globs live at its own merge, but flips to "reviewed" under a naive
+    // CURRENT-state replay once the glob list grows to include its path — hiding the
+    // real miss (#620 is itself a linked bug-introducer) instead of exposing it.
+    const CURRENT_RISK_GLOBS = ['src/guard/**', 'src/new-risky/**']; // grew AFTER this PR merged
+    const prAtMergeGlobsOnly = ['src/guard/**']; // what .github/labeler.yml actually held at its merge
+
+    it('stays skipped under the historical glob list even though the CURRENT list would flip it to reviewed', () => {
+      const prs = [
+        pr({
+          number: 620,
+          title: 'feat: z',
+          mergedAt: '2026-09-11T10:00:00Z',
+          files: ['src/new-risky/z.ts'], // matches CURRENT_RISK_GLOBS, not prAtMergeGlobsOnly
+          atMergeContext: { files: ['src/new-risky/z.ts'], labels: [], riskHighGlobs: prAtMergeGlobsOnly },
+        }),
+      ];
+      const weekly = computeWeeklyReport(prs, CURRENT_RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+      const row = weekly.rows[0]!;
+      expect(row.skipped).toBe(1);
+      expect(row.reviewed).toBe(0);
+    });
+
+    it('sanity check: the SAME PR classifies reviewed if its at-merge context had actually carried the current globs', () => {
+      // Confirms the fixture above is a real divergence, not a tautology: swapping
+      // riskHighGlobs to CURRENT_RISK_GLOBS on the same files DOES flip the verdict.
+      const prs = [
+        pr({
+          number: 620,
+          mergedAt: '2026-09-11T10:00:00Z',
+          files: ['src/new-risky/z.ts'],
+          atMergeContext: { files: ['src/new-risky/z.ts'], labels: [], riskHighGlobs: CURRENT_RISK_GLOBS },
+        }),
+      ];
+      const weekly = computeWeeklyReport(prs, CURRENT_RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+      expect(weekly.rows[0]!.reviewed).toBe(1);
+      expect(weekly.rows[0]!.skipped).toBe(0);
+    });
+  });
+
+  it('counts a revert found within the follow-up window as bug-introducing, same as a Fixes-PR link — P2 #5', () => {
+    // #608-style: reverted by a later PR, but never itself named via Fixes-PR:.
+    const prs = [
+      pr({ number: 608, title: 'feat: risky change', mergedAt: '2026-09-11T00:00:00Z' }),
+      pr({ number: 610, title: 'revert(x): back out #608', mergedAt: '2026-09-12T00:00:00Z' }),
+    ];
+    const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+    const row = weekly.rows[0]!;
+    expect(row.overall.linked).toBe(1);
+    expect(row.overall.overlapHeuristic).toBe(0);
+  });
+
+  it('counts link-matched and overlap-heuristic follow-ups separately, per lane, in a mixed week', () => {
     const prs = [
       pr({
         number: 1,
         title: 'fix(guard): a',
-        mergedAt: '2026-09-08T00:00:00Z',
+        mergedAt: '2026-09-11T00:00:00Z',
         files: ['src/guard/x.ts'],
         changedLines: 500,
-      }), // reviewed — high-risk file
-      pr({
-        number: 2,
-        title: 'feat: b',
-        mergedAt: '2026-09-09T00:00:00Z',
-        files: ['docs/b.md'],
-        labels: ['review:requested'],
-        changedLines: 300,
-      }), // reviewed — labeled, despite low-risk files
+        atMergeContext: { files: ['src/guard/x.ts'], labels: [], riskHighGlobs: RISK_GLOBS },
+      }), // reviewed — high-risk at merge
       pr({
         number: 3,
         title: 'feat: c',
-        mergedAt: '2026-09-10T00:00:00Z',
+        mergedAt: '2026-09-12T00:00:00Z',
         files: ['docs/c.md'],
         changedLines: 1200,
+        atMergeContext: { files: ['docs/c.md'], labels: [], riskHighGlobs: RISK_GLOBS },
       }), // skipped
       pr({ number: 4, title: 'fix: patch a', mergedAt: '2026-09-15T00:00:00Z', body: 'Fixes-PR: #1', files: [] }),
       pr({ number: 5, title: 'fix: patch c', mergedAt: '2026-09-16T00:00:00Z', files: ['docs/c.md'] }),
     ];
-    const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-12T00:00:00Z');
+    const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
     const row = weekly.rows[0]!;
-
-    it('splits merged PRs into reviewed/skipped lanes', () => {
-      expect(row.isoWeek).toBe('2026-W37');
-      expect(row.merged).toBe(3);
-      expect(row.reviewed).toBe(2);
-      expect(row.skipped).toBe(1);
-    });
-
-    it('counts link-matched and overlap-heuristic follow-ups separately, overall', () => {
-      expect(row.overall.linked).toBe(1);
-      expect(row.overall.overlapHeuristic).toBe(1);
-    });
-
-    it('reports the bug-introducing rate per lane, not just overall', () => {
-      // #1 (reviewed) was linked by #4 — the reviewed lane's only member, so linked=1/1.
-      expect(row.reviewedLane.merged).toBe(2);
-      expect(row.reviewedLane.linked).toBe(1);
-      expect(row.reviewedLane.overlapHeuristic).toBe(0);
-      // #3 (skipped) was only overlap-matched by #5 (shares docs/c.md, fix-shaped title).
-      expect(row.skippedLane.merged).toBe(1);
-      expect(row.skippedLane.linked).toBe(0);
-      expect(row.skippedLane.overlapHeuristic).toBe(1);
-    });
-
-    it('computes the linked rate per 1,000 changed lines from the linked (ground-truth) count only', () => {
-      // changedLines = 500 + 300 + 1200 = 2000; overall.linked = 1 -> 1 / (2000/1000) = 0.5.
-      expect(row.changedLines).toBe(2000);
-      expect(row.linkedPerKLoc).toBe(0.5);
-    });
-
-    it('flags the week heuristic-only: it ends before the Fixes-PR convention started', () => {
-      // The convention's first sighting is #4's body, merged 2026-09-15 — after this
-      // week (2026-W37) already ended (2026-09-13T23:59:59.999Z).
-      expect(weekly.conventionStartIso).toBe('2026-09-15T00:00:00Z');
-      expect(row.heuristicOnly).toBe(true);
-    });
-
-    it('does not flag the following week heuristic-only once its end is at/after convention start', () => {
-      const nextWeek = weekly.rows[1]!;
-      expect(nextWeek.isoWeek).toBe('2026-W38');
-      expect(nextWeek.heuristicOnly).toBe(false);
-    });
+    expect(row.reviewed).toBe(1);
+    expect(row.skipped).toBe(1);
+    expect(row.overall.linked).toBe(1);
+    expect(row.overall.overlapHeuristic).toBe(1);
+    expect(row.reviewedLane.linked).toBe(1);
+    expect(row.reviewedLane.overlapHeuristic).toBe(0);
+    expect(row.skippedLane.linked).toBe(0);
+    expect(row.skippedLane.overlapHeuristic).toBe(1);
+    // changedLines = 500 + 1200 = 1700; overall.linked = 1 -> 1 / (1700/1000).
+    expect(row.linkedPerKLoc).toBeCloseTo(1 / 1.7);
   });
 
-  it('flags every week heuristic-only when no PR has ever carried a Fixes-PR line', () => {
-    const prs = [pr({ number: 1, mergedAt: '2026-09-08T00:00:00Z' })];
-    const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-12T00:00:00Z');
-    expect(weekly.conventionStartIso).toBeNull();
-    expect(weekly.rows[0]!.heuristicOnly).toBe(true);
-  });
-
-  it('computes the weekly revert rate at the row level', () => {
+  it('computes the weekly revert rate at the row level (PRs that ARE themselves reverts)', () => {
     const prs = [
-      pr({ number: 1, title: 'feat: a', mergedAt: '2026-09-08T00:00:00Z' }),
-      pr({ number: 2, title: 'revert: back out #1', mergedAt: '2026-09-09T00:00:00Z' }),
+      pr({ number: 1, title: 'feat: a', mergedAt: '2026-09-11T00:00:00Z' }),
+      pr({ number: 2, title: 'revert: back out #1', mergedAt: '2026-09-12T00:00:00Z' }),
     ];
-    const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-12T00:00:00Z');
+    const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
     expect(weekly.rows[0]!.reverted).toBe(1);
     expect(weekly.rows[0]!.revertRate).toBe(0.5);
   });
 
   it('handles changedLines of 0 without dividing by zero', () => {
-    const prs = [pr({ number: 1, mergedAt: '2026-09-08T00:00:00Z', changedLines: 0 })];
-    const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-12T00:00:00Z');
+    const prs = [pr({ number: 1, mergedAt: '2026-09-11T00:00:00Z', changedLines: 0 })];
+    const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
     expect(weekly.rows[0]!.linkedPerKLoc).toBe(0);
+  });
+
+  describe('linkComplete / preConventionMerged (partial weeks) — P2 #4', () => {
+    it('is link-complete when the week START is at/after the convention start (2026-W38 is the first full week)', () => {
+      const prs = [pr({ number: 1, mergedAt: '2026-09-15T00:00:00Z' })];
+      const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+      const row = weekly.rows[0]!;
+      expect(row.isoWeek).toBe('2026-W38');
+      expect(row.linkComplete).toBe(true);
+      expect(row.preConventionMerged).toBe(0);
+    });
+
+    it('is partial when the week START precedes the convention start, with a pre-convention count', () => {
+      // 2026-W37 (Sep 7–13) starts before FIXES_PR_CONVENTION_START_ISO (Sep 11
+      // 12:44:10Z), even though PR #2 in it merged after that instant.
+      const prs = [
+        pr({ number: 1, mergedAt: '2026-09-10T00:00:00Z' }), // before the convention
+        pr({ number: 2, mergedAt: '2026-09-12T00:00:00Z' }), // after the convention, same week
+      ];
+      const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+      const row = weekly.rows[0]!;
+      expect(row.isoWeek).toBe('2026-W37');
+      expect(row.linkComplete).toBe(false);
+      expect(row.preConventionMerged).toBe(1);
+    });
   });
 
   describe('the immature flag', () => {
     // 2026-W37 ends 2026-09-13T23:59:59.999Z; +14 days = 2026-09-27T23:59:59.999Z.
-    const prs = [pr({ number: 1, mergedAt: '2026-09-08T00:00:00Z' })];
+    const prs = [pr({ number: 1, mergedAt: '2026-09-11T00:00:00Z' })];
 
     it('is true one millisecond before followupDays have passed since the week ended', () => {
       const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-27T23:59:59.998Z');
@@ -904,6 +1004,192 @@ describe('computeWeeklyReport', () => {
       const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-27T23:59:59.999Z');
       expect(weekly.rows[0]!.immature).toBe(false);
     });
+  });
+});
+
+describe('classifyAtMergeVerdict', () => {
+  const ctx = { files: ['docs/a.md'], labels: [], riskHighGlobs: ['src/guard/**'] };
+
+  it('is skip for a low-risk, label-eligible context', () => {
+    expect(classifyAtMergeVerdict(ctx)).toBe('skip');
+  });
+
+  it('is review when the files match the AT-MERGE globs', () => {
+    expect(classifyAtMergeVerdict({ ...ctx, files: ['src/guard/x.ts'] })).toBe('review');
+  });
+
+  it('is review when the AT-MERGE labels carry risk:high or review:requested', () => {
+    expect(classifyAtMergeVerdict({ ...ctx, labels: ['review:requested'] })).toBe('review');
+  });
+
+  it('fails closed to review for null or undefined — never skip on missing data', () => {
+    expect(classifyAtMergeVerdict(null)).toBe('review');
+    expect(classifyAtMergeVerdict(undefined)).toBe('review');
+  });
+});
+
+describe('replayLabelsAtMerge', () => {
+  it('adds a label at its LabeledEvent and keeps it if merged after', () => {
+    const events = [{ type: 'labeled' as const, name: 'risk:high', createdAt: '2026-09-10T00:00:00Z' }];
+    expect(replayLabelsAtMerge(events, '2026-09-11T00:00:00Z')).toEqual(['risk:high']);
+  });
+
+  it('removes a label at its UnlabeledEvent, applied in time order', () => {
+    const events = [
+      { type: 'labeled' as const, name: 'risk:high', createdAt: '2026-09-10T00:00:00Z' },
+      { type: 'unlabeled' as const, name: 'risk:high', createdAt: '2026-09-10T12:00:00Z' },
+    ];
+    expect(replayLabelsAtMerge(events, '2026-09-11T00:00:00Z')).toEqual([]);
+  });
+
+  it('ignores an event created AFTER mergedAt — a label added post-merge was not there at merge', () => {
+    const events = [{ type: 'labeled' as const, name: 'risk:high', createdAt: '2026-09-12T00:00:00Z' }];
+    expect(replayLabelsAtMerge(events, '2026-09-11T00:00:00Z')).toEqual([]);
+  });
+
+  it('includes an event at exactly mergedAt', () => {
+    const events = [{ type: 'labeled' as const, name: 'risk:high', createdAt: '2026-09-11T00:00:00Z' }];
+    expect(replayLabelsAtMerge(events, '2026-09-11T00:00:00Z')).toEqual(['risk:high']);
+  });
+});
+
+describe('resolveAtMergeBaseSha', () => {
+  it('names the first parent of a normal 2-parent merge whose second parent is the head', () => {
+    expect(
+      resolveAtMergeBaseSha({ headRefOid: 'head1', mergeCommitOid: 'merge1', parentOids: ['base1', 'head1'] }),
+    ).toBe('base1');
+  });
+
+  it('names the single parent of a 1-parent (squash) commit', () => {
+    expect(resolveAtMergeBaseSha({ headRefOid: 'head1', mergeCommitOid: 'sq1', parentOids: ['base1'] })).toBe('base1');
+  });
+
+  it("is null when the 2-parent commit's second parent is NOT this PR's head (an octopus/manual merge)", () => {
+    expect(
+      resolveAtMergeBaseSha({
+        headRefOid: 'head1',
+        mergeCommitOid: 'merge1',
+        parentOids: ['base1', 'someone-elses-head'],
+      }),
+    ).toBeNull();
+  });
+
+  it('is null for 0 or 3+ parents', () => {
+    expect(resolveAtMergeBaseSha({ headRefOid: 'head1', mergeCommitOid: 'm', parentOids: [] })).toBeNull();
+    expect(resolveAtMergeBaseSha({ headRefOid: 'head1', mergeCommitOid: 'm', parentOids: ['a', 'b', 'c'] })).toBeNull();
+  });
+
+  it('is null when there is no merge commit at all', () => {
+    expect(resolveAtMergeBaseSha({ headRefOid: 'head1', mergeCommitOid: null, parentOids: [] })).toBeNull();
+  });
+});
+
+describe('generatedFileChangedLines — P3', () => {
+  it('sums additions+deletions only for GENERATED_FILES entries', () => {
+    const entries = [
+      { path: 'src/a.ts', additions: 10, deletions: 5 },
+      { path: 'src/upstream-ratchet.json', additions: 1000, deletions: 900 },
+      { path: 'pnpm-lock.yaml', additions: 50, deletions: 20 },
+    ];
+    expect(generatedFileChangedLines(entries)).toBe(1000 + 900 + 50 + 20);
+  });
+
+  it('is 0 when no file is generated', () => {
+    expect(generatedFileChangedLines([{ path: 'src/a.ts', additions: 10, deletions: 5 }])).toBe(0);
+  });
+
+  it('is 0 for an empty file list', () => {
+    expect(generatedFileChangedLines([])).toBe(0);
+  });
+});
+
+describe('stripFencedAndCommented', () => {
+  it('leaves plain text untouched', () => {
+    expect(stripFencedAndCommented('plain\nFixes-PR: #605\nmore')).toBe('plain\nFixes-PR: #605\nmore');
+  });
+
+  it('drops a fenced code block entirely, including any Fixes-PR line inside it', () => {
+    const out = stripFencedAndCommented('before\n```\nFixes-PR: #605\n```\nafter');
+    expect(out).not.toContain('Fixes-PR');
+    expect(out).toContain('before');
+    expect(out).toContain('after');
+  });
+
+  it('drops an HTML comment entirely', () => {
+    const out = stripFencedAndCommented('before\n<!-- Fixes-PR: #605 -->\nafter');
+    expect(out).not.toContain('Fixes-PR');
+  });
+
+  it('runs an unclosed fence to the end of the body', () => {
+    const out = stripFencedAndCommented('kept\n```\nFixes-PR: #605\nstill inside, never closed');
+    expect(out).not.toContain('Fixes-PR');
+    expect(out).toContain('kept');
+  });
+});
+
+describe('extractFixesPrNumbers — P3', () => {
+  it('extracts multiple numbers from one line', () => {
+    expect(extractFixesPrNumbers('Fixes-PR: #605, #620')).toEqual([605, 620]);
+  });
+
+  it('extracts numbers from separate Fixes-PR lines', () => {
+    expect(extractFixesPrNumbers('Fixes-PR: #605\nsome text\nFixes-PR: #620')).toEqual([605, 620]);
+  });
+
+  it('ignores a cross-repo owner/repo#N reference', () => {
+    expect(extractFixesPrNumbers('Fixes-PR: nanocoai/nanoclaw#605')).toEqual([]);
+  });
+
+  it('ignores an "(upstream ...)" parenthetical', () => {
+    expect(extractFixesPrNumbers('Fixes-PR: none (upstream #605 already covers this)')).toEqual([]);
+  });
+
+  it('credits nothing when none and a number both appear on the same line', () => {
+    expect(extractFixesPrNumbers('Fixes-PR: none #2')).toEqual([]);
+  });
+
+  it('credits nothing when none and a number appear on separate lines', () => {
+    expect(extractFixesPrNumbers('Fixes-PR: none\nFixes-PR: #2')).toEqual([]);
+  });
+
+  it('strips a Fixes-PR line inside a fenced code block before reading the rest', () => {
+    expect(extractFixesPrNumbers('before\n```\nFixes-PR: #605\n```\nFixes-PR: #620')).toEqual([620]);
+  });
+
+  it('strips a Fixes-PR line inside an HTML comment before reading the rest', () => {
+    expect(extractFixesPrNumbers('<!-- Fixes-PR: #605 -->\nFixes-PR: #620')).toEqual([620]);
+  });
+
+  it('extractFixesPrNumber (singular) returns the first credited number, or null', () => {
+    expect(extractFixesPrNumber('Fixes-PR: #605, #620')).toBe(605);
+    expect(extractFixesPrNumber('Fixes-PR: none #2')).toBeNull();
+  });
+});
+
+// #653 is the PR that originally shipped this file — its own body quotes another PR's
+// revert-shaped title and refers to a real revert in prose, mid-sentence. These are its
+// EXACT lines (gh pr view 653 --json body), never a paraphrase — the false positive
+// depends on precisely where each line starts.
+describe('isRevertOf / isRevertPR — #653 false-positive regression (P2 #3)', () => {
+  it('does not read a quoted revert title or descriptive prose as a revert declaration', () => {
+    const target = pr({ number: 608, title: 'runner: end a task stream after its result' });
+    const candidate = pr({
+      number: 653,
+      title: 'feat(scripts): review-outcomes, the risk-based review measurement query',
+      body: [
+        "- **Revert matching** — I had to generalize this beyond the literal brief. This repo's real",
+        '  revert PRs don\'t follow GitHub\'s auto-revert template (`Revert "..."` title, "This',
+        '  reverts pull request #N." body); e.g. #610 reverting #608 is titled',
+        '  `revert(runner): back out ending a task stream after its result (#608)` — the same',
+        '  conventional-commit prefix `FIX_TITLE_RE` uses for fixes. So the title rule is',
+        '',
+        '  extraction, fix-title/overlap matching, revert matching including the real #610 shape,',
+        '',
+        'class is consistent with the one real revert in the window (#610 reverting #608) — #608',
+      ].join('\n'),
+    });
+    expect(isRevertOf(candidate, target)).toBe(false);
+    expect(isRevertPR(candidate)).toBe(false);
   });
 });
 

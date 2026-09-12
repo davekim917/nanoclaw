@@ -49,7 +49,12 @@ permissions:
 
 concurrency:
   group: review-metrics-weekly
-  cancel-in-progress: true
+  # false, not true: a manual workflow_dispatch (say, re-posting after a labeler.yml
+  # change) must never cancel the scheduled Monday run that's already in flight and
+  # about to post the week's only comment — same reasoning as main-provenance.yml's
+  # `sweep` job, which never cancels itself for the same reason. A superseded run here
+  # would mean a missed week's data, not just wasted minutes.
+  cancel-in-progress: false
 
 jobs:
   report:
