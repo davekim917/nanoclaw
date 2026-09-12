@@ -467,6 +467,31 @@ export function discoverCanonicalRepositories(workgroupId: string, dataDir: stri
   return repositories;
 }
 
+/**
+ * A pin's identity in the one form every consumer compares: `github.com/<owner>/<repo>`,
+ * lowercase. Repository activation stored the origin URL itself as the identity
+ * (repository-activation.ts:544), while publication derives the github.com form
+ * (modules/repository-workspaces/index.ts:152-168) and compares the two strictly, so
+ * a re-publish of an activated repository was always refused (#697). Every pin read
+ * and write passes through validateOriginPin, so mapping the URL form here serves
+ * every caller. Anything that is not an HTTPS github.com owner/repository URL is
+ * returned unchanged.
+ */
+function normalizedPinIdentity(repositoryId: string): string {
+  if (!/^https:\/\//i.test(repositoryId) || !URL.canParse(repositoryId)) return repositoryId;
+  const parsed = new URL(repositoryId);
+  if (parsed.hostname !== 'github.com' || parsed.username || parsed.password || parsed.search || parsed.hash) {
+    return repositoryId;
+  }
+  const parts = parsed.pathname
+    .replace(/\.git\/?$/i, '')
+    .replace(/^\/+|\/+$/g, '')
+    .split('/')
+    .filter(Boolean);
+  if (parts.length !== 2) return repositoryId;
+  return `github.com/${parts[0]!.toLowerCase()}/${parts[1]!.toLowerCase()}`;
+}
+
 function validateOriginPin(pin: OriginPin): OriginPin {
   if (!pin.repositoryId) throw new Error('origin pin requires repository identity');
   if (pin.kind === 'local-only') {
@@ -491,7 +516,7 @@ function validateOriginPin(pin: OriginPin): OriginPin {
     throw new Error('origin pin must not include query parameters or fragments');
   }
   parsed.pathname = parsed.pathname.replace(/\.git\/?$/i, '');
-  return { origin: parsed.toString().replace(/\/+$/, ''), repositoryId: pin.repositoryId };
+  return { origin: parsed.toString().replace(/\/+$/, ''), repositoryId: normalizedPinIdentity(pin.repositoryId) };
 }
 
 export function readOriginPin(workgroupId: string, repo: string, dataDir: string = DATA_DIR): OriginPin | null {
