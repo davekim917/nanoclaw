@@ -27,10 +27,11 @@
  *   - Jobs run on LANES: one FIFO chain per lane key, jobs on different lanes in
  *     parallel.
  *       - `repository_publish`, `repository_refresh` and `repository_transfer`
- *         share the one `'global'` lane. Two publishes in a workgroup collide on
- *         `withWorkgroupRepositoryMountClaim`, which THROWS rather than queues
- *         (repository-workspaces.ts:251), and a publish and a transfer share no
- *         claim namespace at all. The serial drain is what kept those apart, and
+ *         share the one `'global'` lane. Publish and transfer both take
+ *         `withRepositoryLifecycleClaims` on the work units they drain (#655
+ *         narrowed publish to the requester's), which THROWS rather than queues
+ *         (repository-workspaces.ts:233-235), so two of them on one work unit
+ *         would fail each other. The serial drain is what kept those apart, and
  *         the global lane reproduces exactly that property.
  *       - `repository_checkout` runs on a lane per (workgroup, work unit)
  *         (docs/specs/repository-branch-clones/plan.md §5.2, M6). Same-thread

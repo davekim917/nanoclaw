@@ -107,8 +107,8 @@ function uniqueSessions(sessions: Session[]): Session[] {
  * A session row whose inbound DB was never created (or was reclaimed) has no
  * ingress path to fence: messages_in only exists inside that file, and the only
  * writer that could create it is a spawn, which is already rejected at the
- * workgroup mount claim (container-runner `isWorkgroupRepositoryMountClaimed`)
- * for the whole quiescence window. Opening it instead throws inside
+ * workgroup mount claim or the drained work unit's lifecycle claim
+ * (container-runner.ts:1685-1690) for the whole quiescence window. Opening it instead throws inside
  * better-sqlite3 ("directory does not exist") and fails the entire publication.
  */
 function sessionInboundPath(session: Session): string {
@@ -123,7 +123,7 @@ function hasFenceableIngress(session: Session): boolean {
  * A session whose inbound DB vanished BETWEEN the eligibility filter and the
  * open below carries exactly the invariant `hasFenceableIngress` documents:
  * there is no ingress path left to fence, and no spawn can create one while
- * the workgroup mount claim is held. It is skipped rather than fatal — the
+ * the workgroup mount claim or the work unit's lifecycle claim is held. It is skipped rather than fatal — the
  * 2026-09-01 incident was a storage reclaim landing inside precisely this
  * window, which failed an unrelated publication permanently.
  *
