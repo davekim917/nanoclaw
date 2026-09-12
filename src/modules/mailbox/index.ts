@@ -33,12 +33,7 @@ import {
   openOutboundDbWritable,
   sessionDbPathIsGone,
 } from './openers.js';
-import {
-  hostInboundDbPathFor,
-  migrateInboundDbToHostDir,
-  removeHostInboundDir,
-  resolveInboundDbPath,
-} from './host-inbound.js';
+import { hostInboundDbPathFor, removeHostInboundDir, resolveInboundDbPath } from './host-inbound.js';
 import { ensureNanoclawInboundSchema, ensureSchema } from './schema.js';
 import {
   activateRepoIngressFence,
@@ -745,19 +740,37 @@ export class NanoclawAgentMailbox extends SqliteAgentMailbox {
    */
   override prepare(key: MailboxSessionKey): void {
     // `super.prepare()` creates the LEGACY `<session>/inbound.db` when it is
-    // missing, which is exactly what a fresh session needs: the migration
-    // below then hard-links it into `<session>/.host/`. On every later call
-    // that link is still there, so upstream's existence check finds the file
-    // and creates nothing. One ordering serves the new-session case and the
-    // already-migrated case, and no upstream file has to change (#749).
+    // missing, which is what a fresh session needs; the SPAWN path is what
+    // later hard-links it into `<session>/.host/`. On every later call that
+    // link is still there, so upstream's existence check finds the file and
+    // creates nothing, and no upstream file has to change (#749).
+    //
+    // PROVISIONING DELIBERATELY DOES NOT MIGRATE, and that is a safety
+    // property rather than an omission. A container's `/workspace` is a
+    // read-WRITE bind of the session directory, fixed at spawn, and the
+    // read-only `.host` overlay exists only in a mount set built at spawn
+    // (`hostInboundMounts`, `src/container-runner.ts:4471`). Migrating from
+    // here would create `.host/` UNDERNEATH a container that is already
+    // running — inside its writable mount, with no overlay over it — handing
+    // that container the host's journal path and the authoritative file
+    // itself. That is strictly worse than the pre-#749 state, where at least
+    // the file was overlaid read-only. And this runs live: `prepare()` is
+    // reached on any in-session task create (`src/db/scheduled-tasks.ts`) and
+    // from the documented-reset re-provision (`src/session-manager.ts`).
+    //
+    // So migration belongs to the one seam that also builds the mounts:
+    // `buildMounts` migrates and then REFUSES the spawn unless the session is
+    // host-owned (`assertHostOwnedInboundDb`). A session that is live when
+    // this deploys keeps exactly today's exposure — no regression — and
+    // becomes protected at its next spawn, which is also why the deploy needs
+    // no container restart.
     super.prepare(key);
     const sessionPath = sessionMailboxDir(key);
-    migrateInboundDbToHostDir(sessionPath);
-    // The host-owned path, not the resolved one: provisioning is the moment a
-    // session's database is supposed to become host-owned, so a schema-ensure
-    // that fell back to the legacy name would quietly leave it where a
-    // container can plant a journal beside it.
-    ensureSchema(hostInboundDbPathFor(sessionPath), 'inbound');
+    // The RESOLVED path: host-owned once the spawn path has migrated this
+    // session, the legacy name while it has not. Naming the host-owned path
+    // unconditionally would provision a SECOND, empty database under `.host/`
+    // for a session whose real one is still at the legacy name.
+    ensureSchema(resolveInboundDbPath(sessionPath), 'inbound');
     ensureSchema(sessionMailboxPath(key, 'outbound'), 'outbound');
   }
 

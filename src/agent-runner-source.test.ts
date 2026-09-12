@@ -31,6 +31,7 @@ import { buildMounts } from './container-runner.js';
 import { closeDb, createAgentGroup, getRawDb, initTestDb, runMigrations } from './db/index.js';
 import { ensureContainerConfig } from './db/container-configs.js';
 import { initGroupFilesystem } from './group-init.js';
+import { getAgentMailbox } from './mailbox/index.js';
 import {
   activateAgentRunnerSource,
   agentRunnerSourcePath,
@@ -45,7 +46,11 @@ function group(id: string, folder: string): AgentGroup {
   return { id, name: folder, folder, agent_provider: null, created_at: new Date().toISOString() } as AgentGroup;
 }
 
+// Provisioned, not just shaped: `buildMounts` refuses to spawn a session whose
+// inbound.db is not host-owned (#749), which every real session is by the time
+// a container is handed it.
 function session(id: string, agentGroupId: string): Session {
+  getAgentMailbox().prepare({ agentGroupId, sessionId: id });
   return { id, agent_group_id: agentGroupId } as Session;
 }
 

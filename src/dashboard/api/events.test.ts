@@ -208,6 +208,68 @@ describe('SSE feed — D1', () => {
     expect(ignored(`${sessionsRoot}-lookalike/ag-1/sess-1/inbound.db`)).toBe(true);
   });
 
+  // ── #749: the host writes `<session>/.host/inbound.db` ─────────────────────
+  // Both halves of the watch have to reach one level deeper for that one path.
+  // The failure mode is SILENT — no error, the board just stops updating — so
+  // these are the tests that notice if either branch stops admitting it.
+
+  it('admits the host-owned `.host/inbound.db`, and nothing else one level deeper (#749)', async () => {
+    vi.useRealTimers();
+    startSSEFeed();
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+
+    const [sessionsRoot, opts] = mockWatch.mock.calls[0] as [
+      string,
+      { ignored: (p: string, stats?: { isDirectory(): boolean; isSymbolicLink(): boolean }) => boolean },
+    ];
+    const ignored = opts.ignored;
+    const session = `${sessionsRoot}/ag-1/sess-1`;
+    const directory = { isDirectory: () => true, isSymbolicLink: () => false };
+    const regularFile = { isDirectory: () => false, isSymbolicLink: () => false };
+    const symbolicLink = { isDirectory: () => false, isSymbolicLink: () => true };
+
+    // The `.host` DIRECTORY must be admitted, or chokidar never descends into
+    // it and the database inside is never watched at all.
+    expect(ignored(`${session}/.host`)).toBe(false);
+    expect(ignored(`${session}/.host`, directory)).toBe(false);
+    // ...and the host-owned database itself, which is the file the host writes.
+    expect(ignored(`${session}/.host/inbound.db`)).toBe(false);
+    expect(ignored(`${session}/.host/inbound.db`, regularFile)).toBe(false);
+
+    // Nothing else at that depth: not the journal, not another database, and
+    // not a same-depth path under some other directory name.
+    expect(ignored(`${session}/.host/inbound.db-journal`, regularFile)).toBe(true);
+    expect(ignored(`${session}/.host/outbound.db`, regularFile)).toBe(true);
+    expect(ignored(`${session}/notdothost/inbound.db`, regularFile)).toBe(true);
+
+    // Same shape guards the legacy names get: a symlink or a type mismatch at
+    // either level is refused rather than followed.
+    expect(ignored(`${session}/.host`, regularFile)).toBe(true);
+    expect(ignored(`${session}/.host`, symbolicLink)).toBe(true);
+    expect(ignored(`${session}/.host/inbound.db`, directory)).toBe(true);
+    expect(ignored(`${session}/.host/inbound.db`, symbolicLink)).toBe(true);
+  });
+
+  it('emits an inbound event when the host writes `.host/inbound.db` (#749)', async () => {
+    vi.useRealTimers();
+    startSSEFeed();
+    const { nodeRes } = await openConnection('u1', { no_filter: true });
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+
+    const [sessionsRoot] = mockWatch.mock.calls[0] as [string, unknown];
+    const onChange = (mockWatcher.on.mock.calls as Array<[string, (p: string) => void]>).find(
+      ([event]) => event === 'change',
+    )?.[1];
+    expect(onChange).toBeDefined();
+
+    // Admitting the path is only half of it — the change handler has to accept
+    // the extra depth too, or the event is dropped after the watch delivers it.
+    onChange!(`${sessionsRoot}/ag-1/sess-1/.host/inbound.db`);
+
+    const frames = vi.mocked(nodeRes.write).mock.calls.map((call) => String(call[0]));
+    expect(frames.some((frame) => frame.includes('inbound_message') && frame.includes('sess-1'))).toBe(true);
+  });
+
   it('test_sse_handler_registers_close_listener: connection removed on close', async () => {
     startSSEFeed();
     const ctx = makeCtx('u1', { no_filter: true });

@@ -70,6 +70,8 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 
+import { SessionDbMissingError } from './errors.js';
+
 /**
  * The host-owned directory inside a session directory.
  *
@@ -262,6 +264,38 @@ export interface InboundMigrationResult {
  * which matters because `container-restart` treats a vanished session as one
  * to skip rather than fence.
  */
+/**
+ * Run filesystem work that trusted an `existsSync`, reporting a session that
+ * vanished underneath it as one.
+ *
+ * `existsSync` answered a moment ago, and the answer can be stale by the time
+ * the `stat`/`link` runs: the session reclaim deletes whole session directories
+ * from a worker thread (`src/storage-manager.ts:1543`), concurrently with host
+ * work on the same session. That is the very race `openInboundDb` is built
+ * around (`openers.ts:172-205`), and leaving it unguarded costs more than an
+ * ugly stack — a raw `ENOENT … link` is not the class callers branch on.
+ * `container-restart`, `delivery` and the sweep all key their
+ * skip-the-vanished-session path on `SessionDbMissingError`, so an unmapped
+ * errno fails a whole tick instead of skipping one dead session.
+ *
+ * Wraps the whole trust-then-act region rather than the link alone: the
+ * already-migrated branch `stat`s BOTH names before it links, and a stat on a
+ * reclaimed session throws the same raw errno one line earlier.
+ *
+ * Only ENOENT/ENOTDIR are mapped, matching `sessionDbPathIsGone`'s rule
+ * (`openers.ts:84-92`): every other errno means the filesystem declined to
+ * answer, and no session may be declared vanished on an unanswered question.
+ */
+function asVanished<T>(dbPath: string, work: () => T): T {
+  try {
+    return work();
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') throw new SessionDbMissingError(dbPath);
+    throw err;
+  }
+}
+
 export function migrateInboundDbToHostDir(sessionPath: string): InboundMigrationResult {
   const result: InboundMigrationResult = { outcome: 'absent', removedSidecars: [], replayedCrashJournal: false };
   if (!fs.existsSync(sessionPath)) return { ...result, outcome: 'no-session' };
@@ -281,19 +315,25 @@ export function migrateInboundDbToHostDir(sessionPath: string): InboundMigration
     // recreated by an older binary, or a rolled-back host that provisioned a
     // fresh file over the name) the container's read path would be serving a
     // different database than the host writes. Re-link rather than trust it.
-    const sameInode = legacyExists && fs.statSync(hostPath).ino === fs.statSync(legacyPath).ino;
-    if (!sameInode) {
-      if (legacyExists) fs.rmSync(legacyPath, { force: true });
-      fs.linkSync(hostPath, legacyPath);
-      return { ...result, outcome: 'relinked', removedSidecars: removeForeignInboundSidecars(sessionPath) };
-    }
-    return { ...result, outcome: 'already-host-owned', removedSidecars: removeForeignInboundSidecars(sessionPath) };
+    return asVanished(hostPath, () => {
+      const sameInode = legacyExists && fs.statSync(hostPath).ino === fs.statSync(legacyPath).ino;
+      if (!sameInode) {
+        if (legacyExists) fs.rmSync(legacyPath, { force: true });
+        fs.linkSync(hostPath, legacyPath);
+        return { ...result, outcome: 'relinked' as const, removedSidecars: removeForeignInboundSidecars(sessionPath) };
+      }
+      return {
+        ...result,
+        outcome: 'already-host-owned' as const,
+        removedSidecars: removeForeignInboundSidecars(sessionPath),
+      };
+    });
   }
 
   // The migration itself: one hard link, so both names resolve to the one
   // inode from here on. No bytes move, so this is atomic in the only sense
   // that matters — there is no moment at which a reader finds nothing.
-  fs.linkSync(legacyPath, hostPath);
+  asVanished(legacyPath, () => fs.linkSync(legacyPath, hostPath));
 
   // Now the journal question, and it is the delicate one. A journal sitting at
   // the legacy path is EITHER a genuine crash journal this host owes a replay

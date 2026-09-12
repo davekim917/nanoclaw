@@ -1977,16 +1977,12 @@ describe('the shared-transcript migration is gone', () => {
     initSessionFolder(LAZY_AG, LAZY_SESS);
 
     expect(fs.existsSync(projectsDir())).toBe(false);
-    // `.host/` holds the host-owned inbound.db since #749; `inbound.db` beside
-    // it is the hard link to that same inode. Both are the mailbox this test
-    // already expected — what it pins is that NOTHING ELSE (transcripts,
-    // .claude-projects) is written at session creation.
-    expect(fs.readdirSync(sessionDir(LAZY_AG, LAZY_SESS)).sort()).toEqual([
-      '.host',
-      'inbound.db',
-      'outbound.db',
-      'outbox',
-    ]);
+    // Unchanged by #749, and that is the point: session creation provisions the
+    // mailbox and nothing else. `.host/` is deliberately NOT here — migrating
+    // onto it belongs to the spawn path, never to provisioning, so that a
+    // container already running can never have a host-owned directory appear
+    // inside its writable mount (`NanoclawAgentMailbox.prepare`).
+    expect(fs.readdirSync(sessionDir(LAZY_AG, LAZY_SESS)).sort()).toEqual(['inbound.db', 'outbound.db', 'outbox']);
   });
 
   it('the spawn path creates the projects dir and copies nothing into it', async () => {

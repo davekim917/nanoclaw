@@ -15,59 +15,19 @@ import fs from 'fs';
 
 import { openOutboundDb as upstreamOpenOutboundDb } from '../../mailbox/sqlite/session-db.js';
 import { plantStorageActivityMarker } from '../../storage-activity.js';
+import { SessionDbMissingError, SessionDbUnopenableError } from './errors.js';
 import { sessionDirForInboundDbPath } from './host-inbound.js';
 
 /**
- * A host open found no database file where a provisioned session must have one.
- *
- * Every host-side open funnel refuses to create the file, so callers get this
- * instead of an empty stub. `ensureSchema` is the only host-side creator; a
- * caller that legitimately provisions a session goes through
- * `initSessionFolder`/`initStubSessionFolder`, never through an open.
+ * The two failure classes moved to `errors.ts` in #761's fix round, and are
+ * re-exported here so every existing `from './openers.js'` import site is
+ * unchanged. A re-export is the same class object, so `instanceof` still
+ * works. See `errors.ts` for why they had to leave this file: `host-inbound.ts`
+ * raises `SessionDbMissingError` for a session deleted mid-migration, and this
+ * module imports FROM `host-inbound.ts`, so keeping them here would close a
+ * static import cycle.
  */
-export class SessionDbMissingError extends Error {
-  constructor(readonly dbPath: string) {
-    super(`session database does not exist: ${dbPath}`);
-    this.name = 'SessionDbMissingError';
-  }
-}
-
-/**
- * A host open found the database file PRESENT but could not open it.
- *
- * The counterpart to `SessionDbMissingError`, and the reason it exists as a
- * type: "the mailbox would not open" and "a caller's own work threw" are
- * different failures with different recoveries, and once the outbound handle
- * opens LAZILY — partway through a caller's action — position in the code can
- * no longer tell them apart. Only the funnel knows, so the funnel says so.
- *
- * Callers that already branch on `SessionDbMissingError` are unaffected: this
- * is a distinct class, and a vanished file still reports as missing.
- */
-export class SessionDbUnopenableError extends Error {
-  /**
-   * The driver's own error code, carried up from the cause.
-   *
-   * `src/db/session-db.test.ts` pins `code === 'SQLITE_CANTOPEN'` on a
-   * present-but-unreadable open, and callers may branch on it. Adding a
-   * classification must not cost an observable that already had a contract, so
-   * the wrapper keeps it (and the original error stays reachable as `cause`).
-   */
-  readonly code?: string;
-
-  constructor(
-    readonly dbPath: string,
-    cause: unknown,
-  ) {
-    super(
-      `session database exists but could not be opened: ${dbPath}: ${cause instanceof Error ? cause.message : String(cause)}`,
-      { cause },
-    );
-    this.name = 'SessionDbUnopenableError';
-    const code = (cause as { code?: unknown } | null | undefined)?.code;
-    if (typeof code === 'string') this.code = code;
-  }
-}
+export { SessionDbMissingError, SessionDbUnopenableError } from './errors.js';
 
 /**
  * Is this path genuinely gone, as opposed to unanswerable?

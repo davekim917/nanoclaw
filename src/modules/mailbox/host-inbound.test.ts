@@ -15,7 +15,7 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 
 import {
   assertHostOwnedInboundDb,
@@ -29,6 +29,7 @@ import {
   resolveInboundDbPath,
   sessionDirForInboundDbPath,
 } from './host-inbound.js';
+import { SessionDbMissingError } from './errors.js';
 import { openInboundDb } from './openers.js';
 import { readSessionInbound } from './read-only.js';
 import { INBOUND_SCHEMA } from '../../db/schema.js';
@@ -186,6 +187,49 @@ describe('migrateInboundDbToHostDir — #749', () => {
     expect(migrateInboundDbToHostDir(sess).outcome).toBe('relinked');
     expect(fs.statSync(hostInboundDbPathFor(sess)).ino).toBe(fs.statSync(legacyInboundDbPathFor(sess)).ino);
     expect(rowIds(legacyInboundDbPathFor(sess), 'messages_in')).toEqual(['m-real']);
+  });
+
+  // ── a session reclaimed mid-migration ──────────────────────────────────────
+  // `existsSync` says the file is there, and the reclaim deletes the whole
+  // session directory from a worker thread before the link runs
+  // (`src/storage-manager.ts:1543`). The stale answer is forced here with a spy
+  // rather than by racing a real thread, so the assertion is deterministic —
+  // the code path under test is identical either way. What matters is the
+  // CLASS: callers branch on `SessionDbMissingError` to skip a dead session,
+  // and a raw `ENOENT … link` fails their whole tick instead.
+
+  it('reports a session reclaimed before the migrating link as missing, not a raw ENOENT', () => {
+    const { sess } = makeLegacySession('hostinb-vanish-migrate');
+    const legacy = legacyInboundDbPathFor(sess);
+    fs.rmSync(legacy);
+    const realExists = fs.existsSync;
+    vi.spyOn(fs, 'existsSync').mockImplementation((target) => (String(target) === legacy ? true : realExists(target)));
+
+    try {
+      expect(() => migrateInboundDbToHostDir(sess)).toThrow(SessionDbMissingError);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('reports a session reclaimed before the RE-LINK as missing too — the stat runs first', () => {
+    const { sess } = makeLegacySession('hostinb-vanish-relink');
+    migrateInboundDbToHostDir(sess);
+    // Already host-owned, so the next call takes the re-link branch — which
+    // stats BOTH names before it links. Losing the host-owned file there must
+    // answer with the same class, not the errno the stat happens to raise.
+    const hostPath = hostInboundDbPathFor(sess);
+    fs.rmSync(hostPath);
+    const realExists = fs.existsSync;
+    vi.spyOn(fs, 'existsSync').mockImplementation((target) =>
+      String(target) === hostPath ? true : realExists(target),
+    );
+
+    try {
+      expect(() => migrateInboundDbToHostDir(sess)).toThrow(SessionDbMissingError);
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 
   it('discards a legacy journal when the database is intact, without replaying it', () => {

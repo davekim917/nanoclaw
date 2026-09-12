@@ -29,6 +29,7 @@ import { CronExpressionParser } from 'cron-parser';
 import { DATA_DIR } from '../src/config.js';
 import { resolveGroupTimezone } from '../src/container-config.js';
 import { initDb } from '../src/db/connection.js';
+import { resolveInboundDbPath } from '../src/modules/mailbox/index.js';
 
 const APPLY = process.argv.includes('--apply');
 
@@ -65,7 +66,13 @@ for (const group of fs.readdirSync(sessionsRoot)) {
   // The directory name IS the agent group id (storage-activity.ts:319).
   const tz = await resolveGroupTimezone(group);
   for (const sess of fs.readdirSync(groupDir)) {
-    const inboundPath = path.join(groupDir, sess, 'inbound.db');
+    // The resolver, not the legacy name: since #749 the host keeps inbound.db
+    // at `<session>/.host/`, and the legacy name is a HARD LINK to the same
+    // inode. Opening that name read-write would journal into the session
+    // directory — which is bind-mounted read-write into the container — so an
+    // operator run would both create a sidecar where a container can reach it
+    // and replay one already planted there.
+    const inboundPath = resolveInboundDbPath(path.join(groupDir, sess));
     const outboundPath = path.join(groupDir, sess, 'outbound.db');
     if (!fs.existsSync(inboundPath) || !fs.existsSync(outboundPath)) continue;
 

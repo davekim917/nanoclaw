@@ -31,6 +31,7 @@ vi.mock('../../log.js', () => ({
 
 import { getAgentMailbox } from '../../mailbox/index.js';
 import type { InboundMessage, MailboxSessionKey } from '../../mailbox/types.js';
+import { inboundDbIsHostOwned, resolveInboundDbPath } from './host-inbound.js';
 import { SessionDbMissingError } from './openers.js';
 import { withExistingMailboxSession, withMailboxSession } from '../../session-manager.js';
 import { shouldReapIdleTaskContainer } from '../sweep-idle-reap/index.js';
@@ -1005,5 +1006,49 @@ describe('provider_executing across the container to host seam', () => {
     const busy = await mailbox.session(key, (m) => fork(m).getContainerState());
     expect(busy?.provider_executing).toBe(1);
     expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 0, busy?.provider_executing === 1, false)).toBe(false);
+  });
+});
+
+describe('prepare() provisions but never migrates — #749', () => {
+  /**
+   * Migration is the SPAWN path's job, and this pins that it is not also
+   * provisioning's.
+   *
+   * A container's `/workspace` is a read-WRITE bind of the session directory,
+   * fixed at spawn, and the read-only `.host` overlay exists only in a mount
+   * set built at spawn. Creating `.host/` from `prepare()` would therefore
+   * create it UNDERNEATH any container already running — inside that
+   * container's writable mount, with no overlay over it — handing it both the
+   * host's journal path and the authoritative file. And `prepare()` genuinely
+   * runs against live sessions: any in-session task create reaches it
+   * (`src/db/scheduled-tasks.ts`), as does the documented-reset re-provision
+   * (`src/session-manager.ts`).
+   *
+   * So a session that has only been provisioned keeps exactly its pre-#749
+   * shape, and becomes host-owned at its next spawn instead.
+   */
+  it('provisions the legacy name and leaves the session NOT host-owned', () => {
+    const key = freshKey();
+    const sessionPath = path.join(DATA_DIR, 'v2-sessions', key.agentGroupId, key.sessionId);
+
+    getAgentMailbox().prepare(key);
+
+    expect(fs.existsSync(dbPath(key, 'inbound'))).toBe(true);
+    expect(fs.existsSync(path.join(sessionPath, '.host'))).toBe(false);
+    expect(inboundDbIsHostOwned(sessionPath)).toBe(false);
+    // The schema was ensured on the path a host opener will actually resolve,
+    // not on a second, empty database under `.host/`.
+    expect(resolveInboundDbPath(sessionPath)).toBe(dbPath(key, 'inbound'));
+  });
+
+  it('still does not migrate when re-preparing an already provisioned session', () => {
+    const key = freshKey();
+    const sessionPath = path.join(DATA_DIR, 'v2-sessions', key.agentGroupId, key.sessionId);
+    getAgentMailbox().prepare(key);
+
+    getAgentMailbox().prepare(key);
+
+    expect(fs.existsSync(path.join(sessionPath, '.host'))).toBe(false);
+    expect(inboundDbIsHostOwned(sessionPath)).toBe(false);
   });
 });

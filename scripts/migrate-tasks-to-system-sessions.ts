@@ -49,8 +49,8 @@ import { initDb } from '../src/db/connection.js';
 import { getAgentGroup } from '../src/db/agent-groups.js';
 import { getActiveSessions, isTaskThread } from '../src/db/sessions.js';
 import { cancelSeriesWithStrandClear, deleteTask, insertTaskRow } from '../src/modules/scheduling/db.js';
-import { sessionMailboxPath } from '../src/mailbox/sqlite/paths.js';
-import { readSessionInbound, type ScheduledTaskRow } from '../src/modules/mailbox/index.js';
+import { sessionMailboxDir } from '../src/mailbox/sqlite/paths.js';
+import { readSessionInbound, resolveInboundDbPath, type ScheduledTaskRow } from '../src/modules/mailbox/index.js';
 import { resolveTaskSession } from '../src/session-manager.js';
 
 await initDb(path.join(DATA_DIR, 'v2.db'));
@@ -109,7 +109,12 @@ let duplicates = 0;
 
 for (const session of await getActiveSessions()) {
   if (isTaskThread(session.thread_id)) continue; // already on the new model
-  const srcPath = sessionMailboxPath({ agentGroupId: session.agent_group_id, sessionId: session.id }, 'inbound');
+  // The resolver, not the legacy name (#749): `openRw` below journals beside
+  // whatever path it is given, and the legacy name sits in the session
+  // directory the container has bind-mounted read-write.
+  const srcPath = resolveInboundDbPath(
+    sessionMailboxDir({ agentGroupId: session.agent_group_id, sessionId: session.id }),
+  );
   // Read-only seam: a survey pass must never provision or migrate a session it
   // is only reading. `undefined` is "no mailbox" — nothing to consolidate.
   // 5s busy_timeout because this is an operator-run one-shot against a LIVE
@@ -179,7 +184,9 @@ for (const session of await getActiveSessions()) {
     }
 
     const { session: target } = await resolveTaskSession(session.agent_group_id, seriesId);
-    const targetPath = sessionMailboxPath({ agentGroupId: session.agent_group_id, sessionId: target.id }, 'inbound');
+    const targetPath = resolveInboundDbPath(
+      sessionMailboxDir({ agentGroupId: session.agent_group_id, sessionId: target.id }),
+    );
     const targetDb = openRw(targetPath);
     try {
       const existing = targetDb

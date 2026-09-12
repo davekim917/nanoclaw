@@ -39,6 +39,7 @@ import { DATA_DIR } from '../src/config.js';
 import { initDb, getRawDb } from '../src/db/connection.js';
 import { resolveActiveSession } from '../src/db/scheduled-tasks.js';
 import { findSessionByAgentGroupAndMessagingGroup } from '../src/db/sessions.js';
+import { resolveInboundDbPath } from '../src/modules/mailbox/index.js';
 import { ensureSchema } from '../src/modules/mailbox/schema.js';
 import { nextEvenSeq } from '../src/modules/mailbox/ops/ingress.js';
 
@@ -98,7 +99,10 @@ async function migrateOnce(dryRun: boolean): Promise<MigrationResult> {
     .all() as SessionRow[];
 
   for (const sess of threadSessions) {
-    const sourceInboundPath = path.join(DATA_DIR, 'v2-sessions', sess.agent_group_id, sess.id, 'inbound.db');
+    // The resolver, not the legacy name (#749): the source is ATTACHed to a
+    // read-write connection and UPDATEd below, so opening the legacy hard link
+    // would journal into the container-writable session directory.
+    const sourceInboundPath = resolveInboundDbPath(path.join(DATA_DIR, 'v2-sessions', sess.agent_group_id, sess.id));
     if (!fs.existsSync(sourceInboundPath)) continue;
     result.scanned_sessions += 1;
 
@@ -155,7 +159,7 @@ async function migrateOnce(dryRun: boolean): Promise<MigrationResult> {
 
     const channelInboundPath =
       !dryRun || channelSessionPreexisting
-        ? path.join(DATA_DIR, 'v2-sessions', sess.agent_group_id, channelSessionId, 'inbound.db')
+        ? resolveInboundDbPath(path.join(DATA_DIR, 'v2-sessions', sess.agent_group_id, channelSessionId))
         : null;
 
     // ── DRY RUN ─────────────────────────────────────────────────────────────

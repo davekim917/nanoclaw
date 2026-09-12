@@ -65,7 +65,15 @@ function group(id: string, folder: string): AgentGroup {
   return { id, name: folder, folder, agent_provider: null, created_at: new Date().toISOString() } as AgentGroup;
 }
 
+// Provisioned, not just shaped. `buildMounts` migrates inbound.db under
+// `<session>/.host/` and REFUSES to spawn a session that is not host-owned
+// (#749, `assertHostOwnedInboundDb`), which is what production guarantees:
+// every real session has a mailbox before it is ever handed to a container.
+// A fixture that skipped provisioning was asserting mount behaviour for a
+// session that could not exist, so the mailbox goes here rather than at each
+// of the ~26 buildMounts call sites.
 function session(id: string, agentGroupId: string): Session {
+  getAgentMailbox().prepare({ agentGroupId, sessionId: id });
   return { id, agent_group_id: agentGroupId } as Session;
 }
 
