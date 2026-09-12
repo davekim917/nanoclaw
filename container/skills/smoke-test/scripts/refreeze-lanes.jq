@@ -63,7 +63,11 @@ def rl_refrozen:
 # none, or any non-object when it could not be parsed.
 # Output: {refrozen, stale: [lane ids, contract order], error: string|null}.
 # Every doubt answers `error`, never an empty `stale`: a missing snapshot, a
-# malformed one, or a contract that vanished after the snapshot was taken.
+# malformed one, or a contract that vanished after the snapshot was taken. A
+# required lane the snapshot never named counts as stale too, unless its
+# generation exceeds the snapshot's highest — the one way a lane the snapshot
+# could not have named (it did not exist yet) legitimately clears: an EMPTIED
+# snapshot has no highest to exceed, so nothing it never named can clear.
 def rl_stale_after_refreeze($contract):
   if (rl_refrozen | not) then {refrozen: false, stale: [], error: null}
   else .refreezeLaneSnapshot as $s
@@ -71,8 +75,16 @@ def rl_stale_after_refreeze($contract):
       {refrozen: true, stale: [], error: "identity.json records a re-freeze but no lane snapshot (refreezeLaneSnapshot), so nothing shows the lanes were redispatched after it"}
     elif $s.contractPresent == false then
       # No contract at the re-freeze means no lane had been dispatched yet;
-      # SKILL.md requires the contract before any dispatch.
-      {refrozen: true, stale: [], error: null}
+      # SKILL.md requires the contract before any dispatch. rl_lane_snapshot
+      # never pairs contractPresent:false with a non-null sourceSha — it only
+      # ever writes {contractPresent:false, sourceSha:null, lanes:[]} — so a
+      # non-null sourceSha here did not come from `refreeze`; trust the
+      # "nothing dispatched yet" reading only when that invariant holds.
+      if $s.sourceSha == null then
+        {refrozen: true, stale: [], error: null}
+      else
+        {refrozen: true, stale: [], error: "identity.json's refreezeLaneSnapshot says no contract was present at the re-freeze but also records a sourceSha — a legitimate snapshot never does both"}
+      end
     elif ($s.sourceSha | type) != "string" or ($s.lanes | type) != "array"
          or (all($s.lanes[]; type == "object" and (.id | type == "string") and (.generation | rl_positive_int)) | not) then
       {refrozen: true, stale: [], error: "identity.json's refreezeLaneSnapshot is malformed"}
@@ -86,11 +98,25 @@ def rl_stale_after_refreeze($contract):
       {refrozen: true, stale: [], error: null}
     else
       ([ $s.lanes[] | {key: .id, value: .generation} ] | from_entries) as $snap
+      # The highest generation the snapshot names. `contract --regenerate` is
+      # the only way a required lane the snapshot never named comes to exist,
+      # and it bumps EVERY lane — old and new alike — past whatever generation
+      # was on disk at that moment, which is never below this snapshot's own
+      # max. So a not-yet-named lane whose generation exceeds it was
+      # necessarily dispatched after the re-freeze; one that does not (in
+      # particular, every lane when the snapshot names none at all) has no
+      # such alibi and stays stale.
+      | ([ $s.lanes[].generation ] | if length > 0 then max else null end) as $snapMaxGen
       | {refrozen: true, error: null,
          stale: [ $contract.requiredLaneMarkers[] | rl_lane_id as $id
-                  | select($snap | has($id))
                   | ($contract | rl_lane_generation($id)) as $g
-                  | select(($g | rl_positive_int | not) or $g <= $snap[$id])
+                  | select(
+                      ($g | rl_positive_int | not)
+                      or (if ($snap | has($id))
+                          then $g <= $snap[$id]
+                          else ($snapMaxGen == null) or ($g <= $snapMaxGen)
+                          end)
+                    )
                   | $id ]}
     end
   end;
