@@ -202,6 +202,8 @@
     "src/modules/bash-gate/index.ts": 55.45,
     "src/modules/channel-config/index.ts": 3.23,
     "src/modules/interactive/choice.ts": 96.23,
+    "src/modules/mailbox/errors.ts": 100,
+    "src/modules/mailbox/host-inbound.ts": 96.9,
     "src/modules/mailbox/index.ts": 92.26,
     "src/modules/mailbox/op-sides.ts": 92.52,
     "src/modules/mailbox/openers.ts": 98.31,

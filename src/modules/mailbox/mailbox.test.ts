@@ -31,7 +31,12 @@ vi.mock('../../log.js', () => ({
 
 import { getAgentMailbox } from '../../mailbox/index.js';
 import type { InboundMessage, MailboxSessionKey } from '../../mailbox/types.js';
-import { inboundDbIsHostOwned, resolveInboundDbPath } from './host-inbound.js';
+import {
+  hostInboundDirFor,
+  inboundDbIsHostOwned,
+  migrateInboundDbToHostDir,
+  resolveInboundDbPath,
+} from './host-inbound.js';
 import { SessionDbMissingError } from './openers.js';
 import { withExistingMailboxSession, withMailboxSession } from '../../session-manager.js';
 import { shouldReapIdleTaskContainer } from '../sweep-idle-reap/index.js';
@@ -1039,6 +1044,24 @@ describe('prepare() provisions but never migrates — #749', () => {
     // The schema was ensured on the path a host opener will actually resolve,
     // not on a second, empty database under `.host/`.
     expect(resolveInboundDbPath(sessionPath)).toBe(dbPath(key, 'inbound'));
+  });
+
+  it('destroy() takes the host-owned directory with it', async () => {
+    const key = freshKey();
+    const sessionPath = path.join(DATA_DIR, 'v2-sessions', key.agentGroupId, key.sessionId);
+    getAgentMailbox().prepare(key);
+    // Migrate the way the spawn path does, so there IS a `.host/` to remove.
+    migrateInboundDbToHostDir(sessionPath);
+    expect(fs.existsSync(hostInboundDirFor(sessionPath))).toBe(true);
+
+    await getAgentMailbox().destroy(key);
+
+    // Upstream's `destroy` only knows the legacy name and its sidecars, so the
+    // host-owned copy and its journal sit one level below anything it removes
+    // and would otherwise outlive the session that owned them.
+    expect(fs.existsSync(hostInboundDirFor(sessionPath))).toBe(false);
+    expect(fs.existsSync(dbPath(key, 'inbound'))).toBe(false);
+    expect(fs.existsSync(dbPath(key, 'outbound'))).toBe(false);
   });
 
   it('still does not migrate when re-preparing an already provisioned session', () => {
