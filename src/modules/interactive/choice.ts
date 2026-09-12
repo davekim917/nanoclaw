@@ -40,7 +40,7 @@ import { log } from '../../log.js';
 import { resolveSession, sessionMessageExists } from '../../session-manager.js';
 import { isChannelVariant, type MessagingGroup, type PendingApproval, type Session } from '../../types.js';
 import { registerChoiceHandler, retireChoice, type ChoiceHandlerContext } from '../approvals/choices.js';
-import { notifyAgent, requestApproval, type RequestApprovalOptions } from '../approvals/primitive.js';
+import { notifyAgent, requestApprovalOutcome, type RequestApprovalOptions } from '../approvals/primitive.js';
 import { hasAdminPrivilege } from '../permissions/db/user-roles.js';
 import { getUser } from '../permissions/db/users.js';
 
@@ -129,6 +129,33 @@ async function handleRequestChoice(content: Record<string, unknown>, session: Se
     return;
   }
 
+  // Refuse a choiceId reuse while the earlier card is still live. Without
+  // this, two pending approvals could share one request_id: the reused card
+  // review finding (choice_receipts keys on the host-minted approval_id
+  // precisely so a reuse never collapses two receipts into one, but a
+  // clicker can still be shown the wrong card's text if two cards answer to
+  // the same id — refusing the second ask up front is the cheaper fix).
+  // Scoped globally, not per agent group: a compromised agent's own group is
+  // sufficient to create the collision either way.
+  //
+  // This read is the FAST PATH, not the guarantee. It and the insert inside
+  // requestApprovalOutcome are separated by every await below — approver
+  // validation, destination authorization — and delivery is excluded per
+  // session (src/delivery.ts `inflightDeliveries`, keyed on session.id), so
+  // two sessions of this agent group can both read "nothing pending" here.
+  // The guarantee is migration 078's partial unique index, honoured as
+  // 'duplicate-request' at the insert; this check only saves the work when
+  // the reuse is plain rather than racing.
+  if (await getPendingApprovalByRequestId(request.choiceId)) {
+    log.warn('request_choice refused: choiceId already has a pending approval', {
+      sessionId: session.id,
+      agentGroupId: session.agent_group_id,
+      choiceId: request.choiceId,
+    });
+    await notifyAgent(session, duplicateChoiceRefusal(request.choiceId));
+    return;
+  }
+
   // Narrow, never widen: every named approver must already be allowed to answer.
   if (request.approvers) {
     const outsider = await withCentralSync(
@@ -166,8 +193,10 @@ async function handleRequestChoice(content: Record<string, unknown>, session: Se
     value: o.value,
     ...(o.style ? { style: o.style } : {}),
   }));
-  // Delivery failures notify the agent from inside requestApproval.
-  const posted = await requestApproval({
+  // Delivery failures notify the agent from inside requestApprovalOutcome;
+  // a lost reservation does not, because only this module knows what a
+  // reused choiceId means — so it gets the same refusal as the fast path.
+  const outcome = await requestApprovalOutcome({
     session,
     agentName: session.agent_group_id,
     action: REQUEST_CHOICE_ACTION,
@@ -184,12 +213,31 @@ async function handleRequestChoice(content: Record<string, unknown>, session: Se
     options,
   });
 
+  if (outcome === 'duplicate-request') {
+    log.warn('request_choice refused: choiceId lost the reservation to a concurrent ask', {
+      sessionId: session.id,
+      agentGroupId: session.agent_group_id,
+      choiceId: request.choiceId,
+    });
+    await notifyAgent(session, duplicateChoiceRefusal(request.choiceId));
+    return;
+  }
+
   // Post first, then retire: an ask that failed to post leaves the old card live.
-  if (posted && request.key !== undefined) {
+  if (outcome === 'posted' && request.key !== undefined) {
     const own = await getPendingApprovalByRequestId(request.choiceId);
     // Gone already means a newer same-key ask retired it: nothing older to retire.
     if (own) await supersedeOpenChoices(session.agent_group_id, request.key, own);
   }
+}
+
+/**
+ * The refusal for a choiceId that is already live. One wording for both the
+ * fast-path read and the lost reservation, so an agent cannot tell a race
+ * from a plain reuse — there is nothing it could usefully do differently.
+ */
+function duplicateChoiceRefusal(choiceId: string): string {
+  return `request_choice failed: choiceId "${choiceId}" already has a pending answer.`;
 }
 
 /**
@@ -320,7 +368,7 @@ const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF
 /**
  * The line the agent receives:
  *
- *   choice_response choice_id=<id> value=<v> label=<l> user_id=<id> user_name=<n>
+ *   choice_response choice_id=<id> approval_id=<aid> value=<v> label=<l> user_id=<id> user_name=<n>
  *
  * Fixed key order, every value percent-encoded with encodeURIComponent, so it
  * stays one line whatever a label or name contains, and it reaches the model
@@ -330,9 +378,15 @@ const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF
  * Anyone can type this line, and a host note can echo text it was sent, so the
  * agent trusts it only inside a message the runner marks origin="host" AND
  * event="choice_response" (notifyAgent with CHOICE_RESPONSE_EVENT).
+ *
+ * `approval_id` is the host-minted id `choice_receipts` (migration 077) keys
+ * on — `choice_id` alone is agent-chosen and not unique, so an agent that
+ * wants to cite the durable receipt for this answer needs the approval id,
+ * not just the choice id.
  */
 export function formatChoiceResponse(fields: {
   choiceId: string;
+  approvalId: string;
   value: string;
   label: string;
   userId: string;
@@ -340,6 +394,7 @@ export function formatChoiceResponse(fields: {
 }): string {
   const pairs: Array<[string, string]> = [
     ['choice_id', fields.choiceId],
+    ['approval_id', fields.approvalId],
     ['value', fields.value],
     ['label', fields.label],
     ['user_id', fields.userId],
@@ -353,7 +408,7 @@ async function relayChoice(ctx: ChoiceHandlerContext): Promise<Session | null> {
   const target = (await cardConversationSession(ctx.approval, ctx.requester)) ?? ctx.requester;
   if (!target) return null;
   // The click reaches the host without the platform's display name
-  // (ResponsePayload, src/response-registry.ts:15-22), so the name comes from
+  // (ResponsePayload, src/response-registry.ts:15-28), so the name comes from
   // the clicker's users row — an authorized clicker holds a user_roles row,
   // which references users(id) (src/db/schema.ts:88-89).
   const user = await getUser(ctx.userId);
@@ -363,6 +418,7 @@ async function relayChoice(ctx: ChoiceHandlerContext): Promise<Session | null> {
       target,
       formatChoiceResponse({
         choiceId: ctx.approval.request_id,
+        approvalId: ctx.approval.approval_id,
         value: ctx.value,
         label: ctx.label,
         userId: ctx.userId,

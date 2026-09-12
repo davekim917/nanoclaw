@@ -317,6 +317,52 @@ describe('request_choice delivery', () => {
     expect(notes().map((n) => n.text)).toEqual(['request_choice failed: options must hold 1 to 10 entries']);
   });
 
+  it('refuses a choiceId that already has a pending approval', async () => {
+    const first = (await ask(session, {}, 'choice-dup'))!;
+    expect(first).toBeDefined();
+
+    // `ask()`'s lookup matches by request_id, so a refused second call still
+    // returns the FIRST row (nothing new was created to shadow it) — assert
+    // on the approval count and the refusal note, not on `ask()`'s return.
+    await ask(session, { title: 'A different ask' }, 'choice-dup');
+
+    const matching = (await getPendingApprovalsByAction(REQUEST_CHOICE_ACTION)).filter(
+      (r) => r.request_id === 'choice-dup',
+    );
+    expect(matching).toHaveLength(1);
+    expect(matching[0].approval_id).toBe(first.approval_id);
+    // Exactly one card posted (the first ask's), not two.
+    expect(delivered).toHaveLength(1);
+    expect(notes().map((n) => n.text)).toEqual([
+      'request_choice failed: choiceId "choice-dup" already has a pending answer.',
+    ]);
+    // The original card is untouched.
+    expect(await getPendingApproval(first.approval_id)).toMatchObject({ request_id: 'choice-dup', status: 'pending' });
+  });
+
+  it('refuses the loser when two sessions race the same choiceId', async () => {
+    const other = sessionRow('sess-race', 'ag-1', 'mg-1', 'slack:chan-1:400.1');
+    await createSession(other);
+
+    // Both asks begin before either inserts, so both clear the fast-path read
+    // in handleRequestChoice — the window the pre-check cannot close, since
+    // delivery is excluded per session and these are two sessions. Only the
+    // reservation at the insert (migration 078) can refuse the loser.
+    await Promise.all([
+      ask(session, { title: 'First' }, 'choice-race'),
+      ask(other, { title: 'Second' }, 'choice-race'),
+    ]);
+
+    const matching = (await getPendingApprovalsByAction(REQUEST_CHOICE_ACTION)).filter(
+      (r) => r.request_id === 'choice-race',
+    );
+    expect(matching).toHaveLength(1);
+    expect(delivered.filter((d) => d.content.type === 'ask_question')).toHaveLength(1);
+    expect(notes().map((n) => n.text)).toEqual([
+      'request_choice failed: choiceId "choice-race" already has a pending answer.',
+    ]);
+  });
+
   it('from a task session with `to`, posts the card top-level in the destination', async () => {
     await destinationOnly('mg-2', 'release-room');
 
@@ -356,7 +402,7 @@ describe('request_choice click authority and resolution', () => {
     expect(notes()).toEqual([
       {
         sessionId: 'sess-1',
-        text: 'choice_response choice_id=choice-1 value=ship-all label=Ship%20all%20(2) user_id=slack-fixture%3Aadmin-1 user_name=Admin%20One',
+        text: `choice_response choice_id=choice-1 approval_id=${row.approval_id} value=ship-all label=Ship%20all%20(2) user_id=slack-fixture%3Aadmin-1 user_name=Admin%20One`,
       },
     ]);
     const [, , message, options] = vi.mocked(writeSessionMessage).mock.calls[0];
@@ -713,10 +759,47 @@ describe('thread-delivered gate cards (unchanged)', () => {
   });
 });
 
+/**
+ * The runner's `request_choice` tool description tells the agent what the
+ * answer line looks like. It is prose in the other package tree
+ * (container/agent-runner), so nothing but a test binds it to the host
+ * function that actually emits that line — and it HAS drifted: the
+ * description still documented the pre-`approval_id` key order for a round
+ * after `formatChoiceResponse` began emitting `approval_id` second (a
+ * `choice_receipts` review finding).
+ */
+describe('the documented response line and the emitted one', () => {
+  it('pins the container tool description’s key order to formatChoiceResponse', () => {
+    const emittedKeys = formatChoiceResponse({
+      choiceId: 'choice-9',
+      approvalId: 'appr-123-abc',
+      value: 'v',
+      label: 'l',
+      userId: 'slack:x',
+      userName: 'n',
+    })
+      .split(' ')
+      .slice(1)
+      .map((pair) => pair.slice(0, pair.indexOf('=')));
+
+    const source = fs.readFileSync('container/agent-runner/src/mcp-tools/request-choice.ts', 'utf8');
+    const documented = /`choice_response ([^`]+)`/.exec(source);
+    expect(documented).not.toBeNull();
+    const documentedKeys = documented![1]
+      .trim()
+      .split(' ')
+      .map((pair) => pair.slice(0, pair.indexOf('=')));
+
+    expect(documentedKeys).toEqual(emittedKeys);
+    expect(emittedKeys).toEqual(['choice_id', 'approval_id', 'value', 'label', 'user_id', 'user_name']);
+  });
+});
+
 describe('formatChoiceResponse', () => {
   it('keeps the line single and free of characters the runner escapes', () => {
     const line = formatChoiceResponse({
       choiceId: 'choice-9',
+      approvalId: 'appr-123-abc',
       value: 'a "b" <c> & d',
       label: 'multi\nline',
       userId: 'slack:x',
@@ -735,6 +818,7 @@ describe('formatChoiceResponse', () => {
     );
     expect(fields).toEqual({
       choice_id: 'choice-9',
+      approval_id: 'appr-123-abc',
       value: 'a "b" <c> & d',
       label: 'multi\nline',
       user_id: 'slack:x',

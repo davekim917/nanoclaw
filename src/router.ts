@@ -1551,17 +1551,35 @@ async function deliverToAgent(
   // row visible to that same-turn read.
   archiveInboundUserMessage(agent, mg, event, userId, parsedContent, effectiveThreadId);
 
-  const inserted = await writeSessionMessageIfNew(session.agent_group_id, session.id, {
-    id: routedMessageId,
-    kind: event.message.kind,
-    timestamp: event.message.timestamp,
-    platformId: deliveryAddr.platformId,
-    channelType: deliveryAddr.channelType,
-    messagingGroupId: mg.id,
-    threadId: deliveryAddr.threadId,
-    content: contentForWrite,
-    trigger: wake ? 1 : 0,
-  });
+  const inserted = await writeSessionMessageIfNew(
+    session.agent_group_id,
+    session.id,
+    {
+      id: routedMessageId,
+      kind: event.message.kind,
+      timestamp: event.message.timestamp,
+      platformId: deliveryAddr.platformId,
+      channelType: deliveryAddr.channelType,
+      messagingGroupId: mg.id,
+      threadId: deliveryAddr.threadId,
+      content: contentForWrite,
+      trigger: wake ? 1 : 0,
+    },
+    // The genuine platform message id this row represents — the runner
+    // renders it as platform_msg_id (formatter.ts) so the agent can cite the
+    // exact message it was answering. This is the one write in the codebase
+    // that may set it (host-origin.ts PLATFORM_MSG_ID_FIELD); every other
+    // caller of writeSessionMessage/writeSessionMessageIfNew leaves it unset.
+    //
+    // event.message.id is the routing/dedup key and is set for EVERY event,
+    // including ones this host synthesized (the CLI `to:` admin transport,
+    // Discord slash commands, `ncl messaging-groups send`, and CLI's own
+    // "plain chat"). Only event.message.nativeId is trust-bearing: it is set
+    // solely by main.ts's onInbound for genuine, non-CLI adapter ingress
+    // (adapter.ts InboundEvent.message.nativeId) — undefined here for every
+    // synthetic path, so no stamp is written for them.
+    { platformMessageId: event.message.nativeId },
+  );
   if (!inserted) {
     if (wake) stopTypingRefresh(session.id);
     log.debug('Duplicate routed message ignored', {
