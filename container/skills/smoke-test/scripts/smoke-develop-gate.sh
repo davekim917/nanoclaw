@@ -136,6 +136,18 @@ num_env MERGE_HOLD_SECONDS SMOKE_GATE_MERGE_HOLD_SECONDS 5400
 # hung checks, stuck deploys). Without it the watcher waits silently forever —
 # fail-quiet, which this gate refuses everywhere else.
 num_env UNSETTLED_ALERT_SECONDS SMOKE_GATE_UNSETTLED_ALERT_SECONDS 2700
+# `wait-settled` polls `check` on this interval, up to this bounded total, so a
+# re-verification run never scores an unsettled/red environment as a product
+# FAIL — it waits for the build, then verifies. See `wait-settled` below and
+# SKILL.md's re-verification guidance. Independent of the watcher's own
+# UNSETTLED_ALERT_SECONDS: that alarm exists to wake a human on a stuck develop
+# head; this bounds how long an already-woken agent waits before giving up
+# and reporting BLOCKED itself, and is deliberately not wired into
+# gate_misconfigured — `wait-settled` is invoked directly by an agent, never
+# by the scheduled watcher, so a bad value here degrades to the safe default
+# rather than raising an alarm nobody but that same agent would see.
+num_env WAIT_INTERVAL_SECONDS SMOKE_GATE_WAIT_INTERVAL_SECONDS 300
+num_env WAIT_MAX_SECONDS SMOKE_GATE_WAIT_MAX_SECONDS 2700
 # Optional readiness command run immediately before a campaign is opened, for
 # preconditions this gate cannot see: test-account liveness, a seeded fixture,
 # a reachable dependency. Exit 0 = go. Non-zero = the campaign never opens and
@@ -685,6 +697,43 @@ COMMAND="${1:-poll}"
 # readiness is known. Reusing the poll derivation is the point: a campaign
 # must be judged testable by the SAME rule the watcher uses, not a parallel
 # one that can drift away from it.
+# `wait-settled` is read-only, like `check`, and never claims anything: it
+# just calls `check` on an interval until settled:true or WAIT_MAX_SECONDS
+# elapses. It exists because "unsettled" is a build-timing fact, not a
+# verdict — a re-verification run that hits an unsettled or red environment
+# must wait and re-check, bounded, before deciding anything; it must never
+# score that as a product FAIL. See SKILL.md's re-verification guidance.
+#
+# Recurses into `"$0" check` rather than re-deriving settledness here, for the
+# same reason `check` itself reuses the poll derivation (comment above): a
+# second implementation of "is this build ready" can drift from the one the
+# watcher and `check` already agree on. The master lock (fd 9, acquired at
+# script entry) is released first — held across a bounded sleep loop it would
+# starve every concurrent `claim`/`progress`/`finish` for the whole wait.
+if [ "$COMMAND" = "wait-settled" ]; then
+  flock -u 9 2>/dev/null || true
+  WAIT_START="$(date -u +%s)"
+  WAIT_ATTEMPT=0
+  while :; do
+    WAIT_ATTEMPT=$(( WAIT_ATTEMPT + 1 ))
+    WAIT_OUT="$(bash "$0" check)"
+    WAIT_SETTLED="$(jq -r '.settled // false' <<<"$WAIT_OUT" 2>/dev/null || printf 'false')"
+    WAIT_NOW="$(date -u +%s)"
+    WAIT_ELAPSED=$(( WAIT_NOW - WAIT_START ))
+    if [ "$WAIT_SETTLED" = "true" ]; then
+      jq -c --argjson attempts "$WAIT_ATTEMPT" --argjson waited "$WAIT_ELAPSED" \
+        '. + {waitedSeconds:$waited, attempts:$attempts, timedOut:false}' <<<"$WAIT_OUT"
+      exit 0
+    fi
+    if [ "$WAIT_ELAPSED" -ge "$WAIT_MAX_SECONDS" ]; then
+      jq -c --argjson attempts "$WAIT_ATTEMPT" --argjson waited "$WAIT_ELAPSED" \
+        '. + {waitedSeconds:$waited, attempts:$attempts, timedOut:true}' <<<"$WAIT_OUT"
+      exit 1
+    fi
+    sleep "$WAIT_INTERVAL_SECONDS"
+  done
+fi
+
 if [ "$COMMAND" = "check" ]; then
   READONLY=true
   COMMAND=poll
