@@ -19,19 +19,27 @@ import type { Migration } from './index.js';
  *
  * One row per resolved card, written once, host-only, after delivery
  * succeeds and before the `pending_approvals` row is deleted
- * (src/modules/approvals/choices.ts:resolveChoice). `request_id` is the PK:
- * it is the card's own `choice-…` id (the container's `choiceId`,
- * threaded through as `pending_approvals.request_id` — see
- * src/modules/interactive/choice.ts:174 and
- * src/modules/approvals/primitive.ts:416), globally unique per card and
- * stable whether or not the underlying approval row is retried.
+ * (src/modules/approvals/choices.ts:resolveChoice). `approval_id` is the PK:
+ * it is host-minted per approval (`appr-<ms>-<6 base36>`,
+ * src/modules/approvals/primitive.ts:~410) and unique by construction.
+ * `request_id` — the card's own `choice-…` id, the container's `choiceId`
+ * threaded through as `pending_approvals.request_id` (see
+ * src/modules/interactive/choice.ts:174) — is kept as an indexed, NOT unique
+ * column: it is agent-chosen, so a compromised agent can reuse one across
+ * two different cards. Keying the receipt on `request_id` let a reused
+ * choiceId silently collapse two resolved approvals into one receipt (a
+ * `choice_receipts` review finding); keying on the host-minted `approval_id`
+ * means every resolved approval gets its own row regardless. The host itself
+ * additionally refuses a `request_choice` whose choiceId already has a
+ * PENDING approval (src/modules/interactive/choice.ts handleRequestChoice),
+ * so two live cards never legitimately share one choiceId — this schema is
+ * the second, structural line of defense.
  *
- * `INSERT ... ON CONFLICT DO NOTHING` at the write site, not a schema
- * constraint alone: the first click to win the pending→approved
- * compare-and-swap is the only one that ever reaches the write, so a
- * conflict here would mean two winners for the same card, which cannot
- * happen — the guard is defense in depth, not a case this table expects to
- * hit.
+ * Plain `INSERT` at the write site, no `ON CONFLICT` — a conflict on the
+ * host-minted PK must never happen (the pending→approved compare-and-swap
+ * lets exactly one click win per approval, and approval ids don't repeat),
+ * so a collision throws into the existing logged catch
+ * (choices.ts writeChoiceReceipt) rather than silently discarding evidence.
  *
  * No FK to `pending_approvals` (deleted immediately after) or `sessions`
  * (may end long before this row is read): the receipt's job is to outlive
@@ -45,8 +53,8 @@ export const migration077: Migration = {
   up(db: Database.Database) {
     db.exec(`
       CREATE TABLE IF NOT EXISTS choice_receipts (
-        request_id          TEXT PRIMARY KEY,
-        approval_id         TEXT NOT NULL,
+        approval_id         TEXT PRIMARY KEY,
+        request_id          TEXT NOT NULL,
         action              TEXT NOT NULL,
         agent_group_id      TEXT,
         session_id          TEXT NOT NULL,
@@ -58,6 +66,8 @@ export const migration077: Migration = {
         clicker_user_id     TEXT NOT NULL,
         resolved_at         TEXT NOT NULL
       );
+      CREATE INDEX IF NOT EXISTS idx_choice_receipts_request_id
+        ON choice_receipts(request_id);
       CREATE INDEX IF NOT EXISTS idx_choice_receipts_agent_group
         ON choice_receipts(agent_group_id, resolved_at);
     `);

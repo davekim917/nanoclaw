@@ -314,6 +314,29 @@ describe('request_choice delivery', () => {
     expect(notes().map((n) => n.text)).toEqual(['request_choice failed: options must hold 1 to 10 entries']);
   });
 
+  it('refuses a choiceId that already has a pending approval', async () => {
+    const first = (await ask(session, {}, 'choice-dup'))!;
+    expect(first).toBeDefined();
+
+    // `ask()`'s lookup matches by request_id, so a refused second call still
+    // returns the FIRST row (nothing new was created to shadow it) — assert
+    // on the approval count and the refusal note, not on `ask()`'s return.
+    await ask(session, { title: 'A different ask' }, 'choice-dup');
+
+    const matching = (await getPendingApprovalsByAction(REQUEST_CHOICE_ACTION)).filter(
+      (r) => r.request_id === 'choice-dup',
+    );
+    expect(matching).toHaveLength(1);
+    expect(matching[0].approval_id).toBe(first.approval_id);
+    // Exactly one card posted (the first ask's), not two.
+    expect(delivered).toHaveLength(1);
+    expect(notes().map((n) => n.text)).toEqual([
+      'request_choice failed: choiceId "choice-dup" already has a pending answer.',
+    ]);
+    // The original card is untouched.
+    expect(await getPendingApproval(first.approval_id)).toMatchObject({ request_id: 'choice-dup', status: 'pending' });
+  });
+
   it('from a task session with `to`, posts the card top-level in the destination', async () => {
     await destinationOnly('mg-2', 'release-room');
 
@@ -353,7 +376,7 @@ describe('request_choice click authority and resolution', () => {
     expect(notes()).toEqual([
       {
         sessionId: 'sess-1',
-        text: 'choice_response choice_id=choice-1 value=ship-all label=Ship%20all%20(2) user_id=slack-fixture%3Aadmin-1 user_name=Admin%20One',
+        text: `choice_response choice_id=choice-1 approval_id=${row.approval_id} value=ship-all label=Ship%20all%20(2) user_id=slack-fixture%3Aadmin-1 user_name=Admin%20One`,
       },
     ]);
     const [, , message, options] = vi.mocked(writeSessionMessage).mock.calls[0];
@@ -714,6 +737,7 @@ describe('formatChoiceResponse', () => {
   it('keeps the line single and free of characters the runner escapes', () => {
     const line = formatChoiceResponse({
       choiceId: 'choice-9',
+      approvalId: 'appr-123-abc',
       value: 'a "b" <c> & d',
       label: 'multi\nline',
       userId: 'slack:x',
@@ -732,6 +756,7 @@ describe('formatChoiceResponse', () => {
     );
     expect(fields).toEqual({
       choice_id: 'choice-9',
+      approval_id: 'appr-123-abc',
       value: 'a "b" <c> & d',
       label: 'multi\nline',
       user_id: 'slack:x',

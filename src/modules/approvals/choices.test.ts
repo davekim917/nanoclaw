@@ -12,8 +12,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { closeDb, getDb, initMigratedTestDb } from '../../db/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
-import { getChoiceReceipt } from '../../db/choice-receipts.js';
+import { getChoiceReceipt, getChoiceReceiptsByRequestId } from '../../db/choice-receipts.js';
 import { createPendingApproval, createSession, getPendingApproval } from '../../db/sessions.js';
+import { log } from '../../log.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { registerChoiceHandler, resolveChoice, type ChoiceHandlerContext } from './choices.js';
 
@@ -78,7 +79,10 @@ beforeEach(async () => {
   await createSession(fakeSession('requester-session'));
 });
 
-afterEach(() => closeDb());
+afterEach(() => {
+  vi.restoreAllMocks();
+  return closeDb();
+});
 
 describe('choice receipts', () => {
   it('a resolved click writes exactly one receipt with the right value, user and choice id', async () => {
@@ -88,7 +92,7 @@ describe('choice receipts', () => {
 
     await resolveChoice(approval, 'ship-a', USER);
 
-    const receipt = await getChoiceReceipt(approval.request_id);
+    const receipt = await getChoiceReceipt(approval.approval_id);
     expect(receipt).toBeDefined();
     expect(receipt).toMatchObject({
       request_id: approval.request_id,
@@ -109,7 +113,7 @@ describe('choice receipts', () => {
     expect(count).toBe(1);
   });
 
-  it('a losing second click writes nothing', async () => {
+  it('a losing second click writes nothing and never reaches delivery', async () => {
     const approval = await seedApproval();
     handler.mockResolvedValue(fakeSession('sess-target'));
 
@@ -123,10 +127,45 @@ describe('choice receipts', () => {
     // same approval object no longer wins the CAS.
     await resolveChoice(approval, 'hold', 'slack-fixture:U-other');
 
+    // The handler must fire exactly once. Asserting only the receipt count
+    // (as this test used to) survives removing the CAS guard entirely: the
+    // second call would still deliver to the handler a second time, and only
+    // fail the receipt's write (a PK conflict on approval_id) — silently, if
+    // that write path is ever again given an ON CONFLICT DO NOTHING. Asserting
+    // delivery directly catches the CAS removal regardless of the write path.
+    expect(handler).toHaveBeenCalledTimes(1);
     const count = (await getDb().get<{ n: number }>('SELECT COUNT(*) AS n FROM choice_receipts'))!.n;
     expect(count).toBe(1);
-    const receipt = await getChoiceReceipt(approval.request_id);
+    const receipt = await getChoiceReceipt(approval.approval_id);
     expect(receipt!.value).toBe('ship-a');
+  });
+
+  it('two approvals sharing one reused choiceId each keep their own receipt (review finding F2)', async () => {
+    // Defense in depth for the receipts table itself, independent of the
+    // creation-time refusal in modules/interactive/choice.ts
+    // (choice.test.ts "refuses a choiceId that already has a pending
+    // approval"): even if two PENDING approvals ever end up sharing a
+    // request_id — pending_approvals.request_id carries no UNIQUE
+    // constraint — each resolves to its OWN receipt, keyed by the
+    // host-minted approval_id, not one receipt silently standing in for
+    // both (migration 077).
+    const a = await seedApproval({ approval_id: 'appr-reused-a', request_id: 'choice-shared' });
+    const b = await seedApproval({ approval_id: 'appr-reused-b', request_id: 'choice-shared' });
+    handler.mockResolvedValueOnce(fakeSession('sess-a')).mockResolvedValueOnce(fakeSession('sess-b'));
+
+    await resolveChoice(a, 'ship-a', USER);
+    await resolveChoice(b, 'hold', 'slack-fixture:U-other');
+
+    expect(handler).toHaveBeenCalledTimes(2);
+    const count = (await getDb().get<{ n: number }>('SELECT COUNT(*) AS n FROM choice_receipts'))!.n;
+    expect(count).toBe(2);
+    expect(await getChoiceReceipt('appr-reused-a')).toMatchObject({ value: 'ship-a', clicker_user_id: USER });
+    expect(await getChoiceReceipt('appr-reused-b')).toMatchObject({
+      value: 'hold',
+      clicker_user_id: 'slack-fixture:U-other',
+    });
+    const byRequestId = await getChoiceReceiptsByRequestId('choice-shared');
+    expect(byRequestId.map((r) => r.approval_id).sort()).toEqual(['appr-reused-a', 'appr-reused-b']);
   });
 
   it('an undeliverable answer (card left open) writes nothing', async () => {
@@ -135,16 +174,17 @@ describe('choice receipts', () => {
 
     await resolveChoice(approval, 'ship-a', USER);
 
-    expect(await getChoiceReceipt(approval.request_id)).toBeUndefined();
+    expect(await getChoiceReceipt(approval.approval_id)).toBeUndefined();
     // Card left open: the row goes back to pending, not deleted.
     const row = await getPendingApproval(approval.approval_id);
     expect(row?.status).toBe('pending');
   });
 
-  it('a receipt-insert failure still delivers', async () => {
+  it('a receipt-insert failure still delivers, and logs the error', async () => {
     const approval = await seedApproval();
     const target = fakeSession('sess-target');
     handler.mockResolvedValue(target);
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => undefined);
 
     // Force the write to fail without touching delivery.
     await getDb().exec('DROP TABLE choice_receipts');
@@ -153,5 +193,9 @@ describe('choice receipts', () => {
 
     // The click was still consumed: the row is gone, not left open.
     expect(await getPendingApproval(approval.approval_id)).toBeUndefined();
+    expect(errorSpy).toHaveBeenCalledWith(
+      'Failed to write choice receipt — answer was still delivered',
+      expect.objectContaining({ approvalId: approval.approval_id, requestId: approval.request_id }),
+    );
   });
 });

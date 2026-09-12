@@ -129,6 +129,25 @@ async function handleRequestChoice(content: Record<string, unknown>, session: Se
     return;
   }
 
+  // Refuse a choiceId reuse while the earlier card is still live. Without
+  // this, two pending approvals could share one request_id: the reused card
+  // review finding (choice_receipts keys on the host-minted approval_id
+  // precisely so a reuse never collapses two receipts into one, but a
+  // clicker can still be shown the wrong card's text if two cards answer to
+  // the same id — refusing the second ask up front is the cheaper fix).
+  // Scoped globally, not per agent group: request_id has no uniqueness
+  // constraint in pending_approvals, and a compromised agent's own group is
+  // sufficient to create the collision either way.
+  if (await getPendingApprovalByRequestId(request.choiceId)) {
+    log.warn('request_choice refused: choiceId already has a pending approval', {
+      sessionId: session.id,
+      agentGroupId: session.agent_group_id,
+      choiceId: request.choiceId,
+    });
+    await notifyAgent(session, `request_choice failed: choiceId "${request.choiceId}" already has a pending answer.`);
+    return;
+  }
+
   // Narrow, never widen: every named approver must already be allowed to answer.
   if (request.approvers) {
     const outsider = await withCentralSync(
@@ -320,7 +339,7 @@ const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF
 /**
  * The line the agent receives:
  *
- *   choice_response choice_id=<id> value=<v> label=<l> user_id=<id> user_name=<n>
+ *   choice_response choice_id=<id> approval_id=<aid> value=<v> label=<l> user_id=<id> user_name=<n>
  *
  * Fixed key order, every value percent-encoded with encodeURIComponent, so it
  * stays one line whatever a label or name contains, and it reaches the model
@@ -330,9 +349,15 @@ const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF
  * Anyone can type this line, and a host note can echo text it was sent, so the
  * agent trusts it only inside a message the runner marks origin="host" AND
  * event="choice_response" (notifyAgent with CHOICE_RESPONSE_EVENT).
+ *
+ * `approval_id` is the host-minted id `choice_receipts` (migration 077) keys
+ * on — `choice_id` alone is agent-chosen and not unique, so an agent that
+ * wants to cite the durable receipt for this answer needs the approval id,
+ * not just the choice id.
  */
 export function formatChoiceResponse(fields: {
   choiceId: string;
+  approvalId: string;
   value: string;
   label: string;
   userId: string;
@@ -340,6 +365,7 @@ export function formatChoiceResponse(fields: {
 }): string {
   const pairs: Array<[string, string]> = [
     ['choice_id', fields.choiceId],
+    ['approval_id', fields.approvalId],
     ['value', fields.value],
     ['label', fields.label],
     ['user_id', fields.userId],
@@ -363,6 +389,7 @@ async function relayChoice(ctx: ChoiceHandlerContext): Promise<Session | null> {
       target,
       formatChoiceResponse({
         choiceId: ctx.approval.request_id,
+        approvalId: ctx.approval.approval_id,
         value: ctx.value,
         label: ctx.label,
         userId: ctx.userId,

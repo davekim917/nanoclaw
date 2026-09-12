@@ -13,10 +13,15 @@
 import { getDb } from './connection.js';
 
 export interface ChoiceReceipt {
-  /** The card's own `choice-…` id (`pending_approvals.request_id`). Primary key. */
-  requestId: string;
-  /** The internal `pending_approvals.approval_id` (`appr-…`) that carried it. */
+  /** The internal, host-minted `pending_approvals.approval_id` (`appr-…`). Primary key. */
   approvalId: string;
+  /**
+   * The card's own `choice-…` id (`pending_approvals.request_id`) — agent-chosen,
+   * NOT unique. Indexed, not the key: an agent can reuse a choiceId across two
+   * different cards (migration 077 explains why that must not collapse two
+   * receipts into one).
+   */
+  requestId: string;
   action: string;
   agentGroupId: string | null;
   /** The session the answer was actually delivered to. */
@@ -33,21 +38,23 @@ export interface ChoiceReceipt {
 }
 
 /**
- * Record one resolved choice. `ON CONFLICT DO NOTHING`: defense in depth —
- * `request_id` only ever reaches this call once, because the pending→approved
+ * Record one resolved choice. Plain `INSERT`, no `ON CONFLICT`: a conflict on
+ * the host-minted `approval_id` PK must never happen (the pending→approved
  * compare-and-swap in `transitionPendingApprovalStatus` lets exactly one
- * click win per card (src/db/sessions.ts) — not a case this table expects to
- * hit in practice.
+ * click win per approval, src/db/sessions.ts, and approval ids don't repeat)
+ * — so a genuine conflict throws, same as any other DB error, into the
+ * logged catch at the one call site (choices.ts writeChoiceReceipt). A
+ * reused `request_id` (agent-chosen `choiceId`) is NOT a conflict here: it
+ * inserts its own row, keyed by its own approval_id — see migration 077.
  */
 export async function recordChoiceReceipt(receipt: ChoiceReceipt): Promise<void> {
   await getDb().run(
     `INSERT INTO choice_receipts
-       (request_id, approval_id, action, agent_group_id, session_id,
+       (approval_id, request_id, action, agent_group_id, session_id,
         platform_id, thread_id, platform_message_id, value, label, clicker_user_id, resolved_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(request_id) DO NOTHING`,
-    receipt.requestId,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     receipt.approvalId,
+    receipt.requestId,
     receipt.action,
     receipt.agentGroupId,
     receipt.sessionId,
@@ -63,8 +70,8 @@ export async function recordChoiceReceipt(receipt: ChoiceReceipt): Promise<void>
 
 /** Raw row shape (DB column names), for reads — tests and any future consumer. */
 export interface ChoiceReceiptRow {
-  request_id: string;
   approval_id: string;
+  request_id: string;
   action: string;
   agent_group_id: string | null;
   session_id: string;
@@ -77,6 +84,21 @@ export interface ChoiceReceiptRow {
   resolved_at: string;
 }
 
-export async function getChoiceReceipt(requestId: string): Promise<ChoiceReceiptRow | undefined> {
-  return getDb().get<ChoiceReceiptRow>('SELECT * FROM choice_receipts WHERE request_id = ?', requestId);
+/** Look up a receipt by the host-minted approval id (the table's PK). */
+export async function getChoiceReceipt(approvalId: string): Promise<ChoiceReceiptRow | undefined> {
+  return getDb().get<ChoiceReceiptRow>('SELECT * FROM choice_receipts WHERE approval_id = ?', approvalId);
+}
+
+/**
+ * Every receipt sharing an agent-chosen `request_id` (choiceId) — plural,
+ * because `request_id` is indexed but not unique (migration 077): two cards
+ * can legitimately share a choiceId if the first resolved before the second
+ * was created (the live-collision case is refused up front instead, see
+ * src/modules/interactive/choice.ts).
+ */
+export async function getChoiceReceiptsByRequestId(requestId: string): Promise<ChoiceReceiptRow[]> {
+  return getDb().all<ChoiceReceiptRow>(
+    'SELECT * FROM choice_receipts WHERE request_id = ? ORDER BY resolved_at',
+    requestId,
+  );
 }
