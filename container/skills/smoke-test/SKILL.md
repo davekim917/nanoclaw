@@ -372,6 +372,37 @@ by calling `start` again. Reachability checks (`smoke-build-identity.sh`'s
 bundle/host and `/healthz`) stay separate from identity — they answer "is
 something serving", not "is it the pair this run claimed."
 
+**On drift, the coordinator may re-freeze exactly once per run** with
+`refreeze <run-dir> <reason>`, instead of finishing the whole run BLOCKED for
+what may be one unrelated redeploy:
+
+```bash
+bash /app/skills/smoke-test/scripts/smoke-pair-identity.sh refreeze <run-dir> "<reason>"
+```
+
+This is bounded, not a way to paper over drift: a second `refreeze` call in
+the same run — whether or not another drift is ever detected — is refused
+(exit 4), so a run gets at most one do-over. `refreeze` records the OLD pair,
+the NEW pair, the reason, and a timestamp in `identity.json`'s `history[]`
+(cite both pairs in the run record and the verdict, never just the new one)
+and bumps an internal `freezeGeneration`. Every `check`/`finish` receipt from
+before the re-freeze stays on disk as an honest record that the drift
+happened, but `finish` only looks at receipts recorded at the run's CURRENT
+freeze generation — a stale-generation receipt neither blocks nor clears
+publication, the same way `smoke-run-scaffold.sh`'s lane generations already
+work (see "Re-running a lane" above; this reuses that mechanism rather than
+inventing a parallel one). Concretely, after a `refreeze`:
+
+1. every lane already dispatched against the OLD pair has evidence that
+   predates the run's current identity — `redispatch` it before trusting
+   anything it reports from here on: `smoke-run-scaffold.sh redispatch
+   <run-dir> <lane-id>` for each such lane, then re-brief and re-run it;
+2. each redispatched lane calls `check <run-dir> <label>` again at its new
+   start/end, so a receipt exists at the CURRENT generation — `finish` refuses
+   (exit 2) until at least one does;
+3. a second drift after the one allowed re-freeze finishes the run BLOCKED,
+   exactly like an unhandled first drift would.
+
 A scheduled run arrives with the head already proven settled by the gate. A
 campaign someone asked for in chat does not, and must prove it before freezing
 and claim the environment after — see "Human-requested campaigns" below.
