@@ -220,6 +220,12 @@ describe('OneCLI approvals survive a host restart', () => {
     // The guarded action replays: the held credentialed request is decided by
     // the post-restart callback, which is what the SDK submits to the gateway.
     await expect(redelivered).resolves.toBe('approve');
+    // The bridge edits no approval card on click, so the resolution edit is
+    // the host's: addressed to the card this ROW names, not to whatever
+    // message was clicked.
+    const resolved = cardCalls(adapter2).filter((c) => c.operation === 'edit');
+    expect(resolved).toHaveLength(1);
+    expect(resolved[0].messageId).toBe('slack-msg-1');
     expect(await second.sessions.getPendingApproval(approvalId)).toBeUndefined();
   });
 
@@ -419,10 +425,15 @@ describe('decisions made before the gateway redelivers', () => {
     // poll: nothing is armed in memory yet, but the request is NOT gone.
     expect(await second.approvals.resolveOneCLIApproval('oa-held', 'approve', ADMIN)).toBe(true);
 
-    // The decision is held on the row, not thrown away, and the card is not
-    // yet corrected — we do not know the request is dead.
+    // The decision is held on the row, not thrown away. The card is edited to
+    // show it — the bridge edits no approval card on click, so without this it
+    // would keep offering live buttons — but it is not yet CORRECTED: we do
+    // not know the request is dead.
     expect((await second.sessions.getPendingApproval('oa-held'))?.status).toBe('approved');
-    expect(adapter.deliver).not.toHaveBeenCalled();
+    const decided = cardCalls(adapter).filter((c) => c.operation === 'edit');
+    expect(decided).toHaveLength(1);
+    expect(decided[0].messageId).toBe('slack-msg-held');
+    expect(decided[0].text).not.toContain('the original request ended');
 
     // The gateway redelivers. The held decision is applied to the real
     // request, and no second card is posted.
