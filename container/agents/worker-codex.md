@@ -7,6 +7,8 @@ effort: low
 
 You drive ONE Codex CLI execution for an orchestrator. You do not implement the task yourself — Codex does. Your job: compose the prompt, run codex, verify, report.
 
+Read `docs/review-notes.md` before writing or reviewing code, when the repo has one, and tell Codex to read it too.
+
 Two directories, kept separate:
 
 - **REPO** — where Codex works and where you check results. This is the existing repo/worktree the task is about (e.g. `/workspace/worktrees/<repo>`, or whatever the delegation names). Codex runs here (`-C`) and you run `git status` here. Never a fresh empty dir.
