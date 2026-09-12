@@ -1588,10 +1588,12 @@ echo '["frontend/sub/a.css"]' | python3 "$CLASSIFY" "$STAR_RULES" | jq -e '
   .campaignSize == "standard" and .sizeReason == "standard: frontend/sub/a.css not matched by lightAllowed"
 ' >/dev/null
 
-# --- 32. `fullGlobsFrom`: import the install's own release-policy module
-# instead of keeping a second copy of its sensitive-path list in the rules
-# file. Every failure mode here (missing file, import error, absent or
-# mistyped variable) fails closed to `full` -- exercised directly against
+# --- 32. `fullGlobsFrom`: read the named constant out of the install's own
+# release-policy file via ast.literal_eval, instead of keeping a second copy
+# of its sensitive-path list in the rules file -- and instead of importing
+# the file as a module, which would execute it. Every failure mode here
+# (unreadable file, unparseable file, absent variable, a non-literal value,
+# or a mistyped value) fails closed to `full` -- exercised directly against
 # campaign-size-classify.py, same as the glob unit cases above.
 POLICY_MOD="$STATE_DIR/policy.py"
 cat > "$POLICY_MOD" <<'PY'
@@ -1614,7 +1616,55 @@ echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$FGF_RULES" | jq -e '
   .campaignSize == "light"
 ' >/dev/null
 
-# Import error (file does not exist): fails closed to full, names the path.
+# A policy file whose first line imports a module that doesn't exist still
+# classifies correctly off its globs -- proof the file is read as data (ast),
+# never executed as code.
+NOEXEC_MOD="$STATE_DIR/policy-noexec.py"
+cat > "$NOEXEC_MOD" <<'PY'
+import module_that_does_not_exist_anywhere
+SENSITIVE_GLOBS = ["backend/permissions/**", "backend/billing/**"]
+PY
+FGF_NOEXEC="$STATE_DIR/fgf-noexec.json"
+cat > "$FGF_NOEXEC" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$NOEXEC_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$FGF_NOEXEC" | jq -e '
+  .campaignSize == "full" and
+  .sizeReason == "full: backend/billing/charge.ts matched backend/billing/**"
+' >/dev/null
+
+# A computed value (not a literal): fails closed to full, reason says so.
+COMPUTED_MOD="$STATE_DIR/policy-computed.py"
+cat > "$COMPUTED_MOD" <<'PY'
+BASE = ["backend/permissions/**"]
+EXTRA = ["backend/billing/**"]
+SENSITIVE_GLOBS = BASE + EXTRA
+PY
+FGF_COMPUTED="$STATE_DIR/fgf-computed.json"
+cat > "$FGF_COMPUTED" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$COMPUTED_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$FGF_COMPUTED" | jq -e '
+  .campaignSize == "full" and (.sizeReason | test("is not a literal"))
+' >/dev/null
+
+# An unparseable file: fails closed to full.
+UNPARSEABLE_MOD="$STATE_DIR/policy-unparseable.py"
+cat > "$UNPARSEABLE_MOD" <<'PY'
+SENSITIVE_GLOBS = [
+PY
+FGF_UNPARSEABLE="$STATE_DIR/fgf-unparseable.json"
+cat > "$FGF_UNPARSEABLE" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$UNPARSEABLE_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$FGF_UNPARSEABLE" | jq -e '
+  .campaignSize == "full" and (.sizeReason | test("could not be parsed"))
+' >/dev/null
+
+# Unreadable file (does not exist): fails closed to full, names the path.
 FGF_MISSING="$STATE_DIR/fgf-missing.json"
 cat > "$FGF_MISSING" <<JSON
 {"full":[],"lightAllowed":["frontend/**"],
@@ -1645,7 +1695,7 @@ cat > "$FGF_MISSINGVAR" <<JSON
  "fullGlobsFrom":{"path":"$POLICY_MOD","name":"NOT_THERE"}}
 JSON
 echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$FGF_MISSINGVAR" | jq -e '
-  .campaignSize == "full" and (.sizeReason | test("not found in"))
+  .campaignSize == "full" and (.sizeReason | test("not found at top level in"))
 ' >/dev/null
 
 # Local `full` globs and imported globs are unioned, not one replacing the
