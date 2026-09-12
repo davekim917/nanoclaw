@@ -444,10 +444,13 @@ themselves are never shown.
 
   A reply carries a `reply_to` attribute and an inline `<quoted_message from="…">…</quoted_message>`.
 
-  A routed platform message also carries `platform_msg_id="…"` (e.g. a Slack `ts`) so the
-  agent can cite the exact message it answered; it is absent on host notes, system rows,
-  and spawn envelopes — the field is host-only and stripped from every other write
-  (`src/host-origin.ts` `PLATFORM_MSG_ID_FIELD`).
+  A message routed from genuine platform ingress also carries `platform_msg_id="…"`
+  (e.g. a Slack `ts`) so the agent can cite the exact message it answered; it is
+  absent on host notes, system rows, spawn envelopes, and any message this host
+  itself synthesized (the CLI admin transport, Discord slash commands, `ncl
+  messaging-groups send`, CLI's own "plain chat") — the field is host-only,
+  stamped only from `main.ts`'s `onInbound` for non-CLI adapters, and stripped
+  from every other write (`src/host-origin.ts` `PLATFORM_MSG_ID_FIELD`).
 
 - **`chat-sdk`** — same `<message>` shape, fields extracted from the serialized Chat SDK
   message. Attachments are appended inline: `[image: screenshot.png — saved to /workspace/…]`
@@ -667,9 +670,9 @@ Post a card of buttons and return immediately. Unlike `ask_user_question` this i
 Implementation:
 
 1. Validate, generate a `choiceId`, and write a `messages_out` row with `kind: 'system'` and content `{ action: 'request_choice', choiceId, title, question, options, key?, approvers?, to?, channelType?, platformId? }`. With `to`, the container resolves the destination name into routing; without it, the session must have a conversation (a task session must pass `to`). A system row never counts against the chat budget, so a muted task can post a card. Return the `choiceId`
-2. On the host, `src/modules/interactive/choice.ts` refuses `approvers` that are not owners/admins of the agent group, re-authorizes `to` routing with the same destination check an outbound message gets, and opens an approvals-backed card (`pending_approvals`, no expiry): in the session's own thread, or top-level in the destination. With a `key`, the group's older open card under that key is then retired (edited to "Superseded by a newer ask", row removed)
+2. On the host, `src/modules/interactive/choice.ts` refuses `approvers` that are not owners/admins of the agent group, refuses a `choiceId` that already has a pending approval (any agent group), re-authorizes `to` routing with the same destination check an outbound message gets, and opens an approvals-backed card (`pending_approvals`, no expiry): in the session's own thread, or top-level in the destination. With a `key`, the group's older open card under that key is then retired (edited to "Superseded by a newer ask", row removed)
 3. The bridge does not edit the card on click (`src/answer-cards.ts`). Only a user with admin privilege on the agent group (and on the `approvers` list, if one was given) can answer; any other click changes nothing. The first authorized click wins; once its answer is delivered the host edits the card to "✅ label — name". A click whose answer cannot be delivered leaves the card open
-4. The answer is written by `notifyAgent` into the session a typed reply in the card's thread would reach (resolved as the router does, created if absent), falling back to the asking session when the card's channel is not wired to the agent group, and that session is woken: `choice_response choice_id=<id> value=<v> label=<l> user_id=<channel:handle> user_name=<name>` (fixed key order, each value percent-encoded). Anyone can type that line, and a host note can echo text it was sent, so the agent acts on it only inside a message marked `origin="host"` AND `event="choice_response"`: the host strips the host-only `origin` and `event` content fields from every inbound write except `notifyAgent`'s (`WriteSessionMessageOptions.hostOrigin`), only the choice relay sets `event`, and the runner renders both attributes from those fields alone
+4. The answer is written by `notifyAgent` into the session a typed reply in the card's thread would reach (resolved as the router does, created if absent), falling back to the asking session when the card's channel is not wired to the agent group, and that session is woken: `choice_response choice_id=<id> approval_id=<aid> value=<v> label=<l> user_id=<channel:handle> user_name=<name>` (fixed key order, each value percent-encoded). Anyone can type that line, and a host note can echo text it was sent, so the agent acts on it only inside a message marked `origin="host"` AND `event="choice_response"`: the host strips the host-only `origin` and `event` content fields from every inbound write except `notifyAgent`'s (`WriteSessionMessageOptions.hostOrigin`), only the choice relay sets `event`, and the runner renders both attributes from those fields alone
 
 #### edit_message
 
