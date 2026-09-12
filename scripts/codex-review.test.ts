@@ -2841,11 +2841,31 @@ describe('codex-review review-notes rule: a PR a reviewer said no to records its
   });
 
   it.each([
+    ['trailing spaces', 'Review-notes: none (docs-only change)   '],
+    ['a CRLF line ending before more text', 'Review-notes: none (docs-only change)\r\nMore text.'],
+    ['a lower-case key', 'review-notes: none (docs-only change)'],
+  ])('allows a Review-notes: none line with %s', (_case, line) => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: ['risk:high'], body: `Why.\n\n${line}`, comments: [CHANGES_EARLIER, APPROVED] });
+
+    const result = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('merge=allowed');
+  });
+
+  it.each([
     ['an empty reason', 'Review-notes: none ()'],
     ['a blank reason', 'Review-notes: none (   )'],
     ['no reason at all', 'Review-notes: none'],
     ['the line inside a code fence', '```\nReview-notes: none (an example)\n```'],
     ['the line inside an HTML comment', '<!-- Review-notes: none (a template) -->'],
+    ['a stray parenthesis after the reason (mutation: the loose reason regex)', 'Review-notes: none ()x)'],
+    ['a second closing parenthesis', 'Review-notes: none ( ) )'],
+    ['text after the closing parenthesis', 'Review-notes: none (a reason) and more'],
+    ['a nested parenthesis', 'Review-notes: none (see (the #679 line))'],
+    ['a zero-width space for a reason', 'Review-notes: none (\u200b)'],
+    ['a zero-width space inside a visible reason', 'Review-notes: none (docs\u200b only)'],
+    ['a no-break space for a reason', 'Review-notes: none (\u00a0)'],
   ])('refuses (24) a body line with %s', (_case, line) => {
     const root = tempRoot();
     scopeFixture(root, { labels: ['risk:high'], body: `Why.\n\n${line}`, comments: [CHANGES_EARLIER, APPROVED] });
@@ -2984,5 +3004,104 @@ describe('codex-review review-notes rule: a PR a reviewer said no to records its
     expect(result.status).toBe(1);
     expect(result.stderr).toContain('could not read receipts');
     expect(result.stdout).not.toContain('audit=pass');
+  });
+});
+
+describe('codex-review exact verdicts: a wrong pr-body.jq never passes a check open', () => {
+  // A copy of the skill to run, with its pr-body.jq rewritten by `edit`.
+  function skillWithPrBody(root: string, edit: (module: string) => string): string {
+    const skill = path.join(root, 'skill');
+    fs.mkdirSync(path.join(skill, 'scripts'), { recursive: true });
+    for (const name of fs.readdirSync(path.dirname(HELPER)))
+      fs.copyFileSync(path.join(path.dirname(HELPER), name), path.join(skill, 'scripts', name));
+    fs.copyFileSync(
+      path.join(path.dirname(HELPER), '..', 'reviewer-models.txt'),
+      path.join(skill, 'reviewer-models.txt'),
+    );
+    const module = path.join(skill, 'scripts', 'pr-body.jq');
+    fs.writeFileSync(module, edit(fs.readFileSync(module, 'utf8')));
+    return path.join(skill, 'scripts', 'codex-review.sh');
+  }
+
+  // Valid jq, wrong answer: the whole module replaced by one that yields no body,
+  // or two. Before exact verdicts, either left fix_link empty or doubled, which
+  // is not `missing`, so a fix PR with no Fixes-PR line merged and audited clean.
+  const WRONG_MODULES: [string, () => string][] = [
+    ['yields no body', () => 'def pr_body_text: empty;\n'],
+    ['yields two bodies', () => 'def pr_body_text: (.body // ""), (.body // "");\n'],
+  ];
+
+  it.each(WRONG_MODULES)(
+    'merge-check exits 1, never allowed, on a pr-body.jq that %s (mutation: the site tests only = missing)',
+    (_case, stub) => {
+      const root = tempRoot();
+      scopeFixture(root, { labels: [], title: 'fix: a fix with no Fixes-PR line' });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD], {}, skillWithPrBody(root, stub));
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('the Fixes-PR check gave no verdict');
+      expect(result.stdout).not.toContain('merge=allowed');
+    },
+  );
+
+  it.each(WRONG_MODULES)(
+    'audit exits 1, never passes, on a pr-body.jq that %s (mutation: the site tests only = missing)',
+    (_case, stub) => {
+      const root = tempRoot();
+      auditFixture(root, { labels: [], title: 'fix: a fix with no Fixes-PR line', body: 'Why.' });
+
+      const result = runHelper(root, ['audit'], {}, skillWithPrBody(root, stub));
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('the Fixes-PR check gave no verdict');
+      expect(result.stdout).not.toContain('audit=pass');
+    },
+  );
+
+  it("fails loudly through pr-body.jq's own check when a refactor inside it yields two bodies", () => {
+    const root = tempRoot();
+    // With the real module this head merges: its body says Fixes-PR: none.
+    scopeFixture(root, { labels: [], title: 'fix: a fix', body: 'Fixes-PR: none' });
+    const script = skillWithPrBody(root, (module) => {
+      const edited = module.replace('[ .body // "" | unfenced', '[ (.body // ""), (.body // "") | unfenced');
+      if (edited === module) throw new Error('pr-body.jq no longer holds the expression this test edits');
+      return edited;
+    });
+
+    const result = runHelper(root, ['merge-check', '--head', HEAD], {}, script);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('pr_body_text must yield exactly one string, got 2');
+    expect(result.stdout).not.toContain('merge=allowed');
+  });
+});
+
+describe('codex-review review-notes rule: the same-second edit boundary', () => {
+  const APPROVED = receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z');
+  const LOGIN = (APPROVED.author as { login: string }).login;
+
+  // GitHub's timestamps are to the second, so an edit stamped with the merge's
+  // own second may have landed after it: the comment's text at the merge is
+  // unknown, and it could have been a changes receipt.
+  it("audit reads a trusted comment edited in the merge's own second as a possible changes receipt (mutation: >= loosened to >)", () => {
+    const root = tempRoot();
+    auditFixture(root, {
+      labels: ['risk:high'],
+      comments: [
+        {
+          author: { login: LOGIN },
+          authorAssociation: 'OWNER',
+          createdAt: '2026-09-05T00:10:00Z',
+          lastEditedAt: MERGED_AT,
+          fullDatabaseId: '10',
+          body: 'CI is green.',
+        },
+        APPROVED,
+      ],
+    });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(28);
+    expect(result.stdout).toContain(
+      `review_notes_missing: whether a substitute receipt asked for changes is unknown: ${LOGIN} posted a comment at 2026-09-05T00:10:00Z and edited it at ${MERGED_AT}`,
+    );
   });
 });

@@ -6,13 +6,15 @@ import { describe, expect, it } from 'vitest';
 /**
  * docs/review-notes.md is the review loop's memory: one line per lesson, which
  * the author and the reviewer read before writing or reviewing code
- * (docs/review-policy.md, "Review notes and fix links"). This test holds three
+ * (docs/review-policy.md, "Review notes and fix links"). This test holds these
  * rules on it:
  *
  *  1. every line under `## Lessons` is `- YYYY-MM-DD · PR · class · lesson ·
- *     structural fix`, five fields split on ` · `;
+ *     structural fix`, five fields split on ` · `, dated no later than today (UTC);
  *  2. its class is one `## Classes` registers;
- *  3. the same mistake twice becomes a check: a class on two or more lines
+ *  3. its structural fix is exactly `none`, or cites something a reader can
+ *     open: a backtick path, a `file:line`, a `#<n>`, or a commit sha;
+ *  4. the same mistake twice becomes a check: a class on two or more lines
  *     whose NEWEST line's structural fix is `none` fails. It fails the PR that
  *     records the second occurrence, which is exactly where the structural
  *     fix — a lint rule, a test, a primitive — belongs.
@@ -25,8 +27,10 @@ const NOTES_PATH = path.join(__dirname, '..', 'docs', 'review-notes.md');
 const SEPARATOR = ' · ';
 const PR_FIELD = /^(#\d+(\/#\d+)*|rule)$/;
 const CLASS_ENTRY = /^- `([^`]+)` — \S/;
-// `none`, `none; <why>` or `none (<why>)`: a structural fix that does not exist.
-const NO_FIX = /^none\b/i;
+// What a structural fix may cite: a backtick span holding a path (a `/` or a
+// `.`), a file:line, a PR or issue number, or a commit sha (7-40 hex digits,
+// at least one of them a digit, so a hex-letter word never passes as one).
+const CITATIONS = [/`[^`]*[./][^`]*`/, /[\w./-]+\.\w+:\d+/, /#\d+/, /\b(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b/];
 
 type Lesson = { line: number; date: string; cls: string; fix: string };
 
@@ -46,8 +50,11 @@ function isRealDate(date: string): boolean {
   return !Number.isNaN(parsed.getTime()) && parsed.toISOString().startsWith(date);
 }
 
-/** Every rule violation in a review-notes file's text; empty when it passes. */
-export function reviewNotesProblems(text: string): string[] {
+/**
+ * Every rule violation in a review-notes file's text; empty when it passes.
+ * `today` is a UTC YYYY-MM-DD date; no lesson may be dated after it.
+ */
+export function reviewNotesProblems(text: string, today = new Date().toISOString().slice(0, 10)): string[] {
   const lines = text.split('\n');
   const problems: string[] = [];
 
@@ -87,10 +94,16 @@ export function reviewNotesProblems(text: string): string[] {
     }
     const [date, pr, cls, lesson, fix] = fields.map((field) => field.trim());
     if (!isRealDate(date)) problems.push(`line ${line}: "${date}" is not a YYYY-MM-DD date`);
+    else if (date > today) problems.push(`line ${line}: ${date} is after today (${today}, UTC)`);
     if (!PR_FIELD.test(pr)) problems.push(`line ${line}: PR "${pr}" is not #<n>, #<n>/#<m>…, or rule`);
     if (!registry.has(cls)) problems.push(`line ${line}: class "${cls}" is not registered under Classes`);
     if (lesson === '') problems.push(`line ${line}: the lesson is empty`);
     if (fix === '') problems.push(`line ${line}: the structural fix is empty; write "none" if there is none`);
+    else if (fix !== 'none' && !CITATIONS.some((re) => re.test(fix)))
+      problems.push(
+        `line ${line}: structural fix "${fix}" is neither exactly "none" nor a citation ` +
+          '(a backtick path, a file:line, a #<n>, or a commit sha)',
+      );
     lessons.push({ line, date, cls, fix });
   }
   if (lessons.length === 0) problems.push('`## Lessons` holds no lesson');
@@ -100,7 +113,7 @@ export function reviewNotesProblems(text: string): string[] {
   for (const [cls, group] of byClass) {
     if (group.length < 2) continue;
     const newest = group.reduce((a, b) => (b.date > a.date || (b.date === a.date && b.line > a.line) ? b : a));
-    if (NO_FIX.test(newest.fix)) {
+    if (newest.fix === 'none') {
       problems.push(
         `class "${cls}" recurs (lines ${group.map((l) => l.line).join(', ')}) and its newest line (${newest.line}) ` +
           `has structural fix "none": the second occurrence is where the lint rule, test or primitive lands — name it`,
@@ -109,6 +122,10 @@ export function reviewNotesProblems(text: string): string[] {
   }
   return problems;
 }
+
+// Synthetic cases judge against a fixed day, so they never depend on the clock.
+const TODAY = '2026-09-12';
+const FIX = '`src/x.ts`';
 
 /** A notes file with the given class registry and lesson lines. */
 function notes(classes: string[], lessons: string[]): string {
@@ -129,7 +146,7 @@ function notes(classes: string[], lessons: string[]): string {
 }
 
 describe('docs/review-notes.md', () => {
-  it('is in format, uses registered classes, and names a structural fix for every recurring class', () => {
+  it('is in format, uses registered classes, cites its fixes, and names a fix for every recurring class', () => {
     expect(reviewNotesProblems(fs.readFileSync(NOTES_PATH, 'utf8'))).toEqual([]);
   });
 });
@@ -140,53 +157,69 @@ describe('reviewNotesProblems', () => {
       ['alpha', 'beta'],
       [
         '- 2026-09-01 · #1 · alpha · A lesson · a test at x.ts:1',
-        '- 2026-09-02 · #2/#3 · beta · Another · none; nothing structural yet',
-        '- 2026-09-03 · rule · alpha · A rule line · the check at y.ts:2',
+        '- 2026-09-02 · #2/#3 · beta · Another · none',
+        `- ${TODAY} · rule · alpha · A rule line, dated today · the check at y.ts:2`,
       ],
     );
-    expect(reviewNotesProblems(text)).toEqual([]);
+    expect(reviewNotesProblems(text, TODAY)).toEqual([]);
   });
 
   it.each([
-    ['four fields', '- 2026-09-01 · #1 · A lesson · a fix', /4 fields, not 5/],
-    ['a separator inside a field', '- 2026-09-01 · #1 · alpha · A · lesson · a fix', /6 fields, not 5/],
-    ['no leading dash', '2026-09-01 · #1 · alpha · A lesson · a fix', /starting "- "/],
+    ['a backtick path', '`scripts/check.ts`'],
+    ['a file:line', 'guarded at codex-review.sh:915'],
+    ['a PR or issue number', 'tracked in #676'],
+    ['a commit sha', 'fixed at 545c164cf'],
+    ['exactly none', 'none'],
+  ])('accepts a structural fix that is %s', (_case, fix) => {
+    expect(reviewNotesProblems(notes(['alpha'], [`- 2026-09-01 · #1 · alpha · A lesson · ${fix}`]), TODAY)).toEqual([]);
+  });
+
+  it.each([
+    ['four fields', `- 2026-09-01 · #1 · A lesson · ${FIX}`, /4 fields, not 5/],
+    ['a separator inside a field', `- 2026-09-01 · #1 · alpha · A · lesson · ${FIX}`, /6 fields, not 5/],
+    ['no leading dash', `2026-09-01 · #1 · alpha · A lesson · ${FIX}`, /starting "- "/],
     ['a wrapped continuation line', '  continued from the line above', /starting "- "/],
-    ['a date that is not one', '- 2026-02-30 · #1 · alpha · A lesson · a fix', /not a YYYY-MM-DD date/],
-    ['a PR field that is not a PR', '- 2026-09-01 · PR 1 · alpha · A lesson · a fix', /is not #<n>/],
+    ['a date that is not one', `- 2026-02-30 · #1 · alpha · A lesson · ${FIX}`, /not a YYYY-MM-DD date/],
+    ['a date after today', `- 2026-09-13 · #1 · alpha · A lesson · ${FIX}`, /2026-09-13 is after today \(2026-09-12/],
+    ['a PR field that is not a PR', `- 2026-09-01 · PR 1 · alpha · A lesson · ${FIX}`, /is not #<n>/],
     ['an empty structural fix', '- 2026-09-01 · #1 · alpha · A lesson ·  ', /structural fix is empty/],
+    ['a structural fix of TBD', '- 2026-09-01 · #1 · alpha · A lesson · TBD', /"TBD" is neither exactly "none"/],
+    ['a structural fix of -', '- 2026-09-01 · #1 · alpha · A lesson · -', /"-" is neither exactly "none"/],
+    ['a structural fix of n/a', '- 2026-09-01 · #1 · alpha · A lesson · n/a', /"n\/a" is neither exactly "none"/],
+    ['none with a tail', '- 2026-09-01 · #1 · alpha · A lesson · none; later', /"none; later" is neither/],
+    ['None, capitalised', '- 2026-09-01 · #1 · alpha · A lesson · None', /"None" is neither/],
+    ['prose that cites nothing', '- 2026-09-01 · #1 · alpha · A lesson · the `lstat` guard', /is neither/],
   ])('fails %s', (_case, line, problem) => {
     // A well-formed line alongside, so the bad one is the only problem.
-    const text = notes(['alpha'], ['- 2026-08-31 · #9 · alpha · A good line · a fix', line]);
-    expect(reviewNotesProblems(text)).toEqual([expect.stringMatching(problem)]);
+    const text = notes(['alpha'], [`- 2026-08-31 · #9 · alpha · A good line · ${FIX}`, line]);
+    expect(reviewNotesProblems(text, TODAY)).toEqual([expect.stringMatching(problem)]);
   });
 
   it('fails a class the registry does not list', () => {
-    const problems = reviewNotesProblems(notes(['alpha'], ['- 2026-09-01 · #1 · gamma · A lesson · a fix']));
+    const problems = reviewNotesProblems(notes(['alpha'], [`- 2026-09-01 · #1 · gamma · A lesson · ${FIX}`]), TODAY);
     expect(problems).toEqual([expect.stringMatching(/class "gamma" is not registered/)]);
   });
 
   it('fails a class registered twice, and a file with no Classes or no Lessons section', () => {
-    expect(reviewNotesProblems(notes(['alpha', 'alpha'], ['- 2026-09-01 · #1 · alpha · A · a fix']))).toEqual([
+    expect(reviewNotesProblems(notes(['alpha', 'alpha'], [`- 2026-09-01 · #1 · alpha · A · ${FIX}`]), TODAY)).toEqual([
       expect.stringMatching(/registered twice/),
     ]);
-    expect(reviewNotesProblems('# Review notes\n\n## Lessons\n\n- 2026-09-01 · #1 · alpha · A · a fix\n')).toContain(
-      'no `## Classes` section',
+    expect(
+      reviewNotesProblems(`# Review notes\n\n## Lessons\n\n- 2026-09-01 · #1 · alpha · A · ${FIX}\n`, TODAY),
+    ).toContain('no `## Classes` section');
+    expect(reviewNotesProblems('# Review notes\n\n## Classes\n\n- `alpha` — x\n', TODAY)).toContain(
+      'no `## Lessons` section',
     );
-    expect(reviewNotesProblems('# Review notes\n\n## Classes\n\n- `alpha` — x\n')).toContain('no `## Lessons` section');
   });
 
-  // The recurrence rule (mutation: NO_FIX never matching makes this pass a repeat with no fix).
-  it.each([
-    ['none', 'none'],
-    ['none, with a reason', 'none; it was a one-off'],
-    ['None, capitalised', 'None (tracked elsewhere)'],
-  ])('fails a class on a second line whose newest structural fix is %s', (_case, fix) => {
+  // The recurrence rule (mutation: never treating the newest fix as `none` passes a repeat with no fix).
+  it('fails a class on a second line whose newest structural fix is none', () => {
     const problems = reviewNotesProblems(
       notes(
         ['alpha'],
-        ['- 2026-09-01 · #1 · alpha · First time · none', `- 2026-09-02 · #2 · alpha · Second time · ${fix}`],
+        ['- 2026-09-01 · #1 · alpha · First time · none', '- 2026-09-02 · #2 · alpha · Second time · none'],
       ),
+      TODAY,
     );
     expect(problems).toEqual([
       expect.stringMatching(/class "alpha" recurs \(lines 11, 12\) and its newest line \(12\)/),
@@ -203,6 +236,7 @@ describe('reviewNotesProblems', () => {
           '- 2026-09-03 · #3 · alpha · Third time · a lint rule at z.ts:9',
         ],
       ),
+      TODAY,
     );
     expect(problems).toEqual([]);
   });
@@ -211,13 +245,13 @@ describe('reviewNotesProblems', () => {
     // Later in the file but older by date: the dated-newest line's `none` still fails.
     const byDate = notes(
       ['alpha'],
-      ['- 2026-09-05 · #5 · alpha · Newer · none', '- 2026-09-01 · #1 · alpha · Older, appended late · a test'],
+      ['- 2026-09-05 · #5 · alpha · Newer · none', `- 2026-09-01 · #1 · alpha · Older, appended late · ${FIX}`],
     );
-    expect(reviewNotesProblems(byDate)).toEqual([expect.stringMatching(/newest line \(11\)/)]);
+    expect(reviewNotesProblems(byDate, TODAY)).toEqual([expect.stringMatching(/newest line \(11\)/)]);
     const sameDay = notes(
       ['alpha'],
-      ['- 2026-09-05 · #5 · alpha · Earlier that day · a test', '- 2026-09-05 · #6 · alpha · Later that day · none'],
+      [`- 2026-09-05 · #5 · alpha · Earlier that day · ${FIX}`, '- 2026-09-05 · #6 · alpha · Later that day · none'],
     );
-    expect(reviewNotesProblems(sameDay)).toEqual([expect.stringMatching(/newest line \(12\)/)]);
+    expect(reviewNotesProblems(sameDay, TODAY)).toEqual([expect.stringMatching(/newest line \(12\)/)]);
   });
 });

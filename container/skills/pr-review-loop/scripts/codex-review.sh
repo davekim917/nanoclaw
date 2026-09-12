@@ -528,10 +528,13 @@ FIX_TITLE_RE='^\s*fix(\([^)]*\))?!?:'
 FIXES_PR_LINE_RE='(^|\n)Fixes-PR:[ \t]*(#[0-9]+|none)\b'
 # The review-notes rule (docs/review-policy.md, "Review notes and fix links"):
 # a PR any substitute receipt asked for changes on adds or amends a line in
-# REVIEW_NOTES_FILE, or its body carries this line with a non-empty reason,
-# read the way the Fixes-PR line is (review_notes_state).
+# REVIEW_NOTES_FILE, or its body carries this line, read the way the Fixes-PR
+# line is (review_notes_state). The reason is ONE parenthesised phrase, with no
+# parenthesis inside it and nothing after it on the line, so `none ()x)` and
+# `none ( ) )` never pass for one; review_notes_state also wants a visible
+# character in it, and no zero-width or other format character.
 REVIEW_NOTES_FILE='docs/review-notes.md'
-REVIEW_NOTES_NONE_LINE_RE='(^|\n)Review-notes:[ \t]*none[ \t]*\((?<reason>[^\n]*)\)'
+REVIEW_NOTES_NONE_LINE_RE='(^|\n)Review-notes:[ \t]*none[ \t]*\((?<reason>[^()\n]*)\)[ \t]*\r?(?=\n|\z)'
 
 # `missing` when a fix title's body has no Fixes-PR line, else `ok`, for a
 # {title, body} JSON object on stdin — merge-check's rule, and audit's. A line
@@ -931,20 +934,22 @@ changes_receipt_state() {
 # a non-empty reason, outside code fences and HTML comments as the Fixes-PR
 # line is read. The touch comes from SCOPE_FILES — the pinned comparison
 # scope_eval checked — and a listing it could not check never counts as one.
-# Prints nothing when the rule holds or does not apply, else the reason,
+# Prints exactly `ok` when the rule holds or does not apply — its callers read
+# anything else but the reason as no verdict — else the reason,
 # `review_notes_missing: …`. $1 is the PR as a {body} JSON object: now for
 # merge-check, as it stood at the merge for audit. Non-zero when the receipts
 # cannot be read.
 review_notes_state() {
   local state
   state=$(changes_receipt_state) || return 1
-  [ "$state" = none ] && return 0
+  if [ "$state" = none ]; then echo ok; return 0; fi
   printf '%s' "$1" | jq -r -L "$HERE" --arg state "$state" --arg lineRe "$REVIEW_NOTES_NONE_LINE_RE" \
     --arg notes "$REVIEW_NOTES_FILE" --argjson files "$SCOPE_FILES" '
     include "pr-body";
+    def real_reason: (test("\\p{Cf}") | not) and test("[^\\s\\p{Z}\\p{Cc}\\p{Cf}]");
     ($state | split("\t")) as [$kind, $why]
-    | if [ pr_body_text | capture($lineRe; "gi") ] | any(.reason | test("\\S")) then empty
-      elif ($files | type) == "array" and any($files[]; . == $notes) then empty
+    | if [ pr_body_text | capture($lineRe; "gi") ] | any(.reason | real_reason) then "ok"
+      elif ($files | type) == "array" and any($files[]; . == $notes) then "ok"
       else "review_notes_missing: \(if $kind == "changes" then $why else "whether a substitute receipt asked for changes is unknown: \($why)" end); \(if ($files | type) == "array" then "this head does not touch \($notes)" else "the files this head changes could not be checked, so no touch of \($notes) counts" end), and the body has no `Review-notes: none (<reason>)` line with a reason. Add or amend the lesson in \($notes), or say why there is none in that body line" end'
 }
 
@@ -1035,10 +1040,20 @@ merge_check_main() {
   # merge time: the title and body can both change after the PR opens.
   pr_text=$(gh pr view "$PR" --repo "$REPO" --json title,body) || exit 1
   fix_link=$(printf '%s' "$pr_text" | fix_link_state) || exit 1
-  if [ "$fix_link" = missing ]; then
-    echo "merge=refused head=$SCOPE_HEAD: a fix PR needs a 'Fixes-PR: #<n>' line in its body naming the PR it fixes, or 'Fixes-PR: none'" >&2
-    exit 24
-  fi
+  # Exactly `ok` or `missing`. Anything else — no line, two lines — is no
+  # verdict, never a pass: a pr-body.jq that yields nothing must not wave a fix
+  # PR through.
+  case "$fix_link" in
+    ok) ;;
+    missing)
+      echo "merge=refused head=$SCOPE_HEAD: a fix PR needs a 'Fixes-PR: #<n>' line in its body naming the PR it fixes, or 'Fixes-PR: none'" >&2
+      exit 24
+      ;;
+    *)
+      echo "merge=error head=$SCOPE_HEAD: the Fixes-PR check gave no verdict (got \"$fix_link\")" >&2
+      exit 1
+      ;;
+  esac
   # No branch protection holds this line, so merge-check does, whatever the
   # verdict: every check run on exactly this head, completed green.
   ci=$(ci_verdict "$SCOPE_HEAD") || exit 1
@@ -1066,10 +1081,17 @@ merge_check_main() {
   # or the body says why there is none (review_notes_state). Read at merge
   # time, like the Fixes-PR line, and under either verdict.
   notes=$(review_notes_state "$pr_text") || exit 1
-  if [ -n "$notes" ]; then
-    echo "merge=refused head=$SCOPE_HEAD verdict=$SCOPE_VERDICT: $notes" >&2
-    exit 24
-  fi
+  case "$notes" in
+    ok) ;;
+    review_notes_missing:*)
+      echo "merge=refused head=$SCOPE_HEAD verdict=$SCOPE_VERDICT: $notes" >&2
+      exit 24
+      ;;
+    *)
+      echo "merge=error head=$SCOPE_HEAD: the review-notes check gave no verdict (got \"$notes\")" >&2
+      exit 1
+      ;;
+  esac
   if [ "$SCOPE_VERDICT" = skip ]; then
     refuse_if_base_moved
     echo "merge=allowed head=$SCOPE_HEAD mode=risk-scoped verdict=skip ci=green base=$SCOPE_BASE: $SCOPE_REASON"
@@ -1777,10 +1799,17 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
     fi
     where="$where verdict=$SCOPE_VERDICT"
     fix_link=$(printf '%s' "$at_merge" | fix_link_state) || { echo "audit=error $where: could not read the title and body" >&2; exit 1; }
-    if [ "$fix_link" = missing ]; then
-      echo "audit=violation $where: a fix PR merged with no 'Fixes-PR:' line in its body at merge time"
-      exit 28
-    fi
+    case "$fix_link" in
+      ok) ;;
+      missing)
+        echo "audit=violation $where: a fix PR merged with no 'Fixes-PR:' line in its body at merge time"
+        exit 28
+        ;;
+      *)
+        echo "audit=error $where: the Fixes-PR check gave no verdict (got \"$fix_link\")" >&2
+        exit 1
+        ;;
+    esac
     ci=$(ci_verdict "$audit_head") || { echo "audit=error $where: could not read CI on the head" >&2; exit 1; }
     if [ -n "$ci" ]; then
       echo "audit=violation $where: $ci"
@@ -1809,10 +1838,17 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
     # The review-notes rule, with the body at the merge and the comparison onto
     # the commit it merged onto; receipts as of the merge (changes_receipt_state).
     notes=$(review_notes_state "$at_merge") || { echo "audit=error $where: could not read receipts" >&2; exit 1; }
-    if [ -n "$notes" ]; then
-      echo "audit=violation $where: $notes"
-      exit 28
-    fi
+    case "$notes" in
+      ok) ;;
+      review_notes_missing:*)
+        echo "audit=violation $where: $notes"
+        exit 28
+        ;;
+      *)
+        echo "audit=error $where: the review-notes check gave no verdict (got \"$notes\")" >&2
+        exit 1
+        ;;
+    esac
     if [ "$SCOPE_VERDICT" = skip ]; then
       echo "audit=pass $where: $SCOPE_REASON"
       exit 0

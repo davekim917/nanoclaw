@@ -13,4 +13,11 @@ def unfenced:
            and ($line | test("^ {0,3}" + $open.run + "[ \t]*\r?$")) then .fence = null
       else . end)
   | .out | join("\n");
-def pr_body_text: .body // "" | unfenced | gsub("<!--[\\s\\S]*?(-->|$)"; "");
+# Exactly one string, or an error: each caller turns it into ONE verdict line,
+# and a refactor that yields none or two (`.body | values | …`) must fail
+# loudly rather than leave a check with nothing to read. The callers also
+# accept only an exact verdict, for a module that is wrong altogether.
+def pr_body_text:
+  [ .body // "" | unfenced | gsub("<!--[\\s\\S]*?(-->|$)"; "") ]
+  | if length == 1 and (.[0] | type) == "string" then .[0]
+    else error("pr_body_text must yield exactly one string, got \(length)") end;

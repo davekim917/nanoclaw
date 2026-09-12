@@ -74,8 +74,17 @@ non-empty reason. A finding fixed during review is a lesson as much as a
 deferred one, and it is the kind that used to go unrecorded.
 `codex-review.sh merge-check` refuses without one (exit 24,
 `review_notes_missing`), and `audit` re-checks it as of the merge. A line
-inside a code fence or an HTML comment doesn't count. Deferring a finding to
-an issue, or reverting a PR, adds a line too.
+inside a code fence or an HTML comment doesn't count, and the reason is one
+parenthesised phrase, nothing after it on the line, with a visible character
+and no zero-width or other format character. Deferring a finding to an issue,
+or reverting a PR, adds a line too.
+
+When this rule, or any merge-check rule, changes on main, re-extract the gate
+before the next merge. A PR merged through a skill copy extracted before the
+change landed, but merged after it, is audited under the rule its merge
+commit carries — each merge is audited with its own commit's copy of the
+skill (`.github/scripts/gate-audit.sh:175-180`) — and can be flagged
+`gate-bypass`. No go-live cutoff is needed.
 
 A class on a second line must name a structural fix on its newest line: the
 lint rule, test or primitive that now catches it. `scripts/review-notes.test.ts`
