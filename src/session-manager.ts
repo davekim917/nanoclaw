@@ -21,7 +21,7 @@ import type { OutboundFile } from './channels/adapter.js';
 import { DATA_DIR } from './config.js';
 import { assertChannelRoutingConsistency } from './delivery.js';
 import { ensureContainedInboxDir, isPathInside } from './inbox-safety.js';
-import { withoutHostFields } from './host-origin.js';
+import { stripPlatformMessageId, withoutHostFields, withPlatformMessageId } from './host-origin.js';
 import { acquireStorageActivityLease } from './storage-activity.js';
 import { evaluateGuardSync, withCentralSync } from './db/central-lease.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
@@ -947,6 +947,17 @@ export interface WriteSessionMessageOptions {
    * writer. The one caller is notifyAgent (modules/approvals/primitive.ts).
    */
   hostOrigin?: boolean;
+  /**
+   * The platform-native id of the specific inbound message this write
+   * represents (e.g. a Slack `ts`). Stamped into content as PLATFORM_MSG_ID_FIELD
+   * (host-origin.ts) so the runner can render `platform_msg_id` on it — but
+   * only for this call: every write, regardless of this option, first strips
+   * any `platformMsgId` the caller's own content already carries
+   * (stripPlatformMessageId), so a chat write can never forge or echo one.
+   * The one caller is the router's own routed-message write (router.ts),
+   * which is the sole place that knows the id is genuine.
+   */
+  platformMessageId?: string;
 }
 
 /** Thrown when a write's guard refuses at the last instant. No row is written. */
@@ -1000,6 +1011,7 @@ export async function writeSessionMessage(
     false,
     options.guard,
     options.hostOrigin === true,
+    options.platformMessageId,
   );
 }
 
@@ -1017,6 +1029,7 @@ export async function writeSessionMessageIfNew(
     true,
     options.guard,
     options.hostOrigin === true,
+    options.platformMessageId,
   );
 }
 
@@ -1027,6 +1040,7 @@ async function writeSessionMessageInternal(
   ignoreDuplicateId: boolean,
   guard: WriteGuard | undefined,
   hostOrigin: boolean,
+  platformMessageId: string | undefined,
 ): Promise<boolean> {
   // A session mid-archival is about to lose its directory. Re-provisioning it
   // below would resurrect the dir seconds before the reclaim removes it, and
@@ -1054,7 +1068,15 @@ async function writeSessionMessageInternal(
   // see its claim and wait for it to finish.
   const lease = await acquireStorageActivityLease(sessionDir(agentGroupId, sessionId), `inbound-${sessionId}`);
   try {
-    return await writeSessionMessageLocked(agentGroupId, sessionId, message, ignoreDuplicateId, guard, hostOrigin);
+    return await writeSessionMessageLocked(
+      agentGroupId,
+      sessionId,
+      message,
+      ignoreDuplicateId,
+      guard,
+      hostOrigin,
+      platformMessageId,
+    );
   } finally {
     await lease.release();
   }
@@ -1067,6 +1089,7 @@ async function writeSessionMessageLocked(
   ignoreDuplicateId: boolean,
   guard: WriteGuard | undefined,
   hostOrigin: boolean,
+  platformMessageId: string | undefined,
 ): Promise<boolean> {
   // Waiting for the claim above can mean waiting out a reclaim that archived
   // and deleted this session while we queued. Re-provisioning it here would
@@ -1157,7 +1180,16 @@ async function writeSessionMessageLocked(
 
   // Extract base64 attachment data, save to inbox, replace with file paths
   // The host-only fields survive only a host note (WriteSessionMessageOptions.hostOrigin).
-  const messageContent = hostOrigin ? message.content : withoutHostFields(message.content, message.kind);
+  const strippedContent = hostOrigin ? message.content : withoutHostFields(message.content, message.kind);
+  // platformMsgId has its own, independent trust rule (host-origin.ts):
+  // stripped from whatever the caller's content claims, on every write
+  // regardless of hostOrigin, then reapplied only when this write's own
+  // caller passed platformMessageId explicitly.
+  const withoutClaimedPlatformMsgId = stripPlatformMessageId(strippedContent, message.kind);
+  const messageContent =
+    platformMessageId !== undefined
+      ? withPlatformMessageId(withoutClaimedPlatformMsgId, message.kind, platformMessageId)
+      : withoutClaimedPlatformMsgId;
   const { content, writtenPaths } = extractAttachmentFiles(agentGroupId, sessionId, message.id, messageContent);
 
   // Scheduled occurrences are always inert until the due-time admission seam

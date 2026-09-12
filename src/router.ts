@@ -1551,17 +1551,27 @@ async function deliverToAgent(
   // row visible to that same-turn read.
   archiveInboundUserMessage(agent, mg, event, userId, parsedContent, effectiveThreadId);
 
-  const inserted = await writeSessionMessageIfNew(session.agent_group_id, session.id, {
-    id: routedMessageId,
-    kind: event.message.kind,
-    timestamp: event.message.timestamp,
-    platformId: deliveryAddr.platformId,
-    channelType: deliveryAddr.channelType,
-    messagingGroupId: mg.id,
-    threadId: deliveryAddr.threadId,
-    content: contentForWrite,
-    trigger: wake ? 1 : 0,
-  });
+  const inserted = await writeSessionMessageIfNew(
+    session.agent_group_id,
+    session.id,
+    {
+      id: routedMessageId,
+      kind: event.message.kind,
+      timestamp: event.message.timestamp,
+      platformId: deliveryAddr.platformId,
+      channelType: deliveryAddr.channelType,
+      messagingGroupId: mg.id,
+      threadId: deliveryAddr.threadId,
+      content: contentForWrite,
+      trigger: wake ? 1 : 0,
+    },
+    // The genuine platform message id this row represents — the runner
+    // renders it as platform_msg_id (formatter.ts) so the agent can cite the
+    // exact message it was answering. This is the one write in the codebase
+    // that may set it (host-origin.ts PLATFORM_MSG_ID_FIELD); every other
+    // caller of writeSessionMessage/writeSessionMessageIfNew leaves it unset.
+    { platformMessageId: event.message.id },
+  );
   if (!inserted) {
     if (wake) stopTypingRefresh(session.id);
     log.debug('Duplicate routed message ignored', {

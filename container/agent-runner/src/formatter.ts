@@ -461,7 +461,23 @@ function formatSingleChat(msg: MessageInRow): string {
       ? ` event="${content.event}"`
       : '';
 
-  return `<message${idAttr}${fromAttr}${hostAttr}${eventAttr} sender="${escapeXml(sender)}"${senderIdAttr} time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${attachmentsSuffix}</message>`;
+  // The platform-native id of the specific inbound message this row
+  // represents (e.g. a Slack `ts`) — lets the agent cite the exact message
+  // it was answering, and lets an external verifier check that citation
+  // against the platform's own API. `content.platformMsgId` is a host-only
+  // field: the host strips it from every write except its own routed-message
+  // write (src/host-origin.ts PLATFORM_MSG_ID_FIELD, src/router.ts), so no
+  // chat write — an agent's own tool call, an agent-to-agent delivery, a host
+  // note — can forge or echo one. `origin === 'host'` is excluded explicitly
+  // too, belt-and-suspenders with that write-side guarantee: a host note
+  // never has a genuine platform message behind it.
+  const platformMsgId =
+    content.origin !== 'host' && typeof content.platformMsgId === 'string' && content.platformMsgId.length > 0
+      ? content.platformMsgId
+      : null;
+  const platformMsgIdAttr = platformMsgId ? ` platform_msg_id="${escapeXml(platformMsgId)}"` : '';
+
+  return `<message${idAttr}${fromAttr}${hostAttr}${eventAttr}${platformMsgIdAttr} sender="${escapeXml(sender)}"${senderIdAttr} time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${attachmentsSuffix}</message>`;
 }
 
 /**

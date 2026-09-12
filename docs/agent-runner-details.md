@@ -444,6 +444,11 @@ themselves are never shown.
 
   A reply carries a `reply_to` attribute and an inline `<quoted_message from="…">…</quoted_message>`.
 
+  A routed platform message also carries `platform_msg_id="…"` (e.g. a Slack `ts`) so the
+  agent can cite the exact message it answered; it is absent on host notes, system rows,
+  and spawn envelopes — the field is host-only and stripped from every other write
+  (`src/host-origin.ts` `PLATFORM_MSG_ID_FIELD`).
+
 - **`chat-sdk`** — same `<message>` shape, fields extracted from the serialized Chat SDK
   message. Attachments are appended inline: `[image: screenshot.png — saved to /workspace/…]`
   or `[image: screenshot.png (https://signed-url…)]`. Images/PDFs that Claude handles
