@@ -26,6 +26,15 @@ DEV_URL="${SMOKE_GATE_DEV_URL:-}"
 STATE_DIR="${SMOKE_GATE_STATE_DIR:-/workspace/agent/smoke-gate}"
 STATE_FILE="$STATE_DIR/develop-state.json"
 LOCK_FILE="$STATE_DIR/develop-state.lock"
+# Same path smoke-pr-gate.sh's CONTROL_LOCK names under the SAME
+# SMOKE_GATE_STATE_DIR — the two gates are deployed pointed at one shared
+# state dir, so this is one real lock file, not two. `claim` takes it (fd 8)
+# for its task-slot scan through its state write, mirroring smoke-pr-gate.sh's
+# task-claim (#726 F2); LOCK_FILE (fd 9, develop-state.lock) is taken first,
+# before command dispatch, so the order here is always develop-state then
+# control. smoke-pr-gate.sh never takes develop-state.lock, so that ordering
+# can never form a cycle with its own control-then-per-PR/task-lease order.
+CONTROL_LOCK="$STATE_DIR/control.lock"
 # Single writer per file: smoke-pr-gate.sh's `finish` (given the SAME path via
 # its own SMOKE_GATE_HANDOFF_LEDGER) APPENDS one line per freeze-run outcome
 # here; this gate only ever reads it. Owned by this gate's state dir (not
@@ -729,9 +738,10 @@ COMMAND="${1:-poll}"
 # succeeded — exactly backwards. `develop` has no such terminal state to race:
 # a branch never "closes", so `check` here is always well-defined to recurse
 # on. Porting this to the PR gate needs its own merge/closed-aware settle
-# rule, not a copy of this loop — a real gap (SKILL.md:900 still describes a
-# hand-rolled poll for the PR/freeze flow), tracked separately rather than
-# fixed here.
+# rule, not a copy of this loop — a real gap (`claim`'s own
+# requestedCampaignFlow hint below, smoke-develop-gate.sh:932, still points a
+# freeze campaign at a hand-rolled `smoke-pr-gate.sh check <pr>` poll loop),
+# tracked separately rather than fixed here.
 if [ "$COMMAND" = "wait-settled" ]; then
   flock -u 9 2>/dev/null || true
   WAIT_START="$(date -u +%s)"
@@ -948,11 +958,56 @@ if [ "$COMMAND" = "claim" ]; then
   # way smoke-pr-gate.sh's own find_pr_for_run scans pr-*-state.json — this
   # gate never validates RUN_ID's character set the way run_id_ok does there,
   # so it must not be trusted as a path component.
+  #
+  # This scan through the state write below runs under CONTROL_LOCK (fd 8),
+  # mirroring smoke-pr-gate.sh's task-claim (#726 F2). Unlocked, this scan and
+  # a concurrent `task-claim` could each read before the other wrote, and a
+  # forced interleaving left two active slots for one run id — the fence in
+  # smoke-run-scaffold.sh then refused BOTH with a count of 2. LOCK_FILE (fd 9,
+  # develop-state.lock) is already held at this point (taken at script entry,
+  # before command dispatch), so the order is develop-state then control, same
+  # as the CONTROL_LOCK header comment above. Fail closed, not the best-effort
+  # `|| true` form most CONTROL_LOCK call sites use, because this guards a real
+  # write (cross-gate run-id uniqueness), not just an alarm stamp.
+  if ! exec 8>"$CONTROL_LOCK"; then
+    jq -cn --arg run "$RUN_ID" --arg lock "$CONTROL_LOCK" \
+      '{ok:false,error:("could not open the gate control lock at " + $lock + " - claim refused"),runId:$run}'
+    exit 1
+  fi
+  if ! flock -w "$LOCK_WAIT" 8; then
+    emit_lock_busy "claim-control-lock"
+    exit 0
+  fi
   for _task_state_file in "$STATE_DIR"/task-*-state.json; do
     [ -e "$_task_state_file" ] || continue
-    if [ "$(jq -r '.activeRunId // empty' "$_task_state_file" 2>/dev/null)" = "$RUN_ID" ]; then
-      jq -cn --arg run "$RUN_ID" \
-        '{ok:false,error:"run id already claimed by a task-scoped certification run — run ids must be unique across the gate",runId:$run}'
+    _task_active_run_id=""
+    if [ "$_task_state_file" = "$STATE_DIR/task-$RUN_ID-state.json" ]; then
+      # This run's OWN would-be task-scoped state. `jq … 2>/dev/null` used to
+      # read a malformed or chmod-000 file here the same as "no such file" —
+      # "no match" — and let the claim through onto a run id a task-scoped
+      # certification run might actually still hold (#726 F2 shadow-review
+      # finding 1). A file this gate cannot parse must refuse fail-closed: it
+      # may in fact record OUR run id. An EMPTY file is not evidence of
+      # anything — `-s` mirrors smoke-pr-gate.sh's own reciprocal check
+      # (`smoke-pr-gate.sh`'s `claim`, TASK_OTHER_FILE) — and is not refused.
+      if [ -s "$_task_state_file" ] &&
+         ! _task_active_run_id="$(jq -er '.activeRunId // ""' "$_task_state_file" 2>/dev/null)"; then
+        jq -cn --arg run "$RUN_ID" --arg path "$_task_state_file" \
+          '{ok:false,error:"this run id'"'"'s task-scoped state exists but cannot be read — refusing; run ids must be unique across the gate",runId:$run,taskStateFile:$path}'
+        flock -u 8; exec 8>&-
+        exit 0
+      fi
+    else
+      # A DIFFERENT run's task-scoped state. task-claim writes the same run id
+      # into both the filename and `.activeRunId`, so this file can never
+      # legitimately record OUR run id — a bad file here must never block
+      # THIS claim (another run's corrupt state is not our problem).
+      _task_active_run_id="$(jq -r '.activeRunId // empty' "$_task_state_file" 2>/dev/null)"
+    fi
+    if [ "$_task_active_run_id" = "$RUN_ID" ]; then
+      jq -cn --arg run "$RUN_ID" --arg path "$_task_state_file" \
+        '{ok:false,error:"run id already claimed by a task-scoped certification run — run ids must be unique across the gate",runId:$run,taskStateFile:$path}'
+      flock -u 8; exec 8>&-
       exit 0
     fi
   done
@@ -977,6 +1032,7 @@ if [ "$COMMAND" = "claim" ]; then
         --arg sha "$(jq -r '.activeSha // empty' <<<"$STATE")" \
         '{ok:false,error:$err,activeRunId:$active,activeAgeSeconds:$age,
           activeSha:(if $sha == "" then null else $sha end)}'
+      flock -u 8; exec 8>&-
       exit 0
     fi
     TOOK_OVER="$ACTIVE_RUN"
@@ -996,6 +1052,11 @@ if [ "$COMMAND" = "claim" ]; then
      .candidateSha=null |
      .candidateFirstSeen=null' <<<"$STATE")"
   write_state "$STATE"
+  # The task-slot uniqueness invariant CONTROL_LOCK protects is now committed
+  # to disk; nothing below touches task-*-state.json or develop-state.json's
+  # activeRunId, so release it here rather than holding it for the rest of
+  # this command's advisory-notice and slot-file work.
+  flock -u 8; exec 8>&-
   # A campaign that wants the build to keep moving (its own browser lanes are
   # blocked, a fix must land) opts out; the watcher is still suppressed either
   # way, which is the part that prevents two runs on one environment.
