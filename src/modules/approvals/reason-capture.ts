@@ -32,6 +32,7 @@ import { registerMessageInterceptor } from '../../router.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { ensureUserDm } from '../permissions/user-dm.js';
 import { finalizeReject } from './finalize.js';
+import { editApprovalCardResolution, REJECT_WITH_REASON_VALUE } from './primitive.js';
 
 /** How long an awaiting-reason hold waits for the admin's reply before the sweep finalizes a plain reject. */
 const REASON_CAPTURE_WINDOW_MS = 5 * 60 * 1000;
@@ -111,6 +112,10 @@ export async function armReasonCapture(approval: PendingApproval, session: Sessi
   // can't arrive before the prompt is read, so there's no lost-message window.
   const expiresAt = new Date(Date.now() + REASON_CAPTURE_WINDOW_MS).toISOString();
   await markApprovalAwaitingReason(approval.approval_id, expiresAt);
+  // The bridge edits no approval card on click, so the held card would still
+  // show live buttons while the approver types their reason. finalizeReject
+  // edits it again with the final decision (primitive.ts editApprovalCardResolution).
+  await editApprovalCardResolution(approval, REJECT_WITH_REASON_VALUE, userId);
   awaitingReason.set(dmKey(dm.channel_type, dm.platform_id), { approvalId: approval.approval_id, userId });
   log.info('reject-with-reason: awaiting reason reply', { approvalId: approval.approval_id, userId });
 }
