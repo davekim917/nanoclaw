@@ -32,8 +32,13 @@
 #      are reported, never committed — a file missing from disk stays in the
 #      snapshot commit at its last known-good content. Sensitive filenames
 #      (.env*, *.pem, *.p8, *.key, credentials*, profiles.yml) are never
-#      staged even when tracked; they are reported instead. Any binary
-#      change still refuses the WHOLE commit before anything is staged. A
+#      staged even when tracked; they are reported instead. A binary change
+#      whose --text-forced diff also matches SECRET_RE is HELD per-file like
+#      any other match (see below) and never reaches this check at all — its
+#      scratch-index entry is already back at HEAD by the time it runs. Only
+#      a binary change that ISN'T also held still refuses the whole commit,
+#      and it does so AFTER the per-file hold loop and its state rewrite
+#      below (review-683-r2 P3-4), not "before anything is staged". A
 #      SECRET_RE match in a file's added lines instead HOLDS ONLY THAT FILE
 #      (#628 item 9: a single false positive used to refuse everything —
 #      review-658 measured 32 of 430 groups commits, 7.4%, would be refused
@@ -554,13 +559,44 @@ _commit_groups_impl() { # <scratch index file>
   GIT_INDEX_FILE="$TMPIDX" git -C "$G" add -u -- . "${excludes[@]}" 2>>"$ERR" || {
     FAILURES+=("groups: staging tracked changes into the scratch index failed"); GROUPS_RESULT="failed (add -u)"; return; }
 
+  # review-683-r2 round 3, P2: `ls-files --deleted` above only catches a path
+  # that's genuinely ABSENT (lstat fails, ENOENT) — a tracked file replaced
+  # by a directory, or a tracked symlink replaced by a real directory, still
+  # lstat()s successfully, so it was never in $deleted and never excluded
+  # from `add -u`. `add -u` still can't read directory content as the
+  # tracked blob, so it stages the path as a deletion anyway — one that
+  # slipped past every exclude above and, before this fix, reached the
+  # P3-1 guard, which correctly refuses on ANY unaccountable staged
+  # deletion. For this specific, legitimate on-disk state that refusal was
+  # a false positive: it permanently blocked the WHOLE snapshot every
+  # night, exactly the all-or-nothing failure #628 item 9 exists to
+  # remove. Catch every deletion `add -u` actually staged (not just the
+  # ones `ls-files --deleted` already knew about before it ran), reset each
+  # back to HEAD in the scratch index, and report it like any other
+  # deletion. A path already in $deleted was excluded from `add -u` and so
+  # can never appear here too (its scratch-index entry never changed) —
+  # this list is exactly the deletions `ls-files --deleted` missed.
+  local f
+  while IFS= read -r -d '' f; do
+    [ -n "$f" ] || continue
+    if ! GIT_INDEX_FILE="$TMPIDX" git -C "$G" reset -q HEAD -- ":(literal)$f" 2>>"$ERR"; then
+      FAILURES+=("groups: could not reset an unexpected staged deletion back to HEAD in the scratch index: $(printf '%q' "$f") — refused to commit any pending change")
+      GROUPS_RESULT="failed (deletion reset)"; return
+    fi
+    deleted+=("$f")
+  done < <(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --diff-filter=D --name-only -z --no-ext-diff --no-textconv HEAD 2>>"$ERR")
+
   # diff-index, not diff: see the comment on the phase-1 patch call above —
   # this reads groups' REAL index/working tree and must not rewrite it.
   local sensitive
   sensitive=$(git -C "$G" diff-index --name-only HEAD -- "${GROUPS_SENSITIVE_PATHSPECS[@]}" 2>/dev/null)
   [ -n "$sensitive" ] && say "groups: left uncommitted on purpose (secret-shaped path): $(tr '\n' ' ' <<<"$sensitive")"
   if [ "${#deleted[@]}" -gt 0 ]; then
-    local dlist; dlist=$(printf '%s, ' "${deleted[@]}")
+    # review-683-r2 round 3, P3: %q-quote each name — a deleted path can be
+    # TAB/LF/CR-poisoned same as a held one, and an embedded LF here would
+    # otherwise truncate/corrupt this notice's DM line exactly like the
+    # already-fixed alert text (review-683-r2 P3-6).
+    local dlist; dlist=$(printf '%q, ' "${deleted[@]}")
     say "groups: deleted tracked file(s) NOT committed (kept at last known content; report only): ${dlist%, }"
     NOTICES+=("groups: ${#deleted[@]} tracked file(s) deleted on disk were reported, not committed: ${dlist%, }")
   fi
@@ -927,8 +963,14 @@ these files in place and nothing else commits them."
 }
 commit_groups() {
   local TMPIDX
-  TMPIDX=$(mktemp) && rm -f "$TMPIDX"
+  # review-683-r2 round 3, P3: register in CLEANUP_PATHS the instant mktemp
+  # returns, before the immediate `rm -f` — the same leak-on-signal reasoning
+  # as the phase-1 error temp files (review-683-r2 P3-8): a signal landing
+  # between mktemp creating the file and this rm -f removing it would
+  # otherwise leak that placeholder, since it wasn't registered yet.
+  TMPIDX=$(mktemp)
   CLEANUP_PATHS+=("$TMPIDX")
+  rm -f "$TMPIDX"
   _commit_groups_impl "$TMPIDX"
   rm -f "$TMPIDX"
 }

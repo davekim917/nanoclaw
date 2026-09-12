@@ -1544,20 +1544,41 @@ GUARD2_NEW=$(cat <<'NEWEOF'
   : # MUTATED (review-683-r2 P3-2 selfcheck): P3-1's guard disabled too, to isolate P3-2's own fix
 NEWEOF
 )
+# round 3's own catch-all reset loop (added right after `add -u`, to reset
+# and report ANY staged deletion it left behind) ALSO independently catches
+# this same fault — it doesn't refuse like P3-1's guard, it just quietly
+# resets the deletion back to HEAD and reports it, which likewise means
+# P3-2's bug never gets a chance to actually reach write-tree. Disabled
+# here too, for the same isolation reason as P3-1's guard above.
+P2_R3_OLD=$(cat <<'OLDEOF'
+  local f
+  while IFS= read -r -d '' f; do
+    [ -n "$f" ] || continue
+    if ! GIT_INDEX_FILE="$TMPIDX" git -C "$G" reset -q HEAD -- ":(literal)$f" 2>>"$ERR"; then
+      FAILURES+=("groups: could not reset an unexpected staged deletion back to HEAD in the scratch index: $(printf '%q' "$f") — refused to commit any pending change")
+      GROUPS_RESULT="failed (deletion reset)"; return
+    fi
+    deleted+=("$f")
+  done < <(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --diff-filter=D --name-only -z --no-ext-diff --no-textconv HEAD 2>>"$ERR")
+OLDEOF
+)
 MUTDIR=$(mktemp -d)
 FIXTURE_DIRS+=("$MUTDIR")
 mkdir -p "$MUTDIR/lib"
 ln -s "$(dirname "$REAL")/lib/secret-scan.sh" "$MUTDIR/lib/secret-scan.sh"
-OLDSTR1="$P3_2_OLD" NEWSTR1="$P3_2_NEW" OLDSTR2="$GUARD2_OLD" NEWSTR2="$GUARD2_NEW" \
+OLDSTR1="$P3_2_OLD" NEWSTR1="$P3_2_NEW" OLDSTR2="$GUARD2_OLD" NEWSTR2="$GUARD2_NEW" OLDSTR3="$P2_R3_OLD" \
   SRC="$REAL" DST="$MUTDIR/git-safety.sh" python3 -c "
 import os
 src = open(os.environ['SRC']).read()
 o1, n1 = os.environ['OLDSTR1'], os.environ['NEWSTR1']
 o2, n2 = os.environ['OLDSTR2'], os.environ['NEWSTR2']
+o3 = os.environ['OLDSTR3']
 assert o1 in src, 'P3-2 mutation target text not found — source has drifted from this fixture'
 assert o2 in src, 'P3-1 guard text not found — source has drifted from this fixture'
+assert o3 in src, 'round 3 P2 catch-all loop text not found — source has drifted from this fixture'
 src = src.replace(o1, n1, 1)
 src = src.replace(o2, n2, 1)
+src = src.replace(o3, '', 1)
 open(os.environ['DST'], 'w').write(src)
 "
 chmod +x "$MUTDIR/git-safety.sh"
@@ -1669,20 +1690,32 @@ esac
 
 # ─ review-683-r2 P3-1: the pre-write-tree guard refuses on an unaccountable
 # scratch index, whatever put it in that state — both failure shapes ─────
-new_fixture
-echo 'clean edit' >> "$G/foo/container.json"
-TMPIDX_GONE_OLD=$(cat <<'OLDEOF'
-  GIT_INDEX_FILE="$TMPIDX" git -C "$G" add -u -- . "${excludes[@]}" 2>>"$ERR" || {
-    FAILURES+=("groups: staging tracked changes into the scratch index failed"); GROUPS_RESULT="failed (add -u)"; return; }
+# Anchored on the GUARD's own opening text, not the `add -u` block: round
+# 3's own P2 fix (a catch-all reset for ANY staged deletion `add -u` left
+# behind, added right after `add -u`) would otherwise catch and quietly
+# resolve a fault injected there before the guard ever saw it — these
+# fixtures need the fault to land AFTER round 3's loop has already run, so
+# it reaches the guard exactly as an unaccountable anomaly should.
+GUARD_OLD=$(cat <<'OLDEOF'
+  if [ ! -f "$TMPIDX" ]; then
+    FAILURES+=("groups: the scratch index vanished before write-tree — refusing to commit from an unaccountable index")
+    GROUPS_RESULT="failed (missing scratch index)"; return
+  fi
+  if ! GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --no-ext-diff --no-textconv --diff-filter=D --quiet HEAD 2>>"$ERR"; then
+    FAILURES+=("groups: the scratch index has a staged deletion, which never happens by design — refusing to commit from an unaccountable index")
+    GROUPS_RESULT="failed (unexpected staged deletion)"; return
+  fi
 OLDEOF
 )
-TMPIDX_GONE_NEW=$(cat <<'NEWEOF'
-  GIT_INDEX_FILE="$TMPIDX" git -C "$G" add -u -- . "${excludes[@]}" 2>>"$ERR" || {
-    FAILURES+=("groups: staging tracked changes into the scratch index failed"); GROUPS_RESULT="failed (add -u)"; return; }
-  rm -f "$TMPIDX" # FAULT INJECTION (review-683-r2 P3-1 selfcheck): simulate the scratch index vanishing mid-run
-NEWEOF
-)
-MUTANT_GONE=$(make_mutant_git_safety "$TMPIDX_GONE_OLD" "$TMPIDX_GONE_NEW")
+new_fixture
+echo 'clean edit' >> "$G/foo/container.json"
+# A plain quoted literal, not $(...) — command substitution strips the
+# trailing newline, which would glue this comment line onto the very next
+# line (the guard's own `if`) and swallow it INTO the comment, breaking the
+# mutant's syntax (reproduced while building this fixture).
+TMPIDX_GONE_FAULT='  rm -f "$TMPIDX" # FAULT INJECTION (review-683-r2 P3-1 selfcheck): simulate the scratch index vanishing mid-run
+'
+MUTANT_GONE=$(make_mutant_git_safety "$GUARD_OLD" "${TMPIDX_GONE_FAULT}${GUARD_OLD}")
 run_script "$MUTANT_GONE"
 [ "$RC" -ne 0 ] && ok "P3-1: refuses when the scratch index vanished before write-tree" \
   || bad "P3-1: did not refuse on a missing scratch index" "$OUT"
@@ -1696,18 +1729,10 @@ git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1 \
 
 new_fixture
 echo 'clean edit' >> "$G/foo/container.json"
-STAGED_DEL_OLD=$(cat <<'OLDEOF'
-  GIT_INDEX_FILE="$TMPIDX" git -C "$G" add -u -- . "${excludes[@]}" 2>>"$ERR" || {
-    FAILURES+=("groups: staging tracked changes into the scratch index failed"); GROUPS_RESULT="failed (add -u)"; return; }
-OLDEOF
-)
-STAGED_DEL_NEW=$(cat <<'NEWEOF'
-  GIT_INDEX_FILE="$TMPIDX" git -C "$G" add -u -- . "${excludes[@]}" 2>>"$ERR" || {
-    FAILURES+=("groups: staging tracked changes into the scratch index failed"); GROUPS_RESULT="failed (add -u)"; return; }
-  GIT_INDEX_FILE="$TMPIDX" git -C "$G" rm --cached -q -- foo/container.json 2>>"$ERR" # FAULT INJECTION (review-683-r2 P3-1 selfcheck): simulate an unaccountable staged deletion
-NEWEOF
-)
-MUTANT_STAGED_DEL=$(make_mutant_git_safety "$STAGED_DEL_OLD" "$STAGED_DEL_NEW")
+# Same reasoning as TMPIDX_GONE_FAULT above: a plain literal, not $(...).
+STAGED_DEL_FAULT='  GIT_INDEX_FILE="$TMPIDX" git -C "$G" rm --cached -q -- foo/container.json 2>>"$ERR" # FAULT INJECTION (review-683-r2 P3-1 selfcheck): simulate an unaccountable staged deletion
+'
+MUTANT_STAGED_DEL=$(make_mutant_git_safety "$GUARD_OLD" "${STAGED_DEL_FAULT}${GUARD_OLD}")
 run_script "$MUTANT_STAGED_DEL"
 [ "$RC" -ne 0 ] && ok "P3-1: refuses when the scratch index has an unexpected staged deletion" \
   || bad "P3-1: did not refuse on an unexpected staged deletion" "$OUT"
@@ -1720,20 +1745,10 @@ git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1 \
   || ok "P3-1: nothing was pushed when the scratch index had an unexpected staged deletion"
 
 # ─ review-683-r2 P3-1 mutation evidence: same staged-deletion fault as
-# above, but with the guard ALSO removed — without it, write-tree proceeds
-# on the unaccountable index and a wrong tree (missing foo/container.json)
+# above (anchored the same way, after round 3's own catch-all loop), but
+# with the guard ALSO removed — without it, write-tree proceeds on the
+# unaccountable index and a wrong tree (missing foo/container.json)
 # actually gets pushed to host-snapshot ────────────────────────────────
-GUARD_OLD=$(cat <<'OLDEOF'
-  if [ ! -f "$TMPIDX" ]; then
-    FAILURES+=("groups: the scratch index vanished before write-tree — refusing to commit from an unaccountable index")
-    GROUPS_RESULT="failed (missing scratch index)"; return
-  fi
-  if ! GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --no-ext-diff --no-textconv --diff-filter=D --quiet HEAD 2>>"$ERR"; then
-    FAILURES+=("groups: the scratch index has a staged deletion, which never happens by design — refusing to commit from an unaccountable index")
-    GROUPS_RESULT="failed (unexpected staged deletion)"; return
-  fi
-OLDEOF
-)
 GUARD_NEW=$(cat <<'NEWEOF'
   : # MUTATED (review-683-r2 P3-1): pre-write-tree guard removed entirely
 NEWEOF
@@ -1742,15 +1757,19 @@ DST_DIR=$(mktemp -d)
 FIXTURE_DIRS+=("$DST_DIR")
 mkdir -p "$DST_DIR/lib"
 ln -s "$(dirname "$REAL")/lib/secret-scan.sh" "$DST_DIR/lib/secret-scan.sh"
-OLDSTR1="$STAGED_DEL_OLD" NEWSTR1="$STAGED_DEL_NEW" OLDSTR2="$GUARD_OLD" NEWSTR2="$GUARD_NEW" \
+OLDSTR1="$GUARD_OLD" NEWSTR1="${STAGED_DEL_FAULT}${GUARD_OLD}" OLDSTR2="$GUARD_OLD" NEWSTR2="$GUARD_NEW" \
   SRC="$REAL" DST="$DST_DIR/git-safety.sh" python3 -c "
 import os
 src = open(os.environ['SRC']).read()
 o1, n1 = os.environ['OLDSTR1'], os.environ['NEWSTR1']
 o2, n2 = os.environ['OLDSTR2'], os.environ['NEWSTR2']
 assert o1 in src, 'P3-1 fault-injection target text not found — source has drifted from this fixture'
-assert o2 in src, 'P3-1 guard text not found — source has drifted from this fixture'
+# Sequential, not independent: the fault (o1/n1) is the guard text ITSELF
+# with the fault line prepended, so injecting it first leaves exactly one
+# copy of the guard text (o2) in the result, embedded at the tail of n1 —
+# the second replace then strips the guard from THAT copy.
 src = src.replace(o1, n1, 1)
+assert o2 in src, 'P3-1 guard text not found in the fault-injected copy — fixture drifted'
 src = src.replace(o2, n2, 1)
 open(os.environ['DST'], 'w').write(src)
 "
@@ -1762,6 +1781,129 @@ run_script "$MUTANT_NOGUARD"
 git --git-dir="$REMOTE" cat-file -e host-snapshot:foo/container.json 2>&1 \
   && bad "P3-1 mutation evidence: mutant unexpectedly still kept foo/container.json's entry (fixture doesn't isolate the guard)" "" \
   || ok "P3-1 mutation evidence: without the guard, the unaccountable staged-deletion fault ships a wrong tree (foo/container.json missing from host-snapshot) — reproduces exactly what the guard closes"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# review-683-r2, round 3 on #628 item 9 (CHANGES on one P2, groups#15
+# APPROVED): a file or symlink replaced by a directory slips past
+# `ls-files --deleted` (which only catches genuinely-absent paths) and was
+# staged as a deletion by `add -u` anyway — before this fix, that unaccounted
+# deletion then hit round 2's own P3-1 guard, which correctly refuses ANY
+# unexpected staged deletion, so the WHOLE snapshot refused every night,
+# forever — exactly the all-or-nothing failure #628 item 9 exists to remove.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ─ round 3 P2a: a tracked file replaced by a directory is reset back to HEAD
+# and reported like any other deletion; an unrelated pending edit still
+# commits, and the run doesn't refuse ─────────────────────────────────────
+new_fixture
+mkdir -p "$G/bar"
+echo placeholder > "$G/bar/types.ts"
+git -C "$G" add bar/types.ts
+git -C "$G" commit -qm "add bar/types.ts" >/dev/null
+git -C "$G" push -q origin HEAD:main
+echo 'unrelated clean edit' >> "$G/bar/types.ts"
+rm -f "$G/foo/container.json"
+mkdir "$G/foo/container.json"
+echo 'oops' > "$G/foo/container.json/inner.txt"
+run_safety
+[ "$RC" -eq 0 ] || bad "round 3 P2a: a file-replaced-by-a-directory should not refuse the whole run" "$OUT"
+CONTAINER_TIP=$(git --git-dir="$REMOTE" show host-snapshot:foo/container.json 2>/dev/null)
+[ "$CONTAINER_TIP" = '{"a":1}' ] \
+  && ok "round 3 P2a: foo/container.json stays at HEAD's content in the snapshot, not deleted and not the directory" \
+  || bad "round 3 P2a: unexpected snapshot content for the file-replaced-by-a-directory path" "content=[$CONTAINER_TIP]"
+TYPES_TIP=$(git --git-dir="$REMOTE" show host-snapshot:bar/types.ts 2>/dev/null)
+case "$TYPES_TIP" in
+  *"unrelated clean edit"*) ok "round 3 P2a: the unrelated pending edit still committed" ;;
+  *) bad "round 3 P2a: the unrelated pending edit did not commit" "content=[$TYPES_TIP]" ;;
+esac
+[ -d "$G/foo/container.json" ] \
+  && ok "round 3 P2a: the working tree still has the real directory — nothing on disk was touched" \
+  || bad "round 3 P2a: the working-tree directory was removed" ""
+
+# ─ round 3 P2b: same, for a tracked symlink replaced by a real directory ──
+new_fixture
+mkdir -p "$G/foo"
+echo '{"a":1}' > "$G/foo/target.txt"
+ln -s target.txt "$G/foo/lnk"
+mkdir -p "$G/bar"
+echo placeholder > "$G/bar/types.ts"
+git -C "$G" add foo/target.txt foo/lnk bar/types.ts
+git -C "$G" commit -qm "add foo/lnk symlink and bar/types.ts" >/dev/null
+git -C "$G" push -q origin HEAD:main
+echo 'unrelated clean edit' >> "$G/bar/types.ts"
+rm -f "$G/foo/lnk"
+mkdir "$G/foo/lnk"
+echo 'oops' > "$G/foo/lnk/inner.txt"
+run_safety
+[ "$RC" -eq 0 ] || bad "round 3 P2b: a symlink-replaced-by-a-directory should not refuse the whole run" "$OUT"
+LNK_MODE=$(git --git-dir="$REMOTE" ls-tree host-snapshot foo/lnk 2>/dev/null | awk '{print $1}')
+[ "$LNK_MODE" = "120000" ] \
+  && ok "round 3 P2b: foo/lnk stays a symlink in the snapshot, not deleted and not the directory" \
+  || bad "round 3 P2b: unexpected snapshot mode for the symlink-replaced-by-a-directory path" "mode=[$LNK_MODE]"
+TYPES_TIP=$(git --git-dir="$REMOTE" show host-snapshot:bar/types.ts 2>/dev/null)
+case "$TYPES_TIP" in
+  *"unrelated clean edit"*) ok "round 3 P2b: the unrelated pending edit still committed" ;;
+  *) bad "round 3 P2b: the unrelated pending edit did not commit" "content=[$TYPES_TIP]" ;;
+esac
+
+# ─ round 3 P2 mutation evidence: without the post-add-u reset-and-report
+# step, the file-replaced-by-a-directory case reproduces the exact bug —
+# round 2's own P3-1 guard (left intact in this mutant) then refuses the
+# WHOLE run, permanently, instead of holding back just the one path ───────
+P2_R3_OLD=$(cat <<'OLDEOF'
+  local f
+  while IFS= read -r -d '' f; do
+    [ -n "$f" ] || continue
+    if ! GIT_INDEX_FILE="$TMPIDX" git -C "$G" reset -q HEAD -- ":(literal)$f" 2>>"$ERR"; then
+      FAILURES+=("groups: could not reset an unexpected staged deletion back to HEAD in the scratch index: $(printf '%q' "$f") — refused to commit any pending change")
+      GROUPS_RESULT="failed (deletion reset)"; return
+    fi
+    deleted+=("$f")
+  done < <(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --diff-filter=D --name-only -z --no-ext-diff --no-textconv HEAD 2>>"$ERR")
+OLDEOF
+)
+MUTANT=$(make_mutant_git_safety "$P2_R3_OLD" "")
+new_fixture
+mkdir -p "$G/bar"
+echo placeholder > "$G/bar/types.ts"
+git -C "$G" add bar/types.ts
+git -C "$G" commit -qm "add bar/types.ts" >/dev/null
+git -C "$G" push -q origin HEAD:main
+echo 'unrelated clean edit' >> "$G/bar/types.ts"
+rm -f "$G/foo/container.json"
+mkdir "$G/foo/container.json"
+echo 'oops' > "$G/foo/container.json/inner.txt"
+run_script "$MUTANT"
+if [ "$RC" -ne 0 ]; then
+  case "$OUT" in
+    *"unaccountable index"*) ok "round 3 P2 mutation evidence: without the reset-and-report step, a file-replaced-by-a-directory now hits round 2's P3-1 guard and refuses the WHOLE run, every time — reproduces the exact all-or-nothing bug this fix closes" ;;
+    *) bad "round 3 P2 mutation evidence: mutant refused for an unexpected reason" "$OUT" ;;
+  esac
+else
+  bad "round 3 P2 mutation evidence: mutant unexpectedly still succeeded (fixture doesn't isolate the regression)" "$OUT"
+fi
+
+# ─ round 3 P3: a TAB/LF/CR-poisoned deleted path's notice is %q-quoted, not
+# raw — an embedded LF would otherwise truncate/corrupt the DM line ───────
+new_fixture
+mkdir -p "$G/bar"
+echo placeholder > "$G/bar/types.ts"
+printf 'placeholder\n' > "$G/"$'del\nname.md'
+git -C "$G" add bar/types.ts -- $'del\nname.md'
+git -C "$G" commit -qm "add bar/types.ts and poisoned deletable placeholder" >/dev/null
+git -C "$G" push -q origin HEAD:main
+echo 'unrelated clean edit' >> "$G/bar/types.ts"
+rm -f "$G/"$'del\nname.md'
+run_safety
+[ "$RC" -eq 0 ] || bad "round 3 P3 setup: an ordinary (non-held) deletion should not refuse the run" "$OUT"
+# The deletion notice goes out via the DM (unit-alert-dm style stub, same as
+# every other NOTICES check in this file — see e.g. the deletion-only-run
+# case above) — `say()` writes to the manifest, not stdout/stderr, so $OUT
+# itself never carries it.
+case "$(cat "$DM_LOG" 2>/dev/null)" in
+  *'del\nname.md'*) ok "round 3 P3: the deletion notice %q-quotes an embedded-LF filename intact, on one line" ;;
+  *) bad "round 3 P3: no %q-quoted form of the poisoned deleted filename in the DM" "$(cat "$DM_LOG" 2>/dev/null)" ;;
+esac
 
 [ "$FAILED" -eq 0 ] && echo "git-safety-selfcheck: all checks passed" || echo "git-safety-selfcheck: FAILURES"
 exit "$FAILED"
