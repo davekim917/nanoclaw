@@ -469,19 +469,19 @@ jobs:
           gh label create shadow-review \
             --repo "$REPO" \
             --color 5319E7 \
-            --description "Findings from a post-merge advisory review of a PR that merged without review (docs/specs/risk-based-review/plan.md)" \
+            --description "Findings from a post-merge advisory review of a PR that merged without review" \
             --force \
             || echo "::warning::could not create the shadow-review label"
           gh label create shadow-review-failed \
             --repo "$REPO" \
             --color B60205 \
-            --description "This merge has no post-merge shadow review on record — analyze errored or was cancelled, or the result could not be filed — until this workflow is re-run (docs/specs/risk-based-review/plan.md)" \
+            --description "This merge has no shadow review on record: analyze errored, was cancelled, or filing failed" \
             --force \
             || echo "::warning::could not create the shadow-review-failed label"
           gh label create shadow-reviewed \
             --repo "$REPO" \
             --color 0E8A16 \
-            --description "This PR was reviewed by the post-merge shadow-review workflow, clean or with findings (docs/specs/risk-based-review/plan.md)" \
+            --description "This PR was reviewed by the post-merge shadow-review workflow, clean or with findings" \
             --force \
             || echo "::warning::could not create the shadow-reviewed label"
 

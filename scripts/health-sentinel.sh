@@ -390,7 +390,7 @@ is_nonneg_int() {
 # WATCHED_TIMERS already uses (`unit-$unit` per watched unit).
 DEPLOY_LAG_ENABLED=1
 if ! is_nonneg_int "$DEPLOY_LAG_MAX_S"; then
-  BREACHES+=("deploy-lag-config-max|DEPLOY_LAG_MAX_S='$DEPLOY_LAG_MAX_S' is not a non-negative integer — the deploy-lag vital cannot be evaluated, so this is reported as a breach instead of silently skipping the whole vital")
+  BREACHES+=("deploy-lag-config-max|DEPLOY_LAG_MAX_S='$DEPLOY_LAG_MAX_S' is not a non-negative integer of at most 18 digits — the deploy-lag vital cannot be evaluated, so this is reported as a breach instead of silently skipping the whole vital")
   DEPLOY_LAG_ENABLED=0
 elif [ "$DEPLOY_LAG_MAX_S" -eq 0 ]; then
   DEPLOY_LAG_ENABLED=0 # documented off switch — not an error, no breach
@@ -400,7 +400,7 @@ DEPLOY_LAG_PULL_MAX_S_OK=1
 JQ_OK=1
 if [ "$DEPLOY_LAG_ENABLED" = 1 ]; then
   if ! is_nonneg_int "$DEPLOY_LAG_PULL_MAX_S"; then
-    BREACHES+=("deploy-lag-config-pull|DEPLOY_LAG_PULL_MAX_S='$DEPLOY_LAG_PULL_MAX_S' is not a non-negative integer — the pull-lag half of the deploy-lag vital cannot be evaluated, so this is reported as a breach instead of silently skipping it")
+    BREACHES+=("deploy-lag-config-pull|DEPLOY_LAG_PULL_MAX_S='$DEPLOY_LAG_PULL_MAX_S' is not a non-negative integer of at most 18 digits — the pull-lag half of the deploy-lag vital cannot be evaluated, so this is reported as a breach instead of silently skipping it")
     DEPLOY_LAG_PULL_MAX_S_OK=0
   fi
   if ! command -v jq >/dev/null 2>&1; then
@@ -455,7 +455,11 @@ if [ "$DEPLOY_LAG_ENABLED" = 1 ] && [ "$JQ_OK" = 1 ] && git rev-parse -q --verif
     read -r PULL_BEHIND PULL_FIRST <<<"$(merges_behind HEAD "${RUNTIME_PATHS[@]}")"
     PULL_LAG=$((NOW - ${PULL_FIRST:-$NOW}))
     if [ "$PULL_BEHIND" -gt 0 ] && [ "$PULL_LAG" -ge "$DEPLOY_LAG_PULL_MAX_S" ]; then
-      BREACHES+=("deploy-lag|$PULL_BEHIND merge(s) to scripts or skills have waited $((PULL_LAG / 3600))h for a deploy; the checkout is at $(git rev-parse --short HEAD). None needs a restart of its own, so run scripts/deploy.sh at a quiet moment.$DRY_RUN_LAG_NOTE")
+      # Own dedup key, not `deploy-lag`: that key is restart-lag's. They used to
+      # share it, so a pull-lag alert (24h bound, cosmetic) stamped the same
+      # cooldown a restart-lag breach (3h bound, the more serious of the two)
+      # relies on, hiding it for up to 6h behind an unrelated alert.
+      BREACHES+=("deploy-lag-pull|$PULL_BEHIND merge(s) to scripts or skills have waited $((PULL_LAG / 3600))h for a deploy; the checkout is at $(git rev-parse --short HEAD). None needs a restart of its own, so run scripts/deploy.sh at a quiet moment.$DRY_RUN_LAG_NOTE")
     fi
   fi
   # A build the service never restarted onto: dist/ moved but the running
