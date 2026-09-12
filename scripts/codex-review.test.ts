@@ -2151,8 +2151,28 @@ describe('codex-review risk-scoped review requests', () => {
 // fails this test automatically, instead of depending on someone remembering
 // to add a case (#713 P1; docs/review-notes.md's "usage exit code" class, a
 // recurrence of #698's — a SHA argument not validated at the entry point).
-function headTakingSubcommands(source: string): string[] {
-  const lines = source.split('\n');
+//
+// This discovery is deliberately narrow (a bare `  <name>)` top-level arm, a
+// delegate named exactly `<fn>_main "$@"`, a function opened exactly
+// `<name>() {`, and an inline pattern of exactly `--head)`) and so can miss a
+// shape that still parses --head in bash: an aliased top-level arm
+// (`merge-check|mc)`), a same-line arm, a helper not named `_main`, a
+// `function name {` declaration, or a flag pattern aliased with a short form
+// (`-H|--head)`). The cross-check below (#713 P3) catches exactly that: it
+// scans the whole file for anything shaped like a --head case pattern,
+// independent of this discovery, and fails loudly — naming the line — the
+// moment one exists that this discovery did not attribute to a subcommand it
+// also recognized as head-taking.
+interface ArmBlock {
+  name: string;
+  // Inclusive [start, end] line-index ranges (0-based) attributed to this
+  // arm: its own case-arm lines, plus a delegated function's body when one
+  // was found.
+  ranges: [number, number][];
+}
+
+/** The dispatcher's own case arms and, where resolvable, the function bodies they delegate to — the structural attribution the discovery above relies on. */
+function discoverArmBlocks(lines: string[]): ArmBlock[] {
   const dispatchStart = lines.findIndex((l) => /^case "\$\{1:\?usage:/.test(l));
   if (dispatchStart === -1) throw new Error('codex-review.sh: could not find the command dispatcher');
   const dispatchEnd = lines.findIndex((l, i) => i > dispatchStart && l === 'esac');
@@ -2168,25 +2188,208 @@ function headTakingSubcommands(source: string): string[] {
   }
   if (arms.length === 0) throw new Error('codex-review.sh: found no top-level subcommand arms');
 
+  // Any line at the dispatcher's own two-space indentation is a new
+  // top-level arm boundary, whether armRe can name it or not — checked by
+  // hand: within the dispatcher, only arm-pattern lines and the final `*)`
+  // catch-all sit at this indentation, every arm's own body is indented
+  // deeper. Bounding a recognized arm's range at the *next* such line, named
+  // or not, keeps an arm armRe cannot name (an alias, a same-line arm) from
+  // being silently swept into its neighbor's block — which would otherwise
+  // still "attribute" its content, just to the wrong subcommand (#713 P3).
+  const ARM_BOUNDARY_RE = /^ {2}\S/;
+  function nextBoundary(afterLine: number): number {
+    for (let i = afterLine + 1; i < dispatchEnd; i++) if (ARM_BOUNDARY_RE.test(lines[i])) return i;
+    return dispatchEnd;
+  }
+
   // Every function in this file opens and closes at column 0 (checked by hand
   // against merge_check_main and ci_wait_main), so its body is the lines from
   // `<name>() {` to the next `}` line.
-  function functionBody(name: string): string {
+  function functionBodyRange(name: string): [number, number] | null {
     const start = lines.findIndex((l) => l === `${name}() {`);
-    if (start === -1) return '';
+    if (start === -1) return null;
     const end = lines.findIndex((l, i) => i > start && l === '}');
-    return end === -1 ? '' : lines.slice(start, end + 1).join('\n');
+    return end === -1 ? null : [start, end];
   }
 
+  return arms.map((arm) => {
+    const end = nextBoundary(arm.start);
+    const ranges: [number, number][] = [[arm.start, end - 1]];
+    const blockText = lines.slice(arm.start, end).join('\n');
+    const delegate = blockText.match(/(\w+_main)\s+"\$@"/);
+    if (delegate) {
+      const fnRange = functionBodyRange(delegate[1]);
+      if (fnRange) ranges.push(fnRange);
+    }
+    return { name: arm.name, ranges };
+  });
+}
+
+/** Which of `blocks`' arms are classified head-taking: their attributed text contains a bare `--head)` case pattern. */
+function headTakingNames(lines: string[], blocks: ArmBlock[]): string[] {
   const headTaking: string[] = [];
-  for (let i = 0; i < arms.length; i++) {
-    const end = i + 1 < arms.length ? arms[i + 1].start : dispatchEnd;
-    let block = lines.slice(arms[i].start, end).join('\n');
-    const delegate = block.match(/(\w+_main)\s+"\$@"/);
-    if (delegate) block += `\n${functionBody(delegate[1])}`;
-    if (/^\s*--head\)/m.test(block)) headTaking.push(arms[i].name);
+  for (const b of blocks) {
+    const text = b.ranges.map(([s, e]) => lines.slice(s, e + 1).join('\n')).join('\n');
+    if (/^\s*--head\)/m.test(text)) headTaking.push(b.name);
   }
   return headTaking;
+}
+
+function headTakingSubcommands(source: string): string[] {
+  const lines = source.split('\n');
+  return headTakingNames(lines, discoverArmBlocks(lines));
+}
+
+// A comment line never counts, whichever shape below it happens to resemble
+// — `#`, after only leading whitespace, is never code.
+const COMMENT_LINE_RE = /^\s*#/;
+
+// A case-arm pattern, anywhere in the file, that names --head as one of its
+// alternatives: `--head)`, `-H|--head)`, `--head|--sha)`, a same-line arm
+// (`--head) head="$2"; shift 2 ;;`), a quoted arm (`"--head")`, `'--head')`),
+// spaces around `|` (`-H | --head)`), or an optional leading `(`
+// (`(--head)`, bash's alternate case-pattern spelling) — independent of
+// whether the narrow discovery above found the function it lives in.
+// Anchored on the pattern starting the line (after indentation) so it never
+// matches --head appearing inside a string or a usage message.
+const HEAD_CASE_ARM_RE =
+  /^\s*\(?(?:['"]?[\w.*-]+['"]?\s*\|\s*)*['"]?--head['"]?(?:\s*\|\s*['"]?[\w.*-]+['"]?)*\)/;
+
+// A flag-equality test naming --head, anywhere on the line (unlike a case
+// arm, the test is rarely the first token — `if `/`elif ` usually is):
+// `[ "$1" = --head ]`, `[[ "$1" == --head ]]`, quoted or bare.
+const HEAD_EQUALITY_TEST_RE = /={1,2}\s*['"]?--head['"]?\s*['"]?\s*\]/;
+
+function lineNamesHeadPattern(line: string): boolean {
+  if (COMMENT_LINE_RE.test(line)) return false;
+  return HEAD_CASE_ARM_RE.test(line) || HEAD_EQUALITY_TEST_RE.test(line);
+}
+
+function findHeadCasePatternLines(lines: string[]): number[] {
+  const found: number[] = [];
+  for (let i = 0; i < lines.length; i++) if (lineNamesHeadPattern(lines[i])) found.push(i);
+  return found;
+}
+
+/**
+ * 0-based line indices of every --head-shaped case pattern in `source` that
+ * the parser cannot attribute to a subcommand it also classifies head-taking
+ * — either no discovered arm's block contains the line at all (an alias arm,
+ * a same-line arm, or a delegate/function discovery could not resolve), or
+ * one does, but that arm's own bare-`--head)` detection missed this
+ * pattern's shape (`-H|--head)`, say). Empty on the real script (#713 P3).
+ */
+function unattributedHeadPatternLines(source: string): number[] {
+  const lines = source.split('\n');
+  const blocks = discoverArmBlocks(lines);
+  const headTaking = new Set(headTakingNames(lines, blocks));
+  const ownerOf = new Map<number, string>();
+  for (const b of blocks) for (const [s, e] of b.ranges) for (let i = s; i <= e; i++) ownerOf.set(i, b.name);
+
+  return findHeadCasePatternLines(lines).filter((lineIdx) => {
+    const owner = ownerOf.get(lineIdx);
+    return owner === undefined || !headTaking.has(owner);
+  });
+}
+
+/**
+ * The dispatcher's own subcommand list, read from its usage string (the same
+ * `${1:?usage:...}` text bash prints on a bad first argument) rather than
+ * from `discoverArmBlocks`' `armRe` — an aliased or same-line arm can hide a
+ * name from that structural discovery entirely (the mutations above prove as
+ * much), but can't change what the usage string tells a caller the valid
+ * subcommands are without also breaking that error message (#730 P3 round 3).
+ */
+function usageSubcommandNames(source: string): string[] {
+  const m = /case "\$\{1:\?usage:([^}]+)\}" in/.exec(source);
+  if (!m) throw new Error('codex-review.sh: could not find the dispatcher usage string');
+  return m[1].split('|').map((name) => name.trim());
+}
+
+/**
+ * True when `line` reads as parsing `--head` as ITS OWN flag — any
+ * `--head`-shaped case-arm pattern (HEAD_CASE_ARM_RE, already broad across
+ * quoting, aliasing, spacing and a leading paren), or any other mention of
+ * `--head` that also tests the raw positional parameter `$1` on the same
+ * line, whatever equality/regex operator or keyword does the testing
+ * (`=`, `==`, `=~`, the `test` builtin, reversed operands — the three shapes
+ * that escape HEAD_EQUALITY_TEST_RE all name `$1` right there with it).
+ * Excludes a mention that only FORWARDS `--head` as a literal flag to
+ * another call with an already-computed value — `run_gate --committed-only
+ * --head "$PUSH_HEAD"` in `push`, `--head "$SCOPE_HEAD"` in `request` — never
+ * `$1` there at all, because that call site is not reading argv itself.
+ */
+function lineParsesHeadFlag(line: string): boolean {
+  if (COMMENT_LINE_RE.test(line)) return false;
+  if (HEAD_CASE_ARM_RE.test(line)) return true;
+  return /--head\b/.test(line) && /\$1\b/.test(line);
+}
+
+/**
+ * The bare identifier an arm's own text forwards its arguments to via a
+ * standalone `<name> "$@"` statement (the same shape `merge_check_main
+ * "$@"` and `ci_wait_main "$@"` already use) — by ANY name, not only one
+ * ending in `_main`. discoverArmBlocks' own delegate regex is deliberately
+ * narrower: the round-2 cross-check above depends on it staying that way
+ * (its "catches a helper delegate not named _main" mutation pins exactly
+ * this narrowness), so round 4 gives THIS test its own, separate, broader
+ * attribution instead of loosening that shared one. Anchored to a whole
+ * line (only whitespace before the name and after the closing quote) so it
+ * can't mistake a real line elsewhere in this script — `for arg in "$@"; do`,
+ * `git push "$@"` — for a delegate call (#730 P3 round 4 gap 2).
+ */
+function delegateCalledByArm(armOwnText: string): string | null {
+  const m = /^[ \t]*([a-zA-Z_]\w*)[ \t]+"\$@"[ \t]*$/m.exec(armOwnText);
+  return m ? m[1] : null;
+}
+
+/** `name`'s function body range in `lines` — the same shape as discoverArmBlocks' own (private) functionBodyRange, duplicated here so round 4's broader delegate names don't need that function exported or its `_main`-only caller changed. */
+function functionBodyRangeByName(lines: string[], name: string): [number, number] | null {
+  const start = lines.findIndex((l) => l === `${name}() {`);
+  if (start === -1) return null;
+  const end = lines.findIndex((l, i) => i > start && l === '}');
+  return end === -1 ? null : [start, end];
+}
+
+/**
+ * Names of every subcommand — from the UNION of the usage string
+ * (usageSubcommandNames) and discoverArmBlocks' own arm discovery, so an arm
+ * present in the dispatcher but missing from an out-of-date usage string is
+ * still tested (#730 P3 round 4 gap 1: bash's `case "$1" in` dispatches to
+ * an arm exactly the same either way — the usage string is only ever the
+ * error message `${1:?usage:...}` prints for a MISSING `$1`, never consulted
+ * by case matching itself) — whose own code contains a line that parses
+ * `--head` as its own flag (lineParsesHeadFlag): checked against the arm's
+ * own span first and, when that alone shows nothing, against the body of
+ * ANY function it forwards to by a bare `<name> "$@"` statement
+ * (delegateCalledByArm) — not only a `_main`-suffixed one (round 4 gap 2).
+ * A content check, not a shape match: deliberately broader than
+ * headTakingNames' bare-`--head)`-only pattern, which is exactly what left
+ * three parsing shapes unattributed in round 3, and needs no updating for a
+ * new equality/case spelling because it never looks at the spelling.
+ */
+function mentionsHeadAnywhere(source: string, lines: string[]): Set<string> {
+  const blocks = discoverArmBlocks(lines);
+  const blockByName = new Map(blocks.map((b) => [b.name, b] as const));
+  const allNames = new Set([...usageSubcommandNames(source), ...blocks.map((b) => b.name)]);
+  const names = new Set<string>();
+  for (const name of allNames) {
+    const block = blockByName.get(name);
+    if (!block) continue; // named in the usage string, but no arm text discoverArmBlocks could attribute — nothing to scan
+    const [s, e] = block.ranges[0]; // the arm's own span — never discoverArmBlocks' own narrower _main-only delegate range
+    let hit = false;
+    for (let i = s; i <= e && !hit; i++) if (lineParsesHeadFlag(lines[i])) hit = true;
+    if (!hit) {
+      const delegateName = delegateCalledByArm(lines.slice(s, e + 1).join('\n'));
+      const fnRange = delegateName ? functionBodyRangeByName(lines, delegateName) : null;
+      if (fnRange) {
+        const [fs, fe] = fnRange;
+        for (let i = fs; i <= fe && !hit; i++) if (lineParsesHeadFlag(lines[i])) hit = true;
+      }
+    }
+    if (hit) names.add(name);
+  }
+  return names;
 }
 
 describe('every subcommand that parses --head validates it as a hex sha before reading anything (#713 P1)', () => {
@@ -2210,6 +2413,407 @@ describe('every subcommand that parses --head validates it as a hex sha before r
     expect(result.status).toBe(2);
     expect(result.calls).toBe('');
   });
+});
+
+// #713 P3: a cross-check independent of headTakingSubcommands' own discovery
+// heuristics — it finds every --head-shaped case pattern in the file by a
+// separate, broader scan, and fails, naming the line, the moment one is not
+// attributed to a subcommand the discovery above also classifies head-taking.
+describe('cross-check: every --head-shaped case pattern is attributed to a discovered, head-taking subcommand (#713 P3)', () => {
+  const source = fs.readFileSync(HELPER, 'utf8');
+  const patternLines = findHeadCasePatternLines(source.split('\n'));
+  const unattributed = new Set(unattributedHeadPatternLines(source));
+
+  // A broad scan that silently matched nothing would make every case below
+  // vacuous, the same failure mode the P1 test above guards against.
+  it('found at least one --head case pattern (sanity: the scan is not vacuous)', () => {
+    expect(patternLines.length).toBeGreaterThan(0);
+  });
+
+  it.each(patternLines)('the --head case pattern on line %i is attributed to a discovered, head-taking subcommand', (lineIdx) => {
+    expect(unattributed.has(lineIdx)).toBe(false);
+  });
+});
+
+// #713 P3: proof that the cross-check actually catches the five shapes that
+// motivated it, each applied to an in-memory copy of the real script so a
+// regression in the cross-check itself (not just in headTakingSubcommands)
+// would show up here.
+describe('the cross-check catches each shape that could let a --head parser escape (#713 P3)', () => {
+  const realSource = fs.readFileSync(HELPER, 'utf8');
+
+  it('finds nothing unattributed in the real, unmodified script', () => {
+    expect(unattributedHeadPatternLines(realSource)).toEqual([]);
+  });
+
+  it('catches an aliased top-level arm ("merge-check|mc)") that hides its delegate entirely', () => {
+    const mutated = realSource.replace(
+      '  merge-check)\n    shift\n    merge_check_main "$@"\n    ;;',
+      '  merge-check|mc)\n    shift\n    merge_check_main "$@"\n    ;;',
+    );
+    expect(mutated).not.toBe(realSource); // the replacement must actually have matched something
+    expect(unattributedHeadPatternLines(mutated).length).toBeGreaterThan(0);
+  });
+
+  it('catches a same-line top-level arm that hides its delegate entirely', () => {
+    const mutated = realSource.replace(
+      '  merge-check)\n    shift\n    merge_check_main "$@"\n    ;;',
+      '  merge-check) shift; merge_check_main "$@" ;;',
+    );
+    expect(mutated).not.toBe(realSource);
+    expect(unattributedHeadPatternLines(mutated).length).toBeGreaterThan(0);
+  });
+
+  it('catches a helper delegate not named "_main"', () => {
+    const mutated = realSource.replace(
+      '  merge-check)\n    shift\n    merge_check_main "$@"\n    ;;',
+      '  merge-check)\n    shift\n    merge_check_dispatch "$@"\n    ;;',
+    );
+    expect(mutated).not.toBe(realSource);
+    expect(unattributedHeadPatternLines(mutated).length).toBeGreaterThan(0);
+  });
+
+  it('catches a "function name {" declaration in place of "name() {"', () => {
+    const mutated = realSource.replace('merge_check_main() {', 'function merge_check_main {');
+    expect(mutated).not.toBe(realSource);
+    expect(unattributedHeadPatternLines(mutated).length).toBeGreaterThan(0);
+  });
+
+  it('catches a "-H|--head)" flag alias the narrow bare-"--head)" detection misses', () => {
+    const mutated = realSource.replace(
+      '      --head)\n        [ $# -ge 2 ] && [[ "$2" =~ ^[0-9a-f]{7,40}$ ]] || { echo "merge-check: --head needs a hex sha (7-40)" >&2; exit 2; }',
+      '      -H|--head)\n        [ $# -ge 2 ] && [[ "$2" =~ ^[0-9a-f]{7,40}$ ]] || { echo "merge-check: --head needs a hex sha (7-40)" >&2; exit 2; }',
+    );
+    expect(mutated).not.toBe(realSource);
+    expect(unattributedHeadPatternLines(mutated).length).toBeGreaterThan(0);
+  });
+
+  // #730 P3: these five prove the *broad scan* itself (findHeadCasePatternLines)
+  // sees a shape, not just that a seen shape gets attributed correctly — each
+  // appends a brand-new, never-dispatched-to helper containing the shape, so
+  // it is unattributed by construction *if the scan finds it at all*. A scan
+  // blind to the shape would report the same (empty) result as the pristine
+  // script, silently passing; these fail on that regression.
+  it('catches a double-quoted arm ("--head") a bare-string match misses', () => {
+    const mutated = `${realSource}\nunrelated_helper() {\n  case "$1" in\n    "--head") shift 2 ;;\n  esac\n}\n`;
+    expect(unattributedHeadPatternLines(mutated).length).toBeGreaterThan(0);
+  });
+
+  it("catches a single-quoted arm ('--head') a bare-string match misses", () => {
+    const mutated = `${realSource}\nunrelated_helper() {\n  case "$1" in\n    '--head') shift 2 ;;\n  esac\n}\n`;
+    expect(unattributedHeadPatternLines(mutated).length).toBeGreaterThan(0);
+  });
+
+  it('catches a space-joined flag alias ("-H | --head)") a no-space match misses', () => {
+    const mutated = `${realSource}\nunrelated_helper() {\n  case "$1" in\n    -H | --head) shift 2 ;;\n  esac\n}\n`;
+    expect(unattributedHeadPatternLines(mutated).length).toBeGreaterThan(0);
+  });
+
+  it('catches a paren-prefixed arm ("(--head)") the unparenthesized pattern misses', () => {
+    const mutated = `${realSource}\nunrelated_helper() {\n  case "$1" in\n    (--head) shift 2 ;;\n  esac\n}\n`;
+    expect(unattributedHeadPatternLines(mutated).length).toBeGreaterThan(0);
+  });
+
+  it('catches a flag-equality test ([ "$1" = --head ]) a case-arm-only match misses', () => {
+    const mutated = `${realSource}\nunrelated_helper() {\n  if [ "$1" = --head ]; then shift 2; fi\n}\n`;
+    expect(unattributedHeadPatternLines(mutated).length).toBeGreaterThan(0);
+  });
+
+  it('catches a double-bracket flag-equality test ([[ "$1" == --head ]])', () => {
+    const mutated = `${realSource}\nunrelated_helper() {\n  if [[ "$1" == --head ]]; then shift 2; fi\n}\n`;
+    expect(unattributedHeadPatternLines(mutated).length).toBeGreaterThan(0);
+  });
+
+  // Comment lines never count, whichever shape they resemble — otherwise a
+  // mention of --head in prose would itself be an (unattributed) false
+  // positive on every doc comment naming it.
+  it('does not flag --head mentioned only in a comment', () => {
+    const mutated = `${realSource}\n# case "$1" in\n#   "--head") shift 2 ;;\n# esac\n`;
+    expect(unattributedHeadPatternLines(mutated)).toEqual([]);
+  });
+});
+
+// #730 P3 round 3: HEAD_EQUALITY_TEST_RE (and the cross-check above, which
+// still leans on it for its own detection of a test-style pattern) matches
+// only whichever --head-parsing *shapes* it was written and then widened
+// for; three more escape it today — reversed equality operands
+// (`[ --head = "$1" ]`), the `test` builtin (`test "$1" = --head`, which
+// never has a literal `]` for the regex to anchor on at all), and a
+// `[[ ... =~ ... ]]` regex match (`[[ $1 =~ ^--head$ ]]`, whose `=~` is not
+// `={1,2}` and whose `$` before the closing `]]` breaks the tail match).
+// Each new escaping shape found so far has been fixed by widening the
+// pattern once more, which only means the NEXT shape escapes it too.
+//
+// This closes the whole class behaviourally instead of describing another
+// shape: it reads the dispatcher's own usage string for the authoritative
+// subcommand list (usageSubcommandNames — robust to an aliased or same-line
+// arm hiding a name from armRe entirely, unlike relying on discoverArmBlocks'
+// `arms` for enumeration), keeps only the names whose own attributed code
+// mentions `--head` at all regardless of syntax (mentionsHeadAnywhere — a
+// content check, not a shape match), and actually runs each with an empty
+// value: whatever syntax a subcommand uses to test for `--head`, the one
+// thing every correct implementation must do is exit 2 before touching gh.
+// A subcommand that parses --head without validating it is caught this way,
+// whatever the shape; one that never touches --head at all (open, churn,
+// push, …) is never asked to satisfy an invariant it never claimed.
+describe('every subcommand whose own code mentions --head, in any shape, rejects an empty value before touching gh (#730 P3 round 3)', () => {
+  const source = fs.readFileSync(HELPER, 'utf8');
+  const lines = source.split('\n');
+  const usageNames = usageSubcommandNames(source);
+  const headMentioning = [...mentionsHeadAnywhere(source, lines)];
+
+  // A regression that emptied the usage string would still leave
+  // mentionsHeadAnywhere's arm-derived side of the union finding these four
+  // (discoverArmBlocks doesn't read the usage string at all) — so this is
+  // its own guard, independent of that union, against exactly the failure
+  // mode "renamed it must still exit 1" (usageSubcommandNames throws when it
+  // can't find the pattern at all) does not cover: the pattern still
+  // matches, but its captured list is empty or wrong.
+  it('the usage string names at least the subcommands this file is known to cover', () => {
+    expect(usageNames).toEqual(expect.arrayContaining(['ci-wait', 'merge-check', 'merge', 'receipt']));
+  });
+
+  // A regression that silently found zero subcommands (a broken usage-string
+  // parse, or a discoverArmBlocks change that stopped finding arms at all)
+  // would make every case below vacuous — the same failure mode the P1 test
+  // and the cross-check above both guard against explicitly.
+  it('found the subcommands this file is known to mention --head in', () => {
+    expect(headMentioning).toEqual(expect.arrayContaining(['ci-wait', 'merge-check', 'merge', 'receipt']));
+  });
+
+  it.each(headMentioning)('%s --head "" exits 2 and makes no gh call, whatever shape it parses --head in', (cmd) => {
+    const root = tempRoot();
+    const result = runHelper(root, [cmd, '--head', '']);
+    expect(result.status).toBe(2);
+    expect(result.calls).toBe('');
+  });
+
+  // Proof this closes the class rather than describing a fourth shape: each
+  // case below adds a brand-new subcommand (so no existing arm's own
+  // validation can mask the result) whose --head check is one of the three
+  // escaping shapes above and does nothing else on an empty value — no
+  // length check, no hex check. HEAD_EQUALITY_TEST_RE misses every one of
+  // these (that is what makes them the escaping shapes, asserted below); the
+  // content-based discovery above still finds `--head` in the new arm's own
+  // text, the probe above still runs it, and the missing validation is what
+  // fails that probe — a real `gh` call reaches the mocked network with an
+  // empty head, unvalidated, exactly as #730 P3 warned it could.
+  const ESCAPING_SHAPES: Record<string, string> = {
+    'reversed equality operands ([ --head = "$1" ])': `
+  probe-reversed)
+    shift
+    head=""
+    while [ $# -gt 0 ]; do
+      if [ --head = "$1" ]; then head="$2"; shift 2; else shift; fi
+    done
+    gh api "repos/$REPO/pulls/$PR" >/dev/null 2>&1 || true
+    ;;`,
+    'the test builtin (test "$1" = --head)': `
+  probe-test-builtin)
+    shift
+    head=""
+    while [ $# -gt 0 ]; do
+      if test "$1" = --head; then head="$2"; shift 2; else shift; fi
+    done
+    gh api "repos/$REPO/pulls/$PR" >/dev/null 2>&1 || true
+    ;;`,
+    'a [[ =~ ]] regex match ([[ $1 =~ ^--head$ ]])': `
+  probe-regex-match)
+    shift
+    head=""
+    while [ $# -gt 0 ]; do
+      if [[ "$1" =~ ^--head$ ]]; then head="$2"; shift 2; else shift; fi
+    done
+    gh api "repos/$REPO/pulls/$PR" >/dev/null 2>&1 || true
+    ;;`,
+  };
+
+  for (const [shapeName, armText] of Object.entries(ESCAPING_SHAPES)) {
+    it(`fails for an unvalidated --head parsed via ${shapeName}`, () => {
+      const cmd = /^\n {2}([a-z-]+)\)/.exec(armText)?.[1];
+      if (!cmd) throw new Error(`test fixture bug: could not read the probe subcommand name from:\n${armText}`);
+
+      // Sanity: HEAD_EQUALITY_TEST_RE really does miss this shape — otherwise
+      // this proves nothing about closing a class the OLD check already covered.
+      expect(HEAD_EQUALITY_TEST_RE.test(armText)).toBe(false);
+
+      const mutatedUsage = source.replace(
+        /(case "\$\{1:\?usage:[^}]+)(\}" in)/,
+        (_all: string, head: string, tail: string) => `${head}|${cmd}${tail}`,
+      );
+      expect(mutatedUsage).not.toBe(source);
+      const mutated = mutatedUsage.replace('  open)', `${armText}\n  open)`);
+      expect(mutated).not.toBe(mutatedUsage);
+
+      // Sanity: the new subcommand is discoverable and classified head-mentioning,
+      // so it actually reaches the probe below the way a real regression would.
+      const mutatedLines = mutated.split('\n');
+      const mutatedUsageNames = usageSubcommandNames(mutated);
+      const mutatedHeadMentioning = mentionsHeadAnywhere(mutated, mutatedLines);
+      expect(mutatedUsageNames).toContain(cmd);
+      expect(mutatedHeadMentioning.has(cmd)).toBe(true);
+
+      const root = tempRoot();
+      const scriptPath = path.join(root, 'codex-review.sh');
+      fs.writeFileSync(scriptPath, mutated);
+      const result = runHelper(root, [cmd, '--head', ''], {}, scriptPath);
+
+      // The real invariant the it.each above enforces would fail here: an
+      // unvalidated empty --head reached a real gh call instead of exiting 2
+      // first.
+      expect(result.calls).not.toBe('');
+    });
+  }
+
+  // #730 P3 round 4 (the last placement gap the approval flagged): two more
+  // ways an unvalidated --head parser hid from the probe above — neither a
+  // new parsing SHAPE this time, a placement gap instead.
+  //   1. mentionsHeadAnywhere used to intersect discoverArmBlocks' own arm
+  //      names with the usage string's, so an arm added to the dispatcher
+  //      without also updating the usage string's subcommand list vanished
+  //      from the probe entirely — even though bash's `case "$1" in`
+  //      dispatches to it exactly the same either way; the usage string is
+  //      only ever the error message `${1:?usage:...}` prints for a MISSING
+  //      $1, never consulted by case matching itself.
+  //   2. discoverArmBlocks' own delegate detection requires a `_main`-
+  //      suffixed function name by design (the round-2 cross-check above
+  //      depends on that narrowness — its own "catches a helper delegate not
+  //      named _main" mutation pins it), so a --head parser living inside a
+  //      helper named anything else was invisible to it.
+  // Fixed by probing the UNION of the usage string's names and
+  // discoverArmBlocks' own arm names, and by giving mentionsHeadAnywhere its
+  // own, separate delegate attribution (delegateCalledByArm /
+  // functionBodyRangeByName) that accepts any bare `<name> "$@"` forwarding
+  // statement, not only a `_main`-suffixed one — without touching
+  // discoverArmBlocks itself, so the round-2 cross-check's own narrower
+  // behavior stays exactly as its mutation test pins it. Each variant below
+  // isolates one gap (or both at once, with --head parsed on a single line —
+  // mid-line, past where the narrow case-arm-only pattern anchors, the shape
+  // this whole class has been about since round 2): before this fix, all
+  // four vanish from the probe entirely and the fake subcommand exits 0
+  // after a real, unvalidated gh read.
+  const PLACEMENT_GAPS: {
+    label: string;
+    cmd: string;
+    addToUsage: boolean;
+    armText: string;
+    helperText?: string;
+  }[] = [
+    {
+      label: 'an arm present in the dispatcher but missing from the usage string',
+      cmd: 'probe-missing-usage',
+      addToUsage: false,
+      armText: `
+  probe-missing-usage)
+    shift
+    head=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --head) head="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    gh api "repos/$REPO/pulls/$PR" >/dev/null 2>&1 || true
+    ;;`,
+    },
+    {
+      label: 'a delegate helper called by a name not ending in _main',
+      cmd: 'probe-nonmain-delegate',
+      addToUsage: true,
+      armText: `
+  probe-nonmain-delegate)
+    shift
+    probe_nonmain_helper "$@"
+    ;;`,
+      helperText: `
+probe_nonmain_helper() {
+  head=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --head) head="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  gh api "repos/$REPO/pulls/$PR" >/dev/null 2>&1 || true
+}`,
+    },
+    {
+      label: 'missing from the usage string, with --head parsed on a single-line case',
+      cmd: 'probe-missing-usage-oneline',
+      addToUsage: false,
+      armText: `
+  probe-missing-usage-oneline)
+    shift
+    head=""
+    while [ $# -gt 0 ]; do case "$1" in --head) head="$2"; shift 2 ;; *) shift ;; esac; done
+    gh api "repos/$REPO/pulls/$PR" >/dev/null 2>&1 || true
+    ;;`,
+    },
+    {
+      label: 'a non-_main delegate whose --head parsing is a single-line case',
+      cmd: 'probe-nonmain-delegate-oneline',
+      addToUsage: true,
+      armText: `
+  probe-nonmain-delegate-oneline)
+    shift
+    probe_nonmain_helper_oneline "$@"
+    ;;`,
+      helperText: `
+probe_nonmain_helper_oneline() {
+  head=""
+  while [ $# -gt 0 ]; do case "$1" in --head) head="$2"; shift 2 ;; *) shift ;; esac; done
+  gh api "repos/$REPO/pulls/$PR" >/dev/null 2>&1 || true
+}`,
+    },
+  ];
+
+  for (const gap of PLACEMENT_GAPS) {
+    it(`catches ${gap.label}`, () => {
+      let mutated = source.replace('  open)', `${gap.armText}\n  open)`);
+      expect(mutated).not.toBe(source);
+
+      if (gap.helperText) {
+        // Defined immediately BEFORE the dispatcher, not appended at file
+        // end: bash executes top-to-bottom, so a function definition placed
+        // after the case statement that calls it would not exist yet at
+        // call time — a real run would hit "command not found" (and exit,
+        // under `set -e`, before ever reaching the gh call this test proves
+        // happens instead).
+        const withHelper = mutated.replace(
+          'case "${1:?usage:',
+          `${gap.helperText}\ncase "\${1:?usage:`,
+        );
+        expect(withHelper).not.toBe(mutated);
+        mutated = withHelper;
+      }
+
+      if (gap.addToUsage) {
+        const withUsage = mutated.replace(
+          /(case "\$\{1:\?usage:[^}]+)(\}" in)/,
+          (_all: string, head: string, tail: string) => `${head}|${gap.cmd}${tail}`,
+        );
+        expect(withUsage).not.toBe(mutated);
+        mutated = withUsage;
+      }
+
+      // Sanity: this variant really does isolate the gap it claims to —
+      // present in (or absent from) the usage string exactly as intended,
+      // nothing more.
+      const mutatedLines = mutated.split('\n');
+      expect(usageSubcommandNames(mutated).includes(gap.cmd)).toBe(gap.addToUsage);
+      expect(mentionsHeadAnywhere(mutated, mutatedLines).has(gap.cmd)).toBe(true);
+
+      const root = tempRoot();
+      const scriptPath = path.join(root, 'codex-review.sh');
+      fs.writeFileSync(scriptPath, mutated);
+      const result = runHelper(root, [gap.cmd, '--head', ''], {}, scriptPath);
+
+      // The real invariant the it.each above enforces would fail here too:
+      // an unvalidated empty --head reached a real gh call instead of
+      // exiting 2 first.
+      expect(result.calls).not.toBe('');
+    });
+  }
 });
 
 // After `gh pr merge` succeeds, the PR reads as merged into MERGE_OID.

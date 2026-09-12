@@ -46,7 +46,19 @@ jobs:
   correctness:
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 (full history), not actions/checkout@v4's default depth-1
+      # shallow clone. scripts/review-notes.test.ts's citation checker resolves
+      # every pinned `at <sha>` and skips one that doesn't resolve ONLY when
+      # `git rev-parse --is-shallow-repository` says the checkout is shallow
+      # (#730 P3) — with the default shallow checkout, a typo'd sha or a
+      # missing file behind a bogus pin silently passed here even though the
+      # sha is a real, resolvable commit in this repo's actual history. Full
+      # history costs ~46MB and a few seconds on this repo's size as of
+      # 2026-09; revisit the number if this job's checkout time becomes
+      # noticeable as history grows.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
