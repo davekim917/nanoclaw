@@ -128,13 +128,14 @@ is ever attempted for the same run.
 `smoke-run-scaffold.sh` and `smoke-evidence-barrier.sh` are always invoked
 directly (never through a wrapper) and read those same two env vars from
 whatever process calls them — they do not inherit anything the wrapper
-exported in its own, separate process. A PR campaign solves this by writing
-one `<run>-gate-env.sh` with the wrapper's exact values and sourcing it
-before every direct scaffold/barrier call; give a task-scoped run the same
-file, with the same `SMOKE_GATE_STATE_DIR`/`SMOKE_GATE_LEASE_DIR` values the
-`task-claim` wrapper call above used, before its own contract/marker/barrier
-calls. Skipping this does not fail loudly — it fails exactly like the bare-
-script case above, into a state dir the claim itself never wrote to.
+exported in its own, separate process. An install solves this with its own
+versioned env file (exporting everything its wrapper exports) that the
+wrapper itself sources and that a coordinator also sources before every
+direct scaffold/barrier call — one file both paths read, never a fresh
+per-run copy of the same values. Source that same install env file before a
+task-scoped run's own contract/marker/barrier calls too. Skipping this does
+not fail loudly — it fails exactly like the bare-script case above, into a
+state dir the claim itself never wrote to.
 
 Before dispatch, the coordinator writes the contract with the frozen SHA and
 every lane it is committing to:

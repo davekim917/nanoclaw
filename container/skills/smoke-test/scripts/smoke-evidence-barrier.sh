@@ -36,24 +36,37 @@ if ! jq -e '
   exit 1
 fi
 
-# A pr- or task-owned contract with no coordinatorOwnerToken is the exact
-# shape a hand-composed contract took on the certify-1657 run: smoke-run-
-# scaffold.sh's `contract` verb can ONLY produce a null token for a
-# `develop`-fenced run. begin_active_run_fence sets FENCED_OWNER="" only on
-# the develop branch (smoke-run-scaffold.sh:186); the pr branch
-# (smoke-run-scaffold.sh:236) and the task branch (smoke-run-scaffold.sh:201)
-# both always set it to $DEFAULT_OWNER before the contract is written, and
-# DEFAULT_OWNER (smoke-run-scaffold.sh:125,
+# Every contract the scaffold writes carries `ownershipKind` — `contract`
+# sets it from $FENCED_STATE_KIND unconditionally (smoke-run-scaffold.sh:414),
+# and $FENCED_STATE_KIND is always "pr", "develop", or "task"
+# (smoke-run-scaffold.sh:159/165/175's state_kind assignments, copied to
+# FENCED_STATE_KIND at :182 only after the `count -eq 1` guard at :177
+# guarantees exactly one of those three branches ran) — begin_active_run_fence
+# dies before reaching that line for anything else. A contract with no
+# `ownershipKind` at all therefore did not come from the scaffold; it is the
+# exact hand-composed shape a freehand contract took on the certify-1657 run.
+if ! jq -e '(.ownershipKind | type == "string")' "$CONTRACT" >/dev/null 2>&1; then
+  jq -cn --arg path "$CONTRACT" \
+    '{ready:false,missing:[],invalid:[$path],
+      invalidReasons:["completion contract has no ownershipKind — this was not written by the scaffold; claim the run first (smoke-pr-gate.sh claim for a PR, task-claim for a task-scoped run) and let smoke-run-scaffold.sh write the contract"]}'
+  exit 1
+fi
+
+# A pr- or task-owned contract with no coordinatorOwnerToken is the OTHER
+# half of the same hand-composed shape: smoke-run-scaffold.sh's `contract`
+# verb can ONLY produce a null token for a `develop`-fenced run.
+# begin_active_run_fence sets FENCED_OWNER="" only on the develop branch
+# (smoke-run-scaffold.sh:186); the pr branch (smoke-run-scaffold.sh:236) and
+# the task branch (smoke-run-scaffold.sh:201) both always set it to
+# $DEFAULT_OWNER before the contract is written, and DEFAULT_OWNER
+# (smoke-run-scaffold.sh:125,
 # `${SMOKE_GATE_OWNER:-${HOSTNAME:-unknown-host}}`) can never resolve to an
 # empty string — bash's `:-` falls through on empty too, so an unset or
-# empty HOSTNAME still lands on the literal "unknown-host". So a null/absent
-# token on a contract that itself claims `ownershipKind: "pr"` or `"task"`
-# did not come from a live claim. `ownershipKind` absent (every contract
-# written before this field existed, including every live `develop` contract
-# already mid-campaign) is left alone: this only fires when the contract
-# POSITIVELY claims an ownership kind that requires a token.
+# empty HOSTNAME still lands on the literal "unknown-host". So a null token
+# on a contract that itself claims `ownershipKind: "pr"` or `"task"` did not
+# come from a live claim.
 if ! jq -e '
-  ((.ownershipKind // "") as $k | ($k != "pr" and $k != "task")) or
+  (.ownershipKind != "pr" and .ownershipKind != "task") or
   ((.coordinatorOwnerToken // null) != null)
 ' "$CONTRACT" >/dev/null 2>&1; then
   OWNERSHIP_KIND="$(jq -r '.ownershipKind // "?"' "$CONTRACT" 2>/dev/null || printf '?')"

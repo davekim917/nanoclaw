@@ -563,34 +563,40 @@ jq -e --arg sha "$SHA" --arg run "$TASK_FIN_ID" '.sha == $sha and .runId == $run
 jq -e '.activeRunId == null and .completedRunId == "'"$TASK_FIN_ID"'" and .completedVerdict == "GO"' \
   "$GATE_STATE/task-$TASK_FIN_ID-state.json" >/dev/null
 
-# --- The install wrapper's env pattern, not this test file's ambient export -
+# --- The install's ONE env file, not this test file's ambient export -------
 # Item 2 of the ownership review: SKILL.md's task-claim example used to call
 # the raw skill script directly (`/app/skills/smoke-test/scripts/
 # smoke-pr-gate.sh`), unlike the documented PR `claim` example, which goes
-# through an install's deployed wrapper — a thin per-install script that
-# `export`s SMOKE_GATE_STATE_DIR/SMOKE_GATE_LEASE_DIR to that install's real
-# paths and then `exec`s this skill script. Bypassing the wrapper meant
+# through an install's deployed wrapper. Bypassing the wrapper meant
 # task-claim wrote into the gate's hardcoded defaults (smoke-pr-gate.sh's own
 # STATE_DIR/LEASE_DIR fallbacks) — a directory no scaffold/barrier call, and
 # no later task-progress/task-finish invocation, would ever share.
 #
-# A coordinator's PR campaign already solves this by writing one small
-# per-run env file with the same values the wrapper exports, then sourcing
-# it before every direct scaffold/barrier call. A task-scoped run needs the
-# identical convention. This proves the fixed wiring works with NO ambient
-# SMOKE_GATE_STATE_DIR/SMOKE_GATE_LEASE_DIR export from the rest of this test
-# file — only what a real wrapper invocation and a real sourced env file
-# would supply.
+# The fix is ONE versioned env file the install owns: the wrapper sources it
+# (never repeats its exports) before `exec`ing the gate, and a coordinator's
+# direct scaffold/barrier calls source that SAME file — not a fresh per-run
+# copy of the same values, which is how they used to drift. This proves that
+# with NO ambient SMOKE_GATE_STATE_DIR/SMOKE_GATE_LEASE_DIR export from the
+# rest of this test file: only what the real wrapper (which sources the env
+# file) and a coordinator (who also sources it directly) would see.
 (
   unset SMOKE_GATE_STATE_DIR SMOKE_GATE_LEASE_DIR
   WRAPPER_STATE_DIR="$FIXTURE_BASE/wrapper-state"
   WRAPPER_LEASE_DIR="$SHARED_ROOT/wrapper-leases"
   mkdir -p "$WRAPPER_STATE_DIR" "$WRAPPER_LEASE_DIR"
+
+  # The install's one env file — the single source of truth.
+  GATE_ENV="$FIXTURE_BASE/install-gate-env.sh"
+  {
+    printf 'export SMOKE_GATE_STATE_DIR=%q\n' "$WRAPPER_STATE_DIR"
+    printf 'export SMOKE_GATE_LEASE_DIR=%q\n' "$WRAPPER_LEASE_DIR"
+  } > "$GATE_ENV"
+
+  # The wrapper sources that file rather than repeating its exports.
   WRAPPER="$FIXTURE_BASE/install-wrapper.sh"
   {
     printf '#!/usr/bin/env bash\nset -u\n'
-    printf 'export SMOKE_GATE_STATE_DIR=%q\n' "$WRAPPER_STATE_DIR"
-    printf 'export SMOKE_GATE_LEASE_DIR=%q\n' "$WRAPPER_LEASE_DIR"
+    printf '. %q\n' "$GATE_ENV"
     printf 'exec bash %q "$@"\n' "$SCRIPT_DIR/smoke-pr-gate.sh"
   } > "$WRAPPER"
   chmod +x "$WRAPPER"
@@ -601,12 +607,8 @@ jq -e '.activeRunId == null and .completedRunId == "'"$TASK_FIN_ID"'" and .compl
 
   bash "$WRAPPER" task-claim "$WIRED_RUN_ID" "$SHA" | jq -e '.ok == true' >/dev/null
 
-  GATE_ENV="$FIXTURE_BASE/wired-gate-env.sh"
-  {
-    printf 'export SMOKE_GATE_STATE_DIR=%q\n' "$WRAPPER_STATE_DIR"
-    printf 'export SMOKE_GATE_LEASE_DIR=%q\n' "$WRAPPER_LEASE_DIR"
-  } > "$GATE_ENV"
-
+  # A coordinator's direct scaffold/barrier calls source the SAME install
+  # env file the wrapper used above — no second, hand-copied file.
   (
     set -a; . "$GATE_ENV"; set +a
     scaffold contract "$WIRED_RUN" "$SHA" B1:browser:'certification lane' | jq -e '.ok == true' >/dev/null
