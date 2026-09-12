@@ -161,7 +161,9 @@ import {
   isContainerSpawning,
   renderCapabilitiesSnapshot,
   resolveScanPolicyHooksMount,
+  canonicalGitControlMounts,
 } from './container-runner.js';
+import { ForeignCanonicalCommondirError } from './canonical-git-commondir.js';
 import {
   MANAGED_GIT_HOOKS_REFUSE_DIR,
   MANAGED_GIT_HOOKS_SCAN_DIR,
@@ -2508,5 +2510,84 @@ describe('resolveScanPolicyHooksMount', () => {
       containerPath: MANAGED_GIT_HOOKS_SCAN_DIR,
       readonly: true,
     });
+  });
+});
+
+describe('canonicalGitControlMounts commondir sentinel (#669)', () => {
+  function canonicalGitDir(name: string): { root: string; gitDir: string; stateDir: string } {
+    const root = uniqueTmpRoot(`canonical-commondir-${name}`);
+    const repo = path.join(root, 'repo');
+    fs.mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: repo });
+    return { root, gitDir: path.join(repo, '.git'), stateDir: path.join(root, 'state') };
+  }
+
+  it('creates the sentinel in a canonical that has none, and mounts it read-only at its own path', () => {
+    const { gitDir, stateDir } = canonicalGitDir('create');
+    const commondir = path.join(gitDir, 'commondir');
+    expect(fs.existsSync(commondir)).toBe(false);
+
+    const mounts = canonicalGitControlMounts(gitDir, stateDir);
+
+    expect(fs.lstatSync(commondir).isFile()).toBe(true);
+    expect(fs.readFileSync(commondir, 'utf8')).toBe('.\n');
+    expect(mounts).toContainEqual({ hostPath: commondir, containerPath: commondir, readonly: true });
+    // Git resolves the common dir to the canonical .git itself.
+    const common = execFileSync('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], {
+      cwd: path.dirname(gitDir),
+      encoding: 'utf8',
+    }).trim();
+    expect(fs.realpathSync(common)).toBe(fs.realpathSync(gitDir));
+    expect(fs.readdirSync(gitDir).filter((name) => name.startsWith('commondir.tmp-'))).toEqual([]);
+    // The next spawn finds it in place and mounts exactly the same.
+    expect(canonicalGitControlMounts(gitDir, stateDir)).toEqual(mounts);
+  });
+
+  it.each<[string, (commondir: string, root: string) => void]>([
+    [
+      'another repository',
+      (commondir, root) => {
+        const other = path.join(root, 'other');
+        fs.mkdirSync(other);
+        execFileSync('git', ['init', '-q'], { cwd: other });
+        fs.writeFileSync(commondir, `${path.join(other, '.git')}\n`);
+      },
+    ],
+    ['empty', (commondir) => fs.writeFileSync(commondir, '')],
+    ['the sentinel without its newline', (commondir) => fs.writeFileSync(commondir, '.')],
+    [
+      'a symlink to the sentinel bytes',
+      (commondir, root) => {
+        const bytes = path.join(root, 'sentinel-bytes');
+        fs.writeFileSync(bytes, '.\n');
+        fs.symlinkSync(bytes, commondir);
+      },
+    ],
+    ['a directory', (commondir) => fs.mkdirSync(commondir)],
+  ])('refuses, and never overwrites, a commondir that is %s', (shape, plant) => {
+    const { root, gitDir, stateDir } = canonicalGitDir(shape.replace(/\W+/g, '-'));
+    const commondir = path.join(gitDir, 'commondir');
+    plant(commondir, root);
+    const before = fs.lstatSync(commondir);
+    const bytes = (): string =>
+      before.isSymbolicLink()
+        ? fs.readlinkSync(commondir)
+        : before.isDirectory()
+          ? fs.readdirSync(commondir).join(',')
+          : fs.readFileSync(commondir, 'utf8');
+    const planted = bytes();
+
+    expect(() => canonicalGitControlMounts(gitDir, stateDir)).toThrow(ForeignCanonicalCommondirError);
+
+    const after = fs.lstatSync(commondir);
+    expect([after.isSymbolicLink(), after.isDirectory(), after.isFile()]).toEqual([
+      before.isSymbolicLink(),
+      before.isDirectory(),
+      before.isFile(),
+    ]);
+    expect(bytes()).toBe(planted);
+    // Refused before anything else was written into the .git or the state dir.
+    expect(fs.existsSync(path.join(gitDir, 'objects', 'info', 'alternates'))).toBe(false);
+    expect(fs.existsSync(stateDir)).toBe(false);
   });
 });

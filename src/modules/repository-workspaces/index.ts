@@ -64,6 +64,11 @@ import { sessionsHoldRepoIngressFence } from '../../repo-fence-recovery.js';
 import { readSessionOutbound } from '../mailbox/index.js';
 import { sessionDir, withExistingMailboxSession, writeSessionMessageIfNew } from '../../session-manager.js';
 import { safeGitArgs, safeGitConfigGet, safeGitEnv } from '../../safe-git.js';
+import {
+  ensureCanonicalCommondirSentinel,
+  gitCommonDirIs,
+  readCanonicalCommondir,
+} from '../../canonical-git-commondir.js';
 import type { Session } from '../../types.js';
 
 export interface PublishStagedCanonicalInput {
@@ -173,16 +178,22 @@ function assertNormalClone(repoPath: string, label: string): void {
   const gitDir = path.join(repoPath, '.git');
   const gitStat = fs.lstatSync(gitDir);
   if (gitStat.isSymbolicLink() || !gitStat.isDirectory()) throw new Error(`${label} must be a normal clone`);
-  // A normal clone's .git never holds `commondir`, and Git follows one to
-  // another repository's refs, objects and config. This is a fail-closed check
-  // on a container-writable mount (the canonical .git is mounted read-write,
-  // container-runner.ts:4406), not a structural fix: a separate issue tracks
-  // the mount itself. It runs before any git command here, which would follow it.
-  try {
-    fs.lstatSync(path.join(gitDir, 'commondir'));
-    throw new Error(`${label} must be a normal clone, and its .git holds a commondir file`);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  // Git follows a `commondir` to another repository's refs, objects and config
+  // (#669). A normal clone's .git holds none, or the self-referential sentinel
+  // a canonical carries (canonical-git-commondir.ts), which spawn mounts
+  // read-only over its own path (container-runner.ts:1542). Anything else is
+  // refused before any git command here, which would follow it.
+  if (readCanonicalCommondir(gitDir) === 'foreign') {
+    throw new Error(`${label} must be a normal clone, and its .git holds a commondir file that is not the sentinel`);
+  }
+  // Then Git's own answer. The canonical .git is mounted read-write into
+  // containers (container-runner.ts:4536), so the file check alone is
+  // check-then-use: this catches a
+  // commondir that appeared after it, up to this call's own read.
+  if (!gitCommonDirIs(gitDir, gitDir)) {
+    throw new Error(
+      `${label} must be a normal clone, and its Git common dir (commondir) does not resolve to its own .git`,
+    );
   }
   if (git(repoPath, ['rev-parse', '--is-bare-repository'], 10_000) !== 'false') {
     throw new Error(`${label} must be a normal clone`);
@@ -399,6 +410,12 @@ export async function publishStagedCanonical(
       // The host canonical must not own a user branch. Topic worktrees may
       // legitimately preserve or request the remote-default branch name.
       git(input.stagingPath, ['checkout', '-q', '--detach', head], 30_000);
+      // A canonical is published already carrying its commondir sentinel
+      // (#669), so it never exists without one. assertNormalClone above
+      // refused any other commondir.
+      if (ensureCanonicalCommondirSentinel(path.join(input.stagingPath, '.git')) !== 'sentinel') {
+        throw new Error('repository staging clone .git holds a commondir file that is not the sentinel');
+      }
 
       fs.mkdirSync(path.dirname(canonical), { recursive: true, mode: 0o700 });
       writeOriginPin(input.workgroupId, input.repo, { origin: normalizedInputOrigin, repositoryId }, dataDir);

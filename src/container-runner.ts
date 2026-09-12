@@ -180,6 +180,11 @@ import {
   MANAGED_GIT_HOOKS_SCAN_DIR,
 } from './managed-git-hooks.js';
 import { repositoryConfigPath, safeGitConfigGet } from './safe-git.js';
+import {
+  canonicalCommondirPath,
+  ensureCanonicalCommondirSentinel,
+  ForeignCanonicalCommondirError,
+} from './canonical-git-commondir.js';
 import { resolveStoragePolicy } from './storage-manager.js';
 import { assertStorageAdmissionInBackground } from './storage-maintenance-worker.js';
 import { acquireStorageActivityLease, type StorageActivityLease } from './storage-activity.js';
@@ -1471,6 +1476,15 @@ export async function resolveSessionRepositoryWorkUnit(
 }
 
 export function canonicalGitControlMounts(gitDir: string, stateDir: string): VolumeMount[] {
+  // Checked before anything below writes into this .git. A `commondir` file
+  // sends Git to another repository's refs and objects (#669), so the canonical
+  // carries a self-referential sentinel, bind-mounted read-only over its own
+  // path like the object-alternates placeholders below. An existing canonical
+  // gets it at its next spawn. Anything else found there is never overwritten:
+  // the caller withholds this repository's mounts and logs it.
+  const commondir = canonicalCommondirPath(gitDir);
+  const commondirState = ensureCanonicalCommondirSentinel(gitDir);
+  if (commondirState !== 'sentinel') throw new ForeignCanonicalCommondirError(commondir, commondirState);
   const config = path.join(gitDir, 'config');
   const head = path.join(gitDir, 'HEAD');
   const index = path.join(gitDir, 'index');
@@ -1525,6 +1539,7 @@ export function canonicalGitControlMounts(gitDir: string, stateDir: string): Vol
     { hostPath: indexSource, containerPath: index, readonly: true },
     { hostPath: hooks, containerPath: hooks, readonly: true },
     { hostPath: objectsInfo, containerPath: objectsInfo, readonly: true },
+    { hostPath: commondir, containerPath: commondir, readonly: true },
   ];
 }
 
@@ -4495,14 +4510,31 @@ export async function buildMounts(
     if (hooksDecision.withhold) {
       continue;
     }
-    mounts.push({ hostPath: repository.gitDir, containerPath: repository.gitDir, readonly: false });
     // The common object/ref/worktree store is writable, but host-executable
-    // configuration, hooks, canonical main-worktree HEAD/index, and
-    // object-alternate escape hatches are immutable overlays. Linked
-    // worktrees use their own .git/worktrees/<id>/HEAD and index, so container
-    // Git can fetch/commit/push without being able to clobber the host
-    // canonical checkout state.
-    mounts.push(...canonicalGitControlMounts(repository.gitDir, path.dirname(repository.lockPath)));
+    // configuration, hooks, canonical main-worktree HEAD/index, the
+    // `commondir` sentinel, and object-alternate escape hatches are immutable
+    // overlays. Linked worktrees use their own .git/worktrees/<id>/HEAD and
+    // index, so container Git can fetch/commit/push without being able to
+    // clobber the host canonical checkout state.
+    //
+    // Computed before the gitDir mount, like the hooks decision above: a
+    // canonical whose commondir is not the sentinel gets every mount withheld
+    // (same `continue` shape), never the read-write .git alone.
+    let controlMounts: VolumeMount[];
+    try {
+      controlMounts = canonicalGitControlMounts(repository.gitDir, path.dirname(repository.lockPath));
+    } catch (error) {
+      if (!(error instanceof ForeignCanonicalCommondirError)) throw error;
+      log.error('canonical repository withheld: its .git holds a commondir that is not the sentinel (#669: re-raise)', {
+        workgroupId: wgKey,
+        repository: repository.name,
+        path: error.path,
+        state: error.state,
+      });
+      continue;
+    }
+    mounts.push({ hostPath: repository.gitDir, containerPath: repository.gitDir, readonly: false });
+    mounts.push(...controlMounts);
     // Deduped by container path (#666 review B8): two scan-policy
     // repositories in one workgroup would otherwise both resolve to the
     // SAME containerPath (MANAGED_GIT_HOOKS_SCAN_DIR — one host-managed

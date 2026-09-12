@@ -104,6 +104,20 @@ vi.mock('../mailbox/read-only.js', async () => {
   return { ...actual, readSessionOutbound: hostActionMocks.readSessionOutbound };
 });
 
+// Pass-through, except that one test makes the file check report no commondir
+// to stand for the check-then-use race: a container planted one after the
+// host's file check read, before Git did. Only the Git common-dir check then
+// stands between the host and the other repository.
+const commondirMocks = vi.hoisted(() => ({ fileCheckSeesNothing: false }));
+vi.mock('../../canonical-git-commondir.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../canonical-git-commondir.js')>();
+  return {
+    ...actual,
+    readCanonicalCommondir: (gitDir: string) =>
+      commondirMocks.fileCheckSeesNothing ? ('absent' as const) : actual.readCanonicalCommondir(gitDir),
+  };
+});
+
 import {
   canonicalRepoDir,
   checkoutDirName,
@@ -375,6 +389,50 @@ describe('durable canonical publication core', () => {
     ).toBe(false);
     expect(failureMessages.join('\n')).not.toContain(origin);
     expect(failureMessages.join('\n')).not.toContain('github.com/attacker/forged-action');
+  });
+
+  it('publishes a canonical that already carries the commondir sentinel, and refuses a staging clone with any other commondir (#669)', async () => {
+    const repo = 'sentinel-publish';
+    const stage = path.join(root, 'sessions', 'sess-a', 'repository-staging', 'request-sentinel', repo);
+    cloneTo(stage);
+    const origin = `https://github.com/example/${repo}.git`;
+    git(stage, ['remote', 'set-url', 'origin', origin]);
+
+    await publishStagedCanonical({
+      workgroupId: 'wg-a',
+      repo,
+      origin,
+      repositoryId: `github.com/example/${repo}`,
+      stagingPath: stage,
+      dataDir: root,
+    });
+
+    const canonical = canonicalRepoDir('wg-a', repo, root);
+    const canonicalGit = path.join(canonical, '.git');
+    expect(fs.lstatSync(path.join(canonicalGit, 'commondir')).isFile()).toBe(true);
+    expect(fs.readFileSync(path.join(canonicalGit, 'commondir'), 'utf8')).toBe('.\n');
+    expect(fs.realpathSync(git(canonical, ['rev-parse', '--path-format=absolute', '--git-common-dir']))).toBe(
+      fs.realpathSync(canonicalGit),
+    );
+    expect(fs.readdirSync(canonicalGit).filter((name) => name.startsWith('commondir.tmp-'))).toEqual([]);
+
+    const foreignRepo = 'foreign-publish';
+    const foreignStage = path.join(root, 'sessions', 'sess-a', 'repository-staging', 'request-foreign', foreignRepo);
+    cloneTo(foreignStage);
+    const foreignOrigin = `https://github.com/example/${foreignRepo}.git`;
+    git(foreignStage, ['remote', 'set-url', 'origin', foreignOrigin]);
+    fs.writeFileSync(path.join(foreignStage, '.git', 'commondir'), `${canonicalGit}\n`);
+    await expect(
+      publishStagedCanonical({
+        workgroupId: 'wg-a',
+        repo: foreignRepo,
+        origin: foreignOrigin,
+        repositoryId: `github.com/example/${foreignRepo}`,
+        stagingPath: foreignStage,
+        dataDir: root,
+      }),
+    ).rejects.toThrow(/commondir/);
+    expect(fs.existsSync(canonicalRepoDir('wg-a', foreignRepo, root))).toBe(false);
   });
 
   it('persists the normalized GitHub origin and host-derived repository identity', async () => {
@@ -2368,6 +2426,99 @@ describe('repository_checkout host action (plan §5.2, Phase 2)', { timeout: 60_
     await expect(refreshCanonicalFromLocalRefs({ workgroupId: WG, repo: 'proj', dataDir: root })).rejects.toThrow(
       /commondir/,
     );
+  });
+
+  it('a canonical carrying the commondir sentinel still fetches, pushes, adds linked worktrees, and clones with hardlinks (#669)', async () => {
+    const canonical = networkCanonical(root);
+    const canonicalGit = path.join(canonical, '.git');
+    fs.writeFileSync(path.join(canonicalGit, 'commondir'), '.\n');
+    expect(fs.realpathSync(git(canonical, ['rev-parse', '--path-format=absolute', '--git-common-dir']))).toBe(
+      fs.realpathSync(canonicalGit),
+    );
+
+    // A container fetches origin into the canonical.
+    const pushed = pushToRemote(canonical, 'feat-sentinel', { 'sentinel.txt': 'fetched through the sentinel\n' });
+    expect(git(canonical, ['rev-parse', 'refs/remotes/origin/feat-sentinel'])).toBe(pushed);
+
+    // A linked worktree: add, commit, push.
+    const worktree = path.join(root, 'linked-sentinel');
+    git(canonical, ['worktree', 'add', '-q', '-b', 'wt-sentinel', worktree, 'origin/HEAD']);
+    expect(fs.realpathSync(git(worktree, ['rev-parse', '--path-format=absolute', '--git-common-dir']))).toBe(
+      fs.realpathSync(canonicalGit),
+    );
+    fs.writeFileSync(path.join(worktree, 'linked.txt'), 'linked\n');
+    git(worktree, ['add', 'linked.txt']);
+    git(worktree, ['commit', '-q', '-m', 'linked commit']);
+    const linkedHead = git(worktree, ['rev-parse', 'HEAD']);
+    git(worktree, ['push', '-q', 'origin', 'wt-sentinel']);
+    expect(git(remote, ['rev-parse', 'refs/heads/wt-sentinel'])).toBe(linkedHead);
+
+    // repository_checkout's host `git clone <canonical>` hardlinks the objects,
+    // and the new clone carries no commondir.
+    const unit = threadUnit('sentinel-clone');
+    const result = await checkout(unit, 'feat-sentinel', root);
+    expect(result).toMatchObject({ created: true, branch: 'feat-sentinel', objectsLinked: true });
+    const clone = path.join(topicWorktreesDir(unit, root), result.dirName);
+    expect(fs.existsSync(path.join(clone, '.git', 'commondir'))).toBe(false);
+    expect(git(clone, ['rev-parse', 'HEAD'])).toBe(pushed);
+
+    await expect(
+      refreshCanonicalFromLocalRefs({ workgroupId: WG, repo: 'proj', dataDir: root }),
+    ).resolves.toMatchObject({ ref: expect.stringMatching(/^refs\/remotes\/origin\//) });
+    expect(fs.readFileSync(path.join(canonicalGit, 'commondir'), 'utf8')).toBe('.\n');
+  });
+
+  it('accepts exactly the commondir sentinel, and refuses every other commondir (#669)', async () => {
+    const canonical = networkCanonical(root);
+    const commondir = path.join(canonical, '.git', 'commondir');
+    const elsewhere = path.join(root, 'elsewhere-shapes');
+    fs.mkdirSync(elsewhere);
+    git(elsewhere, ['init', '-q', '-b', 'main']);
+    git(elsewhere, ['commit', '-q', '--allow-empty', '-m', 'elsewhere']);
+    const sentinelBytes = path.join(root, 'sentinel-bytes');
+    fs.writeFileSync(sentinelBytes, '.\n');
+    const refresh = () => refreshCanonicalFromLocalRefs({ workgroupId: WG, repo: 'proj', dataDir: root });
+
+    fs.writeFileSync(commondir, '.\n');
+    await expect(refresh()).resolves.toBeDefined();
+
+    const shapes: Array<[string, () => void]> = [
+      ['another repository', () => fs.writeFileSync(commondir, `${path.join(elsewhere, '.git')}\n`)],
+      ['the same place in other bytes', () => fs.writeFileSync(commondir, './\n')],
+      ['the sentinel without its newline', () => fs.writeFileSync(commondir, '.')],
+      ['a symlink to the sentinel bytes', () => fs.symlinkSync(sentinelBytes, commondir)],
+      ['a directory', () => fs.mkdirSync(commondir)],
+    ];
+    for (const [shape, plant] of shapes) {
+      fs.rmSync(commondir, { recursive: true, force: true });
+      plant();
+      await expect(refresh(), shape).rejects.toThrow(/commondir/);
+    }
+
+    fs.rmSync(commondir, { recursive: true, force: true });
+    fs.writeFileSync(commondir, '.\n');
+    await expect(refresh()).resolves.toBeDefined();
+  });
+
+  it('refuses a canonical whose Git common dir resolves elsewhere, even when the file check saw no commondir (#669)', async () => {
+    const canonical = networkCanonical(root);
+    const elsewhere = path.join(root, 'elsewhere-race');
+    fs.mkdirSync(elsewhere);
+    git(elsewhere, ['init', '-q', '-b', 'main']);
+    git(elsewhere, ['commit', '-q', '--allow-empty', '-m', 'elsewhere']);
+    fs.writeFileSync(path.join(canonical, '.git', 'commondir'), `${path.join(elsewhere, '.git')}\n`);
+    const unit = threadUnit('common-dir-elsewhere');
+
+    commondirMocks.fileCheckSeesNothing = true;
+    try {
+      await expect(refreshCanonicalFromLocalRefs({ workgroupId: WG, repo: 'proj', dataDir: root })).rejects.toThrow(
+        /does not resolve to its own \.git/,
+      );
+      await expect(checkout(unit, 'feat-elsewhere', root)).rejects.toThrow(/does not resolve to its own \.git/);
+    } finally {
+      commondirMocks.fileCheckSeesNothing = false;
+    }
+    expect(listTopicCheckouts(topicWorktreesDir(unit, root))).toEqual([]);
   });
 
   it('refuses a clone checkout for a scan-policy repo (wiki), and leaves nothing staged; an ordinary repo is unaffected (#680 follow-up)', async () => {
