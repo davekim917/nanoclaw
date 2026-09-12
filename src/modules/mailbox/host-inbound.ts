@@ -72,7 +72,6 @@ import path from 'path';
 
 import {
   fileIdentityOf,
-  hostInboundProvenanceMatches,
   readHostInboundProvenance,
   recordHostInboundProvenance,
 } from '../../db/host-inbound-provenance.js';
