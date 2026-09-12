@@ -119,6 +119,7 @@ import {
   resolveRepositoryWorkUnit,
   topicWorktreesDir,
   withRepositoryLifecycleClaims,
+  withWorkgroupRepositoryMountClaim,
   writeOriginPin,
   writeTransferTombstone,
   type RepositoryWorkUnit,
@@ -1115,6 +1116,73 @@ describe('durable canonical publication core', () => {
       expect(observed.notices).toHaveLength(1);
       expect(observed.notices[0]).toMatchObject({ id: `repository-publish-failed-${requestId}`, onWake: 0 });
       expect(observed.notices[0]!.text).toContain('another repository operation on this thread');
+      expect(observed.notices[0]!.text).toContain('clone_repo can be retried');
+      expect(fs.existsSync(path.join(stage, '.git'))).toBe(true);
+      expect(fs.existsSync(canonicalRepoDir('wg-a', 'proj', hostActionDataDir))).toBe(false);
+    });
+
+    it('waits for an operator workgroup mount claim, then publishes once it is released', async () => {
+      // `ncl repositories activate|rollback` holds the workgroup mount claim
+      // while it quiesces every session in the workgroup, the requester's
+      // included (cli/resources/repositories.ts:78). That claim is a different
+      // namespace from the lifecycle claim, so nothing but this wait keeps the
+      // two from fencing the requester's sessions under different epochs.
+      const requestId = 'repo-1723600000000-2b3c4d5e6f708192';
+      await seed();
+      const observed = observeThreadScopedPublish(unitFor(requester), unitFor(otherThread));
+      const stage = stageFor(requestId);
+      let releaseOperator!: () => void;
+      const operatorTransition = withWorkgroupRepositoryMountClaim(
+        'wg-a',
+        () =>
+          new Promise<void>((resolve) => {
+            releaseOperator = resolve;
+          }),
+      );
+
+      const settled = applyRepositoryPublishAction(
+        { requestId, repo: 'proj', origin: remote, repositoryId: remote },
+        requester,
+      ).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      // Still waiting on the operator transition: nothing drained, nothing answered.
+      expect(observed.drained).toEqual([]);
+      expect(observed.notices).toEqual([]);
+
+      releaseOperator();
+      await operatorTransition;
+      expect(await settled).toBeNull();
+      expect(observed.drained).toEqual([[requester.id, sameThread.id].sort()]);
+      expect(observed.notices.map((notice) => notice.id)).toEqual([`repository-publish-complete-${requestId}`]);
+      expect(fs.existsSync(path.join(canonicalRepoDir('wg-a', 'proj', hostActionDataDir), '.git'))).toBe(true);
+      expect(fs.existsSync(stage)).toBe(false);
+    });
+
+    it('fails with a retryable explanation when an operator workgroup claim outlasts the wait, draining nothing', async () => {
+      const requestId = 'repo-1723600000000-3c4d5e6f708192a3';
+      await seed();
+      const observed = observeThreadScopedPublish(unitFor(requester), unitFor(otherThread));
+      const stage = stageFor(requestId);
+
+      _setPublishClaimWaitForTesting({ pollMs: 10, timeoutMs: 50 });
+      try {
+        await withWorkgroupRepositoryMountClaim('wg-a', async () => {
+          await expect(
+            applyRepositoryPublishAction({ requestId, repo: 'proj', origin: remote, repositoryId: remote }, requester),
+          ).rejects.toThrow(/workgroup repository transition held the mount claim on wg-a/);
+        });
+      } finally {
+        _setPublishClaimWaitForTesting(null);
+      }
+
+      // Nothing drained and nothing published: the staging clone is still the
+      // requester's to retry with, and no canonical exists.
+      expect(observed.drained).toEqual([]);
+      expect(observed.notices).toHaveLength(1);
+      expect(observed.notices[0]).toMatchObject({ id: `repository-publish-failed-${requestId}`, onWake: 0 });
       expect(observed.notices[0]!.text).toContain('clone_repo can be retried');
       expect(fs.existsSync(path.join(stage, '.git'))).toBe(true);
       expect(fs.existsSync(canonicalRepoDir('wg-a', 'proj', hostActionDataDir))).toBe(false);

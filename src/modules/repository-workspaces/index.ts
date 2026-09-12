@@ -36,6 +36,7 @@ import {
   cloneIdentity,
   defaultTopicBranch,
   isRepositoryLifecycleClaimed,
+  isWorkgroupRepositoryMountClaimed,
   listTopicCheckouts,
   readCheckoutMetadata,
   readOriginPin,
@@ -1500,18 +1501,41 @@ export async function applyRepositoryPublishAction(content: Record<string, unkno
     // admission for that work unit (container-runner.ts:1688-1690) and marks its
     // fences as in flight to the orphan-fence pass (repo-fence-recovery.ts:105-113).
     // The claim throws when already held (repository-workspaces.ts:233-235).
-    // Publish stays on the global lane with transfer, so those two never meet
-    // on it, but a same-thread checkout or topic cleanup holds it for seconds
-    // (index.ts checkoutRepository, worktree-cleanup.ts:589, :627). So wait for
-    // it, bounded, instead of failing the publish outright.
+    // Publish stays on the global lane with transfer — both are dispatched on
+    // GLOBAL_REPOSITORY_LANE (job-runner.ts:29-35, :62) — so those two never
+    // meet on it, but a same-thread checkout or topic cleanup holds it for
+    // seconds (index.ts checkoutRepository, worktree-cleanup.ts:589, :627). So
+    // wait for it, bounded, instead of failing the publish outright.
+    //
+    // The workgroup mount claim is waited on by the same loop. `ncl
+    // repositories activate|rollback` still takes it (cli/resources/repositories.ts:78)
+    // and quiesces every session in the workgroup, the requester's among them.
+    // The two claim namespaces do not conflict, so without this wait a publish
+    // and an operator transition would each fence the requester's sessions
+    // under a different epoch and the second activateRepoIngressFence would
+    // throw (modules/mailbox/ops/fence.ts:61-62). Publish defers to that claim
+    // rather than taking it: holding it would close spawn admission for every
+    // thread in the workgroup (container-runner.ts:1685-1686) for as long as
+    // the transition runs, which is the harm #655 is about.
     const claimDeadline = Date.now() + publishClaimWait.timeoutMs;
-    while (isRepositoryLifecycleClaimed(requesterWorkUnit) && Date.now() < claimDeadline) {
+    while (
+      (isRepositoryLifecycleClaimed(requesterWorkUnit) || isWorkgroupRepositoryMountClaimed(workgroupId)) &&
+      Date.now() < claimDeadline
+    ) {
       await new Promise((resolve) => setTimeout(resolve, publishClaimWait.pollMs));
     }
     // No await from here to the claim: withRepositoryLifecycleClaims tests and
     // takes its keys synchronously, before its first await
     // (repository-workspaces.ts:233-237), so nothing can take the claim between
     // the last check above and this one. Past the deadline it still throws.
+    if (isWorkgroupRepositoryMountClaimed(workgroupId)) {
+      // withRepositoryLifecycleClaims below keys on the work unit, not the
+      // workgroup, so it would not refuse this. Fail here, before the drain.
+      throw new Error(
+        `a workgroup repository transition held the mount claim on ${workgroupId} for more than ` +
+          `${Math.ceil(publishClaimWait.timeoutMs / 1000)} s, so publication never started; clone_repo can be retried`,
+      );
+    }
     claimHeldAfterWait = isRepositoryLifecycleClaimed(requesterWorkUnit);
     await withRepositoryLifecycleClaims([requesterWorkUnit], async () => {
       mountSessions = await sessionsForWorkUnit(requesterWorkUnit);
