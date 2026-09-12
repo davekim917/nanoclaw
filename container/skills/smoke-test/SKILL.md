@@ -952,12 +952,20 @@ frozen SHA is known yet, which falls back to sniffing the page for
 `meta[name="build-sha"]`, `window.__BUILD_SHA__`, or a `data-build-sha`
 attribute — the app may expose none of those, leaving `buildSha` empty. It
 reads caller-provided `<run-dir>/contact-sheet/shots.json` (capped at 8; the
-script itself is generic, no product knowledge), captures through one named
-`agent-browser` session, and writes `sheet.png` + `manifest.json`. A failed
-screen is `failed: <reason>` plus a placeholder tile, never dropped. Post
-`sheet.png` with `send_file` right after kickoff and link it from the
-verdict. A deployment may also run a fresh, read-only design critic on the
-shot PNGs — shadow only, posted but never gating the verdict.
+script itself is generic, no product knowledge) and writes `sheet.png` +
+`manifest.json`. A failed screen is `failed: <reason>` plus a placeholder
+tile, never dropped. Post `sheet.png` with `send_file` right after kickoff
+and link it from the verdict. A deployment may also run a fresh, read-only
+design critic on the shot PNGs — shadow only, posted but never gating the
+verdict.
+
+**Every screen navigates in its own fresh `agent-browser` session** (never
+one shared session for the whole sheet), with the same saved auth state
+loaded fresh into each — never a fresh login. A shared session let one
+screen's leftover DOM/localStorage state (e.g. a nav drawer a prior screen's
+`steps` opened) bleed into later screenshots, which the shadow critic then
+graded BROKEN as a pure capture artifact. Each screen's manifest entry
+carries `freshNavigation: true` as the record of this.
 
 **Auth state is a live session token — never put it in the run dir or under
 the shared workgroup tree.** The script refuses both (`realpath`-checked
