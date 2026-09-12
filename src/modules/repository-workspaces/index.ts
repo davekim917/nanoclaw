@@ -13,10 +13,9 @@ import {
 import { effectiveCheckoutMode } from '../../checkout-mode.js';
 import { DATA_DIR, REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS } from '../../config.js';
 import { MANAGED_GIT_HOOKS_SCAN_DIR, isScanPolicyRepositoryName } from '../../managed-git-hooks.js';
-import { getAgentGroup, getAllAgentGroups } from '../../db/agent-groups.js';
+import { getAgentGroup } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
-import { getSessionsByAgentGroup } from '../../db/sessions.js';
 import {
   DEPENDENCY_CACHE_DIRNAME,
   linkPackageDir,
@@ -48,7 +47,6 @@ import {
   transferTombstonePath,
   withHostRepositoryLock,
   withRepositoryLifecycleClaims,
-  withWorkgroupRepositoryMountClaim,
   writeCheckoutInheritedTags,
   writeCheckoutMetadata,
   writeOriginPin,
@@ -310,10 +308,10 @@ function assertPinMatchesRequest(
 
 /**
  * The read-only checks publishStagedCanonical makes against an existing canonical
- * and its pin, run before the workgroup drain. A publish that can only be refused
- * must not stop every container in the workgroup first (#697): it did, then failed
- * on the pin check. publishStagedCanonical repeats these under the repository
- * lock, which stays authoritative; this is an early refusal, never a grant.
+ * and its pin, run before the drain. A publish that can only be refused must not
+ * stop containers first (#697): it stopped every container in the workgroup, then
+ * failed on the pin check. publishStagedCanonical repeats these under the
+ * repository lock, which stays authoritative; this is an early refusal, never a grant.
  */
 function assertPublishCanMatchCanonical(input: {
   workgroupId: string;
@@ -407,8 +405,14 @@ export async function publishStagedCanonical(
       // partially-copied canonical.
       fs.renameSync(input.stagingPath, canonical);
       fsyncDirectories(path.dirname(input.stagingPath), path.dirname(canonical));
-      git(canonical, ['config', 'gc.auto', '0'], 10_000);
-      git(canonical, ['config', 'gc.worktreePruneExpire', 'never'], 10_000);
+      // Nothing may rewrite the canonical after the rename. Containers in other
+      // threads keep running through a publish (#655), so a spawn can discover
+      // the canonical the instant it appears and bind its .git/config by path
+      // (canonicalGitControlMounts, container-runner.ts:1523). `git config`
+      // replaces that file through a lock-file rename, which would leave such a
+      // container on an orphaned inode. gc.auto and gc.worktreePruneExpire are
+      // already in the staging config sanitizeCanonicalConfig wrote above
+      // (the [gc] section, line 269).
       return { status: 'published' as const, canonicalPath: canonical };
     },
     dataDir,
@@ -1430,28 +1434,51 @@ export async function applyRepositoryPublishAction(content: Record<string, unkno
   try {
     // Refuse before the drain what the publication would refuse after it (#697).
     assertPublishCanMatchCanonical({ workgroupId, repo, origin, repositoryId });
-    await withWorkgroupRepositoryMountClaim(workgroupId, async () => {
-      const groupIds = (await getAllAgentGroups())
-        .filter((candidate) => (candidate.workgroup_id ?? candidate.folder) === workgroupId)
-        .map((candidate) => candidate.id);
-      mountSessions = (await Promise.all(groupIds.map((id) => getSessionsByAgentGroup(id)))).flat();
+    const requesterWorkUnit = await workUnitForSession(session, workgroupId);
+    // Only the requester's thread is drained (#655). A container's canonical
+    // mounts are fixed when it spawns (buildMounts binds each canonical
+    // discoverCanonicalRepositories finds then, container-runner.ts:4474-4518),
+    // so a container in another thread keeps running on the mounts it has and
+    // sees the new canonical at its next start; nothing needs it stopped. A
+    // spawn that races the publication sees either no canonical or a whole
+    // one: the pin and the lock exist before the atomic rename (withHostRepositoryLock
+    // and writeOriginPin in publishStagedCanonical), discovery refuses a canonical
+    // without its pin (container-runner.ts:4475-4477), and nothing rewrites the
+    // canonical after the rename.
+    //
+    // The requester's work unit must stop: its staging clone is in the
+    // requester's writable /workspace (clone_repo stages under
+    // /workspace/repository-staging), and the confirmation below is an onWake
+    // row that only a fresh container reads. Same-thread sessions share the
+    // topic root, so the whole work unit goes. Its lifecycle claim closes spawn
+    // admission for that work unit (container-runner.ts:1688-1690) and marks its
+    // fences as in flight to the orphan-fence pass (repo-fence-recovery.ts:105-113).
+    // The claim throws when already held (repository-workspaces.ts:233-235);
+    // publish stays on the global lane with transfer, so those two never meet
+    // on it.
+    await withRepositoryLifecycleClaims([requesterWorkUnit], async () => {
+      mountSessions = await sessionsForWorkUnit(requesterWorkUnit);
 
-      // The mount claim closes new spawn admission. Wait for every already
-      // admitted turn/tool to finish and stop all existing containers before
-      // the first canonical publication mutation.
+      // Wait for every already admitted turn/tool in this work unit to finish
+      // and stop its containers before the first canonical publication mutation.
       quiescence = await quiesceSessionsForRepositoryMounts(
         mountSessions,
         `repository-publish:${requestId}`,
         REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS,
       );
       affectedSessions = quiescence.sessions;
+      // A canonical that already matches takes publishStagedCanonical's
+      // existing branch under this same claim: the staging clone is discarded
+      // and the requester is answered. That branch rewrites the canonical's
+      // config and detaches its HEAD with other threads' containers running,
+      // as refresh already does to a live canonical (refreshCanonicalFromLocalRefs).
       const published = await publishStagedCanonical({ workgroupId, repo, origin, repositoryId, stagingPath });
       const confirmation =
         published.status === 'published'
-          ? `Repository ready: ${repo} is now the workgroup canonical. All sibling containers were restarted with consistent topic-worktree mounts.`
-          : `Repository ready: ${repo} already matched the workgroup canonical. Sibling mounts were reconciled before continuing.`;
+          ? `Repository ready: ${repo} is published as the workgroup canonical. This thread restarted with it mounted; other threads see it at their next container start.`
+          : `Repository ready: ${repo} already matched the workgroup canonical, so the staging clone was discarded. This thread restarted with it mounted.`;
       // onWake is load-bearing: the container that requested publication is
-      // deliberately among those stopped below, so a synchronous MCP response
+      // deliberately among those stopped above, so a synchronous MCP response
       // cannot survive. Only the fresh container may consume this confirmation.
       await writeSessionMessageIfNew(session.agent_group_id, session.id, {
         id: `repository-publish-complete-${requestId}`,
@@ -1957,8 +1984,8 @@ export async function applyRepositoryTransferAction(content: Record<string, unkn
 }
 
 // All four run OFF the serial delivery drain (job-runner.ts): a publish's
-// quiescence now waits up to REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS for sibling
-// containers to reach a safe point, and no other session's outbound messages may
+// quiescence now waits up to REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS for the
+// requester's thread to reach a safe point, and no other session's outbound messages may
 // queue behind that. `repository_refresh` joins them because it contends for the
 // same per-repository flock that a detached transfer holds across its whole
 // quiescence — left inline it would simply move the delivery block. Publish,
@@ -1968,8 +1995,8 @@ export async function applyRepositoryTransferAction(content: Record<string, unkn
 // MAX_DELIVERY_ATTEMPTS no longer applies to these rows: the runner owns the
 // `delivered` row (deferAck) and gives each action exactly one attempt per host
 // process. A retry is not free here — every attempt re-fences and re-kills every
-// sibling container in the workgroup, so three attempts at a quiescence that has
-// already timed out cost three fleet-wide restarts to reach the same failure.
+// container it drains, so three attempts at a quiescence that has already timed
+// out cost three restarts to reach the same failure.
 // The give-up path keeps the orphan-fence release the delivery loop used to run.
 registerDeliveryAction(
   'repository_publish',

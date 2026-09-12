@@ -1216,7 +1216,8 @@ async function createCloneWorktree(context: RepositoryContext, branch: string | 
  * canonical's transfers directory before any per-topic withhold
  * (src/container-runner.ts:4474-4480), so that directory proves the canonical
  * exists even where its `.git` is withheld. Publishing it again would drain
- * every container in the workgroup and change nothing (#705).
+ * this thread's containers and change nothing (#705; before #655 it drained
+ * every container in the workgroup).
  */
 function alreadyPublishedAnswer(repo: string, requestedOrigin: string): ToolResult | null {
   const dataDir = process.env.NANOCLAW_HOST_DATA_DIR ?? '';
@@ -1243,7 +1244,7 @@ export const cloneRepoTool: McpToolDefinition = {
   tool: {
     name: 'clone_repo',
     description:
-      "Clone a GitHub repository through this container's scoped identity, then durably publish one host-owned canonical clone for the workgroup. Publishing restarts every container in the workgroup. When the workgroup already has this repository, it returns at once without cloning or publishing: use create_worktree for a checkout, and never call clone_repo to work around a create_worktree error.",
+      "Clone a GitHub repository through this container's scoped identity, then durably publish one host-owned canonical clone for the workgroup. Publishing restarts this thread's containers. When the workgroup already has this repository, it returns at once without cloning or publishing: use create_worktree for a checkout, and never call clone_repo to work around a create_worktree error.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1315,8 +1316,8 @@ export const cloneRepoTool: McpToolDefinition = {
       }),
     });
     return ok(
-      `Repository publication queued durably for ${repo}. The workgroup will respawn with consistent mounts, ` +
-        'and this topic will receive an explicit success or failure message after the host action finishes.',
+      `Repository publication queued durably for ${repo}. End your turn now; do not wait or poll. ` +
+        'This topic restarts with the repository mounted and receives an explicit success or failure message.',
     );
   },
 };
