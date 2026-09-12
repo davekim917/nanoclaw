@@ -413,7 +413,19 @@ export function evaluate(
       // baselineEntry is a number — the normal regression-threshold comparison.
       const effectiveCurrent = typeof current === 'number' ? current : 0; // 'untested' reads as 0
       delta = effectiveCurrent - baselineEntry;
-      status = delta < -threshold ? 'regressed' : 'ok';
+      // Compare in integer hundredths, not the raw float delta: effectiveCurrent and
+      // baselineEntry are both already round2()-ed to 2 decimal places (see
+      // toBaselineEntry), but IEEE 754 doubles can't represent every 2-decimal value
+      // exactly, so a raw float subtraction at an exact threshold boundary can land a
+      // hair past it — e.g. 63.51 - 64.01 comes out about 7e-15 more negative than
+      // -0.5, not exactly -0.5, which would wrongly fail a drop of precisely the
+      // threshold. Multiplying by 100 and rounding to the nearest integer before
+      // comparing removes that drift; --threshold is rounded the same way so it stays
+      // exact at any 2-decimal value a caller passes.
+      const currentHundredths = Math.round(effectiveCurrent * 100);
+      const baselineHundredths = Math.round(baselineEntry * 100);
+      const thresholdHundredths = Math.round(threshold * 100);
+      status = currentHundredths - baselineHundredths < -thresholdHundredths ? 'regressed' : 'ok';
     }
     return { file, baseline: baselineEntry, current, delta, status };
   });

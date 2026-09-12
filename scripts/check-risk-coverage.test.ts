@@ -322,6 +322,52 @@ describe('evaluate', () => {
     expect(result.rows[0].status).toBe('regressed');
   });
 
+  // Floating-point boundary (#686, first half): current/baseline are round2()-ed to 2
+  // decimal places, but a raw `current - baseline` float subtraction isn't guaranteed to
+  // land exactly on a 2-decimal value at the threshold boundary — e.g. 63.51 - 64.01
+  // comes out about 7e-15 more negative than -0.5 in IEEE 754, not exactly -0.5, which
+  // would fail a drop of precisely the threshold when it should pass. The fix compares
+  // in integer hundredths instead of raw floats.
+  describe('threshold boundary is exact despite floating-point drift', () => {
+    it('passes an exact 0.50-point drop (66.67 -> 66.17)', () => {
+      const current = classify({ 'src/a.ts': { kind: 'measured', pct: 66.17 } });
+      const result = evaluate(['src/a.ts'], current, baseline({ 'src/a.ts': 66.67 }));
+      expect(result.passed).toBe(true);
+      expect(result.rows[0].status).toBe('ok');
+    });
+
+    it('fails a 0.51-point drop (66.67 -> 66.16)', () => {
+      const current = classify({ 'src/a.ts': { kind: 'measured', pct: 66.16 } });
+      const result = evaluate(['src/a.ts'], current, baseline({ 'src/a.ts': 66.67 }));
+      expect(result.passed).toBe(false);
+      expect(result.rows[0].status).toBe('regressed');
+    });
+
+    it('passes a 0.49-point drop (66.67 -> 66.18)', () => {
+      const current = classify({ 'src/a.ts': { kind: 'measured', pct: 66.18 } });
+      const result = evaluate(['src/a.ts'], current, baseline({ 'src/a.ts': 66.67 }));
+      expect(result.passed).toBe(true);
+      expect(result.rows[0].status).toBe('ok');
+    });
+
+    // These two pairs are exact 0.50-point drops that DO trip the raw-float comparison
+    // in this repo's actual runtime (verified: `63.51 - 64.01` and `0.57 - 1.07` each
+    // land a hair below -0.5) — the ones the mutation below actually catches.
+    it('passes an exact 0.50-point drop that raw float subtraction misrounds (64.01 -> 63.51)', () => {
+      const current = classify({ 'src/a.ts': { kind: 'measured', pct: 63.51 } });
+      const result = evaluate(['src/a.ts'], current, baseline({ 'src/a.ts': 64.01 }));
+      expect(result.passed).toBe(true);
+      expect(result.rows[0].status).toBe('ok');
+    });
+
+    it('passes an exact 0.50-point drop that raw float subtraction misrounds (1.07 -> 0.57)', () => {
+      const current = classify({ 'src/a.ts': { kind: 'measured', pct: 0.57 } });
+      const result = evaluate(['src/a.ts'], current, baseline({ 'src/a.ts': 1.07 }));
+      expect(result.passed).toBe(true);
+      expect(result.rows[0].status).toBe('ok');
+    });
+  });
+
   it('treats a baseline file that is now untested as a drop to 0%', () => {
     const current = classify({ 'src/a.ts': { kind: 'untested' } });
     const result = evaluate(['src/a.ts'], current, baseline({ 'src/a.ts': 10 }));
