@@ -195,5 +195,22 @@ Review: /home/ubuntu/scratch/autoagent-0912/codex-710c-review.md
       the scoping bullet says pending AND approved, Round 4 documents the
       window, and F1 now uses the deploy-gated wording (merged is not
       authoritative until the host is restarted onto it).
-- [ ] Re-apply the 078 fix destroyed by trap 2, re-run targeted, commit,
-      re-run M8 properly, full host + container suites, ratchet, push.
+- [x] Re-applied the 078 fix destroyed by trap 2, re-verified, committed as
+      78e2d6d53 and pushed BEFORE re-running the mutations this time.
+- [x] Counterfactuals re-run with the corrected script (/tmp/cf-710d2.sh,
+      log .r7-counterfactual.log), both RED:
+      M8 index predicate narrowed back to pending-only → the two barrier
+         tests fail (delivery-failure window, null-delivery window).
+      M9 legacy cleanup deleted → 4 of the 7 migration tests fail, index
+         creation throwing on the seeded duplicates exactly as predicted.
+      File verified restored afterwards: 3 widened predicates, 0 narrow,
+      clean tracked diff.
+- [x] Host tsc clean; targeted 7 files / 109 tests pass; ratchet exit 0 with
+      Δ 0 (no upstream-owned file changed this round, so no accept needed).
+- [x] Container suite at this tree: 1774 pass, 4 skip, 0 fail, 125 files.
+      Nothing under container/ moved this round; run anyway for completeness.
+- [x] docs/review-notes.md gains two lines for this receipt: a second
+      `check-then-act` (a reservation must cover every state in which the
+      guarded thing is still live) and a `mutation coverage` (repair code
+      needs a test that seeds the bad data before the migration runs).
+- [ ] Final: commit the docs, push, full host suite at that head, report.
