@@ -274,19 +274,24 @@ drain_in_flight() {
   main=$(systemctl show -p MainPID --value nanoclaw-v2 2>/dev/null)
   [ -n "$pid" ] && [ "$pid" = "$main" ]
 }
+# One budget for the whole deploy: the check right before the restart spends
+# only what the first wait left, so a drain that already ran the budget out is
+# not waited on a second time.
+DRAIN_DEADLINE=""
 wait_for_drain() {
   drain_in_flight || return 0
+  [ -n "$DRAIN_DEADLINE" ] || DRAIN_DEADLINE=$(($(date +%s) + DRAIN_WAIT_SECONDS))
   write_status "running" "waiting for repository drain" ""
   echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Waiting for an in-flight repository drain before restarting: $(cat "$DRAIN_MARKER")" >> "$LOG"
-  local drain_waited=0
-  while drain_in_flight && [ "$drain_waited" -lt "$DRAIN_WAIT_SECONDS" ]; do
+  local started
+  started=$(date +%s)
+  while drain_in_flight && [ "$(date +%s)" -lt "$DRAIN_DEADLINE" ]; do
     sleep 10
-    drain_waited=$((drain_waited + 10))
   done
   if drain_in_flight; then
-    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Repository drain still running after ${DRAIN_WAIT_SECONDS}s; restarting anyway" >> "$LOG"
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Repository drain still running when the ${DRAIN_WAIT_SECONDS}s wait budget ran out; restarting anyway" >> "$LOG"
   else
-    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Repository drain settled after ${drain_waited}s" >> "$LOG"
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Repository drain settled after $(($(date +%s) - started))s" >> "$LOG"
   fi
 }
 wait_for_drain

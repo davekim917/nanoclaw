@@ -52,7 +52,7 @@ describe('deploy rollback shell contract', () => {
     expect(calls[1]).toBeGreaterThan(script.indexOf('Build complete, restarting'));
     expect(calls[1]).toBeLessThan(script.indexOf('if [ -z "$MIGRATION_CHANGES" ]'));
     expect(calls[1]).toBeLessThan(script.indexOf('write_status "ok" "done"'));
-    expect(script).toContain('[ "$drain_waited" -lt "$DRAIN_WAIT_SECONDS" ]');
+    expect(script).toContain('[ "$(date +%s)" -lt "$DRAIN_DEADLINE" ]');
     // Two back-to-back transfer drains at the default quiescence timeout fit.
     expect(script).toContain('NANOCLAW_DEPLOY_DRAIN_WAIT_SECONDS:-1800');
     // A marker left by a host that died mid-drain must not hold the restart.
@@ -103,6 +103,63 @@ describe('deploy rollback shell contract', () => {
       expect(probeWith('9999')).toBe('proceeds');
       // systemctl cannot say.
       expect(probeWith('')).toBe('proceeds');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('spends one wait budget across both drain checks (#718)', () => {
+    const shellFunction = (name: string): string => {
+      const body = script.match(new RegExp(`^${name}\\(\\) \\{\\n[\\s\\S]*?^\\}$`, 'm'))?.[0];
+      expect(body, name).toBeDefined();
+      return body!;
+    };
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'deploy-drain-budget-'));
+    const bin = path.join(dir, 'bin');
+    fs.mkdirSync(bin);
+    // Simulated time: `sleep N` advances the clock and `date +%s` reads it.
+    const clock = path.join(dir, 'clock');
+    fs.writeFileSync(clock, '1000\n');
+    fs.writeFileSync(path.join(bin, 'sleep'), `#!/bin/sh\necho $(( $(cat "${clock}") + $1 )) > "${clock}"\n`, {
+      mode: 0o755,
+    });
+    fs.writeFileSync(
+      path.join(bin, 'date'),
+      `#!/bin/sh\nif [ "$1" = "+%s" ]; then cat "${clock}"; else exec /bin/date "$@"; fi\n`,
+      { mode: 0o755 },
+    );
+    fs.writeFileSync(path.join(bin, 'systemctl'), '#!/bin/sh\necho 4242\n', { mode: 0o755 });
+    // A drain that never settles, owned by the running service.
+    const marker = path.join(dir, 'repository-drain-in-flight.json');
+    fs.writeFileSync(
+      marker,
+      `${JSON.stringify({ action: 'repository_transfer', requestId: 'r', sessionId: 's', pid: 4242, startedAt: 'x' })}\n`,
+    );
+    const probe = path.join(dir, 'probe.sh');
+    fs.writeFileSync(
+      probe,
+      [
+        `DRAIN_MARKER="${marker}"`,
+        `LOG="${path.join(dir, 'deploy.log')}"`,
+        `STATUS_FILE="${path.join(dir, 'status.json')}"`,
+        'DRAIN_WAIT_SECONDS=30',
+        'DRAIN_DEADLINE=""',
+        shellFunction('write_status'),
+        shellFunction('drain_in_flight'),
+        shellFunction('wait_for_drain'),
+        'wait_for_drain',
+        'wait_for_drain',
+        `cat "${clock}"`,
+        '',
+      ].join('\n'),
+    );
+    try {
+      const out = execFileSync('bash', [probe], {
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+        encoding: 'utf8',
+      }).trim();
+      // Three 10 s polls run the 30 s budget out; the second check spends none.
+      expect(Number(out)).toBe(1030);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
