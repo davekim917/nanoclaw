@@ -1568,6 +1568,61 @@ describe('at-merge replay from local git (fixture repo, no network) — P2', () 
     expect(mergeCommitParentsLocal('0000000000000000000000000000000000000000')).toBeNull();
   });
 
+  it('mergeCommitParentsLocal resolves a commit that merged AFTER the local checkout was taken, by fetching it from `origin` by exact SHA', () => {
+    // Reproduces review-metrics.yml's exact race, live against davekim917/nanoclaw on
+    // 2026-09-12 (workflow run 34675405074, checked out at `818218dee3...`): the job's
+    // `actions/checkout` (`fetch-depth: 0`) runs ONCE at job start, but
+    // `fetchMergedPRs`' live `gh pr list --search` call runs minutes later, after `pnpm
+    // install`. PR #695 merged 24s into that run; its merge commit was real and on
+    // GitHub but had never been part of the checkout, and
+    // `commitExistsLocally`/`mergeCommitParentsLocal` misreported it exactly like a
+    // genuinely force-pushed-away commit — `postGateUnresolved: 1` for that week, where
+    // a same-window local run moments later (with the commit already fetched) showed 0.
+    //
+    // `origin` here is a second real repo on local disk, standing in for GitHub: no
+    // network needed for this test — `git fetch` treats a filesystem path exactly like
+    // any other remote, and the fix under test is generic to `git fetch`'s remote,
+    // not GitHub-specific.
+    const upstreamRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-fetch-origin-upstream-'));
+    function u(args: string[]): string {
+      return execFileSync('git', ['-c', 'user.email=test@example.invalid', '-c', 'user.name=test', ...args], {
+        cwd: upstreamRepo,
+        encoding: 'utf8',
+      }).trim();
+    }
+    u(['init', '-q', '-b', 'main']);
+    fs.writeFileSync(path.join(upstreamRepo, 'a.txt'), 'a\n');
+    u(['add', '-A']);
+    u(['commit', '-q', '-m', 'commit A — present in the checkout']);
+    const commitA = u(['rev-parse', 'HEAD']);
+
+    // Cloned BEFORE commit B exists upstream, so this clone (standing in for the CI
+    // job's `actions/checkout`) genuinely never saw it — not merely reset away from it.
+    const localRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-fetch-origin-local-'));
+    execFileSync('git', ['clone', '-q', upstreamRepo, localRepo], { encoding: 'utf8' });
+
+    // NOW a PR "merges" into upstream main — after the local clone was taken, exactly
+    // the mid-run race the fix closes.
+    fs.writeFileSync(path.join(upstreamRepo, 'b.txt'), 'b\n');
+    u(['add', '-A']);
+    u(['commit', '-q', '-m', 'commit B — merges into main mid-run, after the checkout']);
+    const commitB = u(['rev-parse', 'HEAD']);
+
+    process.chdir(localRepo);
+    try {
+      // Sanity check first: the local clone genuinely does not have commit B yet — if
+      // this stops holding, the fixture no longer reproduces the race.
+      expect(() => execFileSync('git', ['cat-file', '-e', `${commitB}^{commit}`])).toThrow();
+      // mergeCommitParentsLocal funnels through commitExistsLocally, the fetch-and-retry
+      // seam under test — it should now resolve commit B by fetching it from `origin`.
+      expect(mergeCommitParentsLocal(commitB)).toEqual([commitA]);
+    } finally {
+      process.chdir(repoDir);
+      fs.rmSync(localRepo, { recursive: true, force: true });
+      fs.rmSync(upstreamRepo, { recursive: true, force: true });
+    }
+  });
+
   it('readRiskHighGlobsAtShaLocal reads risk:high globs AT the base commit, not the merge commit', () => {
     expect(readRiskHighGlobsAtShaLocal(baseCommit)).toEqual({ kind: 'found', globs: ['src/guard/**'] });
   });

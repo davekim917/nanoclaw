@@ -1779,11 +1779,7 @@ function git(args: readonly string[]): string {
   });
 }
 
-/** Whether `sha` resolves to a real commit in the LOCAL object database — distinct from
- *  "resolves, but a path doesn't exist in its tree" (see `readRiskHighGlobsAtShaLocal`).
- *  False for a commit a shallow clone never fetched, or one a force-push made
- *  unreachable — the "handle a missing commit... as unresolved" case. */
-function commitExistsLocally(sha: string): boolean {
+function commitResolvesLocally(sha: string): boolean {
   try {
     execFileSync('git', ['cat-file', '-e', `${sha}^{commit}`], { stdio: 'ignore' });
     return true;
@@ -1791,6 +1787,43 @@ function commitExistsLocally(sha: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** Whether `sha` resolves to a real commit in the LOCAL object database — distinct from
+ *  "resolves, but a path doesn't exist in its tree" (see `readRiskHighGlobsAtShaLocal`).
+ *  False for a commit a shallow clone never fetched at all, or one a force-push made
+ *  unreachable — the "handle a missing commit... as unresolved" case — but ONLY after
+ *  one `git fetch --quiet --no-tags origin <sha>` attempt on an initial miss, first.
+ *
+ *  Why the fetch: `review-metrics.yml`'s `actions/checkout` (`fetch-depth: 0`) runs ONCE
+ *  at job start, but `fetchMergedPRs`' live `gh pr list --search`/`search/issues` calls
+ *  run minutes later, after `pnpm install`. A PR can merge into `main` in that gap — its
+ *  merge commit is real and on GitHub, was simply never part of the checkout — and
+ *  without this retry it was misreported exactly like a genuinely force-pushed-away
+ *  commit: reproduced live against davekim917/nanoclaw on 2026-09-12 (workflow run
+ *  34675405074, `main` at `818218dee3...`; PR #695 merged 24s into that run, and its
+ *  merge commit `a89d70e32f...` was absent from the checkout, `postGateUnresolved: 1` for
+ *  2026-W37 where a same-window local run moments later — with #695's commit already
+ *  fetched — showed 0). GitHub supports fetching an arbitrary reachable commit by its
+ *  exact SHA (confirmed empirically: a shallow clone pinned to `818218dee3...`, `git
+ *  fetch --no-tags origin a89d70e32f...`, then `git diff` between the two succeeded).
+ *
+ *  The fetch is attempted only AFTER a local miss — the overwhelmingly common case is a
+ *  hit, costing no network at all — and only once per commit. A repo with no `origin`
+ *  remote (every fixture in this suite) fails the attempt in a few milliseconds with no
+ *  network reached at all (confirmed empirically), so this adds no real cost to tests. A
+ *  commit still missing after the fetch attempt is a genuine gap — no reachable SHA, or
+ *  no network/remote at all — and `false` here is what turns into `'error'`/unresolved
+ *  up the stack, never a guessed default. */
+function commitExistsLocally(sha: string): boolean {
+  if (commitResolvesLocally(sha)) return true;
+  try {
+    execFileSync('git', ['fetch', '--quiet', '--no-tags', 'origin', sha], { stdio: 'ignore' });
+    // eslint-disable-next-line no-catch-all/no-catch-all
+  } catch {
+    return false;
+  }
+  return commitResolvesLocally(sha);
 }
 
 /** `mergeCommitOid`'s parent oids, in order, or `null` when that commit isn't resolvable
