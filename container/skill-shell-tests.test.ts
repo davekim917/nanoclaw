@@ -13,11 +13,9 @@ import { allowSubprocess, enforceHermeticity } from '../src/test-hermeticity.js'
 /**
  * Structural gate for shadow-review #724's F3: `ab-net-redact.test.sh` — the
  * only regression check on the network/HAR credential-redaction control added
- * by #700 — never ran anywhere. `container/entrypoint-github-auth.test.ts`
- * already proves the pattern (nothing in this repo executes `*.test.sh` on its
- * own — see that file's own header comment — so a `.test.ts` wrapper that
- * shells out to it is what puts a suite in `pnpm test` and CI), but it only
- * gates the one sibling suite it names.
+ * by #700 — never ran anywhere. Nothing in this repo executes `*.test.sh` on
+ * its own, so this gate runs every eligible shell suite under `pnpm test` and
+ * CI without requiring a sibling wrapper someone must remember to add.
  *
  * Rather than hand-add a second one-off wrapper (and leave the next shell
  * suite exactly as ungated as this one was), this file DISCOVERS every
@@ -28,9 +26,9 @@ import { allowSubprocess, enforceHermeticity } from '../src/test-hermeticity.js'
  * moment it lands, with no wrapper file to remember to add.
  *
  * Every `execFileSync('bash', …)` call below is this file's only subprocess
- * escape (`allowSubprocess(['bash'])` opts in visibly; nothing else needs an
- * exemption, so `enforceHermeticity()` holds the whole file to the strict
- * mode). The sandbox env each suite runs under also neutralizes ambient git
+ * escape (`allowSubprocess(['bash'])` opts in visibly). `enforceHermeticity()`
+ * guards this process's Node seams, not Bash descendants: each shell suite
+ * must isolate its own external commands. The suite environment neutralizes ambient git
  * config — see buildSuiteEnv() — because `GIT_CONFIG_NOSYSTEM=1` plus a fresh
  * `HOME` alone still leaves `$XDG_CONFIG_HOME/git/config` reachable, and git
  * prefers that file over `$HOME/.gitconfig`.
@@ -52,20 +50,14 @@ const SUITE_TIMEOUT_MS = 400_000;
 
 /**
  * Suites that cannot run in this hermetic CI sandbox (Docker, a real browser,
- * network, or a host-only path), plus suites that already have their own
- * dedicated `.test.ts` wrapper elsewhere (so discovering them here too would
- * run the same suite twice) — each with the one-line reason. Every path here
- * is asserted to still exist below, so a rename or removal fails loudly
+ * network, or a host-only path), each with the one-line reason. Every path
+ * here is asserted to still exist below, so a rename or removal fails loudly
  * instead of the exclusion silently rotting into a no-op.
  */
 const EXCLUDED_SUITES: ReadonlyArray<{ relPath: string; reason: string }> = [
   {
     relPath: 'container/claude-review-wrapper.test.sh',
     reason: 'needs a candidate image argument ($1) and a real `docker run`; genuinely cannot run unattended in CI',
-  },
-  {
-    relPath: 'container/entrypoint-github-auth.test.sh',
-    reason: 'already gated by its own wrapper, container/entrypoint-github-auth.test.ts — avoid running it twice',
   },
 ];
 
@@ -125,19 +117,29 @@ const RUNNABLE_SUITES = ALL_SUITES.filter((relPath) => !EXCLUDED_REL_PATHS.has(r
  * `XDG_CONFIG_HOME`, `GIT_CONFIG_GLOBAL` or `GIT_CONFIG_SYSTEM` straight
  * through, so a hostile or merely unusual value on the host/runner (an
  * `insteadOf` rewrite, a `core.hooksPath`) could silently change what a
- * suite's own git commands read or ran. All three are pinned here, after the
- * spread, so they win regardless of what `process.env` carries: this repo has
- * been bitten by ambient git config twice (`docs/review-notes.md`).
+ * suite's own git commands read or ran. Remove the two explicit config-file
+ * overrides after the spread and pin XDG under the fresh home instead. That
+ * keeps host config out while still letting a suite that deliberately writes
+ * `$HOME/.gitconfig` inspect its own configuration.
  */
 function buildSuiteEnv(freshHome: string): NodeJS.ProcessEnv {
-  return {
+  const env: NodeJS.ProcessEnv = {
     ...process.env,
     HOME: freshHome,
     GIT_CONFIG_NOSYSTEM: '1',
     XDG_CONFIG_HOME: path.join(freshHome, '.config'),
-    GIT_CONFIG_GLOBAL: '/dev/null',
-    GIT_CONFIG_SYSTEM: '/dev/null',
   };
+  delete env.GIT_CONFIG_GLOBAL;
+  delete env.GIT_CONFIG_SYSTEM;
+  return env;
+}
+
+function formatShellSuiteFailure(relPath: string, err: unknown): string {
+  const detail = err instanceof Error ? err.message : String(err);
+  const output = typeof err === 'object' && err !== null ? (err as { stdout?: unknown; stderr?: unknown }) : {};
+  return `${relPath} failed: ${detail}\n${output.stdout === undefined ? '' : String(output.stdout)}\n${
+    output.stderr === undefined ? '' : String(output.stderr)
+  }`;
 }
 
 describe('every container skill shell test suite (*.test.sh)', () => {
@@ -176,6 +178,7 @@ describe('every container skill shell test suite (*.test.sh)', () => {
     const savedXdg = process.env.XDG_CONFIG_HOME;
     const savedGlobal = process.env.GIT_CONFIG_GLOBAL;
     const savedSystem = process.env.GIT_CONFIG_SYSTEM;
+    let probeCwd: string | undefined;
     try {
       mkdirSync(path.join(hostileXdg, 'git'), { recursive: true });
       const hostileConfigPath = path.join(hostileXdg, 'git', 'config');
@@ -198,7 +201,7 @@ describe('every container skill shell test suite (*.test.sh)', () => {
       // run from inside the real repo would pick up ITS legitimate local
       // `core.hooksPath` (husky sets `.husky/_`), which has nothing to do with
       // ambient global/system config and would make this test meaningless.
-      const probeCwd = mkdtempSync(path.join(tmpdir(), 'skill-shell-test-probe-cwd-'));
+      probeCwd = mkdtempSync(path.join(tmpdir(), 'skill-shell-test-probe-cwd-'));
 
       // Sanity check the fixture is real: this is the OLD (pre-fix) env —
       // fresh HOME and GIT_CONFIG_NOSYSTEM=1 only — reading the hostile
@@ -221,11 +224,11 @@ describe('every container skill shell test suite (*.test.sh)', () => {
       // The suite's real sandbox env must not see it, even though
       // `process.env` still carries the hostile values at the point
       // buildSuiteEnv() spreads it.
-      const insteadOf = execFileSync(
-        'bash',
-        ['-c', 'git config --get url.https://github.com/.insteadOf; exit 0'],
-        { encoding: 'utf-8', cwd: probeCwd, env: buildSuiteEnv(freshHome) },
-      ).trim();
+      const insteadOf = execFileSync('bash', ['-c', 'git config --get url.https://github.com/.insteadOf; exit 0'], {
+        encoding: 'utf-8',
+        cwd: probeCwd,
+        env: buildSuiteEnv(freshHome),
+      }).trim();
       expect(insteadOf).toBe('');
 
       const hooksPath = execFileSync('bash', ['-c', 'git config --get core.hooksPath; exit 0'], {
@@ -234,7 +237,11 @@ describe('every container skill shell test suite (*.test.sh)', () => {
         env: buildSuiteEnv(freshHome),
       }).trim();
       expect(hooksPath).toBe('');
-      rmSync(probeCwd, { recursive: true, force: true });
+
+      // Removing, rather than pinning, the explicit global path means a suite
+      // can still make and verify an isolated `$HOME/.gitconfig` of its own.
+      expect(buildSuiteEnv(freshHome).GIT_CONFIG_GLOBAL).toBeUndefined();
+      expect(buildSuiteEnv(freshHome).GIT_CONFIG_SYSTEM).toBeUndefined();
     } finally {
       if (savedXdg === undefined) delete process.env.XDG_CONFIG_HOME;
       else process.env.XDG_CONFIG_HOME = savedXdg;
@@ -242,9 +249,17 @@ describe('every container skill shell test suite (*.test.sh)', () => {
       else process.env.GIT_CONFIG_GLOBAL = savedGlobal;
       if (savedSystem === undefined) delete process.env.GIT_CONFIG_SYSTEM;
       else process.env.GIT_CONFIG_SYSTEM = savedSystem;
+      if (probeCwd) rmSync(probeCwd, { recursive: true, force: true });
       rmSync(freshHome, { recursive: true, force: true });
       rmSync(hostileXdg, { recursive: true, force: true });
     }
+  });
+
+  it('keeps the runner error message with suite stdout and stderr', () => {
+    const failure = Object.assign(new Error('spawn ENOENT'), { stdout: 'suite stdout', stderr: 'suite stderr' });
+    expect(formatShellSuiteFailure('container/example.test.sh', failure)).toContain('spawn ENOENT');
+    expect(formatShellSuiteFailure('container/example.test.sh', failure)).toContain('suite stdout');
+    expect(formatShellSuiteFailure('container/example.test.sh', failure)).toContain('suite stderr');
   });
 
   for (const relPath of RUNNABLE_SUITES) {
@@ -260,8 +275,7 @@ describe('every container skill shell test suite (*.test.sh)', () => {
             env: buildSuiteEnv(freshHome),
           });
         } catch (err) {
-          const e = err as { stdout?: string; stderr?: string };
-          throw new Error(`${relPath} failed:\n${e.stdout ?? ''}\n${e.stderr ?? ''}`);
+          throw new Error(formatShellSuiteFailure(relPath, err));
         } finally {
           rmSync(freshHome, { recursive: true, force: true });
         }
