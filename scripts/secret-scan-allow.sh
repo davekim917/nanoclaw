@@ -84,9 +84,13 @@ fi
 # this script never printed anything at all, for any path, ever.
 # `:(literal)` (matching git-safety.sh's own P1-1 fix) turns off pathspec
 # magic, so a path starting with `-` or containing `*`/`:` still matches
-# itself, byte-for-byte, and nothing else. Piped through
-# `LC_ALL=C tr '\000' ' '` for the same NUL-byte reason as git-safety.sh.
-FILE_DIFF=$(git -C "$GROUPS_DIR" diff-index --no-color -p --text \
+# itself, byte-for-byte, and nothing else. `--no-ext-diff --no-textconv`
+# (review-683-r2 P3-3, same reasoning as git-safety.sh's own per-file diff):
+# a repo- or gitattributes-configured diff.external/textconv filter could
+# transform or hide the very line an operator is about to review and
+# allowlist here. Piped through `LC_ALL=C tr '\000' ' '` for the same
+# NUL-byte reason as git-safety.sh.
+FILE_DIFF=$(git -C "$GROUPS_DIR" diff-index --no-color -p --text --no-ext-diff --no-textconv \
   --src-prefix=a/ --dst-prefix=b/ \
   --output-indicator-new="$SECRET_SCAN_NEW_INDICATOR" --output-indicator-old=- --output-indicator-context=' ' \
   HEAD -- ":(literal)$TARGET_PATH" 2>/dev/null | LC_ALL=C tr '\000' ' ')

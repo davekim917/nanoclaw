@@ -212,6 +212,18 @@ line_hash() {
 parse_allowlist_line() {
   PARSED_PATH="" PARSED_HASH="" PARSED_REASON=""
   local line=$1 extra
+  # review-683-r2 P3-5: `IFS=$'\t' read` COLLAPSES adjacent tab delimiters
+  # instead of treating them as empty fields, so a leading tab, a trailing
+  # tab, or a doubled tab between fields (`path<TAB><TAB>hash<TAB>reason`,
+  # `<TAB>path<TAB>hash<TAB>reason`, `path<TAB>hash<TAB>reason<TAB>`) were all
+  # silently accepted as if well-formed — defeating the "rejects an empty
+  # field" claim. Reject those three shapes on the raw line, before the read
+  # split ever runs.
+  case $line in
+    $'\t'* | *$'\t' | *$'\t\t'*)
+      return 1
+      ;;
+  esac
   IFS=$'\t' read -r PARSED_PATH PARSED_HASH PARSED_REASON extra <<<"$line"
   if [ -z "$PARSED_PATH" ] || [ -z "$PARSED_HASH" ] || [ -z "$PARSED_REASON" ] || [ -n "$extra" ]; then
     PARSED_PATH="" PARSED_HASH="" PARSED_REASON=""
@@ -328,7 +340,12 @@ snapshot_repo() { # <repo path> <label>
     h=$(git -C "$w" rev-parse HEAD 2>/dev/null) || continue
     if [ "$(git -C "$repo" rev-list --count "$h" --not --remotes 2>/dev/null || echo 0)" -gt 0 ]; then
       local wslug; wslug=$(slug "$w")
-      local e; e=$(mktemp)
+      # review-683-r2 P3-8: check_err always rm's this on the normal path,
+      # but a SIGTERM/SIGINT landing between mktemp and check_err leaked it
+      # (never in CLEANUP_PATHS, so the EXIT/INT/TERM trap didn't know about
+      # it) — register it the instant it's created, same as every other
+      # scratch path in this file.
+      local e; e=$(mktemp); CLEANUP_PATHS+=("$e")
       git -C "$repo" update-ref "refs/git-safety/detached/$wslug" "$h" 2>"$e"
       check_err "$e" "$label: update-ref for detached worktree at $w"
       live_detached+=("$wslug")
@@ -341,7 +358,9 @@ snapshot_repo() { # <repo path> <label>
   # the moment an entry is popped or a new one is pushed ahead of it.
   local live_stash=()
   while read -r s; do
-    local e; e=$(mktemp)
+    # review-683-r2 P3-8: same leak-on-signal reasoning as the detached-HEAD
+    # loop above.
+    local e; e=$(mktemp); CLEANUP_PATHS+=("$e")
     git -C "$repo" update-ref "refs/git-safety/stash/$s" "$s" 2>"$e"
     check_err "$e" "$label: update-ref for stash entry $s"
     live_stash+=("$s")
@@ -372,7 +391,10 @@ snapshot_repo() { # <repo path> <label>
     [ "$(git -C "$repo" rev-list --count "$r" --not --remotes 2>/dev/null || echo 0)" -gt 0 ] && n=$((n + 1))
   done < <(git -C "$repo" for-each-ref --format='%(refname)' refs/heads refs/git-safety)
   if [ "$n" -gt 0 ]; then
-    local be; be=$(mktemp)
+    # review-683-r2 P3-8: same leak-on-signal reasoning — this one is rm'd
+    # by hand a few lines down rather than via check_err, but a signal
+    # landing before that still leaked it without CLEANUP_PATHS.
+    local be; be=$(mktemp); CLEANUP_PATHS+=("$be")
     if git -C "$repo" bundle create "$dir/unpushed-commits.bundle" --branches --glob='refs/git-safety/*' --not --remotes >/dev/null 2>"$be" &&
        verify_bundle "$dir/unpushed-commits.bundle" "$repo"; then
       say "$label: bundled $n refs holding commits on no remote"
@@ -389,7 +411,8 @@ snapshot_repo() { # <repo path> <label>
     [ -n "$(git -C "$w" status --porcelain 2>/dev/null)" ] || continue
     s=$(slug "$w")
     list="$dir/$s.untracked"
-    local pe; pe=$(mktemp)
+    # review-683-r2 P3-8: same leak-on-signal reasoning as above.
+    local pe; pe=$(mktemp); CLEANUP_PATHS+=("$pe")
     # `diff-index` (not porcelain `diff`): GIT_OPTIONAL_LOCKS=0 does NOT stop
     # `git diff HEAD` from rewriting .git/index when a tracked file is
     # stat-dirty (mtime changed, content identical) — verified empirically
@@ -415,7 +438,8 @@ snapshot_repo() { # <repo path> <label>
         printf '%s\0' "$f"
       done > "$list"
     if [ -s "$list" ]; then
-      local te; te=$(mktemp)
+      # review-683-r2 P3-8: same leak-on-signal reasoning as above.
+      local te; te=$(mktemp); CLEANUP_PATHS+=("$te")
       tar --null -C "$w" -T "$list" -czf "$dir/$s-untracked.tgz" 2>"$te"
       check_err "$te" "$label: tar of untracked files for $w"
     fi
@@ -509,10 +533,23 @@ _commit_groups_impl() { # <scratch index file>
   # `ls-files --deleted` (real index) disagree with what `add -u` is about
   # to stage into the scratch index moments later — silently letting a
   # `git rm`/`git mv` deletion reach host-snapshot unreported.
+  # review-683-r2 P3-2: the same class of bug as P1-1 — a plain newline-
+  # split `ls-files --deleted` quotes a special-byte path (café.md,
+  # d"q.md), and a non-literal `:(exclude)$f` pathspec lets a
+  # pathspec-magic-shaped name (`*`, `[ab]`, `:(exclude)*`) match the WRONG
+  # set of paths or nothing at all — holding a deleted café.md then
+  # committed its deletion anyway (spec §1 violated: a deletion of a held
+  # path must stay held too), a deleted `*` matched every OTHER pending
+  # path as "excluded" and left the run reporting "nothing pending" with
+  # rc=0 while real edits sat unstaged, and a deleted `[ab]` excluded
+  # only a literal file named "a" or "b", not the path actually deleted.
+  # `-z`/NUL-delimited listing plus `:(exclude,literal)` closes all three.
   local deleted=() f
-  while IFS= read -r f; do [ -n "$f" ] && deleted+=("$f"); done < <(GIT_INDEX_FILE="$TMPIDX" git -C "$G" ls-files --deleted)
+  while IFS= read -r -d '' f; do
+    [ -n "$f" ] && deleted+=("$f")
+  done < <(GIT_INDEX_FILE="$TMPIDX" git -C "$G" ls-files --deleted -z)
   local excludes=("${GROUPS_SENSITIVE_EXCLUDES[@]}")
-  for f in "${deleted[@]}"; do excludes+=(":(exclude)$f"); done
+  for f in "${deleted[@]}"; do excludes+=(":(exclude,literal)$f"); done
 
   GIT_INDEX_FILE="$TMPIDX" git -C "$G" add -u -- . "${excludes[@]}" 2>>"$ERR" || {
     FAILURES+=("groups: staging tracked changes into the scratch index failed"); GROUPS_RESULT="failed (add -u)"; return; }
@@ -526,14 +563,6 @@ _commit_groups_impl() { # <scratch index file>
     local dlist; dlist=$(printf '%s, ' "${deleted[@]}")
     say "groups: deleted tracked file(s) NOT committed (kept at last known content; report only): ${dlist%, }"
     NOTICES+=("groups: ${#deleted[@]} tracked file(s) deleted on disk were reported, not committed: ${dlist%, }")
-  fi
-
-  local numstat binfiles
-  numstat=$(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --numstat HEAD 2>>"$ERR")
-  binfiles=$(awk -F'\t' '$1=="-" && $2=="-" {print $3}' <<<"$numstat")
-  if [ -n "$binfiles" ]; then
-    FAILURES+=("groups: refused — binary change(s) in: $(tr '\n' ' ' <<<"$binfiles")")
-    GROUPS_RESULT="refused (binary change)"; return
   fi
 
   # ── #628 item 9: per-file secret-shaped-content hold ──────────────────────
@@ -601,14 +630,19 @@ _commit_groups_impl() { # <scratch index file>
     # turns off ALL pathspec magic — glob wildcards, a leading `:`, a
     # leading `-` that `git diff` would otherwise try to parse as another
     # option — so the path matches byte-for-byte and nothing else, exactly
-    # like the fixed name-listing above requires. Piped through
-    # `LC_ALL=C tr '\000' ' '` (review-683 P3-4) for the same reason #666
-    # applied it to wiki-pre-push-hook.sh: `$(...)` command substitution
-    # silently drops NUL bytes, which can fuse a token with a neighboring
-    # byte and defeat SECRET_RE's boundary anchors; `pipefail` (set at the
-    # top of this file) keeps the `2>>"$ERR"` redirect on git's own
-    # process, and preserves git's own exit status through the pipe.
-    file_diff=$(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --no-color --text --src-prefix=a/ --dst-prefix=b/ \
+    # like the fixed name-listing above requires. `--no-ext-diff
+    # --no-textconv` (review-683-r2 P3-3) refuse a repo- or gitattributes-
+    # configured `diff.external`/textconv filter: either one can rewrite
+    # what this diff shows before SECRET_RE ever sees it — a real secret
+    # could be transformed into something that no longer matches, failing
+    # the scan open. Piped through `LC_ALL=C tr '\000' ' '` (review-683
+    # P3-4) for the same reason #666 applied it to wiki-pre-push-hook.sh:
+    # `$(...)` command substitution silently drops NUL bytes, which can
+    # fuse a token with a neighboring byte and defeat SECRET_RE's boundary
+    # anchors; `pipefail` (set at the top of this file) keeps the
+    # `2>>"$ERR"` redirect on git's own process, and preserves git's own
+    # exit status through the pipe.
+    file_diff=$(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --no-color --text --no-ext-diff --no-textconv --src-prefix=a/ --dst-prefix=b/ \
       --output-indicator-new="$SECRET_SCAN_NEW_INDICATOR" --output-indicator-old=- --output-indicator-context=' ' \
       HEAD -- ":(literal)$path" 2>>"$ERR" | LC_ALL=C tr '\000' ' ')
     added=$(secret_scan_extract_added "$file_diff")
@@ -655,7 +689,14 @@ _commit_groups_impl() { # <scratch index file>
   done
 
   if [ "${#poisoned_paths[@]}" -gt 0 ]; then
-    local poisoned_list; poisoned_list=$(printf '%s, ' "${poisoned_paths[@]}"); poisoned_list=${poisoned_list%, }
+    # review-683-r2 P3-6: these names are TAB/LF/CR-poisoned by definition
+    # (that's why they're in poisoned_paths at all) — printing one raw into
+    # an alert/DM line lets an embedded LF/CR truncate or corrupt the
+    # displayed message (e.g. `new<LF>line.md` shows only "line.md"), and an
+    # embedded TAB reads as a field separator if this text ever gets
+    # re-parsed downstream. `%q`-quote each name so the byte is visible
+    # (`$'new\nline.md'`) instead of silently acting on the display.
+    local poisoned_list; poisoned_list=$(printf '%q, ' "${poisoned_paths[@]}"); poisoned_list=${poisoned_list%, }
     say "groups: ${#poisoned_paths[@]} path(s) with a TAB/LF/CR byte held EVERY run and cannot be allowlisted — rename to resolve: $poisoned_list"
     if [ "$GROUPS_MODE" != "dry" ]; then
       FAILURES+=("groups: ${#poisoned_paths[@]} path(s) with a TAB/LF/CR byte in the name held every run (never allowlistable) — rename: $poisoned_list")
@@ -664,7 +705,11 @@ _commit_groups_impl() { # <scratch index file>
 
   if [ "${#held_paths[@]}" -gt 0 ]; then
     printf '%s' "$held_diffs" > "$OUT/groups-held.patch" 2>/dev/null
-    local held_list; held_list=$(printf '%s, ' "${held_paths[@]}"); held_list=${held_list%, }
+    # review-683-r2 P3-6: same reasoning as poisoned_list above — a held path
+    # isn't always TAB/LF/CR-poisoned, but nothing stops one from being (it's
+    # simply also held rather than exclusively poisoned), so quote every
+    # entry here too rather than assume held names are always print-safe.
+    local held_list; held_list=$(printf '%q, ' "${held_paths[@]}"); held_list=${held_list%, }
     say "groups: ${#held_paths[@]} file(s) held for secret-shaped content: $held_list — diff saved to $OUT/groups-held.patch; release a reviewed line via scripts/secret-scan-allow.sh <path>"
     # Always one stderr line naming the held paths, whether or not this run
     # alerts for them — an unchanged, still-pending hold must still be
@@ -740,6 +785,23 @@ _commit_groups_impl() { # <scratch index file>
     fi
   fi
 
+  # review-683-r2 P3-4: this used to run BEFORE the per-file hold loop, so
+  # refusing here on an unrelated binary change skipped the state rewrite
+  # above entirely — the same class of bug as P2-1 (a real hold's
+  # bookkeeping could go stale while an unrelated binary file kept
+  # refusing every run). Moved to after the hold loop and its state
+  # rewrite, both of which now always run first regardless of whether a
+  # binary change is also present. `--no-ext-diff --no-textconv`
+  # (review-683-r2 P3-3, same reasoning as the per-file diff above) so a
+  # configured filter can't hide a binary change from this check either.
+  local numstat binfiles
+  numstat=$(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --numstat --no-ext-diff --no-textconv HEAD 2>>"$ERR")
+  binfiles=$(awk -F'\t' '$1=="-" && $2=="-" {print $3}' <<<"$numstat")
+  if [ -n "$binfiles" ]; then
+    FAILURES+=("groups: refused — binary change(s) in: $(tr '\n' ' ' <<<"$binfiles")")
+    GROUPS_RESULT="refused (binary change)"; return
+  fi
+
   local n folders
   n=$(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --name-only HEAD | wc -l)
   folders=$(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --name-only HEAD | awk -F/ '{print $1}' | sort -u | tr '\n' ' ')
@@ -767,6 +829,30 @@ _commit_groups_impl() { # <scratch index file>
       GROUPS_RESULT="dry run: would commit $n tracked change(s) in: $folders"
     fi
     return
+  fi
+
+  # review-683-r2 P3-1: a TERM/INT landing while bash is extracting a
+  # `$(...)` during word expansion can make the trap text itself fail to
+  # parse ("unexpected EOF") — the trap never runs at all, so either the
+  # run continues with no idea a signal arrived, or bash aborts outright
+  # ("reader_loop: bad jump", a core dump). Measured empirically: 700 live
+  # runs, 8 lost signals, 6 core dumps, but NONE pushed a wrong tree —
+  # because a run interrupted anywhere before this point never reaches
+  # write-tree at all, and one interrupted AFTER it either already pushed
+  # a real, fully-built tree or never got far enough to push anything.
+  # This guard closes the one class that COULD matter regardless of
+  # whether a trap ran: deletions are excluded from the scratch index by
+  # design (never staged, see the P3-2 comment above) — if the scratch
+  # index went missing, or somehow has a staged deletion anyway (a sign
+  # something left it in an inconsistent, partially-built state), refuse
+  # to write a tree from it rather than trust an unaccountable index.
+  if [ ! -f "$TMPIDX" ]; then
+    FAILURES+=("groups: the scratch index vanished before write-tree — refusing to commit from an unaccountable index")
+    GROUPS_RESULT="failed (missing scratch index)"; return
+  fi
+  if ! GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --no-ext-diff --no-textconv --diff-filter=D --quiet HEAD 2>>"$ERR"; then
+    FAILURES+=("groups: the scratch index has a staged deletion, which never happens by design — refusing to commit from an unaccountable index")
+    GROUPS_RESULT="failed (unexpected staged deletion)"; return
   fi
 
   local tree
