@@ -213,7 +213,7 @@
 ".github/ISSUE_TEMPLATE/documentation.yml":{"diff":64,"mode":"100644","sha256":null,"deleted":true},
 ".github/ISSUE_TEMPLATE/security-hardening.yml":{"diff":95,"mode":"100644","sha256":null,"deleted":true},
 ".github/PULL_REQUEST_TEMPLATE.md":{"diff":85,"mode":"100644","sha256":"2411f696d82cda7e6acaa6b19b6161a8137957004fbcb4e89b5891a87f89e2b9"},
-".github/labeler.yml":{"diff":569,"mode":"100644","sha256":"3d47962100135d544270febe0d6143c4e41a57f74b885cbe338593b79e05424e"},
+".github/labeler.yml":{"diff":630,"mode":"100644","sha256":"c71d0020c6ca4851b7694ed7d78949c3fd778f3a8f3bf52b85aced80d817d8b9"},
 ".github/renovate.json":{"diff":37,"mode":"100644","sha256":null,"deleted":true},
 ".github/workflows/approve-agent-image.yml":{"diff":221,"mode":"100644","sha256":null,"deleted":true},
 ".github/workflows/ci.yml":{"diff":262,"mode":"100644","sha256":"bb4fa93ab310a66316177b4ac097b95d63754e9da3d94837c5e5d1e03f437542"},
