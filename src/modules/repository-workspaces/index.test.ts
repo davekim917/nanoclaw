@@ -627,11 +627,12 @@ describe('durable canonical publication core', () => {
   });
 
   it('sanitizeCanonicalConfig writes core.hooksPath to the one exported MANAGED_GIT_HOOKS_SCAN_DIR constant for a wiki repo, and /dev/null otherwise (#666 review B12/P3-7)', async () => {
-    // Exercises BOTH sanitizeCanonicalConfig call sites: the first publish
-    // (new canonical, no prior .git/config) and a re-publish against an
-    // already-existing, matching canonical (the "existing" branch) — a
-    // writer bug in either path would otherwise silently drop a repo out of
-    // hook coverage (core.hooksPath pointing at a value nothing mounts).
+    // The first publish sanitizes the config and writes core.hooksPath. A
+    // re-publish against the already-existing, matching canonical (the
+    // "existing" branch) must leave that value exactly as written: the branch
+    // is read-only on the canonical (PR #738 review). A writer bug in either path
+    // would otherwise silently drop a repo out of hook coverage (core.hooksPath
+    // pointing at a value nothing mounts).
     for (const repo of ['wiki', 'code']) {
       const expected = repo === 'wiki' ? MANAGED_GIT_HOOKS_SCAN_DIR : '/dev/null';
 
@@ -649,7 +650,7 @@ describe('durable canonical publication core', () => {
       expect(safeGitConfigGet(repositoryConfigPath(path.join(canonical, '.git')), 'core.hooksPath')).toBe(expected);
 
       // Re-publish against the SAME, already-existing, matching canonical —
-      // the "existing" branch's own sanitizeCanonicalConfig call.
+      // the "existing" branch, which must not rewrite the config.
       const retryStage = path.join(root, 'sessions', 'sess-a', 'repository-staging', `hookspath-retry-${repo}`, repo);
       cloneTo(retryStage);
       const retry = await publishStagedCanonical({
@@ -1117,6 +1118,51 @@ describe('durable canonical publication core', () => {
       expect(observed.notices[0]!.text).toContain('clone_repo can be retried');
       expect(fs.existsSync(path.join(stage, '.git'))).toBe(true);
       expect(fs.existsSync(canonicalRepoDir('wg-a', 'proj', hostActionDataDir))).toBe(false);
+    });
+
+    it("leaves a legacy canonical's config, HEAD and index byte- and inode-identical on a re-publish", async () => {
+      // Other threads keep running through a publish and bind the canonical's
+      // config, HEAD and index by file (container-runner.ts:1522-1528). A
+      // re-publish must not replace any of them.
+      const requestId = 'repo-1723600000000-5a4b3c2d1e0f9a8b';
+      await seed();
+      const earlierStage = path.join(hostActionDataDir, 'earlier-request', 'proj');
+      cloneTo(earlierStage);
+      await publishStagedCanonical({
+        workgroupId: 'wg-a',
+        repo: 'proj',
+        origin: remote,
+        repositoryId: remote,
+        stagingPath: earlierStage,
+      });
+      const canonical = canonicalRepoDir('wg-a', 'proj', hostActionDataDir);
+      // A config sanitize would rewrite (a legacy hooksPath, a key it drops) and
+      // a HEAD on a branch, which a checkout --detach would rewrite.
+      git(canonical, ['config', 'core.hooksPath', '/legacy/hooks']);
+      git(canonical, ['config', 'legacy.keep', 'true']);
+      git(canonical, ['checkout', '-q', 'main']);
+      // Hard links hold each file as a bind mount does, so a replaced file
+      // cannot land on a freed inode number and read as unchanged.
+      const held = ['config', 'HEAD', 'index'].map((name) => {
+        const file = path.join(canonical, '.git', name);
+        const link = path.join(hostActionDataDir, `held-${name}`);
+        fs.linkSync(file, link);
+        return { name, file, link, bytes: fs.readFileSync(file) };
+      });
+      const observed = observeThreadScopedPublish(unitFor(requester), unitFor(otherThread));
+      const stage = stageFor(requestId);
+
+      await applyRepositoryPublishAction({ requestId, repo: 'proj', origin: remote, repositoryId: remote }, requester);
+
+      for (const entry of held) {
+        expect(fs.readFileSync(entry.file).equals(entry.bytes), `${entry.name} bytes`).toBe(true);
+        expect(fs.statSync(entry.file).ino, `${entry.name} inode`).toBe(fs.statSync(entry.link).ino);
+      }
+      expect(observed.drained).toEqual([[requester.id, sameThread.id].sort()]);
+      expect(observed.woken).toEqual([[requester.id, sameThread.id].sort()]);
+      expect(observed.notices.map((notice) => notice.id)).toEqual([`repository-publish-complete-${requestId}`]);
+      expect(observed.notices[0]!.text).toContain('proj already matched the workgroup canonical');
+      expect(fs.existsSync(stage)).toBe(false);
     });
   });
 });

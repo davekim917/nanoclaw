@@ -224,11 +224,17 @@ function fsyncDirectories(...directories: string[]): void {
   }
 }
 
-/** Replace container-controlled clone config with the minimal host contract. */
-function sanitizeCanonicalConfig(repoPath: string, expectedOrigin: string): void {
+/**
+ * The read-only half of sanitizeCanonicalConfig: refuse object alternates, a
+ * config origin other than the requested one, and an unsupported object format.
+ * It writes nothing, so it can validate a canonical that live containers mount.
+ */
+function assertCanonicalConfigContract(
+  repoPath: string,
+  expectedOrigin: string,
+): { origin: string; objectFormat: string | null } {
   const config = path.join(repoPath, '.git', 'config');
   const objectsInfo = path.join(repoPath, '.git', 'objects', 'info');
-  fs.mkdirSync(objectsInfo, { recursive: true, mode: 0o700 });
   for (const name of ['alternates', 'http-alternates']) {
     const alternate = path.join(objectsInfo, name);
     try {
@@ -238,7 +244,6 @@ function sanitizeCanonicalConfig(repoPath: string, expectedOrigin: string): void
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-      fs.writeFileSync(alternate, '', { flag: 'wx', mode: 0o600 });
     }
   }
   const origin = safeGitConfigGet(config, 'remote.origin.url');
@@ -248,6 +253,23 @@ function sanitizeCanonicalConfig(repoPath: string, expectedOrigin: string): void
   const objectFormat = safeGitConfigGet(config, 'extensions.objectFormat');
   if (objectFormat && objectFormat !== 'sha1' && objectFormat !== 'sha256') {
     throw new Error(`unsupported repository object format: ${objectFormat}`);
+  }
+  return { origin, objectFormat };
+}
+
+/** Replace container-controlled clone config with the minimal host contract. */
+function sanitizeCanonicalConfig(repoPath: string, expectedOrigin: string): void {
+  const config = path.join(repoPath, '.git', 'config');
+  const objectsInfo = path.join(repoPath, '.git', 'objects', 'info');
+  const { origin, objectFormat } = assertCanonicalConfigContract(repoPath, expectedOrigin);
+  fs.mkdirSync(objectsInfo, { recursive: true, mode: 0o700 });
+  for (const name of ['alternates', 'http-alternates']) {
+    try {
+      fs.writeFileSync(path.join(objectsInfo, name), '', { flag: 'wx', mode: 0o600 });
+    } catch (error) {
+      // Already present, and assertCanonicalConfigContract proved it empty.
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
   }
   const formatVersion = objectFormat === 'sha256' ? '1' : '0';
   const escapedOrigin = normalizeOrigin(origin).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
@@ -348,14 +370,25 @@ export async function publishStagedCanonical(
     input.repo,
     () => {
       if (fs.existsSync(canonical)) {
+        // Read-only on the canonical: validate, discard the staging clone, answer.
+        // Other threads' containers keep running through a publish (#655) and
+        // hold file bind mounts of the canonical's config, HEAD and index
+        // (canonicalGitControlMounts, container-runner.ts:1522-1528), so a
+        // rewrite here changes the canonical under them. A config rewrite also
+        // changes behaviour, not just an inode: spawn mounts the managed hook
+        // only when core.hooksPath already names it (container-runner.ts:1580),
+        // so installing it here would leave running threads of a scan-policy
+        // repository without the hook until they restart. Activation keeps an
+        // adopted canonical's own config on purpose (its only config writes are
+        // the gc keys, repository-activation.ts:538-539). The checks below only
+        // read: assertNormalClone runs rev-parse, and the other checks parse
+        // files. There is no status and no checkout either: the checkout (and
+        // the status that guarded it) only re-detached a canonical that is
+        // detached when it is created, by the staging detach below or by
+        // activation (repository-activation.ts:518).
         assertNormalClone(canonical, 'existing canonical repository');
         validateCloneOrigin(canonical, input.origin);
-        sanitizeCanonicalConfig(canonical, input.origin);
-        if (git(canonical, ['status', '--porcelain=v1', '--untracked-files=all'], 10_000) !== '') {
-          throw new Error('existing canonical repository has local modifications and was left untouched');
-        }
-        const canonicalHead = git(canonical, ['rev-parse', '--verify', 'HEAD^{commit}'], 10_000);
-        git(canonical, ['checkout', '-q', '--detach', canonicalHead], 30_000);
+        assertCanonicalConfigContract(canonical, input.origin);
         assertPinMatchesRequest(
           readOriginPin(input.workgroupId, input.repo, dataDir),
           input,
@@ -412,7 +445,7 @@ export async function publishStagedCanonical(
       // replaces that file through a lock-file rename, which would leave such a
       // container on an orphaned inode. gc.auto and gc.worktreePruneExpire are
       // already in the staging config sanitizeCanonicalConfig wrote above
-      // (the [gc] section, line 269).
+      // (the [gc] section, line 291).
       return { status: 'published' as const, canonicalPath: canonical };
     },
     dataDir,
@@ -1493,9 +1526,9 @@ export async function applyRepositoryPublishAction(content: Record<string, unkno
       affectedSessions = quiescence.sessions;
       // A canonical that already matches takes publishStagedCanonical's
       // existing branch under this same claim: the staging clone is discarded
-      // and the requester is answered. That branch rewrites the canonical's
-      // config and detaches its HEAD with other threads' containers running,
-      // as refresh already does to a live canonical (refreshCanonicalFromLocalRefs).
+      // and the requester is answered. That branch only reads the canonical,
+      // because other threads' containers keep running with its config, HEAD
+      // and index bind-mounted (see the comment there).
       const published = await publishStagedCanonical({ workgroupId, repo, origin, repositoryId, stagingPath });
       const confirmation =
         published.status === 'published'
