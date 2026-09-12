@@ -457,7 +457,7 @@ CREATE INDEX idx_scheduled_audit_unresolved ON scheduled_audit(action, resolved_
 
 ### 1.20 `host_inbound_provenance`
 
-Which `<session>/.host/inbound.db` files **this host created**. One row per session, written by the migration in `src/modules/mailbox/host-inbound.ts` at the moment it `link()`s the database into `.host/`, and checked before that migration will touch an existing one. Added by migration 077.
+Which `<session>/.host/inbound.db` files **this host created**. One row per session, written by the migration in `src/modules/mailbox/host-inbound.ts` at the moment it `link()`s the database into `.host/`, and checked before that migration will touch an existing one. Added by migration 079.
 
 This table exists because no property of the file itself can answer the question. A container can create `.host/` and write its own `inbound.db` there — under a mount set built before the directory existed, `/workspace` is read-write and nothing is overlaid over a path that is not yet there. Ownership is no signal (host and container run as the same uid), mode depends on whichever umask applied, and timestamps are chosen by whoever plants. Content is worse than useless: the attacker authors the schema too, so a zero-row database carrying a hostile `TRIGGER` or `VIEW` on `messages_in`/`delivered` would win any "prefer the non-empty side" tie-break. The only question worth asking is _did this host create it_, and the answer is kept where no container can reach it — the central DB is never mounted.
 

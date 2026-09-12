@@ -1,12 +1,12 @@
 /**
- * Typed accessors over `host_inbound_provenance` (migration 077) — the record
+ * Typed accessors over `host_inbound_provenance` (migration 079) — the record
  * of which `<session>/.host/inbound.db` files THIS HOST created.
  *
  * The table lives in the central DB (`data/v2.db`), which is host-only and
  * never mounted into a container. That is the entire point: a container can
  * create a convincing `.host/inbound.db` on the filesystem — round 2 of #761's
  * review proved it can, under the pre-deploy mount set — but it cannot write a
- * row here, so "the host made this" stays unforgeable. See migration 077 for
+ * row here, so "the host made this" stays unforgeable. See migration 079 for
  * why no content-based or filesystem-based test can answer that question.
  *
  * ASYNC, THROUGH THE LEASE, AND NOT `getRawDb()`. The obvious shape for a gate
@@ -28,7 +28,7 @@ import { withCentralSync, withRawDb } from './central-lease.js';
 export interface HostInboundProvenanceRow {
   agent_group_id: string;
   session_id: string;
-  /** `st_dev` as a decimal string — see migration 077 on why not INTEGER. */
+  /** `st_dev` as a decimal string — see migration 079 on why not INTEGER. */
   device: string;
   /** `st_ino` as a decimal string. */
   inode: string;

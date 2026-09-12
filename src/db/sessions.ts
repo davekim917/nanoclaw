@@ -636,6 +636,18 @@ export async function deletePendingQuestion(questionId: string): Promise<void> {
  * Insert a pending approval row. Idempotent for the same reason as
  * createPendingQuestion: delivery retries with the same approval_id must not
  * fail on UNIQUE before the send step gets a chance to succeed.
+ *
+ * Returns false when `INSERT OR IGNORE` skipped the row. That is also the
+ * RESERVATION signal: a UNIQUE index can make this insert an atomic claim on
+ * a column other than the PK, and `request_choice` relies on exactly that —
+ * migration 078's partial unique index on `request_id` for live choice cards
+ * (src/db/migrations/078-choice-request-reservation.ts). So a false here
+ * means "some other row already holds this request_id", and
+ * `requestApprovalOutcome` (src/modules/approvals/primitive.ts) turns it into
+ * 'duplicate-request' instead of posting a second card. A foreign-key
+ * violation is NOT swallowed by OR IGNORE — SQLite aborts those regardless of
+ * the conflict resolution algorithm — so a false is always a uniqueness
+ * conflict, never a missing parent row.
  */
 export async function createPendingApproval(
   pa: Partial<PendingApproval> &

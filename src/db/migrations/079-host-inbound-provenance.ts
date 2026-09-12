@@ -2,7 +2,7 @@ import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';
 
 /**
- * Migration 077 — `host_inbound_provenance`
+ * Migration 079 — `host_inbound_provenance`
  *
  * WHY. #749 moved the host's `inbound.db` into `<session>/.host/` and overlaid
  * that DIRECTORY read-only, which closes the planted-journal class for every
@@ -52,8 +52,8 @@ import type { Migration } from './index.js';
  * absence is a REFUSAL must never be deleted as a side effect of unrelated
  * cascade behaviour. Removal is explicit, from the mailbox's own `destroy`.
  */
-export const migration077: Migration = {
-  version: 77,
+export const migration079: Migration = {
+  version: 79,
   name: 'host-inbound-provenance',
   up(db: Database.Database) {
     db.exec(`

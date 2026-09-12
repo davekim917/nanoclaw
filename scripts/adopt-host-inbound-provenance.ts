@@ -3,7 +3,7 @@
  * this host's own.
  *
  * WHEN YOU NEED IT. The spawn path refuses to touch a host-owned inbound.db
- * that carries no provenance record in the central DB (migration 077), because
+ * that carries no provenance record in the central DB (migration 079), because
  * a container can create that path itself and adopting it would replace the
  * session's authoritative database. Two legitimate situations produce exactly
  * that shape, and neither is an attack:

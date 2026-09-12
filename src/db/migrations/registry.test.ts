@@ -128,6 +128,8 @@ describe('central migration registry', () => {
       'pending-channel-approvals-cascade',
       'task-run-outcomes',
       'turn-usage-effort',
+      'choice-receipts',
+      'choice-request-reservation',
       'host-inbound-provenance',
     ]);
     const liveSchema = schemaObjects(live);

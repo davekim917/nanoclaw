@@ -46,7 +46,7 @@ const JOURNAL_MAGIC = 'd9d505f920a163d7';
 const roots: string[] = [];
 
 // The migration reads and writes the host's provenance record, which lives in
-// the central DB (migration 077) — so these cases need a real one. A fresh
+// the central DB (migration 079) — so these cases need a real one. A fresh
 // in-memory DB per test also means one case's record can never answer another's
 // question.
 beforeEach(async () => {

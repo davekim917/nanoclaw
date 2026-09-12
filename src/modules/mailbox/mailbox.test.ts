@@ -86,7 +86,7 @@ const message = (id: string, overrides: Partial<InboundMessage> = {}): InboundMe
 });
 
 // A real central DB: `destroy()` forgets the session's host-inbound provenance
-// record there (migration 077), and the migration the destroy case drives reads
+// record there (migration 079), and the migration the destroy case drives reads
 // and writes it too.
 beforeEach(async () => {
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });

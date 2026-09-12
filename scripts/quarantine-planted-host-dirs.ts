@@ -17,7 +17,7 @@
  *
  * AFTER THE DEPLOY THIS SCRIPT IS WRONG. Once the new binary is running, the
  * host itself creates `.host/` for every session it migrates, and those are
- * legitimate — they carry a provenance record (migration 077). Quarantining
+ * legitimate — they carry a provenance record (migration 079). Quarantining
  * them would orphan live mailboxes. This is a one-time pre-deploy step, not a
  * recurring sweep; the standing protection is the provenance gate.
  *

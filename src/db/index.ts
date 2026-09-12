@@ -72,6 +72,13 @@ export {
   deleteContainerConfig,
 } from './container-configs.js';
 export {
+  recordChoiceReceipt,
+  getChoiceReceipt,
+  getChoiceReceiptsByRequestId,
+  type ChoiceReceipt,
+  type ChoiceReceiptRow,
+} from './choice-receipts.js';
+export {
   listDeniedModels,
   getDeniedModel,
   isDeniedModel,

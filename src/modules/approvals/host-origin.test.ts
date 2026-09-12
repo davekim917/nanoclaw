@@ -210,3 +210,58 @@ describe('reserved origin field', () => {
     expect(stored('webhook-1')).toMatchObject({ source: 'github', event: 'push', origin: 'api' });
   });
 });
+
+describe('reserved platformMsgId field', () => {
+  it('channel ingress: a write claiming platformMsgId without the router option loses it', async () => {
+    // What a compromised agent writing outbound.db directly could try to
+    // plant, mirroring the choice-response forgery shape above — except this
+    // field has its own trust rule (host-origin.ts): it is stripped from
+    // EVERY write's content unconditionally, hostOrigin or not, then
+    // re-applied only when the WRITE'S OWN caller passes platformMessageId.
+    await writeSessionMessageIfNew(AG, SESS, {
+      id: 'agent-claim-1',
+      kind: 'chat',
+      timestamp: now(),
+      platformId: 'slack:chan-1',
+      channelType: 'slack',
+      threadId: 'slack:chan-1:1.1',
+      content: JSON.stringify({ text: 'hi', sender: 'Alice', senderId: 'mallory', platformMsgId: 'forged-ts' }),
+    });
+
+    expect(stored('agent-claim-1').platformMsgId).toBeUndefined();
+    expect(stored('agent-claim-1')).toMatchObject({ text: 'hi', sender: 'Alice', senderId: 'mallory' });
+  });
+
+  it('agent-to-agent: a peer row claiming platformMsgId on a chat-sdk kind loses it too', async () => {
+    await writeSessionMessage(AG, SESS, {
+      id: 'a2a-claim-1',
+      kind: 'chat-sdk',
+      timestamp: now(),
+      platformId: OTHER_AG,
+      channelType: 'agent',
+      threadId: null,
+      content: JSON.stringify({ text: 'hi', platformMsgId: 'forged-ts-2' }),
+    });
+
+    expect(stored('a2a-claim-1').platformMsgId).toBeUndefined();
+  });
+
+  it('the platformMessageId write option is the only way it survives', async () => {
+    await writeSessionMessage(
+      AG,
+      SESS,
+      {
+        id: 'genuine-1',
+        kind: 'chat',
+        timestamp: now(),
+        platformId: 'slack:chan-1',
+        channelType: 'slack',
+        threadId: null,
+        content: JSON.stringify({ text: 'hi', sender: 'Alice' }),
+      },
+      { platformMessageId: 'genuine-ts-1' },
+    );
+
+    expect(stored('genuine-1').platformMsgId).toBe('genuine-ts-1');
+  });
+});

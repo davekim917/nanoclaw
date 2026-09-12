@@ -348,7 +348,7 @@ export async function migrateInboundDbToHostDir(
     // mode and timestamps, and inode identity only says "not produced by a
     // linkSync migration", which is also true of the legitimate rolled-back
     // host this branch exists to serve. So the question is answered from the
-    // central DB, which no container can write. See migration 077.
+    // central DB, which no container can write. See migration 079.
     // Which failure is this? A host file that cannot be identified at all is a
     // VANISHED session, not a provenance failure — the reclaim deletes session
     // directories concurrently with this, and callers branch on

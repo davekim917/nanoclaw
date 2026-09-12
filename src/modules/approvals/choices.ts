@@ -24,6 +24,7 @@
  */
 import { registerAnswerCardAction } from '../../answer-cards.js';
 import type { NormalizedOption } from '../../channels/ask-question.js';
+import { recordChoiceReceipt } from '../../db/choice-receipts.js';
 import {
   deletePendingApproval,
   getSession,
@@ -155,6 +156,7 @@ export async function resolveChoice(approval: PendingApproval, selectedOption: s
     userId,
     sessionId: deliveredTo.id,
   });
+  await writeChoiceReceipt(approval, deliveredTo, option, userId);
   await deletePendingApproval(approval.approval_id);
   const name = (await getUser(userId))?.display_name || userId;
   await editChoiceCard(approval, cardText(approval, `✅ ${option.label} — ${name}`));
@@ -179,6 +181,48 @@ export async function retireChoice(approval: PendingApproval, line: string): Pro
 async function liveSession(sessionId: string | null): Promise<Session | undefined> {
   const session = sessionId ? await getSession(sessionId) : undefined;
   return session && session.status === 'active' && session.archived_at == null ? session : undefined;
+}
+
+/**
+ * Write the durable receipt for a resolved choice (migration 077,
+ * choice_receipts) — the external release policy's evidence that THIS card
+ * resolved to THIS value, for THIS user, once the `pending_approvals` row
+ * that carries all three is gone. Best-effort: a write failure here must not
+ * unwind a delivery that already happened, so it is caught and logged, never
+ * thrown — the click stays consumed and the card stays resolved either way.
+ * A consumer that finds no receipt for a request id has to treat it as
+ * unverified and fail closed on its own side; that's the tradeoff for never
+ * reopening an answered card over a receipt-table hiccup.
+ */
+async function writeChoiceReceipt(
+  approval: PendingApproval,
+  deliveredTo: Session,
+  option: NormalizedOption,
+  userId: string,
+): Promise<void> {
+  try {
+    await recordChoiceReceipt({
+      requestId: approval.request_id,
+      approvalId: approval.approval_id,
+      action: approval.action,
+      agentGroupId: approval.agent_group_id,
+      sessionId: deliveredTo.id,
+      platformId: approval.platform_id,
+      threadId: approval.thread_id,
+      platformMessageId: approval.platform_message_id,
+      value: option.value,
+      label: option.label,
+      clickerUserId: userId,
+      resolvedAt: new Date().toISOString(),
+    });
+    // eslint-disable-next-line no-catch-all/no-catch-all -- the answer is already delivered; a receipt-write failure must not reopen the card
+  } catch (err) {
+    log.error('Failed to write choice receipt — answer was still delivered', {
+      approvalId: approval.approval_id,
+      requestId: approval.request_id,
+      err,
+    });
+  }
 }
 
 /**
