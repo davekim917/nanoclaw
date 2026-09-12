@@ -33,6 +33,7 @@ import {
   openOutboundDbWritable,
   sessionDbPathIsGone,
 } from './openers.js';
+import { deleteHostInboundProvenance } from '../../db/host-inbound-provenance.js';
 import { hostInboundDbPathFor, removeHostInboundDir, resolveInboundDbPath } from './host-inbound.js';
 import { ensureNanoclawInboundSchema, ensureSchema } from './schema.js';
 import {
@@ -783,6 +784,11 @@ export class NanoclawAgentMailbox extends SqliteAgentMailbox {
     this.nanoclawMigrated.delete(sessionMailboxPath(key, 'inbound'));
     await super.destroy(key);
     removeHostInboundDir(sessionPath);
+    // The provenance record goes with the file it describes. Leaving it would
+    // mean a later session reusing this (agent group, session id) pair — or a
+    // directory recreated under it — inheriting a record that no longer
+    // describes anything this host created.
+    await deleteHostInboundProvenance(key.agentGroupId, key.sessionId);
   }
 
   /**

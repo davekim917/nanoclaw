@@ -15,7 +15,7 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 
 import {
   assertHostOwnedInboundDb,
@@ -29,17 +29,32 @@ import {
   resolveInboundDbPath,
   sessionDirForInboundDbPath,
 } from './host-inbound.js';
-import { SessionDbMissingError } from './errors.js';
+import { HostInboundProvenanceError, SessionDbMissingError } from './errors.js';
 import { openInboundDb } from './openers.js';
 import { readSessionInbound } from './read-only.js';
 import { INBOUND_SCHEMA } from '../../db/schema.js';
+import { closeDb, initMigratedTestDb } from '../../db/index.js';
+import {
+  fileIdentityOf,
+  readHostInboundProvenance,
+  recordHostInboundProvenance,
+} from '../../db/host-inbound-provenance.js';
 
 const PAGE_SIZE = 4096;
 const JOURNAL_MAGIC = 'd9d505f920a163d7';
 
 const roots: string[] = [];
 
-afterEach(() => {
+// The migration reads and writes the host's provenance record, which lives in
+// the central DB (migration 077) — so these cases need a real one. A fresh
+// in-memory DB per test also means one case's record can never answer another's
+// question.
+beforeEach(async () => {
+  await initMigratedTestDb();
+});
+
+afterEach(async () => {
+  await closeDb();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -48,7 +63,9 @@ function makeLegacySession(label: string): { dataDir: string; agentGroupId: stri
   const dataDir = uniqueTmpRoot(label);
   roots.push(dataDir);
   const agentGroupId = 'ag-1';
-  const sessionId = 'sess-1';
+  // The label, not a fixed id: provenance is keyed by (agent group, session),
+  // so a shared id would let one case's record answer another case's question.
+  const sessionId = label;
   const sess = path.join(dataDir, 'v2-sessions', agentGroupId, sessionId);
   fs.mkdirSync(sess, { recursive: true });
   const db = new Database(legacyInboundDbPathFor(sess));
@@ -61,6 +78,20 @@ function makeLegacySession(label: string): { dataDir: string; agentGroupId: stri
   ).run();
   db.close();
   return { dataDir, agentGroupId, sessionId, sess };
+}
+
+/**
+ * `migrateInboundDbToHostDir` for a fixture, with the session key derived from
+ * the fixture's own path — `<data>/v2-sessions/<agent group>/<session>`.
+ *
+ * Keeps the cases reading as they did before the key became a parameter, and
+ * keeps the key and the directory it names from drifting apart in a fixture.
+ */
+function migrate(sess: string): ReturnType<typeof migrateInboundDbToHostDir> {
+  return migrateInboundDbToHostDir(sess, {
+    agentGroupId: path.basename(path.dirname(sess)),
+    sessionId: path.basename(sess),
+  });
 }
 
 /**
@@ -151,9 +182,9 @@ function rowIds(dbPath: string, table: 'messages_in' | 'delivered'): string[] {
 }
 
 describe('migrateInboundDbToHostDir — #749', () => {
-  it('moves a legacy session onto the host-owned path, keeping the legacy name as the SAME inode', () => {
+  it('moves a legacy session onto the host-owned path, keeping the legacy name as the SAME inode', async () => {
     const { sess } = makeLegacySession('hostinb-migrate');
-    const result = migrateInboundDbToHostDir(sess);
+    const result = await migrate(sess);
 
     expect(result.outcome).toBe('migrated');
     expect(fs.existsSync(hostInboundDbPathFor(sess))).toBe(true);
@@ -166,25 +197,25 @@ describe('migrateInboundDbToHostDir — #749', () => {
     expect(inboundDbIsHostOwned(sess)).toBe(true);
   });
 
-  it('is idempotent — a second call neither moves nor re-links anything', () => {
+  it('is idempotent — a second call neither moves nor re-links anything', async () => {
     const { sess } = makeLegacySession('hostinb-idempotent');
-    migrateInboundDbToHostDir(sess);
+    await migrate(sess);
     const inode = fs.statSync(hostInboundDbPathFor(sess)).ino;
 
-    expect(migrateInboundDbToHostDir(sess).outcome).toBe('already-host-owned');
+    expect((await migrate(sess)).outcome).toBe('already-host-owned');
     expect(fs.statSync(hostInboundDbPathFor(sess)).ino).toBe(inode);
   });
 
-  it('re-links a legacy name that has diverged from the live inode', () => {
+  it('re-links a legacy name that has diverged from the live inode', async () => {
     const { sess } = makeLegacySession('hostinb-relink');
-    migrateInboundDbToHostDir(sess);
+    await migrate(sess);
     // An older binary (or a rolled-back host) provisioning a fresh file over
     // the legacy name would otherwise leave the container reading a DIFFERENT
     // database than the host writes.
     fs.rmSync(legacyInboundDbPathFor(sess));
     fs.writeFileSync(legacyInboundDbPathFor(sess), 'not the live database');
 
-    expect(migrateInboundDbToHostDir(sess).outcome).toBe('relinked');
+    expect((await migrate(sess)).outcome).toBe('relinked');
     expect(fs.statSync(hostInboundDbPathFor(sess)).ino).toBe(fs.statSync(legacyInboundDbPathFor(sess)).ino);
     expect(rowIds(legacyInboundDbPathFor(sess), 'messages_in')).toEqual(['m-real']);
   });
@@ -198,7 +229,7 @@ describe('migrateInboundDbToHostDir — #749', () => {
   // CLASS: callers branch on `SessionDbMissingError` to skip a dead session,
   // and a raw `ENOENT … link` fails their whole tick instead.
 
-  it('reports a session reclaimed before the migrating link as missing, not a raw ENOENT', () => {
+  it('reports a session reclaimed before the migrating link as missing, not a raw ENOENT', async () => {
     const { sess } = makeLegacySession('hostinb-vanish-migrate');
     const legacy = legacyInboundDbPathFor(sess);
     fs.rmSync(legacy);
@@ -206,15 +237,15 @@ describe('migrateInboundDbToHostDir — #749', () => {
     vi.spyOn(fs, 'existsSync').mockImplementation((target) => (String(target) === legacy ? true : realExists(target)));
 
     try {
-      expect(() => migrateInboundDbToHostDir(sess)).toThrow(SessionDbMissingError);
+      await expect(migrate(sess)).rejects.toThrow(SessionDbMissingError);
     } finally {
       vi.restoreAllMocks();
     }
   });
 
-  it('reports a session reclaimed before the RE-LINK as missing too — the stat runs first', () => {
+  it('reports a session reclaimed before the RE-LINK as missing too — the stat runs first', async () => {
     const { sess } = makeLegacySession('hostinb-vanish-relink');
-    migrateInboundDbToHostDir(sess);
+    await migrate(sess);
     // Already host-owned, so the next call takes the re-link branch — which
     // stats BOTH names before it links. Losing the host-owned file there must
     // answer with the same class, not the errno the stat happens to raise.
@@ -226,19 +257,19 @@ describe('migrateInboundDbToHostDir — #749', () => {
     );
 
     try {
-      expect(() => migrateInboundDbToHostDir(sess)).toThrow(SessionDbMissingError);
+      await expect(migrate(sess)).rejects.toThrow(SessionDbMissingError);
     } finally {
       vi.restoreAllMocks();
     }
   });
 
-  it('discards a legacy journal when the database is intact, without replaying it', () => {
+  it('discards a legacy journal when the database is intact, without replaying it', async () => {
     const { sess } = makeLegacySession('hostinb-discard');
     const legacy = legacyInboundDbPathFor(sess);
     const poison = forgedImageOf(legacy, 'discard');
     fs.writeFileSync(`${legacy}-journal`, buildHotJournalRestoringTo(poison));
 
-    const result = migrateInboundDbToHostDir(sess);
+    const result = await migrate(sess);
 
     expect(result.replayedCrashJournal).toBe(false);
     expect(result.removedSidecars).toContain('-journal');
@@ -249,7 +280,7 @@ describe('migrateInboundDbToHostDir — #749', () => {
     expect(rowIds(hostInboundDbPathFor(sess), 'messages_in')).toEqual(['m-real']);
   });
 
-  it('REPLAYS a genuine crash journal when quick_check REPORTS the database torn', () => {
+  it('REPLAYS a genuine crash journal when quick_check REPORTS the database torn', async () => {
     const { sess } = makeLegacySession('hostinb-replay-verdict');
     const legacy = legacyInboundDbPathFor(sess);
     const committed = `${legacy}.committed`;
@@ -270,7 +301,7 @@ describe('migrateInboundDbToHostDir — #749', () => {
     expect(quickCheckOf(legacy)).not.toBe('unreadable');
 
     fs.writeFileSync(`${legacy}-journal`, journal);
-    const result = migrateInboundDbToHostDir(sess);
+    const result = await migrate(sess);
 
     expect(result.replayedCrashJournal).toBe(true);
     // Recovered, not discarded — the authoritative store is whole again.
@@ -278,7 +309,7 @@ describe('migrateInboundDbToHostDir — #749', () => {
     expect(quickCheckOf(hostInboundDbPathFor(sess))).toBe('ok');
   });
 
-  it('REPLAYS a genuine crash journal when the torn database cannot be read at all', () => {
+  it('REPLAYS a genuine crash journal when the torn database cannot be read at all', async () => {
     const { sess } = makeLegacySession('hostinb-replay-unreadable');
     const legacy = legacyInboundDbPathFor(sess);
     const committed = `${legacy}.committed`;
@@ -294,7 +325,7 @@ describe('migrateInboundDbToHostDir — #749', () => {
     expect(quickCheckOf(legacy)).toBe('unreadable');
 
     fs.writeFileSync(`${legacy}-journal`, journal);
-    const result = migrateInboundDbToHostDir(sess);
+    const result = await migrate(sess);
 
     expect(result.replayedCrashJournal).toBe(true);
     expect(rowIds(hostInboundDbPathFor(sess), 'messages_in')).toEqual(['m-real']);
@@ -303,7 +334,7 @@ describe('migrateInboundDbToHostDir — #749', () => {
 });
 
 describe('a journal planted at the container-writable path is never applied — #749', () => {
-  it('CONTROL: the hand-built journal is genuinely hot — an unguarded open replays it', () => {
+  it('CONTROL: the hand-built journal is genuinely hot — an unguarded open replays it', async () => {
     const { sess } = makeLegacySession('hostinb-control');
     const legacy = legacyInboundDbPathFor(sess);
     const poison = forgedImageOf(legacy, 'control');
@@ -321,11 +352,11 @@ describe('a journal planted at the container-writable path is never applied — 
     expect(rowIds(unguarded, 'messages_in')).toContain('forged-wake');
   });
 
-  it('openInboundDb never applies it — the host opens the host-owned path', () => {
+  it('openInboundDb never applies it — the host opens the host-owned path', async () => {
     const { sess } = makeLegacySession('hostinb-openinbound');
     const legacy = legacyInboundDbPathFor(sess);
     const poison = forgedImageOf(legacy, 'openinbound');
-    migrateInboundDbToHostDir(sess);
+    await migrate(sess);
     // The container plants its journal AFTER the session is migrated — the
     // only path it can write, and the one the host no longer resolves.
     fs.writeFileSync(`${legacy}-journal`, buildHotJournalRestoringTo(poison));
@@ -337,11 +368,11 @@ describe('a journal planted at the container-writable path is never applied — 
     expect(rowIds(hostInboundDbPathFor(sess), 'messages_in')).toEqual(['m-real']);
   });
 
-  it('readSessionInbound with recoverJournal never applies it', () => {
+  it('readSessionInbound with recoverJournal never applies it', async () => {
     const fixture = makeLegacySession('hostinb-readonly');
     const legacy = legacyInboundDbPathFor(fixture.sess);
     const poison = forgedImageOf(legacy, 'readonly');
-    migrateInboundDbToHostDir(fixture.sess);
+    await migrate(fixture.sess);
     fs.writeFileSync(`${legacy}-journal`, buildHotJournalRestoringTo(poison));
 
     const seen = readSessionInbound(
@@ -354,10 +385,10 @@ describe('a journal planted at the container-writable path is never applied — 
     expect(rowIds(hostInboundDbPathFor(fixture.sess), 'messages_in')).toEqual(['m-real']);
   });
 
-  it('sweeps the foreign sidecar, so it cannot wedge read-only openers either', () => {
+  it('sweeps the foreign sidecar, so it cannot wedge read-only openers either', async () => {
     const { sess } = makeLegacySession('hostinb-sweep');
     const legacy = legacyInboundDbPathFor(sess);
-    migrateInboundDbToHostDir(sess);
+    await migrate(sess);
     fs.writeFileSync(`${legacy}-journal`, 'planted');
     fs.writeFileSync(`${legacy}-wal`, 'planted');
 
@@ -368,9 +399,9 @@ describe('a journal planted at the container-writable path is never applied — 
 });
 
 describe('a genuine host-crash journal at the host-owned path is still recovered — #749', () => {
-  it('openInboundDb rolls it back, so the uncommitted write is undone rather than kept', () => {
+  it('openInboundDb rolls it back, so the uncommitted write is undone rather than kept', async () => {
     const { sess } = makeLegacySession('hostinb-crash');
-    migrateInboundDbToHostDir(sess);
+    await migrate(sess);
     const hostPath = hostInboundDbPathFor(sess);
 
     // The committed state, then pages from a transaction that never committed.
@@ -396,7 +427,7 @@ describe('a genuine host-crash journal at the host-owned path is still recovered
 });
 
 describe('hostInboundMounts — #749', () => {
-  it('overlays the host-owned DIRECTORY read-only, not merely the file', () => {
+  it('overlays the host-owned DIRECTORY read-only, not merely the file', async () => {
     const { sess } = makeLegacySession('hostinb-mounts');
     const mounts = hostInboundMounts(sess);
 
@@ -415,24 +446,110 @@ describe('hostInboundMounts — #749', () => {
 });
 
 describe('assertHostOwnedInboundDb — #749', () => {
-  it('refuses a spawn while the database still sits where a container could plant a journal', () => {
+  it('refuses a spawn while the database still sits where a container could plant a journal', async () => {
     const { sess } = makeLegacySession('hostinb-failclosed');
 
     // A container is the only thing that can plant a journal, so an
     // unmigrated session must never be the state one is handed.
     expect(() => assertHostOwnedInboundDb(sess, 'sess-1')).toThrow(/host-owned/);
 
-    migrateInboundDbToHostDir(sess);
+    await migrate(sess);
     expect(() => assertHostOwnedInboundDb(sess, 'sess-1')).not.toThrow();
   });
 });
 
 describe('sessionDirForInboundDbPath — #749', () => {
-  it('maps a host-owned path back to the SESSION root, where activity markers belong', () => {
+  it('maps a host-owned path back to the SESSION root, where activity markers belong', async () => {
     const { sess } = makeLegacySession('hostinb-sessiondir');
     // Planting the reclaim-blocking marker on `.host` instead would leave it
     // somewhere resourceRoots() never reads (src/storage-activity.ts:493-496).
     expect(sessionDirForInboundDbPath(hostInboundDbPathFor(sess))).toBe(sess);
     expect(sessionDirForInboundDbPath(legacyInboundDbPathFor(sess))).toBe(sess);
+  });
+});
+
+/**
+ * A container's own `.host/inbound.db`, planted as a DISTINCT inode.
+ *
+ * This is what a container can actually do under a mount set built before
+ * `.host` existed: `/workspace` is bind-mounted read-write and nothing is
+ * overlaid over a directory that is not there yet, so `mkdir` and a write both
+ * succeed and land host-side. A distinct inode is not an accident of the
+ * fixture — it is the shape, and it is exactly what pushes the migration into
+ * the re-link branch that would otherwise adopt it.
+ */
+function plantForeignHostDb(sess: string): string {
+  const poison = forgedImageOf(legacyInboundDbPathFor(sess), 'planted');
+  fs.mkdirSync(hostInboundDirFor(sess), { recursive: true });
+  fs.copyFileSync(poison, hostInboundDbPathFor(sess));
+  return hostInboundDbPathFor(sess);
+}
+
+describe('a host-owned database this host never created is refused — #749 round 2', () => {
+  it('REFUSES a container-planted `.host/inbound.db` instead of adopting it', async () => {
+    const { sess } = makeLegacySession('hostinb-planted');
+    plantForeignHostDb(sess);
+    const genuineInode = fs.statSync(legacyInboundDbPathFor(sess)).ino;
+
+    await expect(migrate(sess)).rejects.toThrow(HostInboundProvenanceError);
+
+    // The genuine database is untouched: still its own inode, still holding the
+    // real row. Without the gate the re-link branch deletes this file and
+    // re-points the legacy name at the planted inode, so these two assertions
+    // are the difference between a refused spawn and a replaced mailbox.
+    expect(fs.statSync(legacyInboundDbPathFor(sess)).ino).toBe(genuineInode);
+    expect(rowIds(legacyInboundDbPathFor(sess), 'messages_in')).toEqual(['m-real']);
+    expect(rowIds(legacyInboundDbPathFor(sess), 'delivered')).toEqual([]);
+  });
+
+  it('names the session and the override in the refusal, so a spawn failure is actionable', async () => {
+    const { sess, sessionId } = makeLegacySession('hostinb-planted-message');
+    plantForeignHostDb(sess);
+
+    await expect(migrate(sess)).rejects.toThrow(new RegExp(sessionId));
+    await expect(migrate(sess)).rejects.toThrow(/adopt-host-inbound-provenance/);
+    await expect(migrate(sess)).rejects.toThrow(/quarantine-planted-host-dirs/);
+  });
+
+  it('records provenance for the file it creates, and passes its own gate next time', async () => {
+    const { sess, agentGroupId, sessionId } = makeLegacySession('hostinb-records');
+
+    expect((await migrate(sess)).outcome).toBe('migrated');
+
+    const row = await readHostInboundProvenance(agentGroupId, sessionId);
+    expect(row).not.toBeNull();
+    // The record names the file that now exists, by identity rather than path.
+    expect(row?.inode).toBe(String(fs.statSync(hostInboundDbPathFor(sess), { bigint: true }).ino));
+    // And the gate it just satisfied lets the next spawn through.
+    expect((await migrate(sess)).outcome).toBe('already-host-owned');
+  });
+
+  it('refuses when the record exists but names a DIFFERENT file — something replaced it', async () => {
+    const { sess, agentGroupId, sessionId } = makeLegacySession('hostinb-stale-record');
+    await migrate(sess);
+    // A record that no longer describes the file on disk is the strongest
+    // negative available: this host created something here, and it is not what
+    // is here now.
+    await recordHostInboundProvenance(agentGroupId, sessionId, { device: '1', inode: '999999999999999999' });
+
+    await expect(migrate(sess)).rejects.toThrow(HostInboundProvenanceError);
+  });
+
+  it('the documented override lets a legitimate restore through', async () => {
+    // A rescue-archive restore: the session directory came back, the central DB
+    // did not. The files are this host's, but the record of creating them is
+    // gone — which is indistinguishable, from the filesystem alone, from a
+    // planted file. `scripts/adopt-host-inbound-provenance.ts` is where the
+    // operator applies what only they can know, and this is what it does.
+    const { sess, agentGroupId, sessionId } = makeLegacySession('hostinb-restore');
+    await migrate(sess);
+    const restored = fileIdentityOf(hostInboundDbPathFor(sess));
+    await recordHostInboundProvenance(agentGroupId, sessionId, { device: '1', inode: '424242' });
+    await expect(migrate(sess)).rejects.toThrow(HostInboundProvenanceError);
+
+    await recordHostInboundProvenance(agentGroupId, sessionId, restored!);
+
+    expect((await migrate(sess)).outcome).toBe('already-host-owned');
+    expect(rowIds(hostInboundDbPathFor(sess), 'messages_in')).toEqual(['m-real']);
   });
 });

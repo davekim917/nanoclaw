@@ -30,6 +30,7 @@ vi.mock('../../log.js', () => ({
 }));
 
 import { getAgentMailbox } from '../../mailbox/index.js';
+import { closeDb, initMigratedTestDb } from '../../db/index.js';
 import type { InboundMessage, MailboxSessionKey } from '../../mailbox/types.js';
 import {
   hostInboundDirFor,
@@ -84,13 +85,18 @@ const message = (id: string, overrides: Partial<InboundMessage> = {}): InboundMe
   ...overrides,
 });
 
-beforeEach(() => {
+// A real central DB: `destroy()` forgets the session's host-inbound provenance
+// record there (migration 077), and the migration the destroy case drives reads
+// and writes it too.
+beforeEach(async () => {
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(DATA_DIR, { recursive: true });
+  await initMigratedTestDb();
 });
 
-afterEach(() => {
+afterEach(async () => {
   vi.restoreAllMocks();
+  await closeDb();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
@@ -1051,7 +1057,7 @@ describe('prepare() provisions but never migrates — #749', () => {
     const sessionPath = path.join(DATA_DIR, 'v2-sessions', key.agentGroupId, key.sessionId);
     getAgentMailbox().prepare(key);
     // Migrate the way the spawn path does, so there IS a `.host/` to remove.
-    migrateInboundDbToHostDir(sessionPath);
+    await migrateInboundDbToHostDir(sessionPath, key);
     expect(fs.existsSync(hostInboundDirFor(sessionPath))).toBe(true);
 
     await getAgentMailbox().destroy(key);

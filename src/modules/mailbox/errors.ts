@@ -31,6 +31,41 @@ export class SessionDbMissingError extends Error {
 }
 
 /**
+ * `<session>/.host/inbound.db` exists, but this host never recorded creating it.
+ *
+ * A container can create that path itself: under a mount set built before the
+ * directory existed, `/workspace` is read-write and nothing is overlaid over
+ * `.host`, so `mkdir` and a write both succeed and land host-side. Adopting
+ * such a file would replace the session's authoritative database wholesale —
+ * worse than the planted-journal defect this layout was introduced to close.
+ *
+ * Nothing in the file can answer "did this host create it", so the answer is
+ * recorded in the central DB, which is never mounted. No record means refuse.
+ *
+ * Deliberately a distinct class: this is not a vanished session and not an
+ * unopenable one, and an operator reading a spawn failure needs to be told
+ * which of the three they have — and what to do about it.
+ */
+export class HostInboundProvenanceError extends Error {
+  constructor(
+    readonly sessionId: string,
+    readonly dbPath: string,
+  ) {
+    super(
+      `Session ${sessionId}: ${dbPath} exists but this host has no provenance record for it; refusing to spawn. ` +
+        `A container can create that path itself, and adopting it would replace the session's authoritative ` +
+        `database. If this host legitimately lost its record — a restore from a rescue archive, or a rebuilt ` +
+        `central DB — adopt the existing files deliberately with ` +
+        `\`pnpm exec tsx scripts/adopt-host-inbound-provenance.ts --all --apply\` (omit --apply to see the plan ` +
+        `first). If this is unexpected, quarantine the ` +
+        `directory with \`pnpm exec tsx scripts/quarantine-planted-host-dirs.ts\`. ` +
+        `See docs/db-session.md, "Provenance, and the override".`,
+    );
+    this.name = 'HostInboundProvenanceError';
+  }
+}
+
+/**
  * A host open found the database file PRESENT but could not open it.
  *
  * The counterpart to `SessionDbMissingError`, and the reason it exists as a

@@ -64,7 +64,7 @@ import { STORAGE_INTERNAL_ENTRY_NAMES, tryRunWithStorageCleanupClaim } from './s
 // read-only (`readonly: true, fileMustExist: true`), never provision, and
 // answer `null` for "could not tell", which every caller treats as
 // fail-closed. Nothing else on the host may open a session DB directly.
-import { sessionMailboxPath } from './modules/mailbox/index.js';
+import { resolveInboundDbPath, sessionMailboxDir, sessionMailboxPath } from './modules/mailbox/index.js';
 import { sessionContextPathFor, sessionsBaseDir, threadsBaseDir, threadWorktreeDir } from './session-manager.js';
 
 const DOCKER_PRUNE_IMAGE_LABEL = 'nanoclaw.commit';
@@ -889,7 +889,14 @@ function dbHasRows(dbPath: string, sql: string, params: unknown[] = []): boolean
  */
 export function sessionHasOpenWork(agentGroupId: string, sessionId: string, sessPath?: string): boolean | null {
   const inbound = dbHasRows(
-    sessPath ? path.join(sessPath, 'inbound.db') : sessionMailboxPath({ agentGroupId, sessionId }, 'inbound'),
+    // The RESOLVER, not the legacy name (#749). A container can still plant
+    // `<session>/inbound.db-journal` beside the legacy hard link, and a hot
+    // journal makes every READ-ONLY open fail — `dbHasRows` catches and returns
+    // `null`, which this function's callers treat exactly like `true`, so the
+    // session becomes permanently unreclaimable. Reading through the resolver
+    // opens `.host/inbound.db` instead, whose directory the container cannot
+    // write, so no planted sidecar can wedge it. Same inode either way.
+    resolveInboundDbPath(sessPath ?? sessionMailboxDir({ agentGroupId, sessionId })),
     `SELECT 1 AS found
        FROM messages_in
       WHERE status IN ('processing', 'pending')

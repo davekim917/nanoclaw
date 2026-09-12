@@ -70,7 +70,12 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 
-import { SessionDbMissingError } from './errors.js';
+import {
+  fileIdentityOf,
+  hostInboundProvenanceMatches,
+  recordHostInboundProvenance,
+} from '../../db/host-inbound-provenance.js';
+import { HostInboundProvenanceError, SessionDbMissingError } from './errors.js';
 
 /**
  * The host-owned directory inside a session directory.
@@ -235,6 +240,21 @@ export function resolveInboundDbPath(sessionPath: string): string {
   return fs.existsSync(legacyInboundDbPathFor(sessionPath)) ? legacyInboundDbPathFor(sessionPath) : hostOwned;
 }
 
+/**
+ * Which session a migration is for.
+ *
+ * Passed explicitly rather than parsed back out of `sessionPath`: the
+ * provenance record this migration writes and checks is keyed by the same
+ * (agent group, session) pair the rest of the central DB uses, and deriving
+ * that from a filesystem path would make the gate depend on the data directory
+ * layout — a path that moves would silently read as "no record", which is a
+ * refusal, for every session at once.
+ */
+export interface HostInboundSessionKey {
+  agentGroupId: string;
+  sessionId: string;
+}
+
 export type InboundMigrationOutcome =
   /** No session directory — nothing to do. */
   | 'no-session'
@@ -296,7 +316,10 @@ function asVanished<T>(dbPath: string, work: () => T): T {
   }
 }
 
-export function migrateInboundDbToHostDir(sessionPath: string): InboundMigrationResult {
+export async function migrateInboundDbToHostDir(
+  sessionPath: string,
+  key: HostInboundSessionKey,
+): Promise<InboundMigrationResult> {
   const result: InboundMigrationResult = { outcome: 'absent', removedSidecars: [], replayedCrashJournal: false };
   if (!fs.existsSync(sessionPath)) return { ...result, outcome: 'no-session' };
 
@@ -310,6 +333,37 @@ export function migrateInboundDbToHostDir(sessionPath: string): InboundMigration
   if (!hostExists && !legacyExists) return result;
 
   if (hostExists) {
+    // PROVENANCE FIRST, before anything below reads or adopts this file.
+    //
+    // A container can create `.host/inbound.db` itself. Under a mount set built
+    // before the directory existed, `/workspace` is read-write and nothing is
+    // overlaid over `.host`, so `mkdir` and a write both succeed and land
+    // host-side — verified in Docker against the production image. Everything
+    // below this line assumes the host-owned file IS the host's; the re-link
+    // branch in particular deletes the legacy file and re-points the name at
+    // whatever inode is here, which for a planted file means adopting the
+    // attacker's database wholesale and orphaning the real one.
+    //
+    // No filesystem signal can separate the two — same uid, attacker-chosen
+    // mode and timestamps, and inode identity only says "not produced by a
+    // linkSync migration", which is also true of the legitimate rolled-back
+    // host this branch exists to serve. So the question is answered from the
+    // central DB, which no container can write. See migration 077.
+    // Which failure is this? A host file that cannot be identified at all is a
+    // VANISHED session, not a provenance failure — the reclaim deletes session
+    // directories concurrently with this, and callers branch on
+    // `SessionDbMissingError` to skip one rather than fail their whole tick.
+    // Ask the filesystem before deciding what to raise, or a reclaimed session
+    // would surface as a security refusal and send an operator hunting a
+    // planted file that was never there.
+    const present = fileIdentityOf(hostPath);
+    if (!present) throw new SessionDbMissingError(hostPath);
+    if (!(await hostInboundProvenanceMatches(key.agentGroupId, key.sessionId, hostPath))) {
+      throw new HostInboundProvenanceError(key.sessionId, hostPath);
+    }
+    // Past the gate the file is known to be this host's, so the inode
+    // comparison below is what it was always honestly written as — a
+    // consistency repair, not a security decision.
     // Already migrated. The only thing left to verify is that the legacy name
     // still points at the LIVE inode: if the two have diverged (a legacy stub
     // recreated by an older binary, or a rolled-back host that provisioned a
@@ -334,6 +388,15 @@ export function migrateInboundDbToHostDir(sessionPath: string): InboundMigration
   // inode from here on. No bytes move, so this is atomic in the only sense
   // that matters — there is no moment at which a reader finds nothing.
   asVanished(legacyPath, () => fs.linkSync(legacyPath, hostPath));
+
+  // Record that THIS HOST created it, immediately — and note where this runs:
+  // inside the migration, which the spawn path calls BEFORE it builds the mount
+  // set and admits the container (`src/container-runner.ts`). A record written
+  // after admission would not be a gate. Every later spawn checks this row
+  // before it will touch the file again.
+  const created = fileIdentityOf(hostPath);
+  if (!created) throw new SessionDbMissingError(hostPath);
+  await recordHostInboundProvenance(key.agentGroupId, key.sessionId, created);
 
   // Now the journal question, and it is the delicate one. A journal sitting at
   // the legacy path is EITHER a genuine crash journal this host owes a replay

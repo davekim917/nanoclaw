@@ -4466,7 +4466,7 @@ export async function buildMounts(
   // stop: no container ever runs against a session whose database still sits
   // in the directory it can write. Fail closed — a spawn that cannot migrate
   // retries rather than coming up unprotected (#749).
-  migrateInboundDbToHostDir(sessDir);
+  await migrateInboundDbToHostDir(sessDir, { agentGroupId: agentGroup.id, sessionId: session.id });
   assertHostOwnedInboundDb(sessDir, session.id);
   mounts.push(...hostInboundMounts(sessDir));
 
