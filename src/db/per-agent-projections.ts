@@ -126,9 +126,13 @@ export function removeStaleProjectionSidecars(dstPath: string): string[] {
   const removed: string[] = [];
   for (const suffix of ['-journal', '-wal', '-shm']) {
     const sidecar = `${dstPath}${suffix}`;
-    if (fs.existsSync(sidecar)) {
-      fs.rmSync(sidecar, { force: true });
+    try {
+      // Unlink the directory entry itself: existsSync follows symlinks and
+      // misses dangling ones, leaving them to obstruct the next SQLite write.
+      fs.unlinkSync(sidecar);
       removed.push(suffix);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     }
   }
   return removed;

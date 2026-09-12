@@ -7,6 +7,7 @@ import {
   buildCentralProjection,
   buildArchiveProjection,
   appendArchiveProjection,
+  removeStaleProjectionSidecars,
   decideArchiveProjectionMode,
   readArchiveScopeSignature,
   ARCHIVE_DEDUP_KEY_SQL,
@@ -1186,6 +1187,85 @@ describe('appendArchiveProjection — foreign hot-journal is never replayed (#66
     const expected = tmpPath('hotjrnl-expected');
     buildArchiveProjection(src, expected, 'ag-test-a', scope);
     expect(contentRows(dst)).toEqual(contentRows(expected));
+  });
+});
+
+describe('removeStaleProjectionSidecars — dangling links (#751)', () => {
+  it('rebuilds and appends with a dangling journal beside the projection', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ncproj-sidecar-'));
+    try {
+      const src = twoSiblingSource('dangling-sidecar-src');
+      const dst = path.join(dir, 'archive.db');
+      const target = path.join(dir, 'absent-target');
+      const scope = ['ag-test-a', 'ag-test-b'];
+      fs.symlinkSync(target, `${dst}-journal`);
+      buildArchiveProjection(src, dst, 'ag-test-a', scope);
+      const before = contentRows(dst);
+      const watermark = maxRowid(src, scope);
+      addArchiveMsg(src, {
+        id: 'sidecar-new-row',
+        agent_group_id: 'ag-test-a',
+        role: 'assistant',
+        sender_id: 'ag-test-a',
+        text: 'new row after cleanup',
+        sent_at: '2026-01-01T10:02:00Z',
+      });
+      fs.symlinkSync(target, `${dst}-journal`);
+      expect(appendArchiveProjection(src, dst, 'ag-test-a', watermark, scope).written).toBe(1);
+      expect(contentRows(dst)).toHaveLength(before.length + 1);
+      expect(fs.existsSync(target)).toBe(false);
+      expect(fs.lstatSync(`${dst}-journal`, { throwIfNoEntry: false })).toBeUndefined();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['-journal', '-wal', '-shm'])('unlinks a dangling %s without creating its target', (suffix) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ncproj-sidecar-'));
+    try {
+      const dst = path.join(dir, 'archive.db');
+      const target = path.join(dir, 'absent-target');
+      fs.symlinkSync(target, `${dst}${suffix}`);
+      expect(fs.existsSync(`${dst}${suffix}`)).toBe(false);
+      expect(fs.lstatSync(`${dst}${suffix}`).isSymbolicLink()).toBe(true);
+
+      expect(removeStaleProjectionSidecars(dst)).toEqual([suffix]);
+      expect(fs.lstatSync(`${dst}${suffix}`, { throwIfNoEntry: false })).toBeUndefined();
+      expect(fs.existsSync(target)).toBe(false);
+      expect(removeStaleProjectionSidecars(dst)).toEqual([]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('unlinks sidecars without modifying an existing symlink target', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ncproj-sidecar-'));
+    try {
+      const dst = path.join(dir, 'archive.db');
+      const target = path.join(dir, 'preserved-target');
+      fs.writeFileSync(target, 'preserve me');
+      fs.symlinkSync(target, `${dst}-journal`);
+      fs.writeFileSync(`${dst}-wal`, 'stale');
+      fs.writeFileSync(`${dst}-shm`, 'stale');
+
+      expect(removeStaleProjectionSidecars(dst)).toEqual(['-journal', '-wal', '-shm']);
+      expect(fs.readFileSync(target, 'utf8')).toBe('preserve me');
+      expect(removeStaleProjectionSidecars(dst)).toEqual([]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('surfaces errors other than a missing sidecar', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ncproj-sidecar-'));
+    try {
+      const dst = path.join(dir, 'archive.db');
+      fs.mkdirSync(`${dst}-journal`);
+      expect(() => removeStaleProjectionSidecars(dst)).toThrow();
+      expect(fs.statSync(`${dst}-journal`).isDirectory()).toBe(true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
