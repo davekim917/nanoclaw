@@ -21,7 +21,7 @@
  * exposing just user-roles/user-dms) is more churn than it's worth. Revisit
  * if either module becomes genuinely optional (see REFACTOR_PLAN open q #3).
  */
-import { normalizeOptions, type RawOption } from '../../channels/ask-question.js';
+import { normalizeOptions, type NormalizedOption, type RawOption } from '../../channels/ask-question.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import {
   createPendingApproval,
@@ -35,6 +35,7 @@ import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { MessagingGroup, PendingApproval, Session } from '../../types.js';
 import { getAdminsOfAgentGroup, getGlobalAdmins, getOwners } from '../permissions/db/user-roles.js';
+import { getUser } from '../permissions/db/users.js';
 import { ensureUserDm, resolveUserChannelType } from '../permissions/user-dm.js';
 
 /**
@@ -501,8 +502,60 @@ export async function editApprovalCard(approval: PendingApproval, newBody: strin
         messageId: approval.platform_message_id,
         text: newBody,
       }),
+      undefined,
+      // Dispatch is exact-key: editing through the bare channel type finds no
+      // adapter at all on an install whose bots are all named instances
+      // (choices.ts editChoiceCard, onecli-approvals.ts editCardResolution).
+      approval.instance ?? approval.channel_type,
     );
   } catch (err) {
     log.warn('Failed to edit approval card', { approvalId: approval.approval_id, err });
   }
+}
+
+/**
+ * How a resolved card reads: the option's own label, and who chose it.
+ *
+ * `selectedOption` is matched against the row's stored options so the card
+ * shows the label it was posted with; a value that matches none renders as
+ * itself. An empty `userId` — the sweep finalizing a hold nobody answered —
+ * drops the byline rather than inventing an actor.
+ */
+export async function approvalResolutionLine(
+  approval: PendingApproval,
+  selectedOption: string,
+  userId: string,
+): Promise<string> {
+  let selectedLabel = selectedOption;
+  try {
+    const parsed: unknown = JSON.parse(approval.options_json);
+    const matched = Array.isArray(parsed)
+      ? (parsed as NormalizedOption[]).find((o) => o?.value === selectedOption)
+      : undefined;
+    if (matched) selectedLabel = matched.selectedLabel || matched.label || selectedOption;
+    // eslint-disable-next-line no-catch-all/no-catch-all -- corrupt metadata just means the raw value is the best label available
+  } catch {
+    /* fall through to the raw value */
+  }
+  const name = userId ? (await getUser(userId))?.display_name || userId : '';
+  return name ? `${selectedLabel} — ${name}` : selectedLabel;
+}
+
+/**
+ * Edit an approval card to show how a click resolved it.
+ *
+ * The bridge edits no approval card on click (chat-sdk-bridge.ts:1176, :2079):
+ * it sees only the id the button carried, so it cannot know the clicked
+ * message was this approval's own card, nor that the clicker may decide it.
+ * The resolution edit happens here instead — addressed to the card the ROW
+ * names, and only once a click has been bound and authorized — so a refused,
+ * unauthorized or losing click leaves every card exactly as it was.
+ */
+export async function editApprovalCardResolution(
+  approval: PendingApproval,
+  selectedOption: string,
+  userId: string,
+): Promise<void> {
+  const resolution = await approvalResolutionLine(approval, selectedOption, userId);
+  await editApprovalCard(approval, [approval.title, approval.question, resolution].filter(Boolean).join('\n\n'));
 }

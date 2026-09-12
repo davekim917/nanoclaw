@@ -1,12 +1,19 @@
 /**
- * Answer cards are not edited by the bridge on click.
+ * No pending_approvals card is edited by the bridge on click.
  *
  * Same harness as chat-sdk-bridge-byline.test.ts: the bridge's real onAction
- * handler, driven through the real Chat SDK dispatch. For an answer card
- * (src/answer-cards.ts) the host edits the card after it has authorized the
- * click and delivered the answer, so the bridge must dispatch without editing:
- * an early "✅ label — clicker" would show an answer that a refused or losing
- * click never gave. Approval cards keep today's edit-then-dispatch.
+ * handler, driven through the real Chat SDK dispatch. All the bridge knows is
+ * the id the button carried — not whether the clicked message is that
+ * approval's own card, nor whether the clicker may decide it — so an edit here
+ * would write the approval's title and question into whatever message was
+ * clicked and label it resolved, moments before the handler refuses the click.
+ * The host edits the card the ROW names once the click is bound and authorized
+ * (modules/approvals/primitive.ts editApprovalCardResolution), so a refused,
+ * unauthorized or losing click leaves every card exactly as it was.
+ *
+ * Answer cards (src/answer-cards.ts) were the first cards to work this way and
+ * are kept here as the case that must not regress; the rule now covers every
+ * approval card, which the last two cases pin.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -104,7 +111,7 @@ async function discordClick(questionId: string): Promise<{ bodies: unknown[]; on
         token: 'token-1',
         data: { custom_id: `ncq:${questionId}:0` },
         member: { user: { id: 'U1' } },
-        message: { embeds: [{ title: 'Release', description: 'Which change ships?' }] },
+        message: { id: 'discord-msg-1', embeds: [{ title: 'Release', description: 'Which change ships?' }] },
       },
     }),
     { name: 'gateway-stub', handleWebhook: vi.fn(async () => new Response('ok')) } as unknown as Adapter,
@@ -152,7 +159,7 @@ describe('chat-sdk-bridge answer cards', () => {
     const { bodies, onAction } = await discordClick('ans-d');
 
     expect(bodies).toEqual([{ type: 6 }]);
-    expect(onAction).toHaveBeenCalledWith('ans-d', 'ship', 'U1');
+    expect(onAction).toHaveBeenCalledWith('ans-d', 'ship', 'U1', 'discord-msg-1');
   });
 
   it('Discord: classifies from the render read too', async () => {
@@ -164,21 +171,21 @@ describe('chat-sdk-bridge answer cards', () => {
     expect(bodies).toEqual([{ type: 6 }]);
   });
 
-  it('Discord: an approval card still gets its UPDATE_MESSAGE', async () => {
+  it('Discord: a plain approval card is acknowledged without an UPDATE_MESSAGE either', async () => {
     await seedCard('appr-d', 'test_approval_card');
 
     const { bodies } = await discordClick('appr-d');
 
-    expect(bodies).toHaveLength(1);
-    expect(bodies[0]).toMatchObject({ type: 7 });
+    // type 6, not 7: nothing of the card's content goes back to the platform.
+    expect(bodies).toEqual([{ type: 6 }]);
   });
 
-  it('still edits an approval card before dispatching it', async () => {
+  it('dispatches a plain approval-card click without editing the clicked message', async () => {
     await seedCard('appr-1', 'test_approval_card');
 
     const { edits, actions } = await click('appr-1');
 
     expect(actions).toEqual(['appr-1:ship:U1']);
-    expect(edits).toHaveLength(1);
+    expect(edits).toEqual([]);
   });
 });

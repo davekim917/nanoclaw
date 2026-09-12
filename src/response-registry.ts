@@ -19,6 +19,12 @@ export interface ResponsePayload {
   channelType: string;
   platformId: string;
   threadId: string | null;
+  /**
+   * Platform id of the message the click was made on. The button names only a
+   * questionId, which any card can carry, so the approvals handler binds a
+   * click to its own card with this. Absent or null when the adapter gave none.
+   */
+  messageId?: string | null;
 }
 
 export type ResponseHandler = (payload: ResponsePayload) => Promise<boolean>;

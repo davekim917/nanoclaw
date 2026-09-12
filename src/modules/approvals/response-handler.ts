@@ -30,7 +30,12 @@ import { hasAdminPrivilege, isGlobalAdmin, isOwner } from '../permissions/db/use
 import { choiceClickAllowed, getChoiceHandler, resolveChoice } from './choices.js';
 import { finalizeReject } from './finalize.js';
 import { ONECLI_ACTION, resolveOneCLIApproval } from './onecli-approvals.js';
-import { getApprovalHandler, notifyApprovalResolved, REJECT_WITH_REASON_VALUE } from './primitive.js';
+import {
+  editApprovalCardResolution,
+  getApprovalHandler,
+  notifyApprovalResolved,
+  REJECT_WITH_REASON_VALUE,
+} from './primitive.js';
 import { armReasonCapture } from './reason-capture.js';
 
 /**
@@ -48,7 +53,42 @@ async function isThreadDelivery(approval: PendingApproval, session: Session): Pr
   return approval.channel_type === mg.channel_type && approval.platform_id === mg.platform_id;
 }
 
+/**
+ * Whether a click was made on this approval's own card: the clicked message
+ * must be the one the host posted, whose id is stored from deliver's return
+ * (primitive.ts:463-465, onecli-approvals.ts:424). Without a stored id there
+ * is nothing to match. A choice card then refuses, because its id is
+ * backfilled just after delivery; any other kind resolves as it did before,
+ * for a row stored without one (primitive.ts:463 skips a deliver that
+ * returned no id).
+ */
+function isClickOnApprovalCard(approval: PendingApproval, payload: ResponsePayload): boolean {
+  if (!approval.platform_message_id) return !getChoiceHandler(approval.action);
+  return payload.messageId === approval.platform_message_id;
+}
+
 export async function handleApprovalsResponse(payload: ResponsePayload): Promise<boolean> {
+  const approval = await getPendingApproval(payload.questionId);
+  if (!approval) return false;
+
+  // Every kind of approval, OneCLI and choice cards included, resolves only
+  // from its own card. The button names just the approval id, and an agent
+  // that writes a raw ask_question row can post a card of its own carrying
+  // that id, and a click on it decodes through the approval's own options
+  // (src/db/sessions.ts:819-824), so it reads as a real answer. Claimed, so
+  // no later handler takes the id either.
+  if (!isClickOnApprovalCard(approval, payload)) {
+    log.warn('Ignoring a click that was not made on the approval card', {
+      approvalId: approval.approval_id,
+      action: approval.action,
+      userId: payload.userId,
+      channelType: payload.channelType,
+      clickedMessageId: payload.messageId ?? null,
+      cardMessageId: approval.platform_message_id,
+    });
+    return true;
+  }
+
   // OneCLI credential approvals — row-keyed resolution first. The 3-arg
   // resolver looks the row up itself and enforces its own cross-tenant
   // approver-set auth (onecli-approvals.ts), so this runs ahead of
@@ -56,10 +96,6 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
   if (await resolveOneCLIApproval(payload.questionId, payload.value, payload.userId ?? '')) {
     return true;
   }
-
-  // DB-backed pending_approvals.
-  const approval = await getPendingApproval(payload.questionId);
-  if (!approval) return false;
 
   if (!(await isAuthorizedApprovalClick(approval, payload))) {
     log.warn('Ignoring unauthorized approval response', {
@@ -183,6 +219,7 @@ async function handleRegisteredApproval(
       action: approval.action,
     });
     await notify(`Your ${approval.action} was approved, but no handler is installed to apply it.`);
+    await editApprovalCardResolution(approval, selectedOption, userId);
     await deletePendingApproval(approval.approval_id);
     await notifyApprovalResolved({ approval, session, outcome: 'approve', userId });
     await requestWake(session, 'approval-response');
@@ -200,6 +237,9 @@ async function handleRegisteredApproval(
     );
   }
 
+  // The bridge edits no approval card on click, so the card still shows live
+  // buttons until this lands (primitive.ts editApprovalCardResolution).
+  await editApprovalCardResolution(approval, selectedOption, userId);
   await deletePendingApproval(approval.approval_id);
   await notifyApprovalResolved({ approval, session, outcome: 'approve', userId });
   await requestWake(session, 'approval-response');
