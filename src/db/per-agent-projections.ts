@@ -985,16 +985,30 @@ export function materializeArchiveProjection(
   let previous = readArchiveProjectionStamp(dstPath);
   let seededFrom: string | null = null;
 
-  // #667: a genuinely fresh session — no local stamp AND no local file — is
-  // the ONLY case eligible for seeding. Every other rebuild trigger (a stale
-  // or mismatched local stamp, a changed scope, an edited row, a deleted
-  // file with a stamp still claiming it) keeps taking the exact path it took
-  // before this change: this block never runs for them, so their fail-closed
-  // behavior is unchanged. A seed candidate whose own stamp is missing,
-  // wrong-version, wrong-agent, wrong-scope, or whose file is gone is never
-  // returned by `findArchiveSeedCandidate` — such a session still lands on a
-  // full build, just like today.
-  if (previous === null && !fs.existsSync(dstPath)) {
+  // #667/#693: any session with NO LOCAL FILE is eligible for seeding —
+  // whether it never had one (a genuinely fresh session, #667) or had one
+  // that is gone now (the storage reclaimer deletes a quiet session's
+  // `archive.db`, `src/storage-manager.ts:1864-1884`, but never its stamp —
+  // `removeArchiveProjectionStamp` appears nowhere in that file, so a
+  // reclaimed session is left with an ORPHAN stamp and no file). The FILE
+  // decides freshness here, not the stamp: a stamp with no file describes
+  // nothing a few lines further down either — `decideArchiveProjectionMode`
+  // would discard it the moment its own `statSync(dstPath)` throws — so
+  // there is no cost to dropping it now and taking the same path a
+  // brand-new session takes. Every other rebuild trigger (a stale or
+  // mismatched local stamp, a changed scope, an edited row) is unaffected:
+  // this block still only runs when the file itself is missing.
+  //
+  // Seed validity never rested on this local stamp in the first place — it
+  // rests on the candidate matching `sameProjectionIdentity` against the
+  // freshly computed `stamp` below, plus `seedArchiveProjectionFrom`'s
+  // post-copy row-label check. Discarding an orphan local stamp touches
+  // neither, so this cannot weaken the isolation boundary #668 established.
+  if (!fs.existsSync(dstPath)) {
+    if (previous !== null) {
+      removeArchiveProjectionStamp(dstPath);
+      previous = null;
+    }
     const candidate = findArchiveSeedCandidate(stamp, dstPath);
     if (candidate) {
       try {
