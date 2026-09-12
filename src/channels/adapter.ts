@@ -102,6 +102,23 @@ export interface InboundEvent {
     isMention?: boolean;
     /** True when the source is a group/channel thread, false for DMs. */
     isGroup?: boolean;
+    /**
+     * The platform's own confirmed message id (e.g. a Slack `ts`) — set ONLY
+     * by genuine adapter ingress, never by an event this host itself
+     * synthesized. `id` above is the routing/dedup key and is set for every
+     * event, synthetic or not; `nativeId` is the narrower, trust-bearing
+     * field the router stamps into a written row's `platformMsgId`
+     * (host-origin.ts), which the runner renders as `platform_msg_id`.
+     *
+     * The one setter is main.ts's `onInbound` callback, and only when the
+     * calling adapter's `channelType` isn't `'cli'` — the CLI adapter's own
+     * "plain chat" path also arrives through `onInbound` (src/channels/cli.ts)
+     * but mints its own `cli-<ms>-<rand>` id, so it is host-synthesized like
+     * every `onInboundEvent` caller (the CLI `to:` admin transport, Discord
+     * slash commands, `ncl messaging-groups send`) — none of which set this
+     * field at all.
+     */
+    nativeId?: string;
   };
   replyTo?: DeliveryAddress;
 }

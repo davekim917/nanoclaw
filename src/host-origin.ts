@@ -27,9 +27,12 @@ export const HOST_ONLY_FIELDS = ['origin', 'event'] as const;
  * `withPlatformMessageId` is the only way it re-enters — called from
  * `writeSessionMessage*` only when the caller passes `platformMessageId`
  * (`WriteSessionMessageOptions`), which in practice is the router's own
- * routed-message write (src/router.ts), the one place that knows the real
- * id. No chat write — an agent's own tool call, an agent-to-agent delivery —
- * can set this field on itself and have it survive.
+ * routed-message write (src/router.ts) passing `event.message.nativeId` —
+ * itself set only by genuine, non-CLI adapter ingress (`main.ts` `onInbound`,
+ * `channels/adapter.ts` `InboundEvent.message.nativeId`), so a CLI-transport,
+ * Discord-slash, or `messaging-groups send` event carries no id at all. No
+ * chat write — an agent's own tool call, an agent-to-agent delivery — can set
+ * this field on itself and have it survive.
  */
 export const PLATFORM_MSG_ID_FIELD = 'platformMsgId';
 

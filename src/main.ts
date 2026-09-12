@@ -942,6 +942,12 @@ export async function main(): Promise<void> {
             timestamp: message.timestamp,
             isMention: message.isMention,
             isGroup: message.isGroup,
+            // Trust-bearing only for genuine platform ingress. The CLI
+            // adapter's own "plain chat" path also arrives through
+            // `onInbound` (src/channels/cli.ts) but mints a host-synthesized
+            // `cli-<ms>-<rand>` id, so it is excluded the same as every
+            // `onInboundEvent` caller below (adapter.ts InboundEvent.message.nativeId).
+            nativeId: adapter.channelType === 'cli' ? undefined : message.id,
           },
         }).catch((err) => {
           log.error('Failed to route inbound message', { channelType: adapter.channelType, err });

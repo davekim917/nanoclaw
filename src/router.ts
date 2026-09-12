@@ -1570,7 +1570,15 @@ async function deliverToAgent(
     // exact message it was answering. This is the one write in the codebase
     // that may set it (host-origin.ts PLATFORM_MSG_ID_FIELD); every other
     // caller of writeSessionMessage/writeSessionMessageIfNew leaves it unset.
-    { platformMessageId: event.message.id },
+    //
+    // event.message.id is the routing/dedup key and is set for EVERY event,
+    // including ones this host synthesized (the CLI `to:` admin transport,
+    // Discord slash commands, `ncl messaging-groups send`, and CLI's own
+    // "plain chat"). Only event.message.nativeId is trust-bearing: it is set
+    // solely by main.ts's onInbound for genuine, non-CLI adapter ingress
+    // (adapter.ts InboundEvent.message.nativeId) — undefined here for every
+    // synthetic path, so no stamp is written for them.
+    { platformMessageId: event.message.nativeId },
   );
   if (!inserted) {
     if (wake) stopTypingRefresh(session.id);
