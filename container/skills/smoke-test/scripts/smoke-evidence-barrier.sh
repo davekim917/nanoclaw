@@ -434,7 +434,8 @@ while IFS= read -r marker; do
   # marker yet, and the reason to give is the redispatch, not "still running".
   if lane_stale_after_refreeze "$lane_id"; then
     INVALID+=("$marker")
-    INVALID_REASONS+=("$marker: not redispatched since the pair re-freeze (contract generation $(expected_generation "$lane_id") is not above the refreeze snapshot) — its evidence predates the current pair; run smoke-run-scaffold.sh redispatch $lane_id, then re-run the lane")
+    printf -v redispatch_command '%q redispatch %q %q' "$SCRIPT_DIR/smoke-run-scaffold.sh" "$RUN_DIR" "$lane_id"
+    INVALID_REASONS+=("$marker: not redispatched since the pair re-freeze (contract generation $(expected_generation "$lane_id") is not above the refreeze snapshot) — its evidence predates the current pair; run $redispatch_command, then re-run the lane")
     continue
   fi
 
