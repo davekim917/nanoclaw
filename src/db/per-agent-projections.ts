@@ -84,6 +84,56 @@ const ARCHIVE_SCHEMA_SQL = `
   END;
 `;
 
+/**
+ * Remove any rollback-journal or WAL sidecars sitting next to a projection
+ * before the host opens the file read-write. Returns the suffixes it deleted.
+ *
+ * WHY THIS EXISTS. The session directory is bind-mounted READ-WRITE into every
+ * container at `/workspace` (`src/container-runner.ts:4439`); only `archive.db`
+ * itself is re-overlaid read-only on top (`:4812`). So a container can freely
+ * create `archive.db-journal` / `-wal` / `-shm` in that directory even though
+ * it cannot alter `archive.db`'s own bytes. SQLite treats a well-formed
+ * rollback journal found beside an EXISTING, non-empty database as a HOT
+ * journal and rolls it back on the next read-write open, writing the journal's
+ * saved page images into the database. Those page images are attacker-chosen:
+ * a rollback journal carries no binding to the identity of the database it
+ * belongs to — its per-page checksums are seeded by a nonce in the journal's
+ * own header — so a journal hand-built by a container (which can read the
+ * read-only `archive.db` to match its page size and layout) is replayed
+ * verbatim into the host-owned projection. Verified against better-sqlite3
+ * 11.10.0. #668's seeding (`seedArchiveProjectionFrom`) would then copy the
+ * poisoned projection into the same agent's other sessions.
+ *
+ * WHY DELETING IS SAFE. The host is the SOLE legitimate writer of a projection
+ * and never opens one file twice concurrently (the projection worker
+ * serializes builds — `src/db/archive-projection-worker.ts`). Every host write
+ * ends by closing its better-sqlite3 connection, which under the default
+ * `journal_mode = DELETE` removes the journal — so no legitimate sidecar
+ * survives between spawns. The only way a genuine hot journal can exist is a
+ * host CRASH mid-append; but `materializeArchiveProjection` removes the
+ * freshness stamp BEFORE it appends and rewrites it only on success, so a crash
+ * leaves NO stamp, `decideArchiveProjectionMode` returns 'rebuilt', and
+ * `buildArchiveProjection` unlinks and rebuilds the file from the canonical
+ * source — a crash journal is discarded, never replayed. Deleting a sidecar
+ * here therefore only ever throws away an untrusted, container-planted file.
+ *
+ * The full-rebuild open is already safe on its own — it unlinks the db first,
+ * so SQLite opens a zero-page database and treats any leftover journal as stale
+ * rather than hot — but calling this at BOTH write opens closes the whole class
+ * structurally instead of resting on that SQLite implementation detail.
+ */
+export function removeStaleProjectionSidecars(dstPath: string): string[] {
+  const removed: string[] = [];
+  for (const suffix of ['-journal', '-wal', '-shm']) {
+    const sidecar = `${dstPath}${suffix}`;
+    if (fs.existsSync(sidecar)) {
+      fs.rmSync(sidecar, { force: true });
+      removed.push(suffix);
+    }
+  }
+  return removed;
+}
+
 const ARCHIVE_COLS = [
   'id',
   'agent_group_id',
@@ -121,6 +171,7 @@ export function buildArchiveProjection(
   agentGroupId: string,
   workgroupMemberIds?: string[],
 ): number {
+  removeStaleProjectionSidecars(dstPath);
   if (fs.existsSync(dstPath)) fs.unlinkSync(dstPath);
   const dst = new Database(dstPath);
   try {
@@ -862,6 +913,10 @@ export function appendArchiveProjection(
     src.close();
   }
 
+  // Discard any container-planted rollback/WAL sidecar before opening the
+  // existing projection read-write; otherwise SQLite would replay it as a hot
+  // journal and inject attacker-chosen pages. See removeStaleProjectionSidecars.
+  removeStaleProjectionSidecars(dstPath);
   const dst = new Database(dstPath);
   try {
     const colList = ARCHIVE_COLS.join(', ');
