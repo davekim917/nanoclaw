@@ -152,6 +152,14 @@ export interface PullRequestData {
    * `buildWeeklyRow` reclassifies such a PR as pre-gate regardless of its `mergedAt`.
    */
   preGateOverride?: boolean;
+  /**
+   * Set instead of `atMergeContext` when the merge commit's diff hit `fileDiffAtMergeLocal`'s
+   * `'over-cap'` case (>=300 changed files) — the gate answers `review` deterministically
+   * there (`codex-review.sh:764`), with no file/label evaluation needed at all, so there is
+   * no real `AtMergeContext` to build. `buildWeeklyRow` reads this BEFORE
+   * `classifyAtMergeVerdict`, treating the PR as resolved with this forced verdict.
+   */
+  atMergeForcedVerdict?: 'review';
 }
 
 /**
@@ -1233,11 +1241,15 @@ function buildWeeklyRow(
   // here on its own: it would silently fold every unresolved PR into `reviewed`,
   // contradicting `postGateUnresolved`'s own contract ("neither reviewed nor skipped").
   // So resolution is checked FIRST, before the verdict is even asked for.
-  const isResolved = (pr: PullRequestData): boolean => pr.atMergeContext != null;
-  const reviewedPRs = postGatePRs.filter(
-    (pr) => isResolved(pr) && classifyAtMergeVerdict(pr.atMergeContext) === 'review',
-  );
-  const skippedPRs = postGatePRs.filter((pr) => isResolved(pr) && classifyAtMergeVerdict(pr.atMergeContext) === 'skip');
+  // `atMergeForcedVerdict` (set for the >=300-file `'over-cap'` case — see its own doc
+  // comment on `PullRequestData`) is itself a RESOLVED verdict with no `AtMergeContext`
+  // behind it, so it is checked ahead of `classifyAtMergeVerdict` rather than folded into
+  // "unresolved" for lack of one.
+  const isResolved = (pr: PullRequestData): boolean => pr.atMergeContext != null || pr.atMergeForcedVerdict != null;
+  const verdictOf = (pr: PullRequestData): 'skip' | 'review' =>
+    pr.atMergeForcedVerdict ?? classifyAtMergeVerdict(pr.atMergeContext);
+  const reviewedPRs = postGatePRs.filter((pr) => isResolved(pr) && verdictOf(pr) === 'review');
+  const skippedPRs = postGatePRs.filter((pr) => isResolved(pr) && verdictOf(pr) === 'skip');
   const postGateUnresolved = postGatePRs.filter((pr) => !isResolved(pr)).length;
 
   const preGateLowRisk = preGatePRs.filter((pr) => isLowRisk(pr.files, riskHighGlobs)).length;
@@ -1515,7 +1527,91 @@ export function generatedFileChangedLines(entries: readonly ResolvedFileEntry[])
   return entries.filter((e) => GENERATED_FILES.has(e.path)).reduce((sum, e) => sum + e.additions + e.deletions, 0);
 }
 
-export function fetchMergedPRs(repo: string, sinceIso: string): PullRequestData[] {
+function toPullRequestData(repo: string, pr: RawPr): PullRequestData {
+  const fileEntries = resolveFileEntries(repo, pr);
+  return {
+    number: pr.number,
+    title: pr.title,
+    body: pr.body ?? '',
+    mergedAt: pr.mergedAt,
+    files: fileEntries.map((f) => f.path),
+    labels: (pr.labels ?? []).map((label) => label.name),
+    baseRefName: pr.baseRefName,
+    changedLines: Math.max(0, pr.additions + pr.deletions - generatedFileChangedLines(fileEntries)),
+    changedFiles: pr.changedFiles,
+    mergeCommitOid: pr.mergeCommit?.oid ?? null,
+    headRefOid: pr.headRefOid,
+  };
+}
+
+export interface MergedPrSearchSlice {
+  startIso: string;
+  endIso: string;
+}
+
+/**
+ * Splits `[sinceIso, untilIso]` (both inclusive) into ISO-week-aligned slices for
+ * GitHub's `merged:<start>..<end>` search qualifier (itself an inclusive range) — no
+ * gap, no overlap, and the partial first and last weeks truncated to the requested
+ * bounds. Reuses `isoWeekKey`/`isoWeekDateRange` (the same week grid `computeWeeklyReport`
+ * buckets by), so a slice boundary always lands exactly on another slice's boundary:
+ * each week after the first starts at 00:00:00.000 the millisecond after the previous
+ * week's 23:59:59.999 end (`isoWeekDateRange`'s own contract).
+ *
+ * This exists because GitHub's search API caps results at 1,000 per query regardless of
+ * `--limit` (docs.github.com/en/rest/search/search#about-search) — this repo's weekly
+ * window already holds 348 PRs and grows ~130-180/week, so one unbounded `merged:>=X`
+ * query (the previous shape) silently truncates around Oct 12-19, 2026, right on top of
+ * the Oct 10 before/after read this file exists to produce. A single ISO week landing at
+ * or above the cap is still possible (a merge storm); `fetchMergedPrsForSlice`/
+ * `combineMergedPrSlices` fail loudly in that case rather than accept a truncated slice.
+ */
+export function computeMergedSearchSlices(sinceIso: string, untilIso: string): MergedPrSearchSlice[] {
+  const untilMs = new Date(untilIso).getTime();
+  let cursorMs = new Date(sinceIso).getTime();
+  const slices: MergedPrSearchSlice[] = [];
+  while (cursorMs <= untilMs) {
+    const { endIso: weekEndIso } = isoWeekDateRange(isoWeekKey(new Date(cursorMs).toISOString()));
+    const weekEndMs = new Date(weekEndIso).getTime();
+    const sliceEndMs = Math.min(weekEndMs, untilMs);
+    slices.push({ startIso: new Date(cursorMs).toISOString(), endIso: new Date(sliceEndMs).toISOString() });
+    cursorMs = sliceEndMs + 1;
+  }
+  return slices;
+}
+
+/**
+ * Merges each search slice's already-fetched PRs into one de-duplicated list, keyed by
+ * PR number. `computeMergedSearchSlices`' slices never overlap, so no PR should ever
+ * appear in two slices, but de-duping is a costless safety net — including for the one
+ * real edge case, a PR whose `mergedAt` lands exactly on a slice boundary, which must be
+ * counted once either way.
+ *
+ * Fails LOUDLY — throws, never silently truncates — the instant any single slice's raw
+ * result count reaches GitHub's 1,000-result search cap: past that point `gh`/GitHub's
+ * search returns exactly 1,000 rows and no error at all (see `computeMergedSearchSlices`'
+ * own comment), so this is the only place left that can catch it before `n` and every
+ * rate built on it go quietly wrong.
+ */
+export function combineMergedPrSlices(
+  sliceResults: readonly { slice: MergedPrSearchSlice; prs: readonly PullRequestData[] }[],
+): PullRequestData[] {
+  const byNumber = new Map<number, PullRequestData>();
+  for (const { slice, prs } of sliceResults) {
+    if (prs.length >= 1000) {
+      throw new Error(
+        `review-outcomes: fetchMergedPRs: search slice merged:${slice.startIso}..${slice.endIso} returned ` +
+          `${prs.length} pull requests — GitHub's search API caps results at 1,000 per query and returns no error ` +
+          `past that point, so this slice is likely truncated and silently wrong. Raising --limit cannot fix this; ` +
+          `the window needs finer slicing than one ISO week for this period.`,
+      );
+    }
+    for (const pr of prs) byNumber.set(pr.number, pr);
+  }
+  return [...byNumber.values()];
+}
+
+function fetchMergedPrsForSlice(repo: string, slice: MergedPrSearchSlice): PullRequestData[] {
   const raw = gh([
     'pr',
     'list',
@@ -1524,29 +1620,24 @@ export function fetchMergedPRs(repo: string, sinceIso: string): PullRequestData[
     '--state',
     'merged',
     '--search',
-    `merged:>=${sinceIso}`,
+    `merged:${slice.startIso}..${slice.endIso}`,
     '--json',
     'number,title,body,mergedAt,changedFiles,files,labels,baseRefName,additions,deletions,headRefOid,mergeCommit',
     '--limit',
     '1000',
   ]);
   const prs = JSON.parse(raw) as RawPr[];
-  return prs.map((pr) => {
-    const fileEntries = resolveFileEntries(repo, pr);
-    return {
-      number: pr.number,
-      title: pr.title,
-      body: pr.body ?? '',
-      mergedAt: pr.mergedAt,
-      files: fileEntries.map((f) => f.path),
-      labels: (pr.labels ?? []).map((label) => label.name),
-      baseRefName: pr.baseRefName,
-      changedLines: Math.max(0, pr.additions + pr.deletions - generatedFileChangedLines(fileEntries)),
-      changedFiles: pr.changedFiles,
-      mergeCommitOid: pr.mergeCommit?.oid ?? null,
-      headRefOid: pr.headRefOid,
-    };
-  });
+  return prs.map((pr) => toPullRequestData(repo, pr));
+}
+
+export function fetchMergedPRs(
+  repo: string,
+  sinceIso: string,
+  nowIso: string = new Date().toISOString(),
+): PullRequestData[] {
+  const slices = computeMergedSearchSlices(sinceIso, nowIso);
+  const sliceResults = slices.map((slice) => ({ slice, prs: fetchMergedPrsForSlice(repo, slice) }));
+  return combineMergedPrSlices(sliceResults);
 }
 
 // ─────────────────────────── at-merge replay (I/O) ─────────────────────────
@@ -1628,25 +1719,52 @@ export type LabelerReadResult =
   | { kind: 'missing' } // the commit resolves locally, but the path doesn't exist in its tree
   | { kind: 'error' }; // the commit doesn't resolve locally, or the file exists but is unparseable/wrong-shaped
 
+/** Whether `path` exists in `sha`'s tree — `git cat-file -e <sha>:<path>`, which only
+ *  asks "is there an object at this tree path", never reads or decodes its content. Kept
+ *  separate from `git show <sha>:<path>` (which DOES read content) so
+ *  `readRiskHighGlobsAtShaLocal` can tell "this path never existed here" apart from "the
+ *  path resolves but its content couldn't be read" (a partial/lazy checkout that has the
+ *  tree entry but not the blob itself, for instance) — see that function's own doc
+ *  comment for why the two must not collapse into the same answer. */
+function labelerPathExistsAtSha(sha: string): boolean {
+  try {
+    execFileSync('git', ['cat-file', '-e', `${sha}:.github/labeler.yml`], { stdio: 'ignore' });
+    return true;
+    // eslint-disable-next-line no-catch-all/no-catch-all
+  } catch {
+    return false;
+  }
+}
+
 /**
  * `risk:high` from `.github/labeler.yml` at commit `sha`, read from the LOCAL git
  * object database (`git show <sha>:.github/labeler.yml`) — never GitHub's `contents`
  * API, and never the current tip. `'missing'` (the commit itself is real, but the file
  * isn't in its tree — a PR merged before `.github/labeler.yml` itself landed) is a
- * DIFFERENT answer from `'error'` (the commit isn't resolvable locally at all, or the
- * file exists but doesn't parse): `resolveAtMergeContexts` reclassifies a `'missing'`
- * result as pre-gate (`preGateOverride`), belt-and-braces alongside the pinned
- * `GATE_GO_LIVE_ISO`, but an `'error'` stays unresolved — a shallow clone or a
- * force-pushed-away base is a real gap in what we can tell, not evidence of anything.
+ * DIFFERENT answer from `'error'` (the commit isn't resolvable locally at all, the path
+ * exists but its content can't be read, or the file exists but doesn't parse):
+ * `resolveAtMergeContexts` reclassifies a `'missing'` result as pre-gate
+ * (`preGateOverride`), belt-and-braces alongside the pinned `GATE_GO_LIVE_ISO`, but an
+ * `'error'` stays unresolved — a shallow clone or a force-pushed-away base is a real gap
+ * in what we can tell, not evidence of anything.
+ *
+ * `labelerPathExistsAtSha` (`git cat-file -e`) is checked BEFORE `git show`: the two can
+ * diverge (a path whose tree entry exists but whose content is unreadable — a partial
+ * checkout missing that blob, for instance) — treating every `git show` failure as
+ * "missing" would silently reclassify that gap as pre-gate, exactly like a genuinely
+ * absent file, instead of failing closed to `'error'`/unresolved.
  */
 export function readRiskHighGlobsAtShaLocal(sha: string): LabelerReadResult {
   if (!commitExistsLocally(sha)) return { kind: 'error' };
+  if (!labelerPathExistsAtSha(sha)) return { kind: 'missing' };
   let raw: string;
   try {
     raw = git(['show', `${sha}:.github/labeler.yml`]);
     // eslint-disable-next-line no-catch-all/no-catch-all
   } catch {
-    return { kind: 'missing' };
+    // The path exists (checked above) but its content could not be read — a genuine gap
+    // (see the doc comment above), never "never existed here".
+    return { kind: 'error' };
   }
   try {
     return { kind: 'found', globs: globsForRiskHigh(parse(raw) as Record<string, unknown>) };
@@ -1656,52 +1774,80 @@ export function readRiskHighGlobsAtShaLocal(sha: string): LabelerReadResult {
   }
 }
 
-/** One line of `git diff --name-status -M` output, split apart. `previousPath` is set
- *  only for a rename/copy (`status` starting `R`/`C`), which `git` reports as
- *  `<status>\t<old>\t<new>`; every other status is `<status>\t<path>`. */
+/** One field-run of `git diff --name-status -M -z` output, split apart. `previousPath`
+ *  is set only for a rename/copy (`status` starting `R`/`C`), which `-z` reports as
+ *  THREE consecutive NUL-terminated fields (`<status>\0<old>\0<new>\0`); every other
+ *  status is TWO (`<status>\0<path>\0`). `-z` is load-bearing, not cosmetic: WITHOUT it,
+ *  `core.quotePath` (on by default) makes git wrap any path containing a byte >= 0x80 in
+ *  C-style double quotes with octal escapes, and a tab/newline-based parser keeps those
+ *  quotes and escapes verbatim in the parsed path — silently missing a risk:high glob
+ *  match for any such path. `-z` disables that quoting entirely: every field here is the
+ *  raw path, unescaped. */
 export interface GitDiffEntry {
   status: string;
   path: string;
   previousPath?: string;
 }
 
-/** Pure parse of `git diff --name-status -M`'s raw stdout — no git invocation, so this
- *  is unit-testable with plain strings. */
+/** Pure parse of `git diff --name-status -M -z`'s raw stdout (NUL-separated fields, no
+ *  git invocation) — so this is unit-testable with plain strings, including ones with
+ *  literal non-ASCII bytes exactly as `-z` hands them back, unquoted. */
 export function parseGitNameStatus(raw: string): GitDiffEntry[] {
+  const fields = raw.split('\0');
+  if (fields.length > 0 && fields[fields.length - 1] === '') fields.pop(); // trailing NUL terminator
   const entries: GitDiffEntry[] = [];
-  for (const line of raw.split('\n')) {
-    if (line.trim() === '') continue;
-    const parts = line.split('\t');
-    const status = parts[0] ?? '';
+  let i = 0;
+  while (i < fields.length) {
+    const status = fields[i] ?? '';
+    i += 1;
     if (status.startsWith('R') || status.startsWith('C')) {
-      entries.push({ status, previousPath: parts[1] ?? '', path: parts[2] ?? '' });
+      entries.push({ status, previousPath: fields[i] ?? '', path: fields[i + 1] ?? '' });
+      i += 2;
     } else {
-      entries.push({ status, path: parts[1] ?? '' });
+      entries.push({ status, path: fields[i] ?? '' });
+      i += 1;
     }
   }
   return entries;
 }
 
 /**
- * The merge commit's diff against `baseSha`, from LOCAL git (`git diff --name-status -M`)
- * — mirroring `codex-review.sh scope_eval`'s own completeness rule (`codex-review.sh
- * :756-760`) even though a local diff has no true 300-file cap: if the listed count
- * doesn't match GitHub's own `changedFiles` for this PR, OR reaches 300, the listing is
- * treated as incomplete/suspect the same way the gate's own REST-capped comparison
- * would be — `null` (fail closed), never a partial list read as the whole truth.
+ * The merge commit's diff against `baseSha`, from LOCAL git (`git diff --name-status -M
+ * -z` — see `GitDiffEntry`'s own doc comment for why `-z`) — mirroring `codex-review.sh
+ * scope_eval`'s own completeness rule (`codex-review.sh:756-767`) even though a local
+ * diff has no true 300-file cap of its own: if the listed count doesn't match GitHub's
+ * own `changedFiles` for this PR, the listing is treated as incomplete/suspect the same
+ * way the gate's own REST-capped comparison would be — `null` (fail closed), never a
+ * partial list read as the whole truth.
+ *
+ * `'over-cap'` is a DIFFERENT answer from `null`, for a count that reaches 300: GitHub's
+ * own `compare` endpoint the gate reads truncates at exactly 300 files
+ * (docs.github.com/en/rest/commits/commits#compare-two-commits), so `scope_eval`'s own
+ * `$listed >= 300` check (`codex-review.sh:764`) ALWAYS trips for a real >=300-file PR —
+ * the gate's own verdict there is a deterministic `review` (the caught error becomes a
+ * non-empty reason list, which takes the `review` branch, `codex-review.sh:777-779`),
+ * never a "maybe-incomplete listing" the way an actual count MISMATCH below 300 is.
+ * `resolveAtMergeFileContextLocal` surfaces `'over-cap'` as its own `'review'` kind so
+ * the replay matches the gate exactly there, instead of folding it into the
+ * count-mismatch case's `unresolved`.
+ *
  * Includes each rename's PREVIOUS path alongside its new one, same as `scope_eval`:
  * moving a file OFF a risky path still changes that path.
  */
-export function fileDiffAtMergeLocal(baseSha: string, mergeCommitOid: string, changedFiles: number): string[] | null {
+export function fileDiffAtMergeLocal(
+  baseSha: string,
+  mergeCommitOid: string,
+  changedFiles: number,
+): string[] | 'over-cap' | null {
   let raw: string;
   try {
-    raw = git(['diff', '--name-status', '-M', baseSha, mergeCommitOid]);
+    raw = git(['diff', '--name-status', '-M', '-z', baseSha, mergeCommitOid]);
     // eslint-disable-next-line no-catch-all/no-catch-all
   } catch {
     return null;
   }
   const entries = parseGitNameStatus(raw);
-  if (entries.length >= 300) return null; // mirrors the gate's per-comparison cap
+  if (entries.length >= 300) return 'over-cap'; // codex-review.sh:764 — the gate's own fail-closed-to-`review` cap
   if (entries.length !== changedFiles) return null; // count mismatch — incomplete or wrong listing
   const names = new Set<string>();
   for (const e of entries) {
@@ -1714,6 +1860,10 @@ export function fileDiffAtMergeLocal(baseSha: string, mergeCommitOid: string, ch
 export type LocalAtMergeFileContext =
   | { kind: 'resolved'; files: string[]; riskHighGlobs: string[] }
   | { kind: 'pre-gate' }
+  /** >=300 changed files (`fileDiffAtMergeLocal`'s `'over-cap'`): the gate itself
+   *  deterministically answers `review` for this case (`codex-review.sh:764`), so the
+   *  replay must too — never left `unresolved`, which would undercount `reviewed`. */
+  | { kind: 'review' }
   | { kind: 'unresolved' };
 
 /**
@@ -1740,6 +1890,7 @@ export function resolveAtMergeFileContextLocal(input: {
   if (labelerResult.kind === 'missing') return { kind: 'pre-gate' };
   if (labelerResult.kind === 'error') return { kind: 'unresolved' };
   const files = fileDiffAtMergeLocal(baseSha, input.mergeCommitOid, input.changedFiles);
+  if (files === 'over-cap') return { kind: 'review' };
   if (files === null) return { kind: 'unresolved' };
   return { kind: 'resolved', files, riskHighGlobs: labelerResult.globs };
 }
@@ -1828,8 +1979,11 @@ export function resolveAtMergeContexts(
     mergeCommitOid: string | null;
     headRefOid: string;
   }[],
-): Map<number, { atMergeContext: AtMergeContext | null; preGateOverride: boolean }> {
-  const result = new Map<number, { atMergeContext: AtMergeContext | null; preGateOverride: boolean }>();
+): Map<number, { atMergeContext: AtMergeContext | null; preGateOverride: boolean; atMergeForcedVerdict?: 'review' }> {
+  const result = new Map<
+    number,
+    { atMergeContext: AtMergeContext | null; preGateOverride: boolean; atMergeForcedVerdict?: 'review' }
+  >();
   const goLiveMs = new Date(GATE_GO_LIVE_ISO).getTime();
   const postGate = prs.filter((pr) => new Date(pr.mergedAt).getTime() > goLiveMs);
   for (let i = 0; i < postGate.length; i += AT_MERGE_GRAPHQL_BATCH_SIZE) {
@@ -1850,6 +2004,13 @@ export function resolveAtMergeContexts(
       });
       if (fileContext.kind === 'pre-gate') {
         result.set(pr.number, { atMergeContext: null, preGateOverride: true });
+        continue;
+      }
+      // >=300 changed files: the gate answers `review` deterministically regardless of
+      // labels (codex-review.sh:764,777-779 — the caught cap error alone makes the
+      // reason list non-empty), so no label-history lookup is needed for this PR at all.
+      if (fileContext.kind === 'review') {
+        result.set(pr.number, { atMergeContext: null, preGateOverride: false, atMergeForcedVerdict: 'review' });
         continue;
       }
       if (fileContext.kind === 'unresolved') {
@@ -2205,6 +2366,7 @@ function main(): void {
         ...pr,
         atMergeContext: resolved ? resolved.atMergeContext : undefined,
         preGateOverride: resolved ? resolved.preGateOverride : false,
+        atMergeForcedVerdict: resolved?.atMergeForcedVerdict,
       };
     });
 

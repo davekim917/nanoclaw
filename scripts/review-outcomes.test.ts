@@ -1,9 +1,10 @@
 import { execFileSync } from 'node:child_process';
+import * as nodeChildProcess from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import {
   allowSubprocess,
@@ -15,7 +16,9 @@ import {
 import {
   buildShadowReviewIndex,
   classifyAtMergeVerdict,
+  combineMergedPrSlices,
   computeFetchSinceIso,
+  computeMergedSearchSlices,
   computeReport,
   computeShadowCoverage,
   computeWeeklyFetchSinceIso,
@@ -790,6 +793,76 @@ describe('isoWeekDateRange', () => {
   });
 });
 
+describe('computeMergedSearchSlices — P2, per-ISO-week GitHub search slicing', () => {
+  it('covers the window exactly: no gap, no overlap, and the partial first and last weeks are truncated to the bounds', () => {
+    // Spans a partial W37, a whole W38, and a partial W39 (W37: Sep 7-13, W38: Sep
+    // 14-20, W39: Sep 21-27 — from the isoWeekDateRange tests above).
+    const sinceIso = '2026-09-08T12:00:00.000Z';
+    const untilIso = '2026-09-22T06:00:00.000Z';
+    const slices = computeMergedSearchSlices(sinceIso, untilIso);
+    expect(slices).toEqual([
+      { startIso: '2026-09-08T12:00:00.000Z', endIso: '2026-09-13T23:59:59.999Z' },
+      { startIso: '2026-09-14T00:00:00.000Z', endIso: '2026-09-20T23:59:59.999Z' },
+      { startIso: '2026-09-21T00:00:00.000Z', endIso: '2026-09-22T06:00:00.000Z' },
+    ]);
+    // No gap, no overlap: each slice after the first starts exactly 1ms after the
+    // previous one ends.
+    for (let i = 1; i < slices.length; i += 1) {
+      const previousEndMs = new Date(slices[i - 1]!.endIso).getTime();
+      const thisStartMs = new Date(slices[i]!.startIso).getTime();
+      expect(thisStartMs).toBe(previousEndMs + 1);
+    }
+    expect(slices[0]!.startIso).toBe(sinceIso); // partial first week, truncated to the request
+    expect(slices[slices.length - 1]!.endIso).toBe(untilIso); // partial last week, truncated to the request
+  });
+
+  it('returns exactly one slice when since and until fall in the same ISO week', () => {
+    const slices = computeMergedSearchSlices('2026-09-09T00:00:00.000Z', '2026-09-11T00:00:00.000Z');
+    expect(slices).toEqual([{ startIso: '2026-09-09T00:00:00.000Z', endIso: '2026-09-11T00:00:00.000Z' }]);
+  });
+
+  it('returns no slices when until precedes since', () => {
+    expect(computeMergedSearchSlices('2026-09-11T00:00:00.000Z', '2026-09-09T00:00:00.000Z')).toEqual([]);
+  });
+});
+
+describe('combineMergedPrSlices — P2, de-dup and fail-on-cap', () => {
+  it('de-duplicates a PR that appears in two slices (a mergedAt exactly on a boundary), counting it once', () => {
+    const boundaryPr = pr({ number: 42, mergedAt: '2026-09-13T23:59:59.000Z' });
+    const result = combineMergedPrSlices([
+      { slice: { startIso: '2026-09-07T00:00:00.000Z', endIso: '2026-09-13T23:59:59.999Z' }, prs: [boundaryPr] },
+      { slice: { startIso: '2026-09-14T00:00:00.000Z', endIso: '2026-09-20T23:59:59.999Z' }, prs: [boundaryPr] },
+    ]);
+    expect(result.filter((p) => p.number === 42)).toHaveLength(1);
+  });
+
+  it('merges distinct PRs across slices with no loss', () => {
+    const result = combineMergedPrSlices([
+      { slice: { startIso: 'a', endIso: 'b' }, prs: [pr({ number: 1 }), pr({ number: 2 })] },
+      { slice: { startIso: 'c', endIso: 'd' }, prs: [pr({ number: 3 })] },
+    ]);
+    expect(result.map((p) => p.number).sort((a, b) => a - b)).toEqual([1, 2, 3]);
+  });
+
+  it('fails loudly — throws, never truncates silently — when a single slice returns >=1,000 rows', () => {
+    const capped = Array.from({ length: 1000 }, (_, i) => pr({ number: i + 1 }));
+    expect(() =>
+      combineMergedPrSlices([
+        { slice: { startIso: '2026-09-07T00:00:00.000Z', endIso: '2026-09-13T23:59:59.999Z' }, prs: capped },
+      ]),
+    ).toThrow(/1,000|1000/);
+  });
+
+  it('does not throw for a slice just under the cap (999 rows)', () => {
+    const almostCapped = Array.from({ length: 999 }, (_, i) => pr({ number: i + 1 }));
+    expect(() =>
+      combineMergedPrSlices([
+        { slice: { startIso: '2026-09-07T00:00:00.000Z', endIso: '2026-09-13T23:59:59.999Z' }, prs: almostCapped },
+      ]),
+    ).not.toThrow();
+  });
+});
+
 describe('computeWeeklyFetchSinceIso', () => {
   it('subtracts weeklyDays from nowIso', () => {
     expect(computeWeeklyFetchSinceIso('2026-09-12T00:00:00Z', 90)).toBe(new Date('2026-06-14T00:00:00Z').toISOString());
@@ -881,6 +954,23 @@ describe('computeWeeklyReport', () => {
       expect(row.reviewed).toBe(0);
       expect(row.skipped).toBe(0);
       expect(row.postGateUnresolved).toBe(1);
+    });
+
+    it('counts a post-gate PR with a forced review verdict (>=300 changed files) as reviewed, not unresolved — codex-review.sh:764', () => {
+      const prs = [
+        pr({
+          number: 700,
+          mergedAt: '2026-09-11T00:00:00Z',
+          atMergeContext: undefined,
+          atMergeForcedVerdict: 'review',
+        }),
+      ];
+      const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+      const row = weekly.rows[0]!;
+      expect(row.postGateMerged).toBe(1);
+      expect(row.reviewed).toBe(1);
+      expect(row.skipped).toBe(0);
+      expect(row.postGateUnresolved).toBe(0);
     });
 
     it('is pre-gate at EXACTLY GATE_GO_LIVE_ISO, strictly: #609 itself is the commit that ships the file', () => {
@@ -1290,24 +1380,24 @@ describe('renderWeeklyMarkdown', () => {
   });
 });
 
-describe('parseGitNameStatus', () => {
-  it('parses an ordinary modify/add/delete line as {status, path}', () => {
-    expect(parseGitNameStatus('M\tsrc/a.ts')).toEqual([{ status: 'M', path: 'src/a.ts' }]);
-    expect(parseGitNameStatus('A\tsrc/new.ts')).toEqual([{ status: 'A', path: 'src/new.ts' }]);
-    expect(parseGitNameStatus('D\tsrc/gone.ts')).toEqual([{ status: 'D', path: 'src/gone.ts' }]);
+describe('parseGitNameStatus — NUL-separated (`-z`) fields', () => {
+  it('parses an ordinary modify/add/delete field-run as {status, path}', () => {
+    expect(parseGitNameStatus('M\0src/a.ts\0')).toEqual([{ status: 'M', path: 'src/a.ts' }]);
+    expect(parseGitNameStatus('A\0src/new.ts\0')).toEqual([{ status: 'A', path: 'src/new.ts' }]);
+    expect(parseGitNameStatus('D\0src/gone.ts\0')).toEqual([{ status: 'D', path: 'src/gone.ts' }]);
   });
 
-  it('parses a rename/copy line as {status, previousPath, path}', () => {
-    expect(parseGitNameStatus('R100\told.ts\tnew.ts')).toEqual([
+  it('parses a rename/copy field-run as {status, previousPath, path}', () => {
+    expect(parseGitNameStatus('R100\0old.ts\0new.ts\0')).toEqual([
       { status: 'R100', previousPath: 'old.ts', path: 'new.ts' },
     ]);
-    expect(parseGitNameStatus('C75\tsrc/a.ts\tsrc/b.ts')).toEqual([
+    expect(parseGitNameStatus('C75\0src/a.ts\0src/b.ts\0')).toEqual([
       { status: 'C75', previousPath: 'src/a.ts', path: 'src/b.ts' },
     ]);
   });
 
-  it('parses multiple lines and skips blank lines', () => {
-    expect(parseGitNameStatus('M\ta.ts\n\nR100\tb.ts\tc.ts\n')).toEqual([
+  it('parses multiple entries in one NUL-separated run', () => {
+    expect(parseGitNameStatus('M\0a.ts\0R100\0b.ts\0c.ts\0')).toEqual([
       { status: 'M', path: 'a.ts' },
       { status: 'R100', previousPath: 'b.ts', path: 'c.ts' },
     ]);
@@ -1315,6 +1405,16 @@ describe('parseGitNameStatus', () => {
 
   it('is empty for empty input', () => {
     expect(parseGitNameStatus('')).toEqual([]);
+  });
+
+  it('handles a non-ASCII path — the whole point of `-z`: no quoting to strip, unlike the tab/newline format', () => {
+    expect(parseGitNameStatus('M\0src/café.ts\0')).toEqual([{ status: 'M', path: 'src/café.ts' }]);
+  });
+
+  it('handles a renamed non-ASCII path (both old and new) with `-z`', () => {
+    expect(parseGitNameStatus('R100\0src/café-old.ts\0src/café-new.ts\0')).toEqual([
+      { status: 'R100', previousPath: 'src/café-old.ts', path: 'src/café-new.ts' },
+    ]);
   });
 });
 
@@ -1457,9 +1557,40 @@ describe('at-merge replay from local git (fixture repo, no network) — P2', () 
     expect(readRiskHighGlobsAtShaLocal('0000000000000000000000000000000000000000')).toEqual({ kind: 'error' });
   });
 
+  it('readRiskHighGlobsAtShaLocal is "error" (NOT "missing") when the path exists but its content cannot be read', () => {
+    // Simulates a partial/lazy checkout that has the tree entry (so `git cat-file -e
+    // <sha>:.github/labeler.yml` succeeds — the file genuinely exists here) but not the
+    // blob's content (so `git show` fails) — the exact gap `readRiskHighGlobsAtShaLocal`'s
+    // own doc comment describes. Before this fix, every `git show` failure — this one
+    // included — was read as "missing", which `resolveAtMergeContexts` reclassifies as
+    // pre-gate; that would be wrong here, since the file DOES exist at this commit.
+    const original = nodeChildProcess.execFileSync;
+    const labelerShowArgs = ['show', `${baseCommit}:.github/labeler.yml`];
+    const spy = vi
+      .spyOn(nodeChildProcess, 'execFileSync')
+      .mockImplementation((...callArgs: Parameters<typeof nodeChildProcess.execFileSync>) => {
+        const [command, cmdArgs] = callArgs;
+        if (command === 'git' && Array.isArray(cmdArgs) && cmdArgs[0] === 'show' && cmdArgs[1] === labelerShowArgs[1]) {
+          throw new Error('simulated: blob content unavailable even though the tree entry exists');
+        }
+        return (original as (...a: unknown[]) => unknown)(...callArgs) as ReturnType<
+          typeof nodeChildProcess.execFileSync
+        >;
+      });
+    try {
+      // Sanity check first: the path DOES resolve via cat-file -e (unmocked) at this sha —
+      // otherwise this test would trivially pass for the wrong reason ("missing" either way).
+      expect(() => execFileSync('git', ['cat-file', '-e', `${baseCommit}:.github/labeler.yml`])).not.toThrow();
+      expect(readRiskHighGlobsAtShaLocal(baseCommit)).toEqual({ kind: 'error' });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('fileDiffAtMergeLocal includes BOTH the old and new path of a rename', () => {
     const files = fileDiffAtMergeLocal(baseCommit, mergeCommit, 2);
     expect(files).not.toBeNull();
+    expect(files).not.toBe('over-cap');
     expect(files).toContain('src/old-name.ts');
     expect(files).toContain('src/new-risky/renamed.ts');
     expect(files).toContain('.github/labeler.yml');
@@ -1467,6 +1598,114 @@ describe('at-merge replay from local git (fixture repo, no network) — P2', () 
 
   it("fileDiffAtMergeLocal is null (fail closed) when the changedFiles count does not match — mirrors the gate's completeness rule", () => {
     expect(fileDiffAtMergeLocal(baseCommit, mergeCommit, 99)).toBeNull();
+  });
+
+  it('fileDiffAtMergeLocal returns "over-cap" — never null/unresolved — at >=300 changed files, matching codex-review.sh:764 exactly', () => {
+    const bigRepoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-over-cap-fixture-'));
+    function g(args: string[]): string {
+      return execFileSync('git', ['-c', 'user.email=test@example.invalid', '-c', 'user.name=test', ...args], {
+        cwd: bigRepoDir,
+        encoding: 'utf8',
+      }).trim();
+    }
+    g(['init', '-q', '-b', 'main']);
+    // A labeler.yml at the base is required so `readRiskHighGlobsAtShaLocal` reaches
+    // 'found' (not 'missing') — otherwise `resolveAtMergeFileContextLocal` short-circuits
+    // to 'pre-gate' before it ever reaches the file-diff/over-cap check this test targets.
+    fs.mkdirSync(path.join(bigRepoDir, '.github'), { recursive: true });
+    fs.writeFileSync(
+      path.join(bigRepoDir, '.github', 'labeler.yml'),
+      "risk:high:\n- changed-files:\n  - any-glob-to-any-file:\n    - 'src/guard/**'\n",
+    );
+    fs.writeFileSync(path.join(bigRepoDir, 'README.md'), 'base\n');
+    g(['add', '-A']);
+    g(['commit', '-q', '-m', 'base']);
+    const base = g(['rev-parse', 'HEAD']);
+    // 300 new files in one commit — GitHub's own `compare` endpoint truncates its file
+    // listing at exactly this count (docs.github.com/en/rest/commits/commits#compare-two-commits),
+    // which is why codex-review.sh:764's `$listed >= 300` check always trips for a real
+    // >=300-file PR and answers `review` deterministically.
+    for (let i = 0; i < 300; i += 1) {
+      fs.writeFileSync(path.join(bigRepoDir, `file-${i}.txt`), `${i}\n`);
+    }
+    g(['add', '-A']);
+    g(['commit', '-q', '-m', 'add 300 files']);
+    const big = g(['rev-parse', 'HEAD']);
+    process.chdir(bigRepoDir);
+    try {
+      expect(fileDiffAtMergeLocal(base, big, 300)).toBe('over-cap');
+      const ctx = resolveAtMergeFileContextLocal({ mergeCommitOid: big, headRefOid: big, changedFiles: 300 });
+      expect(ctx).toEqual({ kind: 'review' });
+    } finally {
+      process.chdir(repoDir);
+      fs.rmSync(bigRepoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('fileDiffAtMergeLocal returns the exact non-ASCII path, unquoted — the `-z` fix (P3)', () => {
+    const utfRepoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-nonascii-fixture-'));
+    function g(args: string[]): string {
+      return execFileSync('git', ['-c', 'user.email=test@example.invalid', '-c', 'user.name=test', ...args], {
+        cwd: utfRepoDir,
+        encoding: 'utf8',
+      }).trim();
+    }
+    g(['init', '-q', '-b', 'main']);
+    fs.writeFileSync(path.join(utfRepoDir, 'README.md'), 'base\n');
+    g(['add', '-A']);
+    g(['commit', '-q', '-m', 'base']);
+    const base = g(['rev-parse', 'HEAD']);
+    // A non-ASCII byte (0xC3 0xA9, UTF-8 for "é") in the path is exactly what
+    // `core.quotePath` (on by default) wraps in C-style double-quoted/octal-escaped form
+    // WITHOUT `-z` — see `GitDiffEntry`'s own doc comment.
+    fs.mkdirSync(path.join(utfRepoDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(utfRepoDir, 'src', 'café.ts'), 'content\n');
+    g(['add', '-A']);
+    g(['commit', '-q', '-m', 'add a non-ASCII path']);
+    const withNonAscii = g(['rev-parse', 'HEAD']);
+    // Sanity check: WITHOUT -z, git really does quote this path — proves the bug this
+    // fix addresses is real, not merely hypothetical.
+    const quotedRaw = g(['diff', '--name-status', '-M', base, withNonAscii]);
+    expect(quotedRaw).toContain('"'); // core.quotePath's C-style quoting kicks in
+    expect(quotedRaw).not.toContain('café.ts'); // the raw UTF-8 name is NOT what appears
+    process.chdir(utfRepoDir);
+    try {
+      const files = fileDiffAtMergeLocal(base, withNonAscii, 1);
+      expect(files).toEqual(['src/café.ts']);
+    } finally {
+      process.chdir(repoDir);
+      fs.rmSync(utfRepoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('fileDiffAtMergeLocal returns a renamed non-ASCII path, unquoted, both old and new sides — the `-z` fix (P3)', () => {
+    const utfRenameRepoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-nonascii-rename-fixture-'));
+    function g(args: string[]): string {
+      return execFileSync('git', ['-c', 'user.email=test@example.invalid', '-c', 'user.name=test', ...args], {
+        cwd: utfRenameRepoDir,
+        encoding: 'utf8',
+      }).trim();
+    }
+    g(['init', '-q', '-b', 'main']);
+    fs.mkdirSync(path.join(utfRenameRepoDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(utfRenameRepoDir, 'src', 'café-old.ts'), 'content\n');
+    g(['add', '-A']);
+    g(['commit', '-q', '-m', 'base with a non-ASCII path']);
+    const base = g(['rev-parse', 'HEAD']);
+    g(['mv', 'src/café-old.ts', 'src/café-new.ts']);
+    g(['commit', '-q', '-m', 'rename a non-ASCII path to another non-ASCII path']);
+    const renamed = g(['rev-parse', 'HEAD']);
+    process.chdir(utfRenameRepoDir);
+    try {
+      const files = fileDiffAtMergeLocal(base, renamed, 1);
+      expect(files).not.toBeNull();
+      expect(files).not.toBe('over-cap');
+      expect(files).toContain('src/café-old.ts');
+      expect(files).toContain('src/café-new.ts');
+    } finally {
+      process.chdir(repoDir);
+      fs.rmSync(utfRenameRepoDir, { recursive: true, force: true });
+    }
   });
 
   it('resolveAtMergeFileContextLocal resolves the full file+glob context in one call', () => {
