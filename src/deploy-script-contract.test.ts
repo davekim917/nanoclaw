@@ -1,4 +1,6 @@
+import { execFileSync } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { describe, expect, it } from 'vitest';
@@ -42,11 +44,17 @@ describe('deploy rollback shell contract', () => {
   });
 
   it('holds the restart for an in-flight repository drain, bounded (#718)', () => {
-    const wait = script.indexOf('while drain_in_flight');
-    expect(wait).toBeGreaterThan(-1);
-    expect(wait).toBeLessThan(script.indexOf('write_status "ok" "done"'));
-    expect(wait).toBeLessThan(script.indexOf('sudo systemctl restart nanoclaw-v2'));
+    const calls = [...script.matchAll(/^\s*wait_for_drain$/gm)].map((match) => match.index!);
+    // Once after the build, and again right before the restart for a drain that
+    // started during the pre-restart steps.
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toBeLessThan(script.indexOf('Build complete, restarting'));
+    expect(calls[1]).toBeGreaterThan(script.indexOf('Build complete, restarting'));
+    expect(calls[1]).toBeLessThan(script.indexOf('if [ -z "$MIGRATION_CHANGES" ]'));
+    expect(calls[1]).toBeLessThan(script.indexOf('write_status "ok" "done"'));
     expect(script).toContain('[ "$drain_waited" -lt "$DRAIN_WAIT_SECONDS" ]');
+    // Two back-to-back transfer drains at the default quiescence timeout fit.
+    expect(script).toContain('NANOCLAW_DEPLOY_DRAIN_WAIT_SECONDS:-1800');
     // A marker left by a host that died mid-drain must not hold the restart.
     expect(script).toContain('systemctl show -p MainPID --value nanoclaw-v2');
     // Both ends name the same file.
@@ -56,5 +64,47 @@ describe('deploy rollback shell contract', () => {
       'utf-8',
     );
     expect(runner).toContain("path.join(DATA_DIR, 'repository-drain-in-flight.json')");
+  });
+
+  it('waits only for a marker the running service wrote (#718)', () => {
+    const drainInFlight = script.match(/^drain_in_flight\(\) \{\n[\s\S]*?^\}$/m)?.[0];
+    expect(drainInFlight).toBeDefined();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'deploy-drain-'));
+    const bin = path.join(dir, 'bin');
+    fs.mkdirSync(bin);
+    // Stands in for `systemctl show -p MainPID --value`; no FAKE_MAINPID means it fails.
+    fs.writeFileSync(
+      path.join(bin, 'systemctl'),
+      '#!/bin/sh\n[ -n "$FAKE_MAINPID" ] || exit 1\necho "$FAKE_MAINPID"\n',
+      {
+        mode: 0o755,
+      },
+    );
+    const probe = path.join(dir, 'probe.sh');
+    fs.writeFileSync(
+      probe,
+      `DRAIN_MARKER="$1"\n${drainInFlight}\nif drain_in_flight; then echo waits; else echo proceeds; fi\n`,
+    );
+    const marker = path.join(dir, 'repository-drain-in-flight.json');
+    const probeWith = (mainPid: string): string =>
+      execFileSync('bash', [probe, marker], {
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_MAINPID: mainPid },
+        encoding: 'utf8',
+      }).trim();
+    try {
+      expect(probeWith('4242')).toBe('proceeds');
+      // Written the way the job runner writes it (JSON.stringify, no spaces).
+      fs.writeFileSync(
+        marker,
+        `${JSON.stringify({ action: 'repository_publish', requestId: 'r', sessionId: 's', pid: 4242, startedAt: 'x' })}\n`,
+      );
+      expect(probeWith('4242')).toBe('waits');
+      // Left by a host that has since died.
+      expect(probeWith('9999')).toBe('proceeds');
+      // systemctl cannot say.
+      expect(probeWith('')).toBe('proceeds');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
