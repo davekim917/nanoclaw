@@ -64,8 +64,15 @@ if [ "${1:-}" = "har-stop" ]; then
   fi
   # Only now, after the raw file is redacted end to end, does anything reach
   # the caller-chosen (possibly shared/durable) path — and via mv, never a
-  # partial write visible mid-copy.
-  mv "$TMP_OUT" "$OUT_PATH"
+  # partial write visible mid-copy. Checked explicitly: this script runs under
+  # `-uo pipefail`, not `-e`, so an unchecked `mv` into a missing/unwritable
+  # directory would otherwise print to stderr and still fall through to
+  # `exit 0` — the caller sees success while the redacted evidence never
+  # landed (the EXIT trap above then deletes the scratch copy too).
+  if ! mv "$TMP_OUT" "$OUT_PATH"; then
+    echo "ab-net-redact.sh har-stop: could not write $OUT_PATH" >&2
+    exit 1
+  fi
   exit 0
 fi
 
