@@ -33,6 +33,8 @@ import {
   findFollowUp,
   findRevert,
   FIXES_PR_CONVENTION_START_ISO,
+  formatStaleMainTipWarning,
+  formatWeeklyWindowLine,
   GATE_GO_LIVE_ISO,
   generatedFileChangedLines,
   globsForRiskHigh,
@@ -49,16 +51,23 @@ import {
   matchesAnyGlob,
   mergeCommitParentsLocal,
   parseGitNameStatus,
+  printWeeklyReport,
   readRiskHighGlobsAtShaLocal,
   replayLabelsAtMerge,
   renderWeeklyMarkdown,
   resolveAtMergeBaseSha,
   resolveAtMergeFileContextLocal,
+  resolveMainTipUntilIso,
   SHADOW_REVIEW_GO_LIVE_ISO,
+  STALE_MAIN_TIP_WARNING_THRESHOLD_MS,
   stripFencedAndCommented,
+  UNTIL_ISO_SEARCH_INDEX_LAG_MARGIN_MS,
+  verifyMergedPrTotalCount,
+  type MainTipInfo,
   type Options,
   type PullRequestData,
   type ShadowReviewIssueData,
+  type WeeklyWindowInfo,
   weeklyRevertRate,
 } from './review-outcomes.js';
 
@@ -68,6 +77,19 @@ import {
 // allowed; `gh` stays blocked, which the GraphQL-failure test below relies on directly.
 enforceHermeticity();
 allowSubprocess(['git']);
+
+function testMainTip(overrides: Partial<MainTipInfo> = {}): MainTipInfo {
+  return { shortSha: 'abc1234', tipIso: '2026-09-12T00:00:00Z', ...overrides };
+}
+
+function testWindow(overrides: Partial<WeeklyWindowInfo> = {}): WeeklyWindowInfo {
+  return {
+    sinceIso: '2026-08-01T00:00:00Z',
+    untilIso: '2026-09-12T00:00:00Z',
+    tip: testMainTip(),
+    ...overrides,
+  };
+}
 
 function pr(overrides: Partial<PullRequestData> & { number: number }): PullRequestData {
   return {
@@ -863,6 +885,46 @@ describe('combineMergedPrSlices — P2, de-dup and fail-on-cap', () => {
   });
 });
 
+describe('verifyMergedPrTotalCount — P3 #2 (#706 round 4), search total_count cross-check', () => {
+  // A malformed or unparsed `merged:` search bound doesn't error — it silently returns a
+  // valid-looking but wrong result set, no slice ever near combineMergedPrSlices' >=1000
+  // cap. `fetchTotal`/`wait` are stubbed here exactly so these cases never shell out to
+  // `gh` or actually pause wall-clock time (see the function's own doc comment).
+  const window = { repo: 'owner/repo', sinceIso: '2026-09-07T00:00:00.000Z', untilIso: '2026-09-13T23:59:59.999Z' };
+
+  it('passes when the first read already matches the combined count — no wait, no retry', () => {
+    let calls = 0;
+    const fetchTotal = (): number => {
+      calls += 1;
+      return 45;
+    };
+    const wait = vi.fn();
+    expect(() => verifyMergedPrTotalCount(45, window, fetchTotal, wait)).not.toThrow();
+    expect(calls).toBe(1);
+    expect(wait).not.toHaveBeenCalled();
+  });
+
+  it('retries once after a mismatch, and passes when the retry clears it (search-index lag on a just-completed merge)', () => {
+    const totals = [44, 45]; // first read misses the just-merged PR; retry catches up
+    let calls = 0;
+    const fetchTotal = (): number => totals[calls++]!;
+    const wait = vi.fn();
+    expect(() => verifyMergedPrTotalCount(45, window, fetchTotal, wait)).not.toThrow();
+    expect(calls).toBe(2);
+    expect(wait).toHaveBeenCalledTimes(1);
+    expect(wait).toHaveBeenCalledWith(expect.any(Number));
+  });
+
+  it('throws, naming both the combined count and the search total, when the mismatch persists past the retry', () => {
+    const fetchTotal = (): number => 47; // never agrees with the combined count below
+    const wait = vi.fn();
+    expect(() => verifyMergedPrTotalCount(45, window, fetchTotal, wait)).toThrow(
+      /45 unique pull request.*47|47.*45 unique pull request/s,
+    );
+    expect(wait).toHaveBeenCalledTimes(1); // one retry attempted before giving up, never more
+  });
+});
+
 describe('computeWeeklyFetchSinceIso', () => {
   it('subtracts weeklyDays from nowIso', () => {
     expect(computeWeeklyFetchSinceIso('2026-09-12T00:00:00Z', 90)).toBe(new Date('2026-06-14T00:00:00Z').toISOString());
@@ -1360,7 +1422,7 @@ describe('renderWeeklyMarkdown', () => {
       json: false,
     };
     const cumulative = computeReport(prs, [], options);
-    const markdown = renderWeeklyMarkdown(weekly, cumulative, 8);
+    const markdown = renderWeeklyMarkdown(weekly, cumulative, testWindow(), 8);
     expect(weekly.rows).toHaveLength(10);
     expect(markdown).toContain('Last 8 week(s) of 10 total');
     // The two oldest weeks are sliced off; only the eight most recent isoWeek keys appear.
@@ -1374,9 +1436,94 @@ describe('renderWeeklyMarkdown', () => {
     const weekly = computeWeeklyReport(prs, [], 14, '2026-09-12T00:00:00Z');
     const options: Options = { repo: 'x/y', switchIso: '2026-09-10T00:00:00Z', days: 5, followupDays: 14, json: false };
     const cumulative = computeReport(prs, [], options);
-    const markdown = renderWeeklyMarkdown(weekly, cumulative, 8);
+    const markdown = renderWeeklyMarkdown(weekly, cumulative, testWindow(), 8);
     expect(markdown).toContain('Cumulative');
     expect(markdown).toContain(cumulative.switchIso);
+  });
+
+  it('#717 review round 2 (P3): includes the window line naming since/until and the origin/main commit untilIso came from', () => {
+    const prs = [pr({ number: 1, mergedAt: '2026-09-08T00:00:00Z' })];
+    const weekly = computeWeeklyReport(prs, [], 14, '2026-09-12T00:00:00Z');
+    const options: Options = { repo: 'x/y', switchIso: '2026-09-10T00:00:00Z', days: 5, followupDays: 14, json: false };
+    const cumulative = computeReport(prs, [], options);
+    const window = testWindow({
+      sinceIso: '2026-08-01T00:00:00.000Z',
+      untilIso: '2026-09-12T00:00:00.000Z',
+      tip: testMainTip({ shortSha: 'deadbee', tipIso: '2026-09-12T00:02:00.000Z' }),
+    });
+    // Fresh relative to the window's own `untilIso`, so no stale warning muddies this
+    // assertion — that path is covered by the dedicated stale-warning tests below.
+    const markdown = renderWeeklyMarkdown(weekly, cumulative, window, 8, '2026-09-12T00:05:00.000Z');
+    expect(markdown).toContain(formatWeeklyWindowLine(window));
+    expect(markdown).toContain(
+      'window: 2026-08-01T00:00:00.000Z..2026-09-12T00:00:00.000Z (origin/main deadbee @ 2026-09-12T00:02:00.000Z)',
+    );
+  });
+
+  it('#717 review round 2 (P3): the stale-origin/main warning appears past the threshold and not below it', () => {
+    const prs = [pr({ number: 1, mergedAt: '2026-09-08T00:00:00Z' })];
+    const weekly = computeWeeklyReport(prs, [], 14, '2026-09-12T00:00:00Z');
+    const options: Options = { repo: 'x/y', switchIso: '2026-09-10T00:00:00Z', days: 5, followupDays: 14, json: false };
+    const cumulative = computeReport(prs, [], options);
+    const untilIso = '2026-09-12T00:00:00.000Z';
+    const window = testWindow({ untilIso });
+
+    // Exactly at the threshold: no warning.
+    const atThresholdNowIso = new Date(new Date(untilIso).getTime() + STALE_MAIN_TIP_WARNING_THRESHOLD_MS).toISOString();
+    const notStaleMarkdown = renderWeeklyMarkdown(weekly, cumulative, window, 8, atThresholdNowIso);
+    expect(notStaleMarkdown).not.toContain('origin/main looks stale');
+
+    // One millisecond past the threshold: warning appears.
+    const pastThresholdNowIso = new Date(
+      new Date(untilIso).getTime() + STALE_MAIN_TIP_WARNING_THRESHOLD_MS + 1,
+    ).toISOString();
+    const staleMarkdown = renderWeeklyMarkdown(weekly, cumulative, window, 8, pastThresholdNowIso);
+    expect(staleMarkdown).toContain('origin/main looks stale');
+    expect(staleMarkdown).toMatch(/fetch/i);
+  });
+});
+
+describe('printWeeklyReport', () => {
+  it('#717 review round 2 (P3): prints the window line, and the stale warning only past the threshold', () => {
+    const prs = [pr({ number: 1, mergedAt: '2026-09-08T00:00:00Z' })];
+    const weekly = computeWeeklyReport(prs, [], 14, '2026-09-12T00:00:00Z');
+    const untilIso = '2026-09-12T00:00:00.000Z';
+    const window = testWindow({ untilIso });
+
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      printWeeklyReport(weekly, window, untilIso); // fresh — nowIso == untilIso
+      const freshOutput = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(freshOutput).toContain(formatWeeklyWindowLine(window));
+      expect(freshOutput).not.toContain('origin/main looks stale');
+
+      logSpy.mockClear();
+      const staleNowIso = new Date(
+        new Date(untilIso).getTime() + STALE_MAIN_TIP_WARNING_THRESHOLD_MS + 1,
+      ).toISOString();
+      printWeeklyReport(weekly, window, staleNowIso);
+      const staleOutput = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(staleOutput).toContain(formatWeeklyWindowLine(window));
+      expect(staleOutput).toContain('origin/main looks stale');
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+});
+
+describe('formatStaleMainTipWarning — mutation coverage for the staleness comparison', () => {
+  it('is null at and below the threshold, non-null just past it', () => {
+    const untilIso = '2026-09-12T00:00:00.000Z';
+    const atThreshold = new Date(new Date(untilIso).getTime() + STALE_MAIN_TIP_WARNING_THRESHOLD_MS).toISOString();
+    const justPast = new Date(
+      new Date(untilIso).getTime() + STALE_MAIN_TIP_WARNING_THRESHOLD_MS + 1,
+    ).toISOString();
+    const wellBelow = new Date(new Date(untilIso).getTime() + 1000).toISOString();
+
+    expect(formatStaleMainTipWarning(untilIso, wellBelow)).toBeNull();
+    expect(formatStaleMainTipWarning(untilIso, atThreshold)).toBeNull();
+    expect(formatStaleMainTipWarning(untilIso, justPast)).not.toBeNull();
+    expect(formatStaleMainTipWarning(untilIso, justPast)).toContain('origin/main looks stale');
   });
 });
 
@@ -1527,6 +1674,64 @@ describe('at-merge replay from local git (fixture repo, no network) — P2', () 
     expect(mergeCommitParentsLocal('0000000000000000000000000000000000000000')).toBeNull();
   });
 
+  it('mergeCommitParentsLocal no longer fetches a commit that merged AFTER the local checkout was taken — it stays null, same as any other local miss', () => {
+    // #717 review round 2 (#706 round-1 P2): round 1 covered this exact race — a PR
+    // merging into `main` in the gap between `review-metrics.yml`'s `actions/checkout`
+    // and this script's live `gh pr list --search` call minutes later — with a
+    // `git fetch --no-tags origin <sha>` retry on a local miss. That retry cannot
+    // authenticate in Actions: the repo is private, and the workflow checks out with
+    // `persist-credentials: false` (confirmed against workflow run 34675405074's log,
+    // which shows checkout removing its auth header), so it only ever worked on a host
+    // with its own git credential helper — never in CI, where the fallback was added to
+    // fix exactly this. The real fix caps the search window's end at `origin/main`'s own
+    // tip (`resolveMainTipUntilIso`), so a PR like commit B below is excluded from the
+    // window entirely (see the `resolveMainTipUntilIso` describe block below) and this
+    // function is never even called with its sha in a real run. `commitExistsLocally`
+    // therefore no longer attempts any fetch at all — this test pins that removal: a
+    // commit merged after the checkout stays an ordinary, un-fetched local miss.
+    //
+    // `origin` here is a second real repo on local disk, standing in for GitHub: no
+    // network needed for this test — `git fetch` treats a filesystem path exactly like
+    // any other remote.
+    const upstreamRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-fetch-origin-upstream-'));
+    function u(args: string[]): string {
+      return execFileSync('git', ['-c', 'user.email=test@example.invalid', '-c', 'user.name=test', ...args], {
+        cwd: upstreamRepo,
+        encoding: 'utf8',
+      }).trim();
+    }
+    u(['init', '-q', '-b', 'main']);
+    fs.writeFileSync(path.join(upstreamRepo, 'a.txt'), 'a\n');
+    u(['add', '-A']);
+    u(['commit', '-q', '-m', 'commit A — present in the checkout']);
+
+    // Cloned BEFORE commit B exists upstream, so this clone (standing in for the CI
+    // job's `actions/checkout`) genuinely never saw it — not merely reset away from it.
+    const localRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-fetch-origin-local-'));
+    execFileSync('git', ['clone', '-q', upstreamRepo, localRepo], { encoding: 'utf8' });
+
+    // NOW a PR "merges" into upstream main — after the local clone was taken, exactly
+    // the mid-run race #706 round 1 tried (and failed, in CI) to paper over.
+    fs.writeFileSync(path.join(upstreamRepo, 'b.txt'), 'b\n');
+    u(['add', '-A']);
+    u(['commit', '-q', '-m', 'commit B — merges into main mid-run, after the checkout']);
+    const commitB = u(['rev-parse', 'HEAD']);
+
+    process.chdir(localRepo);
+    try {
+      // Sanity check first: the local clone genuinely does not have commit B yet — if
+      // this stops holding, the fixture no longer reproduces the race.
+      expect(() => execFileSync('git', ['cat-file', '-e', `${commitB}^{commit}`])).toThrow();
+      // No fetch fallback any more: this stays null, exactly like the zero-SHA case
+      // above, never a network round trip.
+      expect(mergeCommitParentsLocal(commitB)).toBeNull();
+    } finally {
+      process.chdir(repoDir);
+      fs.rmSync(localRepo, { recursive: true, force: true });
+      fs.rmSync(upstreamRepo, { recursive: true, force: true });
+    }
+  });
+
   it('readRiskHighGlobsAtShaLocal reads risk:high globs AT the base commit, not the merge commit', () => {
     expect(readRiskHighGlobsAtShaLocal(baseCommit)).toEqual({ kind: 'found', globs: ['src/guard/**'] });
   });
@@ -1584,6 +1789,61 @@ describe('at-merge replay from local git (fixture repo, no network) — P2', () 
       expect(readRiskHighGlobsAtShaLocal(baseCommit)).toEqual({ kind: 'error' });
     } finally {
       spy.mockRestore();
+    }
+  });
+
+  it('readRiskHighGlobsAtShaLocal is "error" (NOT "missing") when the tree entry is intact but the loose blob object is gone — the real partial-clone bug, not a mocked `git show` failure', () => {
+    // Round 4's P3 #1 on #706: `labelerPathExistsAtSha` used to be `git cat-file -e
+    // <sha>:.github/labeler.yml`, which resolves the tree walk AND THEN verifies the
+    // blob object it names exists in the local object database. A partial/lazy clone
+    // (`--filter=blob:none`) can have the tree entry — the path genuinely exists at this
+    // commit — while missing that one blob. This fixture reproduces exactly that: a
+    // real repo, a real commit, then the loose blob object for `.github/labeler.yml`
+    // deleted straight out of `.git/objects` while its tree entry is left untouched.
+    const partialCloneRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-partial-clone-fixture-'));
+    function g(args: string[]): string {
+      return execFileSync('git', ['-c', 'user.email=test@example.invalid', '-c', 'user.name=test', ...args], {
+        cwd: partialCloneRepo,
+        encoding: 'utf8',
+      }).trim();
+    }
+    g(['init', '-q', '-b', 'main']);
+    fs.mkdirSync(path.join(partialCloneRepo, '.github'), { recursive: true });
+    fs.writeFileSync(
+      path.join(partialCloneRepo, '.github', 'labeler.yml'),
+      "risk:high:\n- changed-files:\n  - any-glob-to-any-file:\n    - 'src/guard/**'\n",
+    );
+    g(['add', '-A']);
+    g(['commit', '-q', '-m', 'base with labeler.yml']);
+    const partialCloneCommit = g(['rev-parse', 'HEAD']);
+    const blobSha = g(['rev-parse', `${partialCloneCommit}:.github/labeler.yml`]);
+
+    // Delete the loose blob object directly. The tree entry (the parent tree object's
+    // own recorded `<mode> <name>\0<oid>` listing) is never touched by this — only the
+    // blob object itself, the thing `cat-file -e` additionally checks and `rev-parse
+    // --verify` does not.
+    const objectPath = path.join(partialCloneRepo, '.git', 'objects', blobSha.slice(0, 2), blobSha.slice(2));
+    expect(fs.existsSync(objectPath)).toBe(true);
+    fs.chmodSync(objectPath, 0o644);
+    fs.unlinkSync(objectPath);
+    expect(fs.existsSync(objectPath)).toBe(false);
+
+    process.chdir(partialCloneRepo);
+    try {
+      // Sanity checks first, both unmocked — if either stops holding, this fixture no
+      // longer reproduces the bug it exists to catch.
+      // (1) the OLD implementation's check fails here even though the path exists at
+      // this commit — reproducing the exact misclassification round 4 flagged.
+      expect(() => execFileSync('git', ['cat-file', '-e', `${partialCloneCommit}:.github/labeler.yml`])).toThrow();
+      // (2) the FIX's tree-only check still resolves the entry without touching the
+      // missing blob.
+      expect(() =>
+        execFileSync('git', ['rev-parse', '--verify', '-q', `${partialCloneCommit}:.github/labeler.yml`]),
+      ).not.toThrow();
+      expect(readRiskHighGlobsAtShaLocal(partialCloneCommit)).toEqual({ kind: 'error' });
+    } finally {
+      process.chdir(repoDir);
+      fs.rmSync(partialCloneRepo, { recursive: true, force: true });
     }
   });
 
@@ -1786,5 +2046,112 @@ describe('at-merge replay from local git (fixture repo, no network) — P2', () 
         'review',
       );
     });
+  });
+});
+
+describe('resolveMainTipUntilIso — #717 review round 2 (#706 round-1 P2 fix): deterministic search window end', () => {
+  const originalCwd = process.cwd();
+
+  function fixtureGit(dir: string, args: string[], extraEnv?: Record<string, string>): string {
+    return execFileSync('git', ['-c', 'user.email=test@example.invalid', '-c', 'user.name=test', ...args], {
+      cwd: dir,
+      encoding: 'utf8',
+      env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
+    }).trim();
+  }
+
+  function makeRepo(): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-untiliso-'));
+    fixtureGit(dir, ['init', '-q', '-b', 'main']);
+    return dir;
+  }
+
+  /** Commits `file` with an EXPLICIT author/committer date, so ordering between commits
+   *  is deterministic and never depends on real wall-clock timing between two `git
+   *  commit` calls in the same test. */
+  function commitAt(dir: string, file: string, contents: string, isoDate: string): string {
+    fs.writeFileSync(path.join(dir, file), contents);
+    fixtureGit(dir, ['add', '-A']);
+    fixtureGit(dir, ['commit', '-q', '-m', `commit at ${isoDate}`], {
+      GIT_AUTHOR_DATE: isoDate,
+      GIT_COMMITTER_DATE: isoDate,
+    });
+    return fixtureGit(dir, ['rev-parse', 'HEAD']);
+  }
+
+  it('equals the tip commit committer time minus the margin, read from origin/main (not HEAD)', () => {
+    const upstreamRepo = makeRepo();
+    const tipIso = '2026-08-01T12:00:00+00:00';
+    commitAt(upstreamRepo, 'a.txt', 'a\n', tipIso);
+
+    const localRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-untiliso-local-'));
+    execFileSync('git', ['clone', '-q', upstreamRepo, localRepo], { encoding: 'utf8' });
+    // A local run may have some other branch checked out — `resolveMainTipUntilIso` must
+    // read `origin/main`, not whatever `HEAD` happens to be, so check out a decoy branch
+    // here to prove that.
+    fixtureGit(localRepo, ['checkout', '-q', '-b', 'some-other-branch']);
+
+    process.chdir(localRepo);
+    try {
+      const untilIso = resolveMainTipUntilIso();
+      expect(untilIso).toBe(new Date(new Date(tipIso).getTime() - UNTIL_ISO_SEARCH_INDEX_LAG_MARGIN_MS).toISOString());
+      // marginMs is overridable — a zero margin is the tip's committer time exactly.
+      expect(resolveMainTipUntilIso(0)).toBe(new Date(tipIso).toISOString());
+    } finally {
+      process.chdir(originalCwd);
+      fs.rmSync(localRepo, { recursive: true, force: true });
+      fs.rmSync(upstreamRepo, { recursive: true, force: true });
+    }
+  });
+
+  it('a PR merging into main AFTER origin/main tip was read here falls after untilIso — excluded from the search window by construction, never reported unresolved', () => {
+    // This is the property the #706 round-1 P2 fix depends on: with the search window's
+    // `until` bound capped at `origin/main`'s own tip, a PR that merges into `main` in
+    // the gap between `review-metrics.yml`'s `actions/checkout` and this script's live
+    // `gh pr list --search` call minutes later can never fall INSIDE
+    // `merged:<since>..<untilIso>` — GitHub's search qualifier would simply never return
+    // it. That is a structurally different outcome from the #706 round-1 fix (a `git
+    // fetch --no-tags origin <sha>` retry in `commitExistsLocally`, removed by this
+    // change): such a PR is not "fetched and found missing", it is outside this run's
+    // window entirely and is picked up whole, as an ordinary ancestor, by the next
+    // scheduled run.
+    const upstreamRepo = makeRepo();
+    const tipIso = '2026-08-01T12:00:00+00:00';
+    commitAt(upstreamRepo, 'a.txt', 'a\n', tipIso);
+
+    const localRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-untiliso-local-'));
+    execFileSync('git', ['clone', '-q', upstreamRepo, localRepo], { encoding: 'utf8' });
+
+    let untilIso: string;
+    process.chdir(localRepo);
+    try {
+      untilIso = resolveMainTipUntilIso();
+    } finally {
+      process.chdir(originalCwd);
+    }
+
+    // NOW a PR "merges" into upstream main — after `origin/main`'s tip was already read
+    // above, exactly the mid-run race #706 round 1's fetch fallback tried (and failed,
+    // in CI) to paper over. 5 minutes later, past even the margin.
+    const midRunIso = '2026-08-01T12:05:00+00:00';
+    commitAt(upstreamRepo, 'b.txt', 'b\n', midRunIso);
+
+    expect(new Date(midRunIso).getTime()).toBeGreaterThan(new Date(untilIso).getTime());
+
+    fs.rmSync(localRepo, { recursive: true, force: true });
+    fs.rmSync(upstreamRepo, { recursive: true, force: true });
+  });
+
+  it('throws — never falls back to wall-clock time — when origin/main cannot be resolved at all', () => {
+    const soloRepo = makeRepo();
+    commitAt(soloRepo, 'a.txt', 'a\n', '2026-08-01T12:00:00+00:00');
+
+    process.chdir(soloRepo);
+    try {
+      expect(() => resolveMainTipUntilIso()).toThrow(/resolveMainTipUntilIso.*origin\/main/);
+    } finally {
+      process.chdir(originalCwd);
+      fs.rmSync(soloRepo, { recursive: true, force: true });
+    }
   });
 });
