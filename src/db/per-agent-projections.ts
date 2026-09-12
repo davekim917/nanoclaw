@@ -581,8 +581,8 @@ interface ArchiveSeedCandidate {
  * match from drifting apart.
  *
  * Scans every stamp under `DATA_DIR/projection-stamps`: cheap (one small JSON
- * read per existing session projection) and only reached when THIS session's
- * own projection has neither a file nor a stamp yet, i.e. genuinely fresh.
+ * read per existing session projection) and only reached when THIS session has
+ * no local projection file (fresh, or reclaimed — #693).
  */
 function findArchiveSeedCandidate(stamp: ArchiveProjectionStamp, excludeDstPath: string): ArchiveSeedCandidate | null {
   let entries: string[];
@@ -750,8 +750,9 @@ export function removeArchiveProjectionStamp(dstPath: string): void {
 }
 
 /**
- * 'seeded' (#667): a genuinely fresh session's projection was copied from a
- * same-scope sibling instead of built from the source archive, then (per
+ * 'seeded' (#667): a session with no local projection file (fresh, or
+ * reclaimed — #693) had its projection copied from a same-scope sibling
+ * instead of built from the source archive, then (per
  * `sinceRowid`/`rows`) reused as-is or brought current with the normal
  * append path. Distinct from 'reused'/'appended' so production logs can tell
  * a first-spawn seed from ordinary steady-state traffic.
@@ -1060,6 +1061,15 @@ export function materializeArchiveProjection(
   // post-copy row-label check. Discarding an orphan local stamp touches
   // neither, so this cannot weaken the isolation boundary #668 established.
   if (!fs.existsSync(dstPath)) {
+    // Defensive, not load-bearing: nothing downstream can currently observe
+    // whether this drop runs (#727 F1). A seed success overwrites `previous`
+    // with `candidate.stamp` a few lines below; a seed failure's catch nulls
+    // it too; and with no candidate at all, the orphan stamp is never reused
+    // as `previous` either — `decideArchiveProjectionMode`'s own
+    // `statSync(dstPath)` throws first and forces a rebuild regardless of
+    // what `previous` held. Kept anyway so a future code path that reads
+    // `previous` before reaching one of those points doesn't inherit a stamp
+    // describing a file that no longer exists.
     if (previous !== null) {
       removeArchiveProjectionStamp(dstPath);
       previous = null;
