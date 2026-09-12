@@ -1099,6 +1099,27 @@ export async function checkoutRepository(input: CheckoutRepositoryInput): Promis
   const { workgroupId, workUnit, repo, branch, requestId } = input;
   assertRepositoryName(repo);
   assertRepositoryRequestId(requestId);
+  // This function is the ONLY place a clone-shaped checkout is created or
+  // served: the runner's create_worktree reaches it exclusively through
+  // createCloneWorktree (container/agent-runner/src/mcp-tools/git-worktrees.ts:1106)
+  // -> requestRepositoryCheckout's `repository_checkout` request (same file,
+  // :985-989) -> applyRepositoryCheckoutAction above -> here -> createCheckout
+  // -> stageClone, a full independent `git clone` with no `core.hooksPath`
+  // set. The runner is expected to never route a scan-policy repo
+  // (isScanPolicyRepositoryName) here at all — it pins that repo to
+  // `worktree` mode itself (effectiveCheckoutModeFor, container/agent-runner/
+  // src/mcp-tools/git-worktrees.ts:114-116) — but this host predicate is the
+  // single source of truth (src/managed-git-hooks.ts), so a clone request
+  // for such a repo is refused here too: if the runner's own copy of the
+  // list (container/agent-runner/src/mcp-tools/scan-policy-repos.json) ever
+  // drifted from the host's, that drift would otherwise be the only thing
+  // standing between an unscanned clone and its remote push (#680 follow-up).
+  if (isScanPolicyRepositoryName(repo)) {
+    throw new RepositoryCheckoutError(
+      `${repo} is under host-managed secret-scan policy and cannot be checked out as a clone; ` +
+        'it must always be a linked worktree so its pushes are scanned',
+    );
+  }
   if (workUnit.workgroupId !== workgroupId) {
     throw new RepositoryCheckoutError('the checkout work unit belongs to another workgroup');
   }

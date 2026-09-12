@@ -70,12 +70,23 @@ function patternsSourcePath(): string {
  * A code repo stays hookless (core.hooksPath=/dev/null) — the hook's own
  * SECRET_BLOCK_RE has real false-positive vectors in code (PEM/AWS-example
  * fixtures, test tokens) that the wiki content shape doesn't. Widen this
- * predicate only after that false-positive rate is measured for code repos
- * the way #666 measured it for wiki (see scripts/wiki-pre-push-hook.sh's
- * header for the historical wiki numbers).
+ * list only after that false-positive rate is measured for code repos the
+ * way #666 measured it for wiki (see scripts/wiki-pre-push-hook.sh's header
+ * for the historical wiki numbers).
+ *
+ * The ONE list this predicate reads. The runner keeps its own copy of this
+ * predicate (container/agent-runner/src/mcp-tools/git-worktrees.ts:109-111,
+ * `isScanPolicyRepositoryName`, needed because it cannot import host src/ —
+ * see that file's comment) sourced from
+ * container/agent-runner/src/mcp-tools/scan-policy-repos.json, the same
+ * array duplicated here rather than re-derived. src/managed-git-hooks.test.ts's
+ * "runner/host scan-policy lists" test reads both and asserts they
+ * deep-equal, so the two can never silently drift apart (#680 follow-up).
  */
+export const SCAN_POLICY_REPOSITORY_NAMES: readonly string[] = ['wiki'];
+
 export function isScanPolicyRepositoryName(name: string): boolean {
-  return name === 'wiki';
+  return SCAN_POLICY_REPOSITORY_NAMES.includes(name);
 }
 
 function sha256(buf: Buffer): string {

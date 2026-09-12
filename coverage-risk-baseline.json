@@ -36,6 +36,7 @@
     "container/agent-runner/src/mcp-tools/permissions.ts": "untested",
     "container/agent-runner/src/mcp-tools/remote-control.ts": "untested",
     "container/agent-runner/src/mcp-tools/request-choice.ts": 100,
+    "container/agent-runner/src/mcp-tools/scan-policy-repos.ts": 100,
     "container/agent-runner/src/mcp-tools/self-mod.ts": 60.83,
     "container/agent-runner/src/mcp-tools/server.ts": 22.37,
     "container/agent-runner/src/mcp-tools/support.ts": 100,

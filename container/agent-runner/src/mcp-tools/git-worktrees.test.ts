@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { execFileSync } from 'child_process';
 import { randomBytes } from 'crypto';
 import {
@@ -14,9 +14,17 @@ import {
 } from 'fs';
 import { fileURLToPath } from 'url';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { dirname, join } from 'path';
 
-import { cloneRepoTool, createWorktreeTool, gitCommitTool, gitPushTool, openPrTool } from './git-worktrees';
+import {
+  cloneRepoTool,
+  createWorktreeTool,
+  gitCommitTool,
+  gitPushTool,
+  isScanPolicyRepositoryName,
+  openPrTool,
+  resetScanPolicyRepositoryNamesForTest,
+} from './git-worktrees';
 import { checkoutDirName } from './checkout-layout';
 import { builtInNanoclawMcpEnv } from '../nanoclaw-mcp-env.js';
 import { closeSessionDb, initTestSessionDb } from '../modules/mailbox/testing.js';
@@ -110,6 +118,19 @@ describe('topic-linked worktree topology', () => {
     mkdirSync(state, { recursive: true });
     writeFileSync(join(state, 'origin.json'), JSON.stringify({ origin: remote, repositoryId: remote }));
     writeFileSync(join(state, 'repository.lock'), '');
+  }
+
+  /** Same shape as seedCanonical, for a second repository name — used by the #666-follow-up scan-policy tests. */
+  function seedNamedCanonical(name: string): string {
+    const named = join(dataDir, 'repositories', 'wg-a', name);
+    execFileSync('git', ['clone', '-q', remote, named]);
+    git(named, ['remote', 'set-head', 'origin', '--auto']);
+    git(named, ['config', 'gc.auto', '0']);
+    const state = join(dataDir, 'repository-state', 'wg-a', name);
+    mkdirSync(state, { recursive: true });
+    writeFileSync(join(state, 'origin.json'), JSON.stringify({ origin: remote, repositoryId: `${remote}#${name}` }));
+    writeFileSync(join(state, 'repository.lock'), '');
+    return named;
   }
 
   function useTopic(name: string, workUnitKey: string): string {
@@ -774,6 +795,34 @@ describe('topic-linked worktree topology', () => {
       return { startCommit };
     }
 
+    // container/agent-runner/src/mcp-tools/git-worktrees.test.ts ->
+    // (mcp-tools, src, agent-runner, container) -> repo root, so this stays
+    // correct regardless of the bun test process's own cwd.
+    const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..');
+
+    /**
+     * Installs a byte-for-byte copy of the real host-managed scan hook
+     * (scripts/wiki-pre-push-hook.sh + scripts/lib/secret-scan.sh, the same
+     * two sources src/managed-git-hooks.ts's refreshManagedGitHooks installs
+     * in production) as `canonicalPath`'s `core.hooksPath` — the #680
+     * review-round fixtures below use the real hook, not a stand-in
+     * directory, for the same reason the canonical always carries it in
+     * production: a leftover CLONE's own independent `.git/config` has no
+     * `core.hooksPath` at all (stageClone, src/modules/repository-workspaces/
+     * index.ts:872-902), so it never reaches this hook either way — this is
+     * what makes serving it unscanned a real gap, not merely a difference
+     * from a stand-in.
+     */
+    function installManagedScanHook(canonicalPath: string): string {
+      const hooksDir = join(dataDir, 'managed-git-hooks', 'scan');
+      mkdirSync(hooksDir, { recursive: true });
+      writeFileSync(join(hooksDir, 'nanoclaw-secret-patterns.sh'), readFileSync(join(REPO_ROOT, 'scripts', 'lib', 'secret-scan.sh')));
+      writeFileSync(join(hooksDir, 'pre-push'), readFileSync(join(REPO_ROOT, 'scripts', 'wiki-pre-push-hook.sh')));
+      chmodSync(join(hooksDir, 'pre-push'), 0o755);
+      git(canonicalPath, ['config', 'core.hooksPath', hooksDir]);
+      return hooksDir;
+    }
+
     function writeRepositoryActionResponse(inbound: any, requestId: string, payload: Record<string, unknown>): void {
       inbound
         .query(
@@ -1147,6 +1196,229 @@ describe('topic-linked worktree topology', () => {
       const cloneText = createWorktreeTool.tool.description ?? '';
       expect(cloneText).toContain('/workspace/worktrees/<repo>@<branch>');
       expect(cloneText).toContain('Any number of threads may hold the same branch at once');
+      // #680 review round 1, cosmetic: the clone-mode description must warn
+      // that a scan-policy repo (wiki) never actually gets the clone-mode
+      // behaviour just described.
+      expect(cloneText).toContain('always gets a linked worktree');
+    });
+
+    test('clone mode plus a wiki repo still gives a linked worktree, with the canonical hooksPath visible (#666 follow-up)', async () => {
+      // A `clone`-mode checkout is a full clone with its own independent
+      // .git/config (stageClone, host src/modules/repository-workspaces/
+      // index.ts:872-902) — it never inherits the canonical's
+      // core.hooksPath, so a wiki push through it would go unscanned. A
+      // scan-policy repo (isScanPolicyRepositoryName, git-worktrees.ts) must
+      // always get a linked worktree instead, whatever the global mode, so
+      // the host-managed hooks mount (whose eligibility is driven by
+      // core.hooksPath on the shared canonical .git/config) still applies.
+      const wikiCanonical = seedNamedCanonical('wiki');
+      // Simulate what the host's managed-git-hooks refresh does at startup
+      // for a scan-policy repo: point its core.hooksPath at the managed,
+      // read-only-mounted scan directory.
+      const managedHooksDir = join(dataDir, 'managed-git-hooks', 'scan');
+      git(wikiCanonical, ['config', 'core.hooksPath', managedHooksDir]);
+
+      process.env.NANOCLAW_CHECKOUT_MODE = 'clone';
+      const { outbound } = initTestSessionDb();
+      delete process.env.NANOCLAW_REPOSITORY_ACTION_TRANSPORT;
+      try {
+        const response = await createWorktreeTool.handler({ repo: 'wiki' });
+        expect(response.isError).toBeFalsy();
+
+        const worktree = join(firstTopic, 'wiki');
+        // Linked worktree, not a clone: `.git` is a file (a gitdir pointer),
+        // and it shares the canonical's own `.git` — exactly what a clone
+        // (its own independent .git directory) would never do.
+        expect(lstatSync(join(worktree, '.git')).isFile()).toBe(true);
+        expect(git(worktree, ['rev-parse', '--path-format=absolute', '--git-common-dir'])).toBe(
+          join(wikiCanonical, '.git'),
+        );
+        // The managed hooks mount's eligibility signal (core.hooksPath) is
+        // therefore visible from inside the checkout too — this is the
+        // actual mechanism that lets the host-managed pre-push hook apply.
+        expect(git(worktree, ['config', '--get', 'core.hooksPath'])).toBe(managedHooksDir);
+
+        // No repository_checkout host round-trip was ever requested — the
+        // scan-policy override took the linked-worktree path directly,
+        // never createCloneWorktree.
+        const actions = (outbound.query('SELECT content FROM messages_out').all() as { content: string }[]).map(
+          (row) => JSON.parse(row.content).action,
+        );
+        expect(actions).not.toContain('repository_checkout');
+      } finally {
+        closeSessionDb();
+      }
+    });
+
+    test('a leftover wiki CLONE at the primary position is refused in both worktree and clone mode, and git_commit/git_push refuse too (#680 review round 1)', async () => {
+      // The Opus review on #682 proved this end to end: a wiki CLONE left
+      // over from a clone-mode period, still parked at the primary
+      // position, was served as-is by create_worktree's reuse branch (the
+      // ok() a few lines above the new guard in the source) and pushed from
+      // by git_push -> worktreeForTool -> resolveCheckout, neither of which
+      // knew the difference between it and any other repo's leftover clone
+      // — and a token pushed through it reached the remote unscanned. Both
+      // paths must now refuse for a scan-policy repo
+      // (isScanPolicyRepositoryName), whatever NANOCLAW_CHECKOUT_MODE says
+      // (effectiveCheckoutModeFor already pins the repo to `worktree`
+      // regardless, so toggling the global setting below exercises the
+      // description-only difference, not a different guard).
+      const wikiCanonical = seedNamedCanonical('wiki');
+      installManagedScanHook(wikiCanonical);
+      const remoteRefsBefore = git(remote, ['for-each-ref', '--format=%(refname) %(objectname)']);
+
+      const worktree = join(firstTopic, 'wiki');
+      createHostClone(remote, worktree, { repo: 'wiki', branch: 'main', startedFrom: 'origin-head' });
+
+      const { outbound } = initTestSessionDb();
+      // #682 round 2: the beforeEach above sets TRANSPORT='disabled', under
+      // which queueHostAction returns before ever calling writeMessageOut
+      // (git-worktrees.ts ~:544) — so the `not.toContain('repository_checkout')`
+      // assertion below would hold vacuously whether or not the refusal
+      // actually stopped the code before queuing a host action. Deleting the
+      // override here (same technique as the passing "clone mode plus a wiki
+      // repo..." test above) makes writeMessageOut real again, so the
+      // assertion proves something: no host action of any kind was queued.
+      delete process.env.NANOCLAW_REPOSITORY_ACTION_TRANSPORT;
+      try {
+        for (const globalMode of ['worktree', 'clone'] as const) {
+          if (globalMode === 'clone') process.env.NANOCLAW_CHECKOUT_MODE = 'clone';
+          else delete process.env.NANOCLAW_CHECKOUT_MODE;
+
+          const created = await createWorktreeTool.handler({ repo: 'wiki' });
+          expect(created.isError).toBe(true);
+          expect(created.content[0].text).toContain('left over from a clone-mode period');
+          expect(created.content[0].text).toContain('not secret-scanned on push');
+        }
+
+        // Still a clone (its own independent .git directory) at the primary
+        // path — refusing it never touched or moved it.
+        expect(lstatSync(join(worktree, '.git')).isDirectory()).toBe(true);
+
+        const committed = await gitCommitTool.handler({ repo: 'wiki', message: 'should never land' });
+        expect(committed.isError).toBe(true);
+
+        const pushed = await gitPushTool.handler({ repo: 'wiki' });
+        expect(pushed.isError).toBe(true);
+
+        // No repository_checkout host round-trip was ever requested, in
+        // either mode — the refusal never falls through to createCloneWorktree.
+        const actions = (outbound.query('SELECT content FROM messages_out').all() as { content: string }[]).map(
+          (row) => JSON.parse(row.content).action,
+        );
+        expect(actions).not.toContain('repository_checkout');
+
+        // Nothing local moved (git_commit refused before its add/commit ever
+        // ran) and nothing reached the remote either.
+        expect(git(worktree, ['status', '--porcelain'])).toBe('');
+        expect(git(remote, ['for-each-ref', '--format=%(refname) %(objectname)'])).toBe(remoteRefsBefore);
+      } finally {
+        closeSessionDb();
+      }
+    });
+
+    test('a leftover wiki@<branch> CLONE is refused the same way, and git_commit/git_push refuse for that branch too', async () => {
+      const wikiCanonical = seedNamedCanonical('wiki');
+      installManagedScanHook(wikiCanonical);
+      const remoteRefsBefore = git(remote, ['for-each-ref', '--format=%(refname) %(objectname)']);
+
+      const branch = 'topic-feature';
+      const branchWorktree = join(firstTopic, checkoutDirName('wiki', branch));
+      createHostClone(remote, branchWorktree, { repo: 'wiki', branch, startedFrom: 'origin-head' });
+
+      const { outbound } = initTestSessionDb();
+      // #682 round 2: same reasoning as the primary-position test above — make
+      // the "no host action queued" assertion meaningful instead of vacuous
+      // under TRANSPORT='disabled'.
+      delete process.env.NANOCLAW_REPOSITORY_ACTION_TRANSPORT;
+      try {
+        const created = await createWorktreeTool.handler({ repo: 'wiki', branch });
+        expect(created.isError).toBe(true);
+        expect(created.content[0].text).toContain('left over from a clone-mode period');
+        expect(created.content[0].text).toContain('not secret-scanned on push');
+
+        const committed = await gitCommitTool.handler({ repo: 'wiki', branch, message: 'should never land' });
+        expect(committed.isError).toBe(true);
+
+        const pushed = await gitPushTool.handler({ repo: 'wiki', branch });
+        expect(pushed.isError).toBe(true);
+
+        const actions = (outbound.query('SELECT content FROM messages_out').all() as { content: string }[]).map(
+          (row) => JSON.parse(row.content).action,
+        );
+        expect(actions).not.toContain('repository_checkout');
+
+        expect(git(branchWorktree, ['status', '--porcelain'])).toBe('');
+        expect(git(remote, ['for-each-ref', '--format=%(refname) %(objectname)'])).toBe(remoteRefsBefore);
+      } finally {
+        closeSessionDb();
+      }
+    });
+
+    test('open_pr refuses a wiki@<branch> leftover clone rather than silently falling back to the primary (#682 round 2 P3 fix)', async () => {
+      // Before round 2, worktreeForTool's scan-policy refusal for the named
+      // branch was indistinguishable from an ordinary "no checkout for that
+      // branch" miss, so open_pr's fallback re-resolved the PRIMARY (valid,
+      // linked) checkout instead — silently swallowing the refusal and
+      // opening the PR from the wrong checkout rather than surfacing the
+      // leftover clone.
+      const wikiCanonical = seedNamedCanonical('wiki');
+      installManagedScanHook(wikiCanonical);
+
+      // A valid PRIMARY linked worktree, e.g. created before the clone-mode
+      // period that left the `@<branch>` clone behind.
+      expect((await createWorktreeTool.handler({ repo: 'wiki' })).isError).toBeFalsy();
+
+      // A leftover clone at the `wiki@<branch>` position — the exact shape
+      // create_worktree/git_commit/git_push already refuse.
+      const branch = 'topic-feature';
+      const branchWorktree = join(firstTopic, checkoutDirName('wiki', branch));
+      createHostClone(remote, branchWorktree, { repo: 'wiki', branch, startedFrom: 'origin-head' });
+
+      const fakeGh = installFakeGh();
+      try {
+        // gh is faked so a swallowed refusal cannot hide behind a real `gh`
+        // failure of its own (missing binary, no network, etc.): if the
+        // fallback fires at all, `gh pr create` succeeds and this test fails
+        // loudly on `isError`/the message instead of ambiguously.
+        const pr = await openPrTool.handler({ repo: 'wiki', title: 'should be refused', branch });
+        expect(pr.isError).toBe(true);
+        expect(pr.content[0].text).toContain('left over from a clone-mode period');
+        expect(pr.content[0].text).toContain('not secret-scanned on push');
+      } finally {
+        fakeGh.restore();
+      }
+    });
+
+    test('clone mode plus an ordinary code repo still gives a clone (#666 follow-up: unaffected)', async () => {
+      process.env.NANOCLAW_CHECKOUT_MODE = 'clone';
+      const { inbound, outbound } = initTestSessionDb();
+      delete process.env.NANOCLAW_REPOSITORY_ACTION_TRANSPORT;
+      try {
+        const seen = new Set<string>();
+        const branch = 'still-a-clone-branch';
+        const dirName = checkoutDirName('proj', branch);
+        const clonePath = join(firstTopic, dirName);
+        createHostClone(remote, clonePath, { repo: 'proj', branch, startedFrom: 'origin-head' });
+
+        const callPromise = createWorktreeTool.handler({ repo: 'proj', branch });
+        // A non-scan-policy repo still goes through the host repository_checkout
+        // round-trip — the scan-policy override only pins 'wiki'.
+        const request = await waitForOutboundAction(outbound, 'repository_checkout', seen);
+        writeRepositoryActionResponse(inbound, request.requestId, {
+          ok: true,
+          dirName,
+          branch,
+          created: true,
+          startedFrom: 'origin-head',
+        });
+        const response = await callPromise;
+        expect(response.isError).toBeFalsy();
+        // A clone has its own independent `.git` directory, never a gitdir pointer file.
+        expect(lstatSync(join(clonePath, '.git')).isDirectory()).toBe(true);
+      } finally {
+        closeSessionDb();
+      }
     });
 
     test('worktree mode creates linked worktrees exactly as today', async () => {
@@ -1440,5 +1712,102 @@ describe('topic-linked worktree topology', () => {
         closeSessionDb();
       }
     });
+  });
+});
+
+describe('isScanPolicyRepositoryName fail-closed behavior (#682 round 2 blocking fix)', () => {
+  // scan-policy-repos.test.ts covers loadScanPolicyRepositoryNames itself
+  // (every malformed shape, and that importing the loader module never
+  // throws). These tests cover the CALLER side that lives in this file:
+  // isScanPolicyRepositoryName's memoization and its fail-closed behavior
+  // when the load fails, via the resetScanPolicyRepositoryNamesForTest seam.
+  let scratchDir: string;
+
+  beforeEach(() => {
+    scratchDir = mkdtempSync(join(tmpdir(), 'gw-scan-policy-'));
+  });
+
+  afterEach(() => {
+    // Always clear the cache AND restore the real data path — later tests in
+    // this file (the wiki leftover-clone tests above, which rely on the
+    // real scan-policy-repos.json saying 'wiki' is scan-policy) must never
+    // see a fixture path or a stale cached decision left behind here.
+    resetScanPolicyRepositoryNamesForTest();
+    try {
+      rmSync(scratchDir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  });
+
+  function fixture(name: string, content: string): string {
+    const filePath = join(scratchDir, name);
+    writeFileSync(filePath, content);
+    return filePath;
+  }
+
+  const badShapes: Array<[string, string]> = [
+    ['malformed JSON', '{ this is not valid json'],
+    ['an empty array', '[]'],
+    ['an object', '{"wiki":true}'],
+    ['a bare string', '"wiki"'],
+  ];
+
+  test('fails closed for a missing scan-policy-repos.json — every repo name is treated as scan-policy', () => {
+    const missingPath = join(scratchDir, 'does-not-exist.json');
+    resetScanPolicyRepositoryNamesForTest(missingPath);
+    expect(isScanPolicyRepositoryName('proj')).toBe(true);
+    expect(isScanPolicyRepositoryName('wiki')).toBe(true);
+    expect(isScanPolicyRepositoryName('anything-at-all')).toBe(true);
+  });
+
+  for (const [label, content] of badShapes) {
+    test(`fails closed for ${label} — every repo name is treated as scan-policy`, () => {
+      const filePath = fixture('scan-policy-repos.json', content);
+      resetScanPolicyRepositoryNamesForTest(filePath);
+      expect(isScanPolicyRepositoryName('proj')).toBe(true);
+      expect(isScanPolicyRepositoryName('wiki')).toBe(true);
+      expect(isScanPolicyRepositoryName('anything-at-all')).toBe(true);
+    });
+  }
+
+  test('logs the load failure exactly once, even across many calls', () => {
+    const filePath = fixture('scan-policy-repos.json', '{ this is not valid json');
+    resetScanPolicyRepositoryNamesForTest(filePath);
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(isScanPolicyRepositoryName('proj')).toBe(true);
+      expect(isScanPolicyRepositoryName('wiki')).toBe(true);
+      expect(isScanPolicyRepositoryName('another-repo')).toBe(true);
+      const failureLogs = errorSpy.mock.calls.filter(
+        (args) => typeof args[0] === 'string' && args[0].includes('scan-policy-repos.json failed to load'),
+      );
+      expect(failureLogs.length).toBe(1);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  test('a valid custom list is read from the overridden path, and the decision is memoized', () => {
+    const filePath = fixture('scan-policy-repos.json', JSON.stringify(['only-this-repo']));
+    resetScanPolicyRepositoryNamesForTest(filePath);
+    expect(isScanPolicyRepositoryName('only-this-repo')).toBe(true);
+    expect(isScanPolicyRepositoryName('wiki')).toBe(false);
+
+    // Memoized: removing the file after the first read must not flip the
+    // decision back to fail-closed — the cached list, not the file, governs
+    // every call after the first.
+    rmSync(filePath);
+    expect(isScanPolicyRepositoryName('only-this-repo')).toBe(true);
+    expect(isScanPolicyRepositoryName('wiki')).toBe(false);
+  });
+
+  test('clearing the override restores the real scan-policy-repos.json (wiki)', () => {
+    resetScanPolicyRepositoryNamesForTest(join(scratchDir, 'does-not-exist.json'));
+    expect(isScanPolicyRepositoryName('wiki')).toBe(true); // fail-closed under the bad override
+
+    resetScanPolicyRepositoryNamesForTest(); // clears both the cache and the override
+    expect(isScanPolicyRepositoryName('wiki')).toBe(true); // true for the real reason this time
+    expect(isScanPolicyRepositoryName('some-other-repo')).toBe(false);
   });
 });

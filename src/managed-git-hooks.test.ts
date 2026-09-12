@@ -2,6 +2,7 @@ import { execFileSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./log.js', () => ({
@@ -19,10 +20,17 @@ import {
   MANAGED_PATTERNS_FILENAME,
   migrateExistingCanonicalHooksPath,
   refreshManagedGitHooks,
+  SCAN_POLICY_REPOSITORY_NAMES,
 } from './managed-git-hooks.js';
 import { log } from './log.js';
 import { canonicalRepoDir, repositoriesRoot } from './repository-workspaces.js';
 import { repositoryConfigPath, safeGitConfigGet, safeGitConfigSet } from './safe-git.js';
+
+// src/managed-git-hooks.test.ts -> src -> repo root. Used only to locate the
+// runner's own copy of the scan-policy list on disk below — never to import
+// it as a TS module (this host tsconfig's `rootDir: ./src` would refuse a
+// file outside it the moment `pnpm run typecheck` reached the import).
+const REPO_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 const git = (cwd: string, args: string[]) =>
   execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd, stdio: 'pipe' })
@@ -64,6 +72,30 @@ describe('isScanPolicyRepositoryName', () => {
     expect(isScanPolicyRepositoryName('Wiki')).toBe(false);
     expect(isScanPolicyRepositoryName('code')).toBe(false);
     expect(isScanPolicyRepositoryName('')).toBe(false);
+  });
+});
+
+describe('runner/host scan-policy lists', () => {
+  // The runner cannot import this host module at all (container/agent-runner
+  // is a separate Bun package tree, no shared modules — CLAUDE.md's Module
+  // System section), so it keeps its own copy of the scan-policy list as
+  // plain JSON (container/agent-runner/src/mcp-tools/scan-policy-repos.json,
+  // read by container/agent-runner/src/mcp-tools/scan-policy-repos.ts).
+  // Reading that JSON file directly here — never importing the runner's .ts
+  // module, which would pull a file outside this project's `rootDir: ./src`
+  // into `pnpm run typecheck` — is what lets this test fail CI the moment
+  // either list is widened (or narrowed) without the other (#680 follow-up).
+  it('the runner copy (scan-policy-repos.json) deep-equals the host list', () => {
+    const runnerListPath = path.join(
+      REPO_ROOT,
+      'container',
+      'agent-runner',
+      'src',
+      'mcp-tools',
+      'scan-policy-repos.json',
+    );
+    const runnerList = JSON.parse(fs.readFileSync(runnerListPath, 'utf8')) as unknown;
+    expect(runnerList).toEqual([...SCAN_POLICY_REPOSITORY_NAMES]);
   });
 });
 
