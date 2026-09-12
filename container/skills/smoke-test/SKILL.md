@@ -347,6 +347,62 @@ coverage. **Browser lanes must not start if this script
 exits non-zero.** Treat that exit as `BLOCKED_BUILD_IDENTITY` and stop — do not
 dispatch the UI adversary or backend verifier lanes against an unproven build.
 
+**Freeze the deployed PAIR with `scripts/smoke-pair-identity.sh`, not a
+per-run ad hoc script.** `smoke-build-identity.sh` proves the bundle/host
+binding once; it does not re-prove the environment still serves the SAME
+build a minute, or an hour, into a long run. A shared dev environment can be
+replaced under a live run by an unrelated deploy — a different failure from
+`smoke-build-identity.sh`'s bundle-host seam and not caught by it. Configure
+`SMOKE_GATE_FRONTEND_SERVICE` / `SMOKE_GATE_BACKEND_SERVICE` (the same names
+`smoke-develop-gate.sh` reads — one wrapper env file configures both) and:
+
+```bash
+bash /app/skills/smoke-test/scripts/smoke-pair-identity.sh start <run-dir>
+bash /app/skills/smoke-test/scripts/smoke-pair-identity.sh check <run-dir> <label>
+bash /app/skills/smoke-test/scripts/smoke-pair-identity.sh finish <run-dir>
+```
+
+Every run, from the coordinator freezing before dispatch: `start` before any
+lane runs; every lane (worker, challenger, coordinator) `check`s at its own
+start and end; the coordinator `finish`es before publication. `check`/`finish`
+exit 3 on drift — finish the run **BLOCKED**, never a scored verdict — exit 2
+means the identity itself is unreadable/invalid (refuse, do not proceed), and
+exit 4 from `start` means this run already froze an identity: never re-freeze
+by calling `start` again. Reachability checks (`smoke-build-identity.sh`'s
+bundle/host and `/healthz`) stay separate from identity — they answer "is
+something serving", not "is it the pair this run claimed."
+
+**On drift, the coordinator may re-freeze exactly once per run** with
+`refreeze <run-dir> <reason>`, instead of finishing the whole run BLOCKED for
+what may be one unrelated redeploy:
+
+```bash
+bash /app/skills/smoke-test/scripts/smoke-pair-identity.sh refreeze <run-dir> "<reason>"
+```
+
+This is bounded, not a way to paper over drift: a second `refreeze` call in
+the same run — whether or not another drift is ever detected — is refused
+(exit 4), so a run gets at most one do-over. `refreeze` records the OLD pair,
+the NEW pair, the reason, and a timestamp in `identity.json`'s `history[]`
+(cite both pairs in the run record and the verdict, never just the new one)
+and bumps an internal `freezeGeneration`. Every `check`/`finish` receipt from
+before the re-freeze stays on disk as an honest record that the drift
+happened, but `finish` only looks at receipts recorded at the run's CURRENT
+freeze generation — a stale-generation receipt neither blocks nor clears
+publication, the same way `smoke-run-scaffold.sh`'s lane generations already
+work (see "Re-running a lane" above; this reuses that mechanism rather than
+inventing a parallel one). Concretely, after a `refreeze`:
+
+1. every lane already dispatched against the OLD pair has evidence that
+   predates the run's current identity — `redispatch` it before trusting
+   anything it reports from here on: `smoke-run-scaffold.sh redispatch
+   <run-dir> <lane-id>` for each such lane, then re-brief and re-run it;
+2. each redispatched lane calls `check <run-dir> <label>` again at its new
+   start/end, so a receipt exists at the CURRENT generation — `finish` refuses
+   (exit 2) until at least one does;
+3. a second drift after the one allowed re-freeze finishes the run BLOCKED,
+   exactly like an unhandled first drift would.
+
 A scheduled run arrives with the head already proven settled by the gate. A
 campaign someone asked for in chat does not, and must prove it before freezing
 and claim the environment after — see "Human-requested campaigns" below.
@@ -1505,6 +1561,50 @@ real one.
 Downstream rule: flag present → automatic hold on promotion; flag absent → no
 smoke objection. Absence semantics make rollout safe — history predating the
 smoke watcher never gates anything.
+
+### Re-verification and other scheduled tasks: unsettled or red is BLOCKED, never FAIL
+
+A scheduled re-verification, certification, or evidence-recovery task reads
+`smoke-develop-gate.sh check` the same way a human-requested campaign does
+(above), but it is usually not opening a campaign at all — it is re-checking a
+specific closed finding against whatever develop currently deploys. That task
+still has to decide what to do when `check` reports `settled:false` or a red
+CI check on the head it was told to test.
+
+**An unsettled or red environment is not a product result.** It answers "is
+this build ready to look at", not "does the fix work" — scoring it PASS or
+FAIL either way manufactures a verdict about a build nobody actually tested. A
+`FAIL` recorded here reopens a closed issue over CI timing, not a regression,
+and the next retry that finds the SAME build green makes that reopen visibly
+wrong after the fact.
+
+The correct outcome is **BLOCKED, with the reason named**, reached by waiting
+and re-checking rather than checking once and giving up:
+
+```bash
+bash /workspace/agent/smoke-develop-gate.sh wait-settled
+```
+
+This polls `check` on `SMOKE_GATE_WAIT_INTERVAL_SECONDS` (default 5 min) up to
+`SMOKE_GATE_WAIT_MAX_SECONDS` (default 45 min total), read-only throughout —
+no claim, no state write. It exits 0 with `settled:true` the moment the build
+settles, so the task simply carries on into its normal read/verify steps using
+the SHAs the settled response names. If the environment never settles inside
+the window, it exits non-zero with `timedOut:true` and the underlying check's
+own diagnostic (`failedChecks`, `pendingChecks`, `deployLagAccepted`, …) still
+attached — finish the task **BLOCKED** with that reason, post it plainly, and
+schedule a follow-up rather than silently absorbing the wait: a build that is
+still red 45 minutes later is itself worth naming, not just retrying forever
+unannounced. Never issue PASS, FAIL, VERIFIED, or NOT VERIFIED off a
+`timedOut:true` response — those verbs are for a build this task actually
+observed.
+
+`wait-settled` never claims the slot, so it composes with everything above:
+a human-requested campaign still calls plain `check` once and freezes
+immediately on `settled:true` per the campaign-open flow; `wait-settled` is
+for a task that would otherwise have to hand-roll its own poll-and-sleep loop
+around `check` — which is what produced a 20-minute cron job and a bespoke
+wait script for one run on 2026-09-11, reinventing exactly this.
 
 ### An undecided hold stops the next round (`SMOKE_GATE_DECISION_LEDGER`)
 
