@@ -528,26 +528,38 @@ export function classifyCanonicalRepositories(
   for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
     const repoPath = path.join(workgroupRoot, entry.name);
     let problem: { reason: string; commondir: boolean } | null;
+    let served: CanonicalRepository | null = null;
     try {
       assertRepositoryName(entry.name);
       problem =
         !entry.isDirectory() || entry.isSymbolicLink()
           ? { reason: `invalid entry in canonical repository namespace: ${repoPath}`, commondir: false }
           : containedNormalCloneProblem(repoPath, workgroupRoot);
+      if (!problem) {
+        // Inside the try as well: this repository's coordination files are its
+        // own, and an I/O fault on one of them (a symlinked `repository.lock`,
+        // say) must make that repository unusable rather than throw out of the
+        // classifier and stop the whole workgroup spawning.
+        served = {
+          name: entry.name,
+          path: repoPath,
+          gitDir: path.join(repoPath, '.git'),
+          lockPath: ensureRepositoryLock(workgroupId, entry.name, dataDir),
+          originPinPath: originPinPath(workgroupId, entry.name, dataDir),
+        };
+      }
     } catch (error) {
       problem = { reason: describeError(error), commondir: false };
     }
-    if (problem) {
-      unusable.push({ name: entry.name, path: repoPath, ...problem });
+    if (problem || !served) {
+      unusable.push({
+        name: entry.name,
+        path: repoPath,
+        ...(problem ?? { reason: `canonical repository could not be prepared: ${repoPath}`, commondir: false }),
+      });
       continue;
     }
-    repositories.push({
-      name: entry.name,
-      path: repoPath,
-      gitDir: path.join(repoPath, '.git'),
-      lockPath: ensureRepositoryLock(workgroupId, entry.name, dataDir),
-      originPinPath: originPinPath(workgroupId, entry.name, dataDir),
-    });
+    repositories.push(served);
   }
   return { repositories, unusable };
 }

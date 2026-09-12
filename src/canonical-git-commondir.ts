@@ -51,6 +51,16 @@ export function canonicalCommondirPath(gitDir: string): string {
  * EXDEV), but a container spawned before the sentinel existed can, and so can
  * one that stages a clone for publication. Such an alias is refused, never
  * removed: the host cannot know who else holds it.
+ *
+ * The type checks below are deliberately redundant, and none of them bites
+ * alone. `isSymbolicLink()` is genuinely subsumed by `!stat.isFile()` on the
+ * same lstat, and O_NOFOLLOW only covers a symlink swapped in after it. The
+ * size check hides all three in most fixtures, because an lstat on a symlink
+ * reports the length of its TARGET PATH: any target but a two-byte one
+ * already differs from the sentinel's two bytes. The fixture that does
+ * separate them is a symlink whose target path is exactly two bytes, in
+ * src/container-runner.test.ts — delete all three guards and that one is
+ * accepted as the sentinel.
  */
 export function readCanonicalCommondir(gitDir: string): CanonicalCommondirState {
   const file = canonicalCommondirPath(gitDir);

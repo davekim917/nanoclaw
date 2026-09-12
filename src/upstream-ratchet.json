@@ -694,7 +694,7 @@
 "src/container-restart.test.ts":{"diff":979,"mode":"100644","sha256":"aa300ea379394be434e7edd4de3bd1122942f2028799f464ed3a8bba8c540001"},
 "src/container-restart.ts":{"diff":1023,"mode":"100644","sha256":"322c0a8ff99f6e12d6cb9395bd7a56bba96bfa5828f6d81dba668dbbf4aa2fe3"},
 "src/container-runner.claims.test.ts":{"diff":111,"mode":"100644","sha256":null,"deleted":true},
-"src/container-runner.test.ts":{"diff":2846,"mode":"100644","sha256":"727f58dd054b8588d4b470b2b600886b9af3e2d62de59102659846ac19fe67e4"},
+"src/container-runner.test.ts":{"diff":2858,"mode":"100644","sha256":"3c1b556a14eaef8a118f0f04396fb2b5d2d41b9e85b2cdc508156b4487a0feeb"},
 "src/container-runner.ts":{"diff":7660,"mode":"100644","sha256":"1f3dcadfcbe84173243b372d9f5b1a6bd05cd9c7ae6cb879ae6f1ff738896fb1"},
 "src/container-runtime.ts":{"diff":268,"mode":"100644","sha256":"26f798adcd4ac572eff3ed83a2fc9b3704caa220ba3e734f53037595744c6a00"},
 "src/db/agent-groups.ts":{"diff":78,"mode":"100644","sha256":"87177f053c32a495ad54c43ba18c3e14ada8f107403ca2ba83aca2590801871f"},

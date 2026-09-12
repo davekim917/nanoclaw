@@ -2573,6 +2573,18 @@ describe('canonicalGitControlMounts commondir sentinel (#669)', () => {
         fs.linkSync(commondir, path.join(path.dirname(commondir), 'writable-alias'));
       },
     ],
+    [
+      // The only shape that separates the type guards from the size check: an
+      // lstat on a symlink reports its TARGET PATH's length, so a two-byte
+      // target ("ab", resolved beside the symlink) is size 2 and nlink 1, exactly
+      // like the sentinel. Delete isSymbolicLink(), !isFile() and O_NOFOLLOW
+      // together and the bytes behind this link are accepted.
+      'a symlink whose target path is two bytes',
+      (commondir) => {
+        fs.writeFileSync(path.join(path.dirname(commondir), 'ab'), '.\n');
+        fs.symlinkSync('ab', commondir);
+      },
+    ],
   ])('refuses, and never overwrites, a commondir that is %s', (shape, plant) => {
     const { root, gitDir, stateDir } = canonicalGitDir(shape.replace(/\W+/g, '-'));
     const commondir = path.join(gitDir, 'commondir');
