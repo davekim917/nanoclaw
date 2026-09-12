@@ -144,6 +144,8 @@ cannot serve them.
   with dedup through `inFlight` and a deferred ack (`job-runner.ts:43,142`).
 - **Publish** quiesces and restarts every container in the workgroup, and waits for admitted
   tools to finish (`index.ts:608-621`), because every container mounts every canonical.
+  (The #655 fix narrowed this to the requester's thread: mounts are fixed at spawn, so other
+  threads see a new canonical at their next container start.)
 - **Refresh** fast-forwards the canonical from its own refs (`index.ts:319-346,692-723`). The
   canonical checkout is detached (`index.ts:302,338`).
 - **Local-only canonicals** start new worktrees from canonical `HEAD^{commit}` and skip refresh
@@ -410,7 +412,8 @@ container-writable mount, not a structural fix. A separate issue tracks the moun
 
 ### 5.6 Publish
 
-Unchanged in Phase 2.
+Unchanged in Phase 2. (Later, the #655 fix narrowed publish's quiescence and restart to the
+requester's thread.)
 
 ### 5.7 Dependency cache (`src/dependency-cache.ts`)
 

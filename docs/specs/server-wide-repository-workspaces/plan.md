@@ -85,7 +85,8 @@ Keep `clone_repo`, `create_worktree`, `git_commit`, `git_push`, and `open_pr`.
   synchronous 30-second CLI bridge;
 - validates origin and repository identity, atomically publishes the host
   canonical, then quiesces and respawns the workgroup so every sibling receives
-  consistent mounts; and
+  consistent mounts (the #655 fix narrowed this to the requester's thread; other
+  threads see the canonical at their next container start); and
 - stores credential-free origin pins atomically in a host-only directory.
 
 `create_worktree`:

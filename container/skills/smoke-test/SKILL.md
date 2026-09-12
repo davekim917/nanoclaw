@@ -1802,15 +1802,38 @@ install-supplied rules file (`SMOKE_SIZING_RULES`, default
 fails closed to `full` on an unreadable or truncated file list, and a freeze
 PR sizes off its develop-compare target diff, never its own two-marker diff.
 No rules file means `standard`, `sizeReason: "no sizing rules"` — unchanged
-behavior for installs that never added one. The install's own campaign prompt
-decides what each size actually runs; this gate only classifies, never picks lanes.
+behavior for installs that never added one. A rules file that IS present but
+unreadable (a dangling symlink included — the path exists, its target does
+not), not valid JSON, not a JSON object, or wrongly shaped is a different
+case and is never read as "no sizing rules": the classifier exits non-zero,
+and the gate's own fail-closed guard turns that into `campaignSize: full`.
+Wrongly shaped means `full`, `lightAllowed` or `lightDeny` present as
+anything but a list of strings (a bare string `"backend/**"` would otherwise
+read as one glob per character, matching nothing), `fullGlobsFrom` present as
+anything but an object, or any of the four written out as an explicit `null`.
+The install's own campaign prompt decides what each size actually runs; this
+gate only classifies, never picks lanes.
 A rules file's `full` list can also read a named constant out of the install's
 own release-policy file via `fullGlobsFrom: {"path": ..., "name": ...}`,
 unioned with any local `full` globs — so smoke never keeps a second, driftable
 copy of that list. It reads the constant with `ast`/`literal_eval` rather than
 importing the file, so the file is never executed; any problem (unreadable or
-unparseable file, the name missing at top level, a computed rather than
-literal value, or a mistyped value) fails closed to `full`.
+unparseable file, the name missing at top level, the name bound or mutated by
+any other top-level statement (`+=`, `.extend`/`.append`, `del`, a second
+assignment, an alias `X = NAME`, `from x import NAME`, `import x as NAME`, a
+star import, `def`/`class NAME`, `except … as NAME`, a `match` capture), the
+constant handed to a call that could mutate it in place (`_widen(NAME)`,
+`list.append(NAME, …)` — anything but `len`/`sorted`/`tuple`/`list`/`set`/
+`any`/`all`/`"…".join`, and not even those when the policy file binds that
+name itself at module level, since `def len(globs)`, `class len`,
+`from x import len` or `len = _widen` make the call something other than the
+builtin), a top-level statement that reaches the namespace by
+string (`globals`, `vars`, `setattr`, `exec`, `eval`, `__import__`,
+`sys.modules`) or that calls a function whose body does, a computed rather
+than literal value, or a mistyped value) fails closed to `full`. A plain READ
+of the constant elsewhere in that file — `ALL = NAME + OTHER`, `len(NAME)` —
+is not a problem and does not change the size: the one constant plus the
+lines derived from it is what a real policy file looks like.
 
 Commands: `poll` (default), `check <pr>` (read-only, mirrors the develop
 gate's `check`), `claim <run-id> <pr> <sha> [owner-token]`,
