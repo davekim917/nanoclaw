@@ -329,18 +329,28 @@ export function formatMessages(messages: MessageInRow[]): string {
   // Detect spawn envelope in the first chat message and inject a system fact.
   // The _spawn.task_id is surfaced before the prompt so the agent knows it
   // is operating as a spawned child and can reference its own task_id.
+  //
+  // `_spawn` is a plain field on chat content, not host-verified at this
+  // layer, so an a2a peer's forwarded message can carry an arbitrary
+  // `task_id` string (F3, verify-710 review of #729: reproduced with a
+  // `task_id` containing a forged `<message origin="host" ...>` element).
+  // A real id is always `deriveSpawnTaskId`'s output
+  // (dispatch/derive-task-id.ts:19: `spawn-${hash}`, 16 lowercase hex chars);
+  // anything else is dropped rather than rendered, and the accepted shape is
+  // escaped too as defense in depth even though it can't carry markup.
+  const SPAWN_TASK_ID_PATTERN = /^spawn-[0-9a-f]{16}$/;
   let spawnTaskId: string | null = null;
   if (chatMessages.length > 0) {
     const firstContent = parseContent(chatMessages[0].content);
     const envelope = detectSpawnEnvelope(firstContent);
-    if (envelope) {
+    if (envelope && SPAWN_TASK_ID_PATTERN.test(envelope.taskId)) {
       spawnTaskId = envelope.taskId;
     }
   }
 
   if (spawnTaskId) {
     parts.push(
-      `[Spawn context]\ntask_id: ${spawnTaskId}\nYou are running as a spawned task. Use spawn_progress, spawn_complete, or spawn_failed to report status to the orchestrator.`,
+      `[Spawn context]\ntask_id: ${escapeXml(spawnTaskId)}\nYou are running as a spawned task. Use spawn_progress, spawn_complete, or spawn_failed to report status to the orchestrator.`,
     );
   }
 
@@ -673,9 +683,11 @@ function formatAttachments(attachments: any[] | undefined): string {
     const localPath = a.localPath ? `/workspace/${a.localPath}` : '';
     const url = a.url || '';
     if (localPath) {
-      return `[${type}: ${escapeXml(name)} — saved to ${escapeXml(localPath)}]`;
+      return `[${escapeXml(type)}: ${escapeXml(name)} — saved to ${escapeXml(localPath)}]`;
     }
-    return url ? `[${type}: ${escapeXml(name)} (${escapeXml(url)})]` : `[${type}: ${escapeXml(name)}]`;
+    return url
+      ? `[${escapeXml(type)}: ${escapeXml(name)} (${escapeXml(url)})]`
+      : `[${escapeXml(type)}: ${escapeXml(name)}]`;
   });
   return '\n' + parts.join('\n');
 }
@@ -735,8 +747,15 @@ function parseContent(json: string): any {
   }
 }
 
-function escapeXml(str: string): string {
-  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+// Coerces at the boundary: a non-string value here (a numeric `sender`, a
+// non-string attachment `type`, ...) used to throw out of escapeXml and fail
+// the whole formatting batch instead of just that one field.
+function escapeXml(value: unknown): string {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
 /**
