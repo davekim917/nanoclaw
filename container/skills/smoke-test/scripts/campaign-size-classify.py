@@ -114,25 +114,56 @@ def match_first(path, compiled_rules):
     return None
 
 
+def _references_name(node, name):
+    """True if `name` appears as an `ast.Name` anywhere within `node` --
+    target, value, or nested call. Used to catch every shape of top-level
+    statement that touches a policy constant besides assigning it outright:
+    `name += [...]` (ast.AugAssign), `name.extend(...)`/`name.append(...)`
+    (an ast.Expr wrapping a Call), `del name` (ast.Delete), and so on."""
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name) and sub.id == name:
+            return True
+    return False
+
+
 def _find_top_level_assignment(tree, name):
-    """Return the AST value node of the LAST top-level `name = ...` (or
-    `name: T = ...`) assignment in `tree.body`, matching normal module
-    semantics where a later assignment shadows an earlier one, or None if
-    `name` is never assigned at module top level. Deliberately does not
+    """Return `(value_node, None)` for the sole top-level `name = ...` (or
+    `name: T = ...`) assignment in `tree.body` -- the one shape this format
+    trusts -- or `(None, reason)` if `name` is never assigned at top level,
+    or if ANY other top-level statement mutates, rebinds, deletes, or
+    otherwise touches `name`: a second assignment, `+=`, `.extend(...)`,
+    `.append(...)`, `del name`, item assignment, and so on.
+
+    Deliberately does not try to evaluate what such a statement does --
+    refusing is the safe, simple behaviour for every shape but the single
+    literal assignment this format trusts; a partial policy silently read as
+    complete is exactly the failure mode this guards against. Does not
     descend into functions, classes, or conditionals -- a value assigned
     conditionally or built inside a function is not a fixed policy constant
     this format can trust."""
     found = None
     for node in tree.body:
+        is_plain_assign = False
         if isinstance(node, ast.Assign):
-            targets = node.targets
+            is_plain_assign = any(isinstance(t, ast.Name) and t.id == name for t in node.targets)
         elif isinstance(node, ast.AnnAssign):
-            targets = [node.target] if node.value is not None else []
-        else:
-            continue
-        if any(isinstance(t, ast.Name) and t.id == name for t in targets):
+            is_plain_assign = (
+                isinstance(node.target, ast.Name)
+                and node.target.id == name
+                and node.value is not None
+            )
+        if is_plain_assign:
+            if found is not None:
+                return None, "reassigned at top level (a second assignment makes the value untrustworthy)"
             found = node.value
-    return found
+            continue
+        if _references_name(node, name):
+            return None, "mutated by another top-level {} statement after assignment".format(
+                type(node).__name__
+            )
+    if found is None:
+        return None, "not found at top level"
+    return found, None
 
 
 def load_full_globs_from(spec):
@@ -152,7 +183,9 @@ def load_full_globs_from(spec):
 
     Every failure mode here is a caller instruction to fail closed to `full`
     — an unreadable file, a file that doesn't parse, a name never assigned at
-    top level, a value that isn't a literal, and a value of the wrong type
+    top level, a name mutated or rebound by any top-level statement besides
+    the one trusted assignment (`+=`, `.extend`/`.append`, `del`, a second
+    assignment), a value that isn't a literal, and a value of the wrong type
     are all indistinguishable from "this rules file's full-glob policy could
     not be read," which must never silently fall through to a lighter
     campaign.
@@ -174,9 +207,11 @@ def load_full_globs_from(spec):
         tree = ast.parse(source, filename=path)
     except (SyntaxError, ValueError) as exc:
         return None, "fullGlobsFrom.path {} could not be parsed: {}".format(path, exc)
-    value_node = _find_top_level_assignment(tree, name)
+    value_node, reason = _find_top_level_assignment(tree, name)
     if value_node is None:
-        return None, "fullGlobsFrom.name {} not found at top level in {}".format(name, path)
+        if reason == "not found at top level":
+            return None, "fullGlobsFrom.name {} not found at top level in {}".format(name, path)
+        return None, "fullGlobsFrom.name {} in {} is untrustworthy: {}".format(name, path, reason)
     try:
         value = ast.literal_eval(value_node)
     except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError) as exc:
@@ -236,16 +271,42 @@ def main():
         print(json.dumps({"campaignSize": "standard", "sizeReason": "no sizing rules"}))
         return
 
+    # An ABSENT file is "never configured" -- backward compatible, standard.
+    # A file that IS present but unreadable or malformed must not collapse
+    # into that same case: smoke-pr-gate.sh:1221-1226 treats a non-zero exit
+    # here (or a stdout reply that isn't {campaignSize: str, sizeReason: str})
+    # as "the classifier failed" and forces campaignSize=full, so those are
+    # the two ways to signal "not configured" and "configured but broken" to
+    # the caller -- exit 0 with the standard reply for the former, a non-zero
+    # exit (nothing meaningful on stdout) for the latter.
     try:
         with open(rules_path, "r", encoding="utf-8") as fh:
-            rules = json.load(fh)
-    except (OSError, ValueError):
+            source = fh.read()
+    except FileNotFoundError:
         print(json.dumps({"campaignSize": "standard", "sizeReason": "no sizing rules"}))
         return
+    except (OSError, UnicodeDecodeError) as exc:
+        print(
+            "sizing rules file {} is present but could not be read: {}".format(rules_path, exc),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        rules = json.loads(source)
+    except ValueError as exc:
+        print(
+            "sizing rules file {} is present but could not be parsed as JSON: {}".format(rules_path, exc),
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     if not isinstance(rules, dict):
-        print(json.dumps({"campaignSize": "standard", "sizeReason": "no sizing rules"}))
-        return
+        print(
+            "sizing rules file {} is present but is not a JSON object".format(rules_path),
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     size, reason = classify(files, rules)
     print(json.dumps({"campaignSize": size, "sizeReason": reason}))

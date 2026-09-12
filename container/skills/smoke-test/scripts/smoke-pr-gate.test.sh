@@ -1585,6 +1585,86 @@ bash "$GATE" check 301 | jq -e '
 unset STUB_PARENT_SHA STUB_COMPARE_FILES SMOKE_SIZING_RULES
 
 # =============================================================================
+# Campaign-size classifier: present-but-broken sizing rules must fail closed,
+# never collapse into "no sizing rules" (shadow-review #721). The caller's
+# guard (smoke-pr-gate.sh:1221-1226) treats a non-zero classifier exit, or a
+# stdout reply that isn't {campaignSize: string, sizeReason: string}, as
+# "the classifier failed" and forces campaignSize=full -- so the fix is a
+# non-zero exit with nothing meaningful on stdout, not a specific JSON shape.
+# =============================================================================
+fresh_state
+CLASSIFY="$SCRIPT_DIR/campaign-size-classify.py"
+
+# A directory in place of a file is unreadable regardless of container uid --
+# deterministic across environments, unlike chmod 000 under root.
+# NOTE: each check below uses `if OUT=$(...); then FAIL; fi` rather than a
+# bare `OUT=$(...); CODE=$?` -- under this file's `set -e -o pipefail`, a bare
+# assignment from a failing command substitution would abort the whole test
+# script before the next line could inspect $?; putting it in the `if`
+# condition is the standard exemption from errexit.
+DIR_AS_RULES="$STATE_DIR/rules-is-a-dir.json"
+mkdir -p "$DIR_AS_RULES"
+if OUT="$(echo '[]' | python3 "$CLASSIFY" "$DIR_AS_RULES" 2>/dev/null)"; then
+  echo "721: unreadable (directory) rules file exited 0 (stdout: $OUT)" >&2
+  exit 1
+fi
+[ -z "$OUT" ] || { echo "721: unreadable rules file printed stdout instead of failing closed" >&2; exit 1; }
+
+# Invalid JSON must fail closed, not read as "no sizing rules".
+BAD_JSON_RULES="$STATE_DIR/bad-json-rules.json"
+printf '{ not valid json' > "$BAD_JSON_RULES"
+if OUT="$(echo '[]' | python3 "$CLASSIFY" "$BAD_JSON_RULES" 2>/dev/null)"; then
+  echo "721: invalid-JSON rules file exited 0 (stdout: $OUT)" >&2
+  exit 1
+fi
+[ -z "$OUT" ] || { echo "721: invalid-JSON rules file printed stdout instead of failing closed" >&2; exit 1; }
+
+# A YAML document is not valid JSON -- same malformed-file direction, a
+# different concrete shape of "the file parses as something, just not JSON".
+YAML_RULES="$STATE_DIR/yaml-rules.yaml"
+cat > "$YAML_RULES" <<'YAML'
+full:
+  - backend/migrations/**
+YAML
+if OUT="$(echo '[]' | python3 "$CLASSIFY" "$YAML_RULES" 2>/dev/null)"; then
+  echo "721: YAML rules file exited 0 (stdout: $OUT)" >&2
+  exit 1
+fi
+[ -z "$OUT" ] || { echo "721: YAML rules file printed stdout instead of failing closed" >&2; exit 1; }
+
+# Valid JSON that isn't an object (a bare array) must fail closed too.
+ARRAY_RULES="$STATE_DIR/array-rules.json"
+echo '["full"]' > "$ARRAY_RULES"
+if OUT="$(echo '[]' | python3 "$CLASSIFY" "$ARRAY_RULES" 2>/dev/null)"; then
+  echo "721: non-dict rules document exited 0 (stdout: $OUT)" >&2
+  exit 1
+fi
+[ -z "$OUT" ] || { echo "721: non-dict rules document printed stdout instead of failing closed" >&2; exit 1; }
+
+# An ABSENT file is still the backward-compatible "no sizing rules" case,
+# exit 0 -- must not regress alongside the above.
+ABSENT_RULES="$STATE_DIR/absent-rules.json"
+echo '[]' | python3 "$CLASSIFY" "$ABSENT_RULES" | jq -e '
+  .campaignSize == "standard" and .sizeReason == "no sizing rules"
+' >/dev/null
+
+# End-to-end: the gate's own fail-closed guard (smoke-pr-gate.sh:1221-1226)
+# fires off the classifier's non-zero exit for a present-but-malformed file,
+# the same way it already does for a classifier crash.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export SMOKE_SIZING_RULES="$STATE_DIR/bad-json-rules.json"
+printf '{ not valid json' > "$SMOKE_SIZING_RULES"
+HEAD_SHA="$(sha 9)"
+export STUB_PR_VIEW="{\"number\":302,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"frontend/a.css"}]'
+bash "$GATE" check 302 | jq -e '
+  .campaignSize == "full" and .sizeReason == "full: campaign size classifier failed"
+' >/dev/null
+unset SMOKE_SIZING_RULES
+
+# =============================================================================
 # #1536 / #1603 — preview-identity disambiguation and the post-finish warm-up
 # false alarm. Render has twice provisioned two services sharing one display
 # name under the same parent (PR #1533, PR #1637); the gate used to take
@@ -1949,6 +2029,90 @@ echo '["frontend/auth/login.tsx"]' | python3 "$CLASSIFY" "$FGF_UNION" | jq -e '
 ' >/dev/null
 echo '["backend/permissions/roles.ts"]' | python3 "$CLASSIFY" "$FGF_UNION" | jq -e '
   .campaignSize == "full" and (.sizeReason | test("matched backend/permissions"))
+' >/dev/null
+
+# --- Any top-level statement that mutates or rebinds the imported name,
+# other than the single trusted literal assignment, must fail closed too
+# (shadow-review #723) -- AugAssign, `.extend`/`.append`, a second
+# (re)assignment, and `del` all silently kept only the first literal before
+# this fix, so a partial policy classified `light` instead of `full`.
+
+# `+=` after the initial assignment.
+AUGASSIGN_MOD="$STATE_DIR/policy-augassign.py"
+cat > "$AUGASSIGN_MOD" <<'PY'
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+SENSITIVE_GLOBS += ["backend/billing/**"]
+PY
+FGF_AUGASSIGN="$STATE_DIR/fgf-augassign.json"
+cat > "$FGF_AUGASSIGN" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$AUGASSIGN_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$FGF_AUGASSIGN" | jq -e '
+  .campaignSize == "full" and (.sizeReason | test("AugAssign"))
+' >/dev/null
+
+# `.extend(...)` after the initial assignment.
+EXTEND_MOD="$STATE_DIR/policy-extend.py"
+cat > "$EXTEND_MOD" <<'PY'
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+SENSITIVE_GLOBS.extend(["backend/billing/**"])
+PY
+FGF_EXTEND="$STATE_DIR/fgf-extend.json"
+cat > "$FGF_EXTEND" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$EXTEND_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$FGF_EXTEND" | jq -e '
+  .campaignSize == "full" and (.sizeReason | test("Expr"))
+' >/dev/null
+
+# `.append(...)` after the initial assignment.
+APPEND_MOD="$STATE_DIR/policy-append.py"
+cat > "$APPEND_MOD" <<'PY'
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+SENSITIVE_GLOBS.append("backend/billing/**")
+PY
+FGF_APPEND="$STATE_DIR/fgf-append.json"
+cat > "$FGF_APPEND" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$APPEND_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$FGF_APPEND" | jq -e '
+  .campaignSize == "full" and (.sizeReason | test("Expr"))
+' >/dev/null
+
+# A second top-level (re)assignment -- even a plain literal one -- is no
+# longer trustworthy either: nothing left in the file distinguishes intended
+# shadowing from an accidental leftover first draft, so this must fail
+# closed rather than silently keep only the last value.
+REASSIGN_MOD="$STATE_DIR/policy-reassign.py"
+cat > "$REASSIGN_MOD" <<'PY'
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+SENSITIVE_GLOBS = ["backend/permissions/**", "backend/billing/**"]
+PY
+FGF_REASSIGN="$STATE_DIR/fgf-reassign.json"
+cat > "$FGF_REASSIGN" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$REASSIGN_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$FGF_REASSIGN" | jq -e '
+  .campaignSize == "full" and (.sizeReason | test("reassigned"))
+' >/dev/null
+
+# `del` after the initial assignment.
+DEL_MOD="$STATE_DIR/policy-del.py"
+cat > "$DEL_MOD" <<'PY'
+SENSITIVE_GLOBS = ["backend/permissions/**", "backend/billing/**"]
+del SENSITIVE_GLOBS
+PY
+FGF_DEL="$STATE_DIR/fgf-del.json"
+cat > "$FGF_DEL" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$DEL_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$FGF_DEL" | jq -e '
+  .campaignSize == "full" and (.sizeReason | test("Delete"))
 ' >/dev/null
 
 # --- Task-scoped certification lease: claim/progress/release --------------
