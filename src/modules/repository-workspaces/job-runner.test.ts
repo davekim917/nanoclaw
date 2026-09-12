@@ -6,6 +6,10 @@
  * safe: one job per request id, strictly one job at a time, an ack the loop no
  * longer writes, and the orphan-fence release on the give-up path.
  */
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 import { log } from '../../log.js';
@@ -62,6 +66,7 @@ const {
   _repositoryActionChainForTesting,
   _repositoryActionLaneCountForTesting,
   _resetRepositoryActionsForTesting,
+  _setRepositoryDrainMarkerPathForTesting,
   REPOSITORY_REQUEST_ID_PATTERN,
 } = await import('./job-runner.js');
 
@@ -74,8 +79,12 @@ function requestId(suffix: string): string {
 /** Let the microtask chain advance without depending on job completion. */
 const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
+let drainMarker: string;
+
 beforeEach(() => {
   _resetRepositoryActionsForTesting();
+  drainMarker = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'repo-drain-')), 'repository-drain-in-flight.json');
+  _setRepositoryDrainMarkerPathForTesting(drainMarker);
   marks.length = 0;
   opened.length = 0;
   releaseOrphans.mockClear();
@@ -357,5 +366,55 @@ describe('runRepositoryActionDetached', () => {
   it('accepts the request ids the container actually generates', () => {
     expect(REPOSITORY_REQUEST_ID_PATTERN.test('repo-1788289675241-b13bcab3ec972233')).toBe(true);
     expect(REPOSITORY_REQUEST_ID_PATTERN.test('repo-1788289675241-NOTHEX0000000000')).toBe(false);
+  });
+});
+
+describe('repository drain marker (#718)', () => {
+  const readMarker = (): Record<string, unknown> => JSON.parse(fs.readFileSync(drainMarker, 'utf8'));
+
+  it('marks a draining action for the deploy while its apply runs, then clears it', async () => {
+    const id = requestId('71');
+    let seen: Record<string, unknown> | null = null;
+    await runRepositoryActionDetached(
+      'repository_publish',
+      async () => {
+        seen = readMarker();
+      },
+      { requestId: id },
+      session,
+    );
+    await _repositoryActionChainForTesting();
+    expect(seen).toMatchObject({ action: 'repository_publish', requestId: id, sessionId: 'sess-1', pid: process.pid });
+    expect(fs.existsSync(drainMarker)).toBe(false);
+  });
+
+  it('clears the marker when the draining action fails', async () => {
+    let present = false;
+    await runRepositoryActionDetached(
+      'repository_transfer',
+      async () => {
+        present = fs.existsSync(drainMarker);
+        throw new Error('timed out waiting for container poll admission');
+      },
+      { requestId: requestId('72') },
+      session,
+    );
+    await _repositoryActionChainForTesting();
+    expect(present).toBe(true);
+    expect(fs.existsSync(drainMarker)).toBe(false);
+  });
+
+  it('does not mark an action that never drains', async () => {
+    let present = true;
+    await runRepositoryActionDetached(
+      'repository_refresh',
+      async () => {
+        present = fs.existsSync(drainMarker);
+      },
+      { requestId: requestId('73') },
+      session,
+    );
+    await _repositoryActionChainForTesting();
+    expect(present).toBe(false);
   });
 });

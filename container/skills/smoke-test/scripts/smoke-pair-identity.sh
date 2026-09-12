@@ -7,17 +7,21 @@
 #   start    <run-dir>          freeze once → <run-dir>/coordinator/identity.json (no-clobber: exit 4 if it exists)
 #   check    <run-dir> <label>  re-read live pair, append coordinator/identity-checks.ndjson
 #   refreeze <run-dir> <reason> bounded re-freeze after drift: exactly ONCE per run (see below)
-#   finish   <run-dir>          coordinator pre-publication check: identity.json present, ≥1 prior
-#                                check at the CURRENT freeze generation, live pair unchanged
+#   finish   <run-dir>          coordinator pre-publication check: identity.json present; after a
+#                                re-freeze, every required lane redispatched since it; ≥1 prior check
+#                                at the CURRENT freeze generation and every such check ok; live
+#                                pair unchanged
 #   read                        print the current live pair as JSON
 #
 # Tests: smoke-pair-identity.test.sh (unchanged, same-commit redeploy, null id,
 # garbage, non-live-first, live→deactivated, non-string ids, re-start after
 # drift, unwritable run dir, unwritable check log, bounded re-freeze — first
-# drift ok, second drift blocked, stale generation ignored — all fail closed).
+# drift ok, second drift blocked, stale generation ignored, finish refused until
+# every lane is redispatched — all fail closed).
 #
-# Exit: 0 unchanged/frozen/re-frozen · 2 unreadable/invalid/unwritable/misconfigured ·
-#       3 DRIFT (lane finishes BLOCKED) · 4 refused (re-start after freeze, or a second re-freeze)
+# Exit: 0 unchanged/frozen/re-frozen · 2 unreadable/invalid/unwritable/misconfigured, or
+#       finish refused (a lane not redispatched since a re-freeze) · 3 DRIFT (lane finishes
+#       BLOCKED) · 4 refused (re-start after freeze, or a second re-freeze)
 #
 # Env: RENDER_API_KEY; SMOKE_GATE_FRONTEND_SERVICE / SMOKE_GATE_BACKEND_SERVICE (required —
 #      no defaults; a missing id fails closed rather than silently identifying the wrong pair.
@@ -32,13 +36,22 @@
 # (a second call, or a second drift after using it, refuses — exit 4), it records the OLD
 # pair plus the reason in identity.json's `history[]` so both pairs are named, not just the
 # new one, and it bumps `freezeGeneration` so `finish` never lets a pre-refreeze check
-# receipt (recorded against the OLD pair) stand in for a post-refreeze one. It does NOT
-# touch lane markers — after a refreeze, the coordinator redispatches every lane whose
-# evidence predates the new pair through smoke-run-scaffold.sh's own `redispatch <run-dir>
-# <lane-id>` (see SKILL.md), the same generation mechanism the barrier already uses for a
-# re-run lane. This script has no notion of a lane and must not grow a second, parallel
-# staleness mechanism for one.
+# receipt (recorded against the OLD pair) stand in for a post-refreeze one.
+#
+# REDISPATCH AFTER RE-FREEZE. A fresher receipt is not fresher lane evidence: before this
+# was enforced, one ok `check` by the coordinator at the new generation cleared `finish`
+# while every lane's evidence still came from the OLD pair (issue #731, F3). `refreeze`
+# therefore snapshots the completion contract's lane generations into identity.json
+# (`refreezeLaneSnapshot`) — the scaffold's own `.lanes[].generation`, which only
+# smoke-run-scaffold.sh `redispatch <run-dir> <lane-id>` (one lane) or `contract
+# --regenerate` (every lane) moves — and `finish` refuses while any required lane is still
+# at or below its snapshot generation. The rule lives in refreeze-lanes.jq and
+# smoke-evidence-barrier.sh applies it too, so skipping `finish` does not skip it. This
+# script still keeps no lane state of its own and never touches markers or the contract;
+# the snapshot is the scaffold's field, copied at one moment. A refreeze with no contract
+# yet snapshots no lanes (none was dispatched); one with markers but no contract refuses.
 set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FE="${SMOKE_GATE_FRONTEND_SERVICE:-}"
 BE="${SMOKE_GATE_BACKEND_SERVICE:-}"
 require_services() {
@@ -154,12 +167,30 @@ PY
     OLD_GEN="$(jq -r '(.freezeGeneration // 1)' <<<"$OLD" 2>/dev/null || echo 1)"
     printf '%s' "$OLD_GEN" | grep -Eq '^[0-9]+$' || OLD_GEN=1
     NEW_GEN=$(( OLD_GEN + 1 ))
+    # Snapshot the contract's lane generations (header, REDISPATCH AFTER RE-FREEZE). A
+    # contract that exists but cannot be read refuses: that is when this script knows least
+    # about which lanes ran on the old pair. No contract but markers on disk refuses too —
+    # the scaffold writes a marker only under a contract, so the contract was removed.
+    C="$RUN/completion-contract.json"
+    if [ -e "$C" ]; then
+      CJSON="$(jq -cs 'if length == 1 then .[0] else "unparsable" end' "$C" 2>/dev/null)" || CJSON='"unparsable"'
+    else
+      for m in "$RUN"/markers/*.json; do
+        [ -e "$m" ] && { echo "REFUSED: lane markers exist under $RUN/markers but there is no completion contract — cannot tell which lanes must be redispatched; nothing re-frozen (exit 2)" >&2; exit 2; }
+      done
+      CJSON=null
+    fi
+    SNAP="$(jq -cn -L "$HERE" --argjson c "$CJSON" 'include "refreeze-lanes"; $c | rl_lane_snapshot')" || {
+      echo "REFUSED: could not snapshot the contract's lane generations — nothing re-frozen (exit 2)" >&2; exit 2; }
+    SNAP_ERR="$(jq -r '.error // empty' <<<"$SNAP")"
+    [ -z "$SNAP_ERR" ] || { echo "REFUSED: $SNAP_ERR — cannot snapshot lane generations; nothing re-frozen (exit 2)" >&2; exit 2; }
     P="$(read_pair)"; rc=$?
     [ $rc -eq 0 ] || { echo "REFUSED: live identity unreadable/invalid — nothing re-frozen: $P" >&2; exit 2; }
     NOW_ISO="$(date -u +%FT%TZ)"
     PAYLOAD="$(jq -c \
       --argjson old "$OLD" --arg reason "$REASON" --arg at "$NOW_ISO" --argjson gen "$NEW_GEN" \
-      '. + {freezeGeneration: $gen,
+      --argjson snap "$SNAP" \
+      '. + {freezeGeneration: $gen, refreezeLaneSnapshot: $snap,
             history: (($old.history // []) + [{
               frontend: $old.frontend, backend: $old.backend, readAt: $old.readAt,
               reason: $reason, refrozenAt: $at}])}' <<<"$P")" || {
@@ -192,11 +223,33 @@ PY
     CUR_GEN="$(jq -r '(.freezeGeneration // 1)' "$F" 2>/dev/null || echo 1)"
     printf '%s' "$CUR_GEN" | grep -Eq '^[0-9]+$' || CUR_GEN=1
     if [ "$1" = finish ]; then
+      # Redispatch after re-freeze (header). Checked first, because it names the remedy the
+      # journal checks below cannot see. With no re-freeze this reads nothing but
+      # identity.json, so a run that never re-froze behaves exactly as before.
+      REFROZEN="$(jq -rs -L "$HERE" 'include "refreeze-lanes"; if length == 1 then (.[0] | rl_refrozen) else error("not one JSON document") end' "$F" 2>/dev/null)"
+      case "$REFROZEN" in
+        false) ;;
+        true)
+          C="$RUN/completion-contract.json"
+          if [ -e "$C" ]; then
+            CJSON="$(jq -cs 'if length == 1 then .[0] else "unparsable" end' "$C" 2>/dev/null)" || CJSON='"unparsable"'
+          else CJSON=null; fi
+          RES="$(jq -cs -L "$HERE" --argjson c "$CJSON" 'include "refreeze-lanes"; .[0] | rl_stale_after_refreeze($c)' "$F" 2>/dev/null)" || {
+            echo "finish: unreadable — could not evaluate the re-freeze lane snapshot (exit 2)"; exit 2; }
+          ERR="$(jq -r '.error // empty' <<<"$RES")"
+          [ -z "$ERR" ] || { echo "finish: unreadable — $ERR (exit 2)"; exit 2; }
+          STALE="$(jq -r '.stale | join(", ")' <<<"$RES")"
+          [ -z "$STALE" ] || {
+            echo "finish: refused — required lanes not redispatched since the pair re-freeze: $STALE; their evidence predates the current pair. Run smoke-run-scaffold.sh redispatch <run-dir> <lane-id> for each, re-run it, then finish again (exit 2)"
+            exit 2; }
+          ;;
+        *) echo "finish: unreadable — identity.json is not valid JSON (exit 2)"; exit 2 ;;
+      esac
       python3 - "$LOG" "$CUR_GEN" <<'PY' || exit $?
 import json, sys
 try: lines = [l for l in open(sys.argv[1]).read().splitlines() if l.strip()]
 except Exception as e: print(f"finish: unreadable — journal missing/unreadable: {e} (exit 2)"); sys.exit(2)
-if not lines: print("finish: unreadable — no lane checks recorded before publication (exit 2)"); sys.exit(2)
+if not lines: print("finish: unreadable — no identity checks recorded before publication (exit 2)"); sys.exit(2)
 cur_gen = int(sys.argv[2])
 current = []
 for i, l in enumerate(lines, 1):
@@ -208,12 +261,14 @@ for i, l in enumerate(lines, 1):
     if int(rec.get("freezeGeneration", 1) or 1) == cur_gen:
         current.append(rec)
 if not current:
-    print(f"finish: unreadable — no lane checks recorded at the current freeze generation ({cur_gen}); a redispatch after refreeze must post fresh checks before publication (exit 2)")
+    print(f"finish: unreadable — no identity checks recorded at the current freeze generation ({cur_gen}); after a refreeze, redispatched lanes must post fresh checks before publication (exit 2)")
     sys.exit(2)
 verdicts = [rec.get("verdict") for rec in current]
-if "drift" in verdicts: print("finish: drift — a lane already recorded drift at the current freeze generation; verdict must be BLOCKED (exit 3)"); sys.exit(3)
+if "drift" in verdicts: print("finish: drift — a check already recorded drift at the current freeze generation; verdict must be BLOCKED (exit 3)"); sys.exit(3)
 bad = [v for v in verdicts if v != "ok"]
-if bad: print(f"finish: unreadable — journal contains non-ok lane checks {bad} at the current freeze generation; every lane must have a clean identity receipt (exit 2)"); sys.exit(2)
+# What is checked: at least one check exists at the current generation and every check
+# there is ok. Check labels are free-form, so this cannot tell which lane posted which.
+if bad: print(f"finish: unreadable — non-ok identity checks {bad} at the current freeze generation; finish requires every check recorded at this generation to be ok (exit 2)"); sys.exit(2)
 PY
       LABEL="finish-prepublication"
     fi

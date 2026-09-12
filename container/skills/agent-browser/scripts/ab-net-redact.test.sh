@@ -201,6 +201,44 @@ export STUB_REQUESTS_JSON='[{"url":"https://app.example.com/depletions/forecast"
 OUT="$("$WRAPPER" --session myapp 2>/dev/null)"
 if echo "$OUT" | grep -q "abc.def.ghi"; then fail "back-compat: live Authorization header value survived"; else pass "back-compat: no-subcommand form redacts same as 'requests'"; fi
 
+# 9. har-stop into a missing output directory must fail loudly, not silently
+#    (shadow-review #724 F2): the wrapper runs under `-uo pipefail`, not `-e`,
+#    so an unchecked `mv "$TMP_OUT" "$OUT_PATH"` printed to stderr and still
+#    fell through to `exit 0` — the caller recorded the capture as saved while
+#    no output file existed anywhere. Assert both the non-zero exit AND that
+#    no output file is left at, or under, the missing path.
+reset_stubs
+export STUB_HAR_JSON='{"log":{"entries":[]}}'
+OUT_PATH_MISSING_DIR="$WORKDIR/no-such-dir/capture.har.json"
+set +e
+"$WRAPPER" har-stop "$OUT_PATH_MISSING_DIR" >/dev/null 2>"$WORKDIR/missingdir.err"
+RC=$?
+set -e 2>/dev/null || true
+if [ "$RC" -ne 0 ]; then pass "har-stop: missing output directory surfaces non-zero exit"; else fail "har-stop: missing output directory silently exited 0"; fi
+if [ -e "$OUT_PATH_MISSING_DIR" ]; then fail "har-stop: output file exists despite missing directory"; else pass "har-stop: no output file written when output directory is missing"; fi
+if grep -q "could not write" "$WORKDIR/missingdir.err"; then pass "har-stop: missing output directory reported on stderr"; else fail "har-stop: no error surfaced for missing output directory ($(cat "$WORKDIR/missingdir.err"))"; fi
+
+# 10. F1 fixture: the REAL flat shape `agent-browser network request <id> --json`
+#     emits on the pinned 0.33.0 (upstream `cli/src/native/actions.rs` —
+#     `TrackedRequest` at :160-178 carries top-level `status`/`responseHeaders`,
+#     and `handle_request_detail` at :10158-10201 adds a top-level
+#     `responseBody` on top of that same flat object). This is NOT the nested
+#     `{"response": {...}}` shape the old fixture above used — that shape is
+#     never emitted by this tool. `BODY_KEYS` deliberately still contains
+#     "response"/"content" (over-redaction is the safe failure if some future
+#     version nests bodies), so this fixture only has to prove today's real
+#     shape survives correctly: status and non-sensitive headers kept,
+#     Authorization/set-cookie redacted, and the body dropped (no allowlist
+#     configured).
+reset_stubs
+export STUB_REQUESTS_JSON='{"url":"https://app.example.com/api/report","method":"GET","headers":{"Authorization":"Bearer abc.def.ghi","Accept":"application/json"},"timestamp":1700000000000,"resourceType":"Fetch","requestId":"1234.5","status":200,"responseHeaders":{"content-type":"application/json","Set-Cookie":"session=live-secret-value"},"mimeType":"application/json","responseBody":"{\"secret\":\"do-not-leak\"}"}'
+OUT="$("$WRAPPER" request 1234.5 --json 2>/dev/null)"
+if echo "$OUT" | grep -q '"status": 200'; then pass "flat 0.33.0 shape: top-level status survives"; else fail "flat 0.33.0 shape: top-level status did not survive ($OUT)"; fi
+if echo "$OUT" | grep -q '"content-type": "application/json"'; then pass "flat 0.33.0 shape: non-sensitive response header survives"; else fail "flat 0.33.0 shape: non-sensitive response header dropped ($OUT)"; fi
+if echo "$OUT" | grep -q "abc.def.ghi"; then fail "flat 0.33.0 shape: live Authorization header value survived"; else pass "flat 0.33.0 shape: Authorization header redacted"; fi
+if echo "$OUT" | grep -q "live-secret-value"; then fail "flat 0.33.0 shape: live Set-Cookie value survived"; else pass "flat 0.33.0 shape: Set-Cookie header redacted"; fi
+if echo "$OUT" | grep -q "do-not-leak"; then fail "flat 0.33.0 shape: responseBody content survived"; else pass "flat 0.33.0 shape: responseBody dropped (no allowlist configured)"; fi
+
 if [ "$FAIL" -ne 0 ]; then
   echo "--- FAILED ---"
   exit 1
