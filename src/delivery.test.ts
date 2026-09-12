@@ -34,6 +34,7 @@ import { openInboundDb as openInboundDbAt } from './modules/mailbox/openers.js';
 import { inboundDbPath, outboundDbPath } from './mailbox/sqlite/paths.js';
 import { getTaskThreadAnchor, setTaskThreadAnchor } from './db/task-thread-anchors.js';
 import { getRawDb } from './db/connection.js';
+import { createPendingApproval, getPendingApproval, getPendingQuestion } from './db/sessions.js';
 import {
   clearSessionStatusOnKill,
   deliverSessionMessages,
@@ -2065,5 +2066,108 @@ describe('delivery through the mailbox seam', () => {
     expect(threadIds).toEqual([null]);
     expect(deliveredStatus(session.id, 'out-orphan')).toBe('delivered');
     expect(outcome).toBe('clean');
+  });
+});
+
+describe('deliverSessionMessages — ask_question ids', () => {
+  const ask = (questionId: string) => ({
+    type: 'ask_question',
+    questionId,
+    title: 'FYI',
+    question: 'Nothing to do here',
+    options: [{ label: 'Dismiss', value: 'approve' }],
+  });
+
+  function recordDeliveries(): string[] {
+    const calls: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        calls.push(content);
+        return 'plat-ask';
+      },
+    });
+    return calls;
+  }
+
+  it('refuses one that reuses a pending approval id: no card, no pending question, not retried', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    await createPendingApproval({
+      approval_id: 'appr-collide',
+      request_id: 'appr-collide',
+      action: 'install_packages',
+      payload: '{}',
+      created_at: now(),
+      title: 'Install packages?',
+      options_json: '[]',
+      session_id: session.id,
+      agent_group_id: 'ag-1',
+      platform_message_id: 'real-card',
+    });
+    insertOutboundKind('ag-1', session.id, 'out-ask', 'chat-sdk', 'telegram', 'telegram:123', ask('appr-collide'));
+    const calls = recordDeliveries();
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([]);
+    expect(await getPendingQuestion('appr-collide')).toBeUndefined();
+    expect((await getPendingApproval('appr-collide'))?.status).toBe('pending');
+    const inDb = openInboundDb('ag-1', session.id);
+    const delivered = getDeliveredIds(inDb);
+    inDb.close();
+    expect(delivered.has('out-ask')).toBe(true);
+  });
+
+  it('refuses one whose id a click would decode onto a pending approval, delimiter and all', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    await createPendingApproval({
+      approval_id: 'appr-suffix',
+      request_id: 'appr-suffix',
+      action: 'install_packages',
+      payload: '{}',
+      created_at: now(),
+      title: 'Install packages?',
+      options_json: '[]',
+      session_id: session.id,
+      agent_group_id: 'ag-1',
+      platform_message_id: 'real-card',
+    });
+    // Written whole, so an exact-match check misses it; both click parsers cut
+    // at the first ':' and hand the handlers `appr-suffix`.
+    insertOutboundKind('ag-1', session.id, 'out-ask', 'chat-sdk', 'telegram', 'telegram:123', ask('appr-suffix:1'));
+    const calls = recordDeliveries();
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([]);
+    expect(await getPendingQuestion('appr-suffix:1')).toBeUndefined();
+    expect((await getPendingApproval('appr-suffix'))?.status).toBe('pending');
+  });
+
+  it('refuses one whose id carries a delimiter even when it collides with nothing', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutboundKind('ag-1', session.id, 'out-ask', 'chat-sdk', 'telegram', 'telegram:123', ask('q-agent:2'));
+    const calls = recordDeliveries();
+
+    await deliverSessionMessages(session);
+
+    // The card would be undecodable anyway: a click resolves `q-agent`, and
+    // pending_questions is keyed by the whole id.
+    expect(calls).toEqual([]);
+    expect(await getPendingQuestion('q-agent:2')).toBeUndefined();
+  });
+
+  it('delivers one whose id names no pending approval, and records its pending question', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutboundKind('ag-1', session.id, 'out-ask', 'chat-sdk', 'telegram', 'telegram:123', ask('q-agent-1'));
+    const calls = recordDeliveries();
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toHaveLength(1);
+    expect(await getPendingQuestion('q-agent-1')).toMatchObject({ session_id: session.id, message_out_id: 'out-ask' });
   });
 });

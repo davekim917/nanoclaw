@@ -1341,9 +1341,19 @@ function pctStr(rate: number): string {
  * the weekly workflow's own spec), then the cumulative before/after-switch comparison
  * `computeReport` already produces — one document, one `gh issue comment` post.
  */
-export function renderWeeklyMarkdown(weekly: WeeklyReport, cumulative: ReportResult, weeksToShow = 8): string {
+export function renderWeeklyMarkdown(
+  weekly: WeeklyReport,
+  cumulative: ReportResult,
+  window: WeeklyWindowInfo,
+  weeksToShow = 8,
+  nowIso: string = new Date().toISOString(),
+): string {
   const lines: string[] = [];
   lines.push('## Review metrics (weekly)');
+  lines.push('');
+  lines.push(formatWeeklyWindowLine(window));
+  const staleWarning = formatStaleMainTipWarning(window.untilIso, nowIso);
+  if (staleWarning) lines.push(staleWarning);
   lines.push('');
   lines.push(
     "These are this file's own definitions, not a reproduction of Augment's Cosmos post — " +
@@ -1630,14 +1640,272 @@ function fetchMergedPrsForSlice(repo: string, slice: MergedPrSearchSlice): PullR
   return prs.map((pr) => toPullRequestData(repo, pr));
 }
 
-export function fetchMergedPRs(
-  repo: string,
-  sinceIso: string,
+/** How long `verifyMergedPrTotalCount` waits before its one retry — long enough for
+ *  GitHub's search index to catch up on a just-completed merge, per the round-4 review
+ *  receipt on #706 ("the search index can lag a very recent merge"). */
+const SEARCH_TOTAL_COUNT_RETRY_WAIT_MS = 3000;
+
+/** Blocks the calling thread for `ms` milliseconds, synchronously. This whole file is
+ *  synchronous top to bottom (`execFileSync` throughout, no `await` anywhere — see
+ *  `main()`), so `verifyMergedPrTotalCount`'s one retry needs a synchronous wait rather
+ *  than threading `async`/`await` through every caller of `fetchMergedPRs` for a single
+ *  pause. `Atomics.wait` blocks without spinning the CPU; the backing buffer is never
+ *  written to, so it always times out after exactly `ms`. */
+function sleepMsSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * GitHub search's own `total_count` for the window `[sinceIso, untilIso]`, using the
+ * REST `search/issues` endpoint with EXACTLY the qualifiers `fetchMergedPrsForSlice`
+ * sends `gh pr list --search` to build (`repo:<repo> is:pr is:merged
+ * merged:<since>..<until>`) — confirmed empirically to agree with `gh pr list`'s own
+ * GraphQL `search().issueCount` for an identical one-day window against
+ * davekim917/nanoclaw on 2026-09-12 (25 both ways; `GH_DEBUG=api` shows `gh pr list
+ * --search` sends `"( merged:<range> ) is:merged repo:<repo> type:pr"` over GraphQL,
+ * which is the same qualifier set in a different order and syntax for `is:pr`/`type:pr`).
+ */
+function fetchMergedPrTotalCount(repo: string, sinceIso: string, untilIso: string): number {
+  const raw = gh([
+    'api',
+    '-X',
+    'GET',
+    'search/issues',
+    '-f',
+    `q=repo:${repo} is:pr is:merged merged:${sinceIso}..${untilIso}`,
+    '--jq',
+    '.total_count',
+  ]);
+  const count = Number.parseInt(raw.trim(), 10);
+  if (!Number.isFinite(count)) {
+    throw new Error(`review-outcomes: fetchMergedPrTotalCount: unparseable total_count from gh: ${JSON.stringify(raw)}`);
+  }
+  return count;
+}
+
+/**
+ * Cross-checks `combinedCount` — the de-duplicated PR count `fetchMergedPRs` actually
+ * collected across all its per-week slices — against GitHub search's own `total_count`
+ * for the identical `[sinceIso, untilIso]` window and qualifiers. This catches a class
+ * `combineMergedPrSlices`' `>=1000`-per-slice guard cannot: a malformed or unparsed
+ * `merged:` search bound doesn't error, it silently returns a valid-looking but empty (or
+ * partial) result set — `n` and every rate built on it would go quietly wrong with no
+ * slice ever near the cap. It also catches slice-cap truncation independently, as a second
+ * line of defense.
+ *
+ * The search index can lag a just-completed merge by a few seconds, so a mismatch is
+ * retried ONCE after a short wait before being treated as real; a mismatch that persists
+ * throws, naming both numbers, rather than silently trusting the (likely wrong) total.
+ *
+ * `fetchTotal`/`wait` are parameters — defaulting to the real `gh` call and a real
+ * synchronous sleep — purely so tests can stub both: a stub returning the same value
+ * twice never waits or throws, one that mismatches both times must throw before its
+ * second call, and one that mismatches once then matches must return normally.
+ *
+ * Rate limit: GitHub's search API allows 30 authenticated requests/minute
+ * (docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api#search-api).
+ * A `--weekly-days 90` run's `computeMergedSearchSlices` already spends roughly 13-14
+ * requests on per-ISO-week slices; this adds exactly 1 more (2 only on the rare mismatch
+ * that needs the retry) — comfortably inside the 30/minute budget for one run.
+ */
+export function verifyMergedPrTotalCount(
+  combinedCount: number,
+  window: { repo: string; sinceIso: string; untilIso: string },
+  fetchTotal: (repo: string, sinceIso: string, untilIso: string) => number = fetchMergedPrTotalCount,
+  wait: (ms: number) => void = sleepMsSync,
+): void {
+  const first = fetchTotal(window.repo, window.sinceIso, window.untilIso);
+  if (first === combinedCount) return;
+  wait(SEARCH_TOTAL_COUNT_RETRY_WAIT_MS);
+  const second = fetchTotal(window.repo, window.sinceIso, window.untilIso);
+  if (second === combinedCount) return;
+  throw new Error(
+    `review-outcomes: fetchMergedPRs: combined per-week slices for merged:${window.sinceIso}..${window.untilIso} ` +
+      `produced ${combinedCount} unique pull request(s), but GitHub search's total_count for the identical window ` +
+      `and qualifiers is ${second} (first read: ${first}) after one retry for search-index lag. A malformed or ` +
+      `unparsed search bound can return 0 rows (or a partial count) with no error at all — never proceeding on a ` +
+      `mismatched count.`,
+  );
+}
+
+/** How much to subtract from `origin/main`'s tip committer time when deriving the
+ *  search window's deterministic end (`resolveMainTipUntilIso`) — covers GitHub's
+ *  search index lagging a few seconds behind a just-landed merge, the same rationale as
+ *  `SEARCH_TOTAL_COUNT_RETRY_WAIT_MS`'s retry wait, applied here to the window bound
+ *  itself rather than to a retry. */
+export const UNTIL_ISO_SEARCH_INDEX_LAG_MARGIN_MS = 2 * 60 * 1000;
+
+/**
+ * The search window's deterministic end (`untilIso`): `origin/main`'s tip committer
+ * time (`git log -1 --format=%cI origin/main`), minus a margin
+ * (`UNTIL_ISO_SEARCH_INDEX_LAG_MARGIN_MS`, ~2 minutes) for GitHub search-index lag.
+ *
+ * Deliberately `origin/main`, not `HEAD` — a local run may have some other branch
+ * checked out (this script itself, developed against a feature branch, is the ordinary
+ * case), and the window must reflect what `main` actually looked like at checkout, not
+ * whatever ref happens to be checked out when the script happens to run.
+ *
+ * This replaces a captured wall-clock `new Date().toISOString()` as the search window's
+ * `until` bound (the #706 P2, review round 2 on #717). With wall-clock `now`, a PR that
+ * merged into `main` in the gap between `review-metrics.yml`'s `actions/checkout` and
+ * this script's live `gh pr list --search` call minutes later — after `pnpm install` —
+ * was IN the window (its `mergedAt` <= wall-clock now) even though its merge commit was
+ * never part of the checkout. `commitExistsLocally` used to paper over exactly that gap
+ * with a `git fetch --no-tags origin <sha>` retry on a local miss, but that retry cannot
+ * authenticate in `review-metrics.yml`: the repo is private and the workflow checks out
+ * with `persist-credentials: false`, so an unauthenticated fetch gets a 401 in Actions —
+ * confirmed against workflow run 34675405074's log, which shows checkout removing its
+ * auth header. The fallback only ever worked on a host with its own git credential
+ * helper (`gh auth git-credential`), which the CI runner is not, so a PR merging mid-job
+ * (#695's case) was still reported unresolved in Actions specifically.
+ *
+ * Deriving `untilIso` from the checkout's OWN `origin/main` tip instead makes the
+ * window's end deterministic and reproducible from that one commit: every merged PR the
+ * window can return is, by construction, already an ancestor of the checkout, so
+ * `commitExistsLocally` needs no fetch fallback at all (removed by this change) — a
+ * local miss there is now always a genuine gap (shallow clone, force-pushed-away base),
+ * never a PR that merely merged mid-job. A PR that merges after `origin/main`'s tip was
+ * read here simply falls outside this run's window and is picked up whole by the next
+ * scheduled run instead.
+ *
+ * Fails loudly, never falling back to wall-clock time, when `origin/main` can't be
+ * resolved at all (no such remote-tracking ref — e.g. a repo with no `origin` remote, or
+ * one `git fetch` never touched) or its committer date can't be parsed.
+ */
+export function resolveMainTipUntilIso(marginMs: number = UNTIL_ISO_SEARCH_INDEX_LAG_MARGIN_MS): string {
+  let raw: string;
+  try {
+    raw = execFileSync('git', ['log', '-1', '--format=%cI', 'origin/main'], {
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch (err) {
+    throw new Error(
+      `review-outcomes: resolveMainTipUntilIso: could not resolve origin/main's tip commit (\`git log -1 ` +
+        `--format=%cI origin/main\` failed) — the search window's end must come from the checked-out ` +
+        `origin/main, never a wall-clock fallback. Underlying error: ${err instanceof Error ? err.message : String(err)}`,
+      { cause: err },
+    );
+  }
+  const tipMs = new Date(raw).getTime();
+  if (!Number.isFinite(tipMs)) {
+    throw new Error(
+      `review-outcomes: resolveMainTipUntilIso: unparseable committer date from \`git log -1 --format=%cI ` +
+        `origin/main\`: ${JSON.stringify(raw)}`,
+    );
+  }
+  return new Date(tipMs - marginMs).toISOString();
+}
+
+/** `origin/main`'s short SHA and tip committer time, read the same way
+ *  `resolveMainTipUntilIso` reads its committer date (a `git log -1` against
+ *  `origin/main`, never `HEAD`) — kept as its own small `git` call rather than folded
+ *  into `resolveMainTipUntilIso` so that function's return type and tested error
+ *  messages stay untouched. Threaded into the weekly report's window line so a human
+ *  reading the posted comment (or the plain-console form) can see the exact commit
+ *  `untilIso` was derived from, not just the derived timestamp — the #717 round-2 P3:
+ *  with only `untilIso` in `--json`'s `until` field, a hand run against a stale
+ *  `origin/main` (fetched days ago) silently cut the current week short with nothing in
+ *  the posted comment saying so.
+ */
+export interface MainTipInfo {
+  shortSha: string;
+  tipIso: string;
+}
+
+export function resolveMainTipInfo(): MainTipInfo {
+  let raw: string;
+  try {
+    raw = execFileSync('git', ['log', '-1', '--format=%h%x1f%cI', 'origin/main'], {
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch (err) {
+    throw new Error(
+      `review-outcomes: resolveMainTipInfo: could not resolve origin/main's tip commit (\`git log -1 ` +
+        `--format=%h%x1f%cI origin/main\` failed) — the weekly window line must name the checked-out ` +
+        `origin/main's own tip, never a wall-clock fallback. Underlying error: ${err instanceof Error ? err.message : String(err)}`,
+      { cause: err },
+    );
+  }
+  const sepIdx = raw.indexOf('\x1f');
+  const shortSha = sepIdx === -1 ? '' : raw.slice(0, sepIdx);
+  const tipIso = sepIdx === -1 ? '' : raw.slice(sepIdx + 1);
+  if (!shortSha || !tipIso || !Number.isFinite(new Date(tipIso).getTime())) {
+    throw new Error(
+      `review-outcomes: resolveMainTipInfo: unparseable output from \`git log -1 --format=%h%x1f%cI ` +
+        `origin/main\`: ${JSON.stringify(raw)}`,
+    );
+  }
+  return { shortSha, tipIso };
+}
+
+/** The search window this run used, plus the exact `origin/main` commit `untilIso` came
+ *  from — everything `formatWeeklyWindowLine` and `formatStaleMainTipWarning` need,
+ *  computed once in `main()` and threaded into both `renderWeeklyMarkdown` (the posted
+ *  comment) and `printWeeklyReport` (the plain-console form) so neither can silently
+ *  omit it the way `--json`'s `until` field alone did before this change.
+ */
+export interface WeeklyWindowInfo {
+  sinceIso: string;
+  untilIso: string;
+  tip: MainTipInfo;
+}
+
+/** `window: <since>..<until> (origin/main <short sha> @ <tip committer time>)` — printed
+ *  identically by both weekly outputs (the markdown comment and the plain-console
+ *  report) so a reader can always see which commit grounded the numbers, not just the
+ *  numbers themselves.
+ */
+export function formatWeeklyWindowLine(window: WeeklyWindowInfo): string {
+  return `window: ${window.sinceIso}..${window.untilIso} (origin/main ${window.tip.shortSha} @ ${window.tip.tipIso})`;
+}
+
+/** How far `origin/main`'s tip may trail the wall clock before the weekly report warns
+ *  that the checkout looks stale. `untilIso` is frozen at whatever `origin/main` pointed
+ *  to when this run's own `git log` read it (`resolveMainTipUntilIso`) — a scheduled CI
+ *  run always starts from a fresh `actions/checkout`, so this never fires there, but a
+ *  hand run against a checkout fetched hours or days ago silently cuts the current week
+ *  short with no signal in the posted comment. Deliberately well above
+ *  `UNTIL_ISO_SEARCH_INDEX_LAG_MARGIN_MS` (~2 minutes of ordinary search-index lag, not
+ *  staleness) so this only fires on genuine staleness, never on the margin itself. */
+export const STALE_MAIN_TIP_WARNING_THRESHOLD_MS = 60 * 60 * 1000;
+
+/**
+ * A warning line for both weekly outputs when `origin/main`'s tip trails the wall clock
+ * by more than `STALE_MAIN_TIP_WARNING_THRESHOLD_MS` (default 1h) — evidence the
+ * checkout this run read `untilIso` from is stale and should be re-fetched before the
+ * numbers are trusted. Returns `null` (never throws) when the gap is within the
+ * threshold: this is a warning, not a gate, and a stale checkout is never a reason to
+ * fail the run.
+ */
+export function formatStaleMainTipWarning(
+  untilIso: string,
   nowIso: string = new Date().toISOString(),
-): PullRequestData[] {
-  const slices = computeMergedSearchSlices(sinceIso, nowIso);
+  thresholdMs: number = STALE_MAIN_TIP_WARNING_THRESHOLD_MS,
+): string | null {
+  const lagMs = new Date(nowIso).getTime() - new Date(untilIso).getTime();
+  if (lagMs <= thresholdMs) return null;
+  const lagHours = (lagMs / (60 * 60 * 1000)).toFixed(1);
+  return (
+    `WARNING: origin/main looks stale — its tip is ${lagHours}h behind wall-clock time, well past the ` +
+    `~2-minute search-index-lag margin. Fetch origin/main and re-run before trusting this window; a ` +
+    'hand run against a stale checkout can silently cut the current week short.'
+  );
+}
+
+export function fetchMergedPRs(repo: string, sinceIso: string, untilIso: string): PullRequestData[] {
+  const slices = computeMergedSearchSlices(sinceIso, untilIso);
   const sliceResults = slices.map((slice) => ({ slice, prs: fetchMergedPrsForSlice(repo, slice) }));
-  return combineMergedPrSlices(sliceResults);
+  const combined = combineMergedPrSlices(sliceResults);
+  // The SAME `untilIso` used for both the slices above and the total below (computed
+  // once by the caller, from `resolveMainTipUntilIso`) — a PR merging mid-run can't
+  // shift one bound without shifting the other, which would otherwise manufacture a
+  // mismatch `verifyMergedPrTotalCount` would then wrongly act on.
+  verifyMergedPrTotalCount(combined.length, { repo, sinceIso, untilIso });
+  return combined;
 }
 
 // ─────────────────────────── at-merge replay (I/O) ─────────────────────────
@@ -1687,8 +1955,31 @@ function git(args: readonly string[]): string {
 
 /** Whether `sha` resolves to a real commit in the LOCAL object database — distinct from
  *  "resolves, but a path doesn't exist in its tree" (see `readRiskHighGlobsAtShaLocal`).
- *  False for a commit a shallow clone never fetched, or one a force-push made
- *  unreachable — the "handle a missing commit... as unresolved" case. */
+ *  False for a commit a shallow clone never fetched at all, or one a force-push made
+ *  unreachable — the "handle a missing commit... as unresolved" case.
+ *
+ *  This used to fall back to one `git fetch --quiet --no-tags origin <sha>` attempt on a
+ *  local miss, to cover a PR merging into `main` in the gap between
+ *  `review-metrics.yml`'s `actions/checkout` (which runs once, at job start) and this
+ *  script's live `gh pr list --search`/`search/issues` calls minutes later, after `pnpm
+ *  install` (#706 round 1; reproduced live against davekim917/nanoclaw on 2026-09-12,
+ *  workflow run 34675405074: PR #695 merged 24s into that run, and its merge commit was
+ *  absent from the checkout). That fallback cannot authenticate in `review-metrics.yml`
+ *  though: the repo is private, and the workflow checks out with
+ *  `persist-credentials: false` — confirmed against that same run's log, which shows
+ *  checkout removing its auth header — so an unauthenticated `git fetch` gets a 401 in
+ *  Actions specifically. The fallback only ever worked on a host with its own git
+ *  credential helper (`gh auth git-credential`), which the CI runner is not, so a PR
+ *  merging mid-job was STILL reported unresolved there (#717 review round 1 P2).
+ *
+ *  Fixed properly instead by capping the search window's end at `origin/main`'s own tip
+ *  (`resolveMainTipUntilIso`, used to build `untilIso` in `main()`): every merged PR this
+ *  run's window can return is, by construction, already an ancestor of the checkout, so
+ *  a local miss here is now always a genuine gap (shallow clone, force-pushed-away
+ *  base) — never a PR that merely merged mid-job, which instead falls outside the
+ *  window entirely and is picked up whole by the next scheduled run. No fetch fallback
+ *  is needed or attempted any more; `false` here is final, and is what turns into
+ *  `'error'`/unresolved up the stack, never a guessed default. */
 function commitExistsLocally(sha: string): boolean {
   try {
     execFileSync('git', ['cat-file', '-e', `${sha}^{commit}`], { stdio: 'ignore' });
@@ -1719,16 +2010,29 @@ export type LabelerReadResult =
   | { kind: 'missing' } // the commit resolves locally, but the path doesn't exist in its tree
   | { kind: 'error' }; // the commit doesn't resolve locally, or the file exists but is unparseable/wrong-shaped
 
-/** Whether `path` exists in `sha`'s tree — `git cat-file -e <sha>:<path>`, which only
- *  asks "is there an object at this tree path", never reads or decodes its content. Kept
- *  separate from `git show <sha>:<path>` (which DOES read content) so
- *  `readRiskHighGlobsAtShaLocal` can tell "this path never existed here" apart from "the
- *  path resolves but its content couldn't be read" (a partial/lazy checkout that has the
- *  tree entry but not the blob itself, for instance) — see that function's own doc
- *  comment for why the two must not collapse into the same answer. */
+/** Whether `path`'s TREE ENTRY exists in `sha`'s tree — `git rev-parse --verify -q
+ *  <sha>:<path>`, which resolves the tree walk only: each path component is looked up by
+ *  reading the parent TREE object's own listing, where the child's oid is already
+ *  recorded, so this succeeds without ever touching the blob object the final entry
+ *  names. This is deliberately NOT `git cat-file -e <sha>:<path>`, which this function
+ *  used until the bug this comment documents: `cat-file -e` walks the same tree but then
+ *  also verifies the blob object it names actually exists and is readable in the local
+ *  object database. Confirmed empirically (fixture with the loose blob object deleted,
+ *  tree entry intact): `cat-file -e` FAILS in exactly that case — a partial/lazy clone
+ *  missing that one blob — even though the path plainly exists at this commit, which
+ *  misclassified a present-but-unreadable file as absent (`'missing'`, which
+ *  `resolveAtMergeContexts` then reclassifies as a pre-gate override) instead of
+ *  `'error'` (fail closed, unresolved). `rev-parse --verify -q` does not have that
+ *  failure mode, because it never needs the blob to exist locally at all.
+ *
+ *  Kept separate from `git show <sha>:<path>` (which DOES read and decode the blob's
+ *  content) so `readRiskHighGlobsAtShaLocal` can tell "this path never existed here"
+ *  (`'missing'`) apart from "the path resolves but its content couldn't be read"
+ *  (`'error'`) — see that function's own doc comment for why the two must not collapse
+ *  into the same answer. */
 function labelerPathExistsAtSha(sha: string): boolean {
   try {
-    execFileSync('git', ['cat-file', '-e', `${sha}:.github/labeler.yml`], { stdio: 'ignore' });
+    execFileSync('git', ['rev-parse', '--verify', '-q', `${sha}:.github/labeler.yml`], { stdio: 'ignore' });
     return true;
     // eslint-disable-next-line no-catch-all/no-catch-all
   } catch {
@@ -1748,9 +2052,10 @@ function labelerPathExistsAtSha(sha: string): boolean {
  * `'error'` stays unresolved — a shallow clone or a force-pushed-away base is a real gap
  * in what we can tell, not evidence of anything.
  *
- * `labelerPathExistsAtSha` (`git cat-file -e`) is checked BEFORE `git show`: the two can
- * diverge (a path whose tree entry exists but whose content is unreadable — a partial
- * checkout missing that blob, for instance) — treating every `git show` failure as
+ * `labelerPathExistsAtSha` (`git rev-parse --verify -q <sha>:<path>`, a TREE-only check —
+ * see that function's own doc comment) is checked BEFORE `git show`: the two can diverge
+ * (a path whose tree entry exists but whose blob content is unreadable — a partial/lazy
+ * checkout missing that one blob, for instance) — treating every `git show` failure as
  * "missing" would silently reclassify that gap as pre-gate, exactly like a genuinely
  * absent file, instead of failing closed to `'error'`/unresolved.
  */
@@ -2276,16 +2581,25 @@ export function computeFetchSinceIso(
   return new Date(Math.min(switchBasedMs, goLiveMs)).toISOString();
 }
 
-/** The lower fetch bound `--weekly` needs on its own: `weeklyDays` back from `nowIso`. */
-export function computeWeeklyFetchSinceIso(nowIso: string, weeklyDays: number): string {
-  return new Date(new Date(nowIso).getTime() - weeklyDays * MS_PER_DAY).toISOString();
+/** The lower fetch bound `--weekly` needs on its own: `weeklyDays` back from `untilIso`
+ *  (the deterministic search-window end — see `resolveMainTipUntilIso` — not wall-clock
+ *  `now`, so the whole run's window anchors to one commit). */
+export function computeWeeklyFetchSinceIso(untilIso: string, weeklyDays: number): string {
+  return new Date(new Date(untilIso).getTime() - weeklyDays * MS_PER_DAY).toISOString();
 }
 
-function printWeeklyReport(weekly: WeeklyReport): void {
+export function printWeeklyReport(
+  weekly: WeeklyReport,
+  window: WeeklyWindowInfo,
+  nowIso: string = new Date().toISOString(),
+): void {
   console.log(
     `review-outcomes --weekly: gate go-live = ${GATE_GO_LIVE_ISO}, Fixes-PR convention start = ${weekly.conventionStartIso}`,
   );
   console.log("(these are this file's own definitions — not directly comparable to Augment Cosmos's figures)");
+  console.log(formatWeeklyWindowLine(window));
+  const staleWarning = formatStaleMainTipWarning(window.untilIso, nowIso);
+  if (staleWarning) console.log(staleWarning);
   console.log('');
   for (const row of weekly.rows) {
     const gate = row.isMixedGateWeek ? 'mixed' : row.preGateMerged > 0 ? 'pre-gate' : 'post-gate';
@@ -2333,20 +2647,33 @@ function main(): void {
   const labelerConfig = parse(labelerYaml) as Record<string, unknown>;
   const riskHighGlobs = globsForRiskHigh(labelerConfig);
 
+  // Computed ONCE, from the checked-out `origin/main`'s own tip — never wall-clock
+  // `now` — so the whole run's search window is deterministic and reproducible from
+  // that commit (see `resolveMainTipUntilIso`'s own doc comment). Used below as both the
+  // `--weekly-days` lookback's reference point and the search window's `until` bound, so
+  // a single value grounds this entire run.
+  const untilIso = resolveMainTipUntilIso();
+
   const beforeAfterSinceIso = computeFetchSinceIso(options.switchIso, options.days);
 
   if (options.weekly) {
     // One `gh` fetch batch serves both reports: the weekly rows need `--weekly-days`
-    // of history back from now, and the cumulative before/after comparison
+    // of history back from `untilIso`, and the cumulative before/after comparison
     // (`renderWeeklyMarkdown`'s second table) needs the same window `computeReport`
     // always has — so the fetch bound is the EARLIER of the two, same reasoning as
     // `computeFetchSinceIso` already applies to its own two callers.
-    const weeklySinceIso = computeWeeklyFetchSinceIso(new Date().toISOString(), options.weeklyDays ?? 90);
+    const weeklySinceIso = computeWeeklyFetchSinceIso(untilIso, options.weeklyDays ?? 90);
     const sinceIso =
       new Date(weeklySinceIso).getTime() < new Date(beforeAfterSinceIso).getTime()
         ? weeklySinceIso
         : beforeAfterSinceIso;
-    const fetchedPRs = fetchMergedPRs(options.repo, sinceIso);
+    // Read right alongside `untilIso` above (same `origin/main`, nothing re-fetches it
+    // mid-run) so the window line printed below always names the exact commit
+    // `untilIso` came from — see `resolveMainTipInfo`'s own doc comment for why this
+    // is a second small `git log` rather than a change to `resolveMainTipUntilIso`'s
+    // tested return shape.
+    const windowInfo: WeeklyWindowInfo = { sinceIso, untilIso, tip: resolveMainTipInfo() };
+    const fetchedPRs = fetchMergedPRs(options.repo, sinceIso, untilIso);
     const shadowReviewIssues = fetchShadowReviewIssues(options.repo);
     const shadowReviewFailedPrNumbers = fetchShadowReviewFailedPRs(options.repo);
     const shadowReviewedLabelPrNumbers = fetchShadowReviewedPRs(options.repo);
@@ -2388,23 +2715,24 @@ function main(): void {
             followupDays: options.followupDays,
             weeklyDays: options.weeklyDays ?? 90,
             since: sinceIso,
+            until: untilIso,
             weekly,
             cumulative,
-            markdown: renderWeeklyMarkdown(weekly, cumulative),
+            markdown: renderWeeklyMarkdown(weekly, cumulative, windowInfo),
           },
           null,
           2,
         ),
       );
     } else {
-      printWeeklyReport(weekly);
+      printWeeklyReport(weekly, windowInfo);
       console.log('');
       printReport(cumulative);
     }
     return;
   }
 
-  const allPRs = fetchMergedPRs(options.repo, beforeAfterSinceIso);
+  const allPRs = fetchMergedPRs(options.repo, beforeAfterSinceIso, untilIso);
   const shadowReviewIssues = fetchShadowReviewIssues(options.repo);
   const shadowReviewFailedPrNumbers = fetchShadowReviewFailedPRs(options.repo);
   const shadowReviewedLabelPrNumbers = fetchShadowReviewedPRs(options.repo);

@@ -401,4 +401,135 @@ bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$FLOOR_DIR" lanes \
 
 rm -rf "$FLOOR_DIR"
 
+# --- pair re-freeze: lanes must be redispatched after it --------------------
+# smoke-pair-identity.sh `refreeze` snapshots the contract's lane generations
+# into coordinator/identity.json. A lane whose contract generation is not above
+# its snapshot still carries old-pair evidence, so it must not clear `lanes` or
+# `synthesis` even with an otherwise valid marker (issue #731, F3). The full
+# flow through the real verbs is smoke-pair-identity.test.sh section 5.
+RF="$FIXTURE_DIR/rf-run"
+RF_SHA="ffffffffffffffffffffffffffffffffffffffff"
+mkdir -p "$RF/markers" "$RF/coordinator" "$RF/challenger"
+printf '# preliminary\n' > "$RF/coordinator/preliminary.md"
+printf '# disposition\n' > "$RF/challenger/disposition.md"
+rf_contract() { # <generation of X> <generation of Y>
+  jq -n --arg sha "$RF_SHA" --argjson x "$1" --argjson y "$2" \
+    '{schemaVersion:1,sourceSha:$sha,ownershipKind:"develop",
+      requiredLaneMarkers:["markers/X.json","markers/Y.json"],
+      lanes:[{id:"X",kind:"lane",generation:$x},{id:"Y",kind:"lane",generation:$y}]}' > "$RF/completion-contract.json"
+}
+rf_marker() { # <lane> <generation>
+  jq -n --arg sha "$RF_SHA" --arg l "$1" --argjson g "$2" \
+    '{schemaVersion:1,lane:$l,sourceSha:$sha,generation:$g,status:"completed",completedAt:"2026-09-12T10:00:00Z"}' > "$RF/markers/$1.json"
+}
+rf_identity_refrozen() {
+  jq -n --arg sha "$RF_SHA" \
+    '{ok:true,freezeGeneration:2,history:[{reason:"backend replaced"}],
+      refreezeLaneSnapshot:{contractPresent:true,sourceSha:$sha,lanes:[{id:"X",generation:1},{id:"Y",generation:1}]}}' \
+    > "$RF/coordinator/identity.json"
+}
+rf_barrier() { bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$RF" "$1" || true; }
+rf_contract 1 1; rf_marker X 1; rf_marker Y 1
+
+# No identity.json: a run that never used pair identity is unaffected.
+rf_barrier synthesis | jq -e '.ready == true' >/dev/null || {
+  echo "expected a run with no identity.json to be unaffected" >&2; exit 1; }
+# identity.json as `start` writes it, no re-freeze: unaffected.
+printf '{"ok":true,"freezeGeneration":1,"history":[]}\n' > "$RF/coordinator/identity.json"
+rf_barrier synthesis | jq -e '.ready == true' >/dev/null || {
+  echo "expected a run that never re-froze to be unaffected" >&2; exit 1; }
+
+# Re-frozen, and neither lane redispatched: both refused with the re-freeze
+# reason, in lanes and synthesis alike.
+rf_identity_refrozen
+for phase in lanes synthesis; do
+  RESULT="$(rf_barrier "$phase")"
+  echo "$RESULT" | jq -e '.ready == false and (.invalid | sort) == ["markers/X.json","markers/Y.json"]
+    and all(.invalidReasons[]; contains("not redispatched since the pair re-freeze"))' >/dev/null || {
+    echo "expected $phase to refuse lanes not redispatched after the re-freeze" >&2; echo "$RESULT" >&2; exit 1; }
+done
+# The challenger never waits on lanes, re-freeze or not.
+rf_barrier disposition | jq -e '.ready == true' >/dev/null || {
+  echo "expected the disposition gate to ignore the re-freeze snapshot" >&2; exit 1; }
+# A lane still in flight on the old pair has no marker yet; it is refused for
+# the redispatch, not reported as merely missing.
+mv "$RF/markers/Y.json" "$RF/y.bak"
+RESULT="$(rf_barrier synthesis)"
+echo "$RESULT" | jq -e '.missing == [] and ((.invalid | sort) == ["markers/X.json","markers/Y.json"])' >/dev/null || {
+  echo "expected an un-redispatched lane with no marker to be refused for the redispatch" >&2; echo "$RESULT" >&2; exit 1; }
+mv "$RF/y.bak" "$RF/markers/Y.json"
+
+# Only X redispatched and re-run: Y is still refused, X clears.
+rf_contract 2 1; rf_marker X 2
+RESULT="$(rf_barrier synthesis)"
+echo "$RESULT" | jq -e '.ready == false and .invalid == ["markers/Y.json"]
+  and (.invalidReasons[0] | contains("not redispatched since the pair re-freeze"))' >/dev/null || {
+  echo "expected a partial redispatch to refuse only the lane left behind" >&2; echo "$RESULT" >&2; exit 1; }
+# Y redispatched but its fresh marker not landed: the ordinary stale-generation
+# reason takes over.
+rf_contract 2 2
+RESULT="$(rf_barrier synthesis)"
+echo "$RESULT" | jq -e '.ready == false and .invalid == ["markers/Y.json"] and (.invalidReasons[0] | contains("stale generation"))' >/dev/null || {
+  echo "expected a redispatched lane to wait on its fresh marker" >&2; echo "$RESULT" >&2; exit 1; }
+rf_marker Y 2
+rf_barrier synthesis | jq -e '.ready == true' >/dev/null || {
+  echo "expected every lane redispatched and re-run to clear synthesis" >&2; exit 1; }
+
+# Fail closed: a re-frozen identity.json with no snapshot, or one that does not
+# parse, refuses instead of reading as "nothing to redispatch".
+jq -c 'del(.refreezeLaneSnapshot)' "$RF/coordinator/identity.json" > "$RF/id.tmp" && mv "$RF/id.tmp" "$RF/coordinator/identity.json"
+RESULT="$(rf_barrier synthesis)"
+echo "$RESULT" | jq -e '.ready == false and .invalid == ["coordinator/identity.json"] and (.invalidReasons[0] | contains("no lane snapshot"))' >/dev/null || {
+  echo "expected a re-frozen identity.json with no snapshot to refuse" >&2; echo "$RESULT" >&2; exit 1; }
+printf 'not json' > "$RF/coordinator/identity.json"
+RESULT="$(rf_barrier synthesis)"
+echo "$RESULT" | jq -e '.ready == false and .invalid == ["coordinator/identity.json"]' >/dev/null || {
+  echo "expected an unparsable identity.json to refuse" >&2; echo "$RESULT" >&2; exit 1; }
+
+# --- an emptied or falsified snapshot must not turn the redispatch rule off -
+# refreeze-lanes.jq's absent-lane exemption ("a lane the snapshot never named
+# is not stale once its generation clears the snapshot's highest") must not
+# become a way to silence every required lane by wiping, or falsifying, the
+# snapshot instead of deleting it outright (the del() case above).
+rf_contract 1 1; rf_marker X 1; rf_marker Y 1
+
+# Bypass 1: `lanes: []` — there is no recorded maximum generation for X or Y
+# to legitimately exceed, so both must still be refused.
+jq -n --arg sha "$RF_SHA" \
+  '{ok:true,freezeGeneration:2,history:[{reason:"backend replaced"}],
+    refreezeLaneSnapshot:{contractPresent:true,sourceSha:$sha,lanes:[]}}' \
+  > "$RF/coordinator/identity.json"
+RESULT="$(rf_barrier synthesis)"
+echo "$RESULT" | jq -e '.ready == false and (.invalid | sort) == ["markers/X.json","markers/Y.json"]
+  and all(.invalidReasons[]; contains("not redispatched since the pair re-freeze"))' >/dev/null || {
+  echo "expected an emptied refreeze snapshot (lanes: []) to still refuse every required lane" >&2; echo "$RESULT" >&2; exit 1; }
+
+# Bypass 2: `contractPresent:false` paired with a sourceSha is not a shape
+# `refreeze` ever writes — a legitimate contractPresent:false always pairs
+# with sourceSha:null — so refuse instead of reading it as "nothing was
+# dispatched yet".
+jq -n --arg sha "$RF_SHA" \
+  '{ok:true,freezeGeneration:2,history:[{reason:"backend replaced"}],
+    refreezeLaneSnapshot:{contractPresent:false,sourceSha:$sha,lanes:[]}}' \
+  > "$RF/coordinator/identity.json"
+RESULT="$(rf_barrier synthesis)"
+echo "$RESULT" | jq -e '.ready == false and .invalid == ["coordinator/identity.json"]
+  and (.invalidReasons[0] | contains("also records a sourceSha"))' >/dev/null || {
+  echo "expected contractPresent:false paired with a sourceSha to refuse, not read as \"nothing dispatched yet\"" >&2; echo "$RESULT" >&2; exit 1; }
+
+# A lane the snapshot never named (added after the re-freeze, so it could not
+# have run on the old pair) clears once its generation is above the
+# snapshot's highest — X and Y, still at the snapshot's own generation, stay
+# refused for the real reason; Z, above it, is merely missing a marker.
+rf_identity_refrozen
+jq '.requiredLaneMarkers += ["markers/Z.json"] | .lanes += [{id:"Z",kind:"lane",generation:2}]' \
+  "$RF/completion-contract.json" > "$RF/contract.tmp" && mv "$RF/contract.tmp" "$RF/completion-contract.json"
+RESULT="$(rf_barrier synthesis)"
+echo "$RESULT" | jq -e '
+  (.invalid | sort) == ["markers/X.json","markers/Y.json"]
+  and all(.invalidReasons[]; contains("not redispatched since the pair re-freeze"))
+  and (.missing == ["markers/Z.json"])
+' >/dev/null || {
+  echo "expected a lane the snapshot never named, above its highest generation, not to be flagged as un-redispatched" >&2; echo "$RESULT" >&2; exit 1; }
+
 echo "smoke evidence barrier tests passed"

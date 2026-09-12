@@ -784,6 +784,10 @@ export async function getPendingApprovalsByAction(action: string): Promise<Pendi
  * Resolve ask_question render metadata (title + normalized options) for any
  * card, regardless of whether it was persisted as a pending_question (generic
  * ask_user_question) or a pending_approval (self-mod / OneCLI credential).
+ *
+ * A pending_approval wins when both hold the id. Approval ids are host-minted
+ * and question ids are whatever the agent wrote, so an agent's row reusing an
+ * approval's id must never decide what a click on the real card means.
  */
 export async function getAskQuestionRender(id: string): Promise<
   | {
@@ -796,8 +800,6 @@ export async function getAskQuestionRender(id: string): Promise<
   | undefined
 > {
   const db = getDb();
-  const q = await getPendingQuestion(id);
-  if (q) return { title: q.title, question: q.question, options: q.options };
 
   const parseRender = (
     row: { title: string; question?: string; options_json: string } | undefined,
@@ -826,8 +828,15 @@ export async function getAskQuestionRender(id: string): Promise<
     'SELECT title, question, options_json, action FROM pending_approvals WHERE approval_id = ?',
     id,
   );
-  const approvalRender = parseRender(a);
-  if (approvalRender) return { ...approvalRender, action: a!.action };
+  if (a) {
+    // Only the approval's own options decode its card: corrupt ones leave the
+    // click unresolved rather than fall through to an agent's row.
+    const approvalRender = parseRender(a);
+    return approvalRender ? { ...approvalRender, action: a.action } : undefined;
+  }
+
+  const q = await getPendingQuestion(id);
+  if (q) return { title: q.title, question: q.question, options: q.options };
 
   // Channel-registration + unknown-sender approvals persist title/options_json
   // the same way pending_approvals does — just SELECT and return.
