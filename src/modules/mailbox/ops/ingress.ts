@@ -11,6 +11,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR } from '../../../config.js';
+import { resolveInboundDbPath } from '../host-inbound.js';
 import { recoverHotJournal } from '../openers.js';
 import { migrateMessagesInTable, migrateSessionRoutingTable } from '../schema.js';
 
@@ -357,7 +358,10 @@ export function inboundHasMessage(db: Database.Database, messageId: string): boo
  * Returns false if the DB file does not exist (session not yet initialised).
  */
 export function sessionInboundHasMessage(agentGroupId: string, sessionId: string, messageId: string): boolean {
-  const dbPath = path.join(DATA_DIR, 'v2-sessions', agentGroupId, sessionId, 'inbound.db');
+  // Resolved, never reconstructed: since #749 the host-owned inbound.db lives
+  // in `<session>/.host/`, and the journal this function recovers below must be
+  // the one in THAT directory — the only one a container cannot have written.
+  const dbPath = resolveInboundDbPath(path.join(DATA_DIR, 'v2-sessions', agentGroupId, sessionId));
   if (!fs.existsSync(dbPath)) return false;
   // Read-only: this only ever runs one SELECT, and a writable open would take
   // a hot-journal rollback write on a session the reclaim may be archiving.

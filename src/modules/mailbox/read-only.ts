@@ -56,6 +56,7 @@ import path from 'path';
 
 import { DATA_DIR } from '../../config.js';
 import { getContainerState, getProcessingClaims, type ContainerState, type ProcessingClaim } from './ops/sweep.js';
+import { resolveInboundDbPath } from './host-inbound.js';
 import { inboundHasMessage } from './ops/ingress.js';
 import {
   countLiveSeriesRows,
@@ -195,9 +196,14 @@ export type {
  */
 function resolveReadPath(location: SessionReadLocation, side: 'inbound' | 'outbound'): string | null {
   const base = path.resolve(location.dataDir ?? DATA_DIR, 'v2-sessions');
-  const resolved = path.resolve(base, location.agentGroupId, location.sessionId, `${side}.db`);
-  const expected = path.join(base, location.agentGroupId, location.sessionId, `${side}.db`);
-  return resolved === expected && resolved.startsWith(base + path.sep) ? resolved : null;
+  const resolved = path.resolve(base, location.agentGroupId, location.sessionId);
+  const expected = path.join(base, location.agentGroupId, location.sessionId);
+  if (resolved !== expected || !resolved.startsWith(base + path.sep)) return null;
+  // The containment check stays on the SESSION directory, which is the part
+  // built from caller-supplied ids. The `.host` segment an inbound path may
+  // carry is appended by our own resolver, never by an id — so a locator can
+  // no more escape through it than it could before (#749).
+  return side === 'inbound' ? resolveInboundDbPath(resolved) : path.join(resolved, 'outbound.db');
 }
 
 /**

@@ -10,14 +10,23 @@ Schemas live in `src/db/schema.ts` as the `INBOUND_SCHEMA` and `OUTBOUND_SCHEMA`
 
 ```
 data/v2-sessions/<agent_group_id>/<session_id>/
-  inbound.db              ← host writes, container reads (read-only open)
+  .host/                  ← host-owned, mounted READ-ONLY as a directory
+    inbound.db            ← the authoritative file the host opens read-write
+    inbound.db-journal    ← SQLite's rollback journal, when a write is in flight
+  inbound.db              ← hard link to .host/inbound.db (same inode)
   outbound.db             ← container writes, host reads (read-only open)
   .heartbeat              ← mtime touched by container (not a DB write)
   inbox/<message_id>/     ← user attachments, decoded from inbound message content
   outbox/<message_id>/    ← attachments the agent produced
 ```
 
-The session directory itself is mounted read-write into the container (`src/container-runner.ts`) — read-only is _not_ a mount property. The container opens `inbound.db` with `{ readonly: true }` at the SQLite connection layer (`container/agent-runner/src/db/connection.ts`), so the container could technically write to the underlying file via another path, but every code path that touches `inbound.db` from inside the container goes through that read-only handle.
+The session directory itself is mounted read-write into the container (`src/container-runner.ts`) — read-only is _not_ a mount property.
+
+**Why `inbound.db` lives in `.host/` (#749).** A file-level read-only overlay protects the file but not its SIBLINGS, and SQLite's rollback journal is a sibling. With the session directory mounted read-write, a container could create `/workspace/inbound.db-journal`; a journal carries no binding to its database's identity (its per-page checksums are seeded by a nonce in the journal's own header), so the host replayed that hand-built file as a *hot journal* on its next read-write open and wrote attacker-chosen pages into the host-owned database — forged `delivered` rows, which are forged admin approvals, a bypassed email gate and a faked `send_file` ack. SQLite only ever creates `-journal`/`-wal`/`-shm` in the database's own directory, so the host keeps the database in a directory that is overlaid read-only in its entirety (`/workspace/.host`), leaving no sibling path outside the protection. Every host opener resolves through one choke point, `resolveInboundDbPath` in `src/modules/mailbox/host-inbound.ts`, and the spawn path refuses to start a container for a session whose database is not host-owned.
+
+`<session_id>/inbound.db` is kept as a **hard link to the same inode** so the container's read path is unchanged — the runner still opens `/workspace/inbound.db` (`container/agent-runner/src/mailbox/sqlite/connection.ts`) through the read-only file overlay that has always covered that name, and SQLite's locking is per-inode, so host writer and container reader still serialize. The link also means a rollback to a pre-#749 binary still finds its database. Sessions migrate on their next `prepare()` or spawn; anything found at `<session_id>/inbound.db-journal` afterwards is foreign by construction and is deleted.
+
+The container opens `inbound.db` with `{ readonly: true }` at the SQLite connection layer (`container/agent-runner/src/db/connection.ts`), so every code path that touches `inbound.db` from inside the container goes through that read-only handle.
 
 One session = one folder = one pair of DBs. The `agent_group_id` parent directory also holds per-group state (`.claude-shared/`) that is shared across every session of that agent group. (The agent-runner source is not copied per group — it's a shared read-only mount from `container/agent-runner/src` into every container; see `src/container-runner.ts`.)
 

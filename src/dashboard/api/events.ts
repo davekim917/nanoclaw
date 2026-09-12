@@ -135,6 +135,10 @@ const AGGREGATE_CAP = 200;
 const KEEPALIVE_INTERVAL_MS = 25_000;
 const SESSIONS_ROOT = path.resolve(process.cwd(), 'data/v2-sessions');
 const SESSION_DATABASE_FILES = new Set(['inbound.db', 'outbound.db']);
+// One definition of the layout, imported rather than restated: the watcher has
+// to look exactly where the host writes, and a second copy of '.host' here
+// would be free to drift away from the writer (#749).
+import { HOST_INBOUND_DIR_NAME } from '../../modules/mailbox/index.js';
 
 type SessionWatchStats = Pick<Stats, 'isDirectory' | 'isSymbolicLink'>;
 
@@ -151,6 +155,17 @@ export function shouldIgnoreSessionWatchPath(filePath: string, stats?: SessionWa
     // Chokidar calls a two-argument ignored function once before and once
     // after stat. Admit the path-only pass, then require a real directory.
     return stats !== undefined && (stats.isSymbolicLink() || !stats.isDirectory());
+  }
+  // Since #749 the host writes `<session>/.host/inbound.db`, so the watch has
+  // to reach one level deeper for that one path — otherwise every host inbound
+  // write stops raising an SSE event and the board silently goes stale. The
+  // `.host` DIRECTORY is admitted too, or chokidar never descends into it.
+  if (parts.length === 3 && parts[2] === HOST_INBOUND_DIR_NAME) {
+    return stats !== undefined && (stats.isSymbolicLink() || !stats.isDirectory());
+  }
+  if (parts.length === 4) {
+    if (parts[2] !== HOST_INBOUND_DIR_NAME || parts[3] !== 'inbound.db') return true;
+    return stats !== undefined && (stats.isSymbolicLink() || stats.isDirectory());
   }
   if (parts.length !== 3 || !SESSION_DATABASE_FILES.has(parts[2]!)) return true;
   return stats !== undefined && (stats.isSymbolicLink() || stats.isDirectory());
@@ -224,9 +239,13 @@ export function startSSEFeed(): void {
         const rel = path.relative(SESSIONS_ROOT, filePath);
         const parts = rel.split(path.sep);
         if (parts.length < 3) return;
-        const [agentGroupId, sessionId, filename] = parts;
+        const [agentGroupId, sessionId] = parts;
         if (!agentGroupId || !sessionId) return;
-        if (filename !== 'inbound.db' && filename !== 'outbound.db') return;
+        // `<ag>/<sess>/{inbound,outbound}.db`, or the host-owned
+        // `<ag>/<sess>/.host/inbound.db` the host has written since #749.
+        const filename = parts[parts.length - 1];
+        const hostOwned = parts.length === 4 && parts[2] === HOST_INBOUND_DIR_NAME && filename === 'inbound.db';
+        if (!hostOwned && (parts.length !== 3 || !filename || !SESSION_DATABASE_FILES.has(filename))) return;
 
         _emitInboundChangeEvent(agentGroupId, sessionId, filename === 'inbound.db');
       });

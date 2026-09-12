@@ -12,10 +12,10 @@
  */
 import Database from 'better-sqlite3';
 import fs from 'fs';
-import path from 'path';
 
 import { openOutboundDb as upstreamOpenOutboundDb } from '../../mailbox/sqlite/session-db.js';
 import { plantStorageActivityMarker } from '../../storage-activity.js';
+import { sessionDirForInboundDbPath } from './host-inbound.js';
 
 /**
  * A host open found no database file where a provisioned session must have one.
@@ -179,7 +179,13 @@ export function openInboundDb(dbPath: string): Database.Database {
   // `sessionDbPathIsGone`, not existsSync: an unreadable parent directory is a
   // present session, and must reach the open and fail there on its real error.
   if (sessionDbPathIsGone(dbPath)) throw new SessionDbMissingError(dbPath);
-  const release = plantStorageActivityMarker(path.dirname(dbPath), 'inbound-open');
+  // The SESSION root, not `path.dirname(dbPath)`: since #749 the host-owned
+  // inbound.db lives at `<session>/.host/inbound.db`, and the reclaim only ever
+  // reads markers on the session root itself (`resourceRoots`,
+  // src/storage-activity.ts:493-496). Planting one level deeper would leave a
+  // marker nothing looks at — the guard would still appear to work while
+  // protecting nothing. See sessionDirForInboundDbPath.
+  const release = plantStorageActivityMarker(sessionDirForInboundDbPath(dbPath), 'inbound-open');
   let db: Database.Database | undefined;
   try {
     // `fileMustExist` closes the residual window between the check above and
