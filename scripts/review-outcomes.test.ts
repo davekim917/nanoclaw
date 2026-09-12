@@ -33,7 +33,7 @@ import {
   findFollowUp,
   findRevert,
   FIXES_PR_CONVENTION_START_ISO,
-  formatStaleMainTipWarning,
+  formatWindowAgeNote,
   formatWeeklyWindowLine,
   GATE_GO_LIVE_ISO,
   generatedFileChangedLines,
@@ -59,7 +59,7 @@ import {
   resolveAtMergeFileContextLocal,
   resolveMainTipUntilIso,
   SHADOW_REVIEW_GO_LIVE_ISO,
-  STALE_MAIN_TIP_WARNING_THRESHOLD_MS,
+  WINDOW_AGE_NOTE_THRESHOLD_MS,
   stripFencedAndCommented,
   UNTIL_ISO_SEARCH_INDEX_LAG_MARGIN_MS,
   verifyMergedPrTotalCount,
@@ -1451,8 +1451,8 @@ describe('renderWeeklyMarkdown', () => {
       untilIso: '2026-09-12T00:00:00.000Z',
       tip: testMainTip({ shortSha: 'deadbee', tipIso: '2026-09-12T00:02:00.000Z' }),
     });
-    // Fresh relative to the window's own `untilIso`, so no stale warning muddies this
-    // assertion — that path is covered by the dedicated stale-warning tests below.
+    // Close to the window's own `untilIso`, so the window-age note does not muddy this
+    // assertion — that path is covered by the dedicated window-age tests below.
     const markdown = renderWeeklyMarkdown(weekly, cumulative, window, 8, '2026-09-12T00:05:00.000Z');
     expect(markdown).toContain(formatWeeklyWindowLine(window));
     expect(markdown).toContain(
@@ -1460,7 +1460,7 @@ describe('renderWeeklyMarkdown', () => {
     );
   });
 
-  it('#717 review round 2 (P3): the stale-origin/main warning appears past the threshold and not below it', () => {
+  it('adds a neutral window-age note past the threshold without calling a quiet checkout stale', () => {
     const prs = [pr({ number: 1, mergedAt: '2026-09-08T00:00:00Z' })];
     const weekly = computeWeeklyReport(prs, [], 14, '2026-09-12T00:00:00Z');
     const options: Options = { repo: 'x/y', switchIso: '2026-09-10T00:00:00Z', days: 5, followupDays: 14, json: false };
@@ -1468,23 +1468,22 @@ describe('renderWeeklyMarkdown', () => {
     const untilIso = '2026-09-12T00:00:00.000Z';
     const window = testWindow({ untilIso });
 
-    // Exactly at the threshold: no warning.
-    const atThresholdNowIso = new Date(new Date(untilIso).getTime() + STALE_MAIN_TIP_WARNING_THRESHOLD_MS).toISOString();
-    const notStaleMarkdown = renderWeeklyMarkdown(weekly, cumulative, window, 8, atThresholdNowIso);
-    expect(notStaleMarkdown).not.toContain('origin/main looks stale');
+    // Exactly at the threshold: no note.
+    const atThresholdNowIso = new Date(new Date(untilIso).getTime() + WINDOW_AGE_NOTE_THRESHOLD_MS).toISOString();
+    const noNoteMarkdown = renderWeeklyMarkdown(weekly, cumulative, window, 8, atThresholdNowIso);
+    expect(noNoteMarkdown).not.toContain('report window ends');
 
-    // One millisecond past the threshold: warning appears.
-    const pastThresholdNowIso = new Date(
-      new Date(untilIso).getTime() + STALE_MAIN_TIP_WARNING_THRESHOLD_MS + 1,
-    ).toISOString();
-    const staleMarkdown = renderWeeklyMarkdown(weekly, cumulative, window, 8, pastThresholdNowIso);
-    expect(staleMarkdown).toContain('origin/main looks stale');
-    expect(staleMarkdown).toMatch(/fetch/i);
+    // One millisecond past the threshold: neutral context appears, with no stale/fetch claim.
+    const pastThresholdNowIso = new Date(new Date(untilIso).getTime() + WINDOW_AGE_NOTE_THRESHOLD_MS + 1).toISOString();
+    const agedMarkdown = renderWeeklyMarkdown(weekly, cumulative, window, 8, pastThresholdNowIso);
+    expect(agedMarkdown).toContain('report window ends 1.0h before this run');
+    expect(agedMarkdown).toContain('commit age does not establish checkout freshness');
+    expect(agedMarkdown).not.toMatch(/looks stale|fetch/i);
   });
 });
 
 describe('printWeeklyReport', () => {
-  it('#717 review round 2 (P3): prints the window line, and the stale warning only past the threshold', () => {
+  it('prints the window line and neutral window-age note only past the threshold', () => {
     const prs = [pr({ number: 1, mergedAt: '2026-09-08T00:00:00Z' })];
     const weekly = computeWeeklyReport(prs, [], 14, '2026-09-12T00:00:00Z');
     const untilIso = '2026-09-12T00:00:00.000Z';
@@ -1495,35 +1494,37 @@ describe('printWeeklyReport', () => {
       printWeeklyReport(weekly, window, untilIso); // fresh — nowIso == untilIso
       const freshOutput = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
       expect(freshOutput).toContain(formatWeeklyWindowLine(window));
-      expect(freshOutput).not.toContain('origin/main looks stale');
+      expect(freshOutput).not.toContain('report window ends');
 
       logSpy.mockClear();
-      const staleNowIso = new Date(
-        new Date(untilIso).getTime() + STALE_MAIN_TIP_WARNING_THRESHOLD_MS + 1,
-      ).toISOString();
-      printWeeklyReport(weekly, window, staleNowIso);
-      const staleOutput = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
-      expect(staleOutput).toContain(formatWeeklyWindowLine(window));
-      expect(staleOutput).toContain('origin/main looks stale');
+      const agedNowIso = new Date(new Date(untilIso).getTime() + WINDOW_AGE_NOTE_THRESHOLD_MS + 1).toISOString();
+      printWeeklyReport(weekly, window, agedNowIso);
+      const agedOutput = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(agedOutput).toContain(formatWeeklyWindowLine(window));
+      expect(agedOutput).toContain('report window ends 1.0h before this run');
+      expect(agedOutput).toContain('commit age does not establish checkout freshness');
+      expect(agedOutput).not.toMatch(/looks stale|fetch/i);
     } finally {
       logSpy.mockRestore();
     }
   });
 });
 
-describe('formatStaleMainTipWarning — mutation coverage for the staleness comparison', () => {
+describe('formatWindowAgeNote — mutation coverage for the window-age comparison', () => {
   it('is null at and below the threshold, non-null just past it', () => {
     const untilIso = '2026-09-12T00:00:00.000Z';
-    const atThreshold = new Date(new Date(untilIso).getTime() + STALE_MAIN_TIP_WARNING_THRESHOLD_MS).toISOString();
-    const justPast = new Date(
-      new Date(untilIso).getTime() + STALE_MAIN_TIP_WARNING_THRESHOLD_MS + 1,
-    ).toISOString();
+    const atThreshold = new Date(new Date(untilIso).getTime() + WINDOW_AGE_NOTE_THRESHOLD_MS).toISOString();
+    const justPast = new Date(new Date(untilIso).getTime() + WINDOW_AGE_NOTE_THRESHOLD_MS + 1).toISOString();
     const wellBelow = new Date(new Date(untilIso).getTime() + 1000).toISOString();
 
-    expect(formatStaleMainTipWarning(untilIso, wellBelow)).toBeNull();
-    expect(formatStaleMainTipWarning(untilIso, atThreshold)).toBeNull();
-    expect(formatStaleMainTipWarning(untilIso, justPast)).not.toBeNull();
-    expect(formatStaleMainTipWarning(untilIso, justPast)).toContain('origin/main looks stale');
+    expect(formatWindowAgeNote(untilIso, wellBelow)).toBeNull();
+    expect(formatWindowAgeNote(untilIso, atThreshold)).toBeNull();
+    expect(formatWindowAgeNote(untilIso, justPast)).toContain('report window ends 1.0h before this run');
+  });
+
+  it('does not render NaN for invalid timestamps', () => {
+    expect(formatWindowAgeNote('invalid', '2026-09-12T02:00:00.000Z')).toBeNull();
+    expect(formatWindowAgeNote('2026-09-12T00:00:00.000Z', 'invalid')).toBeNull();
   });
 });
 

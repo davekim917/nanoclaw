@@ -1352,8 +1352,8 @@ export function renderWeeklyMarkdown(
   lines.push('## Review metrics (weekly)');
   lines.push('');
   lines.push(formatWeeklyWindowLine(window));
-  const staleWarning = formatStaleMainTipWarning(window.untilIso, nowIso);
-  if (staleWarning) lines.push(staleWarning);
+  const windowAgeNote = formatWindowAgeNote(window.untilIso, nowIso);
+  if (windowAgeNote) lines.push(windowAgeNote);
   lines.push('');
   lines.push(
     "These are this file's own definitions, not a reproduction of Augment's Cosmos post — " +
@@ -1678,7 +1678,9 @@ function fetchMergedPrTotalCount(repo: string, sinceIso: string, untilIso: strin
   ]);
   const count = Number.parseInt(raw.trim(), 10);
   if (!Number.isFinite(count)) {
-    throw new Error(`review-outcomes: fetchMergedPrTotalCount: unparseable total_count from gh: ${JSON.stringify(raw)}`);
+    throw new Error(
+      `review-outcomes: fetchMergedPrTotalCount: unparseable total_count from gh: ${JSON.stringify(raw)}`,
+    );
   }
   return count;
 }
@@ -1843,7 +1845,7 @@ export function resolveMainTipInfo(): MainTipInfo {
 }
 
 /** The search window this run used, plus the exact `origin/main` commit `untilIso` came
- *  from — everything `formatWeeklyWindowLine` and `formatStaleMainTipWarning` need,
+ *  from — everything `formatWeeklyWindowLine` and `formatWindowAgeNote` need,
  *  computed once in `main()` and threaded into both `renderWeeklyMarkdown` (the posted
  *  comment) and `printWeeklyReport` (the plain-console form) so neither can silently
  *  omit it the way `--json`'s `until` field alone did before this change.
@@ -1863,37 +1865,32 @@ export function formatWeeklyWindowLine(window: WeeklyWindowInfo): string {
   return `window: ${window.sinceIso}..${window.untilIso} (origin/main ${window.tip.shortSha} @ ${window.tip.tipIso})`;
 }
 
-/** How far `origin/main`'s tip may trail the wall clock before the weekly report warns
- *  that the checkout looks stale. `untilIso` is frozen at whatever `origin/main` pointed
- *  to when this run's own `git log` read it (`resolveMainTipUntilIso`) — a scheduled CI
- *  run always starts from a fresh `actions/checkout`, so this never fires there, but a
- *  hand run against a checkout fetched hours or days ago silently cuts the current week
- *  short with no signal in the posted comment. Deliberately well above
- *  `UNTIL_ISO_SEARCH_INDEX_LAG_MARGIN_MS` (~2 minutes of ordinary search-index lag, not
- *  staleness) so this only fires on genuine staleness, never on the margin itself. */
-export const STALE_MAIN_TIP_WARNING_THRESHOLD_MS = 60 * 60 * 1000;
+/** How old a report window may be before both weekly outputs disclose that age. `untilIso`
+ *  is frozen at whatever `origin/main` pointed to when this run's own `git log` read it
+ *  (`resolveMainTipUntilIso`). A commit's age does not establish whether the checkout is
+ *  fresh, so this is context for the report window, never a checkout-freshness verdict.
+ *  The threshold intentionally remains above the ordinary search-index lag margin so
+ *  short-lived runs do not add noise. */
+export const WINDOW_AGE_NOTE_THRESHOLD_MS = 60 * 60 * 1000;
 
 /**
- * A warning line for both weekly outputs when `origin/main`'s tip trails the wall clock
- * by more than `STALE_MAIN_TIP_WARNING_THRESHOLD_MS` (default 1h) — evidence the
- * checkout this run read `untilIso` from is stale and should be re-fetched before the
- * numbers are trusted. Returns `null` (never throws) when the gap is within the
- * threshold: this is a warning, not a gate, and a stale checkout is never a reason to
- * fail the run.
+ * A neutral context line for both weekly outputs when the report window ends more than
+ * `WINDOW_AGE_NOTE_THRESHOLD_MS` (default 1h) before this run. Returns `null` when the
+ * gap is within the threshold or either timestamp is invalid; this note is not a gate
+ * and makes no claim about checkout freshness.
  */
-export function formatStaleMainTipWarning(
+export function formatWindowAgeNote(
   untilIso: string,
   nowIso: string = new Date().toISOString(),
-  thresholdMs: number = STALE_MAIN_TIP_WARNING_THRESHOLD_MS,
+  thresholdMs: number = WINDOW_AGE_NOTE_THRESHOLD_MS,
 ): string | null {
-  const lagMs = new Date(nowIso).getTime() - new Date(untilIso).getTime();
-  if (lagMs <= thresholdMs) return null;
-  const lagHours = (lagMs / (60 * 60 * 1000)).toFixed(1);
-  return (
-    `WARNING: origin/main looks stale — its tip is ${lagHours}h behind wall-clock time, well past the ` +
-    `~2-minute search-index-lag margin. Fetch origin/main and re-run before trusting this window; a ` +
-    'hand run against a stale checkout can silently cut the current week short.'
-  );
+  const untilMs = new Date(untilIso).getTime();
+  const nowMs = new Date(nowIso).getTime();
+  if (!Number.isFinite(untilMs) || !Number.isFinite(nowMs)) return null;
+  const ageMs = nowMs - untilMs;
+  if (ageMs <= thresholdMs) return null;
+  const ageHours = (ageMs / (60 * 60 * 1000)).toFixed(1);
+  return `NOTE: report window ends ${ageHours}h before this run; commit age does not establish checkout freshness.`;
 }
 
 export function fetchMergedPRs(repo: string, sinceIso: string, untilIso: string): PullRequestData[] {
@@ -2598,8 +2595,8 @@ export function printWeeklyReport(
   );
   console.log("(these are this file's own definitions — not directly comparable to Augment Cosmos's figures)");
   console.log(formatWeeklyWindowLine(window));
-  const staleWarning = formatStaleMainTipWarning(window.untilIso, nowIso);
-  if (staleWarning) console.log(staleWarning);
+  const windowAgeNote = formatWindowAgeNote(window.untilIso, nowIso);
+  if (windowAgeNote) console.log(windowAgeNote);
   console.log('');
   for (const row of weekly.rows) {
     const gate = row.isMixedGateWeek ? 'mixed' : row.preGateMerged > 0 ? 'pre-gate' : 'post-gate';
