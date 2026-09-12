@@ -56,6 +56,7 @@ import {
   resolveAtMergeFileContextLocal,
   SHADOW_REVIEW_GO_LIVE_ISO,
   stripFencedAndCommented,
+  verifyMergedPrTotalCount,
   type Options,
   type PullRequestData,
   type ShadowReviewIssueData,
@@ -863,6 +864,46 @@ describe('combineMergedPrSlices — P2, de-dup and fail-on-cap', () => {
   });
 });
 
+describe('verifyMergedPrTotalCount — P3 #2 (#706 round 4), search total_count cross-check', () => {
+  // A malformed or unparsed `merged:` search bound doesn't error — it silently returns a
+  // valid-looking but wrong result set, no slice ever near combineMergedPrSlices' >=1000
+  // cap. `fetchTotal`/`wait` are stubbed here exactly so these cases never shell out to
+  // `gh` or actually pause wall-clock time (see the function's own doc comment).
+  const window = { repo: 'owner/repo', sinceIso: '2026-09-07T00:00:00.000Z', untilIso: '2026-09-13T23:59:59.999Z' };
+
+  it('passes when the first read already matches the combined count — no wait, no retry', () => {
+    let calls = 0;
+    const fetchTotal = (): number => {
+      calls += 1;
+      return 45;
+    };
+    const wait = vi.fn();
+    expect(() => verifyMergedPrTotalCount(45, window, fetchTotal, wait)).not.toThrow();
+    expect(calls).toBe(1);
+    expect(wait).not.toHaveBeenCalled();
+  });
+
+  it('retries once after a mismatch, and passes when the retry clears it (search-index lag on a just-completed merge)', () => {
+    const totals = [44, 45]; // first read misses the just-merged PR; retry catches up
+    let calls = 0;
+    const fetchTotal = (): number => totals[calls++]!;
+    const wait = vi.fn();
+    expect(() => verifyMergedPrTotalCount(45, window, fetchTotal, wait)).not.toThrow();
+    expect(calls).toBe(2);
+    expect(wait).toHaveBeenCalledTimes(1);
+    expect(wait).toHaveBeenCalledWith(expect.any(Number));
+  });
+
+  it('throws, naming both the combined count and the search total, when the mismatch persists past the retry', () => {
+    const fetchTotal = (): number => 47; // never agrees with the combined count below
+    const wait = vi.fn();
+    expect(() => verifyMergedPrTotalCount(45, window, fetchTotal, wait)).toThrow(
+      /45 unique pull request.*47|47.*45 unique pull request/s,
+    );
+    expect(wait).toHaveBeenCalledTimes(1); // one retry attempted before giving up, never more
+  });
+});
+
 describe('computeWeeklyFetchSinceIso', () => {
   it('subtracts weeklyDays from nowIso', () => {
     expect(computeWeeklyFetchSinceIso('2026-09-12T00:00:00Z', 90)).toBe(new Date('2026-06-14T00:00:00Z').toISOString());
@@ -1584,6 +1625,61 @@ describe('at-merge replay from local git (fixture repo, no network) — P2', () 
       expect(readRiskHighGlobsAtShaLocal(baseCommit)).toEqual({ kind: 'error' });
     } finally {
       spy.mockRestore();
+    }
+  });
+
+  it('readRiskHighGlobsAtShaLocal is "error" (NOT "missing") when the tree entry is intact but the loose blob object is gone — the real partial-clone bug, not a mocked `git show` failure', () => {
+    // Round 4's P3 #1 on #706: `labelerPathExistsAtSha` used to be `git cat-file -e
+    // <sha>:.github/labeler.yml`, which resolves the tree walk AND THEN verifies the
+    // blob object it names exists in the local object database. A partial/lazy clone
+    // (`--filter=blob:none`) can have the tree entry — the path genuinely exists at this
+    // commit — while missing that one blob. This fixture reproduces exactly that: a
+    // real repo, a real commit, then the loose blob object for `.github/labeler.yml`
+    // deleted straight out of `.git/objects` while its tree entry is left untouched.
+    const partialCloneRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-partial-clone-fixture-'));
+    function g(args: string[]): string {
+      return execFileSync('git', ['-c', 'user.email=test@example.invalid', '-c', 'user.name=test', ...args], {
+        cwd: partialCloneRepo,
+        encoding: 'utf8',
+      }).trim();
+    }
+    g(['init', '-q', '-b', 'main']);
+    fs.mkdirSync(path.join(partialCloneRepo, '.github'), { recursive: true });
+    fs.writeFileSync(
+      path.join(partialCloneRepo, '.github', 'labeler.yml'),
+      "risk:high:\n- changed-files:\n  - any-glob-to-any-file:\n    - 'src/guard/**'\n",
+    );
+    g(['add', '-A']);
+    g(['commit', '-q', '-m', 'base with labeler.yml']);
+    const partialCloneCommit = g(['rev-parse', 'HEAD']);
+    const blobSha = g(['rev-parse', `${partialCloneCommit}:.github/labeler.yml`]);
+
+    // Delete the loose blob object directly. The tree entry (the parent tree object's
+    // own recorded `<mode> <name>\0<oid>` listing) is never touched by this — only the
+    // blob object itself, the thing `cat-file -e` additionally checks and `rev-parse
+    // --verify` does not.
+    const objectPath = path.join(partialCloneRepo, '.git', 'objects', blobSha.slice(0, 2), blobSha.slice(2));
+    expect(fs.existsSync(objectPath)).toBe(true);
+    fs.chmodSync(objectPath, 0o644);
+    fs.unlinkSync(objectPath);
+    expect(fs.existsSync(objectPath)).toBe(false);
+
+    process.chdir(partialCloneRepo);
+    try {
+      // Sanity checks first, both unmocked — if either stops holding, this fixture no
+      // longer reproduces the bug it exists to catch.
+      // (1) the OLD implementation's check fails here even though the path exists at
+      // this commit — reproducing the exact misclassification round 4 flagged.
+      expect(() => execFileSync('git', ['cat-file', '-e', `${partialCloneCommit}:.github/labeler.yml`])).toThrow();
+      // (2) the FIX's tree-only check still resolves the entry without touching the
+      // missing blob.
+      expect(() =>
+        execFileSync('git', ['rev-parse', '--verify', '-q', `${partialCloneCommit}:.github/labeler.yml`]),
+      ).not.toThrow();
+      expect(readRiskHighGlobsAtShaLocal(partialCloneCommit)).toEqual({ kind: 'error' });
+    } finally {
+      process.chdir(repoDir);
+      fs.rmSync(partialCloneRepo, { recursive: true, force: true });
     }
   });
 

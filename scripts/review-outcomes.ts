@@ -1630,6 +1630,94 @@ function fetchMergedPrsForSlice(repo: string, slice: MergedPrSearchSlice): PullR
   return prs.map((pr) => toPullRequestData(repo, pr));
 }
 
+/** How long `verifyMergedPrTotalCount` waits before its one retry — long enough for
+ *  GitHub's search index to catch up on a just-completed merge, per the round-4 review
+ *  receipt on #706 ("the search index can lag a very recent merge"). */
+const SEARCH_TOTAL_COUNT_RETRY_WAIT_MS = 3000;
+
+/** Blocks the calling thread for `ms` milliseconds, synchronously. This whole file is
+ *  synchronous top to bottom (`execFileSync` throughout, no `await` anywhere — see
+ *  `main()`), so `verifyMergedPrTotalCount`'s one retry needs a synchronous wait rather
+ *  than threading `async`/`await` through every caller of `fetchMergedPRs` for a single
+ *  pause. `Atomics.wait` blocks without spinning the CPU; the backing buffer is never
+ *  written to, so it always times out after exactly `ms`. */
+function sleepMsSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * GitHub search's own `total_count` for the window `[sinceIso, untilIso]`, using the
+ * REST `search/issues` endpoint with EXACTLY the qualifiers `fetchMergedPrsForSlice`
+ * sends `gh pr list --search` to build (`repo:<repo> is:pr is:merged
+ * merged:<since>..<until>`) — confirmed empirically to agree with `gh pr list`'s own
+ * GraphQL `search().issueCount` for an identical one-day window against
+ * davekim917/nanoclaw on 2026-09-12 (25 both ways; `GH_DEBUG=api` shows `gh pr list
+ * --search` sends `"( merged:<range> ) is:merged repo:<repo> type:pr"` over GraphQL,
+ * which is the same qualifier set in a different order and syntax for `is:pr`/`type:pr`).
+ */
+function fetchMergedPrTotalCount(repo: string, sinceIso: string, untilIso: string): number {
+  const raw = gh([
+    'api',
+    '-X',
+    'GET',
+    'search/issues',
+    '-f',
+    `q=repo:${repo} is:pr is:merged merged:${sinceIso}..${untilIso}`,
+    '--jq',
+    '.total_count',
+  ]);
+  const count = Number.parseInt(raw.trim(), 10);
+  if (!Number.isFinite(count)) {
+    throw new Error(`review-outcomes: fetchMergedPrTotalCount: unparseable total_count from gh: ${JSON.stringify(raw)}`);
+  }
+  return count;
+}
+
+/**
+ * Cross-checks `combinedCount` — the de-duplicated PR count `fetchMergedPRs` actually
+ * collected across all its per-week slices — against GitHub search's own `total_count`
+ * for the identical `[sinceIso, untilIso]` window and qualifiers. This catches a class
+ * `combineMergedPrSlices`' `>=1000`-per-slice guard cannot: a malformed or unparsed
+ * `merged:` search bound doesn't error, it silently returns a valid-looking but empty (or
+ * partial) result set — `n` and every rate built on it would go quietly wrong with no
+ * slice ever near the cap. It also catches slice-cap truncation independently, as a second
+ * line of defense.
+ *
+ * The search index can lag a just-completed merge by a few seconds, so a mismatch is
+ * retried ONCE after a short wait before being treated as real; a mismatch that persists
+ * throws, naming both numbers, rather than silently trusting the (likely wrong) total.
+ *
+ * `fetchTotal`/`wait` are parameters — defaulting to the real `gh` call and a real
+ * synchronous sleep — purely so tests can stub both: a stub returning the same value
+ * twice never waits or throws, one that mismatches both times must throw before its
+ * second call, and one that mismatches once then matches must return normally.
+ *
+ * Rate limit: GitHub's search API allows 30 authenticated requests/minute
+ * (docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api#search-api).
+ * A `--weekly-days 90` run's `computeMergedSearchSlices` already spends roughly 13-14
+ * requests on per-ISO-week slices; this adds exactly 1 more (2 only on the rare mismatch
+ * that needs the retry) — comfortably inside the 30/minute budget for one run.
+ */
+export function verifyMergedPrTotalCount(
+  combinedCount: number,
+  window: { repo: string; sinceIso: string; untilIso: string },
+  fetchTotal: (repo: string, sinceIso: string, untilIso: string) => number = fetchMergedPrTotalCount,
+  wait: (ms: number) => void = sleepMsSync,
+): void {
+  const first = fetchTotal(window.repo, window.sinceIso, window.untilIso);
+  if (first === combinedCount) return;
+  wait(SEARCH_TOTAL_COUNT_RETRY_WAIT_MS);
+  const second = fetchTotal(window.repo, window.sinceIso, window.untilIso);
+  if (second === combinedCount) return;
+  throw new Error(
+    `review-outcomes: fetchMergedPRs: combined per-week slices for merged:${window.sinceIso}..${window.untilIso} ` +
+      `produced ${combinedCount} unique pull request(s), but GitHub search's total_count for the identical window ` +
+      `and qualifiers is ${second} (first read: ${first}) after one retry for search-index lag. A malformed or ` +
+      `unparsed search bound can return 0 rows (or a partial count) with no error at all — never proceeding on a ` +
+      `mismatched count.`,
+  );
+}
+
 export function fetchMergedPRs(
   repo: string,
   sinceIso: string,
@@ -1637,7 +1725,13 @@ export function fetchMergedPRs(
 ): PullRequestData[] {
   const slices = computeMergedSearchSlices(sinceIso, nowIso);
   const sliceResults = slices.map((slice) => ({ slice, prs: fetchMergedPrsForSlice(repo, slice) }));
-  return combineMergedPrSlices(sliceResults);
+  const combined = combineMergedPrSlices(sliceResults);
+  // Same `nowIso` used for both the slices above and the total below (a single value
+  // captured once at this call's entry, whether passed in or defaulted) — a PR merging
+  // mid-run can't shift one bound without shifting the other, which would otherwise
+  // manufacture a mismatch `verifyMergedPrTotalCount` would then wrongly act on.
+  verifyMergedPrTotalCount(combined.length, { repo, sinceIso, untilIso: nowIso });
+  return combined;
 }
 
 // ─────────────────────────── at-merge replay (I/O) ─────────────────────────
@@ -1719,16 +1813,29 @@ export type LabelerReadResult =
   | { kind: 'missing' } // the commit resolves locally, but the path doesn't exist in its tree
   | { kind: 'error' }; // the commit doesn't resolve locally, or the file exists but is unparseable/wrong-shaped
 
-/** Whether `path` exists in `sha`'s tree — `git cat-file -e <sha>:<path>`, which only
- *  asks "is there an object at this tree path", never reads or decodes its content. Kept
- *  separate from `git show <sha>:<path>` (which DOES read content) so
- *  `readRiskHighGlobsAtShaLocal` can tell "this path never existed here" apart from "the
- *  path resolves but its content couldn't be read" (a partial/lazy checkout that has the
- *  tree entry but not the blob itself, for instance) — see that function's own doc
- *  comment for why the two must not collapse into the same answer. */
+/** Whether `path`'s TREE ENTRY exists in `sha`'s tree — `git rev-parse --verify -q
+ *  <sha>:<path>`, which resolves the tree walk only: each path component is looked up by
+ *  reading the parent TREE object's own listing, where the child's oid is already
+ *  recorded, so this succeeds without ever touching the blob object the final entry
+ *  names. This is deliberately NOT `git cat-file -e <sha>:<path>`, which this function
+ *  used until the bug this comment documents: `cat-file -e` walks the same tree but then
+ *  also verifies the blob object it names actually exists and is readable in the local
+ *  object database. Confirmed empirically (fixture with the loose blob object deleted,
+ *  tree entry intact): `cat-file -e` FAILS in exactly that case — a partial/lazy clone
+ *  missing that one blob — even though the path plainly exists at this commit, which
+ *  misclassified a present-but-unreadable file as absent (`'missing'`, which
+ *  `resolveAtMergeContexts` then reclassifies as a pre-gate override) instead of
+ *  `'error'` (fail closed, unresolved). `rev-parse --verify -q` does not have that
+ *  failure mode, because it never needs the blob to exist locally at all.
+ *
+ *  Kept separate from `git show <sha>:<path>` (which DOES read and decode the blob's
+ *  content) so `readRiskHighGlobsAtShaLocal` can tell "this path never existed here"
+ *  (`'missing'`) apart from "the path resolves but its content couldn't be read"
+ *  (`'error'`) — see that function's own doc comment for why the two must not collapse
+ *  into the same answer. */
 function labelerPathExistsAtSha(sha: string): boolean {
   try {
-    execFileSync('git', ['cat-file', '-e', `${sha}:.github/labeler.yml`], { stdio: 'ignore' });
+    execFileSync('git', ['rev-parse', '--verify', '-q', `${sha}:.github/labeler.yml`], { stdio: 'ignore' });
     return true;
     // eslint-disable-next-line no-catch-all/no-catch-all
   } catch {
@@ -1748,9 +1855,10 @@ function labelerPathExistsAtSha(sha: string): boolean {
  * `'error'` stays unresolved — a shallow clone or a force-pushed-away base is a real gap
  * in what we can tell, not evidence of anything.
  *
- * `labelerPathExistsAtSha` (`git cat-file -e`) is checked BEFORE `git show`: the two can
- * diverge (a path whose tree entry exists but whose content is unreadable — a partial
- * checkout missing that blob, for instance) — treating every `git show` failure as
+ * `labelerPathExistsAtSha` (`git rev-parse --verify -q <sha>:<path>`, a TREE-only check —
+ * see that function's own doc comment) is checked BEFORE `git show`: the two can diverge
+ * (a path whose tree entry exists but whose blob content is unreadable — a partial/lazy
+ * checkout missing that one blob, for instance) — treating every `git show` failure as
  * "missing" would silently reclassify that gap as pre-gate, exactly like a genuinely
  * absent file, instead of failing closed to `'error'`/unresolved.
  */
