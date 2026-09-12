@@ -272,6 +272,7 @@ jq -e --arg sha "$HEAD_SHA" '
   .data.previewUrl == "https://xzo-dev-backend-pr-42.onrender.com" and
   .data.isFreezePr == false and .data.ciSha == $sha and
   .data.recovery == false and .data.abandonedActiveSha == null and
+  .data.campaignSize == "standard" and .data.sizeReason == "no sizing rules" and
   (.data.runId | test("^smoke-pr42-")) and
   (.data.coordinatorOwnerToken | test("^owner-[0-9a-f]{64}$"))
 ' <<<"$POLL_OUT" >/dev/null
@@ -383,6 +384,72 @@ flap_poll "6 of 8 QA seats could not be verified" | jq -e '
   .wakeAgent == true and (.data.reason | test("6 of 8"))
 ' >/dev/null
 unset SMOKE_GATE_PREFLIGHT_CMD
+
+# --- 3d. Settle payload carries campaignSize/sizeReason through for a LIGHT
+# PR — the coordinator's run record for pr1792 read no campaignSize at all
+# because this field never rode the pr_build_settled wake, even though the
+# gate computed it into $facts; regression for that gap.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+SIZE_RULES="$STATE_DIR/sizing-3d.json"
+cat > "$SIZE_RULES" <<'JSON'
+{"full":["backend/migrations/**"],"lightAllowed":["frontend/**"],"lightDeny":["frontend/auth/**"]}
+JSON
+export SMOKE_SIZING_RULES="$SIZE_RULES"
+HEAD_SHA="$(sha f)"
+export STUB_PR_LIST="[{\"number\":46,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
+export STUB_PR_VIEW="{\"number\":46,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"frontend/a.css"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-46\",\"name\":\"XZO-DEV-BACKEND PR #46\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-46.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+CHECK_OUT="$(bash "$GATE" check 46)"
+CHECK_SIZE="$(jq -r '.campaignSize' <<<"$CHECK_OUT")"
+CHECK_REASON="$(jq -r '.sizeReason' <<<"$CHECK_OUT")"
+[ "$CHECK_SIZE" = "light" ] || { echo "3d setup: expected the fixture itself to classify light, got $CHECK_SIZE" >&2; exit 1; }
+POLL_OUT="$(bash "$GATE" poll)"
+jq -e --arg size "$CHECK_SIZE" --arg reason "$CHECK_REASON" '
+  .wakeAgent == true and .data.trigger == "pr_build_settled" and
+  .data.campaignSize == $size and .data.sizeReason == $reason and
+  .data.campaignSize == "light" and (.data.sizeReason | startswith("light:"))
+' <<<"$POLL_OUT" >/dev/null \
+  || { echo "3d: light campaignSize/sizeReason did not ride the settled wake: $POLL_OUT" >&2; exit 1; }
+unset SMOKE_SIZING_RULES
+
+# --- 3e. Same, for a FULL PR — the migrations-touching case, where campaign
+# size matters most (this is exactly the sizing signal a coordinator needs to
+# scale up review, not just the light-sizing happy path above).
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+SIZE_RULES="$STATE_DIR/sizing-3e.json"
+cat > "$SIZE_RULES" <<'JSON'
+{"full":["backend/migrations/**"],"lightAllowed":["frontend/**"],"lightDeny":["frontend/auth/**"]}
+JSON
+export SMOKE_SIZING_RULES="$SIZE_RULES"
+HEAD_SHA="$(sha 9)"
+export STUB_PR_LIST="[{\"number\":47,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
+export STUB_PR_VIEW="{\"number\":47,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"backend/migrations/0100_add_col.sql"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-47\",\"name\":\"XZO-DEV-BACKEND PR #47\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-47.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+CHECK_OUT="$(bash "$GATE" check 47)"
+CHECK_SIZE="$(jq -r '.campaignSize' <<<"$CHECK_OUT")"
+CHECK_REASON="$(jq -r '.sizeReason' <<<"$CHECK_OUT")"
+[ "$CHECK_SIZE" = "full" ] || { echo "3e setup: expected the fixture itself to classify full, got $CHECK_SIZE" >&2; exit 1; }
+POLL_OUT="$(bash "$GATE" poll)"
+jq -e --arg size "$CHECK_SIZE" --arg reason "$CHECK_REASON" '
+  .wakeAgent == true and .data.trigger == "pr_build_settled" and
+  .data.campaignSize == $size and .data.sizeReason == $reason and
+  .data.campaignSize == "full" and
+  (.data.sizeReason | test("backend/migrations/0100_add_col.sql matched backend/migrations/\\*\\*"))
+' <<<"$POLL_OUT" >/dev/null \
+  || { echo "3e: full campaignSize/sizeReason did not ride the settled wake: $POLL_OUT" >&2; exit 1; }
+unset SMOKE_SIZING_RULES
 
 # --- 4. Deploy-SHA mismatch: check reports not settled, not ready ----------
 fresh_state

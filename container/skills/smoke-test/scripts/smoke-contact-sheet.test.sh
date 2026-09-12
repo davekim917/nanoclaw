@@ -127,6 +127,9 @@ jq -e '.buildSha == "stub-build-sha-123"' "$RUN1/contact-sheet/manifest.json" >/
 jq -e '.screens[0].status == "captured" and .screens[0].desktop.captured == true and .screens[0].mobile.captured == true' \
   "$RUN1/contact-sheet/manifest.json" >/dev/null \
   || { echo "happy path: expected screen 0 fully captured" >&2; exit 1; }
+jq -e '.screens[0].freshNavigation == true and .screens[1].freshNavigation == true' \
+  "$RUN1/contact-sheet/manifest.json" >/dev/null \
+  || { echo "happy path: expected freshNavigation:true recorded on every screen" >&2; exit 1; }
 
 [ -s "$RUN1/contact-sheet/shots/00-home-1280.png" ] || { echo "happy path: missing desktop shot" >&2; exit 1; }
 [ -s "$RUN1/contact-sheet/shots/00-home-390.png" ] || { echo "happy path: missing mobile shot" >&2; exit 1; }
@@ -134,9 +137,15 @@ jq -e '.screens[0].status == "captured" and .screens[0].desktop.captured == true
 grep -q '<img class="desktop" src="shots/00-home-1280.png">' "$RUN1/contact-sheet/grid.html" \
   || { echo "happy path: grid.html does not reference the desktop shot" >&2; exit 1; }
 
-# One session for the whole run: every call must carry the same --session value.
+# A fresh session per screen, never one shared for the whole run — plus one
+# for the preflight auth-state probe and one for the final grid render: 2
+# screens here means 4 distinct sessions total.
 SESSIONS_USED="$(grep -o '^--session [^ ]*' "$STUB_LOG" | sort -u | wc -l)"
-[ "$SESSIONS_USED" -eq 1 ] || { echo "happy path: expected exactly one session, saw $SESSIONS_USED" >&2; exit 1; }
+[ "$SESSIONS_USED" -eq 4 ] || { echo "happy path: expected 4 distinct sessions (preflight + 2 screens + grid), saw $SESSIONS_USED" >&2; exit 1; }
+# Every session used must also be closed, not just left open at run end.
+CLOSED_SESSIONS="$(awk '$1=="--session" && $3=="close"{print $2}' "$STUB_LOG" | sort -u | wc -l)"
+[ "$CLOSED_SESSIONS" -eq "$SESSIONS_USED" ] \
+  || { echo "happy path: expected all $SESSIONS_USED sessions closed, saw $CLOSED_SESSIONS close calls" >&2; exit 1; }
 
 # state load must run before the first open (auth lease, never a fresh login).
 FIRST_STATE_LINE="$(grep -n ' state load ' "$STUB_LOG" | head -1 | cut -d: -f1)"
@@ -151,7 +160,7 @@ grep -q ' find text Get started click' "$STUB_LOG" \
 grep -q ' click text=' "$STUB_LOG" \
   && { echo "happy path: text= step must never be passed straight to click" >&2; exit 1; }
 
-echo "1/7 happy path ok"
+echo "1/10 happy path ok"
 
 # --- 2. A failed screen stays as a placeholder, never silently dropped ------
 RUN2="$(fresh_run_dir failed-screen)"
@@ -180,7 +189,7 @@ grep -q 'FAILED' "$RUN2/contact-sheet/grid.html" \
 grep -q 'class="desktop placeholder"' "$RUN2/contact-sheet/grid.html" \
   || { echo "failed screen: expected a desktop placeholder div" >&2; exit 1; }
 
-echo "2/7 failed screen stays a placeholder ok"
+echo "2/10 failed screen stays a placeholder ok"
 
 # --- 3. The 8-screen cap ------------------------------------------------------
 RUN3="$(fresh_run_dir cap)"
@@ -196,7 +205,7 @@ echo "$RESULT" | jq -e '.ok == true and .requested == 10 and .capped == true and
 jq -e '.requested == 10 and .capped == true and (.screens | length) == 8' "$RUN3/contact-sheet/manifest.json" \
   >/dev/null || { echo "cap: manifest did not record the 8-screen cap correctly" >&2; exit 1; }
 
-echo "3/7 8-screen cap ok"
+echo "3/10 8-screen cap ok"
 
 # --- 4. Missing auth state: refuse, never touch the browser ------------------
 RUN4="$(fresh_run_dir no-auth)"
@@ -214,7 +223,7 @@ echo "$RESULT" | jq -e '.ok == false and (.error | test("auth state"))' >/dev/nu
   || { echo "missing auth state: expected a refusal naming the auth state: $RESULT" >&2; exit 1; }
 [ ! -s "$STUB_LOG" ] || { echo "missing auth state: agent-browser must never be invoked" >&2; exit 1; }
 
-echo "4/7 missing auth state refuses before touching the browser ok"
+echo "4/10 missing auth state refuses before touching the browser ok"
 
 # --- 5. Empty shots file: refuse -----------------------------------------------
 RUN5="$(fresh_run_dir empty-shots)"
@@ -240,7 +249,7 @@ set -e
 echo "$RESULT" | jq -e '.ok == false' >/dev/null \
   || { echo "missing shots file: expected a refusal: $RESULT" >&2; exit 1; }
 
-echo "5/7 empty/missing shots file refuses ok"
+echo "5/10 empty/missing shots file refuses ok"
 
 # --- 6. Auth state inside the run dir: refuse ---------------------------------
 # The auth state file holds a live session token; the run dir is a shared,
@@ -263,7 +272,7 @@ echo "$RESULT" | jq -e '.ok == false and (.error | test("run dir"))' >/dev/null 
   || { echo "auth in run dir: expected a refusal naming the run dir: $RESULT" >&2; exit 1; }
 [ ! -s "$STUB_LOG" ] || { echo "auth in run dir: agent-browser must never be invoked" >&2; exit 1; }
 
-echo "6/7 auth state inside the run dir refuses ok"
+echo "6/10 auth state inside the run dir refuses ok"
 
 # --- 7. Auth state under the shared workgroup tree: refuse --------------------
 # Override the workgroup root so the test never depends on /workspace/workgroup
@@ -297,6 +306,122 @@ RESULT="$(SMOKE_WORKGROUP_ROOT="$FAKE_WORKGROUP_ROOT" \
 echo "$RESULT" | jq -e '.ok == true' >/dev/null \
   || { echo "auth under workgroup root: a private auth path must still succeed: $RESULT" >&2; exit 1; }
 
-echo "7/7 auth state under the shared workgroup tree refuses ok"
+echo "7/10 auth state under the shared workgroup tree refuses ok"
+
+# --- 8. Caller-supplied source SHA rides through to the manifest verbatim ---
+# and the page is never sniffed for it (the stub's `eval` verb would answer
+# "stub-build-sha-123" if it were ever called for this).
+RUN8="$(fresh_run_dir source-sha)"
+cat >"$RUN8/contact-sheet/shots.json" <<'JSON'
+[{ "name": "home", "path": "/" }]
+JSON
+FROZEN_SHA="abcdef0123456789abcdef0123456789abcdef01"
+
+: >"$STUB_LOG"
+RESULT="$(bash "$SCRIPT" "$RUN8" "https://example.test" "$AUTH_STATE" "$FROZEN_SHA")"
+echo "$RESULT" | jq -e '.ok == true' >/dev/null \
+  || { echo "source sha: unexpected result: $RESULT" >&2; exit 1; }
+jq -e --arg sha "$FROZEN_SHA" '.buildSha == $sha' "$RUN8/contact-sheet/manifest.json" >/dev/null \
+  || { echo "source sha: expected manifest buildSha to be the caller-supplied sha" >&2; exit 1; }
+grep -q ' eval ' "$STUB_LOG" \
+  && { echo "source sha: must not sniff the page for a build sha when the caller already supplied one" >&2; exit 1; }
+
+echo "8/10 caller-supplied source sha rides through to the manifest ok"
+
+# --- 9. A malformed source SHA is refused, never written into the manifest --
+RUN9="$(fresh_run_dir bad-sha)"
+cat >"$RUN9/contact-sheet/shots.json" <<'JSON'
+[{ "name": "home", "path": "/" }]
+JSON
+
+: >"$STUB_LOG"
+for BAD_SHA in "not-a-sha" "abcdef" "ABCDEF0123456789ABCDEF0123456789ABCDEF01" "main"; do
+  set +e
+  RESULT="$(bash "$SCRIPT" "$RUN9" "https://example.test" "$AUTH_STATE" "$BAD_SHA" 2>&1)"
+  EC=$?
+  set -e
+  [ "$EC" -eq 2 ] || { echo "malformed sha ($BAD_SHA): expected exit 2, got $EC" >&2; exit 1; }
+  echo "$RESULT" | jq -e '.ok == false and (.error | test("sha"))' >/dev/null \
+    || { echo "malformed sha ($BAD_SHA): expected a refusal naming the sha: $RESULT" >&2; exit 1; }
+done
+[ ! -s "$STUB_LOG" ] || { echo "malformed sha: agent-browser must never be invoked" >&2; exit 1; }
+[ ! -e "$RUN9/contact-sheet/manifest.json" ] \
+  || { echo "malformed sha: no manifest should be written on refusal" >&2; exit 1; }
+
+# Omitting the argument entirely still falls back to the existing page-sniff
+# behaviour (already covered by the happy path in test 1, which asserts
+# buildSha == "stub-build-sha-123" with no fourth argument given).
+
+echo "9/10 malformed source sha is refused, never written into the manifest ok"
+
+# --- 10. Every screen gets its own fresh session (state load THEN open, in
+# that session, before any other screen's session is ever touched) — and the
+# per-screen pattern is identical regardless of which order the screens are
+# listed in. This is the regression for xzo-pr-pr1792-cac47f6f1153-20260912T113129Z,
+# where one shared session let an earlier screen's open nav drawer bleed into
+# every later 390px shot and the shadow critic graded all three BROKEN on
+# that capture artifact alone.
+check_fresh_nav() {
+  local run_dir="$1" home_path="$2" pricing_path="$3"
+  local home_url="https://example.test${home_path}" pricing_url="https://example.test${pricing_path}"
+
+  : >"$STUB_LOG"
+  local result
+  result="$(bash "$SCRIPT" "$run_dir" "https://example.test" "$AUTH_STATE")"
+  echo "$result" | jq -e '.ok == true and .captured == 2' >/dev/null \
+    || { echo "fresh nav ($run_dir): unexpected result: $result" >&2; exit 1; }
+
+  # Exactly one session ever called `open` with each screen's URL.
+  local home_session pricing_session
+  home_session="$(awk -v u="$home_url" '$1=="--session" && $3=="open" && $4==u{print $2}' "$STUB_LOG")"
+  pricing_session="$(awk -v u="$pricing_url" '$1=="--session" && $3=="open" && $4==u{print $2}' "$STUB_LOG")"
+  [ -n "$home_session" ] || { echo "fresh nav ($run_dir): no session opened $home_url" >&2; exit 1; }
+  [ -n "$pricing_session" ] || { echo "fresh nav ($run_dir): no session opened $pricing_url" >&2; exit 1; }
+  [ "$home_session" != "$pricing_session" ] \
+    || { echo "fresh nav ($run_dir): home and pricing shared one session ($home_session) — this is the pr1792 bleed" >&2; exit 1; }
+
+  # Each screen's own session did a `state load` of the SAME saved auth file
+  # BEFORE its `open` — a fresh context loading the existing state, not a
+  # fresh login.
+  for pair in "$home_session:$home_url" "$pricing_session:$pricing_url"; do
+    local sess="${pair%%:*}" url="${pair#*:}"
+    local state_line open_line
+    state_line="$(grep -n -- "^--session $sess state load $AUTH_STATE\$" "$STUB_LOG" | head -1 | cut -d: -f1)"
+    open_line="$(grep -n -- "^--session $sess open $url\$" "$STUB_LOG" | head -1 | cut -d: -f1)"
+    [ -n "$state_line" ] || { echo "fresh nav ($run_dir): session $sess never did state load" >&2; exit 1; }
+    [ -n "$open_line" ] || { echo "fresh nav ($run_dir): session $sess never opened $url" >&2; exit 1; }
+    [ "$state_line" -lt "$open_line" ] \
+      || { echo "fresh nav ($run_dir): session $sess opened before loading state" >&2; exit 1; }
+    grep -q -- "^--session $sess close\$" "$STUB_LOG" \
+      || { echo "fresh nav ($run_dir): session $sess was never closed" >&2; exit 1; }
+  done
+
+  jq -e '[.screens[].freshNavigation] == [true, true]' "$run_dir/contact-sheet/manifest.json" >/dev/null \
+    || { echo "fresh nav ($run_dir): expected freshNavigation:true on both screens" >&2; exit 1; }
+}
+
+RUN10="$(fresh_run_dir fresh-nav-order-a)"
+cat >"$RUN10/contact-sheet/shots.json" <<'JSON'
+[
+  { "name": "home", "path": "/" },
+  { "name": "pricing", "path": "/pricing" }
+]
+JSON
+check_fresh_nav "$RUN10" "/" "/pricing"
+
+# Same two screens, reversed order: the per-screen pattern above must hold
+# identically — no special-casing of "the first screen" that a shared
+# opening session would tempt (e.g. reusing whatever session happened to be
+# opened outside the loop only for index 0).
+RUN10B="$(fresh_run_dir fresh-nav-order-b)"
+cat >"$RUN10B/contact-sheet/shots.json" <<'JSON'
+[
+  { "name": "pricing", "path": "/pricing" },
+  { "name": "home", "path": "/" }
+]
+JSON
+check_fresh_nav "$RUN10B" "/" "/pricing"
+
+echo "10/10 fresh session per screen, order-independent ok"
 
 echo "smoke contact sheet tests passed"
