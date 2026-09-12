@@ -133,7 +133,12 @@ if [ -n "$rest" ]; then
       exit 1
       ;;
     */actions/runs\\?*)
-      if printf '%s\\n' "$@" | grep -qx -- --slurp; then printf '['; cat "$MOCK_DIR/runs.json"; printf ']'; else cat "$MOCK_DIR/runs.json"; fi
+      # runs-<n>.json answers the nth read of this endpoint in this run;
+      # runs.json otherwise. Mirrors the git/ref/heads nth-read pattern below.
+      n=$(grep -c '^rest repos/[^ ]*/actions/runs?' "$MOCK_CALLS")
+      src="$MOCK_DIR/runs.json"
+      if [ -f "$MOCK_DIR/runs-$n.json" ]; then src="$MOCK_DIR/runs-$n.json"; fi
+      if printf '%s\\n' "$@" | grep -qx -- --slurp; then printf '['; cat "$src"; printf ']'; else cat "$src"; fi
       exit 0
       ;;
     */commits/*/statuses\\?*)
@@ -302,6 +307,15 @@ function prState(
     changedFiles,
     labels: labels.map((name) => ({ name })),
   };
+}
+
+// A PR as ci-wait's mergeability read sees it: state, headRefOid, baseRefName
+// and mergeable, on top of prState's other fields (unused by ci-wait, but
+// harmless to carry so the same fixture also serves the labeler/comparison
+// reads the fake gh dispatches on `pr view`).
+function ciPr(opts: { mergeable?: string; head?: string; state?: string } = {}): Page {
+  const { mergeable = 'MERGEABLE', head = HEAD, state = 'OPEN' } = opts;
+  return { ...prState([], head), state, mergeable };
 }
 
 // One entry of `pulls/<n>/files`; a rename also names the path it left.
@@ -488,6 +502,10 @@ exit 64
   const result = spawnSync('bash', [script, ...args], {
     cwd: root,
     encoding: 'utf8',
+    // A mutation that loops forever (e.g. a bad deadline check) fails this
+    // test instead of hanging the worker — spawnSync blocks, so vitest's own
+    // per-test timeout cannot interrupt it.
+    timeout: 30_000,
     env: {
       ...process.env,
       PATH: `${bin}:${process.env.PATH ?? ''}`,
@@ -507,6 +525,14 @@ exit 64
     sleep: fs.existsSync(sleepLog) ? fs.readFileSync(sleepLog, 'utf8') : '',
     posted: fs.existsSync(posted) ? fs.readFileSync(posted, 'utf8') : null,
   };
+}
+
+// Runs `ci-wait`, feeding it exactly the epoch seconds (§2.3's clock calls)
+// the fake `date` should hand back, one per line, in call order.
+function ciWait(root: string, args: string[], dates: number[], env: Record<string, string> = {}) {
+  const dateValues = path.join(root, 'dates');
+  fs.writeFileSync(dateValues, dates.map((d) => `${d}\n`).join(''));
+  return runHelper(root, ['ci-wait', ...args], { MOCK_DATE_VALUES: dateValues, ...env });
 }
 
 afterEach(() => {
@@ -726,6 +752,252 @@ describe('codex-review status and foreground wait', () => {
     expect(result.stdout).toContain(`codex=head-changed head=${otherHead}`);
     expect(result.stdout).not.toContain('reason=usage_limit');
     expect(result.sleep).toBe('');
+  });
+});
+
+describe('codex-review ci-wait, the only way to wait on CI', () => {
+  // One Actions listing, as the API returns it — the Risk label run
+  // (excluded from CI) plus whatever ci_verdict must actually judge.
+  function writeRuns(root: string, name: string, runs: Page[]): void {
+    writeJson(root, name, { total_count: runs.length + 1, workflow_runs: [labelRun('completed', 'success'), ...runs] });
+  }
+
+  it('reports green on the first poll (mutation: an empty verdict read as pending, so it times out)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    writeRuns(root, 'runs.json', [workflowRun('CI', 'completed', 'success')]);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`ci=green head=${HEAD}`);
+    expect(result.sleep).toBe('');
+  });
+
+  it('polls again after a pending verdict instead of stopping (mutation: exits on the first pending, or never re-polls)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    writeRuns(root, 'runs-1.json', [workflowRun('CI', 'in_progress', null)]);
+    writeRuns(root, 'runs-2.json', [workflowRun('CI', 'completed', 'success')]);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 30]);
+    expect(result.status).toBe(0);
+    expect(result.sleep).toBe('30\n');
+    expect(result.stdout).toContain('tick=0');
+  });
+
+  it('sleeps CODEX_REVIEW_CI_POLL_SECONDS between ticks, not a hard-coded interval (mutation: a hard-coded sleep)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    writeRuns(root, 'runs-1.json', [workflowRun('CI', 'in_progress', null)]);
+    writeRuns(root, 'runs-2.json', [workflowRun('CI', 'completed', 'success')]);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 10], { CODEX_REVIEW_CI_POLL_SECONDS: '10' });
+    expect(result.status).toBe(0);
+    expect(result.sleep).toBe('10\n');
+  });
+
+  it('exits 29 on red CI, never 24 (mutation: red mapped to 24, or polling on after red)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    writeRuns(root, 'runs.json', [workflowRun('CI', 'completed', 'failure')]);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0]);
+    expect(result.status).toBe(29);
+    expect(result.stderr).toContain(`ci=red head=${HEAD}: ci_red: CI=failure (required)`);
+  });
+
+  it('exits 30 when no run at all ever registers before the window closes (mutation: ci_missing treated as pending until timeout)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    writeJson(root, 'runs.json', { total_count: 1, workflow_runs: [labelRun('completed', 'success')] });
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 30, 30, 60], { CODEX_REVIEW_CI_REGISTER_SECONDS: '60' });
+    expect(result.status).toBe(30);
+    expect(result.stderr).toContain(
+      `ci=none head=${HEAD} after 60s: ci_missing: no workflow run or commit status on this head`,
+    );
+    expect(result.sleep).toBe('30\n30\n');
+  });
+
+  it('exits 30 when a required workflow never ran, though another finished (mutation: same as above)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    writeJson(root, 'runs.json', {
+      total_count: 2,
+      workflow_runs: [labelRun('completed', 'success'), workflowRun('Lint', 'completed', 'success')],
+    });
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 30, 30, 60], { CODEX_REVIEW_CI_REGISTER_SECONDS: '60' });
+    expect(result.status).toBe(30);
+    expect(result.stderr).toContain('ci_missing: CI — required, but no run on this head');
+  });
+
+  it('reports "not registered yet" before the window, then green once CI shows up (mutation: exit 30 on the first ci_missing, with no window)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    writeJson(root, 'runs-1.json', { total_count: 1, workflow_runs: [labelRun('completed', 'success')] });
+    writeRuns(root, 'runs-2.json', [workflowRun('CI', 'in_progress', null)]);
+    writeRuns(root, 'runs-3.json', [workflowRun('CI', 'completed', 'success')]);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 30, 30, 60]);
+    expect(result.status).toBe(0);
+    expect(result.stdout.split('\n')[0]).toContain('not registered yet');
+  });
+
+  it('fails fast on a conflicting PR at the start (mutation: no mergeability check, so it waits out the window)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr({ mergeable: 'CONFLICTING' }));
+
+    const result = ciWait(root, ['--head', HEAD], [0]);
+    expect(result.status).toBe(31);
+    expect(result.stderr).toContain(
+      `ci=conflicting head=${HEAD}: PR #1 conflicts with main; merge the base in first. No pull_request CI will run`,
+    );
+    expect(result.calls).not.toContain('actions/runs');
+    expect(result.sleep).toBe('');
+  });
+
+  it('catches a PR that goes conflicting mid-wait (mutation: mergeability checked only once, so it exits 11 instead)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    writeJson(root, 'pr-3.json', ciPr({ mergeable: 'CONFLICTING' }));
+    writeRuns(root, 'runs.json', [workflowRun('CI', 'in_progress', null)]);
+
+    const result = ciWait(root, ['--head', HEAD, '--timeout', '120'], [0, 0, 0, 30]);
+    expect(result.status).toBe(31);
+    expect(result.calls.match(/^pr view$/gm)).toHaveLength(3);
+  });
+
+  it('retries an UNKNOWN mergeability read before polling CI (mutation: UNKNOWN read as CONFLICTING or as fatal)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr-1.json', ciPr({ mergeable: 'UNKNOWN' }));
+    writeJson(root, 'pr-2.json', ciPr({ mergeable: 'UNKNOWN' }));
+    writeJson(root, 'pr-3.json', ciPr());
+    writeJson(root, 'pr.json', ciPr());
+    writeRuns(root, 'runs.json', [workflowRun('CI', 'completed', 'success')]);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0]);
+    expect(result.status).toBe(0);
+    expect(result.sleep).toBe('5\n5\n');
+  });
+
+  it('gives up retrying UNKNOWN after 6 reads and waits on CI anyway (mutation: retried without a bound, or failing at the bound)', () => {
+    const root = tempRoot();
+    for (const n of [1, 2, 3, 4, 5, 6]) writeJson(root, `pr-${n}.json`, ciPr({ mergeable: 'UNKNOWN' }));
+    writeJson(root, 'pr.json', ciPr({ mergeable: 'UNKNOWN' }));
+    writeRuns(root, 'runs.json', [workflowRun('CI', 'completed', 'success')]);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('mergeable=UNKNOWN after 6 reads; waiting on CI anyway');
+    expect(result.sleep).toBe('5\n5\n5\n5\n5\n');
+  });
+
+  it("exits 12 when the PR's head moves off --head, without ever reading CI (mutation: no head re-check each tick)", () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    writeJson(root, 'pr-2.json', ciPr({ head: OTHER_HEAD }));
+    writeRuns(root, 'runs.json', [workflowRun('CI', 'completed', 'success')]);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0]);
+    expect(result.status).toBe(12);
+    expect(result.stderr).toContain(`ci=head-changed head=${OTHER_HEAD} want=${HEAD}`);
+    expect(result.calls).not.toContain('actions/runs');
+  });
+
+  it('times out while CI is still pending at --timeout (mutation: the deadline ignored)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    writeRuns(root, 'runs.json', [workflowRun('CI', 'in_progress', null)]);
+
+    const result = ciWait(root, ['--head', HEAD, '--timeout', '60'], [0, 0, 0, 30, 30, 60, 60]);
+    expect(result.status).toBe(11);
+    expect(result.stderr).toContain(`ci=timeout head=${HEAD} after 60s: ci_pending: CI=in_progress`);
+  });
+
+  it('exits 1 when the PR is no longer open (mutation: a merged PR treated as waitable)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr({ state: 'MERGED' }));
+
+    const result = ciWait(root, ['--head', HEAD], [0]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('PR #1 is MERGED');
+  });
+
+  it('gives up after three CI reads fail in a row (mutation: never giving up, so it loops until it times out)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 30, 30, 60]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('the CI read failed 3 times in a row');
+  });
+
+  it('recovers from one failed CI read (mutation: exit 1 on the first failed read)', () => {
+    const root = tempRoot();
+    writeJson(root, 'pr.json', ciPr());
+    writeRuns(root, 'runs-2.json', [workflowRun('CI', 'completed', 'success')]);
+
+    const result = ciWait(root, ['--head', HEAD], [0, 0, 0, 30]);
+    expect(result.status).toBe(0);
+  });
+
+  it.each([
+    ['no --head', []],
+    ['a short head', ['--head', HEAD.slice(0, 12)]],
+    ['a zero timeout', ['--head', HEAD, '--timeout', '0']],
+    ['a non-numeric timeout', ['--head', HEAD, '--timeout', 'x']],
+    ['an unknown argument', ['--head', HEAD, '--bogus']],
+  ])('refuses %s, reading nothing (mutation: validation after the first read)', (_case, args) => {
+    const root = tempRoot();
+
+    const result = ciWait(root, args, [0]);
+    expect(result.status).toBe(2);
+    expect(result.calls).toBe('');
+  });
+});
+
+describe('receipt-order.jq', () => {
+  const SCRIPTS_DIR = path.dirname(HELPER);
+
+  // Through bash, because the test harness allows only bash subprocesses
+  // (allowSubprocess(['bash']) above) — never a direct jq spawn.
+  function runJq(program: string) {
+    return spawnSync('bash', ['-c', 'jq -nc -L "$1" "$2"', '_', SCRIPTS_DIR, program], {
+      encoding: 'utf8',
+      timeout: 30_000,
+    });
+  }
+
+  it('keys posting order by [length, idstr], typed — never through tonumber (mutation: def posting_key: tonumber; fails on jq 1.7 too)', () => {
+    const result = runJq('include "receipt-order"; ["12345678901234567891","12345678901234567890"] | map(posting_key)');
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual([
+      [20, '12345678901234567891'],
+      [20, '12345678901234567890'],
+    ]);
+  });
+
+  it('sorts the later 20-digit id after the earlier one, past double precision', () => {
+    const result = runJq(
+      'include "receipt-order"; ["12345678901234567891","12345678901234567890"] | sort_by(posting_key) | map(.)',
+    );
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual(['12345678901234567890', '12345678901234567891']);
+  });
+
+  it.each([
+    ['100', true],
+    ['1\n', false],
+    ['099', false],
+    ['0', false],
+    ['abc', false],
+    ['', false],
+    [null, false],
+  ])('reads %s as canonical=%s', (input, expected) => {
+    const result = runJq(`include "receipt-order"; ${JSON.stringify(input)} | canonical_id`);
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toBe(expected);
   });
 });
 
@@ -1720,6 +1992,9 @@ describe('codex-review risk-scoped review requests', () => {
   it.each([
     ['a non-digit id', 'abc'],
     ['an empty-string id', ''],
+    ['an id with a trailing newline', '1\n'],
+    ['an id with a leading zero', '099'],
+    ['a zero id', '0'],
   ])('refuses to merge when a receipt has %s instead of a database id', (_case, badId) => {
     const root = tempRoot();
     scopeFixture(root, {
@@ -1954,7 +2229,7 @@ describe('codex-review merge, the only merge path for a risk-scoped repo', () =>
     // that allows everything.
     const skill = path.join(root, 'skill');
     fs.mkdirSync(path.join(skill, 'scripts'), { recursive: true });
-    for (const name of ['codex-review.sh', 'risk-scope.jq'])
+    for (const name of ['codex-review.sh', 'risk-scope.jq', 'receipt-order.jq'])
       fs.copyFileSync(path.join(path.dirname(HELPER), name), path.join(skill, 'scripts', name));
     fs.copyFileSync(
       path.join(path.dirname(HELPER), '..', 'reviewer-models.txt'),
@@ -2244,6 +2519,9 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
   it.each([
     ['a non-digit id', 'abc'],
     ['an empty-string id', ''],
+    ['an id with a trailing newline', '1\n'],
+    ['an id with a leading zero', '099'],
+    ['a zero id', '0'],
   ])('flags a merge when a receipt has %s instead of a database id', (_case, badId) => {
     const root = tempRoot();
     auditFixture(root, {
@@ -2257,6 +2535,76 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
     const result = runHelper(root, ['audit']);
     expect(result.status).toBe(28);
     expect(result.stdout).toContain('receipt_order_unknown');
+  });
+
+  // #689 P3-3: canonical_id must guard the $unread comparison too, not just
+  // $bad — an id that only coincidentally shares its length with the latest
+  // receipt's must never let a non-canonical id outrank it (a 3-char "abc"
+  // sorts lexicographically after a 3-char "100").
+  it('still reads an approving receipt when an earlier, non-canonical-id comment was edited after the merge (mutation: remove the canonical_id guard from $unread)', () => {
+    const root = tempRoot();
+    auditFixture(root, {
+      labels: ['risk:high'],
+      comments: [
+        {
+          author: { login: 'davekim917' },
+          authorAssociation: 'OWNER',
+          createdAt: '2026-09-05T00:10:00Z',
+          lastEditedAt: '2026-09-05T02:00:00Z',
+          fullDatabaseId: 'abc',
+          body: 'CI is green.',
+        },
+        receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', '100'),
+      ],
+    });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('verdict=review: an approving substitute receipt before the merge');
+  });
+
+  // #689 P3-4: a receipt posted in the merge's own second may have landed
+  // after it — GitHub's timestamp has no sub-second precision — so it fails
+  // closed the same way an edited-after-merge receipt does.
+  it("flags a lone approval posted in the merge's own second (mutation: the pre-fix <= read set passes it)", () => {
+    const root = tempRoot();
+    auditFixture(root, {
+      labels: ['risk:high'],
+      comments: [receiptComment(HEAD, 'approve', MERGED_AT, 'OWNER', 'claude-opus-5 (worker-high)', '100')],
+    });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(28);
+    expect(result.stdout).toContain(`posted a comment at ${MERGED_AT}, the second the PR merged`);
+  });
+
+  it("flags a changes receipt posted in the merge's own second over an earlier approval (mutation: a plain < without the same-second join lets the approve win)", () => {
+    const root = tempRoot();
+    auditFixture(root, {
+      labels: ['risk:high'],
+      comments: [
+        receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z', 'OWNER', 'claude-opus-5 (worker-high)', '100'),
+        receiptComment(HEAD, 'changes', MERGED_AT, 'OWNER', 'claude-opus-5 (worker-high)', '101'),
+      ],
+    });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(28);
+    expect(result.stdout).toContain(`posted a comment at ${MERGED_AT}, the second the PR merged`);
+  });
+
+  it('passes a lone approval one second before the merge (mutation: an off-by-one pushes the boundary a second early)', () => {
+    const root = tempRoot();
+    auditFixture(root, {
+      labels: ['risk:high'],
+      comments: [
+        receiptComment(HEAD, 'approve', '2026-09-05T00:59:59Z', 'OWNER', 'claude-opus-5 (worker-high)', '100'),
+      ],
+    });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('verdict=review: an approving substitute receipt before the merge');
   });
 
   it('still reads an approving receipt that postdates the only comment edited after the merge', () => {

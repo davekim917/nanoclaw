@@ -14,6 +14,9 @@
 #   codex-review.sh wait <sha> <since_iso> [minutes]
 #                                             # foreground GraphQL poll, default $CODEX_REVIEW_WAIT_MINUTES or 15
 #                                             # open/status print a STOP banner at rounds>=4 — diagnose, do not push
+#   codex-review.sh ci-wait --head <sha> [--timeout <sec>]
+#                                             # wait for CI on exactly that head: 0 green, 29 red, 30 no run registered,
+#                                             # 31 the PR conflicts with its base, 11 timeout, 12 head moved
 #   codex-review.sh scope                     # risk-scoped repos: JSON {repo,pr,head,mode,verdict,labels,reason} for the current head
 #   codex-review.sh request                   # risk-scoped repos: post `@codex review` for the current head when every rule allows it
 #   codex-review.sh merge-check [--head <sha>]
@@ -31,7 +34,7 @@
 #   1   no verdict — a GitHub read or validation failed; never read it as a pass
 #   2   usage, no JS runtime, or a push shape the churn gate cannot judge
 #   3   REFRAME REQUIRED — the churn gate refused (gate, push, request)
-#   10  wait: findings   11 wait: timeout   12 wait: head changed   13 wait: connector unavailable
+#   10  wait: findings   11 wait/ci-wait: timeout   12 wait/ci-wait: head changed   13 wait: connector unavailable
 #   20  request: not risk-scoped — automatic review handles this repo; never request
 #   21  request: scope verdict is skip — this head merges on green CI, no round
 #   22  request: a review of this head was already requested
@@ -47,6 +50,13 @@
 #   27  merge: merge-check allowed the head, but `gh pr merge` did not merge it
 #   28  audit: merge-check would have refused this PR at its merge, or it merged by a
 #       method the gate does not authorize (rebase or manual) — a gate bypass
+#   29  ci-wait: CI finished red on the head (`ci_red`) — merge-check would refuse this
+#       head with 24
+#   30  ci-wait: no run registered — nothing at all, or no run of a required workflow, was
+#       on the head within the registration window (`ci_missing`); waiting longer can't
+#       help, so this is never a timeout
+#   31  ci-wait: the PR conflicts with its base — GitHub runs no `pull_request` workflow
+#       on a conflicting PR, so it fails fast rather than waiting out the window
 #   `merge` passes merge-check's 1, 24, 25 (after one re-check) and 26 through unchanged,
 #   and merges only on its 0.
 #
@@ -817,28 +827,36 @@ receipt_comments_page() {
 # history, so it is compared as a digit string — sort by length, then
 # lexicographically — never via `tonumber`, which is a jq double and would
 # round two ids to the same value. A receipt whose fullDatabaseId is missing,
-# null, empty, or not all digits cannot be placed in that order at all: rather
-# than assign it a synthetic position (a null read as "0" ranks a real receipt
-# below one posted earlier), every receipt matching this head is reported
-# `unknown` — no order is inferred from any other field. Under `audit`, a
-# receipt posted after GATE_AS_OF (the merge) did not gate it, and a comment
-# edited since is not read at all: its text at the merge is unknown, and it
-# could have been a receipt. When such a comment, from an author whose
-# receipts count, was posted after the latest receipt that is read, or in the
-# same second, or no receipt is read, the receipts at the merge are unknown:
-# the outcome is `unknown`, and the reviewer text says which comment. Dropping
-# only the edited receipts would let a `changes` receipt, edited after the
-# merge, hand the verdict back to the `approve` before it.
+# null, empty, or not a canonical positive integer: digits only, no leading
+# zero, nothing after (canonical_id, receipt-order.jq) cannot be placed in
+# that order at all: rather than assign it a synthetic position (a null read
+# as "0" ranks a real receipt below one posted earlier), every receipt
+# matching this head is reported `unknown` — no order is inferred from any
+# other field. Under `audit`, a receipt posted after GATE_AS_OF (the merge)
+# did not gate it, and a comment edited since, or posted in the merge's own
+# second, is not read at all: its text at the merge is unknown, and it could
+# have been a receipt — a comment in the same second as the merge may have
+# come after it, since GitHub's timestamp has no sub-second precision. When
+# such a comment, from an author whose receipts count, was posted after the
+# latest receipt that is read, or in the same second, or no receipt is read,
+# the receipts at the merge are unknown: the outcome is `unknown`, and the
+# reviewer text says which comment and why (edited after the merge, or posted
+# in its own second). Dropping only the edited receipts would let a `changes`
+# receipt, edited after the merge, hand the verdict back to the `approve`
+# before it; reading a same-second receipt as before the merge would let a
+# `changes` receipt posted the same second the PR merged pass as if it never
+# happened.
 receipt_outcome() {
   local pages
   pages=$(paginate_connection comments receipt_comments_page) || return 1
-  printf '%s\n' "$pages" | jq -rs --arg re "$RECEIPT_MARKER_RE" --arg reviewerRe "$RECEIPT_REVIEWER_LINE_RE" --arg head "$1" --arg asof "$GATE_AS_OF" '
+  printf '%s\n' "$pages" | jq -rs -L "$HERE" --arg re "$RECEIPT_MARKER_RE" --arg reviewerRe "$RECEIPT_REVIEWER_LINE_RE" --arg head "$1" --arg asof "$GATE_AS_OF" '
+    include "receipt-order";
     [ .[] | .data.repository.pullRequest.comments.nodes[]
       | select(.authorAssociation == "OWNER" or .authorAssociation == "MEMBER" or .authorAssociation == "COLLABORATOR")
       | select($asof == "" or .createdAt <= $asof)
       | .idstr = ((.fullDatabaseId // "") | tostring) ] as $comments
-    | [ $comments[] | select($asof != "" and (.lastEditedAt // "") > $asof) ] as $edited
-    | [ $comments[] | select($asof == "" or (.lastEditedAt // "") <= $asof)
+    | [ $comments[] | select($asof != "" and ((.lastEditedAt // "") > $asof or .createdAt == $asof)) ] as $unreadable
+    | [ $comments[] | select($asof == "" or ((.lastEditedAt // "") <= $asof and .createdAt < $asof))
         | .createdAt as $at
         | .idstr as $idstr
         | .author as $author
@@ -846,16 +864,18 @@ receipt_outcome() {
         | [ ($body // "" | capture($re)) ] | first // empty
         | select(.head == $head)
         | { outcome, at: $at, idstr: $idstr, author: $author, reviewer: (($body // "" | capture($reviewerRe)).reviewer // "") } ] as $matches
-    | ([ $matches[] | select((.idstr | test("^[0-9]+$")) | not) ] | first) as $bad
+    | ([ $matches[] | select((.idstr | canonical_id) | not) ] | first) as $bad
     | if $bad != null then
         "unknown\treceipt_order_unknown: a receipt comment for this head from \($bad.author.login // "someone") has no usable database id (fullDatabaseId=\(if $bad.idstr == "" then "null" else $bad.idstr end)); receipt order cannot be determined without assigning it a synthetic position"
       else
-        ( $matches | sort_by([(.idstr | length), .idstr]) | last ) as $latest
-        | ( [ $edited[] | select($latest == null or .createdAt >= $latest.at
-              or (.idstr | length) > ($latest.idstr | length)
-              or ((.idstr | length) == ($latest.idstr | length) and .idstr > $latest.idstr)) ]
-            | sort_by([(.idstr | length), .idstr]) | last ) as $unread
-        | if $unread != null then "unknown\t\($unread.author.login // "someone") posted a comment at \($unread.createdAt) and edited it at \($unread.lastEditedAt)"
+        ( $matches | sort_by(.idstr | posting_key) | last ) as $latest
+        | ( [ $unreadable[] | select($latest == null or .createdAt >= $latest.at
+              or ((.idstr | canonical_id) and (.idstr | posting_key) > ($latest.idstr | posting_key))) ]
+            | sort_by(.idstr | posting_key) | last ) as $unread
+        | if $unread != null and ($unread.lastEditedAt // "") > $asof then
+            "unknown\t\($unread.author.login // "someone") posted a comment at \($unread.createdAt) and edited it at \($unread.lastEditedAt) after the merge"
+          elif $unread != null then
+            "unknown\t\($unread.author.login // "someone") posted a comment at \($unread.createdAt), the second the PR merged, so it may have come after the merge"
           elif $latest == null then empty
           else "\($latest.outcome)\t\($latest.reviewer)" end
         end'
@@ -1020,7 +1040,189 @@ merge_check_main() {
   esac
 }
 
-case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|scope|request|merge-check|merge|audit|receipt}" in
+# One PR-mergeability read for ci-wait: state, the exact head it points at,
+# mergeable (MERGEABLE/CONFLICTING/UNKNOWN) and its base branch name. Sets
+# CI_WAIT_STATE CI_WAIT_HEAD CI_WAIT_MERGEABLE CI_WAIT_BASE and returns 0 on a
+# clean read; returns 1 on anything else (gh fails, or the JSON does not
+# parse) so the caller can count it toward the read-failure budget rather than
+# reading a failure as pending or green.
+ci_wait_read_pr() {
+  local raw
+  raw=$(gh pr view "$PR" --repo "$REPO" --json state,headRefOid,baseRefName,mergeable) || return 1
+  CI_WAIT_STATE=$(printf '%s' "$raw" | jq -er .state) || return 1
+  CI_WAIT_HEAD=$(printf '%s' "$raw" | jq -er .headRefOid) || return 1
+  CI_WAIT_MERGEABLE=$(printf '%s' "$raw" | jq -er .mergeable) || return 1
+  CI_WAIT_BASE=$(printf '%s' "$raw" | jq -er .baseRefName) || return 1
+}
+
+# ci-wait: the only way this loop waits on CI. It answers rather than times
+# out when waiting cannot help — a conflicting PR (31, GitHub runs no
+# `pull_request` workflow on one:
+# docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows,
+# "pull_request") or no run ever registered (30) — and tells red (29) apart
+# from both, since each needs a different action from the caller. See
+# ci_verdict above for the green predicate this reuses unchanged.
+#
+# Pending versus no run registered: `ci_missing` while still inside the
+# registration window (measured from ci-wait's own start, not the push) is
+# PENDING — GitHub can take seconds to minutes to register a `pull_request`
+# run after a push. `ci_missing` once the window has passed is NO RUN
+# REGISTERED: either nothing at all is registered on the head, or a workflow
+# named in CODEX_REVIEW_REQUIRED_WORKFLOWS has no run on it, and waiting
+# longer cannot help — the causes are the workflow's triggers or path
+# filters, Actions being disabled, or a conflict GitHub hasn't reported yet
+# (mergeable still UNKNOWN) — so this is exit 30, never a timeout. A conflict
+# is caught before either case: on a conflicting PR a `pull_request` run can
+# never register, so without that check ci-wait would wait out the whole
+# window for nothing.
+ci_wait_main() {
+  local head="" timeout="${CODEX_REVIEW_CI_WAIT_SECONDS:-1800}"
+  local poll="${CODEX_REVIEW_CI_POLL_SECONDS:-30}" register="${CODEX_REVIEW_CI_REGISTER_SECONDS:-180}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --head) head="${2:?--head needs a sha}"; shift 2 ;;
+      --timeout) timeout="${2:?--timeout needs seconds}"; shift 2 ;;
+      *) echo "ci-wait: unknown argument $1" >&2; exit 2 ;;
+    esac
+  done
+  # Validated before any read: a bad --head/--timeout/knob or an unknown
+  # argument must cost nothing against GitHub.
+  [[ "$head" =~ ^[0-9a-f]{40}$ ]] || { echo "ci-wait: --head must be the full 40-character SHA you pushed" >&2; exit 2; }
+  [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || { echo "ci-wait: --timeout must be a positive whole number of seconds" >&2; exit 2; }
+  [[ "$poll" =~ ^[1-9][0-9]*$ ]] || { echo "ci-wait: CODEX_REVIEW_CI_POLL_SECONDS must be a positive whole number" >&2; exit 2; }
+  [[ "$register" =~ ^[1-9][0-9]*$ ]] || { echo "ci-wait: CODEX_REVIEW_CI_REGISTER_SECONDS must be a positive whole number" >&2; exit 2; }
+
+  local start deadline now elapsed tick=0 state verdict last_verdict=""
+  local pr_fails=0 ci_fails=0 unk_reads=0
+  start=$(date +%s) || exit 1
+  # The deadline covers the whole command, including the mergeability phase
+  # below.
+  deadline=$((start + timeout))
+
+  # Mergeability phase, ahead of the poll loop. A read failure here shares the
+  # same read-failure budget the poll loop uses (pr_fails) — it is never read
+  # as pending or as UNKNOWN. UNKNOWN itself never fails the run: it retries,
+  # capped at 6 reads in all, and proceeds to the poll loop regardless once
+  # the cap is hit.
+  while :; do
+    if ! ci_wait_read_pr; then
+      pr_fails=$((pr_fails + 1))
+      if [ "$pr_fails" -ge 3 ]; then
+        echo "ci=error head=$head: the PR read failed 3 times in a row" >&2
+        exit 1
+      fi
+      sleep 5
+      continue
+    fi
+    pr_fails=0
+    if [ "$CI_WAIT_STATE" != OPEN ]; then
+      echo "ci=error head=$head: PR #$PR is $CI_WAIT_STATE; there is no head to wait on" >&2
+      exit 1
+    fi
+    if [ "$CI_WAIT_HEAD" != "$head" ]; then
+      echo "ci=head-changed head=$CI_WAIT_HEAD want=$head: the PR's head moved; capture the new head and wait on that" >&2
+      exit 12
+    fi
+    case "$CI_WAIT_MERGEABLE" in
+      CONFLICTING)
+        # Conflict wins over green or red CI: the PR can't merge until it is
+        # resolved, and resolving it makes a new head anyway. Read nothing else.
+        echo "ci=conflicting head=$head: PR #$PR conflicts with $CI_WAIT_BASE; merge the base in first. No pull_request CI will run" >&2
+        exit 31
+        ;;
+      MERGEABLE)
+        break
+        ;;
+      UNKNOWN)
+        unk_reads=$((unk_reads + 1))
+        if [ "$unk_reads" -ge 6 ]; then
+          echo "ci-wait: mergeable=UNKNOWN after 6 reads; waiting on CI anyway, re-checking it each poll"
+          break
+        fi
+        sleep 5
+        continue
+        ;;
+      *)
+        echo "ci=error head=$head: PR #$PR reports mergeable=$CI_WAIT_MERGEABLE, which ci-wait does not recognise" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  # Poll loop. Every tick re-checks mergeability and the head before checking
+  # CI — a head that has moved off --head, or a PR that has gone conflicting
+  # since the last tick, says nothing about the head this call was asked
+  # about. In the loop, UNKNOWN never sleeps extra; it just carries on to the
+  # CI read.
+  while :; do
+    now=$(date +%s) || exit 1
+    elapsed=$((now - start))
+    if ci_wait_read_pr; then
+      pr_fails=0
+      if [ "$CI_WAIT_STATE" != OPEN ]; then
+        echo "ci=error head=$head: PR #$PR is $CI_WAIT_STATE; there is no head to wait on" >&2
+        exit 1
+      fi
+      if [ "$CI_WAIT_HEAD" != "$head" ]; then
+        echo "ci=head-changed head=$CI_WAIT_HEAD want=$head: the PR's head moved; capture the new head and wait on that" >&2
+        exit 12
+      fi
+      if [ "$CI_WAIT_MERGEABLE" = CONFLICTING ]; then
+        echo "ci=conflicting head=$head: PR #$PR conflicts with $CI_WAIT_BASE; merge the base in first. No pull_request CI will run" >&2
+        exit 31
+      fi
+      state="$CI_WAIT_MERGEABLE"
+      if verdict=$(ci_verdict "$head"); then
+        ci_fails=0
+        last_verdict="$verdict"
+        case "$verdict" in
+          '')
+            echo "ci=green head=$head"
+            exit 0
+            ;;
+          ci_red:*)
+            echo "ci=red head=$head: $verdict" >&2
+            exit 29
+            ;;
+          ci_missing:*)
+            if [ "$elapsed" -ge "$register" ]; then
+              echo "ci=none head=$head after ${elapsed}s: $verdict; mergeable=$state" >&2
+              exit 30
+            fi
+            echo "ci-wait tick=$tick elapsed=${elapsed}s/${timeout}s mergeable=$state $verdict (not registered yet; no-run after ${register}s)"
+            ;;
+          ci_pending:*)
+            echo "ci-wait tick=$tick elapsed=${elapsed}s/${timeout}s mergeable=$state $verdict"
+            ;;
+        esac
+      else
+        # No observation this tick: never read as pending or green.
+        ci_fails=$((ci_fails + 1))
+        if [ "$ci_fails" -ge 3 ]; then
+          echo "ci=error head=$head: the CI read failed 3 times in a row" >&2
+          exit 1
+        fi
+      fi
+    else
+      pr_fails=$((pr_fails + 1))
+      if [ "$pr_fails" -ge 3 ]; then
+        echo "ci=error head=$head: the PR read failed 3 times in a row" >&2
+        exit 1
+      fi
+    fi
+    now=$(date +%s) || exit 1
+    if [ "$now" -ge "$deadline" ]; then
+      echo "ci=timeout head=$head after ${timeout}s: $last_verdict" >&2
+      exit 11
+    fi
+    local remaining=$((deadline - now)) sleep_for="$poll"
+    if [ "$remaining" -lt "$sleep_for" ]; then sleep_for="$remaining"; fi
+    sleep "$sleep_for"
+    tick=$((tick + 1))
+  done
+}
+
+case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci-wait|scope|request|merge-check|merge|audit|receipt}" in
   open)
     # thread_id  comment_id  file:line  outdated?  severity  title
     rounds_banner "$(rounds_count)"
@@ -1273,6 +1475,10 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|sc
       tick=$((tick + 1))
     done
     ;;
+  ci-wait)
+    shift
+    ci_wait_main "$@"
+    ;;
   scope)
     # The risk-scoped verdict for the PR's current head, as one JSON line.
     scope_eval || exit 1
@@ -1516,7 +1722,7 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|sc
           echo "audit=violation $where: $receipt_reviewer"
           ;;
         *)
-          echo "audit=violation $where: $receipt_reviewer after the merge; that comment could have been a later substitute receipt, so what the receipts said at the merge is unknown"
+          echo "audit=violation $where: $receipt_reviewer; that comment could have been a later substitute receipt, so what the receipts said at the merge is unknown"
           ;;
       esac
       exit 28
