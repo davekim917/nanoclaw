@@ -101,7 +101,9 @@ Review: /home/ubuntu/scratch/autoagent-0912/codex-710b-review.md
   status='pending'. Scoped to the action because other kinds reuse a
   request_id on purpose (the gateway re-arms an existing row on redelivery,
   bash-gate keys on its outbound message id); scoped to pending because a
-  resolved or retired row is deleted immediately after. It retires any
+  resolved or retired row is deleted immediately after. **WRONG — corrected
+  in Round 4: a resolved row sits in `approved` for the whole delivery await,
+  so pending-only dropped the reservation mid-flight.** It retires any
   pre-existing live duplicate BEFORE creating the index — migrations run at
   every host start, so a throw there would crash-loop the boot rather than
   fail closed usefully. `createPendingApproval` already reported changes>0;
@@ -142,3 +144,56 @@ Review: /home/ubuntu/scratch/autoagent-0912/codex-710b-review.md
   and boot-safety rationale for migration 078, and the ratchet justification
   (5 paths, +71 diff lines, each named).
 - Round 3 COMPLETE. Not merged, not deployed, nothing restarted.
+
+## Two traps this session hit — read before running anything detached
+
+1. **Poll by pattern, never by the setsid pid.** `setsid nohup <cmd> &`
+   returns the pid of the SETSID PARENT, which exits immediately while the
+   real work continues in a child. `kill -0` on that pid reports "done"
+   seconds after launch and you read a half-written log and conclude the job
+   died. Write the pattern so it cannot match the polling shell's own command
+   line (a bracket class does it):
+
+       for i in $(seq 1 240); do
+         pgrep -f "exec vites[t] run" >/dev/null || break
+         sleep 15
+       done
+
+2. **Never restore a mutation with `git checkout --` on uncommitted work.**
+   It restores from the INDEX, so it silently reverts whatever you have not
+   committed. On round 4 that destroyed the migration-078 fix mid-run, and
+   the mutation case then "passed" against unmutated code — a green that
+   meant nothing. Either commit before running counterfactuals (round 3 did)
+   or restore from a backup copy (/tmp/cf-710d2.sh does). Also assert the
+   mutation actually applied: round 4's first script asserted 2 occurrences
+   of a literal that appears 3 times, aborted before editing, and still
+   printed a result.
+
+## Round 4 (Codex CHANGES on b9179fcb9, two P2s)
+
+Review: /home/ubuntu/scratch/autoagent-0912/codex-710c-review.md
+
+- [x] P2.1 the reservation expired mid-delivery. resolveChoice flips
+      pending→approved BEFORE awaiting delivery (choices.ts:115) and restores
+      to pending on a throw (:138) or a null delivery (:149), but migration
+      078's index covered `pending` only — so a competing request could claim
+      the choiceId inside that window, and the restore then threw
+      SQLITE_CONSTRAINT_UNIQUE from an uncaught path: two live cards, first
+      row stuck `approved`, no answer, no receipt, unrecoverable by clicking.
+      Fix: the index AND its legacy cleanup now cover ('pending','approved').
+      `expired` stays out — retireChoice deletes the row in the same breath.
+- [x] P2.2 the legacy cleanup had a surviving mutation: the reservation tests
+      start from an already-migrated empty DB, so deleting the cleanup left
+      them green. New src/db/migrations/078-choice-request-reservation.test.ts
+      seeds duplicates BEFORE applying 078 (oldest-row retention, tie-break on
+      approval_id, `approved` leftover reconciled, other actions untouched,
+      uniqueness after, harmless re-application).
+- [x] New src/modules/approvals/choice-reservation-barrier.test.ts holds
+      delivery open on a deferred and drives a competing request into the
+      window, for the throwing path and the null-delivery path.
+- [x] PR body: the contradicted "deleted immediately after" claim is gone,
+      the scoping bullet says pending AND approved, Round 4 documents the
+      window, and F1 now uses the deploy-gated wording (merged is not
+      authoritative until the host is restarted onto it).
+- [ ] Re-apply the 078 fix destroyed by trap 2, re-run targeted, commit,
+      re-run M8 properly, full host + container suites, ratchet, push.

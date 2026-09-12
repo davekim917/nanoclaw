@@ -31,12 +31,25 @@ import type { Migration } from './index.js';
  * newly constrain both. The uniqueness claim being enforced here is
  * `request_choice`'s alone, so the index carries its action.
  *
- * Also scoped to `status = 'pending'`: a row leaves that status only as it is
- * being resolved or retired, and it is deleted immediately after
- * (src/modules/approvals/choices.ts resolveChoice / retireChoice). "Live"
- * is exactly what the refusal is about — a choiceId whose card has already
- * been answered is free to be used again, which is the same rule the
- * application-level pre-check applies.
+ * Scoped to the LIVE statuses, `pending` AND `approved`, which together are
+ * exactly the window in which a card can still take an answer. This is not
+ * cosmetic: `resolveChoice` flips the row pending→approved BEFORE it awaits
+ * delivery (src/modules/approvals/choices.ts:115), and puts it back to
+ * `pending` when delivery throws (:138) or finds no live session (:149) —
+ * the card stays open and clickable the whole time.
+ *
+ * Covering only `pending` would drop the reservation for the entire delivery
+ * window. A second request could then claim the same choiceId and post its
+ * own card, and the restore-to-`pending` would violate this index and throw
+ * SQLITE_CONSTRAINT_UNIQUE out of a path with no catch — stranding the first
+ * row in `approved` with two live cards, no answer and no receipt, and no
+ * further click able to recover it (a `choice_receipts` review finding,
+ * reproduced by the reviewer).
+ *
+ * `expired` is deliberately NOT covered: `retireChoice` moves a row there and
+ * deletes it in the same breath (choices.ts:173-176), and a resolved row is
+ * deleted outright (:160), so a choiceId whose card is gone is free to be
+ * used again — the same rule the application-level pre-check applies.
  *
  * FAILS SOFT, NEVER CLOSED, on pre-existing duplicates. `runMigrations` runs
  * at every host start (src/db/migrations/index.ts), so a `CREATE UNIQUE INDEX`
@@ -44,7 +57,9 @@ import type { Migration } from './index.js';
  * surgery. Any live duplicate is therefore retired first — oldest row kept,
  * newer ones marked 'expired' so they fall out of the partial index — which
  * is the same outcome the application would have produced had the refusal
- * been atomic all along. Nothing is deleted. Verified before authoring this:
+ * been atomic all along — and it spans both live statuses, so a legacy
+ * `approved` row left behind by a crashed delivery is reconciled too, not
+ * just a `pending` one. Nothing is deleted. Verified before authoring this:
  * the live central DB holds 13 pending approvals with 13 distinct request_ids
  * and no `request_choice` rows at all, so the cleanup is a no-op there.
  */
@@ -56,7 +71,7 @@ export const migration078: Migration = {
       UPDATE pending_approvals
          SET status = 'expired'
        WHERE action = 'request_choice'
-         AND status = 'pending'
+         AND status IN ('pending', 'approved')
          AND approval_id NOT IN (
            SELECT approval_id FROM (
              SELECT approval_id,
@@ -64,13 +79,13 @@ export const migration078: Migration = {
                       PARTITION BY request_id ORDER BY created_at, approval_id
                     ) AS rn
                FROM pending_approvals
-              WHERE action = 'request_choice' AND status = 'pending'
+              WHERE action = 'request_choice' AND status IN ('pending', 'approved')
            ) WHERE rn = 1
          );
 
       CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_approvals_choice_request_live
         ON pending_approvals(request_id)
-        WHERE action = 'request_choice' AND status = 'pending';
+        WHERE action = 'request_choice' AND status IN ('pending', 'approved');
     `);
   },
 };
