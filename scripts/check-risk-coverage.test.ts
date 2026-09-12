@@ -1,11 +1,15 @@
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 
-import { enforceHermeticity } from '../src/test-hermeticity.js';
+import { allowSubprocess, enforceHermeticity } from '../src/test-hermeticity.js';
 
 import {
+  allowNewFor,
   buildBaseline,
   classifyAll,
   classifyFile,
@@ -29,8 +33,9 @@ import {
   type FileRow,
 } from './check-risk-coverage.js';
 
-// This suite never shells out or touches the network — every case here exercises the
-// pure functions check-risk-coverage.ts factors out for exactly that reason.
+// This suite is mostly pure functions check-risk-coverage.ts factors out for exactly
+// that reason; the "CLI entrypoint" describe block below is the one deliberate
+// exception (a real subprocess, allow-listed just for that block).
 enforceHermeticity();
 
 function labelerConfig(riskHighGlobs: string[]): Record<string, unknown> {
@@ -444,6 +449,30 @@ describe('evaluate', () => {
   });
 });
 
+// #714 round 2, P2-B: main() used to compute `allowNew` inline, and flipping it to
+// unconditionally true left every test in this file green, because none of them
+// exercised main() at all. allowNewFor is the extracted pure predicate; every
+// combination of its three booleans is covered here (the CLI entrypoint suite below
+// covers the wiring — that main() actually CALLS this function — end to end).
+describe('allowNewFor', () => {
+  it.each<[boolean, boolean, boolean, boolean]>([
+    // write, bootstrap, baselineExists, expected
+    [true, true, true, true],
+    [true, true, false, true],
+    [true, false, true, true],
+    [true, false, false, true],
+    // #714 round 2, P3-1: --bootstrap alone against an ALREADY-EXISTING baseline
+    // must not suppress the check — this is the exact bug being fixed.
+    [false, true, true, false],
+    // Genuine one-time bootstrap: no baseline yet.
+    [false, true, false, true],
+    [false, false, true, false],
+    [false, false, false, false],
+  ])('write=%s bootstrap=%s baselineExists=%s -> %s', (write, bootstrap, baselineExists, expected) => {
+    expect(allowNewFor({ write, bootstrap, baselineExists })).toBe(expected);
+  });
+});
+
 describe('buildBaseline', () => {
   it('records the classification for every risk file: number, untested, or n/a', () => {
     const current = new Map<string, Classification>([
@@ -568,17 +597,121 @@ describe('formatFailureLine', () => {
   // #714 round 1, P2-1: the failure message for a `new` (unfloored) risk file must
   // name the file, its measured coverage, and the exact JSON line to add — a bare
   // "status: new" tells the author there's a problem but not what to paste.
-  it('names the file, its measured coverage, and the exact JSON line to add for a "new" row', () => {
-    const row: FileRow = { file: 'src/dashboard/index.ts', baseline: null, current: 92.3, delta: null, status: 'new' };
+  it('names the file, its measured coverage, and a paste-safe, floored JSON line to add for a "new" row', () => {
+    // 92.37, not 92.3: the suggested value must be FLOORED to one decimal (#714
+    // round 2, P3-3), so this only passes if 92.37 -> 92.3, not rounded to 92.4.
+    const row: FileRow = { file: 'src/dashboard/index.ts', baseline: null, current: 92.37, delta: null, status: 'new' };
     const line = formatFailureLine(row, 'coverage-risk-baseline.json');
     expect(line).toContain('src/dashboard/index.ts');
-    expect(line).toContain('92.30%'); // the measured value, human-formatted
+    expect(line).toContain('92.37%'); // the measured value, human-formatted (not floored)
     expect(line).toContain('coverage-risk-baseline.json');
-    expect(line).toContain('"src/dashboard/index.ts": 92.3,'); // the exact line to paste in
+    expect(line).toContain('"src/dashboard/index.ts": 92.3'); // floored, to paste in
+    // No trailing comma — coverage-risk-baseline.json is one JSON object, and a
+    // comma after its LAST entry breaks it; the message names the risk instead of
+    // guessing whether this entry will land last.
+    expect(line.trimEnd().endsWith(',')).toBe(false);
+    expect(line).toMatch(/comma/i);
+  });
+
+  it('floors down, never to the nearest, even when that would round up', () => {
+    // 92.351 rounds to 92.35 (round2) then floors to 92.3 — never 92.4.
+    const row: FileRow = { file: 'src/a.ts', baseline: null, current: 92.351, delta: null, status: 'new' };
+    expect(formatFailureLine(row, 'coverage-risk-baseline.json')).toContain('"src/a.ts": 92.3');
   });
 
   it('falls back to the baseline-arrow-current format for every other status', () => {
     const row: FileRow = { file: 'src/a.ts', baseline: 90, current: 89, delta: -1, status: 'regressed' };
     expect(formatFailureLine(row, 'coverage-risk-baseline.json')).toBe('src/a.ts: 90.00% -> 89.00% (regressed)');
+  });
+});
+
+/**
+ * #714 round 2, P2-B: nothing exercised main()'s own CI wiring — the pure-function
+ * suites above cover allowNewFor and evaluate() in isolation, but not that main()
+ * actually threads allowNewFor's result into evaluate() the way it claims to. This
+ * runs the real CLI (the entrypoint is the seam under test, so it has to be a real
+ * process — same pattern as scripts/list-scheduled-tasks.test.ts's "CLI entrypoint"
+ * suite).
+ *
+ * repoRoot inside the script is always THIS repo's real root — it resolves from
+ * `import.meta.dirname` of check-risk-coverage.ts's own file location, not from
+ * this test's cwd — so `.github/labeler.yml` and the risk-file list it discovers
+ * are this checkout's REAL, current ones, not a synthetic fixture. Only
+ * `src/router.ts` (a real risk:high host file) gets a crafted, known coverage entry;
+ * every other real risk file is deliberately absent from the fixture summary and
+ * resolved through the script's own static (hasExecutableCode) fallback instead —
+ * identically in both CLI runs below, so none of them shows up as a failure of its
+ * own and the one deliberately-dropped floor is the only row that fails.
+ */
+describe('CLI entrypoint', () => {
+  beforeAll(() => allowSubprocess(['tsx']));
+
+  const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const SCRIPT = path.join(REPO_ROOT, 'scripts', 'check-risk-coverage.ts');
+  const TSX = path.join(REPO_ROOT, 'node_modules', '.bin', 'tsx');
+
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+  });
+
+  function tmpRoot(): string {
+    const d = fs.mkdtempSync(path.join(os.tmpdir(), 'check-risk-coverage-cli-'));
+    dirs.push(d);
+    return d;
+  }
+
+  function runCli(args: string[]): { status: number | null; stdout: string; stderr: string } {
+    const r = spawnSync(TSX, [SCRIPT, ...args], { cwd: REPO_ROOT, encoding: 'utf8', timeout: 60_000 });
+    return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+  }
+
+  it('normal mode fails exit 1 with the paste line when the baseline is missing one risk file\'s floor', () => {
+    const root = tmpRoot();
+    const hostSummaryPath = path.join(root, 'coverage-summary.json');
+    fs.writeFileSync(hostSummaryPath, JSON.stringify({ 'src/router.ts': { lines: { covered: 1, total: 1 } } }));
+    // A path that never exists, forcing the container-gap static fallback
+    // deterministically in both runs below, regardless of whatever this checkout's
+    // own container/agent-runner/coverage/lcov.info happens to hold right now.
+    const missingContainerLcov = path.join(root, 'no-such-lcov.info');
+
+    const bootstrapBaselinePath = path.join(root, 'bootstrap-baseline.json');
+    const bootstrap = runCli([
+      '--write',
+      '--bootstrap',
+      '--host-summary',
+      hostSummaryPath,
+      '--baseline',
+      bootstrapBaselinePath,
+      '--allow-partial-report',
+      '--allow-missing-container-report',
+      '--container-lcov',
+      missingContainerLcov,
+    ]);
+    expect(bootstrap.status).toBe(0);
+    const bootstrapped = JSON.parse(fs.readFileSync(bootstrapBaselinePath, 'utf8')) as Baseline;
+    expect(bootstrapped.files['src/router.ts']).toBe(100);
+
+    // Drop src/router.ts's floor — the "baseline missing one risk file's floor" case
+    // — leaving every other real risk file's freshly-measured entry untouched.
+    const files = { ...bootstrapped.files };
+    delete files['src/router.ts'];
+    const missingFloorPath = path.join(root, 'missing-floor-baseline.json');
+    fs.writeFileSync(missingFloorPath, JSON.stringify({ generatedAt: bootstrapped.generatedAt, files }));
+
+    const normal = runCli([
+      '--host-summary',
+      hostSummaryPath,
+      '--baseline',
+      missingFloorPath,
+      '--allow-partial-report',
+      '--allow-missing-container-report',
+      '--container-lcov',
+      missingContainerLcov,
+    ]);
+    expect(normal.status).toBe(1);
+    expect(normal.stdout).toContain('src/router.ts: measured 100.00%');
+    expect(normal.stdout).toContain('"src/router.ts": 100');
+    expect(normal.stdout).toMatch(/comma/i);
   });
 });
