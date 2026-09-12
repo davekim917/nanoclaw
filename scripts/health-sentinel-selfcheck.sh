@@ -397,7 +397,12 @@ esac
 # `git` ahead of the real one on PATH records every invocation and then execs
 # the real binary, so the rest of the vital's git plumbing still runs for
 # real; this is the "fake git that records calls" the review asked for.
-FLAG_ROOT="$(mktemp -d)"
+# -p "$ROOT", not a bare mktemp: $ROOT is already under the EXIT trap (line
+# 19), so nesting this fixture inside it means an early exit (a failure under
+# `set -e` in a caller's shell, Ctrl-C, a killed CI job) still cleans it up
+# instead of leaking a throwaway git repo in /tmp. The explicit `rm -rf` below
+# stays as the fast path; the trap is the backstop.
+FLAG_ROOT="$(mktemp -d -p "$ROOT")"
 mkdir -p "$FLAG_ROOT/data" "$FLAG_ROOT/logs" "$FLAG_ROOT/node_modules/.bin" "$FLAG_ROOT/bin" "$FLAG_ROOT/dist"
 : > "$FLAG_ROOT/logs/nanoclaw.log"
 : > "$FLAG_ROOT/logs/nanoclaw.error.log"
@@ -425,15 +430,25 @@ git -C "$FLAG_ROOT" update-ref refs/remotes/origin/main "$FLAG_RUNTIME"
 GIT_CALLS="$FLAG_ROOT/git-calls.log"
 : > "$GIT_CALLS"
 REAL_GIT="$(command -v git)"
+# Logs GIT_OPTIONAL_LOCKS alongside the call, not just the argv: removing the
+# `export GIT_OPTIONAL_LOCKS=0` at the top of health-sentinel.sh (#715 P3)
+# left this selfcheck green, because nothing asserted the env var itself —
+# only that `status` carried its own `--no-optional-locks` flag. The fetch
+# call carries no per-invocation flag for this at all, so the export is its
+# only guard.
 cat > "$FLAG_ROOT/bin/git" <<EOF
 #!/bin/bash
-printf '%s\n' "\$*" >> "$GIT_CALLS"
+printf 'GIT_OPTIONAL_LOCKS=%s %s\n' "\${GIT_OPTIONAL_LOCKS:-<unset>}" "\$*" >> "$GIT_CALLS"
 exec "$REAL_GIT" "\$@"
 EOF
 chmod +x "$FLAG_ROOT/bin/git"
 
 run_flag_sentinel() { # env... -> sets OUT (no outbox: this fixture only cares about $OUT/$GIT_CALLS)
-  OUT="$(env PATH="$FLAG_ROOT/bin:$PATH" NANOCLAW_DIR="$FLAG_ROOT" LOAD15_MAX=999999 HEALTH_SENTINEL_OUTBOX= "$@" bash "$SENTINEL" 2>&1)"
+  # `-u GIT_OPTIONAL_LOCKS`: strip any ambient value before the sentinel runs,
+  # so the GIT_OPTIONAL_LOCKS=0 assertions below can only pass because
+  # health-sentinel.sh's own `export` set it, never because it leaked in from
+  # this harness's environment.
+  OUT="$(env -u GIT_OPTIONAL_LOCKS PATH="$FLAG_ROOT/bin:$PATH" NANOCLAW_DIR="$FLAG_ROOT" LOAD15_MAX=999999 HEALTH_SENTINEL_OUTBOX= "$@" bash "$SENTINEL" 2>&1)"
 }
 
 : > "$GIT_CALLS"
@@ -443,10 +458,19 @@ if grep -q -- '-c gc.auto=0 -c maintenance.auto=false fetch --quiet --no-write-f
 else
   bad "fetch is missing the safety flags" "$(cat "$GIT_CALLS")"
 fi
-if grep -q -- '^--no-optional-locks status' "$GIT_CALLS"; then
+if grep -q -- '--no-optional-locks status' "$GIT_CALLS"; then
   ok "git status runs with --no-optional-locks"
 else
   bad "git status missing --no-optional-locks" "$(cat "$GIT_CALLS")"
+fi
+# (#715 P3) `export GIT_OPTIONAL_LOCKS=0` at the top of health-sentinel.sh had
+# no test of its own — removing it still passed both checks above, since
+# neither one asserted the env var itself, only argv flags. Assert it
+# directly: every git call this vital makes must see it exported as 0.
+if grep -qv '^GIT_OPTIONAL_LOCKS=0 ' "$GIT_CALLS"; then
+  bad "a git call ran without GIT_OPTIONAL_LOCKS=0 exported" "$(cat "$GIT_CALLS")"
+else
+  ok "every git call ran with GIT_OPTIONAL_LOCKS=0 exported"
 fi
 
 : > "$GIT_CALLS"
@@ -487,10 +511,25 @@ case "$OUT" in
   *) ok "DEPLOY_LAG_MAX_S=0 stays the documented off switch, not a config breach" ;;
 esac
 
+# Overflow (#715 P3): `is_nonneg_int` used to accept a digit string of any
+# length, and `[ -eq ]`/`[ -ge ]` on a value past int64 range (2^63-1 = 19
+# digits) errors with exit status 2 — which `if`/`elif` reads as plain false,
+# not a crash. That let an overflowing threshold sail past validation as "a
+# non-negative integer" and then silently switch the whole vital off a few
+# lines down, with no breach and no error. 20 digits is comfortably past the
+# 18-digit cap.
+run_sentinel DRY_RUN=1 DEPLOY_LAG_MAX_S=12345678901234567890
+case "$OUT" in
+  *"DEPLOY_LAG_MAX_S='12345678901234567890' is not a non-negative integer"*) ok "a 20-digit (overflowing) DEPLOY_LAG_MAX_S is reported as a breach" ;;
+  *) bad "a 20-digit DEPLOY_LAG_MAX_S overflow was not reported" "$OUT" ;;
+esac
+
 # A missing `jq`: a PATH built from symlinks to every tool the script needs
 # EXCEPT jq, so `command -v jq` genuinely fails closed instead of silently
 # falling back to HEAD (the exact under-report the header warns about).
-NOJQ_DIR="$(mktemp -d)"
+# -p "$ROOT": nested under the EXIT trap's directory so an early exit still
+# cleans it up, same reasoning as FLAG_ROOT above.
+NOJQ_DIR="$(mktemp -d -p "$ROOT")"
 for tool in bash awk cat date df dirname git grep head mktemp nproc od python3 stat tail timeout tr wc; do
   tool_path="$(command -v "$tool" 2>/dev/null)"
   [ -n "$tool_path" ] && ln -sf "$tool_path" "$NOJQ_DIR/$tool"
@@ -500,6 +539,36 @@ case "$OUT" in
   *"jq is not installed"*) ok "a missing jq is reported as a breach" ;;
   *) bad "a missing jq was not reported as a breach" "$OUT" ;;
 esac
+rm -rf "$NOJQ_DIR"
+
+# ── two config faults at once, delivered together (#715 P3) ────────────────
+# The three config faults used to share one dedup key, `deploy-lag-config`,
+# and the dedup loop sends only the first message per key within the 6h
+# cooldown — so an invalid DEPLOY_LAG_PULL_MAX_S together with a missing jq
+# delivered only one of the two breaches and the cooldown then hid the other
+# for 6h. Now that each fault has its own key, both must land in the SAME
+# delivered alert. Non-dry, going to the outbox under $ROOT like the other
+# delivery-path cases above (notify-owner.ts always fails in this fixture, so
+# delivery falls through to HEALTH_SENTINEL_OUTBOX, already exported above).
+rm -f "$ROOT/data/health-sentinel-state.json"
+rm -f "$OUTBOX"/*health-sentinel*.md 2>/dev/null || true
+NOJQ_DIR="$(mktemp -d -p "$ROOT")"
+for tool in bash awk cat date df dirname git grep head mktemp nproc od python3 stat tail timeout tr wc; do
+  tool_path="$(command -v "$tool" 2>/dev/null)"
+  [ -n "$tool_path" ] && ln -sf "$tool_path" "$NOJQ_DIR/$tool"
+done
+OUT="$(env PATH="$ROOT/bin:$NOJQ_DIR" NANOCLAW_DIR="$ROOT" LOAD15_MAX=999999 DEPLOY_LAG_PULL_MAX_S=notanumber bash "$SENTINEL" 2>&1)"
+BOTH_ALERT=$(ls -t "$OUTBOX"/*health-sentinel*.md 2>/dev/null | head -1)
+if [ -n "$BOTH_ALERT" ] && grep -q "DEPLOY_LAG_PULL_MAX_S='notanumber' is not a non-negative integer" "$BOTH_ALERT"; then
+  ok "invalid PULL_MAX_S + missing jq: the pull-config breach reached the outbox"
+else
+  bad "the pull-config breach did not reach the outbox" "out=$OUT alert=${BOTH_ALERT:-<none>}"
+fi
+if [ -n "$BOTH_ALERT" ] && grep -q "jq is not installed" "$BOTH_ALERT"; then
+  ok "invalid PULL_MAX_S + missing jq: the jq breach reached the outbox"
+else
+  bad "the jq breach did not reach the outbox" "out=$OUT alert=${BOTH_ALERT:-<none>}"
+fi
 rm -rf "$NOJQ_DIR"
 
 [ "$FAILED" -eq 0 ] && echo "health-sentinel-selfcheck: all checks passed" || echo "health-sentinel-selfcheck: FAILURES"

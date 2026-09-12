@@ -36,6 +36,7 @@
     "check:public-boundary": "tsx scripts/check-public-boundary.ts",
     "check:git-safety-selfcheck": "bash scripts/git-safety-selfcheck.sh",
     "check:wiki-pre-push-hook-selfcheck": "bash scripts/wiki-pre-push-hook-selfcheck.sh",
+    "check:health-sentinel-selfcheck": "bash scripts/health-sentinel-selfcheck.sh",
     "ratchet:report": "tsx scripts/upstream-ratchet-report.ts",
     "reviewer-models": "tsx scripts/reviewer-models.ts",
     "upstream-dryrun-report": "tsx scripts/upstream-dry-run-report.ts",

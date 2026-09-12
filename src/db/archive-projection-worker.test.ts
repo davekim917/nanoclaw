@@ -1506,3 +1506,90 @@ describe('#667/#668 — seeding a fresh session from a same-agent, same-scope si
     infoSpy.mockRestore();
   });
 });
+
+describe('#693 — a reclaimed session (orphan stamp, no file) is still seed-eligible', () => {
+  const wgOne = ['ag-one-a', 'ag-one-b'];
+
+  it('seeds from a same-agent, same-scope candidate when the local file is gone but its stamp survives', async () => {
+    const src = makeTwoWorkgroupSource('orphan-seed');
+    useFakeWorker();
+
+    // This session built its own projection earlier...
+    const sessionDst = tmpPath('orphan-seed-session');
+    await ensureArchiveProjection(src, sessionDst, 'ag-one-a', wgOne);
+
+    // ...then went idle while a sibling session (same agent, same scope)
+    // rebuilt against a grown source.
+    archiveInto(src, {
+      id: 'w1-new',
+      agent_group_id: 'ag-one-a',
+      role: 'assistant',
+      sender_id: 'ag-one-a',
+      text: 'a later reply',
+      sent_at: '2026-01-01T12:00:00Z',
+    });
+    const siblingDst = tmpPath('orphan-seed-sibling');
+    await ensureArchiveProjection(src, siblingDst, 'ag-one-a', wgOne);
+
+    // The storage reclaimer deletes the FILE but never the stamp (#693) —
+    // simulated directly, since that's the exact state it leaves behind.
+    fs.unlinkSync(sessionDst);
+    expect(readArchiveProjectionStamp(sessionDst)).not.toBeNull(); // sanity: orphan stamp survives
+
+    // The session wakes up.
+    const result = await ensureArchiveProjection(src, sessionDst, 'ag-one-a', wgOne);
+    expect(result.mode).toBe('seeded');
+    expect(result.seededFrom).toBe(path.relative(TEST_DATA_DIR, siblingDst));
+
+    const expected = tmpPath('orphan-seed-expected');
+    buildArchiveProjection(src, expected, 'ag-one-a', wgOne);
+    expect(allRows(sessionDst)).toEqual(allRows(expected));
+  });
+
+  it("does not trust the orphan stamp as the seed's previous — the candidate's stamp is used instead", async () => {
+    const src = makeTwoWorkgroupSource('orphan-not-trusted');
+    useFakeWorker();
+
+    const sessionDst = tmpPath('orphan-not-trusted-session');
+    await ensureArchiveProjection(src, sessionDst, 'ag-one-a', wgOne);
+
+    // Corrupt the about-to-be-orphaned stamp's mutation count. If THIS stamp
+    // were ever used as `previous`, decideArchiveProjectionMode would see a
+    // mutations mismatch against the live signature and force a rebuild —
+    // so a 'seeded' result below is only possible if the orphan was dropped
+    // and the CANDIDATE's own (correct) stamp was used as `previous` instead.
+    const orphanStamp = readArchiveProjectionStamp(sessionDst);
+    expect(orphanStamp).not.toBeNull();
+    fs.writeFileSync(
+      archiveProjectionStampPath(sessionDst),
+      JSON.stringify({ ...orphanStamp, mutations: (orphanStamp?.mutations ?? 0) + 999 }),
+    );
+
+    // A same-agent, same-scope sibling with a legitimate, uncorrupted stamp.
+    const siblingDst = tmpPath('orphan-not-trusted-sibling');
+    await ensureArchiveProjection(src, siblingDst, 'ag-one-a', wgOne);
+
+    fs.unlinkSync(sessionDst);
+
+    const result = await ensureArchiveProjection(src, sessionDst, 'ag-one-a', wgOne);
+    expect(result.mode).toBe('seeded');
+    expect(result.seededFrom).toBe(path.relative(TEST_DATA_DIR, siblingDst));
+  });
+
+  it('never seeds a session whose local file still exists (unchanged behavior)', async () => {
+    const src = makeTwoWorkgroupSource('orphan-existing-file');
+    useFakeWorker();
+
+    const sessionDst = tmpPath('orphan-existing-file-session');
+    await ensureArchiveProjection(src, sessionDst, 'ag-one-a', wgOne);
+
+    // A same-agent, same-scope candidate exists too, but the session's own
+    // file is still there — it must reuse its own history, never seed.
+    const siblingDst = tmpPath('orphan-existing-file-sibling');
+    await ensureArchiveProjection(src, siblingDst, 'ag-one-a', wgOne);
+
+    const result = await ensureArchiveProjection(src, sessionDst, 'ag-one-a', wgOne);
+    expect(result.mode).toBe('reused');
+    expect(result.seededFrom).toBeNull();
+  });
+});
