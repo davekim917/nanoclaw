@@ -83,9 +83,41 @@ EOF
   chmod +x "$NCDIR/node_modules/.bin/tsx"
 }
 
-run_safety() { # extra env assignments as "$@", e.g. run_safety GIT_SAFETY_GROUPS_COMMIT=dry
-  OUT=$(env "$@" NANOCLAW_DIR="$NCDIR" GIT_SAFETY_DIR="$BACKUPS" HOME="$HOME2" bash "$REAL" 2>&1)
+run_script() { # <script-path> extra env assignments as "$@..."
+  local script=$1; shift
+  OUT=$(env "$@" NANOCLAW_DIR="$NCDIR" GIT_SAFETY_DIR="$BACKUPS" HOME="$HOME2" bash "$script" 2>&1)
   RC=$?
+}
+run_safety() { # extra env assignments as "$@", e.g. run_safety GIT_SAFETY_GROUPS_COMMIT=dry
+  run_script "$REAL" "$@"
+}
+
+# make_mutant_git_safety <old-literal> <new-literal> -> prints a mutant
+# script path, exactly one literal substitution applied to a full copy of
+# the REAL scripts/git-safety.sh (#628 item 9 mutation evidence). Fails
+# loudly (via python's assert) if <old-literal> isn't found verbatim,
+# rather than silently producing a byte-identical, unmutated copy — a
+# fixture that stopped reproducing a bug is worse than no fixture. Lives
+# in its own directory with lib/secret-scan.sh SYMLINKED alongside it
+# (never copied — no drift risk) so the mutant's own
+# `${SCRIPT_DIR}/lib/secret-scan.sh` source line resolves exactly like the
+# real script's does, relative to itself.
+make_mutant_git_safety() {
+  local old=$1 new=$2 mutdir
+  mutdir=$(mktemp -d)
+  FIXTURE_DIRS+=("$mutdir")
+  mkdir -p "$mutdir/lib"
+  ln -s "$(dirname "$REAL")/lib/secret-scan.sh" "$mutdir/lib/secret-scan.sh"
+  OLDSTR="$old" NEWSTR="$new" SRC="$REAL" DST="$mutdir/git-safety.sh" python3 -c "
+import os
+src = open(os.environ['SRC']).read()
+old = os.environ['OLDSTR']
+new = os.environ['NEWSTR']
+assert old in src, 'mutation target text not found in git-safety.sh — source has drifted from this fixture'
+open(os.environ['DST'], 'w').write(src.replace(old, new, 1))
+"
+  chmod +x "$mutdir/git-safety.sh"
+  echo "$mutdir/git-safety.sh"
 }
 
 latest_snapshot() { ls -td "$BACKUPS"/*/ 2>/dev/null | head -1; }
@@ -126,7 +158,7 @@ secret_case() { # label, secret-line
   printf '{"a":2}\n%s\n' "$2" > "$G/foo/container.json"
   run_safety
   case "$OUT" in
-    *"look like a secret"*) ok "secret gate: $1" ;;
+    *"held for secret-shaped content"*) ok "secret gate: $1" ;;
     *) bad "secret gate missed: $1" "line=[$2] out=$OUT" ;;
   esac
   # Refused means nothing pushed.
@@ -156,7 +188,7 @@ git -C "$G" config color.ui always
 printf '{"a":2}\nexport API_KEY=abcdefghijklmnop123456\n' > "$G/foo/container.json"
 run_safety
 case "$OUT" in
-  *"look like a secret"*) ok "secret gate not blinded by color.ui=always" ;;
+  *"held for secret-shaped content"*) ok "secret gate not blinded by color.ui=always" ;;
   *) bad "color.ui=always defeated the scan" "$OUT" ;;
 esac
 
@@ -173,7 +205,7 @@ printf '{"a":2}\n' > "$G/foo/container.json"
 printf 'binary junk: \x80\x81\x82 export SLACK_APP_TOKEN=xapp-1-A0123-4567890123-abcdefabcdefabcdefabcdefabcdef\n' >> "$G/foo/container.json"
 run_safety LANG=en_US.UTF-8 LC_ALL=
 case "$OUT" in
-  *"look like a secret"*) ok "secret gate not blinded by a non-UTF-8 byte on the same line" ;;
+  *"held for secret-shaped content"*) ok "secret gate not blinded by a non-UTF-8 byte on the same line" ;;
   *) bad "a non-UTF-8 byte blinded the scan to an adjacent real secret" "$OUT" ;;
 esac
 if git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1; then
@@ -754,10 +786,43 @@ esac
 # shipped script) actually registers `cleanup_scratch` for all three
 # signals, and that function actually empties CLEANUP_PATHS when invoked
 # directly.
-eval "$(sed -n '/^CLEANUP_PATHS=()/,/^trap cleanup_scratch EXIT INT TERM/p' "$REAL")"
+# review-683 P3-5 split the shipped script's single `trap cleanup_scratch
+# EXIT INT TERM` line into three separate `trap` statements (so INT/TERM
+# actually exit after cleanup, instead of resuming — see that fix below);
+# the range end-anchor here must track whichever is now the LAST such
+# line, or this sed range never closes and captures the rest of the file
+# to EOF, eval'ing far more of the real script than intended in THIS
+# process (reproduced while making this exact change: it read all the way
+# through to code that references $TS, which this truncated eval never
+# assigns, and blew up with "TS: unbound variable").
+eval "$(sed -n "/^CLEANUP_PATHS=()/,/^trap 'cleanup_scratch; exit 143' TERM/p" "$REAL")"
 TRAPPED=$(trap -p | grep -c cleanup_scratch)
 [ "$TRAPPED" -eq 3 ] && ok "cleanup_scratch is registered for EXIT, INT and TERM" \
   || bad "cleanup_scratch is not registered for all three signals" "$(trap -p)"
+# review-683 P3-5, deterministic half: the registered INT/TERM trap TEXT
+# itself must contain the `exit N` that actually stops the script — a bare
+# `trap cleanup_scratch EXIT INT TERM` (the pre-fix shape) also registers
+# cleanup_scratch for all three signals and would pass the check above,
+# but never exits on a caught INT/TERM. A live SIGTERM-mid-run race is
+# deliberately NOT asserted here (same reasoning as the comment above this
+# block): reproduced empirically while building this fix, sending TERM at
+# a random instant can land while bash is extracting a `$(...)` command
+# substitution during word expansion, which can itself abort the trap's
+# own execution with a "trap: ... unexpected EOF" parse diagnostic (or
+# occasionally a "reader_loop: bad jump" abort with a core dump) and let
+# the run continue regardless of the fix's correctness — flaky for a
+# reason unrelated to whether the fix works, exactly the class of test
+# this file already declines to write. review-683-r2 independently
+# measured this same phenomenon far more rigorously (700 live runs: 8 lost
+# signals, 6 core dumps, but none pushed a wrong tree — see the P3-1
+# pre-write-tree guard in git-safety.sh, the actual signal-agnostic fix for
+# the one class of that race that could matter). Manually verified outside
+# this harness instead (dozens of real kill -TERM runs, rc=143 and nothing
+# pushed whenever the signal was not lost to this race).
+[[ $(trap -p INT) == *"exit 130"* ]] && ok "the INT trap actually exits (130), not just cleans up" \
+  || bad "the INT trap has no exit — bash would resume after it" "$(trap -p INT)"
+[[ $(trap -p TERM) == *"exit 143"* ]] && ok "the TERM trap actually exits (143), not just cleans up" \
+  || bad "the TERM trap has no exit — bash would resume after it (the exact #628 item 9 regression: TERM mid-run pushed anyway)" "$(trap -p TERM)"
 SCRATCH_A=$(mktemp -d); SCRATCH_B=$(mktemp)
 CLEANUP_PATHS+=("$SCRATCH_A" "$SCRATCH_B")
 cleanup_scratch
@@ -797,7 +862,7 @@ new_fixture
 printf '{"a":2}\ndesk-configurationabcdefghijklmnopqrstuvwxyz\n' > "$G/foo/container.json"
 run_safety
 case "$OUT" in
-  *"look like a secret"*) bad "false positive: 'desk-...' mid-word match on sk-" "$OUT" ;;
+  *"held for secret-shaped content"*) bad "false positive: 'desk-...' mid-word match on sk-" "$OUT" ;;
   *) ok "'sk-' requires a word boundary — 'desk-...' is not flagged" ;;
 esac
 git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1 \
@@ -837,7 +902,7 @@ git -C "$G" push -q origin HEAD:main
 printf 'ordinary planning notes, nothing secret here\n' >> "$G/foo/tasks/sk-learn-migration-plan-2026.md"
 run_safety
 case "$OUT" in
-  *"look like a secret"*) bad "a '+++ b/…sk-learn-….md' header was scanned as content" "$OUT" ;;
+  *"held for secret-shaped content"*) bad "a '+++ b/…sk-learn-….md' header was scanned as content" "$OUT" ;;
   *) ok "a '+++ b/…sk-learn-….md' header is recognized as a header, not scanned" ;;
 esac
 git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1 \
@@ -856,7 +921,7 @@ git -C "$G" push -q origin HEAD:main
 printf 'ordinary content, nothing secret here\n' >> "$G/foo/café.md"
 run_safety
 case "$OUT" in
-  *"look like a secret"*) bad "a quoted-path '+++ \"b/café.md\"' header was scanned as content" "$OUT" ;;
+  *"held for secret-shaped content"*) bad "a quoted-path '+++ \"b/café.md\"' header was scanned as content" "$OUT" ;;
   *) ok "a quoted-path header is recognized as a header, not scanned" ;;
 esac
 git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1 \
@@ -880,6 +945,965 @@ untracked_excluded_case "SSH key"      "id_rsa"        "-----BEGIN OPENSSH PRIVA
 untracked_excluded_case "prod.env"     "prod.env"      "SECRET=abc"
 untracked_excluded_case "secrets.yaml" "secrets.yaml"  "password: abc"
 
-echo
+# ═══════════════════════════════════════════════════════════════════════════
+# #628 item 9: per-file hold, alert-once, and the line-hash allowlist.
+# review-658 measured 32 of 430 real groups commits (7.4%) would be refused
+# WHOLE under the old single-tier gate — mostly TypeScript type annotations
+# like `token: string`. These cases exercise the replacement: a match holds
+# only its own file (everything else still commits), an alert fires once
+# per (path, line-hash) — not every night — and a reviewed line can only be
+# released by a COMMITTED entry in groups/.secret-scan-allow.
+# ═══════════════════════════════════════════════════════════════════════════
+GHP_LINE='export GITHUB_TOKEN=ghp_16C7e42F292c6912E7710c838347Ae178B4aXYZ123'
+allow_hash() { printf '%s\t%s' "$1" "$2" | sha256sum | cut -d' ' -f1; } # <path> <line> -> same key git-safety.sh/secret-scan-allow.sh use
+held_state_file() { printf '%s/.git-safety-state/secret-scan-held.tsv' "$BACKUPS"; }
+
+# ─ Case 1: a false positive (review-658's own TypeScript shape) holds only
+# its own file; a genuinely clean, unrelated file still commits ───────────
+new_fixture
+mkdir -p "$G/bar"
+echo placeholder > "$G/bar/types.ts"
+git -C "$G" add bar/types.ts
+git -C "$G" commit -qm "add bar/types.ts" >/dev/null
+git -C "$G" push -q origin HEAD:main
+echo 'clean edit' >> "$G/foo/container.json"
+echo 'token: string' >> "$G/bar/types.ts"
+run_safety
+case "$OUT" in
+  *"1 file(s) held for secret-shaped content"*) ok "case 1: exactly one file held (the false positive), named in the output" ;;
+  *) bad "case 1: wrong hold reporting" "$OUT" ;;
+esac
+CONTAINER_TIP=$(git --git-dir="$REMOTE" show host-snapshot:foo/container.json 2>/dev/null)
+case "$CONTAINER_TIP" in
+  *"clean edit"*) ok "case 1: the unrelated clean file still committed" ;;
+  *) bad "case 1: the clean file's edit did not commit" "content=[$CONTAINER_TIP]" ;;
+esac
+TYPES_TIP=$(git --git-dir="$REMOTE" show host-snapshot:bar/types.ts 2>/dev/null)
+[ "$TYPES_TIP" = "placeholder" ] && ok "case 1: the held file's snapshot content is HEAD's version, not the pending false-positive edit" \
+  || bad "case 1: the held file's edit leaked into the snapshot" "content=[$TYPES_TIP]"
+grep -q "token: string" "$G/bar/types.ts" 2>/dev/null && ok "case 1: the pending edit is still on disk in the working tree — nothing was lost" \
+  || bad "case 1: the pending edit vanished from the working tree" ""
+
+# Mutation evidence: the reset-to-HEAD step is what actually implements
+# containment. Disable ONLY that one call (never even attempt it) and
+# replay the identical fixture — detection still fires (still reported
+# "held"), but the content leaks. The exact same `if ! ... reset ...; then`
+# text also appears for the TAB/LF/CR-poisoned-path branch above it in the
+# file — the FAILURES message text that follows is included here so the
+# substitution targets the ORDINARY held-path branch specifically, not
+# whichever occurrence happens to come first.
+P1_MUTATION_OLD=$(cat <<'OLDEOF'
+if ! GIT_INDEX_FILE="$TMPIDX" git -C "$G" reset -q HEAD -- ":(literal)$path" 2>>"$ERR"; then
+        FAILURES+=("groups: could not reset a held path back to HEAD in the scratch index: $path — refused to commit any pending change")
+OLDEOF
+)
+P1_MUTATION_NEW=$(cat <<'NEWEOF'
+if false; then # MUTATED (#628 item 9 case 1): the reset never even runs, detected as offending but never contained
+        FAILURES+=("groups: could not reset a held path back to HEAD in the scratch index: $path — refused to commit any pending change")
+NEWEOF
+)
+MUTANT=$(make_mutant_git_safety "$P1_MUTATION_OLD" "$P1_MUTATION_NEW")
+new_fixture
+mkdir -p "$G/bar"
+echo placeholder > "$G/bar/types.ts"
+git -C "$G" add bar/types.ts
+git -C "$G" commit -qm "add bar/types.ts" >/dev/null
+git -C "$G" push -q origin HEAD:main
+echo 'clean edit' >> "$G/foo/container.json"
+echo 'token: string' >> "$G/bar/types.ts"
+run_script "$MUTANT"
+MUTANT_TYPES=$(git --git-dir="$REMOTE" show host-snapshot:bar/types.ts 2>/dev/null)
+case "$MUTANT_TYPES" in
+  *"token: string"*) ok "case 1 mutation evidence: without the reset-to-HEAD step, the 'held' file's edit leaks into the snapshot anyway — the reset is what actually implements containment, not just the detection" ;;
+  *) bad "case 1 mutation evidence: mutant unexpectedly still contained the edit (fixture doesn't isolate the reset step)" "content=[$MUTANT_TYPES]" ;;
+esac
+
+# ─ Case 2: a brand-new hold exits non-zero exactly once ──────────────────
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_safety
+[ "$RC" -ne 0 ] && ok "case 2: a brand-new hold exits non-zero" || bad "case 2: a new hold did not exit non-zero" "$OUT"
+case "$OUT" in
+  *"new, changed, or unresolved 7+ days"*) ok "case 2: the alert names why (new/changed/stale)" ;;
+  *) bad "case 2: no alert reason in the output" "$OUT" ;;
+esac
+
+MUTANT=$(make_mutant_git_safety \
+  'first_seen="$now_iso"; last_alerted="$now_iso"; alert_worthy=1' \
+  'first_seen="$now_iso"; last_alerted="$now_iso"; alert_worthy=0 # MUTATED (#628 item 9 case 2): a brand-new hold never alerts')
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_script "$MUTANT"
+[ "$RC" -eq 0 ] && ok "case 2 mutation evidence: without alert_worthy=1 on a new hold, the run exits 0 — a real new secret would silently never alert anyone" \
+  || bad "case 2 mutation evidence: mutant unexpectedly still exited non-zero" "$OUT"
+
+# ─ Case 3: the SAME unchanged hold exits 0 on the very next run ──────────
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_safety
+[ "$RC" -ne 0 ] || bad "case 3 setup: the first run should have alerted (new hold)" "$OUT"
+run_safety
+[ "$RC" -eq 0 ] && ok "case 3: an unchanged hold exits 0 on the next run" || bad "case 3: an unchanged hold re-alerted" "$OUT"
+case "$OUT" in
+  *"1 file(s) held for secret-shaped content"*) ok "case 3: still names the still-pending held file even though it doesn't alert" ;;
+  *) bad "case 3: no stderr line naming the still-pending hold" "$OUT" ;;
+esac
+
+MUTANT=$(make_mutant_git_safety \
+  'if [ $((now_epoch - first_epoch)) -ge "$HOLD_REALERT_SECONDS" ] && [ $((now_epoch - last_epoch)) -ge "$HOLD_REALERT_SECONDS" ]; then' \
+  'if true; then # MUTATED (#628 item 9 case 3): every existing hold re-alerts every run, 7-day gate removed')
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_script "$MUTANT"
+[ "$RC" -ne 0 ] || bad "case 3 mutation setup: the first mutant run should still alert (new hold)" "$OUT"
+run_script "$MUTANT"
+[ "$RC" -ne 0 ] && ok "case 3 mutation evidence: without the 7-day gate, an UNCHANGED hold re-alerts on the very next run — reproduces the nightly alert-loop this item fixes" \
+  || bad "case 3 mutation evidence: mutant unexpectedly stayed quiet on an unchanged hold" "$OUT"
+
+# ─ Case 4: a COMMITTED allowlist entry releases a hold; an UNCOMMITTED one doesn't ─
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_safety
+[ "$RC" -ne 0 ] || bad "case 4 setup: the first run should have held and alerted" "$OUT"
+HASH=$(allow_hash "foo/container.json" "$GHP_LINE")
+printf 'foo/container.json\t%s\ttest allow\n' "$HASH" > "$G/.secret-scan-allow"
+run_safety
+CONTAINER_TIP=$(git --git-dir="$REMOTE" show host-snapshot:foo/container.json 2>/dev/null)
+case "$CONTAINER_TIP" in
+  *ghp_*) bad "case 4: an UNCOMMITTED .secret-scan-allow edit released the hold" "content=[$CONTAINER_TIP]" ;;
+  *) ok "case 4: an uncommitted .secret-scan-allow edit does NOT release the hold" ;;
+esac
+git -C "$G" add .secret-scan-allow
+git -C "$G" commit -qm "allow reviewed line" >/dev/null
+run_safety
+CONTAINER_TIP=$(git --git-dir="$REMOTE" show host-snapshot:foo/container.json 2>/dev/null)
+case "$CONTAINER_TIP" in
+  *ghp_*) ok "case 4: a COMMITTED .secret-scan-allow entry releases the hold" ;;
+  *) bad "case 4: a committed allowlist entry did not release the hold" "content=[$CONTAINER_TIP]" ;;
+esac
+[ -s "$(held_state_file)" ] && bad "case 4: the released entry is still in the held-state file" "$(cat "$(held_state_file)")" \
+  || ok "case 4: the released entry dropped out of the held-state file"
+
+MUTANT=$(make_mutant_git_safety \
+  'raw=$(git -C "$g" show HEAD:.secret-scan-allow 2>/dev/null) || return 0' \
+  'raw=$(cat "$g/.secret-scan-allow" 2>/dev/null) || return 0 # MUTATED (#628 item 9 case 4): reads the WORKING TREE, not committed HEAD')
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_script "$MUTANT"
+HASH=$(allow_hash "foo/container.json" "$GHP_LINE")
+printf 'foo/container.json\t%s\ttest allow\n' "$HASH" > "$G/.secret-scan-allow"
+run_script "$MUTANT"
+MUTANT_TIP=$(git --git-dir="$REMOTE" show host-snapshot:foo/container.json 2>/dev/null)
+case "$MUTANT_TIP" in
+  *ghp_*) ok "case 4 mutation evidence: reading the allowlist from the WORKING TREE releases the hold from a merely UNCOMMITTED edit — reproduces the bug the HEAD-only read prevents" ;;
+  *) bad "case 4 mutation evidence: mutant unexpectedly did not release the hold" "content=[$MUTANT_TIP]" ;;
+esac
+
+# ─ Case 5: a real ghp_ token stays held, never committed ─────────────────
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_safety
+CONTAINER_TIP=$(git --git-dir="$REMOTE" show host-snapshot:foo/container.json 2>/dev/null || echo "<no snapshot>")
+case "$CONTAINER_TIP" in
+  *ghp_*) bad "case 5: a real ghp_ token was committed to host-snapshot" "content=[$CONTAINER_TIP]" ;;
+  *) ok "case 5: a real ghp_ token stays held, never committed" ;;
+esac
+
+# ─ Case 6: a hold unresolved and unalerted for 7+ days re-alerts, then goes quiet again ─
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_safety
+[ "$RC" -ne 0 ] || bad "case 6 setup: the first run should have alerted" "$OUT"
+STATE_FILE=$(held_state_file)
+HASH=$(cut -f2 "$STATE_FILE")
+STALE=$(date -u -d '8 days ago' +%Y-%m-%dT%H:%M:%SZ)
+printf 'foo/container.json\t%s\t%s\t%s\n' "$HASH" "$STALE" "$STALE" > "$STATE_FILE"
+run_safety
+[ "$RC" -ne 0 ] && ok "case 6: an 8-day-old, unresolved and unalerted-in-8-days hold re-alerts" \
+  || bad "case 6: an 8-day-stale hold did not re-alert" "$OUT"
+run_safety
+[ "$RC" -eq 0 ] && ok "case 6: immediately after the 7-day re-alert, the very next run is quiet again (last_alerted just moved to now)" \
+  || bad "case 6: re-alerted twice with no further time passing" "$OUT"
+
+# ─ Case 7: a corrupt groups/.secret-scan-allow fails closed (holds stay) ─
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_safety
+[ "$RC" -ne 0 ] || bad "case 7 setup: the first run should have alerted" "$OUT"
+HASH=$(allow_hash "foo/container.json" "$GHP_LINE")
+printf 'foo/container.json\t%s\n' "$HASH" > "$G/.secret-scan-allow" # malformed: missing the "reason" column
+git -C "$G" add .secret-scan-allow
+git -C "$G" commit -qm "malformed allowlist" >/dev/null
+run_safety
+case "$OUT" in
+  *"malformed"*"treating as empty"*) ok "case 7: a malformed allowlist is diagnosed and treated as empty" ;;
+  *) bad "case 7: no malformed-allowlist diagnostic in the output" "$OUT" ;;
+esac
+CONTAINER_TIP=$(git --git-dir="$REMOTE" show host-snapshot:foo/container.json 2>/dev/null || echo "<no snapshot>")
+case "$CONTAINER_TIP" in
+  *ghp_*) bad "case 7: a corrupt allowlist released the hold anyway (fail-OPEN)" "content=[$CONTAINER_TIP]" ;;
+  *) ok "case 7: a corrupt allowlist fails closed — the hold stays" ;;
+esac
+
+# ─ Case 8: a held file, later deleted from the working tree, is held too ─
+# A second, unrelated clean file changes too, so run 1 actually produces a
+# snapshot commit at all — if the held path were the ONLY pending change,
+# holding it leaves nothing to commit and no snapshot exists yet either
+# way, which would make this case vacuous.
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+mkdir -p "$G/bar"
+echo placeholder > "$G/bar/types.ts"
+git -C "$G" add bar/types.ts
+git -C "$G" commit -qm "add bar/types.ts" >/dev/null
+git -C "$G" push -q origin HEAD:main
+echo 'unrelated clean edit' >> "$G/bar/types.ts"
+run_safety
+[ "$RC" -ne 0 ] || bad "case 8 setup: the first run should have held and alerted" "$OUT"
+rm -f "$G/foo/container.json"
+run_safety
+git --git-dir="$REMOTE" cat-file -e host-snapshot:foo/container.json 2>&1 \
+  && ok "case 8: a held file's later deletion never reaches the snapshot as a deletion" \
+  || bad "case 8: the held file's deletion reached the snapshot" ""
+CONTAINER_TIP=$(git --git-dir="$REMOTE" show host-snapshot:foo/container.json 2>/dev/null)
+if [ "$CONTAINER_TIP" = '{"a":1}' ]; then
+  ok "case 8: the snapshot keeps the file's original committed content — no secret, and not the deleted state"
+else
+  bad "case 8: unexpected snapshot content for the deleted-and-held path" "content=[$CONTAINER_TIP]"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# review-683, round 1 on #628 item 9 (CHANGES): a P1 quoted/pathspec-magic
+# filename bypass, two P2s, and several P3s. Each fix gets its own case
+# below; P1-1/P2-1/P2-2/the TERM fix also get mutation evidence.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ─ P1-1: quoted and pathspec-magic filenames must not bypass the scan ─────
+# `diff --cached --name-only HEAD` (no `-z`) quotes a special-byte path per
+# core.quotePath — the quoted STRING then never matches anything as a
+# pathspec, so the file is never scanned or held, yet `add -u` already
+# staged it and it commits regardless. All 13 names below either need
+# real bytes a shell would otherwise treat specially, or resemble git
+# pathspec magic syntax closely enough to break unquoted use as one.
+# review-683-r2 P3-7: an optional setup snippet, eval'd right after
+# new_fixture (and only once) — needed because hostile_name_case calls
+# new_fixture ITSELF as its first line, which silently threw away any
+# fixture config (e.g. `core.quotePath false`) the caller had set up on a
+# fixture from a PRECEDING new_fixture call. That made the
+# "core.quotePath=false" case below vacuous: it actually ran against a
+# fresh default-quotePath fixture, indistinguishable from the default case
+# under a confusing label.
+HOSTILE_CASE_SETUP=""
+hostile_name_case() { # <label> <filename (may contain any byte but NUL and /)>
+  new_fixture
+  if [ -n "$HOSTILE_CASE_SETUP" ]; then eval "$HOSTILE_CASE_SETUP"; HOSTILE_CASE_SETUP=""; fi
+  local label="$1" name="$2"
+  printf 'placeholder\n' > "$G/$name"
+  # review-683-r2 P3-7: a bare `git add -- "$name"` is ITSELF subject to
+  # git's own pathspec-magic parsing — `:(exclude)*` and `:(top)zz.md` are
+  # valid magic syntax as plain strings (any argument shaped `:(...)` is),
+  # so without `:(literal)` this add was silently a no-op for exactly those
+  # two names (nothing staged, no error), the resulting commit had nothing
+  # new to commit, and the whole fixture never actually created the file
+  # this case claims to test — passing "held, never committed" for the
+  # wrong reason (it was never committed to begin with). `:(literal)` makes
+  # this add match the name byte-for-byte, the same fix as the scan itself.
+  git -C "$G" add -- ":(literal)$name"
+  git -C "$G" commit -qm "add hostile-name placeholder" >/dev/null
+  git -C "$G" push -q origin HEAD:main
+  printf 'placeholder\n%s\n' "$GHP_LINE" > "$G/$name"
+  run_safety
+  # review-683-r2 P3-7: assert rc≠0 on the first run explicitly, not just
+  # that the secret didn't reach host-snapshot — a run that silently
+  # succeeded (rc=0) while ALSO somehow not leaking would pass the old
+  # check for the wrong reason.
+  [ "$RC" -ne 0 ] || bad "P1-1 hostile filename ($label): first run did not report a nonzero exit" "$OUT"
+  local remote_content
+  remote_content=$(git --git-dir="$REMOTE" show "host-snapshot:$name" 2>/dev/null || echo "<no-entry>")
+  case "$remote_content" in
+    *ghp_*) bad "P1-1 hostile filename ($label): secret leaked into host-snapshot" "content=[$remote_content]" ;;
+    *) ok "P1-1 hostile filename ($label): held, never committed" ;;
+  esac
+}
+hostile_name_case "café.md, core.quotePath default (true)" "café.md"
+hostile_name_case 'd"q.md (embedded double quote)' 'd"q.md'
+hostile_name_case 'back\slash.md (embedded backslash)' 'back\slash.md'
+# review-683-r2 P3-7: the review's EXACT names, not the softened
+# `:(exclude)star.md`/`*.md`/`[ab].md`/`:!x.md` variants used in round 1 —
+# the un-suffixed forms are what actually collide with pathspec magic
+# syntax byte-for-byte.
+hostile_name_case ':(exclude)* (pathspec-magic-shaped name)' ':(exclude)*'
+hostile_name_case ':(top)zz.md (pathspec-magic-shaped name)' ':(top)zz.md'
+hostile_name_case "a space" "a b.md"
+hostile_name_case "a leading dash" "-x.md"
+hostile_name_case "a bare asterisk" "*"
+hostile_name_case "bracket glob shape" "[ab]"
+hostile_name_case ":!x (pathspec exclude-shorthand shape)" ":!x"
+HOSTILE_CASE_SETUP='git -C "$G" config core.quotePath false'
+hostile_name_case "café.md, core.quotePath=false" "café2.md"
+
+# TAB/LF/CR in a path corrupt the TSV state/allowlist rows outright — per
+# spec, such a path is ALWAYS held and alerts on EVERY run, never gets a
+# state row, and can never be allowlisted; the operator's only path
+# forward is to rename it. Two of the review's 13 names (embedded TAB,
+# embedded LF) exercise exactly this branch, not ordinary one-time
+# containment — checked against 3 consecutive runs with no other change,
+# each of which must still alert.
+poisoned_name_case() { # <label> <filename with an embedded TAB, LF or CR>
+  new_fixture
+  local label="$1" name="$2"
+  printf 'placeholder\n' > "$G/$name"
+  git -C "$G" add -- "$name"
+  git -C "$G" commit -qm "add poisoned-name placeholder" >/dev/null
+  git -C "$G" push -q origin HEAD:main
+  printf 'placeholder\nordinary content, no secret at all\n' > "$G/$name"
+  local i
+  for i in 1 2 3; do
+    run_safety
+    [ "$RC" -ne 0 ] || bad "P1-1 poisoned filename ($label): run $i did not alert" "$OUT"
+  done
+  case "$OUT" in
+    *"TAB/LF/CR"*) ok "P1-1 poisoned filename ($label): names why it's held every run" ;;
+    *) bad "P1-1 poisoned filename ($label): no TAB/LF/CR diagnostic" "$OUT" ;;
+  esac
+  [ -s "$(held_state_file)" ] && bad "P1-1 poisoned filename ($label): got a state-file row despite never being allowlistable" "$(cat "$(held_state_file)")" \
+    || ok "P1-1 poisoned filename ($label): never gets a state-file row"
+  local remote_content
+  remote_content=$(git --git-dir="$REMOTE" show "host-snapshot:$name" 2>/dev/null || echo "<no-entry>")
+  case "$remote_content" in
+    *"ordinary content"*) bad "P1-1 poisoned filename ($label): reached the snapshot anyway" "content=[$remote_content]" ;;
+    *) ok "P1-1 poisoned filename ($label): never reaches the snapshot" ;;
+  esac
+}
+poisoned_name_case "embedded TAB" $'ta\tb.md'
+poisoned_name_case "embedded LF" $'new\nline.md'
+# review-683-r2 P3-7: a CR case — the third of the three TSV-corrupting
+# bytes (TAB/LF/CR), not previously exercised.
+poisoned_name_case "embedded CR" $'cr\rx.md'
+
+# Mutation evidence for P1-1: restore the old newline-split, non-literal
+# pathspec code and show the hostile-name bypass reproduces. Built via
+# heredoc-populated variables, not inline single-quoted literals — the
+# real text contains an embedded `''` (read -d ''), which is painful and
+# error-prone to escape correctly inside a single-quoted bash argument.
+P1_1_OLD=$(cat <<'OLDEOF'
+while IFS= read -r -d '' path; do
+    [ -n "$path" ] && changed_paths+=("$path")
+  done < <(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --name-only -z HEAD 2>>"$ERR")
+OLDEOF
+)
+P1_1_NEW=$(cat <<'NEWEOF'
+while IFS= read -r path; do [ -n "$path" ] && changed_paths+=("$path"); done < <(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --name-only HEAD 2>>"$ERR")
+NEWEOF
+)
+MUTANT=$(make_mutant_git_safety "$P1_1_OLD" "$P1_1_NEW")
+new_fixture
+printf 'placeholder\n' > "$G/café.md"
+git -C "$G" add -- café.md
+git -C "$G" commit -qm "add cafe placeholder" >/dev/null
+git -C "$G" push -q origin HEAD:main
+printf 'placeholder\n%s\n' "$GHP_LINE" > "$G/café.md"
+run_script "$MUTANT"
+MUTANT_CONTENT=$(git --git-dir="$REMOTE" show "host-snapshot:café.md" 2>/dev/null || echo "<no-entry>")
+case "$MUTANT_CONTENT" in
+  *ghp_*) ok "P1-1 mutation evidence: the newline-split/non-literal-pathspec mutant leaks café.md's secret into host-snapshot — reproduces the exact bypass this fix closes" ;;
+  *) bad "P1-1 mutation evidence: mutant unexpectedly still held café.md (fixture doesn't isolate the regression)" "content=[$MUTANT_CONTENT]" ;;
+esac
+
+# ─ P2-1 mutation evidence: skip the state rewrite on the empty-diff path ──
+# (P2-1's own behavioral case — new hold, revert, re-add, must alert again
+# — already lives above, in the original #628 item 9 case list; this adds
+# the mutation evidence review-683 asked for.)
+MUTANT=$(make_mutant_git_safety \
+  'done < <(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --name-only -z HEAD 2>>"$ERR")
+  # No early return here even when $changed_paths is empty (review-683' \
+  'done < <(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --name-only -z HEAD 2>>"$ERR")
+  if [ "${#changed_paths[@]}" -eq 0 ]; then GROUPS_RESULT="nothing pending"; return; fi
+  # (review-683 mutation: restores the removed early return) (review-683')
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_script "$MUTANT"
+[ "$RC" -ne 0 ] || bad "P2-1 mutation setup: the first mutant run should have alerted (new hold)" "$OUT"
+git -C "$G" checkout -q -- foo/container.json
+run_script "$MUTANT"
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_script "$MUTANT"
+[ "$RC" -eq 0 ] && ok "P2-1 mutation evidence: with the early return restored, revert-then-readd of the SAME secret goes quiet (rc=0) — reproduces the missed-re-alert bug" \
+  || bad "P2-1 mutation evidence: mutant unexpectedly still alerted (fixture doesn't isolate the regression)" "$OUT"
+
+# ─ P2-2: secret-scan-allow.sh must actually print something ───────────────
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_safety
+[ "$RC" -ne 0 ] || bad "P2-2 setup: the run should have held and alerted" "$OUT"
+ALLOW_OUT=$(env NANOCLAW_DIR="$NCDIR" GIT_SAFETY_DIR="$BACKUPS" HOME="$HOME2" bash "$(dirname "$REAL")/secret-scan-allow.sh" foo/container.json)
+case "$ALLOW_OUT" in
+  *"foo/container.json"*"ALLOW:"*) ok "P2-2: prints exactly one ready-to-append allowlist line" ;;
+  *) bad "P2-2: printed nothing usable" "$ALLOW_OUT" ;;
+esac
+case "$ALLOW_OUT" in
+  *"$GHP_LINE"*) bad "P2-2: printed the UNMASKED secret line" "$ALLOW_OUT" ;;
+  *"export G..."*) ok "P2-2: the offending line is masked to its first 8 characters" ;;
+  *) bad "P2-2: masking looks wrong" "$ALLOW_OUT" ;;
+esac
+[ -e "$G/.secret-scan-allow" ] && bad "P2-2: the helper wrote groups/.secret-scan-allow itself" "" \
+  || ok "P2-2: the helper wrote nothing on its own"
+
+# Mutation evidence for P2-2: options after `--` are pathspecs, not
+# options — restore that ordering and show the helper prints nothing.
+# Built via heredoc-populated variables passed through the ENVIRONMENT
+# (not embedded in the python source string) — the same reliable pattern
+# make_mutant_git_safety uses, for the same reason: this text is long,
+# multi-line, and full of embedded quotes/backslashes that are painful and
+# error-prone to escape correctly inline.
+P2_2_OLD=$(cat <<'OLDEOF'
+FILE_DIFF=$(git -C "$GROUPS_DIR" diff-index --no-color -p --text --no-ext-diff --no-textconv \
+  --src-prefix=a/ --dst-prefix=b/ \
+  --output-indicator-new="$SECRET_SCAN_NEW_INDICATOR" --output-indicator-old=- --output-indicator-context=' ' \
+  HEAD -- ":(literal)$TARGET_PATH" 2>/dev/null | LC_ALL=C tr '\000' ' ')
+OLDEOF
+)
+P2_2_NEW=$(cat <<'NEWEOF'
+FILE_DIFF=$(git -C "$GROUPS_DIR" diff-index --no-color -p --text --no-ext-diff --no-textconv HEAD -- "$TARGET_PATH" \
+  --src-prefix=a/ --dst-prefix=b/ \
+  --output-indicator-new="$SECRET_SCAN_NEW_INDICATOR" --output-indicator-old=- --output-indicator-context=' ' 2>/dev/null)
+NEWEOF
+)
+MUTANT_ALLOW=$(mktemp)
+ALLOW_SRC="$(dirname "$REAL")/secret-scan-allow.sh"
+OLDSTR="$P2_2_OLD" NEWSTR="$P2_2_NEW" SRC="$ALLOW_SRC" DST="$MUTANT_ALLOW" python3 -c "
+import os
+src = open(os.environ['SRC']).read()
+old = os.environ['OLDSTR']
+new = os.environ['NEWSTR']
+assert old in src, 'mutation target text not found in secret-scan-allow.sh — source has drifted from this fixture'
+open(os.environ['DST'], 'w').write(src.replace(old, new, 1))
+"
+chmod +x "$MUTANT_ALLOW"
+MUTANT_ALLOW_OUT=$(env NANOCLAW_DIR="$NCDIR" GIT_SAFETY_DIR="$BACKUPS" HOME="$HOME2" bash "$MUTANT_ALLOW" foo/container.json)
+case "$MUTANT_ALLOW_OUT" in
+  *"ALLOW:"*) bad "P2-2 mutation evidence: mutant unexpectedly still printed a usable line" "$MUTANT_ALLOW_OUT" ;;
+  *) ok "P2-2 mutation evidence: options placed after -- print nothing at all — reproduces the bug this fix closes" ;;
+esac
+rm -f "$MUTANT_ALLOW"
+
+# ─ P3-1: an unparseable timestamp counts as epoch 0 (re-alerts), not "now" ─
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_safety
+[ "$RC" -ne 0 ] || bad "P3-1 setup: the first run should have alerted" "$OUT"
+HASH=$(cut -f2 "$(held_state_file)")
+printf 'foo/container.json\t%s\tnot-a-timestamp\tnot-a-timestamp\n' "$HASH" > "$(held_state_file)"
+run_safety
+[ "$RC" -ne 0 ] && ok "P3-1: an unparseable first_seen/last_alerted re-alerts instead of going quiet" \
+  || bad "P3-1: an unparseable timestamp was silently treated as fresh (rc=0)" "$OUT"
+
+# ─ P3-3: allowlist parsing rejects an empty field or a malformed hash ─────
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_safety
+[ "$RC" -ne 0 ] || bad "P3-3 setup: the first run should have alerted" "$OUT"
+printf 'foo/container.json\t\ttest allow\n' > "$G/.secret-scan-allow" # empty hash field
+git -C "$G" add .secret-scan-allow
+git -C "$G" commit -qm "malformed: empty hash field" >/dev/null
+run_safety
+CONTAINER_TIP=$(git --git-dir="$REMOTE" show host-snapshot:foo/container.json 2>/dev/null || echo "<no-entry>")
+case "$CONTAINER_TIP" in
+  *ghp_*) bad "P3-3: an empty allowlist field released the hold" "content=[$CONTAINER_TIP]" ;;
+  *) ok "P3-3: an empty allowlist field fails closed" ;;
+esac
+printf 'foo/container.json\tNOTAVALIDHASH\ttest allow\n' > "$G/.secret-scan-allow" # not 64 lowercase hex chars
+git -C "$G" add .secret-scan-allow
+git -C "$G" commit -qm "malformed: bad hash shape" >/dev/null
+run_safety
+CONTAINER_TIP=$(git --git-dir="$REMOTE" show host-snapshot:foo/container.json 2>/dev/null || echo "<no-entry>")
+case "$CONTAINER_TIP" in
+  *ghp_*) bad "P3-3: a malformed (non-hex) hash released the hold" "content=[$CONTAINER_TIP]" ;;
+  *) ok "P3-3: a malformed hash shape fails closed" ;;
+esac
+
+# P3-5's deterministic check (the INT/TERM trap text actually contains
+# `exit N`) lives above, alongside the pre-existing #628 item 6 trap-
+# registration test — see the comment there for why a live SIGTERM-mid-run
+# race isn't asserted here as its own case.
+
+# ─ P3-6: bare vendor-shaped tokens, with no identifier-assignment context ─
+# to fall back on, must still match — the #630 fixtures already in this
+# file (`export GITHUB_TOKEN=ghu_...` etc.) also satisfy the GENERIC
+# identifier alternative on their own (…TOKEN=…), so they never actually
+# proved the vendor-specific gh[ousr]_/  (sk|rk)_live_/xox[abpre]-/
+# (AKIA|ASIA) alternatives fire independently.
+secret_case "bare github user-to-server token (ghu_), no identifier context"  'ghu_16C7e42F292c6912E7710c838347Ae178B4a'
+secret_case "bare github refresh token (ghr_), no identifier context"         'ghr_16C7e42F292c6912E7710c838347Ae178B4a'
+secret_case "bare stripe restricted key (rk_live_), no identifier context"    'rk_live_51H8xamplekeyvalueabc123'
+secret_case "bare slack rotation token (xoxe-), no identifier context"       'xoxe-1-abcdefghijklmnopqrstuvwxyz'
+secret_case "bare AWS STS temp key (ASIA), no identifier context"           'ASIAABCDEFGHIJKLMNOP'
+
+# ═══════════════════════════════════════════════════════════════════════════
+# review-683-r2 on #628 item 9 (CHANGES, then APPROVED at 4853d046f/04477b72
+# with 8 P3s): fixes P3-1 through P3-8. Labeled "review-683-r2 P3-N" below to
+# stay distinct from round 1's own "P3-1"/"P3-3"/"P3-6" cases above, which
+# are a DIFFERENT numbering from a DIFFERENT round.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ─ review-683-r2 P3-2a: a held hostile-named path's later deletion stays
+# held too, exactly like case 8 above but with a name core.quotePath would
+# quote — the bug this closes: a plain newline-split `ls-files --deleted`
+# never matched the quoted string as a literal pathspec, so the deletion
+# slipped past the exclude and reached host-snapshot as a real deletion ──
+new_fixture
+printf 'placeholder\n' > "$G/café.md"
+git -C "$G" add -- café.md
+git -C "$G" commit -qm "add café.md placeholder" >/dev/null
+git -C "$G" push -q origin HEAD:main
+mkdir -p "$G/bar"
+echo placeholder > "$G/bar/types.ts"
+git -C "$G" add bar/types.ts
+git -C "$G" commit -qm "add bar/types.ts" >/dev/null
+git -C "$G" push -q origin HEAD:main
+printf 'placeholder\n%s\n' "$GHP_LINE" > "$G/café.md"
+echo 'unrelated clean edit' >> "$G/bar/types.ts"
+run_safety
+[ "$RC" -ne 0 ] || bad "P3-2a setup: the first run should have held café.md" "$OUT"
+rm -f "$G/café.md"
+run_safety
+git --git-dir="$REMOTE" cat-file -e "host-snapshot:café.md" 2>&1 \
+  && ok "P3-2a: a held hostile-named path's entry still exists in host-snapshot after its deletion" \
+  || bad "P3-2a: a held hostile-named path's deletion reached host-snapshot" ""
+CAFE_TIP=$(git --git-dir="$REMOTE" show "host-snapshot:café.md" 2>/dev/null)
+[ "$CAFE_TIP" = "placeholder" ] \
+  && ok "P3-2a: the snapshot keeps café.md's HEAD content, not the secret and not a deletion" \
+  || bad "P3-2a: unexpected snapshot content for the deleted-and-held hostile-named path" "content=[$CAFE_TIP]"
+
+# ─ review-683-r2 P3-2b: deleting a literal `*` file does not silently drop
+# every OTHER pending edit — the bug: `:(exclude)$f` with a non-literal `$f`
+# equal to `*` is itself a glob matching every path, so `add -u` staged
+# nothing at all and the run reported "nothing pending" (rc=0) while a real,
+# unrelated edit sat unstaged forever ─────────────────────────────────────
+new_fixture
+printf 'literal star file\n' > "$G/*"
+git -C "$G" add -- '*'
+git -C "$G" commit -qm "add literal * file" >/dev/null
+git -C "$G" push -q origin HEAD:main
+echo 'clean edit' >> "$G/foo/container.json"
+rm -f "$G/*"
+run_safety
+CONTAINER_TIP=$(git --git-dir="$REMOTE" show host-snapshot:foo/container.json 2>/dev/null || echo "<no-entry>")
+case "$CONTAINER_TIP" in
+  *"clean edit"*) ok "P3-2b: deleting a literal '*' file doesn't drop an unrelated pending edit" ;;
+  *) bad "P3-2b: deleting a literal '*' file silently dropped an unrelated pending edit" "content=[$CONTAINER_TIP]" ;;
+esac
+
+# ─ review-683-r2 P3-2 mutation evidence: restore the old newline-split,
+# non-literal `:(exclude)$f` deletion handling. Uses `d"q.md`, not café.md —
+# this git version does not actually C-quote valid UTF-8 like café.md in
+# `ls-files` output (only genuinely unusual bytes, like an embedded double
+# quote, get quoted), so café.md's deletion was excluded correctly even
+# under the OLD code and never isolated this regression. `d"q.md` reliably
+# gets quoted (`"d\"q.md"`), which the old non-literal exclude then fails
+# to match.
+P3_2_OLD=$(cat <<'OLDEOF'
+  local deleted=() f
+  while IFS= read -r -d '' f; do
+    [ -n "$f" ] && deleted+=("$f")
+  done < <(GIT_INDEX_FILE="$TMPIDX" git -C "$G" ls-files --deleted -z)
+  local excludes=("${GROUPS_SENSITIVE_EXCLUDES[@]}")
+  for f in "${deleted[@]}"; do excludes+=(":(exclude,literal)$f"); done
+OLDEOF
+)
+P3_2_NEW=$(cat <<'NEWEOF'
+  local deleted=() f
+  while IFS= read -r f; do [ -n "$f" ] && deleted+=("$f"); done < <(GIT_INDEX_FILE="$TMPIDX" git -C "$G" ls-files --deleted) # MUTATED (review-683-r2 P3-2): newline-split, quoted paths never match
+  local excludes=("${GROUPS_SENSITIVE_EXCLUDES[@]}")
+  for f in "${deleted[@]}"; do excludes+=(":(exclude)$f"); done # MUTATED: non-literal pathspec
+NEWEOF
+)
+# The P3-1 pre-write-tree guard (added further below in the real script)
+# independently catches ANY unexpected staged deletion in the scratch
+# index, regardless of cause — so a mutant with ONLY the P3-2 deletion-
+# exclusion code reverted still gets caught by P3-1's guard before
+# write-tree, refusing cleanly instead of reproducing the P3-2 bug (this
+# was measured empirically while building this fixture: the deletion DOES
+# reach the scratch index as intended, but the run then refuses with
+# "the scratch index has a staged deletion... refusing to commit from an
+# unaccountable index" — a real defense-in-depth property of P3-1, but it
+# means P3-2's OWN fix can't be isolated without ALSO disabling P3-1's
+# guard in this one mutant.
+GUARD2_OLD=$(cat <<'OLDEOF'
+  if [ ! -f "$TMPIDX" ]; then
+    FAILURES+=("groups: the scratch index vanished before write-tree — refusing to commit from an unaccountable index")
+    GROUPS_RESULT="failed (missing scratch index)"; return
+  fi
+  if ! GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --no-ext-diff --no-textconv --diff-filter=D --quiet HEAD 2>>"$ERR"; then
+    FAILURES+=("groups: the scratch index has a staged deletion, which never happens by design — refusing to commit from an unaccountable index")
+    GROUPS_RESULT="failed (unexpected staged deletion)"; return
+  fi
+OLDEOF
+)
+GUARD2_NEW=$(cat <<'NEWEOF'
+  : # MUTATED (review-683-r2 P3-2 selfcheck): P3-1's guard disabled too, to isolate P3-2's own fix
+NEWEOF
+)
+# round 3's own catch-all reset loop (added right after `add -u`, to reset
+# and report ANY staged deletion it left behind) ALSO independently catches
+# this same fault — it doesn't refuse like P3-1's guard, it just quietly
+# resets the deletion back to HEAD and reports it, which likewise means
+# P3-2's bug never gets a chance to actually reach write-tree. Disabled
+# here too, for the same isolation reason as P3-1's guard above.
+P2_R3_OLD=$(cat <<'OLDEOF'
+  local f
+  while IFS= read -r -d '' f; do
+    [ -n "$f" ] || continue
+    if ! GIT_INDEX_FILE="$TMPIDX" git -C "$G" reset -q HEAD -- ":(literal)$f" 2>>"$ERR"; then
+      FAILURES+=("groups: could not reset an unexpected staged deletion back to HEAD in the scratch index: $(printf '%q' "$f") — refused to commit any pending change")
+      GROUPS_RESULT="failed (deletion reset)"; return
+    fi
+    deleted+=("$f")
+  done < <(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --diff-filter=D --name-only -z --no-ext-diff --no-textconv HEAD 2>>"$ERR")
+OLDEOF
+)
+MUTDIR=$(mktemp -d)
+FIXTURE_DIRS+=("$MUTDIR")
+mkdir -p "$MUTDIR/lib"
+ln -s "$(dirname "$REAL")/lib/secret-scan.sh" "$MUTDIR/lib/secret-scan.sh"
+OLDSTR1="$P3_2_OLD" NEWSTR1="$P3_2_NEW" OLDSTR2="$GUARD2_OLD" NEWSTR2="$GUARD2_NEW" OLDSTR3="$P2_R3_OLD" \
+  SRC="$REAL" DST="$MUTDIR/git-safety.sh" python3 -c "
+import os
+src = open(os.environ['SRC']).read()
+o1, n1 = os.environ['OLDSTR1'], os.environ['NEWSTR1']
+o2, n2 = os.environ['OLDSTR2'], os.environ['NEWSTR2']
+o3 = os.environ['OLDSTR3']
+assert o1 in src, 'P3-2 mutation target text not found — source has drifted from this fixture'
+assert o2 in src, 'P3-1 guard text not found — source has drifted from this fixture'
+assert o3 in src, 'round 3 P2 catch-all loop text not found — source has drifted from this fixture'
+src = src.replace(o1, n1, 1)
+src = src.replace(o2, n2, 1)
+src = src.replace(o3, '', 1)
+open(os.environ['DST'], 'w').write(src)
+"
+chmod +x "$MUTDIR/git-safety.sh"
+MUTANT="$MUTDIR/git-safety.sh"
+DQ_NAME='d"q.md'
+new_fixture
+printf 'placeholder\n' > "$G/$DQ_NAME"
+git -C "$G" add -- ":(literal)$DQ_NAME"
+git -C "$G" commit -qm "add d-quote placeholder" >/dev/null
+git -C "$G" push -q origin HEAD:main
+mkdir -p "$G/bar"
+echo placeholder > "$G/bar/types.ts"
+git -C "$G" add bar/types.ts
+git -C "$G" commit -qm "add bar/types.ts" >/dev/null
+git -C "$G" push -q origin HEAD:main
+printf 'placeholder\n%s\n' "$GHP_LINE" > "$G/$DQ_NAME"
+echo 'unrelated clean edit' >> "$G/bar/types.ts"
+run_script "$MUTANT"
+rm -f "$G/$DQ_NAME"
+run_script "$MUTANT"
+git --git-dir="$REMOTE" cat-file -e "host-snapshot:$DQ_NAME" 2>&1 \
+  && bad "P3-2 mutation evidence: mutant unexpectedly still kept d\"q.md's entry (fixture doesn't isolate the regression)" "" \
+  || ok "P3-2 mutation evidence: with P3-1's guard ALSO disabled to isolate it, the newline-split/non-literal-pathspec mutant lets a held hostile-named path's deletion reach host-snapshot for real — reproduces the exact bug this fix closes"
+
+# ─ review-683-r2 P3-4: refusing on an unrelated binary change must not skip
+# the hold's own state-file bookkeeping — the bug: the binary check used to
+# run and `return` BEFORE the per-file hold loop and its state rewrite, so
+# an active hold's row (first_seen/last_alerted) never got written while a
+# binary change also sat pending, the same staleness class as P2-1 ───────
+new_fixture
+printf 'text\n' > "$G/bar.bin"
+git -C "$G" add bar.bin
+git -C "$G" commit -qm "add bar.bin" >/dev/null
+git -C "$G" push -q origin HEAD:main
+echo "$GHP_LINE" >> "$G/foo/container.json"
+printf '\x00\x01\x02binary' > "$G/bar.bin"
+run_safety
+[ "$RC" -ne 0 ] || bad "P3-4 setup: a new hold plus a binary change should refuse" "$OUT"
+case "$OUT" in
+  *"binary change"*) ok "P3-4: the run refuses for the unrelated binary change, as before" ;;
+  *) bad "P3-4: no binary-change refusal in the output" "$OUT" ;;
+esac
+STATE_FILE=$(held_state_file)
+grep -q "^foo/container\.json"$'\t' "$STATE_FILE" 2>/dev/null \
+  && ok "P3-4: the hold's state-file row was written even though the run also refused for the unrelated binary change" \
+  || bad "P3-4: no state-file row for the held path — bookkeeping was skipped" "$(cat "$STATE_FILE" 2>/dev/null)"
+
+# ─ review-683-r2 P3-5: a leading, trailing, or doubled TAB in an allowlist
+# line must be rejected as malformed — `IFS=$'\t' read` silently collapsed
+# all three, wrongly accepting them as well-formed ────────────────────────
+new_fixture
+echo "$GHP_LINE" >> "$G/foo/container.json"
+run_safety
+[ "$RC" -ne 0 ] || bad "P3-5 setup: the first run should have alerted" "$OUT"
+HASH=$(allow_hash "foo/container.json" "$GHP_LINE")
+printf '\tfoo/container.json\t%s\ttest allow\n' "$HASH" > "$G/.secret-scan-allow" # leading TAB
+git -C "$G" add .secret-scan-allow
+git -C "$G" commit -qm "malformed: leading TAB" >/dev/null
+run_safety
+CONTAINER_TIP=$(git --git-dir="$REMOTE" show host-snapshot:foo/container.json 2>/dev/null || echo "<no-entry>")
+case "$CONTAINER_TIP" in
+  *ghp_*) bad "P3-5: a leading-TAB allowlist line released the hold" "content=[$CONTAINER_TIP]" ;;
+  *) ok "P3-5: a leading-TAB allowlist line is rejected as malformed" ;;
+esac
+printf 'foo/container.json\t%s\ttest allow\t\n' "$HASH" > "$G/.secret-scan-allow" # trailing TAB
+git -C "$G" add .secret-scan-allow
+git -C "$G" commit -qm "malformed: trailing TAB" >/dev/null
+run_safety
+CONTAINER_TIP=$(git --git-dir="$REMOTE" show host-snapshot:foo/container.json 2>/dev/null || echo "<no-entry>")
+case "$CONTAINER_TIP" in
+  *ghp_*) bad "P3-5: a trailing-TAB allowlist line released the hold" "content=[$CONTAINER_TIP]" ;;
+  *) ok "P3-5: a trailing-TAB allowlist line is rejected as malformed" ;;
+esac
+printf 'foo/container.json\t\t%s\ttest allow\n' "$HASH" > "$G/.secret-scan-allow" # doubled TAB
+git -C "$G" add .secret-scan-allow
+git -C "$G" commit -qm "malformed: doubled TAB" >/dev/null
+run_safety
+CONTAINER_TIP=$(git --git-dir="$REMOTE" show host-snapshot:foo/container.json 2>/dev/null || echo "<no-entry>")
+case "$CONTAINER_TIP" in
+  *ghp_*) bad "P3-5: a doubled-TAB allowlist line released the hold" "content=[$CONTAINER_TIP]" ;;
+  *) ok "P3-5: a doubled-TAB allowlist line is rejected as malformed" ;;
+esac
+# Sanity: a genuinely well-formed line still releases the hold, so P3-5's
+# rejection isn't overbroad.
+printf 'foo/container.json\t%s\ttest allow\n' "$HASH" > "$G/.secret-scan-allow"
+git -C "$G" add .secret-scan-allow
+git -C "$G" commit -qm "well-formed allow" >/dev/null
+run_safety
+CONTAINER_TIP=$(git --git-dir="$REMOTE" show host-snapshot:foo/container.json 2>/dev/null || echo "<no-entry>")
+case "$CONTAINER_TIP" in
+  *ghp_*) ok "P3-5: a genuinely well-formed allowlist line still releases the hold" ;;
+  *) bad "P3-5: a well-formed line was wrongly rejected too" "content=[$CONTAINER_TIP]" ;;
+esac
+
+# ─ review-683-r2 P3-6: an alert naming a TAB/LF/CR-poisoned path renders it
+# via `printf %q`, so an embedded LF can't truncate/corrupt the displayed
+# alert line ────────────────────────────────────────────────────────────
+new_fixture
+printf 'placeholder\n' > "$G/"$'new\nline.md'
+git -C "$G" add -- $'new\nline.md'
+git -C "$G" commit -qm "add poisoned-name placeholder" >/dev/null
+git -C "$G" push -q origin HEAD:main
+printf 'placeholder\nordinary content, no secret at all\n' > "$G/"$'new\nline.md'
+run_safety
+case "$OUT" in
+  *'new\nline.md'*) ok "P3-6: the alert line %q-quotes an embedded-LF filename intact, on one line, instead of truncating it" ;;
+  *) bad "P3-6: no %q-quoted form of the poisoned filename in the alert output" "$OUT" ;;
+esac
+
+# ─ review-683-r2 P3-1: the pre-write-tree guard refuses on an unaccountable
+# scratch index, whatever put it in that state — both failure shapes ─────
+# Anchored on the GUARD's own opening text, not the `add -u` block: round
+# 3's own P2 fix (a catch-all reset for ANY staged deletion `add -u` left
+# behind, added right after `add -u`) would otherwise catch and quietly
+# resolve a fault injected there before the guard ever saw it — these
+# fixtures need the fault to land AFTER round 3's loop has already run, so
+# it reaches the guard exactly as an unaccountable anomaly should.
+GUARD_OLD=$(cat <<'OLDEOF'
+  if [ ! -f "$TMPIDX" ]; then
+    FAILURES+=("groups: the scratch index vanished before write-tree — refusing to commit from an unaccountable index")
+    GROUPS_RESULT="failed (missing scratch index)"; return
+  fi
+  if ! GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --no-ext-diff --no-textconv --diff-filter=D --quiet HEAD 2>>"$ERR"; then
+    FAILURES+=("groups: the scratch index has a staged deletion, which never happens by design — refusing to commit from an unaccountable index")
+    GROUPS_RESULT="failed (unexpected staged deletion)"; return
+  fi
+OLDEOF
+)
+new_fixture
+echo 'clean edit' >> "$G/foo/container.json"
+# A plain quoted literal, not $(...) — command substitution strips the
+# trailing newline, which would glue this comment line onto the very next
+# line (the guard's own `if`) and swallow it INTO the comment, breaking the
+# mutant's syntax (reproduced while building this fixture).
+TMPIDX_GONE_FAULT='  rm -f "$TMPIDX" # FAULT INJECTION (review-683-r2 P3-1 selfcheck): simulate the scratch index vanishing mid-run
+'
+MUTANT_GONE=$(make_mutant_git_safety "$GUARD_OLD" "${TMPIDX_GONE_FAULT}${GUARD_OLD}")
+run_script "$MUTANT_GONE"
+[ "$RC" -ne 0 ] && ok "P3-1: refuses when the scratch index vanished before write-tree" \
+  || bad "P3-1: did not refuse on a missing scratch index" "$OUT"
+case "$OUT" in
+  *"vanished before write-tree"*) ok "P3-1: names the missing-index reason" ;;
+  *) bad "P3-1: no missing-index diagnostic in the output" "$OUT" ;;
+esac
+git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1 \
+  && bad "P3-1: a host-snapshot branch was pushed despite the missing-index refusal" "" \
+  || ok "P3-1: nothing was pushed when the scratch index vanished"
+
+new_fixture
+echo 'clean edit' >> "$G/foo/container.json"
+# Same reasoning as TMPIDX_GONE_FAULT above: a plain literal, not $(...).
+STAGED_DEL_FAULT='  GIT_INDEX_FILE="$TMPIDX" git -C "$G" rm --cached -q -- foo/container.json 2>>"$ERR" # FAULT INJECTION (review-683-r2 P3-1 selfcheck): simulate an unaccountable staged deletion
+'
+MUTANT_STAGED_DEL=$(make_mutant_git_safety "$GUARD_OLD" "${STAGED_DEL_FAULT}${GUARD_OLD}")
+run_script "$MUTANT_STAGED_DEL"
+[ "$RC" -ne 0 ] && ok "P3-1: refuses when the scratch index has an unexpected staged deletion" \
+  || bad "P3-1: did not refuse on an unexpected staged deletion" "$OUT"
+case "$OUT" in
+  *"unexpected staged deletion"* | *"staged deletion, which never happens by design"*) ok "P3-1: names the staged-deletion reason" ;;
+  *) bad "P3-1: no staged-deletion diagnostic in the output" "$OUT" ;;
+esac
+git --git-dir="$REMOTE" rev-parse --verify -q host-snapshot >/dev/null 2>&1 \
+  && bad "P3-1: a host-snapshot branch was pushed despite the staged-deletion refusal" "" \
+  || ok "P3-1: nothing was pushed when the scratch index had an unexpected staged deletion"
+
+# ─ review-683-r2 P3-1 mutation evidence: same staged-deletion fault as
+# above (anchored the same way, after round 3's own catch-all loop), but
+# with the guard ALSO removed — without it, write-tree proceeds on the
+# unaccountable index and a wrong tree (missing foo/container.json)
+# actually gets pushed to host-snapshot ────────────────────────────────
+GUARD_NEW=$(cat <<'NEWEOF'
+  : # MUTATED (review-683-r2 P3-1): pre-write-tree guard removed entirely
+NEWEOF
+)
+DST_DIR=$(mktemp -d)
+FIXTURE_DIRS+=("$DST_DIR")
+mkdir -p "$DST_DIR/lib"
+ln -s "$(dirname "$REAL")/lib/secret-scan.sh" "$DST_DIR/lib/secret-scan.sh"
+OLDSTR1="$GUARD_OLD" NEWSTR1="${STAGED_DEL_FAULT}${GUARD_OLD}" OLDSTR2="$GUARD_OLD" NEWSTR2="$GUARD_NEW" \
+  SRC="$REAL" DST="$DST_DIR/git-safety.sh" python3 -c "
+import os
+src = open(os.environ['SRC']).read()
+o1, n1 = os.environ['OLDSTR1'], os.environ['NEWSTR1']
+o2, n2 = os.environ['OLDSTR2'], os.environ['NEWSTR2']
+assert o1 in src, 'P3-1 fault-injection target text not found — source has drifted from this fixture'
+# Sequential, not independent: the fault (o1/n1) is the guard text ITSELF
+# with the fault line prepended, so injecting it first leaves exactly one
+# copy of the guard text (o2) in the result, embedded at the tail of n1 —
+# the second replace then strips the guard from THAT copy.
+src = src.replace(o1, n1, 1)
+assert o2 in src, 'P3-1 guard text not found in the fault-injected copy — fixture drifted'
+src = src.replace(o2, n2, 1)
+open(os.environ['DST'], 'w').write(src)
+"
+chmod +x "$DST_DIR/git-safety.sh"
+MUTANT_NOGUARD="$DST_DIR/git-safety.sh"
+new_fixture
+echo 'clean edit' >> "$G/foo/container.json"
+run_script "$MUTANT_NOGUARD"
+git --git-dir="$REMOTE" cat-file -e host-snapshot:foo/container.json 2>&1 \
+  && bad "P3-1 mutation evidence: mutant unexpectedly still kept foo/container.json's entry (fixture doesn't isolate the guard)" "" \
+  || ok "P3-1 mutation evidence: without the guard, the unaccountable staged-deletion fault ships a wrong tree (foo/container.json missing from host-snapshot) — reproduces exactly what the guard closes"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# review-683-r2, round 3 on #628 item 9 (CHANGES on one P2, groups#15
+# APPROVED): a file or symlink replaced by a directory slips past
+# `ls-files --deleted` (which only catches genuinely-absent paths) and was
+# staged as a deletion by `add -u` anyway — before this fix, that unaccounted
+# deletion then hit round 2's own P3-1 guard, which correctly refuses ANY
+# unexpected staged deletion, so the WHOLE snapshot refused every night,
+# forever — exactly the all-or-nothing failure #628 item 9 exists to remove.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ─ round 3 P2a: a tracked file replaced by a directory is reset back to HEAD
+# and reported like any other deletion; an unrelated pending edit still
+# commits, and the run doesn't refuse ─────────────────────────────────────
+new_fixture
+mkdir -p "$G/bar"
+echo placeholder > "$G/bar/types.ts"
+git -C "$G" add bar/types.ts
+git -C "$G" commit -qm "add bar/types.ts" >/dev/null
+git -C "$G" push -q origin HEAD:main
+echo 'unrelated clean edit' >> "$G/bar/types.ts"
+rm -f "$G/foo/container.json"
+mkdir "$G/foo/container.json"
+echo 'oops' > "$G/foo/container.json/inner.txt"
+run_safety
+[ "$RC" -eq 0 ] || bad "round 3 P2a: a file-replaced-by-a-directory should not refuse the whole run" "$OUT"
+CONTAINER_TIP=$(git --git-dir="$REMOTE" show host-snapshot:foo/container.json 2>/dev/null)
+[ "$CONTAINER_TIP" = '{"a":1}' ] \
+  && ok "round 3 P2a: foo/container.json stays at HEAD's content in the snapshot, not deleted and not the directory" \
+  || bad "round 3 P2a: unexpected snapshot content for the file-replaced-by-a-directory path" "content=[$CONTAINER_TIP]"
+TYPES_TIP=$(git --git-dir="$REMOTE" show host-snapshot:bar/types.ts 2>/dev/null)
+case "$TYPES_TIP" in
+  *"unrelated clean edit"*) ok "round 3 P2a: the unrelated pending edit still committed" ;;
+  *) bad "round 3 P2a: the unrelated pending edit did not commit" "content=[$TYPES_TIP]" ;;
+esac
+[ -d "$G/foo/container.json" ] \
+  && ok "round 3 P2a: the working tree still has the real directory — nothing on disk was touched" \
+  || bad "round 3 P2a: the working-tree directory was removed" ""
+
+# ─ round 3 P2b: same, for a tracked symlink replaced by a real directory ──
+new_fixture
+mkdir -p "$G/foo"
+echo '{"a":1}' > "$G/foo/target.txt"
+ln -s target.txt "$G/foo/lnk"
+mkdir -p "$G/bar"
+echo placeholder > "$G/bar/types.ts"
+git -C "$G" add foo/target.txt foo/lnk bar/types.ts
+git -C "$G" commit -qm "add foo/lnk symlink and bar/types.ts" >/dev/null
+git -C "$G" push -q origin HEAD:main
+echo 'unrelated clean edit' >> "$G/bar/types.ts"
+rm -f "$G/foo/lnk"
+mkdir "$G/foo/lnk"
+echo 'oops' > "$G/foo/lnk/inner.txt"
+run_safety
+[ "$RC" -eq 0 ] || bad "round 3 P2b: a symlink-replaced-by-a-directory should not refuse the whole run" "$OUT"
+LNK_MODE=$(git --git-dir="$REMOTE" ls-tree host-snapshot foo/lnk 2>/dev/null | awk '{print $1}')
+[ "$LNK_MODE" = "120000" ] \
+  && ok "round 3 P2b: foo/lnk stays a symlink in the snapshot, not deleted and not the directory" \
+  || bad "round 3 P2b: unexpected snapshot mode for the symlink-replaced-by-a-directory path" "mode=[$LNK_MODE]"
+TYPES_TIP=$(git --git-dir="$REMOTE" show host-snapshot:bar/types.ts 2>/dev/null)
+case "$TYPES_TIP" in
+  *"unrelated clean edit"*) ok "round 3 P2b: the unrelated pending edit still committed" ;;
+  *) bad "round 3 P2b: the unrelated pending edit did not commit" "content=[$TYPES_TIP]" ;;
+esac
+
+# ─ round 3 P2 mutation evidence: without the post-add-u reset-and-report
+# step, the file-replaced-by-a-directory case reproduces the exact bug —
+# round 2's own P3-1 guard (left intact in this mutant) then refuses the
+# WHOLE run, permanently, instead of holding back just the one path ───────
+P2_R3_OLD=$(cat <<'OLDEOF'
+  local f
+  while IFS= read -r -d '' f; do
+    [ -n "$f" ] || continue
+    if ! GIT_INDEX_FILE="$TMPIDX" git -C "$G" reset -q HEAD -- ":(literal)$f" 2>>"$ERR"; then
+      FAILURES+=("groups: could not reset an unexpected staged deletion back to HEAD in the scratch index: $(printf '%q' "$f") — refused to commit any pending change")
+      GROUPS_RESULT="failed (deletion reset)"; return
+    fi
+    deleted+=("$f")
+  done < <(GIT_INDEX_FILE="$TMPIDX" git -C "$G" diff --cached --diff-filter=D --name-only -z --no-ext-diff --no-textconv HEAD 2>>"$ERR")
+OLDEOF
+)
+MUTANT=$(make_mutant_git_safety "$P2_R3_OLD" "")
+new_fixture
+mkdir -p "$G/bar"
+echo placeholder > "$G/bar/types.ts"
+git -C "$G" add bar/types.ts
+git -C "$G" commit -qm "add bar/types.ts" >/dev/null
+git -C "$G" push -q origin HEAD:main
+echo 'unrelated clean edit' >> "$G/bar/types.ts"
+rm -f "$G/foo/container.json"
+mkdir "$G/foo/container.json"
+echo 'oops' > "$G/foo/container.json/inner.txt"
+run_script "$MUTANT"
+if [ "$RC" -ne 0 ]; then
+  case "$OUT" in
+    *"unaccountable index"*) ok "round 3 P2 mutation evidence: without the reset-and-report step, a file-replaced-by-a-directory now hits round 2's P3-1 guard and refuses the WHOLE run, every time — reproduces the exact all-or-nothing bug this fix closes" ;;
+    *) bad "round 3 P2 mutation evidence: mutant refused for an unexpected reason" "$OUT" ;;
+  esac
+else
+  bad "round 3 P2 mutation evidence: mutant unexpectedly still succeeded (fixture doesn't isolate the regression)" "$OUT"
+fi
+
+# ─ round 3 P3: a TAB/LF/CR-poisoned deleted path's notice is %q-quoted, not
+# raw — an embedded LF would otherwise truncate/corrupt the DM line ───────
+new_fixture
+mkdir -p "$G/bar"
+echo placeholder > "$G/bar/types.ts"
+printf 'placeholder\n' > "$G/"$'del\nname.md'
+git -C "$G" add bar/types.ts -- $'del\nname.md'
+git -C "$G" commit -qm "add bar/types.ts and poisoned deletable placeholder" >/dev/null
+git -C "$G" push -q origin HEAD:main
+echo 'unrelated clean edit' >> "$G/bar/types.ts"
+rm -f "$G/"$'del\nname.md'
+run_safety
+[ "$RC" -eq 0 ] || bad "round 3 P3 setup: an ordinary (non-held) deletion should not refuse the run" "$OUT"
+# The deletion notice goes out via the DM (unit-alert-dm style stub, same as
+# every other NOTICES check in this file — see e.g. the deletion-only-run
+# case above) — `say()` writes to the manifest, not stdout/stderr, so $OUT
+# itself never carries it.
+case "$(cat "$DM_LOG" 2>/dev/null)" in
+  *'del\nname.md'*) ok "round 3 P3: the deletion notice %q-quotes an embedded-LF filename intact, on one line" ;;
+  *) bad "round 3 P3: no %q-quoted form of the poisoned deleted filename in the DM" "$(cat "$DM_LOG" 2>/dev/null)" ;;
+esac
+
 [ "$FAILED" -eq 0 ] && echo "git-safety-selfcheck: all checks passed" || echo "git-safety-selfcheck: FAILURES"
 exit "$FAILED"
