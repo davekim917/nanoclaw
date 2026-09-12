@@ -376,6 +376,45 @@ if [ "$PHASE" = "disposition" ]; then
   exit 0
 fi
 
+# PAIR RE-FREEZE. `smoke-pair-identity.sh refreeze` re-baselines the deployed
+# pair once per run and snapshots the contract's lane generations into
+# coordinator/identity.json. A lane dispatched before it gathered evidence
+# against the OLD pair, yet its marker is still sourceSha-correct and at the
+# contract's current generation, so every check below would pass it. It stops
+# counting only once `smoke-run-scaffold.sh redispatch` moves its generation
+# past the snapshot. `smoke-pair-identity.sh finish` refuses on the same rule;
+# reading it here too means skipping `finish` does not skip it. The rule lives
+# in refreeze-lanes.jq, shared by both. A run with no identity.json never used
+# pair identity and is unaffected; an unreadable one fails closed.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+IDENTITY_REL="coordinator/identity.json"
+REFREEZE_STALE=()
+if [ -e "$RUN_DIR/$IDENTITY_REL" ]; then
+  refreeze_result="$(jq -cs -L "$SCRIPT_DIR" --slurpfile c "$CONTRACT" '
+    include "refreeze-lanes";
+    if length != 1 then {error: "identity.json is not exactly one JSON document"}
+    else .[0] | rl_stale_after_refreeze(if ($c | length) == 1 then $c[0] else "unparsable" end) end
+  ' "$RUN_DIR/$IDENTITY_REL" 2>/dev/null)" ||
+    refreeze_result='{"error":"identity.json is not valid JSON"}'
+  refreeze_error="$(jq -r '.error // empty' <<<"$refreeze_result")"
+  if [ -n "$refreeze_error" ]; then
+    INVALID+=("$IDENTITY_REL")
+    INVALID_REASONS+=("$IDENTITY_REL: $refreeze_error")
+  else
+    while IFS= read -r stale_lane; do
+      [ -n "$stale_lane" ] && REFREEZE_STALE+=("$stale_lane")
+    done < <(jq -r '.stale[]' <<<"$refreeze_result")
+  fi
+fi
+
+lane_stale_after_refreeze() {
+  local want="$1" lane
+  for lane in ${REFREEZE_STALE[@]+"${REFREEZE_STALE[@]}"}; do
+    [ "$lane" = "$want" ] && return 0
+  done
+  return 1
+}
+
 while IFS= read -r marker; do
   case "$marker" in
     /*|../*|*/../*|*/..)
@@ -385,17 +424,26 @@ while IFS= read -r marker; do
       ;;
   esac
 
+  # Lane id from the marker's own filename (the `markers/<ID>.json` convention
+  # every real contract in this fleet already uses) — not from the marker's
+  # `.lane` field, which is exactly the field a stale/mislabeled marker could
+  # get wrong. expected_generation reads the CURRENT contract, not the marker.
+  lane_id="$(basename "$marker" .json)"
+
+  # Before the missing check: a lane still in flight on the old pair has no
+  # marker yet, and the reason to give is the redispatch, not "still running".
+  if lane_stale_after_refreeze "$lane_id"; then
+    INVALID+=("$marker")
+    INVALID_REASONS+=("$marker: not redispatched since the pair re-freeze (contract generation $(expected_generation "$lane_id") is not above the refreeze snapshot) — its evidence predates the current pair; run smoke-run-scaffold.sh redispatch $lane_id, then re-run the lane")
+    continue
+  fi
+
   marker_path="$RUN_DIR/$marker"
   if [ ! -s "$marker_path" ]; then
     MISSING+=("$marker")
     continue
   fi
 
-  # Lane id from the marker's own filename (the `markers/<ID>.json` convention
-  # every real contract in this fleet already uses) — not from the marker's
-  # `.lane` field, which is exactly the field a stale/mislabeled marker could
-  # get wrong. expected_generation reads the CURRENT contract, not the marker.
-  lane_id="$(basename "$marker" .json)"
   expected_gen="$(expected_generation "$lane_id")"
 
   marker_valid=true

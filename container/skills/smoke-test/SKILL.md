@@ -119,6 +119,10 @@ renews it during a long run and `task-release <run-id>` drops it when the run
 ends; `--takeover` on `task-claim` may reassign a live lease to a new owner,
 same as a PR claim, but the deploy SHA itself binds **permanently** at claim
 and has no takeover escape — a different build always gets a different run id.
+A finished run id is terminal: once `task-finish` has recorded a verdict,
+`task-claim` refuses that id for every build, the claimed one included. The
+one re-claim it still accepts is on the verdict's own SHA after a
+`task-finish` died before committing, so that finish can resume.
 `task-finish <run-id> <deploy-sha> <verdict>` is the terminal step: only the
 run's current lease owner may call it, only for the SHA it claimed, and it
 writes the run's write-once verdict and releases the lease in the same
@@ -389,19 +393,35 @@ and bumps an internal `freezeGeneration`. Every `check`/`finish` receipt from
 before the re-freeze stays on disk as an honest record that the drift
 happened, but `finish` only looks at receipts recorded at the run's CURRENT
 freeze generation — a stale-generation receipt neither blocks nor clears
-publication, the same way `smoke-run-scaffold.sh`'s lane generations already
-work (see "Re-running a lane" above; this reuses that mechanism rather than
-inventing a parallel one). Concretely, after a `refreeze`:
+publication.
 
-1. every lane already dispatched against the OLD pair has evidence that
-   predates the run's current identity — `redispatch` it before trusting
-   anything it reports from here on: `smoke-run-scaffold.sh redispatch
-   <run-dir> <lane-id>` for each such lane, then re-brief and re-run it;
+**A re-freeze does not make old lane evidence current: every lane must be
+redispatched after it, and `finish` refuses until each one is.** `refreeze`
+snapshots the completion contract's lane generations into `identity.json`
+(`refreezeLaneSnapshot`) — the same `generation` field `smoke-run-scaffold.sh`
+uses for a re-run lane (see "Re-running a lane" above). `finish`, and
+`smoke-evidence-barrier.sh`'s `lanes` and `synthesis` phases, then refuse
+while any required lane's contract generation is still at or below its
+snapshot, and name those lanes. Only `redispatch` (or `contract
+--regenerate`, which retires every lane at once) moves a generation, so the
+coordinator's own post-re-freeze `check` cannot stand in for the lanes.
+Concretely, after a `refreeze`:
+
+1. `redispatch` every lane the contract declares — including one not started
+   yet, since nothing on disk tells an in-flight lane from an unstarted one:
+   `smoke-run-scaffold.sh redispatch <run-dir> <lane-id>` for each, then
+   re-brief and re-run it (bump before re-briefing, as above);
 2. each redispatched lane calls `check <run-dir> <label>` again at its new
-   start/end, so a receipt exists at the CURRENT generation — `finish` refuses
-   (exit 2) until at least one does;
+   start/end — `finish` refuses (exit 2) while any lane is still not
+   redispatched, and while no receipt exists at the CURRENT generation;
 3. a second drift after the one allowed re-freeze finishes the run BLOCKED,
    exactly like an unhandled first drift would.
+
+A `refreeze` before the contract exists snapshots no lanes, because none was
+dispatched yet. One with lane markers on disk but no contract is refused. A
+contract re-scaffolded on a different `sourceSha` after the re-freeze
+satisfies the snapshot, because the barrier's sourceSha check already refuses
+every marker written before it.
 
 A scheduled run arrives with the head already proven settled by the gate. A
 campaign someone asked for in chat does not, and must prove it before freezing
@@ -1811,7 +1831,9 @@ gate's `check`), `claim <run-id> <pr> <sha> [owner-token]`,
 PR's state currently holds that run id. That resolution is only unambiguous
 if run ids are unique across the whole gate, not just within one PR, so
 `claim` enforces it: it refuses a run id that is already active on a
-*different* PR, so a caller-chosen id (from `claim`) is always safe to pass
+*different* PR or on an active task-scoped run, and `task-claim` refuses one
+any PR or develop campaign holds — both under the gate's control lock — so a
+caller-chosen id (from `claim`) is always safe to pass
 to `progress`/`release`/`finish` exactly like a gate-generated one.
 
 `poll` claims the shared coordinator lease before it emits
@@ -1940,7 +1962,10 @@ failing, the bundle naming zero or 2+ candidates) is a REFUSAL: no id/url is
 selected, `fetchOk` goes false so the stall alarms as `pr_facts_unavailable`
 rather than retrying forever in silence, and `previewAmbiguityReason` names
 every colliding service. There is no oracle for a frontend-side duplicate —
-2+ frontend candidates is always a refusal. The exact same resolution runs at
+2+ frontend candidates is always a refusal: no frontend id/url is selected and
+`previewAmbiguous`/`previewAmbiguityReason` record it on every PR, but only a
+PR that requires the frontend is held by it (`fetchOk:false`); a backend-only
+PR still settles on its backend. The exact same resolution runs at
 the mutating `finish`/suspend call site, so a wrong-twin pick can never POST
 `.../suspend` against a service nobody chose; on ambiguity there, `finish`
 attempts no suspend, records the reason in the verdict receipt, and still

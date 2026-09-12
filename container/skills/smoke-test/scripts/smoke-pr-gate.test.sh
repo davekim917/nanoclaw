@@ -1788,6 +1788,52 @@ jq -e '
   .backendSelectionMethod == "single" and .settled == true and .fetchOk == true
 ' <<<"$E_CHECK" >/dev/null || { echo "36: backend-only PR did not record the frontend evidence gap: $E_CHECK" >&2; exit 1; }
 
+# --- 36b. #725: frontend ambiguity is RECORDED whether or not the frontend is
+# required. A backend-only PR with two same-named frontend twins used to report
+# previewAmbiguous:false and a null reason — the same facts as "the frontend
+# preview is not created yet". It still settles on its backend (a frontend
+# duplicate it never needed resolved does not hold it), but the refusal is
+# stated and names both twins. The same twins on a PR that DOES require the
+# frontend still block it, with fetchOk false.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+F_SHA="$(sha 6)"
+# The one fixture path that must match the gate's hardcoded frontend prefix is
+# built from the gate's own FRONTEND_PREFIX constant rather than restated here.
+F_FRONTEND_PREFIX="$(sed -n 's/^FRONTEND_PREFIX="\(.*\)"$/\1/p' "$GATE")"
+[ -n "$F_FRONTEND_PREFIX" ] || { echo "36b: could not read FRONTEND_PREFIX from the gate" >&2; exit 1; }
+export STUB_PR_VIEW="{\"number\":84,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$F_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"backend/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$F_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[\
+{\"id\":\"srv-frontend-pr-84-a\",\"name\":\"preview-frontend PR #84\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://preview-frontend-pr-84-a.onrender.com\"}},\
+{\"id\":\"srv-frontend-pr-84-b\",\"name\":\"preview-frontend PR #84\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://preview-frontend-pr-84-b.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-84\",\"name\":\"preview-backend PR #84\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://preview-backend-pr-84.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$F_SHA\"}}]"
+export STUB_FRONTEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$F_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+F_ERR="$STATE_DIR/f-check-stderr.txt"
+F_CHECK="$(bash "$GATE" check 84 2>"$F_ERR")"
+jq -e '
+  .frontendRequired == false and .frontendSelectionMethod == "ambiguous" and
+  .previewAmbiguous == true and
+  (.previewAmbiguityReason | test("frontend preview for PR #84")) and
+  (.previewAmbiguityReason | test("srv-frontend-pr-84-a")) and
+  (.previewAmbiguityReason | test("srv-frontend-pr-84-b")) and
+  .frontendPreviewId == null and .frontendPreviewUrl == null and .frontendEvidenceGap == true and
+  .backendSelectionMethod == "single" and .backendReady == true and
+  .settled == true and .fetchOk == true
+' <<<"$F_CHECK" >/dev/null || { echo "36b: backend-only PR did not record its frontend twins as ambiguous: $F_CHECK" >&2; exit 1; }
+grep -qF 'srv-frontend-pr-84-b' "$F_ERR" || { echo "36b: frontend ambiguity was not reported on stderr" >&2; cat "$F_ERR" >&2; exit 1; }
+export STUB_PR_FILES="[{\"filename\":\"backend/src/foo.ts\"},{\"filename\":\"${F_FRONTEND_PREFIX}src/app.tsx\"}]"
+F_REQ_CHECK="$(bash "$GATE" check 84 2>/dev/null)"
+jq -e '
+  .frontendRequired == true and .previewAmbiguous == true and
+  (.previewAmbiguityReason | test("srv-frontend-pr-84-a")) and
+  .frontendReady == false and .settled == false and .fetchOk == false
+' <<<"$F_REQ_CHECK" >/dev/null || { echo "36b: a frontend-required PR with frontend twins was not held: $F_REQ_CHECK" >&2; exit 1; }
+
 # --- 37. THE mutating site: `finish` refuses to suspend an ambiguous backend
 # (same bundle-oracle resolution as evaluate_pr, applied at the suspend call
 # site). No suspend POST is issued at all, the reason is written into the
@@ -2465,5 +2511,165 @@ jq -e --arg sha "$FIN_SHA" '.sha == $sha and .verdict == "GO"' "$STATE_DIR/runs/
 # A run that was never claimed (or already finished and released) is refused
 # as not-active, not silently treated as a fresh success.
 bash "$GATE" task-finish run-fin-never "$FIN_SHA" GO | jq -e '.ok == false' >/dev/null
+
+# --- #726 F1: a failed task-claim slot write puts back the lease it found ----
+# The cleanup used to delete the shared task lease unconditionally — on a
+# same-owner re-claim of a LIVE lease that destroyed a running coordinator's
+# ownership record, and task-progress then refused it. `claim` and
+# `task-release` both restore the prior lease; task-claim now does too.
+fresh_state
+F1_SHA="$(sha 7)"
+bash "$GATE" task-claim run-f1 "$F1_SHA" owner-a | jq -e '.ok == true' >/dev/null
+F1_BEFORE="$(cat "$SMOKE_GATE_LEASE_DIR/task-lease-run-f1.json")"
+chmod 555 "$STATE_DIR"
+F1_OUT="$(bash "$GATE" task-claim run-f1 "$F1_SHA" owner-a 2>/dev/null || true)"
+chmod 700 "$STATE_DIR"   # restore before asserting, so a failure still cleans up
+jq -e '.ok == false and (.error | test("private task slot")) and (.error | test("could not be") | not)' \
+  <<<"$F1_OUT" >/dev/null || { echo "F1: expected a clean slot-write refusal, got: $F1_OUT" >&2; exit 1; }
+[ "$(cat "$SMOKE_GATE_LEASE_DIR/task-lease-run-f1.json" 2>/dev/null)" = "$F1_BEFORE" ] ||
+  { echo "F1: a failed same-owner re-claim did not leave the live lease exactly as it was" >&2; exit 1; }
+jq -e '.owner == "owner-a"' "$SMOKE_GATE_LEASE_DIR/task-lease-run-f1.json" >/dev/null
+bash "$GATE" task-progress run-f1 owner-a | jq -e '.ok == true' >/dev/null ||
+  { echo "F1: the surviving owner could not progress after the failed re-claim" >&2; exit 1; }
+# A failed --takeover gives the lease back to the owner it tried to displace.
+F1_BEFORE="$(cat "$SMOKE_GATE_LEASE_DIR/task-lease-run-f1.json")"
+chmod 555 "$STATE_DIR"
+F1_TK_OUT="$(bash "$GATE" task-claim run-f1 "$F1_SHA" owner-b --takeover 2>/dev/null || true)"
+chmod 700 "$STATE_DIR"
+jq -e '.ok == false and (.error | test("private task slot"))' <<<"$F1_TK_OUT" >/dev/null ||
+  { echo "F1: expected the takeover's slot write to fail, got: $F1_TK_OUT" >&2; exit 1; }
+[ "$(cat "$SMOKE_GATE_LEASE_DIR/task-lease-run-f1.json" 2>/dev/null)" = "$F1_BEFORE" ] ||
+  { echo "F1: a failed takeover left the lease with the displacing owner" >&2; exit 1; }
+jq -e '.activeLeaseOwner == "owner-a"' "$STATE_DIR/task-run-f1-state.json" >/dev/null
+# Only a lease the failed claim created from nothing is removed.
+chmod 555 "$STATE_DIR"
+F1_NEW_OUT="$(bash "$GATE" task-claim run-f1-new "$F1_SHA" 2>/dev/null || true)"
+chmod 700 "$STATE_DIR"
+jq -e '.ok == false and (.error | test("private task slot"))' <<<"$F1_NEW_OUT" >/dev/null
+[ ! -e "$SMOKE_GATE_LEASE_DIR/task-lease-run-f1-new.json" ] ||
+  { echo "F1: a failed first claim left an orphan task lease behind" >&2; exit 1; }
+
+# --- #726 F1/F2: task-claim holds the shared task lease lock AND the gate
+# control lock from lease acquisition through its private slot write. A
+# PATH-local mktemp probe records, from a separate process, whether each lock
+# is held at the instant the slot's temp file is created; it then runs the real
+# mktemp. Releasing the lease lock before the slot write let two concurrent
+# --takeover claims leave the lease owned by B and the slot naming A.
+PROBE_BIN="$STUB_BIN/task-slot-probe"
+mkdir -p "$PROBE_BIN"
+cat > "$PROBE_BIN/mktemp" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  */.task-*-state.*)
+    t=held; c=held
+    ( flock -n 3 ) 3>"$PROBE_TASK_LOCK" && t=free
+    ( flock -n 3 ) 3>"$PROBE_CONTROL_LOCK" && c=free
+    printf 'task=%s control=%s\n' "$t" "$c" >> "$PROBE_OUT" ;;
+esac
+exec "$REAL_MKTEMP" "$@"
+STUB
+chmod +x "$PROBE_BIN/mktemp"
+PROBE_OUT="$STATE_DIR/slot-probe.txt" \
+PROBE_TASK_LOCK="$SMOKE_GATE_LEASE_DIR/task-lease-run-f1-probe.lock" \
+PROBE_CONTROL_LOCK="$STATE_DIR/control.lock" \
+REAL_MKTEMP="$(command -v mktemp)" PATH="$PROBE_BIN:$PATH" \
+  bash "$GATE" task-claim run-f1-probe "$F1_SHA" | jq -e '.ok == true' >/dev/null
+[ "$(cat "$STATE_DIR/slot-probe.txt" 2>/dev/null)" = "task=held control=held" ] || {
+  echo "F1/F2: task-claim did not hold both locks through its slot write: $(cat "$STATE_DIR/slot-probe.txt" 2>/dev/null)" >&2; exit 1; }
+
+# --- #726 F2: run-id uniqueness holds in BOTH directions ---------------------
+# `task-claim` refused a run id a PR campaign held, but `claim` never looked at
+# task-*-state.json: `task-claim run-b` then `claim run-b 5` returned ok:true,
+# leaving two active slots that wedge both runs in begin_active_run_fence.
+fresh_state
+F2_SHA="$(sha 8)"
+bash "$GATE" task-claim run-f2 "$F2_SHA" | jq -e '.ok == true' >/dev/null
+F2_OUT="$(bash "$GATE" claim run-f2 5 "$F2_SHA")"
+jq -e '.ok == false and .pr == 5 and (.error | test("task-scoped")) and (.error | test("unique"))' \
+  <<<"$F2_OUT" >/dev/null || { echo "F2: claim took a run id an active task run holds: $F2_OUT" >&2; exit 1; }
+[ ! -e "$STATE_DIR/pr-5-state.json" ] &&
+  [ ! -e "$SMOKE_GATE_LEASE_DIR/lease-run-f2.json" ] &&
+  [ ! -e "$SMOKE_GATE_LEASE_DIR/pr-5-authority.json" ] ||
+  { echo "F2: the refused PR claim still wrote a slot, lease or authority" >&2; exit 1; }
+bash "$GATE" task-progress run-f2 | jq -e '.ok == true' >/dev/null
+# The other direction: a run id a PR campaign holds cannot become a task run.
+bash "$GATE" claim run-f2-pr 6 "$F2_SHA" | jq -e '.ok == true' >/dev/null
+bash "$GATE" task-claim run-f2-pr "$F2_SHA" | jq -e '.ok == false and (.error | test("PR campaign"))' >/dev/null ||
+  { echo "F2: task-claim took a run id a PR campaign holds" >&2; exit 1; }
+[ ! -e "$STATE_DIR/task-run-f2-pr-state.json" ] && [ ! -e "$SMOKE_GATE_LEASE_DIR/task-lease-run-f2-pr.json" ] ||
+  { echo "F2: the refused task-claim still wrote a slot or lease" >&2; exit 1; }
+bash "$GATE" progress run-f2-pr | jq -e '.ok == true and .pr == 6' >/dev/null
+# A task state that exists but cannot be read fails the PR claim closed.
+printf 'not json' > "$STATE_DIR/task-run-f2-bad-state.json"
+bash "$GATE" claim run-f2-bad 7 "$F2_SHA" | jq -e '.ok == false and (.error | test("cannot be read"))' >/dev/null ||
+  { echo "F2: claim read an unparseable task state as no task run" >&2; exit 1; }
+[ ! -e "$STATE_DIR/pr-7-state.json" ]
+# task-claim's scan runs under CONTROL_LOCK, the lock `claim` scans under, and
+# fails closed (retryable) when it cannot get it — never the best-effort form.
+F2_HELD="$STATE_DIR/control-held"
+( flock -x 7; : > "$F2_HELD"; sleep 3 ) 7>"$STATE_DIR/control.lock" &
+F2_BLOCKER=$!
+for _ in $(seq 100); do [ -e "$F2_HELD" ] && break; sleep 0.05; done
+[ -e "$F2_HELD" ] || { echo "F2: the control-lock holder never signalled that it held the lock" >&2; exit 1; }
+F2_BUSY_OUT="$(SMOKE_GATE_LOCK_WAIT_SECONDS=1 bash "$GATE" task-claim run-f2-busy "$F2_SHA")"
+wait "$F2_BLOCKER"
+jq -e '.ok == false and .retryable == true and (.error | startswith("gate_lock_busy:"))' <<<"$F2_BUSY_OUT" >/dev/null ||
+  { echo "F2: task-claim did not wait on the control lock: $F2_BUSY_OUT" >&2; exit 1; }
+[ ! -e "$STATE_DIR/task-run-f2-busy-state.json" ] && [ ! -e "$SMOKE_GATE_LEASE_DIR/task-lease-run-f2-busy.json" ] ||
+  { echo "F2: task-claim wrote a slot or lease without the control lock" >&2; exit 1; }
+
+# --- #726 F3: a finished task run id is terminal ------------------------------
+# task-finish removes the lease, the only record of the deploy-SHA binding, so
+# `task-claim run-c <sha7>`, `task-finish GO`, `task-claim run-c <sha8>` used to
+# return ok:true, null the completed fields, and leave task-finish <sha8>
+# permanently reconciliation_required.
+fresh_state
+F3_SHA7="$(sha 7)"
+F3_SHA8="$(sha 8)"
+bash "$GATE" task-claim run-c "$F3_SHA7" | jq -e '.ok == true' >/dev/null
+bash "$GATE" task-finish run-c "$F3_SHA7" GO | jq -e '.ok == true' >/dev/null
+F3_STATE_BEFORE="$(cat "$STATE_DIR/task-run-c-state.json")"
+F3_VERDICT_BEFORE="$(cat "$STATE_DIR/runs/run-c/verdict.json")"
+F3_OUT="$(bash "$GATE" task-claim run-c "$F3_SHA8" || true)"
+jq -e '.ok == false and .finished == true and (.error | test("already finished")) and
+       (.error | test("start a new run id")) and .recordedVerdict.verdict == "GO"' \
+  <<<"$F3_OUT" >/dev/null || { echo "F3: a finished task run was re-claimed on another build: $F3_OUT" >&2; exit 1; }
+# The same build, even with --takeover, is no different: the run is over.
+bash "$GATE" task-claim run-c "$F3_SHA7" --takeover | jq -e '.ok == false and .finished == true' >/dev/null ||
+  { echo "F3: a finished task run was re-claimed on its own build" >&2; exit 1; }
+[ "$(cat "$STATE_DIR/task-run-c-state.json")" = "$F3_STATE_BEFORE" ] &&
+  [ "$(cat "$STATE_DIR/runs/run-c/verdict.json")" = "$F3_VERDICT_BEFORE" ] &&
+  [ ! -e "$SMOKE_GATE_LEASE_DIR/task-lease-run-c.json" ] ||
+  { echo "F3: a refused re-claim rewrote the terminal record or revived a lease" >&2; exit 1; }
+jq -e '.completedRunId == "run-c" and .completedVerdict == "GO" and .completedAt != null' \
+  "$STATE_DIR/task-run-c-state.json" >/dev/null
+bash "$GATE" task-finish run-c "$F3_SHA7" GO | jq -e '.ok == true and .idempotent == true' >/dev/null
+# The one verdict-bearing run that stays re-claimable, and only on its own
+# build: a task-finish that died after its verdict write and lease removal but
+# before its state commit. The run is then active with no lease, so task-finish
+# cannot resume it until the owner re-claims on that SHA (the recovery
+# task_lease_fence_begin's refusal names); refusing that too would strand it.
+# The state commit is failed for real (read-only state dir, run dir already
+# present); the lease removal it rolled back is then redone by hand.
+bash "$GATE" task-claim run-r "$F3_SHA7" | jq -e '.ok == true' >/dev/null
+mkdir -p "$STATE_DIR/runs/run-r"
+chmod 555 "$STATE_DIR"
+F3_R_OUT="$(bash "$GATE" task-finish run-r "$F3_SHA7" GO 2>/dev/null || true)"
+chmod 700 "$STATE_DIR"
+jq -e '.ok == false and (.error | test("terminal task state"))' <<<"$F3_R_OUT" >/dev/null ||
+  { echo "F3: expected task-finish's state commit to fail, got: $F3_R_OUT" >&2; exit 1; }
+F3_R_VERDICT="$(cat "$STATE_DIR/runs/run-r/verdict.json")"
+jq -e '.activeRunId == "run-r" and .completedRunId == null' "$STATE_DIR/task-run-r-state.json" >/dev/null
+rm -f "$SMOKE_GATE_LEASE_DIR/task-lease-run-r.json"
+bash "$GATE" task-finish run-r "$F3_SHA7" GO | jq -e '.ok == false' >/dev/null
+F3_R_OTHER="$(bash "$GATE" task-claim run-r "$F3_SHA8" || true)"
+jq -e '.ok == false and .finished == false and (.error | test("different build"))' <<<"$F3_R_OTHER" >/dev/null ||
+  { echo "F3: a half-finished run was re-claimed on another build: $F3_R_OTHER" >&2; exit 1; }
+bash "$GATE" task-claim run-r "$F3_SHA7" | jq -e '.ok == true' >/dev/null ||
+  { echo "F3: the same-build recovery re-claim of a half-finished run was refused" >&2; exit 1; }
+bash "$GATE" task-finish run-r "$F3_SHA7" GO | jq -e '.ok == true and .verdict == "GO"' >/dev/null ||
+  { echo "F3: task-finish did not resume after the recovery re-claim" >&2; exit 1; }
+[ "$(cat "$STATE_DIR/runs/run-r/verdict.json")" = "$F3_R_VERDICT" ]
+jq -e '.completedRunId == "run-r" and .activeRunId == null' "$STATE_DIR/task-run-r-state.json" >/dev/null
 
 echo "smoke pr gate tests passed"

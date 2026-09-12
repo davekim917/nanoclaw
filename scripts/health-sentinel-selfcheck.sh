@@ -621,9 +621,8 @@ esac
 
 # The cap boundary itself, not just A case comfortably past it (#716 P3): the
 # 20-digit case above would still pass even if the 18-digit cap were loosened
-# to 19 (a 19-digit value is still well under int64's 2^63-1 = 19 digits, so
-# it would neither overflow `[ -ge ]` nor get caught) — and a 19-digit
-# DEPLOY_LAG_MAX_S would then silently switch the vital off with nobody told,
+# to 19 — a 19-digit value can exceed int64 (9999999999999999999 > 2^63-1) and
+# overflow `[ -ge ]`, so loosening the cap to 19 reopens the silent-off path,
 # the exact shape this validation exists to close. Pin both edges directly.
 run_sentinel DRY_RUN=1 DEPLOY_LAG_MAX_S=9999999999999999999
 case "$OUT" in
