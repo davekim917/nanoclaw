@@ -73,6 +73,64 @@ risk:high:
     - 'src/dashboard/api/scheduled-shared.ts'
     - 'src/dashboard/thread-close.ts'
     - 'src/dashboard/thread-snooze.ts'
+    # The remaining dashboard authorization seams from #651's retro review of #624:
+    # who may act on a Signal decision (globalAdmin/canReview), the guarded
+    # observatory.signal.mutate action and its demand() call sites, requireAuth's
+    # CSRF/cookie gate in front of every dashboard handler, and the canSteer gate
+    # thread-message.ts runs before it can create a session as a side effect.
+    - 'src/dashboard/observatory-v2/sources.ts'
+    - 'src/dashboard/observatory-v2/api.ts'
+    - 'src/dashboard/router.ts'
+    - 'src/dashboard/thread-message.ts'
+    # #651 round 2 — the seams #651's own follow-up comment named as still open: gates
+    # that decide who may act (requireAuth's per-route wiring, the SSE feed's
+    # per-connection scope filter, the two scheduled-task management gates, Signal
+    # claim release, and dispatch-destination selection) and read-side scoping that
+    # decides which groups'/workgroups' data a caller sees (the inbox/console/workgroup
+    # list-and-detail endpoints, and the canAssign call sites that gate who a
+    # nudge/steer may target).
+    - 'src/dashboard/index.ts'
+    - 'src/dashboard/api/events.ts'
+    - 'src/dashboard/api/scheduled-mutations.ts'
+    - 'src/dashboard/api/scheduled-move.ts'
+    - 'src/dashboard/observatory-v2/state.ts'
+    - 'src/dashboard/observatory-v2/destination.ts'
+    - 'src/dashboard/api/sessions.ts'
+    - 'src/dashboard/api/threads.ts'
+    - 'src/dashboard/api/groups.ts'
+    - 'src/dashboard/api/workgroups.ts'
+    - 'src/dashboard/api/observatory.ts'
+    - 'src/dashboard/api/scheduled-read.ts'
+    - 'src/dashboard/api/scheduled-assembly.ts'
+    - 'src/dashboard/nudge.ts'
+    - 'src/dashboard/observatory-steer.ts'
+    # #714 round 2 review, two more findings: issue-brief.ts's workgroup-scoped
+    # GitHub fetch (observatoryIssueBriefHandler) never consults the caller's ctx at
+    # all — it reads any requested workgroup's board and fetches with that
+    # workgroup's own token, so a signed-in member scoped to one workgroup could read
+    # another workgroup's private issue body. The leak itself is fixed in its own
+    # security PR (a hasWorkgroupAccess check, same shape as api/observatory.ts's),
+    # but the file belongs on this list regardless of who reads it next. And
+    # messaging-groups.ts's list was global and unscoped when it was added here — a
+    # visibility decision worth review even though it was intentional, not a bug.
+    # #746 has since gated the whole list to canManageScheduled (owner/global-admin),
+    # closing that read; the file stays on this list because it still makes an
+    # authorization decision, now an explicit one.
+    - 'src/dashboard/issue-brief.ts'
+    - 'src/dashboard/api/messaging-groups.ts'
+    # Deliberately NOT on this list: 'src/dashboard/static.ts' (public SPA asset
+    # handler — path-containment only, no authorization decision), 'observatory-v2/
+    # types.ts' (pure interface declarations, no logic to cover), the attention/sweep/
+    # idempotency files ('api/attention-fs.ts', 'api/board-attention.ts',
+    # 'api/desk-attention.ts', 'session-title-sweep.ts', 'db/steer-idempotency.ts' —
+    # file-read item producers, a title-generation sweep, and a request-dedupe cache,
+    # none of which decide who may act or what they may see), 'webhook-server.ts'
+    # (HTTP transport plumbing only — it delegates all routing/dispatch to router.ts,
+    # which is already on this list), 'api/scheduled-board-matrix.ts' (the verb x
+    # health-state availability matrix — health/claim/due facts in, an available-verb
+    # list out, no caller identity or role ever enters it), and 'db/item-assignments.ts'
+    # (plain CRUD on the item-reservation table — reserve/release/read by workgroup
+    # and item id, no ctx or role check anywhere in it either).
     # Irreversible against a live DB
     - 'src/db/migrations/**'
     # Supply chain: pnpm allowBuilds, and the container image it builds
@@ -142,10 +200,15 @@ risk:high:
     - 'src/group-init.ts'
     - 'container/agent-runner/src/mcp-tools/**'
     # The coverage-ratchet baseline (docs/specs/risk-based-review/plan.md, "Tests on
-    # risky paths"): scripts/check-risk-coverage.ts fails closed on a missing baseline,
-    # but a PR could still delete tests and `--write` a new, lower baseline over the old
-    # one unreviewed if this file were not itself on risk:high.
+    # risky paths") AND the script that enforces it: scripts/check-risk-coverage.ts
+    # fails closed on a missing baseline, but a PR could still delete tests and
+    # `--write` a new, lower baseline over the old one unreviewed if the baseline file
+    # were not itself on risk:high — and a bug in the script itself (main() computed
+    # `allowNew` inline and every test stayed green when it was flipped to
+    # unconditionally true) could silently let an unfloored risk file merge with no
+    # review at all if the script were not on risk:high too (#714 round 2, P2-B).
     - 'coverage-risk-baseline.json'
+    - 'scripts/check-risk-coverage.ts'
 
 risk:guard:
 - changed-files:
@@ -204,6 +267,27 @@ risk:credential:
     - 'src/dashboard/api/scheduled-shared.ts'
     - 'src/dashboard/thread-close.ts'
     - 'src/dashboard/thread-snooze.ts'
+    - 'src/dashboard/observatory-v2/sources.ts'
+    - 'src/dashboard/observatory-v2/api.ts'
+    - 'src/dashboard/router.ts'
+    - 'src/dashboard/thread-message.ts'
+    - 'src/dashboard/index.ts'
+    - 'src/dashboard/api/events.ts'
+    - 'src/dashboard/api/scheduled-mutations.ts'
+    - 'src/dashboard/api/scheduled-move.ts'
+    - 'src/dashboard/observatory-v2/state.ts'
+    - 'src/dashboard/observatory-v2/destination.ts'
+    - 'src/dashboard/api/sessions.ts'
+    - 'src/dashboard/api/threads.ts'
+    - 'src/dashboard/api/groups.ts'
+    - 'src/dashboard/api/workgroups.ts'
+    - 'src/dashboard/api/observatory.ts'
+    - 'src/dashboard/api/scheduled-read.ts'
+    - 'src/dashboard/api/scheduled-assembly.ts'
+    - 'src/dashboard/nudge.ts'
+    - 'src/dashboard/observatory-steer.ts'
+    - 'src/dashboard/issue-brief.ts'
+    - 'src/dashboard/api/messaging-groups.ts'
 
 risk:migration:
 - changed-files:
@@ -245,6 +329,7 @@ risk:gates:
     - '.ripgreprc'
     - '.gitmodules'
     - 'coverage-risk-baseline.json'
+    - 'scripts/check-risk-coverage.ts'
 
 risk:runner:
 - changed-files:

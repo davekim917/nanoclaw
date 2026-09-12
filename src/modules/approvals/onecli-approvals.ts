@@ -33,7 +33,7 @@
  */
 import { OneCLI, type ApprovalRequest, type ManualApprovalHandle } from '@onecli-sh/sdk';
 
-import { pickApprovalDelivery, pickApprover } from './primitive.js';
+import { approvalResolutionLine, pickApprovalDelivery, pickApprover } from './primitive.js';
 import { ONECLI_API_KEY, ONECLI_URL } from '../../config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import {
@@ -190,8 +190,10 @@ export async function resolveOneCLIApproval(
   if (state) {
     pending.delete(approvalId);
     clearTimeout(state.timer);
-    // Card is auto-edited to "✅ <option>" by chat-sdk-bridge's onAction
-    // handler, so the happy path needs no edit here.
+    // The bridge edits no approval card on click (chat-sdk-bridge.ts:1176),
+    // so the resolution edit happens here — addressed to the card this ROW
+    // names, not to whatever message the click was made on.
+    await editCardResolution(row, await approvalResolutionLine(row, selectedOption, userId));
     await deletePendingApproval(approvalId);
     state.resolve(decision);
     log.info('OneCLI approval resolved', { approvalId, decision, userId });
@@ -204,6 +206,11 @@ export async function resolveOneCLIApproval(
   // away and let the redelivery post a second card, so the row STAYS as the
   // recorded decision. `handleRequest` consumes it on redelivery; the sweep
   // settles it if the TTL passes first.
+  // The row now records the human's decision, so the card must stop offering
+  // the choice — the bridge no longer edits it on click. This is NOT the
+  // "your request died" correction: settleUnconsumedDecision makes that one
+  // only if the TTL passes with the decision still unconsumed.
+  await editCardResolution(row, await approvalResolutionLine(row, selectedOption, userId));
   log.info('OneCLI approval decided while unarmed — holding the decision for redelivery', {
     approvalId,
     decision,
@@ -220,10 +227,11 @@ export async function resolveOneCLIApproval(
  * The SDK exposes no out-of-band decision API (`ApprovalClient.submitDecision`
  * is private and takes the gateway URL resolved inside `start()`), so there is
  * nothing to submit. An approval must then tell the human the truth: the
- * credentialed call ended and the agent has to retry it. The auto-edit from
- * chat-sdk-bridge will already have flipped the card to "✅ Approved", which
- * on its own would be a lie. A rejection needs no correction — the request was
- * denied either way, which is what the card already says.
+ * credentialed call ended and the agent has to retry it. The resolution edit
+ * made when the decision was recorded will already have flipped the card to
+ * "✅ Approved", which on its own would be a lie. A rejection needs no
+ * correction — the request was denied either way, which is what the card
+ * already says.
  */
 async function settleUnconsumedDecision(row: PendingApproval): Promise<void> {
   if (row.status === 'approved') {

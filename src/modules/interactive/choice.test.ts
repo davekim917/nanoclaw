@@ -153,7 +153,9 @@ async function ask(
   return (await getPendingApprovalsByAction(REQUEST_CHOICE_ACTION)).find((r) => r.request_id === choiceId);
 }
 
-function click(approvalId: string, value: string, handle: string, channelType = CHANNEL): Promise<boolean> {
+/** A click made on the card the host posted for this row. */
+async function click(approvalId: string, value: string, handle: string, channelType = CHANNEL): Promise<boolean> {
+  const messageId = (await getPendingApproval(approvalId))?.platform_message_id ?? null;
   return handleApprovalsResponse({
     questionId: approvalId,
     value,
@@ -161,6 +163,7 @@ function click(approvalId: string, value: string, handle: string, channelType = 
     channelType,
     platformId: '',
     threadId: null,
+    messageId,
   });
 }
 

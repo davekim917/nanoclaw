@@ -219,7 +219,11 @@ jq -e '.freezeGeneration == 1 and .history == []' "$RUN8/coordinator/identity.js
 
 # --- 5d. A contract re-scaffolded on another sourceSha after the re-freeze
 # satisfies the snapshot: the barrier's sourceSha check already refuses every
-# marker written under the old contract.
+# marker written under the old contract. The re-scaffold also gains lane D,
+# which the old snapshot (taken on $SRC_SHA, naming only A and B) never named
+# either — this must stay green for the same reason as the missing-sha
+# mismatch itself: a contract rewrite on a new sourceSha retires every old
+# marker regardless of which lanes it declares.
 RUN9="$T/run9"; mkdir -p "$RUN9"
 gate_develop "$RUN9"
 scaffold contract "$RUN9" "$SRC_SHA" A B
@@ -228,7 +232,7 @@ expect_rc "$(run start "$RUN9")" 0 new-sha-start
 mk dep-be000000009 live "$C" > "$SMOKE_PAIR_FIXTURE_DIR/be.json"
 expect_rc "$(run refreeze "$RUN9" "backend replaced")" 0 new-sha-refreeze
 gate_develop "$RUN9" "$SRC_SHA2"
-scaffold contract "$RUN9" "$SRC_SHA2" A B
+scaffold contract "$RUN9" "$SRC_SHA2" A B D
 expect_rc "$(run check "$RUN9" postfreeze)" 0 new-sha-check
 expect_rc "$(run finish "$RUN9")" 0 finish-after-rescaffold-on-new-sha
 
@@ -270,6 +274,96 @@ expect_rc "$(run check "$RUN11" lane-a)" 0 no-refreeze-check
 expect_rc "$(run finish "$RUN11")" 0 finish-no-refreeze-with-contract
 printf 'not json' > "$RUN11/completion-contract.json"
 expect_rc "$(run finish "$RUN11")" 0 finish-no-refreeze-ignores-contract
+
+# --- 5g. A required lane the snapshot never named is not stale when its
+# generation is above the snapshot's highest — the one way that can happen is
+# `contract --regenerate`, which bumps every lane, old and new, past whatever
+# was on disk at that moment. Covers both `--regenerate` with no lane gain
+# (the ordinary redispatch-everything case) and `--regenerate` adding a lane.
+RUN14="$T/run14"; mkdir -p "$RUN14"
+gate_develop "$RUN14"
+scaffold contract "$RUN14" "$SRC_SHA" A B
+mk dep-fe000000001 live "$A" > "$SMOKE_PAIR_FIXTURE_DIR/fe.json"
+mk dep-be000000001 live "$B" > "$SMOKE_PAIR_FIXTURE_DIR/be.json"
+expect_rc "$(run start "$RUN14")" 0 regen-start
+scaffold marker "$RUN14" A completed "A on the old pair"
+scaffold marker "$RUN14" B completed "B on the old pair"
+mk dep-be000000009 live "$C" > "$SMOKE_PAIR_FIXTURE_DIR/be.json"
+expect_rc "$(run refreeze "$RUN14" "backend replaced")" 0 regen-refreeze
+jq -e --arg sha "$SRC_SHA" '.refreezeLaneSnapshot == {contractPresent: true, sourceSha: $sha,
+    lanes: [{id: "A", generation: 1}, {id: "B", generation: 1}]}' \
+  "$RUN14/coordinator/identity.json" >/dev/null || fail "regen-refreeze: snapshot did not name A, B at generation 1"
+# --regenerate with the SAME lanes: both bump past the snapshot, no lane
+# gain — the old markers are still on disk, at the old generation.
+scaffold contract "$RUN14" "$SRC_SHA" A B --regenerate
+expect_rc "$(run check "$RUN14" postrefreeze)" 0 regen-check-postfreeze
+expect_rc "$(run finish "$RUN14")" 0 finish-after-regenerate-no-new-lane
+conclusions "$RUN14"
+BOUT="$(bash "$BARRIER" "$RUN14" synthesis || true)"
+jq -e '.ready == false and (.invalid | sort) == ["markers/A.json","markers/B.json"]
+       and (.invalidReasons | length == 2) and all(.invalidReasons[]; contains("stale generation"))' <<<"$BOUT" >/dev/null || \
+  { echo "$BOUT" > "$T/out"; fail "barrier-after-regenerate-no-new-lane: A, B should wait on a fresh marker (ordinary stale generation), not be reported un-redispatched"; }
+# --regenerate again, adding lane D: the snapshot never named D, and D's
+# generation — bumped along with A and B — is above the snapshot's highest,
+# so D is not treated as stale either; it simply has no marker yet.
+scaffold contract "$RUN14" "$SRC_SHA" A B D --regenerate
+expect_rc "$(run finish "$RUN14")" 0 finish-after-regenerate-gains-lane
+BOUT="$(bash "$BARRIER" "$RUN14" synthesis || true)"
+jq -e '.ready == false and (.invalid | sort) == ["markers/A.json","markers/B.json"]
+       and all(.invalidReasons[]; contains("stale generation")) and (.missing == ["markers/D.json"])' <<<"$BOUT" >/dev/null || \
+  { echo "$BOUT" > "$T/out"; fail "barrier-after-regenerate-gains-lane: D (never named in the snapshot) must not be flagged as un-redispatched"; }
+
+# --- 5h. Two ways to defeat the redispatch rule without deleting the
+# snapshot outright: emptying `lanes` to `[]`, and flipping `contractPresent`
+# to false while still naming a sourceSha (a shape `refreeze` never writes —
+# its own contractPresent:false always pairs with sourceSha:null). Both must
+# refuse in `finish` AND in the barrier, exactly like the missing-snapshot
+# case in 5e above.
+RUN15="$T/run15"; mkdir -p "$RUN15"
+gate_develop "$RUN15"
+scaffold contract "$RUN15" "$SRC_SHA" A B
+mk dep-fe000000001 live "$A" > "$SMOKE_PAIR_FIXTURE_DIR/fe.json"
+mk dep-be000000001 live "$B" > "$SMOKE_PAIR_FIXTURE_DIR/be.json"
+expect_rc "$(run start "$RUN15")" 0 bypass-start
+mk dep-be000000009 live "$C" > "$SMOKE_PAIR_FIXTURE_DIR/be.json"
+expect_rc "$(run refreeze "$RUN15" "backend replaced")" 0 bypass-refreeze
+# A fresh check at the current freeze generation, so the redispatch-stale
+# check below is what finish would refuse or clear ON — not an incidental
+# empty check journal, which would refuse for an unrelated reason and mask a
+# bypass that let the stale check itself through.
+expect_rc "$(run check "$RUN15" postfreeze)" 0 bypass-check-postfreeze
+ID15="$RUN15/coordinator/identity.json"; cp "$ID15" "$T/id15.bak"
+conclusions "$RUN15"
+
+# Bypass 1: an EMPTIED snapshot (`lanes: []`) must not turn the rule off —
+# there is no recorded maximum generation for A or B to legitimately exceed.
+jq -c '.refreezeLaneSnapshot.lanes = []' "$T/id15.bak" > "$ID15"
+expect_rc "$(run finish "$RUN15")" 2 finish-refuses-emptied-snapshot
+out | grep -Fq 'not redispatched since the pair re-freeze: A, B;' || \
+  fail "finish-refuses-emptied-snapshot: message did not name lanes A, B"
+BOUT="$(bash "$BARRIER" "$RUN15" synthesis || true)"
+jq -e '.ready == false and (.invalid | sort) == ["markers/A.json","markers/B.json"]
+       and all(.invalidReasons[]; contains("not redispatched since the pair re-freeze"))' <<<"$BOUT" >/dev/null || \
+  { echo "$BOUT" > "$T/out"; fail "barrier-refuses-emptied-snapshot"; }
+
+# Bypass 2: `contractPresent:false` paired with a sourceSha — refuse instead
+# of reading it as "nothing was dispatched yet".
+jq -c --arg sha "$SRC_SHA" '.refreezeLaneSnapshot = {contractPresent:false,sourceSha:$sha,lanes:[]}' "$T/id15.bak" > "$ID15"
+expect_rc "$(run finish "$RUN15")" 2 finish-refuses-falsified-contractpresent
+out | grep -Fq 'also records a sourceSha' || \
+  fail "finish-refuses-falsified-contractpresent: refused for the wrong reason"
+BOUT="$(bash "$BARRIER" "$RUN15" synthesis || true)"
+jq -e '.ready == false and .invalid == ["coordinator/identity.json"]
+       and (.invalidReasons[0] | contains("also records a sourceSha"))' <<<"$BOUT" >/dev/null || \
+  { echo "$BOUT" > "$T/out"; fail "barrier-refuses-falsified-contractpresent"; }
+
+# Restoring the real snapshot goes back to the ordinary un-redispatched
+# refusal — not because the snapshot is malformed, but because A and B truly
+# have not been redispatched yet.
+cp "$T/id15.bak" "$ID15"
+expect_rc "$(run finish "$RUN15")" 2 bypass-restored-refuses-for-the-real-reason
+out | grep -Fq 'not redispatched since the pair re-freeze: A, B;' || \
+  fail "bypass-restored-refuses-for-the-real-reason: expected the ordinary un-redispatched refusal after restoring the real snapshot"
 
 # --- 6. Success without evidence: an actual truncated write is refused -----
 # Needs mount privilege (a full 64k tmpfs forces a real short write); skip
