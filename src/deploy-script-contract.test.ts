@@ -40,4 +40,21 @@ describe('deploy rollback shell contract', () => {
     expect(script.indexOf('rm -rf dist')).toBeLessThan(script.indexOf('pnpm run build:dashboard'));
     expect(script.indexOf('pnpm run build:dashboard')).toBeLessThan(script.indexOf('pnpm run build >>'));
   });
+
+  it('holds the restart for an in-flight repository drain, bounded (#718)', () => {
+    const wait = script.indexOf('while drain_in_flight');
+    expect(wait).toBeGreaterThan(-1);
+    expect(wait).toBeLessThan(script.indexOf('write_status "ok" "done"'));
+    expect(wait).toBeLessThan(script.indexOf('sudo systemctl restart nanoclaw-v2'));
+    expect(script).toContain('[ "$drain_waited" -lt "$DRAIN_WAIT_SECONDS" ]');
+    // A marker left by a host that died mid-drain must not hold the restart.
+    expect(script).toContain('systemctl show -p MainPID --value nanoclaw-v2');
+    // Both ends name the same file.
+    expect(script).toContain('DRAIN_MARKER="data/repository-drain-in-flight.json"');
+    const runner = fs.readFileSync(
+      path.join(root, 'src', 'modules', 'repository-workspaces', 'job-runner.ts'),
+      'utf-8',
+    );
+    expect(runner).toContain("path.join(DATA_DIR, 'repository-drain-in-flight.json')");
+  });
 });
