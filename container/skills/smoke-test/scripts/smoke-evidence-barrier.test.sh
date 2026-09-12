@@ -271,4 +271,62 @@ bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$CLIP_DIR" lanes \
 
 rm -rf "$CLIP_DIR"
 
+# --- coordinatorOwnerToken: the certify-1657 shape -------------------------
+# A contract that positively claims a pr/task ownership kind but carries no
+# coordinatorOwnerToken is exactly what a hand-composed contract looked like
+# on that run: smoke-run-scaffold.sh's `contract` verb can only produce a
+# null token on the `develop` branch (begin_active_run_fence sets
+# FENCED_OWNER="" there and nowhere else — smoke-run-scaffold.sh's pr and
+# task branches always set it to $DEFAULT_OWNER before this field is
+# written).
+OWNER_DIR="$(mktemp -d)"
+mkdir -p "$OWNER_DIR/markers"
+
+cat >"$OWNER_DIR/completion-contract.json" <<'JSON'
+{
+  "schemaVersion": 1,
+  "sourceSha": "cccccccccccccccccccccccccccccccccccccccc",
+  "ownershipKind": "task",
+  "coordinatorOwnerToken": null,
+  "requiredLaneMarkers": ["markers/B1.json"]
+}
+JSON
+NULL_TOKEN_OUT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$OWNER_DIR" lanes || true)"
+echo "$NULL_TOKEN_OUT" | jq -e '
+  (.ready == false) and (.invalid == ["'"$OWNER_DIR"'/completion-contract.json"]) and
+  (.invalidReasons[0] | contains("task") and contains("no coordinatorOwnerToken") and contains("task-claim"))
+' >/dev/null || {
+  echo "expected a task-owned contract with a null token to be refused, naming task-claim as the fix" >&2
+  echo "$NULL_TOKEN_OUT" >&2; exit 1; }
+
+# Same shape for a `pr` ownership kind.
+jq '.ownershipKind = "pr"' "$OWNER_DIR/completion-contract.json" >"$OWNER_DIR/.contract.tmp"
+mv "$OWNER_DIR/.contract.tmp" "$OWNER_DIR/completion-contract.json"
+bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$OWNER_DIR" lanes >/dev/null 2>&1 && {
+  echo "expected a pr-owned contract with a null token to be refused too" >&2; exit 1; }
+
+# A `develop`-owned contract with a null token is exactly the legitimate
+# shape begin_active_run_fence's develop branch produces — never refused on
+# this ground. (Still refused on missing markers, which is what "not ready"
+# below asserts; it must not be refused as an invalid CONTRACT.)
+jq '.ownershipKind = "develop"' "$OWNER_DIR/completion-contract.json" >"$OWNER_DIR/.contract.tmp"
+mv "$OWNER_DIR/.contract.tmp" "$OWNER_DIR/completion-contract.json"
+DEVELOP_OUT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$OWNER_DIR" lanes || true)"
+echo "$DEVELOP_OUT" | jq -e '.invalid != ["'"$OWNER_DIR"'/completion-contract.json"]' >/dev/null || {
+  echo "expected a develop-owned contract with a null token to be refused only for missing markers, not as an invalid contract" >&2
+  echo "$DEVELOP_OUT" >&2; exit 1; }
+
+# A contract with no ownershipKind field at all (every contract written
+# before this field existed, including a live develop campaign's contract
+# mid-run at the moment this check ships) is likewise never refused on this
+# ground — grandfathered, not retroactively broken.
+jq 'del(.ownershipKind)' "$OWNER_DIR/completion-contract.json" >"$OWNER_DIR/.contract.tmp"
+mv "$OWNER_DIR/.contract.tmp" "$OWNER_DIR/completion-contract.json"
+NO_KIND_OUT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$OWNER_DIR" lanes || true)"
+echo "$NO_KIND_OUT" | jq -e '.invalid != ["'"$OWNER_DIR"'/completion-contract.json"]' >/dev/null || {
+  echo "expected a contract with no ownershipKind field to be refused only for missing markers, not as an invalid contract" >&2
+  echo "$NO_KIND_OUT" >&2; exit 1; }
+
+rm -rf "$OWNER_DIR"
+
 echo "smoke evidence barrier tests passed"

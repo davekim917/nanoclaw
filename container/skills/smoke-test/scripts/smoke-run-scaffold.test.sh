@@ -539,6 +539,87 @@ MISMATCH_OUT="$(scaffold contract "$SHA_MISMATCH" "$OTHER_SHA" B1:browser 2>&1 |
 jq -e '.ok == false and (.error | test("does not match the SHA claimed"))' <<<"$MISMATCH_OUT" >/dev/null || {
   echo "expected a contract SHA mismatched with the task claim to be refused, got: $MISMATCH_OUT" >&2; exit 1; }
 
+# --- Task-scoped run, end to end: claim -> scaffold -> barrier -> finish ---
+# The gate unit tests (smoke-pr-gate.test.sh) cover task-finish in isolation,
+# against a hand-written fixture state file. This is the actual production
+# chain: a real task-claim lease, a scaffold-written contract and marker, a
+# real barrier check, and only then task-finish — proving the verdict is
+# reachable through the full governed path, not just through the gate script
+# alone.
+TASK_FIN="$FIXTURE_BASE/task-run-finish"
+mkdir -p "$TASK_FIN/evidence"
+TASK_FIN_ID="$(basename "$TASK_FIN")"
+gate task-claim "$TASK_FIN_ID" "$SHA" | jq -e '.ok == true' >/dev/null
+scaffold contract "$TASK_FIN" "$SHA" B1:browser:'certification lane' | jq -e '.ok == true' >/dev/null
+printf 'ok\n' >"$TASK_FIN/evidence/ok.txt"
+scaffold marker "$TASK_FIN" B1 pass 'certified' 'evidence/ok.txt' | jq -e '.ok == true' >/dev/null
+barrier "$TASK_FIN" lanes | jq -e '.ready == true' >/dev/null || {
+  echo "expected the barrier to accept the finish-fixture task run" >&2; exit 1; }
+gate task-finish "$TASK_FIN_ID" "$SHA" GO | jq -e '.ok == true and .leaseReleased == true and .verdict == "GO"' >/dev/null
+jq -e --arg sha "$SHA" --arg run "$TASK_FIN_ID" '.sha == $sha and .runId == $run and .verdict == "GO"' \
+  "$GATE_STATE/runs/$TASK_FIN_ID/verdict.json" >/dev/null
+[ ! -e "$SMOKE_GATE_LEASE_DIR/task-lease-$TASK_FIN_ID.json" ] ||
+  { echo "expected task-finish to remove the shared task lease" >&2; exit 1; }
+jq -e '.activeRunId == null and .completedRunId == "'"$TASK_FIN_ID"'" and .completedVerdict == "GO"' \
+  "$GATE_STATE/task-$TASK_FIN_ID-state.json" >/dev/null
+
+# --- The install wrapper's env pattern, not this test file's ambient export -
+# Item 2 of the ownership review: SKILL.md's task-claim example used to call
+# the raw skill script directly (`/app/skills/smoke-test/scripts/
+# smoke-pr-gate.sh`), unlike the documented PR `claim` example, which goes
+# through an install's deployed wrapper — a thin per-install script that
+# `export`s SMOKE_GATE_STATE_DIR/SMOKE_GATE_LEASE_DIR to that install's real
+# paths and then `exec`s this skill script. Bypassing the wrapper meant
+# task-claim wrote into the gate's hardcoded defaults (smoke-pr-gate.sh's own
+# STATE_DIR/LEASE_DIR fallbacks) — a directory no scaffold/barrier call, and
+# no later task-progress/task-finish invocation, would ever share.
+#
+# A coordinator's PR campaign already solves this by writing one small
+# per-run env file with the same values the wrapper exports, then sourcing
+# it before every direct scaffold/barrier call. A task-scoped run needs the
+# identical convention. This proves the fixed wiring works with NO ambient
+# SMOKE_GATE_STATE_DIR/SMOKE_GATE_LEASE_DIR export from the rest of this test
+# file — only what a real wrapper invocation and a real sourced env file
+# would supply.
+(
+  unset SMOKE_GATE_STATE_DIR SMOKE_GATE_LEASE_DIR
+  WRAPPER_STATE_DIR="$FIXTURE_BASE/wrapper-state"
+  WRAPPER_LEASE_DIR="$SHARED_ROOT/wrapper-leases"
+  mkdir -p "$WRAPPER_STATE_DIR" "$WRAPPER_LEASE_DIR"
+  WRAPPER="$FIXTURE_BASE/install-wrapper.sh"
+  {
+    printf '#!/usr/bin/env bash\nset -u\n'
+    printf 'export SMOKE_GATE_STATE_DIR=%q\n' "$WRAPPER_STATE_DIR"
+    printf 'export SMOKE_GATE_LEASE_DIR=%q\n' "$WRAPPER_LEASE_DIR"
+    printf 'exec bash %q "$@"\n' "$SCRIPT_DIR/smoke-pr-gate.sh"
+  } > "$WRAPPER"
+  chmod +x "$WRAPPER"
+
+  WIRED_RUN="$FIXTURE_BASE/task-run-wired"
+  mkdir -p "$WIRED_RUN/evidence"
+  WIRED_RUN_ID="$(basename "$WIRED_RUN")"
+
+  bash "$WRAPPER" task-claim "$WIRED_RUN_ID" "$SHA" | jq -e '.ok == true' >/dev/null
+
+  GATE_ENV="$FIXTURE_BASE/wired-gate-env.sh"
+  {
+    printf 'export SMOKE_GATE_STATE_DIR=%q\n' "$WRAPPER_STATE_DIR"
+    printf 'export SMOKE_GATE_LEASE_DIR=%q\n' "$WRAPPER_LEASE_DIR"
+  } > "$GATE_ENV"
+
+  (
+    set -a; . "$GATE_ENV"; set +a
+    scaffold contract "$WIRED_RUN" "$SHA" B1:browser:'certification lane' | jq -e '.ok == true' >/dev/null
+    printf 'ok\n' >"$WIRED_RUN/evidence/ok.txt"
+    scaffold marker "$WIRED_RUN" B1 pass 'certified' 'evidence/ok.txt' | jq -e '.ok == true' >/dev/null
+    barrier "$WIRED_RUN" lanes | jq -e '.ready == true' >/dev/null
+  ) || { echo "expected the wrapper-claimed task run's env to also satisfy the scaffold and barrier" >&2; exit 1; }
+
+  bash "$WRAPPER" task-finish "$WIRED_RUN_ID" "$SHA" GO | jq -e '.ok == true and .leaseReleased == true' >/dev/null
+  [ -e "$WRAPPER_STATE_DIR/runs/$WIRED_RUN_ID/verdict.json" ] || {
+    echo "expected task-finish through the wrapper to record a verdict under the wrapper's own state dir" >&2; exit 1; }
+) || exit 1
+
 # Resume the ordinary fixture as its original owner, in case anything is ever
 # appended after this block.
 gate_owns "$(basename "$FIXTURE_DIR")"

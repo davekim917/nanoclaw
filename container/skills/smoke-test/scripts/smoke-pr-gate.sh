@@ -2166,7 +2166,8 @@ if [ "$COMMAND" = "task-claim" ]; then
       '{ok:false,error:"run id already claimed by the develop campaign — run ids must be unique across the gate",runId:$run}'
     exit 0
   fi
-  if ! task_lease_acquire "$RUN_ID" "$OWNER" "$SHA"; then
+  if ! TASK_LEASE_RESULT="$(task_lease_acquire "$RUN_ID" "$OWNER" "$SHA")"; then
+    printf '%s\n' "$TASK_LEASE_RESULT"
     exit 0
   fi
   NOW="$(iso_now)"
@@ -2266,6 +2267,159 @@ if [ "$COMMAND" = "task-release" ]; then
   fi
   task_lease_fence_end
   jq -cn --arg run "$RUN_ID" '{ok:true,releasedRunId:$run,leaseReleased:true}'
+  exit 0
+fi
+
+# task-finish: the terminal step for a task-scoped run, so a hand-composed
+# contract can never reach a PUBLISHED verdict through the scaffold + barrier
+# alone — publication is only real once this writes the write-once
+# run-level verdict.json AND commits the task's terminal state, both under
+# the same lease that `task-claim` handed out. Mirrors `finish`'s terminal
+# binding: the run-level verdict is consulted BEFORE the slot guard (a
+# completed run is nobody's activeRunId, so asking the slot first would
+# misreport a repeat call as "not active" instead of "already finished"),
+# and a second, DIFFERENT verdict for the same run is refused rather than
+# overwritten — verdict.json stays canonical, a human reconciles. Unlike
+# `finish`, there is no PR, no develop handoff, no preview to suspend, and no
+# ledger — so no finishIntent bridge either: with nothing else to make
+# idempotent between the verdict write and the state clear, that crash
+# window is one file write wide and closes itself on retry the same way the
+# state clear below already does.
+if [ "$COMMAND" = "task-finish" ]; then
+  RUN_ID="${2:-}"
+  SHA="${3:-}"
+  VERDICT="${4:-}"
+  OWNER="${5:-$DEFAULT_OWNER}"
+  if ! run_id_ok "$RUN_ID"; then
+    jq -cn --arg run "$RUN_ID" \
+      '{ok:false,error:"task-finish requires a run id of 1-200 chars of [A-Za-z0-9._-]",runId:$run}'
+    exit 2
+  fi
+  if ! printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+    jq -cn '{ok:false,error:"task-finish requires the 40-character deploy SHA this run claimed"}'
+    exit 2
+  fi
+  case "$VERDICT" in
+    GO|NO_GO|HUMAN_DECISION|BLOCKED) ;;
+    *) jq -cn '{ok:false,error:"task-finish verdict must be GO, NO_GO, HUMAN_DECISION, or BLOCKED"}'; exit 2 ;;
+  esac
+
+  RUN_VERDICT_FILE="$(run_verdict_file "$RUN_ID")"
+  RUN_VERDICT_RESUMED=false
+  TASK_STATE_FILE="$(task_state_file "$RUN_ID")"
+  if [ -s "$RUN_VERDICT_FILE" ]; then
+    EXISTING_VERDICT="$(jq -c '.' "$RUN_VERDICT_FILE" 2>/dev/null || printf '')"
+    if [ -n "$EXISTING_VERDICT" ] &&
+       jq -e --arg sha "$SHA" --arg run "$RUN_ID" --arg v "$VERDICT" \
+         '.sha == $sha and .runId == $run and .verdict == $v' \
+         <<<"$EXISTING_VERDICT" >/dev/null 2>&1; then
+      NOW="$(jq -r '.finishedAt' <<<"$EXISTING_VERDICT")"
+      VERDICT_DIGEST="$(verdict_digest "$EXISTING_VERDICT")"
+      RUN_VERDICT_RESUMED=true
+      if [ -s "$TASK_STATE_FILE" ] &&
+         [ "$(jq -r '.completedRunId // empty' "$TASK_STATE_FILE" 2>/dev/null)" = "$RUN_ID" ]; then
+        jq -cn --argjson verdict "$EXISTING_VERDICT" --arg digest "$VERDICT_DIGEST" \
+          '{ok:true,idempotent:true,
+            note:"this run was already finished with these exact terminal facts — nothing re-recorded, no artifact rewritten",
+            verdictDigest:$digest} + $verdict'
+        exit 0
+      fi
+      # Verdict recorded but the slot/lease were never cleared — a crash
+      # between the two writes. Fall through and resume just that half; the
+      # verdict itself is NOT rewritten (RUN_VERDICT_RESUMED guards that below).
+    else
+      jq -cn --arg run "$RUN_ID" --arg path "$RUN_VERDICT_FILE" --arg sha "$SHA" --arg attempted "$VERDICT" \
+        --argjson recorded "$(if [ -n "$EXISTING_VERDICT" ]; then printf '%s' "$EXISTING_VERDICT"; else printf '"unparseable"'; fi)" \
+        '{ok:false,gateStatus:"reconciliation_required",
+          error:("a DIFFERENT verdict is already recorded for this run — STOP. Nothing was overwritten and no verdict was fabricated. " +
+                 $path + " stays canonical; a human must reconcile which run owns this outcome before any verdict is published."),
+          runId:$run,runVerdictFile:$path,recordedVerdict:$recorded,attemptedVerdict:{sha:$sha,verdict:$attempted}}'
+      exit 1
+    fi
+  fi
+
+  if [ ! -s "$TASK_STATE_FILE" ] ||
+     [ "$(jq -r '.activeRunId // empty' "$TASK_STATE_FILE" 2>/dev/null)" != "$RUN_ID" ]; then
+    emit_not_active "$RUN_ID" "not the active task run (reclaimed or already finished) — no verdict recorded"
+    exit 0
+  fi
+  STATE="$(jq -c '.' "$TASK_STATE_FILE")"
+  CLAIMED_SHA="$(jq -r '.activeSha // empty' <<<"$STATE")"
+  if [ "$SHA" != "$CLAIMED_SHA" ]; then
+    jq -cn --arg run "$RUN_ID" --arg supplied "$SHA" --arg claimed "$CLAIMED_SHA" \
+      '{ok:false,
+        error:("task-finish sha does not match the deploy sha this run claimed — no verdict recorded, slot still held. Re-run: task-finish " +
+               $run + " " + (if $claimed == "" then "<claimed-sha>" else $claimed end) + " <verdict>"),
+        runId:$run,suppliedSha:$supplied,claimedSha:(if $claimed == "" then null else $claimed end)}'
+    exit 2
+  fi
+  STORED_OWNER="$(jq -r '.activeLeaseOwner // empty' <<<"$STATE")"
+  if [ -z "$STORED_OWNER" ] || [ "$OWNER" != "$STORED_OWNER" ]; then
+    jq -cn --arg run "$RUN_ID" --arg owner "$OWNER" --arg stored "$STORED_OWNER" \
+      '{ok:false,error:"caller owner does not match the owner recorded by task-claim - no terminal effect attempted",runId:$run,requestedBy:$owner,claimedBy:(if $stored == "" then null else $stored end)}'
+    exit 0
+  fi
+  if ! task_lease_fence_begin "$RUN_ID" "$OWNER" "$COMMAND"; then
+    exit 0
+  fi
+
+  if [ "$RUN_VERDICT_RESUMED" != true ]; then
+    NOW="$(iso_now)"
+    VERDICT_DIGEST="$(verdict_digest "$(verdict_payload "$SHA" "$RUN_ID" "$VERDICT" "$NOW")")"
+    mkdir -p "$(run_dir "$RUN_ID")" 2>/dev/null
+    RV_TMP="$(mktemp "$(run_dir "$RUN_ID")/.verdict.XXXXXX" 2>/dev/null)"
+    if [ -z "$RV_TMP" ]; then
+      task_lease_fence_end
+      jq -cn --arg run "$RUN_ID" --arg dir "$(run_dir "$RUN_ID")" \
+        '{ok:false,error:("could not stage the run verdict under " + $dir +
+                          " — no verdict recorded, slot still held. Fix the state dir and re-run this task-finish."),runId:$run}'
+      exit 1
+    fi
+    verdict_payload "$SHA" "$RUN_ID" "$VERDICT" "$NOW" > "$RV_TMP"
+    if ln "$RV_TMP" "$RUN_VERDICT_FILE" 2>/dev/null; then
+      rm -f "$RV_TMP" 2>/dev/null
+    else
+      rm -f "$RV_TMP" 2>/dev/null
+      # Lost the create to a concurrent task-finish between the short-circuit
+      # above and here. Same arbitration, same refusal to overwrite.
+      EXISTING_VERDICT="$(jq -c '.' "$RUN_VERDICT_FILE" 2>/dev/null || printf '')"
+      if [ -n "$EXISTING_VERDICT" ] && [ "$(verdict_digest "$EXISTING_VERDICT")" = "$VERDICT_DIGEST" ]; then
+        : # identical file already there — proceed, the state clear below is idempotent
+      else
+        task_lease_fence_end
+        jq -cn --arg run "$RUN_ID" --arg path "$RUN_VERDICT_FILE" --arg sha "$SHA" --arg attempted "$VERDICT" \
+          --argjson recorded "$(if [ -n "$EXISTING_VERDICT" ]; then printf '%s' "$EXISTING_VERDICT"; else printf '"unparseable"'; fi)" \
+          '{ok:false,gateStatus:"reconciliation_required",
+            error:("a DIFFERENT verdict was written for this run while this task-finish was running — STOP. Nothing was overwritten and no verdict was fabricated; " +
+                   $path + " stays canonical. A human must reconcile which run owns this outcome."),
+            runId:$run,runVerdictFile:$path,recordedVerdict:$recorded,attemptedVerdict:{sha:$sha,verdict:$attempted}}'
+        exit 1
+      fi
+    fi
+  fi
+
+  if ! task_lease_remove_fenced "$RUN_ID"; then
+    task_lease_fence_end
+    jq -cn --arg run "$RUN_ID" --arg dir "$LEASE_DIR" \
+      '{ok:false,error:("could not remove the shared task lease under " + $dir + " - terminal state not committed"),runId:$run,leaseReleased:false}'
+    exit 1
+  fi
+  STATE="$(jq -c --arg sha "$SHA" --arg run "$RUN_ID" --arg verdict "$VERDICT" --arg now "$NOW" \
+    '.completedSha=$sha | .completedAt=$now | .completedRunId=$run | .completedVerdict=$verdict |
+     .activeSha=null | .activeStartedAt=null | .activeRunId=null | .activeProgressAt=null | .activeLeaseOwner=null' <<<"$STATE")"
+  tmp="$(mktemp "$STATE_DIR/.task-$RUN_ID-state.XXXXXX" 2>/dev/null)"
+  if [ -z "$tmp" ] || ! printf '%s\n' "$STATE" > "$tmp" 2>/dev/null || ! mv "$tmp" "$TASK_STATE_FILE" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    RESTORED=false
+    write_task_lease "$RUN_ID" "$FENCED_TASK_LEASE_JSON" && RESTORED=true
+    task_lease_fence_end
+    jq -cn --arg run "$RUN_ID" --argjson restored "$RESTORED" \
+      '{ok:false,error:"could not commit terminal task state - no success receipt returned and lease restoration attempted",runId:$run,leaseReleased:false,leaseRestored:$restored}'
+    exit 1
+  fi
+  task_lease_fence_end
+  jq -cn --arg run "$RUN_ID" --arg sha "$SHA" --arg verdict "$VERDICT" --arg now "$NOW" --arg digest "$VERDICT_DIGEST" \
+    '{ok:true,leaseReleased:true,runId:$run,sha:$sha,verdict:$verdict,finishedAt:$now,verdictDigest:$digest}'
   exit 0
 fi
 

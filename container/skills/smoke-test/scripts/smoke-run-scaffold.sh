@@ -175,6 +175,11 @@ begin_active_run_fence() {  # <artifact description>
     FENCED_STATE_FILE="$state_dir/task-$run_id-state.json"; state_kind="task"; count=$(( count + 1 ))
   fi
   [ "$count" -eq 1 ] || die "run '$run_id' does not hold the gate in exactly one active slot — STOP this campaign; do not write $description"
+  # Recorded into the contract below so the barrier can tell a `develop`-fenced
+  # run (the only shape a null coordinatorOwnerToken is ever legitimate for)
+  # apart from a pr/task run whose null token means it was never actually
+  # claimed.
+  FENCED_STATE_KIND="$state_kind"
   state="$(jq -c '.' "$FENCED_STATE_FILE" 2>/dev/null)" || die "active PR state is unreadable — refusing $description"
   if [ "$state_kind" = develop ]; then
     FENCED_ACTIVE_SHA="$(jq -r '.activeSha // empty' <<<"$state")"
@@ -397,6 +402,7 @@ contract)
     --arg sha "$SOURCE_SHA" \
     --arg now "$(iso_now)" \
     --arg owner "$FENCED_OWNER" \
+    --arg kind "$FENCED_STATE_KIND" \
     --argjson lanes "$LANES" \
     --argjson markers "$MARKERS" \
     --argjson extra "$EXTRA" \
@@ -405,6 +411,7 @@ contract)
       runId: $runId,
       sourceSha: $sha,
       coordinatorOwnerToken:(if $owner == "" then null else $owner end),
+      ownershipKind: $kind,
       requiredLaneMarkers: $markers,
       lanes: $lanes,
       markerDir: "markers",
