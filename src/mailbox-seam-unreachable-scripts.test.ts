@@ -819,6 +819,9 @@ describe('worktree-cleanup.ts contains no literal seam call, and the only contai
   // rather than walked or classified against a curated module set.
   it('worktree-cleanup.ts imports exactly this complete relative-import manifest', () => {
     expect(collectRelativeImportManifest('src/worktree-cleanup.ts')).toEqual({
+      // #669: cleanup asks Git where a canonical's and its admin dirs' common
+      // dir resolves before acting on them. That module imports only safe-git.
+      'src/canonical-git-commondir.ts': ['gitCommonDirIs'],
       'src/config.ts': ['DATA_DIR', 'GROUPS_DIR'],
       'src/container-mounts.ts': ['runningContainerMounts'],
       'src/container-runner.ts': ['isContainerRunning', 'isContainerSpawning'],

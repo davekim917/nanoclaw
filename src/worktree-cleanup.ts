@@ -54,6 +54,7 @@ import {
   type TopicCheckout,
 } from './repository-workspaces.js';
 
+import { gitCommonDirIs } from './canonical-git-commondir.js';
 import { safeGitArgs, safeGitEnv, safeGitFilterNames } from './safe-git.js';
 import { dirSizeBytes, sessionWasReclaimed } from './storage-manager.js';
 
@@ -516,6 +517,27 @@ function isLinkedToCanonical(target: TopicWorktreeTarget): boolean {
   }
 }
 
+/**
+ * Does Git resolve `gitDir`'s common dir to `canonical`'s own `.git`? (#669)
+ *
+ * Asked before a host Git call that runs against a canonical (as cwd or `-C`)
+ * or one of its linked admin dirs (`--git-dir`): Git follows a `commondir`
+ * file in either to whatever repository it names. The canonical's own file is
+ * the sentinel spawn mounts read-only (container-runner.ts:1542), but the
+ * canonical `.git` is mounted read-write (container-runner.ts:4536), so the
+ * admin dirs under `.git/worktrees/` stay container-writable. This is
+ * therefore check-then-use: it narrows the window, it does not close it. A
+ * mismatch, or a common dir Git cannot report, refuses the item and logs it.
+ */
+function commonDirIsCanonical(gitDir: string, canonical: string, context: Record<string, unknown>): boolean {
+  if (gitCommonDirIs(gitDir, path.join(canonical, '.git'))) return true;
+  log.error('Worktree cleanup: refusing a Git dir whose common dir is not its canonical .git (#669: re-raise)', {
+    ...context,
+    gitDir,
+  });
+  return false;
+}
+
 function branchMayBeRemoved(target: TopicWorktreeTarget): { eligible: boolean; reason: string } {
   const status = git(target.worktreePath, ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
   if (status === null || status !== '') return { eligible: false, reason: status === null ? 'status-failed' : 'dirty' };
@@ -643,6 +665,11 @@ async function cleanupLinkedCheckout(target: TopicWorktreeTarget, dataDir: strin
         }
         const branch = git(target.worktreePath, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
         const head = branch ? git(target.worktreePath, ['rev-parse', '--verify', 'HEAD^{commit}']) : null;
+        // isLinkedToCanonical proved the worktree's own common dir. The two
+        // calls below run with the canonical as cwd, where Git reads the
+        // canonical's own `.git/commondir` instead, so prove that one too.
+        if (!commonDirIsCanonical(path.join(target.canonicalRepoPath, '.git'), target.canonicalRepoPath, context))
+          return;
         execFileSync('git', safeGitArgs(['worktree', 'remove', target.worktreePath]), {
           cwd: target.canonicalRepoPath,
           env: safeGitEnv(),
@@ -1915,6 +1942,16 @@ function removeMissingWorktreeRegistration(
   if (!target) {
     return restorePlaceholder();
   }
+  // Every Git call below runs against the admin dir (`--git-dir`) or the
+  // canonical (cwd, `-C`), and Git follows a `commondir` in either.
+  const proveContext = { workgroupId: entry.workgroupId, repo: entry.repo, worktreePath: entry.worktreePath };
+  if (
+    !commonDirIsCanonical(path.join(canonical, '.git'), canonical, proveContext) ||
+    !commonDirIsCanonical(target.adminDir, canonical, proveContext)
+  ) {
+    restorePlaceholder();
+    return false;
+  }
   if (linkedAdminIsLocked(target.adminDir) !== false || linkedIndexMatchesHead(canonical, target.adminDir) !== true) {
     restorePlaceholder();
     return false;
@@ -2003,6 +2040,10 @@ function completeLegacyPendingRemoval(entry: PendingWorktreeRemoval, dataDir: st
   } catch {
     return false;
   }
+  const proveContext = { workgroupId: entry.workgroupId, repo: entry.repo };
+  // The symbolic-ref read runs with the canonical as cwd, so Git reads the
+  // canonical's own `.git/commondir` first.
+  if (!commonDirIsCanonical(path.join(canonical, '.git'), canonical, proveContext)) return false;
   const integrationRef = git(canonical, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD']);
   if (!integrationRef) return false;
   const records = linkedWorktreeAdminRecords(canonical);
@@ -2012,6 +2053,9 @@ function completeLegacyPendingRemoval(entry: PendingWorktreeRemoval, dataDir: st
     const locked = linkedAdminIsLocked(record.adminDir);
     if (missing === null || locked === null) return false;
     if (!missing || locked) continue;
+    // The two proofs below run Git with `--git-dir=<admin dir>`.
+    if (!commonDirIsCanonical(record.adminDir, canonical, { ...proveContext, worktreePath: record.owner }))
+      return false;
     const clean = linkedIndexMatchesHead(canonical, record.adminDir);
     if (clean === null) return false;
     if (!clean) continue;

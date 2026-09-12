@@ -629,6 +629,149 @@ describe('buildMounts agent surfaces', async () => {
     expect(fs.lstatSync(path.join(state, 'repository.lock')).isFile()).toBe(true);
   });
 
+  /** A canonical as an existing install holds it: a normal clone with no commondir, and its origin pin. */
+  function seedCanonical(workgroupId: string, name: string): { gitDir: string; lock: string; pin: string } {
+    const canonical = path.join(DATA_DIR, 'repositories', workgroupId, name);
+    fs.mkdirSync(canonical, { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: canonical });
+    const state = path.join(DATA_DIR, 'repository-state', workgroupId, name);
+    fs.mkdirSync(state, { recursive: true });
+    const pin = path.join(state, 'origin.json');
+    fs.writeFileSync(
+      pin,
+      JSON.stringify({ origin: `https://github.com/acme/${name}.git`, repositoryId: `github.com/acme/${name}` }),
+    );
+    return { gitDir: path.join(canonical, '.git'), lock: path.join(state, 'repository.lock'), pin };
+  }
+
+  async function repositoryAgent(workgroupId: string, folder: string): Promise<AgentGroup> {
+    const ag = group(`ag-${folder}`, folder);
+    await createAgentGroup(ag);
+    assignWorkgroup(ag, workgroupId);
+    await ensureContainerConfig(ag.id);
+    initGroupFilesystem({ ...ag, workgroup_id: workgroupId }, { provider: 'claude' });
+    return ag;
+  }
+
+  function repositoryMounts(
+    mounts: Awaited<ReturnType<typeof buildMounts>>,
+    repo: { gitDir: string; lock: string; pin: string },
+  ) {
+    return mounts.filter(
+      (mount) =>
+        mount.containerPath === repo.gitDir ||
+        mount.containerPath.startsWith(`${repo.gitDir}/`) ||
+        mount.containerPath === repo.lock ||
+        mount.containerPath === repo.pin,
+    );
+  }
+
+  it('an existing canonical gets the commondir sentinel at its next spawn, and nothing else about its mounts changes (#669)', async () => {
+    const workgroupId = 'wg-sentinel';
+    const ag = await repositoryAgent(workgroupId, 'sentinel-agent');
+    const repo = seedCanonical(workgroupId, 'proj');
+    const commondir = path.join(repo.gitDir, 'commondir');
+    expect(fs.existsSync(commondir)).toBe(false);
+
+    const mounts = await buildMounts(ag, session('s-sentinel', ag.id), containerConfig(), 'claude', {}, workgroupId);
+
+    expect(fs.readFileSync(commondir, 'utf8')).toBe('.\n');
+    const readOnly = (file: string) => ({ hostPath: file, containerPath: file, readonly: true });
+    const state = path.dirname(repo.lock);
+    // What spawn mounted for this canonical before #669, in order...
+    const controls = [
+      { hostPath: repo.gitDir, containerPath: repo.gitDir, readonly: false },
+      readOnly(path.join(repo.gitDir, 'config')),
+      readOnly(path.join(repo.gitDir, 'HEAD')),
+      {
+        hostPath: path.join(state, 'canonical-index-unavailable'),
+        containerPath: path.join(repo.gitDir, 'index'),
+        readonly: true,
+      },
+      readOnly(path.join(repo.gitDir, 'hooks')),
+      readOnly(path.join(repo.gitDir, 'objects', 'info')),
+    ];
+    const coordination = [{ hostPath: repo.lock, containerPath: repo.lock, readonly: false }, readOnly(repo.pin)];
+    // ...plus exactly one entry: the sentinel, read-only, after the object-info overlay.
+    expect(repositoryMounts(mounts, repo)).toEqual([...controls, readOnly(commondir), ...coordination]);
+  });
+
+  it.each<[string, (commondir: string, elsewhere: string) => void]>([
+    ['another repository', (commondir, elsewhere) => fs.writeFileSync(commondir, `${path.join(elsewhere, '.git')}\n`)],
+    [
+      'a symlink to the sentinel bytes',
+      (commondir, elsewhere) => {
+        const bytes = path.join(elsewhere, 'sentinel-bytes');
+        fs.writeFileSync(bytes, '.\n');
+        fs.symlinkSync(bytes, commondir);
+      },
+    ],
+    ['the same place in other bytes', (commondir) => fs.writeFileSync(commondir, './\n')],
+    [
+      // Left by a container spawned before the sentinel's read-only overlay:
+      // the alias stays writable through the read-write .git mount.
+      'the sentinel with a hard-link alias',
+      (commondir) => {
+        fs.writeFileSync(commondir, '.\n');
+        fs.linkSync(commondir, path.join(path.dirname(commondir), 'writable-alias'));
+      },
+    ],
+    [
+      // The case that used to stop the whole workgroup: Git follows this
+      // commondir to a directory that is not there and exits 128, and
+      // discovery ran that probe before anything classified per repository.
+      'a repository that does not exist',
+      (commondir, elsewhere) => fs.writeFileSync(commondir, `${path.join(elsewhere, 'gone', '.git')}\n`),
+    ],
+  ])(
+    'withholds every mount of a canonical whose commondir is %s, logs it, and still mounts its sibling (#669)',
+    async (_shape, plant) => {
+      const workgroupId = 'wg-commondir';
+      const ag = await repositoryAgent(workgroupId, 'commondir-agent');
+      const planted = seedCanonical(workgroupId, 'proj');
+      const sibling = seedCanonical(workgroupId, 'sibling');
+      // Another workgroup's canonical, whose host path a container can guess.
+      const elsewhere = path.join(DATA_DIR, 'repositories', 'wg-elsewhere', 'secret');
+      fs.mkdirSync(elsewhere, { recursive: true });
+      execFileSync('git', ['init', '-q'], { cwd: elsewhere });
+      const commondir = path.join(planted.gitDir, 'commondir');
+      plant(commondir, elsewhere);
+      const read = (): string =>
+        fs.lstatSync(commondir).isSymbolicLink()
+          ? `link:${fs.readlinkSync(commondir)}`
+          : fs.readFileSync(commondir, 'utf8');
+      const plantedBytes = read();
+
+      const mounts = await buildMounts(ag, session('s-commondir', ag.id), containerConfig(), 'claude', {}, workgroupId);
+
+      expect(repositoryMounts(mounts, planted)).toEqual([]);
+      const siblingCommondir = path.join(sibling.gitDir, 'commondir');
+      expect(repositoryMounts(mounts, sibling)).toContainEqual({
+        hostPath: sibling.gitDir,
+        containerPath: sibling.gitDir,
+        readonly: false,
+      });
+      expect(repositoryMounts(mounts, sibling)).toContainEqual({
+        hostPath: siblingCommondir,
+        containerPath: siblingCommondir,
+        readonly: true,
+      });
+      // Discovery classifies this repository as unusable before Git runs on it
+      // at all, so the log names the repository and why it was withheld.
+      expect(log.error).toHaveBeenCalledWith(
+        expect.stringContaining('#669'),
+        expect.objectContaining({
+          workgroupId,
+          repository: 'proj',
+          path: path.dirname(planted.gitDir),
+          reason: expect.stringContaining('commondir'),
+        }),
+      );
+      // Never overwritten.
+      expect(read()).toBe(plantedBytes);
+    },
+  );
+
   // Pins the deletion of the global-~/.codex `config.toml` / `plugins` fallback
   // mounts (822f1deb). Nothing in the container reads /home/node/.codex/* in
   // codex-as-peer mode — the runner redirects CODEX_HOME to
