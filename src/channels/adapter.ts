@@ -110,13 +110,15 @@ export interface InboundEvent {
      * field the router stamps into a written row's `platformMsgId`
      * (host-origin.ts), which the runner renders as `platform_msg_id`.
      *
-     * The one setter is main.ts's `onInbound` callback, and only when the
-     * calling adapter's `channelType` isn't `'cli'` — the CLI adapter's own
-     * "plain chat" path also arrives through `onInbound` (src/channels/cli.ts)
-     * but mints its own `cli-<ms>-<rand>` id, so it is host-synthesized like
-     * every `onInboundEvent` caller (the CLI `to:` admin transport, Discord
-     * slash commands, `ncl messaging-groups send`) — none of which set this
-     * field at all.
+     * The one setter is `adapterInboundEvent`
+     * (src/channels/inbound-event.ts), which main.ts's `onInbound` callback
+     * delegates to for every genuine adapter ingress, and it sets the field
+     * only when the calling adapter's `channelType` isn't `'cli'` — the CLI
+     * adapter's own "plain chat" path also arrives through `onInbound`
+     * (src/channels/cli.ts) but mints its own `cli-<ms>-<rand>` id, so it is
+     * host-synthesized like every `onInboundEvent` caller (the CLI `to:`
+     * admin transport, Discord slash commands, `ncl messaging-groups send`)
+     * — none of which set this field at all.
      */
     nativeId?: string;
   };

@@ -66,4 +66,32 @@ say so explicitly rather than claim they're fixed.
   src/channels/adapter.ts, src/db/index.ts, src/router.ts — all additive
   (new doc lines, new optional field + its doc comment, one more export,
   8 more lines of comment+logic in the write call).
-- Next: full host + container suites, then commit/push, update PR body.
+- Round 2 finished: full host + container suites green, pushed as f6bcb1850.
+
+## Round 3 (Codex CHANGES on f6bcb1850, two P2s)
+
+Review: /home/ubuntu/scratch/autoagent-0912/codex-710b-review.md
+
+- [ ] P2.1 atomic duplicate-choiceId reservation. choice.ts:141's pre-check
+      crosses awaits before primitive.ts inserts; two sessions racing the same
+      choiceId produced two pending approvals + two cards + no refusal.
+      Shape: migration 078, partial UNIQUE index on
+      pending_approvals(request_id) WHERE action='request_choice' AND
+      status='pending' — scoped to the action because the uniqueness claim is
+      request_choice's alone (onecli redelivery and bash-gate have their own
+      request_id reuse semantics and must not be newly constrained).
+      createPendingApproval already answers changes>0; requestApproval must
+      honour it and report 'duplicate-request' so no card posts.
+      Live-install precheck re-run read-only before authoring: 13 pending
+      approvals, 13 distinct request_ids, 0 null, no dupes, choice_receipts
+      absent — the index cannot fail on live data.
+- [ ] P2.2 mutation-proof the tests: real ingress producer for platform + CLI
+      adapters; conflicting-receipt insert instead of DROP TABLE; an ordering
+      assertion that kills "insert after the pending-row deletion".
+- [ ] Stale docs: migration 077's "nothing else deletes" names the
+      scripts/delete-cli-agent.ts teardown exception; request-choice.ts's
+      documented response line gains approval_id, pinned by a drift test.
+- [ ] tsc (host + container), targeted, counterfactual table, full suites,
+      ratchet, push, PR body.
+
+## Round 3 log

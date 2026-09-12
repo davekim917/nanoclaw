@@ -18,6 +18,29 @@ import { log } from '../../log.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { registerChoiceHandler, resolveChoice, type ChoiceHandlerContext } from './choices.js';
 
+/**
+ * Ordering probe. Whether the receipt is written BEFORE the pending row is
+ * deleted is invisible to every value-based assertion — move the insert after
+ * the delete and the answer is just as delivered, the receipt just as
+ * correct. Only observing the pending row AT WRITE TIME catches that
+ * mutation, and the ordering is the point: the receipt exists so the facts on
+ * the pending row outlive it, so it must never be written in a window where a
+ * crash would leave neither.
+ */
+const probe = vi.hoisted(() => ({ pendingRowAtWrite: undefined as boolean | undefined }));
+
+vi.mock('../../db/choice-receipts.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../db/choice-receipts.js')>();
+  return {
+    ...real,
+    recordChoiceReceipt: async (receipt: Parameters<typeof real.recordChoiceReceipt>[0]) => {
+      const { getPendingApproval: readRow } = await import('../../db/sessions.js');
+      probe.pendingRowAtWrite = (await readRow(receipt.approvalId)) !== undefined;
+      return real.recordChoiceReceipt(receipt);
+    },
+  };
+});
+
 const ACTION = 'test-choice';
 const USER = 'slack-fixture:U-clicker';
 
@@ -66,6 +89,7 @@ async function seedApproval(over: Partial<PendingApproval> = {}): Promise<Pendin
 let handler: ReturnType<typeof vi.fn<(ctx: ChoiceHandlerContext) => Promise<Session | null>>>;
 
 beforeEach(async () => {
+  probe.pendingRowAtWrite = undefined;
   await initMigratedTestDb();
   handler = vi.fn<(ctx: ChoiceHandlerContext) => Promise<Session | null>>();
   registerChoiceHandler(ACTION, (ctx: ChoiceHandlerContext) => handler(ctx));
@@ -180,22 +204,60 @@ describe('choice receipts', () => {
     expect(row?.status).toBe('pending');
   });
 
-  it('a receipt-insert failure still delivers, and logs the error', async () => {
+  it('a conflicting receipt insert still delivers, and logs the error', async () => {
     const approval = await seedApproval();
-    const target = fakeSession('sess-target');
-    handler.mockResolvedValue(target);
+    handler.mockResolvedValue(fakeSession('sess-target'));
     const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => undefined);
 
-    // Force the write to fail without touching delivery.
-    await getDb().exec('DROP TABLE choice_receipts');
+    // A row already keyed on this approval_id, so the plain INSERT conflicts
+    // on the PK. This is the shape a real collision takes — and unlike
+    // dropping the table, it stays a conflict if `ON CONFLICT(approval_id) DO
+    // NOTHING` is ever restored at the write site. Under that mutation the
+    // insert would silently succeed and nothing would be logged, so the
+    // log.error assertion below is what fails: the point of this test.
+    await getDb().run(
+      `INSERT INTO choice_receipts
+         (approval_id, request_id, action, agent_group_id, session_id,
+          platform_id, thread_id, platform_message_id, value, label, clicker_user_id, resolved_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      approval.approval_id,
+      approval.request_id,
+      ACTION,
+      'ag-1',
+      'sess-earlier',
+      null,
+      null,
+      null,
+      'earlier-value',
+      'Earlier',
+      'slack-fixture:U-earlier',
+      now(),
+    );
 
     await expect(resolveChoice(approval, 'ship-a', USER)).resolves.toBeUndefined();
 
-    // The click was still consumed: the row is gone, not left open.
+    // Delivered anyway, and the click consumed: the row is gone, not left open.
+    expect(handler).toHaveBeenCalledTimes(1);
     expect(await getPendingApproval(approval.approval_id)).toBeUndefined();
     expect(errorSpy).toHaveBeenCalledWith(
       'Failed to write choice receipt — answer was still delivered',
       expect.objectContaining({ approvalId: approval.approval_id, requestId: approval.request_id }),
     );
+    // The pre-existing row is intact: a conflict discards the new evidence
+    // loudly, it never overwrites the old.
+    expect(await getChoiceReceipt(approval.approval_id)).toMatchObject({ value: 'earlier-value' });
+  });
+
+  it('writes the receipt while the pending row still exists (insert precedes deletion)', async () => {
+    const approval = await seedApproval();
+    handler.mockResolvedValue(fakeSession('sess-target'));
+
+    await resolveChoice(approval, 'ship-a', USER);
+
+    // Moving the insert below `deletePendingApproval` in resolveChoice keeps
+    // every other assertion in this file green and flips this one to false.
+    expect(probe.pendingRowAtWrite).toBe(true);
+    expect(await getPendingApproval(approval.approval_id)).toBeUndefined();
+    expect(await getChoiceReceipt(approval.approval_id)).toMatchObject({ value: 'ship-a' });
   });
 });

@@ -40,7 +40,7 @@ import { log } from '../../log.js';
 import { resolveSession, sessionMessageExists } from '../../session-manager.js';
 import { isChannelVariant, type MessagingGroup, type PendingApproval, type Session } from '../../types.js';
 import { registerChoiceHandler, retireChoice, type ChoiceHandlerContext } from '../approvals/choices.js';
-import { notifyAgent, requestApproval, type RequestApprovalOptions } from '../approvals/primitive.js';
+import { notifyAgent, requestApprovalOutcome, type RequestApprovalOptions } from '../approvals/primitive.js';
 import { hasAdminPrivilege } from '../permissions/db/user-roles.js';
 import { getUser } from '../permissions/db/users.js';
 
@@ -135,16 +135,24 @@ async function handleRequestChoice(content: Record<string, unknown>, session: Se
   // precisely so a reuse never collapses two receipts into one, but a
   // clicker can still be shown the wrong card's text if two cards answer to
   // the same id — refusing the second ask up front is the cheaper fix).
-  // Scoped globally, not per agent group: request_id has no uniqueness
-  // constraint in pending_approvals, and a compromised agent's own group is
+  // Scoped globally, not per agent group: a compromised agent's own group is
   // sufficient to create the collision either way.
+  //
+  // This read is the FAST PATH, not the guarantee. It and the insert inside
+  // requestApprovalOutcome are separated by every await below — approver
+  // validation, destination authorization — and delivery is excluded per
+  // session (src/delivery.ts `inflightDeliveries`, keyed on session.id), so
+  // two sessions of this agent group can both read "nothing pending" here.
+  // The guarantee is migration 078's partial unique index, honoured as
+  // 'duplicate-request' at the insert; this check only saves the work when
+  // the reuse is plain rather than racing.
   if (await getPendingApprovalByRequestId(request.choiceId)) {
     log.warn('request_choice refused: choiceId already has a pending approval', {
       sessionId: session.id,
       agentGroupId: session.agent_group_id,
       choiceId: request.choiceId,
     });
-    await notifyAgent(session, `request_choice failed: choiceId "${request.choiceId}" already has a pending answer.`);
+    await notifyAgent(session, duplicateChoiceRefusal(request.choiceId));
     return;
   }
 
@@ -185,8 +193,10 @@ async function handleRequestChoice(content: Record<string, unknown>, session: Se
     value: o.value,
     ...(o.style ? { style: o.style } : {}),
   }));
-  // Delivery failures notify the agent from inside requestApproval.
-  const posted = await requestApproval({
+  // Delivery failures notify the agent from inside requestApprovalOutcome;
+  // a lost reservation does not, because only this module knows what a
+  // reused choiceId means — so it gets the same refusal as the fast path.
+  const outcome = await requestApprovalOutcome({
     session,
     agentName: session.agent_group_id,
     action: REQUEST_CHOICE_ACTION,
@@ -203,12 +213,31 @@ async function handleRequestChoice(content: Record<string, unknown>, session: Se
     options,
   });
 
+  if (outcome === 'duplicate-request') {
+    log.warn('request_choice refused: choiceId lost the reservation to a concurrent ask', {
+      sessionId: session.id,
+      agentGroupId: session.agent_group_id,
+      choiceId: request.choiceId,
+    });
+    await notifyAgent(session, duplicateChoiceRefusal(request.choiceId));
+    return;
+  }
+
   // Post first, then retire: an ask that failed to post leaves the old card live.
-  if (posted && request.key !== undefined) {
+  if (outcome === 'posted' && request.key !== undefined) {
     const own = await getPendingApprovalByRequestId(request.choiceId);
     // Gone already means a newer same-key ask retired it: nothing older to retire.
     if (own) await supersedeOpenChoices(session.agent_group_id, request.key, own);
   }
+}
+
+/**
+ * The refusal for a choiceId that is already live. One wording for both the
+ * fast-path read and the lost reservation, so an agent cannot tell a race
+ * from a plain reuse — there is nothing it could usefully do differently.
+ */
+function duplicateChoiceRefusal(choiceId: string): string {
+  return `request_choice failed: choiceId "${choiceId}" already has a pending answer.`;
 }
 
 /**

@@ -43,9 +43,17 @@ import type { Migration } from './index.js';
  *
  * No FK to `pending_approvals` (deleted immediately after) or `sessions`
  * (may end long before this row is read): the receipt's job is to outlive
- * both. Nothing else deletes from this table — no session archival, no
- * approval cleanup, no retention sweep. See CONTRIBUTING PR notes for the
- * cited call sites verifying that.
+ * both. Nothing on the normal lifecycle deletes from this table — no session
+ * archival, no approval cleanup, no retention sweep.
+ *
+ * ONE path does delete rows, and it is not on that lifecycle: full
+ * agent-group teardown. `scripts/delete-cli-agent.ts` sweeps every table
+ * carrying an `agent_group_id` column, discovered generically from
+ * `pragma_table_info` rather than named one by one
+ * (scripts/delete-cli-agent.ts:50-59), so this table's rows for that group go
+ * with the group — by design: once the agent group is gone the receipts
+ * attest to cards nobody can resolve back to an agent. A consumer that must
+ * outlive teardown has to copy the receipt out before then.
  */
 export const migration077: Migration = {
   version: 77,

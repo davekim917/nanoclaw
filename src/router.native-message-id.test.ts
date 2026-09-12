@@ -5,15 +5,21 @@
  * platformMessageId: event.message.nativeId })`).
  *
  * `event.message.id` is the routing/dedup key alone and is set on EVERY
- * event, synthetic or not. `nativeId` is set ONLY by main.ts's `onInbound`
- * for genuine, non-CLI adapter ingress; every `onInboundEvent` caller — the
- * CLI `to:` admin transport (channels/cli.ts:231-247), Discord slash commands
+ * event, synthetic or not. `nativeId` is set ONLY by the ingress producer
+ * `adapterInboundEvent` (channels/inbound-event.ts), which main.ts's
+ * `onInbound` delegates to, and only for non-CLI adapters; every
+ * `onInboundEvent` caller — the CLI `to:` admin transport
+ * (channels/cli.ts:231-247), Discord slash commands
  * (channels/discord-slash-commands.ts:356), `ncl messaging-groups send`
  * (cli/resources/messaging-groups.ts:173) — constructs its own `InboundEvent`
- * without it. This suite exercises the real router against those exact event
- * shapes, real central DB, so a future caller that reintroduces
- * `event.message.id` at the write site (review finding F4, PR #710) fails a
- * router-level test rather than only a fixture-poked formatter test.
+ * without it.
+ *
+ * Both halves are driven through their REAL producer against the real router
+ * and a real central DB, so the two mutations that matter fail here: deleting
+ * the `nativeId` assignment (genuine platform ingress loses its stamp) and
+ * deleting the `'cli'` exclusion (plain CLI chat gains a false one). A test
+ * that hands `nativeId` to the router directly catches neither — it never
+ * runs the code that decides the field (review finding, PR #710).
  */
 import Database from 'better-sqlite3';
 import fs from 'fs';
@@ -37,7 +43,8 @@ vi.mock('./config.js', async () => {
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-router-native-id') }));
 
-import type { InboundEvent } from './channels/adapter.js';
+import type { InboundEvent, InboundMessage } from './channels/adapter.js';
+import { adapterInboundEvent, type IngressAdapter } from './channels/inbound-event.js';
 import {
   createAgentGroup,
   createMessagingGroup,
@@ -52,6 +59,12 @@ function now(): string {
   return new Date().toISOString();
 }
 
+/** Two wired conversations: a genuine platform one, and the CLI adapter's own. */
+const WIRED: Array<{ mgId: string; mgaId: string; channelType: string; platformId: string }> = [
+  { mgId: 'mg-1', mgaId: 'mga-1', channelType: 'discord', platformId: 'chan-123' },
+  { mgId: 'mg-cli', mgaId: 'mga-cli', channelType: 'cli', platformId: 'cli-local' },
+];
+
 beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
@@ -63,31 +76,33 @@ beforeEach(async () => {
     agent_provider: null,
     created_at: now(),
   });
-  await createMessagingGroup({
-    id: 'mg-1',
-    channel_type: 'discord',
-    platform_id: 'chan-123',
-    name: 'General',
-    is_group: 1,
-    unknown_sender_policy: 'strict',
-    created_at: now(),
-  });
-  await createMessagingGroupAgent({
-    id: 'mga-1',
-    messaging_group_id: 'mg-1',
-    agent_group_id: 'ag-1',
-    engage_mode: 'pattern',
-    engage_pattern: '.',
-    sender_scope: 'all',
-    ignored_message_policy: 'drop',
-    session_mode: 'shared',
-    priority: 0,
-    default_model: null,
-    default_effort: null,
-    default_tone: null,
-    instructions_profile: null,
-    created_at: now(),
-  });
+  for (const { mgId, mgaId, channelType, platformId } of WIRED) {
+    await createMessagingGroup({
+      id: mgId,
+      channel_type: channelType,
+      platform_id: platformId,
+      name: `Room ${mgId}`,
+      is_group: 1,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+    await createMessagingGroupAgent({
+      id: mgaId,
+      messaging_group_id: mgId,
+      agent_group_id: 'ag-1',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      default_model: null,
+      default_effort: null,
+      default_tone: null,
+      instructions_profile: null,
+      created_at: now(),
+    });
+  }
 });
 
 afterEach(async () => {
@@ -96,10 +111,10 @@ afterEach(async () => {
 });
 
 /** The written row's content, for the one message a routed event produces. */
-async function routedContent(event: InboundEvent): Promise<Record<string, unknown>> {
+async function routedContent(event: InboundEvent, mgId = 'mg-1'): Promise<Record<string, unknown>> {
   const { routeInbound } = await import('./router.js');
   await routeInbound(event);
-  const session = await findSession('mg-1', null);
+  const session = await findSession(mgId, null);
   expect(session).toBeDefined();
   const db = new Database(inboundDbPath('ag-1', session!.id), { readonly: true });
   try {
@@ -113,27 +128,56 @@ async function routedContent(event: InboundEvent): Promise<Record<string, unknow
   }
 }
 
-describe('platformMsgId is stamped only from event.message.nativeId', () => {
-  it('genuine adapter ingress (main.ts onInbound sets nativeId = message.id for non-CLI adapters) stamps it', async () => {
-    const content = await routedContent({
-      channelType: 'discord',
-      platformId: 'chan-123',
-      threadId: null,
-      message: {
-        id: 'native-msg-1',
-        kind: 'chat',
-        timestamp: now(),
-        content: JSON.stringify({ text: 'hello', sender: 'User', senderId: '222' }),
-        nativeId: 'native-msg-1',
-      },
-    });
+/** An adapter's own inbound message, as an adapter hands it to `onInbound`. */
+function inboundMessage(over: Partial<InboundMessage> & Pick<InboundMessage, 'id'>): InboundMessage {
+  return {
+    kind: 'chat',
+    timestamp: now(),
+    content: { text: 'hello', sender: 'User', senderId: '222' },
+    ...over,
+  };
+}
+
+describe('platformMsgId is stamped only from genuine adapter ingress', () => {
+  it('a platform adapter’s ingress, built by the real producer, stamps the platform id', async () => {
+    // The exact call main.ts's onInbound makes: adapter identity plus the
+    // adapter's own message. Deleting the `nativeId` assignment in
+    // adapterInboundEvent drops the stamp and fails here.
+    const adapter: IngressAdapter = { channelType: 'discord', instance: undefined };
+    const content = await routedContent(
+      adapterInboundEvent(adapter, 'chan-123', null, inboundMessage({ id: 'native-msg-1' })),
+    );
+
     expect(content).toMatchObject({ platformMsgId: 'native-msg-1' });
   });
 
+  it('the CLI adapter’s own plain chat, through the same producer, stamps nothing', async () => {
+    // The CLI adapter reaches onInbound exactly like a platform adapter, but
+    // its id is host-synthesized (`cli-<ms>-<rand>`, src/channels/cli.ts).
+    // Deleting the `'cli'` exclusion in adapterInboundEvent gives this line
+    // false platform provenance and fails here.
+    const adapter: IngressAdapter = { channelType: 'cli', instance: undefined };
+    const content = await routedContent(
+      adapterInboundEvent(
+        adapter,
+        'cli-local',
+        null,
+        inboundMessage({
+          id: `cli-${Date.now()}-ab12cd`,
+          content: { text: 'ship it', sender: 'Alice', senderId: 'UOWNER' },
+        }),
+      ),
+      'mg-cli',
+    );
+
+    expect(content).toMatchObject({ sender: 'Alice', senderId: 'UOWNER' });
+    expect(content.platformMsgId).toBeUndefined();
+  });
+
   it('CLI `to:` admin transport (channels/cli.ts:231-247) carries no nativeId, so nothing is stamped', async () => {
-    // Exact shape cli.ts builds for a `to:`-addressed line: a host-synthesized
-    // `cli-<ms>-<rand>` id, no nativeId, sender/senderId are the caller's own
-    // choice — none of that reaches onInboundEvent's nativeId field.
+    // Exact shape cli.ts builds for a `to:`-addressed line: it calls
+    // onInboundEvent with its own InboundEvent, never the producer above, so
+    // a host-synthesized `cli-<ms>-<rand>` id cannot reach platformMsgId.
     const cliId = `cli-${Date.now()}-ab12cd`;
     const content = await routedContent({
       channelType: 'discord',
@@ -146,6 +190,7 @@ describe('platformMsgId is stamped only from event.message.nativeId', () => {
         content: JSON.stringify({ text: 'ship it', sender: 'Alice', senderId: 'UOWNER' }),
       },
     });
+
     expect(content).toMatchObject({ sender: 'Alice', senderId: 'UOWNER' });
     expect(content.platformMsgId).toBeUndefined();
   });
@@ -169,6 +214,7 @@ describe('platformMsgId is stamped only from event.message.nativeId', () => {
         }),
       },
     });
+
     expect(content.platformMsgId).toBeUndefined();
   });
 });

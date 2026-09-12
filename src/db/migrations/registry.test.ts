@@ -129,6 +129,7 @@ describe('central migration registry', () => {
       'task-run-outcomes',
       'turn-usage-effort',
       'choice-receipts',
+      'choice-request-reservation',
     ]);
     const liveSchema = schemaObjects(live);
     // Canary: two empty snapshots compare equal, so assert the query actually

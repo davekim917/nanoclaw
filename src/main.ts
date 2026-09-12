@@ -281,6 +281,7 @@ import './cli/delivery-action.js';
 import { markCliServerReady, startCliServer, stopCliServer } from './cli/socket-server.js';
 
 import type { ChannelAdapter, ChannelSetup } from './channels/adapter.js';
+import { adapterInboundEvent } from './channels/inbound-event.js';
 import {
   initChannelAdapters,
   teardownChannelAdapters,
@@ -926,30 +927,10 @@ export async function main(): Promise<void> {
   await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {
     return {
       onInbound(platformId, threadId, message) {
-        return routeInbound({
-          channelType: adapter.channelType,
-          // The one host-side stamping seam: adapters stay instance-blind,
-          // the host stamps the receiving instance on every inbound event.
-          instance: adapter.instance ?? adapter.channelType,
-          platformId,
-          threadId,
-          isDM: message.isDM,
-          recovered: message.recovered,
-          message: {
-            id: message.id,
-            kind: message.kind,
-            content: JSON.stringify(message.content),
-            timestamp: message.timestamp,
-            isMention: message.isMention,
-            isGroup: message.isGroup,
-            // Trust-bearing only for genuine platform ingress. The CLI
-            // adapter's own "plain chat" path also arrives through
-            // `onInbound` (src/channels/cli.ts) but mints a host-synthesized
-            // `cli-<ms>-<rand>` id, so it is excluded the same as every
-            // `onInboundEvent` caller below (adapter.ts InboundEvent.message.nativeId).
-            nativeId: adapter.channelType === 'cli' ? undefined : message.id,
-          },
-        }).catch((err) => {
+        // The event shape — instance stamping and the trust-bearing
+        // `nativeId` — is built by the ingress producer, so it is testable
+        // against the real router rather than only reachable from here.
+        return routeInbound(adapterInboundEvent(adapter, platformId, threadId, message)).catch((err) => {
           log.error('Failed to route inbound message', { channelType: adapter.channelType, err });
           throw err;
         });

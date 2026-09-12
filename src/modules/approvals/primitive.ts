@@ -326,12 +326,34 @@ export interface RequestApprovalOptions {
 }
 
 /**
+ * What became of a `requestApprovalOutcome` call.
+ *
+ * - `posted` — the row was inserted and the card delivered.
+ * - `duplicate-request` — the row was NOT inserted because another live row
+ *   already holds this `requestId`. Nothing was delivered and nothing was
+ *   left behind, and the agent was NOT notified: the caller owns the wording,
+ *   because only it knows what reusing that id means for its action.
+ * - `failed` — anything else (no approver, no adapter, delivery threw). The
+ *   agent has already been notified from in here.
+ */
+export type ApprovalOutcome = 'posted' | 'duplicate-request' | 'failed';
+
+/**
  * Queue an approval request. Picks an approver, delivers the card to their
  * DM, and records the pending_approvals row. Fire-and-forget from the
  * caller's perspective — the admin's response kicks off the registered
  * approval handler for this action via the response dispatcher.
+ *
+ * The insert is also the RESERVATION. An action whose `requestId` must be
+ * unique among live cards declares that with a partial unique index and then
+ * reads this function's `duplicate-request` — `request_choice` is the one
+ * that does (migration 078). Checking for a conflicting row before calling
+ * here cannot stand on its own: a caller's pre-check and this insert are
+ * separated by several awaits, and delivery is excluded per session
+ * (src/delivery.ts `inflightDeliveries`, keyed on session.id), so two
+ * sessions of one agent group can both pass a pre-check and both arrive here.
  */
-export async function requestApproval(opts: RequestApprovalOptions): Promise<boolean> {
+export async function requestApprovalOutcome(opts: RequestApprovalOptions): Promise<ApprovalOutcome> {
   const {
     session,
     action,
@@ -368,12 +390,12 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<boo
   } else if (deliveryTarget === 'thread') {
     if (!session.messaging_group_id) {
       await notifyAgent(session, `${action} failed: session has no originating channel to post approval in.`);
-      return false;
+      return 'failed';
     }
     const mg = await getMessagingGroup(session.messaging_group_id);
     if (!mg) {
       await notifyAgent(session, `${action} failed: originating channel not found.`);
-      return false;
+      return 'failed';
     }
     destination = {
       channelType: mg.channel_type,
@@ -389,7 +411,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<boo
       : (approverOverride ?? (await pickApprover(session.agent_group_id)));
     if (approvers.length === 0) {
       await notifyAgent(session, `${action} failed: no owner or admin configured to approve.`);
-      return false;
+      return 'failed';
     }
     const originChannelType = session.messaging_group_id
       ? ((await getMessagingGroup(session.messaging_group_id))?.channel_type ?? '')
@@ -397,7 +419,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<boo
     const target = await pickApprovalDelivery(approvers, originChannelType);
     if (!target) {
       await notifyAgent(session, `${action} failed: no DM channel found for any eligible approver.`);
-      return false;
+      return 'failed';
     }
     destination = {
       channelType: target.messagingGroup.channel_type,
@@ -409,7 +431,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<boo
 
   const approvalId = `appr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const normalizedOptions = normalizeOptions(cardOptions);
-  await createPendingApproval({
+  const reserved = await createPendingApproval({
     approval_id: approvalId,
     session_id: session.id,
     agent_group_id: session.agent_group_id,
@@ -430,6 +452,21 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<boo
     instance: destination.instance ?? null,
     approver_user_id: approverUserId ?? null,
   });
+  // Honour the reservation BEFORE anything is posted. approvalId is freshly
+  // minted on every call, so the PK cannot be what was skipped: a false here
+  // is an action-scoped unique index refusing a second live row for this
+  // requestId (createPendingApproval, src/db/sessions.ts). Nothing was
+  // written, so there is nothing to clean up, and no card exists to confuse
+  // whoever answers the one that is already live.
+  if (!reserved) {
+    log.info('Approval request refused: requestId already has a live row', {
+      action,
+      requestId: opts.requestId ?? approvalId,
+      agentGroupId: session.agent_group_id,
+      sessionId: session.id,
+    });
+    return 'duplicate-request';
+  }
 
   const adapter = getDeliveryAdapter();
   if (!adapter) {
@@ -441,7 +478,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<boo
       err: 'delivery adapter unavailable',
     });
     await notifyAgent(session, `${action} failed: delivery adapter unavailable for ${destination.label}.`);
-    return false;
+    return 'failed';
   }
 
   try {
@@ -467,11 +504,21 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<boo
     await deletePendingApproval(approvalId);
     log.error('Failed to deliver approval card', { action, approvalId, target: destination.label, err });
     await notifyAgent(session, `${action} failed: could not deliver approval request to ${destination.label}.`);
-    return false;
+    return 'failed';
   }
 
   log.info('Approval requested', { action, approvalId, agentName, target: destination.label, deliveryTarget });
-  return true;
+  return 'posted';
+}
+
+/**
+ * `requestApprovalOutcome` for the callers that only need "did it post?".
+ * An action with no uniqueness claim on its `requestId` can never see
+ * 'duplicate-request' — no partial unique index covers it — so for those the
+ * boolean loses nothing.
+ */
+export async function requestApproval(opts: RequestApprovalOptions): Promise<boolean> {
+  return (await requestApprovalOutcome(opts)) === 'posted';
 }
 
 /**
