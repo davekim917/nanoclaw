@@ -11,10 +11,19 @@
  * fetched is read out of the workgroup's own release-state.json and must
  * parse as a github.com issue/PR path — the browser can pick which item,
  * never which host gets called.
+ *
+ * Scope: the `workgroup` query value is caller-chosen, and workgroups are the
+ * data-pool boundary (different clients live in different workgroups). So the
+ * first thing after argument validation is `hasWorkgroupAccess` — the same
+ * predicate `observatoryHandler` gates the board itself on — and a caller who
+ * cannot see the workgroup gets the same 404 an unknown workgroup gets. That
+ * check runs before the board read, before the cache (keyed by workgroup, so it
+ * would otherwise hand one caller another's fetch), and before the workgroup's
+ * scoped GitHub token is resolved.
  */
 import { getDb } from '../db/connection.js';
 import { log } from '../log.js';
-import { readReleaseState } from './api/observatory.js';
+import { hasWorkgroupAccess, readReleaseState } from './api/observatory.js';
 import type { AuthHandler } from './router.js';
 
 const json = (status: number, body: unknown): Response =>
@@ -73,11 +82,16 @@ async function gh(path: string, token: string): Promise<unknown> {
   return res.json();
 }
 
-export const observatoryIssueBriefHandler: AuthHandler = async (req, _params, _ctx) => {
+export const observatoryIssueBriefHandler: AuthHandler = async (req, _params, ctx) => {
   const url = new URL(req.url);
   const workgroupId = url.searchParams.get('workgroup');
   const itemId = url.searchParams.get('item');
   if (!workgroupId || !itemId) return json(400, { error: 'workgroup and item are required' });
+
+  // Before the board read, the cache and the token: a workgroup the caller
+  // cannot see is absent — 404, never 403, so its existence does not leak.
+  // Same predicate as observatoryHandler (api/observatory.ts).
+  if (!(await hasWorkgroupAccess(workgroupId, ctx))) return json(404, { error: 'not_found' });
 
   const state = await readReleaseState(workgroupId);
   const item = state?.items.find((i) => i.id === itemId);

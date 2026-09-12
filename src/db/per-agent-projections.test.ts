@@ -1070,6 +1070,125 @@ describe('appendArchiveProjection — #360', () => {
   });
 });
 
+// ── Foreign hot-journal replay (#668 / #676 item 1) ──────────────────────────
+//
+// The session directory is bind-mounted read-write into the container
+// (`src/container-runner.ts:4439`) with only `archive.db` overlaid read-only
+// (`:4812`), so a container can plant `archive.db-journal` beside the projection
+// even though it cannot rewrite the db itself. A rollback journal is not bound
+// to its database's identity — its per-page checksums are seeded by a nonce in
+// the journal's own header — so a hand-built journal is replayed as a HOT
+// journal on the host's next read-write (append) open, injecting the container's
+// chosen page images. The host is the sole legitimate writer and never leaves a
+// live journal between spawns (a crash-time journal pairs with a removed stamp
+// and forces a rebuild), so appendArchiveProjection strips any sidecar first.
+describe('appendArchiveProjection — foreign hot-journal is never replayed (#668/#676)', () => {
+  const PAGE_SIZE = 4096;
+  const JOURNAL_MAGIC = 'd9d505f920a163d7';
+
+  // SQLite rollback-journal per-page checksum: seeded by the journal header's
+  // own nonce (cksumInit), then every 200th byte from the tail of the page.
+  function pageChecksum(cksumInit: number, page: Buffer): number {
+    let c = cksumInit >>> 0;
+    for (let i = PAGE_SIZE - 200; i > 0; i -= 200) c = (c + page[i]) >>> 0;
+    return c >>> 0;
+  }
+
+  // A well-formed rollback journal whose replay restores `restoreToDb` byte for
+  // byte — exactly what a container with shell access and a readable copy of the
+  // page layout can assemble by hand.
+  function buildHotJournalRestoringTo(restoreToDb: string): Buffer {
+    const image = fs.readFileSync(restoreToDb);
+    const nPages = Math.ceil(image.length / PAGE_SIZE);
+    const sectorSize = 512;
+    const cksumInit = 0x0badf00d;
+    const header = Buffer.alloc(sectorSize);
+    Buffer.from(JOURNAL_MAGIC, 'hex').copy(header, 0);
+    header.writeUInt32BE(nPages, 8); // nRec
+    header.writeUInt32BE(cksumInit, 12); // cksumInit (nonce)
+    header.writeUInt32BE(nPages, 16); // nOrig — truncate the db to this many pages
+    header.writeUInt32BE(sectorSize, 20);
+    header.writeUInt32BE(PAGE_SIZE, 24);
+    const parts: Buffer[] = [header];
+    for (let pageNo = 1; pageNo <= nPages; pageNo++) {
+      const page = Buffer.alloc(PAGE_SIZE);
+      image.copy(page, 0, (pageNo - 1) * PAGE_SIZE, pageNo * PAGE_SIZE);
+      const rec = Buffer.alloc(4 + PAGE_SIZE + 4);
+      rec.writeUInt32BE(pageNo, 0);
+      page.copy(rec, 4);
+      rec.writeUInt32BE(pageChecksum(cksumInit, page), 4 + PAGE_SIZE);
+      parts.push(rec);
+    }
+    return Buffer.concat(parts);
+  }
+
+  function forgeRow(dbPath: string, id: string, text: string): void {
+    withDb(dbPath, (db) => {
+      db.prepare(
+        `INSERT INTO messages_archive
+           (id, agent_group_id, messaging_group_id, channel_type, thread_id, role,
+            sender_id, sender_name, text, sent_at, created_at)
+         VALUES (?, 'ag-test-a', 'mg-1', 'slack', 'thread-1', 'user', 'victim', 'Victim', ?, '2026-01-01T09:59:00Z', '2026-01-01T00:00:00Z')`,
+      ).run(id, text);
+    });
+  }
+
+  it('discards a planted hot journal and lands only the legitimate appended rows', () => {
+    const scope = ['ag-test-a', 'ag-test-b'];
+    const src = twoSiblingSource('hotjrnl-src');
+    const dst = tmpPath('hotjrnl-dst');
+    buildArchiveProjection(src, dst, 'ag-test-a', scope);
+    const watermark = maxRowid(src, scope);
+
+    // The attacker's target state: the projection as-is plus a forged row the
+    // agent never received. Label it with the querying agent's own id so #668's
+    // seed-time MIN/MAX foreign-agent check could not catch the spread either.
+    const poison = tmpPath('hotjrnl-poison');
+    fs.copyFileSync(dst, poison);
+    forgeRow(poison, 'forged-1', 'FORGED HISTORY injected via a planted hot journal');
+    const journal = buildHotJournalRestoringTo(poison);
+
+    // Control: prove the journal is genuinely HOT — replayed verbatim by SQLite
+    // against a byte-identical projection opened WITHOUT the guard. Otherwise a
+    // malformed journal would make the real assertion pass vacuously.
+    const control = tmpPath('hotjrnl-control');
+    fs.copyFileSync(dst, control);
+    fs.writeFileSync(`${control}-journal`, journal);
+    tmpFiles.push(`${control}-journal`);
+    const controlDb = new Database(control); // default DELETE mode, as the host uses
+    controlDb.exec('BEGIN IMMEDIATE');
+    controlDb.exec('COMMIT');
+    controlDb.close();
+    expect(getAllArchiveRows(control).some((r) => r.id === 'forged-1')).toBe(true);
+
+    // Plant the same journal next to the real projection and grow the source so
+    // the host takes the append path on the next spawn.
+    fs.writeFileSync(`${dst}-journal`, journal);
+    tmpFiles.push(`${dst}-journal`);
+    addArchiveMsg(src, {
+      id: 'm2-a',
+      agent_group_id: 'ag-test-a',
+      role: 'user',
+      sender_id: 'u-1',
+      text: 'second question',
+      sent_at: '2026-01-01T11:00:00Z',
+    });
+
+    // The real host append open (per-agent-projections.ts).
+    appendArchiveProjection(src, dst, 'ag-test-a', watermark, scope);
+
+    // The forged row must NOT have been injected, and the sidecar must be gone.
+    expect(getAllArchiveRows(dst).some((r) => r.id === 'forged-1')).toBe(false);
+    expect(fs.existsSync(`${dst}-journal`)).toBe(false);
+
+    // And the projection is exactly a fresh full build of the grown source —
+    // the legitimate append still happened; only the planted journal was lost.
+    const expected = tmpPath('hotjrnl-expected');
+    buildArchiveProjection(src, expected, 'ag-test-a', scope);
+    expect(contentRows(dst)).toEqual(contentRows(expected));
+  });
+});
+
 describe('readArchiveScopeSignature — #360', () => {
   it("counts only the scope's own rows and its own mutations", () => {
     const src = twoSiblingSource('signature-src');
