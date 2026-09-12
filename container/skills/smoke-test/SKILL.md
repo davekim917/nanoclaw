@@ -393,19 +393,35 @@ and bumps an internal `freezeGeneration`. Every `check`/`finish` receipt from
 before the re-freeze stays on disk as an honest record that the drift
 happened, but `finish` only looks at receipts recorded at the run's CURRENT
 freeze generation — a stale-generation receipt neither blocks nor clears
-publication, the same way `smoke-run-scaffold.sh`'s lane generations already
-work (see "Re-running a lane" above; this reuses that mechanism rather than
-inventing a parallel one). Concretely, after a `refreeze`:
+publication.
 
-1. every lane already dispatched against the OLD pair has evidence that
-   predates the run's current identity — `redispatch` it before trusting
-   anything it reports from here on: `smoke-run-scaffold.sh redispatch
-   <run-dir> <lane-id>` for each such lane, then re-brief and re-run it;
+**A re-freeze does not make old lane evidence current: every lane must be
+redispatched after it, and `finish` refuses until each one is.** `refreeze`
+snapshots the completion contract's lane generations into `identity.json`
+(`refreezeLaneSnapshot`) — the same `generation` field `smoke-run-scaffold.sh`
+uses for a re-run lane (see "Re-running a lane" above). `finish`, and
+`smoke-evidence-barrier.sh`'s `lanes` and `synthesis` phases, then refuse
+while any required lane's contract generation is still at or below its
+snapshot, and name those lanes. Only `redispatch` (or `contract
+--regenerate`, which retires every lane at once) moves a generation, so the
+coordinator's own post-re-freeze `check` cannot stand in for the lanes.
+Concretely, after a `refreeze`:
+
+1. `redispatch` every lane the contract declares — including one not started
+   yet, since nothing on disk tells an in-flight lane from an unstarted one:
+   `smoke-run-scaffold.sh redispatch <run-dir> <lane-id>` for each, then
+   re-brief and re-run it (bump before re-briefing, as above);
 2. each redispatched lane calls `check <run-dir> <label>` again at its new
-   start/end, so a receipt exists at the CURRENT generation — `finish` refuses
-   (exit 2) until at least one does;
+   start/end — `finish` refuses (exit 2) while any lane is still not
+   redispatched, and while no receipt exists at the CURRENT generation;
 3. a second drift after the one allowed re-freeze finishes the run BLOCKED,
    exactly like an unhandled first drift would.
+
+A `refreeze` before the contract exists snapshots no lanes, because none was
+dispatched yet. One with lane markers on disk but no contract is refused. A
+contract re-scaffolded on a different `sourceSha` after the re-freeze
+satisfies the snapshot, because the barrier's sourceSha check already refuses
+every marker written before it.
 
 A scheduled run arrives with the head already proven settled by the gate. A
 campaign someone asked for in chat does not, and must prove it before freezing
