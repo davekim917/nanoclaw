@@ -982,10 +982,12 @@ async function deliverMessage(
   const content = JSON.parse(msg.content);
 
   // An agent's ask_question must never reuse a pending approval's id: its
-  // buttons would carry that id, and a click would be decoded through this
-  // card's options (src/db/sessions.ts:787-788). ask_user_question mints its
-  // own id (container/agent-runner/src/mcp-tools/interactive.ts:89), so only a
-  // raw outbound row can collide. Refused whole: no card, no pending question.
+  // buttons would carry that id, and a click on them would decode through the
+  // approval's own options (src/db/sessions.ts:819-824), leaving only the card
+  // binding in response-handler.ts between it and the approval.
+  // ask_user_question mints its own id
+  // (container/agent-runner/src/mcp-tools/interactive.ts:89), so only a raw
+  // outbound row can collide. Refused whole: no card, no pending question.
   if (
     content &&
     typeof content === 'object' &&

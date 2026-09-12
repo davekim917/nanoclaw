@@ -6,9 +6,10 @@
  * value, the clicker, and the platform id of the clicked message. An agent that
  * writes a raw ask_question row can post a card of its own reusing a pending
  * approval's id. Before the binding, a click on that card resolved the real
- * approval: the render lookup decodes the click through the agent's options
- * (src/db/sessions.ts:787-788), and the approvals handler runs first
- * (src/modules/index.ts:22-23) and claimed the row by its id alone.
+ * approval: the render lookup decoded the click through the agent's options,
+ * and the approvals handler, which runs first (src/modules/index.ts:22-23),
+ * claimed the row by its id alone. The last block pins the render lookup's
+ * preference for the approval's own options when both rows hold the id.
  *
  * Real central DB, the bridge's real click paths (the Chat SDK dispatch and the
  * Discord gateway interaction), and the real response handlers in production
@@ -67,6 +68,7 @@ import {
 import { setDeliveryAdapter } from '../../delivery.js';
 import { log } from '../../log.js';
 import { getResponseHandlers, type ResponsePayload } from '../../response-registry.js';
+import { initSessionFolder } from '../../session-manager.js';
 import { grantRole } from '../permissions/db/user-roles.js';
 import { createUser } from '../permissions/db/users.js';
 // Production order: approvals, then interactive (src/modules/index.ts:22-23).
@@ -265,8 +267,7 @@ async function seedCredential(approvalId: string, platformMessageId: string): Pr
 
 /**
  * The row delivery persisted, before this change, for a raw outbound
- * ask_question reusing `questionId`: the agent's own card, whose options the
- * bridge then decodes a click through.
+ * ask_question reusing `questionId`: the agent's own card.
  */
 async function agentCard(questionId: string, label: string, value: string): Promise<void> {
   await createPendingQuestion({
@@ -496,5 +497,76 @@ describe("a click made on the approval's own card still resolves it", () => {
     await click('appr-legacy', 0, 'UOWNER', 'any-card');
 
     expect(approved).toEqual([{ approvalId: 'appr-legacy', userId: OWNER }]);
+  });
+});
+
+describe('an agent row reusing an approval id cannot decode a click on the real card', () => {
+  /**
+   * A row written before delivery refused colliding ids: two buttons, both
+   * mapped to `value`, so either index decodes to it if this row is read.
+   */
+  async function staleAgentCard(questionId: string, value: string): Promise<void> {
+    await createPendingQuestion({
+      question_id: questionId,
+      session_id: 'sess-thread',
+      message_out_id: `out-${questionId}`,
+      platform_id: 'slack:CAGENT',
+      channel_type: 'slack',
+      thread_id: null,
+      title: 'FYI',
+      question: 'Nothing to do here',
+      options: normalizeOptions([
+        { label: 'Later', value },
+        { label: 'Dismiss', value },
+      ]),
+      created_at: now(),
+    });
+  }
+
+  it('"Reject" on the real card of an approval rejects it', async () => {
+    initSessionFolder(AG, 'sess-dm');
+    await seedGate('appr-dm', { sessionId: 'sess-dm', platformId: 'slack:DOWNER', platformMessageId: 'real-dm-card' });
+    await staleAgentCard('appr-dm', 'approve');
+    const info = vi.spyOn(log, 'info');
+
+    await click('appr-dm', 1, 'UOWNER', 'real-dm-card');
+
+    expect(approved).toEqual([]);
+    expect(info).toHaveBeenCalledWith('Approval rejected', expect.objectContaining({ approvalId: 'appr-dm' }));
+    expect(await getPendingApproval('appr-dm')).toBeUndefined();
+  });
+
+  it('"Hold" on the real choice card answers hold, and the bridge leaves the card to the host', async () => {
+    await seedChoice('appr-choice', 'real-choice-card');
+    await staleAgentCard('appr-choice', 'ship');
+
+    await click('appr-choice', 1, 'UOWNER', 'real-choice-card');
+
+    expect(answered.map((a) => [a.value, a.label])).toEqual([['hold', 'Hold']]);
+    expect(bridgeEdits).toEqual([]);
+  });
+
+  it('an approval whose stored options are unreadable leaves the click unresolved', async () => {
+    await createPendingApproval({
+      approval_id: 'appr-corrupt',
+      request_id: 'appr-corrupt',
+      action: GATE,
+      payload: '{}',
+      created_at: now(),
+      title: 'Run this?',
+      options_json: '{not json',
+      session_id: 'sess-dm',
+      agent_group_id: AG,
+      channel_type: 'slack',
+      platform_id: 'slack:DOWNER',
+      platform_message_id: 'real-corrupt-card',
+    });
+    await staleAgentCard('appr-corrupt', 'approve');
+
+    await click('appr-corrupt', 0, 'UOWNER', 'real-corrupt-card');
+
+    expect(approved).toEqual([]);
+    expect((await getPendingApproval('appr-corrupt'))?.status).toBe('pending');
+    expect(await getPendingQuestion('appr-corrupt')).toBeDefined();
   });
 });

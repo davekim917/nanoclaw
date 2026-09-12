@@ -69,9 +69,9 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
   // Every kind of approval, OneCLI and choice cards included, resolves only
   // from its own card. The button names just the approval id, and an agent
   // that writes a raw ask_question row can post a card of its own carrying
-  // that id; the render lookup then decodes the click through the agent's
-  // options (src/db/sessions.ts:787-788). Claimed, so no later handler takes
-  // the id either.
+  // that id, and a click on it decodes through the approval's own options
+  // (src/db/sessions.ts:819-824), so it reads as a real answer. Claimed, so
+  // no later handler takes the id either.
   if (!isClickOnApprovalCard(approval, payload)) {
     log.warn('Ignoring a click that was not made on the approval card', {
       approvalId: approval.approval_id,
