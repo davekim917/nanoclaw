@@ -347,6 +347,31 @@ coverage. **Browser lanes must not start if this script
 exits non-zero.** Treat that exit as `BLOCKED_BUILD_IDENTITY` and stop — do not
 dispatch the UI adversary or backend verifier lanes against an unproven build.
 
+**Freeze the deployed PAIR with `scripts/smoke-pair-identity.sh`, not a
+per-run ad hoc script.** `smoke-build-identity.sh` proves the bundle/host
+binding once; it does not re-prove the environment still serves the SAME
+build a minute, or an hour, into a long run. A shared dev environment can be
+replaced under a live run by an unrelated deploy — a different failure from
+`smoke-build-identity.sh`'s bundle-host seam and not caught by it. Configure
+`SMOKE_GATE_FRONTEND_SERVICE` / `SMOKE_GATE_BACKEND_SERVICE` (the same names
+`smoke-develop-gate.sh` reads — one wrapper env file configures both) and:
+
+```bash
+bash /app/skills/smoke-test/scripts/smoke-pair-identity.sh start <run-dir>
+bash /app/skills/smoke-test/scripts/smoke-pair-identity.sh check <run-dir> <label>
+bash /app/skills/smoke-test/scripts/smoke-pair-identity.sh finish <run-dir>
+```
+
+Every run, from the coordinator freezing before dispatch: `start` before any
+lane runs; every lane (worker, challenger, coordinator) `check`s at its own
+start and end; the coordinator `finish`es before publication. `check`/`finish`
+exit 3 on drift — finish the run **BLOCKED**, never a scored verdict — exit 2
+means the identity itself is unreadable/invalid (refuse, do not proceed), and
+exit 4 from `start` means this run already froze an identity: never re-freeze
+by calling `start` again. Reachability checks (`smoke-build-identity.sh`'s
+bundle/host and `/healthz`) stay separate from identity — they answer "is
+something serving", not "is it the pair this run claimed."
+
 A scheduled run arrives with the head already proven settled by the gate. A
 campaign someone asked for in chat does not, and must prove it before freezing
 and claim the environment after — see "Human-requested campaigns" below.
