@@ -128,17 +128,30 @@ export interface PullRequestData {
   baseRefName: string; // e.g. "main" — shadow-review.yml only selects PRs merged INTO main
   changedLines: number; // additions + deletions, EXCLUDING GENERATED_FILES — the weekly report's kLOC denominator
   changedFiles: number; // GitHub's own file count for this PR — the completeness check `resolveAtMergeContexts` needs
+  mergeCommitOid: string | null; // the merge commit's oid (gh pr list's own `mergeCommit` field), or null if unmerged/unknown
+  headRefOid: string; // the PR's head commit oid — resolveAtMergeBaseSha's "is this a normal 2-parent merge" check needs it
   /**
-   * Only ever populated for a PR merged at/after `GATE_GO_LIVE_ISO` (the review-metrics
-   * fetch layer never attempts it for an earlier one — see "Pre-gate vs. post-gate"
-   * below). `undefined`: not attempted at all (every pre-gate PR; every unit-test fixture
-   * that isn't exercising post-gate lane classification). `null`: attempted but the PR's
-   * at-merge context could not be reconstructed (a merge shape `resolveAtMergeBaseSha`
-   * doesn't recognize, an incomplete file listing, a `.github/labeler.yml` read that
-   * failed) — classified `review`, never `skip`, by `classifyAtMergeVerdict`, mirroring
-   * codex-review.sh `scope_eval`'s own "any doubt is review" rule.
+   * Only ever populated for a PR merged STRICTLY AFTER `GATE_GO_LIVE_ISO` (the
+   * review-metrics fetch layer never attempts it for an earlier or exactly-at one — see
+   * "Pre-gate vs. post-gate" below). `undefined`: not attempted at all (every pre-gate
+   * PR; every unit-test fixture that isn't exercising post-gate lane classification).
+   * `null`: attempted but the PR's at-merge context could not be reconstructed (a merge
+   * shape `resolveAtMergeBaseSha` doesn't recognize, an incomplete file listing, a
+   * `.github/labeler.yml` read that failed for a reason OTHER than the file not existing
+   * yet) — counted as `postGateUnresolved`, never as `reviewed` or `skipped`
+   * (`classifyAtMergeVerdict` itself still answers `'review'` for a nullish context, for
+   * a caller that only wants one bit; `buildWeeklyRow` checks resolution FIRST — see its
+   * own comment).
    */
   atMergeContext?: AtMergeContext | null;
+  /**
+   * True when this PR merged strictly after `GATE_GO_LIVE_ISO` by date, but
+   * `.github/labeler.yml` did not exist yet at its OWN base commit — direct evidence the
+   * gate wasn't live for this specific merge (belt and braces alongside the pinned
+   * constant: `resolveAtMergeContexts` sets this instead of leaving the PR unresolved).
+   * `buildWeeklyRow` reclassifies such a PR as pre-gate regardless of its `mergedAt`.
+   */
+  preGateOverride?: boolean;
 }
 
 /**
@@ -146,7 +159,8 @@ export interface PullRequestData {
  * and label half of codex-review.sh `audit`'s own reconstruction (`SCOPE_PIN_BASE`,
  * `GATE_LABELS`; codex-review.sh:663-701,1660-1695), replayed here from the same public
  * facts audit itself reads (the merge commit's first parent, the PR's labeled/unlabeled
- * event history, GitHub's compare API), not from whatever's true today. A `risk:high`
+ * event history, and — LOCALLY, not GitHub's compare API — the merge commit's own diff
+ * against that base), not from whatever's true today. A `risk:high`
  * glob list grows over time — 22 at go-live to 62 as of this file's last edit — and a
  * label can be added or removed after merge; either drift silently rewrites history if
  * the replay uses CURRENT state instead of AT-MERGE state (see the file header's
@@ -641,17 +655,30 @@ export function classifyAtMergeVerdict(ctx: AtMergeContext | null | undefined): 
 const SHADOW_REVIEW_BASE_REF = 'main';
 
 /**
- * When the risk-scoped merge gate went live: PR #605's `mergedAt`
- * (`gh pr view 605 --json mergedAt` against davekim917/nanoclaw —
- * `container/skills/pr-review-loop/scripts/codex-review.sh`'s `merge-check`/`scope_eval`
- * started gating merges at this instant). Every PR merged before it was auto-reviewed —
- * there was no skip verdict to have merged on — so the weekly report classifies it by a
- * plain low-risk/high-risk file class (`isLowRisk` against the CURRENT glob list, same as
- * the before/after bucket already does), never as "reviewed" or "skipped". A PR merged at
- * or after this instant gets the real post-gate verdict, replayed via
- * `classifyAtMergeVerdict`/`AtMergeContext`.
+ * When the risk-scoped merge gate effectively went live: PR #609's `mergedAt`
+ * (`gh pr view 609 --json mergedAt` against davekim917/nanoclaw —
+ * `2026-09-10T16:43:32Z`, 16 seconds after #605). #609, not #605, is the commit that
+ * actually SHIPS `.github/labeler.yml` (title: "ci: label PRs that touch high-risk
+ * paths (observe-only)") — before it, `repo_mode` reads no labeler.yml at all and
+ * `scope_eval` answers `auto`/legacy (`codex-review.sh:~622-634`), the same as no gate
+ * existing yet. #605 itself (the merge-check code) merged 16 seconds EARLIER and is
+ * therefore pre-gate under this constant — it belongs there: #605 is a linked
+ * bug-introducer (fixed by #642), and reading it as post-gate-but-unresolved would make
+ * it vanish from the report instead of landing in the pre-gate class where it's honest.
+ *
+ * Compared with STRICT `>`, not `>=`: #609 is the commit that ships the file, so a PR
+ * merged in the SAME instant as #609 (i.e. #609 itself) was not yet governed by it.
+ * Every PR merged before or AT this instant is auto-reviewed — there was no skip
+ * verdict to have merged on — so the weekly report classifies it by a plain
+ * low-risk/high-risk file class (`isLowRisk` against the CURRENT glob list, same as the
+ * before/after bucket already does), never as "reviewed" or "skipped". A PR merged
+ * STRICTLY AFTER this instant gets the real post-gate verdict, replayed via
+ * `classifyAtMergeVerdict`/`AtMergeContext` — belt and braces, `buildWeeklyRow` ALSO
+ * reclassifies a strictly-after PR as pre-gate if `.github/labeler.yml` did not exist
+ * yet at that PR's own base commit (`preGateOverride` — see `resolveAtMergeContexts`),
+ * since that is itself direct, stronger evidence the gate wasn't live for that merge.
  */
-export const GATE_GO_LIVE_ISO = '2026-09-10T16:43:16Z';
+export const GATE_GO_LIVE_ISO = '2026-09-10T16:43:32Z';
 
 /**
  * When the `Fixes-PR:` convention started: PR #642's `mergedAt` (verified via
@@ -1194,8 +1221,13 @@ function buildWeeklyRow(
   const goLiveMs = new Date(GATE_GO_LIVE_ISO).getTime();
   const conventionStartMs = new Date(FIXES_PR_CONVENTION_START_ISO).getTime();
 
-  const preGatePRs = weekPRs.filter((pr) => new Date(pr.mergedAt).getTime() < goLiveMs);
-  const postGatePRs = weekPRs.filter((pr) => new Date(pr.mergedAt).getTime() >= goLiveMs);
+  // Strict `>`/`<=`: GATE_GO_LIVE_ISO is #609's OWN mergedAt (the commit that ships
+  // labeler.yml), so #609 itself is pre-gate — see that constant's own doc comment.
+  // `preGateOverride` is belt-and-braces: a PR that is post-gate BY DATE but whose own
+  // base commit had no labeler.yml yet (resolveAtMergeContexts) is still reclassified
+  // pre-gate, never left to vanish as merely "unresolved".
+  const preGatePRs = weekPRs.filter((pr) => new Date(pr.mergedAt).getTime() <= goLiveMs || pr.preGateOverride === true);
+  const postGatePRs = weekPRs.filter((pr) => new Date(pr.mergedAt).getTime() > goLiveMs && pr.preGateOverride !== true);
   // `classifyAtMergeVerdict` itself fails closed to `'review'` for a nullish context —
   // correct for a caller that only wants one bit ("would this have gated?"), but WRONG
   // here on its own: it would silently fold every unresolved PR into `reviewed`,
@@ -1441,6 +1473,8 @@ interface RawPr {
   baseRefName: string;
   additions: number;
   deletions: number;
+  headRefOid: string;
+  mergeCommit?: { oid: string } | null;
 }
 
 interface ResolvedFileEntry {
@@ -1492,7 +1526,7 @@ export function fetchMergedPRs(repo: string, sinceIso: string): PullRequestData[
     '--search',
     `merged:>=${sinceIso}`,
     '--json',
-    'number,title,body,mergedAt,changedFiles,files,labels,baseRefName,additions,deletions',
+    'number,title,body,mergedAt,changedFiles,files,labels,baseRefName,additions,deletions,headRefOid,mergeCommit',
     '--limit',
     '1000',
   ]);
@@ -1509,27 +1543,206 @@ export function fetchMergedPRs(repo: string, sinceIso: string): PullRequestData[
       baseRefName: pr.baseRefName,
       changedLines: Math.max(0, pr.additions + pr.deletions - generatedFileChangedLines(fileEntries)),
       changedFiles: pr.changedFiles,
+      mergeCommitOid: pr.mergeCommit?.oid ?? null,
+      headRefOid: pr.headRefOid,
     };
   });
 }
 
 // ─────────────────────────── at-merge replay (I/O) ─────────────────────────
 //
-// Resolves `AtMergeContext` for every PR merged at/after `GATE_GO_LIVE_ISO` — the I/O
-// half of the pure functions above. Deliberately scoped to POST-GATE PRs only: a
+// Resolves `AtMergeContext` for every PR merged STRICTLY AFTER `GATE_GO_LIVE_ISO` — the
+// I/O half of the pure functions above. Deliberately scoped to post-gate PRs only: a
 // pre-gate PR was never subject to any skip verdict at all (see the file header and
-// `GATE_GO_LIVE_ISO`'s own doc comment), so spending a GraphQL + two REST calls per PR
-// on history that predates the gate would only cost budget for a number nobody reads.
+// `GATE_GO_LIVE_ISO`'s own doc comment), so resolving it would only cost budget for a
+// number nobody reads.
 //
-// Cost note (a known, deliberately deferred scaling concern, not fixed here): this
-// population only grows — every week that passes adds its PRs to "post-gate" and none
-// ever leave. At this file's last measurement (2026-09-12, ~68 post-gate PRs since
-// go-live two days earlier) a full run took well under a minute. Once `--weekly-days`'
-// window is mostly post-gate PRs (a few weeks from now, at this repo's throughput),
-// this may need a persistent cache keyed by PR number — an at-merge fact is immutable
-// once computed, so the RIGHT fix is caching the RESULT, not narrowing the window. Re-
-// raise if a real run starts approaching the 2-minute Actions budget the workflow's own
-// header cites.
+// **From LOCAL git, not GitHub's REST `compare`/`contents` endpoints.** An at-merge fact
+// (a base commit's tree, a merge commit's diff) never changes once computed, and this
+// population only grows — every week adds its PRs to "post-gate" and none ever leave.
+// The REST version cost 2 calls per post-gate PR (`compare` + `contents`); measured
+// against davekim917/nanoclaw with 72 post-gate PRs (2026-09-12), that was 114s of the
+// 143s full-run total (~1.58s/PR) and would cross this workflow's 5-minute timeout
+// around 170-190 post-gate PRs, and `GITHUB_TOKEN`'s 1,000 REST-requests/hour budget
+// (docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api) around 480 —
+// both within weeks at this repo's ~50-merges/day throughput, before the 2026-10-10
+// read. Local git has none of that cost: every commit this replay needs is already in
+// the checkout (`fetch-depth: 0` in review-metrics.yml), so the base commit's
+// `.github/labeler.yml` and the merge commit's diff against it are `git show`/`git
+// diff` calls against the local object database, zero REST requests either way.
+// Measured after this change: the same 72-PR run, 0 REST calls for file/glob data
+// (`gh api graphql` for label events only) — see the PR body for the before/after
+// runtime this produced.
+//
+// The ONLY thing still fetched over the network is labels-as-of-merge: GitHub's
+// labeled/unlabeled event timeline has no local-git equivalent at all.
+
+/** One `git` invocation, inheriting `process.cwd()` — the caller must already be
+ *  running from inside the checkout this replay is about (see the file header: "the
+ *  script must run the same way against the checkout", true both for a local `tsx`
+ *  invocation and `review-metrics.yml`'s `run:` step). */
+function git(args: readonly string[]): string {
+  // stderr piped and discarded, not inherited: a missing path or an unresolvable commit
+  // is an ordinary, EXPECTED outcome on this replay's fail-closed paths (every
+  // pre-labeler PR hits it), not a real fault — every caller already reads the result
+  // via a caught exception or a typed 'missing'/'error' kind, never stderr text, so
+  // inheriting it would only print a "fatal: ..." line per ordinary case.
+  return execFileSync('git', args as string[], {
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+}
+
+/** Whether `sha` resolves to a real commit in the LOCAL object database — distinct from
+ *  "resolves, but a path doesn't exist in its tree" (see `readRiskHighGlobsAtShaLocal`).
+ *  False for a commit a shallow clone never fetched, or one a force-push made
+ *  unreachable — the "handle a missing commit... as unresolved" case. */
+function commitExistsLocally(sha: string): boolean {
+  try {
+    execFileSync('git', ['cat-file', '-e', `${sha}^{commit}`], { stdio: 'ignore' });
+    return true;
+    // eslint-disable-next-line no-catch-all/no-catch-all
+  } catch {
+    return false;
+  }
+}
+
+/** `mergeCommitOid`'s parent oids, in order, or `null` when that commit isn't resolvable
+ *  locally at all (see `commitExistsLocally`) — never a guessed or empty default. */
+export function mergeCommitParentsLocal(mergeCommitOid: string): string[] | null {
+  if (!commitExistsLocally(mergeCommitOid)) return null;
+  let raw: string;
+  try {
+    raw = git(['log', '-1', '--format=%P', mergeCommitOid]);
+    // eslint-disable-next-line no-catch-all/no-catch-all
+  } catch {
+    return null;
+  }
+  const trimmed = raw.trim();
+  return trimmed === '' ? [] : trimmed.split(/\s+/);
+}
+
+export type LabelerReadResult =
+  | { kind: 'found'; globs: string[] }
+  | { kind: 'missing' } // the commit resolves locally, but the path doesn't exist in its tree
+  | { kind: 'error' }; // the commit doesn't resolve locally, or the file exists but is unparseable/wrong-shaped
+
+/**
+ * `risk:high` from `.github/labeler.yml` at commit `sha`, read from the LOCAL git
+ * object database (`git show <sha>:.github/labeler.yml`) — never GitHub's `contents`
+ * API, and never the current tip. `'missing'` (the commit itself is real, but the file
+ * isn't in its tree — a PR merged before `.github/labeler.yml` itself landed) is a
+ * DIFFERENT answer from `'error'` (the commit isn't resolvable locally at all, or the
+ * file exists but doesn't parse): `resolveAtMergeContexts` reclassifies a `'missing'`
+ * result as pre-gate (`preGateOverride`), belt-and-braces alongside the pinned
+ * `GATE_GO_LIVE_ISO`, but an `'error'` stays unresolved — a shallow clone or a
+ * force-pushed-away base is a real gap in what we can tell, not evidence of anything.
+ */
+export function readRiskHighGlobsAtShaLocal(sha: string): LabelerReadResult {
+  if (!commitExistsLocally(sha)) return { kind: 'error' };
+  let raw: string;
+  try {
+    raw = git(['show', `${sha}:.github/labeler.yml`]);
+    // eslint-disable-next-line no-catch-all/no-catch-all
+  } catch {
+    return { kind: 'missing' };
+  }
+  try {
+    return { kind: 'found', globs: globsForRiskHigh(parse(raw) as Record<string, unknown>) };
+    // eslint-disable-next-line no-catch-all/no-catch-all
+  } catch {
+    return { kind: 'error' };
+  }
+}
+
+/** One line of `git diff --name-status -M` output, split apart. `previousPath` is set
+ *  only for a rename/copy (`status` starting `R`/`C`), which `git` reports as
+ *  `<status>\t<old>\t<new>`; every other status is `<status>\t<path>`. */
+export interface GitDiffEntry {
+  status: string;
+  path: string;
+  previousPath?: string;
+}
+
+/** Pure parse of `git diff --name-status -M`'s raw stdout — no git invocation, so this
+ *  is unit-testable with plain strings. */
+export function parseGitNameStatus(raw: string): GitDiffEntry[] {
+  const entries: GitDiffEntry[] = [];
+  for (const line of raw.split('\n')) {
+    if (line.trim() === '') continue;
+    const parts = line.split('\t');
+    const status = parts[0] ?? '';
+    if (status.startsWith('R') || status.startsWith('C')) {
+      entries.push({ status, previousPath: parts[1] ?? '', path: parts[2] ?? '' });
+    } else {
+      entries.push({ status, path: parts[1] ?? '' });
+    }
+  }
+  return entries;
+}
+
+/**
+ * The merge commit's diff against `baseSha`, from LOCAL git (`git diff --name-status -M`)
+ * — mirroring `codex-review.sh scope_eval`'s own completeness rule (`codex-review.sh
+ * :756-760`) even though a local diff has no true 300-file cap: if the listed count
+ * doesn't match GitHub's own `changedFiles` for this PR, OR reaches 300, the listing is
+ * treated as incomplete/suspect the same way the gate's own REST-capped comparison
+ * would be — `null` (fail closed), never a partial list read as the whole truth.
+ * Includes each rename's PREVIOUS path alongside its new one, same as `scope_eval`:
+ * moving a file OFF a risky path still changes that path.
+ */
+export function fileDiffAtMergeLocal(baseSha: string, mergeCommitOid: string, changedFiles: number): string[] | null {
+  let raw: string;
+  try {
+    raw = git(['diff', '--name-status', '-M', baseSha, mergeCommitOid]);
+    // eslint-disable-next-line no-catch-all/no-catch-all
+  } catch {
+    return null;
+  }
+  const entries = parseGitNameStatus(raw);
+  if (entries.length >= 300) return null; // mirrors the gate's per-comparison cap
+  if (entries.length !== changedFiles) return null; // count mismatch — incomplete or wrong listing
+  const names = new Set<string>();
+  for (const e of entries) {
+    names.add(e.path);
+    if (e.previousPath) names.add(e.previousPath);
+  }
+  return [...names];
+}
+
+export type LocalAtMergeFileContext =
+  | { kind: 'resolved'; files: string[]; riskHighGlobs: string[] }
+  | { kind: 'pre-gate' }
+  | { kind: 'unresolved' };
+
+/**
+ * The file+glob half of one PR's `AtMergeContext`, from LOCAL git only — no network, no
+ * `repo` argument, so this is directly testable against a real fixture repo (see
+ * `scripts/review-outcomes.test.ts`, "at-merge replay from local git"). `'pre-gate'`
+ * surfaces `readRiskHighGlobsAtShaLocal`'s `'missing'` case up through the stack — see
+ * that function's own doc comment for why it's a different answer from `'unresolved'`.
+ */
+export function resolveAtMergeFileContextLocal(input: {
+  mergeCommitOid: string;
+  headRefOid: string;
+  changedFiles: number;
+}): LocalAtMergeFileContext {
+  const parentOids = mergeCommitParentsLocal(input.mergeCommitOid);
+  if (parentOids === null) return { kind: 'unresolved' };
+  const baseSha = resolveAtMergeBaseSha({
+    headRefOid: input.headRefOid,
+    mergeCommitOid: input.mergeCommitOid,
+    parentOids,
+  });
+  if (baseSha === null) return { kind: 'unresolved' };
+  const labelerResult = readRiskHighGlobsAtShaLocal(baseSha);
+  if (labelerResult.kind === 'missing') return { kind: 'pre-gate' };
+  if (labelerResult.kind === 'error') return { kind: 'unresolved' };
+  const files = fileDiffAtMergeLocal(baseSha, input.mergeCommitOid, input.changedFiles);
+  if (files === null) return { kind: 'unresolved' };
+  return { kind: 'resolved', files, riskHighGlobs: labelerResult.globs };
+}
 
 interface RawAtMergeLabelEventNode {
   __typename: 'LabeledEvent' | 'UnlabeledEvent';
@@ -1537,28 +1750,34 @@ interface RawAtMergeLabelEventNode {
   label: { name: string } | null;
 }
 
-interface RawAtMergePrNode {
-  headRefOid: string;
-  mergeCommit: { oid: string; parents: { totalCount: number; nodes: { oid: string }[] } } | null;
+interface RawAtMergeLabelsPrNode {
   labelEvents: { pageInfo: { hasNextPage: boolean }; nodes: RawAtMergeLabelEventNode[] };
 }
 
-const AT_MERGE_GRAPHQL_BATCH_SIZE = 15;
+const AT_MERGE_GRAPHQL_BATCH_SIZE = 30;
+
+let atMergeGraphQlFailureLogged = false;
 
 /**
- * One batched GraphQL call per `AT_MERGE_GRAPHQL_BATCH_SIZE` PR numbers — every PR
- * aliased (`pr0`, `pr1`, ...) in a single query, rather than one call per PR, to keep
- * this bounded as the post-gate population grows. PR numbers are our own already-
- * fetched integers (never PR-authored text), so inlining them directly into the query
- * string, instead of threading N `-F` variables through aliases, is safe here.
+ * One batched GraphQL call per `AT_MERGE_GRAPHQL_BATCH_SIZE` PR numbers for label-event
+ * history ONLY — every PR aliased (`pr0`, `pr1`, ...) in a single query, rather than one
+ * call per PR, to keep this bounded as the post-gate population grows. PR numbers are
+ * our own already-fetched integers (never PR-authored text), so inlining them directly
+ * into the query string, instead of threading N `-F` variables through aliases, is safe
+ * here. Never throws: a GraphQL failure (an outage, a scope problem) must not kill the
+ * whole run over one batch — it marks every PR in `prNumbers` unresolved instead, and
+ * logs the failure exactly ONCE for the whole run (`atMergeGraphQlFailureLogged`), not
+ * once per batch, so a sustained outage doesn't flood the log.
  */
-function fetchAtMergeGitContextBatch(repo: string, prNumbers: readonly number[]): Map<number, RawAtMergePrNode> {
+export function fetchAtMergeLabelEventsBatch(
+  repo: string,
+  prNumbers: readonly number[],
+): Map<number, RawAtMergeLabelEventNode[]> {
+  const result = new Map<number, RawAtMergeLabelEventNode[]>();
   const [owner, name] = repo.split('/');
   const fields = prNumbers
     .map(
       (n, i) => `pr${i}: pullRequest(number: ${n}) {
-        headRefOid
-        mergeCommit { oid parents(first: 3) { totalCount nodes { oid } } }
         labelEvents: timelineItems(itemTypes: [LABELED_EVENT, UNLABELED_EVENT], first: 100) {
           pageInfo { hasNextPage }
           nodes {
@@ -1571,145 +1790,78 @@ function fetchAtMergeGitContextBatch(repo: string, prNumbers: readonly number[])
     )
     .join('\n');
   const query = `query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) {\n${fields}\n} }`;
-  const raw = gh(['api', 'graphql', '-f', `query=${query}`, '-F', `owner=${owner}`, '-F', `name=${name}`]);
-  const parsed = JSON.parse(raw) as { data: { repository: Record<string, RawAtMergePrNode | null> } };
-  const result = new Map<number, RawAtMergePrNode>();
+  let parsed: { data: { repository: Record<string, RawAtMergeLabelsPrNode | null> } };
+  try {
+    const raw = gh(['api', 'graphql', '-f', `query=${query}`, '-F', `owner=${owner}`, '-F', `name=${name}`]);
+    parsed = JSON.parse(raw) as { data: { repository: Record<string, RawAtMergeLabelsPrNode | null> } };
+    // eslint-disable-next-line no-catch-all/no-catch-all
+  } catch (err) {
+    if (!atMergeGraphQlFailureLogged) {
+      atMergeGraphQlFailureLogged = true;
+      console.error(
+        `review-outcomes: at-merge label-event fetch failed for a batch of ${prNumbers.length} PR(s) — ` +
+          `those PRs will be reported unresolved (further failures this run are not logged again): ${String(err)}`,
+      );
+    }
+    return result; // empty — every PR in this batch is absent, which the caller reads as unresolved
+  }
   prNumbers.forEach((n, i) => {
     const node = parsed.data.repository[`pr${i}`];
-    if (node) result.set(n, node);
+    if (node && !node.labelEvents.pageInfo.hasNextPage) result.set(n, node.labelEvents.nodes);
   });
   return result;
 }
 
-interface RawCompareFile {
-  filename?: string;
-  previous_filename?: string;
-}
-
 /**
- * The merge commit's diff against `baseSha`, mirroring `codex-review.sh scope_eval`'s
- * own completeness rule EXACTLY (`codex-review.sh:756-760`): a comparison lists at most
- * 300 files, and if the listed count doesn't match GitHub's own `changedFiles` for this
- * PR, the listing is incomplete — either way, `null` (fail closed), never a partial
- * list read as the whole truth. Includes each rename's `previous_filename` alongside
- * its new name, same as `scope_eval`: moving a file OFF a risky path still changes that
- * path.
- */
-function fetchFilesAtMerge(
-  repo: string,
-  baseSha: string,
-  mergeCommitOid: string,
-  changedFiles: number,
-): string[] | null {
-  let raw: string;
-  try {
-    raw = gh(['api', `repos/${repo}/compare/${baseSha}...${mergeCommitOid}?per_page=1`]);
-    // Deliberately fail closed to `null` (unresolvable at-merge context) on ANY `gh api`
-    // failure — a network error, a 404 for a commit GitHub has since garbage-collected,
-    // anything — same "any doubt is review, never skip" rule `scope_eval` itself applies.
-    // eslint-disable-next-line no-catch-all/no-catch-all
-  } catch {
-    return null;
-  }
-  let parsed: { files?: RawCompareFile[] };
-  try {
-    parsed = JSON.parse(raw) as { files?: RawCompareFile[] };
-    // Same fail-closed reasoning: unparseable JSON from `gh` is not a listing to trust.
-    // eslint-disable-next-line no-catch-all/no-catch-all
-  } catch {
-    return null;
-  }
-  const files = parsed.files;
-  if (!Array.isArray(files)) return null;
-  const names = new Set<string>();
-  for (const f of files) {
-    if (typeof f.filename !== 'string') return null;
-    names.add(f.filename);
-    if (typeof f.previous_filename === 'string') names.add(f.previous_filename);
-  }
-  const listedCount = new Set(files.map((f) => f.filename)).size;
-  if (listedCount >= 300) return null; // GitHub's per-comparison cap — some files may be missing
-  if (listedCount !== changedFiles) return null; // count mismatch — incomplete or wrong listing
-  return [...names];
-}
-
-const riskHighGlobsAtShaCache = new Map<string, string[] | null>();
-
-/**
- * `risk:high` from `.github/labeler.yml` AT commit `sha` — never the current tip.
- * Memoized per sha: consecutive PRs' at-merge bases are usually distinct commits (each
- * merge advances `main`'s first-parent chain by one), so this rarely re-hits, but costs
- * nothing when it does. `null` — fail closed — when the file didn't exist at that
- * commit yet (a PR merged before `.github/labeler.yml` itself landed) or couldn't be
- * read or parsed.
- */
-function fetchRiskHighGlobsAtSha(repo: string, sha: string): string[] | null {
-  const cached = riskHighGlobsAtShaCache.get(sha);
-  if (cached !== undefined) return cached;
-  let globs: string[] | null;
-  try {
-    const raw = gh([
-      'api',
-      `repos/${repo}/contents/.github/labeler.yml?ref=${sha}`,
-      '-H',
-      'Accept: application/vnd.github.raw',
-    ]);
-    globs = globsForRiskHigh(parse(raw) as Record<string, unknown>);
-    // Fail closed to `null` whether the file didn't exist yet at this commit (a 404 — a
-    // PR merged before `.github/labeler.yml` itself landed), the YAML failed to parse,
-    // or `globsForRiskHigh` rejected its shape: none of those is a `risk:high` list this
-    // replay can trust.
-    // eslint-disable-next-line no-catch-all/no-catch-all
-  } catch {
-    globs = null;
-  }
-  riskHighGlobsAtShaCache.set(sha, globs);
-  return globs;
-}
-
-/**
- * Resolves `AtMergeContext` (or `null`, fail-closed) for every PR in `prs` merged at or
- * after `GATE_GO_LIVE_ISO`; a PR merged before it is left absent from the returned map
- * entirely (never attempted — see the section header above). `prs` needs only the three
- * fields the resolution actually reads, so a caller can pass raw fetch data straight
- * through without building full `PullRequestData` first.
+ * Resolves `AtMergeContext` (or `null`/`preGateOverride`, fail-closed) for every PR in
+ * `prs` merged STRICTLY AFTER `GATE_GO_LIVE_ISO`; a PR merged at or before it is left
+ * absent from the returned map entirely (never attempted — see the section header
+ * above). `prs` needs only the fields the resolution actually reads, so a caller can
+ * pass raw fetch data straight through without building full `PullRequestData` first.
  */
 export function resolveAtMergeContexts(
   repo: string,
-  prs: readonly { number: number; mergedAt: string; changedFiles: number }[],
-): Map<number, AtMergeContext | null> {
-  const result = new Map<number, AtMergeContext | null>();
+  prs: readonly {
+    number: number;
+    mergedAt: string;
+    changedFiles: number;
+    mergeCommitOid: string | null;
+    headRefOid: string;
+  }[],
+): Map<number, { atMergeContext: AtMergeContext | null; preGateOverride: boolean }> {
+  const result = new Map<number, { atMergeContext: AtMergeContext | null; preGateOverride: boolean }>();
   const goLiveMs = new Date(GATE_GO_LIVE_ISO).getTime();
-  const postGate = prs.filter((pr) => new Date(pr.mergedAt).getTime() >= goLiveMs);
+  const postGate = prs.filter((pr) => new Date(pr.mergedAt).getTime() > goLiveMs);
   for (let i = 0; i < postGate.length; i += AT_MERGE_GRAPHQL_BATCH_SIZE) {
     const batch = postGate.slice(i, i + AT_MERGE_GRAPHQL_BATCH_SIZE);
-    const gitContexts = fetchAtMergeGitContextBatch(
+    const labelEventsByPr = fetchAtMergeLabelEventsBatch(
       repo,
       batch.map((pr) => pr.number),
     );
     for (const pr of batch) {
-      const node = gitContexts.get(pr.number);
-      if (!node || !node.mergeCommit || node.labelEvents.pageInfo.hasNextPage) {
-        result.set(pr.number, null);
+      if (pr.mergeCommitOid === null) {
+        result.set(pr.number, { atMergeContext: null, preGateOverride: false });
         continue;
       }
-      const shape: MergeCommitShape = {
-        headRefOid: node.headRefOid,
-        mergeCommitOid: node.mergeCommit.oid,
-        parentOids: node.mergeCommit.parents.nodes.map((p) => p.oid),
-      };
-      const baseSha = resolveAtMergeBaseSha(shape);
-      if (baseSha === null) {
-        result.set(pr.number, null);
+      const fileContext = resolveAtMergeFileContextLocal({
+        mergeCommitOid: pr.mergeCommitOid,
+        headRefOid: pr.headRefOid,
+        changedFiles: pr.changedFiles,
+      });
+      if (fileContext.kind === 'pre-gate') {
+        result.set(pr.number, { atMergeContext: null, preGateOverride: true });
         continue;
       }
-      const files = fetchFilesAtMerge(repo, baseSha, node.mergeCommit.oid, pr.changedFiles);
-      const riskHighGlobs = files === null ? null : fetchRiskHighGlobsAtSha(repo, baseSha);
-      if (files === null || riskHighGlobs === null) {
-        result.set(pr.number, null);
+      if (fileContext.kind === 'unresolved') {
+        result.set(pr.number, { atMergeContext: null, preGateOverride: false });
         continue;
       }
-      const events: RawLabelEvent[] = node.labelEvents.nodes
+      const labelEvents = labelEventsByPr.get(pr.number);
+      if (!labelEvents) {
+        result.set(pr.number, { atMergeContext: null, preGateOverride: false });
+        continue;
+      }
+      const events: RawLabelEvent[] = labelEvents
         .filter((n): n is RawAtMergeLabelEventNode & { label: { name: string } } => n.label !== null)
         .map((n) => ({
           type: n.__typename === 'LabeledEvent' ? 'labeled' : 'unlabeled',
@@ -1717,7 +1869,10 @@ export function resolveAtMergeContexts(
           createdAt: n.createdAt,
         }));
       const labels = replayLabelsAtMerge(events, pr.mergedAt);
-      result.set(pr.number, { files, labels, riskHighGlobs });
+      result.set(pr.number, {
+        atMergeContext: { files: fileContext.files, labels, riskHighGlobs: fileContext.riskHighGlobs },
+        preGateOverride: false,
+      });
     }
   }
   return result;
@@ -2040,7 +2195,18 @@ function main(): void {
     // post-gate" note). Resolved once here, attached onto each PR object, so
     // `computeWeeklyReport` itself stays a pure function over `PullRequestData[]`.
     const atMergeContexts = resolveAtMergeContexts(options.repo, fetchedPRs);
-    const allPRs = fetchedPRs.map((pr) => ({ ...pr, atMergeContext: atMergeContexts.get(pr.number) ?? undefined }));
+    const allPRs = fetchedPRs.map((pr) => {
+      const resolved = atMergeContexts.get(pr.number);
+      // NOT `resolved?.atMergeContext ?? undefined` — `resolved.atMergeContext` can
+      // legitimately be `null` (attempted, unresolved), and `??` would collapse that
+      // into `undefined` (never attempted), erasing the distinction buildWeeklyRow's
+      // `postGateUnresolved` count depends on.
+      return {
+        ...pr,
+        atMergeContext: resolved ? resolved.atMergeContext : undefined,
+        preGateOverride: resolved ? resolved.preGateOverride : false,
+      };
+    });
 
     const cumulative = computeReport(
       allPRs,

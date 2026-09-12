@@ -1,6 +1,16 @@
-import { describe, expect, it } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
-import { enforceHermeticity } from '../src/test-hermeticity.js';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+
+import {
+  allowSubprocess,
+  clearHermeticityAttempts,
+  enforceHermeticity,
+  hermeticityAttempts,
+} from '../src/test-hermeticity.js';
 
 import {
   buildShadowReviewIndex,
@@ -13,11 +23,14 @@ import {
   extractFixesPrNumber,
   extractFixesPrNumbers,
   extractShadowReviewPrNumber,
+  fetchAtMergeLabelEventsBatch,
+  fileDiffAtMergeLocal,
   filesOverlap,
   findConventionStartIso,
   findFollowUp,
   findRevert,
   FIXES_PR_CONVENTION_START_ISO,
+  GATE_GO_LIVE_ISO,
   generatedFileChangedLines,
   globsForRiskHigh,
   hasFixesPrLine,
@@ -31,9 +44,13 @@ import {
   isRevertOf,
   isRevertPR,
   matchesAnyGlob,
+  mergeCommitParentsLocal,
+  parseGitNameStatus,
+  readRiskHighGlobsAtShaLocal,
   replayLabelsAtMerge,
   renderWeeklyMarkdown,
   resolveAtMergeBaseSha,
+  resolveAtMergeFileContextLocal,
   SHADOW_REVIEW_GO_LIVE_ISO,
   stripFencedAndCommented,
   type Options,
@@ -42,9 +59,12 @@ import {
   weeklyRevertRate,
 } from './review-outcomes.js';
 
-// This suite never shells out or touches the network — every case here exercises the
-// pure functions review-outcomes.ts factors out for exactly that reason.
+// This suite never touches the network — every case here exercises pure functions, or
+// (the "at-merge replay from local git" describe block near the end) a real `git`
+// against a throwaway fixture repo under the OS temp dir. `git` is the only subprocess
+// allowed; `gh` stays blocked, which the GraphQL-failure test below relies on directly.
 enforceHermeticity();
+allowSubprocess(['git']);
 
 function pr(overrides: Partial<PullRequestData> & { number: number }): PullRequestData {
   return {
@@ -56,6 +76,8 @@ function pr(overrides: Partial<PullRequestData> & { number: number }): PullReque
     baseRefName: 'main',
     changedLines: 0,
     changedFiles: overrides.files?.length ?? 0,
+    mergeCommitOid: null,
+    headRefOid: 'deadbeef',
     ...overrides,
   };
 }
@@ -809,8 +831,8 @@ describe('computeWeeklyReport', () => {
 
   describe('pre-gate vs. post-gate — P2 #1', () => {
     it('never counts a pre-gate PR as reviewed or skipped, only as a descriptive file class', () => {
-      // Merged before GATE_GO_LIVE_ISO (2026-09-10T16:43:16Z) — the gate did not exist
-      // yet, so there was no skip verdict to have merged on.
+      // Merged before GATE_GO_LIVE_ISO — the gate did not exist yet, so there was no
+      // skip verdict to have merged on.
       const prs = [pr({ number: 601, mergedAt: '2026-09-10T10:00:00Z', files: ['docs/pre.md'] })];
       const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
       const row = weekly.rows[0]!;
@@ -859,6 +881,47 @@ describe('computeWeeklyReport', () => {
       expect(row.reviewed).toBe(0);
       expect(row.skipped).toBe(0);
       expect(row.postGateUnresolved).toBe(1);
+    });
+
+    it('is pre-gate at EXACTLY GATE_GO_LIVE_ISO, strictly: #609 itself is the commit that ships the file', () => {
+      const prs = [pr({ number: 609, mergedAt: GATE_GO_LIVE_ISO, files: ['docs/pre.md'] })];
+      const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+      const row = weekly.rows[0]!;
+      expect(row.preGateMerged).toBe(1);
+      expect(row.postGateMerged).toBe(0);
+    });
+
+    it('is post-gate one millisecond after GATE_GO_LIVE_ISO', () => {
+      const afterGoLive = new Date(new Date(GATE_GO_LIVE_ISO).getTime() + 1).toISOString();
+      const prs = [
+        pr({
+          number: 610,
+          mergedAt: afterGoLive,
+          files: ['docs/post.md'],
+          atMergeContext: { files: ['docs/post.md'], labels: [], riskHighGlobs: RISK_GLOBS },
+        }),
+      ];
+      const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+      const row = weekly.rows[0]!;
+      expect(row.postGateMerged).toBe(1);
+      expect(row.preGateMerged).toBe(0);
+    });
+
+    it('reclassifies a post-gate-by-date PR as pre-gate when preGateOverride is set (labeler.yml missing at its own base — #605-style)', () => {
+      const prs = [
+        pr({
+          number: 605,
+          mergedAt: '2026-09-11T00:00:00Z', // strictly after GATE_GO_LIVE_ISO by date
+          files: ['container/skills/pr-review-loop/scripts/codex-review.sh'],
+          preGateOverride: true, // resolveAtMergeContexts sets this when labeler.yml didn't exist yet at the base
+          atMergeContext: undefined,
+        }),
+      ];
+      const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+      const row = weekly.rows[0]!;
+      expect(row.preGateMerged).toBe(1);
+      expect(row.postGateMerged).toBe(0);
+      expect(row.postGateUnresolved).toBe(0); // reclassified, not left dangling as unresolved
     });
   });
 
@@ -1224,5 +1287,265 @@ describe('renderWeeklyMarkdown', () => {
     const markdown = renderWeeklyMarkdown(weekly, cumulative, 8);
     expect(markdown).toContain('Cumulative');
     expect(markdown).toContain(cumulative.switchIso);
+  });
+});
+
+describe('parseGitNameStatus', () => {
+  it('parses an ordinary modify/add/delete line as {status, path}', () => {
+    expect(parseGitNameStatus('M\tsrc/a.ts')).toEqual([{ status: 'M', path: 'src/a.ts' }]);
+    expect(parseGitNameStatus('A\tsrc/new.ts')).toEqual([{ status: 'A', path: 'src/new.ts' }]);
+    expect(parseGitNameStatus('D\tsrc/gone.ts')).toEqual([{ status: 'D', path: 'src/gone.ts' }]);
+  });
+
+  it('parses a rename/copy line as {status, previousPath, path}', () => {
+    expect(parseGitNameStatus('R100\told.ts\tnew.ts')).toEqual([
+      { status: 'R100', previousPath: 'old.ts', path: 'new.ts' },
+    ]);
+    expect(parseGitNameStatus('C75\tsrc/a.ts\tsrc/b.ts')).toEqual([
+      { status: 'C75', previousPath: 'src/a.ts', path: 'src/b.ts' },
+    ]);
+  });
+
+  it('parses multiple lines and skips blank lines', () => {
+    expect(parseGitNameStatus('M\ta.ts\n\nR100\tb.ts\tc.ts\n')).toEqual([
+      { status: 'M', path: 'a.ts' },
+      { status: 'R100', previousPath: 'b.ts', path: 'c.ts' },
+    ]);
+  });
+
+  it('is empty for empty input', () => {
+    expect(parseGitNameStatus('')).toEqual([]);
+  });
+});
+
+describe('fetchAtMergeLabelEventsBatch — GraphQL failure does not kill the run', () => {
+  it('returns an empty map instead of throwing when `gh` itself is blocked/unavailable', () => {
+    // `gh` is never allowlisted in this file (only `git` is, for the fixture-repo block
+    // below) — enforceHermeticity() makes any `execFileSync('gh', ...)` throw before it
+    // reaches a real binary, which stands in exactly for a real GraphQL/network
+    // failure. The function must catch that, log once, and hand back an empty map so
+    // the caller marks those PRs unresolved and moves on to the next batch. The blocked
+    // call is a DELIBERATE hermeticity trip, asserted on below and cleared, not an
+    // accidental escape.
+    expect(() => fetchAtMergeLabelEventsBatch('owner/repo', [1, 2, 3])).not.toThrow();
+    const result = fetchAtMergeLabelEventsBatch('owner/repo', [1, 2, 3]);
+    expect(result.size).toBe(0);
+    expect(hermeticityAttempts().length).toBeGreaterThan(0);
+    expect(hermeticityAttempts()[0]).toMatchObject({ kind: 'subprocess', api: 'execFileSync', target: 'gh' });
+    clearHermeticityAttempts();
+  });
+});
+
+describe('at-merge replay from local git (fixture repo, no network) — P2', () => {
+  let repoDir: string;
+  let baseCommit: string;
+  let mergeCommit: string; // squash-shaped (1 parent): grows the glob list AND renames a file
+  let originalCwd: string;
+
+  function fixtureGit(args: string[]): string {
+    return execFileSync('git', ['-c', 'user.email=test@example.invalid', '-c', 'user.name=test', ...args], {
+      cwd: repoDir,
+      encoding: 'utf8',
+    }).trim();
+  }
+
+  beforeAll(() => {
+    originalCwd = process.cwd();
+    repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-at-merge-fixture-'));
+    fixtureGit(['init', '-q', '-b', 'main']);
+    fs.mkdirSync(path.join(repoDir, '.github'), { recursive: true });
+    fs.writeFileSync(
+      path.join(repoDir, '.github', 'labeler.yml'),
+      "risk:high:\n- changed-files:\n  - any-glob-to-any-file:\n    - 'src/guard/**'\n",
+    );
+    fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'src', 'old-name.ts'), 'old content\n');
+    fixtureGit(['add', '-A']);
+    fixtureGit(['commit', '-q', '-m', 'base: add labeler.yml and old-name.ts']);
+    baseCommit = fixtureGit(['rev-parse', 'HEAD']);
+
+    // Grow the glob list AND rename a file (pure rename, unchanged content — `-M`'s
+    // default 50% similarity threshold trivially detects it as R100).
+    fs.writeFileSync(
+      path.join(repoDir, '.github', 'labeler.yml'),
+      "risk:high:\n- changed-files:\n  - any-glob-to-any-file:\n    - 'src/guard/**'\n    - 'src/new-risky/**'\n",
+    );
+    fs.mkdirSync(path.join(repoDir, 'src', 'new-risky'), { recursive: true });
+    fixtureGit(['mv', 'src/old-name.ts', 'src/new-risky/renamed.ts']);
+    fixtureGit(['add', '-A']);
+    fixtureGit(['commit', '-q', '-m', 'grow labeler.yml globs and rename a file']);
+    mergeCommit = fixtureGit(['rev-parse', 'HEAD']);
+
+    // review-outcomes.ts's internal `git()` helper inherits process.cwd() (see the
+    // file header: "the script must run the same way against the checkout") — point it
+    // at the fixture for the rest of this describe block.
+    process.chdir(repoDir);
+  });
+
+  afterAll(() => {
+    process.chdir(originalCwd);
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  });
+
+  it('mergeCommitParentsLocal reads the real parent from local git', () => {
+    expect(mergeCommitParentsLocal(mergeCommit)).toEqual([baseCommit]);
+  });
+
+  it('mergeCommitParentsLocal reads BOTH parents, in order, for a genuine 2-parent merge commit', () => {
+    // A separate throwaway repo: base branch + a feature branch merged with --no-ff,
+    // so this is a REAL 2-parent GitHub-shaped merge commit, not a squash.
+    const twoParentRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-2parent-fixture-'));
+    function g(args: string[]): string {
+      return execFileSync('git', ['-c', 'user.email=test@example.invalid', '-c', 'user.name=test', ...args], {
+        cwd: twoParentRepo,
+        encoding: 'utf8',
+      }).trim();
+    }
+    g(['init', '-q', '-b', 'main']);
+    fs.writeFileSync(path.join(twoParentRepo, 'a.txt'), 'a\n');
+    g(['add', '-A']);
+    g(['commit', '-q', '-m', 'base']);
+    const mainTip = g(['rev-parse', 'HEAD']);
+    g(['checkout', '-q', '-b', 'feature']);
+    fs.writeFileSync(path.join(twoParentRepo, 'b.txt'), 'b\n');
+    g(['add', '-A']);
+    g(['commit', '-q', '-m', 'feature work']);
+    const featureHead = g(['rev-parse', 'HEAD']);
+    g(['checkout', '-q', 'main']);
+    g(['merge', '--no-ff', '-q', '-m', 'Merge feature', 'feature']);
+    const twoParentMerge = g(['rev-parse', 'HEAD']);
+    process.chdir(twoParentRepo);
+    try {
+      expect(mergeCommitParentsLocal(twoParentMerge)).toEqual([mainTip, featureHead]);
+    } finally {
+      process.chdir(repoDir);
+      fs.rmSync(twoParentRepo, { recursive: true, force: true });
+    }
+  });
+
+  it('mergeCommitParentsLocal is null for a commit not resolvable locally (shallow clone / force-pushed-away base)', () => {
+    expect(mergeCommitParentsLocal('0000000000000000000000000000000000000000')).toBeNull();
+  });
+
+  it('readRiskHighGlobsAtShaLocal reads risk:high globs AT the base commit, not the merge commit', () => {
+    expect(readRiskHighGlobsAtShaLocal(baseCommit)).toEqual({ kind: 'found', globs: ['src/guard/**'] });
+  });
+
+  it('readRiskHighGlobsAtShaLocal is "missing" (not "error") when the commit exists but predates labeler.yml', () => {
+    const preLabelerRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-pre-labeler-fixture-'));
+    function g(args: string[]): string {
+      return execFileSync('git', ['-c', 'user.email=test@example.invalid', '-c', 'user.name=test', ...args], {
+        cwd: preLabelerRepo,
+        encoding: 'utf8',
+      }).trim();
+    }
+    g(['init', '-q', '-b', 'main']);
+    fs.writeFileSync(path.join(preLabelerRepo, 'README.md'), 'no labeler yet\n');
+    g(['add', '-A']);
+    g(['commit', '-q', '-m', 'pre-labeler commit']);
+    const preLabelerCommit = g(['rev-parse', 'HEAD']);
+    process.chdir(preLabelerRepo);
+    try {
+      expect(readRiskHighGlobsAtShaLocal(preLabelerCommit)).toEqual({ kind: 'missing' });
+    } finally {
+      process.chdir(repoDir);
+      fs.rmSync(preLabelerRepo, { recursive: true, force: true });
+    }
+  });
+
+  it('readRiskHighGlobsAtShaLocal is "error" for a commit that is not resolvable at all', () => {
+    expect(readRiskHighGlobsAtShaLocal('0000000000000000000000000000000000000000')).toEqual({ kind: 'error' });
+  });
+
+  it('fileDiffAtMergeLocal includes BOTH the old and new path of a rename', () => {
+    const files = fileDiffAtMergeLocal(baseCommit, mergeCommit, 2);
+    expect(files).not.toBeNull();
+    expect(files).toContain('src/old-name.ts');
+    expect(files).toContain('src/new-risky/renamed.ts');
+    expect(files).toContain('.github/labeler.yml');
+  });
+
+  it("fileDiffAtMergeLocal is null (fail closed) when the changedFiles count does not match — mirrors the gate's completeness rule", () => {
+    expect(fileDiffAtMergeLocal(baseCommit, mergeCommit, 99)).toBeNull();
+  });
+
+  it('resolveAtMergeFileContextLocal resolves the full file+glob context in one call', () => {
+    const ctx = resolveAtMergeFileContextLocal({
+      mergeCommitOid: mergeCommit,
+      headRefOid: mergeCommit,
+      changedFiles: 2,
+    });
+    expect(ctx.kind).toBe('resolved');
+    if (ctx.kind === 'resolved') {
+      expect(ctx.riskHighGlobs).toEqual(['src/guard/**']); // the AT-MERGE (base) list, not the grown one
+      expect(ctx.files).toContain('src/new-risky/renamed.ts');
+    }
+  });
+
+  it('resolveAtMergeFileContextLocal is "pre-gate" when the base predates labeler.yml', () => {
+    const preLabelerRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-pre-labeler-ctx-'));
+    function g(args: string[]): string {
+      return execFileSync('git', ['-c', 'user.email=test@example.invalid', '-c', 'user.name=test', ...args], {
+        cwd: preLabelerRepo,
+        encoding: 'utf8',
+      }).trim();
+    }
+    g(['init', '-q', '-b', 'main']);
+    fs.writeFileSync(path.join(preLabelerRepo, 'README.md'), 'no labeler yet\n');
+    g(['add', '-A']);
+    g(['commit', '-q', '-m', 'pre-labeler']);
+    fs.writeFileSync(path.join(preLabelerRepo, 'README.md'), 'still no labeler\n');
+    g(['add', '-A']);
+    g(['commit', '-q', '-m', 'a one-parent "merge" onto the pre-labeler base']);
+    const squashCommit = g(['rev-parse', 'HEAD']);
+    process.chdir(preLabelerRepo);
+    try {
+      const ctx = resolveAtMergeFileContextLocal({
+        mergeCommitOid: squashCommit,
+        headRefOid: squashCommit,
+        changedFiles: 1,
+      });
+      expect(ctx).toEqual({ kind: 'pre-gate' });
+    } finally {
+      process.chdir(repoDir);
+      fs.rmSync(preLabelerRepo, { recursive: true, force: true });
+    }
+  });
+
+  it('resolveAtMergeFileContextLocal is "unresolved" for a merge commit oid that is not resolvable locally', () => {
+    const ctx = resolveAtMergeFileContextLocal({
+      mergeCommitOid: '0000000000000000000000000000000000000000',
+      headRefOid: '0000000000000000000000000000000000000000',
+      changedFiles: 1,
+    });
+    expect(ctx).toEqual({ kind: 'unresolved' });
+  });
+
+  describe('the #620-style regression, replayed against a real fixture repo', () => {
+    const CURRENT_RISK_GLOBS = ['src/guard/**', 'src/new-risky/**']; // grown AFTER this "merge"
+
+    it('classifies skip under the AT-MERGE glob list even though the CURRENT (grown) list would flip it to review', () => {
+      const ctx = resolveAtMergeFileContextLocal({
+        mergeCommitOid: mergeCommit,
+        headRefOid: mergeCommit,
+        changedFiles: 2,
+      });
+      expect(ctx.kind).toBe('resolved');
+      if (ctx.kind !== 'resolved') return;
+      expect(classifyAtMergeVerdict({ files: ctx.files, labels: [], riskHighGlobs: ctx.riskHighGlobs })).toBe('skip');
+    });
+
+    it('sanity check: the SAME files classify review under the CURRENT (grown) glob list — confirms a real divergence', () => {
+      const ctx = resolveAtMergeFileContextLocal({
+        mergeCommitOid: mergeCommit,
+        headRefOid: mergeCommit,
+        changedFiles: 2,
+      });
+      expect(ctx.kind).toBe('resolved');
+      if (ctx.kind !== 'resolved') return;
+      expect(classifyAtMergeVerdict({ files: ctx.files, labels: [], riskHighGlobs: CURRENT_RISK_GLOBS })).toBe(
+        'review',
+      );
+    });
   });
 });

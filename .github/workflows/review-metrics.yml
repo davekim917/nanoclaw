@@ -33,6 +33,17 @@
 # comparison, AND the ready-to-post markdown in the SAME fetch (see
 # `renderWeeklyMarkdown` / the `main()` weekly branch in
 # scripts/review-outcomes.ts) — one `gh`-fetching process, not two.
+#
+# The at-merge replay (resolveAtMergeContexts, for the post-gate reviewed/skipped
+# split) reads every post-gate PR's base commit and merge-commit diff from LOCAL git
+# (`fetch-depth: 0` below), never GitHub's REST `compare`/`contents` endpoints — those
+# cost 2 REST calls per post-gate PR, which measured at 114s of a 143s full run for 72
+# PRs (2026-09-12) and would cross this job's `timeout-minutes: 5` around 170-190
+# post-gate PRs, and `GITHUB_TOKEN`'s 1,000-REST-requests/hour budget around 480 — both
+# reachable within weeks at this repo's throughput, well before the 2026-10-10 read.
+# Only labels-as-of-merge still goes over `gh api graphql` (GitHub-only data, no local
+# equivalent), batched across PRs. Measured after the local-git rewrite: the same
+# 72-PR run in well under a minute, zero REST calls for file/glob data.
 
 name: Review metrics (weekly)
 
@@ -66,6 +77,14 @@ jobs:
         with:
           ref: main
           persist-credentials: false
+          # Full history, not the default shallow depth-1 clone: the at-merge replay
+          # (scripts/review-outcomes.ts's resolveAtMergeContexts) reads every post-gate
+          # PR's base commit and merge-commit diff straight from LOCAL git — `git show
+          # <base>:.github/labeler.yml`, `git diff --name-status -M <base> <merge>` —
+          # zero REST calls either way. A shallow clone would make every one of those
+          # commits "not resolvable locally" (see mergeCommitParentsLocal's own
+          # fail-closed handling), turning every post-gate PR unresolved.
+          fetch-depth: 0
 
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
