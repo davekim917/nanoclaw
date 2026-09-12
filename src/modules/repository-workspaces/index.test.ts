@@ -138,6 +138,7 @@ import { closeDb, initTestDb, getRawDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
 import type { Session } from '../../types.js';
 import {
+  _setPublishClaimWaitForTesting,
   _setRepositoryCheckoutHooksForTesting,
   applyRepositoryCheckoutAction,
   applyRepositoryPublishAction,
@@ -1048,6 +1049,74 @@ describe('durable canonical publication core', () => {
       expect(fs.existsSync(stage)).toBe(false);
       expect(fs.existsSync(path.dirname(stage))).toBe(false);
       expect(git(canonical, ['rev-parse', 'HEAD'])).toBe(canonicalHead);
+    });
+
+    it("waits for another operation's claim on the requester's work unit, then publishes once it is released", async () => {
+      // The real 1 s poll: a same-thread checkout or cleanup holds this claim
+      // for seconds, and the publish must outwait it rather than fail.
+      const requestId = 'repo-1723600000000-1c2d3e4f5a6b7c8d';
+      await seed();
+      const requesterUnit = unitFor(requester);
+      const observed = observeThreadScopedPublish(requesterUnit, unitFor(otherThread));
+      const stage = stageFor(requestId);
+      let releaseOther!: () => void;
+      const otherOperation = withRepositoryLifecycleClaims(
+        [requesterUnit],
+        () =>
+          new Promise<void>((resolve) => {
+            releaseOther = resolve;
+          }),
+      );
+
+      const settled = applyRepositoryPublishAction(
+        { requestId, repo: 'proj', origin: remote, repositoryId: remote },
+        requester,
+      ).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      // Still waiting on the other operation: nothing drained, nothing answered.
+      expect(observed.drained).toEqual([]);
+      expect(observed.notices).toEqual([]);
+
+      releaseOther();
+      await otherOperation;
+      expect(await settled).toBeNull();
+      expect(observed.drained).toEqual([[requester.id, sameThread.id].sort()]);
+      expect(observed.notices.map((notice) => notice.id)).toEqual([`repository-publish-complete-${requestId}`]);
+      expect(fs.existsSync(path.join(canonicalRepoDir('wg-a', 'proj', hostActionDataDir), '.git'))).toBe(true);
+      expect(fs.existsSync(stage)).toBe(false);
+    });
+
+    it('fails with a retryable explanation when the claim outlasts the wait, draining nothing', async () => {
+      const requestId = 'repo-1723600000000-9e8d7c6b5a4f3e2d';
+      await seed();
+      const requesterUnit = unitFor(requester);
+      const observed = observeThreadScopedPublish(requesterUnit, unitFor(otherThread));
+      // The other operation still holds the claim when the requester is woken
+      // with its failure notice, so this wake runs under that claim.
+      hostActionMocks.wakeRepositoryMountSessions.mockImplementation(() => undefined);
+      const stage = stageFor(requestId);
+
+      _setPublishClaimWaitForTesting({ pollMs: 10, timeoutMs: 50 });
+      try {
+        await withRepositoryLifecycleClaims([requesterUnit], async () => {
+          await expect(
+            applyRepositoryPublishAction({ requestId, repo: 'proj', origin: remote, repositoryId: remote }, requester),
+          ).rejects.toThrow(/another repository operation on this thread held its lifecycle claim/);
+        });
+      } finally {
+        _setPublishClaimWaitForTesting(null);
+      }
+
+      expect(observed.drained).toEqual([]);
+      expect(observed.notices).toHaveLength(1);
+      expect(observed.notices[0]).toMatchObject({ id: `repository-publish-failed-${requestId}`, onWake: 0 });
+      expect(observed.notices[0]!.text).toContain('another repository operation on this thread');
+      expect(observed.notices[0]!.text).toContain('clone_repo can be retried');
+      expect(fs.existsSync(path.join(stage, '.git'))).toBe(true);
+      expect(fs.existsSync(canonicalRepoDir('wg-a', 'proj', hostActionDataDir))).toBe(false);
     });
   });
 });

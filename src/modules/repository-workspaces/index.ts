@@ -1414,6 +1414,18 @@ async function workUnitForSession(session: Session, workgroupId: string): Promis
   });
 }
 
+/** How often a publish re-checks a lifecycle claim another operation holds on the requester's work unit. */
+const PUBLISH_CLAIM_POLL_MS = 1_000;
+/** How long a publish waits for that claim before it fails. */
+const PUBLISH_CLAIM_WAIT_MS = 120_000;
+
+let publishClaimWait = { pollMs: PUBLISH_CLAIM_POLL_MS, timeoutMs: PUBLISH_CLAIM_WAIT_MS };
+
+/** Test seam for the publish claim wait; `null` restores the defaults. */
+export function _setPublishClaimWaitForTesting(wait: { pollMs: number; timeoutMs: number } | null): void {
+  publishClaimWait = wait ?? { pollMs: PUBLISH_CLAIM_POLL_MS, timeoutMs: PUBLISH_CLAIM_WAIT_MS };
+}
+
 export async function applyRepositoryPublishAction(content: Record<string, unknown>, session: Session): Promise<void> {
   const requestId = typeof content.requestId === 'string' ? content.requestId : '';
   const repo = typeof content.repo === 'string' ? content.repo : '';
@@ -1431,6 +1443,7 @@ export async function applyRepositoryPublishAction(content: Record<string, unkno
   let mountSessions: Session[] = [];
   let releaseWakeSessions: Session[] = [];
   let quiescence: RepositoryMountQuiescence | null = null;
+  let claimHeldAfterWait = false;
   try {
     // Refuse before the drain what the publication would refuse after it (#697).
     assertPublishCanMatchCanonical({ workgroupId, repo, origin, repositoryId });
@@ -1453,9 +1466,20 @@ export async function applyRepositoryPublishAction(content: Record<string, unkno
     // topic root, so the whole work unit goes. Its lifecycle claim closes spawn
     // admission for that work unit (container-runner.ts:1688-1690) and marks its
     // fences as in flight to the orphan-fence pass (repo-fence-recovery.ts:105-113).
-    // The claim throws when already held (repository-workspaces.ts:233-235);
-    // publish stays on the global lane with transfer, so those two never meet
-    // on it.
+    // The claim throws when already held (repository-workspaces.ts:233-235).
+    // Publish stays on the global lane with transfer, so those two never meet
+    // on it, but a same-thread checkout or topic cleanup holds it for seconds
+    // (index.ts checkoutRepository, worktree-cleanup.ts:589, :627). So wait for
+    // it, bounded, instead of failing the publish outright.
+    const claimDeadline = Date.now() + publishClaimWait.timeoutMs;
+    while (isRepositoryLifecycleClaimed(requesterWorkUnit) && Date.now() < claimDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, publishClaimWait.pollMs));
+    }
+    // No await from here to the claim: withRepositoryLifecycleClaims tests and
+    // takes its keys synchronously, before its first await
+    // (repository-workspaces.ts:233-237), so nothing can take the claim between
+    // the last check above and this one. Past the deadline it still throws.
+    claimHeldAfterWait = isRepositoryLifecycleClaimed(requesterWorkUnit);
     await withRepositoryLifecycleClaims([requesterWorkUnit], async () => {
       mountSessions = await sessionsForWorkUnit(requesterWorkUnit);
 
@@ -1502,6 +1526,15 @@ export async function applyRepositoryPublishAction(content: Record<string, unkno
       quiescence = error.barriersReleased ? null : error.quiescence;
     }
     let failure: unknown = error;
+    if (claimHeldAfterWait) {
+      // Still held at the deadline, so the claim itself threw
+      // (repository-workspaces.ts:235) and nothing was drained or published.
+      failure = new Error(
+        `another repository operation on this thread held its lifecycle claim for more than ` +
+          `${Math.ceil(publishClaimWait.timeoutMs / 1000)} s, so publication never started; clone_repo can be retried`,
+        { cause: error },
+      );
+    }
     let barriersReleased = quiescence === null;
     if (quiescence) {
       try {
