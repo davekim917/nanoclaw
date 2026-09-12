@@ -2300,27 +2300,68 @@ function lineParsesHeadFlag(line: string): boolean {
 }
 
 /**
- * Names of `blocks` whose OWN attributed text (arm range, plus any resolved
- * `_main` delegate body) contains a line that parses `--head` as its own flag
- * (lineParsesHeadFlag) — a content check, not a shape match. Deliberately
- * broader than headTakingNames' bare-`--head)`-only pattern: that narrowness
- * is exactly what left three more parsing shapes ([ --head = "$1" ], the
- * `test` builtin, [[ =~ ]]) unattributed to any regex at all, so widening a
- * shape pattern only adds a fourth. This needs no updating for a new
- * equality/case spelling because it never looks at the spelling — only at
- * whether `--head` and `$1` are tested together at all (#730 P3 round 3).
+ * The bare identifier an arm's own text forwards its arguments to via a
+ * standalone `<name> "$@"` statement (the same shape `merge_check_main
+ * "$@"` and `ci_wait_main "$@"` already use) — by ANY name, not only one
+ * ending in `_main`. discoverArmBlocks' own delegate regex is deliberately
+ * narrower: the round-2 cross-check above depends on it staying that way
+ * (its "catches a helper delegate not named _main" mutation pins exactly
+ * this narrowness), so round 4 gives THIS test its own, separate, broader
+ * attribution instead of loosening that shared one. Anchored to a whole
+ * line (only whitespace before the name and after the closing quote) so it
+ * can't mistake a real line elsewhere in this script — `for arg in "$@"; do`,
+ * `git push "$@"` — for a delegate call (#730 P3 round 4 gap 2).
  */
-function mentionsHeadAnywhere(lines: string[], blocks: ArmBlock[]): Set<string> {
+function delegateCalledByArm(armOwnText: string): string | null {
+  const m = /^[ \t]*([a-zA-Z_]\w*)[ \t]+"\$@"[ \t]*$/m.exec(armOwnText);
+  return m ? m[1] : null;
+}
+
+/** `name`'s function body range in `lines` — the same shape as discoverArmBlocks' own (private) functionBodyRange, duplicated here so round 4's broader delegate names don't need that function exported or its `_main`-only caller changed. */
+function functionBodyRangeByName(lines: string[], name: string): [number, number] | null {
+  const start = lines.findIndex((l) => l === `${name}() {`);
+  if (start === -1) return null;
+  const end = lines.findIndex((l, i) => i > start && l === '}');
+  return end === -1 ? null : [start, end];
+}
+
+/**
+ * Names of every subcommand — from the UNION of the usage string
+ * (usageSubcommandNames) and discoverArmBlocks' own arm discovery, so an arm
+ * present in the dispatcher but missing from an out-of-date usage string is
+ * still tested (#730 P3 round 4 gap 1: bash's `case "$1" in` dispatches to
+ * an arm exactly the same either way — the usage string is only ever the
+ * error message `${1:?usage:...}` prints for a MISSING `$1`, never consulted
+ * by case matching itself) — whose own code contains a line that parses
+ * `--head` as its own flag (lineParsesHeadFlag): checked against the arm's
+ * own span first and, when that alone shows nothing, against the body of
+ * ANY function it forwards to by a bare `<name> "$@"` statement
+ * (delegateCalledByArm) — not only a `_main`-suffixed one (round 4 gap 2).
+ * A content check, not a shape match: deliberately broader than
+ * headTakingNames' bare-`--head)`-only pattern, which is exactly what left
+ * three parsing shapes unattributed in round 3, and needs no updating for a
+ * new equality/case spelling because it never looks at the spelling.
+ */
+function mentionsHeadAnywhere(source: string, lines: string[]): Set<string> {
+  const blocks = discoverArmBlocks(lines);
+  const blockByName = new Map(blocks.map((b) => [b.name, b] as const));
+  const allNames = new Set([...usageSubcommandNames(source), ...blocks.map((b) => b.name)]);
   const names = new Set<string>();
-  for (const b of blocks) {
-    for (const [s, e] of b.ranges) {
-      for (let i = s; i <= e; i++) {
-        if (lineParsesHeadFlag(lines[i])) {
-          names.add(b.name);
-          break;
-        }
+  for (const name of allNames) {
+    const block = blockByName.get(name);
+    if (!block) continue; // named in the usage string, but no arm text discoverArmBlocks could attribute — nothing to scan
+    const [s, e] = block.ranges[0]; // the arm's own span — never discoverArmBlocks' own narrower _main-only delegate range
+    let hit = false;
+    for (let i = s; i <= e && !hit; i++) if (lineParsesHeadFlag(lines[i])) hit = true;
+    if (!hit) {
+      const delegateName = delegateCalledByArm(lines.slice(s, e + 1).join('\n'));
+      const fnRange = delegateName ? functionBodyRangeByName(lines, delegateName) : null;
+      if (fnRange) {
+        const [fs, fe] = fnRange;
+        for (let i = fs; i <= fe && !hit; i++) if (lineParsesHeadFlag(lines[i])) hit = true;
       }
     }
+    if (hit) names.add(name);
   }
   return names;
 }
@@ -2493,8 +2534,18 @@ describe('every subcommand whose own code mentions --head, in any shape, rejects
   const source = fs.readFileSync(HELPER, 'utf8');
   const lines = source.split('\n');
   const usageNames = usageSubcommandNames(source);
-  const headMentioningBlocks = mentionsHeadAnywhere(lines, discoverArmBlocks(lines));
-  const headMentioning = usageNames.filter((name) => headMentioningBlocks.has(name));
+  const headMentioning = [...mentionsHeadAnywhere(source, lines)];
+
+  // A regression that emptied the usage string would still leave
+  // mentionsHeadAnywhere's arm-derived side of the union finding these four
+  // (discoverArmBlocks doesn't read the usage string at all) — so this is
+  // its own guard, independent of that union, against exactly the failure
+  // mode "renamed it must still exit 1" (usageSubcommandNames throws when it
+  // can't find the pattern at all) does not cover: the pattern still
+  // matches, but its captured list is empty or wrong.
+  it('the usage string names at least the subcommands this file is known to cover', () => {
+    expect(usageNames).toEqual(expect.arrayContaining(['ci-wait', 'merge-check', 'merge', 'receipt']));
+  });
 
   // A regression that silently found zero subcommands (a broken usage-string
   // parse, or a discoverArmBlocks change that stopped finding arms at all)
@@ -2572,7 +2623,7 @@ describe('every subcommand whose own code mentions --head, in any shape, rejects
       // so it actually reaches the probe below the way a real regression would.
       const mutatedLines = mutated.split('\n');
       const mutatedUsageNames = usageSubcommandNames(mutated);
-      const mutatedHeadMentioning = mentionsHeadAnywhere(mutatedLines, discoverArmBlocks(mutatedLines));
+      const mutatedHeadMentioning = mentionsHeadAnywhere(mutated, mutatedLines);
       expect(mutatedUsageNames).toContain(cmd);
       expect(mutatedHeadMentioning.has(cmd)).toBe(true);
 
@@ -2584,6 +2635,156 @@ describe('every subcommand whose own code mentions --head, in any shape, rejects
       // The real invariant the it.each above enforces would fail here: an
       // unvalidated empty --head reached a real gh call instead of exiting 2
       // first.
+      expect(result.calls).not.toBe('');
+    });
+  }
+
+  // #730 P3 round 4 (the last placement gap the approval flagged): two more
+  // ways an unvalidated --head parser hid from the probe above — neither a
+  // new parsing SHAPE this time, a placement gap instead.
+  //   1. mentionsHeadAnywhere used to intersect discoverArmBlocks' own arm
+  //      names with the usage string's, so an arm added to the dispatcher
+  //      without also updating the usage string's subcommand list vanished
+  //      from the probe entirely — even though bash's `case "$1" in`
+  //      dispatches to it exactly the same either way; the usage string is
+  //      only ever the error message `${1:?usage:...}` prints for a MISSING
+  //      $1, never consulted by case matching itself.
+  //   2. discoverArmBlocks' own delegate detection requires a `_main`-
+  //      suffixed function name by design (the round-2 cross-check above
+  //      depends on that narrowness — its own "catches a helper delegate not
+  //      named _main" mutation pins it), so a --head parser living inside a
+  //      helper named anything else was invisible to it.
+  // Fixed by probing the UNION of the usage string's names and
+  // discoverArmBlocks' own arm names, and by giving mentionsHeadAnywhere its
+  // own, separate delegate attribution (delegateCalledByArm /
+  // functionBodyRangeByName) that accepts any bare `<name> "$@"` forwarding
+  // statement, not only a `_main`-suffixed one — without touching
+  // discoverArmBlocks itself, so the round-2 cross-check's own narrower
+  // behavior stays exactly as its mutation test pins it. Each variant below
+  // isolates one gap (or both at once, with --head parsed on a single line —
+  // mid-line, past where the narrow case-arm-only pattern anchors, the shape
+  // this whole class has been about since round 2): before this fix, all
+  // four vanish from the probe entirely and the fake subcommand exits 0
+  // after a real, unvalidated gh read.
+  const PLACEMENT_GAPS: {
+    label: string;
+    cmd: string;
+    addToUsage: boolean;
+    armText: string;
+    helperText?: string;
+  }[] = [
+    {
+      label: 'an arm present in the dispatcher but missing from the usage string',
+      cmd: 'probe-missing-usage',
+      addToUsage: false,
+      armText: `
+  probe-missing-usage)
+    shift
+    head=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --head) head="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    gh api "repos/$REPO/pulls/$PR" >/dev/null 2>&1 || true
+    ;;`,
+    },
+    {
+      label: 'a delegate helper called by a name not ending in _main',
+      cmd: 'probe-nonmain-delegate',
+      addToUsage: true,
+      armText: `
+  probe-nonmain-delegate)
+    shift
+    probe_nonmain_helper "$@"
+    ;;`,
+      helperText: `
+probe_nonmain_helper() {
+  head=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --head) head="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  gh api "repos/$REPO/pulls/$PR" >/dev/null 2>&1 || true
+}`,
+    },
+    {
+      label: 'missing from the usage string, with --head parsed on a single-line case',
+      cmd: 'probe-missing-usage-oneline',
+      addToUsage: false,
+      armText: `
+  probe-missing-usage-oneline)
+    shift
+    head=""
+    while [ $# -gt 0 ]; do case "$1" in --head) head="$2"; shift 2 ;; *) shift ;; esac; done
+    gh api "repos/$REPO/pulls/$PR" >/dev/null 2>&1 || true
+    ;;`,
+    },
+    {
+      label: 'a non-_main delegate whose --head parsing is a single-line case',
+      cmd: 'probe-nonmain-delegate-oneline',
+      addToUsage: true,
+      armText: `
+  probe-nonmain-delegate-oneline)
+    shift
+    probe_nonmain_helper_oneline "$@"
+    ;;`,
+      helperText: `
+probe_nonmain_helper_oneline() {
+  head=""
+  while [ $# -gt 0 ]; do case "$1" in --head) head="$2"; shift 2 ;; *) shift ;; esac; done
+  gh api "repos/$REPO/pulls/$PR" >/dev/null 2>&1 || true
+}`,
+    },
+  ];
+
+  for (const gap of PLACEMENT_GAPS) {
+    it(`catches ${gap.label}`, () => {
+      let mutated = source.replace('  open)', `${gap.armText}\n  open)`);
+      expect(mutated).not.toBe(source);
+
+      if (gap.helperText) {
+        // Defined immediately BEFORE the dispatcher, not appended at file
+        // end: bash executes top-to-bottom, so a function definition placed
+        // after the case statement that calls it would not exist yet at
+        // call time — a real run would hit "command not found" (and exit,
+        // under `set -e`, before ever reaching the gh call this test proves
+        // happens instead).
+        const withHelper = mutated.replace(
+          'case "${1:?usage:',
+          `${gap.helperText}\ncase "\${1:?usage:`,
+        );
+        expect(withHelper).not.toBe(mutated);
+        mutated = withHelper;
+      }
+
+      if (gap.addToUsage) {
+        const withUsage = mutated.replace(
+          /(case "\$\{1:\?usage:[^}]+)(\}" in)/,
+          (_all: string, head: string, tail: string) => `${head}|${gap.cmd}${tail}`,
+        );
+        expect(withUsage).not.toBe(mutated);
+        mutated = withUsage;
+      }
+
+      // Sanity: this variant really does isolate the gap it claims to —
+      // present in (or absent from) the usage string exactly as intended,
+      // nothing more.
+      const mutatedLines = mutated.split('\n');
+      expect(usageSubcommandNames(mutated).includes(gap.cmd)).toBe(gap.addToUsage);
+      expect(mentionsHeadAnywhere(mutated, mutatedLines).has(gap.cmd)).toBe(true);
+
+      const root = tempRoot();
+      const scriptPath = path.join(root, 'codex-review.sh');
+      fs.writeFileSync(scriptPath, mutated);
+      const result = runHelper(root, [gap.cmd, '--head', ''], {}, scriptPath);
+
+      // The real invariant the it.each above enforces would fail here too:
+      // an unvalidated empty --head reached a real gh call instead of
+      // exiting 2 first.
       expect(result.calls).not.toBe('');
     });
   }
