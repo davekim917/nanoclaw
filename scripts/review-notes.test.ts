@@ -1,7 +1,8 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 
 /**
  * docs/review-notes.md is the review loop's memory: one line per lesson, which
@@ -24,6 +25,7 @@ import { describe, expect, it } from 'vitest';
  */
 
 const NOTES_PATH = path.join(__dirname, '..', 'docs', 'review-notes.md');
+const REPO_ROOT = path.join(__dirname, '..');
 const SEPARATOR = ' · ';
 const PR_FIELD = /^(#\d+(\/#\d+)*|rule)$/;
 const CLASS_ENTRY = /^- `([^`]+)` — \S/;
@@ -31,6 +33,44 @@ const CLASS_ENTRY = /^- `([^`]+)` — \S/;
 // `.`), a file:line, a PR or issue number, or a commit sha (7-40 hex digits,
 // at least one of them a digit, so a hex-letter word never passes as one).
 const CITATIONS = [/`[^`]*[./][^`]*`/, /[\w./-]+\.\w+:\d+/, /#\d+/, /\b(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b/];
+
+// #707 P3-d: CITATIONS only checks shape, so a citation can be well-formed and
+// still be wrong — a renamed file, a typo, a line moved past the file's end.
+// When a repo root is given, these two check it names something real at that
+// root, at HEAD:
+//   - a whitespace-free backtick span with a `.` or `/` and no `:line` tail
+//     must be an existing path;
+//   - a `path.ext:N` (or `path.ext:N-M`) span, backtick-quoted or bare, must
+//     name an existing file with at least N lines.
+// `#<n>` and a commit sha are left format-only: neither can be checked
+// offline — there is no local issue/PR list, and a sha may predate this
+// checkout's history or belong to a commit later squashed or rebased away.
+const CITED_BACKTICK_PATH_RE = /`([\w.][^`\s]*)`/g;
+const CITED_FILE_LINE_RE = /([\w./-]+\.\w+):(\d+)(?:-\d+)?/g;
+
+/** Existence problems for one structural-fix field's citations, checked against `root`. */
+function citationExistenceProblems(fix: string, root: string): string[] {
+  const problems: string[] = [];
+
+  for (const [, file, lineStr] of fix.matchAll(CITED_FILE_LINE_RE)) {
+    const full = path.join(root, file);
+    if (!fs.existsSync(full) || !fs.statSync(full).isFile()) {
+      problems.push(`cites \`${file}:${lineStr}\`, but ${file} does not exist`);
+      continue;
+    }
+    const lineCount = fs.readFileSync(full, 'utf8').split('\n').length;
+    if (lineCount < Number(lineStr))
+      problems.push(`cites \`${file}:${lineStr}\`, but ${file} has only ${lineCount} lines`);
+  }
+
+  for (const [, span] of fix.matchAll(CITED_BACKTICK_PATH_RE)) {
+    if (!/[./]/.test(span)) continue; // not path-like: a bare identifier, not a citation
+    if (/:\d/.test(span)) continue; // a file:line span, already checked above
+    if (!fs.existsSync(path.join(root, span))) problems.push(`cites \`${span}\`, which does not exist in the repo`);
+  }
+
+  return problems;
+}
 
 type Lesson = { line: number; date: string; cls: string; fix: string };
 
@@ -52,9 +92,17 @@ function isRealDate(date: string): boolean {
 
 /**
  * Every rule violation in a review-notes file's text; empty when it passes.
- * `today` is a UTC YYYY-MM-DD date; no lesson may be dated after it.
+ * `today` is a UTC YYYY-MM-DD date; no lesson may be dated after it. `root`,
+ * when given, additionally checks every cited backtick path and file:line
+ * against the filesystem there (citationExistenceProblems) — omit it to
+ * check format only, as every caller but the real docs/review-notes.md check
+ * does.
  */
-export function reviewNotesProblems(text: string, today = new Date().toISOString().slice(0, 10)): string[] {
+export function reviewNotesProblems(
+  text: string,
+  today = new Date().toISOString().slice(0, 10),
+  root?: string,
+): string[] {
   const lines = text.split('\n');
   const problems: string[] = [];
 
@@ -104,6 +152,8 @@ export function reviewNotesProblems(text: string, today = new Date().toISOString
         `line ${line}: structural fix "${fix}" is neither exactly "none" nor a citation ` +
           '(a backtick path, a file:line, a #<n>, or a commit sha)',
       );
+    if (root && fix !== 'none')
+      for (const problem of citationExistenceProblems(fix, root)) problems.push(`line ${line}: ${problem}`);
     lessons.push({ line, date, cls, fix });
   }
   if (lessons.length === 0) problems.push('`## Lessons` holds no lesson');
@@ -148,6 +198,12 @@ function notes(classes: string[], lessons: string[]): string {
 describe('docs/review-notes.md', () => {
   it('is in format, uses registered classes, cites its fixes, and names a fix for every recurring class', () => {
     expect(reviewNotesProblems(fs.readFileSync(NOTES_PATH, 'utf8'))).toEqual([]);
+  });
+
+  // #707 P3-d: every cited backtick path and file:line must name something
+  // real in the repo at HEAD, not just look like one.
+  it('cites paths and file:lines that actually exist at HEAD', () => {
+    expect(reviewNotesProblems(fs.readFileSync(NOTES_PATH, 'utf8'), undefined, REPO_ROOT)).toEqual([]);
   });
 });
 
@@ -253,5 +309,69 @@ describe('reviewNotesProblems', () => {
       [`- 2026-09-05 · #5 · alpha · Earlier that day · ${FIX}`, '- 2026-09-05 · #6 · alpha · Later that day · none'],
     );
     expect(reviewNotesProblems(sameDay, TODAY)).toEqual([expect.stringMatching(/newest line \(12\)/)]);
+  });
+});
+
+describe('citation existence, checked only when a root is given (#707 P3-d)', () => {
+  const roots: string[] = [];
+  afterEach(() => {
+    for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  function tempRoot(): string {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'review-notes-test-'));
+    roots.push(root);
+    return root;
+  }
+
+  it('fails a structural fix citing a backtick path that does not exist', () => {
+    const root = tempRoot();
+    const text = notes(['alpha'], ['- 2026-09-01 · #1 · alpha · A lesson · fixed in `no/such/file.ts`']);
+    expect(reviewNotesProblems(text, TODAY, root)).toEqual([
+      expect.stringMatching(/cites `no\/such\/file\.ts`, which does not exist/),
+    ]);
+  });
+
+  it('fails a structural fix whose file:line names a line past the end of the file', () => {
+    const root = tempRoot();
+    fs.writeFileSync(path.join(root, 'small.ts'), 'line one\nline two\nline three\n');
+    const text = notes(['alpha'], ['- 2026-09-01 · #1 · alpha · A lesson · guarded at `small.ts:99`']);
+    expect(reviewNotesProblems(text, TODAY, root)).toEqual([
+      expect.stringMatching(/cites `small\.ts:99`, but small\.ts has only \d+ lines/),
+    ]);
+  });
+
+  it('fails a structural fix whose file:line names a file that does not exist at all', () => {
+    const root = tempRoot();
+    const text = notes(['alpha'], ['- 2026-09-01 · #1 · alpha · A lesson · guarded at `no/such/file.ts:5`']);
+    expect(reviewNotesProblems(text, TODAY, root)).toEqual([
+      expect.stringMatching(/cites `no\/such\/file\.ts:5`, but no\/such\/file\.ts does not exist/),
+    ]);
+  });
+
+  it('passes real citations: a backtick path and a file:line that both resolve', () => {
+    const root = tempRoot();
+    fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'src', 'thing.ts'), Array.from({ length: 10 }, (_, i) => `line ${i}`).join('\n'));
+    fs.writeFileSync(path.join(root, 'README.md'), '# hi\n');
+    const text = notes(
+      ['alpha'],
+      ['- 2026-09-01 · #1 · alpha · A lesson · documented in `README.md`, guarded at `src/thing.ts:5`'],
+    );
+    expect(reviewNotesProblems(text, TODAY, root)).toEqual([]);
+  });
+
+  it('never checks a #<n> or a commit sha against the filesystem', () => {
+    const root = tempRoot();
+    const text = notes(
+      ['alpha'],
+      ['- 2026-09-01 · #1 · alpha · A lesson · tracked in #9999999 and fixed at abcdef01234'],
+    );
+    expect(reviewNotesProblems(text, TODAY, root)).toEqual([]);
+  });
+
+  it('skips the existence check entirely when no root is given', () => {
+    const text = notes(['alpha'], ['- 2026-09-01 · #1 · alpha · A lesson · fixed in `no/such/file.ts`']);
+    expect(reviewNotesProblems(text, TODAY)).toEqual([]);
   });
 });

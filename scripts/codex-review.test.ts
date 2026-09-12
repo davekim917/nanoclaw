@@ -2104,6 +2104,18 @@ describe('codex-review risk-scoped review requests', () => {
     expect(result.calls).not.toContain('/files');
     expect(result.calls).not.toMatch(/^comments /m);
   });
+
+  // merge-check's own --head (unlike ci-wait/merge/receipt) is optional, but a
+  // bare --head with no value must still exit the usage code 2, not bash's
+  // ${2:?} exit 1 (#698 fixed the same bug in ci-wait, merge and receipt).
+  it('refuses a bare --head, reading nothing', () => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: [] });
+
+    const result = runHelper(root, ['merge-check', '--head']);
+    expect(result.status).toBe(2);
+    expect(result.calls).toBe('');
+  });
 });
 
 // After `gh pr merge` succeeds, the PR reads as merged into MERGE_OID.
@@ -2916,6 +2928,13 @@ describe('codex-review review-notes rule: a PR a reviewer said no to records its
     ['trailing spaces', 'Review-notes: none (docs-only change)   '],
     ['a CRLF line ending before more text', 'Review-notes: none (docs-only change)\r\nMore text.'],
     ['a lower-case key', 'review-notes: none (docs-only change)'],
+    // #707 P3-b: a format character (\p{Cf}) inside an otherwise-visible
+    // reason must not sink it: it is stripped first, and what is left is
+    // what is judged.
+    ['a zero-width space inside a visible reason', 'Review-notes: none (docs\u200b only)'],
+    ['a soft hyphen inside a word', 'Review-notes: none (this\u00adword had a typo)'],
+    ['an emoji ZWJ sequence', 'Review-notes: none (fixed by \u{1F469}\u200d\u{1F4BB})'],
+    ['a Unicode reason', 'Review-notes: none (na\u00efve fix, already covered)'],
   ])('allows a Review-notes: none line with %s', (_case, line) => {
     const root = tempRoot();
     scopeFixture(root, { labels: ['risk:high'], body: `Why.\n\n${line}`, comments: [CHANGES_EARLIER, APPROVED] });
@@ -2936,8 +2955,12 @@ describe('codex-review review-notes rule: a PR a reviewer said no to records its
     ['text after the closing parenthesis', 'Review-notes: none (a reason) and more'],
     ['a nested parenthesis', 'Review-notes: none (see (the #679 line))'],
     ['a zero-width space for a reason', 'Review-notes: none (\u200b)'],
-    ['a zero-width space inside a visible reason', 'Review-notes: none (docs\u200b only)'],
     ['a no-break space for a reason', 'Review-notes: none (\u00a0)'],
+    // #707 P3-b: these look blank but are not \p{Cf}, so stripping alone
+    // never removes them: real_reason must name them not-visible directly.
+    ['a braille blank (U+2800) for a reason', 'Review-notes: none (\u2800)'],
+    ['a Hangul filler (U+3164) for a reason', 'Review-notes: none (\u3164)'],
+    ['a lone combining mark for a reason', 'Review-notes: none (\u0301)'],
   ])('refuses (24) a body line with %s', (_case, line) => {
     const root = tempRoot();
     scopeFixture(root, { labels: ['risk:high'], body: `Why.\n\n${line}`, comments: [CHANGES_EARLIER, APPROVED] });
@@ -2945,6 +2968,57 @@ describe('codex-review review-notes rule: a PR a reviewer said no to records its
     const result = runHelper(root, ['merge-check', '--head', HEAD]);
     expect(result.status).toBe(24);
     expect(result.stderr).toContain(MISSING);
+  });
+
+  // #707 P3-c: the refusal names which shape rule failed, instead of one
+  // generic "no reason" line for every case.
+  it.each([
+    ['no body line at all', 'Why.', 'the body has no `Review-notes: none (<reason>)` line at all'],
+    ['an empty reason', 'Why.\n\nReview-notes: none ()', 'its reason is empty or has no visible character'],
+    [
+      'text after the closing parenthesis',
+      'Why.\n\nReview-notes: none (a reason) and more',
+      'it has text after the closing parenthesis ("and more")',
+    ],
+    [
+      'a nested parenthesis',
+      'Why.\n\nReview-notes: none (see (the #679 line))',
+      'its reason has an unmatched or nested parenthesis',
+    ],
+    [
+      'the line inside a code fence',
+      'Why.\n\n```\nReview-notes: none (an example)\n```',
+      'it is inside a code fence or an HTML comment',
+    ],
+    [
+      'the line inside an HTML comment',
+      'Why.\n\n<!-- Review-notes: none (a template) -->',
+      'it is inside a code fence or an HTML comment',
+    ],
+  ])('names %s in the refusal message', (_case, body, detail) => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: ['risk:high'], body, comments: [CHANGES_EARLIER, APPROVED] });
+
+    const result = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain(detail);
+  });
+
+  // A natural closing sentence ("none (typo only).") reads as text after the
+  // parenthesis; the refusal calls out the trailing period specifically,
+  // since it is the likeliest way to trip this over an ordinary sentence.
+  it('hints at the trailing period on a natural `none (typo only).` line', () => {
+    const root = tempRoot();
+    scopeFixture(root, {
+      labels: ['risk:high'],
+      body: 'Why.\n\nReview-notes: none (typo only).',
+      comments: [CHANGES_EARLIER, APPROVED],
+    });
+
+    const result = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain('text after the closing parenthesis (".")');
+    expect(result.stderr).toContain('a trailing period counts as text after the parenthesis; drop it');
   });
 
   // merge-check reads the comments twice: receipt_outcome, then this rule. The
@@ -3144,6 +3218,45 @@ describe('codex-review exact verdicts: a wrong pr-body.jq never passes a check o
     expect(result.stderr).toContain('pr_body_text must yield exactly one string, got 2');
     expect(result.stdout).not.toContain('merge=allowed');
   });
+
+  // #707 P3-a: pr_body_text's own one-string check lives inside pr-body.jq, so
+  // a module that replaces the whole def replaces the check too. On a feat PR
+  // (fix_link_state's title test is false) with no changes receipt
+  // (review_notes_state never even calls pr_body_text), the old callers never
+  // evaluated $body at all — `and`'s short circuit meant a wrong-typed single
+  // value never surfaced as an error. Both callers now assert the shape
+  // themselves before ever branching on the title or the changes state.
+  const WRONG_TYPE_MODULES: [string, () => string][] = [
+    ['yields an object', () => 'def pr_body_text: {};\n'],
+    ['yields a number', () => 'def pr_body_text: 5;\n'],
+    ['yields null', () => 'def pr_body_text: null;\n'],
+  ];
+
+  it.each(WRONG_TYPE_MODULES)(
+    'merge-check exits 1, never allowed, on a pr-body.jq that %s, on a feat PR with no changes receipt',
+    (_case, stub) => {
+      const root = tempRoot();
+      scopeFixture(root, { labels: [], title: 'feat: a new feature' });
+
+      const result = runHelper(root, ['merge-check', '--head', HEAD], {}, skillWithPrBody(root, stub));
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('pr_body_text (pr-body.jq) must yield exactly one string');
+      expect(result.stdout).not.toContain('merge=allowed');
+    },
+  );
+
+  it.each(WRONG_TYPE_MODULES)(
+    'audit exits 1, never passes, on a pr-body.jq that %s, on a feat PR with no changes receipt',
+    (_case, stub) => {
+      const root = tempRoot();
+      auditFixture(root, { labels: [], title: 'feat: a new feature', body: 'Why.' });
+
+      const result = runHelper(root, ['audit'], {}, skillWithPrBody(root, stub));
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('pr_body_text (pr-body.jq) must yield exactly one string');
+      expect(result.stdout).not.toContain('audit=pass');
+    },
+  );
 });
 
 describe('codex-review review-notes rule: the same-second edit boundary', () => {
