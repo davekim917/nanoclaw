@@ -1951,4 +1951,133 @@ echo '["backend/permissions/roles.ts"]' | python3 "$CLASSIFY" "$FGF_UNION" | jq 
   .campaignSize == "full" and (.sizeReason | test("matched backend/permissions"))
 ' >/dev/null
 
+# --- Task-scoped certification lease: claim/progress/release --------------
+# A certification, re-verification or evidence-recovery run has no PR — this
+# is the lifecycle smoke-run-scaffold.sh's begin_active_run_fence now accepts
+# as a third active-slot shape.
+fresh_state
+TASK_SHA="$(sha 7)"
+OTHER_TASK_SHA="$(sha 8)"
+
+bash "$GATE" task-claim run-t1 "$TASK_SHA" | jq -e '.ok == true and .runId == "run-t1"' >/dev/null
+jq -e --arg sha "$TASK_SHA" '.activeRunId == "run-t1" and .activeSha == $sha and .activeLeaseOwner != null' \
+  "$STATE_DIR/task-run-t1-state.json" >/dev/null
+jq -e --arg sha "$TASK_SHA" '.schemaVersion == 1 and .kind == "task" and .runId == "run-t1" and .deploySha == $sha' \
+  "$SMOKE_GATE_LEASE_DIR/task-lease-run-t1.json" >/dev/null
+
+# A different owner cannot claim a live task run without --takeover.
+SMOKE_GATE_OWNER=owner-b bash "$GATE" task-claim run-t1 "$TASK_SHA" | jq -e '.ok == false' >/dev/null
+
+# The same owner reclaiming keeps its original claimedAt.
+ORIG_CLAIMED="$(jq -r '.claimedAt' "$SMOKE_GATE_LEASE_DIR/task-lease-run-t1.json")"
+sleep 1
+bash "$GATE" task-claim run-t1 "$TASK_SHA" | jq -e '.ok == true' >/dev/null
+[ "$(jq -r '.claimedAt' "$SMOKE_GATE_LEASE_DIR/task-lease-run-t1.json")" = "$ORIG_CLAIMED" ] ||
+  { echo "expected same-owner task reclaim to preserve claimedAt" >&2; exit 1; }
+
+# A run id is permanently bound to its deploy SHA — no --takeover escape,
+# unlike a PR's owner binding. A different build needs a different run id.
+bash "$GATE" task-claim run-t1 "$OTHER_TASK_SHA" | jq -e '.ok == false and (.error | test("permanently bound"))' >/dev/null
+bash "$GATE" task-claim run-t1 "$OTHER_TASK_SHA" --takeover | jq -e '.ok == false and (.error | test("permanently bound"))' >/dev/null
+
+# Run ids are unique across the WHOLE gate: one already claimed by a PR
+# campaign, or by the develop campaign, cannot also become a task run.
+bash "$GATE" claim run-shared-pr 5 "$TASK_SHA" >/dev/null
+bash "$GATE" task-claim run-shared-pr "$TASK_SHA" | jq -e '
+  .ok == false and (.error | test("PR campaign"))
+' >/dev/null
+printf '{"schemaVersion":1,"activeRunId":"run-shared-dev","activeSha":"%s"}\n' "$TASK_SHA" \
+  > "$STATE_DIR/develop-state.json"
+bash "$GATE" task-claim run-shared-dev "$TASK_SHA" | jq -e '
+  .ok == false and (.error | test("develop campaign"))
+' >/dev/null
+rm -f "$STATE_DIR/develop-state.json"
+
+# task-progress renews the lease and stamps activeProgressAt; wrong owner and
+# an unclaimed run are both refused.
+BEFORE_EXPIRES="$(jq -r '.expiresAt' "$SMOKE_GATE_LEASE_DIR/task-lease-run-t1.json")"
+sleep 1
+bash "$GATE" task-progress run-t1 | jq -e '.ok == true and .leaseRenewed == true' >/dev/null
+[ "$(jq -r '.expiresAt' "$SMOKE_GATE_LEASE_DIR/task-lease-run-t1.json")" != "$BEFORE_EXPIRES" ] ||
+  { echo "expected task-progress to renew the lease expiry" >&2; exit 1; }
+bash "$GATE" task-progress run-t1 owner-wrong | jq -e '.ok == false' >/dev/null
+bash "$GATE" task-progress run-never-claimed | jq -e '.ok == false' >/dev/null
+
+# task-release drops both the private slot and the shared lease; the run is
+# then unclaimed and progress/release on it refuse as not-active.
+bash "$GATE" task-release run-t1 | jq -e '.ok == true and .leaseReleased == true' >/dev/null
+[ ! -e "$SMOKE_GATE_LEASE_DIR/task-lease-run-t1.json" ] ||
+  { echo "expected task-release to remove the shared task lease" >&2; exit 1; }
+jq -e '.activeRunId == null' "$STATE_DIR/task-run-t1-state.json" >/dev/null
+bash "$GATE" task-progress run-t1 | jq -e '.ok == false' >/dev/null
+bash "$GATE" task-release run-t1 | jq -e '.ok == false' >/dev/null
+
+# After expiry (no takeover needed), a different owner may claim the same
+# run id on the SAME deploy SHA.
+bash "$GATE" task-claim run-t2 "$TASK_SHA" >/dev/null
+expire_lease "$SMOKE_GATE_LEASE_DIR/task-lease-run-t2.json"
+SMOKE_GATE_OWNER=owner-recovers bash "$GATE" task-claim run-t2 "$TASK_SHA" | jq -e '.ok == true' >/dev/null
+jq -e '.owner == "owner-recovers"' "$SMOKE_GATE_LEASE_DIR/task-lease-run-t2.json" >/dev/null
+
+# A live lease held by another owner IS overridable with --takeover (the
+# owner binding, unlike the deploy-SHA binding, is not permanent).
+bash "$GATE" task-claim run-t3 "$TASK_SHA" >/dev/null
+SMOKE_GATE_OWNER=owner-force bash "$GATE" task-claim run-t3 "$TASK_SHA" --takeover | jq -e '.ok == true' >/dev/null
+jq -e '.owner == "owner-force" and .deploySha == "'"$TASK_SHA"'"' "$SMOKE_GATE_LEASE_DIR/task-lease-run-t3.json" >/dev/null
+
+# A malformed shared task lease fails every verb closed, never open.
+bash "$GATE" task-claim run-t4 "$TASK_SHA" >/dev/null
+printf 'not json' > "$SMOKE_GATE_LEASE_DIR/task-lease-run-t4.json"
+bash "$GATE" task-claim run-t4 "$TASK_SHA" | jq -e '.ok == false and (.error | test("malformed"))' >/dev/null
+bash "$GATE" task-progress run-t4 | jq -e '.ok == false' >/dev/null
+
+# --- task-finish: the terminal step for a task-scoped run -------------------
+# The run scaffold and barrier alone can never PUBLISH a certification's
+# verdict — only this does, and only for the run's own lease owner on its own
+# claimed deploy SHA.
+fresh_state
+FIN_SHA="$(sha 9)"
+
+# No claim at all — refused, no verdict recorded.
+bash "$GATE" task-finish run-fin-1 "$FIN_SHA" GO | jq -e '.ok == false' >/dev/null
+[ ! -e "$STATE_DIR/runs/run-fin-1/verdict.json" ]
+
+bash "$GATE" task-claim run-fin-1 "$FIN_SHA" >/dev/null
+
+# Wrong owner is refused, no terminal effect.
+bash "$GATE" task-finish run-fin-1 "$FIN_SHA" GO owner-wrong | jq -e '.ok == false and (.error | test("caller owner"))' >/dev/null
+[ ! -e "$STATE_DIR/runs/run-fin-1/verdict.json" ]
+
+# Wrong deploy SHA is refused. Exits 2, same as the argument refusals above
+# it and `finish`'s own sha-mismatch check (smoke-pr-gate.sh's comment there:
+# "bare ok:false, exit 2 — the invocation is wrong, not the world") — capture
+# before piping, or `set -o pipefail` reads this refusal as the test failing.
+WRONGSHA_OUT="$(bash "$GATE" task-finish run-fin-1 "$OTHER_TASK_SHA" GO || true)"
+jq -e '.ok == false and (.error | test("does not match"))' <<<"$WRONGSHA_OUT" >/dev/null || {
+  echo "expected task-finish to refuse a sha this run never claimed, got: $WRONGSHA_OUT" >&2; exit 1; }
+[ ! -e "$STATE_DIR/runs/run-fin-1/verdict.json" ]
+
+# Success records the verdict and releases the lease.
+bash "$GATE" task-finish run-fin-1 "$FIN_SHA" GO | jq -e '.ok == true and .leaseReleased == true and .verdict == "GO"' >/dev/null
+jq -e --arg sha "$FIN_SHA" '.sha == $sha and .runId == "run-fin-1" and .verdict == "GO"' \
+  "$STATE_DIR/runs/run-fin-1/verdict.json" >/dev/null
+[ ! -e "$SMOKE_GATE_LEASE_DIR/task-lease-run-fin-1.json" ] ||
+  { echo "expected task-finish to remove the shared task lease" >&2; exit 1; }
+jq -e '.activeRunId == null and .completedRunId == "run-fin-1" and .completedVerdict == "GO"' \
+  "$STATE_DIR/task-run-fin-1-state.json" >/dev/null
+
+# Repeating the SAME terminal facts is idempotent — nothing re-recorded.
+bash "$GATE" task-finish run-fin-1 "$FIN_SHA" GO | jq -e '.ok == true and .idempotent == true' >/dev/null
+
+# A second, DIFFERENT verdict for the same run is a reconciliation case, same
+# shape as `finish`'s own refusal — the recorded verdict is never overwritten.
+RECON_OUT="$(bash "$GATE" task-finish run-fin-1 "$FIN_SHA" NO_GO || true)"
+jq -e '.ok == false and .gateStatus == "reconciliation_required"' <<<"$RECON_OUT" >/dev/null || {
+  echo "expected a second, different task-finish to be refused as a reconciliation case, got: $RECON_OUT" >&2; exit 1; }
+jq -e --arg sha "$FIN_SHA" '.sha == $sha and .verdict == "GO"' "$STATE_DIR/runs/run-fin-1/verdict.json" >/dev/null
+
+# A run that was never claimed (or already finished and released) is refused
+# as not-active, not silently treated as a fresh success.
+bash "$GATE" task-finish run-fin-never "$FIN_SHA" GO | jq -e '.ok == false' >/dev/null
+
 echo "smoke pr gate tests passed"

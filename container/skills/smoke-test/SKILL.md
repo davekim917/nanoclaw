@@ -97,6 +97,46 @@ both:
    while the ownership locks are held. A changed claim cannot inherit evidence
    from the previous build.
 
+**A certification, re-verification, or evidence-recovery run has no PR.**
+Never hand-compose the contract or a marker for one just because there is no
+freeze PR to `claim` against — that reproduces the exact incident this scaffold
+exists to prevent, only on a run the barrier can never see as governed. Claim
+the run itself instead, through the same deployed wrapper a PR campaign
+`claim`s through — **never the raw skill script directly.** The wrapper is
+what sets `SMOKE_GATE_STATE_DIR`/`SMOKE_GATE_LEASE_DIR` to this install's real
+paths; calling `/app/skills/smoke-test/scripts/smoke-pr-gate.sh` bare instead
+falls through to the gate's hardcoded defaults, which a PR campaign's state
+and locks do not live under, and neither will anything this run writes later:
+
+```bash
+bash /workspace/agent/smoke-pr-gate.sh task-claim <run-id> <deploy-sha>
+```
+
+This opens the same door a PR `claim` does: a shared, cross-container lease
+under the workgroup mount, which `begin_active_run_fence` accepts as a third
+active-slot shape alongside `pr` and `develop`. `task-progress <run-id>`
+renews it during a long run and `task-release <run-id>` drops it when the run
+ends; `--takeover` on `task-claim` may reassign a live lease to a new owner,
+same as a PR claim, but the deploy SHA itself binds **permanently** at claim
+and has no takeover escape — a different build always gets a different run id.
+`task-finish <run-id> <deploy-sha> <verdict>` is the terminal step: only the
+run's current lease owner may call it, only for the SHA it claimed, and it
+writes the run's write-once verdict and releases the lease in the same
+step — same reconciliation refusal as `finish` if a second, different verdict
+is ever attempted for the same run.
+
+`smoke-run-scaffold.sh` and `smoke-evidence-barrier.sh` are always invoked
+directly (never through a wrapper) and read those same two env vars from
+whatever process calls them — they do not inherit anything the wrapper
+exported in its own, separate process. An install solves this with its own
+versioned env file (exporting everything its wrapper exports) that the
+wrapper itself sources and that a coordinator also sources before every
+direct scaffold/barrier call — one file both paths read, never a fresh
+per-run copy of the same values. Source that same install env file before a
+task-scoped run's own contract/marker/barrier calls too. Skipping this does
+not fail loudly — it fails exactly like the bare-script case above, into a
+state dir the claim itself never wrote to.
+
 Before dispatch, the coordinator writes the contract with the frozen SHA and
 every lane it is committing to:
 
