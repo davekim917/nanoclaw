@@ -2125,8 +2125,28 @@ describe('codex-review risk-scoped review requests', () => {
 // fails this test automatically, instead of depending on someone remembering
 // to add a case (#713 P1; docs/review-notes.md's "usage exit code" class, a
 // recurrence of #698's — a SHA argument not validated at the entry point).
-function headTakingSubcommands(source: string): string[] {
-  const lines = source.split('\n');
+//
+// This discovery is deliberately narrow (a bare `  <name>)` top-level arm, a
+// delegate named exactly `<fn>_main "$@"`, a function opened exactly
+// `<name>() {`, and an inline pattern of exactly `--head)`) and so can miss a
+// shape that still parses --head in bash: an aliased top-level arm
+// (`merge-check|mc)`), a same-line arm, a helper not named `_main`, a
+// `function name {` declaration, or a flag pattern aliased with a short form
+// (`-H|--head)`). The cross-check below (#713 P3) catches exactly that: it
+// scans the whole file for anything shaped like a --head case pattern,
+// independent of this discovery, and fails loudly — naming the line — the
+// moment one exists that this discovery did not attribute to a subcommand it
+// also recognized as head-taking.
+interface ArmBlock {
+  name: string;
+  // Inclusive [start, end] line-index ranges (0-based) attributed to this
+  // arm: its own case-arm lines, plus a delegated function's body when one
+  // was found.
+  ranges: [number, number][];
+}
+
+/** The dispatcher's own case arms and, where resolvable, the function bodies they delegate to — the structural attribution the discovery above relies on. */
+function discoverArmBlocks(lines: string[]): ArmBlock[] {
   const dispatchStart = lines.findIndex((l) => /^case "\$\{1:\?usage:/.test(l));
   if (dispatchStart === -1) throw new Error('codex-review.sh: could not find the command dispatcher');
   const dispatchEnd = lines.findIndex((l, i) => i > dispatchStart && l === 'esac');
@@ -2142,25 +2162,93 @@ function headTakingSubcommands(source: string): string[] {
   }
   if (arms.length === 0) throw new Error('codex-review.sh: found no top-level subcommand arms');
 
+  // Any line at the dispatcher's own two-space indentation is a new
+  // top-level arm boundary, whether armRe can name it or not — checked by
+  // hand: within the dispatcher, only arm-pattern lines and the final `*)`
+  // catch-all sit at this indentation, every arm's own body is indented
+  // deeper. Bounding a recognized arm's range at the *next* such line, named
+  // or not, keeps an arm armRe cannot name (an alias, a same-line arm) from
+  // being silently swept into its neighbor's block — which would otherwise
+  // still "attribute" its content, just to the wrong subcommand (#713 P3).
+  const ARM_BOUNDARY_RE = /^ {2}\S/;
+  function nextBoundary(afterLine: number): number {
+    for (let i = afterLine + 1; i < dispatchEnd; i++) if (ARM_BOUNDARY_RE.test(lines[i])) return i;
+    return dispatchEnd;
+  }
+
   // Every function in this file opens and closes at column 0 (checked by hand
   // against merge_check_main and ci_wait_main), so its body is the lines from
   // `<name>() {` to the next `}` line.
-  function functionBody(name: string): string {
+  function functionBodyRange(name: string): [number, number] | null {
     const start = lines.findIndex((l) => l === `${name}() {`);
-    if (start === -1) return '';
+    if (start === -1) return null;
     const end = lines.findIndex((l, i) => i > start && l === '}');
-    return end === -1 ? '' : lines.slice(start, end + 1).join('\n');
+    return end === -1 ? null : [start, end];
   }
 
+  return arms.map((arm) => {
+    const end = nextBoundary(arm.start);
+    const ranges: [number, number][] = [[arm.start, end - 1]];
+    const blockText = lines.slice(arm.start, end).join('\n');
+    const delegate = blockText.match(/(\w+_main)\s+"\$@"/);
+    if (delegate) {
+      const fnRange = functionBodyRange(delegate[1]);
+      if (fnRange) ranges.push(fnRange);
+    }
+    return { name: arm.name, ranges };
+  });
+}
+
+/** Which of `blocks`' arms are classified head-taking: their attributed text contains a bare `--head)` case pattern. */
+function headTakingNames(lines: string[], blocks: ArmBlock[]): string[] {
   const headTaking: string[] = [];
-  for (let i = 0; i < arms.length; i++) {
-    const end = i + 1 < arms.length ? arms[i + 1].start : dispatchEnd;
-    let block = lines.slice(arms[i].start, end).join('\n');
-    const delegate = block.match(/(\w+_main)\s+"\$@"/);
-    if (delegate) block += `\n${functionBody(delegate[1])}`;
-    if (/^\s*--head\)/m.test(block)) headTaking.push(arms[i].name);
+  for (const b of blocks) {
+    const text = b.ranges.map(([s, e]) => lines.slice(s, e + 1).join('\n')).join('\n');
+    if (/^\s*--head\)/m.test(text)) headTaking.push(b.name);
   }
   return headTaking;
+}
+
+function headTakingSubcommands(source: string): string[] {
+  const lines = source.split('\n');
+  return headTakingNames(lines, discoverArmBlocks(lines));
+}
+
+// Any case-arm pattern, anywhere in the file, that names --head as one of its
+// alternatives: `--head)`, `-H|--head)`, `--head|--sha)`, or a same-line arm
+// (`--head) head="$2"; shift 2 ;;`) — independent of whether the narrow
+// discovery above found the function it lives in. Anchored on the pattern
+// starting the line (after indentation) so it never matches --head appearing
+// inside a string, a comment, or a usage message (`grep -n -- '--head'
+// codex-review.sh` confirms every real match today is one of the four bare
+// `--head)` case arms this file already covers).
+const HEAD_CASE_PATTERN_RE = /^\s*(?:[\w.*-]+\|)*--head(?:\|[\w.*-]+)*\)/;
+
+function findHeadCasePatternLines(lines: string[]): number[] {
+  const found: number[] = [];
+  for (let i = 0; i < lines.length; i++) if (HEAD_CASE_PATTERN_RE.test(lines[i])) found.push(i);
+  return found;
+}
+
+/**
+ * 0-based line indices of every --head-shaped case pattern in `source` that
+ * the parser cannot attribute to a subcommand it also classifies head-taking
+ * — either no discovered arm's block contains the line at all (an alias arm,
+ * a same-line arm, or a delegate/function discovery could not resolve), or
+ * one does, but that arm's own bare-`--head)` detection missed this
+ * pattern's shape (`-H|--head)`, say). Empty on the real script (#713 P3).
+ */
+function unattributedHeadPatternLines(source: string): number[] {
+  const lines = source.split('\n');
+  const blocks = discoverArmBlocks(lines);
+  const headTaking = new Set(headTakingNames(lines, blocks));
+  const ownerOf = new Map<number, string>();
+  for (const b of blocks) for (const [s, e] of b.ranges) for (let i = s; i <= e; i++) ownerOf.set(i, b.name);
+
+  return findHeadCasePatternLines(lines).filter((lineIdx) => {
+    const owner = ownerOf.get(lineIdx);
+    return owner === undefined || !headTaking.has(owner);
+  });
 }
 
 describe('every subcommand that parses --head validates it as a hex sha before reading anything (#713 P1)', () => {
@@ -2183,6 +2271,80 @@ describe('every subcommand that parses --head validates it as a hex sha before r
     const result = runHelper(root, [cmd, '--head', value]);
     expect(result.status).toBe(2);
     expect(result.calls).toBe('');
+  });
+});
+
+// #713 P3: a cross-check independent of headTakingSubcommands' own discovery
+// heuristics — it finds every --head-shaped case pattern in the file by a
+// separate, broader scan, and fails, naming the line, the moment one is not
+// attributed to a subcommand the discovery above also classifies head-taking.
+describe('cross-check: every --head-shaped case pattern is attributed to a discovered, head-taking subcommand (#713 P3)', () => {
+  const source = fs.readFileSync(HELPER, 'utf8');
+  const patternLines = findHeadCasePatternLines(source.split('\n'));
+  const unattributed = new Set(unattributedHeadPatternLines(source));
+
+  // A broad scan that silently matched nothing would make every case below
+  // vacuous, the same failure mode the P1 test above guards against.
+  it('found at least one --head case pattern (sanity: the scan is not vacuous)', () => {
+    expect(patternLines.length).toBeGreaterThan(0);
+  });
+
+  it.each(patternLines)('the --head case pattern on line %i is attributed to a discovered, head-taking subcommand', (lineIdx) => {
+    expect(unattributed.has(lineIdx)).toBe(false);
+  });
+});
+
+// #713 P3: proof that the cross-check actually catches the five shapes that
+// motivated it, each applied to an in-memory copy of the real script so a
+// regression in the cross-check itself (not just in headTakingSubcommands)
+// would show up here.
+describe('the cross-check catches each shape that could let a --head parser escape (#713 P3)', () => {
+  const realSource = fs.readFileSync(HELPER, 'utf8');
+
+  it('finds nothing unattributed in the real, unmodified script', () => {
+    expect(unattributedHeadPatternLines(realSource)).toEqual([]);
+  });
+
+  it('catches an aliased top-level arm ("merge-check|mc)") that hides its delegate entirely', () => {
+    const mutated = realSource.replace(
+      '  merge-check)\n    shift\n    merge_check_main "$@"\n    ;;',
+      '  merge-check|mc)\n    shift\n    merge_check_main "$@"\n    ;;',
+    );
+    expect(mutated).not.toBe(realSource); // the replacement must actually have matched something
+    expect(unattributedHeadPatternLines(mutated).length).toBeGreaterThan(0);
+  });
+
+  it('catches a same-line top-level arm that hides its delegate entirely', () => {
+    const mutated = realSource.replace(
+      '  merge-check)\n    shift\n    merge_check_main "$@"\n    ;;',
+      '  merge-check) shift; merge_check_main "$@" ;;',
+    );
+    expect(mutated).not.toBe(realSource);
+    expect(unattributedHeadPatternLines(mutated).length).toBeGreaterThan(0);
+  });
+
+  it('catches a helper delegate not named "_main"', () => {
+    const mutated = realSource.replace(
+      '  merge-check)\n    shift\n    merge_check_main "$@"\n    ;;',
+      '  merge-check)\n    shift\n    merge_check_dispatch "$@"\n    ;;',
+    );
+    expect(mutated).not.toBe(realSource);
+    expect(unattributedHeadPatternLines(mutated).length).toBeGreaterThan(0);
+  });
+
+  it('catches a "function name {" declaration in place of "name() {"', () => {
+    const mutated = realSource.replace('merge_check_main() {', 'function merge_check_main {');
+    expect(mutated).not.toBe(realSource);
+    expect(unattributedHeadPatternLines(mutated).length).toBeGreaterThan(0);
+  });
+
+  it('catches a "-H|--head)" flag alias the narrow bare-"--head)" detection misses', () => {
+    const mutated = realSource.replace(
+      '      --head)\n        [ $# -ge 2 ] && [[ "$2" =~ ^[0-9a-f]{7,40}$ ]] || { echo "merge-check: --head needs a hex sha (7-40)" >&2; exit 2; }',
+      '      -H|--head)\n        [ $# -ge 2 ] && [[ "$2" =~ ^[0-9a-f]{7,40}$ ]] || { echo "merge-check: --head needs a hex sha (7-40)" >&2; exit 2; }',
+    );
+    expect(mutated).not.toBe(realSource);
+    expect(unattributedHeadPatternLines(mutated).length).toBeGreaterThan(0);
   });
 });
 
