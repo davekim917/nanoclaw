@@ -170,6 +170,8 @@
     "src/db/migrations/074-pending-channel-approvals-cascade.ts": 100,
     "src/db/migrations/075-task-run-outcomes.ts": 100,
     "src/db/migrations/076-turn-usage-effort.ts": 100,
+    "src/db/migrations/077-choice-receipts.ts": 100,
+    "src/db/migrations/078-choice-request-reservation.ts": 100,
     "src/db/migrations/index.ts": 100,
     "src/db/migrations/module-agent-to-agent-destinations.ts": 38.89,
     "src/db/migrations/module-approvals-pending-approvals.ts": 100,
