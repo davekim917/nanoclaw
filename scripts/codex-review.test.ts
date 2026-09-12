@@ -1326,6 +1326,32 @@ describe('codex-review risk-scoped review requests', () => {
     expect(scope.calls).not.toContain(STALE_BASE);
   });
 
+  // #651: the dashboard's own authorization seams (globalAdmin/canReview, the
+  // observatory.signal.mutate guard and demand(), requireAuth's CSRF/cookie gate,
+  // and thread-message.ts's canSteer gate) joined risk:high. Read this repo's own
+  // .github/labeler.yml, rather than the synthetic RISK_CONFIG every other test
+  // here uses, so a PR touching each of them really does classify as risk:high
+  // through codex-review.sh's real glob replay, not just a fixture that says so.
+  const REAL_LABELER_YML = fs.readFileSync(path.resolve('.github/labeler.yml'), 'utf8');
+
+  it.each([
+    'src/dashboard/observatory-v2/sources.ts',
+    'src/dashboard/observatory-v2/api.ts',
+    'src/dashboard/router.ts',
+    'src/dashboard/thread-message.ts',
+  ])('scopes a PR touching %s to review under this repo\'s real labeler.yml', (file) => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: [], baseConfig: REAL_LABELER_YML, files: [changedFile(file)] });
+
+    const scope = runHelper(root, ['scope']);
+    expect(scope.status).toBe(0);
+    expect(JSON.parse(scope.stdout)).toMatchObject({
+      mode: 'risk-scoped',
+      verdict: 'review',
+      reason: `changes risk:high path ${file}`,
+    });
+  });
+
   it('calls a repo legacy when the base commit it resolved has no labeler.yml, as in a repo that never opted in', () => {
     const root = tempRoot();
     scopeFixture(root, { baseConfig: null, labels: [] });

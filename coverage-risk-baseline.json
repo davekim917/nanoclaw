@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-09-11T22:33:17.000Z",
+  "generatedAt": "2026-09-12T04:21:40.000Z",
   "files": {
     "container/agent-runner/src/admission-gate.ts": 100,
     "container/agent-runner/src/db/container-state.ts": 100,
@@ -67,9 +67,13 @@
     "src/dashboard/auth/exchange.ts": 92.31,
     "src/dashboard/db/dashboard-tokens.ts": 100,
     "src/dashboard/observatory-assign-guard.ts": 100,
+    "src/dashboard/observatory-v2/api.ts": 81.6,
+    "src/dashboard/observatory-v2/sources.ts": 92.3,
+    "src/dashboard/router.ts": 95,
     "src/dashboard/steer.ts": 61.03,
     "src/dashboard/thread-close-guard.ts": 100,
     "src/dashboard/thread-close.ts": 83.96,
+    "src/dashboard/thread-message.ts": 78.5,
     "src/dashboard/thread-snooze.ts": 88.24,
     "src/db/migrations/001-initial.ts": 100,
     "src/db/migrations/002-chat-sdk-state.ts": 100,
