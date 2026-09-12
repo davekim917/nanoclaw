@@ -6,6 +6,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { allowSubprocess, enforceHermeticity } from '../src/test-hermeticity.js';
+import { scaledTimeout } from '../src/test-timeout-scale.js';
 
 allowSubprocess(['bash']);
 enforceHermeticity();
@@ -61,7 +62,8 @@ interface Options {
   filed?: { number: number; body: string; state?: string }[];
   issueCreateFails?: boolean;
   relistFails?: boolean;
-  // Each of two runs (CALLER a and b) waits at its already-filed check until both reach it.
+  // Each of two runs (CALLER a and b) reads the store for its already-filed check, then
+  // waits there until the other has read it too.
   barrier?: boolean;
 }
 
@@ -128,7 +130,8 @@ exit "$(cat "$MOCK_DIR/audit-$PR.status")"
     for (const r of m.runs ?? []) write(`jobs-${r.id}.json`, { total_count: r.jobs.length, jobs: r.jobs });
   }
   // Issues live one per file in issues/, numbered from 900 under a lock, so two runs
-  // filing at once get distinct numbers and see each other's issues.
+  // filing at once get distinct numbers and see each other's issues. Each is written
+  // aside and renamed in, so a run listing the issues never reads one half-written.
   fs.writeFileSync(
     path.join(bin, 'gh'),
     `#!/usr/bin/env bash
@@ -160,7 +163,8 @@ case "$1 $2" in
     n=$(cat "$MOCK_DIR/next-issue" 2>/dev/null || echo 900)
     echo $((n + 1)) > "$MOCK_DIR/next-issue"
     rmdir "$MOCK_DIR/lock"
-    jq -n --argjson n "$n" --arg body "$body" '{ number: $n, state: "open", body: $body }' > "$issues/$n.json"
+    jq -n --argjson n "$n" --arg body "$body" '{ number: $n, state: "open", body: $body }' > "$issues/.$n.$$"
+    mv "$issues/.$n.$$" "$issues/$n.json"
     echo "https://github.com/example/repository/issues/$n"
     exit 0
     ;;
@@ -186,15 +190,26 @@ case "$rest" in
   repos/example/repository/issues\\?*)
     state="\${rest#*state=}"
     state="\${state%%&*}"
-    if [ "$state" = all ] && [ -f "$MOCK_DIR/barrier" ] && [ ! -e "$MOCK_DIR/arrived-\${CALLER:-}" ]; then
-      touch "$MOCK_DIR/arrived-\${CALLER:-}"
-      for _ in $(seq 1 400); do
-        if [ "$(find "$MOCK_DIR" -maxdepth 1 -name 'arrived-*' | wc -l)" -ge 2 ]; then break; fi
-        /bin/sleep 0.025
+    if [ "$state" = open ] && [ -f "$MOCK_DIR/relist-fails" ]; then echo 'gh: HTTP 502' >&2; exit 1; fi
+    listed=$(list_issues "$state")
+    # The barrier. A run's already-filed check reads the store HERE, before it arrives,
+    # and it gets that answer only once both runs have arrived. Arriving after the read,
+    # and releasing only once both have arrived, means neither run can file before both
+    # have read: waiting before the read would let a run released first file before the
+    # other's read. The mkdir both arrives and makes this the caller's one wait. A run
+    # the other never meets fails loudly, never passing alone as the only filer.
+    if [ "$state" = all ] && [ -f "$MOCK_DIR/barrier" ] && mkdir "$MOCK_DIR/arrived-\${CALLER:?}" 2>/dev/null; then
+      deadline=$((SECONDS + 60))
+      until [ -d "$MOCK_DIR/arrived-a" ] && [ -d "$MOCK_DIR/arrived-b" ]; do
+        if [ "$SECONDS" -ge "$deadline" ]; then
+          echo "barrier broken: run $CALLER waited 60s at its already-filed check, and the other run never reached it" > "$MOCK_DIR/barrier-broken"
+          cat "$MOCK_DIR/barrier-broken" >&2
+          exit 70
+        fi
+        /bin/sleep 0.01
       done
     fi
-    if [ "$state" = open ] && [ -f "$MOCK_DIR/relist-fails" ]; then echo 'gh: HTTP 502' >&2; exit 1; fi
-    list_issues "$state"
+    printf '%s\\n' "$listed"
     ;;
   repos/example/repository/activity\\?*) cat "$MOCK_DIR/activity.json" ;;
   repos/example/repository/actions/runs\\?head_sha=*)
@@ -317,29 +332,37 @@ describe('gate-audit.sh', () => {
     expect(result.calls).not.toContain('gh issue close');
   });
 
-  it('leaves exactly one issue open when two runs pass the already-filed check together and both file', () => {
-    const { root, env } = fixture({ prs: [675], audits: { 675: { status: 28, out: VIOLATION } }, barrier: true });
-    const result = spawnSync(
-      'bash',
-      [
-        '-c',
-        `CALLER=a bash "$SCRIPT" "$SHA" > "$MOCK_DIR/out-a" 2>&1 & a=$!
+  // The fake gh's barrier waits up to 60s for the second run, so the test's own
+  // timeout sits above that: a barrier that never forms fails on its own message.
+  it(
+    'leaves exactly one issue open when two runs pass the already-filed check together and both file',
+    () => {
+      const { root, env } = fixture({ prs: [675], audits: { 675: { status: 28, out: VIOLATION } }, barrier: true });
+      const result = spawnSync(
+        'bash',
+        [
+          '-c',
+          `CALLER=a bash "$SCRIPT" "$SHA" > "$MOCK_DIR/out-a" 2>&1 & a=$!
 CALLER=b bash "$SCRIPT" "$SHA" > "$MOCK_DIR/out-b" 2>&1 & b=$!
 wait "$a"; ra=$?; wait "$b"; rb=$?
 echo "$ra $rb"`,
-      ],
-      { cwd: root, encoding: 'utf8', env: { ...env, SCRIPT, SHA } },
-    );
-    expect(result.stdout.trim()).toBe('0 0');
-    // Both got past the already-filed check before either filed.
-    expect(fs.readdirSync(root).filter((name) => name.startsWith('arrived-'))).toHaveLength(2);
-    const issues = issuesIn(root);
-    expect(issues.map((i) => i.number)).toEqual([900, 901]);
-    expect(issues.filter((i) => i.state === 'open').map((i) => i.number)).toEqual([900]);
-    expect(read(root, 'closed')).toContain(
-      'closed #901: Duplicate of #900: both were filed for #675 at the same time.',
-    );
-  });
+        ],
+        { cwd: root, encoding: 'utf8', env: { ...env, SCRIPT, SHA } },
+      );
+      const runs = `run a:\n${read(root, 'out-a')}\nrun b:\n${read(root, 'out-b')}`;
+      expect(read(root, 'barrier-broken'), runs).toBeNull();
+      expect(result.stdout.trim(), runs).toBe('0 0');
+      // Both read the store for the already-filed check before either filed.
+      expect(fs.readdirSync(root).filter((name) => name.startsWith('arrived-'))).toHaveLength(2);
+      const issues = issuesIn(root);
+      expect(issues.map((i) => i.number)).toEqual([900, 901]);
+      expect(issues.filter((i) => i.state === 'open').map((i) => i.number)).toEqual([900]);
+      expect(read(root, 'closed')).toContain(
+        'closed #901: Duplicate of #900: both were filed for #675 at the same time.',
+      );
+    },
+    scaledTimeout(120_000),
+  );
 
   it('fails the job when it cannot re-list the issues after filing, since a duplicate may be left open', () => {
     const result = gateAudit({ prs: [675], audits: { 675: { status: 28, out: VIOLATION } }, relistFails: true });
