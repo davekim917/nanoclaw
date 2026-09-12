@@ -13,6 +13,7 @@ import {
   discoverRiskFiles,
   evaluate,
   findMissingFromReport,
+  formatFailureLine,
   hasExecutableCode,
   mergeCoverage,
   parseLcov,
@@ -375,11 +376,26 @@ describe('evaluate', () => {
     expect(result.rows[0]).toMatchObject({ status: 'regressed', current: 'untested', delta: -10 });
   });
 
-  it('does not fail a new file (not in baseline) that has some coverage', () => {
+  // #714 round 1, P2-1: a risk file with real measured coverage but no baseline
+  // entry at all shipped unfloored and CI stayed green (a probe cutting all four
+  // of that PR's new files to one covered line didn't fail) — the same gap
+  // 0747df453 already fixed once for checkout-layout.ts. `new` now fails in the
+  // normal mode check-risk-coverage runs in (CI's "Risk-path coverage ratchet"
+  // step), so a risk file can no longer ship with no floor and stay green.
+  it('fails a new file (not in baseline) that has some coverage, in normal mode', () => {
     const current = classify({ 'src/new.ts': { kind: 'measured', pct: 40 } });
     const result = evaluate(['src/new.ts'], current, baseline({}));
+    expect(result.passed).toBe(false);
+    expect(result.rows[0].status).toBe('new');
+    expect(result.failures.map((f) => f.file)).toEqual(['src/new.ts']);
+  });
+
+  it('does not fail a new file with some coverage when allowNew is set (--write/--bootstrap)', () => {
+    const current = classify({ 'src/new.ts': { kind: 'measured', pct: 40 } });
+    const result = evaluate(['src/new.ts'], current, baseline({}), 0.5, { allowNew: true });
     expect(result.passed).toBe(true);
     expect(result.rows[0].status).toBe('new');
+    expect(result.failures).toEqual([]);
   });
 
   it('fails a new file (not in baseline) that is untested', () => {
@@ -545,5 +561,24 @@ describe('raiseHints', () => {
   it('is empty when nothing rose past the hint threshold', () => {
     const rows: FileRow[] = [{ file: 'src/a.ts', baseline: 50, current: 50, delta: 0, status: 'ok' }];
     expect(raiseHints(rows)).toEqual([]);
+  });
+});
+
+describe('formatFailureLine', () => {
+  // #714 round 1, P2-1: the failure message for a `new` (unfloored) risk file must
+  // name the file, its measured coverage, and the exact JSON line to add — a bare
+  // "status: new" tells the author there's a problem but not what to paste.
+  it('names the file, its measured coverage, and the exact JSON line to add for a "new" row', () => {
+    const row: FileRow = { file: 'src/dashboard/index.ts', baseline: null, current: 92.3, delta: null, status: 'new' };
+    const line = formatFailureLine(row, 'coverage-risk-baseline.json');
+    expect(line).toContain('src/dashboard/index.ts');
+    expect(line).toContain('92.30%'); // the measured value, human-formatted
+    expect(line).toContain('coverage-risk-baseline.json');
+    expect(line).toContain('"src/dashboard/index.ts": 92.3,'); // the exact line to paste in
+  });
+
+  it('falls back to the baseline-arrow-current format for every other status', () => {
+    const row: FileRow = { file: 'src/a.ts', baseline: 90, current: 89, delta: -1, status: 'regressed' };
+    expect(formatFailureLine(row, 'coverage-risk-baseline.json')).toBe('src/a.ts: 90.00% -> 89.00% (regressed)');
   });
 });

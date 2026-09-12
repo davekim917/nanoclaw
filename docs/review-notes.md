@@ -44,6 +44,7 @@ Add a class here, in the same PR, only when none of these fits.
 - `over-broad guard` — a fail-closed guard that also refuses a legitimate state, blocking all the work instead of one bad input
 - `test synchronization` — a test barrier or wait that does not order what it claims to, or falls through silently on timeout
 - `usage exit code` — a bad invocation exits with the read-failure code instead of the documented usage code
+- `missing floor` — a risk:high file lands with real measured coverage and no floor recorded for it, and the ratchet doesn't fail on the gap
 
 ## Lessons
 
@@ -70,3 +71,4 @@ Add a class here, in the same PR, only when none of these fits.
 - 2026-09-12 · #683 · ambient git config · A repo's `diff.external` or a gitattributes textconv filter can transform or hide content before the secret scan reads the diff, failing it open · `--no-ext-diff --no-textconv` on every scanned diff (round 2, f23564fd8): `scripts/git-safety.sh:681`, `:834`, `:889` and `scripts/secret-scan-allow.sh:93` at 545c164cf (#683, merged as e9c94f37d)
 - 2026-09-12 · #696 · test synchronization · The fake `gh`'s barrier released both runs before either had read the store, so one could file before the other read, and a barrier timeout fell through to a pass; read before arriving, and fail loudly on timeout · the store is read, then the run arrives (`scripts/gate-audit.test.ts:195-206`), and a timeout writes `barrier-broken`, which the test asserts absent first (`:353`)
 - 2026-09-12 · #692/#698 · usage exit code · bash `${2:?msg}` exits 1, which `codex-review.sh`'s contract reserves for a failed read, not the usage code 2, so a bare `--head` read as a GitHub failure; check the argument count explicitly and validate the value's format · `[ $# -ge 2 ] || { …; exit 2; }` in `ci-wait`, `merge` and `receipt` (`container/skills/pr-review-loop/scripts/codex-review.sh:1084`, `:1556`, `:1777` at 35c8c952b; #698 merged as 52df9eadf), with bare-`--head` cases in `scripts/codex-review.test.ts`
+- 2026-09-12 · #714 · missing floor · #714 round 1 added four risk:high dashboard files with no coverage floor at all, and CI stayed green — a probe cutting all four to one covered line still didn't fail; 0747df453 already fixed this same gap once for `checkout-layout.ts`, so it recurred · `evaluate`'s `'new'` status now fails outside `--write`/`--bootstrap` (`scripts/check-risk-coverage.ts:467`), with the failure message naming the measured value and the exact baseline line to add (`formatFailureLine`); cases in `scripts/check-risk-coverage.test.ts`
