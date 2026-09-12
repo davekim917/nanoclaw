@@ -333,4 +333,72 @@ echo "$DEVELOP_OUT" | jq -e '.invalid != ["'"$OWNER_DIR"'/completion-contract.js
 
 rm -rf "$OWNER_DIR"
 
+# --- floor lanes require browser evidence unless declared API-only ---------
+# A floor lane resets its entry's staleness clock on `pass` (SKILL.md "The
+# coverage floor"). Without this check, a lane with API-only receipts (or no
+# evidence at all beyond the bare minimum) could satisfy the barrier and reset
+# that clock with no journey ever walked in a browser.
+FLOOR_DIR="$(mktemp -d)"
+mkdir -p "$FLOOR_DIR/markers" "$FLOOR_DIR/evidence"
+cat >"$FLOOR_DIR/completion-contract.json" <<'JSON'
+{
+  "schemaVersion": 1,
+  "sourceSha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "ownershipKind": "develop",
+  "requiredLaneMarkers": ["markers/F1.json"],
+  "lanes": [
+    {"id": "F1", "kind": "floor", "title": "Payout approval walk"}
+  ]
+}
+JSON
+
+# API-only evidence (a JSON receipt, no image/video extension) on a plain
+# `floor` lane — not declared `evidence:"api"` in the contract — must be
+# refused, even though the evidence file is real, durable, and non-empty.
+printf '{"status":200}\n' >"$FLOOR_DIR/evidence/api-receipt.json"
+cat >"$FLOOR_DIR/markers/F1.json" <<'JSON'
+{"schemaVersion":1,"lane":"F1","sourceSha":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","status":"pass","completedAt":"2026-09-12T10:00:00Z","evidence":["evidence/api-receipt.json"]}
+JSON
+RESULT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$FLOOR_DIR" lanes || true)"
+echo "$RESULT" | jq -e '(.ready == false) and (.invalidReasons[0] | contains("floor pass without browser evidence"))' >/dev/null || {
+  echo "expected an API-only pass on an undeclared floor lane to be refused" >&2; echo "$RESULT" >&2; exit 1; }
+
+# A screenshot that actually exists on disk clears the barrier.
+printf 'fake png bytes\n' >"$FLOOR_DIR/evidence/screenshot.png"
+jq '.evidence = ["evidence/screenshot.png"]' "$FLOOR_DIR/markers/F1.json" >"$FLOOR_DIR/markers/.marker.json"
+mv "$FLOOR_DIR/markers/.marker.json" "$FLOOR_DIR/markers/F1.json"
+bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$FLOOR_DIR" lanes \
+  | jq -e '.ready == true' >/dev/null || {
+  echo "expected a floor pass with a real screenshot on disk to be ready" >&2; exit 1; }
+
+# Naming a screenshot that does not exist is refused by pass_evidence_problem
+# already (evidence must be durable), and must stay refused for a floor lane
+# too — not silently reclassified as the floor-specific reason.
+jq '.evidence = ["evidence/missing-screenshot.png"]' "$FLOOR_DIR/markers/F1.json" >"$FLOOR_DIR/markers/.marker.json"
+mv "$FLOOR_DIR/markers/.marker.json" "$FLOOR_DIR/markers/F1.json"
+RESULT="$(bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$FLOOR_DIR" lanes || true)"
+echo "$RESULT" | jq -e '(.ready == false) and (.invalidReasons[0] | contains("evidence file is missing"))' >/dev/null || {
+  echo "expected a floor pass naming a nonexistent screenshot to be refused for the missing file" >&2; echo "$RESULT" >&2; exit 1; }
+
+# A lane the contract declares `evidence:"api"` is exempt: its API receipts
+# alone clear the barrier, because the declaration lives on the CONTRACT lane
+# entry (never inferred from the marker).
+jq '.lanes[0].evidence = "api"' "$FLOOR_DIR/completion-contract.json" >"$FLOOR_DIR/.contract.tmp"
+mv "$FLOOR_DIR/.contract.tmp" "$FLOOR_DIR/completion-contract.json"
+jq '.evidence = ["evidence/api-receipt.json"]' "$FLOOR_DIR/markers/F1.json" >"$FLOOR_DIR/markers/.marker.json"
+mv "$FLOOR_DIR/markers/.marker.json" "$FLOOR_DIR/markers/F1.json"
+bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$FLOOR_DIR" lanes \
+  | jq -e '.ready == true' >/dev/null || {
+  echo "expected a declared API-only floor lane with API receipts to be ready" >&2; exit 1; }
+
+# A non-floor lane (default "lane" kind) with the same API-only evidence is
+# untouched by this check — it only applies to kind == "floor".
+jq '.lanes = [{"id":"F1","kind":"lane"}]' "$FLOOR_DIR/completion-contract.json" >"$FLOOR_DIR/.contract.tmp"
+mv "$FLOOR_DIR/.contract.tmp" "$FLOOR_DIR/completion-contract.json"
+bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$FLOOR_DIR" lanes \
+  | jq -e '.ready == true' >/dev/null || {
+  echo "expected a non-floor lane with API-only evidence to be unaffected" >&2; exit 1; }
+
+rm -rf "$FLOOR_DIR"
+
 echo "smoke evidence barrier tests passed"

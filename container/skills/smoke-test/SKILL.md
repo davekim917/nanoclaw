@@ -429,7 +429,7 @@ identity in this skill.** It lives in the deploying group's standing
 instructions beside the repo, environment, QA channel, run root, and credential
 locations — never here, because the journeys that matter belong to the
 deployment, not to the skill. What lives here is the contract the list must
-satisfy. Each floor entry declares six things:
+satisfy. Each floor entry declares six things, plus an optional seventh:
 
 | Field | What it must say |
 |---|---|
@@ -439,6 +439,22 @@ satisfy. Each floor entry declares six things:
 | `seed` | the account, seat, tier, fixture, or data row the walk needs, and where it comes from |
 | `max_interval` | the longest this deployment tolerates going without this journey proven on a deployed build |
 | `restore` | how the walk's mutations are reverted, since it runs repeatedly against live-shaped data |
+| `evidence` (optional) | `api` when this entry's proof is an API contract by design — a guard that must not be exercised through the UI. Absent means the default: this entry proves itself with a browser journey and its pass marker must carry real screenshot/video evidence like any other floor lane. This is a per-entry declaration in the install's floor table, never a coordinator's after-the-fact call — inventing an exemption at run time is exactly the failure this field exists to prevent. |
+
+**A floor entry's `evidence: api` declaration in the standing instructions is
+inert until the coordinator carries it into the contract.** When scaffolding a
+`floor` lane for an entry declared `evidence: api`, pass that through to
+`smoke-run-scaffold.sh contract` with `--evidence <entry-id>=api` so the lane
+object in the contract itself says so:
+
+```bash
+bash /app/skills/smoke-test/scripts/smoke-run-scaffold.sh contract \
+  <run-dir> <source-sha> <entry-id>:floor:'<title>' --evidence <entry-id>=api
+```
+
+Omitting the flag for an entry the floor table marks `evidence: api` is a
+scaffolding bug, not a stricter run — the barrier below will refuse the pass
+marker for lacking browser evidence it was never going to have.
 
 **What earns a place on the floor — two questions, both answered with a
 citation rather than an adjective.**
@@ -500,13 +516,26 @@ both, bounded:
   get to pick the convenient one.
 - **"Last passed" is read off the run root, not off a ledger.** An entry's last
   exercise is the newest `pass` marker carrying its lane id, anywhere under the
-  run root. Markers are already durable, already SHA-bound, and already survive
-  media retention, so this needs no new artifact and cannot be asserted without
-  leaving one:
+  run root — but only a marker that actually carries proof counts: a `pass`
+  marker whose evidence is browser media, or one whose run declared this entry
+  `evidence: api` in its contract, at the time that run happened. A `pass` with
+  neither is not evidence of anything and must not reset the clock (see the
+  barrier rule below). Markers are already durable, already SHA-bound, and
+  already survive media retention, so this needs no new artifact and cannot be
+  asserted without leaving one:
 
   ```bash
-  jq -r 'select(.status == "pass") | "\(.completedAt) \(input_filename)"' \
-    <run-root>/*/markers/<entry-id>.json 2>/dev/null | sort | tail -1
+  for marker in <run-root>/*/markers/<entry-id>.json; do
+    [ -f "$marker" ] || continue
+    [ "$(jq -r '.status' "$marker")" = pass ] || continue
+    contract="$(dirname "$(dirname "$marker")")/completion-contract.json"
+    has_media="$(jq -r '[(.evidence // [])[] |
+      select(test("\\.(png|jpg|jpeg|webp|gif|mp4|webm)$"; "i"))] | length > 0' "$marker")"
+    is_api="$(jq -r --arg id "<entry-id>" \
+      '[.lanes[]? | select(.id == $id) | (.evidence == "api")][0] // false' \
+      "$contract" 2>/dev/null)"
+    { [ "$has_media" = true ] || [ "$is_api" = true ]; } && jq -r '.completedAt' "$marker"
+  done | sort | tail -1
   ```
 
 At one entry per campaign a five-entry floor comes fully around every day or
@@ -585,7 +614,16 @@ because it is the same failure wearing a different name:
   that to publish, so a published run structurally has one; a missing or `void`
   marker beside a published verdict means the barrier was bypassed.
 - **Each entry walked carries its own screenshot evidence on the frozen SHA**,
-  named in the marker's evidence list — the same bar as any other browser lane.
+  named in the marker's evidence list — the same bar as any other browser
+  lane, unless the contract declares that entry `evidence: api`. The barrier
+  enforces this directly: `smoke-evidence-barrier.sh` refuses readiness when a
+  `floor` lane's `pass` marker names no media file (png/jpg/jpeg/webp/gif/mp4/
+  webm) that exists under the run root, unless the lane's own contract entry
+  carries `evidence: "api"` — set only by `smoke-run-scaffold.sh contract
+  --evidence <lane-id>=api` at scaffold time, never inferred from the marker
+  or asserted after the fact. A published run with a floor `pass` and no
+  qualifying evidence means this check did not run, not that the entry was
+  legitimately API-only.
 - **Selection is recomputable.** Re-run the least-recently-passed query above as
   of that run's timestamp. A run that walked a freshly-passed entry while
   another sat past its ceiling shows up as a mismatch between what was due and
