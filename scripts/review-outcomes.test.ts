@@ -1,36 +1,73 @@
-import { describe, expect, it } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import * as nodeChildProcess from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
-import { enforceHermeticity } from '../src/test-hermeticity.js';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+
+import {
+  allowSubprocess,
+  clearHermeticityAttempts,
+  enforceHermeticity,
+  hermeticityAttempts,
+} from '../src/test-hermeticity.js';
 
 import {
   buildShadowReviewIndex,
+  classifyAtMergeVerdict,
+  combineMergedPrSlices,
   computeFetchSinceIso,
+  computeMergedSearchSlices,
   computeReport,
   computeShadowCoverage,
+  computeWeeklyFetchSinceIso,
+  computeWeeklyReport,
   extractFixesPrNumber,
+  extractFixesPrNumbers,
   extractShadowReviewPrNumber,
+  fetchAtMergeLabelEventsBatch,
+  fileDiffAtMergeLocal,
   filesOverlap,
+  findConventionStartIso,
   findFollowUp,
   findRevert,
+  FIXES_PR_CONVENTION_START_ISO,
+  GATE_GO_LIVE_ISO,
+  generatedFileChangedLines,
   globsForRiskHigh,
+  hasFixesPrLine,
   isEligibleForShadowReview,
   isFixTitle,
   isLowRisk,
+  isoWeekDateRange,
   isoWeekKey,
+  isSkipVerdict,
   issueHasP1,
   isRevertOf,
   isRevertPR,
   matchesAnyGlob,
+  mergeCommitParentsLocal,
+  parseGitNameStatus,
+  readRiskHighGlobsAtShaLocal,
+  replayLabelsAtMerge,
+  renderWeeklyMarkdown,
+  resolveAtMergeBaseSha,
+  resolveAtMergeFileContextLocal,
   SHADOW_REVIEW_GO_LIVE_ISO,
+  stripFencedAndCommented,
   type Options,
   type PullRequestData,
   type ShadowReviewIssueData,
   weeklyRevertRate,
 } from './review-outcomes.js';
 
-// This suite never shells out or touches the network — every case here exercises the
-// pure functions review-outcomes.ts factors out for exactly that reason.
+// This suite never touches the network — every case here exercises pure functions, or
+// (the "at-merge replay from local git" describe block near the end) a real `git`
+// against a throwaway fixture repo under the OS temp dir. `git` is the only subprocess
+// allowed; `gh` stays blocked, which the GraphQL-failure test below relies on directly.
 enforceHermeticity();
+allowSubprocess(['git']);
 
 function pr(overrides: Partial<PullRequestData> & { number: number }): PullRequestData {
   return {
@@ -40,6 +77,10 @@ function pr(overrides: Partial<PullRequestData> & { number: number }): PullReque
     files: [],
     labels: [],
     baseRefName: 'main',
+    changedLines: 0,
+    changedFiles: overrides.files?.length ?? 0,
+    mergeCommitOid: null,
+    headRefOid: 'deadbeef',
     ...overrides,
   };
 }
@@ -666,5 +707,1084 @@ describe('computeFetchSinceIso', () => {
     // switch - days = 2026-10-01, well after go-live — only the default takes effect here.
     const since = computeFetchSinceIso('2026-10-01T00:00:00Z', 0);
     expect(since).toBe(new Date(SHADOW_REVIEW_GO_LIVE_ISO).toISOString());
+  });
+});
+
+describe('hasFixesPrLine', () => {
+  it('is true for a linked Fixes-PR line', () => {
+    expect(hasFixesPrLine('body\nFixes-PR: #10\nmore')).toBe(true);
+  });
+
+  it('is true for Fixes-PR: none — the convention was followed, even though there is no link', () => {
+    expect(hasFixesPrLine('Fixes-PR: none')).toBe(true);
+  });
+
+  it('is false when the trailer is absent entirely', () => {
+    expect(hasFixesPrLine('nothing here')).toBe(false);
+  });
+});
+
+describe('findConventionStartIso', () => {
+  it('returns the mergedAt of the earliest PR carrying a Fixes-PR line, by merge time not array order', () => {
+    const prs = [
+      pr({ number: 1, mergedAt: '2026-09-05T00:00:00Z', body: '' }), // no line, later merge — irrelevant
+      pr({ number: 2, mergedAt: '2026-09-03T00:00:00Z', body: 'Fixes-PR: none' }), // earliest WITH a line
+      pr({ number: 3, mergedAt: '2026-09-04T00:00:00Z', body: 'Fixes-PR: #1' }),
+    ];
+    expect(findConventionStartIso(prs)).toBe('2026-09-03T00:00:00Z');
+  });
+
+  it('counts a Fixes-PR: none line as evidence the convention started, not just a link', () => {
+    expect(findConventionStartIso([pr({ number: 1, mergedAt: '2026-09-03T00:00:00Z', body: 'Fixes-PR: none' })])).toBe(
+      '2026-09-03T00:00:00Z',
+    );
+  });
+
+  it('returns null when no PR carries the line', () => {
+    expect(findConventionStartIso([pr({ number: 1, body: '' }), pr({ number: 2, body: 'unrelated' })])).toBeNull();
+  });
+
+  it('returns null for an empty list', () => {
+    expect(findConventionStartIso([])).toBeNull();
+  });
+});
+
+describe('isSkipVerdict', () => {
+  const RISK_GLOBS = ['src/guard/**'];
+
+  it('is true (skip) for a low-risk PR with no risk:high/review:requested label — codex-review.sh:765-767', () => {
+    expect(isSkipVerdict(pr({ number: 1, files: ['docs/a.md'], labels: [] }), RISK_GLOBS)).toBe(true);
+  });
+
+  it('is false (review) when the diff matches a risk:high glob, replaying the file half of the rule', () => {
+    expect(isSkipVerdict(pr({ number: 1, files: ['src/guard/x.ts'], labels: [] }), RISK_GLOBS)).toBe(false);
+  });
+
+  it('is false (review) when the PR carries review:requested despite low-risk files', () => {
+    expect(isSkipVerdict(pr({ number: 1, files: ['docs/a.md'], labels: ['review:requested'] }), RISK_GLOBS)).toBe(
+      false,
+    );
+  });
+
+  it('is false (review) when the PR carries risk:high despite low-risk files', () => {
+    expect(isSkipVerdict(pr({ number: 1, files: ['docs/a.md'], labels: ['risk:high'] }), RISK_GLOBS)).toBe(false);
+  });
+});
+
+describe('isoWeekDateRange', () => {
+  it('round-trips with isoWeekKey for a known week', () => {
+    const { startIso, endIso } = isoWeekDateRange('2026-W37');
+    expect(startIso).toBe('2026-09-07T00:00:00.000Z');
+    expect(endIso).toBe('2026-09-13T23:59:59.999Z');
+    expect(isoWeekKey(startIso)).toBe('2026-W37');
+    expect(isoWeekKey(endIso)).toBe('2026-W37');
+  });
+
+  it('round-trips across a year boundary (week 1 starts in the prior calendar year)', () => {
+    const { startIso, endIso } = isoWeekDateRange('2025-W01');
+    expect(startIso).toBe('2024-12-30T00:00:00.000Z');
+    expect(endIso).toBe('2025-01-05T23:59:59.999Z');
+    expect(isoWeekKey(startIso)).toBe('2025-W01');
+    expect(isoWeekKey(endIso)).toBe('2025-W01');
+  });
+
+  it('throws on an invalid week key', () => {
+    expect(() => isoWeekDateRange('garbage')).toThrow(/invalid ISO week key/);
+  });
+});
+
+describe('computeMergedSearchSlices — P2, per-ISO-week GitHub search slicing', () => {
+  it('covers the window exactly: no gap, no overlap, and the partial first and last weeks are truncated to the bounds', () => {
+    // Spans a partial W37, a whole W38, and a partial W39 (W37: Sep 7-13, W38: Sep
+    // 14-20, W39: Sep 21-27 — from the isoWeekDateRange tests above).
+    const sinceIso = '2026-09-08T12:00:00.000Z';
+    const untilIso = '2026-09-22T06:00:00.000Z';
+    const slices = computeMergedSearchSlices(sinceIso, untilIso);
+    expect(slices).toEqual([
+      { startIso: '2026-09-08T12:00:00.000Z', endIso: '2026-09-13T23:59:59.999Z' },
+      { startIso: '2026-09-14T00:00:00.000Z', endIso: '2026-09-20T23:59:59.999Z' },
+      { startIso: '2026-09-21T00:00:00.000Z', endIso: '2026-09-22T06:00:00.000Z' },
+    ]);
+    // No gap, no overlap: each slice after the first starts exactly 1ms after the
+    // previous one ends.
+    for (let i = 1; i < slices.length; i += 1) {
+      const previousEndMs = new Date(slices[i - 1]!.endIso).getTime();
+      const thisStartMs = new Date(slices[i]!.startIso).getTime();
+      expect(thisStartMs).toBe(previousEndMs + 1);
+    }
+    expect(slices[0]!.startIso).toBe(sinceIso); // partial first week, truncated to the request
+    expect(slices[slices.length - 1]!.endIso).toBe(untilIso); // partial last week, truncated to the request
+  });
+
+  it('returns exactly one slice when since and until fall in the same ISO week', () => {
+    const slices = computeMergedSearchSlices('2026-09-09T00:00:00.000Z', '2026-09-11T00:00:00.000Z');
+    expect(slices).toEqual([{ startIso: '2026-09-09T00:00:00.000Z', endIso: '2026-09-11T00:00:00.000Z' }]);
+  });
+
+  it('returns no slices when until precedes since', () => {
+    expect(computeMergedSearchSlices('2026-09-11T00:00:00.000Z', '2026-09-09T00:00:00.000Z')).toEqual([]);
+  });
+});
+
+describe('combineMergedPrSlices — P2, de-dup and fail-on-cap', () => {
+  it('de-duplicates a PR that appears in two slices (a mergedAt exactly on a boundary), counting it once', () => {
+    const boundaryPr = pr({ number: 42, mergedAt: '2026-09-13T23:59:59.000Z' });
+    const result = combineMergedPrSlices([
+      { slice: { startIso: '2026-09-07T00:00:00.000Z', endIso: '2026-09-13T23:59:59.999Z' }, prs: [boundaryPr] },
+      { slice: { startIso: '2026-09-14T00:00:00.000Z', endIso: '2026-09-20T23:59:59.999Z' }, prs: [boundaryPr] },
+    ]);
+    expect(result.filter((p) => p.number === 42)).toHaveLength(1);
+  });
+
+  it('merges distinct PRs across slices with no loss', () => {
+    const result = combineMergedPrSlices([
+      { slice: { startIso: 'a', endIso: 'b' }, prs: [pr({ number: 1 }), pr({ number: 2 })] },
+      { slice: { startIso: 'c', endIso: 'd' }, prs: [pr({ number: 3 })] },
+    ]);
+    expect(result.map((p) => p.number).sort((a, b) => a - b)).toEqual([1, 2, 3]);
+  });
+
+  it('fails loudly — throws, never truncates silently — when a single slice returns >=1,000 rows', () => {
+    const capped = Array.from({ length: 1000 }, (_, i) => pr({ number: i + 1 }));
+    expect(() =>
+      combineMergedPrSlices([
+        { slice: { startIso: '2026-09-07T00:00:00.000Z', endIso: '2026-09-13T23:59:59.999Z' }, prs: capped },
+      ]),
+    ).toThrow(/1,000|1000/);
+  });
+
+  it('does not throw for a slice just under the cap (999 rows)', () => {
+    const almostCapped = Array.from({ length: 999 }, (_, i) => pr({ number: i + 1 }));
+    expect(() =>
+      combineMergedPrSlices([
+        { slice: { startIso: '2026-09-07T00:00:00.000Z', endIso: '2026-09-13T23:59:59.999Z' }, prs: almostCapped },
+      ]),
+    ).not.toThrow();
+  });
+});
+
+describe('computeWeeklyFetchSinceIso', () => {
+  it('subtracts weeklyDays from nowIso', () => {
+    expect(computeWeeklyFetchSinceIso('2026-09-12T00:00:00Z', 90)).toBe(new Date('2026-06-14T00:00:00Z').toISOString());
+  });
+});
+
+describe('computeWeeklyReport', () => {
+  const RISK_GLOBS = ['src/guard/**'];
+
+  it('buckets PRs into one row per ISO week, ascending, across a year boundary', () => {
+    const prs = [
+      pr({ number: 1, mergedAt: '2024-12-31T00:00:00Z' }), // 2025-W01
+      pr({ number: 2, mergedAt: '2025-01-06T00:00:00Z' }), // 2025-W02
+    ];
+    const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-01-01T00:00:00Z');
+    expect(weekly.rows.map((r) => r.isoWeek)).toEqual(['2025-W01', '2025-W02']);
+    expect(weekly.rows[0]!.merged).toBe(1);
+    expect(weekly.rows[1]!.merged).toBe(1);
+  });
+
+  it('excludes a PR merged into a branch other than main', () => {
+    const prs = [
+      pr({ number: 1, mergedAt: '2026-09-11T00:00:00Z', baseRefName: 'release' }),
+      pr({ number: 2, mergedAt: '2026-09-11T00:00:00Z', baseRefName: 'main' }),
+    ];
+    const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+    expect(weekly.rows).toHaveLength(1);
+    expect(weekly.rows[0]!.merged).toBe(1);
+  });
+
+  it('always reports the pinned FIXES_PR_CONVENTION_START_ISO, never a recomputed value', () => {
+    // Every PR here carries a Fixes-PR line dated LATER than the pinned constant — if
+    // conventionStartIso were still recomputed via findConventionStartIso over this
+    // fetch window, it would read as this PR's own (later) mergedAt instead.
+    const prs = [pr({ number: 1, mergedAt: '2026-09-20T00:00:00Z', body: 'Fixes-PR: none' })];
+    const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-25T00:00:00Z');
+    expect(weekly.conventionStartIso).toBe(FIXES_PR_CONVENTION_START_ISO);
+  });
+
+  describe('pre-gate vs. post-gate — P2 #1', () => {
+    it('never counts a pre-gate PR as reviewed or skipped, only as a descriptive file class', () => {
+      // Merged before GATE_GO_LIVE_ISO — the gate did not exist yet, so there was no
+      // skip verdict to have merged on.
+      const prs = [pr({ number: 601, mergedAt: '2026-09-10T10:00:00Z', files: ['docs/pre.md'] })];
+      const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+      const row = weekly.rows[0]!;
+      expect(row.preGateMerged).toBe(1);
+      expect(row.preGateLowRisk).toBe(1);
+      expect(row.preGateHighRisk).toBe(0);
+      expect(row.postGateMerged).toBe(0);
+      expect(row.reviewed).toBe(0);
+      expect(row.skipped).toBe(0);
+      expect(row.isMixedGateWeek).toBe(false);
+    });
+
+    it('classifies a pre-gate PR high-risk when its files match the (current) risk:high globs', () => {
+      const prs = [pr({ number: 601, mergedAt: '2026-09-10T10:00:00Z', files: ['src/guard/x.ts'] })];
+      const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+      const row = weekly.rows[0]!;
+      expect(row.preGateLowRisk).toBe(0);
+      expect(row.preGateHighRisk).toBe(1);
+    });
+
+    it('flags isMixedGateWeek when a week straddles go-live, and scopes reviewed/skipped to the post-gate subset', () => {
+      const prs = [
+        pr({ number: 601, mergedAt: '2026-09-10T10:00:00Z', files: ['docs/pre.md'] }), // pre-gate
+        pr({
+          number: 602,
+          mergedAt: '2026-09-10T18:00:00Z', // post-gate, same week (2026-W37)
+          files: ['docs/post.md'],
+          atMergeContext: { files: ['docs/post.md'], labels: [], riskHighGlobs: RISK_GLOBS },
+        }),
+      ];
+      const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+      const row = weekly.rows[0]!;
+      expect(row.isMixedGateWeek).toBe(true);
+      expect(row.merged).toBe(2);
+      expect(row.preGateMerged).toBe(1);
+      expect(row.postGateMerged).toBe(1);
+      expect(row.skipped).toBe(1);
+      expect(row.skippedRate).toBe(1); // over postGateMerged (1), not merged (2)
+    });
+
+    it('counts a post-gate PR with an unresolvable at-merge context as unresolved, not reviewed or skipped', () => {
+      const prs = [pr({ number: 604, mergedAt: '2026-09-11T00:00:00Z', atMergeContext: null })];
+      const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+      const row = weekly.rows[0]!;
+      expect(row.postGateMerged).toBe(1);
+      expect(row.reviewed).toBe(0);
+      expect(row.skipped).toBe(0);
+      expect(row.postGateUnresolved).toBe(1);
+    });
+
+    it('counts a post-gate PR with a forced review verdict (>=300 changed files) as reviewed, not unresolved — codex-review.sh:764', () => {
+      const prs = [
+        pr({
+          number: 700,
+          mergedAt: '2026-09-11T00:00:00Z',
+          atMergeContext: undefined,
+          atMergeForcedVerdict: 'review',
+        }),
+      ];
+      const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+      const row = weekly.rows[0]!;
+      expect(row.postGateMerged).toBe(1);
+      expect(row.reviewed).toBe(1);
+      expect(row.skipped).toBe(0);
+      expect(row.postGateUnresolved).toBe(0);
+    });
+
+    it('is pre-gate at EXACTLY GATE_GO_LIVE_ISO, strictly: #609 itself is the commit that ships the file', () => {
+      const prs = [pr({ number: 609, mergedAt: GATE_GO_LIVE_ISO, files: ['docs/pre.md'] })];
+      const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+      const row = weekly.rows[0]!;
+      expect(row.preGateMerged).toBe(1);
+      expect(row.postGateMerged).toBe(0);
+    });
+
+    it('is post-gate one millisecond after GATE_GO_LIVE_ISO', () => {
+      const afterGoLive = new Date(new Date(GATE_GO_LIVE_ISO).getTime() + 1).toISOString();
+      const prs = [
+        pr({
+          number: 610,
+          mergedAt: afterGoLive,
+          files: ['docs/post.md'],
+          atMergeContext: { files: ['docs/post.md'], labels: [], riskHighGlobs: RISK_GLOBS },
+        }),
+      ];
+      const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+      const row = weekly.rows[0]!;
+      expect(row.postGateMerged).toBe(1);
+      expect(row.preGateMerged).toBe(0);
+    });
+
+    it('reclassifies a post-gate-by-date PR as pre-gate when preGateOverride is set (labeler.yml missing at its own base — #605-style)', () => {
+      const prs = [
+        pr({
+          number: 605,
+          mergedAt: '2026-09-11T00:00:00Z', // strictly after GATE_GO_LIVE_ISO by date
+          files: ['container/skills/pr-review-loop/scripts/codex-review.sh'],
+          preGateOverride: true, // resolveAtMergeContexts sets this when labeler.yml didn't exist yet at the base
+          atMergeContext: undefined,
+        }),
+      ];
+      const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+      const row = weekly.rows[0]!;
+      expect(row.preGateMerged).toBe(1);
+      expect(row.postGateMerged).toBe(0);
+      expect(row.postGateUnresolved).toBe(0); // reclassified, not left dangling as unresolved
+    });
+  });
+
+  describe('post-gate lane classification replays the AT-MERGE state, never current state — P2 #2', () => {
+    // The concrete case the review round named: PR #620 was correctly SKIPPED under the
+    // 22 risk:high globs live at its own merge, but flips to "reviewed" under a naive
+    // CURRENT-state replay once the glob list grows to include its path — hiding the
+    // real miss (#620 is itself a linked bug-introducer) instead of exposing it.
+    const CURRENT_RISK_GLOBS = ['src/guard/**', 'src/new-risky/**']; // grew AFTER this PR merged
+    const prAtMergeGlobsOnly = ['src/guard/**']; // what .github/labeler.yml actually held at its merge
+
+    it('stays skipped under the historical glob list even though the CURRENT list would flip it to reviewed', () => {
+      const prs = [
+        pr({
+          number: 620,
+          title: 'feat: z',
+          mergedAt: '2026-09-11T10:00:00Z',
+          files: ['src/new-risky/z.ts'], // matches CURRENT_RISK_GLOBS, not prAtMergeGlobsOnly
+          atMergeContext: { files: ['src/new-risky/z.ts'], labels: [], riskHighGlobs: prAtMergeGlobsOnly },
+        }),
+      ];
+      const weekly = computeWeeklyReport(prs, CURRENT_RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+      const row = weekly.rows[0]!;
+      expect(row.skipped).toBe(1);
+      expect(row.reviewed).toBe(0);
+    });
+
+    it('sanity check: the SAME PR classifies reviewed if its at-merge context had actually carried the current globs', () => {
+      // Confirms the fixture above is a real divergence, not a tautology: swapping
+      // riskHighGlobs to CURRENT_RISK_GLOBS on the same files DOES flip the verdict.
+      const prs = [
+        pr({
+          number: 620,
+          mergedAt: '2026-09-11T10:00:00Z',
+          files: ['src/new-risky/z.ts'],
+          atMergeContext: { files: ['src/new-risky/z.ts'], labels: [], riskHighGlobs: CURRENT_RISK_GLOBS },
+        }),
+      ];
+      const weekly = computeWeeklyReport(prs, CURRENT_RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+      expect(weekly.rows[0]!.reviewed).toBe(1);
+      expect(weekly.rows[0]!.skipped).toBe(0);
+    });
+  });
+
+  it('counts a revert found within the follow-up window as bug-introducing, same as a Fixes-PR link — P2 #5', () => {
+    // #608-style: reverted by a later PR, but never itself named via Fixes-PR:.
+    const prs = [
+      pr({ number: 608, title: 'feat: risky change', mergedAt: '2026-09-11T00:00:00Z' }),
+      pr({ number: 610, title: 'revert(x): back out #608', mergedAt: '2026-09-12T00:00:00Z' }),
+    ];
+    const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+    const row = weekly.rows[0]!;
+    expect(row.overall.linked).toBe(1);
+    expect(row.overall.overlapHeuristic).toBe(0);
+  });
+
+  it('counts link-matched and overlap-heuristic follow-ups separately, per lane, in a mixed week', () => {
+    const prs = [
+      pr({
+        number: 1,
+        title: 'fix(guard): a',
+        mergedAt: '2026-09-11T00:00:00Z',
+        files: ['src/guard/x.ts'],
+        changedLines: 500,
+        atMergeContext: { files: ['src/guard/x.ts'], labels: [], riskHighGlobs: RISK_GLOBS },
+      }), // reviewed — high-risk at merge
+      pr({
+        number: 3,
+        title: 'feat: c',
+        mergedAt: '2026-09-12T00:00:00Z',
+        files: ['docs/c.md'],
+        changedLines: 1200,
+        atMergeContext: { files: ['docs/c.md'], labels: [], riskHighGlobs: RISK_GLOBS },
+      }), // skipped
+      pr({ number: 4, title: 'fix: patch a', mergedAt: '2026-09-15T00:00:00Z', body: 'Fixes-PR: #1', files: [] }),
+      pr({ number: 5, title: 'fix: patch c', mergedAt: '2026-09-16T00:00:00Z', files: ['docs/c.md'] }),
+    ];
+    const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+    const row = weekly.rows[0]!;
+    expect(row.reviewed).toBe(1);
+    expect(row.skipped).toBe(1);
+    expect(row.overall.linked).toBe(1);
+    expect(row.overall.overlapHeuristic).toBe(1);
+    expect(row.reviewedLane.linked).toBe(1);
+    expect(row.reviewedLane.overlapHeuristic).toBe(0);
+    expect(row.skippedLane.linked).toBe(0);
+    expect(row.skippedLane.overlapHeuristic).toBe(1);
+    // changedLines = 500 + 1200 = 1700; overall.linked = 1 -> 1 / (1700/1000).
+    expect(row.linkedPerKLoc).toBeCloseTo(1 / 1.7);
+  });
+
+  it('computes the weekly revert rate at the row level (PRs that ARE themselves reverts)', () => {
+    const prs = [
+      pr({ number: 1, title: 'feat: a', mergedAt: '2026-09-11T00:00:00Z' }),
+      pr({ number: 2, title: 'revert: back out #1', mergedAt: '2026-09-12T00:00:00Z' }),
+    ];
+    const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+    expect(weekly.rows[0]!.reverted).toBe(1);
+    expect(weekly.rows[0]!.revertRate).toBe(0.5);
+  });
+
+  it('handles changedLines of 0 without dividing by zero', () => {
+    const prs = [pr({ number: 1, mergedAt: '2026-09-11T00:00:00Z', changedLines: 0 })];
+    const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+    expect(weekly.rows[0]!.linkedPerKLoc).toBe(0);
+  });
+
+  describe('linkComplete / preConventionMerged (partial weeks) — P2 #4', () => {
+    it('is link-complete when the week START is at/after the convention start (2026-W38 is the first full week)', () => {
+      const prs = [pr({ number: 1, mergedAt: '2026-09-15T00:00:00Z' })];
+      const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+      const row = weekly.rows[0]!;
+      expect(row.isoWeek).toBe('2026-W38');
+      expect(row.linkComplete).toBe(true);
+      expect(row.preConventionMerged).toBe(0);
+    });
+
+    it('is partial when the week START precedes the convention start, with a pre-convention count', () => {
+      // 2026-W37 (Sep 7–13) starts before FIXES_PR_CONVENTION_START_ISO (Sep 11
+      // 12:44:10Z), even though PR #2 in it merged after that instant.
+      const prs = [
+        pr({ number: 1, mergedAt: '2026-09-10T00:00:00Z' }), // before the convention
+        pr({ number: 2, mergedAt: '2026-09-12T00:00:00Z' }), // after the convention, same week
+      ];
+      const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-20T00:00:00Z');
+      const row = weekly.rows[0]!;
+      expect(row.isoWeek).toBe('2026-W37');
+      expect(row.linkComplete).toBe(false);
+      expect(row.preConventionMerged).toBe(1);
+    });
+  });
+
+  describe('the immature flag', () => {
+    // 2026-W37 ends 2026-09-13T23:59:59.999Z; +14 days = 2026-09-27T23:59:59.999Z.
+    const prs = [pr({ number: 1, mergedAt: '2026-09-11T00:00:00Z' })];
+
+    it('is true one millisecond before followupDays have passed since the week ended', () => {
+      const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-27T23:59:59.998Z');
+      expect(weekly.rows[0]!.immature).toBe(true);
+    });
+
+    it('is false exactly when followupDays have passed since the week ended', () => {
+      const weekly = computeWeeklyReport(prs, RISK_GLOBS, 14, '2026-09-27T23:59:59.999Z');
+      expect(weekly.rows[0]!.immature).toBe(false);
+    });
+  });
+});
+
+describe('classifyAtMergeVerdict', () => {
+  const ctx = { files: ['docs/a.md'], labels: [], riskHighGlobs: ['src/guard/**'] };
+
+  it('is skip for a low-risk, label-eligible context', () => {
+    expect(classifyAtMergeVerdict(ctx)).toBe('skip');
+  });
+
+  it('is review when the files match the AT-MERGE globs', () => {
+    expect(classifyAtMergeVerdict({ ...ctx, files: ['src/guard/x.ts'] })).toBe('review');
+  });
+
+  it('is review when the AT-MERGE labels carry risk:high or review:requested', () => {
+    expect(classifyAtMergeVerdict({ ...ctx, labels: ['review:requested'] })).toBe('review');
+  });
+
+  it('fails closed to review for null or undefined — never skip on missing data', () => {
+    expect(classifyAtMergeVerdict(null)).toBe('review');
+    expect(classifyAtMergeVerdict(undefined)).toBe('review');
+  });
+});
+
+describe('replayLabelsAtMerge', () => {
+  it('adds a label at its LabeledEvent and keeps it if merged after', () => {
+    const events = [{ type: 'labeled' as const, name: 'risk:high', createdAt: '2026-09-10T00:00:00Z' }];
+    expect(replayLabelsAtMerge(events, '2026-09-11T00:00:00Z')).toEqual(['risk:high']);
+  });
+
+  it('removes a label at its UnlabeledEvent, applied in time order', () => {
+    const events = [
+      { type: 'labeled' as const, name: 'risk:high', createdAt: '2026-09-10T00:00:00Z' },
+      { type: 'unlabeled' as const, name: 'risk:high', createdAt: '2026-09-10T12:00:00Z' },
+    ];
+    expect(replayLabelsAtMerge(events, '2026-09-11T00:00:00Z')).toEqual([]);
+  });
+
+  it('ignores an event created AFTER mergedAt — a label added post-merge was not there at merge', () => {
+    const events = [{ type: 'labeled' as const, name: 'risk:high', createdAt: '2026-09-12T00:00:00Z' }];
+    expect(replayLabelsAtMerge(events, '2026-09-11T00:00:00Z')).toEqual([]);
+  });
+
+  it('includes an event at exactly mergedAt', () => {
+    const events = [{ type: 'labeled' as const, name: 'risk:high', createdAt: '2026-09-11T00:00:00Z' }];
+    expect(replayLabelsAtMerge(events, '2026-09-11T00:00:00Z')).toEqual(['risk:high']);
+  });
+});
+
+describe('resolveAtMergeBaseSha', () => {
+  it('names the first parent of a normal 2-parent merge whose second parent is the head', () => {
+    expect(
+      resolveAtMergeBaseSha({ headRefOid: 'head1', mergeCommitOid: 'merge1', parentOids: ['base1', 'head1'] }),
+    ).toBe('base1');
+  });
+
+  it('names the single parent of a 1-parent (squash) commit', () => {
+    expect(resolveAtMergeBaseSha({ headRefOid: 'head1', mergeCommitOid: 'sq1', parentOids: ['base1'] })).toBe('base1');
+  });
+
+  it("is null when the 2-parent commit's second parent is NOT this PR's head (an octopus/manual merge)", () => {
+    expect(
+      resolveAtMergeBaseSha({
+        headRefOid: 'head1',
+        mergeCommitOid: 'merge1',
+        parentOids: ['base1', 'someone-elses-head'],
+      }),
+    ).toBeNull();
+  });
+
+  it('is null for 0 or 3+ parents', () => {
+    expect(resolveAtMergeBaseSha({ headRefOid: 'head1', mergeCommitOid: 'm', parentOids: [] })).toBeNull();
+    expect(resolveAtMergeBaseSha({ headRefOid: 'head1', mergeCommitOid: 'm', parentOids: ['a', 'b', 'c'] })).toBeNull();
+  });
+
+  it('is null when there is no merge commit at all', () => {
+    expect(resolveAtMergeBaseSha({ headRefOid: 'head1', mergeCommitOid: null, parentOids: [] })).toBeNull();
+  });
+});
+
+describe('generatedFileChangedLines — P3', () => {
+  it('sums additions+deletions only for GENERATED_FILES entries', () => {
+    const entries = [
+      { path: 'src/a.ts', additions: 10, deletions: 5 },
+      { path: 'src/upstream-ratchet.json', additions: 1000, deletions: 900 },
+      { path: 'pnpm-lock.yaml', additions: 50, deletions: 20 },
+    ];
+    expect(generatedFileChangedLines(entries)).toBe(1000 + 900 + 50 + 20);
+  });
+
+  it('is 0 when no file is generated', () => {
+    expect(generatedFileChangedLines([{ path: 'src/a.ts', additions: 10, deletions: 5 }])).toBe(0);
+  });
+
+  it('is 0 for an empty file list', () => {
+    expect(generatedFileChangedLines([])).toBe(0);
+  });
+});
+
+describe('stripFencedAndCommented', () => {
+  it('leaves plain text untouched', () => {
+    expect(stripFencedAndCommented('plain\nFixes-PR: #605\nmore')).toBe('plain\nFixes-PR: #605\nmore');
+  });
+
+  it('drops a fenced code block entirely, including any Fixes-PR line inside it', () => {
+    const out = stripFencedAndCommented('before\n```\nFixes-PR: #605\n```\nafter');
+    expect(out).not.toContain('Fixes-PR');
+    expect(out).toContain('before');
+    expect(out).toContain('after');
+  });
+
+  it('drops an HTML comment entirely', () => {
+    const out = stripFencedAndCommented('before\n<!-- Fixes-PR: #605 -->\nafter');
+    expect(out).not.toContain('Fixes-PR');
+  });
+
+  it('runs an unclosed fence to the end of the body', () => {
+    const out = stripFencedAndCommented('kept\n```\nFixes-PR: #605\nstill inside, never closed');
+    expect(out).not.toContain('Fixes-PR');
+    expect(out).toContain('kept');
+  });
+});
+
+describe('extractFixesPrNumbers — P3', () => {
+  it('extracts multiple numbers from one line', () => {
+    expect(extractFixesPrNumbers('Fixes-PR: #605, #620')).toEqual([605, 620]);
+  });
+
+  it('extracts numbers from separate Fixes-PR lines', () => {
+    expect(extractFixesPrNumbers('Fixes-PR: #605\nsome text\nFixes-PR: #620')).toEqual([605, 620]);
+  });
+
+  it('ignores a cross-repo owner/repo#N reference', () => {
+    expect(extractFixesPrNumbers('Fixes-PR: nanocoai/nanoclaw#605')).toEqual([]);
+  });
+
+  it('ignores an "(upstream ...)" parenthetical', () => {
+    expect(extractFixesPrNumbers('Fixes-PR: none (upstream #605 already covers this)')).toEqual([]);
+  });
+
+  it('credits nothing when none and a number both appear on the same line', () => {
+    expect(extractFixesPrNumbers('Fixes-PR: none #2')).toEqual([]);
+  });
+
+  it('credits nothing when none and a number appear on separate lines', () => {
+    expect(extractFixesPrNumbers('Fixes-PR: none\nFixes-PR: #2')).toEqual([]);
+  });
+
+  it('strips a Fixes-PR line inside a fenced code block before reading the rest', () => {
+    expect(extractFixesPrNumbers('before\n```\nFixes-PR: #605\n```\nFixes-PR: #620')).toEqual([620]);
+  });
+
+  it('strips a Fixes-PR line inside an HTML comment before reading the rest', () => {
+    expect(extractFixesPrNumbers('<!-- Fixes-PR: #605 -->\nFixes-PR: #620')).toEqual([620]);
+  });
+
+  it('extractFixesPrNumber (singular) returns the first credited number, or null', () => {
+    expect(extractFixesPrNumber('Fixes-PR: #605, #620')).toBe(605);
+    expect(extractFixesPrNumber('Fixes-PR: none #2')).toBeNull();
+  });
+});
+
+// #653 is the PR that originally shipped this file — its own body quotes another PR's
+// revert-shaped title and refers to a real revert in prose, mid-sentence. These are its
+// EXACT lines (gh pr view 653 --json body), never a paraphrase — the false positive
+// depends on precisely where each line starts.
+describe('isRevertOf / isRevertPR — #653 false-positive regression (P2 #3)', () => {
+  it('does not read a quoted revert title or descriptive prose as a revert declaration', () => {
+    const target = pr({ number: 608, title: 'runner: end a task stream after its result' });
+    const candidate = pr({
+      number: 653,
+      title: 'feat(scripts): review-outcomes, the risk-based review measurement query',
+      body: [
+        "- **Revert matching** — I had to generalize this beyond the literal brief. This repo's real",
+        '  revert PRs don\'t follow GitHub\'s auto-revert template (`Revert "..."` title, "This',
+        '  reverts pull request #N." body); e.g. #610 reverting #608 is titled',
+        '  `revert(runner): back out ending a task stream after its result (#608)` — the same',
+        '  conventional-commit prefix `FIX_TITLE_RE` uses for fixes. So the title rule is',
+        '',
+        '  extraction, fix-title/overlap matching, revert matching including the real #610 shape,',
+        '',
+        'class is consistent with the one real revert in the window (#610 reverting #608) — #608',
+      ].join('\n'),
+    });
+    expect(isRevertOf(candidate, target)).toBe(false);
+    expect(isRevertPR(candidate)).toBe(false);
+  });
+});
+
+describe('renderWeeklyMarkdown', () => {
+  it('shows only the most recent weeksToShow rows out of a longer history, plainly stating n', () => {
+    const prs = Array.from({ length: 10 }, (_, i) =>
+      pr({ number: i + 1, mergedAt: new Date(Date.UTC(2026, 0, 1) + i * 7 * 24 * 60 * 60 * 1000).toISOString() }),
+    );
+    const weekly = computeWeeklyReport(prs, [], 14, '2027-01-01T00:00:00Z');
+    const options: Options = {
+      repo: 'x/y',
+      switchIso: '2026-02-01T00:00:00Z',
+      days: 30,
+      followupDays: 14,
+      json: false,
+    };
+    const cumulative = computeReport(prs, [], options);
+    const markdown = renderWeeklyMarkdown(weekly, cumulative, 8);
+    expect(weekly.rows).toHaveLength(10);
+    expect(markdown).toContain('Last 8 week(s) of 10 total');
+    // The two oldest weeks are sliced off; only the eight most recent isoWeek keys appear.
+    expect(markdown).not.toContain(weekly.rows[0]!.isoWeek);
+    expect(markdown).not.toContain(weekly.rows[1]!.isoWeek);
+    expect(markdown).toContain(weekly.rows[9]!.isoWeek);
+  });
+
+  it('includes the cumulative before/after comparison', () => {
+    const prs = [pr({ number: 1, mergedAt: '2026-09-08T00:00:00Z' })];
+    const weekly = computeWeeklyReport(prs, [], 14, '2026-09-12T00:00:00Z');
+    const options: Options = { repo: 'x/y', switchIso: '2026-09-10T00:00:00Z', days: 5, followupDays: 14, json: false };
+    const cumulative = computeReport(prs, [], options);
+    const markdown = renderWeeklyMarkdown(weekly, cumulative, 8);
+    expect(markdown).toContain('Cumulative');
+    expect(markdown).toContain(cumulative.switchIso);
+  });
+});
+
+describe('parseGitNameStatus — NUL-separated (`-z`) fields', () => {
+  it('parses an ordinary modify/add/delete field-run as {status, path}', () => {
+    expect(parseGitNameStatus('M\0src/a.ts\0')).toEqual([{ status: 'M', path: 'src/a.ts' }]);
+    expect(parseGitNameStatus('A\0src/new.ts\0')).toEqual([{ status: 'A', path: 'src/new.ts' }]);
+    expect(parseGitNameStatus('D\0src/gone.ts\0')).toEqual([{ status: 'D', path: 'src/gone.ts' }]);
+  });
+
+  it('parses a rename/copy field-run as {status, previousPath, path}', () => {
+    expect(parseGitNameStatus('R100\0old.ts\0new.ts\0')).toEqual([
+      { status: 'R100', previousPath: 'old.ts', path: 'new.ts' },
+    ]);
+    expect(parseGitNameStatus('C75\0src/a.ts\0src/b.ts\0')).toEqual([
+      { status: 'C75', previousPath: 'src/a.ts', path: 'src/b.ts' },
+    ]);
+  });
+
+  it('parses multiple entries in one NUL-separated run', () => {
+    expect(parseGitNameStatus('M\0a.ts\0R100\0b.ts\0c.ts\0')).toEqual([
+      { status: 'M', path: 'a.ts' },
+      { status: 'R100', previousPath: 'b.ts', path: 'c.ts' },
+    ]);
+  });
+
+  it('is empty for empty input', () => {
+    expect(parseGitNameStatus('')).toEqual([]);
+  });
+
+  it('handles a non-ASCII path — the whole point of `-z`: no quoting to strip, unlike the tab/newline format', () => {
+    expect(parseGitNameStatus('M\0src/café.ts\0')).toEqual([{ status: 'M', path: 'src/café.ts' }]);
+  });
+
+  it('handles a renamed non-ASCII path (both old and new) with `-z`', () => {
+    expect(parseGitNameStatus('R100\0src/café-old.ts\0src/café-new.ts\0')).toEqual([
+      { status: 'R100', previousPath: 'src/café-old.ts', path: 'src/café-new.ts' },
+    ]);
+  });
+});
+
+describe('fetchAtMergeLabelEventsBatch — GraphQL failure does not kill the run', () => {
+  it('returns an empty map instead of throwing when `gh` itself is blocked/unavailable', () => {
+    // `gh` is never allowlisted in this file (only `git` is, for the fixture-repo block
+    // below) — enforceHermeticity() makes any `execFileSync('gh', ...)` throw before it
+    // reaches a real binary, which stands in exactly for a real GraphQL/network
+    // failure. The function must catch that, log once, and hand back an empty map so
+    // the caller marks those PRs unresolved and moves on to the next batch. The blocked
+    // call is a DELIBERATE hermeticity trip, asserted on below and cleared, not an
+    // accidental escape.
+    expect(() => fetchAtMergeLabelEventsBatch('owner/repo', [1, 2, 3])).not.toThrow();
+    const result = fetchAtMergeLabelEventsBatch('owner/repo', [1, 2, 3]);
+    expect(result.size).toBe(0);
+    expect(hermeticityAttempts().length).toBeGreaterThan(0);
+    expect(hermeticityAttempts()[0]).toMatchObject({ kind: 'subprocess', api: 'execFileSync', target: 'gh' });
+    clearHermeticityAttempts();
+  });
+});
+
+describe('at-merge replay from local git (fixture repo, no network) — P2', () => {
+  let repoDir: string;
+  let baseCommit: string;
+  let mergeCommit: string; // squash-shaped (1 parent): grows the glob list AND renames a file
+  let originalCwd: string;
+
+  function fixtureGit(args: string[]): string {
+    return execFileSync('git', ['-c', 'user.email=test@example.invalid', '-c', 'user.name=test', ...args], {
+      cwd: repoDir,
+      encoding: 'utf8',
+    }).trim();
+  }
+
+  beforeAll(() => {
+    originalCwd = process.cwd();
+    repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-at-merge-fixture-'));
+    fixtureGit(['init', '-q', '-b', 'main']);
+    fs.mkdirSync(path.join(repoDir, '.github'), { recursive: true });
+    fs.writeFileSync(
+      path.join(repoDir, '.github', 'labeler.yml'),
+      "risk:high:\n- changed-files:\n  - any-glob-to-any-file:\n    - 'src/guard/**'\n",
+    );
+    fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'src', 'old-name.ts'), 'old content\n');
+    fixtureGit(['add', '-A']);
+    fixtureGit(['commit', '-q', '-m', 'base: add labeler.yml and old-name.ts']);
+    baseCommit = fixtureGit(['rev-parse', 'HEAD']);
+
+    // Grow the glob list AND rename a file (pure rename, unchanged content — `-M`'s
+    // default 50% similarity threshold trivially detects it as R100).
+    fs.writeFileSync(
+      path.join(repoDir, '.github', 'labeler.yml'),
+      "risk:high:\n- changed-files:\n  - any-glob-to-any-file:\n    - 'src/guard/**'\n    - 'src/new-risky/**'\n",
+    );
+    fs.mkdirSync(path.join(repoDir, 'src', 'new-risky'), { recursive: true });
+    fixtureGit(['mv', 'src/old-name.ts', 'src/new-risky/renamed.ts']);
+    fixtureGit(['add', '-A']);
+    fixtureGit(['commit', '-q', '-m', 'grow labeler.yml globs and rename a file']);
+    mergeCommit = fixtureGit(['rev-parse', 'HEAD']);
+
+    // review-outcomes.ts's internal `git()` helper inherits process.cwd() (see the
+    // file header: "the script must run the same way against the checkout") — point it
+    // at the fixture for the rest of this describe block.
+    process.chdir(repoDir);
+  });
+
+  afterAll(() => {
+    process.chdir(originalCwd);
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  });
+
+  it('mergeCommitParentsLocal reads the real parent from local git', () => {
+    expect(mergeCommitParentsLocal(mergeCommit)).toEqual([baseCommit]);
+  });
+
+  it('mergeCommitParentsLocal reads BOTH parents, in order, for a genuine 2-parent merge commit', () => {
+    // A separate throwaway repo: base branch + a feature branch merged with --no-ff,
+    // so this is a REAL 2-parent GitHub-shaped merge commit, not a squash.
+    const twoParentRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-2parent-fixture-'));
+    function g(args: string[]): string {
+      return execFileSync('git', ['-c', 'user.email=test@example.invalid', '-c', 'user.name=test', ...args], {
+        cwd: twoParentRepo,
+        encoding: 'utf8',
+      }).trim();
+    }
+    g(['init', '-q', '-b', 'main']);
+    fs.writeFileSync(path.join(twoParentRepo, 'a.txt'), 'a\n');
+    g(['add', '-A']);
+    g(['commit', '-q', '-m', 'base']);
+    const mainTip = g(['rev-parse', 'HEAD']);
+    g(['checkout', '-q', '-b', 'feature']);
+    fs.writeFileSync(path.join(twoParentRepo, 'b.txt'), 'b\n');
+    g(['add', '-A']);
+    g(['commit', '-q', '-m', 'feature work']);
+    const featureHead = g(['rev-parse', 'HEAD']);
+    g(['checkout', '-q', 'main']);
+    g(['merge', '--no-ff', '-q', '-m', 'Merge feature', 'feature']);
+    const twoParentMerge = g(['rev-parse', 'HEAD']);
+    process.chdir(twoParentRepo);
+    try {
+      expect(mergeCommitParentsLocal(twoParentMerge)).toEqual([mainTip, featureHead]);
+    } finally {
+      process.chdir(repoDir);
+      fs.rmSync(twoParentRepo, { recursive: true, force: true });
+    }
+  });
+
+  it('mergeCommitParentsLocal is null for a commit not resolvable locally (shallow clone / force-pushed-away base)', () => {
+    expect(mergeCommitParentsLocal('0000000000000000000000000000000000000000')).toBeNull();
+  });
+
+  it('readRiskHighGlobsAtShaLocal reads risk:high globs AT the base commit, not the merge commit', () => {
+    expect(readRiskHighGlobsAtShaLocal(baseCommit)).toEqual({ kind: 'found', globs: ['src/guard/**'] });
+  });
+
+  it('readRiskHighGlobsAtShaLocal is "missing" (not "error") when the commit exists but predates labeler.yml', () => {
+    const preLabelerRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-pre-labeler-fixture-'));
+    function g(args: string[]): string {
+      return execFileSync('git', ['-c', 'user.email=test@example.invalid', '-c', 'user.name=test', ...args], {
+        cwd: preLabelerRepo,
+        encoding: 'utf8',
+      }).trim();
+    }
+    g(['init', '-q', '-b', 'main']);
+    fs.writeFileSync(path.join(preLabelerRepo, 'README.md'), 'no labeler yet\n');
+    g(['add', '-A']);
+    g(['commit', '-q', '-m', 'pre-labeler commit']);
+    const preLabelerCommit = g(['rev-parse', 'HEAD']);
+    process.chdir(preLabelerRepo);
+    try {
+      expect(readRiskHighGlobsAtShaLocal(preLabelerCommit)).toEqual({ kind: 'missing' });
+    } finally {
+      process.chdir(repoDir);
+      fs.rmSync(preLabelerRepo, { recursive: true, force: true });
+    }
+  });
+
+  it('readRiskHighGlobsAtShaLocal is "error" for a commit that is not resolvable at all', () => {
+    expect(readRiskHighGlobsAtShaLocal('0000000000000000000000000000000000000000')).toEqual({ kind: 'error' });
+  });
+
+  it('readRiskHighGlobsAtShaLocal is "error" (NOT "missing") when the path exists but its content cannot be read', () => {
+    // Simulates a partial/lazy checkout that has the tree entry (so `git cat-file -e
+    // <sha>:.github/labeler.yml` succeeds — the file genuinely exists here) but not the
+    // blob's content (so `git show` fails) — the exact gap `readRiskHighGlobsAtShaLocal`'s
+    // own doc comment describes. Before this fix, every `git show` failure — this one
+    // included — was read as "missing", which `resolveAtMergeContexts` reclassifies as
+    // pre-gate; that would be wrong here, since the file DOES exist at this commit.
+    const original = nodeChildProcess.execFileSync;
+    const labelerShowArgs = ['show', `${baseCommit}:.github/labeler.yml`];
+    const spy = vi
+      .spyOn(nodeChildProcess, 'execFileSync')
+      .mockImplementation((...callArgs: Parameters<typeof nodeChildProcess.execFileSync>) => {
+        const [command, cmdArgs] = callArgs;
+        if (command === 'git' && Array.isArray(cmdArgs) && cmdArgs[0] === 'show' && cmdArgs[1] === labelerShowArgs[1]) {
+          throw new Error('simulated: blob content unavailable even though the tree entry exists');
+        }
+        return (original as (...a: unknown[]) => unknown)(...callArgs) as ReturnType<
+          typeof nodeChildProcess.execFileSync
+        >;
+      });
+    try {
+      // Sanity check first: the path DOES resolve via cat-file -e (unmocked) at this sha —
+      // otherwise this test would trivially pass for the wrong reason ("missing" either way).
+      expect(() => execFileSync('git', ['cat-file', '-e', `${baseCommit}:.github/labeler.yml`])).not.toThrow();
+      expect(readRiskHighGlobsAtShaLocal(baseCommit)).toEqual({ kind: 'error' });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('fileDiffAtMergeLocal includes BOTH the old and new path of a rename', () => {
+    const files = fileDiffAtMergeLocal(baseCommit, mergeCommit, 2);
+    expect(files).not.toBeNull();
+    expect(files).not.toBe('over-cap');
+    expect(files).toContain('src/old-name.ts');
+    expect(files).toContain('src/new-risky/renamed.ts');
+    expect(files).toContain('.github/labeler.yml');
+  });
+
+  it("fileDiffAtMergeLocal is null (fail closed) when the changedFiles count does not match — mirrors the gate's completeness rule", () => {
+    expect(fileDiffAtMergeLocal(baseCommit, mergeCommit, 99)).toBeNull();
+  });
+
+  it('fileDiffAtMergeLocal returns "over-cap" — never null/unresolved — at >=300 changed files, matching codex-review.sh:764 exactly', () => {
+    const bigRepoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-over-cap-fixture-'));
+    function g(args: string[]): string {
+      return execFileSync('git', ['-c', 'user.email=test@example.invalid', '-c', 'user.name=test', ...args], {
+        cwd: bigRepoDir,
+        encoding: 'utf8',
+      }).trim();
+    }
+    g(['init', '-q', '-b', 'main']);
+    // A labeler.yml at the base is required so `readRiskHighGlobsAtShaLocal` reaches
+    // 'found' (not 'missing') — otherwise `resolveAtMergeFileContextLocal` short-circuits
+    // to 'pre-gate' before it ever reaches the file-diff/over-cap check this test targets.
+    fs.mkdirSync(path.join(bigRepoDir, '.github'), { recursive: true });
+    fs.writeFileSync(
+      path.join(bigRepoDir, '.github', 'labeler.yml'),
+      "risk:high:\n- changed-files:\n  - any-glob-to-any-file:\n    - 'src/guard/**'\n",
+    );
+    fs.writeFileSync(path.join(bigRepoDir, 'README.md'), 'base\n');
+    g(['add', '-A']);
+    g(['commit', '-q', '-m', 'base']);
+    const base = g(['rev-parse', 'HEAD']);
+    // 300 new files in one commit — GitHub's own `compare` endpoint truncates its file
+    // listing at exactly this count (docs.github.com/en/rest/commits/commits#compare-two-commits),
+    // which is why codex-review.sh:764's `$listed >= 300` check always trips for a real
+    // >=300-file PR and answers `review` deterministically.
+    for (let i = 0; i < 300; i += 1) {
+      fs.writeFileSync(path.join(bigRepoDir, `file-${i}.txt`), `${i}\n`);
+    }
+    g(['add', '-A']);
+    g(['commit', '-q', '-m', 'add 300 files']);
+    const big = g(['rev-parse', 'HEAD']);
+    process.chdir(bigRepoDir);
+    try {
+      expect(fileDiffAtMergeLocal(base, big, 300)).toBe('over-cap');
+      const ctx = resolveAtMergeFileContextLocal({ mergeCommitOid: big, headRefOid: big, changedFiles: 300 });
+      expect(ctx).toEqual({ kind: 'review' });
+    } finally {
+      process.chdir(repoDir);
+      fs.rmSync(bigRepoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('fileDiffAtMergeLocal returns the exact non-ASCII path, unquoted — the `-z` fix (P3)', () => {
+    const utfRepoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-nonascii-fixture-'));
+    function g(args: string[]): string {
+      return execFileSync('git', ['-c', 'user.email=test@example.invalid', '-c', 'user.name=test', ...args], {
+        cwd: utfRepoDir,
+        encoding: 'utf8',
+      }).trim();
+    }
+    g(['init', '-q', '-b', 'main']);
+    fs.writeFileSync(path.join(utfRepoDir, 'README.md'), 'base\n');
+    g(['add', '-A']);
+    g(['commit', '-q', '-m', 'base']);
+    const base = g(['rev-parse', 'HEAD']);
+    // A non-ASCII byte (0xC3 0xA9, UTF-8 for "é") in the path is exactly what
+    // `core.quotePath` (on by default) wraps in C-style double-quoted/octal-escaped form
+    // WITHOUT `-z` — see `GitDiffEntry`'s own doc comment.
+    fs.mkdirSync(path.join(utfRepoDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(utfRepoDir, 'src', 'café.ts'), 'content\n');
+    g(['add', '-A']);
+    g(['commit', '-q', '-m', 'add a non-ASCII path']);
+    const withNonAscii = g(['rev-parse', 'HEAD']);
+    // Sanity check: WITHOUT -z, git really does quote this path — proves the bug this
+    // fix addresses is real, not merely hypothetical.
+    const quotedRaw = g(['diff', '--name-status', '-M', base, withNonAscii]);
+    expect(quotedRaw).toContain('"'); // core.quotePath's C-style quoting kicks in
+    expect(quotedRaw).not.toContain('café.ts'); // the raw UTF-8 name is NOT what appears
+    process.chdir(utfRepoDir);
+    try {
+      const files = fileDiffAtMergeLocal(base, withNonAscii, 1);
+      expect(files).toEqual(['src/café.ts']);
+    } finally {
+      process.chdir(repoDir);
+      fs.rmSync(utfRepoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('fileDiffAtMergeLocal returns a renamed non-ASCII path, unquoted, both old and new sides — the `-z` fix (P3)', () => {
+    const utfRenameRepoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-nonascii-rename-fixture-'));
+    function g(args: string[]): string {
+      return execFileSync('git', ['-c', 'user.email=test@example.invalid', '-c', 'user.name=test', ...args], {
+        cwd: utfRenameRepoDir,
+        encoding: 'utf8',
+      }).trim();
+    }
+    g(['init', '-q', '-b', 'main']);
+    fs.mkdirSync(path.join(utfRenameRepoDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(utfRenameRepoDir, 'src', 'café-old.ts'), 'content\n');
+    g(['add', '-A']);
+    g(['commit', '-q', '-m', 'base with a non-ASCII path']);
+    const base = g(['rev-parse', 'HEAD']);
+    g(['mv', 'src/café-old.ts', 'src/café-new.ts']);
+    g(['commit', '-q', '-m', 'rename a non-ASCII path to another non-ASCII path']);
+    const renamed = g(['rev-parse', 'HEAD']);
+    process.chdir(utfRenameRepoDir);
+    try {
+      const files = fileDiffAtMergeLocal(base, renamed, 1);
+      expect(files).not.toBeNull();
+      expect(files).not.toBe('over-cap');
+      expect(files).toContain('src/café-old.ts');
+      expect(files).toContain('src/café-new.ts');
+    } finally {
+      process.chdir(repoDir);
+      fs.rmSync(utfRenameRepoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('resolveAtMergeFileContextLocal resolves the full file+glob context in one call', () => {
+    const ctx = resolveAtMergeFileContextLocal({
+      mergeCommitOid: mergeCommit,
+      headRefOid: mergeCommit,
+      changedFiles: 2,
+    });
+    expect(ctx.kind).toBe('resolved');
+    if (ctx.kind === 'resolved') {
+      expect(ctx.riskHighGlobs).toEqual(['src/guard/**']); // the AT-MERGE (base) list, not the grown one
+      expect(ctx.files).toContain('src/new-risky/renamed.ts');
+    }
+  });
+
+  it('resolveAtMergeFileContextLocal is "pre-gate" when the base predates labeler.yml', () => {
+    const preLabelerRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-pre-labeler-ctx-'));
+    function g(args: string[]): string {
+      return execFileSync('git', ['-c', 'user.email=test@example.invalid', '-c', 'user.name=test', ...args], {
+        cwd: preLabelerRepo,
+        encoding: 'utf8',
+      }).trim();
+    }
+    g(['init', '-q', '-b', 'main']);
+    fs.writeFileSync(path.join(preLabelerRepo, 'README.md'), 'no labeler yet\n');
+    g(['add', '-A']);
+    g(['commit', '-q', '-m', 'pre-labeler']);
+    fs.writeFileSync(path.join(preLabelerRepo, 'README.md'), 'still no labeler\n');
+    g(['add', '-A']);
+    g(['commit', '-q', '-m', 'a one-parent "merge" onto the pre-labeler base']);
+    const squashCommit = g(['rev-parse', 'HEAD']);
+    process.chdir(preLabelerRepo);
+    try {
+      const ctx = resolveAtMergeFileContextLocal({
+        mergeCommitOid: squashCommit,
+        headRefOid: squashCommit,
+        changedFiles: 1,
+      });
+      expect(ctx).toEqual({ kind: 'pre-gate' });
+    } finally {
+      process.chdir(repoDir);
+      fs.rmSync(preLabelerRepo, { recursive: true, force: true });
+    }
+  });
+
+  it('resolveAtMergeFileContextLocal is "unresolved" for a merge commit oid that is not resolvable locally', () => {
+    const ctx = resolveAtMergeFileContextLocal({
+      mergeCommitOid: '0000000000000000000000000000000000000000',
+      headRefOid: '0000000000000000000000000000000000000000',
+      changedFiles: 1,
+    });
+    expect(ctx).toEqual({ kind: 'unresolved' });
+  });
+
+  describe('the #620-style regression, replayed against a real fixture repo', () => {
+    const CURRENT_RISK_GLOBS = ['src/guard/**', 'src/new-risky/**']; // grown AFTER this "merge"
+
+    it('classifies skip under the AT-MERGE glob list even though the CURRENT (grown) list would flip it to review', () => {
+      const ctx = resolveAtMergeFileContextLocal({
+        mergeCommitOid: mergeCommit,
+        headRefOid: mergeCommit,
+        changedFiles: 2,
+      });
+      expect(ctx.kind).toBe('resolved');
+      if (ctx.kind !== 'resolved') return;
+      expect(classifyAtMergeVerdict({ files: ctx.files, labels: [], riskHighGlobs: ctx.riskHighGlobs })).toBe('skip');
+    });
+
+    it('sanity check: the SAME files classify review under the CURRENT (grown) glob list — confirms a real divergence', () => {
+      const ctx = resolveAtMergeFileContextLocal({
+        mergeCommitOid: mergeCommit,
+        headRefOid: mergeCommit,
+        changedFiles: 2,
+      });
+      expect(ctx.kind).toBe('resolved');
+      if (ctx.kind !== 'resolved') return;
+      expect(classifyAtMergeVerdict({ files: ctx.files, labels: [], riskHighGlobs: CURRENT_RISK_GLOBS })).toBe(
+        'review',
+      );
+    });
   });
 });
