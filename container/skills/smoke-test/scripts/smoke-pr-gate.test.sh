@@ -2115,6 +2115,228 @@ echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$FGF_DEL" | jq -e '
   .campaignSize == "full" and (.sizeReason | test("Delete"))
 ' >/dev/null
 
+# --- A REALISTIC policy file must classify exactly as the minimal one does
+# (#736 round-1 P1). The first cut of the guard above refused any top-level
+# statement that so much as READ the imported name, and a real policy file is
+# one constant plus every line derived from it -- a compiled regex, a count, a
+# wider list -- so the guard refused the only shape it would ever meet in
+# production and sized every PR on that install `full`. A plain read leaves
+# the assigned literal exactly as written; only a BINDING or MUTATING use may
+# refuse. This fixture is the structural fix for that class: every derived
+# read below is one the live policy file actually contains.
+REALISTIC_MOD="$STATE_DIR/policy-realistic.py"
+cat > "$REALISTIC_MOD" <<'PY'
+"""A policy file shaped like a real one: a constant, then lines derived from it."""
+import re
+
+DEFAULT_SIZE = "standard"
+SENSITIVE_GLOBS = ["backend/permissions/**", "backend/billing/**"]
+SENSITIVE_RE = re.compile("|".join(g.replace("**", ".*") for g in SENSITIVE_GLOBS))
+GLOB_COUNT = len(SENSITIVE_GLOBS)
+ALL_GLOBS = SENSITIVE_GLOBS + ["backend/legacy/**"]
+PY
+FGF_REALISTIC="$STATE_DIR/fgf-realistic.json"
+cat > "$FGF_REALISTIC" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],"lightDeny":[],
+ "fullGlobsFrom":{"path":"$REALISTIC_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+# Identical sizes to the minimal-policy rules file (FGF_RULES, same globs),
+# input for input -- the derived reads change nothing.
+for SIZE_INPUT in '["backend/billing/charge.ts"]' '["backend/permissions/roles.ts"]' '["frontend/a.css"]' '["frontend/a.css","docs/x.md"]'; do
+  MIN_OUT="$(echo "$SIZE_INPUT" | python3 "$CLASSIFY" "$FGF_RULES" | jq -r '.campaignSize')"
+  REAL_OUT="$(echo "$SIZE_INPUT" | python3 "$CLASSIFY" "$FGF_REALISTIC" | jq -r '.campaignSize')"
+  [ "$MIN_OUT" = "$REAL_OUT" ] ||
+    { echo "736: derived reads changed the size for $SIZE_INPUT (minimal=$MIN_OUT realistic=$REAL_OUT)" >&2; exit 1; }
+done
+# ...and those sizes are the real ones, not `full` for everything: the
+# equality above would also hold if BOTH files were refused.
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$FGF_REALISTIC" | jq -e '
+  .campaignSize == "full" and
+  .sizeReason == "full: backend/billing/charge.ts matched backend/billing/**"
+' >/dev/null
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$FGF_REALISTIC" | jq -e '
+  .campaignSize == "light"
+' >/dev/null
+
+# A bare annotation before the assignment binds nothing and must not refuse.
+ANNOTATED_MOD="$STATE_DIR/policy-annotated.py"
+cat > "$ANNOTATED_MOD" <<'PY'
+SENSITIVE_GLOBS: list[str]
+SENSITIVE_GLOBS = ["backend/permissions/**", "backend/billing/**"]
+PY
+FGF_ANNOTATED="$STATE_DIR/fgf-annotated.json"
+cat > "$FGF_ANNOTATED" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$ANNOTATED_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$FGF_ANNOTATED" | jq -e '
+  .campaignSize == "full" and
+  .sizeReason == "full: backend/billing/charge.ts matched backend/billing/**"
+' >/dev/null
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$FGF_ANNOTATED" | jq -e '
+  .campaignSize == "light"
+' >/dev/null
+
+# --- Binding shapes that no ast.Name check can see (#736 round-1 P2-1).
+# Every fixture below assigns ONLY the permissions glob at top level and then
+# rebinds or mutates the name through some other route, so a guard that misses
+# the route reads a PARTIAL policy and sizes a billing PR `light` -- exactly
+# the #723 class. Each must fail closed to `full` instead.
+assert_policy_refused() {
+  # $1 = fixture basename, $2 = python source, $3 = expected reason regex
+  local mod="$STATE_DIR/policy-$1.py" rules="$STATE_DIR/fgf-$1.json"
+  printf '%s' "$2" > "$mod"
+  cat > "$rules" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$mod","name":"SENSITIVE_GLOBS"}}
+JSON
+  echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$rules" | jq -e --arg rx "$3" '
+    .campaignSize == "full" and (.sizeReason | test($rx))
+  ' >/dev/null || { echo "736: policy fixture $1 did not fail closed (expected reason ~ $3)" >&2; exit 1; }
+}
+
+# `from x import NAME` rebinds the name to whatever that module holds.
+assert_policy_refused from-import 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+from policy_extra import SENSITIVE_GLOBS
+' 'ImportFrom'
+
+# `import x as NAME`.
+assert_policy_refused import-as 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+import policy_extra as SENSITIVE_GLOBS
+' 'Import'
+
+# A star import binds names this classifier cannot enumerate, so ANY star
+# import in the policy file is refused, whatever the imported module is.
+assert_policy_refused star-import 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+from policy_extra import *
+' 'ImportFrom'
+
+# `def NAME` / `class NAME` rebind the name to a function or a class.
+assert_policy_refused def-over 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+
+
+def SENSITIVE_GLOBS():
+    return ["backend/permissions/**", "backend/billing/**"]
+' 'FunctionDef'
+
+assert_policy_refused class-over 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+
+
+class SENSITIVE_GLOBS:
+    pass
+' 'ClassDef'
+
+# `except ... as NAME` binds (and then deletes) the name.
+assert_policy_refused except-as 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+try:
+    pass
+except ValueError as SENSITIVE_GLOBS:
+    pass
+' 'Try'
+
+# `match` captures bind through a string field: MatchAs, MatchStar, and
+# MatchMapping.rest. The reason alternative covers a pre-3.10 interpreter,
+# where the statement does not parse at all -- still fail-closed, different
+# reason.
+assert_policy_refused match-as 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+match DEFAULT_SIZE:
+    case SENSITIVE_GLOBS:
+        pass
+' 'Match|could not be parsed'
+
+assert_policy_refused match-star 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+match DEFAULT_SIZE:
+    case [*SENSITIVE_GLOBS]:
+        pass
+' 'Match|could not be parsed'
+
+assert_policy_refused match-rest 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+match DEFAULT_SIZE:
+    case {"a": 1, **SENSITIVE_GLOBS}:
+        pass
+' 'Match|could not be parsed'
+
+# An alias shares the one list object, so a mutation through the OTHER name
+# changes the policy while the literal above still reads complete.
+assert_policy_refused alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+ALIAS = SENSITIVE_GLOBS
+ALIAS.append("backend/billing/**")
+' 'Assign'
+
+# A read is not an alias: `ALL = NAME + OTHER` builds a NEW list and leaves
+# the constant alone, so the same file with a derived read still classifies.
+# (Covered by the realistic fixture above; this is the one-line contrast.)
+
+# --- Namespace reached by string (#736 round-1 P3-1): a constants file has
+# no need for `globals`/`vars`/`setattr`/`exec`/`eval`/`__import__`/
+# `sys.modules` at top level, and each of them can rebind the name in a way
+# no name-level check can see.
+assert_policy_refused globals-write 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+globals()["SENSITIVE_GLOBS"] = ["backend/billing/**"]
+' 'globals'
+
+assert_policy_refused sys-modules 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+import sys
+
+sys.modules[__name__].SENSITIVE_GLOBS = ["backend/billing/**"]
+' 'sys.modules'
+
+# --- A DANGLING SYMLINK is present, not absent (#736 round-1 P2-2). open()
+# raises FileNotFoundError for it exactly as it does for a path that was
+# never created, so it used to collapse into "no sizing rules" -- #721's
+# class. os.path.lexists() tells the two apart; the broken link fails closed.
+DANGLING_RULES="$STATE_DIR/dangling-rules.json"
+ln -s "$STATE_DIR/no-such-sizing-target.json" "$DANGLING_RULES"
+if OUT="$(echo '[]' | python3 "$CLASSIFY" "$DANGLING_RULES" 2>/dev/null)"; then
+  echo "736: dangling-symlink rules file exited 0 (stdout: $OUT)" >&2
+  exit 1
+fi
+[ -z "$OUT" ] || { echo "736: dangling-symlink rules file printed stdout instead of failing closed" >&2; exit 1; }
+# A symlink to a REAL rules file is still an ordinary readable file.
+LINK_TARGET="$STATE_DIR/link-target-rules.json"
+echo '{"full":["backend/**"],"lightAllowed":["frontend/**"]}' > "$LINK_TARGET"
+LIVE_LINK="$STATE_DIR/live-link-rules.json"
+ln -s "$LINK_TARGET" "$LIVE_LINK"
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$LIVE_LINK" | jq -e '
+  .campaignSize == "full"
+' >/dev/null
+
+# --- RULE SHAPES (#736 round-1 P2-3). `list(rules.get(k) or [])` accepts any
+# iterable, so a rule list written as a bare string became one glob per
+# CHARACTER, none of which matches a path: `"full": "backend/**"` sized a
+# sensitive PR `light`. Every wrong shape -- a string, a number, a list with a
+# non-string in it, an explicit null, a non-object fullGlobsFrom -- exits
+# non-zero with nothing meaningful on stdout, into the caller's guard.
+SHAPE_N=0
+for SHAPE_DOC in \
+  '{"full":"backend/**","lightAllowed":["frontend/**"]}' \
+  '{"full":7,"lightAllowed":["frontend/**"]}' \
+  '{"full":null,"lightAllowed":["frontend/**"]}' \
+  '{"full":["backend/**",7],"lightAllowed":["frontend/**"]}' \
+  '{"full":[],"lightAllowed":"frontend/**"}' \
+  '{"full":[],"lightAllowed":["frontend/**"],"lightDeny":"frontend/legacy/**"}' \
+  '{"full":[],"lightAllowed":["frontend/**"],"lightDeny":null}' \
+  '{"full":[],"lightAllowed":{"glob":"frontend/**"}}' \
+  '{"full":[],"lightAllowed":["frontend/**"],"fullGlobsFrom":"policy.py"}' \
+  '{"full":[],"lightAllowed":["frontend/**"],"fullGlobsFrom":null}' \
+  ; do
+  SHAPE_N=$((SHAPE_N + 1))
+  SHAPE_RULES="$STATE_DIR/shape-$SHAPE_N-rules.json"
+  printf '%s' "$SHAPE_DOC" > "$SHAPE_RULES"
+  if OUT="$(echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$SHAPE_RULES" 2>/dev/null)"; then
+    echo "736: malformed rule shape exited 0: $SHAPE_DOC (stdout: $OUT)" >&2
+    exit 1
+  fi
+  [ -z "$OUT" ] || { echo "736: malformed rule shape printed stdout: $SHAPE_DOC" >&2; exit 1; }
+done
+# The well-shaped equivalents still classify normally -- the shape check must
+# not refuse a legitimate rules file (an absent key is not a malformed one).
+SHAPE_OK="$STATE_DIR/shape-ok-rules.json"
+echo '{"lightAllowed":["frontend/**"]}' > "$SHAPE_OK"
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$SHAPE_OK" | jq -e '.campaignSize == "light"' >/dev/null
+echo '{"full":["backend/**"],"lightAllowed":["frontend/**"],"lightDeny":[]}' > "$SHAPE_OK"
+echo '["backend/x.ts"]' | python3 "$CLASSIFY" "$SHAPE_OK" | jq -e '.campaignSize == "full"' >/dev/null
+
 # --- Task-scoped certification lease: claim/progress/release --------------
 # A certification, re-verification or evidence-recovery run has no PR — this
 # is the lifecycle smoke-run-scaffold.sh's begin_active_run_fence now accepts

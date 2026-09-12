@@ -18,6 +18,7 @@ complete, known file list against the rules.
 """
 import ast
 import json
+import os
 import re
 import sys
 
@@ -114,35 +115,188 @@ def match_first(path, compiled_rules):
     return None
 
 
-def _references_name(node, name):
-    """True if `name` appears as an `ast.Name` anywhere within `node` --
-    target, value, or nested call. Used to catch every shape of top-level
-    statement that touches a policy constant besides assigning it outright:
-    `name += [...]` (ast.AugAssign), `name.extend(...)`/`name.append(...)`
-    (an ast.Expr wrapping a Call), `del name` (ast.Delete), and so on."""
+# `match` captures bind through plain string fields, not an `ast.Name`
+# target. These node types exist only on Python 3.10+, which is also the
+# first version where `match` parses at all, so they are looked up
+# defensively -- on an older interpreter the statement cannot exist.
+_MATCH_NAME_NODES = tuple(
+    n
+    for n in (getattr(ast, attr, None) for attr in ("MatchAs", "MatchStar"))
+    if n is not None
+)
+_MATCH_REST_NODES = tuple(n for n in (getattr(ast, "MatchMapping", None),) if n is not None)
+
+# Builtins that reach into the module namespace, or the import system, BY
+# STRING -- so no name-level analysis can see what they rebind. A file that
+# is a policy-constants source has no need for any of them at top level.
+_NAMESPACE_BUILTINS = frozenset(
+    ("globals", "vars", "setattr", "exec", "eval", "__import__")
+)
+
+
+def _module_level_nodes(node):
+    """Walk `node`, but never into a function, lambda or class body: that
+    code runs only when something calls it, so it is not top-level code."""
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        yield cur
+        for child in ast.iter_child_nodes(cur):
+            if isinstance(
+                child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+            ):
+                continue
+            stack.append(child)
+
+
+def _namespace_escape(node):
+    """Name of the namespace-reaching builtin used by top-level statement
+    `node`, or None -- `globals()[...] = ...`, `vars()`, `setattr`, `exec`,
+    `eval`, `__import__`, `sys.modules[...]`. Each can rebind any name by
+    string, which every check below (all of which read names) would miss.
+    Function and class BODIES are not scanned: they are not top-level code,
+    and a helper that happens to call `setattr` is an ordinary thing for a
+    real policy file to contain."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return None
+    for sub in _module_level_nodes(node):
+        if isinstance(sub, ast.Name) and sub.id in _NAMESPACE_BUILTINS:
+            return sub.id
+        if (
+            isinstance(sub, ast.Attribute)
+            and sub.attr == "modules"
+            and isinstance(sub.value, ast.Name)
+            and sub.value.id == "sys"
+        ):
+            return "sys.modules"
+    return None
+
+
+def _roots_at_name(node, name):
+    """True if `node` is an attribute/subscript chain rooted at `name`
+    (`name.x`, `name[0].y`) -- a use that reaches INTO the name's value."""
+    cur = node
+    while isinstance(cur, (ast.Attribute, ast.Subscript)):
+        cur = cur.value
+    return isinstance(cur, ast.Name) and cur.id == name
+
+
+def _rebinding_use(node, name):
+    """How top-level statement `node` binds or mutates `name`, as a phrase,
+    or None if it does neither.
+
+    Only BINDING and MUTATING uses count. A plain read leaves the assigned
+    literal exactly as written and must pass: `ALL = NAME + OTHER`,
+    `len(NAME)`, `re.compile("|".join(NAME))`. Refusing reads refuses the
+    ordinary shape of a real policy file -- one constant, plus everything
+    derived from it in the same module -- which is how the first cut of this
+    guard turned every PR on a live install `full` (round-1 review of #736).
+
+    Checked at any depth inside the statement: a rebinding inside a top-level
+    `if`, `try` or `with` block rebinds the module name just the same."""
     for sub in ast.walk(node):
-        if isinstance(sub, ast.Name) and sub.id == name:
-            return True
-    return False
+        # `NAME = ...` (a second binding), `NAME += ...`, `for NAME in ...`,
+        # `with ... as NAME`, `del NAME`, `(NAME := ...)`: every one of these
+        # parses as an ast.Name in a Store or Del context.
+        if (
+            isinstance(sub, ast.Name)
+            and sub.id == name
+            and isinstance(sub.ctx, (ast.Store, ast.Del))
+        ):
+            return "rebinds or deletes"
+        # `NAME[0] = ...`, `NAME.attr = ...`, `del NAME[0]` -- the name still
+        # points at the same object, whose contents just changed.
+        if (
+            isinstance(sub, (ast.Subscript, ast.Attribute))
+            and isinstance(sub.ctx, (ast.Store, ast.Del))
+            and _roots_at_name(sub, name)
+        ):
+            return "stores into"
+        # `NAME.append(...)`, `.extend(...)`, `.insert(...)`, `.pop()`,
+        # `.clear()`, `.remove()`, `.sort()`, `.reverse()`, `.update()`. Any
+        # method call is refused rather than a named list of mutators: an
+        # allowlist of "safe" methods is a list to be wrong about
+        # (`__setitem__`), and a constants file has no reason to call a
+        # method on its constant at top level at all.
+        if (
+            isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Attribute)
+            and _roots_at_name(sub.func, name)
+        ):
+            return "calls a method on"
+        if isinstance(sub, (ast.Global, ast.Nonlocal)) and name in sub.names:
+            return "declares a global/nonlocal binding for"
+        # `X = NAME` / `X: T = NAME` -- an alias shares the one list object,
+        # so `X.append(...)` further down changes what the policy uses while
+        # the literal above still reads complete.
+        if (
+            isinstance(sub, (ast.Assign, ast.AnnAssign))
+            and isinstance(sub.value, ast.Name)
+            and sub.value.id == name
+        ):
+            return "aliases"
+        # Rebinding through a STRING field, which no ast.Name check above can
+        # see: `from x import NAME`, `import x as NAME`, `import NAME`, and a
+        # star import, which binds names this classifier cannot enumerate.
+        if isinstance(sub, (ast.Import, ast.ImportFrom)):
+            for imported in sub.names:
+                if imported.name == "*":
+                    return "may rebind (a star import binds names this classifier cannot see)"
+                if (imported.asname or imported.name.split(".")[0]) == name:
+                    return "imports over"
+        if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and sub.name == name:
+            return "defines a function over"
+        if isinstance(sub, ast.ClassDef) and sub.name == name:
+            return "defines a class over"
+        if isinstance(sub, ast.ExceptHandler) and sub.name == name:
+            return "binds a caught exception to"
+        if _MATCH_NAME_NODES and isinstance(sub, _MATCH_NAME_NODES) and sub.name == name:
+            return "captures a match subject into"
+        if _MATCH_REST_NODES and isinstance(sub, _MATCH_REST_NODES) and sub.rest == name:
+            return "captures a match mapping rest into"
+    return None
 
 
 def _find_top_level_assignment(tree, name):
     """Return `(value_node, None)` for the sole top-level `name = ...` (or
     `name: T = ...`) assignment in `tree.body` -- the one shape this format
     trusts -- or `(None, reason)` if `name` is never assigned at top level,
-    or if ANY other top-level statement mutates, rebinds, deletes, or
-    otherwise touches `name`: a second assignment, `+=`, `.extend(...)`,
-    `.append(...)`, `del name`, item assignment, and so on.
+    or if ANY other top-level statement BINDS or MUTATES `name`: a second
+    assignment, `+=`, `.extend(...)`/`.append(...)`, `del name`, item or
+    attribute assignment, `global name`, an alias (`X = name`, which shares
+    the one list object), or a rebinding through a string field --
+    `from x import name`, `import x as name`, a star import, `def name`,
+    `class name`, `except ... as name`, a `match` capture.
 
-    Deliberately does not try to evaluate what such a statement does --
+    A plain READ is not any of those and passes: `ALL = name + OTHER`,
+    `len(name)`, `re.compile("|".join(name))`. That distinction is the whole
+    point -- a real policy file is one constant plus everything derived from
+    it, and refusing the derived lines refuses every PR on that install
+    (round-1 review of #736).
+
+    Deliberately does not try to evaluate what a refused statement does --
     refusing is the safe, simple behaviour for every shape but the single
     literal assignment this format trusts; a partial policy silently read as
-    complete is exactly the failure mode this guards against. Does not
-    descend into functions, classes, or conditionals -- a value assigned
-    conditionally or built inside a function is not a fixed policy constant
-    this format can trust."""
+    complete is exactly the failure mode this guards against. The trusted
+    assignment must be at top level: a value assigned conditionally or built
+    inside a function is not a fixed policy constant this format can trust."""
     found = None
     for node in tree.body:
+        escape = _namespace_escape(node)
+        if escape is not None:
+            return None, "a top-level {} statement uses {}, which can rebind any name by string".format(
+                type(node).__name__, escape
+            )
+        # A bare annotation (`name: list[str]`) declares a type for the
+        # assignment below it. It binds nothing and carries no value, so it
+        # is neither the trusted assignment nor a reason to refuse one.
+        if (
+            isinstance(node, ast.AnnAssign)
+            and node.value is None
+            and isinstance(node.target, ast.Name)
+            and node.target.id == name
+        ):
+            continue
         is_plain_assign = False
         if isinstance(node, ast.Assign):
             is_plain_assign = any(isinstance(t, ast.Name) and t.id == name for t in node.targets)
@@ -157,9 +311,10 @@ def _find_top_level_assignment(tree, name):
                 return None, "reassigned at top level (a second assignment makes the value untrustworthy)"
             found = node.value
             continue
-        if _references_name(node, name):
-            return None, "mutated by another top-level {} statement after assignment".format(
-                type(node).__name__
+        phrase = _rebinding_use(node, name)
+        if phrase is not None:
+            return None, "another top-level {} statement {} it".format(
+                type(node).__name__, phrase
             )
     if found is None:
         return None, "not found at top level"
@@ -183,12 +338,13 @@ def load_full_globs_from(spec):
 
     Every failure mode here is a caller instruction to fail closed to `full`
     — an unreadable file, a file that doesn't parse, a name never assigned at
-    top level, a name mutated or rebound by any top-level statement besides
+    top level, a name bound or mutated by any top-level statement besides
     the one trusted assignment (`+=`, `.extend`/`.append`, `del`, a second
-    assignment), a value that isn't a literal, and a value of the wrong type
-    are all indistinguishable from "this rules file's full-glob policy could
-    not be read," which must never silently fall through to a lighter
-    campaign.
+    assignment, an alias, an import that rebinds it), a top-level statement
+    that reaches the namespace by string (`globals`, `setattr`, `exec`), a
+    value that isn't a literal, and a value of the wrong type are all
+    indistinguishable from "this rules file's full-glob policy could not be
+    read," which must never silently fall through to a lighter campaign.
     """
     if not isinstance(spec, dict):
         return None, "fullGlobsFrom must be an object with path and name"
@@ -219,6 +375,31 @@ def load_full_globs_from(spec):
     if not isinstance(value, (list, tuple)) or not all(isinstance(v, str) for v in value):
         return None, "fullGlobsFrom.name {} in {} is not a list of strings".format(name, path)
     return list(value), None
+
+
+def validate_rules_shape(rules):
+    """Reason the rules object is malformed, or None.
+
+    `list(rules.get(key) or [])` below accepts anything iterable, so a rule
+    list written as a bare string -- `"full": "backend/**"` -- becomes one
+    glob per CHARACTER, none of which matches any path: a sensitive PR then
+    sizes `light`. That is the same "configured but broken read as fine"
+    class the rest of this script fails closed on, so every rule list is
+    checked before any of it is compiled.
+
+    An explicit `null` is malformed, not absent: a key written out with no
+    value is a half-finished edit, never a deliberate "no rules here".
+    Unknown keys are left alone -- the format has always carried `_comment`.
+    """
+    for key in ("full", "lightAllowed", "lightDeny"):
+        if key not in rules:
+            continue
+        value = rules[key]
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            return "{} must be absent or a list of strings".format(key)
+    if "fullGlobsFrom" in rules and not isinstance(rules["fullGlobsFrom"], dict):
+        return "fullGlobsFrom must be absent or an object"
+    return None
 
 
 def classify(files, rules):
@@ -283,6 +464,20 @@ def main():
         with open(rules_path, "r", encoding="utf-8") as fh:
             source = fh.read()
     except FileNotFoundError:
+        # A dangling symlink raises FileNotFoundError too, but the path IS
+        # present -- os.path.lexists() answers for the link itself, not its
+        # target. That is a configured-and-broken install, not one that never
+        # configured sizing rules, so it takes the same non-zero exit as
+        # every other present-but-unusable file rather than the backward
+        # compatible "no sizing rules" reply.
+        if os.path.lexists(rules_path):
+            print(
+                "sizing rules file {} is present but its symlink target is missing".format(
+                    rules_path
+                ),
+                file=sys.stderr,
+            )
+            sys.exit(1)
         print(json.dumps({"campaignSize": "standard", "sizeReason": "no sizing rules"}))
         return
     except (OSError, UnicodeDecodeError) as exc:
@@ -304,6 +499,14 @@ def main():
     if not isinstance(rules, dict):
         print(
             "sizing rules file {} is present but is not a JSON object".format(rules_path),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    shape_error = validate_rules_shape(rules)
+    if shape_error is not None:
+        print(
+            "sizing rules file {} is present but malformed: {}".format(rules_path, shape_error),
             file=sys.stderr,
         )
         sys.exit(1)
