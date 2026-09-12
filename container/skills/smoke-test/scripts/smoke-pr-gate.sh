@@ -3809,6 +3809,7 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
       previewUrl:$facts.backendPreviewUrl,
       frontendPreviewUrl:$facts.frontendPreviewUrl,
       isFreezePr:$facts.isFreezePr, ciSha:$facts.ciSha,
+      campaignSize:$facts.campaignSize, sizeReason:$facts.sizeReason,
       recovery:$recovery,
       abandonedActiveSha:(if $abandoned == "" or $abandoned == "null" then null else $abandoned end)
     })}'

@@ -4,7 +4,7 @@
 # of opening N screenshots. This is deterministic evidence collection — no
 # LLM browser time — same motivation as smoke-build-identity.sh.
 #
-# Usage: smoke-contact-sheet.sh <run-dir> <base-url> <auth-state.json>
+# Usage: smoke-contact-sheet.sh <run-dir> <base-url> <auth-state.json> [source-sha]
 #
 #   <run-dir>          an existing smoke-test run directory. Reads
 #                       <run-dir>/contact-sheet/shots.json (already written by
@@ -19,6 +19,15 @@
 #                       see the security note below. The caller deletes this
 #                       file once the sheet is captured; this script never
 #                       does (it doesn't own the file).
+#   [source-sha]        optional. The frozen build SHA the caller already
+#                       knows (40 hex chars) — recorded in manifest.json as
+#                       `buildSha` verbatim, no page sniff needed. Malformed
+#                       values are refused (exit 2) rather than written into
+#                       the manifest. Omit it to fall back to sniffing the
+#                       served page for `meta[name="build-sha"]`,
+#                       `window.__BUILD_SHA__`, or a `data-build-sha`
+#                       attribute — the app may expose none of those, in
+#                       which case `buildSha` ends up empty.
 #
 # SECURITY: the auth state file holds a live session token. This script
 # REFUSES a path that resolves (realpath) inside <run-dir> or anywhere under
@@ -72,13 +81,21 @@ die() { jq -cn --arg e "$1" '{ok:false,error:$e}'; exit 2; }
 RUN_DIR="${1:-}"
 BASE_URL="${2:-}"
 AUTH_STATE="${3:-}"
+SOURCE_SHA="${4:-}"
 
 [ -n "$RUN_DIR" ] && [ -n "$BASE_URL" ] && [ -n "$AUTH_STATE" ] ||
-  die "usage: smoke-contact-sheet.sh <run-dir> <base-url> <auth-state.json>"
+  die "usage: smoke-contact-sheet.sh <run-dir> <base-url> <auth-state.json> [source-sha]"
 [ -d "$RUN_DIR" ] || die "run dir does not exist: $RUN_DIR"
 printf '%s' "$BASE_URL" | grep -Eq '^https?://' ||
   die "base url must start with http:// or https://"
 [ -s "$AUTH_STATE" ] || die "auth state file is missing or empty: $AUTH_STATE"
+# A caller-supplied SHA is trusted verbatim into a shared, durable manifest —
+# refuse a malformed value rather than writing junk (e.g. a branch name, or
+# an accidentally-passed URL) into evidence other sessions read as fact.
+if [ -n "$SOURCE_SHA" ]; then
+  printf '%s' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$' ||
+    die "source sha must be 40 lowercase hex characters: $SOURCE_SHA"
+fi
 
 # The auth state file holds a live session token — refuse it inside either
 # shared, durable tree. `realpath -e` on RUN_DIR/AUTH_STATE is safe (both are
@@ -137,7 +154,9 @@ fi
 
 RESULTS_FILE="$(mktemp)"
 trap 'rm -f "$RESULTS_FILE"; cleanup' EXIT
-BUILD_SHA=""
+# Caller-supplied SHA wins outright — the sniff loop below only runs while
+# BUILD_SHA is still empty, so passing SOURCE_SHA skips it entirely.
+BUILD_SHA="$SOURCE_SHA"
 BUILD_SHA_JS='(document.querySelector("meta[name=\"build-sha\"]")||{}).content || (typeof window!=="undefined" && window.__BUILD_SHA__) || (document.querySelector("[data-build-sha]")||{}).dataset && document.querySelector("[data-build-sha]").dataset.buildSha || ""'
 
 # run_step VERB REST -> 0/1, sets STEP_ERR on failure. See the header comment

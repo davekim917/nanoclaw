@@ -944,8 +944,14 @@ markers elsewhere in this file applies here too, and the flag is optional
 
 At kickoff, once previews are live, capture every diff-touched screen at
 desktop and phone width into one labelled image:
-`smoke-contact-sheet.sh <run-dir> <base-url> <auth-state.json>`. It reads
-caller-provided `<run-dir>/contact-sheet/shots.json` (capped at 8; the
+`smoke-contact-sheet.sh <run-dir> <base-url> <auth-state.json> <source-sha>`
+— pass the campaign's frozen `sourceSha` as the fourth argument so
+`manifest.json`'s `buildSha` records the SHA you already froze on rather
+than whatever (if anything) the served page exposes; omit it only when no
+frozen SHA is known yet, which falls back to sniffing the page for
+`meta[name="build-sha"]`, `window.__BUILD_SHA__`, or a `data-build-sha`
+attribute — the app may expose none of those, leaving `buildSha` empty. It
+reads caller-provided `<run-dir>/contact-sheet/shots.json` (capped at 8; the
 script itself is generic, no product knowledge), captures through one named
 `agent-browser` session, and writes `sheet.png` + `manifest.json`. A failed
 screen is `failed: <reason>` plus a placeholder tile, never dropped. Post

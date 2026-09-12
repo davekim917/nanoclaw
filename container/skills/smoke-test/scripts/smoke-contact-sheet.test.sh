@@ -151,7 +151,7 @@ grep -q ' find text Get started click' "$STUB_LOG" \
 grep -q ' click text=' "$STUB_LOG" \
   && { echo "happy path: text= step must never be passed straight to click" >&2; exit 1; }
 
-echo "1/7 happy path ok"
+echo "1/9 happy path ok"
 
 # --- 2. A failed screen stays as a placeholder, never silently dropped ------
 RUN2="$(fresh_run_dir failed-screen)"
@@ -180,7 +180,7 @@ grep -q 'FAILED' "$RUN2/contact-sheet/grid.html" \
 grep -q 'class="desktop placeholder"' "$RUN2/contact-sheet/grid.html" \
   || { echo "failed screen: expected a desktop placeholder div" >&2; exit 1; }
 
-echo "2/7 failed screen stays a placeholder ok"
+echo "2/9 failed screen stays a placeholder ok"
 
 # --- 3. The 8-screen cap ------------------------------------------------------
 RUN3="$(fresh_run_dir cap)"
@@ -196,7 +196,7 @@ echo "$RESULT" | jq -e '.ok == true and .requested == 10 and .capped == true and
 jq -e '.requested == 10 and .capped == true and (.screens | length) == 8' "$RUN3/contact-sheet/manifest.json" \
   >/dev/null || { echo "cap: manifest did not record the 8-screen cap correctly" >&2; exit 1; }
 
-echo "3/7 8-screen cap ok"
+echo "3/9 8-screen cap ok"
 
 # --- 4. Missing auth state: refuse, never touch the browser ------------------
 RUN4="$(fresh_run_dir no-auth)"
@@ -214,7 +214,7 @@ echo "$RESULT" | jq -e '.ok == false and (.error | test("auth state"))' >/dev/nu
   || { echo "missing auth state: expected a refusal naming the auth state: $RESULT" >&2; exit 1; }
 [ ! -s "$STUB_LOG" ] || { echo "missing auth state: agent-browser must never be invoked" >&2; exit 1; }
 
-echo "4/7 missing auth state refuses before touching the browser ok"
+echo "4/9 missing auth state refuses before touching the browser ok"
 
 # --- 5. Empty shots file: refuse -----------------------------------------------
 RUN5="$(fresh_run_dir empty-shots)"
@@ -240,7 +240,7 @@ set -e
 echo "$RESULT" | jq -e '.ok == false' >/dev/null \
   || { echo "missing shots file: expected a refusal: $RESULT" >&2; exit 1; }
 
-echo "5/7 empty/missing shots file refuses ok"
+echo "5/9 empty/missing shots file refuses ok"
 
 # --- 6. Auth state inside the run dir: refuse ---------------------------------
 # The auth state file holds a live session token; the run dir is a shared,
@@ -263,7 +263,7 @@ echo "$RESULT" | jq -e '.ok == false and (.error | test("run dir"))' >/dev/null 
   || { echo "auth in run dir: expected a refusal naming the run dir: $RESULT" >&2; exit 1; }
 [ ! -s "$STUB_LOG" ] || { echo "auth in run dir: agent-browser must never be invoked" >&2; exit 1; }
 
-echo "6/7 auth state inside the run dir refuses ok"
+echo "6/9 auth state inside the run dir refuses ok"
 
 # --- 7. Auth state under the shared workgroup tree: refuse --------------------
 # Override the workgroup root so the test never depends on /workspace/workgroup
@@ -297,6 +297,52 @@ RESULT="$(SMOKE_WORKGROUP_ROOT="$FAKE_WORKGROUP_ROOT" \
 echo "$RESULT" | jq -e '.ok == true' >/dev/null \
   || { echo "auth under workgroup root: a private auth path must still succeed: $RESULT" >&2; exit 1; }
 
-echo "7/7 auth state under the shared workgroup tree refuses ok"
+echo "7/9 auth state under the shared workgroup tree refuses ok"
+
+# --- 8. Caller-supplied source SHA rides through to the manifest verbatim ---
+# and the page is never sniffed for it (the stub's `eval` verb would answer
+# "stub-build-sha-123" if it were ever called for this).
+RUN8="$(fresh_run_dir source-sha)"
+cat >"$RUN8/contact-sheet/shots.json" <<'JSON'
+[{ "name": "home", "path": "/" }]
+JSON
+FROZEN_SHA="abcdef0123456789abcdef0123456789abcdef01"
+
+: >"$STUB_LOG"
+RESULT="$(bash "$SCRIPT" "$RUN8" "https://example.test" "$AUTH_STATE" "$FROZEN_SHA")"
+echo "$RESULT" | jq -e '.ok == true' >/dev/null \
+  || { echo "source sha: unexpected result: $RESULT" >&2; exit 1; }
+jq -e --arg sha "$FROZEN_SHA" '.buildSha == $sha' "$RUN8/contact-sheet/manifest.json" >/dev/null \
+  || { echo "source sha: expected manifest buildSha to be the caller-supplied sha" >&2; exit 1; }
+grep -q ' eval ' "$STUB_LOG" \
+  && { echo "source sha: must not sniff the page for a build sha when the caller already supplied one" >&2; exit 1; }
+
+echo "8/9 caller-supplied source sha rides through to the manifest ok"
+
+# --- 9. A malformed source SHA is refused, never written into the manifest --
+RUN9="$(fresh_run_dir bad-sha)"
+cat >"$RUN9/contact-sheet/shots.json" <<'JSON'
+[{ "name": "home", "path": "/" }]
+JSON
+
+: >"$STUB_LOG"
+for BAD_SHA in "not-a-sha" "abcdef" "ABCDEF0123456789ABCDEF0123456789ABCDEF01" "main"; do
+  set +e
+  RESULT="$(bash "$SCRIPT" "$RUN9" "https://example.test" "$AUTH_STATE" "$BAD_SHA" 2>&1)"
+  EC=$?
+  set -e
+  [ "$EC" -eq 2 ] || { echo "malformed sha ($BAD_SHA): expected exit 2, got $EC" >&2; exit 1; }
+  echo "$RESULT" | jq -e '.ok == false and (.error | test("sha"))' >/dev/null \
+    || { echo "malformed sha ($BAD_SHA): expected a refusal naming the sha: $RESULT" >&2; exit 1; }
+done
+[ ! -s "$STUB_LOG" ] || { echo "malformed sha: agent-browser must never be invoked" >&2; exit 1; }
+[ ! -e "$RUN9/contact-sheet/manifest.json" ] \
+  || { echo "malformed sha: no manifest should be written on refusal" >&2; exit 1; }
+
+# Omitting the argument entirely still falls back to the existing page-sniff
+# behaviour (already covered by the happy path in test 1, which asserts
+# buildSha == "stub-build-sha-123" with no fourth argument given).
+
+echo "9/9 malformed source sha is refused, never written into the manifest ok"
 
 echo "smoke contact sheet tests passed"
