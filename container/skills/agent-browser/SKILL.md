@@ -224,6 +224,43 @@ agent-browser storage local               # Get localStorage
 agent-browser storage local set k v       # Set value
 ```
 
+### Network captures — never write raw output to disk
+
+```bash
+agent-browser network requests --json          # List captured requests (headers included)
+agent-browser network request <requestId>       # Full request/response detail, including body
+agent-browser network har start                 # Begin recording a HAR
+agent-browser network har stop <path>           # Export the recording to <path>
+```
+
+**Both forms persist live credentials in plain text: `requests`/`request` include
+the `Authorization`/`Cookie` header values verbatim, and `har stop` writes a HAR
+file straight to `<path>` with live bearer tokens and cookies in `headers`,
+`cookies`, and request/response bodies.** A redirected `> file.json` or a
+durable/shared `<path>` on `har stop` puts a working credential on disk in the
+clear — this has happened in production. Never do either directly. Route every
+capture that will touch disk through `scripts/ab-net-redact.sh` in this skill
+directory instead — it structurally drops or redacts credential-bearing fields
+before anything reaches storage, and fails closed (nothing written) if a
+capture can't be parsed or redaction itself fails:
+
+```bash
+# In place of: agent-browser network requests --json > requests.json
+scripts/ab-net-redact.sh requests --json > requests.json
+
+# In place of: agent-browser network request 1234.5 --json > request.json
+scripts/ab-net-redact.sh request 1234.5 --json > request.json
+
+# In place of: agent-browser network har stop evidence.har
+scripts/ab-net-redact.sh har-stop evidence.har.json
+```
+
+`har-stop` records to a private temp file, redacts it, and only then moves the
+redacted result to the path you gave — the raw HAR never lands at a durable
+path, not even briefly. A capture kept only in the model's own context (never
+written to a file, chat, log, or shared path) is not covered by this — the
+requirement is about what touches disk or leaves the container.
+
 ### JavaScript
 
 ```bash
