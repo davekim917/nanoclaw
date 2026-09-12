@@ -4,7 +4,7 @@
 # of opening N screenshots. This is deterministic evidence collection — no
 # LLM browser time — same motivation as smoke-build-identity.sh.
 #
-# Usage: smoke-contact-sheet.sh <run-dir> <base-url> <auth-state.json>
+# Usage: smoke-contact-sheet.sh <run-dir> <base-url> <auth-state.json> [source-sha]
 #
 #   <run-dir>          an existing smoke-test run directory. Reads
 #                       <run-dir>/contact-sheet/shots.json (already written by
@@ -13,12 +13,22 @@
 #   <base-url>          e.g. https://pr-1234.onrender.com — joined with each
 #                       shot's `path`.
 #   <auth-state.json>   an agent-browser `state save` file (QA-seat cookies +
-#                       storage). Loaded once, before any navigation, into one
-#                       named session — never a fresh login. MUST live outside
-#                       the run dir and outside the shared workgroup tree —
-#                       see the security note below. The caller deletes this
-#                       file once the sheet is captured; this script never
-#                       does (it doesn't own the file).
+#                       storage). Loaded fresh into a brand-new session for
+#                       every screen — same saved state file each time, never
+#                       a fresh login (see "Fresh state per screen" below).
+#                       MUST live outside the run dir and outside the shared
+#                       workgroup tree — see the security note below. The
+#                       caller deletes this file once the sheet is captured;
+#                       this script never does (it doesn't own the file).
+#   [source-sha]        optional. The frozen build SHA the caller already
+#                       knows (40 hex chars) — recorded in manifest.json as
+#                       `buildSha` verbatim, no page sniff needed. Malformed
+#                       values are refused (exit 2) rather than written into
+#                       the manifest. Omit it to fall back to sniffing the
+#                       served page for `meta[name="build-sha"]`,
+#                       `window.__BUILD_SHA__`, or a `data-build-sha`
+#                       attribute — the app may expose none of those, in
+#                       which case `buildSha` ends up empty.
 #
 # SECURITY: the auth state file holds a live session token. This script
 # REFUSES a path that resolves (realpath) inside <run-dir> or anywhere under
@@ -35,7 +45,8 @@
 #   [{ "name": "settings-pricing", "path": "/settings",
 #      "steps": ["click text=Pricing", "wait 500"] }, ...]
 #
-# `steps` supports exactly two verbs, run in order against the one session:
+# `steps` supports exactly two verbs, run in order against that screen's
+# session:
 #   click text=<value>   -> agent-browser find text "<value>" click
 #   click <selector>      -> agent-browser click "<selector>" (CSS or XPath,
 #                            whatever `agent-browser click --help` accepts)
@@ -43,6 +54,23 @@
 #                            --load, verbatim)
 # Any other verb fails that one screen with `unsupported step` — never
 # silently skipped.
+#
+# Fresh state per screen: every screen navigates in its OWN, never-before-used
+# `--session` name (a fresh browser context), with the same saved auth state
+# loaded fresh into it — never a fresh login (a login rate limit is shared
+# across the seat; loading the same saved state file locally isn't a login).
+# One shared session for the whole run used to carry a previous screen's DOM
+# state — e.g. a nav drawer opened by an earlier screen's `steps` — into every
+# later screenshot; xzo-pr-pr1792-cac47f6f1153-20260912T113129Z's three 390px
+# shots all showed the drawer open, and the shadow critic graded all three
+# BROKEN partly on that capture artifact, which corrupts the agreement score
+# the whole critic feature is judged on. A same-URL, same-viewport `open` can
+# look like a fresh load while a SPA keeps UI state in localStorage/session
+# state across it (see `record start` dropping `localStorage` for the same
+# reason, in the `agent-browser` skill) — a real fresh context is the only
+# thing that reliably drops it while keeping the cookie-based auth state.
+# Each screen's manifest entry records `freshNavigation: true` so a later
+# reader can tell a real default state from a leftover one.
 #
 # Real syntax verified against agent-browser 0.33.0 in the agent image
 # (`docker run --rm --entrypoint bash nanoclaw-agent-v2-2a38bd3e:latest`):
@@ -52,6 +80,15 @@
 #     the state path, applied on the session's next navigation.
 #   - `set viewport <w> <h>` and `screenshot --full <path>` behave exactly as
 #     documented.
+#   - a `--session <name>` this script has not used before starts fresh: the
+#     `agent-browser` skill documents a REUSED session name as the thing that
+#     "persists across invocations... instead of starting fresh"
+#     (`container/skills/agent-browser/SKILL.md:79-83`) — by the same line, an
+#     unseen name has nothing to reuse and starts a fresh browser context.
+#     `record start` separately documents that a fresh context it opens drops
+#     `localStorage` but keeps cookies (`SKILL.md:109-111`) — the same shape
+#     of state a leftover DOM/localStorage flag (e.g. "nav drawer open")
+#     would bleed through if the run kept reusing one session end to end.
 # See the PR body for the transcript this was verified against.
 #
 # A screen that fails to capture is recorded as `failed: <reason>` and still
@@ -72,13 +109,21 @@ die() { jq -cn --arg e "$1" '{ok:false,error:$e}'; exit 2; }
 RUN_DIR="${1:-}"
 BASE_URL="${2:-}"
 AUTH_STATE="${3:-}"
+SOURCE_SHA="${4:-}"
 
 [ -n "$RUN_DIR" ] && [ -n "$BASE_URL" ] && [ -n "$AUTH_STATE" ] ||
-  die "usage: smoke-contact-sheet.sh <run-dir> <base-url> <auth-state.json>"
+  die "usage: smoke-contact-sheet.sh <run-dir> <base-url> <auth-state.json> [source-sha]"
 [ -d "$RUN_DIR" ] || die "run dir does not exist: $RUN_DIR"
 printf '%s' "$BASE_URL" | grep -Eq '^https?://' ||
   die "base url must start with http:// or https://"
 [ -s "$AUTH_STATE" ] || die "auth state file is missing or empty: $AUTH_STATE"
+# A caller-supplied SHA is trusted verbatim into a shared, durable manifest —
+# refuse a malformed value rather than writing junk (e.g. a branch name, or
+# an accidentally-passed URL) into evidence other sessions read as fact.
+if [ -n "$SOURCE_SHA" ]; then
+  printf '%s' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$' ||
+    die "source sha must be 40 lowercase hex characters: $SOURCE_SHA"
+fi
 
 # The auth state file holds a live session token — refuse it inside either
 # shared, durable tree. `realpath -e` on RUN_DIR/AUTH_STATE is safe (both are
@@ -121,23 +166,46 @@ SHOTS_LIST="$(jq -c ".[0:$MAX_SHOTS]" "$SHOTS_JSON")"
 command -v agent-browser >/dev/null 2>&1 ||
   die "agent-browser is not on PATH"
 
-# One session for the whole sheet — a fresh login per screen would burn the
-# shared QA seat's login rate limit. Name is derived from the run dir so two
-# concurrent runs never collide, sanitized to characters agent-browser session
-# names are known to accept.
-SESSION_RAW="cs-$(basename "$RUN_DIR")-$$"
-SESSION="$(printf '%s' "$SESSION_RAW" | tr -c 'A-Za-z0-9_-' '-')"
+# A fresh `--session` name per screen (never a shared one across the whole
+# sheet) — a shared session let one screen's DOM/localStorage state (e.g. a
+# nav drawer some earlier screen's `steps` opened) bleed into every later
+# screenshot. See the "Fresh state per screen" header note above. Base name
+# is derived from the run dir so two concurrent runs never collide, sanitized
+# to characters agent-browser session names are known to accept; each screen
+# (and the preflight probe and the final grid render) appends its own suffix.
+SESSION_BASE_RAW="cs-$(basename "$RUN_DIR")-$$"
+SESSION_BASE="$(printf '%s' "$SESSION_BASE_RAW" | tr -c 'A-Za-z0-9_-' '-')"
 
-cleanup() { agent-browser --session "$SESSION" close >/dev/null 2>&1 || true; }
+# Every session name this script ever opens is recorded here so cleanup can
+# close all of them on exit, however far the script got — one shared $SESSION
+# variable can't do that once each screen has its own.
+SESSIONS_FILE="$(mktemp)"
+cleanup() {
+  if [ -s "$SESSIONS_FILE" ]; then
+    while IFS= read -r s; do
+      [ -n "$s" ] && agent-browser --session "$s" close >/dev/null 2>&1 || true
+    done <"$SESSIONS_FILE"
+  fi
+  rm -f "$SESSIONS_FILE"
+}
 trap cleanup EXIT
 
-if ! LOAD_OUT="$(agent-browser --session "$SESSION" state load "$AUTH_STATE" 2>&1)"; then
+# A dedicated probe session, closed right after: verifies the auth state file
+# itself is loadable before attempting any screen, so a fundamentally broken
+# file refuses up front (exit 2, nothing written) rather than failing all N
+# screens individually and exiting 1 as if it had merely captured zero.
+PREFLIGHT_SESSION="${SESSION_BASE}-preflight"
+printf '%s\n' "$PREFLIGHT_SESSION" >>"$SESSIONS_FILE"
+if ! LOAD_OUT="$(agent-browser --session "$PREFLIGHT_SESSION" state load "$AUTH_STATE" 2>&1)"; then
   die "agent-browser could not load auth state: $LOAD_OUT"
 fi
+agent-browser --session "$PREFLIGHT_SESSION" close >/dev/null 2>&1 || true
 
 RESULTS_FILE="$(mktemp)"
 trap 'rm -f "$RESULTS_FILE"; cleanup' EXIT
-BUILD_SHA=""
+# Caller-supplied SHA wins outright — the sniff loop below only runs while
+# BUILD_SHA is still empty, so passing SOURCE_SHA skips it entirely.
+BUILD_SHA="$SOURCE_SHA"
 BUILD_SHA_JS='(document.querySelector("meta[name=\"build-sha\"]")||{}).content || (typeof window!=="undefined" && window.__BUILD_SHA__) || (document.querySelector("[data-build-sha]")||{}).dataset && document.querySelector("[data-build-sha]").dataset.buildSha || ""'
 
 # run_step VERB REST -> 0/1, sets STEP_ERR on failure. See the header comment
@@ -192,11 +260,29 @@ while IFS= read -r SCREEN; do
   esac
   URL="${BASE_URL%/}${SCREEN_PATH}"
 
+  # A never-before-used session name per screen — a fresh browser context,
+  # not a URL this script has navigated in before. Registered for cleanup
+  # before use so a mid-screen crash still gets it closed.
+  SESSION="${SESSION_BASE}-scr${IDX}"
+  printf '%s\n' "$SESSION" >>"$SESSIONS_FILE"
+
+  STATE_OK=true
+  STATE_ERR=""
+  if ! OUT="$(agent-browser --session "$SESSION" state load "$AUTH_STATE" 2>&1)"; then
+    STATE_OK=false
+    STATE_ERR="state load: $OUT"
+  fi
+
   OPEN_OK=true
   OPEN_ERR=""
-  if ! OUT="$(agent-browser --session "$SESSION" open "$URL" 2>&1)"; then
+  if [ "$STATE_OK" = true ]; then
+    if ! OUT="$(agent-browser --session "$SESSION" open "$URL" 2>&1)"; then
+      OPEN_OK=false
+      OPEN_ERR="open $URL: $OUT"
+    fi
+  else
     OPEN_OK=false
-    OPEN_ERR="open $URL: $OUT"
+    OPEN_ERR="$STATE_ERR"
   fi
 
   if [ "$OPEN_OK" = true ] && [ -z "$BUILD_SHA" ]; then
@@ -265,12 +351,23 @@ while IFS= read -r SCREEN; do
     STATUS=failed
   fi
 
+  # Close this screen's session now rather than waiting for the run-wide
+  # cleanup trap — it already did its job (a fresh context this screen alone
+  # navigated in) and there is no reason to keep N browser contexts alive at
+  # once as the sheet grows.
+  agent-browser --session "$SESSION" close >/dev/null 2>&1 || true
+
   jq -cn \
     --arg name "$NAME" --arg path "$SCREEN_PATH" --arg status "$STATUS" \
     --argjson dcap "$DESKTOP_CAPTURED" --arg dfile "shots/${BASENAME}-1280.png" --arg dreason "$DESKTOP_REASON" \
     --argjson mcap "$MOBILE_CAPTURED" --arg mfile "shots/${BASENAME}-390.png" --arg mreason "$MOBILE_REASON" \
     '{
       name: $name, path: $path, status: $status,
+      # Every screen navigates in its own never-before-used session (see the
+      # "Fresh state per screen" header note) — always true by construction,
+      # not conditioned on whether the navigation itself succeeded, so a
+      # later reader can tell a real default state from a leftover one.
+      freshNavigation: true,
       desktop: ({captured: $dcap} + (if $dcap then {file: $dfile} else {file: null, reason: $dreason} end)),
       mobile: ({captured: $mcap} + (if $mcap then {file: $mfile} else {file: null, reason: $mreason} end))
     }' >>"$RESULTS_FILE"
@@ -375,14 +472,17 @@ python3 "$RENDER_SCRIPT" "$CS_DIR" "$BASE_URL" "$BUILD_SHA" "$REQUESTED" "$CAPPE
 rm -f "$RENDER_SCRIPT"
 
 # Render the grid itself: wide enough for both columns side by side with no
-# horizontal scroll (1280 + 390 + gutters).
+# horizontal scroll (1280 + 390 + gutters). Its own session — it's a local
+# file, not an authenticated page, so it doesn't need the saved auth state.
+GRID_SESSION="${SESSION_BASE}-grid"
+printf '%s\n' "$GRID_SESSION" >>"$SESSIONS_FILE"
 SHEET_FILE="$CS_DIR/sheet.png"
-agent-browser --session "$SESSION" set viewport 1750 1000 >/dev/null 2>&1 || true
-if ! SHEET_OUT="$(agent-browser --session "$SESSION" open "file://$CS_DIR/grid.html" 2>&1)"; then
+agent-browser --session "$GRID_SESSION" set viewport 1750 1000 >/dev/null 2>&1 || true
+if ! SHEET_OUT="$(agent-browser --session "$GRID_SESSION" open "file://$CS_DIR/grid.html" 2>&1)"; then
   jq -cn --arg e "$SHEET_OUT" '{ok:false,error:("could not open the rendered grid: " + $e)}'
   exit 1
 fi
-if ! SHEET_OUT="$(agent-browser --session "$SESSION" screenshot --full "$SHEET_FILE" 2>&1)"; then
+if ! SHEET_OUT="$(agent-browser --session "$GRID_SESSION" screenshot --full "$SHEET_FILE" 2>&1)"; then
   jq -cn --arg e "$SHEET_OUT" '{ok:false,error:("could not screenshot the rendered grid: " + $e)}'
   exit 1
 fi

@@ -305,6 +305,62 @@ describe('per-topic linked worktree cleanup', () => {
     expect(fs.readFileSync(path.join(sibling, '.git'), 'utf8')).toBe(siblingPointer);
   });
 
+  it("refuses to remove a linked checkout when the canonical's own Git common dir resolves elsewhere (#669)", async () => {
+    const fixture = repositoryFixture();
+    const other = canonicalFixture('repo-other');
+    // The checkout itself is eligible, and its own common dir IS the canonical
+    // (Git reads one level of commondir). Only the canonical's own file,
+    // followed by the removal that runs with the canonical as cwd, is wrong.
+    const planted = path.join(fixture.canonical, '.git', 'commondir');
+    fs.writeFileSync(planted, `${path.join(other.canonical, '.git')}\n`);
+    const target = (await _discoverWorktreesForTesting(state.dataDir)).find((entry) => entry.repo === fixture.repo);
+    expect(target).toBeDefined();
+
+    await expect(_cleanupOneForTesting(target!, state.dataDir)).resolves.toBeUndefined();
+
+    expect(log.error).toHaveBeenCalledWith(
+      expect.stringContaining('#669'),
+      expect.objectContaining({ repo: fixture.repo, gitDir: path.join(fixture.canonical, '.git') }),
+    );
+    fs.rmSync(planted);
+    expect(fs.existsSync(fixture.worktree)).toBe(true);
+    expect(git(fixture.canonical, ['for-each-ref', '--format=%(refname)', `refs/heads/${fixture.branch}`])).toBe(
+      `refs/heads/${fixture.branch}`,
+    );
+  });
+
+  it('a pending deregistration refuses an admin dir whose Git common dir resolves elsewhere, and keeps it journaled (#669)', async () => {
+    const fixture = repositoryFixture();
+    const adminDir = git(fixture.worktree, ['rev-parse', '--absolute-git-dir']);
+    // Another repository holding the same branch at the same commit, so every
+    // proof run through the redirected admin dir would pass.
+    const foreignRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'topic-cleanup-foreign-'));
+    try {
+      const foreign = path.join(foreignRoot, 'repo-a');
+      execFileSync('git', ['clone', '-q', git(fixture.canonical, ['remote', 'get-url', 'origin']), foreign]);
+      git(foreign, ['branch', fixture.branch, 'origin/HEAD']);
+      fs.rmSync(fixture.worktree, { recursive: true, force: true });
+      fs.writeFileSync(path.join(adminDir, 'commondir'), `${path.join(foreign, '.git')}\n`);
+      const journal = path.join(state.dataDir, '.gc-pending-prunes.json');
+      const entry = { workgroupId: 'wg-a', repo: fixture.repo, worktreePath: fixture.worktree };
+      fs.writeFileSync(journal, JSON.stringify([entry]));
+      process.env.NANOCLAW_STORAGE_GC = 'apply';
+      const groupsDir = path.join(state.dataDir, 'groups');
+      fs.mkdirSync(groupsDir, { recursive: true });
+
+      await runStorageGcOnce(state.dataDir, groupsDir);
+
+      expect(fs.existsSync(adminDir)).toBe(true);
+      expect(JSON.parse(fs.readFileSync(journal, 'utf8'))).toEqual([entry]);
+      expect(log.error).toHaveBeenCalledWith(
+        expect.stringContaining('#669'),
+        expect.objectContaining({ repo: fixture.repo, gitDir: adminDir }),
+      );
+    } finally {
+      fs.rmSync(foreignRoot, { recursive: true, force: true });
+    }
+  });
+
   it.each([
     ['running', () => state.running.add('s1')],
     ['spawning', () => state.spawning.add('s1')],
