@@ -434,8 +434,10 @@ nomination in the run record, name it on the report, and do not start running
 it. Adding to the floor is a standing-instruction edit and therefore a human's
 call: a coordinator that can extend its own floor can also quietly shrink it.
 
-**Cadence: every campaign walks at least one floor entry, least-recently-passed
-first.** The flat option — walk the whole floor every campaign — was rejected on
+**Cadence: every standard or full campaign walks at least one floor entry,
+least-recently-passed first. A light campaign walks only entries already past
+their `max_interval`, usually none; standard and full campaigns and the
+install's scheduled sweep keep the floor fresh.** The flat option — walk the whole floor every campaign — was rejected on
 two grounds. At about three campaigns a day a five-entry floor becomes fifteen
 full browser journeys a day, which is exactly the re-derivation cost the skip
 rule below was written to remove; and a walk repeated ninety times a month
@@ -444,10 +446,13 @@ no per-campaign obligation was rejected too: it leaves the mechanism cold for
 days, and a mechanism nobody exercises is one nobody notices has broken. So,
 both, bounded:
 
-- **Every campaign declares at least one lane of kind `floor` in the contract,
-  one lane per entry it walks, with the entry's `id` as the lane id. Never
-  zero** — not on a backend-only diff, not on a one-line change, not on a
-  campaign that found nothing.
+- **Every standard or full campaign declares at least one lane of kind `floor`
+  in the contract, one lane per entry it walks, with the entry's `id` as the
+  lane id. Never zero** — not on a backend-only diff, not on a one-line
+  change, not on a campaign that found nothing. A light campaign's contract
+  may carry zero floor lanes, but only when no entry was actually overdue as
+  of that campaign's own timestamp — recomputable after the fact with the
+  same `jq` query below, so "light, so none" is never taken on faith.
 - **Which entries are due is computed, not chosen.** Every entry past its
   `max_interval` is due, all of them, however many that is — the ceiling is the
   deployment's own stated tolerance and nothing overrides it. If none are
@@ -529,9 +534,13 @@ because it is the same failure wearing a different name:
 
 **Checkable after the fact**, from a finished run's artifacts alone:
 
-- **The contract carries at least one lane of kind `floor`.** A contract with
-  none is a campaign that ran with no floor at all, visible in one `jq` before
-  any evidence is read.
+- **The contract carries at least one lane of kind `floor`, unless it is a
+  light campaign with nothing overdue.** A non-light contract with none is a
+  campaign that ran with no floor at all, visible in one `jq` before any
+  evidence is read. A light contract with none is legitimate only when the
+  least-recently-passed query above, recomputed as of that run's timestamp,
+  also shows zero entries past `max_interval` — the same recomputation the
+  "Selection is recomputable" check below already runs.
 - **Every floor lane has a terminal marker.** The synthesis barrier enforced
   that to publish, so a published run structurally has one; a missing or `void`
   marker beside a published verdict means the barrier was bypassed.
@@ -1547,8 +1556,9 @@ left over is narration that should not have posted.
 Run a changed-surface `audit` for each settled develop SHA. Any user-visible
 change must include a real-browser frontend lane even when the diff looks
 backend-only. Changed surface decides what a campaign runs *extra*; the
-coverage floor (§2) runs in every campaign regardless of the diff, including
-this one. Run `full` for a
+coverage floor (§2) runs in every standard or full campaign regardless of the
+diff, including this one — a light campaign walks only whatever is already
+past its `max_interval` (§2), usually nothing. Run `full` for a
 release candidate, a manually named feature, a high-risk label, or a scheduled
 nightly/weekly sweep. This preserves continuous coverage without paying for idle
 turns or rerunning an unchanged build.
@@ -1583,6 +1593,13 @@ PR sizes off its develop-compare target diff, never its own two-marker diff.
 No rules file means `standard`, `sizeReason: "no sizing rules"` — unchanged
 behavior for installs that never added one. The install's own campaign prompt
 decides what each size actually runs; this gate only classifies, never picks lanes.
+A rules file's `full` list can also read a named constant out of the install's
+own release-policy file via `fullGlobsFrom: {"path": ..., "name": ...}`,
+unioned with any local `full` globs — so smoke never keeps a second, driftable
+copy of that list. It reads the constant with `ast`/`literal_eval` rather than
+importing the file, so the file is never executed; any problem (unreadable or
+unparseable file, the name missing at top level, a computed rather than
+literal value, or a mistyped value) fails closed to `full`.
 
 Commands: `poll` (default), `check <pr>` (read-only, mirrors the develop
 gate's `check`), `claim <run-id> <pr> <sha> [owner-token]`,

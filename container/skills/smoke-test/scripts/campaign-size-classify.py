@@ -16,6 +16,7 @@ failure, truncated listing) — that fail-closed call is made by the caller
 truncation) this script has no access to. This script only classifies a
 complete, known file list against the rules.
 """
+import ast
 import json
 import re
 import sys
@@ -113,8 +114,91 @@ def match_first(path, compiled_rules):
     return None
 
 
+def _find_top_level_assignment(tree, name):
+    """Return the AST value node of the LAST top-level `name = ...` (or
+    `name: T = ...`) assignment in `tree.body`, matching normal module
+    semantics where a later assignment shadows an earlier one, or None if
+    `name` is never assigned at module top level. Deliberately does not
+    descend into functions, classes, or conditionals -- a value assigned
+    conditionally or built inside a function is not a fixed policy constant
+    this format can trust."""
+    found = None
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target] if node.value is not None else []
+        else:
+            continue
+        if any(isinstance(t, ast.Name) and t.id == name for t in targets):
+            found = node.value
+    return found
+
+
+def load_full_globs_from(spec):
+    """Load `fullGlobsFrom: {"path": <python file>, "name": <variable>}`.
+
+    Returns (globs, None) on success or (None, reason) on any failure. The
+    install's release policy already owns its sensitive-path list; this lets
+    smoke read it directly instead of keeping a second, driftable copy.
+
+    Deliberately reads the named constant with `ast` + `literal_eval` rather
+    than importing the file as a module: running another team's program just
+    to get one literal means any future non-stdlib import or import-time side
+    effect in that file (a `yaml` import, an env read) would either silently
+    turn every PR `full` or execute code this classifier never meant to run.
+    A literal has no such surface -- `literal_eval` only ever produces plain
+    data, never runs arbitrary statements.
+
+    Every failure mode here is a caller instruction to fail closed to `full`
+    — an unreadable file, a file that doesn't parse, a name never assigned at
+    top level, a value that isn't a literal, and a value of the wrong type
+    are all indistinguishable from "this rules file's full-glob policy could
+    not be read," which must never silently fall through to a lighter
+    campaign.
+    """
+    if not isinstance(spec, dict):
+        return None, "fullGlobsFrom must be an object with path and name"
+    path = spec.get("path")
+    name = spec.get("name")
+    if not isinstance(path, str) or not path:
+        return None, "fullGlobsFrom.path is missing or not a string"
+    if not isinstance(name, str) or not name:
+        return None, "fullGlobsFrom.name is missing or not a string"
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            source = fh.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, "fullGlobsFrom.path {} could not be read: {}".format(path, exc)
+    try:
+        tree = ast.parse(source, filename=path)
+    except (SyntaxError, ValueError) as exc:
+        return None, "fullGlobsFrom.path {} could not be parsed: {}".format(path, exc)
+    value_node = _find_top_level_assignment(tree, name)
+    if value_node is None:
+        return None, "fullGlobsFrom.name {} not found at top level in {}".format(name, path)
+    try:
+        value = ast.literal_eval(value_node)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError) as exc:
+        return None, "fullGlobsFrom.name {} in {} is not a literal: {}".format(name, path, exc)
+    if not isinstance(value, (list, tuple)) or not all(isinstance(v, str) for v in value):
+        return None, "fullGlobsFrom.name {} in {} is not a list of strings".format(name, path)
+    return list(value), None
+
+
 def classify(files, rules):
-    full_rules = compile_rule_list(rules.get("full", []) or [])
+    full_globs = list(rules.get("full", []) or [])
+    full_globs_from = rules.get("fullGlobsFrom")
+    if full_globs_from is not None:
+        imported_globs, error = load_full_globs_from(full_globs_from)
+        if error is not None or imported_globs is None:
+            return "full", "full: {}".format(error)
+        # Union with any local `full` globs, order preserved, no duplicates.
+        for g in imported_globs:
+            if g not in full_globs:
+                full_globs.append(g)
+
+    full_rules = compile_rule_list(full_globs)
     allowed_rules = compile_rule_list(rules.get("lightAllowed", []) or [])
     deny_rules = compile_rule_list(rules.get("lightDeny", []) or [])
 
