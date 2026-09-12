@@ -10,6 +10,7 @@ import { createHash, randomBytes } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
+import { readCanonicalCommondir, type CanonicalCommondirState } from './canonical-git-commondir.js';
 import { DATA_DIR } from './config.js';
 import { safeGitArgs, safeGitEnv } from './safe-git.js';
 
@@ -402,39 +403,113 @@ export function writeTransferTombstone(
   }
 }
 
-function assertContainedNormalClone(repoPath: string, root: string): void {
+/** One canonical repository that cannot be served, and why. */
+export interface UnusableCanonicalRepository {
+  name: string;
+  path: string;
+  /** The message the throwing form raises, and what a caller logs when it skips this repository. */
+  reason: string;
+  /** The cause is a `commondir` that is not the sentinel, or one that could not be read (#669). */
+  commondir: boolean;
+}
+
+export interface CanonicalRepositoryClassification {
+  repositories: CanonicalRepository[];
+  unusable: UnusableCanonicalRepository[];
+}
+
+const describeError = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+/**
+ * Why `repoPath` cannot be served as a canonical, or null when it can.
+ *
+ * The `commondir` inspection comes BEFORE the Git probe on purpose (#669):
+ * Git follows a `commondir` in any git dir, so probing a repository that
+ * holds a foreign one either answers for another repository or, when it
+ * names a missing directory, exits 128. Reading the file first keeps a
+ * tampered repository away from Git entirely, and keeps its failure to
+ * itself rather than aborting the caller's whole pass.
+ */
+function containedNormalCloneProblem(repoPath: string, root: string): { reason: string; commondir: boolean } | null {
   const gitDir = path.join(repoPath, '.git');
-  const rootReal = fs.realpathSync(root);
-  const repoStat = fs.lstatSync(repoPath);
-  if (repoStat.isSymbolicLink() || !repoStat.isDirectory()) {
-    throw new Error(`canonical repository entry is not a real directory: ${repoPath}`);
+  let repoReal: string;
+  let rootReal: string;
+  try {
+    rootReal = fs.realpathSync(root);
+    const repoStat = fs.lstatSync(repoPath);
+    if (repoStat.isSymbolicLink() || !repoStat.isDirectory()) {
+      return { reason: `canonical repository entry is not a real directory: ${repoPath}`, commondir: false };
+    }
+    repoReal = fs.realpathSync(repoPath);
+  } catch (error) {
+    return {
+      reason: `canonical repository entry is not a real directory: ${repoPath}: ${describeError(error)}`,
+      commondir: false,
+    };
   }
-  const repoReal = fs.realpathSync(repoPath);
   if (!repoReal.startsWith(`${rootReal}${path.sep}`)) {
-    throw new Error(`canonical repository escapes its workgroup namespace: ${repoPath}`);
+    return { reason: `canonical repository escapes its workgroup namespace: ${repoPath}`, commondir: false };
   }
   let gitStat: fs.Stats;
   try {
     gitStat = fs.lstatSync(gitDir);
   } catch (error) {
-    throw new Error(
-      `canonical repository has missing or unreadable Git metadata: ${repoPath}: ${error instanceof Error ? error.message : String(error)}`,
-      { cause: error },
-    );
+    return {
+      reason: `canonical repository has missing or unreadable Git metadata: ${repoPath}: ${describeError(error)}`,
+      commondir: false,
+    };
   }
   if (gitStat.isSymbolicLink() || !gitStat.isDirectory()) {
-    throw new Error(`canonical repository has invalid Git metadata: ${repoPath}`);
+    return { reason: `canonical repository has invalid Git metadata: ${repoPath}`, commondir: false };
   }
-  const bare = execFileSync('git', safeGitArgs(['-C', repoPath, 'rev-parse', '--is-bare-repository']), {
-    encoding: 'utf8',
-    env: safeGitEnv(),
-    stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: 10_000,
-  }).trim();
-  if (bare !== 'false') throw new Error(`canonical repository is not a normal clone: ${repoPath}`);
+  let commondirState: CanonicalCommondirState;
+  try {
+    commondirState = readCanonicalCommondir(gitDir);
+  } catch (error) {
+    return {
+      reason: `canonical repository .git holds an unreadable commondir: ${gitDir}: ${describeError(error)}`,
+      commondir: true,
+    };
+  }
+  if (commondirState === 'foreign') {
+    return {
+      reason: `canonical repository .git holds a commondir that is not the sentinel: ${gitDir}`,
+      commondir: true,
+    };
+  }
+  let bare: string;
+  try {
+    bare = execFileSync('git', safeGitArgs(['-C', repoPath, 'rev-parse', '--is-bare-repository']), {
+      encoding: 'utf8',
+      env: safeGitEnv(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 10_000,
+    }).trim();
+  } catch (error) {
+    return {
+      reason: `canonical repository could not be probed by Git: ${repoPath}: ${describeError(error)}`,
+      commondir: false,
+    };
+  }
+  if (bare !== 'false') return { reason: `canonical repository is not a normal clone: ${repoPath}`, commondir: false };
+  return null;
 }
 
-export function discoverCanonicalRepositories(workgroupId: string, dataDir: string = DATA_DIR): CanonicalRepository[] {
+/**
+ * Every canonical repository in the workgroup, split into the ones that can be
+ * served and the ones that cannot, judged one repository at a time.
+ *
+ * A problem with the workgroup NAMESPACE itself still throws — it disqualifies
+ * every repository under it, so there is nothing to serve. A problem with one
+ * repository is that repository's alone: the caller decides between skipping
+ * it and refusing everything. The spawn path skips it, so one tampered or
+ * half-migrated canonical withholds only its own mounts (#669) instead of
+ * stopping every container in the workgroup.
+ */
+export function classifyCanonicalRepositories(
+  workgroupId: string,
+  dataDir: string = DATA_DIR,
+): CanonicalRepositoryClassification {
   assertWorkgroupId(workgroupId);
   const workgroupRoot = path.join(repositoriesRoot(dataDir), workgroupId);
   try {
@@ -443,19 +518,29 @@ export function discoverCanonicalRepositories(workgroupId: string, dataDir: stri
       throw new Error(`canonical workgroup namespace is not a real directory: ${workgroupRoot}`);
     }
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { repositories: [], unusable: [] };
     throw error;
   }
   const entries = fs.readdirSync(workgroupRoot, { withFileTypes: true });
 
   const repositories: CanonicalRepository[] = [];
+  const unusable: UnusableCanonicalRepository[] = [];
   for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-    assertRepositoryName(entry.name);
-    if (!entry.isDirectory() || entry.isSymbolicLink()) {
-      throw new Error(`invalid entry in canonical repository namespace: ${path.join(workgroupRoot, entry.name)}`);
-    }
     const repoPath = path.join(workgroupRoot, entry.name);
-    assertContainedNormalClone(repoPath, workgroupRoot);
+    let problem: { reason: string; commondir: boolean } | null;
+    try {
+      assertRepositoryName(entry.name);
+      problem =
+        !entry.isDirectory() || entry.isSymbolicLink()
+          ? { reason: `invalid entry in canonical repository namespace: ${repoPath}`, commondir: false }
+          : containedNormalCloneProblem(repoPath, workgroupRoot);
+    } catch (error) {
+      problem = { reason: describeError(error), commondir: false };
+    }
+    if (problem) {
+      unusable.push({ name: entry.name, path: repoPath, ...problem });
+      continue;
+    }
     repositories.push({
       name: entry.name,
       path: repoPath,
@@ -464,6 +549,23 @@ export function discoverCanonicalRepositories(workgroupId: string, dataDir: stri
       originPinPath: originPinPath(workgroupId, entry.name, dataDir),
     });
   }
+  return { repositories, unusable };
+}
+
+/**
+ * The all-or-nothing form: the first unusable repository, in entry order,
+ * throws its reason.
+ *
+ * Two callers depend on that and are deliberately left on it, because for them
+ * a bad repository means the workgroup's answer is untrustworthy as a whole:
+ * `migrateExistingCanonicalHooksPath` (managed-git-hooks.ts:407-415) and
+ * `discoverCanonicalRefreshTargets` (repo-freshness.ts:47-52) both catch it
+ * and skip the entire workgroup. The spawn path calls
+ * classifyCanonicalRepositories instead.
+ */
+export function discoverCanonicalRepositories(workgroupId: string, dataDir: string = DATA_DIR): CanonicalRepository[] {
+  const { repositories, unusable } = classifyCanonicalRepositories(workgroupId, dataDir);
+  if (unusable.length > 0) throw new Error(unusable[0].reason);
   return repositories;
 }
 

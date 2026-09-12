@@ -164,7 +164,7 @@ import {
   writeSessionRouting,
 } from './session-manager.js';
 import {
-  discoverCanonicalRepositories,
+  classifyCanonicalRepositories,
   isRepositoryLifecycleClaimed,
   isWorkgroupRepositoryMountClaimed,
   readOriginPin,
@@ -4486,7 +4486,22 @@ export async function buildMounts(
   // common `.git`, origin pin, and one shared kernel-lock inode. All are bound
   // at their exact host paths so no container-relative back-pointer can leak
   // into Git's administrative records.
-  for (const repository of discoverCanonicalRepositories(wgKey)) {
+  //
+  // Judged one repository at a time. Discovery's throwing form aborts the
+  // whole spawn on the first unusable canonical — and a foreign `commondir`
+  // naming a missing directory makes its Git probe exit 128 — so a single
+  // tampered or half-migrated `.git` used to stop every container in the
+  // workgroup instead of withholding one repository (#669 review).
+  const canonicals = classifyCanonicalRepositories(wgKey);
+  for (const broken of canonicals.unusable) {
+    log.error(
+      broken.commondir
+        ? 'canonical repository withheld: its .git holds a commondir that is not the sentinel (#669: re-raise)'
+        : 'canonical repository withheld: it is not a usable normal clone',
+      { workgroupId: wgKey, repository: broken.name, path: broken.path, reason: broken.reason },
+    );
+  }
+  for (const repository of canonicals.repositories) {
     if (!readOriginPin(wgKey, repository.name)) {
       throw new Error(`Canonical repository ${wgKey}/${repository.name} is missing its host origin pin`);
     }

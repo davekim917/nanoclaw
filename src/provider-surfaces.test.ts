@@ -716,6 +716,13 @@ describe('buildMounts agent surfaces', async () => {
         fs.linkSync(commondir, path.join(path.dirname(commondir), 'writable-alias'));
       },
     ],
+    [
+      // The case that used to stop the whole workgroup: Git follows this
+      // commondir to a directory that is not there and exits 128, and
+      // discovery ran that probe before anything classified per repository.
+      'a repository that does not exist',
+      (commondir, elsewhere) => fs.writeFileSync(commondir, `${path.join(elsewhere, 'gone', '.git')}\n`),
+    ],
   ])(
     'withholds every mount of a canonical whose commondir is %s, logs it, and still mounts its sibling (#669)',
     async (_shape, plant) => {
@@ -749,9 +756,16 @@ describe('buildMounts agent surfaces', async () => {
         containerPath: siblingCommondir,
         readonly: true,
       });
+      // Discovery classifies this repository as unusable before Git runs on it
+      // at all, so the log names the repository and why it was withheld.
       expect(log.error).toHaveBeenCalledWith(
         expect.stringContaining('#669'),
-        expect.objectContaining({ workgroupId, repository: 'proj', path: commondir }),
+        expect.objectContaining({
+          workgroupId,
+          repository: 'proj',
+          path: path.dirname(planted.gitDir),
+          reason: expect.stringContaining('commondir'),
+        }),
       );
       // Never overwritten.
       expect(read()).toBe(plantedBytes);

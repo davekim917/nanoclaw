@@ -11,6 +11,7 @@ import {
   checkoutInheritedTagsPath,
   cloneIdentity,
   defaultTopicBranch,
+  classifyCanonicalRepositories,
   discoverCanonicalRepositories,
   ensureRepositoryLock,
   isWorkgroupRepositoryMountClaimed,
@@ -109,6 +110,29 @@ describe('canonical repository layout', () => {
     execFileSync('git', ['init', '-q', '--bare', bare]);
 
     expect(() => discoverCanonicalRepositories('wg-a', root)).toThrow(/Git metadata|not a normal clone/);
+  });
+
+  it('classifies one repository at a time, so a broken canonical leaves its siblings servable (#669)', () => {
+    const healthy = canonicalRepoDir('wg-a', 'dbt', root);
+    const broken = canonicalRepoDir('wg-a', 'proj', root);
+    for (const repo of [healthy, broken]) {
+      fs.mkdirSync(repo, { recursive: true });
+      execFileSync('git', ['init', '-q'], { cwd: repo });
+    }
+    // A commondir naming a directory that does not exist: Git follows it and
+    // exits 128, which is what used to abort discovery for the whole workgroup.
+    fs.writeFileSync(path.join(broken, '.git', 'commondir'), `${path.join(root, 'missing-repo', '.git')}\n`);
+
+    const { repositories, unusable } = classifyCanonicalRepositories('wg-a', root);
+
+    expect(repositories.map((repository) => repository.name)).toEqual(['dbt']);
+    expect(unusable).toHaveLength(1);
+    expect(unusable[0]).toMatchObject({ name: 'proj', path: broken, commondir: true });
+    expect(unusable[0]?.reason).toMatch(/commondir/);
+    // The healthy sibling is fully formed, not a stub.
+    expect(repositories[0]?.gitDir).toBe(path.join(healthy, '.git'));
+    // The all-or-nothing form still throws, for the two callers that depend on it.
+    expect(() => discoverCanonicalRepositories('wg-a', root)).toThrow(/commondir/);
   });
 });
 
