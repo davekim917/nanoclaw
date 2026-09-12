@@ -70,10 +70,18 @@
  *     `--threshold` (default 0.5) points below that value (missing/'untested' current
  *     coverage counts as a drop to 0%, not a skipped comparison);
  *   - it is NOT in the baseline at all (a risk file introduced after the baseline was
- *     last written) and is currently `'untested'`.
+ *     last written) and is currently `'untested'` (`'new-untested'`), OR has some
+ *     measured coverage but still no floor recorded for it (`'new'`) — a risk file
+ *     that ships with no coverage floor at all is exactly the gap `--write` exists to
+ *     close, so ordinary runs fail it rather than silently accepting whatever the file
+ *     happens to measure today (review receipt on #714, round 1, P2-1: this shipped
+ *     unfloored once before and was fixed only after a reviewer noticed in a probe —
+ *     see docs/review-notes.md's `risk coverage`/repeat-class entries).
  * A baseline entry of `'untested'` never fails on its own — it is accepted debt, not a
- * live threshold — and a NEW risk file with SOME measured coverage does not fail either.
- * `--write` folds the current state into the baseline either way.
+ * live threshold. `--write` folds the current state into the baseline either way, and
+ * `--write`/`--bootstrap` (either flag) suspend the `'new'` failure specifically:
+ * `--write` is about to record a floor for it, and `--bootstrap`'s one-time empty
+ * baseline would otherwise fail on every risk file that exists.
  *
  * Fails closed (exit 1) BEFORE any of the above, regardless of --write, when:
  *   - the baseline file does not exist — pass `--bootstrap` for the one-time initial
@@ -379,12 +387,54 @@ function toBaselineEntry(classification: Classification): BaselineEntry {
   return classification.kind === 'measured' ? round2(classification.pct) : classification.kind;
 }
 
+export interface EvaluateOptions {
+  /**
+   * Suspend the `'new'` failure (a risk file with real measured coverage but no
+   * floor recorded for it yet) — never `'new-untested'`, which stays a failure
+   * regardless. `main()` sets this for `--write` (a floor is about to be recorded,
+   * from the very classifications being evaluated) and `--bootstrap` (the empty
+   * baseline it seeds would otherwise fail on every risk file that exists, which is
+   * the opposite of what a one-time bootstrap run is for). Default false: an
+   * ordinary run — the one CI's "Risk-path coverage ratchet" step runs — fails a
+   * `'new'` file exactly like `'new-untested'`, so a risk file can no longer ship
+   * with no floor at all and stay green (review receipt on #714 round 1, P2-1).
+   */
+  allowNew?: boolean;
+}
+
+/**
+ * Whether `main()` should suspend the `'new'` failure for this run — the exact value
+ * `EvaluateOptions.allowNew` takes. Factored out of `main()`'s inline arithmetic into
+ * a pure, directly testable function: with `allowNew` computed inline, flipping it to
+ * unconditionally `true` in normal mode left every one of this script's existing
+ * tests green, because none of them exercised `main()` itself (review receipt on
+ * #714, round 2, P2-B).
+ *
+ * True in exactly two cases:
+ *   - `write` is set — a `--write` run is ABOUT to record a floor for every current
+ *     risk file (via `buildBaseline`), so `'new'` can never actually fire against the
+ *     baseline it just wrote; true unconditionally, regardless of `bootstrap` or
+ *     `baselineExists`.
+ *   - `bootstrap` is set AND no baseline file exists yet — the one-time
+ *     initial-baseline case (see `resolveBaseline`), whose empty baseline would
+ *     otherwise fail on every risk file that exists.
+ * `bootstrap` paired with an ALREADY-EXISTING baseline is deliberately false:
+ * `--bootstrap` is documented as a one-time initial-baseline flag, not a standing way
+ * to silence the check, so passing it again against a baseline that is already
+ * committed must not suppress `'new'` (review receipt on #714, round 2, P3-1).
+ */
+export function allowNewFor(opts: { write: boolean; bootstrap: boolean; baselineExists: boolean }): boolean {
+  return opts.write || (opts.bootstrap && !opts.baselineExists);
+}
+
 export function evaluate(
   riskFiles: readonly string[],
   classifications: ReadonlyMap<string, Classification>,
   baseline: Baseline,
   threshold = DEFAULT_THRESHOLD,
+  options: EvaluateOptions = {},
 ): EvaluateResult {
+  const { allowNew = false } = options;
   const riskFileSet = new Set(riskFiles);
   const rows: FileRow[] = riskFiles.map((file) => {
     const current = toBaselineEntry(classifications.get(file) ?? { kind: 'n/a' });
@@ -438,7 +488,9 @@ export function evaluate(
     rows.push({ file, baseline: baseline.files[file], current: 'n/a', delta: null, status: 'removed' });
   }
 
-  const failures = rows.filter((row) => row.status === 'regressed' || row.status === 'new-untested');
+  const failures = rows.filter(
+    (row) => row.status === 'regressed' || row.status === 'new-untested' || (row.status === 'new' && !allowNew),
+  );
   return { rows, failures, passed: failures.length === 0 };
 }
 
@@ -457,6 +509,18 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
+/**
+ * Rounds DOWN to one decimal place — this repo's floor convention for a SUGGESTED
+ * coverage baseline entry (a floor must never be stricter than what was actually
+ * measured, so it only ever rounds down, never to the nearest or up — review receipt
+ * on #714, round 2, P3-3). Operates on an already `round2()`-ed value rather than the
+ * raw float, so a floating-point artifact one decimal place further out (e.g.
+ * 92.30000000000001) can't floor to the wrong decile.
+ */
+function floorTo1Decimal(n: number): number {
+  return Math.floor(round2(n) * 10) / 10;
+}
+
 // ─────────────────────────── table rendering ───────────────────────────────
 
 function fmtEntry(entry: BaselineEntry | null): string {
@@ -468,6 +532,38 @@ function fmtDelta(delta: number | null): string {
   if (delta === null) return '—';
   const sign = delta > 0 ? '+' : '';
   return `${sign}${delta.toFixed(2)}`;
+}
+
+/**
+ * One `--failures` line for `printReport`. A `'new'` row (real measured coverage,
+ * no floor recorded — see `EvaluateOptions.allowNew`) gets its own message naming
+ * the measured value and the exact JSON line to add to `baselinePath`, rather than
+ * the generic baseline-arrow-current line every other failure status uses: there is
+ * no baseline entry to show an arrow FROM, and the whole point of failing this
+ * status is to hand the author something to paste, not just a diagnosis.
+ *
+ * The suggested value is `floorTo1Decimal`-ed — this repo's floor convention, never
+ * rounded to the nearest or up, so a pasted-in-full suggestion is never stricter than
+ * what was actually measured. The line itself carries no trailing comma:
+ * `coverage-risk-baseline.json` is one JSON object, a comma after its LAST entry
+ * breaks it, and this script has no way to know whether the entry being pasted in
+ * will land last — so the message says so explicitly instead of guessing (review
+ * receipt on #714, round 2, P3-3).
+ *
+ * `row.current` is always a `number` for a `'new'` row: `classifyFile` only ever
+ * produces status `'new'` (never `'new-untested'`/`'n/a'`) from a `{ kind:
+ * 'measured' }` classification, and `toBaselineEntry` (called before `evaluate`
+ * ever sees the row) turns that into the rounded percentage this prints.
+ */
+export function formatFailureLine(row: FileRow, baselinePath: string): string {
+  if (row.status === 'new') {
+    const floor = floorTo1Decimal(row.current as number);
+    return (
+      `${row.file}: measured ${fmtEntry(row.current)} but has no coverage floor in ${baselinePath} (new) — ` +
+      `add "${row.file}": ${floor} (append a comma if it is not the last entry in ${baselinePath})`
+    );
+  }
+  return `${row.file}: ${fmtEntry(row.baseline)} -> ${fmtEntry(row.current)} (${row.status})`;
 }
 
 export function renderTable(rows: readonly FileRow[]): string {
@@ -671,23 +767,42 @@ function main(): void {
   const classifications = classifyAll(repoRoot, riskFiles, current);
 
   const baselinePath = path.resolve(repoRoot, options.baseline);
+  // Read BEFORE --write's own writeFileSync below, in both branches: allowNewFor's
+  // `baselineExists` means "did a baseline already exist when this run started", not
+  // "does the fresh one --write is about to produce exist" — a --write run replaces
+  // the file regardless of whether one was already there, and `write: true` alone
+  // already forces `allowNewFor` true either way (review receipt on #714, round 2,
+  // P2-B/P3-1).
+  const baselineExists = fs.existsSync(baselinePath);
+  const allowNew = allowNewFor({ write: options.write, bootstrap: options.bootstrap, baselineExists });
 
   if (options.write) {
     const baseline = buildBaseline(riskFiles, classifications);
     fs.writeFileSync(baselinePath, JSON.stringify(baseline, null, 2) + '\n');
-    const result = evaluate(riskFiles, classifications, baseline, options.threshold);
+    // allowNew is true here unconditionally (`allowNewFor` returns true whenever
+    // `write` is set) — buildBaseline just recorded a floor for every current risk
+    // file (including any that were `new`), so evaluating against that same fresh
+    // baseline never actually produces a `new` row; routing through `allowNewFor`
+    // rather than a literal `true` keeps this call sourced from the same single
+    // predicate the other branch below uses, not a second copy of the rule.
+    const result = evaluate(riskFiles, classifications, baseline, options.threshold, { allowNew });
     printReport(result, options, true);
     return;
   }
 
-  const baselineExists = fs.existsSync(baselinePath);
   const resolution = resolveBaseline(
     baselineExists,
     baselineExists ? fs.readFileSync(baselinePath, 'utf8') : null,
     options.bootstrap,
   );
   if (!resolution.ok) fail(resolution.error);
-  const result = evaluate(riskFiles, classifications, resolution.baseline, options.threshold);
+  // --bootstrap without --write: a preview of what bootstrapping would produce.
+  // allowNewFor suspends `new` only when bootstrap is paired with NO existing
+  // baseline (the one-time initial-baseline case, whose empty baseline would
+  // otherwise fail on every risk file that exists) — `--bootstrap` against an
+  // ALREADY-committed baseline no longer silently suppresses the check (review
+  // receipt on #714, round 2, P3-1).
+  const result = evaluate(riskFiles, classifications, resolution.baseline, options.threshold, { allowNew });
   printReport(result, options, false);
   process.exit(result.passed ? 0 : 1);
 }
@@ -710,9 +825,12 @@ function printReport(result: EvaluateResult, options: Options, wrote: boolean): 
   }
   if (!result.passed) {
     console.log('');
-    console.log(`check-risk-coverage: FAILED — ${result.failures.length} risk file(s) regressed or have no tests:`);
+    console.log(
+      `check-risk-coverage: FAILED — ${result.failures.length} risk file(s) regressed, have no tests, or have no ` +
+        'coverage floor recorded:',
+    );
     for (const row of result.failures) {
-      console.log(`  - ${row.file}: ${fmtEntry(row.baseline)} -> ${fmtEntry(row.current)} (${row.status})`);
+      console.log(`  - ${formatFailureLine(row, options.baseline)}`);
     }
   } else {
     console.log('check-risk-coverage: OK — no risk file dropped below its baseline');
