@@ -116,6 +116,23 @@ MIGRATIONS_PREFIX="XZO-BACKEND/migrations/"
 FREEZE_MARKER_BACKEND="XZO-BACKEND/.render-freeze"
 FREEZE_MARKER_FRONTEND="XZO-FRONTEND/.render-freeze"
 
+# Preview-identity disambiguation (#1536). Render has twice provisioned two
+# services sharing one display name under the same parent (PR #1533, PR
+# #1637); positional `[0]` silently took whichever the API listed first — a
+# wrong-twin suspend POST at the mutating `finish` site, and a browser lane
+# attested against a backend the served frontend never actually calls. Same
+# bundle-extraction technique smoke-build-identity.sh already uses (fetch the
+# served frontend HTML, pull the hashed JS bundle path, fetch the bundle) —
+# reused here as a disambiguation ORACLE rather than a pass/fail check: count
+# each ambiguous backend candidate's host inside the bundle and prefer the one
+# the frontend actually calls. Same knob name pattern as
+# SMOKE_BUILD_ID_BUNDLE_PATTERN so both move together if the shape of Vite's
+# hashed output ever changes; default already includes `-` (base64url content
+# hashes legitimately contain it, e.g. `index-Cg8w-v89.js` — the real #1533
+# bundle name) rather than deferring that gap the way #1366 did.
+BUNDLE_PATTERN="${SMOKE_GATE_BUNDLE_PATTERN:-assets/index-[A-Za-z0-9_-]+\.js}"
+num_env IDENTITY_TIMEOUT SMOKE_GATE_IDENTITY_TIMEOUT 10
+
 # Campaign-size classification: the install supplies a rules file naming
 # which changed paths force the full gauntlet vs. which are UI-only enough to
 # get a light campaign — never agent judgment (two PRs called "low risk" by
@@ -837,11 +854,145 @@ fetch_services() {
   timeout 10 curl -fsS --max-time 10 "https://api.render.com/v1/services?limit=100" 2>/dev/null
 }
 
-find_preview() {
+# Enumerates EVERY match, never just the positional first (#1536's original
+# defect). Returns a JSON array of {id,name,url}, empty when nothing matches.
+find_preview_candidates() {
   local services_json="$1" parent_id="$2" pr="$3"
   jq -c --arg pid "$parent_id" --arg suffix "PR #$pr" '
-    [.[]? | (.service // .) | select(.serviceDetails.parentServer.id == $pid) | select(.name | endswith($suffix))][0] // null
+    [.[]? | (.service // .) | select(.serviceDetails.parentServer.id == $pid) | select(.name | endswith($suffix))
+     | {id:(.id // null), name:(.name // null), url:(.serviceDetails.url // null)}]
   ' <<<"$services_json" 2>/dev/null
+}
+
+# Disambiguation oracle for 2+ backend candidates: fetch the served frontend
+# HTML, extract the hashed JS bundle path (identical technique to
+# smoke-build-identity.sh), fetch the bundle, and count each candidate's host
+# inside it. Prints `{resolved:<candidate>|null, reason:<string>|null}`.
+# `resolved` is non-null ONLY when exactly one candidate's host is referenced
+# and every other candidate's host is not — any other outcome (no frontend url,
+# fetch failure, unextractable bundle path, zero or 2+ candidates referenced)
+# is a refusal with a stated reason. Never guesses.
+resolve_backend_by_bundle() {
+  local frontend_url="$1" candidates_json="$2"
+  local tmp html_file bundle_path bundle_url bundle_file
+
+  if [ -z "$frontend_url" ] || [ "$frontend_url" = "null" ]; then
+    jq -cn '{resolved:null, reason:"no healthy frontend preview URL available to disambiguate against"}'
+    return 0
+  fi
+
+  tmp="$(mktemp -d)"
+  html_file="$tmp/index.html"
+  if ! timeout "$IDENTITY_TIMEOUT" curl -fsS --max-time "$IDENTITY_TIMEOUT" "${frontend_url%/}/" >"$html_file" 2>/dev/null; then
+    rm -rf "$tmp"
+    jq -cn '{resolved:null, reason:"failed to fetch the served frontend HTML to disambiguate"}'
+    return 0
+  fi
+
+  bundle_path="$(grep -oE "$BUNDLE_PATTERN" "$html_file" 2>/dev/null | head -1)"
+  if [ -z "$bundle_path" ]; then
+    rm -rf "$tmp"
+    jq -cn '{resolved:null, reason:"could not extract a JS bundle path from the served frontend HTML"}'
+    return 0
+  fi
+
+  bundle_url="${frontend_url%/}/$bundle_path"
+  bundle_file="$tmp/bundle.js"
+  if ! timeout "$IDENTITY_TIMEOUT" curl -fsS --max-time "$IDENTITY_TIMEOUT" "$bundle_url" >"$bundle_file" 2>/dev/null; then
+    rm -rf "$tmp"
+    jq -cn '{resolved:null, reason:"failed to fetch the served JS bundle to disambiguate"}'
+    return 0
+  fi
+
+  local n idx url host count matched=0 match_json=null
+  n="$(jq 'length' <<<"$candidates_json")"
+  for (( idx=0; idx<n; idx++ )); do
+    url="$(jq -r ".[$idx].url // empty" <<<"$candidates_json")"
+    [ -n "$url" ] || continue
+    host="$(printf '%s' "$url" | sed -E 's#^https?://##; s#/.*$##')"
+    [ -n "$host" ] || continue
+    # `grep -c` prints "0" on stdout AND exits 1 when nothing matched — a
+    # zero count is not a failure, so the fallback only covers a genuine
+    # error (e.g. an unreadable file), never `grep`'s own no-match exit code.
+    count="$(grep -cF -- "$host" "$bundle_file" 2>/dev/null)"
+    [ -n "$count" ] || count=0
+    if [ "$count" -gt 0 ]; then
+      matched=$((matched + 1))
+      match_json="$(jq -c ".[$idx]" <<<"$candidates_json")"
+    fi
+  done
+  rm -rf "$tmp"
+
+  if [ "$matched" -eq 1 ]; then
+    jq -cn --argjson c "$match_json" '{resolved:$c, reason:null}'
+  elif [ "$matched" -eq 0 ]; then
+    jq -cn '{resolved:null, reason:"the served bundle references none of the candidate backend hosts"}'
+  else
+    jq -cn '{resolved:null, reason:"the served bundle references more than one candidate backend host"}'
+  fi
+}
+
+# Resolves ONE backend preview's identity for a PR. Prints
+# `{selected:<candidate>|null, method:"none"|"single"|"bundle-disambiguated"|"ambiguous",
+#   candidates:[...], reason:<string>|null}`.
+# `frontend_url` is the (already-resolved, unambiguous) frontend preview URL,
+# or empty when unavailable — bundle disambiguation is attempted only when
+# there is more than one backend candidate, so an unambiguous PR never touches
+# the network for it.
+resolve_backend_identity() {
+  local services_json="$1" pr="$2" frontend_url="$3"
+  local candidates n disambig resolved reason full_reason
+  candidates="$(find_preview_candidates "$services_json" "$BACKEND_SERVICE" "$pr")"
+  n="$(jq 'length' <<<"$candidates")"
+  if [ "$n" -eq 0 ]; then
+    jq -cn --argjson c "$candidates" '{selected:null, method:"none", candidates:$c, reason:null}'
+    return 0
+  fi
+  if [ "$n" -eq 1 ]; then
+    jq -cn --argjson c "$candidates" '{selected:$c[0], method:"single", candidates:$c, reason:null}'
+    return 0
+  fi
+  disambig="$(resolve_backend_by_bundle "$frontend_url" "$candidates")"
+  resolved="$(jq -c '.resolved' <<<"$disambig")"
+  if [ "$resolved" != null ]; then
+    jq -cn --argjson c "$candidates" --argjson sel "$resolved" \
+      '{selected:$sel, method:"bundle-disambiguated", candidates:$c, reason:null}'
+    return 0
+  fi
+  reason="$(jq -r '.reason // "ambiguous"' <<<"$disambig")"
+  full_reason="$(jq -r --arg pr "$pr" --arg why "$reason" '
+    "refusing to select a backend preview for PR #" + $pr + ": " +
+    (length | tostring) + " services share that name — " +
+    ([.[] | ((.name // "unnamed") + " (" + (.id // "no id") + ")")] | join(", ")) +
+    ". " + $why + " (#1536)."
+  ' <<<"$candidates")"
+  jq -cn --argjson c "$candidates" --arg reason "$full_reason" \
+    '{selected:null, method:"ambiguous", candidates:$c, reason:$reason}'
+}
+
+# Resolves ONE frontend preview's identity for a PR. No disambiguation oracle
+# exists for the frontend side (nothing else calls it to be counted against) —
+# 2+ candidates is an unconditional refusal, per the standing disposition on
+# #1536.
+resolve_frontend_identity() {
+  local services_json="$1" pr="$2"
+  local candidates n full_reason
+  candidates="$(find_preview_candidates "$services_json" "$FRONTEND_SERVICE" "$pr")"
+  n="$(jq 'length' <<<"$candidates")"
+  if [ "$n" -eq 0 ]; then
+    jq -cn --argjson c "$candidates" '{selected:null, method:"none", candidates:$c, reason:null}'
+  elif [ "$n" -eq 1 ]; then
+    jq -cn --argjson c "$candidates" '{selected:$c[0], method:"single", candidates:$c, reason:null}'
+  else
+    full_reason="$(jq -r --arg pr "$pr" '
+      "refusing to select a frontend preview for PR #" + $pr + ": " +
+      (length | tostring) + " services share that name — " +
+      ([.[] | ((.name // "unnamed") + " (" + (.id // "no id") + ")")] | join(", ")) +
+      ". No disambiguation oracle exists for the frontend side (#1536)."
+    ' <<<"$candidates")"
+    jq -cn --argjson c "$candidates" --arg reason "$full_reason" \
+      '{selected:null, method:"ambiguous", candidates:$c, reason:$reason}'
+  fi
 }
 
 latest_live_deploy_sha() {
@@ -899,6 +1050,9 @@ evaluate_pr() {
   local runs_json runs_len ci_total ci_pending ci_failed ci_succeeded ci_ready ci_truncated
   local services_json backend backend_id backend_url backend_deploy_sha backend_ready
   local frontend frontend_id frontend_url frontend_deploy_sha frontend_ready
+  local frontend_identity frontend_method frontend_candidates_json
+  local backend_identity backend_method backend_candidates_json
+  local preview_ambiguous preview_ambiguity_text frontend_evidence_gap FR_REASON
   local healthz_ready settled fetch_ok=true
 
   files_fetch_failed=false
@@ -1103,31 +1257,81 @@ evaluate_pr() {
     services_json='[]'
   fi
 
-  backend="$(find_preview "$services_json" "$BACKEND_SERVICE" "$pr")"
+  # Frontend identity is resolved FIRST and unconditionally — not gated on
+  # frontend_required — for two reasons (#1536): its URL is the disambiguation
+  # oracle backend resolution needs below, and a backend-only PR whose
+  # frontend twin exists is exactly the shape that let #1533 recur unnoticed
+  # (the closed-then-reopened disposition's point 6: frontendPreviewUrl was
+  # null on backend-only PRs, which hid the recurring gap rather than proving
+  # anything).
+  frontend_identity="$(resolve_frontend_identity "$services_json" "$pr")"
+  frontend_method="$(jq -r '.method' <<<"$frontend_identity")"
+  frontend="$(jq -c '.selected' <<<"$frontend_identity")"
+  frontend_candidates_json="$(jq -c '.candidates' <<<"$frontend_identity")"
+  frontend_id=""; frontend_url=""
+  if [ "$frontend" != "null" ]; then
+    frontend_id="$(jq -r '.id // empty' <<<"$frontend")"
+    frontend_url="$(jq -r '.url // empty' <<<"$frontend")"
+  fi
+
+  backend_identity="$(resolve_backend_identity "$services_json" "$pr" "$frontend_url")"
+  backend_method="$(jq -r '.method' <<<"$backend_identity")"
+  backend="$(jq -c '.selected' <<<"$backend_identity")"
+  backend_candidates_json="$(jq -c '.candidates' <<<"$backend_identity")"
   backend_id=""; backend_url=""; backend_deploy_sha=""; backend_ready=false
-  if [ "$backend" != "null" ] && [ -n "$backend" ]; then
+  if [ "$backend" != "null" ]; then
     backend_id="$(jq -r '.id // empty' <<<"$backend")"
-    backend_url="$(jq -r '.serviceDetails.url // empty' <<<"$backend")"
+    backend_url="$(jq -r '.url // empty' <<<"$backend")"
     if [ -n "$backend_id" ]; then
       backend_deploy_sha="$(latest_live_deploy_sha "$backend_id")" || { backend_deploy_sha=""; fetch_ok=false; }
       [ "$backend_deploy_sha" = "$head_sha" ] && backend_ready=true
     fi
   fi
 
+  # Ambiguity is REFUSED, never guessed. Backend ambiguity always blocks
+  # settling (backend_ready can never be proven), so fetch_ok goes false
+  # deliberately — leaving it true would leave backendReady false with no
+  # alarm path, and `poll` would `continue` every cycle forever in silence.
+  # fetch_ok=false routes it through the existing facts-stuck latch instead,
+  # which alarms as pr_facts_unavailable once the stall outlives
+  # SMOKE_GATE_FACTS_STUCK_SECONDS. Frontend ambiguity gets the same treatment
+  # only when the frontend is actually required for this PR to settle —
+  # otherwise a backend-only PR would be blocked by a frontend duplicate it
+  # never needed resolved.
+  preview_ambiguous=false
+  preview_ambiguity_text=""
+  if [ "$backend_method" = "ambiguous" ]; then
+    preview_ambiguous=true
+    fetch_ok=false
+    preview_ambiguity_text="$(jq -r '.reason' <<<"$backend_identity")"
+    printf 'smoke-pr-gate: %s\n' "$preview_ambiguity_text" >&2
+  fi
+
   frontend_ready=true
-  frontend=""; frontend_id=""; frontend_url=""; frontend_deploy_sha=""
+  frontend_deploy_sha=""
   if [ "$frontend_required" = true ]; then
     frontend_ready=false
-    frontend="$(find_preview "$services_json" "$FRONTEND_SERVICE" "$pr")"
-    if [ "$frontend" != "null" ] && [ -n "$frontend" ]; then
-      frontend_id="$(jq -r '.id // empty' <<<"$frontend")"
-      frontend_url="$(jq -r '.serviceDetails.url // empty' <<<"$frontend")"
-      if [ -n "$frontend_id" ]; then
-        frontend_deploy_sha="$(latest_live_deploy_sha "$frontend_id")" || { frontend_deploy_sha=""; fetch_ok=false; }
-        [ "$frontend_deploy_sha" = "$head_sha" ] && frontend_ready=true
+    if [ "$frontend_method" = "ambiguous" ]; then
+      preview_ambiguous=true
+      fetch_ok=false
+      FR_REASON="$(jq -r '.reason' <<<"$frontend_identity")"
+      if [ -n "$preview_ambiguity_text" ]; then
+        preview_ambiguity_text="$preview_ambiguity_text; $FR_REASON"
+      else
+        preview_ambiguity_text="$FR_REASON"
       fi
+      printf 'smoke-pr-gate: %s\n' "$FR_REASON" >&2
+    elif [ -n "$frontend_id" ]; then
+      frontend_deploy_sha="$(latest_live_deploy_sha "$frontend_id")" || { frontend_deploy_sha=""; fetch_ok=false; }
+      [ "$frontend_deploy_sha" = "$head_sha" ] && frontend_ready=true
     fi
   fi
+
+  # A null frontendPreviewUrl is an EVIDENCE GAP, not "not applicable" — the
+  # browser lane's own identity attestation (smoke-build-identity.sh) needs
+  # this URL regardless of whether this PR happened to touch frontend files.
+  frontend_evidence_gap=true
+  [ -n "$frontend_url" ] && frontend_evidence_gap=false
 
   healthz_ready=false
   if [ "$backend_ready" = true ] && healthz_ok "$backend_url"; then
@@ -1158,6 +1362,10 @@ evaluate_pr() {
     --argjson healthzReady "$healthz_ready" --argjson settled "$settled" \
     --argjson migrationFiles "$migration_files" --argjson migrationsDeterminable "$migrations_determinable" \
     --arg campaignSize "$campaign_size" --arg sizeReason "$campaign_size_reason" \
+    --arg backendSelectionMethod "$backend_method" --argjson backendCandidates "$backend_candidates_json" \
+    --arg frontendSelectionMethod "$frontend_method" --argjson frontendCandidates "$frontend_candidates_json" \
+    --argjson previewAmbiguous "$preview_ambiguous" --arg previewAmbiguityReason "$preview_ambiguity_text" \
+    --argjson frontendEvidenceGap "$frontend_evidence_gap" \
     '{
       pr: $pr, headSha: $headSha, fetchOk: $fetchOk,
       migrationsTouched: $migrationsTouched, frontendTouched: $frontendTouched,
@@ -1185,7 +1393,22 @@ evaluate_pr() {
       frontendPreviewUrl: (if $frontendPreviewUrl == "" then null else $frontendPreviewUrl end),
       frontendDeploySha: (if $frontendDeploySha == "" then null else $frontendDeploySha end),
       frontendReady: $frontendReady,
-      healthzReady: $healthzReady, settled: $settled
+      healthzReady: $healthzReady, settled: $settled,
+      # #1536: every backend/frontend match Render returned for this PR
+      # suffix, how the selection was made (single / bundle-disambiguated /
+      # ambiguous / none), and the resulting refusal state. previewAmbiguous
+      # is the RECORDED refusal — a duplicate same-named preview was found and
+      # nothing was guessed from it. It is never inferred from a null id
+      # (that is also what "not created yet" looks like); it is stated here
+      # explicitly instead.
+      backendSelectionMethod: $backendSelectionMethod, backendCandidates: $backendCandidates,
+      frontendSelectionMethod: $frontendSelectionMethod, frontendCandidates: $frontendCandidates,
+      previewAmbiguous: $previewAmbiguous,
+      previewAmbiguityReason: (if $previewAmbiguityReason == "" then null else $previewAmbiguityReason end),
+      # A null frontendPreviewUrl is an evidence gap, not a shrug: the browser
+      # lane cannot attest a build identity without it, whether or not this
+      # PR touched frontend files.
+      frontendEvidenceGap: $frontendEvidenceGap
     }'
 }
 
@@ -1978,8 +2201,24 @@ if [ "$COMMAND" = "finish" ]; then
   SUSPEND_STATUS="null"
   SUSPEND_REASON=""
   if SERVICES_JSON="$(fetch_services)" && jq -e 'type == "array"' <<<"$SERVICES_JSON" >/dev/null 2>&1; then
-    BACKEND_PREVIEW="$(find_preview "$SERVICES_JSON" "$BACKEND_SERVICE" "$PR")"
-    if [ "$BACKEND_PREVIEW" != "null" ] && [ -n "$BACKEND_PREVIEW" ]; then
+    # THE mutating site (#1536) — a wrong-twin pick here POSTs suspend against
+    # a service nobody chose. Same candidate-enumeration + bundle-oracle
+    # resolution as evaluate_pr, so this site can never disagree with what a
+    # coordinator was told during the campaign.
+    FINISH_FRONTEND_IDENTITY="$(resolve_frontend_identity "$SERVICES_JSON" "$PR")"
+    FINISH_FRONTEND_URL="$(jq -r '.selected.url // empty' <<<"$FINISH_FRONTEND_IDENTITY")"
+    BACKEND_IDENTITY="$(resolve_backend_identity "$SERVICES_JSON" "$PR" "$FINISH_FRONTEND_URL")"
+    BACKEND_METHOD="$(jq -r '.method' <<<"$BACKEND_IDENTITY")"
+    BACKEND_PREVIEW="$(jq -c '.selected' <<<"$BACKEND_IDENTITY")"
+    if [ "$BACKEND_METHOD" = "ambiguous" ]; then
+      # On ambiguity: attempt nothing, record why. finish itself still
+      # completes and writes its verdict — suspend has always been
+      # best-effort here (every other failure mode below only records a
+      # reason too), and stranding the run would be a worse, newer failure
+      # than one preview left running until a human picks.
+      SUSPEND_REASON="$(jq -r '.reason' <<<"$BACKEND_IDENTITY")"
+      printf 'smoke-pr-gate: %s\n' "$SUSPEND_REASON" >&2
+    elif [ "$BACKEND_PREVIEW" != "null" ]; then
       BACKEND_PREVIEW_ID="$(jq -r '.id // empty' <<<"$BACKEND_PREVIEW")"
       if [ -n "$BACKEND_PREVIEW_ID" ]; then
         SUSPEND_ATTEMPTED=true
@@ -2629,9 +2868,21 @@ while IFS= read -r ROW; do
     continue
   fi
 
+  # #1603: a SHA this gate already finished, and whose backend preview this
+  # gate's own `finish` therefore suspended, keeps reporting backendReady:true
+  # (the deploy is still the right SHA) with healthzReady:false (503 Service
+  # Suspended — by design, not an outage). That is not a stuck warm-up; it is
+  # this gate's own prior suspend still in effect. Checked BEFORE the warmup
+  # alarm fires — four consecutive campaigns (#1560, #1600, #1617, #1644) cost
+  # a wake and a container spawn each to manually distinguish "our gate
+  # suspended this" from a real stuck warm-up, with the alarm's inputs
+  # unchanged across all four. COMPLETED_SHA is read once here and reused
+  # below rather than duplicating the same jq read.
+  COMPLETED_SHA="$(jq -r '.completedSha // empty' <<<"$STATE")"
   HEALTHZ_READY="$(jq -r '.healthzReady' <<<"$FACTS")"
   WARMUP_ALERT_SHA="$(jq -r '.warmupAlertSha // empty' <<<"$STATE")"
-  if [ "$BACKEND_READY" = true ] && [ "$HEALTHZ_READY" != true ] && [ "$WARMUP_ALERT_SHA" != "$HEAD_SHA" ]; then
+  if [ "$BACKEND_READY" = true ] && [ "$HEALTHZ_READY" != true ] && \
+     [ "$WARMUP_ALERT_SHA" != "$HEAD_SHA" ] && [ "$COMPLETED_SHA" != "$HEAD_SHA" ]; then
     LIVE_SINCE_EPOCH="$(epoch_or_zero "$(jq -r '.deployLiveSince // empty' <<<"$STATE")")"
     if [ "$LIVE_SINCE_EPOCH" -gt 0 ] && [ "$(( NOW_EPOCH - LIVE_SINCE_EPOCH ))" -ge "$WARMUP_TIMEOUT" ]; then
       jq -cn --argjson pr "$PR" --arg sha "$HEAD_SHA" '{pr:$pr,sha:$sha,subtype:"warmup"}' >> "$ALARM_CANDIDATES"
@@ -2642,7 +2893,6 @@ while IFS= read -r ROW; do
   SETTLED="$(jq -r '.settled' <<<"$FACTS")"
   [ "$SETTLED" = true ] || continue
 
-  COMPLETED_SHA="$(jq -r '.completedSha // empty' <<<"$STATE")"
   [ "$COMPLETED_SHA" != "$HEAD_SHA" ] || continue
 
   ACTIVE_SHA="$(jq -r '.activeSha // empty' <<<"$STATE")"
