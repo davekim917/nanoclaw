@@ -6,6 +6,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { allowSubprocess, enforceHermeticity } from '../src/test-hermeticity.js';
+import { scaledTimeout } from '../src/test-timeout-scale.js';
 
 allowSubprocess(['git']);
 enforceHermeticity();
@@ -401,21 +402,33 @@ describe('docs/review-notes.md', () => {
   });
 
   // #730 P3: fix 1 (an unresolvable pinned sha is a problem in a full clone)
-  // must not turn a real, historical pin into a false failure in CI's own
-  // shallow checkout (.github/workflows/ci.yml: actions/checkout@v4, no
-  // fetch-depth override, so depth 1) — proved against a real `--depth 1`
-  // clone of this repo, not a synthetic fixture.
-  it('cites paths and file:lines that still pass in a shallow clone', () => {
-    const shallow = fs.mkdtempSync(path.join(os.tmpdir(), 'review-notes-shallow-'));
-    try {
-      spawnSync('git', ['clone', '-q', '--depth', '1', `file://${REPO_ROOT}`, shallow]);
-      expect((gitRead(shallow, ['rev-parse', '--is-shallow-repository']) ?? '').trim()).toBe('true'); // sanity
-      const shallowNotes = fs.readFileSync(path.join(shallow, 'docs', 'review-notes.md'), 'utf8');
-      expect(reviewNotesProblems(shallowNotes, undefined, shallow)).toEqual([]);
-    } finally {
-      fs.rmSync(shallow, { recursive: true, force: true });
-    }
-  });
+  // must not turn a real, historical pin into a false failure in a genuinely
+  // shallow checkout — proved against a real `--depth 1` clone of this repo,
+  // not a synthetic fixture. `.github/workflows/ci.yml`'s `correctness` job
+  // (this test's own job) now uses `fetch-depth: 0` (#730 P3 round 3), but
+  // `bookkeeping`'s checkout, a contributor's default local clone, and this
+  // host's own (shallow from the upstream ratchet pin) all still can be, so
+  // the shallow-clone path stays covered here regardless of any one job's depth.
+  //
+  // ~1.5-2s locally (real git subprocess work: clone, read, no mocking) —
+  // comfortably below vitest's 5000ms default today, but close enough that a
+  // loaded runner could push it over and flake; scaledTimeout keeps headroom
+  // and stays correct under `--coverage`'s multiplier too.
+  it(
+    'cites paths and file:lines that still pass in a shallow clone',
+    () => {
+      const shallow = fs.mkdtempSync(path.join(os.tmpdir(), 'review-notes-shallow-'));
+      try {
+        spawnSync('git', ['clone', '-q', '--depth', '1', `file://${REPO_ROOT}`, shallow]);
+        expect((gitRead(shallow, ['rev-parse', '--is-shallow-repository']) ?? '').trim()).toBe('true'); // sanity
+        const shallowNotes = fs.readFileSync(path.join(shallow, 'docs', 'review-notes.md'), 'utf8');
+        expect(reviewNotesProblems(shallowNotes, undefined, shallow)).toEqual([]);
+      } finally {
+        fs.rmSync(shallow, { recursive: true, force: true });
+      }
+    },
+    scaledTimeout(15_000),
+  );
 });
 
 describe('reviewNotesProblems', () => {
