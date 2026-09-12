@@ -75,9 +75,13 @@ deferred one, and it is the kind that used to go unrecorded.
 `codex-review.sh merge-check` refuses without one (exit 24,
 `review_notes_missing`), and `audit` re-checks it as of the merge. A line
 inside a code fence or an HTML comment doesn't count, and the reason is one
-parenthesised phrase, nothing after it on the line, with a visible character
-and no zero-width or other format character. Deferring a finding to an issue,
-or reverting a PR, adds a line too.
+parenthesised phrase, nothing after it on the line, with at least one visible
+character. Zero-width space, soft hyphen, zero-width joiner, and other Unicode
+format characters are allowed inside an otherwise-visible reason; a reason
+left with nothing but those, whitespace, control characters, bare combining
+marks, or a handful of blank-looking codepoints (U+2800, U+3164, U+115F,
+U+1160, U+FFA0) once they're stripped is refused. Deferring a finding to an
+issue, or reverting a PR, adds a line too.
 
 When this rule, or any merge-check rule, changes on main, re-extract the gate
 before the next merge. A PR merged through a skill copy extracted before the
