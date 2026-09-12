@@ -159,13 +159,26 @@ function gitRead(root: string, args: string[]): string | null {
  */
 function gitPathExists(root: string, filePath: string, rev?: string): boolean {
   if (rev === undefined)
-    return spawnSync('git', ['ls-files', '--error-unmatch', '--', filePath], { cwd: root }).status === 0;
+    // --literal-pathspecs (#730 P3): ls-files otherwise treats `filePath` as a
+    // pathspec, so a citation shaped like a glob (`scripts/*.test.ts`) or a
+    // single-char wildcard (`docs/review-notes.m?`) passes existence just by
+    // matching some other tracked file — this repo's own `pathspec quoting`
+    // class (docs/review-notes.md:67).
+    return (
+      spawnSync('git', ['--literal-pathspecs', 'ls-files', '--error-unmatch', '--', filePath], { cwd: root })
+        .status === 0
+    );
   return spawnSync('git', ['cat-file', '-e', `${rev}:${filePath}`], { cwd: root }).status === 0;
 }
 
 /** True when `sha` resolves to a real commit object in `root`'s repo — false in a checkout too shallow to have it. */
 function gitCommitResolvable(root: string, sha: string): boolean {
   return spawnSync('git', ['cat-file', '-e', `${sha}^{commit}`], { cwd: root }).status === 0;
+}
+
+/** True when `root`'s repo is a shallow clone (a partial history, missing most commit objects) — the only case an unresolvable pinned sha is expected, not a typo (#730 P3). */
+function gitIsShallowRepo(root: string): boolean {
+  return (gitRead(root, ['rev-parse', '--is-shallow-repository']) ?? '').trim() === 'true';
 }
 
 /** `filePath`'s line count at `rev` in `root`'s repo, or null when it can't be read there. Omit `rev` to read the index (see gitPathExists). */
@@ -204,15 +217,23 @@ function citationExistenceProblems(fix: string, root: string): string[] {
       if (!gitCommitResolvable(root, pinnedSha)) {
         // A shallow CI checkout (.github/workflows/ci.yml uses actions/checkout@v4
         // with no fetch-depth override, so depth 1) cannot resolve most historical
-        // shas at all. Checking the path at HEAD as a fallback (as this used to)
-        // fails a citation that was correct at its own pinned commit but whose file
-        // has since been deleted — this checker cannot validate a citation against
-        // a commit it was never pinned to, so it skips it instead (#713 P3), noting
-        // that in the test log rather than failing or silently passing it.
-        console.warn(
-          `review-notes: skipping \`${file}:${span}\` at ${pinnedSha} — that commit is not resolvable in ` +
-            'this checkout (likely a shallow clone); not checked',
-        );
+        // shas at all — the *only* case an unresolvable sha is expected, not a
+        // mistake. Skipping unconditionally here (#730 P3 regression) let a
+        // typo'd `at <sha>` silently exempt a wrong line, or a citation to a
+        // file that never existed, even in a full clone that could have
+        // caught it. So only a genuinely shallow repo skips (with a test-log
+        // note, never checking the path at HEAD as a fallback — a citation
+        // correct at its own pinned commit but whose file has since been
+        // deleted must not fail only there); a full clone that simply cannot
+        // resolve the sha treats that as the problem it is.
+        if (gitIsShallowRepo(root)) {
+          console.warn(
+            `review-notes: skipping \`${file}:${span}\` at ${pinnedSha} — that commit is not resolvable in ` +
+              'this checkout (a shallow clone); not checked',
+          );
+          continue;
+        }
+        problems.push(`cites \`${file}:${span}\` at ${pinnedSha}, but ${pinnedSha} does not resolve to a commit here`);
         continue;
       }
       if (!gitPathExists(root, file, pinnedSha)) {
@@ -378,6 +399,23 @@ describe('docs/review-notes.md', () => {
   it('cites paths and file:lines that actually exist at HEAD', () => {
     expect(reviewNotesProblems(fs.readFileSync(NOTES_PATH, 'utf8'), undefined, REPO_ROOT)).toEqual([]);
   });
+
+  // #730 P3: fix 1 (an unresolvable pinned sha is a problem in a full clone)
+  // must not turn a real, historical pin into a false failure in CI's own
+  // shallow checkout (.github/workflows/ci.yml: actions/checkout@v4, no
+  // fetch-depth override, so depth 1) — proved against a real `--depth 1`
+  // clone of this repo, not a synthetic fixture.
+  it('cites paths and file:lines that still pass in a shallow clone', () => {
+    const shallow = fs.mkdtempSync(path.join(os.tmpdir(), 'review-notes-shallow-'));
+    try {
+      spawnSync('git', ['clone', '-q', '--depth', '1', `file://${REPO_ROOT}`, shallow]);
+      expect((gitRead(shallow, ['rev-parse', '--is-shallow-repository']) ?? '').trim()).toBe('true'); // sanity
+      const shallowNotes = fs.readFileSync(path.join(shallow, 'docs', 'review-notes.md'), 'utf8');
+      expect(reviewNotesProblems(shallowNotes, undefined, shallow)).toEqual([]);
+    } finally {
+      fs.rmSync(shallow, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('reviewNotesProblems', () => {
@@ -513,6 +551,15 @@ describe('citation existence, checked only when a root is given (#707 P3-d)', ()
     spawnSync('git', ['add', '-A'], { cwd: root });
     spawnSync('git', ['commit', '-q', '--allow-empty', '-m', message, '--no-gpg-sign'], { cwd: root });
     return (gitRead(root, ['rev-parse', 'HEAD']) ?? '').trim();
+  }
+
+  /** A real `--depth 1` clone of `root`'s current HEAD — the one case gitCommitResolvable is expected to answer false for an otherwise-real, historical sha (#730 P3). `git clone` accepts an existing, empty destination directory. */
+  function shallowCloneOf(root: string): string {
+    const clone = tempRoot();
+    spawnSync('git', ['clone', '-q', '--depth', '1', `file://${root}`, clone]);
+    spawnSync('git', ['config', 'user.email', 'test@example.com'], { cwd: clone });
+    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: clone });
+    return clone;
   }
 
   it('fails a structural fix citing a backtick path that does not exist', () => {
@@ -682,41 +729,66 @@ describe('citation existence, checked only when a root is given (#707 P3-d)', ()
     ]);
   });
 
-  // #713 P3: a citation pinned to a sha this checkout cannot resolve (as in a
-  // shallow CI checkout — .github/workflows/ci.yml uses actions/checkout@v4
-  // with no fetch-depth override, so depth 1) must not fail spuriously.
+  // #730 P3: an unresolvable pinned sha is a problem in a full clone — this
+  // checker is never entitled to a free pass just because a sha it can look
+  // up doesn't exist. Skipping unconditionally (as this used to) let a
+  // typo'd `at <sha>` silently exempt a wrong line, and a full clone has
+  // every commit it will ever have: there is nothing left to fetch that
+  // would make the sha resolve later.
+  it('fails a typo\'d pin against a wrong line, in a full clone', () => {
+    const root = gitRoot();
+    fs.writeFileSync(path.join(root, 'a.ts'), 'one\ntwo\nthree\n');
+    commit(root);
+    const typo = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'; // well-formed, but no such commit anywhere
+    const text = notes(['alpha'], [`- 2026-09-01 · #1 · alpha · A lesson · fixed at \`a.ts:99\` at ${typo}`]);
+    expect(reviewNotesProblems(text, TODAY, root)).toEqual([
+      expect.stringMatching(new RegExp(`cites \`a\\.ts:99\` at ${typo}, but ${typo} does not resolve to a commit here`)),
+    ]);
+  });
+
+  // #730 P3: the regression this class exists for — a typo'd pin against a
+  // citation to a file that never existed used to be silently exempted too.
+  it('fails a typo\'d pin against a missing file, in a full clone', () => {
+    const root = gitRoot();
+    commit(root);
+    const typo = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
+    const text = notes(['alpha'], [`- 2026-09-01 · #1 · alpha · A lesson · fixed at \`no/such.ts:1\` at ${typo}`]);
+    expect(reviewNotesProblems(text, TODAY, root)).toEqual([
+      expect.stringMatching(
+        new RegExp(`cites \`no/such\\.ts:1\` at ${typo}, but ${typo} does not resolve to a commit here`),
+      ),
+    ]);
+  });
+
+  // #730 P3: the one case an unresolvable pinned sha is expected, not a
+  // mistake — a genuinely shallow checkout (CI's: .github/workflows/ci.yml
+  // uses actions/checkout@v4 with no fetch-depth override, so depth 1)
+  // cannot resolve a real, historical commit at all. A real `--depth 1`
+  // clone proves it, rather than asserting on a merely well-formed sha that
+  // was never a commit anywhere (that case is the full-clone tests above).
   // Checking the path at HEAD as a fallback (as this used to) fails a
   // citation that was correct at its own pinned commit but whose file has
   // since been deleted, and that failure would show up only in CI, never
   // locally — so it is skipped entirely instead, with a note in the test log.
-  it('skips a pinned citation whose sha cannot be resolved here, never checking its path at HEAD', () => {
-    const root = gitRoot();
-    fs.writeFileSync(path.join(root, 'a.ts'), 'one\ntwo\nthree\n');
-    commit(root);
-    const unresolvable = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'; // well-formed, but no such commit here
+  it('skips a pinned citation whose sha a shallow clone genuinely cannot resolve', () => {
+    const full = gitRoot();
+    fs.writeFileSync(path.join(full, 'a.ts'), 'one\n');
+    const oldSha = commit(full, 'old'); // pruned by the shallow clone below
+    fs.writeFileSync(path.join(full, 'a.ts'), 'one\ntwo\n');
+    commit(full, 'new'); // depth 1 keeps only this commit
+    const shallow = shallowCloneOf(full);
+
+    // Sanity: the clone really is shallow, and really cannot resolve oldSha —
+    // otherwise every assertion below would pass for the wrong reason.
+    expect(gitIsShallowRepo(shallow)).toBe(true);
+    expect(gitCommitResolvable(shallow, oldSha)).toBe(false);
+
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-
-    const inBounds = notes(['alpha'], [`- 2026-09-01 · #1 · alpha · A lesson · fixed at \`a.ts:1\` at ${unresolvable}`]);
-    expect(reviewNotesProblems(inBounds, TODAY, root)).toEqual([]);
-
-    // Out of bounds at HEAD, and there is no other commit to check it
-    // against — still not a problem, because it is never checked at all.
-    const outOfBounds = notes(['alpha'], [`- 2026-09-01 · #1 · alpha · A lesson · fixed at \`a.ts:999\` at ${unresolvable}`]);
-    expect(reviewNotesProblems(outOfBounds, TODAY, root)).toEqual([]);
-
-    // The file does not exist at HEAD at all — the "deleted since" case this
-    // behavior exists for — and it must still not fail: the old fallback
-    // would have reported it missing here, which is exactly the "fails only
-    // in CI" bug (a full local checkout resolves the sha and never takes this
-    // path at all; only a shallow one, like CI's, reaches this branch).
-    const missing = notes(['alpha'], [`- 2026-09-01 · #1 · alpha · A lesson · fixed at \`no/such.ts:1\` at ${unresolvable}`]);
-    expect(reviewNotesProblems(missing, TODAY, root)).toEqual([]);
-
-    expect(warn).toHaveBeenCalledTimes(3);
-    for (const [message] of warn.mock.calls) {
-      expect(message).toContain(unresolvable);
-      expect(message).toMatch(/not resolvable/);
-    }
+    const text = notes(['alpha'], [`- 2026-09-01 · #1 · alpha · A lesson · fixed at \`a.ts:1\` at ${oldSha}`]);
+    expect(reviewNotesProblems(text, TODAY, shallow)).toEqual([]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain(oldSha);
+    expect(warn.mock.calls[0][0]).toMatch(/not resolvable/);
     warn.mockRestore();
   });
 
@@ -746,6 +818,28 @@ describe('citation existence, checked only when a root is given (#707 P3-d)', ()
       expect.stringMatching(/cites `untracked\.ts:2`, but untracked\.ts does not exist/),
     ]);
   });
+
+  // #730 P3: index existence went through a raw git pathspec, so a citation
+  // shaped like a glob or a `?` wildcard passed just by matching some other
+  // tracked file — this repo's own `pathspec quoting` class
+  // (docs/review-notes.md:67). None of these three name a real file.
+  it.each(['scripts/*.test.ts', 'src/**/*.ts', 'docs/review-notes.m?'])(
+    'fails a citation shaped like a pathspec glob or wildcard: %s',
+    (span) => {
+      const root = gitRoot();
+      fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
+      fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+      fs.mkdirSync(path.join(root, 'docs'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'scripts', 'foo.test.ts'), 'x\n'); // would match `scripts/*.test.ts`
+      fs.writeFileSync(path.join(root, 'src', 'thing.ts'), 'x\n'); // would match `src/**/*.ts`
+      fs.writeFileSync(path.join(root, 'docs', 'review-notes.md'), 'x\n'); // would match `docs/review-notes.m?`
+      commit(root);
+      const text = notes(['alpha'], [`- 2026-09-01 · #1 · alpha · A lesson · see \`${span}\``]);
+      expect(reviewNotesProblems(text, TODAY, root)).toEqual([
+        expect.stringMatching(new RegExp(`cites \\\`${span.replace(/[.*?+^${}()|[\]\\]/g, '\\$&')}\\\`, which does not exist`)),
+      ]);
+    },
+  );
 
   // #713 P3: pinning is now "at <sha> immediately follows the citation (or an
   // unbroken run of citations it belongs to)", not "shares a clause with it" —

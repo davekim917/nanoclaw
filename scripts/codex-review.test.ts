@@ -2214,19 +2214,34 @@ function headTakingSubcommands(source: string): string[] {
   return headTakingNames(lines, discoverArmBlocks(lines));
 }
 
-// Any case-arm pattern, anywhere in the file, that names --head as one of its
-// alternatives: `--head)`, `-H|--head)`, `--head|--sha)`, or a same-line arm
-// (`--head) head="$2"; shift 2 ;;`) — independent of whether the narrow
-// discovery above found the function it lives in. Anchored on the pattern
-// starting the line (after indentation) so it never matches --head appearing
-// inside a string, a comment, or a usage message (`grep -n -- '--head'
-// codex-review.sh` confirms every real match today is one of the four bare
-// `--head)` case arms this file already covers).
-const HEAD_CASE_PATTERN_RE = /^\s*(?:[\w.*-]+\|)*--head(?:\|[\w.*-]+)*\)/;
+// A comment line never counts, whichever shape below it happens to resemble
+// — `#`, after only leading whitespace, is never code.
+const COMMENT_LINE_RE = /^\s*#/;
+
+// A case-arm pattern, anywhere in the file, that names --head as one of its
+// alternatives: `--head)`, `-H|--head)`, `--head|--sha)`, a same-line arm
+// (`--head) head="$2"; shift 2 ;;`), a quoted arm (`"--head")`, `'--head')`),
+// spaces around `|` (`-H | --head)`), or an optional leading `(`
+// (`(--head)`, bash's alternate case-pattern spelling) — independent of
+// whether the narrow discovery above found the function it lives in.
+// Anchored on the pattern starting the line (after indentation) so it never
+// matches --head appearing inside a string or a usage message.
+const HEAD_CASE_ARM_RE =
+  /^\s*\(?(?:['"]?[\w.*-]+['"]?\s*\|\s*)*['"]?--head['"]?(?:\s*\|\s*['"]?[\w.*-]+['"]?)*\)/;
+
+// A flag-equality test naming --head, anywhere on the line (unlike a case
+// arm, the test is rarely the first token — `if `/`elif ` usually is):
+// `[ "$1" = --head ]`, `[[ "$1" == --head ]]`, quoted or bare.
+const HEAD_EQUALITY_TEST_RE = /={1,2}\s*['"]?--head['"]?\s*['"]?\s*\]/;
+
+function lineNamesHeadPattern(line: string): boolean {
+  if (COMMENT_LINE_RE.test(line)) return false;
+  return HEAD_CASE_ARM_RE.test(line) || HEAD_EQUALITY_TEST_RE.test(line);
+}
 
 function findHeadCasePatternLines(lines: string[]): number[] {
   const found: number[] = [];
-  for (let i = 0; i < lines.length; i++) if (HEAD_CASE_PATTERN_RE.test(lines[i])) found.push(i);
+  for (let i = 0; i < lines.length; i++) if (lineNamesHeadPattern(lines[i])) found.push(i);
   return found;
 }
 
@@ -2345,6 +2360,50 @@ describe('the cross-check catches each shape that could let a --head parser esca
     );
     expect(mutated).not.toBe(realSource);
     expect(unattributedHeadPatternLines(mutated).length).toBeGreaterThan(0);
+  });
+
+  // #730 P3: these five prove the *broad scan* itself (findHeadCasePatternLines)
+  // sees a shape, not just that a seen shape gets attributed correctly — each
+  // appends a brand-new, never-dispatched-to helper containing the shape, so
+  // it is unattributed by construction *if the scan finds it at all*. A scan
+  // blind to the shape would report the same (empty) result as the pristine
+  // script, silently passing; these fail on that regression.
+  it('catches a double-quoted arm ("--head") a bare-string match misses', () => {
+    const mutated = `${realSource}\nunrelated_helper() {\n  case "$1" in\n    "--head") shift 2 ;;\n  esac\n}\n`;
+    expect(unattributedHeadPatternLines(mutated).length).toBeGreaterThan(0);
+  });
+
+  it("catches a single-quoted arm ('--head') a bare-string match misses", () => {
+    const mutated = `${realSource}\nunrelated_helper() {\n  case "$1" in\n    '--head') shift 2 ;;\n  esac\n}\n`;
+    expect(unattributedHeadPatternLines(mutated).length).toBeGreaterThan(0);
+  });
+
+  it('catches a space-joined flag alias ("-H | --head)") a no-space match misses', () => {
+    const mutated = `${realSource}\nunrelated_helper() {\n  case "$1" in\n    -H | --head) shift 2 ;;\n  esac\n}\n`;
+    expect(unattributedHeadPatternLines(mutated).length).toBeGreaterThan(0);
+  });
+
+  it('catches a paren-prefixed arm ("(--head)") the unparenthesized pattern misses', () => {
+    const mutated = `${realSource}\nunrelated_helper() {\n  case "$1" in\n    (--head) shift 2 ;;\n  esac\n}\n`;
+    expect(unattributedHeadPatternLines(mutated).length).toBeGreaterThan(0);
+  });
+
+  it('catches a flag-equality test ([ "$1" = --head ]) a case-arm-only match misses', () => {
+    const mutated = `${realSource}\nunrelated_helper() {\n  if [ "$1" = --head ]; then shift 2; fi\n}\n`;
+    expect(unattributedHeadPatternLines(mutated).length).toBeGreaterThan(0);
+  });
+
+  it('catches a double-bracket flag-equality test ([[ "$1" == --head ]])', () => {
+    const mutated = `${realSource}\nunrelated_helper() {\n  if [[ "$1" == --head ]]; then shift 2; fi\n}\n`;
+    expect(unattributedHeadPatternLines(mutated).length).toBeGreaterThan(0);
+  });
+
+  // Comment lines never count, whichever shape they resemble — otherwise a
+  // mention of --head in prose would itself be an (unattributed) false
+  // positive on every doc comment naming it.
+  it('does not flag --head mentioned only in a comment', () => {
+    const mutated = `${realSource}\n# case "$1" in\n#   "--head") shift 2 ;;\n# esac\n`;
+    expect(unattributedHeadPatternLines(mutated)).toEqual([]);
   });
 });
 
