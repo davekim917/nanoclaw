@@ -114,8 +114,20 @@ set -u
 [ -n "${STUB_SERVICES+x}" ] || STUB_SERVICES='[]'
 [ -n "${STUB_BACKEND_DEPLOYS+x}" ] || STUB_BACKEND_DEPLOYS='[]'
 [ -n "${STUB_FRONTEND_DEPLOYS+x}" ] || STUB_FRONTEND_DEPLOYS='[]'
+# #1536 bundle-disambiguation oracle fixtures. Only exercised when the gate
+# actually has 2+ backend candidates to disambiguate — every pre-existing
+# scenario has 0 or 1, so these never fire outside the new tests below.
+[ -n "${STUB_FRONTEND_HTML_EXIT+x}" ] || STUB_FRONTEND_HTML_EXIT=0
+[ -n "${STUB_FRONTEND_HTML+x}" ] || STUB_FRONTEND_HTML='<html><body><script type="module" src="/assets/index-ABC123.js"></script></body></html>'
+[ -n "${STUB_BUNDLE_EXIT+x}" ] || STUB_BUNDLE_EXIT=0
+[ -n "${STUB_BUNDLE_JS+x}" ] || STUB_BUNDLE_JS=''
 ARGS="$*"
 if printf '%s' "$ARGS" | grep -qF '/suspend'; then
+  # Receipt of every suspend POST that actually went out, so a test can
+  # assert a refusal issued NONE rather than inferring it from a status field.
+  if [ -n "${STUB_SUSPEND_LOG:-}" ]; then
+    printf '%s\n' "$ARGS" >> "$STUB_SUSPEND_LOG"
+  fi
   # Lock probe: `finish` must have RELEASED the PR state lock before it got
   # here, so a concurrent process can take it. Recorded free/held for the
   # caller to assert on.
@@ -147,6 +159,16 @@ if printf '%s' "$ARGS" | grep -qF '/deploys'; then
 fi
 if printf '%s' "$ARGS" | grep -qF '/services?limit'; then
   printf '%s' "$STUB_SERVICES"; exit 0
+fi
+# #1536: the bundle-disambiguation oracle's two fetches. Bundle path checked
+# first (it also lives under the same onrender.com host as the frontend root).
+if printf '%s' "$ARGS" | grep -qE '\.js($| )'; then
+  [ "$STUB_BUNDLE_EXIT" = 0 ] || exit "$STUB_BUNDLE_EXIT"
+  printf '%s' "$STUB_BUNDLE_JS"; exit 0
+fi
+if printf '%s' "$ARGS" | grep -qE 'onrender\.com/?( |$)'; then
+  [ "$STUB_FRONTEND_HTML_EXIT" = 0 ] || exit "$STUB_FRONTEND_HTML_EXIT"
+  printf '%s' "$STUB_FRONTEND_HTML"; exit 0
 fi
 echo '{}'; exit 0
 STUB
@@ -189,7 +211,8 @@ reset_stubs() {
         STUB_HEALTHZ_CODE STUB_SERVICES STUB_BACKEND_DEPLOYS STUB_FRONTEND_DEPLOYS \
         STUB_COMPARE_FILES STUB_COMPARE_EXIT STUB_LOCK_PROBE STUB_LOCK_PROBE_FILE \
         STUB_STATE_PROBE STUB_STATE_PROBE_FILE STUB_SUSPEND_SLEEP STUB_REPO_VIEW_EXIT \
-        STUB_LEDGER_JQ_EMPTY_FILE \
+        STUB_LEDGER_JQ_EMPTY_FILE STUB_SUSPEND_LOG \
+        STUB_FRONTEND_HTML_EXIT STUB_FRONTEND_HTML STUB_BUNDLE_EXIT STUB_BUNDLE_JS \
         SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER \
         SMOKE_GATE_OWNER SMOKE_GATE_LEASE_TTL_SECONDS 2>/dev/null || true
 }
@@ -1560,6 +1583,222 @@ bash "$GATE" check 301 | jq -e '
   .sizeReason == "full: backend/migrations/1_x.sql matched backend/migrations/**"
 ' >/dev/null
 unset STUB_PARENT_SHA STUB_COMPARE_FILES SMOKE_SIZING_RULES
+
+# =============================================================================
+# #1536 / #1603 — preview-identity disambiguation and the post-finish warm-up
+# false alarm. Render has twice provisioned two services sharing one display
+# name under the same parent (PR #1533, PR #1637); the gate used to take
+# whichever the API listed first. These fixtures pin: candidate enumeration,
+# bundle-based backend disambiguation, unconditional refusal (never a guess)
+# when disambiguation cannot resolve to exactly one candidate, the frontend
+# evidence-gap field, the SAME resolution at the mutating `finish`/suspend
+# site, and that a preview this gate itself suspended after finishing never
+# re-alarms as a stuck warm-up.
+
+# --- 33. Backend disambiguated via the served frontend bundle: exactly one
+# candidate's host is referenced, so it is preferred over the other and
+# settling proceeds normally — no ambiguity recorded.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+D_SHA="$(sha 2)"
+export STUB_PR_VIEW="{\"number\":80,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$D_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$D_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[\
+{\"id\":\"srv-frontend-pr-80\",\"name\":\"XZO-DEV-FRONTEND PR #80\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://xzo-dev-frontend-pr-80.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-80-a\",\"name\":\"XZO-DEV-BACKEND PR #80\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-80-a.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-80-b\",\"name\":\"XZO-DEV-BACKEND PR #80\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-80-b.onrender.com\"}}]"
+export STUB_FRONTEND_HTML='<html><body><script type="module" src="/assets/index-Cg8w-v89.js"></script></body></html>'
+export STUB_BUNDLE_JS='fetch("https://xzo-dev-backend-pr-80-b.onrender.com/api")'
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$D_SHA\"}}]"
+export STUB_FRONTEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$D_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+D_CHECK="$(bash "$GATE" check 80)"
+jq -e '
+  .previewAmbiguous == false and .previewAmbiguityReason == null and
+  .backendSelectionMethod == "bundle-disambiguated" and
+  .backendPreviewId == "srv-backend-pr-80-b" and
+  .backendPreviewUrl == "https://xzo-dev-backend-pr-80-b.onrender.com" and
+  (.backendCandidates | length) == 2 and
+  .frontendEvidenceGap == false and .settled == true
+' <<<"$D_CHECK" >/dev/null || { echo "33: bundle disambiguation did not prefer the referenced host: $D_CHECK" >&2; exit 1; }
+
+# --- 34. Backend still ambiguous: the served bundle references NEITHER
+# candidate host. Refused, not guessed — no id/url selected, fetchOk false so
+# the stall is loud (routes through the existing facts-stuck alarm) rather
+# than silently retried forever, and the reason names both candidates.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+N_SHA="$(sha 3)"
+export STUB_PR_VIEW="{\"number\":81,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$N_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$N_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[\
+{\"id\":\"srv-frontend-pr-81\",\"name\":\"XZO-DEV-FRONTEND PR #81\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://xzo-dev-frontend-pr-81.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-81-a\",\"name\":\"XZO-DEV-BACKEND PR #81\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-81-a.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-81-b\",\"name\":\"XZO-DEV-BACKEND PR #81\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-81-b.onrender.com\"}}]"
+export STUB_FRONTEND_HTML='<html><body><script type="module" src="/assets/index-Cg8w-v89.js"></script></body></html>'
+export STUB_BUNDLE_JS='fetch("/api/local")'
+N_ERR="$STATE_DIR/n-check-stderr.txt"
+N_CHECK="$(bash "$GATE" check 81 2>"$N_ERR")"
+jq -e '
+  .previewAmbiguous == true and .backendSelectionMethod == "ambiguous" and
+  (.previewAmbiguityReason | test("PR #81")) and
+  (.previewAmbiguityReason | test("srv-backend-pr-81-a")) and
+  (.previewAmbiguityReason | test("srv-backend-pr-81-b")) and
+  (.previewAmbiguityReason | test("none of the candidate backend hosts")) and
+  .backendPreviewId == null and .backendPreviewUrl == null and
+  .backendReady == false and .settled == false and .fetchOk == false
+' <<<"$N_CHECK" >/dev/null || { echo "34: bundle-referencing-neither did not refuse: $N_CHECK" >&2; exit 1; }
+grep -qF 'srv-backend-pr-81-a' "$N_ERR" || { echo "34: refusal was not reported on stderr" >&2; cat "$N_ERR" >&2; exit 1; }
+# ...and this stall is LOUD: with the facts-stall window at zero, it alarms as
+# pr_facts_unavailable rather than silently retrying forever. Two calls, same
+# shape as test 17 above: the first records factsStuckSince (no alarm — the
+# window has not elapsed by wall-clock yet), the second's elapsed-time check
+# (NOW_EPOCH - factsStuckSince >= 0) is then measured strictly after that
+# timestamp was written, never racing it within one invocation.
+export STUB_PR_LIST="[{\"number\":81,\"headRefOid\":\"$N_SHA\",\"headRefName\":\"feature/x\"}]"
+SMOKE_GATE_FACTS_STUCK_SECONDS=3600 bash "$GATE" poll 2>/dev/null | jq -e '.wakeAgent == false' >/dev/null \
+  || { echo "34-poll: expected the first stall to be silent (inside the window)" >&2; exit 1; }
+SMOKE_GATE_FACTS_STUCK_SECONDS=0 bash "$GATE" poll 2>/dev/null | jq -e '
+  .wakeAgent == true and .data.trigger == "pr_facts_unavailable" and .data.pr == 81
+' >/dev/null || { echo "34-poll: ambiguity did not surface as an alarm" >&2; exit 1; }
+
+# --- 35. Backend ambiguous with NO frontend preview to disambiguate against —
+# the frontend evidence gap and the backend ambiguity are BOTH recorded, and
+# the reason names the missing oracle rather than silently doing nothing.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+G_SHA="$(sha 4)"
+export STUB_PR_VIEW="{\"number\":82,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$G_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$G_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[\
+{\"id\":\"srv-backend-pr-82-a\",\"name\":\"XZO-DEV-BACKEND PR #82\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-82-a.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-82-b\",\"name\":\"XZO-DEV-BACKEND PR #82\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-82-b.onrender.com\"}}]"
+G_CHECK="$(bash "$GATE" check 82 2>/dev/null)"
+jq -e '
+  .previewAmbiguous == true and
+  (.previewAmbiguityReason | test("no healthy frontend preview URL")) and
+  .frontendEvidenceGap == true and .frontendPreviewUrl == null and
+  .backendPreviewId == null and .settled == false
+' <<<"$G_CHECK" >/dev/null || { echo "35: missing-oracle case did not record both gaps: $G_CHECK" >&2; exit 1; }
+
+# --- 36. Frontend evidence gap on an ordinary backend-only PR: a single,
+# unambiguous backend still settles normally, but the ABSENCE of any frontend
+# preview for this PR is now stated explicitly rather than left to be
+# inferred from "not required".
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+E_SHA="$(sha 5)"
+export STUB_PR_VIEW="{\"number\":83,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$E_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$E_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-83\",\"name\":\"XZO-DEV-BACKEND PR #83\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-83.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$E_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+E_CHECK="$(bash "$GATE" check 83 2>/dev/null)"
+jq -e '
+  .frontendRequired == false and .frontendEvidenceGap == true and
+  .frontendPreviewUrl == null and .previewAmbiguous == false and
+  .backendSelectionMethod == "single" and .settled == true and .fetchOk == true
+' <<<"$E_CHECK" >/dev/null || { echo "36: backend-only PR did not record the frontend evidence gap: $E_CHECK" >&2; exit 1; }
+
+# --- 37. THE mutating site: `finish` refuses to suspend an ambiguous backend
+# (same bundle-oracle resolution as evaluate_pr, applied at the suspend call
+# site). No suspend POST is issued at all, the reason is written into the
+# durable verdict receipt, and finish still completes rather than stranding
+# the run.
+fresh_state
+F_SHA="$(sha 6)"
+export STUB_SUSPEND_LOG="$STATE_DIR/suspend-posts-37.log"
+: > "$STUB_SUSPEND_LOG"
+bash "$GATE" claim run-amb-finish 84 "$F_SHA" >/dev/null
+export STUB_SERVICES="[\
+{\"id\":\"srv-frontend-pr-84\",\"name\":\"XZO-DEV-FRONTEND PR #84\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://xzo-dev-frontend-pr-84.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-84-a\",\"name\":\"XZO-DEV-BACKEND PR #84\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-84-a.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-84-b\",\"name\":\"XZO-DEV-BACKEND PR #84\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-84-b.onrender.com\"}}]"
+export STUB_FRONTEND_HTML='<html><body>no module script here</body></html>'
+export STUB_SUSPEND_CODE=202
+F_ERR="$STATE_DIR/f-finish-stderr.txt"
+bash "$GATE" finish "$F_SHA" run-amb-finish GO 2>"$F_ERR" | jq -e --arg sha "$F_SHA" '
+  .ok == true and .verdict == "GO" and .pr == 84 and .sha == $sha and
+  .suspend.attempted == false and .suspend.ok == false and
+  .suspend.httpStatus == null and
+  (.suspend.reason | test("PR #84")) and
+  (.suspend.reason | test("srv-backend-pr-84-a")) and
+  (.suspend.reason | test("srv-backend-pr-84-b")) and
+  (.suspend.reason | test("could not extract a JS bundle path"))
+' >/dev/null || { echo "37: finish did not refuse the ambiguous suspend" >&2; exit 1; }
+[ ! -s "$STUB_SUSPEND_LOG" ] || { echo "37: a suspend POST was issued against an ambiguous preview:" >&2; cat "$STUB_SUSPEND_LOG" >&2; exit 1; }
+jq -e '.suspend.attempted == false and (.suspend.reason | test("srv-backend-pr-84-a"))' \
+  "$STATE_DIR/pr-84-verdict.json" >/dev/null \
+  || { echo "37: the durable verdict receipt did not record the refusal" >&2; exit 1; }
+jq -e --arg sha "$F_SHA" '.completedSha == $sha and .activeSha == null' "$STATE_DIR/pr-84-state.json" >/dev/null \
+  || { echo "37: the refusal stranded the run instead of completing it" >&2; exit 1; }
+grep -qF 'srv-backend-pr-84-a' "$F_ERR" || { echo "37: suspend refusal was not reported on stderr" >&2; cat "$F_ERR" >&2; exit 1; }
+
+# --- 38. THE mutating site, positive case: `finish` disambiguates via the
+# bundle and suspends the CORRECT twin — a real POST hits the wire, targeting
+# the candidate the served frontend actually calls, not whichever the API
+# happened to list first.
+fresh_state
+S_SHA="$(sha 7)"
+export STUB_SUSPEND_LOG="$STATE_DIR/suspend-posts-38.log"
+: > "$STUB_SUSPEND_LOG"
+bash "$GATE" claim run-disambig-finish 85 "$S_SHA" >/dev/null
+export STUB_SERVICES="[\
+{\"id\":\"srv-frontend-pr-85\",\"name\":\"XZO-DEV-FRONTEND PR #85\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://xzo-dev-frontend-pr-85.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-85-a\",\"name\":\"XZO-DEV-BACKEND PR #85\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-85-a.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-85-b\",\"name\":\"XZO-DEV-BACKEND PR #85\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-85-b.onrender.com\"}}]"
+export STUB_FRONTEND_HTML='<html><body><script type="module" src="/assets/index-Dw8AA3y4.js"></script></body></html>'
+export STUB_BUNDLE_JS='fetch("https://xzo-dev-backend-pr-85-a.onrender.com/api")'
+export STUB_SUSPEND_CODE=202
+bash "$GATE" finish "$S_SHA" run-disambig-finish GO | jq -e '
+  .ok == true and .suspend.attempted == true and .suspend.ok == true and
+  .suspend.httpStatus == 202 and .suspend.reason == null
+' >/dev/null || { echo "38: bundle-disambiguated finish did not suspend" >&2; exit 1; }
+[ "$(wc -l < "$STUB_SUSPEND_LOG")" -eq 1 ] || { echo "38: expected exactly one suspend POST, got $(wc -l < "$STUB_SUSPEND_LOG")" >&2; exit 1; }
+grep -qF 'srv-backend-pr-85-a/suspend' "$STUB_SUSPEND_LOG" \
+  || { echo "38: the suspend POST did not target the bundle-referenced twin:" >&2; cat "$STUB_SUSPEND_LOG" >&2; exit 1; }
+
+# --- 39. #1603: a preview THIS GATE ITSELF SUSPENDED after finishing never
+# re-alarms as pr_warmup_stuck. Real completedSha==headSha state, produced by
+# an actual finish call (not hand-crafted), then a poll cycle whose facts show
+# backendReady:true (deploy sha still matches) and healthzReady:false (503
+# Service Suspended — by design). Four consecutive campaigns (#1560, #1600,
+# #1617, #1644) burned a wake and a container spawn each on exactly this.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+W_SHA="$(sha 8)"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-86\",\"name\":\"XZO-DEV-BACKEND PR #86\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-86.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$W_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+bash "$GATE" claim run-warmup-finish 86 "$W_SHA" >/dev/null
+export STUB_SUSPEND_CODE=202
+bash "$GATE" finish "$W_SHA" run-warmup-finish GO | jq -e '.ok == true and .suspend.ok == true' >/dev/null \
+  || { echo "39: setup finish call failed" >&2; exit 1; }
+jq -e --arg sha "$W_SHA" '.completedSha == $sha and .activeRunId == null' "$STATE_DIR/pr-86-state.json" >/dev/null \
+  || { echo "39: setup did not leave the expected completed state" >&2; exit 1; }
+# The suspended preview now 503s. Same headSha, same STUB_PR_FILES/RUN_LIST
+# (evaluate_pr re-fetches them fresh every poll) as a plain settled PR would
+# use, but healthz now reports the suspension.
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$W_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_HEALTHZ_CODE=503
+export STUB_PR_LIST="[{\"number\":86,\"headRefOid\":\"$W_SHA\",\"headRefName\":\"feature/x\"}]"
+# First poll: records deployLiveSince (freshly, as "now") — same reason test
+# 34-poll above needs two calls, so the warm-up window has actually elapsed
+# by wall-clock before the second poll checks it, rather than racing within
+# one invocation.
+bash "$GATE" poll >/dev/null
+SMOKE_GATE_WARMUP_TIMEOUT=0 bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger != "pr_warmup_stuck"' >/dev/null \
+  || { echo "39: a gate-suspended preview re-alarmed as pr_warmup_stuck" >&2; exit 1; }
 
 # --- 31. Glob-translation unit cases: **, {a,b}, and a single * that does not
 # cross `/`. Exercised directly against campaign-size-classify.py so a glob

@@ -708,6 +708,13 @@ max effort. Use the `agent-browser` skill.
   evidence is unproved.
 - Capture the feeding request, response status/body summary, URL, visible state,
   and console/network errors. A screenshot alone rarely proves root cause.
+  **Any `agent-browser network requests`/`request`/`har stop` output that will
+  touch disk — evidence file, run dir, chat, log — goes through
+  `/app/skills/agent-browser/scripts/ab-net-redact.sh` first, never a raw
+  redirect or a raw `har stop <path>`.** Its `headers`/`cookies`/`har stop`
+  output all carry live `Authorization`/`Cookie` values verbatim; a bearer
+  token or session cookie that reaches a shared path this way is burned same
+  as a credential typed into chat.
 - Wait for the request and UI to settle. Use bounded polling; never infer failure
   from one fixed sleep. On timeout, preserve the timed-out state as evidence.
 - Compare equivalent workflows and working sibling modules when they exist.
@@ -1713,7 +1720,44 @@ seam and semantics as the develop gate — one readiness command run once per
 poll, immediately before a settled candidate is actually claimed), and
 `SMOKE_GATE_WARMUP_TIMEOUT` (default 600s — a backend stuck past this long
 without a healthy `/healthz` after going `live` raises one throttled
-`pr_warmup_stuck` alarm instead of polling silently forever).
+`pr_warmup_stuck` alarm instead of polling silently forever — but never for a
+SHA this gate's own `finish` already completed and suspended: `finish`
+suspending its preview by design produces the identical
+backendReady-true/healthzReady-false shape, and is checked first).
+
+**Preview identity is never a positional pick.** Render has provisioned two
+services sharing one display name under the same parent more than once (a
+`renderer` retry, a stale service left behind) — `check`/`poll` facts carry
+`backendCandidates` / `frontendCandidates` (every match, not just the first),
+`backendSelectionMethod` / `frontendSelectionMethod` (`none` / `single` /
+`bundle-disambiguated` / `ambiguous`), and `previewAmbiguous` /
+`previewAmbiguityReason`. On exactly one match, selection is unchanged. On
+2+ backend candidates, the gate fetches the served frontend HTML, extracts
+the hashed JS bundle path (`SMOKE_GATE_BUNDLE_PATTERN`, same technique and
+knob-naming as `smoke-build-identity.sh`'s `SMOKE_BUILD_ID_BUNDLE_PATTERN` —
+this one's default already accepts the `-` that base64url content hashes
+legitimately contain, e.g. `index-Cg8w-v89.js`; `SMOKE_BUILD_ID_BUNDLE_PATTERN`
+still lacks it, tracked separately as #1366), fetches the bundle, and prefers
+whichever candidate's host the
+bundle actually references — but ONLY when that resolves to exactly one
+candidate. Any other outcome (no frontend URL to check against, the fetch
+failing, the bundle naming zero or 2+ candidates) is a REFUSAL: no id/url is
+selected, `fetchOk` goes false so the stall alarms as `pr_facts_unavailable`
+rather than retrying forever in silence, and `previewAmbiguityReason` names
+every colliding service. There is no oracle for a frontend-side duplicate —
+2+ frontend candidates is always a refusal. The exact same resolution runs at
+the mutating `finish`/suspend call site, so a wrong-twin pick can never POST
+`.../suspend` against a service nobody chose; on ambiguity there, `finish`
+attempts no suspend, records the reason in the verdict receipt, and still
+completes rather than stranding the run. `SMOKE_GATE_IDENTITY_TIMEOUT`
+(default 10s) bounds each disambiguation fetch.
+
+A `frontendEvidenceGap: true` fact marks a null `frontendPreviewUrl` as a
+gap in the evidence available for browser-lane build-identity attestation
+(`smoke-build-identity.sh` needs that URL), not a silent "not applicable" —
+the frontend preview is now looked up on every PR regardless of whether its
+diff touched `XZO-FRONTEND/`, since the disambiguation oracle above needs it
+even on a backend-only PR.
 
 Full design and the live Render verification behind every rule above:
 `groups/_ops/specs/fleet-hardening/phase5-preview-envs.md`.

@@ -134,7 +134,9 @@ function resolvedScanPolicyRepositoryNames(): readonly string[] | null {
       loggedScanPolicyLoadFailure = true;
       log(
         'scan-policy-repos.json failed to load or has an invalid shape; failing closed — every repo name is ' +
-          'treated as scan-policy (pinned to worktree mode, every leftover clone refused) until the container restarts.',
+          'treated as scan-policy (pinned to worktree mode, every leftover clone refused). The file comes from the ' +
+          "host's read-only boot snapshot of this source, so a container restart alone re-reads the same broken " +
+          'file; repair the file and restart the host.',
       );
     }
   }
@@ -173,12 +175,26 @@ function effectiveCheckoutModeFor(repo: string): CheckoutMode {
  * ever scanned by the host-managed pre-push hook (#666-follow-up) — it must
  * be removed, never served or pushed from, so re-running create_worktree is
  * the only way forward.
+ *
+ * `repo` here may be scan-policy for either of two reasons, and the caller
+ * cannot tell them apart without asking: the list loaded fine and genuinely
+ * names `repo` (normal case — say nothing extra), or the list failed to load
+ * and `isScanPolicyRepositoryName` is fail-closed treating EVERY repo as
+ * scan-policy (#691). In the second case the wiki-shaped wording above names
+ * the wrong cause — the real cause, the failed load, is otherwise visible
+ * only in the MCP server's stderr (`resolvedScanPolicyRepositoryNames`'s
+ * one-time log) — so this appends a hint pointing the operator at the host.
  */
 function scanPolicyCloneLeftoverMessage(repo: string, checkoutPath: string): string {
-  return (
+  const base =
     `${checkoutPath} is a clone of '${repo}' left over from a clone-mode period and is not secret-scanned on push. ` +
     'Remove it without pushing anything from it, then re-run create_worktree to get a linked worktree that shares ' +
-    "the canonical's scan hook."
+    "the canonical's scan hook.";
+  if (resolvedScanPolicyRepositoryNames() !== null) return base;
+  return (
+    `${base} (This refusal may not mean '${repo}' is actually scan-policy: the scan-policy repository list failed ` +
+    "to load, so every repo is being treated as scan-policy as a fail-closed default. Check the host's logs, " +
+    'repair the file, and restart the host.'
   );
 }
 
@@ -343,19 +359,11 @@ function contextFor(repo: string): RepositoryContext {
   if (!contained(canonical, repositoriesRoot) || !contained(worktree, topicRoot)) {
     throw new Error('repository path escapes its trusted host root');
   }
-  if (!fs.existsSync(gitDir) || !fs.lstatSync(gitDir).isDirectory() || fs.lstatSync(gitDir).isSymbolicLink()) {
-    throw new Error(`canonical repository metadata is unavailable for ${repo}`);
-  }
-  if (runGitDir(gitDir, ['rev-parse', '--is-bare-repository'], 10_000) !== 'false') {
-    throw new Error(`canonical repository is not a normal clone: ${repo}`);
-  }
-  const pin = readPin(pinPath);
-  const configuredOrigin = tryGitDir(gitDir, ['config', '--get', 'remote.origin.url'], 10_000);
-  if (pin.kind === 'local-only') {
-    if (configuredOrigin !== null) throw new Error(`local-only canonical unexpectedly has an origin for ${repo}`);
-  } else if (configuredOrigin === null || normalizeOrigin(configuredOrigin) !== normalizeOrigin(pin.origin)) {
-    throw new Error(`canonical origin does not match the host origin pin for ${repo}`);
-  }
+  // The transfer check comes before every canonical check. The spawn withholds
+  // the canonical `.git` from a topic whose checkout was transferred away
+  // (src/container-runner.ts:4481), so checking `.git` first answered "metadata
+  // is unavailable" to exactly the topic this refusal exists for, and agents
+  // read that as "never published" and re-ran clone_repo (#705).
   const workUnitId = createHash('sha256').update(`${workgroupId}\0${workUnitKey}`).digest('hex').slice(0, 32);
   const tombstonePath = path.join(stateRoot, 'transfers', `${workUnitId}.json`);
   if (fs.existsSync(tombstonePath)) {
@@ -369,9 +377,23 @@ function contextFor(repo: string): RepositoryContext {
       throw new Error('repository transfer tombstone identity mismatch');
     }
     throw new Error(
-      `This topic's ${repo} worktree was transferred to ${tombstone.destinationWorkUnitKey}; ` +
-        'the source topic may not silently recreate it',
+      `This topic's ${repo} checkout was transferred to ${tombstone.destinationWorkUnitKey}, so this topic may ` +
+        `not recreate it. The workgroup already has ${repo}: do not run clone_repo. Continue in that topic, or ` +
+        "ask an operator to clear this topic's transfer record.",
     );
+  }
+  if (!fs.existsSync(gitDir) || !fs.lstatSync(gitDir).isDirectory() || fs.lstatSync(gitDir).isSymbolicLink()) {
+    throw new Error(`canonical repository metadata is unavailable for ${repo}`);
+  }
+  if (runGitDir(gitDir, ['rev-parse', '--is-bare-repository'], 10_000) !== 'false') {
+    throw new Error(`canonical repository is not a normal clone: ${repo}`);
+  }
+  const pin = readPin(pinPath);
+  const configuredOrigin = tryGitDir(gitDir, ['config', '--get', 'remote.origin.url'], 10_000);
+  if (pin.kind === 'local-only') {
+    if (configuredOrigin !== null) throw new Error(`local-only canonical unexpectedly has an origin for ${repo}`);
+  } else if (configuredOrigin === null || normalizeOrigin(configuredOrigin) !== normalizeOrigin(pin.origin)) {
+    throw new Error(`canonical origin does not match the host origin pin for ${repo}`);
   }
   return { workgroupId, workUnitKey, dataDir, topicRoot, repo, canonical, gitDir, lockPath, pinPath, worktree, pin };
 }
@@ -1188,11 +1210,40 @@ async function createCloneWorktree(context: RepositoryContext, branch: string | 
   );
 }
 
+/**
+ * clone_repo's answer for a repository the workgroup already had when this
+ * container started, or null when there is none. The spawn mounts every
+ * canonical's transfers directory before any per-topic withhold
+ * (src/container-runner.ts:4474-4480), so that directory proves the canonical
+ * exists even where its `.git` is withheld. Publishing it again would drain
+ * every container in the workgroup and change nothing (#705).
+ */
+function alreadyPublishedAnswer(repo: string, requestedOrigin: string): ToolResult | null {
+  const dataDir = process.env.NANOCLAW_HOST_DATA_DIR ?? '';
+  const workgroupId = process.env.NANOCLAW_WORKGROUP_ID ?? '';
+  if (!path.isAbsolute(dataDir)) return null;
+  if (!fs.existsSync(path.join(dataDir, 'repository-state', workgroupId, repo, 'transfers'))) return null;
+  let context: RepositoryContext;
+  try {
+    context = contextFor(repo);
+  } catch (error) {
+    return err(
+      `The workgroup already has ${repo}, so clone_repo cannot help: ` +
+        (error instanceof Error ? error.message : String(error)),
+    );
+  }
+  // GitHub owner and repository names are case-insensitive.
+  if (context.pin.origin === null || context.pin.origin.toLowerCase() !== requestedOrigin.toLowerCase()) {
+    return err(`The workgroup already has a repository named ${repo} from a different origin; choose another name.`);
+  }
+  return ok(`The workgroup already has ${repo}; nothing was cloned or published. Call create_worktree for a checkout.`);
+}
+
 export const cloneRepoTool: McpToolDefinition = {
   tool: {
     name: 'clone_repo',
     description:
-      "Clone a GitHub repository through this container's scoped identity, then durably publish one host-owned canonical clone for the workgroup. Idempotent when name, origin, and repository identity match.",
+      "Clone a GitHub repository through this container's scoped identity, then durably publish one host-owned canonical clone for the workgroup. Publishing restarts every container in the workgroup. When the workgroup already has this repository, it returns at once without cloning or publishing: use create_worktree for a checkout, and never call clone_repo to work around a create_worktree error.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1230,6 +1281,8 @@ export const cloneRepoTool: McpToolDefinition = {
     if (nameError) return err(nameError);
     const workgroupId = process.env.NANOCLAW_WORKGROUP_ID ?? '';
     if (validateSegment(workgroupId, 'workgroup id')) return err('repository workgroup context is unavailable');
+    const published = alreadyPublishedAnswer(repo, normalizedUrl);
+    if (published) return published;
 
     const requestId = `repo-${Date.now()}-${randomBytes(8).toString('hex')}`;
     const stageRoot = path.join('/workspace', 'repository-staging', requestId);

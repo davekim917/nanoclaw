@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { execFileSync } from 'child_process';
-import { randomBytes } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import {
   chmodSync,
   existsSync,
@@ -740,6 +740,72 @@ describe('topic-linked worktree topology', () => {
     }
   });
 
+  // #705: a transfer tombstone withholds the canonical `.git` from its source
+  // topic at spawn (src/container-runner.ts:4481), so that topic's container
+  // sees the repository's transfers directory and its own tombstone, and no
+  // canonical at all.
+  function transferAway(repo: string, destinationWorkUnitKey: string): void {
+    const workUnitKey = process.env.NANOCLAW_WORK_UNIT_KEY!;
+    const workUnitId = createHash('sha256').update(`wg-a\0${workUnitKey}`).digest('hex').slice(0, 32);
+    const transfers = join(dataDir, 'repository-state', 'wg-a', repo, 'transfers');
+    mkdirSync(transfers, { recursive: true });
+    writeFileSync(
+      join(transfers, `${workUnitId}.json`),
+      JSON.stringify({
+        version: 1,
+        phase: 'moved',
+        workgroupId: 'wg-a',
+        repo,
+        sourceWorkUnitKey: workUnitKey,
+        destinationWorkUnitKey,
+      }),
+    );
+  }
+
+  test('create_worktree in a transferred-away topic names the transfer, not missing metadata (#705)', async () => {
+    transferAway('moved', 'thread:slack:C1:9.9');
+    const response = await createWorktreeTool.handler({ repo: 'moved' });
+    expect(response.isError).toBe(true);
+    expect(response.content[0].text).toContain('transferred to thread:slack:C1:9.9');
+    expect(response.content[0].text).toContain('do not run clone_repo');
+    expect(response.content[0].text).not.toContain('metadata is unavailable');
+  });
+
+  test('clone_repo answers for a canonical this container can see instead of publishing it again (#705)', async () => {
+    const published = seedNamedCanonical('pub');
+    git(published, ['remote', 'set-url', 'origin', 'https://github.com/example/pub']);
+    const state = join(dataDir, 'repository-state', 'wg-a', 'pub');
+    writeFileSync(
+      join(state, 'origin.json'),
+      JSON.stringify({ origin: 'https://github.com/example/pub', repositoryId: 'github.com/example/pub' }),
+    );
+    mkdirSync(join(state, 'transfers'), { recursive: true });
+    transferAway('moved', 'thread:slack:C1:9.9');
+
+    const stagingRoot = '/workspace/repository-staging';
+    const before = existsSync(stagingRoot) ? readdirSync(stagingRoot).sort() : [];
+    const { outbound } = initTestSessionDb();
+    delete process.env.NANOCLAW_REPOSITORY_ACTION_TRANSPORT;
+    try {
+      const same = await cloneRepoTool.handler({ url: 'https://github.com/Example/pub.git' });
+      expect(same.isError).toBeFalsy();
+      expect(same.content[0].text).toContain('already has pub');
+
+      const otherOrigin = await cloneRepoTool.handler({ url: 'https://github.com/someone-else/pub' });
+      expect(otherOrigin.isError).toBe(true);
+      expect(otherOrigin.content[0].text).toContain('different origin');
+
+      const transferred = await cloneRepoTool.handler({ url: 'https://github.com/example/moved' });
+      expect(transferred.isError).toBe(true);
+      expect(transferred.content[0].text).toContain('transferred to thread:slack:C1:9.9');
+
+      expect(outbound.query('SELECT content FROM messages_out').all()).toEqual([]);
+      expect(existsSync(stagingRoot) ? readdirSync(stagingRoot).sort() : []).toEqual(before);
+    } finally {
+      closeSessionDb();
+    }
+  });
+
   // ── Branch clones (docs/specs/repository-branch-clones/plan.md §5.2-§5.3) ──
   //
   // repository_checkout is a host action (owned by the lead / host builder,
@@ -816,7 +882,10 @@ describe('topic-linked worktree topology', () => {
     function installManagedScanHook(canonicalPath: string): string {
       const hooksDir = join(dataDir, 'managed-git-hooks', 'scan');
       mkdirSync(hooksDir, { recursive: true });
-      writeFileSync(join(hooksDir, 'nanoclaw-secret-patterns.sh'), readFileSync(join(REPO_ROOT, 'scripts', 'lib', 'secret-scan.sh')));
+      writeFileSync(
+        join(hooksDir, 'nanoclaw-secret-patterns.sh'),
+        readFileSync(join(REPO_ROOT, 'scripts', 'lib', 'secret-scan.sh')),
+      );
       writeFileSync(join(hooksDir, 'pre-push'), readFileSync(join(REPO_ROOT, 'scripts', 'wiki-pre-push-hook.sh')));
       chmodSync(join(hooksDir, 'pre-push'), 0o755);
       git(canonicalPath, ['config', 'core.hooksPath', hooksDir]);
@@ -1289,6 +1358,10 @@ describe('topic-linked worktree topology', () => {
           expect(created.isError).toBe(true);
           expect(created.content[0].text).toContain('left over from a clone-mode period');
           expect(created.content[0].text).toContain('not secret-scanned on push');
+          // The real scan-policy-repos.json loaded fine here (no override is
+          // active), so this is a genuine wiki refusal, not a fail-closed
+          // guess — the #691 load-failure hint must not be tacked on.
+          expect(created.content[0].text.toLowerCase()).not.toContain('failed to load');
         }
 
         // Still a clone (its own independent .git directory) at the primary
@@ -1387,6 +1460,48 @@ describe('topic-linked worktree topology', () => {
         expect(pr.content[0].text).toContain('not secret-scanned on push');
       } finally {
         fakeGh.restore();
+      }
+    });
+
+    test('a non-wiki leftover-clone refusal names the load failure, not the wiki cause, when the scan-policy list fails to load (#691)', async () => {
+      // 'proj' (the describe block's default seeded repo, see seedCanonical
+      // in beforeEach) is NOT in the real scan-policy-repos.json — only
+      // 'wiki' is. Forcing the list to fail to load makes
+      // isScanPolicyRepositoryName fail closed for 'proj' too (every repo
+      // name, not just 'wiki'), so its leftover clone at the primary position
+      // is refused exactly the way a real scan-policy repo's would be.
+      // Before this fix, that refusal reused the wiki-shaped wording
+      // verbatim — naming a cause ('left over from a clone-mode period') that
+      // is true of the checkout shape but not of *why* 'proj' was refused;
+      // the real cause (the failed list load) was visible only in the MCP
+      // server's stderr.
+      const clonePath = join(firstTopic, 'proj');
+      createHostClone(remote, clonePath, { repo: 'proj', branch: 'main', startedFrom: 'origin-head' });
+
+      const scratchDir = mkdtempSync(join(tmpdir(), 'gw-scan-policy-hint-'));
+      initTestSessionDb();
+      try {
+        resetScanPolicyRepositoryNamesForTest(join(scratchDir, 'does-not-exist.json'));
+        expect(isScanPolicyRepositoryName('proj')).toBe(true); // fail-closed sanity check
+
+        const created = await createWorktreeTool.handler({ repo: 'proj' });
+        expect(created.isError).toBe(true);
+        const text = created.content[0].text;
+        // The shape-level wording is unchanged...
+        expect(text).toContain('left over from a clone-mode period');
+        expect(text).toContain('not secret-scanned on push');
+        // ...but the real cause is now named, with a pointer at the host.
+        expect(text.toLowerCase()).toContain('scan-policy repository list failed');
+        expect(text.toLowerCase()).toContain('failed');
+        expect(text.toLowerCase()).toContain('to load');
+        expect(text.toLowerCase()).toContain('restart the host');
+      } finally {
+        // Restore the real list before this describe block's later tests run
+        // — several of them (the wiki tests above aside) rely on 'proj' NOT
+        // being scan-policy under the real scan-policy-repos.json.
+        resetScanPolicyRepositoryNamesForTest();
+        rmSync(scratchDir, { recursive: true, force: true });
+        closeSessionDb();
       }
     });
 
@@ -1783,6 +1898,12 @@ describe('isScanPolicyRepositoryName fail-closed behavior (#682 round 2 blocking
         (args) => typeof args[0] === 'string' && args[0].includes('scan-policy-repos.json failed to load'),
       );
       expect(failureLogs.length).toBe(1);
+      // #691: the list file is the host's read-only boot snapshot of this
+      // very source (src/agent-runner-source.ts), so a container restart
+      // alone re-reads the same broken file — the log must point at
+      // restarting the HOST, not the container.
+      expect(String(failureLogs[0]?.[0])).toContain('restart the host');
+      expect(String(failureLogs[0]?.[0])).not.toContain('container restarts');
     } finally {
       errorSpy.mockRestore();
     }

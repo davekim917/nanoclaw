@@ -112,6 +112,7 @@ import {
   defaultTopicBranch,
   isWorkgroupRepositoryMountClaimed,
   listTopicCheckouts,
+  originPinPath,
   readCheckoutInheritedTags,
   readTransferTombstone,
   resolveRepositoryWorkUnit,
@@ -363,7 +364,9 @@ describe('durable canonical publication core', () => {
         requester,
       ),
     ).rejects.toThrow(/repository identity does not match normalized origin/);
-    expect(hostActionMocks.releaseRepositoryMountQuiescence).toHaveBeenCalledTimes(1);
+    // Refused before the drain (#697): nothing was quiesced, so nothing needs releasing.
+    expect(hostActionMocks.quiesceSessionsForRepositoryMounts).not.toHaveBeenCalled();
+    expect(hostActionMocks.releaseRepositoryMountQuiescence).not.toHaveBeenCalled();
     expect(hostActionMocks.wakeRepositoryMountSessions).toHaveBeenCalledWith([requester]);
     expect(fs.existsSync(path.join(stage, '.git'))).toBe(true);
     expect(fs.existsSync(canonicalRepoDir('wg-forged-action', repo, hostActionDataDir))).toBe(false);
@@ -399,6 +402,36 @@ describe('durable canonical publication core', () => {
       repositoryId: `github.com/example/${repo}`,
     });
     expect(JSON.stringify(pin)).not.toContain('.git');
+  });
+
+  it('a re-publish matches an existing canonical whose pin holds the legacy URL-form identity (#697)', async () => {
+    const repo = 'legacy-identity';
+    const origin = `https://github.com/Example/${repo}`;
+    const stage = path.join(root, 'sessions', 'sess-a', 'repository-staging', 'request-legacy', repo);
+    cloneTo(stage);
+    git(stage, ['remote', 'set-url', 'origin', origin]);
+    await publishStagedCanonical({
+      workgroupId: 'wg-a',
+      repo,
+      origin,
+      repositoryId: `github.com/Example/${repo}`,
+      stagingPath: stage,
+      dataDir: root,
+    });
+    // Rewrite the pin as repository activation stored it: the origin URL as the identity.
+    fs.writeFileSync(originPinPath('wg-a', repo, root), `${JSON.stringify({ origin, repositoryId: origin })}\n`, {
+      mode: 0o600,
+    });
+
+    const republished = await publishStagedCanonical({
+      workgroupId: 'wg-a',
+      repo,
+      origin,
+      repositoryId: `github.com/example/${repo}`,
+      stagingPath: path.join(root, 'no-staging', repo),
+      dataDir: root,
+    });
+    expect(republished.status).toBe('existing');
   });
 
   it('clone-is-idempotent-and-conflicting-origin-rejects', async () => {
@@ -709,6 +742,56 @@ describe('durable canonical publication core', () => {
 
     expect(hostActionMocks.releaseRepositoryMountQuiescence).not.toHaveBeenCalled();
     expect(lifecycle).toEqual(['partial-kill', 'failure-notice', 'wake']);
+    expect(fs.existsSync(path.join(stage, '.git'))).toBe(true);
+  });
+
+  it('refuses a publish the existing canonical cannot match before draining the workgroup (#697)', async () => {
+    const requestId = 'repo-1723600000000-0123456789abcdef';
+    const requester = {
+      id: 'session-requester',
+      agent_group_id: 'agent-a',
+      messaging_group_id: 'messaging-a',
+      thread_id: '171234.567',
+      agent_provider: 'claude',
+      status: 'active',
+      container_status: 'running',
+      last_active: null,
+      created_at: new Date().toISOString(),
+    } satisfies Session;
+    hostActionMocks.getAgentGroup.mockReturnValue({ id: 'agent-a', folder: 'agent-a', workgroup_id: 'wg-a' });
+    hostActionMocks.getAllAgentGroups.mockReturnValue([{ id: 'agent-a', folder: 'agent-a', workgroup_id: 'wg-a' }]);
+    hostActionMocks.getSessionsByAgentGroup.mockReturnValue([requester]);
+    const notices: Array<{ id: string; onWake?: number }> = [];
+    hostActionMocks.writeSessionMessageIfNew.mockImplementation(
+      async (_group: string, _id: string, message: { id: string; onWake?: number }) => {
+        notices.push(message);
+        return true;
+      },
+    );
+
+    // The workgroup already holds this repository under a different identity.
+    const canonical = canonicalRepoDir('wg-a', 'proj', hostActionDataDir);
+    cloneTo(canonical);
+    git(canonical, ['checkout', '-q', '--detach', 'HEAD']);
+    writeOriginPin('wg-a', 'proj', { origin: remote, repositoryId: 'github.com/someone-else/proj' }, hostActionDataDir);
+    const stage = path.join(
+      sessionDir(requester.agent_group_id, requester.id),
+      'repository-staging',
+      requestId,
+      'proj',
+    );
+    cloneTo(stage);
+
+    await expect(
+      applyRepositoryPublishAction({ requestId, repo: 'proj', origin: remote, repositoryId: remote }, requester),
+    ).rejects.toThrow(/origin pin conflict or repository identity mismatch/);
+
+    // Nobody was drained or stopped for a publish that could only be refused.
+    expect(hostActionMocks.quiesceSessionsForRepositoryMounts).not.toHaveBeenCalled();
+    expect(hostActionMocks.releaseRepositoryMountQuiescence).not.toHaveBeenCalled();
+    expect(notices.map((notice) => notice.id)).toEqual([`repository-publish-failed-${requestId}`]);
+    expect(notices[0]!.onWake).toBe(0);
+    expect(hostActionMocks.wakeRepositoryMountSessions).toHaveBeenCalledWith([requester]);
     expect(fs.existsSync(path.join(stage, '.git'))).toBe(true);
   });
 });
