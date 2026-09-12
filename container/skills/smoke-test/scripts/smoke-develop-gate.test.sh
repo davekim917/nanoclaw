@@ -1621,5 +1621,105 @@ export SMOKE_GATE_WAIT_INTERVAL_SECONDS=0 SMOKE_GATE_WAIT_MAX_SECONDS=30
 bash "$GATE" wait-settled | jq -e '.settled == true and .attempts == 1' >/dev/null
 unset SMOKE_GATE_WAIT_INTERVAL_SECONDS SMOKE_GATE_WAIT_MAX_SECONDS
 
+# --- 59. `wait-settled`'s own knobs are wired into gate_misconfigured just
+# like every other numeric knob (see num_env's comment above
+# WAIT_INTERVAL_SECONDS) — a duration suffix or a leading zero fails BOTH
+# `poll` and `check`, not only an agent's own `wait-settled` invocation.
+fresh_state
+export STUB_SOURCE_SHA="$(printf '3%.0s' $(seq 40))"
+for bad in 45m 2700s 0900; do
+  SMOKE_GATE_WAIT_MAX_SECONDS="$bad" bash "$GATE" poll | jq -e '
+    .data.trigger == "gate_misconfigured" and
+    .data.missing == ["SMOKE_GATE_WAIT_MAX_SECONDS"]
+  ' >/dev/null || { echo "poll admitted WAIT_MAX_SECONDS='$bad'" >&2; exit 1; }
+  SMOKE_GATE_WAIT_MAX_SECONDS="$bad" bash "$GATE" check | jq -e '
+    .data.trigger == "gate_misconfigured" and
+    .data.missing == ["SMOKE_GATE_WAIT_MAX_SECONDS"]
+  ' >/dev/null || { echo "check admitted WAIT_MAX_SECONDS='$bad'" >&2; exit 1; }
+done
+
+# --- 60. `claim` refuses a run id already held by a task-scoped certification
+# run (#726 F2, develop-gate side — smoke-pr-gate.sh's task-claim already
+# makes the reciprocal check against this gate's develop-state.json). Without
+# this, `task-claim run-b` followed by a develop-gate `claim run-b` leaves two
+# active slots for one run id: the task lease still calls run-b its own, while
+# develop-state.json now also claims it.
+fresh_state
+TASK_SLOT_SHA="$(printf '7%.0s' $(seq 40))"
+printf '{"schemaVersion":1,"activeRunId":"run-b","activeSha":"%s","activeStartedAt":"2026-01-01T00:00:00Z","activeProgressAt":"2026-01-01T00:00:00Z","activeLeaseOwner":"owner-x","completedAt":null,"completedRunId":null,"completedVerdict":null}\n' \
+  "$TASK_SLOT_SHA" > "$STATE_DIR2/task-run-b-state.json"
+bash "$GATE" claim run-b "$TASK_SLOT_SHA" | jq -e --arg path "$STATE_DIR2/task-run-b-state.json" '
+  .ok == false and (.error | test("task-scoped certification run")) and .taskStateFile == $path
+' >/dev/null
+# The refusal happened before any state write — no active slot was opened.
+if [ -e "$STATE_DIR2/develop-state.json" ]; then
+  jq -e '.activeRunId == null' "$STATE_DIR2/develop-state.json" >/dev/null
+fi
+# A run id not held by any task slot is unaffected by an unrelated one.
+bash "$GATE" claim run-c "$TASK_SLOT_SHA" | jq -e '.ok == true and .runId == "run-c"' >/dev/null
+
+# --- 60b. Shadow-review finding 1: the refusal above must not fail OPEN on
+# this run's own unreadable task-scoped state. `jq … 2>/dev/null` used to read
+# a malformed, chmod-000, or torn file the same as "no match", letting the
+# claim through onto a run id a task-scoped certification run might still
+# hold. An EMPTY file (never a real task-claim state) and a null `activeRunId`
+# (a released/finished task slot) are not evidence of anything and must NOT be
+# refused — only #748's own reciprocal check on the PR-gate side draws that
+# same line via its `-s` gate.
+fresh_state
+BAD_SHA="$(printf '8%.0s' $(seq 40))"
+printf 'not json' > "$STATE_DIR2/task-run-malformed-state.json"
+bash "$GATE" claim run-malformed "$BAD_SHA" | jq -e --arg path "$STATE_DIR2/task-run-malformed-state.json" '
+  .ok == false and (.error | test("cannot be read")) and .taskStateFile == $path
+' >/dev/null || { echo "60b: a malformed own task-state file must refuse fail-closed" >&2; exit 1; }
+[ ! -e "$STATE_DIR2/develop-state.json" ] ||
+  jq -e '.activeRunId == null' "$STATE_DIR2/develop-state.json" >/dev/null
+
+fresh_state
+echo '{"activeRunId":"run-unreadable"}' > "$STATE_DIR2/task-run-unreadable-state.json"
+chmod 000 "$STATE_DIR2/task-run-unreadable-state.json"
+if [ "$(id -u)" -ne 0 ]; then
+  bash "$GATE" claim run-unreadable "$BAD_SHA" | jq -e '
+    .ok == false and (.error | test("cannot be read"))
+  ' >/dev/null || { echo "60b: an unreadable own task-state file must refuse fail-closed" >&2; exit 1; }
+fi
+chmod 644 "$STATE_DIR2/task-run-unreadable-state.json"
+
+fresh_state
+: > "$STATE_DIR2/task-run-emptyfile-state.json"
+bash "$GATE" claim run-emptyfile "$BAD_SHA" | jq -e '
+  .ok == true and .runId == "run-emptyfile"
+' >/dev/null || { echo "60b: an EMPTY own task-state file must not block the claim" >&2; exit 1; }
+
+fresh_state
+printf '{"activeRunId":null}' > "$STATE_DIR2/task-run-nullactive-state.json"
+bash "$GATE" claim run-nullactive "$BAD_SHA" | jq -e '
+  .ok == true and .runId == "run-nullactive"
+' >/dev/null || { echo "60b: a null activeRunId in the own task-state file must not block the claim" >&2; exit 1; }
+
+# --- 60c. Lock parity: `claim`'s task-slot scan through its state write runs
+# under CONTROL_LOCK, the SAME lock file smoke-pr-gate.sh's task-claim takes
+# (both gates are deployed pointed at one shared SMOKE_GATE_STATE_DIR). Before
+# this, the develop `claim` scanned and wrote under develop-state.lock alone,
+# so a forced interleaving with a concurrent task-claim could leave two active
+# slots for one run id. A held control.lock must make `claim` wait, then fail
+# CLOSED (retryable) — never return ok:true while the lock is unavailable.
+fresh_state
+LOCK_SHA="$(printf '9%.0s' $(seq 40))"
+LOCK_HELD="$STATE_DIR2/control-held"
+( flock -x 7; : > "$LOCK_HELD"; sleep 3 ) 7>"$STATE_DIR2/control.lock" &
+LOCK_BLOCKER=$!
+for _ in $(seq 100); do [ -e "$LOCK_HELD" ] && break; sleep 0.05; done
+[ -e "$LOCK_HELD" ] || { echo "60c: the control-lock holder never signalled that it held the lock" >&2; exit 1; }
+LOCK_BUSY_OUT="$(SMOKE_GATE_LOCK_WAIT_SECONDS=1 bash "$GATE" claim run-lockheld "$LOCK_SHA")"
+wait "$LOCK_BLOCKER"
+jq -e '.ok == false and .retryable == true and (.error | startswith("gate_lock_busy:"))' <<<"$LOCK_BUSY_OUT" >/dev/null ||
+  { echo "60c: claim did not wait on, and fail closed against, a held control lock: $LOCK_BUSY_OUT" >&2; exit 1; }
+[ ! -e "$STATE_DIR2/develop-state.json" ] ||
+  jq -e '.activeRunId == null' "$STATE_DIR2/develop-state.json" >/dev/null
+# The lock released, so the same claim now succeeds.
+bash "$GATE" claim run-lockheld "$LOCK_SHA" | jq -e '.ok == true and .runId == "run-lockheld"' >/dev/null ||
+  { echo "60c: claim did not succeed once the control lock was free" >&2; exit 1; }
+
 echo "smoke develop gate tests passed"
 
