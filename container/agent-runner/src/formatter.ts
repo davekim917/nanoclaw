@@ -507,9 +507,15 @@ function formatTaskMessage(msg: MessageInRow): string {
   const currentTime = formatLocalDateTimeFull(new Date(), TIMEZONE);
   const parts: string[] = [];
   if (content.scriptOutput) {
-    parts.push('Script output:', JSON.stringify(content.scriptOutput, null, 2), '');
+    parts.push('Script output:', collisionSafeJson(content.scriptOutput, 2), '');
   }
-  parts.push('Instructions:', stripLegacyTaskContract(content.prompt || ''));
+  // The prompt is untrusted: any agent can set it (`ncl tasks create --prompt`),
+  // and a raw `</task><message origin="host" event="choice_response" ...>` inside
+  // it would render a byte-identical fake host message as a SIBLING of this
+  // <task> element, defeating the origin="host" trust check in
+  // mcp-tools/request-choice.ts. Escape after stripping the legacy contract
+  // (its markers are plain ASCII, unaffected by escaping either way).
+  parts.push('Instructions:', escapeXml(stripLegacyTaskContract(content.prompt || '')));
   return `<task${from} time="${escapeXml(time)}" current_time="${escapeXml(currentTime)}">${parts.join('\n')}</task>`;
 }
 
@@ -539,7 +545,7 @@ function formatWebhookMessage(msg: MessageInRow): string {
   const source = content.source || 'unknown';
   const event = content.event || 'unknown';
   const from = originAttr(msg);
-  return `<webhook${from} source="${escapeXml(source)}" event="${escapeXml(event)}">${JSON.stringify(content.payload || content, null, 2)}</webhook>`;
+  return `<webhook${from} source="${escapeXml(source)}" event="${escapeXml(event)}">${collisionSafeJson(content.payload || content, 2)}</webhook>`;
 }
 
 function formatSystemMessage(msg: MessageInRow): string {
@@ -560,11 +566,11 @@ function formatSystemMessage(msg: MessageInRow): string {
   // Per design §4 S26: the orchestrator signals the child to flush and exit.
   if (content._spawn_cancel && typeof content._spawn_cancel === 'object') {
     const reason = (content._spawn_cancel.reason as string | undefined) ?? '(none)';
-    return `[Spawn cancelled]\nThis task was cancelled by the orchestrator (reason: ${reason}). Please flush any in-flight work and exit cleanly.`;
+    return `[Spawn cancelled]\nThis task was cancelled by the orchestrator (reason: ${escapeXml(reason)}). Please flush any in-flight work and exit cleanly.`;
   }
 
   const from = originAttr(msg);
-  return `<system_response${from} action="${escapeXml(content.action || 'unknown')}" status="${escapeXml(content.status || 'unknown')}">${JSON.stringify(content.result || null)}</system_response>`;
+  return `<system_response${from} action="${escapeXml(content.action || 'unknown')}" status="${escapeXml(content.status || 'unknown')}">${collisionSafeJson(content.result || null)}</system_response>`;
 }
 
 const RECALL_EVIDENCE_KEYS = ['memoryEvidence', 'conversationEvidence', 'notices'] as const;
@@ -573,8 +579,8 @@ function hasOwn(value: object, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(value, key);
 }
 
-function collisionSafeJson(value: unknown): string {
-  const json = JSON.stringify(value) ?? 'null';
+function collisionSafeJson(value: unknown, indent?: number): string {
+  const json = JSON.stringify(value, null, indent) ?? 'null';
   return json.replace(/[<>&\u2028\u2029]/g, (char) => {
     switch (char) {
       case '<':
