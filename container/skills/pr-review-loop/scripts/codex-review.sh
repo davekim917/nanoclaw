@@ -43,8 +43,8 @@
 #       neither a clean Codex review nor an approving substitute receipt, the
 #       approving receipt's reviewer isn't a model in reviewer-models.txt, it is a
 #       fix PR whose body has no Fixes-PR line, or a substitute receipt on the PR
-#       asked for changes and it neither touches docs/review-notes.md nor carries a
-#       `Review-notes: none (<reason>)` line (`review_notes_missing`)
+#       asked for changes and it neither adds docs/review-notes/<this PR>.md nor
+#       carries a `Review-notes: none (<reason>)` line (`review_notes_missing`)
 #   25  merge-check: the base branch moved while the check ran, or could not be
 #       re-read, so the verdict may be stale — re-run merge-check
 #   26  merge-check: `merge=defer mode=legacy` — not risk-scoped, so SKILL.md Step 6's
@@ -527,8 +527,8 @@ RECEIPT_REVIEWER_LINE_RE='\*\*Reviewer and runtime:\*\* (?<reviewer>[^\n]+)'
 FIX_TITLE_RE='^\s*fix(\([^)]*\))?!?:'
 FIXES_PR_LINE_RE='(^|\n)Fixes-PR:[ \t]*(#[0-9]+|none)\b'
 # The review-notes rule (docs/review-policy.md, "Review notes and fix links"):
-# a PR any substitute receipt asked for changes on adds or amends a line in
-# REVIEW_NOTES_FILE, or its body carries this line, read the way the Fixes-PR
+# a PR any substitute receipt asked for changes on adds a current-PR fragment
+# under REVIEW_NOTES_DIR, or its body carries this line, read the way the Fixes-PR
 # line is (review_notes_state). The reason is ONE parenthesised phrase, with no
 # parenthesis inside it and nothing after it on the line, so `none ()x)` and
 # `none ( ) )` never pass for one; review_notes_state strips every \p{Cf}
@@ -538,6 +538,7 @@ FIXES_PR_LINE_RE='(^|\n)Fixes-PR:[ \t]*(#[0-9]+|none)\b'
 # with no base of its own, or one of the specific blank-looking codepoints
 # U+2800/U+3164/U+115F/U+1160/U+FFA0 (real_reason, #707 P3-b).
 REVIEW_NOTES_FILE='docs/review-notes.md'
+REVIEW_NOTES_DIR='docs/review-notes'
 REVIEW_NOTES_NONE_LINE_RE='(^|\n)Review-notes:[ \t]*none[ \t]*\((?<reason>[^()\n]*)\)[ \t]*\r?(?=\n|\z)'
 # Looser than REVIEW_NOTES_NONE_LINE_RE: matches an attempted line (up to end
 # of line, whatever its shape) so review_notes_state can name which shape rule
@@ -968,11 +969,14 @@ changes_receipt_state() {
 
 # The review-notes rule, merge-check's and audit's (docs/review-policy.md,
 # "Review notes and fix links"): once any substitute receipt on the PR has
-# asked for changes (changes_receipt_state), the PR adds or amends a line in
-# REVIEW_NOTES_FILE, or its body carries `Review-notes: none (<reason>)` with
-# a non-empty reason, outside code fences and HTML comments as the Fixes-PR
-# line is read. The touch comes from SCOPE_FILES — the pinned comparison
-# scope_eval checked — and a listing it could not check never counts as one.
+# asked for changes (changes_receipt_state), the current PR adds its own
+# REVIEW_NOTES_DIR/<PR>.md fragment, or its body carries `Review-notes: none
+# (<reason>)` with a non-empty reason, outside code fences and HTML comments
+# as the Fixes-PR line is read. The touch comes from SCOPE_FILES — the pinned
+# comparison scope_eval checked, containing only non-deleted post-image paths
+# — and a listing it could not check never counts as one. `audit` deliberately
+# applies this current rule too: normal push audits use the merged commit's own
+# skill copy, while a manual newer-code backfill must expose its new rule.
 # Prints exactly `ok` when the rule holds or does not apply — its callers read
 # anything else but the reason as no verdict — else the reason,
 # `review_notes_missing: …`. $1 is the PR as a {body} JSON object: now for
@@ -985,7 +989,8 @@ review_notes_state() {
   printf '%s' "$1" | jq -r -L "$HERE" --arg state "$state" --arg lineRe "$REVIEW_NOTES_NONE_LINE_RE" \
     --arg candidateRe "$REVIEW_NOTES_NONE_CANDIDATE_RE" --arg anywhereRe "$REVIEW_NOTES_NONE_ANYWHERE_RE" \
     --arg splitRe "$REVIEW_NOTES_REASON_SPLIT_RE" \
-    --arg notes "$REVIEW_NOTES_FILE" --argjson files "$SCOPE_FILES" '
+    --arg notes "$REVIEW_NOTES_FILE" --arg fragment "$REVIEW_NOTES_DIR/$PR.md" \
+    --argjson files "$SCOPE_FILES" '
     include "pr-body";
     # Strip every format character first, then require at least one visible
     # one left: a soft hyphen or an emoji ZWJ sequence must not sink an
@@ -1010,14 +1015,14 @@ review_notes_state() {
     ),
     (
     ($state | split("\t")) as [$kind, $why]
-    | pr_body_text as $body
-    | if [ $body | capture($lineRe; "gi") ] | any(.reason | real_reason) then "ok"
-      elif ($files | type) == "array" and any($files[]; . == $notes) then "ok"
+      | pr_body_text as $body
+      | if [ $body | capture($lineRe; "gi") ] | any(.reason | real_reason) then "ok"
+      elif ($files | type) == "array" and any($files[]; . == $fragment) then "ok"
       else
         ( if $kind == "changes" then $why
           else "whether a substitute receipt asked for changes is unknown: \($why)" end ) as $whyText
-        | ( if ($files | type) == "array" then "this head does not touch \($notes)"
-            else "the files this head changes could not be checked, so no touch of \($notes) counts" end ) as $touch
+        | ( if ($files | type) == "array" then "this head does not add or amend \($fragment)"
+            else "the files this head changes could not be checked, so no addition of \($fragment) counts" end ) as $touch
         # Names which shape rule the line failed, instead of a blanket "no
         # reason" (#707 P3-c): the loose candidate regex finds an attempted
         # line even where the strict one refuses to, so its tail can be
@@ -1034,22 +1039,22 @@ review_notes_state() {
               # the old "unmatched or nested" branch.
               | ( [ $rest | capture($splitRe) ] ) as $split
               | if ($split | length) == 0 then
-                  "the body carries a `Review-notes: none (...)` line, but its reason has an unmatched or nested parenthesis, which the check cannot parse. Remove the inner parenthesis, or add or amend the lesson in \($notes)"
+                  "the body carries a `Review-notes: none (...)` line, but its reason has an unmatched or nested parenthesis, which the check cannot parse. Remove the inner parenthesis, or add the lesson in \($fragment)"
                 else
                   ($split[0].reason) as $reasonContent
                   | ($split[0].trailing | gsub("^[ \t]+"; "") | gsub("[ \t\r]+$"; "")) as $trailing
                   | if ($reasonContent | real_reason | not) then
-                      "the body carries a `Review-notes: none ()` line, but its reason is empty or has no visible character. Give it a visible reason, or add or amend the lesson in \($notes)"
+                      "the body carries a `Review-notes: none ()` line, but its reason is empty or has no visible character. Give it a visible reason, or add the lesson in \($fragment)"
                     elif ($trailing | length) > 0 then
-                      "the body carries a `Review-notes: none (<reason>)` line, but it has text after the closing parenthesis (\"\($trailing)\"), which the check reads as not ending the line\(if $trailing == "." then " (a trailing period counts as text after the parenthesis; drop it)" else "" end). Remove it, or add or amend the lesson in \($notes)"
+                      "the body carries a `Review-notes: none (<reason>)` line, but it has text after the closing parenthesis (\"\($trailing)\"), which the check reads as not ending the line\(if $trailing == "." then " (a trailing period counts as text after the parenthesis; drop it)" else "" end). Remove it, or add the lesson in \($fragment)"
                     else
-                      "the body carries a `Review-notes: none (...)` line that does not count as a statement, for a reason the check could not name precisely. Add or amend the lesson in \($notes), or say why there is none in that body line"
+                      "the body carries a `Review-notes: none (...)` line that does not count as a statement, for a reason the check could not name precisely. Add the lesson in \($fragment), or say why there is none in that body line"
                     end
                 end
             elif $hiddenByStripping then
-              "the body carries a `Review-notes: none (...)` line, but it is inside a code fence or an HTML comment, so it does not count as a statement. Move it outside both, or add or amend the lesson in \($notes)"
+              "the body carries a `Review-notes: none (...)` line, but it is inside a code fence or an HTML comment, so it does not count as a statement. Move it outside both, or add the lesson in \($fragment)"
             else
-              "the body has no `Review-notes: none (<reason>)` line at all. Add or amend the lesson in \($notes), or add that body line saying why there is none"
+              "the body has no `Review-notes: none (<reason>)` line at all. Add the lesson in \($fragment), or add that body line saying why there is none"
             end
           ) as $shapeDetail
         | "review_notes_missing: \($whyText); \($touch), and \($shapeDetail)"
@@ -1183,7 +1188,8 @@ merge_check_main() {
     echo "merge=refused head=$SCOPE_HEAD verdict=$SCOPE_VERDICT: latest substitute receipt: changes — a substitute reviewer said no on this head" >&2
     exit 24
   fi
-  # A review that said no on any head leaves its lesson in docs/review-notes.md,
+  # A review that said no on any head leaves its lesson in this PR's
+  # docs/review-notes/<PR>.md fragment,
   # or the body says why there is none (review_notes_state). Read at merge
   # time, like the Fixes-PR line, and under either verdict.
   notes=$(review_notes_state "$pr_text") || exit 1
