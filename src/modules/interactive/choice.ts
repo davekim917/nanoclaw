@@ -408,7 +408,7 @@ async function relayChoice(ctx: ChoiceHandlerContext): Promise<Session | null> {
   const target = (await cardConversationSession(ctx.approval, ctx.requester)) ?? ctx.requester;
   if (!target) return null;
   // The click reaches the host without the platform's display name
-  // (ResponsePayload, src/response-registry.ts:15-22), so the name comes from
+  // (ResponsePayload, src/response-registry.ts:15-28), so the name comes from
   // the clicker's users row — an authorized clicker holds a user_roles row,
   // which references users(id) (src/db/schema.ts:88-89).
   const user = await getUser(ctx.userId);
