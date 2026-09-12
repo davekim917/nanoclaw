@@ -8,6 +8,8 @@ import {
   canonicalGitDir,
   canonicalRepoDir,
   checkoutDirName,
+  checkoutInheritedTagsPath,
+  cloneIdentity,
   defaultTopicBranch,
   discoverCanonicalRepositories,
   ensureRepositoryLock,
@@ -15,11 +17,13 @@ import {
   listTopicCheckouts,
   originPinPath,
   parseCheckoutDirName,
+  readCheckoutInheritedTags,
   readOriginPin,
   repositoryLockPath,
   resolveRepositoryWorkUnit,
   topicWorktreesDir,
   withWorkgroupRepositoryMountClaim,
+  writeCheckoutInheritedTags,
   writeOriginPin,
 } from './repository-workspaces.js';
 
@@ -31,6 +35,34 @@ beforeEach(() => {
 
 afterEach(() => {
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+describe('inherited tag records (#672)', () => {
+  it('apply only to the clone they were written for: a rename keeps one, a replacement does not', () => {
+    const checkout = path.join(root, 'topic', 'worktrees', 'repo@x');
+    fs.mkdirSync(path.join(checkout, '.git'), { recursive: true });
+    const object = 'a'.repeat(40);
+    const record = checkoutInheritedTagsPath(checkout);
+    // Beside worktrees/, in the topic state dir no container mounts.
+    expect(record).toBe(path.join(root, 'topic', 'checkout-tags', 'repo@x'));
+    writeCheckoutInheritedTags(checkout, cloneIdentity(checkout)!, `${object} refs/tags/v1`);
+    expect(readCheckoutInheritedTags(record, checkout)).toEqual(new Map([['refs/tags/v1', object]]));
+
+    // Quarantine and rollback move the same directory: the record still applies.
+    const moved = path.join(root, 'quarantine', 'repo@x-1');
+    fs.mkdirSync(path.dirname(moved), { recursive: true });
+    fs.renameSync(checkout, moved);
+    expect(readCheckoutInheritedTags(record, moved)).toEqual(new Map([['refs/tags/v1', object]]));
+
+    // Another clone at the same path, however it got there, inherits nothing.
+    fs.mkdirSync(path.join(checkout, '.git'), { recursive: true });
+    expect(readCheckoutInheritedTags(record, checkout)).toBeNull();
+
+    // Nor does a record that is not one, or no record at all.
+    fs.writeFileSync(record, `clone ${cloneIdentity(moved)}\nnot a tag line\n`);
+    expect(readCheckoutInheritedTags(record, moved)).toBeNull();
+    expect(readCheckoutInheritedTags(path.join(root, 'absent'), moved)).toBeNull();
+  });
 });
 
 describe('canonical repository layout', () => {

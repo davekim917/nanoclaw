@@ -121,13 +121,16 @@ import {
 } from './worktree-cleanup.js';
 import {
   canonicalRepoDir,
+  checkoutInheritedTagsPath,
   checkoutStagingRoot,
+  cloneIdentity,
   defaultTopicBranch,
   listTopicCheckouts,
   repositoryLockPath,
   resolveRepositoryWorkUnit,
   topicStateDir,
   topicWorktreesDir,
+  writeCheckoutInheritedTags,
   writeTransferTombstone,
 } from './repository-workspaces.js';
 import { SESSION_RECLAIM_JOURNAL_FILENAME, SESSION_RESCUES_DIRNAME } from './storage-manager.js';
@@ -793,6 +796,121 @@ describe('branch clone checkouts', () => {
     const trashedCopy = path.join(state.trashDir, `2-${path.basename(quarantined)}`);
     expect(fs.readFileSync(path.join(trashedCopy, 'README.md'), 'utf8')).toBe('base\n');
     expect(git(trashedCopy, ['symbolic-ref', '--short', 'HEAD'])).toBe('feat');
+  });
+
+  it('tags the host recorded when it built a clone are not its own work; every other tag still is (#672)', async () => {
+    // The canonical holds tags on a commit no origin branch reaches, as a
+    // repository's release tags often do. A clone copies every canonical tag
+    // (repository_checkout removes only heads and remote-tracking refs).
+    const canon = canonicalFixture('repo-a');
+    const base = git(canon.canonical, ['rev-parse', 'HEAD']);
+    const release = git(canon.canonical, ['commit-tree', `${base}^{tree}`, '-p', base, '-m', 'release']);
+    git(canon.canonical, ['tag', 'release-1', release]);
+    git(canon.canonical, ['tag', '-a', '-m', 'annotated release', 'release-2', release]);
+    git(canon.canonical, ['tag', 'tree-tag', `${base}^{tree}`]);
+    /** Record the clone's tags, as repository_checkout does just before it publishes a clone. */
+    const recordTags = (checkout: string): void =>
+      writeCheckoutInheritedTags(
+        checkout,
+        cloneIdentity(checkout)!,
+        git(checkout, ['for-each-ref', '--format=%(objectname) %(refname)', 'refs/tags']),
+      );
+
+    const cases: Array<{ thread: string; recorded: boolean; reason: string; arrange: (dir: string) => void }> = [
+      {
+        // The clone's own work under a recorded tag's name: same name, another commit.
+        thread: 'p672-moved-tag',
+        recorded: true,
+        reason: 'unpushed',
+        arrange: (dir) => {
+          git(dir, ['checkout', '-q', '--detach']);
+          commitFile(dir, 'moved.txt');
+          git(dir, ['tag', '-f', 'release-1']);
+          git(dir, ['checkout', '-q', 'feat']);
+        },
+      },
+      {
+        // Tag-only work, then a sibling topic, which can write the canonical's
+        // refs, plants the same tag name at the same object there. The record
+        // was written when the clone was built, so the tag still counts.
+        thread: 'p672-planted-after-work',
+        recorded: true,
+        reason: 'unpushed',
+        arrange: (dir) => {
+          git(dir, ['checkout', '-q', '--detach']);
+          commitFile(dir, 'tag-only.txt');
+          git(dir, ['tag', 'wip']);
+          git(dir, ['checkout', '-q', 'feat']);
+          git(canon.canonical, ['fetch', '-q', dir, '+refs/tags/wip:refs/tags/wip']);
+        },
+      },
+      {
+        // A clone this host did not build has no record: every tag counts.
+        thread: 'p672-no-record',
+        recorded: false,
+        reason: 'unpushed',
+        arrange: () => {},
+      },
+      {
+        // Another clone put, by hand, where a recorded one was. The record
+        // belongs to the clone it was written for, so every tag counts again.
+        thread: 'p672-replaced-clone',
+        recorded: true,
+        reason: 'unpushed',
+        arrange: (dir) => {
+          fs.rmSync(dir, { recursive: true, force: true });
+          execFileSync('git', ['clone', '-q', canon.canonical, dir]);
+          git(dir, ['remote', 'set-url', 'origin', canon.remote]);
+        },
+      },
+    ];
+    const refused = cases.map((spec) => {
+      const fixture = cloneCheckout(canon, spec.thread, 'repo-a@feat', 'feat');
+      if (spec.recorded) recordTags(fixture.checkout);
+      spec.arrange(fixture.checkout);
+      age(fixture.checkout);
+      return { ...spec, ...fixture, before: snapshot(fixture.checkout) };
+    });
+    const inherited = cloneCheckout(canon, 'p672-inherited', 'repo-a@feat', 'feat');
+    recordTags(inherited.checkout);
+    expect(git(inherited.checkout, ['tag', '--list']).split('\n').sort()).toEqual([
+      'release-1',
+      'release-2',
+      'tree-tag',
+      'wip',
+    ]);
+    state.rows = [...refused.map((spec) => closedRow(spec.thread)), closedRow('p672-inherited')];
+
+    // The orphan-topic loop, applying.
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const groupsDir = path.join(state.dataDir, 'groups');
+    fs.mkdirSync(groupsDir, { recursive: true });
+    const report = await runStorageGcOnce(state.dataDir, groupsDir);
+    for (const spec of refused) {
+      expect(find(report, spec.topicDir), spec.thread).toMatchObject({ collect: false, reason: spec.reason });
+      expect(snapshot(spec.checkout), spec.thread).toEqual(spec.before);
+    }
+    expect(find(report, inherited.topicDir)).toMatchObject({ collect: true, reason: 'closed-and-clean' });
+    expect(state.trashed).toEqual([inherited.topicDir]);
+
+    // The clone branch of worktree cleanup, including its re-proof of the
+    // quarantined copy.
+    const fresh = cloneCheckout(canon, 'p672-inherited-branch', 'repo-a@feat', 'feat');
+    recordTags(fresh.checkout);
+    state.rows.push(closedRow('p672-inherited-branch'));
+    const decisions = new Map<string, unknown>();
+    for (const target of await _discoverWorktreesForTesting(state.dataDir)) {
+      decisions.set(target.worktreePath, await _cleanupOneForTesting(target, state.dataDir));
+    }
+    for (const spec of refused) {
+      expect(decisions.get(spec.checkout), spec.thread).toEqual({ collected: false, reason: spec.reason });
+      expect(snapshot(spec.checkout), spec.thread).toEqual(spec.before);
+    }
+    expect(decisions.get(fresh.checkout)).toEqual({ collected: true, reason: 'clean-and-pushed' });
+    expect(state.trashed).toHaveLength(2);
+    // The collected clone's record went with it; a refused clone keeps its own.
+    expect(fs.existsSync(checkoutInheritedTagsPath(fresh.checkout))).toBe(false);
+    expect(fs.existsSync(checkoutInheritedTagsPath(refused[0]!.checkout))).toBe(true);
   });
 
   /** Every path under `dir` with its type and bytes: what "restored byte for byte" compares. */

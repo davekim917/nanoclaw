@@ -192,7 +192,9 @@ refused, with a WARN when first
 used, otherwise. Resolution is shape-aware in
 both modes, so switching back to `worktree` strands no clone. Worktree cleanup
 collects an idle clone only after proving that the commits of every local ref,
-HEAD and the stash are already on `origin`.
+HEAD and the stash are already on `origin`. A tag the host recorded when it
+built the clone, still at the same object, is the canonical's, not the
+clone's own work, so it does not count.
 
 Containers fetch with their scoped OneCLI identity. The host never performs a
 credentialed Git network operation: it publishes validated local clones and

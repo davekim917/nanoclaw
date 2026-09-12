@@ -12,7 +12,8 @@
  * A branch clone (`.git` a directory; plan §5.8) takes its own branch: there
  * is no registration to remove, so it is quarantined and trashed, and only on
  * the topic's side-(a) evidence, seven idle days, and a proof covering every
- * local branch, HEAD and the stash. See cleanupCloneCheckout.
+ * local ref, HEAD and the stash, less the tags the host recorded when it built
+ * the clone. See cleanupCloneCheckout and provenDisposable.
  */
 import { execFileSync } from 'child_process';
 import fs from 'fs';
@@ -36,10 +37,12 @@ import { onHostShutdown, onHostStart } from './host-lifecycle.js';
 import { log } from './log.js';
 import {
   canonicalRepoDir,
+  checkoutInheritedTagsPath,
   defaultTopicBranch,
   ensureRepositoryLock,
   listTopicCheckouts,
   parseCheckoutDirName,
+  readCheckoutInheritedTags,
   resolveRepositoryWorkUnit,
   topicStateDir,
   topicWorktreesDir,
@@ -139,13 +142,15 @@ function git(
   args: string[],
   env: NodeJS.ProcessEnv = {},
   filterNames: readonly string[] = [],
+  input?: string,
 ): string | null {
   try {
     return execFileSync('git', safeGitArgs(args, undefined, filterNames), {
       cwd,
       env: safeGitEnv(env),
       encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
+      input,
+      stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
       timeout: 30_000,
       maxBuffer: 64 * 1024 * 1024,
     }).trim();
@@ -588,14 +593,23 @@ async function cleanupCloneCheckout(target: TopicWorktreeTarget, dataDir: string
       (): CloneCleanupDecision => {
         const late = refusal();
         if (late) return { collected: false, reason: late };
-        const proof = disposability.proveCheckoutDisposable({ path: target.worktreePath, shape: target.shape });
+        const proof = disposability.proveCheckoutDisposable({
+          path: target.worktreePath,
+          shape: target.shape,
+          inheritedTagsRecord: checkoutInheritedTagsPath(target.worktreePath),
+        });
         if (!proof.ok) {
           if (idleDays(target.worktreePath) >= STALE_WARNING_DAYS) {
             log.warn('Worktree cleanup: preserving stale clone checkout', { ...context, reason: proof.reason });
           }
           return { collected: false, reason: proof.reason };
         }
-        const finalized = finalizeCloneCollection({ path: target.worktreePath }, dataDir, 'topic-checkout');
+        const finalized = finalizeCloneCollection(
+          { path: target.worktreePath },
+          dataDir,
+          'topic-checkout',
+          checkoutInheritedTagsPath(target.worktreePath),
+        );
         if (!finalized.ok) return { collected: false, reason: finalized.reason ?? 'finalize-refused' };
         log.info('Worktree cleanup: trashed an idle clean pushed clone checkout', context);
         return { collected: true, reason: proof.reason };
@@ -778,7 +792,11 @@ function isWorktreeLocked(dir: string): boolean {
  * that fails — the usual cause is a pruned worktree admin directory or a gitdir
  * only resolvable inside a container — returns unprovable, never clean.
  */
-function provenDisposable(dir: string, scope: 'head' | 'all'): { ok: boolean; reason: string } {
+function provenDisposable(
+  dir: string,
+  scope: 'head' | 'all',
+  inheritedTags: ReadonlyMap<string, string> | null = null,
+): { ok: boolean; reason: string } {
   if (isWorktreeLocked(dir)) return { ok: false, reason: 'worktree-locked' };
   const env = checkoutGitEnv(dir);
 
@@ -830,11 +848,38 @@ function provenDisposable(dir: string, scope: 'head' | 'all'): { ok: boolean; re
   // evidence for a clone: another remote (a sibling clone, a local backup)
   // can hold commits no real remote has. Scope 'head' is a linked worktree's
   // proof, unchanged: its HEAD against every remote-tracking ref.
-  const unpushedArgs =
-    scope === 'all'
-      ? ['log', '--all', 'HEAD', '--not', '--remotes=origin', '--oneline']
-      : ['log', 'HEAD', '--not', '--remotes', '--oneline'];
-  const unpushed = git(dir, unpushedArgs, env);
+  //
+  // One exception for a clone (#672): a tag the host recorded when it built
+  // the clone, still held at the same object, is the canonical's, not the
+  // clone's own work. A clone copies every canonical tag (repository_checkout
+  // removes only heads and remote-tracking refs,
+  // modules/repository-workspaces/index.ts:889-904), and a release tag off
+  // every origin branch would otherwise keep every clone of that repository
+  // forever. The record is host-only (checkoutInheritedTagsPath). The
+  // canonical's refs are container-writable and are never read here, so no
+  // other topic can exempt this clone's work. Matching name and object only
+  // drops roots, so a commit any other ref holds still counts. The roots go in
+  // on stdin, before `--not`.
+  let unpushed: string | null;
+  if (scope === 'all' && inheritedTags !== null && inheritedTags.size > 0) {
+    const refs = git(dir, ['for-each-ref', '--format=%(objectname) %(refname)'], env);
+    if (refs === null) return { ok: false, reason: 'log-unprovable' };
+    const roots = refs
+      .split('\n')
+      .filter(Boolean)
+      .flatMap((line) => {
+        const separator = line.indexOf(' ');
+        const object = line.slice(0, separator);
+        return inheritedTags.get(line.slice(separator + 1)) === object ? [] : [`${object}\n`];
+      });
+    unpushed = git(dir, ['log', '--oneline', 'HEAD', '--stdin', '--not', '--remotes=origin'], env, [], roots.join(''));
+  } else {
+    const unpushedArgs =
+      scope === 'all'
+        ? ['log', '--all', 'HEAD', '--not', '--remotes=origin', '--oneline']
+        : ['log', 'HEAD', '--not', '--remotes', '--oneline'];
+    unpushed = git(dir, unpushedArgs, env);
+  }
   if (unpushed === null) return { ok: false, reason: 'log-unprovable' };
   if (unpushed !== '') return { ok: false, reason: 'unpushed' };
 
@@ -878,13 +923,24 @@ function provenDisposable(dir: string, scope: 'head' | 'all'): { ok: boolean; re
  * The one disposability primitive (plan §5.8). A clone owns every local branch
  * in it, so it is proved with scope `all`; a linked worktree owns only its
  * HEAD, as it always has; a checkout whose shape the lister could not decide
- * is refused outright.
+ * is refused outright. `inheritedTagsRecord` names the host-only record of the
+ * tags a topic clone inherited when the host built it (#672); only a topic
+ * checkout has one, and a clone without a record counts every tag.
  */
-export function proveCheckoutDisposable(checkout: Pick<TopicCheckout, 'path' | 'shape'>): {
+export function proveCheckoutDisposable(
+  checkout: Pick<TopicCheckout, 'path' | 'shape'> & { inheritedTagsRecord?: string | null },
+): {
   ok: boolean;
   reason: string;
 } {
-  if (checkout.shape === 'clone') return disposability.provenDisposable(checkout.path, 'all');
+  if (checkout.shape === 'clone') {
+    // The record is bound to the clone it was written for, which a quarantine
+    // rename keeps: the re-proof of the moved copy still matches it.
+    const inherited = checkout.inheritedTagsRecord
+      ? readCheckoutInheritedTags(checkout.inheritedTagsRecord, checkout.path)
+      : null;
+    return disposability.provenDisposable(checkout.path, 'all', inherited);
+  }
   if (checkout.shape === 'linked') return disposability.provenDisposable(checkout.path, 'head');
   return { ok: false, reason: 'unknown-shape' };
 }
@@ -1117,7 +1173,10 @@ function collectOrphanTopics(report: GcReport, dataDir: string, owners: Map<stri
       }
       let refused: string | null = null;
       for (const probe of probes) {
-        const decision = disposability.proveCheckoutDisposable(probe);
+        const decision = disposability.proveCheckoutDisposable({
+          ...probe,
+          inheritedTagsRecord: probe.shape === 'clone' ? checkoutInheritedTagsPath(probe.path) : null,
+        });
         if (!decision.ok) {
           refused = decision.reason;
           break;
@@ -2070,6 +2129,7 @@ function finalizeCloneCollection(
   candidate: Pick<GcCandidate, 'path'>,
   dataDir: string,
   kind: 'scratch' | 'topic-checkout' = 'scratch',
+  inheritedTagsRecord: string | null = null,
 ): { ok: boolean; reason?: string } {
   const resolvedOriginal = fs.realpathSync(candidate.path);
   const quarantineRoot = path.join(dataDir, '.gc-quarantine');
@@ -2122,8 +2182,9 @@ function finalizeCloneCollection(
   }
   // Re-prove the moved copy, not the original path: this is the check that
   // catches a write landing in the gap between the scan and now.
-  // Both callers only ever finalize a clone, so the moved copy is proved as one.
-  const decision = disposability.proveCheckoutDisposable({ path: quarantinePath, shape: 'clone' });
+  // Both callers only ever finalize a clone, so the moved copy is proved as one,
+  // against the same tag record as the first proof.
+  const decision = disposability.proveCheckoutDisposable({ path: quarantinePath, shape: 'clone', inheritedTagsRecord });
   if (!decision.ok) return restore(`aborted-${decision.reason}`);
 
   try {
@@ -2137,6 +2198,9 @@ function finalizeCloneCollection(
   // a correctness step — and doing it BEFORE the trash would be the stranding
   // bug this sidecar exists to avoid.
   fs.rmSync(cloneSidecarPath(quarantinePath), { force: true });
+  // The clone's tag record goes with it. One left behind is harmless: the next
+  // build of this name replaces it before publishing.
+  if (inheritedTagsRecord) fs.rmSync(inheritedTagsRecord, { force: true });
   return { ok: true };
 }
 
