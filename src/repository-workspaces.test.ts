@@ -367,6 +367,59 @@ describe('host-only origin pins', () => {
     ).toThrow(/credentials/);
   });
 
+  it('reads a legacy URL-form identity as github.com/<owner>/<repo>, so it matches the pin publication writes (#697)', () => {
+    // What repository activation wrote: the origin URL itself as the identity.
+    const legacyPath = originPinPath('wg-a', 'legacy', root);
+    fs.mkdirSync(path.dirname(legacyPath), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(
+      legacyPath,
+      `${JSON.stringify({ origin: 'https://github.com/Acme/Legacy', repositoryId: 'https://github.com/Acme/Legacy.git' })}\n`,
+      { mode: 0o600 },
+    );
+    expect(readOriginPin('wg-a', 'legacy', root)).toEqual({
+      origin: 'https://github.com/Acme/Legacy',
+      repositoryId: 'github.com/acme/legacy',
+    });
+    // The same repository in the publication form is the same pin; another repository is still a conflict.
+    expect(() =>
+      writeOriginPin(
+        'wg-a',
+        'legacy',
+        { origin: 'https://github.com/Acme/Legacy.git', repositoryId: 'github.com/acme/legacy' },
+        root,
+      ),
+    ).not.toThrow();
+    expect(() =>
+      writeOriginPin(
+        'wg-a',
+        'legacy',
+        { origin: 'https://github.com/other/legacy', repositoryId: 'github.com/other/legacy' },
+        root,
+      ),
+    ).toThrow(/origin pin conflict/);
+
+    // A new pin written in the URL form is stored in the publication form.
+    writeOriginPin(
+      'wg-a',
+      'activated',
+      { origin: 'https://github.com/Acme/Activated.git', repositoryId: 'https://github.com/Acme/Activated.git' },
+      root,
+    );
+    expect(JSON.parse(fs.readFileSync(originPinPath('wg-a', 'activated', root), 'utf8'))).toEqual({
+      origin: 'https://github.com/Acme/Activated',
+      repositoryId: 'github.com/acme/activated',
+    });
+
+    // Anything that is not a github.com owner/repository URL keeps its identity unchanged.
+    writeOriginPin(
+      'wg-a',
+      'odd',
+      { origin: 'https://github.com/acme/odd', repositoryId: 'https://gitlab.com/a/b' },
+      root,
+    );
+    expect(readOriginPin('wg-a', 'odd', root)?.repositoryId).toBe('https://gitlab.com/a/b');
+  });
+
   it('rejects query and fragment data on both pin write and persisted-pin read without rewriting it', () => {
     for (const [kind, suffix] of [
       ['query', '?access_token=QUERY_SYNTHETIC_SECRET'],

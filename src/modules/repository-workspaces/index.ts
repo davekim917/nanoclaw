@@ -291,6 +291,52 @@ function sanitizeCanonicalConfig(repoPath: string, expectedOrigin: string): void
   }
 }
 
+/** Refuse unless the workgroup's pin for this repository matches the requested origin and identity. */
+function assertPinMatchesRequest(
+  pin: OriginPin | null,
+  input: { workgroupId: string; repo: string },
+  normalizedInputOrigin: string,
+  repositoryId: string,
+): void {
+  if (
+    !pin ||
+    pin.kind === 'local-only' ||
+    normalizeOrigin(pin.origin) !== normalizedInputOrigin ||
+    pin.repositoryId !== repositoryId
+  ) {
+    throw new Error(`origin pin conflict or repository identity mismatch for ${input.workgroupId}/${input.repo}`);
+  }
+}
+
+/**
+ * The read-only checks publishStagedCanonical makes against an existing canonical
+ * and its pin, run before the workgroup drain. A publish that can only be refused
+ * must not stop every container in the workgroup first (#697): it did, then failed
+ * on the pin check. publishStagedCanonical repeats these under the repository
+ * lock, which stays authoritative; this is an early refusal, never a grant.
+ */
+function assertPublishCanMatchCanonical(input: {
+  workgroupId: string;
+  repo: string;
+  origin: string;
+  repositoryId: string;
+  dataDir?: string;
+}): void {
+  const normalizedInputOrigin = normalizeOrigin(input.origin);
+  const repositoryId = normalizedRepositoryIdentity(normalizedInputOrigin, input.repositoryId);
+  const canonical = canonicalRepoDir(input.workgroupId, input.repo, input.dataDir);
+  const pin = readOriginPin(input.workgroupId, input.repo, input.dataDir);
+  if (fs.existsSync(canonical)) {
+    assertNormalClone(canonical, 'existing canonical repository');
+    validateCloneOrigin(canonical, input.origin);
+    assertPinMatchesRequest(pin, input, normalizedInputOrigin, repositoryId);
+  } else if (pin) {
+    // A pin with no canonical is a crash between pin and rename; writeOriginPin
+    // refuses to replace it with a different one.
+    assertPinMatchesRequest(pin, input, normalizedInputOrigin, repositoryId);
+  }
+}
+
 export async function publishStagedCanonical(
   input: PublishStagedCanonicalInput,
 ): Promise<{ status: 'published' | 'existing'; canonicalPath: string }> {
@@ -312,15 +358,12 @@ export async function publishStagedCanonical(
         }
         const canonicalHead = git(canonical, ['rev-parse', '--verify', 'HEAD^{commit}'], 10_000);
         git(canonical, ['checkout', '-q', '--detach', canonicalHead], 30_000);
-        const pin = readOriginPin(input.workgroupId, input.repo, dataDir);
-        if (
-          !pin ||
-          pin.kind === 'local-only' ||
-          normalizeOrigin(pin.origin) !== normalizedInputOrigin ||
-          pin.repositoryId !== repositoryId
-        ) {
-          throw new Error(`origin pin conflict or repository identity mismatch for ${input.workgroupId}/${input.repo}`);
-        }
+        assertPinMatchesRequest(
+          readOriginPin(input.workgroupId, input.repo, dataDir),
+          input,
+          normalizedInputOrigin,
+          repositoryId,
+        );
         if (fs.existsSync(input.stagingPath)) {
           if (fs.realpathSync(input.stagingPath) === fs.realpathSync(canonical)) {
             throw new Error('repository staging path aliases the canonical');
@@ -1385,6 +1428,8 @@ export async function applyRepositoryPublishAction(content: Record<string, unkno
   let releaseWakeSessions: Session[] = [];
   let quiescence: RepositoryMountQuiescence | null = null;
   try {
+    // Refuse before the drain what the publication would refuse after it (#697).
+    assertPublishCanMatchCanonical({ workgroupId, repo, origin, repositoryId });
     await withWorkgroupRepositoryMountClaim(workgroupId, async () => {
       const groupIds = (await getAllAgentGroups())
         .filter((candidate) => (candidate.workgroup_id ?? candidate.folder) === workgroupId)

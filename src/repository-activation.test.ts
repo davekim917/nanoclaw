@@ -312,9 +312,10 @@ describe('canonical adoption', () => {
     await activateCanonicalRepository({ workgroupId: WG, checkout: checkout!, dataDir: root });
 
     const canonical = canonicalRepoDir(WG, 'app', root);
+    // The identity reads in the one form publication compares (#697), whatever form was passed.
     expect(readOriginPin(WG, 'app', root)).toEqual({
       origin: 'https://github.com/Example/app',
-      repositoryId: 'https://github.com/Example/app',
+      repositoryId: 'github.com/example/app',
     });
     expect(git(canonical, 'config', '--get', 'gc.auto')).toBe('0');
     expect(git(canonical, 'config', '--get', 'gc.worktreePruneExpire')).toBe('never');
