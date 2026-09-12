@@ -1770,12 +1770,12 @@ export function resolveMainTipUntilIso(marginMs: number = UNTIL_ISO_SEARCH_INDEX
       maxBuffer: 64 * 1024 * 1024,
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
-    // eslint-disable-next-line no-catch-all/no-catch-all
   } catch (err) {
     throw new Error(
       `review-outcomes: resolveMainTipUntilIso: could not resolve origin/main's tip commit (\`git log -1 ` +
         `--format=%cI origin/main\` failed) — the search window's end must come from the checked-out ` +
         `origin/main, never a wall-clock fallback. Underlying error: ${err instanceof Error ? err.message : String(err)}`,
+      { cause: err },
     );
   }
   const tipMs = new Date(raw).getTime();
