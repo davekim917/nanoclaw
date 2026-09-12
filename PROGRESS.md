@@ -16,4 +16,4 @@
 - [x] Verified new tests fail on pre-fix code (git stash of formatter.ts) —
       all 6 failed with the expected raw-injection output; passed again after
       unstash.
-- [ ] Commit, push, open draft PR
+- [x] Commit, push, open draft PR: https://github.com/davekim917/nanoclaw/pull/729 (draft, not merged)
