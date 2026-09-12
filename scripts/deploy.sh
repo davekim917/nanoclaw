@@ -253,6 +253,49 @@ if [ -n "$CONTAINER_CHANGES" ]; then
   fi
 fi
 
+# A repository action that drains sessions (publish, transfer) replays from
+# scratch after a host restart and drains every session a second time (#718).
+# The host keeps data/repository-drain-in-flight.json while one runs, so hold
+# the restart until it settles. A marker whose pid is not the service's main
+# process was left by a host that died mid-drain.
+#
+# Bounded, and the default fits a healthy worst case: a transfer drains its
+# source and then its destination (src/modules/repository-workspaces/index.ts
+# :1774 and :1784), each allowed REPOSITORY_MOUNT_QUIESCENCE_TIMEOUT_MS, 10
+# minutes by default (src/config.ts:113-117). Raise this if that is raised. A
+# drain still running past the cap is stuck, and a stuck host may be exactly
+# what this deploy fixes, so the restart then goes ahead.
+DRAIN_MARKER="data/repository-drain-in-flight.json"
+DRAIN_WAIT_SECONDS="${NANOCLAW_DEPLOY_DRAIN_WAIT_SECONDS:-1800}"
+drain_in_flight() {
+  [ -f "$DRAIN_MARKER" ] || return 1
+  local pid main
+  pid=$(grep -o '"pid":[0-9]*' "$DRAIN_MARKER" 2>/dev/null | cut -d: -f2)
+  main=$(systemctl show -p MainPID --value nanoclaw-v2 2>/dev/null)
+  [ -n "$pid" ] && [ "$pid" = "$main" ]
+}
+# One budget for the whole deploy: the check right before the restart spends
+# only what the first wait left, so a drain that already ran the budget out is
+# not waited on a second time.
+DRAIN_DEADLINE=""
+wait_for_drain() {
+  drain_in_flight || return 0
+  [ -n "$DRAIN_DEADLINE" ] || DRAIN_DEADLINE=$(($(date +%s) + DRAIN_WAIT_SECONDS))
+  write_status "running" "waiting for repository drain" ""
+  echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Waiting for an in-flight repository drain before restarting: $(cat "$DRAIN_MARKER")" >> "$LOG"
+  local started
+  started=$(date +%s)
+  while drain_in_flight && [ "$(date +%s)" -lt "$DRAIN_DEADLINE" ]; do
+    sleep 10
+  done
+  if drain_in_flight; then
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Repository drain still running when the ${DRAIN_WAIT_SECONDS}s wait budget ran out; restarting anyway" >> "$LOG"
+  else
+    echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Repository drain settled after $(($(date +%s) - started))s" >> "$LOG"
+  fi
+}
+wait_for_drain
+
 echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Build complete, restarting..." >> "$LOG"
 
 # Arm the post-restart crash guard (src/deploy-crash-guard.ts). The restart
@@ -271,6 +314,17 @@ MIGRATION_CHANGES=$(git diff --name-only "$PRE_COMMIT" HEAD -- src/db/migrations
 if tracked_changes; then
   write_status "failed" "pre-restart" "tracked source changed during deploy — restart refused to preserve customizations"
   exit 1
+fi
+# A drain that started during the steps above gets the same wait, and a long
+# wait gets the tracked-changes check again. What remains is the moment between
+# this check and the restart; closing that needs the host to stop admitting
+# draining jobs, which it does not do.
+if drain_in_flight; then
+  wait_for_drain
+  if tracked_changes; then
+    write_status "failed" "pre-restart" "tracked source changed during deploy — restart refused to preserve customizations"
+    exit 1
+  fi
 fi
 if [ -z "$MIGRATION_CHANGES" ]; then
   mkdir -p data
