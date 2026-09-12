@@ -97,6 +97,24 @@ both:
    while the ownership locks are held. A changed claim cannot inherit evidence
    from the previous build.
 
+**A certification, re-verification, or evidence-recovery run has no PR.**
+Never hand-compose the contract or a marker for one just because there is no
+freeze PR to `claim` against — that reproduces the exact incident this scaffold
+exists to prevent, only on a run the barrier can never see as governed. Claim
+the run itself instead:
+
+```bash
+bash /app/skills/smoke-test/scripts/smoke-pr-gate.sh task-claim <run-id> <deploy-sha>
+```
+
+This opens the same door a PR `claim` does: a shared, cross-container lease
+under the workgroup mount, which `begin_active_run_fence` accepts as a third
+active-slot shape alongside `pr` and `develop`. `task-progress <run-id>`
+renews it during a long run and `task-release <run-id>` drops it when the run
+ends; `--takeover` on `task-claim` may reassign a live lease to a new owner,
+same as a PR claim, but the deploy SHA itself binds **permanently** at claim
+and has no takeover escape — a different build always gets a different run id.
+
 Before dispatch, the coordinator writes the contract with the frozen SHA and
 every lane it is committing to:
 

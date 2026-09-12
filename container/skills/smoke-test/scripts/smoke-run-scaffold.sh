@@ -164,11 +164,53 @@ begin_active_run_fence() {  # <artifact description>
      [ "$(jq -r '.activeRunId // empty' "$state_dir/develop-state.json" 2>/dev/null)" = "$run_id" ]; then
     FENCED_STATE_FILE="$state_dir/develop-state.json"; state_kind="develop"; count=$(( count + 1 ))
   fi
+  # A certification, re-verification or evidence-recovery run has no PR and no
+  # develop campaign — `smoke-pr-gate.sh task-claim` writes this third shape.
+  # Before this branch existed, such a run matched neither of the two above,
+  # so `count` stayed 0 and every task-scoped write was refused outright; the
+  # gap made coordinators hand-compose the contract and markers directly,
+  # skipping every check in this function.
+  if [ -e "$state_dir/task-$run_id-state.json" ] &&
+     [ "$(jq -r '.activeRunId // empty' "$state_dir/task-$run_id-state.json" 2>/dev/null)" = "$run_id" ]; then
+    FENCED_STATE_FILE="$state_dir/task-$run_id-state.json"; state_kind="task"; count=$(( count + 1 ))
+  fi
   [ "$count" -eq 1 ] || die "run '$run_id' does not hold the gate in exactly one active slot — STOP this campaign; do not write $description"
   state="$(jq -c '.' "$FENCED_STATE_FILE" 2>/dev/null)" || die "active PR state is unreadable — refusing $description"
   if [ "$state_kind" = develop ]; then
     FENCED_ACTIVE_SHA="$(jq -r '.activeSha // empty' <<<"$state")"
     FENCED_OWNER=""
+    return 0
+  fi
+  if [ "$state_kind" = task ]; then
+    owner="$(jq -r '.activeLeaseOwner // empty' <<<"$state")"
+    [ -n "$owner" ] && [ "$owner" = "$DEFAULT_OWNER" ] ||
+      die "caller owner does not match the owner recorded by task-claim — STOP this run; do not write $description"
+    prepare_lease_dir
+    exec 8>"$LEASE_DIR/task-lease-$run_id.lock" || die "could not open shared task lease lock"
+    flock -w "$LOCK_WAIT" 8 || die "shared task lease lock is busy — retry this metadata write"
+    state="$(jq -c '.' "$FENCED_STATE_FILE" 2>/dev/null)" || die "active task state became unreadable under the shared fence"
+    [ "$(jq -r '.activeRunId // empty' <<<"$state")" = "$run_id" ] &&
+      [ "$(jq -r '.activeLeaseOwner // empty' <<<"$state")" = "$DEFAULT_OWNER" ] ||
+      die "run ownership changed before the metadata write — STOP this run"
+    FENCED_ACTIVE_SHA="$(jq -r '.activeSha // empty' <<<"$state")"
+    FENCED_OWNER="$DEFAULT_OWNER"
+    lease="$(jq -c 'select(type == "object" and .schemaVersion == 1 and .kind == "task" and
+      (.runId|type == "string" and length > 0) and
+      (.deploySha|type == "string" and test("^[0-9a-f]{40}$")) and
+      (.owner|type == "string" and length > 0) and
+      (.claimedAt|type == "string" and length > 0) and
+      (.renewedAt|type == "string" and length > 0) and
+      (.expiresAt|type == "string" and length > 0))' \
+      "$LEASE_DIR/task-lease-$run_id.json" 2>/dev/null)" || die "shared task lease is missing or malformed — refusing $description"
+    [ "$(jq -r '.owner' <<<"$lease")" = "$DEFAULT_OWNER" ] || die "shared task lease belongs to another owner — STOP this run"
+    [ "$(jq -r '.runId' <<<"$lease")" = "$run_id" ] || die "shared task lease belongs to another run — STOP this run"
+    [ "$(jq -r '.deploySha' <<<"$lease")" = "$FENCED_ACTIVE_SHA" ] || die "shared task lease belongs to another deploy — STOP this run"
+    for timestamp_field in claimedAt renewedAt expiresAt; do
+      valid_utc_timestamp "$(jq -r --arg field "$timestamp_field" '.[$field]' <<<"$lease")" ||
+        die "shared task lease has an invalid UTC timestamp — refusing $description"
+    done
+    expires_epoch="$(date -u -d "$(jq -r '.expiresAt' <<<"$lease")" +%s 2>/dev/null || printf 0)"
+    [ "$(date -u +%s)" -lt "$expires_epoch" ] || die "shared task lease expired — STOP this run"
     return 0
   fi
   owner="$(jq -r '.activeLeaseOwner // empty' <<<"$state")"

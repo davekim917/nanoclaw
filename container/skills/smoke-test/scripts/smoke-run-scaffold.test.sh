@@ -476,4 +476,71 @@ scaffold marker "$CLIP" B1 fail 'real clip' 'clips/F3.mp4' --confirmed-findings 
 barrier "$CLIP" lanes | jq -e '.ready == true' >/dev/null || {
   echo "expected a real clip file to clear the barrier" >&2; exit 1; }
 
+# --- Task-scoped certification: the same shared ownership check as a PR run -
+# begin_active_run_fence had exactly two accepted active-slot shapes (`pr`,
+# `develop`). A task-scoped certification/re-verification/evidence-recovery
+# run matched neither, so contract/marker/redispatch refused it outright —
+# and coordinators hand-composed the artifacts directly instead, bypassing
+# every check below. `smoke-pr-gate.sh task-claim` is the real
+# production entry path; call it here rather than hand-writing a fixture, so
+# this proves the actual claim -> scaffold write chain, not just a schema
+# match.
+gate() { bash "$SCRIPT_DIR/smoke-pr-gate.sh" "$@"; }
+
+TASK_RUN="$FIXTURE_BASE/task-run-fixture"
+mkdir -p "$TASK_RUN/evidence"
+TASK_RUN_ID="$(basename "$TASK_RUN")"
+
+# The bypass itself: with no claim at all, the scaffold refuses exactly like
+# an unclaimed PR run. This is the defect the fix closes.
+NOCLAIM_OUT="$(scaffold contract "$TASK_RUN" "$SHA" B1:browser 2>&1 || true)"
+jq -e '.ok == false and (.error | test("does not hold the gate")) and (.error | test("STOP"))' \
+  <<<"$NOCLAIM_OUT" >/dev/null || {
+  echo "expected an unclaimed task-scoped run to be refused, got: $NOCLAIM_OUT" >&2; exit 1; }
+[ ! -e "$TASK_RUN/completion-contract.json" ] || { echo "the refused write still landed" >&2; exit 1; }
+
+# A legitimate task-claim opens exactly the same door a PR claim does.
+gate task-claim "$TASK_RUN_ID" "$SHA" | jq -e '.ok == true' >/dev/null
+scaffold contract "$TASK_RUN" "$SHA" B1:browser:'certification lane' \
+  | jq -e '.ok == true and .laneCount == 1' >/dev/null
+printf 'ok\n' >"$TASK_RUN/evidence/ok.txt"
+scaffold marker "$TASK_RUN" B1 pass 'certified' 'evidence/ok.txt' | jq -e '.ok == true' >/dev/null
+barrier "$TASK_RUN" lanes | jq -e '.ready == true' >/dev/null || {
+  echo "expected the barrier to accept a task-scoped run's contract and marker" >&2; exit 1; }
+
+# task-progress renews the shared lease; the scaffold keeps working under it.
+gate task-progress "$TASK_RUN_ID" | jq -e '.ok == true and .leaseRenewed == true' >/dev/null
+scaffold redispatch "$TASK_RUN" B1 | jq -e '.ok == true and .generation == 2' >/dev/null
+
+# After task-release, the run is unclaimed again and every write refuses —
+# same "does not hold the gate" shape as a finished/reclaimed PR run.
+gate task-release "$TASK_RUN_ID" | jq -e '.ok == true' >/dev/null
+RELEASED_OUT="$(scaffold marker "$TASK_RUN" B1 pass 'after release' 2>&1 || true)"
+jq -e '.ok == false and (.error | test("does not hold the gate"))' <<<"$RELEASED_OUT" >/dev/null || {
+  echo "expected a released task run to be refused, got: $RELEASED_OUT" >&2; exit 1; }
+
+# A run displaced by --takeover to a different owner is refused exactly like
+# the stale-PR-owner case above — same check, same message.
+STALE_TASK="$FIXTURE_BASE/task-run-stale"
+mkdir -p "$STALE_TASK"
+gate task-claim "$(basename "$STALE_TASK")" "$SHA" >/dev/null
+scaffold contract "$STALE_TASK" "$SHA" B1:browser >/dev/null
+SMOKE_GATE_OWNER=someone-else gate task-claim "$(basename "$STALE_TASK")" "$SHA" --takeover >/dev/null
+STALE_TASK_OUT="$(scaffold marker "$STALE_TASK" B1 fail 'stale' 2>&1 || true)"
+jq -e '.ok == false and (.error | test("caller owner does not match"))' <<<"$STALE_TASK_OUT" >/dev/null || {
+  echo "expected a takeover-displaced task owner to be refused, got: $STALE_TASK_OUT" >&2; exit 1; }
+
+# The contract's sourceSha must still match the claimed deploySha — a task run
+# gets the same "artifact SHA still the claimed SHA" guarantee as a PR run.
+SHA_MISMATCH="$FIXTURE_BASE/task-run-sha-mismatch"
+mkdir -p "$SHA_MISMATCH"
+gate task-claim "$(basename "$SHA_MISMATCH")" "$SHA" >/dev/null
+MISMATCH_OUT="$(scaffold contract "$SHA_MISMATCH" "$OTHER_SHA" B1:browser 2>&1 || true)"
+jq -e '.ok == false and (.error | test("does not match the SHA claimed"))' <<<"$MISMATCH_OUT" >/dev/null || {
+  echo "expected a contract SHA mismatched with the task claim to be refused, got: $MISMATCH_OUT" >&2; exit 1; }
+
+# Resume the ordinary fixture as its original owner, in case anything is ever
+# appended after this block.
+gate_owns "$(basename "$FIXTURE_DIR")"
+
 echo "smoke run scaffold tests passed"
