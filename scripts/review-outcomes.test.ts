@@ -54,8 +54,10 @@ import {
   renderWeeklyMarkdown,
   resolveAtMergeBaseSha,
   resolveAtMergeFileContextLocal,
+  resolveMainTipUntilIso,
   SHADOW_REVIEW_GO_LIVE_ISO,
   stripFencedAndCommented,
+  UNTIL_ISO_SEARCH_INDEX_LAG_MARGIN_MS,
   verifyMergedPrTotalCount,
   type Options,
   type PullRequestData,
@@ -1568,21 +1570,25 @@ describe('at-merge replay from local git (fixture repo, no network) — P2', () 
     expect(mergeCommitParentsLocal('0000000000000000000000000000000000000000')).toBeNull();
   });
 
-  it('mergeCommitParentsLocal resolves a commit that merged AFTER the local checkout was taken, by fetching it from `origin` by exact SHA', () => {
-    // Reproduces review-metrics.yml's exact race, live against davekim917/nanoclaw on
-    // 2026-09-12 (workflow run 34675405074, checked out at `818218dee3...`): the job's
-    // `actions/checkout` (`fetch-depth: 0`) runs ONCE at job start, but
-    // `fetchMergedPRs`' live `gh pr list --search` call runs minutes later, after `pnpm
-    // install`. PR #695 merged 24s into that run; its merge commit was real and on
-    // GitHub but had never been part of the checkout, and
-    // `commitExistsLocally`/`mergeCommitParentsLocal` misreported it exactly like a
-    // genuinely force-pushed-away commit — `postGateUnresolved: 1` for that week, where
-    // a same-window local run moments later (with the commit already fetched) showed 0.
+  it('mergeCommitParentsLocal no longer fetches a commit that merged AFTER the local checkout was taken — it stays null, same as any other local miss', () => {
+    // #717 review round 2 (#706 round-1 P2): round 1 covered this exact race — a PR
+    // merging into `main` in the gap between `review-metrics.yml`'s `actions/checkout`
+    // and this script's live `gh pr list --search` call minutes later — with a
+    // `git fetch --no-tags origin <sha>` retry on a local miss. That retry cannot
+    // authenticate in Actions: the repo is private, and the workflow checks out with
+    // `persist-credentials: false` (confirmed against workflow run 34675405074's log,
+    // which shows checkout removing its auth header), so it only ever worked on a host
+    // with its own git credential helper — never in CI, where the fallback was added to
+    // fix exactly this. The real fix caps the search window's end at `origin/main`'s own
+    // tip (`resolveMainTipUntilIso`), so a PR like commit B below is excluded from the
+    // window entirely (see the `resolveMainTipUntilIso` describe block below) and this
+    // function is never even called with its sha in a real run. `commitExistsLocally`
+    // therefore no longer attempts any fetch at all — this test pins that removal: a
+    // commit merged after the checkout stays an ordinary, un-fetched local miss.
     //
     // `origin` here is a second real repo on local disk, standing in for GitHub: no
     // network needed for this test — `git fetch` treats a filesystem path exactly like
-    // any other remote, and the fix under test is generic to `git fetch`'s remote,
-    // not GitHub-specific.
+    // any other remote.
     const upstreamRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-fetch-origin-upstream-'));
     function u(args: string[]): string {
       return execFileSync('git', ['-c', 'user.email=test@example.invalid', '-c', 'user.name=test', ...args], {
@@ -1594,7 +1600,6 @@ describe('at-merge replay from local git (fixture repo, no network) — P2', () 
     fs.writeFileSync(path.join(upstreamRepo, 'a.txt'), 'a\n');
     u(['add', '-A']);
     u(['commit', '-q', '-m', 'commit A — present in the checkout']);
-    const commitA = u(['rev-parse', 'HEAD']);
 
     // Cloned BEFORE commit B exists upstream, so this clone (standing in for the CI
     // job's `actions/checkout`) genuinely never saw it — not merely reset away from it.
@@ -1602,7 +1607,7 @@ describe('at-merge replay from local git (fixture repo, no network) — P2', () 
     execFileSync('git', ['clone', '-q', upstreamRepo, localRepo], { encoding: 'utf8' });
 
     // NOW a PR "merges" into upstream main — after the local clone was taken, exactly
-    // the mid-run race the fix closes.
+    // the mid-run race #706 round 1 tried (and failed, in CI) to paper over.
     fs.writeFileSync(path.join(upstreamRepo, 'b.txt'), 'b\n');
     u(['add', '-A']);
     u(['commit', '-q', '-m', 'commit B — merges into main mid-run, after the checkout']);
@@ -1613,9 +1618,9 @@ describe('at-merge replay from local git (fixture repo, no network) — P2', () 
       // Sanity check first: the local clone genuinely does not have commit B yet — if
       // this stops holding, the fixture no longer reproduces the race.
       expect(() => execFileSync('git', ['cat-file', '-e', `${commitB}^{commit}`])).toThrow();
-      // mergeCommitParentsLocal funnels through commitExistsLocally, the fetch-and-retry
-      // seam under test — it should now resolve commit B by fetching it from `origin`.
-      expect(mergeCommitParentsLocal(commitB)).toEqual([commitA]);
+      // No fetch fallback any more: this stays null, exactly like the zero-SHA case
+      // above, never a network round trip.
+      expect(mergeCommitParentsLocal(commitB)).toBeNull();
     } finally {
       process.chdir(repoDir);
       fs.rmSync(localRepo, { recursive: true, force: true });
@@ -1937,5 +1942,112 @@ describe('at-merge replay from local git (fixture repo, no network) — P2', () 
         'review',
       );
     });
+  });
+});
+
+describe('resolveMainTipUntilIso — #717 review round 2 (#706 round-1 P2 fix): deterministic search window end', () => {
+  const originalCwd = process.cwd();
+
+  function fixtureGit(dir: string, args: string[], extraEnv?: Record<string, string>): string {
+    return execFileSync('git', ['-c', 'user.email=test@example.invalid', '-c', 'user.name=test', ...args], {
+      cwd: dir,
+      encoding: 'utf8',
+      env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
+    }).trim();
+  }
+
+  function makeRepo(): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-untiliso-'));
+    fixtureGit(dir, ['init', '-q', '-b', 'main']);
+    return dir;
+  }
+
+  /** Commits `file` with an EXPLICIT author/committer date, so ordering between commits
+   *  is deterministic and never depends on real wall-clock timing between two `git
+   *  commit` calls in the same test. */
+  function commitAt(dir: string, file: string, contents: string, isoDate: string): string {
+    fs.writeFileSync(path.join(dir, file), contents);
+    fixtureGit(dir, ['add', '-A']);
+    fixtureGit(dir, ['commit', '-q', '-m', `commit at ${isoDate}`], {
+      GIT_AUTHOR_DATE: isoDate,
+      GIT_COMMITTER_DATE: isoDate,
+    });
+    return fixtureGit(dir, ['rev-parse', 'HEAD']);
+  }
+
+  it('equals the tip commit committer time minus the margin, read from origin/main (not HEAD)', () => {
+    const upstreamRepo = makeRepo();
+    const tipIso = '2026-08-01T12:00:00+00:00';
+    commitAt(upstreamRepo, 'a.txt', 'a\n', tipIso);
+
+    const localRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-untiliso-local-'));
+    execFileSync('git', ['clone', '-q', upstreamRepo, localRepo], { encoding: 'utf8' });
+    // A local run may have some other branch checked out — `resolveMainTipUntilIso` must
+    // read `origin/main`, not whatever `HEAD` happens to be, so check out a decoy branch
+    // here to prove that.
+    fixtureGit(localRepo, ['checkout', '-q', '-b', 'some-other-branch']);
+
+    process.chdir(localRepo);
+    try {
+      const untilIso = resolveMainTipUntilIso();
+      expect(untilIso).toBe(new Date(new Date(tipIso).getTime() - UNTIL_ISO_SEARCH_INDEX_LAG_MARGIN_MS).toISOString());
+      // marginMs is overridable — a zero margin is the tip's committer time exactly.
+      expect(resolveMainTipUntilIso(0)).toBe(new Date(tipIso).toISOString());
+    } finally {
+      process.chdir(originalCwd);
+      fs.rmSync(localRepo, { recursive: true, force: true });
+      fs.rmSync(upstreamRepo, { recursive: true, force: true });
+    }
+  });
+
+  it('a PR merging into main AFTER origin/main tip was read here falls after untilIso — excluded from the search window by construction, never reported unresolved', () => {
+    // This is the property the #706 round-1 P2 fix depends on: with the search window's
+    // `until` bound capped at `origin/main`'s own tip, a PR that merges into `main` in
+    // the gap between `review-metrics.yml`'s `actions/checkout` and this script's live
+    // `gh pr list --search` call minutes later can never fall INSIDE
+    // `merged:<since>..<untilIso>` — GitHub's search qualifier would simply never return
+    // it. That is a structurally different outcome from the #706 round-1 fix (a `git
+    // fetch --no-tags origin <sha>` retry in `commitExistsLocally`, removed by this
+    // change): such a PR is not "fetched and found missing", it is outside this run's
+    // window entirely and is picked up whole, as an ordinary ancestor, by the next
+    // scheduled run.
+    const upstreamRepo = makeRepo();
+    const tipIso = '2026-08-01T12:00:00+00:00';
+    commitAt(upstreamRepo, 'a.txt', 'a\n', tipIso);
+
+    const localRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'revmetrics-untiliso-local-'));
+    execFileSync('git', ['clone', '-q', upstreamRepo, localRepo], { encoding: 'utf8' });
+
+    let untilIso: string;
+    process.chdir(localRepo);
+    try {
+      untilIso = resolveMainTipUntilIso();
+    } finally {
+      process.chdir(originalCwd);
+    }
+
+    // NOW a PR "merges" into upstream main — after `origin/main`'s tip was already read
+    // above, exactly the mid-run race #706 round 1's fetch fallback tried (and failed,
+    // in CI) to paper over. 5 minutes later, past even the margin.
+    const midRunIso = '2026-08-01T12:05:00+00:00';
+    commitAt(upstreamRepo, 'b.txt', 'b\n', midRunIso);
+
+    expect(new Date(midRunIso).getTime()).toBeGreaterThan(new Date(untilIso).getTime());
+
+    fs.rmSync(localRepo, { recursive: true, force: true });
+    fs.rmSync(upstreamRepo, { recursive: true, force: true });
+  });
+
+  it('throws — never falls back to wall-clock time — when origin/main cannot be resolved at all', () => {
+    const soloRepo = makeRepo();
+    commitAt(soloRepo, 'a.txt', 'a\n', '2026-08-01T12:00:00+00:00');
+
+    process.chdir(soloRepo);
+    try {
+      expect(() => resolveMainTipUntilIso()).toThrow(/resolveMainTipUntilIso.*origin\/main/);
+    } finally {
+      process.chdir(originalCwd);
+      fs.rmSync(soloRepo, { recursive: true, force: true });
+    }
   });
 });

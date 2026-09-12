@@ -1718,19 +1718,85 @@ export function verifyMergedPrTotalCount(
   );
 }
 
-export function fetchMergedPRs(
-  repo: string,
-  sinceIso: string,
-  nowIso: string = new Date().toISOString(),
-): PullRequestData[] {
-  const slices = computeMergedSearchSlices(sinceIso, nowIso);
+/** How much to subtract from `origin/main`'s tip committer time when deriving the
+ *  search window's deterministic end (`resolveMainTipUntilIso`) — covers GitHub's
+ *  search index lagging a few seconds behind a just-landed merge, the same rationale as
+ *  `SEARCH_TOTAL_COUNT_RETRY_WAIT_MS`'s retry wait, applied here to the window bound
+ *  itself rather than to a retry. */
+export const UNTIL_ISO_SEARCH_INDEX_LAG_MARGIN_MS = 2 * 60 * 1000;
+
+/**
+ * The search window's deterministic end (`untilIso`): `origin/main`'s tip committer
+ * time (`git log -1 --format=%cI origin/main`), minus a margin
+ * (`UNTIL_ISO_SEARCH_INDEX_LAG_MARGIN_MS`, ~2 minutes) for GitHub search-index lag.
+ *
+ * Deliberately `origin/main`, not `HEAD` — a local run may have some other branch
+ * checked out (this script itself, developed against a feature branch, is the ordinary
+ * case), and the window must reflect what `main` actually looked like at checkout, not
+ * whatever ref happens to be checked out when the script happens to run.
+ *
+ * This replaces a captured wall-clock `new Date().toISOString()` as the search window's
+ * `until` bound (the #706 P2, review round 2 on #717). With wall-clock `now`, a PR that
+ * merged into `main` in the gap between `review-metrics.yml`'s `actions/checkout` and
+ * this script's live `gh pr list --search` call minutes later — after `pnpm install` —
+ * was IN the window (its `mergedAt` <= wall-clock now) even though its merge commit was
+ * never part of the checkout. `commitExistsLocally` used to paper over exactly that gap
+ * with a `git fetch --no-tags origin <sha>` retry on a local miss, but that retry cannot
+ * authenticate in `review-metrics.yml`: the repo is private and the workflow checks out
+ * with `persist-credentials: false`, so an unauthenticated fetch gets a 401 in Actions —
+ * confirmed against workflow run 34675405074's log, which shows checkout removing its
+ * auth header. The fallback only ever worked on a host with its own git credential
+ * helper (`gh auth git-credential`), which the CI runner is not, so a PR merging mid-job
+ * (#695's case) was still reported unresolved in Actions specifically.
+ *
+ * Deriving `untilIso` from the checkout's OWN `origin/main` tip instead makes the
+ * window's end deterministic and reproducible from that one commit: every merged PR the
+ * window can return is, by construction, already an ancestor of the checkout, so
+ * `commitExistsLocally` needs no fetch fallback at all (removed by this change) — a
+ * local miss there is now always a genuine gap (shallow clone, force-pushed-away base),
+ * never a PR that merely merged mid-job. A PR that merges after `origin/main`'s tip was
+ * read here simply falls outside this run's window and is picked up whole by the next
+ * scheduled run instead.
+ *
+ * Fails loudly, never falling back to wall-clock time, when `origin/main` can't be
+ * resolved at all (no such remote-tracking ref — e.g. a repo with no `origin` remote, or
+ * one `git fetch` never touched) or its committer date can't be parsed.
+ */
+export function resolveMainTipUntilIso(marginMs: number = UNTIL_ISO_SEARCH_INDEX_LAG_MARGIN_MS): string {
+  let raw: string;
+  try {
+    raw = execFileSync('git', ['log', '-1', '--format=%cI', 'origin/main'], {
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    // eslint-disable-next-line no-catch-all/no-catch-all
+  } catch (err) {
+    throw new Error(
+      `review-outcomes: resolveMainTipUntilIso: could not resolve origin/main's tip commit (\`git log -1 ` +
+        `--format=%cI origin/main\` failed) — the search window's end must come from the checked-out ` +
+        `origin/main, never a wall-clock fallback. Underlying error: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  const tipMs = new Date(raw).getTime();
+  if (!Number.isFinite(tipMs)) {
+    throw new Error(
+      `review-outcomes: resolveMainTipUntilIso: unparseable committer date from \`git log -1 --format=%cI ` +
+        `origin/main\`: ${JSON.stringify(raw)}`,
+    );
+  }
+  return new Date(tipMs - marginMs).toISOString();
+}
+
+export function fetchMergedPRs(repo: string, sinceIso: string, untilIso: string): PullRequestData[] {
+  const slices = computeMergedSearchSlices(sinceIso, untilIso);
   const sliceResults = slices.map((slice) => ({ slice, prs: fetchMergedPrsForSlice(repo, slice) }));
   const combined = combineMergedPrSlices(sliceResults);
-  // Same `nowIso` used for both the slices above and the total below (a single value
-  // captured once at this call's entry, whether passed in or defaulted) — a PR merging
-  // mid-run can't shift one bound without shifting the other, which would otherwise
-  // manufacture a mismatch `verifyMergedPrTotalCount` would then wrongly act on.
-  verifyMergedPrTotalCount(combined.length, { repo, sinceIso, untilIso: nowIso });
+  // The SAME `untilIso` used for both the slices above and the total below (computed
+  // once by the caller, from `resolveMainTipUntilIso`) — a PR merging mid-run can't
+  // shift one bound without shifting the other, which would otherwise manufacture a
+  // mismatch `verifyMergedPrTotalCount` would then wrongly act on.
+  verifyMergedPrTotalCount(combined.length, { repo, sinceIso, untilIso });
   return combined;
 }
 
@@ -1779,7 +1845,34 @@ function git(args: readonly string[]): string {
   });
 }
 
-function commitResolvesLocally(sha: string): boolean {
+/** Whether `sha` resolves to a real commit in the LOCAL object database — distinct from
+ *  "resolves, but a path doesn't exist in its tree" (see `readRiskHighGlobsAtShaLocal`).
+ *  False for a commit a shallow clone never fetched at all, or one a force-push made
+ *  unreachable — the "handle a missing commit... as unresolved" case.
+ *
+ *  This used to fall back to one `git fetch --quiet --no-tags origin <sha>` attempt on a
+ *  local miss, to cover a PR merging into `main` in the gap between
+ *  `review-metrics.yml`'s `actions/checkout` (which runs once, at job start) and this
+ *  script's live `gh pr list --search`/`search/issues` calls minutes later, after `pnpm
+ *  install` (#706 round 1; reproduced live against davekim917/nanoclaw on 2026-09-12,
+ *  workflow run 34675405074: PR #695 merged 24s into that run, and its merge commit was
+ *  absent from the checkout). That fallback cannot authenticate in `review-metrics.yml`
+ *  though: the repo is private, and the workflow checks out with
+ *  `persist-credentials: false` — confirmed against that same run's log, which shows
+ *  checkout removing its auth header — so an unauthenticated `git fetch` gets a 401 in
+ *  Actions specifically. The fallback only ever worked on a host with its own git
+ *  credential helper (`gh auth git-credential`), which the CI runner is not, so a PR
+ *  merging mid-job was STILL reported unresolved there (#717 review round 1 P2).
+ *
+ *  Fixed properly instead by capping the search window's end at `origin/main`'s own tip
+ *  (`resolveMainTipUntilIso`, used to build `untilIso` in `main()`): every merged PR this
+ *  run's window can return is, by construction, already an ancestor of the checkout, so
+ *  a local miss here is now always a genuine gap (shallow clone, force-pushed-away
+ *  base) — never a PR that merely merged mid-job, which instead falls outside the
+ *  window entirely and is picked up whole by the next scheduled run. No fetch fallback
+ *  is needed or attempted any more; `false` here is final, and is what turns into
+ *  `'error'`/unresolved up the stack, never a guessed default. */
+function commitExistsLocally(sha: string): boolean {
   try {
     execFileSync('git', ['cat-file', '-e', `${sha}^{commit}`], { stdio: 'ignore' });
     return true;
@@ -1787,43 +1880,6 @@ function commitResolvesLocally(sha: string): boolean {
   } catch {
     return false;
   }
-}
-
-/** Whether `sha` resolves to a real commit in the LOCAL object database — distinct from
- *  "resolves, but a path doesn't exist in its tree" (see `readRiskHighGlobsAtShaLocal`).
- *  False for a commit a shallow clone never fetched at all, or one a force-push made
- *  unreachable — the "handle a missing commit... as unresolved" case — but ONLY after
- *  one `git fetch --quiet --no-tags origin <sha>` attempt on an initial miss, first.
- *
- *  Why the fetch: `review-metrics.yml`'s `actions/checkout` (`fetch-depth: 0`) runs ONCE
- *  at job start, but `fetchMergedPRs`' live `gh pr list --search`/`search/issues` calls
- *  run minutes later, after `pnpm install`. A PR can merge into `main` in that gap — its
- *  merge commit is real and on GitHub, was simply never part of the checkout — and
- *  without this retry it was misreported exactly like a genuinely force-pushed-away
- *  commit: reproduced live against davekim917/nanoclaw on 2026-09-12 (workflow run
- *  34675405074, `main` at `818218dee3...`; PR #695 merged 24s into that run, and its
- *  merge commit `a89d70e32f...` was absent from the checkout, `postGateUnresolved: 1` for
- *  2026-W37 where a same-window local run moments later — with #695's commit already
- *  fetched — showed 0). GitHub supports fetching an arbitrary reachable commit by its
- *  exact SHA (confirmed empirically: a shallow clone pinned to `818218dee3...`, `git
- *  fetch --no-tags origin a89d70e32f...`, then `git diff` between the two succeeded).
- *
- *  The fetch is attempted only AFTER a local miss — the overwhelmingly common case is a
- *  hit, costing no network at all — and only once per commit. A repo with no `origin`
- *  remote (every fixture in this suite) fails the attempt in a few milliseconds with no
- *  network reached at all (confirmed empirically), so this adds no real cost to tests. A
- *  commit still missing after the fetch attempt is a genuine gap — no reachable SHA, or
- *  no network/remote at all — and `false` here is what turns into `'error'`/unresolved
- *  up the stack, never a guessed default. */
-function commitExistsLocally(sha: string): boolean {
-  if (commitResolvesLocally(sha)) return true;
-  try {
-    execFileSync('git', ['fetch', '--quiet', '--no-tags', 'origin', sha], { stdio: 'ignore' });
-    // eslint-disable-next-line no-catch-all/no-catch-all
-  } catch {
-    return false;
-  }
-  return commitResolvesLocally(sha);
 }
 
 /** `mergeCommitOid`'s parent oids, in order, or `null` when that commit isn't resolvable
@@ -2417,9 +2473,11 @@ export function computeFetchSinceIso(
   return new Date(Math.min(switchBasedMs, goLiveMs)).toISOString();
 }
 
-/** The lower fetch bound `--weekly` needs on its own: `weeklyDays` back from `nowIso`. */
-export function computeWeeklyFetchSinceIso(nowIso: string, weeklyDays: number): string {
-  return new Date(new Date(nowIso).getTime() - weeklyDays * MS_PER_DAY).toISOString();
+/** The lower fetch bound `--weekly` needs on its own: `weeklyDays` back from `untilIso`
+ *  (the deterministic search-window end — see `resolveMainTipUntilIso` — not wall-clock
+ *  `now`, so the whole run's window anchors to one commit). */
+export function computeWeeklyFetchSinceIso(untilIso: string, weeklyDays: number): string {
+  return new Date(new Date(untilIso).getTime() - weeklyDays * MS_PER_DAY).toISOString();
 }
 
 function printWeeklyReport(weekly: WeeklyReport): void {
@@ -2474,20 +2532,27 @@ function main(): void {
   const labelerConfig = parse(labelerYaml) as Record<string, unknown>;
   const riskHighGlobs = globsForRiskHigh(labelerConfig);
 
+  // Computed ONCE, from the checked-out `origin/main`'s own tip — never wall-clock
+  // `now` — so the whole run's search window is deterministic and reproducible from
+  // that commit (see `resolveMainTipUntilIso`'s own doc comment). Used below as both the
+  // `--weekly-days` lookback's reference point and the search window's `until` bound, so
+  // a single value grounds this entire run.
+  const untilIso = resolveMainTipUntilIso();
+
   const beforeAfterSinceIso = computeFetchSinceIso(options.switchIso, options.days);
 
   if (options.weekly) {
     // One `gh` fetch batch serves both reports: the weekly rows need `--weekly-days`
-    // of history back from now, and the cumulative before/after comparison
+    // of history back from `untilIso`, and the cumulative before/after comparison
     // (`renderWeeklyMarkdown`'s second table) needs the same window `computeReport`
     // always has — so the fetch bound is the EARLIER of the two, same reasoning as
     // `computeFetchSinceIso` already applies to its own two callers.
-    const weeklySinceIso = computeWeeklyFetchSinceIso(new Date().toISOString(), options.weeklyDays ?? 90);
+    const weeklySinceIso = computeWeeklyFetchSinceIso(untilIso, options.weeklyDays ?? 90);
     const sinceIso =
       new Date(weeklySinceIso).getTime() < new Date(beforeAfterSinceIso).getTime()
         ? weeklySinceIso
         : beforeAfterSinceIso;
-    const fetchedPRs = fetchMergedPRs(options.repo, sinceIso);
+    const fetchedPRs = fetchMergedPRs(options.repo, sinceIso, untilIso);
     const shadowReviewIssues = fetchShadowReviewIssues(options.repo);
     const shadowReviewFailedPrNumbers = fetchShadowReviewFailedPRs(options.repo);
     const shadowReviewedLabelPrNumbers = fetchShadowReviewedPRs(options.repo);
@@ -2529,6 +2594,7 @@ function main(): void {
             followupDays: options.followupDays,
             weeklyDays: options.weeklyDays ?? 90,
             since: sinceIso,
+            until: untilIso,
             weekly,
             cumulative,
             markdown: renderWeeklyMarkdown(weekly, cumulative),
@@ -2545,7 +2611,7 @@ function main(): void {
     return;
   }
 
-  const allPRs = fetchMergedPRs(options.repo, beforeAfterSinceIso);
+  const allPRs = fetchMergedPRs(options.repo, beforeAfterSinceIso, untilIso);
   const shadowReviewIssues = fetchShadowReviewIssues(options.repo);
   const shadowReviewFailedPrNumbers = fetchShadowReviewFailedPRs(options.repo);
   const shadowReviewedLabelPrNumbers = fetchShadowReviewedPRs(options.repo);
