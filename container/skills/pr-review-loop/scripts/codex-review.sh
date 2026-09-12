@@ -549,6 +549,14 @@ REVIEW_NOTES_NONE_CANDIDATE_RE='(^|\n)Review-notes:[ \t]*none[ \t]*\((?<rest>[^\
 # line anchor cannot see it either. Used only to tell "hidden by a fence or
 # comment" apart from "no line at all", never to parse the reason itself.
 REVIEW_NOTES_NONE_ANYWHERE_RE='Review-notes:[ \t]*none[ \t]*\('
+# Splits a candidate's `rest` (everything after `none (`) into the reason and
+# whatever follows the closing parenthesis, without jq's `index`/slice, which
+# disagree on offsets below jq 1.8: `index` counts bytes, a slice counts
+# codepoints, so a non-ASCII reason (multi-byte UTF-8) misaligned them and cut
+# the reason short (#713 P3). No match at all — no unescaped `)`, or a `(`
+# before one — means an unmatched or nested parenthesis, read by capture's
+# empty result rather than a byte offset.
+REVIEW_NOTES_REASON_SPLIT_RE='^(?<reason>[^()]*)\)(?<trailing>.*)$'
 
 # `missing` when a fix title's body has no Fixes-PR line, else `ok`, for a
 # {title, body} JSON object on stdin — merge-check's rule, and audit's. A line
@@ -976,6 +984,7 @@ review_notes_state() {
   if [ "$state" = none ]; then echo ok; return 0; fi
   printf '%s' "$1" | jq -r -L "$HERE" --arg state "$state" --arg lineRe "$REVIEW_NOTES_NONE_LINE_RE" \
     --arg candidateRe "$REVIEW_NOTES_NONE_CANDIDATE_RE" --arg anywhereRe "$REVIEW_NOTES_NONE_ANYWHERE_RE" \
+    --arg splitRe "$REVIEW_NOTES_REASON_SPLIT_RE" \
     --arg notes "$REVIEW_NOTES_FILE" --argjson files "$SCOPE_FILES" '
     include "pr-body";
     # Strip every format character first, then require at least one visible
@@ -1017,13 +1026,18 @@ review_notes_state() {
         | ( ((.body // "") | test($anywhereRe; "i")) and (($body | test($anywhereRe; "i")) | not) ) as $hiddenByStripping
         | ( if ($candidates | length) > 0 then
               ($candidates[0].rest) as $rest
-              | ($rest | index("(")) as $openIdx
-              | ($rest | index(")")) as $closeIdx
-              | if ($openIdx != null and ($closeIdx == null or $openIdx < $closeIdx)) or $closeIdx == null then
+              # capture, not index/slice: a byte offset from index and a
+              # codepoint offset from a slice disagree once $rest holds a
+              # multi-byte UTF-8 reason, and this must never depend on which
+              # one wins (#713 P3). No match — no unescaped `)`, or a `(`
+              # before the first `)` — comes back as an empty array, same as
+              # the old "unmatched or nested" branch.
+              | ( [ $rest | capture($splitRe) ] ) as $split
+              | if ($split | length) == 0 then
                   "the body carries a `Review-notes: none (...)` line, but its reason has an unmatched or nested parenthesis, which the check cannot parse. Remove the inner parenthesis, or add or amend the lesson in \($notes)"
                 else
-                  ($rest[0:$closeIdx]) as $reasonContent
-                  | ($rest[($closeIdx + 1):] | gsub("^[ \t]+"; "") | gsub("[ \t\r]+$"; "")) as $trailing
+                  ($split[0].reason) as $reasonContent
+                  | ($split[0].trailing | gsub("^[ \t]+"; "") | gsub("[ \t\r]+$"; "")) as $trailing
                   | if ($reasonContent | real_reason | not) then
                       "the body carries a `Review-notes: none ()` line, but its reason is empty or has no visible character. Give it a visible reason, or add or amend the lesson in \($notes)"
                     elif ($trailing | length) > 0 then
@@ -1113,7 +1127,7 @@ merge_check_main() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --head)
-        [ $# -ge 2 ] || { echo "merge-check: --head needs a sha" >&2; exit 2; }
+        [ $# -ge 2 ] && [[ "$2" =~ ^[0-9a-f]{7,40}$ ]] || { echo "merge-check: --head needs a hex sha (7-40)" >&2; exit 2; }
         want="$2"; shift 2 ;;
       *) echo "merge-check: unknown argument $1" >&2; exit 2 ;;
     esac

@@ -2118,6 +2118,74 @@ describe('codex-review risk-scoped review requests', () => {
   });
 });
 
+// Every subcommand whose --head parsing (its own case arm, or a function it
+// dispatches to as `<fn>_main "$@"`) appears in codex-review.sh, derived from
+// the script's own source rather than a hand-maintained list here — so a
+// future subcommand that adds --head parsing without validating its format
+// fails this test automatically, instead of depending on someone remembering
+// to add a case (#713 P1; docs/review-notes.md's "usage exit code" class, a
+// recurrence of #698's — a SHA argument not validated at the entry point).
+function headTakingSubcommands(source: string): string[] {
+  const lines = source.split('\n');
+  const dispatchStart = lines.findIndex((l) => /^case "\$\{1:\?usage:/.test(l));
+  if (dispatchStart === -1) throw new Error('codex-review.sh: could not find the command dispatcher');
+  const dispatchEnd = lines.findIndex((l, i) => i > dispatchStart && l === 'esac');
+  if (dispatchEnd === -1) throw new Error("codex-review.sh: could not find the dispatcher's closing esac");
+
+  // Top-level arms are exactly two-space indented `<name>)`, never the `*)`
+  // catch-all (which carries its body on the same line).
+  const armRe = /^ {2}([a-z][a-z-]*)\)$/;
+  const arms: { name: string; start: number }[] = [];
+  for (let i = dispatchStart + 1; i < dispatchEnd; i++) {
+    const m = armRe.exec(lines[i]);
+    if (m) arms.push({ name: m[1], start: i });
+  }
+  if (arms.length === 0) throw new Error('codex-review.sh: found no top-level subcommand arms');
+
+  // Every function in this file opens and closes at column 0 (checked by hand
+  // against merge_check_main and ci_wait_main), so its body is the lines from
+  // `<name>() {` to the next `}` line.
+  function functionBody(name: string): string {
+    const start = lines.findIndex((l) => l === `${name}() {`);
+    if (start === -1) return '';
+    const end = lines.findIndex((l, i) => i > start && l === '}');
+    return end === -1 ? '' : lines.slice(start, end + 1).join('\n');
+  }
+
+  const headTaking: string[] = [];
+  for (let i = 0; i < arms.length; i++) {
+    const end = i + 1 < arms.length ? arms[i + 1].start : dispatchEnd;
+    let block = lines.slice(arms[i].start, end).join('\n');
+    const delegate = block.match(/(\w+_main)\s+"\$@"/);
+    if (delegate) block += `\n${functionBody(delegate[1])}`;
+    if (/^\s*--head\)/m.test(block)) headTaking.push(arms[i].name);
+  }
+  return headTaking;
+}
+
+describe('every subcommand that parses --head validates it as a hex sha before reading anything (#713 P1)', () => {
+  const subcommands = headTakingSubcommands(fs.readFileSync(HELPER, 'utf8'));
+
+  // A parser regression that silently found zero subcommands would make every
+  // case below vacuous (it.each on an empty list runs nothing); pin the known
+  // members so that failure mode is itself a visible test failure.
+  it('found the subcommands this file is known to cover', () => {
+    expect(subcommands).toEqual(expect.arrayContaining(['ci-wait', 'merge-check', 'merge', 'receipt']));
+  });
+
+  it.each(subcommands.flatMap((cmd) => [
+    [cmd, ''],
+    [cmd, 'zzz'],
+    [cmd, 'a'],
+  ]))('%s --head %j exits 2, reading nothing', (cmd, value) => {
+    const root = tempRoot();
+
+    const result = runHelper(root, [cmd, '--head', value]);
+    expect(result.status).toBe(2);
+    expect(result.calls).toBe('');
+  });
+});
+
 // After `gh pr merge` succeeds, the PR reads as merged into MERGE_OID.
 function mergesTo(root: string): void {
   writeJson(root, 'pr-merged.json', { ...prState([]), state: 'MERGED', mergeCommit: { oid: MERGE_OID } });
@@ -2984,6 +3052,22 @@ describe('codex-review review-notes rule: a PR a reviewer said no to records its
       'a nested parenthesis',
       'Why.\n\nReview-notes: none (see (the #679 line))',
       'its reason has an unmatched or nested parenthesis',
+    ],
+    // #713 P3: jq's `index` returns a byte offset below 1.8, but a slice
+    // counts codepoints; a multi-byte reason made the two disagree. A
+    // non-ASCII but invisible reason must still read as no visible character
+    // (not, say, a truncated or off-by-several-bytes reason).
+    [
+      'a non-ASCII invisible reason (U+3164, Hangul filler)',
+      'Why.\n\nReview-notes: none (ㅤ)',
+      'its reason is empty or has no visible character',
+    ],
+    // A visible multi-byte reason with trailing text: the trailing text must
+    // be quoted correctly, not shifted by the reason's byte length.
+    [
+      'a non-ASCII visible reason with text after the parenthesis',
+      'Why.\n\nReview-notes: none (日本語) and more',
+      'it has text after the closing parenthesis ("and more")',
     ],
     [
       'the line inside a code fence',
