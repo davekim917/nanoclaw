@@ -62,8 +62,26 @@ its disposition. A local completion claim is not substitute-review coverage.
 
 ## Review notes and fix links
 
-Before starting, the author and the reviewer read `docs/review-notes.md`.
-Deferring a finding to an issue, or reverting a PR, appends one line there.
+Before writing or reviewing code, the author and the reviewer read
+`docs/review-notes.md`.
+
+Every review verdict this fleet produces is posted as a receipt
+(`codex-review.sh receipt`), `changes` included: a verdict that stays in chat
+leaves nothing for the gate or the notes to read. A PR that received any
+`changes` receipt, on any head, adds or amends a line in `docs/review-notes.md`
+in the same PR, or carries a body line `Review-notes: none (<reason>)` with a
+non-empty reason. A finding fixed during review is a lesson as much as a
+deferred one, and it is the kind that used to go unrecorded.
+`codex-review.sh merge-check` refuses without one (exit 24,
+`review_notes_missing`), and `audit` re-checks it as of the merge. A line
+inside a code fence or an HTML comment doesn't count. Deferring a finding to
+an issue, or reverting a PR, adds a line too.
+
+A class on a second line must name a structural fix on its newest line: the
+lint rule, test or primitive that now catches it. `scripts/review-notes.test.ts`
+fails the PR that records the second occurrence without one, which is where
+that fix belongs.
+
 When the PR carries `risk:*` dimension labels, they scope the reviewer's
 brief. Labels are for reading: `codex-review.sh scope` decides whether a head
 is reviewed at all from the PR's changed files, and a label can only add
