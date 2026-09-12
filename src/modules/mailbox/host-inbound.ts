@@ -358,7 +358,8 @@ export async function migrateInboundDbToHostDir(
     // planted file that was never there.
     const present = fileIdentityOf(hostPath);
     if (!present) throw new SessionDbMissingError(hostPath);
-    if (!(await hostInboundProvenanceMatches(key.agentGroupId, key.sessionId, hostPath))) {
+    const recorded = await readHostInboundProvenance(key.agentGroupId, key.sessionId);
+    if (!recorded || recorded.device !== present.device || recorded.inode !== present.inode) {
       throw new HostInboundProvenanceError(key.sessionId, hostPath);
     }
     // Past the gate the file is known to be this host's, so the inode
@@ -370,6 +371,24 @@ export async function migrateInboundDbToHostDir(
     // fresh file over the name) the container's read path would be serving a
     // different database than the host writes. Re-link rather than trust it.
     return asVanished(hostPath, () => {
+      // Re-verify the identity the record named, against a FRESH stat, inside
+      // the synchronous act. The gate above had to await the central DB, and an
+      // `await` in a decide-then-act path is exactly where a check-then-use gap
+      // appears. Analysis says nothing can substitute the file in that window —
+      // no container for this session exists while the spawn runs (the previous
+      // one is gone before the respawn, the next does not exist until the mount
+      // set is built), and a second concurrent migration for one session is
+      // impossible because `buildMounts` runs inside the `spawningSessions`
+      // span and a second wake reuses the in-flight `wakePromises` entry
+      // (`src/container-runner.ts`). This makes that an invariant the code
+      // checks rather than one the reader has to take on trust; the reclaim can
+      // still delete the file, which `asVanished` reports as a vanished
+      // session.
+      const stillRecorded = fileIdentityOf(hostPath);
+      if (!stillRecorded) throw new SessionDbMissingError(hostPath);
+      if (stillRecorded.device !== recorded.device || stillRecorded.inode !== recorded.inode) {
+        throw new HostInboundProvenanceError(key.sessionId, hostPath);
+      }
       const sameInode = legacyExists && fs.statSync(hostPath).ino === fs.statSync(legacyPath).ino;
       if (!sameInode) {
         if (legacyExists) fs.rmSync(legacyPath, { force: true });

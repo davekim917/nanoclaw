@@ -326,6 +326,32 @@ if drain_in_flight; then
     exit 1
   fi
 fi
+# Quarantine any `<session>/.host/` this host did not create (#749).
+#
+# `.host/` is the host-owned directory holding inbound.db. A container can
+# CREATE it: under a mount set built before the directory existed, /workspace is
+# read-write and nothing is overlaid over a path that is not there. A planted
+# directory OUTLIVES the container that made it, so restarting containers does
+# not close it — the next spawn would find a host-owned file present and adopt
+# it. The spawn path refuses that via the provenance record; this asks the same
+# question at the deploy boundary, where the answer can be acted on.
+#
+# Runs on EVERY deploy, not once, because the predicate is provenance rather
+# than age: before this layout shipped no host binary ever created `.host/` and
+# no record exists, so everything found is container-created; afterwards only a
+# directory with no matching record is taken. Quarantine MOVES the directory —
+# `<session>/inbound.db` is a hard link to the same inode, so the database stays
+# reachable under the legacy name and the next spawn re-migrates it.
+#
+# Fails the deploy if it cannot run: a sweep that did not happen cannot rule out
+# a planted directory, and restarting into that is the failure this exists to
+# prevent.
+write_status "running" "planted host-dir sweep" ""
+if ! pnpm exec tsx scripts/quarantine-planted-host-dirs.ts --apply >> "$LOG" 2>&1; then
+  write_status "failed" "planted host-dir sweep" "could not sweep container-planted .host directories — restart refused"
+  exit 1
+fi
+
 if [ -z "$MIGRATION_CHANGES" ]; then
   mkdir -p data
   printf '{"commit":"%s","imageBase":"%s","timestamp":"%s","node":"%s"}\n' \
