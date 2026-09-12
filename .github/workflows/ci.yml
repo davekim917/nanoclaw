@@ -179,6 +179,20 @@ jobs:
           GIT_COMMITTER_NAME: selfcheck
           GIT_COMMITTER_EMAIL: selfcheck@example.invalid
 
+      # Builds real fixture repos (via a real, throwaway HOME) and runs the
+      # SHIPPED health-sentinel.sh against them, same shape as the two
+      # selfchecks above — this one had no CI job at all until #715's
+      # follow-up (review-715 P3 #5). Unlike those two, this fixture sets its
+      # own git identity inside each throwaway repo it creates, so it needs no
+      # GIT_AUTHOR_*/GIT_COMMITTER_* env here. HOME is a fresh mktemp -d and
+      # GIT_CONFIG_NOSYSTEM=1 keeps it hermetic against this runner's own git
+      # config; ~7s, bash/git/jq are all preinstalled on ubuntu-latest.
+      - name: health-sentinel.sh selfcheck
+        run: |
+          export HOME="$(mktemp -d)"
+          export GIT_CONFIG_NOSYSTEM=1
+          pnpm run check:health-sentinel-selfcheck
+
       # Feeds scripts/check-risk-coverage.ts against the committed
       # coverage-risk-baseline.json (docs/specs/risk-based-review/plan.md,
       # "Tests on risky paths"): a per-file floor set by each risk file's OWN
