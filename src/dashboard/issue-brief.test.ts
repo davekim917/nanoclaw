@@ -138,3 +138,122 @@ describe('observatoryIssueBriefHandler', () => {
     expect(brief.bodyTruncated).toBe(true);
   });
 });
+
+// Workgroups are the data-pool boundary. The `workgroup` query value is
+// caller-chosen, so the handler must refuse one the caller cannot see — with
+// the same 404 an unknown workgroup gets — before it reads that workgroup's
+// board, serves its cache, or resolves its scoped GitHub token.
+describe('observatoryIssueBriefHandler — workgroup scope', () => {
+  const scoped = (role: 'member' | 'admin_of_group', groupIds: string[]): AuthedRequestContext => ({
+    ...ctx,
+    scopes: { role, allowed_group_ids: groupIds, no_filter: false },
+  });
+  const globalAdmin: AuthedRequestContext = {
+    ...ctx,
+    scopes: { role: 'global_admin', allowed_group_ids: [], no_filter: true },
+  };
+  const ISSUE = { state: 'open', body: 'private body of workgroup one', labels: [], comments: 0 };
+
+  beforeEach(async () => {
+    await initTestDb();
+    runMigrations(getRawDb());
+    const at = new Date().toISOString();
+    const ins = getRawDb().prepare(`INSERT INTO workgroups (id, display_name, created_at) VALUES (?, ?, ?)`);
+    ins.run('wg-1', 'One', at);
+    ins.run('wg-2', 'Two', at);
+    for (const [id, folder, wg] of [
+      ['ag-1', 'example-co', 'wg-1'],
+      ['ag-2', 'other-co', 'wg-2'],
+    ] as const) {
+      await createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: at });
+      getRawDb().prepare(`UPDATE agent_groups SET workgroup_id = ? WHERE id = ?`).run(wg, id);
+    }
+    vi.stubEnv('GITHUB_TOKEN_EXAMPLE_CO', 'tok-wg-1');
+    vi.stubEnv('GITHUB_TOKEN_OTHER_CO', 'tok-wg-2');
+    _resetIssueBriefCacheForTesting();
+    // Only wg-1 has a board; any other id reads as no board at all.
+    mockReadReleaseState.mockImplementation(async (wg: string) =>
+      wg === 'wg-1' ? boardItem('https://github.com/example-org/example-repo/issues/803') : null,
+    );
+    ghResponses(ISSUE, []);
+  });
+  afterEach(async () => {
+    await closeDb();
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    vi.clearAllMocks();
+  });
+
+  it.each([
+    ['member', scoped('member', ['ag-2'])],
+    ['admin_of_group', scoped('admin_of_group', ['ag-2'])],
+  ])(
+    'a %s scoped to workgroup 2 asking for workgroup 1 gets 404, and neither the board read nor the GitHub fetch happens',
+    async (_role, caller) => {
+      const resp = await observatoryIssueBriefHandler(get('workgroup=wg-1&item=XZO%231'), {}, caller);
+      expect(resp!.status).toBe(404);
+      expect(await resp!.json()).toEqual({ error: 'not_found' });
+      expect(mockReadReleaseState).not.toHaveBeenCalled();
+      expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+    },
+  );
+
+  it('the refusal is indistinguishable from an unknown workgroup — existence does not leak', async () => {
+    const caller = scoped('member', ['ag-2']);
+    const denied = await observatoryIssueBriefHandler(get('workgroup=wg-1&item=XZO%231'), {}, caller);
+    const unknown = await observatoryIssueBriefHandler(get('workgroup=wg-nope&item=XZO%231'), {}, caller);
+    expect(denied!.status).toBe(404);
+    expect(unknown!.status).toBe(404);
+    expect(await denied!.json()).toEqual(await unknown!.json());
+    expect(mockReadReleaseState).not.toHaveBeenCalled();
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+
+  it('a scoped caller with no groups at all gets 404 without a board read', async () => {
+    const resp = await observatoryIssueBriefHandler(get('workgroup=wg-1&item=XZO%231'), {}, scoped('member', []));
+    expect(resp!.status).toBe(404);
+    expect(mockReadReleaseState).not.toHaveBeenCalled();
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+
+  it('a brief an owner already cached is not served to a caller outside the workgroup', async () => {
+    const warm = await observatoryIssueBriefHandler(get('workgroup=wg-1&item=XZO%231'), {}, ctx);
+    expect(warm!.status).toBe(200);
+    const fetchesAfterWarm = vi.mocked(fetch).mock.calls.length;
+    const resp = await observatoryIssueBriefHandler(get('workgroup=wg-1&item=XZO%231'), {}, scoped('member', ['ag-2']));
+    expect(resp!.status).toBe(404);
+    expect(JSON.stringify(await resp!.json())).not.toContain('private body');
+    expect(vi.mocked(fetch).mock.calls.length).toBe(fetchesAfterWarm);
+  });
+
+  it.each([
+    ['member of workgroup 1', scoped('member', ['ag-1'])],
+    ['admin_of_group in workgroup 1', scoped('admin_of_group', ['ag-1'])],
+    ['member of both workgroups', scoped('member', ['ag-1', 'ag-2'])],
+    ['owner', ctx],
+    ['global admin', globalAdmin],
+  ])('a %s gets 200, fetched with workgroup 1’s own token', async (_who, caller) => {
+    const resp = await observatoryIssueBriefHandler(get('workgroup=wg-1&item=XZO%231'), {}, caller);
+    expect(resp!.status).toBe(200);
+    expect(((await resp!.json()) as { body: string }).body).toBe('private body of workgroup one');
+    expect(mockReadReleaseState).toHaveBeenCalledWith('wg-1');
+    const calls = vi.mocked(fetch).mock.calls;
+    expect((calls[0]![1] as RequestInit).headers).toMatchObject({ Authorization: 'Bearer tok-wg-1' });
+  });
+
+  it('an unknown workgroup is a 404 for a scoped caller and for an owner', async () => {
+    const scopedResp = await observatoryIssueBriefHandler(
+      get('workgroup=wg-nope&item=XZO%231'),
+      {},
+      scoped('member', ['ag-1']),
+    );
+    expect(scopedResp!.status).toBe(404);
+    // An owner passes the scope check on its first line (no_filter,
+    // api/observatory.ts hasWorkgroupAccess), so the 404 is the board's: an
+    // unknown workgroup has no board, hence no item.
+    const ownerResp = await observatoryIssueBriefHandler(get('workgroup=wg-nope&item=XZO%231'), {}, ctx);
+    expect(ownerResp!.status).toBe(404);
+    expect(await ownerResp!.json()).toEqual({ error: 'item_not_on_board' });
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+});

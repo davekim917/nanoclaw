@@ -390,6 +390,92 @@ case "$OUT" in
   *) bad "a pulled scripts-only merge still breached" "$OUT" ;;
 esac
 
+# ── pull-lag and restart-lag no longer share a dedup key (#716 P3) ─────────
+# The two breaches used to both stamp `deploy-lag`, so a pull-lag alert (the
+# 24h-bound half that needs no restart) could stamp the SAME cooldown a
+# restart-lag breach (the 3h-bound, more serious half) relies on, hiding it
+# for up to 6h behind an unrelated alert. Own fixture, not the shared $ROOT
+# above (whose git history and refs are already committed to the scenarios
+# tested there): a scripts-only commit (pull-lag) is built first, then a
+# src/ commit (restart-lag) on top of it, so each vital's trigger condition
+# can be turned on independently across two runs against the SAME persisted
+# state.json — the only way to actually exercise a dedup collision between
+# them, since a single sentinel run's if/elif only ever evaluates one.
+DEDUP_ROOT="$(mktemp -d -p "$ROOT")"
+mkdir -p "$DEDUP_ROOT/data" "$DEDUP_ROOT/logs" "$DEDUP_ROOT/node_modules/.bin" "$DEDUP_ROOT/bin" "$DEDUP_ROOT/dist" "$DEDUP_ROOT/scripts"
+: > "$DEDUP_ROOT/logs/nanoclaw.log"
+: > "$DEDUP_ROOT/logs/nanoclaw.error.log"
+: > "$DEDUP_ROOT/scripts/notify-owner.ts"
+cp "$ROOT/node_modules/.bin/tsx" "$DEDUP_ROOT/node_modules/.bin/tsx"
+cp "$ROOT/bin/systemctl" "$DEDUP_ROOT/bin/systemctl"
+DEDUP_OUTBOX="$DEDUP_ROOT/data/outbox"
+mkdir -p "$DEDUP_OUTBOX"
+
+git -C "$DEDUP_ROOT" init -q -b main
+git -C "$DEDUP_ROOT" config user.email selfcheck@localhost
+git -C "$DEDUP_ROOT" config user.name selfcheck
+mkdir -p "$DEDUP_ROOT/src"
+echo base >> "$DEDUP_ROOT/src/a.ts"
+git -C "$DEDUP_ROOT" add src/a.ts
+GIT_COMMITTER_DATE="$(date -d '20 hours ago' -R)" GIT_AUTHOR_DATE="$(date -d '20 hours ago' -R)" \
+  git -C "$DEDUP_ROOT" commit -q -m base
+DEDUP_BASE=$(git -C "$DEDUP_ROOT" rev-parse HEAD)
+printf '{"sha":"%s","shortSha":"%s","builtAt":"%s"}\n' "$DEDUP_BASE" "${DEDUP_BASE:0:9}" \
+  "$(date -u -d '20 hours ago' +%Y-%m-%dT%H:%M:%S.000Z)" > "$DEDUP_ROOT/dist/BUILD_INFO.json"
+
+# Both later commits are built on a side branch so the checked-out `main`
+# (and therefore HEAD) stays at $DEDUP_BASE — origin/main is pointed at them
+# explicitly below, the same "local HEAD stayed behind" shape as the
+# SCRIPT/YOUNG rollback trick above, so PULL_BEHIND (measured from HEAD) is
+# genuinely > 0 rather than trivially equal to origin/main.
+git -C "$DEDUP_ROOT" checkout -q -b tmp-origin
+echo tool >> "$DEDUP_ROOT/scripts/tool.sh"
+git -C "$DEDUP_ROOT" add scripts/tool.sh
+GIT_COMMITTER_DATE="$(date -d '5 hours ago' -R)" GIT_AUTHOR_DATE="$(date -d '5 hours ago' -R)" \
+  git -C "$DEDUP_ROOT" commit -q -m pull-lag-merge
+DEDUP_SCRIPT=$(git -C "$DEDUP_ROOT" rev-parse HEAD)
+echo restart >> "$DEDUP_ROOT/src/b.ts"
+git -C "$DEDUP_ROOT" add src/b.ts
+GIT_COMMITTER_DATE="$(date -d '4 hours ago' -R)" GIT_AUTHOR_DATE="$(date -d '4 hours ago' -R)" \
+  git -C "$DEDUP_ROOT" commit -q -m restart-lag-merge
+DEDUP_RESTART=$(git -C "$DEDUP_ROOT" rev-parse HEAD)
+git -C "$DEDUP_ROOT" checkout -q main
+
+run_dedup_sentinel() { # env... -> sets OUT
+  OUT="$(env PATH="$DEDUP_ROOT/bin:$PATH" NANOCLAW_DIR="$DEDUP_ROOT" LOAD15_MAX=999999 HEALTH_SENTINEL_OUTBOX="$DEDUP_OUTBOX" "$@" bash "$SENTINEL" 2>&1)"
+}
+
+# origin/main is one scripts-only commit ahead of the (unmoved) local HEAD:
+# BEHIND (RESTART_PATHS, from $DEPLOYED) is 0, so only the pull-lag half can
+# fire. Delivered non-dry to $DEDUP_OUTBOX so its dedup key actually gets
+# stamped in state.json, same as the production success path.
+git -C "$DEDUP_ROOT" update-ref refs/remotes/origin/main "$DEDUP_SCRIPT"
+run_dedup_sentinel DEPLOY_LAG_PULL_MAX_S=14400
+PULL_ALERT=$(ls -t "$DEDUP_OUTBOX"/*health-sentinel*.md 2>/dev/null | head -1)
+if [ -n "$PULL_ALERT" ] && grep -q 'merge(s) to scripts or skills' "$PULL_ALERT"; then
+  ok "a pull-lag breach fires first and reaches the outbox"
+else
+  bad "the pull-lag breach did not reach the outbox" "out=$OUT alert=${PULL_ALERT:-<none>}"
+fi
+
+# origin/main now also carries the src/ commit: BEHIND (RESTART_PATHS) from
+# $DEPLOYED (still $DEDUP_BASE) is 1, aged 4h past the default 3h bound, so
+# restart-lag fires this time — moments after the pull-lag run above, well
+# inside the 6h cooldown. Before the fix, both breaches stamped the same
+# `deploy-lag` key, so this restart-lag breach would be silently suppressed
+# by the pull-lag run's stamp; fixed, pull-lag stamps `deploy-lag-pull`
+# instead, and this restart-lag breach must still reach the outbox.
+rm -f "$DEDUP_OUTBOX"/*health-sentinel*.md
+git -C "$DEDUP_ROOT" update-ref refs/remotes/origin/main "$DEDUP_RESTART"
+run_dedup_sentinel
+RESTART_ALERT=$(ls -t "$DEDUP_OUTBOX"/*health-sentinel*.md 2>/dev/null | head -1)
+if [ -n "$RESTART_ALERT" ] && grep -q 'merge(s) on origin/main change the host or its agent runner' "$RESTART_ALERT"; then
+  ok "a restart-lag breach still reaches the outbox after an earlier pull-lag breach within its cooldown"
+else
+  bad "the restart-lag breach was suppressed by the pull-lag breach's cooldown" "out=$OUT alert=${RESTART_ALERT:-<none>}"
+fi
+rm -rf "$DEDUP_ROOT"
+
 # ── DRY_RUN performs no fetch; the fetch and status calls carry their flags ──
 # (#618 P3) A dedicated, disposable git fixture — not the shared $ROOT above,
 # whose history is deliberately doctored for the scenarios tested there — so
@@ -467,10 +553,19 @@ fi
 # no test of its own — removing it still passed both checks above, since
 # neither one asserted the env var itself, only argv flags. Assert it
 # directly: every git call this vital makes must see it exported as 0.
-if grep -qv '^GIT_OPTIONAL_LOCKS=0 ' "$GIT_CALLS"; then
-  bad "a git call ran without GIT_OPTIONAL_LOCKS=0 exported" "$(cat "$GIT_CALLS")"
-else
+#
+# `[ -s "$GIT_CALLS" ] &&` guards the OK path, not just the BAD one (#716
+# P3): `grep -qv PATTERN` on a completely empty file has nothing to select
+# either way and exits 1 (false), so the un-guarded form below used to read
+# a call log with NOTHING recorded in it as "every call exported it" — a
+# vacuous pass that would stay quiet even if the fake git wrapper above were
+# never actually invoked. Requiring the log to be non-empty before a PASS is
+# possible turns that silent case into a FAIL, the same fail-closed shape the
+# two checks above already have (each requires ITS OWN pattern to be found).
+if [ -s "$GIT_CALLS" ] && ! grep -qv '^GIT_OPTIONAL_LOCKS=0 ' "$GIT_CALLS"; then
   ok "every git call ran with GIT_OPTIONAL_LOCKS=0 exported"
+else
+  bad "a git call ran without GIT_OPTIONAL_LOCKS=0 exported, or no git call was recorded at all" "$(cat "$GIT_CALLS")"
 fi
 
 : > "$GIT_CALLS"
@@ -524,16 +619,46 @@ case "$OUT" in
   *) bad "a 20-digit DEPLOY_LAG_MAX_S overflow was not reported" "$OUT" ;;
 esac
 
+# The cap boundary itself, not just A case comfortably past it (#716 P3): the
+# 20-digit case above would still pass even if the 18-digit cap were loosened
+# to 19 — a 19-digit value can exceed int64 (9999999999999999999 > 2^63-1) and
+# overflow `[ -ge ]`, so loosening the cap to 19 reopens the silent-off path,
+# the exact shape this validation exists to close. Pin both edges directly.
+run_sentinel DRY_RUN=1 DEPLOY_LAG_MAX_S=9999999999999999999
+case "$OUT" in
+  *"DEPLOY_LAG_MAX_S='9999999999999999999' is not a non-negative integer of at most 18 digits"*) ok "a 19-digit DEPLOY_LAG_MAX_S is reported as a breach" ;;
+  *) bad "a 19-digit DEPLOY_LAG_MAX_S was not reported as a breach" "$OUT" ;;
+esac
+
+run_sentinel DRY_RUN=1 DEPLOY_LAG_MAX_S=999999999999999999
+case "$OUT" in
+  *"is not a non-negative integer"*) bad "an 18-digit DEPLOY_LAG_MAX_S was treated as invalid" "$OUT" ;;
+  *) ok "an 18-digit DEPLOY_LAG_MAX_S stays within the cap" ;;
+esac
+
 # A missing `jq`: a PATH built from symlinks to every tool the script needs
 # EXCEPT jq, so `command -v jq` genuinely fails closed instead of silently
 # falling back to HEAD (the exact under-report the header warns about).
-# -p "$ROOT": nested under the EXIT trap's directory so an early exit still
-# cleans it up, same reasoning as FLAG_ROOT above.
-NOJQ_DIR="$(mktemp -d -p "$ROOT")"
-for tool in bash awk cat date df dirname git grep head mktemp nproc od python3 stat tail timeout tr wc; do
-  tool_path="$(command -v "$tool" 2>/dev/null)"
-  [ -n "$tool_path" ] && ln -sf "$tool_path" "$NOJQ_DIR/$tool"
-done
+# `rm` is in the list (not just the read-only tools) because a non-dry run
+# needs it to clean up its own ALERT_FILE trap (health-sentinel.sh:510) — an
+# earlier version of this fixture omitted it, so the trap's `rm -f` silently
+# failed (no `rm` on PATH) and every run of the both-faults case below leaked
+# a 372-byte alert file into $TMPDIR. Built once here and reused by both
+# no-jq cases so the tool list only has to be kept correct in one place.
+build_nojq_dir() { # -> path to a fresh directory, on stdout
+  local dir
+  # -p "$ROOT": nested under the EXIT trap's directory so an early exit still
+  # cleans it up, same reasoning as FLAG_ROOT above.
+  dir="$(mktemp -d -p "$ROOT")"
+  local tool tool_path
+  for tool in bash awk cat date df dirname git grep head mktemp nproc od python3 rm stat tail timeout tr wc; do
+    tool_path="$(command -v "$tool" 2>/dev/null)"
+    [ -n "$tool_path" ] && ln -sf "$tool_path" "$dir/$tool"
+  done
+  printf '%s\n' "$dir"
+}
+
+NOJQ_DIR="$(build_nojq_dir)"
 OUT="$(env PATH="$ROOT/bin:$NOJQ_DIR" NANOCLAW_DIR="$ROOT" LOAD15_MAX=999999 DRY_RUN=1 bash "$SENTINEL" 2>&1)"
 case "$OUT" in
   *"jq is not installed"*) ok "a missing jq is reported as a breach" ;;
@@ -550,14 +675,18 @@ rm -rf "$NOJQ_DIR"
 # delivered alert. Non-dry, going to the outbox under $ROOT like the other
 # delivery-path cases above (notify-owner.ts always fails in this fixture, so
 # delivery falls through to HEALTH_SENTINEL_OUTBOX, already exported above).
+#
+# This is the only non-dry case in this section, so it is the one that
+# actually exercises the sentinel's `mktemp`+EXIT-trap cleanup of its own
+# ALERT_FILE (health-sentinel.sh:509-510). Pointing TMPDIR at a fresh,
+# otherwise-empty directory under $ROOT lets us assert directly that nothing
+# was left behind (#716 P3): with `rm` missing from NOJQ_DIR the trap fails
+# silently and the alert file leaks.
 rm -f "$ROOT/data/health-sentinel-state.json"
 rm -f "$OUTBOX"/*health-sentinel*.md 2>/dev/null || true
-NOJQ_DIR="$(mktemp -d -p "$ROOT")"
-for tool in bash awk cat date df dirname git grep head mktemp nproc od python3 stat tail timeout tr wc; do
-  tool_path="$(command -v "$tool" 2>/dev/null)"
-  [ -n "$tool_path" ] && ln -sf "$tool_path" "$NOJQ_DIR/$tool"
-done
-OUT="$(env PATH="$ROOT/bin:$NOJQ_DIR" NANOCLAW_DIR="$ROOT" LOAD15_MAX=999999 DEPLOY_LAG_PULL_MAX_S=notanumber bash "$SENTINEL" 2>&1)"
+NOJQ_DIR="$(build_nojq_dir)"
+ALERT_TMPDIR="$(mktemp -d -p "$ROOT")"
+OUT="$(env PATH="$ROOT/bin:$NOJQ_DIR" NANOCLAW_DIR="$ROOT" LOAD15_MAX=999999 TMPDIR="$ALERT_TMPDIR" DEPLOY_LAG_PULL_MAX_S=notanumber bash "$SENTINEL" 2>&1)"
 BOTH_ALERT=$(ls -t "$OUTBOX"/*health-sentinel*.md 2>/dev/null | head -1)
 if [ -n "$BOTH_ALERT" ] && grep -q "DEPLOY_LAG_PULL_MAX_S='notanumber' is not a non-negative integer" "$BOTH_ALERT"; then
   ok "invalid PULL_MAX_S + missing jq: the pull-config breach reached the outbox"
@@ -569,7 +698,10 @@ if [ -n "$BOTH_ALERT" ] && grep -q "jq is not installed" "$BOTH_ALERT"; then
 else
   bad "the jq breach did not reach the outbox" "out=$OUT alert=${BOTH_ALERT:-<none>}"
 fi
-rm -rf "$NOJQ_DIR"
+LEFTOVER=$(ls -A "$ALERT_TMPDIR" 2>/dev/null | wc -l)
+[ "$LEFTOVER" -eq 0 ] && ok "the both-faults run left no alert file behind in TMPDIR" \
+  || bad "the both-faults run leaked $LEFTOVER file(s) into TMPDIR" "$(ls -la "$ALERT_TMPDIR")"
+rm -rf "$NOJQ_DIR" "$ALERT_TMPDIR"
 
 [ "$FAILED" -eq 0 ] && echo "health-sentinel-selfcheck: all checks passed" || echo "health-sentinel-selfcheck: FAILURES"
 exit "$FAILED"

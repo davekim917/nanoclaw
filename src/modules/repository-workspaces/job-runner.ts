@@ -45,6 +45,10 @@
  *     A lane is forgotten once its last job settles, so per-work-unit lanes do
  *     not accumulate.
  */
+import fs from 'fs';
+import path from 'path';
+
+import { DATA_DIR } from '../../config.js';
 import type { DeliveryActionResult } from '../../delivery.js';
 import { log } from '../../log.js';
 import { releaseOrphanedRepoIngressFencesForDroppedMessage } from '../../repo-fence-recovery.js';
@@ -62,6 +66,49 @@ export type RepositoryActionApply = (content: Record<string, unknown>, session: 
 const inFlight = new Set<string>();
 /** Tail of each lane's chain. Never rejects: every link ends in the terminal catch. */
 const chains = new Map<string, Promise<void>>();
+
+/**
+ * Actions whose apply drains sessions (quiesceSessionsForRepositoryMounts). A
+ * host restart in the middle of one leaves its `messages_out` row undelivered,
+ * so the next host start replays it from scratch and drains every session a
+ * second time (#718). While one runs, a marker file tells scripts/deploy.sh to
+ * hold the restart until the drain settles.
+ */
+const DRAINING_ACTIONS = new Set(['repository_publish', 'repository_transfer']);
+
+/** Its `pid` lets a deploy ignore a marker left by a host that died mid-drain. */
+let drainMarkerPath = path.join(DATA_DIR, 'repository-drain-in-flight.json');
+
+/** Test seam: point the drain marker somewhere disposable. */
+export function _setRepositoryDrainMarkerPathForTesting(markerPath: string): void {
+  drainMarkerPath = markerPath;
+}
+
+/** Best effort: a marker that cannot be written must never stop the job itself. */
+function writeDrainMarker(action: string, requestId: string, session: Session): boolean {
+  const marker = { action, requestId, sessionId: session.id, pid: process.pid, startedAt: new Date().toISOString() };
+  const tmp = `${drainMarkerPath}.${process.pid}.tmp`;
+  try {
+    fs.mkdirSync(path.dirname(drainMarkerPath), { recursive: true });
+    fs.writeFileSync(tmp, `${JSON.stringify(marker)}\n`);
+    fs.renameSync(tmp, drainMarkerPath);
+    return true;
+  } catch (err) {
+    log.warn('Repository drain marker not written; a deploy will not wait for this action', { action, requestId, err });
+    return false;
+  }
+}
+
+function clearDrainMarker(requestId: string): void {
+  try {
+    const current = JSON.parse(fs.readFileSync(drainMarkerPath, 'utf8')) as { requestId?: unknown };
+    if (current.requestId === requestId) fs.rmSync(drainMarkerPath, { force: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn('Repository drain marker not cleared', { requestId, err });
+    }
+  }
+}
 
 /** Test seam: await the tail of one lane's chain (the global lane by default). */
 export function _repositoryActionChainForTesting(lane: string = GLOBAL_REPOSITORY_LANE): Promise<void> {
@@ -119,11 +166,15 @@ async function runRepositoryActionJob(
   requestId: string,
 ): Promise<void> {
   let failure: unknown = null;
+  const marked = DRAINING_ACTIONS.has(action) && writeDrainMarker(action, requestId, session);
   try {
     await apply(content, session);
   } catch (error) {
     failure = error;
     log.error('Repository action failed', { action, requestId, sessionId: session.id, err: error });
+  } finally {
+    // The drain is over once the apply settles, whichever way it went.
+    if (marked) clearDrainMarker(requestId);
   }
   const acked = await ackRow(session, requestId, failure);
   if (failure !== null) {

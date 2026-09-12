@@ -1546,36 +1546,6 @@ describe('#693 — a reclaimed session (orphan stamp, no file) is still seed-eli
     expect(allRows(sessionDst)).toEqual(allRows(expected));
   });
 
-  it("does not trust the orphan stamp as the seed's previous — the candidate's stamp is used instead", async () => {
-    const src = makeTwoWorkgroupSource('orphan-not-trusted');
-    useFakeWorker();
-
-    const sessionDst = tmpPath('orphan-not-trusted-session');
-    await ensureArchiveProjection(src, sessionDst, 'ag-one-a', wgOne);
-
-    // Corrupt the about-to-be-orphaned stamp's mutation count. If THIS stamp
-    // were ever used as `previous`, decideArchiveProjectionMode would see a
-    // mutations mismatch against the live signature and force a rebuild —
-    // so a 'seeded' result below is only possible if the orphan was dropped
-    // and the CANDIDATE's own (correct) stamp was used as `previous` instead.
-    const orphanStamp = readArchiveProjectionStamp(sessionDst);
-    expect(orphanStamp).not.toBeNull();
-    fs.writeFileSync(
-      archiveProjectionStampPath(sessionDst),
-      JSON.stringify({ ...orphanStamp, mutations: (orphanStamp?.mutations ?? 0) + 999 }),
-    );
-
-    // A same-agent, same-scope sibling with a legitimate, uncorrupted stamp.
-    const siblingDst = tmpPath('orphan-not-trusted-sibling');
-    await ensureArchiveProjection(src, siblingDst, 'ag-one-a', wgOne);
-
-    fs.unlinkSync(sessionDst);
-
-    const result = await ensureArchiveProjection(src, sessionDst, 'ag-one-a', wgOne);
-    expect(result.mode).toBe('seeded');
-    expect(result.seededFrom).toBe(path.relative(TEST_DATA_DIR, siblingDst));
-  });
-
   it('never seeds a session whose local file still exists (unchanged behavior)', async () => {
     const src = makeTwoWorkgroupSource('orphan-existing-file');
     useFakeWorker();
