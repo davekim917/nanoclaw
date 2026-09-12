@@ -13,6 +13,14 @@
 #   ab-net-redact.sh request <requestId> [--session <name>] > file.json
 #   ab-net-redact.sh har-stop <output-path> [--session <name>]
 #   ab-net-redact.sh --stdin < raw.json > clean.json
+#   ab-net-redact.sh --session <name> [other network-requests args] > file.json
+#     (no subcommand — back-compat with the pre-v5 calling form: treated as
+#     `requests` with the given args, same as the explicit form above.)
+#
+# The evidence body allowlist is install config, not baked into this script:
+# set $AB_NET_REDACT_ALLOW_FILE (default /workspace/agent/ab-net-allow.txt),
+# one regex per line, `#` comments allowed. Missing/empty/unreadable means no
+# body is allowlisted — every non-auth body is dropped, never the reverse.
 #
 # stderr is never merged into a capture; unparsable input is dropped
 # (exit 2), never echoed. `har-stop` never leaves a raw HAR file behind and
@@ -76,5 +84,11 @@ if [ "${1:-}" = "request" ] || [ "${1:-}" = "requests" ]; then
   exit $?
 fi
 
-echo "ab-net-redact.sh: unknown usage; expected 'requests', 'request <id>', 'har-stop <path>', or '--stdin'" >&2
-exit 2
+# Back-compat default: the pre-v5 calling form had no subcommand at all
+# (`ab-net-redact.sh --session <name> [network args]`) and always meant
+# `network requests --json`. Anything that reached here isn't --stdin,
+# har-stop, request, or requests, so treat it the same way.
+agent-browser network requests --json "$@" 2>/dev/null | python3 "$REDACTOR"
+rc=("${PIPESTATUS[@]}")
+[ "${rc[0]}" -eq 0 ] && [ "${rc[1]}" -eq 0 ]
+exit $?

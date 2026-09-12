@@ -22,45 +22,99 @@ Policy, either shape:
   one-line JSON stub is written, exit 2) — never echoed. A parse failure must
   never fall back to printing the raw bytes.
 - Header/cookie values for Authorization/Cookie/Set-Cookie/X-Api-Key/
-  Proxy-Authorization (by key name, or by `name` in a HAR {name,value} pair)
-  are redacted; every remaining string anywhere in the tree is additionally
-  scrubbed for `Bearer <token>` and JWT-shaped (`eyJ...eyJ...`) substrings,
-  including inside URLs and query strings.
+  Proxy-Authorization and the other names in CRED_KEYS below (by key name, or
+  by `name` in a HAR {name,value} pair) are redacted; every remaining string
+  anywhere in the tree is additionally scrubbed for `Bearer <token>`,
+  JWT-shaped (`eyJ...eyJ...`) substrings, and credential-shaped query
+  parameters, wherever a URL string appears (request URLs included).
 - Bodies (postData/body/responseBody/requestBody/HAR postData.text/HAR
   response.content.text) are DROPPED unless the request URL matches the
-  evidence allowlist below; auth endpoints (login/reset/activate/refresh/
-  token) keep URL, method and status only, body always dropped. An
+  install-supplied allowlist (below); auth endpoints (login/reset/activate/
+  refresh/token) keep URL, method and status only, body always dropped. An
   allowlisted body that is (or contains) a JSON string is parsed and scrubbed
   structurally (credential-shaped keys -> [REDACTED]) before being
   re-serialized; a string body that does not parse as JSON is dropped, never
   passed through — a body we can't structurally inspect is a body we can't
   prove is safe.
+- The evidence allowlist is install configuration, not trunk knowledge: read
+  from the file at $AB_NET_REDACT_ALLOW_FILE (default
+  /workspace/agent/ab-net-allow.txt), one regex per line, `#` comments and
+  blank lines ignored. A missing, empty, unreadable, or all-comments file
+  means an EMPTY allowlist — every non-auth body is dropped, never the
+  reverse. A line that doesn't compile as a regex is skipped (that one line
+  never matches), not treated as a whole-file failure.
 
 This is a minimum bar, not a general secret scanner: exotic non-standard HAR
 extensions (e.g. `_webSocketMessages`) fall back to the generic scrub (key-name
-+ JWT/Bearer pattern match) rather than the body drop/allowlist policy above.
++ JWT/Bearer/query-param pattern match) rather than the body drop/allowlist
+policy above.
 """
 import json
+import os
 import re
 import sys
 
-ALLOW = re.compile(
-    r"/messaging/conversations/[^/?]+/(read|messages)|/users/admin/edit/\d+|/depletions/|/collateral/",
-    re.I,
-)
 AUTH = re.compile(r"/users/(login|reset-password|activate|refresh)|/auth/|/token", re.I)
 CRED_KEYS = re.compile(
     r"^(password|newPassword|currentPassword|confirmPassword|secret|refreshToken|"
     r"refresh_token|token|accessToken|access_token|apiKey|api_key|x-api-key|"
-    r"authorization|cookie|set-cookie|proxy-authorization)$",
+    r"authorization|cookie|set-cookie|proxy-authorization|x-auth-token|"
+    r"x-access-token|x-refresh-token|x-csrf-token|x-xsrf-token|"
+    r"x-amz-security-token|api-key|id_token|idToken|client_secret|clientSecret)$",
     re.I,
 )
 BODY_KEYS = {"postData", "body", "responseBody", "requestBody", "postDataEntries", "response", "content", "text"}
 JWT = re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")
 BEARER = re.compile(r"[Bb]earer\s+\S+")
 
+# Credential-shaped query-param VALUES leak through any URL string — HAR
+# `queryString` pairs are structured and already covered by CRED_KEYS via
+# scrub_pairs, but the same param routinely also appears inline in a plain
+# `url` string (both capture shapes carry one). Matched case-insensitively on
+# `[?&#]name=value` and stops at the next `&`/`#` (or end of string).
+QUERY_CRED_PARAMS = (
+    "access_token", "id_token", "refresh_token", "token", "api_key", "apikey",
+    "client_secret", "password", "secret", "code", "sig", "signature",
+    "x-amz-signature", "x-amz-credential", "x-amz-security-token",
+    "x-goog-signature", "x-goog-credential",
+)
+QUERY_PARAM_RE = re.compile(
+    r"([?&#](?:" + "|".join(re.escape(p) for p in QUERY_CRED_PARAMS) + r")=)([^&#]+)",
+    re.I,
+)
+
+
+def _load_allow_patterns():
+    """Fail-closed by construction: any read/parse problem, or no file at
+    all, yields an empty pattern list — see gated_body, which drops every
+    non-auth body when nothing matches."""
+    path = os.environ.get("AB_NET_REDACT_ALLOW_FILE", "/workspace/agent/ab-net-allow.txt")
+    patterns = []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except (OSError, UnicodeDecodeError):
+        return []
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            patterns.append(re.compile(line, re.I))
+        except re.error:
+            continue
+    return patterns
+
+
+ALLOW_PATTERNS = _load_allow_patterns()
+
+
+def allow_match(url):
+    return any(p.search(url or "") for p in ALLOW_PATTERNS)
+
 
 def scrub_str(s):
+    s = QUERY_PARAM_RE.sub(lambda m: m.group(1) + "[REDACTED]", s)
     return BEARER.sub("Bearer [REDACTED]", JWT.sub("[REDACTED-JWT]", s))
 
 
@@ -88,7 +142,7 @@ def gated_body(v, url):
     """Apply the drop-unless-allowlisted / auth-endpoint policy to one body value."""
     if AUTH.search(url or ""):
         return "[DROPPED-AUTH-REQUEST-BODY]"
-    if ALLOW.search(url or ""):
+    if allow_match(url):
         return scrub_body(v)
     return "[DROPPED-NOT-ALLOWLISTED]"
 
@@ -121,7 +175,7 @@ def walk(o, url=""):
 # ---- Shape 2: HAR 1.2 (`network har stop`) ----
 
 def scrub_pairs(pairs):
-    """A list of HAR {"name":, "value":, ...} pairs — headers, cookies, query params."""
+    """A list of HAR {"name":, "value":, ...} pairs — headers, query params."""
     out = []
     for p in pairs:
         if not isinstance(p, dict) or not isinstance(p.get("name"), str):
@@ -192,7 +246,9 @@ def redact_har(data):
         if not isinstance(e, dict):
             new_entries.append(scrub_tree(e))
             continue
-        req = e.get("request") if isinstance(e.get("request"), dict) else {}
+        req = e.get("request")
+        if not isinstance(req, dict):
+            req = {}
         url = req.get("url") if isinstance(req.get("url"), str) else None
         ne = dict(e)
         if isinstance(e.get("request"), dict):

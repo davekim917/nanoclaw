@@ -710,7 +710,7 @@ max effort. Use the `agent-browser` skill.
   and console/network errors. A screenshot alone rarely proves root cause.
   **Any `agent-browser network requests`/`request`/`har stop` output that will
   touch disk — evidence file, run dir, chat, log — goes through
-  `container/skills/agent-browser/scripts/ab-net-redact.sh` first, never a raw
+  `/app/skills/agent-browser/scripts/ab-net-redact.sh` first, never a raw
   redirect or a raw `har stop <path>`.** Its `headers`/`cookies`/`har stop`
   output all carry live `Authorization`/`Cookie` values verbatim; a bearer
   token or session cookie that reaches a shared path this way is burned same

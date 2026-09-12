@@ -239,21 +239,25 @@ file straight to `<path>` with live bearer tokens and cookies in `headers`,
 `cookies`, and request/response bodies.** A redirected `> file.json` or a
 durable/shared `<path>` on `har stop` puts a working credential on disk in the
 clear — this has happened in production. Never do either directly. Route every
-capture that will touch disk through `scripts/ab-net-redact.sh` in this skill
-directory instead — it structurally drops or redacts credential-bearing fields
-before anything reaches storage, and fails closed (nothing written) if a
-capture can't be parsed or redaction itself fails:
+capture that will touch disk through
+`/app/skills/agent-browser/scripts/ab-net-redact.sh` instead — it
+structurally drops or redacts credential-bearing fields before anything
+reaches storage, and fails closed (nothing written) if a capture can't be
+parsed or redaction itself fails:
 
 ```bash
 # In place of: agent-browser network requests --json > requests.json
-scripts/ab-net-redact.sh requests --json > requests.json
+/app/skills/agent-browser/scripts/ab-net-redact.sh requests --json > requests.json
 
 # In place of: agent-browser network request 1234.5 --json > request.json
-scripts/ab-net-redact.sh request 1234.5 --json > request.json
+/app/skills/agent-browser/scripts/ab-net-redact.sh request 1234.5 --json > request.json
 
 # In place of: agent-browser network har stop evidence.har
-scripts/ab-net-redact.sh har-stop evidence.har.json
+/app/skills/agent-browser/scripts/ab-net-redact.sh har-stop evidence.har.json
 ```
+
+Which URLs may keep their body is install config, not this skill's call — see
+`AB_NET_REDACT_ALLOW_FILE` in the script's own header comment.
 
 `har-stop` records to a private temp file, redacts it, and only then moves the
 redacted result to the path you gave — the raw HAR never lands at a durable
