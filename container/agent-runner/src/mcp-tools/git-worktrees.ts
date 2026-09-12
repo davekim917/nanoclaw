@@ -134,7 +134,9 @@ function resolvedScanPolicyRepositoryNames(): readonly string[] | null {
       loggedScanPolicyLoadFailure = true;
       log(
         'scan-policy-repos.json failed to load or has an invalid shape; failing closed — every repo name is ' +
-          'treated as scan-policy (pinned to worktree mode, every leftover clone refused) until the container restarts.',
+          'treated as scan-policy (pinned to worktree mode, every leftover clone refused). The file comes from the ' +
+          "host's read-only boot snapshot of this source, so a container restart alone re-reads the same broken " +
+          'file; repair the file and restart the host.',
       );
     }
   }
@@ -173,12 +175,26 @@ function effectiveCheckoutModeFor(repo: string): CheckoutMode {
  * ever scanned by the host-managed pre-push hook (#666-follow-up) — it must
  * be removed, never served or pushed from, so re-running create_worktree is
  * the only way forward.
+ *
+ * `repo` here may be scan-policy for either of two reasons, and the caller
+ * cannot tell them apart without asking: the list loaded fine and genuinely
+ * names `repo` (normal case — say nothing extra), or the list failed to load
+ * and `isScanPolicyRepositoryName` is fail-closed treating EVERY repo as
+ * scan-policy (#691). In the second case the wiki-shaped wording above names
+ * the wrong cause — the real cause, the failed load, is otherwise visible
+ * only in the MCP server's stderr (`resolvedScanPolicyRepositoryNames`'s
+ * one-time log) — so this appends a hint pointing the operator at the host.
  */
 function scanPolicyCloneLeftoverMessage(repo: string, checkoutPath: string): string {
-  return (
+  const base =
     `${checkoutPath} is a clone of '${repo}' left over from a clone-mode period and is not secret-scanned on push. ` +
     'Remove it without pushing anything from it, then re-run create_worktree to get a linked worktree that shares ' +
-    "the canonical's scan hook."
+    "the canonical's scan hook.";
+  if (resolvedScanPolicyRepositoryNames() !== null) return base;
+  return (
+    `${base} (This refusal may not mean '${repo}' is actually scan-policy: the scan-policy repository list failed ` +
+    "to load, so every repo is being treated as scan-policy as a fail-closed default. Check the host's logs, " +
+    'repair the file, and restart the host.'
   );
 }
 
