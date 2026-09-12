@@ -1196,6 +1196,10 @@ export function buildCentralProjection(srcPath: string, dstPath: string, agentGr
     writeEmptyCentral(dstPath);
     return;
   }
+  // Same rule as both archive-projection opens, so the sidecar discipline is
+  // uniform across every projection rather than resting on a reader noticing
+  // that the unlink below happens to make this one safe already (#735 P3).
+  removeStaleProjectionSidecars(dstPath);
   if (fs.existsSync(dstPath)) fs.unlinkSync(dstPath);
   const dst = new Database(dstPath);
   // FK targets (agent_groups, users) are intentionally absent from the partial projection.

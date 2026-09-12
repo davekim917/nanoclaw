@@ -151,6 +151,7 @@ import {
 import { buildContainerCodexConfig } from './providers/codex.js';
 import { getSessionClaudeMounts } from './session-claude-mounts.js';
 import { getAgentMailbox } from './mailbox/index.js';
+import { assertHostOwnedInboundDb, hostInboundMounts, migrateInboundDbToHostDir } from './modules/mailbox/index.js';
 import {
   CLAUDE_CODE_PROJECTS_DIR,
   heartbeatPath,
@@ -1716,10 +1717,11 @@ async function spawnContainer(
   // the seam answers `undefined` for the first and `{ fence: null }` for the
   // second, and reading them as the same thing would let a spawn through for a
   // session whose inbound.db has been reclaimed. That fails closed on purpose —
-  // `buildMounts` only installs the read-only /workspace/inbound.db overlay
-  // when the file exists, so such a container would come up with no mailbox to
-  // poll and could recreate the host-owned database under the writable parent
-  // mount. The direct open this replaced threw for exactly this state.
+  // a container with no mailbox to poll could otherwise recreate the host-owned
+  // database under the writable parent mount. The direct open this replaced
+  // threw for exactly this state. Since #749 `buildMounts` refuses such a spawn
+  // outright rather than omitting the overlay, so this is now the first of two
+  // fail-closed checks rather than the only one.
   const repositoryFenceRead = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => ({
     fence: mailbox.readRepoIngressFence(),
   }));
@@ -4444,13 +4446,25 @@ export async function buildMounts(
   // container. Without this, a compromised agent could forge admin
   // approvals by directly INSERT-ing into the `delivered` table, trivially
   // bypassing the email-gate, send_file ack, and any future host→container
-  // signaling that rides on inbound.db. The file-level RO overlay below
-  // reuses the same host file; Docker applies mount rules in order, so the
-  // `:ro` on inbound.db overrides the parent mount's RW permission for
-  // that specific path.
+  // signaling that rides on inbound.db.
+  //
+  // A FILE-level read-only overlay is NOT sufficient, and believing it was is
+  // what #749 exploited. The overlay covers the file; SQLite's rollback
+  // journal is a SIBLING PATH, and this parent mount is read-write, so a
+  // container could create `/workspace/inbound.db-journal` beside it. A
+  // journal carries no binding to its database's identity, so the host
+  // replayed the container's hand-built journal as a HOT journal on its next
+  // read-write open and wrote attacker-chosen pages into the host-owned
+  // database — a forged `delivered` row, proven by the proof of concept on
+  // #735.
+  //
+  // So the host keeps inbound.db in `<session>/.host/` and that DIRECTORY is
+  // overlaid read-only below. SQLite only ever creates `-journal`/`-wal`/
+  // `-shm` in the database's own directory, so there is no sibling path left
+  // outside the protection. See src/modules/mailbox/host-inbound.ts.
   //
   // The SDK-level `readonly: true` open in container/agent-runner/src/db/
-  // connection.ts is belt and suspenders. The mount is the real boundary.
+  // connection.ts is belt and suspenders. The mounts are the real boundary.
   mounts.push({ hostPath: sessDir, containerPath: '/workspace', readonly: false });
   // The runner's immutable startup context, host-owned and outside the
   // agent-writable session directory. spawnContainer writes it just after
@@ -4460,10 +4474,16 @@ export async function buildMounts(
     containerPath: '/app/.nanoclaw-session.json',
     readonly: true,
   });
-  const inboundDbFile = path.join(sessDir, 'inbound.db');
-  if (fs.existsSync(inboundDbFile)) {
-    mounts.push({ hostPath: inboundDbFile, containerPath: '/workspace/inbound.db', readonly: true });
-  }
+  // Move this session's inbound.db under `<session>/.host/` before the mounts
+  // are built, and REFUSE THE SPAWN if it is not host-owned afterwards. A
+  // container is the only thing that can plant a journal, so this is the seam
+  // where the transitional legacy-path fallback in `resolveInboundDbPath` must
+  // stop: no container ever runs against a session whose database still sits
+  // in the directory it can write. Fail closed — a spawn that cannot migrate
+  // retries rather than coming up unprotected (#749).
+  await migrateInboundDbToHostDir(sessDir, { agentGroupId: agentGroup.id, sessionId: session.id });
+  assertHostOwnedInboundDb(sessDir, session.id);
+  mounts.push(...hostInboundMounts(sessDir));
 
   // Repository scope is derived by one canonical work-unit resolver.
   // Same-topic siblings therefore share a checkout; different topics receive

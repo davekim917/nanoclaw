@@ -88,6 +88,7 @@ import { migration075 } from './075-task-run-outcomes.js';
 import { migration076 } from './076-turn-usage-effort.js';
 import { migration077 } from './077-choice-receipts.js';
 import { migration078 } from './078-choice-request-reservation.js';
+import { migration079 } from './079-host-inbound-provenance.js';
 // Upstream's 014/015 — file numbers clash with local but uniqueness is by `name`.
 // Aliased to avoid JS identifier collisions with the local 014/015 above.
 import { migration014 as containerConfigs } from './014-container-configs.js';
@@ -250,6 +251,10 @@ export const migrations: Migration[] = [
   // the end. Nothing below recreates pending_approvals, so 053's timestamp
   // pass cannot drop the index back off.
   migration078,
+  // Creates its own standalone table with no foreign keys and no timestamp for
+  // 053 to normalize, so it has no ordering constraint at all — and it touches
+  // none of the tables 077/078 above do.
+  migration079,
   // Last on purpose: normalizes whatever naive timestamps every migration
   // above has left behind (016's messaging_groups recreate copies created_at
   // through as-is).

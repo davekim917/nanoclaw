@@ -753,7 +753,12 @@ describe('storage-manager.ts / storage-activity.ts contain no literal seam call'
         'startDependencyCachePass',
       ],
       'src/log.ts': ['log'],
-      'src/modules/mailbox/index.ts': ['sessionMailboxPath'],
+      // #749: the reclaim read resolves the inbound path through the mailbox
+      // module rather than joining the legacy name itself, so a container-
+      // planted sidecar cannot wedge every read-only open and starve
+      // reclamation. Both additions are path resolvers — neither opens a
+      // database, so this widens the manifest without widening seam reach.
+      'src/modules/mailbox/index.ts': ['resolveInboundDbPath', 'sessionMailboxDir', 'sessionMailboxPath'],
       'src/repository-workspaces.ts': ['listTopicCheckouts', 'resolveRepositoryWorkUnit'],
       'src/session-manager.ts': ['sessionContextPathFor', 'sessionsBaseDir', 'threadsBaseDir', 'threadWorktreeDir'],
       'src/storage-activity.ts': ['STORAGE_INTERNAL_ENTRY_NAMES', 'tryRunWithStorageCleanupClaim'],

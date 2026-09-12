@@ -2,7 +2,7 @@
 
 Complete reference for `data/v2.db`, the host-owned admin-plane database. Start with [db.md](db.md) for the three-DB overview, the map, and the cross-mount rules.
 
-Access layer: `src/db/`. `src/db/schema.ts`'s `SCHEMA` constant is a *reference copy* of the core tables for orientation — it is not exhaustive: several tables (`agent_destinations`, `pending_approvals`, `container_configs`, `agent_message_policies`, `pending_channel_approvals`, and others) exist only in their migration files under `src/db/migrations/`, which remain the actual source of truth for what's created at runtime.
+Access layer: `src/db/`. `src/db/schema.ts`'s `SCHEMA` constant is a _reference copy_ of the core tables for orientation — it is not exhaustive: several tables (`agent_destinations`, `pending_approvals`, `container_configs`, `agent_message_policies`, `pending_channel_approvals`, and others) exist only in their migration files under `src/db/migrations/`, which remain the actual source of truth for what's created at runtime.
 
 ---
 
@@ -122,6 +122,7 @@ CREATE INDEX idx_user_roles_scope ON user_roles(agent_group_id, role);
 ```
 
 Invariants:
+
 - `role = 'owner'` → must be global (`agent_group_id IS NULL`). Enforced in `grantRole()`.
 - `role = 'admin'` → global (NULL) or scoped to one agent group.
 - Admin @ A implies membership in A — no `agent_group_members` row required.
@@ -201,7 +202,7 @@ CREATE TABLE pending_questions (
 
 ### 1.10 `agent_destinations`
 
-Permission ACL *and* name-resolution map for outbound sending. An agent asking to `send_message(to="dev-channel")` must have a row here with `local_name = 'dev-channel'`, or the send is rejected as `unknown destination`.
+Permission ACL _and_ name-resolution map for outbound sending. An agent asking to `send_message(to="dev-channel")` must have a row here with `local_name = 'dev-channel'`, or the send is rejected as `unknown destination`.
 
 ```sql
 CREATE TABLE agent_destinations (
@@ -422,7 +423,7 @@ CREATE TABLE agent_message_policies (
 
 ### 1.19 `scheduled_audit`
 
-Audit trail for operator actions on the Scheduled Tasks Board (edit / pause / resume / run-now / cancel / move). One row per action; `action` is an open enum (`edit|pause|resume|run_now|cancel|move|move_intent|move_restore_failed`, no CHECK constraint). Bodies are stored hash-first: `before_hash`/`after_hash` always; `before_preview`/`after_preview` truncated previews; scripts are NEVER stored verbatim (hash-only). `detail_json` holds structured deltas — for moves, secret *counts*+hashes only (never names/values); the one exception is a `move_intent` row, which persists the full task snapshot verbatim until the move resolves, then `purgeIntentBody` NULLs it and stamps `resolved_at`. A 90-day sweep (`pruneAuditBodies`) NULLs the body columns while keeping the action-metadata row for the series lifetime (so `action='cancel'` stays distinguishable from natural completion indefinitely). `correlation_id` ties the two-sided rows of a move (one per group). Added by migration 043.
+Audit trail for operator actions on the Scheduled Tasks Board (edit / pause / resume / run-now / cancel / move). One row per action; `action` is an open enum (`edit|pause|resume|run_now|cancel|move|move_intent|move_restore_failed`, no CHECK constraint). Bodies are stored hash-first: `before_hash`/`after_hash` always; `before_preview`/`after_preview` truncated previews; scripts are NEVER stored verbatim (hash-only). `detail_json` holds structured deltas — for moves, secret _counts_+hashes only (never names/values); the one exception is a `move_intent` row, which persists the full task snapshot verbatim until the move resolves, then `purgeIntentBody` NULLs it and stamps `resolved_at`. A 90-day sweep (`pruneAuditBodies`) NULLs the body columns while keeping the action-metadata row for the series lifetime (so `action='cancel'` stays distinguishable from natural completion indefinitely). `correlation_id` ties the two-sided rows of a move (one per group). Added by migration 043.
 
 ```sql
 CREATE TABLE scheduled_audit (
@@ -454,13 +455,39 @@ CREATE INDEX idx_scheduled_audit_unresolved ON scheduled_audit(action, resolved_
 
 ---
 
+### 1.20 `host_inbound_provenance`
+
+Which `<session>/.host/inbound.db` files **this host created**. One row per session, written by the migration in `src/modules/mailbox/host-inbound.ts` at the moment it `link()`s the database into `.host/`, and checked before that migration will touch an existing one. Added by migration 079.
+
+This table exists because no property of the file itself can answer the question. A container can create `.host/` and write its own `inbound.db` there — under a mount set built before the directory existed, `/workspace` is read-write and nothing is overlaid over a path that is not yet there. Ownership is no signal (host and container run as the same uid), mode depends on whichever umask applied, and timestamps are chosen by whoever plants. Content is worse than useless: the attacker authors the schema too, so a zero-row database carrying a hostile `TRIGGER` or `VIEW` on `messages_in`/`delivered` would win any "prefer the non-empty side" tie-break. The only question worth asking is _did this host create it_, and the answer is kept where no container can reach it — the central DB is never mounted.
+
+`device`/`inode` are TEXT holding decimal strings, not INTEGER: `st_ino` can exceed 2^53, and a JS number would round it silently, making neighbouring inodes compare equal — a fail-open in exactly the rare case the gate exists to catch. They are read with `fs.statSync(p, { bigint: true })`.
+
+No foreign key to `sessions`, deliberately: a record whose absence is a **refusal** must never be removed as a side effect of unrelated cascade behaviour. Removal is explicit, from the mailbox's own `destroy()`.
+
+```sql
+CREATE TABLE host_inbound_provenance (
+  agent_group_id TEXT NOT NULL,
+  session_id     TEXT NOT NULL,
+  device         TEXT NOT NULL,   -- st_dev, decimal string
+  inode          TEXT NOT NULL,   -- st_ino, decimal string
+  created_at     TEXT NOT NULL,
+  PRIMARY KEY (agent_group_id, session_id)
+);
+```
+
+- **Readers/Writers:** `src/db/host-inbound-provenance.ts` only (`recordHostInboundProvenance`, `hostInboundProvenanceMatches`, `deleteHostInboundProvenance`), reached from `src/modules/mailbox/host-inbound.ts` and `src/modules/mailbox/index.ts`
+- **Operator override:** `scripts/adopt-host-inbound-provenance.ts` — see [db-session.md](db-session.md), "Provenance, and the override"
+
+---
+
 ## 2. Migration system
 
 Migrations live in `src/db/migrations/`, one file per migration. Runner: `runMigrations()` in `src/db/migrations/index.ts`. It:
 
 1. Creates `schema_version` if absent.
 2. Reads every already-applied `name` from `schema_version` into a `Set` and filters the `migrations` barrel array down to the ones whose `name` isn't in that set — dedup is by **name**, not by the numeric `version` field.
-3. Runs each pending migration's `up(db)` inside a transaction, in the barrel array's literal order (which is *not* sorted by `version`), then inserts a `schema_version` row.
+3. Runs each pending migration's `up(db)` inside a transaction, in the barrel array's literal order (which is _not_ sorted by `version`), then inserts a `schema_version` row.
 4. The `version` column stored in `schema_version` is **not** the migration's own `version` field — it's `COALESCE(MAX(version), 0) + 1`, i.e. an auto-assigned applied-order number computed at insert time. The `version` field on the `Migration` object is just an ordering hint for humans reading the barrel file; it lets module migrations (installed later by skills) pick arbitrary numbers without coordinating with trunk.
 
 ### The ledger rule (name, not file number)
@@ -477,24 +504,24 @@ A few migrations also set `disableForeignKeys: true` (needed for table recreates
 
 Several early migrations were later renamed/retired and replaced by "module" files (their original `name` is retained on the new file so already-migrated DBs don't re-run them):
 
-| Ver. | Name (stored in `schema_version`) | File | Introduces |
-|---|---|------|------------|
-| 1 | `initial-v2-schema` | `001-initial.ts` | Core tables: `agent_groups`, `messaging_groups`, `messaging_group_agents` (with the original `trigger_rules`/`response_scope` columns — see v10), `users`, `user_roles`, `agent_group_members`, `user_dms`, `sessions`, `pending_questions` |
-| 2 | `chat-sdk-state` | `002-chat-sdk-state.ts` | `chat_sdk_kv`, `chat_sdk_subscriptions`, `chat_sdk_locks`, `chat_sdk_lists` |
-| 3 | `pending-approvals` | `module-approvals-pending-approvals.ts` | `pending_approvals` (session-bound + OneCLI fields) |
-| 4 | `agent-destinations` | `module-agent-to-agent-destinations.ts` | `agent_destinations` + backfill from existing `messaging_group_agents` wirings |
-| 7 | `pending-approvals-title-options` | `module-approvals-title-options.ts` | Retroactive `ALTER TABLE pending_approvals` add `title`, `options_json` for DBs that ran migration 3 before its `CREATE TABLE` was edited to include those columns |
-| 8 | `dropped-messages` | `008-dropped-messages.ts` | `unregistered_senders` |
-| 9 | `drop-pending-credentials` | `009-drop-pending-credentials.ts` | Drop the defunct `pending_credentials` table |
-| 10 | `engage-modes` | `010-engage-modes.ts` | `messaging_group_agents`: add `engage_mode`, `engage_pattern`, `sender_scope`, `ignored_message_policy`; backfill from `trigger_rules`/`response_scope`; drop those two legacy columns (see §1.3) |
-| 11 | `pending-sender-approvals` | `011-pending-sender-approvals.ts` | `pending_sender_approvals` (see §1.16) |
-| 12 | `channel-registration` | `012-channel-registration.ts` | `messaging_groups.denied_at` + `pending_channel_approvals` (see §1.17) |
-| 13 | `approval-render-metadata` | `013-approval-render-metadata.ts` | `title`, `options_json` columns on `pending_channel_approvals` and `pending_sender_approvals` |
-| 14 | `container-configs` | `014-container-configs.ts` | `container_configs` — per-agent-group container runtime config |
-| 15 | `cli-scope` | `015-cli-scope.ts` | `ALTER TABLE container_configs ADD COLUMN cli_scope` |
-| 16 | `messaging-group-instance` | `016-messaging-group-instance.ts` | `messaging_groups` gets an `instance` column (adapter-instance dimension); table recreate (`disableForeignKeys: true`) backfills `instance = channel_type` on every existing row and relaxes the `UNIQUE` to `(channel_type, platform_id, instance)` |
-| 17 | `agent-message-policies` | `017-agent-message-policies.ts` | `agent_message_policies` (see §1.18) |
-| 18 | `approvals-approver-user-id` | `018-approvals-approver-user-id.ts` | `pending_approvals.approver_user_id` — names a single required approver for a2a message-gate policies |
+| Ver. | Name (stored in `schema_version`) | File                                    | Introduces                                                                                                                                                                                                                                           |
+| ---- | --------------------------------- | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | `initial-v2-schema`               | `001-initial.ts`                        | Core tables: `agent_groups`, `messaging_groups`, `messaging_group_agents` (with the original `trigger_rules`/`response_scope` columns — see v10), `users`, `user_roles`, `agent_group_members`, `user_dms`, `sessions`, `pending_questions`          |
+| 2    | `chat-sdk-state`                  | `002-chat-sdk-state.ts`                 | `chat_sdk_kv`, `chat_sdk_subscriptions`, `chat_sdk_locks`, `chat_sdk_lists`                                                                                                                                                                          |
+| 3    | `pending-approvals`               | `module-approvals-pending-approvals.ts` | `pending_approvals` (session-bound + OneCLI fields)                                                                                                                                                                                                  |
+| 4    | `agent-destinations`              | `module-agent-to-agent-destinations.ts` | `agent_destinations` + backfill from existing `messaging_group_agents` wirings                                                                                                                                                                       |
+| 7    | `pending-approvals-title-options` | `module-approvals-title-options.ts`     | Retroactive `ALTER TABLE pending_approvals` add `title`, `options_json` for DBs that ran migration 3 before its `CREATE TABLE` was edited to include those columns                                                                                   |
+| 8    | `dropped-messages`                | `008-dropped-messages.ts`               | `unregistered_senders`                                                                                                                                                                                                                               |
+| 9    | `drop-pending-credentials`        | `009-drop-pending-credentials.ts`       | Drop the defunct `pending_credentials` table                                                                                                                                                                                                         |
+| 10   | `engage-modes`                    | `010-engage-modes.ts`                   | `messaging_group_agents`: add `engage_mode`, `engage_pattern`, `sender_scope`, `ignored_message_policy`; backfill from `trigger_rules`/`response_scope`; drop those two legacy columns (see §1.3)                                                    |
+| 11   | `pending-sender-approvals`        | `011-pending-sender-approvals.ts`       | `pending_sender_approvals` (see §1.16)                                                                                                                                                                                                               |
+| 12   | `channel-registration`            | `012-channel-registration.ts`           | `messaging_groups.denied_at` + `pending_channel_approvals` (see §1.17)                                                                                                                                                                               |
+| 13   | `approval-render-metadata`        | `013-approval-render-metadata.ts`       | `title`, `options_json` columns on `pending_channel_approvals` and `pending_sender_approvals`                                                                                                                                                        |
+| 14   | `container-configs`               | `014-container-configs.ts`              | `container_configs` — per-agent-group container runtime config                                                                                                                                                                                       |
+| 15   | `cli-scope`                       | `015-cli-scope.ts`                      | `ALTER TABLE container_configs ADD COLUMN cli_scope`                                                                                                                                                                                                 |
+| 16   | `messaging-group-instance`        | `016-messaging-group-instance.ts`       | `messaging_groups` gets an `instance` column (adapter-instance dimension); table recreate (`disableForeignKeys: true`) backfills `instance = channel_type` on every existing row and relaxes the `UNIQUE` to `(channel_type, platform_id, instance)` |
+| 17   | `agent-message-policies`          | `017-agent-message-policies.ts`         | `agent_message_policies` (see §1.18)                                                                                                                                                                                                                 |
+| 18   | `approvals-approver-user-id`      | `018-approvals-approver-user-id.ts`     | `pending_approvals.approver_user_id` — names a single required approver for a2a message-gate policies                                                                                                                                                |
 
 Numbers 5 and 6 are intentionally absent — migrations were renumbered during early development.
 

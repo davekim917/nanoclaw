@@ -1977,6 +1977,11 @@ describe('the shared-transcript migration is gone', () => {
     initSessionFolder(LAZY_AG, LAZY_SESS);
 
     expect(fs.existsSync(projectsDir())).toBe(false);
+    // Unchanged by #749, and that is the point: session creation provisions the
+    // mailbox and nothing else. `.host/` is deliberately NOT here — migrating
+    // onto it belongs to the spawn path, never to provisioning, so that a
+    // container already running can never have a host-owned directory appear
+    // inside its writable mount (`NanoclawAgentMailbox.prepare`).
     expect(fs.readdirSync(sessionDir(LAZY_AG, LAZY_SESS)).sort()).toEqual(['inbound.db', 'outbound.db', 'outbox']);
   });
 

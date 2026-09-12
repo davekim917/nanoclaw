@@ -39,6 +39,7 @@ import { buildMounts } from '../container-runner.js';
 import { closeDb, createAgentGroup, getDb, initMigratedTestDb } from '../db/index.js';
 import { ensureContainerConfig, getContainerConfig } from '../db/container-configs.js';
 import { initGroupFilesystem } from '../group-init.js';
+import { getAgentMailbox } from '../mailbox/index.js';
 import { STANDING_INSTRUCTIONS_FILE } from '../group-persona.js';
 import type { AgentGroup, Session } from '../types.js';
 import { copyPluginDir } from './plugin-dir.js';
@@ -274,6 +275,9 @@ describe('T5 PR 3 — the plugin reader and the stamp path', () => {
     expect(fs.readdirSync(path.join(GROUPS_DIR, group.folder, 'plugins'))).toEqual([]);
 
     const session = { id: 's-no-plugin', agent_group_id: group.id } as Session;
+    // Provisioned, as production does before any spawn: `buildMounts` refuses a
+    // session whose inbound.db is not host-owned (#749).
+    getAgentMailbox().prepare({ agentGroupId: group.id, sessionId: session.id });
     const config: ContainerConfig = {
       mcpServers: {},
       packages: { apt: [], npm: [] },

@@ -27,6 +27,7 @@ import path from 'path';
 import Database from 'better-sqlite3';
 
 import { DATA_DIR } from '../src/config.js';
+import { resolveInboundDbPath } from '../src/modules/mailbox/index.js';
 
 const apply = process.argv.includes('--apply');
 const STALE = /opus-?4-?7/i;
@@ -44,14 +45,19 @@ for (const ag of fs.readdirSync(sessionsRoot)) {
   const agDir = path.join(sessionsRoot, ag);
   if (!fs.statSync(agDir).isDirectory()) continue;
   for (const sess of fs.readdirSync(agDir)) {
-    const dbPath = path.join(agDir, sess, 'inbound.db');
+    // The resolver, not the legacy name — see #749. The legacy name is a hard
+    // link to the same inode, so a read-write open through it journals into the
+    // container-writable session directory.
+    const dbPath = resolveInboundDbPath(path.join(agDir, sess));
     if (!fs.existsSync(dbPath)) continue;
     const db = new Database(dbPath);
     db.pragma('journal_mode = DELETE');
     db.pragma('busy_timeout = 5000');
     try {
       const rows = db
-        .prepare("SELECT id, content, recurrence, status FROM messages_in WHERE kind = 'task' AND status IN ('pending', 'paused')")
+        .prepare(
+          "SELECT id, content, recurrence, status FROM messages_in WHERE kind = 'task' AND status IN ('pending', 'paused')",
+        )
         .all() as Array<{ id: string; content: string; recurrence: string | null; status: string }>;
       for (const r of rows) {
         totalScanned++;

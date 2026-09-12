@@ -16,7 +16,7 @@ NanoClaw uses **three kinds of SQLite database**, all on the host filesystem:
 | DB | Location | Writer | Readers | Purpose |
 |----|----------|--------|---------|---------|
 | **Central** | `data/v2.db` | host | host | Identity, permissions, routing, wiring — the admin plane |
-| **Session inbound** | `data/v2-sessions/<agent_group_id>/<session_id>/inbound.db` | host | host (sync), container (read-only) | Host → container messages + routing projections |
+| **Session inbound** | `data/v2-sessions/<agent_group_id>/<session_id>/.host/inbound.db` (hard-linked as `…/<session_id>/inbound.db`) | host | host (sync), container (read-only) | Host → container messages + routing projections |
 | **Session outbound** | `data/v2-sessions/<agent_group_id>/<session_id>/outbound.db` | container | host (poll), container | Container → host messages + processing status |
 
 **Single-writer boundary.** Every SQLite file has exactly one writing side of the host/container boundary. The host writes the central DB and every `inbound.db`; only processes inside the owning container write its `outbound.db`. This eliminates writer contention across the Docker/Apple Container mount boundary, where SQLite locking is unreliable. It does not imply one OS process inside the container: the runner and provider-spawned MCP subprocesses can hold separate outbound connections, serialized by SQLite's busy timeout.
@@ -36,7 +36,8 @@ data/
     <agent_group_id>/
       .claude-shared/                     ← shared Claude state for the agent group
       <session_id>/
-        inbound.db                        ← host writes, container reads
+        .host/inbound.db                  ← host writes (read-only dir mount in the container)
+        inbound.db                        ← hard link to .host/inbound.db; container reads
         outbound.db                       ← container writes, host reads
         .heartbeat                        ← mtime touched by container
         inbox/<message_id>/               ← decoded user attachments

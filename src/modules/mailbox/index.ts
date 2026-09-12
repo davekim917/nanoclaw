@@ -10,7 +10,7 @@
  */
 import type Database from 'better-sqlite3';
 
-import { sessionMailboxPath } from '../../mailbox/sqlite/paths.js';
+import { sessionMailboxDir, sessionMailboxPath } from '../../mailbox/sqlite/paths.js';
 import { SqliteAgentMailbox, wrapSqliteInbound, wrapSqliteOutbound } from '../../mailbox/sqlite/index.js';
 import {
   deleteOrphanProcessingClaims,
@@ -33,6 +33,8 @@ import {
   openOutboundDbWritable,
   sessionDbPathIsGone,
 } from './openers.js';
+import { deleteHostInboundProvenance } from '../../db/host-inbound-provenance.js';
+import { hostInboundDbPathFor, removeHostInboundDir, resolveInboundDbPath } from './host-inbound.js';
 import { ensureNanoclawInboundSchema, ensureSchema } from './schema.js';
 import {
   activateRepoIngressFence,
@@ -244,6 +246,24 @@ export {
  * that wants the DATA there opens a mailbox session instead.
  */
 export { sessionMailboxDir, sessionMailboxPath } from '../../mailbox/sqlite/paths.js';
+
+/**
+ * Where the host keeps `inbound.db` since #749, and the spawn path's migration
+ * onto it. The database itself is still reached through a mailbox session —
+ * these are the layout and the one-time move, for the spawn path that has to
+ * mount the host-owned directory read-only.
+ */
+export {
+  HOST_INBOUND_DIR_NAME,
+  assertHostOwnedInboundDb,
+  hostInboundDbPathFor,
+  hostInboundDirFor,
+  hostInboundMounts,
+  inboundDbIsHostOwned,
+  migrateInboundDbToHostDir,
+  removeForeignInboundSidecars,
+  resolveInboundDbPath,
+} from './host-inbound.js';
 
 /**
  * Read-only session access for the operator surfaces (dashboard, Observatory,
@@ -720,14 +740,55 @@ export class NanoclawAgentMailbox extends SqliteAgentMailbox {
    * migrations belong to its first `session()` (H-2).
    */
   override prepare(key: MailboxSessionKey): void {
+    // `super.prepare()` creates the LEGACY `<session>/inbound.db` when it is
+    // missing, which is what a fresh session needs; the SPAWN path is what
+    // later hard-links it into `<session>/.host/`. On every later call that
+    // link is still there, so upstream's existence check finds the file and
+    // creates nothing, and no upstream file has to change (#749).
+    //
+    // PROVISIONING DELIBERATELY DOES NOT MIGRATE, and that is a safety
+    // property rather than an omission. A container's `/workspace` is a
+    // read-WRITE bind of the session directory, fixed at spawn, and the
+    // read-only `.host` overlay exists only in a mount set built at spawn
+    // (`hostInboundMounts`, `src/container-runner.ts:4471`). Migrating from
+    // here would create `.host/` UNDERNEATH a container that is already
+    // running — inside its writable mount, with no overlay over it — handing
+    // that container the host's journal path and the authoritative file
+    // itself. That is strictly worse than the pre-#749 state, where at least
+    // the file was overlaid read-only. And this runs live: `prepare()` is
+    // reached on any in-session task create (`src/db/scheduled-tasks.ts`) and
+    // from the documented-reset re-provision (`src/session-manager.ts`).
+    //
+    // So migration belongs to the one seam that also builds the mounts:
+    // `buildMounts` migrates and then REFUSES the spawn unless the session is
+    // host-owned (`assertHostOwnedInboundDb`). A session that is live when
+    // this deploys keeps exactly today's exposure — no regression — and
+    // becomes protected at its next spawn, which is also why the deploy needs
+    // no container restart.
     super.prepare(key);
-    ensureSchema(sessionMailboxPath(key, 'inbound'), 'inbound');
+    const sessionPath = sessionMailboxDir(key);
+    // The RESOLVED path: host-owned once the spawn path has migrated this
+    // session, the legacy name while it has not. Naming the host-owned path
+    // unconditionally would provision a SECOND, empty database under `.host/`
+    // for a session whose real one is still at the legacy name.
+    ensureSchema(resolveInboundDbPath(sessionPath), 'inbound');
     ensureSchema(sessionMailboxPath(key, 'outbound'), 'outbound');
   }
 
   override async destroy(key: MailboxSessionKey): Promise<void> {
+    const sessionPath = sessionMailboxDir(key);
+    // Both spellings: the memo is keyed on whatever path `session()` resolved,
+    // which is the host-owned one for a migrated session and the legacy one
+    // for a session this host has not migrated yet.
+    this.nanoclawMigrated.delete(hostInboundDbPathFor(sessionPath));
     this.nanoclawMigrated.delete(sessionMailboxPath(key, 'inbound'));
     await super.destroy(key);
+    removeHostInboundDir(sessionPath);
+    // The provenance record goes with the file it describes. Leaving it would
+    // mean a later session reusing this (agent group, session id) pair — or a
+    // directory recreated under it — inheriting a record that no longer
+    // describes anything this host created.
+    await deleteHostInboundProvenance(key.agentGroupId, key.sessionId);
   }
 
   /**
@@ -739,7 +800,7 @@ export class NanoclawAgentMailbox extends SqliteAgentMailbox {
    * loud failure at the next sync so this copy is reviewed then.
    */
   override async session<T>(key: MailboxSessionKey, action: NanoclawMailboxAction<T>): Promise<T> {
-    const inboundPath = sessionMailboxPath(key, 'inbound');
+    const inboundPath = resolveInboundDbPath(sessionMailboxDir(key));
     const outboundPath = sessionMailboxPath(key, 'outbound');
     // A vanished session reports as SessionDbMissingError, not upstream's
     // "not prepared" Error: sweep, delivery and container-restart all branch
