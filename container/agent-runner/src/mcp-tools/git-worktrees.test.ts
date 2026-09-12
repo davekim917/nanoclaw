@@ -1289,6 +1289,10 @@ describe('topic-linked worktree topology', () => {
           expect(created.isError).toBe(true);
           expect(created.content[0].text).toContain('left over from a clone-mode period');
           expect(created.content[0].text).toContain('not secret-scanned on push');
+          // The real scan-policy-repos.json loaded fine here (no override is
+          // active), so this is a genuine wiki refusal, not a fail-closed
+          // guess — the #691 load-failure hint must not be tacked on.
+          expect(created.content[0].text.toLowerCase()).not.toContain('failed to load');
         }
 
         // Still a clone (its own independent .git directory) at the primary
@@ -1387,6 +1391,48 @@ describe('topic-linked worktree topology', () => {
         expect(pr.content[0].text).toContain('not secret-scanned on push');
       } finally {
         fakeGh.restore();
+      }
+    });
+
+    test('a non-wiki leftover-clone refusal names the load failure, not the wiki cause, when the scan-policy list fails to load (#691)', async () => {
+      // 'proj' (the describe block's default seeded repo, see seedCanonical
+      // in beforeEach) is NOT in the real scan-policy-repos.json — only
+      // 'wiki' is. Forcing the list to fail to load makes
+      // isScanPolicyRepositoryName fail closed for 'proj' too (every repo
+      // name, not just 'wiki'), so its leftover clone at the primary position
+      // is refused exactly the way a real scan-policy repo's would be.
+      // Before this fix, that refusal reused the wiki-shaped wording
+      // verbatim — naming a cause ('left over from a clone-mode period') that
+      // is true of the checkout shape but not of *why* 'proj' was refused;
+      // the real cause (the failed list load) was visible only in the MCP
+      // server's stderr.
+      const clonePath = join(firstTopic, 'proj');
+      createHostClone(remote, clonePath, { repo: 'proj', branch: 'main', startedFrom: 'origin-head' });
+
+      const scratchDir = mkdtempSync(join(tmpdir(), 'gw-scan-policy-hint-'));
+      initTestSessionDb();
+      try {
+        resetScanPolicyRepositoryNamesForTest(join(scratchDir, 'does-not-exist.json'));
+        expect(isScanPolicyRepositoryName('proj')).toBe(true); // fail-closed sanity check
+
+        const created = await createWorktreeTool.handler({ repo: 'proj' });
+        expect(created.isError).toBe(true);
+        const text = created.content[0].text;
+        // The shape-level wording is unchanged...
+        expect(text).toContain('left over from a clone-mode period');
+        expect(text).toContain('not secret-scanned on push');
+        // ...but the real cause is now named, with a pointer at the host.
+        expect(text.toLowerCase()).toContain('scan-policy repository list failed');
+        expect(text.toLowerCase()).toContain('failed');
+        expect(text.toLowerCase()).toContain('to load');
+        expect(text.toLowerCase()).toContain('restart the host');
+      } finally {
+        // Restore the real list before this describe block's later tests run
+        // — several of them (the wiki tests above aside) rely on 'proj' NOT
+        // being scan-policy under the real scan-policy-repos.json.
+        resetScanPolicyRepositoryNamesForTest();
+        rmSync(scratchDir, { recursive: true, force: true });
+        closeSessionDb();
       }
     });
 
@@ -1783,6 +1829,12 @@ describe('isScanPolicyRepositoryName fail-closed behavior (#682 round 2 blocking
         (args) => typeof args[0] === 'string' && args[0].includes('scan-policy-repos.json failed to load'),
       );
       expect(failureLogs.length).toBe(1);
+      // #691: the list file is the host's read-only boot snapshot of this
+      // very source (src/agent-runner-source.ts), so a container restart
+      // alone re-reads the same broken file — the log must point at
+      // restarting the HOST, not the container.
+      expect(String(failureLogs[0]?.[0])).toContain('restart the host');
+      expect(String(failureLogs[0]?.[0])).not.toContain('container restarts');
     } finally {
       errorSpy.mockRestore();
     }
