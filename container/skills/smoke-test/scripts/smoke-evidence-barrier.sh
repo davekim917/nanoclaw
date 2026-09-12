@@ -297,6 +297,54 @@ finding_clip_problem() {
   done < <(jq -r '.confirmedFindings[]?' "$marker_path")
 }
 
+# A `floor` lane's `pass` marker must carry real browser evidence — an
+# API-only campaign lane resets that entry's staleness clock with no journey
+# ever walked, exactly the silent regression the coverage floor exists to
+# catch (SKILL.md "The coverage floor"). The one exemption is a lane whose
+# CONTRACT entry (not the marker — a marker cannot self-declare its way out of
+# this) carries `evidence:"api"`, set only by `smoke-run-scaffold.sh contract
+# --evidence <lane-id>=api` at scaffold time. Reads the contract fresh per
+# lane rather than caching it: this runs once per marker in a bounded loop,
+# same cost class as expected_generation() above.
+lane_kind() {
+  local lane_id="$1" found
+  found="$(jq -r --arg id "$lane_id" \
+    '[.lanes[]? | select(type=="object") | select(.id == $id) | (.kind // "lane")][0] // empty' \
+    "$CONTRACT" 2>/dev/null)" || found=""
+  [ -n "$found" ] && printf '%s' "$found" || printf 'lane'
+}
+
+lane_declares_api_evidence() {
+  local lane_id="$1"
+  jq -e --arg id "$lane_id" \
+    '[.lanes[]? | select(type=="object") | select(.id == $id) | (.evidence // "")][0] == "api"' \
+    "$CONTRACT" >/dev/null 2>&1
+}
+
+FLOOR_MEDIA_EXTENSIONS='png|jpg|jpeg|webp|gif|mp4|webm'
+
+# Only called once pass_evidence_problem has already confirmed every listed
+# evidence path exists as a nonempty regular file under the run root — this
+# only has to ask whether at least one of those already-verified paths looks
+# like browser media.
+floor_evidence_problem() {
+  local marker_path="$1" lane_id="$2"
+
+  # Explicit `return 0` on both early exits, not a bare `return` behind `||`:
+  # under `set -e`, `return` with no argument propagates the CURRENT `$?`, and
+  # the failed `[ ... ]` test on the left of `||` leaves that at 1 — the
+  # assignment `evidence_problem="$(floor_evidence_problem ...)"` then trips
+  # errexit and aborts the whole barrier for every non-floor pass marker.
+  [ "$(lane_kind "$lane_id")" = "floor" ] || return 0
+  lane_declares_api_evidence "$lane_id" && return 0
+
+  if ! jq -e --arg ext "$FLOOR_MEDIA_EXTENSIONS" '
+    any((.evidence // [])[]; test("\\.(" + $ext + ")$"; "i"))
+  ' "$marker_path" >/dev/null 2>&1; then
+    printf 'floor pass without browser evidence'
+  fi
+}
+
 # `disposition` gates the challenger's THREAD POST, not its file write.
 #
 # Independence was ordered around files, but the disposition is posted in the
@@ -371,6 +419,10 @@ while IFS= read -r marker; do
     fi
     if [ "$marker_valid" = true ]; then
       evidence_problem="$(finding_clip_problem "$marker_path")"
+      [ -z "$evidence_problem" ] || marker_valid=false
+    fi
+    if [ "$marker_valid" = true ] && [ "$(jq -r '.status' "$marker_path" 2>/dev/null)" = pass ]; then
+      evidence_problem="$(floor_evidence_problem "$marker_path" "$lane_id")"
       [ -z "$evidence_problem" ] || marker_valid=false
     fi
   fi

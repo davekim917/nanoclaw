@@ -622,6 +622,58 @@ jq -e '.activeRunId == null and .completedRunId == "'"$TASK_FIN_ID"'" and .compl
     echo "expected task-finish through the wrapper to record a verdict under the wrapper's own state dir" >&2; exit 1; }
 ) || exit 1
 
+# --- --evidence: declaring a floor lane's proof is API-only by design ------
+EVID_RUN="$FIXTURE_BASE/evidence-flag-run"
+mkdir -p "$EVID_RUN"
+gate_owns "$(basename "$EVID_RUN")"
+
+# The value is a fixed vocabulary of one, on purpose (see the flag's own
+# comment in smoke-run-scaffold.sh) — anything else is refused.
+OUT="$(scaffold contract "$EVID_RUN" "$SHA" F1:floor --evidence F1=screenshot 2>&1 || true)"
+jq -e '.ok == false and (.error | test("only supports the value .api."))' <<<"$OUT" >/dev/null || {
+  echo "expected a non-'api' --evidence value to be refused, got: $OUT" >&2; exit 1; }
+
+# Declaring evidence for a lane id that is not among the lanes being
+# scaffolded on this call must be refused rather than silently ignored.
+OUT="$(scaffold contract "$EVID_RUN" "$SHA" F1:floor --evidence F9=api 2>&1 || true)"
+jq -e '.ok == false and (.error | test("not among the lanes being scaffolded"))' <<<"$OUT" >/dev/null || {
+  echo "expected --evidence naming an undeclared lane to be refused, got: $OUT" >&2; exit 1; }
+
+# --evidence is contract-only.
+OUT="$(scaffold marker "$EVID_RUN" F1 pass '' '' --evidence F1=api 2>&1 || true)"
+jq -e '.ok == false and (.error | test("only valid with the contract command"))' <<<"$OUT" >/dev/null || {
+  echo "expected --evidence on the marker command to be refused, got: $OUT" >&2; exit 1; }
+
+# A valid declaration lands on the matching lane's contract entry, and only
+# that lane — a second lane in the same call with no --evidence stays bare.
+scaffold contract "$EVID_RUN" "$SHA" F1:floor:'Payout walk' S1:source --evidence F1=api \
+  | jq -e '.ok == true and .laneCount == 2' >/dev/null
+jq -e '
+  (.lanes[] | select(.id == "F1") | .evidence) == "api" and
+  (.lanes[] | select(.id == "S1") | has("evidence") | not)
+' "$EVID_RUN/completion-contract.json" >/dev/null || {
+  echo "expected only F1's contract entry to carry evidence:\"api\"" >&2
+  cat "$EVID_RUN/completion-contract.json" >&2; exit 1; }
+
+# The declaration is what the barrier actually reads: an F1 pass with only an
+# API receipt (no screenshot) clears the barrier because the CONTRACT says so.
+mkdir -p "$EVID_RUN/evidence" "$EVID_RUN/coordinator" "$EVID_RUN/challenger"
+printf '{"status":200}\n' >"$EVID_RUN/evidence/api-receipt.json"
+scaffold marker "$EVID_RUN" F1 pass 'api proof' 'evidence/api-receipt.json' | jq -e '.ok == true' >/dev/null
+printf 'source receipt\n' >"$EVID_RUN/evidence/s1.txt"
+scaffold marker "$EVID_RUN" S1 pass 'unit proof' 'evidence/s1.txt' | jq -e '.ok == true' >/dev/null
+printf '# p\n' >"$EVID_RUN/coordinator/preliminary.md"
+printf '# d\n' >"$EVID_RUN/challenger/disposition.md"
+barrier "$EVID_RUN" lanes | jq -e '.ready == true' >/dev/null || {
+  echo "expected a declared API-only floor lane's API receipt to satisfy the barrier" >&2; exit 1; }
+
+# Redispatching F1 preserves the evidence declaration — regenerating a lane's
+# generation must not silently strip an exemption a coordinator already made.
+scaffold redispatch "$EVID_RUN" F1 | jq -e '.ok == true and .generation == 2' >/dev/null
+jq -e '(.lanes[] | select(.id == "F1") | .evidence) == "api"' "$EVID_RUN/completion-contract.json" >/dev/null || {
+  echo "expected redispatch to preserve F1's evidence declaration" >&2
+  cat "$EVID_RUN/completion-contract.json" >&2; exit 1; }
+
 # Resume the ordinary fixture as its original owner, in case anything is ever
 # appended after this block.
 gate_owns "$(basename "$FIXTURE_DIR")"
