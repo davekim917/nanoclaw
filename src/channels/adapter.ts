@@ -21,8 +21,12 @@ export interface ChannelSetup {
   /** Called when the adapter discovers metadata about a conversation. */
   onMetadata(platformId: string, name?: string, isGroup?: boolean): void | Promise<void>;
 
-  /** Called when a user clicks a button/action in a card (e.g., ask_user_question response). */
-  onAction(questionId: string, selectedOption: string, userId: string): void;
+  /**
+   * Called when a user clicks a button/action in a card (e.g., ask_user_question response).
+   * `messageId` is the platform id of the clicked message, null when the platform
+   * gave none: an approval resolves only from a click on its own card.
+   */
+  onAction(questionId: string, selectedOption: string, userId: string, messageId: string | null): void;
 
   /**
    * Called when an adapter knows its inbound transport reconnected. Core also

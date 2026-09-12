@@ -104,7 +104,7 @@ async function discordClick(questionId: string): Promise<{ bodies: unknown[]; on
         token: 'token-1',
         data: { custom_id: `ncq:${questionId}:0` },
         member: { user: { id: 'U1' } },
-        message: { embeds: [{ title: 'Release', description: 'Which change ships?' }] },
+        message: { id: 'discord-msg-1', embeds: [{ title: 'Release', description: 'Which change ships?' }] },
       },
     }),
     { name: 'gateway-stub', handleWebhook: vi.fn(async () => new Response('ok')) } as unknown as Adapter,
@@ -152,7 +152,7 @@ describe('chat-sdk-bridge answer cards', () => {
     const { bodies, onAction } = await discordClick('ans-d');
 
     expect(bodies).toEqual([{ type: 6 }]);
-    expect(onAction).toHaveBeenCalledWith('ans-d', 'ship', 'U1');
+    expect(onAction).toHaveBeenCalledWith('ans-d', 'ship', 'U1', 'discord-msg-1');
   });
 
   it('Discord: classifies from the render read too', async () => {

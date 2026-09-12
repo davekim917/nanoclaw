@@ -1146,6 +1146,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const questionId = parts[1];
         const tail = parts.slice(2).join(':');
         const userId = event.user?.userId || '';
+        // The clicked message itself. The button names only a questionId,
+        // which any card can carry, so approvals bind the click to their own
+        // card with this id (response-handler.ts).
+        const messageId = event.messageId || null;
 
         // Resolve render metadata BEFORE dispatching onAction (which deletes the row).
         const render = await getAskQuestionRender(questionId);
@@ -1170,7 +1174,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         // second one: a row the winning click deletes in between would otherwise
         // read as "not an answer card" and fall through to the edit below.
         if (render?.action !== undefined && isAnswerCardAction(render.action)) {
-          setupConfig.onAction(questionId, selectedOption, userId);
+          setupConfig.onAction(questionId, selectedOption, userId, messageId);
           return;
         }
         const title = render?.title ?? '❓ Question';
@@ -1205,7 +1209,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           log.warn('Failed to update card after action', { err });
         }
 
-        setupConfig.onAction(questionId, selectedOption, userId);
+        setupConfig.onAction(questionId, selectedOption, userId, messageId);
       });
 
       // Native slash commands (e.g. Slack's registered `/dashboard-token`,
@@ -2021,6 +2025,9 @@ export async function handleForwardedEvent(
           (interaction.user as Record<string, string> | undefined);
         const interactionId = interaction.id as string;
         const interactionToken = interaction.token as string;
+        // The clicked message, which approvals bind the click to (see the Chat SDK path).
+        const clickedMessage = (interaction.message as Record<string, unknown> | undefined)?.id;
+        const messageId = typeof clickedMessage === 'string' && clickedMessage ? clickedMessage : null;
 
         // Parse the selected option from custom_id
         let questionId: string | undefined;
@@ -2084,7 +2091,7 @@ export async function handleForwardedEvent(
           } catch (err) {
             log.error('Failed to acknowledge Discord answer-card action', { err });
           }
-          setupConfig.onAction(questionId, selectedOption, user?.id || '');
+          setupConfig.onAction(questionId, selectedOption, user?.id || '', messageId);
           return;
         }
         const cardTitle = render?.title ?? ((originalEmbeds[0]?.title as string) || '❓ Question');
@@ -2115,7 +2122,7 @@ export async function handleForwardedEvent(
         }
 
         // Dispatch to host
-        setupConfig.onAction(questionId, selectedOption, user?.id || '');
+        setupConfig.onAction(questionId, selectedOption, user?.id || '', messageId);
         return;
       }
     }

@@ -468,7 +468,7 @@ describe('Chat SDK bridge Discord approval actions', () => {
         token: 'token-1',
         data: { custom_id: customId },
         member: { user: { id: 'U1' } },
-        message: { embeds: [{ title: '⚠️ Test approval', description: 'Details' }] },
+        message: { id: 'discord-card-1', embeds: [{ title: '⚠️ Test approval', description: 'Details' }] },
       },
     });
   }
@@ -503,7 +503,7 @@ describe('Chat SDK bridge Discord approval actions', () => {
       'bot-token',
     );
 
-    expect(onAction).toHaveBeenCalledWith('appr-discord', 'approve', 'U1');
+    expect(onAction).toHaveBeenCalledWith('appr-discord', 'approve', 'U1', 'discord-card-1');
     const callbackInit = fetchMock.mock.calls[0]?.[1];
     expect(callbackInit).toBeDefined();
     expect(JSON.parse(callbackInit!.body as string)).toMatchObject({
@@ -533,7 +533,7 @@ describe('Chat SDK bridge Discord approval actions', () => {
       'bot-token',
     );
 
-    expect(onAction).toHaveBeenCalledWith('appr-discord-wire', 'approve', 'U1');
+    expect(onAction).toHaveBeenCalledWith('appr-discord-wire', 'approve', 'U1', 'discord-card-1');
     const callbackInit = fetchMock.mock.calls[0]?.[1];
     expect(callbackInit).toBeDefined();
     expect(JSON.parse(callbackInit!.body as string)).toMatchObject({ type: 7 });

@@ -12,6 +12,7 @@ import {
   getRunningSessions,
   getSessionsActiveSince,
   createPendingQuestion,
+  getPendingApproval,
   isTaskThread,
   taskSeriesId,
   TASKS_SYSTEM_THREAD_ID,
@@ -979,6 +980,26 @@ async function deliverMessage(
   }
 
   const content = JSON.parse(msg.content);
+
+  // An agent's ask_question must never reuse a pending approval's id: its
+  // buttons would carry that id, and a click would be decoded through this
+  // card's options (src/db/sessions.ts:787-788). ask_user_question mints its
+  // own id (container/agent-runner/src/mcp-tools/interactive.ts:89), so only a
+  // raw outbound row can collide. Refused whole: no card, no pending question.
+  if (
+    content &&
+    typeof content === 'object' &&
+    content.type === 'ask_question' &&
+    typeof content.questionId === 'string' &&
+    (await getPendingApproval(content.questionId))
+  ) {
+    log.warn('Refusing an ask_question that reuses a pending approval id', {
+      id: msg.id,
+      sessionId: session.id,
+      questionId: content.questionId,
+    });
+    return {};
+  }
 
   // Spawn-child workers sometimes ask via chat-sdk's `ask_question` instead
   // of calling `spawn_request_steer`. Both signal "operator attention

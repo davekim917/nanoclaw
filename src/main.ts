@@ -978,7 +978,7 @@ export async function main(): Promise<void> {
           updates,
         });
       },
-      onAction(questionId, selectedOption, userId) {
+      onAction(questionId, selectedOption, userId, messageId) {
         dispatchResponse({
           questionId,
           value: selectedOption,
@@ -989,6 +989,8 @@ export async function main(): Promise<void> {
           // pending_question / pending_approval row.
           platformId: '',
           threadId: null,
+          // The clicked message, which approvals bind the click to.
+          messageId,
         }).catch((err) => {
           log.error('Failed to handle question response', { questionId, err });
         });
