@@ -390,5 +390,117 @@ case "$OUT" in
   *) bad "a pulled scripts-only merge still breached" "$OUT" ;;
 esac
 
+# ── DRY_RUN performs no fetch; the fetch and status calls carry their flags ──
+# (#618 P3) A dedicated, disposable git fixture — not the shared $ROOT above,
+# whose history is deliberately doctored for the scenarios tested there — so
+# this only has to reason about one clean, one-merge-behind repo. A fake
+# `git` ahead of the real one on PATH records every invocation and then execs
+# the real binary, so the rest of the vital's git plumbing still runs for
+# real; this is the "fake git that records calls" the review asked for.
+FLAG_ROOT="$(mktemp -d)"
+mkdir -p "$FLAG_ROOT/data" "$FLAG_ROOT/logs" "$FLAG_ROOT/node_modules/.bin" "$FLAG_ROOT/bin" "$FLAG_ROOT/dist"
+: > "$FLAG_ROOT/logs/nanoclaw.log"
+: > "$FLAG_ROOT/logs/nanoclaw.error.log"
+cp "$ROOT/node_modules/.bin/tsx" "$FLAG_ROOT/node_modules/.bin/tsx"
+cp "$ROOT/bin/systemctl" "$FLAG_ROOT/bin/systemctl"
+
+git -C "$FLAG_ROOT" init -q -b main
+git -C "$FLAG_ROOT" config user.email selfcheck@localhost
+git -C "$FLAG_ROOT" config user.name selfcheck
+mkdir -p "$FLAG_ROOT/src"
+echo base >> "$FLAG_ROOT/src/a.ts"
+git -C "$FLAG_ROOT" add src/a.ts
+GIT_COMMITTER_DATE="$(date -d '10 hours ago' -R)" GIT_AUTHOR_DATE="$(date -d '10 hours ago' -R)" \
+  git -C "$FLAG_ROOT" commit -q -m base
+FLAG_BASE=$(git -C "$FLAG_ROOT" rev-parse HEAD)
+printf '{"sha":"%s","shortSha":"%s","builtAt":"%s"}\n' "$FLAG_BASE" "${FLAG_BASE:0:9}" \
+  "$(date -u -d '10 hours ago' +%Y-%m-%dT%H:%M:%S.000Z)" > "$FLAG_ROOT/dist/BUILD_INFO.json"
+echo runtime >> "$FLAG_ROOT/src/b.ts"
+git -C "$FLAG_ROOT" add src/b.ts
+GIT_COMMITTER_DATE="$(date -d '4 hours ago' -R)" GIT_AUTHOR_DATE="$(date -d '4 hours ago' -R)" \
+  git -C "$FLAG_ROOT" commit -q -m runtime
+FLAG_RUNTIME=$(git -C "$FLAG_ROOT" rev-parse HEAD)
+git -C "$FLAG_ROOT" update-ref refs/remotes/origin/main "$FLAG_RUNTIME"
+
+GIT_CALLS="$FLAG_ROOT/git-calls.log"
+: > "$GIT_CALLS"
+REAL_GIT="$(command -v git)"
+cat > "$FLAG_ROOT/bin/git" <<EOF
+#!/bin/bash
+printf '%s\n' "\$*" >> "$GIT_CALLS"
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$FLAG_ROOT/bin/git"
+
+run_flag_sentinel() { # env... -> sets OUT (no outbox: this fixture only cares about $OUT/$GIT_CALLS)
+  OUT="$(env PATH="$FLAG_ROOT/bin:$PATH" NANOCLAW_DIR="$FLAG_ROOT" LOAD15_MAX=999999 HEALTH_SENTINEL_OUTBOX= "$@" bash "$SENTINEL" 2>&1)"
+}
+
+: > "$GIT_CALLS"
+run_flag_sentinel
+if grep -q -- '-c gc.auto=0 -c maintenance.auto=false fetch --quiet --no-write-fetch-head origin main' "$GIT_CALLS"; then
+  ok "fetch carries -c gc.auto=0 -c maintenance.auto=false --no-write-fetch-head"
+else
+  bad "fetch is missing the safety flags" "$(cat "$GIT_CALLS")"
+fi
+if grep -q -- '^--no-optional-locks status' "$GIT_CALLS"; then
+  ok "git status runs with --no-optional-locks"
+else
+  bad "git status missing --no-optional-locks" "$(cat "$GIT_CALLS")"
+fi
+
+: > "$GIT_CALLS"
+run_flag_sentinel DRY_RUN=1
+if grep -q 'fetch' "$GIT_CALLS"; then
+  bad "dry run performed a fetch" "$(cat "$GIT_CALLS")"
+else
+  ok "dry run performs no fetch"
+fi
+case "$OUT" in
+  *"last-fetched origin/main"*) ok "dry run says the lag is against the last-fetched ref" ;;
+  *) bad "dry run did not explain the last-fetched-ref caveat" "$OUT" ;;
+esac
+rm -rf "$FLAG_ROOT"
+
+# ── invalid DEPLOY_LAG_MAX_S / DEPLOY_LAG_PULL_MAX_S / missing jq (#618 P3) ──
+# Chosen behavior: fail CLOSED, the same shape WATCHED_TIMERS already uses
+# above — an invalid or missing input is its own breach, never a silent skip
+# or a substituted default. DRY_RUN keeps these hermetic: no delivery/outbox
+# plumbing needed, just the "would alert" listing.
+run_sentinel DRY_RUN=1 DEPLOY_LAG_MAX_S=notanumber
+case "$OUT" in
+  *"DEPLOY_LAG_MAX_S='notanumber' is not a non-negative integer"*) ok "a non-integer DEPLOY_LAG_MAX_S is reported as a breach" ;;
+  *) bad "a non-integer DEPLOY_LAG_MAX_S was not reported" "$OUT" ;;
+esac
+
+run_sentinel DRY_RUN=1 DEPLOY_LAG_PULL_MAX_S=notanumber
+case "$OUT" in
+  *"DEPLOY_LAG_PULL_MAX_S='notanumber' is not a non-negative integer"*) ok "a non-integer DEPLOY_LAG_PULL_MAX_S is reported as a breach" ;;
+  *) bad "a non-integer DEPLOY_LAG_PULL_MAX_S was not reported" "$OUT" ;;
+esac
+
+# DEPLOY_LAG_MAX_S=0 stays the one documented, intentional off switch — not a
+# config error, so it must NOT raise the new config breach.
+run_sentinel DRY_RUN=1 DEPLOY_LAG_MAX_S=0
+case "$OUT" in
+  *"is not a non-negative integer"*) bad "DEPLOY_LAG_MAX_S=0 was treated as an invalid threshold" "$OUT" ;;
+  *) ok "DEPLOY_LAG_MAX_S=0 stays the documented off switch, not a config breach" ;;
+esac
+
+# A missing `jq`: a PATH built from symlinks to every tool the script needs
+# EXCEPT jq, so `command -v jq` genuinely fails closed instead of silently
+# falling back to HEAD (the exact under-report the header warns about).
+NOJQ_DIR="$(mktemp -d)"
+for tool in bash awk cat date df dirname git grep head mktemp nproc od python3 stat tail timeout tr wc; do
+  tool_path="$(command -v "$tool" 2>/dev/null)"
+  [ -n "$tool_path" ] && ln -sf "$tool_path" "$NOJQ_DIR/$tool"
+done
+OUT="$(env PATH="$ROOT/bin:$NOJQ_DIR" NANOCLAW_DIR="$ROOT" LOAD15_MAX=999999 DRY_RUN=1 bash "$SENTINEL" 2>&1)"
+case "$OUT" in
+  *"jq is not installed"*) ok "a missing jq is reported as a breach" ;;
+  *) bad "a missing jq was not reported as a breach" "$OUT" ;;
+esac
+rm -rf "$NOJQ_DIR"
+
 [ "$FAILED" -eq 0 ] && echo "health-sentinel-selfcheck: all checks passed" || echo "health-sentinel-selfcheck: FAILURES"
 exit "$FAILED"
