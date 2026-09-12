@@ -72,7 +72,7 @@ say so explicitly rather than claim they're fixed.
 
 Review: /home/ubuntu/scratch/autoagent-0912/codex-710b-review.md
 
-- [ ] P2.1 atomic duplicate-choiceId reservation. choice.ts:141's pre-check
+- [x] P2.1 atomic duplicate-choiceId reservation. choice.ts:141's pre-check
       crosses awaits before primitive.ts inserts; two sessions racing the same
       choiceId produced two pending approvals + two cards + no refusal.
       Shape: migration 078, partial UNIQUE index on
@@ -85,13 +85,52 @@ Review: /home/ubuntu/scratch/autoagent-0912/codex-710b-review.md
       Live-install precheck re-run read-only before authoring: 13 pending
       approvals, 13 distinct request_ids, 0 null, no dupes, choice_receipts
       absent — the index cannot fail on live data.
-- [ ] P2.2 mutation-proof the tests: real ingress producer for platform + CLI
+- [x] P2.2 mutation-proof the tests: real ingress producer for platform + CLI
       adapters; conflicting-receipt insert instead of DROP TABLE; an ordering
       assertion that kills "insert after the pending-row deletion".
-- [ ] Stale docs: migration 077's "nothing else deletes" names the
+- [x] Stale docs: migration 077's "nothing else deletes" names the
       scripts/delete-cli-agent.ts teardown exception; request-choice.ts's
       documented response line gains approval_id, pinned by a drift test.
 - [ ] tsc (host + container), targeted, counterfactual table, full suites,
       ratchet, push, PR body.
 
 ## Round 3 log
+
+- P2.1: migration 078 adds a partial UNIQUE index on
+  `pending_approvals(request_id)` WHERE action='request_choice' AND
+  status='pending'. Scoped to the action because other kinds reuse a
+  request_id on purpose (the gateway re-arms an existing row on redelivery,
+  bash-gate keys on its outbound message id); scoped to pending because a
+  resolved or retired row is deleted immediately after. It retires any
+  pre-existing live duplicate BEFORE creating the index — migrations run at
+  every host start, so a throw there would crash-loop the boot rather than
+  fail closed usefully. `createPendingApproval` already reported changes>0;
+  the new `requestApprovalOutcome` turns a false into 'duplicate-request'
+  before the card posts, and `requestApproval` stays a boolean wrapper for
+  the other callers. choice.ts's pre-check is kept but demoted to a fast
+  path, with the same refusal text either way.
+- P2.2: the ingress producer moved to `src/channels/inbound-event.ts`
+  (`adapterInboundEvent`); main.ts's onInbound delegates to it. The router
+  test drives it for a platform adapter AND for the CLI adapter against a
+  real wired 'cli' messaging group, so both mutations bite. choices.test.ts
+  swaps DROP TABLE for a preseeded conflicting receipt (kills restoring ON
+  CONFLICT DO NOTHING) and adds a write-time probe on the pending row (kills
+  moving the insert after the delete).
+- Docs: 077 names scripts/delete-cli-agent.ts:50-59 as the one deleter; the
+  tool description documents approval_id and is pinned to
+  formatChoiceResponse by a drift test in choice.test.ts.
+- Live-install precheck, read-only, before authoring the migration: 13
+  pending approvals, 13 distinct request_ids, 0 null, no duplicates,
+  choice_receipts absent — the index cannot fail on live data.
+- Host tsc clean; container tsc clean; targeted 8 files / 99 tests pass.
+  (review-notes.test.ts checks cited paths against HEAD, not the working
+  tree, so the two new files had to be committed before it went green.)
+- Ratchet: 5 growths accepted — adapter.ts +2, migrations/index.ts +7,
+  registry.test.ts +1, sessions.ts +12, primitive.ts +49.
+- Counterfactuals, ALL RED (script /tmp/cf-710.sh, log
+  .r3-counterfactual.log): M1 migration 078 absent, M2 reservation result
+  ignored, M3 ON CONFLICT DO NOTHING restored, M4 insert moved after the
+  delete, M5 nativeId assignment deleted, M6 CLI exclusion deleted, M7 tool
+  description reverted to the stale key order.
+- Commit 10e73c25. Next: full host + container suites, commit the ratchet,
+  push, update the PR body.
