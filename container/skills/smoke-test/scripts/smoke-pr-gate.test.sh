@@ -2473,6 +2473,23 @@ import policy_extra as list
 list(SENSITIVE_GLOBS)
 ' 'could mutate'
 
+# The two import spellings that bind through a DIFFERENT alias field than the
+# two above: a bare `import len` binds the first dotted segment of the module
+# name, and `from x import foo as len` binds the asname. Neither names the
+# constant, so the pre-existing import check walks straight past both and only
+# the shadowing rule refuses them.
+assert_policy_refused shadow-import-bare 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+import len
+
+len(SENSITIVE_GLOBS)
+' 'could mutate'
+
+assert_policy_refused shadow-from-import-as 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+from policy_extra import widen as sorted
+
+sorted(SENSITIVE_GLOBS)
+' 'could mutate'
+
 assert_policy_refused shadow-assign 'def _widen(globs):
     globs.append("backend/billing/**")
     return globs
