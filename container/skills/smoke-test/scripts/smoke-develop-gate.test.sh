@@ -1621,5 +1621,42 @@ export SMOKE_GATE_WAIT_INTERVAL_SECONDS=0 SMOKE_GATE_WAIT_MAX_SECONDS=30
 bash "$GATE" wait-settled | jq -e '.settled == true and .attempts == 1' >/dev/null
 unset SMOKE_GATE_WAIT_INTERVAL_SECONDS SMOKE_GATE_WAIT_MAX_SECONDS
 
+# --- 59. `wait-settled`'s own knobs are wired into gate_misconfigured just
+# like every other numeric knob (see num_env's comment above
+# WAIT_INTERVAL_SECONDS) — a duration suffix or a leading zero fails BOTH
+# `poll` and `check`, not only an agent's own `wait-settled` invocation.
+fresh_state
+export STUB_SOURCE_SHA="$(printf '3%.0s' $(seq 40))"
+for bad in 45m 2700s 0900; do
+  SMOKE_GATE_WAIT_MAX_SECONDS="$bad" bash "$GATE" poll | jq -e '
+    .data.trigger == "gate_misconfigured" and
+    .data.missing == ["SMOKE_GATE_WAIT_MAX_SECONDS"]
+  ' >/dev/null || { echo "poll admitted WAIT_MAX_SECONDS='$bad'" >&2; exit 1; }
+  SMOKE_GATE_WAIT_MAX_SECONDS="$bad" bash "$GATE" check | jq -e '
+    .data.trigger == "gate_misconfigured" and
+    .data.missing == ["SMOKE_GATE_WAIT_MAX_SECONDS"]
+  ' >/dev/null || { echo "check admitted WAIT_MAX_SECONDS='$bad'" >&2; exit 1; }
+done
+
+# --- 60. `claim` refuses a run id already held by a task-scoped certification
+# run (#726 F2, develop-gate side — smoke-pr-gate.sh's task-claim already
+# makes the reciprocal check against this gate's develop-state.json). Without
+# this, `task-claim run-b` followed by a develop-gate `claim run-b` leaves two
+# active slots for one run id: the task lease still calls run-b its own, while
+# develop-state.json now also claims it.
+fresh_state
+TASK_SLOT_SHA="$(printf '7%.0s' $(seq 40))"
+printf '{"schemaVersion":1,"activeRunId":"run-b","activeSha":"%s","activeStartedAt":"2026-01-01T00:00:00Z","activeProgressAt":"2026-01-01T00:00:00Z","activeLeaseOwner":"owner-x","completedAt":null,"completedRunId":null,"completedVerdict":null}\n' \
+  "$TASK_SLOT_SHA" > "$STATE_DIR2/task-run-b-state.json"
+bash "$GATE" claim run-b "$TASK_SLOT_SHA" | jq -e '
+  .ok == false and (.error | test("task-scoped certification run"))
+' >/dev/null
+# The refusal happened before any state write — no active slot was opened.
+if [ -e "$STATE_DIR2/develop-state.json" ]; then
+  jq -e '.activeRunId == null' "$STATE_DIR2/develop-state.json" >/dev/null
+fi
+# A run id not held by any task slot is unaffected by an unrelated one.
+bash "$GATE" claim run-c "$TASK_SLOT_SHA" | jq -e '.ok == true and .runId == "run-c"' >/dev/null
+
 echo "smoke develop gate tests passed"
 
