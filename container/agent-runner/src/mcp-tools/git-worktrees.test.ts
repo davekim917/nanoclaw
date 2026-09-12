@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { execFileSync } from 'child_process';
-import { randomBytes } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import {
   chmodSync,
   existsSync,
@@ -740,6 +740,72 @@ describe('topic-linked worktree topology', () => {
     }
   });
 
+  // #705: a transfer tombstone withholds the canonical `.git` from its source
+  // topic at spawn (src/container-runner.ts:4481), so that topic's container
+  // sees the repository's transfers directory and its own tombstone, and no
+  // canonical at all.
+  function transferAway(repo: string, destinationWorkUnitKey: string): void {
+    const workUnitKey = process.env.NANOCLAW_WORK_UNIT_KEY!;
+    const workUnitId = createHash('sha256').update(`wg-a\0${workUnitKey}`).digest('hex').slice(0, 32);
+    const transfers = join(dataDir, 'repository-state', 'wg-a', repo, 'transfers');
+    mkdirSync(transfers, { recursive: true });
+    writeFileSync(
+      join(transfers, `${workUnitId}.json`),
+      JSON.stringify({
+        version: 1,
+        phase: 'moved',
+        workgroupId: 'wg-a',
+        repo,
+        sourceWorkUnitKey: workUnitKey,
+        destinationWorkUnitKey,
+      }),
+    );
+  }
+
+  test('create_worktree in a transferred-away topic names the transfer, not missing metadata (#705)', async () => {
+    transferAway('moved', 'thread:slack:C1:9.9');
+    const response = await createWorktreeTool.handler({ repo: 'moved' });
+    expect(response.isError).toBe(true);
+    expect(response.content[0].text).toContain('transferred to thread:slack:C1:9.9');
+    expect(response.content[0].text).toContain('do not run clone_repo');
+    expect(response.content[0].text).not.toContain('metadata is unavailable');
+  });
+
+  test('clone_repo answers for a canonical this container can see instead of publishing it again (#705)', async () => {
+    const published = seedNamedCanonical('pub');
+    git(published, ['remote', 'set-url', 'origin', 'https://github.com/example/pub']);
+    const state = join(dataDir, 'repository-state', 'wg-a', 'pub');
+    writeFileSync(
+      join(state, 'origin.json'),
+      JSON.stringify({ origin: 'https://github.com/example/pub', repositoryId: 'github.com/example/pub' }),
+    );
+    mkdirSync(join(state, 'transfers'), { recursive: true });
+    transferAway('moved', 'thread:slack:C1:9.9');
+
+    const stagingRoot = '/workspace/repository-staging';
+    const before = existsSync(stagingRoot) ? readdirSync(stagingRoot).sort() : [];
+    const { outbound } = initTestSessionDb();
+    delete process.env.NANOCLAW_REPOSITORY_ACTION_TRANSPORT;
+    try {
+      const same = await cloneRepoTool.handler({ url: 'https://github.com/Example/pub.git' });
+      expect(same.isError).toBeFalsy();
+      expect(same.content[0].text).toContain('already has pub');
+
+      const otherOrigin = await cloneRepoTool.handler({ url: 'https://github.com/someone-else/pub' });
+      expect(otherOrigin.isError).toBe(true);
+      expect(otherOrigin.content[0].text).toContain('different origin');
+
+      const transferred = await cloneRepoTool.handler({ url: 'https://github.com/example/moved' });
+      expect(transferred.isError).toBe(true);
+      expect(transferred.content[0].text).toContain('transferred to thread:slack:C1:9.9');
+
+      expect(outbound.query('SELECT content FROM messages_out').all()).toEqual([]);
+      expect(existsSync(stagingRoot) ? readdirSync(stagingRoot).sort() : []).toEqual(before);
+    } finally {
+      closeSessionDb();
+    }
+  });
+
   // ── Branch clones (docs/specs/repository-branch-clones/plan.md §5.2-§5.3) ──
   //
   // repository_checkout is a host action (owned by the lead / host builder,
@@ -816,7 +882,10 @@ describe('topic-linked worktree topology', () => {
     function installManagedScanHook(canonicalPath: string): string {
       const hooksDir = join(dataDir, 'managed-git-hooks', 'scan');
       mkdirSync(hooksDir, { recursive: true });
-      writeFileSync(join(hooksDir, 'nanoclaw-secret-patterns.sh'), readFileSync(join(REPO_ROOT, 'scripts', 'lib', 'secret-scan.sh')));
+      writeFileSync(
+        join(hooksDir, 'nanoclaw-secret-patterns.sh'),
+        readFileSync(join(REPO_ROOT, 'scripts', 'lib', 'secret-scan.sh')),
+      );
       writeFileSync(join(hooksDir, 'pre-push'), readFileSync(join(REPO_ROOT, 'scripts', 'wiki-pre-push-hook.sh')));
       chmodSync(join(hooksDir, 'pre-push'), 0o755);
       git(canonicalPath, ['config', 'core.hooksPath', hooksDir]);
