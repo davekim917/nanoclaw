@@ -1824,7 +1824,10 @@ assignment, an alias `X = NAME`, `from x import NAME`, `import x as NAME`, a
 star import, `def`/`class NAME`, `except … as NAME`, a `match` capture), the
 constant handed to a call that could mutate it in place (`_widen(NAME)`,
 `list.append(NAME, …)` — anything but `len`/`sorted`/`tuple`/`list`/`set`/
-`any`/`all`/`"…".join`), a top-level statement that reaches the namespace by
+`any`/`all`/`"…".join`, and not even those when the policy file binds that
+name itself at module level, since `def len(globs)`, `class len`,
+`from x import len` or `len = _widen` make the call something other than the
+builtin), a top-level statement that reaches the namespace by
 string (`globals`, `vars`, `setattr`, `exec`, `eval`, `__import__`,
 `sys.modules`) or that calls a function whose body does, a computed rather
 than literal value, or a mistyped value) fails closed to `full`. A plain READ

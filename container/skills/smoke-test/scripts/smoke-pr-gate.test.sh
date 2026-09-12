@@ -2427,6 +2427,190 @@ echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$HELPERS_RULES" | jq -e '
   .campaignSize == "light"
 ' >/dev/null
 
+# --- A pure-callee name the POLICY FILE ITSELF binds is not the builtin it
+# spells (#736 round-3). The call-argument rule above matched its callee by
+# NAME, so a module-level `def len(globs): globs.append(...)` scored its own
+# `len(NAME)` a pure read: the classifier trusted the literal while the real
+# import widened it -- #723's class, through the round-2 guard's own door.
+#
+# The rule is "this name is bound at module level", not a list of the forms
+# that bind it, so there is one case per binder. Each fixture's literal holds
+# ONLY the permissions glob, so a missed shadowing classifies a billing PR
+# `light` instead of `full`. The two read-only controls directly above
+# (policy-callread, policy-helpers) are the other half of this check: they
+# must stay unmoved, or the rule has regressed into refusing every call --
+# round 1 again.
+assert_policy_refused shadow-def 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+
+
+def len(globs):
+    globs.append("backend/billing/**")
+    return 0
+
+
+len(SENSITIVE_GLOBS)
+' 'could mutate'
+
+assert_policy_refused shadow-class 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+
+
+class sorted:
+    pass
+
+
+sorted(SENSITIVE_GLOBS)
+' 'could mutate'
+
+assert_policy_refused shadow-from-import 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+from policy_extra import tuple
+
+tuple(SENSITIVE_GLOBS)
+' 'could mutate'
+
+assert_policy_refused shadow-import-as 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+import policy_extra as list
+
+list(SENSITIVE_GLOBS)
+' 'could mutate'
+
+assert_policy_refused shadow-assign 'def _widen(globs):
+    globs.append("backend/billing/**")
+    return globs
+
+
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+set = _widen
+set(SENSITIVE_GLOBS)
+' 'could mutate'
+
+assert_policy_refused shadow-annassign 'def _widen(globs):
+    globs.append("backend/billing/**")
+    return globs
+
+
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+any: object = _widen
+any(SENSITIVE_GLOBS)
+' 'could mutate'
+
+assert_policy_refused shadow-for 'def _widen(globs):
+    globs.append("backend/billing/**")
+    return globs
+
+
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+for all in (_widen,):
+    pass
+
+all(SENSITIVE_GLOBS)
+' 'could mutate'
+
+assert_policy_refused shadow-with 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+with open("policy_extra.py") as len:
+    pass
+
+len(SENSITIVE_GLOBS)
+' 'could mutate'
+
+assert_policy_refused shadow-except-as 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+try:
+    pass
+except ValueError as sorted:
+    pass
+
+sorted(SENSITIVE_GLOBS)
+' 'could mutate'
+
+assert_policy_refused shadow-walrus 'def _widen(globs):
+    globs.append("backend/billing/**")
+    return globs
+
+
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+(tuple := _widen)
+tuple(SENSITIVE_GLOBS)
+' 'could mutate'
+
+assert_policy_refused shadow-del 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+del len
+len(SENSITIVE_GLOBS)
+' 'could mutate'
+
+assert_policy_refused shadow-global 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+global len
+len(SENSITIVE_GLOBS)
+' 'could mutate'
+
+# A walrus in a DEFAULT ARGUMENT is evaluated at import and binds a module
+# name, even though the function body around it is not top-level code.
+assert_policy_refused shadow-default-walrus 'def _widen(globs):
+    globs.append("backend/billing/**")
+    return globs
+
+
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+
+
+def _factory(widen=(len := _widen)):
+    return widen
+
+
+len(SENSITIVE_GLOBS)
+' 'could mutate'
+
+# A `match` capture binds through a string field. The reason alternative
+# covers a pre-3.10 interpreter, where the statement does not parse at all --
+# still fail-closed, different reason.
+assert_policy_refused shadow-match 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+match SENSITIVE_GLOBS:
+    case len:
+        pass
+
+len(SENSITIVE_GLOBS)
+' 'could mutate|could not be parsed'
+
+# A star import binds names that cannot be enumerated, so no callee is
+# provably the builtin. The star import itself already refuses the whole file
+# (the `may rebind` reason above), which is why this asserts that reason and
+# not the call-argument one: belt and braces, the same answer twice.
+assert_policy_refused shadow-star-import 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+from policy_extra import *
+
+len(SENSITIVE_GLOBS)
+' 'may rebind'
+
+# Control for the shadowing rule specifically: binding names that are NOT on
+# the pure allowlist must not poison the genuine builtins beside them. This
+# file defines two helpers, calls one, and still reads the constant with the
+# real `len` and `"|".join` -- it must classify exactly as the minimal policy.
+NEARMISS_MOD="$STATE_DIR/policy-nearmiss.py"
+cat > "$NEARMISS_MOD" <<'PY'
+def _describe(count):
+    return "{} sensitive globs".format(count)
+
+
+def _lengths(globs):
+    return [len(g) for g in globs]
+
+
+SENSITIVE_GLOBS = ["backend/permissions/**", "backend/billing/**"]
+GLOB_COUNT = len(SENSITIVE_GLOBS)
+SUMMARY = _describe(GLOB_COUNT)
+GLOB_RE = "|".join(SENSITIVE_GLOBS)
+PY
+NEARMISS_RULES="$STATE_DIR/fgf-nearmiss.json"
+cat > "$NEARMISS_RULES" <<JSON
+{"full":[],"lightAllowed":["frontend/**"],
+ "fullGlobsFrom":{"path":"$NEARMISS_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$NEARMISS_RULES" | jq -e '
+  .campaignSize == "full" and
+  .sizeReason == "full: backend/billing/charge.ts matched backend/billing/**"
+' >/dev/null
+echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$NEARMISS_RULES" | jq -e '
+  .campaignSize == "light"
+' >/dev/null
+
 # --- A DANGLING SYMLINK is present, not absent (#736 round-1 P2-2). open()
 # raises FileNotFoundError for it exactly as it does for a path that was
 # never created, so it used to collapse into "no sizing rules" -- #721's

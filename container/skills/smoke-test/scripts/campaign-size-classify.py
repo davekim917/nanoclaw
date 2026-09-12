@@ -190,12 +190,92 @@ def _roots_at_name(node, name):
 _PURE_CALLEES = frozenset(("len", "sorted", "tuple", "list", "set", "any", "all"))
 
 
-def _call_is_pure(func):
+def _module_bound_names(tree):
+    """Every name that module-level code BINDS, whatever the binder.
+
+    `def`, `class`, `import`/`from ... import` (with or without `as`), a
+    plain or annotated assignment, `+=`, `for ... in`, `with ... as`,
+    `except ... as`, `del`, a walrus, `global`, and `match` captures all bind
+    a module name, and every one of them can bind a name this file would
+    otherwise take for a builtin (round-3 review of #736). The rule is
+    "bound at module level", not a list of the forms -- a list of forms is a
+    list to be wrong about.
+
+    A binding inside a top-level `if`, `try`, `with` or `for` counts: that
+    code runs at import too. A function, lambda or class BODY does not --
+    its names are local -- so the walk records the definition's own name and
+    walks only the parts evaluated at import: decorators, base classes,
+    default arguments and annotations, any of which can carry a walrus.
+
+    Deliberately over-inclusive where it is cheap: a comprehension target is
+    function-scoped in Python 3 and does not really bind here, but an extra
+    name only ever costs a `full`, and the exceptions are another list to be
+    wrong about. A star import binds names that cannot be enumerated at all,
+    so it is recorded as `"*"` -- not a legal identifier, so only a check
+    that asks about it deliberately can read it.
+    """
+    names = set()
+    stack = list(tree.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            if not isinstance(node, ast.Lambda):
+                names.add(node.name)
+            for field, value in ast.iter_fields(node):
+                if field == "body":
+                    continue
+                for child in value if isinstance(value, list) else [value]:
+                    if isinstance(child, ast.AST):
+                        stack.append(child)
+            continue
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            names.add(node.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for imported in node.names:
+                if imported.name == "*":
+                    names.add("*")
+                else:
+                    names.add(imported.asname or imported.name.split(".")[0])
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            names.add(node.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            names.update(node.names)
+        elif _MATCH_NAME_NODES and isinstance(node, _MATCH_NAME_NODES) and node.name:
+            names.add(node.name)
+        elif _MATCH_REST_NODES and isinstance(node, _MATCH_REST_NODES) and node.rest:
+            names.add(node.rest)
+        stack.extend(ast.iter_child_nodes(node))
+    return names
+
+
+def _call_is_pure(func, bound):
     """True for a callee that cannot mutate its arguments: one of the
     `_PURE_CALLEES` builtins, or `str.join` on a literal separator -- the
-    `"|".join(NAME)` a real policy file actually writes."""
-    if isinstance(func, ast.Name) and func.id in _PURE_CALLEES:
-        return True
+    `"|".join(NAME)` a real policy file actually writes.
+
+    `bound` is every name module-level code binds (`_module_bound_names`).
+    `_PURE_CALLEES` is a list of BUILTIN names, and a policy file is free to
+    bind any of those names itself -- `def len(globs): globs.append(...)`,
+    `class len`, `from x import len`, `len = _widen`, `for len in ...`. Read
+    by spelling alone, such a call scores a pure read and the classifier
+    trusts a literal the real import widens: #723's class through this
+    guard's own door (round-3 review of #736). A name the file binds is not
+    the builtin it spells, so it is not pure -- whatever the binding form,
+    and wherever in the file it sits: which of the two a given call reaches
+    depends on execution order, and refusing is the fail-closed answer.
+
+    `"...".join` needs no such check -- the receiver is a string CONSTANT, so
+    the method resolves on `str` itself and no module-level name is
+    consulted."""
+    if isinstance(func, ast.Name):
+        # A star import binds names that cannot be enumerated, so no name is
+        # provably the builtin. Any top-level star import already refuses the
+        # whole file at `_rebinding_use`'s ImportFrom branch below, so this is
+        # the same answer reached twice, kept so the rule reads as "provably
+        # the builtin" rather than "absent from one list".
+        if "*" in bound:
+            return False
+        return func.id in _PURE_CALLEES and func.id not in bound
     return (
         isinstance(func, ast.Attribute)
         and func.attr == "join"
@@ -269,9 +349,11 @@ def _called_function_escape(node, defs):
     return None
 
 
-def _rebinding_use(node, name):
+def _rebinding_use(node, name, bound):
     """How top-level statement `node` binds or mutates `name`, as a phrase,
-    or None if it does neither.
+    or None if it does neither. `bound` is every name module-level code binds
+    (`_module_bound_names`), which is what tells a genuine pure builtin from
+    this file's own binding of the same spelling.
 
     Only BINDING and MUTATING uses count. A plain read leaves the assigned
     literal exactly as written and must pass: `ALL = NAME + OTHER`,
@@ -318,8 +400,10 @@ def _rebinding_use(node, name):
         # site -- nothing else in this function would see them -- and both
         # leave the literal above a partial policy once the module is
         # imported for real. Only a callee that provably cannot mutate its
-        # argument is allowed through (round-2 review of #736).
-        if isinstance(sub, ast.Call) and not _call_is_pure(sub.func) and _passes_name(sub, name):
+        # argument is allowed through (round-2 review of #736), and a name
+        # this file binds at module level is not the builtin it spells
+        # (round-3 review of #736).
+        if isinstance(sub, ast.Call) and not _call_is_pure(sub.func, bound) and _passes_name(sub, name):
             return "hands it to a call that could mutate"
         if isinstance(sub, (ast.Global, ast.Nonlocal)) and name in sub.names:
             return "declares a global/nonlocal binding for"
@@ -379,6 +463,7 @@ def _find_top_level_assignment(tree, name):
     inside a function is not a fixed policy constant this format can trust."""
     found = None
     defs = _module_function_defs(tree)
+    bound = _module_bound_names(tree)
     for node in tree.body:
         escape = _namespace_escape(node)
         if escape is not None:
@@ -414,7 +499,7 @@ def _find_top_level_assignment(tree, name):
                 return None, "reassigned at top level (a second assignment makes the value untrustworthy)"
             found = node.value
             continue
-        phrase = _rebinding_use(node, name)
+        phrase = _rebinding_use(node, name, bound)
         if phrase is not None:
             return None, "another top-level {} statement {} it".format(
                 type(node).__name__, phrase
