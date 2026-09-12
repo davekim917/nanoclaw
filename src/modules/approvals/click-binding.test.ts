@@ -11,10 +11,22 @@
  * claimed the row by its id alone. The last block pins the render lookup's
  * preference for the approval's own options when both rows hold the id.
  *
+ * Three properties are pinned here:
+ *   - the binding itself: every kind of approval refuses a click made on any
+ *     other message;
+ *   - disclosure: the bridge edits no approval card at all, so a refused or an
+ *     unauthorized click never writes the approval's own title and question
+ *     into the message that was clicked — a counterfeit card in a channel the
+ *     approval was never delivered to included. The host edits the card the
+ *     ROW names, once the click is bound and authorized
+ *     (primitive.ts editApprovalCardResolution);
+ *   - the render lookup's preference for the approval's own options when both
+ *     rows hold the id.
+ *
  * Real central DB, the bridge's real click paths (the Chat SDK dispatch and the
- * Discord gateway interaction), and the real response handlers in production
- * order. `onActionFor` builds the payload as main.ts's onAction does and
- * dispatches as its dispatchResponse does (src/main.ts:212-222).
+ * Discord gateway interaction), the host's real payload construction
+ * (`makeOnAction`, src/channels/action-response.ts) and the real response
+ * handlers in production order.
  */
 import * as fs from 'fs';
 
@@ -52,6 +64,7 @@ vi.mock('../../container-runner.js', async (importOriginal) => ({
 
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: uniqueTmpRoot('test-click-binding') }));
 
+import { makeOnAction } from '../../channels/action-response.js';
 import type { ChannelSetup } from '../../channels/adapter.js';
 import { normalizeOptions } from '../../channels/ask-question.js';
 import { createChatSdkBridge, handleForwardedEvent } from '../../channels/chat-sdk-bridge.js';
@@ -101,26 +114,26 @@ registerChoiceHandler(CHOICE, async (ctx) => {
   return ctx.requester ?? null;
 });
 
-/** Host-side card deliveries: a choice card's edit goes out through here. */
+/** Host-side card deliveries: every approval card's resolution edit goes out through here. */
 let deliveries: Array<Record<string, unknown>>;
-/** Message ids the bridge edited on click. */
-let bridgeEdits: string[];
+/** What the bridge edited on click: the clicked message's id, and the body written into it. */
+let bridgeEdits: Array<{ messageId: string; body: string }>;
+/** Discord interaction callbacks the bridge sent (type 6 acknowledges; type 7 rewrites the message). */
+let discordCallbacks: Array<Record<string, unknown>>;
 let bridgeAdapter: Adapter;
 /** Dispatches started by onAction, which main.ts fires without awaiting. */
 const dispatches: Array<Promise<void>> = [];
 
-/** main.ts's onAction and dispatchResponse, for one channel type. */
+/**
+ * The host's own onAction (src/main.ts:981). The payload is built by the
+ * production code, not by this test: `makeOnAction` is the one place a click
+ * becomes a ResponsePayload, so dropping the message id there turns the
+ * refusal tests below red instead of leaving them green against a payload the
+ * test supplied itself. `dispatch` is main.ts's dispatchResponse, minus its
+ * logging.
+ */
 function onActionFor(channelType: string): ChannelSetup['onAction'] {
-  return (questionId, selectedOption, userId, messageId) => {
-    const payload: ResponsePayload = {
-      questionId,
-      value: selectedOption,
-      userId,
-      channelType,
-      platformId: '',
-      threadId: null,
-      messageId,
-    };
+  return makeOnAction(channelType, async (payload: ResponsePayload) => {
     dispatches.push(
       (async () => {
         for (const handler of getResponseHandlers()) {
@@ -128,7 +141,7 @@ function onActionFor(channelType: string): ChannelSetup['onAction'] {
         }
       })(),
     );
-  };
+  });
 }
 
 function setupFor(channelType: string): ChannelSetup {
@@ -161,7 +174,10 @@ async function click(questionId: string, index: number, clicker: string, message
 async function discordClick(questionId: string, index: number, clicker: string, messageId: string): Promise<void> {
   vi.stubGlobal(
     'fetch',
-    vi.fn(async () => new Response(null, { status: 204 })),
+    vi.fn(async (_url: unknown, init?: RequestInit) => {
+      discordCallbacks.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>);
+      return new Response(null, { status: 204 });
+    }),
   );
   await handleForwardedEvent(
     JSON.stringify({
@@ -293,6 +309,7 @@ beforeEach(async () => {
   dispatches.length = 0;
   deliveries = [];
   bridgeEdits = [];
+  discordCallbacks = [];
   setDeliveryAdapter({
     async deliver(_channelType, _platformId, _threadId, _kind, content) {
       deliveries.push(JSON.parse(content) as Record<string, unknown>);
@@ -331,8 +348,8 @@ beforeEach(async () => {
     name: 'stub',
     initialize: async () => {},
     channelIdFromThreadId: (threadId: string) => `stub:${threadId}`,
-    editMessage: async (_threadId: string, messageId: string) => {
-      bridgeEdits.push(messageId);
+    editMessage: async (_threadId: string, messageId: string, content: unknown) => {
+      bridgeEdits.push({ messageId, body: JSON.stringify(content) });
     },
   } as unknown as Adapter;
   await createChatSdkBridge({ adapter: bridgeAdapter, supportsThreads: false }).setup(setupFor('slack'));
@@ -356,7 +373,7 @@ describe('a click made on any other card resolves nothing', () => {
     expect(answered).toEqual([]);
     expect((await getPendingApproval('appr-choice'))?.status).toBe('pending');
     expect(deliveries).toEqual([]);
-    expect(bridgeEdits).not.toContain('real-choice-card');
+    expect(bridgeEdits.map((e) => e.messageId)).not.toContain('real-choice-card');
     // Claimed by the approvals handler, so the agent's own row is not consumed as an answer either.
     expect(await getPendingQuestion('appr-choice')).toBeDefined();
     expect(warn).toHaveBeenCalledWith(
@@ -568,5 +585,95 @@ describe('an agent row reusing an approval id cannot decode a click on the real 
     expect(approved).toEqual([]);
     expect((await getPendingApproval('appr-corrupt'))?.status).toBe('pending');
     expect(await getPendingQuestion('appr-corrupt')).toBeDefined();
+  });
+});
+
+describe('a press that is refused discloses nothing of the approval it named', () => {
+  const PRIVATE_QUESTION = '*To:* board@example.com\n*Subject:* Q3 numbers';
+
+  /** An approval whose card body is material only its own recipient may read. */
+  async function seedPrivateGate(approvalId: string, platformMessageId: string): Promise<void> {
+    await createPendingApproval({
+      approval_id: approvalId,
+      request_id: approvalId,
+      action: GATE,
+      payload: '{}',
+      created_at: now(),
+      title: 'Credentials Request',
+      question: PRIVATE_QUESTION,
+      options_json: GATE_OPTIONS,
+      session_id: 'sess-dm',
+      agent_group_id: AG,
+      channel_type: 'slack',
+      platform_id: 'slack:DOWNER',
+      thread_id: null,
+      platform_message_id: platformMessageId,
+    });
+  }
+
+  it("a counterfeit card is never rewritten with the approval's title and question", async () => {
+    await seedPrivateGate('appr-private', 'real-dm-card');
+
+    await click('appr-private', 0, 'UNOBODY', 'counterfeit-card');
+
+    expect(approved).toEqual([]);
+    expect((await getPendingApproval('appr-private'))?.status).toBe('pending');
+    // Nothing was written into the clicked message, and nothing carrying the
+    // approval's text went anywhere else either.
+    expect(bridgeEdits).toEqual([]);
+    expect(JSON.stringify(deliveries)).not.toContain('board@example.com');
+  });
+
+  it('Discord: the interaction is acknowledged, never rewritten', async () => {
+    await seedGate('appr-d-private', {
+      sessionId: 'sess-dm',
+      channelType: 'discord',
+      platformId: 'discord:@me:dm-owner',
+      platformMessageId: 'discord-card',
+    });
+
+    await discordClick('appr-d-private', 0, 'dnobody', 'counterfeit-card');
+
+    // type 6 acknowledges; a type 7 would carry the card's content back.
+    expect(discordCallbacks).toEqual([{ type: 6 }]);
+    expect((await getPendingApproval('appr-d-private'))?.status).toBe('pending');
+  });
+
+  it('an unauthorized press on the real card leaves that card live and unedited', async () => {
+    await seedPrivateGate('appr-authz', 'real-dm-card');
+
+    // sess-dm has no messaging group, so the any-thread-member rule cannot apply.
+    await click('appr-authz', 0, 'UNOBODY', 'real-dm-card');
+
+    expect(approved).toEqual([]);
+    expect((await getPendingApproval('appr-authz'))?.status).toBe('pending');
+    expect(bridgeEdits).toEqual([]);
+    expect(deliveries).toEqual([]);
+  });
+});
+
+describe('an accepted press edits the card the approval row names', () => {
+  it('approve: the stored card, carrying the option label and the actor', async () => {
+    await seedGate('appr-dm', { sessionId: 'sess-dm', platformId: 'slack:DOWNER', platformMessageId: 'real-dm-card' });
+
+    await click('appr-dm', 0, 'UOWNER', 'real-dm-card');
+
+    expect(approved).toEqual([{ approvalId: 'appr-dm', userId: OWNER }]);
+    expect(bridgeEdits).toEqual([]);
+    expect(deliveries).toEqual([
+      expect.objectContaining({ operation: 'edit', messageId: 'real-dm-card', text: 'Run this?\n\nApprove — Owner' }),
+    ]);
+  });
+
+  it('reject: the same card, carrying the reject label', async () => {
+    initSessionFolder(AG, 'sess-dm');
+    await seedGate('appr-dm', { sessionId: 'sess-dm', platformId: 'slack:DOWNER', platformMessageId: 'real-dm-card' });
+
+    await click('appr-dm', 1, 'UOWNER', 'real-dm-card');
+
+    expect(await getPendingApproval('appr-dm')).toBeUndefined();
+    expect(deliveries).toEqual([
+      expect.objectContaining({ operation: 'edit', messageId: 'real-dm-card', text: 'Run this?\n\nReject — Owner' }),
+    ]);
   });
 });

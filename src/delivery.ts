@@ -985,22 +985,42 @@ async function deliverMessage(
   // buttons would carry that id, and a click on them would decode through the
   // approval's own options (src/db/sessions.ts:819-824), leaving only the card
   // binding in response-handler.ts between it and the approval.
+  //
+  // Compare the id a CLICK will decode, not the one that was written. Both
+  // click parsers cut the question id out of `ncq:<questionId>:<index>` at the
+  // first ':' after the prefix (chat-sdk-bridge.ts:1146-1147, :2032-2036), so
+  // `appr-real:x` is stored whole, walks straight past an exact-match check,
+  // and then reaches the handlers as `appr-real`. A suffixed id is unusable
+  // for the agent's own card either way — pending_questions is keyed by the
+  // whole id, so the click decodes to an id that row does not have — which is
+  // why an ambiguous id is refused outright rather than only when it collides.
+  //
   // ask_user_question mints its own id
   // (container/agent-runner/src/mcp-tools/interactive.ts:89), so only a raw
-  // outbound row can collide. Refused whole: no card, no pending question.
+  // outbound row can carry either shape. Refused whole: no card, no pending
+  // question.
   if (
     content &&
     typeof content === 'object' &&
     content.type === 'ask_question' &&
-    typeof content.questionId === 'string' &&
-    (await getPendingApproval(content.questionId))
+    typeof content.questionId === 'string'
   ) {
-    log.warn('Refusing an ask_question that reuses a pending approval id', {
-      id: msg.id,
-      sessionId: session.id,
-      questionId: content.questionId,
-    });
-    return {};
+    const decodedQuestionId = content.questionId.split(':')[0];
+    const ambiguous = decodedQuestionId !== content.questionId;
+    if (ambiguous || (await getPendingApproval(decodedQuestionId))) {
+      log.warn(
+        ambiguous
+          ? 'Refusing an ask_question whose id a click would decode to a different id'
+          : 'Refusing an ask_question that reuses a pending approval id',
+        {
+          id: msg.id,
+          sessionId: session.id,
+          questionId: content.questionId,
+          decodedQuestionId,
+        },
+      );
+      return {};
+    }
   }
 
   // Spawn-child workers sometimes ask via chat-sdk's `ask_question` instead

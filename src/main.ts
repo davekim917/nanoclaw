@@ -78,6 +78,7 @@ import {
   startChannelRecoveryMonitor,
   stopChannelRecoveryMonitor,
 } from './channels/channel-recovery.js';
+import { makeOnAction } from './channels/action-response.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
 import { startDashboard } from './dashboard/index.js';
@@ -978,23 +979,9 @@ export async function main(): Promise<void> {
           updates,
         });
       },
-      onAction(questionId, selectedOption, userId, messageId) {
-        dispatchResponse({
-          questionId,
-          value: selectedOption,
-          userId,
-          channelType: adapter.channelType,
-          // platformId/threadId aren't surfaced by the current onAction
-          // signature — registered handlers look them up from the
-          // pending_question / pending_approval row.
-          platformId: '',
-          threadId: null,
-          // The clicked message, which approvals bind the click to.
-          messageId,
-        }).catch((err) => {
-          log.error('Failed to handle question response', { questionId, err });
-        });
-      },
+      // Payload construction lives in channels/action-response.ts so a test can
+      // drive the real thing rather than rebuild it.
+      onAction: makeOnAction(adapter.channelType, dispatchResponse),
     };
   });
   // Wire the access gate's sibling-bot allow-list now that channel adapters are

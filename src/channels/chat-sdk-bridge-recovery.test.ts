@@ -506,15 +506,11 @@ describe('Chat SDK bridge Discord approval actions', () => {
     expect(onAction).toHaveBeenCalledWith('appr-discord', 'approve', 'U1', 'discord-card-1');
     const callbackInit = fetchMock.mock.calls[0]?.[1];
     expect(callbackInit).toBeDefined();
-    expect(JSON.parse(callbackInit!.body as string)).toMatchObject({
-      type: 7,
-      data: {
-        content: '**⚠️ Test approval**\n\nDetails\n\n✅ Approved',
-        embeds: [],
-        components: [],
-        allowed_mentions: { parse: [] },
-      },
-    });
+    // type 6 (DEFERRED_UPDATE_MESSAGE), not 7: the bridge has not checked whose
+    // card was clicked, so nothing of the approval goes back to the platform.
+    // The host edits the card the row names once the click is accepted
+    // (modules/approvals/primitive.ts editApprovalCardResolution).
+    expect(JSON.parse(callbackInit!.body as string)).toEqual({ type: 6 });
   });
 
   it("decodes Discord's newline-delimited custom_id before resolving the option", async () => {
@@ -536,7 +532,7 @@ describe('Chat SDK bridge Discord approval actions', () => {
     expect(onAction).toHaveBeenCalledWith('appr-discord-wire', 'approve', 'U1', 'discord-card-1');
     const callbackInit = fetchMock.mock.calls[0]?.[1];
     expect(callbackInit).toBeDefined();
-    expect(JSON.parse(callbackInit!.body as string)).toMatchObject({ type: 7 });
+    expect(JSON.parse(callbackInit!.body as string)).toEqual({ type: 6 });
   });
 
   it('keeps a Discord approval pending when its indexed option cannot be resolved', async () => {

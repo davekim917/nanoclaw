@@ -2118,6 +2118,47 @@ describe('deliverSessionMessages — ask_question ids', () => {
     expect(delivered.has('out-ask')).toBe(true);
   });
 
+  it('refuses one whose id a click would decode onto a pending approval, delimiter and all', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    await createPendingApproval({
+      approval_id: 'appr-suffix',
+      request_id: 'appr-suffix',
+      action: 'install_packages',
+      payload: '{}',
+      created_at: now(),
+      title: 'Install packages?',
+      options_json: '[]',
+      session_id: session.id,
+      agent_group_id: 'ag-1',
+      platform_message_id: 'real-card',
+    });
+    // Written whole, so an exact-match check misses it; both click parsers cut
+    // at the first ':' and hand the handlers `appr-suffix`.
+    insertOutboundKind('ag-1', session.id, 'out-ask', 'chat-sdk', 'telegram', 'telegram:123', ask('appr-suffix:1'));
+    const calls = recordDeliveries();
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([]);
+    expect(await getPendingQuestion('appr-suffix:1')).toBeUndefined();
+    expect((await getPendingApproval('appr-suffix'))?.status).toBe('pending');
+  });
+
+  it('refuses one whose id carries a delimiter even when it collides with nothing', async () => {
+    await seedAgentAndChannel();
+    const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutboundKind('ag-1', session.id, 'out-ask', 'chat-sdk', 'telegram', 'telegram:123', ask('q-agent:2'));
+    const calls = recordDeliveries();
+
+    await deliverSessionMessages(session);
+
+    // The card would be undecodable anyway: a click resolves `q-agent`, and
+    // pending_questions is keyed by the whole id.
+    expect(calls).toEqual([]);
+    expect(await getPendingQuestion('q-agent:2')).toBeUndefined();
+  });
+
   it('delivers one whose id names no pending approval, and records its pending question', async () => {
     await seedAgentAndChannel();
     const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');

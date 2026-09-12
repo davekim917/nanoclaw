@@ -26,7 +26,6 @@ import { log } from '../log.js';
 import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
 import { getAskQuestionRender } from '../db/sessions.js';
-import { isAnswerCardAction } from '../answer-cards.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import type {
   ChannelAdapter,
@@ -1165,15 +1164,28 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           });
           return;
         }
-        // Answer cards (answer-cards.ts) are edited by the host, once the click
-        // is authorized and its answer delivered. Editing here first would show
-        // an answer a refused or losing click never gave. No edit is needed to
-        // acknowledge the click: the adapter acks the platform event itself
-        // (Slack answers block_actions 200 before dispatch, @chat-adapter/slack
-        // dist/index.js:1408-1411). Classified from the render read above, not a
-        // second one: a row the winning click deletes in between would otherwise
-        // read as "not an answer card" and fall through to the edit below.
-        if (render?.action !== undefined && isAnswerCardAction(render.action)) {
+        // A card the host posted for a pending_approvals row is never edited
+        // here. All the bridge knows is the id the button carried: it has not
+        // checked that the clicked message is that approval's own card, nor
+        // that the clicker may decide it. Editing first would write the
+        // approval's title and question into whatever message was clicked — a
+        // counterfeit card carrying the same id, in a channel the approval was
+        // never delivered to, included — and label it resolved, moments before
+        // the handler refuses the click (modules/approvals/response-handler.ts).
+        // So dispatch, and let the host edit the card the row itself names once
+        // the click is bound and authorized (editApprovalCardResolution,
+        // modules/approvals/primitive.ts). A refused, unauthorized or losing
+        // click then leaves every card exactly as it was.
+        //
+        // No edit is needed to acknowledge the click: the adapter acks the
+        // platform event itself (Slack answers block_actions 200 before
+        // dispatch, @chat-adapter/slack dist/index.js:1408-1411).
+        //
+        // `action` is set only on a pending_approvals render
+        // (db/sessions.ts:819-824), and it comes from the render read above,
+        // not a second one: a row the winning click deletes in between would
+        // otherwise read as "not an approval" and fall through to the edit.
+        if (render?.action !== undefined) {
           setupConfig.onAction(questionId, selectedOption, userId, messageId);
           return;
         }
@@ -2076,12 +2088,13 @@ export async function handleForwardedEvent(
           }
           return;
         }
-        if (render?.action !== undefined && isAnswerCardAction(render.action)) {
-          // Answer card, classified from the render read above (see the Chat SDK
-          // path): acknowledge without touching the message (type 6,
-          // DEFERRED_UPDATE_MESSAGE — InteractionResponseType.DeferredMessageUpdate,
-          // discord-api-types payloads/v10/_interactions/responses.d.ts:66-69).
-          // The host edits the card once the answer is delivered.
+        if (render?.action !== undefined) {
+          // An approval card, classified from the render read above (see the
+          // Chat SDK path for why none is edited here): acknowledge without
+          // touching the message (type 6, DEFERRED_UPDATE_MESSAGE —
+          // InteractionResponseType.DeferredMessageUpdate, discord-api-types
+          // payloads/v10/_interactions/responses.d.ts:66-69). The host edits
+          // the card the row names, once the click is bound and authorized.
           try {
             await fetch(`https://discord.com/api/v10/interactions/${interactionId}/${interactionToken}/callback`, {
               method: 'POST',

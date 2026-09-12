@@ -15,7 +15,7 @@ import { deletePendingApproval } from '../../db/sessions.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
-import { notifyApprovalResolved } from './primitive.js';
+import { editApprovalCardResolution, notifyApprovalResolved } from './primitive.js';
 
 /**
  * Notify the requesting agent that its action was rejected, drop the pending
@@ -53,6 +53,9 @@ export async function finalizeReject(
     withReason: reason !== undefined,
   });
 
+  // The bridge edits no approval card on click, so the card still shows live
+  // buttons until this lands (primitive.ts editApprovalCardResolution).
+  await editApprovalCardResolution(approval, 'reject', userId);
   await deletePendingApproval(approval.approval_id);
   await notifyApprovalResolved({ approval, session, outcome: 'reject', userId });
   await requestWake(session, 'approval-response');

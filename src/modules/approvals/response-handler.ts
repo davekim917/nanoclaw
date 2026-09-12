@@ -30,7 +30,12 @@ import { hasAdminPrivilege, isGlobalAdmin, isOwner } from '../permissions/db/use
 import { choiceClickAllowed, getChoiceHandler, resolveChoice } from './choices.js';
 import { finalizeReject } from './finalize.js';
 import { ONECLI_ACTION, resolveOneCLIApproval } from './onecli-approvals.js';
-import { getApprovalHandler, notifyApprovalResolved, REJECT_WITH_REASON_VALUE } from './primitive.js';
+import {
+  editApprovalCardResolution,
+  getApprovalHandler,
+  notifyApprovalResolved,
+  REJECT_WITH_REASON_VALUE,
+} from './primitive.js';
 import { armReasonCapture } from './reason-capture.js';
 
 /**
@@ -214,6 +219,7 @@ async function handleRegisteredApproval(
       action: approval.action,
     });
     await notify(`Your ${approval.action} was approved, but no handler is installed to apply it.`);
+    await editApprovalCardResolution(approval, selectedOption, userId);
     await deletePendingApproval(approval.approval_id);
     await notifyApprovalResolved({ approval, session, outcome: 'approve', userId });
     await requestWake(session, 'approval-response');
@@ -231,6 +237,9 @@ async function handleRegisteredApproval(
     );
   }
 
+  // The bridge edits no approval card on click, so the card still shows live
+  // buttons until this lands (primitive.ts editApprovalCardResolution).
+  await editApprovalCardResolution(approval, selectedOption, userId);
   await deletePendingApproval(approval.approval_id);
   await notifyApprovalResolved({ approval, session, outcome: 'approve', userId });
   await requestWake(session, 'approval-response');
