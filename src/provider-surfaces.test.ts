@@ -707,6 +707,15 @@ describe('buildMounts agent surfaces', async () => {
       },
     ],
     ['the same place in other bytes', (commondir) => fs.writeFileSync(commondir, './\n')],
+    [
+      // Left by a container spawned before the sentinel's read-only overlay:
+      // the alias stays writable through the read-write .git mount.
+      'the sentinel with a hard-link alias',
+      (commondir) => {
+        fs.writeFileSync(commondir, '.\n');
+        fs.linkSync(commondir, path.join(path.dirname(commondir), 'writable-alias'));
+      },
+    ],
   ])(
     'withholds every mount of a canonical whose commondir is %s, logs it, and still mounts its sibling (#669)',
     async (_shape, plant) => {

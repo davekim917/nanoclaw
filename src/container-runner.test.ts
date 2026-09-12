@@ -2530,6 +2530,8 @@ describe('canonicalGitControlMounts commondir sentinel (#669)', () => {
     const mounts = canonicalGitControlMounts(gitDir, stateDir);
 
     expect(fs.lstatSync(commondir).isFile()).toBe(true);
+    // Its only name: the temporary one used to create it is gone.
+    expect(fs.lstatSync(commondir).nlink).toBe(1);
     expect(fs.readFileSync(commondir, 'utf8')).toBe('.\n');
     expect(mounts).toContainEqual({ hostPath: commondir, containerPath: commondir, readonly: true });
     // Git resolves the common dir to the canonical .git itself.
@@ -2564,6 +2566,13 @@ describe('canonicalGitControlMounts commondir sentinel (#669)', () => {
       },
     ],
     ['a directory', (commondir) => fs.mkdirSync(commondir)],
+    [
+      'the sentinel with a hard-link alias',
+      (commondir) => {
+        fs.writeFileSync(commondir, '.\n');
+        fs.linkSync(commondir, path.join(path.dirname(commondir), 'writable-alias'));
+      },
+    ],
   ])('refuses, and never overwrites, a commondir that is %s', (shape, plant) => {
     const { root, gitDir, stateDir } = canonicalGitDir(shape.replace(/\W+/g, '-'));
     const commondir = path.join(gitDir, 'commondir');

@@ -435,6 +435,32 @@ describe('durable canonical publication core', () => {
     expect(fs.existsSync(canonicalRepoDir('wg-a', foreignRepo, root))).toBe(false);
   });
 
+  it('refuses to publish a staging clone whose commondir sentinel has a hard-link alias (#669)', async () => {
+    const repo = 'alias-publish';
+    const stage = path.join(root, 'sessions', 'sess-a', 'repository-staging', 'request-alias', repo);
+    cloneTo(stage);
+    const origin = `https://github.com/example/${repo}.git`;
+    git(stage, ['remote', 'set-url', 'origin', origin]);
+    // The staging clone is the requester's: it plants the exact sentinel bytes
+    // with a second name that publication would carry into the canonical.
+    const commondir = path.join(stage, '.git', 'commondir');
+    fs.writeFileSync(commondir, '.\n');
+    fs.linkSync(commondir, path.join(stage, '.git', 'writable-alias'));
+
+    await expect(
+      publishStagedCanonical({
+        workgroupId: 'wg-a',
+        repo,
+        origin,
+        repositoryId: `github.com/example/${repo}`,
+        stagingPath: stage,
+        dataDir: root,
+      }),
+    ).rejects.toThrow(/commondir/);
+    expect(fs.existsSync(canonicalRepoDir('wg-a', repo, root))).toBe(false);
+    expect(fs.existsSync(path.join(root, 'repository-state', 'wg-a', repo, 'origin.json'))).toBe(false);
+  });
+
   it('persists the normalized GitHub origin and host-derived repository identity', async () => {
     const repo = 'normalized-persist';
     const stage = path.join(root, 'sessions', 'sess-a', 'repository-staging', 'request-normalized', repo);
@@ -2498,6 +2524,24 @@ describe('repository_checkout host action (plan §5.2, Phase 2)', { timeout: 60_
     fs.rmSync(commondir, { recursive: true, force: true });
     fs.writeFileSync(commondir, '.\n');
     await expect(refresh()).resolves.toBeDefined();
+  });
+
+  it('refuses a canonical whose commondir sentinel has a hard-link alias (#669)', async () => {
+    const canonical = networkCanonical(root);
+    const commondir = path.join(canonical, '.git', 'commondir');
+    fs.writeFileSync(commondir, '.\n');
+    // Another name for the sentinel inside the read-write .git mount: a write
+    // through it would change what Git reads at `commondir`.
+    fs.linkSync(commondir, path.join(canonical, '.git', 'writable-alias'));
+    const unit = threadUnit('hard-link-alias');
+
+    await expect(refreshCanonicalFromLocalRefs({ workgroupId: WG, repo: 'proj', dataDir: root })).rejects.toThrow(
+      /commondir/,
+    );
+    await expect(checkout(unit, 'feat-alias', root)).rejects.toThrow(/commondir/);
+    expect(listTopicCheckouts(topicWorktreesDir(unit, root))).toEqual([]);
+    expect(fs.readFileSync(commondir, 'utf8')).toBe('.\n');
+    expect(fs.lstatSync(commondir).nlink).toBe(2);
   });
 
   it('refuses a canonical whose Git common dir resolves elsewhere, even when the file check saw no commondir (#669)', async () => {

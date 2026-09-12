@@ -39,8 +39,18 @@ export function canonicalCommondirPath(gitDir: string): string {
 
 /**
  * What `<gitDir>/commondir` is: absent, exactly the sentinel, or anything else
- * (other content, a symlink, a directory, a FIFO) as `foreign`. Throws only on
- * an unexpected I/O fault, which every caller treats as a refusal.
+ * (other content, a symlink, a directory, a FIFO, a second hard link) as
+ * `foreign`. Throws only on an unexpected I/O fault, which every caller
+ * treats as a refusal.
+ *
+ * The sentinel must be the file's only name (nlink 1). The read-only overlay
+ * protects the name `commondir`, not the inode: another name for it inside the
+ * read-write `.git` mount (container-runner.ts:4536) would stay writable, and a
+ * write through it changes what Git reads at `commondir`. A container spawned
+ * with the overlay cannot make one (link(2) across mount points fails with
+ * EXDEV), but a container spawned before the sentinel existed can, and so can
+ * one that stages a clone for publication. Such an alias is refused, never
+ * removed: the host cannot know who else holds it.
  */
 export function readCanonicalCommondir(gitDir: string): CanonicalCommondirState {
   const file = canonicalCommondirPath(gitDir);
@@ -52,7 +62,7 @@ export function readCanonicalCommondir(gitDir: string): CanonicalCommondirState 
     throw error;
   }
   const expected = Buffer.from(CANONICAL_COMMONDIR_SENTINEL);
-  if (stat.isSymbolicLink() || !stat.isFile() || stat.size !== expected.length) return 'foreign';
+  if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1 || stat.size !== expected.length) return 'foreign';
   // O_NOFOLLOW refuses a symlink swapped in after the lstat; O_NONBLOCK keeps a
   // FIFO swapped in from blocking the host on open.
   let fd: number;
@@ -65,7 +75,8 @@ export function readCanonicalCommondir(gitDir: string): CanonicalCommondirState 
     throw error;
   }
   try {
-    if (!fs.fstatSync(fd).isFile()) return 'foreign';
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.nlink !== 1) return 'foreign';
     const buffer = Buffer.alloc(expected.length + 1);
     const read = fs.readSync(fd, buffer, 0, buffer.length, 0);
     return read === expected.length && buffer.subarray(0, read).equals(expected) ? 'sentinel' : 'foreign';
@@ -85,6 +96,14 @@ export function readCanonicalCommondir(gitDir: string): CanonicalCommondirState 
  * where rename(2) would silently replace a file a container created in the
  * same moment, and a Git process never sees a partial or empty file, which it
  * treats as fatal.
+ *
+ * The temporary name is unlinked before the final read, so a sentinel this
+ * call created ends with nlink 1. Between the link and that unlink it has two
+ * names. No other host spawn can look in that gap: this runs synchronously
+ * inside canonicalGitControlMounts (container-runner.ts:1478), on the host's
+ * one event loop. A container that links the temporary name in that gap
+ * leaves nlink 2, which the final read refuses. So does a host crash inside
+ * the gap; an operator then removes the stray `commondir.tmp-*`.
  */
 export function ensureCanonicalCommondirSentinel(gitDir: string): CanonicalCommondirState {
   const existing = readCanonicalCommondir(gitDir);
@@ -106,18 +125,19 @@ export function ensureCanonicalCommondirSentinel(gitDir: string): CanonicalCommo
       // Someone else created it first: judge what is there now, below.
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     }
-    const dirFd = fs.openSync(gitDir, fs.constants.O_RDONLY);
-    try {
-      fs.fsyncSync(dirFd);
-    } finally {
-      fs.closeSync(dirFd);
-    }
   } finally {
     try {
       fs.unlinkSync(temp);
     } catch {
       // Never created.
     }
+  }
+  // After the unlink, so the directory entry that persists is the one-name sentinel.
+  const dirFd = fs.openSync(gitDir, fs.constants.O_RDONLY);
+  try {
+    fs.fsyncSync(dirFd);
+  } finally {
+    fs.closeSync(dirFd);
   }
   return readCanonicalCommondir(gitDir);
 }
