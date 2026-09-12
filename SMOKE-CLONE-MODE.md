@@ -1,0 +1,1 @@
+clone mode smoke A
