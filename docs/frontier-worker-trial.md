@@ -23,6 +23,20 @@ an exact recorded ID; never use a global latest-session selector. Independent
 review starts in a fresh context. Keep CLI children foreground-attached for
 cancellation; background concurrency belongs to the parent worker layer.
 
+Choose native dispatch or the CLI helper at task start. A native subagent handle
+belongs to its parent session; it cannot be resumed as the helper's CLI UUID.
+For effort changes across resumptions, start with the helper and repeat the
+chosen model/effort on each exact-ID resume. Native Codex effort overrides apply
+at spawn; native follow-ups retain their current configuration unless that
+runtime explicitly exposes an update. Failed cross-transport resume is a
+recovery decision, never permission to silently restart the build.
+
+Ordinary coordinators use Sonnet/xhigh (Claude) and Terra/xhigh (Codex) for this
+trial. Substantive work favors Fable/Astra at medium; explicit Opus 5/Sol
+exceptions use helper --model from task start. QA/release roots that still own
+technical verdicts remain separate until their judgment responsibilities move
+to frontier owners. Existing scheduled-task pins are separate from group defaults.
+
 ## Activate and verify
 
 Host personal agent definitions outrank plugin definitions in discovery.
