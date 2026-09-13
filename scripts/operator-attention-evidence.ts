@@ -45,6 +45,21 @@ const DEFAULT_SAMPLE_LIMIT = 10;
 const DEFAULT_FOLLOWUP_DAYS = 14;
 const REVIEW_OUTCOME_BASE_BRANCH = 'main' as const;
 
+/**
+ * Known agent-group metadata directories, not session directories.
+ *
+ * Keep this explicit: session ids are normally minted as `sess-*`
+ * (`src/session-manager.ts:328-330`), but an unfamiliar directory must still
+ * fail closed as a possible session rather than disappear from coverage.
+ * `.claude-shared` is created per group (`src/group-init.ts:283-288`) and
+ * `.context` is the sibling store written by `sessionContextPathFor`
+ * (`src/session-manager.ts:73-103`). `.claude-memory` is retained for stale
+ * installs: `groupClaudeMemoryDir` created it at
+ * `ac8582847:src/session-manager.ts:90-92` before `3198aef43` moved that state
+ * beneath `.claude-shared`.
+ */
+const AGENT_GROUP_METADATA_DIR_NAMES = new Set(['.claude-shared', '.claude-memory', '.context']);
+
 export interface CandidateSample {
   source: 'inbound' | 'choice_receipts';
   session: string;
@@ -348,7 +363,7 @@ function listSessionDirectories(root: string): Array<{ session: string; dir: str
     const agentGroupPath = path.join(root, agentGroup.name);
     for (const session of fs
       .readdirSync(agentGroupPath, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
+      .filter((entry) => entry.isDirectory() && !AGENT_GROUP_METADATA_DIR_NAMES.has(entry.name))
       .sort((a, b) => a.name.localeCompare(b.name))) {
       result.push({ session: `${agentGroup.name}/${session.name}`, dir: path.join(agentGroupPath, session.name) });
     }
