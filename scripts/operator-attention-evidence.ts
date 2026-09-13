@@ -38,6 +38,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 /* eslint-disable no-catch-all/no-catch-all -- malformed or unreadable evidence must become an explicit incomplete-coverage record, never a guessed count */
+import { resolveInboundDbPath } from '../src/modules/mailbox/host-inbound.js';
 import { computeWeeklyReport, findFollowUp, findRevert, isoWeekKey, type PullRequestData } from './review-outcomes.js';
 
 const DEFAULT_SAMPLE_LIMIT = 10;
@@ -266,7 +267,7 @@ function closeReadOnly(db: Database.Database | undefined, dbPath: string, observ
   }
 }
 
-function hasTable(db: Database.Database, table: string): boolean {
+function readDbHasTable(db: Database.Database, table: string): boolean {
   return db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) !== undefined;
 }
 
@@ -355,12 +356,10 @@ function listSessionDirectories(root: string): Array<{ session: string; dir: str
   return result;
 }
 
-/** Mirrors the host's read-path preference at src/modules/mailbox/host-inbound.ts:237-240. */
+/** Uses the canonical host-owned-first, legacy-fallback resolver at src/modules/mailbox/host-inbound.ts:237-240. */
 function inboundPathForSession(sessionDir: string): string | null {
-  const hostOwned = path.join(sessionDir, '.host', 'inbound.db');
-  if (fs.existsSync(hostOwned)) return hostOwned;
-  const legacy = path.join(sessionDir, 'inbound.db');
-  return fs.existsSync(legacy) ? legacy : null;
+  const resolved = resolveInboundDbPath(sessionDir);
+  return fs.existsSync(resolved) ? resolved : null;
 }
 
 function readAssistantArchiveObservations(
@@ -375,7 +374,7 @@ function readAssistantArchiveObservations(
   let db: Database.Database | undefined;
   try {
     db = openReadOnly(archiveDb, sqliteObservations);
-    if (!hasTable(db, 'messages_archive')) {
+    if (!readDbHasTable(db, 'messages_archive')) {
       errors.push({ source: 'archive', code: 'missing_required_table' });
       return new Map();
     }
@@ -417,7 +416,7 @@ function readCentralEvidence(
   try {
     db = openReadOnly(centralDb, sqliteObservations);
     if (
-      !hasTable(db, 'pending_approvals') ||
+      !readDbHasTable(db, 'pending_approvals') ||
       !hasColumns(db, 'pending_approvals', ['approval_id', 'platform_message_id', 'status'])
     ) {
       errors.push({ source: 'central', code: 'missing_required_table' });
@@ -434,7 +433,7 @@ function readCentralEvidence(
     }
 
     if (
-      !hasTable(db, 'choice_receipts') ||
+      !readDbHasTable(db, 'choice_receipts') ||
       !hasColumns(db, 'choice_receipts', ['approval_id', 'session_id', 'resolved_at'])
     ) {
       errors.push({ source: 'central', code: 'missing_required_table' });
@@ -495,11 +494,11 @@ function scanSession(input: {
     inbound = openReadOnly(inboundPath, input.sqliteObservations);
     activeSource = 'outbound';
     outbound = openReadOnly(outboundPath, input.sqliteObservations);
-    if (!hasTable(inbound, 'messages_in') || !hasTable(inbound, 'delivered')) {
+    if (!readDbHasTable(inbound, 'messages_in') || !readDbHasTable(inbound, 'delivered')) {
       input.errors.push({ source: 'inbound', session: input.session, code: 'missing_required_table' });
       return false;
     }
-    if (!hasTable(outbound, 'messages_out')) {
+    if (!readDbHasTable(outbound, 'messages_out')) {
       input.errors.push({ source: 'outbound', session: input.session, code: 'missing_required_table' });
       return false;
     }
