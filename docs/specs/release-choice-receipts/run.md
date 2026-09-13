@@ -64,3 +64,23 @@
   repository-wide lint rule was weakened.
 - Corrected the documentation boundary: private group instructions name the
   installation's approvers; the public source does not contain those IDs.
+- The original integration-fixture verification claim was incomplete: it did
+  not run the two repository tripwires that scan the fixture. CI
+  `34735176583` correctly found four bare unique-key inserts and one new raw
+  central-DB referrer. No allowlist or tripwire was widened.
+- The fixture now initializes through the existing async migrated-test DB
+  primitive, routes every unique-key fixture seed through `insertOrAdopt`, and
+  exports a disposable `VACUUM INTO` snapshot only after the registered host
+  action and authorized response callback write the receipt. It still refuses
+  an existing `--db` path, changes to its disposable CWD before host imports,
+  and emits the real host-origin response rather than hand-authoring a receipt,
+  response, or approval ID.
+- Fresh verification: the two failing tripwire suites pass (2 files / 18
+  tests); the four original host producer/migration suites pass (4 files / 49
+  tests); the runner request-choice suite passes (32 tests); and the private
+  policy suite passes (84 tests), including the real host fixture round-trip.
+  The private suite's hermetic module guards remained active; it used only the
+  isolated host worktree via `NANOCLAW_HOST_ROOT`, not a live database.
+- `pnpm run typecheck`, `pnpm run lint`, Prettier on the changed fixture, and
+  `git diff --check` pass. Existing private policy-lock ResourceWarnings are
+  outside this fixture correction.

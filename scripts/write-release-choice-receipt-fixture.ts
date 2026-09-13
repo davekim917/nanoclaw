@@ -9,6 +9,8 @@
 import fs from 'fs';
 import path from 'path';
 
+import type { AgentGroup, MessagingGroup, MessagingGroupAgent, Session } from '../src/types.js';
+
 function option(name: string): string {
   const index = process.argv.indexOf(name);
   const value = index === -1 ? undefined : process.argv[index + 1];
@@ -18,6 +20,10 @@ function option(name: string): string {
 
 function now(): string {
   return new Date().toISOString();
+}
+
+function sqliteString(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
 }
 
 async function main(): Promise<void> {
@@ -44,6 +50,7 @@ async function main(): Promise<void> {
     responses,
     choiceModule,
     scopeModule,
+    adoption,
   ] = await Promise.all([
     import('../src/db/index.js'),
     import('../src/db/agent-groups.js'),
@@ -57,6 +64,7 @@ async function main(): Promise<void> {
     import('../src/modules/approvals/response-handler.js'),
     import('../src/modules/interactive/choice.js'),
     import('../src/modules/approvals/release-ship-scope.js'),
+    import('../src/db/insert-or-adopt.js'),
   ]);
   // The real host process imports this composition root at startup. The
   // disposable fixture does the same before provisioning its session mailbox.
@@ -84,17 +92,23 @@ async function main(): Promise<void> {
   const sessionId = 'fixture-session';
   const messagingGroupId = 'fixture-messaging-group';
 
-  await db.initDb(dbPath, { role: 'tool' });
+  // Reuse the async driver-backed migrated test primitive rather than opening
+  // a new synchronous raw-handle migration caller in this script. The real
+  // callback writes to this fresh host DB; its final snapshot is the fixture
+  // database the private reader consumes below.
+  await db.initMigratedTestDb();
   try {
-    db.runMigrations(db.getRawDb());
-    await agentGroups.createAgentGroup({
+    const agentGroup: AgentGroup = {
       id: agentGroupId,
       name: 'Fixture release agent',
       folder: 'fixture-release-agent',
       agent_provider: null,
       created_at: now(),
-    });
-    await messagingGroups.createMessagingGroup({
+    };
+    await adoption.insertOrAdopt(agentGroup, agentGroups.createAgentGroup, () =>
+      agentGroups.getAgentGroup(agentGroupId),
+    );
+    const messagingGroup: MessagingGroup = {
       id: messagingGroupId,
       channel_type: channelType,
       platform_id: platformId,
@@ -102,8 +116,11 @@ async function main(): Promise<void> {
       is_group: 1,
       unknown_sender_policy: 'strict',
       created_at: now(),
-    });
-    await messagingGroups.createMessagingGroupAgent({
+    };
+    await adoption.insertOrAdopt(messagingGroup, messagingGroups.createMessagingGroup, () =>
+      messagingGroups.getMessagingGroup(messagingGroupId),
+    );
+    const wiring: MessagingGroupAgent = {
       id: 'fixture-wiring',
       messaging_group_id: messagingGroupId,
       agent_group_id: agentGroupId,
@@ -118,8 +135,11 @@ async function main(): Promise<void> {
       default_tone: null,
       instructions_profile: null,
       created_at: now(),
-    });
-    await sessions.createSession({
+    };
+    await adoption.insertOrAdopt(wiring, messagingGroups.createMessagingGroupAgent, () =>
+      messagingGroups.getMessagingGroupAgentByPair(messagingGroupId, agentGroupId),
+    );
+    const session: Session = {
       id: sessionId,
       agent_group_id: agentGroupId,
       messaging_group_id: messagingGroupId,
@@ -129,7 +149,8 @@ async function main(): Promise<void> {
       container_status: 'stopped',
       last_active: now(),
       created_at: now(),
-    });
+    };
+    await adoption.insertOrAdopt(session, sessions.createSession, () => sessions.getSession(sessionId));
     sessionManager.initSessionFolder(agentGroupId, sessionId);
     await users.upsertUser({ id: clicker, kind: channelType, display_name: 'Fixture approver', created_at: now() });
     await userRoles.grantRole({
@@ -173,6 +194,11 @@ async function main(): Promise<void> {
       messageId: pending.platform_message_id,
     });
     if (!handled) throw new Error('fixture callback was not claimed');
+
+    // The cross-language consumer needs a real disposable database after this
+    // process exits. Export only after the actual registered action and
+    // authorized callback populated the fresh async-driver test database.
+    await db.getDb().exec(`VACUUM INTO ${sqliteString(dbPath)}`);
 
     const mailbox = new Database(mailboxPaths.inboundDbPath(agentGroupId, sessionId), { readonly: true });
     try {
