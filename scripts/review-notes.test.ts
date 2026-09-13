@@ -12,10 +12,11 @@ allowSubprocess(['git']);
 enforceHermeticity();
 
 /**
- * docs/review-notes.md is the review loop's memory: one line per lesson, which
- * the author and the reviewer read before writing or reviewing code
+ * docs/review-notes.md is the review loop's registry and historical memory.
+ * New lessons live in one small docs/review-notes/<PR>.md fragment per PR.
+ * The author and reviewer read the aggregate before writing or reviewing code
  * (docs/review-policy.md, "Review notes and fix links"). This test holds these
- * rules on it:
+ * rules on that aggregate:
  *
  *  1. every line under `## Lessons` is `- YYYY-MM-DD · PR · class · lesson ·
  *     structural fix`, five fields split on ` · `, dated no later than today (UTC);
@@ -33,6 +34,7 @@ enforceHermeticity();
 
 const NOTES_PATH = path.join(__dirname, '..', 'docs', 'review-notes.md');
 const REPO_ROOT = path.join(__dirname, '..');
+const FRAGMENTS_DIR = path.join('docs', 'review-notes');
 const SEPARATOR = ' · ';
 const PR_FIELD = /^(#\d+(\/#\d+)*|rule)$/;
 const CLASS_ENTRY = /^- `([^`]+)` — \S/;
@@ -166,8 +168,8 @@ function gitPathExists(root: string, filePath: string, rev?: string): boolean {
     // matching some other tracked file — this repo's own `pathspec quoting`
     // class (docs/review-notes.md:67).
     return (
-      spawnSync('git', ['--literal-pathspecs', 'ls-files', '--error-unmatch', '--', filePath], { cwd: root })
-        .status === 0
+      spawnSync('git', ['--literal-pathspecs', 'ls-files', '--error-unmatch', '--', filePath], { cwd: root }).status ===
+      0
     );
   return spawnSync('git', ['cat-file', '-e', `${rev}:${filePath}`], { cwd: root }).status === 0;
 }
@@ -267,7 +269,8 @@ function citationExistenceProblems(fix: string, root: string): string[] {
   return problems;
 }
 
-type Lesson = { line: number; date: string; cls: string; fix: string };
+type Lesson = { source?: string; line: number; order: number; date: string; cls: string; fix: string };
+type ReviewNotesFragment = { path: string; pr: string; text: string };
 
 /** The lines of `## <name>`, up to the next `## ` heading, with their 1-based line numbers. */
 function section(lines: string[], name: string): { line: number; text: string }[] | null {
@@ -286,12 +289,53 @@ function isRealDate(date: string): boolean {
 }
 
 /**
- * Every rule violation in a review-notes file's text; empty when it passes.
- * `today` is a UTC YYYY-MM-DD date; no lesson may be dated after it. `root`,
- * when given, additionally checks every cited backtick path and file:line
- * against the filesystem there (citationExistenceProblems) — omit it to
- * check format only, as every caller but the real docs/review-notes.md check
- * does.
+ * The persistent registry/history stays in review-notes.md; every new lesson
+ * gets a distinct, plain-list fragment named for the PR that added it. Reading
+ * those fragments in numeric PR order gives equal-date lessons a stable,
+ * documented order without making unrelated PRs append to the same file.
+ */
+function readReviewNotesFragments(root: string): { fragments: ReviewNotesFragment[]; problems: string[] } {
+  const absoluteDir = path.join(root, FRAGMENTS_DIR);
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(absoluteDir, { withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { fragments: [], problems: [] };
+    return { fragments: [], problems: [`could not read ${FRAGMENTS_DIR}: ${(err as Error).message}`] };
+  }
+
+  const fragments: ReviewNotesFragment[] = [];
+  const problems: string[] = [];
+  for (const entry of entries) {
+    const relative = path.posix.join(FRAGMENTS_DIR, entry.name);
+    const pr = /^([1-9]\d*)\.md$/.exec(entry.name)?.[1];
+    if (!pr) {
+      problems.push(`${relative}: fragment names must be one positive PR number followed by .md`);
+      continue;
+    }
+    if (!entry.isFile()) {
+      problems.push(`${relative}: a review-notes fragment must be a regular file`);
+      continue;
+    }
+    try {
+      fragments.push({ path: relative, pr, text: fs.readFileSync(path.join(absoluteDir, entry.name), 'utf8') });
+    } catch (err) {
+      problems.push(`could not read ${relative}: ${(err as Error).message}`);
+    }
+  }
+  fragments.sort((a, b) =>
+    a.pr.length === b.pr.length ? (a.pr < b.pr ? -1 : a.pr > b.pr ? 1 : 0) : a.pr.length - b.pr.length,
+  );
+  return { fragments, problems };
+}
+
+/**
+ * Every rule violation in the historical registry and its fragments; empty
+ * when the aggregate passes. `today` is a UTC YYYY-MM-DD date; no lesson may
+ * be dated after it. `root`, when given, loads docs/review-notes/*.md and
+ * additionally checks every cited backtick path and file:line against git —
+ * omit it to check only the historical text's format, as the synthetic cases
+ * below do.
  */
 export function reviewNotesProblems(
   text: string,
@@ -321,46 +365,71 @@ export function reviewNotesProblems(
   if (registry.size === 0) problems.push('`## Classes` registers no class');
 
   const lessons: Lesson[] = [];
-  for (const { line, text: entry } of lessonLines) {
-    if (entry.trim() === '') continue;
-    if (!entry.startsWith('- ')) {
-      problems.push(`line ${line}: every line under Lessons is one whole lesson starting "- ": ${entry}`);
-      continue;
+  const addLessonLines = (entries: { line: number; text: string }[], source?: { path: string; pr: string }): void => {
+    let count = 0;
+    for (const { line, text: entry } of entries) {
+      const location = source ? `${source.path}:${line}` : `line ${line}`;
+      if (entry.trim() === '') continue;
+      if (!entry.startsWith('- ')) {
+        problems.push(`${location}: every lesson is one whole line starting "- ": ${entry}`);
+        continue;
+      }
+      const fields = entry.slice(2).split(SEPARATOR);
+      if (fields.length !== 5) {
+        problems.push(
+          `${location}: ${fields.length} fields, not 5 (YYYY-MM-DD · PR · class · lesson · structural fix); ` +
+            `a ' · ' inside a field splits it`,
+        );
+        continue;
+      }
+      const [date, pr, cls, lesson, fix] = fields.map((field) => field.trim());
+      if (!isRealDate(date)) problems.push(`${location}: "${date}" is not a YYYY-MM-DD date`);
+      else if (date > today) problems.push(`${location}: ${date} is after today (${today}, UTC)`);
+      if (!PR_FIELD.test(pr)) problems.push(`${location}: PR "${pr}" is not #<n>, #<n>/#<m>…, or rule`);
+      else if (source && pr !== `#${source.pr}`)
+        problems.push(`${location}: PR "${pr}" must be exactly #${source.pr} to match ${source.path}`);
+      if (!registry.has(cls)) problems.push(`${location}: class "${cls}" is not registered under Classes`);
+      if (lesson === '') problems.push(`${location}: the lesson is empty`);
+      if (fix === '') problems.push(`${location}: the structural fix is empty; write "none" if there is none`);
+      else if (fix !== 'none' && !CITATIONS.some((re) => re.test(fix)))
+        problems.push(
+          `${location}: structural fix "${fix}" is neither exactly "none" nor a citation ` +
+            '(a backtick path, a file:line, a #<n>, or a commit sha)',
+        );
+      if (root && fix !== 'none')
+        for (const problem of citationExistenceProblems(fix, root)) problems.push(`${location}: ${problem}`);
+      lessons.push({ source: source?.path, line, order: lessons.length, date, cls, fix });
+      count++;
     }
-    const fields = entry.slice(2).split(SEPARATOR);
-    if (fields.length !== 5) {
-      problems.push(
-        `line ${line}: ${fields.length} fields, not 5 (YYYY-MM-DD · PR · class · lesson · structural fix); ` +
-          `a ' · ' inside a field splits it`,
-      );
-      continue;
-    }
-    const [date, pr, cls, lesson, fix] = fields.map((field) => field.trim());
-    if (!isRealDate(date)) problems.push(`line ${line}: "${date}" is not a YYYY-MM-DD date`);
-    else if (date > today) problems.push(`line ${line}: ${date} is after today (${today}, UTC)`);
-    if (!PR_FIELD.test(pr)) problems.push(`line ${line}: PR "${pr}" is not #<n>, #<n>/#<m>…, or rule`);
-    if (!registry.has(cls)) problems.push(`line ${line}: class "${cls}" is not registered under Classes`);
-    if (lesson === '') problems.push(`line ${line}: the lesson is empty`);
-    if (fix === '') problems.push(`line ${line}: the structural fix is empty; write "none" if there is none`);
-    else if (fix !== 'none' && !CITATIONS.some((re) => re.test(fix)))
-      problems.push(
-        `line ${line}: structural fix "${fix}" is neither exactly "none" nor a citation ` +
-          '(a backtick path, a file:line, a #<n>, or a commit sha)',
-      );
-    if (root && fix !== 'none')
-      for (const problem of citationExistenceProblems(fix, root)) problems.push(`line ${line}: ${problem}`);
-    lessons.push({ line, date, cls, fix });
-  }
+    if (source && count === 0) problems.push(`${source.path}: a review-notes fragment holds no lesson`);
+  };
+
+  addLessonLines(lessonLines);
   if (lessons.length === 0) problems.push('`## Lessons` holds no lesson');
+
+  if (root) {
+    const { fragments, problems: fragmentProblems } = readReviewNotesFragments(root);
+    problems.push(...fragmentProblems);
+    for (const fragment of fragments)
+      addLessonLines(
+        fragment.text.split('\n').map((text, index) => ({ line: index + 1, text })),
+        fragment,
+      );
+  }
 
   const byClass = new Map<string, Lesson[]>();
   for (const lesson of lessons) byClass.set(lesson.cls, [...(byClass.get(lesson.cls) ?? []), lesson]);
   for (const [cls, group] of byClass) {
     if (group.length < 2) continue;
-    const newest = group.reduce((a, b) => (b.date > a.date || (b.date === a.date && b.line > a.line) ? b : a));
+    const newest = group.reduce((a, b) => (b.date > a.date || (b.date === a.date && b.order > a.order) ? b : a));
     if (newest.fix === 'none') {
+      const allHistory = group.every((lesson) => !lesson.source);
+      const locations = allHistory
+        ? `lines ${group.map((lesson) => lesson.line).join(', ')}`
+        : group.map((lesson) => (lesson.source ? `${lesson.source}:${lesson.line}` : `line ${lesson.line}`)).join(', ');
+      const newestLocation = newest.source ? `${newest.source}:${newest.line}` : newest.line;
       problems.push(
-        `class "${cls}" recurs (lines ${group.map((l) => l.line).join(', ')}) and its newest line (${newest.line}) ` +
+        `class "${cls}" recurs (${locations}) and its newest line (${newestLocation}) ` +
           `has structural fix "none": the second occurrence is where the lint rule, test or primitive lands — name it`,
       );
     }
@@ -534,6 +603,79 @@ describe('reviewNotesProblems', () => {
     );
     expect(reviewNotesProblems(sameDay, TODAY)).toEqual([expect.stringMatching(/newest line \(12\)/)]);
   });
+
+  it('aggregates a fragment with history when deciding whether a repeated class has a structural fix', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'review-notes-fragment-'));
+    try {
+      const history = notes(['alpha'], ['- 2026-09-01 · #1 · alpha · The first occurrence · none']);
+      fs.mkdirSync(path.join(root, 'docs', 'review-notes'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'docs', 'review-notes.md'), history);
+      fs.writeFileSync(
+        path.join(root, 'docs', 'review-notes', '2.md'),
+        '- 2026-09-02 · #2 · alpha · The second occurrence · none\n',
+      );
+
+      expect(reviewNotesProblems(history, TODAY, root)).toEqual([
+        expect.stringMatching(
+          /class "alpha" recurs \(line 11, docs\/review-notes\/2\.md:1\).*newest line \(docs\/review-notes\/2\.md:1\)/,
+        ),
+      ]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('requires a fragment name and its lesson PR to agree', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'review-notes-fragment-'));
+    try {
+      const history = notes(['alpha'], ['- 2026-09-01 · #1 · alpha · First occurrence · none']);
+      fs.mkdirSync(path.join(root, 'docs', 'review-notes'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'docs', 'review-notes.md'), history);
+      fs.writeFileSync(
+        path.join(root, 'docs', 'review-notes', '2.md'),
+        '- 2026-09-02 · #3 · alpha · Wrong PR for this fragment · `src/x.ts`\n',
+      );
+
+      expect(reviewNotesProblems(history, TODAY, root)).toEqual(
+        expect.arrayContaining([
+          expect.stringMatching(/PR "#3" must be exactly #2 to match docs\/review-notes\/2\.md/),
+        ]),
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ['#10 has no structural fix', '#9', 'none', true],
+    ['#10 names the structural fix', 'none', '#10', false],
+  ])('uses numeric PR order for same-day fragments when %s', (_case, fix9, fix10, shouldFail) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'review-notes-fragment-'));
+    try {
+      const history = notes(['alpha'], ['- 2026-09-01 · #1 · alpha · First occurrence · none']);
+      fs.mkdirSync(path.join(root, 'docs', 'review-notes'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'docs', 'review-notes.md'), history);
+      fs.writeFileSync(
+        path.join(root, 'docs', 'review-notes', '9.md'),
+        `- 2026-09-02 · #9 · alpha · #9 lesson · ${fix9}\n`,
+      );
+      fs.writeFileSync(
+        path.join(root, 'docs', 'review-notes', '10.md'),
+        `- 2026-09-02 · #10 · alpha · #10 lesson · ${fix10}\n`,
+      );
+
+      const problems = reviewNotesProblems(history, TODAY, root);
+      if (shouldFail)
+        expect(problems).toEqual(
+          expect.arrayContaining([
+            expect.stringMatching(/newest line \(docs\/review-notes\/10\.md:1\).*structural fix "none"/),
+          ]),
+        );
+      else expect(problems).toEqual([]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('citation existence, checked only when a root is given (#707 P3-d)', () => {
@@ -565,6 +707,40 @@ describe('citation existence, checked only when a root is given (#707 P3-d)', ()
     spawnSync('git', ['commit', '-q', '--allow-empty', '-m', message, '--no-gpg-sign'], { cwd: root });
     return (gitRead(root, ['rev-parse', 'HEAD']) ?? '').trim();
   }
+
+  it('lets two branches add different PR fragments and merge without a review-notes conflict', () => {
+    const root = gitRoot();
+    const history = notes(['alpha', 'beta'], ['- 2026-09-01 · #1 · alpha · First occurrence · none']);
+    fs.mkdirSync(path.join(root, 'docs'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'docs', 'review-notes.md'), history);
+    fs.writeFileSync(path.join(root, 'x.ts'), 'one\n');
+    commit(root, 'base review notes');
+    const base = (gitRead(root, ['branch', '--show-current']) ?? '').trim();
+    expect(base).not.toBe('');
+
+    expect(spawnSync('git', ['checkout', '-qb', 'notes-101'], { cwd: root }).status).toBe(0);
+    fs.mkdirSync(path.join(root, 'docs', 'review-notes'));
+    fs.writeFileSync(
+      path.join(root, 'docs', 'review-notes', '101.md'),
+      '- 2026-09-02 · #101 · alpha · Second occurrence adds its check · `x.ts`\n',
+    );
+    commit(root, 'add 101 review note');
+
+    expect(spawnSync('git', ['checkout', '-qb', 'notes-102', base], { cwd: root }).status).toBe(0);
+    fs.mkdirSync(path.join(root, 'docs', 'review-notes'));
+    fs.writeFileSync(
+      path.join(root, 'docs', 'review-notes', '102.md'),
+      '- 2026-09-02 · #102 · beta · One independent lesson · none\n',
+    );
+    commit(root, 'add 102 review note');
+
+    const merged = spawnSync('git', ['merge', '--no-edit', 'notes-101'], { cwd: root, encoding: 'utf8' });
+    expect(merged.status).toBe(0);
+    expect(merged.stderr).not.toMatch(/CONFLICT/);
+    expect(
+      reviewNotesProblems(fs.readFileSync(path.join(root, 'docs', 'review-notes.md'), 'utf8'), TODAY, root),
+    ).toEqual([]);
+  });
 
   /** A real `--depth 1` clone of `root`'s current HEAD — the one case gitCommitResolvable is expected to answer false for an otherwise-real, historical sha (#730 P3). `git clone` accepts an existing, empty destination directory. */
   function shallowCloneOf(root: string): string {
@@ -711,10 +887,18 @@ describe('citation existence, checked only when a root is given (#707 P3-d)', ()
     fs.writeFileSync(path.join(root, 'small.ts'), 'line one\nline two\nline three\n');
     commit(root);
     expect(
-      reviewNotesProblems(notes(['alpha'], ['- 2026-09-01 · #1 · alpha · A lesson · guarded at `small.ts:2-99`']), TODAY, root),
+      reviewNotesProblems(
+        notes(['alpha'], ['- 2026-09-01 · #1 · alpha · A lesson · guarded at `small.ts:2-99`']),
+        TODAY,
+        root,
+      ),
     ).toEqual([expect.stringMatching(/cites `small\.ts:2-99`, but small\.ts has only 3 lines/)]);
     expect(
-      reviewNotesProblems(notes(['alpha'], ['- 2026-09-01 · #1 · alpha · A lesson · guarded at `small.ts:2-3`']), TODAY, root),
+      reviewNotesProblems(
+        notes(['alpha'], ['- 2026-09-01 · #1 · alpha · A lesson · guarded at `small.ts:2-3`']),
+        TODAY,
+        root,
+      ),
     ).toEqual([]);
   });
 
@@ -738,7 +922,9 @@ describe('citation existence, checked only when a root is given (#707 P3-d)', ()
     // because HEAD happens to have grown enough lines since.
     const failing = notes(['alpha'], [`- 2026-09-01 · #1 · alpha · A lesson · fixed at \`evolve.ts:5\` at ${oldSha}`]);
     expect(reviewNotesProblems(failing, TODAY, root)).toEqual([
-      expect.stringMatching(new RegExp(`cites \`evolve\\.ts:5\` at ${oldSha}, but evolve\\.ts has only 3 lines at ${oldSha}`)),
+      expect.stringMatching(
+        new RegExp(`cites \`evolve\\.ts:5\` at ${oldSha}, but evolve\\.ts has only 3 lines at ${oldSha}`),
+      ),
     ]);
   });
 
@@ -748,20 +934,22 @@ describe('citation existence, checked only when a root is given (#707 P3-d)', ()
   // typo'd `at <sha>` silently exempt a wrong line, and a full clone has
   // every commit it will ever have: there is nothing left to fetch that
   // would make the sha resolve later.
-  it('fails a typo\'d pin against a wrong line, in a full clone', () => {
+  it("fails a typo'd pin against a wrong line, in a full clone", () => {
     const root = gitRoot();
     fs.writeFileSync(path.join(root, 'a.ts'), 'one\ntwo\nthree\n');
     commit(root);
     const typo = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'; // well-formed, but no such commit anywhere
     const text = notes(['alpha'], [`- 2026-09-01 · #1 · alpha · A lesson · fixed at \`a.ts:99\` at ${typo}`]);
     expect(reviewNotesProblems(text, TODAY, root)).toEqual([
-      expect.stringMatching(new RegExp(`cites \`a\\.ts:99\` at ${typo}, but ${typo} does not resolve to a commit here`)),
+      expect.stringMatching(
+        new RegExp(`cites \`a\\.ts:99\` at ${typo}, but ${typo} does not resolve to a commit here`),
+      ),
     ]);
   });
 
   // #730 P3: the regression this class exists for — a typo'd pin against a
   // citation to a file that never existed used to be silently exempted too.
-  it('fails a typo\'d pin against a missing file, in a full clone', () => {
+  it("fails a typo'd pin against a missing file, in a full clone", () => {
     const root = gitRoot();
     commit(root);
     const typo = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
@@ -849,7 +1037,9 @@ describe('citation existence, checked only when a root is given (#707 P3-d)', ()
       commit(root);
       const text = notes(['alpha'], [`- 2026-09-01 · #1 · alpha · A lesson · see \`${span}\``]);
       expect(reviewNotesProblems(text, TODAY, root)).toEqual([
-        expect.stringMatching(new RegExp(`cites \\\`${span.replace(/[.*?+^${}()|[\]\\]/g, '\\$&')}\\\`, which does not exist`)),
+        expect.stringMatching(
+          new RegExp(`cites \\\`${span.replace(/[.*?+^${}()|[\]\\]/g, '\\$&')}\\\`, which does not exist`),
+        ),
       ]);
     },
   );
@@ -914,7 +1104,10 @@ describe('citation existence, checked only when a root is given (#707 P3-d)', ()
     const oldSha = commit(root, 'old, long enough');
     fs.writeFileSync(path.join(root, 'thing.jq'), 'shrunk\n');
     commit(root, 'new, far too short');
-    const text = notes(['alpha'], [`- 2026-09-01 · #1 · alpha · A lesson · fixed in \`thing.jq:5-6\`, #692 at ${oldSha}`]);
+    const text = notes(
+      ['alpha'],
+      [`- 2026-09-01 · #1 · alpha · A lesson · fixed in \`thing.jq:5-6\`, #692 at ${oldSha}`],
+    );
     expect(reviewNotesProblems(text, TODAY, root)).toEqual([]);
   });
 

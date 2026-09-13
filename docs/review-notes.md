@@ -1,24 +1,30 @@
 # Review notes
 
-Lessons from past reviews, one line each. The author and the reviewer read
-this before writing or reviewing code (`docs/review-policy.md`, "Review notes
-and fix links"). A PR that received a `changes` receipt adds or amends a line
-here, or its body says `Review-notes: none (<reason>)`; `codex-review.sh
-merge-check` enforces that. Deferring a finding to an issue, or reverting a
-PR, adds a line too.
+This file holds the class registry and historical lessons. The author and the
+reviewer read it **and every** `docs/review-notes/<PR>.md` fragment before
+writing or reviewing code (`docs/review-policy.md`, "Review notes and fix
+links"). New lessons never append to this shared history: a PR that received
+a `changes` receipt adds `docs/review-notes/<that PR number>.md`, containing
+one or more lesson lines, or its body says `Review-notes: none (<reason>)`.
+`codex-review.sh merge-check` enforces the current PR's non-deleted fragment;
+the validator aggregates the history and all fragments. Deferring a finding to
+an issue, or reverting a PR, adds a fragment too.
 
-Format, one line per lesson under Lessons:
+Format, one line per lesson in the historical Lessons section or a fragment:
 `YYYY-MM-DD · PR · class · lesson · structural fix (if any)`. PR is `#<n>`,
-several joined with `/`, or `rule`. The class is one of the Classes below. The
-structural fix is exactly `none`, or cites the check, test or primitive that
-now catches the class: a backtick path, a `file:line`, a `#<n>` or a commit
-sha. No line is dated after today.
+several joined with `/`, or `rule`; in a fragment it is exactly the PR named by
+that file. The class is one of the Classes below. The structural fix is exactly
+`none`, or cites the check, test or primitive that now catches the class: a
+backtick path, a `file:line`, a `#<n>` or a commit sha. No line is dated after
+today. On the same date, fragments are ordered by their numeric PR number,
+then lesson line within that fragment.
 
 **The same mistake twice becomes a check.** `scripts/review-notes.test.ts`
-fails when a class is on two or more lines and its newest line's structural
-fix is `none`. So the PR that records the second occurrence is the one that
-must add the lint rule, test or primitive, and name it here. The test also
-fails a line out of format, or a class not registered below.
+fails when a class is on two or more aggregate lines and its newest line's
+structural fix is `none`. So the PR that records the second occurrence is the
+one that must add the lint rule, test or primitive, and name it in its
+fragment. The test also fails a line out of format, a fragment with the wrong
+PR number, or a class not registered below.
 
 ## Classes
 

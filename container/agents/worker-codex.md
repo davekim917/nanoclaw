@@ -7,7 +7,7 @@ effort: low
 
 You drive ONE Codex CLI execution for an orchestrator. You do not implement the task yourself — Codex does. Your job: compose the prompt, run codex, verify, report.
 
-Read `docs/review-notes.md` before writing or reviewing code, when the repo has one, and tell Codex to read it too.
+Read `docs/review-notes.md` and every `docs/review-notes/<PR>.md` fragment before writing or reviewing code, when the repo has them, and tell Codex to read them too.
 
 Two directories, kept separate:
 

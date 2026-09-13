@@ -1339,7 +1339,7 @@ describe('codex-review risk-scoped review requests', () => {
     'src/dashboard/observatory-v2/api.ts',
     'src/dashboard/router.ts',
     'src/dashboard/thread-message.ts',
-  ])('scopes a PR touching %s to review under this repo\'s real labeler.yml', (file) => {
+  ])("scopes a PR touching %s to review under this repo's real labeler.yml", (file) => {
     const root = tempRoot();
     scopeFixture(root, { labels: [], baseConfig: REAL_LABELER_YML, files: [changedFile(file)] });
 
@@ -2099,7 +2099,7 @@ describe('codex-review risk-scoped review requests', () => {
       labels: ['risk:high'],
       // The head records the lesson, so the review-notes rule is met and receipt
       // order alone decides.
-      files: [changedFile('docs/review-notes.md')],
+      files: [changedFile('docs/review-notes/1.md')],
       comments: [
         receiptComment(HEAD, 'approve', '2026-09-05T00:30:00Z'),
         receiptComment(HEAD, 'changes', '2026-09-05T00:20:00Z'),
@@ -2252,8 +2252,7 @@ const COMMENT_LINE_RE = /^\s*#/;
 // whether the narrow discovery above found the function it lives in.
 // Anchored on the pattern starting the line (after indentation) so it never
 // matches --head appearing inside a string or a usage message.
-const HEAD_CASE_ARM_RE =
-  /^\s*\(?(?:['"]?[\w.*-]+['"]?\s*\|\s*)*['"]?--head['"]?(?:\s*\|\s*['"]?[\w.*-]+['"]?)*\)/;
+const HEAD_CASE_ARM_RE = /^\s*\(?(?:['"]?[\w.*-]+['"]?\s*\|\s*)*['"]?--head['"]?(?:\s*\|\s*['"]?[\w.*-]+['"]?)*\)/;
 
 // A flag-equality test naming --head, anywhere on the line (unlike a case
 // arm, the test is rarely the first token — `if `/`elif ` usually is):
@@ -2402,11 +2401,13 @@ describe('every subcommand that parses --head validates it as a hex sha before r
     expect(subcommands).toEqual(expect.arrayContaining(['ci-wait', 'merge-check', 'merge', 'receipt']));
   });
 
-  it.each(subcommands.flatMap((cmd) => [
-    [cmd, ''],
-    [cmd, 'zzz'],
-    [cmd, 'a'],
-  ]))('%s --head %j exits 2, reading nothing', (cmd, value) => {
+  it.each(
+    subcommands.flatMap((cmd) => [
+      [cmd, ''],
+      [cmd, 'zzz'],
+      [cmd, 'a'],
+    ]),
+  )('%s --head %j exits 2, reading nothing', (cmd, value) => {
     const root = tempRoot();
 
     const result = runHelper(root, [cmd, '--head', value]);
@@ -2430,9 +2431,12 @@ describe('cross-check: every --head-shaped case pattern is attributed to a disco
     expect(patternLines.length).toBeGreaterThan(0);
   });
 
-  it.each(patternLines)('the --head case pattern on line %i is attributed to a discovered, head-taking subcommand', (lineIdx) => {
-    expect(unattributed.has(lineIdx)).toBe(false);
-  });
+  it.each(patternLines)(
+    'the --head case pattern on line %i is attributed to a discovered, head-taking subcommand',
+    (lineIdx) => {
+      expect(unattributed.has(lineIdx)).toBe(false);
+    },
+  );
 });
 
 // #713 P3: proof that the cross-check actually catches the five shapes that
@@ -2779,10 +2783,7 @@ probe_nonmain_helper_oneline() {
         // call time — a real run would hit "command not found" (and exit,
         // under `set -e`, before ever reaching the gh call this test proves
         // happens instead).
-        const withHelper = mutated.replace(
-          'case "${1:?usage:',
-          `${gap.helperText}\ncase "\${1:?usage:`,
-        );
+        const withHelper = mutated.replace('case "${1:?usage:', `${gap.helperText}\ncase "\${1:?usage:`);
         expect(withHelper).not.toBe(mutated);
         mutated = withHelper;
       }
@@ -3297,7 +3298,7 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
       // A trusted comment edited after the merge could have been a changes
       // receipt, so the review-notes rule applies; the head meets it, and
       // receipt order alone decides.
-      files: [changedFile('docs/review-notes.md')],
+      files: [changedFile('docs/review-notes/1.md')],
       comments: [
         {
           author: { login: 'davekim917' },
@@ -3406,7 +3407,7 @@ describe('codex-review audit, the gate re-judged as of a merge', () => {
       // A trusted comment edited after the merge could have been a changes
       // receipt, so the review-notes rule applies; the head meets it, and
       // receipt order alone decides.
-      files: [changedFile('docs/review-notes.md')],
+      files: [changedFile('docs/review-notes/1.md')],
       comments: [
         {
           author: { login: 'davekim917' },
@@ -3543,7 +3544,8 @@ describe('codex-review review-notes rule: a PR a reviewer said no to records its
   // A substitute reviewer asked for changes on an earlier head; this head was then approved.
   const CHANGES_EARLIER = receiptComment(OLD_HEAD, 'changes', '2026-09-05T00:10:00Z');
   const APPROVED = receiptComment(HEAD, 'approve', '2026-09-05T00:20:00Z');
-  const NOTES = changedFile('docs/review-notes.md');
+  const FRAGMENT = changedFile('docs/review-notes/1.md');
+  const LEGACY_NOTES = changedFile('docs/review-notes.md');
   // The receipts' author, as receiptComment writes it.
   const LOGIN = (APPROVED.author as { login: string }).login;
   const MISSING = `review_notes_missing: ${LOGIN} asked for changes on ${OLD_HEAD.slice(0, 12)} at 2026-09-05T00:10:00Z`;
@@ -3577,17 +3579,17 @@ describe('codex-review review-notes rule: a PR a reviewer said no to records its
       const result = runHelper(root, ['merge-check', '--head', HEAD]);
       expect(result.status).toBe(24);
       expect(result.stderr).toContain(
-        `merge=refused head=${HEAD} verdict=${verdict}: ${MISSING}; this head does not touch docs/review-notes.md`,
+        `merge=refused head=${HEAD} verdict=${verdict}: ${MISSING}; this head does not add or amend docs/review-notes/1.md`,
       );
       expect(result.stdout).not.toContain('merge=allowed');
     },
   );
 
-  it('allows it once the head adds or amends docs/review-notes.md', () => {
+  it('allows it once the current PR adds its own review-notes fragment', () => {
     const root = tempRoot();
     scopeFixture(root, {
       labels: ['risk:high'],
-      files: [changedFile('docs/notes.md'), NOTES],
+      files: [changedFile('docs/notes.md'), FRAGMENT],
       comments: [CHANGES_EARLIER, APPROVED],
     });
 
@@ -3596,17 +3598,43 @@ describe('codex-review review-notes rule: a PR a reviewer said no to records its
     expect(result.stdout).toContain('the latest substitute receipt for this head approves');
   });
 
-  it('does not count deleting docs/review-notes.md as recording the lesson', () => {
+  it("does not let another PR's fragment satisfy this PR's gate", () => {
     const root = tempRoot();
     scopeFixture(root, {
       labels: ['risk:high'],
-      files: [{ filename: 'docs/review-notes.md', status: 'removed' }],
+      files: [changedFile('docs/review-notes/2.md')],
       comments: [CHANGES_EARLIER, APPROVED],
     });
 
     const result = runHelper(root, ['merge-check', '--head', HEAD]);
     expect(result.status).toBe(24);
-    expect(result.stderr).toContain('this head does not touch docs/review-notes.md');
+    expect(result.stderr).toContain('this head does not add or amend docs/review-notes/1.md');
+  });
+
+  it('does not let a current PR use the shared historical notes file', () => {
+    const root = tempRoot();
+    scopeFixture(root, {
+      labels: ['risk:high'],
+      files: [LEGACY_NOTES],
+      comments: [CHANGES_EARLIER, APPROVED],
+    });
+
+    const result = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain('this head does not add or amend docs/review-notes/1.md');
+  });
+
+  it('does not count deleting the current PR fragment as recording the lesson', () => {
+    const root = tempRoot();
+    scopeFixture(root, {
+      labels: ['risk:high'],
+      files: [{ filename: 'docs/review-notes/1.md', status: 'removed' }],
+      comments: [CHANGES_EARLIER, APPROVED],
+    });
+
+    const result = runHelper(root, ['merge-check', '--head', HEAD]);
+    expect(result.status).toBe(24);
+    expect(result.stderr).toContain('this head does not add or amend docs/review-notes/1.md');
   });
 
   it('allows it with a Review-notes: none line that gives a reason', () => {
@@ -3755,7 +3783,7 @@ describe('codex-review review-notes rule: a PR a reviewer said no to records its
     const refused = runHelper(unread, ['merge-check', '--head', HEAD]);
     expect(refused.status).toBe(24);
     expect(refused.stderr).toContain(
-      `${MISSING}; the files this head changes could not be checked, so no touch of docs/review-notes.md counts`,
+      `${MISSING}; the files this head changes could not be checked, so no addition of docs/review-notes/1.md counts`,
     );
 
     const said = tempRoot();
@@ -3780,9 +3808,22 @@ describe('codex-review review-notes rule: a PR a reviewer said no to records its
     );
   });
 
-  it('audit passes it when the merged head touched docs/review-notes.md', () => {
+  it('audit rejects a merged head that only touched the shared historical notes file', () => {
     const root = tempRoot();
-    auditFixture(root, { labels: ['risk:high'], files: [NOTES], comments: [CHANGES_EARLIER, APPROVED] });
+    auditFixture(root, { labels: ['risk:high'], files: [LEGACY_NOTES], comments: [CHANGES_EARLIER, APPROVED] });
+
+    const result = runHelper(root, ['audit']);
+    expect(result.status).toBe(28);
+    expect(result.stdout).toContain('this head does not add or amend docs/review-notes/1.md');
+  });
+
+  it('audit accepts a merged head that added its own fragment', () => {
+    const root = tempRoot();
+    auditFixture(root, {
+      labels: ['risk:high'],
+      files: [FRAGMENT],
+      comments: [CHANGES_EARLIER, APPROVED],
+    });
 
     const result = runHelper(root, ['audit']);
     expect(result.status).toBe(0);
