@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   buildNudgePrompt,
+  isExplicitlyPaused,
   buildTakeoverPrompt,
   isHandedOffPark,
   isWaitingOnHuman,
@@ -171,6 +172,21 @@ describe('exclusions — the claims self-heal must never touch', () => {
     expect(await sweepClaimsSelfHeal(NOW, d)).toEqual([]);
     expect(d.sent).toEqual([]);
     expect(readClaimFile(dir, 'handed').auto_nudge_count).toBeUndefined();
+  });
+
+  it('never nudges an explicit operator pause, however old it becomes', async () => {
+    const dir = root({
+      held: claim(80, {
+        status: 'paused',
+        paused_at: new Date(NOW - 40 * HOUR).toISOString(),
+        note: 'explicit operator hold; resume only on a new instruction',
+      }),
+    });
+    const d = deps(dir);
+
+    expect(await sweepClaimsSelfHeal(NOW, d)).toEqual([]);
+    expect(d.sent).toEqual([]);
+    expect(isExplicitlyPaused({ status: 'paused' })).toBe(true);
   });
 
   it('still nudges a park whose note says nothing — that is abandonment, not a handoff', async () => {

@@ -1620,29 +1620,60 @@ resolve_backend_identity() {
     '{selected:null, method:"ambiguous", candidates:$c, reason:$reason}'
 }
 
-# Resolves ONE frontend preview's identity for a PR. No disambiguation oracle
-# exists for the frontend side (nothing else calls it to be counted against) —
-# 2+ candidates is an unconditional refusal, per the standing disposition on
-# #1536.
+# Resolves ONE frontend preview's identity for a PR. When Render left a failed
+# duplicate alongside the live preview, the deployment records are the
+# authoritative discriminator: exactly one candidate with a live, commit-bound
+# deployment is safe to select. Multiple live candidates and any unavailable
+# deployment lookup remain an unconditional refusal.
 resolve_frontend_identity() {
   local services_json="$1" pr="$2"
-  local candidates n full_reason
+  local candidates n full_reason candidate candidate_id live_sha live_candidates live_n query_failure
   candidates="$(find_preview_candidates "$services_json" "$FRONTEND_SERVICE" "$pr")"
   n="$(jq 'length' <<<"$candidates")"
   if [ "$n" -eq 0 ]; then
     jq -cn --argjson c "$candidates" '{selected:null, method:"none", candidates:$c, reason:null}'
-  elif [ "$n" -eq 1 ]; then
-    jq -cn --argjson c "$candidates" '{selected:$c[0], method:"single", candidates:$c, reason:null}'
-  else
-    full_reason="$(jq -r --arg pr "$pr" '
-      "refusing to select a frontend preview for PR #" + $pr + ": " +
-      (length | tostring) + " services share that name — " +
-      ([.[] | ((.name // "unnamed") + " (" + (.id // "no id") + ")")] | join(", ")) +
-      ". No disambiguation oracle exists for the frontend side (#1536)."
-    ' <<<"$candidates")"
-    jq -cn --argjson c "$candidates" --arg reason "$full_reason" \
-      '{selected:null, method:"ambiguous", candidates:$c, reason:$reason}'
+    return 0
   fi
+  if [ "$n" -eq 1 ]; then
+    jq -cn --argjson c "$candidates" '{selected:$c[0], method:"single", candidates:$c, reason:null}'
+    return 0
+  fi
+
+  live_candidates='[]'
+  query_failure=""
+  while IFS= read -r candidate; do
+    candidate_id="$(jq -r '.id // empty' <<<"$candidate")"
+    if [ -z "$candidate_id" ]; then
+      query_failure="a candidate has no Render service id"
+      break
+    fi
+    if ! live_sha="$(latest_live_deploy_sha "$candidate_id")"; then
+      query_failure="could not read deployment status for $candidate_id"
+      break
+    fi
+    if [ -n "$live_sha" ]; then
+      live_candidates="$(jq -cn --argjson current "$live_candidates" --argjson item "$candidate" '$current + [$item]')"
+    fi
+  done < <(jq -c '.[]' <<<"$candidates")
+
+  if [ -z "$query_failure" ]; then
+    live_n="$(jq 'length' <<<"$live_candidates")"
+    if [ "$live_n" -eq 1 ]; then
+      jq -cn --argjson c "$candidates" --argjson live "$live_candidates" \
+        '{selected:$live[0], method:"live-deploy-filtered", candidates:$c, reason:null}'
+      return 0
+    fi
+    query_failure="${live_n} candidates have a live, commit-bound deployment"
+  fi
+
+  full_reason="$(jq -r --arg pr "$pr" --arg why "$query_failure" '
+    "refusing to select a frontend preview for PR #" + $pr + ": " +
+    (length | tostring) + " services share that name — " +
+    ([.[] | ((.name // "unnamed") + " (" + (.id // "no id") + ")")] | join(", ")) +
+    ". " + $why + "; a unique live deployment is required (#1536)."
+  ' <<<"$candidates")"
+  jq -cn --argjson c "$candidates" --arg reason "$full_reason" \
+    '{selected:null, method:"ambiguous", candidates:$c, reason:$reason}'
 }
 
 latest_live_deploy_sha() {

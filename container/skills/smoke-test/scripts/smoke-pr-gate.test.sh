@@ -116,6 +116,7 @@ set -u
 [ -n "${STUB_SERVICES+x}" ] || STUB_SERVICES='[]'
 [ -n "${STUB_BACKEND_DEPLOYS+x}" ] || STUB_BACKEND_DEPLOYS='[]'
 [ -n "${STUB_FRONTEND_DEPLOYS+x}" ] || STUB_FRONTEND_DEPLOYS='[]'
+[ -n "${STUB_DEPLOYS_BY_SERVICE_JSON+x}" ] || STUB_DEPLOYS_BY_SERVICE_JSON=''
 # #1536 bundle-disambiguation oracle fixtures. Only exercised when the gate
 # actually has 2+ backend candidates to disambiguate — every pre-existing
 # scenario has 0 or 1, so these never fire outside the new tests below.
@@ -152,6 +153,11 @@ if printf '%s' "$ARGS" | grep -qF '/healthz'; then
   if [ "$STUB_HEALTHZ_CODE" = "200" ]; then printf '200'; exit 0; else exit 22; fi
 fi
 if printf '%s' "$ARGS" | grep -qF '/deploys'; then
+  SERVICE_ID="$(sed -n 's#.*https://api.render.com/v1/services/\([^/]*\)/deploys.*#\1#p' <<<"$ARGS")"
+  if [ -n "$STUB_DEPLOYS_BY_SERVICE_JSON" ]; then
+    jq -c --arg id "$SERVICE_ID" '.[$id] // []' <<<"$STUB_DEPLOYS_BY_SERVICE_JSON"
+    exit 0
+  fi
   if printf '%s' "$ARGS" | grep -qF 'backend-pr'; then
     printf '%s' "$STUB_BACKEND_DEPLOYS"
   else
@@ -213,7 +219,7 @@ reset_stubs() {
         STUB_COMMIT_TREE STUB_BLOB_RESPONSE STUB_TREE_RESPONSE STUB_COMMIT_RESPONSE \
         STUB_REF_RESPONSE STUB_REF_EXIT STUB_BRANCH_EXISTS STUB_PR_LIST_EXIT \
         STUB_PR_FILES_EXIT STUB_PR_CREATE_EXIT STUB_NEW_PR_NUMBER STUB_SUSPEND_CODE \
-        STUB_HEALTHZ_CODE STUB_SERVICES STUB_BACKEND_DEPLOYS STUB_FRONTEND_DEPLOYS \
+        STUB_HEALTHZ_CODE STUB_SERVICES STUB_BACKEND_DEPLOYS STUB_FRONTEND_DEPLOYS STUB_DEPLOYS_BY_SERVICE_JSON \
         STUB_COMPARE_FILES STUB_COMPARE_EXIT STUB_LOCK_PROBE STUB_LOCK_PROBE_FILE \
         STUB_STATE_PROBE STUB_STATE_PROBE_FILE STUB_SUSPEND_SLEEP STUB_REPO_VIEW_EXIT \
         STUB_LEDGER_JQ_EMPTY_FILE STUB_SUSPEND_LOG \
@@ -1954,6 +1960,29 @@ jq -e '
   (.previewAmbiguityReason | test("srv-frontend-pr-84-a")) and
   .frontendReady == false and .settled == false and .fetchOk == false
 ' <<<"$F_REQ_CHECK" >/dev/null || { echo "36b: a frontend-required PR with frontend twins was not held: $F_REQ_CHECK" >&2; exit 1; }
+
+# --- 36c. A failed duplicate must not freeze a frontend-required PR. Render's
+# deployment state selects the one live, commit-bound candidate, which still
+# has to match the immutable PR head before the gate settles.
+fresh_state
+export STUB_PR_VIEW="{\"number\":85,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$F_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES="[{\"filename\":\"${F_FRONTEND_PREFIX}src/app.tsx\"}]"
+export STUB_RUN_LIST="[{\"headSha\":\"$F_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[\
+{\"id\":\"srv-frontend-pr-85-failed\",\"name\":\"preview-frontend PR #85\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://preview-frontend-pr-85-failed.onrender.com\"}},\
+{\"id\":\"srv-frontend-pr-85-live\",\"name\":\"preview-frontend PR #85\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-frontend-base\"},\"url\":\"https://preview-frontend-pr-85-live.onrender.com\"}},\
+{\"id\":\"srv-backend-pr-85\",\"name\":\"preview-backend PR #85\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://preview-backend-pr-85.onrender.com\"}}]"
+export STUB_DEPLOYS_BY_SERVICE_JSON="{\
+\"srv-frontend-pr-85-failed\":[{\"status\":\"build_failed\",\"commit\":{\"id\":\"$F_SHA\"}}],\
+\"srv-frontend-pr-85-live\":[{\"status\":\"live\",\"commit\":{\"id\":\"$F_SHA\"}}],\
+\"srv-backend-pr-85\":[{\"status\":\"live\",\"commit\":{\"id\":\"$F_SHA\"}}]}"
+export STUB_HEALTHZ_CODE=200
+F_LIVE_CHECK="$(bash "$GATE" check 85 2>/dev/null)"
+jq -e '
+  .frontendRequired == true and .frontendSelectionMethod == "live-deploy-filtered" and
+  .previewAmbiguous == false and .frontendPreviewId == "srv-frontend-pr-85-live" and
+  .frontendReady == true and .backendReady == true and .settled == true and .fetchOk == true
+' <<<"$F_LIVE_CHECK" >/dev/null || { echo "36c: failed frontend duplicate did not resolve to the live candidate: $F_LIVE_CHECK" >&2; exit 1; }
 
 # --- 37. THE mutating site: `finish` refuses to suspend an ambiguous backend
 # (same bundle-oracle resolution as evaluate_pr, applied at the suspend call

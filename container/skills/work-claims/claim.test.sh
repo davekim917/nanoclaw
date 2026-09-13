@@ -145,6 +145,20 @@ jq -e '
   (.note | startswith("resumed parked work from ava: "))
 ' "$CLAIMS_DIR/acme-park.json" >/dev/null || fail "take on parked did not record resume note"
 
+# 17b. An explicit operator pause never lapses into stale work and cannot be
+# resumed by an ordinary take. A deliberate `resume` leaves an audit trail.
+bash "$CLAIM" take acme-pause 2 implementation held for operator >/dev/null
+bash "$CLAIM" pause acme-pause "explicit operator hold; resume only after a new instruction" >/dev/null
+jq -e '.status == "paused" and (.paused_at | endswith("Z"))' "$CLAIMS_DIR/acme-pause.json" >/dev/null \
+  || fail "pause did not write explicit hold state"
+[ "$(bash "$CLAIM" check acme-pause >/dev/null 2>&1; echo $?)" = 3 ] \
+  || fail "paused claim was treated as takeable"
+NANOCLAW_ASSISTANT_NAME=bo bash "$CLAIM" take acme-pause 2 accidental resume >/dev/null 2>&1 \
+  && fail "ordinary take resumed an explicit operator pause"
+NANOCLAW_ASSISTANT_NAME=bo bash "$CLAIM" resume acme-pause 2 explicit operator resume >/dev/null
+jq -e '.owner == "bo" and .status != "paused" and (.note | startswith("resumed explicit operator pause from ava: "))' \
+  "$CLAIMS_DIR/acme-pause.json" >/dev/null || fail "explicit resume did not record the prior hold"
+
 # 18. A sibling may not park another agent's LIVE claim; file untouched.
 NANOCLAW_ASSISTANT_NAME=bo bash "$CLAIM" take acme-park-live 4 owned by bo >/dev/null
 [ "$(bash "$CLAIM" park acme-park-live nope >/dev/null 2>&1; echo $?)" = 3 ] \
@@ -240,12 +254,32 @@ tail -n1 "$CLAIMS_DIR/ledger.ndjson" | jq -e '
   .head_sha == "abc1234" and .reviewer == "reviewer-a" and (.ts | endswith("Z"))
 ' >/dev/null || fail "record-review-start did not write the documented fields"
 
+# A second context cannot spend a duplicate review on the same immutable head.
+[ "$(bash "$CLAIM" record-review-start DEMO-REPO 42 abc1234 reviewer-b >/dev/null 2>&1; echo $?)" = 3 ] \
+  || fail "duplicate same-head review was not refused"
+
 bash "$CLAIM" record-verdict DEMO-REPO 42 abc1234 reviewer-a NO_GO >/dev/null
 tail -n1 "$CLAIMS_DIR/ledger.ndjson" | jq -e '
   .event == "review_verdict" and .repo == "DEMO-REPO" and .pr == 42 and
   .head_sha == "abc1234" and .reviewer == "reviewer-a" and .verdict == "NO_GO" and
   (.ts | endswith("Z"))
 ' >/dev/null || fail "record-verdict did not write the documented fields"
+[ "$(find "$CLAIMS_DIR/review-leases" -name '*.json' -type f | wc -l)" = 0 ] \
+  || fail "verdict did not release its review lease"
+
+# A second review is possible only with a durable reason for the independent
+# risk. It gets a separate lease and each verdict clears only its own lease.
+bash "$CLAIM" record-review-start DEMO-REPO 43 def5678 reviewer-a >/dev/null
+bash "$CLAIM" record-review-start DEMO-REPO 43 def5678 reviewer-b --parallel "migration rollback lens" >/dev/null
+tail -n1 "$CLAIMS_DIR/ledger.ndjson" | jq -e '
+  .event == "review_start" and .reviewer == "reviewer-b" and .parallel_reason == "migration rollback lens"
+' >/dev/null || fail "parallel review did not record its reason"
+[ "$(find "$CLAIMS_DIR/review-leases" -name '*.json' -type f | wc -l)" = 2 ] \
+  || fail "parallel reviews did not hold distinct leases"
+bash "$CLAIM" record-verdict DEMO-REPO 43 def5678 reviewer-a CLEAR >/dev/null
+[ "$(find "$CLAIMS_DIR/review-leases" -name '*.json' -type f | wc -l)" = 1 ] \
+  || fail "first parallel verdict cleared the wrong lease"
+bash "$CLAIM" record-verdict DEMO-REPO 43 def5678 reviewer-b CLEAR >/dev/null
 
 bash "$CLAIM" record-merge DEMO-REPO 42 executor-a reviewer-a abc1234 gates/2026-01-01.jsonl merged >/dev/null
 tail -n1 "$CLAIMS_DIR/ledger.ndjson" | jq -e '

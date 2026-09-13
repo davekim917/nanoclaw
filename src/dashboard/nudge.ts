@@ -65,6 +65,12 @@ export const observatoryNudgeHandler: AuthHandler = async (req, _params, ctx) =>
   // agree by construction — including its classification of state/staleness.
   const claim = readClaims(workgroupId, Date.now()).find((c) => c.slug === claimSlug);
   if (!claim) return json(404, { error: 'claim_not_found' });
+  if (claim.state === 'paused') {
+    return json(409, {
+      error: 'claim_is_paused',
+      hint: 'resume it with an explicit operator instruction before creating a nudge',
+    });
+  }
   if (!claim.threadId) {
     return json(409, {
       error: 'claim_has_no_thread',

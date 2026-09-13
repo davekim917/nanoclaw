@@ -50,8 +50,9 @@ exists without it, `claim.sh thread` backfills it — see Mechanics.
 
 1. **Check before starting** substantive work on a claimable unit.
 2. **Write your claim before starting**, not after.
-3. **Delete your claim on completion or handoff** (release), **or park it**
-   if you're stopping without finishing — see states below.
+3. **Delete your claim on completion or handoff** (release), **park it** if
+   you're stopping without finishing, or use **pause** only for an explicit
+   operator hold — see states below.
 4. **A claim past `claimed_at + ttl_hours` is stale** — anyone may take it
    over. Taking over means overwriting it with your own claim and a `note`
    that says it was a takeover.
@@ -60,15 +61,23 @@ exists without it, `claim.sh thread` backfills it — see Mechanics.
    whatever seam you were mid-work on before resuming — a sibling may have
    taken it over while you were down.
 
-## The four states
+## The five states
 
 `claimed` (live, TTL-bound) → `parked` (off it, NOT done — a third state for
 the case that used to get stuffed into a note like "RELEASED, not done") →
 either `taken` (a sibling or you resumes it, always allowed regardless of who
 parked it) or `released` (deleted, done). A stale claim (past its TTL) is a
-variant of `claimed` that anyone may take over; `parked` overrides TTL
-entirely — a parked claim is never stale, it just sits there until someone
-takes it.
+variant of `claimed` that anyone may take over. `parked` overrides the original
+TTL while its 24-hour handoff grace is active; after that, it becomes stale so a
+forgotten handoff remains visible and eligible for recovery.
+
+`paused` is different. Use it only after an **explicit operator instruction to
+hold the work**. It never lapses into a stale claim, never receives an automatic
+self-heal nudge, and is not free for a sibling to take. A new explicit operator
+instruction must precede `resume`; the command makes that resumption visible in
+the claim history. Do not use `paused` for normal uncertainty, a human question,
+CI, another agent, or an autonomous dependency — those follow the ordinary
+claimed/parked rules above.
 
 ## Park when you're the one blocked on a human
 
@@ -104,12 +113,14 @@ CLAIM=/app/skills/work-claims/claim.sh
 bash $CLAIM check   acme-pr-733
 bash $CLAIM take    acme-pr-733 4 "publish-gate seam, PR #733" --source "QA hand-off run r123"
 bash $CLAIM park    acme-pr-733 "not done: schema done, handlers TODO"
+bash $CLAIM pause   acme-pr-733 "operator explicitly paused this release lane; resume only on a new instruction"
+bash $CLAIM resume  acme-pr-733 4 "operator resumed the release lane in #dispatch"
 bash $CLAIM thread  acme-pr-733            # or: thread acme-pr-733 <thread-id>
 bash $CLAIM release acme-pr-733
 bash $CLAIM list
 ```
 
-`--source` (optional, on `take` and `park`) records where the assignment came
+`--source` (optional, on `take`, `park`, and `pause`) records where the assignment came
 from — a QA hand-off, a human in a channel, a review thread. Everything else
 you might want to record (PR, branch, files) belongs in the note as prose.
 
@@ -172,7 +183,7 @@ anyone reading the directory. If you're stopping without finishing, that's
 `park`, not a note left on a claim you keep — see states above.
 
 `claims/ledger.ndjson` is append-only history: one JSON line per `released`,
-`parked`, `thread`, or `cleared_merged` event, each carrying the full note at that
+`parked`, `paused`, `thread`, or `cleared_merged` event, each carrying the full note at that
 moment. Read it ad hoc with `jq` (e.g. `jq 'select(.slug=="acme-pr-733")' claims/ledger.ndjson`
 for one slug's history) — never edit it, and it never shows up in `list`.
 
@@ -206,6 +217,21 @@ They append to the same `claims/ledger.ndjson`:
 - `claim_owner` is `"none"` when nobody held a claim; `gate_ref` is the
   `gates/<date>.jsonl` this merge was authorized by, or `"auto-lane"` when the
   lane needed no human gate.
+
+`record-review-start` also creates a one-hour review lease keyed by repository,
+PR, and exact head. A second watcher or desk session must reuse that active
+receipt instead of launching the same review again. A genuinely additional
+independent lens is allowed only with a concrete reason:
+
+```bash
+bash $CLAIM record-review-start DEMO-REPO 42 abc1234 reviewer-b --parallel "migration rollback lens"
+```
+
+Record the verdict with the same repository, PR, head, and reviewer to release
+that reviewer's lease. A reviewer that crashes or cannot run expires after the
+one-hour lease; record the failed transport in the task/run record before a new
+attempt. Do not use `--parallel` to bypass a duplicate review: it is for a named
+additional risk, not another general reading of the same artifact.
 
 **The ledger is attribution. The `Release policy` status is enforcement.**
 Recording a merge does not authorize one and never will — `ops/release-policy.py`

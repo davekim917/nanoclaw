@@ -156,6 +156,19 @@ describe('observatoryNudgeHandler', () => {
     expect(prompt).toContain('state: parked · 2h since parked');
   });
 
+  it('refuses to turn an explicit operator pause into a recovery task', async () => {
+    claimsAre([{ ...CLAIM, state: 'paused', staleMs: 2 * 3600000 }]);
+
+    const res = (await nudge())!;
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({
+      error: 'claim_is_paused',
+      hint: 'resume it with an explicit operator instruction before creating a nudge',
+    });
+    expect(mockDispatch).not.toHaveBeenCalled();
+  });
+
   it('falls back to the user id when the pusher has no display name', async () => {
     claimsAre([CLAIM]);
     getRawDb().prepare(`INSERT INTO user_roles (user_id, role, agent_group_id) VALUES ('u-noname','owner',NULL)`).run();

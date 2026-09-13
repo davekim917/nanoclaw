@@ -28,14 +28,16 @@ usage() {
   cat >&2 <<'USAGE'
 usage:
   claim.sh check   <slug>
-  claim.sh take    <slug> <ttl_hours> <note...>   [--takeover] [--source <where this came from>]
+  claim.sh take    <slug> <ttl_hours> <note...>   [--takeover] [--resume] [--source <where this came from>]
   claim.sh park    <slug> <note...>               [--source <where this came from>]
+  claim.sh pause   <slug> <reason...>             [--source <where this came from>]
+  claim.sh resume  <slug> <ttl_hours> <note...>   [--source <where this came from>]
   claim.sh thread  <slug> [<thread-id>]           (defaults to $NANOCLAW_THREAD_ID)
   claim.sh release <slug> [--merged-pr <n>]
   claim.sh list
 
 attribution events (append-only, claims/ledger.ndjson):
-  claim.sh record-review-start <repo> <pr> <head_sha> <reviewer>
+  claim.sh record-review-start <repo> <pr> <head_sha> <reviewer> [--parallel <risk reason>]
   claim.sh record-verdict      <repo> <pr> <head_sha> <reviewer> <verdict>
   claim.sh record-merge        <repo> <pr> <executor> <claim_owner> <head_sha> <gate_ref> <result>
 
@@ -45,6 +47,12 @@ USAGE
 }
 
 now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# A review has one owner per repo/PR/head by default. The lease prevents a
+# watcher and an interactive desk session from spending two frontier reviews on
+# the same immutable artifact. A crashed reviewer expires quickly enough to be
+# retried, while a still-running one remains visible to the next dispatcher.
+REVIEW_LEASE_TTL_SECONDS=3600
 
 # No workgroup tree means this install has no shared FS — SKILL.md says skip
 # the convention rather than fail, so callers can invoke this unconditionally.
@@ -96,7 +104,7 @@ ledger_append() {
   ledger_write_line "$line" "for $slug — claim left in place"
 }
 
-# Echoes: state<TAB>owner<TAB>note   where state is unclaimed|yours|live|stale|parked
+# Echoes: state<TAB>owner<TAB>note   where state is unclaimed|yours|live|stale|parked|paused
 inspect() {
   local f="$1" owner claimed_at ttl expires now note status
   if [ ! -f "$f" ]; then printf 'unclaimed\t\t\n'; return; fi
@@ -124,6 +132,12 @@ inspect() {
       fi
     fi
     printf 'parked\t%s\t%s\n' "$owner" "$note"; return
+  fi
+
+  # A paused claim is an explicit operator hold, not a handoff offer. It has
+  # no expiry path: only a deliberate resume may return it to active work.
+  if [ "$status" = "paused" ]; then
+    printf 'paused\t%s\t%s\n' "$owner" "$note"; return
   fi
 
   # A claim with no parseable expiry is treated as stale, never as an
@@ -154,6 +168,7 @@ cmd_check() {
     stale)     echo "STALE — was $owner: $note — you may take it over"; exit 0 ;;
     live)      echo "LIVE — held by $owner: $note — do not start this"; exit 3 ;;
     parked)    echo "PARKED — was $owner: $note — free to take"; exit 0 ;;
+    paused)    echo "PAUSED — held by $owner: $note — resume only after an explicit operator instruction"; exit 3 ;;
   esac
 }
 
@@ -161,10 +176,11 @@ cmd_take() {
   local slug="${1:-}" ttl="${2:-}"; shift 2 2>/dev/null || usage
   [ -n "$slug" ] && [ -n "$ttl" ] || usage
 
-  local takeover=0 source="" note_parts=()
+  local takeover=0 resume=0 source="" note_parts=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --takeover) takeover=1; shift ;;
+      --resume)   resume=1; shift ;;
       --source)   source="${2:-}"; shift 2 ;;
       *)          note_parts+=("$1"); shift ;;
     esac
@@ -178,6 +194,14 @@ cmd_take() {
   f="$(file_for "$slug")"
   IFS=$'\t' read -r state owner _ <<<"$(inspect "$f")"
 
+  if [ "$state" = "paused" ] && [ "$resume" -ne 1 ]; then
+    echo "REFUSED — $slug is explicitly paused by the operator. Resume only after a new explicit instruction, with --resume." >&2
+    exit 3
+  fi
+  if [ "$state" != "paused" ] && [ "$resume" -eq 1 ]; then
+    die "--resume applies only to an explicitly paused claim"
+  fi
+
   if [ "$state" = "live" ] && [ "$takeover" -ne 1 ]; then
     echo "REFUSED — $slug is held live by $owner. Never take live work off a sibling." >&2
     echo "If they are genuinely gone, wait for it to go stale or escalate; --takeover only" >&2
@@ -187,6 +211,7 @@ cmd_take() {
   [ "$state" = "live" ] && note="TAKEOVER from $owner: $note"
   [ "$state" = "stale" ] && note="took over stale claim from $owner: $note"
   [ "$state" = "parked" ] && note="resumed parked work from $owner: $note"
+  [ "$state" = "paused" ] && note="resumed explicit operator pause from $owner: $note"
 
   local tmp
   tmp="$(mktemp "$CLAIMS_DIR/.tmp.XXXXXX")"
@@ -205,6 +230,12 @@ cmd_take() {
   mv "$tmp" "$f"   # same-directory rename: no reader ever sees a partial file
 
   echo "claimed $slug for $(me), ttl ${ttl}h"
+}
+
+cmd_resume() {
+  # Keep the atomic claim rewrite in cmd_take while making a deliberate
+  # resumption explicit in both the command and resulting claim note.
+  cmd_take "$@" --resume
 }
 
 cmd_release() {
@@ -311,6 +342,51 @@ cmd_park() {
   echo "parked $slug"
 }
 
+cmd_pause() {
+  local slug="${1:-}"; shift || usage
+  [ -n "$slug" ] || usage
+  local source="" note_parts=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --source) source="${2:-}"; shift 2 ;;
+      *)        note_parts+=("$1"); shift ;;
+    esac
+  done
+  local note="${note_parts[*]:-}"
+  [ -n "$note" ] || die "a pause reason is required — name the explicit operator direction and resume condition"
+
+  require_workgroup
+  local f owner claimed_at ttl_hours thread_id
+  f="$(file_for "$slug")"
+  [ -f "$f" ] || die "no claim at $slug — pause an existing claimed unit, never an unclaimed slug"
+  owner="$(jq -r '.owner // "unknown"' "$f")"
+  if [ "$owner" != "$(me)" ]; then
+    echo "REFUSED — $slug belongs to $owner. Only the current owner may record an operator pause." >&2
+    exit 3
+  fi
+  claimed_at="$(jq -r '.claimed_at // empty' "$f")"
+  ttl_hours="$(jq -r '.ttl_hours // empty' "$f")"
+  thread_id="$(jq -r '.thread_id // empty' "$f")"
+  [ -n "$source" ] || source="$(jq -r '.source // empty' "$f")"
+  [ -n "$claimed_at" ] || claimed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  local tmp
+  tmp="$(mktemp "$CLAIMS_DIR/.tmp.XXXXXX")"
+  jq -n --arg owner "$owner" --arg sid "$(hostname)" \
+        --arg tid "$thread_id" --arg claimed_at "$claimed_at" \
+        --arg paused_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --argjson ttl "${ttl_hours:-null}" --arg note "$note" --arg source "$source" \
+     '{owner:$owner, session_id:$sid, claimed_at:$claimed_at, status:"paused",
+       paused_at:$paused_at, note:$note}
+      + (if $ttl == null then {} else {ttl_hours:$ttl} end)
+      + (if $tid == "" then {} else {thread_id:$tid} end)
+      + (if $source == "" then {} else {source:$source} end)' > "$tmp"
+
+  ledger_append paused "$slug" "$owner" "$note" "$claimed_at" "$thread_id" ""
+  mv "$tmp" "$f"   # same-directory rename: no reader sees a partial file
+  echo "paused $slug"
+}
+
 # take records thread_id once, at claim time, and only if the claiming session
 # had one. A relayer claiming on someone else's behalf, or a task session, has
 # no thread — and the agent that later works the claim IN a thread had no way to
@@ -372,25 +448,101 @@ require_pr() {
   case "$1" in ''|*[!0-9]*) die "pr must be a bare number (1296, not '#1296' or a url)" ;; esac
 }
 
+review_lease_key() {
+  # A hash keeps untrusted repo/reviewer strings out of filenames while the
+  # complete identity remains auditable inside the JSON lease.
+  printf '%s\037%s\037%s\037%s' "$1" "$2" "$3" "$4" | sha256sum | awk '{print $1}'
+}
+
+review_lease_active() {
+  local f="$1" now="$2" expires
+  expires="$(jq -r '.expires_at // empty' "$f" 2>/dev/null)" || return 2
+  [ -n "$expires" ] || return 2
+  expires="$(date -u -d "$expires" +%s 2>/dev/null)" || return 2
+  [ "$expires" -gt "$now" ]
+}
+
 cmd_record_review_start() {
-  require_args 4 record-review-start "$@"
+  local parallel_reason=""
+  if [ "${5:-}" = "--parallel" ]; then
+    parallel_reason="${6:-}"
+    [ -n "$parallel_reason" ] || die "--parallel requires the concrete risk that needs another reviewer"
+    [ "$#" -eq 6 ] || usage
+    set -- "$1" "$2" "$3" "$4"
+  else
+    require_args 4 record-review-start "$@"
+  fi
   require_pr "$2"
   require_workgroup
-  ledger_write_line "$(jq -nc --arg ts "$(now_utc)" --arg repo "$1" --argjson pr "$2" \
-    --arg head_sha "$3" --arg reviewer "$4" \
-    '{ts:$ts, event:"review_start", repo:$repo, pr:$pr, head_sha:$head_sha, reviewer:$reviewer}')"
-  echo "recorded review_start: $1#$2 @$3 by $4"
+  local repo="$1" pr="$2" head="$3" reviewer="$4" lease_dir lease_key
+  lease_dir="$CLAIMS_DIR/review-leases"
+  lease_key="$(review_lease_key "$repo" "$pr" "$head" "$reviewer")"
+  mkdir -p "$lease_dir"
+
+  (
+    flock -x 200
+    local now_epoch existing existing_repo existing_pr existing_head existing_reviewer status
+    now_epoch="$(date -u +%s)"
+    for existing in "$lease_dir"/*.json; do
+      [ -f "$existing" ] || continue
+      existing_repo="$(jq -r '.repo // empty' "$existing" 2>/dev/null)" || { echo "REFUSED — malformed review lease $existing" >&2; exit 2; }
+      existing_pr="$(jq -r '.pr // empty' "$existing" 2>/dev/null)" || { echo "REFUSED — malformed review lease $existing" >&2; exit 2; }
+      existing_head="$(jq -r '.head_sha // empty' "$existing" 2>/dev/null)" || { echo "REFUSED — malformed review lease $existing" >&2; exit 2; }
+      [ "$existing_repo" = "$repo" ] && [ "$existing_pr" = "$pr" ] && [ "$existing_head" = "$head" ] || continue
+      if review_lease_active "$existing" "$now_epoch"; then
+        existing_reviewer="$(jq -r '.reviewer // "unknown"' "$existing")"
+        if [ -z "$parallel_reason" ]; then
+          echo "REFUSED — $repo#$pr @$head already has an active review by $existing_reviewer. Reuse its receipt, or pass --parallel with the concrete independent risk." >&2
+          exit 3
+        fi
+      else
+        status=$?
+        if [ "$status" -eq 2 ]; then
+          echo "REFUSED — malformed review lease $existing" >&2
+          exit 2
+        fi
+        rm -f "$existing"
+      fi
+    done
+
+    local started_at expires_at line tmp
+    started_at="$(now_utc)"
+    expires_at="$(date -u -d "+ $REVIEW_LEASE_TTL_SECONDS seconds" +%Y-%m-%dT%H:%M:%SZ)"
+    line="$(jq -nc --arg ts "$started_at" --arg repo "$repo" --argjson pr "$pr" \
+      --arg head_sha "$head" --arg reviewer "$reviewer" --arg parallel_reason "$parallel_reason" \
+      '{ts:$ts, event:"review_start", repo:$repo, pr:$pr, head_sha:$head_sha, reviewer:$reviewer}
+       + (if $parallel_reason == "" then {} else {parallel_reason:$parallel_reason} end)')"
+    ledger_write_line "$line"
+    tmp="$(mktemp "$lease_dir/.tmp.XXXXXX")"
+    jq -n --arg repo "$repo" --argjson pr "$pr" --arg head_sha "$head" \
+      --arg reviewer "$reviewer" --arg owner "$(me)" --arg started_at "$started_at" --arg expires_at "$expires_at" \
+      '{repo:$repo, pr:$pr, head_sha:$head_sha, reviewer:$reviewer, owner:$owner,
+        started_at:$started_at, expires_at:$expires_at}' > "$tmp"
+    mv "$tmp" "$lease_dir/$lease_key.json"
+  ) 200>"$CLAIMS_DIR/.review-leases.lock"
+  echo "recorded review_start: $repo#$pr @$head by $reviewer"
 }
 
 cmd_record_verdict() {
   require_args 5 record-verdict "$@"
   require_pr "$2"
   require_workgroup
-  ledger_write_line "$(jq -nc --arg ts "$(now_utc)" --arg repo "$1" --argjson pr "$2" \
-    --arg head_sha "$3" --arg reviewer "$4" --arg verdict "$5" \
-    '{ts:$ts, event:"review_verdict", repo:$repo, pr:$pr, head_sha:$head_sha,
-      reviewer:$reviewer, verdict:$verdict}')"
-  echo "recorded review_verdict: $1#$2 @$3 by $4 — $5"
+  local repo="$1" pr="$2" head="$3" reviewer="$4" verdict="$5" lease_dir lease_key
+  lease_dir="$CLAIMS_DIR/review-leases"
+  lease_key="$(review_lease_key "$repo" "$pr" "$head" "$reviewer")"
+  mkdir -p "$lease_dir"
+
+  (
+    flock -x 200
+    ledger_write_line "$(jq -nc --arg ts "$(now_utc)" --arg repo "$repo" --argjson pr "$pr" \
+      --arg head_sha "$head" --arg reviewer "$reviewer" --arg verdict "$verdict" \
+      '{ts:$ts, event:"review_verdict", repo:$repo, pr:$pr, head_sha:$head_sha,
+        reviewer:$reviewer, verdict:$verdict}')"
+    # Legacy review records may predate leases. Preserve attribution rather than
+    # failing the verdict record; every new dispatch is still required to claim.
+    rm -f "$lease_dir/$lease_key.json"
+  ) 200>"$CLAIMS_DIR/.review-leases.lock"
+  echo "recorded review_verdict: $repo#$pr @$head by $reviewer — $verdict"
 }
 
 # gate_ref is the releases/gates/<date>.jsonl reference this merge was authorized
@@ -425,6 +577,8 @@ case "${1:-}" in
   check)   shift; cmd_check "$@" ;;
   take)    shift; cmd_take "$@" ;;
   park)    shift; cmd_park "$@" ;;
+  pause)   shift; cmd_pause "$@" ;;
+  resume)  shift; cmd_resume "$@" ;;
   thread)  shift; cmd_thread "$@" ;;
   release) shift; cmd_release "$@" ;;
   list)    shift; cmd_list "$@" ;;

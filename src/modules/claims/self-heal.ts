@@ -81,6 +81,11 @@ export function isWaitingOnHuman(note: string): boolean {
   return /^\s*waiting on\b/i.test(note);
 }
 
+/** A deliberate operator hold is not a stale handoff and never self-heals. */
+export function isExplicitlyPaused(raw: { status?: unknown }): boolean {
+  return typeof raw.status === 'string' && raw.status.trim().toLowerCase() === 'paused';
+}
+
 /**
  * How much note a park has to carry to count as a handoff rather than a walk-away.
  *
@@ -209,7 +214,7 @@ export function namedHuman(note: string): string {
  */
 function decideHumanBlocked(
   claim: BoardClaim,
-  raw: SelfHealStamps & { note?: unknown },
+  raw: SelfHealStamps & { note?: unknown; status?: unknown },
   now: number,
 ): SelfHealDecision {
   if (claim.staleMs <= PARK_GRACE_MS) return { action: 'none', reason: 'waiting-on-human' };
@@ -228,10 +233,11 @@ function decideHumanBlocked(
  */
 export function decideSelfHeal(
   claim: BoardClaim,
-  raw: SelfHealStamps & { note?: unknown },
+  raw: SelfHealStamps & { note?: unknown; status?: unknown },
   now: number,
 ): SelfHealDecision {
   if (claim.state !== 'stale') return { action: 'none', reason: 'not-stale' };
+  if (isExplicitlyPaused(raw)) return { action: 'none', reason: 'explicitly-paused' };
   const note = typeof raw.note === 'string' ? raw.note : '';
   if (isWaitingOnHuman(note)) return decideHumanBlocked(claim, raw, now);
   if (isHandedOffPark(raw)) return { action: 'none', reason: 'parked-with-handoff' };
@@ -862,9 +868,9 @@ export async function sweepClaimsSelfHeal(
       const found = resolveAndReadClaim('self-heal', root, workgroupId, claim.slug);
       if (found === null) continue; // already logged — directory or file, see resolveAndReadClaim
 
-      let raw: SelfHealStamps & { note?: unknown };
+      let raw: SelfHealStamps & { note?: unknown; status?: unknown };
       try {
-        raw = JSON.parse(found.text) as SelfHealStamps & { note?: unknown };
+        raw = JSON.parse(found.text) as SelfHealStamps & { note?: unknown; status?: unknown };
       } catch (err) {
         log.warn('self-heal: unparseable claim, skipping', { file: found.file, err });
         continue;
