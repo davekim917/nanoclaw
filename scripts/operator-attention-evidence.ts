@@ -42,6 +42,7 @@ import { computeWeeklyReport, findFollowUp, findRevert, isoWeekKey, type PullReq
 
 const DEFAULT_SAMPLE_LIMIT = 10;
 const DEFAULT_FOLLOWUP_DAYS = 14;
+const REVIEW_OUTCOME_BASE_BRANCH = 'main' as const;
 
 export interface CandidateSample {
   source: 'inbound' | 'choice_receipts';
@@ -100,6 +101,8 @@ export interface ReviewOutcomeRow {
 export interface ReviewOutcomeEvidence {
   followupDays: number;
   until: string;
+  baseBranch: typeof REVIEW_OUTCOME_BASE_BRANCH;
+  populationDefinition: 'targets and relationship candidates merged into main within the half-open review window';
   matureTargetPrs: number;
   immatureTargetPrs: number;
   rows: ReviewOutcomeRow[];
@@ -662,7 +665,17 @@ export function extractReviewOutcomeEvidence(
   // The half-open window is applied before both target and follow-up selection.
   // In particular, a PR fetched past `until` cannot mature or supply evidence
   // for an earlier target in this frozen report.
-  const eligiblePrs = prs.filter((pr) => isStrictIsoUtc(pr.mergedAt) && isIsoInWindow(pr.mergedAt, since, until));
+  // Match `computeWeeklyReport`'s population exactly: it begins by retaining
+  // only PRs whose base is `main` (`scripts/review-outcomes.ts:1310-1317`).
+  // Apply that scope before selecting targets OR relationship candidates so a
+  // PR on another base cannot borrow a main PR's week maturity or link into a
+  // main target's evidence.
+  const eligiblePrs = prs.filter(
+    (pr) =>
+      pr.baseRefName === REVIEW_OUTCOME_BASE_BRANCH &&
+      isStrictIsoUtc(pr.mergedAt) &&
+      isIsoInWindow(pr.mergedAt, since, until),
+  );
 
   // `computeWeeklyReport` owns the established 14-day end-of-week maturity
   // definition (`scripts/review-outcomes.ts:1266-1295`); this only reuses it.
@@ -727,6 +740,8 @@ export function extractReviewOutcomeEvidence(
   return {
     followupDays,
     until,
+    baseBranch: REVIEW_OUTCOME_BASE_BRANCH,
+    populationDefinition: 'targets and relationship candidates merged into main within the half-open review window',
     matureTargetPrs,
     immatureTargetPrs,
     rows,

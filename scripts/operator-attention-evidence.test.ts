@@ -635,7 +635,94 @@ describe('extractReviewOutcomeEvidence', () => {
     });
     expect(report.incidentCustomerDefectRows).toEqual([]);
     expect(report.incidentCustomerDefectStatus).toBe('unavailable_no_machine_readable_linkage');
+    expect(report.baseBranch).toBe('main');
+    expect(report.populationDefinition).toBe(
+      'targets and relationship candidates merged into main within the half-open review window',
+    );
     expect(report.rows.some((row) => row.targetPr === 6 || row.evidencePr === 6)).toBe(false);
+  });
+
+  it('uses the same main-only population for targets, relations, and weekly maturity', () => {
+    const mainTarget = pr({ number: 20, mergedAt: '2026-09-01T12:00:00.000Z', files: ['src/main.ts'] });
+    const mainFollowUp = pr({
+      number: 21,
+      title: 'fix: main follow-up',
+      body: 'Fixes-PR: #20',
+      mergedAt: '2026-09-02T12:00:00.000Z',
+    });
+    const developTarget = pr({
+      number: 30,
+      baseRefName: 'develop',
+      mergedAt: '2026-09-01T12:00:00.000Z',
+      files: ['src/develop.ts'],
+    });
+    const developFollowUp = pr({
+      number: 31,
+      baseRefName: 'develop',
+      title: 'fix: develop follow-up',
+      body: 'Fixes-PR: #30',
+      mergedAt: '2026-09-02T12:00:00.000Z',
+    });
+    const developCrossBaseLink = pr({
+      number: 32,
+      baseRefName: 'develop',
+      title: 'fix: cross-base link must not count',
+      body: 'Fixes-PR: #20',
+      mergedAt: '2026-09-03T12:00:00.000Z',
+    });
+    const initial = extractReviewOutcomeEvidence(
+      [mainTarget, mainFollowUp, developTarget, developFollowUp, developCrossBaseLink],
+      SINCE,
+      UNTIL,
+    );
+    const mainRelation = initial.rows.find((row) => row.targetPr === 20 && row.kind === 'fixes_pr_proxy');
+    expect(mainRelation?.maturity).toBe('mature');
+    expect(initial.rows.some((row) => row.targetPr === 30 || row.evidencePr === 31)).toBe(false);
+    expect(initial.rows.some((row) => row.evidencePr === 32)).toBe(false);
+    expect(initial.matureTargetPrs).toBe(2);
+    expect(initial.immatureTargetPrs).toBe(0);
+
+    const withUnrelatedMain = extractReviewOutcomeEvidence(
+      [
+        mainTarget,
+        mainFollowUp,
+        developTarget,
+        developFollowUp,
+        developCrossBaseLink,
+        pr({ number: 99, mergedAt: developTarget.mergedAt, files: ['src/unrelated.ts'] }),
+      ],
+      SINCE,
+      UNTIL,
+    );
+    expect(withUnrelatedMain.rows.find((row) => row.targetPr === 20 && row.kind === 'fixes_pr_proxy')?.maturity).toBe(
+      mainRelation?.maturity,
+    );
+    expect(withUnrelatedMain.rows.some((row) => row.targetPr === 30 || row.evidencePr === 31)).toBe(false);
+  });
+
+  it('explicitly excludes a non-main-only population instead of reporting it immature', () => {
+    const report = extractReviewOutcomeEvidence(
+      [
+        pr({ number: 40, baseRefName: 'develop', mergedAt: '2026-09-01T12:00:00.000Z' }),
+        pr({
+          number: 41,
+          baseRefName: 'release',
+          title: 'fix: non-main relation',
+          body: 'Fixes-PR: #40',
+          mergedAt: '2026-09-02T12:00:00.000Z',
+        }),
+      ],
+      SINCE,
+      UNTIL,
+    );
+
+    expect(report).toMatchObject({
+      baseBranch: 'main',
+      populationDefinition: 'targets and relationship candidates merged into main within the half-open review window',
+      matureTargetPrs: 0,
+      immatureTargetPrs: 0,
+      rows: [],
+    });
   });
 });
 
