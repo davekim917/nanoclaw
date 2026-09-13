@@ -8,8 +8,17 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 G="$SCRIPT_DIR/smoke-develop-gate.sh"
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+mkdir -p "$T/shared" "$T/bin"
+cat >"$T/bin/mountpoint" <<'STUB'
+#!/usr/bin/env bash
+[ "${1:-}" = "-q" ] && [ "${2:-}" = "${SMOKE_GATE_SHARED_ROOT:-}" ]
+STUB
+chmod +x "$T/bin/mountpoint"
 export SMOKE_GATE_STATE_DIR="$T/state" SMOKE_GATE_ACTIVE_FILE="$T/run-active.json" \
-       SMOKE_GATE_HOLD_FILE="$T/develop-hold.json"
+       SMOKE_GATE_HOLD_FILE="$T/develop-hold.json" \
+       SMOKE_GATE_SHARED_ROOT="$T/shared" \
+       SMOKE_GATE_LEASE_DIR="$T/shared/qa-coordinator/leases"
+export PATH="$T/bin:$PATH"
 SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 SHB=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 FAIL=0

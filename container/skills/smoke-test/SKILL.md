@@ -118,16 +118,19 @@ active-slot shape alongside `pr` and `develop`. `task-progress <run-id>`
 renews it during a long run and `task-release <run-id>` drops it when the run
 ends; `--takeover` on `task-claim` may reassign a live lease to a new owner,
 same as a PR claim, but the deploy SHA itself binds **permanently** at claim
-and has no takeover escape — a different build always gets a different run id.
-A finished run id is terminal: once `task-finish` has recorded a verdict,
-`task-claim` refuses that id for every build, the claimed one included. The
-one re-claim it still accepts is on the verdict's own SHA after a
-`task-finish` died before committing, so that finish can resume.
+in a retained shared `task-binding-<run-id>.json` and has no takeover escape —
+a different build always gets a different run id. Release removes the live
+lease but retains that binding. A finished run id is terminal: once
+`task-finish` has recorded its exact verdict facts in the shared binding,
+`task-claim` refuses that id for every build, the claimed one included. An
+interrupted exact `task-finish` resumes directly, including after its lease was
+already removed; it does not re-claim a terminal identity.
 `task-finish <run-id> <deploy-sha> <verdict>` is the terminal step: only the
 run's current lease owner may call it, only for the SHA it claimed, and it
-writes the run's write-once verdict and releases the lease in the same
-step — same reconciliation refusal as `finish` if a second, different verdict
-is ever attempted for the same run.
+writes the private write-once verdict, commits matching terminal facts to the
+shared binding, releases the lease, and commits private terminal state. Exact
+retries reconcile a crash between those writes without changing the verdict,
+timestamp, or digest; a second, different verdict is always refused.
 
 `smoke-run-scaffold.sh` and `smoke-evidence-barrier.sh` are always invoked
 directly (never through a wrapper) and read those same two env vars from
@@ -1856,10 +1859,11 @@ gate's `check`), `claim <run-id> <pr> <sha> [owner-token]`,
 `finish` take no PR argument — the gate recovers it by locating whichever
 PR's state currently holds that run id. That resolution is only unambiguous
 if run ids are unique across the whole gate, not just within one PR, so
-`claim` enforces it: it refuses a run id that is already active on a
-*different* PR or on an active task-scoped run, and `task-claim` refuses one
-any PR or develop campaign holds — both under the gate's control lock — so a
-caller-chosen id (from `claim`) is always safe to pass
+`claim` enforces it: it refuses a run id retained by a task-scoped run, and
+`task-claim` refuses one any active PR or develop campaign holds. The task/PR
+checks use the shared ownership namespace and its per-run lock, rather than
+depending on one container's private state directory, so a caller-chosen id
+(from `claim`) is always safe to pass
 to `progress`/`release`/`finish` exactly like a gate-generated one.
 
 `poll` claims the shared coordinator lease before it emits
@@ -1875,11 +1879,14 @@ stale process impersonate the new owner.
 The shared lease lives under `/workspace/workgroup/qa-coordinator/leases`,
 separate from each container's private `SMOKE_GATE_STATE_DIR`. Missing,
 unmounted, aliased-to-private, malformed, unwritable, or un-lockable lease
-storage fails closed. `claim`, `progress`, `release`, `challenger-timeout`, and
-`finish` validate the caller token under shared locks. `finish` holds those
-locks across preview suspension, run/PR verdict receipts, promotion hold,
-publish record, ledger append, lease removal, and the terminal state commit;
-an expired predecessor therefore cannot publish after a successor reclaims.
+storage fails closed. Task identities and exact terminal facts remain there in
+retained `task-binding-<run-id>.json` records even when a private gate state or
+verdict is invisible to another container. `claim`, `progress`, `release`,
+`challenger-timeout`, and `finish` validate the caller token under shared
+locks. `finish` holds those locks across preview suspension, run/PR verdict
+receipts, promotion hold, publish record, ledger append, lease removal, and the
+terminal state commit; an expired predecessor therefore cannot publish after
+a successor reclaims.
 One shared per-PR binding points to the current run and owner while the run
 lease remains the only TTL authority. The lease also binds that run id to its
 PR, so the same owner token cannot reuse one live run id on a different PR.

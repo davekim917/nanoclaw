@@ -285,6 +285,32 @@ jq -e --arg owner "$POLL_OWNER" '.owner == $owner' "$SMOKE_GATE_LEASE_DIR/lease-
 # Same head, immediately after claiming: already active, no re-wake.
 bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_candidates"' >/dev/null
 
+# Automatic poll is also a claim producer. Pre-bind every run id it can mint
+# during this short hermetic call; it must refuse before PR lease/authority or
+# private state is written.
+fresh_state
+AUTO_SHA="$(sha d)"
+export SMOKE_GATE_RUN_PREFIX=bound
+export STUB_PR_LIST="[{\"number\":142,\"headRefOid\":\"$AUTO_SHA\",\"headRefName\":\"feature/x\"}]"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$AUTO_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES='[{"id":"srv-backend-pr-142","name":"XZO-DEV-BACKEND PR #142","serviceDetails":{"parentServer":{"id":"srv-backend-base"},"url":"https://xzo-dev-backend-pr-142.onrender.com"}}]'
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$AUTO_SHA\"}}]"
+AUTO_NOW="$(date -u +%s)"
+mkdir -p "$SMOKE_GATE_LEASE_DIR"
+for OFFSET in $(seq -2 12); do
+  AUTO_RUN="bound-pr142-${AUTO_SHA:0:12}-$(date -u -d "@$((AUTO_NOW + OFFSET))" +%Y%m%dT%H%M%SZ)"
+  jq -cn --arg run "$AUTO_RUN" --arg sha "$AUTO_SHA" \
+    '{schemaVersion:1,kind:"task-binding",runId:$run,deploySha:$sha,boundAt:"2026-09-13T00:00:00Z",terminal:null}' \
+    >"$SMOKE_GATE_LEASE_DIR/task-binding-$AUTO_RUN.json"
+done
+AUTO_POLL_OUT="$(bash "$GATE" poll)"
+jq -e '.ok == false and .wakeAgent == true and .data.trigger == "coordinator_lease_unavailable" and
+       (.data.detail.error | test("task-scoped"))' <<<"$AUTO_POLL_OUT" >/dev/null || {
+  echo "automatic PR poll ignored shared task binding: $AUTO_POLL_OUT" >&2; exit 1; }
+[ ! -e "$STATE_DIR/pr-142-state.json" ] && [ ! -e "$SMOKE_GATE_LEASE_DIR/pr-142-authority.json" ]
+unset SMOKE_GATE_RUN_PREFIX
+
 # --- 3a. Target-aware preflight: the gate exports SMOKE_GATE_PREFLIGHT_TARGET_URL
 # for THIS settle candidate's own preview before invoking PREFLIGHT_CMD — the
 # whole point of routing the check to the right host instead of skipping it
@@ -1467,11 +1493,18 @@ MISSING_ROOT="$STATE_DIR/no-such-shared-root"
 BAD="$(SMOKE_GATE_SHARED_ROOT="$MISSING_ROOT" SMOKE_GATE_LEASE_DIR="$MISSING_ROOT/leases" \
   bash "$GATE" claim run-missing 123 "$BAD_SHA" owner-a 2>/dev/null || true)"
 jq -e '.ok == false and (.error | test("missing"))' <<<"$BAD" >/dev/null
+BAD_TASK="$(SMOKE_GATE_SHARED_ROOT="$MISSING_ROOT" SMOKE_GATE_LEASE_DIR="$MISSING_ROOT/leases" \
+  bash "$GATE" task-claim run-missing-task "$BAD_SHA" owner-a 2>/dev/null || true)"
+jq -e '.ok == false and (.error | test("missing"))' <<<"$BAD_TASK" >/dev/null
+BAD_DEV="$(SMOKE_GATE_SHARED_ROOT="$MISSING_ROOT" SMOKE_GATE_LEASE_DIR="$MISSING_ROOT/leases" \
+  bash "$SCRIPT_DIR/smoke-develop-gate.sh" claim run-missing-develop "$BAD_SHA" 2>/dev/null || true)"
+jq -e '.ok == false and (.error | test("missing"))' <<<"$BAD_DEV" >/dev/null
 ln -s "$STATE_DIR" "$TEST_SHARED_ROOT/private-alias"
 BAD="$(SMOKE_GATE_LEASE_DIR="$TEST_SHARED_ROOT/private-alias/leases" \
   bash "$GATE" claim run-private-alias 124 "$BAD_SHA" owner-a 2>/dev/null || true)"
 jq -e '.ok == false and (.error | test("non-shared|outside shared"))' <<<"$BAD" >/dev/null
-[ ! -e "$STATE_DIR/pr-123-state.json" ] && [ ! -e "$STATE_DIR/pr-124-state.json" ]
+[ ! -e "$STATE_DIR/pr-123-state.json" ] && [ ! -e "$STATE_DIR/pr-124-state.json" ] &&
+  [ ! -e "$STATE_DIR/task-run-missing-task-state.json" ]
 
 # A present binding whose referenced lease is corrupt or owner-inconsistent is
 # unknown authority, never an expired slot available for replacement.
@@ -2943,6 +2976,29 @@ chmod 700 "$STATE_DIR"
 jq -e '.ok == false and (.error | test("private task slot"))' <<<"$F1_NEW_OUT" >/dev/null
 [ ! -e "$SMOKE_GATE_LEASE_DIR/task-lease-run-f1-new.json" ] ||
   { echo "F1: a failed first claim left an orphan task lease behind" >&2; exit 1; }
+[ ! -e "$SMOKE_GATE_LEASE_DIR/task-binding-run-f1-new.json" ] ||
+  { echo "F1: a failed first claim left an orphan permanent binding behind" >&2; exit 1; }
+
+# Binding creation and live-lease creation are one claim transaction. Inject a
+# selective task-lease mv failure after the binding write and prove both shared
+# records and the private slot roll back to absence.
+F1_LEASE_BIN="$STUB_BIN/task-lease-write-fail"
+mkdir -p "$F1_LEASE_BIN"
+cat >"$F1_LEASE_BIN/mv" <<'STUB'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  case "$arg" in */task-lease-run-f1-lease.json) exit 1 ;; esac
+done
+exec /usr/bin/mv "$@"
+STUB
+chmod +x "$F1_LEASE_BIN/mv"
+F1_LEASE_OUT="$(PATH="$F1_LEASE_BIN:$PATH" bash "$GATE" task-claim run-f1-lease "$F1_SHA" 2>/dev/null || true)"
+jq -e '.ok == false and (.error | test("could not write the task lease"))' <<<"$F1_LEASE_OUT" >/dev/null ||
+  { echo "F1: expected injected task lease write failure, got: $F1_LEASE_OUT" >&2; exit 1; }
+[ ! -e "$SMOKE_GATE_LEASE_DIR/task-lease-run-f1-lease.json" ] &&
+  [ ! -e "$SMOKE_GATE_LEASE_DIR/task-binding-run-f1-lease.json" ] &&
+  [ ! -e "$STATE_DIR/task-run-f1-lease-state.json" ] ||
+  { echo "F1: failed lease creation did not roll the whole claim back to absence" >&2; exit 1; }
 
 # --- #726 F1/F2: task-claim holds the shared task lease lock AND the gate
 # control lock from lease acquisition through its private slot write. A
@@ -3072,11 +3128,9 @@ bash "$GATE" task-claim run-c "$F3_SHA7" --takeover | jq -e '.ok == false and .f
 jq -e '.completedRunId == "run-c" and .completedVerdict == "GO" and .completedAt != null' \
   "$STATE_DIR/task-run-c-state.json" >/dev/null
 bash "$GATE" task-finish run-c "$F3_SHA7" GO | jq -e '.ok == true and .idempotent == true' >/dev/null
-# The one verdict-bearing run that stays re-claimable, and only on its own
-# build: a task-finish that died after its verdict write and lease removal but
-# before its state commit. The run is then active with no lease, so task-finish
-# cannot resume it until the owner re-claims on that SHA (the recovery
-# task_lease_fence_begin's refusal names); refusing that too would strand it.
+# A verdict-bearing run is never re-claimable. The shared terminal binding is
+# committed before lease removal, so an interrupted task-finish resumes itself
+# directly even after the lease vanished; task-claim remains terminal-refused.
 # The state commit is failed for real (read-only state dir, run dir already
 # present); the lease removal it rolled back is then redone by hand.
 bash "$GATE" task-claim run-r "$F3_SHA7" | jq -e '.ok == true' >/dev/null
@@ -3089,15 +3143,170 @@ jq -e '.ok == false and (.error | test("terminal task state"))' <<<"$F3_R_OUT" >
 F3_R_VERDICT="$(cat "$STATE_DIR/runs/run-r/verdict.json")"
 jq -e '.activeRunId == "run-r" and .completedRunId == null' "$STATE_DIR/task-run-r-state.json" >/dev/null
 rm -f "$SMOKE_GATE_LEASE_DIR/task-lease-run-r.json"
-bash "$GATE" task-finish run-r "$F3_SHA7" GO | jq -e '.ok == false' >/dev/null
 F3_R_OTHER="$(bash "$GATE" task-claim run-r "$F3_SHA8" || true)"
-jq -e '.ok == false and .finished == false and (.error | test("different build"))' <<<"$F3_R_OTHER" >/dev/null ||
+jq -e '.ok == false and .finished == true and (.error | test("already finished"))' <<<"$F3_R_OTHER" >/dev/null ||
   { echo "F3: a half-finished run was re-claimed on another build: $F3_R_OTHER" >&2; exit 1; }
-bash "$GATE" task-claim run-r "$F3_SHA7" | jq -e '.ok == true' >/dev/null ||
-  { echo "F3: the same-build recovery re-claim of a half-finished run was refused" >&2; exit 1; }
 bash "$GATE" task-finish run-r "$F3_SHA7" GO | jq -e '.ok == true and .verdict == "GO"' >/dev/null ||
-  { echo "F3: task-finish did not resume after the recovery re-claim" >&2; exit 1; }
+  { echo "F3: task-finish did not reconcile after lease removal" >&2; exit 1; }
 [ "$(cat "$STATE_DIR/runs/run-r/verdict.json")" = "$F3_R_VERDICT" ]
 jq -e '.completedRunId == "run-r" and .activeRunId == null' "$STATE_DIR/task-run-r-state.json" >/dev/null
+
+# --- #755/#757: retained binding spans private state roots -----------------
+CROSS_BASE="$STATE_DIR/cross-private-task-binding"
+CROSS_A="$CROSS_BASE/a" CROSS_B="$CROSS_BASE/b" CROSS_C="$CROSS_BASE/c"
+CROSS_LEASE="$TEST_SHARED_ROOT/cross-private-task-binding/leases"
+mkdir -p "$CROSS_A" "$CROSS_B" "$CROSS_C"
+CROSS_SHA_A="$(sha a)" CROSS_SHA_B="$(sha b)"
+
+# Release removes the live lease, not the permanent SHA identity. Another
+# private root cannot rebind it, while same-SHA unfinished recovery remains.
+SMOKE_GATE_STATE_DIR="$CROSS_A" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" task-claim run-cross-released "$CROSS_SHA_A" owner-a | jq -e '.ok == true' >/dev/null
+SMOKE_GATE_STATE_DIR="$CROSS_A" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" task-release run-cross-released owner-a | jq -e '.ok == true' >/dev/null
+jq -e --arg sha "$CROSS_SHA_A" '.deploySha == $sha and .terminal == null' \
+  "$CROSS_LEASE/task-binding-run-cross-released.json" >/dev/null
+CROSS_REBIND="$(SMOKE_GATE_STATE_DIR="$CROSS_B" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" task-claim run-cross-released "$CROSS_SHA_B" owner-b)"
+jq -e --arg sha "$CROSS_SHA_A" '.ok == false and .boundSha == $sha and (.error | test("permanently bound"))' \
+  <<<"$CROSS_REBIND" >/dev/null || { echo "cross-root released task rebound: $CROSS_REBIND" >&2; exit 1; }
+[ ! -e "$CROSS_B/task-run-cross-released-state.json" ] && [ ! -e "$CROSS_LEASE/task-lease-run-cross-released.json" ]
+SMOKE_GATE_STATE_DIR="$CROSS_B" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" task-claim run-cross-released "$CROSS_SHA_A" owner-b | jq -e '.ok == true' >/dev/null
+SMOKE_GATE_STATE_DIR="$CROSS_B" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" task-release run-cross-released owner-b | jq -e '.ok == true' >/dev/null
+# The standalone common lease-acquisition seam is a PR identity producer too.
+CROSS_LEASE_CLAIM="$(SMOKE_GATE_STATE_DIR="$CROSS_C" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" lease-claim run-cross-released owner-pr 176)"
+jq -e '.ok == false and (.error | test("task-scoped"))' <<<"$CROSS_LEASE_CLAIM" >/dev/null || {
+  echo "standalone lease-claim ignored shared task binding: $CROSS_LEASE_CLAIM" >&2; exit 1; }
+[ ! -e "$CROSS_LEASE/lease-run-cross-released.json" ]
+
+# A finished task is terminal to task, PR and develop claimants even when its
+# private verdict/state exist only in root A.
+SMOKE_GATE_STATE_DIR="$CROSS_A" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" task-claim run-cross-terminal "$CROSS_SHA_A" owner-a | jq -e '.ok == true' >/dev/null
+SMOKE_GATE_STATE_DIR="$CROSS_A" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" task-finish run-cross-terminal "$CROSS_SHA_A" GO owner-a | jq -e '.ok == true' >/dev/null
+jq -e '.terminal.verdict == "GO" and (.terminal.verdictDigest | test("^[0-9a-f]{64}$"))' \
+  "$CROSS_LEASE/task-binding-run-cross-terminal.json" >/dev/null
+[ ! -e "$CROSS_B/runs/run-cross-terminal/verdict.json" ]
+CROSS_TASK_OUT="$(SMOKE_GATE_STATE_DIR="$CROSS_B" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" task-claim run-cross-terminal "$CROSS_SHA_B" owner-b)"
+CROSS_PR_OUT="$(SMOKE_GATE_STATE_DIR="$CROSS_B" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" claim run-cross-terminal 177 "$CROSS_SHA_B" owner-b)"
+DEVELOP_GATE="$SCRIPT_DIR/smoke-develop-gate.sh"
+CROSS_DEV_OUT="$(SMOKE_GATE_STATE_DIR="$CROSS_C" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$DEVELOP_GATE" claim run-cross-terminal "$CROSS_SHA_B")"
+for OUT in "$CROSS_TASK_OUT" "$CROSS_PR_OUT" "$CROSS_DEV_OUT"; do
+  jq -e '.ok == false and (.error | test("finished|terminal"))' <<<"$OUT" >/dev/null || {
+    echo "cross-root claimant took terminal task identity: $OUT" >&2; exit 1; }
+done
+[ ! -e "$CROSS_B/task-run-cross-terminal-state.json" ] &&
+  [ ! -e "$CROSS_B/pr-177-state.json" ] && [ ! -e "$CROSS_C/develop-state.json" ]
+
+# Reverse active PR-to-task exclusion comes from the shared PR run lease, not
+# from a private PR state scan.
+SMOKE_GATE_STATE_DIR="$CROSS_A" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" claim run-cross-pr-active 178 "$CROSS_SHA_A" owner-pr | jq -e '.ok == true' >/dev/null
+CROSS_PR_TASK="$(SMOKE_GATE_STATE_DIR="$CROSS_B" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" task-claim run-cross-pr-active "$CROSS_SHA_A" owner-task)"
+jq -e '.ok == false and .activePr == 178 and (.error | test("PR campaign"))' <<<"$CROSS_PR_TASK" >/dev/null || {
+  echo "cross-root task claim took active PR identity: $CROSS_PR_TASK" >&2; exit 1; }
+[ ! -e "$CROSS_B/task-run-cross-pr-active-state.json" ] &&
+  [ ! -e "$CROSS_LEASE/task-binding-run-cross-pr-active.json" ]
+SMOKE_GATE_STATE_DIR="$CROSS_A" SMOKE_GATE_LEASE_DIR="$CROSS_LEASE" \
+  bash "$GATE" release run-cross-pr-active owner-pr | jq -e '.ok == true' >/dev/null
+
+# Exact retries recover after each finish cut. The final cut has no lease at
+# all and therefore proves task-finish no longer needs a task-claim detour.
+for CUT in before-binding binding verdict lease-removal; do
+  CUT_STATE="$CROSS_BASE/cut-$CUT" CUT_LEASE="$TEST_SHARED_ROOT/cut-$CUT/leases"
+  CUT_RUN="run-cut-${CUT//-/_}"
+  mkdir -p "$CUT_STATE"
+  SMOKE_GATE_STATE_DIR="$CUT_STATE" SMOKE_GATE_LEASE_DIR="$CUT_LEASE" \
+    bash "$GATE" task-claim "$CUT_RUN" "$CROSS_SHA_A" owner-cut | jq -e '.ok == true' >/dev/null
+  if SMOKE_GATE_STATE_DIR="$CUT_STATE" SMOKE_GATE_LEASE_DIR="$CUT_LEASE" \
+     SMOKE_GATE_TEST_TASK_FINISH_EXIT_AFTER="$CUT" \
+     bash "$GATE" task-finish "$CUT_RUN" "$CROSS_SHA_A" NO_GO owner-cut >/dev/null; then
+    echo "finish crash seam $CUT unexpectedly returned success" >&2; exit 1
+  fi
+  if [ "$CUT" = before-binding ]; then
+    jq -e '.terminal == null' "$CUT_LEASE/task-binding-$CUT_RUN.json" >/dev/null
+    [ -s "$CUT_LEASE/task-lease-$CUT_RUN.json" ]
+    TERMINAL_BEFORE=""
+  else
+    jq -e '.terminal.verdict == "NO_GO"' "$CUT_LEASE/task-binding-$CUT_RUN.json" >/dev/null
+    TERMINAL_BEFORE="$(jq -c '.terminal' "$CUT_LEASE/task-binding-$CUT_RUN.json")"
+    if [ "$CUT" = binding ]; then
+      [ ! -e "$CUT_STATE/runs/$CUT_RUN/verdict.json" ]
+      [ -s "$CUT_LEASE/task-lease-$CUT_RUN.json" ]
+    elif [ "$CUT" = verdict ]; then
+      [ -s "$CUT_STATE/runs/$CUT_RUN/verdict.json" ]
+      [ -s "$CUT_LEASE/task-lease-$CUT_RUN.json" ]
+    else [ ! -e "$CUT_LEASE/task-lease-$CUT_RUN.json" ]; fi
+    CUT_OTHER="$(SMOKE_GATE_STATE_DIR="$CROSS_B" SMOKE_GATE_LEASE_DIR="$CUT_LEASE" \
+      bash "$GATE" task-claim "$CUT_RUN" "$CROSS_SHA_A" owner-other)"
+    jq -e '.ok == false and .finished == true and (.error | test("already finished"))' <<<"$CUT_OTHER" >/dev/null || {
+      echo "$CUT terminal identity was not durable in another private root: $CUT_OTHER" >&2; exit 1; }
+  fi
+  SMOKE_GATE_STATE_DIR="$CUT_STATE" SMOKE_GATE_LEASE_DIR="$CUT_LEASE" \
+    bash "$GATE" task-finish "$CUT_RUN" "$CROSS_SHA_A" NO_GO owner-cut | jq -e '.ok == true' >/dev/null
+  [ -z "$TERMINAL_BEFORE" ] ||
+    [ "$(jq -c '.terminal' "$CUT_LEASE/task-binding-$CUT_RUN.json")" = "$TERMINAL_BEFORE" ] || {
+      echo "$CUT retry rewrote immutable terminal facts" >&2; exit 1; }
+  jq -e --arg run "$CUT_RUN" '.completedRunId == $run and .activeRunId == null' "$CUT_STATE/task-$CUT_RUN-state.json" >/dev/null
+  jq -e --arg sha "$CROSS_SHA_A" '.sha == $sha and .verdict == "NO_GO"' "$CUT_STATE/runs/$CUT_RUN/verdict.json" >/dev/null
+  [ ! -e "$CUT_LEASE/task-lease-$CUT_RUN.json" ]
+done
+
+# Shared malformed state fails all three claim paths closed. No private root
+# can reinterpret it as absence.
+MAL_LEASE="$TEST_SHARED_ROOT/malformed-task-binding/leases"
+mkdir -p "$MAL_LEASE" "$CROSS_BASE/malformed-task" "$CROSS_BASE/malformed-pr" "$CROSS_BASE/malformed-dev"
+printf 'not json' >"$MAL_LEASE/task-binding-run-malformed-shared.json"
+MAL_TASK="$(SMOKE_GATE_STATE_DIR="$CROSS_BASE/malformed-task" SMOKE_GATE_LEASE_DIR="$MAL_LEASE" \
+  bash "$GATE" task-claim run-malformed-shared "$CROSS_SHA_A")"
+MAL_PR="$(SMOKE_GATE_STATE_DIR="$CROSS_BASE/malformed-pr" SMOKE_GATE_LEASE_DIR="$MAL_LEASE" \
+  bash "$GATE" claim run-malformed-shared 179 "$CROSS_SHA_A")"
+MAL_DEV="$(SMOKE_GATE_STATE_DIR="$CROSS_BASE/malformed-dev" SMOKE_GATE_LEASE_DIR="$MAL_LEASE" \
+  bash "$DEVELOP_GATE" claim run-malformed-shared "$CROSS_SHA_A")"
+for OUT in "$MAL_TASK" "$MAL_PR" "$MAL_DEV"; do
+  jq -e '.ok == false and (.error | test("malformed"))' <<<"$OUT" >/dev/null || {
+    echo "malformed shared binding failed open: $OUT" >&2; exit 1; }
+done
+[ ! -e "$CROSS_BASE/malformed-task/task-run-malformed-shared-state.json" ] &&
+  [ ! -e "$CROSS_BASE/malformed-pr/pr-179-state.json" ] &&
+  [ ! -e "$CROSS_BASE/malformed-dev/develop-state.json" ]
+
+# A valid shared record does not license choosing it over contradictory local
+# evidence. Task claim fails closed rather than overwriting the private slot.
+CONFLICT_STATE="$CROSS_BASE/conflicting-local" CONFLICT_LEASE="$TEST_SHARED_ROOT/conflicting-local/leases"
+mkdir -p "$CONFLICT_STATE" "$CONFLICT_LEASE"
+jq -cn --arg run run-conflicting-local --arg sha "$CROSS_SHA_A" \
+  '{schemaVersion:1,kind:"task-binding",runId:$run,deploySha:$sha,boundAt:"2026-09-13T00:00:00Z",terminal:null}' \
+  >"$CONFLICT_LEASE/task-binding-run-conflicting-local.json"
+jq -cn --arg run run-conflicting-local --arg sha "$CROSS_SHA_B" \
+  '{schemaVersion:1,activeRunId:$run,activeSha:$sha,activeStartedAt:"2026-09-13T00:00:00Z",activeProgressAt:"2026-09-13T00:00:00Z",activeLeaseOwner:"old-owner",completedAt:null,completedRunId:null,completedVerdict:null}' \
+  >"$CONFLICT_STATE/task-run-conflicting-local-state.json"
+CONFLICT_OUT="$(SMOKE_GATE_STATE_DIR="$CONFLICT_STATE" SMOKE_GATE_LEASE_DIR="$CONFLICT_LEASE" \
+  bash "$GATE" task-claim run-conflicting-local "$CROSS_SHA_A" owner-new)"
+jq -e '.ok == false and (.error | test("malformed|identity evidence"))' <<<"$CONFLICT_OUT" >/dev/null || {
+  echo "conflicting local/shared identity did not fail closed: $CONFLICT_OUT" >&2; exit 1; }
+jq -e --arg sha "$CROSS_SHA_B" '.activeSha == $sha and .activeLeaseOwner == "old-owner"' \
+  "$CONFLICT_STATE/task-run-conflicting-local-state.json" >/dev/null
+[ ! -e "$CONFLICT_LEASE/task-lease-run-conflicting-local.json" ]
+
+# An old all-null release erased its SHA and cannot be reconstructed. The
+# upgrade invents no history; a later valid claim establishes the first
+# provable shared binding.
+LEGACY_STATE="$CROSS_BASE/legacy-all-null" LEGACY_LEASE="$TEST_SHARED_ROOT/legacy-all-null/leases"
+mkdir -p "$LEGACY_STATE"
+printf '{"schemaVersion":1,"activeRunId":null,"activeSha":null,"completedRunId":null,"completedSha":null}\n' \
+  >"$LEGACY_STATE/task-run-legacy-lost-state.json"
+SMOKE_GATE_STATE_DIR="$LEGACY_STATE" SMOKE_GATE_LEASE_DIR="$LEGACY_LEASE" \
+  bash "$GATE" task-claim run-legacy-lost "$CROSS_SHA_B" owner-legacy | jq -e '.ok == true' >/dev/null
+jq -e --arg sha "$CROSS_SHA_B" '.deploySha == $sha and .terminal == null' \
+  "$LEGACY_LEASE/task-binding-run-legacy-lost.json" >/dev/null
 
 echo "smoke pr gate tests passed"

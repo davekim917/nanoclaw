@@ -7,8 +7,18 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATE="$SCRIPT_DIR/smoke-develop-gate.sh"
 STATE_DIR="$(mktemp -d)"
-trap 'rm -rf "$STATE_DIR"' EXIT
+TEST_SHARED_ROOT="$(mktemp -d)"
+STUB_BIN="$(mktemp -d)"
+trap 'rm -rf "$STATE_DIR" "$TEST_SHARED_ROOT" "$STUB_BIN"' EXIT
 export SMOKE_GATE_STATE_DIR="$STATE_DIR"
+export SMOKE_GATE_SHARED_ROOT="$TEST_SHARED_ROOT"
+export SMOKE_GATE_LEASE_DIR="$TEST_SHARED_ROOT/qa-coordinator/leases"
+cat > "$STUB_BIN/mountpoint" <<'STUB'
+#!/usr/bin/env bash
+[ "${1:-}" = "-q" ] && [ "${2:-}" = "${SMOKE_GATE_SHARED_ROOT:-}" ]
+STUB
+chmod +x "$STUB_BIN/mountpoint"
+export PATH="$STUB_BIN:$PATH"
 unset SMOKE_GATE_REPO SMOKE_GATE_BACKEND_SERVICE SMOKE_GATE_FRONTEND_SERVICE SMOKE_GATE_DEV_URL 2>/dev/null || true
 
 # 1. Missing config wakes once with the missing list...
@@ -54,8 +64,6 @@ bash "$GATE" progress run-x | jq -e '.ok == false and .activeRunId == null' >/de
 # --- Poll path against stubbed gh/curl -------------------------------------
 STATE_FILE="$STATE_DIR/develop-state.json"
 BUILD_SHA="$(printf 'b%.0s' $(seq 40))"
-STUB_BIN="$(mktemp -d)"
-trap 'rm -rf "$STATE_DIR" "$STUB_BIN"' EXIT
 cat > "$STUB_BIN/gh" <<'STUB'
 #!/usr/bin/env bash
 # Advisory freeze notice: record every status POST so a test can assert which
@@ -1744,5 +1752,37 @@ jq -e '.ok == false and .retryable == true and (.error | startswith("gate_lock_b
 # The lock released, so the same claim now succeeds.
 bash "$GATE" claim run-lockheld "$LOCK_SHA" | jq -e '.ok == true and .runId == "run-lockheld"' >/dev/null ||
   { echo "60c: claim did not succeed once the control lock was free" >&2; exit 1; }
+
+# --- 60d. Automatic develop poll is a claim producer too. Its generated run
+# id must consult the same shared task binding under the shared task lock before
+# develop-state.json can name it.
+fresh_state
+AUTO_DEV_SHA="$(printf '6%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$AUTO_DEV_SHA" SMOKE_GATE_RUN_PREFIX=bounddev
+export SMOKE_GATE_DEBOUNCE_SECONDS=10
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "debouncing_candidate"' >/dev/null
+export SMOKE_GATE_DEBOUNCE_SECONDS=0
+AUTO_DEV_NOW="$(date -u +%s)"
+mkdir -p "$SMOKE_GATE_LEASE_DIR"
+for OFFSET in $(seq -2 12); do
+  AUTO_DEV_RUN="bounddev-${AUTO_DEV_SHA:0:12}-$(date -u -d "@$((AUTO_DEV_NOW + OFFSET))" +%Y%m%dT%H%M%SZ)"
+  jq -cn --arg run "$AUTO_DEV_RUN" --arg sha "$AUTO_DEV_SHA" \
+    '{schemaVersion:1,kind:"task-binding",runId:$run,deploySha:$sha,boundAt:"2026-09-13T00:00:00Z",terminal:null}' \
+    >"$SMOKE_GATE_LEASE_DIR/task-binding-$AUTO_DEV_RUN.json"
+done
+AUTO_DEV_OUT="$(bash "$GATE" poll)"
+jq -e '.ok == false and .wakeAgent == true and .data.trigger == "shared_task_binding_unavailable" and
+       (.data.detail.error | test("task-scoped"))' <<<"$AUTO_DEV_OUT" >/dev/null || {
+  echo "60d: automatic develop poll ignored shared task binding: $AUTO_DEV_OUT" >&2; exit 1; }
+jq -e '.activeRunId == null' "$STATE_DIR2/develop-state.json" >/dev/null
+unset SMOKE_GATE_RUN_PREFIX
+
+# The shared binding path must never be constructed from a traversal-shaped
+# manual run id; this gate historically accepted arbitrary ids before it had
+# any shared path keyed by them.
+UNSAFE_DEV_OUT="$(bash "$GATE" claim ../escaped "$AUTO_DEV_SHA")"
+jq -e '.ok == false and (.error | test("unsafe"))' <<<"$UNSAFE_DEV_OUT" >/dev/null || {
+  echo "60d: traversal-shaped develop run id reached shared storage: $UNSAFE_DEV_OUT" >&2; exit 1; }
+[ ! -e "$TEST_SHARED_ROOT/qa-coordinator/task-lease-escaped.lock" ]
 
 echo "smoke develop gate tests passed"
