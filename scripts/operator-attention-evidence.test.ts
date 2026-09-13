@@ -503,6 +503,58 @@ describe('collectOperatorAttentionEvidence', () => {
     }
   });
 
+  it('counts unclassified inbound and every null platform-id delivery row instead of silently dropping them', async () => {
+    const root = makeRoot();
+    const sessionsRoot = path.join(root, 'sessions');
+    const source = createSession(sessionsRoot, await produceQuestionResponse());
+    const centralDb = path.join(root, 'central.db');
+    const archiveDb = path.join(root, 'archive.db');
+    createCentralDb(centralDb);
+    createArchiveDb(archiveDb);
+
+    source.inDb
+      .prepare('INSERT INTO messages_in (id, timestamp, kind, content) VALUES (?, ?, ?, ?)')
+      .run('in-unrecognized-system', '2026-09-10T09:06:00.000Z', 'system', JSON.stringify({ type: 'new_system_event' }));
+    source.inDb
+      .prepare('INSERT INTO messages_in (id, timestamp, kind, content) VALUES (?, ?, ?, ?)')
+      .run('in-human-file-only', '2026-09-10T09:07:00.000Z', 'chat-sdk', JSON.stringify({ author: { isBot: false } }));
+
+    const insertOutbound = source.outDb.prepare(
+      `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content)
+       VALUES (?, ?, 'chat', 'C-fixture', 'slack', ?)`,
+    );
+    const insertDelivered = source.inDb.prepare(
+      'INSERT INTO delivered (message_out_id, status, platform_message_id, delivered_at) VALUES (?, ?, NULL, ?)',
+    );
+    insertOutbound.run('out-pending-null', '2026-09-10T10:01:00.000Z', JSON.stringify({ text: 'private pending' }));
+    insertDelivered.run('out-pending-null', 'pending', '2026-09-10T10:01:30.000Z');
+    insertOutbound.run('out-failed-null', '2026-09-10T10:02:00.000Z', JSON.stringify({ text: 'private failed' }));
+    insertDelivered.run('out-failed-null', 'failed', '2026-09-10T10:02:30.000Z');
+    // The durable acknowledgement can survive without a matching container
+    // row (or be read before that row). It still belongs in the null-id metric.
+    insertDelivered.run('out-orphan-null', 'failed', '2026-09-10T10:03:00.000Z');
+
+    try {
+      const report = collectOperatorAttentionEvidence({
+        sessionsRoot,
+        centralDb,
+        archiveDb,
+        since: SINCE,
+        until: UNTIL,
+      });
+
+      // Baseline includes one malformed question response and four delivered
+      // null-id rows. The two new inbound shapes, two non-delivered attempt
+      // rows, and orphan acknowledgement must be disclosed rather than erased
+      // from a complete-looking run.
+      expect(report.provenance.sourceReadComplete).toBe(true);
+      expect(report.counts.unknownInboundMessages).toBe(3);
+      expect(report.counts.deliveryProcessedUnknown).toBe(7);
+    } finally {
+      source.close();
+    }
+  });
+
   it('discloses SQLite SHM creation while preserving copied main and committed WAL bytes', () => {
     const root = makeRoot();
     const sessionsRoot = path.join(root, 'sessions');
