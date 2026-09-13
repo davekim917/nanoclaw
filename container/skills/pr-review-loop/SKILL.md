@@ -177,14 +177,28 @@ codex-review.sh ci-wait --head <sha> [--timeout <sec>]
                                          # 30 no run registered, 31 the PR conflicts with its base, 11 timeout, 12 head moved
 codex-review.sh scope                     # risk-scoped repos: review|skip for the current head (legacy: auto)
 codex-review.sh request                   # risk-scoped repos: the only way to ask for a round
+codex-review.sh claim --head <sha> --owner <session-label> [--ttl-minutes 1-120]
+                                         # advisory local-review claim; default expiry is 45 minutes
 codex-review.sh merge-check [--head <sha>] # exit 0 only when merging exactly that head is allowed; 26 = legacy repo, Step 6 decides
 codex-review.sh merge --head <sha> [--method merge|squash]
                                          # risk-scoped repos: the only way to merge — merge-check, then gh pr merge on exit 0 alone
 codex-review.sh audit                     # a merged PR as of its merge, by the merge-check rules of the code you run (main-provenance's gate-audit job)
-codex-review.sh receipt --head <sha> --outcome approve|changes --reviewer "<model + runtime>" --body-file <file>
+codex-review.sh receipt --head <sha> --outcome approve|changes --reviewer "<model + runtime>" --body-file <file> [--claim <id> --claim-owner <session-label>]
                                          # post a substitute review's receipt for exactly that head — --reviewer
                                          # must start with an allowed model ID (container/skills/pr-review-loop/reviewer-models.txt)
 ```
+
+An in-flight claim is a visible coordination signal, not review evidence or
+an approval. Start a session-local/adversarial review with `claim`; its
+required owner label identifies the operator session because several agents
+share one GitHub account. `scope`, `request`, and `merge-check` surface a
+fresh claim for the current head, but retain their usual verdicts and exit
+codes. Claims expire after 45 minutes by default (never more than 120), die
+when the head moves, and stay invisible if a reviewer forgets to make one.
+That discipline is intentional: comments cannot infer a local review that has
+not posted a marker. A receipt may retire its own claim only when called with
+both `--claim <id>` and `--claim-owner <label>`; an unrelated same-head receipt
+must not hide another review still in progress.
 
 **Wait on CI only with `codex-review.sh ci-wait --head "$SHA"`**, in any repo — never `gh pr checks --watch`, `gh run watch`, or a sleep loop around either. It waits on exactly the head you pushed, not whatever the PR points at later, and it answers rather than timing out when waiting can't help. 31: the PR conflicts with its base, and GitHub runs no `pull_request` workflow on a conflicting PR, so merge the base in (`git merge origin/<base>`, never rebase), push, and wait again. 30: no CI run registered on the head (or none of a required workflow) — look at the workflow's triggers rather than waiting longer. 29: CI finished red — read the failure and fix it. 11 is a timeout with CI still running; 12, a head that moved — capture the new one. Its green is the same predicate merge-check applies, so `ci-wait` exiting 0 and then `codex-review.sh merge` is the normal order. Never pipe it; the exit code is the answer. A repo whose required workflow isn't named `CI` sets `CODEX_REVIEW_REQUIRED_WORKFLOWS`.
 
