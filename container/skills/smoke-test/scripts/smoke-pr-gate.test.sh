@@ -2728,6 +2728,70 @@ echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$SAFE_COPY_RULES" | 
   .sizeReason == "light: all 1 changed file(s) matched lightAllowed"
 ' >/dev/null
 
+# More ordinary derived reads: eager comprehensions, reverse-order list
+# concatenation, list spreading and slicing all allocate new containers (or
+# scalar compiled values) from the trusted flat string list. They must not
+# make every unrelated backend PR run the full campaign.
+DERIVED_READS_MOD="$STATE_DIR/policy-derived-reads.py"
+cat >"$DERIVED_READS_MOD" <<'PY'
+import re
+
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+COMPILED = [re.compile(glob) for glob in SENSITIVE_GLOBS]
+REVERSED = ["backend/legacy/**"] + SENSITIVE_GLOBS
+SPREAD = [*SENSITIVE_GLOBS]
+SLICE = SENSITIVE_GLOBS[:]
+PY
+python3 - "$DERIVED_READS_MOD" <<'PY'
+import runpy
+import sys
+
+policy = runpy.run_path(sys.argv[1])
+if policy["SENSITIVE_GLOBS"] != ["backend/permissions/**"]:
+    raise SystemExit("derived reads mutated the runtime policy")
+if policy["REVERSED"] != ["backend/legacy/**", "backend/permissions/**"]:
+    raise SystemExit("reverse concatenation control did not execute")
+policy["SPREAD"].append("backend/billing/**")
+policy["SLICE"].append("backend/billing/**")
+if policy["SENSITIVE_GLOBS"] != ["backend/permissions/**"]:
+    raise SystemExit("derived list copy retained the source policy list")
+PY
+DERIVED_READS_RULES="$STATE_DIR/fgf-derived-reads.json"
+cat >"$DERIVED_READS_RULES" <<JSON
+{"full":[],"lightAllowed":["backend/**"],
+ "fullGlobsFrom":{"path":"$DERIVED_READS_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$DERIVED_READS_RULES" | jq -e '
+  .campaignSize == "light" and
+  .sizeReason == "light: all 1 changed file(s) matched lightAllowed"
+' >/dev/null
+
+# `ast.Match` does not exist on Python 3.9. Simulate that interpreter's AST
+# surface to prove the classifier still reads an ordinary policy instead of
+# raising before it can fail closed at the caller.
+PY39_MOD="$STATE_DIR/policy-python39-ast.py"
+cat >"$PY39_MOD" <<'PY'
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+PY
+python3 - "$CLASSIFY" "$PY39_MOD" <<'PY'
+import ast
+import runpy
+import sys
+
+had_match = hasattr(ast, "Match")
+saved_match = getattr(ast, "Match", None)
+if had_match:
+    delattr(ast, "Match")
+try:
+    classifier = runpy.run_path(sys.argv[1])
+    globs, reason = classifier["load_full_globs_from"]({"path": sys.argv[2], "name": "SENSITIVE_GLOBS"})
+finally:
+    if had_match:
+        setattr(ast, "Match", saved_match)
+if globs != ["backend/permissions/**"] or reason is not None:
+    raise SystemExit("pre-3.10 AST surface did not classify a simple policy: {!r} {!r}".format(globs, reason))
+PY
+
 # Read-only control 2: a policy file that CALLS its own helpers at top level
 # classifies normally, as long as no reachable body escapes the namespace.
 # The live policy does this 46 times; refusing it is the round-1 regression.
@@ -2913,12 +2977,13 @@ len(SENSITIVE_GLOBS)
 # covers a pre-3.10 interpreter, where the statement does not parse at all --
 # still fail-closed, different reason.
 assert_policy_refused shadow-match 'SENSITIVE_GLOBS = ["backend/permissions/**"]
-match SENSITIVE_GLOBS:
+DEFAULT_SIZE = "light"
+match DEFAULT_SIZE:
     case len:
         pass
 
 len(SENSITIVE_GLOBS)
-' 'aliases through a match capture|could mutate|could not be parsed'
+' 'could mutate|could not be parsed'
 
 # A star import binds names that cannot be enumerated, so no callee is
 # provably the builtin. The star import itself already refuses the whole file
