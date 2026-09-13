@@ -188,6 +188,17 @@ def _roots_at_name(node, name):
 # which leaves the literal this classifier reads a stale, partial policy
 # (round-2 review of #736).
 _PURE_CALLEES = frozenset(("len", "sorted", "tuple", "list", "set", "any", "all"))
+_PURE_SCALAR_CALLEES = frozenset(("len", "any", "all"))
+_PURE_SHALLOW_COPY_CALLEES = frozenset(("sorted", "tuple", "list", "set"))
+
+# Result-reference lattice for a binding RHS.  `_REF_NONE` is a proof that
+# the expression's RESULT cannot retain the policy list; the other two states
+# are unsafe for a new binding.  Keeping direct and possible/nested reference
+# separate makes the two safe list-copy forms below explicit without trying
+# to interpret arbitrary Python expressions.
+_REF_NONE = 0
+_REF_DIRECT = 1
+_REF_MAY_RETAIN = 2
 
 
 def _module_bound_names(tree):
@@ -349,6 +360,73 @@ def _called_function_escape(node, defs):
     return None
 
 
+def _binding_result_reference(value, name, bound):
+    """Conservatively classify whether a binding RHS retains `name`'s list.
+
+    This is a bounded reference proof, not a Python interpreter.  Unknown
+    NAME-containing shapes are `_REF_MAY_RETAIN` by default.  `_REF_NONE` is
+    reserved for the ordinary policy forms whose result is known not to hold
+    the mutable list: a scalar pure call, a direct shallow copy of the trusted
+    flat string list, literal-string `join`, and direct `NAME + OTHER` where
+    OTHER contains no reference to NAME.  The whole RHS is considered,
+    including a call's callee, so a closure or a second list operand cannot
+    hide a retained reference.
+    """
+    if isinstance(value, ast.Name) and value.id == name:
+        return _REF_DIRECT
+
+    children = list(ast.iter_child_nodes(value))
+    child_refs = [_binding_result_reference(child, name, bound) for child in children]
+    if all(ref == _REF_NONE for ref in child_refs):
+        return _REF_NONE
+
+    if isinstance(value, ast.Call) and _call_is_pure(value.func, bound):
+        if isinstance(value.func, ast.Attribute):
+            # `_call_is_pure` admits only a literal-string `.join`; its
+            # result is a string even when its iterable reads NAME.
+            return _REF_NONE
+        if value.func.id in _PURE_SCALAR_CALLEES:
+            return _REF_NONE
+        if value.func.id in _PURE_SHALLOW_COPY_CALLEES:
+            # The trusted assignment is validated as a flat list of strings,
+            # so copying NAME directly copies only immutable string elements.
+            if (
+                len(value.args) == 1
+                and not value.keywords
+                and isinstance(value.args[0], ast.Name)
+                and value.args[0].id == name
+            ):
+                return _REF_NONE
+
+    if (
+        isinstance(value, ast.BinOp)
+        and isinstance(value.op, ast.Add)
+        and isinstance(value.left, ast.Name)
+        and value.left.id == name
+        and _binding_result_reference(value.right, name, bound) == _REF_NONE
+    ):
+        # `NAME` is the trusted flat list, so list concatenation creates a new
+        # outer list and contributes only immutable strings from NAME.  The
+        # right operand must independently prove it retains no NAME reference.
+        return _REF_NONE
+
+    return _REF_MAY_RETAIN
+
+
+def _binding_value_aliases_name(value, name, bound):
+    return _binding_result_reference(value, name, bound) != _REF_NONE
+
+
+def _match_pattern_binds(pattern):
+    """True when a match pattern captures any value under a new name."""
+    for sub in ast.walk(pattern):
+        if _MATCH_NAME_NODES and isinstance(sub, _MATCH_NAME_NODES) and sub.name:
+            return True
+        if _MATCH_REST_NODES and isinstance(sub, _MATCH_REST_NODES) and sub.rest:
+            return True
+    return False
+
+
 def _rebinding_use(node, name, bound):
     """How top-level statement `node` binds or mutates `name`, as a phrase,
     or None if it does neither. `bound` is every name module-level code binds
@@ -407,13 +485,49 @@ def _rebinding_use(node, name, bound):
             return "hands it to a call that could mutate"
         if isinstance(sub, (ast.Global, ast.Nonlocal)) and name in sub.names:
             return "declares a global/nonlocal binding for"
-        # `X = NAME` / `X: T = NAME` -- an alias shares the one list object,
-        # so `X.append(...)` further down changes what the policy uses while
-        # the literal above still reads complete.
+        # Assignment is not the only way a new module name can retain this
+        # list.  A loop target receives values from its iterable.  Iterating
+        # NAME itself (or a proven flat copy) yields only the trusted immutable
+        # strings, but an iterable that MAY retain NAME can yield the list
+        # object itself, including through nested destructuring.
         if (
-            isinstance(sub, (ast.Assign, ast.AnnAssign))
-            and isinstance(sub.value, ast.Name)
-            and sub.value.id == name
+            isinstance(sub, (ast.For, ast.AsyncFor))
+            and _binding_result_reference(sub.iter, name, bound) == _REF_MAY_RETAIN
+        ):
+            return "aliases through an iterable binding"
+        # Augmented assignment may retain its RHS through the target's
+        # in-place operator.  Its target can be any user-defined object, so a
+        # reference-bearing RHS is refused rather than interpreting `__iadd__`
+        # (or the other augmented operators) as a particular builtin type.
+        if (
+            isinstance(sub, ast.AugAssign)
+            and _binding_value_aliases_name(sub.value, name, bound)
+        ):
+            return "aliases through augmented assignment"
+        # `with EXPR as TARGET` and its async form also bind a value derived
+        # from EXPR.  If EXPR retains NAME, the context-manager protocol does
+        # not prove that the bound value is independent of it.
+        if isinstance(sub, (ast.With, ast.AsyncWith)):
+            for item in sub.items:
+                if (
+                    item.optional_vars is not None
+                    and _binding_value_aliases_name(item.context_expr, name, bound)
+                ):
+                    return "aliases through a context-manager binding"
+        # A capture pattern can bind the whole subject or a nested value from
+        # it.  Reference-bearing subjects are therefore unsafe when any arm
+        # captures, without trying to execute Python's pattern semantics.
+        if isinstance(sub, ast.Match) and _binding_value_aliases_name(sub.subject, name, bound):
+            if any(_match_pattern_binds(case.pattern) for case in sub.cases):
+                return "aliases through a match capture"
+        # `X = NAME`, destructuring a tuple that contains NAME, or binding a
+        # conditional that can select NAME all preserve the one list object.
+        # A mutation through the other binding then leaves the literal above
+        # looking complete while the imported policy has widened.
+        if (
+            isinstance(sub, (ast.Assign, ast.AnnAssign, ast.NamedExpr))
+            and sub.value is not None
+            and _binding_value_aliases_name(sub.value, name, bound)
         ):
             return "aliases"
         # Rebinding through a STRING field, which no ast.Name check above can
@@ -487,7 +601,15 @@ def _find_top_level_assignment(tree, name):
             continue
         is_plain_assign = False
         if isinstance(node, ast.Assign):
-            is_plain_assign = any(isinstance(t, ast.Name) and t.id == name for t in node.targets)
+            # A chained/multi-target assignment binds every target to the
+            # same RHS object.  Trust only one bare target: other targets
+            # would be aliases of this policy list even when the RHS itself
+            # is a literal.
+            is_plain_assign = (
+                len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == name
+            )
         elif isinstance(node, ast.AnnAssign):
             is_plain_assign = (
                 isinstance(node.target, ast.Name)
