@@ -2300,12 +2300,37 @@ assert_policy_refused() {
   local mod="$STATE_DIR/policy-$1.py" rules="$STATE_DIR/fgf-$1.json"
   printf '%s' "$2" > "$mod"
   cat > "$rules" <<JSON
-{"full":[],"lightAllowed":["frontend/**"],
+{"full":[],"lightAllowed":["backend/**"],
  "fullGlobsFrom":{"path":"$mod","name":"SENSITIVE_GLOBS"}}
 JSON
   echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$rules" | jq -e --arg rx "$3" '
     .campaignSize == "full" and (.sizeReason | test($rx))
   ' >/dev/null || { echo "736: policy fixture $1 did not fail closed (expected reason ~ $3)" >&2; exit 1; }
+}
+
+assert_runtime_widening_policy_refused() {
+  # Prove both halves of the stale-literal failure: the reviewer-authored
+  # fixture really widens the imported list at runtime, while the classifier
+  # refuses that binding instead of reading the one-entry literal and calling
+  # the billing change `light` under the backend/** light rule.
+  local mod="$STATE_DIR/policy-$1.py" rules="$STATE_DIR/fgf-$1.json"
+  printf '%s' "$2" > "$mod"
+  python3 - "$mod" <<'PY'
+import runpy
+import sys
+
+globs = runpy.run_path(sys.argv[1])["SENSITIVE_GLOBS"]
+expected = ["backend/permissions/**", "backend/billing/**"]
+if globs != expected:
+    raise SystemExit("fixture did not widen the runtime policy: {!r}".format(globs))
+PY
+  cat > "$rules" <<JSON
+{"full":[],"lightAllowed":["backend/**"],
+ "fullGlobsFrom":{"path":"$mod","name":"SENSITIVE_GLOBS"}}
+JSON
+  echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$rules" | jq -e --arg rx "$3" '
+    .campaignSize == "full" and (.sizeReason | test($rx))
+  ' >/dev/null || { echo "769: runtime-widening fixture $1 did not fail closed (expected reason ~ $3)" >&2; exit 1; }
 }
 
 # `from x import NAME` rebinds the name to whatever that module holds.
@@ -2371,7 +2396,7 @@ match DEFAULT_SIZE:
 
 # An alias shares the one list object, so a mutation through the OTHER name
 # changes the policy while the literal above still reads complete.
-assert_policy_refused alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+assert_runtime_widening_policy_refused alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
 ALIAS = SENSITIVE_GLOBS
 ALIAS.append("backend/billing/**")
 ' 'Assign'
@@ -2380,13 +2405,13 @@ ALIAS.append("backend/billing/**")
 # makes the other target an alias of that literal, so it can widen the policy
 # while the classifier would otherwise read only the original permissions
 # glob and size this billing change `light`.
-assert_policy_refused chained-alias-append 'LEGACY = SENSITIVE_GLOBS = ["backend/permissions/**"]
+assert_runtime_widening_policy_refused chained-alias-append 'LEGACY = SENSITIVE_GLOBS = ["backend/permissions/**"]
 LEGACY.append("backend/billing/**")
 ' 'Assign'
 
 # An alias can also hide in a destructuring RHS; the direct-name-only check
 # above must not treat this as the ordinary derived-list read below.
-assert_policy_refused tuple-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+assert_runtime_widening_policy_refused tuple-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
 LEGACY, UNUSED = (SENSITIVE_GLOBS, [])
 LEGACY.append("backend/billing/**")
 ' 'aliases'
@@ -2394,7 +2419,7 @@ LEGACY.append("backend/billing/**")
 # Likewise, a conditional can bind the trusted list itself on one branch.
 # The condition is true here so this also describes a real import-time
 # widening, but the classifier must refuse any branch that can alias it.
-assert_policy_refused conditional-alias-append 'USE_LEGACY = True
+assert_runtime_widening_policy_refused conditional-alias-append 'USE_LEGACY = True
 SENSITIVE_GLOBS = ["backend/permissions/**"]
 LEGACY = SENSITIVE_GLOBS if USE_LEGACY else []
 LEGACY.append("backend/billing/**")
@@ -2404,12 +2429,12 @@ LEGACY.append("backend/billing/**")
 # wrappers retain the trusted list as an element, so either later mutation
 # widens the imported policy even though direct `tuple(SENSITIVE_GLOBS)` and
 # `list(SENSITIVE_GLOBS)` remain valid copies of the literal strings.
-assert_policy_refused tuple-wrapped-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+assert_runtime_widening_policy_refused tuple-wrapped-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
 LEGACY, = tuple([SENSITIVE_GLOBS])
 LEGACY.append("backend/billing/**")
 ' 'aliases'
 
-assert_policy_refused list-wrapped-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+assert_runtime_widening_policy_refused list-wrapped-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
 LEGACY = list([SENSITIVE_GLOBS])
 LEGACY[0].append("backend/billing/**")
 ' 'aliases'
@@ -2417,28 +2442,44 @@ LEGACY[0].append("backend/billing/**")
 # The wrapper's reference can also be extracted immediately, without a
 # named intermediate container.  The binding guard must cover the expression
 # that receives the alias, not only the wrapper assignment shape.
-assert_policy_refused subscript-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+assert_runtime_widening_policy_refused subscript-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
 LEGACY = (SENSITIVE_GLOBS,)[0]
 LEGACY.append("backend/billing/**")
 ' 'aliases'
 
 # A walrus binds at top level too.  It is not an Assign node, but it can make
 # the same direct alias before a later mutation widens the imported policy.
-assert_policy_refused walrus-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+assert_runtime_widening_policy_refused walrus-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
 (LEGACY := SENSITIVE_GLOBS)
 LEGACY.append("backend/billing/**")
 ' 'aliases'
 
 # New outer containers do not prove a deep copy. Both bindings retain the
 # policy list as element zero, then mutate that exact object at import time.
-assert_policy_refused list-plus-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+assert_runtime_widening_policy_refused list-plus-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
 LEGACY = [SENSITIVE_GLOBS] + []
 LEGACY[0].append("backend/billing/**")
 ' 'aliases'
 
-assert_policy_refused comprehension-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+assert_runtime_widening_policy_refused comprehension-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
 LEGACY = [glob for glob in [SENSITIVE_GLOBS]]
 LEGACY[0].append("backend/billing/**")
+' 'aliases'
+
+# The reference proof must cover BOTH operands of its one permitted derived
+# list form.  The outer concatenation is new, but its right operand keeps the
+# original list as an element and therefore still exposes it for mutation.
+assert_runtime_widening_policy_refused derived-list-nested-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+LEGACY = SENSITIVE_GLOBS + [SENSITIVE_GLOBS]
+LEGACY[-1].append("backend/billing/**")
+' 'aliases'
+
+# A call can retain a reference through its CALLEE, even when it has no
+# arguments.  Looking only at call arguments accepts this immediately-invoked
+# closure and leaves the classifier reading the stale literal.
+assert_runtime_widening_policy_refused lambda-callee-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+LEGACY = (lambda: SENSITIVE_GLOBS)()
+LEGACY.append("backend/billing/**")
 ' 'aliases'
 
 # A read is not an alias: `ALL = NAME + OTHER` builds a NEW list and leaves
@@ -2525,6 +2566,41 @@ echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$CALLREAD_RULES" | j
 ' >/dev/null
 echo '["frontend/a.css"]' | python3 "$CLASSIFY" "$CALLREAD_RULES" | jq -e '
   .campaignSize == "light"
+' >/dev/null
+
+# Safe reference controls: direct list/tuple copies contain only the trusted
+# list's immutable strings, `NAME + OTHER` creates a new outer list, and an
+# unrelated `list([])` does not mention the policy at all.  Mutating the list
+# copy at runtime must leave the source list unchanged, and the classifier
+# must therefore keep a billing-only change `light` rather than over-sizing
+# every policy file that uses these ordinary forms.
+SAFE_COPY_MOD="$STATE_DIR/policy-safe-copy.py"
+cat > "$SAFE_COPY_MOD" <<'PY'
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+LIST_COPY = list(SENSITIVE_GLOBS)
+TUPLE_COPY = tuple(SENSITIVE_GLOBS)
+LIST_COPY.append("backend/billing/**")
+UNRELATED = list([])
+ALL_GLOBS = SENSITIVE_GLOBS + ["backend/legacy/**"]
+PY
+python3 - "$SAFE_COPY_MOD" <<'PY'
+import runpy
+import sys
+
+policy = runpy.run_path(sys.argv[1])
+if policy["SENSITIVE_GLOBS"] != ["backend/permissions/**"]:
+    raise SystemExit("safe copy mutated the runtime policy")
+if policy["LIST_COPY"] != ["backend/permissions/**", "backend/billing/**"]:
+    raise SystemExit("safe copy control did not execute")
+PY
+SAFE_COPY_RULES="$STATE_DIR/fgf-safe-copy.json"
+cat > "$SAFE_COPY_RULES" <<JSON
+{"full":[],"lightAllowed":["backend/**"],
+ "fullGlobsFrom":{"path":"$SAFE_COPY_MOD","name":"SENSITIVE_GLOBS"}}
+JSON
+echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$SAFE_COPY_RULES" | jq -e '
+  .campaignSize == "light" and
+  .sizeReason == "light: all 1 changed file(s) matched lightAllowed"
 ' >/dev/null
 
 # Read-only control 2: a policy file that CALLS its own helpers at top level

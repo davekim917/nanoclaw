@@ -191,6 +191,15 @@ _PURE_CALLEES = frozenset(("len", "sorted", "tuple", "list", "set", "any", "all"
 _PURE_SCALAR_CALLEES = frozenset(("len", "any", "all"))
 _PURE_SHALLOW_COPY_CALLEES = frozenset(("sorted", "tuple", "list", "set"))
 
+# Result-reference lattice for a binding RHS.  `_REF_NONE` is a proof that
+# the expression's RESULT cannot retain the policy list; the other two states
+# are unsafe for a new binding.  Keeping direct and possible/nested reference
+# separate makes the two safe list-copy forms below explicit without trying
+# to interpret arbitrary Python expressions.
+_REF_NONE = 0
+_REF_DIRECT = 1
+_REF_MAY_RETAIN = 2
+
 
 def _module_bound_names(tree):
     """Every name that module-level code BINDS, whatever the binder.
@@ -351,46 +360,61 @@ def _called_function_escape(node, defs):
     return None
 
 
-def _binding_value_aliases_name(value, name, bound):
-    """True unless `value` has a narrow proof that it drops `name`'s list.
+def _binding_result_reference(value, name, bound):
+    """Conservatively classify whether a binding RHS retains `name`'s list.
 
-    This is intentionally not an expression interpreter.  A binding that
-    mentions the policy list is unsafe by default: wrapping it, indexing it,
-    or passing it through a helper can preserve the same mutable object.  The
-    exceptions are only the reads the real policy needs: scalar pure calls,
-    direct flat copies of the literal's strings, literal-string `join`, and
-    the direct `NAME + OTHER` derived list.  A RHS with no mention of `name`
-    cannot alias it, so unrelated bindings remain ordinary policy code.
+    This is a bounded reference proof, not a Python interpreter.  Unknown
+    NAME-containing shapes are `_REF_MAY_RETAIN` by default.  `_REF_NONE` is
+    reserved for the ordinary policy forms whose result is known not to hold
+    the mutable list: a scalar pure call, a direct shallow copy of the trusted
+    flat string list, literal-string `join`, and direct `NAME + OTHER` where
+    OTHER contains no reference to NAME.  The whole RHS is considered,
+    including a call's callee, so a closure or a second list operand cannot
+    hide a retained reference.
     """
-    if not any(isinstance(sub, ast.Name) and sub.id == name for sub in ast.walk(value)):
-        return False
-    if isinstance(value, ast.BinOp):
-        return not (
-            isinstance(value.op, ast.Add)
-            and isinstance(value.left, ast.Name)
-            and value.left.id == name
-        )
-    if isinstance(value, ast.Call):
-        if _call_is_pure(value.func, bound):
-            if isinstance(value.func, ast.Attribute):
-                # `_call_is_pure` admits only a literal-string `.join`, whose
-                # result is always a string rather than a list reference.
-                return False
-            if value.func.id in _PURE_SCALAR_CALLEES:
-                return False
-            if value.func.id in _PURE_SHALLOW_COPY_CALLEES:
-                return not (
-                    len(value.args) == 1
-                    and not value.keywords
-                    and isinstance(value.args[0], ast.Name)
-                    and value.args[0].id == name
-                )
-        # An unknown callee may return any argument unchanged. It is safe only
-        # when each argument has already proved it cannot retain the list.
-        arguments = list(value.args)
-        arguments.extend(keyword.value for keyword in value.keywords)
-        return any(_binding_value_aliases_name(argument, name, bound) for argument in arguments)
-    return True
+    if isinstance(value, ast.Name) and value.id == name:
+        return _REF_DIRECT
+
+    children = list(ast.iter_child_nodes(value))
+    child_refs = [_binding_result_reference(child, name, bound) for child in children]
+    if all(ref == _REF_NONE for ref in child_refs):
+        return _REF_NONE
+
+    if isinstance(value, ast.Call) and _call_is_pure(value.func, bound):
+        if isinstance(value.func, ast.Attribute):
+            # `_call_is_pure` admits only a literal-string `.join`; its
+            # result is a string even when its iterable reads NAME.
+            return _REF_NONE
+        if value.func.id in _PURE_SCALAR_CALLEES:
+            return _REF_NONE
+        if value.func.id in _PURE_SHALLOW_COPY_CALLEES:
+            # The trusted assignment is validated as a flat list of strings,
+            # so copying NAME directly copies only immutable string elements.
+            if (
+                len(value.args) == 1
+                and not value.keywords
+                and isinstance(value.args[0], ast.Name)
+                and value.args[0].id == name
+            ):
+                return _REF_NONE
+
+    if (
+        isinstance(value, ast.BinOp)
+        and isinstance(value.op, ast.Add)
+        and isinstance(value.left, ast.Name)
+        and value.left.id == name
+        and _binding_result_reference(value.right, name, bound) == _REF_NONE
+    ):
+        # `NAME` is the trusted flat list, so list concatenation creates a new
+        # outer list and contributes only immutable strings from NAME.  The
+        # right operand must independently prove it retains no NAME reference.
+        return _REF_NONE
+
+    return _REF_MAY_RETAIN
+
+
+def _binding_value_aliases_name(value, name, bound):
+    return _binding_result_reference(value, name, bound) != _REF_NONE
 
 
 def _rebinding_use(node, name, bound):
