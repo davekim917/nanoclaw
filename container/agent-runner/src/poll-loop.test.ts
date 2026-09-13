@@ -26,6 +26,7 @@ import {
   isAupRefusal,
   isCorruptionError,
   processQuery,
+  formatMessagesWithCommands,
   runPollLoop,
   retainCompleteRecallPairs,
   selectInTurnFollowUps,
@@ -620,6 +621,122 @@ describe('formatter', () => {
     expect(prompt).toContain('A&lt;B');
     expect(prompt).toContain('x &gt; y &amp;&amp; z');
   });
+});
+
+describe('native slash command thread context', () => {
+  it('keeps the router-provided transcript when dispatching a native command', () => {
+    insertMessage('threaded-wwbd', 'chat-sdk', {
+      sender: 'Operator',
+      text:
+        '[Thread context]\n' +
+        'Decision bot: Chain consent: which rule should the save drawer mirror?\n' +
+        'Option A mirrors the chain enforcer; Option B mirrors market scope.\n' +
+        '[Latest message]\n' +
+        '<@U_DECISION_BOT> /wwbd ?',
+    });
+
+    const prompt = formatMessagesWithCommands(getPendingMessages(), true);
+    expect(prompt.startsWith('/wwbd ?\n\n')).toBe(true);
+    expect(prompt).toContain('Chain consent: which rule should the save drawer mirror?');
+    expect(prompt).not.toContain('<message');
+  });
+
+  it('keeps a native command ahead of its host-inserted recall companion', () => {
+    // Channel ingress commits recall_context first and its trigger second
+    // (src/modules/mailbox/ops/ingress.ts:94-110). Preserve that production
+    // sequence exactly: native Claude commands only dispatch when their raw
+    // slash token is the first bytes handed to the SDK.
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
+         VALUES (?, ?, ?, datetime('now'), 'pending', ?, ?)`,
+      )
+      .run(
+        'recall-threaded-wwbd-with-recall',
+        2,
+        'system',
+        0,
+        JSON.stringify({ subtype: 'recall_context', text: 'The response card asks about the save drawer.' }),
+      );
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
+         VALUES (?, ?, ?, datetime('now'), 'pending', ?, ?)`,
+      )
+      .run(
+        'threaded-wwbd-with-recall',
+        4,
+        'chat-sdk',
+        1,
+        JSON.stringify({ sender: 'Operator', text: '<@U_DECISION_BOT> /wwbd ?' }),
+      );
+
+    const pair = getPendingMessages();
+    expect(pair.map((message) => message.id)).toEqual(['recall-threaded-wwbd-with-recall', 'threaded-wwbd-with-recall']);
+
+    const prompt = formatMessagesWithCommands(pair, true);
+    expect(prompt.startsWith('/wwbd ?')).toBe(true);
+    expect(prompt).toContain('The response card asks about the save drawer.');
+    expect(prompt.indexOf('[Untrusted recalled evidence')).toBeGreaterThan(0);
+  });
+
+  it('keeps a native command first after cold continuation rotation bootstraps a recalled turn', async () => {
+    // A rotating continuation forces runner-side bootstrap after host recall
+    // already committed its context/trigger pair (poll-loop.ts:389-403, 690-715).
+    setContinuation('claude', 'continuation-that-must-rotate');
+    insertMessage(
+      'recall-rotated-wwbd',
+      'system',
+      { subtype: 'recall_context', text: 'The response card asks about the save drawer.' },
+      { trigger: 0 },
+    );
+    insertMessage(
+      'rotated-wwbd',
+      'chat-sdk',
+      { sender: 'Operator', text: '<@U_DECISION_BOT> /wwbd ?' },
+      { trigger: 1 },
+    );
+
+    const prompts: string[] = [];
+    const provider = {
+      supportsNativeSlashCommands: true,
+      registerMemorySessionHook: () => {},
+      isSessionInvalid: () => false,
+      isRetryable: () => false,
+      maybeRotateContinuation: (continuation: string) =>
+        continuation === 'continuation-that-must-rotate' ? 'fixture rotation' : null,
+      query: ({ prompt }: { prompt: string }) => {
+        prompts.push(prompt);
+        async function* events(): AsyncGenerator<ProviderEvent> {
+          yield { type: 'init', continuation: 'fresh-after-rotation' };
+          yield { type: 'result', text: '<internal>done</internal>' };
+        }
+        return { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+      },
+    };
+    const abort = new AbortController();
+    const loop = runPollLoop({
+      provider: provider as never,
+      providerName: 'claude',
+      cwd: '/tmp',
+      signal: abort.signal,
+      autosaveWorktrees: async () => ({ committed: [], failed: [], skipped: [] }),
+    });
+
+    try {
+      const deadline = Date.now() + 3_000;
+      while (prompts.length === 0) {
+        if (Date.now() >= deadline) throw new Error('timed out waiting for rotated native-command prompt');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(prompts[0]?.startsWith('/wwbd ?')).toBe(true);
+      expect(prompts[0]).toContain('The response card asks about the save drawer.');
+      expect(prompts[0]?.indexOf('runner-fresh-context-bootstrap')).toBeGreaterThan(0);
+    } finally {
+      abort.abort();
+      await loop;
+    }
+  }, 5_000);
 });
 
 describe('chat budget from task content', () => {

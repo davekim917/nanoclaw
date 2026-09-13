@@ -64,6 +64,7 @@ import {
   extractAttachments,
   extractRouting,
   categorizeMessage,
+  nativeSlashCommandPrompt,
   isClearCommand,
   isRunnerCommand,
   stripInternalTags,
@@ -1580,32 +1581,27 @@ export function selectInTurnFollowUps(allPending: MessageInRow[]): MessageInRow[
  * passthrough commands are sent raw (no XML wrapping) so the SDK can
  * dispatch them. Otherwise they fall through to standard XML formatting.
  */
-function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommands: boolean): string {
-  const parts: string[] = [];
+export function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommands: boolean): string {
+  const commands: string[] = [];
   const normalBatch: MessageInRow[] = [];
 
   for (const msg of messages) {
     if (nativeSlashCommands && (msg.kind === 'chat' || msg.kind === 'chat-sdk')) {
       const cmdInfo = categorizeMessage(msg);
       if (cmdInfo.category === 'passthrough' || cmdInfo.category === 'admin') {
-        // Flush normal batch first
-        if (normalBatch.length > 0) {
-          parts.push(formatMessages(normalBatch));
-          normalBatch.length = 0;
-        }
-        // Pass raw command text (no XML wrapping) — SDK handles it natively
-        parts.push(cmdInfo.text);
+        // The host inserts recall_context immediately BEFORE its wake trigger
+        // (src/modules/mailbox/ops/ingress.ts:94-110). Native slash dispatch
+        // is only recognized when the command starts the SDK prompt, so never
+        // flush preceding recall/context rows before it. They are preserved
+        // below, after the command, along with any router-provided transcript.
+        commands.push(nativeSlashCommandPrompt(msg, cmdInfo.text));
         continue;
       }
     }
     normalBatch.push(msg);
   }
 
-  if (normalBatch.length > 0) {
-    parts.push(formatMessages(normalBatch));
-  }
-
-  return parts.join('\n\n');
+  return [...commands, ...(normalBatch.length > 0 ? [formatMessages(normalBatch)] : [])].join('\n\n');
 }
 
 /** What one ATTEMPT produced. An attempt can carry SEVERAL admitted task turns. */
