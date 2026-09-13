@@ -2376,6 +2376,71 @@ ALIAS = SENSITIVE_GLOBS
 ALIAS.append("backend/billing/**")
 ' 'Assign'
 
+# #769: a trusted literal may have exactly one target.  Chained assignment
+# makes the other target an alias of that literal, so it can widen the policy
+# while the classifier would otherwise read only the original permissions
+# glob and size this billing change `light`.
+assert_policy_refused chained-alias-append 'LEGACY = SENSITIVE_GLOBS = ["backend/permissions/**"]
+LEGACY.append("backend/billing/**")
+' 'Assign'
+
+# An alias can also hide in a destructuring RHS; the direct-name-only check
+# above must not treat this as the ordinary derived-list read below.
+assert_policy_refused tuple-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+LEGACY, UNUSED = (SENSITIVE_GLOBS, [])
+LEGACY.append("backend/billing/**")
+' 'aliases'
+
+# Likewise, a conditional can bind the trusted list itself on one branch.
+# The condition is true here so this also describes a real import-time
+# widening, but the classifier must refuse any branch that can alias it.
+assert_policy_refused conditional-alias-append 'USE_LEGACY = True
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+LEGACY = SENSITIVE_GLOBS if USE_LEGACY else []
+LEGACY.append("backend/billing/**")
+' 'aliases'
+
+# A pure callee is only non-mutating; it does not promise a deep copy.  These
+# wrappers retain the trusted list as an element, so either later mutation
+# widens the imported policy even though direct `tuple(SENSITIVE_GLOBS)` and
+# `list(SENSITIVE_GLOBS)` remain valid copies of the literal strings.
+assert_policy_refused tuple-wrapped-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+LEGACY, = tuple([SENSITIVE_GLOBS])
+LEGACY.append("backend/billing/**")
+' 'aliases'
+
+assert_policy_refused list-wrapped-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+LEGACY = list([SENSITIVE_GLOBS])
+LEGACY[0].append("backend/billing/**")
+' 'aliases'
+
+# The wrapper's reference can also be extracted immediately, without a
+# named intermediate container.  The binding guard must cover the expression
+# that receives the alias, not only the wrapper assignment shape.
+assert_policy_refused subscript-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+LEGACY = (SENSITIVE_GLOBS,)[0]
+LEGACY.append("backend/billing/**")
+' 'aliases'
+
+# A walrus binds at top level too.  It is not an Assign node, but it can make
+# the same direct alias before a later mutation widens the imported policy.
+assert_policy_refused walrus-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+(LEGACY := SENSITIVE_GLOBS)
+LEGACY.append("backend/billing/**")
+' 'aliases'
+
+# New outer containers do not prove a deep copy. Both bindings retain the
+# policy list as element zero, then mutate that exact object at import time.
+assert_policy_refused list-plus-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+LEGACY = [SENSITIVE_GLOBS] + []
+LEGACY[0].append("backend/billing/**")
+' 'aliases'
+
+assert_policy_refused comprehension-alias-append 'SENSITIVE_GLOBS = ["backend/permissions/**"]
+LEGACY = [glob for glob in [SENSITIVE_GLOBS]]
+LEGACY[0].append("backend/billing/**")
+' 'aliases'
+
 # A read is not an alias: `ALL = NAME + OTHER` builds a NEW list and leaves
 # the constant alone, so the same file with a derived read still classifies.
 # (Covered by the realistic fixture above; this is the one-line contrast.)
@@ -2445,6 +2510,7 @@ COPIED_GLOBS = list(SENSITIVE_GLOBS)
 UNIQUE_GLOBS = set(SENSITIVE_GLOBS)
 HAS_ANY = any(SENSITIVE_GLOBS)
 HAS_ALL = all(SENSITIVE_GLOBS)
+EMPTY_COPY = list([])
 GLOB_RE = "|".join(SENSITIVE_GLOBS)
 ALL_GLOBS = SENSITIVE_GLOBS + ["backend/legacy/**"]
 PY

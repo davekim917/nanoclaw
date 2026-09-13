@@ -188,6 +188,8 @@ def _roots_at_name(node, name):
 # which leaves the literal this classifier reads a stale, partial policy
 # (round-2 review of #736).
 _PURE_CALLEES = frozenset(("len", "sorted", "tuple", "list", "set", "any", "all"))
+_PURE_SCALAR_CALLEES = frozenset(("len", "any", "all"))
+_PURE_SHALLOW_COPY_CALLEES = frozenset(("sorted", "tuple", "list", "set"))
 
 
 def _module_bound_names(tree):
@@ -349,6 +351,48 @@ def _called_function_escape(node, defs):
     return None
 
 
+def _binding_value_aliases_name(value, name, bound):
+    """True unless `value` has a narrow proof that it drops `name`'s list.
+
+    This is intentionally not an expression interpreter.  A binding that
+    mentions the policy list is unsafe by default: wrapping it, indexing it,
+    or passing it through a helper can preserve the same mutable object.  The
+    exceptions are only the reads the real policy needs: scalar pure calls,
+    direct flat copies of the literal's strings, literal-string `join`, and
+    the direct `NAME + OTHER` derived list.  A RHS with no mention of `name`
+    cannot alias it, so unrelated bindings remain ordinary policy code.
+    """
+    if not any(isinstance(sub, ast.Name) and sub.id == name for sub in ast.walk(value)):
+        return False
+    if isinstance(value, ast.BinOp):
+        return not (
+            isinstance(value.op, ast.Add)
+            and isinstance(value.left, ast.Name)
+            and value.left.id == name
+        )
+    if isinstance(value, ast.Call):
+        if _call_is_pure(value.func, bound):
+            if isinstance(value.func, ast.Attribute):
+                # `_call_is_pure` admits only a literal-string `.join`, whose
+                # result is always a string rather than a list reference.
+                return False
+            if value.func.id in _PURE_SCALAR_CALLEES:
+                return False
+            if value.func.id in _PURE_SHALLOW_COPY_CALLEES:
+                return not (
+                    len(value.args) == 1
+                    and not value.keywords
+                    and isinstance(value.args[0], ast.Name)
+                    and value.args[0].id == name
+                )
+        # An unknown callee may return any argument unchanged. It is safe only
+        # when each argument has already proved it cannot retain the list.
+        arguments = list(value.args)
+        arguments.extend(keyword.value for keyword in value.keywords)
+        return any(_binding_value_aliases_name(argument, name, bound) for argument in arguments)
+    return True
+
+
 def _rebinding_use(node, name, bound):
     """How top-level statement `node` binds or mutates `name`, as a phrase,
     or None if it does neither. `bound` is every name module-level code binds
@@ -407,13 +451,14 @@ def _rebinding_use(node, name, bound):
             return "hands it to a call that could mutate"
         if isinstance(sub, (ast.Global, ast.Nonlocal)) and name in sub.names:
             return "declares a global/nonlocal binding for"
-        # `X = NAME` / `X: T = NAME` -- an alias shares the one list object,
-        # so `X.append(...)` further down changes what the policy uses while
-        # the literal above still reads complete.
+        # `X = NAME`, destructuring a tuple that contains NAME, or binding a
+        # conditional that can select NAME all preserve the one list object.
+        # A mutation through the other binding then leaves the literal above
+        # looking complete while the imported policy has widened.
         if (
-            isinstance(sub, (ast.Assign, ast.AnnAssign))
-            and isinstance(sub.value, ast.Name)
-            and sub.value.id == name
+            isinstance(sub, (ast.Assign, ast.AnnAssign, ast.NamedExpr))
+            and sub.value is not None
+            and _binding_value_aliases_name(sub.value, name, bound)
         ):
             return "aliases"
         # Rebinding through a STRING field, which no ast.Name check above can
@@ -487,7 +532,15 @@ def _find_top_level_assignment(tree, name):
             continue
         is_plain_assign = False
         if isinstance(node, ast.Assign):
-            is_plain_assign = any(isinstance(t, ast.Name) and t.id == name for t in node.targets)
+            # A chained/multi-target assignment binds every target to the
+            # same RHS object.  Trust only one bare target: other targets
+            # would be aliases of this policy list even when the RHS itself
+            # is a literal.
+            is_plain_assign = (
+                len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == name
+            )
         elif isinstance(node, ast.AnnAssign):
             is_plain_assign = (
                 isinstance(node.target, ast.Name)
