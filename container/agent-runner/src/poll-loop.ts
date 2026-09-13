@@ -1582,34 +1582,26 @@ export function selectInTurnFollowUps(allPending: MessageInRow[]): MessageInRow[
  * dispatch them. Otherwise they fall through to standard XML formatting.
  */
 export function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommands: boolean): string {
-  const parts: string[] = [];
+  const commands: string[] = [];
   const normalBatch: MessageInRow[] = [];
 
   for (const msg of messages) {
     if (nativeSlashCommands && (msg.kind === 'chat' || msg.kind === 'chat-sdk')) {
       const cmdInfo = categorizeMessage(msg);
       if (cmdInfo.category === 'passthrough' || cmdInfo.category === 'admin') {
-        // Flush normal batch first
-        if (normalBatch.length > 0) {
-          parts.push(formatMessages(normalBatch));
-          normalBatch.length = 0;
-        }
-        // Keep the raw command first so the SDK dispatches it natively, while
-        // retaining any router-provided thread transcript after it.  Dropping
-        // that transcript made `/wwbd` under a response card lose the actual
-        // decision it was meant to assess.
-        parts.push(nativeSlashCommandPrompt(msg, cmdInfo.text));
+        // The host inserts recall_context immediately BEFORE its wake trigger
+        // (src/modules/mailbox/ops/ingress.ts:94-110). Native slash dispatch
+        // is only recognized when the command starts the SDK prompt, so never
+        // flush preceding recall/context rows before it. They are preserved
+        // below, after the command, along with any router-provided transcript.
+        commands.push(nativeSlashCommandPrompt(msg, cmdInfo.text));
         continue;
       }
     }
     normalBatch.push(msg);
   }
 
-  if (normalBatch.length > 0) {
-    parts.push(formatMessages(normalBatch));
-  }
-
-  return parts.join('\n\n');
+  return [...commands, ...(normalBatch.length > 0 ? [formatMessages(normalBatch)] : [])].join('\n\n');
 }
 
 /** What one ATTEMPT produced. An attempt can carry SEVERAL admitted task turns. */

@@ -640,6 +640,45 @@ describe('native slash command thread context', () => {
     expect(prompt).toContain('Chain consent: which rule should the save drawer mirror?');
     expect(prompt).not.toContain('<message');
   });
+
+  it('keeps a native command ahead of its host-inserted recall companion', () => {
+    // Channel ingress commits recall_context first and its trigger second
+    // (src/modules/mailbox/ops/ingress.ts:94-110). Preserve that production
+    // sequence exactly: native Claude commands only dispatch when their raw
+    // slash token is the first bytes handed to the SDK.
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
+         VALUES (?, ?, ?, datetime('now'), 'pending', ?, ?)`,
+      )
+      .run(
+        'recall-threaded-wwbd-with-recall',
+        2,
+        'system',
+        0,
+        JSON.stringify({ subtype: 'recall_context', text: 'The response card asks about the save drawer.' }),
+      );
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
+         VALUES (?, ?, ?, datetime('now'), 'pending', ?, ?)`,
+      )
+      .run(
+        'threaded-wwbd-with-recall',
+        4,
+        'chat-sdk',
+        1,
+        JSON.stringify({ sender: 'Operator', text: '<@U_DECISION_BOT> /wwbd ?' }),
+      );
+
+    const pair = getPendingMessages();
+    expect(pair.map((message) => message.id)).toEqual(['recall-threaded-wwbd-with-recall', 'threaded-wwbd-with-recall']);
+
+    const prompt = formatMessagesWithCommands(pair, true);
+    expect(prompt.startsWith('/wwbd ?')).toBe(true);
+    expect(prompt).toContain('The response card asks about the save drawer.');
+    expect(prompt.indexOf('[Untrusted recalled evidence')).toBeGreaterThan(0);
+  });
 });
 
 describe('chat budget from task content', () => {
