@@ -8,10 +8,12 @@ import { effectiveDockerArgBeforeFinalRun } from '../../../../setup/lib/dockerfi
 // Mock the SDK before importing claude.ts, so sdkQuery is interceptable.
 // We capture the options passed to sdkQuery to verify sticky config behavior.
 let capturedSdkOptions: Record<string, unknown> | null = null;
+let capturedSdkPrompt: unknown = null;
 let capturedSetModel: Array<string | undefined> = [];
 let capturedFlagSettings: Array<Record<string, unknown>> = [];
 const mockSdkQuery = mock((_args: unknown) => {
-  const args = _args as { options?: Record<string, unknown> };
+  const args = _args as { prompt: unknown; options?: Record<string, unknown> };
+  capturedSdkPrompt = args.prompt;
   capturedSdkOptions = args.options ?? null;
   // Async iterable that immediately ends, plus the live-control surface
   // (setModel / applyFlagSettings) that applySettings exercises.
@@ -95,6 +97,15 @@ function makeClaudeProvider(
   return provider;
 }
 
+async function firstSdkUserPrompt(): Promise<{ type: string; message: { role: string; content: string } }> {
+  const stream = capturedSdkPrompt as AsyncIterable<{ type: string; message: { role: string; content: string } }>;
+  const iterator = stream[Symbol.asyncIterator]();
+  const first = await iterator.next();
+  await iterator.return?.();
+  if (first.done || !first.value) throw new Error('Claude provider did not hand the SDK an initial user prompt');
+  return first.value;
+}
+
 describe('claudeConfigSchema', () => {
   it('test_claude_cli_agent_sdk_lockstep: installed SDK declares the image CLI version', () => {
     const agentRunnerRoot = path.resolve(import.meta.dir, '../..');
@@ -121,6 +132,27 @@ describe('claudeConfigSchema', () => {
 
   it('test_claude_effort_contract: the runtime schema exposes the SDK effort surface', () => {
     expect(CLAUDE_EFFORT_LEVELS).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+  });
+
+  it('test_native_slash_thread_context_reaches_the_Claude_SDK_as_a_raw_multiline_user_prompt', async () => {
+    capturedSdkPrompt = null;
+    mockSdkQuery.mockClear();
+    const prompt =
+      '/wwbd ?\n\n' +
+      '[Thread context]\n' +
+      'Decision bot: Chain consent: which rule should the save drawer mirror?\n' +
+      'Option A mirrors the chain enforcer; Option B mirrors market scope.';
+
+    makeClaudeProvider().query({ prompt, cwd: '/tmp' });
+
+    expect(mockSdkQuery).toHaveBeenCalledTimes(1);
+    // The Agent SDK's query contract accepts this stream directly
+    // (sdk.d.ts:2953). It must receive the unwrapped command as its first
+    // bytes: wrapping it in our XML envelope stops native slash dispatch.
+    expect(await firstSdkUserPrompt()).toMatchObject({
+      type: 'user',
+      message: { role: 'user', content: prompt },
+    });
   });
 
   it('test_claudeConfigSchema_valid_effort_max: parses { effort: max }', () => {

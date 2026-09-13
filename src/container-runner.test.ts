@@ -139,6 +139,7 @@ import {
   resolveMemoryAdmissionBudgetMb,
   serializeMcpServersEnv,
   resolveAnthropicAuth,
+  assertWikiEgressAllowed,
   resolveCodexAuthFallbacks,
   materializeCodexFallbackRuntime,
   resolveProviderName,
@@ -154,6 +155,7 @@ import {
   persistResolvedWorkgroupAtSpawn,
   resolveWorkgroupIdAtSpawn,
   stripEnvEntry,
+  wikiModelAuth,
   wakeContainer,
   killContainer,
   sessionStillActive,
@@ -902,6 +904,51 @@ describe('resolveAnthropicAuth', () => {
     const auth = resolveAnthropicAuth('any-folder', env, envFile);
     expect(auth.oauthPrimary).toBe('global-oauth');
     expect(auth.oauthFallbacks).toEqual([{ index: 2, value: 'global-oauth-2' }]);
+  });
+});
+
+describe('wikiModelAuth', () => {
+  it('uses OAuth plus its rotation set when present', () => {
+    expect(
+      wikiModelAuth({
+        oauthPrimary: 'oauth-primary',
+        oauthFallbacks: [{ index: 2, value: 'oauth-secondary' }],
+        apiKeyPrimary: 'api-primary',
+        apiKeyFallbacks: [],
+        oauthScoped: false,
+      }),
+    ).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: 'oauth-primary', CLAUDE_CODE_OAUTH_TOKEN_2: 'oauth-secondary' });
+  });
+
+  it('uses the supported API-key family when OAuth is absent', () => {
+    expect(
+      wikiModelAuth({
+        oauthPrimary: undefined,
+        oauthFallbacks: [],
+        apiKeyPrimary: 'api-primary',
+        apiKeyFallbacks: [{ index: 3, value: 'api-secondary' }],
+        oauthScoped: false,
+      }),
+    ).toEqual({ ANTHROPIC_API_KEY: 'api-primary', ANTHROPIC_API_KEY_3: 'api-secondary' });
+  });
+
+  it('refuses a maintenance spawn without either model-authentication family', () => {
+    expect(() =>
+      wikiModelAuth({
+        oauthPrimary: undefined,
+        oauthFallbacks: [],
+        apiKeyPrimary: undefined,
+        apiKeyFallbacks: [],
+        oauthScoped: false,
+      }),
+    ).toThrow('authentication unavailable');
+  });
+});
+
+describe('wiki maintenance egress boundary', () => {
+  it('refuses the restricted runtime when global lockdown has no model-only route', () => {
+    expect(() => assertWikiEgressAllowed(true)).toThrow('direct model egress');
+    expect(() => assertWikiEgressAllowed(false)).not.toThrow();
   });
 });
 

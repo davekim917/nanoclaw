@@ -111,6 +111,29 @@ export function categorizeMessage(msg: MessageInRow): CommandInfo {
 }
 
 /**
+ * Keep a threaded message's preceding transcript available to a native slash
+ * command without moving the command away from the start of the prompt.
+ *
+ * Claude Code only dispatches a native command when it is presented raw and
+ * first.  `categorizeMessage` therefore intentionally peels the router's
+ * `[Thread context] ... [Latest message]` wrapper to identify `/command`.
+ * Passing that peeled string on its own, however, silently turns a reply such
+ * as `/wwbd` under a decision card into a command with no subject.  Preserve
+ * the earlier transcript *after* the raw command: the provider can still
+ * dispatch it, while the skill receives the decision it is being asked about.
+ */
+export function nativeSlashCommandPrompt(msg: MessageInRow, commandText: string): string {
+  const content = parseContent(msg.content);
+  const rawText = (content.text || '').trim();
+  const marker = '[Latest message]\n';
+  const markerIndex = rawText.lastIndexOf(marker);
+  if (markerIndex === -1) return commandText;
+
+  const threadContext = rawText.slice(0, markerIndex).trim();
+  return threadContext ? `${commandText}\n\n${threadContext}` : commandText;
+}
+
+/**
  * Narrow check for /clear — the only command the runner handles directly.
  * All other command gating (filtered, admin) is done by the host router
  * before messages reach the container. Must unwrap thread-context and

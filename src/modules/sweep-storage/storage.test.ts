@@ -190,10 +190,11 @@ describe('F-16.2', () => {
     const source = fs.readFileSync(path.resolve('src/container-runner.ts'), 'utf8');
 
     expect(source.match(/(?<!\w)buildArchiveProjection\(/g) ?? []).toEqual([]);
-    // And exactly one awaited hand-off to the worker, so the spawn path still
-    // waits for the projection rather than racing it.
-    expect(source.match(/(?<!\w)ensureArchiveProjection\(/g) ?? []).toHaveLength(1);
-    expect(source).toContain('await ensureArchiveProjection(');
+    // Both ordinary and isolated wiki spawns hand the work off to the worker;
+    // neither may race its projection.
+    const projectionHandoffs = source.match(/(?<!\w)ensureArchiveProjection\(/g) ?? [];
+    expect(projectionHandoffs).toHaveLength(2);
+    expect(source.match(/await ensureArchiveProjection\(/g) ?? []).toHaveLength(projectionHandoffs.length);
   });
 });
 

@@ -759,6 +759,7 @@ export const SWEEP_DUTY_INVENTORY: Readonly<Record<string, string>> = {
   // leaves a row behind that no foreign key removes. Body in
   // `src/modules/sweep-central/coordination-orphans.ts`.
   FORK2: 'coordination-orphans',
+  FORK3: 'wiki-admission-recovery',
   S2: 'processing-ack-sync',
   S3: 'stale-pending-expiry',
   S4: 'pre-wake-orphan-claim-reset',

@@ -144,6 +144,82 @@ afterEach(async () => {
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
+describe('host-enrolled wiki maintenance mounts', () => {
+  it('ordinary mounts survive malformed publication policy, but a listed actor missing its marker cannot spawn', async () => {
+    const ag = group('ordinary-wiki-neighbor', 'ordinary-wiki-neighbor');
+    await createAgentGroup(ag);
+    assignWorkgroup(ag, 'example');
+    await ensureContainerConfig(ag.id);
+    const policyDir = path.join(GROUPS_DIR, '_ops', 'wiki');
+    fs.mkdirSync(policyDir, { recursive: true });
+    const identity = path.join(policyDir, 'actors.json');
+    fs.writeFileSync(identity, JSON.stringify({ version: 1, actorGroupIds: ['writer', 'verifier'] }));
+    fs.writeFileSync(path.join(policyDir, 'admission.json'), '{malformed');
+    const mounts = await buildMounts(
+      ag,
+      session('ordinary-policy-test', ag.id),
+      containerConfig(),
+      'claude',
+      {},
+      'example',
+    );
+    expect(mounts.some((mount) => mount.containerPath === '/workspace/agent')).toBe(true);
+    fs.writeFileSync(identity, JSON.stringify({ version: 1, actorGroupIds: [ag.id, 'verifier'] }));
+    await expect(
+      buildMounts(ag, session('listed-policy-test', ag.id), containerConfig(), 'claude', {}, 'example'),
+    ).rejects.toThrow('marker');
+  });
+  it('uses private runtime surfaces and omits repository, shared-memory and application mounts', async () => {
+    const ag = group('wiki-writer', 'wiki-writer');
+    await createAgentGroup(ag);
+    assignWorkgroup(ag, 'example');
+    const policyDir = path.join(GROUPS_DIR, '_ops', 'wiki');
+    fs.mkdirSync(policyDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(policyDir, 'actors.json'),
+      JSON.stringify({ version: 1, actorGroupIds: [ag.id, 'wiki-verifier'] }),
+    );
+    fs.writeFileSync(
+      path.join(policyDir, 'admission.json'),
+      JSON.stringify({
+        version: 1,
+        workgroupId: 'example',
+        repository: 'wiki',
+        defaultRef: 'refs/heads/main',
+        writerGroupId: ag.id,
+        verifierGroupId: 'wiki-verifier',
+        seriesId: 'synth-example',
+        sourcePrefixes: ['https://primary.example/'],
+        notification: { channelType: 'test', instance: 'test', platformId: 'example', threadId: null },
+      }),
+    );
+    const sess = session('wiki-maintenance-session', ag.id);
+    const cfg = { ...containerConfig(), wikiMaintenance: true, provider: 'claude' };
+    const mounts = await buildMounts(ag, sess, cfg, 'claude', {}, 'example');
+    expect(mounts.some((m) => m.containerPath === '/workspace/archive.db' && m.readonly)).toBe(true);
+    expect(mounts.some((m) => m.containerPath === '/app/src' && m.readonly)).toBe(true);
+    expect(mounts.filter((m) => !m.readonly).map((m) => m.containerPath)).toEqual([
+      '/workspace',
+      '/workspace/agent',
+      '/home/node/.claude',
+    ]);
+    expect(mounts.filter((m) => !m.readonly).every((m) => !m.hostPath.startsWith(GROUPS_DIR))).toBe(true);
+    expect(mounts.some((m) => /worktrees|workgroup|gh-token|plugins|\.aws|\.wix/.test(m.containerPath))).toBe(false);
+    await expect(
+      buildMounts(ag, sess, { ...cfg, githubTokenEnv: 'FAKE_TOKEN' }, 'claude', {}, 'example'),
+    ).rejects.toThrow('extra runtime');
+    getRawDb()
+      .prepare('UPDATE workgroups SET onecli_secrets = ? WHERE id = ?')
+      .run('["unexpected-secret-name"]', 'example');
+    const withWorkgroupSecrets = await buildMounts(ag, sess, cfg, 'claude', {}, 'example');
+    // A wiki actor takes the isolated runtime path, whose environment is
+    // assembled only from model authentication (container-runner.ts:6019-6065).
+    // A target workgroup's ordinary OneCLI roster must not make the actor
+    // unusable or add a mount to that isolated surface.
+    expect(withWorkgroupSecrets.map((m) => m.containerPath)).toEqual(mounts.map((m) => m.containerPath));
+  });
+});
+
 describe('container instruction contracts', async () => {
   it('routes Claude and OpenCode through the current seven-skill workflow', async () => {
     const retiredRoutes = ['/team-brief', '/team-design', '/team-qa'];

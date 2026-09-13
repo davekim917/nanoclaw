@@ -16,6 +16,7 @@ import './agents.js';
 import { registerProviderSpecificSelfModTools } from './self-mod.js';
 import './thread-search.js';
 import './git-worktrees.js';
+import './wiki-admission.js';
 import './tone-profiles.js';
 import './remote-control.js';
 import './capabilities.js';

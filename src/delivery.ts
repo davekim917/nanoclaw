@@ -34,6 +34,7 @@ import {
 import { recordTaskRunOutcome } from './db/task-run-outcomes.js';
 import { getMessagingGroup, getMessagingGroupByPlatform } from './db/messaging-groups.js';
 import { runGuarded, type DeliveryGuardSpec, type GuardedDeliveryHandler } from './delivery-guard.js';
+import { allowedWikiOutbound, wikiEnrollment } from './wiki-admission/policy.js';
 import { isUnguarded, unguarded, type Unguarded } from './guard/index.js';
 import { log } from './log.js';
 import { scrubSecrets } from './secret-scrubber.js';
@@ -980,6 +981,17 @@ async function deliverMessage(
   }
 
   const content = JSON.parse(msg.content);
+
+  const wikiGroup = await getAgentGroup(session.agent_group_id);
+  if (wikiGroup) {
+    const { readContainerConfig } = await import('./container-config.js');
+    // Enrollment, not the model's tool list, constrains raw outbound rows too.
+    const cfg = readContainerConfig(wikiGroup.folder);
+    if (wikiEnrollment(wikiGroup.id, cfg.wikiMaintenance === true)) {
+      if (!allowedWikiOutbound(msg.kind, content.action))
+        throw new Error('Wiki maintenance outbound capability denied');
+    }
+  }
 
   // An agent's ask_question must never reuse a pending approval's id: its
   // buttons would carry that id, and a click on them would decode through the

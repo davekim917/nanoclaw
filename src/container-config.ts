@@ -627,6 +627,8 @@ export function validateGitIdentity(value: unknown): GitIdentity | undefined {
 
 /** Shape of the materialized `container.json` file read by the container runner. */
 export interface ContainerConfig {
+  /** Host-enrolled wiki actors fail closed if their private policy is absent. */
+  wikiMaintenance?: boolean;
   mcpServers: Record<string, McpServerConfig>;
   packages: { apt: string[]; npm: string[] };
   imageTag?: string;
@@ -1179,6 +1181,7 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
   validateContainerResources(raw.resources);
 
   return {
+    wikiMaintenance: raw.wikiMaintenance,
     mcpServers: validateMcpServers(raw.mcpServers ?? {}),
     packages: {
       apt: raw.packages?.apt ?? [],
