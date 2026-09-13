@@ -26,6 +26,7 @@ import {
   isAupRefusal,
   isCorruptionError,
   processQuery,
+  formatMessagesWithCommands,
   runPollLoop,
   retainCompleteRecallPairs,
   selectInTurnFollowUps,
@@ -619,6 +620,25 @@ describe('formatter', () => {
     const prompt = formatMessages(messages);
     expect(prompt).toContain('A&lt;B');
     expect(prompt).toContain('x &gt; y &amp;&amp; z');
+  });
+});
+
+describe('native slash command thread context', () => {
+  it('keeps the router-provided transcript when dispatching a native command', () => {
+    insertMessage('threaded-wwbd', 'chat-sdk', {
+      sender: 'Operator',
+      text:
+        '[Thread context]\n' +
+        'Decision bot: Chain consent: which rule should the save drawer mirror?\n' +
+        'Option A mirrors the chain enforcer; Option B mirrors market scope.\n' +
+        '[Latest message]\n' +
+        '<@U_DECISION_BOT> /wwbd ?',
+    });
+
+    const prompt = formatMessagesWithCommands(getPendingMessages(), true);
+    expect(prompt.startsWith('/wwbd ?\n\n')).toBe(true);
+    expect(prompt).toContain('Chain consent: which rule should the save drawer mirror?');
+    expect(prompt).not.toContain('<message');
   });
 });
 

@@ -20,6 +20,7 @@ import {
   stripInternalTags,
   stripLegacyTaskContract,
   categorizeMessage,
+  nativeSlashCommandPrompt,
   hasFlagIntent,
   isClearCommand,
 } from './formatter.js';
@@ -88,6 +89,38 @@ describe('context timezone header', () => {
     const firstMsgIdx = result.indexOf('<message ');
     expect(ctxIdx).toBeGreaterThanOrEqual(0);
     expect(firstMsgIdx).toBeGreaterThan(ctxIdx);
+  });
+});
+
+describe('native slash command context', () => {
+  it('keeps a threaded decision card after the raw command', () => {
+    insertMessage('threaded-command', 'chat-sdk', {
+      sender: 'Operator',
+      text:
+        '[Thread context]\n' +
+        'Decision bot: Chain consent: which rule should the save drawer mirror?\n' +
+        'Option A mirrors the chain enforcer; Option B mirrors market scope.\n' +
+        '[Latest message]\n' +
+        '<@U_DECISION_BOT> /wwbd ?',
+    });
+
+    const message = getPendingMessages()[0]!;
+    const command = categorizeMessage(message);
+    expect(command).toMatchObject({ category: 'passthrough', text: '/wwbd ?' });
+    expect(nativeSlashCommandPrompt(message, command.text)).toBe(
+      '/wwbd ?\n\n' +
+        '[Thread context]\n' +
+        'Decision bot: Chain consent: which rule should the save drawer mirror?\n' +
+        'Option A mirrors the chain enforcer; Option B mirrors market scope.',
+    );
+  });
+
+  it('leaves an unwrapped native command byte-for-byte unchanged', () => {
+    insertMessage('plain-command', 'chat-sdk', { sender: 'Operator', text: '<@U_DECISION_BOT> /wwbd cache design' });
+
+    const message = getPendingMessages()[0]!;
+    const command = categorizeMessage(message);
+    expect(nativeSlashCommandPrompt(message, command.text)).toBe('/wwbd cache design');
   });
 });
 

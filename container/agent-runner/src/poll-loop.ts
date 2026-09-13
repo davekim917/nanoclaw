@@ -64,6 +64,7 @@ import {
   extractAttachments,
   extractRouting,
   categorizeMessage,
+  nativeSlashCommandPrompt,
   isClearCommand,
   isRunnerCommand,
   stripInternalTags,
@@ -1580,7 +1581,7 @@ export function selectInTurnFollowUps(allPending: MessageInRow[]): MessageInRow[
  * passthrough commands are sent raw (no XML wrapping) so the SDK can
  * dispatch them. Otherwise they fall through to standard XML formatting.
  */
-function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommands: boolean): string {
+export function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommands: boolean): string {
   const parts: string[] = [];
   const normalBatch: MessageInRow[] = [];
 
@@ -1593,8 +1594,11 @@ function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommand
           parts.push(formatMessages(normalBatch));
           normalBatch.length = 0;
         }
-        // Pass raw command text (no XML wrapping) — SDK handles it natively
-        parts.push(cmdInfo.text);
+        // Keep the raw command first so the SDK dispatches it natively, while
+        // retaining any router-provided thread transcript after it.  Dropping
+        // that transcript made `/wwbd` under a response card lose the actual
+        // decision it was meant to assess.
+        parts.push(nativeSlashCommandPrompt(msg, cmdInfo.text));
         continue;
       }
     }
