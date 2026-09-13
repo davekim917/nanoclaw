@@ -506,9 +506,9 @@ RISK_LABEL_WORKFLOW='Risk label'
 CI_EXCLUDED_CONTEXTS='["Release policy","Release approval"]'
 # The request marker, hidden in the rendered comment. It is how `request`
 # dedupes per head and counts rounds, and how `merge-check` learns when THIS
-# head's review was asked for. A request can also carry its connector claim in
-# this one marker, avoiding a second visibility-only PR comment.
-REQUEST_MARKER_RE='(^|\n)<!-- pr-review-loop:request head=(?<head>[0-9a-f]{40}) round=(?<round>[0-9]+)(?: claim=(?<claim>[A-Za-z0-9._:-]{1,96}) owner=(?<owner>[A-Za-z0-9._:-]{1,64}) started=(?<started>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z) expires=(?<expires>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z))? -->'
+# head's review was asked for. Its existing creation timestamp is also the
+# connector review's advisory claim start, so this marker stays unchanged.
+REQUEST_MARKER_RE='(^|\n)<!-- pr-review-loop:request head=(?<head>[0-9a-f]{40}) round=(?<round>[0-9]+) -->'
 # A local review must claim itself deliberately. GitHub comment authors are
 # not enough: this installation uses one account for several agent sessions,
 # so `owner` is a required bounded session/operator label. Comment claims are
@@ -871,15 +871,21 @@ request_markers() {
 # not review evidence: invalid or unreadable comments disappear from this
 # advisory view, and a failed read must never change a gate decision.
 live_review_claims() {
-  local head="$1" now="$2" pages
-  pages=$(paginate_connection comments comments_page) || return 1
-  printf '%s\n' "$pages" | jq -cs \
+  local head="$1" now="$2" comment_pages review_pages
+  comment_pages=$(paginate_connection comments comments_page) || return 1
+  review_pages=$(paginate_connection reviews reviews_page) || return 1
+  printf '%s\n%s\n' "$comment_pages" "$review_pages" | jq -cs \
     --arg claimRe "$CLAIM_MARKER_RE" \
     --arg requestRe "$REQUEST_MARKER_RE" \
     --arg completeRe "$CLAIM_COMPLETE_MARKER_RE" \
+    --arg receiptRe "$RECEIPT_MARKER_RE" \
     --arg repo "$REPO" --arg pr "$PR" --arg head "$head" --arg now "$now" \
     --argjson ttl "$REVIEW_CLAIM_DEFAULT_TTL_MINUTES" '
-      [ .[] | .data.repository.pullRequest.comments.nodes[] ] as $comments
+      def epoch: try fromdateiso8601 catch null;
+      ($now | epoch) as $nowEpoch
+      | if $nowEpoch == null then error("invalid current claim time") else . end
+      | [ .[] | .data.repository.pullRequest.comments.nodes[]? ] as $comments
+      | [ .[] | .data.repository.pullRequest.reviews.nodes[]? ] as $reviews
       | (
           [ $comments[]
             | (.body // "") as $body
@@ -894,25 +900,45 @@ live_review_claims() {
             | (.createdAt // "") as $at
             | ((.author.login // "unknown") | tostring) as $actor
             | (try ($body | capture($requestRe)) catch empty)
-            | (.started // $at) as $started
-            | (.expires // (try (($started | fromdateiso8601 + ($ttl * 60)) | strftime("%Y-%m-%dT%H:%M:%SZ")) catch "")) as $expires
+            | $at as $started
+            | (try (($started | fromdateiso8601 + ($ttl * 60)) | strftime("%Y-%m-%dT%H:%M:%SZ")) catch "") as $expires
             | select($expires != "")
-            | {id: (.claim // ("connector-" + .round + "-" + ($started | gsub("[^0-9]"; "")))),
-               owner: (.owner // "connector"), head, started: $started, expires: $expires, actor: $actor, kind: "connector"}
+            | {id: ("connector-" + .round + "-" + ($started | gsub("[^0-9]"; ""))),
+               owner: "connector", head, started: $started, expires: $expires, actor: $actor, kind: "connector"}
           ]
         ) as $claims
       | [ $comments[]
           | (.body // "") as $body
           | (.createdAt // "") as $at
           | (try ($body | capture($completeRe)) catch empty)
-          | {id, owner, head, at: $at}
+          | . as $complete
+          | (try ($body | capture($receiptRe)) catch empty) as $receipt
+          | select($receipt.head == $complete.head)
+          | ($at | epoch) as $atEpoch
+          | select($atEpoch != null)
+          | {id, owner, head, atEpoch: $atEpoch}
         ] as $completed
       | [ $claims[]
-          | select(.head == $head and .expires > $now)
+          | . as $claim
+          | ($claim.started | epoch) as $startedEpoch
+          | ($claim.expires | epoch) as $expiresEpoch
+          | select($claim.head == $head)
+          | select($startedEpoch != null and $expiresEpoch != null)
+          | select($startedEpoch <= $nowEpoch and $expiresEpoch > $startedEpoch)
+          | select(($expiresEpoch - $startedEpoch) <= ($ttl * 60) and $expiresEpoch > $nowEpoch)
           | . as $claim
           | select(any($completed[]?;
-              .id == $claim.id and .owner == $claim.owner and .head == $claim.head and .at >= $claim.started
+              .id == $claim.id and .owner == $claim.owner and .head == $claim.head and .atEpoch >= $startedEpoch
             ) | not)
+          | select(
+              if $claim.kind == "connector" then
+                any($reviews[]?;
+                  ((.author.login // "") | ascii_downcase | startswith("chatgpt-codex-connector"))
+                  and (.commit.oid // "") == $claim.head
+                  and ((.submittedAt | epoch) as $submittedEpoch | $submittedEpoch != null and $submittedEpoch > $startedEpoch)
+                ) | not
+              else true end
+            )
         ]
       | sort_by(.started, .id)'
 }
@@ -921,6 +947,12 @@ current_live_review_claim() {
   local claims
   claims=$(live_review_claims "$1" "$2") || return 1
   printf '%s' "$claims" | jq -cer 'last // empty'
+}
+
+current_live_review_claim_for_owner() {
+  local claims
+  claims=$(live_review_claims "$1" "$2") || return 1
+  printf '%s' "$claims" | jq -cer --arg owner "$3" '[ .[] | select(.owner == $owner) ] | last // empty'
 }
 
 review_claim_advisory() {
@@ -943,11 +975,6 @@ claim_marker_fields() {
 explicit_claim_marker() {
   printf '<!-- pr-review-loop:claim id=%s repo=%s pr=%s head=%s owner=%s started=%s expires=%s -->' \
     "$CLAIM_ID" "$REPO" "$PR" "$1" "$2" "$CLAIM_STARTED" "$CLAIM_EXPIRES"
-}
-
-connector_claim_suffix() {
-  claim_marker_fields connector "$REVIEW_CLAIM_DEFAULT_TTL_MINUTES" || return 1
-  printf ' claim=%s owner=connector started=%s expires=%s' "$CLAIM_ID" "$CLAIM_STARTED" "$CLAIM_EXPIRES"
 }
 
 # The comments connection again, with the author's relationship to the repo,
@@ -1855,20 +1882,15 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
     if [ -n "$claim_now_iso" ]; then
       claim=$(current_live_review_claim "$SCOPE_HEAD" "$claim_now_iso") || claim=""
     fi
-    request_claim_suffix=""
     if [ -n "$claim" ]; then
       printf 'warning: %s; this request spends round %s/%s\n' "$(review_claim_advisory "$claim")" "$round" "$cap" >&2
-    else
-      # The connector round becomes visible in its existing request marker,
-      # not in an additional narrative comment.
-      request_claim_suffix=$(connector_claim_suffix) || exit 1
     fi
     # A request starts a round, so the churn gate judges it as it judges a push:
     # committed history at the head the reviewer will read. Exit 3 propagates.
     run_gate --committed-only --head "$SCOPE_HEAD"
     url=$(gh pr comment "$PR" --repo "$REPO" --body "@codex review
 
-<!-- pr-review-loop:request head=$SCOPE_HEAD round=$round$request_claim_suffix -->")
+<!-- pr-review-loop:request head=$SCOPE_HEAD round=$round -->")
     echo "requested: round=$round/$cap head=$SCOPE_HEAD $url"
     ;;
   claim)
@@ -1909,9 +1931,9 @@ case "${1:?usage: open|churn|classes|gate|push|body|reply|resolve|status|wait|ci
       exit 2
     fi
     claim_now_iso=$(claim_now) || exit 1
-    claim=$(current_live_review_claim "$SCOPE_HEAD" "$claim_now_iso") || claim=""
+    claim=$(current_live_review_claim_for_owner "$SCOPE_HEAD" "$claim_now_iso" "$owner") || claim=""
     if [ -n "$claim" ]; then
-      echo "claim: $(review_claim_advisory "$claim"); no second live marker posted"
+      echo "claim: $(review_claim_advisory "$claim"); this owner already has a live marker"
       exit 0
     fi
     claim_marker_fields "$owner" "$ttl" || exit 1

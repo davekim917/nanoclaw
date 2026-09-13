@@ -376,6 +376,14 @@ function reviewClaim(
 }
 
 function completedClaim(id: string, owner: string, head = HEAD, at = '2026-09-13T01:05:00Z'): Page {
+  return comment(
+    at,
+    `### Substitute review receipt\n\n<!-- pr-review-loop:substitute-receipt head=${head} outcome=approve -->\n<!-- pr-review-loop:claim-complete id=${id} owner=${owner} head=${head} -->`,
+    'davekim917',
+  );
+}
+
+function bareClaimCompletion(id: string, owner: string, head = HEAD, at = '2026-09-13T01:05:00Z'): Page {
   return comment(at, `<!-- pr-review-loop:claim-complete id=${id} owner=${owner} head=${head} -->`, 'davekim917');
 }
 
@@ -1487,9 +1495,7 @@ describe('codex-review risk-scoped review requests', () => {
 
     const result = runHelper(root, ['request']);
     expect(result.status).toBe(0);
-    expect(result.posted).toBe(
-      `@codex review\n\n<!-- pr-review-loop:request head=${HEAD} round=2 claim=connector-20260913010000 owner=connector started=2026-09-13T01:00:00Z expires=2026-09-13T01:45:00Z -->`,
-    );
+    expect(result.posted).toBe(`@codex review\n\n<!-- pr-review-loop:request head=${HEAD} round=2 -->`);
     expect(result.stdout).toContain(`requested: round=2/3 head=${HEAD}`);
     expect(result.calls).toMatch(new RegExp(`^node \\S+ gate --json --committed-only --head ${HEAD}$`, 'm'));
   });
@@ -1529,6 +1535,34 @@ describe('codex-review risk-scoped review requests', () => {
         kind: 'connector',
       },
     });
+  });
+
+  it('retires an existing connector request claim after its connector review of that exact head submits', () => {
+    const root = tempRoot();
+    scopeFixture(root, {
+      labels: [],
+      comments: [marker(HEAD, 1, '2026-09-13T01:00:00Z')],
+      reviews: [review('2026-09-13T01:05:00Z', HEAD)],
+    });
+
+    const scope = runHelper(root, ['scope']);
+    expect(scope.status).toBe(0);
+    expect(JSON.parse(scope.stdout)).not.toHaveProperty('reviewClaim');
+  });
+
+  it('retires an existing connector request claim from its matching substitute completion', () => {
+    const root = tempRoot();
+    scopeFixture(root, {
+      labels: [],
+      comments: [
+        marker(HEAD, 1, '2026-09-13T01:00:00Z'),
+        completedClaim('connector-1-20260913010000', 'connector'),
+      ],
+    });
+
+    const scope = runHelper(root, ['scope']);
+    expect(scope.status).toBe(0);
+    expect(JSON.parse(scope.stdout)).not.toHaveProperty('reviewClaim');
   });
 
   it('warns about a live claim before request spends the PR-wide round budget, but still requests', () => {
@@ -1584,6 +1618,21 @@ describe('codex-review risk-scoped review requests', () => {
     expect(tooLong.posted).toBeNull();
   });
 
+  it('dedupes only a live claim from the same owner, allowing another review owner to announce independently', () => {
+    const root = tempRoot();
+    scopeFixture(root, { labels: [], comments: [reviewClaim('other-review', 'other-session')] });
+
+    const differentOwner = runHelper(root, ['claim', '--head', HEAD, '--owner', 'adversarial-session']);
+    expect(differentOwner.status).toBe(0);
+    expect(differentOwner.posted).toContain('id=adversarial-session-20260913010000');
+
+    scopeFixture(root, { labels: [], comments: [reviewClaim('same-review', 'adversarial-session')] });
+    const sameOwner = runHelper(root, ['claim', '--head', HEAD, '--owner', 'adversarial-session']);
+    expect(sameOwner.status).toBe(0);
+    expect(sameOwner.posted).toBeNull();
+    expect(sameOwner.stdout).toContain('this owner already has a live marker');
+  });
+
   it.each([
     [
       'a foreign repo',
@@ -1595,6 +1644,9 @@ describe('codex-review risk-scoped review requests', () => {
     ],
     ['an expired claim', reviewClaim('expired', 'other', HEAD, '2026-09-13T00:00:00Z', '2026-09-13T00:45:00Z')],
     ['a moved-head claim', reviewClaim('old-head', 'other', OLD_HEAD)],
+    ['a claim whose ISO date cannot be parsed', reviewClaim('bad-date', 'other', HEAD, '2026-02-30T01:00:00Z')],
+    ['a claim that starts in the future', reviewClaim('future-start', 'other', HEAD, '2026-09-13T01:01:00Z')],
+    ['a claim lasting more than the maximum 120 minutes', reviewClaim('long-ttl', 'other', HEAD, '2026-09-13T01:00:00Z', '2026-09-13T03:01:00Z')],
   ])('does not surface %s or change no-claim behavior', (_case, claim) => {
     const root = tempRoot();
     scopeFixture(root, { labels: [], comments: [claim] });
@@ -1652,6 +1704,15 @@ describe('codex-review risk-scoped review requests', () => {
     expect(JSON.parse(retired.stdout)).not.toHaveProperty('reviewClaim');
   });
 
+  it('does not retire an explicit claim from bare completion text outside a substitute receipt', () => {
+    const root = tempRoot();
+    const live = reviewClaim('review-710', 'adversarial-session');
+    scopeFixture(root, { labels: [], comments: [live, bareClaimCompletion('review-710', 'adversarial-session')] });
+
+    const scope = runHelper(root, ['scope']);
+    expect(JSON.parse(scope.stdout)).toMatchObject({ reviewClaim: { id: 'review-710', owner: 'adversarial-session' } });
+  });
+
   it('refuses a skip-verdict head without posting', () => {
     const root = tempRoot();
     scopeFixture(root, { labels: [] });
@@ -1685,7 +1746,7 @@ describe('codex-review risk-scoped review requests', () => {
 
     const raised = runHelper(root, ['request'], { REVIEW_ROUND_CAP: '4' });
     expect(raised.status).toBe(0);
-    expect(raised.posted).toContain(`head=${HEAD} round=4 claim=connector-20260913010000`);
+    expect(raised.posted).toContain(`head=${HEAD} round=4 -->`);
   });
 
   it('propagates a churn-gate REFRAME from request without posting', () => {
