@@ -283,6 +283,7 @@ lease_dir_prepare() {
 
 task_binding_file() { printf '%s/task-binding-%s.json' "$LEASE_DIR" "$1"; }
 task_binding_lock_file() { printf '%s/task-lease-%s.lock' "$LEASE_DIR" "$1"; }
+task_lease_file() { printf '%s/task-lease-%s.json' "$LEASE_DIR" "$1"; }
 task_binding_run_id_ok() { printf '%s' "${1:-}" | grep -Eq '^[A-Za-z0-9._-]{1,200}$' && [ "${1:-}" != ".." ]; }
 
 read_task_binding() {
@@ -306,6 +307,65 @@ read_task_binding() {
     [ -z "$stamp" ] || [ "$(date -u -d "$stamp" +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)" = "$stamp" ] || {
       jq -cn --arg path "$f" '{malformedTaskBinding:true,path:$path}'; return; }
   done
+  printf '%s' "$binding"
+}
+
+read_task_lease() {
+  local run="$1" f lease field stamp
+  f="$(task_lease_file "$run")"
+  if [ ! -e "$f" ]; then printf 'null'; return; fi
+  if ! lease="$(jq -ce --arg run "$run" '
+    select(type == "object" and .schemaVersion == 1 and .kind == "task" and .runId == $run and
+           (.deploySha | type == "string" and test("^[0-9a-f]{40}$")) and
+           (.owner | type == "string" and length > 0) and
+           (.claimedAt | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+           (.renewedAt | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+           (.expiresAt | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")))
+  ' "$f" 2>/dev/null)"; then
+    jq -cn --arg path "$f" '{malformedTaskLease:true,path:$path}'
+    return
+  fi
+  for field in claimedAt renewedAt expiresAt; do
+    stamp="$(jq -r --arg field "$field" '.[$field]' <<<"$lease")"
+    [ "$(date -u -d "$stamp" +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)" = "$stamp" ] || {
+      jq -cn --arg path "$f" '{malformedTaskLease:true,path:$path}'; return; }
+  done
+  printf '%s' "$lease"
+}
+
+write_task_binding() {
+  local run="$1" value="$2" tmp
+  tmp="$(mktemp "$LEASE_DIR/.task-binding-$run.XXXXXX" 2>/dev/null)" || return 1
+  printf '%s\n' "$value" >"$tmp" 2>/dev/null && mv "$tmp" "$(task_binding_file "$run")" 2>/dev/null && return 0
+  rm -f "$tmp" 2>/dev/null || true
+  return 1
+}
+
+resolve_shared_task_binding() {
+  local run="$1" binding lease next
+  binding="$(read_task_binding "$run")"
+  lease="$(read_task_lease "$run")"
+  if jq -e '.malformedTaskBinding == true' <<<"$binding" >/dev/null 2>&1 ||
+     jq -e '.malformedTaskLease == true' <<<"$lease" >/dev/null 2>&1; then
+    jq -cn --argjson binding "$binding" --argjson lease "$lease" \
+      '{malformedSharedTaskIdentity:true,taskBinding:$binding,taskLease:$lease}'
+    return
+  fi
+  if [ "$binding" != null ] && [ "$lease" != null ] &&
+     [ "$(jq -r '.deploySha' <<<"$binding")" != "$(jq -r '.deploySha' <<<"$lease")" ]; then
+    jq -cn --argjson binding "$binding" --argjson lease "$lease" \
+      '{malformedSharedTaskIdentity:true,reason:"shared task lease conflicts with shared task binding",taskBinding:$binding,taskLease:$lease}'
+    return
+  fi
+  if [ "$binding" = null ] && [ "$lease" != null ]; then
+    next="$(jq -cn --arg run "$run" --arg sha "$(jq -r '.deploySha' <<<"$lease")" --arg at "$(jq -r '.claimedAt' <<<"$lease")" \
+      '{schemaVersion:1,kind:"task-binding",runId:$run,deploySha:$sha,boundAt:$at,terminal:null}')"
+    if ! write_task_binding "$run" "$next" || [ "$(read_task_binding "$run")" != "$next" ]; then
+      jq -cn --arg path "$(task_binding_file "$run")" '{taskBindingWriteFailed:true,path:$path}'
+      return
+    fi
+    binding="$next"
+  fi
   printf '%s' "$binding"
 }
 
@@ -341,11 +401,11 @@ task_binding_lock_end() {
 task_binding_guard_absent_begin() {
   local run="$1" binding
   task_binding_lock_begin "$run" || return 1
-  binding="$(read_task_binding "$run")"
+  binding="$(resolve_shared_task_binding "$run")"
   if [ "$binding" != null ]; then
     jq -cn --arg run "$run" --arg path "$(task_binding_file "$run")" --argjson binding "$binding" \
-      '{ok:false,error:(if $binding.malformedTaskBinding == true
-                        then "shared task binding is malformed at " + $path + " - refusing develop claim"
+      '{ok:false,error:(if $binding.malformedSharedTaskIdentity == true or $binding.taskBindingWriteFailed == true
+                        then "shared task identity is malformed or could not be made durable at " + $path + " - refusing develop claim"
                         elif $binding.terminal != null
                         then "run id already finished by a task-scoped certification run - terminal run ids are unique across the gate"
                         else "run id remains bound to a task-scoped certification run - run ids are unique across the gate"

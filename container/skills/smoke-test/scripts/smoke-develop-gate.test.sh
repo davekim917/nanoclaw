@@ -6,6 +6,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATE="$SCRIPT_DIR/smoke-develop-gate.sh"
+REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+LEGACY_GATE_BASE=672f03a309a4f11f1ad194900d83a710c55765d6
 STATE_DIR="$(mktemp -d)"
 TEST_SHARED_ROOT="$(mktemp -d)"
 STUB_BIN="$(mktemp -d)"
@@ -18,6 +20,9 @@ cat > "$STUB_BIN/mountpoint" <<'STUB'
 [ "${1:-}" = "-q" ] && [ "${2:-}" = "${SMOKE_GATE_SHARED_ROOT:-}" ]
 STUB
 chmod +x "$STUB_BIN/mountpoint"
+LEGACY_GATE="$STUB_BIN/legacy-smoke-pr-gate.sh"
+git -C "$REPO_ROOT" show "$LEGACY_GATE_BASE:container/skills/smoke-test/scripts/smoke-pr-gate.sh" >"$LEGACY_GATE"
+chmod +x "$LEGACY_GATE"
 export PATH="$STUB_BIN:$PATH"
 unset SMOKE_GATE_REPO SMOKE_GATE_BACKEND_SERVICE SMOKE_GATE_FRONTEND_SERVICE SMOKE_GATE_DEV_URL 2>/dev/null || true
 
@@ -1758,23 +1763,39 @@ bash "$GATE" claim run-lockheld "$LOCK_SHA" | jq -e '.ok == true and .runId == "
 # develop-state.json can name it.
 fresh_state
 AUTO_DEV_SHA="$(printf '6%.0s' $(seq 40))"
+AUTO_DEV_LEGACY_SHA="$(printf '7%.0s' $(seq 40))"
 export STUB_SOURCE_SHA="$AUTO_DEV_SHA" SMOKE_GATE_RUN_PREFIX=bounddev
 export SMOKE_GATE_DEBOUNCE_SECONDS=10
 bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "debouncing_candidate"' >/dev/null
 export SMOKE_GATE_DEBOUNCE_SECONDS=0
-AUTO_DEV_NOW="$(date -u +%s)"
 mkdir -p "$SMOKE_GATE_LEASE_DIR"
-for OFFSET in $(seq -2 12); do
-  AUTO_DEV_RUN="bounddev-${AUTO_DEV_SHA:0:12}-$(date -u -d "@$((AUTO_DEV_NOW + OFFSET))" +%Y%m%dT%H%M%SZ)"
-  jq -cn --arg run "$AUTO_DEV_RUN" --arg sha "$AUTO_DEV_SHA" \
-    '{schemaVersion:1,kind:"task-binding",runId:$run,deploySha:$sha,boundAt:"2026-09-13T00:00:00Z",terminal:null}' \
-    >"$SMOKE_GATE_LEASE_DIR/task-binding-$AUTO_DEV_RUN.json"
-done
+AUTO_DEV_LEGACY_STATE="$STATE_DIR2/legacy-private"
+mkdir -p "$AUTO_DEV_LEGACY_STATE"
+AUTO_DEV_EPOCH="$(/usr/bin/date -u +%s)"
+AUTO_DEV_ISO="$(/usr/bin/date -u -d "@$AUTO_DEV_EPOCH" +%Y-%m-%dT%H:%M:%SZ)"
+AUTO_DEV_STAMP="$(/usr/bin/date -u -d "@$AUTO_DEV_EPOCH" +%Y%m%dT%H%M%SZ)"
+AUTO_DEV_RUN="bounddev-${AUTO_DEV_SHA:0:12}-$AUTO_DEV_STAMP"
+AUTO_DEV_DATE_BIN="$STUB_BIN/fixed-date-develop"
+mkdir -p "$AUTO_DEV_DATE_BIN"
+cat >"$AUTO_DEV_DATE_BIN/date" <<STUB
+#!/usr/bin/env bash
+if [ "\$*" = '-u +%s' ]; then printf '%s\n' '$AUTO_DEV_EPOCH'
+elif [ "\$*" = '-u +%Y-%m-%dT%H:%M:%SZ' ]; then printf '%s\n' '$AUTO_DEV_ISO'
+else exec /usr/bin/date "\$@"
+fi
+STUB
+chmod +x "$AUTO_DEV_DATE_BIN/date"
+TEST_PATH="$PATH"
+export PATH="$AUTO_DEV_DATE_BIN:$PATH"
+SMOKE_GATE_STATE_DIR="$AUTO_DEV_LEGACY_STATE" bash "$LEGACY_GATE" task-claim "$AUTO_DEV_RUN" "$AUTO_DEV_LEGACY_SHA" owner-legacy >/dev/null
 AUTO_DEV_OUT="$(bash "$GATE" poll)"
+export PATH="$TEST_PATH"
 jq -e '.ok == false and .wakeAgent == true and .data.trigger == "shared_task_binding_unavailable" and
        (.data.detail.error | test("task-scoped"))' <<<"$AUTO_DEV_OUT" >/dev/null || {
   echo "60d: automatic develop poll ignored shared task binding: $AUTO_DEV_OUT" >&2; exit 1; }
 jq -e '.activeRunId == null' "$STATE_DIR2/develop-state.json" >/dev/null
+jq -e --arg sha "$AUTO_DEV_LEGACY_SHA" '.deploySha == $sha and .terminal == null' \
+  "$SMOKE_GATE_LEASE_DIR/task-binding-$AUTO_DEV_RUN.json" >/dev/null
 unset SMOKE_GATE_RUN_PREFIX
 
 # The shared binding path must never be constructed from a traversal-shaped

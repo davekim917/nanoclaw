@@ -127,10 +127,11 @@ interrupted exact `task-finish` resumes directly, including after its lease was
 already removed; it does not re-claim a terminal identity.
 `task-finish <run-id> <deploy-sha> <verdict>` is the terminal step: only the
 run's current lease owner may call it, only for the SHA it claimed, and it
-writes the private write-once verdict, commits matching terminal facts to the
-shared binding, releases the lease, and commits private terminal state. Exact
-retries reconcile a crash between those writes without changing the verdict,
-timestamp, or digest; a second, different verdict is always refused.
+commits exact terminal facts to the shared binding, writes the matching
+private write-once verdict, releases the lease, and commits private terminal
+state. Exact retries reconcile a crash between those writes without changing
+the verdict, timestamp, or digest; a second, different verdict is always
+refused.
 
 `smoke-run-scaffold.sh` and `smoke-evidence-barrier.sh` are always invoked
 directly (never through a wrapper) and read those same two env vars from
@@ -1865,6 +1866,11 @@ checks use the shared ownership namespace and its per-run lock, rather than
 depending on one container's private state directory, so a caller-chosen id
 (from `claim`) is always safe to pass
 to `progress`/`release`/`finish` exactly like a gate-generated one.
+On upgrade, a surviving old task lease is enough SHA-bearing evidence to
+establish the retained binding before any PR/develop claim is considered;
+malformed or contradictory shared records refuse rather than being treated as
+absence. A historical released run that left no SHA-bearing artifact cannot be
+reconstructed and is not assigned invented identity.
 
 `poll` claims the shared coordinator lease before it emits
 `pr_build_settled`. Its payload includes `coordinatorOwnerToken`; treat that

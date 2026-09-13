@@ -12,3 +12,19 @@
   cases cover cross-private-root exclusion, malformed/conflicting evidence,
   lease/slot rollback, and crash cuts before/after binding, verdict, lease
   removal, and private state commit.
+- Correction after readiness review: task acquisition now holds the existing
+  PR run lock after the task identity lock through its binding/private-slot
+  transaction, preventing PR release/finish rollback restoration races. The
+  shared resolver now validates and backfills a surviving base-version task
+  lease for all five reciprocal producers (manual PR, standalone lease,
+  automatic PR, manual develop, automatic develop). Deterministic selective
+  `mv` release/finish rollback fixtures and real base-gate legacy fixtures pass.
+- Fresh correction verification passed both full hermetic gate suites,
+  `smoke-run-scaffold.test.sh`, `gate-campaign-test.sh`, shell syntax checks,
+  `git diff --check`, and the upstream ratchet (`959` entries unchanged,
+  divergence delta `0`). The supplied diagnostic probes now stop at their old
+  expected-success assertions: legacy reciprocal claim returns `ok:false`, and
+  rollback-window task claim returns retryable PR-run-lock contention.
+- Known scope limit: develop still publishes no shared identity, so the
+  pre-existing cross-private-root develop-to-task direction is not covered or
+  represented as fixed.

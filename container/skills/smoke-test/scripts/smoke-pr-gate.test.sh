@@ -8,6 +8,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATE="$SCRIPT_DIR/smoke-pr-gate.sh"
+REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+LEGACY_GATE_BASE=672f03a309a4f11f1ad194900d83a710c55765d6
 
 STUB_BIN="$(mktemp -d)"
 TEST_SHARED_ROOT="$(mktemp -d)"
@@ -178,6 +180,9 @@ cat > "$STUB_BIN/mountpoint" <<'STUB'
 [ "${1:-}" = "-q" ] && [ "${2:-}" = "${SMOKE_GATE_SHARED_ROOT:-}" ]
 STUB
 chmod +x "$STUB_BIN/mountpoint"
+LEGACY_GATE="$STUB_BIN/legacy-smoke-pr-gate.sh"
+git -C "$REPO_ROOT" show "$LEGACY_GATE_BASE:container/skills/smoke-test/scripts/smoke-pr-gate.sh" >"$LEGACY_GATE"
+chmod +x "$LEGACY_GATE"
 REAL_JQ="$(command -v jq)"
 export REAL_JQ
 cat > "$STUB_BIN/jq" <<'STUB'
@@ -290,25 +295,41 @@ bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for
 # private state is written.
 fresh_state
 AUTO_SHA="$(sha d)"
+AUTO_LEGACY_SHA="$(sha e)"
 export SMOKE_GATE_RUN_PREFIX=bound
 export STUB_PR_LIST="[{\"number\":142,\"headRefOid\":\"$AUTO_SHA\",\"headRefName\":\"feature/x\"}]"
 export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
 export STUB_RUN_LIST="[{\"headSha\":\"$AUTO_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
 export STUB_SERVICES='[{"id":"srv-backend-pr-142","name":"XZO-DEV-BACKEND PR #142","serviceDetails":{"parentServer":{"id":"srv-backend-base"},"url":"https://xzo-dev-backend-pr-142.onrender.com"}}]'
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$AUTO_SHA\"}}]"
-AUTO_NOW="$(date -u +%s)"
 mkdir -p "$SMOKE_GATE_LEASE_DIR"
-for OFFSET in $(seq -2 12); do
-  AUTO_RUN="bound-pr142-${AUTO_SHA:0:12}-$(date -u -d "@$((AUTO_NOW + OFFSET))" +%Y%m%dT%H%M%SZ)"
-  jq -cn --arg run "$AUTO_RUN" --arg sha "$AUTO_SHA" \
-    '{schemaVersion:1,kind:"task-binding",runId:$run,deploySha:$sha,boundAt:"2026-09-13T00:00:00Z",terminal:null}' \
-    >"$SMOKE_GATE_LEASE_DIR/task-binding-$AUTO_RUN.json"
-done
+AUTO_LEGACY_STATE="$STATE_DIR/legacy-private"
+mkdir -p "$AUTO_LEGACY_STATE"
+AUTO_EPOCH="$(/usr/bin/date -u +%s)"
+AUTO_ISO="$(/usr/bin/date -u -d "@$AUTO_EPOCH" +%Y-%m-%dT%H:%M:%SZ)"
+AUTO_STAMP="$(/usr/bin/date -u -d "@$AUTO_EPOCH" +%Y%m%dT%H%M%SZ)"
+AUTO_RUN="bound-pr142-${AUTO_SHA:0:12}-$AUTO_STAMP"
+AUTO_DATE_BIN="$STUB_BIN/fixed-date-pr"
+mkdir -p "$AUTO_DATE_BIN"
+cat >"$AUTO_DATE_BIN/date" <<STUB
+#!/usr/bin/env bash
+if [ "\$*" = '-u +%s' ]; then printf '%s\n' '$AUTO_EPOCH'
+elif [ "\$*" = '-u +%Y-%m-%dT%H:%M:%SZ' ]; then printf '%s\n' '$AUTO_ISO'
+else exec /usr/bin/date "\$@"
+fi
+STUB
+chmod +x "$AUTO_DATE_BIN/date"
+TEST_PATH="$PATH"
+export PATH="$AUTO_DATE_BIN:$PATH"
+SMOKE_GATE_STATE_DIR="$AUTO_LEGACY_STATE" bash "$LEGACY_GATE" task-claim "$AUTO_RUN" "$AUTO_LEGACY_SHA" owner-legacy >/dev/null
 AUTO_POLL_OUT="$(bash "$GATE" poll)"
+export PATH="$TEST_PATH"
 jq -e '.ok == false and .wakeAgent == true and .data.trigger == "coordinator_lease_unavailable" and
        (.data.detail.error | test("task-scoped"))' <<<"$AUTO_POLL_OUT" >/dev/null || {
   echo "automatic PR poll ignored shared task binding: $AUTO_POLL_OUT" >&2; exit 1; }
 [ ! -e "$STATE_DIR/pr-142-state.json" ] && [ ! -e "$SMOKE_GATE_LEASE_DIR/pr-142-authority.json" ]
+jq -e --arg sha "$AUTO_LEGACY_SHA" '.deploySha == $sha and .terminal == null' \
+  "$SMOKE_GATE_LEASE_DIR/task-binding-$AUTO_RUN.json" >/dev/null
 unset SMOKE_GATE_RUN_PREFIX
 
 # --- 3a. Target-aware preflight: the gate exports SMOKE_GATE_PREFLIGHT_TARGET_URL
@@ -3296,6 +3317,129 @@ jq -e '.ok == false and (.error | test("malformed|identity evidence"))' <<<"$CON
 jq -e --arg sha "$CROSS_SHA_B" '.activeSha == $sha and .activeLeaseOwner == "old-owner"' \
   "$CONFLICT_STATE/task-run-conflicting-local-state.json" >/dev/null
 [ ! -e "$CONFLICT_LEASE/task-lease-run-conflicting-local.json" ]
+
+# A real task claim from the base version has no binding file, but its shared
+# task lease is surviving, SHA-bearing history. Every manual reciprocal claim
+# producer must backfill that lease before refusing the run id.
+for LEGACY_KIND in pr lease develop; do
+  LEGACY_RUN="run-legacy-$LEGACY_KIND"
+  LEGACY_PRODUCER_STATE="$CROSS_BASE/legacy-producer-$LEGACY_KIND"
+  LEGACY_CONSUMER_STATE="$CROSS_BASE/new-producer-$LEGACY_KIND"
+  LEGACY_PRODUCER_LEASE="$TEST_SHARED_ROOT/legacy-producer-$LEGACY_KIND/leases"
+  mkdir -p "$LEGACY_PRODUCER_STATE" "$LEGACY_CONSUMER_STATE"
+  SMOKE_GATE_STATE_DIR="$LEGACY_PRODUCER_STATE" SMOKE_GATE_LEASE_DIR="$LEGACY_PRODUCER_LEASE" \
+    bash "$LEGACY_GATE" task-claim "$LEGACY_RUN" "$CROSS_SHA_A" owner-legacy | jq -e '.ok == true' >/dev/null
+  LEGACY_LEASE_BEFORE="$(cat "$LEGACY_PRODUCER_LEASE/task-lease-$LEGACY_RUN.json")"
+  [ ! -e "$LEGACY_PRODUCER_LEASE/task-binding-$LEGACY_RUN.json" ]
+  case "$LEGACY_KIND" in
+    pr)
+      LEGACY_OUT="$(SMOKE_GATE_STATE_DIR="$LEGACY_CONSUMER_STATE" SMOKE_GATE_LEASE_DIR="$LEGACY_PRODUCER_LEASE" \
+        bash "$GATE" claim "$LEGACY_RUN" 180 "$CROSS_SHA_B" owner-new)" ;;
+    lease)
+      LEGACY_OUT="$(SMOKE_GATE_STATE_DIR="$LEGACY_CONSUMER_STATE" SMOKE_GATE_LEASE_DIR="$LEGACY_PRODUCER_LEASE" \
+        bash "$GATE" lease-claim "$LEGACY_RUN" owner-new 181)" ;;
+    develop)
+      LEGACY_OUT="$(SMOKE_GATE_STATE_DIR="$LEGACY_CONSUMER_STATE" SMOKE_GATE_LEASE_DIR="$LEGACY_PRODUCER_LEASE" \
+        bash "$DEVELOP_GATE" claim "$LEGACY_RUN" "$CROSS_SHA_B")" ;;
+  esac
+  jq -e '.ok == false and (.error | test("task-scoped|task identity|task run"))' <<<"$LEGACY_OUT" >/dev/null || {
+    echo "$LEGACY_KIND claim ignored a surviving base-version task lease: $LEGACY_OUT" >&2; exit 1; }
+  [ "$(cat "$LEGACY_PRODUCER_LEASE/task-lease-$LEGACY_RUN.json")" = "$LEGACY_LEASE_BEFORE" ]
+  jq -e --arg run "$LEGACY_RUN" --arg sha "$CROSS_SHA_A" \
+    '.runId == $run and .deploySha == $sha and .terminal == null' \
+    "$LEGACY_PRODUCER_LEASE/task-binding-$LEGACY_RUN.json" >/dev/null
+done
+
+# Surviving shared lease evidence is accepted only when its exact shape and SHA
+# agree with any binding. Reciprocal producers fail closed on malformed and
+# contradictory legacy storage rather than fabricating a migration choice.
+LEGACY_BAD_STATE="$CROSS_BASE/legacy-bad" LEGACY_BAD_LEASE="$TEST_SHARED_ROOT/legacy-bad/leases"
+mkdir -p "$LEGACY_BAD_STATE" "$LEGACY_BAD_LEASE"
+printf 'not json\n' >"$LEGACY_BAD_LEASE/task-lease-run-legacy-malformed.json"
+LEGACY_BAD_PR="$(SMOKE_GATE_STATE_DIR="$LEGACY_BAD_STATE" SMOKE_GATE_LEASE_DIR="$LEGACY_BAD_LEASE" \
+  bash "$GATE" claim run-legacy-malformed 184 "$CROSS_SHA_B" owner-new)"
+LEGACY_BAD_DEV="$(SMOKE_GATE_STATE_DIR="$LEGACY_BAD_STATE" SMOKE_GATE_LEASE_DIR="$LEGACY_BAD_LEASE" \
+  bash "$DEVELOP_GATE" claim run-legacy-malformed "$CROSS_SHA_B")"
+for OUT in "$LEGACY_BAD_PR" "$LEGACY_BAD_DEV"; do
+  jq -e '.ok == false and (.error | test("cannot be read|malformed"))' <<<"$OUT" >/dev/null || {
+    echo "malformed legacy task lease failed open: $OUT" >&2; exit 1; }
+done
+jq -cn --arg run run-legacy-conflict --arg sha "$CROSS_SHA_A" \
+  '{schemaVersion:1,kind:"task-binding",runId:$run,deploySha:$sha,boundAt:"2026-09-13T00:00:00Z",terminal:null}' \
+  >"$LEGACY_BAD_LEASE/task-binding-run-legacy-conflict.json"
+jq -cn --arg run run-legacy-conflict --arg sha "$CROSS_SHA_B" \
+  '{schemaVersion:1,kind:"task",runId:$run,deploySha:$sha,owner:"legacy",claimedAt:"2026-09-13T00:00:00Z",renewedAt:"2026-09-13T00:00:00Z",expiresAt:"2099-09-13T00:00:00Z"}' \
+  >"$LEGACY_BAD_LEASE/task-lease-run-legacy-conflict.json"
+LEGACY_CONFLICT_PR="$(SMOKE_GATE_STATE_DIR="$LEGACY_BAD_STATE" SMOKE_GATE_LEASE_DIR="$LEGACY_BAD_LEASE" \
+  bash "$GATE" claim run-legacy-conflict 185 "$CROSS_SHA_B" owner-new)"
+LEGACY_CONFLICT_DEV="$(SMOKE_GATE_STATE_DIR="$LEGACY_BAD_STATE" SMOKE_GATE_LEASE_DIR="$LEGACY_BAD_LEASE" \
+  bash "$DEVELOP_GATE" claim run-legacy-conflict "$CROSS_SHA_B")"
+for OUT in "$LEGACY_CONFLICT_PR" "$LEGACY_CONFLICT_DEV"; do
+  jq -e '.ok == false and (.error | test("cannot be read|malformed"))' <<<"$OUT" >/dev/null || {
+    echo "conflicting shared task identity failed open: $OUT" >&2; exit 1; }
+done
+
+# PR release and finish remove the shared PR lease before their private state
+# commit, then restore it if that commit fails. A task claimant must wait on
+# the existing PR run lock through this controlled temporary-absence window;
+# after rollback it must see the restored PR owner, never create a task binding.
+ROLLBACK_MV_BIN="$STUB_BIN/pr-rollback-mv"
+mkdir -p "$ROLLBACK_MV_BIN"
+cat >"$ROLLBACK_MV_BIN/mv" <<'STUB'
+#!/usr/bin/env bash
+if [ -n "${PROBE_SLOT:-}" ] && [ "${!#}" = "$PROBE_SLOT" ] && [ ! -e "$PROBE_PR_LEASE" ]; then
+  : >"$PROBE_READY"
+  for _probe_wait in $(seq 1 1000); do
+    [ -e "$PROBE_CONTINUE" ] && exit 1
+    sleep 0.01
+  done
+  exit 92
+fi
+exec /usr/bin/mv "$@"
+STUB
+chmod +x "$ROLLBACK_MV_BIN/mv"
+for ROLLBACK_MODE in release finish; do
+  ROLLBACK_RUN="run-pr-rollback-$ROLLBACK_MODE"
+  ROLLBACK_PR_STATE="$CROSS_BASE/pr-rollback-$ROLLBACK_MODE-a"
+  ROLLBACK_TASK_STATE="$CROSS_BASE/pr-rollback-$ROLLBACK_MODE-b"
+  ROLLBACK_LEASE="$TEST_SHARED_ROOT/pr-rollback-$ROLLBACK_MODE/leases"
+  ROLLBACK_PR=$([ "$ROLLBACK_MODE" = release ] && printf 182 || printf 183)
+  mkdir -p "$ROLLBACK_PR_STATE" "$ROLLBACK_TASK_STATE"
+  SMOKE_GATE_STATE_DIR="$ROLLBACK_PR_STATE" SMOKE_GATE_LEASE_DIR="$ROLLBACK_LEASE" \
+    bash "$GATE" claim "$ROLLBACK_RUN" "$ROLLBACK_PR" "$CROSS_SHA_A" owner-pr | jq -e '.ok == true' >/dev/null
+  ROLLBACK_READY="$CROSS_BASE/$ROLLBACK_MODE-ready"
+  ROLLBACK_CONTINUE="$CROSS_BASE/$ROLLBACK_MODE-continue"
+  ROLLBACK_OUT="$CROSS_BASE/$ROLLBACK_MODE-out.json"
+  if [ "$ROLLBACK_MODE" = release ]; then ROLLBACK_ARGS=(release "$ROLLBACK_RUN" owner-pr)
+  else ROLLBACK_ARGS=(finish "$CROSS_SHA_A" "$ROLLBACK_RUN" NO_GO owner-pr); fi
+  PROBE_SLOT="$ROLLBACK_PR_STATE/pr-$ROLLBACK_PR-state.json" \
+  PROBE_PR_LEASE="$ROLLBACK_LEASE/lease-$ROLLBACK_RUN.json" \
+  PROBE_READY="$ROLLBACK_READY" PROBE_CONTINUE="$ROLLBACK_CONTINUE" \
+  SMOKE_GATE_STATE_DIR="$ROLLBACK_PR_STATE" SMOKE_GATE_LEASE_DIR="$ROLLBACK_LEASE" \
+  PATH="$ROLLBACK_MV_BIN:$PATH" bash "$GATE" "${ROLLBACK_ARGS[@]}" >"$ROLLBACK_OUT" &
+  ROLLBACK_PID=$!
+  for _wait in $(seq 1 200); do [ -e "$ROLLBACK_READY" ] && break; sleep 0.02; done
+  [ -e "$ROLLBACK_READY" ] && [ ! -e "$ROLLBACK_LEASE/lease-$ROLLBACK_RUN.json" ] || {
+    echo "$ROLLBACK_MODE rollback fixture never reached the lease-removed cut" >&2; exit 1; }
+  ROLLBACK_TASK_OUT="$(SMOKE_GATE_LOCK_WAIT_SECONDS=1 SMOKE_GATE_STATE_DIR="$ROLLBACK_TASK_STATE" \
+    SMOKE_GATE_LEASE_DIR="$ROLLBACK_LEASE" bash "$GATE" task-claim "$ROLLBACK_RUN" "$CROSS_SHA_B" owner-task)"
+  jq -e '.ok == false and .retryable == true and (.error | test("PR run identity lock"))' \
+    <<<"$ROLLBACK_TASK_OUT" >/dev/null || {
+    echo "task claim read through $ROLLBACK_MODE rollback: $ROLLBACK_TASK_OUT" >&2; exit 1; }
+  : >"$ROLLBACK_CONTINUE"
+  wait "$ROLLBACK_PID" || true
+  jq -e '.ok == false and .leaseRestored == true' "$ROLLBACK_OUT" >/dev/null
+  ROLLBACK_AFTER="$(SMOKE_GATE_STATE_DIR="$ROLLBACK_TASK_STATE" SMOKE_GATE_LEASE_DIR="$ROLLBACK_LEASE" \
+    bash "$GATE" task-claim "$ROLLBACK_RUN" "$CROSS_SHA_B" owner-task)"
+  jq -e --argjson pr "$ROLLBACK_PR" '.ok == false and .activePr == $pr and (.error | test("PR campaign"))' \
+    <<<"$ROLLBACK_AFTER" >/dev/null || {
+    echo "task claim ignored restored PR lease after $ROLLBACK_MODE rollback: $ROLLBACK_AFTER" >&2; exit 1; }
+  [ ! -e "$ROLLBACK_LEASE/task-binding-$ROLLBACK_RUN.json" ] &&
+    [ ! -e "$ROLLBACK_LEASE/task-lease-$ROLLBACK_RUN.json" ] &&
+    [ ! -e "$ROLLBACK_TASK_STATE/task-$ROLLBACK_RUN-state.json" ]
+  SMOKE_GATE_STATE_DIR="$ROLLBACK_PR_STATE" SMOKE_GATE_LEASE_DIR="$ROLLBACK_LEASE" \
+    bash "$GATE" progress "$ROLLBACK_RUN" owner-pr | jq -e '.ok == true' >/dev/null
+done
 
 # An old all-null release erased its SHA and cannot be reconstructed. The
 # upgrade invents no history; a later valid claim establishes the first

@@ -14,8 +14,11 @@ Task claim also refuses an existing shared PR run lease, closing the reverse
 cross-private-root active PR-to-task race.
 
 Claim lock order remains private gate/state locks, then the shared task lock,
-then (for PR claims) the existing PR lifecycle and run locks. No task path
-takes those PR locks before the shared task lock.
+then the existing PR run lock (and, for PR campaign claims, its existing PR
+lifecycle lock before that run lock). Task acquisition proves PR-lease absence
+under the run lock through its binding/private-slot commit, so PR
+release/finish rollback cannot expose a temporary absence. No task path takes
+the PR run lock before the shared task lock.
 
 Release removes only the live task lease. Same-SHA unfinished task recovery is
 allowed; another SHA and every PR/develop claim are refused. Finish commits the
@@ -35,3 +38,8 @@ directory, manual and automatic PR/develop claim producers, reverse active
 PR-to-task exclusion, lease/slot write rollback, terminal write/removal/state
 crash cuts, terminal exclusion in another root with no private verdict,
 malformed/unwritable shared storage, and the honest legacy proof limit.
+
+Out of scope: a develop campaign still has no shared identity record, so a
+task claim in another private root cannot discover a pre-existing develop
+claim. This correction does not claim bidirectional cross-root uniqueness for
+develop-to-task and does not add a develop ownership subsystem.
