@@ -28,9 +28,11 @@
 - Known scope limit: develop still publishes no shared identity, so the
   pre-existing cross-private-root develop-to-task direction is not covered or
   represented as fixed.
-- Review lesson pending the eventual per-PR notes fragment: an identity
+- Review lesson recorded for PR #788 in `docs/review-notes/788.md`: an identity
   invariant is shared only when every producer and rollback writer participates
   in one compatible lock transaction. The initial retained-binding fix still
   read through PR release/finish's temporary lease absence and ignored
   base-version task leases on reciprocal claims; the correction pins both
   failure classes with selective rollback and real legacy-producer fixtures.
+- The fragment passed the current main fragment-aware validator at b0987d39c:
+  `scripts/review-notes.test.ts` (60 tests).
