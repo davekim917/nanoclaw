@@ -100,8 +100,9 @@ of agent-editable prompts or config updates:
   read-only workgroup archive/wiki discovery data, not repository write mounts.
 - Permit only existing model authentication and provider runtime inputs. Reject extra
   credential mounts, scoped application credentials, added MCP servers, additional
-  mounts, credentialFolder aliases, provider fallback or workgroup-secret inheritance
-  that would add application access. No new secrets are requested or assigned.
+  mounts, credentialFolder aliases and provider fallback. A target workgroup may retain
+  its ordinary OneCLI roster, but the isolated wiki runtime never applies OneCLI or
+  exposes that roster. No new secrets are requested or assigned.
 - Use fresh verifier session/provider history for each candidate. Do not expose the
   writer's mutable memory, instructions or evidence files as verifier authority.
 - Disable ncl and self-modification for these actors. At host delivery dispatch, allow

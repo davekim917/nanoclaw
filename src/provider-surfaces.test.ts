@@ -211,7 +211,12 @@ describe('host-enrolled wiki maintenance mounts', () => {
     getRawDb()
       .prepare('UPDATE workgroups SET onecli_secrets = ? WHERE id = ?')
       .run('["unexpected-secret-name"]', 'example');
-    await expect(buildMounts(ag, sess, cfg, 'claude', {}, 'example')).rejects.toThrow('inherit workgroup secrets');
+    const withWorkgroupSecrets = await buildMounts(ag, sess, cfg, 'claude', {}, 'example');
+    // A wiki actor takes the isolated runtime path, whose environment is
+    // assembled only from model authentication (container-runner.ts:6019-6065).
+    // A target workgroup's ordinary OneCLI roster must not make the actor
+    // unusable or add a mount to that isolated surface.
+    expect(withWorkgroupSecrets.map((m) => m.containerPath)).toEqual(mounts.map((m) => m.containerPath));
   });
 });
 

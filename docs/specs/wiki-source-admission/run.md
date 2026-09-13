@@ -323,3 +323,20 @@ scoped lint and whitespace validation again exited 0. This is the same bounded r
 not a reset or a new product change. The final nine-path floor comparison returned
 passed=true with no failures; all floors are unchanged. Freeze follows these final
 artifact checks.
+
+## Target-workgroup activation correction
+
+The requested target workgroup has an ordinary workgroup-level OneCLI roster. The
+restricted runtime does not apply OneCLI: its dedicated Docker-argument branch builds
+only the explicitly allowed model-authentication environment and returns before the
+ordinary gateway configuration (`src/container-runner.ts:6019-6065`). Rejecting an
+actor merely because that target roster exists would therefore make the approved
+restricted publisher impossible to enroll while adding no protection.
+
+The enrollment-time rejection was removed. The mount regression now sets a non-empty
+workgroup roster and proves the wiki actor still receives the same isolated mount set;
+the existing runtime-environment controls continue to reject proxy and GitHub credential
+variables. This does not give the maintenance actor OneCLI access: it corrects a false
+configuration precondition in a path that bypasses OneCLI by construction. Production
+enrollment, credential access verification, task movement and live publication remain
+separate post-merge controls.

@@ -4379,8 +4379,6 @@ export async function buildMounts(
   if (wikiActor) {
     assertWikiActorConfig(containerConfig, wikiActor, wgKey);
     if (provider !== (containerConfig.provider ?? 'claude')) throw new Error('Wiki provider override refused');
-    if ((await getWorkgroupOnecliSecretsById(wgKey)).length)
-      throw new Error('Wiki actor cannot inherit workgroup secrets');
     const sessDir = sessionDir(agentGroup.id, session.id);
     await migrateInboundDbToHostDir(sessDir, { agentGroupId: agentGroup.id, sessionId: session.id });
     assertHostOwnedInboundDb(sessDir, session.id);
