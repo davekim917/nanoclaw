@@ -499,13 +499,40 @@ describe("a click made on the approval's own card still resolves it", () => {
     expect(approved).toEqual([{ approvalId: 'appr-discord', userId: DISCORD_OWNER }]);
   });
 
-  it('OneCLI credential approval', async () => {
+  it('OneCLI credential approval accepts the raw Slack actor from the actual bridge', async () => {
     await seedCredential('oa-click02', 'real-credential-card');
 
-    await handleApprovalsResponse(payload('oa-click02', 'approve', OWNER, 'real-credential-card'));
+    await click('oa-click02', 0, 'UOWNER', 'real-credential-card');
+
+    expect((await getPendingApproval('oa-click02'))?.status).toBe('approved');
+  });
+
+  it('OneCLI credential approval leaves an unknown raw Slack actor pending', async () => {
+    await seedCredential('oa-click03', 'real-credential-card');
+
+    await click('oa-click03', 0, 'UUNKNOWN', 'real-credential-card');
+
+    expect((await getPendingApproval('oa-click03'))?.status).toBe('pending');
+  });
+
+  it('OneCLI credential approval preserves an already namespaced Slack actor', async () => {
+    await seedCredential('oa-click04', 'real-credential-card');
+
+    await handleApprovalsResponse(payload('oa-click04', 'approve', OWNER, 'real-credential-card'));
+
+    expect((await getPendingApproval('oa-click04'))?.status).toBe('approved');
+  });
+
+  it('OneCLI credential approval preserves an already namespaced actor from another platform', async () => {
+    await seedCredential('oa-click05', 'real-credential-card');
+
+    await handleApprovalsResponse({
+      ...payload('oa-click05', 'approve', DISCORD_OWNER, 'real-credential-card'),
+      channelType: 'discord',
+    });
 
     // Nothing is armed in this process, so the decision is held on the row (onecli-approvals.ts:201-213).
-    expect((await getPendingApproval('oa-click02'))?.status).toBe('approved');
+    expect((await getPendingApproval('oa-click05'))?.status).toBe('approved');
   });
 
   it('a registered approval stored without a message id resolves as before', async () => {

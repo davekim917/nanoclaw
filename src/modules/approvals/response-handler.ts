@@ -93,7 +93,7 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
   // resolver looks the row up itself and enforces its own cross-tenant
   // approver-set auth (onecli-approvals.ts), so this runs ahead of
   // isAuthorizedApprovalClick and claims every onecli_credential row.
-  if (await resolveOneCLIApproval(payload.questionId, payload.value, payload.userId ?? '')) {
+  if (await resolveOneCLIApproval(payload.questionId, payload.value, namespacedUserId(payload) ?? '')) {
     return true;
   }
 

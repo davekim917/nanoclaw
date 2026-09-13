@@ -847,7 +847,7 @@
 "src/modules/approvals/reason-capture.test.ts":{"diff":49,"mode":"100644","sha256":"1cbbb7214cb702eacab6639d65ccccc157c8905de79aee8d67757aa6fb299266"},
 "src/modules/approvals/reason-capture.ts":{"diff":46,"mode":"100644","sha256":"982da561df571d1a3bf71120c0f3e9943dd4c3be50c12bb89ace9c1097d3c9c6"},
 "src/modules/approvals/response-handler.test.ts":{"diff":101,"mode":"100644","sha256":"d2d534e6f7d9d21f143ea1d14a421a7c50eef5b220b51b2a8ef448440b41f8de"},
-"src/modules/approvals/response-handler.ts":{"diff":170,"mode":"100644","sha256":"6cfc40320e27ba09f43e878b906ba8e69bf8dc2da7424bdfff2dbd1cd001a4ed"},
+"src/modules/approvals/response-handler.ts":{"diff":170,"mode":"100644","sha256":"4b66670de2f4025f3d545c8161a28e4435f0242a5db1e9e8698dd7b31159837c"},
 "src/modules/approvals/restart-honesty.test.ts":{"diff":238,"mode":"100644","sha256":null,"deleted":true},
 "src/modules/cross-session-context/backfill.test.ts":{"diff":140,"mode":"100644","sha256":null,"deleted":true},
 "src/modules/cross-session-context/backfill.ts":{"diff":153,"mode":"100644","sha256":null,"deleted":true},
