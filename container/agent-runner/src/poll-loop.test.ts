@@ -679,6 +679,64 @@ describe('native slash command thread context', () => {
     expect(prompt).toContain('The response card asks about the save drawer.');
     expect(prompt.indexOf('[Untrusted recalled evidence')).toBeGreaterThan(0);
   });
+
+  it('keeps a native command first after cold continuation rotation bootstraps a recalled turn', async () => {
+    // A rotating continuation forces runner-side bootstrap after host recall
+    // already committed its context/trigger pair (poll-loop.ts:389-403, 690-715).
+    setContinuation('claude', 'continuation-that-must-rotate');
+    insertMessage(
+      'recall-rotated-wwbd',
+      'system',
+      { subtype: 'recall_context', text: 'The response card asks about the save drawer.' },
+      { trigger: 0 },
+    );
+    insertMessage(
+      'rotated-wwbd',
+      'chat-sdk',
+      { sender: 'Operator', text: '<@U_DECISION_BOT> /wwbd ?' },
+      { trigger: 1 },
+    );
+
+    const prompts: string[] = [];
+    const provider = {
+      supportsNativeSlashCommands: true,
+      registerMemorySessionHook: () => {},
+      isSessionInvalid: () => false,
+      isRetryable: () => false,
+      maybeRotateContinuation: (continuation: string) =>
+        continuation === 'continuation-that-must-rotate' ? 'fixture rotation' : null,
+      query: ({ prompt }: { prompt: string }) => {
+        prompts.push(prompt);
+        async function* events(): AsyncGenerator<ProviderEvent> {
+          yield { type: 'init', continuation: 'fresh-after-rotation' };
+          yield { type: 'result', text: '<internal>done</internal>' };
+        }
+        return { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+      },
+    };
+    const abort = new AbortController();
+    const loop = runPollLoop({
+      provider: provider as never,
+      providerName: 'claude',
+      cwd: '/tmp',
+      signal: abort.signal,
+      autosaveWorktrees: async () => ({ committed: [], failed: [], skipped: [] }),
+    });
+
+    try {
+      const deadline = Date.now() + 3_000;
+      while (prompts.length === 0) {
+        if (Date.now() >= deadline) throw new Error('timed out waiting for rotated native-command prompt');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(prompts[0]?.startsWith('/wwbd ?')).toBe(true);
+      expect(prompts[0]).toContain('The response card asks about the save drawer.');
+      expect(prompts[0]?.indexOf('runner-fresh-context-bootstrap')).toBeGreaterThan(0);
+    } finally {
+      abort.abort();
+      await loop;
+    }
+  }, 5_000);
 });
 
 describe('chat budget from task content', () => {

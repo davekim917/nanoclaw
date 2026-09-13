@@ -336,7 +336,7 @@
 "container/agent-runner/src/poll-loop.midturn-recovery.test.ts":{"diff":256,"mode":"100644","sha256":null,"deleted":true},
 "container/agent-runner/src/poll-loop.midturn-resultdoor.test.ts":{"diff":521,"mode":"100644","sha256":null,"deleted":true},
 "container/agent-runner/src/poll-loop.midturn.test.ts":{"diff":421,"mode":"100644","sha256":null,"deleted":true},
-"container/agent-runner/src/poll-loop.test.ts":{"diff":3474,"mode":"100644","sha256":"24924caacd7d31344ebea65a75c431d3631b5ef85471fd08ce69e829cd1da09f"},
+"container/agent-runner/src/poll-loop.test.ts":{"diff":3526,"mode":"100644","sha256":"556dda9744c108f7e6252c3d98446cfbb71a84b984a2badcd197d78d499460ab"},
 "container/agent-runner/src/poll-loop.ts":{"diff":3278,"mode":"100644","sha256":"c93e816642bbdaa16987fe624174f7d610206ccbb5329318d297379f085de7ad"},
 "container/agent-runner/src/providers/__fixtures__/sdk-midturn-recordings.json":{"diff":749,"mode":"100644","sha256":null,"deleted":true},
 "container/agent-runner/src/providers/claude.compact-boundary.test.ts":{"diff":0,"mode":"100644","sha256":"bcfc2f357b90380ecc261441e5f2fbdd063e023a78e0b9cbd9120a96f77bdb26"},

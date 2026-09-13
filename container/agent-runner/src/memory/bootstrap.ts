@@ -176,5 +176,11 @@ export function ensureFreshContextBootstrap(
     evidenceBlocks = [...boundedPrompt.matchAll(evidencePattern)];
     recalledChars = bootstrap.length + evidenceBlocks.reduce((sum, match) => sum + match[0].length, 0);
   }
-  return `${bootstrap}\n\n${boundedPrompt}`;
+  // A native slash command reaches this runner as raw text specifically so the
+  // provider SDK can dispatch it. Keep that token at byte zero even when a
+  // cold-context bootstrap is needed; otherwise the bootstrap turns a native
+  // command back into ordinary prompt text before the provider sees it.
+  return boundedPrompt.startsWith('/')
+    ? `${boundedPrompt}\n\n${bootstrap}`
+    : `${bootstrap}\n\n${boundedPrompt}`;
 }

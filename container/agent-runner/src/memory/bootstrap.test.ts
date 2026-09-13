@@ -45,6 +45,18 @@ describe('ensureFreshContextBootstrap', () => {
     expect(result).toContain('<message>hello</message>');
   });
 
+  it('keeps a raw native slash command ahead of a runner-created bootstrap', () => {
+    const command = '/wwbd ?\n\n[Thread context]\nThe decision card asks about a save drawer.';
+
+    const result = ensureFreshContextBootstrap(command, {
+      capabilities: CAPABILITIES,
+      index: INDEX,
+    });
+
+    expect(result.startsWith(command)).toBe(true);
+    expect(result.indexOf('<trusted_capabilities_json>')).toBeGreaterThan(command.length);
+  });
+
   it('reports when runner-side capability bounding drops services', () => {
     fs.writeFileSync(
       CAPABILITIES,
