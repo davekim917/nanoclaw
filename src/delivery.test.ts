@@ -111,6 +111,25 @@ afterEach(async () => {
 });
 
 describe('deliverSessionMessages — concurrent invocations', () => {
+  it.each([false, true])(
+    'isolates malformed wiki policy while retaining durable actor restriction (listed=%s)',
+    async (listed) => {
+      await seedAgentAndChannel();
+      const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');
+      const directory = `${TEST_DIR}/groups/_ops/wiki`;
+      fs.mkdirSync(directory, { recursive: true });
+      fs.writeFileSync(
+        `${directory}/actors.json`,
+        JSON.stringify({ version: 1, actorGroupIds: [listed ? 'ag-1' : 'writer', 'verifier'] }),
+      );
+      fs.writeFileSync(`${directory}/admission.json`, '{malformed');
+      insertOutbound('ag-1', session.id, 'policy-isolation');
+      const deliver = vi.fn(async () => 'policy-test-message');
+      setDeliveryAdapter({ deliver });
+      await deliverSessionMessages(session);
+      expect(deliver).toHaveBeenCalledTimes(listed ? 0 : 1);
+    },
+  );
   it('delivers a message exactly once when active and sweep polls overlap', async () => {
     await seedAgentAndChannel();
     const { session } = await resolveSession('ag-1', 'mg-1', null, 'shared');

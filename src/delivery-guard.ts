@@ -20,7 +20,10 @@ import type { PendingApproval, Session } from './types.js';
  * replay identical to a fresh dispatch — the replay runs long after the drain
  * that raised the hold, and there was never a handle it could have carried.
  */
-export type GuardedDeliveryHandler = (content: Record<string, unknown>, session: Session) => Promise<void>;
+export type GuardedDeliveryHandler = (
+  content: Record<string, unknown>,
+  session: Session,
+) => Promise<void | { deferAck: true }>;
 
 export interface DeliveryGuardSpec {
   /** Guard action consulted before the handler runs — the defined value, not a name. */
@@ -50,7 +53,7 @@ export async function runGuarded(
   content: Record<string, unknown>,
   session: Session,
   grant: PendingApproval | null,
-): Promise<void> {
+): Promise<void | { deferAck: true }> {
   if (spec.precheck && !(await spec.precheck(content, session))) return;
 
   // Under the central lease: the guard's reads are raw by design (seam 3
@@ -74,5 +77,5 @@ export async function runGuarded(
     await spec.requestHold(content, session);
     return;
   }
-  await handler(content, session);
+  return handler(content, session);
 }

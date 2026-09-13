@@ -13,6 +13,8 @@ import { promisify } from 'util';
 import { OneCLI } from '@onecli-sh/sdk';
 
 import { agentRunnerSourcePath } from './agent-runner-source.js';
+import { assertWikiActorConfig, wikiEnrollment } from './wiki-admission/policy.js';
+import { privateWikiRuntime, wikiProviderContribution, wikiRuntimeEnvironment } from './wiki-admission/runtime.js';
 import { getHostCapabilities } from './capabilities.js';
 import {
   CONTAINER_GROUP_LABEL_KEY,
@@ -25,6 +27,7 @@ import {
   CONTAINER_SESSION_LABEL_KEY,
   CONTAINER_WORKGROUP_LABEL_KEY,
   DATA_DIR,
+  EGRESS_LOCKDOWN,
   GROUPS_DIR,
   HOST_LEASE_TTL_MS,
   MAX_CONCURRENT_CONTAINERS,
@@ -1620,6 +1623,8 @@ async function spawnContainer(
   admittedWorkgroupId: string,
   guard?: WakeGuard,
 ): Promise<void> {
+  const wikiActor = wikiEnrollment(agentGroup.id, containerConfig.wikiMaintenance === true);
+  if (wikiActor) assertWikiActorConfig(containerConfig, wikiActor, admittedWorkgroupId);
   // Refresh the destination map and current-thread routing so any admin
   // changes take effect on wake. Destinations come from the agent-to-agent
   // module — skip when the module isn't installed (table absent).
@@ -1877,7 +1882,7 @@ async function spawnContainer(
   // (which has none by construction) this resolves the series' delivery
   // destination so the gate judges WHERE THE TASK POSTS instead of
   // fail-closing on null. See resolveSlackSafetyMessagingGroupId.
-  await writeCapabilitiesSnapshot(agentGroup.id, session.id, slackSafetyMessagingGroupId, resolvedWgId);
+  if (!wikiActor) await writeCapabilitiesSnapshot(agentGroup.id, session.id, slackSafetyMessagingGroupId, resolvedWgId);
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
 
@@ -3790,6 +3795,32 @@ export function resolveAnthropicAuth(
 }
 
 /**
+ * Wiki actors may receive model credentials and nothing else. Prefer the
+ * subscription token set when both supported families are configured, then
+ * fall back to the API-key rotation set.
+ */
+export function wikiModelAuth(auth: ResolvedAnthropicAuth): Record<string, string> {
+  if (auth.oauthPrimary) {
+    return Object.fromEntries([
+      ['CLAUDE_CODE_OAUTH_TOKEN', auth.oauthPrimary],
+      ...auth.oauthFallbacks.map(({ index, value }) => [`CLAUDE_CODE_OAUTH_TOKEN_${index}`, value]),
+    ]);
+  }
+  if (auth.apiKeyPrimary) {
+    return Object.fromEntries([
+      ['ANTHROPIC_API_KEY', auth.apiKeyPrimary],
+      ...auth.apiKeyFallbacks.map(({ index, value }) => [`ANTHROPIC_API_KEY_${index}`, value]),
+    ]);
+  }
+  throw new Error('Wiki Claude model authentication unavailable');
+}
+
+/** The isolated runtime has no model-only route through the locked network. */
+export function assertWikiEgressAllowed(egressLockdown: boolean): void {
+  if (egressLockdown) throw new Error('Wiki maintenance requires direct model egress');
+}
+
+/**
  * Resolve the host-side `.codex/` directory to mount for a given agent
  * group's container. Mirrors the per-group OAuth pattern from
  * `resolveAnthropicAuth` but for Codex, which stores credentials as an
@@ -4371,6 +4402,44 @@ export async function buildMounts(
   // This value was reconciled under the spawn lock. It is the authority for
   // both cross-workgroup policy and the ordinary workgroup mounts below.
   const wgKey = resolvedWgId ?? agentGroup.workgroup_id ?? agentGroup.folder;
+  const wikiActor = wikiEnrollment(agentGroup.id, containerConfig.wikiMaintenance === true);
+  if (wikiActor) {
+    assertWikiActorConfig(containerConfig, wikiActor, wgKey);
+    if (provider !== (containerConfig.provider ?? 'claude')) throw new Error('Wiki provider override refused');
+    const sessDir = sessionDir(agentGroup.id, session.id);
+    await migrateInboundDbToHostDir(sessDir, { agentGroupId: agentGroup.id, sessionId: session.id });
+    assertHostOwnedInboundDb(sessDir, session.id);
+    const members = await withCentralSync(
+      () =>
+        withRawDb((db) =>
+          (db.prepare('SELECT id FROM agent_groups WHERE workgroup_id = ?').all(wgKey) as Array<{ id: string }>).map(
+            (r) => r.id,
+          ),
+        ),
+      'wiki archive membership',
+    );
+    if (!members.includes(agentGroup.id)) throw new Error('Wiki actor is outside its workgroup');
+    const archiveDst = path.join(sessDir, 'archive.db');
+    await ensureArchiveProjection(path.join(DATA_DIR, 'archive.db'), archiveDst, agentGroup.id, members);
+    const contribution = wikiProviderContribution(providerContribution, sessDir, provider);
+    const mounts: VolumeMount[] = [
+      { hostPath: sessDir, containerPath: '/workspace', readonly: false },
+      ...hostInboundMounts(sessDir),
+      {
+        hostPath: sessionContextPath(agentGroup.id, session.id),
+        containerPath: '/app/.nanoclaw-session.json',
+        readonly: true,
+      },
+      { hostPath: agentRunnerSourcePath(), containerPath: '/app/src', readonly: true },
+      { hostPath: archiveDst, containerPath: '/workspace/archive.db', readonly: true },
+      ...privateWikiRuntime(
+        path.join(DATA_DIR, 'wiki-admission', 'runtime', agentGroup.id, session.id),
+        containerConfig,
+      ),
+      ...contribution.mounts,
+    ];
+    return mounts;
+  }
   const workgroupReadAccessStartedAt = Date.now();
   const workgroupReadAccess = await resolveWorkgroupReadAccess(wgKey);
   // The policy chooses *which* registered roots may be offered. The existing
@@ -5972,6 +6041,57 @@ async function buildContainerArgs(
    */
   mailboxEnvironment?: Record<string, string>,
 ): Promise<string[]> {
+  const wikiActor = wikiEnrollment(agentGroup.id, containerConfig.wikiMaintenance === true);
+  if (wikiActor) {
+    assertWikiEgressAllowed(EGRESS_LOCKDOWN);
+    assertWikiActorConfig(containerConfig, wikiActor, resolvedWgId ?? '');
+    if (
+      providerFallbackApplied ||
+      provider !== (containerConfig.provider ?? 'claude') ||
+      Object.keys(mailboxEnvironment ?? {}).length
+    ) {
+      throw new Error('Wiki runtime override refused');
+    }
+    const contribution = wikiProviderContribution(providerContribution, sessionDir(agentGroup.id, sessionId), provider);
+    const auth: Record<string, string> = { ...contribution.env };
+    if (provider === 'claude') {
+      if (process.env.ANTHROPIC_BASE_URL) throw new Error('Wiki runtime requires direct model authentication');
+      const resolved = resolveAnthropicAuth(
+        agentGroup.folder,
+        process.env,
+        readEnvFileMatching(/^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)(_|$)/),
+      );
+      Object.assign(auth, wikiModelAuth(resolved));
+    }
+    const env = wikiRuntimeEnvironment(
+      provider,
+      containerConfig.model,
+      containerConfig.effort,
+      auth,
+      wikiActor.policy.workgroupId,
+    );
+    env.TZ = effectiveTimezone(containerConfig.timezone);
+    const args = [
+      'run',
+      '--rm',
+      '--init',
+      '--name',
+      containerName,
+      ...containerLabelArgs(agentGroup.id, sessionId, resolvedWgId),
+      ...dockerResourceLimitArgs(containerConfig.resources),
+      ...securityArgs(),
+      '--user',
+      `${process.getuid?.() || 1001}:${process.getgid?.() || 1001}`,
+    ];
+    for (const [key, value] of Object.entries(env)) args.push('-e', `${key}=${value}`);
+    if (provider === 'claude') args.push(...claudeSpawnEnv(containerConfig));
+    for (const mount of mounts) {
+      if (fs.realpathSync(mount.hostPath) !== mount.hostPath) throw new Error('Wiki runtime mount changed');
+      args.push('-v', `${mount.hostPath}:${mount.containerPath}${mount.readonly ? ':ro' : ''}`);
+    }
+    args.push('--entrypoint', 'bash', CONTAINER_IMAGE, '-c', 'exec /app/entrypoint.sh');
+    return args;
+  }
   // --init: tini as PID 1 reaps orphaned children (esbuild/gh corpses were
   // accumulating as zombies under bun, which doesn't reap as PID 1) and still
   // forwards signals to the entrypoint, so SIGTERM handling is unchanged.
