@@ -407,7 +407,7 @@ rm -rf "$FLOOR_DIR"
 # its snapshot still carries old-pair evidence, so it must not clear `lanes` or
 # `synthesis` even with an otherwise valid marker (issue #731, F3). The full
 # flow through the real verbs is smoke-pair-identity.test.sh section 5.
-RF="$FIXTURE_DIR/rf-run"
+RF="$FIXTURE_DIR/rf-run with spaces"
 RF_SHA="ffffffffffffffffffffffffffffffffffffffff"
 mkdir -p "$RF/markers" "$RF/coordinator" "$RF/challenger"
 printf '# preliminary\n' > "$RF/coordinator/preliminary.md"
@@ -447,6 +447,12 @@ for phase in lanes synthesis; do
   echo "$RESULT" | jq -e '.ready == false and (.invalid | sort) == ["markers/X.json","markers/Y.json"]
     and all(.invalidReasons[]; contains("not redispatched since the pair re-freeze"))' >/dev/null || {
     echo "expected $phase to refuse lanes not redispatched after the re-freeze" >&2; echo "$RESULT" >&2; exit 1; }
+  for lane in X Y; do
+    printf -v expected_command '%q redispatch %q %q' "$SCRIPT_DIR/smoke-run-scaffold.sh" "$RF" "$lane"
+    echo "$RESULT" | jq -e --arg command "run $expected_command, then re-run the lane" \
+      'any(.invalidReasons[]; contains($command))' >/dev/null || {
+      echo "expected runnable redispatch guidance including the quoted run directory and lane" >&2; exit 1; }
+  done
 done
 # The challenger never waits on lanes, re-freeze or not.
 rf_barrier disposition | jq -e '.ready == true' >/dev/null || {
