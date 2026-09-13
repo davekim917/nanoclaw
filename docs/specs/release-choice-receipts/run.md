@@ -84,3 +84,9 @@
 - `pnpm run typecheck`, `pnpm run lint`, Prettier on the changed fixture, and
   `git diff --check` pass. Existing private policy-lock ResourceWarnings are
   outside this fixture correction.
+- CI `34736774688` passed host and container tests, formatting, lint, all
+  typechecks and the three shell selfchecks. Its remaining failure was the
+  coverage-floor registry: both new host risk files measured 100 percent but
+  had no recorded floor. Added exactly those two 100-percent entries; no
+  existing floor was lowered or automatically raised. The per-PR lesson in
+  `docs/review-notes/787.md` records the missed registration and enforced check.
