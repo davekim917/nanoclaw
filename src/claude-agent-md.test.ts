@@ -4,7 +4,7 @@ import path from 'node:path';
 import { describe, expect, test } from 'vitest';
 
 import {
-  CODEX_WORKER_TIERS,
+  CODEX_WORKER_MODELS,
   MANAGED_MARKER,
   formatCodexAgentToml,
   isManagedToml,
@@ -138,88 +138,32 @@ Body line 2.
   });
 });
 
-describe('formatCodexAgentToml — worker model tiering', () => {
-  test('emits the Codex model and reasoning effort for each tiered worker', () => {
-    for (const [name, tier] of Object.entries(CODEX_WORKER_TIERS)) {
-      const out = formatCodexAgentToml({ name, description: 'd. Runs on Sonnet.', body: 'b' });
-      expect(out).toContain(`model = "${tier.model}"`);
-      expect(out).toContain(`model_reasoning_effort = "${tier.effort}"`);
-    }
+describe('native frontier worker conversion', () => {
+  test('pins Astra without an effort field that would override a native spawn request', () => {
+    const source = fs.readFileSync(path.join(REPO_ROOT, 'container/agents/worker-frontier.md'), 'utf8');
+    const out = formatCodexAgentToml(parseClaudeAgentMd(source)!);
+    expect(CODEX_WORKER_MODELS).toEqual({ 'worker-frontier': 'gpt-6-astra' });
+    expect(out).toContain('model = "gpt-6-astra"');
+    expect(out).not.toMatch(/^model_reasoning_effort\s*=/m);
+    expect(out).toContain('medium reasoning by default');
+    expect(out).not.toContain('Runs on Fable');
+    expect(out).toContain('fresh independent context');
   });
 
-  test('rewrites the Claude model claim so the description names the Codex model', () => {
+  test('rewrites model names containing periods without stripping routing instructions', () => {
     const out = formatCodexAgentToml({
-      name: 'worker',
-      description: 'Default execution worker. Runs on Sonnet at xhigh effort.',
+      name: 'worker-frontier',
+      description: 'Review in a fresh context. Runs on Fable 5.1 at medium effort.',
       body: 'b',
     });
-    expect(out).toContain('Runs on gpt-5.6-terra at xhigh reasoning.');
-    expect(out).not.toContain('Sonnet');
+    expect(out).toContain('Review in a fresh context. Runs on gpt-6-astra');
+    expect(out).not.toContain('Fable');
   });
 
-  test('appends the model sentence when the description has no "Runs on" clause', () => {
-    const out = formatCodexAgentToml({ name: 'worker-fast', description: 'Bulk work.', body: 'b' });
-    expect(out).toContain('Bulk work. Runs on gpt-5.6-luna at max reasoning.');
-  });
-
-  test('preserves a "never a reviewer" clause that precedes the Runs on sentence', () => {
-    // retargetRunsOnSentence strips from " Runs on" to the end of the
-    // description, so any routing-relevant clause MUST come before it or a
-    // Codex sibling loses it. Regression for the "never a reviewer" clause
-    // once living inside the stripped Runs-on sentence itself.
-    const out = formatCodexAgentToml({
-      name: 'worker',
-      description:
-        'Default execution worker. It is never a reviewer: review and verification go elsewhere. Runs on Sonnet at xhigh effort.',
-      body: 'b',
-    });
-    expect(out).toContain('It is never a reviewer: review and verification go elsewhere.');
-    expect(out).toContain('Runs on gpt-5.6-terra at xhigh reasoning.');
-  });
-
-  test.each(['worker', 'worker-fast'])(
-    'the real container/agents/%s.md keeps its "never a reviewer" clause after Codex conversion',
-    (name) => {
-      const content = fs.readFileSync(path.join(REPO_ROOT, 'container/agents', `${name}.md`), 'utf8');
-      const agent = parseClaudeAgentMd(content);
-      expect(agent).not.toBeNull();
-      const out = formatCodexAgentToml(agent!);
-      expect(out.toLowerCase()).toContain('never a reviewer');
-    },
-  );
-
-  test('leaves untiered agents inheriting the parent model', () => {
+  test('leaves specialized roles inheriting their parent model', () => {
     const out = formatCodexAgentToml({ name: 'codex-rescue', description: 'd', body: 'b' });
     expect(out).not.toContain('model = ');
     expect(out).not.toContain('model_reasoning_effort');
-  });
-
-  test('cheap tiers carry higher effort than the top tier', () => {
-    // The whole point of the ladder: dropping to a cheaper model buys back
-    // quality with reasoning effort, so a cheap tier must never be cheaper
-    // on BOTH axes at once.
-    const order = ['low', 'medium', 'high', 'xhigh', 'max'];
-    const fast = CODEX_WORKER_TIERS['worker-fast']!;
-    const top = CODEX_WORKER_TIERS['worker-high']!;
-    expect(order.indexOf(fast.effort)).toBeGreaterThan(order.indexOf(top.effort));
-  });
-
-  test('worker-frontier maps to Astra at high reasoning effort', () => {
-    // The actual top rung: Astra at high effort provides the larger-model
-    // escalation over worker-high.
-    expect(CODEX_WORKER_TIERS['worker-frontier']).toEqual({ model: 'gpt-6-astra', effort: 'high' });
-  });
-
-  test('emits gpt-6-astra and high reasoning effort for worker-frontier', () => {
-    const out = formatCodexAgentToml({
-      name: 'worker-frontier',
-      description: 'Frontier-tier work. Runs on Fable 5.1 at medium effort.',
-      body: 'b',
-    });
-    expect(out).toContain('model = "gpt-6-astra"');
-    expect(out).toContain('model_reasoning_effort = "high"');
-    expect(out).toContain('Runs on gpt-6-astra at high reasoning.');
-    expect(out).not.toContain('Fable');
   });
 });
 

@@ -2,19 +2,9 @@
 /**
  * Reviewer-model allowlist generator.
  *
- * The 2026-09-11 operator rule: a substitute PR reviewer must run on the high
- * or frontier tier, whichever vendor — never a cheap/fast tier (worker,
- * worker-fast), never Codex luna/terra, never a flash or mini model. The
- * allowed IDs are derived, not hand-maintained, from the two places tier
- * membership is actually defined:
- *
- *   - Claude: the `model:` frontmatter of container/agents/worker-high.md and
- *     worker-frontier.md (the `[1m]` context-window suffix is stripped — the
- *     reviewer reports the bare model id from its own runtime, not the
- *     extended-context variant marker).
- *   - Codex: CODEX_WORKER_TIERS['worker-high'] and ['worker-frontier']
- *     (src/claude-agent-md.ts), imported rather than re-parsed so this never
- *     drifts from what actually ships Codex reviews.
+ * Review eligibility follows the single native frontier worker for each
+ * provider: Claude frontmatter (without the context-window suffix), and the
+ * Codex converter's model map. Independent review requires a fresh context.
  *
  * Output: container/skills/pr-review-loop/reviewer-models.txt — sorted, one
  * id per line, under a header. It lives in the skill directory (not
@@ -23,7 +13,7 @@
  * to itself, not somewhere only this repo has.
  *
  * Modes:
- *   --write   regenerate the file from the tier config
+ *   --write   regenerate the file from the frontier config
  *   --check   fail (exit 1) if the file on disk doesn't match; the drift
  *             test (reviewer-models-freshness.test.ts) runs this on every
  *             test pass
@@ -32,24 +22,25 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { CODEX_WORKER_TIERS, extractScalar } from '../src/claude-agent-md.js';
+import { CODEX_WORKER_MODELS, extractScalar } from '../src/claude-agent-md.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-export const REVIEWER_MODELS_OUTPUT_PATH = path.join(
-  REPO_ROOT,
-  'container/skills/pr-review-loop/reviewer-models.txt',
-);
+export const REVIEWER_MODELS_OUTPUT_PATH = path.join(REPO_ROOT, 'container/skills/pr-review-loop/reviewer-models.txt');
 
-const CLAUDE_TIER_AGENT_FILES = ['container/agents/worker-high.md', 'container/agents/worker-frontier.md'];
-const CODEX_TIER_NAMES = ['worker-high', 'worker-frontier'] as const;
+const CLAUDE_AGENT_FILES = ['container/agents/worker-frontier.md'];
+const CODEX_WORKER_NAMES = ['worker-frontier'] as const;
+// Receipt compatibility only: these models remain eligible so an unchanged
+// exact-head receipt does not expire when dispatch defaults change.
+const COMPATIBLE_RECEIPT_MODELS = ['claude-opus-5', 'gpt-5.6-sol'];
 
 export const REVIEWER_MODELS_HEADER = [
-  '# generated from the tier config: edit container/agents/worker-{high,frontier}.md or',
-  '# CODEX_WORKER_TIERS, then run `pnpm run reviewer-models -- --write`',
+  '# generated from the frontier config: edit container/agents/worker-frontier.md or',
+  '# CODEX_WORKER_MODELS, then run `pnpm run reviewer-models -- --write`',
   '#',
-  '# One reviewer-eligible model id per line — the high and frontier tiers, whichever',
-  '# vendor. container/skills/pr-review-loop/scripts/codex-review.sh reads this file to',
+  '# One reviewer-eligible model id per line — the native frontier worker, whichever',
+  '# vendor, plus prior Opus/Sol receipt compatibility (not dispatch defaults).',
+  '# container/skills/pr-review-loop/scripts/codex-review.sh reads this file to',
   '# gate `receipt` and `merge-check`. See scripts/reviewer-models.ts.',
 ].join('\n');
 
@@ -86,7 +77,7 @@ function stripContextWindowSuffix(modelId: string): string {
  * 1. A bare alias ("opus", "sonnet", "inherit") standing in for a real model
  *    id — those resolve to whatever the runtime's current default is, so "who
  *    is allowed to review" would silently follow that default around instead
- *    of naming a fixed tier. Every real id here (Claude or Codex) carries a
+ *    of naming a fixed model. Every real id here (Claude or Codex) carries a
  *    version number, so requiring a digit is enough to catch an alias without
  *    hardcoding the alias list.
  * 2. A shape that isn't purely `[A-Za-z0-9._-]+` — extractScalar is NOT a
@@ -114,19 +105,19 @@ function assertConcreteModelId(id: string, source: string): void {
 
 /** The reviewer-eligible model ids, sorted and de-duplicated. */
 export function computeReviewerModelIds(repoRoot: string = REPO_ROOT): string[] {
-  const claudeIds = CLAUDE_TIER_AGENT_FILES.map((rel) => {
+  const claudeIds = CLAUDE_AGENT_FILES.map((rel) => {
     const content = fs.readFileSync(path.join(repoRoot, rel), 'utf8');
     const id = stripContextWindowSuffix(extractModelLine(content));
     assertConcreteModelId(id, rel);
     return id;
   });
-  const codexIds = CODEX_TIER_NAMES.map((tier) => {
-    const entry = CODEX_WORKER_TIERS[tier];
-    if (!entry) throw new Error(`CODEX_WORKER_TIERS is missing "${tier}"`);
-    assertConcreteModelId(entry.model, `CODEX_WORKER_TIERS['${tier}']`);
-    return entry.model;
+  const codexIds = CODEX_WORKER_NAMES.map((name) => {
+    const entry = CODEX_WORKER_MODELS[name];
+    if (!entry) throw new Error(`CODEX_WORKER_MODELS is missing "${name}"`);
+    assertConcreteModelId(entry, `CODEX_WORKER_MODELS['${name}']`);
+    return entry;
   });
-  return Array.from(new Set([...claudeIds, ...codexIds])).sort();
+  return Array.from(new Set([...claudeIds, ...codexIds, ...COMPATIBLE_RECEIPT_MODELS])).sort();
 }
 
 export function renderReviewerModelsFile(ids: string[]): string {

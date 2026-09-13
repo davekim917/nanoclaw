@@ -5762,8 +5762,8 @@ const MANAGED_WORKER_DEFS = [
 /**
  * Copy trunk worker subagent defs (container/agents/*.md) into
  * .claude-shared/agents/ — the container's ~/.claude/agents — so every Claude
- * group gets the orchestrator worker roster (worker-fast, worker, worker-high,
- * worker-frontier, worker-codex). Copies, not symlinks: agent discovery
+ * group gets the native frontier worker. Cross-provider work uses the direct
+ * CLI helper, without a wrapper agent. Copies, not symlinks: agent discovery
  * through dangling host symlinks is unverified, and the files are tiny.
  * Trunk is canonical: a managed def absent from the current trunk set is
  * pruned; operator-added defs (never in MANAGED_WORKER_DEFS) are untouched. A

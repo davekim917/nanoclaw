@@ -1,8 +1,9 @@
-# generated from the tier config: edit container/agents/worker-{high,frontier}.md or
-# CODEX_WORKER_TIERS, then run `pnpm run reviewer-models -- --write`
+# generated from the frontier config: edit container/agents/worker-frontier.md or
+# CODEX_WORKER_MODELS, then run `pnpm run reviewer-models -- --write`
 #
-# One reviewer-eligible model id per line — the high and frontier tiers, whichever
-# vendor. container/skills/pr-review-loop/scripts/codex-review.sh reads this file to
+# One reviewer-eligible model id per line — the native frontier worker, whichever
+# vendor, plus prior Opus/Sol receipt compatibility (not dispatch defaults).
+# container/skills/pr-review-loop/scripts/codex-review.sh reads this file to
 # gate `receipt` and `merge-check`. See scripts/reviewer-models.ts.
 claude-fable-5-1
 claude-opus-5
