@@ -41,9 +41,7 @@ function hasOrchestratorCapability(): boolean {
 
   try {
     const row = db
-      .prepare(
-        `SELECT 1 FROM agent_group_capabilities WHERE agent_group_id = ? AND role = 'orchestrator' LIMIT 1`,
-      )
+      .prepare(`SELECT 1 FROM agent_group_capabilities WHERE agent_group_id = ? AND role = 'orchestrator' LIMIT 1`)
       .get(agentGroupId);
     return row != null;
   } catch {
@@ -61,6 +59,7 @@ function hasOrchestratorCapability(): boolean {
  * Call this from the barrel (index.ts) after loadConfig() and before startMcpServer().
  */
 export async function mountSpawnTools(): Promise<void> {
+  if (process.env.NANOCLAW_WIKI_MAINTENANCE === '1') return;
   const spawnTaskId = getSessionSpawnTaskId();
 
   if (spawnTaskId !== null) {
@@ -86,6 +85,7 @@ const toolMap = new Map<string, McpToolDefinition>();
 
 export function registerTools(tools: McpToolDefinition[]): void {
   for (const t of tools) {
+    if (process.env.NANOCLAW_WIKI_MAINTENANCE === '1' && t.tool.name !== 'wiki_admission') continue;
     if (toolMap.has(t.tool.name)) {
       log(`Warning: tool "${t.tool.name}" already registered, skipping duplicate`);
       continue;

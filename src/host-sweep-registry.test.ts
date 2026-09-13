@@ -384,6 +384,7 @@ import './modules/sweep-scheduling/index.js';
 // Registers T24 (task-failure-escalation) as its own duty source at import
 // time; without this line R-7's inventory is one registration short.
 import './modules/sweep-task-escalation/index.js';
+import './modules/wiki-admission/index.js';
 import { log } from './log.js';
 // Family module side-effect import (S2-PR7): registers T11
 // (scheduled-move-recovery) and T12 (audit-body-prune) as a duty source, so
@@ -1372,6 +1373,7 @@ describe('sweep duty registry (S2-PR2)', () => {
     ['duty', 'dashboard-token-prune', 'tick:housekeeping', 120],
     ['duty', 'coordination-orphans', 'tick:housekeeping', 130],
     ['duty', 'task-failure-escalation', 'tick:housekeeping', 135],
+    ['duty', 'wiki-admission-recovery', 'tick:housekeeping', 9500],
     ['sla-observation-hook', 'container-oom-notice', 'sla-observation-hook', 10],
     ['kill-follow-up', 'kill-ceiling-notice', 'kill-follow-up', 10],
     ['kill-follow-up', 'orphan-claim-reset', 'kill-follow-up', 20],
@@ -1404,11 +1406,11 @@ describe('sweep duty registry (S2-PR2)', () => {
     // github-token-file-refresh, cli-request-execution-prune,
     // coordination-orphans (seam 4 series A', issue #430) and
     // task-failure-escalation.
-    expect(actual).toHaveLength(43);
+    expect(actual).toHaveLength(44);
     const names = new Set(actual.map((r) => r[1]));
-    expect(names.size).toBe(42);
+    expect(names.size).toBe(43);
     expect(names).toEqual(new Set(Object.values(SWEEP_DUTY_INVENTORY)));
-    expect(Object.keys(SWEEP_DUTY_INVENTORY)).toHaveLength(42);
+    expect(Object.keys(SWEEP_DUTY_INVENTORY)).toHaveLength(43);
     // The one duty registered twice is the orphan-claim reset: once in the tail
     // window, once as the post-kill follow-up (rev-3 grounding §2, S17).
     expect(actual.filter((r) => r[1] === SWEEP_DUTY_INVENTORY.S17)).toHaveLength(2);
@@ -1706,7 +1708,8 @@ describe('sweep duty registry (S2-PR2)', () => {
     //   the abandoned tick is still inside (its host task script, for one).
     // A tick that never settled left the sweep dead ~7h on 2026-09-11 with
     // every vital green. The three structural assertions above are unchanged.
-    expect(source.split('\n').length).toBeLessThanOrEqual(1528);
+    // One inventory entry for wiki admission; its body remains in the module.
+    expect(source.split('\n').length).toBeLessThanOrEqual(1529);
     expect(h.spawns).toEqual([]);
   });
 
@@ -1823,12 +1826,12 @@ describe('sweep duty registry (S2-PR2)', () => {
     // `task-failure-escalation` from `sweep-task-escalation`. The numbers here
     // said 39/38/38 from before those landed; the tuple comparison above was
     // already right, which is why it never failed.
-    expect(actual).toHaveLength(43);
+    expect(actual).toHaveLength(44);
     const names = new Set(actual.map((r) => r[1]));
-    expect(names.size).toBe(42);
+    expect(names.size).toBe(43);
     // The inventory comes from the same fresh instance, not this file's binding.
     expect(names).toEqual(new Set(Object.values(hs.SWEEP_DUTY_INVENTORY)));
-    expect(Object.keys(hs.SWEEP_DUTY_INVENTORY)).toHaveLength(42);
+    expect(Object.keys(hs.SWEEP_DUTY_INVENTORY)).toHaveLength(43);
     expect(actual.filter((r) => r[1] === hs.SWEEP_DUTY_INVENTORY.S17)).toHaveLength(2);
     expect(h.spawns).toEqual([]);
   });

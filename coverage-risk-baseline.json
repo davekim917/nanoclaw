@@ -176,7 +176,7 @@
     "src/db/migrations/module-agent-to-agent-destinations.ts": 38.89,
     "src/db/migrations/module-approvals-pending-approvals.ts": 100,
     "src/db/migrations/module-approvals-title-options.ts": 81.82,
-    "src/delivery-guard.ts": "untested",
+    "src/delivery-guard.ts": 100,
     "src/delivery.ts": 76.88,
     "src/deploy-crash-guard.ts": 90.12,
     "src/group-init.ts": 86.42,
@@ -248,6 +248,14 @@
     "src/modules/self-mod/request.ts": 54.55,
     "src/modules/sweep-scheduling/index.ts": 100,
     "src/onecli-secrets.ts": 95.18,
-    "src/router.ts": 86.13
+    "src/router.ts": 86.13,
+    "container/agent-runner/src/mcp-tools/wiki-admission.ts": 94,
+    "src/modules/wiki-admission/index.ts": 83,
+    "src/wiki-admission/engine.ts": 95.7,
+    "src/wiki-admission/git.ts": 90.5,
+    "src/wiki-admission/policy.ts": 90.3,
+    "src/wiki-admission/runtime.ts": 96.2,
+    "src/wiki-admission/sources.ts": 100,
+    "src/wiki-admission/store.ts": 96.4
   }
 }
