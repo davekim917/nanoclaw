@@ -585,6 +585,51 @@ describe('collectOperatorAttentionEvidence', () => {
     });
     expect(report.provenance.sessionDbsRead).toBe(0);
   });
+
+  it('excludes only known group metadata while genuine and unfamiliar missing sessions stay incomplete', () => {
+    const root = makeRoot();
+    const sessionsRoot = path.join(root, 'sessions');
+    const groupRoot = path.join(sessionsRoot, 'ag-fixture');
+    for (const metadataDir of ['.claude-shared', '.claude-memory', '.context']) {
+      fs.mkdirSync(path.join(groupRoot, metadataDir), { recursive: true });
+    }
+
+    const validSession = path.join(groupRoot, 'sess-valid');
+    fs.mkdirSync(validSession, { recursive: true });
+    const inbound = new Database(path.join(validSession, 'inbound.db'));
+    inbound.exec(INBOUND_SCHEMA);
+    inbound.close();
+    const outbound = new Database(path.join(validSession, 'outbound.db'));
+    outbound.exec(OUTBOUND_SCHEMA);
+    outbound.close();
+
+    // The producer normally mints `sess-*` (`src/session-manager.ts:328-330`),
+    // but an unfamiliar directory is not silently assumed to be metadata.
+    fs.mkdirSync(path.join(groupRoot, 'sess-missing-dbs'));
+    fs.mkdirSync(path.join(groupRoot, 'unclassified-session-copy'));
+
+    const centralDb = path.join(root, 'central.db');
+    const archiveDb = path.join(root, 'archive.db');
+    createCentralDb(centralDb);
+    createArchiveDb(archiveDb);
+
+    const report = collectOperatorAttentionEvidence({ sessionsRoot, centralDb, archiveDb, since: SINCE, until: UNTIL });
+
+    expect(report.provenance.sessionDbsRead).toBe(1);
+    expect(report.provenance.sourceReadComplete).toBe(false);
+    expect(report.provenance.errors).toEqual([
+      {
+        source: 'inbound',
+        session: 'ag-fixture/sess-missing-dbs',
+        code: 'missing_file',
+      },
+      {
+        source: 'inbound',
+        session: 'ag-fixture/unclassified-session-copy',
+        code: 'missing_file',
+      },
+    ]);
+  });
 });
 
 describe('extractReviewOutcomeEvidence', () => {
