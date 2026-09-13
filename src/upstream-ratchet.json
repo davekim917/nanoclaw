@@ -749,7 +749,7 @@
 "src/delivery-attempts-authority.test.ts":{"diff":421,"mode":"100644","sha256":"0a3de40e16dd0e78cf78cb289f1aa13e999e60d3ec5cc50cc602d1fd605b73ec"},
 "src/delivery-guard.ts":{"diff":31,"mode":"100644","sha256":"39490ac6990c719d5285fca3d8134333b8f4c6d814883ffe52954d3f4b395da7"},
 "src/delivery-shadow.test.ts":{"diff":141,"mode":"100644","sha256":null,"deleted":true},
-"src/delivery.test.ts":{"diff":2006,"mode":"100644","sha256":"4051af5539d941873eb62233d43eba3ddb66ead341581413f5a053e412444c9e"},
+"src/delivery.test.ts":{"diff":2044,"mode":"100644","sha256":"0f6cca8fa357e6667346751b452e6318d4eeef96934bbd706c3ddbff2203665c"},
 "src/delivery.ts":{"diff":1515,"mode":"100644","sha256":"7b7aacd75c05e77a177828bbc77156ba5c9cb9e6a89e9f197f2aa69665fbffe0"},
 "src/drivers/cli.test.ts":{"diff":33,"mode":"100644","sha256":null,"deleted":true},
 "src/drivers/cli.ts":{"diff":88,"mode":"100644","sha256":null,"deleted":true},

@@ -1158,12 +1158,13 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
     msgId: string,
     ts: string,
     threadId: string | null = null,
+    inReplyTo = `task-fire-${msgId}`,
   ): void {
     const db = new Database(outboundDbPath(agentGroupId, sessionId));
     db.prepare(
       `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, in_reply_to, content)
        VALUES (?, ?, 'chat', 'telegram:123', 'telegram', ?, ?, ?)`,
-    ).run(msgId, ts, threadId, `task-fire-${msgId}`, JSON.stringify({ text: msgId }));
+    ).run(msgId, ts, threadId, inReplyTo, JSON.stringify({ text: msgId }));
     db.close();
   }
 
@@ -1440,6 +1441,43 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
 
     // Both posts land at root — same UTC day, but the series opted out.
     expect(calls).toEqual([{ threadId: null }, { threadId: null }]);
+    expect(await getTaskThreadAnchor(session.id, 'telegram', 'telegram:123')).toBeNull();
+  });
+
+  it('a threadAnchor:false campaign keeps same-fire evidence under its fresh root', async () => {
+    await seedAgentAndChannel();
+    grantChannelDestination('ag-1', 'mg-1');
+    const { session } = await resolveTaskSession('ag-1', 'series-contact-sheet');
+    const inDb = new Database(inboundDbPath('ag-1', session.id));
+    inDb
+      .prepare("INSERT INTO messages_in (id, kind, timestamp, series_id, content) VALUES (?, 'task', ?, ?, ?)")
+      .run(
+        'task-row-contact-sheet',
+        now(),
+        'series-contact-sheet',
+        JSON.stringify({ prompt: 'p', threadAnchor: false }),
+      );
+    inDb.close();
+
+    // The campaign itself owns a new root per fire; its immediate contact-sheet
+    // evidence is a second row from the SAME fire and belongs in that root's
+    // platform thread, not beside it in the channel.
+    insertTaskChat('ag-1', session.id, 'kickoff', '2026-08-10T09:00:00.000Z', null, 'task-fire-contact-sheet');
+    insertTaskChat('ag-1', session.id, 'contact-sheet', '2026-08-10T09:00:01.000Z', null, 'task-fire-contact-sheet');
+
+    const calls: Array<{ threadId: string | null }> = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, threadId) {
+        calls.push({ threadId });
+        return `plat-${calls.length}`;
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: null }, { threadId: 'telegram:123:plat-1' }]);
+    // The transient same-fire anchor must not turn into the task's rolling
+    // day anchor; the next fire still starts a distinct campaign root.
     expect(await getTaskThreadAnchor(session.id, 'telegram', 'telegram:123')).toBeNull();
   });
 });
