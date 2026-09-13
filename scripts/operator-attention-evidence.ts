@@ -3,15 +3,16 @@
  *
  * This deliberately measures durable events, not inferred attention or reading time:
  *
- * - `messages_out`/`delivered` are separate tables with a nullable platform message
- *   id (`src/mailbox/sqlite/schema.ts:23-60`). The delivery loop marks every
- *   non-deferred row delivered with `result.platformMsgId ?? null`
- *   (`src/delivery.ts:748-758`), while spawn-child status rows return that same
- *   null result after being suppressed (`src/delivery.ts:1211-1233`). Therefore a
- *   null delivery marker is explicitly *not* counted as platform delivery here.
- * - An assistant archive row is a second, conservative final-chat signal: it is
- *   written only after the normal chat-delivery path has continued
- *   (`src/delivery.ts:1579-1609`). The canonical host archive is
+ * - `messages_out`/`delivered` are separate tables; delivery evidence is a non-null
+ *   platform message id at the host-stamped `delivered_at` event time
+ *   (`src/mailbox/sqlite/schema.ts:23-28`, `src/mailbox/sqlite/session-db.ts:258-262`).
+ *   The delivery loop also acknowledges valid adapter no-ops with a null id, so a
+ *   null marker is explicitly *not* counted as platform delivery here
+ *   (`src/delivery.ts:748-758`, `src/channels/cli.ts:139-145`).
+ * - An assistant archive row is reported only as archive observation, at its own
+ *   `sent_at` event time. It is not platform-delivery evidence: the archive write
+ *   follows any normally returned adapter result, including the CLI no-terminal
+ *   no-op above (`src/delivery.ts:1488-1496,1579-1600`). The canonical host archive is
  *   `path.join(DATA_DIR, 'archive.db')` (`src/message-archive.ts:30`), but this
  *   script accepts an explicit archive DB and never claims it covers every
  *   session beneath an independently supplied sessions root. Archive contents
@@ -21,6 +22,12 @@
  *   drop chat rows before their insert (`container/agent-runner/src/modules/mailbox/index.ts:116-131`).
  *   Configuration is reported separately; missing rows are never invented as
  *   suppressed delivery events.
+ *
+ * SQLite connections are opened `readonly` and set `PRAGMA query_only=ON`, so this
+ * script issues no logical data/schema writes. Ordinary SQLite WAL locking may
+ * still create or change `-shm` filesystem metadata; the report says so and counts
+ * WAL-without-SHM inputs and SHM files observed newly present after the read. It
+ * never uses `immutable=1`, because that would silently ignore committed WAL data.
  *
  * It emits no message text, title, card option, selected choice, sender identity,
  * user id, payload, or PR body. Candidate samples carry only synthetic-safe
@@ -63,10 +70,11 @@ export interface AttentionCounters {
   resolvedChoiceReceipts: number;
   /** Exact `ask_question` payload plus a non-null platform message id. */
   platformBackedQuestionCards: number;
-  /** `kind='chat'` with platform-id or assistant-archive evidence. */
+  /** `kind='chat'` with a non-null platform id at `delivered_at`. */
   finalChatDeliveryEvidence: number;
   finalChatPlatformMessageId: number;
-  finalChatAssistantArchiveId: number;
+  /** Matching assistant archive rows at `sent_at`; never delivery confirmation. */
+  finalChatAssistantArchiveObserved: number;
   /** Statuses with a platform message id; null-marker statuses remain unknown. */
   statusPlatformPostEvidence: number;
   deliveryProcessedUnknown: number;
@@ -109,9 +117,18 @@ export interface OperatorAttentionEvidence {
     sourceReadComplete: boolean;
     archiveScope: ArchiveScope;
     errors: CoverageError[];
+    sqliteReadContract: {
+      readonly: true;
+      queryOnly: true;
+      /** SQLite may create/change WAL shared-memory lock metadata even on a logical read. */
+      sidecarMetadataMayChange: true;
+      walFilesWithoutShmBeforeRead: number;
+      shmFilesObservedNewDuringRead: number;
+    };
     definitions: {
-      delivered: 'non-null platform message id, or assistant archive id for final chat';
-      deliveryProcessedUnknown: 'delivered-table row with no sufficient platform/archive evidence';
+      delivered: 'non-null platform message id at delivered_at';
+      archiveObserved: 'matching assistant archive id at sent_at; not platform-delivery confirmation';
+      deliveryProcessedUnknown: 'delivered-table row with a null platform message id';
       prose: 'candidate only; no reading-time inference';
       approvalCards: 'current pending, platform-backed pending_approvals snapshot, not historical total';
     };
@@ -147,6 +164,7 @@ interface DeliveredRow {
   message_out_id: string;
   status: string;
   platform_message_id: string | null;
+  delivered_at: string;
 }
 
 interface InboundRow {
@@ -158,8 +176,16 @@ interface InboundRow {
 
 interface ParsedInbound {
   text: string | null;
-  questionId: string | null;
   knownBot: boolean;
+}
+
+interface ArchiveObservation {
+  sentAt: string;
+}
+
+interface SqliteReadObservations {
+  walWithoutShmBeforeRead: Set<string>;
+  shmObservedNewDuringRead: Set<string>;
 }
 
 interface ParsedTaskControls {
@@ -175,7 +201,7 @@ function emptyCounters(): AttentionCounters {
     platformBackedQuestionCards: 0,
     finalChatDeliveryEvidence: 0,
     finalChatPlatformMessageId: 0,
-    finalChatAssistantArchiveId: 0,
+    finalChatAssistantArchiveObserved: 0,
     statusPlatformPostEvidence: 0,
     deliveryProcessedUnknown: 0,
     questionResponseCandidates: 0,
@@ -213,8 +239,28 @@ function assertIso(value: string, name: string): void {
   if (!isStrictIsoUtc(value)) throw new Error(`${name} must be a strict ISO-8601 UTC timestamp ending in Z`);
 }
 
-function openReadOnly(dbPath: string): Database.Database {
-  return new Database(dbPath, { readonly: true, fileMustExist: true });
+function openReadOnly(dbPath: string, observations: SqliteReadObservations): Database.Database {
+  if (fs.existsSync(`${dbPath}-wal`) && !fs.existsSync(`${dbPath}-shm`)) {
+    observations.walWithoutShmBeforeRead.add(dbPath);
+  }
+  const db = new Database(dbPath, { readonly: true, fileMustExist: true });
+  db.pragma('query_only = ON');
+  if (!db.readonly || db.pragma('query_only', { simple: true }) !== 1) {
+    db.close();
+    throw new Error('failed to enforce SQLite readonly/query_only');
+  }
+  return db;
+}
+
+function closeReadOnly(db: Database.Database | undefined, dbPath: string, observations: SqliteReadObservations): void {
+  if (!db) return;
+  if (observations.walWithoutShmBeforeRead.has(dbPath) && fs.existsSync(`${dbPath}-shm`)) {
+    observations.shmObservedNewDuringRead.add(dbPath);
+  }
+  db.close();
+  if (observations.walWithoutShmBeforeRead.has(dbPath) && fs.existsSync(`${dbPath}-shm`)) {
+    observations.shmObservedNewDuringRead.add(dbPath);
+  }
 }
 
 function hasTable(db: Database.Database, table: string): boolean {
@@ -249,9 +295,17 @@ function parseInbound(content: string): ParsedInbound | null {
       : null;
   return {
     text: typeof parsed.text === 'string' ? parsed.text : null,
-    questionId: typeof parsed.questionId === 'string' ? parsed.questionId : null,
     knownBot: parsed.isFromMe === true || authorRecord?.isBot === true || authorRecord?.isMe === true,
   };
+}
+
+function isQuestionResponseEnvelope(parsed: Record<string, unknown>): boolean {
+  return (
+    parsed.type === 'question_response' &&
+    typeof parsed.questionId === 'string' &&
+    typeof parsed.selectedOption === 'string' &&
+    typeof parsed.userId === 'string'
+  );
 }
 
 function parseTaskControls(content: string): ParsedTaskControls | null {
@@ -306,28 +360,39 @@ function inboundPathForSession(sessionDir: string): string | null {
   return fs.existsSync(legacy) ? legacy : null;
 }
 
-function readAssistantArchiveIds(archiveDb: string, errors: CoverageError[]): Set<string> {
+function readAssistantArchiveObservations(
+  archiveDb: string,
+  errors: CoverageError[],
+  sqliteObservations: SqliteReadObservations,
+): Map<string, ArchiveObservation> {
   if (!fs.existsSync(archiveDb)) {
     errors.push({ source: 'archive', code: 'missing_file' });
-    return new Set();
+    return new Map();
   }
   let db: Database.Database | undefined;
   try {
-    db = openReadOnly(archiveDb);
+    db = openReadOnly(archiveDb, sqliteObservations);
     if (!hasTable(db, 'messages_archive')) {
       errors.push({ source: 'archive', code: 'missing_required_table' });
-      return new Set();
+      return new Map();
     }
-    if (!hasColumns(db, 'messages_archive', ['id', 'role'])) {
+    if (!hasColumns(db, 'messages_archive', ['id', 'role', 'sent_at'])) {
       errors.push({ source: 'archive', code: 'missing_required_column' });
-      return new Set();
+      return new Map();
     }
-    return new Set(db.prepare("SELECT id FROM messages_archive WHERE role = 'assistant'").pluck().all() as string[]);
+    return new Map(
+      (
+        db.prepare("SELECT id, sent_at FROM messages_archive WHERE role = 'assistant'").all() as Array<{
+          id: string;
+          sent_at: string;
+        }>
+      ).map((row) => [row.id, { sentAt: row.sent_at }]),
+    );
   } catch {
     errors.push({ source: 'archive', code: 'unreadable' });
-    return new Set();
+    return new Map();
   } finally {
-    db?.close();
+    closeReadOnly(db, archiveDb, sqliteObservations);
   }
 }
 
@@ -339,6 +404,7 @@ function readCentralEvidence(
   samples: CandidateSample[],
   sampleLimit: number,
   errors: CoverageError[],
+  sqliteObservations: SqliteReadObservations,
 ): void {
   if (!fs.existsSync(centralDb)) {
     errors.push({ source: 'central', code: 'missing_file' });
@@ -346,7 +412,7 @@ function readCentralEvidence(
   }
   let db: Database.Database | undefined;
   try {
-    db = openReadOnly(centralDb);
+    db = openReadOnly(centralDb, sqliteObservations);
     if (
       !hasTable(db, 'pending_approvals') ||
       !hasColumns(db, 'pending_approvals', ['approval_id', 'platform_message_id', 'status'])
@@ -392,7 +458,7 @@ function readCentralEvidence(
   } catch {
     errors.push({ source: 'central', code: 'unreadable' });
   } finally {
-    db?.close();
+    closeReadOnly(db, centralDb, sqliteObservations);
   }
 }
 
@@ -401,11 +467,12 @@ function scanSession(input: {
   dir: string;
   since: string;
   until: string;
-  archiveAssistantIds: ReadonlySet<string>;
+  archiveAssistantObservations: ReadonlyMap<string, ArchiveObservation>;
   counters: AttentionCounters;
   samples: CandidateSample[];
   sampleLimit: number;
   errors: CoverageError[];
+  sqliteObservations: SqliteReadObservations;
 }): boolean {
   const inboundPath = inboundPathForSession(input.dir);
   const outboundPath = path.join(input.dir, 'outbound.db');
@@ -422,9 +489,9 @@ function scanSession(input: {
   let outbound: Database.Database | undefined;
   let activeSource: CoverageError['source'] = 'inbound';
   try {
-    inbound = openReadOnly(inboundPath);
+    inbound = openReadOnly(inboundPath, input.sqliteObservations);
     activeSource = 'outbound';
-    outbound = openReadOnly(outboundPath);
+    outbound = openReadOnly(outboundPath, input.sqliteObservations);
     if (!hasTable(inbound, 'messages_in') || !hasTable(inbound, 'delivered')) {
       input.errors.push({ source: 'inbound', session: input.session, code: 'missing_required_table' });
       return false;
@@ -435,7 +502,7 @@ function scanSession(input: {
     }
     if (
       !hasColumns(inbound, 'messages_in', ['id', 'timestamp', 'kind', 'content']) ||
-      !hasColumns(inbound, 'delivered', ['message_out_id', 'status', 'platform_message_id'])
+      !hasColumns(inbound, 'delivered', ['message_out_id', 'status', 'platform_message_id', 'delivered_at'])
     ) {
       input.errors.push({ source: 'inbound', session: input.session, code: 'missing_required_column' });
       return false;
@@ -458,25 +525,33 @@ function scanSession(input: {
         if (controls?.muteChat) input.counters.mutedChatTaskRowsConfigured += 1;
         continue;
       }
+      if (row.kind === 'system') {
+        const parsed = safeJson(row.content);
+        if (!parsed || parsed.type === 'question_response') {
+          if (parsed && isQuestionResponseEnvelope(parsed)) {
+            input.counters.questionResponseCandidates += 1;
+            appendSample(
+              input.samples,
+              {
+                source: 'inbound',
+                session: input.session,
+                eventId: row.id,
+                timestamp: row.timestamp,
+                classifier: 'question_response_candidate',
+              },
+              input.sampleLimit,
+            );
+          } else {
+            input.counters.unknownInboundMessages += 1;
+          }
+        }
+        continue;
+      }
       if (row.kind !== 'chat' && row.kind !== 'chat-sdk') continue;
       const parsed = parseInbound(row.content);
       if (!parsed) {
         input.counters.unknownInboundMessages += 1;
         continue;
-      }
-      if (parsed.questionId) {
-        input.counters.questionResponseCandidates += 1;
-        appendSample(
-          input.samples,
-          {
-            source: 'inbound',
-            session: input.session,
-            eventId: row.id,
-            timestamp: row.timestamp,
-            classifier: 'question_response_candidate',
-          },
-          input.sampleLimit,
-        );
       }
       if (parsed.knownBot || !parsed.text) continue;
       input.counters.inboundReplyCandidates += 1;
@@ -521,12 +596,24 @@ function scanSession(input: {
     // remains independently read-only, including when its WAL is live.
     const deliveredByOutboundId = new Map(
       (
-        inbound.prepare('SELECT message_out_id, status, platform_message_id FROM delivered').all() as DeliveredRow[]
+        inbound
+          .prepare('SELECT message_out_id, status, platform_message_id, delivered_at FROM delivered')
+          .all() as DeliveredRow[]
       ).map((row) => [row.message_out_id, row]),
     );
     for (const row of outboundRows) {
       const delivery = deliveredByOutboundId.get(row.id);
-      if (!isIsoInWindow(row.timestamp, input.since, input.until) || delivery?.status !== 'delivered') continue;
+      const archiveObservation = input.archiveAssistantObservations.get(row.id);
+      if (
+        row.kind === 'chat' &&
+        archiveObservation &&
+        isIsoInWindow(archiveObservation.sentAt, input.since, input.until)
+      ) {
+        input.counters.finalChatAssistantArchiveObserved += 1;
+      }
+      if (delivery?.status !== 'delivered' || !isIsoInWindow(delivery.delivered_at, input.since, input.until)) {
+        continue;
+      }
       if (row.kind === 'status') {
         if (delivery.platform_message_id !== null) input.counters.statusPlatformPostEvidence += 1;
         else input.counters.deliveryProcessedUnknown += 1;
@@ -541,9 +628,6 @@ function scanSession(input: {
       if (delivery.platform_message_id !== null) {
         input.counters.finalChatDeliveryEvidence += 1;
         input.counters.finalChatPlatformMessageId += 1;
-      } else if (input.archiveAssistantIds.has(row.id)) {
-        input.counters.finalChatDeliveryEvidence += 1;
-        input.counters.finalChatAssistantArchiveId += 1;
       } else {
         input.counters.deliveryProcessedUnknown += 1;
       }
@@ -553,8 +637,8 @@ function scanSession(input: {
     input.errors.push({ source: activeSource, session: input.session, code: 'unreadable' });
     return false;
   } finally {
-    outbound?.close();
-    inbound?.close();
+    closeReadOnly(outbound, outboundPath, input.sqliteObservations);
+    closeReadOnly(inbound, inboundPath, input.sqliteObservations);
   }
 }
 
@@ -581,7 +665,7 @@ export function extractReviewOutcomeEvidence(
   const eligiblePrs = prs.filter((pr) => isStrictIsoUtc(pr.mergedAt) && isIsoInWindow(pr.mergedAt, since, until));
 
   // `computeWeeklyReport` owns the established 14-day end-of-week maturity
-  // definition (`scripts/review-outcomes.ts:1209-1221`); this only reuses it.
+  // definition (`scripts/review-outcomes.ts:1266-1295`); this only reuses it.
   const maturityByWeek = new Map(
     computeWeeklyReport([...eligiblePrs], [], followupDays, until).rows.map((row) => [row.isoWeek, row.immature]),
   );
@@ -665,8 +749,21 @@ export function collectOperatorAttentionEvidence(options: ExtractOptions): Opera
   const errors: CoverageError[] = [];
   const counters = emptyCounters();
   const samples: CandidateSample[] = [];
-  const archiveAssistantIds = readAssistantArchiveIds(options.archiveDb, errors);
-  readCentralEvidence(options.centralDb, options.since, options.until, counters, samples, sampleLimit, errors);
+  const sqliteObservations: SqliteReadObservations = {
+    walWithoutShmBeforeRead: new Set(),
+    shmObservedNewDuringRead: new Set(),
+  };
+  const archiveAssistantObservations = readAssistantArchiveObservations(options.archiveDb, errors, sqliteObservations);
+  readCentralEvidence(
+    options.centralDb,
+    options.since,
+    options.until,
+    counters,
+    samples,
+    sampleLimit,
+    errors,
+    sqliteObservations,
+  );
 
   let sessionDbsRead = 0;
   for (const session of listSessionDirectories(options.sessionsRoot)) {
@@ -675,11 +772,12 @@ export function collectOperatorAttentionEvidence(options: ExtractOptions): Opera
         ...session,
         since: options.since,
         until: options.until,
-        archiveAssistantIds,
+        archiveAssistantObservations,
         counters,
         samples,
         sampleLimit,
         errors,
+        sqliteObservations,
       })
     ) {
       sessionDbsRead += 1;
@@ -694,9 +792,17 @@ export function collectOperatorAttentionEvidence(options: ExtractOptions): Opera
       sourceReadComplete: errors.length === 0,
       archiveScope: 'explicit_db_scope_unverified_against_sessions_root',
       errors,
+      sqliteReadContract: {
+        readonly: true,
+        queryOnly: true,
+        sidecarMetadataMayChange: true,
+        walFilesWithoutShmBeforeRead: sqliteObservations.walWithoutShmBeforeRead.size,
+        shmFilesObservedNewDuringRead: sqliteObservations.shmObservedNewDuringRead.size,
+      },
       definitions: {
-        delivered: 'non-null platform message id, or assistant archive id for final chat',
-        deliveryProcessedUnknown: 'delivered-table row with no sufficient platform/archive evidence',
+        delivered: 'non-null platform message id at delivered_at',
+        archiveObserved: 'matching assistant archive id at sent_at; not platform-delivery confirmation',
+        deliveryProcessedUnknown: 'delivered-table row with a null platform message id',
         prose: 'candidate only; no reading-time inference',
         approvalCards: 'current pending, platform-backed pending_approvals snapshot, not historical total',
       },
