@@ -34,7 +34,8 @@ cat >"$STUB_BIN/agent-browser" <<STUBEOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >>"$STUB_LOG"
 
-if [ "\$1" = "--session" ]; then shift 2; fi
+SESSION=""
+if [ "\$1" = "--session" ]; then SESSION="\$2"; shift 2; fi
 VERB="\${1:-}"
 shift || true
 
@@ -53,6 +54,11 @@ case "\$VERB" in
     exit 0
     ;;
   set)
+    if [ "\${AGENT_BROWSER_STUB_FAIL_GRID_VIEWPORT:-}" = 1 ] &&
+       [[ "\$SESSION" == *-grid ]] && [ "\${1:-}" = "viewport" ]; then
+      echo "stub: grid viewport failed" >&2
+      exit 1
+    fi
     exit 0
     ;;
   screenshot)
@@ -152,6 +158,17 @@ FIRST_STATE_LINE="$(grep -n ' state load ' "$STUB_LOG" | head -1 | cut -d: -f1)"
 FIRST_OPEN_LINE="$(grep -n ' open ' "$STUB_LOG" | head -1 | cut -d: -f1)"
 [ -n "$FIRST_STATE_LINE" ] && [ -n "$FIRST_OPEN_LINE" ] && [ "$FIRST_STATE_LINE" -lt "$FIRST_OPEN_LINE" ] \
   || { echo "happy path: expected state load before the first open" >&2; exit 1; }
+
+# The contact-sheet grid uses a cold session. It must navigate to its local
+# page before setting a viewport, and the viewport must precede its screenshot.
+GRID_SESSION="$(awk '$1=="--session" && $3=="open" && $4 ~ /^file:/{print $2}' "$STUB_LOG")"
+[ -n "$GRID_SESSION" ] || { echo "happy path: grid session never opened the local sheet" >&2; exit 1; }
+GRID_OPEN_LINE="$(grep -n -- "^--session $GRID_SESSION open file:" "$STUB_LOG" | head -1 | cut -d: -f1)"
+GRID_VIEWPORT_LINE="$(grep -n -- "^--session $GRID_SESSION set viewport 1750 1000$" "$STUB_LOG" | head -1 | cut -d: -f1)"
+GRID_SHOT_LINE="$(grep -n -- "^--session $GRID_SESSION screenshot --full .*sheet.png$" "$STUB_LOG" | head -1 | cut -d: -f1)"
+[ -n "$GRID_OPEN_LINE" ] && [ -n "$GRID_VIEWPORT_LINE" ] && [ -n "$GRID_SHOT_LINE" ] &&
+  [ "$GRID_OPEN_LINE" -lt "$GRID_VIEWPORT_LINE" ] && [ "$GRID_VIEWPORT_LINE" -lt "$GRID_SHOT_LINE" ] \
+  || { echo "happy path: grid must open, set viewport, then screenshot in its cold session" >&2; exit 1; }
 
 # the click step's text= shorthand must translate to find text ... click, not
 # a raw `click "text=..."` call agent-browser does not understand.
@@ -423,5 +440,26 @@ JSON
 check_fresh_nav "$RUN10B" "/" "/pricing"
 
 echo "10/10 fresh session per screen, order-independent ok"
+
+# --- 11. A grid viewport failure is visible; it must never post a clipped sheet
+RUN11="$(fresh_run_dir grid-viewport-failure)"
+cat >"$RUN11/contact-sheet/shots.json" <<'JSON'
+[{ "name": "home", "path": "/" }]
+JSON
+
+: >"$STUB_LOG"
+set +e
+RESULT="$(AGENT_BROWSER_STUB_FAIL_GRID_VIEWPORT=1 bash "$SCRIPT" "$RUN11" "https://example.test" "$AUTH_STATE" 2>&1)"
+EC=$?
+set -e
+[ "$EC" -eq 1 ] || { echo "grid viewport: expected exit 1, got $EC" >&2; exit 1; }
+echo "$RESULT" | jq -e '.ok == false and (.error | test("grid viewport"))' >/dev/null \
+  || { echo "grid viewport: expected a visible viewport failure: $RESULT" >&2; exit 1; }
+[ ! -e "$RUN11/contact-sheet/sheet.png" ] \
+  || { echo "grid viewport: must not emit a sheet after viewport failure" >&2; exit 1; }
+grep -q -- ' screenshot --full .*sheet.png$' "$STUB_LOG" \
+  && { echo "grid viewport: must not screenshot a grid after viewport failure" >&2; exit 1; }
+
+echo "11/11 grid viewport failure is visible, no clipped sheet emitted"
 
 echo "smoke contact sheet tests passed"

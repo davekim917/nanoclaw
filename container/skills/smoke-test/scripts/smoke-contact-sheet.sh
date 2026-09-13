@@ -477,9 +477,16 @@ rm -f "$RENDER_SCRIPT"
 GRID_SESSION="${SESSION_BASE}-grid"
 printf '%s\n' "$GRID_SESSION" >>"$SESSIONS_FILE"
 SHEET_FILE="$CS_DIR/sheet.png"
-agent-browser --session "$GRID_SESSION" set viewport 1750 1000 >/dev/null 2>&1 || true
 if ! SHEET_OUT="$(agent-browser --session "$GRID_SESSION" open "file://$CS_DIR/grid.html" 2>&1)"; then
   jq -cn --arg e "$SHEET_OUT" '{ok:false,error:("could not open the rendered grid: " + $e)}'
+  exit 1
+fi
+if ! SHEET_OUT="$(agent-browser --session "$GRID_SESSION" set viewport 1750 1000 2>&1)"; then
+  # The grid session is brand new, unlike each captured screen. A failed
+  # viewport command here would silently emit a clipped/default-width sheet,
+  # which is the primary visual evidence for the campaign. Fail visibly rather
+  # than uploading an artifact whose two-column comparison cannot be trusted.
+  jq -cn --arg e "$SHEET_OUT" '{ok:false,error:("could not set the rendered grid viewport: " + $e)}'
   exit 1
 fi
 if ! SHEET_OUT="$(agent-browser --session "$GRID_SESSION" screenshot --full "$SHEET_FILE" 2>&1)"; then
