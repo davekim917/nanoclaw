@@ -87,10 +87,11 @@ check "missing file"        ""          "$(read_env_value K "$TMP/nope.env")"
 # A malformed override must be refused BEFORE the comparison that uses it:
 # `[ 5 -lt 70% ]` returns status 2, and because it is an `if` condition `set -e`
 # does not stop the script — it falls through and restarts the gateway on every
-# tick. Invalid config exits before touching docker, so these stay hermetic.
+# tick. Every invocation below uses deterministic command shims, so a future
+# ordering regression cannot turn this test into a production-daemon probe.
 expect_reject() { # <label> <VAR=value> <expected substring>
   local out
-  if out="$(env "$2" DRY_RUN=1 bash "$TARGET" 2>&1)"; then
+  if out="$(run_watchdog "$2" DRY_RUN=1 2>&1)"; then
     fail=$((fail + 1))
     printf 'FAIL: %s — accepted, should have been refused\n' "$1" >&2
     return
@@ -102,18 +103,90 @@ expect_reject() { # <label> <VAR=value> <expected substring>
   esac
 }
 
+# Empty is NOT invalid — `${RESTART_PCT:-70}` treats it as unset, matching
+# src/env.ts (`if (value)`: an empty value means not set). Exercise the real
+# default comparison using deterministic command shims: the script must reach
+# its 70%-threshold DRY_RUN branch without talking to the production daemon.
+WATCHDOG_STUBS="$TMP/watchdog-stubs"
+WATCHDOG_LOG="$TMP/watchdog-stub.log"
+mkdir -p "$WATCHDOG_STUBS" "$TMP/watchdog-home" "$TMP/watchdog-nanoclaw"
+
+cat > "$WATCHDOG_STUBS/docker" <<'STUB'
+#!/bin/bash
+set -eu
+printf '%s\n' "$*" >> "${WATCHDOG_STUB_LOG:?}"
+case "${1:-}" in
+  inspect)
+    case " $* " in
+      *'{{.State.Pid}}'*) printf '1\n' ;;
+      *'{{.State.Health.Status}}'*) printf 'healthy\n' ;;
+      *) printf '{}\n' ;;
+    esac
+    ;;
+  top) printf 'root %s 0 0 0 0 0 onecli-gateway\n' "${WATCHDOG_TEST_PID:?}" ;;
+  restart) printf 'unexpected restart\n' >&2; exit 99 ;;
+  *) printf 'unexpected docker invocation: %s\n' "$*" >&2; exit 99 ;;
+esac
+STUB
+cat > "$WATCHDOG_STUBS/ls" <<'STUB'
+#!/bin/bash
+set -eu
+if [ "${1:-}" = "/proc/${WATCHDOG_TEST_PID:?}/fd" ]; then
+  for _ in $(seq 1 70); do printf 'fd\n'; done
+  exit 0
+fi
+exec /bin/ls "$@"
+STUB
+cat > "$WATCHDOG_STUBS/awk" <<'STUB'
+#!/bin/bash
+set -eu
+for arg in "$@"; do
+  if [ "$arg" = "/proc/${WATCHDOG_TEST_PID:?}/limits" ]; then
+    printf '100\n'
+    exit 0
+  fi
+done
+exec /usr/bin/awk "$@"
+STUB
+cat > "$WATCHDOG_STUBS/nsenter" <<'STUB'
+#!/bin/bash
+set -eu
+printf 'ESTAB 0 0 127.0.0.1:1 127.0.0.1:2\nCLOSE-WAIT 0 0 127.0.0.1:3 127.0.0.1:4\n'
+STUB
+chmod +x "$WATCHDOG_STUBS/docker" "$WATCHDOG_STUBS/ls" "$WATCHDOG_STUBS/awk" "$WATCHDOG_STUBS/nsenter"
+
+run_watchdog() {
+  env -i \
+    PATH="$WATCHDOG_STUBS:/usr/bin:/bin" \
+    HOME="$TMP/watchdog-home" \
+    NANOCLAW_DIR="$TMP/watchdog-nanoclaw" \
+    ONECLI_GATEWAY_CONTAINER=test-onecli \
+    WATCHDOG_STUB_LOG="$WATCHDOG_LOG" \
+    WATCHDOG_TEST_PID="$$" \
+    "$@" \
+    bash "$TARGET"
+}
+
 expect_reject "RESTART_PCT non-numeric"  RESTART_PCT=70%    "RESTART_PCT must be an integer 1-100"
 expect_reject "RESTART_PCT zero"         RESTART_PCT=0      "RESTART_PCT must be 1-100"
 expect_reject "RESTART_PCT over 100"     RESTART_PCT=101    "RESTART_PCT must be 1-100"
-# Empty is NOT invalid — `${RESTART_PCT:-70}` treats it as unset, matching
-# src/env.ts (`if (value)`: an empty value means not set). Assert the fallback
-# rather than a rejection, so nobody "fixes" this into an error later.
-out="$(env RESTART_PCT= DRY_RUN=1 bash "$TARGET" 2>&1 || true)"
-case "$out" in
-  *"RESTART_PCT must be"*)
-    fail=$((fail + 1)); printf 'FAIL: empty RESTART_PCT should fall back to the default, not be refused\n' >&2 ;;
-  *) pass=$((pass + 1)) ;;
-esac
+
+: > "$WATCHDOG_LOG"
+if ! out="$(run_watchdog RESTART_PCT= DRY_RUN=1 2>&1)"; then
+  fail=$((fail + 1))
+  printf 'FAIL: empty RESTART_PCT default run exited nonzero\n%s\n' "$out" >&2
+else
+  if [[ "$out" == *'fds=70/100 (70%)'* && "$out" == *'threshold=70%'* && "$out" == *"DRY_RUN=1, would restart 'test-onecli'"* ]]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    printf 'FAIL: empty RESTART_PCT did not reach default threshold branch\n%s\n' "$out" >&2
+  fi
+fi
+grep -q '^inspect test-onecli$' "$WATCHDOG_LOG" \
+  && grep -q '^top test-onecli$' "$WATCHDOG_LOG" \
+  && ! grep -q '^restart ' "$WATCHDOG_LOG" \
+  || { fail=$((fail + 1)); printf 'FAIL: default run did not stay inside the deterministic docker shim\n' >&2; }
 
 expect_reject "RECOVER_WAIT_S bad"      RECOVER_WAIT_S=abc "RECOVER_WAIT_S must be an integer 1-300"
 expect_reject "RECOVER_WAIT_S zero"     RECOVER_WAIT_S=0   "RECOVER_WAIT_S must be 1-300"
