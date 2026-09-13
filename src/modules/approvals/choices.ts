@@ -37,6 +37,7 @@ import { equivalentSlackUserIds } from '../../slack-user-identity.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { getUser } from '../permissions/db/users.js';
 import { notifyApprovalResolved } from './primitive.js';
+import { parseReleaseShipScope, releaseShipScopeJson } from './release-ship-scope.js';
 
 export interface ChoiceHandlerContext {
   approval: PendingApproval;
@@ -117,6 +118,10 @@ export async function resolveChoice(approval: PendingApproval, selectedOption: s
     log.info('Ignoring click on an already-resolved choice', { approvalId: approval.approval_id, userId });
     return;
   }
+  // The authorization decision is the successful CAS, not an arbitrarily
+  // delayed answer delivery or recorder write. Capture it before every await
+  // below and pass it unchanged into the immutable receipt.
+  const resolvedAt = new Date().toISOString();
 
   let deliveredTo: Session | null;
   try {
@@ -156,7 +161,7 @@ export async function resolveChoice(approval: PendingApproval, selectedOption: s
     userId,
     sessionId: deliveredTo.id,
   });
-  await writeChoiceReceipt(approval, deliveredTo, option, userId);
+  await writeChoiceReceipt(approval, deliveredTo, option, userId, resolvedAt);
   await deletePendingApproval(approval.approval_id);
   const name = (await getUser(userId))?.display_name || userId;
   await editChoiceCard(approval, cardText(approval, `✅ ${option.label} — ${name}`));
@@ -199,6 +204,7 @@ async function writeChoiceReceipt(
   deliveredTo: Session,
   option: NormalizedOption,
   userId: string,
+  resolvedAt: string,
 ): Promise<void> {
   try {
     await recordChoiceReceipt({
@@ -213,7 +219,8 @@ async function writeChoiceReceipt(
       value: option.value,
       label: option.label,
       clickerUserId: userId,
-      resolvedAt: new Date().toISOString(),
+      releaseScopeJson: receiptReleaseScopeJson(approval),
+      resolvedAt,
     });
     // eslint-disable-next-line no-catch-all/no-catch-all -- the answer is already delivered; a receipt-write failure must not reopen the card
   } catch (err) {
@@ -222,6 +229,18 @@ async function writeChoiceReceipt(
       requestId: approval.request_id,
       err,
     });
+  }
+}
+
+/** A corrupt pending payload can never manufacture externally trusted scope. */
+function receiptReleaseScopeJson(approval: PendingApproval): string | null {
+  try {
+    const payload = JSON.parse(approval.payload) as { approvalScope?: unknown };
+    const scope = parseReleaseShipScope(payload.approvalScope);
+    return scope ? releaseShipScopeJson(scope) : null;
+    // eslint-disable-next-line no-catch-all/no-catch-all -- corrupt payload is unscoped, never an authority grant
+  } catch {
+    return null;
   }
 }
 

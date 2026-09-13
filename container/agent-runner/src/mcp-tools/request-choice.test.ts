@@ -49,6 +49,13 @@ const OPTIONS = [
   { label: 'Hold', value: 'hold', style: 'danger' },
 ];
 const ASK = { title: 'Release', question: 'Which change ships?', options: OPTIONS };
+const RELEASE_SCOPE = {
+  purpose: 'release_ship',
+  repository: 'owner/repository',
+  pullRequest: 42,
+  base: 'main',
+  headSha: 'a'.repeat(40),
+};
 
 function inConversation(): void {
   seedSessionRouting('slack', 'slack:chan-1', 'slack:chan-1:100.1');
@@ -94,6 +101,18 @@ describe('request_choice', () => {
     inConversation();
     await requestChoice.handler({ ...ASK, approvers: ['slack:admin-1', 'slack:admin-2'] });
     expect(outbound('system')[0].content.approvers).toEqual(['slack:admin-1', 'slack:admin-2']);
+  });
+
+  it('transports a valid release scope without agent-controlled presentation', async () => {
+    inConversation();
+    const result = await requestChoice.handler({ approvalScope: RELEASE_SCOPE });
+
+    expect(result.isError).toBeUndefined();
+    expect(outbound('system')[0].content).toEqual({
+      action: 'request_choice',
+      choiceId: outbound('system')[0].id,
+      approvalScope: RELEASE_SCOPE,
+    });
   });
 
   it('with `to`: resolves the channel destination into the action', async () => {
@@ -177,6 +196,17 @@ describe('request_choice', () => {
     ['a bare string option', { ...ASK, options: ['Hold'] }, /non-empty label/],
     ['an unknown style', { ...ASK, options: [{ label: 'A', value: 'a', style: 'loud' }] }, /unknown style/],
     ['a missing title', { question: 'Q', options: OPTIONS }, /title and question/],
+    ['a string PR in release scope', { approvalScope: { ...RELEASE_SCOPE, pullRequest: '42' } }, /approvalScope/],
+    ['a boolean PR in release scope', { approvalScope: { ...RELEASE_SCOPE, pullRequest: true } }, /approvalScope/],
+    ['a zero PR in release scope', { approvalScope: { ...RELEASE_SCOPE, pullRequest: 0 } }, /approvalScope/],
+    ['a fractional PR in release scope', { approvalScope: { ...RELEASE_SCOPE, pullRequest: 42.5 } }, /approvalScope/],
+    ['an unsafe PR in release scope', { approvalScope: { ...RELEASE_SCOPE, pullRequest: Number.MAX_SAFE_INTEGER + 1 } }, /approvalScope/],
+    ['a malformed repository in release scope', { approvalScope: { ...RELEASE_SCOPE, repository: 'owner repo' } }, /approvalScope/],
+    ['a malformed base in release scope', { approvalScope: { ...RELEASE_SCOPE, base: 'main branch' } }, /approvalScope/],
+    ['a short SHA in release scope', { approvalScope: { ...RELEASE_SCOPE, headSha: 'a'.repeat(39) } }, /approvalScope/],
+    ['an upper-case SHA in release scope', { approvalScope: { ...RELEASE_SCOPE, headSha: 'A'.repeat(40) } }, /approvalScope/],
+    ['a wrong purpose in release scope', { approvalScope: { ...RELEASE_SCOPE, purpose: 'other' } }, /approvalScope/],
+    ['an extra release scope key', { approvalScope: { ...RELEASE_SCOPE, extra: true } }, /approvalScope/],
     ['a malformed key', { ...ASK, key: 'has spaces' }, /key must be/],
     ['an over-long key', { ...ASK, key: 'k'.repeat(129) }, /key must be/],
     ['approvers that are not a list', { ...ASK, approvers: 'slack:admin-1' }, /approvers must hold/],

@@ -43,6 +43,13 @@ vi.mock('../../db/choice-receipts.js', async (importOriginal) => {
 
 const ACTION = 'test-choice';
 const USER = 'slack-fixture:U-clicker';
+const RELEASE_SCOPE = {
+  purpose: 'release_ship',
+  repository: 'owner/repository',
+  pullRequest: 42,
+  base: 'main',
+  headSha: 'a'.repeat(40),
+};
 
 function now(): string {
   return new Date().toISOString();
@@ -130,11 +137,36 @@ describe('choice receipts', () => {
       value: 'ship-a',
       label: 'Ship A',
       clicker_user_id: USER,
+      release_scope_json: null,
     });
     expect(receipt!.resolved_at).toBeTruthy();
 
     const count = (await getDb().get<{ n: number }>('SELECT COUNT(*) AS n FROM choice_receipts'))!.n;
     expect(count).toBe(1);
+  });
+
+  it('writes canonical scope and captures the winning CAS instant before a delayed handler advances the clock', async () => {
+    vi.useFakeTimers();
+    try {
+      const claimedAt = new Date('2026-09-13T10:00:00.000Z');
+      vi.setSystemTime(claimedAt);
+      const approval = await seedApproval({ payload: JSON.stringify({ approvalScope: RELEASE_SCOPE }) });
+      handler.mockImplementation(async () => {
+        // This is after the CAS. The old writer sampled this later value after
+        // delivery, letting transport latency re-date a human decision.
+        vi.setSystemTime(new Date('2026-09-13T12:00:00.000Z'));
+        return fakeSession('sess-target');
+      });
+
+      await resolveChoice(approval, 'ship-a', USER);
+
+      expect(await getChoiceReceipt(approval.approval_id)).toMatchObject({
+        release_scope_json: JSON.stringify(RELEASE_SCOPE),
+        resolved_at: claimedAt.toISOString(),
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('a losing second click writes nothing and never reaches delivery', async () => {
