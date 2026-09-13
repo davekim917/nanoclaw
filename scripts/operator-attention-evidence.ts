@@ -544,23 +544,24 @@ function scanSession(input: {
       }
       if (row.kind === 'system') {
         const parsed = safeJson(row.content);
-        if (!parsed || parsed.type === 'question_response') {
-          if (parsed && isQuestionResponseEnvelope(parsed)) {
-            input.counters.questionResponseCandidates += 1;
-            appendSample(
-              input.samples,
-              {
-                source: 'inbound',
-                session: input.session,
-                eventId: row.id,
-                timestamp: row.timestamp,
-                classifier: 'question_response_candidate',
-              },
-              input.sampleLimit,
-            );
-          } else {
-            input.counters.unknownInboundMessages += 1;
-          }
+        if (parsed && isQuestionResponseEnvelope(parsed)) {
+          input.counters.questionResponseCandidates += 1;
+          appendSample(
+            input.samples,
+            {
+              source: 'inbound',
+              session: input.session,
+              eventId: row.id,
+              timestamp: row.timestamp,
+              classifier: 'question_response_candidate',
+            },
+            input.sampleLimit,
+          );
+        } else {
+          // A system row outside the one recognized question-response shape is
+          // still durable inbound evidence. Do not silently omit a new system
+          // subtype from an extract that claims source completeness.
+          input.counters.unknownInboundMessages += 1;
         }
         continue;
       }
@@ -570,7 +571,14 @@ function scanSession(input: {
         input.counters.unknownInboundMessages += 1;
         continue;
       }
-      if (parsed.knownBot || !parsed.text) continue;
+      if (parsed.knownBot) continue;
+      if (!parsed.text) {
+        // A human file/attachment-only reply is not a prose candidate, but it
+        // must remain visible as unclassified evidence rather than becoming a
+        // zero-traffic window.
+        input.counters.unknownInboundMessages += 1;
+        continue;
+      }
       input.counters.inboundReplyCandidates += 1;
       appendSample(
         input.samples,
@@ -611,13 +619,22 @@ function scanSession(input: {
     // `messages_out` is container-owned and never has this table
     // (`src/mailbox/sqlite/schema.ts:23-60`). Do not ATTACH: each source DB
     // remains independently read-only, including when its WAL is live.
-    const deliveredByOutboundId = new Map(
-      (
-        inbound
-          .prepare('SELECT message_out_id, status, platform_message_id, delivered_at FROM delivered')
-          .all() as DeliveredRow[]
-      ).map((row) => [row.message_out_id, row]),
-    );
+    const deliveredRows = inbound
+      .prepare('SELECT message_out_id, status, platform_message_id, delivered_at FROM delivered')
+      .all() as DeliveredRow[];
+    // Count this metric from its authoritative table rather than from the
+    // outbound join. Acknowledgements can outlive a pruned outbound row, and
+    // a concurrent read can observe an acknowledgement before its row; either
+    // is still durable null-id delivery evidence in this time window.
+    for (const delivery of deliveredRows) {
+      if (
+        delivery.platform_message_id === null &&
+        isIsoInWindow(delivery.delivered_at, input.since, input.until)
+      ) {
+        input.counters.deliveryProcessedUnknown += 1;
+      }
+    }
+    const deliveredByOutboundId = new Map(deliveredRows.map((row) => [row.message_out_id, row]));
     for (const row of outboundRows) {
       const delivery = deliveredByOutboundId.get(row.id);
       const archiveObservation = input.archiveAssistantObservations.get(row.id);
@@ -628,26 +645,27 @@ function scanSession(input: {
       ) {
         input.counters.finalChatAssistantArchiveObserved += 1;
       }
-      if (delivery?.status !== 'delivered' || !isIsoInWindow(delivery.delivered_at, input.since, input.until)) {
+      if (!delivery || !isIsoInWindow(delivery.delivered_at, input.since, input.until)) {
         continue;
       }
+      // Null-id rows were counted directly from `delivered` above. Do not let
+      // them enter successful-delivery classification merely because a matching
+      // container-owned outbound row happens to be present.
+      if (delivery.platform_message_id === null) {
+        continue;
+      }
+      if (delivery.status !== 'delivered') continue;
       if (row.kind === 'status') {
-        if (delivery.platform_message_id !== null) input.counters.statusPlatformPostEvidence += 1;
-        else input.counters.deliveryProcessedUnknown += 1;
+        input.counters.statusPlatformPostEvidence += 1;
         continue;
       }
       if (isAskQuestion(row.content)) {
-        if (delivery.platform_message_id !== null) input.counters.platformBackedQuestionCards += 1;
-        else input.counters.deliveryProcessedUnknown += 1;
+        input.counters.platformBackedQuestionCards += 1;
         continue;
       }
       if (row.kind !== 'chat') continue;
-      if (delivery.platform_message_id !== null) {
-        input.counters.finalChatDeliveryEvidence += 1;
-        input.counters.finalChatPlatformMessageId += 1;
-      } else {
-        input.counters.deliveryProcessedUnknown += 1;
-      }
+      input.counters.finalChatDeliveryEvidence += 1;
+      input.counters.finalChatPlatformMessageId += 1;
     }
     return true;
   } catch {
