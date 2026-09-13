@@ -1658,14 +1658,38 @@ fi
 # A run id not held by any task slot is unaffected by an unrelated one.
 bash "$GATE" claim run-c "$TASK_SLOT_SHA" | jq -e '.ok == true and .runId == "run-c"' >/dev/null
 
+# A finished task has no activeRunId, but its terminal run id still owns the
+# shared verdict key and cannot be reused by the develop gate.
+fresh_state
+printf '{"schemaVersion":1,"activeRunId":null,"activeSha":null,"completedRunId":"run-finished","completedSha":"%s"}\n' \
+  "$TASK_SLOT_SHA" > "$STATE_DIR2/task-run-finished-state.json"
+FINISHED_TASK_OUT="$(bash "$GATE" claim run-finished "$TASK_SLOT_SHA")"
+jq -e '.ok == false and .taskBinding == "completed" and (.error | test("finished"))' \
+  <<<"$FINISHED_TASK_OUT" >/dev/null || {
+  echo "60: claim took a finished task run id: $FINISHED_TASK_OUT" >&2; exit 1; }
+[ ! -e "$STATE_DIR2/develop-state.json" ] ||
+  { echo "60: a refused finished-task claim wrote develop state" >&2; exit 1; }
+
+# task-release retains activeSha as its durable task binding. It is not an
+# active slot, but this gate still may not take the run id on any SHA.
+fresh_state
+printf '{"schemaVersion":1,"activeRunId":null,"activeSha":"%s","completedRunId":null,"completedSha":null}\n' \
+  "$TASK_SLOT_SHA" > "$STATE_DIR2/task-run-released-state.json"
+RELEASED_TASK_OUT="$(bash "$GATE" claim run-released "$TASK_SLOT_SHA")"
+jq -e '.ok == false and .taskBinding == "released" and (.error | test("released"))' \
+  <<<"$RELEASED_TASK_OUT" >/dev/null || {
+  echo "60: claim took a released task run id: $RELEASED_TASK_OUT" >&2; exit 1; }
+[ ! -e "$STATE_DIR2/develop-state.json" ] ||
+  { echo "60: a refused released-task claim wrote develop state" >&2; exit 1; }
+
 # --- 60b. Shadow-review finding 1: the refusal above must not fail OPEN on
 # this run's own unreadable task-scoped state. `jq … 2>/dev/null` used to read
 # a malformed, chmod-000, or torn file the same as "no match", letting the
 # claim through onto a run id a task-scoped certification run might still
-# hold. An EMPTY file (never a real task-claim state) and a null `activeRunId`
-# (a released/finished task slot) are not evidence of anything and must NOT be
-# refused — only #748's own reciprocal check on the PR-gate side draws that
-# same line via its `-s` gate.
+# hold. An EMPTY file (never a real task-claim state) and a bare null
+# `activeRunId` with no retained SHA or completed run are not evidence of
+# anything and must NOT be refused. A released state retains activeSha and a
+# finished state retains completedRunId, both explicitly tested above.
 fresh_state
 BAD_SHA="$(printf '8%.0s' $(seq 40))"
 printf 'not json' > "$STATE_DIR2/task-run-malformed-state.json"
@@ -1722,4 +1746,3 @@ bash "$GATE" claim run-lockheld "$LOCK_SHA" | jq -e '.ok == true and .runId == "
   { echo "60c: claim did not succeed once the control lock was free" >&2; exit 1; }
 
 echo "smoke develop gate tests passed"
-

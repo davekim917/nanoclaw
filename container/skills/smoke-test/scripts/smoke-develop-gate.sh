@@ -980,7 +980,7 @@ if [ "$COMMAND" = "claim" ]; then
   fi
   for _task_state_file in "$STATE_DIR"/task-*-state.json; do
     [ -e "$_task_state_file" ] || continue
-    _task_active_run_id=""
+    _task_binding="none"
     if [ "$_task_state_file" = "$STATE_DIR/task-$RUN_ID-state.json" ]; then
       # This run's OWN would-be task-scoped state. `jq … 2>/dev/null` used to
       # read a malformed or chmod-000 file here the same as "no such file" —
@@ -991,7 +991,15 @@ if [ "$COMMAND" = "claim" ]; then
       # anything — `-s` mirrors smoke-pr-gate.sh's own reciprocal check
       # (`smoke-pr-gate.sh`'s `claim`, TASK_OTHER_FILE) — and is not refused.
       if [ -s "$_task_state_file" ] &&
-         ! _task_active_run_id="$(jq -er '.activeRunId // ""' "$_task_state_file" 2>/dev/null)"; then
+         ! _task_binding="$(jq -er --arg run "$RUN_ID" '
+           if type != "object" then error("not a task state object")
+           elif (.activeRunId // "") == $run then "active"
+           elif (.completedRunId // "") == $run then "completed"
+           elif (.activeRunId // null) == null and (.completedRunId // null) == null and
+                ((.activeSha // null) | type == "string" and test("^[0-9a-f]{40}$")) then "released"
+           else "none"
+           end
+         ' "$_task_state_file" 2>/dev/null)"; then
         jq -cn --arg run "$RUN_ID" --arg path "$_task_state_file" \
           '{ok:false,error:"this run id'"'"'s task-scoped state exists but cannot be read — refusing; run ids must be unique across the gate",runId:$run,taskStateFile:$path}'
         flock -u 8; exec 8>&-
@@ -1002,11 +1010,21 @@ if [ "$COMMAND" = "claim" ]; then
       # into both the filename and `.activeRunId`, so this file can never
       # legitimately record OUR run id — a bad file here must never block
       # THIS claim (another run's corrupt state is not our problem).
-      _task_active_run_id="$(jq -r '.activeRunId // empty' "$_task_state_file" 2>/dev/null)"
+      _task_binding="$(jq -r --arg run "$RUN_ID" '
+        if (.activeRunId // "") == $run then "active"
+        elif (.completedRunId // "") == $run then "completed"
+        else "none"
+        end
+      ' "$_task_state_file" 2>/dev/null || printf 'none')"
     fi
-    if [ "$_task_active_run_id" = "$RUN_ID" ]; then
-      jq -cn --arg run "$RUN_ID" --arg path "$_task_state_file" \
-        '{ok:false,error:"run id already claimed by a task-scoped certification run — run ids must be unique across the gate",runId:$run,taskStateFile:$path}'
+    if [ "$_task_binding" != none ]; then
+      jq -cn --arg run "$RUN_ID" --arg path "$_task_state_file" --arg binding "$_task_binding" \
+        '{ok:false,error:(if $binding == "completed"
+                          then "run id already finished by a task-scoped certification run — terminal run ids must be unique across the gate"
+                          elif $binding == "released"
+                          then "run id remains bound to a released task-scoped certification run — run ids must be unique across the gate"
+                          else "run id already claimed by a task-scoped certification run — run ids must be unique across the gate"
+                          end),runId:$run,taskStateFile:$path,taskBinding:$binding}'
       flock -u 8; exec 8>&-
       exit 0
     fi

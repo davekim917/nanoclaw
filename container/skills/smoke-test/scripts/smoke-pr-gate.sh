@@ -614,13 +614,58 @@ rollback_poll_ownership() { # <pr> <runId> <owner> <prior-lease> <prior-authorit
 # campaign, is a lease that is visible to every CONTAINER (not just every
 # process on one), because the per-run flock below serializes invocations, not
 # containers. `deploySha` binds PERMANENTLY at claim and can never change,
-# even under --takeover: a different build gets a different run id, which
-# keeps this simpler than the PR case (there, the SAME PR legitimately
-# advances across many SHAs over a campaign; a task-scoped run certifies
-# exactly one immutable build).
+# even under --takeover: a different build gets a different run id. The task
+# state retains that existing `activeSha` field after release, because release
+# removes the lease and a later same-SHA recovery still needs a durable binding
+# to compare against. This keeps the task lifecycle simpler than the PR case
+# (there, the SAME PR legitimately advances across many SHAs over a campaign;
+# a task-scoped run certifies exactly one immutable build).
 task_state_file()      { printf '%s/task-%s-state.json' "$STATE_DIR" "$1"; }
 task_lease_file()      { printf '%s/task-lease-%s.json' "$LEASE_DIR" "$1"; }
 task_lease_lock_file() { printf '%s/task-lease-%s.lock' "$LEASE_DIR" "$1"; }
+
+# The task state is the durable record once task-release removes its lease.
+# Empty files are allowed: no task-claim writes one, so they carry no binding.
+# Every nonempty record used as a binding must have the shape this lifecycle
+# writes; otherwise claim paths fail closed rather than guessing which run it
+# may have represented.
+read_task_state_binding() {  # <runId> -> {binding:none|active|released|completed,...}
+  local run="$1" f binding
+  f="$(task_state_file "$run")"
+  if [ ! -e "$f" ] || [ ! -s "$f" ]; then
+    jq -cn --arg path "$f" '{binding:"none",taskStateFile:$path}'
+    return
+  fi
+  if ! binding="$(jq -ce --arg run "$run" '
+    def valid_sha: type == "string" and test("^[0-9a-f]{40}$");
+    if type != "object" or .schemaVersion != 1 then error("not a task state object")
+    else
+      (if has("activeRunId") then .activeRunId else null end) as $active_run |
+      (if has("activeSha") then .activeSha else null end) as $active_sha |
+      (if has("completedRunId") then .completedRunId else null end) as $completed_run |
+      (if has("completedSha") then .completedSha else null end) as $completed_sha |
+      if ($active_run != null and $completed_run != null) then error("task state has active and completed runs")
+      elif ($active_run != null and (($active_run | type) != "string" or $active_run != $run)) then error("task state names another active run")
+      elif ($completed_run != null and (($completed_run | type) != "string" or $completed_run != $run)) then error("task state names another completed run")
+      elif $active_run != null then
+        if ($active_sha | valid_sha) then {binding:"active",deploySha:$active_sha}
+        else error("active task state has no valid deploy SHA") end
+      elif $completed_run != null then
+        if ($completed_sha | valid_sha) then {binding:"completed",deploySha:$completed_sha}
+        else error("completed task state has no valid deploy SHA") end
+      elif $active_sha != null then
+        if ($active_sha | valid_sha) and $completed_sha == null then {binding:"released",deploySha:$active_sha}
+        else error("released task state has an invalid binding") end
+      elif $completed_sha != null then error("task state has a completed SHA without a completed run")
+      else {binding:"none"}
+      end
+    end
+  ' "$f" 2>/dev/null)"; then
+    jq -cn --arg path "$f" '{binding:"malformed",taskStateFile:$path}'
+    return
+  fi
+  jq -cn --argjson binding "$binding" --arg path "$f" '$binding + {taskStateFile:$path}'
+}
 
 read_task_lease() {
   local f lease stamp field; f="$(task_lease_file "$1")"
@@ -675,7 +720,7 @@ write_task_lease() {  # <runId> <json>
 # subshell. On refusal it prints the refusal JSON and releases fd 6.
 task_lease_acquire() {  # <runId> <owner> <deploySha>
   local run="$1" owner="$2" sha="$3" cur prior_claimed now next back
-  local verdict_file completed_run recorded completed
+  local verdict_file recorded completed state_binding state_binding_kind state_binding_sha
   TASK_PRIOR_LEASE_JSON=null
   TASK_ACQUIRED_LEASE_JSON=null
   if ! lease_dir_prepare; then
@@ -695,16 +740,21 @@ task_lease_acquire() {  # <runId> <owner> <deploySha>
     exec 6>&-
     return 1
   fi
-  # A FINISHED run id is terminal (#726 F3). task-finish removes the lease,
-  # the only record of the deploySha binding, so without this a re-claim on a
-  # different SHA passed the binding check below against a null lease, and the
-  # slot write rebuilt the state with completedRunId/completedVerdict/
-  # completedAt nulled: the run certified a second build and task-finish then
-  # came back reconciliation_required. Both terminal records are read here,
-  # under the lock task-finish holds from before its verdict write through its
-  # state commit (task_lease_fence_begin ... task_lease_fence_end in
-  # `task-finish`), so no finish can land between this check and the lease
-  # write below.
+  # The task state remains after task-release and task-finish. It carries the
+  # run's binding after release removes the lease, and terminal identity after
+  # finish removes it. Read it under the same task lease lock task-finish and
+  # task-release hold across their state commits, so neither can land between
+  # this check and the lease write below.
+  state_binding="$(read_task_state_binding "$run")"
+  state_binding_kind="$(jq -r '.binding' <<<"$state_binding")"
+  if [ "$state_binding_kind" = malformed ]; then
+    jq -cn --arg run "$run" --arg path "$(jq -r '.taskStateFile' <<<"$state_binding")" \
+      '{ok:false,error:("task-scoped state is malformed at " + $path + " - refusing to overwrite or rebind this run"),runId:$run,taskStateFile:$path}'
+    flock -u 6; exec 6>&-
+    return 1
+  fi
+  state_binding_sha="$(jq -r '.deploySha // empty' <<<"$state_binding")"
+  # A FINISHED run id is terminal (#726 F3).
   # One exception, same build only: a verdict for this SHA whose state never
   # recorded completion is a task-finish that died between its verdict write
   # and its state commit. Re-claiming it on that SHA is how its owner revives
@@ -712,10 +762,9 @@ task_lease_acquire() {  # <runId> <owner> <deploySha>
   # recovery hint); refusing that too would strand an active slot nothing can
   # release.
   verdict_file="$(run_verdict_file "$run")"
-  completed_run="$(jq -r '.completedRunId // empty' "$(task_state_file "$run")" 2>/dev/null || true)"
-  if [ "$completed_run" = "$run" ] || [ -e "$verdict_file" ]; then
+  completed=false; [ "$state_binding_kind" = completed ] && completed=true
+  if [ "$completed" = true ] || [ -e "$verdict_file" ]; then
     recorded="$(jq -c '.' "$verdict_file" 2>/dev/null || true)"
-    completed=false; [ "$completed_run" = "$run" ] && completed=true
     if [ "$completed" = true ] || [ -z "$recorded" ] ||
        ! jq -e --arg sha "$sha" --arg run "$run" '.sha == $sha and .runId == $run' <<<"$recorded" >/dev/null 2>&1; then
       jq -cn --arg run "$run" --arg owner "$owner" --arg sha "$sha" --arg path "$verdict_file" \
@@ -732,6 +781,18 @@ task_lease_acquire() {  # <runId> <owner> <deploySha>
       return 1
     fi
   fi
+  if { [ "$state_binding_kind" = active ] || [ "$state_binding_kind" = released ]; } &&
+     [ "$state_binding_sha" != "$sha" ]; then
+    jq -cn --arg run "$run" --arg owner "$owner" --arg sha "$sha" --arg bound "$state_binding_sha" \
+      --arg binding "$state_binding_kind" --arg path "$(jq -r '.taskStateFile' <<<"$state_binding")" \
+      '{ok:false,
+        error:("this run id is permanently bound to deploy " + $bound +
+               " and cannot be reused for deploy " + $sha +
+               " — a task-scoped run id is one build for its whole lifetime; start a new run id for a new build"),
+        runId:$run,requestedBy:$owner,requestedSha:$sha,boundSha:$bound,binding:$binding,taskStateFile:$path}'
+    flock -u 6; exec 6>&-
+    return 1
+  fi
   cur="$(read_task_lease "$run")"
   if [ "$(lease_is_malformed "$cur")" = true ]; then
     jq -cn --arg run "$run" --arg path "$(task_lease_file "$run")" \
@@ -739,8 +800,8 @@ task_lease_acquire() {  # <runId> <owner> <deploySha>
     flock -u 6; exec 6>&-
     return 1
   fi
-  # Permanently bound, no --takeover escape: a different build is a different
-  # run id, never a reclaim of this one. (See header comment above.)
+  # A live or expired lease also keeps the binding. The state check above is
+  # what preserves it after a deliberate release removes this lease.
   if [ "$cur" != null ] && [ "$(jq -r '.deploySha // empty' <<<"$cur")" != "$sha" ]; then
     jq -cn --arg run "$run" --arg owner "$owner" --arg sha "$sha" --argjson lease "$cur" \
       '{ok:false,
@@ -1793,27 +1854,35 @@ if [ "$COMMAND" = "claim" ]; then
         pr:$pr,runId:$run,activePr:$otherPr}'
     exit 0
   fi
-  # ...nor one an active task-scoped run holds (#726 F2). `task-claim` refuses a
-  # run id any PR campaign holds; this is the other direction, which
-  # find_pr_for_run cannot see — it scans only pr-*-state.json. Without it a PR
-  # campaign could claim a run id a live certification already holds; both
-  # lifecycles then die in smoke-run-scaffold.sh's begin_active_run_fence
-  # (`count` == 2, "exactly one active slot") and share runs/<id>/verdict.json.
+  # ...nor one a task-scoped run has ever bound (#726 F2, #755/#757). The task
+  # state remains after release (with activeSha retained) and after finish
+  # (with completedRunId): either record owns this run id's immutable build.
+  # `task-claim` refuses a run id any PR campaign holds; this is the other
+  # direction, which find_pr_for_run cannot see — it scans only
+  # pr-*-state.json. Without it a PR campaign could take a task's active,
+  # released, or terminal identity and later collide in runs/<id>/verdict.json.
   # `task-claim` writes its slot under this same CONTROL_LOCK, so this read
-  # cannot race it. A task state that exists but cannot be parsed fails closed.
-  TASK_OTHER_FILE="$(task_state_file "$RUN_ID")"
-  if [ -s "$TASK_OTHER_FILE" ]; then
-    TASK_OTHER_WHY=""
-    if ! TASK_OTHER_ACTIVE="$(jq -er '.activeRunId // ""' "$TASK_OTHER_FILE" 2>/dev/null)"; then
-      TASK_OTHER_WHY="task-scoped state for this run id exists but cannot be read — refusing; run ids must be unique across the gate"
-    elif [ "$TASK_OTHER_ACTIVE" = "$RUN_ID" ]; then
-      TASK_OTHER_WHY="run id already claimed by an active task-scoped run (task-claim) — run ids must be unique across the gate"
-    fi
-    if [ -n "$TASK_OTHER_WHY" ]; then
-      jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg err "$TASK_OTHER_WHY" --arg path "$TASK_OTHER_FILE" \
-        '{ok:false,error:$err,pr:$pr,runId:$run,taskStateFile:$path}'
-      exit 0
-    fi
+  # cannot race it. A nonempty task state that cannot prove its shape fails
+  # closed; an empty file still carries no claimed state.
+  TASK_OTHER_BINDING="$(read_task_state_binding "$RUN_ID")"
+  TASK_OTHER_KIND="$(jq -r '.binding' <<<"$TASK_OTHER_BINDING")"
+  TASK_OTHER_FILE="$(jq -r '.taskStateFile' <<<"$TASK_OTHER_BINDING")"
+  TASK_OTHER_WHY=""
+  case "$TASK_OTHER_KIND" in
+    malformed)
+      TASK_OTHER_WHY="task-scoped state for this run id exists but cannot be read — refusing; run ids must be unique across the gate" ;;
+    active)
+      TASK_OTHER_WHY="run id already claimed by an active task-scoped run (task-claim) — run ids must be unique across the gate" ;;
+    released)
+      TASK_OTHER_WHY="run id remains bound to a released task-scoped run — run ids must be unique across the gate" ;;
+    completed)
+      TASK_OTHER_WHY="run id already finished by a task-scoped run — terminal task run ids cannot be claimed by a PR" ;;
+  esac
+  if [ -n "$TASK_OTHER_WHY" ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg err "$TASK_OTHER_WHY" --arg path "$TASK_OTHER_FILE" \
+      --arg binding "$TASK_OTHER_KIND" \
+      '{ok:false,error:$err,pr:$pr,runId:$run,taskStateFile:$path,taskBinding:$binding}'
+    exit 0
   fi
   exec 9>"$(pr_lock_file "$PR")"
   if ! flock -w "$LOCK_WAIT" 9; then
@@ -2255,11 +2324,30 @@ if [ "$COMMAND" = "task-claim" ]; then
       '{ok:false,error:"run id already claimed by a PR campaign — run ids must be unique across the gate",runId:$run,activePr:$otherPr}'
     exit 0
   fi
-  if [ -e "$STATE_DIR/develop-state.json" ] &&
-     [ "$(jq -r '.activeRunId // empty' "$STATE_DIR/develop-state.json" 2>/dev/null)" = "$RUN_ID" ]; then
-    jq -cn --arg run "$RUN_ID" \
-      '{ok:false,error:"run id already claimed by the develop campaign — run ids must be unique across the gate",runId:$run}'
-    exit 0
+  # The develop gate's own terminal state carries completedRunId after its
+  # active slot clears. It shares runs/<id>/verdict.json with task runs, so a
+  # completed develop identity is just as unavailable as an active one.
+  DEVELOP_STATE_FILE="$STATE_DIR/develop-state.json"
+  if [ -s "$DEVELOP_STATE_FILE" ]; then
+    if ! DEVELOP_BINDING="$(jq -er --arg run "$RUN_ID" '
+      if type != "object" then error("not a develop state object")
+      elif (.activeRunId // "") == $run then "active"
+      elif (.completedRunId // "") == $run then "completed"
+      else "none"
+      end
+    ' "$DEVELOP_STATE_FILE" 2>/dev/null)"; then
+      jq -cn --arg run "$RUN_ID" --arg path "$DEVELOP_STATE_FILE" \
+        '{ok:false,error:("develop state cannot be read at " + $path + " - task-claim refused to preserve run-id uniqueness"),runId:$run,developStateFile:$path}'
+      exit 0
+    fi
+    if [ "$DEVELOP_BINDING" != none ]; then
+      jq -cn --arg run "$RUN_ID" --arg binding "$DEVELOP_BINDING" --arg path "$DEVELOP_STATE_FILE" \
+        '{ok:false,error:(if $binding == "completed"
+                          then "run id already finished by the develop campaign — terminal run ids must be unique across the gate"
+                          else "run id already claimed by the develop campaign — run ids must be unique across the gate"
+                          end),runId:$run,developBinding:$binding,developStateFile:$path}'
+      exit 0
+    fi
   fi
   # Returns holding the shared task lease lock (fd 6) — see task_lease_acquire.
   # Called directly, never inside $(…), or the lock would die with the
@@ -2356,7 +2444,10 @@ if [ "$COMMAND" = "task-release" ]; then
   if ! task_lease_fence_begin "$RUN_ID" "$OWNER" "$COMMAND"; then
     exit 0
   fi
-  STATE="$(jq -c '.activeSha=null | .activeStartedAt=null | .activeRunId=null | .activeProgressAt=null |
+  # Keep activeSha as this run's durable deploy binding after the active slot
+  # and lease are released. task-claim reads it under this same task lease
+  # fence: another SHA must use another run id, while this SHA may recover.
+  STATE="$(jq -c '.activeStartedAt=null | .activeRunId=null | .activeProgressAt=null |
      .activeLeaseOwner=null' <<<"$STATE")"
   if ! task_lease_remove_fenced "$RUN_ID"; then
     task_lease_fence_end

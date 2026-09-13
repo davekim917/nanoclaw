@@ -2793,6 +2793,19 @@ bash "$GATE" task-claim run-shared-dev "$TASK_SHA" | jq -e '
 ' >/dev/null
 rm -f "$STATE_DIR/develop-state.json"
 
+# The reciprocal task-claim check also reads a completed develop identity: the
+# develop slot is no longer active, but its run-level verdict key is terminal.
+printf '{"schemaVersion":1,"activeRunId":null,"activeSha":null,"completedRunId":"run-shared-dev-finished","completedSha":"%s"}\n' "$TASK_SHA" \
+  > "$STATE_DIR/develop-state.json"
+F2_DEVELOP_FINISHED_OUT="$(bash "$GATE" task-claim run-shared-dev-finished "$TASK_SHA")"
+jq -e '.ok == false and .developBinding == "completed" and (.error | test("finished"))' \
+  <<<"$F2_DEVELOP_FINISHED_OUT" >/dev/null || {
+  echo "task-claim took a completed develop run id: $F2_DEVELOP_FINISHED_OUT" >&2; exit 1; }
+[ ! -e "$STATE_DIR/task-run-shared-dev-finished-state.json" ] &&
+  [ ! -e "$SMOKE_GATE_LEASE_DIR/task-lease-run-shared-dev-finished.json" ] ||
+  { echo "a refused completed-develop task claim wrote a task slot or lease" >&2; exit 1; }
+rm -f "$STATE_DIR/develop-state.json"
+
 # task-progress renews the lease and stamps activeProgressAt; wrong owner and
 # an unclaimed run are both refused.
 BEFORE_EXPIRES="$(jq -r '.expiresAt' "$SMOKE_GATE_LEASE_DIR/task-lease-run-t1.json")"
@@ -2803,14 +2816,28 @@ bash "$GATE" task-progress run-t1 | jq -e '.ok == true and .leaseRenewed == true
 bash "$GATE" task-progress run-t1 owner-wrong | jq -e '.ok == false' >/dev/null
 bash "$GATE" task-progress run-never-claimed | jq -e '.ok == false' >/dev/null
 
-# task-release drops both the private slot and the shared lease; the run is
-# then unclaimed and progress/release on it refuse as not-active.
+# task-release drops the active slot and the shared lease, but retains the
+# original activeSha as the run's durable binding. Progress/release then refuse
+# as not-active; a different SHA cannot steal the released run id, while the
+# original SHA can recover it.
 bash "$GATE" task-release run-t1 | jq -e '.ok == true and .leaseReleased == true' >/dev/null
 [ ! -e "$SMOKE_GATE_LEASE_DIR/task-lease-run-t1.json" ] ||
   { echo "expected task-release to remove the shared task lease" >&2; exit 1; }
-jq -e '.activeRunId == null' "$STATE_DIR/task-run-t1-state.json" >/dev/null
+jq -e --arg sha "$TASK_SHA" '.activeRunId == null and .activeSha == $sha' "$STATE_DIR/task-run-t1-state.json" >/dev/null
 bash "$GATE" task-progress run-t1 | jq -e '.ok == false' >/dev/null
 bash "$GATE" task-release run-t1 | jq -e '.ok == false' >/dev/null
+T1_RELEASED_STATE="$STATE_DIR/run-t1-released-before-rebind.json"
+cp "$STATE_DIR/task-run-t1-state.json" "$T1_RELEASED_STATE"
+T1_REBOUND_OUT="$(bash "$GATE" task-claim run-t1 "$OTHER_TASK_SHA")"
+jq -e --arg sha "$TASK_SHA" '
+  .ok == false and .boundSha == $sha and .binding == "released" and (.error | test("permanently bound"))
+' <<<"$T1_REBOUND_OUT" >/dev/null || {
+  echo "task-release allowed this run id to rebind to another SHA: $T1_REBOUND_OUT" >&2; exit 1; }
+cmp -s "$T1_RELEASED_STATE" "$STATE_DIR/task-run-t1-state.json" &&
+  [ ! -e "$SMOKE_GATE_LEASE_DIR/task-lease-run-t1.json" ] ||
+  { echo "a refused released-run rebind rewrote state or revived a lease" >&2; exit 1; }
+bash "$GATE" task-claim run-t1 "$TASK_SHA" | jq -e --arg sha "$TASK_SHA" '.ok == true and .sha == $sha' >/dev/null
+bash "$GATE" task-release run-t1 | jq -e '.ok == true and .leaseReleased == true' >/dev/null
 
 # After expiry (no takeover needed), a different owner may claim the same
 # run id on the SAME deploy SHA.
@@ -2945,7 +2972,7 @@ REAL_MKTEMP="$(command -v mktemp)" PATH="$PROBE_BIN:$PATH" \
 [ "$(cat "$STATE_DIR/slot-probe.txt" 2>/dev/null)" = "task=held control=held" ] || {
   echo "F1/F2: task-claim did not hold both locks through its slot write: $(cat "$STATE_DIR/slot-probe.txt" 2>/dev/null)" >&2; exit 1; }
 
-# --- #726 F2: run-id uniqueness holds in BOTH directions ---------------------
+# --- #726 F2/#755/#757: run-id uniqueness holds in BOTH directions ----------
 # `task-claim` refused a run id a PR campaign held, but `claim` never looked at
 # task-*-state.json: `task-claim run-b` then `claim run-b 5` returned ok:true,
 # leaving two active slots that wedge both runs in begin_active_run_fence.
@@ -2960,6 +2987,39 @@ jq -e '.ok == false and .pr == 5 and (.error | test("task-scoped")) and (.error 
   [ ! -e "$SMOKE_GATE_LEASE_DIR/pr-5-authority.json" ] ||
   { echo "F2: the refused PR claim still wrote a slot, lease or authority" >&2; exit 1; }
 bash "$GATE" task-progress run-f2 | jq -e '.ok == true' >/dev/null
+# A terminal task run is still an owner of its run id. PR claim used to inspect
+# only activeRunId, then write PR state/lease/authority for this completed id;
+# its later finish collided with the write-once task verdict. Refuse before any
+# PR lifecycle write, and leave both task receipts byte-for-byte intact.
+bash "$GATE" task-claim run-f2-finished "$F2_SHA" | jq -e '.ok == true' >/dev/null
+bash "$GATE" task-finish run-f2-finished "$F2_SHA" GO | jq -e '.ok == true' >/dev/null
+F2_FINISHED_STATE="$STATE_DIR/task-run-f2-finished-state.before-pr-claim"
+F2_FINISHED_VERDICT="$STATE_DIR/runs/run-f2-finished/verdict.before-pr-claim"
+cp "$STATE_DIR/task-run-f2-finished-state.json" "$F2_FINISHED_STATE"
+cp "$STATE_DIR/runs/run-f2-finished/verdict.json" "$F2_FINISHED_VERDICT"
+F2_FINISHED_OUT="$(bash "$GATE" claim run-f2-finished 8 "$F2_SHA")"
+jq -e '.ok == false and .taskBinding == "completed" and (.error | test("finished"))' <<<"$F2_FINISHED_OUT" >/dev/null || {
+  echo "F2: claim took a finished task run id: $F2_FINISHED_OUT" >&2; exit 1; }
+[ ! -e "$STATE_DIR/pr-8-state.json" ] &&
+  [ ! -e "$SMOKE_GATE_LEASE_DIR/lease-run-f2-finished.json" ] &&
+  [ ! -e "$SMOKE_GATE_LEASE_DIR/pr-8-authority.json" ] &&
+  cmp -s "$F2_FINISHED_STATE" "$STATE_DIR/task-run-f2-finished-state.json" &&
+  cmp -s "$F2_FINISHED_VERDICT" "$STATE_DIR/runs/run-f2-finished/verdict.json" ||
+  { echo "F2: a refused finished-task PR claim wrote PR authority/state/lease or changed task receipts" >&2; exit 1; }
+# A released task has no active slot, but still owns its retained deploy-SHA
+# binding; PR claim must not seize that recoverable identity either.
+bash "$GATE" task-claim run-f2-released "$F2_SHA" | jq -e '.ok == true' >/dev/null
+bash "$GATE" task-release run-f2-released | jq -e '.ok == true' >/dev/null
+F2_RELEASED_STATE="$STATE_DIR/task-run-f2-released-state.before-pr-claim"
+cp "$STATE_DIR/task-run-f2-released-state.json" "$F2_RELEASED_STATE"
+F2_RELEASED_OUT="$(bash "$GATE" claim run-f2-released 9 "$F2_SHA")"
+jq -e '.ok == false and .taskBinding == "released" and (.error | test("released"))' <<<"$F2_RELEASED_OUT" >/dev/null || {
+  echo "F2: claim took a released task run id: $F2_RELEASED_OUT" >&2; exit 1; }
+[ ! -e "$STATE_DIR/pr-9-state.json" ] &&
+  [ ! -e "$SMOKE_GATE_LEASE_DIR/lease-run-f2-released.json" ] &&
+  [ ! -e "$SMOKE_GATE_LEASE_DIR/pr-9-authority.json" ] &&
+  cmp -s "$F2_RELEASED_STATE" "$STATE_DIR/task-run-f2-released-state.json" ||
+  { echo "F2: a refused released-task PR claim wrote PR authority/state/lease or changed its binding" >&2; exit 1; }
 # The other direction: a run id a PR campaign holds cannot become a task run.
 bash "$GATE" claim run-f2-pr 6 "$F2_SHA" | jq -e '.ok == true' >/dev/null
 bash "$GATE" task-claim run-f2-pr "$F2_SHA" | jq -e '.ok == false and (.error | test("PR campaign"))' >/dev/null ||
