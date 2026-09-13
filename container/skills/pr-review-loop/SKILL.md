@@ -191,14 +191,17 @@ codex-review.sh receipt --head <sha> --outcome approve|changes --reviewer "<mode
 An in-flight claim is a visible coordination signal, not review evidence or
 an approval. Start a session-local/adversarial review with `claim`; its
 required owner label identifies the operator session because several agents
-share one GitHub account. `scope`, `request`, and `merge-check` surface a
+share one GitHub account. `scope`, `request`, and `merge-check` surface every
 fresh claim for the current head, but retain their usual verdicts and exit
-codes. Claims expire after 45 minutes by default (never more than 120), die
-when the head moves, and stay invisible if a reviewer forgets to make one.
-That discipline is intentional: comments cannot infer a local review that has
-not posted a marker. A receipt may retire its own claim only when called with
-both `--claim <id>` and `--claim-owner <label>`; an unrelated same-head receipt
-must not hide another review still in progress.
+codes. Explicit claims expire after 45 minutes by default and may declare any
+whole-minute TTL from 1 through 120. A connector request is also visible as an
+implicit 45-minute claim until its exact-head submitted review or a connector
+thumbs-up newer than that request completes it. Claims die when the head moves
+and stay invisible if a local reviewer forgets to make one. That discipline is
+intentional: comments cannot infer a local review that has not posted a marker.
+A receipt may retire its own explicit claim only when called with both
+`--claim <id>` and `--claim-owner <label>`; connector completion and unrelated
+same-head receipts must not hide another review still in progress.
 
 **Wait on CI only with `codex-review.sh ci-wait --head "$SHA"`**, in any repo — never `gh pr checks --watch`, `gh run watch`, or a sleep loop around either. It waits on exactly the head you pushed, not whatever the PR points at later, and it answers rather than timing out when waiting can't help. 31: the PR conflicts with its base, and GitHub runs no `pull_request` workflow on a conflicting PR, so merge the base in (`git merge origin/<base>`, never rebase), push, and wait again. 30: no CI run registered on the head (or none of a required workflow) — look at the workflow's triggers rather than waiting longer. 29: CI finished red — read the failure and fix it. 11 is a timeout with CI still running; 12, a head that moved — capture the new one. Its green is the same predicate merge-check applies, so `ci-wait` exiting 0 and then `codex-review.sh merge` is the normal order. Never pipe it; the exit code is the answer. A repo whose required workflow isn't named `CI` sets `CODEX_REVIEW_REQUIRED_WORKFLOWS`.
 

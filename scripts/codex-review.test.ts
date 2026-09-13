@@ -238,7 +238,12 @@ if [ -n "\${MOCK_DATE_VALUES:-}" ] && [ -s "$MOCK_DATE_VALUES" ]; then
   sed -i '1d' "$MOCK_DATE_VALUES"
   printf '%s\\n' "$value"
 elif [[ "$*" == *'-d '* ]]; then
-  printf '%s\\n' "\${MOCK_CLAIM_EXPIRES:-2026-09-13T01:45:00Z}"
+  printf 'date %s\\n' "$*" >> "$MOCK_CALLS"
+  if [ "\${MOCK_CLAIM_CLOCK_ROLLOVER:-0}" = 1 ] && [[ "$*" != *'2026-09-13T01:00:00Z'* ]]; then
+    printf '%s\\n' '2026-09-13T01:45:01Z'
+  else
+    printf '%s\\n' "\${MOCK_CLAIM_EXPIRES:-2026-09-13T01:45:00Z}"
+  fi
 elif [[ "$*" == *'+%Y-%m-%dT%H:%M:%SZ'* ]]; then
   printf '%s\\n' "\${MOCK_CLAIM_NOW:-2026-09-13T01:00:00Z}"
 else
@@ -1509,7 +1514,7 @@ describe('codex-review risk-scoped review requests', () => {
     expect(scope.status).toBe(0);
     expect(JSON.parse(scope.stdout)).toMatchObject({
       verdict: 'skip',
-      reviewClaim: { id: 'review-710', owner: 'adversarial-session', head: HEAD, kind: 'explicit' },
+      reviewClaims: [{ id: 'review-710', owner: 'adversarial-session', head: HEAD, kind: 'explicit' }],
     });
 
     const merge = runHelper(root, ['merge-check', '--head', HEAD]);
@@ -1526,14 +1531,16 @@ describe('codex-review risk-scoped review requests', () => {
     const scope = runHelper(root, ['scope']);
     expect(scope.status).toBe(0);
     expect(JSON.parse(scope.stdout)).toMatchObject({
-      reviewClaim: {
-        id: 'connector-1-20260913010000',
-        owner: 'connector',
-        head: HEAD,
-        started: '2026-09-13T01:00:00Z',
-        expires: '2026-09-13T01:45:00Z',
-        kind: 'connector',
-      },
+      reviewClaims: [
+        {
+          id: 'connector-1-20260913010000',
+          owner: 'connector',
+          head: HEAD,
+          started: '2026-09-13T01:00:00Z',
+          expires: '2026-09-13T01:45:00Z',
+          kind: 'connector',
+        },
+      ],
     });
   });
 
@@ -1547,22 +1554,19 @@ describe('codex-review risk-scoped review requests', () => {
 
     const scope = runHelper(root, ['scope']);
     expect(scope.status).toBe(0);
-    expect(JSON.parse(scope.stdout)).not.toHaveProperty('reviewClaim');
+    expect(JSON.parse(scope.stdout)).not.toHaveProperty('reviewClaims');
   });
 
   it('retires an existing connector request claim from its matching substitute completion', () => {
     const root = tempRoot();
     scopeFixture(root, {
       labels: [],
-      comments: [
-        marker(HEAD, 1, '2026-09-13T01:00:00Z'),
-        completedClaim('connector-1-20260913010000', 'connector'),
-      ],
+      comments: [marker(HEAD, 1, '2026-09-13T01:00:00Z'), completedClaim('connector-1-20260913010000', 'connector')],
     });
 
     const scope = runHelper(root, ['scope']);
     expect(scope.status).toBe(0);
-    expect(JSON.parse(scope.stdout)).not.toHaveProperty('reviewClaim');
+    expect(JSON.parse(scope.stdout)).not.toHaveProperty('reviewClaims');
   });
 
   it('warns about a live claim before request spends the PR-wide round budget, but still requests', () => {
@@ -1646,7 +1650,10 @@ describe('codex-review risk-scoped review requests', () => {
     ['a moved-head claim', reviewClaim('old-head', 'other', OLD_HEAD)],
     ['a claim whose ISO date cannot be parsed', reviewClaim('bad-date', 'other', HEAD, '2026-02-30T01:00:00Z')],
     ['a claim that starts in the future', reviewClaim('future-start', 'other', HEAD, '2026-09-13T01:01:00Z')],
-    ['a claim lasting more than the maximum 120 minutes', reviewClaim('long-ttl', 'other', HEAD, '2026-09-13T01:00:00Z', '2026-09-13T03:01:00Z')],
+    [
+      'a claim lasting more than the maximum 120 minutes',
+      reviewClaim('long-ttl', 'other', HEAD, '2026-09-13T01:00:00Z', '2026-09-13T03:01:00Z'),
+    ],
   ])('does not surface %s or change no-claim behavior', (_case, claim) => {
     const root = tempRoot();
     scopeFixture(root, { labels: [], comments: [claim] });
@@ -1675,7 +1682,7 @@ describe('codex-review risk-scoped review requests', () => {
 
     const scope = runHelper(root, ['scope']);
     expect(scope.status).toBe(0);
-    expect(scope.stdout).not.toContain('reviewClaim');
+    expect(scope.stdout).not.toContain('reviewClaims');
 
     const merge = runHelper(root, ['merge-check', '--head', HEAD]);
     expect(merge.status).toBe(0);
@@ -1689,7 +1696,7 @@ describe('codex-review risk-scoped review requests', () => {
 
     const stillLive = runHelper(root, ['scope']);
     expect(JSON.parse(stillLive.stdout)).toMatchObject({
-      reviewClaim: { id: 'review-710', owner: 'adversarial-session' },
+      reviewClaims: [{ id: 'review-710', owner: 'adversarial-session' }],
     });
 
     scopeFixture(root, {
@@ -1701,7 +1708,7 @@ describe('codex-review risk-scoped review requests', () => {
       ],
     });
     const retired = runHelper(root, ['scope']);
-    expect(JSON.parse(retired.stdout)).not.toHaveProperty('reviewClaim');
+    expect(JSON.parse(retired.stdout)).not.toHaveProperty('reviewClaims');
   });
 
   it('does not retire an explicit claim from bare completion text outside a substitute receipt', () => {
@@ -1710,7 +1717,147 @@ describe('codex-review risk-scoped review requests', () => {
     scopeFixture(root, { labels: [], comments: [live, bareClaimCompletion('review-710', 'adversarial-session')] });
 
     const scope = runHelper(root, ['scope']);
-    expect(JSON.parse(scope.stdout)).toMatchObject({ reviewClaim: { id: 'review-710', owner: 'adversarial-session' } });
+    expect(JSON.parse(scope.stdout)).toMatchObject({
+      reviewClaims: [{ id: 'review-710', owner: 'adversarial-session' }],
+    });
+  });
+
+  describe('review claim producer and visibility correction contract', () => {
+    it.each([1, 45, 46, 60, 120])(
+      'round-trips a successfully produced %i-minute explicit claim through the shared reader',
+      (ttl) => {
+        const root = tempRoot();
+        const started = '2026-09-13T01:00:00Z';
+        const expires = new Date(Date.parse(started) + ttl * 60_000).toISOString().replace('.000Z', 'Z');
+        scopeFixture(root);
+
+        const created = runHelper(
+          root,
+          ['claim', '--head', HEAD, '--owner', 'session-a', '--ttl-minutes', String(ttl)],
+          { MOCK_CLAIM_NOW: started, MOCK_CLAIM_EXPIRES: expires },
+        );
+        expect(created.status).toBe(0);
+        expect(created.posted).toContain(`started=${started} expires=${expires}`);
+
+        scopeFixture(root, { comments: [comment(started, created.posted!, 'shared-account')] });
+        const observed = runHelper(root, ['scope'], { MOCK_CLAIM_NOW: started });
+        expect(observed.status).toBe(0);
+        expect(JSON.parse(observed.stdout).reviewClaims).toMatchObject([
+          { owner: 'session-a', started, expires, kind: 'explicit' },
+        ]);
+      },
+    );
+
+    it('derives expiry from its one captured start when the wall clock crosses a second', () => {
+      const root = tempRoot();
+      scopeFixture(root);
+
+      const created = runHelper(root, ['claim', '--head', HEAD, '--owner', 'session-a'], {
+        MOCK_CLAIM_NOW: '2026-09-13T01:00:00Z',
+        MOCK_CLAIM_CLOCK_ROLLOVER: '1',
+      });
+      expect(created.status).toBe(0);
+      expect(created.posted).toContain('started=2026-09-13T01:00:00Z expires=2026-09-13T01:45:00Z');
+      expect(created.calls).toContain('date -u -d 2026-09-13T01:00:00Z + 45 minutes +%Y-%m-%dT%H:%M:%SZ');
+
+      scopeFixture(root, { comments: [comment('2026-09-13T01:00:01Z', created.posted!, 'shared-account')] });
+      const observed = runHelper(root, ['scope'], { MOCK_CLAIM_NOW: '2026-09-13T01:00:01Z' });
+      expect(JSON.parse(observed.stdout).reviewClaims).toMatchObject([{ owner: 'session-a' }]);
+    });
+
+    it.each(['scope', 'request', 'merge-check'])(
+      'surfaces every live owner through %s despite their shared GitHub actor',
+      (command) => {
+        const root = tempRoot();
+        scopeFixture(root, {
+          labels: command === 'request' ? ['risk:high'] : [],
+          comments: [reviewClaim('a', 'session-a'), reviewClaim('b', 'session-b')],
+        });
+
+        const observed = runHelper(root, [command, ...(command === 'merge-check' ? ['--head', HEAD] : [])]);
+        expect(observed.status).toBe(0);
+        if (command === 'scope') {
+          expect(JSON.parse(observed.stdout).reviewClaims).toMatchObject([
+            { id: 'a', owner: 'session-a' },
+            { id: 'b', owner: 'session-b' },
+          ]);
+        } else {
+          expect(observed.stderr).toContain('id=a owner=session-a');
+          expect(observed.stderr).toContain('id=b owner=session-b');
+        }
+      },
+    );
+
+    it('retires only the implicit connector claim on the existing thumbs-up-only clean path', () => {
+      const root = tempRoot();
+      scopeFixture(root, {
+        labels: ['risk:high'],
+        comments: [marker(HEAD, 1, '2026-09-13T01:00:00Z')],
+        reactions: [reaction('2026-09-13T01:05:00Z')],
+      });
+
+      const merged = runHelper(root, ['merge-check', '--head', HEAD], {
+        MOCK_CLAIM_NOW: '2026-09-13T01:06:00Z',
+      });
+      expect(merged.status).toBe(0);
+      expect(merged.stdout).toContain('codex=clean');
+      expect(merged.stderr).not.toContain('kind=connector');
+
+      scopeFixture(root, {
+        comments: [reviewClaim('local-a', 'session-a')],
+        reactions: [reaction('2026-09-13T01:05:00Z')],
+      });
+      expect(JSON.parse(runHelper(root, ['scope']).stdout).reviewClaims).toMatchObject([
+        { id: 'local-a', owner: 'session-a', kind: 'explicit' },
+      ]);
+    });
+
+    it('lets an owner replace an expired claim and surfaces the replacement', () => {
+      const root = tempRoot();
+      scopeFixture(root, {
+        comments: [reviewClaim('old', 'session-a', HEAD, '2026-09-13T00:00:00Z', '2026-09-13T00:45:00Z')],
+      });
+
+      const created = runHelper(root, ['claim', '--head', HEAD, '--owner', 'session-a']);
+      expect(created.status).toBe(0);
+      expect(created.posted).toContain('owner=session-a');
+      scopeFixture(root, { comments: [comment('2026-09-13T01:00:00Z', created.posted!, 'shared-account')] });
+      expect(JSON.parse(runHelper(root, ['scope']).stdout).reviewClaims).toMatchObject([{ owner: 'session-a' }]);
+    });
+
+    it('keeps another live owner after the newest owner retires', () => {
+      const root = tempRoot();
+      scopeFixture(root, {
+        comments: [reviewClaim('a', 'session-a'), reviewClaim('b', 'session-b'), completedClaim('b', 'session-b')],
+      });
+
+      expect(JSON.parse(runHelper(root, ['scope']).stdout).reviewClaims).toMatchObject([
+        { id: 'a', owner: 'session-a' },
+      ]);
+    });
+
+    it('keeps a connector claim live for stale completion evidence or a review of another head', () => {
+      const root = tempRoot();
+      scopeFixture(root, {
+        comments: [marker(HEAD, 2, '2026-09-13T01:00:00Z')],
+        reviews: [review('2026-09-13T00:59:59Z', HEAD), review('2026-09-13T01:05:00Z', OLD_HEAD)],
+        reactions: [reaction('2026-09-13T01:00:00Z')],
+      });
+
+      expect(JSON.parse(runHelper(root, ['scope']).stdout).reviewClaims).toMatchObject([
+        { id: 'connector-2-20260913010000', owner: 'connector' },
+      ]);
+    });
+
+    it('keeps the scope verdict unchanged when an advisory evidence read fails', () => {
+      const root = tempRoot();
+      scopeFixture(root, { comments: [reviewClaim('a', 'session-a')] });
+      fs.writeFileSync(path.join(root, 'reviews-fail-1'), '');
+
+      const observed = runHelper(root, ['scope']);
+      expect(observed.status).toBe(0);
+      expect(JSON.parse(observed.stdout)).toMatchObject({ verdict: 'skip' });
+    });
   });
 
   it('refuses a skip-verdict head without posting', () => {
