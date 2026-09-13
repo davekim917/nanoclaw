@@ -89,6 +89,7 @@ import { migration076 } from './076-turn-usage-effort.js';
 import { migration077 } from './077-choice-receipts.js';
 import { migration078 } from './078-choice-request-reservation.js';
 import { migration079 } from './079-host-inbound-provenance.js';
+import { migration080 } from './080-choice-receipt-release-scope.js';
 // Upstream's 014/015 — file numbers clash with local but uniqueness is by `name`.
 // Aliased to avoid JS identifier collisions with the local 014/015 above.
 import { migration014 as containerConfigs } from './014-container-configs.js';
@@ -255,6 +256,9 @@ export const migrations: Migration[] = [
   // 053 to normalize, so it has no ordering constraint at all — and it touches
   // none of the tables 077/078 above do.
   migration079,
+  // Additive receipt column and immutable-update trigger. Nothing after this
+  // recreates choice_receipts, and legacy rows must remain readable as NULL.
+  migration080,
   // Last on purpose: normalizes whatever naive timestamps every migration
   // above has left behind (016's messaging_groups recreate copies created_at
   // through as-is).

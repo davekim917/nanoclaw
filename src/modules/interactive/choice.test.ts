@@ -74,6 +74,13 @@ const OPTIONS = [
 ];
 const TO_RELEASE = { to: 'release-room', channelType: CHANNEL, platformId: RELEASE };
 const ASK_TEXT = 'Release\n\nWhich change ships?';
+const RELEASE_SCOPE = {
+  purpose: 'release_ship',
+  repository: 'owner/repository',
+  pullRequest: 42,
+  base: 'main',
+  headSha: 'a'.repeat(40),
+};
 
 registerChannelAdapter(CHANNEL, {
   factory: (): ChannelAdapter => ({
@@ -311,10 +318,53 @@ describe('request_choice delivery', () => {
     expect(notes()).toEqual([]);
   });
 
+  it('owns scoped release presentation and payload instead of agent supplied display fields', async () => {
+    const row = (await ask(session, {
+      title: 'Hold this release',
+      question: 'This text must not be shown',
+      options: [{ label: 'Hold', value: 'ship', style: 'danger' }],
+      approvalScope: RELEASE_SCOPE,
+    }))!;
+
+    expect(JSON.parse(row.payload)).toMatchObject({ choiceId: 'choice-1', approvalScope: RELEASE_SCOPE });
+    expect(
+      (JSON.parse(row.options_json) as Array<{ label: string; value: string; style: string }>).map((option) => ({
+        label: option.label,
+        value: option.value,
+        style: option.style,
+      })),
+    ).toEqual([
+      { label: 'Ship', value: 'ship', style: 'primary' },
+      { label: 'Hold', value: 'hold', style: 'danger' },
+    ]);
+    expect(delivered[0].content).toEqual({
+      type: 'ask_question',
+      questionId: row.approval_id,
+      title: 'Release approval: owner/repository#42',
+      question: `Ship owner/repository#42 from main at ${'a'.repeat(40)}?`,
+      options: [
+        { label: 'Ship', value: 'ship', style: 'primary' },
+        { label: 'Hold', value: 'hold', style: 'danger' },
+      ],
+    });
+  });
+
   it('refuses a malformed request without opening a row', async () => {
     expect(await ask(session, { options: [] })).toBeUndefined();
     expect(delivered).toHaveLength(0);
     expect(notes().map((n) => n.text)).toEqual(['request_choice failed: options must hold 1 to 10 entries']);
+  });
+
+  it('refuses malformed scoped release data without opening a row', async () => {
+    await ask(session, { approvalScope: { ...RELEASE_SCOPE, pullRequest: true } });
+    await ask(session, { approvalScope: { ...RELEASE_SCOPE, headSha: 'A'.repeat(40) } }, 'choice-2');
+
+    expect(delivered).toHaveLength(0);
+    expect(await getPendingApprovalsByAction(REQUEST_CHOICE_ACTION)).toHaveLength(0);
+    expect(notes().map((n) => n.text)).toEqual([
+      'request_choice failed: approvalScope is malformed',
+      'request_choice failed: approvalScope is malformed',
+    ]);
   });
 
   it('refuses a choiceId that already has a pending approval', async () => {
@@ -421,6 +471,32 @@ describe('request_choice click authority and resolution', () => {
       messageId: 'pm-1',
       text: `${ASK_TEXT}\n\n✅ Ship all (2) — Admin One`,
     });
+  });
+
+  it('appends a host-canonical release scope only for a valid scoped card', async () => {
+    const row = (await ask(session, { approvalScope: RELEASE_SCOPE }))!;
+
+    expect(await click(row.approval_id, 'ship', ADMIN)).toBe(true);
+
+    const fields = Object.fromEntries(
+      notes()[0]!
+        .text.split(' ')
+        .slice(1)
+        .map((pair) => {
+          const at = pair.indexOf('=');
+          return [pair.slice(0, at), decodeURIComponent(pair.slice(at + 1))];
+        }),
+    );
+    expect(JSON.parse(fields.release_scope!)).toEqual(RELEASE_SCOPE);
+    expect(fields.value).toBe('ship');
+  });
+
+  it('does not emit release_scope from a corrupt saved pending payload', async () => {
+    const row = (await ask(session, { approvalScope: RELEASE_SCOPE }))!;
+    await getDb().run('UPDATE pending_approvals SET payload = ? WHERE approval_id = ?', '{not json', row.approval_id);
+
+    expect(await click(row.approval_id, 'ship', ADMIN)).toBe(true);
+    expect(notes()[0]!.text).not.toContain(' release_scope=');
   });
 
   it('ignores a non-admin thread member: nothing is sent, the row stays pending, the card is untouched', async () => {
@@ -824,5 +900,22 @@ describe('formatChoiceResponse', () => {
       user_id: 'slack:x',
       user_name: '',
     });
+  });
+
+  it('URI-encodes an optional canonical release_scope after the legacy fields', () => {
+    const scope = JSON.stringify(RELEASE_SCOPE);
+    const line = formatChoiceResponse({
+      choiceId: 'choice-9',
+      approvalId: 'appr-123-abc',
+      value: 'ship',
+      label: 'Ship',
+      userId: 'slack:x',
+      userName: 'n',
+      releaseScope: scope,
+    });
+
+    expect(line).toBe(
+      `choice_response choice_id=choice-9 approval_id=appr-123-abc value=ship label=Ship user_id=slack%3Ax user_name=n release_scope=${encodeURIComponent(scope)}`,
+    );
   });
 });

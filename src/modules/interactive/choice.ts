@@ -41,6 +41,7 @@ import { resolveSession, sessionMessageExists } from '../../session-manager.js';
 import { isChannelVariant, type MessagingGroup, type PendingApproval, type Session } from '../../types.js';
 import { registerChoiceHandler, retireChoice, type ChoiceHandlerContext } from '../approvals/choices.js';
 import { notifyAgent, requestApprovalOutcome, type RequestApprovalOptions } from '../approvals/primitive.js';
+import { parseReleaseShipScope, releaseShipScopeJson, type ReleaseShipScope } from '../approvals/release-ship-scope.js';
 import { hasAdminPrivilege } from '../permissions/db/user-roles.js';
 import { getUser } from '../permissions/db/users.js';
 
@@ -65,6 +66,8 @@ export interface ChoiceRequest {
   approvers?: string[];
   /** Routing the container resolved `to` into. Container-written, so re-authorized here. */
   target?: { name: string; channelType: string; platformId: string };
+  /** Host-owned release authorization meaning; display/options are canonicalized below. */
+  approvalScope?: ReleaseShipScope;
 }
 
 /**
@@ -72,23 +75,30 @@ export interface ChoiceRequest {
  * host's own check, since the outbound row is container-written.
  */
 export function parseChoiceRequest(content: Record<string, unknown>): ChoiceRequest | { error: string } {
-  const { choiceId, title, question, options, key, approvers, to, channelType, platformId } = content;
+  const { choiceId, title, question, options, key, approvers, to, channelType, platformId, approvalScope } = content;
   if (typeof choiceId !== 'string' || !ID_RE.test(choiceId)) return { error: 'choiceId is missing or malformed' };
-  if (typeof title !== 'string' || !title.trim()) return { error: 'title is required' };
-  if (typeof question !== 'string' || !question.trim()) return { error: 'question is required' };
-  if (!Array.isArray(options) || options.length < 1 || options.length > MAX_CHOICE_OPTIONS) {
-    return { error: `options must hold 1 to ${MAX_CHOICE_OPTIONS} entries` };
-  }
-  const parsed: ChoiceRequest['options'] = [];
-  const seen = new Set<string>();
-  for (const raw of options as unknown[]) {
-    const { label, value, style } = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
-    if (typeof label !== 'string' || !label.trim()) return { error: 'every option needs a non-empty label' };
-    if (typeof value !== 'string' || !value) return { error: `option "${label}" needs a non-empty value` };
-    if (seen.has(value)) return { error: `option values must be unique ("${value}" repeats)` };
-    if (style !== undefined && !OPTION_STYLES.has(style)) return { error: `option "${label}" has an unknown style` };
-    seen.add(value);
-    parsed.push({ label, value, ...(style !== undefined ? { style: style as OptionStyle } : {}) });
+  const scope = approvalScope === undefined ? undefined : parseReleaseShipScope(approvalScope);
+  if (approvalScope !== undefined && !scope) return { error: 'approvalScope is malformed' };
+  const canonical = scope ? canonicalReleaseChoice(scope) : undefined;
+  const genericTitle = typeof title === 'string' && title.trim() ? title : undefined;
+  const genericQuestion = typeof question === 'string' && question.trim() ? question : undefined;
+  if (!canonical && !genericTitle) return { error: 'title is required' };
+  if (!canonical && !genericQuestion) return { error: 'question is required' };
+  const parsed: ChoiceRequest['options'] = canonical?.options ?? [];
+  if (!canonical) {
+    if (!Array.isArray(options) || options.length < 1 || options.length > MAX_CHOICE_OPTIONS) {
+      return { error: `options must hold 1 to ${MAX_CHOICE_OPTIONS} entries` };
+    }
+    const seen = new Set<string>();
+    for (const raw of options as unknown[]) {
+      const { label, value, style } = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+      if (typeof label !== 'string' || !label.trim()) return { error: 'every option needs a non-empty label' };
+      if (typeof value !== 'string' || !value) return { error: `option "${label}" needs a non-empty value` };
+      if (seen.has(value)) return { error: `option values must be unique ("${value}" repeats)` };
+      if (style !== undefined && !OPTION_STYLES.has(style)) return { error: `option "${label}" has an unknown style` };
+      seen.add(value);
+      parsed.push({ label, value, ...(style !== undefined ? { style: style as OptionStyle } : {}) });
+    }
   }
   if (key !== undefined && (typeof key !== 'string' || !ID_RE.test(key))) {
     return { error: 'key must be 1-128 characters of letters, digits and . _ : -' };
@@ -113,12 +123,24 @@ export function parseChoiceRequest(content: Record<string, unknown>): ChoiceRequ
   }
   return {
     choiceId,
-    title,
-    question,
+    title: canonical?.title ?? genericTitle!,
+    question: canonical?.question ?? genericQuestion!,
     options: parsed,
     ...(key !== undefined ? { key } : {}),
     ...(approvers !== undefined ? { approvers: [...new Set(approvers as string[])] } : {}),
     ...(target ? { target } : {}),
+    ...(scope ? { approvalScope: scope } : {}),
+  };
+}
+
+function canonicalReleaseChoice(scope: ReleaseShipScope): Pick<ChoiceRequest, 'title' | 'question' | 'options'> {
+  return {
+    title: `Release approval: ${scope.repository}#${scope.pullRequest}`,
+    question: `Ship ${scope.repository}#${scope.pullRequest} from ${scope.base} at ${scope.headSha}?`,
+    options: [
+      { label: 'Ship', value: 'ship', style: 'primary' },
+      { label: 'Hold', value: 'hold', style: 'danger' },
+    ],
   };
 }
 
@@ -205,6 +227,7 @@ async function handleRequestChoice(content: Record<string, unknown>, session: Se
       choiceId: request.choiceId,
       ...(request.key !== undefined ? { key: request.key } : {}),
       ...(request.approvers ? { approvers: request.approvers } : {}),
+      ...(request.approvalScope ? { approvalScope: request.approvalScope } : {}),
     },
     title: request.title,
     question: request.question,
@@ -369,6 +392,7 @@ const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF
  * The line the agent receives:
  *
  *   choice_response choice_id=<id> approval_id=<aid> value=<v> label=<l> user_id=<id> user_name=<n>
+ *   [release_scope=<canonical-json>]
  *
  * Fixed key order, every value percent-encoded with encodeURIComponent, so it
  * stays one line whatever a label or name contains, and it reaches the model
@@ -382,7 +406,9 @@ const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF
  * `approval_id` is the host-minted id `choice_receipts` (migration 077) keys
  * on — `choice_id` alone is agent-chosen and not unique, so an agent that
  * wants to cite the durable receipt for this answer needs the approval id,
- * not just the choice id.
+ * not just the choice id. Scoped release cards append `release_scope`, but
+ * only after the host has re-validated the pending row's saved payload. It is
+ * an encoded copy of the host-canonical JSON, not agent-supplied display text.
  */
 export function formatChoiceResponse(fields: {
   choiceId: string;
@@ -391,6 +417,8 @@ export function formatChoiceResponse(fields: {
   label: string;
   userId: string;
   userName: string | null;
+  /** Host-validated canonical JSON for a release_ship card; omitted for generic cards. */
+  releaseScope?: string;
 }): string {
   const pairs: Array<[string, string]> = [
     ['choice_id', fields.choiceId],
@@ -400,8 +428,22 @@ export function formatChoiceResponse(fields: {
     ['user_id', fields.userId],
     ['user_name', fields.userName ?? ''],
   ];
+  // Keep the generic response byte-for-byte compatible for existing parsers.
+  if (fields.releaseScope !== undefined) pairs.push(['release_scope', fields.releaseScope]);
   const encode = (v: string): string => encodeURIComponent(v.replace(LONE_SURROGATE_RE, '�'));
   return ['choice_response', ...pairs.map(([k, v]) => `${k}=${encode(v)}`)].join(' ');
+}
+
+/** A corrupt pending payload can never add scope to a host-origin response. */
+function responseReleaseScope(approval: PendingApproval): string | undefined {
+  try {
+    const payload = JSON.parse(approval.payload) as { approvalScope?: unknown };
+    const scope = parseReleaseShipScope(payload.approvalScope);
+    return scope ? releaseShipScopeJson(scope) : undefined;
+    // eslint-disable-next-line no-catch-all/no-catch-all -- malformed stored payload must remain unscoped
+  } catch {
+    return undefined;
+  }
 }
 
 async function relayChoice(ctx: ChoiceHandlerContext): Promise<Session | null> {
@@ -423,6 +465,7 @@ async function relayChoice(ctx: ChoiceHandlerContext): Promise<Session | null> {
         label: ctx.label,
         userId: ctx.userId,
         userName: user?.display_name ?? null,
+        releaseScope: responseReleaseScope(ctx.approval),
       }),
       { id, event: CHOICE_RESPONSE_EVENT },
     );

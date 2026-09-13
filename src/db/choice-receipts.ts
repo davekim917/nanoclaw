@@ -33,6 +33,8 @@ export interface ChoiceReceipt {
   label: string;
   /** Namespaced user id (`<channel>:<handle>`) of the authorized clicker. */
   clickerUserId: string;
+  /** Canonical host-validated release scope, or NULL for every generic choice. */
+  releaseScopeJson: string | null;
   /** ISO-8601 UTC timestamp of resolution. */
   resolvedAt: string;
 }
@@ -51,8 +53,8 @@ export async function recordChoiceReceipt(receipt: ChoiceReceipt): Promise<void>
   await getDb().run(
     `INSERT INTO choice_receipts
        (approval_id, request_id, action, agent_group_id, session_id,
-        platform_id, thread_id, platform_message_id, value, label, clicker_user_id, resolved_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        platform_id, thread_id, platform_message_id, value, label, clicker_user_id, release_scope_json, resolved_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     receipt.approvalId,
     receipt.requestId,
     receipt.action,
@@ -64,6 +66,7 @@ export async function recordChoiceReceipt(receipt: ChoiceReceipt): Promise<void>
     receipt.value,
     receipt.label,
     receipt.clickerUserId,
+    receipt.releaseScopeJson,
     receipt.resolvedAt,
   );
 }
@@ -81,6 +84,7 @@ export interface ChoiceReceiptRow {
   value: string;
   label: string;
   clicker_user_id: string;
+  release_scope_json: string | null;
   resolved_at: string;
 }
 
