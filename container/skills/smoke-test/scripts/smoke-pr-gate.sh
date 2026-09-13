@@ -2139,6 +2139,131 @@ detect_freeze() {
 COMMAND="${1:-poll}"
 
 # ---------------------------------------------------------------------------
+if [ "$COMMAND" = "wait-settled" ]; then
+  # A PR can merge, close, lose its label, or receive a new head while a
+  # caller waits. Unlike the develop branch waiter, those are terminal facts,
+  # not an unsettled build: retrying them until a deadline would turn a
+  # completed or superseded preview into a false timeout.
+  PR="${2:-}"
+  shift 2 2>/dev/null || true
+  EXPECTED_HEAD=""
+  WAIT_INTERVAL_SECONDS=300
+  WAIT_MAX_SECONDS=2700
+  WAIT_OPTION_ERROR=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --head)
+        if [ "$#" -lt 2 ]; then WAIT_OPTION_ERROR="wait-settled --head requires a 40-character SHA"; break; fi
+        EXPECTED_HEAD="$2"; shift 2 ;;
+      --interval-seconds)
+        if [ "$#" -lt 2 ]; then WAIT_OPTION_ERROR="wait-settled --interval-seconds requires a non-negative integer"; break; fi
+        WAIT_INTERVAL_SECONDS="$2"; shift 2 ;;
+      --max-seconds)
+        if [ "$#" -lt 2 ]; then WAIT_OPTION_ERROR="wait-settled --max-seconds requires a non-negative integer"; break; fi
+        WAIT_MAX_SECONDS="$2"; shift 2 ;;
+      *) WAIT_OPTION_ERROR="unknown wait-settled option: $1"; break ;;
+    esac
+  done
+  # `grep -E` checks each newline-delimited record, not the whole shell
+  # argument. These predicates deliberately combine a full-string glob check
+  # with length/first-byte rules so a multi-line option cannot turn a bounded
+  # waiter into an arithmetic-error spin.
+  is_wait_pr() {
+    local value="$1"
+    [ -n "$value" ] && [[ "$value" == [1-9]* ]] && [[ "$value" != *[!0-9]* ]]
+  }
+  is_wait_sha() {
+    local value="$1"
+    [ "${#value}" -eq 40 ] && [[ "$value" != *[!0-9a-f]* ]]
+  }
+  is_wait_nonnegative_integer() {
+    local value="$1"
+    [ "${#value}" -le 18 ] && { [ "$value" = 0 ] || { [[ "$value" == [1-9]* ]] && [[ "$value" != *[!0-9]* ]]; }; }
+  }
+  if ! is_wait_pr "$PR"; then
+    jq -cn '{ok:false,error:"wait-settled requires a PR number"}'
+    exit 2
+  fi
+  if [ -n "$WAIT_OPTION_ERROR" ] || ! is_wait_sha "$EXPECTED_HEAD" ||
+     ! is_wait_nonnegative_integer "$WAIT_INTERVAL_SECONDS" ||
+     ! is_wait_nonnegative_integer "$WAIT_MAX_SECONDS"; then
+    [ -n "$WAIT_OPTION_ERROR" ] || WAIT_OPTION_ERROR="wait-settled requires --head <40-character SHA> and non-negative integer limits"
+    jq -cn --arg error "$WAIT_OPTION_ERROR" '{ok:false,error:$error}'
+    exit 2
+  fi
+
+  WAIT_STARTED="$(date -u +%s)"
+  WAIT_ATTEMPTS=0
+  while :; do
+    # Do not begin another network read after a prior sleep consumed the
+    # deadline. The initial attempt always happens, even for max=0, so callers
+    # receive the check's actual pending/fetch diagnostic in their BLOCKED row.
+    if [ "$WAIT_ATTEMPTS" -gt 0 ]; then
+      WAIT_NOW="$(date -u +%s)"
+      WAIT_ELAPSED=$(( WAIT_NOW - WAIT_STARTED ))
+      if [ "$WAIT_ELAPSED" -ge "$WAIT_MAX_SECONDS" ]; then
+        jq -c --arg expected "$EXPECTED_HEAD" --argjson attempts "$WAIT_ATTEMPTS" --argjson waited "$WAIT_ELAPSED" \
+          '. + {requestedHeadSha:$expected,waitedSeconds:$waited,attempts:$attempts,timedOut:true,incomplete:true}' \
+          <<<"$WAIT_OUT"
+        exit 1
+      fi
+    fi
+    WAIT_ATTEMPTS=$(( WAIT_ATTEMPTS + 1 ))
+    WAIT_OUT="$(bash "$0" check "$PR")"
+    WAIT_CHECK_RC=$?
+    if ! jq -e 'type == "object"' <<<"$WAIT_OUT" >/dev/null 2>&1; then
+      WAIT_OUT="$(jq -cn --argjson pr "$PR" '{ok:false,pr:$pr,error:"check returned invalid JSON"}')"
+      WAIT_CHECK_RC=1
+    fi
+    WAIT_NOW="$(date -u +%s)"
+    WAIT_ELAPSED=$(( WAIT_NOW - WAIT_STARTED ))
+    WAIT_OK="$(jq -r '.ok == true' <<<"$WAIT_OUT")"
+    WAIT_ELIGIBLE="$(jq -r '.eligible == true' <<<"$WAIT_OUT")"
+    WAIT_HEAD="$(jq -r '.headSha // empty' <<<"$WAIT_OUT")"
+
+    # `check` returns 2 only for a locally permanent configuration/usage
+    # problem. Waiting cannot repair it, and treating it as a product verdict
+    # would obscure the operational error.
+    if [ "$WAIT_CHECK_RC" -eq 2 ]; then
+      jq -c --arg expected "$EXPECTED_HEAD" --argjson attempts "$WAIT_ATTEMPTS" --argjson waited "$WAIT_ELAPSED" \
+        '. + {terminal:"check_error",requestedHeadSha:$expected,waitedSeconds:$waited,attempts:$attempts,timedOut:false,incomplete:true}' \
+        <<<"$WAIT_OUT"
+      exit 2
+    fi
+    if [ "$WAIT_OK" = true ] && [ "$WAIT_ELIGIBLE" != true ]; then
+      jq -c --arg expected "$EXPECTED_HEAD" --argjson attempts "$WAIT_ATTEMPTS" --argjson waited "$WAIT_ELAPSED" \
+        '. + {terminal:"ineligible",requestedHeadSha:$expected,waitedSeconds:$waited,attempts:$attempts,timedOut:false,incomplete:true}' \
+        <<<"$WAIT_OUT"
+      exit 3
+    fi
+    if [ "$WAIT_OK" = true ] && [ -n "$WAIT_HEAD" ] && [ "$WAIT_HEAD" != "$EXPECTED_HEAD" ]; then
+      jq -c --arg expected "$EXPECTED_HEAD" --arg observed "$WAIT_HEAD" --argjson attempts "$WAIT_ATTEMPTS" --argjson waited "$WAIT_ELAPSED" \
+        '. + {terminal:"head_moved",requestedHeadSha:$expected,observedHeadSha:$observed,waitedSeconds:$waited,attempts:$attempts,timedOut:false,incomplete:true}' \
+        <<<"$WAIT_OUT"
+      exit 3
+    fi
+    if [ "$(jq -r '.settled == true' <<<"$WAIT_OUT")" = true ]; then
+      jq -c --arg expected "$EXPECTED_HEAD" --argjson pr "$PR" --argjson attempts "$WAIT_ATTEMPTS" --argjson waited "$WAIT_ELAPSED" \
+        '. + {requestedHeadSha:$expected,checkIdentity:{pr:$pr,requestedHeadSha:$expected,headSha:(.headSha // null),ciSha:(.ciSha // null)},waitedSeconds:$waited,attempts:$attempts,timedOut:false,incomplete:false}' \
+        <<<"$WAIT_OUT"
+      exit 0
+    fi
+    if [ "$WAIT_ELAPSED" -ge "$WAIT_MAX_SECONDS" ]; then
+      jq -c --arg expected "$EXPECTED_HEAD" --argjson attempts "$WAIT_ATTEMPTS" --argjson waited "$WAIT_ELAPSED" \
+        '. + {requestedHeadSha:$expected,waitedSeconds:$waited,attempts:$attempts,timedOut:true,incomplete:true}' \
+        <<<"$WAIT_OUT"
+      exit 1
+    fi
+    WAIT_REMAINING=$(( WAIT_MAX_SECONDS - WAIT_ELAPSED ))
+    WAIT_SLEEP_SECONDS="$WAIT_INTERVAL_SECONDS"
+    if [ "$WAIT_SLEEP_SECONDS" -gt "$WAIT_REMAINING" ]; then
+      WAIT_SLEEP_SECONDS="$WAIT_REMAINING"
+    fi
+    sleep "$WAIT_SLEEP_SECONDS"
+  done
+fi
+
+# ---------------------------------------------------------------------------
 if [ "$COMMAND" = "check" ]; then
   PR="${2:-}"
   if ! printf '%s' "$PR" | grep -Eq '^[1-9][0-9]*$'; then
@@ -3759,7 +3884,7 @@ fi
 if [ "$COMMAND" != "poll" ]; then
   jq -cn --arg command "$COMMAND" \
     '{ok:false,error:("unknown command: " + $command),
-      commands:["poll","check","claim","release","progress","finish",
+      commands:["poll","check","wait-settled","claim","release","progress","finish",
                 "lease-claim","lease-renew","lease-release","lease-status",
                 "challenger-timeout"]}'
   exit 2

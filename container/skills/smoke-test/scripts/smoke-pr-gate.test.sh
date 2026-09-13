@@ -26,6 +26,7 @@ set -u
 [ -n "${STUB_PR_LIST+x}" ] || STUB_PR_LIST='[]'
 [ -n "${STUB_REPO_VIEW_EXIT+x}" ] || STUB_REPO_VIEW_EXIT=0
 [ -n "${STUB_PR_VIEW+x}" ] || STUB_PR_VIEW='{}'
+[ -n "${STUB_PR_VIEW_EXIT+x}" ] || STUB_PR_VIEW_EXIT=0
 [ -n "${STUB_PR_FILES+x}" ] || STUB_PR_FILES='[]'
 [ -n "${STUB_RUN_LIST+x}" ] || STUB_RUN_LIST='[]'
 [ -n "${STUB_RUN_LIST_EXIT+x}" ] || STUB_RUN_LIST_EXIT=0
@@ -41,6 +42,20 @@ set -u
 [ -n "${STUB_COMPARE_FILES+x}" ] || STUB_COMPARE_FILES='{"files":[]}'
 [ -n "${STUB_COMPARE_EXIT+x}" ] || STUB_COMPARE_EXIT=0
 
+sequenced_run_list() {
+  local n=1 out count_file
+  if [ -z "${STUB_RUN_LIST_SEQUENCE_FILE:-}" ]; then
+    printf '%s' "$STUB_RUN_LIST"
+    return
+  fi
+  count_file="${STUB_RUN_LIST_SEQUENCE_COUNT:-${STUB_RUN_LIST_SEQUENCE_FILE}.count}"
+  if [ -s "$count_file" ]; then n="$(cat "$count_file")"; fi
+  printf '%s\n' "$(( n + 1 ))" > "$count_file"
+  out="$(sed -n "${n}p" "$STUB_RUN_LIST_SEQUENCE_FILE")"
+  [ -n "$out" ] || out="$(tail -n 1 "$STUB_RUN_LIST_SEQUENCE_FILE")"
+  printf '%s' "$out"
+}
+
 case "$1" in
   repo)
     # Reachability probe. A repo that does not resolve 404s here even though
@@ -50,11 +65,11 @@ case "$1" in
   run)
     # CI facts now come from `gh run list --branch` (the check-runs REST
     # endpoint is invisible to the container's scoped token — see the gate).
-    printf '%s' "$STUB_RUN_LIST"; exit "$STUB_RUN_LIST_EXIT" ;;
+    sequenced_run_list; exit "$STUB_RUN_LIST_EXIT" ;;
   pr)
     case "$2" in
       list) printf '%s' "$STUB_PR_LIST"; exit "$STUB_PR_LIST_EXIT" ;;
-      view) printf '%s' "$STUB_PR_VIEW"; exit 0 ;;
+      view) if [ "$STUB_PR_VIEW_EXIT" = 0 ]; then printf '%s' "$STUB_PR_VIEW"; fi; exit "$STUB_PR_VIEW_EXIT" ;;
       create)
         if [ "${STUB_PR_CREATE_EXIT:-0}" = 0 ]; then
           echo "https://github.com/org/repo/pull/${STUB_NEW_PR_NUMBER:-1}"
@@ -65,7 +80,7 @@ case "$1" in
   api)
     P="$2"
     if printf '%s' "$P" | grep -qF '/actions/runs?'; then
-      printf '%s' "$STUB_RUN_LIST"; exit "$STUB_RUN_LIST_EXIT"
+      sequenced_run_list; exit "$STUB_RUN_LIST_EXIT"
     fi
     # Parent-sha lookup for freeze PRs: smoke-pr-gate.sh queries the plain
     # (non-git) commits endpoint with this --jq expression; check it before
@@ -181,6 +196,34 @@ fi
 echo '{}'; exit 0
 STUB
 chmod +x "$STUB_BIN/gh" "$STUB_BIN/curl"
+cat > "$STUB_BIN/date" <<'STUB'
+#!/usr/bin/env bash
+# The preview-waiter checks elapsed time from `date -u +%s`. Keep the normal
+# system date for every legacy fixture, but let its new bounded-loop cases use
+# an explicit sequence so success, terminal exits and deadline behaviour are
+# hermetic rather than timing-sensitive.
+if [ "$#" -eq 2 ] && [ "$1" = "-u" ] && [ "$2" = "+%s" ] && [ -n "${STUB_WAIT_CLOCK_FILE:-}" ]; then
+  count_file="${STUB_WAIT_CLOCK_COUNT:-${STUB_WAIT_CLOCK_FILE}.count}"
+  n=1
+  if [ -s "$count_file" ]; then n="$(cat "$count_file")"; fi
+  printf '%s\n' "$(( n + 1 ))" > "$count_file"
+  value="$(sed -n "${n}p" "$STUB_WAIT_CLOCK_FILE")"
+  [ -n "$value" ] || value="$(tail -n 1 "$STUB_WAIT_CLOCK_FILE")"
+  printf '%s\n' "$value"
+  exit 0
+fi
+exec /usr/bin/date "$@"
+STUB
+chmod +x "$STUB_BIN/date"
+cat > "$STUB_BIN/sleep" <<'STUB'
+#!/usr/bin/env bash
+if [ -n "${STUB_WAIT_SLEEP_LOG:-}" ]; then
+  printf '%s\n' "$1" >> "$STUB_WAIT_SLEEP_LOG"
+  exit 0
+fi
+exec /usr/bin/sleep "$@"
+STUB
+chmod +x "$STUB_BIN/sleep"
 cat > "$STUB_BIN/mountpoint" <<'STUB'
 #!/usr/bin/env bash
 [ "${1:-}" = "-q" ] && [ "${2:-}" = "${SMOKE_GATE_SHARED_ROOT:-}" ]
@@ -215,7 +258,8 @@ chmod +x "$STUB_BIN/jq"
 export PATH="$STUB_BIN:$PATH"
 
 reset_stubs() {
-  unset STUB_PR_LIST STUB_PR_VIEW STUB_PR_FILES STUB_RUN_LIST STUB_RUN_LIST_EXIT STUB_PARENT_SHA \
+  unset STUB_PR_LIST STUB_PR_VIEW STUB_PR_VIEW_EXIT STUB_PR_FILES STUB_RUN_LIST STUB_RUN_LIST_EXIT \
+        STUB_RUN_LIST_SEQUENCE_FILE STUB_RUN_LIST_SEQUENCE_COUNT STUB_PARENT_SHA \
         STUB_COMMIT_TREE STUB_BLOB_RESPONSE STUB_TREE_RESPONSE STUB_COMMIT_RESPONSE \
         STUB_REF_RESPONSE STUB_REF_EXIT STUB_BRANCH_EXISTS STUB_PR_LIST_EXIT \
         STUB_PR_FILES_EXIT STUB_PR_CREATE_EXIT STUB_NEW_PR_NUMBER STUB_SUSPEND_CODE \
@@ -224,6 +268,7 @@ reset_stubs() {
         STUB_STATE_PROBE STUB_STATE_PROBE_FILE STUB_SUSPEND_SLEEP STUB_REPO_VIEW_EXIT \
         STUB_LEDGER_JQ_EMPTY_FILE STUB_SUSPEND_LOG \
         STUB_FRONTEND_HTML_EXIT STUB_FRONTEND_HTML STUB_BUNDLE_EXIT STUB_BUNDLE_JS \
+        STUB_WAIT_CLOCK_FILE STUB_WAIT_CLOCK_COUNT STUB_WAIT_SLEEP_LOG \
         SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER \
         SMOKE_GATE_OWNER SMOKE_GATE_LEASE_TTL_SECONDS 2>/dev/null || true
 }
@@ -3665,5 +3710,135 @@ SMOKE_GATE_STATE_DIR="$LEGACY_STATE" SMOKE_GATE_LEASE_DIR="$LEGACY_LEASE" \
   bash "$GATE" task-claim run-legacy-lost "$CROSS_SHA_B" owner-legacy | jq -e '.ok == true' >/dev/null
 jq -e --arg sha "$CROSS_SHA_B" '.deploySha == $sha and .terminal == null' \
   "$LEGACY_LEASE/task-binding-run-legacy-lost.json" >/dev/null
+
+# --- 64. PR preview waiter: pinned, bounded, and strictly read-only --------
+# A preview waiter is deliberately NOT the develop wait-settled loop copied
+# over: a PR can close or move while a caller waits. It must return those
+# terminal states promptly, never turn them into a misleading timeout.
+fresh_state
+WAIT_SHA="$(sha a)"
+export STUB_PR_VIEW="{\"number\":301,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$WAIT_SHA\",\"headRefName\":\"feature/wait\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/wait.ts"}]'
+export STUB_SERVICES='[{"id":"srv-backend-pr-301","name":"XZO-DEV-BACKEND PR #301","serviceDetails":{"parentServer":{"id":"srv-backend-base"},"url":"https://xzo-dev-backend-pr-301.onrender.com"}}]'
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$WAIT_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+WAIT_CLOCK="$STATE_DIR/wait-clock.txt"
+printf '100\n101\n102\n' > "$WAIT_CLOCK"
+export STUB_WAIT_CLOCK_FILE="$WAIT_CLOCK"
+WAIT_RUNS="$STATE_DIR/wait-runs.jsonl"
+printf '%s\n%s\n' \
+  "[{\"headSha\":\"$WAIT_SHA\",\"status\":\"in_progress\",\"conclusion\":null,\"workflowName\":\"CI\"}]" \
+  "[{\"headSha\":\"$WAIT_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]" > "$WAIT_RUNS"
+export STUB_RUN_LIST_SEQUENCE_FILE="$WAIT_RUNS"
+WAIT_OUT="$(bash "$GATE" wait-settled 301 --head "$WAIT_SHA" --interval-seconds 0 --max-seconds 30)"
+jq -e --arg sha "$WAIT_SHA" '
+  .ok == true and .eligible == true and .settled == true and .timedOut == false and .incomplete == false and
+  .headSha == $sha and .ciSha == $sha and .campaignSize == "standard" and .sizeReason == "no sizing rules" and
+  .checkIdentity == {pr:301,requestedHeadSha:$sha,headSha:$sha,ciSha:$sha} and .attempts == 2 and .waitedSeconds == 2
+' <<<"$WAIT_OUT" >/dev/null
+[ ! -e "$STATE_DIR/pr-301-state.json" ] && [ ! -e "$STATE_DIR/control.json" ] && [ ! -d "$SMOKE_GATE_LEASE_DIR" ] || {
+  echo "wait-settled wrote claim, state, or lease evidence" >&2; exit 1; }
+
+# Closed and unlabeled are terminal ineligible facts, not a build that can
+# become ready. They return on the first check even with a long wait budget.
+for WAIT_LABEL in closed unlabeled; do
+  fresh_state
+  WAIT_SHA="$(sha b)"
+  if [ "$WAIT_LABEL" = closed ]; then
+    export STUB_PR_VIEW="{\"number\":302,\"state\":\"CLOSED\",\"headRefOid\":\"$WAIT_SHA\",\"headRefName\":\"feature/closed\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+  else
+    export STUB_PR_VIEW="{\"number\":302,\"state\":\"OPEN\",\"headRefOid\":\"$WAIT_SHA\",\"headRefName\":\"feature/unlabeled\",\"baseRefName\":\"develop\",\"labels\":[]}"
+  fi
+  WAIT_CLOCK="$STATE_DIR/$WAIT_LABEL-clock.txt"
+  printf '200\n201\n' > "$WAIT_CLOCK"
+  export STUB_WAIT_CLOCK_FILE="$WAIT_CLOCK"
+  if bash "$GATE" wait-settled 302 --head "$WAIT_SHA" --interval-seconds 0 --max-seconds 30 >"$STATE_DIR/ineligible.json"; then
+    echo "wait-settled accepted $WAIT_LABEL PR" >&2; exit 1
+  fi
+  jq -e --arg sha "$WAIT_SHA" '.terminal == "ineligible" and .timedOut == false and .incomplete == true and .attempts == 1 and .requestedHeadSha == $sha' \
+    "$STATE_DIR/ineligible.json" >/dev/null
+  [ ! -e "$STATE_DIR/pr-302-state.json" ]
+done
+
+# A new source head must never inherit the waiter's result for the requested
+# one. It exits distinctly instead of observing a later, possibly settled PR.
+fresh_state
+WAIT_SHA="$(sha c)"
+MOVED_SHA="$(sha d)"
+export STUB_PR_VIEW="{\"number\":303,\"state\":\"OPEN\",\"headRefOid\":\"$MOVED_SHA\",\"headRefName\":\"feature/moved\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+WAIT_CLOCK="$STATE_DIR/moved-clock.txt"
+printf '300\n301\n' > "$WAIT_CLOCK"
+export STUB_WAIT_CLOCK_FILE="$WAIT_CLOCK"
+if bash "$GATE" wait-settled 303 --head "$WAIT_SHA" --interval-seconds 0 --max-seconds 30 >"$STATE_DIR/moved.json"; then
+  echo "wait-settled accepted a moved PR head" >&2; exit 1
+fi
+jq -e --arg expected "$WAIT_SHA" --arg observed "$MOVED_SHA" '
+  .terminal == "head_moved" and .timedOut == false and .incomplete == true and .attempts == 1 and
+  .requestedHeadSha == $expected and .observedHeadSha == $observed
+' "$STATE_DIR/moved.json" >/dev/null
+
+# Pending and temporary fetch failures remain incomplete/BLOCKED at the
+# deadline. They retain their exact check diagnostic and never claim a slot.
+fresh_state
+WAIT_SHA="$(sha e)"
+export STUB_PR_VIEW="{\"number\":304,\"state\":\"OPEN\",\"headRefOid\":\"$WAIT_SHA\",\"headRefName\":\"feature/pending\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/pending.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$WAIT_SHA\",\"status\":\"in_progress\",\"conclusion\":null,\"workflowName\":\"CI\"}]"
+WAIT_CLOCK="$STATE_DIR/pending-clock.txt"
+printf '400\n400\n500\n500\n' > "$WAIT_CLOCK"
+export STUB_WAIT_CLOCK_FILE="$WAIT_CLOCK"
+if bash "$GATE" wait-settled 304 --head "$WAIT_SHA" --interval-seconds 0 --max-seconds 0 >"$STATE_DIR/pending.json"; then
+  echo "wait-settled passed a pending preview" >&2; exit 1
+fi
+jq -e '.timedOut == true and .incomplete == true and .ciPending == 1 and .attempts == 1' "$STATE_DIR/pending.json" >/dev/null
+export STUB_PR_VIEW_EXIT=1
+if bash "$GATE" wait-settled 304 --head "$WAIT_SHA" --interval-seconds 0 --max-seconds 0 >"$STATE_DIR/fetch.json"; then
+  echo "wait-settled passed a transient fetch failure" >&2; exit 1
+fi
+jq -e '.timedOut == true and .incomplete == true and .error == "failed to fetch PR" and .attempts == 1' "$STATE_DIR/fetch.json" >/dev/null
+unset STUB_PR_VIEW_EXIT
+[ ! -e "$STATE_DIR/pr-304-state.json" ] && [ ! -d "$SMOKE_GATE_LEASE_DIR" ]
+
+# Limits belong only to the waiter command. A bad option is a usage failure,
+# and the normal read-only check remains available immediately afterwards.
+if bash "$GATE" wait-settled 304 --head "$WAIT_SHA" --max-seconds 09 >"$STATE_DIR/bad-limit.json"; then
+  echo "wait-settled accepted a malformed limit" >&2; exit 1
+fi
+jq -e '.ok == false and (.error | test("non-negative integer"))' "$STATE_DIR/bad-limit.json" >/dev/null
+bash "$GATE" check 304 | jq -e '.ok == true and .eligible == true' >/dev/null
+
+# A wait interval is an upper bound, never permission to sleep past the
+# caller's deadline. The hermetic clock reaches the deadline immediately
+# after the clamped two-second sleep, before a second API request can start.
+WAIT_CLOCK="$STATE_DIR/clamped-clock.txt"
+printf '600\n600\n602\n' > "$WAIT_CLOCK"
+export STUB_WAIT_CLOCK_FILE="$WAIT_CLOCK"
+WAIT_SLEEP_LOG="$STATE_DIR/clamped-sleep.txt"
+export STUB_WAIT_SLEEP_LOG="$WAIT_SLEEP_LOG"
+if bash "$GATE" wait-settled 304 --head "$WAIT_SHA" --interval-seconds 300 --max-seconds 2 >"$STATE_DIR/clamped.json"; then
+  echo "wait-settled passed while CI was pending" >&2; exit 1
+fi
+jq -e '.timedOut == true and .incomplete == true and .attempts == 1 and .waitedSeconds == 2' "$STATE_DIR/clamped.json" >/dev/null
+[ "$(cat "$WAIT_SLEEP_LOG")" = 2 ] || { echo "wait-settled slept past its remaining deadline" >&2; exit 1; }
+unset STUB_WAIT_SLEEP_LOG
+
+# Whole shell arguments must validate, not merely their first newline-delimited
+# record. Every malformed input below was previously accepted by grep -E.
+for WAIT_BAD_FIELD in pr head interval max; do
+  WAIT_CLOCK="$STATE_DIR/$WAIT_BAD_FIELD-clock.txt"
+  printf '700\n700\n' > "$WAIT_CLOCK"
+  export STUB_WAIT_CLOCK_FILE="$WAIT_CLOCK"
+  WAIT_ARGS=(wait-settled 304 --head "$WAIT_SHA" --interval-seconds 0 --max-seconds 0)
+  case "$WAIT_BAD_FIELD" in
+    pr) WAIT_ARGS[1]=$'304\nx' ;;
+    head) WAIT_ARGS[3]="$WAIT_SHA"$'\nx' ;;
+    interval) WAIT_ARGS[5]=$'0\nx' ;;
+    max) WAIT_ARGS[7]=$'0\nx' ;;
+  esac
+  if bash "$GATE" "${WAIT_ARGS[@]}" >"$STATE_DIR/bad-$WAIT_BAD_FIELD.json"; then
+    echo "wait-settled accepted a multiline $WAIT_BAD_FIELD argument" >&2; exit 1
+  fi
+  jq -e '.ok == false' "$STATE_DIR/bad-$WAIT_BAD_FIELD.json" >/dev/null
+done
 
 echo "smoke pr gate tests passed"
