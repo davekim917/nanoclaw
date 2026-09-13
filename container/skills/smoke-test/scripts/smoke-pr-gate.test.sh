@@ -2737,7 +2737,8 @@ cat >"$DERIVED_READS_MOD" <<'PY'
 import re
 
 SENSITIVE_GLOBS = ["backend/permissions/**"]
-COMPILED = [re.compile(glob) for glob in SENSITIVE_GLOBS]
+# A policy commonly turns its glob syntax into regex syntax during import.
+COMPILED = [re.compile(re.escape(glob).replace(r"\\*\\*", ".*")) for glob in SENSITIVE_GLOBS]
 REVERSED = ["backend/legacy/**"] + SENSITIVE_GLOBS
 SPREAD = [*SENSITIVE_GLOBS]
 SLICE = SENSITIVE_GLOBS[:]
@@ -2765,6 +2766,19 @@ echo '["backend/billing/charge.ts"]' | python3 "$CLASSIFY" "$DERIVED_READS_RULES
   .campaignSize == "light" and
   .sizeReason == "light: all 1 changed file(s) matched lightAllowed"
 ' >/dev/null
+
+# The reverse-concatenation allowance has to prove the left operand really is
+# a built-in list. A custom __add__ can hand NAME straight back, so mutating
+# the apparently derived binding widens the runtime policy instead.
+assert_runtime_widening_policy_refused custom-add-reverse 'class Combine:
+    def __add__(self, other):
+        return other
+
+
+SENSITIVE_GLOBS = ["backend/permissions/**"]
+LEGACY = Combine() + SENSITIVE_GLOBS
+LEGACY.append("backend/billing/**")
+' 'aliases'
 
 # `ast.Match` does not exist on Python 3.9. Simulate that interpreter's AST
 # surface to prove the classifier still reads an ordinary policy instead of

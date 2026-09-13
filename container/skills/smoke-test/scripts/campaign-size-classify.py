@@ -369,8 +369,8 @@ def _binding_result_reference(value, name, bound):
     reserved for the ordinary policy forms whose result is known not to hold
     the mutable list: a scalar pure call, a direct shallow copy of the trusted
     flat string list, literal-string `join`, eager comprehensions over its
-    strings, and direct list concatenation in either order where the other
-    operand contains no reference to NAME. The whole RHS is considered,
+    strings, and direct list concatenation with NAME on the left or a literal
+    built-in list on the left of NAME. The whole RHS is considered,
     including a call's callee, so a closure or a second list operand cannot
     hide a retained reference.
     """
@@ -446,15 +446,23 @@ def _binding_result_reference(value, name, bound):
     if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add):
         left_ref = _binding_result_reference(value.left, name, bound)
         right_ref = _binding_result_reference(value.right, name, bound)
+        if left_ref == _REF_DIRECT and right_ref == _REF_NONE:
+            # NAME is the trusted flat list, so its built-in list.__add__
+            # creates a distinct outer list. A non-list RHS would make the
+            # source policy fail to import, not retain NAME.
+            return _REF_NONE
         if not (
-            (left_ref == _REF_DIRECT and right_ref == _REF_NONE)
-            or (right_ref == _REF_DIRECT and left_ref == _REF_NONE)
+            right_ref == _REF_DIRECT
+            and isinstance(value.left, ast.List)
+            and all(
+                _binding_result_reference(item, name, bound) == _REF_NONE
+                for item in value.left.elts
+            )
         ):
             return _REF_MAY_RETAIN
-        # `NAME` is the trusted flat list, so list concatenation creates a new
-        # outer list and contributes only immutable strings from NAME.  The
-        # other operand must independently prove it retains no NAME reference;
-        # concatenation is symmetric for these new list results.
+        # A literal list is known to use built-in list.__add__. Do not accept
+        # an arbitrary reference-free left operand: its custom __add__ can
+        # return NAME itself, turning a later mutation into a policy widening.
         return _REF_NONE
 
     return _REF_MAY_RETAIN
