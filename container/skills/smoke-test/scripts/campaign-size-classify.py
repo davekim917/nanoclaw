@@ -125,6 +125,7 @@ _MATCH_NAME_NODES = tuple(
     if n is not None
 )
 _MATCH_REST_NODES = tuple(n for n in (getattr(ast, "MatchMapping", None),) if n is not None)
+_MATCH_STATEMENT = getattr(ast, "Match", None)
 
 # Builtins that reach into the module namespace, or the import system, BY
 # STRING -- so no name-level analysis can see what they rebind. A file that
@@ -367,13 +368,57 @@ def _binding_result_reference(value, name, bound):
     NAME-containing shapes are `_REF_MAY_RETAIN` by default.  `_REF_NONE` is
     reserved for the ordinary policy forms whose result is known not to hold
     the mutable list: a scalar pure call, a direct shallow copy of the trusted
-    flat string list, literal-string `join`, and direct `NAME + OTHER` where
-    OTHER contains no reference to NAME.  The whole RHS is considered,
+    flat string list, literal-string `join`, eager comprehensions over its
+    strings, and direct list concatenation with NAME on the left or a literal
+    built-in list on the left of NAME. The whole RHS is considered,
     including a call's callee, so a closure or a second list operand cannot
     hide a retained reference.
     """
     if isinstance(value, ast.Name) and value.id == name:
         return _REF_DIRECT
+
+    # A list/set/dict comprehension eagerly creates a new container. When its
+    # output expression does not retain NAME, iterating the trusted flat list
+    # contributes only immutable strings; the result cannot alias NAME itself.
+    # Do not apply this to GeneratorExp: a lazy generator keeps its source
+    # iterator alive and can therefore retain the original list.
+    if isinstance(value, (ast.ListComp, ast.SetComp, ast.DictComp)):
+        result_values = (value.key, value.value) if isinstance(value, ast.DictComp) else (value.elt,)
+        iterable_is_safe = all(
+            _binding_result_reference(generator.iter, name, bound) != _REF_MAY_RETAIN
+            for generator in value.generators
+        )
+        result_is_safe = all(
+            _binding_result_reference(result, name, bound) == _REF_NONE for result in result_values
+        )
+        if iterable_is_safe and result_is_safe:
+            return _REF_NONE
+
+    # `[*NAME]` and `NAME[:]` create a new outer list. The trusted policy is
+    # validated as a flat list of strings, so neither form can retain its list
+    # object (unlike `[NAME]`, which deliberately falls through below).
+    if isinstance(value, ast.List):
+        has_direct_spread = any(
+            isinstance(item, ast.Starred) and _binding_result_reference(item.value, name, bound) == _REF_DIRECT
+            for item in value.elts
+        )
+        items_are_safe = all(
+            (
+                _binding_result_reference(item.value, name, bound) != _REF_MAY_RETAIN
+                if isinstance(item, ast.Starred)
+                else _binding_result_reference(item, name, bound) == _REF_NONE
+            )
+            for item in value.elts
+        )
+        if has_direct_spread and items_are_safe:
+            return _REF_NONE
+    if (
+        isinstance(value, ast.Subscript)
+        and isinstance(value.value, ast.Name)
+        and value.value.id == name
+        and isinstance(value.slice, ast.Slice)
+    ):
+        return _REF_NONE
 
     children = list(ast.iter_child_nodes(value))
     child_refs = [_binding_result_reference(child, name, bound) for child in children]
@@ -398,16 +443,26 @@ def _binding_result_reference(value, name, bound):
             ):
                 return _REF_NONE
 
-    if (
-        isinstance(value, ast.BinOp)
-        and isinstance(value.op, ast.Add)
-        and isinstance(value.left, ast.Name)
-        and value.left.id == name
-        and _binding_result_reference(value.right, name, bound) == _REF_NONE
-    ):
-        # `NAME` is the trusted flat list, so list concatenation creates a new
-        # outer list and contributes only immutable strings from NAME.  The
-        # right operand must independently prove it retains no NAME reference.
+    if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add):
+        left_ref = _binding_result_reference(value.left, name, bound)
+        right_ref = _binding_result_reference(value.right, name, bound)
+        if left_ref == _REF_DIRECT and right_ref == _REF_NONE:
+            # NAME is the trusted flat list, so its built-in list.__add__
+            # creates a distinct outer list. A non-list RHS would make the
+            # source policy fail to import, not retain NAME.
+            return _REF_NONE
+        if not (
+            right_ref == _REF_DIRECT
+            and isinstance(value.left, ast.List)
+            and all(
+                _binding_result_reference(item, name, bound) == _REF_NONE
+                for item in value.left.elts
+            )
+        ):
+            return _REF_MAY_RETAIN
+        # A literal list is known to use built-in list.__add__. Do not accept
+        # an arbitrary reference-free left operand: its custom __add__ can
+        # return NAME itself, turning a later mutation into a policy widening.
         return _REF_NONE
 
     return _REF_MAY_RETAIN
@@ -517,7 +572,7 @@ def _rebinding_use(node, name, bound):
         # A capture pattern can bind the whole subject or a nested value from
         # it.  Reference-bearing subjects are therefore unsafe when any arm
         # captures, without trying to execute Python's pattern semantics.
-        if isinstance(sub, ast.Match) and _binding_value_aliases_name(sub.subject, name, bound):
+        if _MATCH_STATEMENT and isinstance(sub, _MATCH_STATEMENT) and _binding_value_aliases_name(sub.subject, name, bound):
             if any(_match_pattern_binds(case.pattern) for case in sub.cases):
                 return "aliases through a match capture"
         # `X = NAME`, destructuring a tuple that contains NAME, or binding a
