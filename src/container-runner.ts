@@ -27,6 +27,7 @@ import {
   CONTAINER_SESSION_LABEL_KEY,
   CONTAINER_WORKGROUP_LABEL_KEY,
   DATA_DIR,
+  EGRESS_LOCKDOWN,
   GROUPS_DIR,
   HOST_LEASE_TTL_MS,
   MAX_CONCURRENT_CONTAINERS,
@@ -3794,6 +3795,32 @@ export function resolveAnthropicAuth(
 }
 
 /**
+ * Wiki actors may receive model credentials and nothing else. Prefer the
+ * subscription token set when both supported families are configured, then
+ * fall back to the API-key rotation set.
+ */
+export function wikiModelAuth(auth: ResolvedAnthropicAuth): Record<string, string> {
+  if (auth.oauthPrimary) {
+    return Object.fromEntries([
+      ['CLAUDE_CODE_OAUTH_TOKEN', auth.oauthPrimary],
+      ...auth.oauthFallbacks.map(({ index, value }) => [`CLAUDE_CODE_OAUTH_TOKEN_${index}`, value]),
+    ]);
+  }
+  if (auth.apiKeyPrimary) {
+    return Object.fromEntries([
+      ['ANTHROPIC_API_KEY', auth.apiKeyPrimary],
+      ...auth.apiKeyFallbacks.map(({ index, value }) => [`ANTHROPIC_API_KEY_${index}`, value]),
+    ]);
+  }
+  throw new Error('Wiki Claude model authentication unavailable');
+}
+
+/** The isolated runtime has no model-only route through the locked network. */
+export function assertWikiEgressAllowed(egressLockdown: boolean): void {
+  if (egressLockdown) throw new Error('Wiki maintenance requires direct model egress');
+}
+
+/**
  * Resolve the host-side `.codex/` directory to mount for a given agent
  * group's container. Mirrors the per-group OAuth pattern from
  * `resolveAnthropicAuth` but for Codex, which stores credentials as an
@@ -6016,6 +6043,7 @@ async function buildContainerArgs(
 ): Promise<string[]> {
   const wikiActor = wikiEnrollment(agentGroup.id, containerConfig.wikiMaintenance === true);
   if (wikiActor) {
+    assertWikiEgressAllowed(EGRESS_LOCKDOWN);
     assertWikiActorConfig(containerConfig, wikiActor, resolvedWgId ?? '');
     if (
       providerFallbackApplied ||
@@ -6033,9 +6061,7 @@ async function buildContainerArgs(
         process.env,
         readEnvFileMatching(/^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)(_|$)/),
       );
-      if (!resolved.oauthPrimary) throw new Error('Wiki Claude model authentication unavailable');
-      auth.CLAUDE_CODE_OAUTH_TOKEN = resolved.oauthPrimary;
-      for (const token of resolved.oauthFallbacks) auth[`CLAUDE_CODE_OAUTH_TOKEN_${token.index}`] = token.value;
+      Object.assign(auth, wikiModelAuth(resolved));
     }
     const env = wikiRuntimeEnvironment(
       provider,

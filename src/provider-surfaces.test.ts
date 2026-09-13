@@ -190,7 +190,7 @@ describe('host-enrolled wiki maintenance mounts', () => {
         verifierGroupId: 'wiki-verifier',
         seriesId: 'synth-example',
         sourcePrefixes: ['https://primary.example/'],
-        notification: { channelType: 'test', platformId: 'example', threadId: null },
+        notification: { channelType: 'test', instance: 'test', platformId: 'example', threadId: null },
       }),
     );
     const sess = session('wiki-maintenance-session', ag.id);

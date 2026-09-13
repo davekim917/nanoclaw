@@ -79,6 +79,8 @@ function engine(store: CandidateStore): WikiAdmission {
         JSON.stringify({
           text: `Wiki updated with an independently sourced fact/correction (${candidate.head.slice(0, 12)}).`,
         }),
+        undefined,
+        target.instance,
       );
       if (!result) throw new Error('Wiki publication notice delivery unconfirmed');
     },

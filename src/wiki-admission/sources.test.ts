@@ -29,7 +29,7 @@ const policy = parsePolicy({
   verifierGroupId: 'verifier',
   seriesId: 'synth-example',
   sourcePrefixes: ['https://primary.example/'],
-  notification: { channelType: 'test', platformId: 'example', threadId: null },
+  notification: { channelType: 'test', instance: 'test', platformId: 'example', threadId: null },
 });
 class Response extends EventEmitter {
   statusCode = 200;

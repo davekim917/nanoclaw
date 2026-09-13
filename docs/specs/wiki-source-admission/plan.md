@@ -66,7 +66,8 @@ collusion or host compromise. Reader-mirror refresh remains downstream of public
 
 One host-only publication policy file under the existing private wiki operations directory names
 the target workgroup/repository/default ref, writer group, verifier group, existing
-series, notification destination and permitted primary-document origins/path prefixes.
+series, exact notification `{channelType, instance, platformId, threadId}` destination and
+permitted primary-document origins/path prefixes.
 Its digest, together with the identity-record digest, versions each candidate. A missing
 or invalid policy never means unrestricted publication. Enrollment and group IDs are
 installation state, not public constants.

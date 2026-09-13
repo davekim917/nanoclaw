@@ -253,6 +253,9 @@ risk:self-mod:
 risk:credential:
 - changed-files:
   - any-glob-to-any-file:
+    - 'src/wiki-admission/**'
+    - 'src/modules/wiki-admission/**'
+    - 'container/agent-runner/src/mcp-tools/wiki-admission.ts'
     - 'src/onecli-secrets.ts'
     - 'src/container-config.ts'
     - 'src/container-runner.ts'

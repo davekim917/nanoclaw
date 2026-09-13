@@ -63,7 +63,8 @@ export function wikiRuntimeEnvironment(
   auth: Record<string, string>,
   workgroup: string,
 ): Record<string, string> {
-  const permitted = /^(OPENAI_API_KEY|OPENAI_BASE_URL|CODEX_MODEL|CLAUDE_CODE_OAUTH_TOKEN(?:_\d+)?|ANTHROPIC_API_KEY)$/;
+  const permitted =
+    /^(OPENAI_API_KEY|OPENAI_BASE_URL|CODEX_MODEL|CLAUDE_CODE_OAUTH_TOKEN(?:_\d+)?|ANTHROPIC_API_KEY(?:_\d+)?)$/;
   if (Object.keys(auth).some((key) => !permitted.test(key)))
     throw new Error('Wiki runtime received application credentials');
   const env: Record<string, string> = {

@@ -112,7 +112,7 @@ const policy = {
   verifierGroupId: 'verifier',
   seriesId: 'synth-example',
   sourcePrefixes: ['https://primary.example/'],
-  notification: { channelType: 'test', platformId: 'fixture', threadId: null },
+  notification: { channelType: 'test', instance: 'wiki-test', platformId: 'fixture', threadId: null },
 };
 const identityPath = () => path.join(fixture.root, 'groups', '_ops', 'wiki', 'actors.json');
 beforeEach(() => {
@@ -180,6 +180,15 @@ describe('restricted host publisher integration', () => {
         expect(fixture.head).toBe(candidate.head);
         expect(fixture.token).toHaveBeenCalledOnce();
         expect(fixture.notice).toHaveBeenCalledOnce();
+        expect(fixture.notice).toHaveBeenLastCalledWith(
+          'test',
+          'fixture',
+          null,
+          'chat',
+          expect.any(String),
+          undefined,
+          'wiki-test',
+        );
         expect(JSON.stringify(fixture.writes)).not.toContain('fixture-host-token');
       }
     },

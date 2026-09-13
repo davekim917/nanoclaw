@@ -23,7 +23,7 @@ const policy = parsePolicy({
   verifierGroupId: 'verifier',
   seriesId: 'synth-example',
   sourcePrefixes: ['https://primary.example/'],
-  notification: { channelType: 'test', platformId: 'example', threadId: null },
+  notification: { channelType: 'test', instance: 'test', platformId: 'example', threadId: null },
 });
 const enrollment: Enrollment = { policy, role: 'writer', digest: 'test' };
 const config: ContainerConfig = {
@@ -44,6 +44,14 @@ afterEach(() => {
 });
 
 describe('maintenance authority', () => {
+  it('requires an exact channel instance for the host publication notice', () => {
+    const withoutInstance = {
+      ...policy,
+      notification: { channelType: 'test', platformId: 'example', threadId: null },
+    };
+    expect(() => parsePolicy(withoutInstance)).toThrow('notification');
+  });
+
   it('requires both host enrollment and an actor marker; a missing policy is never unrestricted', () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'wiki-policy-'));
     const file = path.join(root, 'policy.json');
@@ -133,6 +141,15 @@ describe('maintenance authority', () => {
     for (const key of ['GH_TOKEN', 'GITHUB_TOKEN', 'GITHUB_TOKEN_FILE', 'HTTPS_PROXY', 'RENDER_API_KEY']) {
       expect(() => wikiRuntimeEnvironment('codex', 'gpt-6-astra', 'medium', { [key]: 'fake' }, 'example')).toThrow();
     }
+    expect(
+      wikiRuntimeEnvironment(
+        'claude',
+        undefined,
+        undefined,
+        { ANTHROPIC_API_KEY: 'primary', ANTHROPIC_API_KEY_2: 'fallback' },
+        'example',
+      ),
+    ).toMatchObject({ ANTHROPIC_API_KEY: 'primary', ANTHROPIC_API_KEY_2: 'fallback' });
     const env = wikiRuntimeEnvironment(
       'codex',
       'gpt-6-astra',

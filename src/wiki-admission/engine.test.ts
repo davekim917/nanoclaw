@@ -24,7 +24,7 @@ const policy: WikiPolicy = {
   verifierGroupId: 'verifier',
   seriesId: 'wiki-synth-example',
   sourcePrefixes: ['https://primary.example/'],
-  notification: { channelType: 'test', platformId: 'example', threadId: null },
+  notification: { channelType: 'test', instance: 'test', platformId: 'example', threadId: null },
 };
 const text = '# Materials\nThe marketplace accepts surplus soil.\n';
 const edits = [

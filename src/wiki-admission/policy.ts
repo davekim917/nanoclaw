@@ -14,7 +14,7 @@ export interface WikiPolicy {
   verifierGroupId: string;
   seriesId: string;
   sourcePrefixes: string[];
-  notification: { channelType: string; platformId: string; threadId: string | null };
+  notification: { channelType: string; instance: string; platformId: string; threadId: string | null };
 }
 export type Enrollment = { policy: WikiPolicy; digest: string; role: 'writer' | 'verifier' };
 export const digest = (value: string | Buffer): string => crypto.createHash('sha256').update(value).digest('hex');
@@ -55,6 +55,7 @@ export function parsePolicy(value: unknown): WikiPolicy {
   if (
     !p.notification ||
     !p.notification.channelType ||
+    !p.notification.instance ||
     !p.notification.platformId ||
     (p.notification.threadId !== null && typeof p.notification.threadId !== 'string')
   ) {
